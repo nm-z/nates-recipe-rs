@@ -99,9 +99,7 @@ for t in 0...ITERS
             zero!(gain_buf)
             oblivious_split_eval_into!(grad_hist, hess_hist, gain_buf, n_nodes, NB, LAM)
             argmax_write_split_into!(gain_buf, sf_dev, sb_dev, best_idx_dev, NB, d)
-            best_idx = download_i32_scalar(best_idx_dev)
-            bf = best_idx / NB; bb = best_idx % NB
-            oblivious_route_step_into!(bins_rm, node_a, node_b, bf, bb, d)
+            oblivious_route_step_dev_into!(bins_rm, node_a, node_b, sf_dev, sb_dev, d)
             node_a, node_b = node_b, node_a
       end
 

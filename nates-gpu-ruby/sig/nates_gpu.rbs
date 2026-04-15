@@ -194,6 +194,8 @@ module NatesGpu
       def self.bernoulli_into!: (GpuBuffer out, Float p, Integer seed) -> void
       def self.grad_hess_into!: (GpuBuffer probs, GpuBuffer targets, GpuBuffer weights, GpuBuffer mask, GpuBuffer grad_out, GpuBuffer hess_out, Integer k) -> void
       def self.tree_build_into!: (GpuBuffer tr_bins, GpuBuffer te_bins, GpuBuffer g, GpuBuffer h, Integer n_bins, Integer depth, Float lambda, Float mcw, GpuBuffer tr_pred, GpuBuffer te_pred) -> void
+      def self.oblivious_route_step_into!: (GpuBuffer bins_rm, GpuBuffer node_in, GpuBuffer node_out, Integer split_feat, Integer split_bin, Integer depth) -> void
+      def self.oblivious_route_step_dev_into!: (GpuBuffer bins_rm, GpuBuffer node_in, GpuBuffer node_out, GpuBuffer split_feat_arr, GpuBuffer split_bin_arr, Integer depth) -> void
       def self.report: (GpuBuffer logits, Array[Integer] val_targets, Integer round) -> Float
 
       # DTW
