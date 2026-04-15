@@ -1,5 +1,17 @@
 # CLAUDE.md
 
+## Core Rules
+- When debugging issues, NEVER speculate or guess at causes. Always read the actual logs, code, and docs FIRST before suggesting fixes. Do not try multiple random approaches — diagnose systematically.
+- When given a clear directive, act on it immediately. Do NOT ask clarifying questions if the answer is already in context, memory, or the codebase. Do NOT propose multiple options when the choice is already made.
+- Always TEST changes before reporting them as done. Run the build, run the tests, verify the output. Do not claim something works without evidence.
+- When corrected, accept the correction immediately and move forward. Do not re-explain original reasoning or contradict the correction.
+
+## Code Changes
+- Do NOT make excessive or scattered changes across many files. Keep changes minimal and focused on what was requested. If a fix touches more than 3 files, pause and explain why before proceeding.
+
+## Project Context
+- This project primarily uses Rust. Secondary tools: Ruby, Shell/Makefile, Markdown. When working on the video pipeline (mvfx), understand that it involves Vulkan, VA-API, DMA-BUF, Wayland, and frame interpolation at 4K 240fps.
+
 ## ABSOLUTE RULES
 - NEVER hand-roll any ML algorithm, math routine, or data structure that exists in a dependency.
 - NEVER reimplement: distance metrics, scalers, encoders, splitters, loss functions, optimizers, matrix ops, stats functions, clustering, trees, linear models, kernels, decompositions, or any preprocessing step.
