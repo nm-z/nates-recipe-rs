@@ -119,6 +119,7 @@ x, y, n, nf, nc = case spec[:format]
       end
 
 nc ||= spec[:nc]
+y.map! { |v| v < 0 ? 0.0 : 1.0 } if task == :binary
 $stderr.puts "  loaded n=#{n} features=#{nf}#{nc ? " classes=#{nc}" : ""} in %.2fs" % (Time.now - t_load)
 
 tr_idx, te_idx = load_split(DATASET, n)
