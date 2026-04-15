@@ -41,13 +41,21 @@ fn main() {
             let src = format!("src/gpu/kernels/{}.hip", name);
             let obj = format!("{}/{}.o", out_dir, name);
             if std::path::Path::new(&src).exists() {
-                let status = std::process::Command::new(hipcc)
-                    .args(&["-x", "hip", "--rocm-path=/opt/rocm", "-I/home/nate/.rocm-install/rocm/include", "-c", "-fPIC", "--offload-arch=gfx1101", "-O3", &src, "-o", &obj])
-                    .status()
-                    .expect("hipcc failed — is ROCm installed?");
-                assert!(status.success(), "hipcc failed for {}", src);
-                objects.push(obj);
                 println!("cargo:rerun-if-changed={}", src);
+                let src_mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+                let obj_mtime = std::fs::metadata(&obj).and_then(|m| m.modified()).ok();
+                let needs_rebuild = match (src_mtime, obj_mtime) {
+                    (Some(s), Some(o)) => s > o,
+                    _ => true,
+                };
+                if needs_rebuild {
+                    let status = std::process::Command::new(hipcc)
+                        .args(&["-x", "hip", "--rocm-path=/opt/rocm", "-I/home/nate/.rocm-install/rocm/include", "-c", "-fPIC", "--offload-arch=gfx1101", "-O3", &src, "-o", &obj])
+                        .status()
+                        .expect("hipcc failed — is ROCm installed?");
+                    assert!(status.success(), "hipcc failed for {}", src);
+                }
+                objects.push(obj);
             }
         }
 
