@@ -231,7 +231,7 @@ mod data_tests {
             write_rgb_image(&cat.join("1.png"), &[(1, 1, 1)], 1, 1);
             write_rgb_image(&dog.join("1.png"), &[(2, 2, 2)], 1, 1);
 
-            let (_x, y) = crate::data::load_labeled_image_dir(root.to_str().expect("utf8 path"), 1, 1)
+            let (_, y) = crate::data::load_labeled_image_dir(root.to_str().expect("utf8 path"), 1, 1)
                   .expect("load_labeled_image_dir failed");
 
             assert_eq!(y.len(), 2);
