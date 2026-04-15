@@ -27,7 +27,7 @@ Core type: `GpuBuffer`
   - `hipMalloc` for normal device allocation
   - `hipMallocManaged` fallback when memory pressure is high
 - Includes simple adaptive spill behavior:
-  - direct device alloc path is used while `(currently_used_bytes + requested_allocation_bytes)` stays within ~90% of total VRAM
+  - direct device allocation is used when `(currently_used_bytes + requested_allocation_bytes)` stays within ~90% of total VRAM
   - spill mode is enabled when pressure remains high after retry/GC
   - exits spill mode once usage drops below ~70% of total VRAM
 - Optional GC callback hook (`set_gc_hook`) for external memory cleanup before retry.
@@ -74,7 +74,8 @@ It keeps a **thread-local rocBLAS handle** and exposes `gpu_shutdown()` to relea
 - Tensor/data transforms (transpose, concat, slicing, im2col/col2im, pooling, broadcast ops)
 - Reductions/stat ops (sum/mean/var/min/max, log-sum-exp, prefix sums)
 - Optimizer updates (`gpu_sgd_update`, `gpu_adam_update`, `gpu_adamw_update`, grad clipping)
-  - `gpu_sgd_update` applies gradient descent formula `weights = weights - lr * grad`; BLAS AXPY is `y = alpha * x + y`
+  - `gpu_sgd_update` applies gradient descent formula `weights = weights - lr * grad`
+  - BLAS AXPY semantics are `y = alpha * x + y`, so this distinction matters when reusing update utilities
 - Distance/nearest-neighbor helpers (`gpu_pairwise_l2`, argsort/top-k/argmin/argmax)
 - Sequence/model primitives (LSTM/GRU cell helpers)
 - Tree/GBM-style kernels (histogram build, split eval, partition, tree build, oblivious-tree helpers)
@@ -85,7 +86,8 @@ It keeps a **thread-local rocBLAS handle** and exposes `gpu_shutdown()` to relea
 - [ ] Replace hard-coded ROCm include/lib paths and fixed `--offload-arch` in `build.rs` with environment-driven config.
 - [ ] Add feature flags for optional kernel groups (core math vs tree/mining extras) to reduce compile/link footprint.
 - [ ] Introduce richer error mapping (rocBLAS/rocSOLVER/HIP domains) instead of mostly raw status codes.
-- [ ] Add shape/stride metadata wrappers around `GpuBuffer` to enable stronger runtime checks now and future compile-time dimensional typing for matrix/tensor shape mismatches.
+- [ ] Add shape/stride metadata wrappers around `GpuBuffer` for stronger runtime dimension checks.
+- [ ] Add optional compile-time dimensional typing for matrix/tensor operations to prevent shape mismatches earlier.
 - [ ] Add optional stream-aware APIs (explicit stream ownership, async copies, overlap patterns).
 - [ ] Add lightweight smoke/integration tests that can be skipped when ROCm is unavailable, with clearer diagnostics.
 - [ ] Add a crate-level API reference table (inputs/outputs/dtypes) for frequently used kernel entry points.
