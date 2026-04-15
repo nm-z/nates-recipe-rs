@@ -1,0 +1,32 @@
+[package]
+name = "nates_recipe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+exclude = ["nates-gpu-lua", "catboost-rs"]
+
+[dependencies]
+gpu-core = { path = "gpu-core" }
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+anyhow = "1"
+polars = { version = "0.46", features = [
+      "csv", "lazy", "dtype-full",
+      "parquet", "json", "strings",
+      "temporal", "is_in", "rolling_window", "rank",
+      "ndarray",
+] }
+ndarray = { version = "0.16", features = ["rayon"] }
+ndarray-stats = "0.6"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+image = "0.25"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 1

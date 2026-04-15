@@ -1,0 +1,18 @@
+/target
+kaggle-data/
+data/
+results.json
+src/config/scheduler_weights.bin
+.firecrawl/
+
+# Vendored repos (clone separately)
+catboost/
+LightGBM/
+xgboost/
+
+# Build artifacts
+*/target/
+*.so
+*.o
+*.a
+*.rlib

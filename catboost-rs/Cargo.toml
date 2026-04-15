@@ -1,0 +1,13 @@
+[package]
+name = "catboost-rs"
+version = "0.1.0"
+edition = "2024"
+description = "CatBoost training — ordered boosting with categorical features"
+
+[workspace]
+
+[dependencies]
+gpu-core = { path = "../gpu-core" }
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"

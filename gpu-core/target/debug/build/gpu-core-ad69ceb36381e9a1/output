@@ -1,0 +1,12 @@
+cargo:rerun-if-changed=src/kernels/elementwise.hip
+cargo:rerun-if-changed=src/kernels/reduce.hip
+cargo:rerun-if-changed=src/kernels/distance.hip
+cargo:rerun-if-changed=src/kernels/argsort.hip
+cargo:rustc-link-search=native=/home/nate/Desktop/nates-recipe-rs/gpu-core/target/debug/build/gpu-core-ad69ceb36381e9a1/out
+cargo:rustc-link-lib=static=hipkernels
+cargo:rustc-link-search=native=/opt/rocm/lib
+cargo:rustc-link-lib=dylib=amdhip64
+cargo:rustc-link-search=native=/home/nate/.rocm-install/rocm/lib
+cargo:rustc-link-lib=dylib=rocblas
+cargo:rustc-link-lib=dylib=rocsolver
+cargo:rustc-link-lib=dylib=stdc++

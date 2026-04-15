@@ -1,0 +1,205 @@
+module NatesGpu
+      class GpuBuffer
+            def rows: -> Integer
+            def cols: -> Integer
+            def len: -> Integer
+            def to_s: -> String
+            def inspect: -> String
+            def +: (GpuBuffer | Float) -> GpuBuffer
+            def -: (GpuBuffer | Float) -> GpuBuffer
+            def *: (GpuBuffer | Float) -> GpuBuffer
+            def /: (GpuBuffer | Float) -> GpuBuffer
+            def -@: -> GpuBuffer
+      end
+
+      # Data transfer
+      def self.upload: (Array[Float], Integer rows, Integer cols) -> GpuBuffer
+      def self.download: (GpuBuffer) -> Array[Float]
+
+      # Init
+      def self.zeros: (Integer rows, Integer cols) -> GpuBuffer
+      def self.ones: (Integer rows, Integer cols) -> GpuBuffer
+      def self.fill: (Integer rows, Integer cols, Float val) -> GpuBuffer
+      def self.eye: (Integer n) -> GpuBuffer
+      def self.randn: (Integer rows, Integer cols, Integer seed) -> GpuBuffer
+      def self.rand_uniform: (Integer rows, Integer cols, Integer seed) -> GpuBuffer
+      def self.bernoulli: (Integer rows, Integer cols, Float p, Integer seed) -> GpuBuffer
+
+      # Elementwise binary (prefer operators: +, -, *, /)
+      def self.add: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.sub: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.mul: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.scale: (GpuBuffer x, Float s) -> GpuBuffer
+      def self.sub_scale: (GpuBuffer a, GpuBuffer b, Float s) -> GpuBuffer
+      def self.fma: (GpuBuffer x, GpuBuffer a, GpuBuffer b) -> GpuBuffer
+
+      # Elementwise unary
+      def self.neg: (GpuBuffer x) -> GpuBuffer
+      def self.abs: (GpuBuffer x) -> GpuBuffer
+      def self.sign: (GpuBuffer x) -> GpuBuffer
+      def self.exp: (GpuBuffer x) -> GpuBuffer
+      def self.log: (GpuBuffer x) -> GpuBuffer
+      def self.sqrt: (GpuBuffer x) -> GpuBuffer
+      def self.pow: (GpuBuffer x, Float p) -> GpuBuffer
+      def self.clamp: (GpuBuffer x, Float lo, Float hi) -> GpuBuffer
+
+      # Broadcast (prefer operators: a - v auto-broadcasts when v is 1-row)
+      def self.broadcast_sub: (GpuBuffer x, GpuBuffer v) -> GpuBuffer
+      def self.broadcast_mul: (GpuBuffer x, GpuBuffer v) -> GpuBuffer
+      def self.broadcast_div: (GpuBuffer x, GpuBuffer v) -> GpuBuffer
+      def self.bias_add: (GpuBuffer x, GpuBuffer b) -> GpuBuffer
+
+      # Reductions (prefer mean/var/sum/max/min with axis:)
+      def self.mean: (GpuBuffer x, ?axis: Symbol) -> GpuBuffer
+      def self.var: (GpuBuffer x, ?axis: Symbol) -> GpuBuffer
+      def self.sum: (GpuBuffer x, ?axis: Symbol) -> GpuBuffer
+      def self.max: (GpuBuffer x, ?axis: Symbol) -> GpuBuffer
+      def self.min: (GpuBuffer x, ?axis: Symbol) -> GpuBuffer
+      def self.reduce_sum_cols: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_sum_rows: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_mean_cols: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_var_cols: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_max_rows: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_max_cols: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_min_rows: (GpuBuffer x) -> GpuBuffer
+      def self.reduce_min_cols: (GpuBuffer x) -> GpuBuffer
+      def self.log_sum_exp: (GpuBuffer x) -> GpuBuffer
+
+      # Comparisons
+      def self.gt: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.lt: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.eq_op: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.gt_scalar: (GpuBuffer x, Float val) -> GpuBuffer
+      def self.lt_scalar: (GpuBuffer x, Float val) -> GpuBuffer
+
+      # Structural
+      def self.copy: (GpuBuffer x) -> GpuBuffer
+      def self.transpose: (GpuBuffer x) -> GpuBuffer
+      def self.reshape: (GpuBuffer x, Integer rows, Integer cols) -> GpuBuffer
+      def self.concat: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.vconcat: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.slice: (GpuBuffer x, Integer start, Integer count, ?axis: Symbol) -> GpuBuffer
+      def self.slice_cols: (GpuBuffer x, Integer start, Integer count) -> GpuBuffer
+      def self.slice_rows: (GpuBuffer x, Integer start, Integer count) -> GpuBuffer
+      def self.repeat_rows: (GpuBuffer x, Integer repeats) -> GpuBuffer
+      def self.where_mask: (GpuBuffer cond, GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.tril_mask: (Integer n, Float fill_val) -> GpuBuffer
+      def self.gather_rows: (GpuBuffer table, GpuBuffer indices) -> GpuBuffer
+      def self.scatter_add: (GpuBuffer target, GpuBuffer indices, GpuBuffer src) -> nil
+
+      # In-place
+      def self.scale_inplace: (GpuBuffer x, Float s) -> nil
+      def self.diag_add: (GpuBuffer a, Float val) -> GpuBuffer
+      def self.sgd_update: (GpuBuffer w, GpuBuffer grad, Float lr) -> nil
+      def self.grad_clip_norm: (GpuBuffer x, Float max_norm) -> nil
+
+      # Prefix sum
+      def self.prefix_sum_inclusive: (GpuBuffer x) -> GpuBuffer
+      def self.prefix_sum_exclusive: (GpuBuffer x) -> GpuBuffer
+
+      # Activations
+      def self.sigmoid: (GpuBuffer x) -> GpuBuffer
+      def self.sigmoid_backward: (GpuBuffer grad, GpuBuffer act) -> GpuBuffer
+      def self.tanh_act: (GpuBuffer x) -> GpuBuffer
+      def self.tanh_backward: (GpuBuffer grad, GpuBuffer act) -> GpuBuffer
+      def self.relu: (GpuBuffer x) -> GpuBuffer
+      def self.relu_backward: (GpuBuffer grad, GpuBuffer act) -> GpuBuffer
+      def self.leaky_relu: (GpuBuffer x, Float alpha) -> GpuBuffer
+      def self.leaky_relu_backward: (GpuBuffer grad, GpuBuffer act, Float alpha) -> GpuBuffer
+      def self.gelu: (GpuBuffer x) -> GpuBuffer
+      def self.gelu_backward: (GpuBuffer grad, GpuBuffer x) -> GpuBuffer
+      def self.silu: (GpuBuffer x) -> GpuBuffer
+      def self.silu_backward: (GpuBuffer grad, GpuBuffer x) -> GpuBuffer
+      def self.softmax: (GpuBuffer x) -> GpuBuffer
+      def self.softmax_backward: (GpuBuffer grad, GpuBuffer sm) -> GpuBuffer
+      def self.log_softmax: (GpuBuffer x) -> GpuBuffer
+      def self.scaled_exp: (GpuBuffer x, Float s) -> GpuBuffer
+      def self.cross_entropy: (GpuBuffer logits, GpuBuffer targets) -> GpuBuffer
+      def self.dropout: (GpuBuffer x, GpuBuffer mask, Float p) -> GpuBuffer
+
+      # BLAS
+      def self.gemm: (GpuBuffer a, GpuBuffer b, String transA, String transB) -> GpuBuffer
+      def self.solve: (GpuBuffer a, GpuBuffer b) -> GpuBuffer
+      def self.cholesky: (GpuBuffer a) -> GpuBuffer
+      def self.cholesky_solve: (GpuBuffer a, GpuBuffer b, Integer n) -> GpuBuffer
+      def self.cholesky_inv: (GpuBuffer a, Integer n) -> GpuBuffer
+      def self.tri_solve: (GpuBuffer l, GpuBuffer b) -> GpuBuffer
+      def self.tri_solve_t: (GpuBuffer l, GpuBuffer b) -> GpuBuffer
+
+      # Linear (fused gemm + bias)
+      def self.linear: (GpuBuffer x, GpuBuffer w, GpuBuffer b) -> GpuBuffer
+      def self.linear_backward: (GpuBuffer grad, GpuBuffer input, GpuBuffer weight) -> Array[GpuBuffer]
+
+      # Normalization
+      def self.layernorm: (GpuBuffer x) -> GpuBuffer
+      def self.layernorm_affine: (GpuBuffer x, GpuBuffer gamma, GpuBuffer beta) -> GpuBuffer
+      def self.layernorm_backward: (GpuBuffer grad_y, GpuBuffer x, GpuBuffer gamma, Float eps) -> Array[GpuBuffer]
+      def self.batchnorm_forward: (GpuBuffer x, GpuBuffer gamma, GpuBuffer beta, Float eps) -> Array[GpuBuffer]
+      def self.batchnorm_inference: (GpuBuffer x, GpuBuffer gamma, GpuBuffer beta, GpuBuffer run_mean, GpuBuffer run_var, Float eps) -> GpuBuffer
+      def self.batchnorm_backward: (GpuBuffer grad_y, GpuBuffer x, GpuBuffer save_mean, GpuBuffer save_inv_std, GpuBuffer gamma) -> Array[GpuBuffer]
+
+      # Optimizers
+      def self.adam_update: (GpuBuffer w, GpuBuffer m, GpuBuffer v, GpuBuffer grad, Float lr, Float beta1, Float beta2, Float eps, Integer t) -> nil
+      def self.adamw_update: (GpuBuffer w, GpuBuffer m, GpuBuffer v, GpuBuffer grad, Float lr, Float beta1, Float beta2, Float eps, Float wd, Integer t) -> nil
+
+      # Distance / sorting
+      def self.pairwise_l2: (GpuBuffer q, GpuBuffer t) -> GpuBuffer
+      def self.argmin_rows: (GpuBuffer x) -> GpuBuffer
+      def self.argmax_rows: (GpuBuffer x) -> GpuBuffer
+      def self.topk_per_row: (GpuBuffer x, Integer k) -> GpuBuffer
+      def self.partial_argsort: (GpuBuffer data, Integer k) -> GpuBuffer
+
+      # Convolution
+      def self.im2col_1d: (GpuBuffer x, Integer ks) -> GpuBuffer
+      def self.im2col_2d: (GpuBuffer x, Array[Integer] img_dims, Array[Integer] kernel_dims) -> GpuBuffer
+      def self.col2im_1d: (GpuBuffer patches, Integer n, Integer p) -> GpuBuffer
+      def self.col2im_2d: (GpuBuffer patches, Array[Integer] shape, Array[Integer] kernel) -> GpuBuffer
+
+      # Pooling
+      def self.avg_pool_1d: (GpuBuffer x, Integer out_len, Integer n_filters) -> GpuBuffer
+      def self.pool_grad_expand: (GpuBuffer grad, Integer out_len, Integer n_filters) -> GpuBuffer
+      def self.max_pool_1d: (GpuBuffer x, Integer out_len, Integer n_filters) -> Array[GpuBuffer]
+      def self.max_pool_1d_backward: (GpuBuffer grad, GpuBuffer indices, Integer out_len, Integer n_filters) -> GpuBuffer
+      def self.avg_pool_2d: (GpuBuffer x, Array[Integer] shape, Array[Integer] kernel, Array[Integer] stride) -> GpuBuffer
+      def self.avg_pool_2d_backward: (GpuBuffer grad, Array[Integer] shape, Array[Integer] kernel, Array[Integer] stride) -> GpuBuffer
+      def self.max_pool_2d: (GpuBuffer x, Array[Integer] shape, Array[Integer] kernel, Array[Integer] stride) -> Array[GpuBuffer]
+      def self.max_pool_2d_backward: (GpuBuffer grad, GpuBuffer indices, Array[Integer] shape, Array[Integer] kernel, Array[Integer] stride) -> GpuBuffer
+      def self.upsample_nearest_2d: (GpuBuffer x, Array[Integer] shape, Array[Integer] scale) -> GpuBuffer
+
+      # Sequence
+      def self.lstm_cell: (GpuBuffer gates, GpuBuffer c, GpuBuffer h, Integer hs) -> Array[GpuBuffer]
+      def self.gru_cell: (GpuBuffer gates, GpuBuffer h, Integer hs) -> GpuBuffer
+
+      # VAE
+      def self.reparameterize: (GpuBuffer mu, GpuBuffer log_var, GpuBuffer eps) -> GpuBuffer
+      def self.kl_div: (GpuBuffer mu, GpuBuffer log_var) -> GpuBuffer
+      def self.vae_backward_latent: (GpuBuffer grad_z, GpuBuffer mu, GpuBuffer log_var, GpuBuffer eps, Float kl_weight) -> Array[GpuBuffer]
+      def self.log_det_cholesky: (GpuBuffer l) -> Float
+
+      # Clustering
+      def self.centroid_update: (GpuBuffer x, GpuBuffer assignments, Integer dim, Integer k) -> Array[GpuBuffer]
+      def self.gaussian_ll: (GpuBuffer x, GpuBuffer means, GpuBuffer vars, GpuBuffer log_priors, Integer k) -> GpuBuffer
+
+      # Tree / GBM
+      def self.histogram_build: (GpuBuffer bins, GpuBuffer grad, GpuBuffer hess, GpuBuffer mask, Integer n_bins) -> Array[GpuBuffer]
+      def self.split_eval: (GpuBuffer grad_hist, GpuBuffer hess_hist, Float lambda, Float min_child_weight) -> Array[GpuBuffer]
+      def self.data_partition: (GpuBuffer bins, GpuBuffer node_mask, Integer split_feature, Integer split_bin) -> Array[GpuBuffer]
+      def self.tree_build: (GpuBuffer tr_bins, GpuBuffer te_bins, GpuBuffer grad, GpuBuffer hess, Integer n_bins, Integer max_depth, Float lambda, Float min_cw) -> Array[GpuBuffer]
+      def self.grad: (GpuBuffer probs, GpuBuffer targets, GpuBuffer weights, Integer k) -> GpuBuffer
+      def self.hessian: (GpuBuffer probs, GpuBuffer weights, Integer k) -> GpuBuffer
+      def self.add_col: (GpuBuffer matrix, Integer k, GpuBuffer col) -> GpuBuffer
+      def self.mul!: (GpuBuffer a, GpuBuffer b) -> void
+      def self.add_col!: (GpuBuffer matrix, Integer k, GpuBuffer col, Float scale) -> void
+      def self.softmax_into!: (GpuBuffer x, GpuBuffer out) -> void
+      def self.bernoulli_into!: (GpuBuffer out, Float p, Integer seed) -> void
+      def self.grad_hess_into!: (GpuBuffer probs, GpuBuffer targets, GpuBuffer weights, GpuBuffer mask, GpuBuffer grad_out, GpuBuffer hess_out, Integer k) -> void
+      def self.tree_build_into!: (GpuBuffer tr_bins, GpuBuffer te_bins, GpuBuffer g, GpuBuffer h, Integer n_bins, Integer depth, Float lambda, Float mcw, GpuBuffer tr_pred, GpuBuffer te_pred) -> void
+      def self.report: (GpuBuffer logits, Array[Integer] val_targets, Integer round) -> Float
+
+      # DTW
+      def self.dtw: (GpuBuffer cost) -> GpuBuffer
+
+      # Apriori
+      def self.itemset_support: (GpuBuffer trans, GpuBuffer cands) -> GpuBuffer
+      def self.candidate_generate: (GpuBuffer freq) -> Array[untyped]
+end

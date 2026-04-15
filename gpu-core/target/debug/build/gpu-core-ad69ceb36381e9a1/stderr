@@ -1,0 +1,238 @@
+In file included from src/kernels/reduce.hip:3:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/rocprim.hpp:31:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/intrinsics.hpp:30:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/intrinsics/thread.hpp:27:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/intrinsics/../detail/various.hpp:26:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/intrinsics/../detail/../type_traits.hpp:24:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/intrinsics/../detail/../type_traits_functions.hpp:25:
+/home/nate/.rocm-install/rocm/include/rocprim/intrinsics/../detail/../functional.hpp:37:1: warning: GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs temporarily disabled, due to performance issues with printf. [-W#pragma-messages]
+   37 | ROCPRIM_PRAGMA_MESSAGE("GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs "
+      | ^
+/home/nate/.rocm-install/rocm/include/rocprim/config.hpp:331:39: note: expanded from macro 'ROCPRIM_PRAGMA_MESSAGE'
+  331 |     #define ROCPRIM_PRAGMA_MESSAGE(x) _Pragma(ROCPRIM_STRINGIZE(message(x)))
+      |                                       ^
+<scratch space>:502:2: note: expanded from here
+  502 |  message("GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs " "temporarily disabled, due to performance issues with printf.")
+      |  ^
+src/kernels/reduce.hip:38:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   38 |     rocprim::segmented_reduce(nullptr, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   39 |         input_it, out, (unsigned int)cols,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   40 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   41 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   42 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:45:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   45 |     hipMalloc(&tmp, tmp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:46:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   46 |     rocprim::segmented_reduce(tmp, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   47 |         input_it, out, (unsigned int)cols,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   48 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   49 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   50 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:51:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   51 |     hipStreamSynchronize(stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:52:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   52 |     hipFree(tmp);
+      |     ^~~~~~~~~~~~
+src/kernels/reduce.hip:63:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   63 |     rocprim::segmented_reduce(nullptr, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   64 |         x, out, (unsigned int)rows,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   65 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   66 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   67 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:70:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   70 |     hipMalloc(&tmp, tmp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:71:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   71 |     rocprim::segmented_reduce(tmp, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |         x, out, (unsigned int)rows,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   74 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   75 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:76:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   76 |     hipStreamSynchronize(stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:77:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   77 |     hipFree(tmp);
+      |     ^~~~~~~~~~~~
+src/kernels/reduce.hip:82:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   82 |     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+12 warnings generated when compiling for gfx1101.
+src/kernels/reduce.hip:38:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   38 |     rocprim::segmented_reduce(nullptr, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   39 |         input_it, out, (unsigned int)cols,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   40 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   41 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   42 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:45:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   45 |     hipMalloc(&tmp, tmp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:46:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   46 |     rocprim::segmented_reduce(tmp, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   47 |         input_it, out, (unsigned int)cols,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   48 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   49 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   50 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:51:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   51 |     hipStreamSynchronize(stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:52:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   52 |     hipFree(tmp);
+      |     ^~~~~~~~~~~~
+src/kernels/reduce.hip:63:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   63 |     rocprim::segmented_reduce(nullptr, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   64 |         x, out, (unsigned int)rows,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   65 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   66 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   67 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:70:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   70 |     hipMalloc(&tmp, tmp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:71:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   71 |     rocprim::segmented_reduce(tmp, tmp_bytes,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |         x, out, (unsigned int)rows,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   73 |         begin_offsets, end_offsets,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   74 |         rocprim::plus<double>(), 0.0,
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   75 |         stream);
+      |         ~~~~~~~
+src/kernels/reduce.hip:76:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   76 |     hipStreamSynchronize(stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/reduce.hip:77:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   77 |     hipFree(tmp);
+      |     ^~~~~~~~~~~~
+src/kernels/reduce.hip:82:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   82 |     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+11 warnings generated when compiling for host.
+In file included from src/kernels/argsort.hip:2:
+In file included from /home/nate/.rocm-install/rocm/include/hipcub/hipcub.hpp:31:
+In file included from /home/nate/.rocm-install/rocm/include/hipcub/config.hpp:78:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/device/config_types.hpp:33:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/device/../detail/various.hpp:26:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/device/../detail/../type_traits.hpp:24:
+In file included from /home/nate/.rocm-install/rocm/include/rocprim/device/../detail/../type_traits_functions.hpp:25:
+/home/nate/.rocm-install/rocm/include/rocprim/device/../detail/../functional.hpp:37:1: warning: GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs temporarily disabled, due to performance issues with printf. [-W#pragma-messages]
+   37 | ROCPRIM_PRAGMA_MESSAGE("GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs "
+      | ^
+/home/nate/.rocm-install/rocm/include/rocprim/device/../config.hpp:331:39: note: expanded from macro 'ROCPRIM_PRAGMA_MESSAGE'
+  331 |     #define ROCPRIM_PRAGMA_MESSAGE(x) _Pragma(ROCPRIM_STRINGIZE(message(x)))
+      |                                       ^
+<scratch space>:538:2: note: expanded from here
+  538 |  message("GPU printf warnings for invalid rocPRIM warp operations on Navi GPUs " "temporarily disabled, due to performance issues with printf.")
+      |  ^
+src/kernels/argsort.hip:18:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   18 |     hipMalloc(&keys_in,  n * sizeof(double));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:19:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   19 |     hipMalloc(&keys_out, n * sizeof(double));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:20:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   20 |     hipMalloc(&vals_out, n * sizeof(int));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:23:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   23 |     hipMemcpyAsync(keys_in, data, n * sizeof(double), hipMemcpyDeviceToDevice, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:30:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   30 |     hipcub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:33:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   33 |     hipMalloc(&temp, temp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:36:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   36 |     hipcub::DeviceRadixSort::SortPairs(temp, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:39:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   39 |     hipMemcpyAsync(indices, vals_out, k * sizeof(int), hipMemcpyDeviceToDevice, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:41:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   41 |     hipFree(temp);
+      |     ^~~~~~~~~~~~~
+src/kernels/argsort.hip:42:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   42 |     hipFree(keys_in);
+      |     ^~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:43:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   43 |     hipFree(keys_out);
+      |     ^~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:44:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   44 |     hipFree(vals_out);
+      |     ^~~~~~~~~~~~~~~~~
+13 warnings generated when compiling for gfx1101.
+src/kernels/argsort.hip:18:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   18 |     hipMalloc(&keys_in,  n * sizeof(double));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:19:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   19 |     hipMalloc(&keys_out, n * sizeof(double));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:20:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   20 |     hipMalloc(&vals_out, n * sizeof(int));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:23:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   23 |     hipMemcpyAsync(keys_in, data, n * sizeof(double), hipMemcpyDeviceToDevice, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:30:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   30 |     hipcub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:33:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   33 |     hipMalloc(&temp, temp_bytes);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:36:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   36 |     hipcub::DeviceRadixSort::SortPairs(temp, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:39:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   39 |     hipMemcpyAsync(indices, vals_out, k * sizeof(int), hipMemcpyDeviceToDevice, stream);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:41:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   41 |     hipFree(temp);
+      |     ^~~~~~~~~~~~~
+src/kernels/argsort.hip:42:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   42 |     hipFree(keys_in);
+      |     ^~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:43:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   43 |     hipFree(keys_out);
+      |     ^~~~~~~~~~~~~~~~~
+src/kernels/argsort.hip:44:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   44 |     hipFree(vals_out);
+      |     ^~~~~~~~~~~~~~~~~
+12 warnings generated when compiling for host.

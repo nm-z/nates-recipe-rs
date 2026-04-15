@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "nates-gpu-ruby"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+name = "nates_gpu"
+
+[dependencies]
+gpu-core = { path = "../gpu-core" }
+magnus = "0.8"
+rb-sys = "0.9"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+catboost-rs = { path = "../catboost-rs" }
