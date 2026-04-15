@@ -9,7 +9,7 @@ It provides:
 
 ## Architecture
 
-## 1) FFI layer (`src/hip.rs`)
+### 1) FFI layer (`src/hip.rs`)
 
 - Defines `HipError` and `check()` for HIP status-code handling.
 - Exposes core HIP runtime symbols (`hipMalloc`, `hipFree`, `hipMemcpy`, streams/events, sync, mem info).
@@ -18,11 +18,11 @@ It provides:
   - `device_synchronize()`
   - `set_device()`
 
-## 2) Memory layer (`src/memory.rs`)
+### 2) Memory layer (`src/memory.rs`)
 
 Core type: `GpuBuffer`
 
-- Owns or borrows a GPU pointer (`borrow` vs owned allocations).
+- Owns or borrows a GPU pointer (via `GpuBuffer::borrow(...)` vs owned allocations).
 - Allocation paths:
   - `hipMalloc` for normal device allocation
   - `hipMallocManaged` fallback when memory pressure is high
@@ -33,7 +33,7 @@ Core type: `GpuBuffer`
 - Upload/download helpers for `f64`, `f32`, and `u8`.
 - RAII `Drop` frees owned device memory with `hipFree`.
 
-## 3) Compute layer (`src/kernels.rs`)
+### 3) Compute layer (`src/kernels.rs`)
 
 This layer combines:
 
