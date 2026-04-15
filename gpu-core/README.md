@@ -27,9 +27,9 @@ Core type: `GpuBuffer`
   - `hipMalloc` for normal device allocation
   - `hipMallocManaged` fallback when memory pressure is high
 - Includes simple adaptive spill behavior:
-  - direct device allocation is used when `(currently_used_bytes + requested_allocation_bytes)` stays within ~90% of total VRAM
+  - direct device allocation is used when `(currently_used_bytes + requested_allocation_bytes)` stays within the current `memory.rs` threshold (90% of total VRAM)
   - spill mode is enabled when pressure remains high after retry/GC
-  - exits spill mode once usage drops below ~70% of total VRAM
+  - exits spill mode once usage drops below the current `memory.rs` threshold (70% of total VRAM)
 - Optional GC callback hook (`set_gc_hook`) for external memory cleanup before retry.
 - Upload/download helpers for `f64`, `f32`, and `u8`.
 - RAII `Drop` frees owned device memory with `hipFree`.
@@ -75,7 +75,7 @@ It keeps a **thread-local rocBLAS handle** and exposes `gpu_shutdown()` to relea
 - Reductions/stat ops (sum/mean/var/min/max, log-sum-exp, prefix sums)
 - Optimizer updates (`gpu_sgd_update`, `gpu_adam_update`, `gpu_adamw_update`, grad clipping)
   - `gpu_sgd_update` applies gradient descent formula `weights = weights - lr * grad`
-  - BLAS AXPY semantics are `y = alpha * x + y`, so this distinction matters when reusing update utilities
+  - BLAS AXPY semantics are `y = alpha * x + y`; this distinction matters to avoid sign/target-update mistakes when reusing update utilities
 - Distance/nearest-neighbor helpers (`gpu_pairwise_l2`, argsort/top-k/argmin/argmax)
 - Sequence/model primitives (LSTM/GRU cell helpers)
 - Tree/GBM-style kernels (histogram build, split eval, partition, tree build, oblivious-tree helpers)
