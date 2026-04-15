@@ -249,6 +249,10 @@ unsafe extern "C" {
     fn launch_oblivious_split_eval(grad_hist: *const c_void, hess_hist: *const c_void, gain_out: *mut c_void, n_nodes: i32, n_features: i32, n_bins: i32, lambda: f32, min_cw: f32, stream: *mut c_void);
     fn launch_softmax_ce_class_grad_f32(ptrs: *const c_void, targets: *const c_void, grad: *mut c_void, hess: *mut c_void, k: i32, n: i32, nc: i32, stream: *mut c_void);
     fn launch_logloss_grad_f32(pred: *const c_void, target: *const c_void, grad: *mut c_void, hess: *mut c_void, n: i32, stream: *mut c_void);
+    fn launch_softmax_inplace(x: *mut c_void, n_rows: i32, n_classes: i32, stream: *mut c_void);
+    fn launch_logloss_grad_mc(pred: *const c_void, tgt: *const c_void, grad: *mut c_void, hess: *mut c_void, n_rows: i32, n_classes: i32, stream: *mut c_void);
+    fn launch_accuracy(pred: *const c_void, tgt: *const c_void, out: *mut c_void, n_rows: i32, n_classes: i32, stream: *mut c_void);
+    fn launch_scatter_add_by_leaf_col(pred: *mut c_void, leaf_idx: *const c_void, leaf_value: *const c_void, lr: f32, n_rows: i32, n_classes: i32, col: i32, stream: *mut c_void);
 
     // DTW
     fn launch_dtw(cost: *const c_void, dp: *mut c_void, m: i32, n: i32, stream: *mut c_void);
@@ -884,7 +888,7 @@ pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, grad: &GpuBuffer,
 
 pub fn gpu_softmax_ce_class_grad_f32(class_ptrs: &[*mut std::ffi::c_void], targets: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, k: usize, n: usize) {
     let nc = class_ptrs.len();
-    let ptr_buf = GpuBuffer::from_bytes(unsafe { std::slice::from_raw_parts(class_ptrs.as_ptr() as *const u8, nc * std::mem::size_of::<*mut c_void>()) }).expect("ptr upload");
+    let ptr_buf = GpuBuffer::upload_u8(unsafe { std::slice::from_raw_parts(class_ptrs.as_ptr() as *const u8, nc * std::mem::size_of::<*mut c_void>()) }).expect("ptr upload");
     unsafe { launch_softmax_ce_class_grad_f32(ptr_buf.ptr as *const c_void, targets.ptr as *const c_void, grad.ptr as *mut c_void, hess.ptr as *mut c_void, k as i32, n as i32, nc as i32, std::ptr::null_mut()); }
     check_launch();
 }
@@ -951,6 +955,26 @@ pub fn gpu_leaf_finalize(leaf_grad: &GpuBuffer, leaf_hess: &GpuBuffer, leaf_valu
 
 pub fn gpu_oblivious_split_eval(grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, gain_out: &GpuBuffer, n_nodes: usize, n_features: usize, n_bins: usize, lambda: f32, min_cw: f32) {
     unsafe { launch_oblivious_split_eval(grad_hist.ptr as *const c_void, hess_hist.ptr as *const c_void, gain_out.ptr as *mut c_void, n_nodes as i32, n_features as i32, n_bins as i32, lambda, min_cw, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_softmax_inplace(x: &GpuBuffer, n_rows: usize, n_classes: usize) {
+    unsafe { launch_softmax_inplace(x.ptr as *mut c_void, n_rows as i32, n_classes as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_logloss_grad_mc(pred: &GpuBuffer, tgt: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, n_rows: usize, n_classes: usize) {
+    unsafe { launch_logloss_grad_mc(pred.ptr as *const c_void, tgt.ptr as *const c_void, grad.ptr as *mut c_void, hess.ptr as *mut c_void, n_rows as i32, n_classes as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_accuracy(pred: &GpuBuffer, tgt: &GpuBuffer, out: &GpuBuffer, n_rows: usize, n_classes: usize) {
+    unsafe { launch_accuracy(pred.ptr as *const c_void, tgt.ptr as *const c_void, out.ptr as *mut c_void, n_rows as i32, n_classes as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_scatter_add_by_leaf_col(pred: &GpuBuffer, leaf_idx: &GpuBuffer, leaf_value: &GpuBuffer, lr: f32, n_rows: usize, n_classes: usize, col: usize) {
+    unsafe { launch_scatter_add_by_leaf_col(pred.ptr as *mut c_void, leaf_idx.ptr as *const c_void, leaf_value.ptr as *const c_void, lr, n_rows as i32, n_classes as i32, col as i32, std::ptr::null_mut()); }
     check_launch();
 }
 

@@ -377,7 +377,7 @@ fn softmax_ce_class_grad_f32_into(ruby: &Ruby, preds: RArray, target: &RubyGpuBu
       let nc = preds.len();
       let mut ptrs: Vec<*mut std::ffi::c_void> = Vec::with_capacity(nc);
       for i in 0..nc {
-            let buf: &RubyGpuBuffer = preds.entry(i as isize).map_err(|e| hip_err(ruby, gpu_core::hip::HipError::Launch(format!("{}", e))))?;
+            let buf: &RubyGpuBuffer = preds.entry(i as isize).map_err(|e| shape_err(ruby, format!("softmax_ce_class_grad_f32: bad preds[{}]: {}", i, e)))?;
             ptrs.push(buf.buf.ptr_raw());
       }
       kernels::gpu_softmax_ce_class_grad_f32(&ptrs, &target.buf, &grad.buf, &hess.buf, k, n);
@@ -453,6 +453,35 @@ fn oblivious_route_full_into(_ruby: &Ruby, bins_rm: &RubyGpuBuffer, split_feat: 
 
 fn scatter_add_by_leaf(_ruby: &Ruby, pred: &RubyGpuBuffer, leaf_idx: &RubyGpuBuffer, leaf_value: &RubyGpuBuffer, lr: f64) -> Result<(), Error> {
       kernels::gpu_scatter_add_by_leaf(&pred.buf, &leaf_idx.buf, &leaf_value.buf, lr as f32, pred.len());
+      Ok(())
+}
+
+fn softmax_inplace_mc(_ruby: &Ruby, pred: &RubyGpuBuffer, n_classes: usize) -> Result<(), Error> {
+      let n_rows = pred.len() / n_classes;
+      kernels::gpu_softmax_inplace(&pred.buf, n_rows, n_classes);
+      Ok(())
+}
+
+fn logloss_grad_mc_into(_ruby: &Ruby, pred: &RubyGpuBuffer, tgt: &RubyGpuBuffer, grad: &RubyGpuBuffer, hess: &RubyGpuBuffer, n_classes: usize) -> Result<(), Error> {
+      let n_rows = tgt.len();
+      kernels::gpu_logloss_grad_mc(&pred.buf, &tgt.buf, &grad.buf, &hess.buf, n_rows, n_classes);
+      Ok(())
+}
+
+fn gpu_accuracy(_ruby: &Ruby, pred: &RubyGpuBuffer, tgt: &RubyGpuBuffer, n_classes: usize) -> Result<f64, Error> {
+      let n_rows = tgt.len();
+      let out = GpuBuffer::zeros_bytes(4).expect("alloc");
+      kernels::gpu_accuracy(&pred.buf, &tgt.buf, &out, n_rows, n_classes);
+      let mut v = [0f32; 1];
+      gpu_core::hip::check(unsafe {
+            gpu_core::hip::hipMemcpy(v.as_mut_ptr() as *mut std::ffi::c_void, out.ptr_raw(), 4, gpu_core::hip::HIP_MEMCPY_D2H)
+      }).ok();
+      Ok(v[0] as f64 / n_rows as f64)
+}
+
+fn scatter_add_by_leaf_col(_ruby: &Ruby, pred: &RubyGpuBuffer, leaf_idx: &RubyGpuBuffer, leaf_value: &RubyGpuBuffer, lr: f64, n_classes: usize, col: usize) -> Result<(), Error> {
+      let n_rows = leaf_idx.len();
+      kernels::gpu_scatter_add_by_leaf_col(&pred.buf, &leaf_idx.buf, &leaf_value.buf, lr as f32, n_rows, n_classes, col);
       Ok(())
 }
 
@@ -1496,9 +1525,13 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("oblivious_route_step_dev_into!", function!(oblivious_route_step_dev_into, 6))?;
       module.define_module_function("oblivious_route_full_into!", function!(oblivious_route_full_into, 5))?;
       module.define_module_function("scatter_add_by_leaf!", function!(scatter_add_by_leaf, 4))?;
+      module.define_module_function("scatter_add_by_leaf_col!", function!(scatter_add_by_leaf_col, 6))?;
       module.define_module_function("leaf_reduce_into!", function!(leaf_reduce_into, 5))?;
       module.define_module_function("leaf_finalize_into!", function!(leaf_finalize_into, 4))?;
       module.define_module_function("oblivious_split_eval_into!", function!(oblivious_split_eval_into, 6))?;
+      module.define_module_function("softmax_inplace_mc!", function!(softmax_inplace_mc, 2))?;
+      module.define_module_function("logloss_grad_mc_into!", function!(logloss_grad_mc_into, 5))?;
+      module.define_module_function("accuracy", function!(gpu_accuracy, 3))?;
 
       module.define_module_function("softmax_into!", function!(softmax_into, 2))?;
       module.define_module_function("bernoulli_into!", function!(bernoulli_into, 3))?;

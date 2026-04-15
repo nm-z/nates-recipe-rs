@@ -757,22 +757,6 @@ extern "C" void launch_dropout(const double* x, const double* mask, double* out,
     hipLaunchKernelGGL(dropout_kernel, grid, block, 0, stream, x, mask, out, n, p, scale);
 }
 
-// ── Dropout with u8 mask ───────────────────────────────────────────────────
-// Bernoulli u8 mask: mask[i] = (philox_uniform(i, seed) >= p) ? 1 : 0
-extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint32_t seed, double p) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        uint2 r = philox2x32(i, seed);
-        double u = (double)(r.x) / 4294967296.0;
-        mask[i] = u >= p ? (unsigned char)1 : (unsigned char)0;
-    }
-}
-
-extern "C" void launch_bernoulli_u8(unsigned char* mask, int n, uint32_t seed, double p, hipStream_t stream) {
-    dim3 block(256); dim3 grid((n + 255) / 256);
-    hipLaunchKernelGGL(bernoulli_u8_kernel, grid, block, 0, stream, mask, n, seed, p);
-}
-
 // Dropout using u8 mask: out[i] = mask[i] ? x[i] * scale : 0.0
 extern "C" __global__ void dropout_u8_kernel(const double* x, const unsigned char* mask, double* out, int n, double scale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1982,6 +1966,20 @@ extern "C" void launch_rand_uniform(double* out, int n, uint32_t seed, hipStream
     hipLaunchKernelGGL(rand_uniform_kernel, grid, block, 0, stream, out, n, seed);
 }
 
+extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint32_t seed, double p) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        uint2 r = philox2x32(i, seed);
+        double u = (double)(r.x) / 4294967296.0;
+        mask[i] = u >= p ? (unsigned char)1 : (unsigned char)0;
+    }
+}
+
+extern "C" void launch_bernoulli_u8(unsigned char* mask, int n, uint32_t seed, double p, hipStream_t stream) {
+    dim3 block(256); dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(bernoulli_u8_kernel, grid, block, 0, stream, mask, n, seed, p);
+}
+
 extern "C" __global__ void randn_kernel(double* out, int n, uint32_t seed) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -2005,4 +2003,93 @@ extern "C" __global__ void bernoulli_kernel(double* out, int n, double p, uint32
 extern "C" void launch_bernoulli(double* out, int n, double p, uint32_t seed, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(bernoulli_kernel, grid, block, 0, stream, out, n, p, seed);
+}
+
+// In-place row-wise softmax over (n_rows × n_classes) f32 matrix
+extern "C" __global__ void softmax_inplace_kernel(float* x, int n_rows, int n_classes) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    float* rp = x + row * n_classes;
+    float mx = rp[0];
+    for (int c = 1; c < n_classes; c++) if (rp[c] > mx) mx = rp[c];
+    float s = 0.0f;
+    for (int c = 0; c < n_classes; c++) { rp[c] = expf(rp[c] - mx); s += rp[c]; }
+    for (int c = 0; c < n_classes; c++) rp[c] /= s;
+}
+
+extern "C" void launch_softmax_inplace(float* x, int n_rows, int n_classes, hipStream_t stream) {
+    dim3 block(256);
+    dim3 grid((n_rows + 255) / 256);
+    hipLaunchKernelGGL(softmax_inplace_kernel, grid, block, 0, stream, x, n_rows, n_classes);
+}
+
+// Cross-entropy gradient for contiguous (n_rows × n_classes) pred (post-softmax)
+// grad[row * n_classes + c] = pred[row * n_classes + c] - (tgt[row] == c)
+// hess[row * n_classes + c] = pred[row * n_classes + c] * (1 - pred[row * n_classes + c])
+extern "C" __global__ void logloss_grad_mc_kernel(
+    const float* pred, const float* tgt, float* grad, float* hess,
+    int n_rows, int n_classes
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    int label = (int)tgt[row];
+    for (int c = 0; c < n_classes; c++) {
+        float p = pred[row * n_classes + c];
+        grad[row * n_classes + c] = p - (label == c ? 1.0f : 0.0f);
+        hess[row * n_classes + c] = fmaxf(p * (1.0f - p), 1e-6f);
+    }
+}
+
+extern "C" void launch_logloss_grad_mc(
+    const float* pred, const float* tgt, float* grad, float* hess,
+    int n_rows, int n_classes, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n_rows + 255) / 256);
+    hipLaunchKernelGGL(logloss_grad_mc_kernel, grid, block, 0, stream,
+        pred, tgt, grad, hess, n_rows, n_classes);
+}
+
+// Accuracy: argmax over (n_rows × n_classes) pred vs int tgt, atomicAdd to out[0]
+extern "C" __global__ void accuracy_kernel(
+    const float* pred, const float* tgt, float* out,
+    int n_rows, int n_classes
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const float* rp = pred + row * n_classes;
+    int best = 0;
+    for (int c = 1; c < n_classes; c++) if (rp[c] > rp[best]) best = c;
+    if (best == (int)tgt[row]) atomicAdd(out, 1.0f);
+}
+
+extern "C" void launch_accuracy(
+    const float* pred, const float* tgt, float* out,
+    int n_rows, int n_classes, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n_rows + 255) / 256);
+    hipLaunchKernelGGL(accuracy_kernel, grid, block, 0, stream,
+        pred, tgt, out, n_rows, n_classes);
+}
+
+// scatter_add_by_leaf for one class column in (n_rows × n_classes) pred matrix
+// pred[row * n_classes + col] += lr * leaf_value[leaf_idx[row]]
+extern "C" __global__ void scatter_add_by_leaf_col_kernel(
+    float* pred, const unsigned char* leaf_idx, const float* leaf_value,
+    float lr, int n_rows, int n_classes, int col
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    pred[row * n_classes + col] += lr * leaf_value[leaf_idx[row]];
+}
+
+extern "C" void launch_scatter_add_by_leaf_col(
+    float* pred, const unsigned char* leaf_idx, const float* leaf_value,
+    float lr, int n_rows, int n_classes, int col, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n_rows + 255) / 256);
+    hipLaunchKernelGGL(scatter_add_by_leaf_col_kernel, grid, block, 0, stream,
+        pred, leaf_idx, leaf_value, lr, n_rows, n_classes, col);
 }
