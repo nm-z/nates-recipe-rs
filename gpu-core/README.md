@@ -29,7 +29,6 @@ Core type: `GpuBuffer`
 - Includes simple adaptive spill behavior:
   - direct device alloc path is used while projected usage stays within ~90% of total VRAM
   - spill mode is enabled when pressure remains high after retry/GC
-  - enters spill mode when usage is high
   - exits spill mode once usage drops below ~70% of total VRAM
 - Optional GC callback hook (`set_gc_hook`) for external memory cleanup before retry.
 - Upload/download helpers for `f64`, `f32`, and `u8`.
@@ -75,7 +74,7 @@ It keeps a **thread-local rocBLAS handle** and exposes `gpu_shutdown()` to relea
 - Tensor/data transforms (transpose, concat, slicing, im2col/col2im, pooling, broadcast ops)
 - Reductions/stat ops (sum/mean/var/min/max, log-sum-exp, prefix sums)
 - Optimizer updates (`gpu_sgd_update`, `gpu_adam_update`, `gpu_adamw_update`, grad clipping)
-  - `gpu_sgd_update` applies gradient descent form `weights = weights - lr * grad` (not BLAS AXPY semantics)
+  - `gpu_sgd_update` applies gradient descent formula `weights = weights - lr * grad` (not BLAS AXPY semantics)
 - Distance/nearest-neighbor helpers (`gpu_pairwise_l2`, argsort/top-k/argmin/argmax)
 - Sequence/model primitives (LSTM/GRU cell helpers)
 - Tree/GBM-style kernels (histogram build, split eval, partition, tree build, oblivious-tree helpers)
