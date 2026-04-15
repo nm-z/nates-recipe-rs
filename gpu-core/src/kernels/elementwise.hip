@@ -377,6 +377,57 @@ extern "C" void launch_mse_grad(const float* pred, const float* target, float* g
     hipLaunchKernelGGL(mse_grad_kernel, grid, block, 0, stream, pred, target, grad, n);
 }
 
+// Softmax CE gradient for multi-class boosting with separate per-class f32 buffers.
+// ptrs: device array of float* pointers, one per class (each [n])
+// targets: [n] f32 (class labels, cast to int)
+// grad: [n] f32 out — gradient for class k
+// hess: [n] f32 out — hessian for class k
+extern "C" __global__ void softmax_ce_class_grad_f32_kernel(
+    const float** ptrs, const float* targets, float* grad, float* hess,
+    int k, int n, int nc
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float mx = -1e30f;
+    for (int c = 0; c < nc; c++) { float v = ptrs[c][i]; if (v > mx) mx = v; }
+    float sum = 0.0f;
+    for (int c = 0; c < nc; c++) sum += expf(ptrs[c][i] - mx);
+    float pk = expf(ptrs[k][i] - mx) / sum;
+    grad[i] = pk - (targets[i] == (float)k ? 1.0f : 0.0f);
+    hess[i] = fmaxf(pk * (1.0f - pk), 1e-6f);
+}
+
+extern "C" void launch_softmax_ce_class_grad_f32(
+    const float** ptrs, const float* targets, float* grad, float* hess,
+    int k, int n, int nc, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(softmax_ce_class_grad_f32_kernel, grid, block, 0, stream,
+        ptrs, targets, grad, hess, k, n, nc);
+}
+
+// Logloss (binary CE) gradient for f32 boosting: grad = sigmoid(pred) - target
+extern "C" __global__ void logloss_grad_f32_kernel(
+    const float* pred, const float* target, float* grad, float* hess, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float p = 1.0f / (1.0f + expf(-pred[i]));
+    grad[i] = p - target[i];
+    hess[i] = fmaxf(p * (1.0f - p), 1e-6f);
+}
+
+extern "C" void launch_logloss_grad_f32(
+    const float* pred, const float* target, float* grad, float* hess,
+    int n, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(logloss_grad_f32_kernel, grid, block, 0, stream,
+        pred, target, grad, hess, n);
+}
+
 // Argmax over flat f32 buffer, writes best index to out[0] as int
 extern "C" __global__ void argmax_f32_kernel(const float* data, int* out, int n) {
     __shared__ float s_val[256];
@@ -704,6 +755,33 @@ extern "C" __global__ void dropout_kernel(const double* x, const double* mask, d
 extern "C" void launch_dropout(const double* x, const double* mask, double* out, int n, double p, double scale, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(dropout_kernel, grid, block, 0, stream, x, mask, out, n, p, scale);
+}
+
+// ── Dropout with u8 mask ───────────────────────────────────────────────────
+// Bernoulli u8 mask: mask[i] = (philox_uniform(i, seed) >= p) ? 1 : 0
+extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint32_t seed, double p) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        uint2 r = philox2x32(i, seed);
+        double u = (double)(r.x) / 4294967296.0;
+        mask[i] = u >= p ? (unsigned char)1 : (unsigned char)0;
+    }
+}
+
+extern "C" void launch_bernoulli_u8(unsigned char* mask, int n, uint32_t seed, double p, hipStream_t stream) {
+    dim3 block(256); dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(bernoulli_u8_kernel, grid, block, 0, stream, mask, n, seed, p);
+}
+
+// Dropout using u8 mask: out[i] = mask[i] ? x[i] * scale : 0.0
+extern "C" __global__ void dropout_u8_kernel(const double* x, const unsigned char* mask, double* out, int n, double scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = mask[i] ? x[i] * scale : 0.0;
+}
+
+extern "C" void launch_dropout_u8(const double* x, const unsigned char* mask, double* out, int n, double scale, hipStream_t stream) {
+    dim3 block(256); dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(dropout_u8_kernel, grid, block, 0, stream, x, mask, out, n, scale);
 }
 
 // ── Concat ──────────────────────────────────────────────────────────────────

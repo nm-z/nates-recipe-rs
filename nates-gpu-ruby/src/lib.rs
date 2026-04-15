@@ -333,6 +333,18 @@ fn dropout_into(ruby: &Ruby, x: &RubyGpuBuffer, mask: &RubyGpuBuffer, p: f64, ou
       Ok(())
 }
 
+fn dropout_u8_into(ruby: &Ruby, x: &RubyGpuBuffer, mask: &RubyGpuBuffer, p: f64, out: &RubyGpuBuffer) -> Result<(), Error> {
+      let n = x.len();
+      if out.len() != n { return Err(shape_err(ruby, format!("dropout_u8_into!: shape mismatch x={} out={}", n, out.len()))); }
+      kernels::gpu_dropout_u8_into(&x.buf, &mask.buf, &out.buf, n, p);
+      Ok(())
+}
+
+fn bernoulli_u8_into(_ruby: &Ruby, mask: &RubyGpuBuffer, seed: u32, p: f64) -> Result<(), Error> {
+      kernels::gpu_bernoulli_u8(&mask.buf, mask.len(), seed, p);
+      Ok(())
+}
+
 fn rand_uniform_into(_ruby: &Ruby, out: &RubyGpuBuffer, seed: u32) -> Result<(), Error> {
       kernels::gpu_rand_uniform_into(&out.buf, out.len(), seed);
       Ok(())
@@ -358,6 +370,22 @@ fn layernorm_backward_into(ruby: &Ruby, grad: &RubyGpuBuffer, x: &RubyGpuBuffer,
 
 fn mse_grad_into(_ruby: &Ruby, pred: &RubyGpuBuffer, target: &RubyGpuBuffer, grad: &RubyGpuBuffer) -> Result<(), Error> {
       kernels::gpu_mse_grad_into(&pred.buf, &target.buf, &grad.buf, pred.len());
+      Ok(())
+}
+
+fn softmax_ce_class_grad_f32_into(ruby: &Ruby, preds: RArray, target: &RubyGpuBuffer, grad: &RubyGpuBuffer, hess: &RubyGpuBuffer, k: usize, n: usize) -> Result<(), Error> {
+      let nc = preds.len();
+      let mut ptrs: Vec<*mut std::ffi::c_void> = Vec::with_capacity(nc);
+      for i in 0..nc {
+            let buf: &RubyGpuBuffer = preds.entry(i as isize).map_err(|e| hip_err(ruby, gpu_core::hip::HipError::Launch(format!("{}", e))))?;
+            ptrs.push(buf.buf.ptr_raw());
+      }
+      kernels::gpu_softmax_ce_class_grad_f32(&ptrs, &target.buf, &grad.buf, &hess.buf, k, n);
+      Ok(())
+}
+
+fn logloss_grad_f32_into(_ruby: &Ruby, pred: &RubyGpuBuffer, target: &RubyGpuBuffer, grad: &RubyGpuBuffer, hess: &RubyGpuBuffer) -> Result<(), Error> {
+      kernels::gpu_logloss_grad_f32(&pred.buf, &target.buf, &grad.buf, &hess.buf, pred.len());
       Ok(())
 }
 
@@ -1453,6 +1481,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("add_col!", function!(add_col_scaled_inplace, 4))?;
       // Oblivious tree helpers
       module.define_module_function("mse_grad_into!", function!(mse_grad_into, 3))?;
+      module.define_module_function("softmax_ce_class_grad_f32!", function!(softmax_ce_class_grad_f32_into, 6))?;
+      module.define_module_function("logloss_grad_f32!", function!(logloss_grad_f32_into, 4))?;
       module.define_module_function("argmax_f32_into!", function!(argmax_f32_into, 2))?;
       module.define_module_function("fill_f32!", function!(fill_f32_val, 2))?;
       module.define_module_function("write_split_into!", function!(write_split_into, 5))?;
@@ -1479,6 +1509,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("gelu_into!", function!(gelu_into, 2))?;
       module.define_module_function("gelu_backward_into!", function!(gelu_backward_into, 3))?;
       module.define_module_function("dropout_into!", function!(dropout_into, 4))?;
+      module.define_module_function("dropout_u8_into!", function!(dropout_u8_into, 4))?;
+      module.define_module_function("bernoulli_u8_into!", function!(bernoulli_u8_into, 3))?;
       module.define_module_function("rand_uniform_into!", function!(rand_uniform_into, 2))?;
       module.define_module_function("linear_backward_into!", function!(linear_backward_into, 4))?;
       module.define_module_function("layernorm_backward_into!", function!(layernorm_backward_into, 5))?;

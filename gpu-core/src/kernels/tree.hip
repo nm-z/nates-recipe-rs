@@ -582,8 +582,7 @@ extern "C" void launch_leaf_finalize(
 }
 
 // ── kernel 6: oblivious split evaluation ──────────────────────────────────
-// One block per feature. For each bin, prefix-sum through histogram and
-// compute total gain across all nodes.
+// One block per feature. Shared-memory prefix sums over histogram bins.
 // gain_out[feat * n_bins + bin] = sum over nodes of split gain at that bin.
 extern "C" __global__
 void oblivious_split_eval_kernel(
@@ -599,21 +598,49 @@ void oblivious_split_eval_kernel(
     int feat = blockIdx.x;
     if (feat >= n_features) return;
 
-    for (int bin = threadIdx.x; bin < n_bins; bin += blockDim.x) {
-        float total_gain = 0.0f;
-        for (int node = 0; node < n_nodes; node++) {
-            int base = ((node * n_features) + feat) * n_bins;
-            float tg = 0.0f, th = 0.0f;
-            for (int b = 0; b < n_bins; b++) { tg += grad_hist[base + b]; th += hess_hist[base + b]; }
-            if (th < 1e-10f) continue;
-            float ps = tg * tg / (th + lambda);
-            float lg = 0.0f, lh = 0.0f;
-            for (int b = 0; b <= bin; b++) { lg += grad_hist[base + b]; lh += hess_hist[base + b]; }
-            float rg = tg - lg, rh = th - lh;
-            if (lh < min_cw || rh < min_cw) continue;
-            total_gain += lg * lg / (lh + lambda) + rg * rg / (rh + lambda) - ps;
+    __shared__ float s_pg[256];
+    __shared__ float s_ph[256];
+
+    for (int bin = threadIdx.x; bin < n_bins; bin += blockDim.x)
+        gain_out[feat * n_bins + bin] = 0.0f;
+    __syncthreads();
+
+    for (int node = 0; node < n_nodes; node++) {
+        int base = ((node * n_features) + feat) * n_bins;
+
+        // Load into shared mem and compute prefix sums
+        float g_val = (threadIdx.x < n_bins) ? grad_hist[base + threadIdx.x] : 0.0f;
+        float h_val = (threadIdx.x < n_bins) ? hess_hist[base + threadIdx.x] : 0.0f;
+
+        // Inclusive prefix sum via shared memory
+        s_pg[threadIdx.x] = g_val;
+        s_ph[threadIdx.x] = h_val;
+        __syncthreads();
+
+        for (int stride = 1; stride < n_bins; stride <<= 1) {
+            float pg = (threadIdx.x >= stride) ? s_pg[threadIdx.x - stride] : 0.0f;
+            float ph = (threadIdx.x >= stride) ? s_ph[threadIdx.x - stride] : 0.0f;
+            __syncthreads();
+            s_pg[threadIdx.x] += pg;
+            s_ph[threadIdx.x] += ph;
+            __syncthreads();
         }
-        gain_out[feat * n_bins + bin] = total_gain;
+
+        float tg = s_pg[n_bins - 1];
+        float th = s_ph[n_bins - 1];
+        if (th < 1e-10f) { __syncthreads(); continue; }
+        float ps = tg * tg / (th + lambda);
+
+        if (threadIdx.x < n_bins - 1) {
+            float lg = s_pg[threadIdx.x];
+            float lh = s_ph[threadIdx.x];
+            float rg = tg - lg, rh = th - lh;
+            if (lh >= min_cw && rh >= min_cw) {
+                float gain = lg * lg / (lh + lambda) + rg * rg / (rh + lambda) - ps;
+                gain_out[feat * n_bins + threadIdx.x] += gain;
+            }
+        }
+        __syncthreads();
     }
 }
 

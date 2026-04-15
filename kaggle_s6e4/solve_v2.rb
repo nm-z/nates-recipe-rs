@@ -313,7 +313,7 @@ end
 def nn_bwd_into(g, b, sc, dst, src)
       sk = g
       linear_backward_full_into!(g, sc[:a2], b[:w2].w, dst, sc[:gw2], sc[:gb2])
-      dropout_into!(dst, sc[:mk], b[:drop], dst)
+      dropout_u8_into!(dst, sc[:mk], b[:drop], dst)
       gelu_backward_into!(dst, sc[:ln2], src); g = src
       layernorm_backward_full_into!(g, sc[:h1], b[:g2].w, LN_EPS, dst, sc[:gg2], sc[:gn2])
       linear_backward_full_into!(dst, sc[:a1], b[:w1].w, src, sc[:gw1], sc[:gb1])

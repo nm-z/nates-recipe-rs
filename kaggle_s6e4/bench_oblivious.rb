@@ -12,9 +12,24 @@ x = rows.map { |r| r[0...nf] }.flatten
 y = rows.map { |r| r[-1] }
 $stderr.puts "Abalone: n=#{n} features=#{nf}"
 
-# Train/test split — exact sklearn train_test_split(test_size=0.2, random_state=0)
-tr_idx = File.readlines("/tmp/abalone_train_idx.txt").map { |l| l.strip.to_i }
-te_idx = File.readlines("/tmp/abalone_test_idx.txt").map { |l| l.strip.to_i }
+# Deterministic train/test split: sklearn-compatible when index files exist,
+# otherwise seeded Fisher-Yates (test_size=0.2, seed=0).
+def deterministic_split(n, test_size, seed)
+      rng = Random.new(seed)
+      idx = (0...n).to_a
+      (n - 1).downto(1) { |i| j = rng.rand(i + 1); idx[i], idx[j] = idx[j], idx[i] }
+      n_te = (n * test_size).round
+      [idx[n_te..], idx[0...n_te]]
+end
+
+tr_idx_file = "/tmp/abalone_train_idx.txt"
+te_idx_file = "/tmp/abalone_test_idx.txt"
+if File.exist?(tr_idx_file) && File.exist?(te_idx_file)
+      tr_idx = File.readlines(tr_idx_file).map { |l| l.strip.to_i }
+      te_idx = File.readlines(te_idx_file).map { |l| l.strip.to_i }
+else
+      tr_idx, te_idx = deterministic_split(n, 0.2, 0)
+end
 n_tr = tr_idx.size; n_te = te_idx.size
 
 x_tr = tr_idx.flat_map { |i| x[i * nf, nf] }

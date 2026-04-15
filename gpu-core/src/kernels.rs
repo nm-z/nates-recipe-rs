@@ -135,6 +135,8 @@ unsafe extern "C" {
     fn launch_leaky_relu_backward(grad: *const c_void, act: *const c_void, out: *mut c_void, n: i32, alpha: f64, stream: *mut c_void);
     fn launch_layernorm(x: *const c_void, out: *mut c_void, gamma: *const c_void, beta: *const c_void, rows: i32, cols: i32, eps: f64, stream: *mut c_void);
     fn launch_dropout(x: *const c_void, mask: *const c_void, out: *mut c_void, n: i32, p: f64, scale: f64, stream: *mut c_void);
+    fn launch_bernoulli_u8(mask: *mut c_void, n: i32, seed: u32, p: f64, stream: *mut c_void);
+    fn launch_dropout_u8(x: *const c_void, mask: *const c_void, out: *mut c_void, n: i32, scale: f64, stream: *mut c_void);
     fn launch_concat(a: *const c_void, b: *const c_void, out: *mut c_void, rows: i32, d1: i32, d2: i32, stream: *mut c_void);
     fn launch_im2col_2d(x: *const c_void, patches: *mut c_void, n: i32, c: i32, h: i32, w: i32, kh: i32, kw: i32, out_h: i32, out_w: i32, stream: *mut c_void);
     fn launch_exp(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
@@ -245,6 +247,8 @@ unsafe extern "C" {
     fn launch_leaf_reduce(leaf_idx: *const c_void, grad: *const c_void, hess: *const c_void, leaf_grad: *mut c_void, leaf_hess: *mut c_void, n_rows: i32, stream: *mut c_void);
     fn launch_leaf_finalize(leaf_grad: *const c_void, leaf_hess: *const c_void, leaf_value: *mut c_void, lambda: f32, n_leaves: i32, stream: *mut c_void);
     fn launch_oblivious_split_eval(grad_hist: *const c_void, hess_hist: *const c_void, gain_out: *mut c_void, n_nodes: i32, n_features: i32, n_bins: i32, lambda: f32, min_cw: f32, stream: *mut c_void);
+    fn launch_softmax_ce_class_grad_f32(ptrs: *const c_void, targets: *const c_void, grad: *mut c_void, hess: *mut c_void, k: i32, n: i32, nc: i32, stream: *mut c_void);
+    fn launch_logloss_grad_f32(pred: *const c_void, target: *const c_void, grad: *mut c_void, hess: *mut c_void, n: i32, stream: *mut c_void);
 
     // DTW
     fn launch_dtw(cost: *const c_void, dp: *mut c_void, m: i32, n: i32, stream: *mut c_void);
@@ -878,6 +882,18 @@ pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, grad: &GpuBuffer,
     check_launch();
 }
 
+pub fn gpu_softmax_ce_class_grad_f32(class_ptrs: &[*mut std::ffi::c_void], targets: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, k: usize, n: usize) {
+    let nc = class_ptrs.len();
+    let ptr_buf = GpuBuffer::from_bytes(unsafe { std::slice::from_raw_parts(class_ptrs.as_ptr() as *const u8, nc * std::mem::size_of::<*mut c_void>()) }).expect("ptr upload");
+    unsafe { launch_softmax_ce_class_grad_f32(ptr_buf.ptr as *const c_void, targets.ptr as *const c_void, grad.ptr as *mut c_void, hess.ptr as *mut c_void, k as i32, n as i32, nc as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_logloss_grad_f32(pred: &GpuBuffer, target: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, n: usize) {
+    unsafe { launch_logloss_grad_f32(pred.ptr as *const c_void, target.ptr as *const c_void, grad.ptr as *mut c_void, hess.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
 pub fn gpu_argmax_f32(data: &GpuBuffer, out: &GpuBuffer, n: usize) {
     unsafe { launch_argmax_f32(data.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
     check_launch();
@@ -1136,6 +1152,17 @@ pub fn gpu_dropout(x: &GpuBuffer, mask: &GpuBuffer, n: usize, p: f64) -> Result<
     let scale = if p < 1.0 { 1.0 / (1.0 - p) } else { 0.0 };
     unsafe { launch_dropout(x.ptr as *const c_void, mask.ptr as *const c_void, out.ptr, n as i32, p, scale, std::ptr::null_mut()); }
     Ok(out)
+}
+
+pub fn gpu_bernoulli_u8(mask: &GpuBuffer, n: usize, seed: u32, p: f64) {
+    unsafe { launch_bernoulli_u8(mask.ptr as *mut c_void, n as i32, seed, p, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_dropout_u8_into(x: &GpuBuffer, mask: &GpuBuffer, out: &GpuBuffer, n: usize, p: f64) {
+    let scale = if p < 1.0 { 1.0 / (1.0 - p) } else { 0.0 };
+    unsafe { launch_dropout_u8(x.ptr as *const c_void, mask.ptr as *const c_void, out.ptr as *mut c_void, n as i32, scale, std::ptr::null_mut()); }
+    check_launch();
 }
 
 /// Concatenate (rows, d1) and (rows, d2) into (rows, d1+d2).
