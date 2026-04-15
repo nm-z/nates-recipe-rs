@@ -3,6 +3,7 @@ $LOAD_PATH.unshift File.expand_path("../nates-gpu-ruby/target/release", __dir__)
 require "nates_gpu"
 require "json"
 require "digest"
+require_relative "lib/split"
 $stdout.sync = true; $stderr.sync = true
 $stdout.reopen($stderr)
 require "xgb"
