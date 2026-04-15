@@ -1051,6 +1051,10 @@ pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuf
     Ok(out)
 }
 
+pub fn gpu_argmax_rows_into(x: &GpuBuffer, out: &GpuBuffer, rows: usize, cols: usize) {
+    unsafe { launch_argmax_rows(x.ptr as *const c_void, out.ptr as *mut c_void, rows as i32, cols as i32, std::ptr::null_mut()); }
+}
+
 pub fn gpu_reduce_sum_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(cols)?;
     unsafe { launch_reduce_sum_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
@@ -1626,6 +1630,23 @@ pub fn gpu_report(logits: &GpuBuffer, val_targets: &[i32], n: usize, nc: usize, 
       let preds = gpu_argmax_rows(logits, n, nc)?;
       let mut preds_cpu = vec![0.0f64; n];
       preds.download(&mut preds_cpu)?;
+      let mut correct = vec![0.0f64; nc];
+      let mut total = vec![0.0f64; nc];
+      for i in 0..n {
+            let c = val_targets[i] as usize;
+            total[c] += 1.0;
+            if preds_cpu[i] as usize == c { correct[c] += 1.0; }
+      }
+      let ba: f64 = (0..nc).map(|k| if total[k] > 0.0 { correct[k] / total[k] } else { 0.0 }).sum::<f64>() / nc as f64;
+      eprintln!("      r={:4}  val={:.4}", round + 1, ba);
+      Ok(ba)
+}
+
+/// Like gpu_report but uses a pre-allocated scratch buffer for argmax results.
+pub fn gpu_report_into(logits: &GpuBuffer, scratch: &GpuBuffer, val_targets: &[i32], n: usize, nc: usize, round: usize) -> Result<f64, HipError> {
+      gpu_argmax_rows_into(logits, scratch, n, nc);
+      let mut preds_cpu = vec![0.0f64; n];
+      scratch.download(&mut preds_cpu)?;
       let mut correct = vec![0.0f64; nc];
       let mut total = vec![0.0f64; nc];
       for i in 0..n {

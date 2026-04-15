@@ -174,6 +174,7 @@ def train_gbm(g_tr, g_te, g_tgt, g_sw, cfg, label, val_tgt, max_rounds: nil)
       g = zeros(ntr, 1); h = zeros(ntr, 1); m = zeros(ntr, 1)
       tr_p = zeros(ntr, 1); te_p = zeros(nte, 1)
       best_ba = 0; stale = 0; best_r = 0; best_tl = nil
+      gbm_report_scratch = val_tgt ? zeros(nte, 1) : nil
       t0 = Time.now
 
       prev_tr_ptr = nil; prev_te_ptr = nil
@@ -209,7 +210,7 @@ def train_gbm(g_tr, g_te, g_tgt, g_sw, cfg, label, val_tgt, max_rounds: nil)
             rss1 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
             round_ms = (Time.now - t_r) * 1000
             if val_tgt
-                  ba = report(tl, val_tgt, r)
+                  ba = report_into(tl, gbm_report_scratch, val_tgt, r)
                   if round_allocs > 0 || v1 - v0 != 0
                         $stderr.puts "      r=%d total %.0fms  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [r, round_ms, v0, v1, v1 - v0, rss0, rss1, round_allocs]
                   end
@@ -354,6 +355,7 @@ def train_nn(raw_tr, raw_val, n_tr, n_val, nf_raw, tgt_cpu, val_tgt, fold_cw, cf
       ghw_buf = zeros(h, NC); ghb_buf = zeros(1, NC)
       gpw_buf = zeros(ns, h); gpb_buf = zeros(1, h)
       clip_tmp = zeros(1, 1)
+      report_scratch = val_tgt ? zeros(n_val, 1) : nil
       ev = val_tgt ? nn_alloc_eval(n_val, h, NC, nb) : nil
 
       epochs = max_epochs || cfg[:epochs]
@@ -363,21 +365,65 @@ def train_nn(raw_tr, raw_val, n_tr, n_val, nf_raw, tgt_cpu, val_tgt, fold_cw, cf
             rss0 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
             t_ep = Time.now
 
+            # ── Per-operation alloc tracking ───────────────────────────
+            op_allocs = {} if ep == 0
+
+            alloc_count_reset
             linear_into!(g_tr, pW.w, pB.w, sc[:chain][0])
-            blks.each_with_index { |b, i| nn_fwd_into(sc[:chain][i], b, n_tr, h, cfg[:seed] * 10000 + ep * 100 + i, sc[:blks][i], sc[:chain][i+1]) }
+            a = alloc_count_reset; op_allocs["proj_in"] = a if ep == 0
+
+            blks.each_with_index do |b, i|
+                  alloc_count_reset
+                  nn_fwd_into(sc[:chain][i], b, n_tr, h, cfg[:seed] * 10000 + ep * 100 + i, sc[:blks][i], sc[:chain][i+1])
+                  a = alloc_count_reset; op_allocs["fwd_blk#{i}"] = a if ep == 0
+            end
+
             hpre = sc[:chain][nb]
+            alloc_count_reset
             linear_into!(hpre, hW.w, hB.w, logits_buf)
+            a = alloc_count_reset; op_allocs["head_fwd"] = a if ep == 0
 
+            alloc_count_reset
             softmax_ce_grad_into!(logits_buf, g_tgt, g_sw, sc[:ce_grad], 1.0 / n_tr)
+            a = alloc_count_reset; op_allocs["ce_grad"] = a if ep == 0
 
+            alloc_count_reset
             linear_backward_full_into!(sc[:ce_grad], hpre, hW.w, sc[:gr_a], ghw_buf, ghb_buf)
-            gr = sc[:gr_a]
-            bg = []; (nb-1).downto(0) { |i| gr, bgs = nn_bwd_into(gr, blks[i], sc[:blks][i], sc[:gr_b], sc[:gr_a]); bg.unshift(bgs) }
-            linear_backward_weights_only_into!(gr, g_tr, gpw_buf, gpb_buf)
+            a = alloc_count_reset; op_allocs["head_bwd"] = a if ep == 0
 
-            nn_up(pW, gpw_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp); nn_up(pB, gpb_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
-            nn_up(hW, ghw_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp); nn_up(hB, ghb_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
-            blks.each_with_index { |b, i| BK.each { |k| nn_up(b[k], bg[i][k], cfg[:lr], cfg[:wd], ep+1, clip_tmp) } }
+            gr = sc[:gr_a]
+            bg = []
+            (nb-1).downto(0) do |i|
+                  alloc_count_reset
+                  gr, bgs = nn_bwd_into(gr, blks[i], sc[:blks][i], sc[:gr_b], sc[:gr_a])
+                  bg.unshift(bgs)
+                  a = alloc_count_reset; op_allocs["bwd_blk#{i}"] = a if ep == 0
+            end
+
+            alloc_count_reset
+            linear_backward_weights_only_into!(gr, g_tr, gpw_buf, gpb_buf)
+            a = alloc_count_reset; op_allocs["proj_bwd"] = a if ep == 0
+
+            alloc_count_reset
+            nn_up(pW, gpw_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
+            nn_up(pB, gpb_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
+            nn_up(hW, ghw_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
+            nn_up(hB, ghb_buf, cfg[:lr], cfg[:wd], ep+1, clip_tmp)
+            a = alloc_count_reset; op_allocs["up_main"] = a if ep == 0
+
+            blks.each_with_index do |b, i|
+                  alloc_count_reset
+                  BK.each { |k| nn_up(b[k], bg[i][k], cfg[:lr], cfg[:wd], ep+1, clip_tmp) }
+                  a = alloc_count_reset; op_allocs["up_blk#{i}"] = a if ep == 0
+            end
+
+            if ep == 0
+                  total_a = op_allocs.values.sum
+                  if total_a > 0
+                        $stderr.puts "      ── ep0 alloc breakdown (total=#{total_a}) ──"
+                        op_allocs.each { |k, v| $stderr.puts "        %-16s %d" % [k, v] if v > 0 }
+                  end
+            end
 
             ep_allocs = alloc_count_reset
             vf1, vt1 = gpu_stats; v1 = vt1 - vf1
@@ -385,10 +431,12 @@ def train_nn(raw_tr, raw_val, n_tr, n_val, nf_raw, tgt_cpu, val_tgt, fold_cw, cf
             ep_ms = (Time.now - t_ep) * 1000
 
             if val_tgt
+                  alloc_count_reset
                   vl = nn_predict_into(g_val, pW, pB, hW, hB, blks, n_val, h, ev)
-                  ba = report(vl, val_tgt, ep)
-                  if ep_allocs > 0 || v1 - v0 != 0
-                        $stderr.puts "      ep=%d total %.0fms  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [ep, ep_ms, v0, v1, v1 - v0, rss0, rss1, ep_allocs]
+                  ba = report_into(vl, report_scratch, val_tgt, ep)
+                  val_allocs = alloc_count_reset
+                  if ep_allocs > 0 || val_allocs > 0 || v1 - v0 != 0
+                        $stderr.puts "      ep=%d total %.0fms  vram %d->%d (%+d)  ram %d->%d  train_allocs=%d val_allocs=%d" % [ep, ep_ms, v0, v1, v1 - v0, rss0, rss1, ep_allocs, val_allocs]
                   end
                   if ba > best_ba; best_ba = ba; stale = 0; best_ep = ep + 1; best_vl = copy(vl)
                   else stale += 1; break if stale >= NN_PATIENCE; end
