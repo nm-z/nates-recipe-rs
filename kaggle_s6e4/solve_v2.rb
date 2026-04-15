@@ -8,6 +8,57 @@ $stdout.reopen($stderr)
 require "xgb"
 require "lightgbm"
 
+class XGBoost::DMatrix
+      def self.from_flat(flat, nrow, ncol, label: nil, weight: nil, missing: Float::NAN)
+            c_data = ::FFI::MemoryPointer.new(:float, nrow * ncol)
+            c_data.write_array_of_float(flat)
+            out = ::FFI::MemoryPointer.new(:pointer)
+            err = XGBoost::FFI.XGDMatrixCreateFromMat(c_data, nrow, ncol, missing, out)
+            raise XGBoost::Error, XGBoost::FFI.XGBGetLastError if err != 0
+            dm = allocate
+            dm.instance_variable_set(:@handle, ::FFI::AutoPointer.new(out.read_pointer, XGBoost::FFI.method(:XGDMatrixFree)))
+            dm.label = label if label
+            dm.weight = weight if weight
+            dm
+      end
+end
+
+class LightGBM::Dataset
+      def self.from_flat(flat, nrow, ncol, label: nil, params: nil, reference: nil)
+            c_data = ::FFI::MemoryPointer.new(:double, nrow * ncol)
+            c_data.write_array_of_double(flat)
+            handle = ::FFI::MemoryPointer.new(:pointer)
+            prms = (params || {}).map { |k, v| "#{k}=#{v}" }.join(" ")
+            ref_handle = reference ? reference.handle : nil
+            err = LightGBM::FFI.LGBM_DatasetCreateFromMat(c_data, LightGBM::FFI::C_API_DTYPE_FLOAT64, nrow, ncol, 1, prms, ref_handle, handle)
+            raise LightGBM::Error, LightGBM::FFI.LGBM_GetLastError if err != 0
+            ds = allocate
+            ds.instance_variable_set(:@handle, ::FFI::AutoPointer.new(handle.read_pointer, LightGBM::FFI.method(:LGBM_DatasetFree)))
+            ds.instance_variable_set(:@data, nil)
+            ds.instance_variable_set(:@params, params)
+            ds.label = label if label
+            ds
+      end
+end
+
+class LightGBM::Booster
+      def predict_flat(flat, nrow, ncol, num_iteration: nil, start_iteration: 0)
+            num_iteration = best_iteration if num_iteration.nil? && start_iteration <= 0
+            num_iteration ||= -1
+            predict_type = LightGBM::FFI::C_API_PREDICT_NORMAL
+            out_n = ::FFI::MemoryPointer.new(:int64)
+            LightGBM::FFI.LGBM_BoosterCalcNumPredict(@handle, nrow, predict_type, start_iteration, num_iteration, out_n)
+            n_preds = out_n.read_int64
+            c_data = ::FFI::MemoryPointer.new(:double, nrow * ncol)
+            c_data.write_array_of_double(flat)
+            out_num = ::FFI::MemoryPointer.new(:int64)
+            out_res = ::FFI::MemoryPointer.new(:double, n_preds)
+            err = LightGBM::FFI.LGBM_BoosterPredictForMat(@handle, c_data, LightGBM::FFI::C_API_DTYPE_FLOAT64, nrow, ncol, 1, predict_type, start_iteration, num_iteration, "", out_num, out_res)
+            raise LightGBM::Error, LightGBM::FFI.LGBM_GetLastError if err != 0
+            out_res.read_array_of_double(out_num.read_int64)
+      end
+end
+
 def mem_report(label)
       rss = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       free, total = gpu_stats
@@ -238,7 +289,7 @@ def nn_up(p, g, lr, wd, t, tmp) grad_clip_norm_scratch(g, 1.0, tmp); adamw_updat
 def nn_alloc_cache(n, h, nc, nb)
       blk_caches = nb.times.map {
             { ln1: zeros(n, h), a1: zeros(n, h), h1: zeros(n, h),
-              ln2: zeros(n, h), a2: zeros(n, h), mk: zeros(n, h),
+              ln2: zeros(n, h), a2: zeros(n, h), mk: zeros_u8(n * h),
               gw1: zeros(h, h), gb1: zeros(1, h), gw2: zeros(h, h), gb2: zeros(1, h),
               gg1: zeros(1, h), gn1: zeros(1, h), gg2: zeros(1, h), gn2: zeros(1, h) }
       }
@@ -253,8 +304,8 @@ def nn_fwd_into(inp, b, n, h, ds, sc, out)
       linear_into!(sc[:a1], b[:w1].w, b[:b1].w, sc[:h1])
       layernorm_into!(sc[:h1], b[:g2].w, b[:n2].w, sc[:ln2])
       gelu_into!(sc[:ln2], sc[:a2])
-      rand_uniform_into!(sc[:mk], ds)
-      dropout_into!(sc[:a2], sc[:mk], b[:drop], sc[:a2])
+      bernoulli_u8_into!(sc[:mk], ds, b[:drop])
+      dropout_u8_into!(sc[:a2], sc[:mk], b[:drop], sc[:a2])
       linear_into!(sc[:a2], b[:w2].w, b[:b2].w, out)
       add_inplace!(out, inp)
 end
@@ -354,7 +405,7 @@ def train_nn(raw_tr, raw_val, n_tr, n_val, nf_raw, tgt_cpu, val_tgt, fold_cw, cf
       ghw_buf = zeros(h, NC); ghb_buf = zeros(1, NC)
       gpw_buf = zeros(ns, h); gpb_buf = zeros(1, h)
       clip_tmp = zeros(1, 1)
-      ev = val_tgt ? nn_alloc_eval(n_val, h, NC, nb) : nil
+      ev = nn_alloc_eval(n_val, h, NC, nb)
 
       epochs = max_epochs || cfg[:epochs]
       for ep in 0...epochs
@@ -400,8 +451,7 @@ def train_nn(raw_tr, raw_val, n_tr, n_val, nf_raw, tgt_cpu, val_tgt, fold_cw, cf
       probs_out = if val_tgt
             download(softmax(best_vl || vl))
       else
-            p2_ev = nn_alloc_eval(n_val, h, NC, nb)
-            vl = nn_predict_into(g_val, pW, pB, hW, hB, blks, n_val, h, p2_ev)
+            vl = nn_predict_into(g_val, pW, pB, hW, hB, blks, n_val, h, ev)
             download(softmax(vl))
       end
       [probs_out, ep_used]
@@ -423,7 +473,7 @@ def train_xgb(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_roun
       vf0, vt0 = gpu_stats; v0 = vt0 - vf0
       rss0 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       t0 = Time.now; rounds = max_rounds || cfg[:num_round]
-      dtrain = XGBoost::DMatrix.new(x_tr, label: tgt_cpu)
+      dtrain = XGBoost::DMatrix.from_flat(x_tr, n_tr, nf, label: tgt_cpu)
       params = {
             objective: "multi:softprob", num_class: NC, eval_metric: "mlogloss",
             max_depth: cfg[:max_depth], eta: cfg[:eta], lambda: cfg[:lambda],
@@ -431,14 +481,14 @@ def train_xgb(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_roun
             seed: cfg[:seed], verbosity: 0,
       }
       if val_tgt
-            dval = XGBoost::DMatrix.new(x_te, label: val_tgt)
+            dval = XGBoost::DMatrix.from_flat(x_te, n_te, nf, label: val_tgt)
             bst = XGBoost.train(params, dtrain, num_boost_round: rounds,
                   evals: [[dval, "val"]], early_stopping_rounds: PATIENCE, verbose_eval: 1)
       else
             bst = XGBoost.train(params, dtrain, num_boost_round: rounds)
       end
       best_r = bst.best_iteration rescue rounds
-      dtest = val_tgt ? dval : XGBoost::DMatrix.new(x_te, label: Array.new(n_te, 0))
+      dtest = val_tgt ? dval : XGBoost::DMatrix.from_flat(x_te, n_te, nf, label: Array.new(n_te, 0))
       probs = bst.predict(dtest)
       allocs = alloc_count_reset
       vf1, vt1 = gpu_stats; v1 = vt1 - vf1
@@ -454,7 +504,7 @@ def train_lgbm(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_rou
       vf0, vt0 = gpu_stats; v0 = vt0 - vf0
       rss0 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       t0 = Time.now; rounds = max_rounds || cfg[:n_estimators]
-      train_set = LightGBM::Dataset.new(x_tr, label: tgt_cpu)
+      train_set = LightGBM::Dataset.from_flat(x_tr, n_tr, nf, label: tgt_cpu)
       params = {
             objective: "multiclass", num_class: NC, metric: "multi_logloss",
             num_leaves: cfg[:num_leaves], learning_rate: cfg[:learning_rate],
@@ -462,14 +512,14 @@ def train_lgbm(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_rou
             colsample_bytree: cfg[:colsample_bytree], seed: cfg[:seed], verbose: -1,
       }
       if val_tgt
-            val_set = LightGBM::Dataset.new(x_te, label: val_tgt)
+            val_set = LightGBM::Dataset.from_flat(x_te, n_te, nf, label: val_tgt)
             bst = LightGBM.train(params, train_set, num_boost_round: rounds,
                   valid_sets: [val_set], early_stopping_rounds: PATIENCE, verbose_eval: 1)
       else
             bst = LightGBM.train(params, train_set, num_boost_round: rounds)
       end
       best_r = bst.best_iteration rescue rounds
-      probs = bst.predict(x_te)
+      probs = bst.predict_flat(x_te, n_te, nf)
       allocs = alloc_count_reset
       vf1, vt1 = gpu_stats; v1 = vt1 - vf1
       rss1 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
@@ -516,17 +566,7 @@ def train_cb_gpu(bins_tr, bins_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label,
       trees = []
       for t in 0...rounds
             NC.times do |k|
-                  softmax_ce_class_grad_f32!(preds, tgt_f32, grad, hess, k, n_tr) rescue begin
-                        probs_cpu = n_tr.times.map { |i|
-                              ls = NC.times.map { |c| download_f32(preds[c])[i] }
-                              mx = ls.max; es = ls.map { |v| Math.exp(v - mx) }; s = es.sum
-                              es.map { |v| v / s }
-                        }
-                        grad_cpu = n_tr.times.map { |i| (probs_cpu[i][k] - (tgt_cpu[i] == k ? 1.0 : 0.0)).to_f }
-                        hess_cpu = n_tr.times.map { |i| pk = probs_cpu[i][k]; [pk * (1.0 - pk), 1e-6].max.to_f }
-                        grad = upload_f32(grad_cpu, n_tr, 1)
-                        hess = upload_f32(hess_cpu, n_tr, 1)
-                  end
+                  softmax_ce_class_grad_f32!(preds, tgt_f32, grad, hess, k, n_tr)
 
                   zero!(node_a)
                   sf_host = []; sb_host = []
@@ -733,12 +773,9 @@ K_FOLDS.times do |fold|
       g_tr = nil; g_te = nil; g_tgt = nil; g_sw = nil
       GC.start
 
-      nested_tr = nft.times.map { |i| NF.times.map { |j| raw_t[i * NF + j] } }
-      nested_te = nfv.times.map { |i| NF.times.map { |j| raw_v[i * NF + j] } }
-
       XGB_CFGS.each_with_index do |cfg, xi|
             probs, br = with_cache("XGBoost ##{xi+1}", fold+1, fvc, cfg: cfg) {
-                  train_xgb(nested_tr, nested_te, nft, nfv, NF, ftc, fvc, cfg, "F#{fold+1} XGBoost ##{xi+1}")
+                  train_xgb(raw_t, raw_v, nft, nfv, NF, ftc, fvc, cfg, "F#{fold+1} XGBoost ##{xi+1}")
             }
             xgb_best_rounds[xi] << br
             (nfv * NC).times { |i| fp_acc[i] += probs[i] }
@@ -746,7 +783,7 @@ K_FOLDS.times do |fold|
 
       LGBM_CFGS.each_with_index do |cfg, li|
             probs, br = with_cache("LightGBM ##{li+1}", fold+1, fvc, cfg: cfg) {
-                  train_lgbm(nested_tr, nested_te, nft, nfv, NF, ftc, fvc, cfg, "F#{fold+1} LightGBM ##{li+1}")
+                  train_lgbm(raw_t, raw_v, nft, nfv, NF, ftc, fvc, cfg, "F#{fold+1} LightGBM ##{li+1}")
             }
             lgbm_best_rounds[li] << br
             (nfv * NC).times { |i| fp_acc[i] += probs[i] }
@@ -838,16 +875,13 @@ NN_CFGS.each_with_index do |cfg, ni|
       (n_te * NC).times { |i| tp[i] += probs[i] }
 end
 
-p2_nested_tr = n_tr.times.map { |i| NF.times.map { |j| raw_ft[i * NF + j] } }
-p2_nested_te = n_te.times.map { |i| NF.times.map { |j| raw_fte[i * NF + j] } }
-
 XGB_CFGS.each_with_index do |cfg, xi|
-      probs, _ = train_xgb(p2_nested_tr, p2_nested_te, n_tr, n_te, NF, targets_i, nil, cfg, "Full XGBoost ##{xi+1}", max_rounds: p2r_xgb[xi])
+      probs, _ = train_xgb(raw_ft, raw_fte, n_tr, n_te, NF, targets_i, nil, cfg, "Full XGBoost ##{xi+1}", max_rounds: p2r_xgb[xi])
       (n_te * NC).times { |i| tp[i] += probs[i] }
 end
 
 LGBM_CFGS.each_with_index do |cfg, li|
-      probs, _ = train_lgbm(p2_nested_tr, p2_nested_te, n_tr, n_te, NF, targets_i, nil, cfg, "Full LightGBM ##{li+1}", max_rounds: p2r_lgbm[li])
+      probs, _ = train_lgbm(raw_ft, raw_fte, n_tr, n_te, NF, targets_i, nil, cfg, "Full LightGBM ##{li+1}", max_rounds: p2r_lgbm[li])
       (n_te * NC).times { |i| tp[i] += probs[i] }
 end
 
