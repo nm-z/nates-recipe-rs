@@ -10,6 +10,9 @@ catboost/
 LightGBM/
 xgboost/
 
+# Cache
+kaggle_s6e4/cache/
+
 # Build artifacts
 */target/
 *.so
