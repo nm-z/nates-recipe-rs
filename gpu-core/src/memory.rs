@@ -10,6 +10,10 @@ pub fn alloc_count_reset() -> usize {
       ALLOC_COUNT.swap(0, Ordering::Relaxed)
 }
 
+pub fn alloc_count_get() -> usize {
+      ALLOC_COUNT.load(Ordering::Relaxed)
+}
+
 const HIP_MEM_ATTACH_GLOBAL: u32 = 0x01;
 
 unsafe extern "C" {

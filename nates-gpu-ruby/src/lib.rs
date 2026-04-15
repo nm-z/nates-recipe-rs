@@ -151,6 +151,10 @@ fn alloc_count_reset(_ruby: &Ruby) -> usize {
       gpu_core::memory::alloc_count_reset()
 }
 
+fn alloc_count(_ruby: &Ruby) -> usize {
+      gpu_core::memory::alloc_count_get()
+}
+
 // ── Data transfer ───────────────────────────────────────────────────────────
 
 fn upload(ruby: &Ruby, data: RArray, rows: usize, cols: usize) -> Result<RubyGpuBuffer, Error> {
@@ -1311,6 +1315,14 @@ fn report(ruby: &Ruby, logits: &RubyGpuBuffer, val_targets: Vec<i64>, round: usi
       kernels::gpu_report(&logits.buf, &vt, n, nc, round).map_err(|e| hip_err(ruby, e))
 }
 
+/// report_into(logits, scratch, val_targets_array, round) → Float (balanced accuracy)
+/// Uses scratch buffer for argmax to avoid per-call allocation.
+fn report_into(ruby: &Ruby, logits: &RubyGpuBuffer, scratch: &RubyGpuBuffer, val_targets: Vec<i64>, round: usize) -> Result<f64, Error> {
+      let n = logits.rows; let nc = logits.cols;
+      let vt: Vec<i32> = val_targets.iter().map(|&v| v as i32).collect();
+      kernels::gpu_report_into(&logits.buf, &scratch.buf, &vt, n, nc, round).map_err(|e| hip_err(ruby, e))
+}
+
 // ── DTW ───────────────────────────────────────────────────────────────────
 
 fn dtw(ruby: &Ruby, cost: &RubyGpuBuffer) -> Result<RubyGpuBuffer, Error> {
@@ -1646,6 +1658,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("gpu_gc", function!(gpu_gc, 0))?;
       module.define_module_function("gpu_stats", function!(gpu_stats, 0))?;
       module.define_module_function("alloc_count_reset", function!(alloc_count_reset, 0))?;
+      module.define_module_function("alloc_count", function!(alloc_count, 0))?;
 
       // Random
       module.define_module_function("rand_uniform", function!(rand_uniform, 3))?;
@@ -1664,6 +1677,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("hessian", function!(hessian, 3))?;
       module.define_module_function("add_col", function!(add_col, 3))?;
       module.define_module_function("report", function!(report, 3))?;
+      module.define_module_function("report_into", function!(report_into, 4))?;
 
       // DTW
       module.define_module_function("dtw", function!(dtw, 1))?;
