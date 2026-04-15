@@ -25,6 +25,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "catboost-rs"
+version = "0.1.0"
+dependencies = [
+ "gpu-core",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -139,6 +149,7 @@ dependencies = [
 name = "nates-gpu-lua"
 version = "0.1.0"
 dependencies = [
+ "catboost-rs",
  "gpu-core",
  "mlua",
  "rand",
