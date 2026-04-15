@@ -409,6 +409,13 @@ fn oblivious_route_step_into(_ruby: &Ruby, bins_rm: &RubyGpuBuffer, node_in: &Ru
       Ok(())
 }
 
+fn oblivious_route_step_dev_into(_ruby: &Ruby, bins_rm: &RubyGpuBuffer, node_in: &RubyGpuBuffer, node_out: &RubyGpuBuffer, split_feat_arr: &RubyGpuBuffer, split_bin_arr: &RubyGpuBuffer, depth: usize) -> Result<(), Error> {
+      let n_rows = node_in.len();
+      let n_features = bins_rm.len() / n_rows;
+      kernels::gpu_oblivious_route_step_dev(&bins_rm.buf, &node_in.buf, &node_out.buf, &split_feat_arr.buf, &split_bin_arr.buf, depth, n_rows, n_features);
+      Ok(())
+}
+
 fn oblivious_route_full_into(_ruby: &Ruby, bins_rm: &RubyGpuBuffer, split_feat: &RubyGpuBuffer, split_bin: &RubyGpuBuffer, leaf_idx: &RubyGpuBuffer, depth: usize) -> Result<(), Error> {
       let n_rows = leaf_idx.len();
       let n_features = bins_rm.len() / n_rows;
@@ -1456,6 +1463,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       // Oblivious tree
       module.define_module_function("oblivious_histogram_into!", function!(oblivious_histogram_into, 8))?;
       module.define_module_function("oblivious_route_step_into!", function!(oblivious_route_step_into, 6))?;
+      module.define_module_function("oblivious_route_step_dev_into!", function!(oblivious_route_step_dev_into, 6))?;
       module.define_module_function("oblivious_route_full_into!", function!(oblivious_route_full_into, 5))?;
       module.define_module_function("scatter_add_by_leaf!", function!(scatter_add_by_leaf, 4))?;
       module.define_module_function("leaf_reduce_into!", function!(leaf_reduce_into, 5))?;

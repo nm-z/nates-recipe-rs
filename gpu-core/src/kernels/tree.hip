@@ -441,6 +441,36 @@ extern "C" void launch_oblivious_route_step(
         bins_rm, node_in, node_out, split_feat, split_bin, depth, n_rows, n_features);
 }
 
+extern "C" __global__
+void oblivious_route_step_dev_kernel(
+    const unsigned char* bins_rm,
+    const unsigned char* node_in,
+    unsigned char* node_out,
+    const int* split_feat_arr,
+    const unsigned char* split_bin_arr,
+    int depth,
+    int n_rows,
+    int n_features
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    int sf = split_feat_arr[depth];
+    unsigned char sb = split_bin_arr[depth];
+    unsigned int bit = bins_rm[row * n_features + sf] > sb ? 1u : 0u;
+    node_out[row] = node_in[row] | (unsigned char)(bit << depth);
+}
+
+extern "C" void launch_oblivious_route_step_dev(
+    const unsigned char* bins_rm, const unsigned char* node_in, unsigned char* node_out,
+    const int* split_feat_arr, const unsigned char* split_bin_arr, int depth,
+    int n_rows, int n_features, hipStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((n_rows + 255) / 256);
+    hipLaunchKernelGGL(oblivious_route_step_dev_kernel, grid, block, 0, stream,
+        bins_rm, node_in, node_out, split_feat_arr, split_bin_arr, depth, n_rows, n_features);
+}
+
 // ── kernel 2b: oblivious route full ───────────────────────────────────────
 // Compute final leaf index from all depth splits.
 extern "C" __global__

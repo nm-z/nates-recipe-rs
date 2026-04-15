@@ -239,6 +239,7 @@ unsafe extern "C" {
     fn launch_argmax_write_split(gain: *const c_void, split_feat: *mut c_void, split_bin: *mut c_void, best_idx: *mut c_void, n_features: i32, n_bins: i32, d: i32, stream: *mut c_void);
     fn launch_oblivious_histogram(bins_fm: *const c_void, node_idx: *const c_void, grad: *const c_void, hess: *const c_void, grad_hist: *mut c_void, hess_hist: *mut c_void, n_rows: i32, n_features: i32, n_bins: i32, n_nodes: i32, stream: *mut c_void);
     fn launch_oblivious_route_step(bins_rm: *const c_void, node_in: *const c_void, node_out: *mut c_void, split_feat: i32, split_bin: u8, depth: i32, n_rows: i32, n_features: i32, stream: *mut c_void);
+    fn launch_oblivious_route_step_dev(bins_rm: *const c_void, node_in: *const c_void, node_out: *mut c_void, split_feat_arr: *const c_void, split_bin_arr: *const c_void, depth: i32, n_rows: i32, n_features: i32, stream: *mut c_void);
     fn launch_oblivious_route_full(bins_rm: *const c_void, split_feat: *const c_void, split_bin: *const c_void, leaf_idx: *mut c_void, n_rows: i32, n_features: i32, depth: i32, stream: *mut c_void);
     fn launch_scatter_add_by_leaf(pred: *mut c_void, leaf_idx: *const c_void, leaf_value: *const c_void, lr: f32, n_rows: i32, stream: *mut c_void);
     fn launch_leaf_reduce(leaf_idx: *const c_void, grad: *const c_void, hess: *const c_void, leaf_grad: *mut c_void, leaf_hess: *mut c_void, n_rows: i32, stream: *mut c_void);
@@ -904,6 +905,11 @@ pub fn gpu_oblivious_histogram(bins_fm: &GpuBuffer, node_idx: &GpuBuffer, grad: 
 
 pub fn gpu_oblivious_route_step(bins_rm: &GpuBuffer, node_in: &GpuBuffer, node_out: &GpuBuffer, split_feat: usize, split_bin: u8, depth: usize, n_rows: usize, n_features: usize) {
     unsafe { launch_oblivious_route_step(bins_rm.ptr as *const c_void, node_in.ptr as *const c_void, node_out.ptr as *mut c_void, split_feat as i32, split_bin, depth as i32, n_rows as i32, n_features as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_oblivious_route_step_dev(bins_rm: &GpuBuffer, node_in: &GpuBuffer, node_out: &GpuBuffer, split_feat_arr: &GpuBuffer, split_bin_arr: &GpuBuffer, depth: usize, n_rows: usize, n_features: usize) {
+    unsafe { launch_oblivious_route_step_dev(bins_rm.ptr as *const c_void, node_in.ptr as *const c_void, node_out.ptr as *mut c_void, split_feat_arr.ptr as *const c_void, split_bin_arr.ptr as *const c_void, depth as i32, n_rows as i32, n_features as i32, std::ptr::null_mut()); }
     check_launch();
 }
 
