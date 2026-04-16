@@ -393,7 +393,7 @@ extern "C" __global__ void logistic_grad_hess_kernel(
             : expf(p) / (1.0f + expf(p));
         grad[i] = sig - target[i];
         float h = sig * (1.0f - sig);
-        hess[i] = fmaxf(h, 1e-6f);
+        hess[i] = fminf(fmaxf(h, 1e-6f), 1.0f);
     }
 }
 
