@@ -191,6 +191,35 @@ fn upload_f32(ruby: &Ruby, data: Vec<f64>, rows: usize, cols: usize) -> Result<R
       Ok(RubyGpuBuffer::new(buf, rows, cols))
 }
 
+fn upload_u8_raw(ruby: &Ruby, data: magnus::RString, rows: usize, cols: usize) -> Result<RubyGpuBuffer, Error> {
+      let bytes = unsafe { data.as_slice() };
+      let expected = rows * cols;
+      if bytes.len() != expected {
+            return Err(Error::new(
+                  ruby.exception_runtime_error(),
+                  format!("upload_u8_raw: data len {} != rows*cols {}*{}={}", bytes.len(), rows, cols, expected),
+            ));
+      }
+      let buf = GpuBuffer::upload_u8(bytes).map_err(|e| hip_err(ruby, e))?;
+      Ok(RubyGpuBuffer::new(buf, rows, cols))
+}
+
+fn upload_f32_raw(ruby: &Ruby, data: magnus::RString, rows: usize, cols: usize) -> Result<RubyGpuBuffer, Error> {
+      let bytes = unsafe { data.as_slice() };
+      let expected = rows * cols * 4;
+      if bytes.len() != expected {
+            return Err(Error::new(
+                  ruby.exception_runtime_error(),
+                  format!("upload_f32_raw: data len {} != rows*cols*4 {}*{}*4={}", bytes.len(), rows, cols, expected),
+            ));
+      }
+      let buf = GpuBuffer::alloc_bytes(expected).map_err(|e| hip_err(ruby, e))?;
+      gpu_core::hip::check(unsafe {
+            gpu_core::hip::hipMemcpy(buf.ptr_raw(), bytes.as_ptr() as *const std::ffi::c_void, expected, gpu_core::hip::HIP_MEMCPY_H2D)
+      }).map_err(|e| hip_err(ruby, e))?;
+      Ok(RubyGpuBuffer::new(buf, rows, cols))
+}
+
 fn zeros_u8(ruby: &Ruby, n: usize) -> Result<RubyGpuBuffer, Error> {
       let buf = GpuBuffer::zeros_bytes(n).map_err(|e| hip_err(ruby, e))?;
       Ok(RubyGpuBuffer::new(buf, n, 1))
@@ -362,6 +391,11 @@ fn layernorm_backward_into(ruby: &Ruby, grad: &RubyGpuBuffer, x: &RubyGpuBuffer,
 
 fn mse_grad_into(_ruby: &Ruby, pred: &RubyGpuBuffer, target: &RubyGpuBuffer, grad: &RubyGpuBuffer) -> Result<(), Error> {
       kernels::gpu_mse_grad_into(&pred.buf, &target.buf, &grad.buf, pred.len());
+      Ok(())
+}
+
+fn logistic_grad_hess_into(_ruby: &Ruby, pred: &RubyGpuBuffer, target: &RubyGpuBuffer, grad: &RubyGpuBuffer, hess: &RubyGpuBuffer) -> Result<(), Error> {
+      kernels::gpu_logistic_grad_hess_into(&pred.buf, &target.buf, &grad.buf, &hess.buf, pred.len());
       Ok(())
 }
 
@@ -1427,8 +1461,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       // Data transfer
       module.define_module_function("upload", function!(upload, 3))?;
       module.define_module_function("upload_u8", function!(upload_u8, 3))?;
+      module.define_module_function("upload_u8_raw", function!(upload_u8_raw, 3))?;
       module.define_module_function("upload_i32", function!(upload_i32, 3))?;
       module.define_module_function("upload_f32", function!(upload_f32, 3))?;
+      module.define_module_function("upload_f32_raw", function!(upload_f32_raw, 3))?;
       module.define_module_function("zeros_u8", function!(zeros_u8, 1))?;
       module.define_module_function("zeros_f32", function!(zeros_f32, 2))?;
       module.define_module_function("download", function!(download, 1))?;
@@ -1458,6 +1494,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       module.define_module_function("add_col!", function!(add_col_scaled_inplace, 4))?;
       // Oblivious tree helpers
       module.define_module_function("mse_grad_into!", function!(mse_grad_into, 3))?;
+      module.define_module_function("logistic_grad_hess_into!", function!(logistic_grad_hess_into, 4))?;
       module.define_module_function("argmax_f32_into!", function!(argmax_f32_into, 2))?;
       module.define_module_function("fill_f32!", function!(fill_f32_val, 2))?;
       module.define_module_function("write_split_into!", function!(write_split_into, 5))?;

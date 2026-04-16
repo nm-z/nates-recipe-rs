@@ -233,6 +233,7 @@ unsafe extern "C" {
 
     // Oblivious tree kernels (u8 bins, f32 grad/hess)
     fn launch_mse_grad(pred: *const c_void, target: *const c_void, grad: *mut c_void, n: i32, stream: *mut c_void);
+    fn launch_logistic_grad_hess(pred: *const c_void, target: *const c_void, grad: *mut c_void, hess: *mut c_void, n: i32, stream: *mut c_void);
     fn launch_argmax_f32(data: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
     fn launch_fill_f32(out: *mut c_void, val: f32, n: i32, stream: *mut c_void);
     fn launch_write_split(split_feat: *mut c_void, split_bin: *mut c_void, feat: i32, bin: u8, d: i32, stream: *mut c_void);
@@ -874,6 +875,11 @@ pub fn gpu_tree_build_into(tr_bins: &GpuBuffer, te_bins: &GpuBuffer, grad: &GpuB
 
 pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, grad: &GpuBuffer, n: usize) {
     unsafe { launch_mse_grad(pred.ptr as *const c_void, target.ptr as *const c_void, grad.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_logistic_grad_hess_into(pred: &GpuBuffer, target: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, n: usize) {
+    unsafe { launch_logistic_grad_hess(pred.ptr as *const c_void, target.ptr as *const c_void, grad.ptr as *mut c_void, hess.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
     check_launch();
 }
 

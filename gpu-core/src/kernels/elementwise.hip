@@ -377,6 +377,36 @@ extern "C" void launch_mse_grad(const float* pred, const float* target, float* g
     hipLaunchKernelGGL(mse_grad_kernel, grid, block, 0, stream, pred, target, grad, n);
 }
 
+// Binary logistic grad+hess into scratch (f32):
+//   sig = 1 / (1 + exp(-pred))
+//   grad[i] = sig - target[i]
+//   hess[i] = sig * (1 - sig), clamped to [1e-6, 1.0]
+extern "C" __global__ void logistic_grad_hess_kernel(
+    const float* pred, const float* target,
+    float* grad, float* hess, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float p = pred[i];
+        float sig = (p >= 0.0f)
+            ? 1.0f / (1.0f + expf(-p))
+            : expf(p) / (1.0f + expf(p));
+        grad[i] = sig - target[i];
+        float h = sig * (1.0f - sig);
+        hess[i] = fmaxf(h, 1e-6f);
+    }
+}
+
+extern "C" void launch_logistic_grad_hess(
+    const float* pred, const float* target,
+    float* grad, float* hess, int n, hipStream_t stream)
+{
+    dim3 block(256);
+    dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(logistic_grad_hess_kernel, grid, block, 0, stream,
+                       pred, target, grad, hess, n);
+}
+
 // Argmax over flat f32 buffer, writes best index to out[0] as int
 extern "C" __global__ void argmax_f32_kernel(const float* data, int* out, int n) {
     __shared__ float s_val[256];
