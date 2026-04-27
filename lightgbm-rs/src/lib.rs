@@ -204,11 +204,11 @@ fn mse_grad_hess(pred: &[f32], y: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
       (grad, hess)
 }
 
-fn mc_grad_hess_row(logits: &[f32], y_class: usize, _n_classes: usize) -> (f32, f32) {
+fn mc_grad_hess_row(logits: &[f32], y_true: usize, k: usize) -> (f32, f32) {
       let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
       let s: f32 = logits.iter().map(|&v| (v - mx).exp()).sum();
-      let prob_k = (logits[y_class] - mx).exp() / s;
-      let g = prob_k - 1.0;
+      let prob_k = (logits[k] - mx).exp() / s;
+      let g = prob_k - if y_true == k { 1.0 } else { 0.0 };
       let h = (prob_k * (1.0 - prob_k)).max(1e-6f32);
       (g, h)
 }
@@ -479,7 +479,7 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
             for k in 0..n_classes {
                   let (mut grad, mut hess): (Vec<f32>, Vec<f32>) = (0..n).map(|i| {
                         let row = &pred_logits[i * n_classes..(i + 1) * n_classes];
-                        mc_grad_hess_row(row, y[i], n_classes)
+                        mc_grad_hess_row(row, y[i], k)
                   }).unzip();
 
                   if use_goss {
@@ -583,7 +583,7 @@ mod tests {
             let x: Vec<f64> = (0..n).map(|i| (i as f64) / n as f64).collect();
             let x2: Vec<f64> = x.iter().map(|&v| v * v).collect();
             let xdata: Vec<f64> = x.iter().zip(x2.iter()).flat_map(|(&a, &b)| [a, b]).collect();
-            let y: Vec<usize> = (0..n).map(|i| i % 3).collect();
+            let y: Vec<usize> = (0..n).map(|i| ((3 * i) / n).min(2)).collect();
             let params = Params { n_estimators: 100, num_leaves: 16, learning_rate: 0.15, l2_reg: 1.0, n_bins: 32, ..Default::default() };
             let model = train_multiclass(&xdata, &y, n, 2, 3, &params).unwrap();
             let probs = predict_proba(&model, &xdata, n).unwrap();
@@ -618,10 +618,11 @@ mod tests {
             let p = 10;
             let mut rng = ChaCha8Rng::seed_from_u64(3);
             let mut x = vec![0.0f64; n * p];
-            let y: Vec<usize> = (0..n).map(|_| (rng.random::<f64>() > 0.5) as usize).collect();
+            let mut y = vec![0usize; n];
             for i in 0..n {
                   let active = (rng.random::<f64>() * p as f64) as usize % p;
                   x[i * p + active] = rng.random::<f64>();
+                  y[i] = if active < p / 2 { 0 } else { 1 };
             }
 
             let params_no_efb = Params { n_estimators: 30, num_leaves: 8, learning_rate: 0.2, l2_reg: 1.0, n_bins: 32, use_efb: false, ..Default::default() };
