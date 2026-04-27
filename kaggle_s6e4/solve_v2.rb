@@ -6,59 +6,6 @@ require "digest"
 require_relative "lib/split"
 $stdout.sync = true; $stderr.sync = true
 $stdout.reopen($stderr)
-require "xgb"
-require "lightgbm"
-
-class XGBoost::DMatrix
-      def self.from_flat(flat, nrow, ncol, label: nil, weight: nil, missing: Float::NAN)
-            c_data = ::FFI::MemoryPointer.new(:float, nrow * ncol)
-            c_data.write_array_of_float(flat)
-            out = ::FFI::MemoryPointer.new(:pointer)
-            err = XGBoost::FFI.XGDMatrixCreateFromMat(c_data, nrow, ncol, missing, out)
-            raise XGBoost::Error, XGBoost::FFI.XGBGetLastError if err != 0
-            dm = allocate
-            dm.instance_variable_set(:@handle, ::FFI::AutoPointer.new(out.read_pointer, XGBoost::FFI.method(:XGDMatrixFree)))
-            dm.label = label if label
-            dm.weight = weight if weight
-            dm
-      end
-end
-
-class LightGBM::Dataset
-      def self.from_flat(flat, nrow, ncol, label: nil, params: nil, reference: nil)
-            c_data = ::FFI::MemoryPointer.new(:double, nrow * ncol)
-            c_data.write_array_of_double(flat)
-            handle = ::FFI::MemoryPointer.new(:pointer)
-            prms = (params || {}).map { |k, v| "#{k}=#{v}" }.join(" ")
-            ref_handle = reference ? reference.handle : nil
-            err = LightGBM::FFI.LGBM_DatasetCreateFromMat(c_data, LightGBM::FFI::C_API_DTYPE_FLOAT64, nrow, ncol, 1, prms, ref_handle, handle)
-            raise LightGBM::Error, LightGBM::FFI.LGBM_GetLastError if err != 0
-            ds = allocate
-            ds.instance_variable_set(:@handle, ::FFI::AutoPointer.new(handle.read_pointer, LightGBM::FFI.method(:LGBM_DatasetFree)))
-            ds.instance_variable_set(:@data, nil)
-            ds.instance_variable_set(:@params, params)
-            ds.label = label if label
-            ds
-      end
-end
-
-class LightGBM::Booster
-      def predict_flat(flat, nrow, ncol, num_iteration: nil, start_iteration: 0)
-            num_iteration = best_iteration if num_iteration.nil? && start_iteration <= 0
-            num_iteration ||= -1
-            predict_type = LightGBM::FFI::C_API_PREDICT_NORMAL
-            out_n = ::FFI::MemoryPointer.new(:int64)
-            LightGBM::FFI.LGBM_BoosterCalcNumPredict(@handle, nrow, predict_type, start_iteration, num_iteration, out_n)
-            n_preds = out_n.read_int64
-            c_data = ::FFI::MemoryPointer.new(:double, nrow * ncol)
-            c_data.write_array_of_double(flat)
-            out_num = ::FFI::MemoryPointer.new(:int64)
-            out_res = ::FFI::MemoryPointer.new(:double, n_preds)
-            err = LightGBM::FFI.LGBM_BoosterPredictForMat(@handle, c_data, LightGBM::FFI::C_API_DTYPE_FLOAT64, nrow, ncol, 1, predict_type, start_iteration, num_iteration, "", out_num, out_res)
-            raise LightGBM::Error, LightGBM::FFI.LGBM_GetLastError if err != 0
-            out_res.read_array_of_double(out_num.read_int64)
-      end
-end
 
 def mem_report(label)
       rss = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
@@ -474,29 +421,21 @@ def train_xgb(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_roun
       vf0, vt0 = gpu_stats; v0 = vt0 - vf0
       rss0 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       t0 = Time.now; rounds = max_rounds || cfg[:num_round]
-      dtrain = XGBoost::DMatrix.from_flat(x_tr, n_tr, nf, label: tgt_cpu)
       params = {
-            objective: "multi:softprob", num_class: NC, eval_metric: "mlogloss",
-            max_depth: cfg[:max_depth], eta: cfg[:eta], lambda: cfg[:lambda],
+            n_estimators: rounds, max_depth: cfg[:max_depth], lr: cfg[:eta],
+            l2_reg: cfg[:lambda], min_child_weight: 1.0,
             subsample: cfg[:subsample], colsample_bytree: cfg[:colsample_bytree],
-            seed: cfg[:seed], verbosity: 0,
+            n_bins: 256, seed: cfg[:seed],
       }
-      if val_tgt
-            dval = XGBoost::DMatrix.from_flat(x_te, n_te, nf, label: val_tgt)
-            bst = XGBoost.train(params, dtrain, num_boost_round: rounds,
-                  evals: [[dval, "val"]], early_stopping_rounds: PATIENCE, verbose_eval: 1)
-      else
-            bst = XGBoost.train(params, dtrain, num_boost_round: rounds)
-      end
-      best_r = bst.best_iteration rescue rounds
-      dtest = val_tgt ? dval : XGBoost::DMatrix.from_flat(x_te, n_te, nf, label: Array.new(n_te, 0))
-      probs = bst.predict(dtest)
+      tgt_int = tgt_cpu.map(&:to_i)
+      model_id = NatesGpu.xgb_train_multiclass(x_tr, tgt_int, n_tr, nf, NC, params)
+      probs = NatesGpu.xgb_predict_proba(model_id, x_te, n_te)
       allocs = alloc_count_reset
       vf1, vt1 = gpu_stats; v1 = vt1 - vf1
       rss1 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       ms = (Time.now - t0) * 1000
-      $stderr.puts "    #{label} (stopped=#{best_r}): %.1fs  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [ms / 1000, v0, v1, v1 - v0, rss0, rss1, allocs]
-      [probs.flatten, best_r]
+      $stderr.puts "    #{label}: %.1fs  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [ms / 1000, v0, v1, v1 - v0, rss0, rss1, allocs]
+      [probs, rounds]
 end
 
 def train_lgbm(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_rounds: nil)
@@ -505,28 +444,22 @@ def train_lgbm(x_tr, x_te, n_tr, n_te, nf, tgt_cpu, val_tgt, cfg, label, max_rou
       vf0, vt0 = gpu_stats; v0 = vt0 - vf0
       rss0 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       t0 = Time.now; rounds = max_rounds || cfg[:n_estimators]
-      train_set = LightGBM::Dataset.from_flat(x_tr, n_tr, nf, label: tgt_cpu)
       params = {
-            objective: "multiclass", num_class: NC, metric: "multi_logloss",
-            num_leaves: cfg[:num_leaves], learning_rate: cfg[:learning_rate],
-            lambda_l2: cfg[:lambda_l2], subsample: cfg[:subsample],
-            colsample_bytree: cfg[:colsample_bytree], seed: cfg[:seed], verbose: -1,
+            n_estimators: rounds, num_leaves: cfg[:num_leaves], max_depth: 0,
+            lr: cfg[:learning_rate], l2_reg: cfg[:lambda_l2],
+            min_child_weight: 1e-3, min_gain_to_split: 0.0,
+            n_bins: 256, goss_a: 0.0, goss_b: 0.0,
+            use_efb: false, seed: cfg[:seed],
       }
-      if val_tgt
-            val_set = LightGBM::Dataset.from_flat(x_te, n_te, nf, label: val_tgt)
-            bst = LightGBM.train(params, train_set, num_boost_round: rounds,
-                  valid_sets: [val_set], early_stopping_rounds: PATIENCE, verbose_eval: 1)
-      else
-            bst = LightGBM.train(params, train_set, num_boost_round: rounds)
-      end
-      best_r = bst.best_iteration rescue rounds
-      probs = bst.predict_flat(x_te, n_te, nf)
+      tgt_int = tgt_cpu.map(&:to_i)
+      model_id = NatesGpu.lgbm_train_multiclass(x_tr, tgt_int, n_tr, nf, NC, params)
+      probs = NatesGpu.lgbm_predict_proba(model_id, x_te, n_te)
       allocs = alloc_count_reset
       vf1, vt1 = gpu_stats; v1 = vt1 - vf1
       rss1 = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i / 1024
       ms = (Time.now - t0) * 1000
-      $stderr.puts "    #{label} (stopped=#{best_r}): %.1fs  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [ms / 1000, v0, v1, v1 - v0, rss0, rss1, allocs]
-      [probs.flatten, best_r]
+      $stderr.puts "    #{label}: %.1fs  vram %d->%d (%+d)  ram %d->%d  allocs=%d" % [ms / 1000, v0, v1, v1 - v0, rss0, rss1, allocs]
+      [probs, rounds]
 end
 
 # ── CatBoost (via catboost-rs) ────────────────────────────────────────────
