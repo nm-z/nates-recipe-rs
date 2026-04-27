@@ -14,6 +14,7 @@ SPECS = {
       "msrank"        => { task: :regression,   nf: 137, format: :libsvm_qid },
       "synthetic"     => { task: :regression,   nf: 100, format: :synthetic,   n_rows: 10_000_000 },
       "synthetic-5k"  => { task: :regression,   nf: 5000, format: :synthetic,  n_rows: 100_000 },
+      "covtype"       => { task: :multiclass,   nf: 54,  format: :csv_covtype, nc: 7 },
 }
 
 raise "Unknown dataset: #{DATASET}. Valid: #{SPECS.keys.join(', ')}" unless SPECS.key?(DATASET)
@@ -80,6 +81,15 @@ def load_libsvm(path, expected_nf, has_qid)
       [x, y, n, expected_nf, nil]
 end
 
+def load_csv_covtype(path)
+      rows = File.readlines(path).map(&:chomp).reject(&:empty?).map { |l| l.split(",").map(&:to_f) }
+      n  = rows.size
+      nf = rows[0].size - 1
+      x  = rows.flat_map { |r| r[0...nf] }
+      y  = rows.map { |r| r[-1] - 1.0 }
+      [x, y, n, nf, 7]
+end
+
 def generate_synthetic(n_rows, nf, seed)
       rng = Random.new(seed)
       weights = Array.new(nf) { rng.rand * 2.0 - 1.0 }
@@ -116,6 +126,7 @@ x, y, n, nf, nc = case spec[:format]
       when :libsvm       then load_libsvm("/tmp/epsilon_normalized", nf, false)
       when :libsvm_qid   then load_libsvm("/tmp/msrank.txt", nf, true)
       when :synthetic    then generate_synthetic(spec[:n_rows], nf, 0)
+      when :csv_covtype  then load_csv_covtype("/tmp/covtype.data")
       end
 
 nc ||= spec[:nc]
