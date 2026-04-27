@@ -381,6 +381,8 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
             (bins_raw, bm, p)
       };
 
+      let eff_n_bins = bins_eff.iter().map(|c| c.iter().copied().max().unwrap_or(0) as usize + 1).max().unwrap_or(params.n_bins).max(params.n_bins);
+
       let use_goss = params.goss_a > 0.0;
       let lambda = params.l2_reg as f32;
       let min_cw = params.min_child_weight as f32;
@@ -402,7 +404,7 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
                   apply_goss(&mut grad, &mut hess, n, params.goss_a, params.goss_b, &mut rng)?;
             }
 
-            let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, params.n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
+            let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
 
             let leaf_preds = predict_tree_cpu(&tree, &bins_flat, n, n_eff);
             for i in 0..n { pred[i] += lr * leaf_preds[i]; }
@@ -461,6 +463,8 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
             (bins_raw, bm, p)
       };
 
+      let eff_n_bins = bins_eff.iter().map(|c| c.iter().copied().max().unwrap_or(0) as usize + 1).max().unwrap_or(params.n_bins).max(params.n_bins);
+
       let use_goss = params.goss_a > 0.0;
       let lambda = params.l2_reg as f32;
       let min_cw = params.min_child_weight as f32;
@@ -486,7 +490,7 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
                         apply_goss(&mut grad, &mut hess, n, params.goss_a, params.goss_b, &mut rng)?;
                   }
 
-                  let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, params.n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
+                  let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
 
                   let leaf_preds = predict_tree_cpu(&tree, &bins_flat, n, n_eff);
                   for i in 0..n { pred_logits[i * n_classes + k] += lr * leaf_preds[i]; }
