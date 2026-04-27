@@ -1,0 +1,16 @@
+[package]
+name = "xgboost-rs"
+version = "0.1.0"
+edition = "2024"
+description = "XGBoost-equivalent gradient boosting — level-wise trees, histogram splits, HIP GPU"
+
+[workspace]
+
+[dependencies]
+gpu-core = { path = "../gpu-core" }
+rand = "0.9"
+rand_chacha = "0.9"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
