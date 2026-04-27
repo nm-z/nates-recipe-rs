@@ -265,26 +265,25 @@ fn build_leaf_wise_tree(
       let hess_hist = GpuBuffer::zeros_f32(hist_size)?;
       let gain_out  = GpuBuffer::zeros_f32(hist_size)?;
 
-      let mut active: Vec<bool> = vec![false; num_leaves];
-      active[0] = true;
-      let mut depth_map: Vec<usize> = vec![0; num_leaves];
-      let mut next_leaf = 1usize;
-
-      let mut nodes: Vec<SplitNode> = (0..num_leaves).map(|_| SplitNode {
+      let max_nodes = 2 * num_leaves - 1;
+      let mut nodes: Vec<SplitNode> = (0..max_nodes).map(|_| SplitNode {
             feature: 0, bin: 0, left_child: 0, right_child: 0, leaf_value: 0.0, is_leaf: true,
       }).collect();
 
-      for _iter in 0..num_leaves - 1 {
-            if active.iter().filter(|&&a| a).count() == 0 { break; }
+      let mut slot_tree: Vec<i32> = vec![-1; num_leaves];
+      slot_tree[0] = 0;
+      let mut depth_map: Vec<usize> = vec![0; max_nodes];
+      let mut next_tree_node = 1usize;
 
-            let active_i32: Vec<i32> = active.iter().map(|&a| if a { 1 } else { 0 }).collect();
+      for _iter in 0..num_leaves - 1 {
+            let active_i32: Vec<i32> = slot_tree.iter().map(|&t| if t >= 0 { 1 } else { 0 }).collect();
+            if active_i32.iter().sum::<i32>() == 0 { break; }
             let leaf_active_gpu = GpuBuffer::upload_i32(&active_i32)?;
 
             grad_hist.memset_zero(hist_size * 4)?;
             hess_hist.memset_zero(hist_size * 4)?;
 
             gpu_oblivious_histogram(&bins_fm, &node_idx, &grad_gpu, &hess_gpu, &grad_hist, &hess_hist, n, n_eff, n_bins, num_leaves);
-
             gpu_leaf_wise_best_split(&grad_hist, &hess_hist, &leaf_active_gpu, &gain_out, lambda, min_cw, num_leaves, n_eff, n_bins);
 
             let mut gain_host = vec![0.0f32; hist_size];
@@ -297,26 +296,38 @@ fn build_leaf_wise_tree(
 
             if best_gain <= min_gain { break; }
 
-            let best_leaf = best_idx / (n_eff * n_bins);
+            let best_slot = best_idx / (n_eff * n_bins);
             let best_feat = (best_idx % (n_eff * n_bins)) / n_bins;
             let best_bin  = (best_idx % n_bins) as u8;
 
-            if next_leaf >= num_leaves { break; }
-            if max_depth > 0 && depth_map[best_leaf] >= max_depth { break; }
+            let parent_tree = slot_tree[best_slot];
+            if parent_tree < 0 { break; }
+            if max_depth > 0 && depth_map[parent_tree as usize] >= max_depth { break; }
 
-            let right_leaf = next_leaf;
-            next_leaf += 1;
+            let right_slot = match slot_tree.iter().position(|&t| t < 0) {
+                  Some(s) => s,
+                  None => break,
+            };
+            if next_tree_node + 2 > max_nodes { break; }
 
-            depth_map[right_leaf] = depth_map[best_leaf] + 1;
-            nodes[best_leaf].feature = best_feat;
-            nodes[best_leaf].bin = best_bin;
-            nodes[best_leaf].left_child = best_leaf;
-            nodes[best_leaf].right_child = right_leaf;
-            nodes[best_leaf].is_leaf = false;
+            let left_tree  = next_tree_node;
+            let right_tree = next_tree_node + 1;
+            next_tree_node += 2;
 
-            active[right_leaf] = true;
+            let parent_depth = depth_map[parent_tree as usize];
+            depth_map[left_tree]  = parent_depth + 1;
+            depth_map[right_tree] = parent_depth + 1;
 
-            gpu_leaf_split_apply(&bins_fm, &node_idx, best_leaf, best_leaf, right_leaf, best_feat, best_bin, n, n_eff);
+            nodes[parent_tree as usize].feature = best_feat;
+            nodes[parent_tree as usize].bin = best_bin;
+            nodes[parent_tree as usize].left_child = left_tree;
+            nodes[parent_tree as usize].right_child = right_tree;
+            nodes[parent_tree as usize].is_leaf = false;
+
+            slot_tree[best_slot]  = left_tree as i32;
+            slot_tree[right_slot] = right_tree as i32;
+
+            gpu_leaf_split_apply(&bins_fm, &node_idx, best_slot, best_slot, right_slot, best_feat, best_bin, n, n_eff);
       }
 
       let leaf_grad = GpuBuffer::zeros_f32(num_leaves)?;
@@ -329,10 +340,9 @@ fn build_leaf_wise_tree(
       let mut leaf_values = vec![0.0f32; num_leaves];
       leaf_val.download_f32(&mut leaf_values)?;
 
-      for j in 0..num_leaves {
-            if nodes[j].is_leaf {
-                  nodes[j].leaf_value = leaf_values[j];
-            }
+      for slot in 0..num_leaves {
+            let t = slot_tree[slot];
+            if t >= 0 { nodes[t as usize].leaf_value = leaf_values[slot]; }
       }
 
       Ok(Tree { nodes })
