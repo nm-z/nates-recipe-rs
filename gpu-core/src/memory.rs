@@ -119,6 +119,14 @@ impl GpuBuffer {
             Ok(buf)
       }
 
+      pub fn zeros_f32(n: usize) -> Result<Self, HipError> {
+            Self::zeros_bytes(n * 4)
+      }
+
+      pub fn memset_zero(&self, n_bytes: usize) -> Result<(), HipError> {
+            check(unsafe { hipMemset(self.ptr, 0, n_bytes) })
+      }
+
       pub fn download(&self, dst: &mut [f64]) -> Result<(), HipError> {
             let bytes = dst.len() * std::mem::size_of::<f64>();
             check(unsafe {

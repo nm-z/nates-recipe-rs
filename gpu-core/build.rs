@@ -5,7 +5,7 @@ fn main() {
             "/opt/rocm/bin/amdclang++"
       };
       let out_dir = std::env::var("OUT_DIR").unwrap();
-      let kernels = ["elementwise", "reduce", "distance", "argsort", "tree", "dtw", "apriori"];
+      let kernels = ["elementwise", "reduce", "distance", "argsort", "tree", "dtw", "apriori", "lightgbm"];
 
       let mut objects = Vec::new();
       for name in &kernels {

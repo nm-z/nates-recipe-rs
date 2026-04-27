@@ -265,6 +265,11 @@ unsafe extern "C" {
     fn launch_rand_uniform(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
     fn launch_randn(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
     fn launch_bernoulli(out: *mut c_void, n: i32, p: f64, seed: u32, stream: *mut c_void);
+
+    // LightGBM leaf-wise kernels
+    fn launch_leaf_wise_best_split(grad_hist: *const c_void, hess_hist: *const c_void, leaf_active: *const c_void, lambda: f32, min_child_weight: f32, gain_out: *mut c_void, n_leaves: i32, n_features: i32, n_bins: i32, stream: *mut c_void);
+    fn launch_goss_sample(sorted_idx: *const c_void, weights_out: *mut c_void, uniform_rand: *const c_void, n_rows: i32, top_k: i32, keep_weight: f32, stream: *mut c_void);
+    fn launch_leaf_split_apply(bins_fm: *const c_void, node_idx: *mut c_void, target_leaf: i32, new_leaf_left: i32, new_leaf_right: i32, split_feature: i32, split_bin: u8, n_rows: i32, n_features: i32, stream: *mut c_void);
 }
 
 // Thread-local rocBLAS handle — created once per thread, never destroyed until thread exits.
@@ -1739,4 +1744,16 @@ pub fn gpu_bernoulli(n: usize, p: f64, seed: u32) -> Result<GpuBuffer, HipError>
       let out = GpuBuffer::alloc(n)?;
       unsafe { launch_bernoulli(out.ptr, n as i32, p, seed, std::ptr::null_mut()); }
       Ok(out)
+}
+
+pub fn gpu_leaf_wise_best_split(grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, leaf_active: &GpuBuffer, gain_out: &GpuBuffer, lambda: f32, min_child_weight: f32, n_leaves: usize, n_features: usize, n_bins: usize) {
+      unsafe { launch_leaf_wise_best_split(grad_hist.ptr as *const c_void, hess_hist.ptr as *const c_void, leaf_active.ptr as *const c_void, lambda, min_child_weight, gain_out.ptr as *mut c_void, n_leaves as i32, n_features as i32, n_bins as i32, std::ptr::null_mut()); }
+}
+
+pub fn gpu_goss_sample(sorted_idx: &GpuBuffer, weights_out: &GpuBuffer, uniform_rand: &GpuBuffer, n_rows: usize, top_k: usize, keep_weight: f32) {
+      unsafe { launch_goss_sample(sorted_idx.ptr as *const c_void, weights_out.ptr as *mut c_void, uniform_rand.ptr as *const c_void, n_rows as i32, top_k as i32, keep_weight, std::ptr::null_mut()); }
+}
+
+pub fn gpu_leaf_split_apply(bins_fm: &GpuBuffer, node_idx: &GpuBuffer, target_leaf: usize, new_leaf_left: usize, new_leaf_right: usize, split_feature: usize, split_bin: u8, n_rows: usize, n_features: usize) {
+      unsafe { launch_leaf_split_apply(bins_fm.ptr as *const c_void, node_idx.ptr as *mut c_void, target_leaf as i32, new_leaf_left as i32, new_leaf_right as i32, split_feature as i32, split_bin, n_rows as i32, n_features as i32, std::ptr::null_mut()); }
 }
