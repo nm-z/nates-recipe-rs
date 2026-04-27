@@ -19,3 +19,4 @@ kaggle_s6e4/cache/
 *.o
 *.a
 *.rlib
+.claude/worktrees/
