@@ -1,0 +1,16 @@
+[package]
+name = "lightgbm-rs"
+version = "0.1.0"
+edition = "2024"
+description = "LightGBM-equivalent gradient boosting — leaf-wise growth, GOSS, EFB — on ROCm/HIP"
+
+[workspace]
+
+[dependencies]
+gpu-core = { path = "../gpu-core" }
+rand = "0.9"
+rand_chacha = "0.9"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"

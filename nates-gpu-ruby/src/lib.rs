@@ -5,6 +5,8 @@ use gpu_core::kernels;
 use std::sync::Arc;
 use std::sync::Mutex;
 static CATBOOST_MODELS: Mutex<Vec<catboost_rs::Model>> = Mutex::new(Vec::new());
+static XGBOOST_MODELS: Mutex<Vec<xgboost_rs::Model>> = Mutex::new(Vec::new());
+static LIGHTGBM_MODELS: Mutex<Vec<lightgbm_rs::Model>> = Mutex::new(Vec::new());
 
 #[magnus::wrap(class = "NatesGpu::GpuBuffer")]
 struct RubyGpuBuffer {
@@ -1452,6 +1454,92 @@ fn catboost_predict(ruby: &Ruby, model_id: usize, x: RArray, n: usize) -> Result
       Ok(arr)
 }
 
+// ── XGBoost bridge ─────────────────────────────────────────────────────────
+
+fn xgb_train_multiclass(ruby: &Ruby, x: RArray, y: RArray, n: usize, p: usize, n_classes: usize, params_hash: Value) -> Result<usize, Error> {
+      let x_vec: Vec<f64> = x.to_vec()?;
+      let y_vec: Vec<usize> = y.to_vec()?;
+      let mut params = xgboost_rs::Params {
+            n_estimators: 100, max_depth: 6, learning_rate: 0.1, l2_reg: 1.0,
+            min_child_weight: 1.0, subsample: 1.0, colsample_bytree: 1.0,
+            n_bins: 256, seed: 42,
+      };
+      if let Ok(h) = magnus::RHash::try_convert(params_hash) {
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("n_estimators")) { params.n_estimators = v; }
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("max_depth")) { params.max_depth = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("lr")) { params.learning_rate = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("l2_reg")) { params.l2_reg = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("min_child_weight")) { params.min_child_weight = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("subsample")) { params.subsample = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("colsample_bytree")) { params.colsample_bytree = v; }
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("n_bins")) { params.n_bins = v; }
+            if let Ok(v) = h.fetch::<_, u64>(ruby.to_symbol("seed")) { params.seed = v; }
+      }
+      let model = xgboost_rs::train_multiclass(&x_vec, &y_vec, n, p, n_classes, &params)
+            .map_err(|e| Error::new(ruby.exception_runtime_error(), format!("{e}")))?;
+      let mut models = XGBOOST_MODELS.lock().unwrap();
+      let id = models.len();
+      models.push(model);
+      Ok(id)
+}
+
+fn xgb_predict_proba(ruby: &Ruby, model_id: usize, x: RArray, n: usize) -> Result<RArray, Error> {
+      let x_vec: Vec<f64> = x.to_vec()?;
+      let models = XGBOOST_MODELS.lock().unwrap();
+      let model = models.get(model_id)
+            .ok_or_else(|| Error::new(ruby.exception_runtime_error(), format!("no xgb model {model_id}")))?;
+      let probs = xgboost_rs::predict_proba(model, &x_vec, n)
+            .map_err(|e| Error::new(ruby.exception_runtime_error(), format!("{e}")))?;
+      let arr = ruby.ary_new();
+      for v in probs { arr.push(v).map_err(|e| e)?; }
+      Ok(arr)
+}
+
+// ── LightGBM bridge ────────────────────────────────────────────────────────
+
+fn lgbm_train_multiclass(ruby: &Ruby, x: RArray, y: RArray, n: usize, p: usize, n_classes: usize, params_hash: Value) -> Result<usize, Error> {
+      let x_vec: Vec<f64> = x.to_vec()?;
+      let y_vec: Vec<usize> = y.to_vec()?;
+      let mut params = lightgbm_rs::Params {
+            n_estimators: 100, num_leaves: 31, max_depth: 0, learning_rate: 0.1,
+            l2_reg: 0.0, min_child_weight: 1e-3, min_gain_to_split: 0.0,
+            n_bins: 256, goss_a: 0.0, goss_b: 0.0,
+            use_efb: false, efb_max_conflict: 0.0, seed: 42,
+      };
+      if let Ok(h) = magnus::RHash::try_convert(params_hash) {
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("n_estimators")) { params.n_estimators = v; }
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("num_leaves")) { params.num_leaves = v; }
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("max_depth")) { params.max_depth = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("lr")) { params.learning_rate = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("l2_reg")) { params.l2_reg = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("min_child_weight")) { params.min_child_weight = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("min_gain_to_split")) { params.min_gain_to_split = v; }
+            if let Ok(v) = h.fetch::<_, usize>(ruby.to_symbol("n_bins")) { params.n_bins = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("goss_a")) { params.goss_a = v; }
+            if let Ok(v) = h.fetch::<_, f64>(ruby.to_symbol("goss_b")) { params.goss_b = v; }
+            if let Ok(v) = h.fetch::<_, bool>(ruby.to_symbol("use_efb")) { params.use_efb = v; }
+            if let Ok(v) = h.fetch::<_, u64>(ruby.to_symbol("seed")) { params.seed = v; }
+      }
+      let model = lightgbm_rs::train_multiclass(&x_vec, &y_vec, n, p, n_classes, &params)
+            .map_err(|e| Error::new(ruby.exception_runtime_error(), format!("{e}")))?;
+      let mut models = LIGHTGBM_MODELS.lock().unwrap();
+      let id = models.len();
+      models.push(model);
+      Ok(id)
+}
+
+fn lgbm_predict_proba(ruby: &Ruby, model_id: usize, x: RArray, n: usize) -> Result<RArray, Error> {
+      let x_vec: Vec<f64> = x.to_vec()?;
+      let models = LIGHTGBM_MODELS.lock().unwrap();
+      let model = models.get(model_id)
+            .ok_or_else(|| Error::new(ruby.exception_runtime_error(), format!("no lgbm model {model_id}")))?;
+      let probs = lightgbm_rs::predict_proba(model, &x_vec, n)
+            .map_err(|e| Error::new(ruby.exception_runtime_error(), format!("{e}")))?;
+      let arr = ruby.ary_new();
+      for v in probs { arr.push(v).map_err(|e| e)?; }
+      Ok(arr)
+}
+
 // ── Module init ─────────────────────────────────────────────────────────────
 
 #[magnus::init(name = "nates_gpu")]
@@ -1748,6 +1836,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
       // CatBoost
       module.define_module_function("catboost_train", function!(catboost_train, 7))?;
       module.define_module_function("catboost_predict", function!(catboost_predict, 3))?;
+      module.define_module_function("xgb_train_multiclass", function!(xgb_train_multiclass, 6))?;
+      module.define_module_function("xgb_predict_proba", function!(xgb_predict_proba, 3))?;
+      module.define_module_function("lgbm_train_multiclass", function!(lgbm_train_multiclass, 6))?;
+      module.define_module_function("lgbm_predict_proba", function!(lgbm_predict_proba, 3))?;
 
       // Named parameter wrappers — generated from .rbs signatures
       ruby.eval::<magnus::Value>(r#"
