@@ -104,6 +104,15 @@ impl GpuBuffer {
             Ok(buf)
       }
 
+      pub fn upload_i32(data: &[i32]) -> Result<Self, HipError> {
+            let bytes = data.len() * 4;
+            let buf = Self::alloc_bytes(bytes)?;
+            check(unsafe {
+                  hipMemcpy(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D)
+            })?;
+            Ok(buf)
+      }
+
       pub fn zeros_bytes(n_bytes: usize) -> Result<Self, HipError> {
             let buf = Self::alloc_bytes(n_bytes)?;
             check(unsafe { hipMemset(buf.ptr, 0, n_bytes) })?;
@@ -112,6 +121,26 @@ impl GpuBuffer {
 
       pub fn download(&self, dst: &mut [f64]) -> Result<(), HipError> {
             let bytes = dst.len() * std::mem::size_of::<f64>();
+            check(unsafe {
+                  hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H)
+            })
+      }
+
+      pub fn download_f32(&self, dst: &mut [f32]) -> Result<(), HipError> {
+            let bytes = dst.len() * 4;
+            check(unsafe {
+                  hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H)
+            })
+      }
+
+      pub fn download_u8(&self, dst: &mut [u8]) -> Result<(), HipError> {
+            check(unsafe {
+                  hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len(), HIP_MEMCPY_D2H)
+            })
+      }
+
+      pub fn download_i32(&self, dst: &mut [i32]) -> Result<(), HipError> {
+            let bytes = dst.len() * 4;
             check(unsafe {
                   hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H)
             })

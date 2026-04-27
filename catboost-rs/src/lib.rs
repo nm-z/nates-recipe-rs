@@ -3,6 +3,12 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::Exp1;
 use std::collections::HashMap;
 use std::fmt;
+use gpu_core::memory::GpuBuffer;
+use gpu_core::kernels::{
+      gpu_oblivious_histogram, gpu_oblivious_split_eval,
+      gpu_oblivious_route_step, gpu_oblivious_route_full,
+      gpu_leaf_reduce, gpu_leaf_finalize,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -75,7 +81,6 @@ fn validate_train(x: &[f64], y: &[usize], n: usize, p: usize, nc: usize, params:
       for (i, &v) in x.iter().enumerate() {
             if v.is_nan() { return Err(Error::InvalidInput(format!("x[{i}] is NaN"))); }
       }
-      let cat_set: std::collections::HashSet<usize> = params.cat_features.iter().cloned().collect();
       for &cat_j in &params.cat_features {
             for i in 0..n {
                   let v = x[i * p + cat_j];
@@ -185,10 +190,6 @@ fn quantize_float_col(values: &[f64], n: usize, border_count: usize) -> (Vec<u32
       (binned, b)
 }
 
-#[derive(Clone)]
-struct HistBucket { grad_sum: f64, hess_sum: f64 }
-
-fn leaf_score(g: f64, h: f64, l2: f64) -> f64 { (g * g) / (h + l2) }
 fn leaf_weight(g: f64, h: f64, l2: f64) -> f64 { -g / (h + l2) }
 
 fn softmax_cpu(logits: &[f64], n: usize, nc: usize) -> Vec<f64> {
@@ -202,84 +203,9 @@ fn softmax_cpu(logits: &[f64], n: usize, nc: usize) -> Vec<f64> {
       probs
 }
 
-fn build_oblivious_tree(
-      bins: &[&[u32]], grads: &[f64], hesses: &[f64],
-      n: usize, n_features: usize, n_classes: usize, depth: usize, l2: f64,
-) -> (ObliviousTree, Vec<u32>) {
-      let n_leaves = 1usize << depth;
-      let mut leaf_indices = vec![0u32; n];
-      let mut split_features = Vec::with_capacity(depth);
-      let mut split_bins_vec = Vec::with_capacity(depth);
-
-      for d in 0..depth {
-            let n_nodes = 1u32 << d;
-            let mut best_feat = 0;
-            let mut best_bin = 0;
-            let mut best_gain = f64::NEG_INFINITY;
-
-            for feat in 0..n_features {
-                  let fb = bins[feat];
-                  let n_bins = fb.iter().max().map(|&v| v as usize + 1).unwrap_or(1);
-                  let mut gain_per_bin = vec![0.0f64; n_bins];
-                  let mut has_valid = vec![false; n_bins];
-
-                  for k in 0..n_classes {
-                        let mut leaf_hists = vec![vec![HistBucket { grad_sum: 0.0, hess_sum: 0.0 }; n_bins]; n_nodes as usize];
-                        for i in 0..n {
-                              let leaf = leaf_indices[i] as usize;
-                              let b = fb[i] as usize;
-                              leaf_hists[leaf][b].grad_sum += grads[i * n_classes + k];
-                              leaf_hists[leaf][b].hess_sum += hesses[i * n_classes + k];
-                        }
-                        for node in 0..n_nodes as usize {
-                              let hist = &leaf_hists[node];
-                              let tg: f64 = hist.iter().map(|h| h.grad_sum).sum();
-                              let th: f64 = hist.iter().map(|h| h.hess_sum).sum();
-                              if th < 1e-10 { continue; }
-                              let ps = leaf_score(tg, th, l2);
-                              let mut lg = 0.0;
-                              let mut lh = 0.0;
-                              for (bin, bucket) in hist.iter().enumerate() {
-                                    lg += bucket.grad_sum;
-                                    lh += bucket.hess_sum;
-                                    let rg = tg - lg;
-                                    let rh = th - lh;
-                                    if rh < 1e-10 || lh < 1e-10 { continue; }
-                                    gain_per_bin[bin] += leaf_score(lg, lh, l2)
-                                          + leaf_score(rg, rh, l2) - ps;
-                                    has_valid[bin] = true;
-                              }
-                        }
-                  }
-                  for (bin, &gain) in gain_per_bin.iter().enumerate() {
-                        if has_valid[bin] && gain > best_gain {
-                              best_gain = gain; best_feat = feat; best_bin = bin;
-                        }
-                  }
-            }
-            split_features.push(best_feat);
-            split_bins_vec.push(best_bin);
-            for i in 0..n {
-                  leaf_indices[i] = (leaf_indices[i] << 1) | ((bins[best_feat][i] as usize > best_bin) as u32);
-            }
-      }
-
-      let mut leaf_values: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
-      for k in 0..n_classes {
-            let mut lg = vec![0.0f64; n_leaves];
-            let mut lh = vec![0.0f64; n_leaves];
-            for i in 0..n {
-                  lg[leaf_indices[i] as usize] += grads[i * n_classes + k];
-                  lh[leaf_indices[i] as usize] += hesses[i * n_classes + k];
-            }
-            leaf_values.push((0..n_leaves).map(|j| leaf_weight(lg[j], lh[j], l2)).collect());
-      }
-      (ObliviousTree { split_features, split_bins: split_bins_vec, leaf_values, ts_borders: vec![] }, leaf_indices)
-}
-
 fn compute_ts_floats(
       y: &[usize], bins: &[Vec<u32>], perm: &[usize], cat_features: &[usize],
-      n_classes: usize, n: usize, prior: f64, class_priors: &[f64],
+      n_classes: usize, _n: usize, prior: f64, class_priors: &[f64],
 ) -> Vec<Vec<f64>> {
       let mut ts_floats = Vec::new();
       for &cat_j in cat_features {
@@ -312,24 +238,142 @@ fn compute_ts_bins_fresh(
       (ts_columns, ts_borders)
 }
 
-fn route_through_tree(
-      tree: &ObliviousTree, orig_bins: &[Vec<u32>], ts_columns: &[Vec<u32>],
-      p: usize, n: usize,
-) -> Vec<u32> {
-      let mut leaves = vec![0u32; n];
-      for i in 0..n {
-            let mut leaf = 0u32;
-            for (&feat, &bin) in tree.split_features.iter().zip(&tree.split_bins) {
-                  let sample_bin = if feat < p { orig_bins[feat][i] as usize } else { ts_columns[feat - p][i] as usize };
-                  leaf = (leaf << 1) | ((sample_bin > bin) as u32);
-            }
-            leaves[i] = leaf;
-      }
-      leaves
-}
-
 fn gen_permutations(n: usize, count: usize, rng: &mut ChaCha8Rng) -> Vec<Vec<usize>> {
       (0..count).map(|_| { let mut p: Vec<usize> = (0..n).collect(); p.shuffle(rng); p }).collect()
+}
+
+fn bins_feature_major_u8(all_bins: &[&[u32]], n_features: usize, n: usize) -> Vec<u8> {
+      let mut fm = vec![0u8; n_features * n];
+      for (j, col) in all_bins.iter().enumerate() {
+            for (i, &v) in col.iter().enumerate() {
+                  fm[j * n + i] = v.min(255) as u8;
+            }
+      }
+      fm
+}
+
+fn bins_row_major_u8(all_bins: &[&[u32]], n_features: usize, n: usize) -> Vec<u8> {
+      let mut rm = vec![0u8; n * n_features];
+      for i in 0..n {
+            for (j, col) in all_bins.iter().enumerate() {
+                  rm[i * n_features + j] = col[i].min(255) as u8;
+            }
+      }
+      rm
+}
+
+fn build_oblivious_tree_gpu(
+      bins_fm_gpu: &GpuBuffer,
+      bins_rm_gpu: &GpuBuffer,
+      grad_f32: &[f32],
+      hess_f32: &[f32],
+      n: usize, n_features: usize, n_classes: usize, depth: usize, l2: f64,
+      n_bins: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<Vec<f64>>, Vec<u8>) {
+      let n_leaves = 1usize << depth;
+      let lambda = l2 as f32;
+      let min_cw = 0.0f32;
+
+      let mut node_a = GpuBuffer::zeros_bytes(n).unwrap();
+      let mut node_b = GpuBuffer::zeros_bytes(n).unwrap();
+
+      let mut split_features = Vec::with_capacity(depth);
+      let mut split_bins_vec = Vec::with_capacity(depth);
+
+      let gain_elems = n_features * n_bins;
+
+      for d in 0..depth {
+            let n_nodes = 1usize << d;
+            let hist_bytes = n_nodes * n_features * n_bins * 4;
+            let mut gain_sum = vec![0.0f32; gain_elems];
+
+            for k in 0..n_classes {
+                  let grad_k: Vec<f32> = (0..n).map(|i| grad_f32[i * n_classes + k]).collect();
+                  let hess_k: Vec<f32> = (0..n).map(|i| hess_f32[i * n_classes + k]).collect();
+                  let g_gpu = GpuBuffer::upload_f32(&grad_k).unwrap();
+                  let h_gpu = GpuBuffer::upload_f32(&hess_k).unwrap();
+
+                  let grad_hist = GpuBuffer::zeros_bytes(hist_bytes).unwrap();
+                  let hess_hist = GpuBuffer::zeros_bytes(hist_bytes).unwrap();
+
+                  gpu_oblivious_histogram(
+                        bins_fm_gpu, &node_a, &g_gpu, &h_gpu,
+                        &grad_hist, &hess_hist,
+                        n, n_features, n_bins, n_nodes,
+                  );
+
+                  let gain_k = GpuBuffer::zeros_bytes(gain_elems * 4).unwrap();
+                  gpu_oblivious_split_eval(
+                        &grad_hist, &hess_hist, &gain_k,
+                        n_nodes, n_features, n_bins, lambda, min_cw,
+                  );
+
+                  let mut g_host = vec![0.0f32; gain_elems];
+                  gain_k.download_f32(&mut g_host).unwrap();
+                  for i in 0..gain_elems { gain_sum[i] += g_host[i]; }
+            }
+
+            let best_idx = gain_sum.iter().enumerate()
+                  .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                  .map(|(i, _)| i)
+                  .unwrap_or(0);
+            let best_feat = best_idx / n_bins;
+            let best_bin = best_idx % n_bins;
+
+            split_features.push(best_feat);
+            split_bins_vec.push(best_bin);
+
+            gpu_oblivious_route_step(
+                  bins_rm_gpu, &node_a, &node_b,
+                  best_feat, best_bin.min(255) as u8,
+                  d, n, n_features,
+            );
+            std::mem::swap(&mut node_a, &mut node_b);
+      }
+
+      let mut leaf_values: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
+      for k in 0..n_classes {
+            let grad_k: Vec<f32> = (0..n).map(|i| grad_f32[i * n_classes + k]).collect();
+            let hess_k: Vec<f32> = (0..n).map(|i| hess_f32[i * n_classes + k]).collect();
+            let g_gpu = GpuBuffer::upload_f32(&grad_k).unwrap();
+            let h_gpu = GpuBuffer::upload_f32(&hess_k).unwrap();
+
+            let leaf_grad = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
+            let leaf_hess = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
+            let leaf_val = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
+
+            gpu_leaf_reduce(&node_a, &g_gpu, &h_gpu, &leaf_grad, &leaf_hess, n);
+            gpu_leaf_finalize(&leaf_grad, &leaf_hess, &leaf_val, lambda, n_leaves);
+
+            let mut lv_f32 = vec![0.0f32; n_leaves];
+            leaf_val.download_f32(&mut lv_f32).unwrap();
+            leaf_values.push(lv_f32.iter().map(|&v| v as f64).collect());
+      }
+
+      let mut leaf_idx = vec![0u8; n];
+      node_a.download_u8(&mut leaf_idx).unwrap();
+
+      (split_features, split_bins_vec, leaf_values, leaf_idx)
+}
+
+fn route_full_gpu(
+      bins_rm_gpu: &GpuBuffer,
+      split_features: &[usize],
+      split_bins: &[usize],
+      n: usize, n_features: usize,
+) -> Vec<u8> {
+      let depth = split_features.len();
+      let sf_i32: Vec<i32> = split_features.iter().map(|&f| f as i32).collect();
+      let sb_u8: Vec<u8> = split_bins.iter().map(|&b| b.min(255) as u8).collect();
+      let sf_gpu = GpuBuffer::upload_i32(&sf_i32).unwrap();
+      let sb_gpu = GpuBuffer::upload_u8(&sb_u8).unwrap();
+      let leaf_gpu = GpuBuffer::zeros_bytes(n).unwrap();
+
+      gpu_oblivious_route_full(bins_rm_gpu, &sf_gpu, &sb_gpu, &leaf_gpu, n, n_features, depth);
+
+      let mut out = vec![0u8; n];
+      leaf_gpu.download_u8(&mut out).unwrap();
+      out
 }
 
 pub fn train(
@@ -345,6 +389,8 @@ pub fn train(
       let mut support_logits: Vec<Vec<f64>> = (0..s).map(|_| vec![0.0f64; n * n_classes]).collect();
       let mut avg_logits = vec![0.0f64; n * n_classes];
       let mut trees = Vec::with_capacity(params.iterations);
+
+      let n_bins = params.border_count + 1;
 
       for t in 0..params.iterations {
             let perm_idx = t % s;
@@ -367,37 +413,45 @@ pub fn train(
             };
 
             let probs = softmax_cpu(&support_logits[perm_idx], n, n_classes);
-            let mut grads = vec![0.0f64; n * n_classes];
-            let mut hesses = vec![0.0f64; n * n_classes];
+            let mut grads_f32 = vec![0.0f32; n * n_classes];
+            let mut hesses_f32 = vec![0.0f32; n * n_classes];
             for i in 0..n {
                   for k in 0..n_classes {
                         let pk = probs[i * n_classes + k];
-                        grads[i * n_classes + k] = (pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
-                        hesses[i * n_classes + k] = (pk * (1.0 - pk)).max(1e-6) * bb[i];
+                        grads_f32[i * n_classes + k] = ((pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i]) as f32;
+                        hesses_f32[i * n_classes + k] = ((pk * (1.0 - pk)).max(1e-6) * bb[i]) as f32;
                   }
             }
 
-            let (mut tree, leaf_indices) = build_oblivious_tree(
-                  &all_bin_refs, &grads, &hesses, n, n_total, n_classes, params.depth, params.l2_reg,
+            let fm = bins_feature_major_u8(&all_bin_refs, n_total, n);
+            let rm = bins_row_major_u8(&all_bin_refs, n_total, n);
+            let bins_fm_gpu = GpuBuffer::upload_u8(&fm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let bins_rm_gpu = GpuBuffer::upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+
+            let (sf, sb, _leaf_values_grad, leaf_idx_u8) = build_oblivious_tree_gpu(
+                  &bins_fm_gpu, &bins_rm_gpu,
+                  &grads_f32, &hesses_f32,
+                  n, n_total, n_classes, params.depth, params.l2_reg, n_bins,
             );
-            tree.ts_borders = ts_bord;
 
             let n_leaves = 1usize << params.depth;
-            {
-                  let avg_probs = softmax_cpu(&avg_logits, n, n_classes);
-                  let mut new_lv: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
-                  for k in 0..n_classes {
-                        let mut lg = vec![0.0f64; n_leaves];
-                        let mut lh = vec![0.0f64; n_leaves];
-                        for i in 0..n {
-                              let pk = avg_probs[i * n_classes + k];
-                              lg[leaf_indices[i] as usize] += (pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
-                              lh[leaf_indices[i] as usize] += (pk * (1.0 - pk)).max(1e-6) * bb[i];
-                        }
-                        new_lv.push((0..n_leaves).map(|j| leaf_weight(lg[j], lh[j], params.l2_reg)).collect());
+            let leaf_indices: Vec<u32> = leaf_idx_u8.iter().map(|&v| v as u32).collect();
+
+            let avg_probs = softmax_cpu(&avg_logits, n, n_classes);
+            let mut new_lv: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
+            for k in 0..n_classes {
+                  let mut lg = vec![0.0f64; n_leaves];
+                  let mut lh = vec![0.0f64; n_leaves];
+                  for i in 0..n {
+                        let pk = avg_probs[i * n_classes + k];
+                        lg[leaf_indices[i] as usize] += (pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
+                        lh[leaf_indices[i] as usize] += (pk * (1.0 - pk)).max(1e-6) * bb[i];
                   }
-                  tree.leaf_values = new_lv;
+                  new_lv.push((0..n_leaves).map(|j| leaf_weight(lg[j], lh[j], params.l2_reg)).collect());
             }
+
+            let tree = ObliviousTree { split_features: sf.clone(), split_bins: sb.clone(), leaf_values: new_lv, ts_borders: ts_bord };
+
             for i in 0..n {
                   let leaf = leaf_indices[i] as usize;
                   for k in 0..n_classes {
@@ -409,7 +463,15 @@ pub fn train(
                   let rperm = &perms[r];
                   let r_ts_floats = compute_ts_floats(y, &bins, rperm, &params.cat_features, n_classes, n, params.ts_prior, &class_priors);
                   let r_ts_cols = bin_ts_floats(&r_ts_floats, &tree.ts_borders);
-                  let r_leaf_indices = route_through_tree(&tree, &bins, &r_ts_cols, p, n);
+
+                  let mut r_all_refs: Vec<&[u32]> = bins.iter().map(|v| v.as_slice()).collect();
+                  for col in &r_ts_cols { r_all_refs.push(col.as_slice()); }
+
+                  let r_rm = bins_row_major_u8(&r_all_refs, n_total, n);
+                  let r_bins_rm_gpu = GpuBuffer::upload_u8(&r_rm).unwrap();
+
+                  let r_leaf_u8 = route_full_gpu(&r_bins_rm_gpu, &sf, &sb, n, n_total);
+                  let r_leaf_indices: Vec<u32> = r_leaf_u8.iter().map(|&v| v as u32).collect();
 
                   let r_probs = softmax_cpu(&support_logits[r], n, n_classes);
                   let mut r_grads = vec![0.0f64; n * n_classes];
@@ -439,9 +501,7 @@ pub fn train(
                   }
             }
             trees.push(tree);
-            if (t + 1) % 1 == 0 {
-                  eprintln!("      cb iter={}/{}", t + 1, params.iterations);
-            }
+            eprintln!("      cb iter={}/{}", t + 1, params.iterations);
       }
 
       let mut ts_infos = Vec::new();
@@ -472,6 +532,7 @@ pub fn predict(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Error> {
 
       let nc = model.n_classes;
       let mut logits = vec![0.0f64; n * nc];
+
       for tree in &model.trees {
             let ts_columns: Vec<Vec<u32>> = if tree.ts_borders.is_empty() {
                   vec![]
@@ -481,10 +542,21 @@ pub fn predict(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Error> {
                         vals.iter().map(|&v| bord.partition_point(|&t| t <= v) as u32).collect()
                   }).collect()
             };
-            let leaves = route_through_tree(tree, &orig_bins, &ts_columns, p, n);
+
+            let n_total = p + ts_columns.len();
+            let mut all_refs: Vec<&[u32]> = orig_bins.iter().map(|v| v.as_slice()).collect();
+            for col in &ts_columns { all_refs.push(col.as_slice()); }
+
+            let rm = bins_row_major_u8(&all_refs, n_total, n);
+            let bins_rm_gpu = GpuBuffer::upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+
+            let leaf_u8 = route_full_gpu(&bins_rm_gpu, &tree.split_features, &tree.split_bins, n, n_total);
+
             for i in 0..n {
-                  let leaf = leaves[i] as usize;
-                  for k in 0..nc { logits[i * nc + k] += model.learning_rate * tree.leaf_values[k][leaf]; }
+                  let leaf = leaf_u8[i] as usize;
+                  for k in 0..nc {
+                        logits[i * nc + k] += model.learning_rate * tree.leaf_values[k][leaf];
+                  }
             }
       }
       Ok(softmax_cpu(&logits, n, nc))

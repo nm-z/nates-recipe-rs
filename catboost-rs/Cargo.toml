@@ -11,3 +11,7 @@ gpu-core = { path = "../gpu-core" }
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
