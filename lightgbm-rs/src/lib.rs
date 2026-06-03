@@ -82,7 +82,7 @@ fn validate_regression(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params
       if x.len() != n * p { return Err(Error::InvalidInput(format!("x.len()={} != n*p={}", x.len(), n * p))); }
       if y.len() != n { return Err(Error::InvalidInput(format!("y.len()={} != n={}", y.len(), n))); }
       if params.num_leaves < 2 { return Err(Error::InvalidInput("num_leaves must be >= 2".into())); }
-      if params.num_leaves > 255 { return Err(Error::InvalidInput("num_leaves must be <= 255".into())); }
+      if params.num_leaves > 65535 { return Err(Error::InvalidInput("num_leaves must be <= 65535".into())); }
       if params.n_bins < 2 || params.n_bins > 255 { return Err(Error::InvalidInput("n_bins must be in [2,255]".into())); }
       if params.goss_a < 0.0 || params.goss_a >= 1.0 { return Err(Error::InvalidInput("goss_a must be in [0,1)".into())); }
       if params.goss_b <= 0.0 || params.goss_b > 1.0 { return Err(Error::InvalidInput("goss_b must be in (0,1]".into())); }
@@ -100,7 +100,7 @@ fn validate_classification(x: &[f64], y: &[usize], n: usize, p: usize, n_classes
       if y.len() != n { return Err(Error::InvalidInput(format!("y.len()={} != n={}", y.len(), n))); }
       if y.iter().any(|&v| v >= n_classes) { return Err(Error::InvalidInput("y contains value >= n_classes".into())); }
       if params.num_leaves < 2 { return Err(Error::InvalidInput("num_leaves must be >= 2".into())); }
-      if params.num_leaves > 255 { return Err(Error::InvalidInput("num_leaves must be <= 255".into())); }
+      if params.num_leaves > 65535 { return Err(Error::InvalidInput("num_leaves must be <= 65535".into())); }
       if params.n_bins < 2 || params.n_bins > 255 { return Err(Error::InvalidInput("n_bins must be in [2,255]".into())); }
       if params.goss_a < 0.0 || params.goss_a >= 1.0 { return Err(Error::InvalidInput("goss_a must be in [0,1)".into())); }
       if params.goss_b <= 0.0 || params.goss_b > 1.0 { return Err(Error::InvalidInput("goss_b must be in (0,1]".into())); }
@@ -215,7 +215,8 @@ fn mc_grad_hess_row(logits: &[f32], y_true: usize, k: usize) -> (f32, f32) {
 
 fn apply_goss(grad: &mut [f32], hess: &mut [f32], n: usize, goss_a: f64, goss_b: f64, rng: &mut ChaCha8Rng) -> Result<(), HipError> {
       let top_k = (n as f64 * goss_a).ceil() as usize;
-      let keep_weight = ((1.0 - goss_a) / goss_b) as f32;
+      let sample_rate = goss_b as f32;                       // keep prob for small-gradient rows
+      let keep_weight = ((1.0 - goss_a) / goss_b) as f32;    // amplification for kept rows
 
       let abs_grad: Vec<f32> = grad.iter().map(|&g| g.abs()).collect();
       let mut sorted_idx: Vec<i32> = (0..n as i32).collect();
@@ -226,7 +227,7 @@ fn apply_goss(grad: &mut [f32], hess: &mut [f32], n: usize, goss_a: f64, goss_b:
       let rand_gpu = GpuBuffer::upload_f32(&rand_vals)?;
       let weights_gpu = GpuBuffer::zeros_f32(n)?;
 
-      gpu_goss_sample(&sorted_gpu, &weights_gpu, &rand_gpu, n, top_k, keep_weight);
+      gpu_goss_sample(&sorted_gpu, &weights_gpu, &rand_gpu, n, top_k, sample_rate, keep_weight);
 
       let mut weights = vec![0.0f32; n];
       weights_gpu.download_f32(&mut weights)?;
@@ -237,6 +238,36 @@ fn apply_goss(grad: &mut [f32], hess: &mut [f32], n: usize, goss_a: f64, goss_b:
       Ok(())
 }
 
+// Evaluate the best split for a set of leaf slots on the GPU and download the
+// packed results. Outputs are indexed by eval position (0..slots.len()), NOT by
+// slot id — the caller scatters them into per-slot host caches.
+fn eval_best_split(
+      grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, count_hist: &GpuBuffer,
+      best_gain_gpu: &GpuBuffer, best_feat_gpu: &GpuBuffer, best_bin_gpu: &GpuBuffer, best_lc_gpu: &GpuBuffer,
+      slots: &[i32], n_eff: usize, n_bins: usize, lambda: f32, min_cw: f32,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<i32>, Vec<i32>), HipError> {
+      let ne = slots.len();
+      let ids = GpuBuffer::upload_i32(slots)?;
+      gpu_lgbm_best_split(grad_hist, hess_hist, count_hist, &ids,
+            best_gain_gpu, best_feat_gpu, best_bin_gpu, best_lc_gpu,
+            ne, n_eff, n_bins, lambda, min_cw);
+      let mut hg = vec![0.0f32; ne];
+      let mut hf = vec![0i32; ne];
+      let mut hb = vec![0i32; ne];
+      let mut hc = vec![0i32; ne];
+      best_gain_gpu.download_f32(&mut hg)?;
+      best_feat_gpu.download_i32(&mut hf)?;
+      best_bin_gpu.download_i32(&mut hb)?;
+      best_lc_gpu.download_i32(&mut hc)?;
+      Ok((hg, hf, hb, hc))
+}
+
+// Leaf-wise (best-first) tree with LightGBM's histogram trick: the root histogram
+// is built once; each split builds the histogram for only the SMALLER child and
+// derives the larger child by subtraction (parent − sibling). Split selection is
+// argmaxed on the GPU per leaf; only the two leaves changed by a split are
+// re-evaluated (leaf-wise caching). Returns the tree plus the per-row training
+// predictions (the final leaf assignment is reused — no CPU tree-walk).
 fn build_leaf_wise_tree(
       bins_eff: &[Vec<u8>],
       grad_h: &[f32],
@@ -249,21 +280,32 @@ fn build_leaf_wise_tree(
       lambda: f32,
       min_cw: f32,
       min_gain: f32,
-) -> Result<Tree, HipError> {
+) -> Result<(Tree, Vec<f32>), Error> {
+      let hist_size = (num_leaves as u64)
+            .checked_mul(n_eff as u64)
+            .and_then(|v| v.checked_mul(n_bins as u64))
+            .filter(|&v| v <= i32::MAX as u64)
+            .ok_or_else(|| Error::InvalidInput(format!(
+                  "histogram size num_leaves*n_eff*n_bins = {num_leaves}*{n_eff}*{n_bins} overflows i32")))? as usize;
+
       let mut bins_flat = vec![0u8; n_eff * n];
       for (j, col) in bins_eff.iter().enumerate() {
             bins_flat[j * n..(j + 1) * n].copy_from_slice(col);
       }
 
-      let bins_fm = GpuBuffer::upload_u8(&bins_flat)?;
-      let node_idx = GpuBuffer::zeros_bytes(n)?;
+      let bins_fm  = GpuBuffer::upload_u8(&bins_flat)?;
+      let node_idx = GpuBuffer::zeros_bytes(n * 4)?;          // i32 slot per row, all = slot 0
       let grad_gpu = GpuBuffer::upload_f32(grad_h)?;
       let hess_gpu = GpuBuffer::upload_f32(hess_h)?;
 
-      let hist_size = num_leaves * n_eff * n_bins;
-      let grad_hist = GpuBuffer::zeros_f32(hist_size)?;
-      let hess_hist = GpuBuffer::zeros_f32(hist_size)?;
-      let gain_out  = GpuBuffer::zeros_f32(hist_size)?;
+      let grad_hist  = GpuBuffer::zeros_f32(hist_size)?;
+      let hess_hist  = GpuBuffer::zeros_f32(hist_size)?;
+      let count_hist = GpuBuffer::zeros_f32(hist_size)?;
+
+      let best_gain_gpu = GpuBuffer::zeros_f32(num_leaves)?;
+      let best_feat_gpu = GpuBuffer::zeros_bytes(num_leaves * 4)?;
+      let best_bin_gpu  = GpuBuffer::zeros_bytes(num_leaves * 4)?;
+      let best_lc_gpu   = GpuBuffer::zeros_bytes(num_leaves * 4)?;
 
       let max_nodes = 2 * num_leaves - 1;
       let mut nodes: Vec<SplitNode> = (0..max_nodes).map(|_| SplitNode {
@@ -273,68 +315,86 @@ fn build_leaf_wise_tree(
       let mut slot_tree: Vec<i32> = vec![-1; num_leaves];
       slot_tree[0] = 0;
       let mut depth_map: Vec<usize> = vec![0; max_nodes];
+      let mut slot_count: Vec<usize> = vec![0; num_leaves];
+      slot_count[0] = n;
       let mut next_tree_node = 1usize;
 
-      for _iter in 0..num_leaves - 1 {
-            let active_i32: Vec<i32> = slot_tree.iter().map(|&t| if t >= 0 { 1 } else { 0 }).collect();
-            if active_i32.iter().sum::<i32>() == 0 { break; }
-            let leaf_active_gpu = GpuBuffer::upload_i32(&active_i32)?;
+      // host caches of each live slot's best split (scattered from GPU evals)
+      let mut bg = vec![f32::NEG_INFINITY; num_leaves];
+      let mut bf = vec![-1i32; num_leaves];
+      let mut bb = vec![-1i32; num_leaves];
+      let mut blc = vec![0i32; num_leaves];
 
-            grad_hist.memset_zero(hist_size * 4)?;
-            hess_hist.memset_zero(hist_size * 4)?;
+      // root: one full histogram pass, then evaluate its split
+      gpu_lgbm_histogram(&bins_fm, &node_idx, &grad_gpu, &hess_gpu, &grad_hist, &hess_hist, &count_hist, 0, n, n_eff, n_bins);
+      let (hg, hf, hb, hc) = eval_best_split(&grad_hist, &hess_hist, &count_hist, &best_gain_gpu, &best_feat_gpu, &best_bin_gpu, &best_lc_gpu, &[0], n_eff, n_bins, lambda, min_cw)?;
+      bg[0] = hg[0]; bf[0] = hf[0]; bb[0] = hb[0]; blc[0] = hc[0];
 
-            gpu_oblivious_histogram(&bins_fm, &node_idx, &grad_gpu, &hess_gpu, &grad_hist, &hess_hist, n, n_eff, n_bins, num_leaves);
-            gpu_leaf_wise_best_split(&grad_hist, &hess_hist, &leaf_active_gpu, &gain_out, lambda, min_cw, num_leaves, n_eff, n_bins);
+      for _ in 0..num_leaves - 1 {
+            // pick the globally best splittable live leaf from the host cache
+            let mut s_sel: i32 = -1;
+            let mut s_gain = f32::NEG_INFINITY;
+            for slot in 0..num_leaves {
+                  let t = slot_tree[slot];
+                  if t < 0 || bf[slot] < 0 { continue; }
+                  if max_depth > 0 && depth_map[t as usize] >= max_depth { continue; }
+                  if bg[slot] > s_gain { s_gain = bg[slot]; s_sel = slot as i32; }
+            }
+            if s_sel < 0 || s_gain <= min_gain { break; }
+            let s = s_sel as usize;
 
-            let mut gain_host = vec![0.0f32; hist_size];
-            gain_out.download_f32(&mut gain_host)?;
+            let feat = bf[s] as usize;
+            let bin = bb[s] as u8;
+            let cl = blc[s] as usize;
+            let cs = slot_count[s];
+            let cr = cs.saturating_sub(cl);
 
-            let (best_idx, best_gain) = gain_host.iter().enumerate()
-                  .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                  .map(|(i, &g)| (i, g))
-                  .unwrap_or((0, f32::NEG_INFINITY));
-
-            if best_gain <= min_gain { break; }
-
-            let best_slot = best_idx / (n_eff * n_bins);
-            let best_feat = (best_idx % (n_eff * n_bins)) / n_bins;
-            let best_bin  = (best_idx % n_bins) as u8;
-
-            let parent_tree = slot_tree[best_slot];
-            if parent_tree < 0 { break; }
-            if max_depth > 0 && depth_map[parent_tree as usize] >= max_depth { break; }
-
-            let right_slot = match slot_tree.iter().position(|&t| t < 0) {
-                  Some(s) => s,
+            let r = match slot_tree.iter().position(|&t| t < 0) {
+                  Some(rr) => rr,
                   None => break,
             };
             if next_tree_node + 2 > max_nodes { break; }
 
-            let left_tree  = next_tree_node;
+            let parent_tree = slot_tree[s] as usize;
+            let left_tree = next_tree_node;
             let right_tree = next_tree_node + 1;
             next_tree_node += 2;
+            depth_map[left_tree]  = depth_map[parent_tree] + 1;
+            depth_map[right_tree] = depth_map[parent_tree] + 1;
 
-            let parent_depth = depth_map[parent_tree as usize];
-            depth_map[left_tree]  = parent_depth + 1;
-            depth_map[right_tree] = parent_depth + 1;
+            nodes[parent_tree].feature = feat;
+            nodes[parent_tree].bin = bin;
+            nodes[parent_tree].left_child = left_tree;
+            nodes[parent_tree].right_child = right_tree;
+            nodes[parent_tree].is_leaf = false;
 
-            nodes[parent_tree as usize].feature = best_feat;
-            nodes[parent_tree as usize].bin = best_bin;
-            nodes[parent_tree as usize].left_child = left_tree;
-            nodes[parent_tree as usize].right_child = right_tree;
-            nodes[parent_tree as usize].is_leaf = false;
+            // Smaller child -> fresh slot r (built directly); larger child reuses
+            // parent slot s (derived by subtraction). The apply kernel routes
+            // bin<=split_bin -> left_arg, else -> right_arg.
+            let (left_arg, right_arg) = if cl <= cr { (r, s) } else { (s, r) };
+            slot_tree[left_arg]  = left_tree as i32;
+            slot_tree[right_arg] = right_tree as i32;
+            slot_count[left_arg]  = cl;
+            slot_count[right_arg] = cr;
 
-            slot_tree[best_slot]  = left_tree as i32;
-            slot_tree[right_slot] = right_tree as i32;
+            gpu_leaf_split_apply(&bins_fm, &node_idx, s, left_arg, right_arg, feat, bin, n, n_eff);
 
-            gpu_leaf_split_apply(&bins_fm, &node_idx, best_slot, best_slot, right_slot, best_feat, best_bin, n, n_eff);
+            // parent histogram still sits in slot s: build smaller child fresh into
+            // r, then slot s -= slot r yields the larger child. Order is mandatory.
+            gpu_lgbm_histogram(&bins_fm, &node_idx, &grad_gpu, &hess_gpu, &grad_hist, &hess_hist, &count_hist, r, n, n_eff, n_bins);
+            gpu_lgbm_hist_subtract(&grad_hist, &hess_hist, &count_hist, s, r, n_eff, n_bins);
+
+            let two = [r as i32, s as i32];
+            let (hg, hf, hb, hc) = eval_best_split(&grad_hist, &hess_hist, &count_hist, &best_gain_gpu, &best_feat_gpu, &best_bin_gpu, &best_lc_gpu, &two, n_eff, n_bins, lambda, min_cw)?;
+            bg[r] = hg[0]; bf[r] = hf[0]; bb[r] = hb[0]; blc[r] = hc[0];
+            bg[s] = hg[1]; bf[s] = hf[1]; bb[s] = hb[1]; blc[s] = hc[1];
       }
 
       let leaf_grad = GpuBuffer::zeros_f32(num_leaves)?;
       let leaf_hess = GpuBuffer::zeros_f32(num_leaves)?;
       let leaf_val  = GpuBuffer::zeros_f32(num_leaves)?;
 
-      gpu_leaf_reduce(&node_idx, &grad_gpu, &hess_gpu, &leaf_grad, &leaf_hess, n);
+      gpu_lgbm_leaf_reduce(&node_idx, &grad_gpu, &hess_gpu, &leaf_grad, &leaf_hess, n);
       gpu_leaf_finalize(&leaf_grad, &leaf_hess, &leaf_val, lambda, num_leaves);
 
       let mut leaf_values = vec![0.0f32; num_leaves];
@@ -345,7 +405,12 @@ fn build_leaf_wise_tree(
             if t >= 0 { nodes[t as usize].leaf_value = leaf_values[slot]; }
       }
 
-      Ok(Tree { nodes })
+      // reuse the training-pass leaf assignment for self-predictions (no CPU walk)
+      let mut node_assign = vec![0i32; n];
+      node_idx.download_i32(&mut node_assign)?;
+      let train_preds: Vec<f32> = node_assign.iter().map(|&slot| leaf_values[slot as usize]).collect();
+
+      Ok((Tree { nodes }, train_preds))
 }
 
 fn predict_tree_cpu(tree: &Tree, bins_flat: &[u8], n: usize, _n_eff: usize) -> Vec<f32> {
@@ -392,11 +457,6 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
       let mut pred = vec![0.0f32; n];
       let mut trees: Vec<Tree> = Vec::with_capacity(params.n_estimators);
 
-      let mut bins_flat = vec![0u8; n_eff * n];
-      for (j, col) in bins_eff.iter().enumerate() {
-            bins_flat[j * n..(j + 1) * n].copy_from_slice(col);
-      }
-
       for t in 0..params.n_estimators {
             let (mut grad, mut hess) = mse_grad_hess(&pred, &y_f32, n);
 
@@ -404,9 +464,7 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
                   apply_goss(&mut grad, &mut hess, n, params.goss_a, params.goss_b, &mut rng)?;
             }
 
-            let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
-
-            let leaf_preds = predict_tree_cpu(&tree, &bins_flat, n, n_eff);
+            let (tree, leaf_preds) = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
             for i in 0..n { pred[i] += lr * leaf_preds[i]; }
             eprintln!("      lgbm iter={}/{}", t + 1, params.n_estimators);
             trees.push(tree);
@@ -474,11 +532,6 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
       let mut pred_logits = vec![0.0f32; n * n_classes];
       let mut all_trees: Vec<Vec<Tree>> = (0..n_classes).map(|_| Vec::with_capacity(params.n_estimators)).collect();
 
-      let mut bins_flat = vec![0u8; n_eff * n];
-      for (j, col) in bins_eff.iter().enumerate() {
-            bins_flat[j * n..(j + 1) * n].copy_from_slice(col);
-      }
-
       for t in 0..params.n_estimators {
             for k in 0..n_classes {
                   let (mut grad, mut hess): (Vec<f32>, Vec<f32>) = (0..n).map(|i| {
@@ -490,9 +543,7 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
                         apply_goss(&mut grad, &mut hess, n, params.goss_a, params.goss_b, &mut rng)?;
                   }
 
-                  let tree = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
-
-                  let leaf_preds = predict_tree_cpu(&tree, &bins_flat, n, n_eff);
+                  let (tree, leaf_preds) = build_leaf_wise_tree(&bins_eff, &grad, &hess, n, n_eff, eff_n_bins, params.num_leaves, params.max_depth, lambda, min_cw, min_gain)?;
                   for i in 0..n { pred_logits[i * n_classes + k] += lr * leaf_preds[i]; }
                   all_trees[k].push(tree);
             }
@@ -650,7 +701,7 @@ mod tests {
             let params = Params::default();
 
             assert!(train(&x, &y, 2, 1, &Params { num_leaves: 1, ..Default::default() }).is_err());
-            assert!(train(&x, &y, 2, 1, &Params { num_leaves: 256, ..Default::default() }).is_err());
+            assert!(train(&x, &y, 2, 1, &Params { num_leaves: 70000, ..Default::default() }).is_err());
             assert!(train(&x, &y, 2, 1, &Params { n_bins: 1, ..Default::default() }).is_err());
             assert!(train(&x, &y, 3, 1, &params).is_err());
             assert!(train_multiclass(&x, &yu, 2, 1, 1, &params).is_err());

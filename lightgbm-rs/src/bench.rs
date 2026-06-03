@@ -18,16 +18,22 @@ fn load_csv(path: &str) -> (Vec<f64>, Vec<usize>, usize, usize) {
 }
 
 fn main() {
-      let (x_tr, y_tr, n_tr, p) = load_csv("/tmp/covtype_train.csv");
-      let (x_te, y_te, n_te, p_te) = load_csv("/tmp/covtype_test.csv");
+      let args: Vec<String> = std::env::args().collect();
+      let n_estimators: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
+      let train_csv = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/covtype_train.csv");
+      let test_csv = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/covtype_test.csv");
+      let num_leaves: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(63);
+
+      let (x_tr, y_tr, n_tr, p) = load_csv(train_csv);
+      let (x_te, y_te, n_te, p_te) = load_csv(test_csv);
       assert_eq!(p, p_te);
 
       let n_classes = *y_tr.iter().max().unwrap() + 1;
       eprintln!("Covtype: train={n_tr} test={n_te} features={p} classes={n_classes}");
 
       let params = Params {
-            n_estimators: 1000,
-            num_leaves: 63,
+            n_estimators,
+            num_leaves,
             max_depth: 0,
             learning_rate: 0.05,
             l2_reg: 1.0,
