@@ -3,6 +3,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::hip::*;
 
+unsafe extern "C" {
+      fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, size: usize, kind: i32, stream: *mut c_void) -> i32;
+}
+
 static SPILL_MODE: AtomicBool = AtomicBool::new(false);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -158,6 +162,84 @@ impl GpuBuffer {
       pub fn n_floats(&self) -> usize { self.len / std::mem::size_of::<f64>() }
       pub fn ptr_addr(&self) -> usize { self.ptr as usize }
       pub fn ptr_raw(&self) -> *mut c_void { self.ptr }
+
+      pub fn is_empty(&self) -> bool { self.len == 0 }
+
+      pub fn as_ptr_offset(&self, n_floats: usize) -> *mut c_void {
+            unsafe { (self.ptr as *mut u8).add(n_floats * 8) as *mut c_void }
+      }
+
+      pub fn view(&self, offset_floats: usize, len_floats: usize) -> GpuBuffer {
+            GpuBuffer::borrow(self.as_ptr_offset(offset_floats), len_floats * 8)
+      }
+
+      pub fn copy_from(&mut self, src: &GpuBuffer, n_bytes: usize) -> Result<(), HipError> {
+            check(unsafe { hipMemcpy(self.ptr, src.ptr as *const c_void, n_bytes, HIP_MEMCPY_D2D) })
+      }
+
+      pub fn fill_bytes(&self, value: u8, n_bytes: usize) -> Result<(), HipError> {
+            check(unsafe { hipMemset(self.ptr, value as i32, n_bytes) })
+      }
+
+      pub fn upload_async(data: &[f64], stream: *mut c_void) -> Result<Self, HipError> {
+            let bytes = data.len() * std::mem::size_of::<f64>();
+            let buf = Self::alloc(data.len())?;
+            check(unsafe {
+                  hipMemcpyAsync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, stream)
+            })?;
+            Ok(buf)
+      }
+
+      pub fn download_async(&self, dst: &mut [f64], stream: *mut c_void) -> Result<(), HipError> {
+            let bytes = dst.len() * std::mem::size_of::<f64>();
+            check(unsafe {
+                  hipMemcpyAsync(dst.as_mut_ptr() as *mut c_void, self.ptr as *const c_void, bytes, HIP_MEMCPY_D2H, stream)
+            })
+      }
+
+      pub fn download_vec(&self) -> Result<Vec<f64>, HipError> {
+            let mut v = vec![0.0f64; self.n_floats()];
+            self.download(&mut v)?;
+            Ok(v)
+      }
+
+      pub fn download_vec_f32(&self) -> Result<Vec<f32>, HipError> {
+            let mut v = vec![0.0f32; self.len / 4];
+            self.download_f32(&mut v)?;
+            Ok(v)
+      }
+
+      pub fn upload_f16(data: &[half::f16]) -> Result<Self, HipError> {
+            let bytes = data.len() * 2;
+            let buf = Self::alloc_bytes(bytes)?;
+            check(unsafe {
+                  hipMemcpy(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D)
+            })?;
+            Ok(buf)
+      }
+
+      pub fn download_f16(&self, dst: &mut [half::f16]) -> Result<(), HipError> {
+            let bytes = dst.len() * 2;
+            check(unsafe {
+                  hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr as *const c_void, bytes, HIP_MEMCPY_D2H)
+            })
+      }
+
+      pub fn upload_bf16(data: &[half::bf16]) -> Result<Self, HipError> {
+            let bytes = data.len() * 2;
+            let buf = Self::alloc_bytes(bytes)?;
+            check(unsafe {
+                  hipMemcpy(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D)
+            })?;
+            Ok(buf)
+      }
+
+      pub fn download_bf16(&self, dst: &mut [half::bf16]) -> Result<(), HipError> {
+            let bytes = dst.len() * 2;
+            check(unsafe {
+                  hipMemcpy(dst.as_mut_ptr() as *mut c_void, self.ptr as *const c_void, bytes, HIP_MEMCPY_D2H)
+            })
+      }
 }
 
 impl Drop for GpuBuffer {

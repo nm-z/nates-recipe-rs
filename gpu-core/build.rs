@@ -5,36 +5,61 @@ fn main() {
             "/opt/rocm/bin/amdclang++"
       };
       let out_dir = std::env::var("OUT_DIR").unwrap();
-      let kernels = ["elementwise", "reduce", "distance", "argsort", "tree", "dtw", "apriori", "lightgbm"];
+
+      fn collect_hip_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return; };
+            for entry in entries.flatten() {
+                  let path = entry.path();
+                  if path.is_dir() {
+                        collect_hip_files(&path, out);
+                  } else if path.extension().map_or(false, |e| e == "hip") {
+                        out.push(path);
+                  }
+            }
+      }
+
+      let mut hip_files = Vec::new();
+      collect_hip_files(std::path::Path::new("src/kernels"), &mut hip_files);
 
       let mut objects = Vec::new();
-      for name in &kernels {
-            let src = format!("src/kernels/{}.hip", name);
-            let obj = format!("{}/{}.o", out_dir, name);
-            if std::path::Path::new(&src).exists() {
-                  println!("cargo:rerun-if-changed={}", src);
-                  let src_mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
-                  let obj_mtime = std::fs::metadata(&obj).and_then(|m| m.modified()).ok();
-                  let needs_rebuild = match (src_mtime, obj_mtime) {
-                        (Some(s), Some(o)) => s > o,
-                        _ => true,
-                  };
-                  if needs_rebuild {
-                        let status = std::process::Command::new(hipcc)
-                              .args(&["-x", "hip", "--rocm-path=/opt/rocm",
-                                    "-I/home/nate/.rocm-install/rocm/include",
-                                    "-c", "-fPIC", "--offload-arch=gfx1101", "-O3",
-                                    &src, "-o", &obj])
-                              .status()
-                              .expect("hipcc failed");
-                        assert!(status.success(), "hipcc failed for {}", src);
+      for src_path in &hip_files {
+            let src = src_path.to_str().unwrap();
+            let rel = src_path.strip_prefix("src/kernels").unwrap();
+            let obj_name = rel.to_str().unwrap().replace(['/', '\\', '.'], "_");
+            let obj = format!("{}/{}.o", out_dir, obj_name);
+            println!("cargo:rerun-if-changed={}", src);
+            let src_mtime = std::fs::metadata(src).and_then(|m| m.modified()).ok();
+            let obj_mtime = std::fs::metadata(&obj).and_then(|m| m.modified()).ok();
+            let needs_rebuild = match (src_mtime, obj_mtime) {
+                  (Some(s), Some(o)) => s > o,
+                  _ => true,
+            };
+            if needs_rebuild {
+                  let status = std::process::Command::new(hipcc)
+                        .args(&["-x", "hip", "--rocm-path=/opt/rocm",
+                              "-I/home/nate/.rocm-install/rocm/include",
+                              "-c", "-fPIC", "--offload-arch=gfx1101", "-O3",
+                              src, "-o", &obj])
+                        .status()
+                        .expect("hipcc failed");
+                  assert!(status.success(), "hipcc failed for {}", src);
+            }
+            objects.push(obj);
+      }
+
+      if let Ok(entries) = std::fs::read_dir(&out_dir) {
+            for entry in entries.flatten() {
+                  let p = entry.path();
+                  if p.to_str().map_or(false, |s| s.ends_with("_hip.o"))
+                        && !objects.iter().any(|o| std::path::Path::new(o) == p) {
+                        let _ = std::fs::remove_file(&p);
                   }
-                  objects.push(obj);
             }
       }
 
       if !objects.is_empty() {
             let lib_path = format!("{}/libhipkernels.a", out_dir);
+            let _ = std::fs::remove_file(&lib_path);
             let mut ar = std::process::Command::new("ar");
             ar.args(&["rcs", &lib_path]);
             for obj in &objects { ar.arg(obj); }
@@ -48,5 +73,6 @@ fn main() {
       println!("cargo:rustc-link-search=native=/home/nate/.rocm-install/rocm/lib");
       println!("cargo:rustc-link-lib=dylib=rocblas");
       println!("cargo:rustc-link-lib=dylib=rocsolver");
+      println!("cargo:rustc-link-lib=dylib=rocfft");
       println!("cargo:rustc-link-lib=dylib=stdc++");
 }

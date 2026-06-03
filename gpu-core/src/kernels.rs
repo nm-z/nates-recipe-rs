@@ -2,15 +2,12 @@ use std::ffi::c_void;
 use crate::memory::GpuBuffer;
 use crate::hip::{HipError, check};
 
-#[cfg(debug_assertions)]
-fn check_launch() {
+pub(crate) fn check_launch() {
       let err = unsafe { crate::hip::hipGetLastError() };
       assert!(err == 0, "HIP kernel launch failed with error code {}", err);
 }
-#[cfg(not(debug_assertions))]
-fn check_launch() {}
 
-fn safe_i32(v: usize) -> i32 {
+pub(crate) fn safe_i32(v: usize) -> i32 {
       assert!(v <= i32::MAX as usize, "size {} overflows i32", v);
       v as i32
 }
@@ -266,9 +263,12 @@ unsafe extern "C" {
     fn launch_randn(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
     fn launch_bernoulli(out: *mut c_void, n: i32, p: f64, seed: u32, stream: *mut c_void);
 
-    // LightGBM leaf-wise kernels
-    fn launch_leaf_wise_best_split(grad_hist: *const c_void, hess_hist: *const c_void, leaf_active: *const c_void, lambda: f32, min_child_weight: f32, gain_out: *mut c_void, n_leaves: i32, n_features: i32, n_bins: i32, stream: *mut c_void);
-    fn launch_goss_sample(sorted_idx: *const c_void, weights_out: *mut c_void, uniform_rand: *const c_void, n_rows: i32, top_k: i32, keep_weight: f32, stream: *mut c_void);
+    // LightGBM leaf-wise kernels (i32 leaf-slot index, f32 grad/hess/count histograms)
+    fn launch_lgbm_histogram(bins_fm: *const c_void, node_idx: *const c_void, grad: *const c_void, hess: *const c_void, grad_hist: *mut c_void, hess_hist: *mut c_void, count_hist: *mut c_void, target_slot: i32, n_rows: i32, n_eff: i32, n_bins: i32, stream: *mut c_void);
+    fn launch_lgbm_hist_subtract(grad_hist: *mut c_void, hess_hist: *mut c_void, count_hist: *mut c_void, dst_slot: i32, src_slot: i32, n_eff: i32, n_bins: i32, stream: *mut c_void);
+    fn launch_lgbm_best_split(grad_hist: *const c_void, hess_hist: *const c_void, count_hist: *const c_void, slot_ids: *const c_void, best_gain: *mut c_void, best_feat: *mut c_void, best_bin: *mut c_void, best_left_count: *mut c_void, n_eval: i32, n_eff: i32, n_bins: i32, lambda: f32, min_child_weight: f32, stream: *mut c_void);
+    fn launch_lgbm_leaf_reduce(node_idx: *const c_void, grad: *const c_void, hess: *const c_void, leaf_grad: *mut c_void, leaf_hess: *mut c_void, n_rows: i32, stream: *mut c_void);
+    fn launch_goss_sample(sorted_idx: *const c_void, weights_out: *mut c_void, uniform_rand: *const c_void, n_rows: i32, top_k: i32, sample_rate: f32, keep_weight: f32, stream: *mut c_void);
     fn launch_leaf_split_apply(bins_fm: *const c_void, node_idx: *mut c_void, target_leaf: i32, new_leaf_left: i32, new_leaf_right: i32, split_feature: i32, split_bin: u8, n_rows: i32, n_features: i32, stream: *mut c_void);
 }
 
@@ -279,7 +279,7 @@ thread_local! {
     static ROCBLAS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 }
 
-fn rocblas_handle() -> *mut c_void {
+pub(crate) fn rocblas_handle() -> *mut c_void {
     ROCBLAS_HANDLE.with(|h| {
         let ptr = h.load(std::sync::atomic::Ordering::Relaxed);
         if !ptr.is_null() {
@@ -1746,12 +1746,24 @@ pub fn gpu_bernoulli(n: usize, p: f64, seed: u32) -> Result<GpuBuffer, HipError>
       Ok(out)
 }
 
-pub fn gpu_leaf_wise_best_split(grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, leaf_active: &GpuBuffer, gain_out: &GpuBuffer, lambda: f32, min_child_weight: f32, n_leaves: usize, n_features: usize, n_bins: usize) {
-      unsafe { launch_leaf_wise_best_split(grad_hist.ptr as *const c_void, hess_hist.ptr as *const c_void, leaf_active.ptr as *const c_void, lambda, min_child_weight, gain_out.ptr as *mut c_void, n_leaves as i32, n_features as i32, n_bins as i32, std::ptr::null_mut()); }
+pub fn gpu_lgbm_histogram(bins_fm: &GpuBuffer, node_idx: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, count_hist: &GpuBuffer, target_slot: usize, n_rows: usize, n_eff: usize, n_bins: usize) {
+      unsafe { launch_lgbm_histogram(bins_fm.ptr as *const c_void, node_idx.ptr as *const c_void, grad.ptr as *const c_void, hess.ptr as *const c_void, grad_hist.ptr as *mut c_void, hess_hist.ptr as *mut c_void, count_hist.ptr as *mut c_void, safe_i32(target_slot), safe_i32(n_rows), safe_i32(n_eff), safe_i32(n_bins), std::ptr::null_mut()); }
 }
 
-pub fn gpu_goss_sample(sorted_idx: &GpuBuffer, weights_out: &GpuBuffer, uniform_rand: &GpuBuffer, n_rows: usize, top_k: usize, keep_weight: f32) {
-      unsafe { launch_goss_sample(sorted_idx.ptr as *const c_void, weights_out.ptr as *mut c_void, uniform_rand.ptr as *const c_void, n_rows as i32, top_k as i32, keep_weight, std::ptr::null_mut()); }
+pub fn gpu_lgbm_hist_subtract(grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, count_hist: &GpuBuffer, dst_slot: usize, src_slot: usize, n_eff: usize, n_bins: usize) {
+      unsafe { launch_lgbm_hist_subtract(grad_hist.ptr as *mut c_void, hess_hist.ptr as *mut c_void, count_hist.ptr as *mut c_void, safe_i32(dst_slot), safe_i32(src_slot), safe_i32(n_eff), safe_i32(n_bins), std::ptr::null_mut()); }
+}
+
+pub fn gpu_lgbm_best_split(grad_hist: &GpuBuffer, hess_hist: &GpuBuffer, count_hist: &GpuBuffer, slot_ids: &GpuBuffer, best_gain: &GpuBuffer, best_feat: &GpuBuffer, best_bin: &GpuBuffer, best_left_count: &GpuBuffer, n_eval: usize, n_eff: usize, n_bins: usize, lambda: f32, min_child_weight: f32) {
+      unsafe { launch_lgbm_best_split(grad_hist.ptr as *const c_void, hess_hist.ptr as *const c_void, count_hist.ptr as *const c_void, slot_ids.ptr as *const c_void, best_gain.ptr as *mut c_void, best_feat.ptr as *mut c_void, best_bin.ptr as *mut c_void, best_left_count.ptr as *mut c_void, safe_i32(n_eval), safe_i32(n_eff), safe_i32(n_bins), lambda, min_child_weight, std::ptr::null_mut()); }
+}
+
+pub fn gpu_lgbm_leaf_reduce(node_idx: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, leaf_grad: &GpuBuffer, leaf_hess: &GpuBuffer, n_rows: usize) {
+      unsafe { launch_lgbm_leaf_reduce(node_idx.ptr as *const c_void, grad.ptr as *const c_void, hess.ptr as *const c_void, leaf_grad.ptr as *mut c_void, leaf_hess.ptr as *mut c_void, safe_i32(n_rows), std::ptr::null_mut()); }
+}
+
+pub fn gpu_goss_sample(sorted_idx: &GpuBuffer, weights_out: &GpuBuffer, uniform_rand: &GpuBuffer, n_rows: usize, top_k: usize, sample_rate: f32, keep_weight: f32) {
+      unsafe { launch_goss_sample(sorted_idx.ptr as *const c_void, weights_out.ptr as *mut c_void, uniform_rand.ptr as *const c_void, n_rows as i32, top_k as i32, sample_rate, keep_weight, std::ptr::null_mut()); }
 }
 
 pub fn gpu_leaf_split_apply(bins_fm: &GpuBuffer, node_idx: &GpuBuffer, target_leaf: usize, new_leaf_left: usize, new_leaf_right: usize, split_feature: usize, split_bin: u8, n_rows: usize, n_features: usize) {

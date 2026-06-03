@@ -1,137 +1,290 @@
 #include <hip/hip_runtime.h>
+#include <float.h>
 
-// ── leaf_wise_best_split_kernel ────────────────────────────────────────────
-// For each (leaf, feature, bin) triple where leaf_active[leaf]==1, compute
-// the XGBoost split gain. Writes gains to gain_out[leaf * n_features * n_bins + feat * n_bins + bin].
-// Leaves with leaf_active==0 get 0 gain.
+// ══════════════════════════════════════════════════════════════════════════════
+// LightGBM leaf-wise kernels — i32 leaf-slot index, f32 grad/hess/count histograms.
+// EXCLUSIVE to lightgbm-rs. The shared oblivious_* / leaf_reduce kernels in tree.hip
+// keep their u8 leaf index for catboost-rs + nates-gpu-ruby and are NOT touched here.
 //
-// grad_hist / hess_hist layout: [n_leaves * n_features * n_bins]
-// Indexed as: leaf * n_features * n_bins + feat * n_bins + bin
+// Histogram layout (size_t throughout — slot*n_eff*n_bins can exceed 2^31):
+//   base = ((size_t)slot * n_eff + feat) * n_bins + bin
+// ══════════════════════════════════════════════════════════════════════════════
 
-__global__ void leaf_wise_best_split_kernel(
-      const float* grad_hist,
-      const float* hess_hist,
-      const int*   leaf_active,
-      float        lambda,
-      float        min_child_weight,
-      float*       gain_out,
-      int          n_leaves,
-      int          n_features,
-      int          n_bins
+// ── lgbm_histogram ─────────────────────────────────────────────────────────
+// Build grad/hess/count histograms for ONE leaf slot. One block per feature,
+// shared-mem [256] accumulators. Scans all rows, accumulates only target_slot's.
+extern "C" __global__
+void lgbm_histogram_kernel(
+      const unsigned char* bins_fm,   // [n_eff * n_rows] feature-major u8
+      const int*           node_idx,  // [n_rows] i32 leaf slot per row
+      const float*         grad,      // [n_rows]
+      const float*         hess,      // [n_rows]
+      float*               grad_hist,
+      float*               hess_hist,
+      float*               count_hist,
+      int                  target_slot,
+      int                  n_rows,
+      int                  n_eff,
+      int                  n_bins
 ) {
-      int leaf = blockIdx.z;
       int feat = blockIdx.x;
       int tid  = threadIdx.x;
 
-      if (leaf >= n_leaves || feat >= n_features) return;
-      if (!leaf_active[leaf]) {
-            for (int b = tid; b < n_bins; b += blockDim.x)
-                  gain_out[leaf * n_features * n_bins + feat * n_bins + b] = 0.0f;
-            return;
-      }
-
       __shared__ float s_g[256];
       __shared__ float s_h[256];
+      __shared__ float s_c[256];
 
-      int base = leaf * n_features * n_bins + feat * n_bins;
       for (int b = tid; b < n_bins; b += blockDim.x) {
-            s_g[b] = (b < 256) ? grad_hist[base + b] : 0.0f;
-            s_h[b] = (b < 256) ? hess_hist[base + b] : 0.0f;
+            s_g[b] = 0.0f; s_h[b] = 0.0f; s_c[b] = 0.0f;
       }
       __syncthreads();
 
-      float total_g = 0.0f, total_h = 0.0f;
-      for (int b = 0; b < n_bins; b++) { total_g += s_g[b]; total_h += s_h[b]; }
-      float parent_score = (total_h + lambda > 0.0f) ? (total_g * total_g / (total_h + lambda)) : 0.0f;
-
-      float left_g = 0.0f, left_h = 0.0f;
-      for (int b = tid; b < n_bins - 1; b += blockDim.x) {
-            float lg = 0.0f, lh = 0.0f;
-            for (int i = 0; i <= b; i++) { lg += s_g[i]; lh += s_h[i]; }
-            float rg = total_g - lg, rh = total_h - lh;
-            float gain = 0.0f;
-            if (lh >= min_child_weight && rh >= min_child_weight) {
-                  gain = lg * lg / (lh + lambda) + rg * rg / (rh + lambda) - parent_score;
+      const unsigned char* feat_bins = bins_fm + (size_t)feat * n_rows;
+      for (int row = tid; row < n_rows; row += blockDim.x) {
+            if (node_idx[row] == target_slot) {
+                  unsigned char bin = feat_bins[row];
+                  if (bin < n_bins) {
+                        atomicAdd(&s_g[bin], grad[row]);
+                        atomicAdd(&s_h[bin], hess[row]);
+                        atomicAdd(&s_c[bin], 1.0f);
+                  }
             }
-            gain_out[base + b] = (gain > 0.0f) ? gain : 0.0f;
       }
-      if (tid == 0) gain_out[base + n_bins - 1] = 0.0f;
+      __syncthreads();
+
+      size_t base = ((size_t)target_slot * n_eff + feat) * n_bins;
+      for (int b = tid; b < n_bins; b += blockDim.x) {
+            grad_hist[base + b]  = s_g[b];
+            hess_hist[base + b]  = s_h[b];
+            count_hist[base + b] = s_c[b];
+      }
 }
 
-extern "C" void launch_leaf_wise_best_split(
+extern "C" void launch_lgbm_histogram(
+      const unsigned char* bins_fm, const int* node_idx,
+      const float* grad, const float* hess,
+      float* grad_hist, float* hess_hist, float* count_hist,
+      int target_slot, int n_rows, int n_eff, int n_bins,
+      hipStream_t stream
+) {
+      dim3 grid(n_eff);
+      dim3 block(256);
+      hipLaunchKernelGGL(lgbm_histogram_kernel, grid, block, 0, stream,
+            bins_fm, node_idx, grad, hess, grad_hist, hess_hist, count_hist,
+            target_slot, n_rows, n_eff, n_bins);
+}
+
+// ── lgbm_hist_subtract ─────────────────────────────────────────────────────
+// In-place histogram subtraction: hist[dst_slot] -= hist[src_slot] for all
+// three (grad/hess/count). One block per feature. Used to derive the larger
+// child (parent − smaller sibling); parent stays in dst_slot until this runs.
+extern "C" __global__
+void lgbm_hist_subtract_kernel(
+      float* grad_hist,
+      float* hess_hist,
+      float* count_hist,
+      int    dst_slot,
+      int    src_slot,
+      int    n_eff,
+      int    n_bins
+) {
+      int feat = blockIdx.x;
+      size_t bd = ((size_t)dst_slot * n_eff + feat) * n_bins;
+      size_t bs = ((size_t)src_slot * n_eff + feat) * n_bins;
+      for (int b = threadIdx.x; b < n_bins; b += blockDim.x) {
+            grad_hist[bd + b]  -= grad_hist[bs + b];
+            hess_hist[bd + b]  -= hess_hist[bs + b];
+            count_hist[bd + b] -= count_hist[bs + b];
+      }
+}
+
+extern "C" void launch_lgbm_hist_subtract(
+      float* grad_hist, float* hess_hist, float* count_hist,
+      int dst_slot, int src_slot, int n_eff, int n_bins,
+      hipStream_t stream
+) {
+      dim3 grid(n_eff);
+      dim3 block(256);
+      hipLaunchKernelGGL(lgbm_hist_subtract_kernel, grid, block, 0, stream,
+            grad_hist, hess_hist, count_hist, dst_slot, src_slot, n_eff, n_bins);
+}
+
+// ── lgbm_best_split ────────────────────────────────────────────────────────
+// One block per evaluated slot. For each feature: Hillis-Steele inclusive prefix
+// scan over bins (linear, NOT O(n_bins^2)), Newton gain gated by min_child_weight,
+// per-thread best across features. Then a shared-array + thread-0 reduction (the
+// codebase has no float atomicMax) picks the winning (feat,bin) and its left count.
+// Outputs are packed by EVAL INDEX (slot_idx), not by slot id.
+extern "C" __global__
+void lgbm_best_split_kernel(
       const float* grad_hist,
       const float* hess_hist,
-      const int*   leaf_active,
-      float        lambda,
-      float        min_child_weight,
-      float*       gain_out,
-      int          n_leaves,
-      int          n_features,
+      const float* count_hist,
+      const int*   slot_ids,        // [n_eval]
+      float*       best_gain,       // [n_eval]
+      int*         best_feat,       // [n_eval]
+      int*         best_bin,        // [n_eval]
+      int*         best_left_count, // [n_eval]
+      int          n_eval,
+      int          n_eff,
       int          n_bins,
-      hipStream_t  stream
+      float        lambda,
+      float        min_child_weight
 ) {
-      dim3 grid(n_features, 1, n_leaves);
-      dim3 block(256);
-      size_t total = (size_t)n_leaves * n_features * n_bins * sizeof(float);
-      hipMemsetAsync(gain_out, 0, total, stream);
-      hipLaunchKernelGGL(leaf_wise_best_split_kernel, grid, block, 0, stream,
-            grad_hist, hess_hist, leaf_active, lambda, min_child_weight,
-            gain_out, n_leaves, n_features, n_bins);
+      int slot_idx = blockIdx.x;
+      if (slot_idx >= n_eval) return;
+      int slot = slot_ids[slot_idx];
+      int tid  = threadIdx.x;
+
+      __shared__ float s_g[256];
+      __shared__ float s_h[256];
+      __shared__ float s_c[256];
+
+      float my_gain = -FLT_MAX;
+      int   my_feat = -1, my_bin = -1;
+      float my_lc   = 0.0f;
+
+      for (int feat = 0; feat < n_eff; feat++) {
+            size_t base = ((size_t)slot * n_eff + feat) * n_bins;
+            s_g[tid] = (tid < n_bins) ? grad_hist[base + tid]  : 0.0f;
+            s_h[tid] = (tid < n_bins) ? hess_hist[base + tid]  : 0.0f;
+            s_c[tid] = (tid < n_bins) ? count_hist[base + tid] : 0.0f;
+            __syncthreads();
+
+            for (int stride = 1; stride < n_bins; stride <<= 1) {
+                  float pg = (tid >= stride) ? s_g[tid - stride] : 0.0f;
+                  float ph = (tid >= stride) ? s_h[tid - stride] : 0.0f;
+                  float pc = (tid >= stride) ? s_c[tid - stride] : 0.0f;
+                  __syncthreads();
+                  s_g[tid] += pg; s_h[tid] += ph; s_c[tid] += pc;
+                  __syncthreads();
+            }
+
+            float tg = s_g[n_bins - 1];
+            float th = s_h[n_bins - 1];
+            if (th < 1e-10f) { __syncthreads(); continue; }
+            float parent = tg * tg / (th + lambda);
+
+            if (tid < n_bins - 1) {
+                  float lg = s_g[tid], lh = s_h[tid], lc = s_c[tid];
+                  float rg = tg - lg, rh = th - lh;
+                  if (lh >= min_child_weight && rh >= min_child_weight) {
+                        float gain = lg * lg / (lh + lambda) + rg * rg / (rh + lambda) - parent;
+                        if (isfinite(gain) && gain > my_gain) {
+                              my_gain = gain; my_feat = feat; my_bin = tid; my_lc = lc;
+                        }
+                  }
+            }
+            __syncthreads();
+      }
+
+      __shared__ float r_gain[256];
+      __shared__ int   r_feat[256];
+      __shared__ int   r_bin[256];
+      __shared__ float r_lc[256];
+      r_gain[tid] = my_gain;
+      r_feat[tid] = my_feat;
+      r_bin[tid]  = my_bin;
+      r_lc[tid]   = my_lc;
+      __syncthreads();
+
+      if (tid == 0) {
+            float bg = -FLT_MAX; int bf = -1, bb = -1; float bc = 0.0f;
+            for (int t = 0; t < blockDim.x; t++) {
+                  if (r_gain[t] > bg) { bg = r_gain[t]; bf = r_feat[t]; bb = r_bin[t]; bc = r_lc[t]; }
+            }
+            best_gain[slot_idx]       = bg;
+            best_feat[slot_idx]       = bf;
+            best_bin[slot_idx]        = bb;
+            best_left_count[slot_idx] = (int)(bc + 0.5f);
+      }
 }
 
-// ── goss_sample_kernel ─────────────────────────────────────────────────────
-// sorted_idx[0..top_k-1]  = indices of top-a rows by |grad| (already computed by argsort)
-// sorted_idx[top_k..n-1]  = remaining rows
-// weights_out[i] = 1.0 for i in top_k,
-//                = (1-a)/b if sampled from rest (uniform_rand[sorted_idx[i]] < b),
-//                = 0.0 otherwise.
+extern "C" void launch_lgbm_best_split(
+      const float* grad_hist, const float* hess_hist, const float* count_hist,
+      const int* slot_ids,
+      float* best_gain, int* best_feat, int* best_bin, int* best_left_count,
+      int n_eval, int n_eff, int n_bins, float lambda, float min_child_weight,
+      hipStream_t stream
+) {
+      dim3 grid(n_eval);
+      dim3 block(256);
+      hipLaunchKernelGGL(lgbm_best_split_kernel, grid, block, 0, stream,
+            grad_hist, hess_hist, count_hist, slot_ids,
+            best_gain, best_feat, best_bin, best_left_count,
+            n_eval, n_eff, n_bins, lambda, min_child_weight);
+}
 
-__global__ void goss_sample_kernel(
+// ── lgbm_leaf_reduce ───────────────────────────────────────────────────────
+// Scatter grad/hess into per-slot buckets via atomics (i32 leaf slot). Pairs with
+// the shared tree.hip leaf_finalize kernel (no node_idx) for value = -G/(H+λ).
+extern "C" __global__
+void lgbm_leaf_reduce_kernel(
+      const int*   node_idx,
+      const float* grad,
+      const float* hess,
+      float*       leaf_grad,
+      float*       leaf_hess,
+      int          n_rows
+) {
+      int row = blockIdx.x * blockDim.x + threadIdx.x;
+      if (row >= n_rows) return;
+      int slot = node_idx[row];
+      atomicAdd(&leaf_grad[slot], grad[row]);
+      atomicAdd(&leaf_hess[slot], hess[row]);
+}
+
+extern "C" void launch_lgbm_leaf_reduce(
+      const int* node_idx, const float* grad, const float* hess,
+      float* leaf_grad, float* leaf_hess, int n_rows, hipStream_t stream
+) {
+      dim3 block(256);
+      dim3 grid((n_rows + 255) / 256);
+      hipLaunchKernelGGL(lgbm_leaf_reduce_kernel, grid, block, 0, stream,
+            node_idx, grad, hess, leaf_grad, leaf_hess, n_rows);
+}
+
+// ── goss_sample ────────────────────────────────────────────────────────────
+// sorted_idx[0..top_k-1] = top-a rows by |grad| (argsorted on host).
+// weights_out[row] = 1.0 (top-a), (1-a)/b if uniform_rand[row] < (1-a)/b (rest), else 0.
+extern "C" __global__
+void goss_sample_kernel(
       const int*   sorted_idx,
       float*       weights_out,
       const float* uniform_rand,
       int          n_rows,
       int          top_k,
-      float        keep_weight
+      float        sample_rate,    // keep a rest row with prob = sample_rate (= goss_b)
+      float        keep_weight     // amplification weight = (1-a)/b applied to kept rest rows
 ) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n_rows) return;
-      weights_out[i] = 0.0f;
-
       int row = sorted_idx[i];
       if (i < top_k) {
             weights_out[row] = 1.0f;
-      } else {
-            if (uniform_rand[row] < keep_weight) {
-                  weights_out[row] = keep_weight;
-            }
+      } else if (uniform_rand[row] < sample_rate) {
+            weights_out[row] = keep_weight;
       }
 }
 
 extern "C" void launch_goss_sample(
-      const int*   sorted_idx,
-      float*       weights_out,
-      const float* uniform_rand,
-      int          n_rows,
-      int          top_k,
-      float        keep_weight,
-      hipStream_t  stream
+      const int* sorted_idx, float* weights_out, const float* uniform_rand,
+      int n_rows, int top_k, float sample_rate, float keep_weight, hipStream_t stream
 ) {
       hipMemsetAsync(weights_out, 0, (size_t)n_rows * sizeof(float), stream);
       dim3 block(256);
       dim3 grid((n_rows + 255) / 256);
       hipLaunchKernelGGL(goss_sample_kernel, grid, block, 0, stream,
-            sorted_idx, weights_out, uniform_rand, n_rows, top_k, keep_weight);
+            sorted_idx, weights_out, uniform_rand, n_rows, top_k, sample_rate, keep_weight);
 }
 
-// ── leaf_split_apply_kernel ────────────────────────────────────────────────
-// For rows in target_leaf: route left (bin <= split_bin) → new_leaf_left,
-//                          route right (bin > split_bin) → new_leaf_right.
-// Other rows: unchanged.
-
-__global__ void leaf_split_apply_kernel(
+// ── leaf_split_apply ───────────────────────────────────────────────────────
+// Route rows of target_leaf: bin <= split_bin → new_leaf_left, else new_leaf_right.
+// node_idx is i32 (widened from u8 — lightgbm-exclusive, supports > 256 leaves).
+extern "C" __global__
+void leaf_split_apply_kernel(
       const unsigned char* bins_fm,
-      unsigned char*       node_idx,
+      int*                 node_idx,
       int                  target_leaf,
       int                  new_leaf_left,
       int                  new_leaf_right,
@@ -142,22 +295,16 @@ __global__ void leaf_split_apply_kernel(
 ) {
       int row = blockIdx.x * blockDim.x + threadIdx.x;
       if (row >= n_rows) return;
-      if ((int)node_idx[row] != target_leaf) return;
-      unsigned char bin = bins_fm[split_feature * n_rows + row];
-      node_idx[row] = (unsigned char)((bin <= split_bin) ? new_leaf_left : new_leaf_right);
+      if (node_idx[row] != target_leaf) return;
+      unsigned char bin = bins_fm[(size_t)split_feature * n_rows + row];
+      node_idx[row] = (bin <= split_bin) ? new_leaf_left : new_leaf_right;
 }
 
 extern "C" void launch_leaf_split_apply(
-      const unsigned char* bins_fm,
-      unsigned char*       node_idx,
-      int                  target_leaf,
-      int                  new_leaf_left,
-      int                  new_leaf_right,
-      int                  split_feature,
-      unsigned char        split_bin,
-      int                  n_rows,
-      int                  n_features,
-      hipStream_t          stream
+      const unsigned char* bins_fm, int* node_idx,
+      int target_leaf, int new_leaf_left, int new_leaf_right,
+      int split_feature, unsigned char split_bin,
+      int n_rows, int n_features, hipStream_t stream
 ) {
       dim3 block(256);
       dim3 grid((n_rows + 255) / 256);
