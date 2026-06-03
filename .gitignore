@@ -9,6 +9,7 @@ src/config/scheduler_weights.bin
 catboost/
 LightGBM/
 xgboost/
+Forks/
 
 # Cache
 kaggle_s6e4/cache/
