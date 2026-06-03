@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "padding" inventory category.
 //
 // For every padding-category item in kernel_inventory/*.json, canonicalize its
@@ -178,7 +179,7 @@ fn canon(name: &str) -> &'static str {
 }
 
 fn load_padding() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       for e in std::fs::read_dir(&dir).expect("no kernel_inventory").flatten() {
             let p = e.path();

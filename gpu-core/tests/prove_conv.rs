@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "conv" inventory category.
 //
 // For every conv-category item in kernel_inventory/*.json, canonicalize its name;
@@ -443,7 +444,7 @@ fn canon(name: &str) -> Option<&'static str> {
 }
 
 fn load_conv() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
       for e in rd.flatten() {

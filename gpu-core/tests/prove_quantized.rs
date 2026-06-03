@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "quantized" inventory category.
 //
 // Affine per-tensor quantization primitives proven on the gfx1101 GPU:
@@ -160,7 +161,7 @@ fn canon(name: &str) -> Option<&'static str> {
 }
 
 fn load_quantized() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
       for e in rd.flatten() {

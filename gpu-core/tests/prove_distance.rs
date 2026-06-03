@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "distance" inventory category.
 //
 // For every distance-category item in kernel_inventory/*.json, canonicalize its
@@ -101,7 +102,7 @@ fn canon(name: &str) -> Option<&'static str> {
 
 // distance items in the inventory (deduped).
 fn load_distance() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       for e in std::fs::read_dir(&dir).expect("no kernel_inventory").flatten() {
             let p = e.path();

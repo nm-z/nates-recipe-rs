@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "histogram" inventory category.
 //
 // Two real kernels are bridged here and proven on the live gfx1101 GPU against
@@ -126,7 +127,7 @@ fn canon(name: &str) -> String {
 }
 
 fn load_histogram() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
       for e in rd.flatten() {

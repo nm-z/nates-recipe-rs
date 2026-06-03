@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "loss" kernel category.
 //
 // For every loss-category item in kernel_inventory/*.json, if its canonical op
@@ -183,7 +184,7 @@ fn canon(name: &str) -> &'static str {
 }
 
 fn load_loss_inventory() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       let rd = std::fs::read_dir(&dir).unwrap_or_else(|_| panic!("no kernel_inventory at {dir}"));
       for e in rd.flatten() {

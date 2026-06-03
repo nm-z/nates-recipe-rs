@@ -1,3 +1,4 @@
+mod common;
 // Live-GPU proof harness for the "optimizer" inventory category.
 //
 // For every optimizer-category item in kernel_inventory/*.json, canonicalize its
@@ -397,7 +398,7 @@ fn canon(name: &str) -> String {
 }
 
 fn load_optimizer() -> Vec<String> {
-      let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+      let dir = common::inventory_dir();
       let mut items = Vec::new();
       let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
       for e in rd.flatten() {

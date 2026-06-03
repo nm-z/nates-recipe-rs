@@ -1,3 +1,4 @@
+mod common;
 // Data-driven proof harness: for every item in kernel_inventory/*.json, if its
 // canonical op name is registered here, run the gpu-core op on the LIVE GPU and
 // assert it matches a CPU oracle. Prints proven/total coverage per category.
@@ -317,7 +318,7 @@ fn canon(name: &str) -> String {
 }
 
 fn load_inventory() -> Vec<(String, String)> {
-    let dir = format!("{}/../kernel_inventory", env!("CARGO_MANIFEST_DIR"));
+    let dir = common::inventory_dir();
     let mut items = Vec::new();
     let Ok(rd) = std::fs::read_dir(&dir) else { panic!("no kernel_inventory at {dir}"); };
     for e in rd.flatten() {
