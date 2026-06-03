@@ -1,0 +1,473 @@
+activations
+      gpu_sigmoid
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_tanh
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_relu
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_leaky_relu
+            x &GpuBuffer
+            n usize
+            alpha f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_gelu
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_silu
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_softmax_rows
+            x &GpuBuffer
+            rows usize
+            cols usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_log_softmax_rows
+            x &GpuBuffer
+            rows usize
+            cols usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_dropout
+            x &GpuBuffer
+            mask &GpuBuffer
+            n usize
+            p f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_relu6
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_hardsigmoid
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_hardtanh
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_softsign
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_tanhshrink
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_logsigmoid
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_gelu_exact
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_softshrink
+            x &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_celu
+            x &GpuBuffer
+            n usize
+            p f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_hardshrink
+            x &GpuBuffer
+            n usize
+            p f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_softshrink_p
+            x &GpuBuffer
+            n usize
+            p f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_thresholdedrelu
+            x &GpuBuffer
+            n usize
+            p f64
+            return "Result<GpuBuffer, HipError>"
+
+"loss functions"
+      gpu_cross_entropy
+            logits &GpuBuffer
+            targets &GpuBuffer
+            rows usize
+            cols usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_mae_grad
+            pred &GpuBuffer
+            target &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_huber_grad
+            pred &GpuBuffer
+            target &GpuBuffer
+            delta f64
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_bce_with_logits
+            logits &GpuBuffer
+            target &GpuBuffer
+            n usize
+            return "Result<(GpuBuffer, GpuBuffer), HipError>"
+      gpu_focal_loss
+            prob &GpuBuffer
+            target &GpuBuffer
+            gamma f64
+            alpha f64
+            n usize
+            return "Result<(GpuBuffer, GpuBuffer), HipError>"
+      gpu_kl_div_loss
+            log_p &GpuBuffer
+            target &GpuBuffer
+            n usize
+            return "Result<GpuBuffer, HipError>"
+      gpu_hinge_loss
+            scores &GpuBuffer
+            labels &GpuBuffer
+            n usize
+            return "Result<(GpuBuffer, GpuBuffer), HipError>"
+      gpu_cosine_embedding_loss
+            a &GpuBuffer
+            b &GpuBuffer
+            label &GpuBuffer
+            n usize
+            dim usize
+            margin f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_triplet_loss
+            anchor &GpuBuffer
+            pos &GpuBuffer
+            neg &GpuBuffer
+            n usize
+            dim usize
+            margin f64
+            return "Result<GpuBuffer, HipError>"
+      gpu_contrastive_loss
+            a &GpuBuffer
+            b &GpuBuffer
+            label &GpuBuffer
+            n usize
+            dim usize
+            margin f64
+            return "Result<GpuBuffer, HipError>"
+
+hyperparameters
+      lr f64
+      momentum f64
+      decay f64
+      eps f64
+      b1 f64
+      b2 f64
+      wd f64
+      t i32
+      alpha f64
+      p f64
+      gamma f64
+      delta f64
+      margin f64
+      max_norm f64
+
+optimization
+      "forward pass"
+            gpu_gemm
+                  a &GpuBuffer
+                  b &GpuBuffer
+                  m usize
+                  n usize
+                  k usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_linear
+                  x &GpuBuffer
+                  w &GpuBuffer
+                  bias &GpuBuffer
+                  m usize
+                  n usize
+                  k usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_layernorm
+                  x &GpuBuffer
+                  rows usize
+                  cols usize
+                  gamma "Option<&GpuBuffer>"
+                  beta "Option<&GpuBuffer>"
+                  return "Result<GpuBuffer, HipError>"
+            gpu_batchnorm_forward
+                  x &GpuBuffer
+                  gamma &GpuBuffer
+                  beta &GpuBuffer
+                  n usize
+                  c usize
+                  eps f64
+                  return "Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError>"
+            gpu_im2col_1d
+                  x &GpuBuffer
+                  n usize
+                  p usize
+                  ks usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_im2col_2d
+                  x &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  kh usize
+                  kw usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_avg_pool_1d
+                  input &GpuBuffer
+                  n usize
+                  out_len usize
+                  n_filters usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_max_pool_1d
+                  input &GpuBuffer
+                  n usize
+                  out_len usize
+                  n_filters usize
+                  return "Result<(GpuBuffer, GpuBuffer), HipError>"
+            gpu_avg_pool_2d
+                  input &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  kh usize
+                  kw usize
+                  sh usize
+                  sw usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_max_pool_2d
+                  input &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  kh usize
+                  kw usize
+                  sh usize
+                  sw usize
+                  return "Result<(GpuBuffer, GpuBuffer), HipError>"
+            gpu_lstm_cell
+                  gates &GpuBuffer
+                  c &GpuBuffer
+                  h &GpuBuffer
+                  n usize
+                  hs usize
+                  return "Result<(GpuBuffer, GpuBuffer), HipError>"
+            gpu_gru_cell
+                  gates &GpuBuffer
+                  h &GpuBuffer
+                  n usize
+                  hs usize
+                  return "Result<GpuBuffer, HipError>"
+      backpropagation
+            gpu_sigmoid_backward
+                  grad &GpuBuffer
+                  act &GpuBuffer
+                  n usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_tanh_backward
+                  grad &GpuBuffer
+                  act &GpuBuffer
+                  n usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_relu_backward
+                  grad &GpuBuffer
+                  act &GpuBuffer
+                  n usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_leaky_relu_backward
+                  grad &GpuBuffer
+                  act &GpuBuffer
+                  n usize
+                  alpha f64
+                  return "Result<GpuBuffer, HipError>"
+            gpu_gelu_backward
+                  grad &GpuBuffer
+                  x &GpuBuffer
+                  n usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_silu_backward
+                  grad &GpuBuffer
+                  x &GpuBuffer
+                  n usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_softmax_backward
+                  grad &GpuBuffer
+                  sm &GpuBuffer
+                  rows usize
+                  cols usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_linear_backward
+                  grad &GpuBuffer
+                  input &GpuBuffer
+                  weight &GpuBuffer
+                  m usize
+                  n usize
+                  k usize
+                  return "Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError>"
+            gpu_layernorm_backward
+                  grad_y &GpuBuffer
+                  x &GpuBuffer
+                  gamma &GpuBuffer
+                  rows usize
+                  cols usize
+                  eps f64
+                  return "Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError>"
+            gpu_batchnorm_backward
+                  grad_y &GpuBuffer
+                  x &GpuBuffer
+                  save_mean &GpuBuffer
+                  save_inv_std &GpuBuffer
+                  gamma &GpuBuffer
+                  n usize
+                  c usize
+                  return "Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError>"
+            gpu_col2im_1d
+                  patches &GpuBuffer
+                  n usize
+                  p usize
+                  ks usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_col2im_2d
+                  patches &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  kh usize
+                  kw usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_max_pool_1d_backward
+                  grad &GpuBuffer
+                  indices &GpuBuffer
+                  n usize
+                  out_len usize
+                  n_filters usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_avg_pool_2d_backward
+                  grad &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  kh usize
+                  kw usize
+                  sh usize
+                  sw usize
+                  return "Result<GpuBuffer, HipError>"
+            gpu_max_pool_2d_backward
+                  grad &GpuBuffer
+                  indices &GpuBuffer
+                  n usize
+                  c usize
+                  h usize
+                  w usize
+                  out_h usize
+                  out_w usize
+                  return "Result<GpuBuffer, HipError>"
+      "gradient descent"
+            gpu_sgd_update
+                  weights &GpuBuffer
+                  grad &GpuBuffer
+                  lr f64
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_adam_update
+                  w &GpuBuffer
+                  m &GpuBuffer
+                  v &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  b1 f64
+                  b2 f64
+                  eps f64
+                  t usize
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_adamw_update
+                  w &GpuBuffer
+                  m &GpuBuffer
+                  v &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  b1 f64
+                  b2 f64
+                  eps f64
+                  wd f64
+                  t usize
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_momentum_update
+                  w &GpuBuffer
+                  v &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  momentum f64
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_rmsprop_update
+                  w &GpuBuffer
+                  cache &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  decay f64
+                  eps f64
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_adagrad_update
+                  w &GpuBuffer
+                  accum &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  eps f64
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_lamb_update
+                  w &GpuBuffer
+                  m &GpuBuffer
+                  v &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  b1 f64
+                  b2 f64
+                  eps f64
+                  wd f64
+                  t i32
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_lion_update
+                  w &GpuBuffer
+                  m &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  b1 f64
+                  b2 f64
+                  wd f64
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_nadam_update
+                  w &GpuBuffer
+                  m &GpuBuffer
+                  v &GpuBuffer
+                  g &GpuBuffer
+                  lr f64
+                  b1 f64
+                  b2 f64
+                  eps f64
+                  t i32
+                  n usize
+                  return "Result<(), HipError>"
+            gpu_grad_clip_norm
+                  x &GpuBuffer
+                  n usize
+                  max_norm f64
+                  return "Result<(), HipError>"

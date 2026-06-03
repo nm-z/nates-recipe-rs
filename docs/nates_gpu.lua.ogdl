@@ -1,0 +1,124 @@
+activations
+      sigmoid
+            x GpuBuffer
+            return GpuBuffer
+      tanh_act
+            x GpuBuffer
+            return GpuBuffer
+      relu
+            x GpuBuffer
+            return GpuBuffer
+      leaky_relu
+            x GpuBuffer
+            alpha number
+            return GpuBuffer
+      softmax
+            x GpuBuffer
+            return GpuBuffer
+      scaled_exp
+            x GpuBuffer
+            s number
+            return GpuBuffer
+      dropout
+            x GpuBuffer
+            mask GpuBuffer
+            p number
+            return GpuBuffer
+
+"loss functions"
+      kl_div
+            mu GpuBuffer
+            log_var GpuBuffer
+            return GpuBuffer
+
+hyperparameters
+      lr number
+      alpha number
+      s number
+      p number
+      seed integer
+      kl_weight number
+
+optimization
+      "forward pass"
+            gemm
+                  a GpuBuffer
+                  b GpuBuffer
+                  ta string
+                  tb string
+                  return GpuBuffer
+            bias_add
+                  x GpuBuffer
+                  b GpuBuffer
+                  return GpuBuffer
+            layernorm
+                  x GpuBuffer
+                  return GpuBuffer
+            im2col_1d
+                  x GpuBuffer
+                  ks integer
+                  return GpuBuffer
+            im2col_2d
+                  x GpuBuffer
+                  c integer
+                  h integer
+                  w integer
+                  kh integer
+                  kw integer
+                  return GpuBuffer
+            avg_pool_1d
+                  x GpuBuffer
+                  out_len integer
+                  n_filters integer
+                  return GpuBuffer
+            lstm_cell
+                  gates GpuBuffer
+                  c GpuBuffer
+                  h GpuBuffer
+                  hs integer
+                  return table
+            reparameterize
+                  mu GpuBuffer
+                  log_var GpuBuffer
+                  eps GpuBuffer
+                  return GpuBuffer
+      backpropagation
+            sigmoid_backward
+                  grad GpuBuffer
+                  act GpuBuffer
+                  return GpuBuffer
+            tanh_backward
+                  grad GpuBuffer
+                  act GpuBuffer
+                  return GpuBuffer
+            relu_backward
+                  grad GpuBuffer
+                  act GpuBuffer
+                  return GpuBuffer
+            leaky_relu_backward
+                  grad GpuBuffer
+                  act GpuBuffer
+                  alpha number
+                  return GpuBuffer
+            pool_grad_expand
+                  grad GpuBuffer
+                  out_len integer
+                  n_filters integer
+                  return GpuBuffer
+            vae_backward_latent
+                  grad_z GpuBuffer
+                  mu GpuBuffer
+                  log_var GpuBuffer
+                  eps GpuBuffer
+                  kl_weight number
+                  return table
+      "gradient descent"
+            sgd_update
+                  w GpuBuffer
+                  grad GpuBuffer
+                  lr number
+                  return nil
+            scale_inplace
+                  x GpuBuffer
+                  s number
+                  return nil
