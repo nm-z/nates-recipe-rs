@@ -78,7 +78,7 @@ pub fn register_composites(lua: &Lua) -> LuaResult<()> {
 
       // gemm(A, B, tA, tB) — tA/tB are "N" or "T"
       g.set("gemm", lua.create_function(|_, (a, b, ta, tb): (LuaGpuBuffer, LuaGpuBuffer, String, String)| {
-            let (m, n, k, buf) = match (ta.as_str(), tb.as_str()) {
+            let (m, n, _k, buf) = match (ta.as_str(), tb.as_str()) {
                   ("N", "N") => {
                         // A[m,k] @ B[k,n] → [m,n]
                         (a.rows, b.cols, a.cols, kernels::gpu_gemm(&a.buf, &b.buf, a.rows, b.cols, a.cols).map_err(hip_err)?)
