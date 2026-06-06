@@ -1,11 +1,25 @@
 use crate::dataset::Dataset;
-use colored::Color;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
+use ratatui::Frame;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::symbols::{self, Marker};
+use ratatui::text::Span;
+use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
 use std::cell::RefCell;
 use std::io::IsTerminal as _;
-use std::io::Write as _;
-use termplot_rs::ChartContext;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Set by the SIGINT handler so headless (cooked-mode) Ctrl+C exits gracefully
+/// — in TUI raw mode Ctrl+C arrives as a key event instead and is handled there.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: i32) {
+      INTERRUPTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Activation {
@@ -52,6 +66,115 @@ pub const ce: Loss = Loss::Ce;
 #[allow(non_upper_case_globals)]
 pub const huber: Loss = Loss::Huber;
 
+/// Which parameters `save` writes — pass `w`, `b`, or both (consts in the crate
+/// root, kept out of this module so they don't shadow local `w`/`b` bindings).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Param {
+      W,
+      B,
+}
+
+/// How to run training: epochs, logging, plotting, resume, and save. Holds the
+/// "run" config so `Model` stays pure architecture and `Data` stays pure data.
+pub struct Train {
+      epochs: usize,
+      log_every: usize,
+      metrics: Vec<Metric>,
+      plot: Vec<Metric>,
+      resume: Option<String>,
+      // None = save never called; Some((parts, path)) = called (parts may be empty).
+      save: Option<(Vec<Param>, String)>,
+}
+
+impl Train {
+      pub fn new() -> Train {
+            Train {
+                  epochs: 1,
+                  log_every: 1,
+                  metrics: Vec::new(),
+                  plot: Vec::new(),
+                  resume: None,
+                  save: None,
+            }
+      }
+
+      /// Resolve a path arg: `""` → `model.ogdl` (cwd), `"*"` → next to the
+      /// running binary, anything else → used verbatim.
+      fn resolve(path: &str) -> String {
+            let raw = if path.is_empty() {
+                  "model.ogdl".to_string()
+            } else if path == "*" {
+                  std::env::current_exe()
+                        .ok()
+                        .and_then(|e| e.parent().map(|d| d.join("model.ogdl")))
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "model.ogdl".to_string())
+            } else {
+                  path.to_string()
+            };
+            expand_tilde(&raw)
+      }
+
+      pub fn epochs(mut self, n: usize) -> Train {
+            self.epochs = n;
+            self
+      }
+
+      pub fn log_every(mut self, every: usize) -> Train {
+            self.log_every = every;
+            self
+      }
+
+      pub fn log(mut self, metrics: &[Metric]) -> Train {
+            self.metrics = metrics.to_vec();
+            self
+      }
+
+      pub fn plot(mut self, metrics: &[Metric]) -> Train {
+            self.plot = metrics.to_vec();
+            self
+      }
+
+      pub fn resume(mut self, path: impl Into<String>) -> Train {
+            self.resume = Some(path.into());
+            self
+      }
+
+      pub fn save(mut self, parts: &[Param], path: impl Into<String>) -> Train {
+            self.save = Some((parts.to_vec(), path.into()));
+            self
+      }
+
+      /// Train `model` on the data's train set, save (if requested), then eval on
+      /// the test set — but only if there is one (`.split` or `.test` was set).
+      pub fn run(&self, model: &Model, data: &crate::dataset::Data) {
+            // Resuming but never calling save = load weights, train, discard. Refuse.
+            if self.resume.is_some() && self.save.is_none() {
+                  eprintln!(
+                        "\x1b[1;31mresume without save\x1b[0m\n\
+                         \x20   you'd load weights, train, then throw them away\n\
+                         \x20   add .save(&[w, b], \"*\") to write back next to your script"
+                  );
+                  std::process::exit(1);
+            }
+            let (train, test) = data.prepare();
+            let resume = self.resume.as_deref().map(Self::resolve);
+            model.fit(&train, self, resume.as_deref());
+            // Saving is owned by fit()'s trailing stop-loss (checkpoint on the first R²
+            // drop, else the final weights at the end) — do NOT save here, or a blow-up
+            // would overwrite the good checkpoint.
+            if let Some(test) = &test {
+                  model.eval(test);
+            }
+      }
+}
+
+impl Default for Train {
+      fn default() -> Self {
+            Self::new()
+      }
+}
+
 /// Per-column number colors, applied in `.log(&[...])` order (cycles past 12).
 const PALETTE: [(u8, u8, u8); 12] = [
       (242, 40, 60),   // #F2283C red
@@ -67,6 +190,24 @@ const PALETTE: [(u8, u8, u8); 12] = [
       (3, 252, 186),   // #03FCBA
       (194, 1, 20),    // #C20114
 ];
+
+/// Palette color for the i-th logged series (cycles).
+fn palette(i: usize) -> (u8, u8, u8) {
+      PALETTE[i % PALETTE.len()]
+}
+
+/// Expand a leading `~` (the shell doesn't, since the path arrives as a literal
+/// string) to `$HOME`. Anything else is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+      match std::env::var("HOME") {
+            Ok(home) if path == "~" => home,
+            Ok(home) => match path.strip_prefix("~/") {
+                  Some(rest) => format!("{home}/{rest}"),
+                  None => path.to_string(),
+            },
+            Err(_) => path.to_string(),
+      }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Metric {
@@ -91,48 +232,58 @@ pub const Time: Metric = Metric::Time;
 #[allow(non_upper_case_globals)]
 pub const R2: Metric = Metric::R2;
 
-/// Restores the terminal (leaves the alternate screen, shows the cursor) when
-/// dropped — on normal scope exit AND during a panic unwind, so a mid-train
-/// crash never leaves the terminal stuck. It does NOT catch/swallow the panic.
-struct TermGuard;
-impl TermGuard {
-      fn new() -> Self {
-            TermGuard
-      }
-}
-impl Drop for TermGuard {
-      fn drop(&mut self) {
-            let _ = write!(std::io::stdout(), "\x1b[?1049l\x1b[?25h");
-            let _ = std::io::stdout().flush();
+/// Symmetric-log transform (linthresh = 1): linear in [-1, 1], log10 beyond.
+/// Handles negatives and huge magnitudes, so disparate metrics share a y-axis.
+fn symlog(y: f64) -> f64 {
+      if y.abs() <= 1.0 {
+            y
+      } else {
+            y.signum() * (1.0 + y.abs().log10())
       }
 }
 
-/// Async-signal-safe SIGINT handler: a Drop guard never runs when SIGINT kills
-/// the process mid-frame, leaving the terminal in the alt screen with the cursor
-/// hidden (and a stray byte from a half-written escape). This restores the
-/// terminal with a single raw `write` and exits 130. Installed only while
-/// live-plotting; `signal`/`write`/`_exit` are all async-signal-safe.
-extern "C" fn restore_term_on_sigint(_sig: libc::c_int) {
-      const RESTORE: &[u8] = b"\r\x1b[?1049l\x1b[?25h\r\n";
-      unsafe {
-            libc::write(1, RESTORE.as_ptr().cast(), RESTORE.len());
-            libc::_exit(130);
+/// Inverse of `symlog`, for labeling y ticks back in original units.
+fn inv_symlog(v: f64) -> f64 {
+      if v.abs() <= 1.0 {
+            v
+      } else {
+            v.signum() * 10f64.powf(v.abs() - 1.0)
       }
 }
 
-/// The i-th palette color as a truecolor `colored::Color` (cycles past 12).
-fn palette_color(i: usize) -> Color {
-      let (r, g, b) = PALETTE[i % PALETTE.len()];
-      Color::TrueColor { r, g, b }
+/// Single-unit time for axis ticks — picks s/m/h by magnitude: `24s`, `2.5m`, `1.2h`.
+fn fmt_time_axis(secs: f64) -> String {
+      if secs >= 3600.0 {
+            format!("{:.1}h", secs / 3600.0)
+      } else if secs >= 60.0 {
+            format!("{:.1}m", secs / 60.0)
+      } else {
+            format!("{secs:.0}s")
+      }
 }
 
-/// Live terminal size (cols, rows) via crossterm's ioctl on the stdout fd —
-/// works for a spawned child where `stty </dev/tty` does not. Falls back to a
-/// conservative size when there is no terminal (piped output).
-fn term_size() -> (usize, usize) {
-      match crossterm::terminal::size() {
-            Ok((c, r)) if c >= 40 && r >= 8 => (c as usize, r as usize),
-            _ => (100, 28),
+/// Human-readable elapsed time: `45.3s`, `2m 05s`, `1h 03m 20s`.
+fn fmt_time(secs: f64) -> String {
+      let s = secs as u64;
+      let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+      if h > 0 {
+            format!("{h}h {m:02}m {sec:02}s")
+      } else if m > 0 {
+            format!("{m}m {sec:02}s")
+      } else {
+            format!("{secs:.1}s")
+      }
+}
+
+/// Compact axis label.
+fn fmt_axis(v: f64) -> String {
+      let a = v.abs();
+      if a >= 1000.0 || (a > 0.0 && a < 0.01) {
+            format!("{v:.1e}")
+      } else if a >= 1.0 {
+            format!("{v:.1}")
+      } else {
+            format!("{v:.3}")
       }
 }
 
@@ -148,9 +299,6 @@ pub struct Model {
       specs: Vec<(usize, Activation)>,
       loss: Loss,
       lr: f64,
-      metrics: Vec<Metric>,
-      log_every: usize,
-      plot: Vec<Metric>,
       params: RefCell<Vec<LayerParams>>,
 }
 
@@ -160,26 +308,8 @@ impl Model {
                   specs: Vec::new(),
                   loss: Loss::Mse,
                   lr: 0.01,
-                  metrics: Vec::new(),
-                  log_every: 1,
-                  plot: Vec::new(),
                   params: RefCell::new(Vec::new()),
             }
-      }
-
-      pub fn log(mut self, metrics: &[Metric]) -> Model {
-            self.metrics = metrics.to_vec();
-            self
-      }
-
-      pub fn log_every(mut self, every: usize) -> Model {
-            self.log_every = every;
-            self
-      }
-
-      pub fn plot(mut self, metrics: &[Metric]) -> Model {
-            self.plot = metrics.to_vec();
-            self
       }
 
       /// dL/dA at the output for the chosen loss (z = predictions, y = targets).
@@ -245,9 +375,8 @@ impl Model {
       }
 
       /// The colored, aligned metric line for the current epoch.
-      fn metrics_line(&self, epoch: usize, p: &[f64], y: &crate::Vec1, n: usize, elapsed: f64) -> String {
-            let parts: Vec<String> = self
-                  .metrics
+      fn metrics_line(&self, metrics: &[Metric], epoch: usize, p: &[f64], y: &crate::Vec1, n: usize, elapsed: f64) -> String {
+            let parts: Vec<String> = metrics
                   .iter()
                   .enumerate()
                   .map(|(i, &m)| {
@@ -255,81 +384,122 @@ impl Model {
                         let num = match m {
                               Metric::Epoch => format!("{:>5}", v as usize),
                               Metric::Lr => format!("{v:>7}"),
-                              Metric::Time => format!("{v:>5.2}s"),
+                              Metric::Time => format!("{:>9}", fmt_time(v)),
                               Metric::Loss => format!("{v:>7.4}"),
                               Metric::Accuracy => format!("{v:>6.4}"),
                               Metric::R2 => format!("{v:>8.4}"),
                         };
-                        let (r, g, b) = PALETTE[i % PALETTE.len()];
+                        let (r, g, b) = palette(i);
                         format!("{} \x1b[38;2;{r};{g};{b}m{num}\x1b[0m", Self::label(m))
                   })
                   .collect();
             parts.join("  ")
       }
 
-      /// Render one facet per metric (x = epoch) into a tiled grid string,
-      /// drawn in-process with termplot-rs (braille). `ys` excludes Epoch.
-      fn chart_grid(&self, rows: &[Vec<f64>], ys: &[Metric], tcols: usize, avail_rows: usize) -> String {
-            if rows.is_empty() || ys.is_empty() {
-                  return String::new();
+      /// Render the live dashboard with ratatui: a header block + one Chart widget
+      /// per metric (x = epoch), stacked via a Layout that can't overflow.
+      fn render_dashboard(&self, frame: &mut Frame, summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
+            let header_h = summary.lines().count() as u16;
+            let mut constraints = vec![Constraint::Length(header_h)];
+            constraints.extend(ys.iter().map(|_| Constraint::Fill(1)));
+            let areas = Layout::vertical(constraints).split(frame.area());
+            frame.render_widget(Paragraph::new(summary), areas[0]);
+
+            let xmax = rows.last().map_or(1.0, |r| r[0]).max(1.0);
+            let lxmax = xmax.log10().max(1e-9); // x bound in log10(epoch) space
+            for (j, &m) in ys.iter().enumerate() {
+                  // Log x (epoch) + symlog y: the huge early transient (e.g. R2 at
+                  // -29M, or the initial loss spike) compresses logarithmically while
+                  // the convergence near the asymptote keeps full linear resolution.
+                  let pts: Vec<(f64, f64)> = rows.iter()
+                        .map(|r| (r[0].max(1.0).log10(), symlog(r[1 + j])))
+                        .collect();
+                  // Bounds live in symlog space; auto-scale tightly to the data so the
+                  // whole curve fits, with a little padding to keep extremes off edge.
+                  let lo = pts.iter().map(|p| p.1).filter(|v| v.is_finite())
+                        .fold(f64::INFINITY, f64::min);
+                  let hi = pts.iter().map(|p| p.1).filter(|v| v.is_finite())
+                        .fold(f64::NEG_INFINITY, f64::max);
+                  let (ymin, ymax) = if hi > lo {
+                        let pad = (hi - lo) * 0.05;
+                        (lo - pad, hi + pad)
+                  } else if lo.is_finite() {
+                        (lo - 1.0, lo + 1.0)
+                  } else {
+                        (0.0, 1.0)
+                  };
+                  // Historical min/max in real units, for the two y tick labels.
+                  let real_lo = if lo.is_finite() { inv_symlog(lo) } else { 0.0 };
+                  let real_hi = if hi.is_finite() { inv_symlog(hi) } else { 1.0 };
+                  let (r, g, b) = palette(j);
+                  let color = Color::Rgb(r, g, b);
+                  let ds = ChartDataset::default()
+                        .marker(Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(color))
+                        .data(&pts);
+                  // Title in the same color as the metric's data, so label ↔ curve.
+                  // Append the current (latest, untransformed) value: `acc = 0.93`.
+                  let cur = rows.last().map_or(f64::NAN, |r| r[1 + j]);
+                  let title = Span::styled(
+                        format!("{} = {}", Self::label(m), fmt_axis(cur)),
+                        Style::default().fg(color),
+                  );
+                  // Ticks: evenly spaced in transformed space, labeled with the real
+                  // value via the inverse transform (10^x = elapsed seconds → human
+                  // readable for x, inv_symlog for y).
+                  let chart = Chart::new(vec![ds])
+                        .block(Block::default().title(title))
+                        .x_axis(Axis::default().bounds([0.0, lxmax]).labels([
+                              String::new(),                          // origin: implicit
+                              String::new(),                          // middle: omitted
+                              fmt_time_axis(10f64.powf(lxmax)),       // only the latest time
+                        ]))
+                        .y_axis(Axis::default().bounds([ymin, ymax]).labels([
+                              format!("{:>12}", fmt_axis(real_lo)),
+                              format!("{:>12}", fmt_axis(real_hi)),
+                        ]));
+                  frame.render_widget(chart, areas[j + 1]);
             }
-            let k = if tcols >= 90 { 2 } else { 1 }; // facet columns
-            let chart_rows = ys.len().div_ceil(k);
-            // No border/title: each box is exactly chart_h braille rows, so the full
-            // height budget goes to the data area (8 px of vertical resolution per
-            // row). One blank line separates stacked chart-rows. The label is drawn
-            // inside the canvas instead of costing a border+title (3 rows).
-            let chart_w = ((tcols - (k - 1) * 2) / k).saturating_sub(2).max(12);
-            let gaps = chart_rows.saturating_sub(1);
-            let chart_h = (avail_rows.saturating_sub(gaps) / chart_rows).max(8);
 
-            let boxes: Vec<Vec<String>> = ys
-                  .iter()
-                  .enumerate()
-                  .map(|(j, &m)| {
-                        let pts: Vec<(f64, f64)> =
-                              rows.iter().map(|r| (r[0], r[1 + j])).collect();
-                        let mut chart = ChartContext::new(chart_w, chart_h);
-                        let (rx, ry) = ChartContext::get_auto_range(&pts, 0.05);
-                        chart.draw_axes(rx, ry, Some(Color::TrueColor { r: 90, g: 90, b: 90 }));
-                        chart.line_chart(&pts, Some(palette_color(j)));
-                        chart.text(Self::label(m), 0.0, 0.98, Some(palette_color(j)));
-                        chart
-                              .canvas
-                              .render_with_options(false, None)
-                              .split('\n')
-                              .map(str::to_string)
-                              .collect()
-                  })
-                  .collect();
-
-            let mut out = String::new();
-            for (ri, chunk) in boxes.chunks(k).enumerate() {
-                  if ri > 0 {
-                        out.push('\n'); // blank line between stacked chart-rows
-                  }
-                  let h = chunk.iter().map(Vec::len).max().unwrap_or(0);
-                  for li in 0..h {
-                        for (ci, b) in chunk.iter().enumerate() {
-                              if ci > 0 {
-                                    out.push_str("  ");
+            // Each Chart draws its own y-axis segment; bridge the title/x-label gaps
+            // between them so the shared axis column reads as one continuous line.
+            if areas.len() >= 2 {
+                  let (first, last) = (areas[1], areas[areas.len() - 1]);
+                  let buf = frame.buffer_mut();
+                  let mut found = None;
+                  'find: for x in first.left()..first.right() {
+                        for y in first.top()..first.bottom() {
+                              if let Some(c) = buf.cell((x, y)) {
+                                    if c.symbol() == symbols::line::VERTICAL {
+                                          found = Some((x, c.style()));
+                                          break 'find;
+                                    }
                               }
-                              out.push_str(b.get(li).map_or("", String::as_str));
-                              out.push_str("\x1b[0m");
                         }
-                        out.push('\n');
+                  }
+                  if let Some((cx, style)) = found {
+                        // Stop at the last chart's x-axis corner, not its x-label row
+                        // below it — otherwise the line dangles a tail past the graph.
+                        for y in first.top()..last.bottom().saturating_sub(1) {
+                              if let Some(c) = buf.cell_mut((cx, y)) {
+                                    match c.symbol() {
+                                          " " | "" => {
+                                                c.set_symbol(symbols::line::VERTICAL);
+                                                c.set_style(style);
+                                          }
+                                          // Intermediate x-axis corner: tee the vertical
+                                          // straight through to the next chart. The last
+                                          // chart's corner stays └ (nothing below it).
+                                          s if s == symbols::line::BOTTOM_LEFT && y < last.top() => {
+                                                c.set_symbol(symbols::line::VERTICAL_RIGHT);
+                                          }
+                                          _ => {}
+                                    }
+                              }
+                        }
                   }
             }
-            out
-      }
-
-      /// Full live frame: summary line, current metrics line, then the facet grid.
-      fn dashboard(&self, summary: &str, cur: &str, rows: &[Vec<f64>], ys: &[Metric], tcols: usize, trows: usize) -> String {
-            // Header = the multi-line arch/data block + the current-metrics line;
-            // the rest of the terminal height is chart area.
-            let header_lines = summary.lines().count() + 1;
-            let grid = self.chart_grid(rows, ys, tcols, trows.saturating_sub(header_lines));
-            format!("{summary}\n{cur}\n{grid}")
       }
 
       pub fn layer(mut self, spec: impl IntoLayer) -> Model {
@@ -342,6 +512,8 @@ impl Model {
             self
       }
 
+      /// Set the learning rate. To reset between runs, rebind:
+      /// `let model = model.lr(1e-8); train.run(&model, &data);`.
       pub fn lr(mut self, lr: f64) -> Model {
             self.lr = lr;
             self
@@ -376,7 +548,23 @@ impl Model {
             acts
       }
 
-      pub fn train(&self, data: &Dataset, epochs: usize) {
+      /// Copy a GPU buffer of `len` f64s back to host.
+      fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
+            let mut v = vec![0.0f64; len];
+            buf.download(&mut v).expect("gpu download");
+            v
+      }
+
+      /// Forward pass + download of the output layer's predictions.
+      fn predict(params: &[LayerParams], x: &GpuBuffer, n: usize) -> Vec<f64> {
+            let acts = Self::forward(params, x, n);
+            Self::download_vec(acts.last().expect("predict: no output"), n)
+      }
+
+      fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
+            // Non-empty params = this model already ran — a rerun (e.g. an lr ramp).
+            // Suppress the pre-run summary and post-run recap on reruns.
+            let rerun = !self.params.borrow().is_empty();
             let start = std::time::Instant::now();
             let (xbuf, n, d) = Self::upload(&data.x);
             let ybuf = GpuBuffer::upload(
@@ -384,19 +572,121 @@ impl Model {
             )
             .expect("upload y");
 
+            // Resumed weights (per-neuron, in save order) or empty for random init.
+            let mut resumed = resume.map(Self::load_ogdl).unwrap_or_default();
+            // NaNs in the OGDL are dead cells — training never writes them, so the
+            // only way they appear is a hand-edited file. Randomize just those cells
+            // (He-scaled per neuron), report the fraction, and keep training.
+            if !resumed.is_empty() {
+                  use rand::{Rng as _, SeedableRng as _};
+                  use rand_distr::StandardNormal;
+                  let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xB1A5);
+                  let total: usize = resumed.iter().map(|(ws, _)| ws.len() + 1).sum();
+                  let mut nans = 0usize;
+                  for (ws, b) in resumed.iter_mut() {
+                        let scale = (2.0 / ws.len().max(1) as f64).sqrt();
+                        for v in ws.iter_mut() {
+                              if v.is_nan() {
+                                    *v = rng.sample::<f64, _>(StandardNormal) * scale;
+                                    nans += 1;
+                              }
+                        }
+                        if b.is_nan() {
+                              *b = rng.sample::<f64, _>(StandardNormal) * scale;
+                              nans += 1;
+                        }
+                  }
+                  if nans > 0 {
+                        let pct = 100.0 * nans as f64 / total as f64;
+                        eprintln!(
+                              "\x1b[32mresume\x1b[0m\n    \x1b[1;31mNaN\x1b[0m\n        path: {}\n        {nans}/{total} weights+biases ({pct:.1}%) were NaN\n        randomized those, continuing",
+                              resume.unwrap_or("")
+                        );
+                  }
+            }
+            let did_resume = !resumed.is_empty();
+            if !resumed.is_empty() {
+                  // The OGDL's per-neuron weight counts must match this arch fed by
+                  // this data (first layer's in_dim = feature count d). Mismatch =
+                  // wrong file or changed data/shape; say exactly what's off and stop.
+                  let expected: usize = self.specs.iter().map(|&(u, _)| u).sum();
+                  let mut why = (resumed.len() != expected).then(|| {
+                        format!("OGDL has {} neurons, this model has {expected}", resumed.len())
+                  });
+                  if why.is_none() {
+                        let mut idx = 0;
+                        let mut din = d;
+                        for (li, &(units, _)) in self.specs.iter().enumerate() {
+                              for _ in 0..units {
+                                    let got = resumed[idx].0.len();
+                                    if got != din {
+                                          why = Some(format!(
+                                                "layer {li} expects {din} weights/neuron, OGDL has {got} (data feature count differs?)"
+                                          ));
+                                          break;
+                                    }
+                                    idx += 1;
+                              }
+                              if why.is_some() {
+                                    break;
+                              }
+                              din = units;
+                        }
+                  }
+                  if why.is_some() {
+                        // OGDL feature count = first layer's per-neuron weight count.
+                        let ogdl_feat = resumed.first().map_or(0, |(w, _)| w.len());
+                        let path = resume.unwrap_or("");
+                        // Error rendered as OGDL itself: green node, bold-red reason,
+                        // then `file` and `data` sub-nodes whose children you compare.
+                        eprintln!(
+                              "\x1b[32mresume\x1b[0m\n\
+                               \x20   \x1b[1;31mdata does not match\x1b[0m\n\
+                               \x20       file\n\
+                               \x20           path={path}\n\
+                               \x20           features={ogdl_feat}\n\
+                               \x20           neurons={}\n\
+                               \x20       data\n\
+                               \x20           path={}\n\
+                               \x20           features={d}\n\
+                               \x20           neurons={expected}",
+                              resumed.len(),
+                              data.source,
+                        );
+                        std::process::exit(1);
+                  }
+            }
+            let mut neuron = 0;
             let mut params: Vec<LayerParams> = Vec::new();
             let mut in_dim = d;
             for (li, &(units, act)) in self.specs.iter().enumerate() {
-                  let scale = (2.0 / in_dim as f64).sqrt();
-                  let w0 = kernels::gpu_randn(in_dim * units, 1234 + (li as u32) * 7919)
-                        .expect("randn w");
-                  let w = kernels::gpu_scale(&w0, scale, in_dim * units).expect("scale w");
-                  let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("upload b");
+                  let (w, b) = if resumed.is_empty() {
+                        let scale = (2.0 / in_dim as f64).sqrt();
+                        let w0 = kernels::gpu_randn(in_dim * units, 1234 + (li as u32) * 7919)
+                              .expect("randn w");
+                        let w = kernels::gpu_scale(&w0, scale, in_dim * units).expect("scale w");
+                        let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("upload b");
+                        (w, b)
+                  } else {
+                        // Distribute saved neurons back into this layer's W (in_dim×units,
+                        // row-major: index i*units+j) and bias[j], matching save's layout.
+                        let mut wh = vec![0.0f64; in_dim * units];
+                        let mut bh = vec![0.0f64; units];
+                        for j in 0..units {
+                              let (ws, bias) = &resumed[neuron];
+                              for i in 0..in_dim {
+                                    wh[i * units + j] = ws[i];
+                              }
+                              bh[j] = *bias;
+                              neuron += 1;
+                        }
+                        (GpuBuffer::upload(&wh).expect("upload w"), GpuBuffer::upload(&bh).expect("upload b"))
+                  };
                   params.push(LayerParams { w, b, in_dim, out_dim: units, act });
                   in_dim = units;
             }
             let last = params.len() - 1;
-            let summary = if self.metrics.is_empty() {
+            let summary = if cfg.metrics.is_empty() {
                   String::new()
             } else {
                   let neurons: usize = params.iter().map(|p| p.out_dim).sum();
@@ -418,7 +708,7 @@ impl Model {
             // Epoch is the x-axis; Time is wall-clock (an axis quantity), not a
             // y-series. Both are excluded from the facets — they're independent
             // variables, not datapoints. They still appear in the metrics header.
-            let plot_ys: Vec<Metric> = self
+            let plot_ys: Vec<Metric> = cfg
                   .plot
                   .iter()
                   .copied()
@@ -426,33 +716,68 @@ impl Model {
                   .collect();
             let mut plot_rows: Vec<Vec<f64>> = Vec::new();
 
-            // Live plotting owns the screen; the scrolling .log is shown inline in
-            // the dashboard header instead. Without .plot, fall back to stderr logs.
-            // The alternate screen buffer clips (never scrolls), so the in-place
-            // redraw can't smear even if a frame slightly overflows.
             // Only take over the screen when stdout is a real terminal; piped or
-            // headless runs fall through to the stderr log path (no escape spam).
-            let plotting = !self.plot.is_empty() && std::io::stdout().is_terminal();
-            if plotting {
-                  // SIGINT (Ctrl+C) kills the process before any Drop runs, so a
-                  // raw-write handler restores the terminal instead of leaking.
-                  unsafe {
-                        libc::signal(libc::SIGINT, restore_term_on_sigint as libc::sighandler_t);
+            // headless runs fall through to the stderr log path. ratatui owns the
+            // terminal (alt screen, raw mode, panic-restore hook); Ctrl+C arrives
+            // as a key event in raw mode and is handled in the loop.
+            let plotting = !cfg.plot.is_empty() && std::io::stdout().is_terminal();
+            if !plotting && !rerun {
+                  if did_resume {
+                        if let Some(path) = resume {
+                              let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+                              eprintln!("resumed: {}", full.display());
+                        }
                   }
-                  let _ = write!(std::io::stdout(), "\x1b[?1049h\x1b[?25l"); // alt screen, hide cursor
-                  let _ = std::io::stdout().flush();
-            } else if !summary.is_empty() {
-                  eprintln!("{summary}");
+                  if !summary.is_empty() {
+                        eprintln!("{summary}");
+                  }
             }
+            let mut terminal = plotting.then(ratatui::init);
             let mut last_draw = start;
-            let mut final_frame = String::new();
-            // Block-scoped so TermGuard::drop restores the terminal the moment the
-            // loop exits — on normal completion AND on panic unwind — before the
-            // final frame is reprinted to the main buffer below.
-            {
-            let _term_guard = plotting.then(TermGuard::new);
-            for e in 0..epochs {
+            // Trailing stop-loss on train R²: hold while it climbs. The first epoch it
+            // ticks down (blow-up is exponential, so that first dip is tiny and the
+            // in-VRAM weights are still ≈ the peak), save those weights once and never
+            // again. If it climbs the whole way, the only save is at the end below.
+            // Requires a save destination; no-op without one.
+            let checkpointing = cfg.save.as_ref().is_some_and(|(p, _)| !p.is_empty());
+            let mut r2_prev = f64::NAN;
+            let mut saved = false;
+            INTERRUPTED.store(false, Ordering::SeqCst);
+            unsafe { libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t); }
+            for e in 0..cfg.epochs {
+                  if INTERRUPTED.load(Ordering::SeqCst) {
+                        break;
+                  }
                   let acts = Self::forward(&params, &xbuf, n);
+                  // Predictions from the pre-update weights — needed for the per-epoch
+                  // R² checkpoint test and reused by logging/plotting below.
+                  let log_now = cfg.log_every > 0
+                        && !cfg.metrics.is_empty()
+                        && (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
+                  let preds = (checkpointing || log_now || plotting)
+                        .then(|| Self::download_vec(acts.last().expect("preds"), n));
+                  let mut checkpointed = false;
+                  if checkpointing {
+                        let pr = preds.as_deref().expect("preds for r2");
+                        let r2 = self.metric_num(Metric::R2, e, pr, &data.y, n, 0.0);
+                        // First epoch R² ticks down = trailing stop hit: decide once.
+                        // Save the in-VRAM weights (≈ the peak, since blow-up is
+                        // exponential) — but ONLY if they beat the file's stored R², so
+                        // a resume that blows up straight off the saved weights can't
+                        // overwrite a good checkpoint with worse ones.
+                        if !saved && e > 0 && r2 < r2_prev {
+                              saved = true;
+                              let (parts, path) = cfg.save.as_ref().expect("save set");
+                              let path = Train::resolve(path);
+                              if Self::saved_r2(&path).map_or(true, |best| r2 > best) {
+                                    Self::write_ogdl(&path, &Self::dump_ogdl(&params, parts, r2));
+                                    checkpointed = true;
+                              }
+                        }
+                        if r2.is_finite() {
+                              r2_prev = r2;
+                        }
+                  }
                   // dL/dA at the output, averaged over the batch, then backprop
                   // through every layer's activation uniformly.
                   let out_last = params[last].out_dim;
@@ -487,21 +812,21 @@ impl Model {
                         kernels::gpu_sgd_update(&params[l].w, &dw, self.lr, in_dim * out_dim);
                         kernels::gpu_sgd_update(&params[l].b, &db, self.lr, out_dim);
                   }
-                  let log_now = self.log_every > 0
-                        && !self.metrics.is_empty()
-                        && (e % self.log_every == 0 || e + 1 == epochs);
-                  let last_epoch = e + 1 == epochs;
-                  if log_now || plotting {
-                        let mut p = vec![0.0f64; n];
-                        acts.last().expect("preds").download(&mut p).expect("preds download");
+                  let last_epoch = e + 1 == cfg.epochs;
+                  if log_now || checkpointed || plotting {
+                        let p = preds.as_deref().expect("preds");
                         let elapsed = start.elapsed().as_secs_f64();
-                        if !plotting && log_now {
-                              eprintln!("{}", self.metrics_line(e, &p, &data.y, n, elapsed));
+                        if !plotting && (log_now || checkpointed) {
+                              let mut line = self.metrics_line(&cfg.metrics, e, p, &data.y, n, elapsed);
+                              if checkpointed {
+                                    line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
+                              }
+                              eprintln!("{line}");
                         }
                         if plotting {
-                              let mut row = vec![e as f64];
+                              let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
                               for &m in &plot_ys {
-                                    row.push(self.metric_num(m, e, &p, &data.y, n, elapsed));
+                                    row.push(self.metric_num(m, e, p, &data.y, n, elapsed));
                               }
                               plot_rows.push(row);
                               // Throttle live redraws to ~25 fps; always draw the last frame.
@@ -509,44 +834,166 @@ impl Model {
                                     || last_epoch
                                     || last_draw.elapsed().as_millis() >= 40
                               {
-                                    let (tcols, trows) = term_size();
-                                    let cur = self.metrics_line(e, &p, &data.y, n, elapsed);
-                                    let frame = self
-                                          .dashboard(&summary, &cur, &plot_rows, &plot_ys, tcols, trows);
-                                    let _ = write!(std::io::stdout(), "\x1b[H{frame}\x1b[0J");
-                                    let _ = std::io::stdout().flush();
-                                    final_frame = frame;
-                                    last_draw = std::time::Instant::now();
+                                    if let Some(term) = terminal.as_mut() {
+                                          let _ = term.draw(|frame| {
+                                                self.render_dashboard(
+                                                      frame, &summary, &plot_rows, &plot_ys,
+                                                );
+                                          });
+                                          last_draw = std::time::Instant::now();
+                                    }
+                              }
+                              // Quit early on q / Ctrl+C (raw mode delivers them as keys).
+                              if event::poll(Duration::ZERO).unwrap_or(false) {
+                                    if let Ok(Event::Key(k)) = event::read() {
+                                          if k.code == KeyCode::Char('q')
+                                                || (k.code == KeyCode::Char('c')
+                                                      && k.modifiers.contains(KeyModifiers::CONTROL))
+                                          {
+                                                break;
+                                          }
+                                    }
                               }
                         }
                   }
             }
-            } // end guard scope: terminal restored here (alt screen left, cursor shown)
+            // Restore default SIGINT so the process is killable again once training
+            // is over — otherwise our handler keeps swallowing Ctrl+C during eval/exit.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL); }
             if plotting {
-                  // Now on the main buffer; persist the final frame in scrollback.
-                  let _ = write!(std::io::stdout(), "{final_frame}");
-                  let _ = std::io::stdout().flush();
+                  ratatui::restore();
             }
+            // No post-run recap: the streaming log already ends on the final epoch,
+            // and the arch/data summary printed once at the top.
+            //
+            // End of epochs or Ctrl+C: save the current weights iff their R² beats the
+            // file's stored best — keep progress when you stop on a good climb, protect
+            // the file when it had blown up. Independent of the trailing stop, so a long
+            // post-dip recovery still saves. Model::save enforces the R²/finite gate.
+            let end_r2 = checkpointing.then(|| {
+                  let preds = Self::predict(&params, &xbuf, n);
+                  self.metric_num(Metric::R2, 0, &preds, &data.y, n, 0.0)
+            });
             *self.params.borrow_mut() = params;
+            if let Some(r2) = end_r2 {
+                  let (parts, path) = cfg.save.as_ref().expect("save set");
+                  self.save(parts, &Train::resolve(path), r2);
+            }
+      }
+
+      /// Dump the requested params to `model.ogdl` in the cwd as one OGDL block
+      /// per neuron: `z{k}` with `w1..` (if `W` requested) and `b` (if requested).
+      /// Call after `train()`: `model.save(&[W, B], "model.ogdl", r2)`. Refuses to
+      /// overwrite a checkpoint whose stored R² already beats `r2` (anti-degradation).
+      pub fn save(&self, parts: &[Param], path: &str, r2: f64) {
+            let params = self.params.borrow();
+            assert!(!params.is_empty(), "save: call train() first");
+            // Don't overwrite a better checkpoint, and never save a blown-up (non-finite)
+            // R² — "ctrl-c while r2 < file's best: don't save (protect the file)".
+            if !r2.is_finite() || Self::saved_r2(path).is_some_and(|best| r2 <= best) {
+                  return;
+            }
+            let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+            Self::write_ogdl(path, &Self::dump_ogdl(&params, parts, r2));
+            let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+            eprintln!("saved {} ({} neurons, r2 {:.4})", full.display(), neurons, r2);
+      }
+
+      /// One OGDL block per neuron (`z{k}` → `w1..` if `W` requested, `b` if `B`),
+      /// W laid out row-major `i*out_dim+j` to match `load_ogdl`'s distribution.
+      fn dump_ogdl(params: &[LayerParams], parts: &[Param], r2: f64) -> String {
+            let (want_w, want_b) = (parts.contains(&Param::W), parts.contains(&Param::B));
+            // Header: the R² these weights achieved, so a later run can refuse to
+            // overwrite this checkpoint with worse weights (anti-degradation).
+            let mut out = format!("r2={r2}\n");
+            let mut z = 1;
+            for p in params.iter() {
+                  let w = Self::download_vec(&p.w, p.in_dim * p.out_dim);
+                  let b = Self::download_vec(&p.b, p.out_dim);
+                  for j in 0..p.out_dim {
+                        out.push_str(&format!("z{z}\n"));
+                        if want_w {
+                              for i in 0..p.in_dim {
+                                    out.push_str(&format!("    w{}={}\n", i + 1, w[i * p.out_dim + j]));
+                              }
+                        }
+                        if want_b {
+                              out.push_str(&format!("    b={}\n", b[j]));
+                        }
+                        z += 1;
+                  }
+            }
+            out
+      }
+
+      /// Write OGDL text, creating any missing parent dirs — saving should make the
+      /// file, not fail because the directory isn't there yet.
+      fn write_ogdl(path: &str, out: &str) {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                  if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                              .unwrap_or_else(|e| panic!("save: mkdir {}: {e}", parent.display()));
+                  }
+            }
+            std::fs::write(path, out).unwrap_or_else(|e| panic!("save: write {path}: {e}"));
+      }
+
+      /// Parse an OGDL dump into one `(weights, bias)` per neuron, in save order.
+      /// A missing file is not an error: it just means "first run" — return empty
+      /// so training starts from random init and a later run can resume.
+      fn load_ogdl(path: &str) -> Vec<(Vec<f64>, f64)> {
+            let text = match std::fs::read_to_string(path) {
+                  Ok(t) => t,
+                  Err(_) => {
+                        eprintln!("no data in {path}, initialized random weights and biases");
+                        return Vec::new();
+                  }
+            };
+            let mut neurons: Vec<(Vec<f64>, f64)> = Vec::new();
+            for line in text.lines() {
+                  let t = line.trim();
+                  if t.is_empty() {
+                        continue;
+                  }
+                  match t.split_once('=') {
+                        None => neurons.push((Vec::new(), 0.0)), // `z{k}` header
+                        Some((k, _)) if k.trim() == "r2" => {} // file's stored best R²
+                        Some((k, v)) => {
+                              let val: f64 = v.trim().parse().expect("resume: parse value");
+                              let cur = neurons.last_mut().expect("resume: w/b before z");
+                              if k.trim_start().starts_with('b') {
+                                    cur.1 = val;
+                              } else {
+                                    cur.0.push(val);
+                              }
+                        }
+                  }
+            }
+            neurons
+      }
+
+      /// The R² stored in an OGDL header (`r2=`), or None if the file is missing or
+      /// predates the header. Used to refuse overwriting a better checkpoint.
+      fn saved_r2(path: &str) -> Option<f64> {
+            let text = std::fs::read_to_string(path).ok()?;
+            for line in text.lines() {
+                  if let Some((k, v)) = line.trim().split_once('=') {
+                        if k.trim() == "r2" {
+                              return v.trim().parse().ok();
+                        }
+                  }
+            }
+            None
       }
 
       pub fn eval(&self, data: &Dataset) {
             let params = self.params.borrow();
             assert!(!params.is_empty(), "eval: call train() first");
             let (xbuf, n, _d) = Self::upload(&data.x);
-            let acts = Self::forward(&params, &xbuf, n);
-            let pred = acts.last().expect("eval: prediction");
-            let mut probs = vec![0.0f64; n];
-            pred.download(&mut probs).expect("eval download");
-            let mut correct = 0usize;
-            for i in 0..n {
-                  let p = if probs[i] >= 0.5 { 1.0 } else { 0.0 };
-                  if (p - data.y[i]).abs() < 0.5 {
-                        correct += 1;
-                  }
-            }
-            let acc = correct as f64 / n as f64;
-            println!("eval: accuracy = {:.4} ({correct}/{n})", acc);
+            let probs = Self::predict(&params, &xbuf, n);
+            let acc = self.metric_num(Metric::Accuracy, 0, &probs, &data.y, n, 0.0);
+            let correct = (acc * n as f64).round() as usize;
+            println!("eval: accuracy = {acc:.4} ({correct}/{n})");
       }
 }
 
@@ -555,3 +1002,6 @@ impl Default for Model {
             Self::new()
       }
 }
+
+
+

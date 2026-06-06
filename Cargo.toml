@@ -22,14 +22,14 @@ polars = { version = "0.46", features = [
 ] }
 ndarray = { version = "0.16", features = ["rayon"] }
 ndarray-stats = "0.6"
+rayon = "1"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
 image = "0.25"
-termplot-rs = "0.3.0"
-colored = "2.0"
-crossterm = "0.27"
+ratatui = "0.30"
 libc = "0.2"
+indicatif = { version = "0.17", features = ["rayon"] }
 
 [profile.release]
 opt-level = 3

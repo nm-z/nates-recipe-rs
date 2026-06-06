@@ -16,11 +16,18 @@ pub mod dataset;
 #[path = "utils/model.rs"]
 pub mod model;
 
-pub use dataset::{Data, DataSplit, Dataset};
+pub use dataset::{Data, Dataset};
 pub use model::{
-      Accuracy, Activation, Epoch, IntoLayer, Loss, Lr, Metric, Model, R2, Time, ce, huber, linear,
-      mae, mse, relu, sigmoid,
+      Accuracy, Activation, Epoch, IntoLayer, Loss, Lr, Metric, Model, Param, R2, Time, Train, ce,
+      huber, linear, mae, mse, relu, sigmoid,
 };
+
+// `save` selectors. Defined here in the crate root — NOT in `model`, where bare
+// `w`/`b` consts would be parsed as constant-patterns and break `let w`/`let b`.
+#[allow(non_upper_case_globals)]
+pub const w: Param = Param::W;
+#[allow(non_upper_case_globals)]
+pub const b: Param = Param::B;
 
 #[cfg(test)]
 #[path = "utils/tests.rs"]
