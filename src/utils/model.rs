@@ -295,6 +295,32 @@ struct LayerParams {
       act: Activation,
 }
 
+/// Per-layer GPU scratch, allocated once and reused every epoch so the training
+/// loop allocates nothing after warmup. `acts[l]` = layer l's output (acts[last]
+/// = predictions), `da[l]` = dL/d(act_l), `dz[l]` = dL/d(preact_l), `dw[l]`/`db[l]`
+/// = parameter grads matching the `w`/`b` layout. Sizes are fixed across epochs.
+struct Scratch {
+      acts: Vec<GpuBuffer>,
+      da: Vec<GpuBuffer>,
+      dz: Vec<GpuBuffer>,
+      dw: Vec<GpuBuffer>,
+      db: Vec<GpuBuffer>,
+}
+
+impl Scratch {
+      fn new(params: &[LayerParams], n: usize) -> Scratch {
+            let mut s = Scratch { acts: vec![], da: vec![], dz: vec![], dw: vec![], db: vec![] };
+            for p in params {
+                  s.acts.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch acts"));
+                  s.da.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch da"));
+                  s.dz.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch dz"));
+                  s.dw.push(GpuBuffer::alloc(p.in_dim * p.out_dim).expect("scratch dw"));
+                  s.db.push(GpuBuffer::alloc(p.out_dim).expect("scratch db"));
+            }
+            s
+      }
+}
+
 pub struct Model {
       specs: Vec<(usize, Activation)>,
       loss: Loss,
@@ -312,24 +338,27 @@ impl Model {
             }
       }
 
-      /// dL/dA at the output for the chosen loss (z = predictions, y = targets).
-      fn loss_grad(loss: Loss, z: &GpuBuffer, y: &GpuBuffer, n: usize) -> GpuBuffer {
+      /// dL/dA at the output for the chosen loss, scaled by 1/n (batch mean),
+      /// written in place into `da` with no allocation. `out` = predictions,
+      /// `y` = targets, `total` = n*out_dim. Equals the old allocate-return
+      /// `loss_grad` followed by `·(1/n)`, op-for-op.
+      fn loss_grad_into(loss: Loss, out: &GpuBuffer, y: &GpuBuffer, da: &GpuBuffer, n: usize, total: usize) {
+            let inv = 1.0 / n as f64;
             match loss {
-                  Loss::Mse => {
-                        let d = kernels::gpu_sub(z, y, n).expect("mse sub");
-                        kernels::gpu_scale(&d, 2.0, n).expect("mse scale")
-                  }
+                  Loss::Mse => kernels::gpu_sub_scale_into(out, y, da, total, 2.0 * inv),
                   Loss::Mae => {
-                        let d = kernels::gpu_sub(z, y, n).expect("mae sub");
-                        kernels::gpu_sign(&d, n).expect("mae sign")
+                        kernels::gpu_sub_scale_into(out, y, da, total, 1.0);
+                        kernels::gpu_sign_into(da, da, total);
+                        kernels::gpu_scale_inplace(da, inv, total);
                   }
                   Loss::Huber => {
-                        let d = kernels::gpu_sub(z, y, n).expect("huber sub");
-                        kernels::gpu_clamp(&d, n, -1.0, 1.0).expect("huber clamp")
+                        kernels::gpu_sub_scale_into(out, y, da, total, 1.0);
+                        kernels::gpu_clamp_into(da, da, total, -1.0, 1.0);
+                        kernels::gpu_scale_inplace(da, inv, total);
                   }
                   Loss::Ce => {
-                        let q = kernels::gpu_div(y, z, n).expect("ce div");
-                        kernels::gpu_scale(&q, -1.0, n).expect("ce scale")
+                        kernels::gpu_div_into(y, out, da, total);
+                        kernels::gpu_scale_inplace(da, -inv, total);
                   }
             }
       }
@@ -374,13 +403,88 @@ impl Model {
             }
       }
 
-      /// The colored, aligned metric line for the current epoch.
-      fn metrics_line(&self, metrics: &[Metric], epoch: usize, p: &[f64], y: &crate::Vec1, n: usize, elapsed: f64) -> String {
+      /// One metric this epoch as a single GPU-reduced scalar, downloading only that
+      /// scalar (never the n predictions). `out` = output activations (n×1, on GPU);
+      /// `ss_tot` and `y2m1` (= 2y-1) are precomputed once since the targets are fixed.
+      /// Matches `metric_num` exactly except accuracy differs only at the measure-zero
+      /// p==0.5 tie (sigmoid outputs never land there).
+      fn metric_gpu(&self, m: Metric, out: &GpuBuffer, ybuf: &GpuBuffer, y2m1: &GpuBuffer, n: usize, ss_tot: f64, epoch: usize, elapsed: f64) -> f64 {
+            match m {
+                  Metric::Epoch => epoch as f64,
+                  Metric::Lr => self.lr,
+                  Metric::Time => elapsed,
+                  Metric::R2 => {
+                        let d = kernels::gpu_sub(ybuf, out, n).expect("r2 sub");
+                        let sq = kernels::gpu_mul(&d, &d, n).expect("r2 sq");
+                        let ssr = kernels::gpu_reduce_sum_cols(&sq, n, 1).expect("r2 reduce");
+                        1.0 - Self::download_scalar(&ssr) / ss_tot
+                  }
+                  Metric::Accuracy => {
+                        let pc = kernels::gpu_copy(out, n).expect("acc copy");
+                        kernels::gpu_add_scalar_inplace(&pc, -0.5, n);
+                        let prod = kernels::gpu_mul(&pc, y2m1, n).expect("acc mul");
+                        let sgn = kernels::gpu_sign(&prod, n).expect("acc sign");
+                        let sum = kernels::gpu_reduce_sum_cols(&sgn, n, 1).expect("acc reduce");
+                        (Self::download_scalar(&sum) + n as f64) / (2.0 * n as f64)
+                  }
+                  // The Loss metric is the model's ACTUAL loss (self.loss), not hardcoded.
+                  Metric::Loss => {
+                        let nf = n as f64;
+                        match self.loss {
+                              Loss::Mse => {
+                                    let d = kernels::gpu_sub(out, ybuf, n).expect("mse sub");
+                                    let sq = kernels::gpu_mul(&d, &d, n).expect("mse sq");
+                                    let s = kernels::gpu_reduce_sum_cols(&sq, n, 1).expect("mse reduce");
+                                    Self::download_scalar(&s) / nf
+                              }
+                              Loss::Mae => {
+                                    let d = kernels::gpu_sub(out, ybuf, n).expect("mae sub");
+                                    let a = kernels::gpu_abs(&d, n).expect("mae abs");
+                                    let s = kernels::gpu_reduce_sum_cols(&a, n, 1).expect("mae reduce");
+                                    Self::download_scalar(&s) / nf
+                              }
+                              Loss::Huber => {
+                                    // delta=1: 0.5 r² for |r|≤1 else |r|-0.5, written as
+                                    // 0.5·clamp(r,-1,1)² + |r| - |clamp(r,-1,1)|.
+                                    let r = kernels::gpu_sub(out, ybuf, n).expect("huber sub");
+                                    let rc = kernels::gpu_clamp(&r, n, -1.0, 1.0).expect("huber clamp");
+                                    let e = kernels::gpu_mul(&rc, &rc, n).expect("huber rc²");
+                                    kernels::gpu_scale_inplace(&e, 0.5, n);
+                                    let absr = kernels::gpu_abs(&r, n).expect("huber |r|");
+                                    kernels::gpu_add_inplace(&e, &absr, n);
+                                    let absrc = kernels::gpu_abs(&rc, n).expect("huber |rc|");
+                                    kernels::gpu_sub_inplace(&e, &absrc, n);
+                                    let s = kernels::gpu_reduce_sum_cols(&e, n, 1).expect("huber reduce");
+                                    Self::download_scalar(&s) / nf
+                              }
+                              Loss::Ce => {
+                                    let eps = 1e-7;
+                                    let pc = kernels::gpu_clamp(out, n, eps, 1.0 - eps).expect("ce clamp");
+                                    let lnp = kernels::gpu_log(&pc, n).expect("ce ln p");
+                                    let t1 = kernels::gpu_mul(ybuf, &lnp, n).expect("ce y·ln p");
+                                    let omp = kernels::gpu_scale(&pc, -1.0, n).expect("ce -p");
+                                    kernels::gpu_add_scalar_inplace(&omp, 1.0, n);
+                                    let lnomp = kernels::gpu_log(&omp, n).expect("ce ln(1-p)");
+                                    let omy = kernels::gpu_scale(ybuf, -1.0, n).expect("ce -y");
+                                    kernels::gpu_add_scalar_inplace(&omy, 1.0, n);
+                                    let t2 = kernels::gpu_mul(&omy, &lnomp, n).expect("ce (1-y)·ln(1-p)");
+                                    kernels::gpu_add_inplace(&t1, &t2, n);
+                                    let s = kernels::gpu_reduce_sum_cols(&t1, n, 1).expect("ce reduce");
+                                    -Self::download_scalar(&s) / nf
+                              }
+                        }
+                  }
+            }
+      }
+
+      /// The colored, aligned metric line: `vals[i]` is the precomputed value of
+      /// `metrics[i]` (already reduced on the GPU), so this only formats.
+      fn metrics_line(&self, metrics: &[Metric], vals: &[f64]) -> String {
             let parts: Vec<String> = metrics
                   .iter()
+                  .zip(vals)
                   .enumerate()
-                  .map(|(i, &m)| {
-                        let v = self.metric_num(m, epoch, p, y, n, elapsed);
+                  .map(|(i, (&m, &v))| {
                         let num = match m {
                               Metric::Epoch => format!("{:>5}", v as usize),
                               Metric::Lr => format!("{v:>7}"),
@@ -548,11 +652,72 @@ impl Model {
             acts
       }
 
+      /// Forward pass writing each layer's output into the preallocated `acts`
+      /// (no allocation). The input `x` feeds layer 0 directly (no copy); the
+      /// activation is applied in place (`acts[l]` holds the pre-activation, then
+      /// is overwritten by its own activation). `acts[last]` ends as predictions.
+      fn forward_into(params: &[LayerParams], x: &GpuBuffer, n: usize, acts: &[GpuBuffer]) {
+            for (l, p) in params.iter().enumerate() {
+                  let prev = if l == 0 { x } else { &acts[l - 1] };
+                  kernels::gpu_linear_into(prev, &p.w, &p.b, &acts[l], n, p.out_dim, p.in_dim);
+                  let m = n * p.out_dim;
+                  match p.act {
+                        Activation::Relu => kernels::gpu_relu_into(&acts[l], &acts[l], m),
+                        Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], &acts[l], m),
+                        Activation::Linear => {}
+                  }
+            }
+      }
+
+      /// One backward pass + SGD update, writing every gradient into preallocated
+      /// `sc` (no allocation). `sc.acts` must hold this epoch's forward output and
+      /// `x` feeds layer 0 as in `forward_into`. Op-for-op identical to the old
+      /// in-loop backward: dz = act'(da)·, dw = aᵀ·dz, db = Σ dz, da_below = dz·wᵀ,
+      /// then w -= lr·dw, b -= lr·db. `w` is read for da_below before its update.
+      fn backward_step(&self, params: &[LayerParams], x: &GpuBuffer, ybuf: &GpuBuffer, n: usize, sc: &Scratch) {
+            let last = params.len() - 1;
+            Self::loss_grad_into(self.loss, &sc.acts[last], ybuf, &sc.da[last], n, n * params[last].out_dim);
+            for l in (0..params.len()).rev() {
+                  let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
+                  let m = n * out_dim;
+                  let grad = match params[l].act {
+                        Activation::Relu => {
+                              kernels::gpu_relu_backward_into(&sc.da[l], &sc.acts[l], &sc.dz[l], m);
+                              &sc.dz[l]
+                        }
+                        Activation::Sigmoid => {
+                              kernels::gpu_sigmoid_backward_into(&sc.da[l], &sc.acts[l], &sc.dz[l], m);
+                              &sc.dz[l]
+                        }
+                        Activation::Linear => &sc.da[l],
+                  };
+                  let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
+                  if l > 0 {
+                        kernels::gpu_linear_backward_full_into(
+                              grad, a_prev, &params[l].w, &sc.da[l - 1], &sc.dw[l], &sc.db[l], n, out_dim, in_dim,
+                        );
+                  } else {
+                        kernels::gpu_linear_backward_weights_only_into(
+                              grad, a_prev, &sc.dw[l], &sc.db[l], n, out_dim, in_dim,
+                        );
+                  }
+                  kernels::gpu_sgd_update(&params[l].w, &sc.dw[l], self.lr, in_dim * out_dim);
+                  kernels::gpu_sgd_update(&params[l].b, &sc.db[l], self.lr, out_dim);
+            }
+      }
+
       /// Copy a GPU buffer of `len` f64s back to host.
       fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
             let mut v = vec![0.0f64; len];
             buf.download(&mut v).expect("gpu download");
             v
+      }
+
+      /// Download a single-element GPU buffer (a reduced scalar) to the host.
+      fn download_scalar(buf: &GpuBuffer) -> f64 {
+            let mut v = [0.0f64];
+            buf.download(&mut v).expect("scalar download");
+            v[0]
       }
 
       /// Forward pass + download of the output layer's predictions.
@@ -742,24 +907,34 @@ impl Model {
             let checkpointing = cfg.save.as_ref().is_some_and(|(p, _)| !p.is_empty());
             let mut r2_prev = f64::NAN;
             let mut saved = false;
+            // Per-epoch metrics reduce to a scalar on the GPU; only the requested ones
+            // are downloaded. SS_tot (R²'s denominator) and 2y-1 (accuracy's sign basis)
+            // depend only on the constant targets, so compute them once here.
+            let ss_tot = {
+                  let ybar = data.y.iter().sum::<f64>() / n as f64;
+                  data.y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
+            };
+            let y2m1 = kernels::gpu_scale(&ybuf, 2.0, n).expect("2y-1 scale");
+            kernels::gpu_add_scalar_inplace(&y2m1, -1.0, n);
+            // Activation + gradient buffers, allocated once and reused every epoch
+            // so steady-state VRAM is flat (no per-epoch sawtooth).
+            let sc = Scratch::new(&params, n);
             INTERRUPTED.store(false, Ordering::SeqCst);
             unsafe { libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t); }
             for e in 0..cfg.epochs {
                   if INTERRUPTED.load(Ordering::SeqCst) {
                         break;
                   }
-                  let acts = Self::forward(&params, &xbuf, n);
-                  // Predictions from the pre-update weights — needed for the per-epoch
-                  // R² checkpoint test and reused by logging/plotting below.
+                  Self::forward_into(&params, &xbuf, n, &sc.acts);
+                  let out = &sc.acts[last];
                   let log_now = cfg.log_every > 0
                         && !cfg.metrics.is_empty()
                         && (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-                  let preds = (checkpointing || log_now || plotting)
-                        .then(|| Self::download_vec(acts.last().expect("preds"), n));
                   let mut checkpointed = false;
                   if checkpointing {
-                        let pr = preds.as_deref().expect("preds for r2");
-                        let r2 = self.metric_num(Metric::R2, e, pr, &data.y, n, 0.0);
+                        // R² every epoch (the trailing stop needs it) — one GPU reduce,
+                        // one scalar down, never the n predictions.
+                        let r2 = self.metric_gpu(Metric::R2, out, &ybuf, &y2m1, n, ss_tot, e, 0.0);
                         // First epoch R² ticks down = trailing stop hit: decide once.
                         // Save the in-VRAM weights (≈ the peak, since blow-up is
                         // exponential) — but ONLY if they beat the file's stored R², so
@@ -779,45 +954,16 @@ impl Model {
                         }
                   }
                   // dL/dA at the output, averaged over the batch, then backprop
-                  // through every layer's activation uniformly.
-                  let out_last = params[last].out_dim;
-                  let g = Self::loss_grad(self.loss, acts.last().expect("output"), &ybuf, n * out_last);
-                  let mut grad_out: Option<GpuBuffer> =
-                        Some(kernels::gpu_scale(&g, 1.0 / n as f64, n * out_last).expect("scale dA"));
-                  for l in (0..params.len()).rev() {
-                        let out_dim = params[l].out_dim;
-                        let a_l = &acts[l + 1];
-                        let da = grad_out.take().expect("dA into layer");
-                        let dz = match params[l].act {
-                              Activation::Relu => kernels::gpu_relu_backward(&da, a_l, n * out_dim)
-                                    .expect("activation backward"),
-                              Activation::Sigmoid => {
-                                    kernels::gpu_sigmoid_backward(&da, a_l, n * out_dim)
-                                          .expect("activation backward")
-                              }
-                              Activation::Linear => da,
-                        };
-                        let in_dim = params[l].in_dim;
-                        let a_prev = &acts[l];
-                        let dw = kernels::gpu_gemm_at(a_prev, &dz, in_dim, out_dim, n)
-                              .expect("dw gemm_at");
-                        let db = kernels::gpu_reduce_sum_cols(&dz, n, out_dim)
-                              .expect("db reduce");
-                        if l > 0 {
-                              grad_out = Some(
-                                    kernels::gpu_gemm_bt(&dz, &params[l].w, n, in_dim, out_dim)
-                                          .expect("dA gemm_bt"),
-                              );
-                        }
-                        kernels::gpu_sgd_update(&params[l].w, &dw, self.lr, in_dim * out_dim);
-                        kernels::gpu_sgd_update(&params[l].b, &db, self.lr, out_dim);
-                  }
+                  // through every layer into the preallocated scratch (no alloc).
+                  self.backward_step(&params, &xbuf, &ybuf, n, &sc);
                   let last_epoch = e + 1 == cfg.epochs;
                   if log_now || checkpointed || plotting {
-                        let p = preds.as_deref().expect("preds");
                         let elapsed = start.elapsed().as_secs_f64();
                         if !plotting && (log_now || checkpointed) {
-                              let mut line = self.metrics_line(&cfg.metrics, e, p, &data.y, n, elapsed);
+                              let vals: Vec<f64> = cfg.metrics.iter()
+                                    .map(|&m| self.metric_gpu(m, out, &ybuf, &y2m1, n, ss_tot, e, elapsed))
+                                    .collect();
+                              let mut line = self.metrics_line(&cfg.metrics, &vals);
                               if checkpointed {
                                     line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
                               }
@@ -826,7 +972,7 @@ impl Model {
                         if plotting {
                               let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
                               for &m in &plot_ys {
-                                    row.push(self.metric_num(m, e, p, &data.y, n, elapsed));
+                                    row.push(self.metric_gpu(m, out, &ybuf, &y2m1, n, ss_tot, e, elapsed));
                               }
                               plot_rows.push(row);
                               // Throttle live redraws to ~25 fps; always draw the last frame.
@@ -1000,6 +1146,161 @@ impl Model {
 impl Default for Model {
       fn default() -> Self {
             Self::new()
+      }
+}
+
+#[cfg(test)]
+mod metric_gpu_tests {
+      use super::*;
+      use std::cell::RefCell;
+
+      // Cross-check every GPU metric against an independent CPU reference on real
+      // predictions (random-init forward over the real churn data). Proves the GPU
+      // reductions are correct without touching the user's model.ogdl.
+      #[test]
+      fn gpu_metrics_match_cpu_reference() {
+            const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
+            if !std::path::Path::new(TRAIN).exists() {
+                  eprintln!("skip: {TRAIN} absent");
+                  return;
+            }
+            gpu_core::hip::set_device(0).expect("set_device");
+
+            let (train, _) = crate::dataset::Data::load().set(TRAIN).target("Churn").prepare();
+            let x = &train.x;
+            let y = &train.y;
+            let n = x.nrows();
+            let d = x.ncols();
+
+            // Two-layer params, random init (as fit does) — just to get real GPU preds.
+            let h = 8usize;
+            let w1 = kernels::gpu_randn(d * h, 11).expect("w1");
+            let b1 = GpuBuffer::upload(&vec![0.0f64; h]).expect("b1");
+            let w2 = kernels::gpu_randn(h, 22).expect("w2");
+            let b2 = GpuBuffer::upload(&vec![0.0f64; 1]).expect("b2");
+            let params = vec![
+                  LayerParams { w: w1, b: b1, in_dim: d, out_dim: h, act: Activation::Relu },
+                  LayerParams { w: w2, b: b2, in_dim: h, out_dim: 1, act: Activation::Sigmoid },
+            ];
+
+            let (xbuf, nn, _d) = Model::upload(x);
+            assert_eq!(nn, n);
+            let acts = Model::forward(&params, &xbuf, n);
+            let out = acts.last().expect("out");
+            let p = Model::download_vec(out, n);
+
+            // GPU-side scratch, mirroring fit.
+            let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
+            let y2m1 = kernels::gpu_scale(&ybuf, 2.0, n).expect("y2m1");
+            kernels::gpu_add_scalar_inplace(&y2m1, -1.0, n);
+            let ybar = y.iter().sum::<f64>() / n as f64;
+            let ss_tot = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>();
+
+            // Independent CPU references.
+            let ss_res: f64 = (0..n).map(|i| (y[i] - p[i]).powi(2)).sum();
+            let r2_ref = 1.0 - ss_res / ss_tot;
+            let acc_ref = (0..n).filter(|&i| (p[i] >= 0.5) == (y[i] >= 0.5)).count() as f64 / n as f64;
+            let mse_ref = (0..n).map(|i| (p[i] - y[i]).powi(2)).sum::<f64>() / n as f64;
+            let mae_ref = (0..n).map(|i| (p[i] - y[i]).abs()).sum::<f64>() / n as f64;
+            let huber_ref = (0..n).map(|i| { let r = p[i] - y[i]; if r.abs() <= 1.0 { 0.5 * r * r } else { r.abs() - 0.5 } }).sum::<f64>() / n as f64;
+            let eps = 1e-7;
+            let bce_ref = -(0..n).map(|i| { let pc = p[i].clamp(eps, 1.0 - eps); y[i] * pc.ln() + (1.0 - y[i]) * (1.0 - pc).ln() }).sum::<f64>() / n as f64;
+
+            let close = |a: f64, b: f64, what: &str| {
+                  let tol = 1e-6 * a.abs().max(b.abs()).max(1.0);
+                  assert!((a - b).abs() <= tol, "{what}: gpu={a} cpu={b} diff={}", (a - b).abs());
+            };
+            let mdl = |loss: Loss| Model { specs: vec![], loss, lr: 0.01, params: RefCell::new(vec![]) };
+
+            close(mdl(Loss::Mse).metric_gpu(Metric::R2, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), r2_ref, "R2");
+            close(mdl(Loss::Mse).metric_gpu(Metric::Accuracy, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), acc_ref, "Accuracy");
+            close(mdl(Loss::Mse).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), mse_ref, "MSE");
+            close(mdl(Loss::Mae).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), mae_ref, "MAE");
+            close(mdl(Loss::Huber).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), huber_ref, "Huber");
+            close(mdl(Loss::Ce).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), bce_ref, "BCE");
+
+            eprintln!("OK n={n} d={d}  R2={r2_ref:.6}  acc={acc_ref:.6}  mse={mse_ref:.6}  mae={mae_ref:.6}  huber={huber_ref:.6}  bce={bce_ref:.6}");
+      }
+
+      // The preallocated training loop must (1) compute the same forward as the
+      // retained allocate-return path, (2) allocate ZERO GPU buffers per epoch in
+      // steady state (flat VRAM, no sawtooth), and (3) still gradient-descend
+      // (train R² rises). Features are standardized on-GPU with existing reduce +
+      // broadcast kernels so the raw frequency-encoded churn columns don't saturate
+      // sigmoid — a well-posed problem on real data, not a hand-rolled scaler.
+      #[test]
+      fn fit_loop_allocations_flat() {
+            const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
+            if !std::path::Path::new(TRAIN).exists() {
+                  eprintln!("skip: {TRAIN} absent");
+                  return;
+            }
+            gpu_core::hip::set_device(0).expect("set_device");
+
+            let (train, _) = crate::dataset::Data::load().set(TRAIN).target("Churn").prepare();
+            let x = &train.x;
+            let y = &train.y;
+            let n = x.nrows();
+            let d = x.ncols();
+
+            let (xraw, _, _) = Model::upload(x);
+            let mean = kernels::gpu_reduce_mean_cols(&xraw, n, d).expect("mean");
+            let var = kernels::gpu_reduce_var_cols(&xraw, n, d).expect("var");
+            kernels::gpu_add_scalar_inplace(&var, 1e-8, d);
+            let std = kernels::gpu_sqrt(&var, d).expect("std");
+            let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("center");
+            let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("scale");
+            let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
+
+            // Two-layer relu→sigmoid, He init exactly as fit does.
+            let h = 16usize;
+            let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
+                  let scale = (2.0 / fan_in as f64).sqrt();
+                  let w0 = kernels::gpu_randn(fan_in * units, seed).expect("randn");
+                  let w = kernels::gpu_scale(&w0, scale, fan_in * units).expect("scale w");
+                  let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
+                  LayerParams { w, b, in_dim: fan_in, out_dim: units, act }
+            };
+            let params = vec![mk(d, h, 11, Activation::Relu), mk(h, 1, 22, Activation::Sigmoid)];
+            let last = params.len() - 1;
+
+            // (1) forward_into must equal the retained allocate-return forward.
+            let acts_ref = Model::forward(&params, &xbuf, n);
+            let out_ref = Model::download_vec(acts_ref.last().expect("ref out"), n);
+            let sc = Scratch::new(&params, n);
+            Model::forward_into(&params, &xbuf, n, &sc.acts);
+            let out_into = Model::download_vec(&sc.acts[last], n);
+            let fwd_diff = out_ref.iter().zip(&out_into).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(fwd_diff < 1e-9, "forward_into != forward, maxdiff={fwd_diff}");
+
+            // (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
+            // allocations and train R². download_vec is host-only (no GpuBuffer
+            // alloc), so reading R² never perturbs the count.
+            let model = Model { specs: vec![], loss: Loss::Mse, lr: 0.5, params: RefCell::new(vec![]) };
+            let ybar = y.iter().sum::<f64>() / n as f64;
+            let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
+            let cpu_r2 = |p: &[f64]| {
+                  let ssr: f64 = (0..n).map(|i| (y[i] - p[i]).powi(2)).sum();
+                  1.0 - ssr / ss_tot
+            };
+
+            const EPOCHS: usize = 60;
+            let mut counts = Vec::with_capacity(EPOCHS);
+            let mut r2s = Vec::with_capacity(EPOCHS);
+            for _ in 0..EPOCHS {
+                  let _ = gpu_core::memory::alloc_count_reset();
+                  Model::forward_into(&params, &xbuf, n, &sc.acts);
+                  model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+                  counts.push(gpu_core::memory::alloc_count_reset());
+                  r2s.push(cpu_r2(&Model::download_vec(&sc.acts[last], n)));
+            }
+
+            assert!(counts.iter().all(|&c| c == 0), "per-epoch GPU allocs not flat-zero: {counts:?}");
+            assert!(r2s.iter().all(|v| v.is_finite()), "non-finite R²: {r2s:?}");
+            assert!(r2s[EPOCHS - 1] > r2s[0], "R² did not rise: first={} last={}", r2s[0], r2s[EPOCHS - 1]);
+
+            eprintln!("alloc/epoch (first 5)={:?} ... all_zero={}  R2 first={:.6} last={:.6}",
+                  &counts[..5.min(counts.len())], counts.iter().all(|&c| c == 0), r2s[0], r2s[EPOCHS - 1]);
       }
 }
 

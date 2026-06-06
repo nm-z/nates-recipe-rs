@@ -637,6 +637,16 @@ pub fn gpu_sigmoid_backward(grad: &GpuBuffer, act: &GpuBuffer, n: usize) -> Resu
     Ok(out)
 }
 
+pub fn gpu_sigmoid_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_sigmoid(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_sigmoid_backward_into(grad: &GpuBuffer, act: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_sigmoid_backward(grad.ptr as *const c_void, act.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
 pub fn gpu_tanh(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(n)?;
     unsafe { launch_tanh_act(x.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
@@ -661,6 +671,16 @@ pub fn gpu_relu_backward(grad: &GpuBuffer, act: &GpuBuffer, n: usize) -> Result<
     Ok(out)
 }
 
+pub fn gpu_relu_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_relu(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+pub fn gpu_relu_backward_into(grad: &GpuBuffer, act: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_relu_backward(grad.ptr as *const c_void, act.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
 pub fn gpu_add(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(n)?;
     unsafe { launch_add(a.ptr as *const c_void, b.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
@@ -677,6 +697,11 @@ pub fn gpu_div(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipE
     let out = GpuBuffer::alloc(n)?;
     unsafe { launch_div(a.ptr as *const c_void, b.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
     Ok(out)
+}
+
+pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_div(a.ptr as *const c_void, b.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
 }
 
 pub fn gpu_scale(x: &GpuBuffer, scalar: f64, n: usize) -> Result<GpuBuffer, HipError> {
@@ -1008,6 +1033,11 @@ pub fn gpu_sub_scale(a: &GpuBuffer, b: &GpuBuffer, n: usize, scale: f64) -> Resu
     Ok(out)
 }
 
+pub fn gpu_sub_scale_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize, scale: f64) {
+    unsafe { launch_sub_scale(a.ptr as *const c_void, b.ptr as *const c_void, out.ptr as *mut c_void, n as i32, scale, std::ptr::null_mut()); }
+    check_launch();
+}
+
 /// GPU 1D avg pool: (n*out_len x n_filters) → (n x n_filters)
 pub fn gpu_avg_pool_1d(input: &GpuBuffer, n: usize, out_len: usize, n_filters: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(n * n_filters)?;
@@ -1247,6 +1277,11 @@ pub fn gpu_sign(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
       Ok(out)
 }
 
+pub fn gpu_sign_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+      unsafe { launch_sign(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+      check_launch();
+}
+
 pub fn gpu_pow(x: &GpuBuffer, n: usize, p: f64) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(n)?;
       unsafe { launch_pow(x.ptr as *const c_void, out.ptr, n as i32, p, std::ptr::null_mut()); }
@@ -1257,6 +1292,11 @@ pub fn gpu_clamp(x: &GpuBuffer, n: usize, lo: f64, hi: f64) -> Result<GpuBuffer,
       let out = GpuBuffer::alloc(n)?;
       unsafe { launch_clamp(x.ptr as *const c_void, out.ptr, n as i32, lo, hi, std::ptr::null_mut()); }
       Ok(out)
+}
+
+pub fn gpu_clamp_into(x: &GpuBuffer, out: &GpuBuffer, n: usize, lo: f64, hi: f64) {
+      unsafe { launch_clamp(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, lo, hi, std::ptr::null_mut()); }
+      check_launch();
 }
 
 /// Transpose: (rows x cols) row-major → (cols x rows) row-major.

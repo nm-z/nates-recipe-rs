@@ -186,7 +186,9 @@
 
 ## Agent Dispatch Rules
 
-Research → Haiku. Implementation → Sonnet. No exceptions. Always `run_in_background: true`.
+Subagents use **Opus 4.8** (the SOTA model) — for both research and implementation. The gpu-core kernel surface (hundreds of primitives) plus this codebase's scattered, multi-architecture sprawl overwhelm Haiku/Sonnet even on tight specs; no Haiku/Sonnet subagents here. ("Max thinking" is NOT required — just use the best model.) Be patient: a slower sub that returns a better result is the right trade — don't optimize subs for speed.
+
+Freely offload research, exploration, and testing to background subagents (or a quick inline web search) to keep the main context window small over time. This project is large, intertwined, and scattered, with multiple architectures emerging (Lua runtime, the Rust builder, gpu-core, the tree/GBDT path), which is easy to get lost in — so gather targeted info via subagents rather than spelunking on the main thread. Always `run_in_background: true`, and feed the agent the accumulated context (kernel signatures, file:line, the plan) so it doesn't re-derive what's known.
 
 ## What This Is
 
