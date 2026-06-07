@@ -1206,9 +1206,13 @@ impl Model {
             assert!(!params.is_empty(), "eval: call train() first");
             let (xbuf, n, _d) = Self::upload(&data.x);
             let preds = Self::predict(&params, &xbuf, n);
-            let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, 0.0);
-            let correct = (acc * n as f64).round() as usize;
-            eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
+            // Labeled test (a split) → score it. Unlabeled (Kaggle test.csv, no
+            // target column) → forward pass only, nothing to score against.
+            if data.has_target {
+                  let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, 0.0);
+                  let correct = (acc * n as f64).round() as usize;
+                  eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
+            }
       }
 }
 

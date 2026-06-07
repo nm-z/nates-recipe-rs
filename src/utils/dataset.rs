@@ -37,6 +37,9 @@ pub struct Dataset {
       pub x: Mat,
       pub y: Vec1,
       pub source: String,
+      // True when the target column was present in this set (train always; a
+      // Kaggle test.csv has no target → false → eval skips scoring, still predicts).
+      pub has_target: bool,
 }
 
 /// Split one ARFF/CSV line into trimmed, unquoted fields, respecting single-quote quoting.
@@ -604,11 +607,11 @@ impl Data {
                   let (_, tx, ty) = encode(&self.attrs, &trows, Some(self.target));
                   report_split(x.nrows(), tx.nrows());
                   (
-                        Dataset { x, y, source: self.source.clone() },
-                        Some(Dataset { x: tx, y: ty, source: tp.clone() }),
+                        Dataset { x, y, source: self.source.clone(), has_target: true },
+                        Some(Dataset { x: tx, y: ty, source: tp.clone(), has_target: true }),
                   )
             } else {
-                  (Dataset { x, y, source: self.source.clone() }, None)
+                  (Dataset { x, y, source: self.source.clone(), has_target: true }, None)
             }
       }
 
@@ -635,12 +638,9 @@ impl Data {
 
             if let Some((tg, tp)) = &test_groups {
                   let (test, _) = assemble(tg, t.as_deref(), Some(&schema), Some(&set.sample_group));
-                  if let Some(tgt) = t.as_ref() {
-                        if !test.names.iter().any(|n| n == tgt) {
-                              eprintln!("\x1b[1;31mtarget '{tgt}' absent from test set\x1b[0m\n    {tp}\n    eval needs labels; add the '{tgt}' column or drop .test()");
-                              panic!("target '{tgt}' absent from test set {tp}");
-                        }
-                  }
+                  // A Kaggle test.csv legitimately omits the target — that's the thing
+                  // to predict. Record its absence; don't crash.
+                  let test_has_target = t.as_ref().is_some_and(|tgt| test.names.iter().any(|n| n == tgt));
                   let tset: std::collections::HashSet<&str> =
                         test.names.iter().map(|s| s.as_str()).collect();
                   let feats: Vec<String> = set
@@ -655,8 +655,8 @@ impl Data {
                         self.source
                   );
                   report_parsed(&set, &feats, t.as_deref(), Some(&test), None);
-                  let train = Dataset { x: set.select(&feats), y: set.y, source: self.source.clone() };
-                  let testds = Dataset { x: test.select(&feats), y: test.y, source: (*tp).clone() };
+                  let train = Dataset { x: set.select(&feats), y: set.y, source: self.source.clone(), has_target: true };
+                  let testds = Dataset { x: test.select(&feats), y: test.y, source: (*tp).clone(), has_target: test_has_target };
                   return (train, Some(testds));
             }
 
@@ -668,7 +668,7 @@ impl Data {
                   return (tr, Some(te));
             }
             report_parsed(&set, &feats, t.as_deref(), None, None);
-            (Dataset { x, y: set.y, source: self.source.clone() }, None)
+            (Dataset { x, y: set.y, source: self.source.clone(), has_target: true }, None)
       }
 
       /// Resolve the target column name. `.target` wins (matched exactly, as a
@@ -885,6 +885,7 @@ fn shuffle_split(x: &Mat, y: &Vec1, train_frac: f64, source: &str) -> (Dataset, 
                   x: Mat::from_shape_vec((sel.len(), cols), xd).expect("split: x reshape"),
                   y: Vec1::from(yd),
                   source: source.to_string(),
+                  has_target: true,
             }
       };
       (take(&idx[..n_train]), take(&idx[n_train..]))
