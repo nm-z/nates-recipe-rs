@@ -413,21 +413,30 @@ fn build_leaf_wise_tree(
       Ok((Tree { nodes }, train_preds))
 }
 
-fn predict_tree_cpu(tree: &Tree, bins_flat: &[u8], n: usize, _n_eff: usize) -> Vec<f32> {
-      let mut out = vec![0.0f32; n];
-      for i in 0..n {
-            let mut node = 0usize;
-            loop {
-                  let sn = &tree.nodes[node];
-                  if sn.is_leaf {
-                        out[i] = sn.leaf_value;
-                        break;
-                  }
-                  let bin = bins_flat[sn.feature * n + i];
-                  node = if bin <= sn.bin { sn.left_child } else { sn.right_child };
+// Flatten a class's forest into the contiguous node arrays the GPU ensemble
+// predict kernel consumes. Each tree's local child indices are offset by the
+// tree's base into the concatenated pool to become global indices.
+fn flatten_forest(trees: &[Tree]) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<u8>, Vec<f64>, Vec<i32>) {
+      let mut feature = Vec::new();
+      let mut thresh = Vec::new();
+      let mut left = Vec::new();
+      let mut right = Vec::new();
+      let mut is_leaf = Vec::new();
+      let mut value = Vec::new();
+      let mut roots = Vec::with_capacity(trees.len());
+      for tree in trees {
+            let base = feature.len() as i32;
+            roots.push(base);
+            for sn in &tree.nodes {
+                  feature.push(sn.feature as i32);
+                  thresh.push(sn.bin as i32);
+                  left.push(base + sn.left_child as i32);
+                  right.push(base + sn.right_child as i32);
+                  is_leaf.push(if sn.is_leaf { 1u8 } else { 0u8 });
+                  value.push(sn.leaf_value as f64);
             }
       }
-      out
+      (feature, thresh, left, right, is_leaf, value, roots)
 }
 
 pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Result<Model, Error> {
@@ -498,12 +507,11 @@ pub fn predict(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Error> {
             bins_flat[j * n..(j + 1) * n].copy_from_slice(col);
       }
 
-      let mut pred = vec![0.0f32; n];
-      for tree in &model.trees[0] {
-            let leaf_preds = predict_tree_cpu(tree, &bins_flat, n, n_eff);
-            for i in 0..n { pred[i] += model.learning_rate as f32 * leaf_preds[i]; }
-      }
-      Ok(pred.iter().map(|&v| v as f64).collect())
+      let (feature, thresh, left, right, is_leaf, value, roots) = flatten_forest(&model.trees[0]);
+      let pred = gpu_core::forest::gpu_tree_ensemble_predict(
+            &bins_flat, &feature, &thresh, &left, &right, &is_leaf, &value, &roots,
+            n, model.learning_rate)?;
+      Ok(pred)
 }
 
 pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: usize, params: &Params) -> Result<Model, Error> {
@@ -579,20 +587,21 @@ pub fn predict_proba(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Err
             bins_flat[j * n..(j + 1) * n].copy_from_slice(col);
       }
 
-      let mut logits = vec![0.0f32; n * nc];
+      let mut logits = vec![0.0f64; n * nc];
       for k in 0..nc {
-            for tree in &model.trees[k] {
-                  let leaf_preds = predict_tree_cpu(tree, &bins_flat, n, n_eff);
-                  for i in 0..n { logits[i * nc + k] += model.learning_rate as f32 * leaf_preds[i]; }
-            }
+            let (feature, thresh, left, right, is_leaf, value, roots) = flatten_forest(&model.trees[k]);
+            let logit_k = gpu_core::forest::gpu_tree_ensemble_predict(
+                  &bins_flat, &feature, &thresh, &left, &right, &is_leaf, &value, &roots,
+                  n, model.learning_rate)?;
+            for i in 0..n { logits[i * nc + k] = logit_k[i]; }
       }
 
       let mut probs = vec![0.0f64; n * nc];
       for i in 0..n {
             let row = &logits[i * nc..(i + 1) * nc];
-            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let s: f32 = row.iter().map(|&v| (v - mx).exp()).sum();
-            for k in 0..nc { probs[i * nc + k] = ((logits[i * nc + k] - mx).exp() / s) as f64; }
+            let mx = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let s: f64 = row.iter().map(|&v| (v - mx).exp()).sum();
+            for k in 0..nc { probs[i * nc + k] = (logits[i * nc + k] - mx).exp() / s; }
       }
       Ok(probs)
 }

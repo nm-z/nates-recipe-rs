@@ -1,63 +1,50 @@
-use std::ffi::c_void;
-use crate::memory::GpuBuffer;
 use crate::hip::HipError;
 use crate::kernels::check_launch;
+use crate::memory::GpuBuffer;
+use std::ffi::c_void;
 
 // ── FFI: catboost.hip ─────────────────────────────────────────────────────────
 
 unsafe extern "C" {
-      fn launch_iota(
-            out: *mut c_void,
-            n: i32,
-            stream: *mut c_void,
-      );
+	fn launch_iota(out: *mut c_void, n: i32, stream: *mut c_void);
 
-      // Bitonic argsort building blocks. The schedule loop lives in the Rust
-      // caller (gpu_random_permutation): fill keys, sentinel-pad, init vals,
-      // then drive the k/j double loop of launch_bitonic_step_idx.
-      fn launch_lcg_rand(
-            out: *mut c_void,
-            n: i32,
-            seed: u32,
-            stream: *mut c_void,
-      );
+	// Bitonic argsort building blocks. The schedule loop lives in the Rust
+	// caller (gpu_random_permutation): fill keys, sentinel-pad, init vals,
+	// then drive the k/j double loop of launch_bitonic_step_idx.
+	fn launch_lcg_rand(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
 
-      fn launch_fill_sentinel_f64(
-            data: *mut c_void,
-            real_n: i32,
-            padded_n: i32,
-            sentinel: f64,
-            stream: *mut c_void,
-      );
+	fn launch_fill_sentinel_f64(
+		data: *mut c_void,
+		real_n: i32,
+		padded_n: i32,
+		sentinel: f64,
+		stream: *mut c_void,
+	);
 
-      fn launch_init_int_idx(
-            idx: *mut c_void,
-            n: i32,
-            stream: *mut c_void,
-      );
+	fn launch_init_int_idx(idx: *mut c_void, n: i32, stream: *mut c_void);
 
-      fn launch_bitonic_step_idx(
-            keys: *mut c_void,
-            vals: *mut c_void,
-            j: i32,
-            k: i32,
-            padded_n: i32,
-            stream: *mut c_void,
-      );
+	fn launch_bitonic_step_idx(
+		keys: *mut c_void,
+		vals: *mut c_void,
+		j: i32,
+		k: i32,
+		padded_n: i32,
+		stream: *mut c_void,
+	);
 
-      fn launch_ordered_target_stats(
-            cat_col: *const c_void,
-            target: *const c_void,
-            perm: *const c_void,
-            encoded_out: *mut c_void,
-            cat_sum: *mut c_void,
-            cat_cnt: *mut c_void,
-            n: i32,
-            n_categories: i32,
-            prior: f64,
-            smoothing: f64,
-            stream: *mut c_void,
-      );
+	fn launch_ordered_target_stats(
+		cat_col: *const c_void,
+		target: *const c_void,
+		perm: *const c_void,
+		encoded_out: *mut c_void,
+		cat_sum: *mut c_void,
+		cat_cnt: *mut c_void,
+		n: i32,
+		n_categories: i32,
+		prior: f64,
+		smoothing: f64,
+		stream: *mut c_void,
+	);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -65,16 +52,12 @@ unsafe extern "C" {
 // gpu_iota
 // Returns GpuBuffer of i32[n] containing [0, 1, 2, ..., n-1].
 pub fn gpu_iota(n: usize) -> Result<GpuBuffer, HipError> {
-      let out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-      unsafe {
-            launch_iota(
-                  out.ptr_raw(),
-                  n as i32,
-                  std::ptr::null_mut(),
-            );
-      }
-      check_launch();
-      Ok(out)
+	let out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+	unsafe {
+		launch_iota(out.ptr_raw(), n as i32, std::ptr::null_mut());
+	}
+	check_launch();
+	Ok(out)
 }
 
 // gpu_random_permutation
@@ -86,35 +69,35 @@ pub fn gpu_iota(n: usize) -> Result<GpuBuffer, HipError> {
 // keys[pn]/vals[pn] scratch (pn = next_pow2(n)); padding keys are set to +INF so
 // they sort to the tail and never displace a real index out of vals[0..n).
 pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError> {
-      let pn = n.next_power_of_two();
-      let keys = GpuBuffer::alloc(pn)?;                                  // f64[pn]
-      let vals = GpuBuffer::alloc_bytes(pn * std::mem::size_of::<i32>())?; // i32[pn]
-      let stream = std::ptr::null_mut();
-      unsafe {
-            launch_lcg_rand(keys.ptr_raw(), n as i32, seed, stream);
-            launch_fill_sentinel_f64(keys.ptr_raw(), n as i32, pn as i32, f64::INFINITY, stream);
-            launch_init_int_idx(vals.ptr_raw(), pn as i32, stream);
-            let mut k = 2usize;
-            while k <= pn {
-                  let mut j = k / 2;
-                  while j > 0 {
-                        launch_bitonic_step_idx(
-                              keys.ptr_raw(),
-                              vals.ptr_raw(),
-                              j as i32,
-                              k as i32,
-                              pn as i32,
-                              stream,
-                        );
-                        j >>= 1;
-                  }
-                  k <<= 1;
-            }
-      }
-      check_launch();
-      let mut out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-      out.copy_from(&vals, n * std::mem::size_of::<i32>())?;
-      Ok(out)
+	let pn = n.next_power_of_two();
+	let keys = GpuBuffer::alloc(pn)?; // f64[pn]
+	let vals = GpuBuffer::alloc_bytes(pn * std::mem::size_of::<i32>())?; // i32[pn]
+	let stream = std::ptr::null_mut();
+	unsafe {
+		launch_lcg_rand(keys.ptr_raw(), n as i32, seed, stream);
+		launch_fill_sentinel_f64(keys.ptr_raw(), n as i32, pn as i32, f64::INFINITY, stream);
+		launch_init_int_idx(vals.ptr_raw(), pn as i32, stream);
+		let mut k = 2usize;
+		while k <= pn {
+			let mut j = k / 2;
+			while j > 0 {
+				launch_bitonic_step_idx(
+					keys.ptr_raw(),
+					vals.ptr_raw(),
+					j as i32,
+					k as i32,
+					pn as i32,
+					stream,
+				);
+				j >>= 1;
+			}
+			k <<= 1;
+		}
+	}
+	check_launch();
+	let mut out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+	out.copy_from(&vals, n * std::mem::size_of::<i32>())?;
+	Ok(out)
 }
 
 // gpu_ordered_target_stats
@@ -138,32 +121,32 @@ pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError
 // The kernel needs per-category running accumulators (cat_sum, cat_cnt). These are
 // caller-owned scratch (n_categories f64 each) and must be zero-filled before launch.
 pub fn gpu_ordered_target_stats(
-      cat_col_i32: &GpuBuffer,
-      target: &GpuBuffer,
-      perm_i32: &GpuBuffer,
-      n: usize,
-      n_categories: usize,
-      prior: f64,
-      smoothing: f64,
+	cat_col_i32: &GpuBuffer,
+	target: &GpuBuffer,
+	perm_i32: &GpuBuffer,
+	n: usize,
+	n_categories: usize,
+	prior: f64,
+	smoothing: f64,
 ) -> Result<GpuBuffer, HipError> {
-      let out = GpuBuffer::alloc(n)?;
-      let cat_sum = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
-      let cat_cnt = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
-      unsafe {
-            launch_ordered_target_stats(
-                  cat_col_i32.ptr_raw() as *const c_void,
-                  target.ptr_raw() as *const c_void,
-                  perm_i32.ptr_raw() as *const c_void,
-                  out.ptr_raw(),
-                  cat_sum.ptr_raw(),
-                  cat_cnt.ptr_raw(),
-                  n as i32,
-                  n_categories as i32,
-                  prior,
-                  smoothing,
-                  std::ptr::null_mut(),
-            );
-      }
-      check_launch();
-      Ok(out)
+	let out = GpuBuffer::alloc(n)?;
+	let cat_sum = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
+	let cat_cnt = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
+	unsafe {
+		launch_ordered_target_stats(
+			cat_col_i32.ptr_raw() as *const c_void,
+			target.ptr_raw() as *const c_void,
+			perm_i32.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			cat_sum.ptr_raw(),
+			cat_cnt.ptr_raw(),
+			n as i32,
+			n_categories as i32,
+			prior,
+			smoothing,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(out)
 }

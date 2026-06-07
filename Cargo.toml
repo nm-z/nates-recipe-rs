@@ -13,12 +13,7 @@ exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
 [dependencies]
 gpu-core = { path = "gpu-core" }
 anyhow = "1"
-polars = { version = "0.46", features = [
-      "csv", "lazy", "dtype-full",
-      "parquet", "json", "strings",
-      "temporal", "is_in", "rolling_window", "rank",
-      "ndarray",
-] }
+csv = "1"
 ndarray = { version = "0.16", features = ["rayon"] }
 ndarray-stats = "0.6"
 rayon = "1"

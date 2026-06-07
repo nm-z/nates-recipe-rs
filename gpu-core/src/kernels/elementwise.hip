@@ -786,6 +786,25 @@ extern "C" void launch_concat(const double* a, const double* b, double* out, int
     hipLaunchKernelGGL(concat_kernel, grid, block, 0, stream, a, b, out, rows, d1, d2);
 }
 
+// ── Slice leading columns ─────────────────────────────────────────────────────
+// Copy the first `take` columns of each row of a (rows, src_cols) matrix into a
+// compact (rows, take) matrix — the inverse of concat for its first operand.
+
+extern "C" __global__ void slice_lead_kernel(const double* src, double* out, int rows, int src_cols, int take) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * take;
+    if (idx >= total) return;
+    int row = idx / take;
+    int col = idx % take;
+    out[idx] = src[row * src_cols + col];
+}
+
+extern "C" void launch_slice_lead(const double* src, double* out, int rows, int src_cols, int take, hipStream_t stream) {
+    int total = rows * take;
+    dim3 block(256); dim3 grid((total + 255) / 256);
+    hipLaunchKernelGGL(slice_lead_kernel, grid, block, 0, stream, src, out, rows, src_cols, take);
+}
+
 // ── 2D im2col ───────────────────────────────────────────────────────────────
 // Extract (kH*kW*C) patches from (H, W, C) images. Input: (N, C, H, W) in NCHW.
 // Output: (N*outH*outW, kH*kW*C) patch matrix for GEMM-based convolution.

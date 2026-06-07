@@ -1,5 +1,3 @@
-use gpu_core::memory::GpuBuffer;
-use gpu_core::kernels::gpu_tree_build_into;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
@@ -96,15 +94,6 @@ fn quantize_with_borders(x: &[f64], n: usize, p: usize, borders: &[Vec<f64>]) ->
             }
       }
       flat
-}
-
-fn bins_u8_to_f64(bins: &[u8], n: usize, p: usize, col_map: &[usize]) -> Vec<f64> {
-      let pc = col_map.len();
-      let mut out = vec![0.0f64; n * pc];
-      for (jc, &j) in col_map.iter().enumerate() {
-            for i in 0..n { out[i * pc + jc] = bins[i * p + j] as f64; }
-      }
-      out
 }
 
 fn softmax_inplace(logits: &mut [f64], n: usize, nc: usize) {
@@ -249,20 +238,7 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
                   hess[i] = 1.0;
             }
 
-            let bins_f64 = bins_u8_to_f64(&bins, n, p, &col_map);
-            let pc = bins_f64.len() / n;
-            let g_buf = GpuBuffer::upload(&grad).map_err(|e| Error::InvalidInput(format!("GPU upload grad: {e:?}")))?;
-            let h_buf = GpuBuffer::upload(&hess).map_err(|e| Error::InvalidInput(format!("GPU upload hess: {e:?}")))?;
-            let tr_bins_buf = GpuBuffer::upload(&bins_f64).map_err(|e| Error::InvalidInput(format!("GPU upload bins: {e:?}")))?;
-            let tr_pred_buf = GpuBuffer::alloc(n).map_err(|e| Error::InvalidInput(format!("GPU alloc tr_pred: {e:?}")))?;
-            let te_pred_buf = GpuBuffer::alloc(1).map_err(|e| Error::InvalidInput(format!("GPU alloc te_pred: {e:?}")))?;
-            let te_bins_buf = GpuBuffer::upload(&[0.0f64]).map_err(|e| Error::InvalidInput(format!("GPU upload te_bins: {e:?}")))?;
-
-            gpu_tree_build_into(&tr_bins_buf, &te_bins_buf, &g_buf, &h_buf, n, 0, pc, params.n_bins, params.max_depth, params.l2_reg, params.min_child_weight, &tr_pred_buf, &te_pred_buf);
-
-            let mut gpu_delta = vec![0.0f64; n];
-            tr_pred_buf.download(&mut gpu_delta).map_err(|e| Error::InvalidInput(format!("GPU download pred: {e:?}")))?;
-
+            // GPU path not integrated: gpu_tree_build_into emits only per-sample tr_pred/te_pred, never the split_feat/split_bin/leaf_val tree the Model stores for predict() — true GPU integration requires gpu-core to return that tree structure.
             let (cpu_tree, node_assign) = build_cpu_tree(&bins, n, p, &grad, &hess, &col_map, params.max_depth, params.l2_reg);
 
             for i in 0..n {
@@ -325,17 +301,7 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
                         hess[i] = (pk * (1.0 - pk)).max(1e-6);
                   }
 
-                  let bins_f64 = bins_u8_to_f64(&bins, n, p, &col_map);
-                  let pc = bins_f64.len() / n;
-                  let g_buf = GpuBuffer::upload(&grad).map_err(|e| Error::InvalidInput(format!("GPU upload grad: {e:?}")))?;
-                  let h_buf = GpuBuffer::upload(&hess).map_err(|e| Error::InvalidInput(format!("GPU upload hess: {e:?}")))?;
-                  let tr_bins_buf = GpuBuffer::upload(&bins_f64).map_err(|e| Error::InvalidInput(format!("GPU upload bins: {e:?}")))?;
-                  let tr_pred_buf = GpuBuffer::alloc(n).map_err(|e| Error::InvalidInput(format!("GPU alloc tr_pred: {e:?}")))?;
-                  let te_pred_buf = GpuBuffer::alloc(1).map_err(|e| Error::InvalidInput(format!("GPU alloc te_pred: {e:?}")))?;
-                  let te_bins_buf = GpuBuffer::upload(&[0.0f64]).map_err(|e| Error::InvalidInput(format!("GPU upload te_bins: {e:?}")))?;
-
-                  gpu_tree_build_into(&tr_bins_buf, &te_bins_buf, &g_buf, &h_buf, n, 0, pc, params.n_bins, params.max_depth, params.l2_reg, params.min_child_weight, &tr_pred_buf, &te_pred_buf);
-
+                  // GPU path not integrated: gpu_tree_build_into emits only per-sample tr_pred/te_pred, never the split_feat/split_bin/leaf_val tree the Model stores for predict() — true GPU integration requires gpu-core to return that tree structure.
                   let (cpu_tree, node_assign) = build_cpu_tree(&bins, n, p, &grad, &hess, &col_map, params.max_depth, params.l2_reg);
 
                   for i in 0..n {

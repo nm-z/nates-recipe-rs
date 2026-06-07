@@ -174,3 +174,90 @@ extern "C" void launch_smo_kkt_score(
       hipLaunchKernelGGL(smo_kkt_score_kernel, dim3(blocks), dim3(threads), 0, stream,
             grad, alpha, y, score_i, score_j, n, C);
 }
+
+// ── Matrix-free SMO support ──────────────────────────────────────────────────
+// Compute one kernel-matrix ROW on demand: krow[t] = K(x_row, x_t) for all t.
+// Lets SMO run without ever materializing the n×n matrix (item 5: no O(n²) alloc).
+__global__ void smo_kernel_row_kernel(
+      const double* x, double* krow, int n, int dim, int row,
+      int kind, double gamma, double coef0, double degree
+) {
+      int t = blockIdx.x * blockDim.x + threadIdx.x;
+      if (t >= n) return;
+      const double* xr = x + (long)row * dim;
+      const double* xt = x + (long)t   * dim;
+      double dot = 0.0, sa = 0.0, sb = 0.0;
+      for (int d = 0; d < dim; d++) {
+            double a = xr[d], b = xt[d];
+            dot += a * b;
+            if (kind == 1) { sa += a * a; sb += b * b; }
+      }
+      double val;
+      if (kind == 0) {
+            val = dot;
+      } else if (kind == 1) {
+            double dist2 = sa + sb - 2.0 * dot; if (dist2 < 0.0) dist2 = 0.0;
+            val = exp(-gamma * dist2);
+      } else if (kind == 2) {
+            val = pow(gamma * dot + coef0, degree);
+      } else {
+            val = tanh(gamma * dot + coef0);
+      }
+      krow[t] = val;
+}
+
+extern "C" void launch_smo_kernel_row(
+      const double* x, double* krow, int n, int dim, int row,
+      int kind, double gamma, double coef0, double degree, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks  = (n + threads - 1) / threads;
+      hipLaunchKernelGGL(smo_kernel_row_kernel, dim3(blocks), dim3(threads), 0, stream,
+            x, krow, n, dim, row, kind, gamma, coef0, degree);
+}
+
+// Single-block argmax over s[n] → out[0]=max value, out[1]=index (as double).
+// Keeps working-set selection on the GPU (item 3: no per-iter O(n) score download).
+__global__ void smo_argmax_kernel(const double* s, double* out, int n) {
+      __shared__ double vbuf[256];
+      __shared__ int    ibuf[256];
+      int tid = threadIdx.x;
+      double best = -1e308; int bi = 0;
+      for (int t = tid; t < n; t += blockDim.x) {
+            double v = s[t];
+            if (v > best) { best = v; bi = t; }
+      }
+      vbuf[tid] = best; ibuf[tid] = bi;
+      __syncthreads();
+      for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && vbuf[tid + stride] > vbuf[tid]) {
+                  vbuf[tid] = vbuf[tid + stride];
+                  ibuf[tid] = ibuf[tid + stride];
+            }
+            __syncthreads();
+      }
+      if (tid == 0) { out[0] = vbuf[0]; out[1] = (double)ibuf[0]; }
+}
+
+extern "C" void launch_smo_argmax(const double* s, double* out, int n, hipStream_t stream) {
+      hipLaunchKernelGGL(smo_argmax_kernel, dim3(1), dim3(256), 0, stream, s, out, n);
+}
+
+// Gradient update from two precomputed kernel rows (matrix-free variant):
+//   grad[t] += di * krow_i[t] + dj * krow_j[t]
+__global__ void smo_update_gradient_rows_kernel(
+      double* grad, const double* ki, const double* kj, int n, double di, double dj
+) {
+      int t = blockIdx.x * blockDim.x + threadIdx.x;
+      if (t >= n) return;
+      grad[t] += di * ki[t] + dj * kj[t];
+}
+
+extern "C" void launch_smo_update_gradient_rows(
+      double* grad, const double* ki, const double* kj, int n, double di, double dj, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks  = (n + threads - 1) / threads;
+      hipLaunchKernelGGL(smo_update_gradient_rows_kernel, dim3(blocks), dim3(threads), 0, stream,
+            grad, ki, kj, n, di, dj);
+}

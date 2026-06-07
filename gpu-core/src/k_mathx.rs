@@ -1,6 +1,6 @@
-use std::ffi::c_void;
-use crate::memory::GpuBuffer;
 use crate::hip::{HipError, check};
+use crate::memory::GpuBuffer;
+use std::ffi::c_void;
 
 macro_rules! mx {
     ($($name:ident => $launch:ident),* $(,)?) => {

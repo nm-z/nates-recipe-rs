@@ -1,8 +1,10 @@
-use std::ffi::c_void;
-use crate::memory::GpuBuffer;
 use crate::hip::{HipError, check};
+use crate::memory::GpuBuffer;
+use std::ffi::c_void;
 
-fn e() -> Result<(), HipError> { check(unsafe { crate::hip::hipGetLastError() }) }
+fn e() -> Result<(), HipError> {
+	check(unsafe { crate::hip::hipGetLastError() })
+}
 
 macro_rules! a0 {
     ($($name:ident => $launch:ident),* $(,)?) => {

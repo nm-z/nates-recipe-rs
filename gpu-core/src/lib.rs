@@ -1,22 +1,29 @@
-pub mod hip;
-pub mod memory;
-pub mod kernels;
-pub mod linalg;
-pub mod math_ops;
-pub mod reductions;
-pub mod encoding;
-pub mod nn_f32;
+#![allow(
+	clippy::too_many_arguments,
+	clippy::unnecessary_cast,
+	clippy::missing_safety_doc,
+	clippy::type_complexity
+)]
+
 pub mod attention;
-pub mod optimizers;
-pub mod losses;
-pub mod graph;
-pub mod sequence;
-pub mod cluster;
-pub mod svm;
 pub mod bayes;
-pub mod forest;
 pub mod catboost;
-pub mod rl;
+pub mod cluster;
+pub mod encoding;
+pub mod forest;
+pub mod graph;
+pub mod hip;
+pub mod k_actx;
 pub mod k_gapact;
 pub mod k_mathx;
-pub mod k_actx;
+pub mod kernels;
+pub mod linalg;
+pub mod losses;
+pub mod math_ops;
+pub mod memory;
+pub mod nn_f32;
+pub mod optimizers;
+pub mod reductions;
+pub mod rl;
+pub mod sequence;
+pub mod svm;

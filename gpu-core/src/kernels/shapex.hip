@@ -151,3 +151,23 @@ extern "C" void launch_shapex_diagonal(
       dim3 block(256); dim3 grid((n + 255) / 256);
       hipLaunchKernelGGL(shapex_diagonal_kernel, grid, block, 0, s, x, out, rows, cols, k, n);
 }
+
+// pack the upper triangle of a column-major (m×n, lda=m) factor into a packed
+// column-major (n×n) R: R[j*n+i] = (i<=j) ? factor[j*m+i] : 0. Replaces a
+// GPU→CPU→GPU round trip in gpu_qr. Each output element written exactly once.
+extern "C" __global__ void shapex_pack_upper_tri_kernel(
+      const double* factor, double* r, int m, int n) {
+      int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      int total = n * n;
+      if (idx >= total) return;
+      int j = idx / n;   // column
+      int i = idx % n;   // row
+      r[j * n + i] = (i <= j) ? factor[j * m + i] : 0.0;
+}
+
+extern "C" void launch_shapex_pack_upper_tri(
+      const double* factor, double* r, int m, int n, hipStream_t s) {
+      int total = n * n;
+      dim3 block(256); dim3 grid((total + 255) / 256);
+      hipLaunchKernelGGL(shapex_pack_upper_tri_kernel, grid, block, 0, s, factor, r, m, n);
+}

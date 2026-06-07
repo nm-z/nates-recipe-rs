@@ -203,3 +203,56 @@ extern "C" void launch_oob_mask(
       hipLaunchKernelGGL(invert_mask_kernel, grid_n, block, 0, stream,
                          used, oob_out, n);
 }
+
+// ── tree-ensemble predict (leaf-wise / arbitrary node arrays) ─────────────
+// Inference for a forest of trees whose nodes are stored as flat arrays with
+// explicit (GLOBAL) left/right child indices — NOT a complete binary heap, so
+// this fits leaf-wise trees (e.g. LightGBM). One thread per sample; each thread
+// walks every tree root→leaf and accumulates leaf values, then scales by lr.
+//   bins         : [n_eff, n] u8, feature-major  bins[feature * n + sample]
+//   node_feature : [total_nodes] i32  (split feature; unused at leaves)
+//   node_thresh  : [total_nodes] i32  (bin threshold; bin <= thresh -> left)
+//   node_left    : [total_nodes] i32  (GLOBAL child index)
+//   node_right   : [total_nodes] i32  (GLOBAL child index)
+//   node_is_leaf : [total_nodes] u8
+//   node_value   : [total_nodes] double (leaf value; valid at leaves)
+//   tree_root    : [n_trees] i32 (GLOBAL root node index per tree)
+//   out          : [n] double  (= lr * sum_t leaf_value)
+__global__ void tree_ensemble_predict_kernel(
+      const unsigned char* bins,
+      const int* node_feature, const int* node_thresh,
+      const int* node_left, const int* node_right,
+      const unsigned char* node_is_leaf, const double* node_value,
+      const int* tree_root, double* out,
+      int n, int n_trees, double lr
+) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= n) return;
+      double acc = 0.0;
+      for (int t = 0; t < n_trees; t++) {
+            int node = tree_root[t];
+            while (node_is_leaf[node] == (unsigned char)0) {
+                  int f = node_feature[node];
+                  int thr = node_thresh[node];
+                  int bv = (int)bins[f * n + i];
+                  node = (bv <= thr) ? node_left[node] : node_right[node];
+            }
+            acc += node_value[node];
+      }
+      out[i] = lr * acc;
+}
+
+extern "C" void launch_tree_ensemble_predict(
+      const unsigned char* bins,
+      const int* node_feature, const int* node_thresh,
+      const int* node_left, const int* node_right,
+      const unsigned char* node_is_leaf, const double* node_value,
+      const int* tree_root, double* out,
+      int n, int n_trees, double lr, hipStream_t stream
+) {
+      dim3 block(256);
+      dim3 grid((n + 255) / 256);
+      hipLaunchKernelGGL(tree_ensemble_predict_kernel, grid, block, 0, stream,
+                         bins, node_feature, node_thresh, node_left, node_right,
+                         node_is_leaf, node_value, tree_root, out, n, n_trees, lr);
+}
