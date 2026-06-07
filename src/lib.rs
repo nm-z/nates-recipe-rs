@@ -17,8 +17,8 @@ pub mod model;
 
 pub use dataset::{Data, Dataset};
 pub use model::{
-      Accuracy, Activation, Epoch, IntoLayer, Loss, Lr, Metric, Model, Param, R2, Time, Train, ce,
-      huber, linear, mae, mse, relu, sigmoid,
+      Accuracy, Activation, Epoch, IntoLayer, Loss, Lr, Metric, Model, Param, R2, Time, Train, bce,
+      ce, huber, linear, mae, mse, relu, sigmoid,
 };
 
 // `save` selectors. Defined here in the crate root — NOT in `model`, where bare

@@ -64,6 +64,8 @@ pub const mae: Loss = Loss::Mae;
 #[allow(non_upper_case_globals)]
 pub const ce: Loss = Loss::Ce;
 #[allow(non_upper_case_globals)]
+pub const bce: Loss = Loss::Ce;
+#[allow(non_upper_case_globals)]
 pub const huber: Loss = Loss::Huber;
 
 /// Which parameters `save` writes — pass `w`, `b`, or both (consts in the crate
