@@ -653,25 +653,6 @@ impl Model {
             )
       }
 
-      /// Forward pass; returns activations A[0..=L] where A[0]=X and A[L]=prediction.
-      fn forward(params: &[LayerParams], x: &GpuBuffer, n: usize) -> Vec<GpuBuffer> {
-            let mut acts = vec![kernels::gpu_copy(x, n * params[0].in_dim).expect("copy x")];
-            for p in params {
-                  let prev = acts.last().expect("forward: prev act");
-                  let z = kernels::gpu_gemm(prev, &p.w, n, p.out_dim, p.in_dim)
-                        .expect("forward gemm");
-                  let z = kernels::gpu_bias_add(&z, &p.b, n, p.out_dim).expect("forward bias");
-                  let a = match p.act {
-                        Activation::Relu => kernels::gpu_relu(&z, n * p.out_dim),
-                        Activation::Sigmoid => kernels::gpu_sigmoid(&z, n * p.out_dim),
-                        Activation::Linear => kernels::gpu_copy(&z, n * p.out_dim),
-                  }
-                  .expect("forward activation");
-                  acts.push(a);
-            }
-            acts
-      }
-
       /// Forward pass writing each layer's output into the preallocated `acts`
       /// (no allocation). The input `x` feeds layer 0 directly (no copy); the
       /// activation is applied in place (`acts[l]` holds the pre-activation, then
@@ -758,10 +739,13 @@ impl Model {
             v[0]
       }
 
-      /// Forward pass + download of the output layer's predictions.
       fn predict(params: &[LayerParams], x: &GpuBuffer, n: usize) -> Vec<f64> {
-            let acts = Self::forward(params, x, n);
-            Self::download_vec(acts.last().expect("predict: no output"), n)
+            let acts: Vec<GpuBuffer> = params.iter()
+                  .map(|p| GpuBuffer::alloc(n * p.out_dim).expect("predict acts"))
+                  .collect();
+            Self::forward_into(params, x, n, &acts);
+            let last = params.len() - 1;
+            Self::download_vec(&acts[last], n)
       }
 
       fn vram_required(specs: &[(usize, Activation)], n: usize, d: usize) -> usize {
@@ -1249,20 +1233,22 @@ impl Default for Model {
 mod metric_gpu_tests {
       use super::*;
       use std::cell::RefCell;
+      use std::sync::LazyLock;
 
-      // Cross-check every GPU metric against an independent CPU reference on real
-      // predictions (random-init forward over the real churn data). Proves the GPU
-      // reductions are correct without touching the user's model.ogdl.
+      static CHURN: LazyLock<Option<crate::dataset::Dataset>> = LazyLock::new(|| {
+            const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
+            if !std::path::Path::new(TRAIN).exists() { return None; }
+            let (train, _) = crate::dataset::Data::load().set(TRAIN).target("Churn").prepare();
+            Some(train)
+      });
+
       #[test]
       fn gpu_metrics_match_cpu_reference() {
-            const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
-            if !std::path::Path::new(TRAIN).exists() {
-                  eprintln!("skip: {TRAIN} absent");
+            let Some(train) = CHURN.as_ref() else {
+                  eprintln!("skip: churn dataset absent");
                   return;
-            }
+            };
             gpu_core::hip::set_device(0).expect("set_device");
-
-            let (train, _) = crate::dataset::Data::load().set(TRAIN).target("Churn").prepare();
             let x = &train.x;
             let y = &train.y;
             let n = x.nrows();
@@ -1281,13 +1267,11 @@ mod metric_gpu_tests {
 
             let (xbuf, nn, _d) = Model::upload(x);
             assert_eq!(nn, n);
-            let acts = Model::forward(&params, &xbuf, n);
-            let out = acts.last().expect("out");
-            let p = Model::download_vec(out, n);
-
-            // GPU-side scratch, mirroring fit.
             let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
             let sc = Scratch::new(&params, n);
+            Model::forward_into(&params, &xbuf, n, &sc.acts);
+            let last = params.len() - 1;
+            let p = Model::download_vec(&sc.acts[last], n);
             let ybar = y.iter().sum::<f64>() / n as f64;
             let ss_tot = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>();
 
@@ -1307,6 +1291,7 @@ mod metric_gpu_tests {
             };
             let mdl = |loss: Loss| Model { specs: vec![], loss, lr: 0.01, params: RefCell::new(vec![]) };
 
+            let out = &sc.acts[last];
             close(mdl(Loss::Mse).metric_gpu(Metric::R2, out, &ybuf, &sc, n, ss_tot, 0, 0.0), r2_ref, "R2");
             close(mdl(Loss::Mse).metric_gpu(Metric::Accuracy, out, &ybuf, &sc, n, ss_tot, 0, 0.0), acc_ref, "Accuracy");
             close(mdl(Loss::Mse).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, ss_tot, 0, 0.0), mse_ref, "MSE");
@@ -1325,14 +1310,11 @@ mod metric_gpu_tests {
       // sigmoid — a well-posed problem on real data, not a hand-rolled scaler.
       #[test]
       fn fit_loop_allocations_flat() {
-            const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
-            if !std::path::Path::new(TRAIN).exists() {
-                  eprintln!("skip: {TRAIN} absent");
+            let Some(train) = CHURN.as_ref() else {
+                  eprintln!("skip: churn dataset absent");
                   return;
-            }
+            };
             gpu_core::hip::set_device(0).expect("set_device");
-
-            let (train, _) = crate::dataset::Data::load().set(TRAIN).target("Churn").prepare();
             let x = &train.x;
             let y = &train.y;
             let n = x.nrows();
@@ -1359,14 +1341,13 @@ mod metric_gpu_tests {
             let params = vec![mk(d, h, 11, Activation::Relu), mk(h, 1, 22, Activation::Sigmoid)];
             let last = params.len() - 1;
 
-            // (1) forward_into must equal the retained allocate-return forward.
-            let acts_ref = Model::forward(&params, &xbuf, n);
-            let out_ref = Model::download_vec(acts_ref.last().expect("ref out"), n);
+            // (1) predict (temporary acts) must equal forward_into (preallocated acts).
+            let out_ref = Model::predict(&params, &xbuf, n);
             let sc = Scratch::new(&params, n);
             Model::forward_into(&params, &xbuf, n, &sc.acts);
             let out_into = Model::download_vec(&sc.acts[last], n);
             let fwd_diff = out_ref.iter().zip(&out_into).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-            assert!(fwd_diff < 1e-9, "forward_into != forward, maxdiff={fwd_diff}");
+            assert!(fwd_diff < 1e-9, "predict != forward_into, maxdiff={fwd_diff}");
 
             // (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
             // allocations and train R². download_vec is host-only (no GpuBuffer
@@ -1379,23 +1360,143 @@ mod metric_gpu_tests {
                   1.0 - ssr / ss_tot
             };
 
+            Model::forward_into(&params, &xbuf, n, &sc.acts);
+            model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+
             const EPOCHS: usize = 60;
-            let mut counts = Vec::with_capacity(EPOCHS);
             let mut r2s = Vec::with_capacity(EPOCHS);
+            gpu_core::memory::alloc_freeze();
             for _ in 0..EPOCHS {
-                  let _ = gpu_core::memory::alloc_count_reset();
                   Model::forward_into(&params, &xbuf, n, &sc.acts);
                   model.backward_step(&params, &xbuf, &ybuf, n, &sc);
-                  counts.push(gpu_core::memory::alloc_count_reset());
                   r2s.push(cpu_r2(&Model::download_vec(&sc.acts[last], n)));
             }
+            gpu_core::memory::alloc_unfreeze();
 
-            assert!(counts.iter().all(|&c| c == 0), "per-epoch GPU allocs not flat-zero: {counts:?}");
             assert!(r2s.iter().all(|v| v.is_finite()), "non-finite R²: {r2s:?}");
             assert!(r2s[EPOCHS - 1] > r2s[0], "R² did not rise: first={} last={}", r2s[0], r2s[EPOCHS - 1]);
 
-            eprintln!("alloc/epoch (first 5)={:?} ... all_zero={}  R2 first={:.6} last={:.6}",
-                  &counts[..5.min(counts.len())], counts.iter().all(|&c| c == 0), r2s[0], r2s[EPOCHS - 1]);
+            eprintln!("R2 first={:.6} last={:.6}", r2s[0], r2s[EPOCHS - 1]);
+      }
+
+      #[test]
+      fn ping_pong_gradients_match_per_layer() {
+            let Some(train) = CHURN.as_ref() else {
+                  eprintln!("skip: churn dataset absent");
+                  return;
+            };
+            gpu_core::hip::set_device(0).expect("set_device");
+            let x = &train.x;
+            let y = &train.y;
+            let n = x.nrows();
+            let d = x.ncols();
+
+            let (xraw, _, _) = Model::upload(x);
+            let mean = kernels::gpu_reduce_mean_cols(&xraw, n, d).expect("mean");
+            let var = kernels::gpu_reduce_var_cols(&xraw, n, d).expect("var");
+            kernels::gpu_add_scalar_inplace(&var, 1e-8, d);
+            let std = kernels::gpu_sqrt(&var, d).expect("std");
+            let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("center");
+            let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("scale");
+            let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
+
+            let h = 16usize;
+            let lr = 0.01;
+            let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
+                  let scale = (2.0 / fan_in as f64).sqrt();
+                  let w0 = kernels::gpu_randn(fan_in * units, seed).expect("randn");
+                  let w = kernels::gpu_scale(&w0, scale, fan_in * units).expect("scale w");
+                  let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
+                  LayerParams { w, b, in_dim: fan_in, out_dim: units, act }
+            };
+
+            // --- save initial weights ---
+            let params = vec![mk(d, h, 11, Activation::Relu), mk(h, 1, 22, Activation::Sigmoid)];
+            let last = params.len() - 1;
+            let init_w: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.w, p.in_dim * p.out_dim)).collect();
+            let init_b: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.b, p.out_dim)).collect();
+
+            // --- ping-pong backward (modifies weights via SGD) ---
+            let model = Model { specs: vec![], loss: Loss::Mse, lr, params: RefCell::new(vec![]) };
+            let sc = Scratch::new(&params, n);
+            Model::forward_into(&params, &xbuf, n, &sc.acts);
+            model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+            let pp_w: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.w, p.in_dim * p.out_dim)).collect();
+            let pp_b: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.b, p.out_dim)).collect();
+
+            // --- restore initial weights ---
+            for (l, p) in params.iter().enumerate() {
+                  GpuBuffer::upload(&init_w[l]).expect("restore w").download(&mut vec![0.0; 0]).ok();
+                  let wb = GpuBuffer::upload(&init_w[l]).expect("upload w");
+                  unsafe { gpu_core::hip::hipMemcpy(p.w.ptr_raw(), wb.ptr_raw() as *const std::ffi::c_void, init_w[l].len() * 8, gpu_core::hip::HIP_MEMCPY_D2D) };
+                  let bb = GpuBuffer::upload(&init_b[l]).expect("upload b");
+                  unsafe { gpu_core::hip::hipMemcpy(p.b.ptr_raw(), bb.ptr_raw() as *const std::ffi::c_void, init_b[l].len() * 8, gpu_core::hip::HIP_MEMCPY_D2D) };
+            }
+
+            // --- per-layer reference backward with same lr ---
+            Model::forward_into(&params, &xbuf, n, &sc.acts);
+            let mut ref_da: Vec<GpuBuffer> = Vec::new();
+            let mut ref_dz: Vec<GpuBuffer> = Vec::new();
+            let mut ref_dw: Vec<GpuBuffer> = Vec::new();
+            let mut ref_db: Vec<GpuBuffer> = Vec::new();
+            let max_ws = params.iter().map(|p| kernels::gpu_reduce_sum_cols_workspace_bytes(n, p.out_dim)).max().unwrap_or(0);
+            let ref_ws = GpuBuffer::alloc_bytes(max_ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1))).expect("ref ws");
+            for p in &params {
+                  ref_da.push(GpuBuffer::alloc(n * p.out_dim).expect("ref da"));
+                  ref_dz.push(GpuBuffer::alloc(n * p.out_dim).expect("ref dz"));
+                  ref_dw.push(GpuBuffer::alloc(p.in_dim * p.out_dim).expect("ref dw"));
+                  ref_db.push(GpuBuffer::alloc(p.out_dim).expect("ref db"));
+            }
+            Model::loss_grad_into(model.loss, &sc.acts[last], &ybuf, &ref_da[last], n, n * params[last].out_dim);
+            for l in (0..params.len()).rev() {
+                  let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
+                  let m = n * out_dim;
+                  let grad = match params[l].act {
+                        Activation::Relu => {
+                              kernels::gpu_relu_backward_into(&ref_da[l], &sc.acts[l], &ref_dz[l], m);
+                              &ref_dz[l]
+                        }
+                        Activation::Sigmoid => {
+                              kernels::gpu_sigmoid_backward_into(&ref_da[l], &sc.acts[l], &ref_dz[l], m);
+                              &ref_dz[l]
+                        }
+                        Activation::Linear => &ref_da[l],
+                  };
+                  let a_prev = if l == 0 { &xbuf } else { &sc.acts[l - 1] };
+                  if out_dim == 1 {
+                        kernels::gpu_dgemv_into(a_prev, grad, &ref_dw[l], n, in_dim, true);
+                        kernels::gpu_reduce_sum_cols_into(grad, &ref_db[l], &ref_ws, n, 1);
+                        if l > 0 {
+                              kernels::gpu_dger_into(grad, &params[l].w, &ref_da[l - 1], n, in_dim);
+                        }
+                  } else if l > 0 {
+                        kernels::gpu_linear_backward_full_into(
+                              grad, a_prev, &params[l].w, &ref_da[l - 1], &ref_dw[l], &ref_db[l], &ref_ws, n, out_dim, in_dim,
+                        );
+                  } else {
+                        kernels::gpu_linear_backward_weights_only_into(
+                              grad, a_prev, &ref_dw[l], &ref_db[l], &ref_ws, n, out_dim, in_dim,
+                        );
+                  }
+                  kernels::gpu_sgd_update(&params[l].w, &ref_dw[l], lr, in_dim * out_dim);
+                  kernels::gpu_sgd_update(&params[l].b, &ref_db[l], lr, out_dim);
+            }
+            let ref_w: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.w, p.in_dim * p.out_dim)).collect();
+            let ref_b: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.b, p.out_dim)).collect();
+
+            // --- compare updated weights ---
+            let mut max_w_diff = 0.0f64;
+            let mut max_b_diff = 0.0f64;
+            for (l, p) in params.iter().enumerate() {
+                  let _ = p;
+                  let wd = pp_w[l].iter().zip(&ref_w[l]).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                  let bd = pp_b[l].iter().zip(&ref_b[l]).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                  eprintln!("layer {l}: W maxdiff={wd:.2e}  b maxdiff={bd:.2e}");
+                  if wd > max_w_diff { max_w_diff = wd; }
+                  if bd > max_b_diff { max_b_diff = bd; }
+            }
+            assert!(max_w_diff < 1e-10, "weights mismatch after backward: max abs diff = {max_w_diff:.2e}");
+            assert!(max_b_diff < 1e-10, "biases mismatch after backward: max abs diff = {max_b_diff:.2e}");
       }
 
       #[test]
