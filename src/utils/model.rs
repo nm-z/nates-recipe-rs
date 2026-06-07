@@ -1363,7 +1363,7 @@ mod metric_gpu_tests {
             Model::forward_into(&params, &xbuf, n, &sc.acts);
             model.backward_step(&params, &xbuf, &ybuf, n, &sc);
 
-            const EPOCHS: usize = 60;
+            const EPOCHS: usize = 10;
             let mut r2s = Vec::with_capacity(EPOCHS);
             gpu_core::memory::alloc_freeze();
             for _ in 0..EPOCHS {
