@@ -164,7 +164,9 @@ impl Train {
             // drop, else the final weights at the end) — do NOT save here, or a blow-up
             // would overwrite the good checkpoint.
             if let Some(test) = &test {
-                  model.eval(test);
+                  if test.has_target {
+                        model.eval(test);
+                  }
             }
       }
 }
