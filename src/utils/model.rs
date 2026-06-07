@@ -446,7 +446,7 @@ impl Model {
                   }
                   Metric::Accuracy => {
                         kernels::gpu_accuracy_into(out, ybuf, &sc.metric_scalar, n);
-                        Self::download_scalar(&sc.metric_scalar) / n as f64
+                        Self::download_scalar(&sc.metric_scalar)
                   }
                   // The Loss metric is the model's ACTUAL loss (self.loss), not hardcoded.
                   Metric::Loss => {
@@ -454,7 +454,7 @@ impl Model {
                         match self.loss {
                               Loss::Mse => {
                                     kernels::gpu_mse_into(out, ybuf, &sc.metric_scalar, n);
-                                    Self::download_scalar(&sc.metric_scalar) / nf
+                                    Self::download_scalar(&sc.metric_scalar)
                               }
                               Loss::Mae => {
                                     kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, n, 1.0);
