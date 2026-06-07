@@ -1369,7 +1369,8 @@ mod metric_gpu_tests {
             for _ in 0..EPOCHS {
                   Model::forward_into(&params, &xbuf, n, &sc.acts);
                   model.backward_step(&params, &xbuf, &ybuf, n, &sc);
-                  r2s.push(cpu_r2(&Model::download_vec(&sc.acts[last], n)));
+                  kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+                  r2s.push(1.0 - Model::download_scalar(&sc.metric_scalar) / ss_tot);
             }
             gpu_core::memory::alloc_unfreeze();
 
