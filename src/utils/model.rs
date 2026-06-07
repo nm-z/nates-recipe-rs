@@ -1214,7 +1214,15 @@ impl Model {
                   let correct = (acc * n as f64).round() as usize;
                   eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
             }
-            eprintln!("eval: {n} predictions");
+            let path = std::path::Path::new(&data.source).parent().unwrap_or(std::path::Path::new("."));
+            let out = path.join("submission.csv");
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&out).expect("create submission.csv"));
+            use std::io::Write;
+            writeln!(w, "id,prediction").expect("write header");
+            for (i, p) in preds.iter().enumerate() {
+                  writeln!(w, "{i},{p}").expect("write row");
+            }
+            eprintln!("eval: {n} predictions → {}", out.display());
       }
 }
 
