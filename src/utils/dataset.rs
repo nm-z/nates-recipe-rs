@@ -252,6 +252,29 @@ impl Assembled {
       fn select(&self, keep: &[String]) -> Mat {
             let n = self.samples;
             let w = keep.len();
+            // The dense matrix is n×w×8B. If that won't fit in RAM, fail clean BEFORE
+            // allocating — and name the columns whose one-hot expansion blew it up
+            // (text/ID columns become one column per distinct value). No silent cap:
+            // the user excludes the offending columns and decides.
+            let bytes = n.saturating_mul(w).saturating_mul(std::mem::size_of::<f64>());
+            let avail = available_ram_bytes();
+            if bytes > avail / 10 * 9 {
+                  let mut by_col: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                  for name in keep {
+                        *by_col.entry(name.split('=').next().unwrap_or(name)).or_insert(0) += 1;
+                  }
+                  let mut top: Vec<(&&str, &usize)> = by_col.iter().collect();
+                  top.sort_by(|a, b| b.1.cmp(a.1));
+                  eprintln!("\x1b[1;31mencoded matrix too large for RAM\x1b[0m");
+                  eprintln!("    {n} rows × {w} cols × 8B = {} (available {})",
+                        crate::data::human_bytes(bytes), crate::data::human_bytes(avail));
+                  eprintln!("    biggest one-hot expansions:");
+                  for (col, cnt) in top.iter().take(5) {
+                        eprintln!("        {col}  →  {cnt} columns");
+                  }
+                  eprintln!("    .exclude() the high-cardinality (text/ID) columns above");
+                  std::process::exit(1);
+            }
             let idx: std::collections::HashMap<&str, usize> =
                   self.names.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
             let mut data = vec![0.0f64; n * w];
@@ -265,6 +288,20 @@ impl Assembled {
             }
             Mat::from_shape_vec((n, w), data).expect("select reshape")
       }
+}
+
+/// Available RAM in bytes (Linux MemAvailable). usize::MAX if it can't be read,
+/// so the guard never blocks a legitimate run on a parse failure.
+fn available_ram_bytes() -> usize {
+      std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                  s.lines()
+                        .find(|l| l.starts_with("MemAvailable:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<usize>().ok())
+            })
+            .map_or(usize::MAX, |kb| kb.saturating_mul(1024))
 }
 
 /// Namespaced feature name: bare for an un-grouped file, `group:col` for a dir.
