@@ -76,7 +76,7 @@ impl GpuBuffer {
                   }
             }
             let mut ptr: *mut c_void = std::ptr::null_mut();
-            check(unsafe { hipMalloc(&mut ptr, n_bytes) })?;
+            check(unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) })?;
             Ok(Self { ptr, len: n_bytes, owned: true })
       }
 
@@ -243,7 +243,7 @@ impl GpuBuffer {
 impl Drop for GpuBuffer {
       fn drop(&mut self) {
             if self.owned && !self.ptr.is_null() {
-                  unsafe { hipFree(self.ptr) };
+                  unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
                   self.ptr = std::ptr::null_mut();
             }
       }
