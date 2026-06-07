@@ -1,11 +1,20 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::hip::*;
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_FROZEN: AtomicBool = AtomicBool::new(false);
 
 pub fn alloc_count_reset() -> usize {
       ALLOC_COUNT.swap(0, Ordering::Relaxed)
+}
+
+pub fn alloc_freeze() {
+      ALLOC_FROZEN.store(true, Ordering::Relaxed);
+}
+
+pub fn alloc_unfreeze() {
+      ALLOC_FROZEN.store(false, Ordering::Relaxed);
 }
 
 const ARENA_ALIGN: usize = 256;
@@ -47,6 +56,8 @@ impl GpuBuffer {
       }
 
       pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
+            assert!(!ALLOC_FROZEN.load(Ordering::Relaxed),
+                  "GPU allocation inside frozen training loop (requested {n_bytes} bytes)");
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
             let base = ARENA_BASE.load(Ordering::Relaxed);
             if base != 0 {

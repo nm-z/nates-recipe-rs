@@ -989,6 +989,7 @@ impl Model {
             // Activation + gradient buffers, allocated once and reused every epoch
             // so steady-state VRAM is flat (no per-epoch sawtooth).
             let sc = Scratch::new(&params, n);
+            gpu_core::memory::alloc_freeze();
             INTERRUPTED.store(false, Ordering::SeqCst);
             unsafe { libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t); }
             for e in 0..cfg.epochs {
@@ -1090,8 +1091,7 @@ impl Model {
                         }
                   }
             }
-            // Restore default SIGINT so the process is killable again once training
-            // is over — otherwise our handler keeps swallowing Ctrl+C during eval/exit.
+            gpu_core::memory::alloc_unfreeze();
             unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL); }
             if plotting {
                   ratatui::restore();
@@ -1104,7 +1104,8 @@ impl Model {
             // the file when it had blown up. Independent of the trailing stop, so a long
             // post-dip recovery still saves. Model::save enforces the R²/finite gate.
             let end_r2 = checkpointing.then(|| {
-                  let preds = Self::predict(&params, &xbuf, n);
+                  Self::forward_into(&params, &xbuf, n, &sc.acts);
+                  let preds = Self::download_vec(&sc.acts[last], n);
                   self.metric_num(Metric::R2, 0, &preds, &data.y, n, 0.0)
             });
             *self.params.borrow_mut() = params;
@@ -1406,12 +1407,13 @@ mod metric_gpu_tests {
             let mut free = 0usize;
             let mut total = 0usize;
             unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
-            let total_mb = total as f64 / 1048576.0;
-            let headroom_mb = total_mb - need_mb;
+            let free_mb = free as f64 / 1048576.0;
+            let headroom_mb = free_mb - need_mb;
 
-            eprintln!("model needs {need_mb:.0} MB, card has {total_mb:.0} MB, headroom {headroom_mb:.0} MB");
+            eprintln!("model needs {need_mb:.0} MB, free {free_mb:.0} MB (total {:.0} MB), headroom {headroom_mb:.0} MB",
+                  total as f64 / 1048576.0);
             assert!(headroom_mb > 1500.0,
-                  "model needs {need_mb:.0} MB on a {total_mb:.0} MB card — only {headroom_mb:.0} MB \
+                  "model needs {need_mb:.0} MB but only {free_mb:.0} MB free — {headroom_mb:.0} MB \
                    headroom, need >1500 MB for rocBLAS workspace + desktop compositing");
       }
 }
