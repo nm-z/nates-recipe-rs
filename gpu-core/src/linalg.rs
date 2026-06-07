@@ -250,12 +250,9 @@ unsafe extern "C" {
 		info: *mut c_void,
 	) -> i32;
 
-	fn rocfft_plan_destroy(plan: *mut c_void) -> i32;
-
 	fn rocfft_plan_get_work_buffer_size(plan: *const c_void, size_in_bytes: *mut usize) -> i32;
 
 	fn rocfft_execution_info_create(info: *mut *mut c_void) -> i32;
-	fn rocfft_execution_info_destroy(info: *mut c_void) -> i32;
 	fn rocfft_execution_info_set_work_buffer(
 		info: *mut c_void,
 		work_buffer: *mut c_void,

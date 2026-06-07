@@ -1417,6 +1417,8 @@ thread_local! {
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn atexit_gpu_shutdown() {
+	let _ = crate::hip::hipDeviceSynchronize();
+	crate::memory::mark_shutting_down();
 	gpu_shutdown();
 }
 
@@ -1445,6 +1447,7 @@ pub(crate) fn rocblas_handle() -> *mut c_void {
 }
 
 pub fn gpu_shutdown() {
+	unsafe { crate::hip::hipDeviceSynchronize() };
 	ROCBLAS_HANDLE.with(|h| {
 		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
 		if !ptr.is_null() {
@@ -1453,11 +1456,6 @@ pub fn gpu_shutdown() {
 			}
 		}
 	});
-	// NO hipDeviceReset() here. At process exit our atexit handler runs before
-	// HIP's own __hip_module_dtor (LIFO); resetting the device frees HIP's
-	// context, which the module dtor then double-frees → heap corruption
-	// ("unaligned tcache chunk" / "corrupted double-linked list"). The OS
-	// reclaims all VRAM on exit regardless, so the reset is redundant here.
 }
 
 /// Fused linear: out = X @ W + bias. X is (m,k), W is (k,n), bias is (1,n), out is (m,n).
@@ -2358,27 +2356,39 @@ pub fn gpu_linear_into(
 			std::ptr::null_mut(),
 		);
 	}
-	let alpha = 1.0_f64;
-	let beta = 1.0_f64;
-	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_NONE,
-			n as i32,
-			m as i32,
-			k as i32,
-			&alpha,
-			w.ptr as *const f64,
-			n as i32,
-			x.ptr as *const f64,
-			k as i32,
-			&beta,
-			out.ptr as *mut f64,
-			n as i32,
-		)
-	};
-	check(status).expect("gpu_linear_into dgemm");
+	if n <= 16 {
+		unsafe {
+			crate::math_ops::launch_tall_skinny_dgemm(
+				x.ptr as *const c_void,
+				w.ptr as *const c_void,
+				out.ptr as *mut c_void,
+				m as i32, n as i32, k as i32,
+				std::ptr::null_mut(),
+			);
+		}
+	} else {
+		let alpha = 1.0_f64;
+		let beta = 1.0_f64;
+		let status = unsafe {
+			rocblas_dgemm(
+				rocblas_handle(),
+				ROCBLAS_OPERATION_NONE,
+				ROCBLAS_OPERATION_NONE,
+				n as i32,
+				m as i32,
+				k as i32,
+				&alpha,
+				w.ptr as *const f64,
+				n as i32,
+				x.ptr as *const f64,
+				k as i32,
+				&beta,
+				out.ptr as *mut f64,
+				n as i32,
+			)
+		};
+		check(status).expect("gpu_linear_into dgemm");
+	}
 }
 
 /// Fused R² residual sum of squares Σ(y-pred)² reduced into scalar `out` (atomicAdd).

@@ -339,3 +339,62 @@ extern "C" void launch_core_distance(
       hipLaunchKernelGGL(core_distance_kernel, dim3(blocks), dim3(threads), 0, stream,
             points, core_dist, n, dim, min_pts);
 }
+
+// ── Fixed-radius neighbors, CSR output (no n×n mask) ─────────────────────────
+// Two passes so memory is O(nnz) not O(n²): count per point, host prefix-sums to
+// row offsets, then fill packs neighbor indices into the compact adjacency.
+
+extern "C" __global__ void fixed_radius_count_kernel(
+      const double* points, int* count, int n, int dim, double eps2
+) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= n) return;
+      int c = 0;
+      for (int j = 0; j < n; j++) {
+            double d2 = 0.0;
+            for (int d = 0; d < dim; d++) {
+                  double diff = points[i * dim + d] - points[j * dim + d];
+                  d2 += diff * diff;
+            }
+            if (d2 <= eps2) c++;
+      }
+      count[i] = c;
+}
+
+extern "C" void launch_fixed_radius_count(
+      const double* points, int* count, int n, int dim, double eps, hipStream_t stream
+) {
+      double eps2 = eps * eps;
+      int threads = 256;
+      int blocks = (n + threads - 1) / threads;
+      hipLaunchKernelGGL(fixed_radius_count_kernel, dim3(blocks), dim3(threads), 0, stream,
+            points, count, n, dim, eps2);
+}
+
+// One thread per point i owns row [row_ptr[i], row_ptr[i+1]) → no atomics. Writes
+// the j-index of every neighbor (including i itself, matching the mask version).
+extern "C" __global__ void fixed_radius_fill_csr_kernel(
+      const double* points, const int* row_ptr, int* indices, int n, int dim, double eps2
+) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= n) return;
+      int off = row_ptr[i];
+      for (int j = 0; j < n; j++) {
+            double d2 = 0.0;
+            for (int d = 0; d < dim; d++) {
+                  double diff = points[i * dim + d] - points[j * dim + d];
+                  d2 += diff * diff;
+            }
+            if (d2 <= eps2) { indices[off++] = j; }
+      }
+}
+
+extern "C" void launch_fixed_radius_fill_csr(
+      const double* points, const int* row_ptr, int* indices, int n, int dim, double eps, hipStream_t stream
+) {
+      double eps2 = eps * eps;
+      int threads = 256;
+      int blocks = (n + threads - 1) / threads;
+      hipLaunchKernelGGL(fixed_radius_fill_csr_kernel, dim3(blocks), dim3(threads), 0, stream,
+            points, row_ptr, indices, n, dim, eps2);
+}

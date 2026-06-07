@@ -5,10 +5,19 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 
 unsafe extern "C" {
-	fn launch_fixed_radius_neighbors(
+	fn launch_fixed_radius_count(
 		points: *const c_void,
-		mask: *mut c_void,
 		count: *mut c_void,
+		n: i32,
+		dim: i32,
+		eps: f64,
+		stream: *mut c_void,
+	);
+
+	fn launch_fixed_radius_fill_csr(
+		points: *const c_void,
+		row_ptr: *const c_void,
+		indices: *mut c_void,
 		n: i32,
 		dim: i32,
 		eps: f64,
@@ -56,9 +65,14 @@ unsafe extern "C" {
 	);
 }
 
-pub struct FixedRadiusResult {
-	pub neighbor_count: GpuBuffer,
-	pub within_mask: GpuBuffer,
+// Compact CSR adjacency: `row_ptr` (i32[n+1]) gives each point's [start,end) span in
+// `indices` (i32[nnz]), the flattened neighbor j-indices (self included). Memory is
+// O(nnz), never O(n²) — a dense mask at n=100k would be 10 GB; this is the actual
+// neighbor count.
+pub struct NeighborCsr {
+	pub row_ptr: GpuBuffer,
+	pub indices: GpuBuffer,
+	pub nnz: usize,
 }
 
 pub fn gpu_fixed_radius_neighbors(
@@ -66,13 +80,12 @@ pub fn gpu_fixed_radius_neighbors(
 	n: usize,
 	dim: usize,
 	eps: f64,
-) -> Result<FixedRadiusResult, HipError> {
+) -> Result<NeighborCsr, HipError> {
+	// Pass 1: per-point neighbor counts (one thread per point — no n×n buffer).
 	let count = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-	let mask = GpuBuffer::zeros_bytes(n * n)?;
 	unsafe {
-		launch_fixed_radius_neighbors(
+		launch_fixed_radius_count(
 			points.ptr_raw() as *const c_void,
-			mask.ptr_raw(),
 			count.ptr_raw(),
 			n as i32,
 			dim as i32,
@@ -81,10 +94,37 @@ pub fn gpu_fixed_radius_neighbors(
 		);
 	}
 	check_launch();
-	Ok(FixedRadiusResult {
-		neighbor_count: count,
-		within_mask: mask,
-	})
+
+	// Exclusive prefix sum of the length-n count vector → CSR row offsets. Done on
+	// the host: it's O(n), not O(n²), so it costs nothing next to the kernels.
+	let mut counts = vec![0i32; n];
+	count.download_i32(&mut counts)?;
+	let mut row_ptr = vec![0i32; n + 1];
+	let mut acc: i64 = 0;
+	for i in 0..n {
+		row_ptr[i] = acc as i32;
+		acc += counts[i] as i64;
+	}
+	row_ptr[n] = acc as i32;
+	let nnz = acc as usize;
+	let row_ptr_buf = GpuBuffer::upload_i32(&row_ptr)?;
+
+	// Pass 2: fill the compact adjacency. alloc at least 1 so nnz==0 is valid.
+	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * std::mem::size_of::<i32>())?;
+	unsafe {
+		launch_fixed_radius_fill_csr(
+			points.ptr_raw() as *const c_void,
+			row_ptr_buf.ptr_raw() as *const c_void,
+			indices.ptr_raw(),
+			n as i32,
+			dim as i32,
+			eps,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+
+	Ok(NeighborCsr { row_ptr: row_ptr_buf, indices, nnz })
 }
 
 // Per-step union-find launchers; this caller owns the parent/changed buffers and

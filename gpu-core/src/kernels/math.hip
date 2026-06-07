@@ -222,3 +222,27 @@ extern "C" void launch_isfinite_all(const double* x, int* flag, int n, hipStream
       int threads = 256; int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(isfinite_all_kernel, dim3(blocks), dim3(threads), 0, stream, x, flag, n);
 }
+
+extern "C" __global__ void tall_skinny_dgemm_kernel(
+      const double* __restrict__ X,
+      const double* __restrict__ W,
+      double* __restrict__ C,
+      int M, int N, int K
+) {
+      int row = blockIdx.x * blockDim.y + threadIdx.y;
+      int col = threadIdx.x;
+      if (row >= M || col >= N) return;
+      double acc = 0.0;
+      for (int i = 0; i < K; i++)
+            acc += X[row * K + i] * W[i * N + col];
+      C[row * N + col] += acc;
+}
+
+extern "C" void launch_tall_skinny_dgemm(
+      const double* X, const double* W, double* C,
+      int M, int N, int K, hipStream_t stream
+) {
+      dim3 threads(N, min(256 / N, 64));
+      dim3 blocks((M + (int)threads.y - 1) / (int)threads.y);
+      hipLaunchKernelGGL(tall_skinny_dgemm_kernel, blocks, threads, 0, stream, X, W, C, M, N, K);
+}

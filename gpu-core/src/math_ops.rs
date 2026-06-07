@@ -61,6 +61,10 @@ unsafe extern "C" {
 	);
 	fn launch_has_nan(x: *const c_void, flag: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_isfinite_all(x: *const c_void, flag: *mut c_void, n: i32, stream: *mut c_void);
+	pub fn launch_tall_skinny_dgemm(
+		x: *const c_void, w: *const c_void, c: *mut c_void,
+		m: i32, n: i32, k: i32, stream: *mut c_void,
+	);
 }
 
 pub fn gpu_rsqrt(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {

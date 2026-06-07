@@ -8,27 +8,21 @@ use std::ffi::c_void;
 unsafe extern "C" {
 	fn launch_iota(out: *mut c_void, n: i32, stream: *mut c_void);
 
-	// Bitonic argsort building blocks. The schedule loop lives in the Rust
-	// caller (gpu_random_permutation): fill keys, sentinel-pad, init vals,
-	// then drive the k/j double loop of launch_bitonic_step_idx.
+	// Random f64 keys (per-element LCG); argsorting them gives the permutation.
 	fn launch_lcg_rand(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
 
-	fn launch_fill_sentinel_f64(
-		data: *mut c_void,
-		real_n: i32,
-		padded_n: i32,
-		sentinel: f64,
-		stream: *mut c_void,
-	);
+	// O(n) permutation via rocPRIM radix sort of (key, index) pairs. Caller owns
+	// the temp (sized by radix_perm_workspace_bytes) and the double-buffer outputs.
+	fn radix_perm_workspace_bytes(n: i32, stream: *mut c_void) -> usize;
 
-	fn launch_init_int_idx(idx: *mut c_void, n: i32, stream: *mut c_void);
-
-	fn launch_bitonic_step_idx(
+	fn launch_radix_sort_perm(
 		keys: *mut c_void,
-		vals: *mut c_void,
-		j: i32,
-		k: i32,
-		padded_n: i32,
+		keys_out: *mut c_void,
+		vals_in: *const c_void,
+		vals_out: *mut c_void,
+		n: i32,
+		tmp: *mut c_void,
+		tmp_bytes: usize,
 		stream: *mut c_void,
 	);
 
@@ -63,41 +57,36 @@ pub fn gpu_iota(n: usize) -> Result<GpuBuffer, HipError> {
 // gpu_random_permutation
 // Returns GpuBuffer of i32[n] — a random permutation of [0..n-1].
 // seed: u32 determines the random draw; different seeds give different permutations.
-// Implementation: draw uniform f64 keys via per-element LCG (launch_lcg_rand), then
-// bitonic-argsort the keys ascending; the argsort indices are the permutation. The
-// bitonic schedule (k/j double loop) is driven here in Rust over caller-allocated
-// keys[pn]/vals[pn] scratch (pn = next_pow2(n)); padding keys are set to +INF so
-// they sort to the tail and never displace a real index out of vals[0..n).
+// Implementation: draw uniform f64 keys via per-element LCG (launch_lcg_rand) and an
+// iota of indices, then rocPRIM radix-sort the (key, index) pairs ascending — O(n),
+// no power-of-two padding. The reordered indices are the permutation.
 pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError> {
-	let pn = n.next_power_of_two();
-	let keys = GpuBuffer::alloc(pn)?; // f64[pn]
-	let vals = GpuBuffer::alloc_bytes(pn * std::mem::size_of::<i32>())?; // i32[pn]
 	let stream = std::ptr::null_mut();
+	let keys = GpuBuffer::alloc(n)?; // f64[n] random keys
+	let keys_out = GpuBuffer::alloc(n)?; // f64[n] sorted keys (discarded)
+	let vals_in = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?; // i32[n] iota
+	let vals_out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?; // i32[n] permutation
 	unsafe {
 		launch_lcg_rand(keys.ptr_raw(), n as i32, seed, stream);
-		launch_fill_sentinel_f64(keys.ptr_raw(), n as i32, pn as i32, f64::INFINITY, stream);
-		launch_init_int_idx(vals.ptr_raw(), pn as i32, stream);
-		let mut k = 2usize;
-		while k <= pn {
-			let mut j = k / 2;
-			while j > 0 {
-				launch_bitonic_step_idx(
-					keys.ptr_raw(),
-					vals.ptr_raw(),
-					j as i32,
-					k as i32,
-					pn as i32,
-					stream,
-				);
-				j >>= 1;
-			}
-			k <<= 1;
-		}
+		launch_iota(vals_in.ptr_raw(), n as i32, stream);
 	}
 	check_launch();
-	let mut out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-	out.copy_from(&vals, n * std::mem::size_of::<i32>())?;
-	Ok(out)
+	let tmp_bytes = unsafe { radix_perm_workspace_bytes(n as i32, stream) };
+	let tmp = GpuBuffer::alloc_bytes(tmp_bytes.max(1))?;
+	unsafe {
+		launch_radix_sort_perm(
+			keys.ptr_raw(),
+			keys_out.ptr_raw(),
+			vals_in.ptr_raw() as *const c_void,
+			vals_out.ptr_raw(),
+			n as i32,
+			tmp.ptr_raw(),
+			tmp_bytes,
+			stream,
+		);
+	}
+	check_launch();
+	Ok(vals_out)
 }
 
 // gpu_ordered_target_stats

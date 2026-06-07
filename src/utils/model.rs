@@ -539,6 +539,8 @@ struct Scratch {
 	// back to the attention width on the backward pass. Len-1 when no concat exists.
 	concat: GpuBuffer,
 	concat_dgrad: GpuBuffer,
+	copy_stream: gpu_core::hip::Stream,
+	pinned_scalar: *mut f64,
 }
 
 impl Scratch {
@@ -673,9 +675,41 @@ impl Scratch {
 			prelu_scalar: alloc(1, "prelu_scalar"),
 			concat: alloc(concat_sz, "concat"),
 			concat_dgrad: alloc(bw(concat_grad_sz), "concat_dgrad"),
+			copy_stream: gpu_core::hip::Stream::new().expect("copy stream"),
+			pinned_scalar: {
+				let ptr = gpu_core::hip::host_malloc(8, 0).expect("pinned scalar");
+				ptr as *mut f64
+			},
 		}
 	}
 
+	fn download_scalar_deferred(&self) {
+		unsafe {
+			gpu_core::hip::hipMemcpyAsync(
+				self.pinned_scalar as *mut std::ffi::c_void,
+				self.metric_scalar.ptr_raw() as *const std::ffi::c_void,
+				8,
+				gpu_core::hip::HIP_MEMCPY_D2H,
+				self.copy_stream.raw(),
+			);
+		}
+	}
+
+	fn sync_deferred_scalar(&self) -> f64 {
+		self.copy_stream.synchronize().expect("sync copy stream");
+		unsafe { *self.pinned_scalar }
+	}
+}
+
+impl Drop for Scratch {
+	fn drop(&mut self) {
+		if !self.pinned_scalar.is_null() {
+			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar as *mut std::ffi::c_void) };
+		}
+	}
+}
+
+impl Scratch {
 	/// Exact bytes `new()` will allocate for these params at row count `n` — the
 	/// SUM of every buffer, mirroring `new()` field-for-field. Used to pre-check a
 	/// forward pass (esp. eval, where attention's scores + per-head buffers are
@@ -1026,6 +1060,78 @@ impl Model {
 					}
 				}
 			}
+		}
+	}
+
+	fn metric_gpu_into(
+		&self,
+		m: Metric,
+		out: &GpuBuffer,
+		ybuf: &GpuBuffer,
+		sc: &Scratch,
+		n: usize,
+		k: usize,
+		ss_tot: f64,
+	) -> (f64, f64) {
+		let nk = n * k;
+		match m {
+			Metric::Loss => {
+				match self.loss {
+					Loss::Mse => {
+						kernels::gpu_mse_into(out, ybuf, &sc.metric_scalar, nk);
+						(1.0, 1.0)
+					}
+					Loss::Mae => {
+						kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, nk, 1.0);
+						kernels::gpu_abs_into(&sc.metric_t0, &sc.metric_t0, nk);
+						kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.metric_scalar, &sc.reduce_ws, nk, 1);
+						(1.0, nk as f64)
+					}
+					Loss::Huber => {
+						kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, nk, 1.0);
+						kernels::gpu_clamp_into(&sc.metric_t0, &sc.metric_t1, nk, -1.0, 1.0);
+						kernels::gpu_copy_into(&sc.metric_t1, &sc.metric_t2, nk);
+						kernels::gpu_mul_inplace(&sc.metric_t2, &sc.metric_t1, nk);
+						kernels::gpu_scale_inplace(&sc.metric_t2, 0.5, nk);
+						kernels::gpu_abs_into(&sc.metric_t0, &sc.metric_t0, nk);
+						kernels::gpu_add_inplace(&sc.metric_t2, &sc.metric_t0, nk);
+						kernels::gpu_abs_into(&sc.metric_t1, &sc.metric_t1, nk);
+						kernels::gpu_sub_inplace(&sc.metric_t2, &sc.metric_t1, nk);
+						kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.metric_scalar, &sc.reduce_ws, nk, 1);
+						(1.0, nk as f64)
+					}
+					Loss::Ce => {
+						let eps = 1e-7;
+						kernels::gpu_softmax_rows_into(out, &sc.metric_t0, n, k);
+						kernels::gpu_clamp_into(&sc.metric_t0, &sc.metric_t0, nk, eps, 1.0);
+						kernels::gpu_log_into(&sc.metric_t0, &sc.metric_t0, nk);
+						kernels::gpu_mul_inplace(&sc.metric_t0, ybuf, nk);
+						kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.metric_scalar, &sc.reduce_ws, nk, 1);
+						(-1.0, n as f64)
+					}
+					Loss::Bce => {
+						let eps = 1e-7;
+						kernels::gpu_clamp_into(out, &sc.metric_t0, nk, eps, 1.0 - eps);
+						kernels::gpu_log_into(&sc.metric_t0, &sc.metric_t1, nk);
+						kernels::gpu_mul_inplace(&sc.metric_t1, ybuf, nk);
+						kernels::gpu_scale_inplace(&sc.metric_t0, -1.0, nk);
+						kernels::gpu_add_scalar_inplace(&sc.metric_t0, 1.0, nk);
+						kernels::gpu_log_into(&sc.metric_t0, &sc.metric_t0, nk);
+						kernels::gpu_copy_into(ybuf, &sc.metric_t2, nk);
+						kernels::gpu_scale_inplace(&sc.metric_t2, -1.0, nk);
+						kernels::gpu_add_scalar_inplace(&sc.metric_t2, 1.0, nk);
+						kernels::gpu_mul_inplace(&sc.metric_t2, &sc.metric_t0, nk);
+						kernels::gpu_add_inplace(&sc.metric_t1, &sc.metric_t2, nk);
+						kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.metric_scalar, &sc.reduce_ws, nk, 1);
+						(-1.0, nk as f64)
+					}
+				}
+			}
+			Metric::R2 => {
+				kernels::gpu_ss_res_into(out, ybuf, &sc.metric_scalar, nk);
+				(1.0, ss_tot)
+			}
+			_ => (1.0, 1.0),
 		}
 	}
 
@@ -2239,7 +2345,7 @@ impl Model {
 		// Activation + gradient buffers, allocated once and reused every epoch
 		// so steady-state VRAM is flat (no per-epoch sawtooth).
 		let sc = Scratch::new(&params, n, false);
-		gpu_core::memory::alloc_freeze();
+		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
@@ -2290,11 +2396,22 @@ impl Model {
 			} else {
 				f64::NAN
 			};
-			let loss = if checkpointing {
-				self.metric_gpu(Metric::Loss, out, &ybuf, &sc, n, k, ss_tot, 0, 0.0)
+			let loss_scale = if checkpointing {
+				let (sign, div) = self.metric_gpu_into(Metric::Loss, out, &ybuf, &sc, n, k, ss_tot);
+				sc.download_scalar_deferred();
+				Some((sign, div))
+			} else {
+				None
+			};
+			let loss = if let Some((sign, div)) = loss_scale {
+				sign * sc.sync_deferred_scalar() / div
 			} else {
 				f64::NAN
 			};
+			if checkpointing && loss.is_nan() {
+				eprintln!("NaN loss at epoch {e} — stopping (weights diverged)");
+				break;
+			}
 			let mut checkpointed = false;
 			if checkpointing {
 				if !saved && e > 0 && loss > loss_prev {
@@ -2372,7 +2489,7 @@ impl Model {
 				}
 			}
 		}
-		gpu_core::memory::alloc_unfreeze();
+		drop(_alloc_guard);
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
 		}
@@ -3054,14 +3171,15 @@ mod metric_gpu_tests {
 
 		const EPOCHS: usize = 10;
 		let mut r2s = Vec::with_capacity(EPOCHS);
-		gpu_core::memory::alloc_freeze();
-		for _ in 0..EPOCHS {
-			Model::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
-			model.backward_step(&params, &xbuf, &ybuf, n, &sc);
-			kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
-			r2s.push(1.0 - Model::download_scalar(&sc.metric_scalar) / ss_tot);
+		{
+			let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
+			for _ in 0..EPOCHS {
+				Model::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+				model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+				r2s.push(1.0 - Model::download_scalar(&sc.metric_scalar) / ss_tot);
+			}
 		}
-		gpu_core::memory::alloc_unfreeze();
 
 		assert!(r2s.iter().all(|v| v.is_finite()), "non-finite R²: {r2s:?}");
 		assert!(

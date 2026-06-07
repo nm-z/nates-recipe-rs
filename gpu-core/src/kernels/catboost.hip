@@ -1,5 +1,7 @@
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <float.h>
+#include <rocprim/rocprim.hpp>
 
 // ── iota ──────────────────────────────────────────────────────────────────────
 // Fills out[i] = i for i in [0, n).
@@ -154,4 +156,30 @@ extern "C" void launch_ordered_target_stats(
       hipLaunchKernelGGL(ordered_target_stats_kernel, dim3(1), dim3(1), 0, stream,
             cat_col, target, perm, encoded_out, cat_sum, cat_cnt,
             n, prior, smoothing);
+}
+
+// ── O(n) random permutation via rocPRIM radix sort ───────────────────────────
+// Replaces the O(n log²n) bitonic argsort (and its power-of-two padding): sort
+// (random f64 key, index) pairs by key; the reordered indices are the permutation.
+// Caller owns the temp buffer (queried via radix_perm_workspace_bytes) and the
+// double-buffer key/value outputs — matching the reduce.hip workspace convention.
+extern "C" size_t radix_perm_workspace_bytes(int n, hipStream_t stream) {
+      size_t tmp_bytes = 0;
+      rocprim::radix_sort_pairs(
+            nullptr, tmp_bytes,
+            (double*)nullptr, (double*)nullptr,
+            (int*)nullptr, (int*)nullptr,
+            (size_t)n, 0, sizeof(double) * 8, stream);
+      return tmp_bytes;
+}
+
+extern "C" void launch_radix_sort_perm(
+      double* keys, double* keys_out, const int* vals_in, int* vals_out,
+      int n, void* tmp, size_t tmp_bytes, hipStream_t stream
+) {
+      rocprim::radix_sort_pairs(
+            tmp, tmp_bytes,
+            keys, keys_out,
+            vals_in, vals_out,
+            (size_t)n, 0, sizeof(double) * 8, stream);
 }

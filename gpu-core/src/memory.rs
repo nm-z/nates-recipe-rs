@@ -1,9 +1,14 @@
 use crate::hip::*;
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_shutting_down() {
+      SHUTTING_DOWN.store(true, Ordering::SeqCst);
+}
 
 thread_local! {
 	static ALLOC_FROZEN: Cell<bool> = const { Cell::new(false) };
@@ -19,6 +24,21 @@ pub fn alloc_freeze() {
 
 pub fn alloc_unfreeze() {
 	ALLOC_FROZEN.with(|f| f.set(false));
+}
+
+pub struct AllocGuard(std::marker::PhantomData<*const ()>);
+
+impl AllocGuard {
+      pub fn freeze() -> Self {
+            alloc_freeze();
+            AllocGuard(std::marker::PhantomData)
+      }
+}
+
+impl Drop for AllocGuard {
+      fn drop(&mut self) {
+            alloc_unfreeze();
+      }
 }
 
 const ARENA_ALIGN: usize = 256;
@@ -346,7 +366,7 @@ impl GpuBuffer {
 
 impl Drop for GpuBuffer {
 	fn drop(&mut self) {
-		if self.owned && !self.ptr.is_null() {
+		if self.owned && !self.ptr.is_null() && !SHUTTING_DOWN.load(Ordering::Relaxed) {
 			unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 			self.ptr = std::ptr::null_mut();
 		}
