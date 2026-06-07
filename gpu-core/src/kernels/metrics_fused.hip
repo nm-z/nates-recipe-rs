@@ -93,6 +93,35 @@ extern "C" void launch_acc_metric(const double* pred, const double* y, double* o
                          pred, y, out, n);
 }
 
+// ── multi-class accuracy: Σ [argmax(pred_row) == argmax(y_row)] / n ───────────
+// Each row is k-wide (one-hot target). Per row, argmax of pred vs argmax of y.
+__global__ void argmax_acc_kernel(const double* pred, const double* y, double* out, int n, int k) {
+      double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
+      double acc = 0.0;
+      for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < n; r += gridDim.x * blockDim.x) {
+            int pa = 0, ya = 0;
+            double pbest = pred[r * k], ybest = y[r * k];
+            for (int j = 1; j < k; ++j) {
+                  double pv = pred[r * k + j];
+                  if (pv > pbest) { pbest = pv; pa = j; }
+                  double yv = y[r * k + j];
+                  if (yv > ybest) { ybest = yv; ya = j; }
+            }
+            acc += (pa == ya) ? inv_n : 0.0;
+      }
+      double block_sum = block_reduce_sum(acc);
+      if (threadIdx.x == 0)
+            atomicAdd(out, block_sum);
+}
+
+extern "C" void launch_argmax_acc(const double* pred, const double* y, double* out, int n, int k, void* stream) {
+      int blocks = (n + BLOCK - 1) / BLOCK;
+      if (blocks < 1) blocks = 1;
+      if (blocks > 65535) blocks = 65535;
+      hipLaunchKernelGGL(argmax_acc_kernel, dim3(blocks), dim3(BLOCK), 0, (hipStream_t)stream,
+                         pred, y, out, n, k);
+}
+
 // ── binary cross-entropy gradient: da = (p - y) / (p(1-p)) / n ────────────────
 // Two-sided BCE: dL/dp = -y/p + (1-y)/(1-p) = (p-y)/(p(1-p)). Element-wise into
 // da (no reduction). p clamped to [eps, 1-eps] so the division stays finite at

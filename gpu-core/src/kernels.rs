@@ -274,6 +274,7 @@ unsafe extern "C" {
     #[link_name = "launch_acc_metric"]
     fn launch_accuracy_metric(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
     fn launch_bce_grad(pred: *const c_void, y: *const c_void, da: *mut c_void, n: i32, stream: *mut c_void);
+    fn launch_argmax_acc(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, k: i32, stream: *mut c_void);
 
     // DTW
     fn launch_dtw_init(dp: *mut c_void, dp_size: i32, stream: *mut c_void);
@@ -848,6 +849,13 @@ pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: us
 /// Two-sided binary cross-entropy gradient da = (pred-y)/(pred(1-pred))/n, element-wise.
 pub fn gpu_bce_grad_into(pred: &GpuBuffer, y: &GpuBuffer, da: &GpuBuffer, n: usize) {
     unsafe { launch_bce_grad(pred.ptr as *const c_void, y.ptr as *const c_void, da.ptr, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Multi-class accuracy Σ[argmax(pred_row)==argmax(y_row)]/n into scalar `out` (rows are k-wide).
+pub fn gpu_argmax_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize, k: usize) {
+    unsafe { crate::hip::hipMemsetAsync(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut()); }
+    unsafe { launch_argmax_acc(pred.ptr as *const c_void, y.ptr as *const c_void, out.ptr, n as i32, k as i32, std::ptr::null_mut()); }
     check_launch();
 }
 
