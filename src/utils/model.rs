@@ -880,9 +880,9 @@ impl Model {
             for (li, &(units, act)) in self.specs.iter().enumerate() {
                   let (w, b) = if resumed.is_empty() {
                         let scale = (2.0 / in_dim as f64).sqrt();
-                        let w0 = kernels::gpu_randn(in_dim * units, 1234 + (li as u32) * 7919)
+                        let w = kernels::gpu_randn(in_dim * units, 1234 + (li as u32) * 7919)
                               .expect("randn w");
-                        let w = kernels::gpu_scale(&w0, scale, in_dim * units).expect("scale w");
+                        kernels::gpu_scale_inplace(&w, scale, in_dim * units);
                         let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("upload b");
                         (w, b)
                   } else {
@@ -1322,8 +1322,8 @@ mod metric_gpu_tests {
             let h = 16usize;
             let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
                   let scale = (2.0 / fan_in as f64).sqrt();
-                  let w0 = kernels::gpu_randn(fan_in * units, seed).expect("randn");
-                  let w = kernels::gpu_scale(&w0, scale, fan_in * units).expect("scale w");
+                  let w = kernels::gpu_randn(fan_in * units, seed).expect("randn");
+                  kernels::gpu_scale_inplace(&w, scale, fan_in * units);
                   let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
                   LayerParams { w, b, in_dim: fan_in, out_dim: units, act }
             };
@@ -1344,10 +1344,6 @@ mod metric_gpu_tests {
             let model = Model { specs: vec![], loss: Loss::Mse, lr: 0.5, params: RefCell::new(vec![]) };
             let ybar = y.iter().sum::<f64>() / n as f64;
             let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
-            let cpu_r2 = |p: &[f64]| {
-                  let ssr: f64 = (0..n).map(|i| (y[i] - p[i]).powi(2)).sum();
-                  1.0 - ssr / ss_tot
-            };
 
             Model::forward_into(&params, &xbuf, n, &sc.acts);
             model.backward_step(&params, &xbuf, &ybuf, n, &sc);
@@ -1394,8 +1390,8 @@ mod metric_gpu_tests {
             let lr = 0.01;
             let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
                   let scale = (2.0 / fan_in as f64).sqrt();
-                  let w0 = kernels::gpu_randn(fan_in * units, seed).expect("randn");
-                  let w = kernels::gpu_scale(&w0, scale, fan_in * units).expect("scale w");
+                  let w = kernels::gpu_randn(fan_in * units, seed).expect("randn");
+                  kernels::gpu_scale_inplace(&w, scale, fan_in * units);
                   let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
                   LayerParams { w, b, in_dim: fan_in, out_dim: units, act }
             };
