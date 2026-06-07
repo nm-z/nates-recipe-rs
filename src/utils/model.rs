@@ -1212,6 +1212,8 @@ impl Model {
                   let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, 0.0);
                   let correct = (acc * n as f64).round() as usize;
                   eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
+            } else {
+                  eprintln!("eval: {n} samples (no target column, accuracy unavailable)");
             }
       }
 }
