@@ -271,7 +271,6 @@ extern "C" void launch_goss_sample(
       const int* sorted_idx, float* weights_out, const float* uniform_rand,
       int n_rows, int top_k, float sample_rate, float keep_weight, hipStream_t stream
 ) {
-      hipMemsetAsync(weights_out, 0, (size_t)n_rows * sizeof(float), stream);
       dim3 block(256);
       dim3 grid((n_rows + 255) / 256);
       hipLaunchKernelGGL(goss_sample_kernel, grid, block, 0, stream,

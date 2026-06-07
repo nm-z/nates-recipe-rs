@@ -23,15 +23,12 @@ __global__ void histogram_build_kernel(
     atomicAdd(&count_hist[h], 1.0);
 }
 
+// Caller must zero grad_hist, hess_hist, count_hist (each p*n_bins doubles) before calling.
 extern "C" void launch_histogram_build(
     const double* bins, const double* grad, const double* hess, const double* mask,
     double* grad_hist, double* hess_hist, double* count_hist,
     int n, int p, int n_bins, hipStream_t stream
 ) {
-    size_t hb = (size_t)p * n_bins * sizeof(double);
-    hipMemsetAsync(grad_hist, 0, hb, stream);
-    hipMemsetAsync(hess_hist, 0, hb, stream);
-    hipMemsetAsync(count_hist, 0, hb, stream);
     int total = n * p;
     dim3 bl(256); dim3 gr((total + 255) / 256);
     hipLaunchKernelGGL(histogram_build_kernel, gr, bl, 0, stream,
@@ -255,95 +252,91 @@ __global__ void tb_apply_tree_kernel(
     predictions[i] = leaf_val[node];
 }
 
-// Launcher — orchestrates the full tree build on GPU. The ONLY host function
-// called from Rust. Allocates temporaries, runs depth loop, frees temps.
-extern "C" void launch_tree_build(
-    const double* tr_bins, int n_tr,
-    const double* grad, const double* hess,
-    const double* te_bins, int n_te,
-    int p, int n_bins, int max_depth, double lambda, double min_cw,
-    double* tr_pred, double* te_pred,
+// Per-step launchers. The Rust caller allocates all scratch buffers, performs
+// every zero/sentinel fill, runs the depth loop, and frees the scratch. Each
+// wrapper below does nothing but hipLaunchKernelGGL.
+//
+// Caller-allocated scratch (max_nodes = (1<<(max_depth+1))-1,
+//   max_level = max_depth<=1 ? 1 : 1<<(max_depth-1), hist_elems = max_level*p*n_bins):
+//   node_assign : n_tr      ints     — fill 0
+//   sf, sb      : max_nodes ints     — fill 0xFF (-1 leaf sentinel)
+//   gh, hh      : hist_elems doubles — per level d: zero first n_level*p*n_bins doubles
+//   sum_g,sum_h : max_nodes doubles  — fill 0 before leaf_sum
+//   lv          : max_nodes doubles  — fill 0 before leaf_val
+//
+// Caller depth loop (d in 0..max_depth): level_base=(1<<d)-1, n_level=1<<d:
+//   zero gh,hh (n_level*p*n_bins doubles) → launch_tb_histogram(level_base)
+//   → launch_tb_split_eval(n_level, level_base) → launch_tb_repartition
+// After loop: zero sum_g,sum_h,lv → launch_tb_leaf_sum → launch_tb_leaf_val(max_nodes,0,lambda)
+//   → launch_tb_scatter (tr) → launch_tb_apply_tree (te).
+
+extern "C" void launch_tb_histogram(
+    const double* tr_bins, const double* grad, const double* hess,
+    const int* node_assign, double* grad_hist, double* hess_hist,
+    int n_tr, int p, int n_bins, int level_base, hipStream_t stream
+) {
+    int total_nf = n_tr * p;
+    dim3 bl(256); dim3 gr((total_nf + 255) / 256);
+    hipLaunchKernelGGL(tb_histogram_kernel, gr, bl, 0, stream,
+        tr_bins, grad, hess, node_assign, grad_hist, hess_hist, n_tr, p, n_bins, level_base);
+}
+
+extern "C" void launch_tb_split_eval(
+    const double* grad_hist, const double* hess_hist,
+    int* split_feat, int* split_bin,
+    int n_level, int p, int n_bins, double lambda, double min_cw, int level_base,
     hipStream_t stream
 ) {
-    int max_nodes = (1 << (max_depth + 1)) - 1;
-    int n_leaves = 1 << max_depth;
-    int leaf_base = (1 << max_depth) - 1;
+    dim3 bl(256); dim3 gr((n_level + 255) / 256);
+    hipLaunchKernelGGL(tb_split_eval_kernel, gr, bl, 0, stream,
+        grad_hist, hess_hist, split_feat, split_bin, n_level, p, n_bins, lambda, min_cw, level_base);
+}
 
-    // Allocate temporaries
-    int* node_assign;  hipMalloc((void**)&node_assign, (size_t)n_tr * sizeof(int));
-    int* sf;           hipMalloc((void**)&sf, (size_t)max_nodes * sizeof(int));
-    int* sb;           hipMalloc((void**)&sb, (size_t)max_nodes * sizeof(int));
-    double* sum_g;     hipMalloc((void**)&sum_g, (size_t)max_nodes * sizeof(double));
-    double* sum_h;     hipMalloc((void**)&sum_h, (size_t)max_nodes * sizeof(double));
-    double* lv;        hipMalloc((void**)&lv, (size_t)max_nodes * sizeof(double));
+extern "C" void launch_tb_repartition(
+    const double* tr_bins, int* node_assign,
+    const int* split_feat, const int* split_bin,
+    int n_tr, int p, hipStream_t stream
+) {
+    dim3 bl(256); dim3 gr((n_tr + 255) / 256);
+    hipLaunchKernelGGL(tb_repartition_kernel, gr, bl, 0, stream,
+        tr_bins, node_assign, split_feat, split_bin, n_tr, p);
+}
 
-    // Largest level determines histogram size
-    size_t max_level = (size_t)(1 << (max_depth - 1));  // deepest split level
-    if (max_depth <= 1) max_level = 1;
-    size_t hist_elems = max_level * p * n_bins;
-    double* gh;  hipMalloc((void**)&gh, hist_elems * sizeof(double));
-    double* hh;  hipMalloc((void**)&hh, hist_elems * sizeof(double));
+extern "C" void launch_tb_leaf_sum(
+    const double* grad, const double* hess, const int* node_assign,
+    double* node_sum_g, double* node_sum_h, int n_tr, hipStream_t stream
+) {
+    dim3 bl(256); dim3 gr((n_tr + 255) / 256);
+    hipLaunchKernelGGL(tb_leaf_sum_kernel, gr, bl, 0, stream,
+        grad, hess, node_assign, node_sum_g, node_sum_h, n_tr);
+}
 
-    hipMemsetAsync(node_assign, 0, (size_t)n_tr * sizeof(int), stream);
-    hipMemsetAsync(sf, 0xFF, (size_t)max_nodes * sizeof(int), stream);  // -1 = leaf sentinel
-    hipMemsetAsync(sb, 0xFF, (size_t)max_nodes * sizeof(int), stream);
+extern "C" void launch_tb_leaf_val(
+    const double* node_sum_g, const double* node_sum_h, double* leaf_val,
+    int n_leaves, int leaf_base, double lambda, hipStream_t stream
+) {
+    dim3 bl(256); dim3 gr((n_leaves + 255) / 256);
+    hipLaunchKernelGGL(tb_leaf_val_kernel, gr, bl, 0, stream,
+        node_sum_g, node_sum_h, leaf_val, n_leaves, leaf_base, lambda);
+}
 
-    dim3 bl(256);
+extern "C" void launch_tb_scatter(
+    const int* node_assign, const double* leaf_val, double* predictions,
+    int n_tr, hipStream_t stream
+) {
+    dim3 bl(256); dim3 gr((n_tr + 255) / 256);
+    hipLaunchKernelGGL(tb_scatter_kernel, gr, bl, 0, stream,
+        node_assign, leaf_val, predictions, n_tr);
+}
 
-    // ── Depth loop ────────────────────────────────────────────────────────
-    for (int d = 0; d < max_depth; d++) {
-        int level_base = (1 << d) - 1;
-        int n_level = 1 << d;
-        size_t lh_bytes = (size_t)n_level * p * n_bins * sizeof(double);
-
-        // Clear histograms for this level
-        hipMemsetAsync(gh, 0, lh_bytes, stream);
-        hipMemsetAsync(hh, 0, lh_bytes, stream);
-
-        // Histogram build
-        int total_nf = n_tr * p;
-        dim3 gr_hist((total_nf + 255) / 256);
-        hipLaunchKernelGGL(tb_histogram_kernel, gr_hist, bl, 0, stream,
-            tr_bins, grad, hess, node_assign, gh, hh, n_tr, p, n_bins, level_base);
-
-        // Split eval
-        dim3 gr_eval((n_level + 255) / 256);
-        hipLaunchKernelGGL(tb_split_eval_kernel, gr_eval, bl, 0, stream,
-            gh, hh, sf, sb, n_level, p, n_bins, lambda, min_cw, level_base);
-
-        // Repartition train
-        dim3 gr_tr((n_tr + 255) / 256);
-        hipLaunchKernelGGL(tb_repartition_kernel, gr_tr, bl, 0, stream,
-            tr_bins, node_assign, sf, sb, n_tr, p);
-    }
-
-    // ── Leaf values ───────────────────────────────────────────────────────
-    hipMemsetAsync(sum_g, 0, (size_t)max_nodes * sizeof(double), stream);
-    hipMemsetAsync(sum_h, 0, (size_t)max_nodes * sizeof(double), stream);
-    hipMemsetAsync(lv, 0, (size_t)max_nodes * sizeof(double), stream);
-
-    dim3 gr_sum((n_tr + 255) / 256);
-    hipLaunchKernelGGL(tb_leaf_sum_kernel, gr_sum, bl, 0, stream,
-        grad, hess, node_assign, sum_g, sum_h, n_tr);
-
-    dim3 gr_lv((max_nodes + 255) / 256);
-    hipLaunchKernelGGL(tb_leaf_val_kernel, gr_lv, bl, 0, stream,
-        sum_g, sum_h, lv, max_nodes, 0, lambda);
-
-    // ── Scatter predictions ───────────────────────────────────────────────
-    hipLaunchKernelGGL(tb_scatter_kernel, gr_sum, bl, 0, stream,
-        node_assign, lv, tr_pred, n_tr);
-
-    // Test: single pass traversal
-    dim3 gr_te((n_te + 255) / 256);
-    hipLaunchKernelGGL(tb_apply_tree_kernel, gr_te, bl, 0, stream,
-        te_bins, sf, sb, lv, te_pred, n_te, p, max_depth);
-
-    // Free temporaries
-    hipFree(node_assign);
-    hipFree(sf); hipFree(sb);
-    hipFree(sum_g); hipFree(sum_h); hipFree(lv);
-    hipFree(gh); hipFree(hh);
+extern "C" void launch_tb_apply_tree(
+    const double* te_bins, const int* split_feat, const int* split_bin,
+    const double* leaf_val, double* predictions,
+    int n_te, int p, int max_depth, hipStream_t stream
+) {
+    dim3 bl(256); dim3 gr((n_te + 255) / 256);
+    hipLaunchKernelGGL(tb_apply_tree_kernel, gr, bl, 0, stream,
+        te_bins, split_feat, split_bin, leaf_val, predictions, n_te, p, max_depth);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

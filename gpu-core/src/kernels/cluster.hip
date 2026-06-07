@@ -31,8 +31,6 @@ extern "C" void launch_fixed_radius_neighbors(
       int n, int dim, double eps, hipStream_t stream
 ) {
       double eps2 = eps * eps;
-      // zero count
-      hipMemset(count, 0, (size_t)n * sizeof(int));
       int total = n * n;
       int threads = 256;
       int blocks = (total + threads - 1) / threads;
@@ -85,42 +83,35 @@ extern "C" __global__ void uf_compress_kernel(int* parent, int n) {
 // After compression: parent[i] is the root. Map roots to compact 0..k-1 labels.
 // We do this on host after downloading parent[].
 
-// Host entry for launch_union_find_cc: loops until no change.
-extern "C" void launch_union_find_cc(
-      const int* edge_src, const int* edge_dst, int* parent_buf,
-      int n_nodes, int n_edges, hipStream_t stream
+// Per-step launchers. Each does only hipLaunchKernelGGL; the Rust caller owns the
+// parent/changed buffers and drives the convergence loop + device->host readback.
+
+extern "C" void launch_uf_init(
+      int* parent, int n_nodes, hipStream_t stream
 ) {
-      // Initialize
-      {
-            int threads = 256;
-            int blocks = (n_nodes + threads - 1) / threads;
-            hipLaunchKernelGGL(uf_init_kernel, dim3(blocks), dim3(threads), 0, stream,
-                  parent_buf, n_nodes);
-      }
-      hipStreamSynchronize(stream);
+      int threads = 256;
+      int blocks = (n_nodes + threads - 1) / threads;
+      hipLaunchKernelGGL(uf_init_kernel, dim3(blocks), dim3(threads), 0, stream,
+            parent, n_nodes);
+}
 
-      // Allocate changed flag on GPU
-      int* d_changed = nullptr;
-      hipMalloc((void**)&d_changed, sizeof(int));
+extern "C" void launch_uf_hook(
+      const int* edge_src, const int* edge_dst, int* parent, int* changed,
+      int n_edges, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks = (n_edges + threads - 1) / threads;
+      hipLaunchKernelGGL(uf_hook_kernel, dim3(blocks), dim3(threads), 0, stream,
+            edge_src, edge_dst, parent, changed, n_edges);
+}
 
-      int threads_e = 256;
-      int blocks_e = (n_edges + threads_e - 1) / threads_e;
-      int threads_n = 256;
-      int blocks_n = (n_nodes + threads_n - 1) / threads_n;
-
-      // Iterate until stable
-      for (int iter = 0; iter < n_nodes + 1; iter++) {
-            hipMemset(d_changed, 0, sizeof(int));
-            hipLaunchKernelGGL(uf_hook_kernel, dim3(blocks_e), dim3(threads_e), 0, stream,
-                  edge_src, edge_dst, parent_buf, d_changed, n_edges);
-            hipLaunchKernelGGL(uf_compress_kernel, dim3(blocks_n), dim3(threads_n), 0, stream,
-                  parent_buf, n_nodes);
-            hipStreamSynchronize(stream);
-            int h_changed = 0;
-            hipMemcpy(&h_changed, d_changed, sizeof(int), hipMemcpyDeviceToHost);
-            if (h_changed == 0) break;
-      }
-      hipFree(d_changed);
+extern "C" void launch_uf_compress(
+      int* parent, int n_nodes, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks = (n_nodes + threads - 1) / threads;
+      hipLaunchKernelGGL(uf_compress_kernel, dim3(blocks), dim3(threads), 0, stream,
+            parent, n_nodes);
 }
 
 // ── Borůvka: find cheapest outgoing edge per component ─────────────────────
@@ -173,145 +164,29 @@ extern "C" __global__ void boruvka_mark_kernel(
       if (e >= 0) in_mst[e] = 1;
 }
 
-// Host-side Borůvka MST loop
-extern "C" void launch_boruvka_mst(
+// Per-step launchers for Borůvka. Each does only hipLaunchKernelGGL. The Rust caller
+// owns parent/best_edge/best_w/in_mst/changed buffers, the round loop, the best_edge
+// reset to -1, the selected-edge dedup, the inner union-find loop, and the host-side
+// MST total-weight reduction with its device<->host readbacks.
+
+extern "C" void launch_boruvka_find_cheapest(
       const int* edge_src, const int* edge_dst, const double* edge_w,
-      unsigned char* in_mst, double* total_weight_buf,
-      int n_nodes, int n_edges, hipStream_t stream
+      const int* parent, int* best_edge, double* best_w,
+      int n_edges, hipStream_t stream
 ) {
-      // Allocate union-find parent array
-      int* parent = nullptr;
-      hipMalloc((void**)&parent, (size_t)n_nodes * sizeof(int));
-      {
-            int threads = 256;
-            int blocks = (n_nodes + threads - 1) / threads;
-            hipLaunchKernelGGL(uf_init_kernel, dim3(blocks), dim3(threads), 0, stream, parent, n_nodes);
-      }
+      int threads = 256;
+      int blocks = (n_edges + threads - 1) / threads;
+      hipLaunchKernelGGL(boruvka_find_cheapest_kernel, dim3(blocks), dim3(threads), 0, stream,
+            edge_src, edge_dst, edge_w, parent, best_edge, best_w, n_edges);
+}
 
-      // Allocate best-edge arrays
-      int* best_edge = nullptr;
-      double* best_w = nullptr;
-      hipMalloc((void**)&best_edge, (size_t)n_nodes * sizeof(int));
-      hipMalloc((void**)&best_w, (size_t)n_nodes * sizeof(double));
-
-      // Also need changed flag for union-find inner loop
-      int* d_changed = nullptr;
-      hipMalloc((void**)&d_changed, sizeof(int));
-
-      hipMemset(in_mst, 0, (size_t)n_edges * sizeof(unsigned char));
-      hipStreamSynchronize(stream);
-
-      int threads_n = 256;
-      int blocks_n  = (n_nodes + threads_n - 1) / threads_n;
-      int threads_e = 256;
-      int blocks_e  = (n_edges + threads_e - 1) / threads_e;
-
-      // Borůvka: at most ceil(log2(n_nodes)) rounds
-      int max_rounds = 0;
-      { int tmp = n_nodes; while (tmp > 1) { tmp = (tmp + 1) / 2; max_rounds++; } if (max_rounds < 1) max_rounds = 1; }
-
-      for (int round = 0; round < max_rounds; round++) {
-            // Init best_edge = -1
-            // hipMemset works on int: -1 in two's complement = 0xFF...FF = memset(ptr, 0xff, ...)
-            hipMemset(best_edge, 0xff, (size_t)n_nodes * sizeof(int));
-            hipStreamSynchronize(stream);
-
-            // Find cheapest outgoing edge per component
-            hipLaunchKernelGGL(boruvka_find_cheapest_kernel, dim3(blocks_e), dim3(threads_e), 0, stream,
-                  edge_src, edge_dst, edge_w, parent, best_edge, best_w, n_edges);
-            hipStreamSynchronize(stream);
-
-            // Check if any component found an outgoing edge
-            // Download best_edge to host and check
-            int* h_best_edge = (int*)malloc((size_t)n_nodes * sizeof(int));
-            hipMemcpy(h_best_edge, best_edge, (size_t)n_nodes * sizeof(int), hipMemcpyDeviceToHost);
-
-            int any_found = 0;
-            for (int c = 0; c < n_nodes; c++) {
-                  if (h_best_edge[c] >= 0) { any_found = 1; break; }
-            }
-            if (!any_found) { free(h_best_edge); break; }
-
-            // Mark edges in MST
-            hipLaunchKernelGGL(boruvka_mark_kernel, dim3(blocks_n), dim3(threads_n), 0, stream,
-                  best_edge, in_mst, n_nodes);
-            hipStreamSynchronize(stream);
-
-            // Merge components via union-find on ONLY the selected cheapest edges.
-            // Build a deduplicated host list of selected edge indices from best_edge.
-            {
-                  // Download edge indices and full edge arrays to host
-                  int* h_src = (int*)malloc((size_t)n_edges * sizeof(int));
-                  int* h_dst = (int*)malloc((size_t)n_edges * sizeof(int));
-                  hipMemcpy(h_src, edge_src, (size_t)n_edges * sizeof(int), hipMemcpyDeviceToHost);
-                  hipMemcpy(h_dst, edge_dst, (size_t)n_edges * sizeof(int), hipMemcpyDeviceToHost);
-
-                  // Collect unique selected edge indices
-                  int* sel_src = (int*)malloc((size_t)n_nodes * sizeof(int));
-                  int* sel_dst = (int*)malloc((size_t)n_nodes * sizeof(int));
-                  int n_sel = 0;
-                  // use a boolean visited array to deduplicate edge indices
-                  unsigned char* seen = (unsigned char*)calloc(n_edges, 1);
-                  for (int c = 0; c < n_nodes; c++) {
-                        int e = h_best_edge[c];
-                        if (e >= 0 && !seen[e]) {
-                              seen[e] = 1;
-                              sel_src[n_sel] = h_src[e];
-                              sel_dst[n_sel] = h_dst[e];
-                              n_sel++;
-                        }
-                  }
-                  free(seen);
-                  free(h_src);
-                  free(h_dst);
-
-                  if (n_sel > 0) {
-                        // Upload selected edges and run UF only on them
-                        int* d_sel_src = nullptr;
-                        int* d_sel_dst = nullptr;
-                        hipMalloc((void**)&d_sel_src, (size_t)n_sel * sizeof(int));
-                        hipMalloc((void**)&d_sel_dst, (size_t)n_sel * sizeof(int));
-                        hipMemcpy(d_sel_src, sel_src, (size_t)n_sel * sizeof(int), hipMemcpyHostToDevice);
-                        hipMemcpy(d_sel_dst, sel_dst, (size_t)n_sel * sizeof(int), hipMemcpyHostToDevice);
-
-                        int thr_sel = 256;
-                        int blk_sel = (n_sel + thr_sel - 1) / thr_sel;
-                        for (int iter = 0; iter < n_nodes + 1; iter++) {
-                              hipMemset(d_changed, 0, sizeof(int));
-                              hipLaunchKernelGGL(uf_hook_kernel, dim3(blk_sel), dim3(thr_sel), 0, stream,
-                                    d_sel_src, d_sel_dst, parent, d_changed, n_sel);
-                              hipLaunchKernelGGL(uf_compress_kernel, dim3(blocks_n), dim3(threads_n), 0, stream,
-                                    parent, n_nodes);
-                              hipStreamSynchronize(stream);
-                              int h_changed = 0;
-                              hipMemcpy(&h_changed, d_changed, sizeof(int), hipMemcpyDeviceToHost);
-                              if (h_changed == 0) break;
-                        }
-                        hipFree(d_sel_src);
-                        hipFree(d_sel_dst);
-                  }
-                  free(sel_src);
-                  free(sel_dst);
-            }
-            free(h_best_edge);
-      }
-
-      // Compute total MST weight on host
-      unsigned char* h_in_mst = (unsigned char*)malloc((size_t)n_edges * sizeof(unsigned char));
-      double* h_w = (double*)malloc((size_t)n_edges * sizeof(double));
-      hipMemcpy(h_in_mst, in_mst, (size_t)n_edges * sizeof(unsigned char), hipMemcpyDeviceToHost);
-      hipMemcpy(h_w, edge_w, (size_t)n_edges * sizeof(double), hipMemcpyDeviceToHost);
-      double total = 0.0;
-      for (int e = 0; e < n_edges; e++) if (h_in_mst[e]) total += h_w[e];
-      free(h_in_mst);
-      free(h_w);
-      // Write total weight to single-element output
-      hipMemcpy(total_weight_buf, &total, sizeof(double), hipMemcpyHostToDevice);
-
-      hipFree(parent);
-      hipFree(best_edge);
-      hipFree(best_w);
-      hipFree(d_changed);
+extern "C" void launch_boruvka_mark(
+      const int* best_edge, unsigned char* in_mst, int n_nodes, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks = (n_nodes + threads - 1) / threads;
+      hipLaunchKernelGGL(boruvka_mark_kernel, dim3(blocks), dim3(threads), 0, stream,
+            best_edge, in_mst, n_nodes);
 }
 
 // ── Core distance: distance to min_pts-th nearest neighbor ─────────────────

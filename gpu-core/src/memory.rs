@@ -1,30 +1,17 @@
 use std::ffi::c_void;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::hip::*;
 
-unsafe extern "C" {
-      fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, size: usize, kind: i32, stream: *mut c_void) -> i32;
-}
-
-static SPILL_MODE: AtomicBool = AtomicBool::new(false);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn alloc_count_reset() -> usize {
       ALLOC_COUNT.swap(0, Ordering::Relaxed)
 }
 
-const HIP_MEM_ATTACH_GLOBAL: u32 = 0x01;
-
-unsafe extern "C" {
-      fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
-}
-
-static GC_HOOK: OnceLock<fn()> = OnceLock::new();
-
-pub fn set_gc_hook(hook: fn()) {
-      let _ = GC_HOOK.set(hook);
-}
+const ARENA_ALIGN: usize = 256;
+static ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
+static ARENA_SIZE: AtomicUsize = AtomicUsize::new(0);
+static ARENA_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 pub struct GpuBuffer {
       pub(crate) ptr: *mut c_void,
@@ -44,41 +31,41 @@ impl GpuBuffer {
             Self::alloc_bytes(n_floats * std::mem::size_of::<f64>())
       }
 
-      pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
-            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            let mut ptr: *mut c_void = std::ptr::null_mut();
+      pub fn alloc_checked(n_bytes: usize) -> Result<(), HipError> {
             let mut free: usize = 0;
             let mut total: usize = 0;
-            unsafe { hipMemGetInfo(&mut free, &mut total) };
-            let mut used = total - free;
+            check(unsafe { hipMemGetInfo(&mut free, &mut total) })?;
+            if (total - free) + n_bytes > total * 90 / 100 {
+                  return Err(HipError(2));
+            }
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            check(unsafe { hipMalloc(&mut ptr, n_bytes) })?;
+            ARENA_BASE.store(ptr as usize, Ordering::Relaxed);
+            ARENA_SIZE.store(n_bytes, Ordering::Relaxed);
+            ARENA_OFFSET.store(0, Ordering::Relaxed);
+            Ok(())
+      }
 
-            if SPILL_MODE.load(Ordering::Relaxed) {
-                  if used < total * 70 / 100 {
-                        SPILL_MODE.store(false, Ordering::Relaxed);
-                  } else {
-                        check(unsafe { hipMallocManaged(&mut ptr, n_bytes, HIP_MEM_ATTACH_GLOBAL) })?;
-                        return Ok(Self { ptr, len: n_bytes, owned: true });
+      pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            let base = ARENA_BASE.load(Ordering::Relaxed);
+            if base != 0 {
+                  let size = ARENA_SIZE.load(Ordering::Relaxed);
+                  let aligned = (n_bytes + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1);
+                  let mut off = ARENA_OFFSET.load(Ordering::Relaxed);
+                  while off + aligned <= size {
+                        match ARENA_OFFSET.compare_exchange_weak(
+                              off, off + aligned, Ordering::Relaxed, Ordering::Relaxed) {
+                              Ok(_) => {
+                                    let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
+                                    return Ok(Self { ptr, len: n_bytes, owned: false });
+                              }
+                              Err(cur) => off = cur,
+                        }
                   }
             }
-
-            if used + n_bytes <= total * 90 / 100 {
-                  check(unsafe { hipMalloc(&mut ptr, n_bytes) })?;
-                  return Ok(Self { ptr, len: n_bytes, owned: true });
-            }
-
-            if let Some(gc) = GC_HOOK.get() {
-                  gc();
-            }
-            unsafe { hipMemGetInfo(&mut free, &mut total) };
-            used = total - free;
-
-            if used + n_bytes <= total * 90 / 100 {
-                  check(unsafe { hipMalloc(&mut ptr, n_bytes) })?;
-                  return Ok(Self { ptr, len: n_bytes, owned: true });
-            }
-
-            SPILL_MODE.store(true, Ordering::Relaxed);
-            check(unsafe { hipMallocManaged(&mut ptr, n_bytes, HIP_MEM_ATTACH_GLOBAL) })?;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            check(unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) })?;
             Ok(Self { ptr, len: n_bytes, owned: true })
       }
 
@@ -245,7 +232,7 @@ impl GpuBuffer {
 impl Drop for GpuBuffer {
       fn drop(&mut self) {
             if self.owned && !self.ptr.is_null() {
-                  unsafe { hipFree(self.ptr) };
+                  unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
                   self.ptr = std::ptr::null_mut();
             }
       }

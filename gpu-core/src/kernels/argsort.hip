@@ -7,41 +7,34 @@ __global__ void init_indices_kernel(int* indices, int n) {
     if (i < n) indices[i] = i;
 }
 
+// Workspace size (bytes) for the hipCUB radix sort over n pairs.
+// Caller queries this, allocates the temp buffer, and passes it to launch_partial_argsort.
+extern "C" size_t partial_argsort_workspace_bytes(int n) {
+    size_t temp_bytes = 0;
+    hipcub::DeviceRadixSort::SortPairs(
+        nullptr, temp_bytes,
+        (const double*)nullptr, (double*)nullptr,
+        (const int*)nullptr, (int*)nullptr,
+        n, 0, sizeof(double) * 8);
+    return temp_bytes;
+}
+
 extern "C" void launch_partial_argsort(
-    const double* data, int* indices, int n, int k, hipStream_t stream
+    const double* data, int* indices,
+    double* keys_out, int* vals_in, void* temp, size_t temp_bytes,
+    int n, hipStream_t stream
 ) {
-    // Allocate device buffers for sort
-    double* keys_in  = nullptr;
-    double* keys_out = nullptr;
-    int*    vals_out = nullptr;
-
-    hipMalloc(&keys_in,  n * sizeof(double));
-    hipMalloc(&keys_out, n * sizeof(double));
-    hipMalloc(&vals_out, n * sizeof(int));
-
-    // Copy input keys and initialize value indices
-    hipMemcpyAsync(keys_in, data, n * sizeof(double), hipMemcpyDeviceToDevice, stream);
     dim3 block(256);
     dim3 grid((n + 255) / 256);
-    hipLaunchKernelGGL(init_indices_kernel, grid, block, 0, stream, indices, n);
+    hipLaunchKernelGGL(init_indices_kernel, grid, block, 0, stream, vals_in, n);
 
-    // Query temp storage size
-    size_t temp_bytes = 0;
-    hipcub::DeviceRadixSort::SortPairs(nullptr, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
-
-    void* temp = nullptr;
-    hipMalloc(&temp, temp_bytes);
-
-    // Sort ascending (smallest first = nearest neighbors)
-    hipcub::DeviceRadixSort::SortPairs(temp, temp_bytes, keys_in, keys_out, indices, vals_out, n, 0, sizeof(double) * 8, stream);
-
-    // Copy top-k sorted indices back
-    hipMemcpyAsync(indices, vals_out, k * sizeof(int), hipMemcpyDeviceToDevice, stream);
-
-    hipFree(temp);
-    hipFree(keys_in);
-    hipFree(keys_out);
-    hipFree(vals_out);
+    // Sort ascending (smallest first = nearest neighbors).
+    // data is the const key input; sorted value-indices land directly in `indices`.
+    hipcub::DeviceRadixSort::SortPairs(
+        temp, temp_bytes,
+        data, keys_out,
+        vals_in, indices,
+        n, 0, sizeof(double) * 8, stream);
 }
 
 // Per-row top-k: for each row of (rows x cols) distance matrix,

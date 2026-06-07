@@ -37,3 +37,6 @@ lto = "thin"
 
 [profile.dev]
 opt-level = 1
+
+[profile.dev.package."*"]
+debug = false

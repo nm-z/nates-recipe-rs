@@ -7,75 +7,73 @@
 // (DeviceSelect::Unique / DeviceRunLengthEncode::Encode); sorting to
 // DeviceRadixSort. Oracle for all = CPU set ops (see tests/prove_set.rs).
 //
-// Variable-length outputs: each launcher writes into a caller pre-allocated
-// device buffer (capacity n) and reports the produced length via a device
-// int* out_count that hipcub fills (d_num_selected). isin is fixed length na.
+// Zero HIP memory APIs in this file. Every buffer is caller-allocated:
+//   - variable-length output buffer (capacity n) + a device int* out_count
+//     that hipcub fills (d_num_selected),
+//   - the sorted intermediate (keys_sorted / b_sorted, capacity n / nb),
+//   - the hipcub temp workspace (tmp, tmp_bytes). Its size comes from the
+//     matching launch_*_workspace_bytes() query, which the Rust caller calls
+//     first to size the allocation. One workspace is reused across the two
+//     sequential hipcub calls (sort then select/encode) sized to their max.
+// hipcub takes the const input directly, so no device-to-device input copy.
 
 // ── unique_consecutive: collapse ADJACENT duplicates only (no sort) ──
 // out[0..*out_count) = run-leaders of x in original order.
-extern "C" void launch_setx_unique_consecutive(
-      const double* x, double* out, int* out_count, int n, hipStream_t s) {
-      double* in = nullptr;
-      hipMalloc(&in, (size_t)n * sizeof(double));
-      hipMemcpyAsync(in, x, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, s);
+extern "C" size_t launch_setx_unique_consecutive_workspace_bytes(int n) {
       size_t tmp_bytes = 0;
-      hipcub::DeviceSelect::Unique(nullptr, tmp_bytes, in, out, out_count, n, s);
-      void* tmp = nullptr;
-      hipMalloc(&tmp, tmp_bytes);
-      hipcub::DeviceSelect::Unique(tmp, tmp_bytes, in, out, out_count, n, s);
-      hipFree(tmp);
-      hipFree(in);
+      hipcub::DeviceSelect::Unique(
+            nullptr, tmp_bytes,
+            (const double*)nullptr, (double*)nullptr, (int*)nullptr, n, (hipStream_t)0);
+      return tmp_bytes;
+}
+
+extern "C" void launch_setx_unique_consecutive(
+      const double* x, double* out, int* out_count,
+      void* tmp, size_t tmp_bytes, int n, hipStream_t s) {
+      hipcub::DeviceSelect::Unique(tmp, tmp_bytes, x, out, out_count, n, s);
 }
 
 // ── unique: sorted distinct = radix sort then adjacent dedup ──
-extern "C" void launch_setx_unique(
-      const double* x, double* out, int* out_count, int n, hipStream_t s) {
-      double* keys_in  = nullptr;
-      double* keys_sorted = nullptr;
-      hipMalloc(&keys_in,     (size_t)n * sizeof(double));
-      hipMalloc(&keys_sorted, (size_t)n * sizeof(double));
-      hipMemcpyAsync(keys_in, x, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, s);
-      // sort ascending
+extern "C" size_t launch_setx_unique_workspace_bytes(int n) {
       size_t sort_bytes = 0;
-      hipcub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, keys_in, keys_sorted, n, 0, sizeof(double) * 8, s);
-      void* sort_tmp = nullptr;
-      hipMalloc(&sort_tmp, sort_bytes);
-      hipcub::DeviceRadixSort::SortKeys(sort_tmp, sort_bytes, keys_in, keys_sorted, n, 0, sizeof(double) * 8, s);
-      hipFree(sort_tmp);
-      // adjacent dedup on the sorted array == global distinct
+      hipcub::DeviceRadixSort::SortKeys(
+            nullptr, sort_bytes,
+            (const double*)nullptr, (double*)nullptr, n, 0, (int)sizeof(double) * 8, (hipStream_t)0);
       size_t sel_bytes = 0;
-      hipcub::DeviceSelect::Unique(nullptr, sel_bytes, keys_sorted, out, out_count, n, s);
-      void* sel_tmp = nullptr;
-      hipMalloc(&sel_tmp, sel_bytes);
-      hipcub::DeviceSelect::Unique(sel_tmp, sel_bytes, keys_sorted, out, out_count, n, s);
-      hipFree(sel_tmp);
-      hipFree(keys_sorted);
-      hipFree(keys_in);
+      hipcub::DeviceSelect::Unique(
+            nullptr, sel_bytes,
+            (const double*)nullptr, (double*)nullptr, (int*)nullptr, n, (hipStream_t)0);
+      return sort_bytes > sel_bytes ? sort_bytes : sel_bytes;
+}
+
+extern "C" void launch_setx_unique(
+      const double* x, double* keys_sorted, double* out, int* out_count,
+      void* tmp, size_t tmp_bytes, int n, hipStream_t s) {
+      // sort ascending
+      hipcub::DeviceRadixSort::SortKeys(tmp, tmp_bytes, x, keys_sorted, n, 0, sizeof(double) * 8, s);
+      // adjacent dedup on the sorted array == global distinct
+      hipcub::DeviceSelect::Unique(tmp, tmp_bytes, keys_sorted, out, out_count, n, s);
 }
 
 // ── unique_counts: sorted distinct values + their multiplicities ──
 // vals_out[0..*out_count) sorted distinct; counts_out[i] = # occurrences.
-extern "C" void launch_setx_unique_counts(
-      const double* x, double* vals_out, int* counts_out, int* out_count, int n, hipStream_t s) {
-      double* keys_in     = nullptr;
-      double* keys_sorted = nullptr;
-      hipMalloc(&keys_in,     (size_t)n * sizeof(double));
-      hipMalloc(&keys_sorted, (size_t)n * sizeof(double));
-      hipMemcpyAsync(keys_in, x, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, s);
+extern "C" size_t launch_setx_unique_counts_workspace_bytes(int n) {
       size_t sort_bytes = 0;
-      hipcub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, keys_in, keys_sorted, n, 0, sizeof(double) * 8, s);
-      void* sort_tmp = nullptr;
-      hipMalloc(&sort_tmp, sort_bytes);
-      hipcub::DeviceRadixSort::SortKeys(sort_tmp, sort_bytes, keys_in, keys_sorted, n, 0, sizeof(double) * 8, s);
-      hipFree(sort_tmp);
+      hipcub::DeviceRadixSort::SortKeys(
+            nullptr, sort_bytes,
+            (const double*)nullptr, (double*)nullptr, n, 0, (int)sizeof(double) * 8, (hipStream_t)0);
       size_t rle_bytes = 0;
-      hipcub::DeviceRunLengthEncode::Encode(nullptr, rle_bytes, keys_sorted, vals_out, counts_out, out_count, n, s);
-      void* rle_tmp = nullptr;
-      hipMalloc(&rle_tmp, rle_bytes);
-      hipcub::DeviceRunLengthEncode::Encode(rle_tmp, rle_bytes, keys_sorted, vals_out, counts_out, out_count, n, s);
-      hipFree(rle_tmp);
-      hipFree(keys_sorted);
-      hipFree(keys_in);
+      hipcub::DeviceRunLengthEncode::Encode(
+            nullptr, rle_bytes,
+            (const double*)nullptr, (double*)nullptr, (int*)nullptr, (int*)nullptr, n, (hipStream_t)0);
+      return sort_bytes > rle_bytes ? sort_bytes : rle_bytes;
+}
+
+extern "C" void launch_setx_unique_counts(
+      const double* x, double* keys_sorted, double* vals_out, int* counts_out, int* out_count,
+      void* tmp, size_t tmp_bytes, int n, hipStream_t s) {
+      hipcub::DeviceRadixSort::SortKeys(tmp, tmp_bytes, x, keys_sorted, n, 0, sizeof(double) * 8, s);
+      hipcub::DeviceRunLengthEncode::Encode(tmp, tmp_bytes, keys_sorted, vals_out, counts_out, out_count, n, s);
 }
 
 // ── isin: mask[i] = (a[i] in b) ? 1.0 : 0.0, via sort(b) + binary search ──
@@ -93,21 +91,18 @@ extern "C" __global__ void setx_isin_kernel(
       mask[i] = (lo < nb && b_sorted[lo] == key) ? 1.0 : 0.0;
 }
 
-extern "C" void launch_setx_isin(
-      const double* a, const double* b, double* mask, int na, int nb, hipStream_t s) {
-      double* b_in     = nullptr;
-      double* b_sorted = nullptr;
-      hipMalloc(&b_in,     (size_t)nb * sizeof(double));
-      hipMalloc(&b_sorted, (size_t)nb * sizeof(double));
-      hipMemcpyAsync(b_in, b, (size_t)nb * sizeof(double), hipMemcpyDeviceToDevice, s);
+extern "C" size_t launch_setx_isin_workspace_bytes(int nb) {
       size_t sort_bytes = 0;
-      hipcub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, b_in, b_sorted, nb, 0, sizeof(double) * 8, s);
-      void* sort_tmp = nullptr;
-      hipMalloc(&sort_tmp, sort_bytes);
-      hipcub::DeviceRadixSort::SortKeys(sort_tmp, sort_bytes, b_in, b_sorted, nb, 0, sizeof(double) * 8, s);
-      hipFree(sort_tmp);
+      hipcub::DeviceRadixSort::SortKeys(
+            nullptr, sort_bytes,
+            (const double*)nullptr, (double*)nullptr, nb, 0, (int)sizeof(double) * 8, (hipStream_t)0);
+      return sort_bytes;
+}
+
+extern "C" void launch_setx_isin(
+      const double* a, const double* b, double* b_sorted, double* mask,
+      void* tmp, size_t tmp_bytes, int na, int nb, hipStream_t s) {
+      hipcub::DeviceRadixSort::SortKeys(tmp, tmp_bytes, b, b_sorted, nb, 0, sizeof(double) * 8, s);
       dim3 block(256); dim3 grid((na + 255) / 256);
       hipLaunchKernelGGL(setx_isin_kernel, grid, block, 0, s, a, b_sorted, mask, na, nb);
-      hipFree(b_sorted);
-      hipFree(b_in);
 }

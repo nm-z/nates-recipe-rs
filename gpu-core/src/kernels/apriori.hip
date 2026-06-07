@@ -32,11 +32,12 @@ __global__ void itemset_support_kernel(
     if (present) atomicAdd(&counts[c], 1.0);
 }
 
+// Caller must zero `counts` (n_cands doubles) before this launch — the kernel
+// only atomicAdds into it.
 extern "C" void launch_itemset_support(
     const double* trans, const double* cands, double* counts,
     int n_trans, int n_items, int n_cands, int k, hipStream_t stream
 ) {
-    hipMemsetAsync(counts, 0, (size_t)n_cands * sizeof(double), stream);
     int total = n_trans * n_cands;
     dim3 bl(256); dim3 gr((total + 255) / 256);
     hipLaunchKernelGGL(itemset_support_kernel, gr, bl, 0, stream,
@@ -55,7 +56,9 @@ extern "C" void launch_itemset_support(
 // and freq[i][k-1] < freq[j][k-1], emit candidate = freq[i] ∪ {freq[j][k-1]}.
 //
 // Two-pass: pass 1 counts how many candidates (atomic), pass 2 writes them.
-// We expose both passes as one function — caller provides pre-allocated output.
+// Each pass is its own per-step launcher. The caller allocates the device
+// counter, zeros it before each pass, reads the count back to host between
+// passes (device->host), and frees it. No HIP memory API lives here.
 
 __global__ void candidate_generate_count_kernel(
     const double* freq, int n_freq, int k, int* count
@@ -116,34 +119,26 @@ __global__ void candidate_generate_write_kernel(
     row[k] = b[k - 1];
 }
 
-// Returns the number of candidates generated (host int).
-// Caller must provide output buffer large enough (worst case: n_freq*(n_freq-1)/2 rows of k+1).
-extern "C" int launch_candidate_generate(
-    const double* freq, double* out,
-    int n_freq, int k, hipStream_t stream
+// Pass 1: count candidates. Caller zeros `count` (1 int) before launching,
+// then reads it back to host to size the output and decide whether to write.
+extern "C" void launch_candidate_generate_count(
+    const double* freq, int n_freq, int k, int* count, hipStream_t stream
 ) {
     int n_pairs = n_freq * (n_freq - 1) / 2;
-    if (n_pairs == 0) return 0;
-
-    // Count pass
-    int* d_count = nullptr;
-    hipMalloc(&d_count, sizeof(int));
-    hipMemsetAsync(d_count, 0, sizeof(int), stream);
+    if (n_pairs == 0) return;
     dim3 bl(256); dim3 gr((n_pairs + 255) / 256);
     hipLaunchKernelGGL(candidate_generate_count_kernel, gr, bl, 0, stream,
-        freq, n_freq, k, d_count);
+        freq, n_freq, k, count);
+}
 
-    int h_count = 0;
-    hipMemcpyAsync(&h_count, d_count, sizeof(int), hipMemcpyDeviceToHost, stream);
-    hipStreamSynchronize(stream);
-
-    if (h_count == 0) { hipFree(d_count); return 0; }
-
-    // Write pass — reuse d_count as write position (reset to 0)
-    hipMemsetAsync(d_count, 0, sizeof(int), stream);
+// Pass 2: write candidates. Caller zeros `write_pos` (1 int) before launching
+// and provides `out` sized for the count from pass 1 (k+1 doubles per row).
+extern "C" void launch_candidate_generate_write(
+    const double* freq, double* out, int n_freq, int k, int* write_pos, hipStream_t stream
+) {
+    int n_pairs = n_freq * (n_freq - 1) / 2;
+    if (n_pairs == 0) return;
+    dim3 bl(256); dim3 gr((n_pairs + 255) / 256);
     hipLaunchKernelGGL(candidate_generate_write_kernel, gr, bl, 0, stream,
-        freq, out, n_freq, k, d_count);
-    hipStreamSynchronize(stream);
-    hipFree(d_count);
-    return h_count;
+        freq, out, n_freq, k, write_pos);
 }

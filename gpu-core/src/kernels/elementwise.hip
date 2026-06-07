@@ -1228,7 +1228,6 @@ extern "C" __global__ void col2im_1d_kernel(
 extern "C" void launch_col2im_1d(
     const double* patches, double* out, int n, int p, int ks, int out_len, hipStream_t stream
 ) {
-    hipMemsetAsync(out, 0, (size_t)n * p * sizeof(double), stream);
     int total = n * out_len * ks;
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(col2im_1d_kernel, grid, block, 0, stream, patches, out, n, p, ks, out_len);
@@ -1264,7 +1263,6 @@ extern "C" void launch_col2im_2d(
     const double* patches, double* out,
     int N, int C, int H, int W, int kH, int kW, int outH, int outW, hipStream_t stream
 ) {
-    hipMemsetAsync(out, 0, (size_t)N * C * H * W * sizeof(double), stream);
     int total = N * outH * outW * C * kH * kW;
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(col2im_2d_kernel, grid, block, 0, stream, patches, out, N, C, H, W, kH, kW, outH, outW);
@@ -1316,7 +1314,6 @@ extern "C" __global__ void max_pool_1d_backward_kernel(
 extern "C" void launch_max_pool_1d_backward(
     const double* grad, const double* indices, double* out, int n, int out_len, int n_filters, hipStream_t stream
 ) {
-    hipMemsetAsync(out, 0, (size_t)n * out_len * n_filters * sizeof(double), stream);
     int total = n * n_filters;
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(max_pool_1d_backward_kernel, grid, block, 0, stream, grad, indices, out, n, out_len, n_filters);
@@ -1385,7 +1382,6 @@ extern "C" void launch_avg_pool_2d_backward(
     const double* grad_out, double* grad_in,
     int N, int C, int H, int W, int kH, int kW, int sH, int sW, int outH, int outW, hipStream_t stream
 ) {
-    hipMemsetAsync(grad_in, 0, (size_t)N * C * H * W * sizeof(double), stream);
     int total = N * C * outH * outW;
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(avg_pool_2d_backward_kernel, grid, block, 0, stream, grad_out, grad_in, N, C, H, W, kH, kW, sH, sW, outH, outW);
@@ -1448,7 +1444,6 @@ extern "C" void launch_max_pool_2d_backward(
     const double* grad_out, const double* indices, double* grad_in,
     int N, int C, int outH, int outW, int H, int W, hipStream_t stream
 ) {
-    hipMemsetAsync(grad_in, 0, (size_t)N * C * H * W * sizeof(double), stream);
     int total = N * C * outH * outW;
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(max_pool_2d_backward_kernel, grid, block, 0, stream, grad_out, indices, grad_in, N, C, outH, outW, H * W);
@@ -1751,8 +1746,6 @@ extern "C" void launch_layernorm_backward(
     double* grad_x, double* grad_gamma, double* grad_beta,
     int rows, int cols, double eps, hipStream_t stream
 ) {
-    hipMemsetAsync(grad_gamma, 0, (size_t)cols * sizeof(double), stream);
-    hipMemsetAsync(grad_beta, 0, (size_t)cols * sizeof(double), stream);
     int threads = min(256, max(32, cols));
     hipLaunchKernelGGL(layernorm_backward_kernel, dim3(rows), dim3(threads), 0, stream,
         grad_y, x, gamma, grad_x, grad_gamma, grad_beta, rows, cols, eps);
@@ -1932,7 +1925,6 @@ extern "C" __global__ void clip_by_norm_kernel(double* x, const double* norm_sq,
 }
 
 extern "C" void launch_grad_clip_norm(double* x, double* tmp, int n, double max_norm, hipStream_t stream) {
-    hipMemsetAsync(tmp, 0, sizeof(double), stream);
     dim3 bl(256); dim3 gr((n+255)/256);
     hipLaunchKernelGGL(reduce_sum_sq_kernel, gr, bl, 0, stream, (const double*)x, tmp, n);
     hipLaunchKernelGGL(clip_by_norm_kernel, gr, bl, 0, stream, x, tmp, n, max_norm);

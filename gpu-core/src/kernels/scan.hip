@@ -4,77 +4,96 @@
 #include <float.h>
 
 // ── Scalar all-reduce helpers ────────────────────────────────────────────────
-// Signature: reduce(tmp_ptr, tmp_bytes, input, output, initial_value, size, op, stream)
+// rocprim temps are caller-allocated. <fn>_workspace_bytes(n) returns the byte
+// size to allocate; pass that buffer + its size into the launch wrapper.
+// Synchronization and the scalar download are owned by the Rust caller.
 
-extern "C" void launch_sum_all(const double* x, double* out, int n, hipStream_t stream) {
+extern "C" size_t launch_sum_all_workspace_bytes(int n) {
       size_t tmp = 0;
-      rocprim::reduce(nullptr, tmp, x, out, 0.0, (size_t)n, rocprim::plus<double>(), stream);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::reduce(d, tmp, x, out, 0.0, (size_t)n, rocprim::plus<double>(), stream);
-      hipStreamSynchronize(stream);
-      hipFree(d);
+      rocprim::reduce(nullptr, tmp, (const double*)nullptr, (double*)nullptr, 0.0, (size_t)n, rocprim::plus<double>(), hipStream_t(0));
+      return tmp;
 }
 
-extern "C" void launch_max_all(const double* x, double* out, int n, hipStream_t stream) {
-      size_t tmp = 0;
-      rocprim::reduce(nullptr, tmp, x, out, -DBL_MAX, (size_t)n, rocprim::maximum<double>(), stream);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::reduce(d, tmp, x, out, -DBL_MAX, (size_t)n, rocprim::maximum<double>(), stream);
-      hipStreamSynchronize(stream);
-      hipFree(d);
+extern "C" void launch_sum_all(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      size_t tmp = workspace_bytes;
+      rocprim::reduce(workspace, tmp, x, out, 0.0, (size_t)n, rocprim::plus<double>(), stream);
 }
 
-extern "C" void launch_min_all(const double* x, double* out, int n, hipStream_t stream) {
+extern "C" size_t launch_max_all_workspace_bytes(int n) {
       size_t tmp = 0;
-      rocprim::reduce(nullptr, tmp, x, out, DBL_MAX, (size_t)n, rocprim::minimum<double>(), stream);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::reduce(d, tmp, x, out, DBL_MAX, (size_t)n, rocprim::minimum<double>(), stream);
-      hipStreamSynchronize(stream);
-      hipFree(d);
+      rocprim::reduce(nullptr, tmp, (const double*)nullptr, (double*)nullptr, -DBL_MAX, (size_t)n, rocprim::maximum<double>(), hipStream_t(0));
+      return tmp;
+}
+
+extern "C" void launch_max_all(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      size_t tmp = workspace_bytes;
+      rocprim::reduce(workspace, tmp, x, out, -DBL_MAX, (size_t)n, rocprim::maximum<double>(), stream);
+}
+
+extern "C" size_t launch_min_all_workspace_bytes(int n) {
+      size_t tmp = 0;
+      rocprim::reduce(nullptr, tmp, (const double*)nullptr, (double*)nullptr, DBL_MAX, (size_t)n, rocprim::minimum<double>(), hipStream_t(0));
+      return tmp;
+}
+
+extern "C" void launch_min_all(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      size_t tmp = workspace_bytes;
+      rocprim::reduce(workspace, tmp, x, out, DBL_MAX, (size_t)n, rocprim::minimum<double>(), stream);
 }
 
 // mean_all: caller downloads out[0] and divides by n (avoids a second kernel)
-extern "C" void launch_mean_all(const double* x, double* out, int n, hipStream_t stream) {
-      launch_sum_all(x, out, n, stream);
+extern "C" size_t launch_mean_all_workspace_bytes(int n) {
+      return launch_sum_all_workspace_bytes(n);
 }
 
-// L2 norm: sum(x^2) — caller downloads and takes sqrt
+extern "C" void launch_mean_all(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      launch_sum_all(x, out, workspace, workspace_bytes, n, stream);
+}
+
+// L2 norm: sum(x^2) — caller downloads and takes sqrt.
+// sq is a caller-allocated n-double scratch buffer for the squared values.
 __global__ void square_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = x[i] * x[i];
 }
 
-extern "C" void launch_l2_norm(const double* x, double* out, int n, hipStream_t stream) {
-      double* sq = nullptr;
-      hipMalloc(&sq, (size_t)n * sizeof(double));
-      dim3 b(256), g((n + 255) / 256);
-      hipLaunchKernelGGL(square_kernel, g, b, 0, stream, x, sq, n);
-      launch_sum_all(sq, out, n, stream);
-      hipFree(sq);
+extern "C" size_t launch_l2_norm_workspace_bytes(int n) {
+      return launch_sum_all_workspace_bytes(n);
 }
 
-// Dot product: sum(a*b) — caller downloads out[0]
+extern "C" void launch_l2_norm(const double* x, double* sq, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      dim3 b(256), g((n + 255) / 256);
+      hipLaunchKernelGGL(square_kernel, g, b, 0, stream, x, sq, n);
+      launch_sum_all(sq, out, workspace, workspace_bytes, n, stream);
+}
+
+// Dot product: sum(a*b) — caller downloads out[0].
+// prod is a caller-allocated n-double scratch buffer for the products.
 __global__ void mul_kernel_dot(const double* a, const double* b, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = a[i] * b[i];
 }
 
-extern "C" void launch_dot(const double* a, const double* b, double* out, int n, hipStream_t stream) {
-      double* prod = nullptr;
-      hipMalloc(&prod, (size_t)n * sizeof(double));
+extern "C" size_t launch_dot_workspace_bytes(int n) {
+      return launch_sum_all_workspace_bytes(n);
+}
+
+extern "C" void launch_dot(const double* a, const double* b, double* prod, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
       dim3 b2(256), g2((n + 255) / 256);
       hipLaunchKernelGGL(mul_kernel_dot, g2, b2, 0, stream, a, b, prod, n);
-      launch_sum_all(prod, out, n, stream);
-      hipFree(prod);
+      launch_sum_all(prod, out, workspace, workspace_bytes, n, stream);
 }
 
 // ── Bitonic sort ─────────────────────────────────────────────────────────────
 // Pads to next power-of-two with +INF sentinels (ascending sort).
 // Padded slots are filled with DBL_MAX so they sink to the tail.
 // After sort, only the first n elements are valid.
+//
+// The count loop (over k, j) and the D2D copies into/out of the work buffer are
+// owned by the Rust caller. The caller allocates the padded work buffer(s)
+// (pn = next_pow2(n) elements), copies the input in, calls launch_fill_sentinel
+// (and launch_init_idx for argsort), then drives the bitonic step launcher in
+// the nested k/j loop, then copies the first n elements back out.
 
 __global__ void bitonic_step_kernel(double* data, int j, int k, int padded_n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,58 +134,27 @@ __global__ void fill_sentinel_kernel(double* data, int real_n, int padded_n, dou
       if (i >= real_n && i < padded_n) data[i] = sentinel;
 }
 
-static int next_pow2(int n) {
-      int p = 1;
-      while (p < n) p <<= 1;
-      return p;
+extern "C" void launch_fill_sentinel(double* data, int real_n, int padded_n, double sentinel, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(fill_sentinel_kernel, g, b, 0, stream, data, real_n, padded_n, sentinel);
 }
 
-extern "C" void launch_sort(const double* x, double* out, int n, hipStream_t stream) {
-      int pn = next_pow2(n);
-      double* work = nullptr;
-      hipMalloc(&work, (size_t)pn * sizeof(double));
-      hipMemcpyAsync(work, x, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      if (pn > n) {
-            dim3 bg((pn + 255) / 256);
-            hipLaunchKernelGGL(fill_sentinel_kernel, bg, dim3(256), 0, stream, work, n, pn, DBL_MAX);
-      }
-      dim3 b(256), g((pn + 255) / 256);
-      for (int k = 2; k <= pn; k <<= 1) {
-            for (int j = k >> 1; j > 0; j >>= 1) {
-                  hipLaunchKernelGGL(bitonic_step_kernel, g, b, 0, stream, work, j, k, pn);
-            }
-      }
-      hipMemcpyAsync(out, work, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      hipStreamSynchronize(stream);
-      hipFree(work);
+extern "C" void launch_init_idx(int* idx, int n, hipStream_t stream) {
+      dim3 b(256), g((n + 255) / 256);
+      hipLaunchKernelGGL(init_idx_kernel, g, b, 0, stream, idx, n);
 }
 
-extern "C" void launch_argsort(const double* x, int* out_idx, int n, hipStream_t stream) {
-      int pn = next_pow2(n);
-      double* keys = nullptr;
-      int* vals = nullptr;
-      hipMalloc(&keys, (size_t)pn * sizeof(double));
-      hipMalloc(&vals, (size_t)pn * sizeof(int));
-      hipMemcpyAsync(keys, x, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      dim3 b(256), g((pn + 255) / 256);
-      hipLaunchKernelGGL(init_idx_kernel, g, b, 0, stream, vals, pn);
-      if (pn > n) {
-            hipLaunchKernelGGL(fill_sentinel_kernel, g, b, 0, stream, keys, n, pn, DBL_MAX);
-      }
-      for (int k = 2; k <= pn; k <<= 1) {
-            for (int j = k >> 1; j > 0; j >>= 1) {
-                  hipLaunchKernelGGL(bitonic_step_idx_kernel, g, b, 0, stream, keys, vals, j, k, pn);
-            }
-      }
-      hipMemcpyAsync(out_idx, vals, (size_t)n * sizeof(int), hipMemcpyDeviceToDevice, stream);
-      hipStreamSynchronize(stream);
-      hipFree(keys);
-      hipFree(vals);
+extern "C" void launch_bitonic_step(double* data, int j, int k, int padded_n, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(bitonic_step_kernel, g, b, 0, stream, data, j, k, padded_n);
+}
+
+extern "C" void launch_bitonic_step_idx(double* keys, int* vals, int j, int k, int padded_n, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(bitonic_step_idx_kernel, g, b, 0, stream, keys, vals, j, k, padded_n);
 }
 
 // Sort (double keys, double vals) pairs ascending by key.
-// vals treated as raw bits via int* reinterpret — safe because sizeof(double)==sizeof(int64) != sizeof(int).
-// We use a dedicated f64-f64 bitonic step instead.
 __global__ void bitonic_step_dd_kernel(double* keys, double* vals, int j, int k, int padded_n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= padded_n) return;
@@ -182,32 +170,9 @@ __global__ void bitonic_step_dd_kernel(double* keys, double* vals, int j, int k,
       }
 }
 
-extern "C" void launch_sort_by_key(
-      const double* keys, const double* vals, double* out_keys, double* out_vals,
-      int n, hipStream_t stream
-) {
-      int pn = next_pow2(n);
-      double* wk = nullptr;
-      double* wv = nullptr;
-      hipMalloc(&wk, (size_t)pn * sizeof(double));
-      hipMalloc(&wv, (size_t)pn * sizeof(double));
-      hipMemcpyAsync(wk, keys, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      hipMemcpyAsync(wv, vals, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      if (pn > n) {
-            dim3 bg((pn + 255) / 256);
-            hipLaunchKernelGGL(fill_sentinel_kernel, bg, dim3(256), 0, stream, wk, n, pn, DBL_MAX);
-      }
-      dim3 b(256), g((pn + 255) / 256);
-      for (int k2 = 2; k2 <= pn; k2 <<= 1) {
-            for (int j = k2 >> 1; j > 0; j >>= 1) {
-                  hipLaunchKernelGGL(bitonic_step_dd_kernel, g, b, 0, stream, wk, wv, j, k2, pn);
-            }
-      }
-      hipMemcpyAsync(out_keys, wk, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      hipMemcpyAsync(out_vals, wv, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      hipStreamSynchronize(stream);
-      hipFree(wk);
-      hipFree(wv);
+extern "C" void launch_bitonic_step_dd(double* keys, double* vals, int j, int k, int padded_n, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(bitonic_step_dd_kernel, g, b, 0, stream, keys, vals, j, k, padded_n);
 }
 
 // Segment sort: sort within each contiguous segment.
@@ -288,15 +253,16 @@ extern "C" void launch_cumsum_cols(const double* x, double* out, int rows, int c
       hipLaunchKernelGGL(cumsum_cols_kernel, g, b, 0, stream, x, out, rows, cols);
 }
 
-// cumprod: inclusive product scan via rocprim
-extern "C" void launch_cumprod(const double* x, double* out, int n, hipStream_t stream) {
+// cumprod: inclusive product scan via rocprim (caller-allocated workspace)
+extern "C" size_t launch_cumprod_workspace_bytes(int n) {
       size_t tmp = 0;
-      rocprim::inclusive_scan(nullptr, tmp, x, out, n, rocprim::multiplies<double>(), stream);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::inclusive_scan(d, tmp, x, out, n, rocprim::multiplies<double>(), stream);
-      hipStreamSynchronize(stream);
-      hipFree(d);
+      rocprim::inclusive_scan(nullptr, tmp, (const double*)nullptr, (double*)nullptr, n, rocprim::multiplies<double>(), hipStream_t(0));
+      return tmp;
+}
+
+extern "C" void launch_cumprod(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      size_t tmp = workspace_bytes;
+      rocprim::inclusive_scan(workspace, tmp, x, out, n, rocprim::multiplies<double>(), stream);
 }
 
 // cummax: inclusive max scan
@@ -304,19 +270,21 @@ struct MaxOp {
       __host__ __device__ double operator()(double a, double b) const { return a > b ? a : b; }
 };
 
-extern "C" void launch_cummax(const double* x, double* out, int n, hipStream_t stream) {
+extern "C" size_t launch_cummax_workspace_bytes(int n) {
       size_t tmp = 0;
-      rocprim::inclusive_scan(nullptr, tmp, x, out, n, MaxOp{}, stream);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::inclusive_scan(d, tmp, x, out, n, MaxOp{}, stream);
-      hipStreamSynchronize(stream);
-      hipFree(d);
+      rocprim::inclusive_scan(nullptr, tmp, (const double*)nullptr, (double*)nullptr, n, MaxOp{}, hipStream_t(0));
+      return tmp;
+}
+
+extern "C" void launch_cummax(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
+      size_t tmp = workspace_bytes;
+      rocprim::inclusive_scan(workspace, tmp, x, out, n, MaxOp{}, stream);
 }
 
 // ── Segmented reduce by key ───────────────────────────────────────────────────
 // seg_ids[i] = segment index for element i. Segments must be dense 0..n_segs-1.
 // Elements need not be contiguous by segment; atomicAdd handles arbitrary order.
+// out (n_segs doubles) must be zeroed by the caller before this launch.
 
 __global__ void segment_sum_kernel(const double* vals, const int* seg_ids, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -326,7 +294,7 @@ __global__ void segment_sum_kernel(const double* vals, const int* seg_ids, doubl
 extern "C" void launch_segment_sum(
       const double* vals, const int* seg_ids, double* out, int n, int n_segs, hipStream_t stream
 ) {
-      hipMemsetAsync(out, 0, (size_t)n_segs * sizeof(double), stream);
+      (void)n_segs;
       dim3 b(256), g((n + 255) / 256);
       hipLaunchKernelGGL(segment_sum_kernel, g, b, 0, stream, vals, seg_ids, out, n);
 }

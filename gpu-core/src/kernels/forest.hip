@@ -96,14 +96,11 @@ __global__ void bitonic_argsort_kernel(
       }
 }
 
-// Host launcher: generates random keys then bitonic-sorts to give first k indices
+// Host launcher: generates random keys then bitonic-sorts to give first k indices.
+// Caller allocates `keys` (n_features doubles) as scratch and reads first k of idx_out.
 extern "C" void launch_feature_subset(
-      int* idx_out, int n_features, int k, uint32_t seed, hipStream_t stream
+      double* keys, int* idx_out, int n_features, int k, uint32_t seed, hipStream_t stream
 ) {
-      // Allocate temporary key buffer
-      double* keys = nullptr;
-      hipMalloc(&keys, n_features * sizeof(double));
-
       // Generate random keys
       dim3 block_k(256);
       dim3 grid_k((n_features + 255) / 256);
@@ -119,9 +116,6 @@ extern "C" void launch_feature_subset(
       size_t smem_bytes = (size_t)np2 * (sizeof(double) + sizeof(int));
       hipLaunchKernelGGL(bitonic_argsort_kernel, dim3(1), dim3(np2), smem_bytes, stream,
                          keys, idx_out, n_features);
-
-      hipStreamSynchronize(stream);
-      hipFree(keys);
 }
 
 // ── Random threshold split: find col min/max, draw one uniform in [min,max] ─
@@ -165,25 +159,17 @@ __global__ void draw_threshold_kernel(
       threshold_out[0] = mn + u * (mx - mn);
 }
 
+// Caller allocates d_min and d_max (1 double each) as scratch.
 extern "C" void launch_random_threshold_split(
-      const double* col, double* threshold_out, int n, uint32_t seed, hipStream_t stream
+      const double* col, double* d_min, double* d_max,
+      double* threshold_out, int n, uint32_t seed, hipStream_t stream
 ) {
-      // Temporary min/max scalars
-      double* d_min = nullptr;
-      double* d_max = nullptr;
-      hipMalloc(&d_min, sizeof(double));
-      hipMalloc(&d_max, sizeof(double));
-
       int threads = 256;
       hipLaunchKernelGGL(col_minmax_kernel, dim3(1), dim3(threads), 0, stream,
                          col, d_min, d_max, n);
 
       hipLaunchKernelGGL(draw_threshold_kernel, dim3(1), dim3(1), 0, stream,
                          d_min, d_max, threshold_out, seed);
-
-      hipStreamSynchronize(stream);
-      hipFree(d_min);
-      hipFree(d_max);
 }
 
 // ── OOB mask: u8[n], 1 where index never appears in bootstrap ────────────
@@ -202,15 +188,12 @@ __global__ void invert_mask_kernel(const unsigned char* used, unsigned char* oob
       if (i < n) oob[i] = used[i] ? (unsigned char)0 : (unsigned char)1;
 }
 
+// Caller allocates `used` (n bytes) and MUST zero it before this call
+// (scatter only writes 1s; invert reads the full buffer).
 extern "C" void launch_oob_mask(
-      const int* bootstrap_idx, unsigned char* oob_out,
+      const int* bootstrap_idx, unsigned char* used, unsigned char* oob_out,
       int n_samples, int n, hipStream_t stream
 ) {
-      // Temporary 'used' array, zero-initialized
-      unsigned char* used = nullptr;
-      hipMalloc(&used, n * sizeof(unsigned char));
-      hipMemsetAsync(used, 0, n * sizeof(unsigned char), stream);
-
       dim3 block(256);
       dim3 grid_s((n_samples + 255) / 256);
       hipLaunchKernelGGL(scatter_used_kernel, grid_s, block, 0, stream,
@@ -219,7 +202,4 @@ extern "C" void launch_oob_mask(
       dim3 grid_n((n + 255) / 256);
       hipLaunchKernelGGL(invert_mask_kernel, grid_n, block, 0, stream,
                          used, oob_out, n);
-
-      hipStreamSynchronize(stream);
-      hipFree(used);
 }

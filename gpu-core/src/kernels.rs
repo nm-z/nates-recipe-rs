@@ -104,12 +104,17 @@ unsafe extern "C" {
     fn launch_add_scalar(x: *const c_void, out: *mut c_void, n: i32, s: f64, stream: *mut c_void);
     fn launch_div(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
     fn launch_fma(x: *const c_void, a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-    fn launch_reduce_sum_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_sum_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_mean_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_var_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+    fn launch_reduce_sum_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_sum_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_mean_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_var_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn reduce_sum_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_sum_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_mean_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_var_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
     fn launch_pairwise_l2(query: *const c_void, train: *const c_void, out: *mut c_void, nq: i32, nt: i32, dim: i32, stream: *mut c_void);
-    fn launch_partial_argsort(data: *const c_void, indices: *mut c_void, n: i32, k: i32, stream: *mut c_void);
+    fn launch_partial_argsort(data: *const c_void, indices: *mut c_void, keys_out: *mut c_void, vals_in: *mut c_void, temp: *mut c_void, temp_bytes: usize, n: i32, stream: *mut c_void);
+    fn partial_argsort_workspace_bytes(n: i32) -> usize;
     fn launch_bias_add(x: *const c_void, bias: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
     fn launch_lstm_cell(gates: *const c_void, c: *mut c_void, h: *mut c_void, n: i32, hs: i32, stream: *mut c_void);
     fn launch_gaussian_ll(x: *const c_void, means: *const c_void, vars: *const c_void, log_priors: *const c_void, out: *mut c_void, n: i32, k: i32, p: i32, stream: *mut c_void);
@@ -176,10 +181,14 @@ unsafe extern "C" {
     fn launch_max_pool_2d_backward(grad_out: *const c_void, indices: *const c_void, grad_in: *mut c_void, n: i32, c: i32, out_h: i32, out_w: i32, h: i32, w: i32, stream: *mut c_void);
 
     // Reduce max/min
-    fn launch_reduce_max_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_max_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_min_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
-    fn launch_reduce_min_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+    fn launch_reduce_max_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_max_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_min_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_reduce_min_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn reduce_max_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_max_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_min_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+    fn reduce_min_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
 
     // Comparisons
     fn launch_gt(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
@@ -221,14 +230,23 @@ unsafe extern "C" {
     fn launch_grad_clip_norm(x: *mut c_void, tmp: *mut c_void, n: i32, max_norm: f64, stream: *mut c_void);
 
     // Prefix sum
-    fn launch_prefix_sum_inclusive(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-    fn launch_prefix_sum_exclusive(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+    fn launch_prefix_sum_inclusive(x: *const c_void, out: *mut c_void, n: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn launch_prefix_sum_exclusive(x: *const c_void, out: *mut c_void, n: i32, tmp: *mut c_void, tmp_bytes: usize, stream: *mut c_void);
+    fn prefix_sum_inclusive_workspace_bytes(x: *const c_void, n: i32, stream: *mut c_void) -> usize;
+    fn prefix_sum_exclusive_workspace_bytes(x: *const c_void, n: i32, stream: *mut c_void) -> usize;
 
     // Tree
     fn launch_histogram_build(bins: *const c_void, grad: *const c_void, hess: *const c_void, mask: *const c_void, grad_hist: *mut c_void, hess_hist: *mut c_void, count_hist: *mut c_void, n: i32, p: i32, n_bins: i32, stream: *mut c_void);
     fn launch_split_eval(grad_hist: *const c_void, hess_hist: *const c_void, best_gain: *mut c_void, best_bin: *mut c_void, p: i32, n_bins: i32, lambda: f64, min_child_weight: f64, stream: *mut c_void);
     fn launch_data_partition(bins: *const c_void, node_mask: *const c_void, left_mask: *mut c_void, right_mask: *mut c_void, n: i32, p: i32, split_feat: i32, split_bin: i32, stream: *mut c_void);
-    fn launch_tree_build(tr_bins: *const c_void, n_tr: i32, grad: *const c_void, hess: *const c_void, te_bins: *const c_void, n_te: i32, p: i32, n_bins: i32, max_depth: i32, lambda: f64, min_cw: f64, tr_pred: *mut c_void, te_pred: *mut c_void, stream: *mut c_void);
+    // Tree build per-step launchers (the depth loop + scratch live in Rust now)
+    fn launch_tb_histogram(tr_bins: *const c_void, grad: *const c_void, hess: *const c_void, node_assign: *const c_void, grad_hist: *mut c_void, hess_hist: *mut c_void, n_tr: i32, p: i32, n_bins: i32, level_base: i32, stream: *mut c_void);
+    fn launch_tb_split_eval(grad_hist: *const c_void, hess_hist: *const c_void, split_feat: *mut c_void, split_bin: *mut c_void, n_level: i32, p: i32, n_bins: i32, lambda: f64, min_cw: f64, level_base: i32, stream: *mut c_void);
+    fn launch_tb_repartition(tr_bins: *const c_void, node_assign: *mut c_void, split_feat: *const c_void, split_bin: *const c_void, n_tr: i32, p: i32, stream: *mut c_void);
+    fn launch_tb_leaf_sum(grad: *const c_void, hess: *const c_void, node_assign: *const c_void, node_sum_g: *mut c_void, node_sum_h: *mut c_void, n_tr: i32, stream: *mut c_void);
+    fn launch_tb_leaf_val(node_sum_g: *const c_void, node_sum_h: *const c_void, leaf_val: *mut c_void, n_leaves: i32, leaf_base: i32, lambda: f64, stream: *mut c_void);
+    fn launch_tb_scatter(node_assign: *const c_void, leaf_val: *const c_void, predictions: *mut c_void, n_tr: i32, stream: *mut c_void);
+    fn launch_tb_apply_tree(te_bins: *const c_void, split_feat: *const c_void, split_bin: *const c_void, leaf_val: *const c_void, predictions: *mut c_void, n_te: i32, p: i32, max_depth: i32, stream: *mut c_void);
 
     // Oblivious tree kernels (u8 bins, f32 grad/hess)
     fn launch_mse_grad(pred: *const c_void, target: *const c_void, grad: *mut c_void, n: i32, stream: *mut c_void);
@@ -251,12 +269,20 @@ unsafe extern "C" {
     fn launch_accuracy(pred: *const c_void, tgt: *const c_void, out: *mut c_void, n_rows: i32, n_classes: i32, stream: *mut c_void);
     fn launch_scatter_add_by_leaf_col(pred: *mut c_void, leaf_idx: *const c_void, leaf_value: *const c_void, lr: f32, n_rows: i32, n_classes: i32, col: i32, stream: *mut c_void);
 
+    // metrics_fused.hip — fused single-pass metric reductions (double, atomicAdd into scalar out)
+    fn launch_ss_res(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+    fn launch_mse(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+    #[link_name = "launch_acc_metric"]
+    fn launch_accuracy_metric(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+
     // DTW
-    fn launch_dtw(cost: *const c_void, dp: *mut c_void, m: i32, n: i32, stream: *mut c_void);
+    fn launch_dtw_init(dp: *mut c_void, dp_size: i32, stream: *mut c_void);
+    fn launch_dtw_antidiag(cost: *const c_void, dp: *mut c_void, m: i32, n: i32, d: i32, stream: *mut c_void);
 
     // Apriori
     fn launch_itemset_support(trans: *const c_void, cands: *const c_void, counts: *mut c_void, n_trans: i32, n_items: i32, n_cands: i32, k: i32, stream: *mut c_void);
-    fn launch_candidate_generate(freq: *const c_void, out: *mut c_void, n_freq: i32, k: i32, stream: *mut c_void) -> i32;
+    fn launch_candidate_generate_count(freq: *const c_void, n_freq: i32, k: i32, count: *mut c_void, stream: *mut c_void);
+    fn launch_candidate_generate_write(freq: *const c_void, out: *mut c_void, n_freq: i32, k: i32, write_pos: *mut c_void, stream: *mut c_void);
 
     // Philox GPU RNG
     fn launch_rand_uniform(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
@@ -272,32 +298,39 @@ unsafe extern "C" {
     fn launch_leaf_split_apply(bins_fm: *const c_void, node_idx: *mut c_void, target_leaf: i32, new_leaf_left: i32, new_leaf_right: i32, split_feature: i32, split_bin: u8, n_rows: i32, n_features: i32, stream: *mut c_void);
 }
 
-// Thread-local rocBLAS handle — created once per thread, never destroyed until thread exits.
-// rocBLAS handles are not Send; each rayon worker gets its own.
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicPtr, AtomicBool, Ordering};
+
 thread_local! {
     static ROCBLAS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 }
 
+static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn atexit_gpu_shutdown() {
+    gpu_shutdown();
+}
+
 pub(crate) fn rocblas_handle() -> *mut c_void {
     ROCBLAS_HANDLE.with(|h| {
-        let ptr = h.load(std::sync::atomic::Ordering::Relaxed);
+        let ptr = h.load(Ordering::Relaxed);
         if !ptr.is_null() {
             return ptr;
+        }
+        if !ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
+            unsafe extern "C" { fn atexit(f: unsafe extern "C" fn()) -> i32; }
+            unsafe { atexit(atexit_gpu_shutdown) };
         }
         let mut handle: *mut c_void = std::ptr::null_mut();
         let status = unsafe { rocblas_create_handle(&mut handle) };
         assert_eq!(status, 0, "rocblas_create_handle failed with status {}", status);
-        h.store(handle, std::sync::atomic::Ordering::Relaxed);
+        h.store(handle, Ordering::Relaxed);
         handle
     })
 }
 
-/// Destroy the thread-local rocBLAS handle and reset the GPU device.
-/// Call once at program exit to release all GPU resources cleanly.
 pub fn gpu_shutdown() {
     ROCBLAS_HANDLE.with(|h| {
-        let ptr = h.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
         if !ptr.is_null() {
             unsafe { rocblas_destroy_handle(ptr); }
         }
@@ -787,6 +820,123 @@ pub fn gpu_linear_into(x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &Gpu
     }
 }
 
+/// Fused R² residual sum of squares Σ(y-pred)² reduced into scalar `out` (atomicAdd).
+pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { crate::hip::hipMemsetAsync(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut()); }
+    unsafe { launch_ss_res(pred.ptr as *const c_void, y.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Fused mean squared error Σ(pred-y)²/n reduced into scalar `out` (atomicAdd).
+pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { crate::hip::hipMemsetAsync(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut()); }
+    unsafe { launch_mse(pred.ptr as *const c_void, y.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Fused accuracy Σ[round(pred)==round(y)]/n reduced into scalar `out` (atomicAdd).
+pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { crate::hip::hipMemsetAsync(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut()); }
+    unsafe { launch_accuracy_metric(pred.ptr as *const c_void, y.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Element-wise absolute value into `out` (in==out allowed).
+pub fn gpu_abs_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_abs(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Element-wise natural log into `out`.
+pub fn gpu_log_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    unsafe { launch_log(x.ptr as *const c_void, out.ptr as *mut c_void, n as i32, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Device-to-device copy of `n` f64s into `out`.
+pub fn gpu_copy_into(src: &GpuBuffer, out: &GpuBuffer, n: usize) {
+    check(unsafe { crate::hip::hipMemcpyAsync(out.ptr, src.ptr as *const c_void, n * std::mem::size_of::<f64>(), crate::hip::HIP_MEMCPY_D2D, std::ptr::null_mut()) }).expect("copy");
+}
+
+/// Column-wise sum of (rows×cols) into preallocated `out` (cols-long), allocation-free for the result.
+pub fn gpu_reduce_sum_cols_into(x: &GpuBuffer, out: &GpuBuffer, reduce_ws: &GpuBuffer, rows: usize, cols: usize) {
+    let ws = unsafe { reduce_sum_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+    unsafe { launch_reduce_sum_cols(x.ptr as *const c_void, out.ptr as *mut c_void, rows as i32, cols as i32, reduce_ws.ptr, ws, std::ptr::null_mut()); }
+    check_launch();
+}
+
+/// Worst-case reduce_sum_cols scratch bytes for a (rows×cols) reduction — for sizing the
+/// persistent Scratch.reduce_ws once from model dimensions. Dims-only; no allocation.
+pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
+    unsafe { reduce_sum_cols_workspace_bytes(std::ptr::null(), rows as i32, cols as i32, std::ptr::null_mut()) }
+}
+
+/// out(n) = X(n×in_dim) @ w(in_dim) + b, for the out_dim==1 forward fast path.
+///
+/// X is row-major (n×in_dim) = column-major (in_dim×n), lda=in_dim. With op=TRANSPOSE
+/// rocBLAS computes (X_cm)ᵀ @ w = X @ w. Bias is broadcast with the SAME primitive the
+/// out_dim>1 path (`gpu_linear_into`) uses — `launch_repeat_rows` pre-fills `out`, then
+/// dgemv with beta=1 accumulates the matvec on top.
+pub fn gpu_matvec_bias_into(x: &GpuBuffer, w: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize, in_dim: usize) {
+    unsafe { launch_repeat_rows(b.ptr as *const c_void, out.ptr as *mut c_void, 1, n as i32, std::ptr::null_mut()); }
+    let alpha = 1.0_f64;
+    let beta = 1.0_f64;
+    let status = unsafe {
+        crate::hip::rocblas_dgemv(
+            rocblas_handle(),
+            ROCBLAS_OPERATION_TRANSPOSE,
+            in_dim as i32, n as i32,
+            &alpha,
+            x.ptr as *const f64, in_dim as i32,
+            w.ptr as *const f64, 1,
+            &beta,
+            out.ptr as *mut f64, 1,
+        )
+    };
+    check(status).expect("gpu_matvec_bias_into dgemv");
+}
+
+/// dw(in_dim) = aᵀ @ grad, for the out_dim==1 backward fast path. `a` is (n×in_dim)
+/// row-major = (in_dim×n) column-major (lda=in_dim); `trans=true` means "transpose the
+/// row-major a", which maps to rocBLAS op=NONE on that view → (a_cm) @ grad = aᵀ @ grad.
+pub fn gpu_dgemv_into(a: &GpuBuffer, x: &GpuBuffer, out: &GpuBuffer, n: usize, in_dim: usize, trans: bool) {
+    let op = if trans { ROCBLAS_OPERATION_NONE } else { ROCBLAS_OPERATION_TRANSPOSE };
+    let alpha = 1.0_f64;
+    let beta = 0.0_f64;
+    let status = unsafe {
+        crate::hip::rocblas_dgemv(
+            rocblas_handle(),
+            op,
+            in_dim as i32, n as i32,
+            &alpha,
+            a.ptr as *const f64, in_dim as i32,
+            x.ptr as *const f64, 1,
+            &beta,
+            out.ptr as *mut f64, 1,
+        )
+    };
+    check(status).expect("gpu_dgemv_into dgemv");
+}
+
+/// da_prev(n×in_dim) = grad(n) ⊗ w(in_dim), the rank-1 outer product for the out_dim==1
+/// backward path. Row-major `out` = column-major (in_dim×n), lda=in_dim; dger writes
+/// A_cm[j,i] = w[j]·grad[i], i.e. da_prev[i,j] = grad[i]·w[j].
+pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize, in_dim: usize) {
+    unsafe { crate::hip::hipMemsetAsync(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut()); }
+    let alpha = 1.0_f64;
+    let status = unsafe {
+        crate::hip::rocblas_dger(
+            rocblas_handle(),
+            in_dim as i32, n as i32,
+            &alpha,
+            w.ptr as *const f64, 1,
+            grad.ptr as *const f64, 1,
+            out.ptr as *mut f64, in_dim as i32,
+        )
+    };
+    check(status).expect("gpu_dger_into dger");
+}
+
 pub fn gpu_layernorm_into(x: &GpuBuffer, out: &GpuBuffer, gamma: Option<&GpuBuffer>, beta: Option<&GpuBuffer>, rows: usize, cols: usize) {
     let g = gamma.map(|b| b.ptr as *const c_void).unwrap_or(std::ptr::null());
     let b = beta.map(|b| b.ptr as *const c_void).unwrap_or(std::ptr::null());
@@ -819,18 +969,19 @@ pub fn gpu_linear_backward_into(grad: &GpuBuffer, input: &GpuBuffer, weight: &Gp
     let grad_b = gpu_reduce_sum_cols(grad, m, n)?;
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
-    unsafe {
+    let status = unsafe {
         rocblas_dgemm(
             rocblas_handle(),
-            ROCBLAS_OPERATION_NONE, ROCBLAS_OPERATION_TRANSPOSE,
+            ROCBLAS_OPERATION_TRANSPOSE, ROCBLAS_OPERATION_NONE,
             k as i32, m as i32, n as i32,
             &alpha,
-            weight.ptr as *const f64, k as i32,
+            weight.ptr as *const f64, n as i32,
             grad.ptr as *const f64, n as i32,
             &beta,
             grad_input.ptr as *mut f64, k as i32,
-        );
-    }
+        )
+    };
+    check(status)?;
     Ok((grad_w, grad_b))
 }
 
@@ -852,37 +1003,42 @@ pub fn gpu_linear_backward_weights_only(grad: &GpuBuffer, input: &GpuBuffer, m: 
     Ok((grad_w, grad_b))
 }
 
-pub fn gpu_linear_backward_weights_only_into(grad: &GpuBuffer, input: &GpuBuffer, grad_w: &GpuBuffer, grad_b: &GpuBuffer, m: usize, n: usize, k: usize) {
+pub fn gpu_linear_backward_weights_only_into(grad: &GpuBuffer, input: &GpuBuffer, grad_w: &GpuBuffer, grad_b: &GpuBuffer, reduce_ws: &GpuBuffer, m: usize, n: usize, k: usize) {
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
-    unsafe {
+    let ws = unsafe { reduce_sum_cols_workspace_bytes(grad.ptr as *const c_void, m as i32, n as i32, std::ptr::null_mut()) };
+    let gw_status = unsafe {
         rocblas_dgemm(rocblas_handle(), ROCBLAS_OPERATION_NONE, ROCBLAS_OPERATION_TRANSPOSE,
             n as i32, k as i32, m as i32, &alpha,
             grad.ptr as *const f64, n as i32, input.ptr as *const f64, k as i32,
-            &beta, grad_w.ptr as *mut f64, n as i32);
-        launch_reduce_sum_cols(grad.ptr as *const c_void, grad_b.ptr as *mut c_void, m as i32, n as i32, std::ptr::null_mut());
-    }
+            &beta, grad_w.ptr as *mut f64, n as i32)
+    };
+    check(gw_status).expect("grad_w dgemm failed");
+    unsafe { launch_reduce_sum_cols(grad.ptr as *const c_void, grad_b.ptr as *mut c_void, m as i32, n as i32, reduce_ws.ptr, ws, std::ptr::null_mut()); }
 }
 
-pub fn gpu_linear_backward_full_into(grad: &GpuBuffer, input: &GpuBuffer, weight: &GpuBuffer, grad_input: &GpuBuffer, grad_w: &GpuBuffer, grad_b: &GpuBuffer, m: usize, n: usize, k: usize) {
+pub fn gpu_linear_backward_full_into(grad: &GpuBuffer, input: &GpuBuffer, weight: &GpuBuffer, grad_input: &GpuBuffer, grad_w: &GpuBuffer, grad_b: &GpuBuffer, reduce_ws: &GpuBuffer, m: usize, n: usize, k: usize) {
     // grad_w = input^T @ grad
     let alpha = 1.0_f64;
     let beta = 0.0_f64;
-    unsafe {
+    let gw_status = unsafe {
         rocblas_dgemm(rocblas_handle(), ROCBLAS_OPERATION_NONE, ROCBLAS_OPERATION_TRANSPOSE,
             n as i32, k as i32, m as i32, &alpha,
             grad.ptr as *const f64, n as i32, input.ptr as *const f64, k as i32,
-            &beta, grad_w.ptr as *mut f64, n as i32);
-    }
+            &beta, grad_w.ptr as *mut f64, n as i32)
+    };
+    check(gw_status).expect("grad_w dgemm failed");
     // grad_b = sum_cols(grad)
-    unsafe { launch_reduce_sum_cols(grad.ptr as *const c_void, grad_b.ptr as *mut c_void, m as i32, n as i32, std::ptr::null_mut()); }
+    let ws = unsafe { reduce_sum_cols_workspace_bytes(grad.ptr as *const c_void, m as i32, n as i32, std::ptr::null_mut()) };
+    unsafe { launch_reduce_sum_cols(grad.ptr as *const c_void, grad_b.ptr as *mut c_void, m as i32, n as i32, reduce_ws.ptr, ws, std::ptr::null_mut()); }
     // grad_input = grad @ weight^T
-    unsafe {
-        rocblas_dgemm(rocblas_handle(), ROCBLAS_OPERATION_NONE, ROCBLAS_OPERATION_TRANSPOSE,
+    let gi_status = unsafe {
+        rocblas_dgemm(rocblas_handle(), ROCBLAS_OPERATION_TRANSPOSE, ROCBLAS_OPERATION_NONE,
             k as i32, m as i32, n as i32, &alpha,
-            weight.ptr as *const f64, k as i32, grad.ptr as *const f64, n as i32,
-            &beta, grad_input.ptr as *mut f64, k as i32);
-    }
+            weight.ptr as *const f64, n as i32, grad.ptr as *const f64, n as i32,
+            &beta, grad_input.ptr as *mut f64, k as i32)
+    };
+    check(gi_status).expect("grad_input dgemm failed");
 }
 
 pub fn gpu_layernorm_backward_full_into(grad_y: &GpuBuffer, x: &GpuBuffer, gamma: &GpuBuffer, grad_x: &GpuBuffer, grad_gamma: &GpuBuffer, grad_beta: &GpuBuffer, rows: usize, cols: usize, eps: f64) {
@@ -905,7 +1061,54 @@ pub fn gpu_grad_hess_into(probs: &GpuBuffer, targets: &GpuBuffer, weights: &GpuB
 }
 
 pub fn gpu_tree_build_into(tr_bins: &GpuBuffer, te_bins: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, n_tr: usize, n_te: usize, p: usize, n_bins: usize, max_depth: usize, lambda: f64, min_cw: f64, tr_pred: &GpuBuffer, te_pred: &GpuBuffer) {
-    unsafe { launch_tree_build(tr_bins.ptr as *const c_void, n_tr as i32, grad.ptr as *const c_void, hess.ptr as *const c_void, te_bins.ptr as *const c_void, n_te as i32, p as i32, n_bins as i32, max_depth as i32, lambda, min_cw, tr_pred.ptr as *mut c_void, te_pred.ptr as *mut c_void, std::ptr::null_mut()); }
+    // Per-step depth loop. Scratch, fills, zeroing and the loop now live here;
+    // the .hip side only exposes the individual launchers.
+    let isz = std::mem::size_of::<i32>();
+    let fsz = std::mem::size_of::<f64>();
+    let max_nodes = (1usize << (max_depth + 1)) - 1;
+    let max_level = if max_depth <= 1 { 1usize } else { 1usize << (max_depth - 1) };
+    let hist_elems = max_level * p * n_bins;
+
+    let node_assign = GpuBuffer::zeros_bytes(n_tr * isz).expect("tb node_assign");      // fill 0
+    let sf = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_feat");
+    let sb = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_bin");
+    sf.fill_bytes(0xFF, max_nodes * isz).expect("tb split_feat fill");                  // -1 leaf sentinel
+    sb.fill_bytes(0xFF, max_nodes * isz).expect("tb split_bin fill");
+    let gh = GpuBuffer::alloc(hist_elems).expect("tb grad_hist");
+    let hh = GpuBuffer::alloc(hist_elems).expect("tb hess_hist");
+    let sum_g = GpuBuffer::alloc(max_nodes).expect("tb node_sum_g");
+    let sum_h = GpuBuffer::alloc(max_nodes).expect("tb node_sum_h");
+    let lv = GpuBuffer::alloc(max_nodes).expect("tb leaf_val");
+
+    for d in 0..max_depth {
+        let level_base = (1usize << d) - 1;
+        let n_level = 1usize << d;
+        let level_bytes = n_level * p * n_bins * fsz;
+        gh.memset_zero(level_bytes).expect("tb grad_hist zero");
+        hh.memset_zero(level_bytes).expect("tb hess_hist zero");
+        unsafe {
+            launch_tb_histogram(tr_bins.ptr as *const c_void, grad.ptr as *const c_void, hess.ptr as *const c_void,
+                node_assign.ptr as *const c_void, gh.ptr, hh.ptr,
+                n_tr as i32, p as i32, n_bins as i32, level_base as i32, std::ptr::null_mut());
+            launch_tb_split_eval(gh.ptr as *const c_void, hh.ptr as *const c_void, sf.ptr, sb.ptr,
+                n_level as i32, p as i32, n_bins as i32, lambda, min_cw, level_base as i32, std::ptr::null_mut());
+            launch_tb_repartition(tr_bins.ptr as *const c_void, node_assign.ptr,
+                sf.ptr as *const c_void, sb.ptr as *const c_void, n_tr as i32, p as i32, std::ptr::null_mut());
+        }
+    }
+
+    sum_g.memset_zero(max_nodes * fsz).expect("tb node_sum_g zero");
+    sum_h.memset_zero(max_nodes * fsz).expect("tb node_sum_h zero");
+    lv.memset_zero(max_nodes * fsz).expect("tb leaf_val zero");
+    unsafe {
+        launch_tb_leaf_sum(grad.ptr as *const c_void, hess.ptr as *const c_void, node_assign.ptr as *const c_void,
+            sum_g.ptr, sum_h.ptr, n_tr as i32, std::ptr::null_mut());
+        launch_tb_leaf_val(sum_g.ptr as *const c_void, sum_h.ptr as *const c_void, lv.ptr,
+            max_nodes as i32, 0, lambda, std::ptr::null_mut());
+        launch_tb_scatter(node_assign.ptr as *const c_void, lv.ptr as *const c_void, tr_pred.ptr, n_tr as i32, std::ptr::null_mut());
+        launch_tb_apply_tree(te_bins.ptr as *const c_void, sf.ptr as *const c_void, sb.ptr as *const c_void,
+            lv.ptr as *const c_void, te_pred.ptr, n_te as i32, p as i32, max_depth as i32, std::ptr::null_mut());
+    }
     check_launch();
 }
 
@@ -1134,25 +1337,33 @@ pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuf
 
 pub fn gpu_reduce_sum_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(cols)?;
-    unsafe { launch_reduce_sum_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+    let ws = unsafe { reduce_sum_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+    let tmp = GpuBuffer::alloc_bytes(ws)?;
+    unsafe { launch_reduce_sum_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
     Ok(out)
 }
 
 pub fn gpu_reduce_sum_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(rows)?;
-    unsafe { launch_reduce_sum_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+    let ws = unsafe { reduce_sum_rows_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+    let tmp = GpuBuffer::alloc_bytes(ws)?;
+    unsafe { launch_reduce_sum_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
     Ok(out)
 }
 
 pub fn gpu_reduce_mean_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(cols)?;
-    unsafe { launch_reduce_mean_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+    let ws = unsafe { reduce_mean_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+    let tmp = GpuBuffer::alloc_bytes(ws)?;
+    unsafe { launch_reduce_mean_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
     Ok(out)
 }
 
 pub fn gpu_reduce_var_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
     let out = GpuBuffer::alloc(cols)?;
-    unsafe { launch_reduce_var_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+    let ws = unsafe { reduce_var_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+    let tmp = GpuBuffer::alloc_bytes(ws)?;
+    unsafe { launch_reduce_var_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
     Ok(out)
 }
 
@@ -1165,10 +1376,18 @@ pub fn gpu_pairwise_l2(query: &GpuBuffer, train: &GpuBuffer, nq: usize, nt: usiz
 }
 
 pub fn gpu_partial_argsort(data: &GpuBuffer, n: usize, k: usize) -> Result<GpuBuffer, HipError> {
-    let out_bytes = k * std::mem::size_of::<i32>();
-    let out = GpuBuffer::alloc_bytes(out_bytes)?;
+    // The kernel now full-sorts n pairs ascending; the first k indices are the
+    // k nearest. Caller-provided scratch: sorted-keys, the identity values the
+    // kernel fills, and the hipCUB radix-sort temp (sized via the query).
+    let _ = k;
+    let isz = std::mem::size_of::<i32>();
+    let out = GpuBuffer::alloc_bytes(n * isz)?;
+    let keys_out = GpuBuffer::alloc(n)?;
+    let vals_in = GpuBuffer::alloc_bytes(n * isz)?;
+    let ws = unsafe { partial_argsort_workspace_bytes(n as i32) };
+    let temp = GpuBuffer::alloc_bytes(ws)?;
     unsafe {
-        launch_partial_argsort(data.ptr as *const c_void, out.ptr, n as i32, k as i32, std::ptr::null_mut());
+        launch_partial_argsort(data.ptr as *const c_void, out.ptr, keys_out.ptr, vals_in.ptr, temp.ptr, ws, n as i32, std::ptr::null_mut());
     }
     Ok(out)
 }
@@ -1449,25 +1668,33 @@ pub fn gpu_max_pool_2d_backward(grad: &GpuBuffer, indices: &GpuBuffer, n: usize,
 
 pub fn gpu_reduce_max_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(rows)?;
-      unsafe { launch_reduce_max_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+      let ws = unsafe { reduce_max_rows_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_reduce_max_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
 pub fn gpu_reduce_max_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(cols)?;
-      unsafe { launch_reduce_max_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+      let ws = unsafe { reduce_max_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_reduce_max_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
 pub fn gpu_reduce_min_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(rows)?;
-      unsafe { launch_reduce_min_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+      let ws = unsafe { reduce_min_rows_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_reduce_min_rows(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
 pub fn gpu_reduce_min_cols(x: &GpuBuffer, rows: usize, cols: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(cols)?;
-      unsafe { launch_reduce_min_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, std::ptr::null_mut()); }
+      let ws = unsafe { reduce_min_cols_workspace_bytes(x.ptr as *const c_void, rows as i32, cols as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_reduce_min_cols(x.ptr as *const c_void, out.ptr, rows as i32, cols as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
@@ -1638,13 +1865,17 @@ pub fn gpu_grad_clip_norm_with_tmp(x: &GpuBuffer, tmp: &GpuBuffer, n: usize, max
 
 pub fn gpu_prefix_sum_inclusive(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(n)?;
-      unsafe { launch_prefix_sum_inclusive(x.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
+      let ws = unsafe { prefix_sum_inclusive_workspace_bytes(x.ptr as *const c_void, n as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_prefix_sum_inclusive(x.ptr as *const c_void, out.ptr, n as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
 pub fn gpu_prefix_sum_exclusive(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
       let out = GpuBuffer::alloc(n)?;
-      unsafe { launch_prefix_sum_exclusive(x.ptr as *const c_void, out.ptr, n as i32, std::ptr::null_mut()); }
+      let ws = unsafe { prefix_sum_exclusive_workspace_bytes(x.ptr as *const c_void, n as i32, std::ptr::null_mut()) };
+      let tmp = GpuBuffer::alloc_bytes(ws)?;
+      unsafe { launch_prefix_sum_exclusive(x.ptr as *const c_void, out.ptr, n as i32, tmp.ptr, ws, std::ptr::null_mut()); }
       Ok(out)
 }
 
@@ -1675,7 +1906,7 @@ pub fn gpu_data_partition(bins: &GpuBuffer, mask: &GpuBuffer, n: usize, p: usize
 pub fn gpu_tree_build(tr_bins: &GpuBuffer, te_bins: &GpuBuffer, grad: &GpuBuffer, hess: &GpuBuffer, n_tr: usize, n_te: usize, p: usize, n_bins: usize, max_depth: usize, lambda: f64, min_cw: f64) -> Result<(GpuBuffer, GpuBuffer), HipError> {
       let tr_pred = GpuBuffer::alloc(n_tr)?;
       let te_pred = GpuBuffer::alloc(n_te)?;
-      unsafe { launch_tree_build(tr_bins.ptr as *const c_void, n_tr as i32, grad.ptr as *const c_void, hess.ptr as *const c_void, te_bins.ptr as *const c_void, n_te as i32, p as i32, n_bins as i32, max_depth as i32, lambda, min_cw, tr_pred.ptr, te_pred.ptr, std::ptr::null_mut()); }
+      gpu_tree_build_into(tr_bins, te_bins, grad, hess, n_tr, n_te, p, n_bins, max_depth, lambda, min_cw, &tr_pred, &te_pred);
       Ok((tr_pred, te_pred))
 }
 
@@ -1743,8 +1974,14 @@ pub fn gpu_report(logits: &GpuBuffer, val_targets: &[i32], n: usize, nc: usize, 
 // ── DTW ───────────────────────────────────────────────────────────────────
 
 pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize) -> Result<GpuBuffer, HipError> {
-      let dp = GpuBuffer::alloc((m + 1) * (n + 1))?;
-      unsafe { launch_dtw(cost.ptr as *const c_void, dp.ptr, m as i32, n as i32, std::ptr::null_mut()); }
+      let dp_size = (m + 1) * (n + 1);
+      let dp = GpuBuffer::alloc(dp_size)?;
+      // The .hip init kernel fills the DP border; the caller drives the anti-diagonal
+      // sweep d = 0..=m+n-2 (the loop moved out of the .hip).
+      unsafe { launch_dtw_init(dp.ptr, dp_size as i32, std::ptr::null_mut()); }
+      for d in 0..(m + n - 1) {
+            unsafe { launch_dtw_antidiag(cost.ptr as *const c_void, dp.ptr, m as i32, n as i32, d as i32, std::ptr::null_mut()); }
+      }
       Ok(dp)
 }
 
@@ -1761,9 +1998,20 @@ pub fn gpu_candidate_generate(freq: &GpuBuffer, n_freq: usize, k: usize) -> Resu
       if max_cands == 0 {
             return Ok((GpuBuffer::alloc(1)?, 0));
       }
-      let out = GpuBuffer::alloc(max_cands * (k + 1))?;
-      let n_generated = unsafe { launch_candidate_generate(freq.ptr as *const c_void, out.ptr, n_freq as i32, k as i32, std::ptr::null_mut()) };
-      Ok((out, n_generated as usize))
+      // Pass 1: count candidates into a device counter, read it back to host.
+      let counter = GpuBuffer::zeros_bytes(std::mem::size_of::<i32>())?;
+      unsafe { launch_candidate_generate_count(freq.ptr as *const c_void, n_freq as i32, k as i32, counter.ptr, std::ptr::null_mut()); }
+      let mut count_host = [0i32; 1];
+      counter.download_i32(&mut count_host)?;
+      let n_generated = count_host[0] as usize;
+      if n_generated == 0 {
+            return Ok((GpuBuffer::alloc(1)?, 0));
+      }
+      // Pass 2: write candidates into an output sized for the counted total.
+      let out = GpuBuffer::alloc(n_generated * (k + 1))?;
+      let write_pos = GpuBuffer::zeros_bytes(std::mem::size_of::<i32>())?;
+      unsafe { launch_candidate_generate_write(freq.ptr as *const c_void, out.ptr, n_freq as i32, k as i32, write_pos.ptr, std::ptr::null_mut()); }
+      Ok((out, n_generated))
 }
 
 // ── Philox GPU RNG ───────────────────────────────────────────────────────

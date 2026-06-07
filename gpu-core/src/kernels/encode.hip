@@ -221,35 +221,24 @@ extern "C" void launch_one_hot(
 // ── count_distinct ────────────────────────────────────────────────────────────
 // Counts distinct values in a sorted int32 array.
 // Uses hipcub::DeviceRunLengthEncode to find run lengths, then counts the runs.
-// Writes result into a single int out[0].
-extern "C" void launch_count_distinct(
-      const int* x, int* out, int n, hipStream_t stream
+// Writes the number of runs directly into out[0] (no DtoD copy).
+// Caller allocates unique_vals (n ints), run_counts (n ints), and temp
+// (count_distinct_workspace_bytes() bytes). Caller owns any stream sync/readback.
+extern "C" size_t count_distinct_workspace_bytes(
+      const int* x, int n, hipStream_t stream
 ) {
-      // Allocate temporaries
-      int*    unique_vals = nullptr;
-      int*    run_counts  = nullptr;
-      int*    d_num_runs  = nullptr;
-      hipMalloc(&unique_vals, n * sizeof(int));
-      hipMalloc(&run_counts,  n * sizeof(int));
-      hipMalloc(&d_num_runs,  sizeof(int));
-
       size_t temp_bytes = 0;
       hipcub::DeviceRunLengthEncode::Encode(nullptr, temp_bytes,
-            x, unique_vals, run_counts, d_num_runs, n, stream);
+            x, (int*)nullptr, (int*)nullptr, (int*)nullptr, n, stream);
+      return temp_bytes;
+}
 
-      void* temp = nullptr;
-      hipMalloc(&temp, temp_bytes);
+extern "C" void launch_count_distinct(
+      const int* x, int* out, int* unique_vals, int* run_counts,
+      void* temp, size_t temp_bytes, int n, hipStream_t stream
+) {
       hipcub::DeviceRunLengthEncode::Encode(temp, temp_bytes,
-            x, unique_vals, run_counts, d_num_runs, n, stream);
-
-      // Copy num_runs → out
-      hipMemcpyAsync(out, d_num_runs, sizeof(int), hipMemcpyDeviceToDevice, stream);
-
-      hipStreamSynchronize(stream);
-      hipFree(temp);
-      hipFree(unique_vals);
-      hipFree(run_counts);
-      hipFree(d_num_runs);
+            x, unique_vals, run_counts, out, n, stream);
 }
 
 // ── run_length ────────────────────────────────────────────────────────────────
@@ -257,19 +246,21 @@ extern "C" void launch_count_distinct(
 // Precondition: x must be sorted ascending.
 // Writes unique values into values_out, counts into counts_out (both pre-allocated,
 // size n is sufficient), and the actual number of runs into n_runs_out[0].
-extern "C" void launch_run_length(
-      const int* x, int* values_out, int* counts_out, int* n_runs_out,
-      int n, hipStream_t stream
+// Caller allocates temp (run_length_workspace_bytes() bytes). Caller owns any
+// stream sync/readback of n_runs_out.
+extern "C" size_t run_length_workspace_bytes(
+      const int* x, int n, hipStream_t stream
 ) {
       size_t temp_bytes = 0;
       hipcub::DeviceRunLengthEncode::Encode(nullptr, temp_bytes,
-            x, values_out, counts_out, n_runs_out, n, stream);
+            x, (int*)nullptr, (int*)nullptr, (int*)nullptr, n, stream);
+      return temp_bytes;
+}
 
-      void* temp = nullptr;
-      hipMalloc(&temp, temp_bytes);
+extern "C" void launch_run_length(
+      const int* x, int* values_out, int* counts_out, int* n_runs_out,
+      void* temp, size_t temp_bytes, int n, hipStream_t stream
+) {
       hipcub::DeviceRunLengthEncode::Encode(temp, temp_bytes,
             x, values_out, counts_out, n_runs_out, n, stream);
-
-      hipStreamSynchronize(stream);
-      hipFree(temp);
 }

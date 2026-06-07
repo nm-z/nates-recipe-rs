@@ -110,15 +110,20 @@ extern "C" void launch_indexingx_triu(const double* m, double* out, int n, hipSt
 
 // masked_select via hipcub::DeviceSelect::Flagged ───────────────────────────
 // in [n], flags [n] (u8: nonzero=keep); out [n] (worst-case), num_out written
-// to d_num (1 int). Two-phase temp storage allocated internally.
-extern "C" void launch_indexingx_masked_select(
-    const double* in, const unsigned char* flags, double* out, int* d_num, int n, hipStream_t s
-) {
+// to d_num (1 int). Caller allocates d_temp (size from _workspace_bytes) and
+// reads d_num back to host after syncing the stream.
+extern "C" size_t indexingx_masked_select_workspace_bytes(int n) {
     void* d_temp = nullptr;
     size_t temp_bytes = 0;
+    hipcub::DeviceSelect::Flagged(
+        d_temp, temp_bytes,
+        (const double*)nullptr, (const unsigned char*)nullptr,
+        (double*)nullptr, (int*)nullptr, n, (hipStream_t)0);
+    return temp_bytes;
+}
+extern "C" void launch_indexingx_masked_select(
+    const double* in, const unsigned char* flags, double* out, int* d_num,
+    void* d_temp, size_t temp_bytes, int n, hipStream_t s
+) {
     hipcub::DeviceSelect::Flagged(d_temp, temp_bytes, in, flags, out, d_num, n, s);
-    hipMalloc(&d_temp, temp_bytes);
-    hipcub::DeviceSelect::Flagged(d_temp, temp_bytes, in, flags, out, d_num, n, s);
-    hipStreamSynchronize(s);
-    hipFree(d_temp);
 }

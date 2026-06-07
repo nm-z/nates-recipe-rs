@@ -202,8 +202,6 @@ extern "C" void launch_layernorm_backward_f32(
       float* grad_x, float* grad_gamma, float* grad_beta,
       int rows, int cols, float eps, hipStream_t stream
 ) {
-      (void)hipMemsetAsync(grad_gamma, 0, (size_t)cols * sizeof(float), stream);
-      (void)hipMemsetAsync(grad_beta, 0, (size_t)cols * sizeof(float), stream);
       int threads = min(256, max(32, cols));
       hipLaunchKernelGGL(layernorm_backward_f32_kernel, dim3(rows), dim3(threads), 0, stream,
             grad_y, x, gamma, grad_x, grad_gamma, grad_beta, rows, cols, eps);
@@ -264,7 +262,6 @@ extern "C" void launch_avg_pool_2d_backward_f32(
       const float* grad_out, float* grad_in,
       int N, int C, int H, int W, int kH, int kW, int sH, int sW, int outH, int outW, hipStream_t stream
 ) {
-      (void)hipMemsetAsync(grad_in, 0, (size_t)N * C * H * W * sizeof(float), stream);
       int total = N * C * outH * outW;
       GRID256(total); hipLaunchKernelGGL(avg_pool_2d_backward_f32_kernel, grid, block, 0, stream,
             grad_out, grad_in, N, C, H, W, kH, kW, sH, sW, outH, outW);
@@ -319,7 +316,6 @@ extern "C" void launch_max_pool_2d_backward_f32(
       const float* grad_out, const float* indices, float* grad_in,
       int N, int C, int outH, int outW, int H, int W, hipStream_t stream
 ) {
-      (void)hipMemsetAsync(grad_in, 0, (size_t)N * C * H * W * sizeof(float), stream);
       int total = N * C * outH * outW;
       GRID256(total); hipLaunchKernelGGL(max_pool_2d_backward_f32_kernel, grid, block, 0, stream,
             grad_out, indices, grad_in, N, C, outH, outW, H * W);

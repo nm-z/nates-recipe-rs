@@ -71,6 +71,24 @@ unsafe extern "C" {
     // Stream-ordered allocation
     pub fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
     pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
+    // Managed (unified) memory
+    pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+    // rocBLAS — matrix-vector multiply (out_dim == 1 fast path)
+    pub fn rocblas_dgemv(
+        handle: *mut c_void, trans: u32,
+        m: i32, n: i32, alpha: *const f64,
+        A: *const f64, lda: i32,
+        x: *const f64, incx: i32,
+        beta: *const f64, y: *mut f64, incy: i32,
+    ) -> i32;
+    // rocBLAS — rank-1 update: A = alpha * x * yᵀ + A (column-major)
+    pub fn rocblas_dger(
+        handle: *mut c_void,
+        m: i32, n: i32, alpha: *const f64,
+        x: *const f64, incx: i32,
+        y: *const f64, incy: i32,
+        A: *mut f64, lda: i32,
+    ) -> i32;
 }
 
 pub fn mem_info() -> Result<(usize, usize), HipError> {

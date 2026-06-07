@@ -23,7 +23,25 @@ struct DivByRows {
     __host__ __device__ double operator()(double v) const { return v * inv_rows; }
 };
 
-extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, int cols, hipStream_t stream) {
+extern "C" size_t reduce_sum_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
+    auto input_it = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0),
+        ColTransposeOp{x, rows, cols});
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+
+    size_t tmp_bytes = 0;
+    rocprim::segmented_reduce(nullptr, tmp_bytes,
+        input_it, (double*)nullptr, (unsigned int)cols,
+        begin_offsets, end_offsets,
+        rocprim::plus<double>(), 0.0,
+        stream);
+    return tmp_bytes;
+}
+
+extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
         ColTransposeOp{x, rows, cols});
@@ -34,26 +52,14 @@ extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, i
     auto end_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
 
-    size_t tmp_bytes = 0;
-    rocprim::segmented_reduce(nullptr, tmp_bytes,
-        input_it, out, (unsigned int)cols,
-        begin_offsets, end_offsets,
-        rocprim::plus<double>(), 0.0,
-        stream);
-
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
     rocprim::segmented_reduce(tmp, tmp_bytes,
         input_it, out, (unsigned int)cols,
         begin_offsets, end_offsets,
         rocprim::plus<double>(), 0.0,
         stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
-extern "C" void launch_reduce_sum_rows(const double* x, double* out, int rows, int cols, hipStream_t stream) {
-    // Row-major: each row is contiguous, segment i = [i*cols, (i+1)*cols)
+extern "C" size_t reduce_sum_rows_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -61,24 +67,33 @@ extern "C" void launch_reduce_sum_rows(const double* x, double* out, int rows, i
 
     size_t tmp_bytes = 0;
     rocprim::segmented_reduce(nullptr, tmp_bytes,
-        x, out, (unsigned int)rows,
+        x, (double*)nullptr, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::plus<double>(), 0.0,
         stream);
+    return tmp_bytes;
+}
 
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+extern "C" void launch_reduce_sum_rows(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    // Row-major: each row is contiguous, segment i = [i*cols, (i+1)*cols)
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{cols});
+
     rocprim::segmented_reduce(tmp, tmp_bytes,
         x, out, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::plus<double>(), 0.0,
         stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
-extern "C" void launch_reduce_mean_cols(const double* x, double* out, int rows, int cols, hipStream_t stream) {
-    launch_reduce_sum_cols(x, out, rows, cols, stream);
+extern "C" size_t reduce_mean_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
+    return reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+}
+
+extern "C" void launch_reduce_mean_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    launch_reduce_sum_cols(x, out, rows, cols, tmp, tmp_bytes, stream);
     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
@@ -95,8 +110,12 @@ __global__ void var_pass2_kernel(const double* x, const double* means, double* o
     out[col] = acc / rows;
 }
 
-extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, int cols, hipStream_t stream) {
-    launch_reduce_mean_cols(x, out, rows, cols, stream);
+extern "C" size_t reduce_var_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
+    return reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+}
+
+extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    launch_reduce_mean_cols(x, out, rows, cols, tmp, tmp_bytes, stream);
     dim3 block(256);
     dim3 grid((cols + 255) / 256);
     var_pass2_kernel<<<grid, block, 0, stream>>>(x, out, out, rows, cols);
@@ -232,7 +251,7 @@ extern "C" void launch_centroid_update(const double* x, const int* assignments, 
 // Row reductions: contiguous segments of length cols.
 // Column reductions: virtual transposed segments via ColTransposeOp.
 
-extern "C" void launch_reduce_max_rows(const double* x, double* out, int rows, int cols, hipStream_t stream) {
+extern "C" size_t reduce_max_rows_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -240,20 +259,25 @@ extern "C" void launch_reduce_max_rows(const double* x, double* out, int rows, i
 
     size_t tmp_bytes = 0;
     rocprim::segmented_reduce(nullptr, tmp_bytes,
-        x, out, (unsigned int)rows,
+        x, (double*)nullptr, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::maximum<double>(), -1e308, stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+    return tmp_bytes;
+}
+
+extern "C" void launch_reduce_max_rows(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{cols});
+
     rocprim::segmented_reduce(tmp, tmp_bytes,
         x, out, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::maximum<double>(), -1e308, stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
-extern "C" void launch_reduce_max_cols(const double* x, double* out, int rows, int cols, hipStream_t stream) {
+extern "C" size_t reduce_max_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
         ColTransposeOp{x, rows, cols});
@@ -264,20 +288,28 @@ extern "C" void launch_reduce_max_cols(const double* x, double* out, int rows, i
 
     size_t tmp_bytes = 0;
     rocprim::segmented_reduce(nullptr, tmp_bytes,
-        input_it, out, (unsigned int)cols,
+        input_it, (double*)nullptr, (unsigned int)cols,
         begin_offsets, end_offsets,
         rocprim::maximum<double>(), -1e308, stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+    return tmp_bytes;
+}
+
+extern "C" void launch_reduce_max_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    auto input_it = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0),
+        ColTransposeOp{x, rows, cols});
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+
     rocprim::segmented_reduce(tmp, tmp_bytes,
         input_it, out, (unsigned int)cols,
         begin_offsets, end_offsets,
         rocprim::maximum<double>(), -1e308, stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
-extern "C" void launch_reduce_min_rows(const double* x, double* out, int rows, int cols, hipStream_t stream) {
+extern "C" size_t reduce_min_rows_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -285,20 +317,25 @@ extern "C" void launch_reduce_min_rows(const double* x, double* out, int rows, i
 
     size_t tmp_bytes = 0;
     rocprim::segmented_reduce(nullptr, tmp_bytes,
-        x, out, (unsigned int)rows,
+        x, (double*)nullptr, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::minimum<double>(), 1e308, stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+    return tmp_bytes;
+}
+
+extern "C" void launch_reduce_min_rows(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{cols});
+
     rocprim::segmented_reduce(tmp, tmp_bytes,
         x, out, (unsigned int)rows,
         begin_offsets, end_offsets,
         rocprim::minimum<double>(), 1e308, stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
-extern "C" void launch_reduce_min_cols(const double* x, double* out, int rows, int cols, hipStream_t stream) {
+extern "C" size_t reduce_min_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
         ColTransposeOp{x, rows, cols});
@@ -309,17 +346,25 @@ extern "C" void launch_reduce_min_cols(const double* x, double* out, int rows, i
 
     size_t tmp_bytes = 0;
     rocprim::segmented_reduce(nullptr, tmp_bytes,
-        input_it, out, (unsigned int)cols,
+        input_it, (double*)nullptr, (unsigned int)cols,
         begin_offsets, end_offsets,
         rocprim::minimum<double>(), 1e308, stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+    return tmp_bytes;
+}
+
+extern "C" void launch_reduce_min_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    auto input_it = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0),
+        ColTransposeOp{x, rows, cols});
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+
     rocprim::segmented_reduce(tmp, tmp_bytes,
         input_it, out, (unsigned int)cols,
         begin_offsets, end_offsets,
         rocprim::minimum<double>(), 1e308, stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
 // ── Log-sum-exp per row ────────────────────────────────────────────────────
@@ -367,24 +412,24 @@ extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out,
 
 // ── Prefix sum (parallel scan) ─────────────────────────────────────────────
 
-extern "C" void launch_prefix_sum_inclusive(const double* x, double* out, int n, hipStream_t stream) {
+extern "C" size_t prefix_sum_inclusive_workspace_bytes(const double* x, int n, hipStream_t stream) {
     size_t tmp_bytes = 0;
-    rocprim::inclusive_scan(nullptr, tmp_bytes, x, out, n, rocprim::plus<double>(), stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
-    rocprim::inclusive_scan(tmp, tmp_bytes, x, out, n, rocprim::plus<double>(), stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
+    rocprim::inclusive_scan(nullptr, tmp_bytes, x, (double*)nullptr, n, rocprim::plus<double>(), stream);
+    return tmp_bytes;
 }
 
-extern "C" void launch_prefix_sum_exclusive(const double* x, double* out, int n, hipStream_t stream) {
+extern "C" void launch_prefix_sum_inclusive(const double* x, double* out, int n, void* tmp, size_t tmp_bytes, hipStream_t stream) {
+    rocprim::inclusive_scan(tmp, tmp_bytes, x, out, n, rocprim::plus<double>(), stream);
+}
+
+extern "C" size_t prefix_sum_exclusive_workspace_bytes(const double* x, int n, hipStream_t stream) {
     size_t tmp_bytes = 0;
-    rocprim::exclusive_scan(nullptr, tmp_bytes, x, out, 0.0, (size_t)n, rocprim::plus<double>(), stream);
-    void* tmp = nullptr;
-    hipMalloc(&tmp, tmp_bytes);
+    rocprim::exclusive_scan(nullptr, tmp_bytes, x, (double*)nullptr, 0.0, (size_t)n, rocprim::plus<double>(), stream);
+    return tmp_bytes;
+}
+
+extern "C" void launch_prefix_sum_exclusive(const double* x, double* out, int n, void* tmp, size_t tmp_bytes, hipStream_t stream) {
     rocprim::exclusive_scan(tmp, tmp_bytes, x, out, 0.0, (size_t)n, rocprim::plus<double>(), stream);
-    hipStreamSynchronize(stream);
-    hipFree(tmp);
 }
 
 extern "C" void launch_log_sum_exp_rows(const double* x, double* out, int rows, int cols, hipStream_t stream) {

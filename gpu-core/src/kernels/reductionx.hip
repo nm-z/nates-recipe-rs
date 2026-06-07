@@ -4,99 +4,145 @@
 #include <float.h>
 
 // ── Full-array reduction gaps (scalar out[0]) ──────────────────────────────
-// All launchers take (const double* x, double* out, int n, hipStream_t s).
-// out is a length-1 device buffer; the Rust side downloads out[0].
+// Launchers do ZERO HIP memory APIs: no hipMalloc/hipFree/hipMemcpy/hipMemset,
+// no host-side hipStreamSynchronize. rocprim temp storage and all internal
+// device scalars are allocated by the Rust caller and passed in as pointers.
+// For each rocprim-backed gap, query the temp size with the matching
+// launch_*_workspace_bytes(...) function, allocate that many bytes, and pass
+// the buffer + size to the launcher. After the launch, the Rust caller syncs
+// its stream and downloads out[].
 // rocprim::reduce signature: reduce(tmp, tmp_bytes, in, out, init, n, op, stream).
 
-// generic rocprim reduce over a (possibly transformed) input iterator
+// rocprim temp-storage size query — pure size computation, launches nothing,
+// touches no device memory (temp storage == nullptr path).
 template <typename InIt, typename Op>
-static inline void rp_reduce(InIt in, double* out, double init, int n, Op op, hipStream_t s) {
+static inline size_t rp_reduce_bytes(InIt in, double* out, double init, int n, Op op) {
       size_t tmp = 0;
-      rocprim::reduce(nullptr, tmp, in, out, init, (size_t)n, op, s);
-      void* d = nullptr;
-      hipMalloc(&d, tmp);
-      rocprim::reduce(d, tmp, in, out, init, (size_t)n, op, s);
-      hipStreamSynchronize(s);
-      hipFree(d);
+      rocprim::reduce(nullptr, tmp, in, out, init, (size_t)n, op);
+      return tmp;
+}
+
+// rocprim reduce into out[0] using caller-provided temp storage (d, d_bytes).
+template <typename InIt, typename Op>
+static inline void rp_reduce(InIt in, double* out, double init, int n, Op op, hipStream_t s, void* d, size_t d_bytes) {
+      rocprim::reduce(d, d_bytes, in, out, init, (size_t)n, op, s);
 }
 
 // product = Π x_i
-extern "C" void launch_reductionx_prod(const double* x, double* out, int n, hipStream_t s) {
-      rp_reduce(x, out, 1.0, n, rocprim::multiplies<double>(), s);
+extern "C" size_t launch_reductionx_prod_workspace_bytes(const double* x, double* out, int n) {
+      return rp_reduce_bytes(x, out, 1.0, n, rocprim::multiplies<double>());
+}
+extern "C" void launch_reductionx_prod(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      rp_reduce(x, out, 1.0, n, rocprim::multiplies<double>(), s, workspace, workspace_bytes);
 }
 
 // nansum = Σ x_i treating NaN as 0
 struct NanToZero { __host__ __device__ double operator()(double v) const { return v == v ? v : 0.0; } };
-extern "C" void launch_reductionx_nansum(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_nansum_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, NanToZero{});
-      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s);
+      return rp_reduce_bytes(it, out, 0.0, n, rocprim::plus<double>());
+}
+extern "C" void launch_reductionx_nansum(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, NanToZero{});
+      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);
 }
 
 // mean_abs = (Σ |x_i|) / n  -> launcher returns Σ|x_i|; Rust divides by n
 struct AbsOp { __host__ __device__ double operator()(double v) const { return v < 0.0 ? -v : v; } };
-extern "C" void launch_reductionx_mean_abs(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_mean_abs_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, AbsOp{});
-      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s);
+      return rp_reduce_bytes(it, out, 0.0, n, rocprim::plus<double>());
+}
+extern "C" void launch_reductionx_mean_abs(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, AbsOp{});
+      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);
 }
 
 // sumsq ("sum of squares" / sqrSum) = Σ x_i²   (distinct from l2 = sqrt of this)
 struct SqOp { __host__ __device__ double operator()(double v) const { return v * v; } };
-extern "C" void launch_reductionx_sumsq(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_sumsq_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, SqOp{});
-      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s);
+      return rp_reduce_bytes(it, out, 0.0, n, rocprim::plus<double>());
+}
+extern "C" void launch_reductionx_sumsq(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, SqOp{});
+      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);
 }
 
 // count_nonzero = number of x_i != 0  (returned as a double)
 struct IsNonzero { __host__ __device__ double operator()(double v) const { return v != 0.0 ? 1.0 : 0.0; } };
-extern "C" void launch_reductionx_count_nonzero(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_count_nonzero_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, IsNonzero{});
-      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s);
+      return rp_reduce_bytes(it, out, 0.0, n, rocprim::plus<double>());
+}
+extern "C" void launch_reductionx_count_nonzero(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, IsNonzero{});
+      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);
 }
 
 // any = (∃ x_i != 0) ? 1 : 0    (logical OR over truthiness)
-extern "C" void launch_reductionx_any(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_any_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, IsNonzero{});
-      rp_reduce(it, out, 0.0, n, rocprim::maximum<double>(), s);
+      return rp_reduce_bytes(it, out, 0.0, n, rocprim::maximum<double>());
+}
+extern "C" void launch_reductionx_any(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, IsNonzero{});
+      rp_reduce(it, out, 0.0, n, rocprim::maximum<double>(), s, workspace, workspace_bytes);
 }
 
 // all = (∀ x_i != 0) ? 1 : 0    (logical AND over truthiness)
-extern "C" void launch_reductionx_all(const double* x, double* out, int n, hipStream_t s) {
+extern "C" size_t launch_reductionx_all_workspace_bytes(const double* x, double* out, int n) {
       auto it = rocprim::make_transform_iterator(x, IsNonzero{});
-      rp_reduce(it, out, 1.0, n, rocprim::minimum<double>(), s);
+      return rp_reduce_bytes(it, out, 1.0, n, rocprim::minimum<double>());
+}
+extern "C" void launch_reductionx_all(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      auto it = rocprim::make_transform_iterator(x, IsNonzero{});
+      rp_reduce(it, out, 1.0, n, rocprim::minimum<double>(), s, workspace, workspace_bytes);
 }
 
 // ptp ("peak to peak") = max(x) - min(x). Launcher writes max into out[0], min into out[1].
-extern "C" void launch_reductionx_ptp(const double* x, double* out, int n, hipStream_t s) {
-      rp_reduce(x, out,     -DBL_MAX, n, rocprim::maximum<double>(), s);
-      rp_reduce(x, out + 1,  DBL_MAX, n, rocprim::minimum<double>(), s);
+// One workspace reused for both reduces (serialized on stream s); size = max of the two.
+extern "C" size_t launch_reductionx_ptp_workspace_bytes(const double* x, double* out, int n) {
+      size_t a = rp_reduce_bytes(x, out,     -DBL_MAX, n, rocprim::maximum<double>());
+      size_t b = rp_reduce_bytes(x, out + 1,  DBL_MAX, n, rocprim::minimum<double>());
+      return a > b ? a : b;
+}
+extern "C" void launch_reductionx_ptp(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      rp_reduce(x, out,     -DBL_MAX, n, rocprim::maximum<double>(), s, workspace, workspace_bytes);
+      rp_reduce(x, out + 1,  DBL_MAX, n, rocprim::minimum<double>(), s, workspace, workspace_bytes);
 }
 
-// logsumexp = m + log(Σ exp(x_i - m)),  m = max(x). out[0]=lse. Needs m first.
+// logsumexp = m + log(Σ exp(x_i - m)),  m = max(x). out[0]=m, out[1]=Σexp; Rust finishes m+log(se).
+// Reduces write directly into out[0]/out[1]; the second reduce reads out[0] (=m) via the iterator,
+// safe because both reduces run on stream s. One workspace reused for both reduces.
 struct SubExp { const double* m; __host__ __device__ double operator()(double v) const { return exp(v - *m); } };
-extern "C" void launch_reductionx_logsumexp(const double* x, double* out, int n, hipStream_t s) {
-      double* m = nullptr; hipMalloc(&m, sizeof(double));
-      rp_reduce(x, m, -DBL_MAX, n, rocprim::maximum<double>(), s);
-      double* se = nullptr; hipMalloc(&se, sizeof(double));
-      auto it = rocprim::make_transform_iterator(x, SubExp{m});
-      rp_reduce(it, se, 0.0, n, rocprim::plus<double>(), s);
-      // out[0] = m + log(se)  (host finishes: download m, se -> Rust). Write both into out.
-      hipMemcpy(out,     m,  sizeof(double), hipMemcpyDeviceToDevice);
-      hipMemcpy(out + 1, se, sizeof(double), hipMemcpyDeviceToDevice);
-      hipFree(m); hipFree(se);
+extern "C" size_t launch_reductionx_logsumexp_workspace_bytes(const double* x, double* out, int n) {
+      size_t a = rp_reduce_bytes(x, out, -DBL_MAX, n, rocprim::maximum<double>());
+      auto it = rocprim::make_transform_iterator(x, SubExp{out});
+      size_t b = rp_reduce_bytes(it, out + 1, 0.0, n, rocprim::plus<double>());
+      return a > b ? a : b;
+}
+extern "C" void launch_reductionx_logsumexp(const double* x, double* out, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      rp_reduce(x, out, -DBL_MAX, n, rocprim::maximum<double>(), s, workspace, workspace_bytes);   // out[0] = m = max(x)
+      auto it = rocprim::make_transform_iterator(x, SubExp{out});
+      rp_reduce(it, out + 1, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);      // out[1] = Σ exp(x - m)
 }
 
 // var/std: launcher returns Σ(x_i - μ)² into out[0]; Rust divides by n (pop) or n-1 (sample) and sqrt for std.
-// Two-pass: mean μ first, then Σ(x-μ)².
+// Two-pass: mean μ first (into caller's `mu` scalar), then Σ(x-μ)². One workspace reused for both reduces.
 struct SqDevOp { const double* mu; __host__ __device__ double operator()(double v) const { double d = v - *mu; return d * d; } };
 __global__ void reductionx_scale1_kernel(double* p, double sc) { if (threadIdx.x == 0 && blockIdx.x == 0) p[0] *= sc; }
-extern "C" void launch_reductionx_sumsqdev(const double* x, double* out, int n, hipStream_t s) {
-      double* mu = nullptr; hipMalloc(&mu, sizeof(double));
-      rp_reduce(x, mu, 0.0, n, rocprim::plus<double>(), s);          // mu = Σx
+extern "C" size_t launch_reductionx_sumsqdev_workspace_bytes(const double* x, double* out, int n) {
+      size_t a = rp_reduce_bytes(x, out, 0.0, n, rocprim::plus<double>());
+      auto it = rocprim::make_transform_iterator(x, SqDevOp{out});
+      size_t b = rp_reduce_bytes(it, out, 0.0, n, rocprim::plus<double>());
+      return a > b ? a : b;
+}
+extern "C" void launch_reductionx_sumsqdev(const double* x, double* out, double* mu, int n, hipStream_t s, void* workspace, size_t workspace_bytes) {
+      rp_reduce(x, mu, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);          // mu = Σx
       hipLaunchKernelGGL(reductionx_scale1_kernel, dim3(1), dim3(1), 0, s, mu, 1.0 / (double)n); // mu /= n
-      hipStreamSynchronize(s);
       auto it = rocprim::make_transform_iterator(x, SqDevOp{mu});
-      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s);
-      hipFree(mu);
+      rp_reduce(it, out, 0.0, n, rocprim::plus<double>(), s, workspace, workspace_bytes);        // out = Σ(x-μ)²
 }
 
 // argmax/argmin: first-occurrence index of the global extremum, returned as a double in out[0].
@@ -143,21 +189,19 @@ __global__ void reductionx_argmin_kernel(const double* x, double* out, unsigned 
 __global__ void reductionx_idx_to_double(const unsigned long long* best, double* out) {
       if (threadIdx.x == 0) out[0] = (double)(int)(*best & 0xffffffffULL);
 }
-extern "C" void launch_reductionx_argmax(const double* x, double* out, int n, hipStream_t s) {
-      unsigned long long* best = nullptr; hipMalloc(&best, sizeof(unsigned long long));
-      unsigned long long zero = 0; hipMemcpy(best, &zero, sizeof(zero), hipMemcpyHostToDevice);
+// initializes the caller's `best` scalar to packed idx 0 (replaces the old HtoD memcpy of zero).
+__global__ void reductionx_zero_u64(unsigned long long* best) {
+      if (threadIdx.x == 0 && blockIdx.x == 0) best[0] = 0;
+}
+extern "C" void launch_reductionx_argmax(const double* x, double* out, unsigned long long* best, int n, hipStream_t s) {
+      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s, best);
       dim3 b(256); dim3 g(min(256, (n + 255) / 256));
       hipLaunchKernelGGL(reductionx_argmax_kernel, g, b, 0, s, x, out, best, n);
       hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, best, out);
-      hipStreamSynchronize(s);
-      hipFree(best);
 }
-extern "C" void launch_reductionx_argmin(const double* x, double* out, int n, hipStream_t s) {
-      unsigned long long* best = nullptr; hipMalloc(&best, sizeof(unsigned long long));
-      unsigned long long zero = 0; hipMemcpy(best, &zero, sizeof(zero), hipMemcpyHostToDevice);
+extern "C" void launch_reductionx_argmin(const double* x, double* out, unsigned long long* best, int n, hipStream_t s) {
+      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s, best);
       dim3 b(256); dim3 g(min(256, (n + 255) / 256));
       hipLaunchKernelGGL(reductionx_argmin_kernel, g, b, 0, s, x, out, best, n);
       hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, best, out);
-      hipStreamSynchronize(s);
-      hipFree(best);
 }

@@ -15,8 +15,13 @@ extern "C" void launch_iota(int* out, int n, hipStream_t stream) {
       hipLaunchKernelGGL(iota_kernel, grid, block, 0, stream, out, n);
 }
 
-// ── Bitonic argsort (self-contained, ascending by f64 key) ───────────────────
-// Keys padded with +INF sentinels so they sort to the tail.
+// ── Bitonic argsort building blocks (ascending by f64 key) ───────────────────
+// Keys padded with +INF sentinels so they sort to the tail. The caller drives
+// the bitonic schedule: it allocates keys[pn] (f64) and vals[pn] (i32) with
+// pn = next_pow2(n), fills keys[0..n) with the random keys, sets keys[n..pn) to
+// the sentinel via launch_fill_sentinel_f64, inits vals via launch_init_int_idx,
+// then runs the k/j double loop of launch_bitonic_step_idx. After the sort,
+// vals[0..n) is the permutation (the caller copies it to its perm output).
 
 __global__ void bitonic_step_idx_kernel_cb(double* keys, int* vals, int j, int k, int padded_n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -33,9 +38,19 @@ __global__ void bitonic_step_idx_kernel_cb(double* keys, int* vals, int j, int k
       }
 }
 
+extern "C" void launch_bitonic_step_idx(double* keys, int* vals, int j, int k, int padded_n, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(bitonic_step_idx_kernel_cb, g, b, 0, stream, keys, vals, j, k, padded_n);
+}
+
 __global__ void fill_sentinel_f64_kernel(double* data, int real_n, int padded_n, double sentinel) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= real_n && i < padded_n) data[i] = sentinel;
+}
+
+extern "C" void launch_fill_sentinel_f64(double* data, int real_n, int padded_n, double sentinel, hipStream_t stream) {
+      dim3 b(256), g((padded_n + 255) / 256);
+      hipLaunchKernelGGL(fill_sentinel_f64_kernel, g, b, 0, stream, data, real_n, padded_n, sentinel);
 }
 
 __global__ void init_int_idx_kernel(int* idx, int n) {
@@ -43,40 +58,15 @@ __global__ void init_int_idx_kernel(int* idx, int n) {
       if (i < n) idx[i] = i;
 }
 
-static int cb_next_pow2(int n) {
-      int p = 1;
-      while (p < n) p <<= 1;
-      return p;
-}
-
-// Sorts keys ascending and returns the permutation in idx_out.
-// keys_in: f64[n] (read-only device ptr), idx_out: int[n].
-static void bitonic_argsort_f64(const double* keys_in, int* idx_out, int n, hipStream_t stream) {
-      int pn = cb_next_pow2(n);
-      double* keys = nullptr;
-      int* vals = nullptr;
-      hipMalloc(&keys, (size_t)pn * sizeof(double));
-      hipMalloc(&vals, (size_t)pn * sizeof(int));
-      hipMemcpyAsync(keys, keys_in, (size_t)n * sizeof(double), hipMemcpyDeviceToDevice, stream);
-      dim3 b(256), g((pn + 255) / 256);
-      hipLaunchKernelGGL(init_int_idx_kernel, g, b, 0, stream, vals, pn);
-      if (pn > n) {
-            hipLaunchKernelGGL(fill_sentinel_f64_kernel, g, b, 0, stream, keys, n, pn, DBL_MAX);
-      }
-      for (int k = 2; k <= pn; k <<= 1) {
-            for (int j = k >> 1; j > 0; j >>= 1) {
-                  hipLaunchKernelGGL(bitonic_step_idx_kernel_cb, g, b, 0, stream, keys, vals, j, k, pn);
-            }
-      }
-      hipMemcpyAsync(idx_out, vals, (size_t)n * sizeof(int), hipMemcpyDeviceToDevice, stream);
-      hipStreamSynchronize(stream);
-      hipFree(keys);
-      hipFree(vals);
+extern "C" void launch_init_int_idx(int* idx, int n, hipStream_t stream) {
+      dim3 b(256), g((n + 255) / 256);
+      hipLaunchKernelGGL(init_int_idx_kernel, g, b, 0, stream, idx, n);
 }
 
 // ── random_permutation ────────────────────────────────────────────────────────
-// Uses a simple LCG on device to fill rand_keys[i], then argsorts them.
-// The resulting argsort indices ARE the permutation.
+// Uses a simple LCG on device to fill rand_keys[i]; argsorting those keys (via
+// the bitonic building blocks above) yields the permutation. The caller fills
+// the keys with launch_lcg_rand, then runs the bitonic schedule.
 
 __global__ void lcg_rand_kernel(double* out, int n, unsigned int seed) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -92,19 +82,9 @@ __global__ void lcg_rand_kernel(double* out, int n, unsigned int seed) {
       out[i] = (double)(state & 0x00FFFFFFu) / (double)0x01000000;
 }
 
-extern "C" void launch_random_permutation(
-      int* perm_out, int n, unsigned int seed, hipStream_t stream
-) {
-      double* rand_keys = nullptr;
-      hipMalloc(&rand_keys, (size_t)n * sizeof(double));
-
+extern "C" void launch_lcg_rand(double* out, int n, unsigned int seed, hipStream_t stream) {
       dim3 block(256), grid((n + 255) / 256);
-      hipLaunchKernelGGL(lcg_rand_kernel, grid, block, 0, stream, rand_keys, n, seed);
-
-      // argsort rand_keys ascending => random permutation
-      bitonic_argsort_f64(rand_keys, perm_out, n, stream);
-
-      hipFree(rand_keys);
+      hipLaunchKernelGGL(lcg_rand_kernel, grid, block, 0, stream, out, n, seed);
 }
 
 // ── ordered_target_stats ──────────────────────────────────────────────────────
@@ -126,6 +106,9 @@ extern "C" void launch_random_permutation(
 // current row in numerator/denominator), then update the accumulator AFTER
 // writing. This is identical to what CatBoost's CPU path does and prevents the
 // target from leaking into its own statistic.
+//
+// The cat_sum / cat_cnt accumulators (n_categories doubles each) are caller-owned
+// scratch and must be zero-filled by the caller before launch.
 
 __global__ void ordered_target_stats_kernel(
       const int*    cat_col,       // i32[n] — category index per row, 0-based
@@ -159,25 +142,16 @@ extern "C" void launch_ordered_target_stats(
       const double* target,
       const int*    perm,
       double*       encoded_out,
+      double*       cat_sum,       // scratch: n_categories doubles, caller zero-fills
+      double*       cat_cnt,       // scratch: n_categories doubles, caller zero-fills
       int           n,
-      int           n_categories,
+      int           n_categories,  // scratch sizing only; unused inside the wrapper
       double        prior,
       double        smoothing,
       hipStream_t   stream
 ) {
-      double* cat_sum = nullptr;
-      double* cat_cnt = nullptr;
-      hipMalloc(&cat_sum, (size_t)n_categories * sizeof(double));
-      hipMalloc(&cat_cnt, (size_t)n_categories * sizeof(double));
-      hipMemsetAsync(cat_sum, 0, (size_t)n_categories * sizeof(double), stream);
-      hipMemsetAsync(cat_cnt, 0, (size_t)n_categories * sizeof(double), stream);
-      hipStreamSynchronize(stream);
-
+      (void)n_categories;
       hipLaunchKernelGGL(ordered_target_stats_kernel, dim3(1), dim3(1), 0, stream,
             cat_col, target, perm, encoded_out, cat_sum, cat_cnt,
             n, prior, smoothing);
-
-      hipStreamSynchronize(stream);
-      hipFree(cat_sum);
-      hipFree(cat_cnt);
 }

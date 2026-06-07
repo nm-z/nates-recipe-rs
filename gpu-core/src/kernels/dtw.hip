@@ -30,53 +30,35 @@ __global__ void dtw_antidiag_kernel(
     dp[i * stride + j] = c + fmin(fmin(top, left), diag);
 }
 
-// Full DTW: initialize DP table, then loop m+n-1 anti-diagonal launches.
-// Returns the completed DP table; the DTW distance is dp[m][n].
-extern "C" void launch_dtw(
-    const double* cost, double* dp,
-    int m, int n, hipStream_t stream
+// ── DTW init kernel ────────────────────────────────────────────────────────
+// Fill the DP table border: dp[0][0] = 0, every other cell = +inf.
+// Replaces the former host-buffer upload init (no HIP memory API here).
+__global__ void dtw_init_kernel(double* dp, int dp_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dp_size) return;
+    dp[idx] = (idx == 0) ? 0.0 : 1e308;
+}
+
+// Single launch: initialize the DP table on device.
+// Caller allocates dp ((m+1)*(n+1) doubles) and passes dp_size = (m+1)*(n+1).
+extern "C" void launch_dtw_init(
+    double* dp, int dp_size, hipStream_t stream
 ) {
-    int stride = n + 1;
-    int dp_size = (m + 1) * stride;
+    dim3 bl(256); dim3 gr((dp_size + 255) / 256);
+    hipLaunchKernelGGL(dtw_init_kernel, gr, bl, 0, stream, dp, dp_size);
+}
 
-    // Init: dp[0][0] = 0, rest of border = +inf
-    // Fill entire dp with inf, then set dp[0][0] = 0
-    // Use a small kernel to fill
-    double inf_val = 1e308;
-
-    // Fill dp with inf
-    {
-        // Reuse fill pattern: one thread per element
-        int total = dp_size;
-        dim3 bl(256); dim3 gr((total + 255) / 256);
-        // Inline fill kernel — set all to inf
-        hipMemsetAsync(dp, 0, dp_size * sizeof(double), stream);
-    }
-    // Actually, hipMemset sets bytes to 0, which gives 0.0. We need inf.
-    // Use a device-side fill. We'll launch a trivial kernel.
-    // For simplicity: fill on host and upload? No, dp is already device memory.
-    // Use the existing fill kernel from elementwise.hip via a function pointer? No.
-    // Just write a local fill kernel here.
-
-    // Workaround: fill dp with inf, then zero dp[0][0]
-    // We'll do it with two hipMemcpy calls from host.
-    double zero = 0.0;
-    // First set all dp to inf using a simple kernel
-    hipStreamSynchronize(stream);
-    std::vector<double> init(dp_size, inf_val);
-    init[0] = 0.0;
-    hipMemcpy(dp, init.data(), dp_size * sizeof(double), hipMemcpyHostToDevice);
-
-    // Launch one kernel per anti-diagonal
-    int n_diags = m + n - 1;
-    for (int d = 0; d < n_diags; d++) {
-        // Number of cells on this anti-diagonal
-        int i_min = max(1, d + 2 - n);
-        int i_max = min(m, d + 1);
-        int count = i_max - i_min + 1;
-        if (count <= 0) continue;
-        dim3 bl(256); dim3 gr((count + 255) / 256);
-        hipLaunchKernelGGL(dtw_antidiag_kernel, gr, bl, 0, stream,
-            cost, dp, m, n, d);
-    }
+// Single launch: compute one anti-diagonal d of the DP table.
+// Caller loops d from 0 to m+n-2 after calling launch_dtw_init once.
+extern "C" void launch_dtw_antidiag(
+    const double* cost, double* dp,
+    int m, int n, int d, hipStream_t stream
+) {
+    int i_min = max(1, d + 2 - n);
+    int i_max = min(m, d + 1);
+    int count = i_max - i_min + 1;
+    if (count <= 0) return;
+    dim3 bl(256); dim3 gr((count + 255) / 256);
+    hipLaunchKernelGGL(dtw_antidiag_kernel, gr, bl, 0, stream,
+        cost, dp, m, n, d);
 }

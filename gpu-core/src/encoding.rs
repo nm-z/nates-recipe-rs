@@ -25,14 +25,23 @@ unsafe extern "C" {
             n: i32, n_classes: i32,
             stream: *mut c_void,
       );
+      fn count_distinct_workspace_bytes(
+            x: *const c_void, n: i32, stream: *mut c_void,
+      ) -> usize;
       fn launch_count_distinct(
             x: *const c_void, out: *mut c_void,
+            unique_vals: *mut c_void, run_counts: *mut c_void,
+            temp: *mut c_void, temp_bytes: usize,
             n: i32,
             stream: *mut c_void,
       );
+      fn run_length_workspace_bytes(
+            x: *const c_void, n: i32, stream: *mut c_void,
+      ) -> usize;
       fn launch_run_length(
             x: *const c_void, values_out: *mut c_void, counts_out: *mut c_void,
             n_runs_out: *mut c_void,
+            temp: *mut c_void, temp_bytes: usize,
             n: i32,
             stream: *mut c_void,
       );
@@ -155,11 +164,21 @@ pub fn gpu_one_hot(
 // x must be a sorted i32 GpuBuffer of length n.
 // Returns the number of distinct values as usize.
 pub fn gpu_count_distinct(x: &GpuBuffer, n: usize) -> Result<usize, HipError> {
-      let out = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+      let out         = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+      let unique_vals = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+      let run_counts  = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+      let temp_bytes  = unsafe {
+            count_distinct_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut())
+      };
+      let temp = GpuBuffer::alloc_bytes(temp_bytes)?;
       unsafe {
             launch_count_distinct(
                   x.ptr_raw() as *const c_void,
                   out.ptr_raw(),
+                  unique_vals.ptr_raw(),
+                  run_counts.ptr_raw(),
+                  temp.ptr_raw(),
+                  temp_bytes,
                   n as i32,
                   std::ptr::null_mut(),
             );
@@ -181,12 +200,18 @@ pub fn gpu_run_length(
       let values    = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
       let counts    = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
       let n_runs_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+      let temp_bytes = unsafe {
+            run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut())
+      };
+      let temp = GpuBuffer::alloc_bytes(temp_bytes)?;
       unsafe {
             launch_run_length(
                   x.ptr_raw() as *const c_void,
                   values.ptr_raw(),
                   counts.ptr_raw(),
                   n_runs_buf.ptr_raw(),
+                  temp.ptr_raw(),
+                  temp_bytes,
                   n as i32,
                   std::ptr::null_mut(),
             );

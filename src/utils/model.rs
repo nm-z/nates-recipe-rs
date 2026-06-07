@@ -299,17 +299,41 @@ struct LayerParams {
 /// loop allocates nothing after warmup. `acts[l]` = layer l's output (acts[last]
 /// = predictions), `da[l]` = dL/d(act_l), `dz[l]` = dL/d(preact_l), `dw[l]`/`db[l]`
 /// = parameter grads matching the `w`/`b` layout. Sizes are fixed across epochs.
+/// `metric_t0..t2` are n-long metric temporaries and `metric_scalar` is the single
+/// reduced output — preallocated so every per-epoch metric (R²/loss/accuracy) runs
+/// allocation-free through the fused launchers + `_into` variants.
 struct Scratch {
       acts: Vec<GpuBuffer>,
       da: Vec<GpuBuffer>,
       dz: Vec<GpuBuffer>,
       dw: Vec<GpuBuffer>,
       db: Vec<GpuBuffer>,
+      metric_t0: GpuBuffer,
+      metric_t1: GpuBuffer,
+      metric_t2: GpuBuffer,
+      metric_scalar: GpuBuffer,
+      reduce_ws: GpuBuffer,
 }
 
 impl Scratch {
       fn new(params: &[LayerParams], n: usize) -> Scratch {
-            let mut s = Scratch { acts: vec![], da: vec![], dz: vec![], dw: vec![], db: vec![] };
+            let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
+            for p in params {
+                  let w = kernels::gpu_reduce_sum_cols_workspace_bytes(n, p.out_dim);
+                  if w > max_ws { max_ws = w; }
+            }
+            let mut s = Scratch {
+                  acts: vec![],
+                  da: vec![],
+                  dz: vec![],
+                  dw: vec![],
+                  db: vec![],
+                  metric_t0: GpuBuffer::alloc(n).expect("scratch metric_t0"),
+                  metric_t1: GpuBuffer::alloc(n).expect("scratch metric_t1"),
+                  metric_t2: GpuBuffer::alloc(n).expect("scratch metric_t2"),
+                  metric_scalar: GpuBuffer::alloc(1).expect("scratch metric_scalar"),
+                  reduce_ws: GpuBuffer::alloc_bytes(max_ws).expect("scratch reduce_ws"),
+            };
             for p in params {
                   s.acts.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch acts"));
                   s.da.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch da"));
@@ -405,72 +429,69 @@ impl Model {
 
       /// One metric this epoch as a single GPU-reduced scalar, downloading only that
       /// scalar (never the n predictions). `out` = output activations (n×1, on GPU);
-      /// `ss_tot` and `y2m1` (= 2y-1) are precomputed once since the targets are fixed.
+      /// `ss_tot` is precomputed once since the targets are fixed. R²/MSE/accuracy go
+      /// through fused single-pass kernels (`gpu_ss_res_into`/`gpu_mse_into`/
+      /// `gpu_accuracy_into`); MAE/Huber/CE go through `_into` variants writing into the
+      /// preallocated `sc.metric_t*` temporaries — so the whole path allocates nothing.
       /// Matches `metric_num` exactly except accuracy differs only at the measure-zero
       /// p==0.5 tie (sigmoid outputs never land there).
-      fn metric_gpu(&self, m: Metric, out: &GpuBuffer, ybuf: &GpuBuffer, y2m1: &GpuBuffer, n: usize, ss_tot: f64, epoch: usize, elapsed: f64) -> f64 {
+      fn metric_gpu(&self, m: Metric, out: &GpuBuffer, ybuf: &GpuBuffer, sc: &Scratch, n: usize, ss_tot: f64, epoch: usize, elapsed: f64) -> f64 {
             match m {
                   Metric::Epoch => epoch as f64,
                   Metric::Lr => self.lr,
                   Metric::Time => elapsed,
                   Metric::R2 => {
-                        let d = kernels::gpu_sub(ybuf, out, n).expect("r2 sub");
-                        let sq = kernels::gpu_mul(&d, &d, n).expect("r2 sq");
-                        let ssr = kernels::gpu_reduce_sum_cols(&sq, n, 1).expect("r2 reduce");
-                        1.0 - Self::download_scalar(&ssr) / ss_tot
+                        kernels::gpu_ss_res_into(out, ybuf, &sc.metric_scalar, n);
+                        1.0 - Self::download_scalar(&sc.metric_scalar) / ss_tot
                   }
                   Metric::Accuracy => {
-                        let pc = kernels::gpu_copy(out, n).expect("acc copy");
-                        kernels::gpu_add_scalar_inplace(&pc, -0.5, n);
-                        let prod = kernels::gpu_mul(&pc, y2m1, n).expect("acc mul");
-                        let sgn = kernels::gpu_sign(&prod, n).expect("acc sign");
-                        let sum = kernels::gpu_reduce_sum_cols(&sgn, n, 1).expect("acc reduce");
-                        (Self::download_scalar(&sum) + n as f64) / (2.0 * n as f64)
+                        kernels::gpu_accuracy_into(out, ybuf, &sc.metric_scalar, n);
+                        Self::download_scalar(&sc.metric_scalar) / n as f64
                   }
                   // The Loss metric is the model's ACTUAL loss (self.loss), not hardcoded.
                   Metric::Loss => {
                         let nf = n as f64;
                         match self.loss {
                               Loss::Mse => {
-                                    let d = kernels::gpu_sub(out, ybuf, n).expect("mse sub");
-                                    let sq = kernels::gpu_mul(&d, &d, n).expect("mse sq");
-                                    let s = kernels::gpu_reduce_sum_cols(&sq, n, 1).expect("mse reduce");
-                                    Self::download_scalar(&s) / nf
+                                    kernels::gpu_mse_into(out, ybuf, &sc.metric_scalar, n);
+                                    Self::download_scalar(&sc.metric_scalar) / nf
                               }
                               Loss::Mae => {
-                                    let d = kernels::gpu_sub(out, ybuf, n).expect("mae sub");
-                                    let a = kernels::gpu_abs(&d, n).expect("mae abs");
-                                    let s = kernels::gpu_reduce_sum_cols(&a, n, 1).expect("mae reduce");
-                                    Self::download_scalar(&s) / nf
+                                    kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, n, 1.0);
+                                    kernels::gpu_abs_into(&sc.metric_t0, &sc.metric_t0, n);
+                                    kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.metric_scalar, &sc.reduce_ws, n, 1);
+                                    Self::download_scalar(&sc.metric_scalar) / nf
                               }
                               Loss::Huber => {
                                     // delta=1: 0.5 r² for |r|≤1 else |r|-0.5, written as
                                     // 0.5·clamp(r,-1,1)² + |r| - |clamp(r,-1,1)|.
-                                    let r = kernels::gpu_sub(out, ybuf, n).expect("huber sub");
-                                    let rc = kernels::gpu_clamp(&r, n, -1.0, 1.0).expect("huber clamp");
-                                    let e = kernels::gpu_mul(&rc, &rc, n).expect("huber rc²");
-                                    kernels::gpu_scale_inplace(&e, 0.5, n);
-                                    let absr = kernels::gpu_abs(&r, n).expect("huber |r|");
-                                    kernels::gpu_add_inplace(&e, &absr, n);
-                                    let absrc = kernels::gpu_abs(&rc, n).expect("huber |rc|");
-                                    kernels::gpu_sub_inplace(&e, &absrc, n);
-                                    let s = kernels::gpu_reduce_sum_cols(&e, n, 1).expect("huber reduce");
-                                    Self::download_scalar(&s) / nf
+                                    kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, n, 1.0); // r
+                                    kernels::gpu_clamp_into(&sc.metric_t0, &sc.metric_t1, n, -1.0, 1.0); // rc
+                                    kernels::gpu_copy_into(&sc.metric_t1, &sc.metric_t2, n); // e = rc
+                                    kernels::gpu_mul_inplace(&sc.metric_t2, &sc.metric_t1, n); // e = rc²
+                                    kernels::gpu_scale_inplace(&sc.metric_t2, 0.5, n); // e = 0.5 rc²
+                                    kernels::gpu_abs_into(&sc.metric_t0, &sc.metric_t0, n); // |r|
+                                    kernels::gpu_add_inplace(&sc.metric_t2, &sc.metric_t0, n); // e += |r|
+                                    kernels::gpu_abs_into(&sc.metric_t1, &sc.metric_t1, n); // |rc|
+                                    kernels::gpu_sub_inplace(&sc.metric_t2, &sc.metric_t1, n); // e -= |rc|
+                                    kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.metric_scalar, &sc.reduce_ws, n, 1);
+                                    Self::download_scalar(&sc.metric_scalar) / nf
                               }
                               Loss::Ce => {
                                     let eps = 1e-7;
-                                    let pc = kernels::gpu_clamp(out, n, eps, 1.0 - eps).expect("ce clamp");
-                                    let lnp = kernels::gpu_log(&pc, n).expect("ce ln p");
-                                    let t1 = kernels::gpu_mul(ybuf, &lnp, n).expect("ce y·ln p");
-                                    let omp = kernels::gpu_scale(&pc, -1.0, n).expect("ce -p");
-                                    kernels::gpu_add_scalar_inplace(&omp, 1.0, n);
-                                    let lnomp = kernels::gpu_log(&omp, n).expect("ce ln(1-p)");
-                                    let omy = kernels::gpu_scale(ybuf, -1.0, n).expect("ce -y");
-                                    kernels::gpu_add_scalar_inplace(&omy, 1.0, n);
-                                    let t2 = kernels::gpu_mul(&omy, &lnomp, n).expect("ce (1-y)·ln(1-p)");
-                                    kernels::gpu_add_inplace(&t1, &t2, n);
-                                    let s = kernels::gpu_reduce_sum_cols(&t1, n, 1).expect("ce reduce");
-                                    -Self::download_scalar(&s) / nf
+                                    kernels::gpu_clamp_into(out, &sc.metric_t0, n, eps, 1.0 - eps); // pc
+                                    kernels::gpu_log_into(&sc.metric_t0, &sc.metric_t1, n); // ln pc
+                                    kernels::gpu_mul_inplace(&sc.metric_t1, ybuf, n); // y·ln pc
+                                    kernels::gpu_scale_inplace(&sc.metric_t0, -1.0, n); // -pc
+                                    kernels::gpu_add_scalar_inplace(&sc.metric_t0, 1.0, n); // 1-pc
+                                    kernels::gpu_log_into(&sc.metric_t0, &sc.metric_t0, n); // ln(1-pc)
+                                    kernels::gpu_copy_into(ybuf, &sc.metric_t2, n); // y
+                                    kernels::gpu_scale_inplace(&sc.metric_t2, -1.0, n); // -y
+                                    kernels::gpu_add_scalar_inplace(&sc.metric_t2, 1.0, n); // 1-y
+                                    kernels::gpu_mul_inplace(&sc.metric_t2, &sc.metric_t0, n); // (1-y)·ln(1-pc)
+                                    kernels::gpu_add_inplace(&sc.metric_t1, &sc.metric_t2, n); // sum terms
+                                    kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.metric_scalar, &sc.reduce_ws, n, 1);
+                                    -Self::download_scalar(&sc.metric_scalar) / nf
                               }
                         }
                   }
@@ -659,7 +680,14 @@ impl Model {
       fn forward_into(params: &[LayerParams], x: &GpuBuffer, n: usize, acts: &[GpuBuffer]) {
             for (l, p) in params.iter().enumerate() {
                   let prev = if l == 0 { x } else { &acts[l - 1] };
-                  kernels::gpu_linear_into(prev, &p.w, &p.b, &acts[l], n, p.out_dim, p.in_dim);
+                  // out_dim==1: z = X@w + b is a matrix-vector product. rocBLAS dispatches
+                  // a full GEMM tile (32×32) for one output column, wasting 31/32 of it —
+                  // dgemv reads the same operands once and is memory-bound, ~33× faster.
+                  if p.out_dim == 1 {
+                        kernels::gpu_matvec_bias_into(prev, &p.w, &p.b, &acts[l], n, p.in_dim);
+                  } else {
+                        kernels::gpu_linear_into(prev, &p.w, &p.b, &acts[l], n, p.out_dim, p.in_dim);
+                  }
                   let m = n * p.out_dim;
                   match p.act {
                         Activation::Relu => kernels::gpu_relu_into(&acts[l], &acts[l], m),
@@ -692,13 +720,24 @@ impl Model {
                         Activation::Linear => &sc.da[l],
                   };
                   let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
-                  if l > 0 {
+                  if out_dim == 1 {
+                        // Matvec/outer-product backward for the single-output layer,
+                        // mirroring the forward dgemv fast path:
+                        //   dw      = a_prevᵀ @ grad   (dgemv, trans)
+                        //   db      = Σ grad           (column reduce)
+                        //   da_below = grad ⊗ w        (dger rank-1), only when l>0
+                        kernels::gpu_dgemv_into(a_prev, grad, &sc.dw[l], n, in_dim, true);
+                        kernels::gpu_reduce_sum_cols_into(grad, &sc.db[l], &sc.reduce_ws, n, 1);
+                        if l > 0 {
+                              kernels::gpu_dger_into(grad, &params[l].w, &sc.da[l - 1], n, in_dim);
+                        }
+                  } else if l > 0 {
                         kernels::gpu_linear_backward_full_into(
-                              grad, a_prev, &params[l].w, &sc.da[l - 1], &sc.dw[l], &sc.db[l], n, out_dim, in_dim,
+                              grad, a_prev, &params[l].w, &sc.da[l - 1], &sc.dw[l], &sc.db[l], &sc.reduce_ws, n, out_dim, in_dim,
                         );
                   } else {
                         kernels::gpu_linear_backward_weights_only_into(
-                              grad, a_prev, &sc.dw[l], &sc.db[l], n, out_dim, in_dim,
+                              grad, a_prev, &sc.dw[l], &sc.db[l], &sc.reduce_ws, n, out_dim, in_dim,
                         );
                   }
                   kernels::gpu_sgd_update(&params[l].w, &sc.dw[l], self.lr, in_dim * out_dim);
@@ -908,14 +947,12 @@ impl Model {
             let mut r2_prev = f64::NAN;
             let mut saved = false;
             // Per-epoch metrics reduce to a scalar on the GPU; only the requested ones
-            // are downloaded. SS_tot (R²'s denominator) and 2y-1 (accuracy's sign basis)
-            // depend only on the constant targets, so compute them once here.
+            // are downloaded. SS_tot (R²'s denominator) depends only on the constant
+            // targets, so compute it once here.
             let ss_tot = {
                   let ybar = data.y.iter().sum::<f64>() / n as f64;
                   data.y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
             };
-            let y2m1 = kernels::gpu_scale(&ybuf, 2.0, n).expect("2y-1 scale");
-            kernels::gpu_add_scalar_inplace(&y2m1, -1.0, n);
             // Activation + gradient buffers, allocated once and reused every epoch
             // so steady-state VRAM is flat (no per-epoch sawtooth).
             let sc = Scratch::new(&params, n);
@@ -930,11 +967,31 @@ impl Model {
                   let log_now = cfg.log_every > 0
                         && !cfg.metrics.is_empty()
                         && (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
+                  // R² is needed when the trailing stop is armed, or when it will be
+                  // logged/plotted this epoch. Compute it ONCE (here, deferred) and reuse
+                  // for both the stop decision and the display — never twice.
+                  let want_r2 = checkpointing
+                        || (log_now && cfg.metrics.contains(&Metric::R2))
+                        || (plotting && plot_ys.contains(&Metric::R2));
+                  // Deferred trailing-stop sync: dispatch the R² reduce now (async, fused
+                  // single pass into metric_scalar) so it overlaps the backward GEMMs.
+                  // No sync here — backward is dispatched immediately after.
+                  if want_r2 {
+                        kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar, n);
+                  }
+                  // Backprop through every layer into the preallocated scratch (no alloc),
+                  // dispatched immediately — no hipDeviceSynchronize between forward and
+                  // backward. The R² reduce above is ordered ahead of it on the stream.
+                  self.backward_step(&params, &xbuf, &ybuf, n, &sc);
+                  // Read the R² scalar (8-byte D2H) at epoch end — the lone blocking copy,
+                  // landing after backward is already in flight (the deferred sync point).
+                  let r2 = if want_r2 {
+                        1.0 - Self::download_scalar(&sc.metric_scalar) / ss_tot
+                  } else {
+                        f64::NAN
+                  };
                   let mut checkpointed = false;
                   if checkpointing {
-                        // R² every epoch (the trailing stop needs it) — one GPU reduce,
-                        // one scalar down, never the n predictions.
-                        let r2 = self.metric_gpu(Metric::R2, out, &ybuf, &y2m1, n, ss_tot, e, 0.0);
                         // First epoch R² ticks down = trailing stop hit: decide once.
                         // Save the in-VRAM weights (≈ the peak, since blow-up is
                         // exponential) — but ONLY if they beat the file's stored R², so
@@ -953,15 +1010,12 @@ impl Model {
                               r2_prev = r2;
                         }
                   }
-                  // dL/dA at the output, averaged over the batch, then backprop
-                  // through every layer into the preallocated scratch (no alloc).
-                  self.backward_step(&params, &xbuf, &ybuf, n, &sc);
                   let last_epoch = e + 1 == cfg.epochs;
                   if log_now || checkpointed || plotting {
                         let elapsed = start.elapsed().as_secs_f64();
                         if !plotting && (log_now || checkpointed) {
                               let vals: Vec<f64> = cfg.metrics.iter()
-                                    .map(|&m| self.metric_gpu(m, out, &ybuf, &y2m1, n, ss_tot, e, elapsed))
+                                    .map(|&m| if m == Metric::R2 { r2 } else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) })
                                     .collect();
                               let mut line = self.metrics_line(&cfg.metrics, &vals);
                               if checkpointed {
@@ -972,7 +1026,7 @@ impl Model {
                         if plotting {
                               let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
                               for &m in &plot_ys {
-                                    row.push(self.metric_gpu(m, out, &ybuf, &y2m1, n, ss_tot, e, elapsed));
+                                    row.push(if m == Metric::R2 { r2 } else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) });
                               }
                               plot_rows.push(row);
                               // Throttle live redraws to ~25 fps; always draw the last frame.
@@ -1191,8 +1245,7 @@ mod metric_gpu_tests {
 
             // GPU-side scratch, mirroring fit.
             let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
-            let y2m1 = kernels::gpu_scale(&ybuf, 2.0, n).expect("y2m1");
-            kernels::gpu_add_scalar_inplace(&y2m1, -1.0, n);
+            let sc = Scratch::new(&params, n);
             let ybar = y.iter().sum::<f64>() / n as f64;
             let ss_tot = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>();
 
@@ -1212,12 +1265,12 @@ mod metric_gpu_tests {
             };
             let mdl = |loss: Loss| Model { specs: vec![], loss, lr: 0.01, params: RefCell::new(vec![]) };
 
-            close(mdl(Loss::Mse).metric_gpu(Metric::R2, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), r2_ref, "R2");
-            close(mdl(Loss::Mse).metric_gpu(Metric::Accuracy, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), acc_ref, "Accuracy");
-            close(mdl(Loss::Mse).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), mse_ref, "MSE");
-            close(mdl(Loss::Mae).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), mae_ref, "MAE");
-            close(mdl(Loss::Huber).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), huber_ref, "Huber");
-            close(mdl(Loss::Ce).metric_gpu(Metric::Loss, out, &ybuf, &y2m1, n, ss_tot, 0, 0.0), bce_ref, "BCE");
+            close(mdl(Loss::Mse).metric_gpu(Metric::R2, out, &ybuf, &sc, n, ss_tot, 0, 0.0), r2_ref, "R2");
+            close(mdl(Loss::Mse).metric_gpu(Metric::Accuracy, out, &ybuf, &sc, n, ss_tot, 0, 0.0), acc_ref, "Accuracy");
+            close(mdl(Loss::Mse).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, ss_tot, 0, 0.0), mse_ref, "MSE");
+            close(mdl(Loss::Mae).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, ss_tot, 0, 0.0), mae_ref, "MAE");
+            close(mdl(Loss::Huber).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, ss_tot, 0, 0.0), huber_ref, "Huber");
+            close(mdl(Loss::Ce).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, ss_tot, 0, 0.0), bce_ref, "BCE");
 
             eprintln!("OK n={n} d={d}  R2={r2_ref:.6}  acc={acc_ref:.6}  mse={mse_ref:.6}  mae={mae_ref:.6}  huber={huber_ref:.6}  bce={bce_ref:.6}");
       }
