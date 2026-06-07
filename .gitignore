@@ -24,3 +24,5 @@ kaggle_s6e4/cache/
 
 # Local dataset symlink (machine-specific absolute path)
 /german_credit.arff
+engi_results.db
+engi/

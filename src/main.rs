@@ -3,20 +3,34 @@ use anyhow::Result;
 fn main() -> Result<()> {
       let args: Vec<String> = std::env::args().collect();
       if args.len() < 2 {
-            eprintln!("usage: recipe <model.lua>");
+            eprintln!("usage: recipe <train.csv> [--target <col>]");
             std::process::exit(1);
       }
 
-      let lua = mlua::Lua::new();
-      nates_recipe::lua_runtime::init(&lua)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+      gpu_core::hip::set_device(0)?;
 
-      let code = std::fs::read_to_string(&args[1])?;
-      match lua.load(&code).set_name(&args[1]).eval::<mlua::Value>() {
-            Ok(mlua::Value::Nil) => {}
-            Ok(val) => println!("{}", val.to_string().unwrap_or_default()),
-            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+      let mut target = None;
+      let mut path = &args[1];
+      let mut i = 2;
+      while i < args.len() {
+            match args[i].as_str() {
+                  "--target" => {
+                        target = Some(args[i + 1].as_str());
+                        i += 2;
+                  }
+                  _ => {
+                        path = &args[i];
+                        i += 1;
+                  }
+            }
       }
+
+      let mut loader = nates_recipe::Data::load().set(path);
+      if let Some(t) = target {
+            loader = loader.target(t);
+      }
+      let (train, _test) = loader.prepare();
+      eprintln!("loaded {} samples × {} features", train.x.nrows(), train.x.ncols());
 
       gpu_core::kernels::gpu_shutdown();
       Ok(())

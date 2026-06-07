@@ -8,11 +8,10 @@ name = "nates_recipe"
 
 [workspace]
 members = ["."]
-exclude = ["nates-gpu-lua", "catboost-rs", "xgboost-rs", "lightgbm-rs"]
+exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
 
 [dependencies]
 gpu-core = { path = "gpu-core" }
-mlua = { version = "0.10", features = ["lua54", "vendored"] }
 anyhow = "1"
 polars = { version = "0.46", features = [
       "csv", "lazy", "dtype-full",
