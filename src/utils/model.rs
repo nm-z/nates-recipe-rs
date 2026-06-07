@@ -1355,6 +1355,85 @@ mod metric_gpu_tests {
             eprintln!("alloc/epoch (first 5)={:?} ... all_zero={}  R2 first={:.6} last={:.6}",
                   &counts[..5.min(counts.len())], counts.iter().all(|&c| c == 0), r2s[0], r2s[EPOCHS - 1]);
       }
+
+      #[test]
+      fn vram_footprint_matches_working_set() {
+            gpu_core::hip::set_device(0).expect("set_device");
+            unsafe { gpu_core::hip::hipDeviceSynchronize() };
+
+            let vram_used = || -> usize {
+                  let mut free = 0usize;
+                  let mut total = 0usize;
+                  unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+                  total - free
+            };
+
+            let mb = |b: usize| b as f64 / 1048576.0;
+            let baseline = vram_used();
+
+            let n: usize = 594194;
+            let specs: &[(usize, usize)] = &[(46, 200), (200, 100), (100, 200), (200, 1)];
+
+            let mut requested = 0usize;
+            let mut bufs: Vec<GpuBuffer> = Vec::new();
+
+            let xbytes = n * 46 * 8;
+            bufs.push(GpuBuffer::alloc_bytes(xbytes).expect("x"));
+            requested += xbytes;
+            let ybytes = n * 8;
+            bufs.push(GpuBuffer::alloc_bytes(ybytes).expect("y"));
+            requested += ybytes;
+
+            for &(in_d, out_d) in specs {
+                  let wb = in_d * out_d * 8;
+                  bufs.push(GpuBuffer::alloc_bytes(wb).expect("w"));
+                  requested += wb;
+                  let bb = out_d * 8;
+                  bufs.push(GpuBuffer::alloc_bytes(bb).expect("b"));
+                  requested += bb;
+            }
+
+            for &(_, out_d) in specs {
+                  for _ in 0..5 {
+                        let sz = n * out_d * 8;
+                        bufs.push(GpuBuffer::alloc_bytes(sz).expect("scratch"));
+                        requested += sz;
+                  }
+            }
+            for _ in 0..3 {
+                  bufs.push(GpuBuffer::alloc_bytes(n * 8).expect("metric_t"));
+                  requested += n * 8;
+            }
+            bufs.push(GpuBuffer::alloc_bytes(8).expect("metric_scalar"));
+            requested += 8;
+            bufs.push(GpuBuffer::alloc_bytes(4096).expect("reduce_ws"));
+            requested += 4096;
+
+            unsafe { gpu_core::hip::hipDeviceSynchronize() };
+            let after_alloc = vram_used();
+            let consumed = after_alloc.saturating_sub(baseline);
+            let overhead_pct = 100.0 * (consumed as f64 - requested as f64) / requested as f64;
+
+            eprintln!("requested  = {:.1} MB", mb(requested));
+            eprintln!("consumed   = {:.1} MB", mb(consumed));
+            eprintln!("overhead   = {:.1}%", overhead_pct);
+            eprintln!("total VRAM = {:.1} MB / {:.1} MB",
+                  mb(after_alloc), mb(after_alloc + vram_used() - after_alloc + after_alloc - after_alloc));
+
+            drop(bufs);
+            unsafe { gpu_core::hip::hipDeviceSynchronize() };
+            let after_free = vram_used();
+            let returned = after_alloc.saturating_sub(after_free);
+            eprintln!("freed      = {:.1} MB", mb(returned));
+            eprintln!("post-free  = {:.1} MB", mb(after_free));
+
+            assert!(overhead_pct < 20.0,
+                  "VRAM overhead {overhead_pct:.1}% > 20% — hipMalloc page waste too high \
+                   (requested {:.0} MB, consumed {:.0} MB)", mb(requested), mb(consumed));
+            assert!(returned > requested / 2,
+                  "hipFree returned only {:.0} MB of {:.0} MB — memory not being released",
+                  mb(returned), mb(consumed));
+      }
 }
 
 
