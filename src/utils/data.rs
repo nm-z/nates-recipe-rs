@@ -89,14 +89,18 @@ pub fn train_test_split(
 /// inference or encoding here — schema inference and encoding happen later, once
 /// the target/feature roles are known. Returns (headers, rows).
 pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    // Announce the on-disk size BEFORE polars allocates — the real magnitude the
+    // user is committing to RAM. Text columns make the dense f64 size (rows×cols×8B)
+    // a wild underestimate; the actual hog is the per-cell String text.
+    let disk = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    eprintln!("loading {} ({} on disk)", short_path(path.to_str().unwrap_or_default()), human_bytes(disk));
     let df = read_csv(path.to_str().unwrap_or_default(), true)?;
     let headers: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
     let h = df.height();
     let w = df.width();
-    // Announce the RAM footprint up front (dense f64: rows × cols × 8B), with the
-    // same progress bar the image path uses, ticking as columns materialize.
-    let bytes = h.saturating_mul(w).saturating_mul(std::mem::size_of::<f64>());
-    eprintln!("loading {}", short_path(path.to_str().unwrap_or_default()));
+    // Same progress bar the image path uses, ticking per column. The message shows
+    // the ACTUAL String bytes accumulating (content + 24B/cell overhead), so the
+    // number tracks true RAM growth, not a fictional dense-matrix estimate.
     let pb = ProgressBar::new(w as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -106,14 +110,19 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
         .progress_chars("=>-"),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(120));
-    pb.set_message(format!("{} into RAM ({h} rows × {w} cols)", human_bytes(bytes)));
+    pb.set_message(format!("0 B into RAM ({h} rows × {w} cols)"));
+    let overhead = std::mem::size_of::<String>();
+    let mut ram = h.saturating_mul(w).saturating_mul(overhead);
     let mut rows = vec![vec![String::new(); w]; h];
     for (j, col) in df.get_columns().iter().enumerate() {
         let s = col.cast(&DataType::String)?;
         let ca = s.str()?;
         for (i, v) in ca.into_iter().enumerate() {
-            rows[i][j] = v.unwrap_or("").to_string();
+            let cell = v.unwrap_or("");
+            ram += cell.len();
+            rows[i][j] = cell.to_string();
         }
+        pb.set_message(format!("{} into RAM ({h} rows × {w} cols)", human_bytes(ram)));
         pb.inc(1);
     }
     pb.finish();
