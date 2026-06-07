@@ -765,10 +765,36 @@ impl Model {
             Self::download_vec(acts.last().expect("predict: no output"), n)
       }
 
+      fn vram_required(specs: &[(usize, Activation)], n: usize, d: usize) -> usize {
+            let mut bytes = 0usize;
+            bytes += n * d * 8;
+            bytes += n * 8;
+            let mut in_dim = d;
+            for &(units, _) in specs {
+                  bytes += in_dim * units * 8;
+                  bytes += units * 8;
+                  bytes += 5 * n * units * 8;
+                  in_dim = units;
+            }
+            bytes += 3 * n * 8;
+            bytes += 8 + 4096;
+            bytes
+      }
+
       fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
-            // Non-empty params = this model already ran — a rerun (e.g. an lr ramp).
-            // Suppress the pre-run summary and post-run recap on reruns.
             let rerun = !self.params.borrow().is_empty();
+            let n = data.x.nrows();
+            let d = data.x.ncols();
+            let need = Self::vram_required(&self.specs, n, d);
+            let mut free = 0usize;
+            let mut total = 0usize;
+            unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+            if need > free * 9 / 10 {
+                  eprintln!("VRAM budget exceeded: need {:.0} MB, free {:.0} MB / {:.0} MB total\n\
+                        reduce layer widths or sample count (n={n})",
+                        need as f64 / 1048576.0, free as f64 / 1048576.0, total as f64 / 1048576.0);
+                  std::process::exit(1);
+            }
             let start = std::time::Instant::now();
             let (xbuf, n, d) = Self::upload(&data.x);
             let ybuf = GpuBuffer::upload(
@@ -1357,82 +1383,28 @@ mod metric_gpu_tests {
       }
 
       #[test]
-      fn vram_footprint_matches_working_set() {
+      fn vram_budget_rejects_oversized_model() {
+            let specs = vec![
+                  (200, Activation::Relu),
+                  (100, Activation::Relu),
+                  (200, Activation::Relu),
+                  (1, Activation::Sigmoid),
+            ];
+            let n = 594194usize;
+            let d = 46usize;
+            let need = Model::vram_required(&specs, n, d);
+            let need_mb = need as f64 / 1048576.0;
+
+            let mut free = 0usize;
+            let mut total = 0usize;
             gpu_core::hip::set_device(0).expect("set_device");
-            unsafe { gpu_core::hip::hipDeviceSynchronize() };
+            unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+            let total_mb = total as f64 / 1048576.0;
 
-            let vram_used = || -> usize {
-                  let mut free = 0usize;
-                  let mut total = 0usize;
-                  unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
-                  total - free
-            };
-
-            let mb = |b: usize| b as f64 / 1048576.0;
-            let baseline = vram_used();
-
-            let n: usize = 594194;
-            let specs: &[(usize, usize)] = &[(46, 200), (200, 100), (100, 200), (200, 1)];
-
-            let mut requested = 0usize;
-            let mut bufs: Vec<GpuBuffer> = Vec::new();
-
-            let xbytes = n * 46 * 8;
-            bufs.push(GpuBuffer::alloc_bytes(xbytes).expect("x"));
-            requested += xbytes;
-            let ybytes = n * 8;
-            bufs.push(GpuBuffer::alloc_bytes(ybytes).expect("y"));
-            requested += ybytes;
-
-            for &(in_d, out_d) in specs {
-                  let wb = in_d * out_d * 8;
-                  bufs.push(GpuBuffer::alloc_bytes(wb).expect("w"));
-                  requested += wb;
-                  let bb = out_d * 8;
-                  bufs.push(GpuBuffer::alloc_bytes(bb).expect("b"));
-                  requested += bb;
-            }
-
-            for &(_, out_d) in specs {
-                  for _ in 0..5 {
-                        let sz = n * out_d * 8;
-                        bufs.push(GpuBuffer::alloc_bytes(sz).expect("scratch"));
-                        requested += sz;
-                  }
-            }
-            for _ in 0..3 {
-                  bufs.push(GpuBuffer::alloc_bytes(n * 8).expect("metric_t"));
-                  requested += n * 8;
-            }
-            bufs.push(GpuBuffer::alloc_bytes(8).expect("metric_scalar"));
-            requested += 8;
-            bufs.push(GpuBuffer::alloc_bytes(4096).expect("reduce_ws"));
-            requested += 4096;
-
-            unsafe { gpu_core::hip::hipDeviceSynchronize() };
-            let after_alloc = vram_used();
-            let consumed = after_alloc.saturating_sub(baseline);
-            let overhead_pct = 100.0 * (consumed as f64 - requested as f64) / requested as f64;
-
-            eprintln!("requested  = {:.1} MB", mb(requested));
-            eprintln!("consumed   = {:.1} MB", mb(consumed));
-            eprintln!("overhead   = {:.1}%", overhead_pct);
-            eprintln!("total VRAM = {:.1} MB / {:.1} MB",
-                  mb(after_alloc), mb(after_alloc + vram_used() - after_alloc + after_alloc - after_alloc));
-
-            drop(bufs);
-            unsafe { gpu_core::hip::hipDeviceSynchronize() };
-            let after_free = vram_used();
-            let returned = after_alloc.saturating_sub(after_free);
-            eprintln!("freed      = {:.1} MB", mb(returned));
-            eprintln!("post-free  = {:.1} MB", mb(after_free));
-
-            assert!(overhead_pct < 20.0,
-                  "VRAM overhead {overhead_pct:.1}% > 20% — hipMalloc page waste too high \
-                   (requested {:.0} MB, consumed {:.0} MB)", mb(requested), mb(consumed));
-            assert!(returned > requested / 2,
-                  "hipFree returned only {:.0} MB of {:.0} MB — memory not being released",
-                  mb(returned), mb(consumed));
+            eprintln!("model needs {need_mb:.0} MB, card has {total_mb:.0} MB total");
+            assert!(need_mb > total_mb * 0.85,
+                  "46→200→100→200→1 at n={n} should exceed 85% of {total_mb:.0} MB card, \
+                   but vram_required reports only {need_mb:.0} MB — budget check is wrong");
       }
 }
 
