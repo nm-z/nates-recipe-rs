@@ -20,7 +20,6 @@ unsafe extern "C" {
     // rocBLAS handle management
     fn rocblas_create_handle(handle: *mut *mut c_void) -> i32;
     fn rocblas_destroy_handle(handle: *mut c_void) -> i32;
-    fn hipDeviceReset() -> i32;
 
     // rocBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
     fn rocblas_dgemm(
@@ -335,7 +334,11 @@ pub fn gpu_shutdown() {
             unsafe { rocblas_destroy_handle(ptr); }
         }
     });
-    unsafe { hipDeviceReset(); }
+    // NO hipDeviceReset() here. At process exit our atexit handler runs before
+    // HIP's own __hip_module_dtor (LIFO); resetting the device frees HIP's
+    // context, which the module dtor then double-frees → heap corruption
+    // ("unaligned tcache chunk" / "corrupted double-linked list"). The OS
+    // reclaims all VRAM on exit regardless, so the reset is redundant here.
 }
 
 /// Fused linear: out = X @ W + bias. X is (m,k), W is (k,n), bias is (1,n), out is (m,n).
