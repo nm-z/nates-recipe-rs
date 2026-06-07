@@ -295,19 +295,13 @@ struct LayerParams {
       act: Activation,
 }
 
-/// Per-layer GPU scratch, allocated once and reused every epoch so the training
-/// loop allocates nothing after warmup. `acts[l]` = layer l's output (acts[last]
-/// = predictions), `da[l]` = dL/d(act_l), `dz[l]` = dL/d(preact_l), `dw[l]`/`db[l]`
-/// = parameter grads matching the `w`/`b` layout. Sizes are fixed across epochs.
-/// `metric_t0..t2` are n-long metric temporaries and `metric_scalar` is the single
-/// reduced output — preallocated so every per-epoch metric (R²/loss/accuracy) runs
-/// allocation-free through the fused launchers + `_into` variants.
 struct Scratch {
       acts: Vec<GpuBuffer>,
-      da: Vec<GpuBuffer>,
-      dz: Vec<GpuBuffer>,
-      dw: Vec<GpuBuffer>,
-      db: Vec<GpuBuffer>,
+      da_a: GpuBuffer,
+      da_b: GpuBuffer,
+      dz: GpuBuffer,
+      dw: GpuBuffer,
+      db: GpuBuffer,
       metric_t0: GpuBuffer,
       metric_t1: GpuBuffer,
       metric_t2: GpuBuffer,
@@ -318,30 +312,35 @@ struct Scratch {
 impl Scratch {
       fn new(params: &[LayerParams], n: usize) -> Scratch {
             let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
+            let mut max_act = 0usize;
+            let mut max_wt = 0usize;
+            let mut max_bias = 0usize;
             for p in params {
                   let w = kernels::gpu_reduce_sum_cols_workspace_bytes(n, p.out_dim);
                   if w > max_ws { max_ws = w; }
+                  let a = n * p.out_dim;
+                  if a > max_act { max_act = a; }
+                  let wt = p.in_dim * p.out_dim;
+                  if wt > max_wt { max_wt = wt; }
+                  if p.out_dim > max_bias { max_bias = p.out_dim; }
             }
-            let mut s = Scratch {
-                  acts: vec![],
-                  da: vec![],
-                  dz: vec![],
-                  dw: vec![],
-                  db: vec![],
+            let mut acts = Vec::with_capacity(params.len());
+            for p in params {
+                  acts.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch acts"));
+            }
+            Scratch {
+                  acts,
+                  da_a: GpuBuffer::alloc(max_act).expect("scratch da_a"),
+                  da_b: GpuBuffer::alloc(max_act).expect("scratch da_b"),
+                  dz: GpuBuffer::alloc(max_act).expect("scratch dz"),
+                  dw: GpuBuffer::alloc(max_wt).expect("scratch dw"),
+                  db: GpuBuffer::alloc(max_bias).expect("scratch db"),
                   metric_t0: GpuBuffer::alloc(n).expect("scratch metric_t0"),
                   metric_t1: GpuBuffer::alloc(n).expect("scratch metric_t1"),
                   metric_t2: GpuBuffer::alloc(n).expect("scratch metric_t2"),
                   metric_scalar: GpuBuffer::alloc(1).expect("scratch metric_scalar"),
                   reduce_ws: GpuBuffer::alloc_bytes(max_ws).expect("scratch reduce_ws"),
-            };
-            for p in params {
-                  s.acts.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch acts"));
-                  s.da.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch da"));
-                  s.dz.push(GpuBuffer::alloc(n * p.out_dim).expect("scratch dz"));
-                  s.dw.push(GpuBuffer::alloc(p.in_dim * p.out_dim).expect("scratch dw"));
-                  s.db.push(GpuBuffer::alloc(p.out_dim).expect("scratch db"));
             }
-            s
       }
 }
 
@@ -704,44 +703,44 @@ impl Model {
       /// then w -= lr·dw, b -= lr·db. `w` is read for da_below before its update.
       fn backward_step(&self, params: &[LayerParams], x: &GpuBuffer, ybuf: &GpuBuffer, n: usize, sc: &Scratch) {
             let last = params.len() - 1;
-            Self::loss_grad_into(self.loss, &sc.acts[last], ybuf, &sc.da[last], n, n * params[last].out_dim);
+            let (da_cur, da_next) = (&sc.da_a, &sc.da_b);
+            Self::loss_grad_into(self.loss, &sc.acts[last], ybuf, da_cur, n, n * params[last].out_dim);
+            let mut flip = false;
             for l in (0..params.len()).rev() {
                   let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
                   let m = n * out_dim;
+                  let da = if flip { da_next } else { da_cur };
+                  let da_below = if flip { da_cur } else { da_next };
                   let grad = match params[l].act {
                         Activation::Relu => {
-                              kernels::gpu_relu_backward_into(&sc.da[l], &sc.acts[l], &sc.dz[l], m);
-                              &sc.dz[l]
+                              kernels::gpu_relu_backward_into(da, &sc.acts[l], &sc.dz, m);
+                              &sc.dz
                         }
                         Activation::Sigmoid => {
-                              kernels::gpu_sigmoid_backward_into(&sc.da[l], &sc.acts[l], &sc.dz[l], m);
-                              &sc.dz[l]
+                              kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], &sc.dz, m);
+                              &sc.dz
                         }
-                        Activation::Linear => &sc.da[l],
+                        Activation::Linear => da,
                   };
                   let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
                   if out_dim == 1 {
-                        // Matvec/outer-product backward for the single-output layer,
-                        // mirroring the forward dgemv fast path:
-                        //   dw      = a_prevᵀ @ grad   (dgemv, trans)
-                        //   db      = Σ grad           (column reduce)
-                        //   da_below = grad ⊗ w        (dger rank-1), only when l>0
-                        kernels::gpu_dgemv_into(a_prev, grad, &sc.dw[l], n, in_dim, true);
-                        kernels::gpu_reduce_sum_cols_into(grad, &sc.db[l], &sc.reduce_ws, n, 1);
+                        kernels::gpu_dgemv_into(a_prev, grad, &sc.dw, n, in_dim, true);
+                        kernels::gpu_reduce_sum_cols_into(grad, &sc.db, &sc.reduce_ws, n, 1);
                         if l > 0 {
-                              kernels::gpu_dger_into(grad, &params[l].w, &sc.da[l - 1], n, in_dim);
+                              kernels::gpu_dger_into(grad, &params[l].w, da_below, n, in_dim);
                         }
                   } else if l > 0 {
                         kernels::gpu_linear_backward_full_into(
-                              grad, a_prev, &params[l].w, &sc.da[l - 1], &sc.dw[l], &sc.db[l], &sc.reduce_ws, n, out_dim, in_dim,
+                              grad, a_prev, &params[l].w, da_below, &sc.dw, &sc.db, &sc.reduce_ws, n, out_dim, in_dim,
                         );
                   } else {
                         kernels::gpu_linear_backward_weights_only_into(
-                              grad, a_prev, &sc.dw[l], &sc.db[l], &sc.reduce_ws, n, out_dim, in_dim,
+                              grad, a_prev, &sc.dw, &sc.db, &sc.reduce_ws, n, out_dim, in_dim,
                         );
                   }
-                  kernels::gpu_sgd_update(&params[l].w, &sc.dw[l], self.lr, in_dim * out_dim);
-                  kernels::gpu_sgd_update(&params[l].b, &sc.db[l], self.lr, out_dim);
+                  kernels::gpu_sgd_update(&params[l].w, &sc.dw, self.lr, in_dim * out_dim);
+                  kernels::gpu_sgd_update(&params[l].b, &sc.db, self.lr, out_dim);
+                  flip = !flip;
             }
       }
 
@@ -769,13 +768,21 @@ impl Model {
             let mut bytes = 0usize;
             bytes += n * d * 8;
             bytes += n * 8;
+            let mut max_act = 0usize;
+            let mut max_wt = 0usize;
             let mut in_dim = d;
             for &(units, _) in specs {
                   bytes += in_dim * units * 8;
                   bytes += units * 8;
-                  bytes += 5 * n * units * 8;
+                  bytes += n * units * 8;
+                  let a = n * units;
+                  if a > max_act { max_act = a; }
+                  let w = in_dim * units;
+                  if w > max_wt { max_wt = w; }
                   in_dim = units;
             }
+            bytes += 3 * max_act * 8;
+            bytes += max_wt * 8;
             bytes += 3 * n * 8;
             bytes += 8 + 4096;
             bytes
@@ -1383,7 +1390,7 @@ mod metric_gpu_tests {
       }
 
       #[test]
-      fn vram_budget_rejects_oversized_model() {
+      fn train_rs_model_fits_with_headroom() {
             let specs = vec![
                   (200, Activation::Relu),
                   (100, Activation::Relu),
@@ -1395,16 +1402,17 @@ mod metric_gpu_tests {
             let need = Model::vram_required(&specs, n, d);
             let need_mb = need as f64 / 1048576.0;
 
+            gpu_core::hip::set_device(0).expect("set_device");
             let mut free = 0usize;
             let mut total = 0usize;
-            gpu_core::hip::set_device(0).expect("set_device");
             unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
             let total_mb = total as f64 / 1048576.0;
+            let headroom_mb = total_mb - need_mb;
 
-            eprintln!("model needs {need_mb:.0} MB, card has {total_mb:.0} MB total");
-            assert!(need_mb > total_mb * 0.85,
-                  "46→200→100→200→1 at n={n} should exceed 85% of {total_mb:.0} MB card, \
-                   but vram_required reports only {need_mb:.0} MB — budget check is wrong");
+            eprintln!("model needs {need_mb:.0} MB, card has {total_mb:.0} MB, headroom {headroom_mb:.0} MB");
+            assert!(headroom_mb > 1500.0,
+                  "model needs {need_mb:.0} MB on a {total_mb:.0} MB card — only {headroom_mb:.0} MB \
+                   headroom, need >1500 MB for rocBLAS workspace + desktop compositing");
       }
 }
 
