@@ -871,26 +871,10 @@ impl Model {
                         }
                   }
                   if why.is_some() {
-                        // OGDL feature count = first layer's per-neuron weight count.
-                        let ogdl_feat = resumed.first().map_or(0, |(w, _)| w.len());
                         let path = resume.unwrap_or("");
-                        // Error rendered as OGDL itself: green node, bold-red reason,
-                        // then `file` and `data` sub-nodes whose children you compare.
-                        eprintln!(
-                              "\x1b[32mresume\x1b[0m\n\
-                               \x20   \x1b[1;31mdata does not match\x1b[0m\n\
-                               \x20       file\n\
-                               \x20           path={path}\n\
-                               \x20           features={ogdl_feat}\n\
-                               \x20           neurons={}\n\
-                               \x20       data\n\
-                               \x20           path={}\n\
-                               \x20           features={d}\n\
-                               \x20           neurons={expected}",
-                              resumed.len(),
-                              data.source,
-                        );
-                        std::process::exit(1);
+                        eprintln!("\x1b[32mresume\x1b[0m  \x1b[1;33march changed\x1b[0m ({} → {expected} neurons), ignoring {path}",
+                              resumed.len());
+                        resumed.clear();
                   }
             }
             let mut neuron = 0;
