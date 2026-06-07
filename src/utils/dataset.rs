@@ -638,7 +638,7 @@ impl Data {
                   if let Some(tgt) = t.as_ref() {
                         if !test.names.iter().any(|n| n == tgt) {
                               eprintln!("\x1b[1;31mtarget '{tgt}' absent from test set\x1b[0m\n    {tp}\n    eval needs labels; add the '{tgt}' column or drop .test()");
-                              std::process::exit(1);
+                              panic!("target '{tgt}' absent from test set {tp}");
                         }
                   }
                   let tset: std::collections::HashSet<&str> =
