@@ -71,12 +71,14 @@ extern "C" void launch_mse(const double* pred, const double* y, double* out, int
                          pred, y, out, n);
 }
 
-// ── classification accuracy: Σ [round(pred) == round(y)] / n ──────────────────
+// ── classification accuracy: Σ [(pred>=0.5) == (y>=0.5)] / n ──────────────────
+// Threshold at 0.5 to match the CPU reference (p>=0.5)==(y>=0.5). llround bins by
+// nearest integer — wrong for raw logits and for anything outside [0,1].
 __global__ void accuracy_kernel(const double* pred, const double* y, double* out, int n) {
       double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
       double acc = 0.0;
       for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-            acc += (llround(pred[i]) == llround(y[i])) ? inv_n : 0.0;
+            acc += ((pred[i] >= 0.5) == (y[i] >= 0.5)) ? inv_n : 0.0;
       }
       double block_sum = block_reduce_sum(acc);
       if (threadIdx.x == 0)
@@ -89,4 +91,26 @@ extern "C" void launch_acc_metric(const double* pred, const double* y, double* o
       if (blocks > 65535) blocks = 65535;
       hipLaunchKernelGGL(accuracy_kernel, dim3(blocks), dim3(BLOCK), 0, (hipStream_t)stream,
                          pred, y, out, n);
+}
+
+// ── binary cross-entropy gradient: da = (p - y) / (p(1-p)) / n ────────────────
+// Two-sided BCE: dL/dp = -y/p + (1-y)/(1-p) = (p-y)/(p(1-p)). Element-wise into
+// da (no reduction). p clamped to [eps, 1-eps] so the division stays finite at
+// the sigmoid tails. Paired with a sigmoid output this chains to dz = p-y.
+__global__ void bce_grad_kernel(const double* pred, const double* y, double* da, int n) {
+      double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
+      const double eps = 1e-7;
+      for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+            double p = pred[i];
+            p = p < eps ? eps : (p > 1.0 - eps ? 1.0 - eps : p);
+            da[i] = (p - y[i]) / (p * (1.0 - p)) * inv_n;
+      }
+}
+
+extern "C" void launch_bce_grad(const double* pred, const double* y, double* da, int n, void* stream) {
+      int blocks = (n + BLOCK - 1) / BLOCK;
+      if (blocks < 1) blocks = 1;
+      if (blocks > 65535) blocks = 65535;
+      hipLaunchKernelGGL(bce_grad_kernel, dim3(blocks), dim3(BLOCK), 0, (hipStream_t)stream,
+                         pred, y, da, n);
 }

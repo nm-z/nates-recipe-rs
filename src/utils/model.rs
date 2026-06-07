@@ -346,11 +346,19 @@ impl Scratch {
       }
 }
 
+/// Per-feature standardizer fit on the train set, reused verbatim on eval so
+/// train and eval see the same scaling (no leakage, no drift).
+struct Scaler {
+      mean: Vec<f64>,
+      std: Vec<f64>,
+}
+
 pub struct Model {
       specs: Vec<(usize, Activation)>,
       loss: Loss,
       lr: f64,
       params: RefCell<Vec<LayerParams>>,
+      scaler: RefCell<Option<Scaler>>,
 }
 
 impl Model {
@@ -360,6 +368,7 @@ impl Model {
                   loss: Loss::Mse,
                   lr: 0.01,
                   params: RefCell::new(Vec::new()),
+                  scaler: RefCell::new(None),
             }
       }
 
@@ -382,8 +391,9 @@ impl Model {
                         kernels::gpu_scale_inplace(da, inv, total);
                   }
                   Loss::Ce => {
-                        kernels::gpu_div_into(y, out, da, total);
-                        kernels::gpu_scale_inplace(da, -inv, total);
+                        // Two-sided BCE gradient (p-y)/(p(1-p))/n — not the one-sided
+                        // -y/p. With a sigmoid output this chains to dz = p-y.
+                        kernels::gpu_bce_grad_into(out, y, da, total);
                   }
             }
       }
@@ -401,28 +411,36 @@ impl Model {
       }
 
       /// Raw numeric value of a metric this epoch (p = downloaded predictions).
-      fn metric_num(&self, m: Metric, epoch: usize, p: &[f64], y: &crate::Vec1, n: usize, elapsed: f64) -> f64 {
+      fn metric_num(&self, m: Metric, epoch: usize, p: &[f64], y: &crate::Vec1, n: usize, k: usize, elapsed: f64) -> f64 {
+            let total = n * k;
+            let ys: &[f64] = y.as_slice().expect("metric: y contiguous");
             match m {
                   Metric::Epoch => epoch as f64,
                   Metric::Lr => self.lr,
                   Metric::Time => elapsed,
                   Metric::Accuracy => {
-                        (0..n).filter(|&i| (p[i] >= 0.5) == (y[i] >= 0.5)).count() as f64 / n as f64
+                        if k == 1 {
+                              (0..n).filter(|&i| (p[i] >= 0.5) == (ys[i] >= 0.5)).count() as f64 / n as f64
+                        } else {
+                              // Multi-output: argmax-of-row match (one-hot k-class).
+                              let argmax = |s: &[f64]| (0..k).max_by(|&a, &b| s[a].partial_cmp(&s[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+                              (0..n).filter(|&i| argmax(&p[i * k..i * k + k]) == argmax(&ys[i * k..i * k + k])).count() as f64 / n as f64
+                        }
                   }
                   Metric::Loss => {
                         let eps = 1e-7;
-                        -(0..n)
+                        -(0..total)
                               .map(|i| {
                                     let pi = p[i].clamp(eps, 1.0 - eps);
                                     y[i] * pi.ln() + (1.0 - y[i]) * (1.0 - pi).ln()
                               })
                               .sum::<f64>()
-                              / n as f64
+                              / total as f64
                   }
                   Metric::R2 => {
-                        let ybar = y.iter().sum::<f64>() / n as f64;
-                        let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
-                        let ss_res: f64 = (0..n).map(|i| (y[i] - p[i]).powi(2)).sum();
+                        let ybar = y.iter().take(total).sum::<f64>() / total as f64;
+                        let ss_tot: f64 = y.iter().take(total).map(|v| (v - ybar).powi(2)).sum();
+                        let ss_res: f64 = (0..total).map(|i| (y[i] - p[i]).powi(2)).sum();
                         1.0 - ss_res / ss_tot
                   }
             }
@@ -741,13 +759,14 @@ impl Model {
             v[0]
       }
 
+      /// Forward + download predictions, flat row-major n*out_dim (k outputs/row).
       fn predict(params: &[LayerParams], x: &GpuBuffer, n: usize) -> Vec<f64> {
             let acts: Vec<GpuBuffer> = params.iter()
                   .map(|p| GpuBuffer::alloc(n * p.out_dim).expect("predict acts"))
                   .collect();
             Self::forward_into(params, x, n, &acts);
             let last = params.len() - 1;
-            Self::download_vec(&acts[last], n)
+            Self::download_vec(&acts[last], n * params[last].out_dim)
       }
 
       fn vram_required(specs: &[(usize, Activation)], n: usize, d: usize) -> usize {
@@ -789,7 +808,21 @@ impl Model {
                   std::process::exit(1);
             }
             let start = std::time::Instant::now();
-            let (xbuf, n, d) = Self::upload(&data.x);
+            let (xraw, n, d) = Self::upload(&data.x);
+            // Per-column z-score on the TRAIN set. Raw frequency-encoded columns
+            // (id, TotalCharges, tenure, …) span wildly different magnitudes; fed
+            // unscaled they saturate the first layer and the gradient dies. Fit
+            // mean/std here, store them, reuse the SAME scaler on eval (no leakage).
+            let mean = kernels::gpu_reduce_mean_cols(&xraw, n, d).expect("mean");
+            let var = kernels::gpu_reduce_var_cols(&xraw, n, d).expect("var");
+            kernels::gpu_add_scalar_inplace(&var, 1e-8, d);
+            let std = kernels::gpu_sqrt(&var, d).expect("std");
+            let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("center");
+            let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("scale");
+            *self.scaler.borrow_mut() = Some(Scaler {
+                  mean: Self::download_vec(&mean, d),
+                  std: Self::download_vec(&std, d),
+            });
             let ybuf = GpuBuffer::upload(
                   data.y.as_slice().expect("train: y contiguous"),
             )
@@ -906,6 +939,14 @@ impl Model {
                   in_dim = units;
             }
             let last = params.len() - 1;
+            // Output units must equal the target count: y is flat n*k and acts[last]
+            // is n*out_dim — they must align element-for-element.
+            let k = data.n_targets.max(1);
+            assert_eq!(
+                  params[last].out_dim, k,
+                  "output layer has {} units but there are {k} target column(s) — make the last .layer({k})",
+                  params[last].out_dim
+            );
             let summary = if cfg.metrics.is_empty() {
                   String::new()
             } else {
@@ -966,7 +1007,8 @@ impl Model {
             // are downloaded. SS_tot (R²'s denominator) depends only on the constant
             // targets, so compute it once here.
             let ss_tot = {
-                  let ybar = data.y.iter().sum::<f64>() / n as f64;
+                  let total = (n * k) as f64;
+                  let ybar = data.y.iter().sum::<f64>() / total;
                   data.y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
             };
             // Activation + gradient buffers, allocated once and reused every epoch
@@ -979,31 +1021,37 @@ impl Model {
                   if INTERRUPTED.load(Ordering::SeqCst) {
                         break;
                   }
+                  // Forward with this epoch's weights, then backprop + SGD update.
                   Self::forward_into(&params, &xbuf, n, &sc.acts);
-                  let out = &sc.acts[last];
                   let log_now = cfg.log_every > 0
                         && !cfg.metrics.is_empty()
                         && (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-                  // R² is needed when the trailing stop is armed, or when it will be
-                  // logged/plotted this epoch. Compute it ONCE (here, deferred) and reuse
-                  // for both the stop decision and the display — never twice.
                   let want_r2 = checkpointing
                         || (log_now && cfg.metrics.contains(&Metric::R2))
                         || (plotting && plot_ys.contains(&Metric::R2));
-                  // Deferred trailing-stop sync: dispatch the R² reduce now (async, fused
-                  // single pass into metric_scalar) so it overlaps the backward GEMMs.
-                  // No sync here — backward is dispatched immediately after.
-                  if want_r2 {
-                        kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar, n);
-                  }
-                  // Backprop through every layer into the preallocated scratch (no alloc),
-                  // dispatched immediately — no hipDeviceSynchronize between forward and
-                  // backward. The R² reduce above is ordered ahead of it on the stream.
                   self.backward_step(&params, &xbuf, &ybuf, n, &sc);
-                  // Read the R² scalar (8-byte D2H) at epoch end — the lone blocking copy,
-                  // landing after backward is already in flight (the deferred sync point).
+                  // Logged/checkpointed metrics must describe the weights AFTER this
+                  // step's update — the pre-update forward above is stale the moment SGD
+                  // runs. Re-forward with the updated weights so the numbers match the
+                  // weights that get saved. Only when a metric is actually needed.
+                  let need_metric = want_r2
+                        || (log_now && !cfg.metrics.is_empty())
+                        || (plotting && !plot_ys.is_empty());
+                  if need_metric {
+                        Self::forward_into(&params, &xbuf, n, &sc.acts);
+                  }
+                  let out = &sc.acts[last];
+                  // The fused GPU metric kernels are single-column. For multi-output
+                  // (k>1) download predictions once and score on the CPU (argmax
+                  // accuracy, flat R²/loss). k==1 keeps the no-download GPU fast path.
+                  let preds_k = (need_metric && k > 1).then(|| Self::download_vec(out, n * k));
                   let r2 = if want_r2 {
-                        1.0 - Self::download_scalar(&sc.metric_scalar) / ss_tot
+                        if let Some(p) = &preds_k {
+                              self.metric_num(Metric::R2, e, p, &data.y, n, k, 0.0)
+                        } else {
+                              kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar, n);
+                              1.0 - Self::download_scalar(&sc.metric_scalar) / ss_tot
+                        }
                   } else {
                         f64::NAN
                   };
@@ -1032,7 +1080,9 @@ impl Model {
                         let elapsed = start.elapsed().as_secs_f64();
                         if !plotting && (log_now || checkpointed) {
                               let vals: Vec<f64> = cfg.metrics.iter()
-                                    .map(|&m| if m == Metric::R2 { r2 } else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) })
+                                    .map(|&m| if m == Metric::R2 { r2 }
+                                          else if let Some(p) = &preds_k { self.metric_num(m, e, p, &data.y, n, k, elapsed) }
+                                          else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) })
                                     .collect();
                               let mut line = self.metrics_line(&cfg.metrics, &vals);
                               if checkpointed {
@@ -1043,7 +1093,9 @@ impl Model {
                         if plotting {
                               let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
                               for &m in &plot_ys {
-                                    row.push(if m == Metric::R2 { r2 } else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) });
+                                    row.push(if m == Metric::R2 { r2 }
+                                          else if let Some(p) = &preds_k { self.metric_num(m, e, p, &data.y, n, k, elapsed) }
+                                          else { self.metric_gpu(m, out, &ybuf, &sc, n, ss_tot, e, elapsed) });
                               }
                               plot_rows.push(row);
                               // Throttle live redraws to ~25 fps; always draw the last frame.
@@ -1088,8 +1140,8 @@ impl Model {
             // post-dip recovery still saves. Model::save enforces the R²/finite gate.
             let end_r2 = checkpointing.then(|| {
                   Self::forward_into(&params, &xbuf, n, &sc.acts);
-                  let preds = Self::download_vec(&sc.acts[last], n);
-                  self.metric_num(Metric::R2, 0, &preds, &data.y, n, 0.0)
+                  let preds = Self::download_vec(&sc.acts[last], n * k);
+                  self.metric_num(Metric::R2, 0, &preds, &data.y, n, k, 0.0)
             });
             *self.params.borrow_mut() = params;
             if let Some(r2) = end_r2 {
@@ -1206,12 +1258,23 @@ impl Model {
       pub fn eval(&self, data: &Dataset) {
             let params = self.params.borrow();
             assert!(!params.is_empty(), "eval: call train() first");
-            let (xbuf, n, _d) = Self::upload(&data.x);
+            let (xraw, n, d) = Self::upload(&data.x);
+            // Apply the TRAIN-set scaler verbatim (same mean/std) — eval must see
+            // the exact transform training saw, or predictions are garbage.
+            let scaler = self.scaler.borrow();
+            let scaler = scaler.as_ref().expect("eval: missing scaler; call train first");
+            assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
+            assert_eq!(scaler.std.len(), d, "eval: feature count changed");
+            let mean = GpuBuffer::upload(&scaler.mean).expect("upload eval mean");
+            let std = GpuBuffer::upload(&scaler.std).expect("upload eval std");
+            let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("eval center");
+            let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("eval scale");
+            let k = params.last().expect("eval: empty model").out_dim;
             let preds = Self::predict(&params, &xbuf, n);
             // Labeled test (a split) → score it. Unlabeled (Kaggle test.csv, no
             // target column) → forward pass only, nothing to score against.
             if data.has_target {
-                  let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, 0.0);
+                  let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, k, 0.0);
                   let correct = (acc * n as f64).round() as usize;
                   eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
             } else {
@@ -1286,7 +1349,7 @@ mod metric_gpu_tests {
                   let tol = 1e-6 * a.abs().max(b.abs()).max(1.0);
                   assert!((a - b).abs() <= tol, "{what}: gpu={a} cpu={b} diff={}", (a - b).abs());
             };
-            let mdl = |loss: Loss| Model { specs: vec![], loss, lr: 0.01, params: RefCell::new(vec![]) };
+            let mdl = |loss: Loss| Model { specs: vec![], loss, lr: 0.01, params: RefCell::new(vec![]), scaler: RefCell::new(None) };
 
             let out = &sc.acts[last];
             close(mdl(Loss::Mse).metric_gpu(Metric::R2, out, &ybuf, &sc, n, ss_tot, 0, 0.0), r2_ref, "R2");
@@ -1349,7 +1412,7 @@ mod metric_gpu_tests {
             // (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
             // allocations and train R². download_vec is host-only (no GpuBuffer
             // alloc), so reading R² never perturbs the count.
-            let model = Model { specs: vec![], loss: Loss::Mse, lr: 0.5, params: RefCell::new(vec![]) };
+            let model = Model { specs: vec![], loss: Loss::Mse, lr: 0.5, params: RefCell::new(vec![]), scaler: RefCell::new(None) };
             let ybar = y.iter().sum::<f64>() / n as f64;
             let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
 
@@ -1411,7 +1474,7 @@ mod metric_gpu_tests {
             let init_b: Vec<Vec<f64>> = params.iter().map(|p| Model::download_vec(&p.b, p.out_dim)).collect();
 
             // --- ping-pong backward (modifies weights via SGD) ---
-            let model = Model { specs: vec![], loss: Loss::Mse, lr, params: RefCell::new(vec![]) };
+            let model = Model { specs: vec![], loss: Loss::Mse, lr, params: RefCell::new(vec![]), scaler: RefCell::new(None) };
             let sc = Scratch::new(&params, n);
             Model::forward_into(&params, &xbuf, n, &sc.acts);
             model.backward_step(&params, &xbuf, &ybuf, n, &sc);

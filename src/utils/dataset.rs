@@ -15,13 +15,30 @@ struct Attr {
       kind: Kind,
 }
 
+/// Accepts one target column (`"y"`) or several (`["a","b","c"]`) for `.target`.
+/// Rust methods aren't variadic, so multiple columns come in as an array/slice.
+pub trait IntoTargets {
+      fn into_targets(self) -> Vec<String>;
+}
+impl IntoTargets for &str {
+      fn into_targets(self) -> Vec<String> { vec![self.to_string()] }
+}
+impl<const N: usize> IntoTargets for [&str; N] {
+      fn into_targets(self) -> Vec<String> { self.iter().map(|s| s.to_string()).collect() }
+}
+impl IntoTargets for &[&str] {
+      fn into_targets(self) -> Vec<String> { self.iter().map(|s| s.to_string()).collect() }
+}
+
 pub struct Data {
       attrs: Vec<Attr>,
       rows: Vec<Vec<String>>,
-      target: usize,
-      // The requested target name (from `.target`). For ARFF it's resolved to the
-      // `target` index; for tabular set/test it's matched against column names.
-      target_name: Option<String>,
+      // ARFF target column indices, resolved from `target_names` when the schema is
+      // known up front. Empty until `.target` is called on an ARFF set.
+      targets: Vec<usize>,
+      // The requested target column name(s) (from `.target`). For ARFF resolved to
+      // `targets` indices; for tabular set/test matched against column names.
+      target_names: Vec<String>,
       source: String,
       // A separate test file (.test) and/or an internal split fraction (.split).
       // Neither set → no test set → no eval.
@@ -35,9 +52,13 @@ pub struct Data {
 
 pub struct Dataset {
       pub x: Mat,
+      // Targets, flat row-major: n*n_targets values, row r's targets at [r*k .. r*k+k].
+      // For a single target this is just the n-long column (k=1), unchanged.
       pub y: Vec1,
       pub source: String,
-      // True when the target column was present in this set (train always; a
+      // Number of target columns (k). Output layer must have this many units.
+      pub n_targets: usize,
+      // True when the target column(s) were present in this set (train always; a
       // Kaggle test.csv has no target → false → eval skips scoring, still predicts).
       pub has_target: bool,
 }
@@ -138,26 +159,28 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>]) -> Vec<Attr> {
 
 /// Encode raw `rows` against `attrs` into `(feature_names, X, y)`. Feature
 /// numerics pass through (blank/unparseable → NaN); feature nominals one-hot as
-/// `name=cat`. The `target` column (if any) is label-encoded for a Nominal kind
-/// and parsed for a Numeric kind; a blank or unseen target value → NaN. With
-/// `target = None`, every column is a feature and `y` is all zeros.
-fn encode(attrs: &[Attr], rows: &[Vec<String>], target: Option<usize>) -> (Vec<String>, Mat, Vec1) {
+/// `name=cat`. Each `targets` column (if any) is label-encoded for a Nominal kind
+/// and parsed for a Numeric kind; a blank/unseen value → NaN. `y` is flat,
+/// row-major n*k (k = targets.len()), so row r's targets are y[r*k .. r*k+k].
+/// With `targets = []`, every column is a feature and `y` is empty.
+fn encode(attrs: &[Attr], rows: &[Vec<String>], targets: &[usize]) -> (Vec<String>, Mat, Vec1) {
       let n = rows.len();
+      let k = targets.len();
       let mut names: Vec<String> = Vec::new();
       let mut cols: Vec<Vec<f64>> = Vec::new();
-      let mut y = vec![0.0f64; n];
+      let mut y = vec![0.0f64; n * k];
       for (ai, attr) in attrs.iter().enumerate() {
-            if Some(ai) == target {
+            if let Some(tj) = targets.iter().position(|&t| t == ai) {
                   match &attr.kind {
                         Kind::Nominal(cats) => {
                               for (r, row) in rows.iter().enumerate() {
                                     let v = cell(row, ai);
-                                    y[r] = cats.iter().position(|c| c == v).map_or(f64::NAN, |p| p as f64);
+                                    y[r * k + tj] = cats.iter().position(|c| c == v).map_or(f64::NAN, |p| p as f64);
                               }
                         }
                         Kind::Numeric => {
                               for (r, row) in rows.iter().enumerate() {
-                                    y[r] = cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
+                                    y[r * k + tj] = cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
                               }
                         }
                   }
@@ -214,7 +237,9 @@ struct Assembled {
       mats: Vec<Mat>,
       // Per matrix, per-sample source row (None → NaN). gather[0] is identity.
       gather: Vec<Vec<Option<usize>>>,
+      // Targets, flat row-major n*n_targets.
       y: Vec1,
+      n_targets: usize,
       samples: usize,
       skipped: Vec<String>,
       sample_group: String,
@@ -282,7 +307,7 @@ fn encode_group(
       g: &DirGroup,
       schema: &mut Schema,
       schema_in: Option<&Schema>,
-      target_col: Option<usize>,
+      target_cols: &[usize],
 ) -> (Vec<String>, Mat, Vec1) {
       match g {
             DirGroup::Table { name, headers, cells, .. } => {
@@ -298,7 +323,7 @@ fn encode_group(
                         }
                   }
                   schema.insert(name.clone(), attrs.clone());
-                  let (fnames, x, y) = encode(&attrs, cells, target_col);
+                  let (fnames, x, y) = encode(&attrs, cells, target_cols);
                   let names = fnames.iter().map(|f| namespaced(name, f)).collect();
                   (names, x, y)
             }
@@ -332,29 +357,34 @@ fn group_hashes(g: &DirGroup) -> &[String] {
 /// schema) is reused so a test source encodes against the same categories.
 fn assemble(
       groups: &[DirGroup],
-      target: Option<&str>,
+      targets: &[String],
       schema_in: Option<&Schema>,
       sample_hint: Option<&str>,
 ) -> (Assembled, Schema) {
       let mut schema: Schema = Schema::new();
 
-      // Which group/column is the target? (A table column whose namespaced name matches.)
+      // The sample group is the table holding the target column(s); collect every
+      // target's column index within it (matched by namespaced name).
       let mut sample_idx = 0usize;
-      let mut target_col: Option<usize> = None;
-      if let Some(t) = target {
+      let mut target_cols: Vec<usize> = Vec::new();
+      if !targets.is_empty() {
             for (gi, g) in groups.iter().enumerate() {
                   if let DirGroup::Table { name, headers, .. } = g {
-                        if let Some(ci) = headers.iter().position(|h| namespaced(name, h) == t) {
+                        let cols: Vec<usize> = targets
+                              .iter()
+                              .filter_map(|t| headers.iter().position(|h| namespaced(name, h) == *t))
+                              .collect();
+                        if !cols.is_empty() {
                               sample_idx = gi;
-                              target_col = Some(ci);
+                              target_cols = cols;
                               break;
                         }
                   }
             }
       }
-      // Target column absent here (e.g. an unlabeled test source): keep the SET's
+      // Target columns absent here (e.g. an unlabeled test source): keep the SET's
       // sample group via `sample_hint`; else the sole group / sole table group.
-      if target_col.is_none() {
+      if target_cols.is_empty() {
             let by_hint = sample_hint.and_then(|h| groups.iter().position(|g| group_name(g) == h));
             sample_idx = match by_hint {
                   Some(i) => i,
@@ -375,12 +405,13 @@ fn assemble(
                   }
             };
       }
+      let n_targets = target_cols.len();
 
       // Encode the sample group (carries the target). Its matrix backs mats[0] with
       // an identity gather. Other groups push their OWN (un-broadcast) matrix plus a
       // per-sample gather index — values are materialized later, only for kept
       // columns, so a dropped/excluded image group never broadcasts (no blow-up).
-      let (s_names, s_x, y) = encode_group(&groups[sample_idx], &mut schema, schema_in, target_col);
+      let (s_names, s_x, y) = encode_group(&groups[sample_idx], &mut schema, schema_in, &target_cols);
       let s_hashes = group_hashes(&groups[sample_idx]);
       let n = s_x.nrows();
 
@@ -457,7 +488,7 @@ fn assemble(
                   ));
                   continue;
             }
-            let (g_names, g_x, _gy) = encode_group(g, &mut schema, schema_in, None);
+            let (g_names, g_x, _gy) = encode_group(g, &mut schema, schema_in, &[]);
             // Per-sample source row in this group (or None → NaN), broadcast (1/hash)
             // or position-aligned (equal counts). Values gathered lazily in `select`.
             let src: Vec<Option<usize>> = (0..n)
@@ -484,6 +515,7 @@ fn assemble(
                   mats,
                   gather,
                   y,
+                  n_targets,
                   samples: n,
                   skipped,
                   sample_group: group_name(&groups[sample_idx]).to_string(),
@@ -520,8 +552,8 @@ impl Data {
             Data {
                   attrs: Vec::new(),
                   rows: Vec::new(),
-                  target: 0,
-                  target_name: None,
+                  targets: Vec::new(),
+                  target_names: Vec::new(),
                   source: String::new(),
                   test_path: None,
                   split_frac: None,
@@ -542,17 +574,22 @@ impl Data {
             self
       }
 
-      /// Name the target column. For an ARFF set it's resolved to the attribute
-      /// index now; for a tabular set/dir it's matched against column names in
-      /// `prepare` (exact, `group:name`, or trailing `:name`).
-      pub fn target(mut self, name: &str) -> Data {
-            self.target_name = Some(name.to_string());
+      /// Name the target column(s): `.target("y")` or `.target(["a","b","c"])`.
+      /// For an ARFF set each is resolved to its attribute index now; for a tabular
+      /// set/dir they're matched against column names in `prepare`.
+      pub fn target(mut self, t: impl IntoTargets) -> Data {
+            self.target_names = t.into_targets();
             if !self.attrs.is_empty() {
-                  self.target = self
-                        .attrs
+                  self.targets = self
+                        .target_names
                         .iter()
-                        .position(|a| a.name == name)
-                        .unwrap_or_else(|| panic!("Data::target: no attribute named '{name}'"));
+                        .map(|name| {
+                              self.attrs
+                                    .iter()
+                                    .position(|a| a.name == *name)
+                                    .unwrap_or_else(|| panic!("Data::target: no attribute named '{name}'"))
+                        })
+                        .collect();
             }
             self
       }
@@ -597,21 +634,22 @@ impl Data {
       /// ARFF set: encode against the declared schema; a `.test` ARFF is encoded
       /// with that same schema (so it aligns by construction).
       fn prepare_arff(&self) -> (Dataset, Option<Dataset>) {
-            let (_, x, y) = encode(&self.attrs, &self.rows, Some(self.target));
+            let k = self.targets.len().max(1);
+            let (_, x, y) = encode(&self.attrs, &self.rows, &self.targets);
             if let Some(frac) = self.split_frac {
-                  let (tr, te) = shuffle_split(&x, &y, frac, &self.source);
+                  let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source);
                   report_split(tr.x.nrows(), te.x.nrows());
                   (tr, Some(te))
             } else if let Some(tp) = &self.test_path {
                   let (_, trows) = parse_arff(tp);
-                  let (_, tx, ty) = encode(&self.attrs, &trows, Some(self.target));
+                  let (_, tx, ty) = encode(&self.attrs, &trows, &self.targets);
                   report_split(x.nrows(), tx.nrows());
                   (
-                        Dataset { x, y, source: self.source.clone(), has_target: true },
-                        Some(Dataset { x: tx, y: ty, source: tp.clone(), has_target: true }),
+                        Dataset { x, y, source: self.source.clone(), n_targets: k, has_target: true },
+                        Some(Dataset { x: tx, y: ty, source: tp.clone(), n_targets: k, has_target: true }),
                   )
             } else {
-                  (Dataset { x, y, source: self.source.clone(), has_target: true }, None)
+                  (Dataset { x, y, source: self.source.clone(), n_targets: k, has_target: true }, None)
             }
       }
 
@@ -631,16 +669,17 @@ impl Data {
                   (None, Some(_)) => Some(set_tnames.clone()),
                   (None, None) => None,
             };
-            let t = self.resolve_target(&set_tnames, test_tnames.as_deref());
+            let t = self.resolve_targets(&set_tnames, test_tnames.as_deref());
 
-            let (set, schema) = assemble(&set_groups, t.as_deref(), None, None);
+            let (set, schema) = assemble(&set_groups, &t, None, None);
+            let k = set.n_targets;
             let keep = |name: &str| !self.exclude.iter().any(|p| exclude_match(p, name));
 
             if let Some((tg, tp)) = &test_groups {
-                  let (test, _) = assemble(tg, t.as_deref(), Some(&schema), Some(&set.sample_group));
-                  // A Kaggle test.csv legitimately omits the target — that's the thing
-                  // to predict. Record its absence; don't crash.
-                  let test_has_target = t.as_ref().is_some_and(|tgt| test.names.iter().any(|n| n == tgt));
+                  let (test, _) = assemble(tg, &t, Some(&schema), Some(&set.sample_group));
+                  // A Kaggle test.csv legitimately omits the target(s) — that's the
+                  // thing to predict. has_target only when ALL target cols are present.
+                  let test_has_target = !t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
                   let tset: std::collections::HashSet<&str> =
                         test.names.iter().map(|s| s.as_str()).collect();
                   let feats: Vec<String> = set
@@ -654,21 +693,21 @@ impl Data {
                         "set ({}) and test ({tp}) share no feature columns — data is non-correlated",
                         self.source
                   );
-                  report_parsed(&set, &feats, t.as_deref(), Some(&test), None);
-                  let train = Dataset { x: set.select(&feats), y: set.y, source: self.source.clone(), has_target: true };
-                  let testds = Dataset { x: test.select(&feats), y: test.y, source: (*tp).clone(), has_target: test_has_target };
+                  report_parsed(&set, &feats, &t, Some(&test), None);
+                  let train = Dataset { x: set.select(&feats), y: set.y, source: self.source.clone(), n_targets: k, has_target: true };
+                  let testds = Dataset { x: test.select(&feats), y: test.y, source: (*tp).clone(), n_targets: test.n_targets, has_target: test_has_target };
                   return (train, Some(testds));
             }
 
             let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
             let x = set.select(&feats);
             if let Some(frac) = self.split_frac {
-                  let (tr, te) = shuffle_split(&x, &set.y, frac, &self.source);
-                  report_parsed(&set, &feats, t.as_deref(), None, Some((tr.x.nrows(), te.x.nrows())));
+                  let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source);
+                  report_parsed(&set, &feats, &t, None, Some((tr.x.nrows(), te.x.nrows())));
                   return (tr, Some(te));
             }
-            report_parsed(&set, &feats, t.as_deref(), None, None);
-            (Dataset { x, y: set.y, source: self.source.clone(), has_target: true }, None)
+            report_parsed(&set, &feats, &t, None, None);
+            (Dataset { x, y: set.y, source: self.source.clone(), n_targets: k, has_target: true }, None)
       }
 
       /// Resolve the target column name. `.target` wins (matched exactly, as a
@@ -676,36 +715,41 @@ impl Data {
       /// present, a single column that exists in the set but not the test is taken
       /// as the target (the thing to predict). Ambiguous (many train-only columns)
       /// or absent → `None`.
-      fn resolve_target(&self, set_names: &[String], test_names: Option<&[String]>) -> Option<String> {
-            if let Some(want) = &self.target_name {
-                  let hit = set_names.iter().find(|n| {
-                        n.as_str() == want
-                              || n.ends_with(&format!(":{want}"))
-                              || n.rsplit(':').next() == Some(want.as_str())
-                  });
-                  match hit {
-                        Some(h) => return Some(h.clone()),
-                        None => {
-                              // Clear OGDL error + clean exit, not a Rust backtrace, so
-                              // the user can read the columns and fix `.target(...)`.
-                              eprintln!("\x1b[1;31mtarget '{want}' not found\x1b[0m");
-                              eprintln!("    available columns");
-                              for n in set_names {
-                                    eprintln!("        {n}");
-                              }
-                              std::process::exit(1);
-                        }
-                  }
+      fn resolve_targets(&self, set_names: &[String], test_names: Option<&[String]>) -> Vec<String> {
+            if !self.target_names.is_empty() {
+                  return self
+                        .target_names
+                        .iter()
+                        .map(|want| {
+                              set_names
+                                    .iter()
+                                    .find(|n| {
+                                          n.as_str() == want
+                                                || n.ends_with(&format!(":{want}"))
+                                                || n.rsplit(':').next() == Some(want.as_str())
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                          // Clean OGDL error + exit, not a Rust backtrace.
+                                          eprintln!("\x1b[1;31mtarget '{want}' not found\x1b[0m");
+                                          eprintln!("    available columns");
+                                          for n in set_names {
+                                                eprintln!("        {n}");
+                                          }
+                                          std::process::exit(1);
+                                    })
+                        })
+                        .collect();
             }
             if let Some(tn) = test_names {
                   let tset: std::collections::HashSet<&str> = tn.iter().map(|s| s.as_str()).collect();
                   let only: Vec<&String> =
                         set_names.iter().filter(|n| !tset.contains(n.as_str())).collect();
                   if only.len() == 1 {
-                        return Some(only[0].clone());
+                        return vec![only[0].clone()];
                   }
             }
-            None
+            Vec::new()
       }
 
 }
@@ -717,14 +761,14 @@ impl Data {
 fn report_parsed(
       set: &Assembled,
       feats: &[String],
-      target: Option<&str>,
+      targets: &[String],
       test: Option<&Assembled>,
       split: Option<(usize, usize)>,
 ) {
       eprintln!("\x1b[32mparsed\x1b[0m");
       let refs: Vec<&str> = feats.iter().map(|s| s.as_str()).collect();
       emit_section("feature column", &refs, 4);
-      if let Some(t) = target {
+      for t in targets {
             eprintln!("    target  {t}");
       }
       match split {
@@ -814,15 +858,26 @@ fn is_arff(path: &str) -> bool {
 /// left intact (its samples must still be predicted). A reasonable default until
 /// feature imputation is added.
 pub(crate) fn drop_nan_samples(train: &mut Dataset) {
-      let keep: Vec<usize> = (0..train.y.len())
-            .filter(|&i| !train.y[i].is_nan() && train.x.row(i).iter().all(|v| !v.is_nan()))
+      let n = train.x.nrows();
+      let k = train.n_targets.max(1);
+      let keep: Vec<usize> = (0..n)
+            .filter(|&i| {
+                  (0..k).all(|j| !train.y[i * k + j].is_nan())
+                        && train.x.row(i).iter().all(|v| !v.is_nan())
+            })
             .collect();
-      let dropped = train.y.len() - keep.len();
+      let dropped = n - keep.len();
       if dropped == 0 {
             return;
       }
       train.x = train.x.select(ndarray::Axis(0), &keep);
-      train.y = train.y.select(ndarray::Axis(0), &keep);
+      let mut yd = Vec::with_capacity(keep.len() * k);
+      for &i in &keep {
+            for j in 0..k {
+                  yd.push(train.y[i * k + j]);
+            }
+      }
+      train.y = Vec1::from(yd);
       eprintln!(
             "\x1b[32mhandled\x1b[0m\n    train\n        dropped {dropped} {} (NaN)",
             if dropped == 1 { "sample" } else { "samples" }
@@ -867,8 +922,9 @@ fn report_nans(train: &Dataset, test: Option<&Dataset>) {
       }
 }
 
-/// Shuffled `train_frac`/`1-train_frac` row split (seed 42), reporting the split.
-fn shuffle_split(x: &Mat, y: &Vec1, train_frac: f64, source: &str) -> (Dataset, Dataset) {
+/// Shuffled `train_frac`/`1-train_frac` row split (seed 42). `y` is flat row-major
+/// n*k (k targets); each selected row carries its whole k-wide target slice.
+fn shuffle_split(x: &Mat, y: &Vec1, k: usize, train_frac: f64, source: &str) -> (Dataset, Dataset) {
       let n = x.nrows();
       let mut idx: Vec<usize> = (0..n).collect();
       idx.shuffle(&mut ChaCha8Rng::seed_from_u64(42));
@@ -876,15 +932,16 @@ fn shuffle_split(x: &Mat, y: &Vec1, train_frac: f64, source: &str) -> (Dataset, 
       let cols = x.ncols();
       let take = |sel: &[usize]| -> Dataset {
             let mut xd = Vec::with_capacity(sel.len() * cols);
-            let mut yd = Vec::with_capacity(sel.len());
+            let mut yd = Vec::with_capacity(sel.len() * k);
             for &i in sel {
                   xd.extend(x.row(i).iter().copied());
-                  yd.push(y[i]);
+                  yd.extend((0..k).map(|j| y[i * k + j]));
             }
             Dataset {
                   x: Mat::from_shape_vec((sel.len(), cols), xd).expect("split: x reshape"),
                   y: Vec1::from(yd),
                   source: source.to_string(),
+                  n_targets: k,
                   has_target: true,
             }
       };
