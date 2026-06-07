@@ -164,9 +164,7 @@ impl Train {
             // drop, else the final weights at the end) — do NOT save here, or a blow-up
             // would overwrite the good checkpoint.
             if let Some(test) = &test {
-                  if test.has_target {
-                        model.eval(test);
-                  }
+                  model.eval(test);
             }
       }
 }
@@ -1210,10 +1208,13 @@ impl Model {
             let params = self.params.borrow();
             assert!(!params.is_empty(), "eval: call train() first");
             let (xbuf, n, _d) = Self::upload(&data.x);
-            let probs = Self::predict(&params, &xbuf, n);
-            let acc = self.metric_num(Metric::Accuracy, 0, &probs, &data.y, n, 0.0);
-            let correct = (acc * n as f64).round() as usize;
-            println!("eval: accuracy = {acc:.4} ({correct}/{n})");
+            let preds = Self::predict(&params, &xbuf, n);
+            if data.has_target {
+                  let acc = self.metric_num(Metric::Accuracy, 0, &preds, &data.y, n, 0.0);
+                  let correct = (acc * n as f64).round() as usize;
+                  eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
+            }
+            eprintln!("eval: {n} predictions");
       }
 }
 
