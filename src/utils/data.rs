@@ -93,6 +93,20 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
     let headers: Vec<String> = df.get_column_names().iter().map(|c| c.to_string()).collect();
     let h = df.height();
     let w = df.width();
+    // Announce the RAM footprint up front (dense f64: rows × cols × 8B), with the
+    // same progress bar the image path uses, ticking as columns materialize.
+    let bytes = h.saturating_mul(w).saturating_mul(std::mem::size_of::<f64>());
+    eprintln!("loading {}", short_path(path.to_str().unwrap_or_default()));
+    let pb = ProgressBar::new(w as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}",
+        )
+        .expect("progress template")
+        .progress_chars("=>-"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    pb.set_message(format!("{} into RAM ({h} rows × {w} cols)", human_bytes(bytes)));
     let mut rows = vec![vec![String::new(); w]; h];
     for (j, col) in df.get_columns().iter().enumerate() {
         let s = col.cast(&DataType::String)?;
@@ -100,8 +114,24 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
         for (i, v) in ca.into_iter().enumerate() {
             rows[i][j] = v.unwrap_or("").to_string();
         }
+        pb.inc(1);
     }
+    pb.finish();
+    eprintln!();
     Ok((headers, rows))
+}
+
+/// Human-readable byte size: GB at ≥1 GiB, else MB, else KB.
+pub(crate) fn human_bytes(b: usize) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f >= K * K * K {
+        format!("{:.2} GB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.1} MB", f / (K * K))
+    } else {
+        format!("{:.1} KB", f / K)
+    }
 }
 
 /// A file's `(group, hash)` given the set of hashes seen as `__` prefixes:
