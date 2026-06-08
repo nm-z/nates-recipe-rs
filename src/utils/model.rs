@@ -3301,11 +3301,10 @@ mod metric_gpu_tests {
 		if !std::path::Path::new(TRAIN).exists() {
 			return None;
 		}
-		let (train, _) = crate::dataset::Data::load()
+		let data = crate::dataset::Data::load()
 			.set(TRAIN)
-			.target("Churn")
-			.prepare();
-		Some(train)
+			.target("Churn");
+		Some(data.set)
 	});
 
 	#[test]

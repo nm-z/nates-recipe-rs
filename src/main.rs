@@ -25,15 +25,17 @@ fn main() -> Result<()> {
 		}
 	}
 
-	let mut loader = nates_recipe::Data::load().set(path);
-	if let Some(t) = target {
-		loader = loader.target(t);
-	}
-	let (train, _test) = loader.prepare();
+	let data = if let Some(t) = target {
+		nates_recipe::Data::load().set(path).target(t)
+	} else {
+		let d = nates_recipe::Data::load().set(path);
+		eprintln!("no --target specified");
+		d
+	};
 	eprintln!(
 		"loaded {} samples × {} features",
-		train.x.nrows(),
-		train.x.ncols()
+		data.set.x.nrows(),
+		data.set.x.ncols()
 	);
 
 	gpu_core::kernels::gpu_shutdown();

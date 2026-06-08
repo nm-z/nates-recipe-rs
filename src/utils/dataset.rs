@@ -917,11 +917,41 @@ impl Data {
 				}
 			}
 		}
-		let (train, test) = self.prepare();
+		let (train, test, attrs) = self.prepare();
 		self.set = train;
 		self.test = test;
+		self.attrs = attrs;
 		self.print_summary();
 		self
+	}
+
+	fn feature_type_counts(&self) -> Vec<(&'static str, usize)> {
+		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
+		let is_excluded = |name: &str| {
+			is_id_column(name) || self.exclude.iter().any(|p| exclude_match(p, name))
+		};
+		let (mut numeric, mut categorical, mut text) = (0usize, 0usize, 0usize);
+		for a in &self.attrs {
+			if is_target(&a.name) || is_excluded(&a.name) {
+				continue;
+			}
+			match &a.kind {
+				Kind::Numeric => numeric += 1,
+				Kind::Nominal(cats) => categorical += cats.len(),
+				Kind::Text(_) => text += SEQ_LEN,
+			}
+		}
+		let mut out = Vec::new();
+		if numeric > 0 {
+			out.push(("numeric", numeric));
+		}
+		if categorical > 0 {
+			out.push(("categorical", categorical));
+		}
+		if text > 0 {
+			out.push(("text", text));
+		}
+		out
 	}
 
 	fn print_summary(&self) {
@@ -938,6 +968,16 @@ impl Data {
 			}
 			path.to_string()
 		};
+		let types = self.feature_type_counts();
+		let print_types = |indent: &str| {
+			if types.len() == 1 {
+				eprintln!("{indent}{} {} features", types[0].1, types[0].0);
+			} else {
+				for (kind, count) in &types {
+					eprintln!("{indent}{count} {kind}");
+				}
+			}
+		};
 		eprintln!(
 			"\x1b[32mset\x1b[0m  {}",
 			short(&self.source),
@@ -948,10 +988,7 @@ impl Data {
 			self.set.x.ncols() + self.set.n_targets.max(1),
 			disk_size(&self.source),
 		);
-		eprintln!(
-			"    {} features after encoding",
-			self.set.x.ncols(),
-		);
+		print_types("    ");
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
 		}
@@ -967,10 +1004,7 @@ impl Data {
 					test.x.ncols() + test.n_targets.max(1),
 					disk_size(tp),
 				);
-				eprintln!(
-					"    {} features after encoding",
-					test.x.ncols(),
-				);
+				print_types("    ");
 			} else if self.split_frac.is_some() {
 				let total = self.set.x.nrows() + test.x.nrows();
 				eprintln!(
@@ -1014,11 +1048,13 @@ impl Data {
 	/// both `.set` and `.test`) goes through the unified named-table path that
 	/// auto-detects features + target, aligns train↔test on shared columns, and
 	/// prints its interpretation.
-	pub fn prepare(&self) -> (Dataset, Option<Dataset>) {
-		let (mut train, test) = if self.attrs.is_empty() {
-			self.prepare_table()
+	fn prepare(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
+		let (mut train, test, attrs) = if self.attrs.is_empty() {
+			let (tr, te, a) = self.prepare_table();
+			(tr, te, a)
 		} else {
-			self.prepare_arff()
+			let (tr, te) = self.prepare_arff();
+			(tr, te, self.attrs.clone())
 		};
 		report_nans(&train, test.as_ref());
 		drop_nan_samples(&mut train);
@@ -1032,7 +1068,7 @@ impl Data {
 			train.x.nrows(),
 			train.y.len(),
 		);
-		(train, test)
+		(train, test, attrs)
 	}
 
 	/// ARFF set: encode against the declared schema; a `.test` ARFF is encoded
@@ -1087,7 +1123,7 @@ impl Data {
 	/// shared (namespaced) feature columns; `.exclude` patterns are dropped. The
 	/// target is `.target` (matched by name) or, when a test exists, the lone
 	/// train-only column.
-	fn prepare_table(&self) -> (Dataset, Option<Dataset>) {
+	fn prepare_table(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
 		let set_groups = load_groups(&self.source);
 		let set_tnames = table_names(&set_groups);
 
@@ -1103,6 +1139,7 @@ impl Data {
 		let t = self.resolve_targets(&set_tnames, test_tnames.as_deref());
 
 		let (set, schema) = assemble(&set_groups, &t, None, None, &self.exclude);
+		let flat_attrs: Vec<Attr> = schema.values().flat_map(|v| v.iter().cloned()).collect();
 		let k = set.n_targets;
 		let keep = |name: &str| !self.exclude.iter().any(|p| exclude_match(p, name));
 
@@ -1148,7 +1185,7 @@ impl Data {
 				has_target: test_has_target,
 				text_cols: tc,
 			};
-			return (train, Some(testds));
+			return (train, Some(testds), flat_attrs);
 		}
 
 		let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
@@ -1157,7 +1194,7 @@ impl Data {
 		if let Some(frac) = self.split_frac {
 			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source, &tc);
 
-			return (tr, Some(te));
+			return (tr, Some(te), flat_attrs);
 		}
 		(
 			Dataset {
@@ -1169,6 +1206,7 @@ impl Data {
 				text_cols: tc,
 			},
 			None,
+			flat_attrs,
 		)
 	}
 
