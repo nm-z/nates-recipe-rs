@@ -1,11 +1,11 @@
-A,B,C,D,MD,GR,Geology,TVT,Notes,Photo
-3.1,7.0,3.0,4.0,10.0,1.0,sandstone,100.0,drilled at dawn near the river bend,site_001.png
-1.4,,4.0,8.0,11.0,2.0,limestone,101.0,core sample showed heavy fracturing,site_002.png
-5.9,2.0,6.0,12.0,12.0,3.0,shale,102.0,unexpected gas pocket encountered,site_003.png
-2.2,9.0,,16.0,13.0,4.0,sandstone,103.0,switched to diamond bit after lunch,site_004.png
-8.7,4.0,8.0,20.0,14.0,5.0,limestone,104.0,very high water table at this depth,site_005.png
-4.3,,9.0,24.0,15.0,6.0,shale,105.0,formation changed abruptly at marker,site_006.png
-9.0,1.0,10.0,28.0,16.0,7.0,sandstone,106.0,pulled rods for inspection overnight,site_007.png
-6.5,8.0,11.0,32.0,17.0,8.0,limestone,107.0,salt deposit visible in the cuttings,site_008.png
-7.8,3.0,12.0,36.0,18.0,9.0,shale,108.0,ran wireline log before casing set,site_009.png
-0.6,5.0,13.0,40.0,19.0,10.0,sandstone,109.0,cemented and moved rig to next pad,site_010.png
+A,B,C,D,MD,GR,Geology,TVT,Notes,Photo,EventDate
+3.1,7.0,3.0,4.0,10.0,1.0,sandstone,100.0,drilled at dawn near the river bend,site_001.png,2024-01-15
+1.4,,4.0,8.0,11.0,2.0,limestone,101.0,core sample showed heavy fracturing,site_002.png,2024-02-20
+5.9,2.0,6.0,12.0,12.0,3.0,shale,102.0,unexpected gas pocket encountered,site_003.png,2024-03-10
+2.2,9.0,,16.0,13.0,4.0,sandstone,103.0,switched to diamond bit after lunch,site_004.png,2024-04-05
+8.7,4.0,8.0,20.0,14.0,5.0,limestone,104.0,very high water table at this depth,site_005.png,2024-05-18
+4.3,,9.0,24.0,15.0,6.0,shale,105.0,formation changed abruptly at marker,site_006.png,2024-06-22
+9.0,1.0,10.0,28.0,16.0,7.0,sandstone,106.0,pulled rods for inspection overnight,site_007.png,2024-07-30
+6.5,8.0,11.0,32.0,17.0,8.0,limestone,107.0,salt deposit visible in the cuttings,site_008.png,2024-08-14
+7.8,3.0,12.0,36.0,18.0,9.0,shale,108.0,ran wireline log before casing set,site_009.png,2024-09-01
+0.6,5.0,13.0,40.0,19.0,10.0,sandstone,109.0,cemented and moved rig to next pad,site_010.png,2024-10-20

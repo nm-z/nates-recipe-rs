@@ -173,7 +173,31 @@ fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
 
+fn is_date_str(s: &str) -> bool {
+	if s.len() < 6 || s.len() > 30 {
+		return false;
+	}
+	let has_sep = s.contains('-') || s.contains('/');
+	let digit_count = s.bytes().filter(|b| b.is_ascii_digit()).count();
+	has_sep && digit_count >= 4
+}
+
+fn date_to_f64(s: &str) -> f64 {
+	let parts: Vec<&str> = s.split(|c: char| c == '-' || c == '/' || c == 'T' || c == ' ').collect();
+	if parts.len() >= 3 {
+		if let (Ok(y), Ok(m), Ok(d)) = (
+			parts[0].parse::<f64>(),
+			parts[1].parse::<f64>(),
+			parts[2].parse::<f64>(),
+		) {
+			return y * 365.25 + m * 30.44 + d;
+		}
+	}
+	f64::NAN
+}
+
 fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
+	let n = rows.len();
 	let attrs: Vec<Attr> = headers
 		.iter()
 		.enumerate()
@@ -184,37 +208,43 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 					kind: sa.kind.clone(),
 				};
 			}
-			let all_numeric = rows
-				.par_iter()
-				.all(|row| cell(row, j).is_empty() || cell(row, j).parse::<f64>().is_ok());
-			let kind = if all_numeric {
-				let vals: Vec<f64> = rows
-					.iter()
-					.filter_map(|row| cell(row, j).parse::<f64>().ok())
-					.collect();
-				if vals.len() >= 2
-					&& vals.windows(2).all(|w| w[1] >= w[0])
-					&& vals.first() != vals.last()
-				{
-					Kind::Temporal
+			let is_missing = |c: &str| c.is_empty() || matches!(c, "NA" | "NaN" | "nan" | "N/A" | "NULL" | "null" | "None" | "none" | "?" | "." | "-");
+			let non_empty: Vec<&str> = rows.iter().map(|row| cell(row, j)).filter(|c| !is_missing(c)).collect();
+			if non_empty.is_empty() {
+				return Attr { name: name.clone(), kind: Kind::Numeric };
+			}
+			let parseable: Vec<Option<f64>> = non_empty.iter().map(|c| c.parse::<f64>().ok()).collect();
+			let n_parsed = parseable.iter().filter(|v| v.is_some()).count();
+			let n_total = non_empty.len();
+			let mostly_numeric = n_total > 0 && n_parsed as f64 / n_total as f64 > 0.8;
+			let all_numeric = n_parsed == n_total;
+			let kind = if all_numeric || mostly_numeric {
+				let vals: Vec<f64> = parseable.iter().filter_map(|v| *v).collect();
+				let mut distinct = std::collections::HashSet::new();
+				for &v in &vals {
+					distinct.insert(v.to_bits());
+				}
+				let n_distinct = distinct.len();
+				if n_distinct <= 20 && n_distinct < vals.len() {
+					let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
+					cats.sort_unstable();
+					Kind::Nominal(cats)
+				} else if n_distinct == vals.len() && vals.len() == n {
+					Kind::Numeric
 				} else {
 					Kind::Numeric
 				}
 			} else {
-				let first_cell = rows.iter()
-					.map(|row| cell(row, j))
-					.find(|c| !c.is_empty())
-					.unwrap_or("");
-				if is_image_cell(first_cell) {
+				let first = non_empty[0];
+				if is_image_cell(first) {
 					Kind::Image
+				} else if non_empty.iter().all(|c| is_date_str(c)) {
+					Kind::Temporal
 				} else {
 					let mut counts: std::collections::HashMap<&str, usize> =
 						std::collections::HashMap::new();
-					for row in rows {
-						let c = cell(row, j);
-						if !c.is_empty() {
-							*counts.entry(c).or_insert(0) += 1;
-						}
+					for &c in &non_empty {
+						*counts.entry(c).or_insert(0) += 1;
 					}
 					let has_repeats = counts.values().any(|&c| c > 2);
 					if has_repeats {
@@ -329,10 +359,16 @@ fn encode(
 							.map_or(f64::NAN, |p| p as f64);
 					}
 				}
-				Kind::Numeric | Kind::Temporal => {
+				Kind::Numeric => {
 					for (r, row) in rows.iter().enumerate() {
 						y[r * k + tj] =
 							cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
+					}
+				}
+				Kind::Temporal => {
+					for (r, row) in rows.iter().enumerate() {
+						let c = cell(row, ai);
+						y[r * k + tj] = c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
 					}
 				}
 				Kind::Text(_) => {
@@ -348,11 +384,20 @@ fn encode(
 			continue;
 		}
 		match &attr.kind {
-			Kind::Numeric | Kind::Temporal => {
+			Kind::Numeric => {
 				names.push(attr.name.clone());
 				let mut col = vec![0.0f64; n];
 				for (r, row) in rows.iter().enumerate() {
 					col[r] = cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
+				}
+				cols.push(col);
+			}
+			Kind::Temporal => {
+				names.push(attr.name.clone());
+				let mut col = vec![0.0f64; n];
+				for (r, row) in rows.iter().enumerate() {
+					let c = cell(row, ai);
+					col[r] = c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
 				}
 				cols.push(col);
 			}
