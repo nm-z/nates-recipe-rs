@@ -1114,7 +1114,7 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 			if ds.text_cols.is_empty() {
 				issues.push(Issue {
 					what: format!("embedding layer {} has no text features", i + 1),
-					have: format!("{} text, {} numeric, {} categorical in {} total features", ds.text_cols.len(), d - ds.text_cols.len(), 0, d),
+					have: format!("{} text features out of {} total", ds.text_cols.len(), d),
 					need: "≥1 text feature (column with >256 distinct values)".into(),
 				});
 			}
