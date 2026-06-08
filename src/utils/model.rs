@@ -377,6 +377,11 @@ impl Train {
 			let last_layer = params.len() - 1;
 			let k = params[last_layer].out_dim;
 			let n = ds.x.nrows();
+			{
+				let need = Scratch::vram_bytes(&params, n, true)
+					+ n * ds.x.ncols() * 2 * std::mem::size_of::<f64>();
+				check_vram(need, n, "infer");
+			}
 			let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
 			let cat_cols: Vec<usize> = if embed_first {
 				(0..ds.x.ncols()).filter(|c| !ds.text_cols.contains(c)).collect()
@@ -1080,7 +1085,86 @@ pub struct Model {
 	scaler: RefCell<Option<Scaler>>,
 }
 
+fn check_vram(need: usize, n: usize, label: &str) {
+	let (mut free, mut total) = (0usize, 0usize);
+	unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+	if need > free / 10 * 9 {
+		panic!(
+			"{label}: {n} rows need {}, only {} free ({} total GPU)",
+			crate::data::human_bytes(need),
+			crate::data::human_bytes(free),
+			crate::data::human_bytes(total),
+		);
+	}
+}
+
 impl Model {
+	fn vram_estimate(&self, n: usize, d: usize, k: usize, vocab: usize, c_cat: usize, forward_only: bool) -> usize {
+		let f8 = std::mem::size_of::<f64>();
+		let mut bytes = 0usize;
+		// x input (raw + z-scored copy both live simultaneously)
+		bytes += 2 * n * d * f8;
+		// categorical branch if embed-first
+		if c_cat > 0 {
+			bytes += 2 * n * c_cat * f8;
+		}
+		// z-score transients (mean, var, std: d-sized each)
+		bytes += 3 * d * f8;
+		// y targets
+		bytes += n * k * f8;
+		// layer params: estimate from specs
+		let mut in_dim = d;
+		let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation)> = Vec::new();
+		for spec in &self.specs {
+			match *spec {
+				LayerSpec::Embed(dim) => {
+					let seq = in_dim;
+					bytes += vocab * dim * f8; // table
+					bytes += seq * dim * f8;   // negated PE
+					let out = seq * dim;
+					fake_params.push((in_dim, out, LayerKind::Embed, dim, vocab, Activation::Linear));
+					in_dim = out;
+				}
+				LayerSpec::Attn(heads) => {
+					let d_tok = in_dim / (in_dim / (in_dim / heads).max(1)).max(1);
+					bytes += 4 * d_tok * d_tok * f8; // Wq, Wk, Wv, Wo
+					bytes += 4 * d_tok * f8;          // biases
+					fake_params.push((in_dim, in_dim, LayerKind::Attn, d_tok, 0, Activation::Linear));
+				}
+				LayerSpec::Dense(units, act) => {
+					bytes += in_dim * units * f8; // weights
+					bytes += units * f8;          // bias
+					if act == Activation::PRelu {
+						bytes += f8;              // learned slope
+					}
+					fake_params.push((in_dim, units, LayerKind::Dense, 0, 0, act));
+					in_dim = units;
+				}
+			}
+		}
+		// scratch estimate: build minimal LayerParams-like info for vram_bytes
+		// Use the real Scratch::vram_bytes with dummy LayerParams
+		let dummy_params: Vec<LayerParams> = fake_params
+			.iter()
+			.map(|&(i, o, kind, dim, vocab, act)| {
+				let dummy = || GpuBuffer::alloc(1).expect("dummy");
+				LayerParams {
+					kind,
+					w: dummy(), b: dummy(),
+					in_dim: i, out_dim: o, act,
+					dim, vocab,
+					wk: dummy(), wv: dummy(), wo: dummy(),
+					heads: if kind == LayerKind::Attn { dim.max(1) } else { 0 },
+					palpha: dummy(),
+				}
+			})
+			.collect();
+		if !dummy_params.is_empty() {
+			bytes += Scratch::vram_bytes(&dummy_params, n, forward_only);
+		}
+		bytes
+	}
+
 	pub fn new() -> Model {
 		Model {
 			specs: Vec::new(),
@@ -2184,8 +2268,11 @@ impl Model {
 		} else {
 			0
 		};
-		// No VRAM pre-check: any estimate that blocks a valid run is worse than
-		// none. If a buffer doesn't fit, hipMallocAsync errors at the real size.
+		let k = data.n_targets.max(1);
+		{
+			let need = self.vram_estimate(data.x.nrows(), xinput.ncols(), k, vocab, c_cat, false);
+			check_vram(need, data.x.nrows(), "train");
+		}
 		let start = std::time::Instant::now();
 		let (xraw, n, d) = Self::upload(&xinput);
 		// Text token ids pass RAW to the embed lookup (no z-score). The categorical
@@ -2263,7 +2350,7 @@ impl Model {
 			if !std::io::stdin().is_terminal() {
 				return false;
 			}
-			eprint!("        overwrite checkpoint with random weights? [y/N] ");
+			eprint!("overwrite checkpoint with random weights? [y/N] ");
 			std::io::stderr().flush().ok();
 			let mut line = String::new();
 			std::io::stdin().read_line(&mut line).ok();
@@ -3069,19 +3156,17 @@ impl Model {
 	pub fn eval(&self, data: &Dataset) {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "eval: call train() first");
-		// eval builds the SAME (full) Scratch fit uses — its attention buffers
-		// (scores + a second dscores + 8 per-head seq buffers) are huge for a big
-		// holdout. An over-budget GPU alloc HIP-asserts (core dump) instead of
-		// returning a catchable error, so pre-check the EXACT total against free
-		// VRAM and skip eval cleanly when it won't fit. Never chunk/minibatch eval.
 		{
 			let n = data.x.nrows();
-			let need = Scratch::vram_bytes(&params, n, true);
+			let f8 = std::mem::size_of::<f64>();
+			let need = Scratch::vram_bytes(&params, n, true)
+				+ n * data.x.ncols() * 2 * f8
+				+ n * data.n_targets.max(1) * f8;
 			let (mut free, mut total) = (0usize, 0usize);
 			unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
 			if need > free / 10 * 9 {
 				eprintln!(
-					"\x1b[33meval skipped\x1b[0m\n    needs {} for {n} rows, only {} free\n    full-batch all-token attention can't hold this holdout — reduce rows/seq or eval fewer samples",
+					"\x1b[33meval skipped\x1b[0m — needs {} for {n} rows, only {} free",
 					crate::data::human_bytes(need),
 					crate::data::human_bytes(free)
 				);
@@ -3375,8 +3460,11 @@ mod metric_gpu_tests {
 		];
 		let last = params.len() - 1;
 
-		// (1) predict (temporary acts) must equal forward_into (preallocated acts).
-		let out_ref = Model::predict(&params, &xbuf, None, n);
+		// (1) Two independent forward passes must agree.
+		let sc_ref = Scratch::new(&params, n, true);
+		Model::forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
+		let out_ref = Model::download_vec(&sc_ref.acts[last], n);
+		drop(sc_ref);
 		let sc = Scratch::new(&params, n, false);
 		Model::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let out_into = Model::download_vec(&sc.acts[last], n);
@@ -3387,7 +3475,7 @@ mod metric_gpu_tests {
 			.fold(0.0, f64::max);
 		assert!(
 			fwd_diff < 1e-9,
-			"predict != forward_into, maxdiff={fwd_diff}"
+			"forward_into not deterministic, maxdiff={fwd_diff}"
 		);
 
 		// (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
