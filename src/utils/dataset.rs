@@ -1014,6 +1014,23 @@ impl Data {
 		out
 	}
 
+	fn cat_cardinality_counts(&self) -> Vec<(usize, usize)> {
+		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
+		let is_excluded = |name: &str| {
+			self.exclude.iter().any(|p| exclude_match(p, name))
+		};
+		let mut card: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+		for a in &self.attrs {
+			if is_target(&a.name) || is_excluded(&a.name) {
+				continue;
+			}
+			if let Kind::Categorical(cats) = &a.kind {
+				*card.entry(cats.len()).or_default() += 1;
+			}
+		}
+		card.into_iter().collect()
+	}
+
 	fn print_summary(&self) {
 		let disk_size = |path: &str| -> String {
 			std::fs::metadata(path)
@@ -1057,6 +1074,14 @@ impl Data {
 		print_types("        ");
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
+		}
+		let cards = self.cat_cardinality_counts();
+		if !cards.is_empty() {
+			eprintln!("    encoding");
+			for (card, count) in &cards {
+				let range: Vec<String> = (0..*card).map(|i| i.to_string()).collect();
+				eprintln!("        {count} × [{}]", range.join(", "));
+			}
 		}
 		eprintln!(
 			"    {} features → model",
