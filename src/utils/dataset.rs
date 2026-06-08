@@ -4,22 +4,21 @@ use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
-const SEQ_LEN: usize = 32;
-
-fn is_image_cell(s: &str) -> bool {
+fn is_image_ext(s: &str) -> bool {
 	let lower = s.to_ascii_lowercase();
-	if lower.ends_with(".png")
+	lower.ends_with(".png")
 		|| lower.ends_with(".jpg")
 		|| lower.ends_with(".jpeg")
 		|| lower.ends_with(".bmp")
 		|| lower.ends_with(".gif")
 		|| lower.ends_with(".webp")
-	{
-		return true;
-	}
-	s.len() > 100
-		&& s.bytes()
-			.all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+fn is_base64(s: &str) -> bool {
+	use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD};
+	[&BASE64, &BASE64_NOPAD, &BASE64URL, &BASE64URL_NOPAD]
+		.iter()
+		.any(|enc| enc.decode(s.as_bytes()).is_ok())
 }
 
 /// Tokenize text into lowercased alphanumeric tokens (whitespace/punctuation are
@@ -85,7 +84,7 @@ pub struct Data {
 	pub(crate) attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
 	targets: Vec<usize>,
-	source: String,
+	sources: Vec<String>,
 	test_path: Option<String>,
 	split_frac: Option<f64>,
 	exclude: Vec<String>,
@@ -179,18 +178,6 @@ fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
 
-fn is_year_range(vals: &[f64]) -> bool {
-	vals.iter().all(|&v| v >= 1800.0 && v <= 2200.0)
-}
-
-fn is_date_str(s: &str) -> bool {
-	if s.len() < 6 || s.len() > 30 {
-		return false;
-	}
-	let has_sep = s.contains('-') || s.contains('/');
-	let digit_count = s.bytes().filter(|b| b.is_ascii_digit()).count();
-	has_sep && digit_count >= 4
-}
 
 fn date_to_f64(s: &str) -> f64 {
 	let parts: Vec<&str> = s.split(|c: char| c == '-' || c == '/' || c == 'T' || c == ' ').collect();
@@ -222,70 +209,10 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 			if non_empty.is_empty() {
 				return Attr { name: name.clone(), kind: Kind::Numeric };
 			}
-			let parseable: Vec<Option<f64>> = non_empty.iter().map(|c| c.parse::<f64>().ok()).collect();
-			let n_parsed = parseable.iter().filter(|v| v.is_some()).count();
-			let n_total = non_empty.len();
-			let mostly_numeric = n_total > 0 && n_parsed as f64 / n_total as f64 >= 0.8;
-			let all_numeric = n_parsed == n_total;
-			let kind = if all_numeric || mostly_numeric {
-				let vals: Vec<f64> = parseable.iter().filter_map(|v| *v).collect();
-				let mut distinct = std::collections::HashSet::new();
-				for &v in &vals {
-					distinct.insert(v.to_bits());
-				}
-				let n_distinct = distinct.len();
-				let all_integer = vals.iter().all(|v| *v == v.trunc() && v.is_finite());
-				if all_integer && is_year_range(&vals) {
-					Kind::Temporal
-				} else {
-					let avg_repeats = vals.len() as f64 / n_distinct.max(1) as f64;
-					if all_integer && avg_repeats >= 2.0 && n_distinct < vals.len() {
-						let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
-						cats.sort_unstable();
-						Kind::Categorical(cats)
-					} else {
-						Kind::Numeric
-					}
-				}
+			let kind = if non_empty.iter().all(|c| is_image_ext(c) || is_base64(c)) {
+				Kind::Image
 			} else {
-				let first = non_empty[0];
-				if is_image_cell(first) {
-					Kind::Image
-				} else if non_empty.iter().all(|c| is_date_str(c)) {
-					Kind::Temporal
-				} else {
-					let mut counts: std::collections::HashMap<&str, usize> =
-						std::collections::HashMap::new();
-					for &c in &non_empty {
-						*counts.entry(c).or_insert(0) += 1;
-					}
-					let has_repeats = counts.values().any(|&c| c > 2);
-					if has_repeats {
-						let mut cats: Vec<String> =
-							counts.keys().map(|c| c.to_string()).collect();
-						cats.sort_unstable();
-						Kind::Categorical(cats)
-					} else {
-						let set = rows
-							.par_iter()
-							.fold(
-								std::collections::HashSet::<String>::new,
-								|mut acc, row| {
-									acc.extend(tokenize(cell(row, j)));
-									acc
-								},
-							)
-							.reduce(std::collections::HashSet::<String>::new, |a, b| {
-								let (mut big, small) =
-									if a.len() >= b.len() { (a, b) } else { (b, a) };
-								big.extend(small);
-								big
-							});
-						let mut vocab: Vec<String> = set.into_iter().collect();
-						vocab.par_sort_unstable();
-						Kind::Text(vocab)
-					}
-				}
+				Kind::Numeric
 			};
 			Attr {
 				name: name.clone(),
@@ -298,7 +225,7 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 
 /// Encode raw `rows` against `attrs` into `(feature_names, X, y)`. Feature
 /// numerics/temporals pass through; categoricals one-hot as `name=cat`; text
-/// tokenized to SEQ_LEN id columns. Targets are label-encoded for Categorical
+/// tokenized to token-id columns. Targets are label-encoded for Categorical
 /// and parsed for Numeric/Temporal; a blank/unseen value → NaN. `y` is flat,
 /// row-major n*k (k = targets.len()), so row r's targets are y[r*k .. r*k+k].
 /// With `targets = []`, every column is a feature and `y` is empty.
@@ -317,17 +244,29 @@ fn encode(
 	// cap, the user `.exclude()`s the offenders and decides.
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
-	let width = |a: &Attr| match &a.kind {
+	let text_seq_lens: Vec<usize> = attrs
+		.iter()
+		.enumerate()
+		.map(|(ai, a)| match &a.kind {
+			Kind::Text(_) if !is_target(ai) && !is_skip(ai) => rows
+				.iter()
+				.map(|row| tokenize(cell(row, ai)).count())
+				.max()
+				.unwrap_or(1),
+			_ => 0,
+		})
+		.collect();
+	let width = |ai: usize, a: &Attr| match &a.kind {
 		Kind::Numeric | Kind::Temporal => 1,
 		Kind::Categorical(c) => c.len(),
-		Kind::Text(_) => SEQ_LEN,
-		Kind::Image => panic!("image columns not yet supported — .exclude() the column or use .images()"),
+		Kind::Text(_) => text_seq_lens[ai].max(1),
+		Kind::Image => panic!("image columns not yet supported — .exclude() the column"),
 	};
 	let proj_w: usize = attrs
 		.iter()
 		.enumerate()
 		.filter(|(ai, _)| !is_target(*ai) && !is_skip(*ai))
-		.map(|(_, a)| width(a))
+		.map(|(ai, a)| width(ai, a))
 		.sum();
 	let bytes = n
 		.saturating_mul(proj_w)
@@ -337,8 +276,8 @@ fn encode(
 		let mut top: Vec<(&str, usize)> = attrs
 			.iter()
 			.enumerate()
-			.filter(|(ai, a)| !is_target(*ai) && !is_skip(*ai) && width(a) > 1)
-			.map(|(_, a)| (a.name.as_str(), width(a)))
+			.filter(|(ai, a)| !is_target(*ai) && !is_skip(*ai) && width(*ai, a) > 1)
+			.map(|(ai, a)| (a.name.as_str(), width(ai, a)))
 			.collect();
 		top.sort_by(|a, b| b.1.cmp(&a.1));
 		eprintln!("\x1b[1;31mencoded matrix too large for RAM\x1b[0m");
@@ -426,20 +365,22 @@ fn encode(
 					cols.push(col);
 				}
 			}
-			// Free text → SEQ_LEN token-id columns (id = vocab index+1, 0 = pad/OOV).
-			// The `embed` layer turns each id into a learned vector; never one-hot.
 			Kind::Text(vocab) => {
+				let seq_len: usize = rows.iter()
+					.map(|row| tokenize(cell(row, ai)).count())
+					.max()
+					.unwrap_or(1);
 				let base = cols.len();
-				for s in 0..SEQ_LEN {
+				for s in 0..seq_len {
 					names.push(format!("{}#t{s}", attr.name));
 					cols.push(vec![0.0f64; n]);
 				}
-				let per_row: Vec<[f64; SEQ_LEN]> = rows
+				let per_row: Vec<Vec<f64>> = rows
 					.par_iter()
 					.map(|row| {
-						let mut ids = [0.0f64; SEQ_LEN];
+						let mut ids = vec![0.0f64; seq_len];
 						for (s, tok) in
-							tokenize(cell(row, ai)).take(SEQ_LEN).enumerate()
+							tokenize(cell(row, ai)).take(seq_len).enumerate()
 						{
 							ids[s] = vocab
 								.binary_search(&tok)
@@ -449,13 +390,13 @@ fn encode(
 					})
 					.collect();
 				for (r, ids) in per_row.iter().enumerate() {
-					for s in 0..SEQ_LEN {
+					for s in 0..seq_len {
 						cols[base + s][r] = ids[s];
 					}
 				}
 			}
 			Kind::Image => {
-				panic!("image column '{}' not yet supported — .exclude() it or use .images()", attr.name);
+				panic!("image column '{}' not yet supported — .exclude() it", attr.name);
 			}
 		}
 	}
@@ -918,7 +859,7 @@ impl Data {
 			attrs: Vec::new(),
 			rows: Vec::new(),
 			targets: Vec::new(),
-			source: String::new(),
+			sources: Vec::new(),
 			test_path: None,
 			split_frac: None,
 			exclude: Vec::new(),
@@ -927,11 +868,12 @@ impl Data {
 		}
 	}
 
-	/// Load the predictors. Accepts anything: an ARFF file (parsed now, schema
-	/// known up front), or a CSV file / directory of hash-correlated samples
-	/// (loaded as a named table in `prepare`). The `.target` is found in the set.
+	fn source_label(&self) -> String {
+		self.sources.join(", ")
+	}
+
 	pub fn set(mut self, path: &str) -> Data {
-		self.source = path.to_string();
+		self.sources.push(path.to_string());
 		if is_arff(path) {
 			let (attrs, rows) = parse_arff(path);
 			self.attrs = attrs;
@@ -1069,15 +1011,20 @@ impl Data {
 		} else {
 			self.set.x.nrows()
 		};
+		for src in &self.sources {
+			eprintln!(
+				"\x1b[32mset\x1b[0m  {}",
+				short(src),
+			);
+			eprintln!(
+				"    {}",
+				disk_size(src),
+			);
+		}
 		eprintln!(
-			"\x1b[32mset\x1b[0m  {}",
-			short(&self.source),
-		);
-		eprintln!(
-			"    {} rows  {} cols  {}",
+			"    {} rows  {} cols",
 			set_rows,
 			raw_cols,
-			disk_size(&self.source),
 		);
 		print_types("        ");
 		for ex in &self.exclude {
@@ -1187,7 +1134,7 @@ impl Data {
 		let tc = text_col_indices(&names);
 		let oh = onehot_group_indices(&names);
 		if let Some(frac) = self.split_frac {
-			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source, &tc, &oh);
+			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source_label(), &tc, &oh);
 			(tr, Some(te))
 		} else if let Some(tp) = &self.test_path {
 			let (_, trows) = parse_arff(tp);
@@ -1196,7 +1143,7 @@ impl Data {
 				Dataset {
 					x,
 					y,
-					source: self.source.clone(),
+					source: self.source_label(),
 					n_targets: k,
 					has_target: true,
 					text_cols: tc.clone(),
@@ -1217,7 +1164,7 @@ impl Data {
 				Dataset {
 					x,
 					y,
-					source: self.source.clone(),
+					source: self.source_label(),
 					n_targets: k,
 					has_target: true,
 					text_cols: tc,
@@ -1235,7 +1182,7 @@ impl Data {
 	/// target is `.target` (matched by name) or, when a test exists, the lone
 	/// train-only column.
 	fn prepare_table(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
-		let set_groups = load_groups(&self.source);
+		let set_groups: Vec<DirGroup> = self.sources.iter().flat_map(|s| load_groups(s)).collect();
 		let set_tnames = table_names(&set_groups);
 
 		let test_groups = self
@@ -1270,7 +1217,7 @@ impl Data {
 			let train = Dataset {
 				x: set.select(&feats),
 				y: set.y,
-				source: self.source.clone(),
+				source: self.source_label(),
 				n_targets: k,
 				has_target: true,
 				text_cols: tc.clone(),
@@ -1295,7 +1242,7 @@ impl Data {
 		let tc = text_col_indices(&feats);
 		let oh = onehot_group_indices(&feats);
 		if let Some(frac) = self.split_frac {
-			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source, &tc, &oh);
+			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source_label(), &tc, &oh);
 
 			return (tr, Some(te), flat_attrs);
 		}
@@ -1303,7 +1250,7 @@ impl Data {
 			Dataset {
 				x,
 				y: set.y,
-				source: self.source.clone(),
+				source: self.source_label(),
 				n_targets: k,
 				has_target: true,
 				text_cols: tc,

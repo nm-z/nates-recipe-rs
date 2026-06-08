@@ -3,7 +3,6 @@
 User-facing features referenced in `examples/cookbook.rs` that don't exist yet.
 
 ## Data loading
-- [ ] `.images("dir/")` — load image directories as samples (pixel matrix + label from CSV or subdir name)
 - [ ] `.window(n)` — sliding window for time series (n prior steps as features, next step as target)
 - [x] `data.target` — resolves to whatever `.target()` was set to
 - [x] `data.set` / `data.test` — public fields populated by `.target()`
@@ -35,7 +34,6 @@ User-facing features referenced in `examples/cookbook.rs` that don't exist yet.
 ## Model types
 - [ ] `.trees(n)` — gradient boosted trees (gpu-core has `forest.rs`, `catboost.rs`)
 - [ ] `.depth(d)` — tree max depth
-- [ ] `.kmeans(k)` — unsupervised k-means clustering (gpu-core has `cluster.rs`)
 - [ ] `.ensemble(&[model, model])` — average/vote across heterogeneous models
 
 ## Optimizers
