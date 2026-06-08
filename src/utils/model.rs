@@ -1145,60 +1145,6 @@ impl Model {
 		}
 	}
 
-	/// Raw numeric value of a metric this epoch (p = downloaded predictions).
-	fn metric_num(
-		&self,
-		m: Metric,
-		epoch: usize,
-		p: &[f64],
-		y: &crate::Vec1,
-		n: usize,
-		k: usize,
-		elapsed: f64,
-	) -> f64 {
-		let total = n * k;
-		let ys: &[f64] = y.as_slice().expect("metric: y contiguous");
-		match m {
-			Metric::Epoch => epoch as f64,
-			Metric::Lr => self.lr,
-			Metric::Time => elapsed,
-			Metric::Accuracy => {
-				if k == 1 {
-					(0..n).filter(|&i| (p[i] >= 0.5) == (ys[i] >= 0.5)).count() as f64
-						/ n as f64
-				} else {
-					// Multi-output: argmax-of-row match (one-hot k-class).
-					let argmax = |s: &[f64]| {
-						(0..k).max_by(|&a, &b| {
-							s[a].partial_cmp(&s[b])
-								.unwrap_or(std::cmp::Ordering::Equal)
-						})
-						.unwrap_or(0)
-					};
-					(0..n).filter(|&i| {
-						argmax(&p[i * k..i * k + k]) == argmax(&ys[i * k..i * k + k])
-					})
-					.count() as f64 / n as f64
-				}
-			}
-			Metric::Loss => {
-				let eps = 1e-7;
-				-(0..total)
-					.map(|i| {
-						let pi = p[i].clamp(eps, 1.0 - eps);
-						y[i] * pi.ln() + (1.0 - y[i]) * (1.0 - pi).ln()
-					})
-					.sum::<f64>() / total as f64
-			}
-			Metric::R2 => {
-				let ybar = y.iter().take(total).sum::<f64>() / total as f64;
-				let ss_tot: f64 = y.iter().take(total).map(|v| (v - ybar).powi(2)).sum();
-				let ss_res: f64 = (0..total).map(|i| (y[i] - p[i]).powi(2)).sum();
-				1.0 - ss_res / ss_tot
-			}
-		}
-	}
-
 	/// One metric this epoch as a single GPU-reduced scalar, downloading only that
 	/// scalar (never the n predictions). `out` = output activations (n×1, on GPU);
 	/// `ss_tot` is precomputed once since the targets are fixed. R²/MSE/accuracy go
@@ -2199,19 +2145,6 @@ impl Model {
 		let mut v = [0.0f64];
 		buf.download(&mut v).expect("scalar download");
 		v[0]
-	}
-
-	/// Forward + download predictions, flat row-major n*out_dim (k outputs/row).
-	fn predict(
-		params: &[LayerParams],
-		x: &GpuBuffer,
-		x_cat: Option<&GpuBuffer>,
-		n: usize,
-	) -> Vec<f64> {
-		let sc = Scratch::new(params, n, true);
-		Self::forward_into(params, x, x_cat, n, &sc.acts, &sc);
-		let last = params.len() - 1;
-		Self::download_vec(&sc.acts[last], n * params[last].out_dim)
 	}
 
 	fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {

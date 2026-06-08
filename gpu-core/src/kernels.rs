@@ -1417,7 +1417,7 @@ thread_local! {
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn atexit_gpu_shutdown() {
-	let _ = crate::hip::hipDeviceSynchronize();
+	let _ = unsafe { crate::hip::hipDeviceSynchronize() };
 	crate::memory::mark_shutting_down();
 	gpu_shutdown();
 }
