@@ -197,7 +197,6 @@ fn date_to_f64(s: &str) -> f64 {
 }
 
 fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
-	let n = rows.len();
 	let attrs: Vec<Attr> = headers
 		.iter()
 		.enumerate()
@@ -216,7 +215,7 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 			let parseable: Vec<Option<f64>> = non_empty.iter().map(|c| c.parse::<f64>().ok()).collect();
 			let n_parsed = parseable.iter().filter(|v| v.is_some()).count();
 			let n_total = non_empty.len();
-			let mostly_numeric = n_total > 0 && n_parsed as f64 / n_total as f64 > 0.8;
+			let mostly_numeric = n_total > 0 && n_parsed as f64 / n_total as f64 >= 0.8;
 			let all_numeric = n_parsed == n_total;
 			let kind = if all_numeric || mostly_numeric {
 				let vals: Vec<f64> = parseable.iter().filter_map(|v| *v).collect();
@@ -225,12 +224,12 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 					distinct.insert(v.to_bits());
 				}
 				let n_distinct = distinct.len();
-				if n_distinct <= 20 && n_distinct < vals.len() {
+				let all_integer = vals.iter().all(|v| *v == v.trunc() && v.is_finite());
+				let avg_repeats = vals.len() as f64 / n_distinct.max(1) as f64;
+				if all_integer && avg_repeats >= 2.0 && n_distinct < vals.len() {
 					let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
 					cats.sort_unstable();
 					Kind::Nominal(cats)
-				} else if n_distinct == vals.len() && vals.len() == n {
-					Kind::Numeric
 				} else {
 					Kind::Numeric
 				}

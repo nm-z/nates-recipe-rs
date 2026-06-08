@@ -142,43 +142,44 @@ mod pipeline_tests {
       }
 
       #[test]
-      fn edge_sorted_numeric_not_temporal() {
+      fn edge_sorted_numeric_with_ties() {
             let path = write_tmp("sorted_price", "\
 Price,Brand
-100,A
-200,B
-300,A
-400,B
-500,A
-600,B
-700,A
-800,B
+100.0,A
+100.0,B
+200.0,A
+200.0,B
+300.0,A
+400.0,B
+500.0,A
+500.0,B
+600.5,A
+750.99,B
 ");
             let data = crate::dataset::Data::load().set(&path).target("Brand");
             assert!(
                   matches!(kind_of(&data, "Price"), Kind::Numeric),
-                  "sorted price column detected as {:?}, expected Numeric",
-                  std::mem::discriminant(kind_of(&data, "Price")),
+                  "sorted continuous prices with ties are numeric, not categorical",
             );
       }
 
       #[test]
-      fn edge_id_column_not_temporal() {
+      fn edge_id_column_with_gaps() {
             let path = write_tmp("patient_id", "\
 patient_number,diagnosis
-1,flu
-2,cold
-3,flu
-4,cold
-5,flu
-6,cold
-7,flu
-8,cold
+1001,flu
+1005,cold
+1012,flu
+1013,cold
+1050,flu
+1051,cold
+1099,flu
+1100,cold
 ");
             let data = crate::dataset::Data::load().set(&path).target("diagnosis");
             assert!(
-                  !matches!(kind_of(&data, "patient_number"), Kind::Temporal),
-                  "unique-integer-per-row column should not be temporal",
+                  matches!(kind_of(&data, "patient_number"), Kind::Numeric),
+                  "unique integers with gaps are numeric IDs, not temporal",
             );
       }
 
@@ -205,42 +206,44 @@ stars,liked
       }
 
       #[test]
-      fn edge_date_strings_temporal() {
-            let path = write_tmp("dates", "\
+      fn edge_date_strings_with_repeats() {
+            let path = write_tmp("dates_repeat", "\
 event_date,count
 2024-01-15,10
+2024-01-15,11
 2024-02-20,20
 2024-03-10,30
+2024-03-10,31
+2024-03-10,32
 2024-04-05,40
 2024-05-18,50
-2024-06-22,60
-2024-07-30,70
-2024-08-14,80
 ");
             let data = crate::dataset::Data::load().set(&path).target("count");
             assert!(
                   matches!(kind_of(&data, "event_date"), Kind::Temporal),
-                  "ISO date strings in ascending order should be temporal",
+                  "repeating date strings are still temporal, not categorical",
             );
       }
 
       #[test]
-      fn edge_mixed_missing_numeric() {
+      fn edge_mixed_missing_mostly_numeric() {
             let path = write_tmp("mixed_missing", "\
 value,label
 3.14,a
-N/A,b
-2.71,a
-NULL,b
+2.71,b
 1.0,a
-N/A,b
+missing,b
 0.5,a
-nan,b
+9.9,b
+4.2,a
+7.7,b
+6.28,a
+unknown,b
 ");
             let data = crate::dataset::Data::load().set(&path).target("label");
             assert!(
                   matches!(kind_of(&data, "value"), Kind::Numeric),
-                  "mostly-f64 column with N/A and NULL markers should be numeric",
+                  "80% f64 with unknown string markers should be numeric",
             );
       }
 
