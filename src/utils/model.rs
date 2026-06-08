@@ -440,7 +440,9 @@ impl Train {
 		let path = path.into();
 		let path = Self::resolve(&path);
 		let last = self.last.borrow();
-		assert!(!last.model.is_null(), "save: call run() first");
+		if last.model.is_null() {
+			return;
+		}
 		let all_params = items.iter().all(|i| matches!(i, SaveItem::W | SaveItem::B));
 		if all_params {
 			let model = unsafe { &*last.model };
