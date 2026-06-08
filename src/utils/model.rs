@@ -1116,16 +1116,9 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 		});
 	}
 
-	let last_out = {
-		let mut dim = d;
-		for spec in &model.specs {
-			dim = match *spec {
-				LayerSpec::Dense(u, _) => u,
-				LayerSpec::Embed(edim) => (dim / 1.max(dim)) * edim,
-				LayerSpec::Attn(_) => dim,
-			};
-		}
-		dim
+	let last_out = match model.specs.last() {
+		Some(LayerSpec::Dense(u, _)) => *u,
+		_ => 0,
 	};
 	if model.loss == Loss::Bce && last_out != 1 {
 		issues.push(Issue {
@@ -1194,59 +1187,61 @@ impl Model {
 	fn vram_estimate(&self, n: usize, d: usize, k: usize, vocab: usize, c_cat: usize, forward_only: bool) -> usize {
 		let f8 = std::mem::size_of::<f64>();
 		let mut bytes = 0usize;
-		// x input (raw + z-scored copy both live simultaneously)
 		bytes += 2 * n * d * f8;
-		// categorical branch if embed-first
 		if c_cat > 0 {
 			bytes += 2 * n * c_cat * f8;
 		}
-		// z-score transients (mean, var, std: d-sized each)
 		bytes += 3 * d * f8;
-		// y targets
 		bytes += n * k * f8;
-		// layer params: estimate from specs
 		let mut in_dim = d;
-		let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation)> = Vec::new();
+		let mut embed_dim = 0usize;
+		let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation, usize)> = Vec::new();
 		for spec in &self.specs {
 			match *spec {
 				LayerSpec::Embed(dim) => {
 					let seq = in_dim;
-					bytes += vocab * dim * f8; // table
-					bytes += seq * dim * f8;   // negated PE
+					bytes += vocab * dim * f8;
+					bytes += seq * dim * f8;
 					let out = seq * dim;
-					fake_params.push((in_dim, out, LayerKind::Embed, dim, vocab, Activation::Linear));
+					embed_dim = dim;
+					fake_params.push((in_dim, out, LayerKind::Embed, dim, vocab, Activation::Linear, 0));
 					in_dim = out;
 				}
 				LayerSpec::Attn(heads) => {
-					let d_tok = in_dim / (in_dim / (in_dim / heads).max(1)).max(1);
-					bytes += 4 * d_tok * d_tok * f8; // Wq, Wk, Wv, Wo
-					bytes += 4 * d_tok * f8;          // biases
-					fake_params.push((in_dim, in_dim, LayerKind::Attn, d_tok, 0, Activation::Linear));
+					let d_tok = if embed_dim > 0 { embed_dim } else { in_dim };
+					bytes += 4 * d_tok * d_tok * f8;
+					bytes += 4 * d_tok * f8;
+					fake_params.push((in_dim, in_dim, LayerKind::Attn, d_tok, 0, Activation::Linear, heads));
 				}
 				LayerSpec::Dense(units, act) => {
-					bytes += in_dim * units * f8; // weights
-					bytes += units * f8;          // bias
+					let actual_in = if c_cat > 0 && !fake_params.is_empty()
+						&& matches!(fake_params.last(), Some((_, _, LayerKind::Embed | LayerKind::Attn, ..)))
+					{
+						in_dim + c_cat
+					} else {
+						in_dim
+					};
+					bytes += actual_in * units * f8;
+					bytes += units * f8;
 					if act == Activation::PRelu {
-						bytes += f8;              // learned slope
+						bytes += f8;
 					}
-					fake_params.push((in_dim, units, LayerKind::Dense, 0, 0, act));
+					fake_params.push((actual_in, units, LayerKind::Dense, 0, 0, act, 0));
 					in_dim = units;
 				}
 			}
 		}
-		// scratch estimate: build minimal LayerParams-like info for vram_bytes
-		// Use the real Scratch::vram_bytes with dummy LayerParams
 		let dummy_params: Vec<LayerParams> = fake_params
 			.iter()
-			.map(|&(i, o, kind, dim, vocab, act)| {
+			.map(|&(i, o, kind, dim, vocab, act, heads)| {
 				let dummy = || GpuBuffer::alloc(1).expect("dummy");
 				LayerParams {
 					kind,
 					w: dummy(), b: dummy(),
 					in_dim: i, out_dim: o, act,
-					dim, vocab,
+					dim: dim.max(1), vocab,
 					wk: dummy(), wv: dummy(), wo: dummy(),
-					heads: if kind == LayerKind::Attn { dim.max(1) } else { 0 },
+					heads,
 					palpha: dummy(),
 				}
 			})
