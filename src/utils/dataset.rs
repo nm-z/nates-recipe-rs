@@ -202,7 +202,7 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 		.iter()
 		.enumerate()
 		.map(|(j, name)| {
-			if let Some(sa) = known.and_then(|k| k.iter().find(|s| s.name == *name)) {
+			if let Some(sa) = known.and_then(|k| k.get(j)) {
 				return Attr {
 					name: name.clone(),
 					kind: sa.kind.clone(),
@@ -1219,23 +1219,9 @@ impl Data {
 				Some(&set.sample_group),
 				&self.exclude,
 			);
-			// A Kaggle test.csv legitimately omits the target(s) — that's the
-			// thing to predict. has_target only when ALL target cols are present.
 			let test_has_target =
 				!t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
-			let tset: std::collections::HashSet<&str> =
-				test.names.iter().map(|s| s.as_str()).collect();
-			let feats: Vec<String> = set
-				.names
-				.iter()
-				.filter(|n| tset.contains(n.as_str()) && keep(n))
-				.cloned()
-				.collect();
-			assert!(
-				!feats.is_empty(),
-				"set ({}) and test ({tp}) share no feature columns — data is non-correlated",
-				self.source
-			);
+			let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
 			let tc = text_col_indices(&feats);
 			let train = Dataset {
 				x: set.select(&feats),
@@ -1245,8 +1231,9 @@ impl Data {
 				has_target: true,
 				text_cols: tc.clone(),
 			};
+			let test_feats: Vec<String> = test.names.iter().filter(|n| keep(n)).cloned().collect();
 			let testds = Dataset {
-				x: test.select(&feats),
+				x: test.select(&test_feats),
 				y: test.y,
 				source: (*tp).clone(),
 				n_targets: test.n_targets,
@@ -1316,14 +1303,8 @@ impl Data {
 				.collect();
 		}
 		if let Some(tn) = test_names {
-			let tset: std::collections::HashSet<&str> =
-				tn.iter().map(|s| s.as_str()).collect();
-			let only: Vec<&String> = set_names
-				.iter()
-				.filter(|n| !tset.contains(n.as_str()))
-				.collect();
-			if only.len() == 1 {
-				return vec![only[0].clone()];
+			if set_names.len() == tn.len() + 1 {
+				return vec![set_names.last().expect("set has columns").clone()];
 			}
 		}
 		Vec::new()
