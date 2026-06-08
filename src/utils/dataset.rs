@@ -34,7 +34,8 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 pub(crate) enum Kind {
 	Numeric,
 	Temporal,
-	Nominal(Vec<String>),
+	Categorical(Vec<String>),
+	// Ordinal(Vec<String>),
 	Text(Vec<String>),
 	Image,
 }
@@ -229,7 +230,7 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 				if all_integer && avg_repeats >= 2.0 && n_distinct < vals.len() {
 					let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
 					cats.sort_unstable();
-					Kind::Nominal(cats)
+					Kind::Categorical(cats)
 				} else {
 					Kind::Numeric
 				}
@@ -250,7 +251,7 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 						let mut cats: Vec<String> =
 							counts.keys().map(|c| c.to_string()).collect();
 						cats.sort_unstable();
-						Kind::Nominal(cats)
+						Kind::Categorical(cats)
 					} else {
 						let set = rows
 							.par_iter()
@@ -305,7 +306,7 @@ fn encode(
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
 	let width = |a: &Attr| match &a.kind {
 		Kind::Numeric | Kind::Temporal => 1,
-		Kind::Nominal(c) => c.len(),
+		Kind::Categorical(c) => c.len(),
 		Kind::Text(_) => SEQ_LEN,
 		Kind::Image => panic!("image columns not yet supported — .exclude() the column or use .images()"),
 	};
@@ -349,7 +350,7 @@ fn encode(
 	for (ai, attr) in attrs.iter().enumerate() {
 		if let Some(tj) = targets.iter().position(|&t| t == ai) {
 			match &attr.kind {
-				Kind::Nominal(cats) => {
+				Kind::Categorical(cats) => {
 					for (r, row) in rows.iter().enumerate() {
 						let v = cell(row, ai);
 						y[r * k + tj] = cats
@@ -400,7 +401,7 @@ fn encode(
 				}
 				cols.push(col);
 			}
-			Kind::Nominal(cats) => {
+			Kind::Categorical(cats) => {
 				for cat in cats {
 					names.push(format!("{}={cat}", attr.name));
 					let mut col = vec![0.0f64; n];
@@ -991,7 +992,7 @@ impl Data {
 			match &a.kind {
 				Kind::Numeric => numeric += 1,
 				Kind::Temporal => temporal += 1,
-				Kind::Nominal(_) => categorical += 1,
+				Kind::Categorical(_) => categorical += 1,
 				Kind::Text(_) => text += 1,
 				Kind::Image => image += 1,
 			}
@@ -1479,7 +1480,7 @@ fn parse_attribute(line: &str) -> Attr {
 	};
 	let kind = if spec.starts_with('{') {
 		let inner = spec.trim_start_matches('{').trim_end_matches('}');
-		Kind::Nominal(split_fields(inner))
+		Kind::Categorical(split_fields(inner))
 	} else {
 		Kind::Numeric
 	};

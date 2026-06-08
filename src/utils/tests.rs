@@ -42,7 +42,7 @@ mod pipeline_tests {
                   .exclude("Photo")
                   .exclude("EventDate")
                   .target("MD");
-            assert!(matches!(kind_of(&data, "Geology"), Kind::Nominal(_)));
+            assert!(matches!(kind_of(&data, "Geology"), Kind::Categorical(_)));
       }
 
       #[test]
@@ -200,7 +200,7 @@ stars,liked
 ");
             let data = crate::dataset::Data::load().set(&path).target("liked");
             assert!(
-                  matches!(kind_of(&data, "stars"), Kind::Nominal(_)),
+                  matches!(kind_of(&data, "stars"), Kind::Categorical(_)),
                   "repeating integer ratings should be categorical",
             );
       }
