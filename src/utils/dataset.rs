@@ -31,7 +31,7 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 #[derive(Clone)]
-enum Kind {
+pub(crate) enum Kind {
 	Numeric,
 	Temporal,
 	Nominal(Vec<String>),
@@ -40,9 +40,9 @@ enum Kind {
 }
 
 #[derive(Clone)]
-struct Attr {
-	name: String,
-	kind: Kind,
+pub(crate) struct Attr {
+	pub(crate) name: String,
+	pub(crate) kind: Kind,
 }
 
 /// Accepts one target column (`"y"`) or several (`["a","b","c"]`) for `.target`.
@@ -81,7 +81,7 @@ pub struct Data {
 	pub set: Dataset,
 	pub test: Option<Dataset>,
 	target_names: Vec<String>,
-	attrs: Vec<Attr>,
+	pub(crate) attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
 	targets: Vec<usize>,
 	source: String,
