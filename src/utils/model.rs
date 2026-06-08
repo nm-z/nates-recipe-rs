@@ -21,6 +21,7 @@ extern "C" fn on_sigint(_: i32) {
 	INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
+/// Activation function for a dense layer: `.layer((64, relu))`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Activation {
 	Relu,
@@ -98,11 +99,14 @@ impl IntoLayer for AttnSpec {
 	}
 }
 
+/// Loss function: `.loss(mse)`, `.loss(ce)`, etc.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Loss {
 	Mse,
 	Mae,
+	/// Softmax cross-entropy (multi-class).
 	Ce,
+	/// Binary cross-entropy.
 	Bce,
 	Huber,
 }
@@ -161,16 +165,103 @@ pub enum Param {
 	B,
 }
 
-/// How to run training: epochs, logging, plotting, resume, and save. Holds the
-/// "run" config so `Model` stays pure architecture and `Data` stays pure data.
+pub enum SaveItem {
+	W,
+	B,
+	Col(String),
+}
+
+impl From<Param> for SaveItem {
+	fn from(p: Param) -> Self {
+		match p {
+			Param::W => SaveItem::W,
+			Param::B => SaveItem::B,
+		}
+	}
+}
+
+impl From<&str> for SaveItem {
+	fn from(s: &str) -> Self {
+		SaveItem::Col(s.to_string())
+	}
+}
+
+impl From<&String> for SaveItem {
+	fn from(s: &String) -> Self {
+		SaveItem::Col(s.clone())
+	}
+}
+
+pub trait RunData {
+	fn dataset(&self) -> &Dataset;
+	fn target_names(&self) -> Vec<String>;
+	fn raw_rows(&self) -> Option<Vec<Vec<String>>>;
+	fn raw_headers(&self) -> Option<Vec<String>>;
+}
+
+impl RunData for Dataset {
+	fn dataset(&self) -> &Dataset {
+		self
+	}
+	fn target_names(&self) -> Vec<String> {
+		Vec::new()
+	}
+	fn raw_rows(&self) -> Option<Vec<Vec<String>>> {
+		None
+	}
+	fn raw_headers(&self) -> Option<Vec<String>> {
+		None
+	}
+}
+
+impl RunData for Option<Dataset> {
+	fn dataset(&self) -> &Dataset {
+		self.as_ref().expect("no test dataset — use .test() or .split()")
+	}
+	fn target_names(&self) -> Vec<String> {
+		Vec::new()
+	}
+	fn raw_rows(&self) -> Option<Vec<Vec<String>>> {
+		None
+	}
+	fn raw_headers(&self) -> Option<Vec<String>> {
+		None
+	}
+}
+
+struct LastRun {
+	model: *const Model,
+	score: f64,
+	preds: Option<Vec<f64>>,
+	n: usize,
+	k: usize,
+	target_names: Vec<String>,
+	raw_test_rows: Option<Vec<Vec<String>>>,
+	raw_test_headers: Option<Vec<String>>,
+}
+
+impl Default for LastRun {
+	fn default() -> Self {
+		LastRun {
+			model: std::ptr::null(),
+			score: f64::NAN,
+			preds: None,
+			n: 0,
+			k: 0,
+			target_names: Vec::new(),
+			raw_test_rows: None,
+			raw_test_headers: None,
+		}
+	}
+}
+
 pub struct Train {
 	epochs: usize,
 	log_every: usize,
 	metrics: Vec<Metric>,
 	plot: Vec<Metric>,
 	resume: Option<String>,
-	// None = save never called; Some((parts, path)) = called (parts may be empty).
-	save: Option<(Vec<Param>, String)>,
+	last: RefCell<LastRun>,
 }
 
 impl Train {
@@ -181,7 +272,7 @@ impl Train {
 			metrics: Vec::new(),
 			plot: Vec::new(),
 			resume: None,
-			save: None,
+			last: RefCell::new(LastRun::default()),
 		}
 	}
 
@@ -212,13 +303,13 @@ impl Train {
 		self
 	}
 
-	pub fn log(mut self, metrics: &[Metric]) -> Train {
-		self.metrics = metrics.to_vec();
+	pub fn log(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
+		self.metrics = metrics.into_iter().collect();
 		self
 	}
 
-	pub fn plot(mut self, metrics: &[Metric]) -> Train {
-		self.plot = metrics.to_vec();
+	pub fn plot(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
+		self.plot = metrics.into_iter().collect();
 		self
 	}
 
@@ -227,35 +318,201 @@ impl Train {
 		self
 	}
 
-	pub fn save(mut self, parts: &[Param], path: impl Into<String>) -> Train {
-		self.save = Some((parts.to_vec(), path.into()));
-		self
+	pub fn run(&self, model: &Model, data: &impl RunData) {
+		let ds = data.dataset();
+		if ds.has_target && self.epochs > 0 {
+			let resume = self.resume.as_deref().map(Self::resolve);
+			model.fit(ds, self, resume.as_deref());
+			if INTERRUPTED.load(Ordering::SeqCst) {
+				eprintln!("\x1b[33minterrupted\x1b[0m");
+			}
+			let score = {
+				let params = model.params.borrow();
+				if params.is_empty() {
+					f64::NAN
+				} else {
+					let _key = model.loss.score_key();
+					let last = params.len() - 1;
+					let k = params[last].out_dim;
+					let n = ds.x.nrows();
+					let sc = Scratch::new(&params, n, true);
+					let (xbuf, nn, d) = Model::upload(&ds.x);
+					assert_eq!(nn, n);
+					let scaler = model.scaler.borrow();
+					let xbuf = if let Some(sc_ref) = scaler.as_ref() {
+						if sc_ref.mean.is_empty() { xbuf } else { Model::zscore_apply(&xbuf, n, d, sc_ref) }
+					} else {
+						xbuf
+					};
+					Model::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+					let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
+					if model.loss.is_classification() {
+						if k == 1 {
+							kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+						} else {
+							kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n, k);
+						}
+						Model::download_scalar(&sc.metric_scalar)
+					} else {
+						let total = (n * k) as f64;
+						let ybar = ds.y.iter().sum::<f64>() / total;
+						let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
+						kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
+						1.0 - Model::download_scalar(&sc.metric_scalar) / ss_tot
+					}
+				}
+			};
+			let mut last = self.last.borrow_mut();
+			last.model = model as *const Model;
+			last.score = score;
+			last.preds = None;
+			last.n = ds.x.nrows();
+			last.k = ds.n_targets.max(1);
+			last.target_names = data.target_names();
+			last.raw_test_rows = data.raw_rows();
+			last.raw_test_headers = data.raw_headers();
+		} else {
+			let params = model.params.borrow();
+			assert!(!params.is_empty(), "run: call train first");
+			let last_layer = params.len() - 1;
+			let k = params[last_layer].out_dim;
+			let n = ds.x.nrows();
+			let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
+			let cat_cols: Vec<usize> = if embed_first {
+				(0..ds.x.ncols()).filter(|c| !ds.text_cols.contains(c)).collect()
+			} else {
+				Vec::new()
+			};
+			let xinput = if embed_first {
+				ds.x.select(ndarray::Axis(1), &ds.text_cols)
+			} else {
+				ds.x.clone()
+			};
+			let (xraw, nn, d) = Model::upload(&xinput);
+			assert_eq!(nn, n);
+			let scaler = model.scaler.borrow();
+			let scaler_ref = scaler.as_ref().expect("run infer: missing scaler; train first");
+			let (xbuf, x_cat) = if embed_first {
+				if cat_cols.is_empty() {
+					(xraw, None)
+				} else {
+					let cat = ds.x.select(ndarray::Axis(1), &cat_cols);
+					let (craw, _, c) = Model::upload(&cat);
+					(xraw, Some(Model::zscore_apply(&craw, n, c, scaler_ref)))
+				}
+			} else {
+				(Model::zscore_apply(&xraw, n, d, scaler_ref), None)
+			};
+			let sc = Scratch::new(&params, n, true);
+			Model::forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			let preds = Model::download_vec(&sc.acts[last_layer], n * k);
+			let mut last = self.last.borrow_mut();
+			last.model = model as *const Model;
+			last.score = f64::NAN;
+			last.preds = Some(preds);
+			last.n = n;
+			last.k = k;
+			let tnames = data.target_names();
+			if !tnames.is_empty() {
+				last.target_names = tnames;
+			}
+			if let Some(rows) = data.raw_rows() {
+				last.raw_test_rows = Some(rows);
+			}
+			if let Some(headers) = data.raw_headers() {
+				last.raw_test_headers = Some(headers);
+			}
+		}
 	}
 
-	/// Train `model` on the data's train set, save (if requested), then eval on
-	/// the test set — but only if there is one (`.split` or `.test` was set).
-	pub fn run(&self, model: &Model, data: &crate::dataset::Data) {
-		// Resuming but never calling save = load weights, train, discard. Refuse.
-		assert!(
-			self.resume.is_none() || self.save.is_some(),
-			"resume without save — you'd load weights, train, then throw them away; add .save(&[w, b], \"*\")",
-		);
-		let (train, test) = data.prepare();
-		let resume = self.resume.as_deref().map(Self::resolve);
-		model.fit(&train, self, resume.as_deref());
-		// Saving is owned by fit()'s trailing stop-loss (checkpoint on the first R²
-		// drop, else the final weights at the end) — do NOT save here, or a blow-up
-		// would overwrite the good checkpoint.
-		//
-		// Ctrl+C during training: stop here. The weights are already saved; do NOT
-		// proceed to eval — that would allocate a fresh (large) eval Scratch on a
-		// device the user just asked to wind down, which is exactly the abort they hit.
-		if INTERRUPTED.load(Ordering::SeqCst) {
-			eprintln!("\x1b[33minterrupted\x1b[0m — skipping eval");
-			return;
-		}
-		if let Some(test) = &test {
-			model.eval(test);
+	pub fn save<I, S>(&self, items: I, path: impl Into<String>)
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<SaveItem>,
+	{
+		let items: Vec<SaveItem> = items.into_iter().map(Into::into).collect();
+		let path = path.into();
+		let path = Self::resolve(&path);
+		let last = self.last.borrow();
+		assert!(!last.model.is_null(), "save: call run() first");
+		let all_params = items.iter().all(|i| matches!(i, SaveItem::W | SaveItem::B));
+		if all_params {
+			let model = unsafe { &*last.model };
+			let params = model.params.borrow();
+			assert!(!params.is_empty(), "save: model has no trained params");
+			let parts: Vec<Param> = items
+				.iter()
+				.map(|i| match i {
+					SaveItem::W => Param::W,
+					SaveItem::B => Param::B,
+					_ => unreachable!(),
+				})
+				.collect();
+			let key = model.loss.score_key();
+			let score = last.score;
+			if !score.is_finite()
+				|| Model::saved_score(&path, key).is_some_and(|best| score <= best)
+			{
+				return;
+			}
+			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+			Model::write_ogdl(&path, &Model::dump_ogdl(&params, &parts, key, score));
+			let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
+			eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
+		} else {
+			let preds = last.preds.as_ref().expect("save columns: run inference first");
+			let n = last.n;
+			let k = last.k;
+			let targets = &last.target_names;
+			let headers_opt = last.raw_test_headers.as_ref();
+			let rows_opt = last.raw_test_rows.as_ref();
+			let mut csv_cols: Vec<(String, Vec<String>)> = Vec::new();
+			for item in &items {
+				match item {
+					SaveItem::Col(name) => {
+						if targets.contains(name) || (targets.len() > 1 && targets[0] == *name)
+						{
+							if k == 1 {
+								let col: Vec<String> = (0..n).map(|i| preds[i].to_string()).collect();
+								csv_cols.push((targets[0].clone(), col));
+							} else {
+								for (ti, tname) in targets.iter().enumerate() {
+									let col: Vec<String> = (0..n)
+										.map(|i| preds[i * k + ti].to_string())
+										.collect();
+									csv_cols.push((tname.clone(), col));
+								}
+							}
+						} else if let (Some(headers), Some(rows)) = (headers_opt, rows_opt) {
+							if let Some(ci) = headers.iter().position(|h| h == name) {
+								let col: Vec<String> =
+									rows.iter().map(|r| r.get(ci).cloned().unwrap_or_default()).collect();
+								csv_cols.push((name.clone(), col));
+							} else {
+								panic!("save: column '{name}' not found in test data");
+							}
+						} else {
+							panic!("save: no raw test data available for column '{name}'");
+						}
+					}
+					SaveItem::W | SaveItem::B => {
+						panic!("save: mixing params and columns is not supported");
+					}
+				}
+			}
+			assert!(!csv_cols.is_empty(), "save: no columns to write");
+			let mut out = String::new();
+			let header: Vec<&str> = csv_cols.iter().map(|(h, _)| h.as_str()).collect();
+			out.push_str(&header.join(","));
+			out.push('\n');
+			for i in 0..n {
+				let row: Vec<&str> = csv_cols.iter().map(|(_, col)| col[i].as_str()).collect();
+				out.push_str(&row.join(","));
+				out.push('\n');
+			}
+			std::fs::write(&path, &out).unwrap_or_else(|e| panic!("save: {path}: {e}"));
+			let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
+			eprintln!("saved {} ({n} rows)", full.display());
 		}
 	}
 }
@@ -300,6 +557,7 @@ fn expand_tilde(path: &str) -> String {
 	}
 }
 
+/// What to log or plot each epoch: `.log(&[Loss, R2, Lr])`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Metric {
 	Loss,
@@ -802,6 +1060,18 @@ struct Scaler {
 	std: Vec<f64>,
 }
 
+/// Neural network architecture: layers, loss, and learning rate.
+///
+/// ```rust,no_run
+/// # use nates_recipe::*;
+/// Model::new()
+///     .layer(embed(16))
+///     .layer(attn(4))
+///     .layer(64).relu()
+///     .layer(1)
+///     .loss(mse)
+///     .lr(0.001);
+/// ```
 pub struct Model {
 	specs: Vec<LayerSpec>,
 	loss: Loss,
@@ -1282,6 +1552,43 @@ impl Model {
 	pub fn layer(mut self, spec: impl IntoLayer) -> Model {
 		self.specs.push(spec.into_layer());
 		self
+	}
+
+	fn set_last_activation(mut self, act: Activation) -> Model {
+		if let Some(LayerSpec::Dense(_, a)) = self.specs.last_mut() {
+			*a = act;
+		} else {
+			panic!("activation method called but last layer is not dense");
+		}
+		self
+	}
+
+	pub fn relu(self) -> Model {
+		self.set_last_activation(Activation::Relu)
+	}
+	pub fn leak(self) -> Model {
+		self.set_last_activation(Activation::LeakyRelu)
+	}
+	pub fn sigmoid(self) -> Model {
+		self.set_last_activation(Activation::Sigmoid)
+	}
+	pub fn tanh(self) -> Model {
+		self.set_last_activation(Activation::Tanh)
+	}
+	pub fn selu(self) -> Model {
+		self.set_last_activation(Activation::Selu)
+	}
+	pub fn gelu(self) -> Model {
+		self.set_last_activation(Activation::Gelu)
+	}
+	pub fn silu(self) -> Model {
+		self.set_last_activation(Activation::Silu)
+	}
+	pub fn elu(self) -> Model {
+		self.set_last_activation(Activation::Elu)
+	}
+	pub fn prelu(self) -> Model {
+		self.set_last_activation(Activation::PRelu)
 	}
 
 	pub fn loss(mut self, loss: Loss) -> Model {
@@ -2330,7 +2637,8 @@ impl Model {
 		}
 		let mut terminal = plotting.then(ratatui::init);
 		let mut last_draw = start;
-		let checkpointing = cfg.save.as_ref().is_some_and(|(p, _)| !p.is_empty());
+		let checkpoint_path = cfg.resume.as_deref().map(Train::resolve);
+		let checkpointing = checkpoint_path.is_some();
 		let classify = self.loss.is_classification();
 		let mut loss_prev = f64::INFINITY;
 		let mut saved = false;
@@ -2416,12 +2724,12 @@ impl Model {
 			if checkpointing {
 				if !saved && e > 0 && loss > loss_prev {
 					saved = true;
-					let (parts, path) = cfg.save.as_ref().expect("save set");
-					let path = Train::resolve(path);
+					let path = checkpoint_path.as_ref().expect("checkpoint path");
 					let key = self.loss.score_key();
-					if Self::saved_score(&path, key).is_none_or(|best| score > best) {
+					let parts = &[Param::W, Param::B];
+					if Self::saved_score(path, key).is_none_or(|best| score > best) {
 						Self::write_ogdl(
-							&path,
+							path,
 							&Self::dump_ogdl(&params, parts, key, score),
 						);
 						checkpointed = true;
@@ -2523,28 +2831,24 @@ impl Model {
 		});
 		*self.params.borrow_mut() = params;
 		if let Some(s) = end_score {
-			let (parts, path) = cfg.save.as_ref().expect("save set");
-			let path = Train::resolve(path);
+			let path = checkpoint_path.as_ref().expect("checkpoint path");
+			let parts = &[Param::W, Param::B];
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				let key = self.loss.score_key();
 				Self::write_ogdl(
-					&path,
+					path,
 					&Self::dump_ogdl(&self.params.borrow(), parts, key, s),
 				);
 				let full =
-					std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
+					std::fs::canonicalize(path).unwrap_or_else(|_| path.as_str().into());
 				eprintln!("saved {} ({key} {s:.4})", full.display());
 			} else {
-				self.save(parts, &path, s);
+				self.save_checkpoint(parts, path, s);
 			}
 		}
 	}
 
-	/// Dump the requested params to `model.ogdl` in the cwd as one OGDL block
-	/// per neuron: `z{k}` with `w1..` (if `W` requested) and `b` (if requested).
-	/// Call after `train()`: `model.save(&[W, B], "model.ogdl", r2)`. Refuses to
-	/// overwrite a checkpoint whose stored R² already beats `r2` (anti-degradation).
-	pub fn save(&self, parts: &[Param], path: &str, score: f64) {
+	fn save_checkpoint(&self, parts: &[Param], path: &str, score: f64) {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "save: call train() first");
 		let key = self.loss.score_key();
@@ -3072,7 +3376,7 @@ mod metric_gpu_tests {
 			"Huber",
 		);
 		close(
-			mdl(Loss::Ce).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
+			mdl(Loss::Bce).metric_gpu(Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
 			bce_ref,
 			"BCE",
 		);

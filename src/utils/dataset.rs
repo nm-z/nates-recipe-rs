@@ -59,24 +59,30 @@ impl IntoTargets for &[&str] {
 	}
 }
 
+/// Data loader: CSV, ARFF, or a directory of correlated files.
+///
+/// ```rust,no_run
+/// # use nates_recipe::*;
+/// let data = Data::load()
+///     .set("train.csv")
+///     .test("test.csv")
+///     .exclude("Id")
+///     .target("Price");
+/// ```
 pub struct Data {
+	pub target: &'static str,
+	pub set: Dataset,
+	pub test: Option<Dataset>,
+	target_names: Vec<String>,
 	attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
-	// ARFF target column indices, resolved from `target_names` when the schema is
-	// known up front. Empty until `.target` is called on an ARFF set.
 	targets: Vec<usize>,
-	// The requested target column name(s) (from `.target`). For ARFF resolved to
-	// `targets` indices; for tabular set/test matched against column names.
-	target_names: Vec<String>,
 	source: String,
-	// A separate test file (.test) and/or an internal split fraction (.split).
-	// Neither set → no test set → no eval.
 	test_path: Option<String>,
 	split_frac: Option<f64>,
-	// Feature patterns to drop: an exact column name, a `group:*` glob, a bare
-	// header, or a group name. The framework keeps everything it finds; the user
-	// decides what's useless.
 	exclude: Vec<String>,
+	raw_test_rows: Option<Vec<Vec<String>>>,
+	raw_test_headers: Option<Vec<String>>,
 }
 
 pub struct Dataset {
@@ -863,14 +869,26 @@ impl Data {
 	/// Start a data builder. Call `.set(path)` to load the predictors file.
 	pub fn load() -> Data {
 		Data {
+			target: "",
+			set: Dataset {
+				x: crate::Mat::default((0, 0)),
+				y: crate::Vec1::default(0),
+				source: String::new(),
+				n_targets: 0,
+				has_target: false,
+				text_cols: Vec::new(),
+			},
+			test: None,
+			target_names: Vec::new(),
 			attrs: Vec::new(),
 			rows: Vec::new(),
 			targets: Vec::new(),
-			target_names: Vec::new(),
 			source: String::new(),
 			test_path: None,
 			split_frac: None,
 			exclude: Vec::new(),
+			raw_test_rows: None,
+			raw_test_headers: None,
 		}
 	}
 
@@ -892,6 +910,7 @@ impl Data {
 	/// set/dir they're matched against column names in `prepare`.
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.target_names = t.into_targets();
+		self.target = self.target_names.first().map_or("", |s| Box::leak(s.clone().into_boxed_str()));
 		if !self.attrs.is_empty() {
 			self.targets = self
 				.target_names
@@ -906,6 +925,25 @@ impl Data {
 				})
 				.collect();
 		}
+		if let Some(tp) = &self.test_path {
+			if let Ok(text) = std::fs::read_to_string(tp) {
+				let mut lines = text.lines();
+				if let Some(header_line) = lines.next() {
+					self.raw_test_headers = Some(
+						split_fields(header_line).into_iter().map(|s| s.trim().to_string()).collect(),
+					);
+					self.raw_test_rows = Some(
+						lines
+							.filter(|l| !l.trim().is_empty())
+							.map(|l| split_fields(l))
+							.collect(),
+					);
+				}
+			}
+		}
+		let (train, test) = self.prepare();
+		self.set = train;
+		self.test = test;
 		self
 	}
 
@@ -1402,4 +1440,19 @@ fn parse_attribute(line: &str) -> Attr {
 		Kind::Numeric
 	};
 	Attr { name, kind }
+}
+
+impl crate::model::RunData for Data {
+	fn dataset(&self) -> &Dataset {
+		&self.set
+	}
+	fn target_names(&self) -> Vec<String> {
+		self.target_names.clone()
+	}
+	fn raw_rows(&self) -> Option<Vec<Vec<String>>> {
+		self.raw_test_rows.clone()
+	}
+	fn raw_headers(&self) -> Option<Vec<String>> {
+		self.raw_test_headers.clone()
+	}
 }

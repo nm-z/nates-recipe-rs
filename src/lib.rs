@@ -1,31 +1,70 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::match_wild_err_arm)]
+//! GPU-native neural network training.
+//!
+//! ```rust,no_run
+//! use nates_recipe::*;
+//!
+//! let data = Data::load()
+//!     .set("train.csv")
+//!     .split(0.8)
+//!     .target("Price");
+//!
+//! let model = Model::new()
+//!     .layer(64).leak()
+//!     .layer(32).leak()
+//!     .layer(1)
+//!     .loss(mse)
+//!     .lr(0.001);
+//!
+//! let train = Train::new()
+//!     .epochs(100)
+//!     .log([Loss, R2]);
+//!
+//! train.run(&model, &data);
+//! train.save([w, b], "model.ogdl");
+//! ```
 
+#[doc(hidden)]
 pub type Mat = ndarray::Array2<f64>;
+#[doc(hidden)]
 pub type Vec1 = ndarray::Array1<f64>;
 
+#[doc(hidden)]
 pub use gpu_core as gpu;
 
+#[doc(hidden)]
 #[path = "utils/data.rs"]
 pub mod data;
 
+#[doc(hidden)]
 #[path = "utils/dataset.rs"]
 pub mod dataset;
 
+#[doc(hidden)]
 #[path = "utils/model.rs"]
 pub mod model;
 
-pub use dataset::{Data, Dataset};
+#[doc(inline)]
+pub use dataset::Data;
+#[doc(hidden)]
+pub use dataset::Dataset;
+
+#[doc(inline)]
 pub use model::{
-	Accuracy, Activation, Epoch, IntoLayer, LayerSpec, Loss, Lr, Metric, Model, Param, R2, Time,
-	Train, attn, bce, ce, elu, embed, gelu, huber, leak, linear, mae, mse, prelu, relu, selu,
-	sig, silu, swish, tanh,
+	Accuracy, Epoch, Loss, Lr, Metric, Model, R2, Time, Train,
+	attn, bce, ce, embed, huber, mae, mse,
+};
+#[doc(hidden)]
+pub use model::{
+	Activation, IntoLayer, LayerSpec, Param, RunData, SaveItem,
+	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
-// `save` selectors. Defined here in the crate root — NOT in `model`, where bare
-// `w`/`b` consts would be parsed as constant-patterns and break `let w`/`let b`.
+/// Save weights: `train.save([w, b], "model.ogdl")`.
 #[allow(non_upper_case_globals)]
 pub const w: Param = Param::W;
+/// Save biases: `train.save([w, b], "model.ogdl")`.
 #[allow(non_upper_case_globals)]
 pub const b: Param = Param::B;
 

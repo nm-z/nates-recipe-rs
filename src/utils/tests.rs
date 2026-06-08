@@ -1,79 +1,81 @@
 #[cfg(test)]
 mod pipeline_tests {
-	fn fixture(name: &str) -> String {
-		let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-		p.push("tests/fixtures");
-		p.push(name);
-		p.display().to_string()
-	}
+      fn fixture() -> String {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/fixture.csv");
+            p.display().to_string()
+      }
 
-	#[test]
-	fn numeric_blanks_drop_rows() {
-		let (train, _) = crate::dataset::Data::load()
-			.set(&fixture("hw_train.csv"))
-			.target("MD")
-			.prepare();
-		assert_eq!(train.x.ncols(), 3, "3 numeric features (A, B, C)");
-		assert_eq!(train.x.nrows(), 7, "10 - 3 NaN rows");
-		assert_eq!(train.x.iter().filter(|v| v.is_nan()).count(), 0);
-	}
+      #[test]
+      fn numeric_blanks_drop_rows() {
+            let data = crate::dataset::Data::load()
+                  .set(&fixture())
+                  .exclude("D")
+                  .exclude("GR")
+                  .exclude("Geology")
+                  .exclude("TVT")
+                  .target("MD");
+            assert_eq!(data.set.x.ncols(), 3, "3 numeric features (A, B, C)");
+            assert_eq!(data.set.x.nrows(), 7, "10 - 3 NaN rows");
+            assert_eq!(data.set.x.iter().filter(|v| v.is_nan()).count(), 0);
+      }
 
-	#[test]
-	fn categorical_feature_one_hot() {
-		let (train, _) = crate::dataset::Data::load()
-			.set(&fixture("tw_train.csv"))
-			.target("TVT")
-			.prepare();
-		assert_eq!(train.x.ncols(), 4, "GR + 3 Geology one-hot columns");
-		assert_eq!(train.x.nrows(), 6, "all rows kept");
-		assert_eq!(train.x.iter().filter(|v| v.is_nan()).count(), 0);
-	}
+      #[test]
+      fn categorical_feature_one_hot() {
+            let data = crate::dataset::Data::load()
+                  .set(&fixture())
+                  .exclude("A")
+                  .exclude("B")
+                  .exclude("C")
+                  .exclude("D")
+                  .exclude("MD")
+                  .target("TVT");
+            assert_eq!(data.set.x.ncols(), 4, "GR + 3 Geology one-hot columns");
+            assert_eq!(data.set.x.nrows(), 10, "all rows kept");
+            assert_eq!(data.set.x.iter().filter(|v| v.is_nan()).count(), 0);
+      }
 
-	#[test]
-	fn selection_before_nan() {
-		let (train, _) = crate::dataset::Data::load()
-			.set(&fixture("tw_train.csv"))
-			.test(&fixture("tw_test.csv"))
-			.target("TVT")
-			.prepare();
-		assert_eq!(train.x.ncols(), 1, "only the shared GR is a feature");
-		assert_eq!(
-			train.x.nrows(),
-			6,
-			"Geology dropped before NaN, drops no rows"
-		);
-	}
+      #[test]
+      fn exclude_before_nan() {
+            let data = crate::dataset::Data::load()
+                  .set(&fixture())
+                  .exclude("B")
+                  .exclude("D")
+                  .exclude("GR")
+                  .exclude("Geology")
+                  .exclude("TVT")
+                  .target("MD");
+            assert_eq!(data.set.x.ncols(), 2, "A, C (B excluded)");
+            assert_eq!(data.set.x.nrows(), 9, "only C-blank row dropped, B blanks irrelevant");
+      }
 
-	#[test]
-	fn aligns_to_shared_columns() {
-		let (train, test) = crate::dataset::Data::load()
-			.set(&fixture("hw_train.csv"))
-			.test(&fixture("hw_test.csv"))
-			.prepare();
-		let test = test.expect("test present");
-		assert_eq!(train.x.ncols(), 3, "3 shared columns (A, B, MD)");
-		assert_eq!(test.x.ncols(), 3);
-	}
+      #[test]
+      fn split_keeps_all_columns() {
+            let data = crate::dataset::Data::load()
+                  .set(&fixture())
+                  .exclude("A")
+                  .exclude("B")
+                  .exclude("C")
+                  .exclude("D")
+                  .exclude("MD")
+                  .split(0.8)
+                  .target("TVT");
+            let test = data.test.as_ref().expect("split yields a test");
+            assert_eq!(data.set.x.ncols(), 4, "GR + 3 Geology one-hot");
+            assert_eq!(test.x.ncols(), 4);
+      }
 
-	#[test]
-	fn split_keeps_all_columns() {
-		let (train, test) = crate::dataset::Data::load()
-			.set(&fixture("clean.csv"))
-			.target("D")
-			.split(0.8)
-			.prepare();
-		let test = test.expect("split yields a test");
-		assert_eq!(train.x.ncols(), 3, "A, B, C (D is target)");
-		assert_eq!(test.x.ncols(), 3);
-	}
-
-	#[test]
-	fn set_only_keeps_all_columns() {
-		let (train, test) = crate::dataset::Data::load()
-			.set(&fixture("clean.csv"))
-			.target("D")
-			.prepare();
-		assert_eq!(train.x.ncols(), 3, "A, B, C (D is target)");
-		assert!(test.is_none());
-	}
+      #[test]
+      fn set_only_no_test() {
+            let data = crate::dataset::Data::load()
+                  .set(&fixture())
+                  .exclude("A")
+                  .exclude("B")
+                  .exclude("C")
+                  .exclude("D")
+                  .exclude("MD")
+                  .target("TVT");
+            assert_eq!(data.set.x.ncols(), 4, "GR + 3 Geology one-hot");
+            assert!(data.test.is_none());
+      }
 }
