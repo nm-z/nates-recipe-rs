@@ -5,12 +5,32 @@ User-facing features referenced in `examples/cookbook.rs` that don't exist yet.
 ## Data loading
 - [ ] `.images("dir/")` — load image directories as samples (pixel matrix + label from CSV or subdir name)
 - [ ] `.window(n)` — sliding window for time series (n prior steps as features, next step as target)
+- [x] `data.target` — resolves to whatever `.target()` was set to
+- [x] `data.set` / `data.test` — public fields populated by `.target()`
+
+## Data type detection
+- [x] Numeric — continuous f64, non-integer or unique floats
+- [x] Temporal — date strings (ISO/slash format) auto-encoded to days
+- [x] Categorical — string values that repeat, or integers where every value appears ≥2x on average
+- [ ] Ordinal — ordered categorical (integer-encode instead of one-hot)
+- [x] Text — all-unique strings, tokenized for embedding
+- [x] Image — file paths (.png/.jpg/etc) or base64 cell content (detected, not yet encoded)
+- [x] Mixed missing markers — N/A, NULL, None, nan, ?, ., - filtered before detection
+- [x] Mostly-numeric columns — ≥80% f64 treated as numeric with NaN for unparseable cells
 
 ## Layer types
 - [ ] `conv(filters, kernel_size)` — 1D/2D convolutional layer
 - [ ] `pool(size)` — max/avg pooling layer
 - [ ] `gru(hidden)` — GRU recurrent layer
 - [ ] `lstm(hidden)` — LSTM recurrent layer
+
+## API
+- [x] `.layer(64).leak()` — chained activation methods replace tuple syntax
+- [x] `.log([Loss, R2])` — accepts IntoIterator, no `&[]` needed
+- [x] `.run()` borrows `&self`, reusable in loops
+- [x] `.save([w, b], path)` — post-run param save
+- [x] `.save(["Id", data.target], path)` — post-run prediction CSV
+- [x] Preflight checks — VRAM, embed/text mismatch, loss/output mismatch, interactive prompt
 
 ## Model types
 - [ ] `.trees(n)` — gradient boosted trees (gpu-core has `forest.rs`, `catboost.rs`)
