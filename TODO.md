@@ -29,9 +29,6 @@ User-facing features referenced in `examples/cookbook.rs` that don't exist yet.
 - [ ] `contrastive` — contrastive loss (gpu-core has `gpu_contrastive_loss`)
 - [ ] `cosine` — cosine embedding loss (gpu-core has `gpu_cosine_embedding_loss`)
 
-## Training
-- [ ] `.submit("submission.csv")` — predict on test set and write Kaggle submission CSV
-
 ## Models from gpu-core not yet wired
 - [ ] SVM (gpu-core has `svm.rs`: kernel matrix, SMO solver)
 - [ ] Naive Bayes (gpu-core has `bayes.rs`: multinomial, Bernoulli)
