@@ -1100,41 +1100,46 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 
 	if model.specs.is_empty() {
 		issues.push(Issue {
-			what: "model has no layers".into(),
-			have: format!("{} layers defined", model.specs.len()),
-			need: "≥1 layer (.layer() before .run())".into(),
+			what: "model has 0 layers".into(),
+			have: "0 layers".into(),
+			need: "≥1 (.layer() before .run())".into(),
 		});
 		return issues;
 	}
 
-	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
-	if embed_first && ds.text_cols.is_empty() {
-		issues.push(Issue {
-			what: "embed layer but no text columns".into(),
-			have: format!("{} text columns in {} total", ds.text_cols.len(), d),
-			need: "≥1 text column (>256 distinct values) for token-id embedding".into(),
-		});
+	for (i, spec) in model.specs.iter().enumerate() {
+		if let LayerSpec::Embed(_) = spec {
+			if ds.text_cols.is_empty() {
+				issues.push(Issue {
+					what: format!("embedding layer {} has no text features", i + 1),
+					have: format!("{} text, {} numeric, {} categorical in {} total features", ds.text_cols.len(), d - ds.text_cols.len(), 0, d),
+					need: "≥1 text feature (column with >256 distinct values)".into(),
+				});
+			}
+		}
 	}
 
 	let last_out = match model.specs.last() {
 		Some(LayerSpec::Dense(u, _)) => *u,
 		_ => 0,
 	};
+	let n_layers = model.specs.len();
 	if model.loss == Loss::Bce && last_out != 1 {
 		issues.push(Issue {
-			what: "BCE loss expects 1 output unit".into(),
-			have: format!("last layer outputs {last_out}"),
-			need: "1 (.layer(1).sigmoid() for binary classification)".into(),
+			what: format!("dense layer {n_layers} outputs {last_out}, bce loss expects 1"),
+			have: format!("{last_out} output units"),
+			need: "1 (.layer(1).sigmoid())".into(),
 		});
 	}
 	if model.loss == Loss::Ce && k > 1 && last_out != k {
 		issues.push(Issue {
-			what: "CE loss output/target mismatch".into(),
-			have: format!("last layer outputs {last_out}"),
-			need: format!("{k} (matching target columns)"),
+			what: format!("dense layer {n_layers} outputs {last_out}, ce loss expects {k}"),
+			have: format!("{last_out} output units"),
+			need: format!("{k} (one per target column)"),
 		});
 	}
 
+	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
 	let (mut free_vram, mut total_vram) = (0usize, 0usize);
 	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
 	let cat_cols = if embed_first { d - ds.text_cols.len() } else { 0 };
@@ -1146,11 +1151,11 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 	};
 	let need = model.vram_estimate(n, text_d, k, vocab, cat_cols, forward_only);
 	if need > free_vram / 10 * 9 {
-		let mode = if forward_only { "infer" } else { "train" };
+		let mode = if forward_only { "inference" } else { "training" };
 		issues.push(Issue {
-			what: format!("{mode}: {n} rows × {d} features"),
-			have: format!("{} free VRAM ({} total)", crate::data::human_bytes(free_vram), crate::data::human_bytes(total_vram)),
-			need: format!("{} estimated", crate::data::human_bytes(need)),
+			what: format!("{mode} on {n} rows × {d} features exceeds GPU memory"),
+			have: format!("{} free of {} total", crate::data::human_bytes(free_vram), crate::data::human_bytes(total_vram)),
+			need: format!("{}", crate::data::human_bytes(need)),
 		});
 	}
 
