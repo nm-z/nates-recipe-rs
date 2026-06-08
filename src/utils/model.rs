@@ -384,15 +384,25 @@ impl Train {
 			let k = params[last_layer].out_dim;
 			let n = ds.x.nrows();
 			let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
+			let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
+			let (collapsed_x, collapsed_embed_cols, collapsed_vocab) = if embed_cats {
+				let (x, ec, v) = collapse_onehot(ds);
+				(Some(x), ec, v)
+			} else {
+				(None, Vec::new(), 0)
+			};
+			let _ = collapsed_vocab;
+			let eff_x = collapsed_x.as_ref().unwrap_or(&ds.x);
+			let eff_text = if embed_cats { &collapsed_embed_cols } else { &ds.text_cols };
 			let cat_cols: Vec<usize> = if embed_first {
-				(0..ds.x.ncols()).filter(|c| !ds.text_cols.contains(c)).collect()
+				(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
 			} else {
 				Vec::new()
 			};
 			let xinput = if embed_first {
-				ds.x.select(ndarray::Axis(1), &ds.text_cols)
+				eff_x.select(ndarray::Axis(1), eff_text)
 			} else {
-				ds.x.clone()
+				eff_x.clone()
 			};
 			let (xraw, nn, d) = Model::upload(&xinput);
 			assert_eq!(nn, n);
@@ -402,7 +412,7 @@ impl Train {
 				if cat_cols.is_empty() {
 					(xraw, None)
 				} else {
-					let cat = ds.x.select(ndarray::Axis(1), &cat_cols);
+					let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
 					let (craw, _, c) = Model::upload(&cat);
 					(xraw, Some(Model::zscore_apply(&craw, n, c, scaler_ref)))
 				}
@@ -760,6 +770,43 @@ fn concat_layer(params: &[LayerParams]) -> Option<(usize, usize, usize)> {
 	None
 }
 
+fn collapse_onehot(ds: &Dataset) -> (crate::Mat, Vec<usize>, usize) {
+	let n = ds.x.nrows();
+	let ncols = ds.x.ncols();
+	let mut in_group = vec![false; ncols];
+	for &(start, len) in &ds.onehot_groups {
+		for c in start..start + len {
+			in_group[c] = true;
+		}
+	}
+	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group[*c]).collect();
+	let n_cat = ds.onehot_groups.len();
+	let new_ncols = passthrough.len() + n_cat;
+	let mut data = vec![0.0f64; n * new_ncols];
+	for (new_j, &orig_j) in passthrough.iter().enumerate() {
+		for i in 0..n {
+			data[i * new_ncols + new_j] = ds.x[[i, orig_j]];
+		}
+	}
+	let embed_start = passthrough.len();
+	let mut offset = 0usize;
+	for (g, &(start, len)) in ds.onehot_groups.iter().enumerate() {
+		let new_j = embed_start + g;
+		for i in 0..n {
+			for c in 0..len {
+				if ds.x[[i, start + c]] > 0.5 {
+					data[i * new_ncols + new_j] = (offset + c) as f64;
+					break;
+				}
+			}
+		}
+		offset += len;
+	}
+	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
+	let x = crate::Mat::from_shape_vec((n, new_ncols), data).expect("collapse_onehot");
+	(x, embed_cols, offset)
+}
+
 struct Scratch {
 	acts: Vec<GpuBuffer>,
 	// Per-layer pre-activation, saved ONLY for Silu/Gelu (their backward needs the
@@ -1109,18 +1156,6 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 		return issues;
 	}
 
-	for (i, spec) in model.specs.iter().enumerate() {
-		if let LayerSpec::Embed(_) = spec {
-			if ds.text_cols.is_empty() {
-				issues.push(Issue {
-					what: format!("embedding layer {} has no text features", i + 1),
-					have: format!("{} text features out of {} total", ds.text_cols.len(), d),
-					need: "≥1 text feature (column with >256 distinct values)".into(),
-				});
-			}
-		}
-	}
-
 	let last_out = match model.specs.last() {
 		Some(LayerSpec::Dense(u, _)) => *u,
 		_ => 0,
@@ -1142,14 +1177,21 @@ fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 	}
 
 	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
+	let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
 	let (mut free_vram, mut total_vram) = (0usize, 0usize);
 	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
-	let cat_cols = if embed_first { d - ds.text_cols.len() } else { 0 };
-	let text_d = if embed_first { ds.text_cols.len() } else { d };
-	let vocab = if embed_first {
-		ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1
+	let (cat_cols, text_d, vocab) = if embed_cats {
+		let n_cat = ds.onehot_groups.len();
+		let n_oh: usize = ds.onehot_groups.iter().map(|(_, len)| len).sum();
+		let passthrough = d - n_oh;
+		let total_cats: usize = ds.onehot_groups.iter().map(|(_, len)| len).sum();
+		(passthrough, n_cat, total_cats)
+	} else if embed_first {
+		let tc = ds.text_cols.len();
+		let vocab = ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1;
+		(d - tc, tc, vocab)
 	} else {
-		0
+		(0, d, 0)
 	};
 	let need = model.vram_estimate(n, text_d, k, vocab, cat_cols, forward_only);
 	if need > free_vram / 10 * 9 {
@@ -2328,25 +2370,34 @@ impl Model {
 	fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
 		let rerun = !self.params.borrow().is_empty();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(_)));
-		// Two branches: text token-id columns drive embed→attn; every other column
-		// (categorical/numeric) skips the prefix and is concatenated onto the
-		// attention output before the dense head. xinput feeds layer 0 (the text
-		// branch when embed-first, else the whole matrix).
+		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
+		let (collapsed_x, collapsed_embed_cols, collapsed_vocab) = if embed_cats {
+			let (x, ec, v) = collapse_onehot(data);
+			(Some(x), ec, v)
+		} else {
+			(None, Vec::new(), 0)
+		};
+		let effective_x = collapsed_x.as_ref().unwrap_or(&data.x);
+		let effective_text = if embed_cats { &collapsed_embed_cols } else { &data.text_cols };
 		let cat_cols: Vec<usize> = if embed_first {
-			(0..data.x.ncols())
-				.filter(|c| !data.text_cols.contains(c))
+			(0..effective_x.ncols())
+				.filter(|c| !effective_text.contains(c))
 				.collect()
 		} else {
 			Vec::new()
 		};
 		let c_cat = cat_cols.len();
 		let xinput = if embed_first {
-			data.x.select(ndarray::Axis(1), &data.text_cols)
+			effective_x.select(ndarray::Axis(1), effective_text)
 		} else {
-			data.x.clone()
+			effective_x.clone()
 		};
 		let vocab = if embed_first {
-			xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1
+			if embed_cats {
+				collapsed_vocab
+			} else {
+				xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1
+			}
 		} else {
 			0
 		};
@@ -2365,7 +2416,7 @@ impl Model {
 				});
 				(xraw, None)
 			} else {
-				let cat = data.x.select(ndarray::Axis(1), &cat_cols);
+				let cat = effective_x.select(ndarray::Axis(1), &cat_cols);
 				let (craw, _, c) = Self::upload(&cat);
 				let ccat = Self::zscore_fit(&craw, n, c, &self.scaler);
 				(xraw, Some(ccat))
@@ -3237,17 +3288,24 @@ impl Model {
 		// raw to embed→attn; the categorical branch is scaled with the TRAIN-set
 		// scaler (same mean/std — eval must see the exact transform training saw).
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(_)));
+		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
+		let (collapsed_x, collapsed_embed_cols, _collapsed_vocab) = if embed_cats {
+			let (x, ec, v) = collapse_onehot(data);
+			(Some(x), ec, v)
+		} else {
+			(None, Vec::new(), 0)
+		};
+		let eff_x = collapsed_x.as_ref().unwrap_or(&data.x);
+		let eff_text = if embed_cats { &collapsed_embed_cols } else { &data.text_cols };
 		let cat_cols: Vec<usize> = if embed_first {
-			(0..data.x.ncols())
-				.filter(|c| !data.text_cols.contains(c))
-				.collect()
+			(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
 		} else {
 			Vec::new()
 		};
 		let xinput = if embed_first {
-			data.x.select(ndarray::Axis(1), &data.text_cols)
+			eff_x.select(ndarray::Axis(1), eff_text)
 		} else {
-			data.x.clone()
+			eff_x.clone()
 		};
 		let (xraw, n, d) = Self::upload(&xinput);
 		let scaler = self.scaler.borrow();
@@ -3258,7 +3316,7 @@ impl Model {
 			if cat_cols.is_empty() {
 				(xraw, None)
 			} else {
-				let cat = data.x.select(ndarray::Axis(1), &cat_cols);
+				let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
 				let (craw, _, c) = Self::upload(&cat);
 				(xraw, Some(Self::zscore_apply(&craw, n, c, scaler)))
 			}

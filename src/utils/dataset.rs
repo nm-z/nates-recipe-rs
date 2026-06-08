@@ -105,9 +105,14 @@ pub struct Dataset {
 	// Kaggle test.csv has no target → false → eval skips scoring, still predicts).
 	pub has_target: bool,
 	// Indices of `x` columns that are token-id columns (from free-text columns,
-	// named `*#t{s}`). An `embed` first layer consumes ONLY these — the rest
-	// (numeric/one-hot) are not token ids and would explode the vocab.
+	// named `*#t{s}`). When non-empty, an `embed` layer consumes these. When
+	// empty and `onehot_groups` is non-empty, embed collapses categoricals to
+	// integer indices at runtime instead.
 	pub text_cols: Vec<usize>,
+	// Contiguous one-hot column groups from categoricals: (start_col, num_categories).
+	// When an `embed` layer is present but text_cols is empty, these groups are
+	// collapsed to integer-index columns and embedded directly.
+	pub(crate) onehot_groups: Vec<(usize, usize)>,
 }
 
 /// Split one ARFF/CSV line into trimmed, unquoted fields, respecting single-quote quoting.
@@ -898,6 +903,7 @@ impl Data {
 				n_targets: 0,
 				has_target: false,
 				text_cols: Vec::new(),
+				onehot_groups: Vec::new(),
 			},
 			test: None,
 			target_names: Vec::new(),
@@ -1146,8 +1152,9 @@ impl Data {
 		let skip = exclude_mask(&self.attrs, "", &self.exclude);
 		let (names, x, y) = encode(&self.attrs, &self.rows, &self.targets, &skip);
 		let tc = text_col_indices(&names);
+		let oh = onehot_group_indices(&names);
 		if let Some(frac) = self.split_frac {
-			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source, &tc);
+			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source, &tc, &oh);
 			(tr, Some(te))
 		} else if let Some(tp) = &self.test_path {
 			let (_, trows) = parse_arff(tp);
@@ -1160,6 +1167,7 @@ impl Data {
 					n_targets: k,
 					has_target: true,
 					text_cols: tc.clone(),
+					onehot_groups: oh.clone(),
 				},
 				Some(Dataset {
 					x: tx,
@@ -1168,6 +1176,7 @@ impl Data {
 					n_targets: k,
 					has_target: true,
 					text_cols: tc,
+					onehot_groups: oh,
 				}),
 			)
 		} else {
@@ -1179,6 +1188,7 @@ impl Data {
 					n_targets: k,
 					has_target: true,
 					text_cols: tc,
+					onehot_groups: oh,
 				},
 				None,
 			)
@@ -1223,6 +1233,7 @@ impl Data {
 				!t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
 			let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
 			let tc = text_col_indices(&feats);
+			let oh = onehot_group_indices(&feats);
 			let train = Dataset {
 				x: set.select(&feats),
 				y: set.y,
@@ -1230,8 +1241,10 @@ impl Data {
 				n_targets: k,
 				has_target: true,
 				text_cols: tc.clone(),
+				onehot_groups: oh.clone(),
 			};
 			let test_feats: Vec<String> = test.names.iter().filter(|n| keep(n)).cloned().collect();
+			let oh_test = onehot_group_indices(&test_feats);
 			let testds = Dataset {
 				x: test.select(&test_feats),
 				y: test.y,
@@ -1239,6 +1252,7 @@ impl Data {
 				n_targets: test.n_targets,
 				has_target: test_has_target,
 				text_cols: tc,
+				onehot_groups: oh_test,
 			};
 			return (train, Some(testds), flat_attrs);
 		}
@@ -1246,8 +1260,9 @@ impl Data {
 		let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
 		let x = set.select(&feats);
 		let tc = text_col_indices(&feats);
+		let oh = onehot_group_indices(&feats);
 		if let Some(frac) = self.split_frac {
-			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source, &tc);
+			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source, &tc, &oh);
 
 			return (tr, Some(te), flat_attrs);
 		}
@@ -1259,6 +1274,7 @@ impl Data {
 				n_targets: k,
 				has_target: true,
 				text_cols: tc,
+				onehot_groups: oh,
 			},
 			None,
 			flat_attrs,
@@ -1404,6 +1420,7 @@ fn shuffle_split(
 	train_frac: f64,
 	source: &str,
 	text_cols: &[usize],
+	onehot_groups: &[(usize, usize)],
 ) -> (Dataset, Dataset) {
 	let n = x.nrows();
 	let mut idx: Vec<usize> = (0..n).collect();
@@ -1424,6 +1441,7 @@ fn shuffle_split(
 			n_targets: k,
 			has_target: true,
 			text_cols: text_cols.to_vec(),
+			onehot_groups: onehot_groups.to_vec(),
 		}
 	};
 	(take(&idx[..n_train]), take(&idx[n_train..]))
@@ -1437,6 +1455,24 @@ fn text_col_indices(feats: &[String]) -> Vec<usize> {
 		.filter(|(_, n)| n.contains("#t"))
 		.map(|(i, _)| i)
 		.collect()
+}
+
+fn onehot_group_indices(feats: &[String]) -> Vec<(usize, usize)> {
+	let mut groups = Vec::new();
+	let mut i = 0;
+	while i < feats.len() {
+		if let Some(eq) = feats[i].find('=') {
+			let prefix = &feats[i][..=eq];
+			let start = i;
+			while i < feats.len() && feats[i].starts_with(prefix) {
+				i += 1;
+			}
+			groups.push((start, i - start));
+		} else {
+			i += 1;
+		}
+	}
+	groups
 }
 
 /// Parse one `@attribute 'name' { a, b }` or `@attribute name real` line.

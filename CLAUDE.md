@@ -75,7 +75,7 @@ gpu-core (path dep, HIP/ROCm)
 
 - **`Data`** — builder for loading datasets. `.set(path)` accepts CSV, ARFF, or a directory of files. `.exclude("col")` to drop columns. `.test(path)` for separate test file. `.split(frac)` for random split. `.target("col")` or `.target(["a","b"])` for multi-target (terminal — triggers preparation). After building: `data.set` (train Dataset), `data.test` (Option\<Dataset\>), `data.target` (target column name).
 - **`Dataset`** — the encoded numeric result: `x: Mat`, `y: Vec1`, `n_targets`, `text_cols`.
-- **`Model`** — layer stack. `.layer(units)` for linear dense, then chain `.relu()`, `.leak()`, `.sigmoid()`, `.tanh()`, `.selu()`, `.gelu()`, `.silu()` for activation. `.layer(embed(dim))` for token embeddings, `.layer(attn(heads))` for self-attention. `.loss(mse)` and `.lr(0.001)`.
+- **`Model`** — layer stack. `.layer(units)` for linear dense, then chain `.relu()`, `.leak()`, `.sigmoid()`, `.tanh()`, `.selu()`, `.gelu()`, `.silu()` for activation. `.layer(embed(dim))` for embeddings, `.layer(attn(heads))` for self-attention. `.loss(mse)` and `.lr(0.001)`. Embed behavior: with text columns → embed token ids; with no text but categoricals → embed categorical indices directly (one-hot groups collapsed to integer indices at runtime, each category gets a unique embedding vector); no embed → one-hot encode categoricals as usual.
 - **`Train`** — run config. `.epochs()`, `.log([Loss, R2])`, `.plot([Loss, R2])`, `.resume(path)`. `.run(&model, &data)` trains, `.run(&model, &data.test)` infers. `.save([w, b], path)` saves params after training, `.save(["Id", data.target], path)` saves predictions after inference. Preflight checks VRAM, embed/text, and loss/output before any GPU work.
 - **Consts** — losses (`mse`, `mae`, `huber`, `ce`, `bce`), metrics (`Loss`, `Accuracy`, `R2`, `Lr`, `Epoch`, `Time`), save selectors (`w`, `b`).
 
@@ -96,7 +96,7 @@ gpu-core (path dep, HIP/ROCm)
    - **Image** — file paths (.png/.jpg/etc) or base64 (detected, encoding not yet implemented)
    - Missing markers (NA, NaN, N/A, NULL, None, ?, ., -) filtered before detection
    - Mostly-numeric columns (≥80% f64) treated as numeric with NaN for unparseable cells
-2. Categorical columns → one-hot encoding
+2. Categorical columns → one-hot encoding (or integer-index when model has embed layer and no text columns)
 3. When `.test()` is set, align train/test to shared columns only
 4. NaN rows dropped after column selection (not before)
 5. RAM guard panics if projected parse size exceeds 90% of available memory
