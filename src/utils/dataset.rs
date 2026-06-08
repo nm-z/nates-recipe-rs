@@ -171,7 +171,6 @@ fn cell(row: &[String], j: usize) -> &str {
 /// Categories are taken from whatever rows are passed (always the SET, so a test
 /// file is later encoded against the same category list).
 fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
-	let t = std::time::Instant::now();
 	let attrs: Vec<Attr> = headers
 		.iter()
 		.enumerate()
@@ -248,10 +247,6 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 			}
 		})
 		.collect();
-	eprintln!(
-		"\x1b[2m  infer schema / vocab {:.1}s\x1b[0m",
-		t.elapsed().as_secs_f64()
-	);
 	attrs
 }
 
@@ -291,10 +286,6 @@ fn encode(
 		.saturating_mul(proj_w)
 		.saturating_mul(std::mem::size_of::<f64>());
 	let avail = available_ram_bytes();
-	eprintln!(
-		"\x1b[32mencoding\x1b[0m {n} rows × {proj_w} cols → {} in RAM",
-		crate::data::human_bytes(bytes)
-	);
 	if bytes > avail / 10 * 9 {
 		let mut top: Vec<(&str, usize)> = attrs
 			.iter()
@@ -319,7 +310,6 @@ fn encode(
 			crate::data::human_bytes(avail)
 		);
 	}
-	let et = std::time::Instant::now();
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
 	let mut cols: Vec<Vec<f64>> = Vec::with_capacity(proj_w);
 	let mut y = vec![0.0f64; n * k];
@@ -403,22 +393,13 @@ fn encode(
 			}
 		}
 	}
-	eprintln!(
-		"\x1b[2m  encode / tokenize {:.1}s\x1b[0m",
-		et.elapsed().as_secs_f64()
-	);
 	let w = cols.len();
-	let rt = std::time::Instant::now();
 	let mut data = vec![0.0f64; n * w];
 	for (j, col) in cols.iter().enumerate() {
 		for (i, v) in col.iter().enumerate() {
 			data[i * w + j] = *v;
 		}
 	}
-	eprintln!(
-		"\x1b[2m  dense reshape {:.1}s\x1b[0m",
-		rt.elapsed().as_secs_f64()
-	);
 	(
 		names,
 		Mat::from_shape_vec((n, w), data).expect("encode: reshape"),
@@ -448,6 +429,7 @@ struct Assembled {
 	y: Vec1,
 	n_targets: usize,
 	samples: usize,
+	#[allow(dead_code)]
 	skipped: Vec<String>,
 	sample_group: String,
 }
@@ -493,7 +475,6 @@ impl Assembled {
 				crate::data::human_bytes(avail)
 			);
 		}
-		let st = std::time::Instant::now();
 		let idx: std::collections::HashMap<&str, usize> = self
 			.names
 			.iter()
@@ -509,10 +490,6 @@ impl Assembled {
 				data[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
 			}
 		}
-		eprintln!(
-			"\x1b[2m  select / gather {:.1}s\x1b[0m",
-			st.elapsed().as_secs_f64()
-		);
 		Mat::from_shape_vec((n, w), data).expect("select reshape")
 	}
 }
@@ -842,7 +819,6 @@ fn exclude_mask(attrs: &[Attr], group: &str, exclude: &[String]) -> Vec<bool> {
 		.map(|a| {
 			let nm = namespaced(group, &a.name);
 			if is_id_column(&nm) {
-				eprintln!("\x1b[33mauto-excluded id column\x1b[0m: {nm}");
 				return true;
 			}
 			exclude.iter().any(|p| exclude_match(p, &nm))
@@ -944,7 +920,70 @@ impl Data {
 		let (train, test) = self.prepare();
 		self.set = train;
 		self.test = test;
+		self.print_summary();
 		self
+	}
+
+	fn print_summary(&self) {
+		let disk_size = |path: &str| -> String {
+			std::fs::metadata(path)
+				.map(|m| crate::data::human_bytes(m.len() as usize))
+				.unwrap_or_else(|_| "?".into())
+		};
+		let short = |path: &str| -> String {
+			if let Some(home) = std::env::var("HOME").ok() {
+				if let Some(rest) = path.strip_prefix(&home) {
+					return format!("~{rest}");
+				}
+			}
+			path.to_string()
+		};
+		eprintln!(
+			"\x1b[32mset\x1b[0m  {}",
+			short(&self.source),
+		);
+		eprintln!(
+			"    {} rows  {} cols  {}",
+			self.set.x.nrows(),
+			self.set.x.ncols() + self.set.n_targets.max(1),
+			disk_size(&self.source),
+		);
+		eprintln!(
+			"    {} features after encoding",
+			self.set.x.ncols(),
+		);
+		for ex in &self.exclude {
+			eprintln!("    excluded  {ex}");
+		}
+		if let Some(test) = &self.test {
+			if let Some(tp) = &self.test_path {
+				eprintln!(
+					"\x1b[32mtest\x1b[0m  {}",
+					short(tp),
+				);
+				eprintln!(
+					"    {} rows  {} cols  {}",
+					test.x.nrows(),
+					test.x.ncols() + test.n_targets.max(1),
+					disk_size(tp),
+				);
+				eprintln!(
+					"    {} features after encoding",
+					test.x.ncols(),
+				);
+			} else if self.split_frac.is_some() {
+				let total = self.set.x.nrows() + test.x.nrows();
+				eprintln!(
+					"\x1b[32msplit\x1b[0m  {}/{} rows (train/test from {})",
+					self.set.x.nrows(),
+					test.x.nrows(),
+					total,
+				);
+			}
+		}
+		for t in &self.target_names {
+			eprintln!("\x1b[32mtarget\x1b[0m  {t}");
+		}
 	}
 
 	/// Use a separate pre-split test file (encoded with the train schema).
@@ -1005,12 +1044,10 @@ impl Data {
 		let tc = text_col_indices(&names);
 		if let Some(frac) = self.split_frac {
 			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source, &tc);
-			report_split(tr.x.nrows(), te.x.nrows());
 			(tr, Some(te))
 		} else if let Some(tp) = &self.test_path {
 			let (_, trows) = parse_arff(tp);
 			let (_, tx, ty) = encode(&self.attrs, &trows, &self.targets, &skip);
-			report_split(x.nrows(), tx.nrows());
 			(
 				Dataset {
 					x,
@@ -1094,7 +1131,6 @@ impl Data {
 				"set ({}) and test ({tp}) share no feature columns — data is non-correlated",
 				self.source
 			);
-			report_parsed(&set, &feats, &t, Some(&test), None);
 			let tc = text_col_indices(&feats);
 			let train = Dataset {
 				x: set.select(&feats),
@@ -1120,10 +1156,9 @@ impl Data {
 		let tc = text_col_indices(&feats);
 		if let Some(frac) = self.split_frac {
 			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source, &tc);
-			report_parsed(&set, &feats, &t, None, Some((tr.x.nrows(), te.x.nrows())));
+
 			return (tr, Some(te));
 		}
-		report_parsed(&set, &feats, &t, None, None);
 		(
 			Dataset {
 				x,
@@ -1189,99 +1224,8 @@ impl Data {
 	}
 }
 
-/// Print the parsed shape as OGDL: green `parsed` root → the feature-column schema
-/// ONCE, the target, then the sample counts per partition (train/eval for a split,
-/// or set/test) and any `unjoined` groups. The schema is identical across
-/// partitions, so it's never repeated, and no per-source path is shown.
-fn report_parsed(
-	set: &Assembled,
-	feats: &[String],
-	targets: &[String],
-	test: Option<&Assembled>,
-	split: Option<(usize, usize)>,
-) {
-	eprintln!("\x1b[32mparsed\x1b[0m");
-	let refs: Vec<&str> = feats.iter().map(|s| s.as_str()).collect();
-	emit_section("feature column", &refs, 4);
-	for t in targets {
-		eprintln!("    target  {t}");
-	}
-	match split {
-		Some((train_rows, eval_rows)) => {
-			eprintln!("    train  {}", plural(train_rows, "sample"));
-			eprintln!("    eval  {}", plural(eval_rows, "sample"));
-		}
-		None => {
-			eprintln!("    set  {}", plural(set.samples, "sample"));
-			if let Some(te) = test {
-				eprintln!("    test  {}", plural(te.samples, "sample"));
-			}
-		}
-	}
-	for s in &set.skipped {
-		eprintln!("    \x1b[33munjoined\x1b[0m  {s}");
-	}
-}
-
-/// Strip a `group:` prefix from a feature name for display.
 fn col_after(c: &str) -> &str {
 	c.split_once(':').map_or(c, |(_, s)| s)
-}
-
-/// True if every column is a flattened-image pixel (`group:px<n>`), so the group
-/// is an image rather than a table of named columns.
-fn is_image_group(cols: &[&str]) -> bool {
-	!cols.is_empty()
-		&& cols.iter().all(|c| {
-			col_after(c)
-				.strip_prefix("px")
-				.is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-		})
-}
-
-/// Image group dimensions `(width, height, channels)` from the value count, when
-/// it factors as a square RGB image (matches `image_to_row`); else `None`.
-fn img_dims(n: usize) -> Option<(usize, usize, usize)> {
-	let px = n / 3;
-	let side = (px as f64).sqrt() as usize;
-	(n.is_multiple_of(3) && side * side == px).then_some((side, side, 3))
-}
-
-/// `n unit` with a plural `s` unless `n == 1`.
-fn plural(n: usize, unit: &str) -> String {
-	format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
-}
-
-/// A `N feature columns` / `N target columns` node with its columns as direct
-/// sibling children (the `group:` prefix stripped). An image group shows its
-/// encoding instead of pixel names. Skipped when empty.
-fn emit_section(unit: &str, list: &[&str], indent: usize) {
-	if list.is_empty() {
-		return;
-	}
-	eprintln!("{}{}", " ".repeat(indent), plural(list.len(), unit));
-	let cpad = " ".repeat(indent + 4);
-	let mut groups: std::collections::BTreeMap<&str, Vec<&str>> =
-		std::collections::BTreeMap::new();
-	for c in list {
-		groups.entry(feat_group(c)).or_default().push(c);
-	}
-	for (_g, members) in groups {
-		if is_image_group(&members) {
-			match img_dims(members.len()) {
-				Some((w, h, c)) => {
-					eprintln!("{cpad}{w} width");
-					eprintln!("{cpad}{h} height");
-					eprintln!("{cpad}{c} channels (RGB)");
-				}
-				None => eprintln!("{cpad}flattened → {} values", members.len()),
-			}
-		} else {
-			for m in members {
-				eprintln!("{cpad}{}", col_after(m));
-			}
-		}
-	}
 }
 
 /// Whether `path` is an ARFF file (by extension) — the only self-describing
@@ -1406,19 +1350,6 @@ fn text_col_indices(feats: &[String]) -> Vec<usize> {
 		.filter(|(_, n)| n.contains("#t"))
 		.map(|(i, _)| i)
 		.collect()
-}
-
-fn report_split(ntr: usize, nte: usize) {
-	let pct = ntr as f64 / (ntr + nte).max(1) as f64 * 100.0;
-	eprintln!(
-		"split: {pct:.1}% train ({ntr}) / {:.1}% test ({nte})",
-		100.0 - pct
-	);
-}
-
-/// Group prefix of a `group:column` feature name (everything before the first `:`).
-fn feat_group(name: &str) -> &str {
-	name.split_once(':').map_or(name, |(g, _)| g)
 }
 
 /// Parse one `@attribute 'name' { a, b }` or `@attribute name real` line.

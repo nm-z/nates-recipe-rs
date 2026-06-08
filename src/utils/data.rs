@@ -37,12 +37,6 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
 	let disk = std::fs::metadata(path)
 		.map(|m| m.len() as usize)
 		.unwrap_or(0);
-	eprintln!(
-		"loading {} ({} on disk)",
-		short_path(path.to_str().unwrap_or_default()),
-		human_bytes(disk)
-	);
-	let t_parse = std::time::Instant::now();
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(true)
 		.flexible(true)
@@ -80,10 +74,6 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
 		);
 	}
 	let mut rows: Vec<Vec<String>> = Vec::new();
-	let mut ram = 0usize;
-	let pb = ProgressBar::new_spinner();
-	pb.set_style(ProgressStyle::with_template("    {msg} {elapsed}").expect("progress template"));
-	pb.enable_steady_tick(std::time::Duration::from_millis(120));
 	for result in rdr.records() {
 		let record = result.with_context(|| "failed to read CSV record")?;
 		let mut row = Vec::with_capacity(w);
@@ -93,22 +83,10 @@ pub(crate) fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>
 				"NA" | "NaN" | "nan" => String::new(),
 				s => s.to_string(),
 			};
-			ram += val.len() + overhead;
 			row.push(val);
 		}
 		rows.push(row);
 	}
-	let h = rows.len();
-	pb.set_message(format!(
-		"{} into RAM ({h} rows × {w} cols)",
-		human_bytes(ram)
-	));
-	pb.finish();
-	eprintln!(
-		"\x1b[2m  csv parse {:.1}s\x1b[0m",
-		t_parse.elapsed().as_secs_f64()
-	);
-	eprintln!();
 	Ok((headers, rows))
 }
 
