@@ -16,6 +16,16 @@ data
 		Text                 (detection TBD) — tokenized to vocab-indexed sequences
 		Image                file extension (.png .jpg .jpeg .bmp .gif .webp) or valid base64
 
+	feature reduction
+		PCA              N features → k components
+		kmeans           N features → k distances
+		SVD              N features → k singular vectors
+	feature generation
+		interaction      N features → N² pairs (x₁·x₂)
+		polynomial       N features → Nᵈ terms (x², x³, x₁x₂)
+		one-hot          1 column → k binary columns
+		embedding        1 index → k learned dimensions
+
 model
 	layers
 		.layer(n)            dense linear, n output units
