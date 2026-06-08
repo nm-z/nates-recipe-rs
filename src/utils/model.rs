@@ -342,15 +342,51 @@ impl Train {
 					let k = params[last].out_dim;
 					let n = ds.x.nrows();
 					let sc = Scratch::new(&params, n, true);
-					let (xbuf, nn, d) = Model::upload(&ds.x);
+					let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
+					let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
+					let (col_x, col_ec, _col_v) = if embed_cats {
+						let (x, ec, v) = collapse_onehot(ds);
+						(Some(x), ec, v)
+					} else {
+						(None, Vec::new(), 0)
+					};
+					let eff_x = col_x.as_ref().unwrap_or(&ds.x);
+					let eff_text = if embed_cats { &col_ec } else { &ds.text_cols };
+					let cat_cols: Vec<usize> = if embed_first {
+						(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
+					} else {
+						Vec::new()
+					};
+					let xinput = if embed_first {
+						eff_x.select(ndarray::Axis(1), eff_text)
+					} else {
+						eff_x.clone()
+					};
+					let (xraw, nn, d) = Model::upload(&xinput);
 					assert_eq!(nn, n);
 					let scaler = model.scaler.borrow();
-					let xbuf = if let Some(sc_ref) = scaler.as_ref() {
-						if sc_ref.mean.is_empty() { xbuf } else { Model::zscore_apply(&xbuf, n, d, sc_ref) }
+					let (xbuf, x_cat) = if embed_first {
+						if cat_cols.is_empty() {
+							(xraw, None)
+						} else {
+							let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
+							let (craw, _, c) = Model::upload(&cat);
+							let scaled = if let Some(sc_ref) = scaler.as_ref() {
+								Model::zscore_apply(&craw, n, c, sc_ref)
+							} else {
+								craw
+							};
+							(xraw, Some(scaled))
+						}
 					} else {
-						xbuf
+						let scaled = if let Some(sc_ref) = scaler.as_ref() {
+							if sc_ref.mean.is_empty() { xraw } else { Model::zscore_apply(&xraw, n, d, sc_ref) }
+						} else {
+							xraw
+						};
+						(scaled, None)
 					};
-					Model::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+					Model::forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 					let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
 					if model.loss.is_classification() {
 						if k == 1 {
