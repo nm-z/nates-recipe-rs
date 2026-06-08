@@ -1,0 +1,83 @@
+data
+	load
+		.set(path)           CSV, ARFF, or directory — chainable for multiple sources
+		.test(path)          separate test file (encoded with train schema)
+		.exclude(pattern)    drop columns matching pattern before encoding
+		.split(frac)         random train/test split (e.g. 0.8)
+		.target(col)         terminal — triggers encoding. single or multi: .target(["a","b"])
+	fields (after .target)
+		data.set             Dataset { x, y }
+		data.test            Option<Dataset>
+		data.target          &str — whatever .target() was set to
+	types (auto-detected from cell values)
+		Numeric              f64-parseable
+		Temporal             (detection TBD)
+		Categorical          (detection TBD) — one-hot encoded, or integer-indexed under embed()
+		Text                 (detection TBD) — tokenized to vocab-indexed sequences
+		Image                file extension (.png .jpg .jpeg .bmp .gif .webp) or valid base64
+
+model
+	layers
+		.layer(n)            dense linear, n output units
+		.layer(embed(dim))   embedding lookup table, dim-wide learned vectors
+		.layer(attn(heads))  multi-head self-attention
+		.layer(conv(f, k))   convolutional (TODO)
+		.layer(pool(s))      pooling (TODO)
+		.layer(gru(h))       GRU recurrent (TODO)
+		.layer(lstm(h))      LSTM recurrent (TODO)
+	activations (chained after .layer)
+		.relu()              max(0, x)                          range [0, ∞)
+		.leak()              x > 0 ? x : 0.01x                 range (-∞, ∞)   leaky relu, α=0.01
+		.prelu()             x > 0 ? x : αx                    range (-∞, ∞)   learnable α, init 0.25
+		.elu()               x > 0 ? x : α(eˣ - 1)            range [-α, ∞)   α=1.0
+		.selu()              λ(x > 0 ? x : α(eˣ - 1))         range (-∞, ∞)   self-normalizing
+		.sigmoid()           1 / (1 + e⁻ˣ)                     range (0, 1)
+		.tanh()              (eˣ - e⁻ˣ) / (eˣ + e⁻ˣ)          range (-1, 1)
+		.gelu()              x · Φ(x)                           range (-∞, ∞)   transformer default
+		.silu()              x · σ(x)                           range (-∞, ∞)   aka swish
+	loss
+		.loss(mse)           L = (ŷ - y)²                      regression
+		.loss(mae)           L = |ŷ - y|                        regression, robust to outliers
+		.loss(huber)         L = mse/2 if |e|<1, |e|-½ else    regression, smooth mae
+		.loss(ce)            L = -Σ yᵢ log(softmax(ŷ)ᵢ)       multi-class classification
+		.loss(bce)           L = -[y log(ŷ) + (1-y) log(1-ŷ)]  binary classification
+	hyperparameters
+		.lr(rate)            learning rate (SGD step size)
+
+train
+	config
+		.epochs(n)           number of full-batch passes
+		.log([Loss, R2])     metrics printed per epoch
+		.plot([Loss, R2])    metrics drawn in TUI live chart
+		.log_every(n)        print every nth epoch (default 1)
+		.resume(path)        load weights from OGDL checkpoint
+	run
+		train.run(&model, &data)        train on data.set
+		train.run(&model, &data.test)   forward-only inference on test set
+	save
+		train.save([w, b], path)                   weights → OGDL checkpoint
+		train.save(["Id", data.target], path)      predictions → CSV
+
+metrics
+	Loss        current loss value
+	Accuracy    classification accuracy (bce: threshold 0.5, ce: argmax)
+	R2          coefficient of determination (regression)
+	Lr          current learning rate
+	Epoch       epoch counter
+	Time        wall clock elapsed
+
+training loop
+	forward      z = Wx + b → activation(z) → next layer → ... → loss(ŷ, y)
+	backward     ∂L/∂ŷ → ... → ∂L/∂W, ∂L/∂b per layer
+	update       W -= lr · ∂L/∂W,  b -= lr · ∂L/∂b
+	full-batch only — every sample every epoch, no mini-batching
+
+embed behavior
+	embed + text columns        tokenize text → embed token ids
+	embed + no text columns     collapse one-hot categoricals → integer indices → embed
+	no embed                    one-hot encode categoricals
+
+checkpoint
+	format       OGDL (indentation-structured, one weight per line)
+	save         on first R² drop (stop-loss)
+	resume       loads and validates shapes — crashes on mismatch, never silently discards
