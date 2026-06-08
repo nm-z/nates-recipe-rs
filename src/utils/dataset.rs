@@ -179,6 +179,10 @@ fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
 
+fn is_year_range(vals: &[f64]) -> bool {
+	vals.iter().all(|&v| v >= 1800.0 && v <= 2200.0)
+}
+
 fn is_date_str(s: &str) -> bool {
 	if s.len() < 6 || s.len() > 30 {
 		return false;
@@ -231,13 +235,17 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 				}
 				let n_distinct = distinct.len();
 				let all_integer = vals.iter().all(|v| *v == v.trunc() && v.is_finite());
-				let avg_repeats = vals.len() as f64 / n_distinct.max(1) as f64;
-				if all_integer && avg_repeats >= 2.0 && n_distinct < vals.len() {
-					let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
-					cats.sort_unstable();
-					Kind::Categorical(cats)
+				if all_integer && is_year_range(&vals) {
+					Kind::Temporal
 				} else {
-					Kind::Numeric
+					let avg_repeats = vals.len() as f64 / n_distinct.max(1) as f64;
+					if all_integer && avg_repeats >= 2.0 && n_distinct < vals.len() {
+						let mut cats: Vec<String> = distinct.iter().map(|&bits| f64::from_bits(bits).to_string()).collect();
+						cats.sort_unstable();
+						Kind::Categorical(cats)
+					} else {
+						Kind::Numeric
+					}
 				}
 			} else {
 				let first = non_empty[0];
