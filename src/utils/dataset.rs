@@ -284,9 +284,9 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 }
 
 /// Encode raw `rows` against `attrs` into `(feature_names, X, y)`. Feature
-/// numerics pass through (blank/unparseable → NaN); feature nominals one-hot as
-/// `name=cat`. Each `targets` column (if any) is label-encoded for a Nominal kind
-/// and parsed for a Numeric kind; a blank/unseen value → NaN. `y` is flat,
+/// numerics/temporals pass through; categoricals one-hot as `name=cat`; text
+/// tokenized to SEQ_LEN id columns. Targets are label-encoded for Categorical
+/// and parsed for Numeric/Temporal; a blank/unseen value → NaN. `y` is flat,
 /// row-major n*k (k = targets.len()), so row r's targets are y[r*k .. r*k+k].
 /// With `targets = []`, every column is a feature and `y` is empty.
 fn encode(

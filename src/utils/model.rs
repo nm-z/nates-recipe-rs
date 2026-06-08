@@ -21,7 +21,7 @@ extern "C" fn on_sigint(_: i32) {
 	INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Activation function for a dense layer: `.layer((64, relu))`.
+/// Activation function for a dense layer: `.layer(64).relu()`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Activation {
 	Relu,
@@ -55,8 +55,8 @@ pub enum LayerSpec {
 	Attn(usize),
 }
 
-/// Accepts `units` (linear dense), `(units, activation)`, or `embed(dim)` for
-/// `Model::layer`.
+/// Accepts `units` (linear dense) or `embed(dim)` / `attn(heads)` for
+/// `Model::layer`. Chain `.relu()`, `.leak()`, etc. for activations.
 pub trait IntoLayer {
 	fn into_layer(self) -> LayerSpec;
 }
@@ -531,7 +531,7 @@ impl Default for Train {
 	}
 }
 
-/// Per-column number colors, applied in `.log(&[...])` order (cycles past 12).
+/// Per-column number colors, applied in `.log([...])` order (cycles past 12).
 const PALETTE: [(u8, u8, u8); 12] = [
 	(242, 40, 60),   // #F2283C red
 	(39, 125, 255),  // #277DFF blue
@@ -565,7 +565,7 @@ fn expand_tilde(path: &str) -> String {
 	}
 }
 
-/// What to log or plot each epoch: `.log(&[Loss, R2, Lr])`.
+/// What to log or plot each epoch: `.log([Loss, R2, Lr])`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Metric {
 	Loss,
