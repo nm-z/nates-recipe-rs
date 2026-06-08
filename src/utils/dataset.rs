@@ -988,7 +988,7 @@ impl Data {
 			self.set.x.ncols() + self.set.n_targets.max(1),
 			disk_size(&self.source),
 		);
-		print_types("    ");
+		print_types("        ");
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
 		}
@@ -1004,7 +1004,7 @@ impl Data {
 					test.x.ncols() + test.n_targets.max(1),
 					disk_size(tp),
 				);
-				print_types("    ");
+				print_types("        ");
 			} else if self.split_frac.is_some() {
 				let total = self.set.x.nrows() + test.x.nrows();
 				eprintln!(
