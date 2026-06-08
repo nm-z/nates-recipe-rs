@@ -4,15 +4,23 @@ use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
-/// A string column with more than this many distinct values is treated as free
-/// TEXT (tokenized → embedding-id sequence) rather than a CATEGORICAL (one-hot).
-/// model names, states, yes/no → one-hot; prompts, responses → text.
-const ONEHOT_MAX: usize = 256;
-
-/// Fixed token-sequence length per text column: each text cell is tokenized and
-/// the first SEQ_LEN token ids are emitted as SEQ_LEN integer columns (id 0 =
-/// pad/out-of-vocab), padded when short. The `embed` layer looks these ids up.
 const SEQ_LEN: usize = 32;
+
+fn is_image_cell(s: &str) -> bool {
+	let lower = s.to_ascii_lowercase();
+	if lower.ends_with(".png")
+		|| lower.ends_with(".jpg")
+		|| lower.ends_with(".jpeg")
+		|| lower.ends_with(".bmp")
+		|| lower.ends_with(".gif")
+		|| lower.ends_with(".webp")
+	{
+		return true;
+	}
+	s.len() > 100
+		&& s.bytes()
+			.all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
 
 /// Tokenize text into lowercased alphanumeric tokens (whitespace/punctuation are
 /// separators). Used both to build a column's vocabulary and to emit token ids.
@@ -25,11 +33,10 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 #[derive(Clone)]
 enum Kind {
 	Numeric,
+	Temporal,
 	Nominal(Vec<String>),
-	// Free text: the column's token vocabulary (sorted distinct tokens). A token's
-	// id is its index+1 (0 = pad / out-of-vocab). Encoded as SEQ_LEN id columns,
-	// consumed by an `embed` layer — never one-hot (that OOMs at ~n columns).
 	Text(Vec<String>),
+	Image,
 }
 
 #[derive(Clone)]
@@ -166,79 +173,75 @@ fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
 
-/// Infer an ARFF-style schema from raw rows: a column is `Numeric` if every
-/// non-empty cell parses as f64, else `Nominal` with its sorted distinct values.
-/// Categories are taken from whatever rows are passed (always the SET, so a test
-/// file is later encoded against the same category list).
 fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
 	let attrs: Vec<Attr> = headers
 		.iter()
 		.enumerate()
 		.map(|(j, name)| {
-			// A column already in the SET schema (a test source sharing a train
-			// column) reuses the train Kind verbatim — same vocab/categories AND
-			// no re-inference, so the heavy token-vocab build never runs twice.
 			if let Some(sa) = known.and_then(|k| k.iter().find(|s| s.name == *name)) {
 				return Attr {
 					name: name.clone(),
 					kind: sa.kind.clone(),
 				};
 			}
-			// Numeric test in parallel; rayon's `all` short-circuits on the first
-			// non-numeric cell, so a text column bails almost immediately.
-			let numeric = rows
+			let all_numeric = rows
 				.par_iter()
 				.all(|row| cell(row, j).is_empty() || cell(row, j).parse::<f64>().is_ok());
-			let kind = if numeric {
-				Kind::Numeric
-			} else {
-				// Distinct non-empty cells, counted with an early exit at
-				// ONEHOT_MAX: a free-text column trips the limit after a few
-				// hundred rows, so the full distinct set (millions of long
-				// strings) is never built. Borrow &str — no per-cell clone.
-				let mut distinct: std::collections::HashSet<&str> =
-					std::collections::HashSet::new();
-				let mut overflow = false;
-				for row in rows {
-					let c = cell(row, j);
-					if c.is_empty() {
-						continue;
-					}
-					distinct.insert(c);
-					if distinct.len() > ONEHOT_MAX {
-						overflow = true;
-						break;
-					}
-				}
-				if !overflow {
-					let mut cats: Vec<String> =
-						distinct.into_iter().map(|c| c.to_string()).collect();
-					cats.sort_unstable();
-					Kind::Nominal(cats)
+			let kind = if all_numeric {
+				let vals: Vec<f64> = rows
+					.iter()
+					.filter_map(|row| cell(row, j).parse::<f64>().ok())
+					.collect();
+				if vals.len() >= 2
+					&& vals.windows(2).all(|w| w[1] >= w[0])
+					&& vals.first() != vals.last()
+				{
+					Kind::Temporal
 				} else {
-					// Free text: build the token vocabulary (sorted distinct
-					// tokens across all cells) for embedding-id encoding. The
-					// serial BTreeSet insert was the load bottleneck (~millions
-					// of inserts over the long-text columns); collect per-thread
-					// HashSets across rows, union, then a single parallel sort.
-					let set = rows
-						.par_iter()
-						.fold(
-							std::collections::HashSet::<String>::new,
-							|mut acc, row| {
-								acc.extend(tokenize(cell(row, j)));
-								acc
-							},
-						)
-						.reduce(std::collections::HashSet::<String>::new, |a, b| {
-							let (mut big, small) =
-								if a.len() >= b.len() { (a, b) } else { (b, a) };
-							big.extend(small);
-							big
-						});
-					let mut vocab: Vec<String> = set.into_iter().collect();
-					vocab.par_sort_unstable();
-					Kind::Text(vocab)
+					Kind::Numeric
+				}
+			} else {
+				let first_cell = rows.iter()
+					.map(|row| cell(row, j))
+					.find(|c| !c.is_empty())
+					.unwrap_or("");
+				if is_image_cell(first_cell) {
+					Kind::Image
+				} else {
+					let mut counts: std::collections::HashMap<&str, usize> =
+						std::collections::HashMap::new();
+					for row in rows {
+						let c = cell(row, j);
+						if !c.is_empty() {
+							*counts.entry(c).or_insert(0) += 1;
+						}
+					}
+					let has_repeats = counts.values().any(|&c| c > 2);
+					if has_repeats {
+						let mut cats: Vec<String> =
+							counts.keys().map(|c| c.to_string()).collect();
+						cats.sort_unstable();
+						Kind::Nominal(cats)
+					} else {
+						let set = rows
+							.par_iter()
+							.fold(
+								std::collections::HashSet::<String>::new,
+								|mut acc, row| {
+									acc.extend(tokenize(cell(row, j)));
+									acc
+								},
+							)
+							.reduce(std::collections::HashSet::<String>::new, |a, b| {
+								let (mut big, small) =
+									if a.len() >= b.len() { (a, b) } else { (b, a) };
+								big.extend(small);
+								big
+							});
+						let mut vocab: Vec<String> = set.into_iter().collect();
+						vocab.par_sort_unstable();
+						Kind::Text(vocab)
+					}
 				}
 			};
 			Attr {
@@ -272,9 +275,10 @@ fn encode(
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
 	let width = |a: &Attr| match &a.kind {
-		Kind::Numeric => 1,
+		Kind::Numeric | Kind::Temporal => 1,
 		Kind::Nominal(c) => c.len(),
 		Kind::Text(_) => SEQ_LEN,
+		Kind::Image => panic!("image columns not yet supported — .exclude() the column or use .images()"),
 	};
 	let proj_w: usize = attrs
 		.iter()
@@ -325,7 +329,7 @@ fn encode(
 							.map_or(f64::NAN, |p| p as f64);
 					}
 				}
-				Kind::Numeric => {
+				Kind::Numeric | Kind::Temporal => {
 					for (r, row) in rows.iter().enumerate() {
 						y[r * k + tj] =
 							cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
@@ -334,6 +338,9 @@ fn encode(
 				Kind::Text(_) => {
 					panic!("target '{}' is free text — not a valid target", attr.name);
 				}
+				Kind::Image => {
+					panic!("target '{}' is image data — not a valid target", attr.name);
+				}
 			}
 			continue;
 		}
@@ -341,7 +348,7 @@ fn encode(
 			continue;
 		}
 		match &attr.kind {
-			Kind::Numeric => {
+			Kind::Numeric | Kind::Temporal => {
 				names.push(attr.name.clone());
 				let mut col = vec![0.0f64; n];
 				for (r, row) in rows.iter().enumerate() {
@@ -369,8 +376,6 @@ fn encode(
 					names.push(format!("{}#t{s}", attr.name));
 					cols.push(vec![0.0f64; n]);
 				}
-				// Tokenize + vocab-lookup per row in parallel (each row is
-				// independent), then scatter the SEQ_LEN ids into the columns.
 				let per_row: Vec<[f64; SEQ_LEN]> = rows
 					.par_iter()
 					.map(|row| {
@@ -390,6 +395,9 @@ fn encode(
 						cols[base + s][r] = ids[s];
 					}
 				}
+			}
+			Kind::Image => {
+				panic!("image column '{}' not yet supported — .exclude() it or use .images()", attr.name);
 			}
 		}
 	}
@@ -930,26 +938,35 @@ impl Data {
 		let is_excluded = |name: &str| {
 			is_id_column(name) || self.exclude.iter().any(|p| exclude_match(p, name))
 		};
-		let (mut numeric, mut categorical, mut text) = (0usize, 0usize, 0usize);
+		let (mut numeric, mut temporal, mut categorical, mut text, mut image) =
+			(0usize, 0usize, 0usize, 0usize, 0usize);
 		for a in &self.attrs {
 			if is_target(&a.name) || is_excluded(&a.name) {
 				continue;
 			}
 			match &a.kind {
 				Kind::Numeric => numeric += 1,
-				Kind::Nominal(cats) => categorical += cats.len(),
-				Kind::Text(_) => text += SEQ_LEN,
+				Kind::Temporal => temporal += 1,
+				Kind::Nominal(_) => categorical += 1,
+				Kind::Text(_) => text += 1,
+				Kind::Image => image += 1,
 			}
 		}
 		let mut out = Vec::new();
 		if numeric > 0 {
 			out.push(("numeric", numeric));
 		}
+		if temporal > 0 {
+			out.push(("temporal", temporal));
+		}
 		if categorical > 0 {
 			out.push(("categorical", categorical));
 		}
 		if text > 0 {
 			out.push(("text", text));
+		}
+		if image > 0 {
+			out.push(("image", image));
 		}
 		out
 	}
@@ -968,15 +985,21 @@ impl Data {
 			}
 			path.to_string()
 		};
+		let raw_cols = self.attrs.len();
 		let types = self.feature_type_counts();
 		let print_types = |indent: &str| {
 			if types.len() == 1 {
-				eprintln!("{indent}{} {} features", types[0].1, types[0].0);
+				eprintln!("{indent}{} {}", types[0].1, types[0].0);
 			} else {
 				for (kind, count) in &types {
 					eprintln!("{indent}{count} {kind}");
 				}
 			}
+		};
+		let set_rows = if self.split_frac.is_some() {
+			self.set.x.nrows() + self.test.as_ref().map_or(0, |t| t.x.nrows())
+		} else {
+			self.set.x.nrows()
 		};
 		eprintln!(
 			"\x1b[32mset\x1b[0m  {}",
@@ -984,34 +1007,42 @@ impl Data {
 		);
 		eprintln!(
 			"    {} rows  {} cols  {}",
-			self.set.x.nrows(),
-			self.set.x.ncols() + self.set.n_targets.max(1),
+			set_rows,
+			raw_cols,
 			disk_size(&self.source),
 		);
 		print_types("        ");
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
 		}
+		eprintln!(
+			"    {} features → model",
+			self.set.x.ncols(),
+		);
 		if let Some(test) = &self.test {
 			if let Some(tp) = &self.test_path {
+				let test_raw_cols = self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
+				let test_raw_rows = self.raw_test_rows.as_ref().map_or(test.x.nrows(), |r| r.len());
 				eprintln!(
 					"\x1b[32mtest\x1b[0m  {}",
 					short(tp),
 				);
 				eprintln!(
 					"    {} rows  {} cols  {}",
-					test.x.nrows(),
-					test.x.ncols() + test.n_targets.max(1),
+					test_raw_rows,
+					test_raw_cols,
 					disk_size(tp),
 				);
 				print_types("        ");
-			} else if self.split_frac.is_some() {
-				let total = self.set.x.nrows() + test.x.nrows();
 				eprintln!(
-					"\x1b[32msplit\x1b[0m  {}/{} rows (train/test from {})",
+					"    {} features → model",
+					test.x.ncols(),
+				);
+			} else if self.split_frac.is_some() {
+				eprintln!(
+					"\x1b[32msplit\x1b[0m  {} train / {} test",
 					self.set.x.nrows(),
 					test.x.nrows(),
-					total,
 				);
 			}
 		}
