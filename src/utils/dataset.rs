@@ -862,18 +862,10 @@ fn group_name(g: &DirGroup) -> &str {
 /// any `.exclude` pattern. Applied before one-hot expansion so excluded columns are
 /// never built (the only place a high-cardinality text/ID column can be stopped
 /// before it OOMs).
-fn is_id_column(name: &str) -> bool {
-	let bare = name.rsplit_once(':').map(|(_, c)| c).unwrap_or(name);
-	bare.eq_ignore_ascii_case("id")
-}
-
 fn exclude_mask(attrs: &[Attr], group: &str, exclude: &[String]) -> Vec<bool> {
 	attrs.iter()
 		.map(|a| {
 			let nm = namespaced(group, &a.name);
-			if is_id_column(&nm) {
-				return true;
-			}
 			exclude.iter().any(|p| exclude_match(p, &nm))
 		})
 		.collect()
@@ -981,7 +973,7 @@ impl Data {
 	fn feature_type_counts(&self) -> Vec<(&'static str, usize)> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| {
-			is_id_column(name) || self.exclude.iter().any(|p| exclude_match(p, name))
+			self.exclude.iter().any(|p| exclude_match(p, name))
 		};
 		let (mut numeric, mut temporal, mut categorical, mut text, mut image) =
 			(0usize, 0usize, 0usize, 0usize, 0usize);
