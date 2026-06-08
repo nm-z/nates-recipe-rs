@@ -320,6 +320,12 @@ impl Train {
 
 	pub fn run(&self, model: &Model, data: &impl RunData) {
 		let ds = data.dataset();
+		let forward_only = !ds.has_target || self.epochs == 0;
+		let issues = preflight(model, ds, forward_only);
+		if !issues.is_empty() && !confirm_issues(&issues) {
+			eprintln!("\x1b[33maborted\x1b[0m");
+			return;
+		}
 		if ds.has_target && self.epochs > 0 {
 			let resume = self.resume.as_deref().map(Self::resolve);
 			model.fit(ds, self, resume.as_deref());
@@ -377,11 +383,6 @@ impl Train {
 			let last_layer = params.len() - 1;
 			let k = params[last_layer].out_dim;
 			let n = ds.x.nrows();
-			{
-				let need = Scratch::vram_bytes(&params, n, true)
-					+ n * ds.x.ncols() * 2 * std::mem::size_of::<f64>();
-				check_vram(need, n, "infer");
-			}
 			let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
 			let cat_cols: Vec<usize> = if embed_first {
 				(0..ds.x.ncols()).filter(|c| !ds.text_cols.contains(c)).collect()
@@ -1085,17 +1086,108 @@ pub struct Model {
 	scaler: RefCell<Option<Scaler>>,
 }
 
-fn check_vram(need: usize, n: usize, label: &str) {
-	let (mut free, mut total) = (0usize, 0usize);
-	unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
-	if need > free / 10 * 9 {
-		panic!(
-			"{label}: {n} rows need {}, only {} free ({} total GPU)",
-			crate::data::human_bytes(need),
-			crate::data::human_bytes(free),
-			crate::data::human_bytes(total),
+struct Issue {
+	what: String,
+	have: String,
+	need: String,
+}
+
+fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
+	let mut issues = Vec::new();
+	let n = ds.x.nrows();
+	let d = ds.x.ncols();
+	let k = ds.n_targets.max(1);
+
+	if model.specs.is_empty() {
+		issues.push(Issue {
+			what: "model has no layers".into(),
+			have: format!("{} layers defined", model.specs.len()),
+			need: "≥1 layer (.layer() before .run())".into(),
+		});
+		return issues;
+	}
+
+	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(_)));
+	if embed_first && ds.text_cols.is_empty() {
+		issues.push(Issue {
+			what: "embed layer but no text columns".into(),
+			have: format!("{} text columns in {} total", ds.text_cols.len(), d),
+			need: "≥1 text column (>256 distinct values) for token-id embedding".into(),
+		});
+	}
+
+	let last_out = {
+		let mut dim = d;
+		for spec in &model.specs {
+			dim = match *spec {
+				LayerSpec::Dense(u, _) => u,
+				LayerSpec::Embed(edim) => (dim / 1.max(dim)) * edim,
+				LayerSpec::Attn(_) => dim,
+			};
+		}
+		dim
+	};
+	if model.loss == Loss::Bce && last_out != 1 {
+		issues.push(Issue {
+			what: "BCE loss expects 1 output unit".into(),
+			have: format!("last layer outputs {last_out}"),
+			need: "1 (.layer(1).sigmoid() for binary classification)".into(),
+		});
+	}
+	if model.loss == Loss::Ce && k > 1 && last_out != k {
+		issues.push(Issue {
+			what: "CE loss output/target mismatch".into(),
+			have: format!("last layer outputs {last_out}"),
+			need: format!("{k} (matching target columns)"),
+		});
+	}
+
+	let (mut free_vram, mut total_vram) = (0usize, 0usize);
+	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
+	let cat_cols = if embed_first { d - ds.text_cols.len() } else { 0 };
+	let text_d = if embed_first { ds.text_cols.len() } else { d };
+	let vocab = if embed_first {
+		ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1
+	} else {
+		0
+	};
+	let need = model.vram_estimate(n, text_d, k, vocab, cat_cols, forward_only);
+	if need > free_vram / 10 * 9 {
+		let mode = if forward_only { "infer" } else { "train" };
+		issues.push(Issue {
+			what: format!("{mode}: {n} rows × {d} features"),
+			have: format!("{} free VRAM ({} total)", crate::data::human_bytes(free_vram), crate::data::human_bytes(total_vram)),
+			need: format!("{} estimated", crate::data::human_bytes(need)),
+		});
+	}
+
+	issues
+}
+
+fn confirm_issues(issues: &[Issue]) -> bool {
+	if issues.is_empty() {
+		return true;
+	}
+	let interactive = std::io::stdin().is_terminal();
+	for (i, issue) in issues.iter().enumerate() {
+		eprintln!(
+			"\x1b[1;33mpreflight {}/{}\x1b[0m  {}\n    have: {}\n    need: {}",
+			i + 1,
+			issues.len(),
+			issue.what,
+			issue.have,
+			issue.need,
 		);
 	}
+	if !interactive {
+		return false;
+	}
+	use std::io::Write;
+	eprint!("continue anyway? [y/N] ");
+	std::io::stderr().flush().ok();
+	let mut line = String::new();
+	std::io::stdin().read_line(&mut line).ok();
+	matches!(line.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 impl Model {
@@ -2232,20 +2324,8 @@ impl Model {
 	}
 
 	fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
-		assert!(
-			!self.specs.is_empty(),
-			"model has no layers — call .layer() before .fit()"
-		);
 		let rerun = !self.params.borrow().is_empty();
-		// An embed first layer reads its input columns as token IDS — it consumes
-		// ONLY the text token-id columns (the rest are numeric/one-hot, not ids and
-		// would explode the vocab). Build the model input from those columns; they
-		// pass through raw (no z-score) and the table is sized to their id range.
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(_)));
-		assert!(
-			!embed_first || !data.text_cols.is_empty(),
-			"embed layer but no text columns in the data",
-		);
 		// Two branches: text token-id columns drive embed→attn; every other column
 		// (categorical/numeric) skips the prefix and is concatenated onto the
 		// attention output before the dense head. xinput feeds layer 0 (the text
@@ -2268,11 +2348,6 @@ impl Model {
 		} else {
 			0
 		};
-		let k = data.n_targets.max(1);
-		{
-			let need = self.vram_estimate(data.x.nrows(), xinput.ncols(), k, vocab, c_cat, false);
-			check_vram(need, data.x.nrows(), "train");
-		}
 		let start = std::time::Instant::now();
 		let (xraw, n, d) = Self::upload(&xinput);
 		// Text token ids pass RAW to the embed lookup (no z-score). The categorical
@@ -3156,23 +3231,6 @@ impl Model {
 	pub fn eval(&self, data: &Dataset) {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "eval: call train() first");
-		{
-			let n = data.x.nrows();
-			let f8 = std::mem::size_of::<f64>();
-			let need = Scratch::vram_bytes(&params, n, true)
-				+ n * data.x.ncols() * 2 * f8
-				+ n * data.n_targets.max(1) * f8;
-			let (mut free, mut total) = (0usize, 0usize);
-			unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
-			if need > free / 10 * 9 {
-				eprintln!(
-					"\x1b[33meval skipped\x1b[0m — needs {} for {n} rows, only {} free",
-					crate::data::human_bytes(need),
-					crate::data::human_bytes(free)
-				);
-				return;
-			}
-		}
 		// Mirror fit's two-branch input construction: text token-id columns pass
 		// raw to embed→attn; the categorical branch is scaled with the TRAIN-set
 		// scaler (same mean/std — eval must see the exact transform training saw).
