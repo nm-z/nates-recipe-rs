@@ -78,171 +78,87 @@ pub fn load_ogdl(path: &str) -> Vec<Saved> {
 
 /// Parse OGDL checkpoint text into `Saved` blocks (the cwd-independent core of
 /// `load_ogdl` — used by `Model::load` with `include_str!`-embedded weights).
+/// The `ogdl` crate turns the text into a name/value tree; this fn interprets
+/// what each top-level block means for model weights. The block layout is fixed
+/// by `dump_ogdl`: a scalar metric header (`r2=`/`acc=`/…), then one bare-named
+/// block per layer with its fields indented underneath.
 pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 	let vals = |s: &str| -> Vec<f64> {
 		s.split_whitespace()
 			.map(|t| t.parse::<f64>().expect("resume: parse value"))
 			.collect()
 	};
-	// A block accumulates several lines before it's complete, so collect into a
-	// mutable `cur` and flush it on the next header (and at EOF).
-	enum Cur {
-		Embed(Vec<(usize, Vec<f64>)>),
-		Attn {
-			wq: Vec<f64>,
-			wk: Vec<f64>,
-			wv: Vec<f64>,
-			wo: Vec<f64>,
-			bq: Vec<f64>,
-			bk: Vec<f64>,
-			bv: Vec<f64>,
-			bo: Vec<f64>,
-		},
-		Dense {
-			w: Vec<f64>,
-			b: f64,
-			a: Option<f64>,
-		},
-		Conv {
-			w: Vec<f64>,
-			b: Vec<f64>,
-		},
-	}
-	let flush = |cur: Option<Cur>, out: &mut Vec<Saved>| match cur {
-		None => {}
-		Some(Cur::Embed(mut rows)) => {
-			rows.sort_by_key(|(id, _)| *id);
-			out.push(Saved::Embed(
-				rows.into_iter().flat_map(|(_, v)| v).collect(),
-			));
-		}
-		Some(Cur::Attn {
-			wq,
-			wk,
-			wv,
-			wo,
-			bq,
-			bk,
-			bv,
-			bo,
-		}) => {
-			out.push(Saved::Attn {
-				wq,
-				wk,
-				wv,
-				wo,
-				bq,
-				bk,
-				bv,
-				bo,
-			});
-		}
-		Some(Cur::Dense { w, b, a }) => out.push(Saved::Dense { w, b, a }),
-		Some(Cur::Conv { w, b }) => out.push(Saved::Conv { w, b }),
-	};
 	let mut out: Vec<Saved> = Vec::new();
-	let mut cur: Option<Cur> = None;
-	for line in text.lines() {
-		let t = line.trim();
-		if t.is_empty() {
+	for block in ogdl::Node::parse(text).children {
+		// A top-level `key=value` line is the scalar metric header, not a weight
+		// block — skip it whatever the metric is named.
+		if block.value.is_some() {
 			continue;
 		}
-		match t.split_once('=') {
-			// Bare token = block header: flush the previous block, open a new one.
-			None => {
-				flush(cur.take(), &mut out);
-				cur = Some(if t == "embed" {
-					Cur::Embed(Vec::new())
-				} else if t == "attn" {
-					Cur::Attn {
-						wq: vec![],
-						wk: vec![],
-						wv: vec![],
-						wo: vec![],
-						bq: vec![],
-						bk: vec![],
-						bv: vec![],
-						bo: vec![],
-					}
-				} else if t.starts_with("conv ") {
-					Cur::Conv { w: vec![], b: vec![] }
-				} else {
-					Cur::Dense {
-						w: Vec::new(),
-						b: 0.0,
-						a: None,
-					} // z{k}
-				});
+		let field = |name: &str| -> Vec<f64> {
+			block
+				.children
+				.iter()
+				.find(|c| c.name == name)
+				.and_then(|c| c.value.as_deref())
+				.map_or_else(Vec::new, vals)
+		};
+		match block.name.as_str() {
+			"embed" => {
+				let mut rows: Vec<(usize, Vec<f64>)> = block
+					.children
+					.iter()
+					.map(|c| {
+						let v = c.value.as_deref().map_or_else(Vec::new, vals);
+						(c.name.parse().expect("resume: embed row id"), v)
+					})
+					.collect();
+				rows.sort_by_key(|(id, _)| *id);
+				out.push(Saved::Embed(
+					rows.into_iter().flat_map(|(_, v)| v).collect(),
+				));
 			}
-			Some((k, _)) if matches!(k.trim(), "r2" | "acc") => {}
-			Some((k, v)) => {
-				let key = k.trim();
-				match cur
-					.as_mut()
-					.expect("resume: value line before any block header")
-				{
-					Cur::Embed(rows) => {
-						rows.push((
-							key.parse().expect("resume: embed row id"),
-							vals(v),
-						));
-					}
-					Cur::Attn {
-						wq,
-						wk,
-						wv,
-						wo,
-						bq,
-						bk,
-						bv,
-						bo,
-					} => match key {
-						"wq" => *wq = vals(v),
-						"wk" => *wk = vals(v),
-						"wv" => *wv = vals(v),
-						"wo" => *wo = vals(v),
-						"bq" => *bq = vals(v),
-						"bk" => *bk = vals(v),
-						"bv" => *bv = vals(v),
-						"bo" => *bo = vals(v),
-						_ => panic!("resume: unknown attn key {key}"),
-					},
-					Cur::Conv { w, b } => match key {
-						"w" => *w = vals(v),
-						"b" => *b = vals(v),
-						_ => panic!("resume: unknown conv key {key}"),
-					},
-					Cur::Dense { w, b, a } => match key {
-						"b" => *b = v.trim().parse().expect("resume: dense b"),
-						"a" => {
-							*a = Some(v
-								.trim()
-								.parse()
-								.expect("resume: dense a"))
-						}
-						"w" => *w = vals(v),
+			"attn" => out.push(Saved::Attn {
+				wq: field("wq"),
+				wk: field("wk"),
+				wv: field("wv"),
+				wo: field("wo"),
+				bq: field("bq"),
+				bk: field("bk"),
+				bv: field("bv"),
+				bo: field("bo"),
+			}),
+			name if name.starts_with("conv ") => {
+				out.push(Saved::Conv { w: field("w"), b: field("b") })
+			}
+			// z{k}: one dense neuron — w row, scalar b, optional PReLU slope a.
+			_ => {
+				let mut w = Vec::new();
+				let mut b = 0.0;
+				let mut a = None;
+				for c in &block.children {
+					let v = c.value.as_deref().unwrap_or("");
+					match c.name.as_str() {
+						"w" => w = vals(v),
+						"b" => b = v.trim().parse().expect("resume: dense b"),
+						"a" => a = Some(v.trim().parse().expect("resume: dense a")),
 						// Back-compat: the old format wrote one weight per line
 						// (w1=, w2=, …) in order — append each to the vector.
-						_ if key.starts_with('w')
-							&& key[1..].chars().all(|c| c.is_ascii_digit())
-							&& key.len() > 1 =>
+						key if key.starts_with('w')
+							&& key.len() > 1
+							&& key[1..].chars().all(|c| c.is_ascii_digit()) =>
 						{
-							w.push(v
-								.trim()
-								.parse()
-								.expect("resume: dense w{n}"));
+							w.push(v.trim().parse().expect("resume: dense w{n}"));
 						}
-						_ => {
-							panic!(
-								"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
-							);
-						}
-					},
+						key => panic!(
+							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
+						),
+					}
 				}
+				out.push(Saved::Dense { w, b, a });
 			}
 		}
 	}
-	flush(cur.take(), &mut out);
 	out
 }
 

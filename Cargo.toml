@@ -8,7 +8,7 @@ name = "nates_recipe"
 
 [workspace]
 members = [".", "recipe-infer", "pantry"]
-exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
+exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
 
 [dependencies]
 gpu-core = { path = "gpu-core" }
