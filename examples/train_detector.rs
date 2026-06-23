@@ -185,6 +185,154 @@ fn column_cells(path: &str, col: &str) -> Vec<String> {
 		.collect()
 }
 
+// ── extra corpus: VNA + UCI dumps in varied delimiters / headerless layouts ──
+// The shipped parser only auto-detects all-numeric headerless files; here the
+// trainer KNOWS each file's delimiter and whether it has a header, so it passes
+// that truth in directly (a headerless file with a categorical column would fool
+// any content test). One delimited reader covers comma/semicolon/tab/space.
+
+enum Delim {
+	Comma,
+	Semicolon,
+	Tab,
+	Space,
+}
+
+fn columns_of(path: &str, d: &Delim, headerless: bool) -> Vec<Vec<String>> {
+	let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+	let split = |line: &str| -> Vec<String> {
+		let raw: Vec<&str> = match d {
+			Delim::Comma => line.split(',').collect(),
+			Delim::Semicolon => line.split(';').collect(),
+			Delim::Tab => line.split('\t').collect(),
+			Delim::Space => line.split_whitespace().collect(),
+		};
+		raw.iter().map(|s| s.trim().trim_matches('"').trim().to_string()).collect()
+	};
+	let rows: Vec<Vec<String>> = text.lines().filter(|l| !l.trim().is_empty()).map(split).collect();
+	if rows.is_empty() {
+		return Vec::new();
+	}
+	let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+	let data = if headerless { &rows[..] } else { &rows[1..] };
+	(0..width)
+		.map(|j| {
+			data.iter()
+				.filter_map(|r| r.get(j))
+				.filter(|c| !c.is_empty())
+				.cloned()
+				.collect()
+		})
+		.collect()
+}
+
+/// Expand one column's cells into prefix variants + the full stream, same shape
+/// as the in-line corpus builder, so fixture-scale and full-length both appear.
+fn push_instances(out: &mut Vec<(Vec<String>, usize)>, cells: Vec<String>, kind: usize) {
+	if cells.is_empty() {
+		return;
+	}
+	for take in [4usize, 8, 16] {
+		if cells.len() > take {
+			out.push((cells[..take].to_vec(), kind));
+		}
+	}
+	out.push((cells, kind));
+}
+
+/// Per-column kinds for a `w`-wide file: Numeric by default, with named overrides.
+fn kinds(width: usize, overrides: &[(usize, usize)]) -> Vec<(usize, usize)> {
+	let mut v: Vec<(usize, usize)> = (0..width).map(|j| (j, KIND_NUMERIC)).collect();
+	for &(j, k) in overrides {
+		if j < width {
+			v[j] = (j, k);
+		}
+	}
+	v
+}
+
+fn add_indexed(out: &mut Vec<(Vec<String>, usize)>, path: &str, d: &Delim, headerless: bool, cols: &[(usize, usize)]) {
+	let columns = columns_of(path, d, headerless);
+	for &(j, kind) in cols {
+		if let Some(c) = columns.get(j) {
+			push_instances(out, c.clone(), kind);
+		}
+	}
+}
+
+/// Wide all-numeric matrices (VNA predictors, HAR sensor): sample ~k evenly-spaced
+/// columns as Numeric. Sampling, not every column, so a 3204-wide file can't swamp
+/// the corpus and collapse class balance — logged, never silent.
+fn add_sampled_numeric(out: &mut Vec<(Vec<String>, usize)>, path: &str, d: &Delim, headerless: bool, k: usize) {
+	let cols = columns_of(path, d, headerless);
+	let width = cols.len();
+	if width == 0 {
+		return;
+	}
+	let step = (width / k).max(1);
+	let mut n = 0;
+	for j in (0..width).step_by(step) {
+		push_instances(out, cols[j].clone(), KIND_NUMERIC);
+		n += 1;
+	}
+	eprintln!("  {path}: sampled {n} of {width} numeric columns");
+}
+
+fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
+	use Delim::{Comma, Semicolon, Space, Tab};
+	// VNA — the headerless numeric dumps that motivated this. Targets: one column.
+	add_indexed(out, "datasets/VNA/9_10_24_Hold_02_targets.csv", &Comma, true, &[(0, KIND_NUMERIC)]);
+	add_indexed(out, "datasets/VNA/sample_targets.csv", &Comma, true, &[(0, KIND_NUMERIC)]);
+	add_sampled_numeric(out, "datasets/VNA/sample_predictors.csv", &Comma, true, 64);
+	add_sampled_numeric(out, "datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv", &Comma, true, 64);
+
+	// UCI comma headerless — numeric attributes + a trailing class/label column.
+	add_indexed(out, "datasets/uci-wine/wine.data", &Comma, true, &kinds(14, &[(0, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-glass/glass.data", &Comma, true, &kinds(11, &[(10, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-ionosphere/ionosphere.data", &Comma, true, &kinds(35, &[(34, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-sonar/sonar.all-data", &Comma, true, &kinds(61, &[(60, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-abalone/abalone.data", &Comma, true, &kinds(9, &[(0, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-bcw/breast-cancer-wisconsin.data", &Comma, true, &kinds(11, &[(10, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-wdbc/wdbc.data", &Comma, true, &kinds(32, &[(1, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-letter/letter-recognition.data", &Comma, true, &kinds(17, &[(0, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-magic/magic04.data", &Comma, true, &kinds(11, &[(10, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-optdigits/optdigits.tra", &Comma, true, &kinds(65, &[(64, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-spambase/spambase.data", &Comma, true, &kinds(58, &[(57, KIND_CATEGORICAL)]));
+	add_indexed(
+		out, "datasets/uci-adult/adult.data", &Comma, true,
+		&kinds(15, &[
+			(1, KIND_CATEGORICAL), (3, KIND_CATEGORICAL), (5, KIND_CATEGORICAL), (6, KIND_CATEGORICAL),
+			(7, KIND_CATEGORICAL), (8, KIND_CATEGORICAL), (9, KIND_CATEGORICAL), (13, KIND_CATEGORICAL),
+			(14, KIND_CATEGORICAL),
+		]),
+	);
+
+	// UCI space/tab headerless numeric matrices (+ trailing class).
+	add_indexed(out, "datasets/uci-german-numeric/german.data-numeric", &Space, true, &kinds(25, &[]));
+	add_indexed(out, "datasets/uci-satimage/sat.trn", &Space, true, &kinds(37, &[(36, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-shuttle/shuttle.trn", &Space, true, &kinds(10, &[(9, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-ecoli/ecoli.data", &Space, true, &kinds(9, &[(0, KIND_TEXT), (8, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-yeast/yeast.data", &Space, true, &kinds(10, &[(0, KIND_TEXT), (9, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-seeds/seeds_dataset.txt", &Tab, true, &kinds(8, &[(7, KIND_CATEGORICAL)]));
+	add_indexed(out, "datasets/uci-airfoil/airfoil_self_noise.dat", &Tab, true, &kinds(6, &[]));
+	add_sampled_numeric(out, "datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt", &Space, true, 64);
+
+	// SMS spam: tab-delimited headerless — label + free text.
+	add_indexed(out, "datasets/uci-sms-tab/SMSSpamCollection", &Tab, true, &[(0, KIND_CATEGORICAL), (1, KIND_TEXT)]);
+
+	// Semicolon-delimited WITH headers (quoted fields in bank).
+	add_indexed(out, "datasets/uci-winequality-semicolon/winequality-red.csv", &Semicolon, false, &kinds(12, &[(11, KIND_ORDINAL)]));
+	add_indexed(out, "datasets/uci-winequality-semicolon/winequality-white.csv", &Semicolon, false, &kinds(12, &[(11, KIND_ORDINAL)]));
+	add_indexed(
+		out, "datasets/uci-bank-semicolon/bank-full.csv", &Semicolon, false,
+		&kinds(17, &[
+			(1, KIND_CATEGORICAL), (2, KIND_CATEGORICAL), (3, KIND_ORDINAL), (4, KIND_CATEGORICAL),
+			(6, KIND_CATEGORICAL), (7, KIND_CATEGORICAL), (8, KIND_CATEGORICAL), (10, KIND_CATEGORICAL),
+			(15, KIND_CATEGORICAL), (16, KIND_CATEGORICAL),
+		]),
+	);
+}
+
 /// Every labelled column across datasets/, as `(byte-stream cells, kind)`.
 fn instances() -> Vec<(Vec<String>, usize)> {
 	let mut out: Vec<(Vec<String>, usize)> = Vec::new();
@@ -229,6 +377,8 @@ fn instances() -> Vec<(Vec<String>, usize)> {
 			add(s, &["date"], KIND_TEMPORAL);
 		}
 	}
+	drop(add);
+	add_new_corpus(&mut out);
 	out
 }
 
