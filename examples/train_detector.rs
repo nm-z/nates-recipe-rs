@@ -287,6 +287,8 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 	add_sampled_numeric(out, "datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv", &Comma, true, 64);
 
 	// UCI comma headerless — numeric attributes + a trailing class/label column.
+	// Full columns (not sampled): more data generalized better than a balanced-but-
+	// smaller corpus here — the v1 (1722 rows) > v2 (1180 rows) held-out result.
 	add_indexed(out, "datasets/uci-wine/wine.data", &Comma, true, &kinds(14, &[(0, KIND_CATEGORICAL)]));
 	add_indexed(out, "datasets/uci-glass/glass.data", &Comma, true, &kinds(11, &[(10, KIND_CATEGORICAL)]));
 	add_indexed(out, "datasets/uci-ionosphere/ionosphere.data", &Comma, true, &kinds(35, &[(34, KIND_CATEGORICAL)]));
@@ -415,12 +417,43 @@ fn corpus_split(seed: u64, test_frac: f64) -> (Dataset, Dataset) {
 	(build_dataset(tr), build_dataset(te))
 }
 
+/// Per-class instance counts (argmax the one-hot targets) — proves the held-out
+/// accuracy isn't a degenerate all-Numeric pass.
+fn class_balance(tag: &str, ds: &Dataset) {
+	let y = ds.y.as_slice().expect("y contiguous");
+	let n = y.len() / N_CLASS;
+	let mut c = [0usize; N_CLASS];
+	for r in 0..n {
+		let row = &y[r * N_CLASS..(r + 1) * N_CLASS];
+		let mut best = 0;
+		for j in 1..N_CLASS {
+			if row[j] > row[best] {
+				best = j;
+			}
+		}
+		c[best] += 1;
+	}
+	eprintln!(
+		"  {tag}: NUM {} TEMP {} CAT {} ORD {} TEXT {} IMG {}",
+		c[KIND_NUMERIC], c[KIND_TEMPORAL], c[KIND_CATEGORICAL], c[KIND_ORDINAL], c[KIND_TEXT], c[KIND_IMAGE]
+	);
+}
+
 fn main() {
 	// 40% train / 60% test over all hand-labelled real columns.
 	let (train, test) = corpus_split(0xC0FFEE, 0.6);
 	eprintln!("split: {} train / {} test columns", train.x.nrows(), test.x.nrows());
+	class_balance("train", &train);
+	class_balance("test", &test);
+
+	// Retrain from scratch on the EXPANDED corpus. The prior detector.ogdl (0.987)
+	// was a different corpus, so resuming + the best-only save guard would compare
+	// against a stale, incomparable score and silently refuse to save the retrained
+	// model. Remove it first; resume_from still sets the checkpoint path so the best
+	// weights are written during training (it just starts from random, file absent).
+	let _ = std::fs::remove_file("pantry/detector.ogdl");
 	let model = model();
-	let trainer = Train::new().epochs(5000).resume_from("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
+	let trainer = Train::new().epochs(20000).resume_from("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
 	trainer.run(&model, &train);
 	trainer.save_as([w, b], "pantry/detector.ogdl");
 	eprintln!("=== held-out test set (60%) — datatype-detection accuracy ===");
