@@ -42,3 +42,4 @@ examples/*/train_images/
 examples/*/test_images/
 !examples/cookbook.rs
 !examples/train_detector.rs
+/kernel_inventory.db
