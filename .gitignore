@@ -23,6 +23,7 @@ kaggle_s6e4/cache/
 .claude/worktrees/
 .directory
 .vscode/
+.rustfmt.toml
 
 # Local dataset symlink (machine-specific absolute path)
 /german_credit.arff
