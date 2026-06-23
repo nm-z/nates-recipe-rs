@@ -10,6 +10,7 @@ pub type Vec1 = ndarray::Array1<f64>;
 
 pub mod data;
 pub mod detect;
+pub mod encode;
 
 pub use data::*;
 pub use detect::*;
