@@ -1,6 +1,11 @@
-//! The OGDL checkpoint codec (read side): parse a saved-weights dump into one
-//! `Saved` block per layer/neuron, in save order. The write side (`dump_ogdl`)
-//! lives in the training crate; this half is all that inference needs to resume.
+//! The OGDL checkpoint codec: parse a saved-weights dump into one `Saved` block
+//! per layer/neuron (read side, `load_ogdl`), and serialize a model's GPU buffers
+//! back out (write side, `dump_ogdl`/`write_ogdl`/`saved_score`). Both halves live
+//! here — serialization is inference-adjacent, not training: the trained params
+//! are tensors, and turning tensors into the on-disk format needs nothing of
+//! datasets or the training loop.
+
+use crate::{Activation, LayerKind, LayerParams, Param, download_scalar, download_vec};
 
 /// One parsed OGDL block, in layer/neuron order — the resume counterpart of the
 /// per-layer save format. `Embed` is the flat [vocab*dim] token table; `Attn` holds
@@ -239,6 +244,129 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 	}
 	flush(cur.take(), &mut out);
 	out
+}
+
+/// One OGDL block per layer, in layer order: `embed` (one `{id}=` row per vocab
+/// token), `attn` (`wq/wk/wv/wo` + `bq/bk/bv/bo`), `conv` (`w=`/`b=`), or one `z{k}`
+/// block per dense neuron (`w=` row, `b=` scalar, plus `a=` for a PReLU layer's
+/// learned slope). W rows are laid out to match `load_ogdl`'s distribution.
+/// `filter: None` saves everything the model allocated (full checkpoint —
+/// future-proof as new param kinds are added per layer below). `Some(parts)`
+/// restricts to a subset. Each layer block downloads exactly the buffers it holds.
+pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
+	let want_w = filter.map_or(true, |f| f.contains(&Param::W));
+	let want_b = filter.map_or(true, |f| f.contains(&Param::B));
+	let join = |v: &[f64]| {
+		v.iter()
+			.map(|x| x.to_string())
+			.collect::<Vec<_>>()
+			.join(" ")
+	};
+	let mut out = format!("{key}={score}\n");
+	let mut z = 1;
+	for p in params.iter() {
+		match p.kind {
+			LayerKind::Embed => {
+				out.push_str("embed\n");
+				if want_w {
+					let table = download_vec(&p.w, p.vocab * p.dim);
+					for id in 0..p.vocab {
+						let row = &table[id * p.dim..(id + 1) * p.dim];
+						out.push_str(&format!("    {id}={}\n", join(row)));
+					}
+				}
+			}
+			LayerKind::Attn => {
+				out.push_str("attn\n");
+				let dd = p.dim * p.dim;
+				if want_w {
+					for (nm, buf) in [
+						("wq", &p.w),
+						("wk", &p.wk),
+						("wv", &p.wv),
+						("wo", &p.wo),
+					] {
+						out.push_str(&format!(
+							"    {nm}={}\n",
+							join(&download_vec(buf, dd))
+						));
+					}
+				}
+				if want_b {
+					// Bare attention has a single shared (zero) bias [d];
+					// emit it as bq/bk/bv/bo for format completeness.
+					let bias = download_vec(&p.b, p.dim);
+					for nm in ["bq", "bk", "bv", "bo"] {
+						out.push_str(&format!("    {nm}={}\n", join(&bias)));
+					}
+				}
+			}
+			LayerKind::Conv => {
+				let lin = p.in_dim / p.conv_cin;
+				let lout = (lin - p.conv_k) / p.conv_stride + 1;
+				let cout = p.out_dim / lout;
+				let w_count = cout * p.conv_cin * p.conv_k;
+				out.push_str(&format!("conv {} {} {} {}\n", cout, p.conv_cin, p.conv_k, p.conv_stride));
+				if want_w {
+					let w = download_vec(&p.w, w_count);
+					out.push_str(&format!("    w={}\n", join(&w)));
+				}
+				if want_b {
+					let b = download_vec(&p.b, cout);
+					out.push_str(&format!("    b={}\n", join(&b)));
+				}
+			}
+			LayerKind::Dense => {
+				let w = download_vec(&p.w, p.in_dim * p.out_dim);
+				let b = download_vec(&p.b, p.out_dim);
+				let slope = (p.act == Activation::PRelu)
+					.then(|| download_scalar(&p.palpha));
+				for j in 0..p.out_dim {
+					out.push_str(&format!("z{z}\n"));
+					if want_w {
+						let row: Vec<f64> = (0..p.in_dim)
+							.map(|i| w[i * p.out_dim + j])
+							.collect();
+						out.push_str(&format!("    w={}\n", join(&row)));
+						if let Some(a) = slope {
+							out.push_str(&format!("    a={a}\n"));
+						}
+					}
+					if want_b {
+						out.push_str(&format!("    b={}\n", b[j]));
+					}
+					z += 1;
+				}
+			}
+		}
+	}
+	out
+}
+
+/// Write OGDL text, creating any missing parent dirs — saving should make the
+/// file, not fail because the directory isn't there yet.
+pub fn write_ogdl(path: &str, out: &str) {
+	if let Some(parent) = std::path::Path::new(path).parent()
+		&& !parent.as_os_str().is_empty()
+	{
+		std::fs::create_dir_all(parent)
+			.unwrap_or_else(|e| panic!("save: mkdir {}: {e}", parent.display()));
+	}
+	std::fs::write(path, out).unwrap_or_else(|e| panic!("save: write {path}: {e}"));
+}
+
+/// Read the score recorded on the first line of a saved checkpoint (`{key}={score}`),
+/// used by the best-only save guard. `None` if the file is absent or unparseable.
+pub fn saved_score(path: &str, key: &str) -> Option<f64> {
+	let text = std::fs::read_to_string(path).ok()?;
+	for line in text.lines() {
+		if let Some((k, v)) = line.trim().split_once('=')
+			&& k.trim() == key
+		{
+			return v.trim().parse().ok();
+		}
+	}
+	None
 }
 
 #[cfg(test)]

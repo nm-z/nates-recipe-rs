@@ -4,11 +4,11 @@
 //! `recipe-infer` crate; this module drives them but they never depend back on it.
 
 use crate::dataset::{Dataset, collapse_onehot};
-use crate::model::{Model, Param, RunData, Train};
+use crate::model::{Model, RunData, Train};
 use recipe_infer::{
 	Activation, ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, Saved, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
-	download_vec, forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
+	forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
 	nan_impute_and_apply, pinned_vocab, upload, zscore_apply, zscore_fit,
 };
 use gpu_core::kernels;
@@ -1031,10 +1031,10 @@ impl Model {
 					saved = true;
 					let path = checkpoint_path.as_ref().expect("checkpoint path");
 					let key = self.loss.score_key();
-					if Self::saved_score(path, key).is_none_or(|best| score > best) {
-						Self::write_ogdl(
+					if recipe_infer::saved_score(path, key).is_none_or(|best| score > best) {
+						recipe_infer::write_ogdl(
 							path,
-							&Self::dump_ogdl(&params, None, key, score),
+							&recipe_infer::dump_ogdl(&params, None, key, score),
 						);
 						checkpointed = true;
 					}
@@ -1138,9 +1138,9 @@ impl Model {
 			let path = checkpoint_path.as_ref().expect("checkpoint path");
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				let key = self.loss.score_key();
-				Self::write_ogdl(
+				recipe_infer::write_ogdl(
 					path,
-					&Self::dump_ogdl(&self.params.borrow(), None, key, s),
+					&recipe_infer::dump_ogdl(&self.params.borrow(), None, key, s),
 				);
 				let full =
 					std::fs::canonicalize(path).unwrap_or_else(|_| path.as_str().into());
@@ -1155,140 +1155,17 @@ impl Model {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "save: call train() first");
 		let key = self.loss.score_key();
-		if !score.is_finite() || Self::saved_score(path, key).is_some_and(|best| score <= best)
+		if !score.is_finite() || recipe_infer::saved_score(path, key).is_some_and(|best| score <= best)
 		{
 			return;
 		}
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-		Self::write_ogdl(path, &Self::dump_ogdl(&params, None, key, score));
+		recipe_infer::write_ogdl(path, &recipe_infer::dump_ogdl(&params, None, key, score));
 		let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
 		eprintln!(
 			"saved {} ({neurons} neurons, {key} {score:.4})",
 			full.display()
 		);
-	}
-
-	/// One OGDL block per layer, in layer order: `embed` (one `{id}=` row per
-	/// vocab token), `attn` (`wq/wk/wv/wo` + `bq/bk/bv/bo`), or one `z{k}` block per
-	/// dense neuron (`w=` row, `b=` scalar, plus `a=` for a PReLU layer's learned
-	/// slope). W rows are laid out to match `load_ogdl`'s distribution. `parts`
-	/// gates emission: weights only if `W` requested, biases only if `B`.
-	/// `filter: None` saves everything the model allocated (full checkpoint — the
-	/// default for `save()`/auto-checkpoint, future-proof as new param kinds are
-	/// added per layer below). `Some(parts)` restricts to a subset (the `save_as`
-	/// override). Each layer block downloads exactly the buffers it holds.
-	pub(crate) fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
-		let want_w = filter.map_or(true, |f| f.contains(&Param::W));
-		let want_b = filter.map_or(true, |f| f.contains(&Param::B));
-		let join = |v: &[f64]| {
-			v.iter()
-				.map(|x| x.to_string())
-				.collect::<Vec<_>>()
-				.join(" ")
-		};
-		let mut out = format!("{key}={score}\n");
-		let mut z = 1;
-		for p in params.iter() {
-			match p.kind {
-				LayerKind::Embed => {
-					out.push_str("embed\n");
-					if want_w {
-						let table = download_vec(&p.w, p.vocab * p.dim);
-						for id in 0..p.vocab {
-							let row = &table[id * p.dim..(id + 1) * p.dim];
-							out.push_str(&format!("    {id}={}\n", join(row)));
-						}
-					}
-				}
-				LayerKind::Attn => {
-					out.push_str("attn\n");
-					let dd = p.dim * p.dim;
-					if want_w {
-						for (nm, buf) in [
-							("wq", &p.w),
-							("wk", &p.wk),
-							("wv", &p.wv),
-							("wo", &p.wo),
-						] {
-							out.push_str(&format!(
-								"    {nm}={}\n",
-								join(&download_vec(buf, dd))
-							));
-						}
-					}
-					if want_b {
-						// Bare attention has a single shared (zero) bias [d];
-						// emit it as bq/bk/bv/bo for format completeness.
-						let bias = download_vec(&p.b, p.dim);
-						for nm in ["bq", "bk", "bv", "bo"] {
-							out.push_str(&format!("    {nm}={}\n", join(&bias)));
-						}
-					}
-				}
-				LayerKind::Conv => {
-					let lin = p.in_dim / p.conv_cin;
-					let lout = (lin - p.conv_k) / p.conv_stride + 1;
-					let cout = p.out_dim / lout;
-					let w_count = cout * p.conv_cin * p.conv_k;
-					out.push_str(&format!("conv {} {} {} {}\n", cout, p.conv_cin, p.conv_k, p.conv_stride));
-					if want_w {
-						let w = download_vec(&p.w, w_count);
-						out.push_str(&format!("    w={}\n", join(&w)));
-					}
-					if want_b {
-						let b = download_vec(&p.b, cout);
-						out.push_str(&format!("    b={}\n", join(&b)));
-					}
-				}
-				LayerKind::Dense => {
-					let w = download_vec(&p.w, p.in_dim * p.out_dim);
-					let b = download_vec(&p.b, p.out_dim);
-					let slope = (p.act == Activation::PRelu)
-						.then(|| download_scalar(&p.palpha));
-					for j in 0..p.out_dim {
-						out.push_str(&format!("z{z}\n"));
-						if want_w {
-							let row: Vec<f64> = (0..p.in_dim)
-								.map(|i| w[i * p.out_dim + j])
-								.collect();
-							out.push_str(&format!("    w={}\n", join(&row)));
-							if let Some(a) = slope {
-								out.push_str(&format!("    a={a}\n"));
-							}
-						}
-						if want_b {
-							out.push_str(&format!("    b={}\n", b[j]));
-						}
-						z += 1;
-					}
-				}
-			}
-		}
-		out
-	}
-
-	/// Write OGDL text, creating any missing parent dirs — saving should make the
-	/// file, not fail because the directory isn't there yet.
-	pub(crate) fn write_ogdl(path: &str, out: &str) {
-		if let Some(parent) = std::path::Path::new(path).parent()
-			&& !parent.as_os_str().is_empty()
-		{
-			std::fs::create_dir_all(parent)
-				.unwrap_or_else(|e| panic!("save: mkdir {}: {e}", parent.display()));
-		}
-		std::fs::write(path, out).unwrap_or_else(|e| panic!("save: write {path}: {e}"));
-	}
-
-	pub(crate) fn saved_score(path: &str, key: &str) -> Option<f64> {
-		let text = std::fs::read_to_string(path).ok()?;
-		for line in text.lines() {
-			if let Some((k, v)) = line.trim().split_once('=')
-				&& k.trim() == key
-			{
-				return v.trim().parse().ok();
-			}
-		}
-		None
 	}
 
 	/// Adapt a `Dataset` to GPU input buffers exactly as training did — collapse

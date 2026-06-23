@@ -73,11 +73,8 @@ impl IntoLayer for AttnSpec {
 
 /// Which parameters `save` writes — pass `w`, `b`, or both (consts in the crate
 /// root, kept out of this module so they don't shadow local `w`/`b` bindings).
-#[derive(Clone, Copy, PartialEq)]
-pub enum Param {
-	W,
-	B,
-}
+/// The enum itself lives in recipe-infer beside the OGDL codec it gates.
+pub use recipe_infer::Param;
 
 pub enum SaveItem {
 	W,
@@ -427,12 +424,12 @@ impl Train {
 		let score = last.score;
 		let path = Self::resolve(path);
 		if !score.is_finite()
-			|| Model::saved_score(&path, key).is_some_and(|best| score <= best)
+			|| recipe_infer::saved_score(&path, key).is_some_and(|best| score <= best)
 		{
 			return;
 		}
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-		Model::write_ogdl(&path, &Model::dump_ogdl(&params, filter, key, score));
+		recipe_infer::write_ogdl(&path, &recipe_infer::dump_ogdl(&params, filter, key, score));
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
 		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
 	}
