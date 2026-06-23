@@ -198,14 +198,91 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 		.collect()
 }
 
+/// Encode one column purely by its `Kind` — identical whether the column is a
+/// feature or a target. Role only decides where the produced columns are routed
+/// (X vs Y), never how they're encoded.
+fn encode_kind(
+	attr: &Attr,
+	rows: &[Vec<String>],
+	ai: usize,
+	seq_len: usize,
+) -> (Vec<String>, Vec<Vec<f64>>) {
+	let n = rows.len();
+	match &attr.kind {
+		Kind::Numeric => {
+			let mut col = vec![0.0f64; n];
+			for (r, row) in rows.iter().enumerate() {
+				col[r] = cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
+			}
+			(vec![attr.name.clone()], vec![col])
+		}
+		Kind::Temporal => {
+			let mut col = vec![0.0f64; n];
+			for (r, row) in rows.iter().enumerate() {
+				let c = cell(row, ai);
+				col[r] = c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
+			}
+			(vec![attr.name.clone()], vec![col])
+		}
+		Kind::Categorical(cats) => {
+			let mut names = Vec::with_capacity(cats.len());
+			let mut cols = Vec::with_capacity(cats.len());
+			for cat in cats {
+				names.push(format!("{}={cat}", attr.name));
+				let mut col = vec![0.0f64; n];
+				for (r, row) in rows.iter().enumerate() {
+					if cell(row, ai) == cat {
+						col[r] = 1.0;
+					}
+				}
+				cols.push(col);
+			}
+			(names, cols)
+		}
+		Kind::Ordinal(cats) => {
+			let mut col = vec![f64::NAN; n];
+			for (r, row) in rows.iter().enumerate() {
+				let v = cell(row, ai);
+				if let Some(p) = cats.iter().position(|c| c == v) {
+					col[r] = p as f64;
+				}
+			}
+			(vec![attr.name.clone()], vec![col])
+		}
+		Kind::Text(vocab) => {
+			let names = (0..seq_len).map(|s| format!("{}#t{s}", attr.name)).collect();
+			let per_row: Vec<Vec<f64>> = rows
+				.par_iter()
+				.map(|row| {
+					let mut ids = vec![0.0f64; seq_len];
+					for (s, tok) in tokenize(cell(row, ai)).take(seq_len).enumerate() {
+						ids[s] = vocab.binary_search(&tok).map_or(0.0, |p| (p + 1) as f64);
+					}
+					ids
+				})
+				.collect();
+			let mut cols = vec![vec![0.0f64; n]; seq_len];
+			for (r, ids) in per_row.iter().enumerate() {
+				for s in 0..seq_len {
+					cols[s][r] = ids[s];
+				}
+			}
+			(names, cols)
+		}
+		Kind::Image => panic!(
+			"image column '{}' not yet supported — .exclude(\"{}\")",
+			attr.name, attr.name
+		),
+	}
+}
+
 fn encode(
 	attrs: &[Attr],
 	rows: &[Vec<String>],
 	targets: &[usize],
 	skip: &[bool],
-) -> (Vec<String>, Mat, Vec1) {
+) -> (Vec<String>, Mat, Vec1, usize) {
 	let n = rows.len();
-	let k = targets.len();
 
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
@@ -213,7 +290,7 @@ fn encode(
 		.iter()
 		.enumerate()
 		.map(|(ai, a)| match &a.kind {
-			Kind::Text(_) if !is_target(ai) && !is_skip(ai) => rows
+			Kind::Text(_) if !is_skip(ai) => rows
 				.iter()
 				.map(|row| tokenize(cell(row, ai)).count())
 				.max()
@@ -266,124 +343,22 @@ fn encode(
 	}
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
 	let mut cols: Vec<Vec<f64>> = Vec::with_capacity(proj_w);
-	let mut y = vec![0.0f64; n * k];
+	let mut tcols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); targets.len()];
 	for (ai, attr) in attrs.iter().enumerate() {
-		if let Some(tj) = targets.iter().position(|&t| t == ai) {
-			match &attr.kind {
-				Kind::Categorical(cats) | Kind::Ordinal(cats) => {
-					for (r, row) in rows.iter().enumerate() {
-						let v = cell(row, ai);
-						y[r * k + tj] = cats
-							.iter()
-							.position(|c| c == v)
-							.map_or(f64::NAN, |p| p as f64);
-					}
-				}
-				Kind::Numeric => {
-					for (r, row) in rows.iter().enumerate() {
-						y[r * k + tj] =
-							cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
-					}
-				}
-				Kind::Temporal => {
-					for (r, row) in rows.iter().enumerate() {
-						let c = cell(row, ai);
-						y[r * k + tj] =
-							c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
-					}
-				}
-				Kind::Text(_) => {
-					panic!("target '{}' is free text — not a valid target", attr.name);
-				}
-				Kind::Image => {
-					panic!("target '{}' is image data — not a valid target", attr.name);
-				}
-			}
+		if is_skip(ai) && !is_target(ai) {
 			continue;
 		}
-		if is_skip(ai) {
-			continue;
-		}
-		match &attr.kind {
-			Kind::Numeric => {
-				names.push(attr.name.clone());
-				let mut col = vec![0.0f64; n];
-				for (r, row) in rows.iter().enumerate() {
-					col[r] = cell(row, ai).parse::<f64>().unwrap_or(f64::NAN);
-				}
-				cols.push(col);
-			}
-			Kind::Temporal => {
-				names.push(attr.name.clone());
-				let mut col = vec![0.0f64; n];
-				for (r, row) in rows.iter().enumerate() {
-					let c = cell(row, ai);
-					col[r] = c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
-				}
-				cols.push(col);
-			}
-			Kind::Categorical(cats) => {
-				for cat in cats {
-					names.push(format!("{}={cat}", attr.name));
-					let mut col = vec![0.0f64; n];
-					for (r, row) in rows.iter().enumerate() {
-						if cell(row, ai) == cat {
-							col[r] = 1.0;
-						}
-					}
-					cols.push(col);
-				}
-			}
-			Kind::Ordinal(cats) => {
-				names.push(attr.name.clone());
-				let mut col = vec![f64::NAN; n];
-				for (r, row) in rows.iter().enumerate() {
-					let v = cell(row, ai);
-					if let Some(p) = cats.iter().position(|c| c == v) {
-						col[r] = p as f64;
-					}
-				}
-				cols.push(col);
-			}
-			Kind::Text(vocab) => {
-				let seq_len: usize = rows
-					.iter()
-					.map(|row| tokenize(cell(row, ai)).count())
-					.max()
-					.unwrap_or(1);
-				let base = cols.len();
-				for s in 0..seq_len {
-					names.push(format!("{}#t{s}", attr.name));
-					cols.push(vec![0.0f64; n]);
-				}
-				let per_row: Vec<Vec<f64>> = rows
-					.par_iter()
-					.map(|row| {
-						let mut ids = vec![0.0f64; seq_len];
-						for (s, tok) in
-							tokenize(cell(row, ai)).take(seq_len).enumerate()
-						{
-							ids[s] = vocab
-								.binary_search(&tok)
-								.map_or(0.0, |p| (p + 1) as f64);
-						}
-						ids
-					})
-					.collect();
-				for (r, ids) in per_row.iter().enumerate() {
-					for s in 0..seq_len {
-						cols[base + s][r] = ids[s];
-					}
-				}
-			}
-			Kind::Image => {
-				panic!(
-					"image column '{}' not yet supported — .exclude() it",
-					attr.name
-				);
+		let (cnames, ccols) = encode_kind(attr, rows, ai, width(ai, attr));
+		match targets.iter().position(|&t| t == ai) {
+			Some(tj) => tcols[tj] = ccols,
+			None => {
+				names.extend(cnames);
+				cols.extend(ccols);
 			}
 		}
 	}
+	let ycols: Vec<Vec<f64>> = tcols.into_iter().flatten().collect();
+	let k = ycols.len();
 	let w = cols.len();
 	let mut data = vec![0.0f64; n * w];
 	for (j, col) in cols.iter().enumerate() {
@@ -391,10 +366,17 @@ fn encode(
 			data[i * w + j] = *v;
 		}
 	}
+	let mut ydata = vec![0.0f64; n * k];
+	for (j, col) in ycols.iter().enumerate() {
+		for (i, v) in col.iter().enumerate() {
+			ydata[i * k + j] = *v;
+		}
+	}
 	(
 		names,
 		Mat::from_shape_vec((n, w), data).expect("encode: reshape"),
-		Vec1::from(y),
+		Vec1::from(ydata),
+		k,
 	)
 }
 
@@ -500,7 +482,7 @@ fn encode_group(
 	schema_in: Option<&Schema>,
 	target_cols: &[usize],
 	exclude: &[String],
-) -> (Vec<String>, Mat, Vec1) {
+) -> (Vec<String>, Mat, Vec1, usize) {
 	match g {
 		DirGroup::Table {
 			name,
@@ -516,9 +498,9 @@ fn encode_group(
 			schema.insert(name.clone(), attrs.clone());
 
 			let skip = exclude_mask(&attrs, name, exclude);
-			let (fnames, x, y) = encode(&attrs, cells, target_cols, &skip);
+			let (fnames, x, y, k) = encode(&attrs, cells, target_cols, &skip);
 			let names = fnames.iter().map(|f| namespaced(name, f)).collect();
-			(names, x, y)
+			(names, x, y, k)
 		}
 		DirGroup::Image {
 			name, dim, pixels, ..
@@ -534,7 +516,7 @@ fn encode_group(
 				.map(|i| namespaced(name, &format!("px{i}")))
 				.collect();
 			let x = Mat::from_shape_vec((n, *dim), data).expect("image reshape");
-			(names, x, Vec1::zeros(n))
+			(names, x, Vec1::zeros(n), 0)
 		}
 	}
 }
@@ -595,9 +577,7 @@ fn assemble(
 			}
 		};
 	}
-	let n_targets = target_cols.len();
-
-	let (s_names, s_x, y) = encode_group(
+	let (s_names, s_x, y, n_targets) = encode_group(
 		&groups[sample_idx],
 		&mut schema,
 		schema_in,
@@ -674,7 +654,7 @@ fn assemble(
                   ));
 			continue;
 		}
-		let (g_names, g_x, _gy) = encode_group(g, &mut schema, schema_in, &[], exclude);
+		let (g_names, g_x, _gy, _gk) = encode_group(g, &mut schema, schema_in, &[], exclude);
 
 		let src: Vec<Option<usize>> = (0..n)
 			.map(|i| {
@@ -1002,9 +982,9 @@ impl Data {
 	}
 
 	fn prepare_arff(&self) -> (Dataset, Option<Dataset>) {
-		let k = self.targets.len().max(1);
 		let skip = exclude_mask(&self.attrs, "", &self.exclude);
-		let (names, x, y) = encode(&self.attrs, &self.rows, &self.targets, &skip);
+		let (names, x, y, enc_k) = encode(&self.attrs, &self.rows, &self.targets, &skip);
+		let k = enc_k.max(1);
 		let tc = text_col_indices(&names);
 		let oh = onehot_group_indices(&names);
 		if let Some(frac) = self.split_frac {
@@ -1012,7 +992,7 @@ impl Data {
 			(tr, Some(te))
 		} else if let Some(tp) = &self.test_path {
 			let (_, trows) = crate::data::parse_arff(tp);
-			let (_, tx, ty) = encode(&self.attrs, &trows, &self.targets, &skip);
+			let (_, tx, ty, _) = encode(&self.attrs, &trows, &self.targets, &skip);
 			(
 				Dataset {
 					x,
