@@ -33,21 +33,42 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let disk = std::fs::metadata(path)
 		.map(|m| m.len() as usize)
 		.unwrap_or(0);
+	// Read EVERY line as a record (no implicit header) so the first row can be
+	// inspected before deciding its role — a CSV carries no header flag.
 	let mut rdr = csv::ReaderBuilder::new()
-		.has_headers(true)
+		.has_headers(false)
 		.flexible(true)
 		.from_path(path)
 		.with_context(|| format!("failed to open {}", path.display()))?;
-	let headers: Vec<String> = rdr
-		.byte_headers()
-		.with_context(|| "failed to read CSV headers")?
+	let mut records = rdr.byte_records();
+	let Some(first) = records.next() else {
+		return Ok((Vec::new(), Vec::new())); // empty file → no columns
+	};
+	let first = first.with_context(|| "failed to read first CSV record")?;
+	let first_cells: Vec<String> = first
 		.iter()
 		.map(|s| String::from_utf8_lossy(s).into_owned())
 		.collect();
-	let w = headers.len();
-	let overhead = std::mem::size_of::<String>();
+	let w = first_cells.len();
 
-	let est_rows = count_lines(path)?.saturating_sub(1);
+	// Header detection is a CSV-format question, not a content heuristic: a header
+	// row names columns, so at least one cell is a non-number. If EVERY cell parses
+	// as f64 (ints, decimals, signs, scientific notation), the first row is data,
+	// not names — synthesize col_0..col_{w-1} and keep the row. Binary structural
+	// test, no thresholds.
+	let headerless = !first_cells.is_empty()
+		&& first_cells.iter().all(|c| {
+			let t = c.trim();
+			!t.is_empty() && t.parse::<f64>().is_ok()
+		});
+	let headers: Vec<String> = if headerless {
+		(0..w).map(|j| format!("col_{j}")).collect()
+	} else {
+		first_cells.clone()
+	};
+
+	let overhead = std::mem::size_of::<String>();
+	let est_rows = count_lines(path)?.saturating_sub(usize::from(!headerless));
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	if proj > avail / 10 * 9 {
@@ -65,17 +86,20 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 			human_bytes(avail)
 		);
 	}
+	let na = |cell: &str| match cell {
+		"NA" | "NaN" | "nan" => String::new(),
+		s => s.to_string(),
+	};
 	let mut rows: Vec<Vec<String>> = Vec::new();
-	for result in rdr.byte_records() {
+	if headerless {
+		rows.push(first_cells.iter().map(|c| na(c)).collect());
+	}
+	for result in records {
 		let record = result.with_context(|| "failed to read CSV record")?;
 		let mut row = Vec::with_capacity(w);
 		for j in 0..w {
 			let cell = record.get(j).map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
-			let val = match cell.as_ref() {
-				"NA" | "NaN" | "nan" => String::new(),
-				s => s.to_string(),
-			};
-			row.push(val);
+			row.push(na(cell.as_ref()));
 		}
 		rows.push(row);
 	}
@@ -553,4 +577,47 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<(Mat
 	let x = Array2::from_shape_vec((n, row_len), data)?;
 	let y = Array1::from_vec(labels);
 	Ok((x, y))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod header_detection_tests {
+	use super::read_raw_csv;
+	use std::io::Write as _;
+
+	fn tmp(name: &str, body: &str) -> std::path::PathBuf {
+		let p = std::env::temp_dir().join(format!("nrs_hdr_{}_{name}", std::process::id()));
+		let mut f = std::fs::File::create(&p).unwrap();
+		f.write_all(body.as_bytes()).unwrap();
+		p
+	}
+
+	// All-numeric first row → no header: synthesize col_N and KEEP that row as data.
+	#[test]
+	fn headerless_numeric_first_row_is_data() {
+		let p = tmp("numeric.csv", "1.0,2,3.29662E-05\n4,5,6\n-7,8.5,9\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["col_0", "col_1", "col_2"]);
+		assert_eq!(rows.len(), 3, "first numeric row must be kept, not eaten");
+		assert_eq!(rows[0], vec!["1.0", "2", "3.29662E-05"]);
+	}
+
+	// A first row with any non-number is a real header: used verbatim, not kept as data.
+	#[test]
+	fn named_first_row_is_header() {
+		let p = tmp("named.csv", "age,city,score\n31,nyc,9.5\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["age", "city", "score"]);
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0], vec!["31", "nyc", "9.5"]);
+	}
+
+	// Single numeric column (the VNA targets shape) → col_0, every value retained.
+	#[test]
+	fn single_numeric_column_headerless() {
+		let p = tmp("single.csv", "3.29662E-05\n1.1\n2.2\n3.3\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["col_0"]);
+		assert_eq!(rows.len(), 4);
+	}
 }
