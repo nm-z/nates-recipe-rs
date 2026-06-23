@@ -53,7 +53,7 @@ pub struct Dataset {
 	pub n_targets: usize,
 	pub has_target: bool,
 	pub text_cols: Vec<usize>,
-	pub(crate) onehot_groups: Vec<(usize, usize)>,
+	pub onehot_groups: Vec<(usize, usize)>,
 }
 
 /// The `Dataset → Mat` seam for the embed-on-categoricals path: collapse each

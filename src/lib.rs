@@ -48,10 +48,6 @@ mod train;
 #[path = "utils/model.rs"]
 pub mod model;
 
-#[doc(hidden)]
-#[path = "utils/detect.rs"]
-pub mod detect;
-
 #[doc(inline)]
 pub use dataset::Data;
 #[doc(hidden)]
