@@ -537,3 +537,102 @@ extern "C" void launch_bn_update_running(
       hipLaunchKernelGGL(attn_bn_update_running_kernel, grid, block, 0, stream,
             run_mean, run_var, save_mean, save_var, momentum, c);
 }
+
+// ── Fused multi-head self-attention, f64, FlashAttention-style ─────────────
+// Inference KV-cache attention: K,V live in GPU memory (the cache, O(L·d)) and
+// are streamed through shared-memory tiles with an online softmax, so the L×L
+// score matrix is NEVER materialized — not in global memory, not in the kernel.
+// Bidirectional (every query attends every key), matching the training forward.
+//
+// Layout (matches model.rs a_q/a_k/a_v/a_ctx): q,k,v,out are [n, seq, d] row-major
+// with d = heads*hd; head hh occupies columns [hh*hd, hh*hd+hd). scale = 1/sqrt(hd).
+// Grid: (ceil(seq/FA_BQ), heads, n). Block: FA_BQ threads, thread t = one query row.
+// Shared: Qs[FA_BQ*hd] | Ks[FA_BK*hd] | Vs[FA_BK*hd] | As[FA_BQ*hd] (accumulators).
+
+#define FA_BQ 64
+#define FA_BK 64
+
+__global__ void flash_attn_f64_kernel(
+      const double* q, const double* k, const double* v, double* out,
+      int n, int seq, int d, int heads
+) {
+      int hd = d / heads;
+      int qtile = blockIdx.x;
+      int hh = blockIdx.y;
+      int bi = blockIdx.z;
+      int tx = threadIdx.x;
+      int qpos = qtile * FA_BQ + tx;
+
+      double scale = 1.0 / sqrt((double)hd);
+
+      extern __shared__ double sh[];
+      double* Qs = sh;
+      double* Ks = Qs + FA_BQ * hd;
+      double* Vs = Ks + FA_BK * hd;
+      double* As = Vs + FA_BK * hd;
+
+      double m = -1.0e308;   // running max
+      double l = 0.0;        // running denom
+
+      // Load this thread's query row + zero its accumulator.
+      if (qpos < seq) {
+            const double* qrow = q + ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++) {
+                  Qs[tx * hd + c] = qrow[c];
+                  As[tx * hd + c] = 0.0;
+            }
+      }
+
+      for (int kt = 0; kt < seq; kt += FA_BK) {
+            // Cooperatively stage this K,V tile into shared memory.
+            for (int idx = tx; idx < FA_BK * hd; idx += FA_BQ) {
+                  int kj = idx / hd;
+                  int cc = idx % hd;
+                  int kpos = kt + kj;
+                  if (kpos < seq) {
+                        long base = ((long)bi * seq + kpos) * d + hh * hd;
+                        Ks[idx] = k[base + cc];
+                        Vs[idx] = v[base + cc];
+                  }
+            }
+            __syncthreads();
+
+            if (qpos < seq) {
+                  int tile = (seq - kt < FA_BK) ? (seq - kt) : FA_BK;
+                  for (int kj = 0; kj < tile; kj++) {
+                        double dot = 0.0;
+                        for (int c = 0; c < hd; c++)
+                              dot += Qs[tx * hd + c] * Ks[kj * hd + c];
+                        double s = dot * scale;
+                        double m_new = (s > m) ? s : m;
+                        double resc = exp(m - m_new);
+                        double e = exp(s - m_new);
+                        for (int c = 0; c < hd; c++)
+                              As[tx * hd + c] = As[tx * hd + c] * resc + Vs[kj * hd + c] * e;
+                        l = l * resc + e;
+                        m = m_new;
+                  }
+            }
+            __syncthreads();
+      }
+
+      if (qpos < seq) {
+            double inv = (l > 0.0) ? 1.0 / l : 0.0;
+            double* orow = out + ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++)
+                  orow[c] = As[tx * hd + c] * inv;
+      }
+}
+
+extern "C" void launch_flash_attention_f64(
+      const double* q, const double* k, const double* v, double* out,
+      int n, int seq, int d, int heads, hipStream_t stream
+) {
+      int hd = d / heads;
+      int qtiles = (seq + FA_BQ - 1) / FA_BQ;
+      dim3 grid(qtiles, heads, n);
+      dim3 block(FA_BQ);
+      size_t shared_bytes = (size_t)(2 * FA_BQ + 2 * FA_BK) * hd * sizeof(double);
+      hipLaunchKernelGGL(flash_attn_f64_kernel, grid, block, shared_bytes, stream,
+            q, k, v, out, n, seq, d, heads);
+}

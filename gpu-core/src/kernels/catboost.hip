@@ -25,26 +25,6 @@ extern "C" void launch_iota(int* out, int n, hipStream_t stream) {
 // then runs the k/j double loop of launch_bitonic_step_idx. After the sort,
 // vals[0..n) is the permutation (the caller copies it to its perm output).
 
-__global__ void bitonic_step_idx_kernel_cb(double* keys, int* vals, int j, int k, int padded_n) {
-      int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i >= padded_n) return;
-      int ixj = i ^ j;
-      if (ixj > i) {
-            int ascending = ((i & k) == 0) ? 1 : 0;
-            double ka = keys[i], kb = keys[ixj];
-            if ((ascending && ka > kb) || (!ascending && ka < kb)) {
-                  keys[i] = kb; keys[ixj] = ka;
-                  int vi = vals[i], vj = vals[ixj];
-                  vals[i] = vj; vals[ixj] = vi;
-            }
-      }
-}
-
-extern "C" void launch_bitonic_step_idx(double* keys, int* vals, int j, int k, int padded_n, hipStream_t stream) {
-      dim3 b(256), g((padded_n + 255) / 256);
-      hipLaunchKernelGGL(bitonic_step_idx_kernel_cb, g, b, 0, stream, keys, vals, j, k, padded_n);
-}
-
 __global__ void fill_sentinel_f64_kernel(double* data, int real_n, int padded_n, double sentinel) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= real_n && i < padded_n) data[i] = sentinel;

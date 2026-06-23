@@ -21,6 +21,8 @@ kaggle_s6e4/cache/
 *.a
 *.rlib
 .claude/worktrees/
+.directory
+.vscode/
 
 # Local dataset symlink (machine-specific absolute path)
 /german_credit.arff
@@ -28,6 +30,9 @@ engi_results.db
 engi/
 
 CLAUDE.md
+
+# Training corpus / datasets (moved out of examples/ — never commit the data)
+/datasets/
 examples/*/train*.csv
 examples/*/test*.csv
 examples/*/sample*.csv
@@ -36,3 +41,4 @@ examples/*/*.csv
 examples/*/train_images/
 examples/*/test_images/
 !examples/cookbook.rs
+!examples/train_detector.rs

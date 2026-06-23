@@ -36,6 +36,15 @@ unsafe extern "C" {
 		alpha: f64,
 		stream: *mut c_void,
 	);
+	fn launch_focal_grad(
+		prob: *const c_void,
+		target: *const c_void,
+		grad_out: *mut c_void,
+		n: i32,
+		gamma: f64,
+		alpha: f64,
+		stream: *mut c_void,
+	);
 	fn launch_kl_div_loss(
 		log_p: *const c_void,
 		target: *const c_void,
@@ -163,6 +172,54 @@ pub fn gpu_focal_loss(
 	}
 	crate::kernels::check_launch();
 	Ok((loss, grad))
+}
+
+/// Focal loss + grad into preallocated buffers (no allocation — training-loop safe).
+pub fn gpu_focal_into(
+	prob: &GpuBuffer,
+	target: &GpuBuffer,
+	loss_out: &GpuBuffer,
+	grad_out: &GpuBuffer,
+	gamma: f64,
+	alpha: f64,
+	n: usize,
+) {
+	unsafe {
+		launch_focal_loss(
+			prob.ptr_raw() as *const c_void,
+			target.ptr_raw() as *const c_void,
+			loss_out.ptr_raw(),
+			grad_out.ptr_raw(),
+			n as i32,
+			gamma,
+			alpha,
+			std::ptr::null_mut(),
+		);
+	}
+	crate::kernels::check_launch();
+}
+
+/// Focal gradient (d loss / d prob, scaled 1/n) into a preallocated buffer.
+pub fn gpu_focal_grad_into(
+	prob: &GpuBuffer,
+	target: &GpuBuffer,
+	grad_out: &GpuBuffer,
+	gamma: f64,
+	alpha: f64,
+	n: usize,
+) {
+	unsafe {
+		launch_focal_grad(
+			prob.ptr_raw() as *const c_void,
+			target.ptr_raw() as *const c_void,
+			grad_out.ptr_raw(),
+			n as i32,
+			gamma,
+			alpha,
+			std::ptr::null_mut(),
+		);
+	}
+	crate::kernels::check_launch();
 }
 
 pub fn gpu_kl_div_loss(

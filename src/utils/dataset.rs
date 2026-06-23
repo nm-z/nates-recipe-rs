@@ -1,52 +1,16 @@
 use crate::{Mat, Vec1};
+use pantry::{Attr, Kind};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
-fn is_image_ext(s: &str) -> bool {
-	let lower = s.to_ascii_lowercase();
-	lower.ends_with(".png")
-		|| lower.ends_with(".jpg")
-		|| lower.ends_with(".jpeg")
-		|| lower.ends_with(".bmp")
-		|| lower.ends_with(".gif")
-		|| lower.ends_with(".webp")
-}
-
-fn is_base64(s: &str) -> bool {
-	use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD};
-	[&BASE64, &BASE64_NOPAD, &BASE64URL, &BASE64URL_NOPAD]
-		.iter()
-		.any(|enc| enc.decode(s.as_bytes()).is_ok())
-}
-
-/// Tokenize text into lowercased alphanumeric tokens (whitespace/punctuation are
-/// separators). Used both to build a column's vocabulary and to emit token ids.
 fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 	s.split(|c: char| !c.is_alphanumeric())
 		.filter(|t| !t.is_empty())
 		.map(|t| t.to_ascii_lowercase())
 }
 
-#[derive(Clone)]
-pub(crate) enum Kind {
-	Numeric,
-	Temporal,
-	Categorical(Vec<String>),
-	// Ordinal(Vec<String>),
-	Text(Vec<String>),
-	Image,
-}
-
-#[derive(Clone)]
-pub(crate) struct Attr {
-	pub(crate) name: String,
-	pub(crate) kind: Kind,
-}
-
-/// Accepts one target column (`"y"`) or several (`["a","b","c"]`) for `.target`.
-/// Rust methods aren't variadic, so multiple columns come in as an array/slice.
 pub trait IntoTargets {
 	fn into_targets(self) -> Vec<String>;
 }
@@ -66,16 +30,6 @@ impl IntoTargets for &[&str] {
 	}
 }
 
-/// Data loader: CSV, ARFF, or a directory of correlated files.
-///
-/// ```rust,no_run
-/// # use nates_recipe::*;
-/// let data = Data::load()
-///     .set("train.csv")
-///     .test("test.csv")
-///     .exclude("Id")
-///     .target("Price");
-/// ```
 pub struct Data {
 	pub target: &'static str,
 	pub set: Dataset,
@@ -94,93 +48,65 @@ pub struct Data {
 
 pub struct Dataset {
 	pub x: Mat,
-	// Targets, flat row-major: n*n_targets values, row r's targets at [r*k .. r*k+k].
-	// For a single target this is just the n-long column (k=1), unchanged.
 	pub y: Vec1,
 	pub source: String,
-	// Number of target columns (k). Output layer must have this many units.
 	pub n_targets: usize,
-	// True when the target column(s) were present in this set (train always; a
-	// Kaggle test.csv has no target → false → eval skips scoring, still predicts).
 	pub has_target: bool,
-	// Indices of `x` columns that are token-id columns (from free-text columns,
-	// named `*#t{s}`). When non-empty, an `embed` layer consumes these. When
-	// empty and `onehot_groups` is non-empty, embed collapses categoricals to
-	// integer indices at runtime instead.
 	pub text_cols: Vec<usize>,
-	// Contiguous one-hot column groups from categoricals: (start_col, num_categories).
-	// When an `embed` layer is present but text_cols is empty, these groups are
-	// collapsed to integer-index columns and embedded directly.
 	pub(crate) onehot_groups: Vec<(usize, usize)>,
 }
 
-/// Split one ARFF/CSV line into trimmed, unquoted fields, respecting single-quote quoting.
-fn split_fields(line: &str) -> Vec<String> {
-	let mut out = Vec::new();
-	let mut cur = String::new();
-	let mut quoted = false;
-	for c in line.chars() {
-		match c {
-			'\'' => quoted = !quoted,
-			',' if !quoted => {
-				out.push(cur.trim().to_string());
-				cur.clear();
+/// The `Dataset → Mat` seam for the embed-on-categoricals path: collapse each
+/// one-hot group back to a single integer-index column (each category a unique
+/// id, offset across groups) so an `embed` layer can look them up directly.
+/// Returns `(collapsed matrix, the new embed-column indices, total vocab size)`.
+/// Lives here, not in `recipe-infer`, because it is the one place inference needs
+/// to know what a `Dataset` is — and that knowledge stays up in this crate.
+pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
+	let n = ds.x.nrows();
+	let ncols = ds.x.ncols();
+	let mut in_group = vec![false; ncols];
+	for &(start, len) in &ds.onehot_groups {
+		for c in start..start + len {
+			in_group[c] = true;
+		}
+	}
+	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group[*c]).collect();
+	let n_cat = ds.onehot_groups.len();
+	let new_ncols = passthrough.len() + n_cat;
+	let mut data = vec![0.0f64; n * new_ncols];
+	for (new_j, &orig_j) in passthrough.iter().enumerate() {
+		for i in 0..n {
+			data[i * new_ncols + new_j] = ds.x[[i, orig_j]];
+		}
+	}
+	let embed_start = passthrough.len();
+	let mut offset = 0usize;
+	for (g, &(start, len)) in ds.onehot_groups.iter().enumerate() {
+		let new_j = embed_start + g;
+		for i in 0..n {
+			for c in 0..len {
+				if ds.x[[i, start + c]] > 0.5 {
+					data[i * new_ncols + new_j] = (offset + c) as f64;
+					break;
+				}
 			}
-			_ => cur.push(c),
 		}
+		offset += len;
 	}
-	out.push(cur.trim().to_string());
-	out
+	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
+	let x = Mat::from_shape_vec((n, new_ncols), data).expect("collapse_onehot");
+	(x, embed_cols, offset)
 }
 
-/// Read + parse an ARFF file into (attributes, data rows). Exits on read error.
-fn parse_arff(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
-	let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-		if e.kind() == std::io::ErrorKind::NotFound {
-			let cwd = std::env::current_dir()
-				.map(|p| p.display().to_string())
-				.unwrap_or_else(|_| ".".to_string());
-			let name = std::path::Path::new(path)
-				.file_name()
-				.and_then(|s| s.to_str())
-				.unwrap_or(path);
-			panic!("couldn't find '{name}' in {cwd}");
-		} else {
-			panic!("Data: cannot read {path}: {e}");
-		}
-	});
-	let mut attrs = Vec::new();
-	let mut rows = Vec::new();
-	let mut in_data = false;
-	for raw in text.lines() {
-		let line = raw.trim();
-		if line.is_empty() || line.starts_with('%') {
-			continue;
-		}
-		if in_data {
-			rows.push(split_fields(line));
-			continue;
-		}
-		let lower = line.to_ascii_lowercase();
-		if lower.starts_with("@attribute") {
-			attrs.push(parse_attribute(line));
-		} else if lower.starts_with("@data") {
-			in_data = true;
-		}
-	}
-	assert!(!attrs.is_empty(), "Data: no @attribute lines in {path}");
-	assert!(!rows.is_empty(), "Data: no @data rows in {path}");
-	(attrs, rows)
-}
-
-/// Cell `j` of a raw row as `&str` (missing/short → "").
 fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
 
-
 fn date_to_f64(s: &str) -> f64 {
-	let parts: Vec<&str> = s.split(|c: char| c == '-' || c == '/' || c == 'T' || c == ' ').collect();
+	let parts: Vec<&str> = s
+		.split(|c: char| c == '-' || c == '/' || c == 'T' || c == ' ')
+		.collect();
 	if parts.len() >= 3 {
 		if let (Ok(y), Ok(m), Ok(d)) = (
 			parts[0].parse::<f64>(),
@@ -193,42 +119,85 @@ fn date_to_f64(s: &str) -> f64 {
 	f64::NAN
 }
 
+fn is_missing(c: &str) -> bool {
+	c.is_empty()
+		|| matches!(
+			c,
+			"NA" | "NaN" | "nan" | "N/A" | "NULL" | "null" | "None" | "none" | "?" | "." | "-"
+		)
+}
+
+fn col_vocab(rows: &[Vec<String>], j: usize) -> Vec<String> {
+	let set = rows
+		.par_iter()
+		.fold(std::collections::HashSet::<String>::new, |mut acc, row| {
+			acc.extend(tokenize(cell(row, j)));
+			acc
+		})
+		.reduce(std::collections::HashSet::<String>::new, |a, b| {
+			let (mut big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+			big.extend(small);
+			big
+		});
+	let mut vocab: Vec<String> = set.into_iter().collect();
+	vocab.par_sort_unstable();
+	vocab
+}
+
+fn distinct_sorted(rows: &[Vec<String>], j: usize) -> Vec<String> {
+	let mut cats: Vec<String> = rows
+		.iter()
+		.map(|row| cell(row, j))
+		.filter(|c| !is_missing(c))
+		.map(str::to_string)
+		.collect::<std::collections::HashSet<_>>()
+		.into_iter()
+		.collect();
+	cats.sort_unstable();
+	cats
+}
+
 fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
-	let attrs: Vec<Attr> = headers
+	let non_empty: Vec<Vec<&str>> = (0..headers.len())
+		.map(|j| {
+			rows.iter()
+				.map(|row| cell(row, j))
+				.filter(|c| !is_missing(c))
+				.collect()
+		})
+		.collect();
+	let to_predict: Vec<usize> = (0..headers.len())
+		.filter(|&j| known.and_then(|k| k.get(j)).is_none() && !non_empty[j].is_empty())
+		.collect();
+	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
+	let preds = pantry::predict_kinds(&cols);
+	let mut pred = std::collections::HashMap::new();
+	for (i, &j) in to_predict.iter().enumerate() {
+		pred.insert(j, preds[i]);
+	}
+	headers
 		.iter()
 		.enumerate()
 		.map(|(j, name)| {
-			if let Some(sa) = known.and_then(|k| k.get(j)) {
-				return Attr {
-					name: name.clone(),
-					kind: sa.kind.clone(),
-				};
-			}
-			let is_missing = |c: &str| c.is_empty() || matches!(c, "NA" | "NaN" | "nan" | "N/A" | "NULL" | "null" | "None" | "none" | "?" | "." | "-");
-			let non_empty: Vec<&str> = rows.iter().map(|row| cell(row, j)).filter(|c| !is_missing(c)).collect();
-			if non_empty.is_empty() {
-				return Attr { name: name.clone(), kind: Kind::Numeric };
-			}
-			let kind = if non_empty.iter().all(|c| is_image_ext(c) || is_base64(c)) {
-				Kind::Image
-			} else {
+			let kind = if let Some(sa) = known.and_then(|k| k.get(j)) {
+				sa.kind.clone()
+			} else if non_empty[j].is_empty() {
 				Kind::Numeric
+			} else {
+				match pred[&j] {
+					pantry::KIND_NUMERIC => Kind::Numeric,
+					pantry::KIND_TEMPORAL => Kind::Temporal,
+					pantry::KIND_CATEGORICAL => Kind::Categorical(distinct_sorted(rows, j)),
+					pantry::KIND_ORDINAL => Kind::Ordinal(distinct_sorted(rows, j)),
+					pantry::KIND_TEXT => Kind::Text(col_vocab(rows, j)),
+					_ => Kind::Image,
+				}
 			};
-			Attr {
-				name: name.clone(),
-				kind,
-			}
+			Attr { name: name.clone(), kind }
 		})
-		.collect();
-	attrs
+		.collect()
 }
 
-/// Encode raw `rows` against `attrs` into `(feature_names, X, y)`. Feature
-/// numerics/temporals pass through; categoricals one-hot as `name=cat`; text
-/// tokenized to token-id columns. Targets are label-encoded for Categorical
-/// and parsed for Numeric/Temporal; a blank/unseen value → NaN. `y` is flat,
-/// row-major n*k (k = targets.len()), so row r's targets are y[r*k .. r*k+k].
-/// With `targets = []`, every column is a feature and `y` is empty.
 fn encode(
 	attrs: &[Attr],
 	rows: &[Vec<String>],
@@ -237,11 +206,7 @@ fn encode(
 ) -> (Vec<String>, Mat, Vec1) {
 	let n = rows.len();
 	let k = targets.len();
-	// RAM guard BEFORE any one-hot column is allocated: project the feature width
-	// from each KEPT column's cardinality (Nominal → one col per category). A
-	// free-text/ID column explodes to ~n columns → an n×n dense matrix. If that
-	// won't fit, fail clean naming the biggest expansions and exit — no silent
-	// cap, the user `.exclude()`s the offenders and decides.
+
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
 	let text_seq_lens: Vec<usize> = attrs
@@ -257,10 +222,13 @@ fn encode(
 		})
 		.collect();
 	let width = |ai: usize, a: &Attr| match &a.kind {
-		Kind::Numeric | Kind::Temporal => 1,
+		Kind::Numeric | Kind::Temporal | Kind::Ordinal(_) => 1,
 		Kind::Categorical(c) => c.len(),
 		Kind::Text(_) => text_seq_lens[ai].max(1),
-		Kind::Image => panic!("image columns not yet supported — .exclude() the column"),
+		Kind::Image => panic!(
+			"image column '{}' not yet supported — .exclude(\"{}\")",
+			a.name, a.name
+		),
 	};
 	let proj_w: usize = attrs
 		.iter()
@@ -271,7 +239,7 @@ fn encode(
 	let bytes = n
 		.saturating_mul(proj_w)
 		.saturating_mul(std::mem::size_of::<f64>());
-	let avail = available_ram_bytes();
+	let avail = pantry::available_ram_bytes();
 	if bytes > avail / 10 * 9 {
 		let mut top: Vec<(&str, usize)> = attrs
 			.iter()
@@ -302,7 +270,7 @@ fn encode(
 	for (ai, attr) in attrs.iter().enumerate() {
 		if let Some(tj) = targets.iter().position(|&t| t == ai) {
 			match &attr.kind {
-				Kind::Categorical(cats) => {
+				Kind::Categorical(cats) | Kind::Ordinal(cats) => {
 					for (r, row) in rows.iter().enumerate() {
 						let v = cell(row, ai);
 						y[r * k + tj] = cats
@@ -320,7 +288,8 @@ fn encode(
 				Kind::Temporal => {
 					for (r, row) in rows.iter().enumerate() {
 						let c = cell(row, ai);
-						y[r * k + tj] = c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
+						y[r * k + tj] =
+							c.parse::<f64>().unwrap_or_else(|_| date_to_f64(c));
 					}
 				}
 				Kind::Text(_) => {
@@ -365,8 +334,20 @@ fn encode(
 					cols.push(col);
 				}
 			}
+			Kind::Ordinal(cats) => {
+				names.push(attr.name.clone());
+				let mut col = vec![f64::NAN; n];
+				for (r, row) in rows.iter().enumerate() {
+					let v = cell(row, ai);
+					if let Some(p) = cats.iter().position(|c| c == v) {
+						col[r] = p as f64;
+					}
+				}
+				cols.push(col);
+			}
 			Kind::Text(vocab) => {
-				let seq_len: usize = rows.iter()
+				let seq_len: usize = rows
+					.iter()
 					.map(|row| tokenize(cell(row, ai)).count())
 					.max()
 					.unwrap_or(1);
@@ -396,7 +377,10 @@ fn encode(
 				}
 			}
 			Kind::Image => {
-				panic!("image column '{}' not yet supported — .exclude() it", attr.name);
+				panic!(
+					"image column '{}' not yet supported — .exclude() it",
+					attr.name
+				);
 			}
 		}
 	}
@@ -416,23 +400,17 @@ fn encode(
 
 use crate::data::DirGroup;
 
-/// Per-group inferred schema, so a `.test` source encodes against the SET's
-/// categories (keyed by group name; `""` for a single un-grouped file).
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
 
-/// A source assembled into one training table: namespaced feature `names`, design
-/// matrix `x`, target `y`, the `samples` count, and any groups `skipped` because
-/// their rows couldn't be hash-aligned to the sample group.
 struct Assembled {
 	names: Vec<String>,
-	// Parallel to `names`: (matrix index, column) locating each feature's values.
+
 	sources: Vec<(usize, usize)>,
-	// Per-source-matrix encoded values at that group's own row count (mats[0] is
-	// the sample group, n rows; others are un-broadcast group matrices).
+
 	mats: Vec<Mat>,
-	// Per matrix, per-sample source row (None → NaN). gather[0] is identity.
+
 	gather: Vec<Vec<Option<usize>>>,
-	// Targets, flat row-major n*n_targets.
+
 	y: Vec1,
 	n_targets: usize,
 	samples: usize,
@@ -442,20 +420,14 @@ struct Assembled {
 }
 
 impl Assembled {
-	/// Materialize the `keep` columns (in order) into a dense `n × keep.len()`
-	/// matrix, gathering each from its group matrix via that group's per-sample
-	/// index. Only kept columns are built — a dropped/excluded group costs nothing.
 	fn select(&self, keep: &[String]) -> Mat {
 		let n = self.samples;
 		let w = keep.len();
-		// The dense matrix is n×w×8B. If that won't fit in RAM, fail clean BEFORE
-		// allocating — and name the columns whose one-hot expansion blew it up
-		// (text/ID columns become one column per distinct value). No silent cap:
-		// the user excludes the offending columns and decides.
+
 		let bytes = n
 			.saturating_mul(w)
 			.saturating_mul(std::mem::size_of::<f64>());
-		let avail = available_ram_bytes();
+		let avail = pantry::available_ram_bytes();
 		if bytes > avail / 10 * 9 {
 			let mut by_col: std::collections::BTreeMap<&str, usize> =
 				std::collections::BTreeMap::new();
@@ -501,21 +473,7 @@ impl Assembled {
 	}
 }
 
-/// Available RAM in bytes (Linux MemAvailable). usize::MAX if it can't be read,
-/// so the guard never blocks a legitimate run on a parse failure.
-pub(crate) fn available_ram_bytes() -> usize {
-	std::fs::read_to_string("/proc/meminfo")
-		.ok()
-		.and_then(|s| {
-			s.lines()
-				.find(|l| l.starts_with("MemAvailable:"))
-				.and_then(|l| l.split_whitespace().nth(1))
-				.and_then(|v| v.parse::<usize>().ok())
-		})
-		.map_or(usize::MAX, |kb| kb.saturating_mul(1024))
-}
 
-/// Namespaced feature name: bare for an un-grouped file, `group:col` for a dir.
 fn namespaced(group: &str, col: &str) -> String {
 	if group.is_empty() {
 		col.to_string()
@@ -524,8 +482,6 @@ fn namespaced(group: &str, col: &str) -> String {
 	}
 }
 
-/// Namespaced names of every TABLE column across the groups — the only target
-/// candidates (a pixel is never a target), used for target resolution.
 fn table_names(groups: &[DirGroup]) -> Vec<String> {
 	let mut out = Vec::new();
 	for g in groups {
@@ -538,28 +494,6 @@ fn table_names(groups: &[DirGroup]) -> Vec<String> {
 	out
 }
 
-/// Load a path into raw groups: a directory → one group per file type; a single
-/// file → one un-grouped Table (no hash). Encoding happens later, in `assemble`.
-fn load_groups(path: &str) -> Vec<DirGroup> {
-	if std::path::Path::new(path).is_dir() {
-		crate::data::load_dir_groups(path).expect("load dir")
-	} else {
-		let (headers, cells) =
-			crate::data::read_raw_csv(std::path::Path::new(path)).expect("read csv");
-		let hashes = vec![String::new(); cells.len()];
-		vec![DirGroup::Table {
-			name: String::new(),
-			headers,
-			hashes,
-			cells,
-		}]
-	}
-}
-
-/// Encode one group into `(namespaced_names, X, y)`. A Table uses its (set-inferred)
-/// schema; the target column is encoded into `y` only for the sample group
-/// (`target_col = Some`). An Image is already numeric. Hashes are read separately
-/// via `group_hashes` so a skipped group never needs encoding.
 fn encode_group(
 	g: &DirGroup,
 	schema: &mut Schema,
@@ -574,17 +508,13 @@ fn encode_group(
 			cells,
 			..
 		} => {
-			// Infer from THIS source's own headers (so a test with fewer/extra
-			// columns is encoded by name, not position), but reuse the SET's
-			// category lists for shared columns so one-hot columns match up.
 			let attrs = infer_attrs(
 				headers,
 				cells,
 				schema_in.and_then(|s| s.get(name)).map(Vec::as_slice),
 			);
 			schema.insert(name.clone(), attrs.clone());
-			// Excluded attrs are dropped HERE, before one-hot expansion, so a
-			// high-cardinality text/ID column is never materialized (no OOM).
+
 			let skip = exclude_mask(&attrs, name, exclude);
 			let (fnames, x, y) = encode(&attrs, cells, target_cols, &skip);
 			let names = fnames.iter().map(|f| namespaced(name, f)).collect();
@@ -609,19 +539,12 @@ fn encode_group(
 	}
 }
 
-/// Per-row hashes of a group (the sample-correlation ids), borrowed cheaply.
 fn group_hashes(g: &DirGroup) -> &[String] {
 	match g {
 		DirGroup::Table { hashes, .. } | DirGroup::Image { hashes, .. } => hashes,
 	}
 }
 
-/// Assemble raw `groups` into one table. The group owning `target` defines the
-/// samples (its rows, at full resolution); every other group is joined by hash —
-/// a 1-row-per-hash group broadcasts onto the sample rows, an equal-rows-per-hash
-/// group aligns by within-hash position, and a group whose row counts don't match
-/// is reported in `skipped` and left out (never aggregated). `schema_in` (the set
-/// schema) is reused so a test source encodes against the same categories.
 fn assemble(
 	groups: &[DirGroup],
 	targets: &[String],
@@ -631,8 +554,6 @@ fn assemble(
 ) -> (Assembled, Schema) {
 	let mut schema: Schema = Schema::new();
 
-	// The sample group is the table holding the target column(s); collect every
-	// target's column index within it (matched by namespaced name).
 	let mut sample_idx = 0usize;
 	let mut target_cols: Vec<usize> = Vec::new();
 	if !targets.is_empty() {
@@ -652,8 +573,7 @@ fn assemble(
 			}
 		}
 	}
-	// Target columns absent here (e.g. an unlabeled test source): keep the SET's
-	// sample group via `sample_hint`; else the sole group / sole table group.
+
 	if target_cols.is_empty() {
 		let by_hint = sample_hint.and_then(|h| groups.iter().position(|g| group_name(g) == h));
 		sample_idx = match by_hint {
@@ -677,10 +597,6 @@ fn assemble(
 	}
 	let n_targets = target_cols.len();
 
-	// Encode the sample group (carries the target). Its matrix backs mats[0] with
-	// an identity gather. Other groups push their OWN (un-broadcast) matrix plus a
-	// per-sample gather index — values are materialized later, only for kept
-	// columns, so a dropped/excluded image group never broadcasts (no blow-up).
 	let (s_names, s_x, y) = encode_group(
 		&groups[sample_idx],
 		&mut schema,
@@ -704,7 +620,6 @@ fn assemble(
 	gather.push((0..n).map(Some).collect());
 	mats.push(s_x);
 
-	// Sample-group hash bookkeeping: count per hash + each row's within-hash position.
 	let mut s_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
 	for h in s_hashes {
 		*s_count.entry(h.as_str()).or_insert(0) += 1;
@@ -723,17 +638,14 @@ fn assemble(
 		if gi == sample_idx {
 			continue;
 		}
-		// Decide the join from hashes ALONE — never encode a group we'll skip
-		// (a mismatched 5M-row group must not be materialized just to be dropped).
+
 		let g_hashes = group_hashes(g);
 		let mut by_hash: std::collections::HashMap<&str, Vec<usize>> =
 			std::collections::HashMap::new();
 		for (gi2, h) in g_hashes.iter().enumerate() {
 			by_hash.entry(h.as_str()).or_default().push(gi2);
 		}
-		// Unrelated table: shares no hash with the sample group (a separate table
-		// in a relational dump — e.g. Cities.csv vs SampleSubmission.csv). Report
-		// it, don't fabricate NaN columns by "joining" on nothing.
+
 		let shares = by_hash.keys().any(|h| s_count.contains_key(*h));
 		if !shares {
 			skipped.push(format!(
@@ -743,7 +655,7 @@ fn assemble(
 			continue;
 		}
 		let all_one = by_hash.values().all(|v| v.len() == 1);
-		// Aligns if, for every sample hash present in this group, counts match.
+
 		let aligns = s_count
 			.iter()
 			.all(|(h, &sc)| by_hash.get(*h).is_none_or(|v| v.len() == sc));
@@ -754,10 +666,7 @@ fn assemble(
                   ));
 			continue;
 		}
-		// An image group is one image per well: broadcasting its pixels into every
-		// sample row would duplicate it thousands of times (the 125 GB blow-up).
-		// Keep it OUT of the dense matrix — it stays one copy per well, linked by
-		// hash, for an index-based GPU path, not copied into rows here.
+
 		if matches!(g, DirGroup::Image { .. }) {
 			skipped.push(format!(
                         "{}: image group ({} wells) kept out of the feature matrix — one copy per well, not duplicated into rows",
@@ -766,8 +675,7 @@ fn assemble(
 			continue;
 		}
 		let (g_names, g_x, _gy) = encode_group(g, &mut schema, schema_in, &[], exclude);
-		// Per-sample source row in this group (or None → NaN), broadcast (1/hash)
-		// or position-aligned (equal counts). Values gathered lazily in `select`.
+
 		let src: Vec<Option<usize>> = (0..n)
 			.map(|i| {
 				let h = s_hashes[i].as_str();
@@ -805,17 +713,12 @@ fn assemble(
 	)
 }
 
-/// A group's display name (`""` un-grouped file shows as its path elsewhere).
 fn group_name(g: &DirGroup) -> &str {
 	match g {
 		DirGroup::Table { name, .. } | DirGroup::Image { name, .. } => name,
 	}
 }
 
-/// Per-attr drop mask for one group: true where the attr's namespaced name matches
-/// any `.exclude` pattern. Applied before one-hot expansion so excluded columns are
-/// never built (the only place a high-cardinality text/ID column can be stopped
-/// before it OOMs).
 fn exclude_mask(attrs: &[Attr], group: &str, exclude: &[String]) -> Vec<bool> {
 	attrs.iter()
 		.map(|a| {
@@ -825,8 +728,6 @@ fn exclude_mask(attrs: &[Attr], group: &str, exclude: &[String]) -> Vec<bool> {
 		.collect()
 }
 
-/// Does exclude `pattern` match feature `name`? Exact, `group:*` glob, group name,
-/// or bare header (the part after `:`).
 fn exclude_match(pattern: &str, name: &str) -> bool {
 	if pattern == name {
 		return true;
@@ -841,7 +742,6 @@ fn exclude_match(pattern: &str, name: &str) -> bool {
 }
 
 impl Data {
-	/// Start a data builder. Call `.set(path)` to load the predictors file.
 	pub fn load() -> Data {
 		Data {
 			target: "",
@@ -875,19 +775,19 @@ impl Data {
 	pub fn set(mut self, path: &str) -> Data {
 		self.sources.push(path.to_string());
 		if is_arff(path) {
-			let (attrs, rows) = parse_arff(path);
+			let (attrs, rows) = crate::data::parse_arff(path);
 			self.attrs = attrs;
 			self.rows = rows;
 		}
 		self
 	}
 
-	/// Name the target column(s): `.target("y")` or `.target(["a","b","c"])`.
-	/// For an ARFF set each is resolved to its attribute index now; for a tabular
-	/// set/dir they're matched against column names in `prepare`.
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.target_names = t.into_targets();
-		self.target = self.target_names.first().map_or("", |s| Box::leak(s.clone().into_boxed_str()));
+		self.target = self
+			.target_names
+			.first()
+			.map_or("", |s| Box::leak(s.clone().into_boxed_str()));
 		if !self.attrs.is_empty() {
 			self.targets = self
 				.target_names
@@ -906,15 +806,14 @@ impl Data {
 			if let Ok(text) = std::fs::read_to_string(tp) {
 				let mut lines = text.lines();
 				if let Some(header_line) = lines.next() {
-					self.raw_test_headers = Some(
-						split_fields(header_line).into_iter().map(|s| s.trim().to_string()).collect(),
-					);
-					self.raw_test_rows = Some(
-						lines
-							.filter(|l| !l.trim().is_empty())
-							.map(|l| split_fields(l))
-							.collect(),
-					);
+					self.raw_test_headers = Some(crate::data::split_fields(header_line)
+						.into_iter()
+						.map(|s| s.trim().to_string())
+						.collect());
+					self.raw_test_rows = Some(lines
+						.filter(|l| !l.trim().is_empty())
+						.map(|l| crate::data::split_fields(l))
+						.collect());
 				}
 			}
 		}
@@ -928,11 +827,9 @@ impl Data {
 
 	fn feature_type_counts(&self) -> Vec<(&'static str, usize)> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
-		let is_excluded = |name: &str| {
-			self.exclude.iter().any(|p| exclude_match(p, name))
-		};
-		let (mut numeric, mut temporal, mut categorical, mut text, mut image) =
-			(0usize, 0usize, 0usize, 0usize, 0usize);
+		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
+		let (mut numeric, mut temporal, mut categorical, mut ordinal, mut text, mut image) =
+			(0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
 		for a in &self.attrs {
 			if is_target(&a.name) || is_excluded(&a.name) {
 				continue;
@@ -941,6 +838,7 @@ impl Data {
 				Kind::Numeric => numeric += 1,
 				Kind::Temporal => temporal += 1,
 				Kind::Categorical(_) => categorical += 1,
+				Kind::Ordinal(_) => ordinal += 1,
 				Kind::Text(_) => text += 1,
 				Kind::Image => image += 1,
 			}
@@ -955,6 +853,9 @@ impl Data {
 		if categorical > 0 {
 			out.push(("categorical", categorical));
 		}
+		if ordinal > 0 {
+			out.push(("ordinal", ordinal));
+		}
 		if text > 0 {
 			out.push(("text", text));
 		}
@@ -966,10 +867,9 @@ impl Data {
 
 	fn cat_cardinality_counts(&self) -> Vec<(usize, usize)> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
-		let is_excluded = |name: &str| {
-			self.exclude.iter().any(|p| exclude_match(p, name))
-		};
-		let mut card: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
+		let mut card: std::collections::BTreeMap<usize, usize> =
+			std::collections::BTreeMap::new();
 		for a in &self.attrs {
 			if is_target(&a.name) || is_excluded(&a.name) {
 				continue;
@@ -1012,20 +912,10 @@ impl Data {
 			self.set.x.nrows()
 		};
 		for src in &self.sources {
-			eprintln!(
-				"\x1b[32mset\x1b[0m  {}",
-				short(src),
-			);
-			eprintln!(
-				"    {}",
-				disk_size(src),
-			);
+			eprintln!("\x1b[32mset\x1b[0m  {}", short(src),);
+			eprintln!("    {}", disk_size(src),);
 		}
-		eprintln!(
-			"    {} rows  {} cols",
-			set_rows,
-			raw_cols,
-		);
+		eprintln!("    {} rows  {} cols", set_rows, raw_cols,);
 		print_types("        ");
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
@@ -1038,18 +928,16 @@ impl Data {
 				eprintln!("        {count} × [{}]", range.join(", "));
 			}
 		}
-		eprintln!(
-			"    {} features → model",
-			self.set.x.ncols(),
-		);
+		eprintln!("    {} features → model", self.set.x.ncols(),);
 		if let Some(test) = &self.test {
 			if let Some(tp) = &self.test_path {
-				let test_raw_cols = self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
-				let test_raw_rows = self.raw_test_rows.as_ref().map_or(test.x.nrows(), |r| r.len());
-				eprintln!(
-					"\x1b[32mtest\x1b[0m  {}",
-					short(tp),
-				);
+				let test_raw_cols =
+					self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
+				let test_raw_rows = self
+					.raw_test_rows
+					.as_ref()
+					.map_or(test.x.nrows(), |r| r.len());
+				eprintln!("\x1b[32mtest\x1b[0m  {}", short(tp),);
 				eprintln!(
 					"    {} rows  {} cols  {}",
 					test_raw_rows,
@@ -1057,10 +945,7 @@ impl Data {
 					disk_size(tp),
 				);
 				print_types("        ");
-				eprintln!(
-					"    {} features → model",
-					test.x.ncols(),
-				);
+				eprintln!("    {} features → model", test.x.ncols(),);
 			} else if self.split_frac.is_some() {
 				eprintln!(
 					"\x1b[32msplit\x1b[0m  {} train / {} test",
@@ -1074,20 +959,16 @@ impl Data {
 		}
 	}
 
-	/// Use a separate pre-split test file (encoded with the train schema).
 	pub fn test(mut self, path: &str) -> Data {
 		self.test_path = Some(path.to_string());
 		self
 	}
 
-	/// Drop features matching `pattern`: an exact column name, a `group:*` glob,
-	/// a group name, or a bare header (matches that column in any group).
 	pub fn exclude(mut self, pattern: &str) -> Data {
 		self.exclude.push(pattern.to_string());
 		self
 	}
 
-	/// Hold out `1 - train_frac` of the `.set` file as the test set.
 	pub fn split(mut self, train_frac: f64) -> Data {
 		assert!(
 			(0.0..1.0).contains(&train_frac),
@@ -1097,11 +978,6 @@ impl Data {
 		self
 	}
 
-	/// Build a train `Dataset` and an optional test `Dataset`. An ARFF set keeps
-	/// its self-describing schema path; anything else (CSV file or directory, for
-	/// both `.set` and `.test`) goes through the unified named-table path that
-	/// auto-detects features + target, aligns train↔test on shared columns, and
-	/// prints its interpretation.
 	fn prepare(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
 		let (mut train, test, attrs) = if self.attrs.is_empty() {
 			let (tr, te, a) = self.prepare_table();
@@ -1125,8 +1001,6 @@ impl Data {
 		(train, test, attrs)
 	}
 
-	/// ARFF set: encode against the declared schema; a `.test` ARFF is encoded
-	/// with that same schema (so it aligns by construction).
 	fn prepare_arff(&self) -> (Dataset, Option<Dataset>) {
 		let k = self.targets.len().max(1);
 		let skip = exclude_mask(&self.attrs, "", &self.exclude);
@@ -1137,7 +1011,7 @@ impl Data {
 			let (tr, te) = shuffle_split(&x, &y, k, frac, &self.source_label(), &tc, &oh);
 			(tr, Some(te))
 		} else if let Some(tp) = &self.test_path {
-			let (_, trows) = parse_arff(tp);
+			let (_, trows) = crate::data::parse_arff(tp);
 			let (_, tx, ty) = encode(&self.attrs, &trows, &self.targets, &skip);
 			(
 				Dataset {
@@ -1175,20 +1049,18 @@ impl Data {
 		}
 	}
 
-	/// Unified path for CSV files and directories. Each source is parsed into raw
-	/// groups, then `assemble`d into one table where the group owning `.target`
-	/// defines the samples and the rest are hash-joined. Train/test align on the
-	/// shared (namespaced) feature columns; `.exclude` patterns are dropped. The
-	/// target is `.target` (matched by name) or, when a test exists, the lone
-	/// train-only column.
 	fn prepare_table(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
-		let set_groups: Vec<DirGroup> = self.sources.iter().flat_map(|s| load_groups(s)).collect();
+		let set_groups: Vec<DirGroup> = self
+			.sources
+			.iter()
+			.flat_map(|s| crate::data::load_groups(s))
+			.collect();
 		let set_tnames = table_names(&set_groups);
 
 		let test_groups = self
 			.test_path
 			.as_ref()
-			.map(|tp| (load_groups(tp), tp.clone()));
+			.map(|tp| (crate::data::load_groups(tp), tp.clone()));
 		let test_tnames: Option<Vec<String>> = match (&test_groups, self.split_frac) {
 			(Some((g, _)), _) => Some(table_names(g)),
 			(None, Some(_)) => Some(set_tnames.clone()),
@@ -1223,7 +1095,8 @@ impl Data {
 				text_cols: tc.clone(),
 				onehot_groups: oh.clone(),
 			};
-			let test_feats: Vec<String> = test.names.iter().filter(|n| keep(n)).cloned().collect();
+			let test_feats: Vec<String> =
+				test.names.iter().filter(|n| keep(n)).cloned().collect();
 			let oh_test = onehot_group_indices(&test_feats);
 			let testds = Dataset {
 				x: test.select(&test_feats),
@@ -1242,7 +1115,8 @@ impl Data {
 		let tc = text_col_indices(&feats);
 		let oh = onehot_group_indices(&feats);
 		if let Some(frac) = self.split_frac {
-			let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, &self.source_label(), &tc, &oh);
+			let (tr, te) =
+				shuffle_split(&x, &set.y, k.max(1), frac, &self.source_label(), &tc, &oh);
 
 			return (tr, Some(te), flat_attrs);
 		}
@@ -1261,11 +1135,6 @@ impl Data {
 		)
 	}
 
-	/// Resolve the target column name. `.target` wins (matched exactly, as a
-	/// `group:name`, or by the trailing `:name`); otherwise, when a test set is
-	/// present, a single column that exists in the set but not the test is taken
-	/// as the target (the thing to predict). Ambiguous (many train-only columns)
-	/// or absent → `None`.
 	fn resolve_targets(
 		&self,
 		set_names: &[String],
@@ -1311,8 +1180,6 @@ fn col_after(c: &str) -> &str {
 	c.split_once(':').map_or(c, |(_, s)| s)
 }
 
-/// Whether `path` is an ARFF file (by extension) — the only self-describing
-/// format that bypasses the named-table path.
 fn is_arff(path: &str) -> bool {
 	std::path::Path::new(path)
 		.extension()
@@ -1320,9 +1187,6 @@ fn is_arff(path: &str) -> bool {
 		== Some("arff")
 }
 
-/// Drop train samples carrying any NaN — in the target or any feature. Test is
-/// left intact (its samples must still be predicted). A reasonable default until
-/// feature imputation is added.
 pub(crate) fn drop_nan_samples(train: &mut Dataset) {
 	let n = train.x.nrows();
 	let k = train.n_targets.max(1);
@@ -1350,7 +1214,6 @@ pub(crate) fn drop_nan_samples(train: &mut Dataset) {
 	);
 }
 
-/// `(NaN cells in features, feature rows touched, NaN cells in target)`.
 pub(crate) fn nan_stats(d: &Dataset) -> (usize, usize, usize) {
 	let cells = d.x.iter().filter(|v| v.is_nan()).count();
 	let rows =
@@ -1361,8 +1224,6 @@ pub(crate) fn nan_stats(d: &Dataset) -> (usize, usize, usize) {
 	(cells, rows, target)
 }
 
-/// OGDL warning of where NaNs live in the final train/test data — printed only
-/// when some exist. Detection only; handling is decided by the caller.
 fn report_nans(train: &Dataset, test: Option<&Dataset>) {
 	let (tf, tr, tt) = nan_stats(train);
 	let (ef, er, et) = test.map(nan_stats).unwrap_or((0, 0, 0));
@@ -1391,8 +1252,6 @@ fn report_nans(train: &Dataset, test: Option<&Dataset>) {
 	}
 }
 
-/// Shuffled `train_frac`/`1-train_frac` row split (seed 42). `y` is flat row-major
-/// n*k (k targets); each selected row carries its whole k-wide target slice.
 fn shuffle_split(
 	x: &Mat,
 	y: &Vec1,
@@ -1427,8 +1286,6 @@ fn shuffle_split(
 	(take(&idx[..n_train]), take(&idx[n_train..]))
 }
 
-/// Indices of feature columns that are token-id columns (from free text, named
-/// `*#t{s}`) — the columns an `embed` layer consumes.
 fn text_col_indices(feats: &[String]) -> Vec<usize> {
 	feats.iter()
 		.enumerate()
@@ -1455,27 +1312,6 @@ fn onehot_group_indices(feats: &[String]) -> Vec<(usize, usize)> {
 	groups
 }
 
-/// Parse one `@attribute 'name' { a, b }` or `@attribute name real` line.
-fn parse_attribute(line: &str) -> Attr {
-	let rest = line["@attribute".len()..].trim();
-	let (name, spec) = if let Some(r) = rest.strip_prefix('\'') {
-		let end = r.find('\'').expect("attribute: unterminated quoted name");
-		(r[..end].to_string(), r[end + 1..].trim())
-	} else {
-		let end = rest
-			.find(char::is_whitespace)
-			.expect("attribute: missing type");
-		(rest[..end].to_string(), rest[end..].trim())
-	};
-	let kind = if spec.starts_with('{') {
-		let inner = spec.trim_start_matches('{').trim_end_matches('}');
-		Kind::Categorical(split_fields(inner))
-	} else {
-		Kind::Numeric
-	};
-	Attr { name, kind }
-}
-
 impl crate::model::RunData for Data {
 	fn dataset(&self) -> &Dataset {
 		&self.set
@@ -1488,5 +1324,8 @@ impl crate::model::RunData for Data {
 	}
 	fn raw_headers(&self) -> Option<Vec<String>> {
 		self.raw_test_headers.clone()
+	}
+	fn infer_only(&self) -> bool {
+		false
 	}
 }

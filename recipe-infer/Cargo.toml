@@ -1,0 +1,11 @@
+[package]
+name = "recipe-infer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "recipe_infer"
+
+[dependencies]
+gpu-core = { path = "../gpu-core" }
+ndarray = "0.16"

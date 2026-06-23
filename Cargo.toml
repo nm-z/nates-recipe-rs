@@ -7,11 +7,13 @@ edition = "2024"
 name = "nates_recipe"
 
 [workspace]
-members = ["."]
+members = [".", "recipe-infer", "pantry"]
 exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
 
 [dependencies]
 gpu-core = { path = "gpu-core" }
+recipe-infer = { path = "recipe-infer" }
+pantry = { path = "pantry" }
 anyhow = "1"
 csv = "1"
 ndarray = { version = "0.16", features = ["rayon"] }
@@ -25,6 +27,7 @@ ratatui = "0.30"
 libc = "0.2"
 indicatif = { version = "0.17", features = ["rayon"] }
 data-encoding = "2.11.0"
+zip = "2"
 
 [profile.release]
 opt-level = 3

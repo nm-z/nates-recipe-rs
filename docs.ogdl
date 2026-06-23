@@ -1,93 +1,107 @@
 data
 	load
-		.set(path)           CSV, ARFF, or directory — chainable for multiple sources
+		.set(path)           CSV, ARFF, or directory
 		.test(path)          separate test file (encoded with train schema)
 		.exclude(pattern)    drop columns matching pattern before encoding
 		.split(frac)         random train/test split (e.g. 0.8)
-		.target(col)         terminal — triggers encoding. single or multi: .target(["a","b"])
+		.target(col)         terminal. single or multi: .target(["a","b"])
+		.window(n)           todo — sliding window for time series
 	fields (after .target)
 		data.set             Dataset { x, y }
 		data.test            Option<Dataset>
-		data.target          &str — whatever .target() was set to
-	types (auto-detected from cell values)
-		Numeric              f64-parseable
-		Temporal             (detection TBD)
-		Categorical          (detection TBD) — one-hot encoded, or integer-indexed under embed()
-		Text                 (detection TBD) — tokenized to vocab-indexed sequences
-		Image                file extension (.png .jpg .jpeg .bmp .gif .webp) or valid base64
-
-	feature reduction
-		PCA              N features → k components
-		kmeans           N features → k distances
-		SVD              N features → k singular vectors
-	feature generation
-		interaction      N features → N² pairs (x₁·x₂)
-		polynomial       N features → Nᵈ terms (x², x³, x₁x₂)
-		one-hot          1 column → k binary columns
-		embedding        1 index → k learned dimensions
+		data.target          &str
+	types (detected by pantry's byte-level transformer, no heuristics)
+		Numeric              continuous f64
+		Temporal             date strings, auto-encoded to days
+		Categorical          repeating strings or integers, one-hot or embed
+		Ordinal              todo — ordered categorical, integer-encode
+		Text                 unique strings, tokenized for embedding
+		Image                file paths or base64 cell content
+	feature transformation
+		todo — reshape / tile / grid (prerequisite for 2D conv)
+		todo — log, square, sqrt, binning, z-score, min-max
 
 model
 	layers
-		.layer(n)            dense linear, n output units
-		.layer(embed(dim))   embedding lookup table, dim-wide learned vectors
+		.layer(n)            dense linear
+		.layer(embed(dim))   embedding lookup
 		.layer(attn(heads))  multi-head self-attention
-		.layer(conv(f, k))   convolutional (TODO)
-		.layer(pool(s))      pooling (TODO)
-		.layer(gru(h))       GRU recurrent (TODO)
-		.layer(lstm(h))      LSTM recurrent (TODO)
-	activations (chained after .layer)
-		.relu()              max(0, x)                          range [0, ∞)
-		.leak()              x > 0 ? x : 0.01x                 range (-∞, ∞)   leaky relu, α=0.01
-		.prelu()             x > 0 ? x : αx                    range (-∞, ∞)   learnable α, init 0.25
-		.elu()               x > 0 ? x : α(eˣ - 1)            range [-α, ∞)   α=1.0
-		.selu()              λ(x > 0 ? x : α(eˣ - 1))         range (-∞, ∞)   self-normalizing
-		.sigmoid()           1 / (1 + e⁻ˣ)                     range (0, 1)
-		.tanh()              (eˣ - e⁻ˣ) / (eˣ + e⁻ˣ)          range (-1, 1)
-		.gelu()              x · Φ(x)                           range (-∞, ∞)   transformer default
-		.silu()              x · σ(x)                           range (-∞, ∞)   aka swish
+		.conv(filters, k)    1D convolutional
+		.stride(s)           conv downsampling (chained on conv)
+	activations (chained after layer)
+		.relu()              max(0, x)                          [0, inf)
+		.leak()              x > 0 ? x : 0.01x                 leaky relu
+		.prelu()             x > 0 ? x : ax                    learnable a
+		.elu()               x > 0 ? x : a(e^x - 1)
+		.selu()              self-normalizing
+		.sigmoid()           1 / (1 + e^-x)                    (0, 1)
+		.tanh()              (e^x - e^-x) / (e^x + e^-x)      (-1, 1)
+		.gelu()              x * phi(x)                        transformer default
+		.silu()              x * sigmoid(x)                    aka swish
 	loss
-		.loss(mse)           L = (ŷ - y)²                      regression
-		.loss(mae)           L = |ŷ - y|                        regression, robust to outliers
-		.loss(huber)         L = mse/2 if |e|<1, |e|-½ else    regression, smooth mae
-		.loss(ce)            L = -Σ yᵢ log(softmax(ŷ)ᵢ)       multi-class classification
-		.loss(bce)           L = -[y log(ŷ) + (1-y) log(1-ŷ)]  binary classification
+		.loss(mse)           regression
+		.loss(mae)           regression, robust to outliers
+		.loss(huber)         regression, smooth mae
+		.loss(ce)            multi-class classification
+		.loss(bce)           binary classification
+		.loss(focal)         binary, class imbalance
 	hyperparameters
-		.lr(rate)            learning rate (SGD step size)
+		.lr(rate)            learning rate (SGD)
+	todo
+		.optimizer(adam)      optimizer selection (gpu-core has adam, momentum, rmsprop, lamb, lion)
+		.trees(booster, n, depth)   gradient boosted trees via catboost/lightgbm/xgboost crates
 
 train
 	config
-		.epochs(n)           number of full-batch passes
-		.log([Loss, R2])     metrics printed per epoch
-		.plot([Loss, R2])    metrics drawn in TUI live chart
-		.log_every(n)        print every nth epoch (default 1)
-		.resume(path)        load weights from OGDL checkpoint
+		.epochs(n)
+		.log([Loss, R2])
+		.plot([Loss, R2])
+		.log_every(n)
+		.resume(path)
 	run
-		train.run(&model, &data)        train on data.set
-		train.run(&model, &data.test)   forward-only inference on test set
+		train.run(&model, &data)        train
+		train.run(&model, &data.test)   inference
 	save
-		train.save([w, b], path)                   weights → OGDL checkpoint
-		train.save(["Id", data.target], path)      predictions → CSV
+		train.save([w, b], path)                   weights to OGDL
+		train.save(["Id", data.target], path)      predictions to CSV
 
 metrics
 	Loss        current loss value
-	Accuracy    classification accuracy (bce: threshold 0.5, ce: argmax)
-	R2          coefficient of determination (regression)
+	Accuracy    classification accuracy
+	R2          coefficient of determination
 	Lr          current learning rate
 	Epoch       epoch counter
 	Time        wall clock elapsed
 
 training loop
-	forward      z = Wx + b → activation(z) → next layer → ... → loss(ŷ, y)
-	backward     ∂L/∂ŷ → ... → ∂L/∂W, ∂L/∂b per layer
-	update       W -= lr · ∂L/∂W,  b -= lr · ∂L/∂b
-	full-batch only — every sample every epoch, no mini-batching
+	forward      z = Wx + b -> activation -> ... -> loss
+	backward     grad_L/grad_W, grad_L/grad_b per layer
+	update       W -= lr * grad_L/grad_W
+	full-batch only
 
 embed behavior
-	embed + text columns        tokenize text → embed token ids
-	embed + no text columns     collapse one-hot categoricals → integer indices → embed
+	embed + text columns        tokenize text, embed token ids
+	embed + no text columns     collapse one-hot categoricals to integer indices, embed
 	no embed                    one-hot encode categoricals
 
 checkpoint
-	format       OGDL (indentation-structured, one weight per line)
-	save         on first R² drop (stop-loss)
-	resume       loads and validates shapes — crashes on mismatch, never silently discards
+	format       OGDL
+	save         on first R2 drop (stop-loss)
+	resume       loads and validates shapes, crashes on mismatch
+
+workspace
+	gpu-core         HIP kernels, memory, links ROCm
+	recipe-infer     forward pass, OGDL load, depends on gpu-core
+	pantry           parse any format, detect column types, depends on recipe-infer
+	nates-recipe     train, backprop, TUI, depends on gpu-core + recipe-infer + pantry
+	catboost-rs      standalone GBM crate
+	lightgbm-rs      standalone GBM crate
+	xgboost-rs       standalone GBM crate
+
+cli (todo)
+	recipe scan path              pantry: inspect data, print types
+	recipe detect path            pantry: column types only
+	recipe train script.rs        nates-recipe: compile + run
+	recipe train --data --target  nates-recipe: CLI args, no script
+	recipe infer model.ogdl data  recipe-infer: predict
+	recipe run script.rs          zscript wrapper, inject deps

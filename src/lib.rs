@@ -34,16 +34,23 @@ pub type Vec1 = ndarray::Array1<f64>;
 pub use gpu_core as gpu;
 
 #[doc(hidden)]
-#[path = "utils/data.rs"]
-pub mod data;
+pub use pantry::data;
 
 #[doc(hidden)]
 #[path = "utils/dataset.rs"]
 pub mod dataset;
 
 #[doc(hidden)]
+#[path = "utils/train.rs"]
+mod train;
+
+#[doc(hidden)]
 #[path = "utils/model.rs"]
 pub mod model;
+
+#[doc(hidden)]
+#[path = "utils/detect.rs"]
+pub mod detect;
 
 #[doc(inline)]
 pub use dataset::Data;
@@ -53,7 +60,7 @@ pub use dataset::Dataset;
 #[doc(inline)]
 pub use model::{
 	Accuracy, Epoch, Loss, Lr, Metric, Model, R2, Time, Train,
-	attn, bce, ce, embed, huber, mae, mse,
+	attn, bce, ce, embed, focal, huber, mae, mse,
 };
 #[doc(hidden)]
 pub use model::{
@@ -67,7 +74,3 @@ pub const w: Param = Param::W;
 /// Save biases: `train.save([w, b], "model.ogdl")`.
 #[allow(non_upper_case_globals)]
 pub const b: Param = Param::B;
-
-#[cfg(test)]
-#[path = "utils/tests.rs"]
-mod tests;

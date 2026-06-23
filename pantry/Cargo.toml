@@ -1,0 +1,24 @@
+[package]
+name = "pantry"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pantry"
+
+[[bin]]
+name = "detect"
+path = "src/main.rs"
+
+[dependencies]
+recipe-infer = { path = "../recipe-infer" }
+anyhow = "1"
+csv = "1"
+ndarray = "0.16"
+image = "0.25"
+data-encoding = "2.11.0"
+zip = "2"
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1"
+indicatif = { version = "0.17", features = ["rayon"] }

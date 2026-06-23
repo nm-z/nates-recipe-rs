@@ -363,6 +363,17 @@ unsafe extern "C" {
 		cols: i32,
 		stream: *mut c_void,
 	);
+	fn launch_flash_attention_f64(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		seq: i32,
+		d: i32,
+		heads: i32,
+		stream: *mut c_void,
+	);
 	fn launch_sub_scale(
 		a: *const c_void,
 		b: *const c_void,
@@ -1404,6 +1415,26 @@ unsafe extern "C" {
 		split_bin: u8,
 		n_rows: i32,
 		n_features: i32,
+		stream: *mut c_void,
+	);
+	fn launch_convx_conv1d(
+		x: *const c_void, w: *const c_void, bias: *const c_void, y: *mut c_void,
+		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
+		stream: *mut c_void,
+	);
+	fn launch_convx_conv1d_backward_data(
+		dy: *const c_void, w: *const c_void, dx: *mut c_void,
+		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
+		stream: *mut c_void,
+	);
+	fn launch_convx_conv1d_backward_filter(
+		dy: *const c_void, x: *const c_void, temp: *mut c_void,
+		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
+		chunks: i32, stream: *mut c_void,
+	);
+	fn launch_convx_conv1d_backward_bias(
+		dy: *const c_void, db: *mut c_void,
+		n: i32, cout: i32, lout: i32,
 		stream: *mut c_void,
 	);
 }
@@ -3031,6 +3062,36 @@ pub fn gpu_softmax_rows_into(x: &GpuBuffer, out: &GpuBuffer, rows: usize, cols: 
 			out.ptr as *mut c_void,
 			rows as i32,
 			cols as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+/// Fused multi-head self-attention (f64, FlashAttention-style) for inference.
+/// q/k/v/out are [n, seq, d] row-major, d = heads*hd. K,V are streamed through
+/// shared-memory tiles with an online softmax — the L×L score matrix is never
+/// materialized. Bidirectional, numerically equal to the full softmax path.
+pub fn gpu_flash_attention_into(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	out: &GpuBuffer,
+	n: usize,
+	seq: usize,
+	d: usize,
+	heads: usize,
+) {
+	unsafe {
+		launch_flash_attention_f64(
+			q.ptr as *const c_void,
+			k.ptr as *const c_void,
+			v.ptr as *const c_void,
+			out.ptr as *mut c_void,
+			n as i32,
+			seq as i32,
+			d as i32,
+			heads as i32,
 			std::ptr::null_mut(),
 		);
 	}
@@ -6104,4 +6165,68 @@ pub fn gpu_leaf_split_apply(
 			std::ptr::null_mut(),
 		);
 	}
+}
+
+pub fn gpu_conv1d_into(
+	x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, y: &GpuBuffer,
+	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+) {
+	let lout = (l - k) / stride + 1;
+	unsafe {
+		launch_convx_conv1d(
+			x.ptr as *const c_void, w.ptr as *const c_void,
+			bias.ptr as *const c_void, y.ptr as *mut c_void,
+			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+pub fn gpu_conv1d_backward_data_into(
+	dy: &GpuBuffer, w: &GpuBuffer, dx: &GpuBuffer,
+	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+) {
+	let lout = (l - k) / stride + 1;
+	unsafe {
+		launch_convx_conv1d_backward_data(
+			dy.ptr as *const c_void, w.ptr as *const c_void, dx.ptr as *mut c_void,
+			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+pub fn gpu_conv1d_backward_filter_into(
+	dy: &GpuBuffer, x: &GpuBuffer, dw: &GpuBuffer,
+	temp: &GpuBuffer, ws: &GpuBuffer,
+	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+	chunks: usize,
+) {
+	let lout = (l - k) / stride + 1;
+	let fsz = cout * cin * k;
+	unsafe {
+		launch_convx_conv1d_backward_filter(
+			dy.ptr as *const c_void, x.ptr as *const c_void, temp.ptr as *mut c_void,
+			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
+			chunks as i32, std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	gpu_reduce_sum_cols_into(temp, dw, ws, chunks, fsz);
+}
+
+pub fn gpu_conv1d_backward_bias_into(
+	dy: &GpuBuffer, db: &GpuBuffer,
+	n: usize, cout: usize, lout: usize,
+) {
+	unsafe {
+		launch_convx_conv1d_backward_bias(
+			dy.ptr as *const c_void, db.ptr as *mut c_void,
+			n as i32, cout as i32, lout as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
 }

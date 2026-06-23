@@ -5,10 +5,10 @@
 // All "valid" padding (out = in - k + 1). f64 throughout. Unique convx_ names.
 
 // conv1d: x (N, Cin, L)  w (Cout, Cin, K)  bias (Cout, may be null) → y (N, Cout, Lout)
-// Lout = L - K + 1. Cross-correlation: y[n,co,t] = sum_ci sum_k x[n,ci,t+k]*w[co,ci,k] + b[co]
+// Lout = (L - K) / S + 1. Cross-correlation with stride S.
 extern "C" __global__ void convx_conv1d_kernel(
     const double* x, const double* w, const double* bias, double* y,
-    int N, int Cin, int L, int Cout, int K, int Lout
+    int N, int Cin, int L, int Cout, int K, int Lout, int S
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * Cout * Lout;
@@ -21,17 +21,134 @@ extern "C" __global__ void convx_conv1d_kernel(
     for (int ci = 0; ci < Cin; ++ci) {
         const double* xp = x + ((n * Cin + ci) * L);
         const double* wp = w + ((co * Cin + ci) * K);
-        for (int k = 0; k < K; ++k) acc += xp[t + k] * wp[k];
+        for (int k = 0; k < K; ++k) acc += xp[t * S + k] * wp[k];
     }
     y[idx] = acc;
 }
 extern "C" void launch_convx_conv1d(
     const double* x, const double* w, const double* bias, double* y,
-    int N, int Cin, int L, int Cout, int K, int Lout, hipStream_t s
+    int N, int Cin, int L, int Cout, int K, int Lout, int S, hipStream_t s
 ) {
     int total = N * Cout * Lout;
     dim3 block(256); dim3 grid((total + 255) / 256);
-    hipLaunchKernelGGL(convx_conv1d_kernel, grid, block, 0, s, x, w, bias, y, N, Cin, L, Cout, K, Lout);
+    hipLaunchKernelGGL(convx_conv1d_kernel, grid, block, 0, s, x, w, bias, y, N, Cin, L, Cout, K, Lout, S);
+}
+
+// conv1d backward: dL/dX. dy (N, Cout, Lout), w (Cout, Cin, K) → dx (N, Cin, L).
+// dx[n,ci,l] = sum_co sum_k w[co,ci,k] * dy[n,co,t] where t = (l-k)/S, if (l-k)%S==0 and 0<=t<Lout.
+extern "C" __global__ void convx_conv1d_backward_data_kernel(
+    const double* dy, const double* w, double* dx,
+    int N, int Cin, int L, int Cout, int K, int Lout, int S
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * Cin * L;
+    if (idx >= total) return;
+    int l  = idx % L;
+    int r  = idx / L;
+    int ci = r % Cin;
+    int n  = r / Cin;
+    double acc = 0.0;
+    for (int co = 0; co < Cout; ++co) {
+        const double* dyp = dy + ((n * Cout + co) * Lout);
+        const double* wp  = w + ((co * Cin + ci) * K);
+        for (int k = 0; k < K; ++k) {
+            int lk = l - k;
+            if (lk >= 0 && lk % S == 0) {
+                int t = lk / S;
+                if (t < Lout) acc += wp[k] * dyp[t];
+            }
+        }
+    }
+    dx[idx] = acc;
+}
+extern "C" void launch_convx_conv1d_backward_data(
+    const double* dy, const double* w, double* dx,
+    int N, int Cin, int L, int Cout, int K, int Lout, int S, hipStream_t s
+) {
+    int total = N * Cin * L;
+    dim3 block(256); dim3 grid((total + 255) / 256);
+    hipLaunchKernelGGL(convx_conv1d_backward_data_kernel, grid, block, 0, s, dy, w, dx, N, Cin, L, Cout, K, Lout, S);
+}
+
+// One workgroup per (filter_weight, chunk). Each thread accumulates in a register
+// over its slice of N*Lout, warp shuffle reduces, one write to global. Zero atomics.
+// Rust-side reduce_sum_cols on temp[fsz*chunks] → dw[fsz].
+extern "C" __global__ void convx_conv1d_backward_filter_kernel(
+    const double* dy, const double* x, double* out,
+    int N, int Cin, int L, int Cout, int K, int Lout, int S, int chunks
+) {
+    int fsz = Cout * Cin * K;
+    int filter_idx = blockIdx.x / chunks;
+    int chunk_id   = blockIdx.x % chunks;
+    if (filter_idx >= fsz) return;
+    int cik = Cin * K;
+    int co = filter_idx / cik;
+    int ci = (filter_idx % cik) / K;
+    int kk = filter_idx % K;
+    int nl = N * Lout;
+    int chunk_size = (nl + chunks - 1) / chunks;
+    int start = chunk_id * chunk_size;
+    int end   = start + chunk_size;
+    if (end > nl) end = nl;
+    __shared__ double smem[256];
+    double sum = 0.0;
+    for (int nt = start + threadIdx.x; nt < end; nt += blockDim.x) {
+        int t = nt % Lout;
+        int n = nt / Lout;
+        sum += dy[n * Cout * Lout + co * Lout + t]
+             * x[(n * Cin + ci) * L + t * S + kk];
+    }
+    smem[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[chunk_id * fsz + filter_idx] = smem[0];
+}
+extern "C" void launch_convx_conv1d_backward_filter(
+    const double* dy, const double* x, double* temp,
+    int N, int Cin, int L, int Cout, int K, int Lout, int S, int chunks, hipStream_t s
+) {
+    int fsz = Cout * Cin * K;
+    int grid = fsz * chunks;
+    hipLaunchKernelGGL(convx_conv1d_backward_filter_kernel, dim3(grid), dim3(256),
+        0, s, dy, x, temp, N, Cin, L, Cout, K, Lout, S, chunks);
+}
+
+// Single-pass backward_bias. Each block handles one (co, chunk) pair. Tree reduction
+// in smem, one atomicAdd to db[co]. Grid = Cout * blocks_per_co, data-driven.
+extern "C" __global__ void convx_conv1d_backward_bias_kernel(
+    const double* dy, double* db, int N, int Cout, int Lout
+) {
+    __shared__ double smem[256];
+    int blocks_per_co = gridDim.x / Cout;
+    int co = blockIdx.x % Cout;
+    int chunk = blockIdx.x / Cout;
+    int tid = threadIdx.x;
+    int nl = N * Lout;
+    double acc = 0.0;
+    for (int nt = chunk * 256 + tid; nt < nl; nt += blocks_per_co * 256) {
+        int t = nt % Lout;
+        int n = nt / Lout;
+        acc += dy[n * Cout * Lout + co * Lout + t];
+    }
+    smem[tid] = acc;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(&db[co], smem[0]);
+}
+extern "C" void launch_convx_conv1d_backward_bias(
+    const double* dy, double* db, int N, int Cout, int Lout, hipStream_t s
+) {
+    int nl = N * Lout;
+    int blocks_per_co = (nl + 255) / 256;
+    int grid = Cout * blocks_per_co;
+    hipLaunchKernelGGL(convx_conv1d_backward_bias_kernel, dim3(grid), dim3(256),
+        256 * sizeof(double), s, dy, db, N, Cout, Lout);
 }
 
 // conv2d: x (N,Cin,H,W) w (Cout,Cin,kH,kW) bias (Cout|null) → y (N,Cout,Hout,Wout)

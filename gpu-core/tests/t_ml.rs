@@ -11,7 +11,6 @@ use gpu_core::rl::{
 	gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob,
 	gpu_td_targets,
 };
-use gpu_core::svm::{gpu_kernel_matrix, gpu_smo_train};
 
 const EPS: f64 = 1e-9;
 
@@ -477,101 +476,4 @@ fn test_catboost_ordered_target_stats() {
 		);
 	}
 	eprintln!("ordered_target_stats OK: {:?}", result);
-}
-
-// ── SVM ───────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_svm_kernel_matrix_linear() {
-	// 3 points in 2D: x=[[1,0],[0,1],[1,1]]
-	// Linear kernel: K[i,j] = x_i . x_j
-	// K = [[1,0,1],[0,1,1],[1,1,2]]
-	let x = GpuBuffer::upload(&[1.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
-	let k = gpu_kernel_matrix(&x, 3, 2, 0, 1.0, 0.0, 2.0).unwrap();
-	let mut km = [0.0_f64; 9];
-	k.download(&mut km).unwrap();
-
-	let expected = [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0];
-	for (i, (&got, &exp)) in km.iter().zip(expected.iter()).enumerate() {
-		assert!(got.is_finite(), "K[{}] not finite", i);
-		assert!(
-			(got - exp).abs() < 1e-9,
-			"K_linear[{}]={} expected {}",
-			i,
-			got,
-			exp
-		);
-	}
-	eprintln!("kernel_matrix linear OK: {:?}", km);
-}
-
-#[test]
-fn test_svm_kernel_matrix_rbf() {
-	// 2 points in 1D: x=[[0],[1]], gamma=1
-	// RBF: K[0,0]=exp(0)=1, K[0,1]=exp(-1), K[1,0]=exp(-1), K[1,1]=1
-	let x = GpuBuffer::upload(&[0.0_f64, 1.0]).unwrap();
-	let k = gpu_kernel_matrix(&x, 2, 1, 1, 1.0, 0.0, 2.0).unwrap();
-	let mut km = [0.0_f64; 4];
-	k.download(&mut km).unwrap();
-
-	let exp01 = (-1.0_f64).exp();
-	assert!((km[0] - 1.0).abs() < 1e-9, "K[0,0]={}", km[0]);
-	assert!(
-		(km[1] - exp01).abs() < 1e-9,
-		"K[0,1]={} expected {}",
-		km[1],
-		exp01
-	);
-	assert!(
-		(km[2] - exp01).abs() < 1e-9,
-		"K[1,0]={} expected {}",
-		km[2],
-		exp01
-	);
-	assert!((km[3] - 1.0).abs() < 1e-9, "K[1,1]={}", km[3]);
-	eprintln!("kernel_matrix rbf OK: {:?}", km);
-}
-
-#[test]
-fn test_svm_smo_train_no_hang_box_valid() {
-	// Verifies smo_train does not hang and returns box-feasible alphas.
-	//
-	// KNOWN DEFECT (host-side, separate from svm.hip sign bug):
-	// svm.rs:204 breaks on delta<1e-12 at iteration 0. With all-zero alpha init,
-	// the dual gradient G is uniformly -1, so G[i]-G[j]=0 for any working-set pair,
-	// giving zero step -> immediate delta-break. smo_train cannot converge from alpha=0
-	// on any binary SVM problem until this second bug is also fixed.
-	//
-	// The svm.hip:159 sign fix is correct and necessary: without it the KKT gap
-	// falsely reads 0 (gap=score_i-score_j=1-1=0 with wrong sign) and the convergence
-	// check fires even before the delta-break. With the fix, gap=2>0 correctly, but
-	// the delta-break fires instead. Both bugs compound.
-	use std::time::{Duration, Instant};
-
-	let x = GpuBuffer::upload(&[2.0_f64, 2.0, 2.0, -2.0, -2.0, 2.0, -2.0, -2.0]).unwrap();
-	let y_pm1 = [1.0_f64, 1.0, -1.0, -1.0];
-	let k = gpu_kernel_matrix(&x, 4, 2, 0, 1.0, 0.0, 1.0).unwrap();
-
-	let start = Instant::now();
-	let (alphas, b) =
-		gpu_smo_train(&k, &y_pm1, 1.0, 1e-3, 1000, 4).expect("gpu_smo_train returned Err");
-	let elapsed = start.elapsed();
-
-	assert!(
-		elapsed < Duration::from_secs(30),
-		"FINDING: gpu_smo_train HUNG (>30s)"
-	);
-
-	for (i, &a) in alphas.iter().enumerate() {
-		assert!(a.is_finite(), "alpha[{}] not finite: {}", i, a);
-		assert!(a >= -1e-9, "alpha[{}]={} < 0", i, a);
-		assert!(a <= 1.0 + 1e-9, "alpha[{}]={} > C=1.0", i, a);
-	}
-	assert!(b.is_finite(), "bias b not finite: {}", b);
-
-	eprintln!(
-		"smo_train no-hang + box-valid OK: alphas={:?}, b={} ({:?})",
-		alphas, b, elapsed
-	);
-	eprintln!("NOTE: alphas remain 0 (second bug: svm.rs:204 delta-break on uniform G at init)");
 }

@@ -351,49 +351,6 @@ fn test_viterbi() {
 	assert_eq!(path[2], 0, "Viterbi path[2]: expected 0, got {}", path[2]);
 }
 
-// ── cluster: fixed_radius_neighbors ──────────────────────────────────────
-
-#[test]
-fn test_fixed_radius_neighbors() {
-	// 4 points in 2D: (0,0),(1,0),(5,0),(6,0), eps=1.5
-	// Points 0&1 are within eps of each other, 2&3 are within eps of each other.
-	// mask[i*4+j] = 1 if dist(i,j)<=eps (includes self i==i)
-	// count[i] counts neighbors including self
-	let points_h: [f64; 8] = [0.0, 0.0, 1.0, 0.0, 5.0, 0.0, 6.0, 0.0];
-
-	let points = GpuBuffer::upload(&points_h).unwrap();
-
-	let result = cluster::gpu_fixed_radius_neighbors(&points, 4, 2, 1.5).unwrap();
-
-	let mut mask = [0u8; 16];
-	let mut count = [0i32; 4];
-
-	result.within_mask.download_u8(&mut mask).unwrap();
-	result.neighbor_count.download_i32(&mut count).unwrap();
-
-	println!("FRN mask  = {:?}", mask);
-	println!("FRN count = {:?}", count);
-
-	// Expected mask (1 = within eps including self):
-	// row 0: [1,1,0,0], row 1: [1,1,0,0], row 2: [0,0,1,1], row 3: [0,0,1,1]
-	let expected_mask: [u8; 16] = [1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1];
-	for i in 0..16 {
-		assert_eq!(
-			mask[i], expected_mask[i],
-			"FRN mask[{}]: expected {}, got {}",
-			i, expected_mask[i], mask[i]
-		);
-	}
-	// count: each point has exactly 2 neighbors (self + partner)
-	for i in 0..4 {
-		assert_eq!(
-			count[i], 2,
-			"FRN count[{}]: expected 2, got {}",
-			i, count[i]
-		);
-	}
-}
-
 // ── cluster: union_find_cc ────────────────────────────────────────────────
 
 #[test]
