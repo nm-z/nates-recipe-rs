@@ -16,7 +16,7 @@ recipe-infer → gpu-core           forward pass + ogdl load. pure tensor fns:
 pantry       → recipe-infer       ALL data parsing (csv/arff/zip/dir loaders) + column-type
                                   detection (the trained char-level detector, embedded ogdl) +
                                   the standalone `detect` binary. no training.
-nates-recipe → gpu-core,          Model/Train builder API, backward, fit, save/resume, TUI,
+recipe → gpu-core,          Model/Train builder API, backward, fit, save/resume, TUI,
                recipe-infer,        eval. Data delegates loading+detection to pantry; runs the
                pantry               forward via recipe-infer. Holds the detector trainer.
 ```
@@ -27,10 +27,10 @@ nates-recipe → gpu-core,          Model/Train builder API, backward, fit, save
 
 ```bash
 cargo build --release                    # thin LTO, links ROCm libs
-cargo test --workspace                   # all crates (root tests nates-recipe only)
+cargo test --workspace                   # all crates (root tests recipe only)
 cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
-cargo test -p nates-recipe model::metric_gpu_tests::   # GPU metric/gradient tests
-cargo run --release -- train.csv --target Price        # nates-recipe CLI
+cargo test -p recipe model::metric_gpu_tests::   # GPU metric/gradient tests
+cargo run --release -- train.csv --target Price        # recipe CLI
 cargo run --release -- detect <path>                   # column-type detection (CLI)
 ./target/release/detect <path>           # standalone GPU-only detector (pantry bin, no training fw)
 cargo run --release --example cookbook   # API examples
@@ -42,7 +42,7 @@ Requires ROCm (default `/opt/rocm`). Override with `ROCM_PATH`, `ROCM_EXTRA_LIB`
 ## Typical Usage (examples/cookbook.rs)
 
 ```rust
-use nates_recipe::*;
+use recipe::*;
 
 let data = Data::load()
       .set("train.csv")
@@ -87,7 +87,7 @@ pantry (all parsing + detection; deps recipe-infer only)
 ├── src/main.rs        — standalone `detect` binary (init → load_groups → predict_kinds → print)
 └── detector.ogdl      — trained detector weights, include_str!'d into the binary
 
-nates-recipe (root crate — training framework; deps gpu-core, recipe-infer, pantry)
+recipe (root crate — training framework; deps gpu-core, recipe-infer, pantry)
 ├── src/lib.rs         — type aliases, re-exports (incl. `pub use pantry::data`, recipe_infer enums)
 ├── src/main.rs        — CLI: recipe <train.csv> [--target <col>] | recipe detect <path>
 └── src/utils/
@@ -119,14 +119,14 @@ gpu-core (path dep, HIP/ROCm)
 ## Internals (not user-facing)
 
 - **`GpuBuffer`** (`gpu-core/memory.rs`) — async-allocated GPU memory (`hipMallocAsync`/`hipFreeAsync`). Weights, activations, and scratch live here. Upload/download to/from host `&[f64]`.
-- **`kernels`** (`gpu-core/kernels.rs`) — pub FFI wrappers: gemm, activations, loss gradients, fused metrics, reductions, optimizers. Called by `recipe-infer` (forward) and `nates-recipe` `train.rs` (backward) — never by user code.
-- **`LayerParams`** / **`Scratch`** (`recipe-infer`) — per-layer GPU weight buffers and ping-pong activation/gradient scratch. Allocated once at fit, reused across epochs. Forward (`forward_into`) is in recipe-infer; backward (`backward_step`) stays in nates-recipe `train.rs` and reads the activations forward retained.
+- **`kernels`** (`gpu-core/kernels.rs`) — pub FFI wrappers: gemm, activations, loss gradients, fused metrics, reductions, optimizers. Called by `recipe-infer` (forward) and `recipe` `train.rs` (backward) — never by user code.
+- **`LayerParams`** / **`Scratch`** (`recipe-infer`) — per-layer GPU weight buffers and ping-pong activation/gradient scratch. Allocated once at fit, reused across epochs. Forward (`forward_into`) is in recipe-infer; backward (`backward_step`) stays in recipe `train.rs` and reads the activations forward retained.
 - **Domain modules** (`gpu-core/src/{attention,forest,cluster,svm,...}.rs`) — GPU ops for specific algorithm families. Wired through `kernels.rs` FFI. Note: `svm`/`cluster` neighbor / perm fns are unused prototypes (no production callers).
 
 ## Data Pipeline (lives in `pantry`)
 
 1. Load CSV/ARFF/zip/dir, detect column types via the trained char-level detector (`pantry::predict_kinds`, embedded `pantry/detector.ogdl` run through recipe-infer). `Kind` enum:
-   6 classes — **Numeric**, **Temporal**, **Categorical**, **Ordinal**, **Text**, **Image**. Detection is a trained char-level transformer (`embed(32).vocab(257) → attn(4) → 64.leak() → 6`, ~0.987 train acc), NOT magic-number thresholds (every picked constant is a banned guess — see the detector trainer in nates-recipe `detect.rs`). Each column's raw cells → byte-stream (CONTEXT=256) → the model picks the Kind.
+   6 classes — **Numeric**, **Temporal**, **Categorical**, **Ordinal**, **Text**, **Image**. Detection is a trained char-level transformer (`embed(32).vocab(257) → attn(4) → 64.leak() → 6`, ~0.987 train acc), NOT magic-number thresholds (every picked constant is a banned guess — see the detector trainer in recipe `detect.rs`). Each column's raw cells → byte-stream (CONTEXT=256) → the model picks the Kind.
    - **Text** → tokenize → token-id sequences for `embed` layers; **Categorical** → one-hot (or integer-index when an embed layer + no text cols); **Temporal** → encoded as days.
    - Missing markers (NA, NaN, N/A, NULL, None, ?, ., -) filtered before detection.
 2. When `.test()` is set, align train/test to shared columns only.

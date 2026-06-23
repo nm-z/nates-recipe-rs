@@ -93,7 +93,7 @@ workspace
 	gpu-core         HIP kernels, memory, links ROCm
 	recipe-infer     forward pass, OGDL load, depends on gpu-core
 	pantry           parse any format, detect column types, depends on recipe-infer
-	nates-recipe     train, backprop, TUI, depends on gpu-core + recipe-infer + pantry
+	recipe     train, backprop, TUI, depends on gpu-core + recipe-infer + pantry
 	catboost-rs      standalone GBM crate
 	lightgbm-rs      standalone GBM crate
 	xgboost-rs       standalone GBM crate
@@ -101,7 +101,7 @@ workspace
 cli (todo)
 	recipe scan path              pantry: inspect data, print types
 	recipe detect path            pantry: column types only
-	recipe train script.rs        nates-recipe: compile + run
-	recipe train --data --target  nates-recipe: CLI args, no script
+	recipe train script.rs        recipe: compile + run
+	recipe train --data --target  recipe: CLI args, no script
 	recipe infer model.ogdl data  recipe-infer: predict
 	recipe run script.rs          zscript wrapper, inject deps

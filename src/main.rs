@@ -69,9 +69,9 @@ fn main() -> Result<()> {
 	}
 
 	let data = if let Some(t) = target {
-		nates_recipe::Data::load().set(path).target(t)
+		recipe::Data::load().set(path).target(t)
 	} else {
-		let d = nates_recipe::Data::load().set(path);
+		let d = recipe::Data::load().set(path);
 		eprintln!("no --target specified");
 		d
 	};

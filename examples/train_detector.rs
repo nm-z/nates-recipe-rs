@@ -5,8 +5,8 @@
 //!
 //!   cargo run --release --example train_detector
 
-use nates_recipe::data::read_raw_csv;
-use nates_recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, b, ce, embed, w};
+use recipe::data::read_raw_csv;
+use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, b, ce, embed, w};
 use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,

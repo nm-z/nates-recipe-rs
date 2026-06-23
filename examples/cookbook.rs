@@ -1,4 +1,4 @@
-use nates_recipe::*;
+use recipe::*;
 
 fn main() {
 	// ── built APIs ─────────────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ fn main() {
 
 // ── unimplemented / not-wired API sketches ──────────────────────────────────
 // This section is intentionally not compiled. Keep future cookbook examples here
-// until the public builders and training paths exist in nates_recipe::Model/Data.
+// until the public builders and training paths exist in recipe::Model/Data.
 #[cfg(any())]
 fn unimplemented_api_examples() {
 	// 6. image classification — handwriting with conv layers (pooling is built into conv)

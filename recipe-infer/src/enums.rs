@@ -132,7 +132,7 @@ pub const Time: Metric = Metric::Time;
 pub const R2: Metric = Metric::R2;
 
 /// Which parameters an OGDL save writes — `W` (weights) and/or `B` (biases). The
-/// crate-root `w`/`b` consts in `nates-recipe` map onto these; lives here beside
+/// crate-root `w`/`b` consts in `recipe` map onto these; lives here beside
 /// the checkpoint codec since it gates `dump_ogdl`'s per-layer emission.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Param {

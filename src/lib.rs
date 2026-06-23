@@ -3,7 +3,7 @@
 //! GPU-native neural network training.
 //!
 //! ```rust,no_run
-//! use nates_recipe::*;
+//! use recipe::*;
 //!
 //! let data = Data::load()
 //!     .set("train.csv")

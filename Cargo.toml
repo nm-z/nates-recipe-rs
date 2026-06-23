@@ -1,10 +1,10 @@
 [package]
-name = "nates-recipe"
+name = "recipe"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "nates_recipe"
+name = "recipe"
 
 [workspace]
 members = [".", "recipe-infer", "pantry"]
