@@ -97,9 +97,9 @@ fn main() {
 		.lr(0.0001);
 	let train = Train::new().epochs(10000).log([Loss, R2]);
 	train.run(&model, &data);
-	train.save([w, b], "model.ogdl");
+	train.save();
 	train.run(&model, &data.test);
-	train.save(["Id", data.target], "submission.csv");
+	train.save_as(["Id", data.target], "submission.csv");
 }
 
 // ── unimplemented / not-wired API sketches ──────────────────────────────────

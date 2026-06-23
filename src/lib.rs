@@ -22,7 +22,7 @@
 //!     .log([Loss, R2]);
 //!
 //! train.run(&model, &data);
-//! train.save([w, b], "model.ogdl");
+//! train.save();
 //! ```
 
 #[doc(hidden)]
@@ -68,9 +68,9 @@ pub use model::{
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
-/// Save weights: `train.save([w, b], "model.ogdl")`.
+/// Save weights: `train.save()` (→ model.ogdl) or `train.save_as([w, b], path)`.
 #[allow(non_upper_case_globals)]
 pub const w: Param = Param::W;
-/// Save biases: `train.save([w, b], "model.ogdl")`.
+/// Save biases via `train.save()` / `train.save_as([w, b], path)`.
 #[allow(non_upper_case_globals)]
 pub const b: Param = Param::B;

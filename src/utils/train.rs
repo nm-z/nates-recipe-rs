@@ -4,12 +4,12 @@
 //! `recipe-infer` crate; this module drives them but they never depend back on it.
 
 use crate::dataset::{Dataset, collapse_onehot};
-use crate::model::{Model, Param, Train};
+use crate::model::{Model, Param, RunData, Train};
 use recipe_infer::{
 	Activation, ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, Saved, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
-	download_vec, forward_into, load_ogdl, metric_gpu, metric_gpu_into, nan_impute_and_apply,
-	pinned_vocab, upload, zscore_apply, zscore_fit,
+	download_vec, forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
+	nan_impute_and_apply, pinned_vocab, upload, zscore_apply, zscore_fit,
 };
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
@@ -1031,11 +1031,10 @@ impl Model {
 					saved = true;
 					let path = checkpoint_path.as_ref().expect("checkpoint path");
 					let key = self.loss.score_key();
-					let parts = &[Param::W, Param::B];
 					if Self::saved_score(path, key).is_none_or(|best| score > best) {
 						Self::write_ogdl(
 							path,
-							&Self::dump_ogdl(&params, parts, key, score),
+							&Self::dump_ogdl(&params, None, key, score),
 						);
 						checkpointed = true;
 					}
@@ -1137,23 +1136,22 @@ impl Model {
 		*self.params.borrow_mut() = params;
 		if let Some(s) = end_score {
 			let path = checkpoint_path.as_ref().expect("checkpoint path");
-			let parts = &[Param::W, Param::B];
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				let key = self.loss.score_key();
 				Self::write_ogdl(
 					path,
-					&Self::dump_ogdl(&self.params.borrow(), parts, key, s),
+					&Self::dump_ogdl(&self.params.borrow(), None, key, s),
 				);
 				let full =
 					std::fs::canonicalize(path).unwrap_or_else(|_| path.as_str().into());
 				eprintln!("saved {} ({key} {s:.4})", full.display());
 			} else {
-				self.save_checkpoint(parts, path, s);
+				self.save_checkpoint(path, s);
 			}
 		}
 	}
 
-	fn save_checkpoint(&self, parts: &[Param], path: &str, score: f64) {
+	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "save: call train() first");
 		let key = self.loss.score_key();
@@ -1162,7 +1160,7 @@ impl Model {
 			return;
 		}
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-		Self::write_ogdl(path, &Self::dump_ogdl(&params, parts, key, score));
+		Self::write_ogdl(path, &Self::dump_ogdl(&params, None, key, score));
 		let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
 		eprintln!(
 			"saved {} ({neurons} neurons, {key} {score:.4})",
@@ -1175,8 +1173,13 @@ impl Model {
 	/// dense neuron (`w=` row, `b=` scalar, plus `a=` for a PReLU layer's learned
 	/// slope). W rows are laid out to match `load_ogdl`'s distribution. `parts`
 	/// gates emission: weights only if `W` requested, biases only if `B`.
-	pub(crate) fn dump_ogdl(params: &[LayerParams], parts: &[Param], key: &str, score: f64) -> String {
-		let (want_w, want_b) = (parts.contains(&Param::W), parts.contains(&Param::B));
+	/// `filter: None` saves everything the model allocated (full checkpoint — the
+	/// default for `save()`/auto-checkpoint, future-proof as new param kinds are
+	/// added per layer below). `Some(parts)` restricts to a subset (the `save_as`
+	/// override). Each layer block downloads exactly the buffers it holds.
+	pub(crate) fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
+		let want_w = filter.map_or(true, |f| f.contains(&Param::W));
+		let want_b = filter.map_or(true, |f| f.contains(&Param::B));
 		let join = |v: &[f64]| {
 			v.iter()
 				.map(|x| x.to_string())
@@ -1288,22 +1291,23 @@ impl Model {
 		None
 	}
 
-	pub fn eval(&self, data: &Dataset) {
-		let params = self.params.borrow();
-		assert!(!params.is_empty(), "eval: call train() first");
-		// Mirror fit's two-branch input construction: text token-id columns pass
-		// raw to embed→attn; the categorical branch is scaled with the TRAIN-set
-		// scaler (same mean/std — eval must see the exact transform training saw).
+	/// Adapt a `Dataset` to GPU input buffers exactly as training did — collapse
+	/// one-hot for an embed-first model, split text vs categorical columns, and
+	/// apply the TRAIN-set scaler (same mean/std the model saw). Shared by `eval`
+	/// and `Train::run`'s inference branch so forward-only input construction
+	/// lives in ONE place; the forward itself is recipe-infer's `infer_scored`.
+	pub(crate) fn prep_eval_input(&self, ds: &Dataset) -> (GpuBuffer, Option<GpuBuffer>, usize) {
+		let n = ds.x.nrows();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
-		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
-		let (collapsed_x, collapsed_embed_cols, _collapsed_vocab) = if embed_cats {
-			let (x, ec, v) = collapse_onehot(data);
+		let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
+		let (collapsed_x, collapsed_embed_cols, _v) = if embed_cats {
+			let (x, ec, v) = collapse_onehot(ds);
 			(Some(x), ec, v)
 		} else {
 			(None, Vec::new(), 0)
 		};
-		let eff_x = collapsed_x.as_ref().unwrap_or(&data.x);
-		let eff_text = if embed_cats { &collapsed_embed_cols } else { &data.text_cols };
+		let eff_x = collapsed_x.as_ref().unwrap_or(&ds.x);
+		let eff_text = if embed_cats { &collapsed_embed_cols } else { &ds.text_cols };
 		let cat_cols: Vec<usize> = if embed_first {
 			(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
 		} else {
@@ -1314,44 +1318,55 @@ impl Model {
 		} else {
 			eff_x.clone()
 		};
-		let (xraw, n, d) = upload(&xinput);
+		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
-		let scaler = scaler
-			.as_ref()
-			.expect("eval: missing scaler; call train first");
-		let (xbuf, x_cat) = if embed_first {
+		let scaler_ref = scaler.as_ref().expect("eval: missing scaler; train first");
+		if embed_first {
+			let (xraw, _, _) = upload(&xinput);
 			if cat_cols.is_empty() {
-				(xraw, None)
+				(xraw, None, n)
 			} else {
 				let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
 				let (craw, _, c) = upload(&cat);
-				(xraw, Some(zscore_apply(&craw, n, c, scaler)))
+				(xraw, Some(zscore_apply(&craw, n, c, scaler_ref)), n)
 			}
 		} else {
-			(zscore_apply(&xraw, n, d, scaler), None)
-		};
-		let last = params.len() - 1;
-		let k = params[last].out_dim;
-		// Forward on GPU; accuracy reduced on GPU (no CPU metric computation).
-		let sc = Scratch::new(&params, n, true);
-		let acts = &sc.acts;
-		forward_into(&params, &xbuf, x_cat.as_ref(), n, acts, &sc);
-		// Labeled test (a split) → score it on the GPU. Unlabeled (Kaggle test.csv,
-		// no target column) → forward pass only, nothing to score against.
-		if data.has_target {
-			let ybuf = GpuBuffer::upload(data.y.as_slice().expect("eval: y contiguous"))
+			(nan_impute_and_apply(&xinput, n, d, scaler_ref), None, n)
+		}
+	}
+
+	/// Forward-only evaluation of the trained model on `data`, reporting the
+	/// loss-appropriate score (accuracy for classification, R² for regression).
+	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the
+	/// Dataset. Returns the raw `n*k` predictions.
+	pub fn eval(&self, data: &impl RunData) -> Vec<f64> {
+		let ds = data.dataset();
+		let (xbuf, x_cat, n) = self.prep_eval_input(ds);
+		let params = self.params.borrow();
+		assert!(!params.is_empty(), "eval: call train() first");
+		let yscaler = *self.yscaler.borrow();
+		let metric = if self.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
+		if ds.has_target {
+			let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("eval: y contiguous"))
 				.expect("eval ybuf");
-			let scalar = GpuBuffer::alloc(1).expect("eval scalar");
-			if k == 1 {
-				kernels::gpu_accuracy_into(&acts[last], &ybuf, &scalar, n);
-			} else {
-				kernels::gpu_argmax_accuracy_into(&acts[last], &ybuf, &scalar, n, k);
-			}
-			let acc = download_scalar(&scalar);
-			let correct = (acc * n as f64).round() as usize;
-			eprintln!("eval: accuracy = {acc:.4} ({correct}/{n})");
+			let k = params[params.len() - 1].out_dim;
+			let total = (n * k) as f64;
+			let ybar = ds.y.iter().sum::<f64>() / total;
+			let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
+			let (preds, vals) = infer_scored(
+				&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
+				self.loss, self.lr, std::slice::from_ref(&metric), ss_tot,
+			);
+			let label = if self.loss.is_classification() { "accuracy" } else { "R2" };
+			eprintln!("eval: {label} = {:.4} ({n} samples)", vals[0]);
+			preds
 		} else {
-			eprintln!("eval: {n} samples (no target column, accuracy unavailable)");
+			let (preds, _) = infer_scored(
+				&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
+				self.loss, self.lr, &[], 0.0,
+			);
+			eprintln!("eval: {n} samples (no target column, score unavailable)");
+			preds
 		}
 	}
 }

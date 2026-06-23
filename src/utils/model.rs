@@ -3,9 +3,8 @@ use crate::train::INTERRUPTED;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, Scaler, Scratch, build_layer_params, download_scalar, download_vec, forward_into,
-	load_ogdl_str, metric_gpu, nan_impute_and_apply, pinned_vocab, upload, vram_estimate,
-	zscore_apply,
+	LayerParams, Scaler, Scratch, build_layer_params, download_scalar, forward_into, infer_scored,
+	load_ogdl_str, pinned_vocab, upload, vram_estimate, zscore_apply,
 };
 use std::cell::RefCell;
 use std::io::IsTerminal as _;
@@ -235,7 +234,13 @@ impl Train {
 		self
 	}
 
-	pub fn resume(mut self, path: impl Into<String>) -> Train {
+	/// Warm-start from `model.ogdl` in the cwd (skips silently if absent). For a
+	/// custom path use [`resume_from`](Self::resume_from).
+	pub fn resume(self) -> Train {
+		self.resume_from("model.ogdl")
+	}
+
+	pub fn resume_from(mut self, path: impl Into<String>) -> Train {
 		self.resume = Some(path.into());
 		self
 	}
@@ -350,72 +355,35 @@ impl Train {
 			last.raw_test_rows = data.raw_rows();
 			last.raw_test_headers = data.raw_headers();
 		} else {
+			let (xbuf, x_cat, n) = model.prep_eval_input(ds);
 			let params = model.params.borrow();
 			assert!(!params.is_empty(), "run: call train first");
-			let last_layer = params.len() - 1;
-			let k = params[last_layer].out_dim;
-			let n = ds.x.nrows();
-			let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
-			let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
-			let (collapsed_x, collapsed_embed_cols, collapsed_vocab) = if embed_cats {
-				let (x, ec, v) = collapse_onehot(ds);
-				(Some(x), ec, v)
-			} else {
-				(None, Vec::new(), 0)
-			};
-			let _ = collapsed_vocab;
-			let eff_x = collapsed_x.as_ref().unwrap_or(&ds.x);
-			let eff_text = if embed_cats { &collapsed_embed_cols } else { &ds.text_cols };
-			let cat_cols: Vec<usize> = if embed_first {
-				(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
-			} else {
-				Vec::new()
-			};
-			let xinput = if embed_first {
-				eff_x.select(ndarray::Axis(1), eff_text)
-			} else {
-				eff_x.clone()
-			};
-			let d = xinput.ncols();
-			let scaler = model.scaler.borrow();
-			let scaler_ref = scaler.as_ref().expect("run infer: missing scaler; train first");
-			let (xbuf, x_cat) = if embed_first {
-				let (xraw, _, _) = upload(&xinput);
-				if cat_cols.is_empty() {
-					(xraw, None)
-				} else {
-					let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-					let (craw, _, c) = upload(&cat);
-					(xraw, Some(zscore_apply(&craw, n, c, scaler_ref)))
-				}
-			} else {
-				(nan_impute_and_apply(&xinput, n, d, scaler_ref), None)
-			};
-			let sc = Scratch::new(&params, n, true);
-			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
-			if let Some((ymean, ystd)) = *model.yscaler.borrow() {
-				kernels::gpu_scale_inplace(&sc.acts[last_layer], ystd, n * k);
-				kernels::gpu_add_scalar_inplace(&sc.acts[last_layer], ymean, n * k);
-			}
-			let preds = download_vec(&sc.acts[last_layer], n * k);
-			let score = if ds.has_target && !self.metrics.is_empty() {
+			let k = params[params.len() - 1].out_dim;
+			let yscaler = *model.yscaler.borrow();
+			let (score, preds) = if ds.has_target && !self.metrics.is_empty() {
 				let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
 				let total = (n * k) as f64;
 				let ybar = ds.y.iter().sum::<f64>() / total;
 				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-				let out = &sc.acts[last_layer];
-				let vals: Vec<f64> = self.metrics.iter().map(|&m| {
-					match m {
-						Metric::Lr | Metric::Epoch | Metric::Time => f64::NAN,
-						_ => metric_gpu(model.loss, model.lr, m, out, &ybuf, &sc, n, k, ss_tot, 0, 0.0),
-					}
-				}).collect();
-				let line = model.metrics_line(&self.metrics, &vals);
-				eprintln!("eval  {line}");
+				let (preds, vals) = infer_scored(
+					&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
+					model.loss, model.lr, &self.metrics, ss_tot,
+				);
+				eprintln!("eval  {}", model.metrics_line(&self.metrics, &vals));
 				let stop = if model.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
-				self.metrics.iter().zip(vals.iter()).find(|(m, _)| **m == stop).map_or(f64::NAN, |(_, v)| *v)
+				let score = self
+					.metrics
+					.iter()
+					.zip(vals.iter())
+					.find(|(m, _)| **m == stop)
+					.map_or(f64::NAN, |(_, v)| *v);
+				(score, preds)
 			} else {
-				f64::NAN
+				let (preds, _) = infer_scored(
+					&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
+					model.loss, model.lr, &[], 0.0,
+				);
+				(f64::NAN, preds)
 			};
 			let mut last = self.last.borrow_mut();
 			last.model = model as *const Model;
@@ -436,23 +404,47 @@ impl Train {
 		}
 	}
 
-	pub fn save<I, S>(&self, items: I, path: impl Into<String>)
+	/// Save the FULL trained checkpoint — every param the model allocated — to
+	/// `model.ogdl` in the cwd. The model decides what to write; nothing is
+	/// hardcoded. For a subset, a custom path, or prediction columns, use
+	/// [`save_as`](Self::save_as).
+	pub fn save(&self) {
+		self.save_ogdl(None, "model.ogdl");
+	}
+
+	/// Write the model's params to `path` as OGDL. `filter: None` = everything the
+	/// model holds; `Some(parts)` = subset. Best-only guard: skips if the file
+	/// already holds a better score.
+	fn save_ogdl(&self, filter: Option<&[Param]>, path: &str) {
+		let last = self.last.borrow();
+		if last.model.is_null() {
+			return;
+		}
+		let model = unsafe { &*last.model };
+		let params = model.params.borrow();
+		assert!(!params.is_empty(), "save: model has no trained params");
+		let key = model.loss.score_key();
+		let score = last.score;
+		let path = Self::resolve(path);
+		if !score.is_finite()
+			|| Model::saved_score(&path, key).is_some_and(|best| score <= best)
+		{
+			return;
+		}
+		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+		Model::write_ogdl(&path, &Model::dump_ogdl(&params, filter, key, score));
+		let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
+		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
+	}
+
+	pub fn save_as<I, S>(&self, items: I, path: impl Into<String>)
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<SaveItem>,
 	{
 		let items: Vec<SaveItem> = items.into_iter().map(Into::into).collect();
-		let path = path.into();
-		let path = Self::resolve(&path);
-		let last = self.last.borrow();
-		if last.model.is_null() {
-			return;
-		}
 		let all_params = items.iter().all(|i| matches!(i, SaveItem::W | SaveItem::B));
 		if all_params {
-			let model = unsafe { &*last.model };
-			let params = model.params.borrow();
-			assert!(!params.is_empty(), "save: model has no trained params");
 			let parts: Vec<Param> = items
 				.iter()
 				.map(|i| match i {
@@ -461,18 +453,14 @@ impl Train {
 					_ => unreachable!(),
 				})
 				.collect();
-			let key = model.loss.score_key();
-			let score = last.score;
-			if !score.is_finite()
-				|| Model::saved_score(&path, key).is_some_and(|best| score <= best)
-			{
+			self.save_ogdl(Some(&parts), &path.into());
+		} else {
+			let path = path.into();
+			let path = Self::resolve(&path);
+			let last = self.last.borrow();
+			if last.model.is_null() {
 				return;
 			}
-			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-			Model::write_ogdl(&path, &Model::dump_ogdl(&params, &parts, key, score));
-			let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
-			eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
-		} else {
 			let preds = last.preds.as_ref().expect("save columns: run inference first");
 			let n = last.n;
 			let k = last.k;
@@ -749,6 +737,8 @@ impl Model {
 		self.set_last_activation(Activation::PRelu)
 	}
 
+	/// 1D conv: `filters` output channels, `kernel` width, `stride` downsample
+	/// factor (1 = none). Stride is a conv parameter, not a separate step.
 	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Model {
 		self.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
 		self

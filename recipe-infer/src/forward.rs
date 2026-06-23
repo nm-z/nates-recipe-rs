@@ -549,6 +549,47 @@ pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	v
 }
 
+/// The single forward-only path: built params + prepared input buffers in →
+/// (downloaded `n*k` preds, requested metric values) out. Applies the inverse
+/// target scaler if `yscaler` is set; scores against `ybuf` on the GPU when
+/// present (else returns no metric vals). The model knows how to forward — the
+/// caller adapts its Dataset to tensors and chooses metrics. Both `Train::run`'s
+/// inference branch and `Model::eval` call this; neither reimplements forward.
+#[allow(clippy::too_many_arguments)]
+pub fn infer_scored(
+	params: &[LayerParams],
+	xbuf: &GpuBuffer,
+	x_cat: Option<&GpuBuffer>,
+	n: usize,
+	yscaler: Option<(f64, f64)>,
+	ybuf: Option<&GpuBuffer>,
+	loss: Loss,
+	lr: f64,
+	metrics: &[Metric],
+	ss_tot: f64,
+) -> (Vec<f64>, Vec<f64>) {
+	let last = params.len() - 1;
+	let k = params[last].out_dim;
+	let sc = Scratch::new(params, n, true);
+	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc);
+	if let Some((ymean, ystd)) = yscaler {
+		kernels::gpu_scale_inplace(&sc.acts[last], ystd, n * k);
+		kernels::gpu_add_scalar_inplace(&sc.acts[last], ymean, n * k);
+	}
+	let out = &sc.acts[last];
+	let vals: Vec<f64> = match ybuf {
+		Some(yb) => metrics
+			.iter()
+			.map(|&m| match m {
+				Metric::Lr | Metric::Epoch | Metric::Time => f64::NAN,
+				_ => metric_gpu(loss, lr, m, out, yb, &sc, n, k, ss_tot, 0, 0.0),
+			})
+			.collect(),
+		None => Vec::new(),
+	};
+	(download_vec(out, n * k), vals)
+}
+
 /// Download a single-element GPU buffer (a reduced scalar) to the host.
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64];
