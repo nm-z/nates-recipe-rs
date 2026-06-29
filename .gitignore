@@ -32,8 +32,7 @@ engi/
 
 CLAUDE.md
 
-# Training corpus / datasets (moved out of examples/ — never commit the data)
-/datasets/
+# Training corpus / datasets — tracked via Git LFS (see .gitattributes)
 examples/*/train*.csv
 examples/*/test*.csv
 examples/*/sample*.csv
