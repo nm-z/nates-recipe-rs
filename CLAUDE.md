@@ -167,6 +167,7 @@ Root `build.rs` scans all `src/*.rs` files and panics on banned patterns:
 
 ## Rules
 
+- ANY bug you hit, you FIX — regardless of cause. Never deflect a failure as "pre-existing", "intermittent", "not caused by my change", "unrelated", or "fine on a re-run". That deflection is banned; fix it then and there, even mid-task, then verify. 0% effort proving it isn't yours, 100% on the fix.
 - Diagnose before fixing — read logs, code, and docs first. No guessing.
 - Test changes before claiming success.
 - Minimal, focused edits. If a fix touches >3 files, explain why.

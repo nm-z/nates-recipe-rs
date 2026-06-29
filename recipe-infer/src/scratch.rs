@@ -332,6 +332,12 @@ impl Scratch {
 
 impl Drop for Scratch {
 	fn drop(&mut self) {
+		// Drain all in-flight GPU work BEFORE any buffer field is hipFreeAsync'd:
+		// rocBLAS GEMMs that fall back to their own stream can still be running when
+		// this Scratch's acts/scratch buffers free, racing → "Memory access fault /
+		// GPU Hang" at the phase boundary. One sync here covers every phase
+		// (fit / score / eval / inference). Cheap — only at jawn transitions.
+		let _ = gpu_core::hip::device_synchronize();
 		if !self.pinned_scalar.is_null() {
 			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar as *mut std::ffi::c_void) };
 		}
