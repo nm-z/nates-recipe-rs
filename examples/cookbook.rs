@@ -1,11 +1,29 @@
 use recipe::*;
 
+struct Sets {
+	numeric: &'static str,
+	temporal: &'static str,
+	categoric: &'static str,
+	ordinal: &'static str,
+	text: &'static str,
+	image: &'static str,
+}
+
+const SET: Sets = Sets {
+	numeric: "datasets/house-prices/train.csv",
+	temporal: "datasets/web-traffic-time-series-forecasting/train_1.csv",
+	categoric: "datasets/playground-series-s6e3/train.csv",
+	ordinal: "",
+	text: "datasets/llm-classification-finetuning/train.csv",
+	image: "datasets/predict-the-handwriting-images/train.csv",
+};
+
 fn main() {
 	// ── built APIs ─────────────────────────────────────────────────────────────
 
 	// 1. binary classification — telecom customer churn (Yes/No)
 	let data = Data::load()
-		.set("datasets/playground-series-s6e3/train.csv")
+		.set(SET.categoric)
 		.split(0.8)
 		.exclude("id")
 		.target("Churn");
@@ -32,7 +50,7 @@ fn main() {
 
 	// 2. multi-class classification — handwriting recognition (36 classes: 1-9, A-Z)
 	let data = Data::load()
-		.set("datasets/predict-the-handwriting-images/train.csv")
+		.set(SET.image)
 		.set("datasets/predict-the-handwriting-images/train_images/")
 		.split(0.8)
 		.target("label");
@@ -49,7 +67,7 @@ fn main() {
 
 	// 3. regression — house sale prices
 	let data = Data::load()
-		.set("datasets/house-prices/train.csv")
+		.set(SET.numeric)
 		.split(0.8)
 		.exclude("Id")
 		.target("SalePrice");
@@ -66,7 +84,7 @@ fn main() {
 
 	// 4. text classification — LLM arena judge (3-way: model_a wins, model_b wins, tie)
 	let data = Data::load()
-		.set("datasets/llm-classification-finetuning/train.csv")
+		.set(SET.text)
 		.split(0.8)
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
@@ -83,7 +101,7 @@ fn main() {
 
 	// 5. competition submission — house prices with test set
 	let data = Data::load()
-		.set("datasets/house-prices/train.csv")
+		.set(SET.numeric)
 		.test("datasets/house-prices/test.csv")
 		.exclude("Id")
 		.target("SalePrice");
@@ -109,7 +127,7 @@ fn main() {
 fn unimplemented_api_examples() {
 	// 6. image classification — handwriting with conv layers (pooling is built into conv)
 	let data = Data::load()
-		.set("datasets/predict-the-handwriting-images/train.csv")
+		.set(SET.image)
 		.set("datasets/predict-the-handwriting-images/train_images/")
 		.split(0.8)
 		.target("label");
@@ -128,7 +146,7 @@ fn unimplemented_api_examples() {
 
 	// 7. time series — web traffic forecasting
 	let data = Data::load()
-		.set("datasets/web-traffic-time-series-forecasting/train_1.csv")
+		.set(SET.temporal)
 		.exclude("Page")
 		.window(24)
 		.split(0.8)
@@ -139,7 +157,7 @@ fn unimplemented_api_examples() {
 
 	// 8. boosted trees — churn prediction (same data, tree model)
 	let data = Data::load()
-		.set("datasets/playground-series-s6e3/train.csv")
+		.set(SET.categoric)
 		.split(0.8)
 		.exclude("id")
 		.target("Churn");
@@ -149,7 +167,7 @@ fn unimplemented_api_examples() {
 
 	// 9. ensemble — NN + trees on churn
 	let data = Data::load()
-		.set("datasets/playground-series-s6e3/train.csv")
+		.set(SET.categoric)
 		.split(0.8)
 		.exclude("id")
 		.target("Churn");
