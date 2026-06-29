@@ -2,12 +2,12 @@ use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// ── rocBLAS f32 ────────────────────────────────────────────────────────────
+// ── hipBLAS f32 ────────────────────────────────────────────────────────────
 // Same column-major conventions as kernels.rs dgemm section.
-const ROCBLAS_OPERATION_NONE: u32 = 111;
+const HIPBLAS_OP_N: u32 = 111;
 
 unsafe extern "C" {
-	fn rocblas_sgemm(
+	fn hipblasSgemm(
 		handle: *mut c_void,
 		transA: u32,
 		transB: u32,
@@ -24,7 +24,7 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	fn rocblas_saxpy(
+	fn hipblasSaxpy(
 		handle: *mut c_void,
 		n: i32,
 		alpha: *const f32,
@@ -217,10 +217,10 @@ pub fn gpu_linear_f32(
 	let alpha = 1.0_f32;
 	let beta = 1.0_f32;
 	let status = unsafe {
-		rocblas_sgemm(
-			crate::kernels::rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasSgemm(
+			crate::kernels::hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_N,
 			safe_i32(n),
 			safe_i32(m),
 			safe_i32(k),
@@ -629,12 +629,12 @@ pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, 
 }
 
 // ── gpu_sgd_update_f32 ────────────────────────────────────────────────────
-// In-place: weights -= lr * grad, via rocblas_saxpy with negated lr.
+// In-place: weights -= lr * grad, via hipblasSaxpy with negated lr.
 pub fn gpu_sgd_update_f32(weights: &GpuBuffer, grad: &GpuBuffer, lr: f32, n: usize) {
 	let neg_lr = -lr;
 	let status = unsafe {
-		rocblas_saxpy(
-			crate::kernels::rocblas_handle(),
+		hipblasSaxpy(
+			crate::kernels::hipblas_handle(),
 			safe_i32(n),
 			&neg_lr,
 			grad.ptr_raw() as *const f32,
@@ -643,5 +643,5 @@ pub fn gpu_sgd_update_f32(weights: &GpuBuffer, grad: &GpuBuffer, lr: f32, n: usi
 			1,
 		)
 	};
-	assert_eq!(status, 0, "rocblas_saxpy failed with status {}", status);
+	assert_eq!(status, 0, "hipblasSaxpy failed with status {}", status);
 }

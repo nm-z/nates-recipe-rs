@@ -13,10 +13,11 @@ __device__ __forceinline__ double block_sum_bcast(double val, double* smem) {
     for (int off = warpSize / 2; off > 0; off /= 2) val += __shfl_down(val, off);
     if (lane == 0) smem[wid] = val;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        double v = smem[threadIdx.x];
+    int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+    if (wid == 0) {
+        double v = (lane < nwarps) ? smem[lane] : 0.0;
         for (int off = warpSize / 2; off > 0; off /= 2) v += __shfl_down(v, off);
-        if (threadIdx.x == 0) smem[0] = v;
+        if (lane == 0) smem[0] = v;
     }
     __syncthreads();
     double total = smem[0];

@@ -58,11 +58,14 @@ unsafe extern "C" {
 	);
 	fn launch_indexingx_tril(m: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_indexingx_triu(m: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn indexingx_masked_select_workspace_bytes(n: i32) -> usize;
 	fn launch_indexingx_masked_select(
 		in_: *const c_void,
 		flags: *const c_void,
 		out: *mut c_void,
 		d_num: *mut c_void,
+		d_temp: *mut c_void,
+		temp_bytes: usize,
 		n: i32,
 		s: *mut c_void,
 	);
@@ -213,12 +216,17 @@ fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	let bf = GpuBuffer::upload_u8(flags).unwrap();
 	let o = GpuBuffer::alloc(n).unwrap();
 	let bn = GpuBuffer::alloc_bytes(4).unwrap();
+	// hipcub DeviceSelect::Flagged is two-phase: query temp size, allocate, then run.
+	let temp_bytes = unsafe { indexingx_masked_select_workspace_bytes(n as i32) };
+	let d_temp = GpuBuffer::alloc_bytes(temp_bytes.max(1)).unwrap();
 	unsafe {
 		launch_indexingx_masked_select(
 			bi.ptr_raw() as *const c_void,
 			bf.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			bn.ptr_raw(),
+			d_temp.ptr_raw(),
+			temp_bytes,
 			n as i32,
 			std::ptr::null_mut(),
 		);

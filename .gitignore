@@ -32,7 +32,8 @@ engi/
 
 CLAUDE.md
 
-# Training corpus / datasets — tracked via Git LFS (see .gitattributes)
+# Training corpus / datasets — tracked via Git LFS (see .gitattributes).
+# examples-local copies stay ignored.
 examples/*/train*.csv
 examples/*/test*.csv
 examples/*/sample*.csv
@@ -43,3 +44,4 @@ examples/*/test_images/
 !examples/cookbook.rs
 !examples/train_detector.rs
 /kernel_inventory.db
+/gpu-core/vendor/

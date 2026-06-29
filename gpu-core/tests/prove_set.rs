@@ -25,32 +25,47 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 unsafe extern "C" {
+	fn launch_setx_unique_workspace_bytes(n: i32) -> usize;
 	fn launch_setx_unique(
 		x: *const c_void,
+		keys_sorted: *mut c_void,
 		out: *mut c_void,
 		out_count: *mut c_void,
+		tmp: *mut c_void,
+		tmp_bytes: usize,
 		n: i32,
 		s: *mut c_void,
 	);
+	fn launch_setx_unique_consecutive_workspace_bytes(n: i32) -> usize;
 	fn launch_setx_unique_consecutive(
 		x: *const c_void,
 		out: *mut c_void,
 		out_count: *mut c_void,
+		tmp: *mut c_void,
+		tmp_bytes: usize,
 		n: i32,
 		s: *mut c_void,
 	);
+	fn launch_setx_unique_counts_workspace_bytes(n: i32) -> usize;
 	fn launch_setx_unique_counts(
 		x: *const c_void,
+		keys_sorted: *mut c_void,
 		vals_out: *mut c_void,
 		counts_out: *mut c_void,
 		out_count: *mut c_void,
+		tmp: *mut c_void,
+		tmp_bytes: usize,
 		n: i32,
 		s: *mut c_void,
 	);
+	fn launch_setx_isin_workspace_bytes(nb: i32) -> usize;
 	fn launch_setx_isin(
 		a: *const c_void,
 		b: *const c_void,
+		b_sorted: *mut c_void,
 		mask: *mut c_void,
+		tmp: *mut c_void,
+		tmp_bytes: usize,
 		na: i32,
 		nb: i32,
 		s: *mut c_void,
@@ -75,19 +90,54 @@ fn data() -> Vec<f64> {
 
 // ── GPU runners ──
 
-fn run_unique(
-	launch: unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, *mut c_void),
-	x: &[f64],
-) -> Vec<f64> {
+// unique: radix sort then adjacent dedup -> needs an extra keys_sorted f64[n]
+// scratch the launcher sorts into, plus the hipcub temp workspace.
+fn run_unique(x: &[f64]) -> Vec<f64> {
+	let n = x.len();
+	let b = GpuBuffer::upload(x).unwrap();
+	let keys_sorted = GpuBuffer::alloc(n).unwrap();
+	let out = GpuBuffer::alloc(n).unwrap();
+	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
+	let wb = unsafe { launch_setx_unique_workspace_bytes(n as i32) };
+	let tmp = GpuBuffer::alloc_bytes(wb.max(1)).unwrap();
+	unsafe {
+		launch_setx_unique(
+			b.ptr_raw() as *const c_void,
+			keys_sorted.ptr_raw(),
+			out.ptr_raw(),
+			cnt.ptr_raw(),
+			tmp.ptr_raw(),
+			wb,
+			n as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	lasterr();
+	let mut k = [0i32];
+	cnt.download_i32(&mut k).unwrap();
+	let k = k[0] as usize;
+	let mut buf = vec![0.0; n];
+	out.download(&mut buf).unwrap();
+	buf.truncate(k);
+	buf
+}
+
+// unique_consecutive: adjacent dedup only, no sort -> no keys_sorted scratch,
+// just the hipcub DeviceSelect::Unique temp workspace.
+fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 	let n = x.len();
 	let b = GpuBuffer::upload(x).unwrap();
 	let out = GpuBuffer::alloc(n).unwrap();
 	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
+	let wb = unsafe { launch_setx_unique_consecutive_workspace_bytes(n as i32) };
+	let tmp = GpuBuffer::alloc_bytes(wb.max(1)).unwrap();
 	unsafe {
-		launch(
+		launch_setx_unique_consecutive(
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			cnt.ptr_raw(),
+			tmp.ptr_raw(),
+			wb,
 			n as i32,
 			std::ptr::null_mut(),
 		);
@@ -105,15 +155,21 @@ fn run_unique(
 fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 	let n = x.len();
 	let b = GpuBuffer::upload(x).unwrap();
+	let keys_sorted = GpuBuffer::alloc(n).unwrap();
 	let vals = GpuBuffer::alloc(n).unwrap();
 	let counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
 	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
+	let wb = unsafe { launch_setx_unique_counts_workspace_bytes(n as i32) };
+	let tmp = GpuBuffer::alloc_bytes(wb.max(1)).unwrap();
 	unsafe {
 		launch_setx_unique_counts(
 			b.ptr_raw() as *const c_void,
+			keys_sorted.ptr_raw(),
 			vals.ptr_raw(),
 			counts.ptr_raw(),
 			cnt.ptr_raw(),
+			tmp.ptr_raw(),
+			wb,
 			n as i32,
 			std::ptr::null_mut(),
 		);
@@ -135,11 +191,18 @@ fn run_isin(a: &[f64], b: &[f64]) -> Vec<f64> {
 	let ba = GpuBuffer::upload(a).unwrap();
 	let bb = GpuBuffer::upload(b).unwrap();
 	let mask = GpuBuffer::alloc(a.len()).unwrap();
+	// hipcub DeviceRadixSort sorts b internally: needs a b_sorted output + temp storage.
+	let b_sorted = GpuBuffer::alloc(b.len()).unwrap();
+	let tmp_bytes = unsafe { launch_setx_isin_workspace_bytes(b.len() as i32) };
+	let tmp = GpuBuffer::alloc_bytes(tmp_bytes.max(1)).unwrap();
 	unsafe {
 		launch_setx_isin(
 			ba.ptr_raw() as *const c_void,
 			bb.ptr_raw() as *const c_void,
+			b_sorted.ptr_raw(),
 			mask.ptr_raw(),
+			tmp.ptr_raw(),
+			tmp_bytes,
 			a.len() as i32,
 			b.len() as i32,
 			std::ptr::null_mut(),
@@ -200,7 +263,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 	// unique: sorted distinct == CPU sort+dedup
 	{
-		let g = run_unique(launch_setx_unique, &x);
+		let g = run_unique(&x);
 		let w = cpu_unique(&x);
 		let pass = g.len() == w.len() && g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!("unique", pass, format!("unique {:?} != {:?}", g, w));
@@ -209,7 +272,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	// unique_consecutive: adjacent-only dedup, original order == CPU dedup
 	// MUST differ from unique here (probe has non-adjacent dups), else vacuous.
 	{
-		let g = run_unique(launch_setx_unique_consecutive, &x);
+		let g = run_unique_consecutive(&x);
 		let w = cpu_unique_consecutive(&x);
 		let mut pass =
 			g.len() == w.len() && g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= TOL);

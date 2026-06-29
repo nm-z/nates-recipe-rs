@@ -18,14 +18,91 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 unsafe extern "C" {
-	fn launch_sortx_sort_asc(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_sortx_sort_desc(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_sortx_argsort(x: *const c_void, out_idx: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_sortx_topk(x: *const c_void, out: *mut c_void, n: i32, k: i32, s: *mut c_void);
-	fn launch_sortx_kthvalue(x: *const c_void, out: *mut c_void, n: i32, k: i32, s: *mut c_void);
-	fn launch_sortx_median(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_sortx_argmax(x: *const c_void, out_idx: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_sortx_argmin(x: *const c_void, out_idx: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_sortx_sort_asc(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_sort_asc_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_sort_desc(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_sort_desc_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_argsort(
+		x: *const c_void,
+		out_idx: *mut c_void,
+		n: i32,
+		keys_out: *mut c_void,
+		vals_in: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_argsort_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_topk(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		k: i32,
+		keys_out: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_topk_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_kthvalue(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		k: i32,
+		keys_out: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_kthvalue_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_median(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		keys_out: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_median_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_argmax(
+		x: *const c_void,
+		out_idx: *mut c_void,
+		n: i32,
+		keys_out: *mut c_void,
+		vals_in: *mut c_void,
+		vals_out: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_argmax_workspace_bytes(n: i32) -> usize;
+	fn launch_sortx_argmin(
+		x: *const c_void,
+		out_idx: *mut c_void,
+		n: i32,
+		keys_out: *mut c_void,
+		vals_in: *mut c_void,
+		vals_out: *mut c_void,
+		workspace: *mut c_void,
+		workspace_bytes: usize,
+		s: *mut c_void,
+	);
+	fn sortx_argmin_workspace_bytes(n: i32) -> usize;
 	fn launch_sortx_searchsorted(
 		sorted: *const c_void,
 		q: *const c_void,
@@ -52,16 +129,21 @@ fn data() -> Vec<f64> {
 }
 
 fn run_keys(
-	f: unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void),
+	f: unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void, usize, *mut c_void),
+	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 ) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc(x.len()).unwrap();
+	let wbytes = unsafe { wb(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		f(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -74,11 +156,19 @@ fn run_keys(
 fn run_argsort(x: &[f64]) -> Vec<i32> {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
+	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
+	let vals_in = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
+	let wbytes = unsafe { sortx_argsort_workspace_bytes(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		launch_sortx_argsort(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
+			keys_out.ptr_raw(),
+			vals_in.ptr_raw(),
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -89,16 +179,37 @@ fn run_argsort(x: &[f64]) -> Vec<i32> {
 }
 
 fn run_argextreme(
-	f: unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void),
+	f: unsafe extern "C" fn(
+		*const c_void,
+		*mut c_void,
+		i32,
+		*mut c_void,
+		*mut c_void,
+		*mut c_void,
+		*mut c_void,
+		usize,
+		*mut c_void,
+	),
+	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 ) -> i32 {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc_bytes(4).unwrap();
+	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
+	let vals_in = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
+	let vals_out = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
+	let wbytes = unsafe { wb(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		f(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
+			keys_out.ptr_raw(),
+			vals_in.ptr_raw(),
+			vals_out.ptr_raw(),
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -111,12 +222,18 @@ fn run_argextreme(
 fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc(k).unwrap();
+	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
+	let wbytes = unsafe { sortx_topk_workspace_bytes(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		launch_sortx_topk(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
 			k as i32,
+			keys_out.ptr_raw(),
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -127,18 +244,34 @@ fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
 }
 
 fn run_scalar(
-	f: unsafe extern "C" fn(*const c_void, *mut c_void, i32, i32, *mut c_void),
+	f: unsafe extern "C" fn(
+		*const c_void,
+		*mut c_void,
+		i32,
+		i32,
+		*mut c_void,
+		*mut c_void,
+		usize,
+		*mut c_void,
+	),
+	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 	k: i32,
 ) -> f64 {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc(1).unwrap();
+	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
+	let wbytes = unsafe { wb(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		f(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
 			k,
+			keys_out.ptr_raw(),
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -151,11 +284,17 @@ fn run_scalar(
 fn run_median(x: &[f64]) -> f64 {
 	let b = GpuBuffer::upload(x).unwrap();
 	let o = GpuBuffer::alloc(1).unwrap();
+	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
+	let wbytes = unsafe { sortx_median_workspace_bytes(x.len() as i32) };
+	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
 	unsafe {
 		launch_sortx_median(
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
+			keys_out.ptr_raw(),
+			ws.ptr_raw(),
+			wbytes,
 			std::ptr::null_mut(),
 		);
 	}
@@ -210,7 +349,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 	// sort ascending == CPU sort
 	{
-		let g = run_keys(launch_sortx_sort_asc, &x);
+		let g = run_keys(launch_sortx_sort_asc, sortx_sort_asc_workspace_bytes, &x);
 		let pass =
 			g.len() == asc.len() && g.iter().zip(&asc).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!("sort", pass, format!("sort_asc {:?} != {:?}", g, asc));
@@ -219,7 +358,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		let mut desc = asc.clone();
 		desc.reverse();
-		let g = run_keys(launch_sortx_sort_desc, &x);
+		let g = run_keys(launch_sortx_sort_desc, sortx_sort_desc_workspace_bytes, &x);
 		let pass = g.iter().zip(&desc).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!(
 			"sort_desc",
@@ -263,7 +402,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		let mut all = true;
 		for k in [1usize, 7, n] {
-			let g = run_scalar(launch_sortx_kthvalue, &x, k as i32);
+			let g = run_scalar(launch_sortx_kthvalue, sortx_kthvalue_workspace_bytes, &x, k as i32);
 			let want = asc[k - 1];
 			if (g - want).abs() > TOL {
 				all = false;
@@ -293,12 +432,12 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	}
 	// argmax / argmin (ties: radix pair sort returns the lowest original index)
 	{
-		let g = run_argextreme(launch_sortx_argmax, &x);
+		let g = run_argextreme(launch_sortx_argmax, sortx_argmax_workspace_bytes, &x);
 		let want = (0..n)
 			.max_by(|&a, &b| x[a].partial_cmp(&x[b]).unwrap())
 			.unwrap() as i32;
 		mark!("argmax", g == want, format!("argmax {} != {}", g, want));
-		let g2 = run_argextreme(launch_sortx_argmin, &x);
+		let g2 = run_argextreme(launch_sortx_argmin, sortx_argmin_workspace_bytes, &x);
 		let want2 = (0..n)
 			.min_by(|&a, &b| x[a].partial_cmp(&x[b]).unwrap())
 			.unwrap() as i32;

@@ -76,13 +76,14 @@ extern "C" __global__ void softmax_rows_kernel(const double* x, double* out, int
     int wid = threadIdx.x / warpSize;
     if (lane == 0) smax[wid] = local_max;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_max = smax[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_max = (lane < nwarps) ? smax[lane] : -1e308;
         for (int offset = warpSize / 2; offset > 0; offset /= 2) {
             double other = __shfl_down(local_max, offset);
             if (other > local_max) local_max = other;
         }
-        if (threadIdx.x == 0) smax[0] = local_max;
+        if (lane == 0) smax[0] = local_max;
     }
     __syncthreads();
     double row_max = smax[0];
@@ -100,11 +101,12 @@ extern "C" __global__ void softmax_rows_kernel(const double* x, double* out, int
     __shared__ double ssum[32];
     if (lane == 0) ssum[wid] = local_sum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_sum = ssum[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < nwarps) ? ssum[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             local_sum += __shfl_down(local_sum, offset);
-        if (threadIdx.x == 0) ssum[0] = local_sum;
+        if (lane == 0) ssum[0] = local_sum;
     }
     __syncthreads();
     double row_sum = ssum[0];
@@ -599,11 +601,12 @@ extern "C" __global__ void gaussian_ll_kernel(
     int wid = threadIdx.x / warpSize;
     if (lane == 0) sdata[wid] = local_sum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_sum = sdata[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < nwarps) ? sdata[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             local_sum += __shfl_down(local_sum, offset);
-        if (threadIdx.x == 0) {
+        if (lane == 0) {
             out[i * k + c] = log_priors[c] - 0.5 * local_sum;
         }
     }
@@ -704,11 +707,12 @@ extern "C" __global__ void layernorm_kernel(const double* x, double* out,
     int wid = threadIdx.x / warpSize;
     if (lane == 0) smem[wid] = sum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        sum = smem[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nwarps) ? smem[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             sum += __shfl_down(sum, offset);
-        if (threadIdx.x == 0) smem[0] = sum;
+        if (lane == 0) smem[0] = sum;
     }
     __syncthreads();
     double mean = smem[0] / cols;
@@ -722,11 +726,12 @@ extern "C" __global__ void layernorm_kernel(const double* x, double* out,
         var_acc += __shfl_down(var_acc, offset);
     if (lane == 0) smem[wid] = var_acc;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        var_acc = smem[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        var_acc = (lane < nwarps) ? smem[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             var_acc += __shfl_down(var_acc, offset);
-        if (threadIdx.x == 0) smem[0] = var_acc;
+        if (lane == 0) smem[0] = var_acc;
     }
     __syncthreads();
     double inv_std = 1.0 / sqrt(smem[0] / cols + eps);
@@ -1042,11 +1047,12 @@ extern "C" __global__ void softmax_backward_kernel(
     int wid = threadIdx.x / warpSize;
     if (lane == 0) sdot[wid] = local_dot;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_dot = sdot[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_dot = (lane < nwarps) ? sdot[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             local_dot += __shfl_down(local_dot, offset);
-        if (threadIdx.x == 0) sdot[0] = local_dot;
+        if (lane == 0) sdot[0] = local_dot;
     }
     __syncthreads();
     double dot = sdot[0];
@@ -1083,13 +1089,14 @@ extern "C" __global__ void log_softmax_rows_kernel(const double* x, double* out,
     int wid = threadIdx.x / warpSize;
     if (lane == 0) smax[wid] = local_max;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_max = smax[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_max = (lane < nwarps) ? smax[lane] : -1e308;
         for (int offset = warpSize / 2; offset > 0; offset /= 2) {
             double other = __shfl_down(local_max, offset);
             if (other > local_max) local_max = other;
         }
-        if (threadIdx.x == 0) smax[0] = local_max;
+        if (lane == 0) smax[0] = local_max;
     }
     __syncthreads();
     double row_max = smax[0];
@@ -1102,11 +1109,12 @@ extern "C" __global__ void log_softmax_rows_kernel(const double* x, double* out,
     __shared__ double ssum[32];
     if (lane == 0) ssum[wid] = local_sum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_sum = ssum[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < nwarps) ? ssum[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             local_sum += __shfl_down(local_sum, offset);
-        if (threadIdx.x == 0) ssum[0] = local_sum;
+        if (lane == 0) ssum[0] = local_sum;
     }
     __syncthreads();
     double log_sum_exp = log(ssum[0]);
@@ -1145,13 +1153,14 @@ extern "C" __global__ void cross_entropy_kernel(
     int wid = threadIdx.x / warpSize;
     if (lane == 0) smax[wid] = local_max;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_max = smax[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_max = (lane < nwarps) ? smax[lane] : -1e308;
         for (int offset = warpSize / 2; offset > 0; offset /= 2) {
             double other = __shfl_down(local_max, offset);
             if (other > local_max) local_max = other;
         }
-        if (threadIdx.x == 0) smax[0] = local_max;
+        if (lane == 0) smax[0] = local_max;
     }
     __syncthreads();
     double row_max = smax[0];
@@ -1164,11 +1173,12 @@ extern "C" __global__ void cross_entropy_kernel(
     __shared__ double ssum[32];
     if (lane == 0) ssum[wid] = local_sum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        local_sum = ssum[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < nwarps) ? ssum[lane] : 0.0;
         for (int offset = warpSize / 2; offset > 0; offset /= 2)
             local_sum += __shfl_down(local_sum, offset);
-        if (threadIdx.x == 0) ssum[0] = local_sum;
+        if (lane == 0) ssum[0] = local_sum;
     }
     __syncthreads();
 
@@ -1571,10 +1581,11 @@ extern "C" __global__ void batchnorm_forward_kernel(
     int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
     if (lane == 0) sm[wid] = lsum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lsum = sm[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        lsum = (lane < nwarps) ? sm[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) lsum += __shfl_down(lsum, off);
-        if (threadIdx.x == 0) sm[0] = lsum;
+        if (lane == 0) sm[0] = lsum;
     }
     __syncthreads();
     double mean = sm[0] / N;
@@ -1586,10 +1597,11 @@ extern "C" __global__ void batchnorm_forward_kernel(
     for (int off = warpSize/2; off > 0; off /= 2) lvar += __shfl_down(lvar, off);
     if (lane == 0) sm[wid] = lvar;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lvar = sm[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        lvar = (lane < nwarps) ? sm[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) lvar += __shfl_down(lvar, off);
-        if (threadIdx.x == 0) sm[0] = lvar;
+        if (lane == 0) sm[0] = lvar;
     }
     __syncthreads();
     double inv_std = 1.0 / sqrt(sm[0] / N + eps);
@@ -1659,10 +1671,11 @@ extern "C" __global__ void batchnorm_backward_kernel(
     int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
     if (lane == 0) { s1[wid] = ldy; s2[wid] = ldyx; }
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        ldy = s1[threadIdx.x]; ldyx = s2[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        ldy = (lane < nwarps) ? s1[lane] : 0.0; ldyx = (lane < nwarps) ? s2[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) { ldy += __shfl_down(ldy, off); ldyx += __shfl_down(ldyx, off); }
-        if (threadIdx.x == 0) { s1[0] = ldy; s2[0] = ldyx; }
+        if (lane == 0) { s1[0] = ldy; s2[0] = ldyx; }
     }
     __syncthreads();
     double sum_dy = s1[0], sum_dyx = s2[0];
@@ -1708,10 +1721,11 @@ extern "C" __global__ void layernorm_backward_kernel(
     __shared__ double smem[32];
     if (lane == 0) smem[wid] = lm;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lm = smem[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        lm = (lane < nwarps) ? smem[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) lm += __shfl_down(lm, off);
-        if (threadIdx.x == 0) smem[0] = lm;
+        if (lane == 0) smem[0] = lm;
     }
     __syncthreads();
     double mean = smem[0] / cols;
@@ -1722,10 +1736,11 @@ extern "C" __global__ void layernorm_backward_kernel(
     for (int off = warpSize/2; off > 0; off /= 2) lv += __shfl_down(lv, off);
     if (lane == 0) smem[wid] = lv;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lv = smem[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        lv = (lane < nwarps) ? smem[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) lv += __shfl_down(lv, off);
-        if (threadIdx.x == 0) smem[0] = lv;
+        if (lane == 0) smem[0] = lv;
     }
     __syncthreads();
     double inv_std = 1.0 / sqrt(smem[0] / cols + eps);
@@ -1743,10 +1758,11 @@ extern "C" __global__ void layernorm_backward_kernel(
     for (int off = warpSize/2; off > 0; off /= 2) { ls1 += __shfl_down(ls1, off); ls2 += __shfl_down(ls2, off); }
     if (lane == 0) { ss1[wid] = ls1; ss2[wid] = ls2; }
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        ls1 = ss1[threadIdx.x]; ls2 = ss2[threadIdx.x];
+    if (wid == 0) {
+        int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+        ls1 = (lane < nwarps) ? ss1[lane] : 0.0; ls2 = (lane < nwarps) ? ss2[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) { ls1 += __shfl_down(ls1, off); ls2 += __shfl_down(ls2, off); }
-        if (threadIdx.x == 0) { ss1[0] = ls1; ss2[0] = ls2; }
+        if (lane == 0) { ss1[0] = ls1; ss2[0] = ls2; }
     }
     __syncthreads();
     double sum1 = ss1[0], sum2 = ss2[0];

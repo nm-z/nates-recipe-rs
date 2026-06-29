@@ -107,13 +107,18 @@ impl Scratch {
 			if a > max_act {
 				max_act = a;
 			}
-			let wt = if p.kind == LayerKind::Conv {
-				let lin = p.in_dim / p.conv_cin;
-				let lout = (lin - p.conv_k) / p.conv_stride + 1;
-				let cout = p.out_dim / lout;
-				cout * p.conv_cin * p.conv_k
-			} else {
-				p.in_dim * p.out_dim
+			// dw holds ONLY Dense/Conv weight grads. Attn projections write their
+			// d×d grads to a_gw and Embed writes to embed_grad, so neither sizes dw —
+			// an attn in_dim×out_dim here is (S·d)² and would blow VRAM for nothing.
+			let wt = match p.kind {
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					cout * p.conv_cin * p.conv_k
+				}
+				LayerKind::Dense => p.in_dim * p.out_dim,
+				_ => 0,
 			};
 			if wt > max_wt {
 				max_wt = wt;
@@ -307,8 +312,19 @@ impl Scratch {
 			if n * p.out_dim.max(p.in_dim) > max_act {
 				max_act = n * p.out_dim.max(p.in_dim);
 			}
-			if p.in_dim * p.out_dim > max_wt {
-				max_wt = p.in_dim * p.out_dim;
+			// Mirror new(): dw is sized only by Dense/Conv (Attn→a_gw, Embed→embed_grad).
+			let wt = match p.kind {
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					cout * p.conv_cin * p.conv_k
+				}
+				LayerKind::Dense => p.in_dim * p.out_dim,
+				_ => 0,
+			};
+			if wt > max_wt {
+				max_wt = wt;
 			}
 			if p.out_dim > max_bias {
 				max_bias = p.out_dim;

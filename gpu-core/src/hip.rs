@@ -93,8 +93,8 @@ unsafe extern "C" {
 	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	// Managed (unified) memory
 	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
-	// rocBLAS — matrix-vector multiply (out_dim == 1 fast path)
-	pub fn rocblas_dgemv(
+	// hipBLAS — matrix-vector multiply (out_dim == 1 fast path)
+	pub fn hipblasDgemv(
 		handle: *mut c_void,
 		trans: u32,
 		m: i32,
@@ -108,8 +108,8 @@ unsafe extern "C" {
 		y: *mut f64,
 		incy: i32,
 	) -> i32;
-	// rocBLAS — rank-1 update: A = alpha * x * yᵀ + A (column-major)
-	pub fn rocblas_dger(
+	// hipBLAS — rank-1 update: A = alpha * x * yᵀ + A (column-major)
+	pub fn hipblasDger(
 		handle: *mut c_void,
 		m: i32,
 		n: i32,

@@ -15,17 +15,17 @@ pub(crate) fn safe_i32(v: usize) -> i32 {
 	v as i32
 }
 
-// rocBLAS operation constants
-const ROCBLAS_OPERATION_NONE: u32 = 111;
-const ROCBLAS_OPERATION_TRANSPOSE: u32 = 112;
+// hipBLAS operation constants
+const HIPBLAS_OP_N: u32 = 111;
+const HIPBLAS_OP_T: u32 = 112;
 
 unsafe extern "C" {
-	// rocBLAS handle management
-	fn rocblas_create_handle(handle: *mut *mut c_void) -> i32;
-	fn rocblas_destroy_handle(handle: *mut c_void) -> i32;
+	// hipBLAS handle management
+	fn hipblasCreate(handle: *mut *mut c_void) -> i32;
+	fn hipblasDestroy(handle: *mut c_void) -> i32;
 
-	// rocBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
-	fn rocblas_dgemm(
+	// hipBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
+	fn hipblasDgemm(
 		handle: *mut c_void,
 		transA: u32,
 		transB: u32,
@@ -42,8 +42,8 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	// rocBLAS daxpy: y = alpha * x + y
-	fn rocblas_daxpy(
+	// hipBLAS daxpy: y = alpha * x + y
+	fn hipblasDaxpy(
 		handle: *mut c_void,
 		n: i32,
 		alpha: *const f64,
@@ -53,8 +53,8 @@ unsafe extern "C" {
 		incy: i32,
 	) -> i32;
 
-	// rocBLAS dscal: x = alpha * x (in-place)
-	fn rocblas_dscal(
+	// hipBLAS dscal: x = alpha * x (in-place)
+	fn hipblasDscal(
 		handle: *mut c_void,
 		n: i32,
 		alpha: *const f64,
@@ -65,31 +65,35 @@ unsafe extern "C" {
 	// HIP memcpy for the copy needed in gpu_scale
 	fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
 
-	// rocsolver Cholesky factorization: A = L L^T (in-place, lower triangle)
-	fn rocsolver_dpotrf(
-		handle: *mut c_void,
-		uplo: u32, // 121 = lower
-		n: i32,
-		A: *mut f64,
-		lda: i32,
-		info: *mut i32,
+	// hipSOLVER (→ rocSOLVER on AMD, cuSOLVER on NVIDIA). Explicit-workspace model:
+	// query *_bufferSize, allocate a device work buffer, pass work/lwork + devInfo.
+	fn hipsolverCreate(handle: *mut *mut c_void) -> i32;
+	fn hipsolverDestroy(handle: *mut c_void) -> i32;
+	fn hipsolverDpotrf_bufferSize(
+		handle: *mut c_void, uplo: u32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32,
+	) -> i32;
+	fn hipsolverDpotrf(
+		handle: *mut c_void, uplo: u32, n: i32, A: *mut f64, lda: i32,
+		work: *mut f64, lwork: i32, info: *mut i32,
+	) -> i32;
+	fn hipsolverDgetrf_bufferSize(
+		handle: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32,
+	) -> i32;
+	fn hipsolverDgetrf(
+		handle: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32,
+		work: *mut f64, lwork: i32, ipiv: *mut i32, info: *mut i32,
+	) -> i32;
+	fn hipsolverDgetrs_bufferSize(
+		handle: *mut c_void, trans: u32, n: i32, nrhs: i32, A: *mut f64, lda: i32,
+		ipiv: *mut i32, B: *mut f64, ldb: i32, lwork: *mut i32,
+	) -> i32;
+	fn hipsolverDgetrs(
+		handle: *mut c_void, trans: u32, n: i32, nrhs: i32, A: *mut f64, lda: i32,
+		ipiv: *mut i32, B: *mut f64, ldb: i32, work: *mut f64, lwork: i32, info: *mut i32,
 	) -> i32;
 
-	// rocsolver LU solve: solve A*X = B via LU pivoting (in-place, overwrites A and B)
-	fn rocsolver_dgesv(
-		handle: *mut c_void,
-		n: i32,
-		nrhs: i32,
-		A: *mut f64,
-		lda: i32,
-		ipiv: *mut i32,
-		B: *mut f64,
-		ldb: i32,
-		info: *mut i32,
-	) -> i32;
-
-	// rocBLAS triangular solve: op(A) * X = alpha * B (in-place, overwrites B)
-	fn rocblas_dtrsm(
+	// hipBLAS triangular solve: op(A) * X = alpha * B (in-place, overwrites B)
+	fn hipblasDtrsm(
 		handle: *mut c_void,
 		side: u32,   // 141 = left
 		uplo: u32,   // 121 = lower, 122 = upper
@@ -1442,7 +1446,8 @@ unsafe extern "C" {
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 thread_local! {
-    static ROCBLAS_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
+    static HIPBLAS_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
+    static HIPSOLVER_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
 }
 
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1453,8 +1458,8 @@ unsafe extern "C" fn atexit_gpu_shutdown() {
 	gpu_shutdown();
 }
 
-pub(crate) fn rocblas_handle() -> *mut c_void {
-	ROCBLAS_HANDLE.with(|h| {
+pub(crate) fn hipblas_handle() -> *mut c_void {
+	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
 		if !ptr.is_null() {
 			return ptr;
@@ -1466,10 +1471,28 @@ pub(crate) fn rocblas_handle() -> *mut c_void {
 			unsafe { atexit(atexit_gpu_shutdown) };
 		}
 		let mut handle: *mut c_void = std::ptr::null_mut();
-		let status = unsafe { rocblas_create_handle(&mut handle) };
+		let status = unsafe { hipblasCreate(&mut handle) };
 		assert_eq!(
 			status, 0,
-			"rocblas_create_handle failed with status {}",
+			"hipblasCreate failed with status {}",
+			status
+		);
+		h.store(handle, Ordering::Relaxed);
+		handle
+	})
+}
+
+pub(crate) fn hipsolver_handle() -> *mut c_void {
+	HIPSOLVER_HANDLE.with(|h| {
+		let ptr = h.load(Ordering::Relaxed);
+		if !ptr.is_null() {
+			return ptr;
+		}
+		let mut handle: *mut c_void = std::ptr::null_mut();
+		let status = unsafe { hipsolverCreate(&mut handle) };
+		assert_eq!(
+			status, 0,
+			"hipsolverCreate failed with status {}",
 			status
 		);
 		h.store(handle, Ordering::Relaxed);
@@ -1479,11 +1502,19 @@ pub(crate) fn rocblas_handle() -> *mut c_void {
 
 pub fn gpu_shutdown() {
 	unsafe { crate::hip::hipDeviceSynchronize() };
-	ROCBLAS_HANDLE.with(|h| {
+	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
 		if !ptr.is_null() {
 			unsafe {
-				rocblas_destroy_handle(ptr);
+				hipblasDestroy(ptr);
+			}
+		}
+	});
+	HIPSOLVER_HANDLE.with(|h| {
+		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
+		if !ptr.is_null() {
+			unsafe {
+				hipsolverDestroy(ptr);
 			}
 		}
 	});
@@ -1516,10 +1547,10 @@ pub fn gpu_linear(
 	let alpha = 1.0_f64;
 	let beta = 1.0_f64;
 	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_N,
 			n as i32,
 			m as i32,
 			k as i32,
@@ -1555,8 +1586,8 @@ pub fn gpu_linear_backward(
 
 /// C = A @ B, A is (m x k) row-major, B is (k x n) row-major, C is (m x n) row-major.
 ///
-/// rocBLAS is column-major. The identity C_rm = (C_cm)^T = (B_cm @ A_cm)^T lets us call:
-///   rocblas_dgemm(N, N, n, m, k, 1.0, B, n, A, k, 0.0, C, n)
+/// hipBLAS is column-major. The identity C_rm = (C_cm)^T = (B_cm @ A_cm)^T lets us call:
+///   hipblasDgemm(N, N, n, m, k, 1.0, B, n, A, k, 0.0, C, n)
 pub fn gpu_gemm(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1568,10 +1599,10 @@ pub fn gpu_gemm(
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_N,
 			n as i32,
 			m as i32,
 			k as i32,
@@ -1592,7 +1623,7 @@ pub fn gpu_gemm(
 /// C = A^T @ B, A is (k x m) row-major, B is (k x n) row-major, C is (m x n) row-major.
 ///
 /// Column-major: C_cm = B_cm @ A_cm^T →
-///   rocblas_dgemm(N, T, n, m, k, 1.0, B, n, A, m, 0.0, C, n)
+///   hipblasDgemm(N, T, n, m, k, 1.0, B, n, A, m, 0.0, C, n)
 pub fn gpu_gemm_at(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1604,10 +1635,10 @@ pub fn gpu_gemm_at(
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_TRANSPOSE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_T,
 			n as i32,
 			m as i32,
 			k as i32,
@@ -1628,7 +1659,7 @@ pub fn gpu_gemm_at(
 /// C = A @ B^T, A is (m x k) row-major, B is (n x k) row-major, C is (m x n) row-major.
 ///
 /// Column-major: C_cm = B_cm^T @ A_cm →
-///   rocblas_dgemm(T, N, n, m, k, 1.0, B, k, A, k, 0.0, C, n)
+///   hipblasDgemm(T, N, n, m, k, 1.0, B, k, A, k, 0.0, C, n)
 pub fn gpu_gemm_bt(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1640,10 +1671,10 @@ pub fn gpu_gemm_bt(
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_TRANSPOSE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_T,
+			HIPBLAS_OP_N,
 			n as i32,
 			m as i32,
 			k as i32,
@@ -1662,21 +1693,35 @@ pub fn gpu_gemm_bt(
 }
 
 /// GPU Cholesky solve: solve A x = b where A is symmetric positive-definite (n x n).
-/// Uses rocsolver dpotrf (factorize) + rocblas dtrsm (triangular solve).
+/// Uses rocsolver dpotrf (factorize) + hipblas dtrsm (triangular solve).
 /// Copies inputs (dpotrf destroys A, dtrsm overwrites b). Returns solution on GPU.
 pub fn gpu_cholesky_solve(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 	let a_copy = gpu_copy(a, n * n)?;
 	let b_copy = gpu_copy(b, n)?;
 
 	// Cholesky factorize: A = L L^T
-	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
-	let status = unsafe {
-		rocsolver_dpotrf(
-			rocblas_handle(),
-			121, // rocblas_fill_lower
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDpotrf_bufferSize(
+			hipsolver_handle(),
+			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
+			&mut lwork,
+		)
+	};
+	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
+	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	let status = unsafe {
+		hipsolverDpotrf(
+			hipsolver_handle(),
+			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			n as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			work.ptr as *mut f64,
+			lwork,
 			info_buf.ptr as *mut i32,
 		)
 	};
@@ -1685,10 +1730,10 @@ pub fn gpu_cholesky_solve(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuB
 	// Forward solve: L z = b
 	let alpha = 1.0_f64;
 	let status = unsafe {
-		rocblas_dtrsm(
-			rocblas_handle(),
+		hipblasDtrsm(
+			hipblas_handle(),
 			141, // left
-			121, // lower
+			122, // lower (matches the L·Lᵀ factor)
 			111, // no transpose
 			131, // non-unit diagonal
 			n as i32,
@@ -1704,10 +1749,10 @@ pub fn gpu_cholesky_solve(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuB
 
 	// Backward solve: L^T x = z
 	let status = unsafe {
-		rocblas_dtrsm(
-			rocblas_handle(),
+		hipblasDtrsm(
+			hipblas_handle(),
 			141, // left
-			121, // lower
+			122, // lower (matches the L·Lᵀ factor)
 			112, // transpose
 			131, // non-unit diagonal
 			n as i32,
@@ -1731,14 +1776,28 @@ pub fn gpu_cholesky_inv(a: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> 
 	let eye = gpu_eye(n)?;
 
 	// Cholesky factorize: A = L L^T
-	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
-	let status = unsafe {
-		rocsolver_dpotrf(
-			rocblas_handle(),
-			121, // rocblas_fill_lower
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDpotrf_bufferSize(
+			hipsolver_handle(),
+			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
+			&mut lwork,
+		)
+	};
+	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
+	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	let status = unsafe {
+		hipsolverDpotrf(
+			hipsolver_handle(),
+			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			n as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			work.ptr as *mut f64,
+			lwork,
 			info_buf.ptr as *mut i32,
 		)
 	};
@@ -1747,10 +1806,10 @@ pub fn gpu_cholesky_inv(a: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> 
 	let alpha = 1.0_f64;
 	// Forward solve: L Z = I
 	let status = unsafe {
-		rocblas_dtrsm(
-			rocblas_handle(),
+		hipblasDtrsm(
+			hipblas_handle(),
 			141,
-			121,
+			122, // lower — match this function's own potrf(122)
 			111,
 			131,
 			n as i32,
@@ -1766,10 +1825,10 @@ pub fn gpu_cholesky_inv(a: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> 
 
 	// Backward solve: L^T X = Z
 	let status = unsafe {
-		rocblas_dtrsm(
-			rocblas_handle(),
+		hipblasDtrsm(
+			hipblas_handle(),
 			141,
-			121,
+			122, // lower — match this function's own potrf(122)
 			112,
 			131,
 			n as i32,
@@ -1798,9 +1857,41 @@ pub fn gpu_solve(
 	let b_copy = gpu_copy(b, n * nrhs)?;
 	let ipiv_buf = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
 	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+
+	// LU factorize: A = P L U
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDgetrf_bufferSize(
+			hipsolver_handle(),
+			n as i32,
+			n as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			&mut lwork,
+		)
+	};
+	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
 	let status = unsafe {
-		rocsolver_dgesv(
-			rocblas_handle(),
+		hipsolverDgetrf(
+			hipsolver_handle(),
+			n as i32,
+			n as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			work.ptr as *mut f64,
+			lwork,
+			ipiv_buf.ptr as *mut i32,
+			info_buf.ptr as *mut i32,
+		)
+	};
+	check(status)?;
+
+	// Solve A X = B using the LU factors
+	let mut lwork_s: i32 = 0;
+	unsafe {
+		hipsolverDgetrs_bufferSize(
+			hipsolver_handle(),
+			111, // op none
 			n as i32,
 			nrhs as i32,
 			a_copy.ptr as *mut f64,
@@ -1808,6 +1899,23 @@ pub fn gpu_solve(
 			ipiv_buf.ptr as *mut i32,
 			b_copy.ptr as *mut f64,
 			n as i32,
+			&mut lwork_s,
+		)
+	};
+	let work_s = GpuBuffer::alloc_bytes((lwork_s.max(1) as usize) * 8)?;
+	let status = unsafe {
+		hipsolverDgetrs(
+			hipsolver_handle(),
+			111, // op none
+			n as i32,
+			nrhs as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			ipiv_buf.ptr as *mut i32,
+			b_copy.ptr as *mut f64,
+			n as i32,
+			work_s.ptr as *mut f64,
+			lwork_s,
 			info_buf.ptr as *mut i32,
 		)
 	};
@@ -1818,15 +1926,34 @@ pub fn gpu_solve(
 /// GPU Cholesky factorization: A = L*L^T. Returns L (lower triangular) on GPU.
 /// Copies A (dpotrf destroys it).
 pub fn gpu_cholesky(a: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
+	// Factor-only: callers read the result row-major and expect the lower-triangular
+	// L (L·Lᵀ=A). hipSOLVER/cuSOLVER are column-major, so asking for the col-major
+	// UPPER (121) writes the factor into the row-major LOWER triangle — the L we want.
+	// (The solve helpers above stay 122: they keep potrf+dtrsm column-major-consistent
+	// and only return the solution vector, so layout never escapes.)
 	let a_copy = gpu_copy(a, n * n)?;
-	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
-	let status = unsafe {
-		rocsolver_dpotrf(
-			rocblas_handle(),
-			121, // lower
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDpotrf_bufferSize(
+			hipsolver_handle(),
+			121, // col-major UPPER ⇒ row-major LOWER factor L
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
+			&mut lwork,
+		)
+	};
+	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
+	let info_buf = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	let status = unsafe {
+		hipsolverDpotrf(
+			hipsolver_handle(),
+			121, // col-major UPPER ⇒ row-major LOWER factor L
+			n as i32,
+			a_copy.ptr as *mut f64,
+			n as i32,
+			work.ptr as *mut f64,
+			lwork,
 			info_buf.ptr as *mut i32,
 		)
 	};
@@ -1847,10 +1974,10 @@ pub fn gpu_tri_solve(
 	let alpha = 1.0_f64;
 	let trans_flag = if trans { 112u32 } else { 111u32 };
 	let status = unsafe {
-		rocblas_dtrsm(
-			rocblas_handle(),
+		hipblasDtrsm(
+			hipblas_handle(),
 			141, // left
-			121, // lower
+			121, // upper — gpu_cholesky factors col-major UPPER; read the same triangle
 			trans_flag,
 			131, // non-unit
 			n as i32,
@@ -2247,7 +2374,7 @@ pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) {
 pub fn gpu_scale(x: &GpuBuffer, scalar: f64, n: usize) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n)?;
 	let bytes = n * std::mem::size_of::<f64>();
-	// Copy x → out, then scale in-place via rocBLAS dscal
+	// Copy x → out, then scale in-place via hipBLAS dscal
 	check(unsafe {
 		hipMemcpy(
 			out.ptr,
@@ -2257,7 +2384,7 @@ pub fn gpu_scale(x: &GpuBuffer, scalar: f64, n: usize) -> Result<GpuBuffer, HipE
 		)
 	})?;
 	let status =
-		unsafe { rocblas_dscal(rocblas_handle(), n as i32, &scalar, out.ptr as *mut f64, 1) };
+		unsafe { hipblasDscal(hipblas_handle(), n as i32, &scalar, out.ptr as *mut f64, 1) };
 	check(status)?;
 	Ok(out)
 }
@@ -2265,8 +2392,8 @@ pub fn gpu_scale(x: &GpuBuffer, scalar: f64, n: usize) -> Result<GpuBuffer, HipE
 /// In-place scale: x *= scalar (no alloc, no copy)
 pub fn gpu_scale_inplace(x: &GpuBuffer, scalar: f64, n: usize) {
 	let status =
-		unsafe { rocblas_dscal(rocblas_handle(), n as i32, &scalar, x.ptr as *mut f64, 1) };
-	assert_eq!(status, 0, "rocblas_dscal failed with status {}", status);
+		unsafe { hipblasDscal(hipblas_handle(), n as i32, &scalar, x.ptr as *mut f64, 1) };
+	assert_eq!(status, 0, "hipblasDscal failed with status {}", status);
 }
 
 pub fn gpu_fma(
@@ -2291,12 +2418,12 @@ pub fn gpu_fma(
 
 /// In-place: y -= alpha * x (for SGD weight updates on GPU)
 /// SGD weight update: Y = Y - α·X (gradient descent step).
-/// Uses rocblas_daxpy with negated alpha. NOT standard axpy (Y = αX + Y).
+/// Uses hipblasDaxpy with negated alpha. NOT standard axpy (Y = αX + Y).
 pub fn gpu_sgd_update(weights: &GpuBuffer, grad: &GpuBuffer, lr: f64, n: usize) {
 	let neg_lr = -lr;
 	let status = unsafe {
-		rocblas_daxpy(
-			rocblas_handle(),
+		hipblasDaxpy(
+			hipblas_handle(),
 			n as i32,
 			&neg_lr,
 			grad.ptr as *const f64,
@@ -2305,7 +2432,7 @@ pub fn gpu_sgd_update(weights: &GpuBuffer, grad: &GpuBuffer, lr: f64, n: usize) 
 			1,
 		)
 	};
-	assert_eq!(status, 0, "rocblas_daxpy failed with status {}", status);
+	assert_eq!(status, 0, "hipblasDaxpy failed with status {}", status);
 }
 
 pub fn gpu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
@@ -2401,10 +2528,10 @@ pub fn gpu_linear_into(
 		let alpha = 1.0_f64;
 		let beta = 1.0_f64;
 		let status = unsafe {
-			rocblas_dgemm(
-				rocblas_handle(),
-				ROCBLAS_OPERATION_NONE,
-				ROCBLAS_OPERATION_NONE,
+			hipblasDgemm(
+				hipblas_handle(),
+				HIPBLAS_OP_N,
+				HIPBLAS_OP_N,
 				n as i32,
 				m as i32,
 				k as i32,
@@ -2617,7 +2744,7 @@ pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 /// out(n) = X(n×in_dim) @ w(in_dim) + b, for the out_dim==1 forward fast path.
 ///
 /// X is row-major (n×in_dim) = column-major (in_dim×n), lda=in_dim. With op=TRANSPOSE
-/// rocBLAS computes (X_cm)ᵀ @ w = X @ w. Bias is broadcast with the SAME primitive the
+/// hipBLAS computes (X_cm)ᵀ @ w = X @ w. Bias is broadcast with the SAME primitive the
 /// out_dim>1 path (`gpu_linear_into`) uses — `launch_repeat_rows` pre-fills `out`, then
 /// dgemv with beta=1 accumulates the matvec on top.
 pub fn gpu_matvec_bias_into(
@@ -2640,9 +2767,9 @@ pub fn gpu_matvec_bias_into(
 	let alpha = 1.0_f64;
 	let beta = 1.0_f64;
 	let status = unsafe {
-		crate::hip::rocblas_dgemv(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_TRANSPOSE,
+		crate::hip::hipblasDgemv(
+			hipblas_handle(),
+			HIPBLAS_OP_T,
 			in_dim as i32,
 			n as i32,
 			&alpha,
@@ -2660,7 +2787,7 @@ pub fn gpu_matvec_bias_into(
 
 /// dw(in_dim) = aᵀ @ grad, for the out_dim==1 backward fast path. `a` is (n×in_dim)
 /// row-major = (in_dim×n) column-major (lda=in_dim); `trans=true` means "transpose the
-/// row-major a", which maps to rocBLAS op=NONE on that view → (a_cm) @ grad = aᵀ @ grad.
+/// row-major a", which maps to hipBLAS op=NONE on that view → (a_cm) @ grad = aᵀ @ grad.
 pub fn gpu_dgemv_into(
 	a: &GpuBuffer,
 	x: &GpuBuffer,
@@ -2670,15 +2797,15 @@ pub fn gpu_dgemv_into(
 	trans: bool,
 ) {
 	let op = if trans {
-		ROCBLAS_OPERATION_NONE
+		HIPBLAS_OP_N
 	} else {
-		ROCBLAS_OPERATION_TRANSPOSE
+		HIPBLAS_OP_T
 	};
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
-		crate::hip::rocblas_dgemv(
-			rocblas_handle(),
+		crate::hip::hipblasDgemv(
+			hipblas_handle(),
 			op,
 			in_dim as i32,
 			n as i32,
@@ -2709,8 +2836,8 @@ pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize,
 	}
 	let alpha = 1.0_f64;
 	let status = unsafe {
-		crate::hip::rocblas_dger(
-			rocblas_handle(),
+		crate::hip::hipblasDger(
+			hipblas_handle(),
 			in_dim as i32,
 			n as i32,
 			&alpha,
@@ -2815,10 +2942,10 @@ pub fn gpu_linear_backward_into(
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_TRANSPOSE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_T,
+			HIPBLAS_OP_N,
 			k as i32,
 			m as i32,
 			n as i32,
@@ -2921,10 +3048,10 @@ pub fn gpu_linear_backward_weights_only_into(
 		)
 	};
 	let gw_status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_TRANSPOSE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_T,
 			n as i32,
 			k as i32,
 			m as i32,
@@ -2968,10 +3095,10 @@ pub fn gpu_linear_backward_full_into(
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let gw_status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_NONE,
-			ROCBLAS_OPERATION_TRANSPOSE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_N,
+			HIPBLAS_OP_T,
 			n as i32,
 			k as i32,
 			m as i32,
@@ -3008,10 +3135,10 @@ pub fn gpu_linear_backward_full_into(
 	}
 	// grad_input = grad @ weight^T
 	let gi_status = unsafe {
-		rocblas_dgemm(
-			rocblas_handle(),
-			ROCBLAS_OPERATION_TRANSPOSE,
-			ROCBLAS_OPERATION_NONE,
+		hipblasDgemm(
+			hipblas_handle(),
+			HIPBLAS_OP_T,
+			HIPBLAS_OP_N,
 			k as i32,
 			m as i32,
 			n as i32,
@@ -4838,6 +4965,8 @@ pub fn gpu_col2im_1d(
 ) -> Result<GpuBuffer, HipError> {
 	let out_len = p - ks + 1;
 	let out = GpuBuffer::alloc(n * p)?;
+	// col2im folds overlapping patches via atomicAdd → the accumulator must start at 0.
+	out.memset_zero(n * p * 8)?;
 	unsafe {
 		launch_col2im_1d(
 			patches.ptr as *const c_void,
@@ -4864,6 +4993,8 @@ pub fn gpu_col2im_2d(
 	let out_h = h - kh + 1;
 	let out_w = w - kw + 1;
 	let out = GpuBuffer::alloc(n * c * h * w)?;
+	// col2im folds overlapping patches via atomicAdd → the accumulator must start at 0.
+	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_col2im_2d(
 			patches.ptr as *const c_void,
@@ -4912,6 +5043,9 @@ pub fn gpu_max_pool_1d_backward(
 	n_filters: usize,
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n * out_len * n_filters)?;
+	// Kernel writes only the argmax cell per window; every other cell must be 0
+	// (GpuBuffer::alloc is not zeroed — pool memory is recycled non-zeroed).
+	out.memset_zero(n * out_len * n_filters * 8)?;
 	unsafe {
 		launch_max_pool_1d_backward(
 			grad.ptr as *const c_void,
@@ -4974,6 +5108,9 @@ pub fn gpu_avg_pool_2d_backward(
 	let out_h = (h - kh) / sh + 1;
 	let out_w = (w - kw) / sw + 1;
 	let out = GpuBuffer::alloc(n * c * h * w)?;
+	// Kernel atomic-adds grad/count into each window cell; uncovered cells and the
+	// accumulation base must be 0 (alloc is not zeroed on all backends).
+	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_avg_pool_2d_backward(
 			grad.ptr as *const c_void,
@@ -5041,6 +5178,8 @@ pub fn gpu_max_pool_2d_backward(
 	out_w: usize,
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n * c * h * w)?;
+	// Kernel atomic-adds only into the argmax cell; every other cell must be 0.
+	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_max_pool_2d_backward(
 			grad.ptr as *const c_void,

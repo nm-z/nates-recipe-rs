@@ -93,10 +93,11 @@ extern "C" __global__ void layernorm_f32_kernel(
       int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
       if (lane == 0) smem[wid] = sum;
       __syncthreads();
-      if (threadIdx.x < blockDim.x / warpSize) {
-            sum = smem[threadIdx.x];
+      int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            sum = (lane < nwarps) ? smem[lane] : 0.0f;
             for (int off = warpSize / 2; off > 0; off /= 2) sum += __shfl_down(sum, off);
-            if (threadIdx.x == 0) smem[0] = sum;
+            if (lane == 0) smem[0] = sum;
       }
       __syncthreads();
       float mean = smem[0] / cols;
@@ -106,10 +107,10 @@ extern "C" __global__ void layernorm_f32_kernel(
       for (int off = warpSize / 2; off > 0; off /= 2) var_acc += __shfl_down(var_acc, off);
       if (lane == 0) smem[wid] = var_acc;
       __syncthreads();
-      if (threadIdx.x < blockDim.x / warpSize) {
-            var_acc = smem[threadIdx.x];
+      if (wid == 0) {
+            var_acc = (lane < nwarps) ? smem[lane] : 0.0f;
             for (int off = warpSize / 2; off > 0; off /= 2) var_acc += __shfl_down(var_acc, off);
-            if (threadIdx.x == 0) smem[0] = var_acc;
+            if (lane == 0) smem[0] = var_acc;
       }
       __syncthreads();
       float inv_std = 1.0f / sqrtf(smem[0] / cols + eps);
@@ -149,10 +150,11 @@ extern "C" __global__ void layernorm_backward_f32_kernel(
       __shared__ float smem[32];
       if (lane == 0) smem[wid] = lm;
       __syncthreads();
-      if (threadIdx.x < blockDim.x / warpSize) {
-            lm = smem[threadIdx.x];
+      int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            lm = (lane < nwarps) ? smem[lane] : 0.0f;
             for (int off = warpSize/2; off > 0; off /= 2) lm += __shfl_down(lm, off);
-            if (threadIdx.x == 0) smem[0] = lm;
+            if (lane == 0) smem[0] = lm;
       }
       __syncthreads();
       float mean = smem[0] / cols;
@@ -162,10 +164,10 @@ extern "C" __global__ void layernorm_backward_f32_kernel(
       for (int off = warpSize/2; off > 0; off /= 2) lv += __shfl_down(lv, off);
       if (lane == 0) smem[wid] = lv;
       __syncthreads();
-      if (threadIdx.x < blockDim.x / warpSize) {
-            lv = smem[threadIdx.x];
+      if (wid == 0) {
+            lv = (lane < nwarps) ? smem[lane] : 0.0f;
             for (int off = warpSize/2; off > 0; off /= 2) lv += __shfl_down(lv, off);
-            if (threadIdx.x == 0) smem[0] = lv;
+            if (lane == 0) smem[0] = lv;
       }
       __syncthreads();
       float inv_std = 1.0f / sqrtf(smem[0] / cols + eps);
@@ -182,10 +184,10 @@ extern "C" __global__ void layernorm_backward_f32_kernel(
       for (int off = warpSize/2; off > 0; off /= 2) { ls1 += __shfl_down(ls1, off); ls2 += __shfl_down(ls2, off); }
       if (lane == 0) { ss1[wid] = ls1; ss2[wid] = ls2; }
       __syncthreads();
-      if (threadIdx.x < blockDim.x / warpSize) {
-            ls1 = ss1[threadIdx.x]; ls2 = ss2[threadIdx.x];
+      if (wid == 0) {
+            ls1 = (lane < nwarps) ? ss1[lane] : 0.0f; ls2 = (lane < nwarps) ? ss2[lane] : 0.0f;
             for (int off = warpSize/2; off > 0; off /= 2) { ls1 += __shfl_down(ls1, off); ls2 += __shfl_down(ls2, off); }
-            if (threadIdx.x == 0) { ss1[0] = ls1; ss2[0] = ls2; }
+            if (lane == 0) { ss1[0] = ls1; ss2[0] = ls2; }
       }
       __syncthreads();
       float sum1 = ss1[0], sum2 = ss2[0];

@@ -385,10 +385,11 @@ extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out,
     int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
     if (lane == 0) sm[wid] = lmax;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lmax = sm[threadIdx.x];
+    int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+    if (wid == 0) {
+        lmax = (lane < nwarps) ? sm[lane] : -1e308;
         for (int off = warpSize/2; off > 0; off /= 2) { double o = __shfl_down(lmax, off); if (o > lmax) lmax = o; }
-        if (threadIdx.x == 0) sm[0] = lmax;
+        if (lane == 0) sm[0] = lmax;
     }
     __syncthreads();
     double row_max = sm[0];
@@ -400,10 +401,10 @@ extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out,
     __shared__ double ss[32];
     if (lane == 0) ss[wid] = lsum;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / warpSize) {
-        lsum = ss[threadIdx.x];
+    if (wid == 0) {
+        lsum = (lane < nwarps) ? ss[lane] : 0.0;
         for (int off = warpSize/2; off > 0; off /= 2) lsum += __shfl_down(lsum, off);
-        if (threadIdx.x == 0) ss[0] = lsum;
+        if (lane == 0) ss[0] = lsum;
     }
     __syncthreads();
 

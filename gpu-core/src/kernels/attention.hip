@@ -47,11 +47,12 @@ __global__ void attn_sdp_kernel(
             int wid  = threadIdx.x / warpSize;
             if (lane == 0) s_dot[wid] = local_dot;
             __syncthreads();
-            if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-                  float v2 = s_dot[threadIdx.x];
+            int nwarps = (blockDim.x + warpSize - 1) / warpSize;
+            if (wid == 0) {
+                  float v2 = (lane < nwarps) ? s_dot[lane] : 0.0f;
                   for (int offset = warpSize / 2; offset > 0; offset /= 2)
                         v2 += __shfl_down(v2, offset);
-                  if (threadIdx.x == 0) s_dot[0] = v2;
+                  if (lane == 0) s_dot[0] = v2;
             }
             __syncthreads();
             float s = s_dot[0] * scale;
@@ -112,13 +113,14 @@ __global__ void attn_causal_softmax_kernel(float* x, int rows, int cols) {
       int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
       if (lane == 0) s_max[wid] = local_max;
       __syncthreads();
-      if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-            float v = s_max[threadIdx.x];
+      int nwarps_max = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            float v = (lane < nwarps_max) ? s_max[lane] : -1e30f;
             for (int offset = warpSize / 2; offset > 0; offset /= 2) {
                   float other = __shfl_down(v, offset);
                   if (other > v) v = other;
             }
-            if (threadIdx.x == 0) s_max[0] = v;
+            if (lane == 0) s_max[0] = v;
       }
       __syncthreads();
       float row_max = s_max[0];
@@ -135,11 +137,12 @@ __global__ void attn_causal_softmax_kernel(float* x, int rows, int cols) {
       __shared__ float s_sum[32];
       if (lane == 0) s_sum[wid] = local_sum;
       __syncthreads();
-      if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-            float v = s_sum[threadIdx.x];
+      int nwarps_sum = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            float v = (lane < nwarps_sum) ? s_sum[lane] : 0.0f;
             for (int offset = warpSize / 2; offset > 0; offset /= 2)
                   v += __shfl_down(v, offset);
-            if (threadIdx.x == 0) s_sum[0] = v;
+            if (lane == 0) s_sum[0] = v;
       }
       __syncthreads();
       float inv_sum = (s_sum[0] > 0.0f) ? 1.0f / s_sum[0] : 0.0f;
@@ -281,11 +284,12 @@ __global__ void attn_rmsnorm_kernel(
       int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
       if (lane == 0) s_sq[wid] = local_sq;
       __syncthreads();
-      if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-            float v = s_sq[threadIdx.x];
+      int nwarps_sq = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            float v = (lane < nwarps_sq) ? s_sq[lane] : 0.0f;
             for (int offset = warpSize / 2; offset > 0; offset /= 2)
                   v += __shfl_down(v, offset);
-            if (threadIdx.x == 0) s_sq[0] = v;
+            if (lane == 0) s_sq[0] = v;
       }
       __syncthreads();
       float rms = rsqrtf(s_sq[0] / (float)cols + eps);
@@ -326,11 +330,12 @@ __global__ void attn_rmsnorm_backward_kernel(
       int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
       if (lane == 0) s_sq[wid] = local_sq;
       __syncthreads();
-      if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-            float v = s_sq[threadIdx.x];
+      int nwarps_sq = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            float v = (lane < nwarps_sq) ? s_sq[lane] : 0.0f;
             for (int offset = warpSize / 2; offset > 0; offset /= 2)
                   v += __shfl_down(v, offset);
-            if (threadIdx.x == 0) s_sq[0] = v;
+            if (lane == 0) s_sq[0] = v;
       }
       __syncthreads();
       float rms_inv = rsqrtf(s_sq[0] / (float)cols + eps);
@@ -344,11 +349,12 @@ __global__ void attn_rmsnorm_backward_kernel(
       __shared__ float s_dot[32];
       if (lane == 0) s_dot[wid] = local_dot;
       __syncthreads();
-      if (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) {
-            float v = s_dot[threadIdx.x];
+      int nwarps_dot = (blockDim.x + warpSize - 1) / warpSize;
+      if (wid == 0) {
+            float v = (lane < nwarps_dot) ? s_dot[lane] : 0.0f;
             for (int offset = warpSize / 2; offset > 0; offset /= 2)
                   v += __shfl_down(v, offset);
-            if (threadIdx.x == 0) s_dot[0] = v;
+            if (lane == 0) s_dot[0] = v;
       }
       __syncthreads();
       float dot_val = s_dot[0] / (float)cols;

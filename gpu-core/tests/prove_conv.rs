@@ -30,6 +30,7 @@ unsafe extern "C" {
 		cout: i32,
 		k: i32,
 		lout: i32,
+		stride: i32,
 		s: *mut c_void,
 	);
 	fn launch_convx_conv2d(
@@ -199,6 +200,7 @@ fn prove_conv1d() -> bool {
 			cout as i32,
 			k as i32,
 			lout as i32,
+			1, // stride
 			std::ptr::null_mut(),
 		);
 	});

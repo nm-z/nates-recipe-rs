@@ -148,60 +148,62 @@ extern "C" void launch_reductionx_sumsqdev(const double* x, double* out, double*
 // argmax/argmin: first-occurrence index of the global extremum, returned as a double in out[0].
 // Mirrors reduce.hip argmin_rows_kernel (single block, value+index warp-shuffle), generalized to a
 // grid-stride scan with an atomic tie-break that keeps the SMALLEST index among equal extrema.
-__global__ void reductionx_argmax_kernel(const double* x, double* out, unsigned long long* best, int n) {
+// The packed extremum tracker is a file-scope __device__ scalar so the launcher needs no caller
+// scratch — keeping the 4-arg (x, out, n, stream) shape shared by every other reductionx launcher.
+__device__ unsigned long long g_reductionx_best;
+
+__global__ void reductionx_argmax_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       double lval = -DBL_MAX; int lidx = 0;
       for (int j = i; j < n; j += gridDim.x * blockDim.x) {
             if (x[j] > lval) { lval = x[j]; lidx = j; }
       }
-      // pack (value, idx) so a single atomicMax picks max value, and for ties the smaller idx.
-      // value dominates; encode idx complemented so larger value OR (==value, smaller idx) wins.
-      // Simpler: use atomicMax on a 64-bit pack of float-order-preserving value bits is fragile for f64.
-      // Use a global lock-free CAS loop on a packed best holding idx, compare via x[].
-      unsigned long long cur = *best;
+      // Lock-free CAS loop on a packed best holding idx; compare via x[]. value dominates,
+      // ties keep the smaller idx (atomicMax on order-preserving f64 bits is too fragile).
+      unsigned long long cur = g_reductionx_best;
       while (true) {
             int cidx = (int)(cur & 0xffffffffULL);
             double cval = x[cidx];
             if (lval < cval || (lval == cval && lidx >= cidx)) break;
             unsigned long long want = (unsigned long long)(unsigned int)lidx;
-            unsigned long long prev = atomicCAS(best, cur, want);
+            unsigned long long prev = atomicCAS(&g_reductionx_best, cur, want);
             if (prev == cur) break;
             cur = prev;
       }
 }
-__global__ void reductionx_argmin_kernel(const double* x, double* out, unsigned long long* best, int n) {
+__global__ void reductionx_argmin_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       double lval = DBL_MAX; int lidx = 0;
       for (int j = i; j < n; j += gridDim.x * blockDim.x) {
             if (x[j] < lval) { lval = x[j]; lidx = j; }
       }
-      unsigned long long cur = *best;
+      unsigned long long cur = g_reductionx_best;
       while (true) {
             int cidx = (int)(cur & 0xffffffffULL);
             double cval = x[cidx];
             if (lval > cval || (lval == cval && lidx >= cidx)) break;
             unsigned long long want = (unsigned long long)(unsigned int)lidx;
-            unsigned long long prev = atomicCAS(best, cur, want);
+            unsigned long long prev = atomicCAS(&g_reductionx_best, cur, want);
             if (prev == cur) break;
             cur = prev;
       }
 }
-__global__ void reductionx_idx_to_double(const unsigned long long* best, double* out) {
-      if (threadIdx.x == 0) out[0] = (double)(int)(*best & 0xffffffffULL);
+__global__ void reductionx_idx_to_double(double* out) {
+      if (threadIdx.x == 0) out[0] = (double)(int)(g_reductionx_best & 0xffffffffULL);
 }
-// initializes the caller's `best` scalar to packed idx 0 (replaces the old HtoD memcpy of zero).
-__global__ void reductionx_zero_u64(unsigned long long* best) {
-      if (threadIdx.x == 0 && blockIdx.x == 0) best[0] = 0;
+// resets the packed tracker to idx 0 (replaces the old HtoD memcpy of zero).
+__global__ void reductionx_zero_u64() {
+      if (threadIdx.x == 0 && blockIdx.x == 0) g_reductionx_best = 0;
 }
-extern "C" void launch_reductionx_argmax(const double* x, double* out, unsigned long long* best, int n, hipStream_t s) {
-      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s, best);
+extern "C" void launch_reductionx_argmax(const double* x, double* out, int n, hipStream_t s) {
+      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s);
       dim3 b(256); dim3 g(min(256, (n + 255) / 256));
-      hipLaunchKernelGGL(reductionx_argmax_kernel, g, b, 0, s, x, out, best, n);
-      hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, best, out);
+      hipLaunchKernelGGL(reductionx_argmax_kernel, g, b, 0, s, x, out, n);
+      hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, out);
 }
-extern "C" void launch_reductionx_argmin(const double* x, double* out, unsigned long long* best, int n, hipStream_t s) {
-      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s, best);
+extern "C" void launch_reductionx_argmin(const double* x, double* out, int n, hipStream_t s) {
+      hipLaunchKernelGGL(reductionx_zero_u64, dim3(1), dim3(1), 0, s);
       dim3 b(256); dim3 g(min(256, (n + 255) / 256));
-      hipLaunchKernelGGL(reductionx_argmin_kernel, g, b, 0, s, x, out, best, n);
-      hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, best, out);
+      hipLaunchKernelGGL(reductionx_argmin_kernel, g, b, 0, s, x, out, n);
+      hipLaunchKernelGGL(reductionx_idx_to_double, dim3(1), dim3(1), 0, s, out);
 }
