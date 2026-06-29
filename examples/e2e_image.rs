@@ -2,6 +2,7 @@
 // indexed by filename. Mirrors the cookbook CNN scenario, few epochs, foreground.
 use recipe::*;
 
+#[allow(unused_variables)] // cnn/data resolved via the live registry, not textually read
 fn main() {
 	let cnn = Model::new()
 		.loss(ce)
@@ -19,5 +20,5 @@ fn main() {
 		.split(0.8)
 		.target("label");
 	let train = Train::new().epochs(20).log([Loss, Accuracy]);
-	train.run(&cnn, &data);
+	train.run(());
 }

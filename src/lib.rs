@@ -21,7 +21,7 @@
 //!     .epochs(100)
 //!     .log([Loss, R2]);
 //!
-//! train.run(&model, &data);
+//! train.run(());      // one model + one data in scope → no arguments needed
 //! train.save(());
 //! ```
 
@@ -60,6 +60,6 @@ pub use model::{
 };
 #[doc(hidden)]
 pub use model::{
-	Activation, IntoLayer, LayerSpec, Prepared, RunData, SavePath,
+	Activation, IntoLayer, LayerSpec, Prepared, RunArgs, RunData, SavePath,
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };

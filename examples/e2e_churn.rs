@@ -2,6 +2,7 @@
 // layer(1).sigmoid() on the binary "Churn" target (now a single class-index column).
 use recipe::*;
 
+#[allow(unused_variables)] // nn/data resolved via the live registry, not textually read
 fn main() {
 	let nn = Model::new()
 		.loss(bce)
@@ -16,5 +17,5 @@ fn main() {
 		.exclude("id")
 		.target("Churn");
 	let train = Train::new().epochs(20).log([Loss, Accuracy]);
-	train.run(&nn, &data);
+	train.run(());
 }

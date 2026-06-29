@@ -1,6 +1,7 @@
 use crate::Mat;
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
+use std::cell::RefCell;
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
@@ -27,7 +28,16 @@ impl IntoTargets for &[&str] {
 /// Nothing is loaded or encoded until `Train::run` (or `datasets()`) asks for it
 /// — so building a `Data`, even many of them, costs only the config it holds.
 /// `Data` describes; `Train` executes.
+///
+/// The config lives in a heap-pinned [`DataInner`] so the builder's by-value
+/// moves don't shift its address; the live-data registry holds a raw pointer to
+/// it for the no-argument `.run()` / `.run(model)` resolution.
 pub struct Data {
+	pub(crate) inner: Box<DataInner>,
+}
+
+#[doc(hidden)]
+pub struct DataInner {
 	pub target: &'static str,
 	target_names: Vec<String>,
 	pub(crate) attrs: Vec<Attr>,
@@ -39,6 +49,49 @@ pub struct Data {
 	exclude: Vec<String>,
 	raw_test_rows: Option<Vec<Vec<String>>>,
 	raw_test_headers: Option<Vec<String>>,
+}
+
+impl std::ops::Deref for Data {
+	type Target = DataInner;
+	fn deref(&self) -> &DataInner {
+		&self.inner
+	}
+}
+impl std::ops::DerefMut for Data {
+	fn deref_mut(&mut self) -> &mut DataInner {
+		&mut self.inner
+	}
+}
+impl Drop for Data {
+	fn drop(&mut self) {
+		let r: &dyn crate::model::RunData = &*self.inner;
+		deregister_data(r as *const dyn crate::model::RunData);
+	}
+}
+
+// Every live `Data` registers the stable address of its heap config here, so
+// `.run(())` / `.run(model)` can resolve "the Data in scope" with no argument.
+thread_local! {
+	static DATAS: RefCell<Vec<*const dyn crate::model::RunData>> =
+		const { RefCell::new(Vec::new()) };
+}
+fn register_data(p: *const dyn crate::model::RunData) {
+	DATAS.with(|d| d.borrow_mut().push(p));
+}
+fn deregister_data(p: *const dyn crate::model::RunData) {
+	DATAS.with(|d| d.borrow_mut().retain(|&x| !std::ptr::addr_eq(x, p)));
+}
+/// The one live `Data`, or a clear panic when zero or several exist — backs the
+/// no-argument `.run()` / `.run(model)` "use what's in scope" resolution.
+pub(crate) fn the_data() -> *const dyn crate::model::RunData {
+	DATAS.with(|d| {
+		let d = d.borrow();
+		match d.len() {
+			1 => d[0],
+			0 => panic!("run(): no Data in scope — build one with Data::load()…, or pass it: train.run((model, data))"),
+			n => panic!("run(): {n} Datasets in scope — ambiguous; pass the one to run, e.g. train.run((model, data))"),
+		}
+	})
 }
 
 /// The `Dataset → Mat` seam for the embed-on-categoricals path: collapse each
@@ -127,7 +180,7 @@ fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 
 impl Data {
 	pub fn load() -> Data {
-		Data {
+		let inner = Box::new(DataInner {
 			target: "",
 			target_names: Vec::new(),
 			attrs: Vec::new(),
@@ -139,39 +192,41 @@ impl Data {
 			exclude: Vec::new(),
 			raw_test_rows: None,
 			raw_test_headers: None,
-		}
-	}
-
-	fn source_label(&self) -> String {
-		self.sources.join(", ")
+		});
+		let r: &dyn crate::model::RunData = &*inner;
+		register_data(r as *const dyn crate::model::RunData);
+		Data { inner }
 	}
 
 	pub fn set(mut self, path: &str) -> Data {
-		self.sources.push(path.to_string());
+		self.inner.sources.push(path.to_string());
 		if is_arff(path) {
 			let (attrs, rows) = crate::data::parse_arff(path);
-			self.attrs = attrs;
-			self.rows = rows;
+			self.inner.attrs = attrs;
+			self.inner.rows = rows;
 		} else if is_safetensors(path) {
 			let (attrs, rows) = safetensors_to_table(path);
-			self.attrs = attrs;
-			self.rows = rows;
+			self.inner.attrs = attrs;
+			self.inner.rows = rows;
 		}
 		self
 	}
 
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
-		self.target_names = t.into_targets();
-		self.target = self
+		self.inner.target_names = t.into_targets();
+		self.inner.target = self
+			.inner
 			.target_names
 			.first()
 			.map_or("", |s| Box::leak(s.clone().into_boxed_str()));
-		if !self.attrs.is_empty() {
-			self.targets = self
+		if !self.inner.attrs.is_empty() {
+			let attrs = &self.inner.attrs;
+			let targets = self
+				.inner
 				.target_names
 				.iter()
 				.map(|name| {
-					self.attrs
+					attrs
 						.iter()
 						.position(|a| a.name == *name)
 						.unwrap_or_else(|| {
@@ -179,23 +234,51 @@ impl Data {
 						})
 				})
 				.collect();
+			self.inner.targets = targets;
 		}
-		if let Some(tp) = &self.test_path {
+		if let Some(tp) = &self.inner.test_path {
 			if let Ok(text) = std::fs::read_to_string(tp) {
 				let mut lines = text.lines();
 				if let Some(header_line) = lines.next() {
-					self.raw_test_headers = Some(crate::data::split_fields(header_line)
+					let headers = crate::data::split_fields(header_line)
 						.into_iter()
 						.map(|s| s.trim().to_string())
-						.collect());
-					self.raw_test_rows = Some(lines
+						.collect();
+					let rows = lines
 						.filter(|l| !l.trim().is_empty())
 						.map(|l| crate::data::split_fields(l))
-						.collect());
+						.collect();
+					self.inner.raw_test_headers = Some(headers);
+					self.inner.raw_test_rows = Some(rows);
 				}
 			}
 		}
 		self
+	}
+
+	pub fn test(mut self, path: &str) -> Data {
+		self.inner.test_path = Some(path.to_string());
+		self
+	}
+
+	pub fn exclude(mut self, pattern: &str) -> Data {
+		self.inner.exclude.push(pattern.to_string());
+		self
+	}
+
+	pub fn split(mut self, train_frac: f64) -> Data {
+		assert!(
+			(0.0..1.0).contains(&train_frac),
+			"split fraction must be in (0, 1), got {train_frac}",
+		);
+		self.inner.split_frac = Some(train_frac);
+		self
+	}
+}
+
+impl DataInner {
+	fn source_label(&self) -> String {
+		self.sources.join(", ")
 	}
 
 	/// Materialize this description into encoded `(train, Option<test>)` datasets,
@@ -342,25 +425,6 @@ impl Data {
 		}
 	}
 
-	pub fn test(mut self, path: &str) -> Data {
-		self.test_path = Some(path.to_string());
-		self
-	}
-
-	pub fn exclude(mut self, pattern: &str) -> Data {
-		self.exclude.push(pattern.to_string());
-		self
-	}
-
-	pub fn split(mut self, train_frac: f64) -> Data {
-		assert!(
-			(0.0..1.0).contains(&train_frac),
-			"split fraction must be in (0, 1), got {train_frac}",
-		);
-		self.split_frac = Some(train_frac);
-		self
-	}
-
 	fn prepare(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
 		let (mut train, mut test, attrs) = if self.attrs.is_empty() {
 			self.prepare_table()
@@ -452,7 +516,7 @@ impl Data {
 	}
 }
 
-impl crate::model::RunData for Data {
+impl crate::model::RunData for DataInner {
 	fn prepared(&self) -> crate::model::Prepared<'_> {
 		let (train, _test) = self.datasets();
 		crate::model::Prepared::Owned(train)
@@ -468,6 +532,27 @@ impl crate::model::RunData for Data {
 	}
 	fn infer_only(&self) -> bool {
 		false
+	}
+}
+
+// `Data` forwards to its inner so an explicit `train.run((&model, &data))` (the
+// only form a loop over several datasets can use) accepts a `&Data` directly,
+// while the live-data registry holds the heap-pinned `DataInner`.
+impl crate::model::RunData for Data {
+	fn prepared(&self) -> crate::model::Prepared<'_> {
+		self.inner.prepared()
+	}
+	fn target_names(&self) -> Vec<String> {
+		self.inner.target_names()
+	}
+	fn raw_rows(&self) -> Option<Vec<Vec<String>>> {
+		self.inner.raw_rows()
+	}
+	fn raw_headers(&self) -> Option<Vec<String>> {
+		self.inner.raw_headers()
+	}
+	fn infer_only(&self) -> bool {
+		self.inner.infer_only()
 	}
 }
 

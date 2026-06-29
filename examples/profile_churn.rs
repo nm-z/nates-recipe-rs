@@ -6,6 +6,9 @@
 // compare directly against engi/856369_results.db (before).
 use recipe::*;
 
+// `.run(())` resolves the one model + one data in scope through the live
+// registry, so `nn`/`data` are read by Drop/pointer, not textually — hence allow.
+#[allow(unused_variables)]
 fn main() {
 	let nn = Model::new().loss(ce).layer(64).leak().layer(2).lr(0.001);
 	let data = Data::load()
@@ -15,5 +18,5 @@ fn main() {
 		.target("Churn");
 	let ep: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
 	let train = Train::new().epochs(ep).log([Loss, Accuracy]);
-	train.run(&nn, &data);
+	train.run(());
 }

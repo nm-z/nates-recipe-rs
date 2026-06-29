@@ -162,8 +162,40 @@ impl RunData for Option<Dataset> {
 	}
 }
 
+/// What [`Train::run`] accepts. Rust can't overload one method name across
+/// zero/one/two arguments, so the "use what's in scope" forms collapse onto a
+/// single argument:
+///
+/// - `()` — the one live `Model` and the one live `Data` (panics if either is ambiguous).
+/// - `&Model` — that model, with the one live `Data`.
+/// - `(&Model, &data)` — both explicit (the only form a loop over several
+///   models/datasets can use, since then nothing is unambiguous "in scope").
+///
+/// Resolution returns raw pointers into heap-pinned state that the caller's
+/// bindings own for the duration of the `run` call (same lifetime contract the
+/// old `&Model`/`&data` arguments carried).
+pub trait RunArgs {
+	fn resolve(self) -> (*const ModelInner, *const dyn RunData);
+}
+impl RunArgs for () {
+	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
+		(the_model(), crate::dataset::the_data())
+	}
+}
+impl RunArgs for &Model {
+	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
+		(&*self.inner as *const ModelInner, crate::dataset::the_data())
+	}
+}
+impl<D: RunData + 'static> RunArgs for (&Model, &D) {
+	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
+		let data: &dyn RunData = self.1;
+		(&*self.0.inner as *const ModelInner, data as *const dyn RunData)
+	}
+}
+
 struct LastRun {
-	model: *const Model,
+	model: *const ModelInner,
 	score: f64,
 	preds: Option<Vec<f64>>,
 	n: usize,
@@ -263,7 +295,15 @@ impl Train {
 		last.preds.clone().map(|p| (p, last.k))
 	}
 
-	pub fn run(&self, model: &Model, data: &impl RunData) {
+	/// Train (or infer) the model on the data. The argument selects what to run:
+	/// `()` uses the one model + one data in scope, `model` pins the model (data
+	/// from scope), `(model, data)` pins both. See [`RunArgs`].
+	pub fn run<A: RunArgs>(&self, args: A) {
+		let (model_ptr, data_ptr) = args.resolve();
+		// Borrows live for the whole call: explicit args are owned by the caller's
+		// `let` bindings, registry pointers by the boxed state those bindings own.
+		let model: &ModelInner = unsafe { &*model_ptr };
+		let data: &dyn RunData = unsafe { &*data_ptr };
 		// A scenario whose encoded matrix can't fit host RAM is skipped (just like
 		// the VRAM preflight aborts a too-big GPU run) instead of crashing the whole
 		// program. check_ram prints the size before bailing; catch that here, report
@@ -383,7 +423,7 @@ impl Train {
 				}
 			};
 			let mut last = self.last.borrow_mut();
-			last.model = model as *const Model;
+			last.model = model as *const ModelInner;
 			last.score = score;
 			last.preds = None;
 			last.n = ds.x.nrows();
@@ -423,7 +463,7 @@ impl Train {
 				(f64::NAN, preds)
 			};
 			let mut last = self.last.borrow_mut();
-			last.model = model as *const Model;
+			last.model = model as *const ModelInner;
 			last.score = score;
 			last.preds = Some(preds);
 			last.n = n;
@@ -507,7 +547,13 @@ fn expand_tilde(path: &str) -> String {
 ///     .loss(mse)
 ///     .lr(0.001);
 /// ```
-pub struct Model {
+/// The model's actual state, heap-pinned inside [`Model`] so its address stays
+/// fixed across the builder's by-value moves (`Model::new().layer()…` moves the
+/// struct at every step). `run`/`save` and the live-model registry keep raw
+/// `*const ModelInner` into this box; the box outlives every run because the
+/// user's `Model` binding owns it until it drops.
+#[doc(hidden)]
+pub struct ModelInner {
 	pub(crate) specs: Vec<LayerSpec>,
 	pub(crate) loss: Loss,
 	pub(crate) lr: f64,
@@ -516,13 +562,59 @@ pub struct Model {
 	pub(crate) yscaler: RefCell<Option<(f64, f64)>>,
 }
 
+pub struct Model {
+	pub(crate) inner: Box<ModelInner>,
+}
+
+impl std::ops::Deref for Model {
+	type Target = ModelInner;
+	fn deref(&self) -> &ModelInner {
+		&self.inner
+	}
+}
+impl std::ops::DerefMut for Model {
+	fn deref_mut(&mut self) -> &mut ModelInner {
+		&mut self.inner
+	}
+}
+impl Drop for Model {
+	fn drop(&mut self) {
+		deregister_model(&*self.inner as *const ModelInner);
+	}
+}
+
+// Every live `Model` registers the stable address of its heap state here, so
+// `.run(())` / `.run(model)` can resolve "the Model in scope" with no argument.
+// Single-threaded GPU program; the table is per-thread by construction.
+thread_local! {
+	static MODELS: RefCell<Vec<*const ModelInner>> = const { RefCell::new(Vec::new()) };
+}
+fn register_model(p: *const ModelInner) {
+	MODELS.with(|m| m.borrow_mut().push(p));
+}
+fn deregister_model(p: *const ModelInner) {
+	MODELS.with(|m| m.borrow_mut().retain(|&x| !std::ptr::eq(x, p)));
+}
+/// The one live `Model`, or a clear panic when zero or several exist — backs the
+/// no-argument `.run()` / `.run(model)` "use what's in scope" resolution.
+fn the_model() -> *const ModelInner {
+	MODELS.with(|m| {
+		let m = m.borrow();
+		match m.len() {
+			1 => m[0],
+			0 => panic!("run(): no Model in scope — build one with Model::new()…, or pass it: train.run(model)"),
+			n => panic!("run(): {n} Models in scope — ambiguous; pass the one to run, e.g. train.run(model)"),
+		}
+	})
+}
+
 struct Issue {
 	what: String,
 	have: String,
 	need: String,
 }
 
-fn preflight(model: &Model, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
+fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
 	let mut issues = Vec::new();
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
@@ -624,14 +716,16 @@ fn confirm_issues(issues: &[Issue]) -> bool {
 impl Model {
 
 	pub fn new() -> Model {
-		Model {
+		let inner = Box::new(ModelInner {
 			specs: Vec::new(),
 			loss: Loss::Mse,
 			lr: 0.01,
 			params: RefCell::new(Vec::new()),
 			scaler: RefCell::new(None),
 			yscaler: RefCell::new(None),
-		}
+		});
+		register_model(&*inner as *const ModelInner);
+		Model { inner }
 	}
 
 	/// Load shipped weights into a freshly-built model for forward-only use, with
@@ -707,7 +801,7 @@ impl Model {
 	}
 
 	/// Set the learning rate. To reset between runs, rebind:
-	/// `let model = model.lr(1e-8); train.run(&model, &data);`.
+	/// `let model = model.lr(1e-8); train.run((&model, &data));`.
 	pub fn lr(mut self, lr: f64) -> Model {
 		self.lr = lr;
 		self
@@ -964,12 +1058,14 @@ mod metric_gpu_tests {
 		// allocations and train R². download_vec is host-only (no GpuBuffer
 		// alloc), so reading R² never perturbs the count.
 		let model = Model {
-			specs: vec![],
-			loss: Loss::Mse,
-			lr: 0.5,
-			params: RefCell::new(vec![]),
-			scaler: RefCell::new(None),
-			yscaler: RefCell::new(None),
+			inner: Box::new(ModelInner {
+				specs: vec![],
+				loss: Loss::Mse,
+				lr: 0.5,
+				params: RefCell::new(vec![]),
+				scaler: RefCell::new(None),
+				yscaler: RefCell::new(None),
+			}),
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
 		let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
@@ -1063,12 +1159,14 @@ mod metric_gpu_tests {
 
 		// --- ping-pong backward (modifies weights via SGD) ---
 		let model = Model {
-			specs: vec![],
-			loss: Loss::Mse,
-			lr,
-			params: RefCell::new(vec![]),
-			scaler: RefCell::new(None),
-			yscaler: RefCell::new(None),
+			inner: Box::new(ModelInner {
+				specs: vec![],
+				loss: Loss::Mse,
+				lr,
+				params: RefCell::new(vec![]),
+				scaler: RefCell::new(None),
+				yscaler: RefCell::new(None),
+			}),
 		};
 		let sc = Scratch::new(&params, n, false);
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
@@ -1138,7 +1236,7 @@ mod metric_gpu_tests {
 			ref_dw.push(GpuBuffer::alloc(p.in_dim * p.out_dim).expect("ref dw"));
 			ref_db.push(GpuBuffer::alloc(p.out_dim).expect("ref db"));
 		}
-		Model::loss_grad_into(
+		ModelInner::loss_grad_into(
 			model.loss,
 			&sc.acts[last],
 			&ybuf,

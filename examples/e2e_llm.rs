@@ -3,6 +3,7 @@
 // the preflight aborts cleanly (a dataset-size limit, not a RoPE bug).
 use recipe::*;
 
+#[allow(unused_variables)] // llm/data resolved via the live registry, not textually read
 fn main() {
 	let llm = Model::new()
 		.loss(ce)
@@ -18,5 +19,5 @@ fn main() {
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
 	let train = Train::new().epochs(3).log([Loss, Accuracy]);
-	train.run(&llm, &data);
+	train.run(());
 }

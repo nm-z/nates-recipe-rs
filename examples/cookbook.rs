@@ -101,5 +101,5 @@ fn main() {
 		(&cnn, &cnn_data, &cnn_train),
 		(&mlp, &mlp_data, &mlp_train),
 		(&llm, &llm_data, &llm_train),
-	] { train.run(model, data); }
+	] { train.run((model, data)); }
 }

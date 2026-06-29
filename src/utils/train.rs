@@ -4,7 +4,7 @@
 //! `recipe-infer` crate; this module drives them but they never depend back on it.
 
 use crate::dataset::{Dataset, collapse_onehot};
-use crate::model::{Model, RunData, Train};
+use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
 	Activation, ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
@@ -108,7 +108,7 @@ fn fmt_axis(v: f64) -> String {
 	}
 }
 
-impl Model {
+impl ModelInner {
 
 	/// dL/dA at the output for the chosen loss, scaled by 1/n (batch mean),
 	/// written in place into `da` with no allocation. `out` = predictions,

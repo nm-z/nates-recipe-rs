@@ -454,8 +454,8 @@ fn main() {
 	let _ = std::fs::remove_file("pantry/detector.ogdl");
 	let model = model();
 	let trainer = Train::new().epochs(20000).resume("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
-	trainer.run(&model, &train);
+	trainer.run((&model, &train));
 	trainer.save("pantry/detector.ogdl");
 	eprintln!("=== held-out test set (60%) — datatype-detection accuracy ===");
-	Train::new().log([Accuracy]).run(&model, &Some(test));
+	Train::new().log([Accuracy]).run((&model, &Some(test)));
 }
