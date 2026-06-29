@@ -23,10 +23,12 @@ impl IntoTargets for &[&str] {
 	}
 }
 
+/// A lazy description of a dataset: which sources, target, split, exclusions.
+/// Nothing is loaded or encoded until `Train::run` (or `datasets()`) asks for it
+/// — so building a `Data`, even many of them, costs only the config it holds.
+/// `Data` describes; `Train` executes.
 pub struct Data {
 	pub target: &'static str,
-	pub set: Dataset,
-	pub test: Option<Dataset>,
 	target_names: Vec<String>,
 	pub(crate) attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
@@ -127,16 +129,6 @@ impl Data {
 	pub fn load() -> Data {
 		Data {
 			target: "",
-			set: Dataset {
-				x: crate::Mat::default((0, 0)),
-				y: crate::Vec1::default(0),
-				source: String::new(),
-				n_targets: 0,
-				has_target: false,
-				text_cols: Vec::new(),
-				onehot_groups: Vec::new(),
-			},
-			test: None,
 			target_names: Vec::new(),
 			attrs: Vec::new(),
 			rows: Vec::new(),
@@ -203,20 +195,25 @@ impl Data {
 				}
 			}
 		}
-		let (train, test, attrs) = self.prepare();
-		self.set = train;
-		self.test = test;
-		self.attrs = attrs;
-		self.print_summary();
 		self
 	}
 
-	fn feature_type_counts(&self) -> Vec<(&'static str, usize)> {
+	/// Materialize this description into encoded `(train, Option<test>)` datasets,
+	/// printing the summary as it goes. This is the ONLY place loading + encoding
+	/// happens; `Train::run` calls it per run so exactly one dataset is resident at
+	/// a time. Public so the CLI / tests can force materialization explicitly.
+	pub fn datasets(&self) -> (Dataset, Option<Dataset>) {
+		let (train, test, attrs) = self.prepare();
+		self.print_summary(&train, test.as_ref(), &attrs);
+		(train, test)
+	}
+
+	fn feature_type_counts(&self, attrs: &[Attr]) -> Vec<(&'static str, usize)> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
 		let (mut numeric, mut temporal, mut categorical, mut ordinal, mut text, mut image) =
 			(0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-		for a in &self.attrs {
+		for a in attrs {
 			if is_target(&a.name) || is_excluded(&a.name) {
 				continue;
 			}
@@ -251,12 +248,12 @@ impl Data {
 		out
 	}
 
-	fn cat_cardinality_counts(&self) -> Vec<(usize, usize)> {
+	fn cat_cardinality_counts(&self, attrs: &[Attr]) -> Vec<(usize, usize)> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
 		let mut card: std::collections::BTreeMap<usize, usize> =
 			std::collections::BTreeMap::new();
-		for a in &self.attrs {
+		for a in attrs {
 			if is_target(&a.name) || is_excluded(&a.name) {
 				continue;
 			}
@@ -267,7 +264,7 @@ impl Data {
 		card.into_iter().collect()
 	}
 
-	fn print_summary(&self) {
+	fn print_summary(&self, train: &Dataset, test: Option<&Dataset>, attrs: &[Attr]) {
 		let disk_size = |path: &str| -> String {
 			std::fs::metadata(path)
 				.map(|m| crate::data::human_bytes(m.len() as usize))
@@ -281,8 +278,8 @@ impl Data {
 			}
 			path.to_string()
 		};
-		let raw_cols = self.attrs.len();
-		let types = self.feature_type_counts();
+		let raw_cols = attrs.len();
+		let types = self.feature_type_counts(attrs);
 		let print_types = |indent: &str| {
 			if types.len() == 1 {
 				eprintln!("{indent}{} {}", types[0].1, types[0].0);
@@ -293,9 +290,9 @@ impl Data {
 			}
 		};
 		let set_rows = if self.split_frac.is_some() {
-			self.set.x.nrows() + self.test.as_ref().map_or(0, |t| t.x.nrows())
+			train.x.nrows() + test.map_or(0, |t| t.x.nrows())
 		} else {
-			self.set.x.nrows()
+			train.x.nrows()
 		};
 		for src in &self.sources {
 			eprintln!("\x1b[32mset\x1b[0m  {}", short(src),);
@@ -306,7 +303,7 @@ impl Data {
 		for ex in &self.exclude {
 			eprintln!("    excluded  {ex}");
 		}
-		let cards = self.cat_cardinality_counts();
+		let cards = self.cat_cardinality_counts(attrs);
 		if !cards.is_empty() {
 			eprintln!("    encoding");
 			for (card, count) in &cards {
@@ -314,8 +311,8 @@ impl Data {
 				eprintln!("        {count} × [{}]", range.join(", "));
 			}
 		}
-		eprintln!("    {} features → model", self.set.x.ncols(),);
-		if let Some(test) = &self.test {
+		eprintln!("    {} features → model", train.x.ncols(),);
+		if let Some(test) = test {
 			if let Some(tp) = &self.test_path {
 				let test_raw_cols =
 					self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
@@ -335,7 +332,7 @@ impl Data {
 			} else if self.split_frac.is_some() {
 				eprintln!(
 					"\x1b[32msplit\x1b[0m  {} train / {} test",
-					self.set.x.nrows(),
+					train.x.nrows(),
 					test.x.nrows(),
 				);
 			}
@@ -451,8 +448,9 @@ impl Data {
 }
 
 impl crate::model::RunData for Data {
-	fn dataset(&self) -> &Dataset {
-		&self.set
+	fn prepared(&self) -> crate::model::Prepared<'_> {
+		let (train, _test) = self.datasets();
+		crate::model::Prepared::Owned(train)
 	}
 	fn target_names(&self) -> Vec<String> {
 		self.target_names.clone()
@@ -505,9 +503,10 @@ mod safetensors_source_tests {
 		assert_eq!(rows[2], vec!["5", "6", "30"]);
 
 		let data = Data::load().set(p).split(0.66).target("y");
-		assert_eq!(data.set.x.ncols(), 2, "two feature columns (x:0, x:1)");
-		assert_eq!(data.set.n_targets, 1, "single target (y)");
-		let total = data.set.x.nrows() + data.test.as_ref().map_or(0, |t| t.x.nrows());
+		let (set, test) = data.datasets();
+		assert_eq!(set.x.ncols(), 2, "two feature columns (x:0, x:1)");
+		assert_eq!(set.n_targets, 1, "single target (y)");
+		let total = set.x.nrows() + test.as_ref().map_or(0, |t| t.x.nrows());
 		assert_eq!(total, 3, "all rows preserved across the split");
 		let _ = std::fs::remove_file(&path);
 	}
@@ -520,6 +519,7 @@ mod safetensors_source_tests {
 	fn data_load_on_real_safetensors_shard() {
 		let p = std::env::var("ST_FILE").expect("set ST_FILE");
 		let d = Data::load().set(&p);
-		eprintln!("loaded: {} rows × {} cols", d.set.x.nrows(), d.set.x.ncols());
+		let (set, _) = d.datasets();
+		eprintln!("loaded: {} rows × {} cols", set.x.nrows(), set.x.ncols());
 	}
 }

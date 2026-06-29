@@ -75,10 +75,11 @@ fn main() -> Result<()> {
 		eprintln!("no --target specified");
 		d
 	};
+	let (set, _test) = data.datasets();
 	eprintln!(
 		"loaded {} samples × {} features",
-		data.set.x.nrows(),
-		data.set.x.ncols()
+		set.x.nrows(),
+		set.x.ncols()
 	);
 
 	gpu_core::kernels::gpu_shutdown();

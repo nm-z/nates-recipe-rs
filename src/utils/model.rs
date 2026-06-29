@@ -103,8 +103,29 @@ impl From<&String> for SaveItem {
 	}
 }
 
+/// A `Dataset` ready for a single `run`, either freshly materialized by a lazy
+/// builder (`Owned`) or borrowed from one the caller already holds (`Borrowed`).
+/// `run` binds this for the duration of the run, so an `Owned` dataset is freed
+/// the moment the run returns — only one is ever alive at a time.
+pub enum Prepared<'a> {
+	Owned(Dataset),
+	Borrowed(&'a Dataset),
+}
+
+impl Prepared<'_> {
+	pub fn get(&self) -> &Dataset {
+		match self {
+			Prepared::Owned(d) => d,
+			Prepared::Borrowed(d) => d,
+		}
+	}
+}
+
 pub trait RunData {
-	fn dataset(&self) -> &Dataset;
+	/// Produce the `Dataset` for this run. Lazy builders load + encode HERE — not
+	/// before — so describing a `Data` costs nothing and `Train` is the only thing
+	/// that executes. If `run` never calls this, the data is never materialized.
+	fn prepared(&self) -> Prepared<'_>;
 	fn target_names(&self) -> Vec<String>;
 	fn raw_rows(&self) -> Option<Vec<Vec<String>>>;
 	fn raw_headers(&self) -> Option<Vec<String>>;
@@ -112,8 +133,8 @@ pub trait RunData {
 }
 
 impl RunData for Dataset {
-	fn dataset(&self) -> &Dataset {
-		self
+	fn prepared(&self) -> Prepared<'_> {
+		Prepared::Borrowed(self)
 	}
 	fn target_names(&self) -> Vec<String> {
 		Vec::new()
@@ -130,8 +151,8 @@ impl RunData for Dataset {
 }
 
 impl RunData for Option<Dataset> {
-	fn dataset(&self) -> &Dataset {
-		self.as_ref().expect("no test dataset — use .test() or .split()")
+	fn prepared(&self) -> Prepared<'_> {
+		Prepared::Borrowed(self.as_ref().expect("no test dataset — use .test() or .split()"))
 	}
 	fn target_names(&self) -> Vec<String> {
 		Vec::new()
@@ -253,7 +274,8 @@ impl Train {
 	}
 
 	pub fn run(&self, model: &Model, data: &impl RunData) {
-		let ds = data.dataset();
+		let prepared = data.prepared();
+		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
 		let issues = preflight(model, ds, forward_only);
 		if !issues.is_empty() && !confirm_issues(&issues) {
@@ -775,7 +797,7 @@ mod metric_gpu_tests {
 		let data = crate::dataset::Data::load()
 			.set(TRAIN)
 			.target("Churn");
-		Some(data.set)
+		Some(data.datasets().0)
 	});
 
 	#[test]

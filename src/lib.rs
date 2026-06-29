@@ -60,7 +60,7 @@ pub use model::{
 };
 #[doc(hidden)]
 pub use model::{
-	Activation, IntoLayer, LayerSpec, Param, RunData, SaveItem,
+	Activation, IntoLayer, LayerSpec, Param, Prepared, RunData, SaveItem,
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 

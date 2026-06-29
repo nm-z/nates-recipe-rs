@@ -1255,7 +1255,8 @@ impl Model {
 	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the
 	/// Dataset. Returns the raw `n*k` predictions.
 	pub fn eval(&self, data: &impl RunData) -> Vec<f64> {
-		let ds = data.dataset();
+		let prepared = data.prepared();
+		let ds = prepared.get();
 		let (xbuf, x_cat, n) = self.prep_eval_input(ds);
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "eval: call train() first");
