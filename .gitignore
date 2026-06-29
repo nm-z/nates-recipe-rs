@@ -45,3 +45,12 @@ examples/*/test_images/
 !examples/train_detector.rs
 /kernel_inventory.db
 /gpu-core/vendor/
+
+# Run / profiling / editor artifacts (session junk, never source)
+/model.ogdl
+/perf.data
+/submission.csv
+/.rocprofv3/
+*.kate-swp
+/*.patch
+/deleted-copilot-branches-*.txt

@@ -273,29 +273,41 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			.and_then(|s| s.to_str())
 			.unwrap_or(dir);
 		pb.set_message(format!("decoding images in /{leaf}"));
-		for (name, paths) in images {
-			let rows: Vec<(String, Vec<f64>)> = paths
-				.par_iter()
-				.map(|(hash, p)| {
-					let px = match image_to_row(p.to_str().unwrap_or_default(), 32, 32) {
-						Ok(r) => r.to_vec(),
-						Err(e) => {
-							eprintln!("WARN: skipping image {}: {e}", p.display());
-							vec![f64::NAN; 32 * 32 * 3]
-						}
-					};
-					pb.inc(1);
-					(hash.clone(), px)
-				})
-				.collect();
-			let (hashes, pixels) = rows.into_iter().unzip();
-			groups.push(DirGroup::Image {
-				name,
-				dim: 32 * 32 * 3,
-				hashes,
-				pixels,
-			});
-		}
+		// A directory of image files is ONE vector, indexed by filename (stem) — the
+		// join key a CSV column of filenames matches against. (Previously each unique
+		// stem became its own single-image group, so nothing could join.)
+		let leaf = std::path::Path::new(dir)
+			.file_name()
+			.and_then(|s| s.to_str())
+			.unwrap_or("images")
+			.to_string();
+		let all: Vec<std::path::PathBuf> = images.into_values().flatten().map(|(_, p)| p).collect();
+		let rows: Vec<(String, Vec<f64>)> = all
+			.par_iter()
+			.map(|p| {
+				let stem = p
+					.file_stem()
+					.and_then(|s| s.to_str())
+					.unwrap_or_default()
+					.to_string();
+				let px = match image_to_row(p.to_str().unwrap_or_default(), 32, 32) {
+					Ok(r) => r.to_vec(),
+					Err(e) => {
+						eprintln!("WARN: skipping image {}: {e}", p.display());
+						vec![f64::NAN; 32 * 32 * 3]
+					}
+				};
+				pb.inc(1);
+				(stem, px)
+			})
+			.collect();
+		let (hashes, pixels): (Vec<String>, Vec<Vec<f64>>) = rows.into_iter().unzip();
+		groups.push(DirGroup::Image {
+			name: leaf,
+			dim: 32 * 32 * 3,
+			hashes,
+			pixels,
+		});
 		pb.finish();
 		eprintln!();
 	}

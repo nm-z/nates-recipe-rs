@@ -29,6 +29,15 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 		.map(|t| t.to_ascii_lowercase())
 }
 
+/// Filename → stem (drop directory + extension) so a CSV cell like
+/// `train/train_0001.png` matches an image vector keyed by `train_0001`.
+fn file_stem(s: &str) -> &str {
+	std::path::Path::new(s)
+		.file_stem()
+		.and_then(|x| x.to_str())
+		.unwrap_or(s)
+}
+
 fn cell(row: &[String], j: usize) -> &str {
 	row.get(j).map_or("", |s| s.as_str())
 }
@@ -199,10 +208,9 @@ fn encode_kind(
 			}
 			(names, cols)
 		}
-		Kind::Image => panic!(
-			"image column '{}' not yet supported — .exclude(\"{}\")",
-			attr.name, attr.name
-		),
+		// An image column holds filenames — it is the JOIN KEY into an image vector
+		// (handled in `assemble`), not a feature itself, so it emits no columns.
+		Kind::Image => (Vec::new(), Vec::new()),
 	}
 }
 
@@ -232,10 +240,8 @@ fn encode(
 		Kind::Numeric | Kind::Temporal | Kind::Ordinal(_) => 1,
 		Kind::Categorical(c) => c.len(),
 		Kind::Text(_) => text_seq_lens[ai].max(1),
-		Kind::Image => panic!(
-			"image column '{}' not yet supported — .exclude(\"{}\")",
-			a.name, a.name
-		),
+		// Image columns are join keys, not features — zero feature width.
+		Kind::Image => 0,
 	};
 	let proj_w: usize = attrs
 		.iter()
@@ -258,7 +264,22 @@ fn encode(
 		if is_skip(ai) && !is_target(ai) {
 			continue;
 		}
-		let (cnames, ccols) = encode_kind(attr, rows, ai, width(ai, attr));
+		// A categorical TARGET encodes to ONE class-index column (0..N-1), not a
+		// one-hot — the trainer expands it to the model's output width for CE (so a
+		// declared class count above what the data shows still works). Features keep
+		// their one-hot encoding (role decides target-index vs feature-one-hot here).
+		let (cnames, ccols) = match (&attr.kind, is_target(ai)) {
+			(Kind::Categorical(cats), true) => {
+				let mut col = vec![f64::NAN; n];
+				for (r, row) in rows.iter().enumerate() {
+					if let Some(p) = cats.iter().position(|c| c == cell(row, ai)) {
+						col[r] = p as f64;
+					}
+				}
+				(vec![attr.name.clone()], vec![col])
+			}
+			_ => encode_kind(attr, rows, ai, width(ai, attr)),
+		};
 		match targets.iter().position(|&t| t == ai) {
 			Some(tj) => tcols[tj] = ccols,
 			None => {
@@ -498,6 +519,12 @@ fn assemble(
 	);
 	let s_hashes = group_hashes(&groups[sample_idx]);
 	let n = s_x.nrows();
+	// Raw sample cells — an image vector joins by matching the filename it holds in
+	// one of these columns (the "column of filenames" in the user's abstraction).
+	let sample_cells: Option<&[Vec<String>]> = match &groups[sample_idx] {
+		DirGroup::Table { cells, .. } => Some(cells.as_slice()),
+		_ => None,
+	};
 
 	let mut names: Vec<String> = Vec::new();
 	let mut sources: Vec<(usize, usize)> = Vec::new();
@@ -531,6 +558,48 @@ fn assemble(
 			continue;
 		}
 
+		// Image vector ⋈ filename column: a dir of files is a vector indexed by
+		// filename; a sample column of filenames is a vector of those keys. Pick the
+		// sample column whose cell stems best match this image vector's filenames,
+		// then gather each row's image by that key (index = filename, data = image).
+		if let (DirGroup::Image { hashes: g_hashes, .. }, Some(cells)) = (g, sample_cells) {
+			let key_set: std::collections::HashSet<&str> =
+				g_hashes.iter().map(String::as_str).collect();
+			let ncols = cells.first().map_or(0, Vec::len);
+			let (mut best_col, mut best) = (0usize, 0usize);
+			for c in 0..ncols {
+				let hits = cells
+					.iter()
+					.filter(|r| key_set.contains(file_stem(r.get(c).map_or("", String::as_str))))
+					.count();
+				if hits > best {
+					best = hits;
+					best_col = c;
+				}
+			}
+			if best > 0 {
+				let by_key: std::collections::HashMap<&str, usize> =
+					g_hashes.iter().enumerate().map(|(i, h)| (h.as_str(), i)).collect();
+				let (g_names, g_x, _gy, _gk) =
+					encode_group(g, &mut schema, schema_in, &[], exclude);
+				let src: Vec<Option<usize>> = (0..n)
+					.map(|i| {
+						by_key
+							.get(file_stem(cells[i].get(best_col).map_or("", String::as_str)))
+							.copied()
+					})
+					.collect();
+				let mi = mats.len();
+				for (j, nm) in g_names.iter().enumerate() {
+					names.push(nm.clone());
+					sources.push((mi, j));
+				}
+				gather.push(src);
+				mats.push(g_x);
+				continue;
+			}
+		}
+
 		let g_hashes = group_hashes(g);
 		let mut by_hash: std::collections::HashMap<&str, Vec<usize>> =
 			std::collections::HashMap::new();
@@ -559,13 +628,6 @@ fn assemble(
 			continue;
 		}
 
-		if matches!(g, DirGroup::Image { .. }) {
-			skipped.push(format!(
-                        "{}: image group ({} wells) kept out of the feature matrix — one copy per well, not duplicated into rows",
-                        group_name(g), by_hash.len()
-                  ));
-			continue;
-		}
 		let (g_names, g_x, _gy, _gk) = encode_group(g, &mut schema, schema_in, &[], exclude);
 
 		let src: Vec<Option<usize>> = (0..n)

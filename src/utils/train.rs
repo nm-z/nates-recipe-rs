@@ -794,7 +794,7 @@ impl Model {
 		} else {
 			(zscore_fit(&xraw, n, d, &self.scaler), None)
 		};
-		let ybuf = {
+		let y_host = {
 			let ys = data.y.as_slice().expect("train: y contiguous");
 			let mut ydata = ys.to_vec();
 			let has_nan = ydata.iter().any(|v| v.is_nan());
@@ -820,7 +820,7 @@ impl Model {
 					}
 				}
 			}
-			GpuBuffer::upload(&ydata).expect("upload y")
+			ydata
 		};
 
 		// Resumed weights (per-neuron, in save order) or empty for random init.
@@ -895,14 +895,34 @@ impl Model {
 			}
 		};
 		let last = params.len() - 1;
-		// Output units must equal the target count: y is flat n*k and acts[last]
-		// is n*out_dim — they must align element-for-element.
-		let k = data.n_targets.max(1);
+		// A categorical target arrives as ONE class-index column; for multi-class CE
+		// the model's output width IS the class count, so expand the index to a
+		// one-hot of `out_dim` here (reusing the dense one-hot CE/accuracy path).
+		// Binary (bce, out_dim==1) and regression/multi-output use the column as-is.
+		let n_targets = data.n_targets.max(1);
+		let out_dim = params[last].out_dim;
+		let expand_ce = self.loss.is_classification() && n_targets == 1 && out_dim > 1;
+		let k = if expand_ce { out_dim } else { n_targets };
+		// Output units must equal the target width: y is flat n*k and acts[last] is
+		// n*out_dim — they must align element-for-element (the expanded one-hot does).
 		assert_eq!(
-			params[last].out_dim, k,
-			"output layer has {} units but there are {k} target column(s) — make the last .layer({k})",
-			params[last].out_dim
+			out_dim, k,
+			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
 		);
+		let ybuf = if expand_ce {
+			let mut oh = vec![0.0f64; n * out_dim];
+			for (i, &idx) in y_host.iter().enumerate() {
+				if idx.is_finite() {
+					let c = idx as usize;
+					if c < out_dim {
+						oh[i * out_dim + c] = 1.0;
+					}
+				}
+			}
+			GpuBuffer::upload(&oh).expect("upload y onehot")
+		} else {
+			GpuBuffer::upload(&y_host).expect("upload y")
+		};
 		let summary = if cfg.metrics.is_empty() {
 			String::new()
 		} else {
