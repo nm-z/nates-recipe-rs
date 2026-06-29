@@ -3027,18 +3027,55 @@ pub fn gpu_linear_backward_weights_only(
 	Ok((grad_w, grad_b))
 }
 
+/// Element count of the `[P×k×n]` partial scratch the split-K dW kernel needs for
+/// this shape. Scratch sizes its `dw_partials` buffer from this so the kernel and
+/// the allocation always agree on P.
+pub fn gpu_splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
+	crate::math_ops::splitk_dw_partials_elems(m, k, n)
+}
+
+/// Two-pass split-K backward weight gradient: `grad_w` [k×n] = `input`ᵀ·`grad`
+/// reduced over the `m` batch rows, fanned across all CUs (the vendor BLAS GEMM
+/// leaves ~50 of 54 idle on this tiny output). `partials` must hold ≥
+/// `gpu_splitk_dw_partials_elems(m, k, n)` elements. Deterministic (two-pass
+/// reduce, fixed sum order — no f64 atomicAdd).
+pub fn gpu_splitk_dw_into(
+	input: &GpuBuffer,
+	grad: &GpuBuffer,
+	partials: &GpuBuffer,
+	grad_w: &GpuBuffer,
+	m: usize,
+	n: usize,
+	k: usize,
+) {
+	let p = crate::math_ops::splitk_dw_p(m, k, n);
+	unsafe {
+		crate::math_ops::launch_splitk_dw(
+			input.ptr as *const c_void,
+			grad.ptr as *const c_void,
+			partials.ptr as *mut c_void,
+			grad_w.ptr as *mut c_void,
+			m as i32,
+			n as i32,
+			k as i32,
+			p as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
 pub fn gpu_linear_backward_weights_only_into(
 	grad: &GpuBuffer,
 	input: &GpuBuffer,
 	grad_w: &GpuBuffer,
 	grad_b: &GpuBuffer,
 	reduce_ws: &GpuBuffer,
+	partials: &GpuBuffer,
 	m: usize,
 	n: usize,
 	k: usize,
 ) {
-	let alpha = 1.0_f64;
-	let beta = 0.0_f64;
 	let ws = unsafe {
 		reduce_sum_cols_workspace_bytes(
 			grad.ptr as *const c_void,
@@ -3047,25 +3084,8 @@ pub fn gpu_linear_backward_weights_only_into(
 			std::ptr::null_mut(),
 		)
 	};
-	let gw_status = unsafe {
-		hipblasDgemm(
-			hipblas_handle(),
-			HIPBLAS_OP_N,
-			HIPBLAS_OP_T,
-			n as i32,
-			k as i32,
-			m as i32,
-			&alpha,
-			grad.ptr as *const f64,
-			n as i32,
-			input.ptr as *const f64,
-			k as i32,
-			&beta,
-			grad_w.ptr as *mut f64,
-			n as i32,
-		)
-	};
-	check(gw_status).expect("grad_w dgemm failed");
+	// grad_w = inputᵀ @ grad — split-K across all CUs.
+	gpu_splitk_dw_into(input, grad, partials, grad_w, m, n, k);
 	unsafe {
 		launch_reduce_sum_cols(
 			grad.ptr as *const c_void,
@@ -3087,32 +3107,15 @@ pub fn gpu_linear_backward_full_into(
 	grad_w: &GpuBuffer,
 	grad_b: &GpuBuffer,
 	reduce_ws: &GpuBuffer,
+	partials: &GpuBuffer,
 	m: usize,
 	n: usize,
 	k: usize,
 ) {
-	// grad_w = input^T @ grad
+	// grad_w = input^T @ grad — split-K across all CUs.
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
-	let gw_status = unsafe {
-		hipblasDgemm(
-			hipblas_handle(),
-			HIPBLAS_OP_N,
-			HIPBLAS_OP_T,
-			n as i32,
-			k as i32,
-			m as i32,
-			&alpha,
-			grad.ptr as *const f64,
-			n as i32,
-			input.ptr as *const f64,
-			k as i32,
-			&beta,
-			grad_w.ptr as *mut f64,
-			n as i32,
-		)
-	};
-	check(gw_status).expect("grad_w dgemm failed");
+	gpu_splitk_dw_into(input, grad, partials, grad_w, m, n, k);
 	// grad_b = sum_cols(grad)
 	let ws = unsafe {
 		reduce_sum_cols_workspace_bytes(

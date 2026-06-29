@@ -40,7 +40,7 @@ pub fn metric_gpu(
 		Metric::Time => elapsed,
 		Metric::R2 => {
 			kernels::gpu_ss_res_into(out, ybuf, &sc.metric_scalar, nk);
-			1.0 - download_scalar(&sc.metric_scalar) / ss_tot
+			1.0 - sc.read_metric_scalar() / ss_tot
 		}
 		Metric::Accuracy => {
 			if k == 1 {
@@ -48,7 +48,7 @@ pub fn metric_gpu(
 			} else {
 				kernels::gpu_argmax_accuracy_into(out, ybuf, &sc.metric_scalar, n, k);
 			}
-			download_scalar(&sc.metric_scalar)
+			sc.read_metric_scalar()
 		}
 		// The Loss metric is the model's ACTUAL loss (self.loss), not hardcoded.
 		Metric::Loss => {
@@ -56,7 +56,7 @@ pub fn metric_gpu(
 			match loss {
 				Loss::Mse => {
 					kernels::gpu_mse_into(out, ybuf, &sc.metric_scalar, nk);
-					download_scalar(&sc.metric_scalar)
+					sc.read_metric_scalar()
 				}
 				Loss::Mae => {
 					kernels::gpu_sub_scale_into(out, ybuf, &sc.metric_t0, nk, 1.0);
@@ -68,7 +68,7 @@ pub fn metric_gpu(
 						nk,
 						1,
 					);
-					download_scalar(&sc.metric_scalar) / nf
+					sc.read_metric_scalar() / nf
 				}
 				Loss::Huber => {
 					// delta=1: 0.5 r² for |r|≤1 else |r|-0.5, written as
@@ -95,7 +95,7 @@ pub fn metric_gpu(
 						nk,
 						1,
 					);
-					download_scalar(&sc.metric_scalar) / nf
+					sc.read_metric_scalar() / nf
 				}
 				Loss::Ce => {
 					// Categorical CE: p = softmax(logits); −Σ y·ln(p) / n. y is
@@ -118,7 +118,7 @@ pub fn metric_gpu(
 						nk,
 						1,
 					);
-					-download_scalar(&sc.metric_scalar) / n as f64
+					-sc.read_metric_scalar() / n as f64
 				}
 				Loss::Bce => {
 					let eps = 1e-7;
@@ -140,14 +140,14 @@ pub fn metric_gpu(
 						nk,
 						1,
 					);
-					-download_scalar(&sc.metric_scalar) / nf
+					-sc.read_metric_scalar() / nf
 				}
 				Loss::Focal => {
 					// Per-element focal loss (already positive) → mean. t1 is a
 					// throwaway sink for the grad the kernel also emits.
 					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.metric_t0, &sc.metric_t1, FOCAL_GAMMA, FOCAL_ALPHA, nk);
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.metric_scalar, &sc.reduce_ws, nk, 1);
-					download_scalar(&sc.metric_scalar) / nf
+					sc.read_metric_scalar() / nf
 				}
 			}
 		}
@@ -694,5 +694,37 @@ mod tests {
 		let ms = t0.elapsed().as_secs_f64() * 1e3;
 		assert!(out.iter().all(|v| v.is_finite()), "flash-attn output not finite");
 		eprintln!("flash-attn bounded: completed in {ms:.2} ms (S={s}, n={n}, heads={heads}, d={d}), out[0]={:.6}", out[0]);
+	}
+
+	// The split-K backward weight gradient (dW = inputᵀ·grad, reduced over the
+	// batch rows across all CUs) must match rocBLAS's dW to f64 tolerance. It
+	// reassociates the reduction (P fixed-order partial sums summed in pass 2), so
+	// bit-equality isn't expected — only numerical agreement. Shapes: the profiled
+	// skinny output + huge reduction, the out_dim==1 (gemv) case, and a multi-tile
+	// output that exercises grid.x > 1.
+	#[test]
+	fn splitk_dw_matches_rocblas() {
+		gpu_core::hip::set_device(0).expect("set_device");
+		for &(m, k, n) in &[(4096usize, 42usize, 64usize), (100_000, 42, 1), (777, 130, 96)] {
+			let input = kernels::gpu_randn(m * k, 11).expect("input");
+			let grad = kernels::gpu_randn(m * n, 22).expect("grad");
+			let reference = kernels::gpu_gemm_at(&input, &grad, k, n, m).expect("ref dw");
+			let partials =
+				GpuBuffer::alloc(kernels::gpu_splitk_dw_partials_elems(m, k, n)).expect("partials");
+			let dw = GpuBuffer::alloc(k * n).expect("dw");
+			kernels::gpu_splitk_dw_into(&input, &grad, &partials, &dw, m, n, k);
+			let r = download_vec(&reference, k * n);
+			let g = download_vec(&dw, k * n);
+			let (mut maxdiff, mut maxabs) = (0.0f64, 0.0f64);
+			for i in 0..r.len() {
+				maxdiff = maxdiff.max((r[i] - g[i]).abs());
+				maxabs = maxabs.max(r[i].abs());
+			}
+			eprintln!("split-K dW m={m} k={k} n={n}: maxdiff={maxdiff:e} maxabs={maxabs:e}");
+			assert!(
+				maxdiff <= 1e-8 * maxabs.max(1.0),
+				"split-K dW diverged from rocBLAS: m={m} k={k} n={n} maxdiff={maxdiff:e}"
+			);
+		}
 	}
 }

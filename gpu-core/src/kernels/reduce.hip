@@ -97,28 +97,51 @@ extern "C" void launch_reduce_mean_cols(const double* x, double* out, int rows, 
     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
-// Pass 2: given column means in means[], compute population variance per column
-__global__ void var_pass2_kernel(const double* x, const double* means, double* out, int rows, int cols) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= cols) return;
-    double mean = means[col];
-    double acc = 0.0;
-    for (int r = 0; r < rows; r++) {
-        double d = x[r * cols + col] - mean;
-        acc += d * d;
+// Squared-deviation view for variance: index i (column-transposed, like
+// ColTransposeOp) → (x[row,col] - means[col])². Feeding this through the same
+// device_segmented_reduce that powers launch_reduce_sum_cols gives a fully
+// parallel variance pass (one segment per column, fixed-order → deterministic),
+// replacing the old one-thread-per-column serial scan.
+struct ColDevSqOp {
+    const double* x;
+    const double* means;
+    int rows;
+    int cols;
+    __host__ __device__ double operator()(int i) const {
+        int col = i / rows;
+        double d = x[(i % rows) * cols + col] - means[col];
+        return d * d;
     }
-    out[col] = acc / rows;
-}
+};
 
+// Workspace = the segmented-reduce scratch + a column-mean buffer carved from the
+// 256B-aligned tail, so variance stays allocate-once (no per-call hipMalloc).
 extern "C" size_t reduce_var_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
-    return reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    size_t off = (seg + 255) & ~((size_t)255);
+    return off + (size_t)cols * sizeof(double);
 }
 
 extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
-    launch_reduce_mean_cols(x, out, rows, cols, tmp, tmp_bytes, stream);
-    dim3 block(256);
-    dim3 grid((cols + 255) / 256);
-    var_pass2_kernel<<<grid, block, 0, stream>>>(x, out, out, rows, cols);
+    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    size_t off = (seg + 255) & ~((size_t)255);
+    double* means = (double*)((char*)tmp + off);
+    // Pass 1: column means (parallel segmented sum / rows).
+    launch_reduce_sum_cols(x, means, rows, cols, tmp, seg, stream);
+    rocprim::transform(means, means, (size_t)cols, DivByRows{1.0 / rows}, stream);
+    // Pass 2: column variance = mean of squared deviations, same parallel reduce.
+    auto input_it = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0),
+        ColDevSqOp{x, means, rows, cols});
+    auto begin_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+    auto end_offsets = rocprim::make_transform_iterator(
+        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+    rocprim::segmented_reduce(tmp, seg,
+        input_it, out, (unsigned int)cols,
+        begin_offsets, end_offsets,
+        rocprim::plus<double>(), 0.0, stream);
+    rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
 // Argmin per row with warp shuffle reduction.

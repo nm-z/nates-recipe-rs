@@ -1163,6 +1163,15 @@ mod metric_gpu_tests {
 			max_ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1)),
 		)
 		.expect("ref ws");
+		let ref_partials = GpuBuffer::alloc(
+			params
+				.iter()
+				.map(|p| kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim))
+				.max()
+				.unwrap_or(1)
+				.max(1),
+		)
+		.expect("ref partials");
 		for p in &params {
 			ref_da.push(GpuBuffer::alloc(n * p.out_dim).expect("ref da"));
 			ref_dz.push(GpuBuffer::alloc(n * p.out_dim).expect("ref dz"));
@@ -1218,13 +1227,14 @@ mod metric_gpu_tests {
 					&ref_dw[l],
 					&ref_db[l],
 					&ref_ws,
+					&ref_partials,
 					n,
 					out_dim,
 					in_dim,
 				);
 			} else {
 				kernels::gpu_linear_backward_weights_only_into(
-					grad, a_prev, &ref_dw[l], &ref_db[l], &ref_ws, n, out_dim, in_dim,
+					grad, a_prev, &ref_dw[l], &ref_db[l], &ref_ws, &ref_partials, n, out_dim, in_dim,
 				);
 			}
 			kernels::gpu_sgd_update(&params[l].w, &ref_dw[l], lr, in_dim * out_dim);

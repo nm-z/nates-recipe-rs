@@ -18,11 +18,17 @@ pub struct Scratch {
 	pub da_b: GpuBuffer,
 	pub dz: GpuBuffer,
 	pub dw: GpuBuffer,
+	// Split-K weight-grad partials [P×in_dim·out_dim], summed in pass 2 into dw.
+	// Sized to the widest Dense layer's P·k·n; len-1 in forward-only.
+	pub dw_partials: GpuBuffer,
 	pub db: GpuBuffer,
 	pub metric_t0: GpuBuffer,
 	pub metric_t1: GpuBuffer,
 	pub metric_t2: GpuBuffer,
 	pub metric_scalar: GpuBuffer,
+	// Second scalar slot so the per-epoch score and loss can both ride the async
+	// copy stream and sync once, instead of one blocking 8-byte D2H per metric.
+	pub metric_scalar_b: GpuBuffer,
 	pub reduce_ws: GpuBuffer,
 	// Embed layers accumulate the table gradient here ([vocab×dim]) before the
 	// SGD step — scatter-add target, separate from the table so the update is
@@ -61,6 +67,7 @@ pub struct Scratch {
 	pub infer: bool,
 	pub copy_stream: gpu_core::hip::Stream,
 	pub pinned_scalar: *mut f64,
+	pub pinned_scalar_b: *mut f64,
 }
 
 impl Scratch {
@@ -87,8 +94,22 @@ impl Scratch {
 		let mut max_seqd = 1usize;
 		let mut max_scores = 1usize;
 		let mut max_dd = 1usize;
+		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
 		for p in params {
+			// Split-K dW partials: Dense reduces n×(in_dim×out_dim); each Attn
+			// projection (Wq/Wk/Wv/Wo) reduces (n·s)×(d×d) through the same kernel.
+			let dw_dp = match p.kind {
+				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
+				LayerKind::Attn => {
+					let s = p.in_dim / p.dim;
+					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
+				}
+				_ => 0,
+			};
+			if dw_dp > max_dw_partials {
+				max_dw_partials = dw_dp;
+			}
 			if p.act == Activation::PRelu {
 				has_prelu = true;
 				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * p.out_dim, 1);
@@ -207,11 +228,13 @@ impl Scratch {
 			da_b: alloc(bw(max_act), "da_b"),
 			dz: alloc(bw(max_act), "dz"),
 			dw: alloc(bw(max_wt), "dw"),
+			dw_partials: alloc(bw(max_dw_partials), "dw_partials"),
 			db: alloc(bw(max_bias), "db"),
 			metric_t0: alloc(out_elems, "metric_t0"),
 			metric_t1: alloc(out_elems, "metric_t1"),
 			metric_t2: alloc(out_elems, "metric_t2"),
 			metric_scalar: alloc(1, "metric_scalar"),
+			metric_scalar_b: alloc(1, "metric_scalar_b"),
 			reduce_ws: GpuBuffer::alloc_bytes(max_ws).unwrap_or_else(|e| {
 				panic!(
 					"reduce_ws: GPU alloc of {} failed — {e:?}",
@@ -246,6 +269,10 @@ impl Scratch {
 				let ptr = gpu_core::hip::host_malloc(8, 0).expect("pinned scalar");
 				ptr as *mut f64
 			},
+			pinned_scalar_b: {
+				let ptr = gpu_core::hip::host_malloc(8, 0).expect("pinned scalar b");
+				ptr as *mut f64
+			},
 		}
 	}
 
@@ -261,9 +288,45 @@ impl Scratch {
 		}
 	}
 
+	/// Enqueue the async D2H of `metric_scalar_b` onto the same copy stream — used
+	/// for the per-epoch score so it batches into one sync with the loss copy.
+	pub fn download_scalar_b_deferred(&self) {
+		unsafe {
+			gpu_core::hip::hipMemcpyAsync(
+				self.pinned_scalar_b as *mut std::ffi::c_void,
+				self.metric_scalar_b.ptr_raw() as *const std::ffi::c_void,
+				8,
+				gpu_core::hip::HIP_MEMCPY_D2H,
+				self.copy_stream.raw(),
+			);
+		}
+	}
+
 	pub fn sync_deferred_scalar(&self) -> f64 {
 		self.copy_stream.synchronize().expect("sync copy stream");
 		unsafe { *self.pinned_scalar }
+	}
+
+	/// Async read of `metric_scalar`: `hipMemcpyAsync` on the copy stream then a
+	/// targeted copy-stream sync — never a blocking default-stream `hipMemcpy`.
+	/// Used by every per-epoch metric so no metric scalar stalls the compute stream.
+	pub fn read_metric_scalar(&self) -> f64 {
+		self.download_scalar_deferred();
+		self.sync_deferred_scalar()
+	}
+
+	/// Drain the copy stream once (both deferred scalar copies complete).
+	pub fn sync_copy_stream(&self) {
+		self.copy_stream.synchronize().expect("sync copy stream");
+	}
+
+	/// Last value copied by `download_scalar_deferred` / `download_scalar_b_deferred`.
+	/// Valid only after `sync_copy_stream` (or `sync_deferred_scalar`).
+	pub fn deferred_scalar(&self) -> f64 {
+		unsafe { *self.pinned_scalar }
+	}
+	pub fn deferred_scalar_b(&self) -> f64 {
+		unsafe { *self.pinned_scalar_b }
 	}
 }
 
@@ -271,6 +334,9 @@ impl Drop for Scratch {
 	fn drop(&mut self) {
 		if !self.pinned_scalar.is_null() {
 			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar as *mut std::ffi::c_void) };
+		}
+		if !self.pinned_scalar_b.is_null() {
+			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar_b as *mut std::ffi::c_void) };
 		}
 	}
 }
@@ -287,10 +353,22 @@ impl Scratch {
 		let (mut max_act, mut max_wt, mut max_bias) = (0usize, 0usize, 0usize);
 		let (mut max_embed_grad, mut max_seqd, mut max_scores, mut max_dd) =
 			(1usize, 1usize, 1usize, 1usize);
+		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
 		let mut floats = 0usize; // acts + preact (per-layer, variable)
 		for p in params {
 			floats += n * p.out_dim; // acts[l]
+			let dw_dp = match p.kind {
+				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
+				LayerKind::Attn => {
+					let s = p.in_dim / p.dim;
+					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
+				}
+				_ => 0,
+			};
+			if dw_dp > max_dw_partials {
+				max_dw_partials = dw_dp;
+			}
 			let needs_pre = matches!(
 				p.act,
 				Activation::Silu
@@ -351,8 +429,8 @@ impl Scratch {
 		}
 		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
 		floats += 3 * bw(max_act); // da_a, da_b, dz
-		floats += bw(max_wt) + bw(max_bias); // dw, db
-		floats += 3 * out_elems + 1; // metric_t0/t1/t2, metric_scalar
+		floats += bw(max_wt) + bw(max_dw_partials) + bw(max_bias); // dw, dw_partials, db
+		floats += 3 * out_elems + 2; // metric_t0/t1/t2, metric_scalar, metric_scalar_b
 		floats += bw(max_embed_grad); // embed_grad
 		floats += 4 * max_seqd; // a_q,a_k,a_v,a_ctx (forward)
 		floats += 4 * bw(max_seqd); // a_dctx,a_dq,a_dk,a_dv (backward)

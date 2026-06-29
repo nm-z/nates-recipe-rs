@@ -349,6 +349,7 @@ impl Model {
 			&sc.a_gw,
 			&sc.a_dbias,
 			&sc.reduce_ws,
+			&sc.dw_partials,
 			m,
 			d,
 			d,
@@ -457,6 +458,7 @@ impl Model {
 			&sc.a_gw,
 			&sc.a_dbias,
 			&sc.reduce_ws,
+			&sc.dw_partials,
 			m,
 			d,
 			d,
@@ -470,6 +472,7 @@ impl Model {
 			&sc.a_gw,
 			&sc.a_dbias,
 			&sc.reduce_ws,
+			&sc.dw_partials,
 			m,
 			d,
 			d,
@@ -484,6 +487,7 @@ impl Model {
 			&sc.a_gw,
 			&sc.a_dbias,
 			&sc.reduce_ws,
+			&sc.dw_partials,
 			m,
 			d,
 			d,
@@ -670,7 +674,8 @@ impl Model {
 				&sc.acts[l - 1]
 			};
 			if out_dim == 1 {
-				kernels::gpu_dgemv_into(a_prev, grad, &sc.dw, n, in_dim, true);
+				// dW = a_prevᵀ·grad reduced over n batch rows — split-K across all CUs.
+				kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, &sc.dw, n, 1, in_dim);
 				kernels::gpu_reduce_sum_cols_into(grad, &sc.db, &sc.reduce_ws, n, 1);
 				if l > 0 {
 					kernels::gpu_dger_into(grad, &params[l].w, da_below, n, in_dim);
@@ -684,6 +689,7 @@ impl Model {
 					&sc.dw,
 					&sc.db,
 					&sc.reduce_ws,
+					&sc.dw_partials,
 					n,
 					out_dim,
 					in_dim,
@@ -695,6 +701,7 @@ impl Model {
 					&sc.dw,
 					&sc.db,
 					&sc.reduce_ws,
+					&sc.dw_partials,
 					n,
 					out_dim,
 					in_dim,
@@ -988,27 +995,26 @@ impl Model {
 				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 			}
 			let out = &sc.acts[last];
-			let score = if want_score {
+			// Per-epoch metrics ride the async copy stream and sync ONCE (no blocking
+			// 8-byte D2H per metric): score → metric_scalar_b, loss → metric_scalar.
+			let score_is_acc = if want_score {
 				if classify {
 					if k == 1 {
-						kernels::gpu_accuracy_into(out, &ybuf, &sc.metric_scalar, n);
+						kernels::gpu_accuracy_into(out, &ybuf, &sc.metric_scalar_b, n);
 					} else {
-						kernels::gpu_argmax_accuracy_into(
-							out,
-							&ybuf,
-							&sc.metric_scalar,
-							n,
-							k,
-						);
+						kernels::gpu_argmax_accuracy_into(out, &ybuf, &sc.metric_scalar_b, n, k);
 					}
-					download_scalar(&sc.metric_scalar)
+					Some(true)
 				} else {
-					kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar, n * k);
-					1.0 - download_scalar(&sc.metric_scalar) / ss_tot
+					kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar_b, n * k);
+					Some(false)
 				}
 			} else {
-				f64::NAN
+				None
 			};
+			if score_is_acc.is_some() {
+				sc.download_scalar_b_deferred();
+			}
 			let loss_scale = if checkpointing {
 				let (sign, div) = metric_gpu_into(self.loss, Metric::Loss, out, &ybuf, &sc, n, k, ss_tot);
 				sc.download_scalar_deferred();
@@ -1016,8 +1022,16 @@ impl Model {
 			} else {
 				None
 			};
+			if score_is_acc.is_some() || loss_scale.is_some() {
+				sc.sync_copy_stream();
+			}
+			let score = match score_is_acc {
+				Some(true) => sc.deferred_scalar_b(),
+				Some(false) => 1.0 - sc.deferred_scalar_b() / ss_tot,
+				None => f64::NAN,
+			};
 			let loss = if let Some((sign, div)) = loss_scale {
-				sign * sc.sync_deferred_scalar() / div
+				sign * sc.deferred_scalar() / div
 			} else {
 				f64::NAN
 			};
@@ -1127,10 +1141,10 @@ impl Model {
 						k,
 					);
 				}
-				download_scalar(&sc.metric_scalar)
+				sc.read_metric_scalar()
 			} else {
 				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
-				1.0 - download_scalar(&sc.metric_scalar) / ss_tot
+				1.0 - sc.read_metric_scalar() / ss_tot
 			}
 		});
 		*self.params.borrow_mut() = params;

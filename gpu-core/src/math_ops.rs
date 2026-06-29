@@ -65,6 +65,33 @@ unsafe extern "C" {
 		x: *const c_void, w: *const c_void, c: *mut c_void,
 		m: i32, n: i32, k: i32, stream: *mut c_void,
 	);
+	pub fn launch_splitk_dw(
+		input: *const c_void, grad: *const c_void, partials: *mut c_void, grad_w: *mut c_void,
+		m: i32, n: i32, k: i32, p: i32, stream: *mut c_void,
+	);
+}
+
+// Split-K partition for the backward dW kernel: dW is [k×n], reduction over m
+// batch rows. Output tiles (SK_BM×SK_BN) are few, so we split the reduction into
+// P slices to fill all 54 CUs. P scales DOWN as the output grows more tiles, so
+// the [P×k×n] partial scratch stays ~bounded (≈ TARGET_BLOCKS·BM·BN). Derived
+// purely from shape + CU count (no tuned constant beyond the occupancy target),
+// and computed in ONE place so the kernel launch and Scratch sizing always agree.
+const SK_BM: usize = 64;
+const SK_BN: usize = 64;
+const SK_TARGET_BLOCKS: usize = 54 * 8; // CUs × occupancy waves
+const SK_MIN_SLICE: usize = 256; // rows per slice floor (amortize launch/LDS)
+
+pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
+	let out_tiles = k.div_ceil(SK_BM) * n.div_ceil(SK_BN);
+	let target = (SK_TARGET_BLOCKS / out_tiles.max(1)).max(1);
+	let max_by_rows = (m / SK_MIN_SLICE).max(1);
+	target.min(max_by_rows).min(m.max(1))
+}
+
+/// Element count of the `[P×k×n]` partial scratch the split-K dW kernel needs.
+pub fn splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
+	splitk_dw_p(m, k, n) * k * n
 }
 
 pub fn gpu_rsqrt(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
