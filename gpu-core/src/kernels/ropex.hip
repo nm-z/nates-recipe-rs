@@ -39,3 +39,44 @@ extern "C" void launch_ropex_qk(
     dim3 block(256); dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(ropex_qk_kernel, grid, block, 0, s, q, k, pos, qo, ko, n_rows, d, theta);
 }
+
+// ── Multi-head RoPE, IN-PLACE, implicit position = token's sequence index ──────
+//
+// q,k:(m,d) row-major f64, d = heads*hd. Rotate WITHIN each head block [h*hd,
+// h*hd+hd): pair (j, j+hd/2) by angle = (row % seq) / theta^(2j/hd). Position is
+// the token's index within its sequence (row r = sample*seq + pos → pos = r%seq).
+// `sgn` selects direction: +1 forward (Q_rot = R(angle)·Q), -1 backward — a
+// rotation is orthogonal so dQ = R(-angle)·dQ_rot, the SAME kernel with sgn=-1.
+extern "C" __global__ void ropex_qk_heads_kernel(
+    double* q, double* k, int m, int d, int heads, int seq, double theta, double sgn
+) {
+    int hd = d / heads;
+    int half = hd / 2;
+    int total = m * heads * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int j = idx % half;            // pair index within the head
+    int t = idx / half;
+    int h = t % heads;             // head
+    int row = t / heads;           // token row
+    int pos = row % seq;           // sequence position
+    double angle = (double)pos / pow(theta, (2.0 * (double)j) / (double)hd);
+    double c = cos(angle);
+    double s = sgn * sin(angle);
+    long base = (long)row * d + (long)h * hd;
+    double qa = q[base + j], qb = q[base + j + half];
+    q[base + j]        = qa * c - qb * s;
+    q[base + j + half] = qb * c + qa * s;
+    double ka = k[base + j], kb = k[base + j + half];
+    k[base + j]        = ka * c - kb * s;
+    k[base + j + half] = kb * c + ka * s;
+}
+extern "C" void launch_ropex_qk_heads(
+    double* q, double* k, int m, int d, int heads, int seq, double theta, double sgn, hipStream_t st
+) {
+    int half = (d / heads) / 2;
+    if (half == 0) return;
+    int total = m * heads * half;
+    dim3 block(256); dim3 grid((total + 255) / 256);
+    hipLaunchKernelGGL(ropex_qk_heads_kernel, grid, block, 0, st, q, k, m, d, heads, seq, theta, sgn);
+}

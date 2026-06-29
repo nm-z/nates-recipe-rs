@@ -449,6 +449,10 @@ impl Model {
 				false,
 			);
 		}
+		// dscores came from ROTATED Q,K, so a_dq/a_dk are gradients w.r.t. the rotated
+		// tensors. Un-rotate (RoPE with sgn=-1) to get gradients w.r.t. the raw Q,K
+		// projection outputs before back-propagating through Wq/Wk.
+		gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_dq, &sc.a_dk, m, d, heads, s, -1.0);
 		// {Q,K,V} = H·{Wq,Wk,Wv}: accumulate dH = dH_q+dH_k+dH_v into da_below; update weights.
 		kernels::gpu_linear_backward_full_into(
 			&sc.a_dq,

@@ -471,6 +471,9 @@ pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, s
 	kernels::gpu_linear_into(h, &p.w, &p.b, &sc.a_q, m, d, d);
 	kernels::gpu_linear_into(h, &p.wk, &p.b, &sc.a_k, m, d, d);
 	kernels::gpu_linear_into(h, &p.wv, &p.b, &sc.a_v, m, d, d);
+	// RoPE: rotate Q,K per head by token position before the QK dot product, so
+	// scores depend on relative position (the attention op is position-aware).
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_q, &sc.a_k, m, d, heads, s, 1.0);
 	// scores[head] = Q_head · K_headᵀ  (per-head sub-matrix views, ld = d)
 	for hh in 0..heads {
 		gpu_core::linalg::gpu_bmm_into(
@@ -537,6 +540,8 @@ pub fn attn_forward_cached(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: u
 	kernels::gpu_linear_into(h, &p.w, &p.b, &sc.a_q, m, d, d);
 	kernels::gpu_linear_into(h, &p.wk, &p.b, &sc.a_k, m, d, d);
 	kernels::gpu_linear_into(h, &p.wv, &p.b, &sc.a_v, m, d, d);
+	// Same RoPE as the training path so cached inference matches it exactly.
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_q, &sc.a_k, m, d, heads, s, 1.0);
 	// Fused attention in one kernel launch — no L×L buffer anywhere.
 	kernels::gpu_flash_attention_into(&sc.a_q, &sc.a_k, &sc.a_v, &sc.a_ctx, n, s, d, heads);
 	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, out, m, d, d);
