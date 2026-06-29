@@ -6,7 +6,7 @@
 //!   cargo run --release --example train_detector
 
 use recipe::data::read_raw_csv;
-use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, b, ce, embed, w};
+use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
 use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
@@ -453,9 +453,9 @@ fn main() {
 	// weights are written during training (it just starts from random, file absent).
 	let _ = std::fs::remove_file("pantry/detector.ogdl");
 	let model = model();
-	let trainer = Train::new().epochs(20000).resume_from("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
+	let trainer = Train::new().epochs(20000).resume("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
 	trainer.run(&model, &train);
-	trainer.save_as([w, b], "pantry/detector.ogdl");
+	trainer.save("pantry/detector.ogdl");
 	eprintln!("=== held-out test set (60%) — datatype-detection accuracy ===");
 	Train::new().log([Accuracy]).run(&model, &Some(test));
 }

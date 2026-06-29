@@ -262,25 +262,6 @@ pub fn zscore_fit(
 	xbuf
 }
 
-pub fn nan_impute_and_apply(x: &ndarray::Array2<f64>, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
-	let std_layout = x.as_standard_layout();
-	let mut data = std_layout.as_slice().expect("impute: non-contiguous").to_vec();
-	let mut imputed = 0usize;
-	for i in 0..n {
-		for j in 0..d {
-			if data[i * d + j].is_nan() {
-				data[i * d + j] = scaler.mean[j];
-				imputed += 1;
-			}
-		}
-	}
-	if imputed > 0 {
-		eprintln!("    imputed {imputed} NaN → training mean");
-	}
-	let xraw = GpuBuffer::upload(&data).expect("upload imputed");
-	zscore_apply(&xraw, n, d, scaler)
-}
-
 pub fn zscore_apply(xraw: &GpuBuffer, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
 	assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
 	assert_eq!(scaler.std.len(), d, "eval: feature count changed");

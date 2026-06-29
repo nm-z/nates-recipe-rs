@@ -7,9 +7,9 @@ use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{Model, RunData, Train};
 use recipe_infer::{
 	Activation, ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerKind, LayerParams, LayerSpec,
-	Loss, Metric, Saved, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
+	Loss, Metric, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
 	forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
-	nan_impute_and_apply, pinned_vocab, upload, zscore_apply, zscore_fit,
+	pinned_vocab, upload, zscore_apply, zscore_fit,
 };
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
@@ -793,22 +793,13 @@ impl Model {
 		} else if rerun {
 			let sc = self.scaler.borrow();
 			let sc = sc.as_ref().expect("rerun without scaler");
-			let xbuf = nan_impute_and_apply(&xinput, n, d, sc);
-			(xbuf, None)
+			(zscore_apply(&xraw, n, d, sc), None)
 		} else {
 			(zscore_fit(&xraw, n, d, &self.scaler), None)
 		};
 		let y_host = {
 			let ys = data.y.as_slice().expect("train: y contiguous");
 			let mut ydata = ys.to_vec();
-			let has_nan = ydata.iter().any(|v| v.is_nan());
-			if has_nan {
-				let ymean = ydata.iter().filter(|v| !v.is_nan()).sum::<f64>()
-					/ ydata.iter().filter(|v| !v.is_nan()).count().max(1) as f64;
-				for v in ydata.iter_mut() {
-					if v.is_nan() { *v = ymean; }
-				}
-			}
 			if !self.loss.is_classification() && !rerun {
 				let ymean = ydata.iter().sum::<f64>() / ydata.len() as f64;
 				let yvar = ydata.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / ydata.len() as f64;
@@ -828,42 +819,7 @@ impl Model {
 		};
 
 		// Resumed weights (per-neuron, in save order) or empty for random init.
-		let mut resumed = resume.map(load_ogdl).unwrap_or_default();
-		// NaNs in the OGDL are dead cells — training never writes them, so the
-		// only way they appear is a hand-edited file. Randomize just those cells
-		// (He-scaled per neuron), report the fraction, and keep training.
-		if !resumed.is_empty() {
-			use rand::{Rng as _, SeedableRng as _};
-			use rand_distr::StandardNormal;
-			let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xB1A5);
-			let total: usize = resumed.iter().map(Saved::len).sum();
-			let mut nans = 0usize;
-			// Only dense weights/biases get NaN-cell randomization: training never
-			// writes NaN, so they only come from a hand-edited file. A NaN in an
-			// embed/attn block is a real error and is left to surface downstream.
-			for s in resumed.iter_mut() {
-				if let Saved::Dense { w, b, .. } = s {
-					let scale = (2.0 / w.len().max(1) as f64).sqrt();
-					for v in w.iter_mut() {
-						if v.is_nan() {
-							*v = rng.sample::<f64, _>(StandardNormal) * scale;
-							nans += 1;
-						}
-					}
-					if b.is_nan() {
-						*b = rng.sample::<f64, _>(StandardNormal) * scale;
-						nans += 1;
-					}
-				}
-			}
-			if nans > 0 {
-				let pct = 100.0 * nans as f64 / total as f64;
-				eprintln!(
-					"\x1b[32mresume\x1b[0m\n    \x1b[1;31mNaN\x1b[0m\n        path: {}\n        {nans}/{total} weights+biases ({pct:.1}%) were NaN\n        randomized those, continuing",
-					resume.unwrap_or("")
-				);
-			}
-		}
+		let resumed = resume.map(load_ogdl).unwrap_or_default();
 		// On a checkpoint/architecture mismatch, ask whether to overwrite with random
 		// weights (y) or abort (n). build_layer_params(.., false) re-runs construction with
 		// random init, so "overwrite" is a clean fresh start the next save writes over the stale file.
@@ -981,10 +937,13 @@ impl Model {
 		// Per-epoch metrics reduce to a scalar on the GPU; only the requested ones
 		// are downloaded. SS_tot (R²'s denominator) depends only on the constant
 		// targets, so compute it once here.
+		// On the SAME (z-scored) scale as the training-loop ss_res — `out` predicts
+		// the z-scored target, so ss_tot must use the z-scored y too. Using raw
+		// data.y here made R² ≈ 1 always (huge ss_tot vs a z-scored residual).
 		let ss_tot = {
-			let total = (n * k) as f64;
-			let ybar = data.y.iter().sum::<f64>() / total;
-			data.y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
+			let total = y_host.len() as f64;
+			let ybar = y_host.iter().sum::<f64>() / total;
+			y_host.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
 		};
 		// Activation + gradient buffers, allocated once and reused every epoch
 		// so steady-state VRAM is flat (no per-epoch sawtooth).
@@ -1246,7 +1205,8 @@ impl Model {
 				(xraw, Some(zscore_apply(&craw, n, c, scaler_ref)), n)
 			}
 		} else {
-			(nan_impute_and_apply(&xinput, n, d, scaler_ref), None, n)
+			let (xraw, _, _) = upload(&xinput);
+			(zscore_apply(&xraw, n, d, scaler_ref), None, n)
 		}
 	}
 

@@ -22,7 +22,7 @@
 //!     .log([Loss, R2]);
 //!
 //! train.run(&model, &data);
-//! train.save();
+//! train.save(());
 //! ```
 
 #[doc(hidden)]
@@ -60,13 +60,6 @@ pub use model::{
 };
 #[doc(hidden)]
 pub use model::{
-	Activation, IntoLayer, LayerSpec, Param, Prepared, RunData, SaveItem,
+	Activation, IntoLayer, LayerSpec, Prepared, RunData, SavePath,
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
-
-/// Save weights: `train.save()` (→ model.ogdl) or `train.save_as([w, b], path)`.
-#[allow(non_upper_case_globals)]
-pub const w: Param = Param::W;
-/// Save biases via `train.save()` / `train.save_as([w, b], path)`.
-#[allow(non_upper_case_globals)]
-pub const b: Param = Param::B;

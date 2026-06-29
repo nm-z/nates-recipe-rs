@@ -761,68 +761,76 @@ fn onehot_group_indices(feats: &[String]) -> Vec<(usize, usize)> {
 	groups
 }
 
-pub fn drop_nan_samples(train: &mut Dataset) {
-	let n = train.x.nrows();
-	let k = train.n_targets.max(1);
-	let keep: Vec<usize> = (0..n)
-		.filter(|&i| {
-			(0..k).all(|j| !train.y[i * k + j].is_nan())
-				&& train.x.row(i).iter().all(|v| !v.is_nan())
-		})
-		.collect();
-	let dropped = n - keep.len();
-	if dropped == 0 {
-		return;
-	}
-	train.x = train.x.select(ndarray::Axis(0), &keep);
-	let mut yd = Vec::with_capacity(keep.len() * k);
-	for &i in &keep {
-		for j in 0..k {
-			yd.push(train.y[i * k + j]);
-		}
-	}
-	train.y = Vec1::from(yd);
-	eprintln!(
-		"\x1b[32mhandled\x1b[0m\n    train\n        dropped {dropped} {} (NaN)",
-		if dropped == 1 { "sample" } else { "samples" }
-	);
+/// The single NaN strategy: `Drop` reports the finite rows (caller removes them
+/// from every column), `ImputeMean` fills NaN with the column's finite mean in
+/// place, `Error` panics on any NaN.
+pub enum Nan {
+	Drop,
+	ImputeMean,
+	Error,
 }
 
-fn nan_stats(d: &Dataset) -> (usize, usize, usize) {
-	let cells = d.x.iter().filter(|v| v.is_nan()).count();
-	let rows = d
-		.x
-		.outer_iter()
-		.filter(|r| r.iter().any(|v| v.is_nan()))
-		.count();
-	let target = d.y.iter().filter(|v| v.is_nan()).count();
-	(cells, rows, target)
+/// THE one NaN-handling function — applied to a single column-vector. Returns the
+/// row indices to keep (every row except for `Drop`, which keeps only finite ones).
+pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
+	match strategy {
+		Nan::ImputeMean => {
+			let (mut sum, mut cnt) = (0.0f64, 0usize);
+			for &x in v.iter() {
+				if x.is_finite() {
+					sum += x;
+					cnt += 1;
+				}
+			}
+			let mean = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
+			for x in v.iter_mut() {
+				if !x.is_finite() {
+					*x = mean;
+				}
+			}
+			(0..v.len()).collect()
+		}
+		Nan::Error => {
+			assert!(
+				v.iter().all(|x| x.is_finite()),
+				"NaN/inf in '{name}' — no missing values allowed here"
+			);
+			(0..v.len()).collect()
+		}
+		Nan::Drop => (0..v.len()).filter(|&i| v[i].is_finite()).collect(),
+	}
 }
 
-pub fn report_nans(train: &Dataset, test: Option<&Dataset>) {
-	let (tf, tr, tt) = nan_stats(train);
-	let (ef, er, et) = test.map(nan_stats).unwrap_or((0, 0, 0));
-	if tf + tt + ef + et == 0 {
-		return;
+/// The ONE call site: apply the NaN policy once per column-vector as a dataset
+/// enters the numeric pipeline. Targets use `Drop` (a missing label can't be
+/// invented); features use `ImputeMean`. Afterwards the matrix holds no NaN, so
+/// nothing downstream handles NaN again.
+pub fn clean_dataset(d: &mut Dataset) {
+	let k = d.n_targets.max(1);
+	let n = d.x.nrows();
+	let mut keep: Vec<usize> = (0..n).collect();
+	for j in 0..k {
+		let mut col: Vec<f64> = (0..n).map(|i| d.y[i * k + j]).collect();
+		let kj = nan_clean(&mut col, Nan::Drop, "target");
+		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
-	let rows = |n: usize| if n == 1 { "row" } else { "rows" };
-	eprintln!("\x1b[1;31mnans\x1b[0m");
-	if tf > 0 || tt > 0 {
-		eprintln!("    train");
-		if tf > 0 {
-			eprintln!("        {tf} in features ({tr} {})", rows(tr));
+	if keep.len() < n {
+		eprintln!("\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target", n - keep.len());
+		d.x = d.x.select(ndarray::Axis(0), &keep);
+		let mut yd = Vec::with_capacity(keep.len() * k);
+		for &i in &keep {
+			for j in 0..k {
+				yd.push(d.y[i * k + j]);
+			}
 		}
-		if tt > 0 {
-			eprintln!("        {tt} in target");
-		}
+		d.y = Vec1::from(yd);
 	}
-	if ef > 0 || et > 0 {
-		eprintln!("    test");
-		if ef > 0 {
-			eprintln!("        {ef} in features ({er} {})", rows(er));
-		}
-		if et > 0 {
-			eprintln!("        {et} in target");
+	let (rows, cols) = (d.x.nrows(), d.x.ncols());
+	for j in 0..cols {
+		let mut col: Vec<f64> = (0..rows).map(|i| d.x[(i, j)]).collect();
+		nan_clean(&mut col, Nan::ImputeMean, "feature");
+		for i in 0..rows {
+			d.x[(i, j)] = col[i];
 		}
 	}
 }

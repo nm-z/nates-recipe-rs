@@ -362,14 +362,19 @@ impl Data {
 	}
 
 	fn prepare(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
-		let (mut train, test, attrs) = if self.attrs.is_empty() {
+		let (mut train, mut test, attrs) = if self.attrs.is_empty() {
 			self.prepare_table()
 		} else {
 			let (tr, te) = self.prepare_arff();
 			(tr, te, self.attrs.clone())
 		};
-		pantry::encode::report_nans(&train, test.as_ref());
-		pantry::encode::drop_nan_samples(&mut train);
+		// The ONE NaN call site: each dataset's column-vectors are cleaned once here
+		// as they enter the pipeline (missing-target rows dropped, feature NaNs
+		// imputed). After this nothing downstream handles NaN again.
+		pantry::encode::clean_dataset(&mut train);
+		if let Some(t) = test.as_mut() {
+			pantry::encode::clean_dataset(t);
+		}
 		assert!(train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
 		assert!(train.x.ncols() > 0, "dataset has 0 feature columns");
 		let k = train.n_targets.max(1);

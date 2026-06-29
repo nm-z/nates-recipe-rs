@@ -71,35 +71,29 @@ impl IntoLayer for AttnSpec {
 	}
 }
 
-/// Which parameters `save` writes — pass `w`, `b`, or both (consts in the crate
-/// root, kept out of this module so they don't shadow local `w`/`b` bindings).
-/// The enum itself lives in recipe-infer beside the OGDL codec it gates.
+/// Param selector for the OGDL codec; `save` writes every param (no filter), so
+/// this is now only the internal `save_ogdl` filter type. Defined in recipe-infer.
 pub use recipe_infer::Param;
 
-pub enum SaveItem {
-	W,
-	B,
-	Col(String),
+/// Optional path argument for [`save`](Train::save) / [`resume`](Train::resume):
+/// pass nothing (`()`) for the default `model.ogdl`, or a `&str`/`String` for an
+/// explicit path. Rust has no zero-arg/one-arg overload, so "nothing" is `()`.
+pub trait SavePath {
+	fn or_default(self) -> String;
 }
-
-impl From<Param> for SaveItem {
-	fn from(p: Param) -> Self {
-		match p {
-			Param::W => SaveItem::W,
-			Param::B => SaveItem::B,
-		}
+impl SavePath for () {
+	fn or_default(self) -> String {
+		"model.ogdl".to_string()
 	}
 }
-
-impl From<&str> for SaveItem {
-	fn from(s: &str) -> Self {
-		SaveItem::Col(s.to_string())
+impl SavePath for &str {
+	fn or_default(self) -> String {
+		self.to_string()
 	}
 }
-
-impl From<&String> for SaveItem {
-	fn from(s: &String) -> Self {
-		SaveItem::Col(s.clone())
+impl SavePath for String {
+	fn or_default(self) -> String {
+		self
 	}
 }
 
@@ -252,14 +246,10 @@ impl Train {
 		self
 	}
 
-	/// Warm-start from `model.ogdl` in the cwd (skips silently if absent). For a
-	/// custom path use [`resume_from`](Self::resume_from).
-	pub fn resume(self) -> Train {
-		self.resume_from("model.ogdl")
-	}
-
-	pub fn resume_from(mut self, path: impl Into<String>) -> Train {
-		self.resume = Some(path.into());
+	/// Warm-start from a checkpoint (skips silently if absent). `.resume(())` uses
+	/// `model.ogdl` in the cwd; `.resume("custom.ogdl")` uses an explicit path.
+	pub fn resume(mut self, path: impl SavePath) -> Train {
+		self.resume = Some(path.or_default());
 		self
 	}
 
@@ -274,7 +264,35 @@ impl Train {
 	}
 
 	pub fn run(&self, model: &Model, data: &impl RunData) {
-		let prepared = data.prepared();
+		// A scenario whose encoded matrix can't fit host RAM is skipped (just like
+		// the VRAM preflight aborts a too-big GPU run) instead of crashing the whole
+		// program. check_ram prints the size before bailing; catch that here, report
+		// the skip, and move on. Any OTHER panic is re-raised unchanged.
+		let prev = std::panic::take_hook();
+		std::panic::set_hook(Box::new(|info| {
+			let ram = info
+				.payload()
+				.downcast_ref::<String>()
+				.is_some_and(|s| s.contains("too large for RAM"));
+			if !ram {
+				eprintln!("{info}");
+			}
+		}));
+		let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| data.prepared()));
+		std::panic::set_hook(prev);
+		let prepared = match prepared {
+			Ok(p) => p,
+			Err(payload) => {
+				if payload
+					.downcast_ref::<String>()
+					.is_some_and(|s| s.contains("too large for RAM"))
+				{
+					eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the host RAM budget (size above)");
+					return;
+				}
+				std::panic::resume_unwind(payload);
+			}
+		};
 		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
 		let issues = preflight(model, ds, forward_only);
@@ -423,12 +441,11 @@ impl Train {
 		}
 	}
 
-	/// Save the FULL trained checkpoint — every param the model allocated — to
-	/// `model.ogdl` in the cwd. The model decides what to write; nothing is
-	/// hardcoded. For a subset, a custom path, or prediction columns, use
-	/// [`save_as`](Self::save_as).
-	pub fn save(&self) {
-		self.save_ogdl(None, "model.ogdl");
+	/// Save the FULL trained checkpoint — every param the model allocated — as
+	/// OGDL. `.save(())` writes `model.ogdl` in the cwd; `.save("custom.ogdl")`
+	/// writes an explicit path. Best-only guard applies.
+	pub fn save(&self, path: impl SavePath) {
+		self.save_ogdl(None, &path.or_default());
 	}
 
 	/// Write the model's params to `path` as OGDL. `filter: None` = everything the
@@ -456,85 +473,6 @@ impl Train {
 		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
 	}
 
-	pub fn save_as<I, S>(&self, items: I, path: impl Into<String>)
-	where
-		I: IntoIterator<Item = S>,
-		S: Into<SaveItem>,
-	{
-		let items: Vec<SaveItem> = items.into_iter().map(Into::into).collect();
-		let all_params = items.iter().all(|i| matches!(i, SaveItem::W | SaveItem::B));
-		if all_params {
-			let parts: Vec<Param> = items
-				.iter()
-				.map(|i| match i {
-					SaveItem::W => Param::W,
-					SaveItem::B => Param::B,
-					_ => unreachable!(),
-				})
-				.collect();
-			self.save_ogdl(Some(&parts), &path.into());
-		} else {
-			let path = path.into();
-			let path = Self::resolve(&path);
-			let last = self.last.borrow();
-			if last.model.is_null() {
-				return;
-			}
-			let preds = last.preds.as_ref().expect("save columns: run inference first");
-			let n = last.n;
-			let k = last.k;
-			let targets = &last.target_names;
-			let headers_opt = last.raw_test_headers.as_ref();
-			let rows_opt = last.raw_test_rows.as_ref();
-			let mut csv_cols: Vec<(String, Vec<String>)> = Vec::new();
-			for item in &items {
-				match item {
-					SaveItem::Col(name) => {
-						if targets.contains(name) || (targets.len() > 1 && targets[0] == *name)
-						{
-							if k == 1 {
-								let col: Vec<String> = (0..n).map(|i| preds[i].to_string()).collect();
-								csv_cols.push((targets[0].clone(), col));
-							} else {
-								for (ti, tname) in targets.iter().enumerate() {
-									let col: Vec<String> = (0..n)
-										.map(|i| preds[i * k + ti].to_string())
-										.collect();
-									csv_cols.push((tname.clone(), col));
-								}
-							}
-						} else if let (Some(headers), Some(rows)) = (headers_opt, rows_opt) {
-							if let Some(ci) = headers.iter().position(|h| h == name) {
-								let col: Vec<String> =
-									rows.iter().map(|r| r.get(ci).cloned().unwrap_or_default()).collect();
-								csv_cols.push((name.clone(), col));
-							} else {
-								panic!("save: column '{name}' not found in test data");
-							}
-						} else {
-							panic!("save: no raw test data available for column '{name}'");
-						}
-					}
-					SaveItem::W | SaveItem::B => {
-						panic!("save: mixing params and columns is not supported");
-					}
-				}
-			}
-			assert!(!csv_cols.is_empty(), "save: no columns to write");
-			let mut out = String::new();
-			let header: Vec<&str> = csv_cols.iter().map(|(h, _)| h.as_str()).collect();
-			out.push_str(&header.join(","));
-			out.push('\n');
-			for i in 0..n {
-				let row: Vec<&str> = csv_cols.iter().map(|(_, col)| col[i].as_str()).collect();
-				out.push_str(&row.join(","));
-				out.push('\n');
-			}
-			std::fs::write(&path, &out).unwrap_or_else(|e| panic!("save: {path}: {e}"));
-			let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
-			eprintln!("saved {} ({n} rows)", full.display());
-		}
-	}
 }
 
 impl Default for Train {

@@ -37,7 +37,7 @@ fn main() {
 		.exclude("id")
 		.target("Churn");
 	let nn_train = Train::new()
-		.epochs(5000)
+		.epochs(20)
 		.log([Loss, Accuracy]);
 
 	// CNN
@@ -57,7 +57,7 @@ fn main() {
 		.split(0.8)
 		.target("label");
 	let cnn_train = Train::new()
-		.epochs(5000)
+		.epochs(20)
 		.log([Loss, Accuracy]);
 
 	// MLP
@@ -75,7 +75,7 @@ fn main() {
 		.exclude("Id")
 		.target("SalePrice");
 	let mlp_train = Train::new()
-		.epochs(10000)
+		.epochs(20)
 		.log([Loss, R2]);
 
 	// LLM
@@ -93,7 +93,7 @@ fn main() {
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
 	let llm_train = Train::new()
-		.epochs(5000)
+		.epochs(20)
 		.log([Loss, Accuracy]);
 
 	for (model, data, train) in [
