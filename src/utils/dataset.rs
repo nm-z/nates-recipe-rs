@@ -89,6 +89,40 @@ fn is_arff(path: &str) -> bool {
 		== Some("arff")
 }
 
+fn is_safetensors(path: &str) -> bool {
+	std::path::Path::new(path).extension().and_then(|e| e.to_str()) == Some("safetensors")
+}
+
+/// A `.safetensors` source as a numeric table: each tensor's leading dim is the row
+/// count, its trailing dims flatten to columns (`name` for a 1-D tensor, `name:c` per
+/// column above that). Every column is `Numeric`; `.target(name)` selects which tensor
+/// is the target, the rest are features. Feeds the same arff encode path.
+fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
+	let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("safetensors: read {path}: {e}"));
+	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
+		.unwrap_or_else(|e| panic!("safetensors: {path}: {e}"));
+	assert!(!tensors.is_empty(), "safetensors: {path} has no tensors");
+	let n = tensors[0].1.first().copied().unwrap_or_else(|| {
+		panic!("safetensors: tensor '{}' has no leading row dim", tensors[0].0)
+	});
+	let mut attrs = Vec::new();
+	let mut cols: Vec<Vec<f64>> = Vec::new();
+	for (name, shape, vals) in &tensors {
+		let leading = shape.first().copied().unwrap_or(0);
+		assert_eq!(leading, n, "safetensors: tensor '{name}' leading dim {leading} != {n}");
+		let width = shape.iter().skip(1).product::<usize>().max(1);
+		for c in 0..width {
+			let aname = if width == 1 { name.clone() } else { format!("{name}:{c}") };
+			attrs.push(Attr { name: aname, kind: Kind::Numeric });
+			cols.push((0..n).map(|i| vals[i * width + c]).collect());
+		}
+	}
+	let rows = (0..n)
+		.map(|i| cols.iter().map(|col| format!("{}", col[i])).collect())
+		.collect();
+	(attrs, rows)
+}
+
 impl Data {
 	pub fn load() -> Data {
 		Data {
@@ -124,6 +158,10 @@ impl Data {
 		self.sources.push(path.to_string());
 		if is_arff(path) {
 			let (attrs, rows) = crate::data::parse_arff(path);
+			self.attrs = attrs;
+			self.rows = rows;
+		} else if is_safetensors(path) {
+			let (attrs, rows) = safetensors_to_table(path);
 			self.attrs = attrs;
 			self.rows = rows;
 		}
@@ -427,5 +465,61 @@ impl crate::model::RunData for Data {
 	}
 	fn infer_only(&self) -> bool {
 		false
+	}
+}
+
+#[cfg(test)]
+mod safetensors_source_tests {
+	use super::*;
+
+	// Build a tiny .safetensors image (x: [3,2] F64 features, y: [3] F64 target), write
+	// it to a temp file, and load it through the public Data builder. Host-only — encode
+	// builds an ndarray Mat, no GPU. Proves .set("*.safetensors") is a real Data source.
+	#[test]
+	fn data_load_reads_safetensors_source() {
+		let header = concat!(
+			r#"{"x":{"dtype":"F64","shape":[3,2],"data_offsets":[0,48]},"#,
+			r#""y":{"dtype":"F64","shape":[3],"data_offsets":[48,72]}}"#,
+		);
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+		bytes.extend_from_slice(header.as_bytes());
+		for v in [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		for v in [10.0f64, 20.0, 30.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		let path = std::env::temp_dir().join("recipe_st_source_test.safetensors");
+		std::fs::write(&path, &bytes).expect("write temp safetensors");
+		let p = path.to_str().expect("temp path utf8");
+
+		let (attrs, rows) = safetensors_to_table(p);
+		assert_eq!(
+			attrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+			vec!["x:0", "x:1", "y"]
+		);
+		assert!(attrs.iter().all(|a| matches!(a.kind, Kind::Numeric)));
+		assert_eq!(rows.len(), 3);
+		assert_eq!(rows[0], vec!["1", "2", "10"]);
+		assert_eq!(rows[2], vec!["5", "6", "30"]);
+
+		let data = Data::load().set(p).split(0.66).target("y");
+		assert_eq!(data.set.x.ncols(), 2, "two feature columns (x:0, x:1)");
+		assert_eq!(data.set.n_targets, 1, "single target (y)");
+		let total = data.set.x.nrows() + data.test.as_ref().map_or(0, |t| t.x.nrows());
+		assert_eq!(total, 3, "all rows preserved across the split");
+		let _ = std::fs::remove_file(&path);
+	}
+
+	// Run the real thing: feed an actual model weight shard ($ST_FILE) to Data::load().
+	// Not a dataset — whatever happens (panic on heterogeneous tensor dims, or success)
+	// is the experiment. Ignored by default; run with ST_FILE set.
+	#[test]
+	#[ignore = "set ST_FILE to a real .safetensors weight shard"]
+	fn data_load_on_real_safetensors_shard() {
+		let p = std::env::var("ST_FILE").expect("set ST_FILE");
+		let d = Data::load().set(&p);
+		eprintln!("loaded: {} rows × {} cols", d.set.x.nrows(), d.set.x.ncols());
 	}
 }

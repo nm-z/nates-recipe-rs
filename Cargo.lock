@@ -2073,6 +2073,7 @@ dependencies = [
 name = "recipe-infer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpu-core",
  "ndarray",
  "ogdl",

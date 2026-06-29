@@ -11,6 +11,7 @@ pub mod enums;
 pub mod forward;
 pub mod ogdl;
 pub mod params;
+pub mod safetensors;
 pub mod scratch;
 
 pub use enums::*;
