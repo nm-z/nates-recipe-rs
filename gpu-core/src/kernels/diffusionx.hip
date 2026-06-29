@@ -56,3 +56,24 @@ extern "C" void launch_diffusionx_entropy_gated_step(
     hipLaunchKernelGGL(diffusionx_entropy_gated_step_kernel, grid, block, 0, s,
                        logits, canvas, accepted, renoise, bound, n_positions, vocab);
 }
+
+// ── block-autoregressive commit step ────────────────────────────────────────
+// One iteration of the diffusion loop. Already-committed positions are FROZEN
+// (their tokens condition later blocks); every other position takes the gated
+// step's `accepted` value, and a newly-confident one (renoise==0) is marked
+// committed. Convergence = all positions committed.
+extern "C" __global__ void diffusionx_commit_kernel(
+    double* canvas, const double* accepted, const double* renoise, double* committed, int n
+) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    if (committed[p] != 0.0) return;     // frozen — keep its committed token
+    canvas[p] = accepted[p];             // confident → argmax, else unchanged canvas
+    if (renoise[p] == 0.0) committed[p] = 1.0;
+}
+extern "C" void launch_diffusionx_commit(
+    double* canvas, const double* accepted, const double* renoise, double* committed, int n, hipStream_t s
+) {
+    dim3 block(256); dim3 grid((n + 255) / 256);
+    hipLaunchKernelGGL(diffusionx_commit_kernel, grid, block, 0, s, canvas, accepted, renoise, committed, n);
+}
