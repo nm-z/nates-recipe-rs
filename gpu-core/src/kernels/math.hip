@@ -1,5 +1,16 @@
 #include <hip/hip_runtime.h>
 
+// Multiprocessor count of the current device via hipGetDeviceProperties →
+// prop.multiProcessorCount (CUs in CU mode, half-CUs in WGP mode). Returned as a
+// plain int so Rust never has to bind the ~800-byte hipDeviceProp_t struct.
+extern "C" int hip_multiprocessor_count() {
+      int dev = 0;
+      if (hipGetDevice(&dev) != hipSuccess) return 0;
+      hipDeviceProp_t prop;
+      if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return 0;
+      return prop.multiProcessorCount;
+}
+
 // ── Unary elementwise ──────────────────────────────────────────────────────
 
 extern "C" __global__ void rsqrt_kernel(const double* x, double* out, int n) {

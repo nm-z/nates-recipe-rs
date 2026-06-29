@@ -710,6 +710,10 @@ mod tests {
 	#[test]
 	fn splitk_dw_matches_rocblas() {
 		gpu_core::hip::set_device(0).expect("set_device");
+		eprintln!(
+			"split-K uses device multiProcessorCount = {} (queried, not hardcoded)",
+			gpu_core::hip::cu_count()
+		);
 		for &(m, k, n) in &[(4096usize, 42usize, 64usize), (100_000, 42, 1), (777, 130, 96)] {
 			let input = kernels::gpu_randn(m * k, 11).expect("input");
 			let grad = kernels::gpu_randn(m * n, 22).expect("grad");

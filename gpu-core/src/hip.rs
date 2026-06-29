@@ -29,6 +29,27 @@ pub fn check(code: i32) -> Result<(), HipError> {
 	}
 }
 
+/// Multiprocessor count of the current device (hipGetDeviceProperties →
+/// prop.multiProcessorCount), cached after the first query. Used to size GPU
+/// launches to the real hardware instead of a hardcoded CU count. No fallback:
+/// if the query fails (e.g. called before the device is initialized) it panics
+/// with a clear cause rather than returning a silent wrong value.
+pub fn cu_count() -> usize {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	static CU: AtomicUsize = AtomicUsize::new(0);
+	let cached = CU.load(Ordering::Relaxed);
+	if cached != 0 {
+		return cached;
+	}
+	let n = unsafe { hip_multiprocessor_count() };
+	assert!(
+		n > 0,
+		"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
+	);
+	CU.store(n as usize, Ordering::Relaxed);
+	n as usize
+}
+
 pub const HIP_MEMCPY_H2D: i32 = 1;
 pub const HIP_MEMCPY_D2H: i32 = 2;
 pub const HIP_MEMCPY_D2D: i32 = 3;
@@ -74,6 +95,9 @@ unsafe extern "C" {
 	// to avoid defining it in Rust and to allow querying individual fields by attribute enum int.
 	pub fn hipGetDeviceCount(count: *mut i32) -> i32;
 	pub fn hipDeviceGetAttribute(pi: *mut i32, attr: i32, device_id: i32) -> i32;
+	// Defined in kernels/math.hip: hipGetDeviceProperties → prop.multiProcessorCount,
+	// returned as a plain int so we never bind the hipDeviceProp_t struct in Rust.
+	pub fn hip_multiprocessor_count() -> i32;
 	// Peer access
 	pub fn hipDeviceCanAccessPeer(
 		can_access_peer: *mut i32,

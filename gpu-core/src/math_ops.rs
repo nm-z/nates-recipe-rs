@@ -73,18 +73,22 @@ unsafe extern "C" {
 
 // Split-K partition for the backward dW kernel: dW is [k×n], reduction over m
 // batch rows. Output tiles (SK_BM×SK_BN) are few, so we split the reduction into
-// P slices to fill all 54 CUs. P scales DOWN as the output grows more tiles, so
-// the [P×k×n] partial scratch stays ~bounded (≈ TARGET_BLOCKS·BM·BN). Derived
-// purely from shape + CU count (no tuned constant beyond the occupancy target),
-// and computed in ONE place so the kernel launch and Scratch sizing always agree.
+// P slices to fill every multiprocessor. P scales DOWN as the output grows more
+// tiles, so the [P×k×n] partial scratch stays ~bounded (≈ target·BM·BN). Derived
+// purely from shape + the device's REAL multiprocessor count (queried at runtime,
+// never hardcoded), and computed in ONE place so the kernel launch and Scratch
+// sizing always agree.
 const SK_BM: usize = 64;
 const SK_BN: usize = 64;
-const SK_TARGET_BLOCKS: usize = 54 * 8; // CUs × occupancy waves
+const SK_WAVES: usize = 8; // occupancy waves per multiprocessor
 const SK_MIN_SLICE: usize = 256; // rows per slice floor (amortize launch/LDS)
 
 pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
+	// Target enough workgroups to fill the actual hardware: multiProcessorCount
+	// (hipGetDeviceProperties) × occupancy waves, not a baked-in CU count.
+	let target_blocks = crate::hip::cu_count() * SK_WAVES;
 	let out_tiles = k.div_ceil(SK_BM) * n.div_ceil(SK_BN);
-	let target = (SK_TARGET_BLOCKS / out_tiles.max(1)).max(1);
+	let target = (target_blocks / out_tiles.max(1)).max(1);
 	let max_by_rows = (m / SK_MIN_SLICE).max(1);
 	target.min(max_by_rows).min(m.max(1))
 }
