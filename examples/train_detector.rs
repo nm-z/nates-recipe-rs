@@ -1,3 +1,4 @@
+#!/usr/bin/env -S cargo run --release --example train_detector --
 //! Detector TRAINER — produces `pantry/detector.ogdl`. The labelled corpus, the
 //! model builder, and the train/test split all live here, not in the shipped
 //! library: training labels exist only for this script. Runtime prediction

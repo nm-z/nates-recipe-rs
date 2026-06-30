@@ -1,3 +1,4 @@
+#!/usr/bin/env -S cargo run --release --example cookbook --
 use recipe::*;
 
 #[allow(dead_code)]
