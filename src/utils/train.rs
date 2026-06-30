@@ -951,7 +951,7 @@ impl ModelInner {
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {
-			libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
