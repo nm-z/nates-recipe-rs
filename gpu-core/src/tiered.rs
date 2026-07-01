@@ -89,6 +89,19 @@ impl Budgets {
       }
 }
 
+/// The admit check that replaces every `check_ram`: the run stops for one reason
+/// only — the requested buffer exceeds VRAM+RAM+disk combined — decided from live
+/// budgets before anything is allocated. Returns the measured budgets on success
+/// (so the caller can log the ceiling it fit under).
+pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Result<Budgets, Full> {
+      let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
+      if b > bud.cap {
+            Err(Full { need: b, cap: bud.cap })
+      } else {
+            Ok(bud)
+      }
+}
+
 fn vram_total_free() -> (usize, usize) {
       let (mut free, mut total) = (0usize, 0usize);
       // SAFETY: FFI query into two owned stack usizes.

@@ -255,7 +255,7 @@ fn encode(
 		.filter(|(ai, a)| !is_target(*ai) && !is_skip(*ai) && width(*ai, a) > 1)
 		.map(|(ai, a)| (a.name.as_str(), width(ai, a)))
 		.collect();
-	check_ram(n, proj_w, "encoded", &top);
+	admit_or_skip(n, proj_w, "encoded", &top);
 
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
 	// Scatter each encoded feature column straight into the row-major output and drop
@@ -320,18 +320,23 @@ fn oom_pair(name: &str, val: &str) -> String {
 	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
 }
 
-/// Single RAM guard for both the per-group encode and the cross-group selection:
-/// if `n × w × 8B` would exceed 90% of available memory, print a one-line memory
-/// autopsy (largest bucket first) built from `top_cols`, then panic. `label`
-/// names the matrix in the message ("encoded" vs "selection").
-fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
+/// Admit check — replaces the old RAM-only guard for both the per-group encode
+/// and the cross-group selection. The run stops for one reason only: the encoded
+/// matrix `n × w × 8B` exceeds the combined VRAM+RAM+disk ceiling, decided from
+/// live budgets (`tiered::admit`) before the matrix is built. On over-ceiling it
+/// prints a one-line autopsy (largest bucket first) then panics; the preflight in
+/// the training crate catches that and skips the scenario.
+fn admit_or_skip(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 	let bytes = n
 		.saturating_mul(w)
 		.saturating_mul(std::mem::size_of::<f64>());
-	let avail = crate::available_ram_bytes();
-	if bytes <= avail {
-		return;
-	}
+	// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
+	// sized against that filesystem's free space.
+	let spill = std::path::Path::new(".recipe_spill");
+	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
+		Ok(_) => return,
+		Err(f) => f,
+	};
 	let hb = crate::data::human_bytes;
 	let cols_bytes = |c: usize| c.saturating_mul(n).saturating_mul(8);
 	let tokens_cols: usize = top_cols
@@ -351,7 +356,7 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 			.filter(|(_, c)| *c > 0)
 			.collect();
 	autopsy.sort_by(|a, b| cols_bytes(b.1).cmp(&cols_bytes(a.1)));
-	let mut line = vec![oom_pair("RAM OOM", label)];
+	let mut line = vec![oom_pair("OVER CEILING", label)];
 	line.extend(
 		autopsy
 			.iter()
@@ -362,16 +367,16 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 		*bases.entry(nm.split("#t").next().unwrap_or(nm)).or_insert(0) += 1;
 	}
 	line.push(oom_pair("rows", &n.to_string()));
-	line.push(oom_pair("free", &hb(avail)));
-	line.push(oom_pair("over", &hb(bytes.saturating_sub(avail))));
+	line.push(oom_pair("ceiling", &hb(full.cap)));
+	line.push(oom_pair("over", &hb(full.need.saturating_sub(full.cap))));
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
 	eprintln!("{}", line.join(", "));
 	panic!(
-		"{label} matrix too large for RAM: {n} rows × {w} cols × 8B = {} (available {})",
-		crate::data::human_bytes(bytes),
-		crate::data::human_bytes(avail)
+		"{label} buffer exceeds VRAM+RAM+disk ceiling: {n} rows × {w} cols × 8B = {} (ceiling {})",
+		hb(full.need),
+		hb(full.cap)
 	);
 }
 
@@ -442,7 +447,7 @@ impl Assembled {
 				.or_insert(0) += 1;
 		}
 		let top: Vec<(&str, usize)> = by_col.into_iter().collect();
-		check_ram(n, w, "selection", &top);
+		admit_or_skip(n, w, "selection", &top);
 		let mut data = vec![0.0f64; n * w];
 		for (jc, name) in keep.iter().enumerate() {
 			let (mi, col) = self.sources[idx[name.as_str()]];

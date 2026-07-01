@@ -313,7 +313,7 @@ impl Train {
 			let ram = info
 				.payload()
 				.downcast_ref::<String>()
-				.is_some_and(|s| s.contains("too large for RAM"));
+				.is_some_and(|s| s.contains("exceeds VRAM+RAM+disk"));
 			if !ram {
 				eprintln!("{info}");
 			}
@@ -325,9 +325,9 @@ impl Train {
 			Err(payload) => {
 				if payload
 					.downcast_ref::<String>()
-					.is_some_and(|s| s.contains("too large for RAM"))
+					.is_some_and(|s| s.contains("exceeds VRAM+RAM+disk"))
 				{
-					eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the host RAM budget (size above)");
+					eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
 					return;
 				}
 				std::panic::resume_unwind(payload);

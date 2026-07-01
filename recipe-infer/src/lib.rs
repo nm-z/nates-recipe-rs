@@ -16,6 +16,9 @@ pub mod scratch;
 
 pub use enums::*;
 pub use forward::*;
+// The tiered VRAM/RAM/disk buffer + its admit check, surfaced so pantry (which
+// depends only on recipe-infer) can gate encoding on B ≤ VRAM+RAM+disk.
+pub use gpu_core::tiered;
 pub use ogdl::*;
 pub use params::*;
 pub use scratch::*;
