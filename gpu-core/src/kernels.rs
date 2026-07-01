@@ -23,6 +23,7 @@ unsafe extern "C" {
 	// hipBLAS handle management
 	fn hipblasCreate(handle: *mut *mut c_void) -> i32;
 	fn hipblasDestroy(handle: *mut c_void) -> i32;
+	fn hipblasSetStream(handle: *mut c_void, stream: *mut c_void) -> i32;
 
 	// hipBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
 	fn hipblasDgemm(
@@ -1477,6 +1478,12 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 			"hipblasCreate failed with status {}",
 			status
 		);
+		// Bind hipBLAS to the null stream so its GEMMs are ordered with every
+		// other gpu-core kernel (all launched on stream 0); otherwise hipBLAS
+		// runs on its own stream and can read inputs a null-stream kernel has
+		// not finished writing (a cross-stream data race).
+		let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
+		assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
 		h.store(handle, Ordering::Relaxed);
 		handle
 	})

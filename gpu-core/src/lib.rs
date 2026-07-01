@@ -14,6 +14,7 @@ pub mod encoding;
 pub mod forest;
 pub mod graph;
 pub mod hip;
+pub mod infer_ops;
 pub mod k_actx;
 pub mod k_gapact;
 pub mod k_mathx;

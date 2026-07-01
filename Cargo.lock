@@ -2067,6 +2067,7 @@ dependencies = [
  "ratatui",
  "rayon",
  "recipe-infer",
+ "serde_json",
  "zip",
 ]
 

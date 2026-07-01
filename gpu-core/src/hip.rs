@@ -115,6 +115,8 @@ unsafe extern "C" {
 	// Stream-ordered allocation
 	pub fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
 	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
+	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
+	pub fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	// Managed (unified) memory
 	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	// VRAM tier of the tiered buffer — VMM wrappers (src/kernels/vmm.hip). Handles
@@ -169,6 +171,37 @@ pub fn device_synchronize() -> Result<(), HipError> {
 
 pub fn set_device(device: i32) -> Result<(), HipError> {
 	check(unsafe { hipSetDevice(device) })
+}
+
+/// Make the default stream-ordered memory pool retain freed memory instead of
+/// releasing it to the OS (release threshold = u64::MAX). Without this the pool
+/// unmaps freed pages on sync and a later hipMallocAsync can hand back an
+/// address whose backing is not yet remapped when a kernel touches it — an
+/// intermittent GPU page fault under heavy alloc/free churn (weight streaming).
+pub fn retain_mempool(device: i32) -> Result<(), HipError> {
+	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
+	let mut pool: *mut c_void = std::ptr::null_mut();
+	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+	let mut threshold: u64 = u64::MAX;
+	check(unsafe {
+		hipMemPoolSetAttribute(
+			pool,
+			HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD,
+			&mut threshold as *mut u64 as *mut c_void,
+		)
+	})?;
+	// Warm the pool: a fresh hipMallocAsync buffer has no committed backing until
+	// its stream processes the alloc, so an SDMA hipMemcpy into it can fault
+	// (page not present). Force-commit a large chunk, then free it — with the
+	// retain threshold set the pages stay in the pool, so later allocs reuse
+	// already-mapped memory and no copy hits an uncommitted page.
+	let mut ptr: *mut c_void = std::ptr::null_mut();
+	let warm: usize = 1usize << 30; // 1 GiB
+	check(unsafe { hipMallocAsync(&mut ptr, warm, std::ptr::null_mut()) })?;
+	check(unsafe { hipMemset(ptr, 0, warm) })?;
+	check(unsafe { hipDeviceSynchronize() })?;
+	check(unsafe { hipFreeAsync(ptr, std::ptr::null_mut()) })?;
+	check(unsafe { hipDeviceSynchronize() })
 }
 
 pub fn peek_last_error() -> i32 {

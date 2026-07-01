@@ -8,6 +8,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
+// When set, drain the device after each hipMallocAsync so the pool commits the
+// new buffer's pages before anything (notably an SDMA host->device copy, which
+// runs on a queue not ordered with the alloc) writes into it. Off by default —
+// training uploads once and never churns; streaming inference (fresh alloc +
+// immediate copy, thousands of times) needs it to avoid GPU page faults.
+static ALLOC_SYNC: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the post-allocation device sync (see `ALLOC_SYNC`).
+pub fn set_alloc_sync(on: bool) {
+	ALLOC_SYNC.store(on, Ordering::Relaxed);
+}
+
 // Live device bytes per purpose-tag. On a VRAM OOM we dump this so the failure
 // names what is on the card (data / weights / scratch / other), not just a size.
 static TAG_BYTES: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
@@ -184,6 +196,9 @@ impl GpuBuffer {
 			oom_report(n_bytes);
 		}
 		check(code)?;
+		if ALLOC_SYNC.load(Ordering::Relaxed) {
+			check(unsafe { hipDeviceSynchronize() })?;
+		}
 		tag_add(tag, n_bytes);
 		Ok(Self {
 			ptr,
@@ -218,6 +233,20 @@ impl GpuBuffer {
 			)
 		})?;
 		Ok(buf)
+	}
+
+	/// Copy host bytes into this (already-allocated) buffer — the reuse path for
+	/// a persistent staging window, avoiding a fresh alloc per upload.
+	pub fn write_u8(&self, data: &[u8]) -> Result<(), HipError> {
+		assert!(
+			data.len() <= self.len,
+			"write_u8: {} bytes into a {}-byte buffer",
+			data.len(),
+			self.len
+		);
+		check(unsafe {
+			hipMemcpy(self.ptr, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D)
+		})
 	}
 
 	pub fn upload_f32(data: &[f32]) -> Result<Self, HipError> {

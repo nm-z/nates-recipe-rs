@@ -85,6 +85,63 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>,
 	Ok(out)
 }
 
+/// A single tensor's header record: name, dtype, shape, and the byte range
+/// `[begin, end)` *relative to the blob* (i.e. relative to `data_start`).
+pub struct TensorEntry {
+	pub name: String,
+	pub dtype: String,
+	pub shape: Vec<usize>,
+	pub begin: usize,
+	pub end: usize,
+}
+
+/// Parse only the JSON header of a safetensors image — no blob decode. Returns
+/// `(data_start, entries)` where `data_start = 8 + header_len` is the file
+/// offset of the blob, so a tensor's file bytes are `[data_start+begin,
+/// data_start+end)`. Lets a caller memory-map / seek huge shards and stage
+/// individual tensors on demand rather than widening the whole file to f64.
+pub fn parse_safetensors_header(bytes: &[u8]) -> Result<(usize, Vec<TensorEntry>)> {
+	if bytes.len() < 8 {
+		bail!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len());
+	}
+	let n = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte header len")) as usize;
+	let data_start = 8 + n;
+	if bytes.len() < data_start {
+		bail!("safetensors: header length {n} exceeds file size {}", bytes.len());
+	}
+	let header = std::str::from_utf8(&bytes[8..data_start])
+		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
+	let Json::Obj(entries) = parse_json(header)? else {
+		bail!("safetensors: header is not a JSON object");
+	};
+	let mut out = Vec::new();
+	for (name, val) in entries {
+		if name == "__metadata__" {
+			continue;
+		}
+		let Json::Obj(fields) = val else {
+			bail!("safetensors: tensor '{name}' is not an object");
+		};
+		let dtype = field_str(&fields, "dtype")
+			.ok_or_else(|| anyhow!("safetensors: tensor '{name}' missing string dtype"))?;
+		let shape = field_arr(&fields, "shape")
+			.ok_or_else(|| anyhow!("safetensors: tensor '{name}' missing numeric shape"))?;
+		let offsets = field_arr(&fields, "data_offsets")
+			.ok_or_else(|| anyhow!("safetensors: tensor '{name}' missing data_offsets"))?;
+		if offsets.len() != 2 {
+			bail!("safetensors: tensor '{name}' data_offsets must have exactly 2 elements");
+		}
+		out.push(TensorEntry {
+			name,
+			dtype,
+			shape: shape.iter().map(|&d| d as usize).collect(),
+			begin: offsets[0] as usize,
+			end: offsets[1] as usize,
+		});
+	}
+	Ok((data_start, out))
+}
+
 /// `(name, values)` pairs, dropping shape — the original flat view used by
 /// `load_safetensors`. Thin wrapper over [`parse_safetensors_shaped`].
 pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<(String, Vec<f64>)>> {

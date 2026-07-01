@@ -26,7 +26,8 @@ pub use scratch::*;
 /// Select GPU device 0 — call once before any inference. recipe-infer owns the
 /// device lifecycle so callers (pantry, binaries) reach the GPU only through it.
 pub fn init() -> Result<(), gpu_core::hip::HipError> {
-	gpu_core::hip::set_device(0)
+	gpu_core::hip::set_device(0)?;
+	gpu_core::hip::retain_mempool(0)
 }
 
 /// Release GPU resources at process exit.
