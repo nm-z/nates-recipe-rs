@@ -304,10 +304,10 @@ impl Train {
 		// `let` bindings, registry pointers by the boxed state those bindings own.
 		let model: &ModelInner = unsafe { &*model_ptr };
 		let data: &dyn RunData = unsafe { &*data_ptr };
-		// A scenario whose encoded matrix can't fit host RAM is skipped (just like
-		// the VRAM preflight aborts a too-big GPU run) instead of crashing the whole
-		// program. check_ram prints the size before bailing; catch that here, report
-		// the skip, and move on. Any OTHER panic is re-raised unchanged.
+		// A scenario whose encoded matrix exceeds the combined VRAM+RAM+disk ceiling
+		// is skipped instead of crashing the whole program. tiered::admit prints the
+		// size before bailing; catch that here, report the skip, and move on. Any
+		// OTHER panic is re-raised unchanged.
 		let prev = std::panic::take_hook();
 		std::panic::set_hook(Box::new(|info| {
 			let ram = info
