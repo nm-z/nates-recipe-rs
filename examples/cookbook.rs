@@ -24,8 +24,7 @@ const SET: Sets = Sets {
 };
 
 fn main() {
-	// NN
-	let nn = Model::new()
+	let nn = Model::new()             // NN
 		.loss(bce)
 		.layer(64)
 		.leak()
@@ -41,8 +40,7 @@ fn main() {
 		.epochs(20)
 		.log([Loss, Accuracy]);
 
-	// CNN
-	let cnn = Model::new()
+	let cnn = Model::new()            // CNN
 		.loss(ce)
 		.conv(32, 3, 1)
 		.leak()
@@ -61,8 +59,7 @@ fn main() {
 		.epochs(20)
 		.log([Loss, Accuracy]);
 
-	// MLP
-	let mlp = Model::new()
+	let mlp = Model::new()          // MLP
 		.loss(mse)
 		.layer(128)
 		.leak()
@@ -79,13 +76,11 @@ fn main() {
 		.epochs(20)
 		.log([Loss, R2]);
 
-	// LLM
-	let llm = Model::new()
+	let llm = Model::new()          // LLM
 		.loss(ce)
 		.layer(embed(16))
 		.layer(attn(4))
-		.layer(32)
-		.leak()
+		.layer(32).leak()
 		.layer(3)
 		.lr(0.001);
 	let llm_data = Data::load()
@@ -97,10 +92,36 @@ fn main() {
 		.epochs(20)
 		.log([Loss, Accuracy]);
 
-	for (model, data, train) in [
-		(&nn, &nn_data, &nn_train),
+	for (model, data, train) 
+	in [(&nn , &nn_data , &nn_train ),
 		(&cnn, &cnn_data, &cnn_train),
 		(&mlp, &mlp_data, &mlp_train),
-		(&llm, &llm_data, &llm_train),
-	] { train.run((model, data)); }
+		(&llm, &llm_data, &llm_train),]
+		{ 
+			train.run((model, data)); 
+		}
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
