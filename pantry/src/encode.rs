@@ -258,7 +258,14 @@ fn encode(
 	check_ram(n, proj_w, "encoded", &top);
 
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
-	let mut cols: Vec<Vec<f64>> = Vec::with_capacity(proj_w);
+	// Scatter each encoded feature column straight into the row-major output and drop
+	// it, instead of accumulating every column in a `Vec<Vec<f64>>` and copying the
+	// whole lot into `data` afterwards — holding both was a full second copy of the
+	// ~n×proj_w matrix (the measured 2× peak). proj_w is the exact feature width, so
+	// the output is sized once up front and filled column by column.
+	let w = proj_w;
+	let mut data = vec![0.0f64; n * w];
+	let mut jc = 0usize;
 	let mut tcols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); targets.len()];
 	for (ai, attr) in attrs.iter().enumerate() {
 		if is_skip(ai) && !is_target(ai) {
@@ -283,20 +290,18 @@ fn encode(
 		match targets.iter().position(|&t| t == ai) {
 			Some(tj) => tcols[tj] = ccols,
 			None => {
-				names.extend(cnames);
-				cols.extend(ccols);
+				for (cn, col) in cnames.into_iter().zip(ccols) {
+					names.push(cn);
+					for (i, v) in col.iter().enumerate() {
+						data[i * w + jc] = *v;
+					}
+					jc += 1;
+				}
 			}
 		}
 	}
 	let ycols: Vec<Vec<f64>> = tcols.into_iter().flatten().collect();
 	let k = ycols.len();
-	let w = cols.len();
-	let mut data = vec![0.0f64; n * w];
-	for (j, col) in cols.iter().enumerate() {
-		for (i, v) in col.iter().enumerate() {
-			data[i * w + j] = *v;
-		}
-	}
 	let mut ydata = vec![0.0f64; n * k];
 	for (j, col) in ycols.iter().enumerate() {
 		for (i, v) in col.iter().enumerate() {
@@ -324,7 +329,7 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 		.saturating_mul(w)
 		.saturating_mul(std::mem::size_of::<f64>());
 	let avail = crate::available_ram_bytes();
-	if bytes <= avail / 10 * 9 {
+	if bytes <= avail {
 		return;
 	}
 	let hb = crate::data::human_bytes;
@@ -386,9 +391,49 @@ struct Assembled {
 }
 
 impl Assembled {
-	fn select(&self, keep: &[String]) -> Mat {
+	fn select(&mut self, keep: &[String]) -> Mat {
 		let n = self.samples;
 		let w = keep.len();
+		let idx: std::collections::HashMap<&str, usize> = self
+			.names
+			.iter()
+			.enumerate()
+			.map(|(i, s)| (s.as_str(), i))
+			.collect();
+		let picks: Vec<(usize, usize)> =
+			keep.iter().map(|name| self.sources[idx[name.as_str()]]).collect();
+
+		// Left-compaction fast path: when every kept column comes from a single source
+		// matrix whose row-gather is the identity and whose column indices stay
+		// ascending, the selection is just that matrix's own columns in place. Reuse
+		// its buffer instead of allocating a second full n×w matrix — holding the
+		// source and the copy at once is what doubled peak RAM. In place is safe
+		// because each read index i*big_w + col ≥ its write index i*w + jc, so no
+		// cell is overwritten before it is read.
+		if w > 0 {
+			let mi = picks[0].0;
+			let cols: Vec<usize> = picks.iter().map(|&(_, c)| c).collect();
+			let compact = picks.iter().all(|&(m, _)| m == mi)
+				&& self.gather[mi].len() == n
+				&& self.gather[mi].iter().enumerate().all(|(i, g)| *g == Some(i))
+				&& cols.windows(2).all(|p| p[0] < p[1])
+				&& self.mats[mi].is_standard_layout();
+			if compact {
+				let big_w = self.mats[mi].ncols();
+				let (mut buf, _) =
+					std::mem::take(&mut self.mats[mi]).into_raw_vec_and_offset();
+				for i in 0..n {
+					let (ib, iw) = (i * big_w, i * w);
+					for (jc, &c) in cols.iter().enumerate() {
+						buf[iw + jc] = buf[ib + c];
+					}
+				}
+				buf.truncate(n * w);
+				return Mat::from_shape_vec((n, w), buf).expect("select reshape");
+			}
+		}
+
+		// General path: gather across sources / non-identity joins into a fresh matrix.
 		let mut by_col: std::collections::BTreeMap<&str, usize> =
 			std::collections::BTreeMap::new();
 		for name in keep {
@@ -398,12 +443,6 @@ impl Assembled {
 		}
 		let top: Vec<(&str, usize)> = by_col.into_iter().collect();
 		check_ram(n, w, "selection", &top);
-		let idx: std::collections::HashMap<&str, usize> = self
-			.names
-			.iter()
-			.enumerate()
-			.map(|(i, s)| (s.as_str(), i))
-			.collect();
 		let mut data = vec![0.0f64; n * w];
 		for (jc, name) in keep.iter().enumerate() {
 			let (mi, col) = self.sources[idx[name.as_str()]];
@@ -947,13 +986,13 @@ pub fn prepare_table_data(
 	};
 	let t = resolve(&set_tnames, test_tnames.as_deref());
 
-	let (set, schema) = assemble(&set_groups, &t, None, None, exclude);
+	let (mut set, schema) = assemble(&set_groups, &t, None, None, exclude);
 	let flat_attrs: Vec<Attr> = schema.values().flat_map(|v| v.iter().cloned()).collect();
 	let k = set.n_targets;
 	let keep = |name: &str| !exclude.iter().any(|p| exclude_match(p, name));
 
 	if let Some((tg, tp)) = &test_groups {
-		let (test, _) = assemble(
+		let (mut test, _) = assemble(
 			tg,
 			&t,
 			Some(&schema),

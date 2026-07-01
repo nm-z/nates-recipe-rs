@@ -259,7 +259,7 @@ pub fn build_layer_params(
 			let w_count = filters * cin * kernel;
 			let (w, b) = if !try_resume {
 				let scale = (2.0 / (cin * kernel) as f64).sqrt();
-				let w = kernels::gpu_randn(w_count, 5678 + (li as u32) * 7919)
+				let w = kernels::gpu_randn(w_count, li as u32)
 					.expect("randn conv w");
 				kernels::gpu_scale_inplace(&w, scale, w_count);
 				let b = GpuBuffer::upload(&vec![0.0f64; filters]).expect("upload conv b");
@@ -333,7 +333,7 @@ pub fn build_layer_params(
 		}
 		let (w, b, slope) = if !try_resume {
 			let scale = (2.0 / in_dim as f64).sqrt();
-			let w = kernels::gpu_randn(in_dim * units, 1234 + (li as u32) * 7919)
+			let w = kernels::gpu_randn(in_dim * units, li as u32)
 				.expect("randn w");
 			kernels::gpu_scale_inplace(&w, scale, in_dim * units);
 			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("upload b");

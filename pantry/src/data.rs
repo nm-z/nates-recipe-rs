@@ -71,7 +71,7 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let est_rows = count_lines(path)?.saturating_sub(usize::from(!headerless));
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
-	if proj > avail / 10 * 9 {
+	if proj > avail {
 		eprintln!("\x1b[1;31mcsv too large to parse into RAM\x1b[0m");
 		eprintln!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
@@ -282,6 +282,10 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			.unwrap_or("images")
 			.to_string();
 		let all: Vec<std::path::PathBuf> = images.into_values().flatten().map(|(_, p)| p).collect();
+		// The images' own native resolution sets the matrix width — no picked resize target.
+		let (iw, ih) = image::image_dimensions(&all[0])
+			.with_context(|| format!("failed to read image dimensions: {}", all[0].display()))?;
+		let dim = (iw * ih * 3) as usize;
 		let rows: Vec<(String, Vec<f64>)> = all
 			.par_iter()
 			.map(|p| {
@@ -290,11 +294,11 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					.and_then(|s| s.to_str())
 					.unwrap_or_default()
 					.to_string();
-				let px = match image_to_row(p.to_str().unwrap_or_default(), 32, 32) {
+				let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 					Ok(r) => r.to_vec(),
 					Err(e) => {
 						eprintln!("WARN: skipping image {}: {e}", p.display());
-						vec![f64::NAN; 32 * 32 * 3]
+						vec![f64::NAN; dim]
 					}
 				};
 				pb.inc(1);
@@ -304,7 +308,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		let (hashes, pixels): (Vec<String>, Vec<Vec<f64>>) = rows.into_iter().unzip();
 		groups.push(DirGroup::Image {
 			name: leaf,
-			dim: 32 * 32 * 3,
+			dim,
 			hashes,
 			pixels,
 		});

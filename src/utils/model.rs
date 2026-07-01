@@ -675,7 +675,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool) -> Vec<Issue>
 		(0, d, 0)
 	};
 	let need = vram_estimate(&model.specs, n, text_d, k, vocab, cat_cols, forward_only);
-	if need > free_vram / 10 * 9 {
+	if need > free_vram {
 		let mode = if forward_only { "inference" } else { "training" };
 		issues.push(Issue {
 			what: format!("{mode} on {n} rows × {d} features exceeds GPU memory"),
