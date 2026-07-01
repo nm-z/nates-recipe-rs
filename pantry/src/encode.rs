@@ -346,7 +346,7 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 			.filter(|(_, c)| *c > 0)
 			.collect();
 	autopsy.sort_by(|a, b| cols_bytes(b.1).cmp(&cols_bytes(a.1)));
-	let mut line = vec![oom_pair(label, "too large for RAM")];
+	let mut line = vec![oom_pair("RAM OOM", label)];
 	line.extend(
 		autopsy
 			.iter()
