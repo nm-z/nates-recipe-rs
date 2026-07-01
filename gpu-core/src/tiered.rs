@@ -339,6 +339,55 @@ impl Tiered {
             hip::device_synchronize()
       }
 
+      /// Stage an arbitrary logical byte range `[off, off+len)` into the device
+      /// `window` (contiguous, ≥ `len` bytes), gathering each overlapping page's
+      /// sub-range from its home tier. Rows do not align to pages, so the row-tiled
+      /// trainer stages exact row ranges (`off = r0·d·8`, `len = R·d·8`) and gets a
+      /// contiguous `[R×d]` device block.
+      pub fn stage_bytes(&self, off: usize, len: usize, window: *mut c_void) {
+            let mut scratch = vec![0u8; P];
+            let mut done = 0usize;
+            while done < len {
+                  let gpos = off + done;
+                  let p = gpos / P;
+                  let poff = gpos % P;
+                  let chunk = (P - poff).min(len - done);
+                  let dst = unsafe { (window as *mut u8).add(done) as *mut c_void };
+                  // SAFETY: dst = window+done covers `chunk`; each tier src is a valid
+                  // page sub-range at `poff`.
+                  match self.res[p] {
+                        Residence::Vram(s) => unsafe {
+                              let src = (self.va as *mut u8).add(s as usize * P + poff) as *const c_void;
+                              hip::memcpy_async(dst, src, chunk, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+                                    .expect("stage_bytes D2D");
+                        },
+                        Residence::Ram(i) => unsafe {
+                              let src = self.ram[i as usize].as_ptr().add(poff) as *const c_void;
+                              hip::memcpy_async(dst, src, chunk, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
+                                    .expect("stage_bytes H2D");
+                        },
+                        Residence::Disk(diskoff) => {
+                              self.disk
+                                    .as_ref()
+                                    .expect("disk tier")
+                                    .read_exact_at(&mut scratch[..chunk], diskoff + poff as u64)
+                                    .expect("stage_bytes read");
+                              unsafe {
+                                    hip::memcpy_async(
+                                          dst,
+                                          scratch.as_ptr() as *const c_void,
+                                          chunk,
+                                          hip::HIP_MEMCPY_H2D,
+                                          std::ptr::null_mut(),
+                                    )
+                                    .expect("stage_bytes disk H2D");
+                              }
+                        },
+                  }
+                  done += chunk;
+            }
+      }
+
       /// Stage a contiguous run of pages `[first_page, first_page+n_pages)` into the
       /// device `window` (contiguous, ≥ `n_pages·P` bytes), gathering each page from
       /// its home tier — VRAM→D2D, RAM→H2D, disk→read+H2D. This is the sequential
@@ -471,6 +520,114 @@ mod tests {
                   }
                   Ok(_) => panic!("admitted a buffer over the ceiling"),
             }
+      }
+
+      // G1 "and runs": a buffer forced to span VRAM+RAM+disk is trained by a
+      // row-tiled full-batch linear model (stream each block through a fixed staging
+      // window, accumulate dW/db across blocks, ONE SGD update per epoch) and must
+      // reach the SAME weights as the whole-batch trainer on the same data. All
+      // device buffers are allocated before the VMM buffer (pool-after-VMM faults).
+      #[test]
+      fn tiled_full_batch_runs_and_matches_whole() {
+            use crate::kernels;
+            use crate::memory::GpuBuffer;
+            hip::set_device(0).expect("dev");
+            let (n, d, o) = (60000usize, 16usize, 4usize); // 7.68 MB → 4 pages
+            let epochs = 20;
+            let lr = 0.05;
+            let mut xh = vec![0f64; n * d];
+            let mut yh = vec![0f64; n * o];
+            for i in 0..n {
+                  for j in 0..d {
+                        xh[i * d + j] = (((i * 7 + j * 13) % 97) as f64) / 97.0 - 0.5;
+                  }
+            }
+            for i in 0..n {
+                  for k in 0..o {
+                        let mut s = 0.0;
+                        for j in 0..d {
+                              s += xh[i * d + j] * ((((j * 3 + k * 5) % 11) as f64) - 5.0) * 0.1;
+                        }
+                        yh[i * o + k] = s;
+                  }
+            }
+            let dl = |buf: &GpuBuffer, m: usize| -> Vec<f64> {
+                  let mut h = vec![0f64; m];
+                  unsafe {
+                        hip::memcpy_async(h.as_mut_ptr() as *mut c_void, buf.ptr, m * 8, hip::HIP_MEMCPY_D2H, std::ptr::null_mut())
+                              .expect("D2H");
+                  }
+                  hip::device_synchronize().expect("sync");
+                  h
+            };
+            // ---- all device buffers BEFORE any VMM buffer ----
+            let x_dev = GpuBuffer::upload(&xh).expect("x");
+            let y_dev = GpuBuffer::upload(&yh).expect("y");
+            let make = |sz: usize| GpuBuffer::alloc(sz).expect("buf");
+            let (w_ref, b_ref) = (make(d * o), make(o));
+            let (w_t, b_t) = (make(d * o), make(o));
+            kernels::gpu_scale_inplace(&w_ref, 0.0, d * o);
+            kernels::gpu_scale_inplace(&b_ref, 0.0, o);
+            kernels::gpu_scale_inplace(&w_t, 0.0, d * o);
+            kernels::gpu_scale_inplace(&b_t, 0.0, o);
+            let yhat = make(n * o);
+            let (dw, db) = (make(d * o), make(o));
+            let (dw_acc, db_acc) = (make(d * o), make(o));
+            let rws_bytes = kernels::gpu_reduce_sum_cols_workspace_bytes(n, o)
+                  .max(kernels::gpu_reduce_sum_cols_workspace_bytes(n * o, 1))
+                  .max(kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1));
+            let reduce_ws = GpuBuffer::alloc_bytes(rws_bytes).expect("rws");
+            let dw_partials = make(kernels::gpu_splitk_dw_partials_elems(n, d, o));
+            let rows_per_block = 4096usize;
+            let window = make(rows_per_block * d);
+            // warm hipBLAS workspace before the VMM buffer exists
+            kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, &yhat, 1, o, d);
+            hip::device_synchronize().expect("warmup");
+
+            // ---- reference: whole-batch full-batch GD ----
+            let scale = lr / n as f64;
+            for _ in 0..epochs {
+                  kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, &yhat, n, o, d);
+                  kernels::gpu_sub_inplace(&yhat, &y_dev, n * o);
+                  kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &dw, &db, &reduce_ws, &dw_partials, n, o, d);
+                  kernels::gpu_sgd_update(&w_ref, &dw, scale, d * o);
+                  kernels::gpu_sgd_update(&b_ref, &db, scale, o);
+            }
+            let w_ref_h = dl(&w_ref, d * o);
+
+            // ---- tiled: X in a forced-spill Tiered buffer, streamed row-blocks ----
+            let bytes = n * d * 8;
+            let mut t = Tiered::alloc_capped(bytes, 1, 1, Path::new("/tmp/tiled_train.spill")); // 1 VRAM,1 RAM,2 disk
+            let xbytes = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, bytes) };
+            t.fill(xbytes);
+            t.sync().expect("fill");
+            assert!(!t.is_contiguous_vram(), "buffer must span >1 tier");
+            for _ in 0..epochs {
+                  kernels::gpu_scale_inplace(&dw_acc, 0.0, d * o);
+                  kernels::gpu_scale_inplace(&db_acc, 0.0, o);
+                  let mut r0 = 0;
+                  while r0 < n {
+                        let r = rows_per_block.min(n - r0);
+                        t.stage_bytes(r0 * d * 8, r * d * 8, window.ptr);
+                        kernels::gpu_linear_into(&window, &w_t, &b_t, &yhat, r, o, d);
+                        let yblk = GpuBuffer::borrow(unsafe { (y_dev.ptr as *mut f64).add(r0 * o) as *mut c_void }, r * o * 8);
+                        kernels::gpu_sub_inplace(&yhat, &yblk, r * o);
+                        kernels::gpu_linear_backward_weights_only_into(&yhat, &window, &dw, &db, &reduce_ws, &dw_partials, r, o, d);
+                        kernels::gpu_add_inplace(&dw_acc, &dw, d * o);
+                        kernels::gpu_add_inplace(&db_acc, &db, o);
+                        r0 += r;
+                  }
+                  kernels::gpu_sgd_update(&w_t, &dw_acc, scale, d * o);
+                  kernels::gpu_sgd_update(&b_t, &db_acc, scale, o);
+            }
+            let w_t_h = dl(&w_t, d * o);
+            let maxdiff = w_ref_h
+                  .iter()
+                  .zip(&w_t_h)
+                  .map(|(a, b)| (a - b).abs())
+                  .fold(0.0f64, f64::max);
+            eprintln!("[tiled] pages={} spilled=true maxdiff(tiled vs whole)={maxdiff:e}", t.pages());
+            assert!(maxdiff < 1e-9, "tiled full-batch must match whole-batch: maxdiff={maxdiff}");
       }
 
       #[test]
