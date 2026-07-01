@@ -117,6 +117,15 @@ unsafe extern "C" {
 	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	// Managed (unified) memory
 	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+	// VRAM tier of the tiered buffer — VMM wrappers (src/kernels/vmm.hip). Handles
+	// are opaque, carried as *mut c_void.
+	pub fn vmm_granularity(out: *mut usize) -> i32;
+	pub fn vmm_create(handle_out: *mut *mut c_void, size: usize) -> i32;
+	pub fn vmm_reserve(va_out: *mut *mut c_void, size: usize) -> i32;
+	pub fn vmm_map_at(va: *mut c_void, size: usize, handle: *mut c_void) -> i32;
+	pub fn vmm_unmap(va: *mut c_void, size: usize) -> i32;
+	pub fn vmm_release(handle: *mut c_void) -> i32;
+	pub fn vmm_addr_free(va: *mut c_void, size: usize) -> i32;
 	// hipBLAS — matrix-vector multiply (out_dim == 1 fast path)
 	pub fn hipblasDgemv(
 		handle: *mut c_void,

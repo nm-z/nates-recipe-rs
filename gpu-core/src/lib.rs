@@ -30,3 +30,4 @@ pub mod rl;
 pub mod rope;
 pub mod sequence;
 pub mod svm;
+pub mod tiered;
