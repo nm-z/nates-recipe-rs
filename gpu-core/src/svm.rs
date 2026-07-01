@@ -98,12 +98,12 @@ fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	unsafe {
 		let src = (buf.ptr_raw() as *const u8).add(idx * std::mem::size_of::<f64>())
 			as *const c_void;
-		crate::hip::check(crate::hip::hipMemcpy(
+		crate::memory::xfer_sync(
 			v.as_mut_ptr() as *mut c_void,
 			src,
 			std::mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_D2H,
-		))?;
+		)?;
 	}
 	Ok(v[0])
 }

@@ -278,7 +278,7 @@ impl Scratch {
 
 	pub fn download_scalar_deferred(&self) {
 		unsafe {
-			gpu_core::hip::hipMemcpyAsync(
+			let _ = gpu_core::memory::xfer(
 				self.pinned_scalar as *mut std::ffi::c_void,
 				self.metric_scalar.ptr_raw() as *const std::ffi::c_void,
 				8,
@@ -292,7 +292,7 @@ impl Scratch {
 	/// for the per-epoch score so it batches into one sync with the loss copy.
 	pub fn download_scalar_b_deferred(&self) {
 		unsafe {
-			gpu_core::hip::hipMemcpyAsync(
+			let _ = gpu_core::memory::xfer(
 				self.pinned_scalar_b as *mut std::ffi::c_void,
 				self.metric_scalar_b.ptr_raw() as *const std::ffi::c_void,
 				8,

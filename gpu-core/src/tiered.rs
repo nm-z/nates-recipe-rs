@@ -217,6 +217,10 @@ impl Tiered {
             // handles into it. For a buffer that fits VRAM this is the whole thing,
             // contiguous — the GEMM uses it directly.
             let (va, handles) = reserve_and_map(n_vram).expect("vmm reserve/map");
+            // The VMM-mapped VRAM handles live outside the stream-ordered pool, so
+            // the alloc choke never sees them — note their physical bytes into the
+            // ledger directly under tag "tiered-vram".
+            crate::memory::tag_note_alloc("tiered-vram", handles.len() * P);
             let slot_page: Vec<Option<usize>> = (0..n_vram).map(Some).collect();
 
             // RAM tier: anon P-blocks.
@@ -312,7 +316,7 @@ impl Tiered {
                         let dst = unsafe { (self.va as *mut u8).add(s as usize * P) as *mut c_void };
                         // SAFETY: dst is the s-th mapped P-window; bytes ≤ P.
                         unsafe {
-                              hip::memcpy_async(
+                              crate::memory::xfer(
                                     dst,
                                     bytes.as_ptr() as *const c_void,
                                     bytes.len(),
@@ -358,12 +362,12 @@ impl Tiered {
                   match self.res[p] {
                         Residence::Vram(s) => unsafe {
                               let src = (self.va as *mut u8).add(s as usize * P + poff) as *const c_void;
-                              hip::memcpy_async(dst, src, chunk, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+                              crate::memory::xfer(dst, src, chunk, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
                                     .expect("stage_bytes D2D");
                         },
                         Residence::Ram(i) => unsafe {
                               let src = self.ram[i as usize].as_ptr().add(poff) as *const c_void;
-                              hip::memcpy_async(dst, src, chunk, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
+                              crate::memory::xfer(dst, src, chunk, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
                                     .expect("stage_bytes H2D");
                         },
                         Residence::Disk(diskoff) => {
@@ -373,7 +377,7 @@ impl Tiered {
                                     .read_exact_at(&mut scratch[..chunk], diskoff + poff as u64)
                                     .expect("stage_bytes read");
                               unsafe {
-                                    hip::memcpy_async(
+                                    crate::memory::xfer(
                                           dst,
                                           scratch.as_ptr() as *const c_void,
                                           chunk,
@@ -408,12 +412,12 @@ impl Tiered {
                   match self.res[p] {
                         Residence::Vram(s) => unsafe {
                               let src = (self.va as *mut u8).add(s as usize * P) as *const c_void;
-                              hip::memcpy_async(dst, src, bytes, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+                              crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
                                     .expect("stage D2D");
                         },
                         Residence::Ram(i) => unsafe {
                               let src = self.ram[i as usize].as_ptr() as *const c_void;
-                              hip::memcpy_async(dst, src, bytes, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
+                              crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
                                     .expect("stage H2D");
                         },
                         Residence::Disk(off) => {
@@ -424,7 +428,7 @@ impl Tiered {
                                     .expect("stage read");
                               // SAFETY: scratch holds `bytes` valid host bytes.
                               unsafe {
-                                    hip::memcpy_async(
+                                    crate::memory::xfer(
                                           dst,
                                           disk_scratch.as_ptr() as *const c_void,
                                           bytes,
@@ -441,6 +445,7 @@ impl Tiered {
 
 impl Drop for Tiered {
       fn drop(&mut self) {
+            crate::memory::tag_note_free("tiered-vram", self.slots * P);
             for (s, h) in self.handles.iter().enumerate() {
                   let va = unsafe { (self.va as *mut u8).add(s * P) as *mut c_void };
                   // SAFETY: unmap then release each slot we mapped; free the VA range.
@@ -554,7 +559,7 @@ mod tests {
             let dl = |buf: &GpuBuffer, m: usize| -> Vec<f64> {
                   let mut h = vec![0f64; m];
                   unsafe {
-                        hip::memcpy_async(h.as_mut_ptr() as *mut c_void, buf.ptr, m * 8, hip::HIP_MEMCPY_D2H, std::ptr::null_mut())
+                        crate::memory::xfer(h.as_mut_ptr() as *mut c_void, buf.ptr, m * 8, hip::HIP_MEMCPY_D2H, std::ptr::null_mut())
                               .expect("D2H");
                   }
                   hip::device_synchronize().expect("sync");
@@ -638,7 +643,8 @@ mod tests {
             let bytes = pages * P;
             // Allocate + prove the window BEFORE any VMM buffer exists, to bisect
             // whether VMM setup corrupts the stream-ordered pool.
-            let window = unsafe { hip::malloc_async(bytes, std::ptr::null_mut()).expect("window") };
+            let window_buf = crate::memory::GpuBuffer::alloc_bytes(bytes).expect("window");
+            let window = window_buf.ptr;
             // Force 2 pages per tier so the sweep exercises VRAM, RAM, and disk.
             let mut t = Tiered::alloc_capped(bytes, 2, 2, spill);
             assert_eq!(t.pages(), pages);
@@ -658,7 +664,7 @@ mod tests {
             let mut back = vec![0u8; bytes];
             // SAFETY: window covers `bytes`; back owns `bytes`.
             unsafe {
-                  hip::memcpy_async(
+                  crate::memory::xfer(
                         back.as_mut_ptr() as *mut c_void,
                         window,
                         bytes,
@@ -694,7 +700,7 @@ mod tests {
             let mut back = vec![0u8; bytes];
             // SAFETY: device_ptr covers `bytes`; back owns `bytes`.
             unsafe {
-                  hip::memcpy_async(
+                  crate::memory::xfer(
                         back.as_mut_ptr() as *mut c_void,
                         t.device_ptr(),
                         bytes,

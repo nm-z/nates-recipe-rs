@@ -375,11 +375,7 @@ pub fn gpu_rdiv_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, Hip
 pub fn gpu_has_nan(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
 	let flag = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 	unsafe {
-		crate::hip::check(crate::hip::hipMemset(
-			flag.ptr_raw(),
-			0,
-			std::mem::size_of::<i32>(),
-		))?;
+		crate::memory::memset_sync(flag.ptr_raw(), 0, std::mem::size_of::<i32>())?;
 		launch_has_nan(
 			x.ptr_raw() as *const c_void,
 			flag.ptr_raw(),
@@ -396,11 +392,7 @@ pub fn gpu_has_nan(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
 pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
 	let flag = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 	unsafe {
-		crate::hip::check(crate::hip::hipMemset(
-			flag.ptr_raw(),
-			0,
-			std::mem::size_of::<i32>(),
-		))?;
+		crate::memory::memset_sync(flag.ptr_raw(), 0, std::mem::size_of::<i32>())?;
 		launch_isfinite_all(
 			x.ptr_raw() as *const c_void,
 			flag.ptr_raw(),

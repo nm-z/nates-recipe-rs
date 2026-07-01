@@ -1185,28 +1185,8 @@ mod metric_gpu_tests {
 
 		// --- restore initial weights ---
 		for (l, p) in params.iter().enumerate() {
-			GpuBuffer::upload(&init_w[l])
-				.expect("restore w")
-				.download(&mut [0.0; 0])
-				.ok();
-			let wb = GpuBuffer::upload(&init_w[l]).expect("upload w");
-			unsafe {
-				gpu_core::hip::hipMemcpy(
-					p.w.ptr_raw(),
-					wb.ptr_raw() as *const std::ffi::c_void,
-					init_w[l].len() * 8,
-					gpu_core::hip::HIP_MEMCPY_D2D,
-				)
-			};
-			let bb = GpuBuffer::upload(&init_b[l]).expect("upload b");
-			unsafe {
-				gpu_core::hip::hipMemcpy(
-					p.b.ptr_raw(),
-					bb.ptr_raw() as *const std::ffi::c_void,
-					init_b[l].len() * 8,
-					gpu_core::hip::HIP_MEMCPY_D2D,
-				)
-			};
+			p.w.load(&init_w[l]).expect("restore w");
+			p.b.load(&init_b[l]).expect("restore b");
 		}
 
 		// --- per-layer reference backward with same lr ---

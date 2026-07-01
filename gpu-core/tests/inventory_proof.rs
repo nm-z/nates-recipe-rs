@@ -393,7 +393,7 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let (mm, kk, nn) = (3usize, 4usize, 2usize);
 	let a: Vec<f64> = (0..mm * kk).map(|i| i as f64 * 0.1 - 0.5).collect();
 	let b: Vec<f64> = (0..kk * nn).map(|i| i as f64 * 0.2 - 0.3).collect();
-	let c = {
+	let run_gemm = || {
 		let ga = GpuBuffer::upload(&a).unwrap();
 		let gb = GpuBuffer::upload(&b).unwrap();
 		let gc = gpu_gemm(&ga, &gb, mm, nn, kk).unwrap();
@@ -401,6 +401,11 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		gc.download(&mut o).unwrap();
 		o
 	};
+	// Fault probe: the first Dgemm of a process intermittently returns garbage
+	// when another GPU process ran moments before. Run it twice — a transient
+	// (clock/init) glitch passes on retry; persistent corruption repeats.
+	let c = run_gemm();
+	let c2 = run_gemm();
 	let mut want = vec![0.0; mm * nn];
 	for i in 0..mm {
 		for j in 0..nn {
@@ -411,7 +416,13 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 			want[i * nn + j] = s;
 		}
 	}
+	if !close(&c, &c2) {
+		eprintln!("GEMM RETRY DIVERGED: first={c:?} second={c2:?} want={want:?}");
+	}
 	let ok = close(&c, &want);
+	if !ok {
+		eprintln!("GEMM WRONG: got={c:?} retry={c2:?} want={want:?}");
+	}
 	for k in ["gemm", "matmul"] {
 		m.insert(k, ok);
 	}

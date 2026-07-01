@@ -63,9 +63,6 @@ unsafe extern "C" {
 		incx: i32,
 	) -> i32;
 
-	// HIP memcpy for the copy needed in gpu_scale
-	fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
-
 	// hipSOLVER (→ rocSOLVER on AMD, cuSOLVER on NVIDIA). Explicit-workspace model:
 	// query *_bufferSize, allocate a device work buffer, pass work/lwork + devInfo.
 	fn hipsolverCreate(handle: *mut *mut c_void) -> i32;
@@ -1525,6 +1522,9 @@ pub fn gpu_shutdown() {
 			}
 		}
 	});
+	// Return retained pool VRAM to the driver before the process dies — see
+	// trim_mempool: async teardown reclaim races the next process's first touch.
+	let _ = crate::hip::trim_mempool(0);
 }
 
 /// Fused linear: out = X @ W + bias. X is (m,k), W is (k,n), bias is (1,n), out is (m,n).
@@ -2382,14 +2382,7 @@ pub fn gpu_scale(x: &GpuBuffer, scalar: f64, n: usize) -> Result<GpuBuffer, HipE
 	let out = GpuBuffer::alloc(n)?;
 	let bytes = n * std::mem::size_of::<f64>();
 	// Copy x → out, then scale in-place via hipBLAS dscal
-	check(unsafe {
-		hipMemcpy(
-			out.ptr,
-			x.ptr as *const c_void,
-			bytes,
-			crate::hip::HIP_MEMCPY_D2D,
-		)
-	})?;
+	unsafe { crate::memory::xfer_sync(out.ptr, x.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
 	let status =
 		unsafe { hipblasDscal(hipblas_handle(), n as i32, &scalar, out.ptr as *mut f64, 1) };
 	check(status)?;
@@ -2559,12 +2552,7 @@ pub fn gpu_linear_into(
 /// Fused R² residual sum of squares Σ(y-pred)² reduced into scalar `out` (atomicAdd).
 pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
 	unsafe {
-		crate::hip::hipMemsetAsync(
-			out.ptr,
-			0,
-			std::mem::size_of::<f64>(),
-			std::ptr::null_mut(),
-		);
+		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_ss_res(
@@ -2581,12 +2569,7 @@ pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usiz
 /// Fused mean squared error Σ(pred-y)²/n reduced into scalar `out` (atomicAdd).
 pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
 	unsafe {
-		crate::hip::hipMemsetAsync(
-			out.ptr,
-			0,
-			std::mem::size_of::<f64>(),
-			std::ptr::null_mut(),
-		);
+		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_mse(
@@ -2603,12 +2586,7 @@ pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) 
 /// Fused accuracy Σ[round(pred)==round(y)]/n reduced into scalar `out` (atomicAdd).
 pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, out: &GpuBuffer, n: usize) {
 	unsafe {
-		crate::hip::hipMemsetAsync(
-			out.ptr,
-			0,
-			std::mem::size_of::<f64>(),
-			std::ptr::null_mut(),
-		);
+		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_accuracy_metric(
@@ -2645,12 +2623,7 @@ pub fn gpu_argmax_accuracy_into(
 	k: usize,
 ) {
 	unsafe {
-		crate::hip::hipMemsetAsync(
-			out.ptr,
-			0,
-			std::mem::size_of::<f64>(),
-			std::ptr::null_mut(),
-		);
+		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_argmax_acc(
@@ -2693,15 +2666,15 @@ pub fn gpu_log_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
 
 /// Device-to-device copy of `n` f64s into `out`.
 pub fn gpu_copy_into(src: &GpuBuffer, out: &GpuBuffer, n: usize) {
-	check(unsafe {
-		crate::hip::hipMemcpyAsync(
+	unsafe {
+		crate::memory::xfer(
 			out.ptr,
 			src.ptr as *const c_void,
 			n * std::mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_D2D,
 			std::ptr::null_mut(),
 		)
-	})
+	}
 	.expect("copy");
 }
 
@@ -2834,12 +2807,7 @@ pub fn gpu_dgemv_into(
 /// A_cm[j,i] = w[j]·grad[i], i.e. da_prev[i,j] = grad[i]·w[j].
 pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize, in_dim: usize) {
 	unsafe {
-		crate::hip::hipMemsetAsync(
-			out.ptr,
-			0,
-			n * in_dim * std::mem::size_of::<f64>(),
-			std::ptr::null_mut(),
-		);
+		let _ = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	let alpha = 1.0_f64;
 	let status = unsafe {
@@ -3955,14 +3923,7 @@ pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize) -> Result<Gp
 pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; n];
 	let bytes = n * std::mem::size_of::<i32>();
-	check(unsafe {
-		hipMemcpy(
-			result.as_mut_ptr() as *mut c_void,
-			buf.ptr,
-			bytes,
-			crate::hip::HIP_MEMCPY_D2H,
-		)
-	})?;
+	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
 	Ok(result)
 }
 
@@ -4019,14 +3980,7 @@ pub fn download_topk_indices(buf: &GpuBuffer, rows: usize, k: usize) -> Result<V
 	let n = rows * k;
 	let mut result = vec![0i32; n];
 	let bytes = n * std::mem::size_of::<i32>();
-	check(unsafe {
-		hipMemcpy(
-			result.as_mut_ptr() as *mut c_void,
-			buf.ptr,
-			bytes,
-			crate::hip::HIP_MEMCPY_D2H,
-		)
-	})?;
+	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
 	Ok(result)
 }
 
@@ -4281,14 +4235,7 @@ pub fn gpu_partial_argsort(data: &GpuBuffer, n: usize, k: usize) -> Result<GpuBu
 pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; k];
 	let bytes = k * std::mem::size_of::<i32>();
-	check(unsafe {
-		hipMemcpy(
-			result.as_mut_ptr() as *mut c_void,
-			buf.ptr,
-			bytes,
-			crate::hip::HIP_MEMCPY_D2H,
-		)
-	})?;
+	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
 	Ok(result)
 }
 
@@ -4682,14 +4629,7 @@ pub fn gpu_eye(n: usize) -> Result<GpuBuffer, HipError> {
 pub fn gpu_copy(src: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 	let dst = GpuBuffer::alloc(n)?;
 	let bytes = n * std::mem::size_of::<f64>();
-	check(unsafe {
-		hipMemcpy(
-			dst.ptr,
-			src.ptr as *const c_void,
-			bytes,
-			crate::hip::HIP_MEMCPY_D2D,
-		)
-	})?;
+	unsafe { crate::memory::xfer_sync(dst.ptr, src.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
 	Ok(dst)
 }
 
@@ -5641,22 +5581,15 @@ pub fn gpu_vconcat(
 	let out = GpuBuffer::alloc(a_n + b_n)?;
 	let a_bytes = a_n * std::mem::size_of::<f64>();
 	let b_bytes = b_n * std::mem::size_of::<f64>();
-	check(unsafe {
-		hipMemcpy(
-			out.ptr,
-			a.ptr as *const c_void,
-			a_bytes,
-			crate::hip::HIP_MEMCPY_D2D,
-		)
-	})?;
-	check(unsafe {
-		hipMemcpy(
+	unsafe { crate::memory::xfer_sync(out.ptr, a.ptr as *const c_void, a_bytes, crate::hip::HIP_MEMCPY_D2D) }?;
+	unsafe {
+		crate::memory::xfer_sync(
 			(out.ptr as *mut u8).add(a_bytes) as *mut c_void,
 			b.ptr as *const c_void,
 			b_bytes,
 			crate::hip::HIP_MEMCPY_D2D,
 		)
-	})?;
+	}?;
 	Ok(out)
 }
 

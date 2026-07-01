@@ -568,6 +568,7 @@ fn main() -> Result<()> {
 
 	let out: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
 	println!("\n=== OUTPUT ===\n{out}");
+	eprintln!("{}", gpu_core::memory::ledger_report());
 	recipe_infer::shutdown();
 	Ok(())
 }

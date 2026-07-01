@@ -454,7 +454,7 @@ pub fn gpu_dgemv(
 pub fn gpu_dger(x: &GpuBuffer, y: &GpuBuffer, m: usize, n: usize) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(m * n)?;
 	unsafe {
-		crate::hip::hipMemset(out.ptr_raw(), 0, m * n * std::mem::size_of::<f64>());
+		crate::memory::memset_sync(out.ptr_raw(), 0, m * n * std::mem::size_of::<f64>())?;
 	}
 	let alpha = 1.0f64;
 	let status = unsafe {

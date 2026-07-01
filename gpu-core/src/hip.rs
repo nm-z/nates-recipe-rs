@@ -117,6 +117,7 @@ unsafe extern "C" {
 	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
 	pub fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+	pub fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
 	// Managed (unified) memory
 	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	// VRAM tier of the tiered buffer — VMM wrappers (src/kernels/vmm.hip). Handles
@@ -169,7 +170,26 @@ pub fn device_synchronize() -> Result<(), HipError> {
 	check(unsafe { hipDeviceSynchronize() })
 }
 
+// The SDMA copy engine is incoherent with the gfx L2 on reused hipMallocAsync
+// pool pages (ROCm 7.2.1 / gfx1101): an SDMA H2D lands in memory while compute
+// reads stale L2 lines (silent wrong gemm results) or a stale mapping
+// (intermittent "page not present" fault). Measured on inventory_proof: ~55%
+// failure with SDMA, 8/8 clean without. Force blit-kernel copies — coherent
+// with gfx L2 by construction — unless the user set the variable themselves.
+// Must run before the first HIP call of the process; both GPU entry funnels
+// (set_device, first allocation) call it.
+pub(crate) fn disable_sdma_once() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		if std::env::var_os("HSA_ENABLE_SDMA").is_none() {
+			// SAFETY: first GPU touch is effectively single-threaded, before HSA init.
+			unsafe { std::env::set_var("HSA_ENABLE_SDMA", "0") };
+		}
+	});
+}
+
 pub fn set_device(device: i32) -> Result<(), HipError> {
+	disable_sdma_once();
 	check(unsafe { hipSetDevice(device) })
 }
 
@@ -178,7 +198,7 @@ pub fn set_device(device: i32) -> Result<(), HipError> {
 /// unmaps freed pages on sync and a later hipMallocAsync can hand back an
 /// address whose backing is not yet remapped when a kernel touches it — an
 /// intermittent GPU page fault under heavy alloc/free churn (weight streaming).
-pub fn retain_mempool(device: i32) -> Result<(), HipError> {
+pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
 	let mut pool: *mut c_void = std::ptr::null_mut();
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
@@ -189,19 +209,27 @@ pub fn retain_mempool(device: i32) -> Result<(), HipError> {
 			HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD,
 			&mut threshold as *mut u64 as *mut c_void,
 		)
-	})?;
-	// Warm the pool: a fresh hipMallocAsync buffer has no committed backing until
-	// its stream processes the alloc, so an SDMA hipMemcpy into it can fault
-	// (page not present). Force-commit a large chunk, then free it — with the
-	// retain threshold set the pages stay in the pool, so later allocs reuse
-	// already-mapped memory and no copy hits an uncommitted page.
-	let mut ptr: *mut c_void = std::ptr::null_mut();
-	let warm: usize = 1usize << 30; // 1 GiB
-	check(unsafe { hipMallocAsync(&mut ptr, warm, std::ptr::null_mut()) })?;
-	check(unsafe { hipMemset(ptr, 0, warm) })?;
-	check(unsafe { hipDeviceSynchronize() })?;
-	check(unsafe { hipFreeAsync(ptr, std::ptr::null_mut()) })?;
-	check(unsafe { hipDeviceSynchronize() })
+	})
+}
+
+/// Pin the pool's release threshold and warm it (commit + retain a chunk) so no
+/// async copy faults on an uncommitted page. Idempotent — funnels through the
+/// same one-time warm that the first allocation triggers, so calling it from
+/// `init()` and allocating without `init()` both warm the pool exactly once.
+pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
+	crate::memory::ensure_pool_warmed();
+	Ok(())
+}
+
+/// Release all retained pool VRAM back to the driver. Retention (threshold=max)
+/// must not outlive the process: teardown reclaim is asynchronous, so a process
+/// launched milliseconds later (cargo's next test binary) can touch pages whose
+/// remap is still in flight — an intermittent gfxhub fault in the FIRST heavy
+/// test of the next binary. Called from gpu_shutdown's atexit hook.
+pub(crate) fn trim_mempool(device: i32) -> Result<(), HipError> {
+	let mut pool: *mut c_void = std::ptr::null_mut();
+	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+	check(unsafe { hipMemPoolTrimTo(pool, 0) })
 }
 
 pub fn peek_last_error() -> i32 {
@@ -218,36 +246,6 @@ pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 	let mut val: i32 = 0;
 	check(unsafe { hipDeviceGetAttribute(&mut val, attr, device) })?;
 	Ok(val)
-}
-
-pub unsafe fn memcpy_async(
-	dst: *mut c_void,
-	src: *const c_void,
-	size: usize,
-	kind: i32,
-	stream: *mut c_void,
-) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipMemcpyAsync(dst, src, size, kind, stream) })
-}
-
-pub unsafe fn memset_async(
-	dst: *mut c_void,
-	value: i32,
-	size: usize,
-	stream: *mut c_void,
-) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipMemsetAsync(dst, value, size, stream) })
-}
-
-pub unsafe fn memcpy_dtod(
-	dst: *mut c_void,
-	src: *const c_void,
-	size: usize,
-) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipMemcpy(dst, src, size, HIP_MEMCPY_D2D) })
 }
 
 pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
@@ -290,18 +288,6 @@ pub unsafe fn memcpy_peer(
 ) -> Result<(), HipError> {
 	// SAFETY: FFI call — caller must ensure pointer validity and size.
 	check(unsafe { hipMemcpyPeer(dst, dst_device, src, src_device, size) })
-}
-
-pub unsafe fn malloc_async(size: usize, stream: *mut c_void) -> Result<*mut c_void, HipError> {
-	let mut ptr: *mut c_void = std::ptr::null_mut();
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipMallocAsync(&mut ptr, size, stream) })?;
-	Ok(ptr)
-}
-
-pub unsafe fn free_async(ptr: *mut c_void, stream: *mut c_void) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipFreeAsync(ptr, stream) })
 }
 
 /// RAII wrapper for a HIP stream.
