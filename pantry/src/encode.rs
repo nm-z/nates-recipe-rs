@@ -346,10 +346,12 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 			.filter(|(_, c)| *c > 0)
 			.collect();
 	autopsy.sort_by(|a, b| cols_bytes(b.1).cmp(&cols_bytes(a.1)));
-	let mut line: Vec<String> = autopsy
-		.iter()
-		.map(|(nm, c)| oom_pair(nm, &format!("{} ({c})", hb(cols_bytes(*c)))))
-		.collect();
+	let mut line = vec![oom_pair(label, "too large for RAM")];
+	line.extend(
+		autopsy
+			.iter()
+			.map(|(nm, c)| oom_pair(nm, &format!("{} ({c})", hb(cols_bytes(*c))))),
+	);
 	let mut bases: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
 	for (nm, _) in top_cols.iter().filter(|(nm, _)| nm.contains("#t")) {
 		*bases.entry(nm.split("#t").next().unwrap_or(nm)).or_insert(0) += 1;
