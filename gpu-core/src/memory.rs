@@ -181,6 +181,13 @@ pub fn alloc_count_reset() -> usize {
 	ALLOC_COUNT.swap(0, Ordering::Relaxed)
 }
 
+/// Cumulative count of real device-pool allocations (`hipMallocAsync`) since
+/// process start. Steady-state proof for the streaming forward: identical before
+/// step 0 and after the last step ⇒ zero allocations churned in the hot loop.
+pub fn device_alloc_count() -> usize {
+	ALLOC_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn alloc_freeze() {
 	ALLOC_FROZEN.with(|f| f.set(true));
 }

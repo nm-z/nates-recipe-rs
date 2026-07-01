@@ -11,10 +11,10 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_gelu_mul, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial, gpu_widen_bf16,
-	gpu_widen_bf16_into,
+	gpu_gelu_mul_into, gpu_glu_gelu_into, gpu_gqa_attn_into, gpu_rmsnorm_f64_into,
+	gpu_rope_partial, gpu_widen_bf16_into,
 };
-use gpu_core::kernels::{gpu_add, gpu_copy, gpu_gemm_bt, gpu_scale};
+use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::safetensors::parse_safetensors_header;
 use std::collections::HashMap;
@@ -71,6 +71,97 @@ struct Tensor {
 
 // Largest single streamed weight: full-layer q_proj / o_proj = 8192*2816 f64.
 const MAXW: usize = 8192 * 2816;
+
+// Max per-layer projection widths across both attention geometries: q/attn use
+// full-layer qd = NQH*512 = 8192; k/v use the sliding-layer kd = 8*256 = 2048
+// (wider than the full layer's 2*512). Arena activation buffers size to these.
+const QD_MAX: usize = NQH * 512;
+const KD_MAX: usize = 8 * 256;
+// LM-head vocab tile: cn*NE f64 must fit the reused widen window (MAXW), and
+// cn*NE*2 bf16 bytes must fit the staging buffer (MAXW*2) — 8192*NE hits both exactly.
+const LM_CHUNK: usize = 8192;
+
+// Every device buffer the steady-state forward touches, allocated once at
+// `Arena::new` (after `t` is known) and reused across all 30 layers and 6 steps.
+// Sized to the maximum shape each buffer ever holds; the hot loop writes into the
+// leading `used`-element window via the `_into` ops, so no op ever allocates.
+struct Arena {
+	x: GpuBuffer,
+	q: GpuBuffer,
+	k: GpuBuffer,
+	v: GpuBuffer,
+	attn: GpuBuffer,
+	o: GpuBuffer,
+	attn_out: GpuBuffer,
+	cms: GpuBuffer,
+	g: GpuBuffer,
+	u: GpuBuffer,
+	act: GpuBuffer,
+	mlp0: GpuBuffer,
+	mlp: GpuBuffer,
+	cmoes: GpuBuffer,
+	moe_xg: GpuBuffer,
+	moe_gu: GpuBuffer,
+	moe_ea: GpuBuffer,
+	moe_dv: GpuBuffer,
+	mo: GpuBuffer,
+	mop: GpuBuffer,
+	comb: GpuBuffer,
+	ha: GpuBuffer, // ping-pong hidden state A (also holds the per-step base + canvas)
+	hb: GpuBuffer, // ping-pong hidden state B
+	soft: GpuBuffer,
+	scn: GpuBuffer,
+	sg: GpuBuffer,
+	su: GpuBuffer,
+	sa: GpuBuffer,
+	sc_add: GpuBuffer,
+	cur: GpuBuffer,
+	normed: GpuBuffer,
+	hfs: GpuBuffer,
+	lm_out: GpuBuffer,
+}
+
+impl Arena {
+	fn new(t: usize) -> Result<Arena> {
+		let c = NCANVAS;
+		let a = GpuBuffer::alloc;
+		Ok(Arena {
+			x: a(t * NE)?,
+			q: a(t * QD_MAX)?,
+			k: a(t * KD_MAX)?,
+			v: a(t * KD_MAX)?,
+			attn: a(t * QD_MAX)?,
+			o: a(t * NE)?,
+			attn_out: a(t * NE)?,
+			cms: a(t * NE)?,
+			g: a(t * NFF)?,
+			u: a(t * NFF)?,
+			act: a(t * NFF)?,
+			mlp0: a(t * NE)?,
+			mlp: a(t * NE)?,
+			cmoes: a(t * NE)?,
+			moe_xg: a(t * NE)?,
+			moe_gu: a(t * 2 * NFFE)?,
+			moe_ea: a(t * NFFE)?,
+			moe_dv: a(t * NE)?,
+			mo: a(t * NE)?,
+			mop: a(t * NE)?,
+			comb: a(t * NE)?,
+			ha: a(t * NE)?,
+			hb: a(t * NE)?,
+			soft: a(c * NE)?,
+			scn: a(c * NE)?,
+			sg: a(c * NFF)?,
+			su: a(c * NFF)?,
+			sa: a(c * NFF)?,
+			sc_add: a(c * NE)?,
+			cur: a(c * NE)?,
+			normed: a(c * NE)?,
+			hfs: a(c * NE)?,
+			lm_out: a(c * LM_CHUNK)?,
+		})
+	}
+}
 
 struct Model {
 	shards: Vec<File>,
@@ -278,43 +369,54 @@ fn xs(st: &mut u64) -> f64 {
 	(*st >> 11) as f64 / (1u64 << 53) as f64
 }
 
-// One transformer layer on GPU; returns new hidden state h (t, NE).
-fn layer(m: &Model, l: usize, h: &GpuBuffer, t: usize, prefix: usize) -> Result<GpuBuffer> {
+// One transformer layer on GPU, allocation-free: reads hidden `h_in` (t, NE),
+// writes the new hidden into `h_out` (t, NE). Every intermediate is a preallocated
+// arena buffer written through an `_into` op. RMSNorm is done in-place where the
+// input dies (kernel reads the whole row before writing, so aliasing is safe).
+fn layer(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	prefix: usize,
+	ar: &Arena,
+) -> Result<()> {
 	let nm = &m.norms[l];
 	let d = dims(l);
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, NQH * d.hd, d.nkv * d.hd);
-	// Attention. Full layers have no v_proj: v reuses the k_proj weight.
-	let x = gpu_rmsnorm_f64(h, Some(&nm["input"]), t, NE, EPS)?;
-	let q = gpu_gemm_bt(&x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, NE)?;
+	// Attention. Full layers have no v_proj: v reuses the k_proj weight window.
+	gpu_rmsnorm_f64_into(h_in, Some(&nm["input"]), &ar.x, t, NE, EPS);
+	gpu_gemm_bt_into(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, &ar.q, t, qd, NE)?;
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
-	let k = gpu_gemm_bt(&x, &wk, t, kd, NE)?;
-	let v = if d.has_v {
-		gpu_gemm_bt(&x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, NE)?
+	gpu_gemm_bt_into(&ar.x, &wk, &ar.k, t, kd, NE)?;
+	if d.has_v {
+		gpu_gemm_bt_into(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, &ar.v, t, kd, NE)?;
 	} else {
-		gpu_gemm_bt(&x, &wk, t, kd, NE)?
-	};
-	let q = gpu_rmsnorm_f64(&q, Some(&nm["q_norm"]), t * NQH, hd, EPS)?;
-	let k = gpu_rmsnorm_f64(&k, Some(&nm["k_norm"]), t * nkv, hd, EPS)?;
-	let v = gpu_rmsnorm_f64(&v, None, t * nkv, hd, EPS)?;
-	gpu_rope_partial(&q, t * NQH, hd, d.rotary, NQH, d.theta);
-	gpu_rope_partial(&k, t * nkv, hd, d.rotary, nkv, d.theta);
-	let attn = gpu_gqa_attn(&q, &k, &v, t, NQH, nkv, hd, prefix)?;
-	let o = gpu_gemm_bt(&attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, NE, qd)?;
-	let o = gpu_rmsnorm_f64(&o, Some(&nm["post_attn"]), t, NE, EPS)?;
-	let attn_out = gpu_add(&o, h, t * NE)?;
+		gpu_gemm_bt_into(&ar.x, &wk, &ar.v, t, kd, NE)?;
+	}
+	gpu_rmsnorm_f64_into(&ar.q, Some(&nm["q_norm"]), &ar.q, t * NQH, hd, EPS);
+	gpu_rmsnorm_f64_into(&ar.k, Some(&nm["k_norm"]), &ar.k, t * nkv, hd, EPS);
+	gpu_rmsnorm_f64_into(&ar.v, None, &ar.v, t * nkv, hd, EPS);
+	gpu_rope_partial(&ar.q, t * NQH, hd, d.rotary, NQH, d.theta);
+	gpu_rope_partial(&ar.k, t * nkv, hd, d.rotary, nkv, d.theta);
+	gpu_gqa_attn_into(&ar.q, &ar.k, &ar.v, &ar.attn, t, NQH, nkv, hd, prefix);
+	gpu_gemm_bt_into(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, &ar.o, t, NE, qd)?;
+	gpu_rmsnorm_f64_into(&ar.o, Some(&nm["post_attn"]), &ar.o, t, NE, EPS);
+	gpu_add_into(&ar.o, h_in, &ar.attn_out, t * NE);
 
 	// Shared MLP branch.
-	let cms = gpu_rmsnorm_f64(&attn_out, Some(&nm["pre_ff"]), t, NE, EPS)?;
-	let g = gpu_gemm_bt(&cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, t, NFF, NE)?;
-	let u = gpu_gemm_bt(&cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, t, NFF, NE)?;
-	let act = gpu_gelu_mul(&g, &u, t * NFF)?;
-	let mlp0 = gpu_gemm_bt(&act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, t, NE, NFF)?;
-	let mlp = gpu_rmsnorm_f64(&mlp0, Some(&nm["pf1"]), t, NE, EPS)?;
+	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pre_ff"]), &ar.cms, t, NE, EPS);
+	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, &ar.g, t, NFF, NE)?;
+	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, &ar.u, t, NFF, NE)?;
+	gpu_gelu_mul_into(&ar.g, &ar.u, &ar.act, t * NFF);
+	gpu_gemm_bt_into(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, &ar.mlp0, t, NE, NFF)?;
+	gpu_rmsnorm_f64_into(&ar.mlp0, Some(&nm["pf1"]), &ar.mlp, t, NE, EPS);
 
 	// MoE branch — routing + grouping on host, expert GEMMs on GPU.
-	let cmoes = gpu_rmsnorm_f64(&attn_out, Some(&nm["pn2"]), t, NE, EPS)?;
-	let ao_host = attn_out.download_vec()?;
-	let cmoes_host = cmoes.download_vec()?;
+	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pn2"]), &ar.cmoes, t, NE, EPS);
+	let ao_host = ar.attn_out.download_vec()?;
+	let cmoes_host = ar.cmoes.download_vec()?;
 	let (rw, gis, pe) = (&m.rw[l], &m.gis[l], &m.pe[l]);
 	let inv_sqrt_ne = 1.0 / (NE as f64).sqrt();
 	let mut e2p: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
@@ -336,19 +438,20 @@ fn layer(m: &Model, l: usize, h: &GpuBuffer, t: usize, prefix: usize) -> Result<
 		}
 	}
 	let mut mo_host = vec![0.0f64; t * NE];
+	let mut xg = vec![0.0f64; t * NE];
+	let mut dv_host = vec![0.0f64; t * NE];
 	for (&e, poslist) in &e2p {
 		let np = poslist.len();
-		let mut xg = vec![0.0f64; np * NE];
 		for (i, &(p, _)) in poslist.iter().enumerate() {
 			xg[i * NE..(i + 1) * NE].copy_from_slice(&cmoes_host[p * NE..(p + 1) * NE]);
 		}
-		let xg = GpuBuffer::upload(&xg)?;
+		ar.moe_xg.load(&xg[..np * NE])?;
 		let gu_w = m.stream_expert(&layer_name(l, "experts.gate_up_proj"), e, 2 * NFFE * NE)?;
-		let gu = gpu_gemm_bt(&xg, &gu_w, np, 2 * NFFE, NE)?;
-		let ea = gpu_glu_gelu(&gu, np, NFFE)?;
+		gpu_gemm_bt_into(&ar.moe_xg, &gu_w, &ar.moe_gu, np, 2 * NFFE, NE)?;
+		gpu_glu_gelu_into(&ar.moe_gu, &ar.moe_ea, np, NFFE);
 		let dn_w = m.stream_expert(&layer_name(l, "experts.down_proj"), e, NE * NFFE)?;
-		let dv = gpu_gemm_bt(&ea, &dn_w, np, NE, NFFE)?;
-		let dv_host = dv.download_vec()?;
+		gpu_gemm_bt_into(&ar.moe_ea, &dn_w, &ar.moe_dv, np, NE, NFFE)?;
+		ar.moe_dv.download(&mut dv_host[..np * NE])?;
 		for (i, &(p, w)) in poslist.iter().enumerate() {
 			let s = w * pe[e];
 			for xx in 0..NE {
@@ -356,14 +459,15 @@ fn layer(m: &Model, l: usize, h: &GpuBuffer, t: usize, prefix: usize) -> Result<
 			}
 		}
 	}
-	let mo = GpuBuffer::upload(&mo_host)?;
-	let mop = gpu_rmsnorm_f64(&mo, Some(&nm["pf2"]), t, NE, EPS)?;
+	ar.mo.load(&mo_host)?;
+	gpu_rmsnorm_f64_into(&ar.mo, Some(&nm["pf2"]), &ar.mop, t, NE, EPS);
 
 	// Combine: post_ffw_norm(mlp+moe), then (attn_out + comb) * layer_scalar.
-	let comb = gpu_add(&mlp, &mop, t * NE)?;
-	let comb = gpu_rmsnorm_f64(&comb, Some(&nm["pfw"]), t, NE, EPS)?;
-	let hplus = gpu_add(&attn_out, &comb, t * NE)?;
-	Ok(gpu_scale(&hplus, m.ls[l], t * NE)?)
+	gpu_add_into(&ar.mlp, &ar.mop, &ar.comb, t * NE);
+	gpu_rmsnorm_f64_into(&ar.comb, Some(&nm["pfw"]), &ar.comb, t, NE, EPS);
+	gpu_add_into(&ar.attn_out, &ar.comb, h_out, t * NE);
+	gpu_scale_inplace(h_out, m.ls[l], t * NE);
+	Ok(())
 }
 
 fn layer_name(l: usize, suffix: &str) -> String {
@@ -372,17 +476,19 @@ fn layer_name(l: usize, suffix: &str) -> String {
 
 // LM head: hfs (ncanvas, NE) @ emb (VOCAB, NE)^T -> host logits (ncanvas, VOCAB),
 // tiling the vocab so the widened f64 chunk stays small.
-fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize) -> Result<Vec<f64>> {
+fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec<f64>> {
 	let mut logits = vec![0.0f64; ncanvas * VOCAB];
-	let chunk = 32768usize;
+	let mut out_host = vec![0.0f64; ncanvas * LM_CHUNK];
 	let mut c0 = 0;
 	while c0 < VOCAB {
-		let cn = chunk.min(VOCAB - c0);
+		let cn = LM_CHUNK.min(VOCAB - c0);
+		// Reuse the weight-streaming windows (stage → win) — the layer loop is done
+		// for this step, so nothing else holds them. No allocation.
 		let raw = &m.emb[c0 * NE * 2..(c0 + cn) * NE * 2];
-		let g = GpuBuffer::upload_u8(raw)?;
-		let w = gpu_widen_bf16(&g, cn * NE)?;
-		let out = gpu_gemm_bt(hfs, &w, ncanvas, cn, NE)?;
-		let out_host = out.download_vec()?;
+		m.stage.write_u8(raw)?;
+		gpu_widen_bf16_into(&m.stage, &m.win, cn * NE);
+		gpu_gemm_bt_into(hfs, &m.win.view(0, cn * NE), &ar.lm_out, ncanvas, cn, NE)?;
+		ar.lm_out.download(&mut out_host[..ncanvas * cn])?;
 		for p in 0..ncanvas {
 			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
 		}
@@ -469,10 +575,19 @@ fn main() -> Result<()> {
 
 	let mut sck: Vec<Vec<(usize, f64)>> = vec![vec![]; NCANVAS];
 	let mut pred = vec![MASK as u32; NCANVAS];
+
+	// Preallocate the whole forward arena once (t is now known). After this point
+	// the hot loop allocates nothing — the acceptance invariant is that the device
+	// pool alloc count is identical before step 0 and after the last step.
+	let ar = {
+		let _t = gpu_core::memory::tag_scope("arena");
+		Arena::new(t)?
+	};
+	let allocs_before = gpu_core::memory::device_alloc_count();
 	let t0 = Instant::now();
 
 	for step in 0..6 {
-		// Host: base scaled embeddings for every position.
+		// Host: base scaled embeddings for every position → into the ping-pong A buffer.
 		let mut base = vec![0.0f64; t * NE];
 		for (p, &tk) in toks.iter().enumerate() {
 			let b = tk as usize * NE * 2;
@@ -480,12 +595,12 @@ fn main() -> Result<()> {
 				base[p * NE + x] = bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scl;
 			}
 		}
-		let mut h = GpuBuffer::upload(&base)?;
+		ar.ha.load(&base)?;
 
 		// Canvas rows: add self-conditioning (step>0) then scale-less rmsnorm.
 		let coff = prefix * NE;
 		let clen = NCANVAS * NE;
-		let cur = if step > 0 {
+		if step > 0 {
 			// soft = sum over top-8 prev (prob * emb(id)) * scl, per canvas position
 			let mut soft = vec![0.0f64; NCANVAS * NE];
 			for (c, top) in sck.iter().enumerate() {
@@ -499,31 +614,35 @@ fn main() -> Result<()> {
 					soft[c * NE + x] *= scl;
 				}
 			}
-			let soft = GpuBuffer::upload(&soft)?;
-			let scn = gpu_rmsnorm_f64(&soft, Some(&m.sc_pre), NCANVAS, NE, EPS)?;
-			let sg = gpu_gemm_bt(&scn, &m.sc_gate, NCANVAS, NFF, NE)?;
-			let su = gpu_gemm_bt(&scn, &m.sc_up, NCANVAS, NFF, NE)?;
-			let sa = gpu_gelu_mul(&sg, &su, NCANVAS * NFF)?;
-			let sc_add = gpu_gemm_bt(&sa, &m.sc_down, NCANVAS, NE, NFF)?;
-			gpu_add(&h.view(coff, clen), &sc_add, clen)?
+			ar.soft.load(&soft)?;
+			gpu_rmsnorm_f64_into(&ar.soft, Some(&m.sc_pre), &ar.scn, NCANVAS, NE, EPS);
+			gpu_gemm_bt_into(&ar.scn, &m.sc_gate, &ar.sg, NCANVAS, NFF, NE)?;
+			gpu_gemm_bt_into(&ar.scn, &m.sc_up, &ar.su, NCANVAS, NFF, NE)?;
+			gpu_gelu_mul_into(&ar.sg, &ar.su, &ar.sa, NCANVAS * NFF);
+			gpu_gemm_bt_into(&ar.sa, &m.sc_down, &ar.sc_add, NCANVAS, NE, NFF)?;
+			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, &ar.cur, clen);
+			gpu_rmsnorm_f64_into(&ar.cur, None, &ar.normed, NCANVAS, NE, EPS);
 		} else {
-			gpu_copy(&h.view(coff, clen), clen)?
-		};
-		let normed = gpu_rmsnorm_f64(&cur, None, NCANVAS, NE, EPS)?;
-		h.view(coff, clen).copy_from(&normed, clen * 8)?;
-
-		// 30 transformer layers.
-		for l in 0..NL {
-			h = layer(&m, l, &h, t, prefix)?;
+			gpu_rmsnorm_f64_into(&ar.ha.view(coff, clen), None, &ar.normed, NCANVAS, NE, EPS);
 		}
-		let nan = h.download_vec()?.iter().filter(|v| !v.is_finite()).count();
+		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
+
+		// 30 transformer layers, ping-ponging the hidden state between ha/hb.
+		let mut src: &GpuBuffer = &ar.ha;
+		let mut dst: &GpuBuffer = &ar.hb;
+		for l in 0..NL {
+			layer(&m, l, src, dst, t, prefix, &ar)?;
+			std::mem::swap(&mut src, &mut dst);
+		}
+		let hbuf = src; // last buffer written
+		let nan = hbuf.download_vec()?.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {
 			bail!("step {step}: {nan} non-finite in h after layers");
 		}
 
 		// LM head over canvas positions.
-		let hfs = gpu_rmsnorm_f64(&h.view(coff, clen), Some(&m.decoder_norm), NCANVAS, NE, EPS)?;
-		let logits = lm_head(&m, &hfs, NCANVAS)?;
+		gpu_rmsnorm_f64_into(&hbuf.view(coff, clen), Some(&m.decoder_norm), &ar.hfs, NCANVAS, NE, EPS);
+		let logits = lm_head(&m, &ar.hfs, NCANVAS, &ar)?;
 
 		// Sample each canvas position (top-50, temperature, xorshift) — host.
 		let temp = 1.0 - 0.7 * (step as f64 / 6.0);
@@ -565,6 +684,9 @@ fn main() -> Result<()> {
 		let text: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
 		eprintln!("step {step} ({:.0}s): {text}", t0.elapsed().as_secs_f64());
 	}
+
+	let allocs_after = gpu_core::memory::device_alloc_count();
+	eprintln!("steady-state allocs: {}", allocs_after - allocs_before);
 
 	let out: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
 	println!("\n=== OUTPUT ===\n{out}");

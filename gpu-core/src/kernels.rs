@@ -1675,6 +1675,21 @@ pub fn gpu_gemm_bt(
 	k: usize,
 ) -> Result<GpuBuffer, HipError> {
 	let c = GpuBuffer::alloc(m * n)?;
+	gpu_gemm_bt_into(a, b, &c, m, n, k)?;
+	Ok(c)
+}
+
+/// `gpu_gemm_bt` into a caller-owned `c` (`m×n`, no alloc). `beta = 0` so `c` is
+/// fully overwritten; `c` must be distinct from `a`/`b`. The streaming-inference
+/// hot loop calls this to keep steady-state device allocations at zero.
+pub fn gpu_gemm_bt_into(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	c: &GpuBuffer,
+	m: usize,
+	n: usize,
+	k: usize,
+) -> Result<(), HipError> {
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	let status = unsafe {
@@ -1695,8 +1710,7 @@ pub fn gpu_gemm_bt(
 			n as i32,
 		)
 	};
-	check(status)?;
-	Ok(c)
+	check(status)
 }
 
 /// GPU Cholesky solve: solve A x = b where A is symmetric positive-definite (n x n).
@@ -2325,16 +2339,23 @@ pub fn gpu_relu_backward_into(grad: &GpuBuffer, act: &GpuBuffer, out: &GpuBuffer
 
 pub fn gpu_add(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n)?;
+	gpu_add_into(a, b, &out, n);
+	Ok(out)
+}
+
+/// `out = a + b` into a caller-owned buffer (no alloc). Aliasing `out == a` or
+/// `out == b` is safe — thread `i` reads `a[i]`/`b[i]` before writing `out[i]`.
+pub fn gpu_add_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) {
 	unsafe {
 		launch_add(
 			a.ptr as *const c_void,
 			b.ptr as *const c_void,
-			out.ptr,
+			out.ptr as *mut c_void,
 			n as i32,
 			std::ptr::null_mut(),
 		);
 	}
-	Ok(out)
+	check_launch();
 }
 
 pub fn gpu_add_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, HipError> {

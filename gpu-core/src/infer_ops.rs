@@ -100,6 +100,21 @@ pub fn gpu_rmsnorm_f64(
 	eps: f64,
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(rows * cols)?;
+	gpu_rmsnorm_f64_into(x, gamma, &out, rows, cols, eps);
+	Ok(out)
+}
+
+/// RMSNorm into a caller-owned `out` (no alloc). Aliasing `out == x` is safe:
+/// every thread reads all its `x` columns into the sum-of-squares before the
+/// block barrier, and only then writes `out`, so an in-place norm is well-defined.
+pub fn gpu_rmsnorm_f64_into(
+	x: &GpuBuffer,
+	gamma: Option<&GpuBuffer>,
+	out: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	eps: f64,
+) {
 	let gptr = gamma.map(|g| g.ptr_raw() as *const c_void).unwrap_or(std::ptr::null());
 	unsafe {
 		launch_normx_rmsnorm(
@@ -113,7 +128,6 @@ pub fn gpu_rmsnorm_f64(
 		);
 	}
 	check_launch();
-	Ok(out)
 }
 
 /// GQA attention. `q` is `(t, nqh*hd)`, `k`/`v` are `(t, nkv*hd)`, all f64
@@ -130,6 +144,23 @@ pub fn gpu_gqa_attn(
 	prefix: usize,
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(t * nqh * hd)?;
+	gpu_gqa_attn_into(q, k, v, &out, t, nqh, nkv, hd, prefix);
+	Ok(out)
+}
+
+/// GQA attention into a caller-owned `out` `(t, nqh*hd)` (no alloc). `out` must
+/// be distinct from `q`/`k`/`v` — each block reads the whole q/k/v sequence.
+pub fn gpu_gqa_attn_into(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	nqh: usize,
+	nkv: usize,
+	hd: usize,
+	prefix: usize,
+) {
 	unsafe {
 		launch_gqa_masked_attn(
 			q.ptr_raw() as *const c_void,
@@ -145,26 +176,37 @@ pub fn gpu_gqa_attn(
 		);
 	}
 	check_launch();
-	Ok(out)
 }
 
 /// Elementwise `out = gelu(a) * b` (tanh-approx GELU), `n` elements.
 pub fn gpu_gelu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n)?;
+	gpu_gelu_mul_into(a, b, &out, n);
+	Ok(out)
+}
+
+/// `out = gelu(a) * b` into a caller-owned buffer (no alloc). Aliasing `out == a`
+/// or `out == b` is safe — thread `i` reads `a[i]`/`b[i]` before writing `out[i]`.
+pub fn gpu_gelu_mul_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) {
 	unsafe {
 		launch_gelu_mul(a.ptr_raw() as *const c_void, b.ptr_raw() as *const c_void, out.ptr_raw(), n as i64, std::ptr::null_mut());
 	}
 	check_launch();
-	Ok(out)
 }
 
 /// Fused gate|up split: `in` is `(rows, 2*half)` = `[gate | up]` per row;
 /// returns `(rows, half)` with `gelu(gate) * up`.
 pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(rows * half)?;
+	gpu_glu_gelu_into(input, &out, rows, half);
+	Ok(out)
+}
+
+/// Gated-GELU split into a caller-owned `out` `(rows, half)` (no alloc). `out`
+/// must be distinct from `input` (different shape: input is `(rows, 2*half)`).
+pub fn gpu_glu_gelu_into(input: &GpuBuffer, out: &GpuBuffer, rows: usize, half: usize) {
 	unsafe {
 		launch_glu_gelu(input.ptr_raw() as *const c_void, out.ptr_raw(), rows as i32, half as i32, std::ptr::null_mut());
 	}
 	check_launch();
-	Ok(out)
 }
