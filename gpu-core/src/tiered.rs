@@ -187,6 +187,30 @@ impl Tiered {
             let n_pg = b.div_ceil(P);
             let n_vram = n_pg.min(budgets.n_v);
             let n_ram = (n_pg - n_vram).min(budgets.n_r);
+            Ok(Self::build(b, n_pg, n_vram, n_ram, budgets, spill))
+      }
+
+      /// Test-only: lay a buffer out with explicit per-tier resident caps, so a
+      /// small buffer can be forced to span all three tiers on a machine with
+      /// gigabytes of headroom. Budgets are still measured (for the record) but the
+      /// caps override the resident split.
+      #[cfg(test)]
+      pub(crate) fn alloc_capped(b: usize, n_v: usize, n_r: usize, spill: &Path) -> Self {
+            let budgets = Budgets::measure(0, 0, spill);
+            let n_pg = b.div_ceil(P);
+            let n_vram = n_pg.min(n_v);
+            let n_ram = (n_pg - n_vram).min(n_r);
+            Self::build(b, n_pg, n_vram, n_ram, budgets, spill)
+      }
+
+      fn build(
+            b: usize,
+            n_pg: usize,
+            n_vram: usize,
+            n_ram: usize,
+            budgets: Budgets,
+            spill: &Path,
+      ) -> Self {
             let n_disk = n_pg - n_vram - n_ram;
 
             // VRAM tier: reserve one contiguous VA window, create+map `n_vram`
@@ -224,7 +248,7 @@ impl Tiered {
                   res.push(Residence::Disk((i * P) as u64));
             }
 
-            Ok(Tiered {
+            Tiered {
                   b,
                   n_pg,
                   res,
@@ -236,7 +260,7 @@ impl Tiered {
                   ram,
                   disk,
                   spill_path: spill.to_path_buf(),
-            })
+            }
       }
 
       pub fn budgets(&self) -> Budgets {
@@ -313,6 +337,56 @@ impl Tiered {
 
       pub fn sync(&self) -> Result<(), HipError> {
             hip::device_synchronize()
+      }
+
+      /// Stage a contiguous run of pages `[first_page, first_page+n_pages)` into the
+      /// device `window` (contiguous, ≥ `n_pages·P` bytes), gathering each page from
+      /// its home tier — VRAM→D2D, RAM→H2D, disk→read+H2D. This is the sequential
+      /// sweep's access: the row-tiled GEMM consumes `window` as one contiguous
+      /// device block. `window` is the fixed staging buffer of G3; home pages never
+      /// move, so there is no writeback and read-only pages evict as a drop.
+      pub fn stage_into(&self, first_page: usize, n_pages: usize, window: *mut c_void) {
+            let mut disk_scratch = vec![0u8; P];
+            for k in 0..n_pages {
+                  let p = first_page + k;
+                  if p >= self.n_pg {
+                        break;
+                  }
+                  let bytes = P.min(self.b - p * P);
+                  let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
+                  // SAFETY: dst is the k-th P-window of `window`; src per tier is a
+                  // valid P-region; `bytes` ≤ P.
+                  match self.res[p] {
+                        Residence::Vram(s) => unsafe {
+                              let src = (self.va as *mut u8).add(s as usize * P) as *const c_void;
+                              hip::memcpy_async(dst, src, bytes, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+                                    .expect("stage D2D");
+                        },
+                        Residence::Ram(i) => unsafe {
+                              let src = self.ram[i as usize].as_ptr() as *const c_void;
+                              hip::memcpy_async(dst, src, bytes, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
+                                    .expect("stage H2D");
+                        },
+                        Residence::Disk(off) => {
+                              self.disk
+                                    .as_ref()
+                                    .expect("disk tier")
+                                    .read_exact_at(&mut disk_scratch[..bytes], off)
+                                    .expect("stage read");
+                              // SAFETY: scratch holds `bytes` valid host bytes.
+                              unsafe {
+                                    hip::memcpy_async(
+                                          dst,
+                                          disk_scratch.as_ptr() as *const c_void,
+                                          bytes,
+                                          hip::HIP_MEMCPY_H2D,
+                                          std::ptr::null_mut(),
+                                    )
+                                    .expect("stage disk H2D");
+                              }
+                        },
+                  }
+            }
       }
 }
 
@@ -396,6 +470,51 @@ mod tests {
                         assert_eq!(c, cap);
                   }
                   Ok(_) => panic!("admitted a buffer over the ceiling"),
+            }
+      }
+
+      #[test]
+      fn stage_across_three_tiers() {
+            hip::set_device(0).expect("set device");
+            let spill = Path::new("/tmp/tiered_3tier.spill");
+            let pages = 6usize;
+            let bytes = pages * P;
+            // Allocate + prove the window BEFORE any VMM buffer exists, to bisect
+            // whether VMM setup corrupts the stream-ordered pool.
+            let window = unsafe { hip::malloc_async(bytes, std::ptr::null_mut()).expect("window") };
+            // Force 2 pages per tier so the sweep exercises VRAM, RAM, and disk.
+            let mut t = Tiered::alloc_capped(bytes, 2, 2, spill);
+            assert_eq!(t.pages(), pages);
+            assert!(!t.is_contiguous_vram(), "capped buffer must span >1 tier");
+            let mut src = vec![0u8; bytes];
+            for p in 0..pages {
+                  for i in 0..P {
+                        src[p * P + i] = (p as u8).wrapping_add(1);
+                  }
+            }
+            t.fill(&src);
+            t.sync().expect("sync");
+            // Stage every page into a contiguous device window, read it back, verify
+            // each page survived a round trip through its home tier.
+            t.stage_into(0, pages, window);
+            hip::device_synchronize().expect("sync");
+            let mut back = vec![0u8; bytes];
+            // SAFETY: window covers `bytes`; back owns `bytes`.
+            unsafe {
+                  hip::memcpy_async(
+                        back.as_mut_ptr() as *mut c_void,
+                        window,
+                        bytes,
+                        hip::HIP_MEMCPY_D2H,
+                        std::ptr::null_mut(),
+                  )
+                  .expect("D2H");
+            }
+            hip::device_synchronize().expect("sync");
+            for p in 0..pages {
+                  let m = (p as u8).wrapping_add(1);
+                  assert_eq!(back[p * P], m, "page {p} head");
+                  assert_eq!(back[p * P + P - 1], m, "page {p} tail");
             }
       }
 
