@@ -1,10 +1,82 @@
 use crate::hip::*;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+// Live device bytes per purpose-tag. On a VRAM OOM we dump this so the failure
+// names what is on the card (data / weights / scratch / other), not just a size.
+static TAG_BYTES: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
+
+thread_local! {
+	static CURRENT_TAG: Cell<&'static str> = const { Cell::new("other") };
+}
+
+/// Sets the purpose-tag for every allocation made while it is alive; restores
+/// the previous tag on drop. Wrap an allocation phase: `let _t = tag_scope("data");`.
+pub struct TagScope(&'static str);
+
+pub fn tag_scope(name: &'static str) -> TagScope {
+	let prev = CURRENT_TAG.with(|t| t.replace(name));
+	TagScope(prev)
+}
+
+impl Drop for TagScope {
+	fn drop(&mut self) {
+		CURRENT_TAG.with(|t| t.set(self.0));
+	}
+}
+
+fn tag_add(tag: &'static str, n: usize) {
+	if let Ok(mut m) = TAG_BYTES.lock() {
+		*m.entry(tag).or_insert(0) += n;
+	}
+}
+
+fn tag_sub(tag: &'static str, n: usize) {
+	if let Ok(mut m) = TAG_BYTES.lock() {
+		let e = m.entry(tag).or_insert(0);
+		*e = e.saturating_sub(n);
+	}
+}
+
+fn fmt_bytes(b: usize) -> String {
+	const K: f64 = 1024.0;
+	let f = b as f64;
+	if f >= K * K * K {
+		format!("{:.2} GB", f / (K * K * K))
+	} else if f >= K * K {
+		format!("{:.2} MB", f / (K * K))
+	} else if f >= K {
+		format!("{:.2} KB", f / K)
+	} else {
+		format!("{b} B")
+	}
+}
+
+fn oom_pair(name: &str, val: &str) -> String {
+	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
+}
+
+// One-line VRAM autopsy: live tags largest-first, then request/free/total/over.
+fn oom_report(req: usize) {
+	let (free, total) = crate::hip::mem_info().unwrap_or((0, 0));
+	let mut autopsy: Vec<(&'static str, usize)> = TAG_BYTES
+		.lock()
+		.map(|m| m.iter().map(|(k, v)| (*k, *v)).filter(|(_, v)| *v > 0).collect())
+		.unwrap_or_default();
+	autopsy.sort_by(|a, b| b.1.cmp(&a.1));
+	let mut line: Vec<String> = autopsy.iter().map(|(k, v)| oom_pair(k, &fmt_bytes(*v))).collect();
+	line.push(oom_pair("req", &fmt_bytes(req)));
+	line.push(oom_pair("free", &fmt_bytes(free)));
+	line.push(oom_pair("total", &fmt_bytes(total)));
+	line.push(oom_pair("over", &fmt_bytes(req.saturating_sub(free))));
+	eprintln!("{}", line.join(", "));
+}
 
 pub fn mark_shutting_down() {
       SHUTTING_DOWN.store(true, Ordering::SeqCst);
@@ -50,6 +122,7 @@ pub struct GpuBuffer {
 	pub(crate) ptr: *mut c_void,
 	len: usize,
 	owned: bool,
+	tag: &'static str,
 }
 
 // SAFETY: HIP device pointers are thread-safe; the runtime serializes kernel launches per-stream.
@@ -62,6 +135,7 @@ impl GpuBuffer {
 			ptr,
 			len,
 			owned: false,
+			tag: "borrow",
 		}
 	}
 
@@ -77,6 +151,7 @@ impl GpuBuffer {
 			)
 		});
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+		let tag = CURRENT_TAG.with(|t| t.get());
 		let base = ARENA_BASE.load(Ordering::Relaxed);
 		if base != 0 {
 			let size = ARENA_SIZE.load(Ordering::Relaxed);
@@ -91,10 +166,12 @@ impl GpuBuffer {
 				) {
 					Ok(_) => {
 						let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
+						tag_add(tag, n_bytes);
 						return Ok(Self {
 							ptr,
 							len: n_bytes,
 							owned: false,
+							tag,
 						});
 					}
 					Err(cur) => off = cur,
@@ -102,11 +179,17 @@ impl GpuBuffer {
 			}
 		}
 		let mut ptr: *mut c_void = std::ptr::null_mut();
-		check(unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) })?;
+		let code = unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) };
+		if code == 2 {
+			oom_report(n_bytes);
+		}
+		check(code)?;
+		tag_add(tag, n_bytes);
 		Ok(Self {
 			ptr,
 			len: n_bytes,
 			owned: true,
+			tag,
 		})
 	}
 
@@ -367,6 +450,7 @@ impl GpuBuffer {
 impl Drop for GpuBuffer {
 	fn drop(&mut self) {
 		if self.owned && !self.ptr.is_null() && !SHUTTING_DOWN.load(Ordering::Relaxed) {
+			tag_sub(self.tag, self.len);
 			unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 			self.ptr = std::ptr::null_mut();
 		}

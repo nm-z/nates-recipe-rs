@@ -763,6 +763,7 @@ impl ModelInner {
 			0
 		};
 		let start = std::time::Instant::now();
+		let _t_data = gpu_core::memory::tag_scope("data");
 		let (xraw, n, d) = upload(&xinput);
 		// Text token ids pass RAW to the embed lookup (no z-score). The categorical
 		// branch IS z-scored on the train set (raw frequency-encoded columns span
@@ -843,14 +844,17 @@ impl ModelInner {
 		// Build every layer's params, consuming parsed checkpoint blocks when try_resume.
 		// A shape/order mismatch returns Err(reason) (not abort) so the caller can prompt.
 		// `si` indexes blocks: one per embed/attn layer, one per dense neuron, in order.
-		let params = match build_layer_params(&self.specs, d, c_cat, vocab, &resumed, did_resume) {
-			Ok(p) => p,
-			Err(what) => {
-				if ask_overwrite(&what) {
-					did_resume = false;
-					build_layer_params(&self.specs, d, c_cat, vocab, &resumed, false).unwrap_or_else(|e| panic!("{e}"))
-				} else {
-					panic!("checkpoint mismatch — user declined overwrite");
+		let params = {
+			let _t_weights = gpu_core::memory::tag_scope("weights");
+			match build_layer_params(&self.specs, d, c_cat, vocab, &resumed, did_resume) {
+				Ok(p) => p,
+				Err(what) => {
+					if ask_overwrite(&what) {
+						did_resume = false;
+						build_layer_params(&self.specs, d, c_cat, vocab, &resumed, false).unwrap_or_else(|e| panic!("{e}"))
+					} else {
+						panic!("checkpoint mismatch — user declined overwrite");
+					}
 				}
 			}
 		};
@@ -947,7 +951,10 @@ impl ModelInner {
 		};
 		// Activation + gradient buffers, allocated once and reused every epoch
 		// so steady-state VRAM is flat (no per-epoch sawtooth).
-		let sc = Scratch::new(&params, n, false);
+		let sc = {
+			let _t_scratch = gpu_core::memory::tag_scope("scratch");
+			Scratch::new(&params, n, false)
+		};
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {

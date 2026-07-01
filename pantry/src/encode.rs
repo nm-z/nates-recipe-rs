@@ -311,9 +311,13 @@ fn encode(
 	)
 }
 
+fn oom_pair(name: &str, val: &str) -> String {
+	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
+}
+
 /// Single RAM guard for both the per-group encode and the cross-group selection:
-/// if `n × w × 8B` would exceed 90% of available memory, print the projected
-/// size and the biggest one-hot expansions (`top_cols`), then panic. `label`
+/// if `n × w × 8B` would exceed 90% of available memory, print a one-line memory
+/// autopsy (largest bucket first) built from `top_cols`, then panic. `label`
 /// names the matrix in the message ("encoded" vs "selection").
 fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 	let bytes = n
@@ -323,18 +327,40 @@ fn check_ram(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 	if bytes <= avail / 10 * 9 {
 		return;
 	}
-	let mut top = top_cols.to_vec();
-	top.sort_by(|a, b| b.1.cmp(&a.1));
-	eprintln!("\x1b[1;31m{label} matrix too large for RAM\x1b[0m");
-	eprintln!(
-		"    {n} rows × {w} cols × 8B = {} (available {})",
-		crate::data::human_bytes(bytes),
-		crate::data::human_bytes(avail)
-	);
-	eprintln!("    biggest one-hot expansions:");
-	for (col, cnt) in top.iter().take(5) {
-		eprintln!("        {col}  →  {cnt} columns");
+	let hb = crate::data::human_bytes;
+	let cols_bytes = |c: usize| c.saturating_mul(n).saturating_mul(8);
+	let tokens_cols: usize = top_cols
+		.iter()
+		.filter(|(nm, _)| nm.contains("#t"))
+		.map(|(_, c)| *c)
+		.sum();
+	let onehot_cols: usize = top_cols.iter().filter(|(_, c)| *c > 1).map(|(_, c)| *c).sum();
+	let scalar_cols: usize = top_cols
+		.iter()
+		.filter(|(nm, c)| *c == 1 && !nm.contains("#t"))
+		.map(|(_, c)| *c)
+		.sum();
+	let mut autopsy: Vec<(&str, usize)> =
+		[("tokens", tokens_cols), ("scalar", scalar_cols), ("onehot", onehot_cols)]
+			.into_iter()
+			.filter(|(_, c)| *c > 0)
+			.collect();
+	autopsy.sort_by(|a, b| cols_bytes(b.1).cmp(&cols_bytes(a.1)));
+	let mut line: Vec<String> = autopsy
+		.iter()
+		.map(|(nm, c)| oom_pair(nm, &format!("{} ({c})", hb(cols_bytes(*c)))))
+		.collect();
+	let mut bases: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+	for (nm, _) in top_cols.iter().filter(|(nm, _)| nm.contains("#t")) {
+		*bases.entry(nm.split("#t").next().unwrap_or(nm)).or_insert(0) += 1;
 	}
+	line.push(oom_pair("rows", &n.to_string()));
+	line.push(oom_pair("free", &hb(avail)));
+	line.push(oom_pair("over", &hb(bytes.saturating_sub(avail))));
+	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
+		line.push(oom_pair("widest", &format!("{base}×{seq}")));
+	}
+	eprintln!("{}", line.join(", "));
 	panic!(
 		"{label} matrix too large for RAM: {n} rows × {w} cols × 8B = {} (available {})",
 		crate::data::human_bytes(bytes),

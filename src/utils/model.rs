@@ -1041,7 +1041,10 @@ mod metric_gpu_tests {
 		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
 		let out_ref = download_vec(&sc_ref.acts[last], n);
 		drop(sc_ref);
-		let sc = Scratch::new(&params, n, false);
+		let sc = {
+			let _t_scratch = gpu_core::memory::tag_scope("scratch");
+			Scratch::new(&params, n, false)
+		};
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let out_into = download_vec(&sc.acts[last], n);
 		let fwd_diff = out_ref
