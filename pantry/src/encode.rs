@@ -224,15 +224,30 @@ fn encode(
 
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
+	// Attention is O(seq²) per row in both memory and compute; an unbounded text
+	// column (e.g. a 9641-token LLM response) makes a single row's score matrix tens
+	// of GB. Bound the token sequence to a context window — a no-op for ordinary
+	// short text (rows under the window keep their full length), a truncation only
+	// for the long-form outliers that would otherwise be untrainable.
 	let text_seq_lens: Vec<usize> = attrs
 		.iter()
 		.enumerate()
 		.map(|(ai, a)| match &a.kind {
-			Kind::Text(_) if !is_skip(ai) => rows
-				.iter()
-				.map(|row| tokenize(cell(row, ai)).count())
-				.max()
-				.unwrap_or(1),
+			Kind::Text(_) if !is_skip(ai) => {
+				let raw = rows
+					.iter()
+					.map(|row| tokenize(cell(row, ai)).count())
+					.max()
+					.unwrap_or(1);
+				let capped = raw.min(crate::TEXT_CONTEXT);
+				if raw > capped {
+					eprintln!(
+						"    \x1b[33mcontext\x1b[0m  {} tokens/{} → capped to {capped}",
+						raw, a.name
+					);
+				}
+				capped
+			}
 			_ => 0,
 		})
 		.collect();

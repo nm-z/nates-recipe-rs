@@ -8,6 +8,12 @@
 pub type Mat = ndarray::Array2<f64>;
 pub type Vec1 = ndarray::Array1<f64>;
 
+/// Token-sequence context window for Text columns. Attention is O(seq²) per row,
+/// so a single unbounded long-form cell (e.g. a multi-thousand-token LLM response)
+/// would blow up the score matrix; the encoder caps each Text column's sequence
+/// length to this. A no-op for ordinary short text, a truncation only for outliers.
+pub const TEXT_CONTEXT: usize = 256;
+
 pub mod bpe;
 pub mod data;
 pub mod detect;
