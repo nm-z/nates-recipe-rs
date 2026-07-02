@@ -54,3 +54,4 @@ examples/*/test_images/
 *.kate-swp
 /*.patch
 /deleted-copilot-branches-*.txt
+.recipe_spill

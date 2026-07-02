@@ -76,7 +76,20 @@ impl Scratch {
 	/// they're never read in a forward pass — so inference allocates ~half the VRAM
 	/// of training (no second `a_dsum`, no `da`/`dw`/grad mirrors).
 	pub fn new(params: &[LayerParams], n: usize, forward_only: bool) -> Scratch {
-		let bw = |sz: usize| if forward_only { 1 } else { sz };
+		Self::new_inner(params, n, forward_only, false)
+	}
+
+	/// Out-of-core companion: ONLY what the fit loop reads directly — the last
+	/// layer output (metrics/loss), metric buffers, reduce workspace, embed_grad,
+	/// streams and pinned scalars. Every big full-batch buffer is len-1; the Ooc
+	/// owns the real ones with waterfall homes.
+	pub fn new_light(params: &[LayerParams], n: usize) -> Scratch {
+		Self::new_inner(params, n, false, true)
+	}
+
+	fn new_inner(params: &[LayerParams], n: usize, forward_only: bool, light: bool) -> Scratch {
+		let bw = move |sz: usize| if forward_only { 1 } else { sz };
+		let lt = move |sz: usize| if light { 1 } else { sz };
 		// On OOM, report the buffer name and the size it tried to grab (f64 count →
 		// bytes) instead of a bare HipError(2) — full-batch attention scores dominate.
 		let alloc = |sz: usize, label: &str| -> GpuBuffer {
@@ -179,7 +192,7 @@ impl Scratch {
 		let mut acts = Vec::with_capacity(params.len());
 		let mut preact = Vec::with_capacity(params.len());
 		for p in params {
-			acts.push(alloc(n * p.out_dim, "scratch acts"));
+			acts.push(alloc(if light && acts.len() + 1 != params.len() { 1 } else { n * p.out_dim }, "scratch acts"));
 			let needs_pre = matches!(
 				p.act,
 				Activation::Silu
@@ -187,7 +200,7 @@ impl Scratch {
 					| Activation::Selu | Activation::PRelu
 			);
 			preact.push(alloc(
-				if needs_pre { n * p.out_dim } else { 1 },
+				if needs_pre { lt(n * p.out_dim) } else { 1 },
 				"scratch preact",
 			));
 		}
@@ -210,7 +223,7 @@ impl Scratch {
 				if fsz > max_conv_fsz { max_conv_fsz = fsz; }
 			}
 		}
-		let (conv_temp_buf, conv_wg_count) = if !forward_only && max_conv_fsz > 0 {
+		let (conv_temp_buf, conv_wg_count) = if !forward_only && !light && max_conv_fsz > 0 {
 			let (mut free, mut total) = (0usize, 0usize);
 			unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
 			let usable = free / 2;
@@ -226,12 +239,12 @@ impl Scratch {
 		Scratch {
 			acts,
 			preact,
-			da_a: alloc(bw(max_act), "da_a"),
-			da_b: alloc(bw(max_act), "da_b"),
-			dz: alloc(bw(max_act), "dz"),
-			dw: alloc(bw(max_wt), "dw"),
-			dw_partials: alloc(bw(max_dw_partials), "dw_partials"),
-			db: alloc(bw(max_bias), "db"),
+			da_a: alloc(lt(bw(max_act)), "da_a"),
+			da_b: alloc(lt(bw(max_act)), "da_b"),
+			dz: alloc(lt(bw(max_act)), "dz"),
+			dw: alloc(lt(bw(max_wt)), "dw"),
+			dw_partials: alloc(lt(bw(max_dw_partials)), "dw_partials"),
+			db: alloc(lt(bw(max_bias)), "db"),
 			metric_t0: alloc(out_elems, "metric_t0"),
 			metric_t1: alloc(out_elems, "metric_t1"),
 			metric_t2: alloc(out_elems, "metric_t2"),
@@ -244,25 +257,25 @@ impl Scratch {
 				)
 			}),
 			embed_grad: alloc(bw(max_embed_grad), "embed_grad"),
-			a_q: alloc(max_seqd, "a_q"),
-			a_k: alloc(max_seqd, "a_k"),
-			a_v: alloc(max_seqd, "a_v"),
-			a_ctx: alloc(max_seqd, "a_ctx"),
+			a_q: alloc(lt(max_seqd), "a_q"),
+			a_k: alloc(lt(max_seqd), "a_k"),
+			a_v: alloc(lt(max_seqd), "a_v"),
+			a_ctx: alloc(lt(max_seqd), "a_ctx"),
 			// Training flash forward writes the per-row logsumexp here for the
 			// backward tile recompute; inference never needs it.
-			a_lse: alloc(if forward_only { 1 } else { max_lse }, "a_lse"),
-			a_dctx: alloc(bw(max_seqd), "a_dctx"),
-			a_dq: alloc(bw(max_seqd), "a_dq"),
-			a_dk: alloc(bw(max_seqd), "a_dk"),
-			a_dv: alloc(bw(max_seqd), "a_dv"),
-			a_dsum: alloc(bw(max_lse), "a_dsum"),
+			a_lse: alloc(if forward_only || light { 1 } else { max_lse }, "a_lse"),
+			a_dctx: alloc(lt(bw(max_seqd)), "a_dctx"),
+			a_dq: alloc(lt(bw(max_seqd)), "a_dq"),
+			a_dk: alloc(lt(bw(max_seqd)), "a_dk"),
+			a_dv: alloc(lt(bw(max_seqd)), "a_dv"),
+			a_dsum: alloc(lt(bw(max_lse)), "a_dsum"),
 			a_gw: alloc(bw(max_dd), "a_gw"),
 			a_dbias: alloc(bw(max_dd), "a_dbias"),
-			prelu_t0: alloc(bw(if has_prelu { max_act } else { 1 }), "prelu_t0"),
-			prelu_t1: alloc(bw(if has_prelu { max_act } else { 1 }), "prelu_t1"),
+			prelu_t0: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t0"),
+			prelu_t1: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t1"),
 			prelu_scalar: alloc(1, "prelu_scalar"),
-			concat: alloc(concat_sz, "concat"),
-			concat_dgrad: alloc(bw(concat_grad_sz), "concat_dgrad"),
+			concat: alloc(lt(concat_sz), "concat"),
+			concat_dgrad: alloc(lt(bw(concat_grad_sz)), "concat_dgrad"),
 			conv_temp: conv_temp_buf,
 			conv_wg: conv_wg_count,
 			infer: forward_only,

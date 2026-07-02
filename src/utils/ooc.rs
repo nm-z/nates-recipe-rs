@@ -1,0 +1,768 @@
+//! Out-of-core training: the waterfall applied to the fit loop. When the
+//! full-batch scratch exceeds free VRAM, every big buffer gets a HOME laid out
+//! strictly VRAM → RAM → DISK (one spill file), and each op streams
+//! sample-aligned windows through a fixed pool of device staging buffers. The
+//! math stays full-batch: every sample flows through every op each epoch,
+//! weight gradients are tiled reductions over windows (the split-K pattern one
+//! level up), and SGD updates once per epoch.
+
+use crate::model::ModelInner;
+use gpu_core::kernels;
+use gpu_core::memory::GpuBuffer;
+use recipe_infer::{
+	Activation, ELU_ALPHA, LEAKY_ALPHA, LayerKind, LayerParams, Loss, Scratch, download_scalar,
+};
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileExt;
+
+thread_local! {
+	static HOST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn mem_available() -> usize {
+	std::fs::read_to_string("/proc/meminfo")
+		.ok()
+		.and_then(|s| {
+			s.lines()
+				.find(|l| l.starts_with("MemAvailable:"))
+				.and_then(|l| l.split_whitespace().nth(1))
+				.and_then(|v| v.parse::<usize>().ok())
+		})
+		.map_or(0, |kb| kb.saturating_mul(1024))
+}
+
+fn disk_free(path: &std::path::Path) -> usize {
+	let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+		return 0;
+	};
+	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+	if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+		return 0;
+	}
+	(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
+}
+
+fn view(b: &GpuBuffer, byte_off: usize, byte_len: usize) -> GpuBuffer {
+	GpuBuffer::borrow(
+		unsafe { (b.ptr_raw() as *mut u8).add(byte_off) as *mut c_void },
+		byte_len,
+	)
+}
+
+fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
+	(0..n.div_ceil(c)).map(move |i| (i * c, c.min(n - i * c)))
+}
+
+enum Home {
+	Vram(GpuBuffer),
+	Ram(Vec<u8>),
+	Disk(u64), // byte offset in the shared spill file
+}
+
+/// One full-batch logical buffer, [n × spb] f64, homed by the waterfall. `spb`
+/// (f64s per sample) can change when a ping-pong buffer is reused at another
+/// width — bytes are always packed at the current width.
+struct Paged {
+	home: Home,
+	spb: usize,
+}
+
+impl Paged {
+	fn bytes(&self, samples: usize) -> usize {
+		samples * self.spb * 8
+	}
+	/// Device view of samples [s0, s0+cnt): VRAM homes return an offset view
+	/// (zero copies); RAM/DISK homes stage into `win` first.
+	fn read(&self, s0: usize, cnt: usize, win: &GpuBuffer, spill: &File) -> GpuBuffer {
+		let (off, len) = (self.bytes(s0), self.bytes(cnt));
+		match &self.home {
+			Home::Vram(b) => view(b, off, len),
+			Home::Ram(v) => {
+				win.write_u8(&v[off..off + len]).expect("ooc H2D");
+				view(win, 0, len)
+			}
+			Home::Disk(base) => HOST.with_borrow_mut(|h| {
+				h.resize(len, 0);
+				spill.read_exact_at(h, base + off as u64).expect("ooc spill read");
+				win.write_u8(h).expect("ooc H2D");
+				view(win, 0, len)
+			}),
+		}
+	}
+	/// Device window a kernel writes samples [s0, s0+cnt) into. Pair with
+	/// `commit(same view)` afterwards — a no-op for VRAM homes.
+	fn write_view(&self, s0: usize, cnt: usize, win: &GpuBuffer) -> GpuBuffer {
+		let (off, len) = (self.bytes(s0), self.bytes(cnt));
+		match &self.home {
+			Home::Vram(b) => view(b, off, len),
+			_ => view(win, 0, len),
+		}
+	}
+	fn commit(&mut self, s0: usize, cnt: usize, v: &GpuBuffer, spill: &File) {
+		let (off, len) = (self.bytes(s0), self.bytes(cnt));
+		match &mut self.home {
+			Home::Vram(_) => {}
+			Home::Ram(dst) => v.download_u8(&mut dst[off..off + len]).expect("ooc D2H"),
+			Home::Disk(base) => HOST.with_borrow_mut(|h| {
+				h.resize(len, 0);
+				v.download_u8(h).expect("ooc D2H");
+				spill.write_all_at(h, *base + off as u64).expect("ooc spill write");
+			}),
+		}
+	}
+}
+
+pub struct Plan {
+	pub vram: usize,
+	pub ram: usize,
+	pub disk: usize,
+}
+
+/// Combined-ceiling admit in waterfall order from live measurements. `None`
+/// only when VRAM+RAM+DISK together cannot hold `need` — the sole abort.
+pub fn plan(need: usize) -> Option<Plan> {
+	let free_v = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+	let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
+	let vram_avail = free_v.saturating_sub(slack);
+	let ram_avail = mem_available().saturating_sub(mem_available() / 10);
+	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+	let disk_avail = disk_free(&cwd).saturating_sub(1 << 30);
+	if need > vram_avail + ram_avail + disk_avail {
+		return None;
+	}
+	let vram = need.min(vram_avail);
+	let ram = (need - vram).min(ram_avail);
+	Some(Plan { vram, ram, disk: need - vram - ram })
+}
+
+/// The out-of-core buffer set + streaming state for one fit.
+pub struct Ooc {
+	n: usize,
+	chunk: usize,
+	wins: Vec<GpuBuffer>,
+	spill: File,
+	spill_path: std::path::PathBuf,
+	acts: Vec<Paged>,
+	preacts: Vec<Option<Paged>>,
+	a_q: Paged,
+	a_k: Paged,
+	a_v: Paged,
+	a_ctx: Paged,
+	a_dctx: Paged,
+	a_dq: Paged,
+	a_dk: Paged,
+	a_dv: Paged,
+	concat: Paged,
+	da_a: Paged,
+	da_b: Paged,
+	lse: GpuBuffer,
+	dsum: GpuBuffer,
+	dw_acc: GpuBuffer,
+	db_acc: GpuBuffer,
+	dw_tmp: GpuBuffer,
+	db_tmp: GpuBuffer,
+	scalar_acc: GpuBuffer,
+	scalar_tmp: GpuBuffer,
+	dwq_acc: GpuBuffer,
+	dwk_acc: GpuBuffer,
+	dwv_acc: GpuBuffer,
+	dw_partials: GpuBuffer,
+	reduce_ws: GpuBuffer,
+}
+
+impl Ooc {
+	/// Lay every full-batch buffer out across the waterfall and size the
+	/// streaming windows. Windows are sample-aligned; the widest op (flash
+	/// backward) holds 9 at once, so VRAM's window share is carved into 10.
+	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>) -> Ooc {
+		let attn = params.iter().find(|p| p.kind == LayerKind::Attn);
+		let (seq_spb, hs) = attn.map_or((1, 1), |p| (p.in_dim, p.heads * (p.in_dim / p.dim)));
+		let max_act_spb = params.iter().map(|p| p.out_dim.max(p.in_dim)).max().unwrap_or(1);
+		let (ca, cc) = concat_ac.unwrap_or((0, 0));
+		let max_spb = seq_spb.max(max_act_spb).max(ca + cc);
+
+		let spill_path = std::env::current_dir()
+			.unwrap_or_else(|_| ".".into())
+			.join(".recipe_spill");
+		let spill = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(true)
+			.open(&spill_path)
+			.expect("open spill file");
+
+		const WINS: usize = 10;
+		let free_v = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+		let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
+		// Half of free VRAM stages windows; the waterfall fills the other half
+		// with buffer homes before spilling to RAM.
+		let win_budget = free_v.saturating_sub(slack) / 2;
+		let chunk = (win_budget / (WINS * max_spb * 8)).clamp(1, n);
+		let wins: Vec<GpuBuffer> = (0..WINS)
+			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
+			.collect();
+
+		let max_wt = params
+			.iter()
+			.map(|p| match p.kind {
+				LayerKind::Dense => p.in_dim * p.out_dim,
+				LayerKind::Attn => p.dim * p.dim,
+				LayerKind::Embed => p.vocab * p.dim,
+				LayerKind::Conv => p.in_dim * p.out_dim,
+			})
+			.max()
+			.unwrap_or(1);
+		let max_bias = params.iter().map(|p| p.out_dim).max().unwrap_or(1);
+		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
+		let mut dwp = 1usize;
+		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
+		for p in params {
+			let e = match p.kind {
+				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(chunk, p.in_dim, p.out_dim),
+				LayerKind::Attn => kernels::gpu_splitk_dw_partials_elems(seq_rows, p.dim, p.dim),
+				_ => 0,
+			};
+			dwp = dwp.max(e);
+			let rows = if p.kind == LayerKind::Attn { seq_rows } else { chunk };
+			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
+			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
+		}
+		// Resident allocations FIRST — the waterfall fill below takes VRAM to
+		// refusal, so everything that must stay device-resident is claimed before.
+		let lse = GpuBuffer::alloc(n * hs).expect("ooc lse");
+		let dsum = GpuBuffer::alloc(n * hs).expect("ooc dsum");
+		let dw_acc = GpuBuffer::alloc(max_wt).expect("ooc dw_acc");
+		let db_acc = GpuBuffer::alloc(max_bias).expect("ooc db_acc");
+		let dw_tmp = GpuBuffer::alloc(max_wt).expect("ooc dw_tmp");
+		let db_tmp = GpuBuffer::alloc(max_bias).expect("ooc db_tmp");
+		let scalar_acc = GpuBuffer::alloc(1).expect("ooc scalar_acc");
+		let scalar_tmp = GpuBuffer::alloc(1).expect("ooc scalar_tmp");
+		let dwq_acc = GpuBuffer::alloc(max_wt).expect("ooc dwq_acc");
+		let dwk_acc = GpuBuffer::alloc(max_wt).expect("ooc dwk_acc");
+		let dwv_acc = GpuBuffer::alloc(max_wt).expect("ooc dwv_acc");
+		let dw_partials = GpuBuffer::alloc(dwp).expect("ooc dw_partials");
+		let reduce_ws = GpuBuffer::alloc_bytes(ws).expect("ooc reduce_ws");
+
+		// RAM accounting must be CUMULATIVE: fresh Vec pages are lazily
+		// zero-backed, so mem_available() does not drop until an epoch touches
+		// them — re-measuring per placement admits unbounded virtual memory and
+		// the OOM killer collects mid-epoch.
+		let ram_start = mem_available();
+		let ram_floor = ram_start / 10;
+		let mut ram_used = 0usize;
+		let mut vram_open = true;
+		let mut disk_cursor: u64 = 0;
+		let mut place = |spb: usize| -> Paged {
+			let bytes = n * spb * 8;
+			if vram_open {
+				if let Some(b) = GpuBuffer::try_alloc_bytes(bytes) {
+					return Paged { home: Home::Vram(b), spb };
+				}
+				vram_open = false;
+			}
+			if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
+				ram_used += bytes;
+				return Paged { home: Home::Ram(vec![0u8; bytes]), spb };
+			}
+			let off = disk_cursor;
+			disk_cursor += bytes as u64;
+			Paged { home: Home::Disk(off), spb }
+		};
+
+		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect();
+		let preacts: Vec<Option<Paged>> = params
+			.iter()
+			.map(|p| {
+				matches!(
+					p.act,
+					Activation::Silu
+						| Activation::Gelu | Activation::Elu
+						| Activation::Selu | Activation::PRelu
+				)
+				.then(|| place(p.out_dim))
+			})
+			.collect();
+		let a_q = place(seq_spb);
+		let a_k = place(seq_spb);
+		let a_v = place(seq_spb);
+		let a_ctx = place(seq_spb);
+		let a_dctx = place(seq_spb);
+		let a_dq = place(seq_spb);
+		let a_dk = place(seq_spb);
+		let a_dv = place(seq_spb);
+		let concat = place(if ca + cc > 0 { ca + cc } else { 1 });
+		let da_a = place(max_spb);
+		let da_b = place(max_spb);
+		if disk_cursor > 0 {
+			spill.set_len(disk_cursor).expect("size spill file");
+		}
+
+		Ooc {
+			n,
+			chunk,
+			wins,
+			spill,
+			spill_path,
+			acts,
+			preacts,
+			a_q,
+			a_k,
+			a_v,
+			a_ctx,
+			a_dctx,
+			a_dq,
+			a_dk,
+			a_dv,
+			concat,
+			da_a,
+			da_b,
+			lse,
+			dsum,
+			dw_acc,
+			db_acc,
+			dw_tmp,
+			db_tmp,
+			scalar_acc,
+			scalar_tmp,
+			dwq_acc,
+			dwk_acc,
+			dwv_acc,
+			dw_partials,
+			reduce_ws,
+		}
+	}
+
+	pub fn report(&self) {
+		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
+		let (mut v, mut r, mut d) = (0usize, 0usize, 0usize);
+		let mut tally = |p: &Paged| match &p.home {
+			Home::Vram(_) => v += self.n * p.spb * 8,
+			Home::Ram(x) => r += x.len(),
+			Home::Disk(_) => d += self.n * p.spb * 8,
+		};
+		for a in &self.acts {
+			tally(a);
+		}
+		for pa in self.preacts.iter().flatten() {
+			tally(pa);
+		}
+		for b in [
+			&self.a_q, &self.a_k, &self.a_v, &self.a_ctx, &self.a_dctx, &self.a_dq, &self.a_dk,
+			&self.a_dv, &self.concat, &self.da_a, &self.da_b,
+		] {
+			tally(b);
+		}
+		eprintln!(
+			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB, {}-sample windows",
+			gb(v),
+			gb(r),
+			gb(d),
+			self.chunk
+		);
+	}
+
+	/// Full-batch forward swept in windows. `x`/`x_cat`/`sc.acts[last]` are
+	/// resident; the last layer writes `sc.acts[last]` so the metric plumbing
+	/// works unchanged.
+	pub fn forward(
+		&mut self,
+		params: &[LayerParams],
+		x: &GpuBuffer,
+		x_cat: Option<&GpuBuffer>,
+		sc: &Scratch,
+		concat_at: Option<(usize, usize, usize)>,
+	) {
+		let last = params.len() - 1;
+		for (l, p) in params.iter().enumerate() {
+			if let Some((pf, a, c)) = concat_at
+				&& l == pf
+			{
+				for (s0, cnt) in chunks(self.n, self.chunk) {
+					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill);
+					let xc = view(x_cat.expect("x_cat"), s0 * c * 8, cnt * c * 8);
+					let out = self.concat.write_view(s0, cnt, &self.wins[1]);
+					kernels::gpu_concat_into(&prev, &xc, &out, cnt, a, c);
+					self.concat.commit(s0, cnt, &out, &self.spill);
+				}
+			}
+			match p.kind {
+				LayerKind::Embed => {
+					for (s0, cnt) in chunks(self.n, self.chunk) {
+						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
+						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
+						kernels::gpu_gather_rows_into(&p.w, &ids, &out, cnt * p.in_dim, p.dim);
+						kernels::gpu_broadcast_sub_into(&out, &p.b, &out, cnt * p.out_dim, p.out_dim);
+						self.acts[l].commit(s0, cnt, &out, &self.spill);
+					}
+				}
+				LayerKind::Attn => {
+					let d = p.dim;
+					let heads = p.heads;
+					let s = p.in_dim / d;
+					for (s0, cnt) in chunks(self.n, self.chunk) {
+						let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill);
+						let m = cnt * s;
+						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
+						let k = self.a_k.write_view(s0, cnt, &self.wins[2]);
+						let v = self.a_v.write_view(s0, cnt, &self.wins[3]);
+						kernels::gpu_linear_into(&prev, &p.w, &p.b, &q, m, d, d);
+						kernels::gpu_linear_into(&prev, &p.wk, &p.b, &k, m, d, d);
+						kernels::gpu_linear_into(&prev, &p.wv, &p.b, &v, m, d, d);
+						gpu_core::rope::gpu_rope_qk_heads_inplace(&q, &k, m, d, heads, s, 1.0);
+						self.a_q.commit(s0, cnt, &q, &self.spill);
+						self.a_k.commit(s0, cnt, &k, &self.spill);
+						self.a_v.commit(s0, cnt, &v, &self.spill);
+					}
+					for (s0, cnt) in chunks(self.n, self.chunk) {
+						let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill);
+						let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill);
+						let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill);
+						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3]);
+						let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
+						kernels::gpu_flash_attention_train_into(&q, &k, &v, &ctx, &lse, cnt, s, d, heads);
+						self.a_ctx.commit(s0, cnt, &ctx, &self.spill);
+					}
+					for (s0, cnt) in chunks(self.n, self.chunk) {
+						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], &self.spill);
+						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
+						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, &out, cnt * s, d, d);
+						self.acts[l].commit(s0, cnt, &out, &self.spill);
+					}
+				}
+				LayerKind::Dense | LayerKind::Conv => {
+					for (s0, cnt) in chunks(self.n, self.chunk) {
+						let prev = if l == 0 {
+							view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
+						} else if Some(l) == concat_at.map(|t| t.0) {
+							self.concat.read(s0, cnt, &self.wins[0], &self.spill)
+						} else {
+							self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill)
+						};
+						let out = if l == last {
+							view(&sc.acts[last], s0 * p.out_dim * 8, cnt * p.out_dim * 8)
+						} else {
+							self.acts[l].write_view(s0, cnt, &self.wins[1])
+						};
+						if p.kind == LayerKind::Conv {
+							let (cin, kk, stride) = (p.conv_cin, p.conv_k, p.conv_stride);
+							let lin = p.in_dim / cin;
+							let cout = p.out_dim / ((lin - kk) / stride + 1);
+							kernels::gpu_conv1d_into(&prev, &p.w, &p.b, &out, cnt, cin, lin, cout, kk, stride);
+						} else if p.out_dim == 1 {
+							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, &out, cnt, p.in_dim);
+						} else {
+							kernels::gpu_linear_into(&prev, &p.w, &p.b, &out, cnt, p.out_dim, p.in_dim);
+						}
+						let m = cnt * p.out_dim;
+						if let Some(pa) = self.preacts[l].as_mut() {
+							let pre = pa.write_view(s0, cnt, &self.wins[2]);
+							kernels::gpu_copy_into(&out, &pre, m);
+							pa.commit(s0, cnt, &pre, &self.spill);
+							// PRelu/Elu/Selu/Silu/Gelu apply FROM the saved z.
+							match p.act {
+								Activation::PRelu => {
+									let a = download_scalar(&p.palpha);
+									kernels::gpu_leaky_relu_into(&pre, &out, m, a);
+								}
+								Activation::Elu => gpu_core::k_gapact::gpu_elu_into(&pre, &out, m, ELU_ALPHA),
+								Activation::Selu => gpu_core::k_gapact::gpu_selu_into(&pre, &out, m),
+								Activation::Silu => kernels::gpu_silu_into(&pre, &out, m),
+								Activation::Gelu => kernels::gpu_gelu_into(&pre, &out, m),
+								_ => unreachable!("preact only saved for z-based activations"),
+							}
+						} else {
+							match p.act {
+								Activation::Relu => kernels::gpu_relu_into(&out, &out, m),
+								Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, &out, m),
+								Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &out, m, LEAKY_ALPHA),
+								Activation::Tanh => kernels::gpu_tanh_into(&out, &out, m),
+								Activation::Linear => {}
+								_ => unreachable!("z-based activation without preact"),
+							}
+						}
+						if l != last {
+							self.acts[l].commit(s0, cnt, &out, &self.spill);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/// Full-batch backward + one SGD update per layer, swept in windows.
+	/// Weight grads accumulate across windows into dw_acc/db_acc (tiled
+	/// reduction — same math as one pass), then update once.
+	#[allow(clippy::too_many_arguments)]
+	pub fn backward(
+		&mut self,
+		params: &[LayerParams],
+		x: &GpuBuffer,
+		ybuf: &GpuBuffer,
+		sc: &Scratch,
+		lr: f64,
+		loss: Loss,
+		concat_at: Option<(usize, usize, usize)>,
+	) {
+		let last = params.len() - 1;
+		let n = self.n;
+		// Loss gradient at the output, windowed into da_a (width = out_dim).
+		// loss_grad_into scales by 1/rows-it-was-given, so rescale cnt/n to get
+		// the global-batch 1/n.
+		self.da_a.spb = params[last].out_dim;
+		for (s0, cnt) in chunks(n, self.chunk) {
+			let k = params[last].out_dim;
+			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
+			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
+			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
+			ModelInner::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k);
+			kernels::gpu_scale_inplace(&da, cnt as f64 / n as f64, cnt * k);
+			self.da_a.commit(s0, cnt, &da, &self.spill);
+		}
+		let mut flip = false;
+		for l in (0..params.len()).rev() {
+			let p = &params[l];
+			let (in_dim, out_dim) = (p.in_dim, p.out_dim);
+			match p.kind {
+				LayerKind::Embed => {
+					kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
+					for (s0, cnt) in chunks(n, self.chunk) {
+						let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill);
+						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
+						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
+					}
+					kernels::gpu_sgd_update(&p.w, &sc.embed_grad, lr, p.vocab * p.dim);
+					flip = !flip;
+					continue;
+				}
+				LayerKind::Attn => {
+					self.attn_backward(params, l, x, lr, flip);
+					flip = !flip;
+					continue;
+				}
+				LayerKind::Conv => panic!(
+					"out-of-core conv backward not implemented — a conv this large has no production caller yet"
+				),
+				LayerKind::Dense => {}
+			}
+			// Dense: dz = act'(da) per window; dW/db accumulate; da_below → home.
+			kernels::gpu_scale_inplace(&self.dw_acc, 0.0, in_dim * out_dim);
+			kernels::gpu_scale_inplace(&self.db_acc, 0.0, out_dim);
+			if p.act == Activation::PRelu {
+				kernels::gpu_scale_inplace(&self.scalar_acc, 0.0, 1);
+			}
+			self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
+			for (s0, cnt) in chunks(n, self.chunk) {
+				let m = cnt * out_dim;
+				let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill);
+				let act_l = if l == last {
+					view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
+				} else {
+					self.acts[l].read(s0, cnt, &self.wins[1], &self.spill)
+				};
+				let dz = view(&self.wins[2], 0, m * 8);
+				let grad: &GpuBuffer = match p.act {
+					Activation::Relu => {
+						kernels::gpu_relu_backward_into(&da, &act_l, &dz, m);
+						&dz
+					}
+					Activation::Sigmoid => {
+						kernels::gpu_sigmoid_backward_into(&da, &act_l, &dz, m);
+						&dz
+					}
+					Activation::LeakyRelu => {
+						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &dz, m, LEAKY_ALPHA);
+						&dz
+					}
+					Activation::PRelu => {
+						let a = download_scalar(&p.palpha);
+						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &dz, m, a);
+						let pre = self.preacts[l]
+							.as_ref()
+							.expect("prelu preact")
+							.read(s0, cnt, &self.wins[3], &self.spill);
+						let t0 = view(&self.wins[4], 0, m * 8);
+						let t1 = view(&self.wins[5], 0, m * 8);
+						kernels::gpu_relu_into(&pre, &t0, m);
+						kernels::gpu_copy_into(&pre, &t1, m);
+						kernels::gpu_sub_inplace(&t1, &t0, m);
+						kernels::gpu_mul_inplace(&t1, &da, m);
+						kernels::gpu_reduce_sum_cols_into(&t1, &self.scalar_tmp, &self.reduce_ws, m, 1);
+						kernels::gpu_add_inplace(&self.scalar_acc, &self.scalar_tmp, 1);
+						&dz
+					}
+					Activation::Tanh => {
+						kernels::gpu_tanh_backward_into(&da, &act_l, &dz, m);
+						&dz
+					}
+					Activation::Elu => {
+						let pre = self.preacts[l].as_ref().expect("elu preact").read(s0, cnt, &self.wins[3], &self.spill);
+						gpu_core::k_gapact::gpu_elu_backward_into(&da, &pre, &dz, m, ELU_ALPHA);
+						&dz
+					}
+					Activation::Selu => {
+						let pre = self.preacts[l].as_ref().expect("selu preact").read(s0, cnt, &self.wins[3], &self.spill);
+						gpu_core::k_gapact::gpu_selu_backward_into(&da, &pre, &dz, m);
+						&dz
+					}
+					Activation::Silu => {
+						let pre = self.preacts[l].as_ref().expect("silu preact").read(s0, cnt, &self.wins[3], &self.spill);
+						kernels::gpu_silu_backward_into(&da, &pre, &dz, m);
+						&dz
+					}
+					Activation::Gelu => {
+						let pre = self.preacts[l].as_ref().expect("gelu preact").read(s0, cnt, &self.wins[3], &self.spill);
+						kernels::gpu_gelu_backward_into(&da, &pre, &dz, m);
+						&dz
+					}
+					Activation::Linear => &da,
+				};
+				let a_prev = if l == 0 {
+					view(x, s0 * in_dim * 8, cnt * in_dim * 8)
+				} else if Some(l) == concat_at.map(|t| t.0) {
+					self.concat.read(s0, cnt, &self.wins[6], &self.spill)
+				} else {
+					self.acts[l - 1].read(s0, cnt, &self.wins[6], &self.spill)
+				};
+				if l > 0 {
+					let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
+					let below = below_pg.write_view(s0, cnt, &self.wins[7]);
+					kernels::gpu_linear_backward_full_into(
+						grad, &a_prev, &p.w, &below, &self.dw_tmp, &self.db_tmp,
+						&self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+					);
+					// The layer below the concat only wants the leading A
+					// attention columns — compact before committing.
+					if let Some((pf, a, c)) = concat_at
+						&& l == pf
+					{
+						let compact = view(&self.wins[8], 0, cnt * a * 8);
+						kernels::gpu_slice_lead_into(&below, &compact, cnt, a + c, a);
+						below_pg.spb = a;
+						below_pg.commit(s0, cnt, &compact, &self.spill);
+						below_pg.spb = a + c;
+					} else {
+						below_pg.commit(s0, cnt, &below, &self.spill);
+					}
+				} else {
+					kernels::gpu_linear_backward_weights_only_into(
+						grad, &a_prev, &self.dw_tmp, &self.db_tmp,
+						&self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+					);
+				}
+				kernels::gpu_add_inplace(&self.dw_acc, &self.dw_tmp, in_dim * out_dim);
+				kernels::gpu_add_inplace(&self.db_acc, &self.db_tmp, out_dim);
+			}
+			if let Some((pf, a, _)) = concat_at
+				&& l == pf
+			{
+				self.da_below(flip).spb = a;
+			}
+			kernels::gpu_sgd_update(&p.w, &self.dw_acc, lr, in_dim * out_dim);
+			kernels::gpu_sgd_update(&p.b, &self.db_acc, lr, out_dim);
+			if p.act == Activation::PRelu {
+				kernels::gpu_sgd_update(&p.palpha, &self.scalar_acc, lr, 1);
+			}
+			flip = !flip;
+		}
+	}
+
+	fn da(&self, flip: bool) -> &Paged {
+		if flip { &self.da_b } else { &self.da_a }
+	}
+	fn da_below(&mut self, flip: bool) -> &mut Paged {
+		if flip { &mut self.da_a } else { &mut self.da_b }
+	}
+
+	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, lr: f64, flip: bool) {
+		let p = &params[l];
+		let d = p.dim;
+		let heads = p.heads;
+		let s = p.in_dim / d;
+		let n = self.n;
+		// Wo: da → dctx, dWo accumulated over windows.
+		kernels::gpu_scale_inplace(&self.dw_acc, 0.0, d * d);
+		for (s0, cnt) in chunks(n, self.chunk) {
+			let m = cnt * s;
+			let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill);
+			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], &self.spill);
+			let dctx = self.a_dctx.write_view(s0, cnt, &self.wins[2]);
+			kernels::gpu_linear_backward_full_into(
+				&da, &ctx, &p.wo, &dctx, &self.dw_tmp, &self.db_tmp,
+				&self.reduce_ws, &self.dw_partials, m, d, d,
+			);
+			kernels::gpu_add_inplace(&self.dw_acc, &self.dw_tmp, d * d);
+			self.a_dctx.commit(s0, cnt, &dctx, &self.spill);
+		}
+		kernels::gpu_sgd_update(&p.wo, &self.dw_acc, lr, d * d);
+		// Flash backward per sample chunk: dsum, then dQ/dK/dV; un-rotate RoPE.
+		for (s0, cnt) in chunks(n, self.chunk) {
+			let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill);
+			let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill);
+			let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill);
+			let ctx = self.a_ctx.read(s0, cnt, &self.wins[3], &self.spill);
+			let dctx = self.a_dctx.read(s0, cnt, &self.wins[4], &self.spill);
+			let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
+			let dsum = view(&self.dsum, s0 * heads * s * 8, cnt * heads * s * 8);
+			let dq = self.a_dq.write_view(s0, cnt, &self.wins[5]);
+			let dk = self.a_dk.write_view(s0, cnt, &self.wins[6]);
+			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7]);
+			kernels::gpu_flash_attention_backward_into(
+				&q, &k, &v, &ctx, &dctx, &lse, &dsum, &dq, &dk, &dv, cnt, s, d, heads,
+			);
+			gpu_core::rope::gpu_rope_qk_heads_inplace(&dq, &dk, cnt * s, d, heads, s, -1.0);
+			self.a_dq.commit(s0, cnt, &dq, &self.spill);
+			self.a_dk.commit(s0, cnt, &dk, &self.spill);
+			self.a_dv.commit(s0, cnt, &dv, &self.spill);
+		}
+		// Wq/Wk/Wv: three projections in one sweep per window so the dH sum
+		// stays local; per-projection dW accumulators zeroed up front.
+		self.da_below(flip).spb = p.in_dim;
+		kernels::gpu_scale_inplace(&self.dwq_acc, 0.0, d * d);
+		kernels::gpu_scale_inplace(&self.dwk_acc, 0.0, d * d);
+		kernels::gpu_scale_inplace(&self.dwv_acc, 0.0, d * d);
+		for (s0, cnt) in chunks(n, self.chunk) {
+			let m = cnt * s;
+			let h = if l == 0 {
+				view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
+			} else {
+				self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill)
+			};
+			let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
+			let below = below_pg.write_view(s0, cnt, &self.wins[1]);
+			let dh_tmp = view(&self.wins[2], 0, cnt * p.in_dim * 8);
+			for (wi, (w, dbuf)) in [(&p.w, &self.a_dq), (&p.wk, &self.a_dk), (&p.wv, &self.a_dv)]
+				.into_iter()
+				.enumerate()
+			{
+				let dg = dbuf.read(s0, cnt, &self.wins[3], &self.spill);
+				let dst = if wi == 0 { &below } else { &dh_tmp };
+				kernels::gpu_linear_backward_full_into(
+					&dg, &h, w, dst, &self.dw_tmp, &self.db_tmp,
+					&self.reduce_ws, &self.dw_partials, m, d, d,
+				);
+				let acc = match wi {
+					0 => &self.dwq_acc,
+					1 => &self.dwk_acc,
+					_ => &self.dwv_acc,
+				};
+				kernels::gpu_add_inplace(acc, &self.dw_tmp, d * d);
+				if wi > 0 {
+					kernels::gpu_add_inplace(&below, &dh_tmp, cnt * p.in_dim);
+				}
+			}
+			below_pg.commit(s0, cnt, &below, &self.spill);
+		}
+		kernels::gpu_sgd_update(&p.w, &self.dwq_acc, lr, d * d);
+		kernels::gpu_sgd_update(&p.wk, &self.dwk_acc, lr, d * d);
+		kernels::gpu_sgd_update(&p.wv, &self.dwv_acc, lr, d * d);
+	}
+}
+
+impl Drop for Ooc {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_file(&self.spill_path);
+	}
+}

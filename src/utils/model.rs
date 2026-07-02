@@ -677,11 +677,28 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool) -> Vec<Issue>
 	let need = vram_estimate(&model.specs, n, text_d, k, vocab, cat_cols, forward_only);
 	if need > free_vram {
 		let mode = if forward_only { "inference" } else { "training" };
-		issues.push(Issue {
-			what: format!("{mode} on {n} rows × {d} features exceeds GPU memory"),
-			have: format!("{} free of {} total", crate::data::human_bytes(free_vram), crate::data::human_bytes(total_vram)),
-			need: format!("{}", crate::data::human_bytes(need)),
-		});
+		// Training waterfalls VRAM → RAM → DISK (crate::ooc): over-VRAM is not an
+		// issue while the COMBINED ceiling holds — announce the tier plan and
+		// proceed. Inference has no streaming path yet; either mode aborts only
+		// when even the combined ceiling is exceeded.
+		match (forward_only, crate::ooc::plan(need)) {
+			(false, Some(p)) => {
+				eprintln!(
+					"\x1b[33mwaterfall\x1b[0m  scratch {} → VRAM {} + RAM {} + DISK {}",
+					crate::data::human_bytes(need),
+					crate::data::human_bytes(p.vram),
+					crate::data::human_bytes(p.ram),
+					crate::data::human_bytes(p.disk),
+				);
+			}
+			_ => {
+				issues.push(Issue {
+					what: format!("{mode} on {n} rows × {d} features exceeds {}", if forward_only { "GPU memory" } else { "VRAM+RAM+DISK" }),
+					have: format!("{} free of {} total", crate::data::human_bytes(free_vram), crate::data::human_bytes(total_vram)),
+					need: format!("{}", crate::data::human_bytes(need)),
+				});
+			}
+		}
 	}
 
 	issues

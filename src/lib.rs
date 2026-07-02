@@ -39,6 +39,8 @@ pub use pantry::data;
 #[doc(hidden)]
 #[path = "utils/dataset.rs"]
 pub mod dataset;
+#[path = "utils/ooc.rs"]
+pub mod ooc;
 
 #[doc(hidden)]
 #[path = "utils/train.rs"]

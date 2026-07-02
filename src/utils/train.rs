@@ -856,10 +856,22 @@ impl ModelInner {
 		};
 		// Activation + gradient buffers, allocated once and reused every epoch
 		// so steady-state VRAM is flat (no per-epoch sawtooth).
+		// Waterfall: when the full-batch scratch exceeds free VRAM, homes spill
+		// VRAM → RAM → DISK and every op streams sample windows (crate::ooc).
+		let cc_fit = concat_layer(&params);
+		let scratch_need = Scratch::vram_bytes(&params, n, false);
+		let free_vram = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+		let use_ooc = scratch_need > free_vram;
 		let sc = {
 			let _t_scratch = gpu_core::memory::tag_scope("scratch");
-			Scratch::new(&params, n, false)
+			if use_ooc { Scratch::new_light(&params, n) } else { Scratch::new(&params, n, false) }
 		};
+		let mut ooc = use_ooc.then(|| {
+			let _t_scratch = gpu_core::memory::tag_scope("waterfall");
+			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)));
+			o.report();
+			o
+		});
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {
@@ -870,7 +882,10 @@ impl ModelInner {
 				break;
 			}
 			// Forward with this epoch's weights, then backprop + SGD update.
-			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			match ooc.as_mut() {
+				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
+				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
+			}
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
@@ -882,12 +897,18 @@ impl ModelInner {
 			let want_score = checkpointing
 				|| (log_now && cfg.metrics.contains(&stop_metric))
 				|| (plotting && plot_ys.contains(&stop_metric));
-			self.backward_step(&params, &xbuf, &ybuf, n, &sc);
+			match ooc.as_mut() {
+				Some(o) => o.backward(&params, &xbuf, &ybuf, &sc, self.lr, self.loss, cc_fit),
+				None => self.backward_step(&params, &xbuf, &ybuf, n, &sc),
+			}
 			let need_metric = want_score
 				|| (log_now && !cfg.metrics.is_empty())
 				|| (plotting && !plot_ys.is_empty());
 			if need_metric {
-				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+				match ooc.as_mut() {
+					Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
+					None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
+				}
 			}
 			let out = &sc.acts[last];
 			// Per-epoch metrics ride the async copy stream and sync ONCE (no blocking
@@ -1017,8 +1038,12 @@ impl ModelInner {
 		if plotting {
 			ratatui::restore();
 		}
+		let mut ooc_end = ooc;
 		let end_score = checkpointing.then(|| {
-			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			match ooc_end.as_mut() {
+				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
+				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
+			}
 			if classify {
 				if k == 1 {
 					kernels::gpu_accuracy_into(
