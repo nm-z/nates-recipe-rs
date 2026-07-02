@@ -32,8 +32,44 @@ pub(crate) fn tick(c: &AtomicU64) {
 	c.fetch_add(1, Ordering::Relaxed);
 }
 
+pub const N: usize = 41;
+static ALL: [&AtomicU64; N] = [
+	&HOST_MALLOC, &HOST_FREE,
+	&MEMCPY_ASYNC, &MALLOC_ASYNC, &MEMSET_ASYNC, &FREE_ASYNC,
+	&LAUNCH,
+	&GET_LAST_ERROR, &PEEK_AT_LAST_ERROR, &GET_ERROR_STRING, &GET_ERROR_NAME,
+	&EVENT_RECORD, &EVENT_ELAPSED_TIME, &EVENT_DESTROY, &EVENT_CREATE,
+	&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE,
+	&STREAM_DESTROY, &STREAM_CREATE,
+	&MEM_GET_INFO, &SET_DEVICE, &GET_DEVICE_COUNT, &DEVICE_GET_ATTRIBUTE,
+	&DEVICE_ENABLE_PEER_ACCESS, &DEVICE_CAN_ACCESS_PEER, &GET_DEVICE_PROPERTIES, &GET_DEVICE,
+	&GET_DEFAULT_MEMPOOL, &MEMPOOL_GET_ATTRIBUTE, &MEMPOOL_TRIM_TO, &MEMPOOL_SET_ATTRIBUTE,
+	&MEM_UNMAP, &MEM_SET_ACCESS, &MEM_RELEASE, &MEM_MAP,
+	&MEM_GET_ALLOCATION_GRANULARITY, &MEM_CREATE, &MEM_ADDRESS_RESERVE, &MEM_ADDRESS_FREE,
+	&HIPBLAS,
+];
+
+/// Counter values right now — pass to `report_since` for a run-scoped delta.
+pub fn snapshot() -> [u64; N] {
+	let mut s = [0u64; N];
+	for (i, c) in ALL.iter().enumerate() {
+		s[i] = c.load(Ordering::Relaxed);
+	}
+	s
+}
+
 pub fn report() -> String {
-	let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+	report_since(&[0u64; N])
+}
+
+pub fn report_since(base: &[u64; N]) -> String {
+	let g = |c: &AtomicU64| {
+		let i = ALL
+			.iter()
+			.position(|x| std::ptr::eq(*x, c))
+			.expect("counter registered in ALL");
+		c.load(Ordering::Relaxed).saturating_sub(base[i])
+	};
 	let groups: &[(&str, &[(u64, &str)])] = &[
 		("sync", &[
 			(g(&HOST_MALLOC), "allocations"),

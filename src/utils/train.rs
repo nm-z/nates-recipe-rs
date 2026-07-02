@@ -166,6 +166,7 @@ impl ModelInner {
 			Metric::Lr => "lr",
 			Metric::Time => "time",
 			Metric::R2 => "r2",
+			Metric::Hip => "hip",
 		}
 	}
 
@@ -175,6 +176,7 @@ impl ModelInner {
 		let parts: Vec<String> = metrics
 			.iter()
 			.zip(vals)
+			.filter(|(m, _)| **m != Metric::Hip)
 			.enumerate()
 			.map(|(i, (&m, &v))| {
 				let num = if v.is_nan() && matches!(m, Metric::Lr | Metric::Epoch | Metric::Time) {
@@ -192,6 +194,7 @@ impl ModelInner {
 						Metric::Loss => format!("{v:>7.4}"),
 						Metric::Accuracy => format!("{v:>6.4}"),
 						Metric::R2 => format!("{v:>8.4}"),
+						Metric::Hip => unreachable!("Hip filtered from metric line"),
 					}
 				};
 				let (r, g, b) = palette(i);
@@ -727,6 +730,7 @@ impl ModelInner {
 	}
 
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
+		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let rerun = !self.params.borrow().is_empty();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
@@ -1152,6 +1156,9 @@ impl ModelInner {
 			} else {
 				self.save_checkpoint(path, s);
 			}
+		}
+		if let Some(base) = hip_snap {
+			eprint!("{}", gpu_core::callspy::report_since(&base));
 		}
 	}
 

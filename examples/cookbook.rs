@@ -74,7 +74,7 @@ fn main() {
 		.target("SalePrice");
 	let mlp_train = Train::new()
 		.epochs(20)
-		.log([Loss, R2]);
+		.log([Loss, R2, hip]);
 
 	let llm = Model::new()          // LLM
 		.loss(ce)

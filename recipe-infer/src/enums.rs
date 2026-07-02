@@ -81,6 +81,9 @@ pub enum Metric {
 	Lr,
 	Time,
 	R2,
+	/// Not a per-epoch number: prints the run-scoped HIP call-count tree when
+	/// the run finishes. `.log([Loss, R2, hip])`.
+	Hip,
 }
 
 #[allow(non_upper_case_globals)]
@@ -130,6 +133,8 @@ pub const Lr: Metric = Metric::Lr;
 pub const Time: Metric = Metric::Time;
 #[allow(non_upper_case_globals)]
 pub const R2: Metric = Metric::R2;
+#[allow(non_upper_case_globals)]
+pub const hip: Metric = Metric::Hip;
 
 /// Which parameters an OGDL save writes — `W` (weights) and/or `B` (biases). The
 /// crate-root `w`/`b` consts in `recipe` map onto these; lives here beside

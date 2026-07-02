@@ -55,7 +55,7 @@ pub use dataset::Dataset;
 
 #[doc(inline)]
 pub use model::{
-	Accuracy, Epoch, Loss, Lr, Metric, Model, R2, Time, Train,
+	Accuracy, Epoch, Loss, Lr, Metric, Model, R2, Time, Train, hip,
 	attn, bce, ce, embed, focal, huber, mae, mse,
 };
 #[doc(hidden)]

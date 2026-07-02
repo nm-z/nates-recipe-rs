@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 // them so the existing `recipe::*` / `crate::model::*` API is unchanged.
 pub use recipe_infer::{
 	Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu, focal, gelu,
-	huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
+	hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
 /// Accepts `units` (linear dense) or `embed(dim)` / `attn(heads)` for

@@ -35,6 +35,9 @@ pub fn metric_gpu(
 ) -> f64 {
 	let nk = n * k; // element count: n samples × k outputs, flat row-major
 	match m {
+		// Hip is not a per-epoch scalar — the trainer prints the call-count
+		// tree at run end and filters it out of the metric line.
+		Metric::Hip => f64::NAN,
 		Metric::Epoch => epoch as f64,
 		Metric::Lr => lr,
 		Metric::Time => elapsed,
