@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Data-driven proof harness: for every item in kernel_inventory/*.json, if its
 // canonical op name is registered here, run the gpu-core op on the LIVE GPU and
 // assert it matches a CPU oracle. Prints proven/total coverage per category.

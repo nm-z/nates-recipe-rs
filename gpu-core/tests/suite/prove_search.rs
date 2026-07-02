@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "search" inventory category.
 //
 // For every search-category item in kernel_inventory/*.json, canonicalize its

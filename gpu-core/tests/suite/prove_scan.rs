@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "scan" inventory category.
 //
 // For every scan-category item in kernel_inventory/*.json, canonicalize its name;

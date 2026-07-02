@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof for the elementwise_binary inventory category.
 //
 // For every elementwise_binary item in kernel_inventory/*.json, canonicalize its

@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "sort" inventory category.
 //
 // For every sort-category item in kernel_inventory/*.json, canonicalize its name;

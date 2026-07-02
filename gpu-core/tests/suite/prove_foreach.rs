@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "foreach" inventory category.
 //
 // torch._foreach_<op> applies <op> elementwise across a LIST of tensors. The

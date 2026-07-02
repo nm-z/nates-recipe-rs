@@ -16,12 +16,30 @@ use gpu_core::infer_ops::{
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::memory::GpuBuffer;
+use gpu_core::waterfall::{Home, Waterfall};
 use recipe_infer::safetensors::parse_safetensors_header;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+// DEBUG timing accumulators (ns): disk read, H2D upload (write_u8), widen kernel.
+static DISK_NS: AtomicU64 = AtomicU64::new(0);
+static H2D_NS: AtomicU64 = AtomicU64::new(0);
+static WIDEN_NS: AtomicU64 = AtomicU64::new(0);
+static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+static MLP_NS: AtomicU64 = AtomicU64::new(0);
+static MOE_NS: AtomicU64 = AtomicU64::new(0);
+static MOE_RT_NS: AtomicU64 = AtomicU64::new(0);
+static ROUTE_NS: AtomicU64 = AtomicU64::new(0);
+static LM_NS: AtomicU64 = AtomicU64::new(0);
+
+fn acc(a: &AtomicU64, t: Instant) {
+	a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
 
 // ── config (config.json) ─────────────────────────────────────────────────────
 const NE: usize = 2816; // hidden
@@ -80,6 +98,57 @@ const KD_MAX: usize = 8 * 256;
 // LM-head vocab tile: cn*NE f64 must fit the reused widen window (MAXW), and
 // cn*NE*2 bf16 bytes must fit the staging buffer (MAXW*2) — 8192*NE hits both exactly.
 const LM_CHUNK: usize = 8192;
+
+// One expert's bf16 bytes: gate_up (2*NFFE, NE) followed by down (NE, NFFE).
+const GU_BYTES: usize = 2 * NFFE * NE * 2;
+const DN_BYTES: usize = NFFE * NE * 2;
+const SLOT_BYTES: usize = GU_BYTES + DN_BYTES;
+
+// Byte-granular device view (GpuBuffer::view is f64-granular; all our bf16
+// offsets are multiples of NE*2 = 5632, so /8 is exact — asserted).
+fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
+	assert!(off_bytes % 8 == 0 && len_bytes % 8 == 0, "bview: unaligned {off_bytes}/{len_bytes}");
+	buf.view(off_bytes / 8, len_bytes / 8)
+}
+
+// Per-step tier hit counters (where expert bytes came from).
+static E_VRAM: AtomicU64 = AtomicU64::new(0);
+static E_RAM: AtomicU64 = AtomicU64::new(0);
+static E_DISK: AtomicU64 = AtomicU64::new(0);
+
+// Load watchdog: hipMallocAsync pool growth stochastically wedges in an HSA
+// spin on this driver (gdb-verified). Every load phase bumps the beat; if it
+// stalls for 20s the process dies LOUDLY instead of spinning silently forever.
+static BEAT: AtomicU64 = AtomicU64::new(0);
+
+fn beat() {
+	BEAT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn arm_watchdog() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+	let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+	let flag = armed.clone();
+	std::thread::spawn(move || {
+		let mut last = u64::MAX;
+		loop {
+			std::thread::sleep(std::time::Duration::from_secs(20));
+			if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+				return;
+			}
+			let b = BEAT.load(Ordering::Relaxed);
+			if b == last {
+				eprintln!("\nLOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting.");
+				std::process::abort();
+			}
+			last = b;
+		}
+	});
+	armed
+}
+
+fn ekey(l: usize, e: usize) -> String {
+	format!("expert.{l}.{e}")
+}
 
 // Every device buffer the steady-state forward touches, allocated once at
 // `Arena::new` (after `t` is known) and reused across all 30 layers and 6 steps.
@@ -168,6 +237,8 @@ struct Model {
 	big: HashMap<String, Tensor>, // streamed (bf16 on disk)
 	stage: GpuBuffer,             // reusable device bf16 staging (MAXW*2 bytes)
 	win: GpuBuffer,               // reusable f64 widen window (MAXW floats)
+	store: Waterfall,             // VRAM→RAM→DISK home of every big weight blob
+	rbuf: RefCell<Vec<u8>>,       // reusable disk read buffer (no per-read alloc/zero)
 	// resident f64 on GPU, per layer
 	norms: Vec<HashMap<&'static str, GpuBuffer>>,
 	decoder_norm: GpuBuffer,
@@ -199,10 +270,29 @@ impl Model {
 	// Read a tensor's raw bytes (or a byte sub-range) from its shard.
 	fn read_bytes(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
 		let mut buf = vec![0u8; len];
+		let _d = Instant::now();
 		self.shards[t.shard]
 			.read_exact_at(&mut buf, (t.off + off) as u64)
 			.with_context(|| format!("read {len} bytes at shard {}", t.shard))?;
+		acc(&DISK_NS, _d);
 		Ok(buf)
+	}
+
+	// Disk → device through the reusable host buffer: no per-read alloc/zero.
+	fn read_into(&self, t: &Tensor, off: usize, len: usize, dst: &GpuBuffer, dst_off: usize) -> Result<()> {
+		let mut rb = self.rbuf.borrow_mut();
+		if rb.len() < len {
+			rb.resize(len, 0);
+		}
+		let _d = Instant::now();
+		self.shards[t.shard]
+			.read_exact_at(&mut rb[..len], (t.off + off) as u64)
+			.with_context(|| format!("read {len} bytes at shard {}", t.shard))?;
+		acc(&DISK_NS, _d);
+		let _h = Instant::now();
+		bview(dst, dst_off, len).write_u8(&rb[..len])?;
+		acc(&H2D_NS, _h);
+		Ok(())
 	}
 
 	// Decode a small tensor fully to host f64.
@@ -212,27 +302,63 @@ impl Model {
 		Ok(raw.chunks_exact(2).map(|c| bf16(u16::from_le_bytes([c[0], c[1]]))).collect())
 	}
 
-	// Widen a full big tensor into the reusable window; returns a borrow view of
-	// the window (no allocation — avoids hipMallocAsync pool churn/lazy-commit
-	// faults). The caller must consume it before the next stream_* call.
+	// Widen `n` bf16 elems at `off_bytes` of a device bf16 buffer into the shared
+	// f64 window; returns a borrow view. The caller must consume it before the
+	// next widen (stream-ordered, so enqueued GEMMs read it first).
+	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> GpuBuffer {
+		let _w = Instant::now();
+		gpu_widen_bf16_into(&bview(src, off_bytes, n * 2), &self.win, n);
+		acc(&WIDEN_NS, _w);
+		self.win.view(0, n)
+	}
+
+	// Host bytes → stage, timed as H2D.
+	fn to_stage(&self, bytes: &[u8]) -> Result<()> {
+		let _h = Instant::now();
+		self.stage.write_u8(bytes)?;
+		acc(&H2D_NS, _h);
+		Ok(())
+	}
+
+	// Whole-tensor weight through the waterfall: VRAM home widens in place, RAM
+	// home bounces to stage, DISK home streams the shard.
 	fn stream(&self, name: &str) -> Result<GpuBuffer> {
 		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
-		let raw = self.read_bytes(t, 0, t.nbytes)?;
-		self.widen_window(&raw)
+		let n = t.nbytes / 2;
+		match self.store.home(name) {
+			Some(Home::Vram(dev)) => Ok(self.widen_from(dev, 0, n)),
+			Some(Home::Ram(bytes)) => {
+				self.to_stage(bytes)?;
+				Ok(self.widen_from(&self.stage, 0, n))
+			}
+			_ => {
+				self.read_into(t, 0, t.nbytes, &self.stage, 0)?;
+				Ok(self.widen_from(&self.stage, 0, n))
+			}
+		}
 	}
 
-	// Widen one expert slice `e` (per-expert element count `per`) into the window.
-	fn stream_expert(&self, name: &str, e: usize, per: usize) -> Result<GpuBuffer> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
-		let raw = self.read_bytes(t, e * per * 2, per * 2)?;
-		self.widen_window(&raw)
-	}
-
-	fn widen_window(&self, raw: &[u8]) -> Result<GpuBuffer> {
-		let n = raw.len() / 2;
-		self.stage.write_u8(raw)?;
-		gpu_widen_bf16_into(&self.stage, &self.win, n);
-		Ok(self.win.view(0, n))
+	// One expert's bf16 bytes (gate_up ‖ down) as a device view, same three tiers.
+	fn expert_slot(&self, l: usize, e: usize) -> Result<GpuBuffer> {
+		match self.store.home(&ekey(l, e)) {
+			Some(Home::Vram(dev)) => {
+				E_VRAM.fetch_add(1, Ordering::Relaxed);
+				Ok(bview(dev, 0, SLOT_BYTES))
+			}
+			Some(Home::Ram(bytes)) => {
+				E_RAM.fetch_add(1, Ordering::Relaxed);
+				self.to_stage(bytes)?;
+				Ok(bview(&self.stage, 0, SLOT_BYTES))
+			}
+			_ => {
+				E_DISK.fetch_add(1, Ordering::Relaxed);
+				let gu = self.big.get(&layer_name(l, "experts.gate_up_proj")).ok_or_else(|| anyhow!("no gate_up {l}"))?;
+				let dn = self.big.get(&layer_name(l, "experts.down_proj")).ok_or_else(|| anyhow!("no down {l}"))?;
+				self.read_into(gu, e * GU_BYTES, GU_BYTES, &self.stage, 0)?;
+				self.read_into(dn, e * DN_BYTES, DN_BYTES, &self.stage, GU_BYTES)?;
+				Ok(bview(&self.stage, 0, SLOT_BYTES))
+			}
+		}
 	}
 }
 
@@ -295,11 +421,14 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 	let plus_one = mean.abs() < 0.5;
 	eprintln!("norm probe mean={mean:.4} -> {}", if plus_one { "(1+w) HF convention" } else { "folded x*w" });
 
+	eprintln!("allocating stage+win...");
 	let mut m = Model {
 		shards,
 		big,
 		stage: GpuBuffer::alloc_bytes(MAXW * 2)?,
 		win: GpuBuffer::alloc(MAXW)?,
+		store: Waterfall::new(),
+		rbuf: RefCell::new(Vec::new()),
 		norms: Vec::new(),
 		decoder_norm: GpuBuffer::alloc(1)?,
 		sc_pre: GpuBuffer::alloc(1)?,
@@ -315,6 +444,8 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 
 	// Per-layer resident tensors.
 	for l in 0..NL {
+		eprint!("\rnorms layer {}/{NL}", l + 1);
+		beat();
 		let p = |n: &str| format!("model.decoder.layers.{l}.{n}");
 		let mut nm = HashMap::new();
 		for (key, suffix) in LAYER_NORMS {
@@ -328,6 +459,7 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 	}
 
 	// Globals.
+	eprintln!("\rglobals + embedding table...");
 	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
 	m.sc_pre = upload_gamma(&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?, plus_one)?;
 	m.sc_gate = GpuBuffer::upload(&m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?)?;
@@ -342,6 +474,98 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 	m.emb = m.read_bytes(et, 0, et.nbytes)?;
 
 	Ok(m)
+}
+
+// The per-layer weight names touched every step outside the expert loop.
+fn fixed_names(l: usize) -> Vec<String> {
+	let mut names = vec![
+		layer_name(l, "self_attn.q_proj.weight"),
+		layer_name(l, "self_attn.k_proj.weight"),
+		layer_name(l, "self_attn.o_proj.weight"),
+		layer_name(l, "mlp.gate_proj.weight"),
+		layer_name(l, "mlp.up_proj.weight"),
+		layer_name(l, "mlp.down_proj.weight"),
+	];
+	if dims(l).has_v {
+		names.push(layer_name(l, "self_attn.v_proj.weight"));
+	}
+	names
+}
+
+// Warm every allocation the forward will ever need besides the waterfall —
+// rocBLAS grows its workspace on first use per shape class, and the waterfall
+// takes ALL remaining VRAM, so the workspace must exist first.
+fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
+	gpu_core::kernels::gpu_gemm_bt_into(&ar.x, &m.win.view(0, 8192 * NE), &ar.q, t, 8192, NE)?;
+	beat();
+	gpu_core::kernels::gpu_gemm_bt_into(&ar.cms, &m.win.view(0, NFF * NE), &ar.g, t, NFF, NE)?;
+	beat();
+	gpu_core::kernels::gpu_gemm_bt_into(&ar.act, &m.win.view(0, NE * NFF), &ar.mlp0, t, NE, NFF)?;
+	beat();
+	gpu_core::kernels::gpu_gemm_bt_into(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), &ar.moe_gu, t, 2 * NFFE, NE)?;
+	gpu_core::hip::device_synchronize()?;
+	beat();
+	Ok(())
+}
+
+// Waterfall fill, hottest first: the embedding table and per-layer attn+mlp
+// weights (touched every step), then experts interleaved expert-major so the
+// VRAM tier spans all 30 layers instead of pinning the first N. Runs LAST —
+// everything else is already allocated, so "VRAM full" is the allocator refusing.
+fn fill_store(m: &mut Model) -> Result<()> {
+	let mut store = Waterfall::with_slab();
+	beat();
+	store.place("model.decoder.embed_tokens.weight", m.emb.len(), |dst| {
+		dst.copy_from_slice(&m.emb);
+		Ok(())
+	})?;
+	beat();
+	for l in 0..NL {
+		for name in fixed_names(l) {
+			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
+			store.place(&name, t.nbytes, |dst| m.shards[t.shard].read_exact_at(dst, t.off as u64))?;
+			beat();
+		}
+	}
+	for e in 0..NEXP {
+		for l in 0..NL {
+			let gu = m.big.get(&layer_name(l, "experts.gate_up_proj")).ok_or_else(|| anyhow!("no gate_up {l}"))?;
+			let dn = m.big.get(&layer_name(l, "experts.down_proj")).ok_or_else(|| anyhow!("no down {l}"))?;
+			store.place(&ekey(l, e), SLOT_BYTES, |dst| {
+				m.shards[gu.shard].read_exact_at(&mut dst[..GU_BYTES], (gu.off + e * GU_BYTES) as u64)?;
+				m.shards[dn.shard].read_exact_at(&mut dst[GU_BYTES..], (dn.off + e * DN_BYTES) as u64)
+			})?;
+			beat();
+		}
+	}
+	store.report();
+	m.store = store;
+
+	// Loud staleness canary: VRAM homes must read back the shard bytes. A driver
+	// serving stale zeros for fresh pool pages dies HERE, not mid-step-0.
+	for name in [
+		"model.decoder.embed_tokens.weight".to_string(),
+		fixed_names(0).remove(0),
+		fixed_names(NL - 1).pop().ok_or_else(|| anyhow!("no names"))?,
+	] {
+		if let Some(Home::Vram(dev)) = m.store.home(&name) {
+			let t = &m.big[&name];
+			let n = 4096.min(t.nbytes);
+			for off in [0, t.nbytes - n] {
+				let want = if name.ends_with("embed_tokens.weight") {
+					m.emb[off..off + n].to_vec()
+				} else {
+					m.read_bytes(t, off, n)?
+				};
+				let mut got = vec![0u8; n];
+				bview(dev, off, n).download_u8(&mut got)?;
+				if got != want {
+					bail!("waterfall {name} stale at byte {off}: upload not visible to GPU reads");
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 // Host RMSNorm (scale-less) for router input.
@@ -386,6 +610,7 @@ fn layer(
 	let d = dims(l);
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, NQH * d.hd, d.nkv * d.hd);
 	// Attention. Full layers have no v_proj: v reuses the k_proj weight window.
+	let _ta = Instant::now();
 	gpu_rmsnorm_f64_into(h_in, Some(&nm["input"]), &ar.x, t, NE, EPS);
 	gpu_gemm_bt_into(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, &ar.q, t, qd, NE)?;
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
@@ -404,22 +629,31 @@ fn layer(
 	gpu_gemm_bt_into(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, &ar.o, t, NE, qd)?;
 	gpu_rmsnorm_f64_into(&ar.o, Some(&nm["post_attn"]), &ar.o, t, NE, EPS);
 	gpu_add_into(&ar.o, h_in, &ar.attn_out, t * NE);
+	acc(&ATTN_NS, _ta);
 
 	// Shared MLP branch.
+	let _tm = Instant::now();
 	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pre_ff"]), &ar.cms, t, NE, EPS);
 	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, &ar.g, t, NFF, NE)?;
 	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, &ar.u, t, NFF, NE)?;
 	gpu_gelu_mul_into(&ar.g, &ar.u, &ar.act, t * NFF);
 	gpu_gemm_bt_into(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, &ar.mlp0, t, NE, NFF)?;
 	gpu_rmsnorm_f64_into(&ar.mlp0, Some(&nm["pf1"]), &ar.mlp, t, NE, EPS);
+	acc(&MLP_NS, _tm);
 
 	// MoE branch — routing + grouping on host, expert GEMMs on GPU.
+	let _tmoe = Instant::now();
 	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pn2"]), &ar.cmoes, t, NE, EPS);
+	let _rt = Instant::now();
 	let ao_host = ar.attn_out.download_vec()?;
 	let cmoes_host = ar.cmoes.download_vec()?;
+	acc(&MOE_RT_NS, _rt);
+	let _tr = Instant::now();
 	let (rw, gis, pe) = (&m.rw[l], &m.gis[l], &m.pe[l]);
 	let inv_sqrt_ne = 1.0 / (NE as f64).sqrt();
-	let mut e2p: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+	// BTreeMap: deterministic iteration (HashMap order randomizes per process →
+	// f64 accumulation order → sampler flips) and offset-ordered disk reads.
+	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
 	for p in 0..t {
 		let rmn = rnp(&ao_host[p * NE..(p + 1) * NE]);
 		let rin: Vec<f64> = (0..NE).map(|xx| rmn[xx] * inv_sqrt_ne * gis[xx]).collect();
@@ -437,6 +671,7 @@ fn layer(
 			e2p.entry(e).or_default().push((p, rl[e] / ws));
 		}
 	}
+	acc(&ROUTE_NS, _tr);
 	let mut mo_host = vec![0.0f64; t * NE];
 	let mut xg = vec![0.0f64; t * NE];
 	let mut dv_host = vec![0.0f64; t * NE];
@@ -445,13 +680,18 @@ fn layer(
 		for (i, &(p, _)) in poslist.iter().enumerate() {
 			xg[i * NE..(i + 1) * NE].copy_from_slice(&cmoes_host[p * NE..(p + 1) * NE]);
 		}
+		let _rt = Instant::now();
 		ar.moe_xg.load(&xg[..np * NE])?;
-		let gu_w = m.stream_expert(&layer_name(l, "experts.gate_up_proj"), e, 2 * NFFE * NE)?;
+		acc(&MOE_RT_NS, _rt);
+		let es = m.expert_slot(l, e)?;
+		let gu_w = m.widen_from(&es, 0, 2 * NFFE * NE);
 		gpu_gemm_bt_into(&ar.moe_xg, &gu_w, &ar.moe_gu, np, 2 * NFFE, NE)?;
 		gpu_glu_gelu_into(&ar.moe_gu, &ar.moe_ea, np, NFFE);
-		let dn_w = m.stream_expert(&layer_name(l, "experts.down_proj"), e, NE * NFFE)?;
+		let dn_w = m.widen_from(&es, GU_BYTES, NE * NFFE);
 		gpu_gemm_bt_into(&ar.moe_ea, &dn_w, &ar.moe_dv, np, NE, NFFE)?;
+		let _rt = Instant::now();
 		ar.moe_dv.download(&mut dv_host[..np * NE])?;
+		acc(&MOE_RT_NS, _rt);
 		for (i, &(p, w)) in poslist.iter().enumerate() {
 			let s = w * pe[e];
 			for xx in 0..NE {
@@ -461,6 +701,7 @@ fn layer(
 	}
 	ar.mo.load(&mo_host)?;
 	gpu_rmsnorm_f64_into(&ar.mo, Some(&nm["pf2"]), &ar.mop, t, NE, EPS);
+	acc(&MOE_NS, _tmoe);
 
 	// Combine: post_ffw_norm(mlp+moe), then (attn_out + comb) * layer_scalar.
 	gpu_add_into(&ar.mlp, &ar.mop, &ar.comb, t * NE);
@@ -477,23 +718,29 @@ fn layer_name(l: usize, suffix: &str) -> String {
 // LM head: hfs (ncanvas, NE) @ emb (VOCAB, NE)^T -> host logits (ncanvas, VOCAB),
 // tiling the vocab so the widened f64 chunk stays small.
 fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec<f64>> {
+	let _tl = Instant::now();
 	let mut logits = vec![0.0f64; ncanvas * VOCAB];
 	let mut out_host = vec![0.0f64; ncanvas * LM_CHUNK];
 	let mut c0 = 0;
 	while c0 < VOCAB {
 		let cn = LM_CHUNK.min(VOCAB - c0);
-		// Reuse the weight-streaming windows (stage → win) — the layer loop is done
-		// for this step, so nothing else holds them. No allocation.
-		let raw = &m.emb[c0 * NE * 2..(c0 + cn) * NE * 2];
-		m.stage.write_u8(raw)?;
-		gpu_widen_bf16_into(&m.stage, &m.win, cn * NE);
-		gpu_gemm_bt_into(hfs, &m.win.view(0, cn * NE), &ar.lm_out, ncanvas, cn, NE)?;
+		// Embedding tile: widen from its waterfall home (VRAM in place; otherwise
+		// the host copy bounces through stage). No allocation.
+		let w = match m.store.home("model.decoder.embed_tokens.weight") {
+			Some(Home::Vram(dev)) => m.widen_from(dev, c0 * NE * 2, cn * NE),
+			_ => {
+				m.to_stage(&m.emb[c0 * NE * 2..(c0 + cn) * NE * 2])?;
+				m.widen_from(&m.stage, 0, cn * NE)
+			}
+		};
+		gpu_gemm_bt_into(hfs, &w, &ar.lm_out, ncanvas, cn, NE)?;
 		ar.lm_out.download(&mut out_host[..ncanvas * cn])?;
 		for p in 0..ncanvas {
 			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
 		}
 		c0 += cn;
 	}
+	acc(&LM_NS, _tl);
 	Ok(logits)
 }
 
@@ -556,12 +803,28 @@ fn main() -> Result<()> {
 
 	eprintln!("loading model...");
 	let t_load = Instant::now();
+	let watchdog = arm_watchdog();
 	recipe_infer::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 	// Streaming inference churns fresh buffers with immediate host->device copies;
 	// commit each allocation before it is written to (avoids SDMA page faults).
 	gpu_core::memory::set_alloc_sync(true);
-	let m = load_model(&dir)?;
-	eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+	// Keepalive: load has multi-second host-only gaps (disk reads, tokenize) and
+	// the GPU has a 5s runtime-PM autosuspend; the wedges cluster right after
+	// those gaps. A 1 Hz trivial device op keeps the queues warm through load.
+	let keepalive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+	{
+		let ka = keepalive.clone();
+		let buf = GpuBuffer::alloc(1)?;
+		std::thread::spawn(move || {
+			while ka.load(std::sync::atomic::Ordering::Relaxed) {
+				if buf.memset_zero(8).is_err() {
+					return;
+				}
+				std::thread::sleep(std::time::Duration::from_secs(1));
+			}
+		});
+	}
+	let mut m = load_model(&dir)?;
 
 	// Build the diffusion canvas: prompt tokens + NCANVAS masks.
 	let mut toks = tokenize(&prompt, &rev);
@@ -583,6 +846,15 @@ fn main() -> Result<()> {
 		let _t = gpu_core::memory::tag_scope("arena");
 		Arena::new(t)?
 	};
+	// Everything else the forward allocates now exists (arena, stage, win,
+	// rocBLAS workspace via preflight) — the waterfall takes all that remains.
+	eprintln!("preflight gemms...");
+	preflight(&m, &ar, t)?;
+	eprintln!("waterfall fill...");
+	fill_store(&mut m)?;
+	watchdog.store(false, std::sync::atomic::Ordering::Relaxed);
+	keepalive.store(false, std::sync::atomic::Ordering::Relaxed);
+	eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 	let allocs_before = gpu_core::memory::device_alloc_count();
 	let t0 = Instant::now();
 
@@ -628,12 +900,25 @@ fn main() -> Result<()> {
 		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
 
 		// 30 transformer layers, ping-ponging the hidden state between ha/hb.
+		let bithash = |b: &GpuBuffer, n: usize| -> Result<u64> {
+			let mut v = vec![0.0f64; n];
+			b.view(0, n).download(&mut v)?;
+			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x100000001b3)))
+		};
+		if step == 0 {
+			eprintln!("[hash] step0 input {:016x}", bithash(&ar.ha, t * NE)?);
+		}
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..NL {
+			eprint!("\rstep {step} layer {}/{NL} ({:.0}s)", l + 1, t0.elapsed().as_secs_f64());
 			layer(&m, l, src, dst, t, prefix, &ar)?;
 			std::mem::swap(&mut src, &mut dst);
+			if step == 0 {
+				eprintln!("\n[hash] step0 layer {l:2} {:016x}", bithash(src, t * NE)?);
+			}
 		}
+		eprint!("\r\x1b[K");
 		let hbuf = src; // last buffer written
 		let nan = hbuf.download_vec()?.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {
@@ -687,6 +972,21 @@ fn main() -> Result<()> {
 
 	let allocs_after = gpu_core::memory::device_alloc_count();
 	eprintln!("steady-state allocs: {}", allocs_after - allocs_before);
+	let tot = t0.elapsed().as_secs_f64();
+	let s = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+	eprintln!(
+		"[breakdown] total={tot:.1}s  disk={:.1}s  h2d(write_u8)={:.1}s  widen(launch)={:.1}s",
+		s(&DISK_NS), s(&H2D_NS), s(&WIDEN_NS),
+	);
+	eprintln!(
+		"[sections]  attn={:.1}s  mlp={:.1}s  moe={:.1}s (route={:.1}s roundtrips={:.1}s)  lm_head={:.1}s",
+		s(&ATTN_NS), s(&MLP_NS), s(&MOE_NS), s(&ROUTE_NS), s(&MOE_RT_NS), s(&LM_NS),
+	);
+	eprintln!(
+		"[experts]   from VRAM={}  from RAM={}  from DISK={}",
+		E_VRAM.load(Ordering::Relaxed), E_RAM.load(Ordering::Relaxed), E_DISK.load(Ordering::Relaxed),
+	);
+	m.store.report();
 
 	let out: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
 	println!("\n=== OUTPUT ===\n{out}");

@@ -403,7 +403,21 @@ impl GpuBuffer {
 		Self::alloc_bytes(n_floats * std::mem::size_of::<f64>())
 	}
 
+	/// Waterfall probe: allocate or quietly refuse. A `None` is the "VRAM is
+	/// full" signal the waterfall fills against — no autopsy spam, no error.
+	/// Routes through the same single `hipMallocAsync` site as `alloc_bytes`.
+	pub fn try_alloc_bytes(n_bytes: usize) -> Option<Self> {
+		match Self::alloc_bytes_inner(n_bytes, true) {
+			Ok(buf) => Some(buf),
+			Err(_) => None,
+		}
+	}
+
 	pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
+		Self::alloc_bytes_inner(n_bytes, false)
+	}
+
+	fn alloc_bytes_inner(n_bytes: usize, quiet_oom: bool) -> Result<Self, HipError> {
 		ensure_pool_warmed();
 		ALLOC_FROZEN.with(|f| {
 			assert!(
@@ -441,7 +455,7 @@ impl GpuBuffer {
 		}
 		let mut ptr: *mut c_void = std::ptr::null_mut();
 		let code = unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) };
-		if code == 2 {
+		if code == 2 && !quiet_oom {
 			oom_report(n_bytes);
 		}
 		check(code)?;

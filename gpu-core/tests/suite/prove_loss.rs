@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "loss" kernel category.
 //
 // For every loss-category item in kernel_inventory/*.json, if its canonical op

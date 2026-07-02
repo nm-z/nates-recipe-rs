@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "shape" inventory category.
 //
 // Shape ops are pure index remaps: out[i] = x[src(i)]. No arithmetic happens,

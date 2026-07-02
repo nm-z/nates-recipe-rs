@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "padding" inventory category.
 //
 // For every padding-category item in kernel_inventory/*.json, canonicalize its

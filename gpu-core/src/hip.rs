@@ -117,6 +117,7 @@ unsafe extern "C" {
 	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
 	pub fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
 	// Managed (unified) memory
 	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
@@ -198,6 +199,38 @@ pub fn set_device(device: i32) -> Result<(), HipError> {
 /// unmaps freed pages on sync and a later hipMallocAsync can hand back an
 /// address whose backing is not yet remapped when a kernel touches it — an
 /// intermittent GPU page fault under heavy alloc/free churn (weight streaming).
+/// Bytes the default pool has reserved from the driver but not handed out —
+/// growth for a new allocation comes on top of this, so a "how much can I
+/// still ask for" computation must subtract it.
+pub fn pool_slack(device: i32) -> Result<usize, HipError> {
+	const RESERVED_MEM_CURRENT: i32 = 0x5;
+	const USED_MEM_CURRENT: i32 = 0x7;
+	let mut pool: *mut c_void = std::ptr::null_mut();
+	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+	let mut reserved: u64 = 0;
+	let mut used: u64 = 0;
+	check(unsafe { hipMemPoolGetAttribute(pool, RESERVED_MEM_CURRENT, &mut reserved as *mut u64 as *mut c_void) })?;
+	check(unsafe { hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, &mut used as *mut u64 as *mut c_void) })?;
+	Ok(reserved.saturating_sub(used) as usize)
+}
+
+/// Physical VRAM the kernel reports free across ALL clients (compositor
+/// included) — `hipMemGetInfo` only sees KFD's own accounting, and an ask
+/// beyond real physical free is an uncatchable `VmHeap::MapPhysMemory` abort,
+/// so the slab pre-check needs the amdgpu sysfs ground truth.
+pub fn sysfs_vram_free() -> Option<usize> {
+	for card in std::fs::read_dir("/sys/class/drm").ok()? {
+		let dev = card.ok()?.path().join("device");
+		let read = |f: &str| -> Option<usize> {
+			std::fs::read_to_string(dev.join(f)).ok()?.trim().parse().ok()
+		};
+		if let (Some(total), Some(used)) = (read("mem_info_vram_total"), read("mem_info_vram_used")) {
+			return Some(total.saturating_sub(used));
+		}
+	}
+	None
+}
+
 pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
 	let mut pool: *mut c_void = std::ptr::null_mut();

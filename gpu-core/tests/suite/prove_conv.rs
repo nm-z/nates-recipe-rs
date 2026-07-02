@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "conv" inventory category.
 //
 // For every conv-category item in kernel_inventory/*.json, canonicalize its name;

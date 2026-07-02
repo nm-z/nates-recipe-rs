@@ -32,3 +32,4 @@ pub mod rope;
 pub mod sequence;
 pub mod svm;
 pub mod tiered;
+pub mod waterfall;

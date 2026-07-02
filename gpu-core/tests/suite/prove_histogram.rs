@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "histogram" inventory category.
 //
 // Two real kernels are bridged here and proven on the live gfx1101 GPU against

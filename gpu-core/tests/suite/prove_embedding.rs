@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "embedding" inventory category.
 //
 // For every embedding-category item in kernel_inventory/*.json, canonicalize its

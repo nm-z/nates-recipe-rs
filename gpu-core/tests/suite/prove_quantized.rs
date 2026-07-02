@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "quantized" inventory category.
 //
 // Affine per-tensor quantization primitives proven on the gfx1101 GPU:

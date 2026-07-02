@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "optimizer" inventory category.
 //
 // For every optimizer-category item in kernel_inventory/*.json, canonicalize its

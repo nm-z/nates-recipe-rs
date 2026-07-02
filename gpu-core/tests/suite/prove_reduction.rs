@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 // Live-GPU proof harness for the "reduction" inventory category.
 //
 // For every reduction-category item in kernel_inventory/*.json, canonicalize its
