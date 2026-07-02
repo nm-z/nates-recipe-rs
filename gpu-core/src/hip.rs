@@ -55,9 +55,6 @@ pub const HIP_MEMCPY_D2H: i32 = 2;
 pub const HIP_MEMCPY_D2D: i32 = 3;
 
 unsafe extern "C" {
-	pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
-	pub fn hipFree(ptr: *mut c_void) -> i32;
-	pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
 	pub fn hipMemset(dst: *mut c_void, value: i32, size: usize) -> i32;
 	pub fn hipGetLastError() -> i32;
 	pub fn hipDeviceSynchronize() -> i32;
@@ -77,7 +74,7 @@ unsafe extern "C" {
 	// Peek at last error without clearing it
 	pub fn hipPeekAtLastError() -> i32;
 	// Async transfers
-	pub fn hipMemcpyAsync(
+	pub(crate) fn hipMemcpyAsync(
 		dst: *mut c_void,
 		src: *const c_void,
 		size: usize,
@@ -86,8 +83,8 @@ unsafe extern "C" {
 	) -> i32;
 	pub fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
 	// Pinned host memory
-	pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
-	pub fn hipHostFree(ptr: *mut c_void) -> i32;
+	pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+	pub(crate) fn hipHostFree(ptr: *mut c_void) -> i32;
 	pub fn hipHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> i32;
 	pub fn hipHostUnregister(ptr: *mut c_void) -> i32;
 	// Device count and attributes
@@ -113,8 +110,8 @@ unsafe extern "C" {
 		size: usize,
 	) -> i32;
 	// Stream-ordered allocation
-	pub fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
-	pub fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
+	pub(crate) fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
+	pub(crate) fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
 	pub fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;

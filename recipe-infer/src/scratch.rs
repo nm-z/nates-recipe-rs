@@ -339,10 +339,10 @@ impl Drop for Scratch {
 		// (fit / score / eval / inference). Cheap — only at jawn transitions.
 		let _ = gpu_core::hip::device_synchronize();
 		if !self.pinned_scalar.is_null() {
-			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar as *mut std::ffi::c_void) };
+			let _ = unsafe { gpu_core::hip::host_free(self.pinned_scalar as *mut std::ffi::c_void) };
 		}
 		if !self.pinned_scalar_b.is_null() {
-			let _ = unsafe { gpu_core::hip::hipHostFree(self.pinned_scalar_b as *mut std::ffi::c_void) };
+			let _ = unsafe { gpu_core::hip::host_free(self.pinned_scalar_b as *mut std::ffi::c_void) };
 		}
 	}
 }
