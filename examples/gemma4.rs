@@ -997,6 +997,12 @@ fn main() -> Result<()> {
 	let out: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
 	println!("\n=== OUTPUT ===\n{out}");
 	eprintln!("{}", gpu_core::memory::ledger_report());
+	// exit → free all: the claim (the process's ONE owned device allocation)
+	// must drop BEFORE shutdown marks the runtime down, or its hipFreeAsync is
+	// skipped and VRAM only returns via process death.
+	drop(ar);
+	drop(m);
+	eprintln!("exit: device frees {}", gpu_core::memory::device_free_count());
 	recipe_infer::shutdown();
 	Ok(())
 }

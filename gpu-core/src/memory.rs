@@ -188,6 +188,10 @@ pub fn device_alloc_count() -> usize {
 	ALLOC_TOTAL.load(Ordering::Relaxed)
 }
 
+pub fn device_free_count() -> usize {
+	FREE_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn alloc_freeze() {
 	ALLOC_FROZEN.with(|f| f.set(true));
 }
@@ -267,6 +271,18 @@ unsafe fn dev_copy(
 
 const BOUNCE_BYTES: usize = 64 << 20;
 static BOUNCE: Mutex<usize> = Mutex::new(0);
+
+/// Explicitly release the pinned bounce at shutdown (exit frees ALL RAM).
+pub(crate) fn free_bounce() {
+	let mut guard = match BOUNCE.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if *guard != 0 {
+		let _ = unsafe { crate::hip::host_free(*guard as *mut c_void) };
+		*guard = 0;
+	}
+}
 
 unsafe fn h2d_pinned(
 	dst: *mut c_void,

@@ -1531,6 +1531,9 @@ pub fn gpu_shutdown() {
 			}
 		}
 	});
+	// Free the pinned H2D bounce (the one hipHostMalloc) — exit frees ALL RAM
+	// and VRAM explicitly, not by process teardown.
+	crate::memory::free_bounce();
 	// Return retained pool VRAM to the driver before the process dies — see
 	// trim_mempool: async teardown reclaim races the next process's first touch.
 	let _ = crate::hip::trim_mempool(0);
