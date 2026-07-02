@@ -37,13 +37,30 @@ unsafe extern "C" {
 
 	fn launch_uf_compress(parent: *mut c_void, n_nodes: i32, stream: *mut c_void);
 
-	fn launch_boruvka_find_cheapest(
+	fn launch_boruvka_init(
+		best_edge: *mut c_void,
+		best_wkey: *mut c_void,
+		n_nodes: i32,
+		stream: *mut c_void,
+	);
+
+	fn launch_boruvka_min_w(
 		edge_src: *const c_void,
 		edge_dst: *const c_void,
 		edge_w: *const c_void,
 		parent: *const c_void,
+		best_wkey: *mut c_void,
+		n_edges: i32,
+		stream: *mut c_void,
+	);
+
+	fn launch_boruvka_min_e(
+		edge_src: *const c_void,
+		edge_dst: *const c_void,
+		edge_w: *const c_void,
+		parent: *const c_void,
+		best_wkey: *const c_void,
 		best_edge: *mut c_void,
-		best_w: *mut c_void,
 		n_edges: i32,
 		stream: *mut c_void,
 	);
@@ -52,6 +69,7 @@ unsafe extern "C" {
 		best_edge: *const c_void,
 		in_mst: *mut c_void,
 		n_nodes: i32,
+		n_edges: i32,
 		stream: *mut c_void,
 	);
 
@@ -205,17 +223,34 @@ pub fn gpu_boruvka_mst(
 	let mut best_edge_h = vec![0i32; n_nodes];
 	let mut flag = [0i32; 1];
 	loop {
-		// reset best_edge[c] = -1 (all bytes 0xFF == i32 -1)
-		best_edge.fill_bytes(0xFF, n_nodes * std::mem::size_of::<i32>())?;
-
+		// Per-round reset (best_edge = INT_MAX sentinel, best_wkey = u64 max),
+		// then a two-pass race-free min: pass 1 atomicMin's the monotonic
+		// weight encoding per component, pass 2 atomicMin's the edge index
+		// among edges attaining that min (deterministic tie-break).
 		unsafe {
-			launch_boruvka_find_cheapest(
+			launch_boruvka_init(best_edge.ptr_raw(), best_w.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
+		}
+		check_launch();
+		unsafe {
+			launch_boruvka_min_w(
 				edge_src.ptr_raw() as *const c_void,
 				edge_dst.ptr_raw() as *const c_void,
 				edge_w.ptr_raw() as *const c_void,
 				parent.ptr_raw() as *const c_void,
-				best_edge.ptr_raw(),
 				best_w.ptr_raw(),
+				n_edges as i32,
+				std::ptr::null_mut(),
+			);
+		}
+		check_launch();
+		unsafe {
+			launch_boruvka_min_e(
+				edge_src.ptr_raw() as *const c_void,
+				edge_dst.ptr_raw() as *const c_void,
+				edge_w.ptr_raw() as *const c_void,
+				parent.ptr_raw() as *const c_void,
+				best_w.ptr_raw() as *const c_void,
+				best_edge.ptr_raw(),
 				n_edges as i32,
 				std::ptr::null_mut(),
 			);
@@ -226,6 +261,7 @@ pub fn gpu_boruvka_mst(
 				best_edge.ptr_raw() as *const c_void,
 				in_mst.ptr_raw(),
 				n_nodes as i32,
+				n_edges as i32,
 				std::ptr::null_mut(),
 			);
 		}
@@ -239,7 +275,7 @@ pub fn gpu_boruvka_mst(
 		let mut sel_src: Vec<i32> = Vec::new();
 		let mut sel_dst: Vec<i32> = Vec::new();
 		for &e in &best_edge_h {
-			if e >= 0 && seen.insert(e) {
+			if e >= 0 && (e as usize) < n_edges && seen.insert(e) {
 				sel_src.push(src_h[e as usize]);
 				sel_dst.push(dst_h[e as usize]);
 			}

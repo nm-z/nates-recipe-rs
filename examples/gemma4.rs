@@ -11,10 +11,10 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_gelu_mul_into, gpu_glu_gelu_into, gpu_gqa_attn_into, gpu_rmsnorm_f64_into,
-	gpu_rope_partial, gpu_widen_bf16_into,
+	gpu_gelu_mul_into, gpu_gemm_bt_f64_into, gpu_glu_gelu_into, gpu_gqa_attn_into,
+	gpu_rmsnorm_f64_into, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16_into,
 };
-use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
+use gpu_core::kernels::gpu_add_into;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::waterfall::{Home, Waterfall};
 use recipe_infer::safetensors::parse_safetensors_header;
@@ -22,9 +22,47 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Global (cross-library) VRAM tracking (see gpu_core::memory ledger's
+/// "global (vramspy, ...)" section) only sees anything when this process was
+/// started under `LD_PRELOAD=libvramspy.so`. Detect absence here — before any
+/// GPU call — and re-exec with the shim preloaded. A run without global
+/// tracking is not allowed: both failure branches (re-exec loop, missing
+/// libvramspy.so) are hard errors, not silently-degraded fallbacks.
+fn ensure_vramspy_preloaded() -> Result<()> {
+	// SAFETY: dlsym query only, no side effects on the process's allocations.
+	let loaded = !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_loaded".as_ptr()) }.is_null();
+	if loaded {
+		return Ok(());
+	}
+	if std::env::var_os("VRAMSPY_REEXEC").is_some() {
+		bail!("vramspy re-exec loop: libvramspy.so did not load");
+	}
+	let exe = std::env::current_exe()?;
+	let shim = exe
+		.parent()
+		.and_then(|p| p.parent())
+		.map(|p| p.join("libvramspy.so"))
+		.ok_or_else(|| anyhow!("could not resolve libvramspy.so path from current_exe {}", exe.display()))?;
+	if !shim.exists() {
+		bail!("vramspy: {} not found — build it with `cargo build --release -p vramspy`", shim.display());
+	}
+	let ld_preload = match std::env::var("LD_PRELOAD") {
+		Ok(existing) if !existing.is_empty() => format!("{existing}:{}", shim.display()),
+		_ => shim.display().to_string(),
+	};
+	// SAFETY: single-threaded at this point (first statement of main).
+	unsafe {
+		std::env::set_var("LD_PRELOAD", &ld_preload);
+		std::env::set_var("VRAMSPY_REEXEC", "1");
+	}
+	eprintln!("re-exec with vramspy");
+	Err(anyhow!(std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).exec()))
+}
 
 // DEBUG timing accumulators (ns): disk read, H2D upload (write_u8), widen kernel.
 static DISK_NS: AtomicU64 = AtomicU64::new(0);
@@ -496,13 +534,13 @@ fn fixed_names(l: usize) -> Vec<String> {
 // rocBLAS grows its workspace on first use per shape class, and the waterfall
 // takes ALL remaining VRAM, so the workspace must exist first.
 fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
-	gpu_core::kernels::gpu_gemm_bt_into(&ar.x, &m.win.view(0, 8192 * NE), &ar.q, t, 8192, NE)?;
+	gpu_gemm_bt_f64_into(&ar.x, &m.win.view(0, 8192 * NE), &ar.q, t, 8192, NE);
 	beat();
-	gpu_core::kernels::gpu_gemm_bt_into(&ar.cms, &m.win.view(0, NFF * NE), &ar.g, t, NFF, NE)?;
+	gpu_gemm_bt_f64_into(&ar.cms, &m.win.view(0, NFF * NE), &ar.g, t, NFF, NE);
 	beat();
-	gpu_core::kernels::gpu_gemm_bt_into(&ar.act, &m.win.view(0, NE * NFF), &ar.mlp0, t, NE, NFF)?;
+	gpu_gemm_bt_f64_into(&ar.act, &m.win.view(0, NE * NFF), &ar.mlp0, t, NE, NFF);
 	beat();
-	gpu_core::kernels::gpu_gemm_bt_into(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), &ar.moe_gu, t, 2 * NFFE, NE)?;
+	gpu_gemm_bt_f64_into(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), &ar.moe_gu, t, 2 * NFFE, NE);
 	gpu_core::hip::device_synchronize()?;
 	beat();
 	Ok(())
@@ -612,13 +650,13 @@ fn layer(
 	// Attention. Full layers have no v_proj: v reuses the k_proj weight window.
 	let _ta = Instant::now();
 	gpu_rmsnorm_f64_into(h_in, Some(&nm["input"]), &ar.x, t, NE, EPS);
-	gpu_gemm_bt_into(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, &ar.q, t, qd, NE)?;
+	gpu_gemm_bt_f64_into(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, &ar.q, t, qd, NE);
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
-	gpu_gemm_bt_into(&ar.x, &wk, &ar.k, t, kd, NE)?;
+	gpu_gemm_bt_f64_into(&ar.x, &wk, &ar.k, t, kd, NE);
 	if d.has_v {
-		gpu_gemm_bt_into(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, &ar.v, t, kd, NE)?;
+		gpu_gemm_bt_f64_into(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, &ar.v, t, kd, NE);
 	} else {
-		gpu_gemm_bt_into(&ar.x, &wk, &ar.v, t, kd, NE)?;
+		gpu_gemm_bt_f64_into(&ar.x, &wk, &ar.v, t, kd, NE);
 	}
 	gpu_rmsnorm_f64_into(&ar.q, Some(&nm["q_norm"]), &ar.q, t * NQH, hd, EPS);
 	gpu_rmsnorm_f64_into(&ar.k, Some(&nm["k_norm"]), &ar.k, t * nkv, hd, EPS);
@@ -626,7 +664,7 @@ fn layer(
 	gpu_rope_partial(&ar.q, t * NQH, hd, d.rotary, NQH, d.theta);
 	gpu_rope_partial(&ar.k, t * nkv, hd, d.rotary, nkv, d.theta);
 	gpu_gqa_attn_into(&ar.q, &ar.k, &ar.v, &ar.attn, t, NQH, nkv, hd, prefix);
-	gpu_gemm_bt_into(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, &ar.o, t, NE, qd)?;
+	gpu_gemm_bt_f64_into(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, &ar.o, t, NE, qd);
 	gpu_rmsnorm_f64_into(&ar.o, Some(&nm["post_attn"]), &ar.o, t, NE, EPS);
 	gpu_add_into(&ar.o, h_in, &ar.attn_out, t * NE);
 	acc(&ATTN_NS, _ta);
@@ -634,10 +672,10 @@ fn layer(
 	// Shared MLP branch.
 	let _tm = Instant::now();
 	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pre_ff"]), &ar.cms, t, NE, EPS);
-	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, &ar.g, t, NFF, NE)?;
-	gpu_gemm_bt_into(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, &ar.u, t, NFF, NE)?;
+	gpu_gemm_bt_f64_into(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, &ar.g, t, NFF, NE);
+	gpu_gemm_bt_f64_into(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, &ar.u, t, NFF, NE);
 	gpu_gelu_mul_into(&ar.g, &ar.u, &ar.act, t * NFF);
-	gpu_gemm_bt_into(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, &ar.mlp0, t, NE, NFF)?;
+	gpu_gemm_bt_f64_into(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, &ar.mlp0, t, NE, NFF);
 	gpu_rmsnorm_f64_into(&ar.mlp0, Some(&nm["pf1"]), &ar.mlp, t, NE, EPS);
 	acc(&MLP_NS, _tm);
 
@@ -685,10 +723,10 @@ fn layer(
 		acc(&MOE_RT_NS, _rt);
 		let es = m.expert_slot(l, e)?;
 		let gu_w = m.widen_from(&es, 0, 2 * NFFE * NE);
-		gpu_gemm_bt_into(&ar.moe_xg, &gu_w, &ar.moe_gu, np, 2 * NFFE, NE)?;
+		gpu_gemm_bt_f64_into(&ar.moe_xg, &gu_w, &ar.moe_gu, np, 2 * NFFE, NE);
 		gpu_glu_gelu_into(&ar.moe_gu, &ar.moe_ea, np, NFFE);
 		let dn_w = m.widen_from(&es, GU_BYTES, NE * NFFE);
-		gpu_gemm_bt_into(&ar.moe_ea, &dn_w, &ar.moe_dv, np, NE, NFFE)?;
+		gpu_gemm_bt_f64_into(&ar.moe_ea, &dn_w, &ar.moe_dv, np, NE, NFFE);
 		let _rt = Instant::now();
 		ar.moe_dv.download(&mut dv_host[..np * NE])?;
 		acc(&MOE_RT_NS, _rt);
@@ -707,7 +745,7 @@ fn layer(
 	gpu_add_into(&ar.mlp, &ar.mop, &ar.comb, t * NE);
 	gpu_rmsnorm_f64_into(&ar.comb, Some(&nm["pfw"]), &ar.comb, t, NE, EPS);
 	gpu_add_into(&ar.attn_out, &ar.comb, h_out, t * NE);
-	gpu_scale_inplace(h_out, m.ls[l], t * NE);
+	gpu_scale_f64_inplace(h_out, m.ls[l], t * NE);
 	Ok(())
 }
 
@@ -733,7 +771,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 				m.widen_from(&m.stage, 0, cn * NE)
 			}
 		};
-		gpu_gemm_bt_into(hfs, &w, &ar.lm_out, ncanvas, cn, NE)?;
+		gpu_gemm_bt_f64_into(hfs, &w, &ar.lm_out, ncanvas, cn, NE);
 		ar.lm_out.download(&mut out_host[..ncanvas * cn])?;
 		for p in 0..ncanvas {
 			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
@@ -773,6 +811,8 @@ fn tokenize(prompt: &str, rev: &HashMap<String, u32>) -> Vec<u32> {
 }
 
 fn main() -> Result<()> {
+	ensure_vramspy_preloaded()?;
+
 	let dir = PathBuf::from("/home/nate/Desktop/gemma4/diffusiongemma-26B-A4B-it");
 	let prompt = std::env::args().nth(1).unwrap_or_else(|| "The capital of France is".to_string());
 
@@ -806,14 +846,57 @@ fn main() -> Result<()> {
 	let watchdog = arm_watchdog();
 	// One-claim lifecycle: no pool warm (the claim is the pool's only customer),
 	// then ONE allocation of all free VRAM becomes the process arena — every
-	// GpuBuffer after this line carves from it, including hipBLAS's workspace.
+	// GpuBuffer after this line carves from it. No hipBLAS anywhere in this
+	// forward (custom gemm_bt_f64/scale_f64 kernels only), so there is no
+	// hipBLAS workspace to preallocate.
 	// init → one precalculated claim; exit → its one free.
 	gpu_core::memory::skip_pool_warm();
 	recipe_infer::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
-	let claim = Waterfall::claim();
+	// Probe child: attempt exactly one allocation and report by exit code. An
+	// oversize ask dies in an uncatchable VmHeap abort — in THIS process, which
+	// is disposable. The parent walks the ask down until a child survives.
+	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
+		let n: usize = sz.to_string_lossy().parse().context("VRAM_PROBE parse")?;
+		std::process::exit(match GpuBuffer::try_alloc_bytes(n) {
+			Some(_) => 0,
+			None => 2,
+		});
+	}
+	// No driver counter reports the true mappable ceiling (hip and sysfs both
+	// over-report; the overshoot is an abort, not an error), so the ceiling is
+	// MEASURED: spawn probe children (cores off — the corpse is the signal)
+	// from the counters' guess downward; claim the first size that survives.
+	let claim = {
+		let mut want = Waterfall::claim_guess();
+		loop {
+			if want < (1 << 30) {
+				bail!("claim probe: nothing mappable above 1 GB");
+			}
+			let status = {
+				let mut c = std::process::Command::new(std::env::current_exe()?);
+				c.env("VRAM_PROBE", want.to_string());
+				unsafe {
+					c.pre_exec(|| {
+						let z = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+						libc::setrlimit(libc::RLIMIT_CORE, &z);
+						Ok(())
+					});
+				}
+				c.status().context("spawn claim probe")?
+			};
+			beat();
+			if status.success() {
+				break;
+			}
+			eprintln!("claim probe: {:.2} GB unmappable, backing off", want as f64 / (1u64 << 30) as f64);
+			want -= want / 16;
+		}
+		eprintln!("claim: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
+		let w = Waterfall::claim_bytes(want);
+		eprintln!("[right after claim] {}", gpu_core::memory::ledger_report());
+		w
+	};
 	beat();
-	let _blas_ws = GpuBuffer::alloc_bytes(128 << 20)?;
-	gpu_core::kernels::gpu_blas_workspace(&_blas_ws);
 	// Keepalive: load has multi-second host-only gaps (disk reads, tokenize) and
 	// the GPU has a 5s runtime-PM autosuspend; the wedges cluster right after
 	// those gaps. A 1 Hz trivial device op keeps the queues warm through load.
@@ -894,10 +977,10 @@ fn main() -> Result<()> {
 			}
 			ar.soft.load(&soft)?;
 			gpu_rmsnorm_f64_into(&ar.soft, Some(&m.sc_pre), &ar.scn, NCANVAS, NE, EPS);
-			gpu_gemm_bt_into(&ar.scn, &m.sc_gate, &ar.sg, NCANVAS, NFF, NE)?;
-			gpu_gemm_bt_into(&ar.scn, &m.sc_up, &ar.su, NCANVAS, NFF, NE)?;
+			gpu_gemm_bt_f64_into(&ar.scn, &m.sc_gate, &ar.sg, NCANVAS, NFF, NE);
+			gpu_gemm_bt_f64_into(&ar.scn, &m.sc_up, &ar.su, NCANVAS, NFF, NE);
 			gpu_gelu_mul_into(&ar.sg, &ar.su, &ar.sa, NCANVAS * NFF);
-			gpu_gemm_bt_into(&ar.sa, &m.sc_down, &ar.sc_add, NCANVAS, NE, NFF)?;
+			gpu_gemm_bt_f64_into(&ar.sa, &m.sc_down, &ar.sc_add, NCANVAS, NE, NFF);
 			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, &ar.cur, clen);
 			gpu_rmsnorm_f64_into(&ar.cur, None, &ar.normed, NCANVAS, NE, EPS);
 		} else {

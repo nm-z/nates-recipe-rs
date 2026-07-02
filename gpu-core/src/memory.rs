@@ -136,6 +136,50 @@ fn oom_report(req: usize) {
 	);
 }
 
+// ── Global (cross-library) tracking via the vramspy LD_PRELOAD shim ────────
+// The choke points above see only bytes this crate's own code path allocates.
+// The HIP/HSA runtime and the vendor BLAS lib allocate more underneath them
+// (code objects, workspaces, queues) that never touches this file. vramspy
+// interposes the four HSA allocation entry points and exposes per-kind
+// counters via a C ABI, present only when the process was started under
+// `LD_PRELOAD=libvramspy.so`. Resolved by name (RTLD_DEFAULT) at report time
+// so this crate never links against vramspy directly.
+
+/// Kernel-attributed VRAM/GTT (KiB, summed) from `/proc/self/fdinfo/*`. Every
+/// DRM fd carries a `drm-client-id:` line; the same client appears under
+/// multiple fds (dup'd handles), so entries are deduped by that id before
+/// summing `drm-memory-vram:` / `drm-memory-gtt:` — the ground truth
+/// vramspy's userspace count must reconcile against. `None` means the
+/// directory itself was unreadable (not "no GPU fd open", which is a
+/// legitimate all-zero result).
+fn kernel_fdinfo() -> Option<(u64, u64)> {
+	let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
+	let mut by_client: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+	for e in entries.flatten() {
+		let Ok(info) = std::fs::read_to_string(e.path()) else {
+			continue;
+		};
+		let mut client_id: Option<String> = None;
+		let mut vram_kib = 0u64;
+		let mut gtt_kib = 0u64;
+		for line in info.lines() {
+			if let Some(v) = line.strip_prefix("drm-client-id:") {
+				client_id = Some(v.trim().to_string());
+			} else if let Some(v) = line.strip_prefix("drm-memory-vram:") {
+				vram_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
+			} else if let Some(v) = line.strip_prefix("drm-memory-gtt:") {
+				gtt_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
+			}
+		}
+		if let Some(id) = client_id {
+			by_client.entry(id).or_insert((vram_kib, gtt_kib));
+		}
+	}
+	let vram_total: u64 = by_client.values().map(|(v, _)| v).sum();
+	let gtt_total: u64 = by_client.values().map(|(_, g)| g).sum();
+	Some((vram_total, gtt_total))
+}
+
 /// Exact device-memory ledger as a human table: live + peak bytes per purpose
 /// tag, cumulative transfer bytes/calls per direction, and device alloc/free
 /// counts. One call answers "how many GBs and for exactly what".
@@ -165,6 +209,58 @@ pub fn ledger_report() -> String {
 	);
 	let (a, f) = (ALLOC_TOTAL.load(Ordering::Relaxed), FREE_TOTAL.load(Ordering::Relaxed));
 	s += &format!("  device     allocs {a}  frees {f}  live-buffers {}\n", a.saturating_sub(f));
+
+	// SAFETY: RTLD_DEFAULT + a literal NUL-terminated name is always well-defined.
+	let live_sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_live".as_ptr()) };
+	if live_sym.is_null() {
+		s += "  global: vramspy NOT loaded (LD_PRELOAD libvramspy.so)\n";
+	} else {
+		let sym = |name: &std::ffi::CStr| -> *mut c_void {
+			// SAFETY: RTLD_DEFAULT + a valid NUL-terminated name.
+			unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }
+		};
+		let to_u32_u64 = |p: *mut c_void| -> extern "C" fn(u32) -> u64 {
+			// SAFETY: p was resolved from a vramspy_* symbol documented with this signature.
+			unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(u32) -> u64>(p) }
+		};
+		let live_fn = to_u32_u64(live_sym);
+		let peak_fn = to_u32_u64(sym(c"vramspy_peak"));
+		let allocs_fn = to_u32_u64(sym(c"vramspy_allocs"));
+		let frees_fn = to_u32_u64(sym(c"vramspy_frees"));
+		// SAFETY: same as above, different fixed signature (no kind argument).
+		let unknown_frees_fn = unsafe {
+			std::mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(c"vramspy_unknown_frees"))
+		};
+
+		s += "  global (vramspy, every byte incl. runtime+libs)\n";
+		let mut device_live = 0u64;
+		for (kind, label) in [(0u32, "device"), (1, "pinned"), (2, "kernarg"), (3, "other")] {
+			let (live, peak, al, fr) = (live_fn(kind), peak_fn(kind), allocs_fn(kind), frees_fn(kind));
+			if kind == 0 {
+				device_live = live;
+			}
+			s += &format!(
+				"    {label:<10} live {:>11}  peak {:>11}  (allocs {al} frees {fr})\n",
+				fmt_bytes(live as usize),
+				fmt_bytes(peak as usize)
+			);
+		}
+		let delta = (device_live as usize).saturating_sub(total_live);
+		s += &format!("    library delta: {} (unknown frees: {})\n", fmt_bytes(delta), unknown_frees_fn());
+	}
+
+	match kernel_fdinfo() {
+		Some((vram_kib, gtt_kib)) => {
+			s += &format!(
+				"  kernel (fdinfo)  vram {}  gtt {}\n",
+				fmt_bytes((vram_kib * 1024) as usize),
+				fmt_bytes((gtt_kib * 1024) as usize)
+			);
+		}
+		None => {
+			s += "  kernel (fdinfo): unreadable\n";
+		}
+	}
 	s += "───────────────────────────────────";
 	s
 }

@@ -7,7 +7,7 @@ edition = "2024"
 name = "recipe"
 
 [workspace]
-members = [".", "recipe-infer", "pantry"]
+members = [".", "recipe-infer", "pantry", "vramspy"]
 exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
 
 [dependencies]

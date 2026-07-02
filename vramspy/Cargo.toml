@@ -1,0 +1,11 @@
+[package]
+name = "vramspy"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "vramspy"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"

@@ -119,49 +119,64 @@ extern "C" void launch_uf_compress(
 // cheapest[c] = index of cheapest outgoing edge from component c (-1 = none).
 // We store (best_w, best_e_idx) packed as two arrays.
 
-extern "C" __global__ void boruvka_find_cheapest_kernel(
+// Monotonic u64 encoding of an f64: preserves < over the full double range,
+// so a single atomicMin on the encoding is a race-free min-weight reduction.
+__device__ static unsigned long long boruvka_wkey(double w) {
+      unsigned long long b = __double_as_longlong(w);
+      return (b & 0x8000000000000000ull) ? ~b : (b | 0x8000000000000000ull);
+}
+
+// Per-round init: no cheapest edge (INT_MAX sentinel), no weight (u64 max).
+extern "C" __global__ void boruvka_init_kernel(
+      int* best_edge, unsigned long long* best_wkey, int n_nodes
+) {
+      int c = blockIdx.x * blockDim.x + threadIdx.x;
+      if (c >= n_nodes) return;
+      best_edge[c] = 0x7FFFFFFF;
+      best_wkey[c] = ~0ull;
+}
+
+// Pass 1: race-free per-component min weight. (The old single-pass CAS paired
+// best_edge and best_w non-atomically — a torn read of the pair let a heavier
+// edge win depending on pool garbage; intermittent wrong MST totals.)
+extern "C" __global__ void boruvka_min_w_kernel(
       const int* src, const int* dst, const double* w,
-      const int* parent, int* best_edge, double* best_w,
+      const int* parent, unsigned long long* best_wkey,
       int n_edges
 ) {
       int e = blockIdx.x * blockDim.x + threadIdx.x;
       if (e >= n_edges) return;
-      int u = src[e], v = dst[e];
-      int cu = parent[u], cv = parent[v];
-      if (cu == cv) return; // same component
-      double ew = w[e];
-      // Try update for component cu
-      // We use a double-precision atomic via integer CAS trick
-      // Simplification: use atomicMin on a long long encoding (limited to positive weights)
-      // For generality we do two separate atomic operations on int arrays:
-      // best_edge[cu] stores the edge index of the cheapest found so far
-      // We loop with atomicCAS — this is O(contention) but correct.
-      // Update cu's best:
-      while (1) {
-            int old_e = best_edge[cu];
-            double old_w = (old_e < 0) ? DBL_MAX : best_w[cu];
-            if (ew >= old_w) break;
-            int got = atomicCAS(&best_edge[cu], old_e, e);
-            if (got == old_e) { best_w[cu] = ew; break; }
-      }
-      // Update cv's best:
-      while (1) {
-            int old_e = best_edge[cv];
-            double old_w = (old_e < 0) ? DBL_MAX : best_w[cv];
-            if (ew >= old_w) break;
-            int got = atomicCAS(&best_edge[cv], old_e, e);
-            if (got == old_e) { best_w[cv] = ew; break; }
-      }
+      int cu = parent[src[e]], cv = parent[dst[e]];
+      if (cu == cv) return;
+      unsigned long long k = boruvka_wkey(w[e]);
+      atomicMin(&best_wkey[cu], k);
+      atomicMin(&best_wkey[cv], k);
 }
 
-// Mark MST edges found in this Borůvka round
+// Pass 2: among edges attaining the min weight, lowest edge index wins —
+// deterministic tie-break, bit-identical rounds.
+extern "C" __global__ void boruvka_min_e_kernel(
+      const int* src, const int* dst, const double* w,
+      const int* parent, const unsigned long long* best_wkey, int* best_edge,
+      int n_edges
+) {
+      int e = blockIdx.x * blockDim.x + threadIdx.x;
+      if (e >= n_edges) return;
+      int cu = parent[src[e]], cv = parent[dst[e]];
+      if (cu == cv) return;
+      unsigned long long k = boruvka_wkey(w[e]);
+      if (k == best_wkey[cu]) atomicMin(&best_edge[cu], e);
+      if (k == best_wkey[cv]) atomicMin(&best_edge[cv], e);
+}
+
+// Mark MST edges found in this Borůvka round (INT_MAX sentinel = none).
 extern "C" __global__ void boruvka_mark_kernel(
-      const int* best_edge, unsigned char* in_mst, int n_nodes
+      const int* best_edge, unsigned char* in_mst, int n_nodes, int n_edges
 ) {
       int c = blockIdx.x * blockDim.x + threadIdx.x;
       if (c >= n_nodes) return;
       int e = best_edge[c];
-      if (e >= 0) in_mst[e] = 1;
+      if (e >= 0 && e < n_edges) in_mst[e] = 1;
 }
 
 // Per-step launchers for Borůvka. Each does only hipLaunchKernelGGL. The Rust caller
@@ -169,24 +184,44 @@ extern "C" __global__ void boruvka_mark_kernel(
 // reset to -1, the selected-edge dedup, the inner union-find loop, and the host-side
 // MST total-weight reduction with its device<->host readbacks.
 
-extern "C" void launch_boruvka_find_cheapest(
+extern "C" void launch_boruvka_init(
+      int* best_edge, unsigned long long* best_wkey, int n_nodes, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks = (n_nodes + threads - 1) / threads;
+      hipLaunchKernelGGL(boruvka_init_kernel, dim3(blocks), dim3(threads), 0, stream,
+            best_edge, best_wkey, n_nodes);
+}
+
+extern "C" void launch_boruvka_min_w(
       const int* edge_src, const int* edge_dst, const double* edge_w,
-      const int* parent, int* best_edge, double* best_w,
+      const int* parent, unsigned long long* best_wkey,
       int n_edges, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n_edges + threads - 1) / threads;
-      hipLaunchKernelGGL(boruvka_find_cheapest_kernel, dim3(blocks), dim3(threads), 0, stream,
-            edge_src, edge_dst, edge_w, parent, best_edge, best_w, n_edges);
+      hipLaunchKernelGGL(boruvka_min_w_kernel, dim3(blocks), dim3(threads), 0, stream,
+            edge_src, edge_dst, edge_w, parent, best_wkey, n_edges);
+}
+
+extern "C" void launch_boruvka_min_e(
+      const int* edge_src, const int* edge_dst, const double* edge_w,
+      const int* parent, const unsigned long long* best_wkey, int* best_edge,
+      int n_edges, hipStream_t stream
+) {
+      int threads = 256;
+      int blocks = (n_edges + threads - 1) / threads;
+      hipLaunchKernelGGL(boruvka_min_e_kernel, dim3(blocks), dim3(threads), 0, stream,
+            edge_src, edge_dst, edge_w, parent, best_wkey, best_edge, n_edges);
 }
 
 extern "C" void launch_boruvka_mark(
-      const int* best_edge, unsigned char* in_mst, int n_nodes, hipStream_t stream
+      const int* best_edge, unsigned char* in_mst, int n_nodes, int n_edges, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n_nodes + threads - 1) / threads;
       hipLaunchKernelGGL(boruvka_mark_kernel, dim3(blocks), dim3(threads), 0, stream,
-            best_edge, in_mst, n_nodes);
+            best_edge, in_mst, n_nodes, n_edges);
 }
 
 // ── Core distance: distance to min_pts-th nearest neighbor ─────────────────

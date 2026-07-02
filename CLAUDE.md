@@ -153,6 +153,20 @@ Memory: `hipMallocAsync`/`hipFreeAsync` only. Synchronous `hipMalloc`/`hipFree` 
 Root `build.rs` scans all `src/*.rs` files and panics on banned patterns:
 - `hipMalloc(` / `hipFree(` (must use async variants)
 
+gpu-core `build.rs` bans `rocblas`/`cublas` tokens in `src/*.rs` (comments included).
+
+## Vendor Math Libraries: BANNED
+
+ROC and CU are banned — no rocBLAS, hipBLAS, rocSOLVER, rocFFT, cuBLAS, or any
+vendor math call anywhere. All GPU math is our own `.hip` kernels through our own
+launch wrappers (they allocate dark, run opaque stream semantics, and break the
+memory ledger's total accounting). Sole sanctioned exception: exactly 2 cu shim
+call sites for hip→cu MEMORY ALLOCATION on the NVIDIA backend — `rg` for cu must
+match exactly 2 instances at end-state. The historical "call hipBLAS instead"
+reading of this ban was wrong; the ~57 `hipblas*` calls in kernels.rs are
+violations under migration (forward → training GEMMs → solver/fft → unlink libs).
+Never add a new one.
+
 ## Conventions
 
 - Edition 2024, Rust stable

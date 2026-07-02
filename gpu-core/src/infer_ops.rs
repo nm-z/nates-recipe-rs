@@ -42,6 +42,16 @@ unsafe extern "C" {
 		theta: f64,
 		stream: *mut c_void,
 	);
+	fn launch_gemm_bt_f64(
+		a: *const c_void,
+		b: *const c_void,
+		c: *mut c_void,
+		m: i32,
+		n: i32,
+		k: i32,
+		stream: *mut c_void,
+	);
+	fn launch_scale_f64(x: *mut c_void, scalar: f64, n: i64, stream: *mut c_void);
 }
 
 /// NeoX partial rotary embedding, in-place on `buf` `(rows, head_dim)`. The
@@ -207,6 +217,32 @@ pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize) -> Result<GpuBu
 pub fn gpu_glu_gelu_into(input: &GpuBuffer, out: &GpuBuffer, rows: usize, half: usize) {
 	unsafe {
 		launch_glu_gelu(input.ptr_raw() as *const c_void, out.ptr_raw(), rows as i32, half as i32, std::ptr::null_mut());
+	}
+	check_launch();
+}
+
+/// Custom f64 GEMM-BT (no hipBLAS): `out(m,n) = a(m,k) . b(n,k)^T`, all
+/// row-major, into a caller-owned `out` (no alloc). `out` must be distinct
+/// from `a`/`b`. Replaces `gpu_gemm_bt_into` in the inference forward.
+pub fn gpu_gemm_bt_f64_into(a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, m: usize, n: usize, k: usize) {
+	unsafe {
+		launch_gemm_bt_f64(
+			a.ptr_raw() as *const c_void,
+			b.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			m as i32,
+			n as i32,
+			k as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+/// In-place scale `x *= scalar` (no alloc, no copy). Replaces `gpu_scale_inplace`.
+pub fn gpu_scale_f64_inplace(x: &GpuBuffer, scalar: f64, n: usize) {
+	unsafe {
+		launch_scale_f64(x.ptr_raw(), scalar, n as i64, std::ptr::null_mut());
 	}
 	check_launch();
 }
