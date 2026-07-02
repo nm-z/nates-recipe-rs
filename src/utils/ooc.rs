@@ -419,7 +419,12 @@ impl Ooc {
 				}
 				if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
 					ram_used += bytes;
-					homes.push(Home::Ram(vec![0u8; bytes]));
+					let mut v = vec![0u8; bytes];
+					// Fault the pages in NOW across all cores — calloc pages are
+					// lazy and would otherwise materialize one at a time inside
+					// the epoch (RAM climbing at 8% CPU).
+					gpu_core::memory::par_touch(&mut v);
+					homes.push(Home::Ram(v));
 					continue;
 				}
 				homes.push(Home::Disk(disk_cursor));

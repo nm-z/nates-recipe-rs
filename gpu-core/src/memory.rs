@@ -366,6 +366,42 @@ unsafe fn dev_copy(
 	check(unsafe { hipMemcpyAsync(dst, src, bytes, kind, stream) })
 }
 
+// Host-side copies saturate all cores: a single-thread memcpy runs ~5 GB/s
+// while 12 threads reach ~4x that — whenever RAM is moving, CPU is at 100%.
+/// Fault a fresh allocation's pages in on every core (one write per 4 KiB
+/// page) — lazy zero-pages otherwise materialize serially on first touch.
+pub fn par_touch(v: &mut [u8]) {
+	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let per = v.len().div_ceil(threads).div_ceil(4096) * 4096;
+	std::thread::scope(|sc| {
+		for ch in v.chunks_mut(per.max(4096)) {
+			sc.spawn(|| {
+				for i in (0..ch.len()).step_by(4096) {
+					unsafe { std::ptr::write_volatile(ch.as_mut_ptr().add(i), 0) };
+				}
+			});
+		}
+	});
+}
+
+pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
+	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let per = bytes.div_ceil(threads);
+	let (d, s0) = (dst as usize, src as usize);
+	std::thread::scope(|sc| {
+		for t in 0..threads {
+			let off = t * per;
+			if off >= bytes {
+				break;
+			}
+			let len = per.min(bytes - off);
+			sc.spawn(move || unsafe {
+				std::ptr::copy_nonoverlapping((s0 as *const u8).add(off), (d as *mut u8).add(off), len);
+			});
+		}
+	});
+}
+
 const BOUNCE_BYTES: usize = 64 << 20;
 static BOUNCE: Mutex<usize> = Mutex::new(0);
 
@@ -399,7 +435,7 @@ unsafe fn h2d_pinned(
 	while done < bytes {
 		let chunk = BOUNCE_BYTES.min(bytes - done);
 		// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES.
-		unsafe { std::ptr::copy_nonoverlapping((src as *const u8).add(done), pin, chunk) };
+		par_copy(pin, unsafe { (src as *const u8).add(done) }, chunk);
 		unsafe {
 			dev_copy(
 				(dst as *mut u8).add(done) as *mut c_void,
@@ -426,11 +462,47 @@ pub(crate) unsafe fn xfer_sync(
 	bytes: usize,
 	kind: i32,
 ) -> Result<(), HipError> {
+	// Synchronous D2H to pageable memory otherwise crawls through the driver's
+	// single-threaded internal staging — bounce it through the pinned arena and
+	// fan the host copy across all cores. The ASYNC D2H path (deferred metric
+	// scalars, one sync per epoch) is untouched.
+	if kind == HIP_MEMCPY_D2H {
+		D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
+		D2H_CALLS.fetch_add(1, Ordering::Relaxed);
+		let mut guard = match BOUNCE.lock() {
+			Ok(g) => g,
+			Err(p) => p.into_inner(),
+		};
+		if *guard == 0 {
+			*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
+		}
+		let pin = *guard as *mut u8;
+		let mut done = 0usize;
+		while done < bytes {
+			let chunk = BOUNCE_BYTES.min(bytes - done);
+			// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES.
+			unsafe {
+				dev_copy(
+					pin as *mut c_void,
+					(src as *const u8).add(done) as *const c_void,
+					chunk,
+					HIP_MEMCPY_D2H,
+					std::ptr::null_mut(),
+				)
+			}?;
+			crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
+			check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })?;
+			par_copy(unsafe { (dst as *mut u8).add(done) }, pin, chunk);
+			done += chunk;
+		}
+		return Ok(());
+	}
 	// SAFETY: forwarded from the caller's validated pointers.
 	unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) }?;
 	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
 }
+
 
 /// THE single hipMemsetAsync call site. Enqueues on `stream`, no host sync.
 pub(crate) unsafe fn memset_dev(
