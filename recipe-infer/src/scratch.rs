@@ -221,6 +221,7 @@ impl Scratch {
 		} else {
 			(alloc(1, "conv_temp"), 0)
 		};
+		let pinned_pair = gpu_core::hip::host_malloc(16, 0).expect("pinned scalars") as *mut f64;
 		Scratch {
 			acts,
 			preact,
@@ -265,14 +266,11 @@ impl Scratch {
 			conv_wg: conv_wg_count,
 			infer: forward_only,
 			copy_stream: gpu_core::hip::Stream::new().expect("copy stream"),
-			pinned_scalar: {
-				let ptr = gpu_core::hip::host_malloc(8, 0).expect("pinned scalar");
-				ptr as *mut f64
-			},
-			pinned_scalar_b: {
-				let ptr = gpu_core::hip::host_malloc(8, 0).expect("pinned scalar b");
-				ptr as *mut f64
-			},
+			// One pinned block for both scalars — a & b at +0/+8 — so the whole
+			// Scratch costs a single blocking host alloc (budget: ≤2 per run
+			// including the transfer bounce).
+			pinned_scalar: pinned_pair,
+			pinned_scalar_b: unsafe { pinned_pair.add(1) },
 		}
 	}
 
@@ -338,11 +336,10 @@ impl Drop for Scratch {
 		// GPU Hang" at the phase boundary. One sync here covers every phase
 		// (fit / score / eval / inference). Cheap — only at jawn transitions.
 		let _ = gpu_core::hip::device_synchronize();
+		// pinned_scalar is the base of the shared 16-byte pinned pair (b is base+1):
+		// one free releases both.
 		if !self.pinned_scalar.is_null() {
 			let _ = unsafe { gpu_core::hip::host_free(self.pinned_scalar as *mut std::ffi::c_void) };
-		}
-		if !self.pinned_scalar_b.is_null() {
-			let _ = unsafe { gpu_core::hip::host_free(self.pinned_scalar_b as *mut std::ffi::c_void) };
 		}
 	}
 }

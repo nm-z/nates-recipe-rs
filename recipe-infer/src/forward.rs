@@ -589,6 +589,11 @@ mod tests {
 	use crate::params::LayerParams;
 	use crate::scratch::Scratch;
 
+	// Serialize the GPU tests: concurrent Scratch builds grow the alloc pool from
+	// multiple threads, which stochastically wedges the driver (HSA spin → GPU
+	// Hang SIGABRT). One test on the device at a time.
+	static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 	// One attn layer built directly; helper for the KV-cache tests.
 	fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, GpuBuffer) {
 		let in_dim = s * d;
@@ -619,6 +624,7 @@ mod tests {
 	// softmax rescale across tiles.
 	#[test]
 	fn kv_cache_matches_full_attention() {
+		let _g = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		gpu_core::hip::set_device(0).expect("set_device");
 		let (n, heads, d, s) = (2usize, 4usize, 16usize, 1200usize);
 		let in_dim = s * d;
@@ -656,6 +662,7 @@ mod tests {
 	// prints the inference wall-time over a warmed launch.
 	#[test]
 	fn kv_cache_bounded_memory_long_sequence() {
+		let _g = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		gpu_core::hip::set_device(0).expect("set_device");
 		let (n, heads, d, s) = (2usize, 2usize, 16usize, 8192usize);
 		let in_dim = s * d;
@@ -690,6 +697,7 @@ mod tests {
 	// output that exercises grid.x > 1.
 	#[test]
 	fn splitk_dw_matches_rocblas() {
+		let _g = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		gpu_core::hip::set_device(0).expect("set_device");
 		eprintln!(
 			"split-K uses device multiProcessorCount = {} (queried, not hardcoded)",
