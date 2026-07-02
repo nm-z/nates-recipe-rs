@@ -1,6 +1,8 @@
 mod common;
 #[path = "suite/_gpu_live.rs"]
 mod gpu_live;
+#[path = "suite/oversize_oom.rs"]
+mod oversize_oom;
 #[path = "suite/inventory_proof.rs"]
 mod inventory_proof;
 #[path = "suite/parity_blas_batched.rs"]
