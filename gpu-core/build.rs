@@ -82,8 +82,61 @@ fn ban_direct_blas() {
 	}
 }
 
+// Memory ledger law: every living HIP memory API has exactly ONE FFI decl and
+// ONE call site (the choke point) in gpu-core's Rust sources — so the byte
+// ledger sees every op. Occurrences past 2 (decl + call) break the build.
+fn enforce_memory_chokepoints() {
+	let apis = [
+		"hipMemcpyAsync(",
+		"hipHostMalloc(",
+		"hipMallocAsync(",
+		"hipMemsetAsync(",
+		"hipHostFree(",
+		"hipFreeAsync(",
+		"hipMemPoolSetAttribute(",
+		"hipMemPoolTrimTo(",
+	];
+	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+		let Ok(rd) = std::fs::read_dir(dir) else { return };
+		for e in rd.flatten() {
+			let p = e.path();
+			if p.is_dir() {
+				walk(&p, out);
+			} else if p.extension().is_some_and(|x| x == "rs") {
+				out.push(p);
+			}
+		}
+	}
+	let mut files = Vec::new();
+	walk(Path::new("src"), &mut files);
+	let mut counts = vec![0usize; apis.len()];
+	let mut sites: Vec<Vec<String>> = vec![Vec::new(); apis.len()];
+	for f in &files {
+		let text = std::fs::read_to_string(f).unwrap_or_default();
+		for (i, line) in text.lines().enumerate() {
+			for (k, api) in apis.iter().enumerate() {
+				if line.contains(api) {
+					counts[k] += 1;
+					sites[k].push(format!("{}:{}", f.display(), i + 1));
+				}
+			}
+		}
+	}
+	for (k, api) in apis.iter().enumerate() {
+		if counts[k] > 2 {
+			panic!(
+				"{}: {} occurrences (max 2 = decl + choke call site): {}",
+				api,
+				counts[k],
+				sites[k].join(", ")
+			);
+		}
+	}
+}
+
 fn main() {
 	ban_direct_blas();
+	enforce_memory_chokepoints();
 	let platform = detect_platform();
 	let out_dir = std::env::var("OUT_DIR").unwrap();
 
