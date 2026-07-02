@@ -1,11 +1,12 @@
 //! VRAM→RAM→DISK waterfall for immutable byte blobs (model weights).
 //!
 //! Strict fill order — the water never pools in two layers at once:
-//!   1. VRAM until the allocator REFUSES. No headroom constant: the caller
-//!      allocates everything else it will ever need first (arena, staging,
-//!      library workspaces), then the waterfall takes literally all that is
-//!      left. Alloc-sync mode memsets each allocation, so a reservation is
-//!      committed, touched memory — the water level is real.
+//!   1. VRAM: `claim()` takes ONE allocation of everything the driver reports
+//!      free at init (memset-committed, so the water level is touched pages,
+//!      not reservations) and registers it as the process device arena; every
+//!      later GpuBuffer — activations, norms, staging, library workspace,
+//!      weight blobs — carves from the claim until it is exhausted. The pool
+//!      is never touched again; exit frees the one claim.
 //!   2. RAM until the next blob would push past 90% of MemAvailable measured
 //!      at fill start (the same guard law pantry applies to dataset parsing).
 //!   3. DISK: once both tiers have refused, every later blob stays on disk
@@ -27,7 +28,6 @@ pub enum Home {
 
 pub struct Waterfall {
 	slab: Option<GpuBuffer>, // ONE pool allocation; blobs are bump-placed views
-	slab_used: usize,
 	homes: HashMap<String, Home>,
 	vram_full: bool,
 	ram_full: bool,
@@ -56,13 +56,11 @@ impl Default for Waterfall {
 }
 
 impl Waterfall {
-	/// An empty store: no slab, every lookup misses to DISK. Placeholder until
-	/// `fill()` time — construct the real store with `with_slab()` only after
-	/// everything else the program will ever allocate exists.
+	/// An empty store: no slab, every lookup misses to DISK. Placeholder only —
+	/// the real store comes from `claim()` at init.
 	pub fn new() -> Self {
 		Waterfall {
 			slab: None,
-			slab_used: 0,
 			homes: HashMap::new(),
 			vram_full: true,
 			ram_full: false,
@@ -73,14 +71,16 @@ impl Waterfall {
 		}
 	}
 
-	/// Claim the VRAM tier as ONE allocation of everything the driver reports
-	/// free (backing off geometrically on refusal — no absolute constants).
-	/// One pool-growth event instead of one per blob: this driver's allocator
-	/// stochastically wedges during growth, so growths are minimized, and the
-	/// alloc-sync memset commits every slab page before any blob lands.
-	pub fn with_slab() -> Self {
+	/// The one-claim lifecycle: init → ONE pool allocation of everything the
+	/// driver reports free, which becomes the process device arena — every
+	/// later `GpuBuffer` allocation (norms, activations, staging, blobs, the
+	/// hipBLAS workspace) carves from it with zero pool traffic — and exit →
+	/// the slab's single free. One growth event (this driver's allocator
+	/// stochastically wedges during growth), one memset commits every page
+	/// before any bytes land (fresh pool pages read back as stale zeros).
+	pub fn claim() -> Self {
 		let mut w = Self::new();
-		let _t = tag_scope("waterfall");
+		let _t = tag_scope("unclaimed");
 		// Exact pre-check, not probe-by-refusal: an ask beyond mappable physical
 		// VRAM is an uncatchable VmHeap abort. Mappable = the smaller of HIP's
 		// and the kernel's free counts, minus what the pool already holds idle
@@ -90,7 +90,7 @@ impl Waterfall {
 		let slack = crate::hip::pool_slack(0).unwrap_or(0);
 		let mut want = hip_free.min(sys_free).saturating_sub(slack) & !((1 << 21) - 1);
 		eprintln!(
-			"waterfall slab: hip_free={:.2} GB sys_free={:.2} GB pool_slack={:.2} GB -> ask {:.2} GB",
+			"claim: hip_free={:.2} GB sys_free={:.2} GB pool_slack={:.2} GB -> ask {:.2} GB",
 			hip_free as f64 / (1u64 << 30) as f64,
 			sys_free as f64 / (1u64 << 30) as f64,
 			slack as f64 / (1u64 << 30) as f64,
@@ -99,13 +99,10 @@ impl Waterfall {
 		while want > (1 << 20) {
 			match GpuBuffer::try_alloc_bytes(want) {
 				Some(slab) => {
-					// One device-path memset commits every slab page before any
-					// blob H2D lands — fresh pool pages served as stale zeros to
-					// GPU reads is an observed failure mode (step-0 all-zero
-					// weights). One commit, one pool growth, done.
 					if slab.memset_zero(want).is_err() {
 						break;
 					}
+					crate::memory::set_device_arena(slab.ptr_raw(), want);
 					w.slab = Some(slab);
 					w.vram_full = false;
 					break;
@@ -135,16 +132,14 @@ impl Waterfall {
 
 	fn settle(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
 		if !self.vram_full {
-			// "Full" = the next blob doesn't fit in the slab. Views are f64-
-			// granular, so offsets stay 8-aligned.
-			let aligned = (len + 7) & !7;
-			let slab = self.slab.as_ref().ok_or_else(|| Error::other("waterfall: no slab"))?;
-			if self.slab_used + aligned > slab.len() {
+			// "Full" = the next blob doesn't fit in what's left of the claim.
+			// Carves are non-owning and cost zero pool traffic; checking the
+			// remainder first means the pool is NEVER touched past the claim.
+			if crate::memory::arena_remaining() < len {
 				self.vram_full = true;
 			} else {
-				let off = self.slab_used;
-				self.slab_used += aligned;
-				let view = slab.view(off / 8, aligned / 8);
+				let _t = tag_scope("waterfall");
+				let view = GpuBuffer::alloc_bytes(len).map_err(|e| Error::other(format!("carve: {e}")))?;
 				let mut host = vec![0u8; len];
 				fill(&mut host)?;
 				view.write_u8(&host).map_err(|e| Error::other(format!("waterfall H2D: {e}")))?;

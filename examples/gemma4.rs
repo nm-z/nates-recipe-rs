@@ -512,8 +512,8 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 // weights (touched every step), then experts interleaved expert-major so the
 // VRAM tier spans all 30 layers instead of pinning the first N. Runs LAST —
 // everything else is already allocated, so "VRAM full" is the allocator refusing.
-fn fill_store(m: &mut Model) -> Result<()> {
-	let mut store = Waterfall::with_slab();
+fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
+	let mut store = store;
 	beat();
 	store.place("model.decoder.embed_tokens.weight", m.emb.len(), |dst| {
 		dst.copy_from_slice(&m.emb);
@@ -804,10 +804,16 @@ fn main() -> Result<()> {
 	eprintln!("loading model...");
 	let t_load = Instant::now();
 	let watchdog = arm_watchdog();
+	// One-claim lifecycle: no pool warm (the claim is the pool's only customer),
+	// then ONE allocation of all free VRAM becomes the process arena — every
+	// GpuBuffer after this line carves from it, including hipBLAS's workspace.
+	// init → one precalculated claim; exit → its one free.
+	gpu_core::memory::skip_pool_warm();
 	recipe_infer::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
-	// Streaming inference churns fresh buffers with immediate host->device copies;
-	// commit each allocation before it is written to (avoids SDMA page faults).
-	gpu_core::memory::set_alloc_sync(true);
+	let claim = Waterfall::claim();
+	beat();
+	let _blas_ws = GpuBuffer::alloc_bytes(128 << 20)?;
+	gpu_core::kernels::gpu_blas_workspace(&_blas_ws);
 	// Keepalive: load has multi-second host-only gaps (disk reads, tokenize) and
 	// the GPU has a 5s runtime-PM autosuspend; the wedges cluster right after
 	// those gaps. A 1 Hz trivial device op keeps the queues warm through load.
@@ -851,7 +857,7 @@ fn main() -> Result<()> {
 	eprintln!("preflight gemms...");
 	preflight(&m, &ar, t)?;
 	eprintln!("waterfall fill...");
-	fill_store(&mut m)?;
+	fill_store(&mut m, claim)?;
 	watchdog.store(false, std::sync::atomic::Ordering::Relaxed);
 	keepalive.store(false, std::sync::atomic::Ordering::Relaxed);
 	eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());

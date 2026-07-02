@@ -356,12 +356,43 @@ pub(crate) fn ensure_pool_warmed() {
 	}
 	POOL_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
+		if WARM_SKIP.load(Ordering::Relaxed) {
+			return;
+		}
 		WARMING.with(|w| w.set(true));
 		if let Err(e) = crate::hip::set_pool_retain(0).and_then(|_| warm_pool()) {
 			eprintln!("GPU pool warm failed: {e}");
 		}
 		WARMING.with(|w| w.set(false));
 	});
+}
+
+static WARM_SKIP: AtomicBool = AtomicBool::new(false);
+
+/// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
+/// allocation): skip the churn-protection warm — there is no churn to protect,
+/// and the retained warm gigabyte would just shrink the claim.
+pub fn skip_pool_warm() {
+	WARM_SKIP.store(true, Ordering::Relaxed);
+}
+
+/// Hand the process its ONE pre-claimed device block: every subsequent
+/// `GpuBuffer` allocation carves from it (non-owning, no pool traffic) until
+/// it is exhausted. init → one claim, exit → one free — the lifecycle law.
+/// The backing allocation must be tagged "unclaimed"; carves move their bytes
+/// from that tag to the caller's current tag so the ledger stays exact.
+pub fn set_device_arena(base: *mut c_void, size: usize) {
+	ARENA_OFFSET.store(0, Ordering::Relaxed);
+	ARENA_SIZE.store(size, Ordering::Relaxed);
+	ARENA_BASE.store(base as usize, Ordering::Relaxed);
+}
+
+/// Bytes still carvable from the claimed block (0 when no claim is active).
+pub fn arena_remaining() -> usize {
+	if ARENA_BASE.load(Ordering::Relaxed) == 0 {
+		return 0;
+	}
+	ARENA_SIZE.load(Ordering::Relaxed).saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed))
 }
 
 /// Force-commit a 1 GiB buffer (so its pages are backed), zero it, then free it.
@@ -441,6 +472,7 @@ impl GpuBuffer {
 				) {
 					Ok(_) => {
 						let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
+						tag_sub("unclaimed", aligned);
 						tag_add(tag, n_bytes);
 						return Ok(Self {
 							ptr,

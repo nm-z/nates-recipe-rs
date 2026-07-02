@@ -24,6 +24,7 @@ unsafe extern "C" {
 	fn hipblasCreate(handle: *mut *mut c_void) -> i32;
 	fn hipblasDestroy(handle: *mut c_void) -> i32;
 	fn hipblasSetStream(handle: *mut c_void, stream: *mut c_void) -> i32;
+	fn hipblasSetWorkspace(handle: *mut c_void, addr: *mut c_void, size: usize) -> i32;
 
 	// hipBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
 	fn hipblasDgemm(
@@ -1484,6 +1485,14 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 		h.store(handle, Ordering::Relaxed);
 		handle
 	})
+}
+
+/// Point hipBLAS at a caller-owned device workspace so it never allocates its
+/// own — required by the one-claim lifecycle (the library's hidden pool alloc
+/// would be a second allocation). Caller keeps `buf` alive for the process.
+pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
+	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
+	assert_eq!(status, 0, "hipblasSetWorkspace failed with status {}", status);
 }
 
 pub(crate) fn hipsolver_handle() -> *mut c_void {
