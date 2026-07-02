@@ -44,11 +44,38 @@ fn disk_free(path: &std::path::Path) -> usize {
 	(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
 }
 
+// Claimable VRAM the way the claim law demands: hipMemGetInfo does not see
+// other processes (the desktop), sysfs does; take the min and subtract the
+// pool's idle reservations.
+fn vram_avail() -> usize {
+	let hip_free = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+	let sys_free = gpu_core::hip::sysfs_vram_free().unwrap_or(hip_free);
+	let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
+	hip_free.min(sys_free).saturating_sub(slack)
+}
+
 fn view(b: &GpuBuffer, byte_off: usize, byte_len: usize) -> GpuBuffer {
 	GpuBuffer::borrow(
 		unsafe { (b.ptr_raw() as *mut u8).add(byte_off) as *mut c_void },
 		byte_len,
 	)
+}
+
+// Spill-file cache discipline: without this the kernel hoards every written
+// window as dirty page cache (tens of GB) and the box swaps. Force the range
+// to disk and drop it from cache immediately — the spill is streamed, never
+// hot.
+fn drop_cache(f: &File, off: u64, len: usize) {
+	use std::os::unix::io::AsRawFd;
+	unsafe {
+		libc::sync_file_range(
+			f.as_raw_fd(),
+			off as i64,
+			len as i64,
+			libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+		);
+		libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+	}
 }
 
 fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
@@ -86,6 +113,10 @@ impl Paged {
 			Home::Disk(base) => HOST.with_borrow_mut(|h| {
 				h.resize(len, 0);
 				spill.read_exact_at(h, base + off as u64).expect("ooc spill read");
+				unsafe {
+					use std::os::unix::io::AsRawFd;
+					libc::posix_fadvise(spill.as_raw_fd(), (base + off as u64) as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+				}
 				win.write_u8(h).expect("ooc H2D");
 				view(win, 0, len)
 			}),
@@ -109,6 +140,7 @@ impl Paged {
 				h.resize(len, 0);
 				v.download_u8(h).expect("ooc D2H");
 				spill.write_all_at(h, *base + off as u64).expect("ooc spill write");
+				drop_cache(spill, *base + off as u64, len);
 			}),
 		}
 	}
@@ -123,9 +155,7 @@ pub struct Plan {
 /// Combined-ceiling admit in waterfall order from live measurements. `None`
 /// only when VRAM+RAM+DISK together cannot hold `need` — the sole abort.
 pub fn plan(need: usize) -> Option<Plan> {
-	let free_v = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-	let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
-	let vram_avail = free_v.saturating_sub(slack);
+	let vram_avail = vram_avail();
 	let ram_avail = mem_available().saturating_sub(mem_available() / 10);
 	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 	let disk_avail = disk_free(&cwd).saturating_sub(1 << 30);
@@ -194,17 +224,6 @@ impl Ooc {
 			.open(&spill_path)
 			.expect("open spill file");
 
-		const WINS: usize = 10;
-		let free_v = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-		let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
-		// Half of free VRAM stages windows; the waterfall fills the other half
-		// with buffer homes before spilling to RAM.
-		let win_budget = free_v.saturating_sub(slack) / 2;
-		let chunk = (win_budget / (WINS * max_spb * 8)).clamp(1, n);
-		let wins: Vec<GpuBuffer> = (0..WINS)
-			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
-			.collect();
-
 		let max_wt = params
 			.iter()
 			.map(|p| match p.kind {
@@ -216,6 +235,17 @@ impl Ooc {
 			.max()
 			.unwrap_or(1);
 		let max_bias = params.iter().map(|p| p.out_dim).max().unwrap_or(1);
+		const WINS: usize = 10;
+		// Budget from the honest availability (min of hip/sysfs minus pool slack)
+		// AFTER reserving the fixed residents (lse/dsum/grad accumulators); half
+		// of what remains stages windows (+2 windows of margin for the
+		// chunk-sized dw_partials/reduce_ws), the waterfall homes fill the rest.
+		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
+		let win_budget = vram_avail().saturating_sub(fixed_res) / 2;
+		let chunk = (win_budget / ((WINS + 2) * max_spb * 8)).clamp(1, n);
+		let wins: Vec<GpuBuffer> = (0..WINS)
+			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
+			.collect();
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
 		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
@@ -230,6 +260,7 @@ impl Ooc {
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
 		}
+
 		// Resident allocations FIRST — the waterfall fill below takes VRAM to
 		// refusal, so everything that must stay device-resident is claimed before.
 		let lse = GpuBuffer::alloc(n * hs).expect("ooc lse");
@@ -377,6 +408,7 @@ impl Ooc {
 	) {
 		let last = params.len() - 1;
 		for (l, p) in params.iter().enumerate() {
+			let t_l = std::time::Instant::now();
 			if let Some((pf, a, c)) = concat_at
 				&& l == pf
 			{
@@ -489,6 +521,7 @@ impl Ooc {
 					}
 				}
 			}
+			self.sweep_line("fwd", l, match p.kind { LayerKind::Embed => "embed", LayerKind::Attn => "attn", LayerKind::Conv => "conv", LayerKind::Dense => "dense" }, t_l);
 		}
 	}
 
@@ -524,6 +557,7 @@ impl Ooc {
 		let mut flip = false;
 		for l in (0..params.len()).rev() {
 			let p = &params[l];
+			let t_l = std::time::Instant::now();
 			let (in_dim, out_dim) = (p.in_dim, p.out_dim);
 			match p.kind {
 				LayerKind::Embed => {
@@ -534,11 +568,13 @@ impl Ooc {
 						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
 					}
 					kernels::gpu_sgd_update(&p.w, &sc.embed_grad, lr, p.vocab * p.dim);
+					self.sweep_line("bwd", l, "embed", t_l);
 					flip = !flip;
 					continue;
 				}
 				LayerKind::Attn => {
 					self.attn_backward(params, l, x, lr, flip);
+					self.sweep_line("bwd", l, "attn", t_l);
 					flip = !flip;
 					continue;
 				}
@@ -665,8 +701,21 @@ impl Ooc {
 			if p.act == Activation::PRelu {
 				kernels::gpu_sgd_update(&p.palpha, &self.scalar_acc, lr, 1);
 			}
+			self.sweep_line("bwd", l, "dense", t_l);
 			flip = !flip;
 		}
+	}
+
+	// Persistent per-layer heartbeat — an out-of-core epoch moves ~100 GB
+	// through the tiers before the first loss line, and silence looks like a
+	// hang. One line per layer pass with wall time, newline-terminated so it
+	// survives the dev wrapper own 1 Hz line.
+	fn sweep_line(&self, phase: &str, l: usize, kind: &str, t: std::time::Instant) {
+		eprintln!(
+			"ooc {phase} L{l} {kind}  {} windows  {:.1}s",
+			self.n.div_ceil(self.chunk),
+			t.elapsed().as_secs_f64()
+		);
 	}
 
 	fn da(&self, flip: bool) -> &Paged {
