@@ -563,6 +563,18 @@ static WARM_SKIP: AtomicBool = AtomicBool::new(false);
 static POOL_LIVE: AtomicUsize = AtomicUsize::new(0);
 static POOL_VERIFIED: AtomicUsize = AtomicUsize::new(0);
 
+/// Release the pool's slack back to the driver and reset the verified
+/// high-water to what is actually live. An out-of-core fit leaves nearly all
+/// of VRAM as freed slack; a later differently-shaped allocation storm skips
+/// the growth gate (projected < the stale high-water) yet still forces new
+/// physical maps out of the fragmented slack — the uncatchable VmHeap assert,
+/// observed at the interrupt teardown. Trim + reset makes the gate honest.
+pub fn pool_trim() {
+	crate::hip::device_synchronize().expect("pool_trim sync");
+	crate::hip::trim_mempool(0).expect("pool_trim");
+	POOL_VERIFIED.store(POOL_LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
 /// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
 /// allocation): skip the churn-protection warm — there is no churn to protect,
 /// and the retained warm gigabyte would just shrink the claim.

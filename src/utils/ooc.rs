@@ -16,9 +16,25 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Mutex};
 
-thread_local! {
-	static HOST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+/// Fixed pool of host window buffers, preallocated and page-touched at build.
+/// Every transient host byte this path moves (read-ahead, sync reads, the
+/// write-behind queue, commit staging) comes from here — so host RAM is FLAT
+/// at exactly the budget instead of fluctuating below it while disk churns
+/// (the reserve law: RAM at top−1GB or it's visible laziness). Exhaustion is
+/// a counting bug and panics loud.
+type HostPool = Arc<Mutex<Vec<Vec<u8>>>>;
+
+fn pool_take(p: &HostPool) -> Vec<u8> {
+	p.lock()
+		.expect("host pool lock")
+		.pop()
+		.expect("host pool exhausted — transient window count exceeded POOL_BUFS")
+}
+
+fn pool_give(p: &HostPool, v: Vec<u8>) {
+	p.lock().expect("host pool lock").push(v);
 }
 
 fn mem_available() -> usize {
@@ -114,19 +130,20 @@ impl Paged {
 		assert!(s0 % self.chunk == 0 && cnt <= self.chunk, "ooc access not window-aligned");
 		s0 / self.chunk
 	}
-	fn kick_ahead(&self, s0: usize, cnt: usize, n: usize, spill: &File) {
+	fn kick_ahead(&self, s0: usize, cnt: usize, n: usize, spill: &File, host: &HostPool) {
 		let mut q = self.ahead.borrow_mut();
 		let mut next0 = q.back().map_or(s0 + cnt, |(p0, pc, _)| p0 + pc);
-		while q.len() < 2 && next0 < n {
+		while q.len() < AHEAD && next0 < n {
 			let next_cnt = cnt.min(n - next0);
 			let Home::Disk(off) = self.homes[next0 / self.chunk] else {
 				return; // next window is a fast tier — nothing to hide
 			};
 			let len = next_cnt * self.spb * 8;
 			let f = spill.try_clone().expect("spill clone");
+			let hp = host.clone();
 			let h = std::thread::spawn(move || {
-				let mut buf = vec![0u8; len];
-				f.read_exact_at(&mut buf, off).expect("ooc spill read-ahead");
+				let mut buf = pool_take(&hp);
+				f.read_exact_at(&mut buf[..len], off).expect("ooc spill read-ahead");
 				unsafe {
 					use std::os::unix::io::AsRawFd;
 					libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
@@ -137,9 +154,14 @@ impl Paged {
 			next0 += next_cnt;
 		}
 	}
+	fn drain_ahead(&self, host: &HostPool) {
+		for (_, _, h) in self.ahead.borrow_mut().drain(..) {
+			pool_give(host, h.join().expect("read-ahead thread"));
+		}
+	}
 	/// Device view of samples [s0, s0+cnt): VRAM-homed windows return an
 	/// offset view (zero copies); RAM/DISK windows stage into `win` first.
-	fn read(&self, s0: usize, cnt: usize, win: &GpuBuffer, spill: &File, n: usize) -> GpuBuffer {
+	fn read(&self, s0: usize, cnt: usize, win: &GpuBuffer, spill: &File, n: usize, host: &HostPool) -> GpuBuffer {
 		let len = cnt * self.spb * 8;
 		match &self.homes[self.win(s0, cnt)] {
 			Home::Vram(b) => view(b, 0, len),
@@ -152,13 +174,13 @@ impl Paged {
 				let bytes = match pre {
 					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().expect("read-ahead thread"),
 					other => {
-						// Wrong window prefetched (new sweep) — drop the queue, read sync.
-						drop(other.map(|(_, _, h)| h.join()));
-						for (_, _, h) in self.ahead.borrow_mut().drain(..) {
-							let _ = h.join();
+						// Wrong window prefetched (new sweep) — drain the queue, read sync.
+						if let Some((_, _, h)) = other {
+							pool_give(host, h.join().expect("read-ahead thread"));
 						}
-						let mut buf = vec![0u8; len];
-						spill.read_exact_at(&mut buf, *off).expect("ooc spill read");
+						self.drain_ahead(host);
+						let mut buf = pool_take(host);
+						spill.read_exact_at(&mut buf[..len], *off).expect("ooc spill read");
 						unsafe {
 							use std::os::unix::io::AsRawFd;
 							libc::posix_fadvise(spill.as_raw_fd(), *off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
@@ -166,8 +188,9 @@ impl Paged {
 						buf
 					}
 				};
-				self.kick_ahead(s0, cnt, n, spill);
-				win.write_u8(&bytes).expect("ooc H2D");
+				self.kick_ahead(s0, cnt, n, spill, host);
+				win.write_u8(&bytes[..len]).expect("ooc H2D");
+				pool_give(host, bytes);
 				view(win, 0, len)
 			}
 		}
@@ -181,16 +204,16 @@ impl Paged {
 			_ => view(win, 0, len),
 		}
 	}
-	fn commit(&mut self, s0: usize, cnt: usize, v: &GpuBuffer, writer: &Writer) {
+	fn commit(&mut self, s0: usize, cnt: usize, v: &GpuBuffer, writer: &Writer, host: &HostPool) {
 		let len = cnt * self.spb * 8;
 		let w = self.win(s0, cnt);
 		match &mut self.homes[w] {
 			Home::Vram(_) => {}
 			Home::Ram(dst) => v.download_u8(&mut dst[..len]).expect("ooc D2H"),
 			Home::Disk(off) => {
-				let mut buf = vec![0u8; len];
-				v.download_u8(&mut buf).expect("ooc D2H");
-				writer.send(*off, buf);
+				let mut buf = pool_take(host);
+				v.download_u8(&mut buf[..len]).expect("ooc D2H");
+				writer.send(*off, buf, len);
 			}
 		}
 	}
@@ -202,35 +225,49 @@ impl Paged {
 /// Write-behind pool: THREE workers, round-robin dispatch, each queue 2 deep
 /// — the NVMe sees parallel writes instead of one serial pwrite stream.
 struct Writer {
-	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>, Option<std::thread::JoinHandle<()>>)>,
+	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>)>,
 	next: std::cell::Cell<usize>,
+	host: HostPool,
 }
 
 const W_LANES: usize = 3;
+const WQ_DEPTH: usize = 2;
+const AHEAD: usize = 2;
+// The widest read fan-out of any sweep: flash backward pulls q/k/v/ctx/dctx
+// through disk queues in one window body.
+const MAX_READERS: usize = 5;
+// Exact structural max of concurrently checked-out host windows: every
+// mid-sweep reader holds AHEAD queued prefetches (one Paged at a time also
+// holds its current buffer: +1), each writer lane holds its queue plus the
+// buffer being pwritten, and one commit stages before its send lands.
+const POOL_BUFS: usize = MAX_READERS * AHEAD + 1 + W_LANES * (WQ_DEPTH + 1) + 1;
 
-fn spawn_lane(spill: &File) -> (Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>, Option<std::thread::JoinHandle<()>>) {
+fn spawn_lane(spill: &File, host: &HostPool) -> (Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>) {
 	let f = spill.try_clone().expect("spill clone");
-	let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(2);
+	let hp = host.clone();
+	let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>, usize)>(WQ_DEPTH);
 	let worker = std::thread::spawn(move || {
-		for (off, buf) in rx {
-			f.write_all_at(&buf, off).expect("ooc spill write");
-			drop_cache(&f, off, buf.len());
+		for (off, buf, len) in rx {
+			f.write_all_at(&buf[..len], off).expect("ooc spill write");
+			drop_cache(&f, off, len);
+			pool_give(&hp, buf);
 		}
 	});
 	(Some(tx), Some(worker))
 }
 
 impl Writer {
-	fn new(spill: &File) -> Writer {
+	fn new(spill: &File, host: HostPool) -> Writer {
 		Writer {
-			lanes: (0..W_LANES).map(|_| spawn_lane(spill)).collect(),
+			lanes: (0..W_LANES).map(|_| spawn_lane(spill, &host)).collect(),
 			next: std::cell::Cell::new(0),
+			host,
 		}
 	}
-	fn send(&self, off: u64, buf: Vec<u8>) {
+	fn send(&self, off: u64, buf: Vec<u8>, len: usize) {
 		let i = self.next.get();
 		self.next.set((i + 1) % W_LANES);
-		self.lanes[i].0.as_ref().expect("writer live").send((off, buf)).expect("writer send");
+		self.lanes[i].0.as_ref().expect("writer live").send((off, buf, len)).expect("writer send");
 	}
 	/// Drain every lane — REQUIRED before any read of a disk home that was
 	/// just written this sweep (the next sweep reads it).
@@ -242,7 +279,7 @@ impl Writer {
 			if let Some(w) = lane.1.take() {
 				w.join().expect("writer join");
 			}
-			*lane = spawn_lane(spill);
+			*lane = spawn_lane(spill, &self.host);
 		}
 	}
 }
@@ -279,6 +316,7 @@ pub struct Ooc {
 	wins: Vec<GpuBuffer>,
 	spill: File,
 	writer: Writer,
+	host: HostPool,
 	acts: Vec<Paged>,
 	preacts: Vec<Option<Paged>>,
 	a_q: Paged,
@@ -332,7 +370,6 @@ impl Ooc {
 		// reclaims itself no matter how the process dies (a SIGKILLed run
 		// leaked a 40 GB spill on disk once).
 		let _ = std::fs::remove_file(&spill_path);
-		let writer = Writer::new(&spill);
 
 		let max_wt = params
 			.iter()
@@ -356,6 +393,19 @@ impl Ooc {
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
 			.collect();
+		// Host pool BEFORE the RAM measurement below, faulted in across all
+		// cores — its bytes are part of the budget, permanently resident.
+		let wbytes = chunk * max_spb * 8;
+		let host: HostPool = Arc::new(Mutex::new(
+			(0..POOL_BUFS)
+				.map(|_| {
+					let mut v = vec![0u8; wbytes];
+					gpu_core::memory::par_touch(&mut v);
+					v
+				})
+				.collect(),
+		));
+		let writer = Writer::new(&spill, host.clone());
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
 		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
@@ -390,14 +440,12 @@ impl Ooc {
 		// RAM accounting must be CUMULATIVE: fresh Vec pages are lazily
 		// zero-backed, so mem_available() does not drop until an epoch touches
 		// them — re-measuring per placement admits unbounded virtual memory and
-		// the OOM killer collects mid-epoch. The homes budget must also carry
-		// THIS path's own host machinery (read-ahead Vecs — up to 5 buffers
-		// concurrently read in flash backward — the 2-deep write-behind queue,
-		// the staging bounce and a commit temp: 9 windows), or the box lands
-		// exactly on the floor and the OOM killer collects (it did, twice).
-		let host_overhead = (2 * 5 + 2 * W_LANES + 2) * chunk * max_spb * 8;
+		// the OOM killer collects mid-epoch. Every transient host byte comes
+		// from the preallocated (touched, already-measured) pool above, so the
+		// floor is exactly the user's gigabyte — homes fill RAM to top−1GB and
+		// it STAYS there while disk churns.
 		let ram_start = mem_available();
-		let ram_floor = USER_GB + host_overhead;
+		let ram_floor = USER_GB;
 		let mut ram_used = 0usize;
 		let mut vram_open = true;
 		let mut disk_cursor: u64 = 0;
@@ -471,6 +519,7 @@ impl Ooc {
 			wins,
 			spill,
 			writer,
+			host,
 			acts,
 			preacts,
 			a_q,
@@ -553,28 +602,28 @@ impl Ooc {
 			{
 				self.writer.barrier(&self.spill);
 				for (s0, cnt) in chunks(self.n, self.chunk) {
-					if interrupted() {
+					if self.bail() {
 						return;
 					}
-					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n);
+					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 					let xc = view(x_cat.expect("x_cat"), s0 * c * 8, cnt * c * 8);
 					let out = self.concat.write_view(s0, cnt, &self.wins[1]);
 					kernels::gpu_concat_into(&prev, &xc, &out, cnt, a, c);
-					self.concat.commit(s0, cnt, &out, &self.writer);
+					self.concat.commit(s0, cnt, &out, &self.writer, &self.host);
 				}
 			}
 			match p.kind {
 				LayerKind::Embed => {
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
 						kernels::gpu_gather_rows_into(&p.w, &ids, &out, cnt * p.in_dim, p.dim);
 						kernels::gpu_broadcast_sub_into(&out, &p.b, &out, cnt * p.out_dim, p.out_dim);
-						self.acts[l].commit(s0, cnt, &out, &self.writer);
+						self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
 					}
 				}
 				LayerKind::Attn => {
@@ -583,10 +632,10 @@ impl Ooc {
 					let s = p.in_dim / d;
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
-						let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n);
+						let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 						let m = cnt * s;
 						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
 						let k = self.a_k.write_view(s0, cnt, &self.wins[2]);
@@ -595,46 +644,46 @@ impl Ooc {
 						kernels::gpu_linear_into(&prev, &p.wk, &p.b, &k, m, d, d);
 						kernels::gpu_linear_into(&prev, &p.wv, &p.b, &v, m, d, d);
 						gpu_core::rope::gpu_rope_qk_heads_inplace(&q, &k, m, d, heads, s, 1.0);
-						self.a_q.commit(s0, cnt, &q, &self.writer);
-						self.a_k.commit(s0, cnt, &k, &self.writer);
-						self.a_v.commit(s0, cnt, &v, &self.writer);
+						self.a_q.commit(s0, cnt, &q, &self.writer, &self.host);
+						self.a_k.commit(s0, cnt, &k, &self.writer, &self.host);
+						self.a_v.commit(s0, cnt, &v, &self.writer, &self.host);
 					}
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
-						let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n);
-						let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n);
-						let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n);
+						let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
+						let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n, &self.host);
+						let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n, &self.host);
 						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3]);
 						let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
 						kernels::gpu_flash_attention_train_into(&q, &k, &v, &ctx, &lse, cnt, s, d, heads);
-						self.a_ctx.commit(s0, cnt, &ctx, &self.writer);
+						self.a_ctx.commit(s0, cnt, &ctx, &self.writer, &self.host);
 					}
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
-						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], &self.spill, self.n);
+						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
 						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, &out, cnt * s, d, d);
-						self.acts[l].commit(s0, cnt, &out, &self.writer);
+						self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
 					}
 				}
 				LayerKind::Dense | LayerKind::Conv => {
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
 						let prev = if l == 0 {
 							view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
 						} else if Some(l) == concat_at.map(|t| t.0) {
-							self.concat.read(s0, cnt, &self.wins[0], &self.spill, self.n)
+							self.concat.read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host)
 						} else {
-							self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n)
+							self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host)
 						};
 						let out = if l == last {
 							view(&sc.acts[last], s0 * p.out_dim * 8, cnt * p.out_dim * 8)
@@ -655,7 +704,7 @@ impl Ooc {
 						if let Some(pa) = self.preacts[l].as_mut() {
 							let pre = pa.write_view(s0, cnt, &self.wins[2]);
 							kernels::gpu_copy_into(&out, &pre, m);
-							pa.commit(s0, cnt, &pre, &self.writer);
+							pa.commit(s0, cnt, &pre, &self.writer, &self.host);
 							// PRelu/Elu/Selu/Silu/Gelu apply FROM the saved z.
 							match p.act {
 								Activation::PRelu => {
@@ -679,7 +728,7 @@ impl Ooc {
 							}
 						}
 						if l != last {
-							self.acts[l].commit(s0, cnt, &out, &self.writer);
+							self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
 						}
 					}
 				}
@@ -710,7 +759,7 @@ impl Ooc {
 		self.da_a.spb = params[last].out_dim;
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
-			if interrupted() {
+			if self.bail() {
 				return;
 			}
 			let k = params[last].out_dim;
@@ -719,7 +768,7 @@ impl Ooc {
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
 			ModelInner::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k);
 			kernels::gpu_scale_inplace(&da, cnt as f64 / n as f64, cnt * k);
-			self.da_a.commit(s0, cnt, &da, &self.writer);
+			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host);
 		}
 		let mut flip = false;
 		for l in (0..params.len()).rev() {
@@ -731,10 +780,10 @@ impl Ooc {
 					kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(n, self.chunk) {
-						if interrupted() {
+						if self.bail() {
 							return;
 						}
-						let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
+						let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
 					}
@@ -763,15 +812,15 @@ impl Ooc {
 			self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
 			self.writer.barrier(&self.spill);
 			for (s0, cnt) in chunks(n, self.chunk) {
-				if interrupted() {
+				if self.bail() {
 					return;
 				}
 				let m = cnt * out_dim;
-				let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
+				let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 				let act_l = if l == last {
 					view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
 				} else {
-					self.acts[l].read(s0, cnt, &self.wins[1], &self.spill, self.n)
+					self.acts[l].read(s0, cnt, &self.wins[1], &self.spill, self.n, &self.host)
 				};
 				let dz = view(&self.wins[2], 0, m * 8);
 				let grad: &GpuBuffer = match p.act {
@@ -793,7 +842,7 @@ impl Ooc {
 						let pre = self.preacts[l]
 							.as_ref()
 							.expect("prelu preact")
-							.read(s0, cnt, &self.wins[3], &self.spill, self.n);
+							.read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						let t0 = view(&self.wins[4], 0, m * 8);
 						let t1 = view(&self.wins[5], 0, m * 8);
 						kernels::gpu_relu_into(&pre, &t0, m);
@@ -809,22 +858,22 @@ impl Ooc {
 						&dz
 					}
 					Activation::Elu => {
-						let pre = self.preacts[l].as_ref().expect("elu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n);
+						let pre = self.preacts[l].as_ref().expect("elu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						gpu_core::k_gapact::gpu_elu_backward_into(&da, &pre, &dz, m, ELU_ALPHA);
 						&dz
 					}
 					Activation::Selu => {
-						let pre = self.preacts[l].as_ref().expect("selu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n);
+						let pre = self.preacts[l].as_ref().expect("selu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						gpu_core::k_gapact::gpu_selu_backward_into(&da, &pre, &dz, m);
 						&dz
 					}
 					Activation::Silu => {
-						let pre = self.preacts[l].as_ref().expect("silu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n);
+						let pre = self.preacts[l].as_ref().expect("silu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						kernels::gpu_silu_backward_into(&da, &pre, &dz, m);
 						&dz
 					}
 					Activation::Gelu => {
-						let pre = self.preacts[l].as_ref().expect("gelu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n);
+						let pre = self.preacts[l].as_ref().expect("gelu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						kernels::gpu_gelu_backward_into(&da, &pre, &dz, m);
 						&dz
 					}
@@ -833,9 +882,9 @@ impl Ooc {
 				let a_prev = if l == 0 {
 					view(x, s0 * in_dim * 8, cnt * in_dim * 8)
 				} else if Some(l) == concat_at.map(|t| t.0) {
-					self.concat.read(s0, cnt, &self.wins[6], &self.spill, self.n)
+					self.concat.read(s0, cnt, &self.wins[6], &self.spill, self.n, &self.host)
 				} else {
-					self.acts[l - 1].read(s0, cnt, &self.wins[6], &self.spill, self.n)
+					self.acts[l - 1].read(s0, cnt, &self.wins[6], &self.spill, self.n, &self.host)
 				};
 				if l > 0 {
 					let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
@@ -852,10 +901,10 @@ impl Ooc {
 						let compact = view(&self.wins[8], 0, cnt * a * 8);
 						kernels::gpu_slice_lead_into(&below, &compact, cnt, a + c, a);
 						below_pg.spb = a;
-						below_pg.commit(s0, cnt, &compact, &self.writer);
+						below_pg.commit(s0, cnt, &compact, &self.writer, &self.host);
 						below_pg.spb = a + c;
 					} else {
-						below_pg.commit(s0, cnt, &below, &self.writer);
+						below_pg.commit(s0, cnt, &below, &self.writer, &self.host);
 					}
 				} else {
 					kernels::gpu_linear_backward_weights_only_into(
@@ -893,6 +942,28 @@ impl Ooc {
 		);
 	}
 
+	/// Interrupt check for every sweep. On ^C the read-ahead queues hold
+	/// checked-out pool buffers; drain them back so a later sweep (the
+	/// checkpoint forward) starts with the full pool.
+	fn bail(&self) -> bool {
+		if !interrupted() {
+			return false;
+		}
+		for a in &self.acts {
+			a.drain_ahead(&self.host);
+		}
+		for pa in self.preacts.iter().flatten() {
+			pa.drain_ahead(&self.host);
+		}
+		for b in [
+			&self.a_q, &self.a_k, &self.a_v, &self.a_ctx, &self.a_dctx, &self.a_dq, &self.a_dk,
+			&self.a_dv, &self.concat, &self.da_a, &self.da_b,
+		] {
+			b.drain_ahead(&self.host);
+		}
+		true
+	}
+
 	fn da(&self, flip: bool) -> &Paged {
 		if flip { &self.da_b } else { &self.da_a }
 	}
@@ -910,32 +981,32 @@ impl Ooc {
 		kernels::gpu_scale_inplace(&self.dw_acc, 0.0, d * d);
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
-			if interrupted() {
+			if self.bail() {
 				return;
 			}
 			let m = cnt * s;
-			let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
-			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], &self.spill, self.n);
+			let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
+			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], &self.spill, self.n, &self.host);
 			let dctx = self.a_dctx.write_view(s0, cnt, &self.wins[2]);
 			kernels::gpu_linear_backward_full_into(
 				&da, &ctx, &p.wo, &dctx, &self.dw_tmp, &self.db_tmp,
 				&self.reduce_ws, &self.dw_partials, m, d, d,
 			);
 			kernels::gpu_add_inplace(&self.dw_acc, &self.dw_tmp, d * d);
-			self.a_dctx.commit(s0, cnt, &dctx, &self.writer);
+			self.a_dctx.commit(s0, cnt, &dctx, &self.writer, &self.host);
 		}
 		kernels::gpu_sgd_update(&p.wo, &self.dw_acc, lr, d * d);
 		// Flash backward per sample chunk: dsum, then dQ/dK/dV; un-rotate RoPE.
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
-			if interrupted() {
+			if self.bail() {
 				return;
 			}
-			let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n);
-			let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n);
-			let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n);
-			let ctx = self.a_ctx.read(s0, cnt, &self.wins[3], &self.spill, self.n);
-			let dctx = self.a_dctx.read(s0, cnt, &self.wins[4], &self.spill, self.n);
+			let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
+			let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n, &self.host);
+			let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n, &self.host);
+			let ctx = self.a_ctx.read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
+			let dctx = self.a_dctx.read(s0, cnt, &self.wins[4], &self.spill, self.n, &self.host);
 			let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
 			let dsum = view(&self.dsum, s0 * heads * s * 8, cnt * heads * s * 8);
 			let dq = self.a_dq.write_view(s0, cnt, &self.wins[5]);
@@ -945,9 +1016,9 @@ impl Ooc {
 				&q, &k, &v, &ctx, &dctx, &lse, &dsum, &dq, &dk, &dv, cnt, s, d, heads,
 			);
 			gpu_core::rope::gpu_rope_qk_heads_inplace(&dq, &dk, cnt * s, d, heads, s, -1.0);
-			self.a_dq.commit(s0, cnt, &dq, &self.writer);
-			self.a_dk.commit(s0, cnt, &dk, &self.writer);
-			self.a_dv.commit(s0, cnt, &dv, &self.writer);
+			self.a_dq.commit(s0, cnt, &dq, &self.writer, &self.host);
+			self.a_dk.commit(s0, cnt, &dk, &self.writer, &self.host);
+			self.a_dv.commit(s0, cnt, &dv, &self.writer, &self.host);
 		}
 		// Wq/Wk/Wv: three projections in one sweep per window so the dH sum
 		// stays local; per-projection dW accumulators zeroed up front.
@@ -957,14 +1028,14 @@ impl Ooc {
 		kernels::gpu_scale_inplace(&self.dwv_acc, 0.0, d * d);
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
-			if interrupted() {
+			if self.bail() {
 				return;
 			}
 			let m = cnt * s;
 			let h = if l == 0 {
 				view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
 			} else {
-				self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n)
+				self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host)
 			};
 			let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
 			let below = below_pg.write_view(s0, cnt, &self.wins[1]);
@@ -973,7 +1044,7 @@ impl Ooc {
 				.into_iter()
 				.enumerate()
 			{
-				let dg = dbuf.read(s0, cnt, &self.wins[3], &self.spill, self.n);
+				let dg = dbuf.read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 				let dst = if wi == 0 { &below } else { &dh_tmp };
 				kernels::gpu_linear_backward_full_into(
 					&dg, &h, w, dst, &self.dw_tmp, &self.db_tmp,
@@ -989,7 +1060,7 @@ impl Ooc {
 					kernels::gpu_add_inplace(&below, &dh_tmp, cnt * p.in_dim);
 				}
 			}
-			below_pg.commit(s0, cnt, &below, &self.writer);
+			below_pg.commit(s0, cnt, &below, &self.writer, &self.host);
 		}
 		kernels::gpu_sgd_update(&p.w, &self.dwq_acc, lr, d * d);
 		kernels::gpu_sgd_update(&p.wk, &self.dwk_acc, lr, d * d);

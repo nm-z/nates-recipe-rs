@@ -6,7 +6,7 @@ use recipe_infer::{
 	LayerParams, Scaler, Scratch, build_layer_params, download_scalar, forward_into, infer_scored,
 	load_ogdl_str, pinned_vocab, upload, vram_estimate, zscore_apply,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::sync::atomic::Ordering;
 
@@ -348,13 +348,21 @@ impl Train {
 			}
 			let score = {
 				let params = model.params.borrow();
+				let n = ds.x.nrows();
+				let fwd_fits = params.is_empty()
+					|| Scratch::vram_bytes(&params, n, true)
+						<= gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
 				if params.is_empty() {
 					f64::NAN
+				} else if !fwd_fits {
+					// The standalone scoring forward below needs the very buffer
+					// set that did not fit VRAM (that is why fit streamed
+					// out-of-core) — use the score fit already computed.
+					model.fit_score.get()
 				} else {
 					let _key = model.loss.score_key();
 					let last = params.len() - 1;
 					let k = params[last].out_dim;
-					let n = ds.x.nrows();
 					let sc = Scratch::new(&params, n, true);
 					let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
 					let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
@@ -560,6 +568,7 @@ pub struct ModelInner {
 	pub(crate) params: RefCell<Vec<LayerParams>>,
 	pub(crate) scaler: RefCell<Option<Scaler>>,
 	pub(crate) yscaler: RefCell<Option<(f64, f64)>>,
+	pub(crate) fit_score: Cell<f64>,
 }
 
 pub struct Model {
@@ -740,6 +749,7 @@ impl Model {
 			params: RefCell::new(Vec::new()),
 			scaler: RefCell::new(None),
 			yscaler: RefCell::new(None),
+			fit_score: Cell::new(f64::NAN),
 		});
 		register_model(&*inner as *const ModelInner);
 		Model { inner }
@@ -1085,6 +1095,7 @@ mod metric_gpu_tests {
 				params: RefCell::new(vec![]),
 				scaler: RefCell::new(None),
 				yscaler: RefCell::new(None),
+				fit_score: Cell::new(f64::NAN),
 			}),
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
@@ -1186,6 +1197,7 @@ mod metric_gpu_tests {
 				params: RefCell::new(vec![]),
 				scaler: RefCell::new(None),
 				yscaler: RefCell::new(None),
+				fit_score: Cell::new(f64::NAN),
 			}),
 		};
 		let sc = Scratch::new(&params, n, false);

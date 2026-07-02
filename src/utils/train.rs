@@ -880,6 +880,7 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
+		let mut fit_score = f64::NAN;
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
@@ -952,6 +953,9 @@ impl ModelInner {
 				Some(false) => 1.0 - sc.deferred_scalar_b() / ss_tot,
 				None => f64::NAN,
 			};
+			if score.is_finite() {
+				fit_score = score;
+			}
 			let loss = if let Some((sign, div)) = loss_scale {
 				sign * sc.deferred_scalar() / div
 			} else {
@@ -1074,6 +1078,12 @@ impl ModelInner {
 			}
 		});
 		*self.params.borrow_mut() = params;
+		if let Some(s) = end_score
+			&& s.is_finite()
+		{
+			fit_score = s;
+		}
+		self.fit_score.set(fit_score);
 		if let Some(s) = end_score {
 			let path = checkpoint_path.as_ref().expect("checkpoint path");
 			if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1091,6 +1101,15 @@ impl ModelInner {
 		}
 		if let Some(base) = hip_snap {
 			eprint!("{}", gpu_core::callspy::report_since(&base));
+		}
+		// An out-of-core fit leaves ~all of VRAM as freed pool slack with a
+		// stale verified high-water; the next allocation storm would skip the
+		// growth gate yet still map new physical out of fragmented slack (the
+		// VmHeap assert). Trim + reset so the gate stays honest.
+		drop(ooc_end);
+		drop(sc);
+		if use_ooc {
+			gpu_core::memory::pool_trim();
 		}
 	}
 	fn save_checkpoint(&self, path: &str, score: f64) {
