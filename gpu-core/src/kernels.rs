@@ -6,6 +6,8 @@ use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
 pub(crate) fn check_launch() {
+	crate::callspy::tick(&crate::callspy::LAUNCH);
+	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	let err = unsafe { crate::hip::hipGetLastError() };
 	assert!(err == 0, "HIP kernel launch failed with error code {}", err);
 }
@@ -1452,12 +1454,14 @@ thread_local! {
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn atexit_gpu_shutdown() {
+	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 	let _ = unsafe { crate::hip::hipDeviceSynchronize() };
 	crate::memory::mark_shutting_down();
 	gpu_shutdown();
 }
 
 pub(crate) fn hipblas_handle() -> *mut c_void {
+	crate::callspy::tick(&crate::callspy::HIPBLAS);
 	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
 		if !ptr.is_null() {
@@ -1514,6 +1518,7 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 }
 
 pub fn gpu_shutdown() {
+	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 	unsafe { crate::hip::hipDeviceSynchronize() };
 	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
@@ -1537,6 +1542,7 @@ pub fn gpu_shutdown() {
 	// Return retained pool VRAM to the driver before the process dies — see
 	// trim_mempool: async teardown reclaim races the next process's first touch.
 	let _ = crate::hip::trim_mempool(0);
+	eprint!("{}", crate::callspy::report());
 }
 
 /// Fused linear: out = X @ W + bias. X is (m,k), W is (k,n), bias is (1,n), out is (m,n).

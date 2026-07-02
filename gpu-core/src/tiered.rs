@@ -105,6 +105,7 @@ pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) ->
 fn vram_total_free() -> (usize, usize) {
       let (mut free, mut total) = (0usize, 0usize);
       // SAFETY: FFI query into two owned stack usizes.
+      crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
       unsafe { hip::hipMemGetInfo(&mut free, &mut total) };
       (free, total)
 }
@@ -450,11 +451,14 @@ impl Drop for Tiered {
                   let va = unsafe { (self.va as *mut u8).add(s * P) as *mut c_void };
                   // SAFETY: unmap then release each slot we mapped; free the VA range.
                   unsafe {
+                        crate::callspy::tick(&crate::callspy::MEM_UNMAP);
                         hip::vmm_unmap(va, P);
+                        crate::callspy::tick(&crate::callspy::MEM_RELEASE);
                         hip::vmm_release(*h);
                   }
             }
             if !self.va.is_null() && self.slots > 0 {
+                  crate::callspy::tick(&crate::callspy::MEM_ADDRESS_FREE);
                   unsafe { hip::vmm_addr_free(self.va, self.slots * P) };
             }
             if self.disk.is_some() {
@@ -470,12 +474,16 @@ fn reserve_and_map(slots: usize) -> Result<(*mut c_void, Vec<*mut c_void>), HipE
             return Ok((std::ptr::null_mut(), Vec::new()));
       }
       let mut va: *mut c_void = std::ptr::null_mut();
+      crate::callspy::tick(&crate::callspy::MEM_ADDRESS_RESERVE);
       hip::check(unsafe { hip::vmm_reserve(&mut va, slots * P) })?;
       let mut handles = Vec::with_capacity(slots);
       for s in 0..slots {
             let mut h: *mut c_void = std::ptr::null_mut();
+            crate::callspy::tick(&crate::callspy::MEM_CREATE);
             hip::check(unsafe { hip::vmm_create(&mut h, P) })?;
             let slot_va = unsafe { (va as *mut u8).add(s * P) as *mut c_void };
+            crate::callspy::tick(&crate::callspy::MEM_MAP);
+            crate::callspy::tick(&crate::callspy::MEM_SET_ACCESS);
             hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })?;
             handles.push(h);
       }

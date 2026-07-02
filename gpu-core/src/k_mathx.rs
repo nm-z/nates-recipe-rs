@@ -9,6 +9,8 @@ macro_rules! mx {
             pub fn $name(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
                 let o = GpuBuffer::alloc(n)?;
                 unsafe { $launch(x.ptr_raw() as *const c_void, o.ptr_raw(), n as i32, std::ptr::null_mut()); }
+                crate::callspy::tick(&crate::callspy::LAUNCH);
+                crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
                 check(unsafe { crate::hip::hipGetLastError() })?;
                 Ok(o)
             }

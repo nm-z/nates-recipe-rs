@@ -3,6 +3,8 @@ use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
 fn e() -> Result<(), HipError> {
+	crate::callspy::tick(&crate::callspy::LAUNCH);
+	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	check(unsafe { crate::hip::hipGetLastError() })
 }
 

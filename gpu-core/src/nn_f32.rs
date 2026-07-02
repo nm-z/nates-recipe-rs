@@ -183,6 +183,8 @@ unsafe extern "C" {
 }
 
 fn check_launch() {
+	crate::callspy::tick(&crate::callspy::LAUNCH);
+	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	let err = unsafe { crate::hip::hipGetLastError() };
 	assert!(err == 0, "HIP kernel launch failed with error code {}", err);
 }

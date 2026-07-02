@@ -7,6 +7,8 @@ pub struct HipError(pub i32);
 impl fmt::Display for HipError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		unsafe {
+			crate::callspy::tick(&crate::callspy::GET_ERROR_NAME);
+			crate::callspy::tick(&crate::callspy::GET_ERROR_STRING);
 			let name_ptr = hipGetErrorName(self.0);
 			let str_ptr = hipGetErrorString(self.0);
 			if !name_ptr.is_null() && !str_ptr.is_null() {
@@ -41,6 +43,7 @@ pub fn cu_count() -> usize {
 	if cached != 0 {
 		return cached;
 	}
+	crate::callspy::tick(&crate::callspy::GET_DEVICE_PROPERTIES);
 	let n = unsafe { hip_multiprocessor_count() };
 	assert!(
 		n > 0,
@@ -148,11 +151,13 @@ unsafe extern "C" {
 pub fn mem_info() -> Result<(usize, usize), HipError> {
 	let mut free: usize = 0;
 	let mut total: usize = 0;
+	crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
 	check(unsafe { hipMemGetInfo(&mut free, &mut total) })?;
 	Ok((free, total))
 }
 
 pub fn device_synchronize() -> Result<(), HipError> {
+	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 	check(unsafe { hipDeviceSynchronize() })
 }
 
@@ -176,6 +181,7 @@ pub(crate) fn disable_sdma_once() {
 
 pub fn set_device(device: i32) -> Result<(), HipError> {
 	disable_sdma_once();
+	crate::callspy::tick(&crate::callspy::SET_DEVICE);
 	check(unsafe { hipSetDevice(device) })
 }
 
@@ -191,10 +197,13 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	const RESERVED_MEM_CURRENT: i32 = 0x5;
 	const USED_MEM_CURRENT: i32 = 0x7;
 	let mut pool: *mut c_void = std::ptr::null_mut();
+	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
 	let mut reserved: u64 = 0;
 	let mut used: u64 = 0;
+	crate::callspy::tick(&crate::callspy::MEMPOOL_GET_ATTRIBUTE);
 	check(unsafe { hipMemPoolGetAttribute(pool, RESERVED_MEM_CURRENT, &mut reserved as *mut u64 as *mut c_void) })?;
+	crate::callspy::tick(&crate::callspy::MEMPOOL_GET_ATTRIBUTE);
 	check(unsafe { hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, &mut used as *mut u64 as *mut c_void) })?;
 	Ok(reserved.saturating_sub(used) as usize)
 }
@@ -219,8 +228,10 @@ pub fn sysfs_vram_free() -> Option<usize> {
 pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
 	let mut pool: *mut c_void = std::ptr::null_mut();
+	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
 	let mut threshold: u64 = u64::MAX;
+	crate::callspy::tick(&crate::callspy::MEMPOOL_SET_ATTRIBUTE);
 	check(unsafe {
 		hipMemPoolSetAttribute(
 			pool,
@@ -246,44 +257,53 @@ pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
 /// test of the next binary. Called from gpu_shutdown's atexit hook.
 pub(crate) fn trim_mempool(device: i32) -> Result<(), HipError> {
 	let mut pool: *mut c_void = std::ptr::null_mut();
+	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+	crate::callspy::tick(&crate::callspy::MEMPOOL_TRIM_TO);
 	check(unsafe { hipMemPoolTrimTo(pool, 0) })
 }
 
 pub fn peek_last_error() -> i32 {
+	crate::callspy::tick(&crate::callspy::PEEK_AT_LAST_ERROR);
 	unsafe { hipPeekAtLastError() }
 }
 
 pub fn device_count() -> Result<i32, HipError> {
 	let mut count: i32 = 0;
+	crate::callspy::tick(&crate::callspy::GET_DEVICE_COUNT);
 	check(unsafe { hipGetDeviceCount(&mut count) })?;
 	Ok(count)
 }
 
 pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 	let mut val: i32 = 0;
+	crate::callspy::tick(&crate::callspy::DEVICE_GET_ATTRIBUTE);
 	check(unsafe { hipDeviceGetAttribute(&mut val, attr, device) })?;
 	Ok(val)
 }
 
 pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 	let mut ptr: *mut c_void = std::ptr::null_mut();
+	crate::callspy::tick(&crate::callspy::HOST_MALLOC);
 	check(unsafe { hipHostMalloc(&mut ptr, size, flags) })?;
 	Ok(ptr)
 }
 
 pub unsafe fn host_free(ptr: *mut c_void) -> Result<(), HipError> {
 	// SAFETY: FFI call — caller must ensure pointer validity and size.
+	crate::callspy::tick(&crate::callspy::HOST_FREE);
 	check(unsafe { hipHostFree(ptr) })
 }
 
 pub fn can_access_peer(device: i32, peer: i32) -> Result<bool, HipError> {
 	let mut val: i32 = 0;
+	crate::callspy::tick(&crate::callspy::DEVICE_CAN_ACCESS_PEER);
 	check(unsafe { hipDeviceCanAccessPeer(&mut val, device, peer) })?;
 	Ok(val != 0)
 }
 
 pub fn enable_peer_access(peer: i32, flags: u32) -> Result<(), HipError> {
+	crate::callspy::tick(&crate::callspy::DEVICE_ENABLE_PEER_ACCESS);
 	check(unsafe { hipDeviceEnablePeerAccess(peer, flags) })
 }
 
@@ -299,6 +319,7 @@ unsafe impl Sync for Stream {}
 impl Stream {
 	pub fn new() -> Result<Self, HipError> {
 		let mut raw: *mut c_void = std::ptr::null_mut();
+		crate::callspy::tick(&crate::callspy::STREAM_CREATE);
 		check(unsafe { hipStreamCreate(&mut raw) })?;
 		Ok(Stream { raw })
 	}
@@ -308,6 +329,7 @@ impl Stream {
 	}
 
 	pub fn synchronize(&self) -> Result<(), HipError> {
+		crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 		check(unsafe { hipStreamSynchronize(self.raw) })
 	}
 }
@@ -315,6 +337,7 @@ impl Stream {
 impl Drop for Stream {
 	fn drop(&mut self) {
 		unsafe {
+			crate::callspy::tick(&crate::callspy::STREAM_DESTROY);
 			hipStreamDestroy(self.raw);
 		}
 	}
@@ -332,16 +355,19 @@ unsafe impl Sync for Event {}
 impl Event {
 	pub fn new() -> Result<Self, HipError> {
 		let mut raw: *mut c_void = std::ptr::null_mut();
+		crate::callspy::tick(&crate::callspy::EVENT_CREATE);
 		check(unsafe { hipEventCreate(&mut raw) })?;
 		Ok(Event { raw })
 	}
 
 	pub unsafe fn record(&self, stream: *mut c_void) -> Result<(), HipError> {
 		// SAFETY: FFI call — caller must ensure pointer validity and size.
+		crate::callspy::tick(&crate::callspy::EVENT_RECORD);
 		check(unsafe { hipEventRecord(self.raw, stream) })
 	}
 
 	pub fn synchronize(&self) -> Result<(), HipError> {
+		crate::callspy::tick(&crate::callspy::EVENT_SYNCHRONIZE);
 		check(unsafe { hipEventSynchronize(self.raw) })
 	}
 }
@@ -349,6 +375,7 @@ impl Event {
 impl Drop for Event {
 	fn drop(&mut self) {
 		unsafe {
+			crate::callspy::tick(&crate::callspy::EVENT_DESTROY);
 			hipEventDestroy(self.raw);
 		}
 	}
@@ -356,6 +383,7 @@ impl Drop for Event {
 
 pub fn elapsed_ms(start: &Event, stop: &Event) -> Result<f32, HipError> {
 	let mut ms: f32 = 0.0;
+	crate::callspy::tick(&crate::callspy::EVENT_ELAPSED_TIME);
 	check(unsafe { hipEventElapsedTime(&mut ms, start.raw, stop.raw) })?;
 	Ok(ms)
 }

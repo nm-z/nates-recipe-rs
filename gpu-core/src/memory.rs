@@ -362,6 +362,7 @@ unsafe fn dev_copy(
 	stream: *mut c_void,
 ) -> Result<(), HipError> {
 	// SAFETY: caller guarantees dst/src validity and that both span `bytes`.
+	crate::callspy::tick(&crate::callspy::MEMCPY_ASYNC);
 	check(unsafe { hipMemcpyAsync(dst, src, bytes, kind, stream) })
 }
 
@@ -408,6 +409,7 @@ unsafe fn h2d_pinned(
 				stream,
 			)
 		}?;
+		crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 		check(unsafe { hipStreamSynchronize(stream) })?;
 		done += chunk;
 	}
@@ -426,6 +428,7 @@ pub(crate) unsafe fn xfer_sync(
 ) -> Result<(), HipError> {
 	// SAFETY: forwarded from the caller's validated pointers.
 	unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) }?;
+	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
 }
 
@@ -437,6 +440,7 @@ pub(crate) unsafe fn memset_dev(
 	stream: *mut c_void,
 ) -> Result<(), HipError> {
 	// SAFETY: caller guarantees dst spans `bytes`.
+	crate::callspy::tick(&crate::callspy::MEMSET_ASYNC);
 	check(unsafe { hipMemsetAsync(dst, value, bytes, stream) })
 }
 
@@ -444,6 +448,7 @@ pub(crate) unsafe fn memset_dev(
 pub(crate) unsafe fn memset_sync(dst: *mut c_void, value: i32, bytes: usize) -> Result<(), HipError> {
 	// SAFETY: forwarded from the caller's validated pointer.
 	unsafe { memset_dev(dst, value, bytes, std::ptr::null_mut()) }?;
+	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
 }
 
@@ -666,6 +671,7 @@ impl GpuBuffer {
 			}
 		}
 		let mut ptr: *mut c_void = std::ptr::null_mut();
+		crate::callspy::tick(&crate::callspy::MALLOC_ASYNC);
 		let code = unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) };
 		if code == 2 && !quiet_oom {
 			oom_report(n_bytes);
@@ -673,6 +679,7 @@ impl GpuBuffer {
 		check(code)?;
 		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
 		if ALLOC_SYNC.load(Ordering::Relaxed) {
+			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 			check(unsafe { hipDeviceSynchronize() })?;
 		}
 		tag_add(tag, n_bytes);
@@ -866,6 +873,7 @@ impl Drop for GpuBuffer {
 			tag_sub(self.tag, self.len);
 			POOL_LIVE.fetch_sub(self.len, Ordering::Relaxed);
 			FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
+			crate::callspy::tick(&crate::callspy::FREE_ASYNC);
 			unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 			self.ptr = std::ptr::null_mut();
 		}
