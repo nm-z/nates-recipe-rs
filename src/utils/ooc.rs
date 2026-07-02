@@ -362,9 +362,14 @@ impl Ooc {
 		// RAM accounting must be CUMULATIVE: fresh Vec pages are lazily
 		// zero-backed, so mem_available() does not drop until an epoch touches
 		// them — re-measuring per placement admits unbounded virtual memory and
-		// the OOM killer collects mid-epoch.
+		// the OOM killer collects mid-epoch. The homes budget must also carry
+		// THIS path's own host machinery (read-ahead Vecs — up to 5 buffers
+		// concurrently read in flash backward — the 2-deep write-behind queue,
+		// the staging bounce and a commit temp: 9 windows), or the box lands
+		// exactly on the floor and the OOM killer collects (it did, twice).
+		let host_overhead = 9 * chunk * max_spb * 8;
 		let ram_start = mem_available();
-		let ram_floor = ram_start / 10;
+		let ram_floor = ram_start / 10 + host_overhead;
 		let mut ram_used = 0usize;
 		let mut vram_open = true;
 		let mut disk_cursor: u64 = 0;
