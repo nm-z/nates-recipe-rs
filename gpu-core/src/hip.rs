@@ -55,7 +55,6 @@ pub const HIP_MEMCPY_D2H: i32 = 2;
 pub const HIP_MEMCPY_D2D: i32 = 3;
 
 unsafe extern "C" {
-	pub fn hipMemset(dst: *mut c_void, value: i32, size: usize) -> i32;
 	pub fn hipGetLastError() -> i32;
 	pub fn hipDeviceSynchronize() -> i32;
 	pub fn hipEventCreate(event: *mut *mut c_void) -> i32;
@@ -81,12 +80,10 @@ unsafe extern "C" {
 		kind: i32,
 		stream: *mut c_void,
 	) -> i32;
-	pub fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
+	pub(crate) fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
 	// Pinned host memory
 	pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	pub(crate) fn hipHostFree(ptr: *mut c_void) -> i32;
-	pub fn hipHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> i32;
-	pub fn hipHostUnregister(ptr: *mut c_void) -> i32;
 	// Device count and attributes
 	// Note: hipDeviceProp_t is a ~800-byte struct; we expose hipDeviceGetAttribute instead
 	// to avoid defining it in Rust and to allow querying individual fields by attribute enum int.
@@ -102,22 +99,13 @@ unsafe extern "C" {
 		peer_device_id: i32,
 	) -> i32;
 	pub fn hipDeviceEnablePeerAccess(peer_device_id: i32, flags: u32) -> i32;
-	pub fn hipMemcpyPeer(
-		dst: *mut c_void,
-		dst_device: i32,
-		src: *const c_void,
-		src_device: i32,
-		size: usize,
-	) -> i32;
 	// Stream-ordered allocation
 	pub(crate) fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
 	pub(crate) fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
-	pub fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
-	pub fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
-	// Managed (unified) memory
-	pub fn hipMallocManaged(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
+	pub(crate) fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
 	// VRAM tier of the tiered buffer — VMM wrappers (src/kernels/vmm.hip). Handles
 	// are opaque, carried as *mut c_void.
 	pub fn vmm_granularity(out: *mut usize) -> i32;
@@ -289,16 +277,6 @@ pub unsafe fn host_free(ptr: *mut c_void) -> Result<(), HipError> {
 	check(unsafe { hipHostFree(ptr) })
 }
 
-pub unsafe fn host_register(ptr: *mut c_void, size: usize, flags: u32) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipHostRegister(ptr, size, flags) })
-}
-
-pub unsafe fn host_unregister(ptr: *mut c_void) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipHostUnregister(ptr) })
-}
-
 pub fn can_access_peer(device: i32, peer: i32) -> Result<bool, HipError> {
 	let mut val: i32 = 0;
 	check(unsafe { hipDeviceCanAccessPeer(&mut val, device, peer) })?;
@@ -307,17 +285,6 @@ pub fn can_access_peer(device: i32, peer: i32) -> Result<bool, HipError> {
 
 pub fn enable_peer_access(peer: i32, flags: u32) -> Result<(), HipError> {
 	check(unsafe { hipDeviceEnablePeerAccess(peer, flags) })
-}
-
-pub unsafe fn memcpy_peer(
-	dst: *mut c_void,
-	dst_device: i32,
-	src: *const c_void,
-	src_device: i32,
-	size: usize,
-) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
-	check(unsafe { hipMemcpyPeer(dst, dst_device, src, src_device, size) })
 }
 
 /// RAII wrapper for a HIP stream.
