@@ -26,7 +26,10 @@ use std::time::Duration;
 /// — in TUI raw mode Ctrl+C arrives as a key event instead and is handled there.
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_sigint(_: i32) {
-	INTERRUPTED.store(true, Ordering::SeqCst);
+	// Second ^C means OUT NOW — skip checkpoints, async-signal-safe exit.
+	if INTERRUPTED.swap(true, Ordering::SeqCst) {
+		unsafe { libc::_exit(130) };
+	}
 }
 /// Per-column number colors, applied in `.log([...])` order (cycles past 12).
 const PALETTE: [(u8, u8, u8); 12] = [
@@ -885,6 +888,9 @@ impl ModelInner {
 			match ooc.as_mut() {
 				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
 				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
+			}
+			if INTERRUPTED.load(Ordering::SeqCst) {
+				break;
 			}
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()

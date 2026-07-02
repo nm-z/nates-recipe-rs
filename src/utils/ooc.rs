@@ -78,6 +78,10 @@ fn drop_cache(f: &File, off: u64, len: usize) {
 	}
 }
 
+fn interrupted() -> bool {
+	crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
 	(0..n.div_ceil(c)).map(move |i| (i * c, c.min(n - i * c)))
 }
@@ -254,7 +258,6 @@ pub struct Ooc {
 	wins: Vec<GpuBuffer>,
 	spill: File,
 	writer: Writer,
-	spill_path: std::path::PathBuf,
 	acts: Vec<Paged>,
 	preacts: Vec<Option<Paged>>,
 	a_q: Paged,
@@ -304,6 +307,10 @@ impl Ooc {
 			.truncate(true)
 			.open(&spill_path)
 			.expect("open spill file");
+		// Unlink immediately: the fd keeps the file alive, and the space
+		// reclaims itself no matter how the process dies (a SIGKILLed run
+		// leaked a 40 GB spill on disk once).
+		let _ = std::fs::remove_file(&spill_path);
 		let writer = Writer::new(&spill);
 
 		let max_wt = params
@@ -424,7 +431,6 @@ impl Ooc {
 			wins,
 			spill,
 			writer,
-			spill_path,
 			acts,
 			preacts,
 			a_q,
@@ -502,6 +508,9 @@ impl Ooc {
 			{
 				self.writer.barrier(&self.spill);
 				for (s0, cnt) in chunks(self.n, self.chunk) {
+					if interrupted() {
+						return;
+					}
 					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n);
 					let xc = view(x_cat.expect("x_cat"), s0 * c * 8, cnt * c * 8);
 					let out = self.concat.write_view(s0, cnt, &self.wins[1]);
@@ -513,6 +522,9 @@ impl Ooc {
 				LayerKind::Embed => {
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
 						kernels::gpu_gather_rows_into(&p.w, &ids, &out, cnt * p.in_dim, p.dim);
@@ -526,6 +538,9 @@ impl Ooc {
 					let s = p.in_dim / d;
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n);
 						let m = cnt * s;
 						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
@@ -541,6 +556,9 @@ impl Ooc {
 					}
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n);
 						let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n);
 						let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n);
@@ -551,6 +569,9 @@ impl Ooc {
 					}
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], &self.spill, self.n);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
 						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, &out, cnt * s, d, d);
@@ -560,6 +581,9 @@ impl Ooc {
 				LayerKind::Dense | LayerKind::Conv => {
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(self.n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let prev = if l == 0 {
 							view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
 						} else if Some(l) == concat_at.map(|t| t.0) {
@@ -641,6 +665,9 @@ impl Ooc {
 		self.da_a.spb = params[last].out_dim;
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
+			if interrupted() {
+				return;
+			}
 			let k = params[last].out_dim;
 			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
@@ -659,6 +686,9 @@ impl Ooc {
 					kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(n, self.chunk) {
+						if interrupted() {
+							return;
+						}
 						let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
@@ -688,6 +718,9 @@ impl Ooc {
 			self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
 			self.writer.barrier(&self.spill);
 			for (s0, cnt) in chunks(n, self.chunk) {
+				if interrupted() {
+					return;
+				}
 				let m = cnt * out_dim;
 				let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
 				let act_l = if l == last {
@@ -832,6 +865,9 @@ impl Ooc {
 		kernels::gpu_scale_inplace(&self.dw_acc, 0.0, d * d);
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
+			if interrupted() {
+				return;
+			}
 			let m = cnt * s;
 			let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n);
 			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], &self.spill, self.n);
@@ -847,6 +883,9 @@ impl Ooc {
 		// Flash backward per sample chunk: dsum, then dQ/dK/dV; un-rotate RoPE.
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
+			if interrupted() {
+				return;
+			}
 			let q = self.a_q.read(s0, cnt, &self.wins[0], &self.spill, self.n);
 			let k = self.a_k.read(s0, cnt, &self.wins[1], &self.spill, self.n);
 			let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n);
@@ -873,6 +912,9 @@ impl Ooc {
 		kernels::gpu_scale_inplace(&self.dwv_acc, 0.0, d * d);
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
+			if interrupted() {
+				return;
+			}
 			let m = cnt * s;
 			let h = if l == 0 {
 				view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
@@ -912,8 +954,8 @@ impl Ooc {
 
 impl Drop for Ooc {
 	fn drop(&mut self) {
-		// Drain in-flight write-behind before the spill file goes away.
+		// Drain in-flight write-behind (the spill fd itself dies with us —
+		// the path was unlinked at open).
 		self.writer.barrier(&self.spill);
-		let _ = std::fs::remove_file(&self.spill_path);
 	}
 }
