@@ -251,11 +251,15 @@ pub struct Plan {
 
 /// Combined-ceiling admit in waterfall order from live measurements. `None`
 /// only when VRAM+RAM+DISK together cannot hold `need` — the sole abort.
+// THE reserve law: exactly 1 GB of each tier belongs to the user; every
+// other byte is ours to fill. No ratios, no floors, no guesses.
+pub const USER_GB: usize = 1 << 30;
+
 pub fn plan(need: usize) -> Option<Plan> {
-	let vram_avail = vram_avail();
-	let ram_avail = mem_available().saturating_sub(mem_available() / 10);
+	let vram_avail = vram_avail().saturating_sub(USER_GB);
+	let ram_avail = mem_available().saturating_sub(USER_GB);
 	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-	let disk_avail = disk_free(&cwd).saturating_sub(1 << 30);
+	let disk_avail = disk_free(&cwd).saturating_sub(USER_GB);
 	if need > vram_avail + ram_avail + disk_avail {
 		return None;
 	}
@@ -343,7 +347,7 @@ impl Ooc {
 		// of what remains stages windows (+2 windows of margin for the
 		// chunk-sized dw_partials/reduce_ws), the waterfall homes fill the rest.
 		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
-		let win_budget = vram_avail().saturating_sub(fixed_res) / 2;
+		let win_budget = vram_avail().saturating_sub(USER_GB).saturating_sub(fixed_res) / 2;
 		let chunk = (win_budget / ((WINS + 2) * max_spb * 8)).clamp(1, n);
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
@@ -389,7 +393,7 @@ impl Ooc {
 		// exactly on the floor and the OOM killer collects (it did, twice).
 		let host_overhead = (2 * 5 + 2 * W_LANES + 2) * chunk * max_spb * 8;
 		let ram_start = mem_available();
-		let ram_floor = ram_start / 10 + host_overhead;
+		let ram_floor = USER_GB + host_overhead;
 		let mut ram_used = 0usize;
 		let mut vram_open = true;
 		let mut disk_cursor: u64 = 0;

@@ -491,41 +491,6 @@ static WARM_SKIP: AtomicBool = AtomicBool::new(false);
 static POOL_LIVE: AtomicUsize = AtomicUsize::new(0);
 static POOL_VERIFIED: AtomicUsize = AtomicUsize::new(0);
 
-// Ask a disposable child process to map `n` bytes while this process keeps
-// everything it holds: child success proves live+n is co-mappable; a child
-// killed by the VmHeap assert (or refused with OOM) means the parent must not
-// try. The child sets VRAM_PROBE_CHILD so ITS allocation skips probing — the
-// child is the probe, the crash risk is its job.
-fn probe_mappable(n: usize) -> bool {
-	if std::env::var_os("VRAM_PROBE_CHILD").is_some() {
-		return true;
-	}
-	let exe = std::env::current_exe().expect("current_exe");
-	let dir = exe.parent().expect("exe dir");
-	let probe = ["vram_probe", "../vram_probe"]
-		.iter()
-		.map(|p| dir.join(p))
-		.find(|p| p.is_file())
-		.unwrap_or_else(|| {
-			panic!(
-				"vram_probe binary not found beside {} — build the gpu-core workspace member",
-				exe.display()
-			)
-		});
-	let mut cmd = std::process::Command::new(probe);
-	cmd.arg(n.to_string()).env("VRAM_PROBE_CHILD", "1");
-	// The child aborting is an expected outcome — no core dumps from it.
-	unsafe {
-		use std::os::unix::process::CommandExt;
-		cmd.pre_exec(|| {
-			let lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-			libc::setrlimit(libc::RLIMIT_CORE, &lim);
-			Ok(())
-		});
-	}
-	cmd.status().map(|s| s.success()).unwrap_or(false)
-}
-
 /// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
 /// allocation): skip the churn-protection warm — there is no churn to protect,
 /// and the retained warm gigabyte would just shrink the claim.
@@ -655,15 +620,18 @@ impl GpuBuffer {
 		//      risk and its exit status is the verdict.
 		// Re-asks under the proven peak skip both — the pool never shrinks
 		// mid-run (retain threshold = max), so no new mapping is needed.
-		let projected = POOL_LIVE.load(Ordering::Relaxed) + n_bytes;
-		let verified = POOL_VERIFIED.load(Ordering::Relaxed);
-		if projected > verified {
+		let live = POOL_LIVE.load(Ordering::Relaxed);
+		let projected = live + n_bytes;
+		if projected > POOL_VERIFIED.load(Ordering::Relaxed) {
 			let hip_free = crate::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
 			let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
 			let slack = crate::hip::pool_slack(0).unwrap_or(0);
 			let remaining = hip_free.min(sys_free).saturating_sub(slack);
-			let growth = projected - verified;
-			if growth > remaining || !probe_mappable(n_bytes) {
+			// THE law: 1 GB of VRAM belongs to the user, always. Growth is
+			// refused inside that band — which also covers the counters'
+			// over-report of the true VmHeap ceiling (observed well under
+			// 1 GB), so no per-ask probe children, no ratios, no guesses.
+			if n_bytes > remaining.saturating_sub(1 << 30) {
 				if !quiet_oom {
 					oom_report(n_bytes);
 				}

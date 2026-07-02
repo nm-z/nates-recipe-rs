@@ -28,7 +28,7 @@ pub const P: usize = 2 << 20;
 // Reserves layered on top of the model's own weight/grad footprint (VRAM), the
 // kernel page cache (RAM), and filesystem metadata (disk). Headroom each tier
 // must never dip into — not thresholds on the buffer, floors under the OS.
-const RESERVE_V: usize = 512 << 20; // 512 MiB device context/driver headroom
+const RESERVE_V: usize = 1 << 30; // the 1 GB-per-tier user reserve law
 const RESERVE_R: usize = 1 << 30; //  1 GiB  OS headroom
 const RESERVE_D: usize = 1 << 30; //  1 GiB  filesystem headroom
 
