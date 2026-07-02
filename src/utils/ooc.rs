@@ -92,34 +92,37 @@ enum Home {
 	Disk(u64), // byte offset in the shared spill file
 }
 
-/// One full-batch logical buffer, [n × spb] f64, homed by the waterfall. `spb`
-/// (f64s per sample) can change when a ping-pong buffer is reused at another
-/// width — bytes are always packed at the current width.
+/// One full-batch logical buffer, [n × spb] f64, homed PER WINDOW by the
+/// waterfall — VRAM fills to the gate line at window granularity instead of
+/// all-or-nothing per buffer. `spb` (f64s per sample) can change when a
+/// ping-pong buffer is reused at another width; each window's backing is sized
+/// for the creation width and later widths use its prefix. `chunk` is the
+/// window sample count every sweep iterates by, so (s0, cnt) always addresses
+/// exactly one window.
 struct Paged {
-	home: Home,
+	homes: Vec<Home>,
 	spb: usize,
+	chunk: usize,
 	// Sequential read-ahead, depth 2: every disk read keeps the next TWO
-	// windows in flight (every sweep walks windows in order), so the NVMe
-	// sees queue depth and streams underneath the GPU instead of taking
-	// turns with it.
+	// disk-resident windows in flight, so the NVMe sees queue depth and
+	// streams underneath the GPU instead of taking turns with it.
 	ahead: RefCell<std::collections::VecDeque<(usize, usize, std::thread::JoinHandle<Vec<u8>>)>>,
 }
 
 impl Paged {
-	fn bytes(&self, samples: usize) -> usize {
-		samples * self.spb * 8
+	fn win(&self, s0: usize, cnt: usize) -> usize {
+		assert!(s0 % self.chunk == 0 && cnt <= self.chunk, "ooc access not window-aligned");
+		s0 / self.chunk
 	}
 	fn kick_ahead(&self, s0: usize, cnt: usize, n: usize, spill: &File) {
-		let base = match &self.home {
-			Home::Disk(b) => *b,
-			_ => return,
-		};
 		let mut q = self.ahead.borrow_mut();
 		let mut next0 = q.back().map_or(s0 + cnt, |(p0, pc, _)| p0 + pc);
 		while q.len() < 2 && next0 < n {
 			let next_cnt = cnt.min(n - next0);
-			let off = base + self.bytes(next0) as u64;
-			let len = self.bytes(next_cnt);
+			let Home::Disk(off) = self.homes[next0 / self.chunk] else {
+				return; // next window is a fast tier — nothing to hide
+			};
+			let len = next_cnt * self.spb * 8;
 			let f = spill.try_clone().expect("spill clone");
 			let h = std::thread::spawn(move || {
 				let mut buf = vec![0u8; len];
@@ -134,17 +137,17 @@ impl Paged {
 			next0 += next_cnt;
 		}
 	}
-	/// Device view of samples [s0, s0+cnt): VRAM homes return an offset view
-	/// (zero copies); RAM/DISK homes stage into `win` first.
+	/// Device view of samples [s0, s0+cnt): VRAM-homed windows return an
+	/// offset view (zero copies); RAM/DISK windows stage into `win` first.
 	fn read(&self, s0: usize, cnt: usize, win: &GpuBuffer, spill: &File, n: usize) -> GpuBuffer {
-		let (off, len) = (self.bytes(s0), self.bytes(cnt));
-		match &self.home {
-			Home::Vram(b) => view(b, off, len),
+		let len = cnt * self.spb * 8;
+		match &self.homes[self.win(s0, cnt)] {
+			Home::Vram(b) => view(b, 0, len),
 			Home::Ram(v) => {
-				win.write_u8(&v[off..off + len]).expect("ooc H2D");
+				win.write_u8(&v[..len]).expect("ooc H2D");
 				view(win, 0, len)
 			}
-			Home::Disk(base) => {
+			Home::Disk(off) => {
 				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
 					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().expect("read-ahead thread"),
@@ -155,10 +158,10 @@ impl Paged {
 							let _ = h.join();
 						}
 						let mut buf = vec![0u8; len];
-						spill.read_exact_at(&mut buf, base + off as u64).expect("ooc spill read");
+						spill.read_exact_at(&mut buf, *off).expect("ooc spill read");
 						unsafe {
 							use std::os::unix::io::AsRawFd;
-							libc::posix_fadvise(spill.as_raw_fd(), (base + off as u64) as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+							libc::posix_fadvise(spill.as_raw_fd(), *off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
 						}
 						buf
 					}
@@ -170,23 +173,24 @@ impl Paged {
 		}
 	}
 	/// Device window a kernel writes samples [s0, s0+cnt) into. Pair with
-	/// `commit(same view)` afterwards — a no-op for VRAM homes.
+	/// `commit(same view)` afterwards — a no-op for VRAM-homed windows.
 	fn write_view(&self, s0: usize, cnt: usize, win: &GpuBuffer) -> GpuBuffer {
-		let (off, len) = (self.bytes(s0), self.bytes(cnt));
-		match &self.home {
-			Home::Vram(b) => view(b, off, len),
+		let len = cnt * self.spb * 8;
+		match &self.homes[self.win(s0, cnt)] {
+			Home::Vram(b) => view(b, 0, len),
 			_ => view(win, 0, len),
 		}
 	}
 	fn commit(&mut self, s0: usize, cnt: usize, v: &GpuBuffer, writer: &Writer) {
-		let (off, len) = (self.bytes(s0), self.bytes(cnt));
-		match &mut self.home {
+		let len = cnt * self.spb * 8;
+		let w = self.win(s0, cnt);
+		match &mut self.homes[w] {
 			Home::Vram(_) => {}
-			Home::Ram(dst) => v.download_u8(&mut dst[off..off + len]).expect("ooc D2H"),
-			Home::Disk(base) => {
+			Home::Ram(dst) => v.download_u8(&mut dst[..len]).expect("ooc D2H"),
+			Home::Disk(off) => {
 				let mut buf = vec![0u8; len];
 				v.download_u8(&mut buf).expect("ooc D2H");
-				writer.send(*base + off as u64, buf);
+				writer.send(*off, buf);
 			}
 		}
 	}
@@ -397,21 +401,31 @@ impl Ooc {
 		let mut ram_used = 0usize;
 		let mut vram_open = true;
 		let mut disk_cursor: u64 = 0;
+		// Per-WINDOW placement: the waterfall fills VRAM window by window until
+		// the gate refuses (top minus the user GB), THEN RAM to its line, THEN
+		// disk — not a byte pools in a slower tier while a faster one has room.
 		let mut place = |spb: usize| -> Paged {
-			let bytes = n * spb * 8;
-			if vram_open {
-				if let Some(b) = GpuBuffer::try_alloc_bytes(bytes) {
-					return Paged { home: Home::Vram(b), spb, ahead: RefCell::new(std::collections::VecDeque::new()) };
+			let n_wins = n.div_ceil(chunk);
+			let mut homes = Vec::with_capacity(n_wins);
+			for w in 0..n_wins {
+				let cnt = chunk.min(n - w * chunk);
+				let bytes = cnt * spb * 8;
+				if vram_open {
+					if let Some(b) = GpuBuffer::try_alloc_bytes(bytes) {
+						homes.push(Home::Vram(b));
+						continue;
+					}
+					vram_open = false;
 				}
-				vram_open = false;
+				if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
+					ram_used += bytes;
+					homes.push(Home::Ram(vec![0u8; bytes]));
+					continue;
+				}
+				homes.push(Home::Disk(disk_cursor));
+				disk_cursor += bytes as u64;
 			}
-			if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
-				ram_used += bytes;
-				return Paged { home: Home::Ram(vec![0u8; bytes]), spb, ahead: RefCell::new(std::collections::VecDeque::new()) };
-			}
-			let off = disk_cursor;
-			disk_cursor += bytes as u64;
-			Paged { home: Home::Disk(off), spb, ahead: RefCell::new(std::collections::VecDeque::new()) }
+			Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()) }
 		};
 
 		// Placement in HOTNESS order — the waterfall gives the fastest tier to
@@ -484,10 +498,15 @@ impl Ooc {
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
 		let (mut v, mut r, mut d) = (0usize, 0usize, 0usize);
-		let mut tally = |p: &Paged| match &p.home {
-			Home::Vram(_) => v += self.n * p.spb * 8,
-			Home::Ram(x) => r += x.len(),
-			Home::Disk(_) => d += self.n * p.spb * 8,
+		let mut tally = |p: &Paged| {
+			for (w, h) in p.homes.iter().enumerate() {
+				let cnt = p.chunk.min(self.n - w * p.chunk);
+				match h {
+					Home::Vram(_) => v += cnt * p.spb * 8,
+					Home::Ram(x) => r += x.len(),
+					Home::Disk(_) => d += cnt * p.spb * 8,
+				}
+			}
 		};
 		for a in &self.acts {
 			tally(a);
