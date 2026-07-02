@@ -481,6 +481,46 @@ pub(crate) fn ensure_pool_warmed() {
 
 static WARM_SKIP: AtomicBool = AtomicBool::new(false);
 
+// Bytes currently held by pool (owned) allocations, and the co-mapped total a
+// disposable child has PROVEN the system can hold alongside this process.
+static POOL_LIVE: AtomicUsize = AtomicUsize::new(0);
+static POOL_VERIFIED: AtomicUsize = AtomicUsize::new(0);
+
+// Ask a disposable child process to map `n` bytes while this process keeps
+// everything it holds: child success proves live+n is co-mappable; a child
+// killed by the VmHeap assert (or refused with OOM) means the parent must not
+// try. The child sets VRAM_PROBE_CHILD so ITS allocation skips probing — the
+// child is the probe, the crash risk is its job.
+fn probe_mappable(n: usize) -> bool {
+	if std::env::var_os("VRAM_PROBE_CHILD").is_some() {
+		return true;
+	}
+	let exe = std::env::current_exe().expect("current_exe");
+	let dir = exe.parent().expect("exe dir");
+	let probe = ["vram_probe", "../vram_probe"]
+		.iter()
+		.map(|p| dir.join(p))
+		.find(|p| p.is_file())
+		.unwrap_or_else(|| {
+			panic!(
+				"vram_probe binary not found beside {} — build the gpu-core workspace member",
+				exe.display()
+			)
+		});
+	let mut cmd = std::process::Command::new(probe);
+	cmd.arg(n.to_string()).env("VRAM_PROBE_CHILD", "1");
+	// The child aborting is an expected outcome — no core dumps from it.
+	unsafe {
+		use std::os::unix::process::CommandExt;
+		cmd.pre_exec(|| {
+			let lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			libc::setrlimit(libc::RLIMIT_CORE, &lim);
+			Ok(())
+		});
+	}
+	cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
 /// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
 /// allocation): skip the churn-protection warm — there is no churn to protect,
 /// and the retained warm gigabyte would just shrink the claim.
@@ -597,6 +637,34 @@ impl GpuBuffer {
 				}
 			}
 		}
+		// Growing the pool past what has been PROVEN co-mappable risks the
+		// driver's uncatchable VmHeap::MapPhysMemory assert. Two regimes, two
+		// checks, both required before the map is attempted:
+		//   1. Counters (heavy-parent regime): the growth cannot exceed
+		//      min(hip_free, sysfs_free) − pool_slack. A fresh probe process
+		//      would pass here anyway — its mapping gets eviction-assisted —
+		//      so counters, not a probe, are the honest signal once this
+		//      process is the one holding the card.
+		//   2. Probe (fresh/light regime): counters over-report near the
+		//      ceiling for big asks, so a disposable child takes the assert
+		//      risk and its exit status is the verdict.
+		// Re-asks under the proven peak skip both — the pool never shrinks
+		// mid-run (retain threshold = max), so no new mapping is needed.
+		let projected = POOL_LIVE.load(Ordering::Relaxed) + n_bytes;
+		let verified = POOL_VERIFIED.load(Ordering::Relaxed);
+		if projected > verified {
+			let hip_free = crate::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
+			let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
+			let slack = crate::hip::pool_slack(0).unwrap_or(0);
+			let remaining = hip_free.min(sys_free).saturating_sub(slack);
+			let growth = projected - verified;
+			if growth > remaining || !probe_mappable(n_bytes) {
+				if !quiet_oom {
+					oom_report(n_bytes);
+				}
+				return Err(HipError(2));
+			}
+		}
 		let mut ptr: *mut c_void = std::ptr::null_mut();
 		let code = unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) };
 		if code == 2 && !quiet_oom {
@@ -608,6 +676,8 @@ impl GpuBuffer {
 			check(unsafe { hipDeviceSynchronize() })?;
 		}
 		tag_add(tag, n_bytes);
+		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
+		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
 		Ok(Self {
 			ptr,
 			len: n_bytes,
@@ -794,6 +864,7 @@ impl Drop for GpuBuffer {
 	fn drop(&mut self) {
 		if self.owned && !self.ptr.is_null() && !SHUTTING_DOWN.load(Ordering::Relaxed) {
 			tag_sub(self.tag, self.len);
+			POOL_LIVE.fetch_sub(self.len, Ordering::Relaxed);
 			FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
 			unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 			self.ptr = std::ptr::null_mut();

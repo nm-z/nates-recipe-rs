@@ -12,6 +12,7 @@ fn oversize_alloc_is_clean_oom_not_abort() {
 	if std::env::var("OVERSIZE_OOM_CHILD").is_ok() {
 		let mut held = Vec::new();
 		loop {
+			eprintln!("fill: holding {} x 512MB, asking next", held.len());
 			match GpuBuffer::try_alloc_bytes(1usize << 29) {
 				Some(b) => held.push(b),
 				None => std::process::exit(0),
