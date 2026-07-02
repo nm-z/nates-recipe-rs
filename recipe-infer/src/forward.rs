@@ -449,7 +449,6 @@ pub fn forward_into(
 pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, sc: &Scratch) {
 	let d = p.dim;
 	let heads = p.heads;
-	let hd = d / heads;
 	let s = p.in_dim / d;
 	let m = n * s;
 	kernels::gpu_linear_into(h, &p.w, &p.b, &sc.a_q, m, d, d);
@@ -458,54 +457,9 @@ pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, s
 	// RoPE: rotate Q,K per head by token position before the QK dot product, so
 	// scores depend on relative position (the attention op is position-aware).
 	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_q, &sc.a_k, m, d, heads, s, 1.0);
-	// scores[head] = Q_head · K_headᵀ  (per-head sub-matrix views, ld = d)
-	for hh in 0..heads {
-		gpu_core::linalg::gpu_bmm_into(
-			&sc.a_scores,
-			&sc.a_q,
-			&sc.a_k,
-			n,
-			s,
-			s,
-			hd,
-			d,
-			d,
-			s,
-			s * d,
-			s * d,
-			s * s,
-			hh * hd,
-			hh * hd,
-			hh * n * s * s,
-			false,
-			true,
-		);
-	}
-	kernels::gpu_scale_inplace(&sc.a_scores, 1.0 / (hd as f64).sqrt(), n * heads * s * s);
-	kernels::gpu_softmax_rows_into(&sc.a_scores, &sc.a_scores, n * heads * s, s);
-	// context[head] = scores[head] · V_head
-	for hh in 0..heads {
-		gpu_core::linalg::gpu_bmm_into(
-			&sc.a_ctx,
-			&sc.a_scores,
-			&sc.a_v,
-			n,
-			s,
-			hd,
-			s,
-			s,
-			d,
-			d,
-			s * s,
-			s * d,
-			s * d,
-			hh * n * s * s,
-			hh * hd,
-			hh * hd,
-			false,
-			false,
-		);
-	}
+	// Fused flash attention: context in one launch, no L×L buffer anywhere; the
+	// per-row logsumexp lands in a_lse so backward can recompute score tiles.
+	kernels::gpu_flash_attention_train_into(&sc.a_q, &sc.a_k, &sc.a_v, &sc.a_ctx, &sc.a_lse, n, s, d, heads);
 	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, out, m, d, d);
 }
 

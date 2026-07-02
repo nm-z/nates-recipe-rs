@@ -379,6 +379,57 @@ unsafe extern "C" {
 		heads: i32,
 		stream: *mut c_void,
 	);
+	fn launch_flash_attention_f64_train_fwd(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		out: *mut c_void,
+		lse: *mut c_void,
+		n: i32,
+		seq: i32,
+		d: i32,
+		heads: i32,
+		stream: *mut c_void,
+	);
+	fn launch_flash_attention_f64_dsum(
+		ctx: *const c_void,
+		dctx: *const c_void,
+		dsum: *mut c_void,
+		n: i32,
+		seq: i32,
+		d: i32,
+		heads: i32,
+		stream: *mut c_void,
+	);
+	fn launch_flash_attention_f64_bwd_dq(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		dctx: *const c_void,
+		lse: *const c_void,
+		dsum: *const c_void,
+		dq: *mut c_void,
+		n: i32,
+		seq: i32,
+		d: i32,
+		heads: i32,
+		stream: *mut c_void,
+	);
+	fn launch_flash_attention_f64_bwd_dkv(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		dctx: *const c_void,
+		lse: *const c_void,
+		dsum: *const c_void,
+		dk: *mut c_void,
+		dv: *mut c_void,
+		n: i32,
+		seq: i32,
+		d: i32,
+		heads: i32,
+		stream: *mut c_void,
+	);
 	fn launch_sub_scale(
 		a: *const c_void,
 		b: *const c_void,
@@ -3232,6 +3283,107 @@ pub fn gpu_flash_attention_into(
 			k.ptr as *const c_void,
 			v.ptr as *const c_void,
 			out.ptr as *mut c_void,
+			n as i32,
+			seq as i32,
+			d as i32,
+			heads as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+/// Training flash attention: same fused stream as `gpu_flash_attention_into`
+/// but also writes the per-row logsumexp (`lse`, [n][heads][seq]) that the
+/// backward kernels use to recompute score tiles — no L×L buffer in training
+/// either.
+pub fn gpu_flash_attention_train_into(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	out: &GpuBuffer,
+	lse: &GpuBuffer,
+	n: usize,
+	seq: usize,
+	d: usize,
+	heads: usize,
+) {
+	unsafe {
+		launch_flash_attention_f64_train_fwd(
+			q.ptr as *const c_void,
+			k.ptr as *const c_void,
+			v.ptr as *const c_void,
+			out.ptr as *mut c_void,
+			lse.ptr as *mut c_void,
+			n as i32,
+			seq as i32,
+			d as i32,
+			heads as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+}
+
+/// Flash-attention backward, three deterministic passes (no atomics, no L×L):
+/// dsum rows, then dQ (query-major), then dK+dV (key-major). All inputs are the
+/// forward's q/k/v (post-RoPE), the pre-Wo context and its gradient, and lse.
+pub fn gpu_flash_attention_backward_into(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	ctx: &GpuBuffer,
+	dctx: &GpuBuffer,
+	lse: &GpuBuffer,
+	dsum: &GpuBuffer,
+	dq: &GpuBuffer,
+	dk: &GpuBuffer,
+	dv: &GpuBuffer,
+	n: usize,
+	seq: usize,
+	d: usize,
+	heads: usize,
+) {
+	unsafe {
+		launch_flash_attention_f64_dsum(
+			ctx.ptr as *const c_void,
+			dctx.ptr as *const c_void,
+			dsum.ptr as *mut c_void,
+			n as i32,
+			seq as i32,
+			d as i32,
+			heads as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	unsafe {
+		launch_flash_attention_f64_bwd_dq(
+			q.ptr as *const c_void,
+			k.ptr as *const c_void,
+			v.ptr as *const c_void,
+			dctx.ptr as *const c_void,
+			lse.ptr as *const c_void,
+			dsum.ptr as *const c_void,
+			dq.ptr as *mut c_void,
+			n as i32,
+			seq as i32,
+			d as i32,
+			heads as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	unsafe {
+		launch_flash_attention_f64_bwd_dkv(
+			q.ptr as *const c_void,
+			k.ptr as *const c_void,
+			v.ptr as *const c_void,
+			dctx.ptr as *const c_void,
+			lse.ptr as *const c_void,
+			dsum.ptr as *const c_void,
+			dk.ptr as *mut c_void,
+			dv.ptr as *mut c_void,
 			n as i32,
 			seq as i32,
 			d as i32,

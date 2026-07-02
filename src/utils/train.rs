@@ -2,7 +2,6 @@
 //! backprop, loss-gradient computation, OGDL checkpoint writing, evaluation, and
 //! the ratatui live dashboard. The forward engine and execution enums live in the
 //! `recipe-infer` crate; this module drives them but they never depend back on it.
-
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
@@ -23,15 +22,12 @@ use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, P
 use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
 /// Set by the SIGINT handler so headless (cooked-mode) Ctrl+C exits gracefully
 /// — in TUI raw mode Ctrl+C arrives as a key event instead and is handled there.
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
 extern "C" fn on_sigint(_: i32) {
 	INTERRUPTED.store(true, Ordering::SeqCst);
 }
-
 /// Per-column number colors, applied in `.log([...])` order (cycles past 12).
 const PALETTE: [(u8, u8, u8); 12] = [
 	(242, 40, 60),   // #F2283C red
@@ -47,12 +43,10 @@ const PALETTE: [(u8, u8, u8); 12] = [
 	(3, 252, 186),   // #03FCBA
 	(194, 1, 20),    // #C20114
 ];
-
 /// Palette color for the i-th logged series (cycles).
 fn palette(i: usize) -> (u8, u8, u8) {
 	PALETTE[i % PALETTE.len()]
 }
-
 /// Symmetric-log transform (linthresh = 1): linear in [-1, 1], log10 beyond.
 /// Handles negatives and huge magnitudes, so disparate metrics share a y-axis.
 fn symlog(y: f64) -> f64 {
@@ -62,7 +56,6 @@ fn symlog(y: f64) -> f64 {
 		y.signum() * (1.0 + y.abs().log10())
 	}
 }
-
 /// Inverse of `symlog`, for labeling y ticks back in original units.
 fn inv_symlog(v: f64) -> f64 {
 	if v.abs() <= 1.0 {
@@ -71,7 +64,6 @@ fn inv_symlog(v: f64) -> f64 {
 		v.signum() * 10f64.powf(v.abs() - 1.0)
 	}
 }
-
 /// Single-unit time for axis ticks — picks s/m/h by magnitude: `24s`, `2.5m`, `1.2h`.
 fn fmt_time_axis(secs: f64) -> String {
 	if secs >= 3600.0 {
@@ -82,7 +74,6 @@ fn fmt_time_axis(secs: f64) -> String {
 		format!("{secs:.0}s")
 	}
 }
-
 /// Human-readable elapsed time: `45.3s`, `2m 05s`, `1h 03m 20s`.
 fn fmt_time(secs: f64) -> String {
 	let s = secs as u64;
@@ -95,7 +86,6 @@ fn fmt_time(secs: f64) -> String {
 		format!("{secs:.1}s")
 	}
 }
-
 /// Compact axis label.
 fn fmt_axis(v: f64) -> String {
 	let a = v.abs();
@@ -107,9 +97,7 @@ fn fmt_axis(v: f64) -> String {
 		format!("{v:.3}")
 	}
 }
-
 impl ModelInner {
-
 	/// dL/dA at the output for the chosen loss, scaled by 1/n (batch mean),
 	/// written in place into `da` with no allocation. `out` = predictions,
 	/// `y` = targets, `total` = n*out_dim. Equals the old allocate-return
@@ -156,7 +144,6 @@ impl ModelInner {
 			}
 		}
 	}
-
 	/// Short column label for a metric.
 	fn label(m: Metric) -> &'static str {
 		match m {
@@ -169,7 +156,6 @@ impl ModelInner {
 			Metric::Hip => "hip",
 		}
 	}
-
 	/// The colored, aligned metric line: `vals[i]` is the precomputed value of
 	/// `metrics[i]` (already reduced on the GPU), so this only formats.
 	pub(crate) fn metrics_line(&self, metrics: &[Metric], vals: &[f64]) -> String {
@@ -203,7 +189,6 @@ impl ModelInner {
 			.collect();
 		parts.join("  ")
 	}
-
 	/// Render the live dashboard with ratatui: a header block + one Chart widget
 	/// per metric (x = epoch), stacked via a Layout that can't overflow.
 	fn render_dashboard(
@@ -218,7 +203,6 @@ impl ModelInner {
 		constraints.extend(ys.iter().map(|_| Constraint::Fill(1)));
 		let areas = Layout::vertical(constraints).split(frame.area());
 		frame.render_widget(Paragraph::new(summary), areas[0]);
-
 		let xmax = rows.last().map_or(1.0, |r| r[0]).max(1.0);
 		let lxmax = xmax.log10().max(1e-9); // x bound in log10(epoch) space
 		for (j, &m) in ys.iter().enumerate() {
@@ -282,7 +266,6 @@ impl ModelInner {
 				]));
 			frame.render_widget(chart, areas[j + 1]);
 		}
-
 		// Each Chart draws its own y-axis segment; bridge the title/x-label gaps
 		// between them so the shared axis column reads as one continuous line.
 		if areas.len() >= 2 {
@@ -324,7 +307,6 @@ impl ModelInner {
 			}
 		}
 	}
-
 	/// Bare multi-head self-attention backward + SGD on Wq/Wk/Wv/Wo. `da` = grad
 	/// wrt the layer output, `h` = the layer input (saved by forward), `da_below`
 	/// receives dL/dH (= dH_q+dH_k+dH_v). Reverses attn_forward op-for-op. Alloc-free.
@@ -337,10 +319,8 @@ impl ModelInner {
 		n: usize,
 		sc: &Scratch,
 	) {
-		use gpu_core::linalg::gpu_bmm_into;
 		let d = p.dim;
 		let heads = p.heads;
-		let hd = d / heads;
 		let s = p.in_dim / d;
 		let m = n * s;
 		// out = context·Wo → dcontext (a_dctx), dWo (a_gw); update Wo.
@@ -358,100 +338,25 @@ impl ModelInner {
 			d,
 		);
 		kernels::gpu_sgd_update(&p.wo, &sc.a_gw, self.lr, d * d);
-		// context = scores·V → dscores = dcontext·Vᵀ, dV = scoresᵀ·dcontext.
-		for hh in 0..heads {
-			gpu_bmm_into(
-				&sc.a_dscores,
-				&sc.a_dctx,
-				&sc.a_v,
-				n,
-				s,
-				s,
-				hd,
-				d,
-				d,
-				s,
-				s * d,
-				s * d,
-				s * s,
-				hh * hd,
-				hh * hd,
-				hh * n * s * s,
-				false,
-				true,
-			);
-			gpu_bmm_into(
-				&sc.a_dv,
-				&sc.a_scores,
-				&sc.a_dctx,
-				n,
-				s,
-				hd,
-				s,
-				s,
-				d,
-				d,
-				s * s,
-				s * d,
-				s * d,
-				hh * n * s * s,
-				hh * hd,
-				hh * hd,
-				true,
-				false,
-			);
-		}
-		kernels::gpu_softmax_backward_into(
-			&sc.a_dscores,
-			&sc.a_scores,
-			&sc.a_dscores,
-			n * heads * s,
+		// Flash backward: dQ/dK/dV without materializing scores or dscores — the
+		// kernels recompute P tiles from Q,K + the forward's logsumexp (a_lse) and
+		// the rowsum term D = Σ dctx∘ctx (a_dsum). Deterministic, no atomics.
+		kernels::gpu_flash_attention_backward_into(
+			&sc.a_q,
+			&sc.a_k,
+			&sc.a_v,
+			&sc.a_ctx,
+			&sc.a_dctx,
+			&sc.a_lse,
+			&sc.a_dsum,
+			&sc.a_dq,
+			&sc.a_dk,
+			&sc.a_dv,
+			n,
 			s,
+			d,
+			heads,
 		);
-		kernels::gpu_scale_inplace(&sc.a_dscores, 1.0 / (hd as f64).sqrt(), n * heads * s * s);
-		// scores = Q·Kᵀ → dQ = dscores·K, dK = dscoresᵀ·Q.
-		for hh in 0..heads {
-			gpu_bmm_into(
-				&sc.a_dq,
-				&sc.a_dscores,
-				&sc.a_k,
-				n,
-				s,
-				hd,
-				s,
-				s,
-				d,
-				d,
-				s * s,
-				s * d,
-				s * d,
-				hh * n * s * s,
-				hh * hd,
-				hh * hd,
-				false,
-				false,
-			);
-			gpu_bmm_into(
-				&sc.a_dk,
-				&sc.a_dscores,
-				&sc.a_q,
-				n,
-				s,
-				hd,
-				s,
-				s,
-				d,
-				d,
-				s * s,
-				s * d,
-				s * d,
-				hh * n * s * s,
-				hh * hd,
-				hh * hd,
-				true,
-				false,
-			);
-		}
 		// dscores came from ROTATED Q,K, so a_dq/a_dk are gradients w.r.t. the rotated
 		// tensors. Un-rotate (RoPE with sgn=-1) to get gradients w.r.t. the raw Q,K
 		// projection outputs before back-propagating through Wq/Wk.
@@ -502,7 +407,6 @@ impl ModelInner {
 		kernels::gpu_sgd_update(&p.wv, &sc.a_gw, self.lr, d * d);
 		kernels::gpu_add_inplace(da_below, &sc.a_dctx, m * d);
 	}
-
 	/// One backward pass + SGD update, writing every gradient into preallocated
 	/// `sc` (no allocation). `sc.acts` must hold this epoch's forward output and
 	/// `x` feeds layer 0 as in `forward_into`. Op-for-op identical to the old
@@ -728,7 +632,6 @@ impl ModelInner {
 			flip = !flip;
 		}
 	}
-
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let rerun = !self.params.borrow().is_empty();
@@ -822,7 +725,6 @@ impl ModelInner {
 			}
 			ydata
 		};
-
 		// Resumed weights (per-neuron, in save order) or empty for random init.
 		let resumed = resume.map(load_ogdl).unwrap_or_default();
 		// On a checkpoint/architecture mismatch, ask whether to overwrite with random
@@ -920,7 +822,6 @@ impl ModelInner {
 			.filter(|&m| m != Metric::Epoch && m != Metric::Time)
 			.collect();
 		let mut plot_rows: Vec<Vec<f64>> = Vec::new();
-
 		// Only take over the screen when stdout is a real terminal; piped or
 		// headless runs fall through to the stderr log path. ratatui owns the
 		// terminal (alt screen, raw mode, panic-restore hook); Ctrl+C arrives
@@ -1161,7 +1062,6 @@ impl ModelInner {
 			eprint!("{}", gpu_core::callspy::report_since(&base));
 		}
 	}
-
 	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "save: call train() first");
@@ -1178,7 +1078,6 @@ impl ModelInner {
 			full.display()
 		);
 	}
-
 	/// Adapt a `Dataset` to GPU input buffers exactly as training did — collapse
 	/// one-hot for an embed-first model, split text vs categorical columns, and
 	/// apply the TRAIN-set scaler (same mean/std the model saw). Shared by `eval`
@@ -1223,7 +1122,6 @@ impl ModelInner {
 			(zscore_apply(&xraw, n, d, scaler_ref), None, n)
 		}
 	}
-
 	/// Forward-only evaluation of the trained model on `data`, reporting the
 	/// loss-appropriate score (accuracy for classification, R² for regression).
 	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the

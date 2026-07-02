@@ -3,6 +3,8 @@ mod common;
 mod gpu_live;
 #[path = "suite/oversize_oom.rs"]
 mod oversize_oom;
+#[path = "suite/prove_flash_train.rs"]
+mod prove_flash_train;
 #[path = "suite/inventory_proof.rs"]
 mod inventory_proof;
 #[path = "suite/parity_blas_batched.rs"]

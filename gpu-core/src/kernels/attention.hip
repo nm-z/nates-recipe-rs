@@ -642,3 +642,310 @@ extern "C" void launch_flash_attention_f64(
       hipLaunchKernelGGL(flash_attn_f64_kernel, grid, block, shared_bytes, stream,
             q, k, v, out, n, seq, d, heads);
 }
+
+// ── FlashAttention f64 TRAINING ─────────────────────────────────────────────
+// Forward is the same online-softmax stream as flash_attn_f64_kernel but also
+// emits the per-row logsumexp L_i = m_i + ln(l_i)  (layout [n][heads][seq]).
+// Backward never materializes the L×L score matrix: both passes recompute
+// P_ij = exp(q_i·k_j·scale − L_i) tile by tile from Q,K + lse. dsum holds
+// D_i = Σ_c dO_ic·O_ic (equals rowsum(dP∘P), the softmax-backward row term).
+// Deterministic: each output row is owned by exactly one thread, fixed loop
+// order, no atomics.
+
+__global__ void flash_attn_f64_train_fwd_kernel(
+      const double* q, const double* k, const double* v, double* out, double* lse,
+      int n, int seq, int d, int heads
+) {
+      int hd = d / heads;
+      int qtile = blockIdx.x;
+      int hh = blockIdx.y;
+      int bi = blockIdx.z;
+      int tx = threadIdx.x;
+      int qpos = qtile * FA_BQ + tx;
+
+      double scale = 1.0 / sqrt((double)hd);
+
+      extern __shared__ double sh[];
+      double* Qs = sh;
+      double* Ks = Qs + FA_BQ * hd;
+      double* Vs = Ks + FA_BK * hd;
+      double* As = Vs + FA_BK * hd;
+
+      double m = -1.0e308;
+      double l = 0.0;
+
+      if (qpos < seq) {
+            const double* qrow = q + ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++) {
+                  Qs[tx * hd + c] = qrow[c];
+                  As[tx * hd + c] = 0.0;
+            }
+      }
+
+      for (int kt = 0; kt < seq; kt += FA_BK) {
+            for (int idx = tx; idx < FA_BK * hd; idx += FA_BQ) {
+                  int kj = idx / hd;
+                  int cc = idx % hd;
+                  int kpos = kt + kj;
+                  if (kpos < seq) {
+                        long base = ((long)bi * seq + kpos) * d + hh * hd;
+                        Ks[idx] = k[base + cc];
+                        Vs[idx] = v[base + cc];
+                  }
+            }
+            __syncthreads();
+
+            if (qpos < seq) {
+                  int tile = (seq - kt < FA_BK) ? (seq - kt) : FA_BK;
+                  for (int kj = 0; kj < tile; kj++) {
+                        double dot = 0.0;
+                        for (int c = 0; c < hd; c++)
+                              dot += Qs[tx * hd + c] * Ks[kj * hd + c];
+                        double s = dot * scale;
+                        double m_new = (s > m) ? s : m;
+                        double resc = exp(m - m_new);
+                        double e = exp(s - m_new);
+                        for (int c = 0; c < hd; c++)
+                              As[tx * hd + c] = As[tx * hd + c] * resc + Vs[kj * hd + c] * e;
+                        l = l * resc + e;
+                        m = m_new;
+                  }
+            }
+            __syncthreads();
+      }
+
+      if (qpos < seq) {
+            double inv = (l > 0.0) ? 1.0 / l : 0.0;
+            double* orow = out + ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++)
+                  orow[c] = As[tx * hd + c] * inv;
+            lse[((long)bi * heads + hh) * seq + qpos] = (l > 0.0) ? m + log(l) : -1.0e308;
+      }
+}
+
+extern "C" void launch_flash_attention_f64_train_fwd(
+      const double* q, const double* k, const double* v, double* out, double* lse,
+      int n, int seq, int d, int heads, hipStream_t stream
+) {
+      int hd = d / heads;
+      int qtiles = (seq + FA_BQ - 1) / FA_BQ;
+      dim3 grid(qtiles, heads, n);
+      dim3 block(FA_BQ);
+      size_t shared_bytes = (size_t)(2 * FA_BQ + 2 * FA_BK) * hd * sizeof(double);
+      hipLaunchKernelGGL(flash_attn_f64_train_fwd_kernel, grid, block, shared_bytes, stream,
+            q, k, v, out, lse, n, seq, d, heads);
+}
+
+// D_i = Σ_c dctx_ic · ctx_ic per (sample, head, row) — the softmax-backward row
+// term, computed once so both backward kernels read it instead of re-reducing.
+__global__ void flash_attn_f64_dsum_kernel(
+      const double* ctx, const double* dctx, double* dsum,
+      int n, int seq, int d, int heads
+) {
+      int qpos = blockIdx.x * blockDim.x + threadIdx.x;
+      int hh = blockIdx.y;
+      int bi = blockIdx.z;
+      if (qpos >= seq) return;
+      int hd = d / heads;
+      long base = ((long)bi * seq + qpos) * d + hh * hd;
+      double acc = 0.0;
+      for (int c = 0; c < hd; c++)
+            acc += dctx[base + c] * ctx[base + c];
+      dsum[((long)bi * heads + hh) * seq + qpos] = acc;
+}
+
+extern "C" void launch_flash_attention_f64_dsum(
+      const double* ctx, const double* dctx, double* dsum,
+      int n, int seq, int d, int heads, hipStream_t stream
+) {
+      dim3 grid((seq + 255) / 256, heads, n);
+      dim3 block(256);
+      hipLaunchKernelGGL(flash_attn_f64_dsum_kernel, grid, block, 0, stream,
+            ctx, dctx, dsum, n, seq, d, heads);
+}
+
+// dQ_i = Σ_j P_ij (dO_i·V_j − D_i) · scale · K_j — query-major: one thread per
+// query row, K/V tiles streamed through shared memory like the forward.
+__global__ void flash_attn_f64_bwd_dq_kernel(
+      const double* q, const double* k, const double* v, const double* dctx,
+      const double* lse, const double* dsum, double* dq,
+      int n, int seq, int d, int heads
+) {
+      int hd = d / heads;
+      int qtile = blockIdx.x;
+      int hh = blockIdx.y;
+      int bi = blockIdx.z;
+      int tx = threadIdx.x;
+      int qpos = qtile * FA_BQ + tx;
+      double scale = 1.0 / sqrt((double)hd);
+
+      extern __shared__ double sh[];
+      double* Qs = sh;                    // FA_BQ*hd  own query rows
+      double* Ds = Qs + FA_BQ * hd;       // FA_BQ*hd  own dO rows
+      double* Ks = Ds + FA_BQ * hd;       // FA_BK*hd
+      double* Vs = Ks + FA_BK * hd;       // FA_BK*hd
+      double* Aq = Vs + FA_BK * hd;       // FA_BQ*hd  dq accumulators
+
+      double L = 0.0, Drow = 0.0;
+      if (qpos < seq) {
+            long qb = ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++) {
+                  Qs[tx * hd + c] = q[qb + c];
+                  Ds[tx * hd + c] = dctx[qb + c];
+                  Aq[tx * hd + c] = 0.0;
+            }
+            long sb = ((long)bi * heads + hh) * seq + qpos;
+            L = lse[sb];
+            Drow = dsum[sb];
+      }
+
+      for (int kt = 0; kt < seq; kt += FA_BK) {
+            for (int idx = tx; idx < FA_BK * hd; idx += FA_BQ) {
+                  int kj = idx / hd;
+                  int cc = idx % hd;
+                  int kpos = kt + kj;
+                  if (kpos < seq) {
+                        long b = ((long)bi * seq + kpos) * d + hh * hd;
+                        Ks[idx] = k[b + cc];
+                        Vs[idx] = v[b + cc];
+                  }
+            }
+            __syncthreads();
+
+            if (qpos < seq) {
+                  int tile = (seq - kt < FA_BK) ? (seq - kt) : FA_BK;
+                  for (int kj = 0; kj < tile; kj++) {
+                        double dot = 0.0, dp = 0.0;
+                        for (int c = 0; c < hd; c++) {
+                              dot += Qs[tx * hd + c] * Ks[kj * hd + c];
+                              dp += Ds[tx * hd + c] * Vs[kj * hd + c];
+                        }
+                        double p = exp(dot * scale - L);
+                        double dsv = p * (dp - Drow) * scale;
+                        for (int c = 0; c < hd; c++)
+                              Aq[tx * hd + c] += dsv * Ks[kj * hd + c];
+                  }
+            }
+            __syncthreads();
+      }
+
+      if (qpos < seq) {
+            long qb = ((long)bi * seq + qpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++)
+                  dq[qb + c] = Aq[tx * hd + c];
+      }
+}
+
+extern "C" void launch_flash_attention_f64_bwd_dq(
+      const double* q, const double* k, const double* v, const double* dctx,
+      const double* lse, const double* dsum, double* dq,
+      int n, int seq, int d, int heads, hipStream_t stream
+) {
+      int hd = d / heads;
+      int qtiles = (seq + FA_BQ - 1) / FA_BQ;
+      dim3 grid(qtiles, heads, n);
+      dim3 block(FA_BQ);
+      size_t shared_bytes = (size_t)(3 * FA_BQ + 2 * FA_BK) * hd * sizeof(double);
+      hipLaunchKernelGGL(flash_attn_f64_bwd_dq_kernel, grid, block, shared_bytes, stream,
+            q, k, v, dctx, lse, dsum, dq, n, seq, d, heads);
+}
+
+// dK_j = Σ_i dS_ij Q_i, dV_j = Σ_i P_ij dO_i — key-major: one thread per key
+// row, Q/dO tiles (FA_TQ rows) streamed with their lse/dsum scalars.
+#define FA_TQ 32
+
+__global__ void flash_attn_f64_bwd_dkv_kernel(
+      const double* q, const double* k, const double* v, const double* dctx,
+      const double* lse, const double* dsum, double* dk, double* dv,
+      int n, int seq, int d, int heads
+) {
+      int hd = d / heads;
+      int ktile = blockIdx.x;
+      int hh = blockIdx.y;
+      int bi = blockIdx.z;
+      int tx = threadIdx.x;
+      int kpos = ktile * FA_BK + tx;
+      double scale = 1.0 / sqrt((double)hd);
+
+      extern __shared__ double sh[];
+      double* Ks = sh;                    // FA_BK*hd  own key rows
+      double* Vo = Ks + FA_BK * hd;       // FA_BK*hd  own value rows
+      double* Ak = Vo + FA_BK * hd;       // FA_BK*hd  dk accumulators
+      double* Av = Ak + FA_BK * hd;       // FA_BK*hd  dv accumulators
+      double* Qs = Av + FA_BK * hd;       // FA_TQ*hd
+      double* Ds = Qs + FA_TQ * hd;       // FA_TQ*hd  dO rows
+      double* Ls = Ds + FA_TQ * hd;       // FA_TQ     lse
+      double* Rs = Ls + FA_TQ;            // FA_TQ     dsum
+
+      if (kpos < seq) {
+            long kb = ((long)bi * seq + kpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++) {
+                  Ks[tx * hd + c] = k[kb + c];
+                  Vo[tx * hd + c] = v[kb + c];
+                  Ak[tx * hd + c] = 0.0;
+                  Av[tx * hd + c] = 0.0;
+            }
+      }
+
+      for (int qt = 0; qt < seq; qt += FA_TQ) {
+            for (int idx = tx; idx < FA_TQ * hd; idx += FA_BK) {
+                  int qi = idx / hd;
+                  int cc = idx % hd;
+                  int qpos = qt + qi;
+                  if (qpos < seq) {
+                        long b = ((long)bi * seq + qpos) * d + hh * hd;
+                        Qs[idx] = q[b + cc];
+                        Ds[idx] = dctx[b + cc];
+                  }
+            }
+            for (int idx = tx; idx < FA_TQ; idx += FA_BK) {
+                  int qpos = qt + idx;
+                  if (qpos < seq) {
+                        long sb = ((long)bi * heads + hh) * seq + qpos;
+                        Ls[idx] = lse[sb];
+                        Rs[idx] = dsum[sb];
+                  }
+            }
+            __syncthreads();
+
+            if (kpos < seq) {
+                  int tile = (seq - qt < FA_TQ) ? (seq - qt) : FA_TQ;
+                  for (int qi = 0; qi < tile; qi++) {
+                        double dot = 0.0, dp = 0.0;
+                        for (int c = 0; c < hd; c++) {
+                              dot += Qs[qi * hd + c] * Ks[tx * hd + c];
+                              dp += Ds[qi * hd + c] * Vo[tx * hd + c];
+                        }
+                        double p = exp(dot * scale - Ls[qi]);
+                        double dsv = p * (dp - Rs[qi]) * scale;
+                        for (int c = 0; c < hd; c++) {
+                              Ak[tx * hd + c] += dsv * Qs[qi * hd + c];
+                              Av[tx * hd + c] += p * Ds[qi * hd + c];
+                        }
+                  }
+            }
+            __syncthreads();
+      }
+
+      if (kpos < seq) {
+            long kb = ((long)bi * seq + kpos) * d + hh * hd;
+            for (int c = 0; c < hd; c++) {
+                  dk[kb + c] = Ak[tx * hd + c];
+                  dv[kb + c] = Av[tx * hd + c];
+            }
+      }
+}
+
+extern "C" void launch_flash_attention_f64_bwd_dkv(
+      const double* q, const double* k, const double* v, const double* dctx,
+      const double* lse, const double* dsum, double* dk, double* dv,
+      int n, int seq, int d, int heads, hipStream_t stream
+) {
+      int hd = d / heads;
+      int ktiles = (seq + FA_BK - 1) / FA_BK;
+      dim3 grid(ktiles, heads, n);
+      dim3 block(FA_BK);
+      size_t shared_bytes = ((size_t)(4 * FA_BK + 2 * FA_TQ) * hd + 2 * FA_TQ) * sizeof(double);
+      hipLaunchKernelGGL(flash_attn_f64_bwd_dkv_kernel, grid, block, shared_bytes, stream,
+            q, k, v, dctx, lse, dsum, dk, dv, n, seq, d, heads);
+}

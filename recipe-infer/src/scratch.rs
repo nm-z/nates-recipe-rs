@@ -34,19 +34,20 @@ pub struct Scratch {
 	// SGD step — scatter-add target, separate from the table so the update is
 	// `table -= lr·grad`. Len 1 when there's no embed layer.
 	pub embed_grad: GpuBuffer,
-	// Attention scratch (len 1 when there's no attn layer). q/k/v/ctx are the
-	// projected sequences [n*S*d]; scores [n*heads*S*S]; the d* mirrors hold the
-	// backward gradients; gw is a [d*d] weight-grad temp reused per projection.
+	// Attention scratch (len 1 when there is no attn layer). q/k/v/ctx are the
+	// projected sequences [n*S*d]; a_lse is the flash forward's per-row logsumexp
+	// and a_dsum the backward's rowsum(dO∘O) — both [n*heads*S], never S×S; the
+	// d* mirrors hold backward gradients; gw is a [d*d] weight-grad temp.
 	pub a_q: GpuBuffer,
 	pub a_k: GpuBuffer,
 	pub a_v: GpuBuffer,
 	pub a_ctx: GpuBuffer,
-	pub a_scores: GpuBuffer,
+	pub a_lse: GpuBuffer,
 	pub a_dctx: GpuBuffer,
 	pub a_dq: GpuBuffer,
 	pub a_dk: GpuBuffer,
 	pub a_dv: GpuBuffer,
-	pub a_dscores: GpuBuffer,
+	pub a_dsum: GpuBuffer,
 	pub a_gw: GpuBuffer,
 	pub a_dbias: GpuBuffer,
 	// PRelu d_alpha scratch (act-sized temps + a scalar accumulator). Len-1 when
@@ -61,9 +62,9 @@ pub struct Scratch {
 	pub concat_dgrad: GpuBuffer,
 	pub conv_temp: GpuBuffer,
 	pub conv_wg: usize,
-	// Inference (forward-only) path: attention uses the chunked KV-cache forward
-	// and `a_scores` is a len-1 stub (the O(L²) buffer is never allocated). The
-	// training path leaves this false and keeps the full-batch score buffer.
+	// Inference (forward-only) path: attention uses the fused KV-cache forward and
+	// a_lse/a_dsum are len-1 stubs. Training runs the flash kernels too — the L×L
+	// score matrix is never materialized on either path.
 	pub infer: bool,
 	pub copy_stream: gpu_core::hip::Stream,
 	pub pinned_scalar: *mut f64,
@@ -73,7 +74,7 @@ pub struct Scratch {
 impl Scratch {
 	/// `forward_only` (eval/predict) sizes every BACKWARD-only buffer to len-1 —
 	/// they're never read in a forward pass — so inference allocates ~half the VRAM
-	/// of training (no second `a_dscores`, no `da`/`dw`/grad mirrors).
+	/// of training (no second `a_dsum`, no `da`/`dw`/grad mirrors).
 	pub fn new(params: &[LayerParams], n: usize, forward_only: bool) -> Scratch {
 		let bw = |sz: usize| if forward_only { 1 } else { sz };
 		// On OOM, report the buffer name and the size it tried to grab (f64 count →
@@ -92,7 +93,7 @@ impl Scratch {
 		let mut max_bias = 0usize;
 		let mut max_embed_grad = 1usize;
 		let mut max_seqd = 1usize;
-		let mut max_scores = 1usize;
+		let mut max_lse = 1usize;
 		let mut max_dd = 1usize;
 		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
@@ -162,8 +163,8 @@ impl Scratch {
 				if n * p.in_dim > max_seqd {
 					max_seqd = n * p.in_dim;
 				}
-				if n * p.heads * s * s > max_scores {
-					max_scores = n * p.heads * s * s;
+				if n * p.heads * s > max_lse {
+					max_lse = n * p.heads * s;
 				}
 				if p.dim * p.dim > max_dd {
 					max_dd = p.dim * p.dim;
@@ -247,14 +248,14 @@ impl Scratch {
 			a_k: alloc(max_seqd, "a_k"),
 			a_v: alloc(max_seqd, "a_v"),
 			a_ctx: alloc(max_seqd, "a_ctx"),
-			// Inference chunks the query stream and allocates a bounded score block
-			// per attn layer at run time, so the full O(L²) buffer is never made.
-			a_scores: alloc(if forward_only { 1 } else { max_scores }, "a_scores"),
+			// Training flash forward writes the per-row logsumexp here for the
+			// backward tile recompute; inference never needs it.
+			a_lse: alloc(if forward_only { 1 } else { max_lse }, "a_lse"),
 			a_dctx: alloc(bw(max_seqd), "a_dctx"),
 			a_dq: alloc(bw(max_seqd), "a_dq"),
 			a_dk: alloc(bw(max_seqd), "a_dk"),
 			a_dv: alloc(bw(max_seqd), "a_dv"),
-			a_dscores: alloc(bw(max_scores), "a_dscores"),
+			a_dsum: alloc(bw(max_lse), "a_dsum"),
 			a_gw: alloc(bw(max_dd), "a_gw"),
 			a_dbias: alloc(bw(max_dd), "a_dbias"),
 			prelu_t0: alloc(bw(if has_prelu { max_act } else { 1 }), "prelu_t0"),
@@ -354,7 +355,7 @@ impl Scratch {
 		let bw = |sz: usize| if forward_only { 1 } else { sz };
 		let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
 		let (mut max_act, mut max_wt, mut max_bias) = (0usize, 0usize, 0usize);
-		let (mut max_embed_grad, mut max_seqd, mut max_scores, mut max_dd) =
+		let (mut max_embed_grad, mut max_seqd, mut max_lse, mut max_dd) =
 			(1usize, 1usize, 1usize, 1usize);
 		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
@@ -418,8 +419,8 @@ impl Scratch {
 				if n * p.in_dim > max_seqd {
 					max_seqd = n * p.in_dim;
 				}
-				if n * p.heads * s * s > max_scores {
-					max_scores = n * p.heads * s * s;
+				if n * p.heads * s > max_lse {
+					max_lse = n * p.heads * s;
 				}
 				if p.dim * p.dim > max_dd {
 					max_dd = p.dim * p.dim;
@@ -439,10 +440,10 @@ impl Scratch {
 		floats += 4 * bw(max_seqd); // a_dctx,a_dq,a_dk,a_dv (backward)
 		if forward_only {
 			// FlashAttention inference: no L×L score buffer at all (the fused kernel
-			// streams K,V through shared memory). a_scores/a_dscores are len-1 stubs.
+			// streams K,V through shared memory). a_lse/a_dsum are len-1 stubs.
 			floats += 2;
 		} else {
-			floats += 2 * max_scores; // a_scores (fwd), a_dscores (bwd)
+			floats += 2 * max_lse; // a_lse (fwd), a_dsum (bwd)
 		}
 		floats += 2 * bw(max_dd); // a_gw, a_dbias
 		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1; // prelu_t0/t1, prelu_scalar
