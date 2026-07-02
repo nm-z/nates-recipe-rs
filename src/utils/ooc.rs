@@ -98,10 +98,11 @@ enum Home {
 struct Paged {
 	home: Home,
 	spb: usize,
-	// Sequential read-ahead: every disk read kicks a background pread of the
-	// NEXT window (every sweep walks windows in order), so the disk streams
-	// underneath the GPU instead of taking turns with it.
-	ahead: RefCell<Option<(usize, usize, std::thread::JoinHandle<Vec<u8>>)>>,
+	// Sequential read-ahead, depth 2: every disk read keeps the next TWO
+	// windows in flight (every sweep walks windows in order), so the NVMe
+	// sees queue depth and streams underneath the GPU instead of taking
+	// turns with it.
+	ahead: RefCell<std::collections::VecDeque<(usize, usize, std::thread::JoinHandle<Vec<u8>>)>>,
 }
 
 impl Paged {
@@ -109,27 +110,29 @@ impl Paged {
 		samples * self.spb * 8
 	}
 	fn kick_ahead(&self, s0: usize, cnt: usize, n: usize, spill: &File) {
-		let (base, next0) = match &self.home {
-			Home::Disk(b) => (*b, s0 + cnt),
+		let base = match &self.home {
+			Home::Disk(b) => *b,
 			_ => return,
 		};
-		if next0 >= n {
-			return;
+		let mut q = self.ahead.borrow_mut();
+		let mut next0 = q.back().map_or(s0 + cnt, |(p0, pc, _)| p0 + pc);
+		while q.len() < 2 && next0 < n {
+			let next_cnt = cnt.min(n - next0);
+			let off = base + self.bytes(next0) as u64;
+			let len = self.bytes(next_cnt);
+			let f = spill.try_clone().expect("spill clone");
+			let h = std::thread::spawn(move || {
+				let mut buf = vec![0u8; len];
+				f.read_exact_at(&mut buf, off).expect("ooc spill read-ahead");
+				unsafe {
+					use std::os::unix::io::AsRawFd;
+					libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+				}
+				buf
+			});
+			q.push_back((next0, next_cnt, h));
+			next0 += next_cnt;
 		}
-		let next_cnt = cnt.min(n - next0);
-		let off = base + self.bytes(next0) as u64;
-		let len = self.bytes(next_cnt);
-		let f = spill.try_clone().expect("spill clone");
-		let h = std::thread::spawn(move || {
-			let mut buf = vec![0u8; len];
-			f.read_exact_at(&mut buf, off).expect("ooc spill read-ahead");
-			unsafe {
-				use std::os::unix::io::AsRawFd;
-				libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
-			}
-			buf
-		});
-		*self.ahead.borrow_mut() = Some((next0, next_cnt, h));
 	}
 	/// Device view of samples [s0, s0+cnt): VRAM homes return an offset view
 	/// (zero copies); RAM/DISK homes stage into `win` first.
@@ -142,12 +145,15 @@ impl Paged {
 				view(win, 0, len)
 			}
 			Home::Disk(base) => {
-				let pre = self.ahead.borrow_mut().take();
+				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
 					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().expect("read-ahead thread"),
 					other => {
-						// Wrong window prefetched (new sweep) — drop it, read sync.
+						// Wrong window prefetched (new sweep) — drop the queue, read sync.
 						drop(other.map(|(_, _, h)| h.join()));
+						for (_, _, h) in self.ahead.borrow_mut().drain(..) {
+							let _ = h.join();
+						}
 						let mut buf = vec![0u8; len];
 						spill.read_exact_at(&mut buf, base + off as u64).expect("ooc spill read");
 						unsafe {
@@ -189,44 +195,51 @@ impl Paged {
 /// Write-behind: disk commits queue here (bounded, so at most 2 windows of
 /// host bytes are in flight) and a worker pwrites + drops the page cache while
 /// the GPU moves on to the next window.
+/// Write-behind pool: THREE workers, round-robin dispatch, each queue 2 deep
+/// — the NVMe sees parallel writes instead of one serial pwrite stream.
 struct Writer {
-	tx: Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>,
-	worker: Option<std::thread::JoinHandle<()>>,
+	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>, Option<std::thread::JoinHandle<()>>)>,
+	next: std::cell::Cell<usize>,
+}
+
+const W_LANES: usize = 3;
+
+fn spawn_lane(spill: &File) -> (Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>, Option<std::thread::JoinHandle<()>>) {
+	let f = spill.try_clone().expect("spill clone");
+	let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(2);
+	let worker = std::thread::spawn(move || {
+		for (off, buf) in rx {
+			f.write_all_at(&buf, off).expect("ooc spill write");
+			drop_cache(&f, off, buf.len());
+		}
+	});
+	(Some(tx), Some(worker))
 }
 
 impl Writer {
 	fn new(spill: &File) -> Writer {
-		let f = spill.try_clone().expect("spill clone");
-		let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(2);
-		let worker = std::thread::spawn(move || {
-			for (off, buf) in rx {
-				f.write_all_at(&buf, off).expect("ooc spill write");
-				drop_cache(&f, off, buf.len());
-			}
-		});
-		Writer { tx: Some(tx), worker: Some(worker) }
+		Writer {
+			lanes: (0..W_LANES).map(|_| spawn_lane(spill)).collect(),
+			next: std::cell::Cell::new(0),
+		}
 	}
 	fn send(&self, off: u64, buf: Vec<u8>) {
-		self.tx.as_ref().expect("writer live").send((off, buf)).expect("writer send");
+		let i = self.next.get();
+		self.next.set((i + 1) % W_LANES);
+		self.lanes[i].0.as_ref().expect("writer live").send((off, buf)).expect("writer send");
 	}
-	/// Drain the queue — REQUIRED before any read of a disk home that was just
-	/// written this sweep (the next sweep's reads).
+	/// Drain every lane — REQUIRED before any read of a disk home that was
+	/// just written this sweep (the next sweep reads it).
 	fn barrier(&mut self, spill: &File) {
-		if let Some(tx) = self.tx.take() {
-			drop(tx);
-		}
-		if let Some(w) = self.worker.take() {
-			w.join().expect("writer join");
-		}
-		let f = spill.try_clone().expect("spill clone");
-		let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(2);
-		self.worker = Some(std::thread::spawn(move || {
-			for (off, buf) in rx {
-				f.write_all_at(&buf, off).expect("ooc spill write");
-				drop_cache(&f, off, buf.len());
+		for lane in &mut self.lanes {
+			if let Some(tx) = lane.0.take() {
+				drop(tx);
 			}
-		}));
-		self.tx = Some(tx);
+			if let Some(w) = lane.1.take() {
+				w.join().expect("writer join");
+			}
+			*lane = spawn_lane(spill);
+		}
 	}
 }
 
@@ -374,7 +387,7 @@ impl Ooc {
 		// concurrently read in flash backward — the 2-deep write-behind queue,
 		// the staging bounce and a commit temp: 9 windows), or the box lands
 		// exactly on the floor and the OOM killer collects (it did, twice).
-		let host_overhead = 9 * chunk * max_spb * 8;
+		let host_overhead = (2 * 5 + 2 * W_LANES + 2) * chunk * max_spb * 8;
 		let ram_start = mem_available();
 		let ram_floor = ram_start / 10 + host_overhead;
 		let mut ram_used = 0usize;
@@ -384,20 +397,35 @@ impl Ooc {
 			let bytes = n * spb * 8;
 			if vram_open {
 				if let Some(b) = GpuBuffer::try_alloc_bytes(bytes) {
-					return Paged { home: Home::Vram(b), spb, ahead: RefCell::new(None) };
+					return Paged { home: Home::Vram(b), spb, ahead: RefCell::new(std::collections::VecDeque::new()) };
 				}
 				vram_open = false;
 			}
 			if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
 				ram_used += bytes;
-				return Paged { home: Home::Ram(vec![0u8; bytes]), spb, ahead: RefCell::new(None) };
+				return Paged { home: Home::Ram(vec![0u8; bytes]), spb, ahead: RefCell::new(std::collections::VecDeque::new()) };
 			}
 			let off = disk_cursor;
 			disk_cursor += bytes as u64;
-			Paged { home: Home::Disk(off), spb, ahead: RefCell::new(None) }
+			Paged { home: Home::Disk(off), spb, ahead: RefCell::new(std::collections::VecDeque::new()) }
 		};
 
+		// Placement in HOTNESS order — the waterfall gives the fastest tier to
+		// the buffers touched most per epoch, so disk sees the coldest traffic:
+		// da ping-pongs hit every layer (3-4 R/W each), ctx is 1W+3R, q/k/v and
+		// acts 1W+2R, concat 1W+2R, the d* grads 1W+1R, preacts 1W+1R.
+		let da_a = place(max_spb);
+		let da_b = place(max_spb);
+		let a_ctx = place(seq_spb);
+		let a_q = place(seq_spb);
+		let a_k = place(seq_spb);
+		let a_v = place(seq_spb);
 		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect();
+		let concat = place(if ca + cc > 0 { ca + cc } else { 1 });
+		let a_dctx = place(seq_spb);
+		let a_dq = place(seq_spb);
+		let a_dk = place(seq_spb);
+		let a_dv = place(seq_spb);
 		let preacts: Vec<Option<Paged>> = params
 			.iter()
 			.map(|p| {
@@ -410,17 +438,6 @@ impl Ooc {
 				.then(|| place(p.out_dim))
 			})
 			.collect();
-		let a_q = place(seq_spb);
-		let a_k = place(seq_spb);
-		let a_v = place(seq_spb);
-		let a_ctx = place(seq_spb);
-		let a_dctx = place(seq_spb);
-		let a_dq = place(seq_spb);
-		let a_dk = place(seq_spb);
-		let a_dv = place(seq_spb);
-		let concat = place(if ca + cc > 0 { ca + cc } else { 1 });
-		let da_a = place(max_spb);
-		let da_b = place(max_spb);
 		if disk_cursor > 0 {
 			spill.set_len(disk_cursor).expect("size spill file");
 		}
