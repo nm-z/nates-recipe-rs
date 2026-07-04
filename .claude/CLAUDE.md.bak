@@ -1,0 +1,223 @@
+# CLAUDE.md
+## What This Is
+
+GPU-native neural network training framework in Rust. Builder-pattern API for defining models, loading data (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, and evaluating. All compute runs on GPU through the `gpu-core` subcrate — no CPU ML crates.
+
+Split into a 5-member workspace; the 4 framework crates form a strict one-way dependency DAG:
+
+```
+gpu-core                          HIP kernels, links ROCm, depends on nothing
+recipe-infer → gpu-core           forward pass + ogdl/safetensors load. pure tensor fns:
+                                  weights + input matrix → output matrix. owns GPU device
+                                  lifecycle (init/shutdown). knows nothing of Datasets/columns.
+pantry       → recipe-infer       ALL data parsing (csv/arff/zip/dir loaders), encoding +
+                                  NaN policy, column-type detection (the trained char-level
+                                  detector, embedded ogdl) + the standalone `detect` binary.
+recipe → gpu-core,          Model/Train builder API, backward, fit (in-VRAM and
+               recipe-infer,        out-of-core streaming), save/resume, TUI, eval. Data
+               pantry               delegates loading+detection to pantry; runs the forward
+                                    via recipe-infer.
+vramspy                           the ledger's global-tracking arm: LD_PRELOAD cdylib
+                                  interposing the 4 HSA alloc entry points, counting the
+                                  VRAM the HIP runtime and libraries allocate beneath the
+                                  choke points. Total accounting = choke-point ledger (our
+                                  bytes) + vramspy (library bytes) + fdinfo (kernel truth).
+                                  No DAG edges by necessity — an interposer must resolve
+                                  before everything; memory.rs reads its counters by name.
+```
+
+`catboost-rs` / `lightgbm-rs` / `xgboost-rs` are workspace-`exclude`d, standalone, untouched.
+
+## Build & Run
+
+```bash
+cargo build --release                    # thin LTO, links ROCm libs
+cargo test --workspace                   # all crates (root tests recipe only)
+cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
+cargo test -p recipe model::metric_gpu_tests::   # GPU metric/gradient tests
+cargo test -p gpu-core --release         # kernel proof suite (tests/suite/: inventory_proof,
+                                         #   parity_blas_*, prove_*; needs kernel_inventory.db)
+cargo run --release -- train.csv --target Price        # recipe CLI
+cargo run --release -- detect <path>                   # column-type detection (CLI)
+./target/release/detect <path>           # standalone GPU-only detector (pantry bin, no training fw)
+cargo run --release --example cookbook   # API examples (the e2e: NN/CNN/MLP/LLM scenarios)
+cargo run --release --example train_detector           # retrain the detector → pantry/detector.ogdl
+cargo run --release --example gemma4 -- "prompt"       # gemma-26B f64 inference (safetensors,
+                                         #   waterfall weight homes, one-claim VRAM lifecycle)
+```
+
+Requires ROCm (default `/opt/rocm`). Override with `ROCM_PATH`, `ROCM_EXTRA_LIB`, `ROCM_EXTRA_INCLUDE`, `GPU_ARCH` (default `gfx1101`), `HIPCC` env vars.
+
+## Typical Usage (examples/cookbook.rs)
+
+```rust
+use recipe::*;
+
+let data = Data::load()
+      .set("train.csv")
+      .split(0.8)
+      .target("Price");
+
+let model = Model::new()
+      .layer(64).leak()
+      .layer(32).leak()
+      .layer(1)
+      .loss(mse)
+      .lr(0.001);
+
+let train = Train::new()
+      .epochs(100)
+      .log([Loss, R2, Lr])
+      .plot([Loss, R2]);
+
+train.run((&model, &data));   // or train.run(()) — model/data resolve from a registry
+train.save("model.ogdl");     // or train.save(()) — defaults to "model.ogdl"
+```
+
+Examples live in `examples/` — normal `cargo run --example` programs, not `-Zscript`. Datasets live in `datasets/` (gitignored). Edit examples in place rather than spawning new script files (each new crate target triggers a full rebuild).
+
+## Architecture
+
+```
+recipe-infer (forward engine — tensors in, tensors out; deps gpu-core + ndarray only)
+├── src/lib.rs         — re-exports; init()/shutdown() (GPU device lifecycle); human_bytes
+├── src/enums.rs       — Activation, LayerSpec, LayerKind, Loss, Metric + user consts (mse/ce/R2/…)
+├── src/params.rs      — Saved, LayerParams, Scaler, build_layer_params, sinusoidal_pe, concat_layer, pinned_vocab
+├── src/scratch.rs     — Scratch (ping-pong activation/grad arena), vram_bytes estimate
+├── src/forward.rs     — forward_into (dense/embed/attn/conv + KV-cache flash-attn inference path),
+│                        attn_forward(_cached), metric_gpu(_into), upload/zscore/nan_impute/download
+├── src/ogdl.rs        — OGDL checkpoint codec: load_ogdl(_str)
+└── src/safetensors.rs — safetensors header parser (gemma weight loading)
+
+pantry (all parsing + encoding + detection; deps recipe-infer only)
+├── src/lib.rs         — Mat/Vec1 aliases, Kind enum, Attr struct, available_ram_bytes, re-exports
+├── src/data.rs        — loaders: read_raw_csv, parse_arff, load_groups/zip/dir, image dirs, RAM guards
+├── src/encode.rs      — encoding + THE one NaN adapter: nan_clean (Drop/ImputeMean/Error),
+│                        clean_dataset (features impute, only NaN-target rows drop)
+├── src/bpe.rs         — tokenizer
+├── src/detect.rs      — char-level detector inference: tokenize_column, predict_kinds (runs the
+│                        embedded ogdl through recipe-infer's forward), Kind/CONTEXT/VOCAB consts
+├── src/main.rs        — standalone `detect` binary (init → load_groups → predict_kinds → print)
+└── detector.ogdl      — trained detector weights, include_str!'d into the binary
+
+recipe (root crate — training framework; deps gpu-core, recipe-infer, pantry)
+├── src/lib.rs         — type aliases, re-exports (incl. `pub use pantry::data`, recipe_infer enums)
+├── src/main.rs        — CLI: recipe <train.csv> [--target <col>] | recipe detect <path>
+└── src/utils/
+    ├── dataset.rs     — Data builder: .load().set().exclude().test().split().target(); Dataset;
+    │                    LAZY — .target() only describes, Train::run materializes+frees per run;
+    │                    delegates loading+type-detection to pantry; encoding, column alignment
+    ├── model.rs       — Model (layer stack + chained activations), Train (run/save/resume), TUI,
+    │                    preflight, post-fit scoring
+    ├── train.rs       — backward_step, fit loop, use_ooc decision, checkpoints, ^C handling
+    └── ooc.rs         — out-of-core fit: per-window VRAM→RAM→DISK homes (waterfall), spill file,
+                         read-ahead + write-behind through a fixed host pool, full-batch semantics
+                         preserved (windows stream through every op each epoch)
+
+gpu-core (path dep, HIP/ROCm)
+├── src/lib.rs         — module declarations
+├── src/hip.rs         — HIP FFI bindings, set_device, streams, mem_info/pool_slack/trim
+├── src/memory.rs      — GpuBuffer + THE choke points: ONE call site each for alloc/free/xfer/memset,
+│                        byte ledger (live+peak per tag, cumulative H2D/D2H/D2D), pool growth gate,
+│                        pinned H2D bounce, par_copy/par_touch, device arena (one-claim mode)
+├── src/kernels.rs     — pub fns: gemm, activations, losses, metrics, optimizers, reductions
+├── src/kernels/*.hip  — 57 HIP kernel source files compiled to libhipkernels.a
+├── src/nvidia_compat/ — nvcc-only header shims for the NVIDIA backend (rocprim→CUB,
+│                        hipcub→CUB, maskless __shfl_* → *_sync); inert under hipcc
+├── src/callspy.rs     — HIP API call counting/reporting (the `hip` metric)
+├── src/waterfall.rs   — one-claim VRAM→RAM→DISK blob store for immutable weights (gemma)
+├── src/tiered.rs      — VMM tiered buffer
+├── src/infer_ops.rs   — f64 inference ops (rmsnorm, gemm_bt, rope, gqa attn, moe, widen bf16)
+├── tests/suite/       — kernel proof tests (inventory_proof, parity_blas_*, prove_*)
+└── src/{attention,bayes,catboost,cluster,diffusion,encoding,forest,graph,k_actx,k_gapact,
+         k_mathx,linalg,losses,math_ops,moe,nn_f32,optimizers,reductions,rl,rope,sequence,
+         svm}.rs — domain-specific GPU ops
+
+vramspy (the ledger's global-tracking arm; cdylib)
+└── src/lib.rs         — LD_PRELOAD interposer for hsa_amd_memory_pool_{allocate,free} +
+                         hsa_memory_{allocate,free}; classifies by pool-owning agent
+                         (device/pinned-host/kernarg — ownership, not segment flags, is the
+                         reliable discriminator); memory.rs reads the counters via
+                         RTLD_DEFAULT when the process runs under LD_PRELOAD=libvramspy.so
+```
+
+## User API (re-exported from lib.rs — what train.rs scripts use)
+
+- **`Data`** — builder for loading datasets. `.set(path)` accepts CSV, ARFF, or a directory of files. `.exclude("col")` to drop columns. `.test(path)` for separate test file. `.split(frac)` for random split. `.target("col")` or `.target(["a","b"])` for multi-target (terminal — triggers preparation). After building: `data.set` (train Dataset), `data.test` (Option\<Dataset\>), `data.target` (target column name).
+- **`Dataset`** — the encoded numeric result: `x: Mat`, `y: Vec1`, `n_targets`, `text_cols`.
+- **`Model`** — layer stack. `.layer(units)` for linear dense, then chain `.relu()`, `.leak()`, `.sigmoid()`, `.tanh()`, `.selu()`, `.gelu()`, `.silu()` for activation. `.layer(embed(dim))` for embeddings, `.layer(attn(heads))` for self-attention. `.loss(mse)` and `.lr(0.001)`. Embed behavior: with text columns → embed token ids; with no text but categoricals → embed categorical indices directly (one-hot groups collapsed to integer indices at runtime, each category gets a unique embedding vector); no embed → one-hot encode categoricals as usual.
+- **`Train`** — run config. `.epochs()`, `.log([Loss, R2])`, `.plot([Loss, R2])`, `.resume(path)`. `.run(())` / `.run(model)` / `.run((model, data))` — missing pieces resolve from a thread-local registry of live Model/Data (they are boxed for stable addresses; `.run(())` makes bindings look unused, allow the lint). Training vs inference is decided by the data (`infer_only`/no target/0 epochs → forward only). `.save(path)`/`.resume(path)` take `impl SavePath`; `()` means the default `"model.ogdl"` (Rust can't overload arity, so it's `.save(())`, not `.save()`). Preflight checks VRAM, embed/text, and loss/output before any GPU work; over-ceiling scenarios are skipped gracefully, not crashed.
+- **Consts** — losses (`mse`, `mae`, `huber`, `ce`, `bce`, `focal`), metrics (`Loss`, `Accuracy`, `R2`, `Lr`, `Epoch`, `Time`, `hip` — HIP call report).
+
+## Internals (not user-facing)
+
+- **`GpuBuffer`** (`gpu-core/memory.rs`) — async-allocated GPU memory (`hipMallocAsync`/`hipFreeAsync`). Weights, activations, and scratch live here. Upload/download to/from host `&[f64]`.
+- **`kernels`** (`gpu-core/kernels.rs`) — pub FFI wrappers: gemm, activations, loss gradients, fused metrics, reductions, optimizers. Called by `recipe-infer` (forward) and `recipe` `train.rs` (backward) — never by user code.
+- **`LayerParams`** / **`Scratch`** (`recipe-infer`) — per-layer GPU weight buffers and ping-pong activation/gradient scratch. Allocated once at fit, reused across epochs. Forward (`forward_into`) is in recipe-infer; backward (`backward_step`) stays in recipe `train.rs` and reads the activations forward retained.
+- **Domain modules** (`gpu-core/src/{attention,forest,cluster,svm,...}.rs`) — GPU ops for specific algorithm families. Wired through `kernels.rs` FFI. Note: `svm`/`cluster` neighbor / perm fns are unused prototypes (no production callers).
+
+## Data Pipeline (lives in `pantry`)
+
+1. Load CSV/ARFF/zip/dir, detect column types via the trained char-level detector (`pantry::predict_kinds`, embedded `pantry/detector.ogdl` run through recipe-infer). `Kind` enum:
+   6 classes — **Numeric**, **Temporal**, **Categorical**, **Ordinal**, **Text**, **Image**. Detection is a trained char-level transformer (`embed(32).vocab(257) → attn(4) → 64.leak() → 6`), NOT magic-number thresholds (every picked constant is a banned guess — the trainer + corpus live in `examples/train_detector.rs`). Each column's raw cells → byte-stream (CONTEXT=256) → the model picks the Kind.
+   - **Text** → tokenize → token-id sequences for `embed` layers; **Categorical** → one-hot (or integer-index when an embed layer + no text cols); **Temporal** → encoded as days.
+   - Missing markers (NA, NaN, N/A, NULL, None, ?, ., -) filtered before detection.
+2. When `.test()` is set, align train/test to shared columns only.
+3. ALL NaN value-policy lives in ONE adapter: `pantry::encode::nan_clean` via `clean_dataset` at prepare — features are mean-imputed, only rows with a NaN target drop. No scattered NaN handling.
+4. RAM guard (`pantry::available_ram_bytes`) panics if projected parse size exceeds 90% of available memory.
+
+## Training Loop
+
+Full-batch gradient descent on GPU. No mini-batching (banned). Weights uploaded once, stay on GPU. Per-epoch: forward all layers → loss gradient → backward all layers → SGD update. Metrics (R², loss, accuracy) computed via fused GPU kernels — single scalar download per metric, never downloading predictions. Allocation is frozen inside the epoch loop (`AllocGuard`) — scratch is allocated once and reused.
+
+When the training scratch exceeds claimable VRAM the fit streams **out-of-core** (`src/utils/ooc.rs`): every big buffer is homed per-window strictly VRAM → RAM → DISK (one unlinked spill file), windows stream through a fixed set of device staging buffers with read-ahead and write-behind threads drawing from a preallocated, page-touched host pool. Math stays full-batch — every sample flows through every op each epoch. Memory laws: exactly 1 GB per tier belongs to the user (`USER_GB`, no ratios); all "will it fit" decisions go through `gpu_core::memory::claimable_bytes()` (the alloc gate's own measure), never raw `hipMemGetInfo`.
+
+Activations: relu, sigmoid, linear, leaky_relu, prelu (learnable slope), elu, selu, tanh, silu/swish, gelu.
+Losses: mse, mae, huber, ce (softmax cross-entropy), bce (binary cross-entropy).
+
+Checkpoint: saves weights in OGDL format on first R² drop (stop-loss). Resume loads and validates shapes — crashes on mismatch, never silently discards.
+
+## GPU Architecture (gpu-core)
+
+`gpu-core/build.rs` compiles all `.hip` files in `src/kernels/` with hipcc/amdclang++, archives into `libhipkernels.a`, links with `amdhip64`, `hipblas`, `hipsolver`, `hipfft` (the hip* links are under-migration violations of the vendor ban below — never add a call). An NVIDIA backend path routes rocPRIM/hipCUB kernels through plain nvcc with the `src/nvidia_compat/` shims.
+
+Memory: `hipMallocAsync`/`hipFreeAsync` only. Synchronous `hipMalloc`/`hipFree` are banned at compile time by the root `build.rs` scanner. ONE call site per HIP memory API — alloc/free/xfer/memset choke points live in `memory.rs` and everything is byte-ledgered; never add a raw `hip::` memory call elsewhere. Blocking-op budget: async transfers/allocs/frees unlimited; max 2 blocking allocations + 2 blocking frees per run.
+
+## Build Enforcement
+
+Root `build.rs` scans all `src/*.rs` files and panics on banned patterns:
+- `hipMalloc(` / `hipFree(` (must use async variants)
+
+gpu-core `build.rs` bans `rocblas`/`cublas` tokens in `src/*.rs` (comments included).
+
+## Vendor Math Libraries: BANNED
+
+ROC and CU are banned — no rocBLAS, hipBLAS, rocSOLVER, rocFFT, cuBLAS, or any
+vendor math call anywhere. All GPU math is our own `.hip` kernels through our own
+launch wrappers (they allocate dark, run opaque stream semantics, and break the
+memory ledger's total accounting). Sole sanctioned exception: exactly 2 cu shim
+call sites for hip→cu MEMORY ALLOCATION on the NVIDIA backend — `rg` for cu must
+match exactly 2 instances at end-state. The historical "call hipBLAS instead"
+reading of this ban was wrong; the ~57 `hipblas*` calls in kernels.rs are
+violations under migration (forward → training GEMMs → solver/fft → unlink libs).
+Never add a new one.
+
+## Conventions
+
+- Edition 2024, Rust stable
+- 6-space tab indentation everywhere
+- `anyhow::Result` for fallible functions
+- `#![deny(clippy::unwrap_used)]` — no unwraps in library code
+- `f64` everywhere — fp32/mixed precision not allowed
+- Full-batch only — mini-batch/batch_size banned
+- Lowercase const aliases for losses/metrics/save: `mse`, `bce`, `w`, `b`, `Loss`, `R2`, etc.
+- Activations are chained methods: `.layer(64).leak()`, `.layer(1).sigmoid()`
+- Progress/diagnostics to stderr, never stdout
+
+## Rules
+
+- ANY bug you hit, you FIX — regardless of cause. Never deflect a failure as "pre-existing", "intermittent", "not caused by my change", "unrelated", or "fine on a re-run". That deflection is banned; fix it then and there, even mid-task, then verify. 0% effort proving it isn't yours, 100% on the fix.
+- Diagnose before fixing — read logs, code, and docs first. No guessing.
+- Test changes before claiming success.
+- Minimal, focused edits. If a fix touches >3 files, explain why.
+- Never hand-roll what a crate provides. Check Cargo.toml and docs.rs first.

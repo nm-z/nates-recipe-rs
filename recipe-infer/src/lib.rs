@@ -13,9 +13,11 @@ pub mod ogdl;
 pub mod params;
 pub mod safetensors;
 pub mod scratch;
+pub mod work;
 
 pub use enums::*;
 pub use forward::*;
+pub use work::{GEMM_GFLOPS, VRAM_GBS, Work, layer_bwd, layer_fwd};
 // The tiered VRAM/RAM/disk buffer + its admit check, surfaced so pantry (which
 // depends only on recipe-infer) can gate encoding on B ≤ VRAM+RAM+disk.
 pub use gpu_core::tiered;

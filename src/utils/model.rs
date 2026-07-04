@@ -349,21 +349,9 @@ impl Train {
 			let score = {
 				let params = model.params.borrow();
 				let n = ds.x.nrows();
-				let fwd_fits = params.is_empty()
-					|| Scratch::vram_bytes(&params, n, true)
-						<= gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
 				if params.is_empty() {
 					f64::NAN
-				} else if !fwd_fits {
-					// The standalone scoring forward below needs the very buffer
-					// set that did not fit VRAM (that is why fit streamed
-					// out-of-core) — use the score fit already computed.
-					model.fit_score.get()
 				} else {
-					let _key = model.loss.score_key();
-					let last = params.len() - 1;
-					let k = params[last].out_dim;
-					let sc = Scratch::new(&params, n, true);
 					let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
 					let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
 					let (col_x, col_ec, _col_v) = if embed_cats {
@@ -374,59 +362,76 @@ impl Train {
 					};
 					let eff_x = col_x.as_ref().unwrap_or(&ds.x);
 					let eff_text = if embed_cats { &col_ec } else { &ds.text_cols };
-					let cat_cols: Vec<usize> = if embed_first {
-						(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
+					// The FULL device ask of this scoring forward — scratch plus
+					// the x/x_cat/y uploads (2× x covers the zscore double
+					// buffer) — against the same claimability rule the alloc
+					// gate enforces. When it does not fit (the very buffer set
+					// that made fit stream out-of-core), fit's own post-update
+					// end score stands in.
+					let need = Scratch::vram_bytes(&params, n, true)
+						+ 2 * eff_x.len() * 8
+						+ ds.y.len() * 8;
+					if need > gpu_core::memory::claimable_bytes() {
+						model.fit_score.get()
 					} else {
-						Vec::new()
-					};
-					let xinput = if embed_first {
-						eff_x.select(ndarray::Axis(1), eff_text)
-					} else {
-						eff_x.clone()
-					};
-					let (xraw, nn, d) = upload(&xinput);
-					assert_eq!(nn, n);
-					let scaler = model.scaler.borrow();
-					let (xbuf, x_cat) = if embed_first {
-						if cat_cols.is_empty() {
-							(xraw, None)
+						let _key = model.loss.score_key();
+						let last = params.len() - 1;
+						let k = params[last].out_dim;
+						let sc = Scratch::new(&params, n, true);
+						let cat_cols: Vec<usize> = if embed_first {
+							(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
 						} else {
-							let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-							let (craw, _, c) = upload(&cat);
-							let scaled = if let Some(sc_ref) = scaler.as_ref() {
-								zscore_apply(&craw, n, c, sc_ref)
-							} else {
-								craw
-							};
-							(xraw, Some(scaled))
-						}
-					} else {
-						let scaled = if let Some(sc_ref) = scaler.as_ref() {
-							if sc_ref.mean.is_empty() { xraw } else { zscore_apply(&xraw, n, d, sc_ref) }
-						} else {
-							xraw
+							Vec::new()
 						};
-						(scaled, None)
-					};
-					forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
-					if let Some((ymean, ystd)) = *model.yscaler.borrow() {
-						kernels::gpu_scale_inplace(&sc.acts[last], ystd, n * k);
-						kernels::gpu_add_scalar_inplace(&sc.acts[last], ymean, n * k);
-					}
-					let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
-					if model.loss.is_classification() {
-						if k == 1 {
-							kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+						let xinput = if embed_first {
+							eff_x.select(ndarray::Axis(1), eff_text)
 						} else {
-							kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n, k);
+							eff_x.clone()
+						};
+						let (xraw, nn, d) = upload(&xinput);
+						assert_eq!(nn, n);
+						let scaler = model.scaler.borrow();
+						let (xbuf, x_cat) = if embed_first {
+							if cat_cols.is_empty() {
+								(xraw, None)
+							} else {
+								let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
+								let (craw, _, c) = upload(&cat);
+								let scaled = if let Some(sc_ref) = scaler.as_ref() {
+									zscore_apply(&craw, n, c, sc_ref)
+								} else {
+									craw
+								};
+								(xraw, Some(scaled))
+							}
+						} else {
+							let scaled = if let Some(sc_ref) = scaler.as_ref() {
+								if sc_ref.mean.is_empty() { xraw } else { zscore_apply(&xraw, n, d, sc_ref) }
+							} else {
+								xraw
+							};
+							(scaled, None)
+						};
+						forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+						if let Some((ymean, ystd)) = *model.yscaler.borrow() {
+							kernels::gpu_scale_inplace(&sc.acts[last], ystd, n * k);
+							kernels::gpu_add_scalar_inplace(&sc.acts[last], ymean, n * k);
 						}
-						download_scalar(&sc.metric_scalar)
-					} else {
-						let total = (n * k) as f64;
-						let ybar = ds.y.iter().sum::<f64>() / total;
-						let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-						kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
-						1.0 - download_scalar(&sc.metric_scalar) / ss_tot
+						let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
+						if model.loss.is_classification() {
+							if k == 1 {
+								kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+							} else {
+								kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n, k);
+							}
+							download_scalar(&sc.metric_scalar)
+						} else {
+							let total = (n * k) as f64;
+							let ybar = ds.y.iter().sum::<f64>() / total;
+							let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
+							kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
+							1.0 - download_scalar(&sc.metric_scalar) / ss_tot
+						}
 					}
 				}
 			};

@@ -69,6 +69,13 @@ pub struct Scratch {
 	pub copy_stream: gpu_core::hip::Stream,
 	pub pinned_scalar: *mut f64,
 	pub pinned_scalar_b: *mut f64,
+	// Per-layer roofline timing: boundary events on the null stream (where every
+	// compute kernel launches), recorded only while `timing` is set — the fit
+	// loop arms it on log epochs so non-logged epochs run untouched. L+1 each:
+	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse.
+	ev_fwd: Vec<gpu_core::hip::Event>,
+	ev_bwd: Vec<gpu_core::hip::Event>,
+	timing: std::cell::Cell<bool>,
 }
 
 impl Scratch {
@@ -285,7 +292,51 @@ impl Scratch {
 			// including the transfer bounce).
 			pinned_scalar: pinned_pair,
 			pinned_scalar_b: unsafe { pinned_pair.add(1) },
+			ev_fwd: (0..=params.len())
+				.map(|_| gpu_core::hip::Event::new().expect("layer timing event"))
+				.collect(),
+			ev_bwd: (0..=params.len())
+				.map(|_| gpu_core::hip::Event::new().expect("layer timing event"))
+				.collect(),
+			timing: std::cell::Cell::new(false),
 		}
+	}
+
+	/// Arm/disarm per-layer boundary timing. Armed only for the epoch a log line
+	/// will print; the metric re-forward runs disarmed so it can't overwrite the
+	/// recorded boundaries.
+	pub fn set_timing(&self, on: bool) {
+		self.timing.set(on);
+	}
+
+	/// Record forward layer boundary `i` (0 = before layer 0) on the null stream.
+	pub fn mark_fwd(&self, i: usize) {
+		if self.timing.get() {
+			// SAFETY: null stream — the stream every compute kernel launches on.
+			unsafe { self.ev_fwd[i].record(std::ptr::null_mut()).expect("record fwd event") }
+		}
+	}
+
+	/// Record backward layer boundary `i` (params.len() = before the top layer,
+	/// recorded in descending order as backward walks down).
+	pub fn mark_bwd(&self, i: usize) {
+		if self.timing.get() {
+			// SAFETY: null stream — the stream every compute kernel launches on.
+			unsafe { self.ev_bwd[i].record(std::ptr::null_mut()).expect("record bwd event") }
+		}
+	}
+
+	/// Per-layer (forward_ms, backward_ms) for the last armed epoch. Waits on the
+	/// final boundary event (bwd[0], recorded last) — call at log time only.
+	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
+		self.ev_bwd[0].synchronize().expect("sync bwd event");
+		let f = (0..layers)
+			.map(|l| gpu_core::hip::elapsed_ms(&self.ev_fwd[l], &self.ev_fwd[l + 1]).expect("fwd elapsed") as f64)
+			.collect();
+		let b = (0..layers)
+			.map(|l| gpu_core::hip::elapsed_ms(&self.ev_bwd[l + 1], &self.ev_bwd[l]).expect("bwd elapsed") as f64)
+			.collect();
+		(f, b)
 	}
 
 	pub fn download_scalar_deferred(&self) {

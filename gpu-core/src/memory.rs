@@ -288,6 +288,16 @@ pub fn device_free_count() -> usize {
 	FREE_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Cumulative transfer ledger bytes as numbers: (H2D, D2H, D2D). Snapshot before
+/// and after a phase to attribute the delta to that phase's PCIe traffic.
+pub fn xfer_bytes() -> (usize, usize, usize) {
+	(
+		H2D_BYTES.load(Ordering::Relaxed),
+		D2H_BYTES.load(Ordering::Relaxed),
+		D2D_BYTES.load(Ordering::Relaxed),
+	)
+}
+
 pub fn alloc_freeze() {
 	ALLOC_FROZEN.with(|f| f.set(true));
 }
@@ -404,6 +414,13 @@ pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 
 const BOUNCE_BYTES: usize = 64 << 20;
 static BOUNCE: Mutex<usize> = Mutex::new(0);
+
+/// Pinned bounce arena [base, base+len) if allocated — the fault autopsy names
+/// a faulting VA that lands inside it.
+pub(crate) fn bounce_range() -> Option<(usize, usize)> {
+	let base = *BOUNCE.lock().ok()?;
+	(base != 0).then_some((base, BOUNCE_BYTES))
+}
 
 /// Explicitly release the pinned bounce at shutdown (exit frees ALL RAM).
 pub(crate) fn free_bounce() {
@@ -553,6 +570,11 @@ pub(crate) fn ensure_pool_warmed() {
 			eprintln!("GPU pool warm failed: {e}");
 		}
 		WARMING.with(|w| w.set(false));
+		// HSA is up by now (the warm's HIP calls initialized it) — register the
+		// GPU memory-fault autopsy and the KFD thrash watchdog here so EVERY
+		// GPU process gets them, not just callers of set_device.
+		crate::hip::register_fault_autopsy_once();
+		crate::hw::spawn_thrash_watchdog();
 	});
 }
 
@@ -573,6 +595,34 @@ pub fn pool_trim() {
 	crate::hip::device_synchronize().expect("pool_trim sync");
 	crate::hip::trim_mempool(0).expect("pool_trim");
 	POOL_VERIFIED.store(POOL_LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+	// Post-trim pages are uncommitted, but every allocation after the reset is
+	// a growth ask (projected > verified) and gets the commit memset below.
+}
+
+/// THE reserve law: exactly 1 GB of each tier belongs to the user, always.
+pub const USER_GB: usize = 1 << 30;
+
+/// Counters' view of free device memory: min of HIP's and the kernel's free
+/// counts (hipMemGetInfo does not see other processes; sysfs does) minus the
+/// pool's idle slack (mapped, but a growth map cannot use it). Crashes on a
+/// failed query — a wedged device must never read as "0 free" and quietly
+/// reroute callers.
+pub fn vram_free_base() -> usize {
+	let hip_free = crate::hip::mem_info().expect("hipMemGetInfo").0;
+	let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
+	let slack = crate::hip::pool_slack(0).expect("pool_slack");
+	hip_free.min(sys_free).saturating_sub(slack)
+}
+
+/// Device bytes claimable under the SAME rules the alloc gate below enforces:
+/// arena remainder, plus pool-reusable bytes (re-asks under the proven peak
+/// skip the gate), plus growable headroom (base minus the user's gigabyte).
+/// Every "will it fit" decision consults this — never raw hipMemGetInfo.
+pub fn claimable_bytes() -> usize {
+	let reusable = POOL_VERIFIED
+		.load(Ordering::Relaxed)
+		.saturating_sub(POOL_LIVE.load(Ordering::Relaxed));
+	arena_remaining() + reusable + vram_free_base().saturating_sub(USER_GB)
 }
 
 /// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
@@ -706,16 +756,14 @@ impl GpuBuffer {
 		// mid-run (retain threshold = max), so no new mapping is needed.
 		let live = POOL_LIVE.load(Ordering::Relaxed);
 		let projected = live + n_bytes;
-		if projected > POOL_VERIFIED.load(Ordering::Relaxed) {
-			let hip_free = crate::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-			let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
-			let slack = crate::hip::pool_slack(0).unwrap_or(0);
-			let remaining = hip_free.min(sys_free).saturating_sub(slack);
+		let fresh = projected > POOL_VERIFIED.load(Ordering::Relaxed);
+		if fresh {
+			let remaining = vram_free_base();
 			// THE law: 1 GB of VRAM belongs to the user, always. Growth is
 			// refused inside that band — which also covers the counters'
 			// over-report of the true VmHeap ceiling (observed well under
 			// 1 GB), so no per-ask probe children, no ratios, no guesses.
-			if n_bytes > remaining.saturating_sub(1 << 30) {
+			if n_bytes > remaining.saturating_sub(USER_GB) {
 				if !quiet_oom {
 					oom_report(n_bytes);
 				}
@@ -729,6 +777,22 @@ impl GpuBuffer {
 			oom_report(n_bytes);
 		}
 		check(code)?;
+		if fresh {
+			// Pool growth returns UNCOMMITTED pages: the blit-engine H2D into one
+			// is a gfxhub fault ("page not present"), and a kernel read of one
+			// returns stale zeros. A stream-ordered memset commits every page
+			// before any later same-stream copy or kernel can touch the buffer.
+			// The memset alone is NOT enough: the growth mapping is a KFD-side
+			// page-table update ordered with no stream, and the engines race it
+			// (reproduced: gfxhub faults in the cookbook LLM fit setup with the
+			// memset in place; gone under ALLOC_SYNC). Drain the device so the
+			// mapping completes before first touch. Growth-only: reused slack
+			// committed in its prior life skips both, and AllocGuard keeps
+			// growth out of the fit loop, so the loop's blocking-op count is 0.
+			unsafe { memset_dev(ptr, 0, n_bytes, std::ptr::null_mut())? };
+			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
+			check(unsafe { hipDeviceSynchronize() })?;
+		}
 		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
 		if ALLOC_SYNC.load(Ordering::Relaxed) {
 			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);

@@ -16,7 +16,14 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+// Cumulative spill-file traffic (bytes), bumped at the three I/O sites so each
+// sweep line can attribute its disk delta — the NVMe half of the streamed-tier
+// roofline (PCIe H2D/D2H deltas come from the gpu-core ledger).
+static DISK_R_BYTES: AtomicUsize = AtomicUsize::new(0);
+static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Fixed pool of host window buffers, preallocated and page-touched at build.
 /// Every transient host byte this path moves (read-ahead, sync reads, the
@@ -58,16 +65,6 @@ fn disk_free(path: &std::path::Path) -> usize {
 		return 0;
 	}
 	(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
-}
-
-// Claimable VRAM the way the claim law demands: hipMemGetInfo does not see
-// other processes (the desktop), sysfs does; take the min and subtract the
-// pool's idle reservations.
-fn vram_avail() -> usize {
-	let hip_free = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-	let sys_free = gpu_core::hip::sysfs_vram_free().unwrap_or(hip_free);
-	let slack = gpu_core::hip::pool_slack(0).unwrap_or(0);
-	hip_free.min(sys_free).saturating_sub(slack)
 }
 
 fn view(b: &GpuBuffer, byte_off: usize, byte_len: usize) -> GpuBuffer {
@@ -144,6 +141,7 @@ impl Paged {
 			let h = std::thread::spawn(move || {
 				let mut buf = pool_take(&hp);
 				f.read_exact_at(&mut buf[..len], off).expect("ooc spill read-ahead");
+				DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
 				unsafe {
 					use std::os::unix::io::AsRawFd;
 					libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
@@ -181,6 +179,7 @@ impl Paged {
 						self.drain_ahead(host);
 						let mut buf = pool_take(host);
 						spill.read_exact_at(&mut buf[..len], *off).expect("ooc spill read");
+						DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
 						unsafe {
 							use std::os::unix::io::AsRawFd;
 							libc::posix_fadvise(spill.as_raw_fd(), *off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
@@ -228,6 +227,10 @@ struct Writer {
 	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>)>,
 	next: std::cell::Cell<usize>,
 	host: HostPool,
+	// Seconds spent draining lanes since the last sweep line — epoch-to-epoch
+	// wander on identical work is write-behind drain landing on whichever
+	// sweep's barrier catches it; the line surfaces it as `drain Xs`.
+	drained: std::cell::Cell<f64>,
 }
 
 const W_LANES: usize = 3;
@@ -249,6 +252,7 @@ fn spawn_lane(spill: &File, host: &HostPool) -> (Option<std::sync::mpsc::SyncSen
 	let worker = std::thread::spawn(move || {
 		for (off, buf, len) in rx {
 			f.write_all_at(&buf[..len], off).expect("ooc spill write");
+			DISK_W_BYTES.fetch_add(len, Ordering::Relaxed);
 			drop_cache(&f, off, len);
 			pool_give(&hp, buf);
 		}
@@ -262,6 +266,7 @@ impl Writer {
 			lanes: (0..W_LANES).map(|_| spawn_lane(spill, &host)).collect(),
 			next: std::cell::Cell::new(0),
 			host,
+			drained: std::cell::Cell::new(0.0),
 		}
 	}
 	fn send(&self, off: u64, buf: Vec<u8>, len: usize) {
@@ -272,6 +277,7 @@ impl Writer {
 	/// Drain every lane — REQUIRED before any read of a disk home that was
 	/// just written this sweep (the next sweep reads it).
 	fn barrier(&mut self, spill: &File) {
+		let t = std::time::Instant::now();
 		for lane in &mut self.lanes {
 			if let Some(tx) = lane.0.take() {
 				drop(tx);
@@ -281,6 +287,7 @@ impl Writer {
 			}
 			*lane = spawn_lane(spill, &self.host);
 		}
+		self.drained.set(self.drained.get() + t.elapsed().as_secs_f64());
 	}
 }
 
@@ -293,11 +300,12 @@ pub struct Plan {
 /// Combined-ceiling admit in waterfall order from live measurements. `None`
 /// only when VRAM+RAM+DISK together cannot hold `need` — the sole abort.
 // THE reserve law: exactly 1 GB of each tier belongs to the user; every
-// other byte is ours to fill. No ratios, no floors, no guesses.
-pub const USER_GB: usize = 1 << 30;
+// other byte is ours to fill. No ratios, no floors, no guesses. The constant
+// lives in gpu-core next to the alloc gate that enforces it.
+pub use gpu_core::memory::USER_GB;
 
 pub fn plan(need: usize) -> Option<Plan> {
-	let vram_avail = vram_avail().saturating_sub(USER_GB);
+	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
 	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 	let disk_avail = disk_free(&cwd).saturating_sub(USER_GB);
@@ -343,6 +351,34 @@ pub struct Ooc {
 	dwv_acc: GpuBuffer,
 	dw_partials: GpuBuffer,
 	reduce_ws: GpuBuffer,
+	// Streamed-tier rates measured at build (bytes/sec): one window pushed
+	// through each production path — the PCIe/NVMe rooflines every sweep line
+	// reports its achieved rate against.
+	rate_h2d: f64,
+	rate_d2h: f64,
+	rate_disk_r: f64,
+	rate_disk_w: f64,
+}
+
+/// Wall clock + cumulative transfer counters at sweep start, so the sweep line
+/// can attribute exactly this sweep's PCIe and disk bytes.
+struct SweepStart {
+	t: std::time::Instant,
+	h2d: usize,
+	d2h: usize,
+	disk_r: usize,
+	disk_w: usize,
+}
+
+fn sweep_start() -> SweepStart {
+	let (h2d, d2h, _) = gpu_core::memory::xfer_bytes();
+	SweepStart {
+		t: std::time::Instant::now(),
+		h2d,
+		d2h,
+		disk_r: DISK_R_BYTES.load(Ordering::Relaxed),
+		disk_w: DISK_W_BYTES.load(Ordering::Relaxed),
+	}
 }
 
 impl Ooc {
@@ -383,12 +419,12 @@ impl Ooc {
 			.unwrap_or(1);
 		let max_bias = params.iter().map(|p| p.out_dim).max().unwrap_or(1);
 		const WINS: usize = 10;
-		// Budget from the honest availability (min of hip/sysfs minus pool slack)
+		// Budget from the honest claimability (the alloc gate's own measure)
 		// AFTER reserving the fixed residents (lse/dsum/grad accumulators); half
 		// of what remains stages windows (+2 windows of margin for the
 		// chunk-sized dw_partials/reduce_ws), the waterfall homes fill the rest.
 		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
-		let win_budget = vram_avail().saturating_sub(USER_GB).saturating_sub(fixed_res) / 2;
+		let win_budget = gpu_core::memory::claimable_bytes().saturating_sub(fixed_res) / 2;
 		let chunk = (win_budget / ((WINS + 2) * max_spb * 8)).clamp(1, n);
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
@@ -406,6 +442,32 @@ impl Ooc {
 				.collect(),
 		));
 		let writer = Writer::new(&spill, host.clone());
+		// One window through each streamed path, timed — the measured PCIe/NVMe
+		// rates the sweep lines report against. Window-sized (the exact unit the
+		// epoch streams); the spill region is overwritten by real windows later.
+		// Drain the device first: the wins were just hipMallocAsync'd and an
+		// immediate copy into uncommitted pool pages GPU-page-faults (the
+		// ALLOC_SYNC pattern in gpu-core/memory.rs).
+		gpu_core::hip::device_synchronize().expect("ooc calibrate sync");
+		let (rate_h2d, rate_d2h, rate_disk_r, rate_disk_w) = {
+			let bps = |b: usize, t: std::time::Instant| b as f64 / t.elapsed().as_secs_f64();
+			let mut buf = pool_take(&host);
+			let t = std::time::Instant::now();
+			wins[0].write_u8(&buf[..wbytes]).expect("calibrate h2d");
+			let h2d = bps(wbytes, t);
+			let t = std::time::Instant::now();
+			wins[0].download_u8(&mut buf[..wbytes]).expect("calibrate d2h");
+			let d2h = bps(wbytes, t);
+			let t = std::time::Instant::now();
+			spill.write_all_at(&buf[..wbytes], 0).expect("calibrate spill write");
+			drop_cache(&spill, 0, wbytes);
+			let w = bps(wbytes, t);
+			let t = std::time::Instant::now();
+			spill.read_exact_at(&mut buf[..wbytes], 0).expect("calibrate spill read");
+			let r = bps(wbytes, t);
+			pool_give(&host, buf);
+			(h2d, d2h, r, w)
+		};
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
 		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
@@ -546,6 +608,10 @@ impl Ooc {
 			dwv_acc,
 			dw_partials,
 			reduce_ws,
+			rate_h2d,
+			rate_d2h,
+			rate_disk_r,
+			rate_disk_w,
 		}
 	}
 
@@ -581,6 +647,15 @@ impl Ooc {
 			gb(d),
 			self.chunk
 		);
+		eprintln!(
+			"\x1b[33mwaterfall\x1b[0m  measured rooflines: gemm {} GF/s  vram {} GB/s  h2d {:.2} GB/s  d2h {:.2} GB/s  disk-r {:.2} GB/s  disk-w {:.2} GB/s",
+			recipe_infer::GEMM_GFLOPS,
+			recipe_infer::VRAM_GBS,
+			self.rate_h2d / 1e9,
+			self.rate_d2h / 1e9,
+			self.rate_disk_r / 1e9,
+			self.rate_disk_w / 1e9,
+		);
 	}
 
 	/// Full-batch forward swept in windows. `x`/`x_cat`/`sc.acts[last]` are
@@ -596,10 +671,12 @@ impl Ooc {
 	) {
 		let last = params.len() - 1;
 		for (l, p) in params.iter().enumerate() {
-			let t_l = std::time::Instant::now();
+			// The concat build is its own sweep with its own line — folded into
+			// the consuming dense's timer it read as that layer's slowness.
 			if let Some((pf, a, c)) = concat_at
 				&& l == pf
 			{
+				let s_c = sweep_start();
 				self.writer.barrier(&self.spill);
 				for (s0, cnt) in chunks(self.n, self.chunk) {
 					if self.bail() {
@@ -611,7 +688,11 @@ impl Ooc {
 					kernels::gpu_concat_into(&prev, &xc, &out, cnt, a, c);
 					self.concat.commit(s0, cnt, &out, &self.writer, &self.host);
 				}
+				// Pure copy: [n×A]+[n×C] read, [n×(A+C)] written, zero FLOP.
+				let cw = recipe_infer::Work { flop: 0.0, bytes: 16.0 * (self.n * (a + c)) as f64 };
+				self.sweep_line_work("fwd", l, "concat", &format!("{a}+{c}"), cw, s_c);
 			}
+			let s_l = sweep_start();
 			match p.kind {
 				LayerKind::Embed => {
 					self.writer.barrier(&self.spill);
@@ -733,7 +814,7 @@ impl Ooc {
 					}
 				}
 			}
-			self.sweep_line("fwd", l, match p.kind { LayerKind::Embed => "embed", LayerKind::Attn => "attn", LayerKind::Conv => "conv", LayerKind::Dense => "dense" }, t_l);
+			self.sweep_line("fwd", l, p, s_l);
 		}
 	}
 
@@ -773,7 +854,7 @@ impl Ooc {
 		let mut flip = false;
 		for l in (0..params.len()).rev() {
 			let p = &params[l];
-			let t_l = std::time::Instant::now();
+			let s_l = sweep_start();
 			let (in_dim, out_dim) = (p.in_dim, p.out_dim);
 			match p.kind {
 				LayerKind::Embed => {
@@ -788,13 +869,13 @@ impl Ooc {
 						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
 					}
 					kernels::gpu_sgd_update(&p.w, &sc.embed_grad, lr, p.vocab * p.dim);
-					self.sweep_line("bwd", l, "embed", t_l);
+					self.sweep_line("bwd", l, p, s_l);
 					flip = !flip;
 					continue;
 				}
 				LayerKind::Attn => {
 					self.attn_backward(params, l, x, lr, flip);
-					self.sweep_line("bwd", l, "attn", t_l);
+					self.sweep_line("bwd", l, p, s_l);
 					flip = !flip;
 					continue;
 				}
@@ -925,21 +1006,116 @@ impl Ooc {
 			if p.act == Activation::PRelu {
 				kernels::gpu_sgd_update(&p.palpha, &self.scalar_acc, lr, 1);
 			}
-			self.sweep_line("bwd", l, "dense", t_l);
+			self.sweep_line("bwd", l, p, s_l);
 			flip = !flip;
 		}
 	}
 
 	// Persistent per-layer heartbeat — an out-of-core epoch moves ~100 GB
 	// through the tiers before the first loss line, and silence looks like a
-	// hang. One line per layer pass with wall time, newline-terminated so it
-	// survives the dev wrapper own 1 Hz line.
-	fn sweep_line(&self, phase: &str, l: usize, kind: &str, t: std::time::Instant) {
-		eprintln!(
-			"ooc {phase} L{l} {kind}  {} windows  {:.1}s",
+	// hang. One line per layer pass with wall time, the layer's analytic GFLOP
+	// and VRAM GB (achieved rate as % of the gemm/vram rooflines), and this
+	// sweep's streamed bytes per channel as % of the build-measured PCIe/NVMe
+	// rates. Newline-terminated so it survives the dev wrapper own 1 Hz line.
+	fn sweep_line(&self, phase: &str, l: usize, p: &LayerParams, s: SweepStart) {
+		let kind = match p.kind {
+			LayerKind::Embed => "embed",
+			LayerKind::Attn => "attn",
+			LayerKind::Conv => "conv",
+			LayerKind::Dense => "dense",
+		};
+		let w = if phase == "fwd" {
+			recipe_infer::layer_fwd(p, self.n)
+		} else {
+			recipe_infer::layer_bwd(p, self.n, l == 0)
+		};
+		self.sweep_line_work(phase, l, kind, &format!("{}→{}", p.in_dim, p.out_dim), w, s);
+	}
+
+	fn sweep_line_work(&self, phase: &str, l: usize, kind: &str, dims: &str, w: recipe_infer::Work, s: SweepStart) {
+		// Drain the device before reading the clock, so the line includes this
+		// sweep's own enqueued kernels instead of leaking the tail into the
+		// next layer's line.
+		gpu_core::hip::device_synchronize().expect("sweep sync");
+		let sec = s.t.elapsed().as_secs_f64();
+		let (gfs, gbs) = (w.flop / sec / 1e9, w.bytes / sec / 1e9);
+		let mut line = format!(
+			"ooc {phase} L{l} {kind} {dims}  {} windows  {sec:.1}s  {:.2} GFLOP {gfs:.1} GF/s {:.0}% gemm  {:.2} GB {gbs:.1} GB/s {:.0}% vram",
 			self.n.div_ceil(self.chunk),
-			t.elapsed().as_secs_f64()
+			w.flop / 1e9,
+			100.0 * gfs / recipe_infer::GEMM_GFLOPS,
+			w.bytes / 1e9,
+			100.0 * gbs / recipe_infer::VRAM_GBS,
 		);
+		let (h2d, d2h, _) = gpu_core::memory::xfer_bytes();
+		for (label, delta, rate) in [
+			("h2d", h2d - s.h2d, self.rate_h2d),
+			("d2h", d2h - s.d2h, self.rate_d2h),
+			("disk-r", DISK_R_BYTES.load(Ordering::Relaxed) - s.disk_r, self.rate_disk_r),
+			("disk-w", DISK_W_BYTES.load(Ordering::Relaxed) - s.disk_w, self.rate_disk_w),
+		] {
+			if delta > 0 {
+				let bps = delta as f64 / sec;
+				line += &format!(
+					"  {label} {:.2} GB {:.2} GB/s {:.0}%",
+					delta as f64 / 1e9,
+					bps / 1e9,
+					100.0 * bps / rate,
+				);
+			}
+		}
+		let drain = self.writer.drained.take();
+		if drain > 0.0 {
+			line += &format!("  drain {drain:.1}s");
+		}
+		eprintln!("{line}");
+	}
+
+	/// Every Paged buffer. The exhaustive destructure (no `..`) makes adding a
+	/// field a compile error HERE, so a future Paged cannot silently miss the
+	/// interrupt drain in `bail` and strand its read-ahead pool checkouts.
+	fn all_paged(&self) -> impl Iterator<Item = &Paged> {
+		let Ooc {
+			n: _,
+			chunk: _,
+			wins: _,
+			spill: _,
+			writer: _,
+			host: _,
+			acts,
+			preacts,
+			a_q,
+			a_k,
+			a_v,
+			a_ctx,
+			a_dctx,
+			a_dq,
+			a_dk,
+			a_dv,
+			concat,
+			da_a,
+			da_b,
+			lse: _,
+			dsum: _,
+			dw_acc: _,
+			db_acc: _,
+			dw_tmp: _,
+			db_tmp: _,
+			scalar_acc: _,
+			scalar_tmp: _,
+			dwq_acc: _,
+			dwk_acc: _,
+			dwv_acc: _,
+			dw_partials: _,
+			reduce_ws: _,
+			rate_h2d: _,
+			rate_d2h: _,
+			rate_disk_r: _,
+			rate_disk_w: _,
+		} = self;
+		acts.iter().chain(preacts.iter().flatten()).chain([
+			a_q, a_k, a_v, a_ctx, a_dctx, a_dq, a_dk, a_dv, concat, da_a, da_b,
+		])
 	}
 
 	/// Interrupt check for every sweep. On ^C the read-ahead queues hold
@@ -949,17 +1125,8 @@ impl Ooc {
 		if !interrupted() {
 			return false;
 		}
-		for a in &self.acts {
-			a.drain_ahead(&self.host);
-		}
-		for pa in self.preacts.iter().flatten() {
-			pa.drain_ahead(&self.host);
-		}
-		for b in [
-			&self.a_q, &self.a_k, &self.a_v, &self.a_ctx, &self.a_dctx, &self.a_dq, &self.a_dk,
-			&self.a_dv, &self.concat, &self.da_a, &self.da_b,
-		] {
-			b.drain_ahead(&self.host);
+		for p in self.all_paged() {
+			p.drain_ahead(&self.host);
 		}
 		true
 	}

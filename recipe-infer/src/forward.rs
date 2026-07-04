@@ -287,6 +287,7 @@ pub fn forward_into(
 	sc: &Scratch,
 ) {
 	let cc = concat_layer(params);
+	sc.mark_fwd(0);
 	for (l, p) in params.iter().enumerate() {
 		// The first dense after the text prefix reads concat(attn_out, x_cat):
 		// build [n×(A+C)] = [acts[l-1] | x_cat] and feed THAT instead of acts[l-1].
@@ -439,6 +440,7 @@ pub fn forward_into(
 				}
 			}
 		}
+		sc.mark_fwd(l + 1);
 	}
 }
 

@@ -78,23 +78,14 @@ impl Waterfall {
 	/// the slab's single free. One growth event (this driver's allocator
 	/// stochastically wedges during growth), one memset commits every page
 	/// before any bytes land (fresh pool pages read back as stale zeros).
-	/// The counters' best guess at claimable VRAM: min of HIP's and the kernel's
-	/// free counts minus idle pool holdings, 2 MB-floored. NOT sufficient alone —
-	/// both counters over-report what the pool can physically map (an ask past
-	/// the real ceiling is an uncatchable VmHeap abort), so the caller must
-	/// child-process-probe downward from here and claim the size that SURVIVED.
+	/// The counters' best guess at claimable VRAM (the shared vram_free_base
+	/// measure), 2 MB-floored. NOT sufficient alone — both counters over-report
+	/// what the pool can physically map (an ask past the real ceiling is an
+	/// uncatchable VmHeap abort), so the caller must child-process-probe
+	/// downward from here and claim the size that SURVIVED.
 	pub fn claim_guess() -> usize {
-		let hip_free = crate::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-		let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
-		let slack = crate::hip::pool_slack(0).unwrap_or(0);
-		let want = hip_free.min(sys_free).saturating_sub(slack) & !((1 << 21) - 1);
-		eprintln!(
-			"claim guess: hip_free={:.2} GB sys_free={:.2} GB pool_slack={:.2} GB -> {:.2} GB",
-			hip_free as f64 / (1u64 << 30) as f64,
-			sys_free as f64 / (1u64 << 30) as f64,
-			slack as f64 / (1u64 << 30) as f64,
-			want as f64 / (1u64 << 30) as f64
-		);
+		let want = crate::memory::vram_free_base() & !((1 << 21) - 1);
+		eprintln!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64);
 		want
 	}
 

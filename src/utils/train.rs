@@ -159,6 +159,53 @@ impl ModelInner {
 			Metric::Hip => "hip",
 		}
 	}
+	/// One line per layer under each log line: measured fwd+bwd seconds (null-
+	/// stream boundary events), analytic GFLOP and VRAM GB from the actual dims,
+	/// and the achieved rates as % of the two on-card rooflines (our measured
+	/// GEMM ceiling, gfx1101 memory BW). The OOC path prints its streamed-tier
+	/// counterpart per sweep with the PCIe/NVMe rooflines it measures at build.
+	fn roofline_block(params: &[LayerParams], n: usize, sc: &Scratch) -> String {
+		let (fms, bms) = sc.layer_ms(params.len());
+		let mut out = String::new();
+		let (mut t_ms, mut t_flop, mut t_bytes) = (0.0f64, 0.0f64, 0.0f64);
+		for (l, p) in params.iter().enumerate() {
+			let w = recipe_infer::layer_fwd(p, n).plus(recipe_infer::layer_bwd(p, n, l == 0));
+			let ms = fms[l] + bms[l];
+			t_ms += ms;
+			t_flop += w.flop;
+			t_bytes += w.bytes;
+			out.push_str(&Self::roofline_line(
+				&format!("L{l} {:<5} {}→{}", Self::kind_label(p), p.in_dim, p.out_dim),
+				ms, w.flop, w.bytes,
+			));
+		}
+		if params.len() > 1 {
+			out.push_str(&Self::roofline_line("total", t_ms, t_flop, t_bytes));
+		}
+		out
+	}
+
+	fn kind_label(p: &LayerParams) -> &'static str {
+		match p.kind {
+			LayerKind::Dense => "dense",
+			LayerKind::Attn => "attn",
+			LayerKind::Conv => "conv",
+			LayerKind::Embed => "embed",
+		}
+	}
+
+	fn roofline_line(label: &str, ms: f64, flop: f64, bytes: f64) -> String {
+		let gfs = flop / ms / 1e6; // flop / (ms·1e-3 s) / 1e9
+		let gbs = bytes / ms / 1e6;
+		format!(
+			"    {label:<24} {ms:>8.2}ms  {:>8.3} GFLOP {gfs:>6.1} GF/s {:>3.0}% gemm  {:>7.3} GB {gbs:>6.1} GB/s {:>3.0}% vram\n",
+			flop / 1e9,
+			100.0 * gfs / recipe_infer::GEMM_GFLOPS,
+			bytes / 1e9,
+			100.0 * gbs / recipe_infer::VRAM_GBS,
+		)
+	}
+
 	/// The colored, aligned metric line: `vals[i]` is the precomputed value of
 	/// `metrics[i]` (already reduced on the GPU), so this only formats.
 	pub(crate) fn metrics_line(&self, metrics: &[Metric], vals: &[f64]) -> String {
@@ -436,6 +483,7 @@ impl ModelInner {
 			n,
 			n * params[last].out_dim,
 		);
+		sc.mark_bwd(params.len());
 		let mut flip = false;
 		for l in (0..params.len()).rev() {
 			let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
@@ -450,12 +498,14 @@ impl ModelInner {
 				kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
 				kernels::gpu_scatter_add(&sc.embed_grad, x, da, n * p.in_dim, p.dim);
 				kernels::gpu_sgd_update(&p.w, &sc.embed_grad, self.lr, p.vocab * p.dim);
+				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
 			}
 			if params[l].kind == LayerKind::Attn {
 				let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
 				self.attn_backward(&params[l], a_prev, da, da_below, n, sc);
+				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
 			}
@@ -499,6 +549,7 @@ impl ModelInner {
 				}
 				kernels::gpu_sgd_update(&p.w, &sc.dw, self.lr, cout * cin * k);
 				kernels::gpu_sgd_update(&p.b, &sc.db, self.lr, cout);
+				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
 			}
@@ -632,6 +683,7 @@ impl ModelInner {
 				kernels::gpu_slice_lead_into(da_below, &sc.concat_dgrad, n, a + c, a);
 				kernels::gpu_copy_into(&sc.concat_dgrad, da_below, n * a);
 			}
+			sc.mark_bwd(l);
 			flip = !flip;
 		}
 	}
@@ -837,6 +889,11 @@ impl ModelInner {
 			}
 			if !summary.is_empty() {
 				eprintln!("{summary}");
+				eprintln!(
+					"roofline  gemm {} GF/s  vram {} GB/s",
+					recipe_infer::GEMM_GFLOPS,
+					recipe_infer::VRAM_GBS
+				);
 			}
 		}
 		let mut terminal = plotting.then(ratatui::init);
@@ -863,8 +920,7 @@ impl ModelInner {
 		// VRAM → RAM → DISK and every op streams sample windows (crate::ooc).
 		let cc_fit = concat_layer(&params);
 		let scratch_need = Scratch::vram_bytes(&params, n, false);
-		let free_vram = gpu_core::hip::mem_info().map(|(f, _)| f).unwrap_or(0);
-		let use_ooc = scratch_need > free_vram;
+		let use_ooc = scratch_need > gpu_core::memory::claimable_bytes();
 		let sc = {
 			let _t_scratch = gpu_core::memory::tag_scope("scratch");
 			if use_ooc { Scratch::new_light(&params, n) } else { Scratch::new(&params, n, false) }
@@ -885,6 +941,13 @@ impl ModelInner {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
 			}
+			let log_now = cfg.log_every > 0
+				&& !cfg.metrics.is_empty()
+				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
+			// Per-layer boundary events armed only for epochs whose log line will
+			// print (the OOC path prints its own per-sweep roofline lines).
+			let time_layers = log_now && !plotting && ooc.is_none();
+			sc.set_timing(time_layers);
 			// Forward with this epoch's weights, then backprop + SGD update.
 			match ooc.as_mut() {
 				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
@@ -893,9 +956,6 @@ impl ModelInner {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
 			}
-			let log_now = cfg.log_every > 0
-				&& !cfg.metrics.is_empty()
-				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
 			let stop_metric = if classify {
 				Metric::Accuracy
 			} else {
@@ -908,6 +968,9 @@ impl ModelInner {
 				Some(o) => o.backward(&params, &xbuf, &ybuf, &sc, self.lr, self.loss, cc_fit),
 				None => self.backward_step(&params, &xbuf, &ybuf, n, &sc),
 			}
+			// Disarm before the metric re-forward so it can't overwrite the epoch's
+			// recorded boundaries.
+			sc.set_timing(false);
 			let need_metric = want_score
 				|| (log_now && !cfg.metrics.is_empty())
 				|| (plotting && !plot_ys.is_empty());
@@ -916,6 +979,12 @@ impl ModelInner {
 					Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
 					None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
 				}
+			}
+			// ^C mid metric-forward bails the OOC sweep early: acts[last] still
+			// holds the previous weights' output and the loss line would repeat
+			// verbatim after an update. Break before computing/printing from it.
+			if INTERRUPTED.load(Ordering::SeqCst) {
+				break;
 			}
 			let out = &sc.acts[last];
 			// Per-epoch metrics ride the async copy stream and sync ONCE (no blocking
@@ -1005,6 +1074,9 @@ impl ModelInner {
 						line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
 					}
 					eprintln!("{line}");
+					if time_layers {
+						eprint!("{}", Self::roofline_block(&params, n, &sc));
+					}
 				}
 				if plotting {
 					let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
@@ -1049,7 +1121,14 @@ impl ModelInner {
 			ratatui::restore();
 		}
 		let mut ooc_end = ooc;
-		let end_score = checkpointing.then(|| {
+		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
+		// Post-update score: checkpoint saves need it, and an out-of-core fit is
+		// the ONLY place one can be computed (run()'s scoring forward may not
+		// fit), so every OOC fit computes it. Except on ^C — the OOC forward
+		// would bail on its first window and the metric would read stale
+		// mixed-epoch activations; the last per-epoch score stands instead.
+		let want_end = if ooc_end.is_some() { !was_interrupted } else { checkpointing };
+		let end_score = want_end.then(|| {
 			match ooc_end.as_mut() {
 				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
 				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
@@ -1084,33 +1163,36 @@ impl ModelInner {
 			fit_score = s;
 		}
 		self.fit_score.set(fit_score);
-		if let Some(s) = end_score {
-			let path = checkpoint_path.as_ref().expect("checkpoint path");
-			if INTERRUPTED.load(Ordering::SeqCst) {
+		if let Some(path) = checkpoint_path.as_ref() {
+			if was_interrupted {
+				// ^C save is unconditional — the weights in memory are the only
+				// copy — scored with the best available (end score for an
+				// in-VRAM fit, last per-epoch score for OOC, NaN if no epoch
+				// finished; honest, never fabricated from a bailed forward).
 				let key = self.loss.score_key();
 				recipe_infer::write_ogdl(
 					path,
-					&recipe_infer::dump_ogdl(&self.params.borrow(), None, key, s),
+					&recipe_infer::dump_ogdl(&self.params.borrow(), None, key, fit_score),
 				);
 				let full =
 					std::fs::canonicalize(path).unwrap_or_else(|_| path.as_str().into());
-				eprintln!("saved {} ({key} {s:.4})", full.display());
-			} else {
+				eprintln!("saved {} ({key} {fit_score:.4})", full.display());
+			} else if let Some(s) = end_score {
 				self.save_checkpoint(path, s);
 			}
 		}
 		if let Some(base) = hip_snap {
 			eprint!("{}", gpu_core::callspy::report_since(&base));
 		}
-		// An out-of-core fit leaves ~all of VRAM as freed pool slack with a
-		// stale verified high-water; the next allocation storm would skip the
-		// growth gate yet still map new physical out of fragmented slack (the
-		// VmHeap assert). Trim + reset so the gate stays honest.
+		// A fit leaves its scratch (~all of VRAM for an out-of-core run) as
+		// freed pool slack with a stale verified high-water; a later
+		// differently-shaped allocation storm would skip the growth gate yet
+		// still map new physical out of fragmented slack (the VmHeap assert),
+		// and every claimable-VRAM read would see the slack as gone. Trim +
+		// reset after EVERY fit so the gate and the measure stay honest.
 		drop(ooc_end);
 		drop(sc);
-		if use_ooc {
-			gpu_core::memory::pool_trim();
-		}
+		gpu_core::memory::pool_trim();
 	}
 	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();

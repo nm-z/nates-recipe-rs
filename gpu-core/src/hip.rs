@@ -181,8 +181,89 @@ pub(crate) fn disable_sdma_once() {
 
 pub fn set_device(device: i32) -> Result<(), HipError> {
 	disable_sdma_once();
+	register_fault_autopsy_once();
 	crate::callspy::tick(&crate::callspy::SET_DEVICE);
 	check(unsafe { hipSetDevice(device) })
+}
+
+/// HSA event payload for `hsa_amd_register_system_event_handler` — only the
+/// memory-fault arm is read (event_type 0 = HSA_AMD_GPU_MEMORY_FAULT_EVENT,
+/// hsa_ext_amd.h:2656/2701).
+#[repr(C)]
+struct HsaAmdEvent {
+	event_type: u32,
+	// union arm: hsa_amd_gpu_memory_fault_info_t
+	agent: u64,
+	virtual_address: u64,
+	fault_reason_mask: u32,
+}
+
+extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i32 {
+	// Runs on an HSA runtime thread right before the abort() that today only
+	// leaves a core: print the faulting VA and decoded reason so the crash
+	// names itself, then return non-success so the runtime still aborts (the
+	// queues are dead; the core stays available for deeper digs).
+	let e = unsafe { &*event };
+	if e.event_type == 0 {
+		const REASONS: [(u32, &str); 8] = [
+			(1 << 0, "page-not-present"),
+			(1 << 1, "read-only"),
+			(1 << 2, "nx"),
+			(1 << 3, "host-only"),
+			(1 << 4, "dram-ecc"),
+			(1 << 5, "imprecise"),
+			(1 << 6, "sram-ecc"),
+			(1 << 31, "hang"),
+		];
+		let mut why = String::new();
+		for (bit, name) in REASONS {
+			if e.fault_reason_mask & bit != 0 {
+				if !why.is_empty() {
+					why.push('+');
+				}
+				why.push_str(name);
+			}
+		}
+		let locate = match crate::memory::bounce_range() {
+			Some((b, len)) if (e.virtual_address as usize) >= b && (e.virtual_address as usize) < b + len => {
+				format!("INSIDE pinned h2d bounce (+0x{:x})", e.virtual_address as usize - b)
+			}
+			Some((b, _)) => format!("outside bounce (bounce base 0x{b:x})"),
+			None => "bounce not yet allocated".to_string(),
+		};
+		eprintln!(
+			"\x1b[1;31mgpu fault autopsy\x1b[0m  va=0x{:x}  reason={why}  {locate}\n{}",
+			e.virtual_address,
+			crate::memory::ledger_report(),
+		);
+		// Give the KFD SMI watchdog thread a beat to drain its event lines
+		// before the runtime aborts the process.
+		std::thread::sleep(std::time::Duration::from_millis(150));
+	}
+	1 // HSA_STATUS_ERROR — let the runtime abort as before
+}
+
+/// Register the GPU memory-fault autopsy once. Resolved via dlsym (same
+/// pattern as the vramspy hooks): the symbol lives in libhsa-runtime64,
+/// which amdhip64 loads at runtime — no new link dependency.
+pub(crate) fn register_fault_autopsy_once() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		// SAFETY: RTLD_DEFAULT + literal NUL-terminated name.
+		let sym = unsafe {
+			libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
+		};
+		if sym.is_null() {
+			return; // runtime without HSA (never on ROCm) — autopsy simply absent
+		}
+		type Register = extern "C" fn(
+			extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
+			*mut c_void,
+		) -> i32;
+		// SAFETY: sym resolved from the documented HSA entry with this signature.
+		let register = unsafe { std::mem::transmute::<*mut c_void, Register>(sym) };
+		register(fault_autopsy, std::ptr::null_mut());
+	});
 }
 
 /// Make the default stream-ordered memory pool retain freed memory instead of

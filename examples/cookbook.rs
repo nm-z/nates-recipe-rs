@@ -92,7 +92,7 @@ fn main() {
 		.epochs(20)
 		.log([Loss, Accuracy]);
 
-	for (model, data, train) 
+	for (model, data, train)
 		in [(&nn , &nn_data , &nn_train ),
 			(&cnn, &cnn_data, &cnn_train),
 			(&mlp, &mlp_data, &mlp_train),
