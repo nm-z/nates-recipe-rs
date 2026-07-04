@@ -7,6 +7,56 @@
 
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ── Saturation crash ───────────────────────────────────────────────────────
+// The saturation invariant, executable: while armed (the fit's compute loop),
+// a GPU busy reading below 100 aborts the process on the spot. No thresholds,
+// no grace windows — every stall is a hard failure until the stall is fixed.
+
+static SAT_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn busy_path() -> std::path::PathBuf {
+	for card in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+		let p = card.path().join("device/gpu_busy_percent");
+		if p.exists() {
+			return p;
+		}
+	}
+	panic!("saturation watchdog: no gpu_busy_percent under /sys/class/drm");
+}
+
+/// Arm for the duration of a compute phase. First call spawns the sampler.
+pub fn arm_saturation_crash() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	SAT_ARMED.store(true, Ordering::SeqCst);
+	ONCE.call_once(|| {
+		let path = busy_path();
+		std::thread::spawn(move || {
+			loop {
+				if SAT_ARMED.load(Ordering::SeqCst) {
+					let busy: u32 = std::fs::read_to_string(&path)
+						.unwrap_or_else(|e| panic!("saturation watchdog: read {path:?}: {e}"))
+						.trim()
+						.parse()
+						.unwrap_or_else(|e| panic!("saturation watchdog: parse busy: {e}"))
+;
+					if SAT_ARMED.load(Ordering::SeqCst) && busy < 100 {
+						eprintln!(
+							"\x1b[1;31mGPU NOT PINNED\x1b[0m  gpu_busy_percent={busy} during compute — aborting (saturation law)"
+						);
+						std::process::abort();
+					}
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			}
+		});
+	});
+}
+
+pub fn disarm_saturation_crash() {
+	SAT_ARMED.store(false, Ordering::SeqCst);
+}
 
 // _IOWR('K', 0x1F, struct kfd_ioctl_smi_events_args{u32,u32}) — kfd_ioctl.h:1735.
 const AMDKFD_IOC_SMI_EVENTS: libc::c_ulong = 0xC008_4B1F;

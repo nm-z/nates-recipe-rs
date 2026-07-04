@@ -89,14 +89,13 @@ fn main() {
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
 	let llm_train = Train::new()
-		.epochs(20)
+		.epochs(3) // TEMP fault-locator: bounded clean exits
 		.log([Loss, Accuracy]);
 
+	// TEMP fault-locator loop: LLM-only until the race is root-caused.
+	let _ = (&nn, &nn_data, &nn_train, &cnn, &cnn_data, &cnn_train, &mlp, &mlp_data, &mlp_train);
 	for (model, data, train)
-		in [(&nn , &nn_data , &nn_train ),
-			(&cnn, &cnn_data, &cnn_train),
-			(&mlp, &mlp_data, &mlp_train),
-			(&llm, &llm_data, &llm_train),]
+		in [(&llm, &llm_data, &llm_train),]
 		{ train.run((model, data)) }
 }
 

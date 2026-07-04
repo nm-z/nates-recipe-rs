@@ -932,6 +932,9 @@ impl ModelInner {
 			o
 		});
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
+		// Saturation law, executable: any sub-100% GPU reading inside the
+		// compute loop aborts the process.
+		gpu_core::hw::arm_saturation_crash();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
@@ -1113,6 +1116,7 @@ impl ModelInner {
 				}
 			}
 		}
+		gpu_core::hw::disarm_saturation_crash();
 		drop(_alloc_guard);
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
