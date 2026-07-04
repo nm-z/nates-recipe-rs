@@ -422,6 +422,31 @@ pub(crate) fn bounce_range() -> Option<(usize, usize)> {
 	(base != 0).then_some((base, BOUNCE_BYTES))
 }
 
+// Ring of the most recent allocation ranges (device pool, arena carves, pinned
+// host), so the fault autopsy can name the buffer a faulting VA lands in.
+// Entries outlive frees on purpose — a fault in a FREED range is itself the
+// diagnosis (use-after-free / reuse-before-remap).
+static RECENT_RANGES: Mutex<Vec<(usize, usize, &'static str)>> = Mutex::new(Vec::new());
+
+pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
+	if let Ok(mut r) = RECENT_RANGES.lock() {
+		if r.len() >= 256 {
+			r.remove(0);
+		}
+		r.push((base, len, what));
+	}
+}
+
+/// Name the most recent recorded allocation containing `va` (most recent wins:
+/// a reused VA should report its current life, not a prior one).
+pub(crate) fn locate_va(va: usize) -> Option<String> {
+	let r = RECENT_RANGES.lock().ok()?;
+	r.iter()
+		.rev()
+		.find(|(b, l, _)| va >= *b && va < b + l)
+		.map(|(b, l, what)| format!("{what} [base 0x{b:x} len {}] +0x{:x}", fmt_bytes(*l), va - b))
+}
+
 /// Explicitly release the pinned bounce at shutdown (exit frees ALL RAM).
 pub(crate) fn free_bounce() {
 	let mut guard = match BOUNCE.lock() {
@@ -576,6 +601,11 @@ pub(crate) fn ensure_pool_warmed() {
 		crate::hip::register_fault_autopsy_once();
 		crate::hw::spawn_thrash_watchdog();
 	});
+	// After the once-block: the keepalive's own tiny alloc would re-enter the
+	// call_once (deadlock) if spawned inside it.
+	if POOL_INIT.is_completed() {
+		crate::hw::spawn_gpu_keepalive();
+	}
 }
 
 static WARM_SKIP: AtomicBool = AtomicBool::new(false);
@@ -665,6 +695,26 @@ pub(crate) fn warm_pool() -> Result<(), HipError> {
 	crate::hip::device_synchronize()
 }
 
+/// Walk the claimable ask down from the counters' guess until a DISPOSABLE
+/// probe (spawned by the caller — a child process that attempts exactly one
+/// allocation) survives. Both counters over-report the true VmHeap ceiling
+/// and an in-process overshoot is an uncatchable `VmHeap::MapPhysMemory`
+/// abort (reproduced deterministically at LLM scale — the over-report can
+/// exceed the 1 GB band), so the ceiling is MEASURED, never assumed.
+pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<usize> {
+	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
+	while want > (1 << 30) {
+		if probe_survives(want) {
+			eprintln!("claim probe: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
+			return Some(want);
+		}
+		eprintln!("claim probe: {:.2} GB unmappable, backing off", want as f64 / (1u64 << 30) as f64);
+		want -= want / 16;
+	}
+	None
+}
+
+
 pub struct GpuBuffer {
 	pub(crate) ptr: *mut c_void,
 	len: usize,
@@ -730,6 +780,7 @@ impl GpuBuffer {
 						let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
 						tag_sub("unclaimed", aligned);
 						tag_add(tag, n_bytes);
+						note_range(ptr as usize, n_bytes, tag);
 						return Ok(Self {
 							ptr,
 							len: n_bytes,
@@ -777,28 +828,26 @@ impl GpuBuffer {
 			oom_report(n_bytes);
 		}
 		check(code)?;
-		if fresh {
-			// Pool growth returns UNCOMMITTED pages: the blit-engine H2D into one
-			// is a gfxhub fault ("page not present"), and a kernel read of one
-			// returns stale zeros. A stream-ordered memset commits every page
-			// before any later same-stream copy or kernel can touch the buffer.
-			// The memset alone is NOT enough: the growth mapping is a KFD-side
-			// page-table update ordered with no stream, and the engines race it
-			// (reproduced: gfxhub faults in the cookbook LLM fit setup with the
-			// memset in place; gone under ALLOC_SYNC). Drain the device so the
-			// mapping completes before first touch. Growth-only: reused slack
-			// committed in its prior life skips both, and AllocGuard keeps
-			// growth out of the fit loop, so the loop's blocking-op count is 0.
-			unsafe { memset_dev(ptr, 0, n_bytes, std::ptr::null_mut())? };
-			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
-			check(unsafe { hipDeviceSynchronize() })?;
-		}
+		// EVERY pool hand-out gets a commit memset + device drain — growth AND
+		// reuse. Growth returns uncommitted pages (blit H2D into one is a
+		// gfxhub fault, kernel reads see stale zeros). Reuse is NOT safe
+		// either on this driver despite retention (threshold=max): the named
+		// autopsy caught an H2D faulting 6 MB INTO a reused "data" buffer —
+		// the prior life's lazy unmap lands after the re-hand-out, exactly the
+		// disease set_pool_retain was meant to fence. The memset touches every
+		// page and the drain lets the KFD page-table update (ordered with no
+		// stream) finish before first engine touch. Setup-only cost: AllocGuard
+		// keeps all of this out of the fit loop.
+		unsafe { memset_dev(ptr, 0, n_bytes, std::ptr::null_mut())? };
+		crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
+		check(unsafe { hipDeviceSynchronize() })?;
 		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
 		if ALLOC_SYNC.load(Ordering::Relaxed) {
 			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 			check(unsafe { hipDeviceSynchronize() })?;
 		}
 		tag_add(tag, n_bytes);
+		note_range(ptr as usize, n_bytes, tag);
 		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
 		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
 		Ok(Self {

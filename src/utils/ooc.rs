@@ -95,6 +95,42 @@ fn interrupted() -> bool {
 	crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// VRAM ceiling proven by disposable probe children (the `recipe` binary's
+/// VRAM_PROBE branch): both driver counters over-report what VmHeap can
+/// physically map and an in-process overshoot is an uncatchable
+/// `VmHeap::MapPhysMemory` abort (reproduced 10/10 by SETUP_RACE fill-to-
+/// refusal), so the only trustworthy size is one a child SURVIVED claiming
+/// alongside this process's current residency.
+fn probe_verified_vram() -> usize {
+	let exe = std::env::current_exe()
+		.ok()
+		.and_then(|e| {
+			let dir = e.parent()?;
+			[dir.join("recipe"), dir.parent()?.join("recipe")]
+				.into_iter()
+				.find(|p| p.exists())
+		})
+		.unwrap_or_else(|| panic!("ooc: no `recipe` probe binary beside {:?}", std::env::current_exe()));
+	gpu_core::memory::probe_ceiling(|bytes| {
+		use std::os::unix::process::CommandExt;
+		let mut c = std::process::Command::new(&exe);
+		c.env("VRAM_PROBE", bytes.to_string());
+		// Cores off — the corpse is the signal, not a bug report.
+		unsafe {
+			c.pre_exec(|| {
+				let z = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+				libc::setrlimit(libc::RLIMIT_CORE, &z);
+				Ok(())
+			});
+		}
+		c.status().map(|s| s.success()).unwrap_or(false)
+	})
+	.unwrap_or_else(|| {
+		eprintln!("ooc: no growth band above 1 GiB survived probing");
+		0
+	})
+}
+
 fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
 	(0..n.div_ceil(c)).map(move |i| (i * c, c.min(n - i * c)))
 }
@@ -358,6 +394,10 @@ pub struct Ooc {
 	rate_d2h: f64,
 	rate_disk_r: f64,
 	rate_disk_w: f64,
+	// ONE probe-verified slab holds every VRAM-homed window as a carved view —
+	// the pool is never asked to grow near the top of the card (the gate
+	// admits asks VmHeap cannot map there; see probe_verified_vram).
+	slab: GpuBuffer,
 }
 
 /// Wall clock + cumulative transfer counters at sweep start, so the sweep line
@@ -499,6 +539,35 @@ impl Ooc {
 		let dw_partials = GpuBuffer::alloc(dwp).expect("ooc dw_partials");
 		let reduce_ws = GpuBuffer::alloc_bytes(ws).expect("ooc reduce_ws");
 
+		// The windows' VRAM share: one probe-verified slab, committed here,
+		// carved below. Probing runs with the residents above already mapped,
+		// so the child's survival proves exactly the co-mapping this process
+		// is about to hold. Walk down on a gate refusal (its measure can sit
+		// under the probe's).
+		let slab = {
+			// Reuse of retained pool slack is already-committed pages (probe-
+			// free); only the growth band needs a child's survival proof.
+			let growable = gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB);
+			let reusable = gpu_core::memory::claimable_bytes()
+				.saturating_sub(gpu_core::memory::arena_remaining())
+				.saturating_sub(growable);
+			let mut want = reusable + probe_verified_vram();
+			loop {
+				if want < (1 << 21) {
+					// VRAM genuinely full — every window waterfalls to RAM/disk.
+					break GpuBuffer::alloc(1).expect("ooc slab stub");
+				}
+				if let Some(b) = GpuBuffer::try_alloc_bytes(want) {
+					b.memset_zero(want).expect("ooc slab commit");
+					gpu_core::hip::device_synchronize().expect("ooc slab sync");
+					break b;
+				}
+				want -= want / 16;
+			}
+		};
+		let slab_bytes = if slab.len() > (1 << 21) { slab.len() } else { 0 };
+		let mut slab_off = 0usize;
+
 		// RAM accounting must be CUMULATIVE: fresh Vec pages are lazily
 		// zero-backed, so mem_available() does not drop until an epoch touches
 		// them — re-measuring per placement admits unbounded virtual memory and
@@ -521,8 +590,12 @@ impl Ooc {
 				let cnt = chunk.min(n - w * chunk);
 				let bytes = cnt * spb * 8;
 				if vram_open {
-					if let Some(b) = GpuBuffer::try_alloc_bytes(bytes) {
-						homes.push(Home::Vram(b));
+					// Carve from the committed slab — zero pool traffic; the
+					// waterfall's "fill to refusal" is now slab exhaustion.
+					let aligned = (bytes + 4095) & !4095;
+					if slab_off + aligned <= slab_bytes {
+						homes.push(Home::Vram(view(&slab, slab_off, bytes)));
+						slab_off += aligned;
 						continue;
 					}
 					vram_open = false;
@@ -612,6 +685,7 @@ impl Ooc {
 			rate_d2h,
 			rate_disk_r,
 			rate_disk_w,
+			slab,
 		}
 	}
 
@@ -1112,6 +1186,7 @@ impl Ooc {
 			rate_d2h: _,
 			rate_disk_r: _,
 			rate_disk_w: _,
+			slab: _,
 		} = self;
 		acts.iter().chain(preacts.iter().flatten()).chain([
 			a_q, a_k, a_v, a_ctx, a_dctx, a_dq, a_dk, a_dv, concat, da_a, da_b,

@@ -231,6 +231,10 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			Some((b, _)) => format!("outside bounce (bounce base 0x{b:x})"),
 			None => "bounce not yet allocated".to_string(),
 		};
+		let locate = match crate::memory::locate_va(e.virtual_address as usize) {
+			Some(hit) => format!("{locate}; {hit}"),
+			None => format!("{locate}; va in NO recorded allocation"),
+		};
 		eprintln!(
 			"\x1b[1;31mgpu fault autopsy\x1b[0m  va=0x{:x}  reason={why}  {locate}\n{}",
 			e.virtual_address,
@@ -247,23 +251,29 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 /// pattern as the vramspy hooks): the symbol lives in libhsa-runtime64,
 /// which amdhip64 loads at runtime — no new link dependency.
 pub(crate) fn register_fault_autopsy_once() {
-	static ONCE: std::sync::Once = std::sync::Once::new();
-	ONCE.call_once(|| {
-		// SAFETY: RTLD_DEFAULT + literal NUL-terminated name.
-		let sym = unsafe {
-			libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
-		};
-		if sym.is_null() {
-			return; // runtime without HSA (never on ROCm) — autopsy simply absent
-		}
-		type Register = extern "C" fn(
-			extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
-			*mut c_void,
-		) -> i32;
-		// SAFETY: sym resolved from the documented HSA entry with this signature.
-		let register = unsafe { std::mem::transmute::<*mut c_void, Register>(sym) };
-		register(fault_autopsy, std::ptr::null_mut());
-	});
+	use std::sync::atomic::{AtomicBool, Ordering};
+	// Success-latched, not Once: a call before HSA is initialized fails with a
+	// status (observed via set_device pre-init) and must retry at pool warm.
+	static REGISTERED: AtomicBool = AtomicBool::new(false);
+	if REGISTERED.load(Ordering::Relaxed) {
+		return;
+	}
+	// SAFETY: RTLD_DEFAULT + literal NUL-terminated name.
+	let sym = unsafe {
+		libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
+	};
+	if sym.is_null() {
+		return; // runtime without HSA (never on ROCm) — autopsy simply absent
+	}
+	type Register = extern "C" fn(
+		extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
+		*mut c_void,
+	) -> i32;
+	// SAFETY: sym resolved from the documented HSA entry with this signature.
+	let register = unsafe { std::mem::transmute::<*mut c_void, Register>(sym) };
+	if register(fault_autopsy, std::ptr::null_mut()) == 0 {
+		REGISTERED.store(true, Ordering::Relaxed);
+	}
 }
 
 /// Make the default stream-ordered memory pool retain freed memory instead of
@@ -367,6 +377,7 @@ pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 	let mut ptr: *mut c_void = std::ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::HOST_MALLOC);
 	check(unsafe { hipHostMalloc(&mut ptr, size, flags) })?;
+	crate::memory::note_range(ptr as usize, size, "pinned-host");
 	Ok(ptr)
 }
 
