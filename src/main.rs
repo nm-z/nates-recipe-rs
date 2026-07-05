@@ -63,6 +63,26 @@ fn main() -> Result<()> {
 		std::process::exit(1);
 	}
 
+	// recipe serve [--port N] — headless RPC node. STORE/FETCH/STAT are live as
+	// the remote-storage tier; compute runners (MOE_FFN) register into the same
+	// map once the gemma expert path is wired. No device init on a storage node.
+	if args[1] == "serve" {
+		let mut port = recipe::wire::PORT;
+		let mut i = 2;
+		while i < args.len() {
+			if args[i] == "--port" {
+				port = args[i + 1].parse().expect("--port parse");
+				i += 2;
+			} else {
+				i += 1;
+			}
+		}
+		let info = recipe::wire::NodeInfo::probe();
+		let runners = std::collections::HashMap::new();
+		recipe::wire::Server::new(info, runners).serve(&format!("0.0.0.0:{port}"))?;
+		return Ok(());
+	}
+
 	gpu_core::hip::set_device(0)?;
 
 	if args[1] == "detect" {
