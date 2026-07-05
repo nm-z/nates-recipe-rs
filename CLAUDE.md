@@ -35,7 +35,7 @@ cargo run --release --example train_detector   # retrains → pantry/detector.og
 cargo run --release --example gemma4 -- "prompt"  # gemma-26B f64 inference
 ```
 
-ROCm default `/opt/rocm` (symlink to ~/.rocm-install/rocm); overrides: `ROCM_PATH`, `GPU_ARCH` (default gfx1101), `HIPCC`. Datasets live in `datasets/` (gitignored). Edit examples and `/home/nate/Desktop/train.rs` in place — every new crate target or new -Zscript file triggers a full ~15-min rebuild.
+ROCm default `/opt/rocm` (symlink to ~/.rocm-install/rocm); overrides: `ROCM_PATH`, `GPU_ARCH` (default gfx1101), `HIPCC`. Datasets live in `datasets/` — tracked via **Git LFS** (`.gitattributes`: `datasets/** filter=lfs`), not gitignored. A fresh `git clone` smudges ~3.3 GiB of dataset blobs; a compute/serve node that only needs source can skip them with `GIT_LFS_SKIP_SMUDGE=1 git clone/pull` (leaves LFS pointer files, ~110 MB tree). Edit examples and `/home/nate/Desktop/train.rs` in place — every new crate target or new -Zscript file triggers a full ~15-min rebuild.
 
 ## User API
 
