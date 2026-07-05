@@ -102,6 +102,7 @@ train.save(());               // SavePath: () = "model.ogdl" (Rust can't overloa
 ## Hardware & Environment
 
 - Ryzen 5 7600X (6c/12t), **RX 7700 XT gfx1101** (RDNA3, 54 CU, 12GB): f64 peak **1.099 TFLOP/s** (1/16 rate — hard floor), memory BW **432 GB/s**, ridge ≈2.54 FLOP/byte. Arch Linux; ROCm 7.2.x via pacman; hipcc → `/opt/rocm/bin/amdclang++ -x hip --rocm-path=/opt/rocm`. GPU busy: `/sys/class/drm/card1/device/gpu_busy_percent`. Root partition is tight; home has space (build targets are 16GB+).
+- Remote boxes reachable via ssh-config aliases (no IPs in this file): `ssh archy` — Precision Tower 5810, Xeon E5-2620 v3 (12t), 24GB RAM, 4× Tesla M60 + Radeon 540, Arch. `ssh sentry` — Precision Tower 7810, Xeon E5-2643 v4 (24t), 32GB RAM, Radeon Pro V340 (MI25×2), Arch. Quick check: `ssh <host> 'neofetch'`.
 - Original Python AutoML reference: `/tmp/nates_recipe-V2/`. CPU gemma exploration engine: `~/Desktop/gemma4/rustgemma/` (f32/gguf, exploration only — the GPU path is safetensors→f64; don't run external reference binaries like llama-cli).
 - `nates-gpu-ruby` is workspace-excluded: build with `--manifest-path nates-gpu-ruby/Cargo.toml`, `touch` edited gpu-core sources first, confirm `Compiling gpu-core` in output. Load from Ruby via the `nates_gpu.so` named symlink (entry symbol lookup requires that name).
 
