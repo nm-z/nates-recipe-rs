@@ -932,8 +932,8 @@ impl ModelInner {
 			o
 		});
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
-		// Saturation law, executable: any sub-100% GPU reading inside the
-		// compute loop aborts the process.
+		// Saturation law, executable: the GPU must hit 100% at least once in
+		// every 5s window of the compute loop or the process aborts.
 		gpu_core::hw::arm_saturation_crash();
 		INTERRUPTED.store(false, Ordering::SeqCst);
 		unsafe {

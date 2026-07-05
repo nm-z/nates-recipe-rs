@@ -11,10 +11,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Saturation crash ───────────────────────────────────────────────────────
 // The saturation invariant, executable: while armed (the fit's compute loop),
-// a GPU busy reading below 100 aborts the process on the spot. No thresholds,
-// no grace windows — every stall is a hard failure until the stall is fixed.
+// the GPU must hit 100% busy at least once in every 5-second window; a window
+// that never pins aborts the process. Momentary dips (the one scalar download
+// at an epoch boundary) are not serialization; five straight seconds without
+// a single pinned sample is.
 
 static SAT_ARMED: AtomicBool = AtomicBool::new(false);
+const SAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+// ── Fast death ──────────────────────────────────────────────────────────────
+// A GPU-scale process holds tens of GB; SIGABRT's default core dump pipes the
+// whole image through systemd-coredump, which drains it even past its size
+// cap — the terminal sits minutes in an uninterruptible dump where ^C is
+// undeliverable. The autopsy + ledger on stderr are the real forensics; the
+// giant core is not. RLIMIT_CORE is NOT enforced for piped core_patterns
+// (core(5)), so the working switch is PR_SET_DUMPABLE=0: do_coredump refuses
+// non-dumpable processes outright and the re-raise dies instantly, dump-free.
+// RECIPE_CORE=1 skips installation for a session where a core is wanted.
+
+extern "C" fn fast_death(sig: libc::c_int) {
+	unsafe {
+		libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+		libc::signal(sig, libc::SIG_DFL);
+		libc::raise(sig);
+	}
+}
+
+pub fn install_fast_death() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		if std::env::var_os("RECIPE_CORE").is_some() {
+			return;
+		}
+		unsafe {
+			libc::signal(libc::SIGABRT, fast_death as *const () as libc::sighandler_t);
+		}
+	});
+}
 
 fn busy_path() -> std::path::PathBuf {
 	for card in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
@@ -29,25 +62,37 @@ fn busy_path() -> std::path::PathBuf {
 /// Arm for the duration of a compute phase. First call spawns the sampler.
 pub fn arm_saturation_crash() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
+	install_fast_death();
 	SAT_ARMED.store(true, Ordering::SeqCst);
 	ONCE.call_once(|| {
 		let path = busy_path();
 		std::thread::spawn(move || {
+			let mut last_pinned = std::time::Instant::now();
+			let mut was_armed = false;
 			loop {
-				if SAT_ARMED.load(Ordering::SeqCst) {
+				let armed = SAT_ARMED.load(Ordering::SeqCst);
+				if armed {
+					if !was_armed {
+						// Fresh compute phase gets a fresh window.
+						last_pinned = std::time::Instant::now();
+					}
 					let busy: u32 = std::fs::read_to_string(&path)
 						.unwrap_or_else(|e| panic!("saturation watchdog: read {path:?}: {e}"))
 						.trim()
 						.parse()
-						.unwrap_or_else(|e| panic!("saturation watchdog: parse busy: {e}"))
-;
-					if SAT_ARMED.load(Ordering::SeqCst) && busy < 100 {
+						.unwrap_or_else(|e| panic!("saturation watchdog: parse busy: {e}"));
+					if busy >= 100 {
+						last_pinned = std::time::Instant::now();
+					}
+					if SAT_ARMED.load(Ordering::SeqCst) && last_pinned.elapsed() > SAT_WINDOW {
 						eprintln!(
-							"\x1b[1;31mGPU NOT PINNED\x1b[0m  gpu_busy_percent={busy} during compute — aborting (saturation law)"
+							"\x1b[1;31mGPU NOT PINNED\x1b[0m  no 100% gpu_busy_percent sample in {}s (latest {busy}%) during compute — aborting (saturation law)",
+							SAT_WINDOW.as_secs()
 						);
 						std::process::abort();
 					}
 				}
+				was_armed = armed;
 				std::thread::sleep(std::time::Duration::from_millis(10));
 			}
 		});

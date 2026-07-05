@@ -182,6 +182,7 @@ pub(crate) fn disable_sdma_once() {
 pub fn set_device(device: i32) -> Result<(), HipError> {
 	disable_sdma_once();
 	register_fault_autopsy_once();
+	crate::hw::install_fast_death();
 	crate::callspy::tick(&crate::callspy::SET_DEVICE);
 	check(unsafe { hipSetDevice(device) })
 }
