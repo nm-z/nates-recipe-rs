@@ -1,0 +1,14 @@
+[Unit]
+Description=recipe wire daemon (RPC node + discovery beacon, port 7845)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nate
+ExecStart=/usr/local/bin/recipe serve
+Environment=LD_LIBRARY_PATH=/home/nate/rocm-libs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

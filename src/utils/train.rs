@@ -687,7 +687,7 @@ impl ModelInner {
 			flip = !flip;
 		}
 	}
-	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
+	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let rerun = !self.params.borrow().is_empty();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
@@ -927,7 +927,7 @@ impl ModelInner {
 		};
 		let mut ooc = use_ooc.then(|| {
 			let _t_scratch = gpu_core::memory::tag_scope("waterfall");
-			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)));
+			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone());
 			o.report();
 			o
 		});

@@ -38,6 +38,7 @@ fn main() {
 		.target("Churn");
 	let nn_train = Train::new()
 		.epochs(20)
+		.net(["archy", "sentry"])
 		.log([Loss, Accuracy]);
 
 	let cnn = Model::new()            // CNN
@@ -57,6 +58,7 @@ fn main() {
 		.target("label");
 	let cnn_train = Train::new()
 		.epochs(20)
+		.net(["archy", "sentry"])
 		.log([Loss, Accuracy]);
 
 	let mlp = Model::new()          // MLP
@@ -74,8 +76,8 @@ fn main() {
 		.target("SalePrice");
 	let mlp_train = Train::new()
 		.epochs(20)
+		.net(["archy", "sentry"])
 		.log([Loss, R2, hip]);
-
 	let llm = Model::new()          // LLM
 		.loss(ce)
 		.layer(embed(16))
@@ -90,6 +92,7 @@ fn main() {
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
 	let llm_train = Train::new()
 		.epochs(20)
+		.net(["archy", "sentry"])
 		.log([Loss, Accuracy]);
 
 	for (model, data, train)

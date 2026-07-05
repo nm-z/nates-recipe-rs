@@ -226,6 +226,7 @@ pub struct Train {
 	pub(crate) metrics: Vec<Metric>,
 	pub(crate) plot: Vec<Metric>,
 	pub(crate) resume: Option<String>,
+	pub(crate) net: Option<crate::wire::Net>,
 	last: RefCell<LastRun>,
 }
 
@@ -237,6 +238,7 @@ impl Train {
 			metrics: Vec::new(),
 			plot: Vec::new(),
 			resume: None,
+			net: None,
 			last: RefCell::new(LastRun::default()),
 		}
 	}
@@ -282,6 +284,20 @@ impl Train {
 	/// `model.ogdl` in the cwd; `.resume("custom.ogdl")` uses an explicit path.
 	pub fn resume(mut self, path: impl SavePath) -> Train {
 		self.resume = Some(path.or_default());
+		self
+	}
+
+	/// Pool remote machines into the run: `.net(["archy", "sentry"])`. Names are
+	/// hostnames — resolved through this machine's own daemon's peer registry
+	/// (eth before wlan), falling back to ssh config. Remote RAM joins the
+	/// waterfall as the tier below local disk; a named node that can't be
+	/// reached fails the run loudly at start.
+	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Train {
+		let mut net = crate::wire::Net::new();
+		for alias in nodes {
+			net = net.node(alias);
+		}
+		self.net = Some(net);
 		self
 	}
 
@@ -335,14 +351,31 @@ impl Train {
 		};
 		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
-		let issues = preflight(model, ds, forward_only);
+		// Pool the named nodes before preflight so the remote-RAM tier counts
+		// toward the combined ceiling. A named node that can't be reached fails
+		// the run loudly here — a pooled run with a missing member is a bug.
+		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = self.net.as_ref().map(|net| {
+			let cs = net.connect().unwrap_or_else(|e| panic!("net: {e}"));
+			for c in &cs {
+				eprintln!(
+					"\x1b[33mnet\x1b[0m  pooled {} ({} RAM)",
+					c.info.arch,
+					crate::data::human_bytes(c.info.ram as usize),
+				);
+			}
+			std::sync::Arc::new(cs)
+		});
+		let net_ram: usize = conns.as_ref().map_or(0, |cs| {
+			cs.iter().map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB)).sum()
+		});
+		let issues = preflight(model, ds, forward_only, net_ram);
 		if !issues.is_empty() && !confirm_issues(&issues) {
 			eprintln!("\x1b[33maborted\x1b[0m");
 			return;
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
-			model.fit(ds, self, resume.as_deref());
+			model.fit(ds, self, resume.as_deref(), conns);
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
 			}
@@ -628,7 +661,7 @@ struct Issue {
 	need: String,
 }
 
-fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool) -> Vec<Issue> {
+fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool, net_ram: usize) -> Vec<Issue> {
 	let mut issues = Vec::new();
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
@@ -695,10 +728,15 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool) -> Vec<Issue>
 		// issue while the COMBINED ceiling holds — announce the tier plan and
 		// proceed. Inference has no streaming path yet; either mode aborts only
 		// when even the combined ceiling is exceeded.
-		match (forward_only, crate::ooc::plan(need)) {
+		match (forward_only, crate::ooc::plan(need, net_ram)) {
 			(false, Some(p)) => {
+				let net_part = if p.remote > 0 {
+					format!(" + NET {}", crate::data::human_bytes(p.remote))
+				} else {
+					String::new()
+				};
 				eprintln!(
-					"\x1b[33mwaterfall\x1b[0m  scratch {} → VRAM {} + RAM {} + DISK {}",
+					"\x1b[33mwaterfall\x1b[0m  scratch {} → VRAM {} + RAM {} + DISK {}{net_part}",
 					crate::data::human_bytes(need),
 					crate::data::human_bytes(p.vram),
 					crate::data::human_bytes(p.ram),

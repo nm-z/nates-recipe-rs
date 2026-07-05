@@ -24,6 +24,12 @@ pub const MAGIC: u32 = 0x5243_5031; // "RCP1"
 pub const PORT: u16 = 7845;
 const HDR: usize = 32;
 
+// ── discovery protocol constants ─────────────────────────────────────────────
+const BEACON_MAGIC: u32 = 0x5243_5042; // "RCPB", UDP beacon on the same port
+const BEACON_SECS: u64 = 2;
+const STALE_MS: u128 = 3 * BEACON_SECS as u128 * 1000;
+const CONNECT_TIMEOUT_SECS: u64 = 2;
+
 // fn_id values carried in `tag` for RUN. Registered handlers key off these.
 pub const FN_MOE_FFN: u16 = 1;
 
@@ -37,6 +43,8 @@ pub enum Op {
 	Stat = 5,
 	Reply = 6,
 	Err = 7,
+	Peers = 8,
+	Free = 9,
 }
 
 impl Op {
@@ -49,6 +57,8 @@ impl Op {
 			5 => Op::Stat,
 			6 => Op::Reply,
 			7 => Op::Err,
+			8 => Op::Peers,
+			9 => Op::Free,
 			_ => bail!("wire: bad op byte {b}"),
 		})
 	}
@@ -69,22 +79,26 @@ impl Frame {
 	}
 }
 
-fn write_frame(s: &mut TcpStream, f: &Frame) -> Result<()> {
+fn write_frame_raw(s: &mut TcpStream, op: Op, flags: u8, tag: u16, seq: u32, id: u64, data: &[u8]) -> Result<()> {
 	let mut h = [0u8; HDR];
 	h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-	h[4] = f.op as u8;
-	h[5] = f.flags;
-	h[6..8].copy_from_slice(&f.tag.to_le_bytes());
-	h[8..12].copy_from_slice(&f.seq.to_le_bytes());
-	h[12..20].copy_from_slice(&f.id.to_le_bytes());
-	h[20..28].copy_from_slice(&(f.data.len() as u64).to_le_bytes());
+	h[4] = op as u8;
+	h[5] = flags;
+	h[6..8].copy_from_slice(&tag.to_le_bytes());
+	h[8..12].copy_from_slice(&seq.to_le_bytes());
+	h[12..20].copy_from_slice(&id.to_le_bytes());
+	h[20..28].copy_from_slice(&(data.len() as u64).to_le_bytes());
 	// one syscall for the small frames; payload follows uncopied
 	s.write_all(&h)?;
-	if !f.data.is_empty() {
-		s.write_all(&f.data)?;
+	if !data.is_empty() {
+		s.write_all(data)?;
 	}
 	s.flush()?;
 	Ok(())
+}
+
+fn write_frame(s: &mut TcpStream, f: &Frame) -> Result<()> {
+	write_frame_raw(s, f.op, f.flags, f.tag, f.seq, f.id, &f.data)
 }
 
 fn read_frame(s: &mut TcpStream) -> Result<Frame> {
@@ -148,6 +162,191 @@ fn mem_available() -> u64 {
 	0
 }
 
+// ── discovery ────────────────────────────────────────────────────────────────
+// Every daemon broadcasts a beacon per up interface every BEACON_SECS and
+// accumulates every beacon it hears into a peer table; running `recipe serve`
+// IS the registration. A client asks its OWN local daemon (PEERS) for the
+// network view — symmetric, no hierarchy, no coordinator role in the protocol.
+// Beacons go out tagged eth/wlan; a dead cable drops IFF_RUNNING, its beacons
+// stop, receivers age the address out — eth-preferred with wlan fallback needs
+// no special-casing beyond preference order at connect.
+
+fn hostname() -> String {
+	std::fs::read_to_string("/proc/sys/kernel/hostname")
+		.map(|s| s.trim().to_string())
+		.unwrap_or_default()
+}
+
+struct Iface {
+	ip: std::net::Ipv4Addr,
+	bcast: std::net::Ipv4Addr,
+	wireless: bool,
+}
+
+// Up+running non-loopback IPv4 interfaces with their directed broadcast addr.
+fn ifaces() -> Vec<Iface> {
+	let mut out = Vec::new();
+	unsafe {
+		let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+		if libc::getifaddrs(&mut ifap) != 0 {
+			return out;
+		}
+		let mut p = ifap;
+		while !p.is_null() {
+			let a = &*p;
+			let up = a.ifa_flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32
+				== (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+			let lo = a.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
+			if up && !lo && !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET {
+				let sin = &*(a.ifa_addr as *const libc::sockaddr_in);
+				let ip = u32::from_be(sin.sin_addr.s_addr);
+				let mask = if a.ifa_netmask.is_null() {
+					0
+				} else {
+					u32::from_be((*(a.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr)
+				};
+				let name = std::ffi::CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
+				let wireless = std::path::Path::new(&format!("/sys/class/net/{name}/wireless")).exists();
+				out.push(Iface {
+					ip: std::net::Ipv4Addr::from(ip),
+					bcast: std::net::Ipv4Addr::from(ip | !mask),
+					wireless,
+				});
+			}
+			p = a.ifa_next;
+		}
+		libc::freeifaddrs(ifap);
+	}
+	out
+}
+
+// kind → (reachable "ip:port", last heard)
+struct PeerRec {
+	info: NodeInfo,
+	addrs: HashMap<String, (String, std::time::Instant)>,
+}
+
+type Registry = Arc<Mutex<HashMap<String, PeerRec>>>;
+
+fn beacon_loop(port: u16) {
+	let host = hostname();
+	loop {
+		let info = NodeInfo::probe();
+		for i in ifaces() {
+			let Ok(s) = std::net::UdpSocket::bind((i.ip, 0)) else { continue };
+			let _ = s.set_broadcast(true);
+			let kind = if i.wireless { "wlan" } else { "eth" };
+			let mut buf = BEACON_MAGIC.to_le_bytes().to_vec();
+			buf.extend_from_slice(
+				format!("{host}\n{kind}\n{port}\n{}", String::from_utf8_lossy(&info.encode()))
+					.as_bytes(),
+			);
+			let _ = s.send_to(&buf, (i.bcast, PORT));
+		}
+		thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
+	}
+}
+
+fn listen_loop(reg: Registry) {
+	let sock = match std::net::UdpSocket::bind(("0.0.0.0", PORT)) {
+		Ok(s) => s,
+		Err(e) => {
+			eprintln!("recipe serve: discovery listener bind failed: {e}");
+			return;
+		}
+	};
+	let own = hostname();
+	let mut buf = [0u8; 512];
+	loop {
+		let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+		if n < 4 || buf[0..4] != BEACON_MAGIC.to_le_bytes() {
+			continue;
+		}
+		let Ok(text) = std::str::from_utf8(&buf[4..n]) else { continue };
+		let mut it = text.splitn(4, '\n');
+		let (Some(host), Some(kind), Some(port)) = (it.next(), it.next(), it.next()) else {
+			continue;
+		};
+		if host == own || host.is_empty() {
+			continue;
+		}
+		let Ok(info) = NodeInfo::decode(it.next().unwrap_or("").as_bytes()) else { continue };
+		let addr = format!("{}:{}", from.ip(), port);
+		if let Ok(mut g) = reg.lock() {
+			let rec = g
+				.entry(host.to_string())
+				.or_insert_with(|| PeerRec { info: info.clone(), addrs: HashMap::new() });
+			rec.info = info;
+			rec.addrs.insert(kind.to_string(), (addr, std::time::Instant::now()));
+		}
+	}
+}
+
+// PEERS reply: one peer per line, live addrs eth-first:
+//   host \t kind=ip:port@age_ms,... \t arch \t gpus \t vram \t ram
+fn encode_peers(reg: &Registry) -> Result<Vec<u8>> {
+	let g = reg.lock().map_err(|_| anyhow::anyhow!("wire: registry poisoned"))?;
+	let mut lines = Vec::new();
+	for (host, rec) in g.iter() {
+		let mut addrs: Vec<_> = rec
+			.addrs
+			.iter()
+			.map(|(k, (a, t))| (k.clone(), a.clone(), t.elapsed().as_millis()))
+			.collect();
+		addrs.sort_by_key(|(k, _, _)| k != "eth");
+		let addrs =
+			addrs.iter().map(|(k, a, ms)| format!("{k}={a}@{ms}")).collect::<Vec<_>>().join(",");
+		lines.push(format!(
+			"{host}\t{addrs}\t{}\t{}\t{}\t{}",
+			rec.info.arch, rec.info.gpus, rec.info.vram, rec.info.ram
+		));
+	}
+	Ok(lines.join("\n").into_bytes())
+}
+
+// A peer as seen from the local daemon's registry: live addrs in
+// preference order (eth before wlan, stale dropped).
+#[derive(Clone, Debug)]
+pub struct PeerEntry {
+	pub host: String,
+	pub addrs: Vec<String>,
+	pub info: NodeInfo,
+}
+
+fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
+	let mut out = Vec::new();
+	for line in String::from_utf8_lossy(b).lines() {
+		let f: Vec<&str> = line.split('\t').collect();
+		if f.len() != 6 {
+			continue;
+		}
+		let addrs: Vec<String> = f[1]
+			.split(',')
+			.filter_map(|e| {
+				let (kv, age) = e.rsplit_once('@')?;
+				let (_, addr) = kv.split_once('=')?;
+				(age.parse::<u128>().ok()? < STALE_MS).then(|| addr.to_string())
+			})
+			.collect();
+		let info = NodeInfo {
+			arch: f[2].to_string(),
+			gpus: f[3].parse().unwrap_or(0),
+			vram: f[4].parse().unwrap_or(0),
+			ram: f[5].parse().unwrap_or(0),
+		};
+		if !addrs.is_empty() {
+			out.push(PeerEntry { host: f[0].to_string(), addrs, info });
+		}
+	}
+	out
+}
+
+// Ask this machine's own daemon for the network view.
+pub fn local_peers() -> Result<Vec<PeerEntry>> {
+	let c = Conn::connect(&format!("127.0.0.1:{PORT}"))?;
+	Ok(decode_peers(&c.call(Op::Peers, 0, 0, Vec::new())?.data))
+}
+
 // ── client connection ───────────────────────────────────────────────────────
 // One TCP connection per node. A dedicated reader thread parses replies and
 // routes each to the waiter registered under its seq, so RUN frames pipeline:
@@ -161,7 +360,13 @@ pub struct Conn {
 
 impl Conn {
 	pub fn connect(addr: &str) -> Result<Conn> {
-		let stream = TcpStream::connect(addr)?;
+		use std::net::ToSocketAddrs;
+		let sa = addr
+			.to_socket_addrs()?
+			.next()
+			.ok_or_else(|| anyhow::anyhow!("wire: {addr} resolves to nothing"))?;
+		let stream =
+			TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
 		stream.set_nodelay(true)?;
 		let reader = stream.try_clone()?;
 		let pending: Arc<Mutex<HashMap<u32, Sender<Frame>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -217,6 +422,25 @@ impl Conn {
 	pub fn store(&self, id: u64, bytes: Vec<u8>) -> Result<()> {
 		self.call(Op::Store, 0, id, bytes).map(|_| ())
 	}
+	/// Store borrowing the payload — ooc write-behind lanes reuse pooled window
+	/// buffers and must not clone a window per STORE.
+	pub fn store_from(&self, id: u64, data: &[u8]) -> Result<()> {
+		let seq = self.next_seq()?;
+		let (tx, rx) = channel();
+		self.pending
+			.lock()
+			.map_err(|_| anyhow::anyhow!("wire: pending poisoned"))?
+			.insert(seq, tx);
+		{
+			let mut s = self.wr.lock().map_err(|_| anyhow::anyhow!("wire: writer poisoned"))?;
+			write_frame_raw(&mut s, Op::Store, 0, 0, seq, id, data)?;
+		}
+		let f = rx.recv()?;
+		if f.op == Op::Err {
+			bail!("wire: remote error: {}", String::from_utf8_lossy(&f.data));
+		}
+		Ok(())
+	}
 	pub fn run(&self, fn_id: u16, id: u64, payload: Vec<u8>) -> Result<Receiver<Frame>> {
 		self.send(Op::Run, fn_id, id, payload)
 	}
@@ -225,6 +449,9 @@ impl Conn {
 		p.extend_from_slice(&off.to_le_bytes());
 		p.extend_from_slice(&len.to_le_bytes());
 		Ok(self.call(Op::Fetch, 0, id, p)?.data)
+	}
+	pub fn free(&self, id: u64) -> Result<()> {
+		self.call(Op::Free, 0, id, Vec::new()).map(|_| ())
 	}
 	pub fn stat(&self) -> Result<String> {
 		Ok(String::from_utf8_lossy(&self.call(Op::Stat, 0, 0, Vec::new())?.data).into_owned())
@@ -244,16 +471,31 @@ pub struct Server {
 	info: NodeInfo,
 	store: Store,
 	runners: Arc<HashMap<u16, RunFn>>,
+	reg: Registry,
 }
 
 impl Server {
 	pub fn new(info: NodeInfo, runners: HashMap<u16, RunFn>) -> Server {
-		Server { info, store: Arc::new(Mutex::new(HashMap::new())), runners: Arc::new(runners) }
+		Server {
+			info,
+			store: Arc::new(Mutex::new(HashMap::new())),
+			runners: Arc::new(runners),
+			reg: Arc::new(Mutex::new(HashMap::new())),
+		}
 	}
 
 	pub fn serve(self, addr: &str) -> Result<()> {
 		let listener = TcpListener::bind(addr)?;
-		eprintln!("recipe serve: {} on {addr} (ram {} MiB)", self.info.arch, self.info.ram >> 20);
+		let port = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(PORT);
+		thread::spawn(move || beacon_loop(port));
+		let reg = Arc::clone(&self.reg);
+		thread::spawn(move || listen_loop(reg));
+		eprintln!(
+			"recipe serve: {} ({}) on {addr} (ram {} MiB)",
+			self.info.arch,
+			hostname(),
+			self.info.ram >> 20
+		);
 		for stream in listener.incoming() {
 			let stream = stream?;
 			let srv = self.clone();
@@ -315,6 +557,14 @@ impl Server {
 				Ok(format!("{}: {} blobs, {} MiB stored", self.info.arch, g.len(), bytes >> 20)
 					.into_bytes())
 			}
+			Op::Peers => encode_peers(&self.reg),
+			Op::Free => {
+				self.store
+					.lock()
+					.map_err(|_| anyhow::anyhow!("wire: store poisoned"))?
+					.remove(&f.id);
+				Ok(Vec::new())
+			}
 			other => bail!("wire: server got client-only op {other:?}"),
 		}
 	}
@@ -346,19 +596,53 @@ impl Net {
 	// HELLO every node; a node that fails to answer fails the run loudly (no
 	// silent drop — a distributed run with a missing member is a bug).
 	pub fn connect(&self) -> Result<Vec<Conn>> {
-		self.nodes
-			.iter()
-			.map(|n| {
-				let addr = resolve(n)?;
-				Conn::connect(&addr).map_err(|e| anyhow::anyhow!("node {n} ({addr}): {e}"))
-			})
-			.collect()
+		let peers = local_peers().unwrap_or_default();
+		self.nodes.iter().map(|n| connect_first(n, &candidates(n, &peers)?)).collect()
 	}
+
+	// Every live peer the local daemon has heard — the whole network, no list.
+	pub fn all() -> Result<Vec<Conn>> {
+		let peers = local_peers()
+			.map_err(|e| anyhow::anyhow!("wire: no local daemon for discovery (recipe serve): {e}"))?;
+		if peers.is_empty() {
+			bail!("wire: local daemon hears no peers");
+		}
+		peers.iter().map(|p| connect_first(&p.host, &p.addrs)).collect()
+	}
+}
+
+fn connect_first(name: &str, addrs: &[String]) -> Result<Conn> {
+	let mut errs = Vec::new();
+	for a in addrs {
+		match Conn::connect(a) {
+			Ok(c) => return Ok(c),
+			Err(e) => errs.push(format!("{a}: {e}")),
+		}
+	}
+	bail!("node {name}: no address reachable [{}]", errs.join("; "))
 }
 
 #[cfg(test)]
 mod tests {
       use super::*;
+
+      // Live pooled train: scratch overflows VRAM+RAM into the remote-RAM tier.
+      // Run from a tiny-cwd (tmpfs) so the disk tier is zero and windows go
+      // remote; the dataset path is absolute for exactly that reason:
+      //   cd <tmpfs> && <repo>/target/release/deps/recipe-<hash> --ignored net_pool_ooc
+      #[test]
+      #[ignore]
+      fn net_pool_ooc() {
+            let data = crate::Data::load()
+                  .set("/home/nate/Desktop/nates-recipe-rs/datasets/playground-series-s6e3/train.csv")
+                  .split(0.8)
+                  .exclude("id")
+                  .target("Churn");
+            let model =
+                  crate::Model::new().loss(crate::bce).layer(3000).leak().layer(1).sigmoid().lr(0.001);
+            let train = crate::Train::new().epochs(1).net(["archy", "sentry"]).log([crate::Loss]);
+            train.run((&model, &data));
+      }
 
       // Live-network round-trip: needs `recipe serve` running on archy and sentry.
       // cargo test -p recipe --release wire_remotes -- --ignored --nocapture
@@ -416,18 +700,36 @@ mod tests {
       }
 }
 
-fn resolve(alias: &str) -> Result<String> {
+// Addresses to try for an alias. The ssh config is THE naming layer, enforced:
+// every alias must map to a HostName in ~/.ssh/config with keys set up — the
+// exact contract that makes `ssh archy` trivial is what makes `.net(["archy"])`
+// work, and there is no second registry to keep in sync. The daemon's peer
+// table then upgrades that one address to the live set (eth before wlan) when
+// a heard beacon matches, so eth preference and wlan fallback ride on top.
+fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 	if alias.contains(':') {
-		return Ok(alias.to_string());
+		return Ok(vec![alias.to_string()]);
 	}
-	// `ssh -G <alias>` prints the effective config; take its hostname line.
-	let out = std::process::Command::new("ssh").args(["-G", alias]).output()?;
-	let text = String::from_utf8_lossy(&out.stdout);
+	let ssh = std::process::Command::new("ssh").args(["-G", alias]).output()?;
+	let text = String::from_utf8_lossy(&ssh.stdout);
 	let host = text
 		.lines()
 		.find_map(|l| l.strip_prefix("hostname "))
 		.map(str::trim)
 		.filter(|h| !h.is_empty())
 		.unwrap_or(alias);
-	Ok(format!("{host}:{PORT}"))
+	if host == alias {
+		bail!(
+			"wire: '{alias}' is not an ssh alias — add to ~/.ssh/config:\n  Host {alias}\n      HostName <address>\nwith keys so `ssh {alias}` works, then retry"
+		);
+	}
+	let ssh_addr = format!("{host}:{PORT}");
+	if let Some(p) = peers.iter().find(|p| p.host == alias || p.addrs.contains(&ssh_addr)) {
+		let mut out = p.addrs.clone();
+		if !out.contains(&ssh_addr) {
+			out.push(ssh_addr);
+		}
+		return Ok(out);
+	}
+	Ok(vec![ssh_addr])
 }

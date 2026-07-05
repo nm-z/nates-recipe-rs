@@ -83,6 +83,20 @@ fn main() -> Result<()> {
 		return Ok(());
 	}
 
+	// recipe peers — the live network view from this machine's own daemon.
+	if args[1] == "peers" {
+		for p in recipe::wire::local_peers()? {
+			println!(
+				"{}\t{}\t{} MiB ram\t{}",
+				p.host,
+				p.addrs.join(","),
+				p.info.ram >> 20,
+				p.info.arch
+			);
+		}
+		return Ok(());
+	}
+
 	gpu_core::hip::set_device(0)?;
 
 	if args[1] == "detect" {

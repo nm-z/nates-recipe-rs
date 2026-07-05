@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 // roofline (PCIe H2D/D2H deltas come from the gpu-core ledger).
 static DISK_R_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
+static NET_R_BYTES: AtomicUsize = AtomicUsize::new(0);
+static NET_W_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Fixed pool of host window buffers, preallocated and page-touched at build.
 /// Every transient host byte this path moves (read-ahead, sync reads, the
@@ -139,6 +141,7 @@ enum Home {
 	Vram(GpuBuffer),
 	Ram(Vec<u8>),
 	Disk(u64), // byte offset in the shared spill file
+	Remote { node: usize, id: u64 }, // blob on net[node] — the tier below disk
 }
 
 /// One full-batch logical buffer, [n × spb] f64, homed PER WINDOW by the
@@ -156,6 +159,7 @@ struct Paged {
 	// disk-resident windows in flight, so the NVMe sees queue depth and
 	// streams underneath the GPU instead of taking turns with it.
 	ahead: RefCell<std::collections::VecDeque<(usize, usize, std::thread::JoinHandle<Vec<u8>>)>>,
+	net: Option<Arc<Vec<crate::wire::Conn>>>,
 }
 
 impl Paged {
@@ -168,22 +172,37 @@ impl Paged {
 		let mut next0 = q.back().map_or(s0 + cnt, |(p0, pc, _)| p0 + pc);
 		while q.len() < AHEAD && next0 < n {
 			let next_cnt = cnt.min(n - next0);
-			let Home::Disk(off) = self.homes[next0 / self.chunk] else {
-				return; // next window is a fast tier — nothing to hide
-			};
 			let len = next_cnt * self.spb * 8;
-			let f = spill.try_clone().expect("spill clone");
-			let hp = host.clone();
-			let h = std::thread::spawn(move || {
-				let mut buf = pool_take(&hp);
-				f.read_exact_at(&mut buf[..len], off).expect("ooc spill read-ahead");
-				DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
-				unsafe {
-					use std::os::unix::io::AsRawFd;
-					libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+			let h = match &self.homes[next0 / self.chunk] {
+				Home::Disk(off) => {
+					let off = *off;
+					let f = spill.try_clone().expect("spill clone");
+					let hp = host.clone();
+					std::thread::spawn(move || {
+						let mut buf = pool_take(&hp);
+						f.read_exact_at(&mut buf[..len], off).expect("ooc spill read-ahead");
+						DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
+						unsafe {
+							use std::os::unix::io::AsRawFd;
+							libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+						}
+						buf
+					})
 				}
-				buf
-			});
+				Home::Remote { node, id } => {
+					let (node, id) = (*node, *id);
+					let nt = Arc::clone(self.net.as_ref().expect("remote home without net"));
+					let hp = host.clone();
+					std::thread::spawn(move || {
+						let mut buf = pool_take(&hp);
+						let v = nt[node].fetch(id, 0, len as u64).expect("ooc net read-ahead");
+						buf[..len].copy_from_slice(&v);
+						NET_R_BYTES.fetch_add(len, Ordering::Relaxed);
+						buf
+					})
+				}
+				_ => return, // next window is a fast tier — nothing to hide
+			};
 			q.push_back((next0, next_cnt, h));
 			next0 += next_cnt;
 		}
@@ -228,6 +247,28 @@ impl Paged {
 				pool_give(host, bytes);
 				view(win, 0, len)
 			}
+			Home::Remote { node, id } => {
+				let pre = self.ahead.borrow_mut().pop_front();
+				let bytes = match pre {
+					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().expect("read-ahead thread"),
+					other => {
+						if let Some((_, _, h)) = other {
+							pool_give(host, h.join().expect("read-ahead thread"));
+						}
+						self.drain_ahead(host);
+						let mut buf = pool_take(host);
+						let nt = self.net.as_ref().expect("remote home without net");
+						let v = nt[*node].fetch(*id, 0, len as u64).expect("ooc net read");
+						buf[..len].copy_from_slice(&v);
+						NET_R_BYTES.fetch_add(len, Ordering::Relaxed);
+						buf
+					}
+				};
+				self.kick_ahead(s0, cnt, n, spill, host);
+				win.write_u8(&bytes[..len]).expect("ooc H2D");
+				pool_give(host, bytes);
+				view(win, 0, len)
+			}
 		}
 	}
 	/// Device window a kernel writes samples [s0, s0+cnt) into. Pair with
@@ -248,7 +289,12 @@ impl Paged {
 			Home::Disk(off) => {
 				let mut buf = pool_take(host);
 				v.download_u8(&mut buf[..len]).expect("ooc D2H");
-				writer.send(*off, buf, len);
+				writer.send(Dest::Disk(*off), buf, len);
+			}
+			Home::Remote { node, id } => {
+				let mut buf = pool_take(host);
+				v.download_u8(&mut buf[..len]).expect("ooc D2H");
+				writer.send(Dest::Remote { node: *node, id: *id }, buf, len);
 			}
 		}
 	}
@@ -259,10 +305,17 @@ impl Paged {
 /// the GPU moves on to the next window.
 /// Write-behind pool: THREE workers, round-robin dispatch, each queue 2 deep
 /// — the NVMe sees parallel writes instead of one serial pwrite stream.
+#[derive(Clone, Copy)]
+enum Dest {
+	Disk(u64),
+	Remote { node: usize, id: u64 },
+}
+
 struct Writer {
-	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>)>,
+	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(Dest, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>)>,
 	next: std::cell::Cell<usize>,
 	host: HostPool,
+	net: Option<Arc<Vec<crate::wire::Conn>>>,
 	// Seconds spent draining lanes since the last sweep line — epoch-to-epoch
 	// wander on identical work is write-behind drain landing on whichever
 	// sweep's barrier catches it; the line surfaces it as `drain Xs`.
@@ -281,15 +334,25 @@ const MAX_READERS: usize = 5;
 // buffer being pwritten, and one commit stages before its send lands.
 const POOL_BUFS: usize = MAX_READERS * AHEAD + 1 + W_LANES * (WQ_DEPTH + 1) + 1;
 
-fn spawn_lane(spill: &File, host: &HostPool) -> (Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>) {
+fn spawn_lane(spill: &File, host: &HostPool, net: &Option<Arc<Vec<crate::wire::Conn>>>) -> (Option<std::sync::mpsc::SyncSender<(Dest, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<()>>) {
 	let f = spill.try_clone().expect("spill clone");
 	let hp = host.clone();
-	let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>, usize)>(WQ_DEPTH);
+	let nt = net.clone();
+	let (tx, rx) = std::sync::mpsc::sync_channel::<(Dest, Vec<u8>, usize)>(WQ_DEPTH);
 	let worker = std::thread::spawn(move || {
-		for (off, buf, len) in rx {
-			f.write_all_at(&buf[..len], off).expect("ooc spill write");
-			DISK_W_BYTES.fetch_add(len, Ordering::Relaxed);
-			drop_cache(&f, off, len);
+		for (dest, buf, len) in rx {
+			match dest {
+				Dest::Disk(off) => {
+					f.write_all_at(&buf[..len], off).expect("ooc spill write");
+					DISK_W_BYTES.fetch_add(len, Ordering::Relaxed);
+					drop_cache(&f, off, len);
+				}
+				Dest::Remote { node, id } => {
+					let nt = nt.as_ref().expect("remote dest without net");
+					nt[node].store_from(id, &buf[..len]).expect("ooc net write");
+					NET_W_BYTES.fetch_add(len, Ordering::Relaxed);
+				}
+			}
 			pool_give(&hp, buf);
 		}
 	});
@@ -297,18 +360,19 @@ fn spawn_lane(spill: &File, host: &HostPool) -> (Option<std::sync::mpsc::SyncSen
 }
 
 impl Writer {
-	fn new(spill: &File, host: HostPool) -> Writer {
+	fn new(spill: &File, host: HostPool, net: Option<Arc<Vec<crate::wire::Conn>>>) -> Writer {
 		Writer {
-			lanes: (0..W_LANES).map(|_| spawn_lane(spill, &host)).collect(),
+			lanes: (0..W_LANES).map(|_| spawn_lane(spill, &host, &net)).collect(),
 			next: std::cell::Cell::new(0),
 			host,
+			net,
 			drained: std::cell::Cell::new(0.0),
 		}
 	}
-	fn send(&self, off: u64, buf: Vec<u8>, len: usize) {
+	fn send(&self, dest: Dest, buf: Vec<u8>, len: usize) {
 		let i = self.next.get();
 		self.next.set((i + 1) % W_LANES);
-		self.lanes[i].0.as_ref().expect("writer live").send((off, buf, len)).expect("writer send");
+		self.lanes[i].0.as_ref().expect("writer live").send((dest, buf, len)).expect("writer send");
 	}
 	/// Drain every lane — REQUIRED before any read of a disk home that was
 	/// just written this sweep (the next sweep reads it).
@@ -321,7 +385,7 @@ impl Writer {
 			if let Some(w) = lane.1.take() {
 				w.join().expect("writer join");
 			}
-			*lane = spawn_lane(spill, &self.host);
+			*lane = spawn_lane(spill, &self.host, &self.net);
 		}
 		self.drained.set(self.drained.get() + t.elapsed().as_secs_f64());
 	}
@@ -331,6 +395,7 @@ pub struct Plan {
 	pub vram: usize,
 	pub ram: usize,
 	pub disk: usize,
+	pub remote: usize,
 }
 
 /// Combined-ceiling admit in waterfall order from live measurements. `None`
@@ -340,17 +405,18 @@ pub struct Plan {
 // lives in gpu-core next to the alloc gate that enforces it.
 pub use gpu_core::memory::USER_GB;
 
-pub fn plan(need: usize) -> Option<Plan> {
+pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
 	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 	let disk_avail = disk_free(&cwd).saturating_sub(USER_GB);
-	if need > vram_avail + ram_avail + disk_avail {
+	if need > vram_avail + ram_avail + disk_avail + net_ram {
 		return None;
 	}
 	let vram = need.min(vram_avail);
 	let ram = (need - vram).min(ram_avail);
-	Some(Plan { vram, ram, disk: need - vram - ram })
+	let disk = (need - vram - ram).min(disk_avail);
+	Some(Plan { vram, ram, disk, remote: need - vram - ram - disk })
 }
 
 /// The out-of-core buffer set + streaming state for one fit.
@@ -394,6 +460,9 @@ pub struct Ooc {
 	rate_d2h: f64,
 	rate_disk_r: f64,
 	rate_disk_w: f64,
+	rate_net_r: f64,
+	rate_net_w: f64,
+	net: Option<Arc<Vec<crate::wire::Conn>>>,
 	// ONE probe-verified slab holds every VRAM-homed window as a carved view —
 	// the pool is never asked to grow near the top of the card (the gate
 	// admits asks VmHeap cannot map there; see probe_verified_vram).
@@ -408,6 +477,8 @@ struct SweepStart {
 	d2h: usize,
 	disk_r: usize,
 	disk_w: usize,
+	net_r: usize,
+	net_w: usize,
 }
 
 fn sweep_start() -> SweepStart {
@@ -418,6 +489,8 @@ fn sweep_start() -> SweepStart {
 		d2h,
 		disk_r: DISK_R_BYTES.load(Ordering::Relaxed),
 		disk_w: DISK_W_BYTES.load(Ordering::Relaxed),
+		net_r: NET_R_BYTES.load(Ordering::Relaxed),
+		net_w: NET_W_BYTES.load(Ordering::Relaxed),
 	}
 }
 
@@ -425,7 +498,7 @@ impl Ooc {
 	/// Lay every full-batch buffer out across the waterfall and size the
 	/// streaming windows. Windows are sample-aligned; the widest op (flash
 	/// backward) holds 9 at once, so VRAM's window share is carved into 10.
-	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>) -> Ooc {
+	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>, net: Option<Arc<Vec<crate::wire::Conn>>>) -> Ooc {
 		let attn = params.iter().find(|p| p.kind == LayerKind::Attn);
 		let (seq_spb, hs) = attn.map_or((1, 1), |p| (p.in_dim, p.heads * (p.in_dim / p.dim)));
 		let max_act_spb = params.iter().map(|p| p.out_dim.max(p.in_dim)).max().unwrap_or(1);
@@ -481,7 +554,7 @@ impl Ooc {
 				})
 				.collect(),
 		));
-		let writer = Writer::new(&spill, host.clone());
+		let writer = Writer::new(&spill, host.clone(), net.clone());
 		// One window through each streamed path, timed — the measured PCIe/NVMe
 		// rates the sweep lines report against. Window-sized (the exact unit the
 		// epoch streams); the spill region is overwritten by real windows later.
@@ -580,6 +653,26 @@ impl Ooc {
 		let mut ram_used = 0usize;
 		let mut vram_open = true;
 		let mut disk_cursor: u64 = 0;
+		// Disk fills to ITS reserve line, then windows go remote: each pooled
+		// node takes up to its HELLO-reported MemAvailable minus the same 1 GB
+		// user reserve (the reserve law applies on the far side too).
+		let disk_budget = disk_free(&std::env::current_dir().unwrap_or_else(|_| ".".into()))
+			.saturating_sub(USER_GB);
+		let net_caps: Vec<usize> = net.as_ref().map_or(Vec::new(), |ns| {
+			ns.iter().map(|c| (c.info.ram as usize).saturating_sub(USER_GB)).collect()
+		});
+		let mut net_used = vec![0usize; net_caps.len()];
+		// Blob ids carry a coordinator fingerprint in the high half — two
+		// machines pooling the same node must not collide.
+		let id_base: u64 = {
+			let host_s = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+			let mut h = 0xcbf2_9ce4_8422_2325u64;
+			for b in host_s.trim().bytes().chain(std::process::id().to_le_bytes()) {
+				h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+			}
+			h << 32
+		};
+		let mut next_id: u64 = 0;
 		// Per-WINDOW placement: the waterfall fills VRAM window by window until
 		// the gate refuses (top minus the user GB), THEN RAM to its line, THEN
 		// disk — not a byte pools in a slower tier while a faster one has room.
@@ -610,10 +703,22 @@ impl Ooc {
 					homes.push(Home::Ram(v));
 					continue;
 				}
-				homes.push(Home::Disk(disk_cursor));
-				disk_cursor += bytes as u64;
+				if disk_cursor as usize + bytes <= disk_budget {
+					homes.push(Home::Disk(disk_cursor));
+					disk_cursor += bytes as u64;
+					continue;
+				}
+				let node = (0..net_caps.len()).find(|&nd| net_used[nd] + bytes <= net_caps[nd]);
+				let Some(node) = node else {
+					panic!(
+						"ooc: window has no home — disk {disk_cursor}B of {disk_budget}B, remote {net_used:?} of {net_caps:?} (admit passed what placement cannot hold)"
+					);
+				};
+				net_used[node] += bytes;
+				homes.push(Home::Remote { node, id: id_base | next_id });
+				next_id += 1;
 			}
-			Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()) }
+			Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()), net: net.clone() }
 		};
 
 		// Placement in HOTNESS order — the waterfall gives the fastest tier to
@@ -647,6 +752,25 @@ impl Ooc {
 		if disk_cursor > 0 {
 			spill.set_len(disk_cursor).expect("size spill file");
 		}
+		// One window through the wire when any window homed remote — the net
+		// roofline the sweep lines report against.
+		let (rate_net_r, rate_net_w) = if net_used.iter().any(|u| *u > 0) {
+			let ns = net.as_ref().expect("net used without net");
+			let cal_id = id_base | 0xffff_ffff;
+			let buf = pool_take(&host);
+			let bps = |b: usize, t: std::time::Instant| b as f64 / t.elapsed().as_secs_f64();
+			let t = std::time::Instant::now();
+			ns[0].store_from(cal_id, &buf[..wbytes]).expect("calibrate net write");
+			let w = bps(wbytes, t);
+			let t = std::time::Instant::now();
+			let v = ns[0].fetch(cal_id, 0, wbytes as u64).expect("calibrate net read");
+			let r = bps(v.len(), t);
+			let _ = ns[0].free(cal_id);
+			pool_give(&host, buf);
+			(r, w)
+		} else {
+			(0.0, 0.0)
+		};
 
 		Ooc {
 			n,
@@ -685,13 +809,16 @@ impl Ooc {
 			rate_d2h,
 			rate_disk_r,
 			rate_disk_w,
+			rate_net_r,
+			rate_net_w,
+			net,
 			slab,
 		}
 	}
 
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-		let (mut v, mut r, mut d) = (0usize, 0usize, 0usize);
+		let (mut v, mut r, mut d, mut nt) = (0usize, 0usize, 0usize, 0usize);
 		let mut tally = |p: &Paged| {
 			for (w, h) in p.homes.iter().enumerate() {
 				let cnt = p.chunk.min(self.n - w * p.chunk);
@@ -699,6 +826,7 @@ impl Ooc {
 					Home::Vram(_) => v += cnt * p.spb * 8,
 					Home::Ram(x) => r += x.len(),
 					Home::Disk(_) => d += cnt * p.spb * 8,
+					Home::Remote { .. } => nt += cnt * p.spb * 8,
 				}
 			}
 		};
@@ -715,10 +843,11 @@ impl Ooc {
 			tally(b);
 		}
 		eprintln!(
-			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB, {}-sample windows",
+			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB → NET {:.2} GB, {}-sample windows",
 			gb(v),
 			gb(r),
 			gb(d),
+			gb(nt),
 			self.chunk
 		);
 		eprintln!(
@@ -730,6 +859,14 @@ impl Ooc {
 			self.rate_disk_r / 1e9,
 			self.rate_disk_w / 1e9,
 		);
+		if self.rate_net_r > 0.0 {
+			eprintln!(
+				"\x1b[33mwaterfall\x1b[0m  net roofline: net-r {:.3} GB/s  net-w {:.3} GB/s ({} nodes)",
+				self.rate_net_r / 1e9,
+				self.rate_net_w / 1e9,
+				self.net.as_ref().map_or(0, |n| n.len()),
+			);
+		}
 	}
 
 	/// Full-batch forward swept in windows. `x`/`x_cat`/`sc.acts[last]` are
@@ -1127,6 +1264,8 @@ impl Ooc {
 			("d2h", d2h - s.d2h, self.rate_d2h),
 			("disk-r", DISK_R_BYTES.load(Ordering::Relaxed) - s.disk_r, self.rate_disk_r),
 			("disk-w", DISK_W_BYTES.load(Ordering::Relaxed) - s.disk_w, self.rate_disk_w),
+			("net-r", NET_R_BYTES.load(Ordering::Relaxed) - s.net_r, self.rate_net_r),
+			("net-w", NET_W_BYTES.load(Ordering::Relaxed) - s.net_w, self.rate_net_w),
 		] {
 			if delta > 0 {
 				let bps = delta as f64 / sec;
@@ -1186,6 +1325,9 @@ impl Ooc {
 			rate_d2h: _,
 			rate_disk_r: _,
 			rate_disk_w: _,
+			rate_net_r: _,
+			rate_net_w: _,
+			net: _,
 			slab: _,
 		} = self;
 		acts.iter().chain(preacts.iter().flatten()).chain([
@@ -1313,7 +1455,18 @@ impl Ooc {
 impl Drop for Ooc {
 	fn drop(&mut self) {
 		// Drain in-flight write-behind (the spill fd itself dies with us —
-		// the path was unlinked at open).
-		self.writer.barrier(&self.spill);
+		// the path was unlinked at open). The barrier also lands every queued
+		// remote STORE before the blobs are freed off the pooled nodes.
+		let Ooc { writer, spill, .. } = &mut *self;
+		writer.barrier(spill);
+		if let Some(net) = self.net.clone() {
+			for p in self.all_paged() {
+				for h in &p.homes {
+					if let Home::Remote { node, id } = h {
+						let _ = net[*node].free(*id);
+					}
+				}
+			}
+		}
 	}
 }
