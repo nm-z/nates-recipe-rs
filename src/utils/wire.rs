@@ -356,6 +356,66 @@ impl Net {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+      use super::*;
+
+      // Live-network round-trip: needs `recipe serve` running on archy and sentry.
+      // cargo test -p recipe --release wire_remotes -- --ignored --nocapture
+      #[test]
+      #[ignore]
+      fn wire_remotes() -> Result<()> {
+            let conns = Net::new().node("archy").node("sentry").connect()?;
+            let mb = 64usize;
+            let mut blob = vec![0u8; mb << 20];
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            for w in blob.chunks_exact_mut(8) {
+                  x ^= x << 13;
+                  x ^= x >> 7;
+                  x ^= x << 17;
+                  w.copy_from_slice(&x.to_le_bytes());
+            }
+            for (i, c) in conns.iter().enumerate() {
+                  eprintln!("node {i}: hello {:?}", c.info);
+                  let t = std::time::Instant::now();
+                  c.store(42, blob.clone())?;
+                  let up = mb as f64 / t.elapsed().as_secs_f64();
+                  let t = std::time::Instant::now();
+                  let back = c.fetch(42, 0, blob.len() as u64)?;
+                  let down = mb as f64 / t.elapsed().as_secs_f64();
+                  assert_eq!(back, blob);
+                  let off = 1usize << 20;
+                  let slice = c.fetch(42, off as u64, 4096)?;
+                  assert_eq!(&slice[..], &blob[off..off + 4096]);
+                  let past = c.fetch(42, blob.len() as u64, 1);
+                  assert!(past.is_err(), "fetch past end must error");
+                  let no_runner = c.run(FN_MOE_FFN, 42, vec![0u8; 8])?.recv()?;
+                  assert_eq!(no_runner.op, Op::Err, "RUN with no handler must return Err frame");
+                  eprintln!("node {i}: store {up:.0} MB/s, fetch {down:.0} MB/s, stat: {}", c.stat()?);
+            }
+            // duplex: same blob to both nodes concurrently
+            let t = std::time::Instant::now();
+            thread::scope(|s| {
+                  let handles: Vec<_> = conns
+                        .iter()
+                        .map(|c| {
+                              let b = blob.clone();
+                              s.spawn(move || c.store(43, b))
+                        })
+                        .collect();
+                  for h in handles {
+                        h.join().expect("store thread panicked").expect("parallel store failed");
+                  }
+            });
+            let agg = (mb * conns.len()) as f64 / t.elapsed().as_secs_f64();
+            eprintln!("parallel store to {} nodes: {agg:.0} MB/s aggregate", conns.len());
+            for c in &conns {
+                  eprintln!("final {}", c.stat()?);
+            }
+            Ok(())
+      }
+}
+
 fn resolve(alias: &str) -> Result<String> {
 	if alias.contains(':') {
 		return Ok(alias.to_string());
