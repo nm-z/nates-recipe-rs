@@ -454,6 +454,11 @@ pub struct Ooc {
 	dwv_acc: GpuBuffer,
 	dw_partials: GpuBuffer,
 	reduce_ws: GpuBuffer,
+	// Per-window cnt/n batch-mean corrections (plan-time: the window layout is
+	// fixed here), one f64 per window in chunks() order. Bce/Focal grad kernels
+	// scale by 1/count-they-were-given (= 1/cnt per window); this restores the
+	// global 1/n exactly, ragged last window included.
+	win_scale: GpuBuffer,
 	// Streamed-tier rates measured at build (bytes/sec): one window pushed
 	// through each production path — the PCIe/NVMe rooflines every sweep line
 	// reports its achieved rate against.
@@ -540,6 +545,8 @@ impl Ooc {
 		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
 		let win_budget = gpu_core::memory::claimable_bytes().saturating_sub(fixed_res) / 2;
 		let chunk = (win_budget / ((WINS + 2) * max_spb * 8)).clamp(1, n);
+		let scales: Vec<f64> = chunks(n, chunk).map(|(_, cnt)| cnt as f64 / n as f64).collect();
+		let win_scale = GpuBuffer::upload(&scales).expect("ooc win_scale");
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
 			.collect();
@@ -806,6 +813,7 @@ impl Ooc {
 			dwv_acc,
 			dw_partials,
 			reduce_ws,
+			win_scale,
 			rate_h2d,
 			rate_d2h,
 			rate_disk_r,
@@ -1050,7 +1058,7 @@ impl Ooc {
 		// contribution is already at the full-batch scale — no per-window rescale.
 		self.da_a.spb = params[last].out_dim;
 		self.writer.barrier(&self.spill);
-		for (s0, cnt) in chunks(n, self.chunk) {
+		for (w, (s0, cnt)) in chunks(n, self.chunk).enumerate() {
 			if self.bail() {
 				return;
 			}
@@ -1059,6 +1067,12 @@ impl Ooc {
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
 			ModelInner::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss);
+			if matches!(loss, Loss::Bce | Loss::Focal) {
+				// Their grad kernels scaled by 1/(cnt*k); cnt/n corrects to the
+				// global 1/(n*k). Mse/Mae/Huber/Ce already ride ss.inv_n globally.
+				let w_sc = view(&self.win_scale, w * 8, 8);
+				kernels::gpu_scale_inplace(&w_sc, cnt * k, &da).expect("bce window rescale");
+			}
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host);
 		}
 		let mut flip = false;
@@ -1319,6 +1333,7 @@ impl Ooc {
 			dwv_acc: _,
 			dw_partials: _,
 			reduce_ws: _,
+			win_scale: _,
 			rate_h2d: _,
 			rate_d2h: _,
 			rate_disk_r: _,
@@ -1465,6 +1480,138 @@ impl Drop for Ooc {
 					}
 				}
 			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use gpu_core::kernels;
+
+	fn cpu_bce_grad(p: &[f64], y: &[f64], n_total: usize) -> Vec<f64> {
+		let eps = 1e-7;
+		p.iter()
+			.zip(y)
+			.map(|(&p, &y)| {
+				let p = p.clamp(eps, 1.0 - eps);
+				(p - y) / (p * (1.0 - p)) / n_total as f64
+			})
+			.collect()
+	}
+
+	fn cpu_focal_grad(p: &[f64], y: &[f64], gamma: f64, alpha: f64, n_total: usize) -> Vec<f64> {
+		let eps = 1e-12;
+		p.iter()
+			.zip(y)
+			.map(|(&p, &t)| {
+				let p = p.clamp(eps, 1.0 - eps);
+				let p_t = if t > 0.5 { p } else { 1.0 - p };
+				let wt = 1.0 - p_t;
+				let sign_pt = if t > 0.5 { 1.0 } else { -1.0 };
+				let g = -alpha
+					* (gamma * wt.powf(gamma - 1.0) * (-sign_pt) * p_t.ln()
+						+ wt.powf(gamma) * sign_pt / p_t);
+				g / n_total as f64
+			})
+			.collect()
+	}
+
+	// OOC Bce/Focal loss-grad semantics: the grad kernels scale by 1/count-they-
+	// were-given, so per-window calls come out at 1/cnt — the plan-time cnt/n
+	// window scale (Ooc::win_scale) corrects each window to the global 1/n. The
+	// windowed composition must equal the full-batch gradient and the analytic
+	// CPU reference EXACTLY, ragged last window included (7 = 3+3+1). This test
+	// fails without the win_scale rescale (windows come out ~windows× too large).
+	#[test]
+	fn ragged_window_bce_focal_grad_matches_full_batch() {
+		gpu_core::hip::set_device(0).expect("set_device");
+		let n = 7usize;
+		let chunk = 3usize; // windows (0,3) (3,3) (6,1) — ragged
+		let p = [0.9, 0.2, 0.7, 0.4, 0.6, 0.15, 0.85];
+		let y = [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+		let bp = GpuBuffer::upload(&p).expect("p");
+		let by = GpuBuffer::upload(&y).expect("y");
+		let scales: Vec<f64> = chunks(n, chunk).map(|(_, cnt)| cnt as f64 / n as f64).collect();
+		let win_scale = GpuBuffer::upload(&scales).expect("win_scale");
+		let (gamma, alpha) = (2.0, 0.25);
+		let bgamma = GpuBuffer::upload(&[gamma]).expect("gamma");
+		let balpha = GpuBuffer::upload(&[alpha]).expect("alpha");
+
+		// full batch on GPU vs CPU analytic
+		let da_full = GpuBuffer::alloc(n).expect("da");
+		kernels::gpu_bce_grad_into(&bp, &by, n, &da_full).expect("bce full");
+		let mut got = vec![0.0; n];
+		da_full.download(&mut got).expect("dl");
+		let want = cpu_bce_grad(&p, &y, n);
+		for i in 0..n {
+			assert!((got[i] - want[i]).abs() < 1e-12, "bce full[{i}] {} vs {}", got[i], want[i]);
+		}
+
+		// windowed + win_scale composition (the exact Ooc::backward sequence)
+		let da_win = GpuBuffer::alloc(n).expect("da_win");
+		for (w, (s0, cnt)) in chunks(n, chunk).enumerate() {
+			let pw = view(&bp, s0 * 8, cnt * 8);
+			let yw = view(&by, s0 * 8, cnt * 8);
+			let dw = view(&da_win, s0 * 8, cnt * 8);
+			kernels::gpu_bce_grad_into(&pw, &yw, cnt, &dw).expect("bce win");
+			let w_sc = view(&win_scale, w * 8, 8);
+			kernels::gpu_scale_inplace(&w_sc, cnt, &dw).expect("bce rescale");
+		}
+		da_win.download(&mut got).expect("dl");
+		for i in 0..n {
+			assert!((got[i] - want[i]).abs() < 1e-12, "bce win[{i}] {} vs {}", got[i], want[i]);
+		}
+
+		// premise guard: WITHOUT the rescale (the pre-fix Ooc::backward behavior)
+		// windows come out at 1/cnt scale and must diverge from the full batch —
+		// if this ever passes, the kernel stopped scaling by its own count and
+		// win_scale itself would become the bug.
+		let da_raw = GpuBuffer::alloc(n).expect("da_raw");
+		for (s0, cnt) in chunks(n, chunk) {
+			let pw = view(&bp, s0 * 8, cnt * 8);
+			let yw = view(&by, s0 * 8, cnt * 8);
+			let dw = view(&da_raw, s0 * 8, cnt * 8);
+			kernels::gpu_bce_grad_into(&pw, &yw, cnt, &dw).expect("bce raw win");
+		}
+		da_raw.download(&mut got).expect("dl");
+		let max_dev = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+		assert!(max_dev > 1e-3, "unrescaled windows unexpectedly match full batch (max dev {max_dev}) — kernel scaling semantics changed");
+
+		// focal: same composition law
+		let want_f = cpu_focal_grad(&p, &y, gamma, alpha, n);
+		kernels_focal_full_and_windowed(&bp, &by, &bgamma, &balpha, &win_scale, n, chunk, &want_f);
+	}
+
+	fn kernels_focal_full_and_windowed(
+		bp: &GpuBuffer,
+		by: &GpuBuffer,
+		bgamma: &GpuBuffer,
+		balpha: &GpuBuffer,
+		win_scale: &GpuBuffer,
+		n: usize,
+		chunk: usize,
+		want: &[f64],
+	) {
+		let mut got = vec![0.0; n];
+		let da_full = GpuBuffer::alloc(n).expect("da");
+		gpu_core::losses::gpu_focal_grad_into(bp, by, bgamma, balpha, n, &da_full).expect("focal full");
+		da_full.download(&mut got).expect("dl");
+		for i in 0..n {
+			assert!((got[i] - want[i]).abs() < 1e-12, "focal full[{i}] {} vs {}", got[i], want[i]);
+		}
+		let da_win = GpuBuffer::alloc(n).expect("da_win");
+		for (w, (s0, cnt)) in chunks(n, chunk).enumerate() {
+			let pw = view(bp, s0 * 8, cnt * 8);
+			let yw = view(by, s0 * 8, cnt * 8);
+			let dw = view(&da_win, s0 * 8, cnt * 8);
+			gpu_core::losses::gpu_focal_grad_into(&pw, &yw, bgamma, balpha, cnt, &dw).expect("focal win");
+			let w_sc = view(win_scale, w * 8, 8);
+			kernels::gpu_scale_inplace(&w_sc, cnt, &dw).expect("focal rescale");
+		}
+		da_win.download(&mut got).expect("dl");
+		for i in 0..n {
+			assert!((got[i] - want[i]).abs() < 1e-12, "focal win[{i}] {} vs {}", got[i], want[i]);
 		}
 	}
 }
