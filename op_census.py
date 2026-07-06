@@ -47,7 +47,20 @@ counts = {"pub fn": 0, "pub unsafe fn": 0, "pub(crate) fn": 0}
 for fname in sorted(os.listdir(SRC)):
       if not fname.endswith(".rs"): continue
       mod = fname[:-3]
-      text = strip_comments(open(os.path.join(SRC, fname)).read())
+      raw = open(os.path.join(SRC, fname)).read()
+      # `// not-an-op: <reason>` on the line above a pub fn excludes it from the op
+      # set (drivers/plumbing/plan-helpers). Audited: --check prints every one.
+      annotated = {}
+      raw_lines = raw.split("\n")
+      for ln, line in enumerate(raw_lines):
+            m = re.search(r"//\s*not-an-op:\s*(.+)", line)
+            if m:
+                  for la in range(ln + 1, min(ln + 3, len(raw_lines))):
+                        fm = re.search(r"\bpub(\(crate\))?\s+(unsafe\s+)?fn\s+(\w+)", raw_lines[la])
+                        if fm:
+                              annotated[fm.group(3)] = m.group(1).strip()
+                              break
+      text = strip_comments(raw)
 
       # map char pos -> inside extern block? track impl context by brace depth
       # build events: (pos, kind, name)
@@ -126,7 +139,9 @@ for fname in sorted(os.listdir(SRC)):
                   else:
                         ins.append(norm_type(a))
             kind2 = "ffi" if (ctx_kind == "extern" or is_decl) else ("plumbing" if mod in PLUMBING else "op")
-            rows.append(dict(module=mod, kind=kind2, name=name, recv=recv, inputs=ins, output=ret))
+            line_no = text.count("\n", 0, p) + 1
+            rows.append(dict(module=mod, kind=kind2, name=name, line=line_no, recv=recv,
+                             inputs=ins, output=ret, not_an_op=annotated.get(name)))
 
 print(json.dumps(counts), file=sys.stderr)
 print(f"total parsed: {len(rows)}", file=sys.stderr)
@@ -134,10 +149,54 @@ print(f"total parsed: {len(rows)}", file=sys.stderr)
 # ── dump ──
 dump_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "op_census_dump.tsv")
 with open(dump_path, "w") as f:
-      f.write("kind\tmodule\tfn\treceiver\tinputs\toutput\n")
+      f.write("kind\tmodule\tfn\tline\treceiver\tinputs\toutput\n")
       for r in sorted(rows, key=lambda r: (r["kind"], r["module"], r["name"])):
-            f.write(f"{r['kind']}\t{r['module']}\t{r['name']}\t{r['recv'] or ''}\t{', '.join(r['inputs'])}\t{r['output']}\n")
+            f.write(f"{r['kind']}\t{r['module']}\t{r['name']}\t{r['line']}\t{r['recv'] or ''}\t{', '.join(r['inputs'])}\t{r['output']}\n")
 print(f"dump: {dump_path}", file=sys.stderr)
+
+# ── --check: enforce the schedulable-op type constraint ──────────────────────
+# fn op(in: &GpuBuffer ..., dim: usize ..., out: &GpuBuffer ...) -> Result<()>
+# inputs only &GpuBuffer/usize; return exactly Result<()>; no methods.
+ALLOW = {
+      "gpu_shutdown",        # device lifecycle, not a schedulable op
+}
+def is_plan_helper(r):
+      # plan-time size query: no device work — only usize in, usize out
+      return all(t == "usize" for t in r["inputs"]) and r["output"] == "usize" \
+            and r["name"].endswith("_workspace_bytes")
+
+if "--check" in sys.argv:
+      excluded = [r for r in rows if r["kind"] == "op" and r["not_an_op"]]
+      viols = []
+      for r in rows:
+            if r["kind"] != "op" or r["name"] in ALLOW or is_plan_helper(r) or r["not_an_op"]:
+                  continue
+            why = []
+            if r["recv"]:
+                  why.append(f"method receiver {r['recv']}")
+            for t in r["inputs"]:
+                  if t not in ("&GpuBuffer", "usize"):
+                        why.append(f"input {t}")
+            if r["output"] != "Result<()>":
+                  why.append(f"returns {r['output']}")
+            if why:
+                  viols.append((r, why))
+      by_clause = Counter()
+      for r, why in viols:
+            for w in why:
+                  by_clause[w.split(" ")[0] + " " + (w.split(" ")[1] if w.startswith(("input", "returns")) else "")] += 1
+      for r, why in sorted(viols, key=lambda v: (v[0]["module"], v[0]["line"])):
+            print(f"VIOLATION gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {'; '.join(why)}")
+      n_ops = sum(1 for r in rows if r["kind"] == "op" and r["name"] not in ALLOW
+                  and not is_plan_helper(r) and not r["not_an_op"])
+      print(f"\n--check: {n_ops} ops, {n_ops - len(viols)} conforming, {len(viols)} violating")
+      for clause, n in by_clause.most_common():
+            print(f"  {n:4d}  {clause}")
+      if excluded:
+            print(f"\nnot-an-op exclusions ({len(excluded)}) — audit this list:")
+            for r in sorted(excluded, key=lambda r: (r["module"], r["line"])):
+                  print(f"  gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {r['not_an_op']}")
+      sys.exit(1 if viols else 0)
 
 def bars(counter, total, top=None, width=36):
       items = counter.most_common(top)
