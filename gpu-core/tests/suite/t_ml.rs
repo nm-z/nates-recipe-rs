@@ -2,10 +2,14 @@ use gpu_core::bayes::{
 	gpu_bernoulli_nb_logprob, gpu_multinomial_nb_logprob, gpu_nb_count_table,
 	gpu_nb_feature_log_prob,
 };
-use gpu_core::catboost::{gpu_iota, gpu_ordered_target_stats, gpu_random_permutation};
+use gpu_core::catboost::{
+	gpu_iota, gpu_ordered_target_stats, gpu_random_permutation,
+	gpu_random_permutation_workspace_bytes,
+};
 use gpu_core::forest::{
 	gpu_bootstrap_sample, gpu_feature_subset, gpu_oob_mask, gpu_random_threshold_split,
 };
+use gpu_core::kernels::gpu_rand_uniform;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::rl::{
 	gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob,
@@ -19,8 +23,9 @@ const EPS: f64 = 1e-9;
 #[test]
 fn test_rl_discounted_returns() {
 	let rewards = GpuBuffer::upload(&[1.0_f64, 1.0, 1.0]).unwrap();
-	let gamma = 0.5_f64;
-	let out = gpu_discounted_returns(&rewards, gamma, 3).unwrap();
+	let gamma = GpuBuffer::upload(&[0.5_f64]).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_discounted_returns(&rewards, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
 	out.download(&mut result).unwrap();
 
@@ -52,7 +57,10 @@ fn test_rl_gae() {
 	let values = GpuBuffer::upload(&[1.0_f64, 1.0, 1.0]).unwrap();
 	let gamma = 0.9_f64;
 	let lam = 0.95_f64;
-	let out = gpu_gae(&rewards, &values, gamma, lam, 3).unwrap();
+	let gamma_buf = GpuBuffer::upload(&[gamma]).unwrap();
+	let lam_buf = GpuBuffer::upload(&[lam]).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_gae(&rewards, &values, &gamma_buf, &lam_buf, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
 	out.download(&mut result).unwrap();
 
@@ -85,8 +93,9 @@ fn test_rl_td_targets() {
 	let rewards = GpuBuffer::upload(&[1.0_f64, 2.0, 3.0]).unwrap();
 	let values_next = GpuBuffer::upload(&[4.0_f64, 5.0, 6.0]).unwrap();
 	let done = GpuBuffer::upload(&[0.0_f64, 1.0, 0.0]).unwrap();
-	let gamma = 0.99_f64;
-	let out = gpu_td_targets(&rewards, &values_next, gamma, &done, 3).unwrap();
+	let gamma = GpuBuffer::upload(&[0.99_f64]).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_td_targets(&rewards, &values_next, &done, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
 	out.download(&mut result).unwrap();
 
@@ -113,7 +122,8 @@ fn test_rl_categorical_logprob() {
 	// log_softmax[2] = 2 - log(1 + e + e^2)
 	let logits = GpuBuffer::upload(&[0.0_f64, 1.0, 2.0]).unwrap();
 	let actions = GpuBuffer::upload_i32(&[2_i32]).unwrap();
-	let out = gpu_categorical_logprob(&logits, &actions, 1, 3).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_categorical_logprob(&logits, &actions, 1, 3, &out).unwrap();
 	let mut result = [0.0_f64; 1];
 	out.download(&mut result).unwrap();
 
@@ -143,7 +153,8 @@ fn test_rl_gaussian_logprob() {
 	let mu = GpuBuffer::upload(&[0.0_f64]).unwrap();
 	let log_std = GpuBuffer::upload(&[0.0_f64]).unwrap();
 	let actions = GpuBuffer::upload(&[1.0_f64]).unwrap();
-	let out = gpu_gaussian_logprob(&mu, &log_std, &actions, 1, 1).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_gaussian_logprob(&mu, &log_std, &actions, 1, 1, &out).unwrap();
 	let mut result = [0.0_f64; 1];
 	out.download(&mut result).unwrap();
 
@@ -175,8 +186,9 @@ fn test_bayes_nb_feature_log_prob() {
 		4.0, 5.0, 6.0, // class 1
 	])
 	.unwrap();
-	let alpha = 1.0_f64;
-	let out = gpu_nb_feature_log_prob(&counts, 2, 3, alpha).unwrap();
+	let alpha = GpuBuffer::upload(&[1.0_f64]).unwrap();
+	let out = GpuBuffer::alloc(6).unwrap();
+	gpu_nb_feature_log_prob(&counts, &alpha, 2, 3, &out).unwrap();
 	let mut result = [0.0_f64; 6];
 	out.download(&mut result).unwrap();
 
@@ -225,7 +237,8 @@ fn test_bayes_nb_count_table() {
 	// expected count_table: class0=[2,1], class1=[0,1]
 	let x = GpuBuffer::upload(&[1.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
 	let y = GpuBuffer::upload_i32(&[0_i32, 1, 0]).unwrap();
-	let out = gpu_nb_count_table(&x, &y, 3, 2, 2).unwrap();
+	let out = GpuBuffer::zeros_bytes(4 * std::mem::size_of::<f64>()).unwrap();
+	gpu_nb_count_table(&x, &y, 3, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 4];
 	out.download(&mut result).unwrap();
 
@@ -254,7 +267,8 @@ fn test_bayes_multinomial_nb_logprob() {
 	])
 	.unwrap();
 	let x = GpuBuffer::upload(&[1.0_f64, 1.0]).unwrap();
-	let out = gpu_multinomial_nb_logprob(&log_prior, &flp, &x, 1, 2, 2).unwrap();
+	let out = GpuBuffer::alloc(2).unwrap();
+	gpu_multinomial_nb_logprob(&log_prior, &flp, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
 	out.download(&mut result).unwrap();
 
@@ -293,7 +307,8 @@ fn test_bayes_bernoulli_nb_logprob() {
 	let log_neg =
 		GpuBuffer::upload(&[0.7_f64.ln(), 0.3_f64.ln(), 0.4_f64.ln(), 0.6_f64.ln()]).unwrap();
 	let x = GpuBuffer::upload(&[1.0_f64, 0.0]).unwrap();
-	let out = gpu_bernoulli_nb_logprob(&log_prior, &log_p, &log_neg, &x, 1, 2, 2).unwrap();
+	let out = GpuBuffer::alloc(2).unwrap();
+	gpu_bernoulli_nb_logprob(&log_prior, &log_p, &log_neg, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
 	out.download(&mut result).unwrap();
 
@@ -323,7 +338,10 @@ fn test_bayes_bernoulli_nb_logprob() {
 fn test_forest_bootstrap_sample() {
 	let n = 10_usize;
 	let n_samples = 20_usize;
-	let buf = gpu_bootstrap_sample(n, n_samples, 42).unwrap();
+	let uniform_ws = GpuBuffer::alloc(n_samples).unwrap();
+	gpu_rand_uniform(n_samples, 42, &uniform_ws).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n_samples * std::mem::size_of::<i32>()).unwrap();
+	gpu_bootstrap_sample(&uniform_ws, n, n_samples, 42, &buf).unwrap();
 	// buf.len() is bytes = n_samples * 4
 	assert_eq!(buf.len(), n_samples * 4, "wrong byte length");
 	let mut idx = vec![0_i32; n_samples];
@@ -338,7 +356,9 @@ fn test_forest_bootstrap_sample() {
 fn test_forest_feature_subset() {
 	let n_features = 10_usize;
 	let k = 4_usize;
-	let buf = gpu_feature_subset(n_features, k, 7).unwrap();
+	let keys_ws = GpuBuffer::alloc(n_features).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n_features * std::mem::size_of::<i32>()).unwrap();
+	gpu_feature_subset(&keys_ws, n_features, k, 7, &buf).unwrap();
 	// buf is alloc_bytes(n_features * 4) — always returns n_features indices sorted by key
 	// the first k are the selected subset
 	let mut all_idx = vec![0_i32; n_features];
@@ -368,7 +388,13 @@ fn test_forest_feature_subset() {
 fn test_forest_random_threshold_split() {
 	let col_data = vec![1.0_f64, 3.0, 2.0, 5.0, 4.0];
 	let col = GpuBuffer::upload(&col_data).unwrap();
-	let threshold = gpu_random_threshold_split(&col, col_data.len(), 99).unwrap();
+	let d_min_ws = GpuBuffer::alloc(1).unwrap();
+	let d_max_ws = GpuBuffer::alloc(1).unwrap();
+	let thr_buf = GpuBuffer::alloc(1).unwrap();
+	gpu_random_threshold_split(&col, &d_min_ws, &d_max_ws, col_data.len(), 99, &thr_buf).unwrap();
+	let mut thr = [0.0_f64; 1];
+	thr_buf.download(&mut thr).unwrap();
+	let threshold = thr[0];
 	assert!(threshold.is_finite(), "threshold not finite: {}", threshold);
 	let col_min = 1.0_f64;
 	let col_max = 5.0_f64;
@@ -389,7 +415,9 @@ fn test_forest_oob_mask() {
 	let bootstrap = [0_i32, 1, 2, 3];
 	let n = 6_usize;
 	let bs_buf = GpuBuffer::upload_i32(&bootstrap).unwrap();
-	let mask_buf = gpu_oob_mask(&bs_buf, n).unwrap();
+	let used_ws = GpuBuffer::alloc_bytes(n).unwrap();
+	let mask_buf = GpuBuffer::alloc_bytes(n).unwrap();
+	gpu_oob_mask(&bs_buf, &used_ws, bootstrap.len(), n, &mask_buf).unwrap();
 	// mask_buf is zeros_bytes(n) -> u8 array of length n bytes
 	let mut mask = vec![0_u8; n];
 	mask_buf.download_u8(&mut mask).unwrap();
@@ -409,7 +437,8 @@ fn test_forest_oob_mask() {
 #[test]
 fn test_catboost_iota() {
 	let n = 8_usize;
-	let buf = gpu_iota(n).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	gpu_iota(n, &buf).unwrap();
 	let mut out = vec![0_i32; n];
 	buf.download_i32(&mut out).unwrap();
 	for (i, &v) in out.iter().enumerate() {
@@ -421,7 +450,13 @@ fn test_catboost_iota() {
 #[test]
 fn test_catboost_random_permutation() {
 	let n = 16_usize;
-	let buf = gpu_random_permutation(n, 42).unwrap();
+	let tmp_bytes = gpu_random_permutation_workspace_bytes(n);
+	let keys = GpuBuffer::alloc(n).unwrap();
+	let keys_out = GpuBuffer::alloc(n).unwrap();
+	let iota_scratch = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	let tmp = GpuBuffer::alloc_bytes(tmp_bytes).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	gpu_random_permutation(&keys, &keys_out, &iota_scratch, &tmp, n, 42, tmp_bytes, &buf).unwrap();
 	let mut perm = vec![0_i32; n];
 	buf.download_i32(&mut perm).unwrap();
 
@@ -454,9 +489,15 @@ fn test_catboost_ordered_target_stats() {
 	let cat_col = GpuBuffer::upload_i32(&[0_i32, 1, 0, 1]).unwrap();
 	let target = GpuBuffer::upload(&[10.0_f64, 20.0, 30.0, 40.0]).unwrap();
 	let perm = GpuBuffer::upload_i32(&[0_i32, 1, 2, 3]).unwrap();
-	let prior = 0.0_f64;
-	let smoothing = 1.0_f64;
-	let out = gpu_ordered_target_stats(&cat_col, &target, &perm, 4, 2, prior, smoothing).unwrap();
+	let prior = GpuBuffer::upload(&[0.0_f64]).unwrap();
+	let smoothing = GpuBuffer::upload(&[1.0_f64]).unwrap();
+	let cat_sum = GpuBuffer::zeros_bytes(2 * std::mem::size_of::<f64>()).unwrap();
+	let cat_cnt = GpuBuffer::zeros_bytes(2 * std::mem::size_of::<f64>()).unwrap();
+	let out = GpuBuffer::alloc(4).unwrap();
+	gpu_ordered_target_stats(
+		&cat_col, &target, &perm, &prior, &smoothing, &cat_sum, &cat_cnt, 4, 2, &out,
+	)
+	.unwrap();
 	let mut result = [0.0_f64; 4];
 	out.download(&mut result).unwrap();
 

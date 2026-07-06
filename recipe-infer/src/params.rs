@@ -131,12 +131,11 @@ pub fn build_layer_params(
 				si += 1;
 				GpuBuffer::upload(t).expect("upload embed table")
 			} else {
-				let table = kernels::gpu_randn(
-					vocab * dim,
-					4242 + (li as u32) * 7919,
-				)
-				.expect("randn embed");
-				kernels::gpu_scale_inplace(&table, 0.1, vocab * dim);
+				let table = GpuBuffer::alloc(vocab * dim).expect("alloc embed table");
+				kernels::gpu_randn(vocab * dim, 4242 + li * 7919, &table)
+					.expect("randn embed");
+				let scale = GpuBuffer::upload(&[0.1]).expect("embed scale");
+				kernels::gpu_scale_inplace(&scale, vocab * dim, &table).expect("scale embed");
 				table
 			};
 			let neg_pe = sinusoidal_pe(in_dim, dim, true);
@@ -208,21 +207,19 @@ pub fn build_layer_params(
 					GpuBuffer::upload(so).expect("upload wo"),
 				)
 			} else {
-				let mk = |seed: u32| {
-					let w =
-						kernels::gpu_randn(need, seed).expect("randn attn");
-					kernels::gpu_scale_inplace(
-						&w,
-						(1.0 / d_tok as f64).sqrt(),
-						need,
-					);
+				let mk = |seed: usize| {
+					let w = GpuBuffer::alloc(need).expect("alloc attn w");
+					kernels::gpu_randn(need, seed, &w).expect("randn attn");
+					let scale = GpuBuffer::upload(&[(1.0 / d_tok as f64).sqrt()])
+						.expect("attn scale");
+					kernels::gpu_scale_inplace(&scale, need, &w).expect("scale attn");
 					w
 				};
 				(
-					mk(7001 + li as u32 * 13),
-					mk(7002 + li as u32 * 13),
-					mk(7003 + li as u32 * 13),
-					mk(7004 + li as u32 * 13),
+					mk(7001 + li * 13),
+					mk(7002 + li * 13),
+					mk(7003 + li * 13),
+					mk(7004 + li * 13),
 				)
 			};
 			params.push(LayerParams {
@@ -259,9 +256,10 @@ pub fn build_layer_params(
 			let w_count = filters * cin * kernel;
 			let (w, b) = if !try_resume {
 				let scale = (2.0 / (cin * kernel) as f64).sqrt();
-				let w = kernels::gpu_randn(w_count, li as u32)
-					.expect("randn conv w");
-				kernels::gpu_scale_inplace(&w, scale, w_count);
+				let w = GpuBuffer::alloc(w_count).expect("alloc conv w");
+				kernels::gpu_randn(w_count, li, &w).expect("randn conv w");
+				let scale_b = GpuBuffer::upload(&[scale]).expect("conv scale");
+				kernels::gpu_scale_inplace(&scale_b, w_count, &w).expect("scale conv");
 				let b = GpuBuffer::upload(&vec![0.0f64; filters]).expect("upload conv b");
 				(w, b)
 			} else {
@@ -333,9 +331,10 @@ pub fn build_layer_params(
 		}
 		let (w, b, slope) = if !try_resume {
 			let scale = (2.0 / in_dim as f64).sqrt();
-			let w = kernels::gpu_randn(in_dim * units, li as u32)
-				.expect("randn w");
-			kernels::gpu_scale_inplace(&w, scale, in_dim * units);
+			let w = GpuBuffer::alloc(in_dim * units).expect("alloc w");
+			kernels::gpu_randn(in_dim * units, li, &w).expect("randn w");
+			let scale_b = GpuBuffer::upload(&[scale]).expect("dense scale");
+			kernels::gpu_scale_inplace(&scale_b, in_dim * units, &w).expect("scale dense");
 			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("upload b");
 			(w, b, None)
 		} else {

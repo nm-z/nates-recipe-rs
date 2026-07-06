@@ -88,7 +88,9 @@ fn prove_avg_pool_1d() {
 		.map(|i| (i as f64) * 0.5 - 1.0)
 		.collect();
 	let b = GpuBuffer::upload(&x).unwrap();
-	let got = dl(&gpu_avg_pool_1d(&b, n, out_len, nf).unwrap(), n * nf);
+	let out = GpuBuffer::alloc(n * nf).unwrap();
+	gpu_avg_pool_1d(&b, n, out_len, nf, &out).unwrap();
+	let got = dl(&out, n * nf);
 	let mut want = vec![0.0; n * nf];
 	for i in 0..n {
 		for fi in 0..nf {
@@ -110,10 +112,9 @@ fn prove_avg_pool_2d() {
 	let b = GpuBuffer::upload(&x).unwrap();
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
-	let got = dl(
-		&gpu_avg_pool_2d(&b, n, c, h, w, kh, kw, sh, sw).unwrap(),
-		n * c * oh * ow,
-	);
+	let out = GpuBuffer::alloc(n * c * oh * ow).unwrap();
+	gpu_avg_pool_2d(&b, n, c, h, w, kh, kw, sh, sw, &out).unwrap();
+	let got = dl(&out, n * c * oh * ow);
 	let mut want = vec![0.0; n * c * oh * ow];
 	for nn in 0..n {
 		for cc in 0..c {
@@ -148,7 +149,9 @@ fn prove_max_pool_1d_and_argmax() {
 		.map(|i| ((i * 37 + 11) % 97) as f64)
 		.collect();
 	let b = GpuBuffer::upload(&x).unwrap();
-	let (vb, ib) = gpu_max_pool_1d(&b, n, out_len, nf).unwrap();
+	let vb = GpuBuffer::alloc(n * nf).unwrap();
+	let ib = GpuBuffer::alloc(n * nf).unwrap();
+	gpu_max_pool_1d(&b, n, out_len, nf, &vb, &ib).unwrap();
 	let gv = dl(&vb, n * nf);
 	let gi = dl(&ib, n * nf);
 	let mut wv = vec![0.0; n * nf];
@@ -182,7 +185,9 @@ fn prove_max_pool_2d() {
 	let b = GpuBuffer::upload(&x).unwrap();
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
-	let (vb, ib) = gpu_max_pool_2d(&b, n, c, h, w, kh, kw, sh, sw).unwrap();
+	let vb = GpuBuffer::alloc(n * c * oh * ow).unwrap();
+	let ib = GpuBuffer::alloc(n * c * oh * ow).unwrap();
+	gpu_max_pool_2d(&b, n, c, h, w, kh, kw, sh, sw, &vb, &ib).unwrap();
 	let gv = dl(&vb, n * c * oh * ow);
 	let _ = &ib;
 	let mut wv = vec![0.0; n * c * oh * ow];
@@ -219,10 +224,9 @@ fn prove_avg_pool_grad() {
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
 	let g: Vec<f64> = (0..n * nf).map(|i| (i as f64) + 1.0).collect();
 	let gb = GpuBuffer::upload(&g).unwrap();
-	let got = dl(
-		&gpu_pool_grad_expand(&gb, n, out_len, nf).unwrap(),
-		n * out_len * nf,
-	);
+	let out = GpuBuffer::alloc(n * out_len * nf).unwrap();
+	gpu_pool_grad_expand(&gb, n, out_len, nf, &out).unwrap();
+	let got = dl(&out, n * out_len * nf);
 	let mut want = vec![0.0; n * out_len * nf];
 	for idx in 0..n * out_len * nf {
 		let i = idx / (out_len * nf);
@@ -239,10 +243,9 @@ fn prove_avg_pool_grad() {
 		.map(|i| (i as f64) * 0.5 + 1.0)
 		.collect();
 	let gob = GpuBuffer::upload(&go).unwrap();
-	let gi = dl(
-		&gpu_avg_pool_2d_backward(&gob, n2, c, h, w, kh, kw, sh, sw).unwrap(),
-		n2 * c * h * w,
-	);
+	let goutb = GpuBuffer::alloc(n2 * c * h * w).unwrap();
+	gpu_avg_pool_2d_backward(&gob, n2, c, h, w, kh, kw, sh, sw, &goutb).unwrap();
+	let gi = dl(&goutb, n2 * c * h * w);
 	let mut wi = vec![0.0; n2 * c * h * w];
 	for nn in 0..n2 {
 		for cc in 0..c {
@@ -284,13 +287,14 @@ fn prove_max_pool_grad() {
 		.map(|i| ((i * 37 + 11) % 97) as f64)
 		.collect();
 	let xb = GpuBuffer::upload(&x).unwrap();
-	let (_vb, ib) = gpu_max_pool_1d(&xb, n, out_len, nf).unwrap();
+	let _vb = GpuBuffer::alloc(n * nf).unwrap();
+	let ib = GpuBuffer::alloc(n * nf).unwrap();
+	gpu_max_pool_1d(&xb, n, out_len, nf, &_vb, &ib).unwrap();
 	let g: Vec<f64> = (0..n * nf).map(|i| (i as f64) + 2.0).collect();
 	let gb = GpuBuffer::upload(&g).unwrap();
-	let got = dl(
-		&gpu_max_pool_1d_backward(&gb, &ib, n, out_len, nf).unwrap(),
-		n * out_len * nf,
-	);
+	let mpb = GpuBuffer::alloc(n * out_len * nf).unwrap();
+	gpu_max_pool_1d_backward(&gb, &ib, n, out_len, nf, &mpb).unwrap();
+	let got = dl(&mpb, n * out_len * nf);
 	let idx = dl(&ib, n * nf);
 	let mut want = vec![0.0; n * out_len * nf];
 	for i in 0..n {
@@ -309,15 +313,16 @@ fn prove_max_pool_grad() {
 		.map(|i| ((i * 53 + 7) % 211) as f64)
 		.collect();
 	let x2b = GpuBuffer::upload(&x2).unwrap();
-	let (_v2, i2) = gpu_max_pool_2d(&x2b, n2, c, h, w, kh, kw, sh, sw).unwrap();
+	let _v2 = GpuBuffer::alloc(n2 * c * oh * ow).unwrap();
+	let i2 = GpuBuffer::alloc(n2 * c * oh * ow).unwrap();
+	gpu_max_pool_2d(&x2b, n2, c, h, w, kh, kw, sh, sw, &_v2, &i2).unwrap();
 	let g2: Vec<f64> = (0..n2 * c * oh * ow)
 		.map(|i| (i as f64) * 0.5 + 1.0)
 		.collect();
 	let g2b = GpuBuffer::upload(&g2).unwrap();
-	let got2 = dl(
-		&gpu_max_pool_2d_backward(&g2b, &i2, n2, c, h, w, oh, ow).unwrap(),
-		n2 * c * h * w,
-	);
+	let mp2b = GpuBuffer::alloc(n2 * c * h * w).unwrap();
+	gpu_max_pool_2d_backward(&g2b, &i2, n2, c, h, w, oh, ow, &mp2b).unwrap();
+	let got2 = dl(&mp2b, n2 * c * h * w);
 	let idx2 = dl(&i2, n2 * c * oh * ow);
 	let mut want2 = vec![0.0; n2 * c * h * w];
 	for nn in 0..n2 {

@@ -109,7 +109,7 @@ pub fn gpu_diffusion_sample(
 	vocab: usize,
 ) -> Result<(GpuBuffer, usize), HipError> {
 	let canvas = GpuBuffer::alloc(n_positions)?;
-	gpu_copy_into(initial_canvas, &canvas, n_positions);
+	gpu_copy_into(initial_canvas, n_positions, &canvas)?;
 	let committed = GpuBuffer::zeros_bytes(n_positions * std::mem::size_of::<f64>())?;
 	let bound = GpuBuffer::upload(&[entropy_bound])?;
 	let accepted = GpuBuffer::alloc(n_positions)?;

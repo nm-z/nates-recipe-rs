@@ -26,7 +26,8 @@ fn test_csr_spmv() {
 	let row_ptr = GpuBuffer::upload_i32(&row_ptr_h).unwrap();
 	let x = GpuBuffer::upload(&x_h).unwrap();
 
-	let y_gpu = graph::gpu_csr_spmv(&values, &col_idx, &row_ptr, &x, 3).unwrap();
+	let y_gpu = GpuBuffer::alloc(3).unwrap();
+	graph::gpu_csr_spmv(&values, &col_idx, &row_ptr, &x, 3, &y_gpu).unwrap();
 
 	let mut y = [0.0f64; 3];
 	y_gpu.download(&mut y).unwrap();
@@ -54,7 +55,8 @@ fn test_csr_spmm() {
 	let row_ptr = GpuBuffer::upload_i32(&row_ptr_h).unwrap();
 	let b = GpuBuffer::upload(&b_h).unwrap();
 
-	let c_gpu = graph::gpu_csr_spmm(&values, &col_idx, &row_ptr, &b, 3, 2).unwrap();
+	let c_gpu = GpuBuffer::alloc(6).unwrap();
+	graph::gpu_csr_spmm(&values, &col_idx, &row_ptr, &b, 3, 2, &c_gpu).unwrap();
 
 	let mut c = [0.0f64; 6];
 	c_gpu.download(&mut c).unwrap();
@@ -88,8 +90,10 @@ fn test_neighbor_aggregate_sum() {
 	let edge_src = GpuBuffer::upload_i32(&edge_src_h).unwrap();
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
 
-	let agg_gpu =
-		graph::gpu_neighbor_aggregate(&features, &edge_src, &edge_dst, 4, 2, 3, false).unwrap();
+	let deg_ws = GpuBuffer::alloc(4).unwrap();
+	let agg_gpu = GpuBuffer::alloc(8).unwrap();
+	graph::gpu_neighbor_aggregate(&features, &edge_src, &edge_dst, &deg_ws, 4, 2, 3, 0, &agg_gpu)
+		.unwrap();
 
 	let mut agg = [0.0f64; 8];
 	agg_gpu.download(&mut agg).unwrap();
@@ -126,8 +130,10 @@ fn test_neighbor_aggregate_mean() {
 	let edge_src = GpuBuffer::upload_i32(&edge_src_h).unwrap();
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
 
-	let agg_gpu =
-		graph::gpu_neighbor_aggregate(&features, &edge_src, &edge_dst, 4, 2, 3, true).unwrap();
+	let deg_ws = GpuBuffer::alloc(4).unwrap();
+	let agg_gpu = GpuBuffer::alloc(8).unwrap();
+	graph::gpu_neighbor_aggregate(&features, &edge_src, &edge_dst, &deg_ws, 4, 2, 3, 1, &agg_gpu)
+		.unwrap();
 
 	let mut agg = [0.0f64; 8];
 	agg_gpu.download(&mut agg).unwrap();
@@ -158,7 +164,8 @@ fn test_gpu_degree() {
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
 
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
-	let deg_gpu = graph::gpu_degree(&edge_dst, 4, 3).unwrap();
+	let deg_gpu = GpuBuffer::alloc(4).unwrap();
+	graph::gpu_degree(&edge_dst, 4, 3, &deg_gpu).unwrap();
 
 	let mut deg = [0.0f64; 4];
 	deg_gpu.download(&mut deg).unwrap();
@@ -238,8 +245,13 @@ fn test_forward_backward() {
 	let log_trans = GpuBuffer::upload(&log_trans_h).unwrap();
 	let log_emit = GpuBuffer::upload(&log_emit_h).unwrap();
 
-	let (alpha_gpu, beta_gpu, gamma_gpu) =
-		sequence::gpu_forward_backward(&log_trans, &log_emit, 2, 3).unwrap();
+	let alpha_gpu = GpuBuffer::alloc(6).unwrap();
+	let beta_gpu = GpuBuffer::alloc(6).unwrap();
+	let gamma_gpu = GpuBuffer::alloc(6).unwrap();
+	sequence::gpu_forward_backward(
+		&log_trans, &log_emit, 2, 3, &alpha_gpu, &beta_gpu, &gamma_gpu,
+	)
+	.unwrap();
 
 	let mut log_alpha = [0.0f64; 6];
 	let mut log_beta = [0.0f64; 6];
@@ -339,7 +351,10 @@ fn test_viterbi() {
 	let log_trans = GpuBuffer::upload(&log_trans_h).unwrap();
 	let log_emit = GpuBuffer::upload(&log_emit_h).unwrap();
 
-	let path_gpu = sequence::gpu_viterbi(&log_trans, &log_emit, 2, 3).unwrap();
+	let delta = GpuBuffer::alloc(6).unwrap();
+	let backptr = GpuBuffer::alloc_bytes(6 * std::mem::size_of::<i32>()).unwrap();
+	let path_gpu = GpuBuffer::alloc_bytes(3 * std::mem::size_of::<i32>()).unwrap();
+	sequence::gpu_viterbi(&log_trans, &log_emit, 2, 3, &delta, &backptr, &path_gpu).unwrap();
 
 	let mut path = [0i32; 3];
 	path_gpu.download_i32(&mut path).unwrap();
@@ -471,7 +486,8 @@ fn test_core_distance() {
 	let points_h: [f64; 4] = [0.0, 1.0, 2.0, 10.0];
 
 	let points = GpuBuffer::upload(&points_h).unwrap();
-	let core_dist_gpu = cluster::gpu_core_distance(&points, 4, 1, 2).unwrap();
+	let core_dist_gpu = GpuBuffer::alloc(4).unwrap();
+	cluster::gpu_core_distance(&points, 4, 1, 2, &core_dist_gpu).unwrap();
 
 	let mut cd = [0.0f64; 4];
 	core_dist_gpu.download(&mut cd).unwrap();

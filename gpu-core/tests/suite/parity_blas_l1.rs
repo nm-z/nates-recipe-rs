@@ -61,7 +61,9 @@ fn ddot_parity() {
             let b = make_seq(n, 2);
             let ga = GpuBuffer::upload(&a).unwrap();
             let gb = GpuBuffer::upload(&b).unwrap();
-            let got = linalg::gpu_ddot(&ga, &gb, n).unwrap();
+            let out = GpuBuffer::alloc(1).unwrap();
+            linalg::gpu_ddot(&ga, &gb, n, &out).unwrap();
+            let got = out.download_vec().unwrap()[0];
             let want = cpu_ddot(&a, &b);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -82,7 +84,9 @@ fn dnrm2_parity() {
       for &n in SIZES {
             let x = make_seq(n, 3);
             let gx = GpuBuffer::upload(&x).unwrap();
-            let got = linalg::gpu_dnrm2(&gx, n).unwrap();
+            let out = GpuBuffer::alloc(1).unwrap();
+            linalg::gpu_dnrm2(&gx, n, &out).unwrap();
+            let got = out.download_vec().unwrap()[0];
             let want = cpu_dnrm2(&x);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -103,7 +107,9 @@ fn dasum_parity() {
       for &n in SIZES {
             let x = make_seq(n, 4);
             let gx = GpuBuffer::upload(&x).unwrap();
-            let got = linalg::gpu_dasum(&gx, n).unwrap();
+            let out = GpuBuffer::alloc(1).unwrap();
+            linalg::gpu_dasum(&gx, n, &out).unwrap();
+            let got = out.download_vec().unwrap()[0];
             let want = cpu_dasum(&x);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -123,7 +129,9 @@ fn idamax_parity() {
       for &n in SIZES {
             let x = make_seq(n, 5);
             let gx = GpuBuffer::upload(&x).unwrap();
-            let got = linalg::gpu_idamax(&gx, n).unwrap();
+            let out = GpuBuffer::alloc(1).unwrap();
+            linalg::gpu_idamax(&gx, n, &out).unwrap();
+            let got = out.download_vec().unwrap()[0].round() as usize;
             let want = cpu_idamax(&x);
             assert_eq!(
                   got, want,
@@ -136,6 +144,8 @@ fn idamax_parity() {
       let mut x = make_seq(50, 6);
       x[37] = -99.0;
       let gx = GpuBuffer::upload(&x).unwrap();
-      let got = linalg::gpu_idamax(&gx, x.len()).unwrap();
+      let out = GpuBuffer::alloc(1).unwrap();
+      linalg::gpu_idamax(&gx, x.len(), &out).unwrap();
+      let got = out.download_vec().unwrap()[0].round() as usize;
       assert_eq!(got, 37, "idamax negative-spike: gpu={got} want=37");
 }

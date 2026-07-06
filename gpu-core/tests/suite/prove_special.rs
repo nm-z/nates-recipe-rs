@@ -63,11 +63,12 @@ fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-// Existing k_mathx unary ops carry signature (x, n) -> GpuBuffer.
-type Km = fn(&GpuBuffer, usize) -> Result<GpuBuffer, gpu_core::hip::HipError>;
+// Existing k_mathx unary ops carry signature (x, n, out) -> ().
+type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::hip::HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = f(&b, x.len()).unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out

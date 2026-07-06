@@ -58,21 +58,32 @@ fn run_scanx(f: Launch, x: &[f64]) -> Vec<f64> {
 fn g_cumsum(x: &[f64]) -> Vec<f64> {
 	// gpu_cumsum_rows: 1 row × n cols => inclusive prefix sum over the row.
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = gpu_core::reductions::gpu_cumsum_rows(&b, 1, x.len()).unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	gpu_core::reductions::gpu_cumsum_rows(&b, 1, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out
 }
 fn g_cumprod(x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = gpu_core::reductions::gpu_cumprod(&b, x.len()).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_cumprod_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	gpu_core::reductions::gpu_cumprod(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out
 }
 fn g_cummax(x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = gpu_core::reductions::gpu_cummax(&b, x.len()).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_cummax_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	gpu_core::reductions::gpu_cummax(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out

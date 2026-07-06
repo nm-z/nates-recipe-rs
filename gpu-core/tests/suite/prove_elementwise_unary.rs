@@ -90,10 +90,11 @@ fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-type UnaryGpu = fn(&GpuBuffer, usize) -> Result<GpuBuffer, HipError>;
+type UnaryGpu = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_existing(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = f(&b, x.len()).unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out
@@ -132,6 +133,13 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round,
 		gpu_rsqrt, gpu_sin, gpu_tan, gpu_trunc,
 	};
+
+	// selu carries two scalar params (alpha, lambda); wrap to the standard unary form.
+	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let a = GpuBuffer::upload(&[1.6732632423543772f64])?;
+		let l = GpuBuffer::upload(&[1.0507009873554805f64])?;
+		gpu_selu(x, &a, &l, n, out)
+	}
 
 	let std_probe = probes(-3.0, 3.0, 64);
 	let pos_probe = probes(0.05, 5.0, 64);
@@ -246,7 +254,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!("rsqrt", gpu_rsqrt, |x| 1.0 / x.sqrt(), pos_probe);
 	e!(
 		"selu",
-		gpu_selu,
+		selu_w,
 		|x| {
 			let (a, l) = (1.6732632423543772, 1.0507009873554805);
 			l * if x > 0.0 { x } else { a * (x.exp() - 1.0) }
@@ -293,11 +301,13 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!("trunc", gpu_trunc, |x| x.trunc(), std_probe);
 	{
 		// elu/leaky_relu take a param; wrap to the standard unary form
-		fn elu1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-			gpu_core::k_gapact::gpu_elu(x, n, 1.0)
+		fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+			let a = GpuBuffer::upload(&[1.0f64])?;
+			gpu_core::k_gapact::gpu_elu(x, &a, n, out)
 		}
-		fn lrelu(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-			gpu_leaky_relu(x, n, 0.01)
+		fn lrelu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+			let a = GpuBuffer::upload(&[0.01f64])?;
+			gpu_leaky_relu(x, &a, n, out)
 		}
 		e!(
 			"elu",

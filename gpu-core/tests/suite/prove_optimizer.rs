@@ -113,7 +113,8 @@ fn prove_sgd() -> bool {
 	let g = gv(n);
 	let bw = GpuBuffer::upload(&w).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::kernels::gpu_sgd_update(&bw, &bg, lr, n);
+	let bneg_lr = GpuBuffer::upload(&[-lr]).unwrap();
+	gpu_core::kernels::gpu_sgd_update(&bg, &bneg_lr, n, &bw).unwrap();
 	let mut got = vec![0.0; n];
 	bw.download(&mut got).unwrap();
 	let want: Vec<f64> = (0..n).map(|i| w[i] - lr * g[i]).collect();
@@ -129,7 +130,9 @@ fn prove_momentum() -> bool {
 	let bw = GpuBuffer::upload(&w).unwrap();
 	let bv = GpuBuffer::upload(&v0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_momentum_update(&bw, &bv, &bg, lr, mu, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bmu = GpuBuffer::upload(&[mu]).unwrap();
+	gpu_core::optimizers::gpu_momentum_update(&bg, &blr, &bmu, n, &bw, &bv).unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let mut gvb = vec![0.0; n];
@@ -148,7 +151,10 @@ fn prove_rmsprop() -> bool {
 	let bw = GpuBuffer::upload(&w).unwrap();
 	let bc = GpuBuffer::upload(&c0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_rmsprop_update(&bw, &bc, &bg, lr, decay, eps, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bdecay = GpuBuffer::upload(&[decay]).unwrap();
+	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	gpu_core::optimizers::gpu_rmsprop_update(&bg, &blr, &bdecay, &beps, n, &bw, &bc).unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let mut gc = vec![0.0; n];
@@ -171,7 +177,9 @@ fn prove_adagrad() -> bool {
 	let bw = GpuBuffer::upload(&w).unwrap();
 	let ba = GpuBuffer::upload(&a0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_adagrad_update(&bw, &ba, &bg, lr, eps, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	gpu_core::optimizers::gpu_adagrad_update(&bg, &blr, &beps, n, &bw, &ba).unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let mut ga = vec![0.0; n];
@@ -192,7 +200,11 @@ fn prove_lion() -> bool {
 	let bw = GpuBuffer::upload(&w).unwrap();
 	let bm = GpuBuffer::upload(&m0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_lion_update(&bw, &bm, &bg, lr, b1, b2, wd, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
+	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
+	let bwd = GpuBuffer::upload(&[wd]).unwrap();
+	gpu_core::optimizers::gpu_lion_update(&bg, &blr, &bb1, &bb2, &bwd, n, &bw, &bm).unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let mut gm = vec![0.0; n];
@@ -227,7 +239,11 @@ fn prove_adam() -> bool {
 	let bm = GpuBuffer::upload(&m0).unwrap();
 	let bv = GpuBuffer::upload(&v0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::kernels::gpu_adam_update(&bw, &bm, &bv, &bg, lr, b1, b2, eps, t, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
+	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
+	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	gpu_core::kernels::gpu_adam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv).unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
@@ -253,7 +269,13 @@ fn prove_adamw() -> bool {
 	let bm = GpuBuffer::upload(&m0).unwrap();
 	let bv = GpuBuffer::upload(&v0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::kernels::gpu_adamw_update(&bw, &bm, &bv, &bg, lr, b1, b2, eps, wd, t, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
+	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
+	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	let bwd = GpuBuffer::upload(&[wd]).unwrap();
+	gpu_core::kernels::gpu_adamw_update(&bg, &blr, &bb1, &bb2, &beps, &bwd, t, n, &bw, &bm, &bv)
+		.unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
@@ -280,7 +302,12 @@ fn prove_nadam() -> bool {
 	let bm = GpuBuffer::upload(&m0).unwrap();
 	let bv = GpuBuffer::upload(&v0).unwrap();
 	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_nadam_update(&bw, &bm, &bv, &bg, lr, b1, b2, eps, t as i32, n);
+	let blr = GpuBuffer::upload(&[lr]).unwrap();
+	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
+	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
+	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	gpu_core::optimizers::gpu_nadam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
+		.unwrap();
 	let mut gw = vec![0.0; n];
 	bw.download(&mut gw).unwrap();
 	let bc1t = 1.0 - b1.powi(t as i32);

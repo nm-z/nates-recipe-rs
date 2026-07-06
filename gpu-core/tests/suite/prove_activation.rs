@@ -90,11 +90,12 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-// existing k_* unary ops: (x, n) -> GpuBuffer
-type Km = fn(&GpuBuffer, usize) -> Result<GpuBuffer, HipError>;
+// existing k_* unary ops: (x, n, out) -> ()
+type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = f(&b, x.len()).unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out
@@ -150,8 +151,14 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	km!("silu", gpu_silu, |x| x / (1.0 + (-x).exp()), -6.0, 6.0);
 
 	use gpu_core::k_gapact::{gpu_hardswish, gpu_mish, gpu_selu, gpu_softplus};
-	fn elu1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::k_gapact::gpu_elu(x, n, 1.0)
+	fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let a = GpuBuffer::upload(&[1.0f64])?;
+		gpu_core::k_gapact::gpu_elu(x, &a, n, out)
+	}
+	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let a = GpuBuffer::upload(&[1.6732632423543772f64])?;
+		let l = GpuBuffer::upload(&[1.0507009873554805f64])?;
+		gpu_selu(x, &a, &l, n, out)
 	}
 	km!(
 		"elu",
@@ -162,7 +169,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	);
 	km!(
 		"selu",
-		gpu_selu,
+		selu_w,
 		|x| {
 			let (a, l) = (1.6732632423543772, 1.0507009873554805);
 			l * if x > 0.0 { x } else { a * (x.exp() - 1.0) }
@@ -196,14 +203,17 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		gpu_gelu_exact, gpu_hardsigmoid, gpu_hardtanh, gpu_logsigmoid, gpu_relu6,
 		gpu_softshrink, gpu_softsign, gpu_tanhshrink,
 	};
-	fn celu1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::k_actx::gpu_celu(x, n, 1.0)
+	fn celu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[1.0f64])?;
+		gpu_core::k_actx::gpu_celu(x, &p, n, out)
 	}
-	fn hardshrink05(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::k_actx::gpu_hardshrink(x, n, 0.5)
+	fn hardshrink05(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[0.5f64])?;
+		gpu_core::k_actx::gpu_hardshrink(x, &p, n, out)
 	}
-	fn thresh1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::k_actx::gpu_thresholdedrelu(x, n, 1.0)
+	fn thresh1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[1.0f64])?;
+		gpu_core::k_actx::gpu_thresholdedrelu(x, &p, n, out)
 	}
 	km!("relu6", gpu_relu6, |x| x.clamp(0.0, 6.0), -4.0, 8.0);
 	km!(
@@ -653,7 +663,7 @@ fn prove_activation() {
 
 	// ── row-wise softmax / log_softmax (existing kernels, (rows,cols) sig) ──
 	{
-		use gpu_core::kernels::{gpu_log_softmax_rows, gpu_softmax_rows};
+		use gpu_core::kernels::{gpu_log_softmax_rows, gpu_softmax_rows_into};
 		let (rows, cols) = (5usize, 7usize);
 		let mut x = vec![0.0f64; rows * cols];
 		for r in 0..rows {
@@ -663,10 +673,12 @@ fn prove_activation() {
 		}
 		let bx = GpuBuffer::upload(&x).unwrap();
 
-		let sm = gpu_softmax_rows(&bx, rows, cols).unwrap();
+		let sm = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_softmax_rows_into(&bx, rows, cols, &sm).unwrap();
 		let mut gsm = vec![0.0; rows * cols];
 		sm.download(&mut gsm).unwrap();
-		let lsm = gpu_log_softmax_rows(&bx, rows, cols).unwrap();
+		let lsm = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_log_softmax_rows(&bx, rows, cols, &lsm).unwrap();
 		let mut glsm = vec![0.0; rows * cols];
 		lsm.download(&mut glsm).unwrap();
 
@@ -704,7 +716,9 @@ fn prove_activation() {
 		let alpha = 0.01;
 		let xs = probes(-3.0, 3.0, 32);
 		let bx = GpuBuffer::upload(&xs).unwrap();
-		let o = gpu_leaky_relu(&bx, xs.len(), alpha).unwrap();
+		let ba = GpuBuffer::upload(&[alpha]).unwrap();
+		let o = GpuBuffer::alloc(xs.len()).unwrap();
+		gpu_leaky_relu(&bx, &ba, xs.len(), &o).unwrap();
 		let mut got = vec![0.0; xs.len()];
 		o.download(&mut got).unwrap();
 		let ok = xs
@@ -724,10 +738,12 @@ fn prove_activation() {
 		let b = probes(-5.0, 5.0, 32);
 		let ba = GpuBuffer::upload(&a).unwrap();
 		let bb = GpuBuffer::upload(&b).unwrap();
-		let sw = gpu_swiglu(&ba, &bb, a.len()).unwrap();
+		let sw = GpuBuffer::alloc(a.len()).unwrap();
+		gpu_swiglu(&ba, &bb, a.len(), &sw).unwrap();
 		let mut gsw = vec![0.0; a.len()];
 		sw.download(&mut gsw).unwrap();
-		let ge = gpu_geglu(&ba, &bb, a.len()).unwrap();
+		let ge = GpuBuffer::alloc(a.len()).unwrap();
+		gpu_geglu(&ba, &bb, a.len(), &ge).unwrap();
 		let mut gge = vec![0.0; a.len()];
 		ge.download(&mut gge).unwrap();
 		let mut sw_ok = true;

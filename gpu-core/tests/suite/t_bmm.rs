@@ -57,7 +57,6 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 	let bg = GpuBuffer::upload(&b).expect("b");
 	let cg = GpuBuffer::alloc(batch * m * n).expect("c");
 	gpu_bmm_into(
-		&cg,
 		&ag,
 		&bg,
 		batch,
@@ -73,9 +72,11 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 		0,
 		0,
 		0,
-		ta,
-		tb,
-	);
+		ta as usize,
+		tb as usize,
+		&cg,
+	)
+	.unwrap();
 	let mut got = vec![0.0f64; batch * m * n];
 	cg.download(&mut got).expect("dl");
 	let maxd = want
@@ -109,7 +110,6 @@ fn bmm_per_head_offset() {
 	for h in 0..heads {
 		// batch over n: A=Q head block, B=K head block, C=scores_h, opB=trans
 		gpu_bmm_into(
-			&scores,
 			&qg,
 			&kg,
 			n,
@@ -125,9 +125,11 @@ fn bmm_per_head_offset() {
 			h * hd,
 			h * hd,
 			h * n * s * s,
-			false,
-			true,
-		);
+			0,
+			1,
+			&scores,
+		)
+		.unwrap();
 	}
 	let mut got = vec![0.0f64; heads * n * s * s];
 	scores.download(&mut got).expect("dl");

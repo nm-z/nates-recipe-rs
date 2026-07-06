@@ -232,16 +232,17 @@ fn prove_distance() {
 	// ── existing kernels (proven against their TRUE convention) ──
 	// pairwise_l2 → SQUARED L2
 	{
-		let got = gpu_core::kernels::gpu_pairwise_l2(
+		let out = GpuBuffer::alloc(nq * nt).unwrap();
+		gpu_core::kernels::gpu_pairwise_l2(
 			&GpuBuffer::upload(&q).unwrap(),
 			&GpuBuffer::upload(&t).unwrap(),
 			nq,
 			nt,
 			dim,
+			&out,
 		)
-		.unwrap()
-		.download_vec()
 		.unwrap();
+		let got = out.download_vec().unwrap();
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 		});
@@ -249,16 +250,17 @@ fn prove_distance() {
 	}
 	// pairwise_cosine → cosine SIMILARITY
 	{
-		let got = gpu_core::encoding::gpu_pairwise_cosine(
+		let out = GpuBuffer::alloc(nq * nt).unwrap();
+		gpu_core::encoding::gpu_pairwise_cosine(
 			&GpuBuffer::upload(&q).unwrap(),
 			&GpuBuffer::upload(&t).unwrap(),
 			nq,
 			nt,
 			dim,
+			&out,
 		)
-		.unwrap()
-		.download_vec()
 		.unwrap();
+		let got = out.download_vec().unwrap();
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
 			let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -270,16 +272,17 @@ fn prove_distance() {
 	}
 	// pairwise_l1 → L1
 	{
-		let got = gpu_core::encoding::gpu_pairwise_l1(
+		let out = GpuBuffer::alloc(nq * nt).unwrap();
+		gpu_core::encoding::gpu_pairwise_l1(
 			&GpuBuffer::upload(&q).unwrap(),
 			&GpuBuffer::upload(&t).unwrap(),
 			nq,
 			nt,
 			dim,
+			&out,
 		)
-		.unwrap()
-		.download_vec()
 		.unwrap();
+		let got = out.download_vec().unwrap();
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
 		});
@@ -298,16 +301,17 @@ fn prove_distance() {
 		for (i, v) in tu.iter_mut().enumerate() {
 			*v = ((i * 2 + 2) % 4) as u8;
 		}
-		let got = gpu_core::encoding::gpu_pairwise_hamming(
+		let out = GpuBuffer::alloc(nqh * nth).unwrap();
+		gpu_core::encoding::gpu_pairwise_hamming(
 			&GpuBuffer::upload_u8(&qu).unwrap(),
 			&GpuBuffer::upload_u8(&tu).unwrap(),
 			nqh,
 			nth,
 			qd,
+			&out,
 		)
-		.unwrap()
-		.download_vec()
 		.unwrap();
+		let got = out.download_vec().unwrap();
 		let mut want = vec![0.0; nqh * nth];
 		for qi in 0..nqh {
 			for ti in 0..nth {
@@ -399,16 +403,17 @@ fn prove_distance() {
 		});
 		assert_op("euclidean", mink2.clone(), want, &mut failures);
 		// bonus cross-check: GPU minkowski(p=2) == sqrt(GPU squared-L2 kernel)
-		let l2sq = gpu_core::kernels::gpu_pairwise_l2(
+		let l2out = GpuBuffer::alloc(nq * nt).unwrap();
+		gpu_core::kernels::gpu_pairwise_l2(
 			&GpuBuffer::upload(&q).unwrap(),
 			&GpuBuffer::upload(&t).unwrap(),
 			nq,
 			nt,
 			dim,
+			&l2out,
 		)
-		.unwrap()
-		.download_vec()
 		.unwrap();
+		let l2sq = l2out.download_vec().unwrap();
 		let l2root: Vec<f64> = l2sq.iter().map(|v| v.sqrt()).collect();
 		if close(&mink2, &l2root).is_some() {
 			failures.push("minkowski(p=2) != sqrt(l2_squared)".into());

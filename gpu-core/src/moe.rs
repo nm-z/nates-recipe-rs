@@ -1,6 +1,6 @@
 use crate::hip::{HipError, check};
 use crate::kernels::{
-	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_gemm_bt,
+	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_gemm_bt_into,
 	gpu_softmax_backward_into, gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
@@ -178,7 +178,7 @@ pub fn gpu_moe_backward(
 			d_out, &gate, &ye, n_tokens, d_model, n_experts, e, &d_ye, &d_gate,
 		)?;
 		// d_hidden += d_ye · Weᵀ
-		gpu_gemm_bt(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
+		gpu_gemm_bt_into(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
 		gpu_add_inplace(&dh_e, n_tokens * d_model, &d_hidden)?;
 		// d_We = hiddenᵀ · d_ye  →  d_expert_w[e]
 		gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens, &dwe)?;
@@ -188,7 +188,7 @@ pub fn gpu_moe_backward(
 	let d_logits = GpuBuffer::alloc(n_tokens * n_experts)?;
 	gpu_softmax_backward_into(&d_gate, &gate, n_tokens, n_experts, &d_logits)?;
 	let dh_r = GpuBuffer::alloc(n_tokens * d_model)?;
-	gpu_gemm_bt(&d_logits, gate_w, n_tokens, d_model, n_experts, &dh_r)?;
+	gpu_gemm_bt_into(&d_logits, gate_w, n_tokens, d_model, n_experts, &dh_r)?;
 	gpu_add_inplace(&dh_r, n_tokens * d_model, &d_hidden)?;
 	let d_gate_w = GpuBuffer::alloc(d_model * n_experts)?;
 	gpu_gemm_at(hidden, &d_logits, d_model, n_experts, n_tokens, &d_gate_w)?;

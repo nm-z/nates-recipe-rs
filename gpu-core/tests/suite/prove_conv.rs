@@ -602,10 +602,9 @@ fn prove_im2col_2d() -> bool {
 	let x = fill(n * c * h * w, 81);
 	let bx = GpuBuffer::upload(&x).unwrap();
 	let mut got = vec![0.0; n * oh * ow * c * kh * kw];
-	gpu_im2col_2d(&bx, n, c, h, w, kh, kw)
-		.unwrap()
-		.download(&mut got)
-		.unwrap();
+	let bout = GpuBuffer::alloc(n * oh * ow * c * kh * kw).unwrap();
+	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &bout).unwrap();
+	bout.download(&mut got).unwrap();
 	// Oracle: patches[(n*oh*ow), (c*kh*kw)], patch[(...,p),(c,ph,pw)] = x[n,c,oh+ph,ow+pw]
 	let ps = c * kh * kw;
 	let mut want = vec![0.0; n * oh * ow * ps];
@@ -635,10 +634,9 @@ fn prove_im2col_1d() -> bool {
 	let x = fill(n * p, 91);
 	let bx = GpuBuffer::upload(&x).unwrap();
 	let mut got = vec![0.0; n * out_len * ks];
-	gpu_im2col_1d(&bx, n, p, ks)
-		.unwrap()
-		.download(&mut got)
-		.unwrap();
+	let bout = GpuBuffer::alloc(n * out_len * ks).unwrap();
+	gpu_im2col_1d(&bx, n, p, ks, &bout).unwrap();
+	bout.download(&mut got).unwrap();
 	let mut want = vec![0.0; n * out_len * ks];
 	for i in 0..n {
 		for t in 0..out_len {
@@ -658,12 +656,13 @@ fn prove_col2im_2d() -> bool {
 	let (kh, kw) = (2, 3);
 	let x = fill(n * c * h * w, 101);
 	let bx = GpuBuffer::upload(&x).unwrap();
-	let patches = gpu_im2col_2d(&bx, n, c, h, w, kh, kw).unwrap();
+	let (poh, pow) = (h - kh + 1, w - kw + 1);
+	let patches = GpuBuffer::alloc(n * poh * pow * c * kh * kw).unwrap();
+	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &patches).unwrap();
 	let mut got = vec![0.0; n * c * h * w];
-	gpu_col2im_2d(&patches, n, c, h, w, kh, kw)
-		.unwrap()
-		.download(&mut got)
-		.unwrap();
+	let bout = GpuBuffer::alloc(n * c * h * w).unwrap();
+	gpu_col2im_2d(&patches, n, c, h, w, kh, kw, &bout).unwrap();
+	bout.download(&mut got).unwrap();
 	// Oracle: scatter-add the same patch values back; equals x scaled by per-cell
 	// overlap multiplicity (number of (oh,ow) windows covering that cell).
 	let (oh, ow) = (h - kh + 1, w - kw + 1);
@@ -693,12 +692,12 @@ fn prove_col2im_1d() -> bool {
 	let out_len = p - ks + 1;
 	let x = fill(n * p, 111);
 	let bx = GpuBuffer::upload(&x).unwrap();
-	let patches = gpu_im2col_1d(&bx, n, p, ks).unwrap();
+	let patches = GpuBuffer::alloc(n * out_len * ks).unwrap();
+	gpu_im2col_1d(&bx, n, p, ks, &patches).unwrap();
 	let mut got = vec![0.0; n * p];
-	gpu_col2im_1d(&patches, n, p, ks)
-		.unwrap()
-		.download(&mut got)
-		.unwrap();
+	let bout = GpuBuffer::alloc(n * p).unwrap();
+	gpu_col2im_1d(&patches, n, p, ks, &bout).unwrap();
+	bout.download(&mut got).unwrap();
 	let mut want = vec![0.0; n * p];
 	for i in 0..n {
 		for t in 0..out_len {

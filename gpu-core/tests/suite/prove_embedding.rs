@@ -292,7 +292,8 @@ fn prove_embedding_lookup_bwd() -> bool {
 	let grad_out: Vec<f32> = (0..n * cols).map(|i| (i as f32) * 0.05 - 0.3).collect();
 	let bg = GpuBuffer::upload_f32(&grad_out).unwrap();
 	let bi = GpuBuffer::upload_i32(&indices).unwrap();
-	let gt = gpu_core::attention::gpu_embedding_backward(&bg, &bi, n, cols, vocab).unwrap();
+	let gt = GpuBuffer::zeros_f32(vocab * cols).unwrap();
+	gpu_core::attention::gpu_embedding_backward(&bg, &bi, n, cols, vocab, &gt).unwrap();
 	let mut got = vec![0.0f32; vocab * cols];
 	gt.download_f32(&mut got).unwrap();
 	// Rust scatter-add oracle

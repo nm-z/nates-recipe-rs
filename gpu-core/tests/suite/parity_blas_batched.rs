@@ -87,7 +87,6 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
       let cg = GpuBuffer::alloc(batch * m * n).unwrap();
 
       linalg::gpu_bmm_into(
-            &cg,
             &ag,
             &bg,
             batch,
@@ -103,9 +102,11 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
             0,
             0,
             0,
-            ta,
-            tb,
-      );
+            ta as usize,
+            tb as usize,
+            &cg,
+      )
+      .unwrap();
 
       let got = cg.download_vec().unwrap();
       let d = max_abs_diff(&want, &got);
@@ -159,8 +160,9 @@ fn bmm_parity_two_batch_explicit() {
       let bg = GpuBuffer::upload(&b).unwrap();
       let cg = GpuBuffer::alloc(batch * m * n).unwrap();
       linalg::gpu_bmm_into(
-            &cg, &ag, &bg, batch, m, n, k, k, n, n, m * k, k * n, m * n, 0, 0, 0, false, false,
-      );
+            &ag, &bg, batch, m, n, k, k, n, n, m * k, k * n, m * n, 0, 0, 0, 0, 0, &cg,
+      )
+      .unwrap();
       let got = cg.download_vec().unwrap();
       let d = max_abs_diff(&want, &got);
       assert!(d < 1e-9, "explicit 2-batch bmm maxdiff={d:.3e}");
@@ -186,8 +188,10 @@ fn gemm_pipeline_compose_parity() {
       let xg = GpuBuffer::upload(&x).unwrap();
       let w1g = GpuBuffer::upload(&w1).unwrap();
       let w2g = GpuBuffer::upload(&w2).unwrap();
-      let hg = kernels::gpu_gemm(&xg, &w1g, rows, f1, f0).unwrap();
-      let yg = kernels::gpu_gemm(&hg, &w2g, rows, f2, f1).unwrap();
+      let hg = GpuBuffer::alloc(rows * f1).unwrap();
+      kernels::gpu_gemm(&xg, &w1g, rows, f1, f0, &hg).unwrap();
+      let yg = GpuBuffer::alloc(rows * f2).unwrap();
+      kernels::gpu_gemm(&hg, &w2g, rows, f2, f1, &yg).unwrap();
 
       // Intermediate parity.
       let h_gpu = hg.download_vec().unwrap();

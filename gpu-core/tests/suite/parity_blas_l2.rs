@@ -84,7 +84,8 @@ fn dgemv_notrans_parity() {
 
 		let ga = GpuBuffer::upload(&a).unwrap();
 		let gx = GpuBuffer::upload(&x).unwrap();
-		let gy = linalg::gpu_dgemv(&ga, &gx, m, n, false).unwrap();
+		let gy = GpuBuffer::alloc(m).unwrap();
+		linalg::gpu_dgemv(&ga, &gx, m, n, 0, &gy).unwrap();
 		let got = gy.download_vec().unwrap();
 
 		let expect = cpu_gemv_notrans(&a, &x, m, n);
@@ -106,7 +107,8 @@ fn dgemv_trans_parity() {
 
 		let ga = GpuBuffer::upload(&a).unwrap();
 		let gx = GpuBuffer::upload(&x).unwrap();
-		let gy = linalg::gpu_dgemv(&ga, &gx, m, n, true).unwrap();
+		let gy = GpuBuffer::alloc(n).unwrap();
+		linalg::gpu_dgemv(&ga, &gx, m, n, 1, &gy).unwrap();
 		let got = gy.download_vec().unwrap();
 
 		let expect = cpu_gemv_trans(&a, &x, m, n);
@@ -128,7 +130,9 @@ fn dger_parity() {
 
 		let gx = GpuBuffer::upload(&x).unwrap();
 		let gy = GpuBuffer::upload(&y).unwrap();
-		let ga = linalg::gpu_dger(&gx, &gy, m, n).unwrap();
+		let ga = GpuBuffer::alloc(m * n).unwrap();
+		ga.memset_zero(m * n * 8).unwrap();
+		linalg::gpu_dger(&gx, &gy, m, n, &ga).unwrap();
 		let got = ga.download_vec().unwrap();
 
 		let expect = cpu_ger(&x, &y, m, n);

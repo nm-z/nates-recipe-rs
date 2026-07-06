@@ -119,10 +119,11 @@ fn flash_train_matches_cpu_oracle() {
 	let gdk = GpuBuffer::alloc(len).expect("dk");
 	let gdv = GpuBuffer::alloc(len).expect("dv");
 
-	gpu_flash_attention_train_into(&gq, &gk, &gv, &gctx, &glse, n, s, d, heads);
+	gpu_flash_attention_train_into(&gq, &gk, &gv, n, s, d, heads, &gctx, &glse).unwrap();
 	gpu_flash_attention_backward_into(
-		&gq, &gk, &gv, &gctx, &gdctx, &glse, &gdsum, &gdq, &gdk, &gdv, n, s, d, heads,
-	);
+		&gq, &gk, &gv, &gctx, &gdctx, &glse, n, s, d, heads, &gdsum, &gdq, &gdk, &gdv,
+	)
+	.unwrap();
 
 	let dl = |b: &GpuBuffer, l: usize| {
 		let mut h = vec![0.0; l];

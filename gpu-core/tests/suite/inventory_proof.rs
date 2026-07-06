@@ -12,8 +12,10 @@ use gpu_core::hip::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::HashMap;
 
-type UnaryGpu = fn(&GpuBuffer, usize) -> Result<GpuBuffer, HipError>;
-type BinaryGpu = fn(&GpuBuffer, &GpuBuffer, usize) -> Result<GpuBuffer, HipError>;
+// Ops now write into a caller-provided `out` and return Result<(), _>. The proof
+// harness allocates the out buffer, invokes the op, then downloads to assert.
+type UnaryGpu = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
+type BinaryGpu = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 
 struct UnaryOp {
 	gpu: UnaryGpu,
@@ -37,7 +39,8 @@ fn probes(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 
 fn run_unary(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
 	let b = GpuBuffer::upload(x).unwrap();
-	let o = f(&b, x.len()).unwrap();
+	let o = GpuBuffer::alloc(x.len()).unwrap();
+	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
 	o.download(&mut out).unwrap();
 	out
@@ -45,7 +48,8 @@ fn run_unary(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
 fn run_binary(f: BinaryGpu, a: &[f64], b: &[f64]) -> Vec<f64> {
 	let ba = GpuBuffer::upload(a).unwrap();
 	let bb = GpuBuffer::upload(b).unwrap();
-	let o = f(&ba, &bb, a.len()).unwrap();
+	let o = GpuBuffer::alloc(a.len()).unwrap();
+	f(&ba, &bb, a.len(), &o).unwrap();
 	let mut out = vec![0.0; a.len()];
 	o.download(&mut out).unwrap();
 	out
@@ -137,8 +141,15 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	u!("rad2deg", gpu_rad2deg, |x| x.to_degrees(), -3.0, 3.0);
 	// gap activations
 	use gpu_core::k_gapact::{gpu_hardswish, gpu_mish, gpu_selu, gpu_softplus};
-	fn elu1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::k_gapact::gpu_elu(x, n, 1.0)
+	// device-scalar params (alpha/lambda) upload once inside each wrapper.
+	fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let a = GpuBuffer::upload(&[1.0])?;
+		gpu_core::k_gapact::gpu_elu(x, &a, n, out)
+	}
+	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let a = GpuBuffer::upload(&[1.6732632423543772])?;
+		let l = GpuBuffer::upload(&[1.0507009873554805])?;
+		gpu_selu(x, &a, &l, n, out)
 	}
 	u!(
 		"elu",
@@ -149,7 +160,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	);
 	u!(
 		"selu",
-		gpu_selu,
+		selu_w,
 		|x| {
 			let (a, l) = (1.6732632423543772, 1.0507009873554805);
 			l * if x > 0.0 { x } else { a * (x.exp() - 1.0) }
@@ -180,14 +191,17 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	);
 	// actx gap activations
 	use gpu_core::k_actx::*;
-	fn celu1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_celu(x, n, 1.0)
+	fn celu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[1.0])?;
+		gpu_celu(x, &p, n, out)
 	}
-	fn hardshrink05(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_hardshrink(x, n, 0.5)
+	fn hardshrink05(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[0.5])?;
+		gpu_hardshrink(x, &p, n, out)
 	}
-	fn thresh1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_thresholdedrelu(x, n, 1.0)
+	fn thresh1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		let p = GpuBuffer::upload(&[1.0])?;
+		gpu_thresholdedrelu(x, &p, n, out)
 	}
 	u!("relu6", gpu_relu6, |x| x.clamp(0.0, 6.0), -4.0, 8.0);
 	u!(
@@ -317,6 +331,9 @@ fn binary_registry() -> HashMap<&'static str, BinaryOp> {
 	m
 }
 
+// Reduce ops write a device scalar into a 1-elem `out`; the harness downloads it.
+// Wrappers allocate any workspace (sized via the paired *_workspace_bytes helper)
+// and the out scalar, then read the value back — download-and-assert is test-side.
 type ReduceGpu = fn(&GpuBuffer, usize) -> Result<f64, HipError>;
 struct ReduceOp {
 	gpu: ReduceGpu,
@@ -337,8 +354,51 @@ struct ScanOp {
 fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 	use gpu_core::linalg::gpu_dasum;
 	use gpu_core::reductions::{
-		gpu_l2_norm, gpu_max_all, gpu_mean_all, gpu_min_all, gpu_sum_all,
+		gpu_l2_norm, gpu_l2_norm_workspace_bytes, gpu_max_all, gpu_max_all_workspace_bytes,
+		gpu_mean_all, gpu_mean_all_workspace_bytes, gpu_min_all, gpu_min_all_workspace_bytes,
+		gpu_sum_all, gpu_sum_all_workspace_bytes,
 	};
+	fn red_scalar(x: &GpuBuffer) -> Result<f64, HipError> {
+		let mut o = [0.0];
+		x.download(&mut o)?;
+		Ok(o[0])
+	}
+	fn red_sum(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_sum_all_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(1)?;
+		gpu_sum_all(x, &ws, n, &out)?;
+		red_scalar(&out)
+	}
+	fn red_mean(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_mean_all_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(1)?;
+		gpu_mean_all(x, &ws, n, &out)?;
+		red_scalar(&out)
+	}
+	fn red_max(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_max_all_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(1)?;
+		gpu_max_all(x, &ws, n, &out)?;
+		red_scalar(&out)
+	}
+	fn red_min(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_min_all_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(1)?;
+		gpu_min_all(x, &ws, n, &out)?;
+		red_scalar(&out)
+	}
+	fn red_norm(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_l2_norm_workspace_bytes(n))?;
+		let sq = GpuBuffer::alloc(n)?;
+		let out = GpuBuffer::alloc(1)?;
+		gpu_l2_norm(x, &ws, &sq, n, &out)?;
+		red_scalar(&out)
+	}
+	fn red_asum(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+		let out = GpuBuffer::alloc(1)?;
+		gpu_dasum(x, n, &out)?;
+		red_scalar(&out)
+	}
 	let mut m: HashMap<&'static str, ReduceOp> = HashMap::new();
 	macro_rules! r {
 		($k:literal, $g:expr, $o:expr) => {
@@ -354,23 +414,23 @@ fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 			);
 		};
 	}
-	r!("redsum", gpu_sum_all, |x: &[f64]| x.iter().sum());
-	r!("redmean", gpu_mean_all, |x: &[f64]| x.iter().sum::<f64>()
+	r!("redsum", red_sum, |x: &[f64]| x.iter().sum());
+	r!("redmean", red_mean, |x: &[f64]| x.iter().sum::<f64>()
 		/ x.len() as f64);
-	r!("redmax", gpu_max_all, |x: &[f64]| x
+	r!("redmax", red_max, |x: &[f64]| x
 		.iter()
 		.cloned()
 		.fold(f64::NEG_INFINITY, f64::max));
-	r!("redmin", gpu_min_all, |x: &[f64]| x
+	r!("redmin", red_min, |x: &[f64]| x
 		.iter()
 		.cloned()
 		.fold(f64::INFINITY, f64::min));
-	r!("rednorm", gpu_l2_norm, |x: &[f64]| x
+	r!("rednorm", red_norm, |x: &[f64]| x
 		.iter()
 		.map(|v| v * v)
 		.sum::<f64>()
 		.sqrt());
-	r!("asum", gpu_dasum, |x: &[f64]| x
+	r!("asum", red_asum, |x: &[f64]| x
 		.iter()
 		.map(|v| v.abs())
 		.sum());
@@ -379,7 +439,9 @@ fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 
 // Complex proofs (matmul/dot/scal/softmax): run ONCE, map all alias keys to the pass/fail bool.
 fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
-	use gpu_core::kernels::{gpu_gemm, gpu_log_softmax_rows, gpu_scale, gpu_softmax_rows};
+	use gpu_core::kernels::{
+		gpu_gemm, gpu_log_softmax_rows, gpu_scale, gpu_softmax_rows_into,
+	};
 	use gpu_core::linalg::gpu_ddot;
 	let mut m: HashMap<&'static str, bool> = HashMap::new();
 	let mut fails: Vec<String> = Vec::new();
@@ -396,7 +458,8 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let run_gemm = || {
 		let ga = GpuBuffer::upload(&a).unwrap();
 		let gb = GpuBuffer::upload(&b).unwrap();
-		let gc = gpu_gemm(&ga, &gb, mm, nn, kk).unwrap();
+		let gc = GpuBuffer::alloc(mm * nn).unwrap();
+		gpu_gemm(&ga, &gb, mm, nn, kk, &gc).unwrap();
 		let mut o = vec![0.0; mm * nn];
 		gc.download(&mut o).unwrap();
 		o
@@ -436,7 +499,11 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let d = {
 		let ga = GpuBuffer::upload(&av).unwrap();
 		let gb = GpuBuffer::upload(&bv).unwrap();
-		gpu_ddot(&ga, &gb, 16).unwrap()
+		let out = GpuBuffer::alloc(1).unwrap();
+		gpu_ddot(&ga, &gb, 16, &out).unwrap();
+		let mut o = [0.0];
+		out.download(&mut o).unwrap();
+		o[0]
 	};
 	let wd: f64 = av.iter().zip(&bv).map(|(x, y)| x * y).sum();
 	let ok = (d - wd).abs() <= 1e-9 * (1.0 + wd.abs());
@@ -445,11 +512,13 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("dot".into());
 	}
 
-	// scal: y = alpha·x
+	// scal: y = alpha·x  (alpha uploaded once as a 1-elem device scalar)
 	let xs: Vec<f64> = (0..16).map(|i| i as f64 * 0.1 - 0.5).collect();
 	let y = {
 		let gx = GpuBuffer::upload(&xs).unwrap();
-		let gy = gpu_scale(&gx, 2.5, 16).unwrap();
+		let scalar = GpuBuffer::upload(&[2.5]).unwrap();
+		let gy = GpuBuffer::alloc(16).unwrap();
+		gpu_scale(&gx, &scalar, 16, &gy).unwrap();
 		let mut o = vec![0.0; 16];
 		gy.download(&mut o).unwrap();
 		o
@@ -468,7 +537,8 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let ssum: f64 = ex.iter().sum();
 	let sm = {
 		let gx = GpuBuffer::upload(&sx).unwrap();
-		let gy = gpu_softmax_rows(&gx, 1, 5).unwrap();
+		let gy = GpuBuffer::alloc(5).unwrap();
+		gpu_softmax_rows_into(&gx, 1, 5, &gy).unwrap();
 		let mut o = vec![0.0; 5];
 		gy.download(&mut o).unwrap();
 		o
@@ -480,7 +550,8 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	}
 	let lsm = {
 		let gx = GpuBuffer::upload(&sx).unwrap();
-		let gy = gpu_log_softmax_rows(&gx, 1, 5).unwrap();
+		let gy = GpuBuffer::alloc(5).unwrap();
+		gpu_log_softmax_rows(&gx, 1, 5, &gy).unwrap();
 		let mut o = vec![0.0; 5];
 		gy.download(&mut o).unwrap();
 		o
@@ -493,7 +564,7 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	}
 
 	// gemv: y(m) = A(m,n)·x(n)
-	use gpu_core::kernels::gpu_cholesky;
+	use gpu_core::kernels::{gpu_cholesky, gpu_cholesky_workspace_bytes};
 	use gpu_core::linalg::{gpu_dgemv, gpu_dger, gpu_dsyrk};
 	let (gm, gn) = (3usize, 4usize);
 	let amat: Vec<f64> = (0..gm * gn).map(|i| i as f64 * 0.1 - 0.6).collect();
@@ -501,7 +572,8 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let yv = {
 		let ga = GpuBuffer::upload(&amat).unwrap();
 		let gx = GpuBuffer::upload(&xv).unwrap();
-		let gy = gpu_dgemv(&ga, &gx, gm, gn, false).unwrap();
+		let gy = GpuBuffer::alloc(gm).unwrap();
+		gpu_dgemv(&ga, &gx, gm, gn, 0, &gy).unwrap();
 		let mut o = vec![0.0; gm];
 		gy.download(&mut o).unwrap();
 		o
@@ -515,13 +587,14 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("gemv".into());
 	}
 
-	// ger: A(m,n) = x(m)·y(n)ᵀ
+	// ger: A(m,n) = x(m)·y(n)ᵀ  (dger accumulates → out pre-zeroed)
 	let xo: Vec<f64> = (0..gm).map(|i| i as f64 * 0.2 - 0.1).collect();
 	let yo: Vec<f64> = (0..gn).map(|i| i as f64 * 0.15 + 0.3).collect();
 	let ao = {
 		let gx = GpuBuffer::upload(&xo).unwrap();
 		let gy = GpuBuffer::upload(&yo).unwrap();
-		let ga = gpu_dger(&gx, &gy, gm, gn).unwrap();
+		let ga = GpuBuffer::zeros_bytes(gm * gn * std::mem::size_of::<f64>()).unwrap();
+		gpu_dger(&gx, &gy, gm, gn, &ga).unwrap();
 		let mut o = vec![0.0; gm * gn];
 		ga.download(&mut o).unwrap();
 		o
@@ -557,7 +630,10 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	}
 	let lmat = {
 		let ga = GpuBuffer::upload(&ca).unwrap();
-		let gl = gpu_cholesky(&ga, cn).unwrap();
+		let work = GpuBuffer::alloc_bytes(gpu_cholesky_workspace_bytes(cn)).unwrap();
+		let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>()).unwrap();
+		let gl = GpuBuffer::alloc(cn * cn).unwrap();
+		gpu_cholesky(&ga, cn, &work, &info, &gl).unwrap();
 		let mut o = vec![0.0; cn * cn];
 		gl.download(&mut o).unwrap();
 		o
@@ -584,7 +660,8 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let ta: Vec<f64> = (0..tm * tn).map(|i| i as f64 * 0.25 - 1.0).collect();
 	let tb = {
 		let ga = GpuBuffer::upload(&ta).unwrap();
-		let gt = gpu_transpose(&ga, tm, tn).unwrap();
+		let gt = GpuBuffer::alloc(tm * tn).unwrap();
+		gpu_transpose(&ga, tm, tn, &gt).unwrap();
 		let mut o = vec![0.0; tm * tn];
 		gt.download(&mut o).unwrap();
 		o
@@ -605,9 +682,26 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 }
 
 fn scan_registry() -> HashMap<&'static str, ScanOp> {
-	use gpu_core::reductions::{gpu_cummax, gpu_cumprod};
-	fn cumsum1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-		gpu_core::reductions::gpu_cumsum_rows(x, 1, n)
+	use gpu_core::reductions::{
+		gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod, gpu_cumprod_workspace_bytes,
+		gpu_cumsum_rows,
+	};
+	fn scan_cumsum(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
+		let out = GpuBuffer::alloc(n)?;
+		gpu_cumsum_rows(x, 1, n, &out)?;
+		Ok(out)
+	}
+	fn scan_cumprod(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_cumprod_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(n)?;
+		gpu_cumprod(x, &ws, n, &out)?;
+		Ok(out)
+	}
+	fn scan_cummax(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
+		let ws = GpuBuffer::alloc_bytes(gpu_cummax_workspace_bytes(n))?;
+		let out = GpuBuffer::alloc(n)?;
+		gpu_cummax(x, &ws, n, &out)?;
+		Ok(out)
 	}
 	let mut m: HashMap<&'static str, ScanOp> = HashMap::new();
 	macro_rules! s {
@@ -626,7 +720,7 @@ fn scan_registry() -> HashMap<&'static str, ScanOp> {
 	}
 	s!(
 		"cumsum",
-		cumsum1,
+		scan_cumsum,
 		|x: &[f64]| {
 			let mut a = 0.0;
 			x.iter()
@@ -641,7 +735,7 @@ fn scan_registry() -> HashMap<&'static str, ScanOp> {
 	);
 	s!(
 		"cumprod",
-		gpu_cumprod,
+		scan_cumprod,
 		|x: &[f64]| {
 			let mut a = 1.0;
 			x.iter()
@@ -656,7 +750,7 @@ fn scan_registry() -> HashMap<&'static str, ScanOp> {
 	);
 	s!(
 		"cummax",
-		gpu_cummax,
+		scan_cummax,
 		|x: &[f64]| {
 			let mut a = f64::NEG_INFINITY;
 			x.iter()

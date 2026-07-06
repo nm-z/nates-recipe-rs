@@ -110,27 +110,78 @@ fn scalar(f: Launch, x: &[f64]) -> f64 {
 
 // ── GPU op wrappers producing a single f64 result on the LIVE GPU ─────────────
 // Each closure uploads x, runs the device op, returns the finished scalar.
+fn download1(o: &GpuBuffer) -> f64 {
+	let mut out = [0.0; 1];
+	o.download(&mut out).unwrap();
+	out[0]
+}
 fn g_sum(x: &[f64]) -> f64 {
-	gpu_core::reductions::gpu_sum_all(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_sum_all_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_sum_all(&b, &ws, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_mean(x: &[f64]) -> f64 {
-	gpu_core::reductions::gpu_mean_all(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_mean_all_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_mean_all(&b, &ws, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_max(x: &[f64]) -> f64 {
-	gpu_core::reductions::gpu_max_all(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_max_all_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_max_all(&b, &ws, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_min(x: &[f64]) -> f64 {
-	gpu_core::reductions::gpu_min_all(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_min_all_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_min_all(&b, &ws, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_l2(x: &[f64]) -> f64 {
-	gpu_core::reductions::gpu_l2_norm(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_l2_norm_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let sq = GpuBuffer::alloc(x.len()).unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_l2_norm(&b, &ws, &sq, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_asum(x: &[f64]) -> f64 {
-	gpu_core::linalg::gpu_dasum(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap()
+	let b = GpuBuffer::upload(x).unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::linalg::gpu_dasum(&b, x.len(), &o).unwrap();
+	download1(&o)
 }
 fn g_dot(x: &[f64]) -> f64 {
 	let b = GpuBuffer::upload(x).unwrap();
-	gpu_core::reductions::gpu_dot(&b, &b, x.len()).unwrap() // dot(x,x) = Σx²
+	let ws = GpuBuffer::alloc_bytes(
+		gpu_core::reductions::gpu_dot_workspace_bytes(x.len()).max(1),
+	)
+	.unwrap();
+	let prod = GpuBuffer::alloc(x.len()).unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::reductions::gpu_dot(&b, &b, &ws, &prod, x.len(), &o).unwrap(); // dot(x,x) = Σx²
+	download1(&o)
 }
 fn g_prod(x: &[f64]) -> f64 {
 	scalar_ws(launch_reductionx_prod_workspace_bytes, launch_reductionx_prod, x)
@@ -181,7 +232,10 @@ fn g_argmin(x: &[f64]) -> f64 {
 }
 // iamax: index of element with largest |x| (BLAS Idamax/Isamax family). 0-based.
 fn g_iamax(x: &[f64]) -> f64 {
-	gpu_core::linalg::gpu_idamax(&GpuBuffer::upload(x).unwrap(), x.len()).unwrap() as f64
+	let b = GpuBuffer::upload(x).unwrap();
+	let o = GpuBuffer::alloc(1).unwrap();
+	gpu_core::linalg::gpu_idamax(&b, x.len(), &o).unwrap();
+	download1(&o)
 }
 
 // ── Op registry: canonical name -> (gpu closure, cpu oracle over the probe) ───

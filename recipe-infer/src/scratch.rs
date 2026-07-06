@@ -29,6 +29,20 @@ pub struct Scratch {
 	// Second scalar slot so the per-epoch score and loss can both ride the async
 	// copy stream and sync once, instead of one blocking 8-byte D2H per metric.
 	pub metric_scalar_b: GpuBuffer,
+	// Constant scalar operands, uploaded once (ops take device-scalar pointers now,
+	// never host f64s): activation / loss / clamp / rope constants, reused every step.
+	pub c_one: GpuBuffer,
+	pub c_neg_one: GpuBuffer,
+	pub c_half: GpuBuffer,
+	pub c_eps: GpuBuffer,
+	pub c_one_minus_eps: GpuBuffer,
+	pub c_leaky_alpha: GpuBuffer,
+	pub c_elu_alpha: GpuBuffer,
+	pub c_selu_alpha: GpuBuffer,
+	pub c_selu_lambda: GpuBuffer,
+	pub c_focal_gamma: GpuBuffer,
+	pub c_focal_alpha: GpuBuffer,
+	pub c_rope_theta: GpuBuffer,
 	pub reduce_ws: GpuBuffer,
 	// Embed layers accumulate the table gradient here ([vocab×dim]) before the
 	// SGD step — scatter-add target, separate from the table so the update is
@@ -257,6 +271,18 @@ impl Scratch {
 			metric_t2: alloc(out_elems, "metric_t2"),
 			metric_scalar: alloc(1, "metric_scalar"),
 			metric_scalar_b: alloc(1, "metric_scalar_b"),
+			c_one: GpuBuffer::upload(&[1.0]).expect("c_one"),
+			c_neg_one: GpuBuffer::upload(&[-1.0]).expect("c_neg_one"),
+			c_half: GpuBuffer::upload(&[0.5]).expect("c_half"),
+			c_eps: GpuBuffer::upload(&[1e-7]).expect("c_eps"),
+			c_one_minus_eps: GpuBuffer::upload(&[1.0 - 1e-7]).expect("c_one_minus_eps"),
+			c_leaky_alpha: GpuBuffer::upload(&[crate::params::LEAKY_ALPHA]).expect("c_leaky_alpha"),
+			c_elu_alpha: GpuBuffer::upload(&[crate::params::ELU_ALPHA]).expect("c_elu_alpha"),
+			c_selu_alpha: GpuBuffer::upload(&[gpu_core::k_gapact::SELU_ALPHA]).expect("c_selu_alpha"),
+			c_selu_lambda: GpuBuffer::upload(&[gpu_core::k_gapact::SELU_LAMBDA]).expect("c_selu_lambda"),
+			c_focal_gamma: GpuBuffer::upload(&[crate::params::FOCAL_GAMMA]).expect("c_focal_gamma"),
+			c_focal_alpha: GpuBuffer::upload(&[crate::params::FOCAL_ALPHA]).expect("c_focal_alpha"),
+			c_rope_theta: GpuBuffer::upload(&[gpu_core::rope::ROPE_THETA]).expect("c_rope_theta"),
 			reduce_ws: GpuBuffer::alloc_bytes(max_ws).unwrap_or_else(|e| {
 				panic!(
 					"reduce_ws: GPU alloc of {} failed — {e:?}",
@@ -499,6 +525,7 @@ impl Scratch {
 		floats += 3 * bw(max_act); // da_a, da_b, dz
 		floats += bw(max_wt) + bw(max_dw_partials) + bw(max_bias); // dw, dw_partials, db
 		floats += 3 * out_elems + 2; // metric_t0/t1/t2, metric_scalar, metric_scalar_b
+		floats += 12; // constant scalar operands c_one … c_rope_theta
 		floats += bw(max_embed_grad); // embed_grad
 		floats += 4 * max_seqd; // a_q,a_k,a_v,a_ctx (forward)
 		floats += 4 * bw(max_seqd); // a_dctx,a_dq,a_dk,a_dv (backward)

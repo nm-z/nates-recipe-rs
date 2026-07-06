@@ -577,12 +577,15 @@ mod tests {
             let x_dev = GpuBuffer::upload(&xh).expect("x");
             let y_dev = GpuBuffer::upload(&yh).expect("y");
             let make = |sz: usize| GpuBuffer::alloc(sz).expect("buf");
+            let scale = lr / n as f64;
+            let zero = GpuBuffer::upload(&[0.0f64]).expect("zero");
+            let neg_scale = GpuBuffer::upload(&[-scale]).expect("neg_scale");
             let (w_ref, b_ref) = (make(d * o), make(o));
             let (w_t, b_t) = (make(d * o), make(o));
-            kernels::gpu_scale_inplace(&w_ref, 0.0, d * o);
-            kernels::gpu_scale_inplace(&b_ref, 0.0, o);
-            kernels::gpu_scale_inplace(&w_t, 0.0, d * o);
-            kernels::gpu_scale_inplace(&b_t, 0.0, o);
+            kernels::gpu_scale_inplace(&zero, d * o, &w_ref);
+            kernels::gpu_scale_inplace(&zero, o, &b_ref);
+            kernels::gpu_scale_inplace(&zero, d * o, &w_t);
+            kernels::gpu_scale_inplace(&zero, o, &b_t);
             let yhat = make(n * o);
             let (dw, db) = (make(d * o), make(o));
             let (dw_acc, db_acc) = (make(d * o), make(o));
@@ -594,17 +597,16 @@ mod tests {
             let rows_per_block = 4096usize;
             let window = make(rows_per_block * d);
             // warm hipBLAS workspace before the VMM buffer exists
-            kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, &yhat, 1, o, d);
+            kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, 1, o, d, &yhat);
             hip::device_synchronize().expect("warmup");
 
             // ---- reference: whole-batch full-batch GD ----
-            let scale = lr / n as f64;
             for _ in 0..epochs {
-                  kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, &yhat, n, o, d);
-                  kernels::gpu_sub_inplace(&yhat, &y_dev, n * o);
-                  kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &dw, &db, &reduce_ws, &dw_partials, n, o, d);
-                  kernels::gpu_sgd_update(&w_ref, &dw, scale, d * o);
-                  kernels::gpu_sgd_update(&b_ref, &db, scale, o);
+                  kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, n, o, d, &yhat);
+                  kernels::gpu_sub_inplace(&y_dev, n * o, &yhat);
+                  kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &reduce_ws, &dw_partials, n, o, d, &dw, &db);
+                  kernels::gpu_sgd_update(&dw, &neg_scale, d * o, &w_ref);
+                  kernels::gpu_sgd_update(&db, &neg_scale, o, &b_ref);
             }
             let w_ref_h = dl(&w_ref, d * o);
 
@@ -616,22 +618,22 @@ mod tests {
             t.sync().expect("fill");
             assert!(!t.is_contiguous_vram(), "buffer must span >1 tier");
             for _ in 0..epochs {
-                  kernels::gpu_scale_inplace(&dw_acc, 0.0, d * o);
-                  kernels::gpu_scale_inplace(&db_acc, 0.0, o);
+                  kernels::gpu_scale_inplace(&zero, d * o, &dw_acc);
+                  kernels::gpu_scale_inplace(&zero, o, &db_acc);
                   let mut r0 = 0;
                   while r0 < n {
                         let r = rows_per_block.min(n - r0);
                         t.stage_bytes(r0 * d * 8, r * d * 8, window.ptr);
-                        kernels::gpu_linear_into(&window, &w_t, &b_t, &yhat, r, o, d);
+                        kernels::gpu_linear_into(&window, &w_t, &b_t, r, o, d, &yhat);
                         let yblk = GpuBuffer::borrow(unsafe { (y_dev.ptr as *mut f64).add(r0 * o) as *mut c_void }, r * o * 8);
-                        kernels::gpu_sub_inplace(&yhat, &yblk, r * o);
-                        kernels::gpu_linear_backward_weights_only_into(&yhat, &window, &dw, &db, &reduce_ws, &dw_partials, r, o, d);
-                        kernels::gpu_add_inplace(&dw_acc, &dw, d * o);
-                        kernels::gpu_add_inplace(&db_acc, &db, o);
+                        kernels::gpu_sub_inplace(&yblk, r * o, &yhat);
+                        kernels::gpu_linear_backward_weights_only_into(&yhat, &window, &reduce_ws, &dw_partials, r, o, d, &dw, &db);
+                        kernels::gpu_add_inplace(&dw, d * o, &dw_acc);
+                        kernels::gpu_add_inplace(&db, o, &db_acc);
                         r0 += r;
                   }
-                  kernels::gpu_sgd_update(&w_t, &dw_acc, scale, d * o);
-                  kernels::gpu_sgd_update(&b_t, &db_acc, scale, o);
+                  kernels::gpu_sgd_update(&dw_acc, &neg_scale, d * o, &w_t);
+                  kernels::gpu_sgd_update(&db_acc, &neg_scale, o, &b_t);
             }
             let w_t_h = dl(&w_t, d * o);
             let maxdiff = w_ref_h

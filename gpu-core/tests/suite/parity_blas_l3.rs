@@ -140,7 +140,8 @@ fn gemm_matches_cpu_oracle() {
 		let b = fill(k * n, 0x2222 ^ ((k * 100 + n) as u64));
 		let ag = GpuBuffer::upload(&a).unwrap();
 		let bg = GpuBuffer::upload(&b).unwrap();
-		let cg = kernels::gpu_gemm(&ag, &bg, m, n, k).unwrap();
+		let cg = GpuBuffer::alloc(m * n).unwrap();
+		kernels::gpu_gemm(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = cg.download_vec().unwrap();
 		let cpu = cpu_gemm(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm m={m} n={n} k={k}"), &gpu, &cpu);
@@ -158,7 +159,8 @@ fn gemm_at_matches_cpu_oracle() {
 		let b = fill(k * n, 0x4444 ^ ((k * 100 + n) as u64));
 		let ag = GpuBuffer::upload(&a).unwrap();
 		let bg = GpuBuffer::upload(&b).unwrap();
-		let cg = kernels::gpu_gemm_at(&ag, &bg, m, n, k).unwrap();
+		let cg = GpuBuffer::alloc(m * n).unwrap();
+		kernels::gpu_gemm_at(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = cg.download_vec().unwrap();
 		let cpu = cpu_gemm_at(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm_at m={m} n={n} k={k}"), &gpu, &cpu);
@@ -176,7 +178,8 @@ fn gemm_bt_matches_cpu_oracle() {
 		let b = fill(n * k, 0x6666 ^ ((n * 100 + k) as u64));
 		let ag = GpuBuffer::upload(&a).unwrap();
 		let bg = GpuBuffer::upload(&b).unwrap();
-		let cg = kernels::gpu_gemm_bt(&ag, &bg, m, n, k).unwrap();
+		let cg = GpuBuffer::alloc(m * n).unwrap();
+		kernels::gpu_gemm_bt_into(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = cg.download_vec().unwrap();
 		let cpu = cpu_gemm_bt(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm_bt m={m} n={n} k={k}"), &gpu, &cpu);
@@ -200,7 +203,8 @@ fn dsyrk_lower_triangle_matches_cpu_oracle() {
 		let k = n;
 		let a = fill(k * n, 0x7777 ^ (n as u64));
 		let ag = GpuBuffer::upload(&a).unwrap();
-		let cg = linalg::gpu_dsyrk(&ag, n, k).unwrap();
+		let cg = GpuBuffer::alloc(n * n).unwrap();
+		linalg::gpu_dsyrk(&ag, n, k, &cg).unwrap();
 		let gpu = cg.download_vec().unwrap();
 		let gram = cpu_gram(&a, n, k);
 

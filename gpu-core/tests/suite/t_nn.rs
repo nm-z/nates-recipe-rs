@@ -66,7 +66,8 @@ fn test_linear_f32() {
 	let w = GpuBuffer::upload_f32(&w_data).unwrap();
 	let bias = GpuBuffer::upload_f32(&bias_data).unwrap();
 
-	let out = gpu_linear_f32(&x, &w, &bias, 2, 2, 3).unwrap();
+	let out = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_linear_f32(&x, &w, &bias, 2, 2, 3, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -82,7 +83,8 @@ fn test_relu_f32() {
 	let expected: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0, 2.0];
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
-	let out = gpu_relu_f32(&x, 5).unwrap();
+	let out = GpuBuffer::zeros_f32(5).unwrap();
+	gpu_relu_f32(&x, 5, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 5];
@@ -100,7 +102,8 @@ fn test_relu_backward_f32() {
 
 	let grad = GpuBuffer::upload_f32(&grad_data).unwrap();
 	let act = GpuBuffer::upload_f32(&act_data).unwrap();
-	let out = gpu_relu_backward_f32(&grad, &act, 5).unwrap();
+	let out = GpuBuffer::zeros_f32(5).unwrap();
+	gpu_relu_backward_f32(&grad, &act, 5, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 5];
@@ -124,7 +127,8 @@ fn test_gelu_f32() {
 	};
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
-	let out = gpu_gelu_f32(&x, 5).unwrap();
+	let out = GpuBuffer::zeros_f32(5).unwrap();
+	gpu_gelu_f32(&x, 5, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 5];
@@ -140,7 +144,8 @@ fn test_gelu_backward_f32() {
 	let grad_data: Vec<f32> = vec![1.0, 1.0, 1.0];
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
 	let grad = GpuBuffer::upload_f32(&grad_data).unwrap();
-	let out = gpu_gelu_backward_f32(&grad, &x, 3).unwrap();
+	let out = GpuBuffer::zeros_f32(3).unwrap();
+	gpu_gelu_backward_f32(&grad, &x, 3, &out).unwrap();
 	sync();
 	let mut got = vec![0.0f32; 3];
 	out.download_f32(&mut got).unwrap();
@@ -171,7 +176,9 @@ fn test_layernorm_f32() {
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
 	let gamma = GpuBuffer::upload_f32(&gamma_data).unwrap();
 	let beta = GpuBuffer::upload_f32(&beta_data).unwrap();
-	let out = gpu_layernorm_f32(&x, &gamma, &beta, 2, 4, eps).unwrap();
+	let eps_buf = GpuBuffer::upload_f32(&[eps]).unwrap();
+	let out = GpuBuffer::zeros_f32(8).unwrap();
+	gpu_layernorm_f32(&x, &gamma, &beta, &eps_buf, 2, 4, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 8];
@@ -193,8 +200,14 @@ fn test_layernorm_backward_f32() {
 	let gamma = GpuBuffer::upload_f32(&gamma_data).unwrap();
 	let grad_y = GpuBuffer::upload_f32(&grad_y_data).unwrap();
 
-	let (grad_x, grad_gamma, grad_beta) =
-		gpu_layernorm_backward_f32(&grad_y, &x, &gamma, rows, cols, eps).unwrap();
+	let eps_buf = GpuBuffer::upload_f32(&[eps]).unwrap();
+	let grad_x = GpuBuffer::zeros_f32(rows * cols).unwrap();
+	let grad_gamma = GpuBuffer::zeros_f32(cols).unwrap();
+	let grad_beta = GpuBuffer::zeros_f32(cols).unwrap();
+	gpu_layernorm_backward_f32(
+		&grad_y, &x, &gamma, &eps_buf, rows, cols, &grad_x, &grad_gamma, &grad_beta,
+	)
+	.unwrap();
 	sync();
 
 	let mut gx = vec![0.0f32; rows * cols];
@@ -236,7 +249,8 @@ fn test_bias_add_f32() {
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
 	let bias = GpuBuffer::upload_f32(&bias_data).unwrap();
-	let out = gpu_bias_add_f32(&x, &bias, 2, 3).unwrap();
+	let out = GpuBuffer::zeros_f32(6).unwrap();
+	gpu_bias_add_f32(&x, &bias, 2, 3, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 6];
@@ -255,7 +269,8 @@ fn test_avg_pool_2d_f32() {
 	let expected: Vec<f32> = vec![3.5, 5.5, 11.5, 13.5];
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
-	let out = gpu_avg_pool_2d_f32(&x, 1, 1, 4, 4, 2, 2, 2, 2).unwrap();
+	let out = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_avg_pool_2d_f32(&x, 1, 1, 4, 4, 2, 2, 2, 2, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -273,7 +288,9 @@ fn test_max_pool_2d_f32() {
 	let expected: Vec<f32> = vec![6.0, 8.0, 14.0, 16.0];
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
-	let (out_vals, _out_idx) = gpu_max_pool_2d_f32(&x, 1, 1, 4, 4, 2, 2, 2, 2).unwrap();
+	let out_vals = GpuBuffer::zeros_f32(4).unwrap();
+	let out_idx = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_max_pool_2d_f32(&x, 1, 1, 4, 4, 2, 2, 2, 2, &out_vals, &out_idx).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -294,7 +311,7 @@ fn test_lstm_cell_f32() {
 	let c = GpuBuffer::upload_f32(&c_data).unwrap();
 	let h = GpuBuffer::upload_f32(&h_data).unwrap();
 
-	gpu_lstm_cell_f32(&gates, &c, &h, 1, 2);
+	gpu_lstm_cell_f32(&gates, 1, 2, &c, &h).unwrap();
 	sync();
 
 	let mut c_got = vec![0.0f32; 2];
@@ -322,7 +339,8 @@ fn test_gru_cell_f32() {
 	let gates = GpuBuffer::upload_f32(&gates_data).unwrap();
 	let h = GpuBuffer::upload_f32(&h_data).unwrap();
 
-	let h_new = gpu_gru_cell_f32(&gates, &h, 1, 2).unwrap();
+	let h_new = GpuBuffer::zeros_f32(2).unwrap();
+	gpu_gru_cell_f32(&gates, &h, 1, 2, &h_new).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 2];
@@ -339,7 +357,8 @@ fn test_relu_f16() {
 	let expected: Vec<f32> = vec![0.0, 0.0, 2.0];
 
 	let x = GpuBuffer::upload_f16(&x_data).unwrap();
-	let out = gpu_relu_f16(&x, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(3 * 2).unwrap();
+	gpu_relu_f16(&x, 3, &out).unwrap();
 	sync();
 
 	let mut got_f16 = vec![f16::ZERO; 3];
@@ -360,7 +379,8 @@ fn test_gelu_f16() {
 	let expected: Vec<f32> = vec![gelu(0.0), gelu(1.0), gelu(-1.0)];
 
 	let x = GpuBuffer::upload_f16(&x_data).unwrap();
-	let out = gpu_gelu_f16(&x, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(3 * 2).unwrap();
+	gpu_gelu_f16(&x, 3, &out).unwrap();
 	sync();
 
 	let mut got_f16 = vec![f16::ZERO; 3];
@@ -388,7 +408,8 @@ fn test_add_f16() {
 
 	let ga = GpuBuffer::upload_f16(&a).unwrap();
 	let gb = GpuBuffer::upload_f16(&b).unwrap();
-	let out = gpu_add_f16(&ga, &gb, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(3 * 2).unwrap();
+	gpu_add_f16(&ga, &gb, 3, &out).unwrap();
 	sync();
 
 	let mut got_f16 = vec![f16::ZERO; 3];
@@ -415,7 +436,8 @@ fn test_mul_f16() {
 
 	let ga = GpuBuffer::upload_f16(&a).unwrap();
 	let gb = GpuBuffer::upload_f16(&b).unwrap();
-	let out = gpu_mul_f16(&ga, &gb, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(3 * 2).unwrap();
+	gpu_mul_f16(&ga, &gb, 3, &out).unwrap();
 	sync();
 
 	let mut got_f16 = vec![f16::ZERO; 3];
@@ -444,7 +466,8 @@ fn test_sgd_update_f32() {
 
 	let w = GpuBuffer::upload_f32(&w_data).unwrap();
 	let grad = GpuBuffer::upload_f32(&grad_data).unwrap();
-	gpu_sgd_update_f32(&w, &grad, lr, 3);
+	let lr_buf = GpuBuffer::upload_f32(&[lr]).unwrap();
+	gpu_sgd_update_f32(&grad, &lr_buf, 3, &w).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 3];
@@ -467,7 +490,8 @@ fn test_sdpa_noncausal() {
 	let k = GpuBuffer::upload_f32(&k_data).unwrap();
 	let v = GpuBuffer::upload_f32(&v_data).unwrap();
 
-	let out = gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, false).unwrap();
+	let out = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, 0, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -490,7 +514,8 @@ fn test_sdpa_causal() {
 	let k = GpuBuffer::upload_f32(&k_data).unwrap();
 	let v = GpuBuffer::upload_f32(&v_data).unwrap();
 
-	let out = gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, true).unwrap();
+	let out = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, 1, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -508,7 +533,7 @@ fn test_causal_softmax_rows() {
 	let x_data: Vec<f32> = vec![1.0; 9];
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
-	gpu_causal_softmax_rows(&x, 3, 3);
+	gpu_causal_softmax_rows(&x, 3, 3).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 9];
@@ -567,10 +592,12 @@ fn test_mha_split_merge_roundtrip() {
 	let data: Vec<f32> = (0..(seq * n_heads * head_dim)).map(|i| i as f32).collect();
 
 	let x = GpuBuffer::upload_f32(&data).unwrap();
-	let split = gpu_mha_split(&x, seq, n_heads, head_dim).unwrap();
+	let split = GpuBuffer::zeros_f32(seq * n_heads * head_dim).unwrap();
+	gpu_mha_split(&x, seq, n_heads, head_dim, &split).unwrap();
 	sync();
 
-	let merged = gpu_mha_merge(&split, seq, n_heads, head_dim).unwrap();
+	let merged = GpuBuffer::zeros_f32(seq * n_heads * head_dim).unwrap();
+	gpu_mha_merge(&split, seq, n_heads, head_dim, &merged).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; data.len()];
@@ -593,7 +620,8 @@ fn test_mha_split_layout() {
 	let expected: Vec<f32> = vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0];
 
 	let x = GpuBuffer::upload_f32(&data).unwrap();
-	let split = gpu_mha_split(&x, 2, 2, 2).unwrap();
+	let split = GpuBuffer::zeros_f32(8).unwrap();
+	gpu_mha_split(&x, 2, 2, 2, &split).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 8];
@@ -614,7 +642,9 @@ fn test_rope_norm_preserved() {
 	]; // s=2
 
 	let x = GpuBuffer::upload_f32(&data).unwrap();
-	let out = gpu_rope(&x, seq, dim, 10000.0).unwrap();
+	let base = GpuBuffer::upload_f32(&[10000.0]).unwrap();
+	let out = GpuBuffer::zeros_f32(seq * dim).unwrap();
+	gpu_rope(&x, seq, dim, &base, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; seq * dim];
@@ -648,7 +678,8 @@ fn test_rope_norm_preserved() {
 fn test_positional_encoding() {
 	let seq = 4usize;
 	let dim = 8usize;
-	let out = gpu_positional_encoding(seq, dim).unwrap();
+	let out = GpuBuffer::zeros_f32(seq * dim).unwrap();
+	gpu_positional_encoding(seq, dim, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; seq * dim];
@@ -686,11 +717,12 @@ fn test_rmsnorm() {
 	// 1 row of 4 cols; gamma=ones; expected = x / rms(x)
 	let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
 	let gamma_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
-	let eps = 1e-5_f64;
+	let eps_buf = GpuBuffer::upload_f32(&[1e-5_f32]).unwrap();
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
 	let gamma = GpuBuffer::upload_f32(&gamma_data).unwrap();
-	let out = gpu_rmsnorm(&x, &gamma, 1, 4, eps).unwrap();
+	let out = GpuBuffer::zeros_f32(4).unwrap();
+	gpu_rmsnorm(&x, &gamma, &eps_buf, 1, 4, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -709,14 +741,15 @@ fn test_rmsnorm_backward() {
 	let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 1.0];
 	let gamma_data: Vec<f32> = vec![1.0; cols];
 	let grad_out_data: Vec<f32> = vec![1.0; rows * cols];
-	let eps = 1e-5_f64;
+	let eps_buf = GpuBuffer::upload_f32(&[1e-5_f32]).unwrap();
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
 	let gamma = GpuBuffer::upload_f32(&gamma_data).unwrap();
 	let grad_out = GpuBuffer::upload_f32(&grad_out_data).unwrap();
 
-	let (grad_x, grad_gamma) =
-		gpu_rmsnorm_backward(&grad_out, &x, &gamma, rows, cols, eps).unwrap();
+	let grad_x = GpuBuffer::zeros_f32(rows * cols).unwrap();
+	let grad_gamma = GpuBuffer::zeros_f32(cols).unwrap();
+	gpu_rmsnorm_backward(&grad_out, &x, &gamma, &eps_buf, rows, cols, &grad_x, &grad_gamma).unwrap();
 	sync();
 
 	let mut gx = vec![0.0f32; rows * cols];
@@ -767,8 +800,8 @@ fn test_im2col_2d_ext() {
 	assert_eq!(out_w, 3);
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
-	let patches =
-		gpu_im2col_2d_ext(&x, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w).unwrap();
+	let patches = GpuBuffer::zeros_f32(n * out_h * out_w * c * kh * kw).unwrap();
+	gpu_im2col_2d_ext(&x, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w, &patches).unwrap();
 	sync();
 
 	let patch_count = n * out_h * out_w;
@@ -806,7 +839,8 @@ fn test_embedding_backward() {
 	let grad_out = GpuBuffer::upload_f32(&grad_out_data).unwrap();
 	let indices = GpuBuffer::upload_i32(&indices_i32).unwrap();
 
-	let grad_table = gpu_embedding_backward(&grad_out, &indices, n, cols, vocab).unwrap();
+	let grad_table = GpuBuffer::zeros_f32(vocab * cols).unwrap();
+	gpu_embedding_backward(&grad_out, &indices, n, cols, vocab, &grad_table).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; vocab * cols];
@@ -824,14 +858,14 @@ fn test_bn_update_running() {
 	let run_var_data: Vec<f32> = vec![1.0, 1.0];
 	let save_mean_data: Vec<f32> = vec![2.0, -2.0];
 	let save_var_data: Vec<f32> = vec![0.5, 0.5];
-	let momentum = 0.1_f64;
+	let momentum = GpuBuffer::upload_f32(&[0.1_f32]).unwrap();
 
 	let run_mean = GpuBuffer::upload_f32(&run_mean_data).unwrap();
 	let run_var = GpuBuffer::upload_f32(&run_var_data).unwrap();
 	let save_mean = GpuBuffer::upload_f32(&save_mean_data).unwrap();
 	let save_var = GpuBuffer::upload_f32(&save_var_data).unwrap();
 
-	gpu_bn_update_running(&run_mean, &run_var, &save_mean, &save_var, momentum, 2);
+	gpu_bn_update_running(&save_mean, &save_var, &momentum, 2, &run_mean, &run_var).unwrap();
 	sync();
 
 	let mut got_mean = vec![0.0f32; 2];

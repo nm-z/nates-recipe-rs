@@ -234,14 +234,19 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let bx = GpuBuffer::upload(&x).unwrap();
 		let bg = GpuBuffer::upload(&gamma).unwrap();
 		let bb = GpuBuffer::upload(&beta).unwrap();
-		let g = gpu_layernorm(&bx, rows, cols, Some(&bg), Some(&bb)).unwrap();
+		let beps = GpuBuffer::upload(&[1e-5]).unwrap();
+		let g = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_layernorm(&bx, &bg, &bb, &beps, rows, cols, &g).unwrap();
 		let got = dl(&g, rows * cols);
 		let want = cpu_layernorm(&x, rows, cols, &gamma, &beta, 1e-5);
 		put("layernorm", close(&got, &want), &mut fails);
 		// jax.nn.standardize == layernorm without affine (gamma=1,beta=0)
 		let one = vec![1.0; cols];
 		let zero = vec![0.0; cols];
-		let g2 = gpu_layernorm(&bx, rows, cols, None, None).unwrap();
+		let bone = GpuBuffer::upload(&one).unwrap();
+		let bzero = GpuBuffer::upload(&zero).unwrap();
+		let g2 = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_layernorm(&bx, &bone, &bzero, &beps, rows, cols, &g2).unwrap();
 		let got2 = dl(&g2, rows * cols);
 		let want2 = cpu_layernorm(&x, rows, cols, &one, &zero, 1e-5);
 		put("standardize", close(&got2, &want2), &mut fails);
@@ -258,7 +263,11 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let bx = GpuBuffer::upload(&x).unwrap();
 		let bg = GpuBuffer::upload(&gamma).unwrap();
 		let bb = GpuBuffer::upload(&beta).unwrap();
-		let (out, _m, _i) = gpu_batchnorm_forward(&bx, &bg, &bb, n, c, eps).unwrap();
+		let beps = GpuBuffer::upload(&[eps]).unwrap();
+		let out = GpuBuffer::alloc(n * c).unwrap();
+		let mean = GpuBuffer::alloc(c).unwrap();
+		let inv_std = GpuBuffer::alloc(c).unwrap();
+		gpu_batchnorm_forward(&bx, &bg, &bb, &beps, n, c, &out, &mean, &inv_std).unwrap();
 		let got = dl(&out, n * c);
 		let want = cpu_batchnorm(&x, n, c, &gamma, &beta, eps);
 		put("batchnorm", close(&got, &want), &mut fails);
@@ -266,17 +275,19 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 	// ── softmax + log_softmax (existing) ──
 	{
-		use gpu_core::kernels::{gpu_log_softmax_rows, gpu_softmax_rows};
+		use gpu_core::kernels::{gpu_log_softmax_rows, gpu_softmax_rows_into};
 		let (rows, cols) = (3usize, 5usize);
 		let x = ramp(rows * cols, 0.21, -1.5);
 		let bx = GpuBuffer::upload(&x).unwrap();
-		let g = gpu_softmax_rows(&bx, rows, cols).unwrap();
+		let g = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_softmax_rows_into(&bx, rows, cols, &g).unwrap();
 		put(
 			"softmax",
 			close(&dl(&g, rows * cols), &cpu_softmax(&x, rows, cols)),
 			&mut fails,
 		);
-		let gl = gpu_log_softmax_rows(&bx, rows, cols).unwrap();
+		let gl = GpuBuffer::alloc(rows * cols).unwrap();
+		gpu_log_softmax_rows(&bx, rows, cols, &gl).unwrap();
 		put(
 			"log_softmax",
 			close(&dl(&gl, rows * cols), &cpu_log_softmax(&x, rows, cols)),
@@ -294,7 +305,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let bsm = GpuBuffer::upload(&sm).unwrap();
 		let bgrad = GpuBuffer::upload(&grad).unwrap();
 		let bout = GpuBuffer::alloc(rows * cols).unwrap();
-		gpu_softmax_backward_into(&bgrad, &bsm, &bout, rows, cols);
+		gpu_softmax_backward_into(&bgrad, &bsm, rows, cols, &bout).unwrap();
 		let got = dl(&bout, rows * cols);
 		let mut want = vec![0.0; rows * cols];
 		for r in 0..rows {

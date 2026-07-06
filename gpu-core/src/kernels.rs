@@ -3808,13 +3808,11 @@ pub fn gpu_tree_build_into(
 	p: usize,
 	n_bins: usize,
 	max_depth: usize,
-	lambda: f64,
-	min_cw: f64,
+	lambda: &GpuBuffer,
+	min_cw: &GpuBuffer,
 	tr_pred: &GpuBuffer,
 	te_pred: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let lambda_buf = GpuBuffer::upload(&[lambda])?;
-	let min_cw_buf = GpuBuffer::upload(&[min_cw])?;
 	// Per-step depth loop. Scratch, fills, zeroing and the loop live here;
 	// the .hip side only exposes the individual launchers.
 	let isz = std::mem::size_of::<i32>();
@@ -3847,7 +3845,7 @@ pub fn gpu_tree_build_into(
 		gh.memset_zero(level_bytes).expect("tb grad_hist zero");
 		hh.memset_zero(level_bytes).expect("tb hess_hist zero");
 		gpu_tb_histogram(tr_bins, grad, hess, &node_assign, n_tr, p, n_bins, level_base, &gh, &hh)?;
-		gpu_tb_split_eval(&gh, &hh, &lambda_buf, &min_cw_buf, n_level, p, n_bins, level_base, &sf, &sb)?;
+		gpu_tb_split_eval(&gh, &hh, &lambda, &min_cw, n_level, p, n_bins, level_base, &sf, &sb)?;
 		gpu_tb_repartition(tr_bins, &sf, &sb, n_tr, p, &node_assign)?;
 	}
 
@@ -3857,7 +3855,7 @@ pub fn gpu_tree_build_into(
 		.expect("tb node_sum_h zero");
 	lv.memset_zero(max_nodes * fsz).expect("tb leaf_val zero");
 	gpu_tb_leaf_sum(grad, hess, &node_assign, n_tr, &sum_g, &sum_h)?;
-	gpu_tb_leaf_val(&sum_g, &sum_h, &lambda_buf, max_nodes, 0, &lv)?;
+	gpu_tb_leaf_val(&sum_g, &sum_h, &lambda, max_nodes, 0, &lv)?;
 	gpu_tb_scatter(&node_assign, &lv, n_tr, tr_pred)?;
 	gpu_tb_apply_tree(te_bins, &sf, &sb, &lv, n_te, p, max_depth, te_pred)?;
 	Ok(())

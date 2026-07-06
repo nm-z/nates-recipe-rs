@@ -1,14 +1,19 @@
-use gpu_core::kernels::gpu_cholesky;
+use gpu_core::kernels::{gpu_cholesky, gpu_cholesky_workspace_bytes};
 use gpu_core::linalg::{
 	gpu_dasum, gpu_ddot, gpu_dgemm_strided_batched, gpu_dgemv, gpu_dger, gpu_dnrm2, gpu_dsyrk,
-	gpu_eigh_sym, gpu_fft_c2c_1d, gpu_idamax, gpu_lu_factor, gpu_lu_solve, gpu_potrs, gpu_qr,
-	gpu_rfft_1d, gpu_svd,
+	gpu_eigh_sym, gpu_eigh_sym_workspace_bytes, gpu_fft_c2c_1d, gpu_idamax, gpu_lu_factor,
+	gpu_lu_factor_workspace_bytes, gpu_lu_solve, gpu_lu_solve_workspace_bytes, gpu_potrs,
+	gpu_potrs_workspace_bytes, gpu_qr, gpu_qr_workspace_bytes, gpu_rfft_1d, gpu_svd,
+	gpu_svd_workspace_bytes,
 };
 use gpu_core::memory::GpuBuffer;
 use gpu_core::reductions::{
-	gpu_argsort, gpu_cummax, gpu_cumprod, gpu_cumsum_cols, gpu_cumsum_rows, gpu_dot, gpu_l2_norm,
-	gpu_max_all, gpu_mean_all, gpu_min_all, gpu_scan_linear_recurrence, gpu_segment_max,
-	gpu_segment_sort, gpu_segment_sum, gpu_sort, gpu_sort_by_key, gpu_sum_all,
+	gpu_argsort, gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod, gpu_cumprod_workspace_bytes,
+	gpu_cumsum_cols, gpu_cumsum_rows, gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm,
+	gpu_l2_norm_workspace_bytes, gpu_max_all, gpu_max_all_workspace_bytes, gpu_mean_all,
+	gpu_mean_all_workspace_bytes, gpu_min_all, gpu_min_all_workspace_bytes,
+	gpu_scan_linear_recurrence, gpu_segment_max, gpu_segment_sort, gpu_segment_sum, gpu_sort,
+	gpu_sort_by_key, gpu_sum_all, gpu_sum_all_workspace_bytes,
 };
 
 fn close(a: f64, b: f64) -> bool {
@@ -26,42 +31,60 @@ fn assert_close(label: &str, got: f64, expected: f64) {
 	);
 }
 
+// Download a 1-elem device scalar to host.
+fn scalar(out: &GpuBuffer) -> f64 {
+	let mut v = [0.0f64; 1];
+	out.download(&mut v).unwrap();
+	v[0]
+}
+
 // ── reductions: scalar all-reduces ───────────────────────────────────────────
 
 #[test]
 fn test_sum_all() {
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
-	let s = gpu_sum_all(&x, 4).unwrap();
-	assert_close("sum_all", s, 10.0);
+	let ws = GpuBuffer::alloc_bytes(gpu_sum_all_workspace_bytes(4)).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_sum_all(&x, &ws, 4, &out).unwrap();
+	assert_close("sum_all", scalar(&out), 10.0);
 }
 
 #[test]
 fn test_max_all() {
 	let x = GpuBuffer::upload(&[3.0, -1.0, 7.0, 2.0]).unwrap();
-	let v = gpu_max_all(&x, 4).unwrap();
-	assert_close("max_all", v, 7.0);
+	let ws = GpuBuffer::alloc_bytes(gpu_max_all_workspace_bytes(4)).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_max_all(&x, &ws, 4, &out).unwrap();
+	assert_close("max_all", scalar(&out), 7.0);
 }
 
 #[test]
 fn test_min_all() {
 	let x = GpuBuffer::upload(&[3.0, -1.0, 7.0, 2.0]).unwrap();
-	let v = gpu_min_all(&x, 4).unwrap();
-	assert_close("min_all", v, -1.0);
+	let ws = GpuBuffer::alloc_bytes(gpu_min_all_workspace_bytes(4)).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_min_all(&x, &ws, 4, &out).unwrap();
+	assert_close("min_all", scalar(&out), -1.0);
 }
 
 #[test]
 fn test_mean_all() {
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
-	let v = gpu_mean_all(&x, 4).unwrap();
-	assert_close("mean_all", v, 2.5);
+	let ws = GpuBuffer::alloc_bytes(gpu_mean_all_workspace_bytes(4)).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_mean_all(&x, &ws, 4, &out).unwrap();
+	assert_close("mean_all", scalar(&out), 2.5);
 }
 
 #[test]
 fn test_l2_norm() {
 	// ||[3,4]|| = 5
 	let x = GpuBuffer::upload(&[3.0, 4.0]).unwrap();
-	let v = gpu_l2_norm(&x, 2).unwrap();
-	assert_close("l2_norm", v, 5.0);
+	let ws = GpuBuffer::alloc_bytes(gpu_l2_norm_workspace_bytes(2)).unwrap();
+	let sq = GpuBuffer::alloc(2).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_l2_norm(&x, &ws, &sq, 2, &out).unwrap();
+	assert_close("l2_norm", scalar(&out), 5.0);
 }
 
 #[test]
@@ -69,8 +92,11 @@ fn test_dot_reductions() {
 	// [1,2,3] · [1,1,1] = 6
 	let a = GpuBuffer::upload(&[1.0, 2.0, 3.0]).unwrap();
 	let b = GpuBuffer::upload(&[1.0, 1.0, 1.0]).unwrap();
-	let v = gpu_dot(&a, &b, 3).unwrap();
-	assert_close("dot", v, 6.0);
+	let ws = GpuBuffer::alloc_bytes(gpu_dot_workspace_bytes(3)).unwrap();
+	let prod = GpuBuffer::alloc(3).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_dot(&a, &b, &ws, &prod, 3, &out).unwrap();
+	assert_close("dot", scalar(&out), 6.0);
 }
 
 // ── reductions: sort ──────────────────────────────────────────────────────────
@@ -78,7 +104,8 @@ fn test_dot_reductions() {
 #[test]
 fn test_sort_basic() {
 	let x = GpuBuffer::upload(&[3.0, 1.0, 2.0]).unwrap();
-	let out = gpu_sort(&x, 3).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_sort(&x, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
 	out.download(&mut v).unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0]);
@@ -88,7 +115,8 @@ fn test_sort_basic() {
 fn test_sort_non_power_of_two() {
 	// n=5 is not a power of two — tests padding/sentinel correctness
 	let x = GpuBuffer::upload(&[5.0, 3.0, 1.0, 4.0, 2.0]).unwrap();
-	let out = gpu_sort(&x, 5).unwrap();
+	let out = GpuBuffer::alloc(5).unwrap();
+	gpu_sort(&x, 5, &out).unwrap();
 	let mut v = [0.0f64; 5];
 	out.download(&mut v).unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0, 4.0, 5.0], "sort non-power-of-two");
@@ -98,7 +126,8 @@ fn test_sort_non_power_of_two() {
 fn test_sort_size_three() {
 	// n=3 — padded to 4
 	let x = GpuBuffer::upload(&[9.0, -1.0, 5.0]).unwrap();
-	let out = gpu_sort(&x, 3).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_sort(&x, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
 	out.download(&mut v).unwrap();
 	assert_eq!(v, [-1.0, 5.0, 9.0], "sort size 3 (padded to 4)");
@@ -108,7 +137,8 @@ fn test_sort_size_three() {
 fn test_argsort_basic() {
 	// [30, 10, 20] → indices [1, 2, 0]
 	let x = GpuBuffer::upload(&[30.0, 10.0, 20.0]).unwrap();
-	let out = gpu_argsort(&x, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(3 * 4).unwrap();
+	gpu_argsort(&x, 3, &out).unwrap();
 	let mut v = [0i32; 3];
 	out.download_i32(&mut v).unwrap();
 	assert_eq!(v, [1, 2, 0], "argsort basic: {:?}", v);
@@ -118,7 +148,8 @@ fn test_argsort_basic() {
 fn test_argsort_non_power_of_two() {
 	// n=5 → padding to 8
 	let x = GpuBuffer::upload(&[5.0, 1.0, 4.0, 2.0, 3.0]).unwrap();
-	let out = gpu_argsort(&x, 5).unwrap();
+	let out = GpuBuffer::alloc_bytes(5 * 4).unwrap();
+	gpu_argsort(&x, 5, &out).unwrap();
 	let mut v = [0i32; 5];
 	out.download_i32(&mut v).unwrap();
 	// sorted order: 1,2,3,4,5 → indices 1,3,4,2,0
@@ -129,7 +160,9 @@ fn test_argsort_non_power_of_two() {
 fn test_sort_by_key() {
 	let keys = GpuBuffer::upload(&[3.0, 1.0, 2.0]).unwrap();
 	let vals = GpuBuffer::upload(&[30.0, 10.0, 20.0]).unwrap();
-	let (ok, ov) = gpu_sort_by_key(&keys, &vals, 3).unwrap();
+	let ok = GpuBuffer::alloc(3).unwrap();
+	let ov = GpuBuffer::alloc(3).unwrap();
+	gpu_sort_by_key(&keys, &vals, 3, &ok, &ov).unwrap();
 	let mut rk = [0.0f64; 3];
 	let mut rv = [0.0f64; 3];
 	ok.download(&mut rk).unwrap();
@@ -145,7 +178,8 @@ fn test_segment_sort() {
 	let data = GpuBuffer::upload(&[3.0, 1.0, 2.0, 5.0, 4.0]).unwrap();
 	let offsets_data = [0i32, 3, 5];
 	let offsets = GpuBuffer::upload_i32(&offsets_data).unwrap();
-	let out = gpu_segment_sort(&data, &offsets, 5, 2).unwrap();
+	let out = GpuBuffer::alloc(5).unwrap();
+	gpu_segment_sort(&data, &offsets, 5, 2, &out).unwrap();
 	let mut v = [0.0f64; 5];
 	out.download(&mut v).unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0, 4.0, 5.0], "segment_sort: {:?}", v);
@@ -158,7 +192,8 @@ fn test_cumsum_rows() {
 	// 2x3 matrix: [[1,2,3],[4,5,6]]
 	// row cumsums: [[1,3,6],[4,9,15]]
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-	let out = gpu_cumsum_rows(&x, 2, 3).unwrap();
+	let out = GpuBuffer::alloc(6).unwrap();
+	gpu_cumsum_rows(&x, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
 	out.download(&mut v).unwrap();
 	let expected = [1.0, 3.0, 6.0, 4.0, 9.0, 15.0];
@@ -172,7 +207,8 @@ fn test_cumsum_cols() {
 	// 2x3 matrix (row-major): [[1,2,3],[4,5,6]]
 	// col cumsums: [[1,2,3],[5,7,9]]
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-	let out = gpu_cumsum_cols(&x, 2, 3).unwrap();
+	let out = GpuBuffer::alloc(6).unwrap();
+	gpu_cumsum_cols(&x, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
 	out.download(&mut v).unwrap();
 	let expected = [1.0, 2.0, 3.0, 5.0, 7.0, 9.0];
@@ -185,7 +221,9 @@ fn test_cumsum_cols() {
 fn test_cumprod() {
 	// [1,2,3,4] → [1,2,6,24]
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
-	let out = gpu_cumprod(&x, 4).unwrap();
+	let ws = GpuBuffer::alloc_bytes(gpu_cumprod_workspace_bytes(4)).unwrap();
+	let out = GpuBuffer::alloc(4).unwrap();
+	gpu_cumprod(&x, &ws, 4, &out).unwrap();
 	let mut v = [0.0f64; 4];
 	out.download(&mut v).unwrap();
 	let expected = [1.0, 2.0, 6.0, 24.0];
@@ -198,7 +236,9 @@ fn test_cumprod() {
 fn test_cummax() {
 	// [3,1,4,1,5,2] → [3,3,4,4,5,5]
 	let x = GpuBuffer::upload(&[3.0, 1.0, 4.0, 1.0, 5.0, 2.0]).unwrap();
-	let out = gpu_cummax(&x, 6).unwrap();
+	let ws = GpuBuffer::alloc_bytes(gpu_cummax_workspace_bytes(6)).unwrap();
+	let out = GpuBuffer::alloc(6).unwrap();
+	gpu_cummax(&x, &ws, 6, &out).unwrap();
 	let mut v = [0.0f64; 6];
 	out.download(&mut v).unwrap();
 	let expected = [3.0, 3.0, 4.0, 4.0, 5.0, 5.0];
@@ -215,7 +255,9 @@ fn test_segment_sum() {
 	// expected out = [3.0, 7.0, 11.0]
 	let vals = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 	let seg_ids = GpuBuffer::upload_i32(&[0i32, 0, 1, 1, 2, 2]).unwrap();
-	let out = gpu_segment_sum(&vals, &seg_ids, 6, 3).unwrap();
+	// segment_sum accumulates via atomicAdd — out must be pre-zeroed.
+	let out = GpuBuffer::zeros_bytes(3 * 8).unwrap();
+	gpu_segment_sum(&vals, &seg_ids, 6, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
 	out.download(&mut v).unwrap();
 	assert_close("segment_sum[0]", v[0], 3.0);
@@ -229,7 +271,8 @@ fn test_segment_max() {
 	// expected out = [5.0, 3.0, 6.0]
 	let vals = GpuBuffer::upload(&[1.0, 5.0, 3.0, 2.0, 4.0, 6.0]).unwrap();
 	let seg_ids = GpuBuffer::upload_i32(&[0i32, 0, 1, 1, 2, 2]).unwrap();
-	let out = gpu_segment_max(&vals, &seg_ids, 6, 3).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_segment_max(&vals, &seg_ids, 6, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
 	out.download(&mut v).unwrap();
 	assert_close("segment_max[0]", v[0], 5.0);
@@ -256,7 +299,8 @@ fn test_scan_linear_recurrence() {
 	let b_data = [1.0f64, 1.0, 1.0, 0.0, 1.0, 0.0];
 	let a = GpuBuffer::upload(&a_data).unwrap();
 	let b = GpuBuffer::upload(&b_data).unwrap();
-	let out = gpu_scan_linear_recurrence(&a, &b, 3, 2).unwrap();
+	let out = GpuBuffer::alloc(6).unwrap();
+	gpu_scan_linear_recurrence(&a, &b, 3, 2, &out).unwrap();
 	let mut v = [0.0f64; 6];
 	out.download(&mut v).unwrap();
 	// v[t*2+d]
@@ -275,31 +319,36 @@ fn test_ddot() {
 	// [1,2,3] · [4,5,6] = 4+10+18 = 32
 	let a = GpuBuffer::upload(&[1.0, 2.0, 3.0]).unwrap();
 	let b = GpuBuffer::upload(&[4.0, 5.0, 6.0]).unwrap();
-	let v = gpu_ddot(&a, &b, 3).unwrap();
-	assert_close("ddot", v, 32.0);
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_ddot(&a, &b, 3, &out).unwrap();
+	assert_close("ddot", scalar(&out), 32.0);
 }
 
 #[test]
 fn test_dnrm2() {
 	// ||[3,4]|| = 5
 	let x = GpuBuffer::upload(&[3.0, 4.0]).unwrap();
-	let v = gpu_dnrm2(&x, 2).unwrap();
-	assert_close("dnrm2", v, 5.0);
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_dnrm2(&x, 2, &out).unwrap();
+	assert_close("dnrm2", scalar(&out), 5.0);
 }
 
 #[test]
 fn test_dasum() {
 	// sum |[-1, 2, -3, 4]| = 1+2+3+4 = 10
 	let x = GpuBuffer::upload(&[-1.0, 2.0, -3.0, 4.0]).unwrap();
-	let v = gpu_dasum(&x, 4).unwrap();
-	assert_close("dasum", v, 10.0);
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_dasum(&x, 4, &out).unwrap();
+	assert_close("dasum", scalar(&out), 10.0);
 }
 
 #[test]
 fn test_idamax() {
 	// [1, -5, 3, 2] → largest |v| is -5 at index 1
 	let x = GpuBuffer::upload(&[1.0, -5.0, 3.0, 2.0]).unwrap();
-	let idx = gpu_idamax(&x, 4).unwrap();
+	let out = GpuBuffer::alloc(1).unwrap();
+	gpu_idamax(&x, 4, &out).unwrap();
+	let idx = scalar(&out) as i32;
 	assert_eq!(idx, 1, "idamax should be 1 (|-5| is largest), got {}", idx);
 }
 
@@ -311,7 +360,8 @@ fn test_dgemv_no_trans() {
 	// y = A @ x = [3, 7, 11]
 	let a = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 	let x = GpuBuffer::upload(&[1.0, 1.0]).unwrap();
-	let out = gpu_dgemv(&a, &x, 3, 2, false).unwrap();
+	let out = GpuBuffer::alloc(3).unwrap();
+	gpu_dgemv(&a, &x, 3, 2, 0, &out).unwrap();
 	let mut v = [0.0f64; 3];
 	out.download(&mut v).unwrap();
 	assert_close("dgemv[0]", v[0], 3.0);
@@ -325,7 +375,8 @@ fn test_dgemv_trans() {
 	// y = A^T @ x = [1+3+5, 2+4+6] = [9, 12]
 	let a = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 	let x = GpuBuffer::upload(&[1.0, 1.0, 1.0]).unwrap();
-	let out = gpu_dgemv(&a, &x, 3, 2, true).unwrap();
+	let out = GpuBuffer::alloc(2).unwrap();
+	gpu_dgemv(&a, &x, 3, 2, 1, &out).unwrap();
 	let mut v = [0.0f64; 2];
 	out.download(&mut v).unwrap();
 	assert_close("dgemv_t[0]", v[0], 9.0);
@@ -338,7 +389,9 @@ fn test_dger() {
 	// A = [[3,4,5],[6,8,10]]
 	let x = GpuBuffer::upload(&[1.0, 2.0]).unwrap();
 	let y = GpuBuffer::upload(&[3.0, 4.0, 5.0]).unwrap();
-	let out = gpu_dger(&x, &y, 2, 3).unwrap();
+	// dger accumulates into out — pre-zero (2*3).
+	let out = GpuBuffer::zeros_bytes(6 * 8).unwrap();
+	gpu_dger(&x, &y, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
 	out.download(&mut v).unwrap();
 	let expected = [3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
@@ -357,7 +410,8 @@ fn test_dsyrk() {
 	// A = [[1,2],[3,4]], C = A^T@A = [[1,3],[2,4]] @ [[1,2],[3,4]] = [[10,14],[14,20]]
 	// Only lower triangle is written, but let's check diagonal and lower
 	let a = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
-	let c = gpu_dsyrk(&a, 2, 2).unwrap();
+	let c = GpuBuffer::alloc(4).unwrap();
+	gpu_dsyrk(&a, 2, 2, &c).unwrap();
 	let mut v = [0.0f64; 4];
 	c.download(&mut v).unwrap();
 	// row-major: v[0]=C(0,0), v[1]=C(0,1), v[2]=C(1,0), v[3]=C(1,1)
@@ -384,7 +438,8 @@ fn test_dgemm_strided_batched() {
 		3.0, 1.0, 1.0, 3.0, // B[1]
 	])
 	.unwrap();
-	let c = gpu_dgemm_strided_batched(&a, &b, 2, 2, 2, 2).unwrap();
+	let c = GpuBuffer::alloc(8).unwrap();
+	gpu_dgemm_strided_batched(&a, &b, 2, 2, 2, 2, &c).unwrap();
 	let mut v = [0.0f64; 8];
 	c.download(&mut v).unwrap();
 	let expected = [1.0, 2.0, 3.0, 4.0, 6.0, 2.0, 2.0, 6.0];
@@ -403,8 +458,17 @@ fn test_lu_solve() {
 	// x = (1/5)*[3*5-1*10, -1*5+2*10] = (1/5)*[5,15] = [1,3]
 	let a = GpuBuffer::upload(&[2.0, 1.0, 1.0, 3.0]).unwrap();
 	let b = GpuBuffer::upload(&[5.0, 10.0]).unwrap();
-	let (lu, ipiv) = gpu_lu_factor(&a, 2).unwrap();
-	let x = gpu_lu_solve(&lu, &ipiv, &b, 2, 1).unwrap();
+
+	let fac_work = GpuBuffer::alloc_bytes(gpu_lu_factor_workspace_bytes(2)).unwrap();
+	let lu = GpuBuffer::alloc(2 * 2).unwrap();
+	let ipiv = GpuBuffer::alloc_bytes(2 * 4).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_lu_factor(&a, 2, &fac_work, &lu, &ipiv, &info).unwrap();
+
+	let solve_work = GpuBuffer::alloc_bytes(gpu_lu_solve_workspace_bytes(2, 1)).unwrap();
+	let x = GpuBuffer::alloc(2 * 1).unwrap();
+	gpu_lu_solve(&lu, &ipiv, &b, 2, 1, &solve_work, &info, &x).unwrap();
+
 	let mut v = [0.0f64; 2];
 	x.download(&mut v).unwrap();
 	assert_close("lu_solve x[0]", v[0], 1.0);
@@ -422,8 +486,16 @@ fn test_potrs() {
 	// x = (1/8)*[[3,-2],[-2,4]]*[8,7] = (1/8)*[24-14, -16+28] = (1/8)*[10,12] = [1.25, 1.5]
 	let a = GpuBuffer::upload(&[4.0, 2.0, 2.0, 3.0]).unwrap();
 	let b = GpuBuffer::upload(&[8.0, 7.0]).unwrap();
-	let l = gpu_cholesky(&a, 2).unwrap();
-	let x = gpu_potrs(&l, &b, 2, 1).unwrap();
+
+	let chol_work = GpuBuffer::alloc_bytes(gpu_cholesky_workspace_bytes(2)).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	let l = GpuBuffer::alloc(2 * 2).unwrap();
+	gpu_cholesky(&a, 2, &chol_work, &info, &l).unwrap();
+
+	let potrs_work = GpuBuffer::alloc_bytes(gpu_potrs_workspace_bytes(2, 1)).unwrap();
+	let x = GpuBuffer::alloc(2 * 1).unwrap();
+	gpu_potrs(&l, &b, 2, 1, &potrs_work, &info, &x).unwrap();
+
 	let mut v = [0.0f64; 2];
 	x.download(&mut v).unwrap();
 	assert_close("potrs x[0]", v[0], 1.25);
@@ -437,7 +509,13 @@ fn test_qr_square_reconstruction() {
 	// A = [[3,1],[4,2]] (2x2 row-major). Verify Q*R == A and Q orthonormal.
 	let a_data = [3.0f64, 1.0, 4.0, 2.0];
 	let a = GpuBuffer::upload(&a_data).unwrap();
-	let (q, r) = gpu_qr(&a, 2, 2).unwrap();
+	let (m, n) = (2usize, 2usize);
+	let work = GpuBuffer::alloc_bytes(gpu_qr_workspace_bytes(m, n)).unwrap();
+	let tau = GpuBuffer::alloc(m.min(n)).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	let q = GpuBuffer::alloc(m * n).unwrap();
+	let r = GpuBuffer::alloc(n * n).unwrap();
+	gpu_qr(&a, m, n, &work, &tau, &info, &q, &r).unwrap();
 
 	let mut q_v = [0.0f64; 4];
 	let mut r_v = [0.0f64; 4];
@@ -454,8 +532,6 @@ fn test_qr_square_reconstruction() {
 	// Q col-major lda=m=2: Q[i,k] = q_v[k*2+i]
 	// R col-major lda=n=2: R[k,j] = r_v[j*2+k] for k<=j
 	// Verify Q*R == A_rm[i,j] = a_data[i*2+j]
-	let m = 2usize;
-	let n = 2usize;
 	for i in 0..m {
 		for j in 0..n {
 			let mut qr_ij = 0.0f64;
@@ -489,7 +565,13 @@ fn test_qr_tall_reconstruction() {
 	// A = [[1,2],[3,4],[5,6]] (3x2 row-major). Verify Q*R == A and Q orthonormal.
 	let a_data = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
 	let a = GpuBuffer::upload(&a_data).unwrap();
-	let (q, r) = gpu_qr(&a, 3, 2).unwrap();
+	let (m, n) = (3usize, 2usize);
+	let work = GpuBuffer::alloc_bytes(gpu_qr_workspace_bytes(m, n)).unwrap();
+	let tau = GpuBuffer::alloc(m.min(n)).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	let q = GpuBuffer::alloc(m * n).unwrap();
+	let r = GpuBuffer::alloc(n * n).unwrap();
+	gpu_qr(&a, m, n, &work, &tau, &info, &q, &r).unwrap();
 
 	let mut q_v = [0.0f64; 6];
 	let mut r_v = [0.0f64; 4];
@@ -506,8 +588,6 @@ fn test_qr_tall_reconstruction() {
 	// Q col-major lda=m=3: Q[i,k] = q_v[k*3+i]
 	// R col-major lda=n=2: R[k,j] = r_v[j*2+k] for k<=j
 	// Verify Q*R == A_rm[i,j] = a_data[i*2+j]
-	let m = 3usize;
-	let n = 2usize;
 	for i in 0..m {
 		for j in 0..n {
 			let mut qr_ij = 0.0f64;
@@ -545,7 +625,12 @@ fn test_eigh_sym() {
 	// dsyevd overwrites A with eigenvectors (columns in cm = rows in result)
 	// A is symmetric: A_rm == A_cm
 	let a = GpuBuffer::upload(&[2.0f64, 1.0, 1.0, 2.0]).unwrap();
-	let (evals, evecs) = gpu_eigh_sym(&a, 2).unwrap();
+	let n = 2usize;
+	let work = GpuBuffer::alloc_bytes(gpu_eigh_sym_workspace_bytes(n)).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	let evals = GpuBuffer::alloc(n).unwrap();
+	let evecs = GpuBuffer::alloc(n * n).unwrap();
+	gpu_eigh_sym(&a, n, &work, &info, &evals, &evecs).unwrap();
 
 	let mut ev = [0.0f64; 2];
 	evals.download(&mut ev).unwrap();
@@ -582,7 +667,14 @@ fn test_svd_reconstruction() {
 	//   where U[i,k] = u_v[k*m+i] and Vt[k,j] = vt_v[j*n+k].
 	let a_data = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
 	let a = GpuBuffer::upload(&a_data).unwrap();
-	let (u, s, vt) = gpu_svd(&a, 3, 2).unwrap();
+	let (m, n) = (3usize, 2usize);
+	let k = m.min(n);
+	let work = GpuBuffer::alloc_bytes(gpu_svd_workspace_bytes(m, n)).unwrap();
+	let info = GpuBuffer::alloc_bytes(4).unwrap();
+	let u = GpuBuffer::alloc(m * m).unwrap();
+	let s = GpuBuffer::alloc(k).unwrap();
+	let vt = GpuBuffer::alloc(n * n).unwrap();
+	gpu_svd(&a, m, n, &work, &info, &u, &s, &vt).unwrap();
 
 	let mut u_v = [0.0f64; 9];
 	let mut s_v = [0.0f64; 2];
@@ -607,9 +699,6 @@ fn test_svd_reconstruction() {
 		assert!(x.is_finite(), "Vt[{}] non-finite: {}", i, x);
 	}
 
-	let m = 3usize;
-	let n = 2usize;
-	let k = 2usize;
 	for i in 0..m {
 		for j in 0..n {
 			let mut aij = 0.0f64;
@@ -634,7 +723,8 @@ fn test_fft_c2c_1d_and_inverse() {
 	input[0] = 1.0; // re part of first element
 	let x = GpuBuffer::upload(&input).unwrap();
 
-	let fwd = gpu_fft_c2c_1d(&x, n, true).unwrap();
+	let fwd = GpuBuffer::alloc(2 * n).unwrap();
+	gpu_fft_c2c_1d(&x, n, 1, &fwd).unwrap();
 	let mut fwd_v = [0.0f64; 8];
 	fwd.download(&mut fwd_v).unwrap();
 
@@ -645,7 +735,8 @@ fn test_fft_c2c_1d_and_inverse() {
 	}
 
 	// Inverse: IFFT(FFT(x)) = n * x (rocFFT is unnormalized)
-	let inv = gpu_fft_c2c_1d(&fwd, n, false).unwrap();
+	let inv = GpuBuffer::alloc(2 * n).unwrap();
+	gpu_fft_c2c_1d(&fwd, n, 0, &inv).unwrap();
 	let mut inv_v = [0.0f64; 8];
 	inv.download(&mut inv_v).unwrap();
 
@@ -667,8 +758,9 @@ fn test_rfft_1d() {
 	// RFFT([1,0,0,0]) = [1+0i, 1+0i, 1+0i]
 	let n = 4usize;
 	let x = GpuBuffer::upload(&[1.0f64, 0.0, 0.0, 0.0]).unwrap();
-	let out = gpu_rfft_1d(&x, n).unwrap();
 	let out_complex = n / 2 + 1; // = 3
+	let out = GpuBuffer::alloc(2 * out_complex).unwrap();
+	gpu_rfft_1d(&x, n, &out).unwrap();
 	let mut v = vec![0.0f64; 2 * out_complex];
 	out.download(&mut v).unwrap();
 

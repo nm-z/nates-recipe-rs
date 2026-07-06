@@ -172,17 +172,20 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		use gpu_core::kernels::gpu_fill;
 		let n = 37usize;
 		let val = std::f64::consts::PI;
-		let g = gpu_fill(n, val).unwrap();
+		let g = GpuBuffer::alloc(n).unwrap();
+		gpu_fill(&GpuBuffer::upload(&[val]).unwrap(), n, &g).unwrap();
 		let mut got = vec![0.0; n];
 		g.download(&mut got).unwrap();
 		let want = vec![val; n];
 		prove!("full", close(&got, &want));
 		// zeros & ones ride the same proven fill kernel, but assert distinctly.
-		let z = gpu_fill(n, 0.0).unwrap();
+		let z = GpuBuffer::alloc(n).unwrap();
+		gpu_fill(&GpuBuffer::upload(&[0.0]).unwrap(), n, &z).unwrap();
 		let mut gz = vec![9.0; n];
 		z.download(&mut gz).unwrap();
 		prove!("zeros", gz.iter().all(|v| *v == 0.0));
-		let o = gpu_fill(n, 1.0).unwrap();
+		let o = GpuBuffer::alloc(n).unwrap();
+		gpu_fill(&GpuBuffer::upload(&[1.0]).unwrap(), n, &o).unwrap();
 		let mut go = vec![0.0; n];
 		o.download(&mut go).unwrap();
 		prove!("ones", go.iter().all(|v| *v == 1.0));
@@ -192,7 +195,8 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		use gpu_core::kernels::gpu_eye;
 		let n = 5usize;
-		let g = gpu_eye(n).unwrap();
+		let g = GpuBuffer::alloc(n * n).unwrap();
+		gpu_eye(n, &g).unwrap();
 		let mut got = vec![0.0; n * n];
 		g.download(&mut got).unwrap();
 		// diagonal == 1, off-diagonal == 0 (assert BOTH).
@@ -309,7 +313,8 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		use gpu_core::catboost::gpu_iota;
 		let n = 41usize;
-		let g = gpu_iota(n).unwrap();
+		let g = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+		gpu_iota(n, &g).unwrap();
 		let mut got = vec![0i32; n];
 		g.download_i32(&mut got).unwrap();
 		let want: Vec<i32> = (0..n as i32).collect();

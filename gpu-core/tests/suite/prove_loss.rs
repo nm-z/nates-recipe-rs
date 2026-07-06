@@ -334,8 +334,12 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		move |a, b| {
 			let ba = GpuBuffer::upload(a).unwrap();
 			let bb = GpuBuffer::upload(b).unwrap();
-			let (loss, _grad) =
-				gpu_core::losses::gpu_focal_loss(&ba, &bb, gamma, alpha, a.len()).unwrap();
+			let bgamma = GpuBuffer::upload(&[gamma]).unwrap();
+			let balpha = GpuBuffer::upload(&[alpha]).unwrap();
+			let loss = GpuBuffer::alloc(a.len()).unwrap();
+			let grad = GpuBuffer::alloc(a.len()).unwrap();
+			gpu_core::losses::gpu_focal_loss(&ba, &bb, &bgamma, &balpha, a.len(), &loss, &grad)
+				.unwrap();
 			let mut out = vec![0.0; a.len()];
 			loss.download(&mut out).unwrap();
 			out
@@ -357,7 +361,9 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		|a, b| {
 			let ba = GpuBuffer::upload(a).unwrap();
 			let bb = GpuBuffer::upload(b).unwrap();
-			let (loss, _grad) = gpu_core::losses::gpu_hinge_loss(&ba, &bb, a.len()).unwrap();
+			let loss = GpuBuffer::alloc(a.len()).unwrap();
+			let grad = GpuBuffer::alloc(a.len()).unwrap();
+			gpu_core::losses::gpu_hinge_loss(&ba, &bb, a.len(), &loss, &grad).unwrap();
 			let mut out = vec![0.0; a.len()];
 			loss.download(&mut out).unwrap();
 			out

@@ -127,7 +127,8 @@ fn prove_transpose() -> bool {
 	let (r, c) = (3usize, 4usize);
 	let x = seq(r * c);
 	let gx = upload(&x);
-	let g = gpu_core::kernels::gpu_transpose(&gx, r, c).unwrap();
+	let g = GpuBuffer::alloc(r * c).unwrap();
+	gpu_core::kernels::gpu_transpose(&gx, r, c, &g).unwrap();
 	let got = download(&g, r * c);
 	let mut want = vec![0.0; r * c]; // out[j*r+i] = x[i*c+j], shape c x r
 	for i in 0..r {
@@ -223,7 +224,8 @@ fn prove_rot90() -> bool {
 	// GPU: fliplr then transpose
 	let f = run_flip(&x, r, c, 1); // r x c
 	let gf = upload(&f);
-	let g = gpu_core::kernels::gpu_transpose(&gf, r, c).unwrap(); // c x r
+	let g = GpuBuffer::alloc(r * c).unwrap();
+	gpu_core::kernels::gpu_transpose(&gf, r, c, &g).unwrap(); // c x r
 	let got = download(&g, r * c);
 	// oracle: numpy.rot90 -> out[c-1-j][i] = x[i][j], shape c x r
 	let mut want = vec![0.0; r * c];

@@ -144,8 +144,8 @@ unsafe extern "C" {
 
 type Launch = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, *mut c_void);
 
-// gpu_* public wrappers (existing ops) share the (a,b,n) signature.
-type GpuBin = fn(&GpuBuffer, &GpuBuffer, usize) -> Result<GpuBuffer, gpu_core::hip::HipError>;
+// gpu_* public wrappers (existing ops) share the (a,b,n,out) signature.
+type GpuBin = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::hip::HipError>;
 
 enum Op {
 	// raw launcher from the new .hip
@@ -192,7 +192,8 @@ fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
 fn run_wrap(f: GpuBin, a: &[f64], b: &[f64]) -> Vec<f64> {
 	let ba = GpuBuffer::upload(a).unwrap();
 	let bb = GpuBuffer::upload(b).unwrap();
-	let o = f(&ba, &bb, a.len()).unwrap();
+	let o = GpuBuffer::alloc(a.len()).unwrap();
+	f(&ba, &bb, a.len(), &o).unwrap();
 	let mut out = vec![0.0; a.len()];
 	o.download(&mut out).unwrap();
 	out

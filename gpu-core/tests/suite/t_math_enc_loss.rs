@@ -11,6 +11,10 @@ fn upload(data: &[f64]) -> GpuBuffer {
 	GpuBuffer::upload(data).expect("upload")
 }
 
+fn out_buf(n: usize) -> GpuBuffer {
+	GpuBuffer::alloc(n).expect("alloc out")
+}
+
 fn download(buf: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; n];
 	buf.download(&mut v).expect("download");
@@ -22,7 +26,8 @@ fn download(buf: &GpuBuffer, n: usize) -> Vec<f64> {
 #[test]
 fn test_rsqrt() {
 	let x = upload(&[4.0, 16.0, 1.0]);
-	let out = gpu_rsqrt(&x, 3).unwrap();
+	let out = out_buf(3);
+	gpu_rsqrt(&x, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -41,7 +46,8 @@ fn test_rsqrt() {
 #[test]
 fn test_reciprocal() {
 	let x = upload(&[2.0, 4.0, 0.5]);
-	let out = gpu_reciprocal(&x, 3).unwrap();
+	let out = out_buf(3);
+	gpu_reciprocal(&x, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -57,7 +63,8 @@ fn test_reciprocal() {
 fn test_max() {
 	let a = upload(&[1.0, 5.0, 3.0]);
 	let b = upload(&[3.0, 2.0, 3.0]);
-	let out = gpu_max(&a, &b, 3).unwrap();
+	let out = out_buf(3);
+	gpu_max(&a, &b, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 3.0), "max(1,3) expected 3, got {}", r[0]);
 	assert!(approx_eq(r[1], 5.0), "max(5,2) expected 5, got {}", r[1]);
@@ -68,7 +75,8 @@ fn test_max() {
 fn test_min() {
 	let a = upload(&[1.0, 5.0, 3.0]);
 	let b = upload(&[3.0, 2.0, 3.0]);
-	let out = gpu_min(&a, &b, 3).unwrap();
+	let out = out_buf(3);
+	gpu_min(&a, &b, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 1.0), "min(1,3) expected 1, got {}", r[0]);
 	assert!(approx_eq(r[1], 2.0), "min(5,2) expected 2, got {}", r[1]);
@@ -84,7 +92,8 @@ fn test_sin_cos_tan() {
 	];
 	let x = upload(&angles);
 
-	let sin_out = gpu_sin(&x, 3).unwrap();
+	let sin_out = out_buf(3);
+	gpu_sin(&x, 3, &sin_out).unwrap();
 	let s = download(&sin_out, 3);
 	for (i, &a) in angles.iter().enumerate() {
 		assert!(
@@ -96,7 +105,8 @@ fn test_sin_cos_tan() {
 		);
 	}
 
-	let cos_out = gpu_cos(&x, 3).unwrap();
+	let cos_out = out_buf(3);
+	gpu_cos(&x, 3, &cos_out).unwrap();
 	let c = download(&cos_out, 3);
 	for (i, &a) in angles.iter().enumerate() {
 		assert!(
@@ -108,7 +118,8 @@ fn test_sin_cos_tan() {
 		);
 	}
 
-	let tan_out = gpu_tan(&x, 3).unwrap();
+	let tan_out = out_buf(3);
+	gpu_tan(&x, 3, &tan_out).unwrap();
 	let t = download(&tan_out, 3);
 	for (i, &a) in angles.iter().enumerate() {
 		assert!(
@@ -126,7 +137,8 @@ fn test_atan2() {
 	// atan2(y=1, x=1) = pi/4; atan2(y=1, x=0) = pi/2
 	let y = upload(&[1.0, 1.0, 0.0]);
 	let x = upload(&[1.0, 0.0, 1.0]);
-	let out = gpu_atan2(&y, &x, 3).unwrap();
+	let out = out_buf(3);
+	gpu_atan2(&y, &x, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(
 		approx_eq(r[0], std::f64::consts::PI / 4.0),
@@ -146,7 +158,8 @@ fn test_log1p_expm1() {
 	let vals = [0.0f64, 1.0, -0.5, 2.0];
 	let x = upload(&vals);
 
-	let log_out = gpu_log1p(&x, 4).unwrap();
+	let log_out = out_buf(4);
+	gpu_log1p(&x, 4, &log_out).unwrap();
 	let l = download(&log_out, 4);
 	for (i, &v) in vals.iter().enumerate() {
 		let exp = v.ln_1p();
@@ -161,7 +174,8 @@ fn test_log1p_expm1() {
 		}
 	}
 
-	let exp_out = gpu_expm1(&x, 4).unwrap();
+	let exp_out = out_buf(4);
+	gpu_expm1(&x, 4, &exp_out).unwrap();
 	let e = download(&exp_out, 4);
 	for (i, &v) in vals.iter().enumerate() {
 		assert!(
@@ -180,10 +194,18 @@ fn test_floor_ceil_round_trunc() {
 	let x = upload(&vals);
 	let n = vals.len();
 
-	let fl = download(&gpu_floor(&x, n).unwrap(), n);
-	let ce = download(&gpu_ceil(&x, n).unwrap(), n);
-	let ro = download(&gpu_round(&x, n).unwrap(), n);
-	let tr = download(&gpu_trunc(&x, n).unwrap(), n);
+	let fl_b = out_buf(n);
+	gpu_floor(&x, n, &fl_b).unwrap();
+	let fl = download(&fl_b, n);
+	let ce_b = out_buf(n);
+	gpu_ceil(&x, n, &ce_b).unwrap();
+	let ce = download(&ce_b, n);
+	let ro_b = out_buf(n);
+	gpu_round(&x, n, &ro_b).unwrap();
+	let ro = download(&ro_b, n);
+	let tr_b = out_buf(n);
+	gpu_trunc(&x, n, &tr_b).unwrap();
+	let tr = download(&tr_b, n);
 
 	for i in 0..n {
 		assert!(
@@ -226,7 +248,8 @@ fn test_floor_ceil_round_trunc() {
 fn test_fmod() {
 	let a = upload(&[5.0, -5.0, 7.0]);
 	let b = upload(&[3.0, 3.0, 2.0]);
-	let out = gpu_fmod(&a, &b, 3).unwrap();
+	let out = out_buf(3);
+	gpu_fmod(&a, &b, 3, &out).unwrap();
 	let r = download(&out, 3);
 	// C fmod: 5%3=2, -5%3=-2, 7%2=1
 	assert!(approx_eq(r[0], 2.0), "fmod(5,3) expected 2, got {}", r[0]);
@@ -241,7 +264,9 @@ fn test_fmod() {
 #[test]
 fn test_sub_scalar() {
 	let x = upload(&[10.0, 20.0, 30.0]);
-	let out = gpu_sub_scalar(&x, 5.0, 3).unwrap();
+	let s = upload(&[5.0]);
+	let out = out_buf(3);
+	gpu_sub_scalar(&x, &s, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 5.0), "sub_scalar: 10-5=5, got {}", r[0]);
 	assert!(approx_eq(r[1], 15.0), "sub_scalar: 20-5=15, got {}", r[1]);
@@ -251,7 +276,9 @@ fn test_sub_scalar() {
 #[test]
 fn test_div_scalar() {
 	let x = upload(&[10.0, 20.0, 30.0]);
-	let out = gpu_div_scalar(&x, 5.0, 3).unwrap();
+	let s = upload(&[5.0]);
+	let out = out_buf(3);
+	gpu_div_scalar(&x, &s, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 2.0), "div_scalar: 10/5=2, got {}", r[0]);
 	assert!(approx_eq(r[1], 4.0), "div_scalar: 20/5=4, got {}", r[1]);
@@ -262,7 +289,9 @@ fn test_div_scalar() {
 fn test_rsub_scalar() {
 	// rsub: out[i] = s - x[i]
 	let x = upload(&[1.0, 2.0, 3.0]);
-	let out = gpu_rsub_scalar(&x, 10.0, 3).unwrap();
+	let s = upload(&[10.0]);
+	let out = out_buf(3);
+	gpu_rsub_scalar(&x, &s, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 9.0), "rsub_scalar: 10-1=9, got {}", r[0]);
 	assert!(approx_eq(r[1], 8.0), "rsub_scalar: 10-2=8, got {}", r[1]);
@@ -273,7 +302,9 @@ fn test_rsub_scalar() {
 fn test_rdiv_scalar() {
 	// rdiv: out[i] = s / x[i]
 	let x = upload(&[2.0, 4.0, 5.0]);
-	let out = gpu_rdiv_scalar(&x, 20.0, 3).unwrap();
+	let s = upload(&[20.0]);
+	let out = out_buf(3);
+	gpu_rdiv_scalar(&x, &s, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 10.0), "rdiv_scalar: 20/2=10, got {}", r[0]);
 	assert!(approx_eq(r[1], 5.0), "rdiv_scalar: 20/4=5, got {}", r[1]);
@@ -283,36 +314,52 @@ fn test_rdiv_scalar() {
 #[test]
 fn test_has_nan_true() {
 	let x = upload(&[1.0, f64::NAN, 3.0]);
-	let result = gpu_has_nan(&x, 3).unwrap();
-	assert!(result, "has_nan with NaN should return true");
+	let flag = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_has_nan(&x, 3, &flag).unwrap();
+	let mut f = [0i32; 1];
+	flag.download_i32(&mut f).unwrap();
+	assert!(f[0] != 0, "has_nan with NaN should return true");
 }
 
 #[test]
 fn test_has_nan_false() {
 	let x = upload(&[1.0, 2.0, 3.0]);
-	let result = gpu_has_nan(&x, 3).unwrap();
-	assert!(!result, "has_nan with no NaN should return false");
+	let flag = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_has_nan(&x, 3, &flag).unwrap();
+	let mut f = [0i32; 1];
+	flag.download_i32(&mut f).unwrap();
+	assert!(f[0] == 0, "has_nan with no NaN should return false");
 }
 
 #[test]
-fn test_isfinite_all_true() {
+fn test_isfinite_all_all_true() {
 	let x = upload(&[1.0, 2.0, 3.0]);
-	let result = gpu_isfinite_all(&x, 3).unwrap();
-	assert!(result, "isfinite_all with all finite should return true");
+	let flag = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_isfinite_all(&x, 3, &flag).unwrap();
+	let mut f = [0i32; 1];
+	flag.download_i32(&mut f).unwrap();
+	// flag==0 → no non-finite element → all finite
+	assert!(f[0] == 0, "isfinite_all with all finite should return true");
 }
 
 #[test]
 fn test_isfinite_all_false_inf() {
 	let x = upload(&[1.0, f64::INFINITY, 3.0]);
-	let result = gpu_isfinite_all(&x, 3).unwrap();
-	assert!(!result, "isfinite_all with Inf should return false");
+	let flag = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_isfinite_all(&x, 3, &flag).unwrap();
+	let mut f = [0i32; 1];
+	flag.download_i32(&mut f).unwrap();
+	assert!(f[0] != 0, "isfinite_all with Inf should return false");
 }
 
 #[test]
 fn test_isfinite_all_false_nan() {
 	let x = upload(&[1.0, f64::NAN, 3.0]);
-	let result = gpu_isfinite_all(&x, 3).unwrap();
-	assert!(!result, "isfinite_all with NaN should return false");
+	let flag = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_isfinite_all(&x, 3, &flag).unwrap();
+	let mut f = [0i32; 1];
+	flag.download_i32(&mut f).unwrap();
+	assert!(f[0] != 0, "isfinite_all with NaN should return false");
 }
 
 // ─── encoding ────────────────────────────────────────────────────────────────
@@ -323,7 +370,8 @@ fn test_one_hot_layout() {
 	// row-major output: row 0 = [1,0,0], row 1 = [0,0,1]
 	let labels_i32: Vec<i32> = vec![0, 2];
 	let labels_buf = GpuBuffer::upload_i32(&labels_i32).unwrap();
-	let out = gpu_one_hot(&labels_buf, 2, 3).unwrap();
+	let out = out_buf(6);
+	gpu_one_hot(&labels_buf, 2, 3, &out).unwrap();
 	let r = download(&out, 6);
 	// row 0
 	assert!(approx_eq(r[0], 1.0), "one_hot[0][0]=1, got {}", r[0]);
@@ -339,7 +387,8 @@ fn test_one_hot_layout() {
 fn test_one_hot_single() {
 	let labels_i32: Vec<i32> = vec![1];
 	let labels_buf = GpuBuffer::upload_i32(&labels_i32).unwrap();
-	let out = gpu_one_hot(&labels_buf, 1, 3).unwrap();
+	let out = out_buf(3);
+	gpu_one_hot(&labels_buf, 1, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(approx_eq(r[0], 0.0), "one_hot[0]=0, got {}", r[0]);
 	assert!(approx_eq(r[1], 1.0), "one_hot[1]=1, got {}", r[1]);
@@ -351,8 +400,9 @@ fn test_bin_edges_uniform() {
 	// 4 rows, 1 col, values [0, 1, 2, 3] → min=0, max=3
 	// n_bins=3: edges = [0, 1, 2, 3]
 	let x = upload(&[0.0, 1.0, 2.0, 3.0]);
-	let out = gpu_bin_edges_uniform(&x, 4, 1, 3).unwrap();
-	let r = download(&out, 4); // cols*(n_bins+1) = 1*4 = 4
+	let out = out_buf(4); // cols*(n_bins+1) = 1*4 = 4
+	gpu_bin_edges_uniform(&x, 4, 1, 3, &out).unwrap();
+	let r = download(&out, 4);
 	assert!(approx_eq(r[0], 0.0), "edge[0]=0, got {}", r[0]);
 	assert!(approx_eq(r[1], 1.0), "edge[1]=1, got {}", r[1]);
 	assert!(approx_eq(r[2], 2.0), "edge[2]=2, got {}", r[2]);
@@ -367,7 +417,8 @@ fn test_bin_edges_uniform_two_cols() {
 	// edges layout: col-major: col0*(n_bins+1) then col1*(n_bins+1)
 	// i.e. edges[0..3]=[0,1,2], edges[3..6]=[10,15,20]
 	let x = upload(&[0.0, 10.0, 2.0, 20.0]);
-	let out = gpu_bin_edges_uniform(&x, 2, 2, 2).unwrap();
+	let out = out_buf(6);
+	gpu_bin_edges_uniform(&x, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 6);
 	assert!(approx_eq(r[0], 0.0), "col0 edge[0]=0, got {}", r[0]);
 	assert!(approx_eq(r[1], 1.0), "col0 edge[1]=1, got {}", r[1]);
@@ -387,7 +438,8 @@ fn test_quantize_features_basic() {
 	// v=3: ep[3]=3 ≤ 3 → lo=3, clamped to n_bins-1=2
 	let x = upload(&[0.0, 1.0, 2.0, 3.0]);
 	let edges = upload(&[0.0, 1.0, 2.0, 3.0]);
-	let out = gpu_quantize_features(&x, &edges, 4, 1, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_quantize_features(&x, &edges, 4, 1, 3, &out).unwrap();
 	let mut r = vec![0u8; 4];
 	out.download_u8(&mut r).unwrap();
 	assert_eq!(r[0], 0, "quantize v=0 expected bin 0, got {}", r[0]);
@@ -406,7 +458,8 @@ fn test_quantize_boundary_below_first_edge() {
 	// so bin 0 is expected
 	let x = upload(&[-1.0]);
 	let edges = upload(&[0.0, 1.0, 2.0, 3.0]);
-	let out = gpu_quantize_features(&x, &edges, 1, 1, 3).unwrap();
+	let out = GpuBuffer::alloc_bytes(1).unwrap();
+	gpu_quantize_features(&x, &edges, 1, 1, 3, &out).unwrap();
 	let mut r = vec![0u8; 1];
 	out.download_u8(&mut r).unwrap();
 	assert_eq!(r[0], 0, "below-min expected bin 0, got {}", r[0]);
@@ -421,7 +474,9 @@ fn test_bin_edges_quantile_sorted() {
 	// b=2: 2*3/4=1.5 → 0.5*(1+2) = 1.5
 	// b=3: 3*3/4=2.25 → 0.75*(2+3) ... lo=2, frac=0.25 → 2+0.25 = 2.25
 	let x = upload(&[0.0, 1.0, 2.0, 3.0]);
-	let out = gpu_bin_edges_quantile(&x, 4, 1, 4).unwrap();
+	let tmp = out_buf(4); // cols*rows
+	let out = out_buf(5); // cols*(n_bins+1)
+	gpu_bin_edges_quantile(&x, 4, 1, 4, &tmp, &out).unwrap();
 	let r = download(&out, 5);
 	assert!(approx_eq(r[0], 0.0), "q_edge[0]=0, got {}", r[0]);
 	assert!(approx_eq(r[1], 0.75), "q_edge[1]=0.75, got {}", r[1]);
@@ -435,7 +490,15 @@ fn test_count_distinct() {
 	// sorted: [1, 1, 2, 3, 3, 3] → 3 distinct
 	let data: Vec<i32> = vec![1, 1, 2, 3, 3, 3];
 	let buf = GpuBuffer::upload_i32(&data).unwrap();
-	let count = gpu_count_distinct(&buf, 6).unwrap();
+	let n = 6;
+	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
+	let mut c = [0i32; 1];
+	count_out.download_i32(&mut c).unwrap();
+	let count = c[0];
 	assert_eq!(count, 3, "count_distinct expected 3, got {}", count);
 }
 
@@ -443,7 +506,15 @@ fn test_count_distinct() {
 fn test_count_distinct_all_same() {
 	let data: Vec<i32> = vec![5, 5, 5];
 	let buf = GpuBuffer::upload_i32(&data).unwrap();
-	let count = gpu_count_distinct(&buf, 3).unwrap();
+	let n = 3;
+	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
+	let mut c = [0i32; 1];
+	count_out.download_i32(&mut c).unwrap();
+	let count = c[0];
 	assert_eq!(
 		count, 1,
 		"count_distinct all-same expected 1, got {}",
@@ -457,13 +528,21 @@ fn test_run_length() {
 	// expected: values=[1,2,3], counts=[2,1,3], n_runs=3
 	let data: Vec<i32> = vec![1, 1, 2, 3, 3, 3];
 	let buf = GpuBuffer::upload_i32(&data).unwrap();
-	let (vals_buf, counts_buf, n_runs) = gpu_run_length(&buf, 6).unwrap();
+	let n = 6;
+	let temp = GpuBuffer::alloc_bytes(gpu_run_length_workspace_bytes(&buf, n).max(8)).unwrap();
+	let values_out = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let counts_out = GpuBuffer::alloc_bytes(n * 4).unwrap();
+	let n_runs_out = GpuBuffer::alloc_bytes(4).unwrap();
+	gpu_run_length(&buf, n, &temp, &values_out, &counts_out, &n_runs_out).unwrap();
+	let mut nr = [0i32; 1];
+	n_runs_out.download_i32(&mut nr).unwrap();
+	let n_runs = nr[0] as usize;
 	assert_eq!(n_runs, 3, "run_length n_runs expected 3, got {}", n_runs);
 
 	let mut vals = vec![0i32; n_runs];
 	let mut counts = vec![0i32; n_runs];
-	vals_buf.download_i32(&mut vals).unwrap();
-	counts_buf.download_i32(&mut counts).unwrap();
+	values_out.download_i32(&mut vals).unwrap();
+	counts_out.download_i32(&mut counts).unwrap();
 
 	assert_eq!(vals[0], 1, "run_val[0]=1, got {}", vals[0]);
 	assert_eq!(vals[1], 2, "run_val[1]=2, got {}", vals[1]);
@@ -478,7 +557,8 @@ fn test_pairwise_cosine_identical() {
 	// Two identical vectors [1,0] — cosine similarity = 1
 	let q = upload(&[1.0, 0.0]);
 	let t = upload(&[1.0, 0.0]);
-	let out = gpu_pairwise_cosine(&q, &t, 1, 1, 2).unwrap();
+	let out = out_buf(1);
+	gpu_pairwise_cosine(&q, &t, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "pairwise_cosine identical: NaN/inf");
 	assert!(approx_eq(r[0], 1.0), "cosine([1,0],[1,0])=1, got {}", r[0]);
@@ -489,7 +569,8 @@ fn test_pairwise_cosine_orthogonal() {
 	// [1,0] vs [0,1] → cosine = 0
 	let q = upload(&[1.0, 0.0]);
 	let t = upload(&[0.0, 1.0]);
-	let out = gpu_pairwise_cosine(&q, &t, 1, 1, 2).unwrap();
+	let out = out_buf(1);
+	gpu_pairwise_cosine(&q, &t, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "pairwise_cosine orthogonal: NaN/inf");
 	assert!(approx_eq(r[0], 0.0), "cosine([1,0],[0,1])=0, got {}", r[0]);
@@ -502,7 +583,8 @@ fn test_pairwise_cosine_2x2() {
 	//             out[2]=cos([0,1],[1,0])=0, out[3]=cos([0,1],[0,1])=1
 	let q = upload(&[1.0, 0.0, 0.0, 1.0]);
 	let t = upload(&[1.0, 0.0, 0.0, 1.0]);
-	let out = gpu_pairwise_cosine(&q, &t, 2, 2, 2).unwrap();
+	let out = out_buf(4);
+	gpu_pairwise_cosine(&q, &t, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 4);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -520,7 +602,8 @@ fn test_pairwise_l1_basic() {
 	// q=[0,0], t=[3,4] → L1 = |0-3| + |0-4| = 7
 	let q = upload(&[0.0, 0.0]);
 	let t = upload(&[3.0, 4.0]);
-	let out = gpu_pairwise_l1(&q, &t, 1, 1, 2).unwrap();
+	let out = out_buf(1);
+	gpu_pairwise_l1(&q, &t, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "pairwise_l1: NaN/inf");
 	assert!(approx_eq(r[0], 7.0), "L1([0,0],[3,4])=7, got {}", r[0]);
@@ -533,7 +616,8 @@ fn test_pairwise_l1_2x2() {
 	// out[2]=|1-0|+|1-0|=2, out[3]=|1-2|+|1-3|=3
 	let q = upload(&[0.0, 0.0, 1.0, 1.0]);
 	let t = upload(&[0.0, 0.0, 2.0, 3.0]);
-	let out = gpu_pairwise_l1(&q, &t, 2, 2, 2).unwrap();
+	let out = out_buf(4);
+	gpu_pairwise_l1(&q, &t, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 4);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -551,7 +635,8 @@ fn test_pairwise_hamming_identical() {
 	// [1,2] vs [1,2] → 0/2 = 0.0
 	let q_u8 = GpuBuffer::upload_u8(&[1u8, 2u8]).unwrap();
 	let t_u8 = GpuBuffer::upload_u8(&[1u8, 2u8]).unwrap();
-	let out = gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2).unwrap();
+	let out = out_buf(1);
+	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "hamming identical: NaN/inf");
 	assert!(
@@ -566,7 +651,8 @@ fn test_pairwise_hamming_half_mismatch() {
 	// [1,0] vs [0,0] → 1/2 = 0.5
 	let q_u8 = GpuBuffer::upload_u8(&[1u8, 0u8]).unwrap();
 	let t_u8 = GpuBuffer::upload_u8(&[0u8, 0u8]).unwrap();
-	let out = gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2).unwrap();
+	let out = out_buf(1);
+	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "hamming half-mismatch: NaN/inf");
 	assert!(
@@ -585,7 +671,8 @@ fn test_pairwise_hamming_2x2() {
 	// out[3]=hamming([1,0],[1,1])=1/2=0.5
 	let q_u8 = GpuBuffer::upload_u8(&[0u8, 1, 1, 0]).unwrap();
 	let t_u8 = GpuBuffer::upload_u8(&[0u8, 1, 1, 1]).unwrap();
-	let out = gpu_pairwise_hamming(&q_u8, &t_u8, 2, 2, 2).unwrap();
+	let out = out_buf(4);
+	gpu_pairwise_hamming(&q_u8, &t_u8, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 4);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -606,7 +693,8 @@ fn test_mae_grad_basic() {
 	// grad = sign(d)/n → [1/3, -1/3, 0/3]
 	let pred = upload(&[2.0, 1.0, 3.0]);
 	let target = upload(&[1.0, 3.0, 3.0]);
-	let out = gpu_mae_grad(&pred, &target, 3).unwrap();
+	let out = out_buf(3);
+	gpu_mae_grad(&pred, &target, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(
 		r.iter().all(|v| v.is_finite()),
@@ -625,7 +713,9 @@ fn test_huber_grad_small_residual() {
 	// pred=[1.5], target=[1.0], d=0.5 <= 1.0 → grad = 0.5/1
 	let pred = upload(&[1.5]);
 	let target = upload(&[1.0]);
-	let out = gpu_huber_grad(&pred, &target, 1.0, 1).unwrap();
+	let delta = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_huber_grad(&pred, &target, &delta, 1, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "huber_grad small: NaN/inf");
 	assert!(
@@ -641,7 +731,9 @@ fn test_huber_grad_large_residual() {
 	// pred=[3.0], target=[0.0], d=3.0 > 1.0 → grad = 1.0 * 1 / 1 = 1.0
 	let pred = upload(&[3.0]);
 	let target = upload(&[0.0]);
-	let out = gpu_huber_grad(&pred, &target, 1.0, 1).unwrap();
+	let delta = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_huber_grad(&pred, &target, &delta, 1, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "huber_grad large pos: NaN/inf");
 	assert!(
@@ -656,7 +748,9 @@ fn test_huber_grad_large_negative_residual() {
 	// d=-3.0 < -1.0 → grad = -delta/n = -1.0
 	let pred = upload(&[0.0]);
 	let target = upload(&[3.0]);
-	let out = gpu_huber_grad(&pred, &target, 1.0, 1).unwrap();
+	let delta = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_huber_grad(&pred, &target, &delta, 1, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "huber_grad large neg: NaN/inf");
 	assert!(
@@ -673,7 +767,9 @@ fn test_bce_with_logits_loss_and_grad() {
 	// Test z=0, y=1: loss = 0 - 0 + log1p(1) = ln(2) ≈ 0.6931; grad = 0.5 - 1 = -0.5
 	let z = upload(&[0.0]);
 	let y = upload(&[1.0]);
-	let (loss_buf, grad_buf) = gpu_bce_with_logits(&z, &y, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_bce_with_logits(&z, &y, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let expected_loss = (2.0f64).ln();
@@ -699,7 +795,9 @@ fn test_bce_with_logits_positive_logit() {
 	// grad = sigmoid(2) - 1 = 1/(1+exp(-2)) - 1 ≈ 0.8808 - 1 = -0.1192
 	let z = upload(&[2.0]);
 	let y = upload(&[1.0]);
-	let (loss_buf, grad_buf) = gpu_bce_with_logits(&z, &y, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_bce_with_logits(&z, &y, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let sig2 = 1.0 / (1.0 + (-2.0f64).exp());
@@ -730,7 +828,9 @@ fn test_bce_with_logits_negative_logit() {
 	// grad = sigmoid(-2) - 0 = 1/(1+exp(2)) ≈ 0.1192
 	let z = upload(&[-2.0]);
 	let y = upload(&[0.0]);
-	let (loss_buf, grad_buf) = gpu_bce_with_logits(&z, &y, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_bce_with_logits(&z, &y, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let sig_neg2 = 1.0 / (1.0 + (2.0f64).exp());
@@ -758,7 +858,11 @@ fn test_focal_loss_target1() {
 	// loss = -0.01 * ln(0.9)
 	let prob = upload(&[0.9]);
 	let target = upload(&[1.0]);
-	let (loss_buf, grad_buf) = gpu_focal_loss(&prob, &target, 2.0, 1.0, 1).unwrap();
+	let gamma = upload(&[2.0]);
+	let alpha = upload(&[1.0]);
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_focal_loss(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let p_t = 0.9f64;
@@ -780,7 +884,11 @@ fn test_focal_loss_target0() {
 	// p_t = 1-0.1 = 0.9, loss = -(1*(1-0.9)^2 * ln(0.9)) = -0.01*ln(0.9)
 	let prob = upload(&[0.1]);
 	let target = upload(&[0.0]);
-	let (loss_buf, grad_buf) = gpu_focal_loss(&prob, &target, 2.0, 1.0, 1).unwrap();
+	let gamma = upload(&[2.0]);
+	let alpha = upload(&[1.0]);
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_focal_loss(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let p_t = 0.9f64;
@@ -802,7 +910,8 @@ fn test_kl_div_loss() {
 	// target=[0.5, 0.5], log_p=[ln(0.5), ln(0.5)] → out=[0,0] (uniform matches uniform)
 	let log_p = upload(&[(0.5f64).ln(), (0.5f64).ln()]);
 	let target = upload(&[0.5, 0.5]);
-	let out = gpu_kl_div_loss(&log_p, &target, 2).unwrap();
+	let out = out_buf(2);
+	gpu_kl_div_loss(&log_p, &target, 2, &out).unwrap();
 	let r = download(&out, 2);
 	assert!(r.iter().all(|v| v.is_finite()), "kl_div: NaN/inf: {:?}", r);
 	assert!(approx_eq(r[0], 0.0), "kl_div uniform[0]=0, got {}", r[0]);
@@ -816,7 +925,8 @@ fn test_kl_div_loss_skewed() {
 	// out[1] = 0 → 0
 	let log_p = upload(&[(0.8f64).ln(), (0.2f64).ln()]);
 	let target = upload(&[1.0, 0.0]);
-	let out = gpu_kl_div_loss(&log_p, &target, 2).unwrap();
+	let out = out_buf(2);
+	gpu_kl_div_loss(&log_p, &target, 2, &out).unwrap();
 	let r = download(&out, 2);
 	let expected0 = 1.0 * (1.0f64.ln() - (0.8f64).ln());
 	assert!(r[0].is_finite(), "kl_div skewed[0]: NaN/inf");
@@ -834,7 +944,9 @@ fn test_hinge_loss_margin_positive() {
 	// score=0.5, label=+1 → margin = 1 - 0.5 = 0.5 > 0 → loss=0.5, grad=-1
 	let scores = upload(&[0.5]);
 	let labels = upload(&[1.0]);
-	let (loss_buf, grad_buf) = gpu_hinge_loss(&scores, &labels, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_hinge_loss(&scores, &labels, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	assert!(
@@ -854,7 +966,9 @@ fn test_hinge_loss_no_margin() {
 	// score=2.0, label=+1 → margin = 1 - 2 = -1 < 0 → loss=0, grad=0
 	let scores = upload(&[2.0]);
 	let labels = upload(&[1.0]);
-	let (loss_buf, grad_buf) = gpu_hinge_loss(&scores, &labels, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_hinge_loss(&scores, &labels, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	assert!(
@@ -874,7 +988,9 @@ fn test_hinge_loss_negative_label() {
 	// score=-0.5, label=-1 → margin = 1 - (-1)(-0.5) = 1 - 0.5 = 0.5 > 0 → loss=0.5, grad=+1
 	let scores = upload(&[-0.5]);
 	let labels = upload(&[-1.0]);
-	let (loss_buf, grad_buf) = gpu_hinge_loss(&scores, &labels, 1).unwrap();
+	let loss_buf = out_buf(1);
+	let grad_buf = out_buf(1);
+	gpu_hinge_loss(&scores, &labels, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	assert!(
@@ -896,7 +1012,9 @@ fn test_cosine_embedding_loss_similar() {
 	let a = upload(&[1.0, 0.0]);
 	let b = upload(&[1.0, 0.0]);
 	let label = upload(&[1.0]);
-	let out = gpu_cosine_embedding_loss(&a, &b, &label, 1, 2, 0.5).unwrap();
+	let margin = upload(&[0.5]);
+	let out = out_buf(1);
+	gpu_cosine_embedding_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "cosine_emb similar: NaN/inf");
 	assert!(
@@ -913,7 +1031,9 @@ fn test_cosine_embedding_loss_dissimilar_no_violation() {
 	let a = upload(&[1.0, 0.0]);
 	let b = upload(&[-1.0, 0.0]);
 	let label = upload(&[-1.0]);
-	let out = gpu_cosine_embedding_loss(&a, &b, &label, 1, 2, 0.0).unwrap();
+	let margin = upload(&[0.0]);
+	let out = out_buf(1);
+	gpu_cosine_embedding_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "cosine_emb dissim no-viol: NaN/inf");
 	assert!(
@@ -930,7 +1050,9 @@ fn test_cosine_embedding_loss_dissimilar_violation() {
 	let a = upload(&[1.0, 0.0]);
 	let b = upload(&[1.0, 0.0]);
 	let label = upload(&[-1.0]);
-	let out = gpu_cosine_embedding_loss(&a, &b, &label, 1, 2, 0.5).unwrap();
+	let margin = upload(&[0.5]);
+	let out = out_buf(1);
+	gpu_cosine_embedding_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "cosine_emb dissim violation: NaN/inf");
 	assert!(
@@ -950,7 +1072,9 @@ fn test_triplet_loss_no_violation() {
 	let anchor = upload(&[0.0, 0.0]);
 	let pos = upload(&[0.0, 0.0]);
 	let neg = upload(&[2.0, 0.0]);
-	let out = gpu_triplet_loss(&anchor, &pos, &neg, 1, 2, 0.0).unwrap();
+	let margin = upload(&[0.0]);
+	let out = out_buf(1);
+	gpu_triplet_loss(&anchor, &pos, &neg, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "triplet no-viol: NaN/inf");
 	assert!(
@@ -967,7 +1091,9 @@ fn test_triplet_loss_with_violation() {
 	let anchor = upload(&[0.0, 0.0]);
 	let pos = upload(&[1.0, 0.0]);
 	let neg = upload(&[0.5, 0.0]);
-	let out = gpu_triplet_loss(&anchor, &pos, &neg, 1, 2, 0.0).unwrap();
+	let margin = upload(&[0.0]);
+	let out = out_buf(1);
+	gpu_triplet_loss(&anchor, &pos, &neg, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "triplet violation: NaN/inf");
 	assert!(
@@ -984,7 +1110,9 @@ fn test_triplet_loss_margin() {
 	let anchor = upload(&[0.0, 0.0]);
 	let pos = upload(&[1.0, 0.0]);
 	let neg = upload(&[2.0, 0.0]);
-	let out = gpu_triplet_loss(&anchor, &pos, &neg, 1, 2, 1.0).unwrap();
+	let margin = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_triplet_loss(&anchor, &pos, &neg, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "triplet margin: NaN/inf");
 	assert!(
@@ -1001,7 +1129,9 @@ fn test_contrastive_loss_similar() {
 	let a = upload(&[0.0, 0.0]);
 	let b = upload(&[0.0, 0.0]);
 	let label = upload(&[1.0]);
-	let out = gpu_contrastive_loss(&a, &b, &label, 1, 2, 1.0).unwrap();
+	let margin = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_contrastive_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "contrastive similar: NaN/inf");
 	assert!(
@@ -1018,7 +1148,9 @@ fn test_contrastive_loss_similar_nonzero() {
 	let a = upload(&[1.0, 0.0]);
 	let b = upload(&[3.0, 0.0]);
 	let label = upload(&[1.0]);
-	let out = gpu_contrastive_loss(&a, &b, &label, 1, 2, 1.0).unwrap();
+	let margin = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_contrastive_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "contrastive similar nonzero: NaN/inf");
 	assert!(
@@ -1035,7 +1167,9 @@ fn test_contrastive_loss_dissimilar_no_violation() {
 	let a = upload(&[0.0, 0.0]);
 	let b = upload(&[2.0, 0.0]);
 	let label = upload(&[0.0]);
-	let out = gpu_contrastive_loss(&a, &b, &label, 1, 2, 1.0).unwrap();
+	let margin = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_contrastive_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "contrastive dissim no-viol: NaN/inf");
 	assert!(
@@ -1052,7 +1186,9 @@ fn test_contrastive_loss_dissimilar_violation() {
 	let a = upload(&[0.0, 0.0]);
 	let b = upload(&[0.5, 0.0]);
 	let label = upload(&[0.0]);
-	let out = gpu_contrastive_loss(&a, &b, &label, 1, 2, 1.0).unwrap();
+	let margin = upload(&[1.0]);
+	let out = out_buf(1);
+	gpu_contrastive_loss(&a, &b, &label, &margin, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
 	assert!(r[0].is_finite(), "contrastive dissim violation: NaN/inf");
 	assert!(
