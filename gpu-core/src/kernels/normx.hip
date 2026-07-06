@@ -134,8 +134,9 @@ extern "C" void launch_normx_l2_normalize(
 // x: (rows, cols). out = x / sqrt(mean(x^2)+eps) * gamma (gamma optional,
 // per-column length cols). torch.nn.functional.rms_norm / llama convention.
 extern "C" __global__ void normx_rmsnorm_kernel(
-    const double* x, double* out, const double* gamma, int rows, int cols, double eps
+    const double* x, double* out, const double* gamma, int rows, int cols, const double* eps_p
 ) {
+    double eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
     const double* r = x + (long)row * cols;
@@ -151,7 +152,7 @@ extern "C" __global__ void normx_rmsnorm_kernel(
 }
 
 extern "C" void launch_normx_rmsnorm(
-    const double* x, double* out, const double* gamma, int rows, int cols, double eps, hipStream_t s
+    const double* x, double* out, const double* gamma, int rows, int cols, const double* eps, hipStream_t s
 ) {
     int threads = min(256, max(32, cols));
     hipLaunchKernelGGL(normx_rmsnorm_kernel, dim3(rows), dim3(threads), 0, s,

@@ -1,10 +1,16 @@
-use crate::hip::HipError;
+use crate::hip::{HipError, check};
 use crate::kernels::{
-	check_launch, gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_gemm_bt,
-	gpu_softmax_backward_into, gpu_softmax_rows,
+	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_gemm_bt,
+	gpu_softmax_backward_into, gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+
+fn cl() -> Result<(), HipError> {
+	crate::callspy::tick(&crate::callspy::LAUNCH);
+	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
+	check(unsafe { crate::hip::hipGetLastError() })
+}
 
 // FFI declaration — slot-for-slot with the launcher in moex.hip
 //
@@ -36,6 +42,62 @@ unsafe extern "C" {
 	);
 }
 
+// Weighted expert accumulate (forward primitive): out += gate[:,e] * ye, in
+// place on `out` (n_tokens, d) accumulator. `e` is the loop index of the expert.
+pub fn gpu_moe_weighted_accumulate(
+	ye: &GpuBuffer,
+	gate: &GpuBuffer,
+	n: usize,
+	d: usize,
+	n_experts: usize,
+	e: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_moex_weighted_accumulate(
+			ye.ptr_raw() as *const c_void,
+			gate.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			n as i32,
+			d as i32,
+			n_experts as i32,
+			e as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	cl()
+}
+
+// Weighted expert accumulate backward (primitive): from d_out/gate/ye produce
+// d_ye (n_tokens, d) and d_gate[:,e] (column e of an n_tokens*n_experts buffer).
+pub fn gpu_moe_weighted_accumulate_backward(
+	d_out: &GpuBuffer,
+	gate: &GpuBuffer,
+	ye: &GpuBuffer,
+	n: usize,
+	d: usize,
+	n_experts: usize,
+	e: usize,
+	d_ye: &GpuBuffer,
+	d_gate: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_moex_weighted_accumulate_backward(
+			d_out.ptr_raw() as *const c_void,
+			gate.ptr_raw() as *const c_void,
+			ye.ptr_raw() as *const c_void,
+			d_ye.ptr_raw(),
+			d_gate.ptr_raw(),
+			n as i32,
+			d as i32,
+			n_experts as i32,
+			e as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	cl()
+}
+
 // ── gpu_moe_route ────────────────────────────────────────────────────────────
 // Dense mixture-of-experts routing forward (all experts evaluated per token).
 //   hidden:   f64 (n_tokens, d_model) row-major.
@@ -45,6 +107,9 @@ unsafe extern "C" {
 // router logits = hidden @ gate_w → (n_tokens, n_experts); softmax over experts
 // per token → gate probs; for each expert e, Ye = hidden @ expert_w[e]; the
 // output O = Σ_e gate[:,e] * Ye, shape (n_tokens, d_model) == hidden.
+// not-an-op: driver — orchestrates gpu_gemm/gpu_softmax_rows_into + a per-expert
+// gpu_gemm/gpu_moe_weighted_accumulate loop; allocates the returned output and
+// intermediates.
 pub fn gpu_moe_route(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -53,27 +118,18 @@ pub fn gpu_moe_route(
 	d_model: usize,
 	n_experts: usize,
 ) -> Result<GpuBuffer, HipError> {
-	let logits = gpu_gemm(hidden, gate_w, n_tokens, n_experts, d_model)?;
-	let gate = gpu_softmax_rows(&logits, n_tokens, n_experts)?;
+	let logits = GpuBuffer::alloc(n_tokens * n_experts)?;
+	gpu_gemm(hidden, gate_w, n_tokens, n_experts, d_model, &logits)?;
+	let gate = GpuBuffer::alloc(n_tokens * n_experts)?;
+	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 
 	let out = GpuBuffer::zeros_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
 	let expert_stride = d_model * d_model;
+	let ye = GpuBuffer::alloc(n_tokens * d_model)?;
 	for e in 0..n_experts {
 		let we = expert_w.view(e * expert_stride, expert_stride);
-		let ye = gpu_gemm(hidden, &we, n_tokens, d_model, d_model)?;
-		unsafe {
-			launch_moex_weighted_accumulate(
-				ye.ptr_raw() as *const c_void,
-				gate.ptr_raw() as *const c_void,
-				out.ptr_raw(),
-				n_tokens as i32,
-				d_model as i32,
-				n_experts as i32,
-				e as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
+		gpu_gemm(hidden, &we, n_tokens, d_model, d_model, &ye)?;
+		gpu_moe_weighted_accumulate(&ye, &gate, n_tokens, d_model, n_experts, e, &out)?;
 	}
 	Ok(out)
 }
@@ -88,6 +144,10 @@ pub fn gpu_moe_route(
 //                 d_hidden += d_ye · Weᵀ ; d_We = hiddenᵀ · d_ye
 //   router: d_logits = softmax_bwd(d_gate, gate)
 //           d_hidden += d_logits · gate_wᵀ ; d_gate_w = hiddenᵀ · d_logits
+// not-an-op: driver — recomputes the forward intermediates, loops experts with
+// gpu_moe_weighted_accumulate_backward + gpu_gemm_bt/gpu_gemm_at/gpu_add_inplace/
+// gpu_copy_into, then the router grads via gpu_softmax_backward_into; allocates
+// all returned grads and intermediates.
 pub fn gpu_moe_backward(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -97,46 +157,41 @@ pub fn gpu_moe_backward(
 	d_model: usize,
 	n_experts: usize,
 ) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError> {
-	let logits = gpu_gemm(hidden, gate_w, n_tokens, n_experts, d_model)?;
-	let gate = gpu_softmax_rows(&logits, n_tokens, n_experts)?;
+	let logits = GpuBuffer::alloc(n_tokens * n_experts)?;
+	gpu_gemm(hidden, gate_w, n_tokens, n_experts, d_model, &logits)?;
+	let gate = GpuBuffer::alloc(n_tokens * n_experts)?;
+	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 	let expert_stride = d_model * d_model;
 
 	let d_hidden = GpuBuffer::zeros_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
 	let d_gate = GpuBuffer::alloc(n_tokens * n_experts)?;
 	let d_expert_w = GpuBuffer::alloc(n_experts * expert_stride)?;
 	let d_ye = GpuBuffer::alloc(n_tokens * d_model)?;
+	let ye = GpuBuffer::alloc(n_tokens * d_model)?;
+	let dh_e = GpuBuffer::alloc(n_tokens * d_model)?;
+	let dwe = GpuBuffer::alloc(expert_stride)?;
 
 	for e in 0..n_experts {
 		let we = expert_w.view(e * expert_stride, expert_stride);
-		let ye = gpu_gemm(hidden, &we, n_tokens, d_model, d_model)?;
-		unsafe {
-			launch_moex_weighted_accumulate_backward(
-				d_out.ptr_raw() as *const c_void,
-				gate.ptr_raw() as *const c_void,
-				ye.ptr_raw() as *const c_void,
-				d_ye.ptr_raw(),
-				d_gate.ptr_raw(),
-				n_tokens as i32,
-				d_model as i32,
-				n_experts as i32,
-				e as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
+		gpu_gemm(hidden, &we, n_tokens, d_model, d_model, &ye)?;
+		gpu_moe_weighted_accumulate_backward(
+			d_out, &gate, &ye, n_tokens, d_model, n_experts, e, &d_ye, &d_gate,
+		)?;
 		// d_hidden += d_ye · Weᵀ
-		let dh_e = gpu_gemm_bt(&d_ye, &we, n_tokens, d_model, d_model)?;
-		gpu_add_inplace(&d_hidden, &dh_e, n_tokens * d_model);
+		gpu_gemm_bt(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
+		gpu_add_inplace(&dh_e, n_tokens * d_model, &d_hidden)?;
 		// d_We = hiddenᵀ · d_ye  →  d_expert_w[e]
-		let dwe = gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens)?;
-		gpu_copy_into(&dwe, &d_expert_w.view(e * expert_stride, expert_stride), expert_stride);
+		gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens, &dwe)?;
+		gpu_copy_into(&dwe, expert_stride, &d_expert_w.view(e * expert_stride, expert_stride))?;
 	}
 
 	let d_logits = GpuBuffer::alloc(n_tokens * n_experts)?;
-	gpu_softmax_backward_into(&d_gate, &gate, &d_logits, n_tokens, n_experts);
-	let dh_r = gpu_gemm_bt(&d_logits, gate_w, n_tokens, d_model, n_experts)?;
-	gpu_add_inplace(&d_hidden, &dh_r, n_tokens * d_model);
-	let d_gate_w = gpu_gemm_at(hidden, &d_logits, d_model, n_experts, n_tokens)?;
+	gpu_softmax_backward_into(&d_gate, &gate, n_tokens, n_experts, &d_logits)?;
+	let dh_r = GpuBuffer::alloc(n_tokens * d_model)?;
+	gpu_gemm_bt(&d_logits, gate_w, n_tokens, d_model, n_experts, &dh_r)?;
+	gpu_add_inplace(&dh_r, n_tokens * d_model, &d_hidden)?;
+	let d_gate_w = GpuBuffer::alloc(d_model * n_experts)?;
+	gpu_gemm_at(hidden, &d_logits, d_model, n_experts, n_tokens, &d_gate_w)?;
 
 	Ok((d_hidden, d_gate_w, d_expert_w))
 }

@@ -6,21 +6,21 @@ pub const SELU_ALPHA: f64 = 1.6732632423543772848170429916717;
 pub const SELU_LAMBDA: f64 = 1.0507009873554804934193349852946;
 
 unsafe extern "C" {
-	fn launch_gapact_elu(x: *const c_void, out: *mut c_void, n: i32, alpha: f64, s: *mut c_void);
+	fn launch_gapact_elu(x: *const c_void, out: *mut c_void, n: i32, alpha: *const c_void, s: *mut c_void);
 	fn launch_gapact_elu_backward(
 		g: *const c_void,
 		x: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		alpha: f64,
+		alpha: *const c_void,
 		s: *mut c_void,
 	);
 	fn launch_gapact_selu(
 		x: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		alpha: f64,
-		lambda: f64,
+		alpha: *const c_void,
+		lambda: *const c_void,
 		s: *mut c_void,
 	);
 	fn launch_gapact_selu_backward(
@@ -28,8 +28,8 @@ unsafe extern "C" {
 		x: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		alpha: f64,
-		lambda: f64,
+		alpha: *const c_void,
+		lambda: *const c_void,
 		s: *mut c_void,
 	);
 	fn launch_gapact_mish(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
@@ -78,172 +78,129 @@ fn e() -> Result<(), HipError> {
 	check(unsafe { crate::hip::hipGetLastError() })
 }
 
-pub fn gpu_elu(x: &GpuBuffer, n: usize, alpha: f64) -> Result<GpuBuffer, HipError> {
-	let o = GpuBuffer::alloc(n)?;
+// ELU/SELU (backward takes the PRE-activation x, not the output). Hyperparameters
+// ride as caller-uploaded 1-elem device buffers (alpha/lambda).
+pub fn gpu_elu(
+	x: &GpuBuffer,
+	alpha: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gapact_elu(
 			x.ptr_raw() as *const c_void,
-			o.ptr_raw(),
+			out.ptr_raw(),
 			n as i32,
-			alpha,
+			alpha.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
-	e()?;
-	Ok(o)
+	e()
 }
 pub fn gpu_elu_backward(
 	g: &GpuBuffer,
 	x: &GpuBuffer,
+	alpha: &GpuBuffer,
 	n: usize,
-	alpha: f64,
-) -> Result<GpuBuffer, HipError> {
-	let o = GpuBuffer::alloc(n)?;
-	unsafe {
-		launch_gapact_elu_backward(
-			g.ptr_raw() as *const c_void,
-			x.ptr_raw() as *const c_void,
-			o.ptr_raw(),
-			n as i32,
-			alpha,
-			std::ptr::null_mut(),
-		);
-	}
-	e()?;
-	Ok(o)
-}
-pub fn gpu_selu(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let o = GpuBuffer::alloc(n)?;
-	unsafe {
-		launch_gapact_selu(
-			x.ptr_raw() as *const c_void,
-			o.ptr_raw(),
-			n as i32,
-			SELU_ALPHA,
-			SELU_LAMBDA,
-			std::ptr::null_mut(),
-		);
-	}
-	e()?;
-	Ok(o)
-}
-pub fn gpu_selu_backward(g: &GpuBuffer, x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let o = GpuBuffer::alloc(n)?;
-	unsafe {
-		launch_gapact_selu_backward(
-			g.ptr_raw() as *const c_void,
-			x.ptr_raw() as *const c_void,
-			o.ptr_raw(),
-			n as i32,
-			SELU_ALPHA,
-			SELU_LAMBDA,
-			std::ptr::null_mut(),
-		);
-	}
-	e()?;
-	Ok(o)
-}
-
-// Alloc-free ELU/SELU (backward takes the PRE-activation x, not the output).
-pub fn gpu_elu_into(x: &GpuBuffer, out: &GpuBuffer, n: usize, alpha: f64) {
-	unsafe {
-		launch_gapact_elu(
-			x.ptr_raw() as *const c_void,
-			out.ptr_raw(),
-			n as i32,
-			alpha,
-			std::ptr::null_mut(),
-		);
-	}
-}
-pub fn gpu_elu_backward_into(g: &GpuBuffer, x: &GpuBuffer, out: &GpuBuffer, n: usize, alpha: f64) {
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gapact_elu_backward(
 			g.ptr_raw() as *const c_void,
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			alpha,
+			alpha.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
+	e()
 }
-pub fn gpu_selu_into(x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+pub fn gpu_selu(
+	x: &GpuBuffer,
+	alpha: &GpuBuffer,
+	lambda: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gapact_selu(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			SELU_ALPHA,
-			SELU_LAMBDA,
+			alpha.ptr_raw() as *const c_void,
+			lambda.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
+	e()
 }
-pub fn gpu_selu_backward_into(g: &GpuBuffer, x: &GpuBuffer, out: &GpuBuffer, n: usize) {
+pub fn gpu_selu_backward(
+	g: &GpuBuffer,
+	x: &GpuBuffer,
+	alpha: &GpuBuffer,
+	lambda: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gapact_selu_backward(
 			g.ptr_raw() as *const c_void,
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			SELU_ALPHA,
-			SELU_LAMBDA,
+			alpha.ptr_raw() as *const c_void,
+			lambda.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
+	e()
 }
 
 macro_rules! u {
 	($name:ident, $launch:ident) => {
-		pub fn $name(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-			let o = GpuBuffer::alloc(n)?;
+		pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			unsafe {
 				$launch(
 					x.ptr_raw() as *const c_void,
-					o.ptr_raw(),
+					out.ptr_raw(),
 					n as i32,
 					std::ptr::null_mut(),
 				);
 			}
-			e()?;
-			Ok(o)
+			e()
 		}
 	};
 }
 macro_rules! ub {
 	($name:ident, $launch:ident) => {
-		pub fn $name(g: &GpuBuffer, x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-			let o = GpuBuffer::alloc(n)?;
+		pub fn $name(g: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			unsafe {
 				$launch(
 					g.ptr_raw() as *const c_void,
 					x.ptr_raw() as *const c_void,
-					o.ptr_raw(),
+					out.ptr_raw(),
 					n as i32,
 					std::ptr::null_mut(),
 				);
 			}
-			e()?;
-			Ok(o)
+			e()
 		}
 	};
 }
 macro_rules! gate {
 	($name:ident, $launch:ident) => {
-		pub fn $name(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-			let o = GpuBuffer::alloc(n)?;
+		pub fn $name(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			unsafe {
 				$launch(
 					a.ptr_raw() as *const c_void,
 					b.ptr_raw() as *const c_void,
-					o.ptr_raw(),
+					out.ptr_raw(),
 					n as i32,
 					std::ptr::null_mut(),
 				);
 			}
-			e()?;
-			Ok(o)
+			e()
 		}
 	};
 }

@@ -46,8 +46,13 @@ extern "C" size_t launch_mean_all_workspace_bytes(int n) {
       return launch_sum_all_workspace_bytes(n);
 }
 
+__global__ void scale_inv_n_kernel(double* out, int n) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) out[0] = out[0] / (double)n;
+}
+
 extern "C" void launch_mean_all(const double* x, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
       launch_sum_all(x, out, workspace, workspace_bytes, n, stream);
+      hipLaunchKernelGGL(scale_inv_n_kernel, dim3(1), dim3(1), 0, stream, out, n);
 }
 
 // L2 norm: sum(x^2) — caller downloads and takes sqrt.
@@ -61,10 +66,15 @@ extern "C" size_t launch_l2_norm_workspace_bytes(int n) {
       return launch_sum_all_workspace_bytes(n);
 }
 
+__global__ void sqrt_scalar_kernel(double* out) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) out[0] = sqrt(out[0]);
+}
+
 extern "C" void launch_l2_norm(const double* x, double* sq, double* out, void* workspace, size_t workspace_bytes, int n, hipStream_t stream) {
       dim3 b(256), g((n + 255) / 256);
       hipLaunchKernelGGL(square_kernel, g, b, 0, stream, x, sq, n);
       launch_sum_all(sq, out, workspace, workspace_bytes, n, stream);
+      hipLaunchKernelGGL(sqrt_scalar_kernel, dim3(1), dim3(1), 0, stream, out);
 }
 
 // Dot product: sum(a*b) — caller downloads out[0].
@@ -129,12 +139,13 @@ __global__ void init_idx_kernel(int* idx, int n) {
       if (i < n) idx[i] = i;
 }
 
-__global__ void fill_sentinel_kernel(double* data, int real_n, int padded_n, double sentinel) {
+__global__ void fill_sentinel_kernel(double* data, int real_n, int padded_n, const double* sentinel) {
+      double s = *sentinel;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i >= real_n && i < padded_n) data[i] = sentinel;
+      if (i >= real_n && i < padded_n) data[i] = s;
 }
 
-extern "C" void launch_fill_sentinel(double* data, int real_n, int padded_n, double sentinel, hipStream_t stream) {
+extern "C" void launch_fill_sentinel(double* data, int real_n, int padded_n, const double* sentinel, hipStream_t stream) {
       dim3 b(256), g((padded_n + 255) / 256);
       hipLaunchKernelGGL(fill_sentinel_kernel, g, b, 0, stream, data, real_n, padded_n, sentinel);
 }

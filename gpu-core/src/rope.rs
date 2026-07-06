@@ -5,7 +5,7 @@ use std::ffi::c_void;
 
 // ── FFI: ropex.hip ───────────────────────────────────────────────────────────
 // C: launch_ropex_qk(q, k, pos, qo, ko, n_rows, d, theta, stream)
-//    const double*, const double*, const double*, double*, double*, int, int, double, hipStream_t
+//    const double*, const double*, const double*, double*, double*, int, int, const double*, hipStream_t
 unsafe extern "C" {
 	fn launch_ropex_qk(
 		q: *const c_void,
@@ -15,7 +15,7 @@ unsafe extern "C" {
 		ko: *mut c_void,
 		n_rows: i32,
 		d: i32,
-		theta: f64,
+		theta: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_ropex_qk_heads(
@@ -25,8 +25,8 @@ unsafe extern "C" {
 		d: i32,
 		heads: i32,
 		seq: i32,
-		theta: f64,
-		sgn: f64,
+		theta: *const c_void,
+		sgn: *const c_void,
 		stream: *mut c_void,
 	);
 }
@@ -36,17 +36,20 @@ pub const ROPE_THETA: f64 = 10000.0;
 
 /// Multi-head rotary position embedding applied IN-PLACE to Q and K, each
 /// `(m, d)` row-major with `d = heads*hd`. Rotates per head by the token's
-/// sequence position (`row % seq`). `sgn`: `+1.0` forward (Q_rot = R(angle)·Q),
-/// `-1.0` backward (un-rotate a gradient — a rotation's inverse is itself negated).
+/// sequence position (`row % seq`). `sgn`: 1-elem f64 buffer, `+1.0` forward
+/// (Q_rot = R(angle)·Q), `-1.0` backward (un-rotate a gradient — a rotation's
+/// inverse is itself negated). `theta`: 1-elem f64 base-frequency buffer.
+/// q,k are mutated in place (serve as both input and output).
 pub fn gpu_rope_qk_heads_inplace(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
+	sgn: &GpuBuffer,
+	theta: &GpuBuffer,
 	m: usize,
 	d: usize,
 	heads: usize,
 	seq: usize,
-	sgn: f64,
-) {
+) -> Result<(), HipError> {
 	unsafe {
 		launch_ropex_qk_heads(
 			q.ptr_raw(),
@@ -55,29 +58,30 @@ pub fn gpu_rope_qk_heads_inplace(
 			d as i32,
 			heads as i32,
 			seq as i32,
-			ROPE_THETA,
-			sgn,
+			theta.ptr_raw() as *const c_void,
+			sgn.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
+	Ok(())
 }
 
 // ── gpu_rope_qk ──────────────────────────────────────────────────────────────
 // Q, K: f64 (n_rows, dim) row-major. positions: f64 (n_rows,), cast to int in-kernel.
 // NeoX half-split rotary: pair (i, i+dim/2) rotated by angle = pos / theta^(2i/dim).
-// Same rotation applied to both Q and K. theta: base frequency (e.g. 10000.0).
-// Returns freshly-allocated rotated (Q, K) of the same (n_rows, dim) shape.
+// Same rotation applied to both Q and K. theta: 1-elem f64 base-frequency buffer.
+// qo, ko: caller-provided f64[n_rows * dim] rotated outputs.
 pub fn gpu_rope_qk(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
 	positions: &GpuBuffer,
+	theta: &GpuBuffer,
 	n_rows: usize,
 	dim: usize,
-	theta: f64,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let qo = GpuBuffer::alloc(n_rows * dim)?;
-	let ko = GpuBuffer::alloc(n_rows * dim)?;
+	qo: &GpuBuffer,
+	ko: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_ropex_qk(
 			q.ptr_raw() as *const c_void,
@@ -87,12 +91,12 @@ pub fn gpu_rope_qk(
 			ko.ptr_raw(),
 			n_rows as i32,
 			dim as i32,
-			theta,
+			theta.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok((qo, ko))
+	Ok(())
 }
 
 #[cfg(test)]
@@ -111,10 +115,13 @@ mod tests {
 		let xk: Vec<f64> = (0..m * d).map(|i| ((i * 5 % 11) as f64 - 5.0) * 0.1).collect();
 		let g: Vec<f64> = (0..m * d).map(|i| ((i * 3 % 17) as f64 - 8.0) * 0.1).collect();
 
+		let theta = GpuBuffer::upload(&[ROPE_THETA]).expect("theta");
+		let sgn_bwd = GpuBuffer::upload(&[-1.0f64]).expect("sgn_bwd");
+		let sgn_fwd = GpuBuffer::upload(&[1.0f64]).expect("sgn_fwd");
 		// analytic: dL/dq = R(-angle)·g = rope(g, -1) on the q slot
 		let gq = GpuBuffer::upload(&g).expect("g");
 		let gk = GpuBuffer::upload(&vec![0.0f64; m * d]).expect("gk");
-		gpu_rope_qk_heads_inplace(&gq, &gk, m, d, heads, seq, -1.0);
+		gpu_rope_qk_heads_inplace(&gq, &gk, &sgn_bwd, &theta, m, d, heads, seq).expect("rope bwd");
 		let analytic = {
 			let mut v = vec![0.0f64; m * d];
 			gq.download(&mut v).expect("dl");
@@ -125,7 +132,7 @@ mod tests {
 		let loss = |x: &[f64]| -> f64 {
 			let q = GpuBuffer::upload(x).expect("q");
 			let k = GpuBuffer::upload(&xk).expect("k");
-			gpu_rope_qk_heads_inplace(&q, &k, m, d, heads, seq, 1.0);
+			gpu_rope_qk_heads_inplace(&q, &k, &sgn_fwd, &theta, m, d, heads, seq).expect("rope fwd");
 			let mut o = vec![0.0f64; m * d];
 			q.download(&mut o).expect("o");
 			o.iter().zip(&g).map(|(a, b)| a * b).sum()

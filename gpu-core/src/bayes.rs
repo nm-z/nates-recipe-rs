@@ -17,7 +17,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n_classes: i32,
 		n_features: i32,
-		alpha: f64,
+		alpha: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_multinomial_nb_logprob(
@@ -45,15 +45,15 @@ unsafe extern "C" {
 
 /// Accumulate per-class feature count table [n_classes * n_features] via
 /// atomicAdd.  `x_counts` is [n * n_features] f64 feature counts; `y` is
-/// [n] i32 class labels.  The output buffer must be zeroed by the caller.
+/// [n] i32 class labels.  `out` must be zeroed by the caller (kernel accumulates).
 pub fn gpu_nb_count_table(
 	x_counts: &GpuBuffer,
 	y: &GpuBuffer,
 	n: usize,
 	n_features: usize,
 	n_classes: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_bytes(n_classes * n_features * std::mem::size_of::<f64>())?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_nb_count_table(
 			x_counts.ptr_raw() as *const c_void,
@@ -66,33 +66,33 @@ pub fn gpu_nb_count_table(
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
-/// Compute smoothed log P(feature|class) from a count table.
-/// Returns [n_classes * n_features] with Laplace smoothing parameter `alpha`.
+/// Compute smoothed log P(feature|class) from a count table into `out`
+/// [n_classes * n_features]. `alpha` is a 1-elem device buffer (Laplace smoothing).
 pub fn gpu_nb_feature_log_prob(
 	count_table: &GpuBuffer,
+	alpha: &GpuBuffer,
 	n_classes: usize,
 	n_features: usize,
-	alpha: f64,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n_classes * n_features)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_nb_feature_log_prob(
 			count_table.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n_classes as i32,
 			n_features as i32,
-			alpha,
+			alpha.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
-/// Multinomial NB log-posterior [n * n_classes].
+/// Multinomial NB log-posterior [n * n_classes] into `out`.
 /// out[i,c] = log_prior[c] + sum_f x[i,f] * feature_log_prob[c,f]
 pub fn gpu_multinomial_nb_logprob(
 	log_class_prior: &GpuBuffer,
@@ -101,8 +101,8 @@ pub fn gpu_multinomial_nb_logprob(
 	n: usize,
 	n_features: usize,
 	n_classes: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n * n_classes)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_multinomial_nb_logprob(
 			log_class_prior.ptr_raw() as *const c_void,
@@ -116,10 +116,10 @@ pub fn gpu_multinomial_nb_logprob(
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
-/// Bernoulli NB log-posterior [n * n_classes] including the (1-x)*log(1-p) term.
+/// Bernoulli NB log-posterior [n * n_classes] into `out`, including the (1-x)*log(1-p) term.
 /// out[i,c] = log_prior[c] + sum_f [ x[i,f]*log_p[c,f] + (1-x[i,f])*log_neg[c,f] ]
 pub fn gpu_bernoulli_nb_logprob(
 	log_class_prior: &GpuBuffer,
@@ -129,8 +129,8 @@ pub fn gpu_bernoulli_nb_logprob(
 	n: usize,
 	n_features: usize,
 	n_classes: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n * n_classes)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_bernoulli_nb_logprob(
 			log_class_prior.ptr_raw() as *const c_void,
@@ -145,5 +145,5 @@ pub fn gpu_bernoulli_nb_logprob(
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }

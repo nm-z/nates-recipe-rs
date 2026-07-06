@@ -319,17 +319,14 @@ unsafe extern "C" {
 	fn hipfftExecD2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void) -> i32;
 }
 
-// helper: copy n f64 elements out of a GpuBuffer into a fresh buffer
-fn gpu_copy_n(src: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	crate::kernels::gpu_copy(src, n)
-}
-
 // ── L1 scalar routines ────────────────────────────────────────────────────
+// The shared handle stays in host-pointer mode (per the vendor rule this file
+// only converts signatures; adding hipblasSetPointerMode is a forbidden new
+// vendor call). The scalar the vendor writes to a host stack slot is then
+// stored into the caller's 1-elem device `out` via the H2D choke point.
 
-// Dot product: a · b  (n elements, stride 1).
-// The shared handle stays in host-pointer mode; result is written to a stack
-// variable via host-pointer path — no GpuBuffer download needed.
-pub fn gpu_ddot(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+// Dot product: a · b  (n elements, stride 1). Result -> out (1-elem f64).
+pub fn gpu_ddot(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
 	let status = unsafe {
 		hipblasDdot(
@@ -343,11 +340,11 @@ pub fn gpu_ddot(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<f64, HipError>
 		)
 	};
 	check(status)?;
-	Ok(result)
+	out.load(&[result])
 }
 
-// Euclidean norm: ||x||_2  (n elements, stride 1).
-pub fn gpu_dnrm2(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+// Euclidean norm: ||x||_2  (n elements, stride 1). Result -> out (1-elem f64).
+pub fn gpu_dnrm2(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
 	let status = unsafe {
 		hipblasDnrm2(
@@ -359,11 +356,11 @@ pub fn gpu_dnrm2(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
 		)
 	};
 	check(status)?;
-	Ok(result)
+	out.load(&[result])
 }
 
-// Sum of absolute values: sum |x_i|  (n elements, stride 1).
-pub fn gpu_dasum(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
+// Sum of absolute values: sum |x_i|  (n elements, stride 1). Result -> out.
+pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
 	let status = unsafe {
 		hipblasDasum(
@@ -375,12 +372,14 @@ pub fn gpu_dasum(x: &GpuBuffer, n: usize) -> Result<f64, HipError> {
 		)
 	};
 	check(status)?;
-	Ok(result)
+	out.load(&[result])
 }
 
 // Index of element with largest absolute value (n elements, stride 1).
-// hipBLAS returns a 1-based BLAS index; subtract 1 for 0-based usize.
-pub fn gpu_idamax(x: &GpuBuffer, n: usize) -> Result<usize, HipError> {
+// hipBLAS returns a 1-based BLAS index; the 0-based index is stored as f64 in
+// out (1-elem). The trivial -1/max(0) stays host-side (the vendor already
+// returned the value to host under host-pointer mode).
+pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result: i32 = 0;
 	let status = unsafe {
 		hipblasIdamax(
@@ -392,7 +391,7 @@ pub fn gpu_idamax(x: &GpuBuffer, n: usize) -> Result<usize, HipError> {
 		)
 	};
 	check(status)?;
-	Ok((result - 1).max(0) as usize)
+	out.load(&[(result - 1).max(0) as f64])
 }
 
 // ── L2 routines ───────────────────────────────────────────────────────────
@@ -407,18 +406,19 @@ pub fn gpu_idamax(x: &GpuBuffer, n: usize) -> Result<usize, HipError> {
 //   — the library transposes A_cm → which is A_rm, times x(n) → y(m).
 // To compute y = A_rm^T @ x  (A col, x len m, y len n):
 //   hipblasDgemv(NONE, n, m, 1, A, n, x, 1, 0, y, 1)
+// trans is a plan-time flag encoded as usize (0 = A@x, nonzero = A^T@x).
+// out is caller-provided: length m when trans==0, else n.
 pub fn gpu_dgemv(
 	a: &GpuBuffer,
 	x: &GpuBuffer,
 	m: usize,
 	n: usize,
-	trans: bool,
-) -> Result<GpuBuffer, HipError> {
-	let out_len = if trans { n } else { m };
-	let out = GpuBuffer::alloc(out_len)?;
+	trans: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
-	let (rb_trans, rb_m, rb_n) = if trans {
+	let (rb_trans, rb_m, rb_n) = if trans != 0 {
 		(OP_NONE, n as i32, m as i32)
 	} else {
 		(OP_TRANS, n as i32, m as i32)
@@ -439,8 +439,7 @@ pub fn gpu_dgemv(
 			1,
 		)
 	};
-	check(status)?;
-	Ok(out)
+	check(status)
 }
 
 // Rank-1 update: A = x ⊗ y^T  (outer product), A is (m x n) row-major output.
@@ -451,11 +450,15 @@ pub fn gpu_dgemv(
 // A_rm(i,j) = x[i]*y[j].  Stored as A_cm^T(n,m).
 // Pass y as the "x" operand (length n) and x as the "y" operand (length m),
 // with m_rb=n, n_rb=m, lda=n — hipBLAS writes A_cm(j,i)=y[j]*x[i]=A_rm(i,j). ✓
-pub fn gpu_dger(x: &GpuBuffer, y: &GpuBuffer, m: usize, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(m * n)?;
-	unsafe {
-		crate::memory::memset_sync(out.ptr_raw(), 0, m * n * std::mem::size_of::<f64>())?;
-	}
+// hipblasDger ACCUMULATES into out, so the caller must pre-zero out (m*n)
+// before the call; the op does no internal memset (conforming ops never init).
+pub fn gpu_dger(
+	x: &GpuBuffer,
+	y: &GpuBuffer,
+	m: usize,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let status = unsafe {
 		hipblasDger(
@@ -471,8 +474,7 @@ pub fn gpu_dger(x: &GpuBuffer, y: &GpuBuffer, m: usize, n: usize) -> Result<GpuB
 			n as i32, // lda=n (stride between col-major cols = n)
 		)
 	};
-	check(status)?;
-	Ok(out)
+	check(status)
 }
 
 // ── Symmetric rank-k update ───────────────────────────────────────────────
@@ -489,8 +491,13 @@ pub fn gpu_dger(x: &GpuBuffer, y: &GpuBuffer, m: usize, n: usize) -> Result<GpuB
 // hipBLAS dsyrk: if transA=NONE, C += alpha*A*A^T (A is n×k cm, so n×k@k×n=n×n ✓).
 // With lda=k that interprets A as cm n×k — but A_rm(k×n) as cm is (n×k), so lda_cm=k. ✓
 // Result: C(n×n) cm lower triangle = A_rm^T @ A_rm in rm. ✓
-pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize) -> Result<GpuBuffer, HipError> {
-	let c = GpuBuffer::alloc(n * n)?;
+// out is (n×n); only the lower triangle is written (upper is garbage).
+pub fn gpu_dsyrk(
+	a: &GpuBuffer,
+	n: usize,
+	k: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
 	let status = unsafe {
@@ -504,12 +511,11 @@ pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize) -> Result<GpuBuffer, HipErro
 			a.ptr_raw() as *const f64,
 			k as i32, // lda=k: A_rm(k×n) as cm n×k
 			&beta,
-			c.ptr_raw() as *mut f64,
+			out.ptr_raw() as *mut f64,
 			n as i32,
 		)
 	};
-	check(status)?;
-	Ok(c)
+	check(status)
 }
 
 // ── Strided batched GEMM ──────────────────────────────────────────────────
@@ -520,6 +526,7 @@ pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize) -> Result<GpuBuffer, HipErro
 // Mirror gpu_gemm's column-major identity: C_rm = (B_cm @ A_cm)^T.
 // hipblasDgemmStridedBatched(N, N, n, m, k, 1, B, n, stride_b, A, k, stride_a, 0, C, n, stride_c, batch).
 // hipBLAS "A" = our B (lda=n, stride=k*n), "B" = our A (ldb=k, stride=m*k). ✓
+// out is (batch × m × n). Strides are the natural contiguous ones.
 pub fn gpu_dgemm_strided_batched(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -527,8 +534,8 @@ pub fn gpu_dgemm_strided_batched(
 	m: usize,
 	n: usize,
 	k: usize,
-) -> Result<GpuBuffer, HipError> {
-	let c = GpuBuffer::alloc(batch * m * n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
 	let stride_a = (m * k) as i64;
@@ -550,14 +557,13 @@ pub fn gpu_dgemm_strided_batched(
 			k as i32,
 			stride_a, // hipBLAS "B" = our A
 			&beta,
-			c.ptr_raw() as *mut f64,
+			out.ptr_raw() as *mut f64,
 			n as i32,
 			stride_c,
 			batch as i32,
 		)
 	};
-	check(status)?;
-	Ok(c)
+	check(status)
 }
 
 /// Alloc-free batched GEMM into a preallocated `c`, per batch i (all row-major):
@@ -573,7 +579,6 @@ pub fn gpu_dgemm_strided_batched(
 /// for the no-transpose case.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_bmm_into(
-	c: &GpuBuffer,
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	batch: usize,
@@ -589,13 +594,14 @@ pub fn gpu_bmm_into(
 	a_off: usize,
 	b_off: usize,
 	c_off: usize,
-	trans_a: bool,
-	trans_b: bool,
-) {
+	trans_a: usize,
+	trans_b: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
-	let op_a = if trans_a { OP_TRANS } else { OP_NONE };
-	let op_b = if trans_b { OP_TRANS } else { OP_NONE };
+	let op_a = if trans_a != 0 { OP_TRANS } else { OP_NONE };
+	let op_b = if trans_b != 0 { OP_TRANS } else { OP_NONE };
 	let status = unsafe {
 		hipblasDgemmStridedBatched(
 			hipblas_handle(),
@@ -612,13 +618,13 @@ pub fn gpu_bmm_into(
 			lda as i32,
 			stride_a as i64,
 			&beta,
-			c.as_ptr_offset(c_off) as *mut f64,
+			out.as_ptr_offset(c_off) as *mut f64,
 			ldc as i32,
 			stride_c as i64,
 			batch as i32,
 		)
 	};
-	check(status).expect("gpu_bmm_into: hipblas dgemm_strided_batched");
+	check(status)
 }
 
 // ── rocSOLVER: LU factorization and solve ─────────────────────────────────
@@ -627,52 +633,97 @@ pub fn gpu_bmm_into(
 // lu_buf is a copy of A overwritten by the factorization (A is preserved).
 // ipiv_buf holds n i32 pivot indices (1-based LAPACK convention).
 // Callers pass lu_buf to gpu_lu_solve; do not read its content directly.
-pub fn gpu_lu_factor(a: &GpuBuffer, n: usize) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let lu = gpu_copy_n(a, n * n)?;
-	let ipiv = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+// Plan-time workspace size (bytes) for gpu_lu_factor's rocSOLVER work buffer.
+pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgetrf_bufferSize(
 			hipsolver_handle(),
 			n as i32,
 			n as i32,
-			lu.ptr_raw() as *mut f64,
+			std::ptr::null_mut(),
 			n as i32,
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
+	(lwork.max(1) as usize) * 8
+}
+
+// Caller provides: work (>= gpu_lu_factor_workspace_bytes), lu_out (n*n f64,
+// receives A then its LU factors), ipiv_out (n i32), info_out (1 i32).
+pub fn gpu_lu_factor(
+	a: &GpuBuffer,
+	n: usize,
+	work: &GpuBuffer,
+	lu_out: &GpuBuffer,
+	ipiv_out: &GpuBuffer,
+	info_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	crate::kernels::gpu_copy(a, n * n, lu_out)?;
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDgetrf_bufferSize(
+			hipsolver_handle(),
+			n as i32,
+			n as i32,
+			lu_out.ptr_raw() as *mut f64,
+			n as i32,
+			&mut lwork,
+		);
+	}
 	let status = unsafe {
 		hipsolverDgetrf(
 			hipsolver_handle(),
 			n as i32,
 			n as i32,
-			lu.ptr_raw() as *mut f64,
+			lu_out.ptr_raw() as *mut f64,
 			n as i32,
 			work.ptr_raw() as *mut f64,
 			lwork,
-			ipiv.ptr_raw() as *mut i32,
-			info.ptr_raw() as *mut i32,
+			ipiv_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
-	check(status)?;
-	Ok((lu, ipiv))
+	check(status)
 }
 
 // Solve A*X = B using a pre-factored LU (from gpu_lu_factor).
 // A is n×n, B is n×nrhs (both row-major).  Returns solution X on GPU.
 // dgetrs operates on the factorization in-place and overwrites B.
 // B is copied; the lu factor is read-only (ipiv is const in the header).
+// Plan-time workspace size (bytes) for gpu_lu_solve.
+pub fn gpu_lu_solve_workspace_bytes(n: usize, nrhs: usize) -> usize {
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDgetrs_bufferSize(
+			hipsolver_handle(),
+			OP_NONE,
+			n as i32,
+			nrhs as i32,
+			std::ptr::null_mut(),
+			n as i32,
+			std::ptr::null_mut(),
+			std::ptr::null_mut(),
+			n as i32,
+			&mut lwork,
+		);
+	}
+	(lwork.max(1) as usize) * 8
+}
+
+// dgetrs overwrites B in place; the op copies b into caller-provided x_out
+// (n*nrhs) then solves there. work >= gpu_lu_solve_workspace_bytes, info_out 1 i32.
 pub fn gpu_lu_solve(
 	lu: &GpuBuffer,
 	ipiv: &GpuBuffer,
 	b: &GpuBuffer,
 	n: usize,
 	nrhs: usize,
-) -> Result<GpuBuffer, HipError> {
-	let b_copy = gpu_copy_n(b, n * nrhs)?;
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	work: &GpuBuffer,
+	info_out: &GpuBuffer,
+	x_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	crate::kernels::gpu_copy(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgetrs_bufferSize(
@@ -683,12 +734,11 @@ pub fn gpu_lu_solve(
 			lu.ptr_raw() as *mut f64,
 			n as i32,
 			ipiv.ptr_raw() as *mut i32,
-			b_copy.ptr_raw() as *mut f64,
+			x_out.ptr_raw() as *mut f64,
 			n as i32,
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
 	let status = unsafe {
 		hipsolverDgetrs(
 			hipsolver_handle(),
@@ -698,15 +748,14 @@ pub fn gpu_lu_solve(
 			lu.ptr_raw() as *mut f64,
 			n as i32,
 			ipiv.ptr_raw() as *mut i32,
-			b_copy.ptr_raw() as *mut f64,
+			x_out.ptr_raw() as *mut f64,
 			n as i32,
 			work.ptr_raw() as *mut f64,
 			lwork,
-			info.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
-	check(status)?;
-	Ok(b_copy)
+	check(status)
 }
 
 // ── rocSOLVER: Cholesky solve given pre-factored L ────────────────────────
@@ -715,14 +764,37 @@ pub fn gpu_lu_solve(
 // n×n factor L (lower triangle), B is n×nrhs.  Returns X on GPU.
 // dpotrs reads the factor but does NOT overwrite it; only B is mutated.
 // uplo = 121 (lower) matches gpu_cholesky's convention.
+// Plan-time workspace size (bytes) for gpu_potrs.
+pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDpotrs_bufferSize(
+			hipsolver_handle(),
+			SOLVER_FILL_UPPER,
+			n as i32,
+			nrhs as i32,
+			std::ptr::null_mut(),
+			n as i32,
+			std::ptr::null_mut(),
+			n as i32,
+			&mut lwork,
+		);
+	}
+	(lwork.max(1) as usize) * 8
+}
+
+// dpotrs overwrites B in place; the op copies b into caller-provided x_out
+// (n*nrhs) then solves. uplo=UPPER matches gpu_cholesky's potrf fill mode.
 pub fn gpu_potrs(
 	l: &GpuBuffer,
 	b: &GpuBuffer,
 	n: usize,
 	nrhs: usize,
-) -> Result<GpuBuffer, HipError> {
-	let b_copy = gpu_copy_n(b, n * nrhs)?;
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	work: &GpuBuffer,
+	info_out: &GpuBuffer,
+	x_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	crate::kernels::gpu_copy(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDpotrs_bufferSize(
@@ -732,12 +804,11 @@ pub fn gpu_potrs(
 			nrhs as i32,
 			l.ptr_raw() as *mut f64,
 			n as i32,
-			b_copy.ptr_raw() as *mut f64,
+			x_out.ptr_raw() as *mut f64,
 			n as i32,
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
 	let status = unsafe {
 		hipsolverDpotrs(
 			hipsolver_handle(),
@@ -746,15 +817,14 @@ pub fn gpu_potrs(
 			nrhs as i32,
 			l.ptr_raw() as *mut f64,
 			n as i32,
-			b_copy.ptr_raw() as *mut f64,
+			x_out.ptr_raw() as *mut f64,
 			n as i32,
 			work.ptr_raw() as *mut f64,
 			lwork,
-			info.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
-	check(status)?;
-	Ok(b_copy)
+	check(status)
 }
 
 // ── rocSOLVER: QR factorization ───────────────────────────────────────────
@@ -773,47 +843,84 @@ pub fn gpu_potrs(
 //      Copy the full m*n factor into a compact n×n buffer using a strided extraction:
 //      R[i,j] lives at factor[j*m+i]; copy to r[j*n+i] for 0<=i<=j<n.
 //   4. dorgqr(m, n, k, factor, lda=m) expands Householder vectors into explicit Q (m×n col-major).
-pub fn gpu_qr(a: &GpuBuffer, m: usize, n: usize) -> Result<(GpuBuffer, GpuBuffer), HipError> {
+// Plan-time workspace size (bytes): max of the geqrf and orgqr lwork queries,
+// since gpu_qr reuses one caller work buffer for both stages.
+pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
+	let k = m.min(n);
+	let mut lwork: i32 = 0;
+	let mut lwork_q: i32 = 0;
+	unsafe {
+		hipsolverDgeqrf_bufferSize(
+			hipsolver_handle(),
+			m as i32,
+			n as i32,
+			std::ptr::null_mut(),
+			m as i32,
+			&mut lwork,
+		);
+		hipsolverDorgqr_bufferSize(
+			hipsolver_handle(),
+			m as i32,
+			n as i32,
+			k as i32,
+			std::ptr::null_mut(),
+			m as i32,
+			std::ptr::null_mut(),
+			&mut lwork_q,
+		);
+	}
+	(lwork.max(lwork_q).max(1) as usize) * 8
+}
+
+// Caller provides: work (>= gpu_qr_workspace_bytes), tau (k=min(m,n) f64),
+// info_out (1 i32), q_out (m*n f64 — holds the col-major factor then explicit Q),
+// r_out (n*n f64, col-major upper-triangular). One work buffer serves both stages.
+pub fn gpu_qr(
+	a: &GpuBuffer,
+	m: usize,
+	n: usize,
+	work: &GpuBuffer,
+	tau: &GpuBuffer,
+	info_out: &GpuBuffer,
+	q_out: &GpuBuffer,
+	r_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let k = m.min(n);
 
-	// Step 1: transpose A_rm to col-major layout (factor[j*m+i] = A[i,j]).
-	let factor = crate::kernels::gpu_transpose(a, m, n)?;
-	let tau = GpuBuffer::alloc(k)?;
+	// Step 1: transpose A_rm to col-major layout (q_out[j*m+i] = A[i,j]).
+	crate::kernels::gpu_transpose(a, m, n, q_out)?;
 
 	// Step 2: QR factorize in-place; lda=m is correct for the col-major factor.
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgeqrf_bufferSize(
 			hipsolver_handle(),
 			m as i32,
 			n as i32,
-			factor.ptr_raw() as *mut f64,
+			q_out.ptr_raw() as *mut f64,
 			m as i32,
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
 	let status = unsafe {
 		hipsolverDgeqrf(
 			hipsolver_handle(),
 			m as i32,
 			n as i32,
-			factor.ptr_raw() as *mut f64,
+			q_out.ptr_raw() as *mut f64,
 			m as i32,
 			tau.ptr_raw() as *mut f64,
 			work.ptr_raw() as *mut f64,
 			lwork,
-			info.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
 	check(status)?;
 
-	// Step 3: Extract R (n×n col-major) from the upper triangle of factor (lda=m),
-	// entirely on the GPU — r[j*n+i] = factor[j*m+i] for i<=j, else 0. Must run
-	// before dorgqr below overwrites factor with Q. (No GPU→CPU→GPU round trip.)
-	let r = GpuBuffer::alloc(n * n)?;
-	crate::kernels::gpu_pack_upper_tri(&factor, &r, m, n);
+	// Step 3: Extract R (n×n col-major) from the upper triangle of the factor
+	// (lda=m) — r[j*n+i] = factor[j*m+i] for i<=j, else 0. Must run before dorgqr
+	// below overwrites q_out with Q. (No GPU→CPU→GPU round trip.)
+	crate::kernels::gpu_pack_upper_tri(q_out, m, n, r_out)?;
 
 	// Step 4: expand Householder reflectors → explicit Q (m×n col-major, lda=m).
 	let mut lwork_q: i32 = 0;
@@ -823,31 +930,27 @@ pub fn gpu_qr(a: &GpuBuffer, m: usize, n: usize) -> Result<(GpuBuffer, GpuBuffer
 			m as i32,
 			n as i32,
 			k as i32,
-			factor.ptr_raw() as *mut f64,
+			q_out.ptr_raw() as *mut f64,
 			m as i32,
 			tau.ptr_raw() as *mut f64,
 			&mut lwork_q,
 		);
 	}
-	let work_q = GpuBuffer::alloc_bytes((lwork_q.max(1) as usize) * 8)?;
-	let info_q = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 	let status = unsafe {
 		hipsolverDorgqr(
 			hipsolver_handle(),
 			m as i32,
 			n as i32,
 			k as i32,
-			factor.ptr_raw() as *mut f64,
+			q_out.ptr_raw() as *mut f64,
 			m as i32,
 			tau.ptr_raw() as *mut f64,
-			work_q.ptr_raw() as *mut f64,
+			work.ptr_raw() as *mut f64,
 			lwork_q,
-			info_q.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
-	check(status)?;
-
-	Ok((factor, r))
+	check(status)
 }
 
 // ── rocSOLVER: symmetric eigendecomposition ───────────────────────────────
@@ -857,11 +960,8 @@ pub fn gpu_qr(a: &GpuBuffer, m: usize, n: usize) -> Result<(GpuBuffer, GpuBuffer
 // evecs is (n×n) where COLUMNS (in column-major storage = rows in row-major) are eigenvectors.
 // A_rm == A_cm for symmetric matrices, so no layout adjustment needed.
 // dsyevd overwrites A with eigenvectors; we copy A first.
-pub fn gpu_eigh_sym(a: &GpuBuffer, n: usize) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let evecs = gpu_copy_n(a, n * n)?;
-	let evals = GpuBuffer::alloc(n)?;
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
-
+// Plan-time workspace size (bytes) for gpu_eigh_sym.
+pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDsyevd_bufferSize(
@@ -869,29 +969,54 @@ pub fn gpu_eigh_sym(a: &GpuBuffer, n: usize) -> Result<(GpuBuffer, GpuBuffer), H
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
 			n as i32,
-			evecs.ptr_raw() as *mut f64,
+			std::ptr::null_mut(),
 			n as i32,
-			evals.ptr_raw() as *mut f64,
+			std::ptr::null_mut(),
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
+	(lwork.max(1) as usize) * 8
+}
+
+// dsyevd overwrites A with eigenvectors; the op copies a into evecs_out (n*n)
+// then computes. evals_out is length-n ascending. work >= workspace_bytes.
+pub fn gpu_eigh_sym(
+	a: &GpuBuffer,
+	n: usize,
+	work: &GpuBuffer,
+	info_out: &GpuBuffer,
+	evals_out: &GpuBuffer,
+	evecs_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	crate::kernels::gpu_copy(a, n * n, evecs_out)?;
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDsyevd_bufferSize(
+			hipsolver_handle(),
+			SOLVER_EIG_VECTOR,
+			SOLVER_FILL_LOWER,
+			n as i32,
+			evecs_out.ptr_raw() as *mut f64,
+			n as i32,
+			evals_out.ptr_raw() as *mut f64,
+			&mut lwork,
+		);
+	}
 	let status = unsafe {
 		hipsolverDsyevd(
 			hipsolver_handle(),
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
 			n as i32,
-			evecs.ptr_raw() as *mut f64,
+			evecs_out.ptr_raw() as *mut f64,
 			n as i32,
-			evals.ptr_raw() as *mut f64,
+			evals_out.ptr_raw() as *mut f64,
 			work.ptr_raw() as *mut f64,
 			lwork,
-			info.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
-	check(status)?;
-	Ok((evals, evecs))
+	check(status)
 }
 
 // ── rocSOLVER: SVD ────────────────────────────────────────────────────────
@@ -907,17 +1032,42 @@ pub fn gpu_eigh_sym(a: &GpuBuffer, n: usize) -> Result<(GpuBuffer, GpuBuffer), H
 //   V (n×n col-major, ldv=n): right singular vectors as columns (NOT V^T).
 // Transpose V → Vt so callers use a uniform U·diag(S)·Vt contract.
 // E (superdiagonal workspace) has length max(1, min(m,n)-1).
+// Plan-time workspace size (bytes): rocSOLVER gesvd lwork PLUS two device
+// scratch regions carved from the same buffer — a_cm (m*n, the col-major input
+// gesvd destroys) and v (n*n, right vectors before transpose into vt_out).
+pub fn gpu_svd_workspace_bytes(m: usize, n: usize) -> usize {
+	let mut lwork: i32 = 0;
+	unsafe {
+		hipsolverDgesvd_bufferSize(
+			hipsolver_handle(),
+			SOLVER_JOB_ALL,
+			SOLVER_JOB_ALL,
+			m as i32,
+			n as i32,
+			&mut lwork,
+		);
+	}
+	((lwork.max(1) as usize) + m * n + n * n) * 8
+}
+
+// Caller provides work (>= gpu_svd_workspace_bytes), info_out (1 i32),
+// u_out (m*m f64), s_out (min(m,n) f64), vt_out (n*n f64). The a_cm and v
+// scratch are carved from the front of work; the solver work area follows them.
 pub fn gpu_svd(
 	a: &GpuBuffer,
 	m: usize,
 	n: usize,
-) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError> {
-	let k = m.min(n);
-	let a_cm = crate::kernels::gpu_transpose(a, m, n)?;
-	let s = GpuBuffer::alloc(k)?;
-	let u = GpuBuffer::alloc(m * m)?;
-	let v = GpuBuffer::alloc(n * n)?;
-	let info = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	work: &GpuBuffer,
+	info_out: &GpuBuffer,
+	u_out: &GpuBuffer,
+	s_out: &GpuBuffer,
+	vt_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	let a_cm = work.view(0, m * n);
+	let v = work.view(m * n, n * n);
+	let solver_off = m * n + n * n;
+
+	crate::kernels::gpu_transpose(a, m, n, &a_cm)?;
 
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -930,7 +1080,6 @@ pub fn gpu_svd(
 			&mut lwork,
 		);
 	}
-	let work = GpuBuffer::alloc_bytes((lwork.max(1) as usize) * 8)?;
 	let status = unsafe {
 		hipsolverDgesvd(
 			hipsolver_handle(),
@@ -940,20 +1089,19 @@ pub fn gpu_svd(
 			n as i32,
 			a_cm.ptr_raw() as *mut f64,
 			m as i32,
-			s.ptr_raw() as *mut f64,
-			u.ptr_raw() as *mut f64,
+			s_out.ptr_raw() as *mut f64,
+			u_out.ptr_raw() as *mut f64,
 			m as i32,
 			v.ptr_raw() as *mut f64,
 			n as i32,
-			work.ptr_raw() as *mut f64,
+			work.as_ptr_offset(solver_off) as *mut f64,
 			lwork,
 			std::ptr::null_mut(),
-			info.ptr_raw() as *mut i32,
+			info_out.ptr_raw() as *mut i32,
 		)
 	};
 	check(status)?;
-	let vt = crate::kernels::gpu_transpose(&v, n, n)?;
-	Ok((u, s, vt))
+	crate::kernels::gpu_transpose(&v, n, n, vt_out)
 }
 
 // ── rocFFT: complex 1-D FFT ───────────────────────────────────────────────
@@ -973,45 +1121,46 @@ unsafe impl Send for CachedFftPlan {}
 
 static FFT_CACHE: OnceLock<Mutex<HashMap<(i32, usize), CachedFftPlan>>> = OnceLock::new();
 
-// Return a cached plan for (fft_type, n), creating it on first use.
-// Plans are never destroyed — that's the point of the cache. The plan
-// auto-allocates its own work area, so no separate work buffer is tracked.
-fn fft_plan(fft_type: i32, n: usize) -> *mut c_void {
+// not-an-op: plan-time helper — return a cached hipFFT plan for (fft_type, n),
+// creating it on first use. Plans are never destroyed (that's the cache's point)
+// and auto-allocate their own work area, so no separate work buffer is tracked.
+fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	let mut cache = FFT_CACHE
 		.get_or_init(|| Mutex::new(HashMap::new()))
 		.lock()
 		.expect("fft cache poisoned");
-	let entry = cache.entry((fft_type, n)).or_insert_with(|| {
-		let mut plan: *mut c_void = std::ptr::null_mut();
-		let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
-		assert_eq!(status, 0, "hipfftPlan1d failed: {}", status);
-		CachedFftPlan {
-			plan: plan as usize,
-		}
-	});
-	entry.plan as *mut c_void
+	if let Some(entry) = cache.get(&(fft_type, n)) {
+		return Ok(entry.plan as *mut c_void);
+	}
+	let mut plan: *mut c_void = std::ptr::null_mut();
+	let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
+	check(status)?;
+	cache.insert((fft_type, n), CachedFftPlan { plan: plan as usize });
+	Ok(plan)
 }
 
-pub fn gpu_fft_c2c_1d(input: &GpuBuffer, n: usize, forward: bool) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(2 * n)?; // 2 f64 per complex element
-	let plan = fft_plan(HIPFFT_Z2Z, n);
-	let direction = if forward {
+// forward is a plan-time flag as usize (nonzero = DFT, 0 = IDFT).
+// out is caller-provided, length 2*n f64 (interleaved re/im).
+pub fn gpu_fft_c2c_1d(
+	input: &GpuBuffer,
+	n: usize,
+	forward: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	let plan = fft_plan(HIPFFT_Z2Z, n)?;
+	let direction = if forward != 0 {
 		HIPFFT_FORWARD
 	} else {
 		HIPFFT_BACKWARD
 	};
 	let status = unsafe { hipfftExecZ2Z(plan, input.ptr_raw(), out.ptr_raw(), direction) };
-	assert_eq!(status, 0, "hipfftExecZ2Z failed: {}", status);
-	Ok(out)
+	check(status)
 }
 
 // 1-D real-to-complex FFT.  Input: n f64 (real).
-// Output: 2*(n/2+1) f64 (interleaved complex, hermitian-symmetric half-spectrum).
-pub fn gpu_rfft_1d(input_real: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out_complex = n / 2 + 1;
-	let out = GpuBuffer::alloc(2 * out_complex)?; // 2 f64 per complex
-	let plan = fft_plan(HIPFFT_D2Z, n);
+// out is caller-provided, length 2*(n/2+1) f64 (hermitian-symmetric half-spectrum).
+pub fn gpu_rfft_1d(input_real: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let plan = fft_plan(HIPFFT_D2Z, n)?;
 	let status = unsafe { hipfftExecD2Z(plan, input_real.ptr_raw(), out.ptr_raw()) };
-	assert_eq!(status, 0, "hipfftExecD2Z failed: {}", status);
-	Ok(out)
+	check(status)
 }

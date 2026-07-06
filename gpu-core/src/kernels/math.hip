@@ -92,24 +92,28 @@ extern "C" __global__ void fmod_kernel(const double* a, const double* b, double*
 
 // ── Scalar ops ─────────────────────────────────────────────────────────────
 
-extern "C" __global__ void sub_scalar_kernel(const double* x, double* out, int n, double s) {
+extern "C" __global__ void sub_scalar_kernel(const double* x, double* out, int n, const double* s) {
+      double sv = *s;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n) out[i] = x[i] - s;
+      if (i < n) out[i] = x[i] - sv;
 }
 
-extern "C" __global__ void div_scalar_kernel(const double* x, double* out, int n, double s) {
+extern "C" __global__ void div_scalar_kernel(const double* x, double* out, int n, const double* s) {
+      double sv = *s;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n) out[i] = x[i] / s;
+      if (i < n) out[i] = x[i] / sv;
 }
 
-extern "C" __global__ void rsub_scalar_kernel(const double* x, double* out, int n, double s) {
+extern "C" __global__ void rsub_scalar_kernel(const double* x, double* out, int n, const double* s) {
+      double sv = *s;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n) out[i] = s - x[i];
+      if (i < n) out[i] = sv - x[i];
 }
 
-extern "C" __global__ void rdiv_scalar_kernel(const double* x, double* out, int n, double s) {
+extern "C" __global__ void rdiv_scalar_kernel(const double* x, double* out, int n, const double* s) {
+      double sv = *s;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n) out[i] = s / x[i];
+      if (i < n) out[i] = sv / x[i];
 }
 
 // ── Reduce: has_nan / isfinite_all ────────────────────────────────────────
@@ -204,22 +208,22 @@ extern "C" void launch_fmod(const double* a, const double* b, double* out, int n
       hipLaunchKernelGGL(fmod_kernel, dim3(blocks), dim3(threads), 0, stream, a, b, out, n);
 }
 
-extern "C" void launch_sub_scalar(const double* x, double* out, int n, double s, hipStream_t stream) {
+extern "C" void launch_sub_scalar(const double* x, double* out, int n, const double* s, hipStream_t stream) {
       int threads = 256; int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(sub_scalar_kernel, dim3(blocks), dim3(threads), 0, stream, x, out, n, s);
 }
 
-extern "C" void launch_div_scalar(const double* x, double* out, int n, double s, hipStream_t stream) {
+extern "C" void launch_div_scalar(const double* x, double* out, int n, const double* s, hipStream_t stream) {
       int threads = 256; int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(div_scalar_kernel, dim3(blocks), dim3(threads), 0, stream, x, out, n, s);
 }
 
-extern "C" void launch_rsub_scalar(const double* x, double* out, int n, double s, hipStream_t stream) {
+extern "C" void launch_rsub_scalar(const double* x, double* out, int n, const double* s, hipStream_t stream) {
       int threads = 256; int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(rsub_scalar_kernel, dim3(blocks), dim3(threads), 0, stream, x, out, n, s);
 }
 
-extern "C" void launch_rdiv_scalar(const double* x, double* out, int n, double s, hipStream_t stream) {
+extern "C" void launch_rdiv_scalar(const double* x, double* out, int n, const double* s, hipStream_t stream) {
       int threads = 256; int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(rdiv_scalar_kernel, dim3(blocks), dim3(threads), 0, stream, x, out, n, s);
 }

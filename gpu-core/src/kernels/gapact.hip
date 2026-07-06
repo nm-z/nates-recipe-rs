@@ -4,19 +4,23 @@
 // Unique symbol names (gapact_*) to avoid any collision with existing kernels.
 // Backward kernels take the PRE-activation x. Hyperparameters are runtime args.
 
-extern "C" __global__ void gapact_elu_kernel(const double* x, double* out, int n, double alpha) {
+extern "C" __global__ void gapact_elu_kernel(const double* x, double* out, int n, const double* alpha_) {
+    double alpha = *alpha_;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { double v = x[i]; out[i] = v > 0.0 ? v : alpha * (exp(v) - 1.0); }
 }
-extern "C" __global__ void gapact_elu_backward_kernel(const double* grad, const double* x, double* out, int n, double alpha) {
+extern "C" __global__ void gapact_elu_backward_kernel(const double* grad, const double* x, double* out, int n, const double* alpha_) {
+    double alpha = *alpha_;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { double v = x[i]; out[i] = grad[i] * (v > 0.0 ? 1.0 : alpha * exp(v)); }
 }
-extern "C" __global__ void gapact_selu_kernel(const double* x, double* out, int n, double alpha, double lambda) {
+extern "C" __global__ void gapact_selu_kernel(const double* x, double* out, int n, const double* alpha_, const double* lambda_) {
+    double alpha = *alpha_; double lambda = *lambda_;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { double v = x[i]; out[i] = lambda * (v > 0.0 ? v : alpha * (exp(v) - 1.0)); }
 }
-extern "C" __global__ void gapact_selu_backward_kernel(const double* grad, const double* x, double* out, int n, double alpha, double lambda) {
+extern "C" __global__ void gapact_selu_backward_kernel(const double* grad, const double* x, double* out, int n, const double* alpha_, const double* lambda_) {
+    double alpha = *alpha_; double lambda = *lambda_;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { double v = x[i]; out[i] = grad[i] * lambda * (v > 0.0 ? 1.0 : alpha * exp(v)); }
 }
@@ -59,10 +63,10 @@ extern "C" __global__ void gapact_geglu_kernel(const double* a, const double* b,
 }
 
 #define GA_GRID(n) dim3 block(256); dim3 grid(((n) + 255) / 256)
-extern "C" void launch_gapact_elu(const double* x, double* out, int n, double alpha, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_elu_kernel, grid, block, 0, s, x, out, n, alpha); }
-extern "C" void launch_gapact_elu_backward(const double* g, const double* x, double* out, int n, double alpha, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_elu_backward_kernel, grid, block, 0, s, g, x, out, n, alpha); }
-extern "C" void launch_gapact_selu(const double* x, double* out, int n, double alpha, double lambda, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_selu_kernel, grid, block, 0, s, x, out, n, alpha, lambda); }
-extern "C" void launch_gapact_selu_backward(const double* g, const double* x, double* out, int n, double alpha, double lambda, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_selu_backward_kernel, grid, block, 0, s, g, x, out, n, alpha, lambda); }
+extern "C" void launch_gapact_elu(const double* x, double* out, int n, const double* alpha, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_elu_kernel, grid, block, 0, s, x, out, n, alpha); }
+extern "C" void launch_gapact_elu_backward(const double* g, const double* x, double* out, int n, const double* alpha, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_elu_backward_kernel, grid, block, 0, s, g, x, out, n, alpha); }
+extern "C" void launch_gapact_selu(const double* x, double* out, int n, const double* alpha, const double* lambda, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_selu_kernel, grid, block, 0, s, x, out, n, alpha, lambda); }
+extern "C" void launch_gapact_selu_backward(const double* g, const double* x, double* out, int n, const double* alpha, const double* lambda, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_selu_backward_kernel, grid, block, 0, s, g, x, out, n, alpha, lambda); }
 extern "C" void launch_gapact_mish(const double* x, double* out, int n, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_mish_kernel, grid, block, 0, s, x, out, n); }
 extern "C" void launch_gapact_mish_backward(const double* g, const double* x, double* out, int n, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_mish_backward_kernel, grid, block, 0, s, g, x, out, n); }
 extern "C" void launch_gapact_softplus(const double* x, double* out, int n, hipStream_t s) { GA_GRID(n); hipLaunchKernelGGL(gapact_softplus_kernel, grid, block, 0, s, x, out, n); }

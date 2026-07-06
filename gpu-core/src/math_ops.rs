@@ -43,20 +43,32 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_sub_scalar(x: *const c_void, out: *mut c_void, n: i32, s: f64, stream: *mut c_void);
-	fn launch_div_scalar(x: *const c_void, out: *mut c_void, n: i32, s: f64, stream: *mut c_void);
+	fn launch_sub_scalar(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *const c_void,
+		stream: *mut c_void,
+	);
+	fn launch_div_scalar(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *const c_void,
+		stream: *mut c_void,
+	);
 	fn launch_rsub_scalar(
 		x: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		s: f64,
+		s: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_rdiv_scalar(
 		x: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		s: f64,
+		s: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_has_nan(x: *const c_void, flag: *mut c_void, n: i32, stream: *mut c_void);
@@ -83,6 +95,7 @@ const SK_BN: usize = 64;
 const SK_WAVES: usize = 8; // occupancy waves per multiprocessor
 const SK_MIN_SLICE: usize = 256; // rows per slice floor (amortize launch/LDS)
 
+// not-an-op: plan-time helper — split-K partition count from shape + real CU count
 pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
 	// Target enough workgroups to fill the actual hardware: multiProcessorCount
 	// (hipGetDeviceProperties) × occupancy waves, not a baked-in CU count.
@@ -93,13 +106,12 @@ pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
 	target.min(max_by_rows).min(m.max(1))
 }
 
-/// Element count of the `[P×k×n]` partial scratch the split-K dW kernel needs.
+// not-an-op: plan-time helper — element count of the [P×k×n] partial scratch
 pub fn splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
 	splitk_dw_p(m, k, n) * k * n
 }
 
-pub fn gpu_rsqrt(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_rsqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_rsqrt(
 			x.ptr_raw() as *const c_void,
@@ -109,11 +121,10 @@ pub fn gpu_rsqrt(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_reciprocal(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_reciprocal(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_reciprocal(
 			x.ptr_raw() as *const c_void,
@@ -123,11 +134,10 @@ pub fn gpu_reciprocal(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_emax(
 			a.ptr_raw() as *const c_void,
@@ -138,11 +148,10 @@ pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipE
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_emin(
 			a.ptr_raw() as *const c_void,
@@ -153,11 +162,10 @@ pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipE
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_sin(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_sin(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_sin(
 			x.ptr_raw() as *const c_void,
@@ -167,11 +175,10 @@ pub fn gpu_sin(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_cos(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_cos(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_cos(
 			x.ptr_raw() as *const c_void,
@@ -181,11 +188,10 @@ pub fn gpu_cos(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_tan(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_tan(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_tan(
 			x.ptr_raw() as *const c_void,
@@ -195,11 +201,10 @@ pub fn gpu_tan(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_atan2(
 			a.ptr_raw() as *const c_void,
@@ -210,11 +215,10 @@ pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, Hi
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_log1p(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_log1p(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_log1p(
 			x.ptr_raw() as *const c_void,
@@ -224,11 +228,10 @@ pub fn gpu_log1p(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_expm1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_expm1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_expm1(
 			x.ptr_raw() as *const c_void,
@@ -238,11 +241,10 @@ pub fn gpu_expm1(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_floor(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_floor(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_floor(
 			x.ptr_raw() as *const c_void,
@@ -252,11 +254,10 @@ pub fn gpu_floor(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_ceil(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_ceil(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_ceil(
 			x.ptr_raw() as *const c_void,
@@ -266,11 +267,10 @@ pub fn gpu_ceil(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_round(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_round(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_round(
 			x.ptr_raw() as *const c_void,
@@ -280,11 +280,10 @@ pub fn gpu_round(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_trunc(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_trunc(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_trunc(
 			x.ptr_raw() as *const c_void,
@@ -294,11 +293,10 @@ pub fn gpu_trunc(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_fmod(
 			a.ptr_raw() as *const c_void,
@@ -309,71 +307,86 @@ pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, Hip
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_sub_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_sub_scalar(
+	x: &GpuBuffer,
+	s: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_sub_scalar(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			s,
+			s.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_div_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_div_scalar(
+	x: &GpuBuffer,
+	s: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_div_scalar(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			s,
+			s.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_rsub_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_rsub_scalar(
+	x: &GpuBuffer,
+	s: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_rsub_scalar(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			s,
+			s.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_rdiv_scalar(x: &GpuBuffer, s: f64, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_rdiv_scalar(
+	x: &GpuBuffer,
+	s: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_rdiv_scalar(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			s,
+			s.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }
 
-pub fn gpu_has_nan(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
-	let flag = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+pub fn gpu_has_nan(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		crate::memory::memset_sync(flag.ptr_raw(), 0, std::mem::size_of::<i32>())?;
 		launch_has_nan(
@@ -384,13 +397,10 @@ pub fn gpu_has_nan(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
 		);
 	}
 	check_launch();
-	let mut v = [0i32; 1];
-	flag.download_i32(&mut v)?;
-	Ok(v[0] != 0)
+	Ok(())
 }
 
-pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
-	let flag = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		crate::memory::memset_sync(flag.ptr_raw(), 0, std::mem::size_of::<i32>())?;
 		launch_isfinite_all(
@@ -401,7 +411,5 @@ pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize) -> Result<bool, HipError> {
 		);
 	}
 	check_launch();
-	let mut v = [0i32; 1];
-	flag.download_i32(&mut v)?;
-	Ok(v[0] == 0)
+	Ok(())
 }

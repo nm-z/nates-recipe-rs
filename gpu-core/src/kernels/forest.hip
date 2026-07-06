@@ -224,8 +224,9 @@ __global__ void tree_ensemble_predict_kernel(
       const int* node_left, const int* node_right,
       const unsigned char* node_is_leaf, const double* node_value,
       const int* tree_root, double* out,
-      int n, int n_trees, double lr
+      int n, int n_trees, const double* lr
 ) {
+      double lr_v = *lr;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       double acc = 0.0;
@@ -239,7 +240,7 @@ __global__ void tree_ensemble_predict_kernel(
             }
             acc += node_value[node];
       }
-      out[i] = lr * acc;
+      out[i] = lr_v * acc;
 }
 
 extern "C" void launch_tree_ensemble_predict(
@@ -248,7 +249,7 @@ extern "C" void launch_tree_ensemble_predict(
       const int* node_left, const int* node_right,
       const unsigned char* node_is_leaf, const double* node_value,
       const int* tree_root, double* out,
-      int n, int n_trees, double lr, hipStream_t stream
+      int n, int n_trees, const double* lr, hipStream_t stream
 ) {
       dim3 block(256);
       dim3 grid((n + 255) / 256);

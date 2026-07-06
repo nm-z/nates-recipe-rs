@@ -38,8 +38,9 @@ extern "C" void launch_nb_count_table(
 
 extern "C" __global__ void nb_feature_log_prob_kernel(
       const double* count_table, double* out,
-      int n_classes, int n_features, double alpha)
+      int n_classes, int n_features, const double* alpha_p)
 {
+      double alpha = *alpha_p;
       int cls = blockIdx.x * blockDim.x + threadIdx.x;
       if (cls >= n_classes) return;
       double row_sum = 0.0;
@@ -54,7 +55,7 @@ extern "C" __global__ void nb_feature_log_prob_kernel(
 
 extern "C" void launch_nb_feature_log_prob(
       const double* count_table, double* out,
-      int n_classes, int n_features, double alpha, hipStream_t stream)
+      int n_classes, int n_features, const double* alpha, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n_classes + threads - 1) / threads;

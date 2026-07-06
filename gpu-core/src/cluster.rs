@@ -10,7 +10,14 @@ unsafe extern "C" {
 		count: *mut c_void,
 		n: i32,
 		dim: i32,
-		eps: f64,
+		eps: *const c_void,
+		stream: *mut c_void,
+	);
+
+	fn launch_exclusive_scan_i32(
+		count_in: *const c_void,
+		row_ptr_out: *mut c_void,
+		n: i32,
 		stream: *mut c_void,
 	);
 
@@ -20,7 +27,7 @@ unsafe extern "C" {
 		indices: *mut c_void,
 		n: i32,
 		dim: i32,
-		eps: f64,
+		eps: *const c_void,
 		stream: *mut c_void,
 	);
 
@@ -73,6 +80,14 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
+	fn launch_masked_weight_sum(
+		edge_w: *const c_void,
+		in_mst: *const c_void,
+		total: *mut c_void,
+		n_edges: i32,
+		stream: *mut c_void,
+	);
+
 	fn launch_core_distance(
 		points: *const c_void,
 		core_dist: *mut c_void,
@@ -93,60 +108,140 @@ pub struct NeighborCsr {
 	pub nnz: usize,
 }
 
+// ── Fixed-radius neighbor CSR: count → scan → fill schedulable ops ───────────
+
+// Pass 1: per-point neighbor counts (one thread per point — no n×n buffer).
+pub fn fixed_radius_count(
+	points: &GpuBuffer,
+	eps: &GpuBuffer,
+	n: usize,
+	dim: usize,
+	count_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_fixed_radius_count(
+			points.ptr_raw() as *const c_void,
+			count_out.ptr_raw(),
+			n as i32,
+			dim as i32,
+			eps.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Exclusive prefix sum of the length-n count vector → CSR row offsets. Writes
+// row_ptr_out[0..n] and row_ptr_out[n] = nnz.
+pub fn exclusive_scan_i32(
+	count_in: &GpuBuffer,
+	n: usize,
+	row_ptr_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_exclusive_scan_i32(
+			count_in.ptr_raw() as *const c_void,
+			row_ptr_out.ptr_raw(),
+			n as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Pass 2: fill the compact adjacency (one thread per point owns its row).
+pub fn fixed_radius_fill_csr(
+	points: &GpuBuffer,
+	row_ptr: &GpuBuffer,
+	eps: &GpuBuffer,
+	n: usize,
+	dim: usize,
+	indices_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_fixed_radius_fill_csr(
+			points.ptr_raw() as *const c_void,
+			row_ptr.ptr_raw() as *const c_void,
+			indices_out.ptr_raw(),
+			n as i32,
+			dim as i32,
+			eps.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// content_sized CSR (nnz unknown at plan time): composes count → scan → row_ptr[n]
+// readback to size indices → fill; owns the eps upload and the nnz download.
+// not-an-op: driver — count/scan/read/fill composite with a mid-flow nnz readback
 pub fn gpu_fixed_radius_neighbors(
 	points: &GpuBuffer,
 	n: usize,
 	dim: usize,
 	eps: f64,
 ) -> Result<NeighborCsr, HipError> {
-	// Pass 1: per-point neighbor counts (one thread per point — no n×n buffer).
+	let eps_buf = GpuBuffer::upload(&[eps])?;
 	let count = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
-	unsafe {
-		launch_fixed_radius_count(
-			points.ptr_raw() as *const c_void,
-			count.ptr_raw(),
-			n as i32,
-			dim as i32,
-			eps,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
+	fixed_radius_count(points, &eps_buf, n, dim, &count)?;
 
-	// Exclusive prefix sum of the length-n count vector → CSR row offsets. Done on
-	// the host: it's O(n), not O(n²), so it costs nothing next to the kernels.
-	let mut counts = vec![0i32; n];
-	count.download_i32(&mut counts)?;
-	let mut row_ptr = vec![0i32; n + 1];
-	let mut acc: i64 = 0;
-	for i in 0..n {
-		row_ptr[i] = acc as i32;
-		acc += counts[i] as i64;
-	}
-	row_ptr[n] = acc as i32;
-	let nnz = acc as usize;
-	let row_ptr_buf = GpuBuffer::upload_i32(&row_ptr)?;
+	let row_ptr_buf = GpuBuffer::alloc_bytes((n + 1) * std::mem::size_of::<i32>())?;
+	exclusive_scan_i32(&count, n, &row_ptr_buf)?;
 
-	// Pass 2: fill the compact adjacency. alloc at least 1 so nnz==0 is valid.
+	// nnz = row_ptr[n], read back as a plan-time size query to size `indices`.
+	let mut row_ptr_h = vec![0i32; n + 1];
+	row_ptr_buf.download_i32(&mut row_ptr_h)?;
+	let nnz = row_ptr_h[n] as usize;
+
 	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * std::mem::size_of::<i32>())?;
-	unsafe {
-		launch_fixed_radius_fill_csr(
-			points.ptr_raw() as *const c_void,
-			row_ptr_buf.ptr_raw() as *const c_void,
-			indices.ptr_raw(),
-			n as i32,
-			dim as i32,
-			eps,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
+	fixed_radius_fill_csr(points, &row_ptr_buf, &eps_buf, n, dim, &indices)?;
 
 	Ok(NeighborCsr { row_ptr: row_ptr_buf, indices, nnz })
 }
 
-// Per-step union-find launchers; this caller owns the parent/changed buffers and
-// drives the hook→compress convergence loop with the device→host readback.
+// ── Union-Find connected components: per-step ops + convergence driver ───────
+
+pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
+	unsafe {
+		launch_uf_init(parent_out.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
+	}
+	check_launch();
+	Ok(())
+}
+
+pub fn uf_hook(
+	edge_src: &GpuBuffer,
+	edge_dst: &GpuBuffer,
+	n_edges: usize,
+	parent_out: &GpuBuffer,
+	changed_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_uf_hook(
+			edge_src.ptr_raw() as *const c_void,
+			edge_dst.ptr_raw() as *const c_void,
+			parent_out.ptr_raw(),
+			changed_out.ptr_raw(),
+			n_edges as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
+	unsafe {
+		launch_uf_compress(parent_out.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
+	}
+	check_launch();
+	Ok(())
+}
+
+// not-an-op: driver — hook→compress convergence loop branching on the `changed` readback
 pub fn gpu_union_find_cc(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -156,29 +251,13 @@ pub fn gpu_union_find_cc(
 	let labels = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
 	let changed = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 
-	unsafe {
-		launch_uf_init(labels.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
-	}
-	check_launch();
+	uf_init(n_nodes, &labels)?;
 
 	let mut flag = [0i32; 1];
 	loop {
 		changed.memset_zero(std::mem::size_of::<i32>())?;
-		unsafe {
-			launch_uf_hook(
-				edge_src.ptr_raw() as *const c_void,
-				edge_dst.ptr_raw() as *const c_void,
-				labels.ptr_raw(),
-				changed.ptr_raw(),
-				n_edges as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
-		unsafe {
-			launch_uf_compress(labels.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
-		}
-		check_launch();
+		uf_hook(edge_src, edge_dst, n_edges, &labels, &changed)?;
+		uf_compress(n_nodes, &labels)?;
 		changed.download_i32(&mut flag)?;
 		if flag[0] == 0 {
 			break;
@@ -192,9 +271,115 @@ pub struct BoruvkaResult {
 	pub total_weight: f64,
 }
 
-// Per-step Borůvka launchers; this caller owns parent/best_edge/best_w/in_mst/changed,
-// the round loop, the best_edge reset to -1, the selected-edge dedup, the inner
-// union-find loop that merges components, and the host-side MST weight reduction.
+// ── Borůvka MST: per-step ops + round/dedup/inner-UF driver ──────────────────
+
+pub fn boruvka_init(
+	n_nodes: usize,
+	best_edge_out: &GpuBuffer,
+	best_wkey_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_boruvka_init(
+			best_edge_out.ptr_raw(),
+			best_wkey_out.ptr_raw(),
+			n_nodes as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+pub fn boruvka_min_w(
+	edge_src: &GpuBuffer,
+	edge_dst: &GpuBuffer,
+	edge_w: &GpuBuffer,
+	parent: &GpuBuffer,
+	n_edges: usize,
+	best_wkey_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_boruvka_min_w(
+			edge_src.ptr_raw() as *const c_void,
+			edge_dst.ptr_raw() as *const c_void,
+			edge_w.ptr_raw() as *const c_void,
+			parent.ptr_raw() as *const c_void,
+			best_wkey_out.ptr_raw(),
+			n_edges as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+pub fn boruvka_min_e(
+	edge_src: &GpuBuffer,
+	edge_dst: &GpuBuffer,
+	edge_w: &GpuBuffer,
+	parent: &GpuBuffer,
+	best_wkey: &GpuBuffer,
+	n_edges: usize,
+	best_edge_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_boruvka_min_e(
+			edge_src.ptr_raw() as *const c_void,
+			edge_dst.ptr_raw() as *const c_void,
+			edge_w.ptr_raw() as *const c_void,
+			parent.ptr_raw() as *const c_void,
+			best_wkey.ptr_raw() as *const c_void,
+			best_edge_out.ptr_raw(),
+			n_edges as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+pub fn boruvka_mark(
+	best_edge: &GpuBuffer,
+	n_nodes: usize,
+	n_edges: usize,
+	in_mst_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_boruvka_mark(
+			best_edge.ptr_raw() as *const c_void,
+			in_mst_out.ptr_raw(),
+			n_nodes as i32,
+			n_edges as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Device MST total-weight reduction over marked edges → 1-elem total_out.
+pub fn masked_weight_sum(
+	edge_w: &GpuBuffer,
+	in_mst: &GpuBuffer,
+	n_edges: usize,
+	total_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_masked_weight_sum(
+			edge_w.ptr_raw() as *const c_void,
+			in_mst.ptr_raw() as *const c_void,
+			total_out.ptr_raw(),
+			n_edges as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// round loop with host edge-endpoint download, HashSet dedup of selected edges,
+// selected-list upload, inner union-find convergence, and final weight download.
+// not-an-op: driver — Borůvka round/dedup/inner-UF orchestration over the step ops
 pub fn gpu_boruvka_mst(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -215,57 +400,18 @@ pub fn gpu_boruvka_mst(
 	edge_src.download_i32(&mut src_h)?;
 	edge_dst.download_i32(&mut dst_h)?;
 
-	unsafe {
-		launch_uf_init(parent.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
-	}
-	check_launch();
+	uf_init(n_nodes, &parent)?;
 
 	let mut best_edge_h = vec![0i32; n_nodes];
 	let mut flag = [0i32; 1];
 	loop {
-		// Per-round reset (best_edge = INT_MAX sentinel, best_wkey = u64 max),
-		// then a two-pass race-free min: pass 1 atomicMin's the monotonic
-		// weight encoding per component, pass 2 atomicMin's the edge index
-		// among edges attaining that min (deterministic tie-break).
-		unsafe {
-			launch_boruvka_init(best_edge.ptr_raw(), best_w.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
-		}
-		check_launch();
-		unsafe {
-			launch_boruvka_min_w(
-				edge_src.ptr_raw() as *const c_void,
-				edge_dst.ptr_raw() as *const c_void,
-				edge_w.ptr_raw() as *const c_void,
-				parent.ptr_raw() as *const c_void,
-				best_w.ptr_raw(),
-				n_edges as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
-		unsafe {
-			launch_boruvka_min_e(
-				edge_src.ptr_raw() as *const c_void,
-				edge_dst.ptr_raw() as *const c_void,
-				edge_w.ptr_raw() as *const c_void,
-				parent.ptr_raw() as *const c_void,
-				best_w.ptr_raw() as *const c_void,
-				best_edge.ptr_raw(),
-				n_edges as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
-		unsafe {
-			launch_boruvka_mark(
-				best_edge.ptr_raw() as *const c_void,
-				in_mst.ptr_raw(),
-				n_nodes as i32,
-				n_edges as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
+		// Per-round reset then a two-pass race-free min: pass 1 atomicMin's the
+		// monotonic weight encoding per component, pass 2 atomicMin's the edge
+		// index among edges attaining that min (deterministic tie-break).
+		boruvka_init(n_nodes, &best_edge, &best_w)?;
+		boruvka_min_w(edge_src, edge_dst, edge_w, &parent, n_edges, &best_w)?;
+		boruvka_min_e(edge_src, edge_dst, edge_w, &parent, &best_w, n_edges, &best_edge)?;
+		boruvka_mark(&best_edge, n_nodes, n_edges, &in_mst)?;
 
 		best_edge.download_i32(&mut best_edge_h)?;
 
@@ -291,21 +437,8 @@ pub fn gpu_boruvka_mst(
 		// Merge the selected components via union-find until it stabilizes.
 		loop {
 			changed.memset_zero(std::mem::size_of::<i32>())?;
-			unsafe {
-				launch_uf_hook(
-					sel_src_buf.ptr_raw() as *const c_void,
-					sel_dst_buf.ptr_raw() as *const c_void,
-					parent.ptr_raw(),
-					changed.ptr_raw(),
-					n_sel as i32,
-					std::ptr::null_mut(),
-				);
-			}
-			check_launch();
-			unsafe {
-				launch_uf_compress(parent.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
-			}
-			check_launch();
+			uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
+			uf_compress(n_nodes, &parent)?;
 			changed.download_i32(&mut flag)?;
 			if flag[0] == 0 {
 				break;
@@ -313,20 +446,13 @@ pub fn gpu_boruvka_mst(
 		}
 	}
 
-	// Host-side MST total-weight reduction over the marked edges.
-	let mut in_mst_h = vec![0u8; n_edges];
-	in_mst.download_u8(&mut in_mst_h)?;
-	let mut w_h = vec![0.0f64; n_edges];
-	edge_w.download(&mut w_h)?;
-	let total_weight: f64 = (0..n_edges)
-		.filter(|&e| in_mst_h[e] != 0)
-		.map(|e| w_h[e])
-		.sum();
+	// Device MST total-weight reduction over the marked edges; driver reads it back.
+	let total_buf = GpuBuffer::alloc(1)?;
+	masked_weight_sum(edge_w, &in_mst, n_edges, &total_buf)?;
+	let mut tw = [0.0f64; 1];
+	total_buf.download(&mut tw)?;
 
-	Ok(BoruvkaResult {
-		in_mst,
-		total_weight,
-	})
+	Ok(BoruvkaResult { in_mst, total_weight: tw[0] })
 }
 
 pub fn gpu_core_distance(
@@ -334,12 +460,12 @@ pub fn gpu_core_distance(
 	n: usize,
 	dim: usize,
 	min_pts: usize,
-) -> Result<GpuBuffer, HipError> {
-	let core_dist = GpuBuffer::alloc(n)?;
+	core_dist_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_core_distance(
 			points.ptr_raw() as *const c_void,
-			core_dist.ptr_raw(),
+			core_dist_out.ptr_raw(),
 			n as i32,
 			dim as i32,
 			min_pts as i32,
@@ -347,5 +473,5 @@ pub fn gpu_core_distance(
 		);
 	}
 	check_launch();
-	Ok(core_dist)
+	Ok(())
 }

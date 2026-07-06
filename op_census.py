@@ -54,12 +54,18 @@ for fname in sorted(os.listdir(SRC)):
       raw_lines = raw.split("\n")
       for ln, line in enumerate(raw_lines):
             m = re.search(r"//\s*not-an-op:\s*(.+)", line)
-            if m:
-                  for la in range(ln + 1, min(ln + 3, len(raw_lines))):
-                        fm = re.search(r"\bpub(\(crate\))?\s+(unsafe\s+)?fn\s+(\w+)", raw_lines[la])
-                        if fm:
-                              annotated[fm.group(3)] = m.group(1).strip()
-                              break
+            if not m:
+                  continue
+            # applies to the next pub fn, skipping the rest of its comment block,
+            # attributes, and blank lines
+            for la in range(ln + 1, min(ln + 30, len(raw_lines))):
+                  s = raw_lines[la].strip()
+                  fm = re.search(r"\bpub(\(crate\))?\s+(unsafe\s+)?fn\s+(\w+)", raw_lines[la])
+                  if fm:
+                        annotated[fm.group(3)] = m.group(1).strip()
+                        break
+                  if s and not s.startswith(("//", "#[", "#!")):
+                        break
       text = strip_comments(raw)
 
       # map char pos -> inside extern block? track impl context by brace depth

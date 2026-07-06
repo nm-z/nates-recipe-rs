@@ -26,8 +26,9 @@ extern "C" void launch_mae_grad(
 // |d| >  delta: delta * sign(d) / n
 
 extern "C" __global__ void huber_grad_kernel(
-      const double* pred, const double* target, double* out, int n, double delta
+      const double* pred, const double* target, double* out, int n, const double* delta_p
 ) {
+      double delta = *delta_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       double d = pred[i] - target[i];
@@ -38,7 +39,7 @@ extern "C" __global__ void huber_grad_kernel(
 }
 
 extern "C" void launch_huber_grad(
-      const double* pred, const double* target, double* out, int n, double delta, hipStream_t stream
+      const double* pred, const double* target, double* out, int n, const double* delta, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -78,8 +79,10 @@ extern "C" void launch_bce_logits(
 
 extern "C" __global__ void focal_loss_kernel(
       const double* prob, const double* target, double* loss_out, double* grad_out,
-      int n, double gamma, double alpha
+      int n, const double* gamma_p, const double* alpha_p
 ) {
+      double gamma = *gamma_p;
+      double alpha = *alpha_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       double p = prob[i];
@@ -107,7 +110,7 @@ extern "C" __global__ void focal_loss_kernel(
 
 extern "C" void launch_focal_loss(
       const double* prob, const double* target, double* loss_out, double* grad_out,
-      int n, double gamma, double alpha, hipStream_t stream
+      int n, const double* gamma, const double* alpha, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -119,8 +122,10 @@ extern "C" void launch_focal_loss(
 // convention so it can drop into the training loop with no allocation).
 extern "C" __global__ void focal_grad_kernel(
       const double* prob, const double* target, double* grad_out,
-      int n, double gamma, double alpha
+      int n, const double* gamma_p, const double* alpha_p
 ) {
+      double gamma = *gamma_p;
+      double alpha = *alpha_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
@@ -142,7 +147,7 @@ extern "C" __global__ void focal_grad_kernel(
 
 extern "C" void launch_focal_grad(
       const double* prob, const double* target, double* grad_out,
-      int n, double gamma, double alpha, hipStream_t stream
+      int n, const double* gamma, const double* alpha, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -205,8 +210,9 @@ extern "C" void launch_hinge(
 
 extern "C" __global__ void cosine_emb_kernel(
       const double* a, const double* b, const double* label, double* out,
-      int n, int dim, double margin
+      int n, int dim, const double* margin_p
 ) {
+      double margin = *margin_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       const double* ai = a + i * dim;
@@ -230,7 +236,7 @@ extern "C" __global__ void cosine_emb_kernel(
 
 extern "C" void launch_cosine_emb(
       const double* a, const double* b, const double* label, double* out,
-      int n, int dim, double margin, hipStream_t stream
+      int n, int dim, const double* margin, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -244,8 +250,9 @@ extern "C" void launch_cosine_emb(
 
 extern "C" __global__ void triplet_kernel(
       const double* anchor, const double* pos, const double* neg, double* out,
-      int n, int dim, double margin
+      int n, int dim, const double* margin_p
 ) {
+      double margin = *margin_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       const double* a = anchor + i * dim;
@@ -264,7 +271,7 @@ extern "C" __global__ void triplet_kernel(
 
 extern "C" void launch_triplet(
       const double* anchor, const double* pos, const double* neg, double* out,
-      int n, int dim, double margin, hipStream_t stream
+      int n, int dim, const double* margin, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -279,8 +286,9 @@ extern "C" void launch_triplet(
 
 extern "C" __global__ void contrastive_kernel(
       const double* a, const double* b, const double* label, double* out,
-      int n, int dim, double margin
+      int n, int dim, const double* margin_p
 ) {
+      double margin = *margin_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       const double* ai = a + i * dim;
@@ -299,7 +307,7 @@ extern "C" __global__ void contrastive_kernel(
 
 extern "C" void launch_contrastive(
       const double* a, const double* b, const double* label, double* out,
-      int n, int dim, double margin, hipStream_t stream
+      int n, int dim, const double* margin, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;

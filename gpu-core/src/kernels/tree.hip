@@ -43,8 +43,9 @@ extern "C" void launch_histogram_build(
 __global__ void split_eval_kernel(
     const double* grad_hist, const double* hess_hist,
     double* best_gain, double* best_bin,
-    int p, int n_bins, double lambda, double min_child_weight
+    int p, int n_bins, const double* lambda_p, const double* min_child_weight_p
 ) {
+    double lambda = *lambda_p, min_child_weight = *min_child_weight_p;
     int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= p) return;
 
@@ -73,7 +74,7 @@ __global__ void split_eval_kernel(
 extern "C" void launch_split_eval(
     const double* grad_hist, const double* hess_hist,
     double* best_gain, double* best_bin,
-    int p, int n_bins, double lambda, double min_child_weight, hipStream_t stream
+    int p, int n_bins, const double* lambda, const double* min_child_weight, hipStream_t stream
 ) {
     dim3 bl(256); dim3 gr((p + 255) / 256);
     hipLaunchKernelGGL(split_eval_kernel, gr, bl, 0, stream,
@@ -145,8 +146,10 @@ __global__ void tb_split_eval_kernel(
     int* split_feat,          // [max_nodes] — global, indexed by node_id
     int* split_bin,           // [max_nodes]
     int n_level_nodes, int p, int n_bins,
-    double lambda, double min_cw, int level_base
+    const double* lambda_p, const double* min_cw_p, int level_base
 ) {
+    double lambda = *lambda_p;
+    double min_cw = *min_cw_p;
     int node_off = blockIdx.x * blockDim.x + threadIdx.x;
     if (node_off >= n_level_nodes) return;
     int node_id = level_base + node_off;
@@ -212,8 +215,9 @@ __global__ void tb_leaf_sum_kernel(
 __global__ void tb_leaf_val_kernel(
     const double* node_sum_g, const double* node_sum_h,
     double* leaf_val,
-    int n_leaves, int leaf_base, double lambda
+    int n_leaves, int leaf_base, const double* lambda_p
 ) {
+    double lambda = *lambda_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_leaves) return;
     int node = leaf_base + i;
@@ -284,7 +288,7 @@ extern "C" void launch_tb_histogram(
 extern "C" void launch_tb_split_eval(
     const double* grad_hist, const double* hess_hist,
     int* split_feat, int* split_bin,
-    int n_level, int p, int n_bins, double lambda, double min_cw, int level_base,
+    int n_level, int p, int n_bins, const double* lambda, const double* min_cw, int level_base,
     hipStream_t stream
 ) {
     dim3 bl(256); dim3 gr((n_level + 255) / 256);
@@ -313,7 +317,7 @@ extern "C" void launch_tb_leaf_sum(
 
 extern "C" void launch_tb_leaf_val(
     const double* node_sum_g, const double* node_sum_h, double* leaf_val,
-    int n_leaves, int leaf_base, double lambda, hipStream_t stream
+    int n_leaves, int leaf_base, const double* lambda, hipStream_t stream
 ) {
     dim3 bl(256); dim3 gr((n_leaves + 255) / 256);
     hipLaunchKernelGGL(tb_leaf_val_kernel, gr, bl, 0, stream,
@@ -503,9 +507,10 @@ void scatter_add_by_leaf_kernel(
     float* pred,
     const unsigned char* leaf_idx,
     const float* leaf_value,
-    float lr,
+    const float* lr_p,
     int n_rows
 ) {
+    float lr = *lr_p;
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
     pred[row] += lr * leaf_value[leaf_idx[row]];
@@ -513,7 +518,7 @@ void scatter_add_by_leaf_kernel(
 
 extern "C" void launch_scatter_add_by_leaf(
     float* pred, const unsigned char* leaf_idx, const float* leaf_value,
-    float lr, int n_rows, hipStream_t stream
+    const float* lr, int n_rows, hipStream_t stream
 ) {
     dim3 block(256);
     dim3 grid((n_rows + 255) / 256);
@@ -556,9 +561,10 @@ void leaf_finalize_kernel(
     const float* leaf_grad,
     const float* leaf_hess,
     float* leaf_value,
-    float lambda,
+    const float* lambda_p,
     int n_leaves
 ) {
+    float lambda = *lambda_p;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_leaves) return;
     leaf_value[j] = -leaf_grad[j] / (leaf_hess[j] + lambda);
@@ -566,7 +572,7 @@ void leaf_finalize_kernel(
 
 extern "C" void launch_leaf_finalize(
     const float* leaf_grad, const float* leaf_hess, float* leaf_value,
-    float lambda, int n_leaves, hipStream_t stream
+    const float* lambda, int n_leaves, hipStream_t stream
 ) {
     dim3 block(256);
     dim3 grid((n_leaves + 255) / 256);
@@ -585,9 +591,11 @@ void oblivious_split_eval_kernel(
     int n_nodes,
     int n_features,
     int n_bins,
-    float lambda,
-    float min_cw
+    const float* lambda_p,
+    const float* min_cw_p
 ) {
+    float lambda = *lambda_p;
+    float min_cw = *min_cw_p;
     int feat = blockIdx.x;
     if (feat >= n_features) return;
 
@@ -639,7 +647,7 @@ void oblivious_split_eval_kernel(
 
 extern "C" void launch_oblivious_split_eval(
     const float* grad_hist, const float* hess_hist, float* gain_out,
-    int n_nodes, int n_features, int n_bins, float lambda, float min_cw,
+    int n_nodes, int n_features, int n_bins, const float* lambda, const float* min_cw,
     hipStream_t stream
 ) {
     dim3 grid(n_features);

@@ -15,7 +15,7 @@ unsafe extern "C" {
 		target: *const c_void,
 		out: *mut c_void,
 		n: i32,
-		delta: f64,
+		delta: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_bce_logits(
@@ -32,8 +32,8 @@ unsafe extern "C" {
 		loss_out: *mut c_void,
 		grad_out: *mut c_void,
 		n: i32,
-		gamma: f64,
-		alpha: f64,
+		gamma: *const c_void,
+		alpha: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_focal_grad(
@@ -41,8 +41,8 @@ unsafe extern "C" {
 		target: *const c_void,
 		grad_out: *mut c_void,
 		n: i32,
-		gamma: f64,
-		alpha: f64,
+		gamma: *const c_void,
+		alpha: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_kl_div_loss(
@@ -67,7 +67,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		dim: i32,
-		margin: f64,
+		margin: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_triplet(
@@ -77,7 +77,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		dim: i32,
-		margin: f64,
+		margin: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_contrastive(
@@ -87,13 +87,17 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		dim: i32,
-		margin: f64,
+		margin: *const c_void,
 		stream: *mut c_void,
 	);
 }
 
-pub fn gpu_mae_grad(pred: &GpuBuffer, target: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+pub fn gpu_mae_grad(
+	pred: &GpuBuffer,
+	target: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_mae_grad(
 			pred.ptr_raw() as *const c_void,
@@ -104,86 +108,60 @@ pub fn gpu_mae_grad(pred: &GpuBuffer, target: &GpuBuffer, n: usize) -> Result<Gp
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
 pub fn gpu_huber_grad(
 	pred: &GpuBuffer,
 	target: &GpuBuffer,
-	delta: f64,
+	delta: &GpuBuffer,
 	n: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_huber_grad(
 			pred.ptr_raw() as *const c_void,
 			target.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			delta,
+			delta.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
 pub fn gpu_bce_with_logits(
 	logits: &GpuBuffer,
 	target: &GpuBuffer,
 	n: usize,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let loss = GpuBuffer::alloc(n)?;
-	let grad = GpuBuffer::alloc(n)?;
+	loss_out: &GpuBuffer,
+	grad_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_bce_logits(
 			logits.ptr_raw() as *const c_void,
 			target.ptr_raw() as *const c_void,
-			loss.ptr_raw(),
-			grad.ptr_raw(),
+			loss_out.ptr_raw(),
+			grad_out.ptr_raw(),
 			n as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok((loss, grad))
+	Ok(())
 }
 
 pub fn gpu_focal_loss(
 	prob: &GpuBuffer,
 	target: &GpuBuffer,
-	gamma: f64,
-	alpha: f64,
+	gamma: &GpuBuffer,
+	alpha: &GpuBuffer,
 	n: usize,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let loss = GpuBuffer::alloc(n)?;
-	let grad = GpuBuffer::alloc(n)?;
-	unsafe {
-		launch_focal_loss(
-			prob.ptr_raw() as *const c_void,
-			target.ptr_raw() as *const c_void,
-			loss.ptr_raw(),
-			grad.ptr_raw(),
-			n as i32,
-			gamma,
-			alpha,
-			std::ptr::null_mut(),
-		);
-	}
-	crate::kernels::check_launch();
-	Ok((loss, grad))
-}
-
-/// Focal loss + grad into preallocated buffers (no allocation — training-loop safe).
-pub fn gpu_focal_into(
-	prob: &GpuBuffer,
-	target: &GpuBuffer,
 	loss_out: &GpuBuffer,
 	grad_out: &GpuBuffer,
-	gamma: f64,
-	alpha: f64,
-	n: usize,
-) {
+) -> Result<(), HipError> {
 	unsafe {
 		launch_focal_loss(
 			prob.ptr_raw() as *const c_void,
@@ -191,43 +169,71 @@ pub fn gpu_focal_into(
 			loss_out.ptr_raw(),
 			grad_out.ptr_raw(),
 			n as i32,
-			gamma,
-			alpha,
+			gamma.ptr_raw() as *const c_void,
+			alpha.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
+	Ok(())
+}
+
+/// Focal loss + grad into preallocated buffers (no allocation — training-loop safe).
+pub fn gpu_focal_into(
+	prob: &GpuBuffer,
+	target: &GpuBuffer,
+	gamma: &GpuBuffer,
+	alpha: &GpuBuffer,
+	n: usize,
+	loss_out: &GpuBuffer,
+	grad_out: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_focal_loss(
+			prob.ptr_raw() as *const c_void,
+			target.ptr_raw() as *const c_void,
+			loss_out.ptr_raw(),
+			grad_out.ptr_raw(),
+			n as i32,
+			gamma.ptr_raw() as *const c_void,
+			alpha.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	crate::kernels::check_launch();
+	Ok(())
 }
 
 /// Focal gradient (d loss / d prob, scaled 1/n) into a preallocated buffer.
 pub fn gpu_focal_grad_into(
 	prob: &GpuBuffer,
 	target: &GpuBuffer,
-	grad_out: &GpuBuffer,
-	gamma: f64,
-	alpha: f64,
+	gamma: &GpuBuffer,
+	alpha: &GpuBuffer,
 	n: usize,
-) {
+	grad_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_focal_grad(
 			prob.ptr_raw() as *const c_void,
 			target.ptr_raw() as *const c_void,
 			grad_out.ptr_raw(),
 			n as i32,
-			gamma,
-			alpha,
+			gamma.ptr_raw() as *const c_void,
+			alpha.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
+	Ok(())
 }
 
 pub fn gpu_kl_div_loss(
 	log_p: &GpuBuffer,
 	target: &GpuBuffer,
 	n: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_kl_div_loss(
 			log_p.ptr_raw() as *const c_void,
@@ -238,39 +244,39 @@ pub fn gpu_kl_div_loss(
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
 pub fn gpu_hinge_loss(
 	scores: &GpuBuffer,
 	labels: &GpuBuffer,
 	n: usize,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let loss = GpuBuffer::alloc(n)?;
-	let grad = GpuBuffer::alloc(n)?;
+	loss_out: &GpuBuffer,
+	grad_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_hinge(
 			scores.ptr_raw() as *const c_void,
 			labels.ptr_raw() as *const c_void,
-			loss.ptr_raw(),
-			grad.ptr_raw(),
+			loss_out.ptr_raw(),
+			grad_out.ptr_raw(),
 			n as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok((loss, grad))
+	Ok(())
 }
 
 pub fn gpu_cosine_embedding_loss(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	label: &GpuBuffer,
+	margin: &GpuBuffer,
 	n: usize,
 	dim: usize,
-	margin: f64,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_cosine_emb(
 			a.ptr_raw() as *const c_void,
@@ -279,23 +285,23 @@ pub fn gpu_cosine_embedding_loss(
 			out.ptr_raw(),
 			n as i32,
 			dim as i32,
-			margin,
+			margin.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
 pub fn gpu_triplet_loss(
 	anchor: &GpuBuffer,
 	pos: &GpuBuffer,
 	neg: &GpuBuffer,
+	margin: &GpuBuffer,
 	n: usize,
 	dim: usize,
-	margin: f64,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_triplet(
 			anchor.ptr_raw() as *const c_void,
@@ -304,23 +310,23 @@ pub fn gpu_triplet_loss(
 			out.ptr_raw(),
 			n as i32,
 			dim as i32,
-			margin,
+			margin.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }
 
 pub fn gpu_contrastive_loss(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	label: &GpuBuffer,
+	margin: &GpuBuffer,
 	n: usize,
 	dim: usize,
-	margin: f64,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_contrastive(
 			a.ptr_raw() as *const c_void,
@@ -329,10 +335,10 @@ pub fn gpu_contrastive_loss(
 			out.ptr_raw(),
 			n as i32,
 			dim as i32,
-			margin,
+			margin.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
-	Ok(out)
+	Ok(())
 }

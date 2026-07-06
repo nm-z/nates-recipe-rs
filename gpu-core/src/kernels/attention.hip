@@ -215,8 +215,9 @@ extern "C" void launch_mha_merge(
 
 __global__ void attn_rope_kernel(
       const float* x, float* out,
-      int seq, int dim, float base
+      int seq, int dim, const float* base_ptr
 ) {
+      float base = *base_ptr;
       int idx = blockIdx.x * blockDim.x + threadIdx.x;
       int half_dim = dim / 2;
       int total = seq * half_dim;
@@ -233,7 +234,7 @@ __global__ void attn_rope_kernel(
 }
 
 extern "C" void launch_rope(
-      const float* x, float* out, int seq, int dim, float base, hipStream_t stream
+      const float* x, float* out, int seq, int dim, const float* base, hipStream_t stream
 ) {
       int total = seq * (dim / 2);
       dim3 block(256); dim3 grid((total + 255) / 256);
@@ -268,8 +269,9 @@ extern "C" void launch_positional_encoding(
 
 __global__ void attn_rmsnorm_kernel(
       const float* x, const float* gamma, float* out,
-      int rows, int cols, float eps
+      int rows, int cols, const float* eps_ptr
 ) {
+      float eps = *eps_ptr;
       int row = blockIdx.x;
       if (row >= rows) return;
       const float* xr = x + row * cols;
@@ -299,7 +301,7 @@ __global__ void attn_rmsnorm_kernel(
 
 extern "C" void launch_rmsnorm(
       const float* x, const float* gamma, float* out,
-      int rows, int cols, float eps, hipStream_t stream
+      int rows, int cols, const float* eps, hipStream_t stream
 ) {
       hipLaunchKernelGGL(attn_rmsnorm_kernel, dim3(rows), dim3(128), 0, stream,
             x, gamma, out, rows, cols, eps);
@@ -312,8 +314,9 @@ extern "C" void launch_rmsnorm(
 __global__ void attn_rmsnorm_backward_kernel(
       const float* grad_out, const float* x, const float* gamma,
       float* grad_x, float* grad_gamma,
-      int rows, int cols, float eps
+      int rows, int cols, const float* eps_ptr
 ) {
+      float eps = *eps_ptr;
       int row = blockIdx.x;
       if (row >= rows) return;
       const float* go = grad_out + row * cols;
@@ -370,7 +373,7 @@ __global__ void attn_rmsnorm_backward_kernel(
 extern "C" void launch_rmsnorm_backward(
       const float* grad_out, const float* x, const float* gamma,
       float* grad_x, float* grad_gamma,
-      int rows, int cols, float eps, hipStream_t stream
+      int rows, int cols, const float* eps, hipStream_t stream
 ) {
       hipLaunchKernelGGL(attn_rmsnorm_backward_kernel, dim3(rows), dim3(128), 0, stream,
             grad_out, x, gamma, grad_x, grad_gamma, rows, cols, eps);
@@ -525,8 +528,9 @@ extern "C" void launch_embedding_backward(
 __global__ void attn_bn_update_running_kernel(
       float* run_mean, float* run_var,
       const float* save_mean, const float* save_var,
-      float momentum, int c
+      const float* momentum_ptr, int c
 ) {
+      float momentum = *momentum_ptr;
       int idx = blockIdx.x * blockDim.x + threadIdx.x;
       if (idx >= c) return;
       float one_minus_m = 1.0f - momentum;
@@ -537,7 +541,7 @@ __global__ void attn_bn_update_running_kernel(
 extern "C" void launch_bn_update_running(
       float* run_mean, float* run_var,
       const float* save_mean, const float* save_var,
-      float momentum, int c, hipStream_t stream
+      const float* momentum, int c, hipStream_t stream
 ) {
       dim3 block(256); dim3 grid((c + 255) / 256);
       hipLaunchKernelGGL(attn_bn_update_running_kernel, grid, block, 0, stream,

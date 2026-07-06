@@ -35,8 +35,8 @@ unsafe extern "C" {
 		cat_cnt: *mut c_void,
 		n: i32,
 		n_categories: i32,
-		prior: f64,
-		smoothing: f64,
+		prior: *const c_void,
+		smoothing: *const c_void,
 		stream: *mut c_void,
 	);
 }
@@ -44,41 +44,51 @@ unsafe extern "C" {
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 // gpu_iota
-// Returns GpuBuffer of i32[n] containing [0, 1, 2, ..., n-1].
-pub fn gpu_iota(n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+// Fills `out` (i32[n]) with [0, 1, 2, ..., n-1].
+pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_iota(out.ptr_raw(), n as i32, std::ptr::null_mut());
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
+}
+
+// not-an-op: plan-time helper — rocPRIM radix-sort workspace byte-size query
+pub fn gpu_random_permutation_workspace_bytes(n: usize) -> usize {
+	unsafe { radix_perm_workspace_bytes(n as i32, std::ptr::null_mut()) }
 }
 
 // gpu_random_permutation
-// Returns GpuBuffer of i32[n] — a random permutation of [0..n-1].
-// seed: u32 determines the random draw; different seeds give different permutations.
-// Implementation: draw uniform f64 keys via per-element LCG (launch_lcg_rand) and an
-// iota of indices, then rocPRIM radix-sort the (key, index) pairs ascending — O(n),
-// no power-of-two padding. The reordered indices are the permutation.
-pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError> {
+// Writes a random permutation of [0..n-1] (i32[n]) into `out`.
+// seed determines the random draw; different seeds give different permutations.
+// Implementation: draw uniform f64 keys via per-element LCG (launch_lcg_rand) into
+// `keys`, an iota of indices into `iota_scratch`, then rocPRIM radix-sort the
+// (key, index) pairs ascending — O(n), no power-of-two padding. `keys_out` receives
+// the sorted keys (discarded) and `tmp` (tmp_bytes from
+// gpu_random_permutation_workspace_bytes) is the rocPRIM scratch. All scratch is
+// caller-owned.
+pub fn gpu_random_permutation(
+	keys: &GpuBuffer,
+	keys_out: &GpuBuffer,
+	iota_scratch: &GpuBuffer,
+	tmp: &GpuBuffer,
+	n: usize,
+	seed: usize,
+	tmp_bytes: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let stream = std::ptr::null_mut();
-	let keys = GpuBuffer::alloc(n)?; // f64[n] random keys
-	let keys_out = GpuBuffer::alloc(n)?; // f64[n] sorted keys (discarded)
-	let vals_in = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?; // i32[n] iota
-	let vals_out = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?; // i32[n] permutation
 	unsafe {
-		launch_lcg_rand(keys.ptr_raw(), n as i32, seed, stream);
-		launch_iota(vals_in.ptr_raw(), n as i32, stream);
+		launch_lcg_rand(keys.ptr_raw(), n as i32, seed as u32, stream);
+		launch_iota(iota_scratch.ptr_raw(), n as i32, stream);
 	}
 	check_launch();
-	let tmp_bytes = unsafe { radix_perm_workspace_bytes(n as i32, stream) };
-	let tmp = GpuBuffer::alloc_bytes(tmp_bytes.max(1))?;
 	unsafe {
 		launch_radix_sort_perm(
 			keys.ptr_raw(),
 			keys_out.ptr_raw(),
-			vals_in.ptr_raw() as *const c_void,
-			vals_out.ptr_raw(),
+			iota_scratch.ptr_raw() as *const c_void,
+			out.ptr_raw(),
 			n as i32,
 			tmp.ptr_raw(),
 			tmp_bytes,
@@ -86,7 +96,7 @@ pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError
 		);
 	}
 	check_launch();
-	Ok(vals_out)
+	Ok(())
 }
 
 // gpu_ordered_target_stats
@@ -95,32 +105,30 @@ pub fn gpu_random_permutation(n: usize, seed: u32) -> Result<GpuBuffer, HipError
 // cat_col_i32: GpuBuffer i32[n]   — category index per row (0-based, 0..n_categories-1)
 // target:      GpuBuffer f64[n]   — regression target per row
 // perm_i32:    GpuBuffer i32[n]   — random permutation from gpu_random_permutation
+// prior:       1-elem device buffer — prior value added to numerator (prior * smoothing)
+// smoothing:   1-elem device buffer — denominator additive term
+// cat_sum/cat_cnt: caller-owned scratch (n_categories f64 each), zero-filled before launch
 // n_categories: number of distinct categories
-// prior:        prior value added to numerator (prior * smoothing)
-// smoothing:    denominator additive term (avoids division by zero; controls strength)
 //
-// Returns GpuBuffer f64[n] where encoded[row] is the target statistic for that row,
+// Writes f64[n] into `out` where out[row] is the target statistic for that row,
 // computed using only rows that appear BEFORE row in the permutation order, so the
 // target never leaks into its own statistic.
 //
 // Formula (per position p in permutation, row = perm[p]):
 //   TS = (sum_{j<p, cat_col[perm[j]]==cat} target[perm[j]] + prior * smoothing)
 //        / (count_{j<p, cat_col[perm[j]]==cat} + smoothing)
-//
-// The kernel needs per-category running accumulators (cat_sum, cat_cnt). These are
-// caller-owned scratch (n_categories f64 each) and must be zero-filled before launch.
 pub fn gpu_ordered_target_stats(
 	cat_col_i32: &GpuBuffer,
 	target: &GpuBuffer,
 	perm_i32: &GpuBuffer,
+	prior: &GpuBuffer,
+	smoothing: &GpuBuffer,
+	cat_sum: &GpuBuffer,
+	cat_cnt: &GpuBuffer,
 	n: usize,
 	n_categories: usize,
-	prior: f64,
-	smoothing: f64,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc(n)?;
-	let cat_sum = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
-	let cat_cnt = GpuBuffer::zeros_bytes(n_categories * std::mem::size_of::<f64>())?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_ordered_target_stats(
 			cat_col_i32.ptr_raw() as *const c_void,
@@ -131,11 +139,11 @@ pub fn gpu_ordered_target_stats(
 			cat_cnt.ptr_raw(),
 			n as i32,
 			n_categories as i32,
-			prior,
-			smoothing,
+			prior.ptr_raw() as *const c_void,
+			smoothing.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(out)
+	Ok(())
 }

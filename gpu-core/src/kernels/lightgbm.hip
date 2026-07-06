@@ -128,9 +128,10 @@ void lgbm_best_split_kernel(
       int          n_eval,
       int          n_eff,
       int          n_bins,
-      float        lambda,
-      float        min_child_weight
+      const float* lambda_p,
+      const float* min_child_weight_p
 ) {
+      float lambda = *lambda_p, min_child_weight = *min_child_weight_p;
       int slot_idx = blockIdx.x;
       if (slot_idx >= n_eval) return;
       int slot = slot_ids[slot_idx];
@@ -204,7 +205,7 @@ extern "C" void launch_lgbm_best_split(
       const float* grad_hist, const float* hess_hist, const float* count_hist,
       const int* slot_ids,
       float* best_gain, int* best_feat, int* best_bin, int* best_left_count,
-      int n_eval, int n_eff, int n_bins, float lambda, float min_child_weight,
+      int n_eval, int n_eff, int n_bins, const float* lambda, const float* min_child_weight,
       hipStream_t stream
 ) {
       dim3 grid(n_eval);
@@ -254,9 +255,10 @@ void goss_sample_kernel(
       const float* uniform_rand,
       int          n_rows,
       int          top_k,
-      float        sample_rate,    // keep a rest row with prob = sample_rate (= goss_b)
-      float        keep_weight     // amplification weight = (1-a)/b applied to kept rest rows
+      const float* sample_rate_p,    // keep a rest row with prob = sample_rate (= goss_b)
+      const float* keep_weight_p     // amplification weight = (1-a)/b applied to kept rest rows
 ) {
+      float sample_rate = *sample_rate_p, keep_weight = *keep_weight_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n_rows) return;
       int row = sorted_idx[i];
@@ -269,7 +271,7 @@ void goss_sample_kernel(
 
 extern "C" void launch_goss_sample(
       const int* sorted_idx, float* weights_out, const float* uniform_rand,
-      int n_rows, int top_k, float sample_rate, float keep_weight, hipStream_t stream
+      int n_rows, int top_k, const float* sample_rate, const float* keep_weight, hipStream_t stream
 ) {
       dim3 block(256);
       dim3 grid((n_rows + 255) / 256);

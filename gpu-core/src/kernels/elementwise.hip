@@ -15,7 +15,8 @@ extern "C" __global__ void add_kernel(const double* a, const double* b, double* 
     if (i < n) out[i] = a[i] + b[i];
 }
 
-extern "C" __global__ void add_scalar_kernel(const double* x, double* out, int n, double s) {
+extern "C" __global__ void add_scalar_kernel(const double* x, double* out, int n, const double* s_ptr) {
+    double s = *s_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = x[i] + s;
 }
@@ -119,7 +120,8 @@ extern "C" __global__ void softmax_rows_kernel(const double* x, double* out, int
 }
 
 // Scale each element: out[i] = (x[i] - y[i]) / n  (for gradient = (softmax - onehot) / n)
-extern "C" __global__ void sub_scale_kernel(const double* a, const double* b, double* out, int n, double scale) {
+extern "C" __global__ void sub_scale_kernel(const double* a, const double* b, double* out, int n, const double* scale_p) {
+    double scale = *scale_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = (a[i] - b[i]) * scale;
 }
@@ -130,7 +132,7 @@ extern "C" void launch_softmax_rows(const double* x, double* out, int rows, int 
     hipLaunchKernelGGL(softmax_rows_kernel, dim3(rows), dim3(threads), 0, stream, x, out, rows, cols);
 }
 
-extern "C" void launch_sub_scale(const double* a, const double* b, double* out, int n, double scale, hipStream_t stream) {
+extern "C" void launch_sub_scale(const double* a, const double* b, double* out, int n, const double* scale, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(sub_scale_kernel, grid, block, 0, stream, a, b, out, n, scale);
@@ -161,7 +163,8 @@ extern "C" __global__ void tanh_backward_kernel(const double* grad, const double
 }
 
 // Scaled exp: out = exp(scale * x) — for RBF kernel exp(-gamma * dist²)
-extern "C" __global__ void scaled_exp_kernel(const double* x, double* out, int n, double scale) {
+extern "C" __global__ void scaled_exp_kernel(const double* x, double* out, int n, const double* scale_ptr) {
+    double scale = *scale_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = exp(scale * x[i]);
 }
@@ -197,8 +200,9 @@ extern "C" __global__ void kl_div_kernel(const double* mu, const double* log_var
 // grad_lv_out = grad_z * 0.5 * exp(0.5 * log_var) * eps + kl_weight * 0.5 * (exp(log_var) - 1)
 extern "C" __global__ void vae_backward_latent_kernel(
     const double* grad_z, const double* mu, const double* log_var, const double* eps,
-    double* grad_mu_out, double* grad_lv_out, int n, double kl_weight
+    double* grad_mu_out, double* grad_lv_out, int n, const double* kl_weight_ptr
 ) {
+    double kl_weight = *kl_weight_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         grad_mu_out[i] = grad_z[i] + kl_weight * mu[i];
@@ -208,12 +212,13 @@ extern "C" __global__ void vae_backward_latent_kernel(
 }
 
 // Add scalar to diagonal of n x n matrix (in-place)
-extern "C" __global__ void add_diag_kernel(double* A, int n, double val) {
+extern "C" __global__ void add_diag_kernel(double* A, int n, const double* val_ptr) {
+    double val = *val_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) A[i * n + i] += val;
 }
 
-extern "C" void launch_add_diag(double* A, int n, double val, hipStream_t stream) {
+extern "C" void launch_add_diag(double* A, int n, const double* val, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(add_diag_kernel, grid, block, 0, stream, A, n, val);
 }
@@ -230,7 +235,7 @@ extern "C" void launch_kl_div(const double* mu, const double* log_var, double* o
 
 extern "C" void launch_vae_backward_latent(
     const double* grad_z, const double* mu, const double* log_var, const double* eps,
-    double* grad_mu_out, double* grad_lv_out, int n, double kl_weight, hipStream_t stream
+    double* grad_mu_out, double* grad_lv_out, int n, const double* kl_weight, hipStream_t stream
 ) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(vae_backward_latent_kernel, grid, block, 0, stream, grad_z, mu, log_var, eps, grad_mu_out, grad_lv_out, n, kl_weight);
@@ -240,7 +245,7 @@ extern "C" void launch_log_det_cholesky(const double* L, double* out, int n, hip
     hipLaunchKernelGGL(log_det_cholesky_kernel, dim3(1), dim3(1), 0, stream, L, out, n);
 }
 
-extern "C" void launch_scaled_exp(const double* x, double* out, int n, double scale, hipStream_t stream) {
+extern "C" void launch_scaled_exp(const double* x, double* out, int n, const double* scale, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(scaled_exp_kernel, grid, block, 0, stream, x, out, n, scale);
@@ -288,7 +293,7 @@ extern "C" void launch_add(const double* a, const double* b, double* out, int n,
     hipLaunchKernelGGL(add_kernel, grid, block, 0, stream, a, b, out, n);
 }
 
-extern "C" void launch_add_scalar(const double* x, double* out, int n, double s, hipStream_t stream) {
+extern "C" void launch_add_scalar(const double* x, double* out, int n, const double* s, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(add_scalar_kernel, grid, block, 0, stream, x, out, n, s);
@@ -345,7 +350,8 @@ extern "C" void launch_grad_hess(const double* probs, const double* targets, con
     hipLaunchKernelGGL(grad_hess_kernel, grid, block, 0, stream, probs, targets, weights, mask, grad_out, hess_out, n, nc, k);
 }
 
-extern "C" __global__ void softmax_ce_grad_kernel(const double* logits, const double* targets, const double* weights, double* grad_out, int n, int nc, double scale) {
+extern "C" __global__ void softmax_ce_grad_kernel(const double* logits, const double* targets, const double* weights, double* grad_out, int n, int nc, const double* scale_p) {
+    double scale = *scale_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const double* l = logits + i * nc;
@@ -361,7 +367,7 @@ extern "C" __global__ void softmax_ce_grad_kernel(const double* logits, const do
     }
 }
 
-extern "C" void launch_softmax_ce_grad(const double* logits, const double* targets, const double* weights, double* grad_out, int n, int nc, double scale, hipStream_t stream) {
+extern "C" void launch_softmax_ce_grad(const double* logits, const double* targets, const double* weights, double* grad_out, int n, int nc, const double* scale, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(softmax_ce_grad_kernel, grid, block, 0, stream, logits, targets, weights, grad_out, n, nc, scale);
@@ -458,12 +464,13 @@ extern "C" void launch_argmax_f32(const float* data, int* out, int n, hipStream_
 }
 
 // Fill f32 buffer with constant value
-extern "C" __global__ void fill_f32_kernel(float* out, float val, int n) {
+extern "C" __global__ void fill_f32_kernel(float* out, const float* val_p, int n) {
+    float val = *val_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = val;
 }
 
-extern "C" void launch_fill_f32(float* out, float val, int n, hipStream_t stream) {
+extern "C" void launch_fill_f32(float* out, const float* val, int n, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(fill_f32_kernel, grid, block, 0, stream, out, val, n);
@@ -521,12 +528,13 @@ extern "C" void launch_argmax_write_split(
         gain, split_feat, split_bin, best_idx_out, n_features, n_bins, d);
 }
 
-extern "C" __global__ void add_col_scaled_kernel(double* matrix, const double* col, int n, int cols, int k, double scale) {
+extern "C" __global__ void add_col_scaled_kernel(double* matrix, const double* col, int n, int cols, int k, const double* scale_p) {
+    double scale = *scale_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) matrix[i * cols + k] += col[i] * scale;
 }
 
-extern "C" void launch_add_col_scaled(double* matrix, const double* col, int n, int cols, int k, double scale, hipStream_t stream) {
+extern "C" void launch_add_col_scaled(double* matrix, const double* col, int n, int cols, int k, const double* scale, hipStream_t stream) {
     dim3 block(256);
     dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(add_col_scaled_kernel, grid, block, 0, stream, matrix, col, n, cols, k, scale);
@@ -667,22 +675,24 @@ extern "C" void launch_argmax_rows(const double* x, double* out, int rows, int c
 
 // ── Leaky ReLU ──────────────────────────────────────────────────────────────
 
-extern "C" __global__ void leaky_relu_kernel(const double* x, double* out, int n, double alpha) {
+extern "C" __global__ void leaky_relu_kernel(const double* x, double* out, int n, const double* alpha_ptr) {
+    double alpha = *alpha_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = x[i] > 0.0 ? x[i] : alpha * x[i];
 }
 
-extern "C" __global__ void leaky_relu_backward_kernel(const double* grad, const double* act, double* out, int n, double alpha) {
+extern "C" __global__ void leaky_relu_backward_kernel(const double* grad, const double* act, double* out, int n, const double* alpha_ptr) {
+    double alpha = *alpha_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = act[i] > 0.0 ? grad[i] : alpha * grad[i];
 }
 
-extern "C" void launch_leaky_relu(const double* x, double* out, int n, double alpha, hipStream_t stream) {
+extern "C" void launch_leaky_relu(const double* x, double* out, int n, const double* alpha, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(leaky_relu_kernel, grid, block, 0, stream, x, out, n, alpha);
 }
 
-extern "C" void launch_leaky_relu_backward(const double* grad, const double* act, double* out, int n, double alpha, hipStream_t stream) {
+extern "C" void launch_leaky_relu_backward(const double* grad, const double* act, double* out, int n, const double* alpha, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(leaky_relu_backward_kernel, grid, block, 0, stream, grad, act, out, n, alpha);
 }
@@ -692,7 +702,8 @@ extern "C" void launch_leaky_relu_backward(const double* grad, const double* act
 // gamma/beta (learnable scale/shift) applied if non-null.
 
 extern "C" __global__ void layernorm_kernel(const double* x, double* out,
-    const double* gamma, const double* beta, int rows, int cols, double eps) {
+    const double* gamma, const double* beta, int rows, int cols, const double* eps_p) {
+    double eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
     const double* r = x + row * cols;
@@ -743,7 +754,7 @@ extern "C" __global__ void layernorm_kernel(const double* x, double* out,
 }
 
 extern "C" void launch_layernorm(const double* x, double* out,
-    const double* gamma, const double* beta, int rows, int cols, double eps, hipStream_t stream) {
+    const double* gamma, const double* beta, int rows, int cols, const double* eps, hipStream_t stream) {
     int threads = min(256, max(32, cols));
     hipLaunchKernelGGL(layernorm_kernel, dim3(rows), dim3(threads), 0, stream, x, out, gamma, beta, rows, cols, eps);
 }
@@ -752,23 +763,26 @@ extern "C" void launch_layernorm(const double* x, double* out,
 // Mask is pre-generated on CPU and uploaded (same pattern as VAE eps buffer).
 // out[i] = mask[i] < p ? 0.0 : x[i] * scale, where scale = 1/(1-p)
 
-extern "C" __global__ void dropout_kernel(const double* x, const double* mask, double* out, int n, double p, double scale) {
+extern "C" __global__ void dropout_kernel(const double* x, const double* mask, double* out, int n, const double* p_p, const double* scale_p) {
+    double p = *p_p;
+    double scale = *scale_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = mask[i] < p ? 0.0 : x[i] * scale;
 }
 
-extern "C" void launch_dropout(const double* x, const double* mask, double* out, int n, double p, double scale, hipStream_t stream) {
+extern "C" void launch_dropout(const double* x, const double* mask, double* out, int n, const double* p, const double* scale, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(dropout_kernel, grid, block, 0, stream, x, mask, out, n, p, scale);
 }
 
 // Dropout using u8 mask: out[i] = mask[i] ? x[i] * scale : 0.0
-extern "C" __global__ void dropout_u8_kernel(const double* x, const unsigned char* mask, double* out, int n, double scale) {
+extern "C" __global__ void dropout_u8_kernel(const double* x, const unsigned char* mask, double* out, int n, const double* scale_ptr) {
+    double scale = *scale_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = mask[i] ? x[i] * scale : 0.0;
 }
 
-extern "C" void launch_dropout_u8(const double* x, const unsigned char* mask, double* out, int n, double scale, hipStream_t stream) {
+extern "C" void launch_dropout_u8(const double* x, const unsigned char* mask, double* out, int n, const double* scale, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(dropout_u8_kernel, grid, block, 0, stream, x, mask, out, n, scale);
 }
@@ -878,12 +892,15 @@ extern "C" __global__ void sign_kernel(const double* x, double* out, int n) {
       if (i < n) out[i] = (x[i] > 0.0) ? 1.0 : ((x[i] < 0.0) ? -1.0 : 0.0);
 }
 
-extern "C" __global__ void pow_kernel(const double* x, double* out, int n, double p) {
+extern "C" __global__ void pow_kernel(const double* x, double* out, int n, const double* p_ptr) {
+    double p = *p_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = pow(x[i], p);
 }
 
-extern "C" __global__ void clamp_kernel(const double* x, double* out, int n, double lo, double hi) {
+extern "C" __global__ void clamp_kernel(const double* x, double* out, int n, const double* lo_ptr, const double* hi_ptr) {
+    double lo = *lo_ptr;
+    double hi = *hi_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = fmin(fmax(x[i], lo), hi);
 }
@@ -918,12 +935,12 @@ extern "C" void launch_sign(const double* x, double* out, int n, hipStream_t str
       hipLaunchKernelGGL(sign_kernel, grid, block, 0, stream, x, out, n);
 }
 
-extern "C" void launch_pow(const double* x, double* out, int n, double p, hipStream_t stream) {
+extern "C" void launch_pow(const double* x, double* out, int n, const double* p, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(pow_kernel, grid, block, 0, stream, x, out, n, p);
 }
 
-extern "C" void launch_clamp(const double* x, double* out, int n, double lo, double hi, hipStream_t stream) {
+extern "C" void launch_clamp(const double* x, double* out, int n, const double* lo, const double* hi, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(clamp_kernel, grid, block, 0, stream, x, out, n, lo, hi);
 }
@@ -1492,11 +1509,13 @@ extern "C" __global__ void eq_kernel(const double* a, const double* b, double* o
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] == b[i] ? 1.0 : 0.0;
 }
-extern "C" __global__ void gt_scalar_kernel(const double* x, double* out, int n, double val) {
+extern "C" __global__ void gt_scalar_kernel(const double* x, double* out, int n, const double* val_p) {
+    double val = *val_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = x[i] > val ? 1.0 : 0.0;
 }
-extern "C" __global__ void lt_scalar_kernel(const double* x, double* out, int n, double val) {
+extern "C" __global__ void lt_scalar_kernel(const double* x, double* out, int n, const double* val_p) {
+    double val = *val_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = x[i] < val ? 1.0 : 0.0;
 }
@@ -1507,9 +1526,9 @@ extern "C" void launch_lt(const double* a, const double* b, double* out, int n, 
     dim3 bl(256); dim3 gr((n+255)/256); hipLaunchKernelGGL(lt_kernel, gr, bl, 0, s, a, b, out, n); }
 extern "C" void launch_eq(const double* a, const double* b, double* out, int n, hipStream_t s) {
     dim3 bl(256); dim3 gr((n+255)/256); hipLaunchKernelGGL(eq_kernel, gr, bl, 0, s, a, b, out, n); }
-extern "C" void launch_gt_scalar(const double* x, double* out, int n, double val, hipStream_t s) {
+extern "C" void launch_gt_scalar(const double* x, double* out, int n, const double* val, hipStream_t s) {
     dim3 bl(256); dim3 gr((n+255)/256); hipLaunchKernelGGL(gt_scalar_kernel, gr, bl, 0, s, x, out, n, val); }
-extern "C" void launch_lt_scalar(const double* x, double* out, int n, double val, hipStream_t s) {
+extern "C" void launch_lt_scalar(const double* x, double* out, int n, const double* val, hipStream_t s) {
     dim3 bl(256); dim3 gr((n+255)/256); hipLaunchKernelGGL(lt_scalar_kernel, gr, bl, 0, s, x, out, n, val); }
 
 // ── GELU + backward ───────────────────────────────────────────────────────
@@ -1568,8 +1587,9 @@ extern "C" void launch_silu_backward(const double* grad, const double* x, double
 extern "C" __global__ void batchnorm_forward_kernel(
     const double* x, const double* gamma, const double* beta,
     double* out, double* save_mean, double* save_inv_std,
-    int N, int C, double eps
+    int N, int C, const double* eps_p
 ) {
+    double eps = *eps_p;
     int c = blockIdx.x;
     if (c >= C) return;
 
@@ -1616,7 +1636,7 @@ extern "C" __global__ void batchnorm_forward_kernel(
 extern "C" void launch_batchnorm_forward(
     const double* x, const double* gamma, const double* beta,
     double* out, double* save_mean, double* save_inv_std,
-    int N, int C, double eps, hipStream_t stream
+    int N, int C, const double* eps, hipStream_t stream
 ) {
     int threads = min(256, max(32, N));
     hipLaunchKernelGGL(batchnorm_forward_kernel, dim3(C), dim3(threads), 0, stream,
@@ -1628,8 +1648,9 @@ extern "C" void launch_batchnorm_forward(
 extern "C" __global__ void batchnorm_inference_kernel(
     const double* x, const double* gamma, const double* beta,
     const double* run_mean, const double* run_var,
-    double* out, int N, int C, double eps
+    double* out, int N, int C, const double* eps_p
 ) {
+    double eps = *eps_p;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N * C) return;
     int c = idx % C;
@@ -1639,7 +1660,7 @@ extern "C" __global__ void batchnorm_inference_kernel(
 extern "C" void launch_batchnorm_inference(
     const double* x, const double* gamma, const double* beta,
     const double* run_mean, const double* run_var,
-    double* out, int N, int C, double eps, hipStream_t stream
+    double* out, int N, int C, const double* eps, hipStream_t stream
 ) {
     int total = N * C;
     dim3 bl(256); dim3 gr((total+255)/256);
@@ -1705,8 +1726,9 @@ extern "C" void launch_batchnorm_backward(
 extern "C" __global__ void layernorm_backward_kernel(
     const double* grad_y, const double* x, const double* gamma,
     double* grad_x, double* grad_gamma, double* grad_beta,
-    int rows, int cols, double eps
+    int rows, int cols, const double* eps_p
 ) {
+    double eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
     const double* xr = x + row * cols;
@@ -1779,7 +1801,7 @@ extern "C" __global__ void layernorm_backward_kernel(
 extern "C" void launch_layernorm_backward(
     const double* grad_y, const double* x, const double* gamma,
     double* grad_x, double* grad_gamma, double* grad_beta,
-    int rows, int cols, double eps, hipStream_t stream
+    int rows, int cols, const double* eps, hipStream_t stream
 ) {
     int threads = min(256, max(32, cols));
     hipLaunchKernelGGL(layernorm_backward_kernel, dim3(rows), dim3(threads), 0, stream,
@@ -1792,8 +1814,11 @@ extern "C" void launch_layernorm_backward(
 
 extern "C" __global__ void adam_update_kernel(
     double* w, double* m, double* v, const double* g,
-    double lr, double b1, double b2, double eps, double bc1, double bc2, int n
+    const double* lr_p, const double* b1_p, const double* b2_p, const double* eps_p, int t, int n
 ) {
+    double lr = *lr_p, b1 = *b1_p, b2 = *b2_p, eps = *eps_p;
+    double bc1 = 1.0 - pow(b1, (double)t);
+    double bc2 = 1.0 - pow(b2, (double)t);
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     double gi = g[i];
@@ -1806,20 +1831,21 @@ extern "C" __global__ void adam_update_kernel(
 
 extern "C" void launch_adam_update(
     double* w, double* m, double* v, const double* g,
-    double lr, double b1, double b2, double eps, int t, int n, hipStream_t stream
+    const double* lr, const double* b1, const double* b2, const double* eps, int t, int n, hipStream_t stream
 ) {
-    double bc1 = 1.0 - pow(b1, (double)t);
-    double bc2 = 1.0 - pow(b2, (double)t);
     dim3 bl(256); dim3 gr((n+255)/256);
-    hipLaunchKernelGGL(adam_update_kernel, gr, bl, 0, stream, w, m, v, g, lr, b1, b2, eps, bc1, bc2, n);
+    hipLaunchKernelGGL(adam_update_kernel, gr, bl, 0, stream, w, m, v, g, lr, b1, b2, eps, t, n);
 }
 
 // ── AdamW update (Adam + decoupled weight decay) ───────────────────────────
 
 extern "C" __global__ void adamw_update_kernel(
     double* w, double* m, double* v, const double* g,
-    double lr, double b1, double b2, double eps, double wd, double bc1, double bc2, int n
+    const double* lr_p, const double* b1_p, const double* b2_p, const double* eps_p, const double* wd_p, int t, int n
 ) {
+    double lr = *lr_p, b1 = *b1_p, b2 = *b2_p, eps = *eps_p, wd = *wd_p;
+    double bc1 = 1.0 - pow(b1, (double)t);
+    double bc2 = 1.0 - pow(b2, (double)t);
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     double gi = g[i];
@@ -1832,12 +1858,10 @@ extern "C" __global__ void adamw_update_kernel(
 
 extern "C" void launch_adamw_update(
     double* w, double* m, double* v, const double* g,
-    double lr, double b1, double b2, double eps, double wd, int t, int n, hipStream_t stream
+    const double* lr, const double* b1, const double* b2, const double* eps, const double* wd, int t, int n, hipStream_t stream
 ) {
-    double bc1 = 1.0 - pow(b1, (double)t);
-    double bc2 = 1.0 - pow(b2, (double)t);
     dim3 bl(256); dim3 gr((n+255)/256);
-    hipLaunchKernelGGL(adamw_update_kernel, gr, bl, 0, stream, w, m, v, g, lr, b1, b2, eps, wd, bc1, bc2, n);
+    hipLaunchKernelGGL(adamw_update_kernel, gr, bl, 0, stream, w, m, v, g, lr, b1, b2, eps, wd, t, n);
 }
 
 // ── GRU cell ───────────────────────────────────────────────────────────────
@@ -1879,25 +1903,27 @@ extern "C" void launch_slice_cols(const double* src, double* dst, int rows, int 
 }
 
 // Causal mask: n x n, lower tri = 0.0, upper tri = fill_val (e.g. -1e10)
-extern "C" __global__ void tril_mask_kernel(double* out, int n, double fill_val) {
+extern "C" __global__ void tril_mask_kernel(double* out, int n, const double* fill_val_p) {
+    double fill_val = *fill_val_p;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n * n) return;
     out[idx] = (idx % n <= idx / n) ? 0.0 : fill_val;
 }
 
-extern "C" void launch_tril_mask(double* out, int n, double fill_val, hipStream_t s) {
+extern "C" void launch_tril_mask(double* out, int n, const double* fill_val, hipStream_t s) {
     int total = n * n;
     dim3 bl(256); dim3 gr((total+255)/256);
     hipLaunchKernelGGL(tril_mask_kernel, gr, bl, 0, s, out, n, fill_val);
 }
 
 // Fill buffer with constant value
-extern "C" __global__ void fill_kernel(double* out, int n, double val) {
+extern "C" __global__ void fill_kernel(double* out, int n, const double* val_p) {
+    double val = *val_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = val;
 }
 
-extern "C" void launch_fill(double* out, int n, double val, hipStream_t s) {
+extern "C" void launch_fill(double* out, int n, const double* val, hipStream_t s) {
     dim3 bl(256); dim3 gr((n+255)/256);
     hipLaunchKernelGGL(fill_kernel, gr, bl, 0, s, out, n, val);
 }
@@ -1951,7 +1977,8 @@ extern "C" __global__ void reduce_sum_sq_kernel(const double* x, double* out, in
     if (tid == 0) atomicAdd(out, sdata[0]);
 }
 
-extern "C" __global__ void clip_by_norm_kernel(double* x, const double* norm_sq, int n, double max_norm) {
+extern "C" __global__ void clip_by_norm_kernel(double* x, const double* norm_sq, int n, const double* max_norm_p) {
+    double max_norm = *max_norm_p;
     double norm = sqrt(*norm_sq);
     if (norm <= max_norm) return;
     double scale = max_norm / norm;
@@ -1959,7 +1986,7 @@ extern "C" __global__ void clip_by_norm_kernel(double* x, const double* norm_sq,
     if (i < n) x[i] *= scale;
 }
 
-extern "C" void launch_grad_clip_norm(double* x, double* tmp, int n, double max_norm, hipStream_t stream) {
+extern "C" void launch_grad_clip_norm(double* x, double* tmp, int n, const double* max_norm, hipStream_t stream) {
     dim3 bl(256); dim3 gr((n+255)/256);
     hipLaunchKernelGGL(reduce_sum_sq_kernel, gr, bl, 0, stream, (const double*)x, tmp, n);
     hipLaunchKernelGGL(clip_by_norm_kernel, gr, bl, 0, stream, x, tmp, n, max_norm);
@@ -1993,7 +2020,8 @@ extern "C" void launch_rand_uniform(double* out, int n, uint32_t seed, hipStream
     hipLaunchKernelGGL(rand_uniform_kernel, grid, block, 0, stream, out, n, seed);
 }
 
-extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint32_t seed, double p) {
+extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint32_t seed, const double* p_ptr) {
+    double p = *p_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         uint2 r = philox2x32(i, seed);
@@ -2002,7 +2030,7 @@ extern "C" __global__ void bernoulli_u8_kernel(unsigned char* mask, int n, uint3
     }
 }
 
-extern "C" void launch_bernoulli_u8(unsigned char* mask, int n, uint32_t seed, double p, hipStream_t stream) {
+extern "C" void launch_bernoulli_u8(unsigned char* mask, int n, uint32_t seed, const double* p, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(bernoulli_u8_kernel, grid, block, 0, stream, mask, n, seed, p);
 }
@@ -2022,12 +2050,13 @@ extern "C" void launch_randn(double* out, int n, uint32_t seed, hipStream_t stre
     hipLaunchKernelGGL(randn_kernel, grid, block, 0, stream, out, n, seed);
 }
 
-extern "C" __global__ void bernoulli_kernel(double* out, int n, double p, uint32_t seed) {
+extern "C" __global__ void bernoulli_kernel(double* out, int n, const double* p_p, uint32_t seed) {
+    double p = *p_p;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = philox_uniform(i, seed) < p ? 1.0 : 0.0;
 }
 
-extern "C" void launch_bernoulli(double* out, int n, double p, uint32_t seed, hipStream_t stream) {
+extern "C" void launch_bernoulli(double* out, int n, const double* p, uint32_t seed, hipStream_t stream) {
     dim3 block(256); dim3 grid((n + 255) / 256);
     hipLaunchKernelGGL(bernoulli_kernel, grid, block, 0, stream, out, n, p, seed);
 }
@@ -2104,8 +2133,9 @@ extern "C" void launch_accuracy(
 // pred[row * n_classes + col] += lr * leaf_value[leaf_idx[row]]
 extern "C" __global__ void scatter_add_by_leaf_col_kernel(
     float* pred, const unsigned char* leaf_idx, const float* leaf_value,
-    float lr, int n_rows, int n_classes, int col
+    const float* lr_p, int n_rows, int n_classes, int col
 ) {
+    float lr = *lr_p;
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
     pred[row * n_classes + col] += lr * leaf_value[leaf_idx[row]];
@@ -2113,7 +2143,7 @@ extern "C" __global__ void scatter_add_by_leaf_col_kernel(
 
 extern "C" void launch_scatter_add_by_leaf_col(
     float* pred, const unsigned char* leaf_idx, const float* leaf_value,
-    float lr, int n_rows, int n_classes, int col, hipStream_t stream
+    const float* lr, int n_rows, int n_classes, int col, hipStream_t stream
 ) {
     dim3 block(256);
     dim3 grid((n_rows + 255) / 256);

@@ -12,11 +12,12 @@
         hipLaunchKernelGGL(actx_##fn##_kernel, g, b, 0, s, x, out, n);           \
     }
 #define ACTX1(fn, expr)                                                          \
-    extern "C" __global__ void actx_##fn##_kernel(const double* x, double* out, int n, double p) { \
+    extern "C" __global__ void actx_##fn##_kernel(const double* x, double* out, int n, const double* pp) { \
+        double p = *pp;                                                          \
         int i = blockIdx.x * blockDim.x + threadIdx.x;                           \
         if (i < n) { double v = x[i]; out[i] = (expr); }                         \
     }                                                                            \
-    extern "C" void launch_actx_##fn(const double* x, double* out, int n, double p, hipStream_t s) { \
+    extern "C" void launch_actx_##fn(const double* x, double* out, int n, const double* p, hipStream_t s) { \
         dim3 b(256); dim3 g((n + 255) / 256);                                    \
         hipLaunchKernelGGL(actx_##fn##_kernel, g, b, 0, s, x, out, n, p);        \
     }

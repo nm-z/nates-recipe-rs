@@ -24,16 +24,6 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	fn hipblasSaxpy(
-		handle: *mut c_void,
-		n: i32,
-		alpha: *const f32,
-		x: *const f32,
-		incx: i32,
-		y: *mut f32,
-		incy: i32,
-	) -> i32;
-
 	// f32 kernels
 	fn launch_relu_f32(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_relu_backward_f32(
@@ -73,7 +63,7 @@ unsafe extern "C" {
 		beta: *const c_void,
 		rows: i32,
 		cols: i32,
-		eps: f32,
+		eps: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_layernorm_backward_f32(
@@ -85,7 +75,7 @@ unsafe extern "C" {
 		grad_beta: *mut c_void,
 		rows: i32,
 		cols: i32,
-		eps: f32,
+		eps: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_avg_pool_2d_f32(
@@ -180,13 +170,20 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
+	fn launch_sgd_update_f32(
+		grad: *const c_void,
+		lr: *const c_void,
+		weights: *mut c_void,
+		n: i32,
+		stream: *mut c_void,
+	);
 }
 
-fn check_launch() {
+fn check_launch() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
 	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	let err = unsafe { crate::hip::hipGetLastError() };
-	assert!(err == 0, "HIP kernel launch failed with error code {}", err);
+	check(err)
 }
 
 fn safe_i32(v: usize) -> i32 {
@@ -204,18 +201,18 @@ pub fn gpu_linear_f32(
 	m: usize,
 	n: usize,
 	k: usize,
-) -> Result<GpuBuffer, HipError> {
-	let c = GpuBuffer::zeros_f32(m * n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_repeat_rows_f32(
 			bias.ptr_raw() as *const c_void,
-			c.ptr_raw(),
+			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(m * n),
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
+	check_launch()?;
 	let alpha = 1.0_f32;
 	let beta = 1.0_f32;
 	let status = unsafe {
@@ -232,17 +229,15 @@ pub fn gpu_linear_f32(
 			x.ptr_raw() as *const f32,
 			safe_i32(k),
 			&beta,
-			c.ptr_raw() as *mut f32,
+			out.ptr_raw() as *mut f32,
 			safe_i32(n),
 		)
 	};
-	check(status)?;
-	Ok(c)
+	check(status)
 }
 
 // ── gpu_relu_f32 / backward ────────────────────────────────────────────────
-pub fn gpu_relu_f32(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(n)?;
+pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_relu_f32(
 			x.ptr_raw() as *const c_void,
@@ -251,16 +246,15 @@ pub fn gpu_relu_f32(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 pub fn gpu_relu_backward_f32(
 	grad: &GpuBuffer,
 	act: &GpuBuffer,
 	n: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_relu_backward_f32(
 			grad.ptr_raw() as *const c_void,
@@ -270,14 +264,12 @@ pub fn gpu_relu_backward_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 // ── gpu_gelu_f32 / backward ────────────────────────────────────────────────
 // backward takes pre-activation x (not the output), matching the f64 convention
-pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(n)?;
+pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_f32(
 			x.ptr_raw() as *const c_void,
@@ -286,16 +278,15 @@ pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 pub fn gpu_gelu_backward_f32(
 	grad: &GpuBuffer,
 	x: &GpuBuffer,
 	n: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(n)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_backward_f32(
 			grad.ptr_raw() as *const c_void,
@@ -305,8 +296,7 @@ pub fn gpu_gelu_backward_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 // ── gpu_layernorm_f32 / backward ───────────────────────────────────────────
@@ -314,11 +304,11 @@ pub fn gpu_layernorm_f32(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
 	beta: &GpuBuffer,
+	eps: &GpuBuffer,
 	rows: usize,
 	cols: usize,
-	eps: f32,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(rows * cols)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_layernorm_f32(
 			x.ptr_raw() as *const c_void,
@@ -327,25 +317,24 @@ pub fn gpu_layernorm_f32(
 			beta.ptr_raw() as *const c_void,
 			safe_i32(rows),
 			safe_i32(cols),
-			eps,
+			eps.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 pub fn gpu_layernorm_backward_f32(
 	grad_y: &GpuBuffer,
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
+	eps: &GpuBuffer,
 	rows: usize,
 	cols: usize,
-	eps: f32,
-) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError> {
-	let grad_x = GpuBuffer::zeros_f32(rows * cols)?;
-	let grad_gamma = GpuBuffer::zeros_f32(cols)?;
-	let grad_beta = GpuBuffer::zeros_f32(cols)?;
+	grad_x: &GpuBuffer,
+	grad_gamma: &GpuBuffer,
+	grad_beta: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_layernorm_backward_f32(
 			grad_y.ptr_raw() as *const c_void,
@@ -356,12 +345,11 @@ pub fn gpu_layernorm_backward_f32(
 			grad_beta.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
-			eps,
+			eps.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok((grad_x, grad_gamma, grad_beta))
+	check_launch()
 }
 
 // ── gpu_bias_add_f32 ───────────────────────────────────────────────────────
@@ -370,8 +358,8 @@ pub fn gpu_bias_add_f32(
 	bias: &GpuBuffer,
 	rows: usize,
 	cols: usize,
-) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::zeros_f32(rows * cols)?;
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_bias_add_f32(
 			x.ptr_raw() as *const c_void,
@@ -382,8 +370,7 @@ pub fn gpu_bias_add_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 // ── gpu_avg_pool_2d_f32 / backward ────────────────────────────────────────
@@ -398,10 +385,10 @@ pub fn gpu_avg_pool_2d_f32(
 	kw: usize,
 	sh: usize,
 	sw: usize,
-) -> Result<GpuBuffer, HipError> {
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let out_h = (h - kh) / sh + 1;
 	let out_w = (w - kw) / sw + 1;
-	let out = GpuBuffer::zeros_f32(n_batch * c * out_h * out_w)?;
 	unsafe {
 		launch_avg_pool_2d_f32(
 			input.ptr_raw() as *const c_void,
@@ -419,8 +406,7 @@ pub fn gpu_avg_pool_2d_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 pub fn gpu_avg_pool_2d_backward_f32(
@@ -435,8 +421,8 @@ pub fn gpu_avg_pool_2d_backward_f32(
 	sw: usize,
 	out_h: usize,
 	out_w: usize,
-) -> Result<GpuBuffer, HipError> {
-	let grad_in = GpuBuffer::zeros_f32(n_batch * c * h * w)?;
+	grad_in: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_avg_pool_2d_backward_f32(
 			grad_out.ptr_raw() as *const c_void,
@@ -454,8 +440,7 @@ pub fn gpu_avg_pool_2d_backward_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(grad_in)
+	check_launch()
 }
 
 // ── gpu_max_pool_2d_f32 / backward ────────────────────────────────────────
@@ -471,11 +456,11 @@ pub fn gpu_max_pool_2d_f32(
 	kw: usize,
 	sh: usize,
 	sw: usize,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
+	out_vals: &GpuBuffer,
+	out_idx: &GpuBuffer,
+) -> Result<(), HipError> {
 	let out_h = (h - kh) / sh + 1;
 	let out_w = (w - kw) / sw + 1;
-	let out_vals = GpuBuffer::zeros_f32(n_batch * c * out_h * out_w)?;
-	let out_idx = GpuBuffer::zeros_f32(n_batch * c * out_h * out_w)?;
 	unsafe {
 		launch_max_pool_2d_f32(
 			input.ptr_raw() as *const c_void,
@@ -494,8 +479,7 @@ pub fn gpu_max_pool_2d_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok((out_vals, out_idx))
+	check_launch()
 }
 
 pub fn gpu_max_pool_2d_backward_f32(
@@ -507,8 +491,8 @@ pub fn gpu_max_pool_2d_backward_f32(
 	w: usize,
 	out_h: usize,
 	out_w: usize,
-) -> Result<GpuBuffer, HipError> {
-	let grad_in = GpuBuffer::zeros_f32(n_batch * c * h * w)?;
+	grad_in: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_max_pool_2d_backward_f32(
 			grad_out.ptr_raw() as *const c_void,
@@ -523,14 +507,19 @@ pub fn gpu_max_pool_2d_backward_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(grad_in)
+	check_launch()
 }
 
 // ── gpu_lstm_cell_f32 ─────────────────────────────────────────────────────
 // gates: (n, 4*hs) f32, layout [forget|input|cell_cand|output] per sample.
 // c and h are updated in-place (n, hs).
-pub fn gpu_lstm_cell_f32(gates: &GpuBuffer, c: &GpuBuffer, h: &GpuBuffer, n: usize, hs: usize) {
+pub fn gpu_lstm_cell_f32(
+	gates: &GpuBuffer,
+	n: usize,
+	hs: usize,
+	c: &GpuBuffer,
+	h: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_lstm_cell_f32(
 			gates.ptr_raw() as *const c_void,
@@ -541,7 +530,7 @@ pub fn gpu_lstm_cell_f32(gates: &GpuBuffer, c: &GpuBuffer, h: &GpuBuffer, n: usi
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
+	check_launch()
 }
 
 // ── gpu_gru_cell_f32 ──────────────────────────────────────────────────────
@@ -552,8 +541,8 @@ pub fn gpu_gru_cell_f32(
 	h: &GpuBuffer,
 	n: usize,
 	hs: usize,
-) -> Result<GpuBuffer, HipError> {
-	let h_new = GpuBuffer::zeros_f32(n * hs)?;
+	h_new: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gru_cell_f32(
 			gates.ptr_raw() as *const c_void,
@@ -564,16 +553,14 @@ pub fn gpu_gru_cell_f32(
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(h_new)
+	check_launch()
 }
 
 // ── f16 kernels ───────────────────────────────────────────────────────────
 // Buffers hold raw __half bit patterns. Allocate with alloc_bytes(n * 2).
 // Upload via upload_u8 (reinterpret &[u16] as &[u8]) or via half::f16 helpers.
 
-pub fn gpu_relu_f16(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc_bytes(n * 2)?;
+pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_relu_f16(
 			x.ptr_raw() as *const c_void,
@@ -582,12 +569,10 @@ pub fn gpu_relu_f16(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
-pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc_bytes(n * 2)?;
+pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_f16(
 			x.ptr_raw() as *const c_void,
@@ -596,12 +581,10 @@ pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
-pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc_bytes(n * 2)?;
+pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_add_f16(
 			a.ptr_raw() as *const c_void,
@@ -611,12 +594,10 @@ pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, 
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
-pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-	let out = GpuBuffer::alloc_bytes(n * 2)?;
+pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_mul_f16(
 			a.ptr_raw() as *const c_void,
@@ -626,24 +607,25 @@ pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer, 
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok(out)
+	check_launch()
 }
 
 // ── gpu_sgd_update_f32 ────────────────────────────────────────────────────
-// In-place: weights -= lr * grad, via hipblasSaxpy with negated lr.
-pub fn gpu_sgd_update_f32(weights: &GpuBuffer, grad: &GpuBuffer, lr: f32, n: usize) {
-	let neg_lr = -lr;
-	let status = unsafe {
-		hipblasSaxpy(
-			crate::kernels::hipblas_handle(),
+// In-place: weights -= lr * grad. lr rides as a 1-elem f32 device buffer.
+pub fn gpu_sgd_update_f32(
+	grad: &GpuBuffer,
+	lr: &GpuBuffer,
+	n: usize,
+	weights: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_sgd_update_f32(
+			grad.ptr_raw() as *const c_void,
+			lr.ptr_raw() as *const c_void,
+			weights.ptr_raw(),
 			safe_i32(n),
-			&neg_lr,
-			grad.ptr_raw() as *const f32,
-			1,
-			weights.ptr_raw() as *mut f32,
-			1,
-		)
-	};
-	assert_eq!(status, 0, "hipblasSaxpy failed with status {}", status);
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch()
 }

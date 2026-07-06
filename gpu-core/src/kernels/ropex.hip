@@ -10,8 +10,9 @@
 // Identical rotation applied to both Q and K. Fresh outputs qo, ko.
 extern "C" __global__ void ropex_qk_kernel(
     const double* q, const double* k, const double* pos,
-    double* qo, double* ko, int n_rows, int d, double theta
+    double* qo, double* ko, int n_rows, int d, const double* theta_p
 ) {
+    double theta = *theta_p;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = d / 2;
     if (idx >= n_rows * half) return;
@@ -33,7 +34,7 @@ extern "C" __global__ void ropex_qk_kernel(
 }
 extern "C" void launch_ropex_qk(
     const double* q, const double* k, const double* pos,
-    double* qo, double* ko, int n_rows, int d, double theta, hipStream_t s
+    double* qo, double* ko, int n_rows, int d, const double* theta, hipStream_t s
 ) {
     int total = n_rows * (d / 2);
     dim3 block(256); dim3 grid((total + 255) / 256);
@@ -48,8 +49,10 @@ extern "C" void launch_ropex_qk(
 // `sgn` selects direction: +1 forward (Q_rot = R(angle)·Q), -1 backward — a
 // rotation is orthogonal so dQ = R(-angle)·dQ_rot, the SAME kernel with sgn=-1.
 extern "C" __global__ void ropex_qk_heads_kernel(
-    double* q, double* k, int m, int d, int heads, int seq, double theta, double sgn
+    double* q, double* k, int m, int d, int heads, int seq, const double* theta_p, const double* sgn_p
 ) {
+    double theta = *theta_p;
+    double sgn = *sgn_p;
     int hd = d / heads;
     int half = hd / 2;
     int total = m * heads * half;
@@ -72,7 +75,7 @@ extern "C" __global__ void ropex_qk_heads_kernel(
     k[base + j + half] = kb * c + ka * s;
 }
 extern "C" void launch_ropex_qk_heads(
-    double* q, double* k, int m, int d, int heads, int seq, double theta, double sgn, hipStream_t st
+    double* q, double* k, int m, int d, int heads, int seq, const double* theta, const double* sgn, hipStream_t st
 ) {
     int half = (d / heads) / 2;
     if (half == 0) return;

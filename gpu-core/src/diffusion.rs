@@ -1,12 +1,12 @@
-use crate::hip::HipError;
-use crate::kernels::{check_launch, gpu_copy_into, safe_i32};
+use crate::hip::{HipError, check};
+use crate::kernels::{gpu_copy_into, safe_i32};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
 // FFI declaration — slot-for-slot with launcher in diffusionx.hip
 //
 // C: launch_diffusionx_entropy_gated_step(logits, canvas, accepted, renoise, bound, n_positions, vocab, stream)
-//    const double*, const double*, double*, double*, double, int, int, hipStream_t
+//    const double*, const double*, double*, double*, const double*, int, int, hipStream_t
 
 unsafe extern "C" {
 	fn launch_diffusionx_entropy_gated_step(
@@ -14,7 +14,7 @@ unsafe extern "C" {
 		canvas: *const c_void,
 		accepted: *mut c_void,
 		renoise: *mut c_void,
-		bound: f64,
+		bound: *const c_void,
 		n_positions: i32,
 		vocab: i32,
 		stream: *mut c_void,
@@ -29,6 +29,12 @@ unsafe extern "C" {
 	);
 }
 
+fn e() -> Result<(), HipError> {
+	crate::callspy::tick(&crate::callspy::LAUNCH);
+	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
+	check(unsafe { crate::hip::hipGetLastError() })
+}
+
 // ── gpu_entropy_gated_step ────────────────────────────────────────────────
 // Entropy-gated discrete diffusion sampler STEP. One fused thread per position.
 // logits: f64 (n_positions, vocab) row-major. canvas: f64 (n_positions,) token ids.
@@ -38,26 +44,49 @@ unsafe extern "C" {
 pub fn gpu_entropy_gated_step(
 	logits: &GpuBuffer,
 	canvas: &GpuBuffer,
-	entropy_bound: f64,
+	entropy_bound: &GpuBuffer,
 	n_positions: usize,
 	vocab: usize,
-) -> Result<(GpuBuffer, GpuBuffer), HipError> {
-	let accepted = GpuBuffer::alloc(n_positions)?;
-	let renoise = GpuBuffer::alloc(n_positions)?;
+	accepted: &GpuBuffer,
+	renoise: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_diffusionx_entropy_gated_step(
 			logits.ptr_raw() as *const c_void,
 			canvas.ptr_raw() as *const c_void,
 			accepted.ptr_raw(),
 			renoise.ptr_raw(),
-			entropy_bound,
+			entropy_bound.ptr_raw() as *const c_void,
 			safe_i32(n_positions),
 			safe_i32(vocab),
 			std::ptr::null_mut(),
 		);
 	}
-	check_launch();
-	Ok((accepted, renoise))
+	e()
+}
+
+// ── gpu_diffusion_commit ──────────────────────────────────────────────────────
+// One block-autoregressive commit step. Already-committed positions are FROZEN;
+// every other position takes `accepted`, and a newly-confident one (renoise==0)
+// is marked committed. canvas + committed are in/out.
+pub fn gpu_diffusion_commit(
+	accepted: &GpuBuffer,
+	renoise: &GpuBuffer,
+	n: usize,
+	canvas: &GpuBuffer,
+	committed: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_diffusionx_commit(
+			canvas.ptr_raw(),
+			accepted.ptr_raw() as *const c_void,
+			renoise.ptr_raw() as *const c_void,
+			committed.ptr_raw(),
+			safe_i32(n),
+			std::ptr::null_mut(),
+		);
+	}
+	e()
 }
 
 // ── gpu_diffusion_sample ─────────────────────────────────────────────────────
@@ -69,6 +98,8 @@ pub fn gpu_entropy_gated_step(
 // Terminates when every position is committed or `max_steps` is reached. Returns
 // the final canvas and the number of steps taken. `initial_canvas` holds the
 // starting token ids (any sentinel for "open"); it is not mutated.
+// not-an-op: driver — host loop over the logits_fn closure with a mid-flow D2H of
+// `committed` and a convergence branch; composes gpu_entropy_gated_step + gpu_diffusion_commit.
 pub fn gpu_diffusion_sample(
 	mut logits_fn: impl FnMut(&GpuBuffer) -> Result<GpuBuffer, HipError>,
 	initial_canvas: &GpuBuffer,
@@ -80,24 +111,24 @@ pub fn gpu_diffusion_sample(
 	let canvas = GpuBuffer::alloc(n_positions)?;
 	gpu_copy_into(initial_canvas, &canvas, n_positions);
 	let committed = GpuBuffer::zeros_bytes(n_positions * std::mem::size_of::<f64>())?;
+	let bound = GpuBuffer::upload(&[entropy_bound])?;
+	let accepted = GpuBuffer::alloc(n_positions)?;
+	let renoise = GpuBuffer::alloc(n_positions)?;
 	let mut host = vec![0.0f64; n_positions];
 	let mut steps = 0usize;
 	for s in 0..max_steps {
 		steps = s + 1;
 		let logits = logits_fn(&canvas)?;
-		let (accepted, renoise) =
-			gpu_entropy_gated_step(&logits, &canvas, entropy_bound, n_positions, vocab)?;
-		unsafe {
-			launch_diffusionx_commit(
-				canvas.ptr_raw(),
-				accepted.ptr_raw() as *const c_void,
-				renoise.ptr_raw() as *const c_void,
-				committed.ptr_raw(),
-				safe_i32(n_positions),
-				std::ptr::null_mut(),
-			);
-		}
-		check_launch();
+		gpu_entropy_gated_step(
+			&logits,
+			&canvas,
+			&bound,
+			n_positions,
+			vocab,
+			&accepted,
+			&renoise,
+		)?;
+		gpu_diffusion_commit(&accepted, &renoise, n_positions, &canvas, &committed)?;
 		committed.download(&mut host)?;
 		if host.iter().all(|&c| c != 0.0) {
 			break;

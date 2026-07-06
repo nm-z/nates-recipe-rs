@@ -7,7 +7,7 @@ unsafe extern "C" {
 	fn launch_discounted_returns(
 		rewards: *const c_void,
 		returns: *mut c_void,
-		gamma: f64,
+		gamma: *const c_void,
 		t_len: i32,
 		stream: *mut c_void,
 	);
@@ -16,8 +16,8 @@ unsafe extern "C" {
 		rewards: *const c_void,
 		values: *const c_void,
 		advantages: *mut c_void,
-		gamma: f64,
-		lam: f64,
+		gamma: *const c_void,
+		lam: *const c_void,
 		t_len: i32,
 		stream: *mut c_void,
 	);
@@ -27,7 +27,7 @@ unsafe extern "C" {
 		values_next: *const c_void,
 		done_mask: *const c_void,
 		targets: *mut c_void,
-		gamma: f64,
+		gamma: *const c_void,
 		n: i32,
 		stream: *mut c_void,
 	);
@@ -53,76 +53,76 @@ unsafe extern "C" {
 }
 
 /// Discounted returns for a single trajectory (reverse scan on one thread).
-/// rewards: [t_len], gamma: discount factor.
-/// Returns G[t_len] where G_t = r_t + gamma * G_{t+1}.
+/// rewards: [t_len], gamma: 1-elem device buffer (discount factor).
+/// Writes G[t_len] where G_t = r_t + gamma * G_{t+1} into `returns`.
 pub fn gpu_discounted_returns(
 	rewards: &GpuBuffer,
-	gamma: f64,
+	gamma: &GpuBuffer,
 	t_len: usize,
-) -> Result<GpuBuffer, HipError> {
-	let returns = GpuBuffer::alloc(t_len)?;
+	returns: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_discounted_returns(
 			rewards.ptr_raw() as *const c_void,
 			returns.ptr_raw(),
-			gamma,
+			gamma.ptr_raw() as *const c_void,
 			t_len as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(returns)
+	Ok(())
 }
 
 /// Generalized Advantage Estimation (reverse scan on one thread).
-/// rewards: [t_len], values: [t_len], gamma, lam: GAE lambda.
-/// Returns advantages[t_len].
+/// rewards: [t_len], values: [t_len], gamma/lam: 1-elem device buffers.
+/// Writes advantages[t_len].
 pub fn gpu_gae(
 	rewards: &GpuBuffer,
 	values: &GpuBuffer,
-	gamma: f64,
-	lam: f64,
+	gamma: &GpuBuffer,
+	lam: &GpuBuffer,
 	t_len: usize,
-) -> Result<GpuBuffer, HipError> {
-	let advantages = GpuBuffer::alloc(t_len)?;
+	advantages: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gae(
 			rewards.ptr_raw() as *const c_void,
 			values.ptr_raw() as *const c_void,
 			advantages.ptr_raw(),
-			gamma,
-			lam,
+			gamma.ptr_raw() as *const c_void,
+			lam.ptr_raw() as *const c_void,
 			t_len as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(advantages)
+	Ok(())
 }
 
 /// TD targets: targets[i] = r[i] + gamma * V_next[i] * (1 - done[i]).
-/// done_mask: f64 buffer with 0.0 (not done) or 1.0 (done).
+/// done_mask: f64 buffer with 0.0 (not done) or 1.0 (done). gamma: 1-elem device buffer.
 pub fn gpu_td_targets(
 	rewards: &GpuBuffer,
 	values_next: &GpuBuffer,
-	gamma: f64,
 	done_mask: &GpuBuffer,
+	gamma: &GpuBuffer,
 	n: usize,
-) -> Result<GpuBuffer, HipError> {
-	let targets = GpuBuffer::alloc(n)?;
+	targets: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_td_targets(
 			rewards.ptr_raw() as *const c_void,
 			values_next.ptr_raw() as *const c_void,
 			done_mask.ptr_raw() as *const c_void,
 			targets.ptr_raw(),
-			gamma,
+			gamma.ptr_raw() as *const c_void,
 			n as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(targets)
+	Ok(())
 }
 
 /// Categorical log-prob: logp[i] = log_softmax(logits[i])[actions[i]].
@@ -133,8 +133,8 @@ pub fn gpu_categorical_logprob(
 	actions_i32: &GpuBuffer,
 	n: usize,
 	n_actions: usize,
-) -> Result<GpuBuffer, HipError> {
-	let logp = GpuBuffer::alloc(n)?;
+	logp: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_categorical_logprob(
 			logits.ptr_raw() as *const c_void,
@@ -146,7 +146,7 @@ pub fn gpu_categorical_logprob(
 		);
 	}
 	check_launch();
-	Ok(logp)
+	Ok(())
 }
 
 /// Gaussian log-prob: logp[i] = sum_d [ -0.5*((a-mu)/sigma)^2 - log_std - 0.5*log(2pi) ].
@@ -157,8 +157,8 @@ pub fn gpu_gaussian_logprob(
 	actions: &GpuBuffer,
 	n: usize,
 	dim: usize,
-) -> Result<GpuBuffer, HipError> {
-	let logp = GpuBuffer::alloc(n)?;
+	logp: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gaussian_logprob(
 			mu.ptr_raw() as *const c_void,
@@ -171,5 +171,5 @@ pub fn gpu_gaussian_logprob(
 		);
 	}
 	check_launch();
-	Ok(logp)
+	Ok(())
 }

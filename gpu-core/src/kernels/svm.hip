@@ -16,10 +16,13 @@ __global__ void kernel_matrix_kernel(
       int           n,
       int           dim,
       int           kind,
-      double        gamma,
-      double        coef0,
-      double        degree
+      const double* gamma_p,
+      const double* coef0_p,
+      const double* degree_p
 ) {
+      double gamma  = *gamma_p;
+      double coef0  = *coef0_p;
+      double degree = *degree_p;
       int row = blockIdx.y * TILE + threadIdx.y;
       int col = blockIdx.x * TILE + threadIdx.x;
 
@@ -76,9 +79,9 @@ extern "C" void launch_kernel_matrix(
       int           n,
       int           dim,
       int           kind,
-      double        gamma,
-      double        coef0,
-      double        degree,
+      const double* gamma,
+      const double* coef0,
+      const double* degree,
       hipStream_t   stream
 ) {
       dim3 block(TILE, TILE);
@@ -141,8 +144,9 @@ __global__ void smo_kkt_score_kernel(
       double*       score_i, // upper-set violation: -y[t]*G[t], -inf if inactive
       double*       score_j, // lower-set violation: +y[t]*G[t], -inf if inactive
       int           n,
-      double        C
+      const double* C_p
 ) {
+      double C = *C_p;
       int t = blockIdx.x * blockDim.x + threadIdx.x;
       if (t >= n) return;
 
@@ -166,7 +170,7 @@ extern "C" void launch_smo_kkt_score(
       double*       score_i,
       double*       score_j,
       int           n,
-      double        C,
+      const double* C,
       hipStream_t   stream
 ) {
       int threads = 256;
@@ -180,8 +184,11 @@ extern "C" void launch_smo_kkt_score(
 // Lets SMO run without ever materializing the n×n matrix (item 5: no O(n²) alloc).
 __global__ void smo_kernel_row_kernel(
       const double* x, double* krow, int n, int dim, int row,
-      int kind, double gamma, double coef0, double degree
+      int kind, const double* gamma_p, const double* coef0_p, const double* degree_p
 ) {
+      double gamma  = *gamma_p;
+      double coef0  = *coef0_p;
+      double degree = *degree_p;
       int t = blockIdx.x * blockDim.x + threadIdx.x;
       if (t >= n) return;
       const double* xr = x + (long)row * dim;
@@ -208,7 +215,7 @@ __global__ void smo_kernel_row_kernel(
 
 extern "C" void launch_smo_kernel_row(
       const double* x, double* krow, int n, int dim, int row,
-      int kind, double gamma, double coef0, double degree, hipStream_t stream
+      int kind, const double* gamma, const double* coef0, const double* degree, hipStream_t stream
 ) {
       int threads = 256;
       int blocks  = (n + threads - 1) / threads;
@@ -246,15 +253,17 @@ extern "C" void launch_smo_argmax(const double* s, double* out, int n, hipStream
 // Gradient update from two precomputed kernel rows (matrix-free variant):
 //   grad[t] += di * krow_i[t] + dj * krow_j[t]
 __global__ void smo_update_gradient_rows_kernel(
-      double* grad, const double* ki, const double* kj, int n, double di, double dj
+      double* grad, const double* ki, const double* kj, int n, const double* di_p, const double* dj_p
 ) {
+      double di = *di_p;
+      double dj = *dj_p;
       int t = blockIdx.x * blockDim.x + threadIdx.x;
       if (t >= n) return;
       grad[t] += di * ki[t] + dj * kj[t];
 }
 
 extern "C" void launch_smo_update_gradient_rows(
-      double* grad, const double* ki, const double* kj, int n, double di, double dj, hipStream_t stream
+      double* grad, const double* ki, const double* kj, int n, const double* di, const double* dj, hipStream_t stream
 ) {
       int threads = 256;
       int blocks  = (n + threads - 1) / threads;

@@ -380,8 +380,9 @@ extern "C" void launch_core_distance(
 // row offsets, then fill packs neighbor indices into the compact adjacency.
 
 extern "C" __global__ void fixed_radius_count_kernel(
-      const double* points, int* count, int n, int dim, double eps2
+      const double* points, int* count, int n, int dim, const double* eps
 ) {
+      double eps2 = (*eps) * (*eps);
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       int c = 0;
@@ -397,20 +398,58 @@ extern "C" __global__ void fixed_radius_count_kernel(
 }
 
 extern "C" void launch_fixed_radius_count(
-      const double* points, int* count, int n, int dim, double eps, hipStream_t stream
+      const double* points, int* count, int n, int dim, const double* eps, hipStream_t stream
 ) {
-      double eps2 = eps * eps;
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(fixed_radius_count_kernel, dim3(blocks), dim3(threads), 0, stream,
-            points, count, n, dim, eps2);
+            points, count, n, dim, eps);
+}
+
+// ── Exclusive prefix sum of an i32 count vector → CSR row offsets ────────────
+// out has n+1 elements; out[i] = sum(in[0..i]), out[n] = total (nnz). Single
+// sequential pass (O(n)) — the count/fill kernels are the O(n²) cost.
+extern "C" __global__ void exclusive_scan_i32_kernel(
+      const int* in, int* out, int n
+) {
+      if (blockIdx.x * blockDim.x + threadIdx.x != 0) return;
+      int acc = 0;
+      for (int i = 0; i < n; i++) { out[i] = acc; acc += in[i]; }
+      out[n] = acc;
+}
+
+extern "C" void launch_exclusive_scan_i32(
+      const int* in, int* out, int n, hipStream_t stream
+) {
+      hipLaunchKernelGGL(exclusive_scan_i32_kernel, dim3(1), dim3(1), 0, stream,
+            in, out, n);
+}
+
+// ── Masked MST weight sum: total = sum of edge_w[e] where in_mst[e]!=0 ───────
+// Single-thread sequential sum preserves edge order (bit-identical to the old
+// host reduction).
+extern "C" __global__ void masked_weight_sum_kernel(
+      const double* w, const unsigned char* in_mst, double* total, int n_edges
+) {
+      if (blockIdx.x * blockDim.x + threadIdx.x != 0) return;
+      double s = 0.0;
+      for (int e = 0; e < n_edges; e++) { if (in_mst[e]) s += w[e]; }
+      total[0] = s;
+}
+
+extern "C" void launch_masked_weight_sum(
+      const double* w, const unsigned char* in_mst, double* total, int n_edges, hipStream_t stream
+) {
+      hipLaunchKernelGGL(masked_weight_sum_kernel, dim3(1), dim3(1), 0, stream,
+            w, in_mst, total, n_edges);
 }
 
 // One thread per point i owns row [row_ptr[i], row_ptr[i+1]) → no atomics. Writes
 // the j-index of every neighbor (including i itself, matching the mask version).
 extern "C" __global__ void fixed_radius_fill_csr_kernel(
-      const double* points, const int* row_ptr, int* indices, int n, int dim, double eps2
+      const double* points, const int* row_ptr, int* indices, int n, int dim, const double* eps
 ) {
+      double eps2 = (*eps) * (*eps);
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       int off = row_ptr[i];
@@ -425,11 +464,10 @@ extern "C" __global__ void fixed_radius_fill_csr_kernel(
 }
 
 extern "C" void launch_fixed_radius_fill_csr(
-      const double* points, const int* row_ptr, int* indices, int n, int dim, double eps, hipStream_t stream
+      const double* points, const int* row_ptr, int* indices, int n, int dim, const double* eps, hipStream_t stream
 ) {
-      double eps2 = eps * eps;
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(fixed_radius_fill_csr_kernel, dim3(blocks), dim3(threads), 0, stream,
-            points, row_ptr, indices, n, dim, eps2);
+            points, row_ptr, indices, n, dim, eps);
 }

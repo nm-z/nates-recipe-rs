@@ -54,11 +54,12 @@ extern "C" void launch_gemm_bt_f64(
 }
 
 // x[i] *= scalar, elementwise. Replaces hipblasDscal.
-extern "C" __global__ void scale_f64(double* x, double scalar, long n) {
+extern "C" __global__ void scale_f64(double* x, const double* scalar_p, long n) {
+    double scalar = *scalar_p;
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= scalar;
 }
-extern "C" void launch_scale_f64(double* x, double scalar, long n, hipStream_t s) {
+extern "C" void launch_scale_f64(double* x, const double* scalar, long n, hipStream_t s) {
     int t = 256;
     long blk = (n + t - 1) / t;
     hipLaunchKernelGGL(scale_f64, dim3((unsigned)blk), dim3(t), 0, s, x, scalar, n);

@@ -100,9 +100,11 @@ __global__ void ordered_target_stats_kernel(
       double*       cat_sum,       // f64[n_categories] — scratch: per-category running sum
       double*       cat_cnt,       // f64[n_categories] — scratch: per-category running count
       int           n,
-      double        prior,
-      double        smoothing
+      const double* prior_p,
+      const double* smoothing_p
 ) {
+      double prior     = *prior_p;
+      double smoothing = *smoothing_p;
       // Sequential kernel: single thread walks perm order
       if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
@@ -128,8 +130,8 @@ extern "C" void launch_ordered_target_stats(
       double*       cat_cnt,       // scratch: n_categories doubles, caller zero-fills
       int           n,
       int           n_categories,  // scratch sizing only; unused inside the wrapper
-      double        prior,
-      double        smoothing,
+      const double* prior,
+      const double* smoothing,
       hipStream_t   stream
 ) {
       (void)n_categories;

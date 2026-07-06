@@ -5,8 +5,9 @@
 // G_t = r_t + gamma * G_{t+1}, G_{T-1} = r_{T-1}
 // One thread does the full reverse loop (sequential recurrence).
 __global__ void discounted_returns_kernel(
-      const double* rewards, double* returns, double gamma, int t_len
+      const double* rewards, double* returns, const double* gamma_p, int t_len
 ) {
+      double gamma = *gamma_p;
       if (threadIdx.x != 0 || blockIdx.x != 0) return;
       double g = 0.0;
       for (int t = t_len - 1; t >= 0; t--) {
@@ -16,7 +17,7 @@ __global__ void discounted_returns_kernel(
 }
 
 extern "C" void launch_discounted_returns(
-      const double* rewards, double* returns, double gamma, int t_len, hipStream_t stream
+      const double* rewards, double* returns, const double* gamma, int t_len, hipStream_t stream
 ) {
       hipLaunchKernelGGL(discounted_returns_kernel, dim3(1), dim3(1), 0, stream,
             rewards, returns, gamma, t_len);
@@ -28,8 +29,10 @@ extern "C" void launch_discounted_returns(
 // One thread, sequential reverse loop.
 __global__ void gae_kernel(
       const double* rewards, const double* values,
-      double* advantages, double gamma, double lam, int t_len
+      double* advantages, const double* gamma_p, const double* lam_p, int t_len
 ) {
+      double gamma = *gamma_p;
+      double lam   = *lam_p;
       if (threadIdx.x != 0 || blockIdx.x != 0) return;
       double a = 0.0;
       for (int t = t_len - 1; t >= 0; t--) {
@@ -42,7 +45,7 @@ __global__ void gae_kernel(
 
 extern "C" void launch_gae(
       const double* rewards, const double* values,
-      double* advantages, double gamma, double lam, int t_len, hipStream_t stream
+      double* advantages, const double* gamma, const double* lam, int t_len, hipStream_t stream
 ) {
       hipLaunchKernelGGL(gae_kernel, dim3(1), dim3(1), 0, stream,
             rewards, values, advantages, gamma, lam, t_len);
@@ -53,8 +56,9 @@ extern "C" void launch_gae(
 // done_mask[i] is 0.0 or 1.0 (f64).
 __global__ void td_targets_kernel(
       const double* rewards, const double* values_next, const double* done_mask,
-      double* targets, double gamma, int n
+      double* targets, const double* gamma_p, int n
 ) {
+      double gamma = *gamma_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
       targets[i] = rewards[i] + gamma * values_next[i] * (1.0 - done_mask[i]);
@@ -62,7 +66,7 @@ __global__ void td_targets_kernel(
 
 extern "C" void launch_td_targets(
       const double* rewards, const double* values_next, const double* done_mask,
-      double* targets, double gamma, int n, hipStream_t stream
+      double* targets, const double* gamma, int n, hipStream_t stream
 ) {
       int threads = 256;
       int blocks  = (n + threads - 1) / threads;

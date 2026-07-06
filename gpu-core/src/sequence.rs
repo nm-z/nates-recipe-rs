@@ -36,32 +36,30 @@ unsafe extern "C" {
 /// log_trans: [n_states * n_states] — log_trans[s * n_states + s2] = log P(s2 | s)
 /// log_emit:  [t_len * n_states]   — log_emit[t * n_states + s]   = log P(obs_t | s)
 ///
-/// Returns (log_alpha, log_beta, log_gamma) each of length t_len * n_states.
+/// log_alpha_out, log_beta_out, log_gamma_out: caller-provided f64[t_len * n_states] each.
 pub fn gpu_forward_backward(
 	log_trans: &GpuBuffer,
 	log_emit: &GpuBuffer,
 	n_states: usize,
 	t_len: usize,
-) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError> {
-	let ts = t_len * n_states;
-	let log_alpha = GpuBuffer::alloc(ts)?;
-	let log_beta = GpuBuffer::alloc(ts)?;
-	let log_gamma = GpuBuffer::alloc(ts)?;
-
+	log_alpha_out: &GpuBuffer,
+	log_beta_out: &GpuBuffer,
+	log_gamma_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_forward_backward(
 			log_trans.ptr_raw() as *const c_void,
 			log_emit.ptr_raw() as *const c_void,
-			log_alpha.ptr_raw(),
-			log_beta.ptr_raw(),
-			log_gamma.ptr_raw(),
+			log_alpha_out.ptr_raw(),
+			log_beta_out.ptr_raw(),
+			log_gamma_out.ptr_raw(),
 			n_states as i32,
 			t_len as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok((log_alpha, log_beta, log_gamma))
+	Ok(())
 }
 
 /// Viterbi decoding in log space.
@@ -69,34 +67,29 @@ pub fn gpu_forward_backward(
 /// log_trans: [n_states * n_states]
 /// log_emit:  [t_len * n_states]
 ///
-/// Returns best_path as GpuBuffer containing i32[t_len].
-/// Download with download_i32 into a &mut [i32] of length t_len.
+/// best_path_out: caller-provided i32[t_len]. delta: f64[t_len*n_states] workspace;
+/// backptr: i32[t_len*n_states] workspace. Download best_path_out with download_i32.
 pub fn gpu_viterbi(
 	log_trans: &GpuBuffer,
 	log_emit: &GpuBuffer,
 	n_states: usize,
 	t_len: usize,
-) -> Result<GpuBuffer, HipError> {
-	let ts = t_len * n_states;
-	// delta: f64 scratch
-	let delta = GpuBuffer::alloc(ts)?;
-	// backptr: i32 scratch — allocate as bytes (4 bytes per i32)
-	let backptr = GpuBuffer::alloc_bytes(ts * 4)?;
-	// best_path: i32 output
-	let best_path = GpuBuffer::alloc_bytes(t_len * 4)?;
-
+	delta: &GpuBuffer,
+	backptr: &GpuBuffer,
+	best_path_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_viterbi(
 			log_trans.ptr_raw() as *const c_void,
 			log_emit.ptr_raw() as *const c_void,
 			delta.ptr_raw(),
 			backptr.ptr_raw(),
-			best_path.ptr_raw(),
+			best_path_out.ptr_raw(),
 			n_states as i32,
 			t_len as i32,
 			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(best_path)
+	Ok(())
 }

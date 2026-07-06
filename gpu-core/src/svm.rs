@@ -1,4 +1,5 @@
 use crate::hip::HipError;
+use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
@@ -10,9 +11,9 @@ unsafe extern "C" {
 		n: i32,
 		dim: i32,
 		kind: i32,
-		gamma: f64,
-		coef0: f64,
-		degree: f64,
+		gamma: *const c_void,
+		coef0: *const c_void,
+		degree: *const c_void,
 		stream: *mut c_void,
 	);
 
@@ -24,7 +25,7 @@ unsafe extern "C" {
 		score_i: *mut c_void,
 		score_j: *mut c_void,
 		n: i32,
-		c: f64,
+		c: *const c_void,
 		stream: *mut c_void,
 	);
 
@@ -36,9 +37,9 @@ unsafe extern "C" {
 		dim: i32,
 		row: i32,
 		kind: i32,
-		gamma: f64,
-		coef0: f64,
-		degree: f64,
+		gamma: *const c_void,
+		coef0: *const c_void,
+		degree: *const c_void,
 		stream: *mut c_void,
 	);
 
@@ -51,48 +52,149 @@ unsafe extern "C" {
 		ki: *const c_void,
 		kj: *const c_void,
 		n: i32,
-		di: f64,
-		dj: f64,
+		di: *const c_void,
+		dj: *const c_void,
 		stream: *mut c_void,
 	);
 }
 
 // Compute the n×n kernel matrix for the n training samples in x (n×dim, row-major).
 // kind: 0=linear, 1=rbf, 2=poly, 3=sigmoid.
-// gamma, coef0, degree are kernel hyperparameters (full real-line valid; unused params ignored).
-// Returns K[n*n] on GPU. NOTE: O(n²) memory — for SVM training prefer the matrix-free
-// `gpu_smo_train`, which never materializes this. Kept for callers that genuinely need
-// the dense Gram matrix.
+// gamma, coef0, degree are 1-elem device buffers (kernel hyperparameters; unused
+// params ignored). Writes K[n*n] into `k_out`. NOTE: O(n²) memory — for SVM training
+// prefer the matrix-free `gpu_smo_train`, which never materializes this. Kept for
+// callers that genuinely need the dense Gram matrix.
 pub fn gpu_kernel_matrix(
 	x: &GpuBuffer,
+	gamma: &GpuBuffer,
+	coef0: &GpuBuffer,
+	degree: &GpuBuffer,
 	n: usize,
 	dim: usize,
-	kind: i32,
-	gamma: f64,
-	coef0: f64,
-	degree: f64,
-) -> Result<GpuBuffer, HipError> {
-	let k_out = GpuBuffer::alloc(n * n)?;
+	kind: usize,
+	k_out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_kernel_matrix(
 			x.ptr_raw() as *const c_void,
 			k_out.ptr_raw(),
 			n as i32,
 			dim as i32,
-			kind,
-			gamma,
-			coef0,
-			degree,
+			kind as i32,
+			gamma.ptr_raw() as *const c_void,
+			coef0.ptr_raw() as *const c_void,
+			degree.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}
-	crate::kernels::check_launch();
-	Ok(k_out)
+	check_launch();
+	Ok(())
 }
 
-// Read a single f64 element out of a GPU buffer at element index `idx` (one tiny D2H
-// copy). Used for the handful of scalars SMO needs per iteration (K[i,i], K[i,j],
-// K[j,j], G[i], G[j]) instead of downloading whole vectors.
+// ── Schedulable SMO primitives ──────────────────────────────────────────────
+// The matrix-free SMO iteration (gpu_smo_train, below) is a host-side driver that
+// composes these four conforming ops.
+
+// KKT-violation scoring for working-set selection. c is a 1-elem device buffer (box
+// bound C). Writes per-sample I_up / I_down violation scores into score_i / score_j.
+pub fn gpu_smo_kkt_score(
+	grad: &GpuBuffer,
+	alpha: &GpuBuffer,
+	y: &GpuBuffer,
+	c: &GpuBuffer,
+	n: usize,
+	score_i: &GpuBuffer,
+	score_j: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_smo_kkt_score(
+			grad.ptr_raw() as *const c_void,
+			alpha.ptr_raw() as *const c_void,
+			y.ptr_raw() as *const c_void,
+			score_i.ptr_raw(),
+			score_j.ptr_raw(),
+			n as i32,
+			c.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Recompute one kernel-matrix row on demand (matrix-free): krow[t] = K(x_row, x_t).
+// gamma/coef0/degree are 1-elem device buffers; kind and row are plan-time dims.
+pub fn gpu_smo_kernel_row(
+	x: &GpuBuffer,
+	gamma: &GpuBuffer,
+	coef0: &GpuBuffer,
+	degree: &GpuBuffer,
+	n: usize,
+	dim: usize,
+	kind: usize,
+	row: usize,
+	krow: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_smo_kernel_row(
+			x.ptr_raw() as *const c_void,
+			krow.ptr_raw(),
+			n as i32,
+			dim as i32,
+			row as i32,
+			kind as i32,
+			gamma.ptr_raw() as *const c_void,
+			coef0.ptr_raw() as *const c_void,
+			degree.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Single-block argmax over s[n]. Writes out[0]=max value, out[1]=index (as f64).
+pub fn gpu_smo_argmax(s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	unsafe {
+		launch_smo_argmax(
+			s.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			n as i32,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// Gradient update from two precomputed kernel rows: grad[t] += di*ki[t] + dj*kj[t].
+// di/dj are 1-elem device buffers; grad is the in/out accumulator.
+pub fn gpu_smo_update_gradient_rows(
+	ki: &GpuBuffer,
+	kj: &GpuBuffer,
+	di: &GpuBuffer,
+	dj: &GpuBuffer,
+	n: usize,
+	grad: &GpuBuffer,
+) -> Result<(), HipError> {
+	unsafe {
+		launch_smo_update_gradient_rows(
+			grad.ptr_raw(),
+			ki.ptr_raw() as *const c_void,
+			kj.ptr_raw() as *const c_void,
+			n as i32,
+			di.ptr_raw() as *const c_void,
+			dj.ptr_raw() as *const c_void,
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
+}
+
+// not-an-op: plumbing — D2H readback of a single f64 element from a GPU buffer.
+// Used for the handful of scalars SMO needs per iteration (K[i,i], K[i,j], K[j,j],
+// G[i], G[j]) instead of downloading whole vectors.
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
 	unsafe {
@@ -108,22 +210,30 @@ fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	Ok(v[0])
 }
 
-// Matrix-free working-set SMO training for binary SVM.
+// not-an-op: plumbing — H2D write of a single f64 into a 1-elem device buffer.
+fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
+	let v = [val];
+	unsafe {
+		crate::memory::xfer_sync(
+			buf.ptr_raw(),
+			v.as_ptr() as *const c_void,
+			std::mem::size_of::<f64>(),
+			crate::hip::HIP_MEMCPY_H2D,
+		)?;
+	}
+	Ok(())
+}
+
+// not-an-op: driver — matrix-free working-set SMO training for binary SVM. The host
+// loop, closed-form alpha pair update, box clip, convergence break, and per-iter D2H
+// scalar reads (read_at) that steer control flow all live here; the driver composes
+// the conforming ops gpu_smo_kkt_score / gpu_smo_argmax / gpu_smo_kernel_row /
+// gpu_smo_update_gradient_rows plus memory plumbing.
 //
-// Nothing O(n²) is ever allocated or downloaded: the kernel matrix is never
-// materialized — each iteration recomputes only the two needed rows K[i,:], K[j,:]
-// on the GPU (item 5). Working-set selection (argmax of the two KKT-violation score
-// vectors) runs on the GPU and returns just (value,index) pairs, and the per-iteration
-// scalars (K[i,i], K[i,j], K[j,j], G[i], G[j]) are single-element reads — no whole
-// vectors cross the bus (item 3).
-//
-// Each iteration:
-//   1. GPU: smo_kkt_score → per-sample I_up / I_down violation scores.
-//   2. GPU: argmax of each score vector → (val,idx); download 2 doubles each.
-//      Stop when score_i[i] - score_j[j] < tol.
-//   3. GPU: recompute rows K[i,:] and K[j,:]; read K[i,i], K[i,j], K[j,j] (3 scalars).
-//   4. Host: standard SMO closed-form alpha pair update, clipped to [0,C].
-//   5. GPU: gradient update from the two rows. Read G[i], G[j] (2 scalars) for bias.
+// Nothing O(n²) is ever allocated or downloaded: each iteration recomputes only the
+// two needed rows K[i,:], K[j,:] on the GPU; working-set selection runs on the GPU
+// (returns just (value,index) pairs); the per-iteration scalars (K[i,i], K[i,j],
+// K[j,j], G[i], G[j]) are single-element reads.
 //
 // x: n×dim row-major samples. y must be in {-1.0,+1.0}. C, tol, max_iter: full valid
 // ranges (C>0, tol>0, max_iter>0). Returns (alpha[n], b).
@@ -153,67 +263,37 @@ pub fn gpu_smo_train(
 	let krow_j = GpuBuffer::alloc(n)?;
 	let argmax_out = GpuBuffer::alloc(2)?;
 
+	// 1-elem device scalars the conforming ops consume.
+	let gamma_buf = GpuBuffer::upload(&[gamma])?;
+	let coef0_buf = GpuBuffer::upload(&[coef0])?;
+	let degree_buf = GpuBuffer::upload(&[degree])?;
+	let c_buf = GpuBuffer::upload(&[c])?;
+	let di_buf = GpuBuffer::alloc(1)?;
+	let dj_buf = GpuBuffer::alloc(1)?;
+	let kind_u = kind as usize;
+
 	let mut alpha_host = vec![0.0_f64; n];
 	let mut b = 0.0_f64;
 	let mut b_count = 0_usize;
 
-	let argmax = |scores: &GpuBuffer| -> Result<(f64, usize), HipError> {
-		unsafe {
-			launch_smo_argmax(
-				scores.ptr_raw() as *const c_void,
-				argmax_out.ptr_raw(),
-				n as i32,
-				std::ptr::null_mut(),
-			);
-		}
-		crate::kernels::check_launch();
-		let mut o = [0.0_f64; 2];
-		argmax_out.download(&mut o)?;
-		Ok((o[0], o[1] as usize))
-	};
-	let kernel_row = |row: usize, out: &GpuBuffer| {
-		unsafe {
-			launch_smo_kernel_row(
-				x.ptr_raw() as *const c_void,
-				out.ptr_raw(),
-				n as i32,
-				dim as i32,
-				row as i32,
-				kind,
-				gamma,
-				coef0,
-				degree,
-				std::ptr::null_mut(),
-			);
-		}
-		crate::kernels::check_launch();
-	};
-
 	for _iter in 0..max_iter {
-		unsafe {
-			launch_smo_kkt_score(
-				grad_buf.ptr_raw() as *const c_void,
-				alpha_buf.ptr_raw() as *const c_void,
-				y_buf.ptr_raw() as *const c_void,
-				score_i_buf.ptr_raw(),
-				score_j_buf.ptr_raw(),
-				n as i32,
-				c,
-				std::ptr::null_mut(),
-			);
-		}
-		crate::kernels::check_launch();
+		gpu_smo_kkt_score(&grad_buf, &alpha_buf, &y_buf, &c_buf, n, &score_i_buf, &score_j_buf)?;
 
 		// Working-set selection on the GPU: i = argmax(score_i), j = argmax(score_j).
-		let (val_i, i) = argmax(&score_i_buf)?;
-		let (val_j, j) = argmax(&score_j_buf)?;
+		let mut o = [0.0_f64; 2];
+		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
+		argmax_out.download(&mut o)?;
+		let (val_i, i) = (o[0], o[1] as usize);
+		gpu_smo_argmax(&score_j_buf, n, &argmax_out)?;
+		argmax_out.download(&mut o)?;
+		let (val_j, j) = (o[0], o[1] as usize);
 		if val_i - val_j < tol {
 			break;
 		}
 
 		// Recompute only rows i and j of the kernel matrix (matrix-free).
-		kernel_row(i, &krow_i);
-		kernel_row(j, &krow_j);
+		gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, i, &krow_i)?;
+		gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, j, &krow_j)?;
 		let kii = read_at(&krow_i, i)?;
 		let kij = read_at(&krow_i, j)?;
 		let kjj = read_at(&krow_j, j)?;
@@ -253,18 +333,9 @@ pub fn gpu_smo_train(
 
 		// GPU gradient update from the two kernel rows:
 		//   G[t] += yi*delta_ai*K[i,t] + yj*delta_aj*K[j,t]
-		unsafe {
-			launch_smo_update_gradient_rows(
-				grad_buf.ptr_raw(),
-				krow_i.ptr_raw() as *const c_void,
-				krow_j.ptr_raw() as *const c_void,
-				n as i32,
-				yi * delta_ai,
-				yj * delta_aj,
-				std::ptr::null_mut(),
-			);
-		}
-		crate::kernels::check_launch();
+		write1(&di_buf, yi * delta_ai)?;
+		write1(&dj_buf, yj * delta_aj)?;
+		gpu_smo_update_gradient_rows(&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf)?;
 
 		alpha_host[i] = new_ai;
 		alpha_host[j] = new_aj;

@@ -79,8 +79,9 @@ extern "C" void launch_repeat_rows_f32(const float* src, float* dst, int cols, i
 extern "C" __global__ void layernorm_f32_kernel(
       const float* x, float* out,
       const float* gamma, const float* beta,
-      int rows, int cols, float eps
+      int rows, int cols, const float* eps_ptr
 ) {
+      float eps = eps_ptr[0];
       int row = blockIdx.x;
       if (row >= rows) return;
       const float* r = x + row * cols;
@@ -123,7 +124,7 @@ extern "C" __global__ void layernorm_f32_kernel(
 extern "C" void launch_layernorm_f32(
       const float* x, float* out,
       const float* gamma, const float* beta,
-      int rows, int cols, float eps, hipStream_t stream
+      int rows, int cols, const float* eps, hipStream_t stream
 ) {
       int threads = min(256, max(32, cols));
       hipLaunchKernelGGL(layernorm_f32_kernel, dim3(rows), dim3(threads), 0, stream,
@@ -135,8 +136,9 @@ extern "C" void launch_layernorm_f32(
 extern "C" __global__ void layernorm_backward_f32_kernel(
       const float* grad_y, const float* x, const float* gamma,
       float* grad_x, float* grad_gamma, float* grad_beta,
-      int rows, int cols, float eps
+      int rows, int cols, const float* eps_ptr
 ) {
+      float eps = eps_ptr[0];
       int row = blockIdx.x;
       if (row >= rows) return;
       const float* xr = x + row * cols;
@@ -202,7 +204,7 @@ extern "C" __global__ void layernorm_backward_f32_kernel(
 extern "C" void launch_layernorm_backward_f32(
       const float* grad_y, const float* x, const float* gamma,
       float* grad_x, float* grad_gamma, float* grad_beta,
-      int rows, int cols, float eps, hipStream_t stream
+      int rows, int cols, const float* eps, hipStream_t stream
 ) {
       int threads = min(256, max(32, cols));
       hipLaunchKernelGGL(layernorm_backward_f32_kernel, dim3(rows), dim3(threads), 0, stream,
@@ -402,4 +404,13 @@ extern "C" __global__ void mul_f16_kernel(const __half* a, const __half* b, __ha
 }
 extern "C" void launch_mul_f16(const __half* a, const __half* b, __half* out, int n, hipStream_t stream) {
       GRID256(n); hipLaunchKernelGGL(mul_f16_kernel, grid, block, 0, stream, a, b, out, n);
+}
+
+// ── SGD update f32: weights[i] -= lr[0] * grad[i] (own axpy, lr device-side) ──
+extern "C" __global__ void sgd_update_f32_kernel(const float* grad, const float* lr, float* weights, int n) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i < n) weights[i] -= lr[0] * grad[i];
+}
+extern "C" void launch_sgd_update_f32(const float* grad, const float* lr, float* weights, int n, hipStream_t stream) {
+      GRID256(n); hipLaunchKernelGGL(sgd_update_f32_kernel, grid, block, 0, stream, grad, lr, weights, n);
 }

@@ -105,8 +105,9 @@ extern "C" void launch_gqa_masked_attn(
 // through. Each row's position is row/heads_per_tok. rotary_dim == head_dim is
 // full rotary. angle = pos * theta^(-2i/rotary_dim).
 extern "C" __global__ void rope_partial(
-    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, double theta
+    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta_p
 ) {
+    double theta = *theta_p;
     int half = rotary_dim / 2;
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)rows * half;
@@ -122,7 +123,7 @@ extern "C" __global__ void rope_partial(
     b[i + half] = a0 * s + a1 * c;
 }
 extern "C" void launch_rope_partial(
-    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, double theta, hipStream_t s
+    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta, hipStream_t s
 ) {
     int t = 256;
     long total = (long)rows * (rotary_dim / 2);

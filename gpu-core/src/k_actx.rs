@@ -12,22 +12,20 @@ macro_rules! a0 {
     ($($name:ident => $launch:ident),* $(,)?) => {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void); )* }
         $(
-            pub fn $name(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
-                let o = GpuBuffer::alloc(n)?;
-                unsafe { $launch(x.ptr_raw() as *const c_void, o.ptr_raw(), n as i32, std::ptr::null_mut()); }
-                e()?; Ok(o)
+            pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, std::ptr::null_mut()); }
+                e()
             }
         )*
     };
 }
 macro_rules! a1 {
     ($($name:ident => $launch:ident),* $(,)?) => {
-        unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, p: f64, s: *mut c_void); )* }
+        unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, p: *const c_void, s: *mut c_void); )* }
         $(
-            pub fn $name(x: &GpuBuffer, n: usize, p: f64) -> Result<GpuBuffer, HipError> {
-                let o = GpuBuffer::alloc(n)?;
-                unsafe { $launch(x.ptr_raw() as *const c_void, o.ptr_raw(), n as i32, p, std::ptr::null_mut()); }
-                e()?; Ok(o)
+            pub fn $name(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, p.ptr_raw() as *const c_void, std::ptr::null_mut()); }
+                e()
             }
         )*
     };

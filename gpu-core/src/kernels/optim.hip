@@ -4,8 +4,10 @@
 // Momentum SGD: v = momentum*v - lr*g; w += v  (in-place, updates both w and v)
 extern "C" __global__ void momentum_update_kernel(
       double* w, double* v, const double* g,
-      double lr, double momentum, int n)
+      const double* lr_p, const double* momentum_p, int n)
 {
+      double lr = *lr_p;
+      double momentum = *momentum_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double vi = momentum * v[i] - lr * g[i];
@@ -16,7 +18,7 @@ extern "C" __global__ void momentum_update_kernel(
 
 extern "C" void launch_momentum_update(
       double* w, double* v, const double* g,
-      double lr, double momentum, int n, hipStream_t stream)
+      const double* lr, const double* momentum, int n, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -27,8 +29,11 @@ extern "C" void launch_momentum_update(
 // RMSProp: cache = decay*cache + (1-decay)*g^2; w -= lr*g/(sqrt(cache)+eps)
 extern "C" __global__ void rmsprop_update_kernel(
       double* w, double* cache, const double* g,
-      double lr, double decay, double eps, int n)
+      const double* lr_p, const double* decay_p, const double* eps_p, int n)
 {
+      double lr = *lr_p;
+      double decay = *decay_p;
+      double eps = *eps_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double gi = g[i];
@@ -40,7 +45,7 @@ extern "C" __global__ void rmsprop_update_kernel(
 
 extern "C" void launch_rmsprop_update(
       double* w, double* cache, const double* g,
-      double lr, double decay, double eps, int n, hipStream_t stream)
+      const double* lr, const double* decay, const double* eps, int n, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -51,8 +56,10 @@ extern "C" void launch_rmsprop_update(
 // Adagrad: accum += g^2; w -= lr*g/(sqrt(accum)+eps)
 extern "C" __global__ void adagrad_update_kernel(
       double* w, double* accum, const double* g,
-      double lr, double eps, int n)
+      const double* lr_p, const double* eps_p, int n)
 {
+      double lr = *lr_p;
+      double eps = *eps_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double gi = g[i];
@@ -64,7 +71,7 @@ extern "C" __global__ void adagrad_update_kernel(
 
 extern "C" void launch_adagrad_update(
       double* w, double* accum, const double* g,
-      double lr, double eps, int n, hipStream_t stream)
+      const double* lr, const double* eps, int n, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -76,9 +83,13 @@ extern "C" void launch_adagrad_update(
 // and accumulate ||w||^2 and ||update||^2 into single-element buffers via atomicAdd.
 extern "C" __global__ void lamb_phase1_kernel(
       double* w, double* m, double* v, const double* g,
-      double b1, double b2, double eps, double wd, int t, int n,
+      const double* b1_p, const double* b2_p, const double* eps_p, const double* wd_p, int t, int n,
       double* tmp_upd, double* w_norm_sq, double* u_norm_sq)
 {
+      double b1 = *b1_p;
+      double b2 = *b2_p;
+      double eps = *eps_p;
+      double wd = *wd_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       double local_w2 = 0.0;
       double local_u2 = 0.0;
@@ -115,12 +126,13 @@ extern "C" __global__ void lamb_phase1_kernel(
 // trust_ratio = ||w|| / ||update||, clamped to 1.0 if either norm is 0.
 extern "C" __global__ void lamb_phase2_kernel(
       double* w, const double* tmp_upd,
-      double lr, double w_norm_sq, double u_norm_sq, int n)
+      const double* lr_p, const double* w_norm_sq, const double* u_norm_sq, int n)
 {
+      double lr = *lr_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
-            double w_norm = sqrt(w_norm_sq);
-            double u_norm = sqrt(u_norm_sq);
+            double w_norm = sqrt(*w_norm_sq);
+            double u_norm = sqrt(*u_norm_sq);
             double ratio = (w_norm == 0.0 || u_norm == 0.0) ? 1.0 : w_norm / u_norm;
             w[i] -= lr * ratio * tmp_upd[i];
       }
@@ -128,7 +140,7 @@ extern "C" __global__ void lamb_phase2_kernel(
 
 extern "C" void launch_lamb_phase1(
       double* w, double* m, double* v, const double* g,
-      double b1, double b2, double eps, double wd, int t, int n,
+      const double* b1, const double* b2, const double* eps, const double* wd, int t, int n,
       double* tmp_upd, double* w_norm_sq, double* u_norm_sq,
       hipStream_t stream)
 {
@@ -140,7 +152,7 @@ extern "C" void launch_lamb_phase1(
 
 extern "C" void launch_lamb_phase2(
       double* w, const double* tmp_upd,
-      double lr, double w_norm_sq, double u_norm_sq,
+      const double* lr, const double* w_norm_sq, const double* u_norm_sq,
       int n, hipStream_t stream)
 {
       int threads = 256;
@@ -152,8 +164,12 @@ extern "C" void launch_lamb_phase2(
 // Lion: update = sign(b1*m + (1-b1)*g); w -= lr*(update + wd*w); m = b2*m + (1-b2)*g
 extern "C" __global__ void lion_update_kernel(
       double* w, double* m, const double* g,
-      double lr, double b1, double b2, double wd, int n)
+      const double* lr_p, const double* b1_p, const double* b2_p, const double* wd_p, int n)
 {
+      double lr = *lr_p;
+      double b1 = *b1_p;
+      double b2 = *b2_p;
+      double wd = *wd_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double gi = g[i];
@@ -167,7 +183,7 @@ extern "C" __global__ void lion_update_kernel(
 
 extern "C" void launch_lion_update(
       double* w, double* m, const double* g,
-      double lr, double b1, double b2, double wd, int n, hipStream_t stream)
+      const double* lr, const double* b1, const double* b2, const double* wd, int n, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -183,8 +199,12 @@ extern "C" void launch_lion_update(
 // w -= lr * m_hat_nesterov / (sqrt(v_hat) + eps)
 extern "C" __global__ void nadam_update_kernel(
       double* w, double* m, double* v, const double* g,
-      double lr, double b1, double b2, double eps, int t, int n)
+      const double* lr_p, const double* b1_p, const double* b2_p, const double* eps_p, int t, int n)
 {
+      double lr = *lr_p;
+      double b1 = *b1_p;
+      double b2 = *b2_p;
+      double eps = *eps_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double gi = g[i];
@@ -205,7 +225,7 @@ extern "C" __global__ void nadam_update_kernel(
 
 extern "C" void launch_nadam_update(
       double* w, double* m, double* v, const double* g,
-      double lr, double b1, double b2, double eps, int t, int n, hipStream_t stream)
+      const double* lr, const double* b1, const double* b2, const double* eps, int t, int n, hipStream_t stream)
 {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
@@ -214,7 +234,9 @@ extern "C" void launch_nadam_update(
 }
 
 // Clip value in-place: x[i] = clamp(x[i], lo, hi)
-extern "C" __global__ void clip_value_kernel(double* x, double lo, double hi, int n) {
+extern "C" __global__ void clip_value_kernel(double* x, const double* lo_p, const double* hi_p, int n) {
+      double lo = *lo_p;
+      double hi = *hi_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) {
             double v = x[i];
@@ -224,7 +246,7 @@ extern "C" __global__ void clip_value_kernel(double* x, double lo, double hi, in
       }
 }
 
-extern "C" void launch_clip_value(double* x, double lo, double hi, int n, hipStream_t stream) {
+extern "C" void launch_clip_value(double* x, const double* lo, const double* hi, int n, hipStream_t stream) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(clip_value_kernel, dim3(blocks), dim3(threads), 0, stream,

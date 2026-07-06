@@ -13,8 +13,9 @@
 
 extern "C" __global__ void diffusionx_entropy_gated_step_kernel(
     const double* logits, const double* canvas, double* accepted, double* renoise,
-    double bound, int n_positions, int vocab
+    const double* bound_, int n_positions, int vocab
 ) {
+    double bound = *bound_;
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_positions) return;
     const double* row = logits + (long)p * vocab;
@@ -50,7 +51,7 @@ extern "C" __global__ void diffusionx_entropy_gated_step_kernel(
 }
 extern "C" void launch_diffusionx_entropy_gated_step(
     const double* logits, const double* canvas, double* accepted, double* renoise,
-    double bound, int n_positions, int vocab, hipStream_t s
+    const double* bound, int n_positions, int vocab, hipStream_t s
 ) {
     dim3 block(256); dim3 grid((n_positions + 255) / 256);
     hipLaunchKernelGGL(diffusionx_entropy_gated_step_kernel, grid, block, 0, s,
