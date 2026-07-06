@@ -1338,6 +1338,7 @@ unsafe extern "C" {
 		y: *const c_void,
 		da: *mut c_void,
 		n: i32,
+		inv_n: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_argmax_acc(
@@ -2784,13 +2785,20 @@ pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuf
 }
 
 /// Two-sided binary cross-entropy gradient da = (pred-y)/(pred(1-pred))/n, element-wise.
-pub fn gpu_bce_grad_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, da: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_bce_grad_into(
+	pred: &GpuBuffer,
+	y: &GpuBuffer,
+	inv_n: &GpuBuffer,
+	n: usize,
+	da: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_bce_grad(
 			pred.ptr as *const c_void,
 			y.ptr as *const c_void,
 			da.ptr,
 			n as i32,
+			inv_n.ptr as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}

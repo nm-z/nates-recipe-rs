@@ -126,8 +126,8 @@ extern "C" void launch_argmax_acc(const double* pred, const double* y, double* o
 // Two-sided BCE: dL/dp = -y/p + (1-y)/(1-p) = (p-y)/(p(1-p)). Element-wise into
 // da (no reduction). p clamped to [eps, 1-eps] so the division stays finite at
 // the sigmoid tails. Paired with a sigmoid output this chains to dz = p-y.
-__global__ void bce_grad_kernel(const double* pred, const double* y, double* da, int n) {
-      double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
+__global__ void bce_grad_kernel(const double* pred, const double* y, double* da, int n, const double* inv_n_p) {
+      double inv_n = *inv_n_p;
       const double eps = 1e-7;
       for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
             double p = pred[i];
@@ -136,10 +136,10 @@ __global__ void bce_grad_kernel(const double* pred, const double* y, double* da,
       }
 }
 
-extern "C" void launch_bce_grad(const double* pred, const double* y, double* da, int n, void* stream) {
+extern "C" void launch_bce_grad(const double* pred, const double* y, double* da, int n, const double* inv_n, void* stream) {
       int blocks = (n + BLOCK - 1) / BLOCK;
       if (blocks < 1) blocks = 1;
       if (blocks > 65535) blocks = 65535;
       hipLaunchKernelGGL(bce_grad_kernel, dim3(blocks), dim3(BLOCK), 0, (hipStream_t)stream,
-                         pred, y, da, n);
+                         pred, y, da, n, inv_n);
 }

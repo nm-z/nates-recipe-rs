@@ -122,13 +122,13 @@ extern "C" void launch_focal_loss(
 // convention so it can drop into the training loop with no allocation).
 extern "C" __global__ void focal_grad_kernel(
       const double* prob, const double* target, double* grad_out,
-      int n, const double* gamma_p, const double* alpha_p
+      int n, const double* gamma_p, const double* alpha_p, const double* inv_n_p
 ) {
       double gamma = *gamma_p;
       double alpha = *alpha_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
-      double inv_n = (n > 0) ? 1.0 / (double)n : 0.0;
+      double inv_n = *inv_n_p;
       double p = prob[i];
       double t = target[i];
       double eps = 1e-12;
@@ -147,12 +147,12 @@ extern "C" __global__ void focal_grad_kernel(
 
 extern "C" void launch_focal_grad(
       const double* prob, const double* target, double* grad_out,
-      int n, const double* gamma, const double* alpha, hipStream_t stream
+      int n, const double* gamma, const double* alpha, const double* inv_n, hipStream_t stream
 ) {
       int threads = 256;
       int blocks = (n + threads - 1) / threads;
       hipLaunchKernelGGL(focal_grad_kernel, dim3(blocks), dim3(threads), 0, stream,
-            prob, target, grad_out, n, gamma, alpha);
+            prob, target, grad_out, n, gamma, alpha, inv_n);
 }
 
 // ── KL divergence (categorical) ───────────────────────────────────────────

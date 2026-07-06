@@ -43,6 +43,7 @@ unsafe extern "C" {
 		n: i32,
 		gamma: *const c_void,
 		alpha: *const c_void,
+		inv_n: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_kl_div_loss(
@@ -210,6 +211,7 @@ pub fn gpu_focal_grad_into(
 	target: &GpuBuffer,
 	gamma: &GpuBuffer,
 	alpha: &GpuBuffer,
+	inv_n: &GpuBuffer,
 	n: usize,
 	grad_out: &GpuBuffer,
 ) -> Result<(), HipError> {
@@ -221,6 +223,7 @@ pub fn gpu_focal_grad_into(
 			n as i32,
 			gamma.ptr_raw() as *const c_void,
 			alpha.ptr_raw() as *const c_void,
+			inv_n.ptr_raw() as *const c_void,
 			std::ptr::null_mut(),
 		);
 	}

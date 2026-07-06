@@ -159,14 +159,16 @@ impl ModelInner {
 				kernels::gpu_sub_scale_into(da, y, &ss.inv_n, total, da).expect("ce grad"); // da = (softmax − y)/n
 			}
 			Loss::Bce => {
-				// Two-sided BCE gradient (p-y)/(p(1-p))/n — not the one-sided
-				// -y/p. With a sigmoid output this chains to dz = p-y.
-				kernels::gpu_bce_grad_into(out, y, total, da).expect("bce grad");
+				// Two-sided BCE gradient (p-y)/(p(1-p))·(1/n) — not the one-sided
+				// -y/p. With a sigmoid output this chains to dz = p-y. The global
+				// 1/n rides ss.inv_n like every other loss, so per-window OOC
+				// calls come out at full-batch scale with no rescale.
+				kernels::gpu_bce_grad_into(out, y, &ss.inv_n, total, da).expect("bce grad");
 			}
 			Loss::Focal => {
-				// d focal / d prob, scaled 1/n. `out` is the sigmoid prob; this
-				// chains through the sigmoid backward like Bce.
-				gpu_core::losses::gpu_focal_grad_into(out, y, &sc.c_focal_gamma, &sc.c_focal_alpha, total, da).expect("focal grad");
+				// d focal / d prob, scaled by ss.inv_n. `out` is the sigmoid
+				// prob; this chains through the sigmoid backward like Bce.
+				gpu_core::losses::gpu_focal_grad_into(out, y, &sc.c_focal_gamma, &sc.c_focal_alpha, &ss.inv_n, total, da).expect("focal grad");
 			}
 		}
 	}
