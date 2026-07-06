@@ -318,6 +318,7 @@ pub fn gpu_fill_sentinel(
 	Ok(())
 }
 
+// in-place: writes idx (iota init)
 pub fn gpu_init_idx(idx: &GpuBuffer, n: usize) -> Result<(), HipError> {
 	unsafe {
 		launch_init_idx(idx.ptr_raw(), safe_i32(n), std::ptr::null_mut());
@@ -326,6 +327,7 @@ pub fn gpu_init_idx(idx: &GpuBuffer, n: usize) -> Result<(), HipError> {
 	Ok(())
 }
 
+// in-place: writes data (one compare-exchange stage)
 pub fn gpu_bitonic_step(
 	data: &GpuBuffer,
 	j: usize,
@@ -345,6 +347,7 @@ pub fn gpu_bitonic_step(
 	Ok(())
 }
 
+// in-place: writes keys+idx (keyed stage)
 pub fn gpu_bitonic_step_idx(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,
@@ -366,6 +369,7 @@ pub fn gpu_bitonic_step_idx(
 	Ok(())
 }
 
+// in-place: writes keys+vals (key/value stage)
 pub fn gpu_bitonic_step_dd(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,

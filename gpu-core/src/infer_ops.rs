@@ -63,6 +63,7 @@ unsafe extern "C" {
 /// first `rotary_dim` dims of each head rotate (rotate-half); the rest pass
 /// through. Row `r`'s position is `r / heads_per_tok`. `rotary_dim == head_dim`
 /// gives full rotary. `theta` is a caller-supplied 1-elem device buffer.
+// in-place: writes x (rotary embedding over leading dims)
 pub fn gpu_rope_partial(
 	buf: &GpuBuffer,
 	theta: &GpuBuffer,
@@ -216,6 +217,7 @@ pub fn gpu_gemm_bt_f64(a: &GpuBuffer, b: &GpuBuffer, m: usize, n: usize, k: usiz
 
 /// In-place scale `x *= scalar` (no alloc, no copy). `scalar` is a caller-
 /// supplied 1-elem device buffer.
+// in-place: writes x (x *= scalar)
 pub fn gpu_scale_f64_inplace(x: &GpuBuffer, scalar: &GpuBuffer, n: usize) -> Result<(), HipError> {
 	unsafe {
 		launch_scale_f64(x.ptr_raw(), scalar.ptr_raw() as *const c_void, n as i64, std::ptr::null_mut());

@@ -51,8 +51,19 @@ for fname in sorted(os.listdir(SRC)):
       # `// not-an-op: <reason>` on the line above a pub fn excludes it from the op
       # set (drivers/plumbing/plan-helpers). Audited: --check prints every one.
       annotated = {}
+      inplace = {}
       raw_lines = raw.split("\n")
       for ln, line in enumerate(raw_lines):
+            ip = re.search(r"//\s*in-place:\s*(.+)", line)
+            if ip:
+                  for la in range(ln + 1, min(ln + 30, len(raw_lines))):
+                        fm = re.search(r"\bpub(\(crate\))?\s+(unsafe\s+)?fn\s+(\w+)", raw_lines[la])
+                        if fm:
+                              inplace[fm.group(3)] = ip.group(1).strip()
+                              break
+                        t = raw_lines[la].strip()
+                        if t and not t.startswith(("//", "#[", "#!")):
+                              break
             m = re.search(r"//\s*not-an-op:\s*(.+)", line)
             if not m:
                   continue
@@ -147,7 +158,8 @@ for fname in sorted(os.listdir(SRC)):
             kind2 = "ffi" if (ctx_kind == "extern" or is_decl) else ("plumbing" if mod in PLUMBING else "op")
             line_no = text.count("\n", 0, p) + 1
             rows.append(dict(module=mod, kind=kind2, name=name, line=line_no, recv=recv,
-                             inputs=ins, output=ret, not_an_op=annotated.get(name)))
+                             inputs=ins, output=ret, not_an_op=annotated.get(name),
+                             in_place=inplace.get(name)))
 
 print(json.dumps(counts), file=sys.stderr)
 print(f"total parsed: {len(rows)}", file=sys.stderr)
@@ -172,11 +184,18 @@ def is_plan_helper(r):
             and r["name"].endswith("_workspace_bytes")
 
 if "--check" in sys.argv:
-      excluded = [r for r in rows if r["kind"] == "op" and r["not_an_op"]]
+      all_op = [r for r in rows if r["kind"] == "op"]
+      excluded = [r for r in all_op if r["not_an_op"]]
+      allow_only = [r for r in all_op if r["name"] in ALLOW and not r["not_an_op"]]
+      helpers = [r for r in all_op
+                 if is_plan_helper(r) and not r["not_an_op"] and r["name"] not in ALLOW]
+      gated = [r for r in all_op
+               if not r["not_an_op"] and r["name"] not in ALLOW and not is_plan_helper(r)]
+      # THE partition law: every op-module fn is in exactly one bucket.
+      assert len(all_op) == len(gated) + len(excluded) + len(helpers) + len(allow_only), \
+            f"partition broken: {len(all_op)} != {len(gated)}+{len(excluded)}+{len(helpers)}+{len(allow_only)}"
       viols = []
-      for r in rows:
-            if r["kind"] != "op" or r["name"] in ALLOW or is_plan_helper(r) or r["not_an_op"]:
-                  continue
+      for r in gated:
             why = []
             if r["recv"]:
                   why.append(f"method receiver {r['recv']}")
@@ -185,6 +204,15 @@ if "--check" in sys.argv:
                         why.append(f"input {t}")
             if r["output"] != "Result<()>":
                   why.append(f"returns {r['output']}")
+            cls = "".join("B" if t == "&GpuBuffer" else "U" for t in r["inputs"])
+            if not re.fullmatch(r"B*U*B*", cls):
+                  why.append(f"param order {cls} not (ins,dims,outs)")
+            if not cls.endswith("B"):
+                  # no trailing out block: must be a declared in-place mutator,
+                  # else it computes nothing anyone can read — dead-op flag.
+                  named = "inplace" in r["name"] or r["name"].endswith("_into")
+                  if not (named or r["in_place"]):
+                        why.append("no out block and not in-place-named/annotated")
             if why:
                   viols.append((r, why))
       by_clause = Counter()
@@ -193,9 +221,10 @@ if "--check" in sys.argv:
                   by_clause[w.split(" ")[0] + " " + (w.split(" ")[1] if w.startswith(("input", "returns")) else "")] += 1
       for r, why in sorted(viols, key=lambda v: (v[0]["module"], v[0]["line"])):
             print(f"VIOLATION gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {'; '.join(why)}")
-      n_ops = sum(1 for r in rows if r["kind"] == "op" and r["name"] not in ALLOW
-                  and not is_plan_helper(r) and not r["not_an_op"])
-      print(f"\n--check: {n_ops} ops, {n_ops - len(viols)} conforming, {len(viols)} violating")
+      print(f"\n--check: {len(gated)} ops, {len(gated) - len(viols)} conforming, {len(viols)} violating")
+      print(f"partition: {len(all_op)} op-module fns = {len(gated)} gated"
+            f" + {len(excluded)} not-an-op + {len(helpers)} plan-helpers"
+            f" + {len(allow_only)} allowlisted  [asserted]")
       for clause, n in by_clause.most_common():
             print(f"  {n:4d}  {clause}")
       if excluded:

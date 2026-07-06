@@ -40,6 +40,7 @@ pub const ROPE_THETA: f64 = 10000.0;
 /// (Q_rot = R(angle)·Q), `-1.0` backward (un-rotate a gradient — a rotation's
 /// inverse is itself negated). `theta`: 1-elem f64 base-frequency buffer.
 /// q,k are mutated in place (serve as both input and output).
+// in-place: writes q+k (rotary over heads)
 pub fn gpu_rope_qk_heads_inplace(
 	q: &GpuBuffer,
 	k: &GpuBuffer,

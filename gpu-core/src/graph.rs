@@ -171,6 +171,7 @@ pub fn gpu_degree(
 
 // Scale each row of a node-feature matrix by deg[node]^{-1/2} in place (GCN normalization).
 // features: n_nodes x feat (f64, in-place out). deg: n_nodes (f64).
+// in-place: writes features (D^-1/2 A D^-1/2 normalization)
 pub fn gpu_gcn_norm(
 	features: &GpuBuffer,
 	deg: &GpuBuffer,

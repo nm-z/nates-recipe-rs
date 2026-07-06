@@ -3871,8 +3871,8 @@ pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, n: usize, grad: &
 
 pub fn gpu_softmax_ce_class_grad_f32(
 	class_ptr_buf: &GpuBuffer,
-	nc: usize,
 	targets: &GpuBuffer,
+	nc: usize,
 	k: usize,
 	n: usize,
 	grad: &GpuBuffer,
