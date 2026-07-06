@@ -11,8 +11,8 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_gelu_mul_into, gpu_gemm_bt_f64_into, gpu_glu_gelu_into, gpu_gqa_attn_into,
-	gpu_rmsnorm_f64_into, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16_into,
+	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
+	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
 };
 use gpu_core::kernels::gpu_add_into;
 use gpu_core::memory::GpuBuffer;
@@ -107,14 +107,13 @@ struct Dims {
 	hd: usize,
 	nkv: usize,
 	rotary: usize,
-	theta: f64,
 	has_v: bool,
 }
 fn dims(l: usize) -> Dims {
 	if l % 6 == 5 {
-		Dims { hd: 512, nkv: 2, rotary: 128, theta: 1_000_000.0, has_v: false }
+		Dims { hd: 512, nkv: 2, rotary: 128, has_v: false }
 	} else {
-		Dims { hd: 256, nkv: 8, rotary: 256, theta: 10_000.0, has_v: true }
+		Dims { hd: 256, nkv: 8, rotary: 256, has_v: true }
 	}
 }
 
@@ -288,8 +287,13 @@ struct Model {
 	rw: Vec<Vec<f64>>,  // router.proj (NEXP,NE)
 	gis: Vec<Vec<f64>>, // router.scale (NE,)
 	pe: Vec<Vec<f64>>,  // router.per_expert_scale (NEXP,)
-	ls: Vec<f64>,       // layer_scalar
 	emb: Vec<u8>,       // embed_tokens bf16 bytes (VOCAB*NE*2)
+	// device-side scalars, uploaded once (rmsnorm eps, rope theta per geometry,
+	// per-layer layer_scalar) — reused every step, never re-uploaded in the loop.
+	eps: GpuBuffer,
+	theta_full: GpuBuffer,  // full-attention layers (theta 1e6)
+	theta_slide: GpuBuffer, // sliding layers (theta 1e4)
+	ls_dev: Vec<GpuBuffer>, // layer_scalar, one 1-elem buffer per layer
 }
 
 const LAYER_NORMS: [(&str, &str); 9] = [
@@ -345,7 +349,7 @@ impl Model {
 	// next widen (stream-ordered, so enqueued GEMMs read it first).
 	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> GpuBuffer {
 		let _w = Instant::now();
-		gpu_widen_bf16_into(&bview(src, off_bytes, n * 2), &self.win, n);
+		gpu_widen_bf16(&bview(src, off_bytes, n * 2), n, &self.win).expect("widen_bf16 launch");
 		acc(&WIDEN_NS, _w);
 		self.win.view(0, n)
 	}
@@ -476,8 +480,11 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		rw: Vec::new(),
 		gis: Vec::new(),
 		pe: Vec::new(),
-		ls: Vec::new(),
 		emb: Vec::new(),
+		eps: GpuBuffer::upload(&[EPS])?,
+		theta_full: GpuBuffer::upload(&[1_000_000.0f64])?,
+		theta_slide: GpuBuffer::upload(&[10_000.0f64])?,
+		ls_dev: Vec::new(),
 	};
 
 	// Per-layer resident tensors.
@@ -493,7 +500,8 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		m.rw.push(m.small_f64(&p("router.proj.weight"))?);
 		m.gis.push(m.small_f64(&p("router.scale"))?);
 		m.pe.push(m.small_f64(&p("router.per_expert_scale"))?);
-		m.ls.push(m.small_f64(&p("layer_scalar"))?[0]);
+		let lsv = m.small_f64(&p("layer_scalar"))?[0];
+		m.ls_dev.push(GpuBuffer::upload(&[lsv])?);
 	}
 
 	// Globals.
@@ -534,13 +542,13 @@ fn fixed_names(l: usize) -> Vec<String> {
 // rocBLAS grows its workspace on first use per shape class, and the waterfall
 // takes ALL remaining VRAM, so the workspace must exist first.
 fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
-	gpu_gemm_bt_f64_into(&ar.x, &m.win.view(0, 8192 * NE), &ar.q, t, 8192, NE);
+	gpu_gemm_bt_f64(&ar.x, &m.win.view(0, 8192 * NE), t, 8192, NE, &ar.q)?;
 	beat();
-	gpu_gemm_bt_f64_into(&ar.cms, &m.win.view(0, NFF * NE), &ar.g, t, NFF, NE);
+	gpu_gemm_bt_f64(&ar.cms, &m.win.view(0, NFF * NE), t, NFF, NE, &ar.g)?;
 	beat();
-	gpu_gemm_bt_f64_into(&ar.act, &m.win.view(0, NE * NFF), &ar.mlp0, t, NE, NFF);
+	gpu_gemm_bt_f64(&ar.act, &m.win.view(0, NE * NFF), t, NE, NFF, &ar.mlp0)?;
 	beat();
-	gpu_gemm_bt_f64_into(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), &ar.moe_gu, t, 2 * NFFE, NE);
+	gpu_gemm_bt_f64(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), t, 2 * NFFE, NE, &ar.moe_gu)?;
 	gpu_core::hip::device_synchronize()?;
 	beat();
 	Ok(())
@@ -647,41 +655,42 @@ fn layer(
 	let nm = &m.norms[l];
 	let d = dims(l);
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, NQH * d.hd, d.nkv * d.hd);
+	let theta = if l % 6 == 5 { &m.theta_full } else { &m.theta_slide };
 	// Attention. Full layers have no v_proj: v reuses the k_proj weight window.
 	let _ta = Instant::now();
-	gpu_rmsnorm_f64_into(h_in, Some(&nm["input"]), &ar.x, t, NE, EPS);
-	gpu_gemm_bt_f64_into(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, &ar.q, t, qd, NE);
+	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, NE, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, NE, &ar.q)?;
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
-	gpu_gemm_bt_f64_into(&ar.x, &wk, &ar.k, t, kd, NE);
+	gpu_gemm_bt_f64(&ar.x, &wk, t, kd, NE, &ar.k)?;
 	if d.has_v {
-		gpu_gemm_bt_f64_into(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, &ar.v, t, kd, NE);
+		gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, NE, &ar.v)?;
 	} else {
-		gpu_gemm_bt_f64_into(&ar.x, &wk, &ar.v, t, kd, NE);
+		gpu_gemm_bt_f64(&ar.x, &wk, t, kd, NE, &ar.v)?;
 	}
-	gpu_rmsnorm_f64_into(&ar.q, Some(&nm["q_norm"]), &ar.q, t * NQH, hd, EPS);
-	gpu_rmsnorm_f64_into(&ar.k, Some(&nm["k_norm"]), &ar.k, t * nkv, hd, EPS);
-	gpu_rmsnorm_f64_into(&ar.v, None, &ar.v, t * nkv, hd, EPS);
-	gpu_rope_partial(&ar.q, t * NQH, hd, d.rotary, NQH, d.theta);
-	gpu_rope_partial(&ar.k, t * nkv, hd, d.rotary, nkv, d.theta);
-	gpu_gqa_attn_into(&ar.q, &ar.k, &ar.v, &ar.attn, t, NQH, nkv, hd, prefix);
-	gpu_gemm_bt_f64_into(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, &ar.o, t, NE, qd);
-	gpu_rmsnorm_f64_into(&ar.o, Some(&nm["post_attn"]), &ar.o, t, NE, EPS);
-	gpu_add_into(&ar.o, h_in, &ar.attn_out, t * NE);
+	gpu_rmsnorm_f64(&ar.q, &nm["q_norm"], &m.eps, t * NQH, hd, &ar.q)?;
+	gpu_rmsnorm_f64(&ar.k, &nm["k_norm"], &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
+	gpu_rope_partial(&ar.q, theta, t * NQH, hd, d.rotary, NQH)?;
+	gpu_rope_partial(&ar.k, theta, t * nkv, hd, d.rotary, nkv)?;
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, NQH, nkv, hd, prefix, &ar.attn)?;
+	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, NE, qd, &ar.o)?;
+	gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, NE, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * NE, &ar.attn_out)?;
 	acc(&ATTN_NS, _ta);
 
 	// Shared MLP branch.
 	let _tm = Instant::now();
-	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pre_ff"]), &ar.cms, t, NE, EPS);
-	gpu_gemm_bt_f64_into(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, &ar.g, t, NFF, NE);
-	gpu_gemm_bt_f64_into(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, &ar.u, t, NFF, NE);
-	gpu_gelu_mul_into(&ar.g, &ar.u, &ar.act, t * NFF);
-	gpu_gemm_bt_f64_into(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, &ar.mlp0, t, NE, NFF);
-	gpu_rmsnorm_f64_into(&ar.mlp0, Some(&nm["pf1"]), &ar.mlp, t, NE, EPS);
+	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, NE, &ar.cms)?;
+	gpu_gemm_bt_f64(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, t, NFF, NE, &ar.g)?;
+	gpu_gemm_bt_f64(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, t, NFF, NE, &ar.u)?;
+	gpu_gelu_mul(&ar.g, &ar.u, t * NFF, &ar.act)?;
+	gpu_gemm_bt_f64(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, t, NE, NFF, &ar.mlp0)?;
+	gpu_rmsnorm_f64(&ar.mlp0, &nm["pf1"], &m.eps, t, NE, &ar.mlp)?;
 	acc(&MLP_NS, _tm);
 
 	// MoE branch — routing + grouping on host, expert GEMMs on GPU.
 	let _tmoe = Instant::now();
-	gpu_rmsnorm_f64_into(&ar.attn_out, Some(&nm["pn2"]), &ar.cmoes, t, NE, EPS);
+	gpu_rmsnorm_f64(&ar.attn_out, &nm["pn2"], &m.eps, t, NE, &ar.cmoes)?;
 	let _rt = Instant::now();
 	let ao_host = ar.attn_out.download_vec()?;
 	let cmoes_host = ar.cmoes.download_vec()?;
@@ -723,10 +732,10 @@ fn layer(
 		acc(&MOE_RT_NS, _rt);
 		let es = m.expert_slot(l, e)?;
 		let gu_w = m.widen_from(&es, 0, 2 * NFFE * NE);
-		gpu_gemm_bt_f64_into(&ar.moe_xg, &gu_w, &ar.moe_gu, np, 2 * NFFE, NE);
-		gpu_glu_gelu_into(&ar.moe_gu, &ar.moe_ea, np, NFFE);
+		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * NFFE, NE, &ar.moe_gu)?;
+		gpu_glu_gelu(&ar.moe_gu, np, NFFE, &ar.moe_ea)?;
 		let dn_w = m.widen_from(&es, GU_BYTES, NE * NFFE);
-		gpu_gemm_bt_f64_into(&ar.moe_ea, &dn_w, &ar.moe_dv, np, NE, NFFE);
+		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, NE, NFFE, &ar.moe_dv)?;
 		let _rt = Instant::now();
 		ar.moe_dv.download(&mut dv_host[..np * NE])?;
 		acc(&MOE_RT_NS, _rt);
@@ -738,14 +747,14 @@ fn layer(
 		}
 	}
 	ar.mo.load(&mo_host)?;
-	gpu_rmsnorm_f64_into(&ar.mo, Some(&nm["pf2"]), &ar.mop, t, NE, EPS);
+	gpu_rmsnorm_f64(&ar.mo, &nm["pf2"], &m.eps, t, NE, &ar.mop)?;
 	acc(&MOE_NS, _tmoe);
 
 	// Combine: post_ffw_norm(mlp+moe), then (attn_out + comb) * layer_scalar.
-	gpu_add_into(&ar.mlp, &ar.mop, &ar.comb, t * NE);
-	gpu_rmsnorm_f64_into(&ar.comb, Some(&nm["pfw"]), &ar.comb, t, NE, EPS);
-	gpu_add_into(&ar.attn_out, &ar.comb, h_out, t * NE);
-	gpu_scale_f64_inplace(h_out, m.ls[l], t * NE);
+	gpu_add_into(&ar.mlp, &ar.mop, t * NE, &ar.comb)?;
+	gpu_rmsnorm_f64(&ar.comb, &nm["pfw"], &m.eps, t, NE, &ar.comb)?;
+	gpu_add_into(&ar.attn_out, &ar.comb, t * NE, h_out)?;
+	gpu_scale_f64_inplace(h_out, &m.ls_dev[l], t * NE)?;
 	Ok(())
 }
 
@@ -771,7 +780,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 				m.widen_from(&m.stage, 0, cn * NE)
 			}
 		};
-		gpu_gemm_bt_f64_into(hfs, &w, &ar.lm_out, ncanvas, cn, NE);
+		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, NE, &ar.lm_out)?;
 		ar.lm_out.download(&mut out_host[..ncanvas * cn])?;
 		for p in 0..ncanvas {
 			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
@@ -976,15 +985,15 @@ fn main() -> Result<()> {
 				}
 			}
 			ar.soft.load(&soft)?;
-			gpu_rmsnorm_f64_into(&ar.soft, Some(&m.sc_pre), &ar.scn, NCANVAS, NE, EPS);
-			gpu_gemm_bt_f64_into(&ar.scn, &m.sc_gate, &ar.sg, NCANVAS, NFF, NE);
-			gpu_gemm_bt_f64_into(&ar.scn, &m.sc_up, &ar.su, NCANVAS, NFF, NE);
-			gpu_gelu_mul_into(&ar.sg, &ar.su, &ar.sa, NCANVAS * NFF);
-			gpu_gemm_bt_f64_into(&ar.sa, &m.sc_down, &ar.sc_add, NCANVAS, NE, NFF);
-			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, &ar.cur, clen);
-			gpu_rmsnorm_f64_into(&ar.cur, None, &ar.normed, NCANVAS, NE, EPS);
+			gpu_rmsnorm_f64(&ar.soft, &m.sc_pre, &m.eps, NCANVAS, NE, &ar.scn)?;
+			gpu_gemm_bt_f64(&ar.scn, &m.sc_gate, NCANVAS, NFF, NE, &ar.sg)?;
+			gpu_gemm_bt_f64(&ar.scn, &m.sc_up, NCANVAS, NFF, NE, &ar.su)?;
+			gpu_gelu_mul(&ar.sg, &ar.su, NCANVAS * NFF, &ar.sa)?;
+			gpu_gemm_bt_f64(&ar.sa, &m.sc_down, NCANVAS, NE, NFF, &ar.sc_add)?;
+			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, clen, &ar.cur)?;
+			gpu_rmsnorm_f64_nogamma(&ar.cur, &m.eps, NCANVAS, NE, &ar.normed)?;
 		} else {
-			gpu_rmsnorm_f64_into(&ar.ha.view(coff, clen), None, &ar.normed, NCANVAS, NE, EPS);
+			gpu_rmsnorm_f64_nogamma(&ar.ha.view(coff, clen), &m.eps, NCANVAS, NE, &ar.normed)?;
 		}
 		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
 
@@ -1015,7 +1024,7 @@ fn main() -> Result<()> {
 		}
 
 		// LM head over canvas positions.
-		gpu_rmsnorm_f64_into(&hbuf.view(coff, clen), Some(&m.decoder_norm), &ar.hfs, NCANVAS, NE, EPS);
+		gpu_rmsnorm_f64(&hbuf.view(coff, clen), &m.decoder_norm, &m.eps, NCANVAS, NE, &ar.hfs)?;
 		let logits = lm_head(&m, &ar.hfs, NCANVAS, &ar)?;
 
 		// Sample each canvas position (top-50, temperature, xorshift) — host.
