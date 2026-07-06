@@ -5,8 +5,8 @@
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
-	Activation, ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerKind, LayerParams, LayerSpec,
-	Loss, Metric, Scaler, Scratch, build_layer_params, concat_layer, download_scalar,
+	Activation, LayerKind, LayerParams, LayerSpec,
+	Loss, Metric, Scaler, Scratch, build_layer_params, concat_layer,
 	forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
 	pinned_vocab, upload, zscore_apply, zscore_fit,
 };
@@ -100,6 +100,28 @@ fn fmt_axis(v: f64) -> String {
 		format!("{v:.3}")
 	}
 }
+/// Per-fit device-scalar operands the SGD/loss-grad ops now take as 1-elem
+/// buffers instead of host f64s: `neg_lr` (= -lr, the DAXPY step), `inv_n`
+/// (= 1/n) and `two_inv_n` (= 2/n) for the batch-mean loss gradient, and a
+/// reusable `zero` for async accumulator clears. Uploaded ONCE per fit (before
+/// the AllocGuard freeze) and reused every epoch — never re-uploaded in-loop.
+pub(crate) struct StepScalars {
+	pub neg_lr: GpuBuffer,
+	pub inv_n: GpuBuffer,
+	pub two_inv_n: GpuBuffer,
+	pub zero: GpuBuffer,
+}
+impl StepScalars {
+	pub(crate) fn new(lr: f64, n: usize) -> StepScalars {
+		let inv = 1.0 / n as f64;
+		StepScalars {
+			neg_lr: GpuBuffer::upload(&[-lr]).expect("neg_lr"),
+			inv_n: GpuBuffer::upload(&[inv]).expect("inv_n"),
+			two_inv_n: GpuBuffer::upload(&[2.0 * inv]).expect("two_inv_n"),
+			zero: GpuBuffer::upload(&[0.0]).expect("zero"),
+		}
+	}
+}
 impl ModelInner {
 	/// dL/dA at the output for the chosen loss, scaled by 1/n (batch mean),
 	/// written in place into `da` with no allocation. `out` = predictions,
@@ -112,19 +134,20 @@ impl ModelInner {
 		da: &GpuBuffer,
 		n: usize,
 		total: usize,
+		sc: &Scratch,
+		ss: &StepScalars,
 	) {
-		let inv = 1.0 / n as f64;
 		match loss {
-			Loss::Mse => kernels::gpu_sub_scale_into(out, y, da, total, 2.0 * inv),
+			Loss::Mse => kernels::gpu_sub_scale_into(out, y, &ss.two_inv_n, total, da).expect("mse grad"),
 			Loss::Mae => {
-				kernels::gpu_sub_scale_into(out, y, da, total, 1.0);
-				kernels::gpu_sign_into(da, da, total);
-				kernels::gpu_scale_inplace(da, inv, total);
+				kernels::gpu_sub_scale_into(out, y, &sc.c_one, total, da).expect("mae sub");
+				kernels::gpu_sign_into(da, total, da).expect("mae sign");
+				kernels::gpu_scale_inplace(&ss.inv_n, total, da).expect("mae scale");
 			}
 			Loss::Huber => {
-				kernels::gpu_sub_scale_into(out, y, da, total, 1.0);
-				kernels::gpu_clamp_into(da, da, total, -1.0, 1.0);
-				kernels::gpu_scale_inplace(da, inv, total);
+				kernels::gpu_sub_scale_into(out, y, &sc.c_one, total, da).expect("huber sub");
+				kernels::gpu_clamp_into(da, &sc.c_neg_one, &sc.c_one, total, da).expect("huber clamp");
+				kernels::gpu_scale_inplace(&ss.inv_n, total, da).expect("huber scale");
 			}
 			Loss::Ce => {
 				// Categorical CE fused with softmax: dz = (softmax(logits) − y)/n,
@@ -132,18 +155,18 @@ impl ModelInner {
 				// couples the k outputs (they sum to 1) — unlike Bce's per-output
 				// independence. With a Linear output, backward's grad = da = dz.
 				let k = total / n;
-				kernels::gpu_softmax_rows_into(out, da, n, k); // da = softmax(logits)
-				kernels::gpu_sub_scale_into(da, y, da, total, inv); // da = (softmax − y)/n
+				kernels::gpu_softmax_rows_into(out, n, k, da).expect("ce softmax"); // da = softmax(logits)
+				kernels::gpu_sub_scale_into(da, y, &ss.inv_n, total, da).expect("ce grad"); // da = (softmax − y)/n
 			}
 			Loss::Bce => {
 				// Two-sided BCE gradient (p-y)/(p(1-p))/n — not the one-sided
 				// -y/p. With a sigmoid output this chains to dz = p-y.
-				kernels::gpu_bce_grad_into(out, y, da, total);
+				kernels::gpu_bce_grad_into(out, y, total, da).expect("bce grad");
 			}
 			Loss::Focal => {
 				// d focal / d prob, scaled 1/n. `out` is the sigmoid prob; this
 				// chains through the sigmoid backward like Bce.
-				gpu_core::losses::gpu_focal_grad_into(out, y, da, FOCAL_GAMMA, FOCAL_ALPHA, total);
+				gpu_core::losses::gpu_focal_grad_into(out, y, &sc.c_focal_gamma, &sc.c_focal_alpha, total, da).expect("focal grad");
 			}
 		}
 	}
@@ -368,6 +391,7 @@ impl ModelInner {
 		da_below: &GpuBuffer,
 		n: usize,
 		sc: &Scratch,
+		ss: &StepScalars,
 	) {
 		let d = p.dim;
 		let heads = p.heads;
@@ -378,16 +402,16 @@ impl ModelInner {
 			da,
 			&sc.a_ctx,
 			&p.wo,
-			&sc.a_dctx,
-			&sc.a_gw,
-			&sc.a_dbias,
 			&sc.reduce_ws,
 			&sc.dw_partials,
 			m,
 			d,
 			d,
-		);
-		kernels::gpu_sgd_update(&p.wo, &sc.a_gw, self.lr, d * d);
+			&sc.a_dctx,
+			&sc.a_gw,
+			&sc.a_dbias,
+		).expect("attn wo backward");
+		kernels::gpu_sgd_update(&sc.a_gw, &ss.neg_lr, d * d, &p.wo).expect("sgd wo");
 		// Flash backward: dQ/dK/dV without materializing scores or dscores — the
 		// kernels recompute P tiles from Q,K + the forward's logsumexp (a_lse) and
 		// the rowsum term D = Σ dctx∘ctx (a_dsum). Deterministic, no atomics.
@@ -398,64 +422,64 @@ impl ModelInner {
 			&sc.a_ctx,
 			&sc.a_dctx,
 			&sc.a_lse,
-			&sc.a_dsum,
-			&sc.a_dq,
-			&sc.a_dk,
-			&sc.a_dv,
 			n,
 			s,
 			d,
 			heads,
-		);
+			&sc.a_dsum,
+			&sc.a_dq,
+			&sc.a_dk,
+			&sc.a_dv,
+		).expect("flash attn backward");
 		// dscores came from ROTATED Q,K, so a_dq/a_dk are gradients w.r.t. the rotated
 		// tensors. Un-rotate (RoPE with sgn=-1) to get gradients w.r.t. the raw Q,K
 		// projection outputs before back-propagating through Wq/Wk.
-		gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_dq, &sc.a_dk, m, d, heads, s, -1.0);
+		gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_dq, &sc.a_dk, &sc.c_neg_one, &sc.c_rope_theta, m, d, heads, s).expect("rope backward");
 		// {Q,K,V} = H·{Wq,Wk,Wv}: accumulate dH = dH_q+dH_k+dH_v into da_below; update weights.
 		kernels::gpu_linear_backward_full_into(
 			&sc.a_dq,
 			h,
 			&p.w,
-			da_below,
-			&sc.a_gw,
-			&sc.a_dbias,
 			&sc.reduce_ws,
 			&sc.dw_partials,
 			m,
 			d,
 			d,
-		);
-		kernels::gpu_sgd_update(&p.w, &sc.a_gw, self.lr, d * d);
+			da_below,
+			&sc.a_gw,
+			&sc.a_dbias,
+		).expect("attn wq backward");
+		kernels::gpu_sgd_update(&sc.a_gw, &ss.neg_lr, d * d, &p.w).expect("sgd wq");
 		kernels::gpu_linear_backward_full_into(
 			&sc.a_dk,
 			h,
 			&p.wk,
-			&sc.a_dctx,
-			&sc.a_gw,
-			&sc.a_dbias,
 			&sc.reduce_ws,
 			&sc.dw_partials,
 			m,
 			d,
 			d,
-		);
-		kernels::gpu_sgd_update(&p.wk, &sc.a_gw, self.lr, d * d);
-		kernels::gpu_add_inplace(da_below, &sc.a_dctx, m * d);
+			&sc.a_dctx,
+			&sc.a_gw,
+			&sc.a_dbias,
+		).expect("attn wk backward");
+		kernels::gpu_sgd_update(&sc.a_gw, &ss.neg_lr, d * d, &p.wk).expect("sgd wk");
+		kernels::gpu_add_inplace(&sc.a_dctx, m * d, da_below).expect("attn dh add k");
 		kernels::gpu_linear_backward_full_into(
 			&sc.a_dv,
 			h,
 			&p.wv,
-			&sc.a_dctx,
-			&sc.a_gw,
-			&sc.a_dbias,
 			&sc.reduce_ws,
 			&sc.dw_partials,
 			m,
 			d,
 			d,
-		);
-		kernels::gpu_sgd_update(&p.wv, &sc.a_gw, self.lr, d * d);
-		kernels::gpu_add_inplace(da_below, &sc.a_dctx, m * d);
+			&sc.a_dctx,
+			&sc.a_gw,
+			&sc.a_dbias,
+		).expect("attn wv backward");
+		kernels::gpu_sgd_update(&sc.a_gw, &ss.neg_lr, d * d, &p.wv).expect("sgd wv");
+		kernels::gpu_add_inplace(&sc.a_dctx, m * d, da_below).expect("attn dh add v");
 	}
 	/// One backward pass + SGD update, writing every gradient into preallocated
 	/// `sc` (no allocation). `sc.acts` must hold this epoch's forward output and
@@ -469,6 +493,7 @@ impl ModelInner {
 		ybuf: &GpuBuffer,
 		n: usize,
 		sc: &Scratch,
+		ss: &StepScalars,
 	) {
 		let last = params.len() - 1;
 		// The first dense after the text prefix was fed sc.concat in the forward pass
@@ -482,6 +507,8 @@ impl ModelInner {
 			da_cur,
 			n,
 			n * params[last].out_dim,
+			sc,
+			ss,
 		);
 		sc.mark_bwd(params.len());
 		let mut flip = false;
@@ -495,16 +522,16 @@ impl ModelInner {
 				// is [n*in_dim, dim]; scatter-add it by token id into a zeroed
 				// table-gradient, then SGD the table. x holds the token ids.
 				let p = &params[l];
-				kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
-				kernels::gpu_scatter_add(&sc.embed_grad, x, da, n * p.in_dim, p.dim);
-				kernels::gpu_sgd_update(&p.w, &sc.embed_grad, self.lr, p.vocab * p.dim);
+				kernels::gpu_scale_inplace(&ss.zero, p.vocab * p.dim, &sc.embed_grad).expect("embed zero");
+				kernels::gpu_scatter_add(x, da, n * p.in_dim, p.dim, &sc.embed_grad).expect("embed scatter");
+				kernels::gpu_sgd_update(&sc.embed_grad, &ss.neg_lr, p.vocab * p.dim, &p.w).expect("sgd embed");
 				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
 			}
 			if params[l].kind == LayerKind::Attn {
 				let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
-				self.attn_backward(&params[l], a_prev, da, da_below, n, sc);
+				self.attn_backward(&params[l], a_prev, da, da_below, n, sc, ss);
 				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
@@ -516,116 +543,117 @@ impl ModelInner {
 				let cout = p.out_dim / ((lin - k) / stride + 1);
 				let lout = (lin - k) / stride + 1;
 				let grad = match p.act {
-					Activation::Relu => { kernels::gpu_relu_backward_into(da, &sc.acts[l], &sc.dz, m); &sc.dz }
-					Activation::Sigmoid => { kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], &sc.dz, m); &sc.dz }
-					Activation::LeakyRelu => { kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.dz, m, LEAKY_ALPHA); &sc.dz }
+					Activation::Relu => { kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz).expect("relu bwd"); &sc.dz }
+					Activation::Sigmoid => { kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz).expect("sigmoid bwd"); &sc.dz }
+					Activation::LeakyRelu => { kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.c_leaky_alpha, m, &sc.dz).expect("leaky bwd"); &sc.dz }
 					Activation::PRelu => {
-						let a = download_scalar(&p.palpha);
-						kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.dz, m, a);
-						kernels::gpu_relu_into(&sc.preact[l], &sc.prelu_t0, m);
-						kernels::gpu_copy_into(&sc.preact[l], &sc.prelu_t1, m);
-						kernels::gpu_sub_inplace(&sc.prelu_t1, &sc.prelu_t0, m);
-						kernels::gpu_mul_inplace(&sc.prelu_t1, da, m);
-						kernels::gpu_reduce_sum_cols_into(&sc.prelu_t1, &sc.prelu_scalar, &sc.reduce_ws, m, 1);
-						kernels::gpu_sgd_update(&p.palpha, &sc.prelu_scalar, self.lr, 1);
+						kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &p.palpha, m, &sc.dz).expect("prelu bwd");
+						kernels::gpu_relu_into(&sc.preact[l], m, &sc.prelu_t0).expect("prelu relu");
+						kernels::gpu_copy_into(&sc.preact[l], m, &sc.prelu_t1).expect("prelu copy");
+						kernels::gpu_sub_inplace(&sc.prelu_t0, m, &sc.prelu_t1).expect("prelu sub");
+						kernels::gpu_mul_inplace(da, m, &sc.prelu_t1).expect("prelu mul");
+						kernels::gpu_reduce_sum_cols_into(&sc.prelu_t1, &sc.reduce_ws, m, 1, &sc.prelu_scalar).expect("prelu reduce");
+						kernels::gpu_sgd_update(&sc.prelu_scalar, &ss.neg_lr, 1, &p.palpha).expect("sgd prelu");
 						&sc.dz
 					}
-					Activation::Tanh => { kernels::gpu_tanh_backward_into(da, &sc.acts[l], &sc.dz, m); &sc.dz }
-					Activation::Elu => { gpu_core::k_gapact::gpu_elu_backward_into(da, &sc.preact[l], &sc.dz, m, ELU_ALPHA); &sc.dz }
-					Activation::Selu => { gpu_core::k_gapact::gpu_selu_backward_into(da, &sc.preact[l], &sc.dz, m); &sc.dz }
-					Activation::Silu => { kernels::gpu_silu_backward_into(da, &sc.preact[l], &sc.dz, m); &sc.dz }
-					Activation::Gelu => { kernels::gpu_gelu_backward_into(da, &sc.preact[l], &sc.dz, m); &sc.dz }
+					Activation::Tanh => { kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz).expect("tanh bwd"); &sc.dz }
+					Activation::Elu => { gpu_core::k_gapact::gpu_elu_backward(da, &sc.preact[l], &sc.c_elu_alpha, m, &sc.dz).expect("elu bwd"); &sc.dz }
+					Activation::Selu => { gpu_core::k_gapact::gpu_selu_backward(da, &sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &sc.dz).expect("selu bwd"); &sc.dz }
+					Activation::Silu => { kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("silu bwd"); &sc.dz }
+					Activation::Gelu => { kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("gelu bwd"); &sc.dz }
 					Activation::Linear => da,
 				};
 				let a_prev = if l == 0 { x } else { &sc.acts[l - 1] };
 				kernels::gpu_conv1d_backward_filter_into(
-					grad, a_prev, &sc.dw, &sc.conv_temp, &sc.reduce_ws,
+					grad, a_prev, &sc.conv_temp, &sc.reduce_ws,
 					n, cin, lin, cout, k, stride, sc.conv_wg,
-				);
-				kernels::gpu_scale_inplace(&sc.db, 0.0, cout);
-				kernels::gpu_conv1d_backward_bias_into(grad, &sc.db, n, cout, lout);
+					&sc.dw,
+				).expect("conv filter bwd");
+				kernels::gpu_scale_inplace(&ss.zero, cout, &sc.db).expect("conv db zero");
+				kernels::gpu_conv1d_backward_bias_into(grad, n, cout, lout, &sc.db).expect("conv bias bwd");
 				if l > 0 {
-					kernels::gpu_conv1d_backward_data_into(grad, &p.w, da_below, n, cin, lin, cout, k, stride);
+					kernels::gpu_conv1d_backward_data_into(grad, &p.w, n, cin, lin, cout, k, stride, da_below).expect("conv data bwd");
 				}
-				kernels::gpu_sgd_update(&p.w, &sc.dw, self.lr, cout * cin * k);
-				kernels::gpu_sgd_update(&p.b, &sc.db, self.lr, cout);
+				kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, cout * cin * k, &p.w).expect("sgd conv w");
+				kernels::gpu_sgd_update(&sc.db, &ss.neg_lr, cout, &p.b).expect("sgd conv b");
 				sc.mark_bwd(l);
 				flip = !flip;
 				continue;
 			}
 			let grad = match params[l].act {
 				Activation::Relu => {
-					kernels::gpu_relu_backward_into(da, &sc.acts[l], &sc.dz, m);
+					kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz).expect("relu bwd");
 					&sc.dz
 				}
 				Activation::Sigmoid => {
-					kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], &sc.dz, m);
+					kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz).expect("sigmoid bwd");
 					&sc.dz
 				}
 				Activation::LeakyRelu => {
 					kernels::gpu_leaky_relu_backward_into(
 						da,
 						&sc.acts[l],
-						&sc.dz,
+						&sc.c_leaky_alpha,
 						m,
-						LEAKY_ALPHA,
-					);
+						&sc.dz,
+					).expect("leaky bwd");
 					&sc.dz
 				}
 				Activation::PRelu => {
 					// dx uses the current slope; then update the slope:
 					// dα = Σ grad·min(z,0), with min(z,0) = z − relu(z).
-					let a = download_scalar(&params[l].palpha);
-					kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.dz, m, a);
-					kernels::gpu_relu_into(&sc.preact[l], &sc.prelu_t0, m);
-					kernels::gpu_copy_into(&sc.preact[l], &sc.prelu_t1, m);
-					kernels::gpu_sub_inplace(&sc.prelu_t1, &sc.prelu_t0, m);
-					kernels::gpu_mul_inplace(&sc.prelu_t1, da, m);
+					kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &params[l].palpha, m, &sc.dz).expect("prelu bwd");
+					kernels::gpu_relu_into(&sc.preact[l], m, &sc.prelu_t0).expect("prelu relu");
+					kernels::gpu_copy_into(&sc.preact[l], m, &sc.prelu_t1).expect("prelu copy");
+					kernels::gpu_sub_inplace(&sc.prelu_t0, m, &sc.prelu_t1).expect("prelu sub");
+					kernels::gpu_mul_inplace(da, m, &sc.prelu_t1).expect("prelu mul");
 					kernels::gpu_reduce_sum_cols_into(
 						&sc.prelu_t1,
-						&sc.prelu_scalar,
 						&sc.reduce_ws,
 						m,
 						1,
-					);
-					kernels::gpu_sgd_update(
-						&params[l].palpha,
 						&sc.prelu_scalar,
-						self.lr,
+					).expect("prelu reduce");
+					kernels::gpu_sgd_update(
+						&sc.prelu_scalar,
+						&ss.neg_lr,
 						1,
-					);
+						&params[l].palpha,
+					).expect("sgd prelu");
 					&sc.dz
 				}
 				Activation::Tanh => {
-					kernels::gpu_tanh_backward_into(da, &sc.acts[l], &sc.dz, m);
+					kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz).expect("tanh bwd");
 					&sc.dz
 				}
 				// Elu/Selu/Silu/Gelu backward read the saved pre-activation, not the output.
 				Activation::Elu => {
-					gpu_core::k_gapact::gpu_elu_backward_into(
+					gpu_core::k_gapact::gpu_elu_backward(
 						da,
 						&sc.preact[l],
-						&sc.dz,
+						&sc.c_elu_alpha,
 						m,
-						ELU_ALPHA,
-					);
+						&sc.dz,
+					).expect("elu bwd");
 					&sc.dz
 				}
 				Activation::Selu => {
-					gpu_core::k_gapact::gpu_selu_backward_into(
+					gpu_core::k_gapact::gpu_selu_backward(
 						da,
 						&sc.preact[l],
-						&sc.dz,
+						&sc.c_selu_alpha,
+						&sc.c_selu_lambda,
 						m,
-					);
+						&sc.dz,
+					).expect("selu bwd");
 					&sc.dz
 				}
 				Activation::Silu => {
-					kernels::gpu_silu_backward_into(da, &sc.preact[l], &sc.dz, m);
+					kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("silu bwd");
 					&sc.dz
 				}
 				Activation::Gelu => {
-					kernels::gpu_gelu_backward_into(da, &sc.preact[l], &sc.dz, m);
+					kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("gelu bwd");
 					&sc.dz
 				}
 				Activation::Linear => da,
@@ -640,48 +668,48 @@ impl ModelInner {
 			};
 			if out_dim == 1 {
 				// dW = a_prevᵀ·grad reduced over n batch rows — split-K across all CUs.
-				kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, &sc.dw, n, 1, in_dim);
-				kernels::gpu_reduce_sum_cols_into(grad, &sc.db, &sc.reduce_ws, n, 1);
+				kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, n, 1, in_dim, &sc.dw).expect("splitk dw");
+				kernels::gpu_reduce_sum_cols_into(grad, &sc.reduce_ws, n, 1, &sc.db).expect("db reduce");
 				if l > 0 {
-					kernels::gpu_dger_into(grad, &params[l].w, da_below, n, in_dim);
+					kernels::gpu_dger_into(grad, &params[l].w, da_below, n, in_dim).expect("dger");
 				}
 			} else if l > 0 {
 				kernels::gpu_linear_backward_full_into(
 					grad,
 					a_prev,
 					&params[l].w,
-					da_below,
-					&sc.dw,
-					&sc.db,
 					&sc.reduce_ws,
 					&sc.dw_partials,
 					n,
 					out_dim,
 					in_dim,
-				);
+					da_below,
+					&sc.dw,
+					&sc.db,
+				).expect("linear full bwd");
 			} else {
 				kernels::gpu_linear_backward_weights_only_into(
 					grad,
 					a_prev,
-					&sc.dw,
-					&sc.db,
 					&sc.reduce_ws,
 					&sc.dw_partials,
 					n,
 					out_dim,
 					in_dim,
-				);
+					&sc.dw,
+					&sc.db,
+				).expect("linear weights bwd");
 			}
-			kernels::gpu_sgd_update(&params[l].w, &sc.dw, self.lr, in_dim * out_dim);
-			kernels::gpu_sgd_update(&params[l].b, &sc.db, self.lr, out_dim);
+			kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, in_dim * out_dim, &params[l].w).expect("sgd w");
+			kernels::gpu_sgd_update(&sc.db, &ss.neg_lr, out_dim, &params[l].b).expect("sgd b");
 			// da_below here is [n×(A+C)]; the attn layer below only wants the A
 			// attention columns — compact them to the front so the next iteration
 			// reads a contiguous [n×A] grad. (The trailing C cat-grads are inputs.)
 			if let Some((pf, a, c)) = cc
 				&& l == pf
 			{
-				kernels::gpu_slice_lead_into(da_below, &sc.concat_dgrad, n, a + c, a);
-				kernels::gpu_copy_into(&sc.concat_dgrad, da_below, n * a);
+				kernels::gpu_slice_lead_into(da_below, n, a + c, a, &sc.concat_dgrad).expect("concat slice");
+				kernels::gpu_copy_into(&sc.concat_dgrad, n * a, da_below).expect("concat copy");
 			}
 			sc.mark_bwd(l);
 			flip = !flip;
@@ -931,6 +959,9 @@ impl ModelInner {
 			o.report();
 			o
 		});
+		// Device-scalar operands for SGD (-lr) and the batch-mean loss gradient
+		// (1/n, 2/n) + a reusable zero — uploaded once here, reused every epoch.
+		let ss = StepScalars::new(self.lr, n);
 		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 		// Saturation law, executable: the GPU must hit 100% at least once in
 		// every 5s window of the compute loop or the process aborts.
@@ -968,8 +999,8 @@ impl ModelInner {
 				|| (log_now && cfg.metrics.contains(&stop_metric))
 				|| (plotting && plot_ys.contains(&stop_metric));
 			match ooc.as_mut() {
-				Some(o) => o.backward(&params, &xbuf, &ybuf, &sc, self.lr, self.loss, cc_fit),
-				None => self.backward_step(&params, &xbuf, &ybuf, n, &sc),
+				Some(o) => o.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, cc_fit),
+				None => self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss),
 			}
 			// Disarm before the metric re-forward so it can't overwrite the epoch's
 			// recorded boundaries.
@@ -995,13 +1026,13 @@ impl ModelInner {
 			let score_is_acc = if want_score {
 				if classify {
 					if k == 1 {
-						kernels::gpu_accuracy_into(out, &ybuf, &sc.metric_scalar_b, n);
+						kernels::gpu_accuracy_into(out, &ybuf, n, &sc.metric_scalar_b).expect("accuracy");
 					} else {
-						kernels::gpu_argmax_accuracy_into(out, &ybuf, &sc.metric_scalar_b, n, k);
+						kernels::gpu_argmax_accuracy_into(out, &ybuf, n, k, &sc.metric_scalar_b).expect("argmax accuracy");
 					}
 					Some(true)
 				} else {
-					kernels::gpu_ss_res_into(out, &ybuf, &sc.metric_scalar_b, n * k);
+					kernels::gpu_ss_res_into(out, &ybuf, n * k, &sc.metric_scalar_b).expect("ss_res");
 					Some(false)
 				}
 			} else {
@@ -1142,21 +1173,21 @@ impl ModelInner {
 					kernels::gpu_accuracy_into(
 						&sc.acts[last],
 						&ybuf,
-						&sc.metric_scalar,
 						n,
-					);
+						&sc.metric_scalar,
+					).expect("accuracy");
 				} else {
 					kernels::gpu_argmax_accuracy_into(
 						&sc.acts[last],
 						&ybuf,
-						&sc.metric_scalar,
 						n,
 						k,
-					);
+						&sc.metric_scalar,
+					).expect("argmax accuracy");
 				}
 				sc.read_metric_scalar()
 			} else {
-				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
+				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &sc.metric_scalar).expect("ss_res");
 				1.0 - sc.read_metric_scalar() / ss_tot
 			}
 		});

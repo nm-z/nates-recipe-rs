@@ -7,10 +7,11 @@
 //! level up), and SGD updates once per epoch.
 
 use crate::model::ModelInner;
+use crate::train::StepScalars;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	Activation, ELU_ALPHA, LEAKY_ALPHA, LayerKind, LayerParams, Loss, Scratch, download_scalar,
+	Activation, LayerKind, LayerParams, Loss, Scratch,
 };
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -896,7 +897,7 @@ impl Ooc {
 					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 					let xc = view(x_cat.expect("x_cat"), s0 * c * 8, cnt * c * 8);
 					let out = self.concat.write_view(s0, cnt, &self.wins[1]);
-					kernels::gpu_concat_into(&prev, &xc, &out, cnt, a, c);
+					kernels::gpu_concat_into(&prev, &xc, cnt, a, c, &out).expect("concat");
 					self.concat.commit(s0, cnt, &out, &self.writer, &self.host);
 				}
 				// Pure copy: [n×A]+[n×C] read, [n×(A+C)] written, zero FLOP.
@@ -913,8 +914,8 @@ impl Ooc {
 						}
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
-						kernels::gpu_gather_rows_into(&p.w, &ids, &out, cnt * p.in_dim, p.dim);
-						kernels::gpu_broadcast_sub_into(&out, &p.b, &out, cnt * p.out_dim, p.out_dim);
+						kernels::gpu_gather_rows_into(&p.w, &ids, cnt * p.in_dim, p.dim, &out).expect("gather");
+						kernels::gpu_broadcast_sub_into(&out, &p.b, cnt * p.out_dim, p.out_dim, &out).expect("pe add");
 						self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
 					}
 				}
@@ -932,10 +933,10 @@ impl Ooc {
 						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
 						let k = self.a_k.write_view(s0, cnt, &self.wins[2]);
 						let v = self.a_v.write_view(s0, cnt, &self.wins[3]);
-						kernels::gpu_linear_into(&prev, &p.w, &p.b, &q, m, d, d);
-						kernels::gpu_linear_into(&prev, &p.wk, &p.b, &k, m, d, d);
-						kernels::gpu_linear_into(&prev, &p.wv, &p.b, &v, m, d, d);
-						gpu_core::rope::gpu_rope_qk_heads_inplace(&q, &k, m, d, heads, s, 1.0);
+						kernels::gpu_linear_into(&prev, &p.w, &p.b, m, d, d, &q).expect("attn q");
+						kernels::gpu_linear_into(&prev, &p.wk, &p.b, m, d, d, &k).expect("attn k");
+						kernels::gpu_linear_into(&prev, &p.wv, &p.b, m, d, d, &v).expect("attn v");
+						gpu_core::rope::gpu_rope_qk_heads_inplace(&q, &k, &sc.c_one, &sc.c_rope_theta, m, d, heads, s).expect("rope");
 						self.a_q.commit(s0, cnt, &q, &self.writer, &self.host);
 						self.a_k.commit(s0, cnt, &k, &self.writer, &self.host);
 						self.a_v.commit(s0, cnt, &v, &self.writer, &self.host);
@@ -950,7 +951,7 @@ impl Ooc {
 						let v = self.a_v.read(s0, cnt, &self.wins[2], &self.spill, self.n, &self.host);
 						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3]);
 						let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
-						kernels::gpu_flash_attention_train_into(&q, &k, &v, &ctx, &lse, cnt, s, d, heads);
+						kernels::gpu_flash_attention_train_into(&q, &k, &v, cnt, s, d, heads, &ctx, &lse).expect("flash attn");
 						self.a_ctx.commit(s0, cnt, &ctx, &self.writer, &self.host);
 					}
 					self.writer.barrier(&self.spill);
@@ -960,7 +961,7 @@ impl Ooc {
 						}
 						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
-						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, &out, cnt * s, d, d);
+						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, cnt * s, d, d, &out).expect("attn out");
 						self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
 					}
 				}
@@ -986,35 +987,34 @@ impl Ooc {
 							let (cin, kk, stride) = (p.conv_cin, p.conv_k, p.conv_stride);
 							let lin = p.in_dim / cin;
 							let cout = p.out_dim / ((lin - kk) / stride + 1);
-							kernels::gpu_conv1d_into(&prev, &p.w, &p.b, &out, cnt, cin, lin, cout, kk, stride);
+							kernels::gpu_conv1d_into(&prev, &p.w, &p.b, cnt, cin, lin, cout, kk, stride, &out).expect("conv1d");
 						} else if p.out_dim == 1 {
-							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, &out, cnt, p.in_dim);
+							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, &out, cnt, p.in_dim).expect("matvec");
 						} else {
-							kernels::gpu_linear_into(&prev, &p.w, &p.b, &out, cnt, p.out_dim, p.in_dim);
+							kernels::gpu_linear_into(&prev, &p.w, &p.b, cnt, p.out_dim, p.in_dim, &out).expect("linear");
 						}
 						let m = cnt * p.out_dim;
 						if let Some(pa) = self.preacts[l].as_mut() {
 							let pre = pa.write_view(s0, cnt, &self.wins[2]);
-							kernels::gpu_copy_into(&out, &pre, m);
+							kernels::gpu_copy_into(&out, m, &pre).expect("copy preact");
 							pa.commit(s0, cnt, &pre, &self.writer, &self.host);
 							// PRelu/Elu/Selu/Silu/Gelu apply FROM the saved z.
 							match p.act {
 								Activation::PRelu => {
-									let a = download_scalar(&p.palpha);
-									kernels::gpu_leaky_relu_into(&pre, &out, m, a);
+									kernels::gpu_leaky_relu_into(&pre, &p.palpha, m, &out).expect("prelu");
 								}
-								Activation::Elu => gpu_core::k_gapact::gpu_elu_into(&pre, &out, m, ELU_ALPHA),
-								Activation::Selu => gpu_core::k_gapact::gpu_selu_into(&pre, &out, m),
-								Activation::Silu => kernels::gpu_silu_into(&pre, &out, m),
-								Activation::Gelu => kernels::gpu_gelu_into(&pre, &out, m),
+								Activation::Elu => gpu_core::k_gapact::gpu_elu(&pre, &sc.c_elu_alpha, m, &out).expect("elu"),
+								Activation::Selu => gpu_core::k_gapact::gpu_selu(&pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &out).expect("selu"),
+								Activation::Silu => kernels::gpu_silu_into(&pre, m, &out).expect("silu"),
+								Activation::Gelu => kernels::gpu_gelu_into(&pre, m, &out).expect("gelu"),
 								_ => unreachable!("preact only saved for z-based activations"),
 							}
 						} else {
 							match p.act {
-								Activation::Relu => kernels::gpu_relu_into(&out, &out, m),
-								Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, &out, m),
-								Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &out, m, LEAKY_ALPHA),
-								Activation::Tanh => kernels::gpu_tanh_into(&out, &out, m),
+								Activation::Relu => kernels::gpu_relu_into(&out, m, &out).expect("relu"),
+								Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, m, &out).expect("sigmoid"),
+								Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &sc.c_leaky_alpha, m, &out).expect("leaky"),
+								Activation::Tanh => kernels::gpu_tanh_into(&out, m, &out).expect("tanh"),
 								Activation::Linear => {}
 								_ => unreachable!("z-based activation without preact"),
 							}
@@ -1039,15 +1039,15 @@ impl Ooc {
 		x: &GpuBuffer,
 		ybuf: &GpuBuffer,
 		sc: &Scratch,
-		lr: f64,
+		ss: &StepScalars,
 		loss: Loss,
 		concat_at: Option<(usize, usize, usize)>,
 	) {
 		let last = params.len() - 1;
 		let n = self.n;
-		// Loss gradient at the output, windowed into da_a (width = out_dim).
-		// loss_grad_into scales by 1/rows-it-was-given, so rescale cnt/n to get
-		// the global-batch 1/n.
+		// Loss gradient at the output, windowed into da_a (width = out_dim). The
+		// batch-mean scale rides ss.inv_n/two_inv_n (global 1/n) so each window's
+		// contribution is already at the full-batch scale — no per-window rescale.
 		self.da_a.spb = params[last].out_dim;
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
@@ -1058,8 +1058,7 @@ impl Ooc {
 			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
-			ModelInner::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k);
-			kernels::gpu_scale_inplace(&da, cnt as f64 / n as f64, cnt * k);
+			ModelInner::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss);
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host);
 		}
 		let mut flip = false;
@@ -1069,7 +1068,7 @@ impl Ooc {
 			let (in_dim, out_dim) = (p.in_dim, p.out_dim);
 			match p.kind {
 				LayerKind::Embed => {
-					kernels::gpu_scale_inplace(&sc.embed_grad, 0.0, p.vocab * p.dim);
+					kernels::gpu_scale_inplace(&ss.zero, p.vocab * p.dim, &sc.embed_grad).expect("embed zero");
 					self.writer.barrier(&self.spill);
 					for (s0, cnt) in chunks(n, self.chunk) {
 						if self.bail() {
@@ -1077,15 +1076,15 @@ impl Ooc {
 						}
 						let da = self.da(flip).read(s0, cnt, &self.wins[0], &self.spill, self.n, &self.host);
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
-						kernels::gpu_scatter_add(&sc.embed_grad, &ids, &da, cnt * p.in_dim, p.dim);
+						kernels::gpu_scatter_add(&ids, &da, cnt * p.in_dim, p.dim, &sc.embed_grad).expect("embed scatter");
 					}
-					kernels::gpu_sgd_update(&p.w, &sc.embed_grad, lr, p.vocab * p.dim);
+					kernels::gpu_sgd_update(&sc.embed_grad, &ss.neg_lr, p.vocab * p.dim, &p.w).expect("sgd embed");
 					self.sweep_line("bwd", l, p, s_l);
 					flip = !flip;
 					continue;
 				}
 				LayerKind::Attn => {
-					self.attn_backward(params, l, x, lr, flip);
+					self.attn_backward(params, l, x, sc, ss, flip);
 					self.sweep_line("bwd", l, p, s_l);
 					flip = !flip;
 					continue;
@@ -1096,10 +1095,10 @@ impl Ooc {
 				LayerKind::Dense => {}
 			}
 			// Dense: dz = act'(da) per window; dW/db accumulate; da_below → home.
-			kernels::gpu_scale_inplace(&self.dw_acc, 0.0, in_dim * out_dim);
-			kernels::gpu_scale_inplace(&self.db_acc, 0.0, out_dim);
+			kernels::gpu_scale_inplace(&ss.zero, in_dim * out_dim, &self.dw_acc).expect("dw_acc zero");
+			kernels::gpu_scale_inplace(&ss.zero, out_dim, &self.db_acc).expect("db_acc zero");
 			if p.act == Activation::PRelu {
-				kernels::gpu_scale_inplace(&self.scalar_acc, 0.0, 1);
+				kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).expect("scalar_acc zero");
 			}
 			self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
 			self.writer.barrier(&self.spill);
@@ -1117,56 +1116,55 @@ impl Ooc {
 				let dz = view(&self.wins[2], 0, m * 8);
 				let grad: &GpuBuffer = match p.act {
 					Activation::Relu => {
-						kernels::gpu_relu_backward_into(&da, &act_l, &dz, m);
+						kernels::gpu_relu_backward_into(&da, &act_l, m, &dz).expect("relu bwd");
 						&dz
 					}
 					Activation::Sigmoid => {
-						kernels::gpu_sigmoid_backward_into(&da, &act_l, &dz, m);
+						kernels::gpu_sigmoid_backward_into(&da, &act_l, m, &dz).expect("sigmoid bwd");
 						&dz
 					}
 					Activation::LeakyRelu => {
-						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &dz, m, LEAKY_ALPHA);
+						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &sc.c_leaky_alpha, m, &dz).expect("leaky bwd");
 						&dz
 					}
 					Activation::PRelu => {
-						let a = download_scalar(&p.palpha);
-						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &dz, m, a);
+						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &p.palpha, m, &dz).expect("prelu bwd");
 						let pre = self.preacts[l]
 							.as_ref()
 							.expect("prelu preact")
 							.read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 						let t0 = view(&self.wins[4], 0, m * 8);
 						let t1 = view(&self.wins[5], 0, m * 8);
-						kernels::gpu_relu_into(&pre, &t0, m);
-						kernels::gpu_copy_into(&pre, &t1, m);
-						kernels::gpu_sub_inplace(&t1, &t0, m);
-						kernels::gpu_mul_inplace(&t1, &da, m);
-						kernels::gpu_reduce_sum_cols_into(&t1, &self.scalar_tmp, &self.reduce_ws, m, 1);
-						kernels::gpu_add_inplace(&self.scalar_acc, &self.scalar_tmp, 1);
+						kernels::gpu_relu_into(&pre, m, &t0).expect("prelu relu");
+						kernels::gpu_copy_into(&pre, m, &t1).expect("prelu copy");
+						kernels::gpu_sub_inplace(&t0, m, &t1).expect("prelu sub");
+						kernels::gpu_mul_inplace(&da, m, &t1).expect("prelu mul");
+						kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).expect("prelu reduce");
+						kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).expect("prelu acc");
 						&dz
 					}
 					Activation::Tanh => {
-						kernels::gpu_tanh_backward_into(&da, &act_l, &dz, m);
+						kernels::gpu_tanh_backward_into(&da, &act_l, m, &dz).expect("tanh bwd");
 						&dz
 					}
 					Activation::Elu => {
 						let pre = self.preacts[l].as_ref().expect("elu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
-						gpu_core::k_gapact::gpu_elu_backward_into(&da, &pre, &dz, m, ELU_ALPHA);
+						gpu_core::k_gapact::gpu_elu_backward(&da, &pre, &sc.c_elu_alpha, m, &dz).expect("elu bwd");
 						&dz
 					}
 					Activation::Selu => {
 						let pre = self.preacts[l].as_ref().expect("selu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
-						gpu_core::k_gapact::gpu_selu_backward_into(&da, &pre, &dz, m);
+						gpu_core::k_gapact::gpu_selu_backward(&da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &dz).expect("selu bwd");
 						&dz
 					}
 					Activation::Silu => {
 						let pre = self.preacts[l].as_ref().expect("silu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
-						kernels::gpu_silu_backward_into(&da, &pre, &dz, m);
+						kernels::gpu_silu_backward_into(&da, &pre, m, &dz).expect("silu bwd");
 						&dz
 					}
 					Activation::Gelu => {
 						let pre = self.preacts[l].as_ref().expect("gelu preact").read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
-						kernels::gpu_gelu_backward_into(&da, &pre, &dz, m);
+						kernels::gpu_gelu_backward_into(&da, &pre, m, &dz).expect("gelu bwd");
 						&dz
 					}
 					Activation::Linear => &da,
@@ -1182,16 +1180,16 @@ impl Ooc {
 					let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
 					let below = below_pg.write_view(s0, cnt, &self.wins[7]);
 					kernels::gpu_linear_backward_full_into(
-						grad, &a_prev, &p.w, &below, &self.dw_tmp, &self.db_tmp,
-						&self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
-					);
+						grad, &a_prev, &p.w, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+						&below, &self.dw_tmp, &self.db_tmp,
+					).expect("linear full bwd");
 					// The layer below the concat only wants the leading A
 					// attention columns — compact before committing.
 					if let Some((pf, a, c)) = concat_at
 						&& l == pf
 					{
 						let compact = view(&self.wins[8], 0, cnt * a * 8);
-						kernels::gpu_slice_lead_into(&below, &compact, cnt, a + c, a);
+						kernels::gpu_slice_lead_into(&below, cnt, a + c, a, &compact).expect("concat slice");
 						below_pg.spb = a;
 						below_pg.commit(s0, cnt, &compact, &self.writer, &self.host);
 						below_pg.spb = a + c;
@@ -1200,22 +1198,22 @@ impl Ooc {
 					}
 				} else {
 					kernels::gpu_linear_backward_weights_only_into(
-						grad, &a_prev, &self.dw_tmp, &self.db_tmp,
-						&self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
-					);
+						grad, &a_prev, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+						&self.dw_tmp, &self.db_tmp,
+					).expect("linear weights bwd");
 				}
-				kernels::gpu_add_inplace(&self.dw_acc, &self.dw_tmp, in_dim * out_dim);
-				kernels::gpu_add_inplace(&self.db_acc, &self.db_tmp, out_dim);
+				kernels::gpu_add_inplace(&self.dw_tmp, in_dim * out_dim, &self.dw_acc).expect("dw acc");
+				kernels::gpu_add_inplace(&self.db_tmp, out_dim, &self.db_acc).expect("db acc");
 			}
 			if let Some((pf, a, _)) = concat_at
 				&& l == pf
 			{
 				self.da_below(flip).spb = a;
 			}
-			kernels::gpu_sgd_update(&p.w, &self.dw_acc, lr, in_dim * out_dim);
-			kernels::gpu_sgd_update(&p.b, &self.db_acc, lr, out_dim);
+			kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, in_dim * out_dim, &p.w).expect("sgd w");
+			kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, out_dim, &p.b).expect("sgd b");
 			if p.act == Activation::PRelu {
-				kernels::gpu_sgd_update(&p.palpha, &self.scalar_acc, lr, 1);
+				kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).expect("sgd prelu");
 			}
 			self.sweep_line("bwd", l, p, s_l);
 			flip = !flip;
@@ -1355,14 +1353,14 @@ impl Ooc {
 		if flip { &mut self.da_a } else { &mut self.da_b }
 	}
 
-	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, lr: f64, flip: bool) {
+	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, sc: &Scratch, ss: &StepScalars, flip: bool) {
 		let p = &params[l];
 		let d = p.dim;
 		let heads = p.heads;
 		let s = p.in_dim / d;
 		let n = self.n;
 		// Wo: da → dctx, dWo accumulated over windows.
-		kernels::gpu_scale_inplace(&self.dw_acc, 0.0, d * d);
+		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dw_acc).expect("dw_acc zero");
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
 			if self.bail() {
@@ -1373,13 +1371,13 @@ impl Ooc {
 			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], &self.spill, self.n, &self.host);
 			let dctx = self.a_dctx.write_view(s0, cnt, &self.wins[2]);
 			kernels::gpu_linear_backward_full_into(
-				&da, &ctx, &p.wo, &dctx, &self.dw_tmp, &self.db_tmp,
-				&self.reduce_ws, &self.dw_partials, m, d, d,
-			);
-			kernels::gpu_add_inplace(&self.dw_acc, &self.dw_tmp, d * d);
+				&da, &ctx, &p.wo, &self.reduce_ws, &self.dw_partials, m, d, d,
+				&dctx, &self.dw_tmp, &self.db_tmp,
+			).expect("attn wo bwd");
+			kernels::gpu_add_inplace(&self.dw_tmp, d * d, &self.dw_acc).expect("dw_acc add");
 			self.a_dctx.commit(s0, cnt, &dctx, &self.writer, &self.host);
 		}
-		kernels::gpu_sgd_update(&p.wo, &self.dw_acc, lr, d * d);
+		kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, d * d, &p.wo).expect("sgd wo");
 		// Flash backward per sample chunk: dsum, then dQ/dK/dV; un-rotate RoPE.
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
@@ -1397,9 +1395,9 @@ impl Ooc {
 			let dk = self.a_dk.write_view(s0, cnt, &self.wins[6]);
 			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7]);
 			kernels::gpu_flash_attention_backward_into(
-				&q, &k, &v, &ctx, &dctx, &lse, &dsum, &dq, &dk, &dv, cnt, s, d, heads,
+				&q, &k, &v, &ctx, &dctx, &lse, cnt, s, d, heads, &dsum, &dq, &dk, &dv,
 			);
-			gpu_core::rope::gpu_rope_qk_heads_inplace(&dq, &dk, cnt * s, d, heads, s, -1.0);
+			gpu_core::rope::gpu_rope_qk_heads_inplace(&dq, &dk, &sc.c_neg_one, &sc.c_rope_theta, cnt * s, d, heads, s).expect("rope bwd");
 			self.a_dq.commit(s0, cnt, &dq, &self.writer, &self.host);
 			self.a_dk.commit(s0, cnt, &dk, &self.writer, &self.host);
 			self.a_dv.commit(s0, cnt, &dv, &self.writer, &self.host);
@@ -1407,9 +1405,9 @@ impl Ooc {
 		// Wq/Wk/Wv: three projections in one sweep per window so the dH sum
 		// stays local; per-projection dW accumulators zeroed up front.
 		self.da_below(flip).spb = p.in_dim;
-		kernels::gpu_scale_inplace(&self.dwq_acc, 0.0, d * d);
-		kernels::gpu_scale_inplace(&self.dwk_acc, 0.0, d * d);
-		kernels::gpu_scale_inplace(&self.dwv_acc, 0.0, d * d);
+		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwq_acc).expect("dwq zero");
+		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwk_acc).expect("dwk zero");
+		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwv_acc).expect("dwv zero");
 		self.writer.barrier(&self.spill);
 		for (s0, cnt) in chunks(n, self.chunk) {
 			if self.bail() {
@@ -1431,24 +1429,24 @@ impl Ooc {
 				let dg = dbuf.read(s0, cnt, &self.wins[3], &self.spill, self.n, &self.host);
 				let dst = if wi == 0 { &below } else { &dh_tmp };
 				kernels::gpu_linear_backward_full_into(
-					&dg, &h, w, dst, &self.dw_tmp, &self.db_tmp,
-					&self.reduce_ws, &self.dw_partials, m, d, d,
-				);
+					&dg, &h, w, &self.reduce_ws, &self.dw_partials, m, d, d,
+					dst, &self.dw_tmp, &self.db_tmp,
+				).expect("attn wqkv bwd");
 				let acc = match wi {
 					0 => &self.dwq_acc,
 					1 => &self.dwk_acc,
 					_ => &self.dwv_acc,
 				};
-				kernels::gpu_add_inplace(acc, &self.dw_tmp, d * d);
+				kernels::gpu_add_inplace(&self.dw_tmp, d * d, acc).expect("acc add");
 				if wi > 0 {
-					kernels::gpu_add_inplace(&below, &dh_tmp, cnt * p.in_dim);
+					kernels::gpu_add_inplace(&dh_tmp, cnt * p.in_dim, &below).expect("dh add");
 				}
 			}
 			below_pg.commit(s0, cnt, &below, &self.writer, &self.host);
 		}
-		kernels::gpu_sgd_update(&p.w, &self.dwq_acc, lr, d * d);
-		kernels::gpu_sgd_update(&p.wk, &self.dwk_acc, lr, d * d);
-		kernels::gpu_sgd_update(&p.wv, &self.dwv_acc, lr, d * d);
+		kernels::gpu_sgd_update(&self.dwq_acc, &ss.neg_lr, d * d, &p.w).expect("sgd wq");
+		kernels::gpu_sgd_update(&self.dwk_acc, &ss.neg_lr, d * d, &p.wk).expect("sgd wk");
+		kernels::gpu_sgd_update(&self.dwv_acc, &ss.neg_lr, d * d, &p.wv).expect("sgd wv");
 	}
 }
 

@@ -447,22 +447,24 @@ impl Train {
 						};
 						forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 						if let Some((ymean, ystd)) = *model.yscaler.borrow() {
-							kernels::gpu_scale_inplace(&sc.acts[last], ystd, n * k);
-							kernels::gpu_add_scalar_inplace(&sc.acts[last], ymean, n * k);
+							let ystd_b = GpuBuffer::upload(&[ystd]).expect("ystd");
+							let ymean_b = GpuBuffer::upload(&[ymean]).expect("ymean");
+							kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last]).expect("y unscale");
+							kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last]).expect("y unshift");
 						}
 						let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
 						if model.loss.is_classification() {
 							if k == 1 {
-								kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+								kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("accuracy");
 							} else {
-								kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n, k);
+								kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, n, k, &sc.metric_scalar).expect("argmax accuracy");
 							}
 							download_scalar(&sc.metric_scalar)
 						} else {
 							let total = (n * k) as f64;
 							let ybar = ds.y.iter().sum::<f64>() / total;
 							let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-							kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n * k);
+							kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &sc.metric_scalar).expect("ss_res");
 							1.0 - download_scalar(&sc.metric_scalar) / ss_tot
 						}
 					}
@@ -916,9 +918,11 @@ mod metric_gpu_tests {
 
 		// Two-layer params, random init (as fit does) — just to get real GPU preds.
 		let h = 8usize;
-		let w1 = kernels::gpu_randn(d * h, 11).expect("w1");
+		let w1 = GpuBuffer::alloc(d * h).expect("w1 alloc");
+		kernels::gpu_randn(d * h, 11, &w1).expect("w1");
 		let b1 = GpuBuffer::upload(&vec![0.0f64; h]).expect("b1");
-		let w2 = kernels::gpu_randn(h, 22).expect("w2");
+		let w2 = GpuBuffer::alloc(h).expect("w2 alloc");
+		kernels::gpu_randn(h, 22, &w2).expect("w2");
 		let b2 = GpuBuffer::upload(&[0.0f64; 1]).expect("b2");
 		let params = vec![
 			LayerParams {
@@ -1068,20 +1072,30 @@ mod metric_gpu_tests {
 		let d = x.ncols();
 
 		let (xraw, _, _) = upload(x);
-		let mean = kernels::gpu_reduce_mean_cols(&xraw, n, d).expect("mean");
-		let var = kernels::gpu_reduce_var_cols(&xraw, n, d).expect("var");
-		kernels::gpu_add_scalar_inplace(&var, 1e-8, d);
-		let std = kernels::gpu_sqrt(&var, d).expect("std");
-		let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("center");
-		let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("scale");
+		let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
+		let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).expect("reduce ws");
+		let mean = GpuBuffer::alloc(d).expect("mean");
+		kernels::gpu_reduce_mean_cols(&xraw, n, d, &ws, &mean).expect("mean");
+		let var = GpuBuffer::alloc(d).expect("var");
+		kernels::gpu_reduce_var_cols(&xraw, n, d, &ws, &var).expect("var");
+		let eps = GpuBuffer::upload(&[1e-8]).expect("eps");
+		kernels::gpu_add_scalar_inplace(&eps, d, &var).expect("var eps");
+		let std = GpuBuffer::alloc(d).expect("std");
+		kernels::gpu_sqrt(&var, d, &std).expect("std");
+		let xc = GpuBuffer::alloc(n * d).expect("center");
+		kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d, &xc).expect("center");
+		let xbuf = GpuBuffer::alloc(n * d).expect("scale");
+		kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
 		let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
 
 		// Two-layer relu→sigmoid, He init exactly as fit does.
 		let h = 16usize;
 		let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
 			let scale = (2.0 / fan_in as f64).sqrt();
-			let w = kernels::gpu_randn(fan_in * units, seed).expect("randn");
-			kernels::gpu_scale_inplace(&w, scale, fan_in * units);
+			let w = GpuBuffer::alloc(fan_in * units).expect("randn alloc");
+			kernels::gpu_randn(fan_in * units, seed as usize, &w).expect("randn");
+			let sbuf = GpuBuffer::upload(&[scale]).expect("he scale");
+			kernels::gpu_scale_inplace(&sbuf, fan_in * units, &w).expect("he scale");
 			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
 			LayerParams {
 				kind: LayerKind::Dense,
@@ -1143,9 +1157,10 @@ mod metric_gpu_tests {
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
 		let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
+		let ss = crate::train::StepScalars::new(0.5, n);
 
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
-		model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 
 		const EPOCHS: usize = 10;
 		let mut r2s = Vec::with_capacity(EPOCHS);
@@ -1153,8 +1168,8 @@ mod metric_gpu_tests {
 			let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 			for _ in 0..EPOCHS {
 				forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
-				model.backward_step(&params, &xbuf, &ybuf, n, &sc);
-				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, &sc.metric_scalar, n);
+				model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
+				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
 				r2s.push(1.0 - download_scalar(&sc.metric_scalar) / ss_tot);
 			}
 		}
@@ -1183,20 +1198,30 @@ mod metric_gpu_tests {
 		let d = x.ncols();
 
 		let (xraw, _, _) = upload(x);
-		let mean = kernels::gpu_reduce_mean_cols(&xraw, n, d).expect("mean");
-		let var = kernels::gpu_reduce_var_cols(&xraw, n, d).expect("var");
-		kernels::gpu_add_scalar_inplace(&var, 1e-8, d);
-		let std = kernels::gpu_sqrt(&var, d).expect("std");
-		let xc = kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d).expect("center");
-		let xbuf = kernels::gpu_broadcast_div(&xc, &std, n * d, d).expect("scale");
+		let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
+		let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).expect("reduce ws");
+		let mean = GpuBuffer::alloc(d).expect("mean");
+		kernels::gpu_reduce_mean_cols(&xraw, n, d, &ws, &mean).expect("mean");
+		let var = GpuBuffer::alloc(d).expect("var");
+		kernels::gpu_reduce_var_cols(&xraw, n, d, &ws, &var).expect("var");
+		let eps = GpuBuffer::upload(&[1e-8]).expect("eps");
+		kernels::gpu_add_scalar_inplace(&eps, d, &var).expect("var eps");
+		let std = GpuBuffer::alloc(d).expect("std");
+		kernels::gpu_sqrt(&var, d, &std).expect("std");
+		let xc = GpuBuffer::alloc(n * d).expect("center");
+		kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d, &xc).expect("center");
+		let xbuf = GpuBuffer::alloc(n * d).expect("scale");
+		kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
 		let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
 
 		let h = 16usize;
 		let lr = 0.01;
 		let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
 			let scale = (2.0 / fan_in as f64).sqrt();
-			let w = kernels::gpu_randn(fan_in * units, seed).expect("randn");
-			kernels::gpu_scale_inplace(&w, scale, fan_in * units);
+			let w = GpuBuffer::alloc(fan_in * units).expect("randn alloc");
+			kernels::gpu_randn(fan_in * units, seed as usize, &w).expect("randn");
+			let sbuf = GpuBuffer::upload(&[scale]).expect("he scale");
+			kernels::gpu_scale_inplace(&sbuf, fan_in * units, &w).expect("he scale");
 			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
 			LayerParams {
 				kind: LayerKind::Dense,
@@ -1243,9 +1268,10 @@ mod metric_gpu_tests {
 				fit_score: Cell::new(f64::NAN),
 			}),
 		};
+		let ss = crate::train::StepScalars::new(lr, n);
 		let sc = Scratch::new(&params, n, false);
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
-		model.backward_step(&params, &xbuf, &ybuf, n, &sc);
+		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 		let pp_w: Vec<Vec<f64>> = params
 			.iter()
 			.map(|p| download_vec(&p.w, p.in_dim * p.out_dim))
@@ -1298,6 +1324,8 @@ mod metric_gpu_tests {
 			&ref_da[last],
 			n,
 			n * params[last].out_dim,
+			&sc,
+			&ss,
 		);
 		for l in (0..params.len()).rev() {
 			let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
@@ -1307,18 +1335,18 @@ mod metric_gpu_tests {
 					kernels::gpu_relu_backward_into(
 						&ref_da[l],
 						&sc.acts[l],
-						&ref_dz[l],
 						m,
-					);
+						&ref_dz[l],
+					).expect("relu bwd");
 					&ref_dz[l]
 				}
 				Activation::Sigmoid => {
 					kernels::gpu_sigmoid_backward_into(
 						&ref_da[l],
 						&sc.acts[l],
-						&ref_dz[l],
 						m,
-					);
+						&ref_dz[l],
+					).expect("sigmoid bwd");
 					&ref_dz[l]
 				}
 				Activation::Linear => &ref_da[l],
@@ -1326,32 +1354,32 @@ mod metric_gpu_tests {
 			};
 			let a_prev = if l == 0 { &xbuf } else { &sc.acts[l - 1] };
 			if out_dim == 1 {
-				kernels::gpu_dgemv_into(a_prev, grad, &ref_dw[l], n, in_dim, true);
-				kernels::gpu_reduce_sum_cols_into(grad, &ref_db[l], &ref_ws, n, 1);
+				kernels::gpu_dgemv_into(a_prev, grad, &ref_dw[l], n, in_dim, 1).expect("dgemv");
+				kernels::gpu_reduce_sum_cols_into(grad, &ref_ws, n, 1, &ref_db[l]).expect("db reduce");
 				if l > 0 {
-					kernels::gpu_dger_into(grad, &params[l].w, &ref_da[l - 1], n, in_dim);
+					kernels::gpu_dger_into(grad, &params[l].w, &ref_da[l - 1], n, in_dim).expect("dger");
 				}
 			} else if l > 0 {
 				kernels::gpu_linear_backward_full_into(
 					grad,
 					a_prev,
 					&params[l].w,
-					&ref_da[l - 1],
-					&ref_dw[l],
-					&ref_db[l],
 					&ref_ws,
 					&ref_partials,
 					n,
 					out_dim,
 					in_dim,
-				);
+					&ref_da[l - 1],
+					&ref_dw[l],
+					&ref_db[l],
+				).expect("linear full bwd");
 			} else {
 				kernels::gpu_linear_backward_weights_only_into(
-					grad, a_prev, &ref_dw[l], &ref_db[l], &ref_ws, &ref_partials, n, out_dim, in_dim,
-				);
+					grad, a_prev, &ref_ws, &ref_partials, n, out_dim, in_dim, &ref_dw[l], &ref_db[l],
+				).expect("linear weights bwd");
 			}
-			kernels::gpu_sgd_update(&params[l].w, &ref_dw[l], lr, in_dim * out_dim);
-			kernels::gpu_sgd_update(&params[l].b, &ref_db[l], lr, out_dim);
+			kernels::gpu_sgd_update(&ref_dw[l], &ss.neg_lr, in_dim * out_dim, &params[l].w).expect("sgd w");
+			kernels::gpu_sgd_update(&ref_db[l], &ss.neg_lr, out_dim, &params[l].b).expect("sgd b");
 		}
 		let ref_w: Vec<Vec<f64>> = params
 			.iter()
