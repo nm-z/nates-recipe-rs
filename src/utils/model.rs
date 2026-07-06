@@ -1354,10 +1354,10 @@ mod metric_gpu_tests {
 			};
 			let a_prev = if l == 0 { &xbuf } else { &sc.acts[l - 1] };
 			if out_dim == 1 {
-				kernels::gpu_dgemv_into(a_prev, grad, &ref_dw[l], n, in_dim, 1).expect("dgemv");
+				kernels::gpu_dgemv_into(a_prev, grad, n, in_dim, 1, &ref_dw[l]).expect("dgemv");
 				kernels::gpu_reduce_sum_cols_into(grad, &ref_ws, n, 1, &ref_db[l]).expect("db reduce");
 				if l > 0 {
-					kernels::gpu_dger_into(grad, &params[l].w, &ref_da[l - 1], n, in_dim).expect("dger");
+					kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, &ref_da[l - 1]).expect("dger");
 				}
 			} else if l > 0 {
 				kernels::gpu_linear_backward_full_into(

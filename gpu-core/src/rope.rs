@@ -42,14 +42,14 @@ pub const ROPE_THETA: f64 = 10000.0;
 /// q,k are mutated in place (serve as both input and output).
 // in-place: writes q+k (rotary over heads)
 pub fn gpu_rope_qk_heads_inplace(
-	q: &GpuBuffer,
-	k: &GpuBuffer,
 	sgn: &GpuBuffer,
 	theta: &GpuBuffer,
 	m: usize,
 	d: usize,
 	heads: usize,
 	seq: usize,
+	q: &GpuBuffer,
+	k: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_ropex_qk_heads(
@@ -122,7 +122,7 @@ mod tests {
 		// analytic: dL/dq = R(-angle)·g = rope(g, -1) on the q slot
 		let gq = GpuBuffer::upload(&g).expect("g");
 		let gk = GpuBuffer::upload(&vec![0.0f64; m * d]).expect("gk");
-		gpu_rope_qk_heads_inplace(&gq, &gk, &sgn_bwd, &theta, m, d, heads, seq).expect("rope bwd");
+		gpu_rope_qk_heads_inplace(&sgn_bwd, &theta, m, d, heads, seq, &gq, &gk).expect("rope bwd");
 		let analytic = {
 			let mut v = vec![0.0f64; m * d];
 			gq.download(&mut v).expect("dl");
@@ -133,7 +133,7 @@ mod tests {
 		let loss = |x: &[f64]| -> f64 {
 			let q = GpuBuffer::upload(x).expect("q");
 			let k = GpuBuffer::upload(&xk).expect("k");
-			gpu_rope_qk_heads_inplace(&q, &k, &sgn_fwd, &theta, m, d, heads, seq).expect("rope fwd");
+			gpu_rope_qk_heads_inplace(&sgn_fwd, &theta, m, d, heads, seq, &q, &k).expect("rope fwd");
 			let mut o = vec![0.0f64; m * d];
 			q.download(&mut o).expect("o");
 			o.iter().zip(&g).map(|(a, b)| a * b).sum()

@@ -319,7 +319,7 @@ pub fn gpu_fill_sentinel(
 }
 
 // in-place: writes idx (iota init)
-pub fn gpu_init_idx(idx: &GpuBuffer, n: usize) -> Result<(), HipError> {
+pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_init_idx(idx.ptr_raw(), safe_i32(n), std::ptr::null_mut());
 	}
@@ -329,10 +329,10 @@ pub fn gpu_init_idx(idx: &GpuBuffer, n: usize) -> Result<(), HipError> {
 
 // in-place: writes data (one compare-exchange stage)
 pub fn gpu_bitonic_step(
-	data: &GpuBuffer,
 	j: usize,
 	k: usize,
 	padded_n: usize,
+	data: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_bitonic_step(
@@ -349,11 +349,11 @@ pub fn gpu_bitonic_step(
 
 // in-place: writes keys+idx (keyed stage)
 pub fn gpu_bitonic_step_idx(
-	keys: &GpuBuffer,
-	vals: &GpuBuffer,
 	j: usize,
 	k: usize,
 	padded_n: usize,
+	keys: &GpuBuffer,
+	vals: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_bitonic_step_idx(
@@ -371,11 +371,11 @@ pub fn gpu_bitonic_step_idx(
 
 // in-place: writes keys+vals (key/value stage)
 pub fn gpu_bitonic_step_dd(
-	keys: &GpuBuffer,
-	vals: &GpuBuffer,
 	j: usize,
 	k: usize,
 	padded_n: usize,
+	keys: &GpuBuffer,
+	vals: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_bitonic_step_dd(
@@ -404,7 +404,7 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	while k <= pn {
 		let mut j = k >> 1;
 		while j > 0 {
-			gpu_bitonic_step(&work, j, k, pn)?;
+			gpu_bitonic_step(j, k, pn, &work)?;
 			j >>= 1;
 		}
 		k <<= 1;
@@ -420,7 +420,7 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	let mut keys = GpuBuffer::alloc(pn)?;
 	let vals = GpuBuffer::alloc_bytes(pn * 4)?;
 	keys.copy_from(x, n * 8)?;
-	gpu_init_idx(&vals, pn)?;
+	gpu_init_idx(pn, &vals)?;
 	if pn > n {
 		let sentinel = GpuBuffer::upload(&[f64::MAX])?;
 		gpu_fill_sentinel(&keys, n, pn, &sentinel)?;
@@ -429,7 +429,7 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	while k <= pn {
 		let mut j = k >> 1;
 		while j > 0 {
-			gpu_bitonic_step_idx(&keys, &vals, j, k, pn)?;
+			gpu_bitonic_step_idx(j, k, pn, &keys, &vals)?;
 			j >>= 1;
 		}
 		k <<= 1;
@@ -460,7 +460,7 @@ pub fn gpu_sort_by_key(
 	while k <= pn {
 		let mut j = k >> 1;
 		while j > 0 {
-			gpu_bitonic_step_dd(&wk, &wv, j, k, pn)?;
+			gpu_bitonic_step_dd(j, k, pn, &wk, &wv)?;
 			j >>= 1;
 		}
 		k <<= 1;

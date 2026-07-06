@@ -165,18 +165,18 @@ fn main() {
 		let k = GpuBuffer::upload(&k0).expect("k");
 		let v = GpuBuffer::upload(&v0).expect("v");
 		let theta_buf = GpuBuffer::upload(&[theta]).expect("theta");
-		gpu_rope_partial(&q, &theta_buf, T * 16, hd, rotary, 16).expect("rope q");
-		gpu_rope_partial(&k, &theta_buf, T * nkv, hd, rotary, nkv).expect("rope k");
+		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
+		gpu_rope_partial(&theta_buf, T * nkv, hd, rotary, nkv, &k).expect("rope k");
 		twice(label, T * 16 * hd, |o| gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, o).expect("gqa"));
 
 		// rope itself: re-upload, rotate, download, twice.
 		let mut a = vec![0.0f64; T * 16 * hd];
 		let mut b = vec![0.0f64; T * 16 * hd];
 		q.load(&q0).expect("reload q");
-		gpu_rope_partial(&q, &theta_buf, T * 16, hd, rotary, 16).expect("rope q");
+		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
 		q.download(&mut a).expect("dl");
 		q.load(&q0).expect("reload q");
-		gpu_rope_partial(&q, &theta_buf, T * 16, hd, rotary, 16).expect("rope q");
+		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
 		q.download(&mut b).expect("dl");
 		cmp(&format!("rope {label}"), &a, &b);
 	}
@@ -213,10 +213,10 @@ fn main() {
 	let mut sf1 = vec![0.0f64; T * NE];
 	let mut sf2 = vec![0.0f64; T * NE];
 	x.load(&x0).expect("reload");
-	gpu_scale_f64_inplace(&x, &scale, T * NE).expect("scale_f64");
+	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
 	x.download(&mut sf1).expect("dl");
 	x.load(&x0).expect("reload");
-	gpu_scale_f64_inplace(&x, &scale, T * NE).expect("scale_f64");
+	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
 	x.download(&mut sf2).expect("dl");
 	cmp("scale_f64", &sf1, &sf2);
 	let err_scale = s1.iter().zip(&sf1).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);

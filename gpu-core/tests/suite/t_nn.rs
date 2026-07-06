@@ -533,7 +533,7 @@ fn test_causal_softmax_rows() {
 	let x_data: Vec<f32> = vec![1.0; 9];
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
-	gpu_causal_softmax_rows(&x, 3, 3).unwrap();
+	gpu_causal_softmax_rows(3, 3, &x).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 9];

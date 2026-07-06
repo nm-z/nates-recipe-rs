@@ -203,7 +203,7 @@ pub fn gpu_scaled_dot_product_attention(
 // In-place: upper triangle (j > i) masked to 0 before normalization.
 // x: f32 buffer shaped (rows, cols), modified in place.
 // in-place: writes scores (rows softmaxed under causal mask)
-pub fn gpu_causal_softmax_rows(x: &GpuBuffer, rows: usize, cols: usize) -> Result<(), HipError> {
+pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_causal_softmax_rows(x.ptr_raw(), rows as i32, cols as i32, std::ptr::null_mut());
 	}

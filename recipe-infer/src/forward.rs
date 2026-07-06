@@ -384,8 +384,13 @@ pub fn forward_into(
 				// dgemv reads the same operands once and is memory-bound, ~33× faster.
 				if p.out_dim == 1 {
 					kernels::gpu_matvec_bias_into(
-						prev, &p.w, &p.b, &acts[l], n, p.in_dim,
-					).expect("matvec");
+	prev,
+	&p.w,
+	&p.b,
+	n,
+	p.in_dim,
+	&acts[l],
+).expect("matvec");
 				} else {
 					kernels::gpu_linear_into(
 						prev, &p.w, &p.b, n, p.out_dim, p.in_dim, &acts[l],
@@ -468,7 +473,7 @@ pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, s
 	// RoPE: rotate Q,K per head by token position before the QK dot product, so
 	// scores depend on relative position (the attention op is position-aware).
 	// sgn=+1 (forward rotation), theta the fixed base frequency.
-	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_q, &sc.a_k, &sc.c_one, &sc.c_rope_theta, m, d, heads, s).expect("rope");
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k).expect("rope");
 	// Fused flash attention: context in one launch, no L×L buffer anywhere; the
 	// per-row logsumexp lands in a_lse so backward can recompute score tiles.
 	kernels::gpu_flash_attention_train_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx, &sc.a_lse).expect("flash attn");
@@ -491,7 +496,7 @@ pub fn attn_forward_cached(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: u
 	kernels::gpu_linear_into(h, &p.wk, &p.b, m, d, d, &sc.a_k).expect("attn k");
 	kernels::gpu_linear_into(h, &p.wv, &p.b, m, d, d, &sc.a_v).expect("attn v");
 	// Same RoPE as the training path so cached inference matches it exactly.
-	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_q, &sc.a_k, &sc.c_one, &sc.c_rope_theta, m, d, heads, s).expect("rope");
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k).expect("rope");
 	// Fused attention in one kernel launch — no L×L buffer anywhere.
 	kernels::gpu_flash_attention_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx).expect("flash attn");
 	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, m, d, d, out).expect("attn out");

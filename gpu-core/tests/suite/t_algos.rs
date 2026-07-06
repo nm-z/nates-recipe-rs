@@ -197,7 +197,7 @@ fn test_gpu_gcn_norm() {
 	let features = GpuBuffer::upload(&features_h).unwrap();
 	let deg = GpuBuffer::upload(&deg_h).unwrap();
 
-	graph::gpu_gcn_norm(&features, &deg, 4, 2).unwrap();
+	graph::gpu_gcn_norm(&deg, 4, 2, &features).unwrap();
 
 	features.download(&mut features_h).unwrap();
 

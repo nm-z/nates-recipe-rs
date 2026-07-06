@@ -56,3 +56,4 @@ examples/*/test_images/
 /*.patch
 /deleted-copilot-branches-*.txt
 .recipe_spill
+/suite.log

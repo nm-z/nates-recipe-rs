@@ -670,8 +670,8 @@ fn layer(
 	gpu_rmsnorm_f64(&ar.q, &nm["q_norm"], &m.eps, t * NQH, hd, &ar.q)?;
 	gpu_rmsnorm_f64(&ar.k, &nm["k_norm"], &m.eps, t * nkv, hd, &ar.k)?;
 	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
-	gpu_rope_partial(&ar.q, theta, t * NQH, hd, d.rotary, NQH)?;
-	gpu_rope_partial(&ar.k, theta, t * nkv, hd, d.rotary, nkv)?;
+	gpu_rope_partial(theta, t * NQH, hd, d.rotary, NQH, &ar.q)?;
+	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
 	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, NQH, nkv, hd, prefix, &ar.attn)?;
 	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, NE, qd, &ar.o)?;
 	gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, NE, &ar.o)?;
@@ -754,7 +754,7 @@ fn layer(
 	gpu_add_into(&ar.mlp, &ar.mop, t * NE, &ar.comb)?;
 	gpu_rmsnorm_f64(&ar.comb, &nm["pfw"], &m.eps, t, NE, &ar.comb)?;
 	gpu_add_into(&ar.attn_out, &ar.comb, t * NE, h_out)?;
-	gpu_scale_f64_inplace(h_out, &m.ls_dev[l], t * NE)?;
+	gpu_scale_f64_inplace(&m.ls_dev[l], t * NE, h_out)?;
 	Ok(())
 }
 

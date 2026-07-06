@@ -173,10 +173,10 @@ pub fn gpu_degree(
 // features: n_nodes x feat (f64, in-place out). deg: n_nodes (f64).
 // in-place: writes features (D^-1/2 A D^-1/2 normalization)
 pub fn gpu_gcn_norm(
-	features: &GpuBuffer,
 	deg: &GpuBuffer,
 	n_nodes: usize,
 	feat: usize,
+	features: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_gcn_norm(

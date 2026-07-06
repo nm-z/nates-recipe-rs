@@ -936,7 +936,7 @@ impl Ooc {
 						kernels::gpu_linear_into(&prev, &p.w, &p.b, m, d, d, &q).expect("attn q");
 						kernels::gpu_linear_into(&prev, &p.wk, &p.b, m, d, d, &k).expect("attn k");
 						kernels::gpu_linear_into(&prev, &p.wv, &p.b, m, d, d, &v).expect("attn v");
-						gpu_core::rope::gpu_rope_qk_heads_inplace(&q, &k, &sc.c_one, &sc.c_rope_theta, m, d, heads, s).expect("rope");
+						gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &q, &k).expect("rope");
 						self.a_q.commit(s0, cnt, &q, &self.writer, &self.host);
 						self.a_k.commit(s0, cnt, &k, &self.writer, &self.host);
 						self.a_v.commit(s0, cnt, &v, &self.writer, &self.host);
@@ -989,7 +989,7 @@ impl Ooc {
 							let cout = p.out_dim / ((lin - kk) / stride + 1);
 							kernels::gpu_conv1d_into(&prev, &p.w, &p.b, cnt, cin, lin, cout, kk, stride, &out).expect("conv1d");
 						} else if p.out_dim == 1 {
-							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, &out, cnt, p.in_dim).expect("matvec");
+							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, cnt, p.in_dim, &out).expect("matvec");
 						} else {
 							kernels::gpu_linear_into(&prev, &p.w, &p.b, cnt, p.out_dim, p.in_dim, &out).expect("linear");
 						}
@@ -1397,7 +1397,7 @@ impl Ooc {
 			kernels::gpu_flash_attention_backward_into(
 				&q, &k, &v, &ctx, &dctx, &lse, cnt, s, d, heads, &dsum, &dq, &dk, &dv,
 			);
-			gpu_core::rope::gpu_rope_qk_heads_inplace(&dq, &dk, &sc.c_neg_one, &sc.c_rope_theta, cnt * s, d, heads, s).expect("rope bwd");
+			gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_neg_one, &sc.c_rope_theta, cnt * s, d, heads, s, &dq, &dk).expect("rope bwd");
 			self.a_dq.commit(s0, cnt, &dq, &self.writer, &self.host);
 			self.a_dk.commit(s0, cnt, &dk, &self.writer, &self.host);
 			self.a_dv.commit(s0, cnt, &dv, &self.writer, &self.host);

@@ -436,7 +436,7 @@ impl ModelInner {
 		// dscores came from ROTATED Q,K, so a_dq/a_dk are gradients w.r.t. the rotated
 		// tensors. Un-rotate (RoPE with sgn=-1) to get gradients w.r.t. the raw Q,K
 		// projection outputs before back-propagating through Wq/Wk.
-		gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.a_dq, &sc.a_dk, &sc.c_neg_one, &sc.c_rope_theta, m, d, heads, s).expect("rope backward");
+		gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_neg_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_dq, &sc.a_dk).expect("rope backward");
 		// {Q,K,V} = H·{Wq,Wk,Wv}: accumulate dH = dH_q+dH_k+dH_v into da_below; update weights.
 		kernels::gpu_linear_backward_full_into(
 			&sc.a_dq,
@@ -673,7 +673,7 @@ impl ModelInner {
 				kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, n, 1, in_dim, &sc.dw).expect("splitk dw");
 				kernels::gpu_reduce_sum_cols_into(grad, &sc.reduce_ws, n, 1, &sc.db).expect("db reduce");
 				if l > 0 {
-					kernels::gpu_dger_into(grad, &params[l].w, da_below, n, in_dim).expect("dger");
+					kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, da_below).expect("dger");
 				}
 			} else if l > 0 {
 				kernels::gpu_linear_backward_full_into(

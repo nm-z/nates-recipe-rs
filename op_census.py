@@ -174,7 +174,8 @@ print(f"dump: {dump_path}", file=sys.stderr)
 
 # ── --check: enforce the schedulable-op type constraint ──────────────────────
 # fn op(in: &GpuBuffer ..., dim: usize ..., out: &GpuBuffer ...) -> Result<()>
-# inputs only &GpuBuffer/usize; return exactly Result<()>; no methods.
+# Gates: types, positional order (B*U*B*), mandatory trailing out block, and the
+# plumbing inverted rule. The partition over TOTAL PARSED is a hard assert.
 ALLOW = {
       "gpu_shutdown",        # device lifecycle, not a schedulable op
 }
@@ -183,7 +184,30 @@ def is_plan_helper(r):
       return all(t == "usize" for t in r["inputs"]) and r["output"] == "usize" \
             and r["name"].endswith("_workspace_bytes")
 
+def fn_body(mod, name):
+      # body text of `pub fn name` in a module file (for the plumbing gate)
+      src = open(os.path.join(SRC, mod + ".rs")).read()
+      m = re.search(r"\bpub(\(crate\))?\s+(unsafe\s+)?fn\s+" + name + r"\b", src)
+      if not m:
+            return ""
+      b0 = src.find("{", m.end())
+      if b0 == -1:
+            return ""
+      depth, i = 0, b0
+      while i < len(src):
+            if src[i] == "{":
+                  depth += 1
+            elif src[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                        break
+            i += 1
+      return src[b0:i]
+
 if "--check" in sys.argv:
+      total = len(rows)
+      ffi = [r for r in rows if r["kind"] == "ffi"]
+      plumb = [r for r in rows if r["kind"] == "plumbing"]
       all_op = [r for r in rows if r["kind"] == "op"]
       excluded = [r for r in all_op if r["not_an_op"]]
       allow_only = [r for r in all_op if r["name"] in ALLOW and not r["not_an_op"]]
@@ -191,9 +215,7 @@ if "--check" in sys.argv:
                  if is_plan_helper(r) and not r["not_an_op"] and r["name"] not in ALLOW]
       gated = [r for r in all_op
                if not r["not_an_op"] and r["name"] not in ALLOW and not is_plan_helper(r)]
-      # THE partition law: every op-module fn is in exactly one bucket.
-      assert len(all_op) == len(gated) + len(excluded) + len(helpers) + len(allow_only), \
-            f"partition broken: {len(all_op)} != {len(gated)}+{len(excluded)}+{len(helpers)}+{len(allow_only)}"
+
       viols = []
       for r in gated:
             why = []
@@ -208,67 +230,59 @@ if "--check" in sys.argv:
             if not re.fullmatch(r"B*U*B*", cls):
                   why.append(f"param order {cls} not (ins,dims,outs)")
             if not cls.endswith("B"):
-                  # no trailing out block: must be a declared in-place mutator,
-                  # else it computes nothing anyone can read — dead-op flag.
-                  named = "inplace" in r["name"] or r["name"].endswith("_into")
-                  if not (named or r["in_place"]):
-                        why.append("no out block and not in-place-named/annotated")
+                  why.append(f"no trailing out block ({cls}) — outs are mandatory, aliases included")
             if why:
                   viols.append((r, why))
-      by_clause = Counter()
-      for r, why in viols:
-            for w in why:
-                  by_clause[w.split(" ")[0] + " " + (w.split(" ")[1] if w.startswith(("input", "returns")) else "")] += 1
+
+      # plumbing inverted rule: exempt from the op constraint, but a pub fn there
+      # that takes &GpuBuffer AND launches a kernel needs a not-an-op annotation.
+      plumb_viols = []
+      plumb_annotated = []
+      for r in plumb:
+            takes_buf = any("GpuBuffer" in t for t in r["inputs"])
+            if not takes_buf:
+                  continue
+            if not re.search(r"\blaunch_\w+\s*\(", fn_body(r["module"], r["name"])):
+                  continue
+            if r["not_an_op"]:
+                  plumb_annotated.append(r)
+            else:
+                  plumb_viols.append(r)
+
       for r, why in sorted(viols, key=lambda v: (v[0]["module"], v[0]["line"])):
             print(f"VIOLATION gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {'; '.join(why)}")
-      print(f"\n--check: {len(gated)} ops, {len(gated) - len(viols)} conforming, {len(viols)} violating")
-      print(f"partition: {len(all_op)} op-module fns = {len(gated)} gated"
-            f" + {len(excluded)} not-an-op + {len(helpers)} plan-helpers"
-            f" + {len(allow_only)} allowlisted  [asserted]")
-      for clause, n in by_clause.most_common():
-            print(f"  {n:4d}  {clause}")
+      for r in plumb_viols:
+            print(f"VIOLATION gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: plumbing pub fn takes &GpuBuffer and launches a kernel without not-an-op annotation")
+
+      n_bad = len(viols) + len(plumb_viols)
+      print(f"\n--check: {len(gated)} ops, {len(gated) - len(viols)} conforming, {n_bad} violating")
+
+      # THE partition law over everything the parser saw. Off-by-one = crash.
+      buckets = len(gated) + len(excluded) + len(helpers) + len(allow_only) + len(plumb) + len(ffi)
+      assert buckets == total, \
+            f"PARTITION BROKEN: {total} parsed != {len(gated)} gated + {len(excluded)} not-an-op " \
+            f"+ {len(helpers)} auto-exempt + {len(allow_only)} allowlisted + {len(plumb)} plumbing + {len(ffi)} ffi = {buckets}"
+      print(f"partition [asserted]: {total} parsed = {len(gated)} gated"
+            f" + {len(excluded)} not-an-op + {len(helpers)} auto-exempt(usize-only *_workspace_bytes)"
+            f" + {len(allow_only)} allowlisted + {len(plumb)} plumbing + {len(ffi)} ffi decls")
+      from collections import Counter as _C
+      pm = _C(r["module"] for r in plumb)
+      print("plumbing per module: " + ", ".join(f"{m}={c}" for m, c in sorted(pm.items())))
+      print(f"allowlisted: {sorted(r['name'] for r in allow_only) or '(empty)'}")
+      print(f"auto-exempt helpers ({len(helpers)}):")
+      for r in sorted(helpers, key=lambda r: (r["module"], r["line"])):
+            print(f"  gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}")
       if excluded:
             print(f"\nnot-an-op exclusions ({len(excluded)}) — audit this list:")
             for r in sorted(excluded, key=lambda r: (r["module"], r["line"])):
                   print(f"  gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {r['not_an_op']}")
-      sys.exit(1 if viols else 0)
-
-def bars(counter, total, top=None, width=36):
-      items = counter.most_common(top)
-      mx = items[0][1] if items else 1
-      out = []
-      for t, c in items:
-            b = "█" * max(1, round(c / mx * width))
-            out.append(f"{c:5d}  {c/total*100:5.1f}%  {b}  {t}")
-      return "\n".join(out)
-
-ops = [r for r in rows if r["kind"] == "op"]
-print(f"\n=== SCOPE: {len(ops)} compute ops | {sum(1 for r in rows if r['kind']=='ffi')} ffi launchers | {sum(1 for r in rows if r['kind']=='plumbing')} plumbing fns ===")
-
-# output freq
-out_c = Counter(r["output"] for r in ops)
-print(f"\n=== OUTPUT TYPES ({len(ops)} ops) ===")
-print(bars(out_c, len(ops)))
-
-# individual input param freq
-in_params = Counter()
-for r in ops:
-      for t in r["inputs"]:
-            in_params[t] += 1
-      if r["recv"]: in_params["&" + r["recv"].lstrip("&").replace("mut ", "")] += 0  # receivers rare in op modules
-tot_params = sum(in_params.values())
-print(f"\n=== INPUT PARAMETER TYPES ({tot_params} params across {len(ops)} ops) ===")
-print(bars(in_params, tot_params, top=25))
-
-# input multiset freq
-def sig_of(r):
-      c = Counter(r["inputs"])
-      return ", ".join(f"{t}×{n}" if n > 1 else t for t, n in sorted(c.items(), key=lambda x: (-x[1], x[0])))
-sig_c = Counter(sig_of(r) for r in ops)
-print(f"\n=== INPUT SIGNATURE SETS (top 30 of {len(sig_c)} distinct) ===")
-print(bars(sig_c, len(ops), top=30))
-
-# full-shape freq: inputs -> output
-shape_c = Counter(f"({sig_of(r)}) -> {r['output']}" for r in ops)
-print(f"\n=== FULL SHAPES inputs->output (top 20 of {len(shape_c)} distinct) ===")
-print(bars(shape_c, len(ops), top=20))
+      if plumb_annotated:
+            print(f"\nplumbing launch-fns accepted by annotation ({len(plumb_annotated)}):")
+            for r in plumb_annotated:
+                  print(f"  gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {r['not_an_op']}")
+      aliases = [r for r in all_op if r.get("in_place")]
+      if aliases:
+            print(f"\nOPDESC alias records (// in-place:, {len(aliases)}):")
+            for r in sorted(aliases, key=lambda r: (r["module"], r["line"])):
+                  print(f"  gpu-core/src/{r['module']}.rs:{r['line']} {r['name']}: {r['in_place']}")
+      sys.exit(1 if n_bad else 0)

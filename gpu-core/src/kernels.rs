@@ -2555,12 +2555,12 @@ pub fn gpu_scale(
 	// hipblasDscal is out: host-pointer-mode alpha host-derefs the device
 	// scalar (SIGSEGV) and device pointer mode would be a new vendor call.
 	unsafe { crate::memory::xfer_sync(out.ptr, x.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
-	crate::infer_ops::gpu_scale_f64_inplace(out, scalar, n)
+	crate::infer_ops::gpu_scale_f64_inplace(scalar, n, out)
 }
 
 /// In-place scale: x *= scalar (no alloc, no copy)
 pub fn gpu_scale_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
-	crate::infer_ops::gpu_scale_f64_inplace(x, scalar, n)
+	crate::infer_ops::gpu_scale_f64_inplace(scalar, n, x)
 }
 
 pub fn gpu_fma(
@@ -2927,9 +2927,9 @@ pub fn gpu_matvec_bias_into(
 	x: &GpuBuffer,
 	w: &GpuBuffer,
 	b: &GpuBuffer,
-	out: &GpuBuffer,
 	n: usize,
 	in_dim: usize,
+	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_repeat_rows(
@@ -2968,10 +2968,10 @@ pub fn gpu_matvec_bias_into(
 pub fn gpu_dgemv_into(
 	a: &GpuBuffer,
 	x: &GpuBuffer,
-	out: &GpuBuffer,
 	n: usize,
 	in_dim: usize,
 	trans: usize,
+	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let op = if trans != 0 {
 		HIPBLAS_OP_N
@@ -3003,7 +3003,7 @@ pub fn gpu_dgemv_into(
 /// da_prev(n×in_dim) = grad(n) ⊗ w(in_dim), the rank-1 outer product for the out_dim==1
 /// backward path. Row-major `out` = column-major (in_dim×n), lda=in_dim; dger writes
 /// A_cm[j,i] = w[j]·grad[i], i.e. da_prev[i,j] = grad[i]·w[j].
-pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize, in_dim: usize) -> Result<(), HipError> {
+pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, n: usize, in_dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		let _ = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
