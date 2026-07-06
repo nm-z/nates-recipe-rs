@@ -252,3 +252,19 @@ extern "C" void launch_clip_value(double* x, const double* lo, const double* hi,
       hipLaunchKernelGGL(clip_value_kernel, dim3(blocks), dim3(threads), 0, stream,
             x, lo, hi, n);
 }
+
+// Plain SGD step: weights[i] += neg_lr * grad[i] (neg_lr = -lr, device scalar)
+extern "C" __global__ void sgd_update_f64_kernel(double* w, const double* g, const double* neg_lr_p, int n) {
+      double neg_lr = *neg_lr_p;
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i < n) {
+            w[i] += neg_lr * g[i];
+      }
+}
+
+extern "C" void launch_sgd_update_f64(double* w, const double* g, const double* neg_lr, int n, hipStream_t stream) {
+      int threads = 256;
+      int blocks = (n + threads - 1) / threads;
+      hipLaunchKernelGGL(sgd_update_f64_kernel, dim3(blocks), dim3(threads), 0, stream,
+            w, g, neg_lr, n);
+}

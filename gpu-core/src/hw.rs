@@ -103,30 +103,6 @@ pub fn disarm_saturation_crash() {
 	SAT_ARMED.store(false, Ordering::SeqCst);
 }
 
-/// 1 Hz trivial device op for the life of the process. The GPU has a ~5 s
-/// runtime-PM autosuspend; a multi-minute host-only phase (CSV parse,
-/// tokenize) lets it suspend, and the wake races the first heavy transfer —
-/// faults/wedges cluster exactly there (gemma4 fights the same disease with
-/// a load-scoped keepalive; the recipe fit's crashes sit right after the
-/// data-load gap, writing runtime-internal VAs no allocation of ours owns).
-pub fn spawn_gpu_keepalive() {
-	static ONCE: std::sync::Once = std::sync::Once::new();
-	ONCE.call_once(|| {
-		let Ok(buf) = crate::memory::GpuBuffer::alloc(1) else {
-			eprintln!("keepalive: alloc failed");
-			return;
-		};
-		std::thread::spawn(move || {
-			loop {
-				if buf.memset_zero(8).is_err() {
-					return;
-				}
-				std::thread::sleep(std::time::Duration::from_secs(1));
-			}
-		});
-	});
-}
-
 // _IOWR('K', 0x1F, struct kfd_ioctl_smi_events_args{u32,u32}) — kfd_ioctl.h:1735.
 const AMDKFD_IOC_SMI_EVENTS: libc::c_ulong = 0xC008_4B1F;
 

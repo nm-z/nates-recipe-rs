@@ -496,7 +496,7 @@ unsafe fn h2d_pinned(
 
 /// Blocking transfer: enqueue on the default stream, then wait on that stream —
 /// the drop-in for the old synchronous `hipMemcpy`. Fresh buffers come from the
-/// warmed, page-committed pool (see `ensure_pool_warmed`), so the async SDMA copy
+/// initialized pool (see `ensure_pool_init`), so the async SDMA copy
 /// never touches an uncommitted page.
 pub(crate) unsafe fn xfer_sync(
 	dst: *mut c_void,
@@ -581,7 +581,8 @@ thread_local! {
 /// copies (the only copy primitive now) never touch an uncommitted page and
 /// fault "page not present". Re-entrant-safe: the warm's own 1 GiB alloc re-enters
 /// `alloc_bytes` → here, but the thread-local WARMING guard short-circuits it.
-pub(crate) fn ensure_pool_warmed() {
+/// Retires only when the one-claim arena lifecycle replaces pool growth per-run.
+pub(crate) fn ensure_pool_init() {
 	if POOL_INIT.is_completed() || WARMING.with(|w| w.get()) {
 		return;
 	}
@@ -601,14 +602,26 @@ pub(crate) fn ensure_pool_warmed() {
 		crate::hip::register_fault_autopsy_once();
 		crate::hw::spawn_thrash_watchdog();
 	});
-	// After the once-block: the keepalive's own tiny alloc would re-enter the
-	// call_once (deadlock) if spawned inside it.
-	if POOL_INIT.is_completed() {
-		crate::hw::spawn_gpu_keepalive();
-	}
 }
 
 static WARM_SKIP: AtomicBool = AtomicBool::new(false);
+
+/// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
+/// allocation): skip the churn-protection warm — there is no churn to protect,
+/// and the retained warm gigabyte would just shrink the claim.
+pub fn skip_pool_warm() {
+	WARM_SKIP.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn warm_pool() -> Result<(), HipError> {
+	let _t = tag_scope("warmup");
+	let warm: usize = 1usize << 30; // 1 GiB
+	let buf = GpuBuffer::alloc_bytes(warm)?;
+	buf.memset_zero(warm)?;
+	crate::hip::device_synchronize()?;
+	drop(buf);
+	crate::hip::device_synchronize()
+}
 
 // Bytes currently held by pool (owned) allocations, and the co-mapped total a
 // disposable child has PROVEN the system can hold alongside this process.
@@ -655,13 +668,6 @@ pub fn claimable_bytes() -> usize {
 	arena_remaining() + reusable + vram_free_base().saturating_sub(USER_GB)
 }
 
-/// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
-/// allocation): skip the churn-protection warm — there is no churn to protect,
-/// and the retained warm gigabyte would just shrink the claim.
-pub fn skip_pool_warm() {
-	WARM_SKIP.store(true, Ordering::Relaxed);
-}
-
 /// Hand the process its ONE pre-claimed device block: every subsequent
 /// `GpuBuffer` allocation carves from it (non-owning, no pool traffic) until
 /// it is exhausted. init → one claim, exit → one free — the lifecycle law.
@@ -685,16 +691,6 @@ pub fn arena_remaining() -> usize {
 /// With the pool's release threshold pinned the pages stay resident, so later
 /// allocs reuse already-mapped memory. Runs through the choke points against the
 /// ledger under tag "warmup"; freed immediately.
-pub(crate) fn warm_pool() -> Result<(), HipError> {
-	let _t = tag_scope("warmup");
-	let warm: usize = 1usize << 30; // 1 GiB
-	let buf = GpuBuffer::alloc_bytes(warm)?;
-	buf.memset_zero(warm)?;
-	crate::hip::device_synchronize()?;
-	drop(buf);
-	crate::hip::device_synchronize()
-}
-
 /// Walk the claimable ask down from the counters' guess until a DISPOSABLE
 /// probe (spawned by the caller — a child process that attempts exactly one
 /// allocation) survives. Both counters over-report the true VmHeap ceiling
@@ -755,7 +751,7 @@ impl GpuBuffer {
 	}
 
 	fn alloc_bytes_inner(n_bytes: usize, quiet_oom: bool) -> Result<Self, HipError> {
-		ensure_pool_warmed();
+		ensure_pool_init();
 		ALLOC_FROZEN.with(|f| {
 			assert!(
 				!f.get(),

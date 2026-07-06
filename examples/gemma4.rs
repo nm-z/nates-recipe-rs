@@ -906,22 +906,6 @@ fn main() -> Result<()> {
 		w
 	};
 	beat();
-	// Keepalive: load has multi-second host-only gaps (disk reads, tokenize) and
-	// the GPU has a 5s runtime-PM autosuspend; the wedges cluster right after
-	// those gaps. A 1 Hz trivial device op keeps the queues warm through load.
-	let keepalive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-	{
-		let ka = keepalive.clone();
-		let buf = GpuBuffer::alloc(1)?;
-		std::thread::spawn(move || {
-			while ka.load(std::sync::atomic::Ordering::Relaxed) {
-				if buf.memset_zero(8).is_err() {
-					return;
-				}
-				std::thread::sleep(std::time::Duration::from_secs(1));
-			}
-		});
-	}
 	let mut m = load_model(&dir)?;
 
 	// Build the diffusion canvas: prompt tokens + NCANVAS masks.
@@ -951,7 +935,6 @@ fn main() -> Result<()> {
 	eprintln!("waterfall fill...");
 	fill_store(&mut m, claim)?;
 	watchdog.store(false, std::sync::atomic::Ordering::Relaxed);
-	keepalive.store(false, std::sync::atomic::Ordering::Relaxed);
 	eprintln!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 	let allocs_before = gpu_core::memory::device_alloc_count();
 	let t0 = Instant::now();

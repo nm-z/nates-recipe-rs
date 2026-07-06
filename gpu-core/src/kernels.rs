@@ -48,25 +48,14 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	// hipBLAS daxpy: y = alpha * x + y
-	fn hipblasDaxpy(
-		handle: *mut c_void,
+	// own SGD step kernel (optim.hip): w[i] += neg_lr * g[i], neg_lr device scalar
+	fn launch_sgd_update_f64(
+		w: *mut f64,
+		g: *const f64,
+		neg_lr: *const f64,
 		n: i32,
-		alpha: *const f64,
-		x: *const f64,
-		incx: i32,
-		y: *mut f64,
-		incy: i32,
-	) -> i32;
-
-	// hipBLAS dscal: x = alpha * x (in-place)
-	fn hipblasDscal(
-		handle: *mut c_void,
-		n: i32,
-		alpha: *const f64,
-		x: *mut f64,
-		incx: i32,
-	) -> i32;
+		stream: *mut c_void,
+	);
 
 	// hipSOLVER (→ rocSOLVER on AMD, cuSOLVER on NVIDIA). Explicit-workspace model:
 	// query *_bufferSize, allocate a device work buffer, pass work/lwork + devInfo.
@@ -2561,20 +2550,16 @@ pub fn gpu_scale(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let bytes = n * std::mem::size_of::<f64>();
-	// Copy x → out, then scale in-place via hipBLAS dscal
+	// Copy x → out, then scale in-place with the own device-scalar kernel.
+	// hipblasDscal is out: host-pointer-mode alpha host-derefs the device
+	// scalar (SIGSEGV) and device pointer mode would be a new vendor call.
 	unsafe { crate::memory::xfer_sync(out.ptr, x.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
-	let status = unsafe {
-		hipblasDscal(hipblas_handle(), n as i32, scalar.ptr as *const f64, out.ptr as *mut f64, 1)
-	};
-	check(status)
+	crate::infer_ops::gpu_scale_f64_inplace(out, scalar, n)
 }
 
 /// In-place scale: x *= scalar (no alloc, no copy)
 pub fn gpu_scale_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
-	let status = unsafe {
-		hipblasDscal(hipblas_handle(), n as i32, scalar.ptr as *const f64, x.ptr as *mut f64, 1)
-	};
-	check(status)
+	crate::infer_ops::gpu_scale_f64_inplace(x, scalar, n)
 }
 
 pub fn gpu_fma(
@@ -2598,27 +2583,26 @@ pub fn gpu_fma(
 	Ok(())
 }
 
-/// In-place: y -= alpha * x (for SGD weight updates on GPU)
-/// SGD weight update: Y = Y - α·X (gradient descent step).
-/// Uses hipblasDaxpy with negated alpha. NOT standard axpy (Y = αX + Y).
+/// SGD weight update: W += neg_lr·G (gradient descent step, neg_lr = -lr).
+/// Own kernel with a device-scalar neg_lr — a hipblas host-pointer-mode alpha
+/// would host-deref the device buffer.
 pub fn gpu_sgd_update(
 	grad: &GpuBuffer,
 	neg_lr: &GpuBuffer,
 	n: usize,
 	weights: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let status = unsafe {
-		hipblasDaxpy(
-			hipblas_handle(),
-			n as i32,
-			neg_lr.ptr as *const f64,
-			grad.ptr as *const f64,
-			1,
+	unsafe {
+		launch_sgd_update_f64(
 			weights.ptr as *mut f64,
-			1,
-		)
-	};
-	check(status)
+			grad.ptr as *const f64,
+			neg_lr.ptr as *const f64,
+			safe_i32(n),
+			std::ptr::null_mut(),
+		);
+	}
+	check_launch();
+	Ok(())
 }
 
 pub fn gpu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {

@@ -55,7 +55,7 @@ unsafe extern "C" {
 		gamma: *const c_void,
 		rows: i32,
 		cols: i32,
-		eps: f64,
+		eps: *const c_void,
 		s: *mut c_void,
 	);
 }
@@ -327,6 +327,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let gamma = ramp(cols, 0.03, 0.9);
 		let bx = GpuBuffer::upload(&x).unwrap();
 		let bg = GpuBuffer::upload(&gamma).unwrap();
+		let beps = GpuBuffer::upload(&[eps]).unwrap();
 		let out = GpuBuffer::alloc(rows * cols).unwrap();
 		unsafe {
 			launch_normx_rmsnorm(
@@ -335,7 +336,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				bg.ptr_raw() as *const c_void,
 				rows as i32,
 				cols as i32,
-				eps,
+				beps.ptr_raw() as *const c_void,
 				std::ptr::null_mut(),
 			);
 		}
