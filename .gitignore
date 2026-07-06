@@ -47,6 +47,7 @@ examples/*/test_images/
 /gpu-core/vendor/
 
 # Run / profiling / editor artifacts (session junk, never source)
+/op_census_dump.tsv
 /model.ogdl
 /perf.data
 /submission.csv
