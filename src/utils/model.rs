@@ -374,22 +374,45 @@ impl Train {
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
-			// One-claim arena. First free the PREVIOUS run's parked backing (the
-			// deferred single free of the run lifecycle) — this also resets the arena
-			// registration so the claim's "no arena active" assert holds. Then size
-			// this run's whole device footprint host-side and, when it fits, claim it
-			// as ONE block before fit; every alloc inside fit (weights, scaler stats,
-			// scratch) bump-carves from it (non-owning, no pool churn). An
-			// over-footprint run leaves the arena unclaimed and fit streams
-			// out-of-core exactly as before (its own use_ooc test sees the real free
-			// VRAM). The claim is PARKED at exit, not freed: its weight/stat views
-			// stay live on device past run() for scoring, save, and a following eval,
-			// until the next run releases it (or the process exits).
-			gpu_core::memory::release_run_backing();
+			// One-claim arena, adopt-first. A staged-eligible run re-arms the
+			// PREVIOUS run's parked slab as its own arena (adopt: sweep + rewind +
+			// one memset — no free, no realloc, so the freeAsync lazy-unmap /
+			// VA-reuse race and the post-free counter depression cannot fire);
+			// every alloc inside fit (weights, scaler stats, scratch) bump-carves
+			// from it. Only the first run of the process (or a grown footprint)
+			// claims fresh. The slab is PARKED again at exit, not freed: its
+			// weight/stat views stay live past run() for scoring, save, and a
+			// following eval. A pooled fit (plot / checkpoint / resume / rerun /
+			// non-ring metric) must NOT run under an arena — it leaves no host
+			// weight mirror, so a later cross-model eval would find its parked
+			// backing freed with nothing to rebuild from — so ineligible runs
+			// release the park and allocate from the pool exactly as before
+			// (their params stay pool-owned). Footprint sizing is plan-time only
+			// (dims math + null borrows, zero device traffic), safe while the
+			// previous backing is still parked.
+			let eligible = model.staged_eligible(self, resume.as_deref());
 			let footprint = plan_footprint(model, ds, false);
-			let slab = (footprint <= gpu_core::memory::claimable_bytes())
-				.then(gpu_core::memory::claim_device_arena)
-				.flatten();
+			let slab = if eligible {
+				gpu_core::memory::adopt_run_backing(footprint).or_else(|| {
+					gpu_core::memory::release_run_backing();
+					(footprint <= gpu_core::memory::claimable_bytes())
+						.then(gpu_core::memory::claim_device_arena)
+						.flatten()
+				})
+			} else {
+				gpu_core::memory::release_run_backing();
+				None
+			};
+			// A staged-eligible run demoting to pooled is never silent: print the
+			// numbers the decision was made from so a sizing bug shows itself.
+			if eligible && slab.is_none() {
+				eprintln!(
+					"arena: claim refused — footprint {} claimable {} free {} (falling to pooled)",
+					crate::data::human_bytes(footprint),
+					crate::data::human_bytes(gpu_core::memory::claimable_bytes()),
+					crate::data::human_bytes(gpu_core::memory::vram_free_base()),
+				);
+			}
 			model.fit(ds, self, resume.as_deref(), conns);
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");

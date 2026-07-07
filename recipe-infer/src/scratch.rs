@@ -669,7 +669,11 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 	let dummy_params: Vec<LayerParams> = fake_params
 		.iter()
 		.map(|&(i, o, kind, dim, vocab, act, heads)| {
-			let dummy = || GpuBuffer::alloc(1).expect("dummy");
+			// Plan-time dims carrier: vram_bytes only reads shapes, never the
+			// buffers — a null borrow costs zero device traffic and cannot be
+			// refused by the growth gate (an 8-byte ask was observed refused
+			// under post-free counter depression, crashing footprint sizing).
+			let dummy = || GpuBuffer::borrow(std::ptr::null_mut(), 0);
 			let (cc, ck, cs) = if kind == LayerKind::Conv { (dim, vocab, heads) } else { (0, 0, 0) };
 			LayerParams {
 				kind,

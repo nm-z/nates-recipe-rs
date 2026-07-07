@@ -127,6 +127,13 @@ fn oom_report(req: usize) {
 	line.push(oom_pair("free", &fmt_bytes(free)));
 	line.push(oom_pair("total", &fmt_bytes(total)));
 	line.push(oom_pair("over", &fmt_bytes(req.saturating_sub(free))));
+	// Pool + arena state: the bytes the tag map cannot see. slack = mapped but
+	// idle (a growth map cannot use it, a re-ask under `verified` can); the
+	// verified/live pair is the growth gate's own view; arena = live claim left.
+	line.push(oom_pair("slack", &fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0))));
+	line.push(oom_pair("verified", &fmt_bytes(POOL_VERIFIED.load(Ordering::Relaxed))));
+	line.push(oom_pair("live", &fmt_bytes(POOL_LIVE.load(Ordering::Relaxed))));
+	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
 	eprintln!("{}", line.join(", "));
 	eprintln!(
 		"{}, {}, {}",
@@ -359,7 +366,18 @@ fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
 /// pool traffic) until `release_device_arena` — init → one claim, exit → one
 /// free. Returns None when even 1 MB cannot be mapped.
 pub fn claim_device_arena() -> Option<GpuBuffer> {
-	claim_device_arena_bytes(vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1))
+	// Never size from raw free (the waterfall invariant): after a freed backing
+	// its bytes may sit as retained pool slack, which vram_free_base subtracts —
+	// free alone would ask ~0 and silently demote every following staged run to
+	// pooled. Ask the LARGER of the pool's re-servable retention (an ask under
+	// the proven peak skips the growth gate entirely — already-committed pages)
+	// or the growable headroom the gate admits; summing both in one ask would
+	// only be judged fresh in full and walk back down to the headroom anyway.
+	let reusable = POOL_VERIFIED
+		.load(Ordering::Relaxed)
+		.saturating_sub(POOL_LIVE.load(Ordering::Relaxed));
+	let grow = vram_free_base().saturating_sub(USER_GB);
+	claim_device_arena_bytes(reusable.max(grow) & !((1 << 21) - 1))
 }
 
 /// Claim exactly `want` bytes (walking down 1/16 per refusal, waterfall-style).
@@ -434,6 +452,47 @@ pub fn park_run_backing(buf: GpuBuffer) {
 pub fn live_parked_gen() -> Option<usize> {
 	let g = PARKED_GEN.load(Ordering::Relaxed);
 	(g != 0).then_some(g)
+}
+
+/// Re-arm the previous run's parked backing as THIS run's arena when it can
+/// hold `need` bytes: no free, no realloc, no unmap — the freeAsync lazy-unmap
+/// / VA-reuse race and the post-free counter depression (driver still counting
+/// the freed slab, refusing even 8-byte growth) structurally cannot fire. The
+/// prior run's carve ledger is swept, the bump pointer rewound, and the pages
+/// re-zeroed with one memset so carves see exactly the fresh-claim contents
+/// (accumulator carves rely on the claim-time zero fill). Prior params carved
+/// from the slab are invalidated via the park generation — their models
+/// rebuild from the host weight mirror. Returns None when nothing is parked
+/// (first run: caller claims fresh) or the parked slab is too small / not the
+/// registered arena (released here; caller claims fresh).
+pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
+	let parked = match PARKED.lock() {
+		Ok(mut g) => g.take(),
+		Err(p) => p.into_inner().take(),
+	}?;
+	PARKED_GEN.store(0, Ordering::Relaxed);
+	let registered = ARENA_BASE.load(Ordering::Relaxed) == parked.ptr_addr();
+	if !registered || parked.len() < need {
+		if registered {
+			release_device_arena(parked);
+		} else {
+			crate::hip::device_synchronize().expect("parked release sync");
+			drop(parked);
+			pool_trim();
+		}
+		return None;
+	}
+	if let Ok(mut m) = ARENA_CARVED.lock() {
+		for (tag, bytes) in m.iter() {
+			tag_sub(tag, *bytes);
+		}
+		m.clear();
+	}
+	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
+	ARENA_OFFSET.store(0, Ordering::Relaxed);
+	parked.memset_zero(parked.len()).expect("adopt commit memset");
+	crate::hip::device_synchronize().expect("adopt commit sync");
+	Some(parked)
 }
 
 /// Release the previous run's parked backing (no-op when none). Views into it
@@ -1251,7 +1310,16 @@ impl Drop for GpuBuffer {
 			POOL_LIVE.fetch_sub(self.len, Ordering::Relaxed);
 			FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
 			crate::callspy::tick(&crate::callspy::FREE_ASYNC);
-			unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
+			let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
+			// Drop cannot propagate; a swallowed failed free silently leaks the
+			// buffer in the DRIVER's accounting (free counters stay depressed for
+			// the rest of the process) — say so loudly instead.
+			if code != 0 {
+				eprintln!(
+					"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:p}",
+					self.len, self.tag, self.ptr
+				);
+			}
 			self.ptr = std::ptr::null_mut();
 		}
 	}

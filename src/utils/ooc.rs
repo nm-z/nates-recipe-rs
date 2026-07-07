@@ -467,7 +467,8 @@ pub struct Ooc {
 	// ONE probe-verified slab holds every VRAM-homed window as a carved view —
 	// the pool is never asked to grow near the top of the card (the gate
 	// admits asks VmHeap cannot map there; see probe_verified_vram).
-	_slab: GpuBuffer,
+	arena: bool,
+	slab: Option<GpuBuffer>,
 }
 
 /// Wall clock + cumulative transfer counters at sweep start, so the sweep line
@@ -540,12 +541,81 @@ impl Ooc {
 		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
 		let win_budget = gpu_core::memory::claimable_bytes().saturating_sub(fixed_res) / 2;
 		let chunk = (win_budget / ((WINS + 2) * max_spb * 8)).clamp(1, n);
+		let wbytes = chunk * max_spb * 8;
+		// Split-K dW-partials + column-reduce workspace sizes, computed here so the
+		// resident block can be measured before the ONE claim carves it.
+		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
+		let mut dwp = 1usize;
+		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
+		for p in params {
+			let e = match p.kind {
+				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(chunk, p.in_dim, p.out_dim),
+				LayerKind::Attn => kernels::gpu_splitk_dw_partials_elems(seq_rows, p.dim, p.dim),
+				_ => 0,
+			};
+			dwp = dwp.max(e);
+			let rows = if p.kind == LayerKind::Attn { seq_rows } else { chunk };
+			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
+			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
+		}
+
+		// ── ONE claim: the 10 staging windows, the 13 residents, and the VRAM
+		// window homes all come from a single memset-committed block registered as
+		// the process device arena. Claiming BEFORE the carves means the probe
+		// proves exactly this process's co-mapping and every resident/window then
+		// bump-carves from the arena (no per-buffer growth-commit — the ROCm 7.2.4
+		// fresh-page-commit race is structurally gone). The remainder past the
+		// carve prefix is the VRAM window budget. When the claim cannot even cover
+		// the carve prefix (VRAM full) the arena is skipped: residents/wins
+		// pool-alloc as before and every window waterfalls to RAM/disk.
+		let align256 = |b: usize| (b + 255) & !255; // mirror memory.rs ARENA_ALIGN
+		let residents_bytes: usize = [
+			n * hs * 8, n * hs * 8,
+			max_wt * 8, max_bias * 8, max_wt * 8, max_bias * 8,
+			8, 8,
+			max_wt * 8, max_wt * 8, max_wt * 8,
+			dwp * 8, ws,
+		]
+		.iter()
+		.map(|&b| align256(b))
+		.sum();
+		let carve_bytes = WINS * align256(wbytes) + residents_bytes;
+		// Reuse of retained pool slack is already-committed pages (probe-free);
+		// only the growth band needs a child's survival proof.
+		let reusable = gpu_core::memory::claimable_bytes()
+			.saturating_sub(gpu_core::memory::arena_remaining())
+			.saturating_sub(gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB));
+		let claimed = {
+			let _t = gpu_core::memory::tag_scope("unclaimed");
+			// 256-aligned so the tail-seal below carves the window region exactly
+			// (leaving no sub-align sliver a later ask could bump into).
+			let mut want = (reusable + probe_verified_vram()) & !255;
+			loop {
+				// Floor at the carve prefix: an arena that cannot hold the
+				// residents+wins is worse than none (they would overflow into pool
+				// growth). Below it, degrade to the pool + waterfall path.
+				if want < carve_bytes.max(1 << 21) {
+					break None;
+				}
+				if let Some(b) = GpuBuffer::try_alloc_bytes(want) {
+					gpu_core::memory::set_device_arena(b.ptr_raw(), b.len());
+					break Some(b);
+				}
+				want = (want - want / 16) & !255;
+			}
+		};
+		let arena = claimed.is_some();
+		let slab = claimed.unwrap_or_else(|| GpuBuffer::alloc(1).expect("ooc slab stub"));
+
+		// Staging windows carve from the arena (pool-alloc in the VRAM-full
+		// fallback). With the arena committed the calibrate copy below lands in
+		// mapped pages, but keep the drain so the KFD page-table update orders
+		// before the first engine touch.
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_| GpuBuffer::alloc(chunk * max_spb).expect("ooc window"))
 			.collect();
 		// Host pool BEFORE the RAM measurement below, faulted in across all
 		// cores — its bytes are part of the budget, permanently resident.
-		let wbytes = chunk * max_spb * 8;
 		let host: HostPool = Arc::new(Mutex::new(
 			(0..POOL_BUFS)
 				.map(|_| {
@@ -559,9 +629,6 @@ impl Ooc {
 		// One window through each streamed path, timed — the measured PCIe/NVMe
 		// rates the sweep lines report against. Window-sized (the exact unit the
 		// epoch streams); the spill region is overwritten by real windows later.
-		// Drain the device first: the wins were just hipMallocAsync'd and an
-		// immediate copy into uncommitted pool pages GPU-page-faults (the
-		// ALLOC_SYNC pattern in gpu-core/memory.rs).
 		gpu_core::hip::device_synchronize().expect("ooc calibrate sync");
 		let (rate_h2d, rate_d2h, rate_disk_r, rate_disk_w) = {
 			let bps = |b: usize, t: std::time::Instant| b as f64 / t.elapsed().as_secs_f64();
@@ -582,23 +649,8 @@ impl Ooc {
 			pool_give(&host, buf);
 			(h2d, d2h, r, w)
 		};
-		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
-		let mut dwp = 1usize;
-		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
-		for p in params {
-			let e = match p.kind {
-				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(chunk, p.in_dim, p.out_dim),
-				LayerKind::Attn => kernels::gpu_splitk_dw_partials_elems(seq_rows, p.dim, p.dim),
-				_ => 0,
-			};
-			dwp = dwp.max(e);
-			let rows = if p.kind == LayerKind::Attn { seq_rows } else { chunk };
-			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
-			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
-		}
 
-		// Resident allocations FIRST — the waterfall fill below takes VRAM to
-		// refusal, so everything that must stay device-resident is claimed before.
+		// Residents carve from the arena front (pool-alloc in the fallback).
 		let lse = GpuBuffer::alloc(n * hs).expect("ooc lse");
 		let dsum = GpuBuffer::alloc(n * hs).expect("ooc dsum");
 		let dw_acc = GpuBuffer::alloc(max_wt).expect("ooc dw_acc");
@@ -613,34 +665,26 @@ impl Ooc {
 		let dw_partials = GpuBuffer::alloc(dwp).expect("ooc dw_partials");
 		let reduce_ws = GpuBuffer::alloc_bytes(ws).expect("ooc reduce_ws");
 
-		// The windows' VRAM share: one probe-verified slab, committed here,
-		// carved below. Probing runs with the residents above already mapped,
-		// so the child's survival proves exactly the co-mapping this process
-		// is about to hold. Walk down on a gate refusal (its measure can sit
-		// under the probe's).
-		let slab = {
-			// Reuse of retained pool slack is already-committed pages (probe-
-			// free); only the growth band needs a child's survival proof.
-			let growable = gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB);
-			let reusable = gpu_core::memory::claimable_bytes()
-				.saturating_sub(gpu_core::memory::arena_remaining())
-				.saturating_sub(growable);
-			let mut want = reusable + probe_verified_vram();
-			loop {
-				if want < (1 << 21) {
-					// VRAM genuinely full — every window waterfalls to RAM/disk.
-					break GpuBuffer::alloc(1).expect("ooc slab stub");
-				}
-				if let Some(b) = GpuBuffer::try_alloc_bytes(want) {
-					b.memset_zero(want).expect("ooc slab commit");
-					gpu_core::hip::device_synchronize().expect("ooc slab sync");
-					break b;
-				}
-				want -= want / 16;
+		// VRAM window homes carve from the arena REMAINDER (offset past the
+		// residents/wins carve prefix); the fallback slab holds them from 0.
+		// The tail-seal: consume the whole remainder from the bump allocator the
+		// moment win_base is fixed, so no later allocation (StepScalars, any
+		// pre-freeze straggler) can land inside the window region place() hands
+		// out as views — an unsealed tail let the step scalars alias da_a's
+		// window 0 and the first backward silently clobbered -lr/1/n/2/n/zero.
+		// The seal carve is non-owning; dropping it keeps the offset consumed.
+		let win_base = if arena {
+			let base = slab.len() - gpu_core::memory::arena_remaining();
+			if gpu_core::memory::arena_remaining() > 0 {
+				let _seal = GpuBuffer::alloc_bytes(gpu_core::memory::arena_remaining())
+					.expect("ooc window-region seal");
 			}
+			base
+		} else {
+			0
 		};
-		let slab_bytes = if slab.len() > (1 << 21) { slab.len() } else { 0 };
-		let mut slab_off = 0usize;
+		let slab_bytes = if arena || slab.len() > (1 << 21) { slab.len() } else { 0 };
+		let mut slab_off = win_base;
 
 		// RAM accounting must be CUMULATIVE: fresh Vec pages are lazily
 		// zero-backed, so mem_available() does not drop until an epoch touches
@@ -813,7 +857,8 @@ impl Ooc {
 			rate_net_r,
 			rate_net_w,
 			net,
-			_slab: slab,
+			arena,
+			slab: Some(slab),
 		}
 	}
 
@@ -1326,7 +1371,8 @@ impl Ooc {
 			rate_net_r: _,
 			rate_net_w: _,
 			net: _,
-			_slab: _,
+			arena: _,
+			slab: _,
 		} = self;
 		acts.iter().chain(preacts.iter().flatten()).chain([
 			a_q, a_k, a_v, a_ctx, a_dctx, a_dq, a_dk, a_dv, concat, da_a, da_b,
@@ -1465,6 +1511,16 @@ impl Drop for Ooc {
 						let _ = net[*node].free(*id);
 					}
 				}
+			}
+		}
+		// The ONE free of the run lifecycle. release_device_arena drains the
+		// device (no window carve may be in flight past the barrier above),
+		// unregisters ARENA_BASE→0 so the next scenario's claim starts clean, and
+		// sweeps every carve's ledger bytes before the single hipFreeAsync. The
+		// VRAM-full fallback holds a pool stub instead — dropped normally.
+		if let Some(slab) = self.slab.take() {
+			if self.arena {
+				gpu_core::memory::release_device_arena(slab);
 			}
 		}
 	}

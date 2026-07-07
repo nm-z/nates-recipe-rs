@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static SAT_ARMED: AtomicBool = AtomicBool::new(false);
 const SAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+const SAT_ENFORCE: bool = false;
 
 // ── Fast death ──────────────────────────────────────────────────────────────
 // A GPU-scale process holds tens of GB; SIGABRT's default core dump pipes the
@@ -60,7 +61,15 @@ fn busy_path() -> std::path::PathBuf {
 }
 
 /// Arm for the duration of a compute phase. First call spawns the sampler.
+/// DORMANT until post-AOT (user directive 2026-07-07): the pre-AOT OOC loop
+/// streams windows without compute/transfer overlap, so a disk-bound sweep
+/// legitimately idles the GPU past the window — the abort would kill valid
+/// runs. The AOT schedule restores the overlap that makes the law enforceable;
+/// re-arm by deleting the early return.
 pub fn arm_saturation_crash() {
+	if !SAT_ENFORCE {
+		return;
+	}
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	install_fast_death();
 	SAT_ARMED.store(true, Ordering::SeqCst);

@@ -153,6 +153,10 @@ pub fn metric_gpu(
 	}
 }
 
+/// Device-side metric: the raw kernel reduction lands in `dst` (a 1-elem device
+/// buffer — the scratch metric scalar, or a staged metric-ring slot written in
+/// place with no D2D). Returns the host-side (sign, div) rescale that turns the
+/// raw value into the reported metric.
 pub fn metric_gpu_into(
 	loss: Loss,
 	m: Metric,
@@ -162,19 +166,20 @@ pub fn metric_gpu_into(
 	n: usize,
 	k: usize,
 	ss_tot: f64,
+	dst: &GpuBuffer,
 ) -> (f64, f64) {
 	let nk = n * k;
 	match m {
 		Metric::Loss => {
 			match loss {
 				Loss::Mse => {
-					kernels::gpu_mse_into(out, ybuf, nk, &sc.metric_scalar).expect("mse");
+					kernels::gpu_mse_into(out, ybuf, nk, dst).expect("mse");
 					(1.0, 1.0)
 				}
 				Loss::Mae => {
 					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0).expect("sub");
 					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0).expect("abs");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
 					(1.0, nk as f64)
 				}
 				Loss::Huber => {
@@ -187,7 +192,7 @@ pub fn metric_gpu_into(
 					kernels::gpu_add_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("add");
 					kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1).expect("abs");
 					kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2).expect("sub");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.reduce_ws, nk, 1, dst).expect("reduce");
 					(1.0, nk as f64)
 				}
 				Loss::Ce => {
@@ -195,7 +200,7 @@ pub fn metric_gpu_into(
 					kernels::gpu_clamp_into(&sc.metric_t0, &sc.c_eps, &sc.c_one, nk, &sc.metric_t0).expect("clamp");
 					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0).expect("log");
 					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0).expect("mul");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
 					(-1.0, n as f64)
 				}
 				Loss::Bce => {
@@ -210,19 +215,28 @@ pub fn metric_gpu_into(
 					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t2).expect("add");
 					kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("mul");
 					kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1).expect("add");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.reduce_ws, nk, 1, dst).expect("reduce");
 					(-1.0, nk as f64)
 				}
 				Loss::Focal => {
 					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.c_focal_gamma, &sc.c_focal_alpha, nk, &sc.metric_t0, &sc.metric_t1).expect("focal");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
 					(1.0, nk as f64)
 				}
 			}
 		}
 		Metric::R2 => {
-			kernels::gpu_ss_res_into(out, ybuf, nk, &sc.metric_scalar).expect("ss_res");
+			kernels::gpu_ss_res_into(out, ybuf, nk, dst).expect("ss_res");
 			(1.0, ss_tot)
+		}
+		// Accuracy is already the reported fraction (no host rescale).
+		Metric::Accuracy => {
+			if k == 1 {
+				kernels::gpu_accuracy_into(out, ybuf, n, dst).expect("accuracy");
+			} else {
+				kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst).expect("argmax accuracy");
+			}
+			(1.0, 1.0)
 		}
 		_ => (1.0, 1.0),
 	}

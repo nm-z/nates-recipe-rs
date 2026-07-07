@@ -82,7 +82,8 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 		]),
 		("async", &[
 			(g(&MEMCPY_ASYNC), "transfers"),
-			(g(&MALLOC_ASYNC) + g(&MEMSET_ASYNC), "allocations"),
+			(g(&MALLOC_ASYNC), "allocations"),
+			(g(&MEMSET_ASYNC), "memsets"),
 			(g(&FREE_ASYNC), "frees"),
 		]),
 		("kernel launch", &[(g(&LAUNCH), "hipLaunchKernelGGL")]),
