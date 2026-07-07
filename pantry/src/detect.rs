@@ -92,10 +92,22 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 		.flatten();
 	let _arena = ArenaGuard(arena);
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);
-	let params = recipe_infer::build_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, true)
-		.unwrap_or_else(|e| panic!("detect build_layer_params: {e}"));
-	let (xbuf, _, _) = recipe_infer::upload(&x);
-	let sc = recipe_infer::Scratch::new(&params, n, true);
+	// AOT init: weights (resume-composed host image), the 12 scratch constants,
+	// and the tokenized input ride ONE staged H2D on the claim — was ~37
+	// per-buffer uploads (per-layer weights, 12 constants, x) through the same
+	// data. Scratch still bump-carves from the slab; nothing else transfers
+	// until the single logits D2H below.
+	let plan = recipe_infer::plan_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, true)
+		.unwrap_or_else(|e| panic!("detect plan_layer_params: {e}"));
+	let mut stage = recipe_infer::Stage::new();
+	let w_off = stage.push(plan.host());
+	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
+	let x_off = stage.push(x.as_slice().expect("detect: x contiguous"));
+	let base = stage.upload().expect("detect stage upload");
+	let params = plan.materialize(&base, w_off);
+	let xbuf = base.view(x_off, n * CONTEXT);
+	let consts_view = base.view(consts_off, 12);
+	let sc = recipe_infer::Scratch::new_staged_infer(&params, n, &consts_view);
 	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 	let last = params.len() - 1;
 	// preds copies to host here; params/xbuf/sc are non-owning carves, so the

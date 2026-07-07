@@ -528,7 +528,13 @@ impl Ooc {
 				LayerKind::Dense => p.in_dim * p.out_dim,
 				LayerKind::Attn => p.dim * p.dim,
 				LayerKind::Embed => p.vocab * p.dim,
-				LayerKind::Conv => p.in_dim * p.out_dim,
+				// The FILTER tensor (cout·cin·k), not in·out — the unrolled
+				// activation product read 84 GiB for the cookbook CNN and
+				// aborted every conv fit that spilled out of core.
+				LayerKind::Conv => {
+					let lout = (p.in_dim / p.conv_cin - p.conv_k) / p.conv_stride + 1;
+					(p.out_dim / lout.max(1)) * p.conv_cin * p.conv_k
+				}
 			})
 			.max()
 			.unwrap_or(1);

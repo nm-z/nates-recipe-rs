@@ -133,6 +133,12 @@ impl Scratch {
 		Self::new_inner(params, n, false, light, Some(consts))
 	}
 
+	/// One-claim forward-only path (the detector): backward buffers len-1 like
+	/// `new(.., forward_only=true)`, constants as staged views like `new_staged`.
+	pub fn new_staged_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
+		Self::new_inner(params, n, true, false, Some(consts))
+	}
+
 	fn new_inner(
 		params: &[LayerParams],
 		n: usize,
