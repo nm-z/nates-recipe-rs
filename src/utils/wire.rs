@@ -496,6 +496,14 @@ impl Server {
 			hostname(),
 			self.info.ram >> 20
 		);
+		self.serve_on(listener)
+	}
+
+	// The bare TCP request/reply loop over an already-bound listener. `serve` layers
+	// the discovery beacon and peer listener on top and binds by address; a caller
+	// that only needs the frame path (a loopback test) binds its own listener and
+	// drives this, skipping the UDP discovery halves.
+	pub fn serve_on(self, listener: TcpListener) -> Result<()> {
 		for stream in listener.incoming() {
 			let stream = stream?;
 			let srv = self.clone();
@@ -626,31 +634,21 @@ fn connect_first(name: &str, addrs: &[String]) -> Result<Conn> {
 mod tests {
       use super::*;
 
-      // Live pooled train: scratch overflows VRAM+RAM into the remote-RAM tier.
-      // Run from a tiny-cwd (tmpfs) so the disk tier is zero and windows go
-      // remote; the dataset path is absolute for exactly that reason:
-      //   cd <tmpfs> && <repo>/target/release/deps/recipe-<hash> --ignored net_pool_ooc
+      // Loopback round-trip: bind an ephemeral port, run the accept loop in a
+      // thread, and drive the same store / fetch / run frames the cross-machine
+      // test drove: the wire framing, the RAM store, and runner dispatch end to
+      // end with no remote daemon and no GPU. A missing runner must answer Err.
       #[test]
-      #[ignore]
-      fn net_pool_ooc() {
-            let data = crate::Data::load()
-                  .set("/home/nate/Desktop/nates-recipe-rs/datasets/playground-series-s6e3/train.csv")
-                  .split(0.8)
-                  .exclude("id")
-                  .target("Churn");
-            let model =
-                  crate::Model::new().loss(crate::bce).layer(3000).leak().layer(1).sigmoid().lr(0.001);
-            let train = crate::Train::new().epochs(1).net(["archy", "sentry"]).log([crate::Loss]);
-            train.run((&model, &data));
-      }
+      fn wire_loopback_roundtrip() -> Result<()> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let addr = listener.local_addr()?.to_string();
+            let server = Server::new(NodeInfo::probe(), std::collections::HashMap::new());
+            thread::spawn(move || {
+                  let _ = server.serve_on(listener);
+            });
 
-      // Live-network round-trip: needs `recipe serve` running on archy and sentry.
-      // cargo test -p recipe --release wire_remotes -- --ignored --nocapture
-      #[test]
-      #[ignore]
-      fn wire_remotes() -> Result<()> {
-            let conns = Net::new().node("archy").node("sentry").connect()?;
-            let mb = 64usize;
+            let c = Conn::connect(&addr)?;
+            let mb = 2usize;
             let mut blob = vec![0u8; mb << 20];
             let mut x = 0x9e37_79b9_7f4a_7c15u64;
             for w in blob.chunks_exact_mut(8) {
@@ -659,43 +657,16 @@ mod tests {
                   x ^= x << 17;
                   w.copy_from_slice(&x.to_le_bytes());
             }
-            for (i, c) in conns.iter().enumerate() {
-                  eprintln!("node {i}: hello {:?}", c.info);
-                  let t = std::time::Instant::now();
-                  c.store(42, blob.clone())?;
-                  let up = mb as f64 / t.elapsed().as_secs_f64();
-                  let t = std::time::Instant::now();
-                  let back = c.fetch(42, 0, blob.len() as u64)?;
-                  let down = mb as f64 / t.elapsed().as_secs_f64();
-                  assert_eq!(back, blob);
-                  let off = 1usize << 20;
-                  let slice = c.fetch(42, off as u64, 4096)?;
-                  assert_eq!(&slice[..], &blob[off..off + 4096]);
-                  let past = c.fetch(42, blob.len() as u64, 1);
-                  assert!(past.is_err(), "fetch past end must error");
-                  let no_runner = c.run(FN_MOE_FFN, 42, vec![0u8; 8])?.recv()?;
-                  assert_eq!(no_runner.op, Op::Err, "RUN with no handler must return Err frame");
-                  eprintln!("node {i}: store {up:.0} MB/s, fetch {down:.0} MB/s, stat: {}", c.stat()?);
-            }
-            // duplex: same blob to both nodes concurrently
-            let t = std::time::Instant::now();
-            thread::scope(|s| {
-                  let handles: Vec<_> = conns
-                        .iter()
-                        .map(|c| {
-                              let b = blob.clone();
-                              s.spawn(move || c.store(43, b))
-                        })
-                        .collect();
-                  for h in handles {
-                        h.join().expect("store thread panicked").expect("parallel store failed");
-                  }
-            });
-            let agg = (mb * conns.len()) as f64 / t.elapsed().as_secs_f64();
-            eprintln!("parallel store to {} nodes: {agg:.0} MB/s aggregate", conns.len());
-            for c in &conns {
-                  eprintln!("final {}", c.stat()?);
-            }
+            c.store(42, blob.clone())?;
+            let back = c.fetch(42, 0, blob.len() as u64)?;
+            assert_eq!(back, blob, "full fetch must round-trip the stored blob");
+            let off = 1usize << 20;
+            let slice = c.fetch(42, off as u64, 4096)?;
+            assert_eq!(&slice[..], &blob[off..off + 4096], "offset fetch must match source");
+            let past = c.fetch(42, blob.len() as u64, 1);
+            assert!(past.is_err(), "fetch past end must error");
+            let no_runner = c.run(FN_MOE_FFN, 42, vec![0u8; 8])?.recv()?;
+            assert_eq!(no_runner.op, Op::Err, "RUN with no handler must return Err frame");
             Ok(())
       }
 }

@@ -25,10 +25,14 @@ vramspy                        LD_PRELOAD cdylib interposing HSA alloc entry poi
 
 ```bash
 cargo build --release                    # thin LTO, links ROCm
-cargo test --workspace                   # all crates (root `cargo test` only tests recipe)
+cargo test all                           # THE suite (SUITE SPEC v3): every test in every crate, one
+                                         #   OS process per test, 60s SIGKILL deadline each = that
+                                         #   test's FAIL (suite continues), device-health probe after
+                                         #   any crash/kill, one log: suite.log; verdict:
+                                         #   rg '\[FAIL\]' suite.log
 cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
 cargo test -p recipe model::metric_gpu_tests::   # GPU metric/gradient tests
-cargo test -p gpu-core --release         # kernel proof suite (tests/suite/: inventory_proof,
+cargo test -p gpu-core --release --test suite    # kernel proof suite (tests/suite/: inventory_proof,
                                          #   parity_blas_*, prove_*; needs kernel_inventory.db)
 cargo run --release -- train.csv --target Price       # recipe CLI
 cargo run --release -- detect <path>                  # column-type detection
@@ -173,7 +177,7 @@ All NaN VALUE-policy lives in `pantry::encode::nan_clean(v, strategy, name)` (`e
 
 ### 6.1 The loop and its five constraints
 
-Full-batch gradient descent on GPU. Per epoch: forward all layers → loss gradient → backward all layers → SGD update. Constraints: (1) load data once RAM→VRAM; (2) N kernels in a loop; (3) zero allocations inside the loop (`AllocGuard` panics on `GpuBuffer::alloc_bytes` inside); (4) no VRAM↔RAM roundtrips inside — the only D2H is the 8-byte metric scalar, one-way, via the async copy-stream (`read_metric_scalar`; zero per-epoch blocking copies); (5) the API surface should make violations impossible (partially met — the guard is runtime). `fit_loop_allocations_flat` is the regression test.
+Full-batch gradient descent on GPU. Per epoch: forward all layers → loss gradient → backward all layers → SGD update. Constraints: (1) load data once RAM→VRAM; (2) N kernels in a loop; (3) zero allocations inside the loop (`AllocGuard` panics on `GpuBuffer::alloc_bytes` inside); (4) no VRAM↔RAM roundtrips inside — the only D2H is the 8-byte metric scalar, one-way, via the async copy-stream (`read_metric_scalar`; zero per-epoch blocking copies); (5) the API surface should make violations impossible (partially met — the guard is runtime). `fit_loop_memory_flat` is the regression test.
 
 ### 6.2 Scratch (recipe-infer/scratch.rs)
 
@@ -244,7 +248,7 @@ Architecture facts (source-verified): FULL-attn layers (every 6th) have head_dim
 - **After adding a NEW .hip file**, `touch` an existing one so build.rs re-discovers the set. Duplicate-symbol link errors have two causes: stale old-named `.o` in OUT_DIR (delete them + libhipkernels.a, touch a .hip; `cargo clean -p gpu-core` also works but recompiles everything) or a genuine duplicate `extern "C"` definition across two .hip sources (delete the redundant source copy).
 - **rocPRIM in .hip files**: `#include <rocprim/rocprim.hpp>` AND `#include <cstring>` (without cstring, hipcc fails in texture_cache_iterator). Device temp is caller-owned: expose `*_workspace_bytes(...)` (query with nullptr temp) + a launcher taking `(tmp, tmp_bytes)`; the Rust wrapper allocates the GpuBuffer. `reduce.hip` is the working reference.
 - **Library handles pin to the null stream** (kernels.rs) — a handle on its own stream races our kernels.
-- **Proof suite**: `tests/suite/` — `inventory_proof.rs` loads `kernel_inventory.db` (repo root, gitignored, ~3.7MB SQLite, ~13k named kernels across 6 vendor sources) and proves each mapped `gpu_*` op against a CPU/library oracle; `prove_<cat>.rs` per category. The db is live test data — ~20 tests fail without it; if missing: `git show 4be70c4^:kernel_inventory.db > kernel_inventory.db`. To extend coverage: register an op + oracle + canon alias, or implement the gap kernel and register it. Test invocation needs `-p gpu-core`; a .hip change relinks many big test binaries (~10 min, not a hang).
+- **Proof suite**: `tests/suite/` — `inventory_proof.rs` loads `kernel_inventory.db` (repo root, committed, ~3.7MB SQLite, ~13k named kernels across 6 vendor sources) and proves each mapped `gpu_*` op against a CPU/library oracle; `prove_<cat>.rs` per category. The db is live test data — ~20 tests fail without it (SUITE SPEC R10: a test reads only committed or self-created files; env-var paths banned; any #[ignore] reds the suite). To extend coverage: register an op + oracle + canon alias, or implement the gap kernel and register it. Test invocation needs `-p gpu-core`; a .hip change relinks many big test binaries (~10 min, not a hang).
 
 ## 10. Hardware & System Reference
 

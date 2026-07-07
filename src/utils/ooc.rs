@@ -467,7 +467,7 @@ pub struct Ooc {
 	// ONE probe-verified slab holds every VRAM-homed window as a carved view —
 	// the pool is never asked to grow near the top of the card (the gate
 	// admits asks VmHeap cannot map there; see probe_verified_vram).
-	slab: GpuBuffer,
+	_slab: GpuBuffer,
 }
 
 /// Wall clock + cumulative transfer counters at sweep start, so the sweep line
@@ -813,7 +813,7 @@ impl Ooc {
 			rate_net_r,
 			rate_net_w,
 			net,
-			slab,
+			_slab: slab,
 		}
 	}
 
@@ -1033,7 +1033,7 @@ impl Ooc {
 	/// Weight grads accumulate across windows into dw_acc/db_acc (tiled
 	/// reduction — same math as one pass), then update once.
 	#[allow(clippy::too_many_arguments)]
-	pub fn backward(
+	pub(crate) fn backward(
 		&mut self,
 		params: &[LayerParams],
 		x: &GpuBuffer,
@@ -1326,7 +1326,7 @@ impl Ooc {
 			rate_net_r: _,
 			rate_net_w: _,
 			net: _,
-			slab: _,
+			_slab: _,
 		} = self;
 		acts.iter().chain(preacts.iter().flatten()).chain([
 			a_q, a_k, a_v, a_ctx, a_dctx, a_dq, a_dk, a_dv, concat, da_a, da_b,
@@ -1396,7 +1396,8 @@ impl Ooc {
 			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7]);
 			kernels::gpu_flash_attention_backward_into(
 				&q, &k, &v, &ctx, &dctx, &lse, cnt, s, d, heads, &dsum, &dq, &dk, &dv,
-			);
+			)
+			.expect("flash attn bwd");
 			gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_neg_one, &sc.c_rope_theta, cnt * s, d, heads, s, &dq, &dk).expect("rope bwd");
 			self.a_dq.commit(s0, cnt, &dq, &self.writer, &self.host);
 			self.a_dk.commit(s0, cnt, &dk, &self.writer, &self.host);

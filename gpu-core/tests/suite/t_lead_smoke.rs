@@ -22,7 +22,7 @@ fn approx(a: &[f64], b: &[f64]) {
 }
 
 #[test]
-fn sum_all() {
+fn sum_entire() {
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
 	let ws = GpuBuffer::alloc_bytes(gpu_sum_all_workspace_bytes(4)).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();

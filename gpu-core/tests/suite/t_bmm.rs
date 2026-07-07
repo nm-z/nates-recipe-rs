@@ -88,7 +88,7 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 }
 
 #[test]
-fn bmm_all_transpose_modes() {
+fn bmm_every_transpose_mode() {
 	run_case(3, 5, 7, 4, false, false);
 	run_case(3, 5, 7, 4, false, true);
 	run_case(3, 5, 7, 4, true, false);

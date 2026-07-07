@@ -582,10 +582,10 @@ mod tests {
             let neg_scale = GpuBuffer::upload(&[-scale]).expect("neg_scale");
             let (w_ref, b_ref) = (make(d * o), make(o));
             let (w_t, b_t) = (make(d * o), make(o));
-            kernels::gpu_scale_inplace(&zero, d * o, &w_ref);
-            kernels::gpu_scale_inplace(&zero, o, &b_ref);
-            kernels::gpu_scale_inplace(&zero, d * o, &w_t);
-            kernels::gpu_scale_inplace(&zero, o, &b_t);
+            kernels::gpu_scale_inplace(&zero, d * o, &w_ref).expect("enq");
+            kernels::gpu_scale_inplace(&zero, o, &b_ref).expect("enq");
+            kernels::gpu_scale_inplace(&zero, d * o, &w_t).expect("enq");
+            kernels::gpu_scale_inplace(&zero, o, &b_t).expect("enq");
             let yhat = make(n * o);
             let (dw, db) = (make(d * o), make(o));
             let (dw_acc, db_acc) = (make(d * o), make(o));
@@ -597,16 +597,16 @@ mod tests {
             let rows_per_block = 4096usize;
             let window = make(rows_per_block * d);
             // warm hipBLAS workspace before the VMM buffer exists
-            kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, 1, o, d, &yhat);
+            kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, 1, o, d, &yhat).expect("enq");
             hip::device_synchronize().expect("warmup");
 
             // ---- reference: whole-batch full-batch GD ----
             for _ in 0..epochs {
-                  kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, n, o, d, &yhat);
-                  kernels::gpu_sub_inplace(&y_dev, n * o, &yhat);
-                  kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &reduce_ws, &dw_partials, n, o, d, &dw, &db);
-                  kernels::gpu_sgd_update(&dw, &neg_scale, d * o, &w_ref);
-                  kernels::gpu_sgd_update(&db, &neg_scale, o, &b_ref);
+                  kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, n, o, d, &yhat).expect("enq");
+                  kernels::gpu_sub_inplace(&y_dev, n * o, &yhat).expect("enq");
+                  kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &reduce_ws, &dw_partials, n, o, d, &dw, &db).expect("enq");
+                  kernels::gpu_sgd_update(&dw, &neg_scale, d * o, &w_ref).expect("enq");
+                  kernels::gpu_sgd_update(&db, &neg_scale, o, &b_ref).expect("enq");
             }
             let w_ref_h = dl(&w_ref, d * o);
 
@@ -618,22 +618,22 @@ mod tests {
             t.sync().expect("fill");
             assert!(!t.is_contiguous_vram(), "buffer must span >1 tier");
             for _ in 0..epochs {
-                  kernels::gpu_scale_inplace(&zero, d * o, &dw_acc);
-                  kernels::gpu_scale_inplace(&zero, o, &db_acc);
+                  kernels::gpu_scale_inplace(&zero, d * o, &dw_acc).expect("enq");
+                  kernels::gpu_scale_inplace(&zero, o, &db_acc).expect("enq");
                   let mut r0 = 0;
                   while r0 < n {
                         let r = rows_per_block.min(n - r0);
                         t.stage_bytes(r0 * d * 8, r * d * 8, window.ptr);
-                        kernels::gpu_linear_into(&window, &w_t, &b_t, r, o, d, &yhat);
+                        kernels::gpu_linear_into(&window, &w_t, &b_t, r, o, d, &yhat).expect("enq");
                         let yblk = GpuBuffer::borrow(unsafe { (y_dev.ptr as *mut f64).add(r0 * o) as *mut c_void }, r * o * 8);
-                        kernels::gpu_sub_inplace(&yblk, r * o, &yhat);
-                        kernels::gpu_linear_backward_weights_only_into(&yhat, &window, &reduce_ws, &dw_partials, r, o, d, &dw, &db);
-                        kernels::gpu_add_inplace(&dw, d * o, &dw_acc);
-                        kernels::gpu_add_inplace(&db, o, &db_acc);
+                        kernels::gpu_sub_inplace(&yblk, r * o, &yhat).expect("enq");
+                        kernels::gpu_linear_backward_weights_only_into(&yhat, &window, &reduce_ws, &dw_partials, r, o, d, &dw, &db).expect("enq");
+                        kernels::gpu_add_inplace(&dw, d * o, &dw_acc).expect("enq");
+                        kernels::gpu_add_inplace(&db, o, &db_acc).expect("enq");
                         r0 += r;
                   }
-                  kernels::gpu_sgd_update(&dw_acc, &neg_scale, d * o, &w_t);
-                  kernels::gpu_sgd_update(&db_acc, &neg_scale, o, &b_t);
+                  kernels::gpu_sgd_update(&dw_acc, &neg_scale, d * o, &w_t).expect("enq");
+                  kernels::gpu_sgd_update(&db_acc, &neg_scale, o, &b_t).expect("enq");
             }
             let w_t_h = dl(&w_t, d * o);
             let maxdiff = w_ref_h

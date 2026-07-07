@@ -601,15 +601,43 @@ mod safetensors_source_tests {
 		let _ = std::fs::remove_file(&path);
 	}
 
-	// Run the real thing: feed an actual model weight shard ($ST_FILE) to Data::load().
-	// Not a dataset — whatever happens (panic on heterogeneous tensor dims, or success)
-	// is the experiment. Ignored by default; run with ST_FILE set.
+	// Shard-shaped source: several weight tensors sharing a leading dim become a
+	// table (F32 widened to f64, trailing dims flattened to `name:c` columns), with
+	// one tensor named as the target. Pins the materialized rows × cols and two
+	// values through the real Data::load path. A no-target load instead trips the
+	// x/y guard in prepare(), so naming a target is what makes a shard a dataset.
 	#[test]
-	#[ignore = "set ST_FILE to a real .safetensors weight shard"]
-	fn data_load_on_real_safetensors_shard() {
-		let p = std::env::var("ST_FILE").expect("set ST_FILE");
-		let d = Data::load().set(&p);
-		let (set, _) = d.datasets();
-		eprintln!("loaded: {} rows × {} cols", set.x.nrows(), set.x.ncols());
+	fn data_load_materializes_safetensors_shard() {
+		let header = concat!(
+			r#"{"blk.0.w":{"dtype":"F32","shape":[4,2],"data_offsets":[0,32]},"#,
+			r#""blk.0.b":{"dtype":"F64","shape":[4],"data_offsets":[32,64]},"#,
+			r#""label":{"dtype":"F64","shape":[4],"data_offsets":[64,96]}}"#,
+		);
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+		bytes.extend_from_slice(header.as_bytes());
+		for v in [10.0f32, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		for v in [100.0f64, 200.0, 300.0, 400.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		for v in [1.0f64, 2.0, 3.0, 4.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		let path = std::env::temp_dir()
+			.join(format!("recipe_st_shard_{}.safetensors", std::process::id()));
+		std::fs::write(&path, &bytes).expect("write temp safetensors shard");
+		let p = path.to_str().expect("temp path utf8");
+
+		let data = Data::load().set(p).target("label");
+		let (set, test) = data.datasets();
+		assert_eq!(set.x.nrows(), 4, "four rows from the shared leading dim");
+		assert_eq!(set.x.ncols(), 3, "three feature cols (blk.0.w:0, blk.0.w:1, blk.0.b)");
+		assert_eq!(set.n_targets, 1, "label is the single target");
+		assert!(test.is_none(), "no split and no test set yields one dataset");
+		assert_eq!(set.x[[0, 0]], 10.0, "F32 weight widened to f64, column order kept");
+		assert_eq!(set.x[[3, 2]], 400.0, "F64 bias, last feature column, last row");
+		let _ = std::fs::remove_file(&path);
 	}
 }

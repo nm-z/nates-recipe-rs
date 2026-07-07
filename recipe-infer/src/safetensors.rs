@@ -428,81 +428,73 @@ mod tests {
 		assert!(parse_safetensors(&bytes).is_err());
 	}
 
-	// Real-file smoke: parse the header of every shard in $SAFETENSORS_FILES (header
-	// only — never reads the multi-GB blob, so a 4.6 GB shard costs ~100 KB of RAM),
-	// then decode just the single smallest tensor of shard 1 to exercise the real
-	// dtype path. Ignored by default; run with the env var set.
+	// Real-file path, hermetic: write a two-tensor image (F32 [2,2], F64 [3]) with
+	// byte-exact contents to a temp file, then walk it the way a shard-header reader
+	// does — 8-byte length, JSON header, parse_json, pick the smallest tensor by byte
+	// span, seek to its blob range and decode through the real dtype path — asserting
+	// the decoded values exactly. The 16-byte F32 tensor wins over the 24-byte F64 one.
 	#[test]
-	#[ignore = "set SAFETENSORS_FILES to space-separated real .safetensors paths"]
-	fn read_real_safetensors_headers() {
-		use std::collections::BTreeMap;
+	fn read_safetensors_header_and_decode_min() {
 		use std::io::{Read, Seek, SeekFrom};
-		let files = std::env::var("SAFETENSORS_FILES").expect("set SAFETENSORS_FILES");
-		let paths: Vec<&str> = files.split_whitespace().collect();
-		let mut grand_tensors = 0usize;
-		let mut grand_params: u128 = 0;
-		let mut smallest: Option<(String, String, u64, u64, u64)> = None;
-		for (fi, path) in paths.iter().enumerate() {
-			let mut f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
-			let mut lb = [0u8; 8];
-			f.read_exact(&mut lb).expect("read header len");
-			let n = u64::from_le_bytes(lb);
-			let mut hdr = vec![0u8; n as usize];
-			f.read_exact(&mut hdr).expect("read header");
-			let header = std::str::from_utf8(&hdr).expect("header utf8");
-			let Json::Obj(entries) = parse_json(header).expect("parse header json") else {
-				panic!("header not a JSON object");
-			};
-			let (mut count, mut params, mut sample) = (0usize, 0u128, String::new());
-			let mut dtypes: BTreeMap<String, usize> = BTreeMap::new();
-			let mut min_bytes = u64::MAX;
-			for (name, val) in &entries {
-				if name == "__metadata__" {
-					continue;
-				}
-				let Json::Obj(fields) = val else { continue };
-				let dtype = field_str(fields, "dtype").unwrap_or_default();
-				let shape = field_arr(fields, "shape").unwrap_or_default();
-				let offs = field_arr(fields, "data_offsets").unwrap_or_default();
-				count += 1;
-				params += shape.iter().map(|&d| d as u128).product::<u128>();
-				*dtypes.entry(dtype.clone()).or_default() += 1;
-				if sample.is_empty() {
-					let sh: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-					sample = format!("{name} {sh:?} {dtype}");
-				}
-				if fi == 0 && offs.len() == 2 {
-					let (b, e) = (offs[0] as u64, offs[1] as u64);
-					if e > b && e - b < min_bytes {
-						min_bytes = e - b;
-						smallest = Some((name.clone(), dtype, 8 + n, b, e));
-					}
+		let header = concat!(
+			r#"{"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"#,
+			r#""b":{"dtype":"F64","shape":[3],"data_offsets":[16,40]}}"#,
+		);
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+		bytes.extend_from_slice(header.as_bytes());
+		for v in [1.5f32, -2.5, 3.0, 4.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		for v in [10.0f64, 20.0, 30.0] {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		let path =
+			std::env::temp_dir().join(format!("recipe_st_hdr_{}.safetensors", std::process::id()));
+		std::fs::write(&path, &bytes).expect("write temp safetensors");
+
+		let mut f = std::fs::File::open(&path).expect("open temp safetensors");
+		let mut lb = [0u8; 8];
+		f.read_exact(&mut lb).expect("read header len");
+		let n = u64::from_le_bytes(lb);
+		let mut hdr = vec![0u8; n as usize];
+		f.read_exact(&mut hdr).expect("read header");
+		let header_read = std::str::from_utf8(&hdr).expect("header utf8");
+		let Json::Obj(entries) = parse_json(header_read).expect("parse header json") else {
+			panic!("header not a JSON object");
+		};
+		let (mut count, mut params, mut min_bytes) = (0usize, 0u128, u64::MAX);
+		let mut min_tensor: Option<(String, String, u64, u64)> = None;
+		for (name, val) in &entries {
+			if name == "__metadata__" {
+				continue;
+			}
+			let Json::Obj(fields) = val else { continue };
+			let dtype = field_str(fields, "dtype").unwrap_or_default();
+			let shape = field_arr(fields, "shape").unwrap_or_default();
+			let offs = field_arr(fields, "data_offsets").unwrap_or_default();
+			count += 1;
+			params += shape.iter().map(|&d| d as u128).product::<u128>();
+			if offs.len() == 2 {
+				let (b, e) = (offs[0] as u64, offs[1] as u64);
+				if e > b && e - b < min_bytes {
+					min_bytes = e - b;
+					min_tensor = Some((name.clone(), dtype, b, e));
 				}
 			}
-			let fname = std::path::Path::new(path)
-				.file_name()
-				.and_then(|s| s.to_str())
-				.unwrap_or(path);
-			eprintln!("{fname}: {count} tensors, {params} params, dtypes {dtypes:?}\n    e.g. {sample}");
-			assert!(count > 0, "{fname}: parsed 0 tensors");
-			grand_tensors += count;
-			grand_params += params;
 		}
-		eprintln!("TOTAL: {grand_tensors} tensors, {grand_params} params across {} shards", paths.len());
+		assert_eq!(count, 2, "two tensors parsed from the header");
+		assert_eq!(params, 7, "2*2 + 3 element counts");
 
-		if let Some((name, dtype, data_start, begin, end)) = smallest {
-			let mut f = std::fs::File::open(paths[0]).expect("reopen shard 1");
-			f.seek(SeekFrom::Start(data_start + begin)).expect("seek tensor");
-			let mut raw = vec![0u8; (end - begin) as usize];
-			f.read_exact(&mut raw).expect("read tensor bytes");
-			let vals = decode(&dtype, &raw);
-			let finite = vals.iter().filter(|v| v.is_finite()).count();
-			let head: Vec<f64> = vals.iter().take(5).copied().collect();
-			eprintln!(
-				"decoded smallest tensor '{name}' ({dtype}, {} elems): {finite} finite, first {head:?}",
-				vals.len()
-			);
-			assert_eq!(finite, vals.len(), "decoded NaN/Inf from real weights");
-		}
+		let data_start = 8 + n;
+		let (name, dtype, begin, end) = min_tensor.expect("a smallest tensor by byte span");
+		assert_eq!(name, "a", "F32 [2,2] 16B is smaller than F64 [3] 24B");
+		assert_eq!(dtype, "F32");
+		f.seek(SeekFrom::Start(data_start + begin)).expect("seek tensor");
+		let mut raw = vec![0u8; (end - begin) as usize];
+		f.read_exact(&mut raw).expect("read tensor bytes");
+		let vals = decode(&dtype, &raw);
+		assert_eq!(vals, vec![1.5, -2.5, 3.0, 4.0], "decoded F32 tensor, widened to f64");
+		let _ = std::fs::remove_file(&path);
 	}
 }

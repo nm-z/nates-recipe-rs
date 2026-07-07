@@ -1060,7 +1060,7 @@ mod metric_gpu_tests {
 	// broadcast kernels so the raw frequency-encoded churn columns don't saturate
 	// sigmoid — a well-posed problem on real data, not a hand-rolled scaler.
 	#[test]
-	fn fit_loop_allocations_flat() {
+	fn fit_loop_memory_flat() {
 		let Some(train) = CHURN.as_ref() else {
 			eprintln!("skip: churn dataset absent");
 			return;

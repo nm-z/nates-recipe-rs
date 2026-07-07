@@ -41,7 +41,7 @@ fn scalar(out: &GpuBuffer) -> f64 {
 // ── reductions: scalar all-reduces ───────────────────────────────────────────
 
 #[test]
-fn test_sum_all() {
+fn test_sum_entire() {
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
 	let ws = GpuBuffer::alloc_bytes(gpu_sum_all_workspace_bytes(4)).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();
@@ -50,7 +50,7 @@ fn test_sum_all() {
 }
 
 #[test]
-fn test_max_all() {
+fn test_max_entire() {
 	let x = GpuBuffer::upload(&[3.0, -1.0, 7.0, 2.0]).unwrap();
 	let ws = GpuBuffer::alloc_bytes(gpu_max_all_workspace_bytes(4)).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();
@@ -59,7 +59,7 @@ fn test_max_all() {
 }
 
 #[test]
-fn test_min_all() {
+fn test_min_entire() {
 	let x = GpuBuffer::upload(&[3.0, -1.0, 7.0, 2.0]).unwrap();
 	let ws = GpuBuffer::alloc_bytes(gpu_min_all_workspace_bytes(4)).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();
@@ -68,7 +68,7 @@ fn test_min_all() {
 }
 
 #[test]
-fn test_mean_all() {
+fn test_mean_entire() {
 	let x = GpuBuffer::upload(&[1.0, 2.0, 3.0, 4.0]).unwrap();
 	let ws = GpuBuffer::alloc_bytes(gpu_mean_all_workspace_bytes(4)).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();
@@ -561,7 +561,7 @@ fn test_qr_square_reconstruction() {
 }
 
 #[test]
-fn test_qr_tall_reconstruction() {
+fn test_qr_thin_reconstruction() {
 	// A = [[1,2],[3,4],[5,6]] (3x2 row-major). Verify Q*R == A and Q orthonormal.
 	let a_data = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
 	let a = GpuBuffer::upload(&a_data).unwrap();

@@ -8,7 +8,7 @@ use std::process::Command;
 // acceptable outcome is try_alloc_bytes -> None (exit 0). A signal 6 exit is
 // the bug.
 #[test]
-fn oversize_alloc_is_clean_oom_not_abort() {
+fn oversize_request_is_clean_oom_not_abort() {
 	if std::env::var("OVERSIZE_OOM_CHILD").is_ok() {
 		let mut held = Vec::new();
 		loop {
@@ -23,11 +23,14 @@ fn oversize_alloc_is_clean_oom_not_abort() {
 	let mut cmd = Command::new(exe);
 	cmd.args([
 		"--exact",
-		"oversize_oom::oversize_alloc_is_clean_oom_not_abort",
+		"oversize_oom::oversize_request_is_clean_oom_not_abort",
 		"--nocapture",
 		"--test-threads=1",
 	])
-	.env("OVERSIZE_OOM_CHILD", "1");
+	.env("OVERSIZE_OOM_CHILD", "1")
+	// The fill child needs the committed-page warm regardless of how the
+	// parent was launched (no-warm children fault instead of clean-OOM).
+	.env_remove("RECIPE_SKIP_POOL_WARM");
 	// No core dump from the expected-abort child.
 	unsafe {
 		use std::os::unix::process::CommandExt;

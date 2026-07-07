@@ -1372,13 +1372,6 @@ unsafe extern "C" {
 		k: i32,
 		stream: *mut c_void,
 	);
-	fn launch_candidate_generate_count(
-		freq: *const c_void,
-		n_freq: i32,
-		k: i32,
-		count: *mut c_void,
-		stream: *mut c_void,
-	);
 	fn launch_candidate_generate_write(
 		freq: *const c_void,
 		out: *mut c_void,

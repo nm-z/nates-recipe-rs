@@ -332,7 +332,7 @@ fn test_has_nan_false() {
 }
 
 #[test]
-fn test_isfinite_all_all_true() {
+fn test_isfinite_entire_true() {
 	let x = upload(&[1.0, 2.0, 3.0]);
 	let flag = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_isfinite_all(&x, 3, &flag).unwrap();
@@ -343,7 +343,7 @@ fn test_isfinite_all_all_true() {
 }
 
 #[test]
-fn test_isfinite_all_false_inf() {
+fn test_isfinite_entire_false_inf() {
 	let x = upload(&[1.0, f64::INFINITY, 3.0]);
 	let flag = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_isfinite_all(&x, 3, &flag).unwrap();
@@ -353,7 +353,7 @@ fn test_isfinite_all_false_inf() {
 }
 
 #[test]
-fn test_isfinite_all_false_nan() {
+fn test_isfinite_entire_false_nan() {
 	let x = upload(&[1.0, f64::NAN, 3.0]);
 	let flag = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_isfinite_all(&x, 3, &flag).unwrap();
@@ -503,7 +503,7 @@ fn test_count_distinct() {
 }
 
 #[test]
-fn test_count_distinct_all_same() {
+fn test_count_distinct_uniform() {
 	let data: Vec<i32> = vec![5, 5, 5];
 	let buf = GpuBuffer::upload_i32(&data).unwrap();
 	let n = 3;
@@ -708,7 +708,7 @@ fn test_mae_grad_basic() {
 }
 
 #[test]
-fn test_huber_grad_small_residual() {
+fn test_huber_grad_tiny_residual() {
 	// |d| <= delta=1.0: grad = d/n
 	// pred=[1.5], target=[1.0], d=0.5 <= 1.0 → grad = 0.5/1
 	let pred = upload(&[1.5]);

@@ -25,9 +25,13 @@ vramspy                        LD_PRELOAD cdylib interposing HSA alloc entry poi
 
 ```bash
 cargo build --release                    # thin LTO, links ROCm
-cargo test --workspace                   # root `cargo test` only tests recipe
+cargo test all                           # THE suite: every test in every crate, one OS process per
+                                         #   test, 60s SIGKILL deadline each (kill = that test's FAIL,
+                                         #   suite continues), single log at suite.log, verdict:
+                                         #   rg '\[FAIL\]' suite.log   (SUITE SPEC v3; tests/all.rs)
 cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
-cargo test -p gpu-core --release         # kernel proof suite (needs kernel_inventory.db)
+cargo test -p gpu-core --release --test suite   # kernel proof suite alone (target renamed from `all`;
+                                         #   no test id may contain substring "all" — cargo filter)
 cargo run --release -- train.csv --target Price
 cargo run --release -- detect <path>     # or ./target/release/detect <path> (standalone bin)
 cargo run --release --example cookbook   # the e2e: NN/CNN/MLP/LLM scenarios
@@ -92,7 +96,7 @@ train.save(());               // SavePath: () = "model.ogdl" (Rust can't overloa
 
 - Real verification = build, then run the real binary in the **foreground** with visible output; `cargo test` green is supplementary, never the e2e claim. TUI work is verified with kwin-mcp screenshots before claiming done (kwin-mcp with writable=true IS the host filesystem).
 - Never run a blocking command that shows no output; redirect to a file AND tail it. Don't merge or hide streams in this project (no `2>&1`, no `/dev/null`, no output-filtering pipes that conceal; using `tail`/`tee` to make silent output visible is required). Wrap anything that can hang in a short `timeout` so the hang surfaces immediately.
-- Tests ≤60s each; iterate with op-level probes or single-step runs, not full multi-GB reloads. No multi-hour training runs — iterate in short checkpointed runs; a run with no bounded ETA is a hang. If the user backgrounds one of my commands, that's a signal to stop launching long blockers.
+- Tests ≤60s each — enforced by the `cargo test all` orchestrator (per-test SIGKILL at 60s = that test's FAIL; the suite continues; never wall-clock-kill the suite itself). Iterate with op-level probes or single-step runs, not full multi-GB reloads. No multi-hour training runs — iterate in short checkpointed runs; a run with no bounded ETA is a hang. If the user backgrounds one of my commands, that's a signal to stop launching long blockers.
 - One GPU process at a time (concurrent runs OOM at weight init). Wrap heavy commands in Nate's `dev` function for live 1Hz CPU/RAM/GPU/VRAM metrics: `script -qec 'bash -ic "dev <cmd>"' /dev/null`. After perf changes, verify under `dev`: tiers at top−1GB, no util sawtooth, no low-CPU phase while RAM moves.
 - rocprofv3 hangs at teardown — always `timeout 8 rocprofv3 --hip-trace --kernel-trace -d <dir> -- <bin>`; the SQLite DB survives the kill (query `rocpd_kernel_dispatch`; workgroups = grid/workgroup dims).
 - GPU crash forensics (read-only, always fine): `coredumpctl list/info <PID>` for the backtrace, `journalctl -k` for amdgpu page-fault vs OOM truth. Don't rebuild over a binary before inspecting its core.
@@ -113,7 +117,7 @@ train.save(());               // SavePath: () = "model.ogdl" (Rust can't overloa
 
 ## Gotchas
 
-- `kernel_inventory.db` (repo root, gitignored, ~3.7MB SQLite) is live test data for the gpu-core proof suite — ~20 tests fail without it. If missing: `git show 4be70c4^:kernel_inventory.db > kernel_inventory.db`.
+- `kernel_inventory.db` (repo root, committed, ~3.7MB SQLite) is live test data for the gpu-core proof suite — ~20 tests fail without it (SUITE SPEC R10: a test reads only committed or self-created files; env-var paths banned; any #[ignore] reds the suite).
 - gpu-core duplicate-symbol link errors have two causes: stale old-named `.o` in OUT_DIR (delete them + libhipkernels.a, touch a .hip) or a genuine duplicate `extern "C"` definition across two .hip sources (delete the redundant source copy).
 - After adding a NEW .hip file, `touch` an existing one so build.rs re-discovers the set. build.rs must rebuild the archive from scratch each run (`ar r` never removes stale members).
 - rocPRIM in .hip files needs `#include <rocprim/rocprim.hpp>` AND `#include <cstring>`; device temp is caller-owned (`*_workspace_bytes` query + launcher taking tmp) — see reduce.hip.

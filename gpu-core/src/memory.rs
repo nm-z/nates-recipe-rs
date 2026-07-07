@@ -588,7 +588,12 @@ pub(crate) fn ensure_pool_init() {
 	}
 	POOL_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
-		if WARM_SKIP.load(Ordering::Relaxed) {
+		// RECIPE_SKIP_POOL_WARM: per-process env form of skip_pool_warm() for
+		// single-test suite children (SUITE SPEC R9) — one test per process has
+		// no cross-thread first-touch storm to serialize.
+		if WARM_SKIP.load(Ordering::Relaxed)
+			|| std::env::var_os("RECIPE_SKIP_POOL_WARM").is_some()
+		{
 			return;
 		}
 		WARMING.with(|w| w.set(true));

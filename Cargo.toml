@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 name = "recipe"
 
+# SUITE SPEC v3 R1: `cargo test all` dispatches the suite orchestrator.
+[[test]]
+name = "all"
+harness = false
+
 [workspace]
 members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core"]
 exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
