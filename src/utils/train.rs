@@ -972,6 +972,7 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
+		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let mut fit_score = f64::NAN;
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1150,6 +1151,7 @@ impl ModelInner {
 			}
 		}
 		gpu_core::hw::disarm_saturation_crash();
+		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		drop(_alloc_guard);
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -1218,9 +1220,6 @@ impl ModelInner {
 				self.save_checkpoint(path, s);
 			}
 		}
-		if let Some(base) = hip_snap {
-			eprint!("{}", gpu_core::callspy::report_since(&base));
-		}
 		// A fit leaves its scratch (~all of VRAM for an out-of-core run) as
 		// freed pool slack with a stale verified high-water; a later
 		// differently-shaped allocation storm would skip the growth gate yet
@@ -1230,6 +1229,15 @@ impl ModelInner {
 		drop(ooc_end);
 		drop(sc);
 		gpu_core::memory::pool_trim();
+		if let (Some(base), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
+			for (phase, a, b) in [
+				("init", &base, &init),
+				("loop", &init, &lp),
+				("exit", &lp, &gpu_core::callspy::snapshot()),
+			] {
+				eprint!("── hip {phase} ──\n{}", gpu_core::callspy::report_between(a, b));
+			}
+		}
 	}
 	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();

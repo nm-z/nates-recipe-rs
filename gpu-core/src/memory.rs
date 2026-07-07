@@ -326,6 +326,138 @@ static ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
 static ARENA_SIZE: AtomicUsize = AtomicUsize::new(0);
 static ARENA_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
+// Per-tag bytes carved from the live claim (and the aligned total), so
+// `release_device_arena` can return every carve's ledger bytes to "unclaimed"
+// before the slab's own drop subtracts the full claim — the ledger reads exact
+// at every point of the claim→carve→release lifecycle.
+static ARENA_CARVED: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
+static ARENA_CARVED_ALIGNED: AtomicUsize = AtomicUsize::new(0);
+
+fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
+	if let Ok(mut m) = ARENA_CARVED.lock() {
+		*m.entry(tag).or_insert(0) += n_bytes;
+	}
+	ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
+}
+
+/// The run's ONE claim: everything the driver reports free minus the user's
+/// gigabyte, memset-committed and registered as the process device arena.
+/// Every later `GpuBuffer` allocation bump-carves from it (non-owning, zero
+/// pool traffic) until `release_device_arena` — init → one claim, exit → one
+/// free. Returns None when even 1 MB cannot be mapped.
+pub fn claim_device_arena() -> Option<GpuBuffer> {
+	claim_device_arena_bytes(vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1))
+}
+
+/// Claim exactly `want` bytes (walking down 1/16 per refusal, waterfall-style).
+pub fn claim_device_arena_bytes(mut want: usize) -> Option<GpuBuffer> {
+	assert_eq!(
+		ARENA_BASE.load(Ordering::Relaxed),
+		0,
+		"claim_device_arena: a device arena is already active"
+	);
+	let _t = tag_scope("unclaimed");
+	while want > (1 << 20) {
+		match GpuBuffer::try_alloc_bytes(want) {
+			Some(slab) => {
+				set_device_arena(slab.ptr_raw(), want);
+				return Some(slab);
+			}
+			None => want -= want / 16,
+		}
+	}
+	None
+}
+
+/// The run's ONE free: drain the device (no carve may be in flight), unregister
+/// the arena, sweep every carve's ledger bytes back to "unclaimed", then drop
+/// the slab — the single `hipFreeAsync` of the run's exit block.
+pub fn release_device_arena(slab: GpuBuffer) {
+	assert_eq!(
+		ARENA_BASE.load(Ordering::Relaxed),
+		slab.ptr_addr(),
+		"release_device_arena: slab is not the active claim"
+	);
+	crate::hip::device_synchronize().expect("arena release sync");
+	set_device_arena(std::ptr::null_mut(), 0);
+	if let Ok(mut m) = ARENA_CARVED.lock() {
+		for (tag, bytes) in m.iter() {
+			tag_sub(tag, *bytes);
+		}
+		m.clear();
+	}
+	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
+	drop(slab);
+}
+
+/// AOT init composer: every host-sourced block a run needs on the device is
+/// pushed (real bytes) or reserved (device-filled later: randn weights, zscore
+/// stats, metric ring) during init planning, then `upload()` moves the WHOLE
+/// image with one carve + ONE sync H2D — the run's single upload. Offsets are
+/// in f64s, each block 256-byte aligned so any view is kernel-clean.
+pub struct Stage {
+	host: Vec<f64>,
+}
+
+const STAGE_ALIGN_F64: usize = ARENA_ALIGN / 8;
+
+impl Default for Stage {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Stage {
+	pub fn new() -> Self {
+		Stage { host: Vec::new() }
+	}
+
+	fn pad(&mut self) {
+		let rem = self.host.len() % STAGE_ALIGN_F64;
+		if rem != 0 {
+			self.host.resize(self.host.len() + STAGE_ALIGN_F64 - rem, 0.0);
+		}
+	}
+
+	/// Append `data`, returning its offset in f64s.
+	pub fn push(&mut self, data: &[f64]) -> usize {
+		self.pad();
+		let off = self.host.len();
+		self.host.extend_from_slice(data);
+		off
+	}
+
+	/// Append a zero-filled slot the device fills later (randn init, zscore
+	/// stats, metric ring), returning its offset in f64s.
+	pub fn reserve(&mut self, n_floats: usize) -> usize {
+		self.pad();
+		let off = self.host.len();
+		self.host.resize(off + n_floats, 0.0);
+		off
+	}
+
+	pub fn len_floats(&self) -> usize {
+		self.host.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.host.is_empty()
+	}
+
+	/// One carve + ONE sync H2D of the composed image. The returned buffer is a
+	/// carve (non-owning) — hand out sub-views with `.view(offset, len)`.
+	pub fn upload(self) -> Result<GpuBuffer, HipError> {
+		let buf = GpuBuffer::alloc(self.host.len().max(1))?;
+		if !self.host.is_empty() {
+			let bytes = std::mem::size_of_val(self.host.as_slice());
+			unsafe {
+				xfer_sync(buf.ptr, self.host.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D)
+			}?;
+		}
+		Ok(buf)
+	}
+}
+
 // ── The three device choke points ───────────────────────────────────────────
 // Exactly one hipMemcpyAsync call, one hipMemsetAsync call, one hipMallocAsync
 // call (in alloc_bytes), and one hipFreeAsync call (in Drop) exist in the whole
@@ -786,6 +918,7 @@ impl GpuBuffer {
 						let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
 						tag_sub("unclaimed", aligned);
 						tag_add(tag, n_bytes);
+						arena_note_carve(tag, n_bytes, aligned);
 						note_range(ptr as usize, n_bytes, tag);
 						return Ok(Self {
 							ptr,

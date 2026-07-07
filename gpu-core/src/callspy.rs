@@ -63,12 +63,17 @@ pub fn report() -> String {
 }
 
 pub fn report_since(base: &[u64; N]) -> String {
+	report_between(base, &snapshot())
+}
+
+/// Delta between two snapshots — phase-scoped counts (init/loop/exit).
+pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 	let g = |c: &AtomicU64| {
 		let i = ALL
 			.iter()
 			.position(|x| std::ptr::eq(*x, c))
 			.expect("counter registered in ALL");
-		c.load(Ordering::Relaxed).saturating_sub(base[i])
+		end[i].saturating_sub(base[i])
 	};
 	let groups: &[(&str, &[(u64, &str)])] = &[
 		("sync", &[
