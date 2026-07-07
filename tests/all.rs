@@ -364,14 +364,11 @@ fn run_test(t: &Test) -> Attempt {
       let cap = File::create(&cap_path).expect("create capture file");
       let cap2 = cap.try_clone().expect("clone capture handle");
       let mut cmd = Command::new(&t.exe);
+      // children run WITH the 1 GiB pool warm — it commits pages so async
+      // copies never fault "page not present" (proven 6/6 vs 1/6 without);
+      // load-bearing until the one-claim arena replaces pool growth.
       cmd.args(["--exact", &t.name, "--nocapture"])
             .current_dir(&t.cwd)
-            // R9 overhead lever + wedge surface: the 1 GiB pool warm exists to
-            // serialize multi-thread first-touch; a one-test process has no
-            // storm to serialize, and per-process warm is the measured
-            // hipMallocAsync growth-wedge surface (~20% of fresh setups).
-            // oversize_oom's fill child env_removes this itself.
-            .env("RECIPE_SKIP_POOL_WARM", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(cap))
             .stderr(Stdio::from(cap2));
@@ -434,7 +431,6 @@ fn run_test(t: &Test) -> Attempt {
 fn probe_ok(probe: &Path) -> bool {
       let mut cmd = Command::new(probe);
       cmd.current_dir(ROOT)
-            .env("RECIPE_SKIP_POOL_WARM", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

@@ -624,8 +624,13 @@ pub(crate) fn warm_pool() -> Result<(), HipError> {
 	let buf = GpuBuffer::alloc_bytes(warm)?;
 	buf.memset_zero(warm)?;
 	crate::hip::device_synchronize()?;
-	drop(buf);
-	crate::hip::device_synchronize()
+	// Retained for process lifetime. Freeing here (even behind a device sync)
+	// re-opens the freeAsync VA-reuse race at setup: the next allocation gets
+	// this VA back while the driver-side unmap is still in flight and faults
+	// page-not-present on a VA in no recorded allocation — the ~50% first-init
+	// flake (diffusion test, LLM fit setups). No frees mid-run, warm included.
+	std::mem::forget(buf);
+	Ok(())
 }
 
 // Bytes currently held by pool (owned) allocations, and the co-mapped total a
