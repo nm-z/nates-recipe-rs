@@ -103,11 +103,34 @@ pub struct Scratch {
 	pub pinned_scalar_b: *mut f64,
 	// Per-layer roofline timing: boundary events on the null stream (where every
 	// compute kernel launches), recorded only while `timing` is set — the fit
-	// loop arms it on log epochs so non-logged epochs run untouched. L+1 each:
-	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse.
-	ev_fwd: Vec<gpu_core::hip::Event>,
-	ev_bwd: Vec<gpu_core::hip::Event>,
+	// loop arms it on log epochs so non-logged epochs run untouched. One event
+	// SET per timed epoch (outer index = `timing_slot`), each L+1 events:
+	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse. The
+	// pooled path keeps a single reused slot (read+synced in-loop each log epoch);
+	// the staged path pre-allocates one slot per logged epoch, records into them
+	// transfer-free, and reads them ALL at exit (after the exit drain) so the loop
+	// itself does zero event syncs.
+	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
+	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
 	timing: std::cell::Cell<bool>,
+	timing_slot: std::cell::Cell<usize>,
+}
+
+/// Per-layer (forward_ms, backward_ms) from an already-completed event set — no
+/// sync (the caller drained the device first, e.g. the staged exit's Scratch
+/// drop). `ev_fwd`/`ev_bwd` are one timed epoch's L+1 boundary events.
+pub fn layer_ms_from(
+	ev_fwd: &[gpu_core::hip::Event],
+	ev_bwd: &[gpu_core::hip::Event],
+	layers: usize,
+) -> (Vec<f64>, Vec<f64>) {
+	let f = (0..layers)
+		.map(|l| gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]).expect("fwd elapsed") as f64)
+		.collect();
+	let b = (0..layers)
+		.map(|l| gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]).expect("bwd elapsed") as f64)
+		.collect();
+	(f, b)
 }
 
 impl Scratch {
@@ -115,7 +138,7 @@ impl Scratch {
 	/// they're never read in a forward pass — so inference allocates ~half the VRAM
 	/// of training (no second `a_dsum`, no `da`/`dw`/grad mirrors).
 	pub fn new(params: &[LayerParams], n: usize, forward_only: bool) -> Scratch {
-		Self::new_inner(params, n, forward_only, false, None)
+		Self::new_inner(params, n, forward_only, false, None, 1)
 	}
 
 	/// Out-of-core companion: ONLY what the fit loop reads directly — the last
@@ -123,20 +146,22 @@ impl Scratch {
 	/// streams and pinned scalars. Every big full-batch buffer is len-1; the Ooc
 	/// owns the real ones with waterfall homes.
 	pub fn new_light(params: &[LayerParams], n: usize) -> Scratch {
-		Self::new_inner(params, n, false, true, None)
+		Self::new_inner(params, n, false, true, None, 1)
 	}
 
 	/// One-claim fit path: the 12 constant operands are views of `consts` (a
 	/// `SCRATCH_CONSTS`-ordered block in the run's staged init image) instead
 	/// of 12 separate uploads — the constants ride the run's ONE sync H2D.
-	pub fn new_staged(params: &[LayerParams], n: usize, light: bool, consts: &GpuBuffer) -> Scratch {
-		Self::new_inner(params, n, false, light, Some(consts))
+	/// `n_timed` pre-allocates that many per-epoch roofline event sets so the loop
+	/// records boundaries transfer-free and the exit reads them after the drain.
+	pub fn new_staged(params: &[LayerParams], n: usize, light: bool, consts: &GpuBuffer, n_timed: usize) -> Scratch {
+		Self::new_inner(params, n, false, light, Some(consts), n_timed)
 	}
 
 	/// One-claim forward-only path (the detector): backward buffers len-1 like
 	/// `new(.., forward_only=true)`, constants as staged views like `new_staged`.
 	pub fn new_staged_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
-		Self::new_inner(params, n, true, false, Some(consts))
+		Self::new_inner(params, n, true, false, Some(consts), 0)
 	}
 
 	fn new_inner(
@@ -145,6 +170,7 @@ impl Scratch {
 		forward_only: bool,
 		light: bool,
 		consts: Option<&GpuBuffer>,
+		n_timed: usize,
 	) -> Scratch {
 		let bw = move |sz: usize| if forward_only { 1 } else { sz };
 		let lt = move |sz: usize| if light { 1 } else { sz };
@@ -364,13 +390,14 @@ impl Scratch {
 			// including the transfer bounce).
 			pinned_scalar: pinned_pair,
 			pinned_scalar_b: unsafe { pinned_pair.add(1) },
-			ev_fwd: (0..=params.len())
-				.map(|_| gpu_core::hip::Event::new().expect("layer timing event"))
+			ev_fwd: (0..n_timed)
+				.map(|_| (0..=params.len()).map(|_| gpu_core::hip::Event::new().expect("layer timing event")).collect())
 				.collect(),
-			ev_bwd: (0..=params.len())
-				.map(|_| gpu_core::hip::Event::new().expect("layer timing event"))
+			ev_bwd: (0..n_timed)
+				.map(|_| (0..=params.len()).map(|_| gpu_core::hip::Event::new().expect("layer timing event")).collect())
 				.collect(),
 			timing: std::cell::Cell::new(false),
+			timing_slot: std::cell::Cell::new(0),
 		}
 	}
 
@@ -381,11 +408,18 @@ impl Scratch {
 		self.timing.set(on);
 	}
 
+	/// Select which per-epoch event set the next `mark_*` calls record into (the
+	/// staged loop advances this once per logged epoch; the pooled path leaves it 0
+	/// and reuses the single set every log epoch).
+	pub fn set_timing_slot(&self, slot: usize) {
+		self.timing_slot.set(slot);
+	}
+
 	/// Record forward layer boundary `i` (0 = before layer 0) on the null stream.
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
 			// SAFETY: null stream — the stream every compute kernel launches on.
-			unsafe { self.ev_fwd[i].record(std::ptr::null_mut()).expect("record fwd event") }
+			unsafe { self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record fwd event") }
 		}
 	}
 
@@ -394,21 +428,25 @@ impl Scratch {
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
 			// SAFETY: null stream — the stream every compute kernel launches on.
-			unsafe { self.ev_bwd[i].record(std::ptr::null_mut()).expect("record bwd event") }
+			unsafe { self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record bwd event") }
 		}
 	}
 
-	/// Per-layer (forward_ms, backward_ms) for the last armed epoch. Waits on the
-	/// final boundary event (bwd[0], recorded last) — call at log time only.
+	/// Per-layer (forward_ms, backward_ms) for the current slot. Waits on the final
+	/// boundary event (bwd[0], recorded last) — the pooled path's in-loop read at
+	/// log time. The staged path instead moves the event sets out with `take_events`
+	/// and reads them after the exit drain (no in-loop sync).
 	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
-		self.ev_bwd[0].synchronize().expect("sync bwd event");
-		let f = (0..layers)
-			.map(|l| gpu_core::hip::elapsed_ms(&self.ev_fwd[l], &self.ev_fwd[l + 1]).expect("fwd elapsed") as f64)
-			.collect();
-		let b = (0..layers)
-			.map(|l| gpu_core::hip::elapsed_ms(&self.ev_bwd[l + 1], &self.ev_bwd[l]).expect("bwd elapsed") as f64)
-			.collect();
-		(f, b)
+		let s = self.timing_slot.get();
+		self.ev_bwd[s][0].synchronize().expect("sync bwd event");
+		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
+	}
+
+	/// Move the per-epoch timing event sets out of the Scratch so their handles
+	/// outlive the Scratch drop (whose `device_synchronize` completes them). Used
+	/// by the staged exit to read every logged epoch's roofline after the drain.
+	pub fn take_events(&mut self) -> (Vec<Vec<gpu_core::hip::Event>>, Vec<Vec<gpu_core::hip::Event>>) {
+		(std::mem::take(&mut self.ev_fwd), std::mem::take(&mut self.ev_bwd))
 	}
 
 	pub fn download_scalar_deferred(&self) {

@@ -137,18 +137,42 @@ impl From<&LayerParams> for LayerDims {
 	}
 }
 
-/// How a planned block gets its initial device contents: bytes already in the
-/// plan's host image (resumed weights, PE tables, biases, zeros), or a device
-/// randn fill scaled by a 1-float slot the image carries at `scale_off`.
-enum Fill {
-	Staged,
-	Randn { seed: usize, scale_off: usize },
+/// Philox-2x32 (10 rounds) — the exact host mirror of the `philox2x32` device
+/// kernel, so the host-composed randn init draws from the same stream the old
+/// device `gpu_randn` did (bit-identical up to libm transcendental ULPs).
+fn philox2x32(counter: u32, key: u32) -> u32 {
+	let (mut x, mut y) = (counter, key);
+	for i in 0..10u32 {
+		let lo = x.wrapping_mul(0xD2511F53);
+		let hi = ((x as u64 * 0xD2511F53u64) >> 32) as u32;
+		x = hi ^ y ^ key.wrapping_mul(i + 1);
+		y = lo;
+	}
+	x
 }
 
+fn philox_uniform(idx: u32, seed: u32) -> f64 {
+	philox2x32(idx, seed) as f64 / 4294967296.0
+}
+
+/// Host randn matching the device `randn_kernel` op-for-op: Box-Muller over two
+/// philox uniforms, then scaled by the per-layer-kind init scale (He / 0.1 /
+/// 1/√d_tok) — the same scale the device `gpu_scale_inplace` applied. Fills the
+/// block host-side so the init runs ZERO device kernels.
+fn host_randn(seed: u32, scale: f64, out: &mut [f64]) {
+	for (i, o) in out.iter_mut().enumerate() {
+		let u1 = philox_uniform((2 * i) as u32, seed).max(1e-30);
+		let u2 = philox_uniform((2 * i + 1) as u32, seed);
+		*o = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * scale;
+	}
+}
+
+/// A planned block's location in the plan's host image. Every block is composed
+/// host-side (resumed weights, PE tables, biases, zeros, and now randn init too),
+/// so `materialize` only carves views — no device init kernels remain.
 struct BlockPlan {
 	off: usize, // f64 offset into the plan's host image
 	len: usize,
-	fill: Fill,
 }
 
 struct PlanEntry {
@@ -185,23 +209,24 @@ impl LayerPlan {
 		self.pad();
 		let off = self.host.len();
 		self.host.extend_from_slice(data);
-		BlockPlan { off, len: data.len(), fill: Fill::Staged }
+		BlockPlan { off, len: data.len() }
 	}
 
 	fn zeros(&mut self, len: usize) -> BlockPlan {
 		self.pad();
 		let off = self.host.len();
 		self.host.resize(off + len, 0.0);
-		BlockPlan { off, len, fill: Fill::Staged }
+		BlockPlan { off, len }
 	}
 
+	/// Compose a randn-init block directly into the host image (host Box-Muller +
+	/// scale), returning a plain staged block — the device runs no init kernel.
 	fn randn(&mut self, len: usize, seed: usize, scale: f64) -> BlockPlan {
-		let scale_off = self.host.len();
-		self.host.push(scale);
 		self.pad();
 		let off = self.host.len();
 		self.host.resize(off + len, 0.0);
-		BlockPlan { off, len, fill: Fill::Randn { seed, scale_off } }
+		host_randn(seed as u32, scale, &mut self.host[off..off + len]);
+		BlockPlan { off, len }
 	}
 
 	/// The composed host image — push this (whole) into the run's init stage.
@@ -217,18 +242,13 @@ impl LayerPlan {
 		self.entries.last().map_or(0, |e| e.dims.out_dim)
 	}
 
-	/// Carve every block as a view of the uploaded image (`base_off` = where
-	/// the image landed in the staged buffer, in f64s) and run the randn init
-	/// kernels for random blocks. In-place device calcs only — no transfers.
+	/// Carve every block as a view of the uploaded image (`base_off` = where the
+	/// image landed in the staged buffer, in f64s). The image already holds every
+	/// block's contents (weights, PE tables, biases, host-composed randn init), so
+	/// this is pure pointer arithmetic — ZERO device kernels, ZERO transfers.
 	pub fn materialize(&self, staged: &GpuBuffer, base_off: usize) -> Vec<LayerParams> {
 		let view = |bp: &BlockPlan| -> GpuBuffer {
-			let v = staged.view(base_off + bp.off, bp.len.max(1));
-			if let Fill::Randn { seed, scale_off } = bp.fill {
-				kernels::gpu_randn(bp.len, seed, &v).expect("plan randn");
-				let s = staged.view(base_off + scale_off, 1);
-				kernels::gpu_scale_inplace(&s, bp.len, &v).expect("plan randn scale");
-			}
-			v
+			staged.view(base_off + bp.off, bp.len.max(1))
 		};
 		self.entries
 			.iter()
@@ -329,7 +349,7 @@ pub fn plan_layer_params(
 	// One shared zero scalar backs every never-touched dummy slot (non-attn
 	// wk/wv/wo, non-PRelu palpha) — they are read-only placeholders.
 	let dummy_off = plan.zeros(1).off;
-	let dummy = || BlockPlan { off: dummy_off, len: 1, fill: Fill::Staged };
+	let dummy = || BlockPlan { off: dummy_off, len: 1 };
 	let mut si = 0usize;
 	let mut in_dim = d;
 	for (li, spec) in specs.iter().enumerate() {

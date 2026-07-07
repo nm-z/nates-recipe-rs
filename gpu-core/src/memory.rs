@@ -400,6 +400,44 @@ pub fn claim_device_arena_bytes(mut want: usize) -> Option<GpuBuffer> {
 	None
 }
 
+/// Carve the run's staged init image off the FRONT of the just-claimed/adopted
+/// arena and upload it — the H2D that used to be a standalone `Stage::upload` now
+/// rides the claim/adopt operation. The carve bumps the arena offset past the
+/// image (kernel-clean, ledgered as "weights") so every later scratch carve lands
+/// after it; the image lives at the arena base, so `slab.view(off, len)` addresses
+/// any block. Blocking H2D through the pinned bounce (inside the claim window, not
+/// the fit loop — the AllocGuard is not yet armed).
+fn upload_arena_front(image: &[f64]) {
+	if image.is_empty() {
+		return;
+	}
+	let _t = tag_scope("weights");
+	let img = GpuBuffer::alloc(image.len()).expect("arena image carve");
+	let bytes = std::mem::size_of_val(image);
+	// SAFETY: img spans image.len() f64s at the arena front; image spans `bytes`.
+	unsafe { xfer_sync(img.ptr, image.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }
+		.expect("arena image H2D");
+}
+
+/// Claim the process arena AND upload the run's composed init image to its front
+/// in one operation — the H2D rides the claim (no standalone upload). Returns the
+/// slab (image resident at offset 0, arena offset past it); None if even the
+/// minimum arena cannot be mapped.
+pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
+	let slab = claim_device_arena()?;
+	upload_arena_front(image);
+	Some(slab)
+}
+
+/// Claim exactly `want` bytes AND upload the image to the arena front in one
+/// operation (the detector's sized claim + fused init image — the H2D rides the
+/// claim). Returns the slab (image resident at offset 0); None if refused.
+pub fn claim_device_arena_bytes_with_image(want: usize, image: &[f64]) -> Option<GpuBuffer> {
+	let slab = claim_device_arena_bytes(want)?;
+	upload_arena_front(image);
+	Some(slab)
+}
+
 /// The run's ONE free: drain the device (no carve may be in flight), unregister
 /// the arena, sweep every carve's ledger bytes back to "unclaimed", then drop
 /// the slab — the single `hipFreeAsync` of the run's exit block.
@@ -495,6 +533,16 @@ pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
 	Some(parked)
 }
 
+/// Adopt the parked backing AND upload the run's composed init image to its front
+/// in one operation — the H2D rides the adopt (no standalone upload). Returns the
+/// re-armed slab (image resident at offset 0); None when nothing is parked or the
+/// parked slab is too small (caller claims fresh with the image).
+pub fn adopt_run_backing_with_image(need: usize, image: &[f64]) -> Option<GpuBuffer> {
+	let slab = adopt_run_backing(need)?;
+	upload_arena_front(image);
+	Some(slab)
+}
+
 /// Release the previous run's parked backing (no-op when none). Views into it
 /// — a prior fit's weights — are dead after this; the caller owns that
 /// invalidation (each run re-composes its inputs from host state).
@@ -564,19 +612,35 @@ impl Stage {
 		self.host.len()
 	}
 
+	/// Consume the Stage and hand back the composed host image — the caller uploads
+	/// it as part of the arena claim/adopt (`claim_device_arena_with_image`) so the
+	/// H2D rides the claim instead of a standalone `upload`.
+	pub fn into_host(self) -> Vec<f64> {
+		self.host
+	}
+
 	pub fn is_empty(&self) -> bool {
 		self.host.is_empty()
 	}
 
-	/// One carve + ONE sync H2D of the composed image. The returned buffer is a
-	/// carve (non-owning) — hand out sub-views with `.view(offset, len)`.
+	/// One carve + ONE H2D of the composed image. The returned buffer is a carve
+	/// (non-owning) — hand out sub-views with `.view(offset, len)`. An image that
+	/// fits the pinned bounce (≤ 64 MB) moves as a single ASYNC enqueue with no
+	/// host wait — null-stream ordering makes the first dependent kernel wait for
+	/// the copy, so init incurs ZERO blocking syncs; a larger image falls back to
+	/// the chunked synced path. The ledger counts one logical H2D either way.
 	pub fn upload(self) -> Result<GpuBuffer, HipError> {
 		let buf = GpuBuffer::alloc(self.host.len().max(1))?;
 		if !self.host.is_empty() {
 			let bytes = std::mem::size_of_val(self.host.as_slice());
+			let src = self.host.as_ptr() as *const c_void;
 			unsafe {
-				xfer_sync(buf.ptr, self.host.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D)
-			}?;
+				if bytes <= BOUNCE_BYTES {
+					h2d_pinned_async(buf.ptr, src, bytes)?;
+				} else {
+					xfer_sync(buf.ptr, src, bytes, HIP_MEMCPY_H2D)?;
+				}
+			}
 		}
 		Ok(buf)
 	}
@@ -750,6 +814,74 @@ unsafe fn h2d_pinned(
 	Ok(())
 }
 
+/// Single-chunk ASYNC H2D through the pinned bounce: fan the host image into the
+/// pin on all cores, then ONE async `dev_copy` on the null stream — NO host sync.
+/// Null-stream ordering makes the first dependent kernel wait for the copy, and
+/// the bounce is not reused until the run's exit D2H, so the init image is safe in
+/// the pin the whole time. Caller guarantees `bytes ≤ BOUNCE_BYTES`. Counts one
+/// logical H2D in the ledger (callspy sees exactly one MEMCPY_ASYNC).
+unsafe fn h2d_pinned_async(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<(), HipError> {
+	let mut guard = match BOUNCE.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if *guard == 0 {
+		*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
+	}
+	let pin = *guard as *mut u8;
+	H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+	H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+	// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES ≥ bytes.
+	par_copy(pin, src as *const u8, bytes);
+	unsafe { dev_copy(dst, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut()) }
+}
+
+/// Largest image the single-enqueue async transfer paths accept; above it the
+/// caller falls back to the chunked synced path (correctness over cell-counts).
+pub const BOUNCE_LIMIT: usize = BOUNCE_BYTES;
+
+/// In-flight handle for the exit's two-phase D2H: the device→pin copy is already
+/// enqueued (async, no wait) and the bounce lock is held so nothing else can
+/// reuse the pin. The caller drains the device by OTHER means — the Scratch
+/// drop's mandated `device_synchronize` — then calls `finish` to fan the pin
+/// into the host buffer on all cores. One enqueue, zero dedicated waits.
+pub struct ExitD2H {
+	_guard: std::sync::MutexGuard<'static, usize>,
+	pin: usize,
+	bytes: usize,
+}
+
+impl ExitD2H {
+	/// Fan the (already-drained) pin into `dst`. Call ONLY after the device has
+	/// been synchronized so the enqueued copy is complete; releases the bounce lock.
+	pub fn finish(self, dst: &mut [f64]) {
+		assert_eq!(std::mem::size_of_val(dst), self.bytes, "ExitD2H::finish size mismatch");
+		// SAFETY: pin spans BOUNCE_BYTES ≥ bytes; dst spans `bytes`; copy is complete.
+		par_copy(dst.as_mut_ptr() as *mut u8, self.pin as *const u8, self.bytes);
+	}
+}
+
+/// Phase 1 of the blocking-free exit D2H: enqueue the device→pin copy on the null
+/// stream (async, counted as one logical D2H) and hold the bounce lock. Single
+/// chunk only (`bytes ≤ BOUNCE_BYTES`). The returned handle's `finish` completes
+/// the transfer host-side after the caller's own device drain.
+pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD2H, HipError> {
+	assert!(bytes <= BOUNCE_BYTES, "exit_d2h_enqueue: {bytes} exceeds bounce");
+	let mut guard = match BOUNCE.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if *guard == 0 {
+		*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
+	}
+	let pin = *guard as *mut u8;
+	D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
+	D2H_CALLS.fetch_add(1, Ordering::Relaxed);
+	// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES ≥ bytes.
+	unsafe { dev_copy(pin as *mut c_void, src, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+	Ok(ExitD2H { _guard: guard, pin: pin as usize, bytes })
+}
+
 /// Blocking transfer: enqueue on the default stream, then wait on that stream —
 /// the drop-in for the old synchronous `hipMemcpy`. Fresh buffers come from the
 /// initialized pool (see `ensure_pool_init`), so the async SDMA copy
@@ -797,6 +929,12 @@ pub(crate) unsafe fn xfer_sync(
 	}
 	// SAFETY: forwarded from the caller's validated pointers.
 	unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) }?;
+	if kind == HIP_MEMCPY_H2D {
+		// h2d_pinned already held the bounce lock across a per-chunk stream
+		// sync — the copy is complete here; a trailing wait would be the
+		// second stall for the same transfer.
+		return Ok(());
+	}
 	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
 }

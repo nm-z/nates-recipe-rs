@@ -319,6 +319,11 @@ impl Train {
 		// `let` bindings, registry pointers by the boxed state those bindings own.
 		let model: &ModelInner = unsafe { &*model_ptr };
 		let data: &dyn RunData = unsafe { &*data_ptr };
+		// Whole-run callspy bracket (gated on the Hip metric, like fit's per-phase
+		// blocks): a run-entry snapshot so the sync-class ops OUTSIDE fit are visible
+		// — the detector's claim/forward/release during data prep and the training
+		// arena claim show up in the pre-fit block, the exit park in the post-fit one.
+		let run_hip = self.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		// A scenario whose encoded matrix exceeds the combined VRAM+RAM+disk ceiling
 		// is skipped instead of crashing the whole program. tiered::admit prints the
 		// size before bailing; catch that here, report the skip, and move on. Any
@@ -374,46 +379,28 @@ impl Train {
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
-			// One-claim arena, adopt-first. A staged-eligible run re-arms the
-			// PREVIOUS run's parked slab as its own arena (adopt: sweep + rewind +
-			// one memset — no free, no realloc, so the freeAsync lazy-unmap /
-			// VA-reuse race and the post-free counter depression cannot fire);
-			// every alloc inside fit (weights, scaler stats, scratch) bump-carves
-			// from it. Only the first run of the process (or a grown footprint)
-			// claims fresh. The slab is PARKED again at exit, not freed: its
-			// weight/stat views stay live past run() for scoring, save, and a
-			// following eval. A pooled fit (out-of-core / non-ring metric / a
-			// rerun with no host mirror) must NOT run under an arena — it leaves
-			// no host weight mirror, so a later cross-model eval would find its
-			// parked backing freed with nothing to rebuild from — so ineligible
-			// runs release the park and allocate from the pool exactly as before
-			// (their params stay pool-owned). Footprint sizing is plan-time only
-			// (dims math + null borrows, zero device traffic), safe while the
-			// previous backing is still parked.
+			// One-claim arena, adopt-first — now OWNED by `fit_staged` (the compose →
+			// claim-with-image → park lifecycle): a staged-eligible run composes its init
+			// image and claims/adopts the arena WITH it (the training H2D rides the claim
+			// op, not a standalone upload) then parks the slab at exit (the prefix D2H
+			// rides the park op). Adopt re-arms the prior run's parked slab (sweep +
+			// rewind + one memset — no free/realloc, so the freeAsync VA-reuse race can't
+			// fire); the slab stays PARKED past run() for scoring/save/eval. run() only
+			// releases the prior park for an INELIGIBLE (pooled) run — a staged run must
+			// keep it so fit_staged can adopt it. A refused claim inside fit_staged prints
+			// its own demotion and falls through to the pooled path.
 			let eligible = model.staged_eligible(self);
-			let footprint = plan_footprint(model, ds, false);
-			let slab = if eligible {
-				gpu_core::memory::adopt_run_backing(footprint).or_else(|| {
-					gpu_core::memory::release_run_backing();
-					(footprint <= gpu_core::memory::claimable_bytes())
-						.then(gpu_core::memory::claim_device_arena)
-						.flatten()
-				})
-			} else {
+			if !eligible {
 				gpu_core::memory::release_run_backing();
-				None
-			};
-			// A staged-eligible run demoting to pooled is never silent: print the
-			// numbers the decision was made from so a sizing bug shows itself.
-			if eligible && slab.is_none() {
-				eprintln!(
-					"arena: claim refused — footprint {} claimable {} free {} (falling to pooled)",
-					crate::data::human_bytes(footprint),
-					crate::data::human_bytes(gpu_core::memory::claimable_bytes()),
-					crate::data::human_bytes(gpu_core::memory::vram_free_base()),
-				);
+			}
+			// pre-fit block: sync-class ops between run entry and fit — the detector's
+			// claim + release during data prep. The training claim/adopt (with its H2D)
+			// and the park (with its D2H) ride INSIDE fit's own init/exit blocks now.
+			if let Some(a) = run_hip.as_ref() {
+				eprint!("── run pre-fit ──\n{}", gpu_core::callspy::report_since(a));
 			}
 			model.fit(ds, self, resume.as_deref(), conns);
+			let post_fit = run_hip.map(|_| gpu_core::callspy::snapshot());
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
 			}
@@ -423,8 +410,11 @@ impl Train {
 			// invariant under the affine target scaling, so the z-scored-target score
 			// equals the raw-scale one.
 			let score = model.fit_score.get();
-			if let Some(slab) = slab {
-				gpu_core::memory::park_run_backing(slab);
+			// post-fit block: fit already parked (staged) or freed/trimmed (pooled) its
+			// backing, so this window carries only a pooled fit's pool_trim (empty for
+			// a staged run — its park/D2H rode fit's exit block).
+			if let Some(p) = post_fit.as_ref() {
+				eprint!("── run post-fit ──\n{}", gpu_core::callspy::report_since(p));
 			}
 			// Record which parked backing this run's params view is carved from (None
 			// when nothing was parked — a pooled out-of-core run keeps pool-owned
@@ -670,7 +660,7 @@ struct Issue {
 /// exact host-side estimate — the same `vram_estimate` preflight reports, factored
 /// out so the arena claim and preflight share one number. Derives the embed/text
 /// vs categorical column split (and pinned/derived vocab) exactly as fit does.
-fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: bool) -> usize {
+pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: bool) -> usize {
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
 	let k = ds.n_targets.max(1);

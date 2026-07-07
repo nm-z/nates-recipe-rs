@@ -25,7 +25,8 @@ pub use gpu_core::tiered;
 // a single memset-committed slab (bump-carves, no per-buffer pool growth — the
 // same lifecycle fit uses) rather than the flake-prone fresh-page path.
 pub use gpu_core::memory::{
-	GpuBuffer, Stage, claim_device_arena_bytes, device_arena_active, release_device_arena,
+	GpuBuffer, Stage, claim_device_arena_bytes, claim_device_arena_bytes_with_image,
+	device_arena_active, release_device_arena,
 };
 pub use ogdl::*;
 pub use params::*;

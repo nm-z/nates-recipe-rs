@@ -360,6 +360,53 @@ pub fn zscore_apply_into(
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
 }
 
+/// Host z-score fit, op-for-op the same math as the device `zscore_fit_into`
+/// (population mean, population variance +1e-8, sqrt, (x−mean)/std) but composed
+/// on the host so the staged init runs ZERO device zscore kernels. Returns
+/// (mean[d], std[d], scaled[n·d]); the stats still ride the init image so the
+/// exit D2H hands them to the Scaler exactly as before. `x` is row-major [n×d].
+pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+	let nf = n as f64;
+	let mut mean = vec![0.0f64; d];
+	for i in 0..n {
+		for j in 0..d {
+			mean[j] += x[i * d + j];
+		}
+	}
+	for m in mean.iter_mut() {
+		*m /= nf;
+	}
+	let mut std = vec![0.0f64; d];
+	for i in 0..n {
+		for j in 0..d {
+			let dv = x[i * d + j] - mean[j];
+			std[j] += dv * dv;
+		}
+	}
+	for s in std.iter_mut() {
+		*s = (*s / nf + ZSCORE_EPS).sqrt();
+	}
+	let mut scaled = vec![0.0f64; n * d];
+	for i in 0..n {
+		for j in 0..d {
+			scaled[i * d + j] = (x[i * d + j] - mean[j]) / std[j];
+		}
+	}
+	(mean, std, scaled)
+}
+
+/// Host z-score apply with a fitted mean/std (the staged rerun path) — the same
+/// (x−mean)/std the device `zscore_apply_into` computes, on the host.
+pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64]) -> Vec<f64> {
+	let mut scaled = vec![0.0f64; n * d];
+	for i in 0..n {
+		for j in 0..d {
+			scaled[i * d + j] = (x[i * d + j] - mean[j]) / std[j];
+		}
+	}
+	scaled
+}
+
 pub fn zscore_apply(xraw: &GpuBuffer, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
 	assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
 	assert_eq!(scaler.std.len(), d, "eval: feature count changed");

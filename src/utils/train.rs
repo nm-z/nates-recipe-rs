@@ -8,8 +8,7 @@ use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, build_layer_params, concat_layer,
 	forward_into, infer_scored, load_ogdl, load_ogdl_str, metric_gpu, metric_gpu_into,
-	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_apply_into, zscore_fit,
-	zscore_fit_into,
+	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_fit,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
@@ -190,8 +189,7 @@ impl ModelInner {
 	/// and the achieved rates as % of the two on-card rooflines (our measured
 	/// GEMM ceiling, gfx1101 memory BW). The OOC path prints its streamed-tier
 	/// counterpart per sweep with the PCIe/NVMe rooflines it measures at build.
-	fn roofline_block(params: &[LayerParams], n: usize, sc: &Scratch) -> String {
-		let (fms, bms) = sc.layer_ms(params.len());
+	fn roofline_block(params: &[LayerParams], n: usize, fms: &[f64], bms: &[f64]) -> String {
 		let mut out = String::new();
 		let (mut t_ms, mut t_flop, mut t_bytes) = (0.0f64, 0.0f64, 0.0f64);
 		for (l, p) in params.iter().enumerate() {
@@ -755,16 +753,14 @@ impl ModelInner {
 		// upload into many callspy MEMCPY_ASYNC ticks, so callspy overcounts).
 		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let rerun = !self.params.borrow().is_empty();
-		// One-claim staged fit: when run() claimed the arena (in-VRAM) for a
-		// staged-eligible run, compose the whole init as ONE staged image + one H2D,
-		// run a zero-transfer loop, and bring everything home in one exit D2H. Every
-		// other case (out-of-core, a non-ring metric, a rerun with no host mirror)
-		// keeps the proven pooled path below unchanged. `run()` gates the arena CLAIM
-		// on the same predicate, so `arena_remaining() > 0` already implies
-		// eligibility; the re-check keeps `fit` correct for any future caller that
-		// skips the gate.
-		if gpu_core::memory::arena_remaining() > 0 && self.staged_eligible(cfg) {
-			self.fit_staged(data, cfg, resume);
+		// One-claim staged fit: a staged-eligible in-VRAM run composes the whole init
+		// as ONE image that rides the arena claim/adopt (the training H2D is part of
+		// the claim op), runs a zero-transfer loop, and brings everything home in one
+		// exit D2H that rides the park op. `fit_staged` now owns the arena decision:
+		// it claims/adopts WITH the image and returns false only when the claim is
+		// refused, in which case we fall through to the proven pooled path (out-of-core,
+		// a non-ring metric, a rerun with no host mirror also stay pooled).
+		if self.staged_eligible(cfg) && self.fit_staged(data, cfg, resume) {
 			return;
 		}
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
@@ -1163,7 +1159,8 @@ impl ModelInner {
 					}
 					eprintln!("{line}");
 					if time_layers {
-						eprint!("{}", Self::roofline_block(&params, n, &sc));
+						let (fms, bms) = sc.layer_ms(params.len());
+							eprint!("{}", Self::roofline_block(&params, n, &fms, &bms));
 					}
 				}
 				if plotting {
@@ -1324,7 +1321,12 @@ impl ModelInner {
 	/// the ONE exit D2H, which then replays the log lines, the checkpoint
 	/// divergence semantics, and the end-of-run TUI plot. Stats cross to the host
 	/// Scaler exactly ONCE, at exit.
-	fn fit_staged(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
+	/// Returns true if the staged fit ran; false if the arena claim was refused
+	/// (the caller falls through to the pooled path). The composed init image rides
+	/// the arena claim/adopt (`claim_device_arena_with_image`), so the training H2D
+	/// is part of the claim op, not a standalone upload; the exit prefix D2H rides
+	/// `park_staged`, so it is part of the park op.
+	fn fit_staged(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) -> bool {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let start = std::time::Instant::now();
@@ -1491,50 +1493,103 @@ impl ModelInner {
 			}
 		}
 		let n_rows = ring_row.len();
+		// Roofline event sets to pre-allocate: one per epoch whose log line prints a
+		// per-layer block (time_layers = log_now && !plotting). The loop records into
+		// them transfer-free; the exit reads them all after the drain (loop event
+		// syncs → 0). Zero when plotting or nothing logs.
+		let n_timed = if plotting || cfg.metrics.is_empty() || cfg.log_every == 0 {
+			0
+		} else {
+			(0..cfg.epochs).filter(|&e| e % cfg.log_every == 0 || e + 1 == cfg.epochs).count()
+		};
+		// ── host-composed z-score (item 1): mean / std / scaled features computed on
+		// the host so the init runs ZERO device zscore kernels (in-place 0). The math
+		// is the device path's op-for-op (population mean/var, +1e-8, sqrt,
+		// (x−mean)/std). mean/std still ride the exit-region prefix so the exit D2H
+		// hands them to the Scaler unchanged; the scaled matrix rides the upload-only
+		// suffix. The scale source is the categorical branch (embed) or the whole
+		// matrix (non-embed); embed token ids are never scaled. ──
+		let (mean_host, std_host, scaled_host) = if d_sc == 0 {
+			(Vec::new(), Vec::new(), Vec::new())
+		} else {
+			let src = if embed_first { cat.as_ref().expect("cat matrix") } else { &xinput };
+			let src_std = src.as_standard_layout();
+			let sl = src_std.as_slice().expect("scale src contiguous");
+			if rerun {
+				let sc_host = self.scaler.borrow();
+				let s = sc_host.as_ref().expect("rerun without scaler");
+				assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
+				let scaled = recipe_infer::zscore_apply_host(sl, n, d_sc, &s.mean, &s.std);
+				(s.mean.clone(), s.std.clone(), scaled)
+			} else {
+				recipe_infer::zscore_fit_host(sl, n, d_sc)
+			}
+		};
 		let mut stage = Stage::new();
 		let w_off = stage.push(plan.host());
-		// First fit: mean/std slots are device-filled by the z-score fit. Rerun: the
-		// host Scaler's stats ride the image IN and get broadcast-applied — same
-		// semantics as the pooled rerun's `zscore_apply`, no re-fit.
+		// mean/std ride the prefix as REAL bytes (first fit and rerun alike): the
+		// exit D2H brings them to the host Scaler exactly as before.
 		let (mean_off, std_off) = if d_sc == 0 {
 			(0, 0)
-		} else if rerun {
-			let sc_host = self.scaler.borrow();
-			let s = sc_host.as_ref().expect("rerun without scaler");
-			assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
-			(stage.push(&s.mean), stage.push(&s.std))
 		} else {
-			(stage.reserve(d_sc), stage.reserve(d_sc))
+			(stage.push(&mean_host), stage.push(&std_host))
 		};
 		let ring_off = stage.reserve(n_rows * epochs); // metric ring: n_rows × epochs scalars
 		let end_off = stage.reserve(1); // end-score scalar (stop metric)
 		// Everything above is the exit-region PREFIX (weights + stats + ring +
 		// end-score), brought home in ONE contiguous D2H at exit. Below is
-		// upload-only (consts/scalars/eps/x/cat/y), never downloaded.
+		// upload-only (consts/scalars/scaled-x/tokens/y), never downloaded.
 		let w_len = plan.host().len();
 		let prefix_len = stage.len_floats();
 		let consts_off = stage.push(&SCRATCH_CONSTS);
 		let sc_off = stage.push(&[-self.lr, 1.0 / n as f64, 2.0 / n as f64, 0.0]);
-		let eps_off = if d_sc > 0 { stage.push(&[1e-8]) } else { 0 };
-		let x_std = xinput.as_standard_layout();
-		let x_off = stage.push(x_std.as_slice().expect("xinput contiguous"));
-		let cat_off = cat.as_ref().map(|m| {
-			let s = m.as_standard_layout();
-			stage.push(s.as_slice().expect("cat contiguous"))
-		});
-		let scaled_off = if d_sc > 0 { stage.reserve(n * d_sc) } else { 0 };
-		let y_off = stage.push(&y_flat);
-		let base = {
-			let _t = gpu_core::memory::tag_scope("weights");
-			stage.upload().expect("stage upload")
+		// The standardized features (real host bytes). Non-embed models feed this as
+		// xbuf directly; embed models feed it as the categorical side-input x_cat.
+		let scaled_off = if d_sc > 0 { stage.push(&scaled_host) } else { 0 };
+		// Raw token ids for an embed model's xbuf (never scaled). Non-embed models
+		// need no raw matrix on device — the scaled features above are xbuf.
+		let x_off = if embed_first {
+			let x_std = xinput.as_standard_layout();
+			stage.push(x_std.as_slice().expect("xinput contiguous"))
+		} else {
+			0
 		};
-		// ── materialize weights from the image (device randn init, no transfer) ──
+		let y_off = stage.push(&y_flat);
+		// ── claim the arena WITH the image (the training H2D rides the claim/adopt op,
+		// not a standalone upload). adopt-first: re-arm the prior run's parked slab
+		// (rewind + re-zero + image H2D + one drain); else claim fresh. A refused claim
+		// returns false → the caller runs the pooled path. The image lives at the arena
+		// front, so `base` is a view spanning it and `base.view(off,len)` addresses any
+		// block; scratch bump-carves after it. ──
+		let image = stage.into_host();
+		let image_floats = image.len();
+		let footprint = crate::model::plan_footprint(self, data, false);
+		let slab = gpu_core::memory::adopt_run_backing_with_image(footprint, &image).or_else(|| {
+			gpu_core::memory::release_run_backing();
+			(footprint <= gpu_core::memory::claimable_bytes())
+				.then(|| gpu_core::memory::claim_device_arena_with_image(&image))
+				.flatten()
+		});
+		let slab = match slab {
+			Some(s) => s,
+			None => {
+				eprintln!(
+					"arena: claim refused — footprint {} claimable {} free {} (falling to pooled)",
+					crate::data::human_bytes(footprint),
+					crate::data::human_bytes(gpu_core::memory::claimable_bytes()),
+					crate::data::human_bytes(gpu_core::memory::vram_free_base()),
+				);
+				return false;
+			}
+		};
+		let base = slab.view(0, image_floats);
+		// ── materialize weights from the image (pure carve, no init kernel/transfer) ──
 		let params = plan.materialize(&base, w_off);
 		let last = params.len() - 1;
 		let consts_view = base.view(consts_off, 12);
-		let sc = {
+		let mut sc = {
 			let _t = gpu_core::memory::tag_scope("scratch");
-			Scratch::new_staged(&params, n, false, &consts_view)
+			Scratch::new_staged(&params, n, false, &consts_view, n_timed)
 		};
 		let ss = StepScalars {
 			neg_lr: base.view(sc_off, 1),
@@ -1542,34 +1597,9 @@ impl ModelInner {
 			two_inv_n: base.view(sc_off + 2, 1),
 			zero: base.view(sc_off + 3, 1),
 		};
-		// ── z-score on device into reserved views; mean/std NEVER downloaded here ──
+		// ── input views (z-score already applied host-side above) ──
 		let (xbuf, x_cat) = if d_sc > 0 {
 			let scaled = base.view(scaled_off, n * d_sc);
-			let x_src = if embed_first {
-				base.view(cat_off.expect("cat_off"), n * c)
-			} else {
-				base.view(x_off, n * d)
-			};
-			if rerun {
-				zscore_apply_into(
-					&x_src,
-					n,
-					d_sc,
-					&base.view(mean_off, d_sc),
-					&base.view(std_off, d_sc),
-					&scaled,
-				);
-			} else {
-				zscore_fit_into(
-					&x_src,
-					n,
-					d_sc,
-					&base.view(eps_off, 1),
-					&base.view(mean_off, d_sc),
-					&base.view(std_off, d_sc),
-					&scaled,
-				);
-			}
 			if embed_first {
 				(base.view(x_off, n * d), Some(scaled))
 			} else {
@@ -1628,17 +1658,20 @@ impl ModelInner {
 		let mut fit_score = f64::NAN;
 		// Per-recorded-epoch host records replayed AFTER the loop (batch logging
 		// keeps the loop transfer-free): epoch, wall-clock, whether it was a
-		// scheduled log epoch, and its roofline block (which reads layer_ms via
-		// event syncs, not transfers). Checkpoint and plot runs record EVERY epoch
-		// (the divergence test and the plot series replay per-epoch from the ring);
-		// otherwise only log epochs. The metric values themselves go into the
-		// device ring — raw kernel outputs (ss_res / accuracy / loss reduction),
-		// transformed host-side at replay from the ONE ring download.
-		let mut epoch_meta: Vec<(usize, f64, bool, String)> = Vec::new();
+		// scheduled log epoch, and its roofline event-set index (None when the epoch
+		// records no per-layer block). The boundaries themselves are recorded on the
+		// null stream into that set; the ONE exit drain completes them and the replay
+		// reads them with NO further sync — so the loop does zero event syncs.
+		// Checkpoint and plot runs record EVERY epoch (the divergence test and the
+		// plot series replay per-epoch from the ring); otherwise only log epochs. The
+		// metric values themselves go into the device ring — raw kernel outputs
+		// (ss_res / accuracy / loss reduction), transformed host-side at replay.
+		let mut epoch_meta: Vec<(usize, f64, bool, Option<usize>)> = Vec::new();
 		let ring_every = checkpointing || plotting;
 		// Host-side (sign, div) rescale for each ring row, filled once in the loop;
 		// constant across epochs (depends only on loss / metric / n / ss_tot).
 		let mut ring_scale: Vec<(f64, f64)> = vec![(1.0, 1.0); n_rows];
+		let mut timed_slot = 0usize; // next roofline event set to record into
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
@@ -1647,6 +1680,11 @@ impl ModelInner {
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
 			let time_layers = log_now && !plotting;
+			// Record this epoch's boundaries into its own event set (read at exit).
+			let this_slot = time_layers.then_some(timed_slot);
+			if let Some(s) = this_slot {
+				sc.set_timing_slot(s);
+			}
 			sc.set_timing(time_layers);
 			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 			if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1654,6 +1692,9 @@ impl ModelInner {
 			}
 			self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 			sc.set_timing(false);
+			if time_layers {
+				timed_slot += 1;
+			}
 			if log_now || ring_every {
 				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 				if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1667,24 +1708,13 @@ impl ModelInner {
 					let slot = base.view(ring_off + mi * epochs + e, 1);
 					ring_scale[mi] = metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot);
 				}
-				epoch_meta.push((
-					e,
-					start.elapsed().as_secs_f64(),
-					log_now,
-					if time_layers { Self::roofline_block(&params, n, &sc) } else { String::new() },
-				));
+				epoch_meta.push((e, start.elapsed().as_secs_f64(), log_now, this_slot));
 			}
 		}
-		gpu_core::hw::disarm_saturation_crash();
-		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
-		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
-		drop(_guard);
-		unsafe {
-			libc::signal(libc::SIGINT, libc::SIG_DFL);
-		}
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
-		// End score into the reserved slot on device (no D2H) — it rides home in the
-		// single prefix D2H below with everything else.
+		// End score (item 3): the loop's FINAL scoring pass — one more forward into
+		// the reserved end-score slot on device (no D2H). Executed BEFORE the
+		// loop-boundary snapshot so its launches/GEMMs count as loop work, not exit.
 		if !was_interrupted {
 			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 			let end_slot = base.view(end_off, 1);
@@ -1698,10 +1728,22 @@ impl ModelInner {
 				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &end_slot).expect("ss_res");
 			}
 		}
-		// THE single exit D2H: the whole exit-region prefix (weights + mean/std +
-		// ring + end-score) into ONE host block; everything below is scattered from
-		// it with zero further device transfers.
-		let host = base.view(0, prefix_len).download_vec().expect("exit prefix d2h");
+		gpu_core::hw::disarm_saturation_crash();
+		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
+		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		drop(_guard);
+		unsafe {
+			libc::signal(libc::SIGINT, libc::SIG_DFL);
+		}
+		// ── exit: bring the exit-region prefix home INSIDE the park op (`park_staged`)
+		// — the prefix D2H enqueue rides the park, the Scratch drop's mandated
+		// device_synchronize is the ONE blocking drain (it also completes every
+		// roofline event), then the slab is PARKED (not freed) for later eval/save.
+		// The per-epoch event sets are moved out first so their handles outlive the
+		// drop. This is the D2H fold: the exit does no standalone transfer. ──
+		let (ev_fwd, ev_bwd) = sc.take_events();
+		let src = base.as_ptr_offset(0);
+		let host = self.park_staged(slab, src, prefix_len, sc);
 		// stats → host Scaler (the one crossing to RAM, per the invariant). A rerun
 		// pushed the SAME stats in and never re-fit, so nothing crosses back.
 		if d_sc > 0 && !rerun {
@@ -1738,7 +1780,7 @@ impl ModelInner {
 		// per-epoch weights never come home under the one-D2H exit contract).
 		let mut loss_prev = f64::INFINITY;
 		let mut ckpt_saved = false;
-		for (e, elapsed, was_log, roof) in &epoch_meta {
+		for (e, elapsed, was_log, roof_slot) in &epoch_meta {
 			let score = val_of(stop_metric, *e);
 			if score.is_finite() {
 				fit_score = score;
@@ -1782,8 +1824,12 @@ impl ModelInner {
 					line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
 				}
 				eprintln!("{line}");
-				if *was_log {
-					eprint!("{roof}");
+				// Roofline block read from the epoch's event set AFTER the exit drain —
+				// the events are complete, so this needs no further sync (loop stayed
+				// event-sync-free). Byte-identical to the old in-loop print.
+				if *was_log && let Some(s) = roof_slot {
+					let (fms, bms) = recipe_infer::layer_ms_from(&ev_fwd[*s], &ev_bwd[*s], params.len());
+					eprint!("{}", Self::roofline_block(&params, n, &fms, &bms));
 				}
 			}
 		}
@@ -1870,7 +1916,11 @@ impl ModelInner {
 		}
 		*self.params.borrow_mut() = params;
 		self.fit_score.set(fit_score);
-		gpu_core::memory::pool_trim();
+		// No pool_trim here (unlike the pooled path): a staged fit only bump-carves
+		// from the arena — it never grows the pool, so there is no freed slack to
+		// trim and no stale high-water. pool_trim's device_synchronize would be a
+		// SECOND exit blocking sync; the exit contract is exactly one (the Scratch
+		// drop drain above).
 		if let (Some(b0), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
 			for (phase, a, b) in [
 				("init", &b0, &init),
@@ -1887,6 +1937,29 @@ impl ModelInner {
 				eprintln!("── ledger {phase} ── H2D calls {h}  D2H calls {dd}");
 			}
 		}
+		true
+	}
+	/// The exit/park op: enqueue the prefix D2H INSIDE this call (so the exit does no
+	/// standalone transfer), let the Scratch drop be the ONE blocking drain, fan the
+	/// pinned bounce into `host` on all cores, then park the slab (kept resident, not
+	/// freed, for later eval/save). `src` is the arena front (prefix start). A prefix
+	/// larger than the bounce falls back to a blocking chunked download — same fold,
+	/// the transfer still lives inside this park call.
+	fn park_staged(&self, slab: GpuBuffer, src: *mut std::ffi::c_void, prefix_len: usize, sc: Scratch) -> Vec<f64> {
+		let mut host = vec![0.0f64; prefix_len];
+		let prefix_bytes = prefix_len * 8;
+		if prefix_bytes <= gpu_core::memory::BOUNCE_LIMIT {
+			let inflight = unsafe {
+				gpu_core::memory::exit_d2h_enqueue(src, prefix_bytes).expect("exit prefix d2h enqueue")
+			};
+			drop(sc); // the ONE exit blocking sync: drains the enqueued D2H + completes events
+			inflight.finish(&mut host);
+		} else {
+			drop(sc); // drain first, then a blocking chunked download of the oversize prefix
+			GpuBuffer::borrow(src, prefix_bytes).download(&mut host).expect("exit prefix d2h");
+		}
+		gpu_core::memory::park_run_backing(slab);
+		host
 	}
 	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();

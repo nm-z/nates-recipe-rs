@@ -84,13 +84,6 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	// ~30-50% of fresh-process data loads. Only claim when no arena is already
 	// active: a parked training backing already carves reliably, and a second
 	// claim asserts. A refused claim (None) falls back to the pool path unchanged.
-	let arena = (!recipe_infer::device_arena_active())
-		.then(|| {
-			let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, true);
-			recipe_infer::claim_device_arena_bytes(est + est / 2 + (1 << 20))
-		})
-		.flatten();
-	let _arena = ArenaGuard(arena);
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);
 	// AOT init: weights (resume-composed host image), the 12 scratch constants,
 	// and the tokenized input ride ONE staged H2D on the claim — was ~37
@@ -103,7 +96,26 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	let w_off = stage.push(plan.host());
 	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
 	let x_off = stage.push(x.as_slice().expect("detect: x contiguous"));
-	let base = stage.upload().expect("detect stage upload");
+	// Claim the detector's arena WITH the composed image when no arena is already
+	// active (the H2D rides the claim, not a standalone upload); a second claim
+	// would assert while a training slab is parked+registered, so in that case carve
+	// from it and upload into the carve. Either way the whole init moves in ONE H2D.
+	let image = stage.into_host();
+	let image_floats = image.len();
+	let claim = (!recipe_infer::device_arena_active())
+		.then(|| {
+			let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, true);
+			recipe_infer::claim_device_arena_bytes_with_image(est + est / 2 + (1 << 20), &image)
+		})
+		.flatten();
+	let (arena, base) = match claim {
+		Some(slab) => {
+			let b = slab.view(0, image_floats);
+			(Some(slab), b)
+		}
+		None => (None, recipe_infer::GpuBuffer::upload(&image).expect("detect image upload")),
+	};
+	let _arena = ArenaGuard(arena);
 	let params = plan.materialize(&base, w_off);
 	let xbuf = base.view(x_off, n * CONTEXT);
 	let consts_view = base.view(consts_off, 12);

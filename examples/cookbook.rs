@@ -78,6 +78,7 @@ fn main() {
 		.epochs(20)
 		.net(["archy", "sentry"])
 		.log([Loss, R2, hip]);
+
 	let llm = Model::new()          // LLM
 		.loss(ce)
 		.layer(embed(16))
@@ -91,7 +92,7 @@ fn main() {
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
 	let llm_train = Train::new()
-		.epochs(20)
+		.epochs(1)
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy]);
 
