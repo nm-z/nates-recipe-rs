@@ -42,6 +42,20 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	ids
 }
 
+// Releases the detector's one-claim slab on every exit (normal return or a
+// panic in the GPU calls) so a fault can never leave the arena registered and
+// wedge the next claim. `None` when nothing was claimed (an arena was already
+// active, or the claim was refused) — Drop is then a no-op.
+struct ArenaGuard(Option<recipe_infer::GpuBuffer>);
+
+impl Drop for ArenaGuard {
+	fn drop(&mut self) {
+		if let Some(slab) = self.0.take() {
+			recipe_infer::release_device_arena(slab);
+		}
+	}
+}
+
 /// Each column's byte stream → argmax over the six kind logits. Builds the fixed
 /// `embed(32,vocab=257) → attn(4) → dense(64,leaky) → dense(6,linear)` stack as
 /// `recipe_infer::LayerSpec` values, loads the inline checkpoint into it, and runs
@@ -63,6 +77,20 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 		recipe_infer::LayerSpec::Dense(64, recipe_infer::Activation::LeakyRelu),
 		recipe_infer::LayerSpec::Dense(N_CLASS, recipe_infer::Activation::Linear),
 	];
+	// One-claim arena for the detector's forward. Sized by the same estimator
+	// fit uses (input + weights + scratch, forward-only) plus a margin, so
+	// build/upload/scratch all bump-carve from one memset-committed slab instead
+	// of growing the pool per buffer — the fresh-page memset-commit that faults
+	// ~30-50% of fresh-process data loads. Only claim when no arena is already
+	// active: a parked training backing already carves reliably, and a second
+	// claim asserts. A refused claim (None) falls back to the pool path unchanged.
+	let arena = (!recipe_infer::device_arena_active())
+		.then(|| {
+			let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, true);
+			recipe_infer::claim_device_arena_bytes(est + est / 2 + (1 << 20))
+		})
+		.flatten();
+	let _arena = ArenaGuard(arena);
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);
 	let params = recipe_infer::build_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, true)
 		.unwrap_or_else(|e| panic!("detect build_layer_params: {e}"));
@@ -70,6 +98,8 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	let sc = recipe_infer::Scratch::new(&params, n, true);
 	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 	let last = params.len() - 1;
+	// preds copies to host here; params/xbuf/sc are non-owning carves, so the
+	// guard's release (after this scope) frees them with the slab.
 	let preds = recipe_infer::download_vec(&sc.acts[last], n * N_CLASS);
 	(0..n)
 		.map(|r| {

@@ -894,6 +894,14 @@ pub fn arena_remaining() -> usize {
 	ARENA_SIZE.load(Ordering::Relaxed).saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed))
 }
 
+/// Whether a device arena is currently registered — a live claim (a run's own)
+/// or a parked training backing still resident between runs. A second claim
+/// asserts, so callers that opportunistically claim (the detector) must skip
+/// their claim when one is already active and carve from it instead.
+pub fn device_arena_active() -> bool {
+	ARENA_BASE.load(Ordering::Relaxed) != 0
+}
+
 /// Force-commit a 1 GiB buffer (so its pages are backed), zero it, then free it.
 /// With the pool's release threshold pinned the pages stay resident, so later
 /// allocs reuse already-mapped memory. Runs through the choke points against the

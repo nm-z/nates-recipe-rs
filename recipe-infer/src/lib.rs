@@ -21,6 +21,12 @@ pub use work::{GEMM_GFLOPS, VRAM_GBS, Work, layer_bwd, layer_fwd};
 // The tiered VRAM/RAM/disk buffer + its admit check, surfaced so pantry (which
 // depends only on recipe-infer) can gate encoding on B ≤ VRAM+RAM+disk.
 pub use gpu_core::tiered;
+// One-claim device arena, surfaced so pantry can back the detector's forward in
+// a single memset-committed slab (bump-carves, no per-buffer pool growth — the
+// same lifecycle fit uses) rather than the flake-prone fresh-page path.
+pub use gpu_core::memory::{
+	GpuBuffer, claim_device_arena_bytes, device_arena_active, release_device_arena,
+};
 pub use ogdl::*;
 pub use params::*;
 pub use scratch::*;
