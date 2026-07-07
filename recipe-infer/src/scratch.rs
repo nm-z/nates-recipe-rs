@@ -4,9 +4,27 @@
 //! `vram_estimate`) that gate a forward/backward pass against free VRAM.
 
 use crate::enums::{Activation, LayerKind, LayerSpec};
-use crate::params::{LayerParams, concat_layer};
+use crate::params::{LayerDims, LayerParams, concat_layer};
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
+
+/// The 12 constant scalar operands every Scratch carries, in the fixed order
+/// `new_staged` reads them from its staged view — push this array verbatim
+/// into the run's init stage so the constants ride the ONE upload.
+pub const SCRATCH_CONSTS: [f64; 12] = [
+	1.0,                                // c_one
+	-1.0,                               // c_neg_one
+	0.5,                                // c_half
+	1e-7,                               // c_eps
+	1.0 - 1e-7,                         // c_one_minus_eps
+	crate::params::LEAKY_ALPHA,         // c_leaky_alpha
+	crate::params::ELU_ALPHA,           // c_elu_alpha
+	gpu_core::k_gapact::SELU_ALPHA,     // c_selu_alpha
+	gpu_core::k_gapact::SELU_LAMBDA,    // c_selu_lambda
+	crate::params::FOCAL_GAMMA,         // c_focal_gamma
+	crate::params::FOCAL_ALPHA,         // c_focal_alpha
+	gpu_core::rope::ROPE_THETA,         // c_rope_theta
+];
 
 pub struct Scratch {
 	pub acts: Vec<GpuBuffer>,
@@ -97,7 +115,7 @@ impl Scratch {
 	/// they're never read in a forward pass — so inference allocates ~half the VRAM
 	/// of training (no second `a_dsum`, no `da`/`dw`/grad mirrors).
 	pub fn new(params: &[LayerParams], n: usize, forward_only: bool) -> Scratch {
-		Self::new_inner(params, n, forward_only, false)
+		Self::new_inner(params, n, forward_only, false, None)
 	}
 
 	/// Out-of-core companion: ONLY what the fit loop reads directly — the last
@@ -105,10 +123,23 @@ impl Scratch {
 	/// streams and pinned scalars. Every big full-batch buffer is len-1; the Ooc
 	/// owns the real ones with waterfall homes.
 	pub fn new_light(params: &[LayerParams], n: usize) -> Scratch {
-		Self::new_inner(params, n, false, true)
+		Self::new_inner(params, n, false, true, None)
 	}
 
-	fn new_inner(params: &[LayerParams], n: usize, forward_only: bool, light: bool) -> Scratch {
+	/// One-claim fit path: the 12 constant operands are views of `consts` (a
+	/// `SCRATCH_CONSTS`-ordered block in the run's staged init image) instead
+	/// of 12 separate uploads — the constants ride the run's ONE sync H2D.
+	pub fn new_staged(params: &[LayerParams], n: usize, light: bool, consts: &GpuBuffer) -> Scratch {
+		Self::new_inner(params, n, false, light, Some(consts))
+	}
+
+	fn new_inner(
+		params: &[LayerParams],
+		n: usize,
+		forward_only: bool,
+		light: bool,
+		consts: Option<&GpuBuffer>,
+	) -> Scratch {
 		let bw = move |sz: usize| if forward_only { 1 } else { sz };
 		let lt = move |sz: usize| if light { 1 } else { sz };
 		// On OOM, report the buffer name and the size it tried to grab (f64 count →
@@ -256,6 +287,15 @@ impl Scratch {
 		} else {
 			(alloc(1, "conv_temp"), 0)
 		};
+		// Constant operands: views of the staged block when the run composed
+		// one (fit), individual uploads otherwise (eval / tests / standalone).
+		let cbuf = |i: usize| -> GpuBuffer {
+			match consts {
+				Some(v) => v.view(i, 1),
+				None => GpuBuffer::upload(&[SCRATCH_CONSTS[i]])
+					.unwrap_or_else(|e| panic!("scratch const {i}: {e:?}")),
+			}
+		};
 		let pinned_pair = gpu_core::hip::host_malloc(16, 0).expect("pinned scalars") as *mut f64;
 		Scratch {
 			acts,
@@ -271,18 +311,18 @@ impl Scratch {
 			metric_t2: alloc(out_elems, "metric_t2"),
 			metric_scalar: alloc(1, "metric_scalar"),
 			metric_scalar_b: alloc(1, "metric_scalar_b"),
-			c_one: GpuBuffer::upload(&[1.0]).expect("c_one"),
-			c_neg_one: GpuBuffer::upload(&[-1.0]).expect("c_neg_one"),
-			c_half: GpuBuffer::upload(&[0.5]).expect("c_half"),
-			c_eps: GpuBuffer::upload(&[1e-7]).expect("c_eps"),
-			c_one_minus_eps: GpuBuffer::upload(&[1.0 - 1e-7]).expect("c_one_minus_eps"),
-			c_leaky_alpha: GpuBuffer::upload(&[crate::params::LEAKY_ALPHA]).expect("c_leaky_alpha"),
-			c_elu_alpha: GpuBuffer::upload(&[crate::params::ELU_ALPHA]).expect("c_elu_alpha"),
-			c_selu_alpha: GpuBuffer::upload(&[gpu_core::k_gapact::SELU_ALPHA]).expect("c_selu_alpha"),
-			c_selu_lambda: GpuBuffer::upload(&[gpu_core::k_gapact::SELU_LAMBDA]).expect("c_selu_lambda"),
-			c_focal_gamma: GpuBuffer::upload(&[crate::params::FOCAL_GAMMA]).expect("c_focal_gamma"),
-			c_focal_alpha: GpuBuffer::upload(&[crate::params::FOCAL_ALPHA]).expect("c_focal_alpha"),
-			c_rope_theta: GpuBuffer::upload(&[gpu_core::rope::ROPE_THETA]).expect("c_rope_theta"),
+			c_one: cbuf(0),
+			c_neg_one: cbuf(1),
+			c_half: cbuf(2),
+			c_eps: cbuf(3),
+			c_one_minus_eps: cbuf(4),
+			c_leaky_alpha: cbuf(5),
+			c_elu_alpha: cbuf(6),
+			c_selu_alpha: cbuf(7),
+			c_selu_lambda: cbuf(8),
+			c_focal_gamma: cbuf(9),
+			c_focal_alpha: cbuf(10),
+			c_rope_theta: cbuf(11),
 			reduce_ws: GpuBuffer::alloc_bytes(max_ws).unwrap_or_else(|e| {
 				panic!(
 					"reduce_ws: GPU alloc of {} failed — {e:?}",
@@ -442,6 +482,13 @@ impl Scratch {
 	/// huge) against free VRAM, since an over-budget alloc HIP-asserts (core dump)
 	/// rather than returning a catchable error.
 	pub fn vram_bytes(params: &[LayerParams], n: usize, forward_only: bool) -> usize {
+		let dims: Vec<LayerDims> = params.iter().map(LayerDims::from).collect();
+		Self::vram_bytes_dims(&dims, n, forward_only)
+	}
+
+	/// `vram_bytes` over the host-only dims mirror — the plan pass sizes the
+	/// scratch (and decides in-VRAM vs out-of-core) before any GPU work.
+	pub fn vram_bytes_dims(params: &[LayerDims], n: usize, forward_only: bool) -> usize {
 		let bw = |sz: usize| if forward_only { 1 } else { sz };
 		let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
 		let (mut max_act, mut max_wt, mut max_bias) = (0usize, 0usize, 0usize);
@@ -538,7 +585,7 @@ impl Scratch {
 		}
 		floats += 2 * bw(max_dd); // a_gw, a_dbias
 		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1; // prelu_t0/t1, prelu_scalar
-		match concat_layer(params) {
+		match crate::params::concat_layer_dims(params) {
 			// concat (fwd) + concat_dgrad (bwd)
 			Some((_, a, c)) => {
 				floats += n * (a + c) + bw(n * a);

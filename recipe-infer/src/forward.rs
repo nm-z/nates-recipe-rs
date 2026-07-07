@@ -240,29 +240,45 @@ pub fn upload(x: &ndarray::Array2<f64>) -> (GpuBuffer, usize, usize) {
 
 /// Per-column z-score fit on the TRAIN set; store mean/std in `scaler` (reused
 /// verbatim at eval, no leakage) and return the scaled [n×d] buffer.
-pub fn zscore_fit(
+/// The value the staged z-score fit's `eps` view must hold (push `[ZSCORE_EPS]`
+/// into the run's init stage).
+pub const ZSCORE_EPS: f64 = 1e-8;
+
+/// Device-only z-score fit: mean/std are written IN PLACE into caller-provided
+/// views (the run's persist region — they cross to RAM once, in the exit
+/// block) and `eps` is a staged 1-float view. In-place calcs + carves only:
+/// no upload, no download.
+pub fn zscore_fit_views(
 	xraw: &GpuBuffer,
 	n: usize,
 	d: usize,
-	scaler: &RefCell<Option<Scaler>>,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+	eps: &GpuBuffer,
 ) -> GpuBuffer {
 	// var_cols needs align(sum_ws,256)+d·8 bytes; mean/sum need only sum_ws — size
 	// the shared workspace to the larger (var) requirement.
 	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
 	let ws_bytes = ((seg + 255) & !255usize) + d * 8;
 	let ws = GpuBuffer::alloc_bytes(ws_bytes).expect("zscore reduce ws");
-	let mean = GpuBuffer::alloc(d).expect("mean");
-	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, &mean).expect("mean");
+	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean).expect("mean");
 	let var = GpuBuffer::alloc(d).expect("var");
 	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var).expect("var");
-	let eps = GpuBuffer::upload(&[1e-8]).expect("var eps");
-	kernels::gpu_add_scalar_inplace(&eps, d, &var).expect("var eps add");
+	kernels::gpu_add_scalar_inplace(eps, d, &var).expect("var eps add");
+	kernels::gpu_sqrt(&var, d, std).expect("std");
+	zscore_apply_views(xraw, n, d, mean, std)
+}
+
+pub fn zscore_fit(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	scaler: &RefCell<Option<Scaler>>,
+) -> GpuBuffer {
+	let mean = GpuBuffer::alloc(d).expect("mean");
 	let std = GpuBuffer::alloc(d).expect("std");
-	kernels::gpu_sqrt(&var, d, &std).expect("std");
-	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub(xraw, &mean, n * d, d, &xc).expect("center");
-	let xbuf = GpuBuffer::alloc(n * d).expect("scale");
-	kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
+	let eps = GpuBuffer::upload(&[ZSCORE_EPS]).expect("var eps");
+	let xbuf = zscore_fit_views(xraw, n, d, &mean, &std, &eps);
 	*scaler.borrow_mut() = Some(Scaler {
 		mean: download_vec(&mean, d),
 		std: download_vec(&std, d),
@@ -270,16 +286,55 @@ pub fn zscore_fit(
 	xbuf
 }
 
+/// Apply with device-resident mean/std (views of the staged image on the fit
+/// rerun path) — no uploads.
+pub fn zscore_apply_views(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+) -> GpuBuffer {
+	let xc = GpuBuffer::alloc(n * d).expect("center");
+	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	let xbuf = GpuBuffer::alloc(n * d).expect("scale");
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, &xbuf).expect("scale");
+	xbuf
+}
+
+/// One-claim z-score fit: mean/std/scaled written into caller-provided device
+/// VIEWS (reserved slots of the run's staged image), no allocation of those and
+/// NO download. `mean`/`std` stay resident and cross to the host Scaler exactly
+/// once, in the run's single exit D2H — never at init. `eps` is a staged 1e-8
+/// scalar view. Transient var/center/workspace are carved (freed with the arena).
+/// Op-for-op identical to `zscore_fit` minus the mean/std readback.
+pub fn zscore_fit_into(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	eps: &GpuBuffer,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+	out: &GpuBuffer,
+) {
+	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
+	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).expect("zscore ws");
+	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean).expect("mean");
+	let var = GpuBuffer::alloc(d).expect("var");
+	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var).expect("var");
+	kernels::gpu_add_scalar_inplace(eps, d, &var).expect("var eps");
+	kernels::gpu_sqrt(&var, d, std).expect("std");
+	let xc = GpuBuffer::alloc(n * d).expect("center");
+	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
+}
+
 pub fn zscore_apply(xraw: &GpuBuffer, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
 	assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
 	assert_eq!(scaler.std.len(), d, "eval: feature count changed");
 	let mean = GpuBuffer::upload(&scaler.mean).expect("upload eval mean");
 	let std = GpuBuffer::upload(&scaler.std).expect("upload eval std");
-	let xc = GpuBuffer::alloc(n * d).expect("eval center");
-	kernels::gpu_broadcast_sub(xraw, &mean, n * d, d, &xc).expect("eval center");
-	let xbuf = GpuBuffer::alloc(n * d).expect("eval scale");
-	kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("eval scale");
-	xbuf
+	zscore_apply_views(xraw, n, d, &mean, &std)
 }
 
 /// Forward pass writing each layer's output into the preallocated `acts`

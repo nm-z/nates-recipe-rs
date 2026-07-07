@@ -6,12 +6,12 @@ use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
-	Loss, Metric, Scaler, Scratch, build_layer_params, concat_layer,
+	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, build_layer_params, concat_layer,
 	forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
-	pinned_vocab, upload, zscore_apply, zscore_fit,
+	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_fit, zscore_fit_into,
 };
 use gpu_core::kernels;
-use gpu_core::memory::GpuBuffer;
+use gpu_core::memory::{GpuBuffer, Stage};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -719,7 +719,34 @@ impl ModelInner {
 	}
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
+		// Ledger transfer-CALL snapshots parallel to the callspy ones: authoritative
+		// per-phase H2D/D2H logical-upload counts (the pinned bounce chunks a single
+		// upload into many callspy MEMCPY_ASYNC ticks, so callspy overcounts).
+		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let rerun = !self.params.borrow().is_empty();
+		// One-claim staged fit: when run() claimed the arena (in-VRAM) and this is a
+		// plain first fit (no live TUI plot, no checkpoint file, no warm-start, no
+		// rerun), compose the whole init as ONE staged image + one H2D, run a
+		// zero-transfer loop, and bring everything home in one exit D2H. Every other
+		// case (out-of-core, plotting, checkpointing, resume, rerun) keeps the proven
+		// pooled path below unchanged. The metric ring holds only the loss and the
+		// stop-metric score per epoch, so the log line's other columns must be
+		// host-derivable (epoch/lr/time) — any other logged metric falls to pooled.
+		let stop_metric = if self.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
+		let ring_metrics = cfg.metrics.iter().all(|m| {
+			*m == stop_metric
+				|| matches!(m, Metric::Loss | Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip)
+		});
+		if gpu_core::memory::arena_remaining() > 0
+			&& cfg.plot.is_empty()
+			&& cfg.resume.is_none()
+			&& resume.is_none()
+			&& !rerun
+			&& ring_metrics
+		{
+			self.fit_staged(data, cfg);
+			return;
+		}
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
 		let (collapsed_x, collapsed_embed_cols, collapsed_vocab) = if embed_cats {
@@ -973,6 +1000,7 @@ impl ModelInner {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
 		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
+		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1152,6 +1180,7 @@ impl ModelInner {
 		}
 		gpu_core::hw::disarm_saturation_crash();
 		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
+		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		drop(_alloc_guard);
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -1161,12 +1190,13 @@ impl ModelInner {
 		}
 		let mut ooc_end = ooc;
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
-		// Post-update score: checkpoint saves need it, and an out-of-core fit is
-		// the ONLY place one can be computed (run()'s scoring forward may not
-		// fit), so every OOC fit computes it. Except on ^C — the OOC forward
-		// would bail on its first window and the metric would read stale
-		// mixed-epoch activations; the last per-epoch score stands instead.
-		let want_end = if ooc_end.is_some() { !was_interrupted } else { checkpointing };
+		// Post-update score: `run()` no longer re-forwards to score (the arena that
+		// held x/y/params is freed right after fit), so fit computes the
+		// authoritative end score here for EVERY completed fit — the same buffers
+		// are still resident. Except on ^C, where the OOC forward would bail on its
+		// first window and read stale mixed-epoch activations; the last per-epoch
+		// score stands instead.
+		let want_end = !was_interrupted;
 		let end_score = want_end.then(|| {
 			match ooc_end.as_mut() {
 				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
@@ -1238,6 +1268,358 @@ impl ModelInner {
 				eprint!("── hip {phase} ──\n{}", gpu_core::callspy::report_between(a, b));
 			}
 		}
+		// Authoritative per-phase transfer-call ledger (one increment per logical
+		// upload/download, bounce chunking not counted). One-claim target for an
+		// in-VRAM fit: init H2D 1, loop 0, exit D2H 1.
+		if let (Some(s), Some(i), Some(l)) = (led_snap, led_init, led_loop) {
+			let e = gpu_core::memory::xfer_calls();
+			let dh = |a: (usize, usize, usize), b: (usize, usize, usize)| (b.0 - a.0, b.1 - a.1);
+			for (phase, (h2d, d2h)) in [
+				("init", dh(s, i)),
+				("loop", dh(i, l)),
+				("exit", dh(l, e)),
+			] {
+				eprintln!("── ledger {phase} ── H2D calls {h2d}  D2H calls {d2h}");
+			}
+		}
+	}
+	/// One-claim staged fit (in-VRAM, non-plotting, non-checkpointing, non-resume,
+	/// first fit — every other case uses the pooled `fit` above). The entire init
+	/// is composed into ONE `Stage` image and moved with ONE sync H2D: weights
+	/// (plan image, device-randn-initialized in place), the 12 scratch constants,
+	/// the 4 step scalars, x/cat/y, and reserved z-score slots. Stats are computed
+	/// on device and cross to the host Scaler exactly ONCE, at exit. Sub-stages
+	/// still open: (b) the metric ring for zero loop transfers, (c) the single
+	/// contiguous exit-region D2H + write-only save mirror.
+	fn fit_staged(&self, data: &Dataset, cfg: &Train) {
+		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
+		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		let start = std::time::Instant::now();
+		let classify = self.loss.is_classification();
+		// ── host prep: column split, vocab, x/cat matrices ──
+		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
+		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
+		let (collapsed_x, collapsed_ec, collapsed_vocab) = if embed_cats {
+			let (x, ec, v) = collapse_onehot(data);
+			(Some(x), ec, v)
+		} else {
+			(None, Vec::new(), 0)
+		};
+		let effective_x = collapsed_x.as_ref().unwrap_or(&data.x);
+		let effective_text = if embed_cats { &collapsed_ec } else { &data.text_cols };
+		let cat_cols: Vec<usize> = if embed_first {
+			(0..effective_x.ncols()).filter(|c| !effective_text.contains(c)).collect()
+		} else {
+			Vec::new()
+		};
+		let c_cat = cat_cols.len();
+		let xinput = if embed_first {
+			effective_x.select(ndarray::Axis(1), effective_text)
+		} else {
+			effective_x.clone()
+		};
+		let n = xinput.nrows();
+		let d = xinput.ncols();
+		let vocab = if let Some(v) = pinned_vocab(&self.specs) {
+			v
+		} else if embed_first {
+			if embed_cats { collapsed_vocab } else { xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1 }
+		} else {
+			0
+		};
+		let cat = (embed_first && c_cat > 0).then(|| effective_x.select(ndarray::Axis(1), &cat_cols));
+		let c = cat.as_ref().map_or(0, |m| m.ncols());
+		// z-score width: non-embed → whole matrix; embed+cats → the categorical branch;
+		// embed-only tokens are never scaled.
+		let d_sc = if embed_first { c } else { d };
+		// ── plan weights (host image), derive output width / y ──
+		let plan = plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
+			.unwrap_or_else(|e| panic!("plan_layer_params: {e}"));
+		let out_dim = plan.out_dim_last();
+		let n_targets = data.n_targets.max(1);
+		let expand_ce = classify && n_targets == 1 && out_dim > 1;
+		let k = if expand_ce { out_dim } else { n_targets };
+		assert_eq!(
+			out_dim, k,
+			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
+		);
+		let y_flat = {
+			let ys = data.y.as_slice().expect("train: y contiguous");
+			let mut yd = ys.to_vec();
+			if !classify {
+				let ymean = yd.iter().sum::<f64>() / yd.len() as f64;
+				let yvar = yd.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / yd.len() as f64;
+				let ystd = (yvar + 1e-8).sqrt();
+				for v in yd.iter_mut() {
+					*v = (*v - ymean) / ystd;
+				}
+				*self.yscaler.borrow_mut() = Some((ymean, ystd));
+			}
+			if expand_ce {
+				let mut oh = vec![0.0f64; n * out_dim];
+				for (i, &idx) in yd.iter().enumerate() {
+					if idx.is_finite() {
+						let cc = idx as usize;
+						if cc < out_dim {
+							oh[i * out_dim + cc] = 1.0;
+						}
+					}
+				}
+				oh
+			} else {
+				yd
+			}
+		};
+		// ── compose the ONE staged image: exit-region prefix, upload-only suffix ──
+		let epochs = cfg.epochs.max(1);
+		let mut stage = Stage::new();
+		let w_off = stage.push(plan.host());
+		let (mean_off, std_off) = if d_sc > 0 {
+			(stage.reserve(d_sc), stage.reserve(d_sc))
+		} else {
+			(0, 0)
+		};
+		let ring_off = stage.reserve(2 * epochs); // metric ring: score[e], loss[e]
+		let end_off = stage.reserve(1); // end-score scalar
+		// Everything above is the exit-region PREFIX (weights + stats + ring +
+		// end-score), brought home in ONE contiguous D2H at exit. Below is
+		// upload-only (consts/scalars/eps/x/cat/y), never downloaded.
+		let w_len = plan.host().len();
+		let prefix_len = stage.len_floats();
+		let consts_off = stage.push(&SCRATCH_CONSTS);
+		let sc_off = stage.push(&[-self.lr, 1.0 / n as f64, 2.0 / n as f64, 0.0]);
+		let eps_off = if d_sc > 0 { stage.push(&[1e-8]) } else { 0 };
+		let x_std = xinput.as_standard_layout();
+		let x_off = stage.push(x_std.as_slice().expect("xinput contiguous"));
+		let cat_off = cat.as_ref().map(|m| {
+			let s = m.as_standard_layout();
+			stage.push(s.as_slice().expect("cat contiguous"))
+		});
+		let scaled_off = if d_sc > 0 { stage.reserve(n * d_sc) } else { 0 };
+		let y_off = stage.push(&y_flat);
+		let base = {
+			let _t = gpu_core::memory::tag_scope("weights");
+			stage.upload().expect("stage upload")
+		};
+		// ── materialize weights from the image (device randn init, no transfer) ──
+		let params = plan.materialize(&base, w_off);
+		let last = params.len() - 1;
+		let consts_view = base.view(consts_off, 12);
+		let sc = {
+			let _t = gpu_core::memory::tag_scope("scratch");
+			Scratch::new_staged(&params, n, false, &consts_view)
+		};
+		let ss = StepScalars {
+			neg_lr: base.view(sc_off, 1),
+			inv_n: base.view(sc_off + 1, 1),
+			two_inv_n: base.view(sc_off + 2, 1),
+			zero: base.view(sc_off + 3, 1),
+		};
+		// ── z-score on device into reserved views; mean/std NEVER downloaded here ──
+		let (xbuf, x_cat) = if d_sc > 0 {
+			let scaled = base.view(scaled_off, n * d_sc);
+			let x_src = if embed_first {
+				base.view(cat_off.expect("cat_off"), n * c)
+			} else {
+				base.view(x_off, n * d)
+			};
+			zscore_fit_into(
+				&x_src,
+				n,
+				d_sc,
+				&base.view(eps_off, 1),
+				&base.view(mean_off, d_sc),
+				&base.view(std_off, d_sc),
+				&scaled,
+			);
+			if embed_first {
+				(base.view(x_off, n * d), Some(scaled))
+			} else {
+				(scaled, None)
+			}
+		} else {
+			// embed-only tokens: no scaling; empty scaler so eval skips it.
+			*self.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+			(base.view(x_off, xinput.len()), None)
+		};
+		let ybuf = base.view(y_off, n * k);
+		// R²'s denominator, on the SAME (z-scored) target scale the loop scores against.
+		let ss_tot = {
+			let total = y_flat.len() as f64;
+			let ybar = y_flat.iter().sum::<f64>() / total;
+			y_flat.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
+		};
+		// ── summary + roofline header (matches the pooled non-plotting print) ──
+		if !cfg.metrics.is_empty() {
+			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+			let out = params[last].out_dim;
+			let row = |x: usize, l1: &str, y: usize, l2: &str| format!("    {x:>5}  {l1:<11}{y:>5}  {l2}");
+			let summary = [
+				"arch".to_string(),
+				row(neurons, "neurons", params.len(), "layers"),
+				row(n, "samples", d, "features"),
+				row(d, "input_dim", out, "output_dim"),
+				"data".to_string(),
+				row(n + 1, "rows", d + 1, "columns"),
+				row(d, "predictors", out, "targets"),
+			]
+			.join("\n");
+			eprintln!("{summary}");
+			eprintln!(
+				"roofline  gemm {} GF/s  vram {} GB/s",
+				recipe_infer::GEMM_GFLOPS,
+				recipe_infer::VRAM_GBS
+			);
+		}
+		// ── loop: zero device allocations (AllocGuard); saturation watchdog live ──
+		let _guard = gpu_core::memory::AllocGuard::freeze();
+		gpu_core::hw::arm_saturation_crash();
+		INTERRUPTED.store(false, Ordering::SeqCst);
+		unsafe {
+			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+		}
+		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
+		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		let stop_metric = if classify { Metric::Accuracy } else { Metric::R2 };
+		let mut fit_score = f64::NAN;
+		// Per-log-epoch host records replayed AFTER the loop (batch logging keeps the
+		// loop transfer-free): epoch, wall-clock, and the roofline block (which reads
+		// layer_ms via event syncs, not transfers). The loss and stop-metric SCORE go
+		// into the device ring — raw kernel outputs (ss_res / accuracy / loss
+		// reduction), transformed host-side at replay from the ONE ring download.
+		let mut log_rows: Vec<(usize, f64, String)> = Vec::new();
+		let mut loss_scale = (1.0f64, 1.0f64);
+		for e in 0..cfg.epochs {
+			if INTERRUPTED.load(Ordering::SeqCst) {
+				break;
+			}
+			let log_now = cfg.log_every > 0
+				&& !cfg.metrics.is_empty()
+				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
+			sc.set_timing(log_now);
+			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			if INTERRUPTED.load(Ordering::SeqCst) {
+				break;
+			}
+			self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
+			sc.set_timing(false);
+			if log_now {
+				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+				let out = &sc.acts[last];
+				// score → ring[e] (raw ss_res / accuracy); zero device→host traffic.
+				let score_slot = base.view(ring_off + e, 1);
+				if classify {
+					if k == 1 {
+						kernels::gpu_accuracy_into(out, &ybuf, n, &score_slot).expect("accuracy");
+					} else {
+						kernels::gpu_argmax_accuracy_into(out, &ybuf, n, k, &score_slot).expect("argmax accuracy");
+					}
+				} else {
+					kernels::gpu_ss_res_into(out, &ybuf, n * k, &score_slot).expect("ss_res");
+				}
+				// loss reduction → metric_scalar, D2D-copied into ring[epochs+e].
+				loss_scale = metric_gpu_into(self.loss, Metric::Loss, out, &ybuf, &sc, n, k, ss_tot);
+				let mut loss_slot = base.view(ring_off + epochs + e, 1);
+				loss_slot.copy_from(&sc.metric_scalar, 8).expect("ring loss d2d");
+				log_rows.push((e, start.elapsed().as_secs_f64(), Self::roofline_block(&params, n, &sc)));
+			}
+		}
+		gpu_core::hw::disarm_saturation_crash();
+		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
+		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		drop(_guard);
+		unsafe {
+			libc::signal(libc::SIGINT, libc::SIG_DFL);
+		}
+		// End score into the reserved slot on device (no D2H) — it rides home in the
+		// single prefix D2H below with everything else.
+		if !INTERRUPTED.load(Ordering::SeqCst) {
+			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			let end_slot = base.view(end_off, 1);
+			if classify {
+				if k == 1 {
+					kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, n, &end_slot).expect("accuracy");
+				} else {
+					kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, n, k, &end_slot).expect("argmax accuracy");
+				}
+			} else {
+				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &end_slot).expect("ss_res");
+			}
+		}
+		// THE single exit D2H: the whole exit-region prefix (weights + mean/std +
+		// ring + end-score) into ONE host block; everything below is scattered from
+		// it with zero further device transfers.
+		let host = base.view(0, prefix_len).download_vec().expect("exit prefix d2h");
+		// stats → host Scaler (the one crossing to RAM, per the invariant).
+		if d_sc > 0 {
+			*self.scaler.borrow_mut() = Some(Scaler {
+				mean: host[mean_off..mean_off + d_sc].to_vec(),
+				std: host[std_off..std_off + d_sc].to_vec(),
+			});
+		}
+		// deferred per-epoch log lines replayed from the ring slice, in epoch order.
+		if !log_rows.is_empty() {
+			let (lsign, ldiv) = loss_scale;
+			for (e, elapsed, roof) in &log_rows {
+				let score = if classify { host[ring_off + e] } else { 1.0 - host[ring_off + e] / ss_tot };
+				let loss = lsign * host[ring_off + epochs + e] / ldiv;
+				if score.is_finite() {
+					fit_score = score;
+				}
+				let vals: Vec<f64> = cfg
+					.metrics
+					.iter()
+					.map(|&m| match m {
+						Metric::Loss => loss,
+						Metric::Epoch => *e as f64,
+						Metric::Lr => self.lr,
+						Metric::Time => *elapsed,
+						_ if m == stop_metric => score,
+						_ => f64::NAN,
+					})
+					.collect();
+				eprintln!("{}", self.metrics_line(&cfg.metrics, &vals));
+				eprint!("{roof}");
+			}
+		}
+		// end score → fit_score (authoritative; equals the last epoch's — one more forward).
+		if !INTERRUPTED.load(Ordering::SeqCst) {
+			let s = if classify { host[end_off] } else { 1.0 - host[end_off] / ss_tot };
+			if s.is_finite() {
+				fit_score = s;
+			}
+		}
+		// weights → host OGDL mirror (byte-identical to a device dump): written
+		// verbatim on save, and the source a forward-only read rebuilds from once a
+		// later run frees these params' arena backing. Carries the fit's derived
+		// widths so the rebuild matches shapes exactly.
+		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+		*self.saved_ogdl.borrow_mut() = Some(crate::model::SavedWeights {
+			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], self.loss.score_key(), fit_score),
+			neurons,
+			d,
+			c_cat,
+			vocab,
+		});
+		*self.params.borrow_mut() = params;
+		self.fit_score.set(fit_score);
+		gpu_core::memory::pool_trim();
+		if let (Some(b0), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
+			for (phase, a, b) in [
+				("init", &b0, &init),
+				("loop", &init, &lp),
+				("exit", &lp, &gpu_core::callspy::snapshot()),
+			] {
+				eprint!("── hip {phase} ──\n{}", gpu_core::callspy::report_between(a, b));
+			}
+		}
+		if let (Some(s0), Some(i), Some(l)) = (led_snap, led_init, led_loop) {
+			let ee = gpu_core::memory::xfer_calls();
+			let dh = |a: (usize, usize, usize), b: (usize, usize, usize)| (b.0 - a.0, b.1 - a.1);
+			for (phase, (h, dd)) in [("init", dh(s0, i)), ("loop", dh(i, l)), ("exit", dh(l, ee))] {
+				eprintln!("── ledger {phase} ── H2D calls {h}  D2H calls {dd}");
+			}
+		}
 	}
 	fn save_checkpoint(&self, path: &str, score: f64) {
 		let params = self.params.borrow();
@@ -1306,6 +1688,8 @@ impl ModelInner {
 	pub fn eval(&self, data: &impl RunData) -> Vec<f64> {
 		let prepared = data.prepared();
 		let ds = prepared.get();
+		// Rebuild params from the host mirror if a later run freed their arena backing.
+		self.ensure_params_live();
 		let (xbuf, x_cat, n) = self.prep_eval_input(ds);
 		let params = self.params.borrow();
 		assert!(!params.is_empty(), "eval: call train() first");

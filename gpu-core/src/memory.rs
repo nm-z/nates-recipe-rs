@@ -298,6 +298,19 @@ pub fn xfer_bytes() -> (usize, usize, usize) {
 	)
 }
 
+/// Cumulative transfer ledger CALL counts: (H2D, D2H, D2D). One increment per
+/// `xfer_sync`/`xfer` regardless of the pinned bounce's 64 MB chunking (callspy
+/// MEMCPY_ASYNC counts chunks; these count logical transfers). Snapshot around a
+/// phase to prove "one upload / one download" — the authoritative single-transfer
+/// check for the one-claim lifecycle.
+pub fn xfer_calls() -> (usize, usize, usize) {
+	(
+		H2D_CALLS.load(Ordering::Relaxed),
+		D2H_CALLS.load(Ordering::Relaxed),
+		D2D_CALLS.load(Ordering::Relaxed),
+	)
+}
+
 pub fn alloc_freeze() {
 	ALLOC_FROZEN.with(|f| f.set(true));
 }
@@ -388,6 +401,58 @@ pub fn release_device_arena(slab: GpuBuffer) {
 	}
 	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
 	drop(slab);
+}
+
+// The previous run's backing block (arena slab, or the staged pool buffer of
+// an out-of-core run), kept alive after the run returns so the params/stat
+// views stored in the model registry stay valid for eval/save. The NEXT run's
+// entry releases it — the deferred "one free at exit" of the run lifecycle.
+static PARKED: Mutex<Option<GpuBuffer>> = Mutex::new(None);
+
+// Monotonic id stamped on each parked backing, and the id of the one CURRENTLY
+// parked (0 = nothing parked). A model records the id its param views were
+// carved from; before a forward-only read it compares against the live id, and
+// a mismatch means a later run freed that backing (the params must be rebuilt
+// from the host weight mirror rather than dereferenced).
+static PARK_GEN: AtomicUsize = AtomicUsize::new(0);
+static PARKED_GEN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn park_run_backing(buf: GpuBuffer) {
+	let mut g = match PARKED.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	assert!(g.is_none(), "park_run_backing: a parked run backing already exists");
+	*g = Some(buf);
+	PARKED_GEN.store(PARK_GEN.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
+/// Id of the backing currently parked (the arena slab whose carves the last
+/// in-VRAM run left resident), or None when nothing is parked. A model records
+/// this at park time; when it no longer matches, a later run freed that slab
+/// and the model's device weights are gone.
+pub fn live_parked_gen() -> Option<usize> {
+	let g = PARKED_GEN.load(Ordering::Relaxed);
+	(g != 0).then_some(g)
+}
+
+/// Release the previous run's parked backing (no-op when none). Views into it
+/// — a prior fit's weights — are dead after this; the caller owns that
+/// invalidation (each run re-composes its inputs from host state).
+pub fn release_run_backing() {
+	let parked = match PARKED.lock() {
+		Ok(mut g) => g.take(),
+		Err(p) => p.into_inner().take(),
+	};
+	PARKED_GEN.store(0, Ordering::Relaxed);
+	if let Some(b) = parked {
+		if ARENA_BASE.load(Ordering::Relaxed) == b.ptr_addr() {
+			release_device_arena(b);
+		} else {
+			crate::hip::device_synchronize().expect("parked release sync");
+			drop(b);
+		}
+	}
 }
 
 /// AOT init composer: every host-sourced block a run needs on the device is

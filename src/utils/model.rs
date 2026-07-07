@@ -1,10 +1,9 @@
-use crate::dataset::{Dataset, collapse_onehot};
+use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
-use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, Scaler, Scratch, build_layer_params, download_scalar, forward_into, infer_scored,
-	load_ogdl_str, pinned_vocab, upload, vram_estimate, zscore_apply,
+	LayerParams, Scaler, build_layer_params, infer_scored, load_ogdl_str, pinned_vocab,
+	vram_estimate,
 };
 use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
@@ -375,101 +374,40 @@ impl Train {
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
+			// One-claim arena. First free the PREVIOUS run's parked backing (the
+			// deferred single free of the run lifecycle) — this also resets the arena
+			// registration so the claim's "no arena active" assert holds. Then size
+			// this run's whole device footprint host-side and, when it fits, claim it
+			// as ONE block before fit; every alloc inside fit (weights, scaler stats,
+			// scratch) bump-carves from it (non-owning, no pool churn). An
+			// over-footprint run leaves the arena unclaimed and fit streams
+			// out-of-core exactly as before (its own use_ooc test sees the real free
+			// VRAM). The claim is PARKED at exit, not freed: its weight/stat views
+			// stay live on device past run() for scoring, save, and a following eval,
+			// until the next run releases it (or the process exits).
+			gpu_core::memory::release_run_backing();
+			let footprint = plan_footprint(model, ds, false);
+			let slab = (footprint <= gpu_core::memory::claimable_bytes())
+				.then(gpu_core::memory::claim_device_arena)
+				.flatten();
 			model.fit(ds, self, resume.as_deref(), conns);
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
 			}
-			let score = {
-				let params = model.params.borrow();
-				let n = ds.x.nrows();
-				if params.is_empty() {
-					f64::NAN
-				} else {
-					let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
-					let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
-					let (col_x, col_ec, _col_v) = if embed_cats {
-						let (x, ec, v) = collapse_onehot(ds);
-						(Some(x), ec, v)
-					} else {
-						(None, Vec::new(), 0)
-					};
-					let eff_x = col_x.as_ref().unwrap_or(&ds.x);
-					let eff_text = if embed_cats { &col_ec } else { &ds.text_cols };
-					// The FULL device ask of this scoring forward — scratch plus
-					// the x/x_cat/y uploads (2× x covers the zscore double
-					// buffer) — against the same claimability rule the alloc
-					// gate enforces. When it does not fit (the very buffer set
-					// that made fit stream out-of-core), fit's own post-update
-					// end score stands in.
-					let need = Scratch::vram_bytes(&params, n, true)
-						+ 2 * eff_x.len() * 8
-						+ ds.y.len() * 8;
-					if need > gpu_core::memory::claimable_bytes() {
-						model.fit_score.get()
-					} else {
-						let _key = model.loss.score_key();
-						let last = params.len() - 1;
-						let k = params[last].out_dim;
-						let sc = Scratch::new(&params, n, true);
-						let cat_cols: Vec<usize> = if embed_first {
-							(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
-						} else {
-							Vec::new()
-						};
-						let xinput = if embed_first {
-							eff_x.select(ndarray::Axis(1), eff_text)
-						} else {
-							eff_x.clone()
-						};
-						let (xraw, nn, d) = upload(&xinput);
-						assert_eq!(nn, n);
-						let scaler = model.scaler.borrow();
-						let (xbuf, x_cat) = if embed_first {
-							if cat_cols.is_empty() {
-								(xraw, None)
-							} else {
-								let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-								let (craw, _, c) = upload(&cat);
-								let scaled = if let Some(sc_ref) = scaler.as_ref() {
-									zscore_apply(&craw, n, c, sc_ref)
-								} else {
-									craw
-								};
-								(xraw, Some(scaled))
-							}
-						} else {
-							let scaled = if let Some(sc_ref) = scaler.as_ref() {
-								if sc_ref.mean.is_empty() { xraw } else { zscore_apply(&xraw, n, d, sc_ref) }
-							} else {
-								xraw
-							};
-							(scaled, None)
-						};
-						forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
-						if let Some((ymean, ystd)) = *model.yscaler.borrow() {
-							let ystd_b = GpuBuffer::upload(&[ystd]).expect("ystd");
-							let ymean_b = GpuBuffer::upload(&[ymean]).expect("ymean");
-							kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last]).expect("y unscale");
-							kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last]).expect("y unshift");
-						}
-						let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
-						if model.loss.is_classification() {
-							if k == 1 {
-								kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("accuracy");
-							} else {
-								kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, n, k, &sc.metric_scalar).expect("argmax accuracy");
-							}
-							download_scalar(&sc.metric_scalar)
-						} else {
-							let total = (n * k) as f64;
-							let ybar = ds.y.iter().sum::<f64>() / total;
-							let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-							kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &sc.metric_scalar).expect("ss_res");
-							1.0 - download_scalar(&sc.metric_scalar) / ss_tot
-						}
-					}
-				}
-			};
+			// fit computes the authoritative post-update score into fit_score (its exit
+			// block), so scoring never re-uploads x/y or re-forwards — the buffers a
+			// scoring forward would need are the very ones fit just used, and R2 is
+			// invariant under the affine target scaling, so the z-scored-target score
+			// equals the raw-scale one.
+			let score = model.fit_score.get();
+			if let Some(slab) = slab {
+				gpu_core::memory::park_run_backing(slab);
+			}
+			// Record which parked backing this run's params view is carved from (None
+			// when nothing was parked — a pooled out-of-core run keeps pool-owned
+			// params). A later run that frees this backing is then detectable, so a
+			// forward-only read rebuilds the weights instead of faulting.
+			model.arena_gen.set(gpu_core::memory::live_parked_gen());
 			let mut last = self.last.borrow_mut();
 			last.model = model as *const ModelInner;
 			last.score = score;
@@ -480,6 +418,9 @@ impl Train {
 			last.raw_test_rows = data.raw_rows();
 			last.raw_test_headers = data.raw_headers();
 		} else {
+			// Rebuild the params from the host mirror if a later run freed their arena
+			// backing, so scoring never dereferences freed device memory.
+			model.ensure_params_live();
 			let (xbuf, x_cat, n) = model.prep_eval_input(ds);
 			let params = model.params.borrow();
 			assert!(!params.is_empty(), "run: call train first");
@@ -545,8 +486,6 @@ impl Train {
 			return;
 		}
 		let model = unsafe { &*last.model };
-		let params = model.params.borrow();
-		assert!(!params.is_empty(), "save: model has no trained params");
 		let key = model.loss.score_key();
 		let score = last.score;
 		let path = Self::resolve(path);
@@ -555,8 +494,23 @@ impl Train {
 		{
 			return;
 		}
-		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-		recipe_infer::write_ogdl(&path, &recipe_infer::dump_ogdl(&params, filter, key, score));
+		// A staged fit already brought the trained weights home in its single exit
+		// D2H and formatted them to OGDL text (the write-only save mirror) — write
+		// that verbatim, zero device transfers. `last.score` is the fit score the
+		// mirror was keyed with, so the text is consistent. A pooled run left no
+		// mirror; its params are resident, so dump them directly (honoring filter).
+		let mirror = model.saved_ogdl.borrow();
+		let (text, neurons) = if let Some(m) = mirror.as_ref() {
+			(m.text.clone(), m.neurons)
+		} else {
+			let params = model.params.borrow();
+			assert!(!params.is_empty(), "save: model has no trained params");
+			(
+				recipe_infer::dump_ogdl(&params, filter, key, score),
+				params.iter().map(|p| p.out_dim).sum::<usize>(),
+			)
+		};
+		recipe_infer::write_ogdl(&path, &text);
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
 		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
 	}
@@ -601,6 +555,19 @@ fn expand_tilde(path: &str) -> String {
 /// `*const ModelInner` into this box; the box outlives every run because the
 /// user's `Model` binding owns it until it drops.
 #[doc(hidden)]
+/// Host mirror of a staged fit's trained weights: the OGDL text (byte-identical
+/// to a device dump) plus the neuron count for the save banner and the exact
+/// input / categorical / vocab widths the fit derived, so a forward-only read
+/// can rebuild fresh device params from it (same builder resume uses) after the
+/// arena backing is freed by a later run.
+pub(crate) struct SavedWeights {
+	pub(crate) text: String,
+	pub(crate) neurons: usize,
+	pub(crate) d: usize,
+	pub(crate) c_cat: usize,
+	pub(crate) vocab: usize,
+}
+
 pub struct ModelInner {
 	pub(crate) specs: Vec<LayerSpec>,
 	pub(crate) loss: Loss,
@@ -609,6 +576,19 @@ pub struct ModelInner {
 	pub(crate) scaler: RefCell<Option<Scaler>>,
 	pub(crate) yscaler: RefCell<Option<(f64, f64)>>,
 	pub(crate) fit_score: Cell<f64>,
+	// Write-only host save mirror: the staged-fit exit D2H brings the trained
+	// weights home once and formats them to OGDL text here (with the neuron count).
+	// `save` writes it verbatim — zero device transfers on save. Also the source a
+	// forward-only read rebuilds from once the params' arena backing is freed.
+	// `None` for a pooled (out-of-core / plotting / resume) run, whose params stay live.
+	pub(crate) saved_ogdl: RefCell<Option<SavedWeights>>,
+	// Id of the parked arena backing this model's `params` views were carved from
+	// (see gpu_core::memory::live_parked_gen). `None` when the params are pool-owned
+	// (out-of-core / Model::load / not yet trained) and thus never freed by a later
+	// run. When `Some(g)` stops matching the live parked backing, a later training
+	// run freed this model's device weights, so a forward-only read rebuilds them
+	// from `saved_ogdl` before use rather than dereferencing freed memory.
+	pub(crate) arena_gen: Cell<Option<usize>>,
 }
 
 pub struct Model {
@@ -663,6 +643,77 @@ struct Issue {
 	need: String,
 }
 
+/// The run's whole device footprint (scratch + weights + data buffers) as an
+/// exact host-side estimate — the same `vram_estimate` preflight reports, factored
+/// out so the arena claim and preflight share one number. Derives the embed/text
+/// vs categorical column split (and pinned/derived vocab) exactly as fit does.
+fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: bool) -> usize {
+	let n = ds.x.nrows();
+	let d = ds.x.ncols();
+	let k = ds.n_targets.max(1);
+	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
+	let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
+	let (cat_cols, text_d, vocab) = if embed_cats {
+		let n_oh: usize = ds.onehot_groups.iter().map(|(_, len)| len).sum();
+		(d - n_oh, ds.onehot_groups.len(), n_oh)
+	} else if embed_first {
+		let tc = ds.text_cols.len();
+		let vocab = pinned_vocab(&model.specs)
+			.unwrap_or_else(|| ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1);
+		(d - tc, tc, vocab)
+	} else {
+		(0, d, 0)
+	};
+	let base = vram_estimate(&model.specs, n, text_d, k, vocab, cat_cols, forward_only);
+	if forward_only {
+		return base;
+	}
+	// The in-VRAM (staged) fit z-scores on device via `zscore_fit_into`, which carves
+	// a center buffer (n*d_sc) and a reduce workspace that never free under the arena
+	// (carve Drop is a no-op) — bytes `vram_estimate`'s loop-resident term does not
+	// count. Budget them here (claim gate only) so a model that fits solely by that
+	// slack goes out-of-core cleanly instead of overflowing the arena mid-run. d_sc
+	// mirrors fit_staged's z-score width: categorical branch for an embed model, the
+	// whole matrix otherwise, 0 for pure embed/text (no z-scored branch).
+	let d_sc = if embed_first { cat_cols } else { d };
+	let zscore_transient = if d_sc > 0 {
+		n * d_sc * 8 + gpu_core::kernels::gpu_reduce_sum_cols_workspace_bytes(n, d_sc)
+	} else {
+		0
+	};
+	base + zscore_transient
+}
+
+impl ModelInner {
+	/// Make `self.params` safe to read for a forward-only pass. After an in-VRAM fit
+	/// the params are non-owning views into the run's parked arena slab; a later
+	/// training run frees that slab. When it has (the recorded backing id no longer
+	/// matches the live parked one), rebuild fresh device params from the host weight
+	/// mirror the staged exit left behind — the same builder resume uses, so the
+	/// weights are bit-identical. Params that are pool-owned (arena_gen None) or still
+	/// backed by the live parked slab are left untouched (no re-upload).
+	pub(crate) fn ensure_params_live(&self) {
+		let Some(g) = self.arena_gen.get() else {
+			return;
+		};
+		if gpu_core::memory::live_parked_gen() == Some(g) {
+			return;
+		}
+		let params = {
+			let mirror = self.saved_ogdl.borrow();
+			let m = mirror.as_ref().expect(
+				"eval: this model's device weights were freed by a later training run and \
+				 there is no host mirror to restore them (pooled out-of-core arena run)",
+			);
+			let saved = load_ogdl_str(&m.text);
+			build_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
+				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"))
+		};
+		*self.params.borrow_mut() = params;
+		self.arena_gen.set(gpu_core::memory::live_parked_gen());
+	}
+}
+
 fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool, net_ram: usize) -> Vec<Issue> {
 	let mut issues = Vec::new();
 	let n = ds.x.nrows();
@@ -705,25 +756,9 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool, net_ram: usiz
 		});
 	}
 
-	let embed_first = matches!(model.specs.first(), Some(LayerSpec::Embed(..)));
-	let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
 	let (mut free_vram, mut total_vram) = (0usize, 0usize);
 	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
-	let (cat_cols, text_d, vocab) = if embed_cats {
-		let n_cat = ds.onehot_groups.len();
-		let n_oh: usize = ds.onehot_groups.iter().map(|(_, len)| len).sum();
-		let passthrough = d - n_oh;
-		let total_cats: usize = ds.onehot_groups.iter().map(|(_, len)| len).sum();
-		(passthrough, n_cat, total_cats)
-	} else if embed_first {
-		let tc = ds.text_cols.len();
-		let vocab = pinned_vocab(&model.specs)
-			.unwrap_or_else(|| ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1);
-		(d - tc, tc, vocab)
-	} else {
-		(0, d, 0)
-	};
-	let need = vram_estimate(&model.specs, n, text_d, k, vocab, cat_cols, forward_only);
+	let need = plan_footprint(model, ds, forward_only);
 	if need > free_vram {
 		let mode = if forward_only { "inference" } else { "training" };
 		// Training waterfalls VRAM → RAM → DISK (crate::ooc): over-VRAM is not an
@@ -795,6 +830,8 @@ impl Model {
 			scaler: RefCell::new(None),
 			yscaler: RefCell::new(None),
 			fit_score: Cell::new(f64::NAN),
+			saved_ogdl: RefCell::new(None),
+			arena_gen: Cell::new(None),
 		});
 		register_model(&*inner as *const ModelInner);
 		Model { inner }
@@ -889,6 +926,7 @@ impl Default for Model {
 #[cfg(test)]
 mod metric_gpu_tests {
 	use super::*;
+	use gpu_core::kernels;
 	use recipe_infer::*;
 	use std::cell::RefCell;
 	use std::sync::LazyLock;
@@ -1153,6 +1191,8 @@ mod metric_gpu_tests {
 				scaler: RefCell::new(None),
 				yscaler: RefCell::new(None),
 				fit_score: Cell::new(f64::NAN),
+				saved_ogdl: RefCell::new(None),
+				arena_gen: Cell::new(None),
 			}),
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
@@ -1266,6 +1306,8 @@ mod metric_gpu_tests {
 				scaler: RefCell::new(None),
 				yscaler: RefCell::new(None),
 				fit_score: Cell::new(f64::NAN),
+				saved_ogdl: RefCell::new(None),
+				arena_gen: Cell::new(None),
 			}),
 		};
 		let ss = crate::train::StepScalars::new(lr, n);
