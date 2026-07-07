@@ -7,8 +7,9 @@ use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, build_layer_params, concat_layer,
-	forward_into, infer_scored, load_ogdl, metric_gpu, metric_gpu_into,
-	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_fit, zscore_fit_into,
+	forward_into, infer_scored, load_ogdl, load_ogdl_str, metric_gpu, metric_gpu_into,
+	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_apply_into, zscore_fit,
+	zscore_fit_into,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
@@ -717,14 +718,14 @@ impl ModelInner {
 			flip = !flip;
 		}
 	}
-	/// Whether every logged metric is servable by the zero-transfer staged loop.
-	/// The device metric ring holds one per-epoch scalar row per logged
+	/// Whether every logged AND plotted metric is servable by the zero-transfer
+	/// staged loop. The device metric ring holds one per-epoch scalar row per
 	/// device-computed metric (loss / R² / accuracy); epoch / lr / time / hip are
 	/// host-free. That covers the entire closed metric set, so this is true for any
 	/// metric list today — kept as a method so a future non-ring metric has exactly
 	/// one gate to fall through to the pooled path.
 	pub(crate) fn ring_metrics(&self, cfg: &Train) -> bool {
-		cfg.metrics.iter().all(|m| {
+		cfg.metrics.iter().chain(cfg.plot.iter()).all(|m| {
 			matches!(
 				m,
 				Metric::Loss
@@ -734,20 +735,18 @@ impl ModelInner {
 			)
 		})
 	}
-	/// Whether this run can take the one-claim staged path (`fit_staged`): a plain
-	/// first fit with no live TUI plot, no checkpoint/resume file, no warm-start
-	/// rerun, and only ring-servable metrics. The arena CLAIM in `Train::run` is
-	/// gated on exactly this so the pooled path never runs under an arena (a pooled
-	/// fit leaves no host weight mirror, so a later cross-model eval would find its
-	/// arena backing freed with nothing to rebuild from). `fit` re-checks the same
-	/// predicate before dispatching.
-	pub(crate) fn staged_eligible(&self, cfg: &Train, resume: Option<&str>) -> bool {
+	/// Whether this run can take the one-claim staged path (`fit_staged`): an
+	/// in-VRAM fit whose logged/plotted metrics are all ring-servable and — for a
+	/// rerun — whose current weights left a host mirror to warm-start from (a
+	/// pooled fit leaves none). Checkpoint/resume (`.resume`), the TUI plot, and
+	/// reruns all stage; out-of-core keeps the pooled path. The arena CLAIM in
+	/// `Train::run` is gated on exactly this so the pooled path never runs under
+	/// an arena (a pooled fit leaves no host weight mirror, so a later cross-model
+	/// eval would find its arena backing freed with nothing to rebuild from).
+	/// `fit` re-checks the same predicate before dispatching.
+	pub(crate) fn staged_eligible(&self, cfg: &Train) -> bool {
 		let rerun = !self.params.borrow().is_empty();
-		cfg.plot.is_empty()
-			&& cfg.resume.is_none()
-			&& resume.is_none()
-			&& !rerun
-			&& self.ring_metrics(cfg)
+		(!rerun || self.saved_ogdl.borrow().is_some()) && self.ring_metrics(cfg)
 	}
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
@@ -759,12 +758,13 @@ impl ModelInner {
 		// One-claim staged fit: when run() claimed the arena (in-VRAM) for a
 		// staged-eligible run, compose the whole init as ONE staged image + one H2D,
 		// run a zero-transfer loop, and bring everything home in one exit D2H. Every
-		// other case (out-of-core, plotting, checkpointing, resume, rerun) keeps the
-		// proven pooled path below unchanged. `run()` gates the arena CLAIM on the
-		// same predicate, so `arena_remaining() > 0` already implies eligibility; the
-		// re-check keeps `fit` correct for any future caller that skips the gate.
-		if gpu_core::memory::arena_remaining() > 0 && self.staged_eligible(cfg, resume) {
-			self.fit_staged(data, cfg);
+		// other case (out-of-core, a non-ring metric, a rerun with no host mirror)
+		// keeps the proven pooled path below unchanged. `run()` gates the arena CLAIM
+		// on the same predicate, so `arena_remaining() > 0` already implies
+		// eligibility; the re-check keeps `fit` correct for any future caller that
+		// skips the gate.
+		if gpu_core::memory::arena_remaining() > 0 && self.staged_eligible(cfg) {
+			self.fit_staged(data, cfg, resume);
 			return;
 		}
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
@@ -1249,6 +1249,13 @@ impl ModelInner {
 			}
 		});
 		*self.params.borrow_mut() = params;
+		// The pooled fit just replaced the weights, so a staged mirror from an
+		// earlier run now describes dead state. Clearing it sends the next rerun
+		// to the pooled path (mirror-less) instead of silently warm-starting from
+		// stale weights, and keeps save() reading the live params — never an old
+		// image keyed with this run's score.
+		*self.saved_ogdl.borrow_mut() = None;
+		self.arena_gen.set(None);
 		if let Some(s) = end_score
 			&& s.is_finite()
 		{
@@ -1306,19 +1313,32 @@ impl ModelInner {
 			}
 		}
 	}
-	/// One-claim staged fit (in-VRAM, non-plotting, non-checkpointing, non-resume,
-	/// first fit — every other case uses the pooled `fit` above). The entire init
-	/// is composed into ONE `Stage` image and moved with ONE sync H2D: weights
-	/// (plan image, device-randn-initialized in place), the 12 scratch constants,
-	/// the 4 step scalars, x/cat/y, and reserved z-score slots. Stats are computed
-	/// on device and cross to the host Scaler exactly ONCE, at exit. Sub-stages
-	/// still open: (b) the metric ring for zero loop transfers, (c) the single
-	/// contiguous exit-region D2H + write-only save mirror.
-	fn fit_staged(&self, data: &Dataset, cfg: &Train) {
+	/// One-claim staged fit (in-VRAM; out-of-core, non-ring metrics, and a rerun
+	/// with no host mirror keep the pooled `fit` above). The entire init is
+	/// composed into ONE `Stage` image and moved with ONE sync H2D: weights (plan
+	/// image — device-randn-initialized in place, or warm-started host-side from a
+	/// `.resume` file or the rerun mirror), the 12 scratch constants, the 4 step
+	/// scalars, x/cat/y, and z-score slots (reserved on a first fit; pushed from
+	/// the host Scaler on a rerun and broadcast-applied, never re-fit). The loop is
+	/// transfer-free: per-epoch metrics reduce into a device ring brought home in
+	/// the ONE exit D2H, which then replays the log lines, the checkpoint
+	/// divergence semantics, and the end-of-run TUI plot. Stats cross to the host
+	/// Scaler exactly ONCE, at exit.
+	fn fit_staged(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let start = std::time::Instant::now();
 		let classify = self.loss.is_classification();
+		let rerun = !self.params.borrow().is_empty();
+		let checkpoint_path = cfg.resume.as_deref().map(Train::resolve);
+		let checkpointing = checkpoint_path.is_some();
+		let plotting = !cfg.plot.is_empty() && std::io::stdout().is_terminal();
+		let plot_ys: Vec<Metric> = cfg
+			.plot
+			.iter()
+			.copied()
+			.filter(|&m| m != Metric::Epoch && m != Metric::Time)
+			.collect();
 		// ── host prep: column split, vocab, x/cat matrices ──
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
@@ -1356,8 +1376,50 @@ impl ModelInner {
 		// embed-only tokens are never scaled.
 		let d_sc = if embed_first { c } else { d };
 		// ── plan weights (host image), derive output width / y ──
-		let plan = plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
-			.unwrap_or_else(|e| panic!("plan_layer_params: {e}"));
+		// Warm-start blocks ride the plan's host image into the one H2D: an existing
+		// `.resume` file wins; else a rerun warm-starts from the host mirror the prior
+		// staged exit D2H left (the gate guarantees it exists); else random init.
+		let resumed = resume.map(load_ogdl).unwrap_or_default();
+		let mut did_resume = !resumed.is_empty();
+		let source = if did_resume {
+			resumed
+		} else if rerun {
+			let m = self.saved_ogdl.borrow();
+			load_ogdl_str(&m.as_ref().expect("staged rerun without host weight mirror").text)
+		} else {
+			Vec::new()
+		};
+		let ask_overwrite = |what: &str| -> bool {
+			use std::io::Write;
+			eprintln!(
+				"\x1b[32mresume\x1b[0m\n    \x1b[1;31mdata does not match\x1b[0m\n        {what}\n        file path={}\n        data path={}",
+				resume.unwrap_or(""),
+				data.source,
+			);
+			if !std::io::stdin().is_terminal() {
+				return false;
+			}
+			eprint!("overwrite checkpoint with random weights? [y/N] ");
+			std::io::stderr().flush().ok();
+			let mut line = String::new();
+			std::io::stdin().read_line(&mut line).ok();
+			matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+		};
+		let warm = did_resume || rerun;
+		let plan = match plan_layer_params(&self.specs, d, c_cat, vocab, &source, warm) {
+			Ok(p) => p,
+			Err(what) => {
+				if did_resume && ask_overwrite(&what) {
+					did_resume = false;
+					plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
+						.unwrap_or_else(|e| panic!("{e}"))
+				} else if did_resume {
+					panic!("checkpoint mismatch — user declined overwrite");
+				} else {
+					panic!("rerun: host weight mirror does not match this run — {what}");
+				}
+			}
+		};
 		let out_dim = plan.out_dim_last();
 		let n_targets = data.n_targets.max(1);
 		let expand_ce = classify && n_targets == 1 && out_dim > 1;
@@ -1369,7 +1431,7 @@ impl ModelInner {
 		let (y_flat, ss_tot) = {
 			let ys = data.y.as_slice().expect("train: y contiguous");
 			let mut yd = ys.to_vec();
-			if !classify {
+			if !classify && !rerun {
 				let ymean = yd.iter().sum::<f64>() / yd.len() as f64;
 				let yvar = yd.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / yd.len() as f64;
 				let ystd = (yvar + 1e-8).sqrt();
@@ -1377,6 +1439,12 @@ impl ModelInner {
 					*v = (*v - ymean) / ystd;
 				}
 				*self.yscaler.borrow_mut() = Some((ymean, ystd));
+			} else if !classify && rerun {
+				if let Some((ymean, ystd)) = *self.yscaler.borrow() {
+					for v in yd.iter_mut() {
+						*v = (*v - ymean) / ystd;
+					}
+				}
 			}
 			// R²'s denominator from the PRE-expansion column, matching the pooled
 			// path's y_host — an ss_tot over the one-hot expansion differs and the
@@ -1403,14 +1471,21 @@ impl ModelInner {
 		// ── compose the ONE staged image: exit-region prefix, upload-only suffix ──
 		let epochs = cfg.epochs.max(1);
 		// Device metric ring rows: the stop metric (always — for fit_score and a ^C
-		// snapshot) plus every logged device-computed metric (loss / R² / accuracy),
-		// deduped in log order. Epoch / lr / time / hip are host-free and take no
-		// row. Each row is `epochs` scalars; a row is filled per log-epoch on device
-		// and replayed from the single exit D2H, so all-metrics logging keeps the
-		// loop transfer-free.
+		// snapshot) plus every logged/plotted device-computed metric (loss / R² /
+		// accuracy) plus loss when checkpointing (its divergence test reads loss at
+		// EVERY epoch), deduped. Epoch / lr / time / hip are host-free and take no
+		// row. Each row is `epochs` scalars, filled on device and replayed from the
+		// single exit D2H, so logging, checkpoint decisions, and the TUI plot all
+		// keep the loop transfer-free.
 		let stop_metric = if classify { Metric::Accuracy } else { Metric::R2 };
 		let mut ring_row: Vec<Metric> = vec![stop_metric];
-		for &m in &cfg.metrics {
+		for m in cfg
+			.metrics
+			.iter()
+			.copied()
+			.chain(checkpointing.then_some(Metric::Loss))
+			.chain(plot_ys.iter().copied())
+		{
 			if matches!(m, Metric::Loss | Metric::R2 | Metric::Accuracy) && !ring_row.contains(&m) {
 				ring_row.push(m);
 			}
@@ -1418,10 +1493,18 @@ impl ModelInner {
 		let n_rows = ring_row.len();
 		let mut stage = Stage::new();
 		let w_off = stage.push(plan.host());
-		let (mean_off, std_off) = if d_sc > 0 {
-			(stage.reserve(d_sc), stage.reserve(d_sc))
-		} else {
+		// First fit: mean/std slots are device-filled by the z-score fit. Rerun: the
+		// host Scaler's stats ride the image IN and get broadcast-applied — same
+		// semantics as the pooled rerun's `zscore_apply`, no re-fit.
+		let (mean_off, std_off) = if d_sc == 0 {
 			(0, 0)
+		} else if rerun {
+			let sc_host = self.scaler.borrow();
+			let s = sc_host.as_ref().expect("rerun without scaler");
+			assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
+			(stage.push(&s.mean), stage.push(&s.std))
+		} else {
+			(stage.reserve(d_sc), stage.reserve(d_sc))
 		};
 		let ring_off = stage.reserve(n_rows * epochs); // metric ring: n_rows × epochs scalars
 		let end_off = stage.reserve(1); // end-score scalar (stop metric)
@@ -1467,15 +1550,26 @@ impl ModelInner {
 			} else {
 				base.view(x_off, n * d)
 			};
-			zscore_fit_into(
-				&x_src,
-				n,
-				d_sc,
-				&base.view(eps_off, 1),
-				&base.view(mean_off, d_sc),
-				&base.view(std_off, d_sc),
-				&scaled,
-			);
+			if rerun {
+				zscore_apply_into(
+					&x_src,
+					n,
+					d_sc,
+					&base.view(mean_off, d_sc),
+					&base.view(std_off, d_sc),
+					&scaled,
+				);
+			} else {
+				zscore_fit_into(
+					&x_src,
+					n,
+					d_sc,
+					&base.view(eps_off, 1),
+					&base.view(mean_off, d_sc),
+					&base.view(std_off, d_sc),
+					&scaled,
+				);
+			}
 			if embed_first {
 				(base.view(x_off, n * d), Some(scaled))
 			} else {
@@ -1483,16 +1577,21 @@ impl ModelInner {
 			}
 		} else {
 			// embed-only tokens: no scaling; empty scaler so eval skips it.
-			*self.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+			if !rerun {
+				*self.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+			}
 			(base.view(x_off, xinput.len()), None)
 		};
 		let ybuf = base.view(y_off, n * k);
-		// ── summary + roofline header (matches the pooled non-plotting print) ──
-		if !cfg.metrics.is_empty() {
+		// ── summary + roofline header (matches the pooled print: stderr on a plain
+		// first fit, dashboard header when plotting, silent on a rerun) ──
+		let summary = if cfg.metrics.is_empty() {
+			String::new()
+		} else {
 			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 			let out = params[last].out_dim;
 			let row = |x: usize, l1: &str, y: usize, l2: &str| format!("    {x:>5}  {l1:<11}{y:>5}  {l2}");
-			let summary = [
+			[
 				"arch".to_string(),
 				row(neurons, "neurons", params.len(), "layers"),
 				row(n, "samples", d, "features"),
@@ -1501,13 +1600,21 @@ impl ModelInner {
 				row(n + 1, "rows", d + 1, "columns"),
 				row(d, "predictors", out, "targets"),
 			]
-			.join("\n");
-			eprintln!("{summary}");
-			eprintln!(
-				"roofline  gemm {} GF/s  vram {} GB/s",
-				recipe_infer::GEMM_GFLOPS,
-				recipe_infer::VRAM_GBS
-			);
+			.join("\n")
+		};
+		if !plotting && !rerun {
+			if did_resume && let Some(path) = resume {
+				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+				eprintln!("resumed: {}", full.display());
+			}
+			if !summary.is_empty() {
+				eprintln!("{summary}");
+				eprintln!(
+					"roofline  gemm {} GF/s  vram {} GB/s",
+					recipe_infer::GEMM_GFLOPS,
+					recipe_infer::VRAM_GBS
+				);
+			}
 		}
 		// ── loop: zero device allocations (AllocGuard); saturation watchdog live ──
 		let _guard = gpu_core::memory::AllocGuard::freeze();
@@ -1519,12 +1626,16 @@ impl ModelInner {
 		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
-		// Per-log-epoch host records replayed AFTER the loop (batch logging keeps the
-		// loop transfer-free): epoch, wall-clock, and the roofline block (which reads
-		// layer_ms via event syncs, not transfers). The loss and stop-metric SCORE go
-		// into the device ring — raw kernel outputs (ss_res / accuracy / loss
-		// reduction), transformed host-side at replay from the ONE ring download.
-		let mut log_rows: Vec<(usize, f64, String)> = Vec::new();
+		// Per-recorded-epoch host records replayed AFTER the loop (batch logging
+		// keeps the loop transfer-free): epoch, wall-clock, whether it was a
+		// scheduled log epoch, and its roofline block (which reads layer_ms via
+		// event syncs, not transfers). Checkpoint and plot runs record EVERY epoch
+		// (the divergence test and the plot series replay per-epoch from the ring);
+		// otherwise only log epochs. The metric values themselves go into the
+		// device ring — raw kernel outputs (ss_res / accuracy / loss reduction),
+		// transformed host-side at replay from the ONE ring download.
+		let mut epoch_meta: Vec<(usize, f64, bool, String)> = Vec::new();
+		let ring_every = checkpointing || plotting;
 		// Host-side (sign, div) rescale for each ring row, filled once in the loop;
 		// constant across epochs (depends only on loss / metric / n / ss_tot).
 		let mut ring_scale: Vec<(f64, f64)> = vec![(1.0, 1.0); n_rows];
@@ -1535,15 +1646,19 @@ impl ModelInner {
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-			sc.set_timing(log_now);
+			let time_layers = log_now && !plotting;
+			sc.set_timing(time_layers);
 			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
 			}
 			self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 			sc.set_timing(false);
-			if log_now {
+			if log_now || ring_every {
 				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+				if INTERRUPTED.load(Ordering::SeqCst) {
+					break;
+				}
 				let out = &sc.acts[last];
 				// Each ring row's raw device scalar (ss_res / accuracy / loss reduction)
 				// reduces DIRECTLY into row mi's slot for epoch e — no D2D, no
@@ -1552,7 +1667,12 @@ impl ModelInner {
 					let slot = base.view(ring_off + mi * epochs + e, 1);
 					ring_scale[mi] = metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot);
 				}
-				log_rows.push((e, start.elapsed().as_secs_f64(), Self::roofline_block(&params, n, &sc)));
+				epoch_meta.push((
+					e,
+					start.elapsed().as_secs_f64(),
+					log_now,
+					if time_layers { Self::roofline_block(&params, n, &sc) } else { String::new() },
+				));
 			}
 		}
 		gpu_core::hw::disarm_saturation_crash();
@@ -1562,9 +1682,10 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
 		}
+		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
 		// End score into the reserved slot on device (no D2H) — it rides home in the
 		// single prefix D2H below with everything else.
-		if !INTERRUPTED.load(Ordering::SeqCst) {
+		if !was_interrupted {
 			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
 			let end_slot = base.view(end_off, 1);
 			if classify {
@@ -1581,38 +1702,70 @@ impl ModelInner {
 		// ring + end-score) into ONE host block; everything below is scattered from
 		// it with zero further device transfers.
 		let host = base.view(0, prefix_len).download_vec().expect("exit prefix d2h");
-		// stats → host Scaler (the one crossing to RAM, per the invariant).
-		if d_sc > 0 {
+		// stats → host Scaler (the one crossing to RAM, per the invariant). A rerun
+		// pushed the SAME stats in and never re-fit, so nothing crosses back.
+		if d_sc > 0 && !rerun {
 			*self.scaler.borrow_mut() = Some(Scaler {
 				mean: host[mean_off..mean_off + d_sc].to_vec(),
 				std: host[std_off..std_off + d_sc].to_vec(),
 			});
 		}
-		// deferred per-epoch log lines replayed from the ring slice, in epoch order.
-		if !log_rows.is_empty() {
-			// A logged device metric → its reported value, read from its ring row and
-			// rescaled host-side (the raw kernel output is ss_res / accuracy / a loss
-			// reduction). Host-free metrics never reach here.
-			let val_of = |m: Metric, e: usize| -> f64 {
-				let Some(mi) = ring_row.iter().position(|&d| d == m) else {
-					return f64::NAN;
-				};
-				let raw = host[ring_off + mi * epochs + e];
-				match m {
-					Metric::R2 => 1.0 - raw / ss_tot,
-					Metric::Accuracy => raw,
-					Metric::Loss => {
-						let (sign, div) = ring_scale[mi];
-						sign * raw / div
-					}
-					_ => f64::NAN,
-				}
+		// A ring device metric → its reported value, read from its ring row and
+		// rescaled host-side (the raw kernel output is ss_res / accuracy / a loss
+		// reduction). Host-free metrics never reach here.
+		let val_of = |m: Metric, e: usize| -> f64 {
+			let Some(mi) = ring_row.iter().position(|&d| d == m) else {
+				return f64::NAN;
 			};
-			for (e, elapsed, roof) in &log_rows {
-				let score = val_of(stop_metric, *e);
-				if score.is_finite() {
-					fit_score = score;
+			let raw = host[ring_off + mi * epochs + e];
+			match m {
+				Metric::R2 => 1.0 - raw / ss_tot,
+				Metric::Accuracy => raw,
+				Metric::Loss => {
+					let (sign, div) = ring_scale[mi];
+					sign * raw / div
 				}
+				_ => f64::NAN,
+			}
+		};
+		let key = self.loss.score_key();
+		// Deferred per-epoch replay in epoch order: the scheduled log lines, and —
+		// when checkpointing — the pooled divergence semantics reproduced from the
+		// ring rows (first loss rise → save once under the best-score guard, keyed
+		// with THAT epoch's score; NaN loss → stop). The bytes written are the exit
+		// image's weights — the run's only host copy, so a divergence save carries
+		// the final weights, not the epoch-e snapshot the pooled path writes (the
+		// per-epoch weights never come home under the one-D2H exit contract).
+		let mut loss_prev = f64::INFINITY;
+		let mut ckpt_saved = false;
+		for (e, elapsed, was_log, roof) in &epoch_meta {
+			let score = val_of(stop_metric, *e);
+			if score.is_finite() {
+				fit_score = score;
+			}
+			let mut checkpointed = false;
+			if checkpointing {
+				let loss = val_of(Metric::Loss, *e);
+				if loss.is_nan() {
+					eprintln!("NaN loss at epoch {e} — stopping (weights diverged)");
+					break;
+				}
+				if !ckpt_saved && *e > 0 && loss > loss_prev {
+					ckpt_saved = true;
+					let path = checkpoint_path.as_ref().expect("checkpoint path");
+					if recipe_infer::saved_score(path, key).is_none_or(|best| score > best) {
+						recipe_infer::write_ogdl(
+							path,
+							&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
+						);
+						checkpointed = true;
+					}
+				}
+				if loss.is_finite() {
+					loss_prev = loss;
+				}
+			}
+			if (*was_log || checkpointed) && !plotting {
 				let vals: Vec<f64> = cfg
 					.metrics
 					.iter()
@@ -1624,16 +1777,57 @@ impl ModelInner {
 						_ => val_of(m, *e),
 					})
 					.collect();
-				eprintln!("{}", self.metrics_line(&cfg.metrics, &vals));
-				eprint!("{roof}");
+				let mut line = self.metrics_line(&cfg.metrics, &vals);
+				if checkpointed {
+					line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
+				}
+				eprintln!("{line}");
+				if *was_log {
+					eprint!("{roof}");
+				}
 			}
 		}
-		// end score → fit_score (authoritative; equals the last epoch's — one more forward).
-		if !INTERRUPTED.load(Ordering::SeqCst) {
-			let s = if classify { host[end_off] } else { 1.0 - host[end_off] / ss_tot };
-			if s.is_finite() {
-				fit_score = s;
+		// TUI plot fed ONCE from the ring (full series) — same renderer, same
+		// facets; only the data source moved from live per-epoch to the exit replay.
+		if plotting && !epoch_meta.is_empty() {
+			let plot_rows: Vec<Vec<f64>> = epoch_meta
+				.iter()
+				.map(|(e, elapsed, _, _)| {
+					let mut row = vec![*elapsed];
+					for &m in &plot_ys {
+						row.push(match m {
+							Metric::Lr => self.lr,
+							Metric::Hip => f64::NAN,
+							_ => val_of(m, *e),
+						});
+					}
+					row
+				})
+				.collect();
+			let mut term = ratatui::init();
+			let _ = term.draw(|frame| {
+				self.render_dashboard(frame, &summary, &plot_rows, &plot_ys);
+			});
+			// One frame post-loop (the staged loop is transfer-free, nothing renders
+			// live) — hold the alt screen until a key press so the dashboard is
+			// actually seen; an instant restore made a staged .plot() run invisible.
+			if std::io::stdin().is_terminal() {
+				loop {
+					match event::read() {
+						Ok(Event::Key(_)) | Err(_) => break,
+						_ => {}
+					}
+				}
 			}
+			ratatui::restore();
+		}
+		// end score → fit_score (authoritative; equals the last epoch's — one more forward).
+		let end_val = (!was_interrupted)
+			.then(|| if classify { host[end_off] } else { 1.0 - host[end_off] / ss_tot });
+		if let Some(s) = end_val
+			&& s.is_finite()
+		{
+			fit_score = s;
 		}
 		// weights → host OGDL mirror (byte-identical to a device dump): written
 		// verbatim on save, and the source a forward-only read rebuilds from once a
@@ -1641,12 +1835,39 @@ impl ModelInner {
 		// widths so the rebuild matches shapes exactly.
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 		*self.saved_ogdl.borrow_mut() = Some(crate::model::SavedWeights {
-			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], self.loss.score_key(), fit_score),
+			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, fit_score),
 			neurons,
 			d,
 			c_cat,
 			vocab,
 		});
+		// Checkpoint end-of-run save, from the mirror text (zero device transfers):
+		// the ^C flush writes the exit image (the only in-memory copy) UNLESS the
+		// file already holds a strictly better-scored checkpoint — an interrupted
+		// (or NaN-scored) flush must never destroy a good prior run's weights.
+		// A completed run keeps the pooled best-only guard on the end score.
+		if let Some(path) = checkpoint_path.as_deref() {
+			let sw = self.saved_ogdl.borrow();
+			let text = &sw.as_ref().expect("staged fit leaves a mirror").text;
+			if was_interrupted {
+				let better_on_disk = recipe_infer::saved_score(path, key)
+					.is_some_and(|best| !(fit_score.is_finite() && fit_score > best));
+				if better_on_disk {
+					eprintln!("keeping {path} (better prior {key} on disk)");
+				} else {
+					recipe_infer::write_ogdl(path, text);
+					let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+					eprintln!("saved {} ({key} {fit_score:.4})", full.display());
+				}
+			} else if let Some(s) = end_val
+				&& s.is_finite()
+				&& recipe_infer::saved_score(path, key).is_none_or(|best| s > best)
+			{
+				recipe_infer::write_ogdl(path, text);
+				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+				eprintln!("saved {} ({neurons} neurons, {key} {s:.4})", full.display());
+			}
+		}
 		*self.params.borrow_mut() = params;
 		self.fit_score.set(fit_score);
 		gpu_core::memory::pool_trim();

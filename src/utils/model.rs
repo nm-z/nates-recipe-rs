@@ -382,15 +382,15 @@ impl Train {
 			// from it. Only the first run of the process (or a grown footprint)
 			// claims fresh. The slab is PARKED again at exit, not freed: its
 			// weight/stat views stay live past run() for scoring, save, and a
-			// following eval. A pooled fit (plot / checkpoint / resume / rerun /
-			// non-ring metric) must NOT run under an arena — it leaves no host
-			// weight mirror, so a later cross-model eval would find its parked
-			// backing freed with nothing to rebuild from — so ineligible runs
-			// release the park and allocate from the pool exactly as before
+			// following eval. A pooled fit (out-of-core / non-ring metric / a
+			// rerun with no host mirror) must NOT run under an arena — it leaves
+			// no host weight mirror, so a later cross-model eval would find its
+			// parked backing freed with nothing to rebuild from — so ineligible
+			// runs release the park and allocate from the pool exactly as before
 			// (their params stay pool-owned). Footprint sizing is plan-time only
 			// (dims math + null borrows, zero device traffic), safe while the
 			// previous backing is still parked.
-			let eligible = model.staged_eligible(self, resume.as_deref());
+			let eligible = model.staged_eligible(self);
 			let footprint = plan_footprint(model, ds, false);
 			let slab = if eligible {
 				gpu_core::memory::adopt_run_backing(footprint).or_else(|| {

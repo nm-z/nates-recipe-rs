@@ -343,6 +343,23 @@ pub fn zscore_fit_into(
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
 }
 
+/// One-claim z-score apply (the staged rerun path): mean/std rode the init image
+/// in — pushed from the host Scaler the first fit derived, never re-fit — and
+/// the result lands in the reserved `out` view. The center temp is carved (freed
+/// with the arena). No uploads, no downloads.
+pub fn zscore_apply_into(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+	out: &GpuBuffer,
+) {
+	let xc = GpuBuffer::alloc(n * d).expect("center");
+	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
+}
+
 pub fn zscore_apply(xraw: &GpuBuffer, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
 	assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
 	assert_eq!(scaler.std.len(), d, "eval: feature count changed");
