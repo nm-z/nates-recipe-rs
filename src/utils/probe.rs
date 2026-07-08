@@ -46,11 +46,12 @@ impl Machine {
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
 			eprintln!("recipe probe: measuring gpu{d}");
-			match measure_gpu(d) {
+			// Disposable child per device: an unsupported arch can WEDGE inside the
+			// driver (ROCm 7 on gfx900 hangs, not errors), so the bench runs in a
+			// child the parent can kill — hang/abort/refusal all read the same way:
+			// not drivable, storage node. Loud, never silent, never a crashloop.
+			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
-				// An arch this binary's kernels cannot drive is the same data
-				// shape as no GPU: the machine serves as a storage node. Loud,
-				// never silent, never a crashloop on a fleet daemon.
 				Err(e) => eprintln!("recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"),
 			}
 		}
@@ -155,6 +156,59 @@ fn disk_total(path: &Path) -> Result<u64> {
 }
 
 // ── GPU benches (device i current) ───────────────────────────────────────────
+
+/// Run `measure_gpu(dev)` in a disposable child (RECIPE_PROBE_GPU hook in main)
+/// with a hard timeout; the child prints "vram|pcie|flops|transfer" on success.
+fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
+	let exe = std::env::current_exe()?;
+	let mut child = std::process::Command::new(exe)
+		.env("RECIPE_PROBE_GPU", dev.to_string())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::null())
+		.spawn()?;
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+	loop {
+		if let Some(status) = child.try_wait()? {
+			if !status.success() {
+				bail!("probe child exited {status}");
+			}
+			let mut out = String::new();
+			use std::io::Read as _;
+			child.stdout.take().expect("probe child stdout").read_to_string(&mut out)?;
+			let f: Vec<&str> = out.trim().split('|').collect();
+			if f.len() != 4 {
+				bail!("probe child output malformed: {out:?}");
+			}
+			return Ok(GpuDev {
+				vram: f[0].parse()?,
+				pcie_gbs: f[1].parse()?,
+				flops_gflops: f[2].parse()?,
+				transfer_gbs: f[3].parse()?,
+			});
+		}
+		if std::time::Instant::now() > deadline {
+			let _ = child.kill();
+			let _ = child.wait();
+			bail!("probe child wedged (120s) — killed");
+		}
+		std::thread::sleep(std::time::Duration::from_millis(200));
+	}
+}
+
+/// The RECIPE_PROBE_GPU child body: measure one device, print the fields, exit.
+pub fn probe_gpu_child_main(dev: i32) -> ! {
+	match measure_gpu(dev) {
+		Ok(g) => {
+			println!("{}|{}|{}|{}", g.vram, g.pcie_gbs, g.flops_gflops, g.transfer_gbs);
+			std::process::exit(0);
+		}
+		Err(e) => {
+			eprintln!("probe child gpu{dev}: {e}");
+			std::process::exit(2);
+		}
+	}
+}
+
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
 	gpu_core::hip::set_device(dev)?;
 	let (_free, total) = gpu_core::hip::mem_info()?;
@@ -501,6 +555,11 @@ pub fn install(machine: &Machine) -> Result<()> {
 	std::fs::create_dir_all(&bin_dir).map_err(|e| anyhow::anyhow!("recipe install: mkdir {}: {e}", bin_dir.display()))?;
 	let dest = bin_dir.join("recipe");
 	let dest = dest.as_path();
+	// Running FROM the install path: nothing to copy (self-copy is ETXTBSY).
+	if std::fs::canonicalize(&exe).ok() == std::fs::canonicalize(dest).ok() {
+		eprintln!("recipe install: {} is already the installed binary", dest.display());
+		return Ok(());
+	}
 	match std::fs::copy(&exe, dest) {
 		Ok(_) => eprintln!("recipe install: copied {} -> {}", exe.display(), dest.display()),
 		Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(

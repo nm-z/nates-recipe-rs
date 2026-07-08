@@ -16,6 +16,12 @@ fn main() -> Result<()> {
 	// code. An oversize ask dies in the uncatchable VmHeap abort — in THIS
 	// process, whose corpse is the signal (memory::probe_ceiling walks the ask
 	// down until a probe survives).
+	// Disposable per-device probe child (see probe::measure_gpu_child): benches one
+	// GPU and prints its fields; a wedged driver dies here, not in the daemon.
+	if let Some(d) = std::env::var_os("RECIPE_PROBE_GPU") {
+		let dev: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
+		recipe::probe::probe_gpu_child_main(dev);
+	}
 	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
 		let n: usize = sz.to_string_lossy().parse().expect("VRAM_PROBE parse");
 		let ok = gpu_core::memory::GpuBuffer::try_alloc_bytes(n).is_some();
