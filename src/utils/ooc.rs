@@ -707,7 +707,7 @@ impl Ooc {
 		// tallied so the host pool below is sized to exactly the streamed windows.
 		let mut spill: Option<File> = None;
 		let mut nonvram = 0usize;
-		// Disk fills to ITS reserve line, then windows go remote: each pooled
+		// Disk fills to ITS reserve line, then windows go remote: each remote
 		// node takes up to its HELLO-reported MemAvailable minus the same 1 GB
 		// user reserve (the reserve law applies on the far side too).
 		let disk_budget = disk_free(&crate::probe::data_dir())
@@ -1686,7 +1686,7 @@ impl Drop for Ooc {
 	fn drop(&mut self) {
 		// Drain in-flight write-behind (the spill fd itself dies with us — the path
 		// was unlinked at open). The barrier lands every queued remote STORE before
-		// the blobs are freed off the pooled nodes. An all-VRAM run sent nothing, so
+		// the blobs are freed off the remote nodes. An all-VRAM run sent nothing, so
 		// this drains zero lanes. The arena is the CALLER's: its park/release op owns
 		// the exit drain and the single free — Ooc touches neither. Host pools and
 		// the spill fd drop naturally here.

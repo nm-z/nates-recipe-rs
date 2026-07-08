@@ -186,7 +186,7 @@ struct PlanEntry {
 
 /// The AOT weight plan: every layer's block sizes, offsets, and initial host
 /// bytes composed on the host with ZERO GPU calls. The run pushes `host()`
-/// into its one staged init image (the run's persist prefix — the exit block
+/// into its one init image (the run's persist prefix — the exit block
 /// downloads it back in the same single D2H), then `materialize` carves views
 /// and runs the randn init kernels.
 pub struct LayerPlan {
@@ -219,7 +219,7 @@ impl LayerPlan {
 	}
 
 	/// Compose a randn-init block directly into the host image (host Box-Muller +
-	/// scale), returning a plain staged block — the device runs no init kernel.
+	/// scale), returning a plain host-composed block — the device runs no init kernel.
 	fn randn(&mut self, len: usize, seed: usize, scale: f64) -> BlockPlan {
 		self.pad();
 		let off = self.host.len();
@@ -242,7 +242,7 @@ impl LayerPlan {
 	}
 
 	/// Carve every block as a view of the uploaded image (`base_off` = where the
-	/// image landed in the staged buffer, in f64s). The image already holds every
+	/// image landed in the init image buffer, in f64s). The image already holds every
 	/// block's contents (weights, PE tables, biases, host-composed randn init), so
 	/// this is pure pointer arithmetic — ZERO device kernels, ZERO transfers.
 	pub fn materialize(&self, staged: &GpuBuffer, base_off: usize) -> Vec<LayerParams> {
@@ -335,7 +335,7 @@ impl LayerPlan {
 /// Host-only plan pass: same walk, same shapes, same seeds, same resume
 /// validation the fit builder does, but composes every block into a host
 /// image instead of touching the GPU. The fit path plans → sizes scratch →
-/// claims the arena → uploads ONE staged image → materializes.
+/// claims the arena → uploads ONE init image → materializes.
 pub fn plan_layer_params(
 	specs: &[LayerSpec],
 	d: usize,

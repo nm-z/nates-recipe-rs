@@ -1347,7 +1347,7 @@ impl ModelInner {
 			b.load(sl).expect("eval upload");
 			b
 		};
-		// z-score apply with the fitted scaler: mean/std ride ONE staged image (two
+		// z-score apply with the fitted scaler: mean/std ride ONE composed image (two
 		// carved views), not a fresh upload each eval; the scaled result is owned.
 		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> GpuBuffer {
 			assert_eq!(sc.mean.len(), cols, "eval: feature count changed");
@@ -1355,7 +1355,9 @@ impl ModelInner {
 			let mut st = Stage::new();
 			let m_off = st.push(&sc.mean);
 			let s_off = st.push(&sc.std);
-			let img = st.upload().expect("eval scaler stage");
+			let host = st.into_host();
+			let img = GpuBuffer::alloc(host.len().max(1)).expect("eval scaler stage");
+			img.load(&host).expect("eval scaler stage");
 			zscore_apply_views(xraw, rows, cols, &img.view(m_off, cols), &img.view(s_off, cols))
 		};
 		if embed_first {

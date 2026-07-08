@@ -467,8 +467,8 @@ impl Conn {
 		Ok(f)
 	}
 
-	/// Store borrowing the payload — ooc write-behind lanes reuse pooled window
-	/// buffers and must not clone a window per STORE.
+	/// Store borrowing the payload — ooc write-behind lanes reuse window buffers
+	/// from a fixed pool and must not clone a window per STORE.
 	pub fn store_from(&self, id: u64, data: &[u8]) -> Result<()> {
 		let seq = self.next_seq()?;
 		let (tx, rx) = channel();

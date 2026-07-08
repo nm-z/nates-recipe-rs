@@ -220,7 +220,7 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	];
 	// Uniform adopt→forward→park backing for the detector's forward. Weights
 	// (resume-composed host image), the 12 scratch constants, and the tokenized
-	// input compose ONE staged image; build/upload/scratch all bump-carve from
+	// input compose ONE init image; build/upload/scratch all bump-carve from
 	// one memset-committed slab — no per-buffer pool growth (the fresh-page
 	// commit that faults ~30-50% of fresh-process loads).
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);

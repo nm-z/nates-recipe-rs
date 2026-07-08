@@ -39,12 +39,14 @@ fn main() -> Result<()> {
 			// The LLM scenario's real dims: x [45982×768], cat [45982×128].
 			let x = ndarray::Array2::<f64>::from_elem((45982, 768), 1.0);
 			let cat = ndarray::Array2::<f64>::from_elem((45982, 128), 1.0);
-			// One staged image + ONE H2D for the whole setup (features + categorical),
+			// One composed image + ONE H2D for the whole setup (features + categorical),
 			// the fit's single-upload arc; xraw/craw are views of that one buffer.
 			let mut stage = gpu_core::memory::Stage::new();
 			let x_off = stage.push(x.as_standard_layout().as_slice().expect("x contig"));
 			let cat_off = stage.push(cat.as_standard_layout().as_slice().expect("cat contig"));
-			let staged = stage.upload().expect("setup-race stage");
+			let host = stage.into_host();
+			let staged = gpu_core::memory::GpuBuffer::alloc(host.len().max(1)).expect("setup-race stage");
+			staged.load(&host).expect("setup-race stage");
 			let xraw = staged.view(x_off, x.len());
 			let craw = staged.view(cat_off, cat.len());
 			let (nn, cc) = (cat.nrows(), cat.ncols());

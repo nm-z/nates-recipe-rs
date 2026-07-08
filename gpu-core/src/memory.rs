@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
-// Cumulative device-pool alloc/free counts (the two choke sites below). Never
-// reset — they answer "how many live device buffers" at any point.
-static ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
+// Cumulative device-pool free count (the free choke site below). Never reset —
+// with the real map count (callspy MALLOC_ASYNC) it answers "how many live
+// device buffers" at any point.
 static FREE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 // Cumulative transfer ledger, bumped by the ONE xfer site before each copy is
@@ -22,18 +22,6 @@ static D2D_BYTES: AtomicUsize = AtomicUsize::new(0);
 static H2D_CALLS: AtomicUsize = AtomicUsize::new(0);
 static D2H_CALLS: AtomicUsize = AtomicUsize::new(0);
 static D2D_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-// When set, drain the device after each hipMallocAsync so the pool commits the
-// new buffer's pages before anything (notably an SDMA host->device copy, which
-// runs on a queue not ordered with the alloc) writes into it. Off by default —
-// training uploads once and never churns; streaming inference (fresh alloc +
-// immediate copy, thousands of times) needs it to avoid GPU page faults.
-static ALLOC_SYNC: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable the post-allocation device sync (see `ALLOC_SYNC`).
-pub fn set_alloc_sync(on: bool) {
-	ALLOC_SYNC.store(on, Ordering::Relaxed);
-}
 
 // Live device bytes per purpose-tag, and the high-water peak per tag. On a VRAM
 // OOM we dump the live map so the failure names what is on the card (data /
@@ -128,11 +116,8 @@ fn oom_report(req: usize) {
 	line.push(oom_pair("total", &fmt_bytes(total)));
 	line.push(oom_pair("over", &fmt_bytes(req.saturating_sub(free))));
 	// Pool + arena state: the bytes the tag map cannot see. slack = mapped but
-	// idle (a growth map cannot use it, a re-ask under `verified` can); the
-	// verified/live pair is the growth gate's own view; arena = live claim left.
+	// idle (a growth map cannot use it); arena = live claim left.
 	line.push(oom_pair("slack", &fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0))));
-	line.push(oom_pair("verified", &fmt_bytes(POOL_VERIFIED.load(Ordering::Relaxed))));
-	line.push(oom_pair("live", &fmt_bytes(POOL_LIVE.load(Ordering::Relaxed))));
 	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
 	eprintln!("{}", line.join(", "));
 	eprintln!(
@@ -214,7 +199,8 @@ pub fn ledger_report() -> String {
 		fmt_bytes(D2D_BYTES.load(Ordering::Relaxed)),
 		D2D_CALLS.load(Ordering::Relaxed),
 	);
-	let (a, f) = (ALLOC_TOTAL.load(Ordering::Relaxed), FREE_TOTAL.load(Ordering::Relaxed));
+	let a = crate::callspy::MALLOC_ASYNC.load(Ordering::Relaxed) as usize;
+	let f = FREE_TOTAL.load(Ordering::Relaxed);
 	s += &format!("  device     allocs {a}  frees {f}  live-buffers {}\n", a.saturating_sub(f));
 
 	// SAFETY: RTLD_DEFAULT + a literal NUL-terminated name is always well-defined.
@@ -288,7 +274,7 @@ pub fn alloc_count_reset() -> usize {
 /// process start. Steady-state proof for the streaming forward: identical before
 /// step 0 and after the last step ⇒ zero allocations churned in the hot loop.
 pub fn device_alloc_count() -> usize {
-	ALLOC_TOTAL.load(Ordering::Relaxed)
+	crate::callspy::MALLOC_ASYNC.load(Ordering::Relaxed) as usize
 }
 
 pub fn device_free_count() -> usize {
@@ -412,17 +398,12 @@ pub fn claim_device_arena_bytes(want: usize) -> Option<GpuBuffer> {
 
 /// Claim the process arena AND commit the run's composed init image to its front
 /// in one operation — the H2D rides the claim (no standalone upload). Sizes the
-/// ask as the LARGER of the pool's re-servable retention (an ask under the proven
-/// peak skips the growth gate — already-committed pages) or the growable headroom
-/// the gate admits; summing both would be judged fresh in full and walk back down
-/// to the headroom anyway. Returns the slab (image resident at offset 0, arena
-/// offset past it); None if even the minimum arena cannot be mapped.
+/// ask as the growable headroom (device free base minus the user's gigabyte),
+/// rounded down to a 2 MB boundary. Returns the slab (image resident at offset 0,
+/// arena offset past it); None if even the minimum arena cannot be mapped.
 pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
-	let reusable = POOL_VERIFIED
-		.load(Ordering::Relaxed)
-		.saturating_sub(POOL_LIVE.load(Ordering::Relaxed));
 	let grow = vram_free_base().saturating_sub(USER_GB);
-	claim_device_arena_bytes_with_image(reusable.max(grow) & !((1 << 21) - 1), image)
+	claim_device_arena_bytes_with_image(grow & !((1 << 21) - 1), image)
 }
 
 /// Claim exactly `want` bytes AND commit the image to the arena front in one
@@ -473,7 +454,7 @@ pub fn release_device_arena(slab: GpuBuffer) {
 	drop(slab);
 }
 
-// The previous run's backing block (arena slab, or the staged pool buffer of
+// The previous run's backing block (arena slab, or the arena backing of
 // an out-of-core run), kept alive after the run returns so the params/stat
 // views stored in the model registry stay valid for eval/save. The NEXT run's
 // entry releases it — the deferred "one free at exit" of the run lifecycle.
@@ -645,36 +626,6 @@ impl Stage {
 		self.host.is_empty()
 	}
 
-	/// One carve + ONE H2D of the composed image. The returned buffer is a carve
-	/// (non-owning) — hand out sub-views with `.view(offset, len)`. An image that
-	/// fits the pinned bounce (≤ 64 MB) moves as a single ASYNC enqueue with no
-	/// host wait — null-stream ordering makes the first dependent kernel wait for
-	/// the copy, so init incurs ZERO blocking syncs; a larger image falls back to
-	/// the chunked synced path. The ledger counts one logical H2D either way.
-	pub fn upload(self) -> Result<GpuBuffer, HipError> {
-		let buf = GpuBuffer::alloc(self.host.len().max(1))?;
-		if !self.host.is_empty() {
-			let bytes = std::mem::size_of_val(self.host.as_slice());
-			let src = self.host.as_ptr() as *const c_void;
-			unsafe {
-				if bytes <= BOUNCE_BYTES {
-					h2d_pinned_async(buf.ptr, src, bytes)?;
-				} else {
-					// Larger than the fixed bounce: stage through the run pin sized
-					// to the whole image (ONE enqueue, no chunk loop) and drain HERE —
-					// this Stage is the op that owns completion (mirrors
-					// commit_with_image). Counts one logical H2D.
-					let pin = run_pin(bytes);
-					H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
-					H2D_CALLS.fetch_add(1, Ordering::Relaxed);
-					par_copy(pin, src as *const u8, bytes);
-					dev_copy(buf.ptr, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())?;
-					crate::hip::device_synchronize()?;
-				}
-			}
-		}
-		Ok(buf)
-	}
 }
 
 // ── The three device choke points ───────────────────────────────────────────
@@ -898,28 +849,6 @@ unsafe fn h2d_pinned(
 	Ok(())
 }
 
-/// Single-chunk ASYNC H2D through the pinned bounce: fan the host image into the
-/// pin on all cores, then ONE async `dev_copy` on the null stream — NO host sync.
-/// Null-stream ordering makes the first dependent kernel wait for the copy, and
-/// the bounce is not reused until the run's exit D2H, so the init image is safe in
-/// the pin the whole time. Caller guarantees `bytes ≤ BOUNCE_BYTES`. Counts one
-/// logical H2D in the ledger (callspy sees exactly one MEMCPY_ASYNC).
-unsafe fn h2d_pinned_async(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<(), HipError> {
-	let mut guard = match BOUNCE.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
-	if *guard == 0 {
-		*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
-	}
-	let pin = *guard as *mut u8;
-	H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
-	H2D_CALLS.fetch_add(1, Ordering::Relaxed);
-	// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES ≥ bytes.
-	par_copy(pin, src as *const u8, bytes);
-	unsafe { dev_copy(dst, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut()) }
-}
-
 /// Largest image the single-enqueue async transfer paths accept; above it the
 /// caller falls back to the chunked synced path (correctness over cell-counts).
 pub const BOUNCE_LIMIT: usize = BOUNCE_BYTES;
@@ -999,23 +928,13 @@ pub(crate) fn device_init_once() {
 }
 
 
-// Bytes currently held by pool (owned) allocations, and the co-mapped total a
-// disposable child has PROVEN the system can hold alongside this process.
-static POOL_LIVE: AtomicUsize = AtomicUsize::new(0);
-static POOL_VERIFIED: AtomicUsize = AtomicUsize::new(0);
-
-/// Release the pool's slack back to the driver and reset the verified
-/// high-water to what is actually live. An out-of-core fit leaves nearly all
-/// of VRAM as freed slack; a later differently-shaped allocation storm skips
-/// the growth gate (projected < the stale high-water) yet still forces new
-/// physical maps out of the fragmented slack — the uncatchable VmHeap assert,
-/// observed at the interrupt teardown. Trim + reset makes the gate honest.
+/// Release the pool's idle slack back to the driver. An out-of-core fit leaves
+/// nearly all of VRAM as freed slack; a later differently-shaped allocation storm
+/// forces new physical maps out of the fragmented slack — the uncatchable VmHeap
+/// assert, observed at the interrupt teardown. Sync + trim hands the pages back.
 pub fn pool_trim() {
 	crate::hip::device_synchronize().expect("pool_trim sync");
 	crate::hip::trim_mempool(0).expect("pool_trim");
-	POOL_VERIFIED.store(POOL_LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-	// Post-trim pages are uncommitted, but every allocation after the reset is
-	// a growth ask (projected > verified) and gets the commit memset below.
 }
 
 /// THE reserve law: exactly 1 GB of each tier belongs to the user, always.
@@ -1034,14 +953,10 @@ pub fn vram_free_base() -> usize {
 }
 
 /// Device bytes claimable under the SAME rules the alloc gate below enforces:
-/// arena remainder, plus pool-reusable bytes (re-asks under the proven peak
-/// skip the gate), plus growable headroom (base minus the user's gigabyte).
+/// arena remainder plus growable headroom (base minus the user's gigabyte).
 /// Every "will it fit" decision consults this — never raw hipMemGetInfo.
 pub fn claimable_bytes() -> usize {
-	let reusable = POOL_VERIFIED
-		.load(Ordering::Relaxed)
-		.saturating_sub(POOL_LIVE.load(Ordering::Relaxed));
-	arena_remaining() + reusable + vram_free_base().saturating_sub(USER_GB)
+	arena_remaining() + vram_free_base().saturating_sub(USER_GB)
 }
 
 /// Hand the process its ONE pre-claimed device block: every subsequent
@@ -1224,8 +1139,8 @@ impl GpuBuffer {
 	}
 
 	/// The claim/adopt op's own mapping — the FIRST HALF of a claim op, its own
-	/// contract distinct from `alloc_bytes_inner`: the same growth-band admission
-	/// and `map_bytes`, the same ledger/POOL_LIVE/note_range bookkeeping, but NO
+	/// contract distinct from `alloc_bytes_inner`: the same headroom admission
+	/// and `map_bytes`, the same ledger/note_range bookkeeping, but NO
 	/// memset and NO drain — the claim op commits the WHOLE slab itself (one
 	/// memset + the init image + ONE drain, in `commit_with_image`). A claim can
 	/// only happen with no arena active (asserted); there is no bump-carve branch.
@@ -1242,21 +1157,13 @@ impl GpuBuffer {
 		);
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
-		let live = POOL_LIVE.load(Ordering::Relaxed);
-		let projected = live + n_bytes;
-		let fresh = projected > POOL_VERIFIED.load(Ordering::Relaxed);
-		if fresh {
-			let remaining = vram_free_base();
-			if n_bytes > remaining.saturating_sub(USER_GB) {
-				return None;
-			}
+		let remaining = vram_free_base();
+		if n_bytes > remaining.saturating_sub(USER_GB) {
+			return None;
 		}
 		let ptr = Self::map_bytes(n_bytes).ok()?;
-		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
 		tag_add(tag, n_bytes);
 		note_range(ptr as usize, n_bytes, tag);
-		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
-		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
 		Some(Self {
 			ptr,
 			len: n_bytes,
@@ -1438,7 +1345,6 @@ impl Drop for GpuBuffer {
 	fn drop(&mut self) {
 		if self.owned && !self.ptr.is_null() && !SHUTTING_DOWN.load(Ordering::Relaxed) {
 			tag_sub(self.tag, self.len);
-			POOL_LIVE.fetch_sub(self.len, Ordering::Relaxed);
 			FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
 			crate::callspy::tick(&crate::callspy::FREE_ASYNC);
 			let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };

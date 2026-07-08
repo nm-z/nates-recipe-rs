@@ -10,7 +10,7 @@ use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
 /// Device-side metric: the raw kernel reduction lands in `dst` (a 1-elem device
-/// buffer — the scratch metric scalar, or a staged metric-ring slot written in
+/// buffer — the scratch metric scalar, or a metric-ring slot written in
 /// place with no D2D). Returns the host-side (sign, div) rescale that turns the
 /// raw value into the reported metric.
 pub fn metric_gpu_into(
@@ -100,11 +100,11 @@ pub fn metric_gpu_into(
 
 /// Per-column z-score fit on the TRAIN set; store mean/std in `scaler` (reused
 /// verbatim at eval, no leakage) and return the scaled [n×d] buffer.
-/// The value the staged z-score fit's `eps` view must hold (push `[ZSCORE_EPS]`
+/// The value the z-score fit's `eps` view must hold (push `[ZSCORE_EPS]`
 /// into the run's init stage).
 pub const ZSCORE_EPS: f64 = 1e-8;
 
-/// Apply with device-resident mean/std (views of the staged image on the fit
+/// Apply with device-resident mean/std (views of the init image on the fit
 /// rerun path) — no uploads.
 pub fn zscore_apply_views(
 	xraw: &GpuBuffer,
@@ -121,9 +121,9 @@ pub fn zscore_apply_views(
 }
 
 /// One-claim z-score fit: mean/std/scaled written into caller-provided device
-/// VIEWS (reserved slots of the run's staged image), no allocation of those and
+/// VIEWS (reserved slots of the run's init image), no allocation of those and
 /// NO download. `mean`/`std` stay resident and cross to the host Scaler exactly
-/// once, in the run's single exit D2H — never at init. `eps` is a staged 1e-8
+/// once, in the run's single exit D2H — never at init. `eps` is an init-image 1e-8
 /// scalar view. Transient var/center/workspace are carved (freed with the arena).
 /// Op-for-op identical to `zscore_fit` minus the mean/std readback.
 pub fn zscore_fit_into(
@@ -147,7 +147,7 @@ pub fn zscore_fit_into(
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
 }
 
-/// One-claim z-score apply (the staged rerun path): mean/std rode the init image
+/// One-claim z-score apply (the rerun path): mean/std rode the init image
 /// in — pushed from the host Scaler the first fit derived, never re-fit — and
 /// the result lands in the reserved `out` view. The center temp is carved (freed
 /// with the arena). No uploads, no downloads.
@@ -166,7 +166,7 @@ pub fn zscore_apply_into(
 
 /// Host z-score fit, op-for-op the same math as the device `zscore_fit_into`
 /// (population mean, population variance +1e-8, sqrt, (x−mean)/std) but composed
-/// on the host so the staged init runs ZERO device zscore kernels. Returns
+/// on the host so the host-composed init runs ZERO device zscore kernels. Returns
 /// (mean[d], std[d], scaled[n·d]); the stats still ride the init image so the
 /// exit D2H hands them to the Scaler exactly as before. `x` is row-major [n×d].
 pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -199,7 +199,7 @@ pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Ve
 	(mean, std, scaled)
 }
 
-/// Host z-score apply with a fitted mean/std (the staged rerun path) — the same
+/// Host z-score apply with a fitted mean/std (the rerun path) — the same
 /// (x−mean)/std the device `zscore_apply_into` computes, on the host.
 pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64]) -> Vec<f64> {
 	let mut scaled = vec![0.0f64; n * d];

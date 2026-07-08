@@ -362,7 +362,7 @@ impl Train {
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
 		// Pool the named nodes before preflight so the remote-RAM tier counts
 		// toward the combined ceiling. A named node that can't be reached fails
-		// the run loudly here — a pooled run with a missing member is a bug.
+		// the run loudly here — a node-pooling run with a missing member is a bug.
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = self.net.as_ref().map(|net| {
 			let cs = net.connect().unwrap_or_else(|e| panic!("net: {e}"));
 			for c in &cs {
@@ -509,10 +509,10 @@ impl Train {
 		{
 			return;
 		}
-		// A staged fit already brought the trained weights home in its single exit
+		// An in-VRAM fit already brought the trained weights home in its single exit
 		// D2H and formatted them to OGDL text (the write-only save mirror) — write
 		// that verbatim, zero device transfers. `last.score` is the fit score the
-		// mirror was keyed with, so the text is consistent. A pooled run left no
+		// mirror was keyed with, so the text is consistent. An out-of-core run left no
 		// mirror; its params are resident, so dump them directly (honoring filter).
 		let mirror = model.saved_ogdl.borrow();
 		let (text, neurons) = if let Some(m) = mirror.as_ref() {
@@ -570,7 +570,7 @@ fn expand_tilde(path: &str) -> String {
 /// `*const ModelInner` into this box; the box outlives every run because the
 /// user's `Model` binding owns it until it drops.
 #[doc(hidden)]
-/// Host mirror of a staged fit's trained weights: the OGDL text (byte-identical
+/// Host mirror of an in-VRAM fit's trained weights: the OGDL text (byte-identical
 /// to a device dump) plus the neuron count for the save banner and the exact
 /// input / categorical / vocab widths the fit derived, so a forward-only read
 /// can rebuild fresh device params from it (same builder resume uses) after the
@@ -591,11 +591,11 @@ pub struct ModelInner {
 	pub(crate) scaler: RefCell<Option<Scaler>>,
 	pub(crate) yscaler: RefCell<Option<(f64, f64)>>,
 	pub(crate) fit_score: Cell<f64>,
-	// Write-only host save mirror: the staged-fit exit D2H brings the trained
+	// Write-only host save mirror: the in-VRAM-fit exit D2H brings the trained
 	// weights home once and formats them to OGDL text here (with the neuron count).
 	// `save` writes it verbatim — zero device transfers on save. Also the source a
 	// forward-only read rebuilds from once the params' arena backing is freed.
-	// `None` for a pooled (out-of-core / plotting / resume) run, whose params stay live.
+	// `None` for an out-of-core (plotting / resume) run, whose params stay live.
 	pub(crate) saved_ogdl: RefCell<Option<SavedWeights>>,
 	// Id of the parked arena backing this model's `params` views were carved from
 	// (see gpu_core::memory::live_parked_gen). `None` when the params are pool-owned
@@ -604,7 +604,7 @@ pub struct ModelInner {
 	// run freed this model's device weights, so a forward-only read rebuilds them
 	// from `saved_ogdl` before use rather than dereferencing freed memory.
 	pub(crate) arena_gen: Cell<Option<usize>>,
-	// Owns the single staged weight image that mirror-rebuilt / `Model::load` params
+	// Owns the single composed weight image that mirror-rebuilt / `Model::load` params
 	// (composed by `plan_layer_params` + `materialize`) are non-owning views into,
 	// so it outlives them. `None` until such a rebuild composes one; replaced (old
 	// image dropped) whenever the params are rebuilt again.
@@ -688,7 +688,7 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: boo
 	if forward_only {
 		return base;
 	}
-	// The in-VRAM (staged) fit z-scores on device via `zscore_fit_into`, which carves
+	// The in-VRAM fit z-scores on device via `zscore_fit_into`, which carves
 	// a center buffer (n*d_sc) and a reduce workspace that never free under the arena
 	// (carve Drop is a no-op) — bytes `vram_estimate`'s loop-resident term does not
 	// count. Budget them here (claim gate only) so a model that fits solely by that
@@ -709,7 +709,7 @@ impl ModelInner {
 	/// the params are non-owning views into the run's parked arena slab; a later
 	/// training run frees that slab. When it has (the recorded backing id no longer
 	/// matches the live parked one), rebuild fresh device params from the host weight
-	/// mirror the staged exit left behind — the same builder resume uses, so the
+	/// mirror the in-VRAM exit left behind — the same builder resume uses, so the
 	/// weights are bit-identical. Params that are pool-owned (arena_gen None) or still
 	/// backed by the live parked slab are left untouched (no re-upload).
 	pub(crate) fn ensure_params_live(&self) {
@@ -730,8 +730,8 @@ impl ModelInner {
 				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"));
 			// ONE owned image + ONE load, then materialize views into it — the same
 			// resumed weights the fit builder produced, but composed on the host
-			// and uploaded once instead of per-layer alloc+upload. `staged` is stored
-			// in `rebuild_backing` so it outlives the views.
+			// and uploaded once instead of per-layer alloc+upload. The composed image
+			// is stored in `rebuild_backing` so it outlives the views.
 			let host = plan.host();
 			let staged = GpuBuffer::alloc(host.len().max(1)).expect("rebuild staged alloc");
 			staged.load(host).expect("rebuild staged load");
@@ -969,8 +969,8 @@ mod metric_gpu_tests {
 	use std::cell::RefCell;
 	use std::sync::LazyLock;
 
-	// Local carve+load helper (the crate `upload` fn was retired for the staged
-	// one-image path); tests still need a plain owned host→device matrix.
+	// Local carve+load helper (the crate `upload` fn was removed in favor of the
+	// one-image arena path); tests still need a plain owned host→device matrix.
 	fn upload(x: &ndarray::Array2<f64>) -> (GpuBuffer, usize, usize) {
 		let s = x.as_standard_layout();
 		let sl = s.as_slice().expect("upload: non-contiguous");

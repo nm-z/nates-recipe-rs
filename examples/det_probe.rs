@@ -135,7 +135,6 @@ fn twice(name: &str, n_out: usize, mut f: impl FnMut(&GpuBuffer)) {
 
 fn main() {
 	recipe_infer::init().expect("gpu init");
-	gpu_core::memory::set_alloc_sync(true);
 
 	let x = { let __up = &host(T * NE, 7); let __ub = GpuBuffer::alloc(__up.len()).expect("x"); __ub.load(__up).expect("x"); __ub };
 	let g = { let __up = &host(NE, 11); let __ub = GpuBuffer::alloc(__up.len()).expect("g"); __ub.load(__up).expect("g"); __ub };
