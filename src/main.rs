@@ -75,26 +75,33 @@ fn main() -> Result<()> {
 	if args.len() < 2 {
 		eprintln!("usage: recipe <train.csv> [--target <col>]");
 		eprintln!("       recipe detect <path>");
+		eprintln!("       recipe serve            # discovery + RPC node on 7845");
+		eprintln!("       recipe peers            # live network view");
+		eprintln!("       recipe install          # probe + config.ogdl + systemd unit");
 		std::process::exit(1);
 	}
 
-	// recipe serve [--port N] — headless RPC node. STORE/FETCH/STAT are live as
-	// the remote-storage tier; compute runners (MOE_FFN) register into the same
-	// map once the gemma expert path is wired. No device init on a storage node.
+	// recipe serve — headless RPC + discovery node, ALWAYS on 7845 (no override).
+	// Probes this machine's device table once at start, writes + broadcasts it as
+	// this host's config.ogdl entry; peers heard append to the same registry file.
+	// STORE/FETCH/STAT are live as the remote-storage tier; compute runners
+	// (MOE_FFN) register into the same map once the gemma expert path is wired.
+	// A storage node (no GPU) probes CPU/disk only — no device is ever inited.
 	if args[1] == "serve" {
-		let mut port = recipe::wire::PORT;
-		let mut i = 2;
-		while i < args.len() {
-			if args[i] == "--port" {
-				port = args[i + 1].parse().expect("--port parse");
-				i += 2;
-			} else {
-				i += 1;
-			}
-		}
+		let machine = recipe::probe::Machine::probe()?;
 		let info = recipe::wire::NodeInfo::probe();
 		let runners = std::collections::HashMap::new();
-		recipe::wire::Server::new(info, runners).serve(&format!("0.0.0.0:{port}"))?;
+		recipe::wire::Server::new(info, runners)
+			.machine(machine)
+			.serve(&format!("0.0.0.0:{}", recipe::wire::PORT))?;
+		return Ok(());
+	}
+
+	// recipe install — probe this machine, write its config.ogdl entry, generate
+	// the systemd user unit from it, and copy the running binary to /usr/local/bin.
+	if args[1] == "install" {
+		let machine = recipe::probe::Machine::probe()?;
+		recipe::probe::install(&machine)?;
 		return Ok(());
 	}
 

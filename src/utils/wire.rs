@@ -12,6 +12,7 @@
 // Weights ride as bf16 (the on-disk format); widening to f64 happens wherever
 // the compute lands, so the wire never carries an f64 weight. All math stays f64.
 
+use crate::probe::Machine;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -224,30 +225,41 @@ fn ifaces() -> Vec<Iface> {
 struct PeerRec {
 	info: NodeInfo,
 	addrs: HashMap<String, (String, std::time::Instant)>,
+	// Last device table heard from this host; folded into config.ogdl. None
+	// until a machine-bearing beacon arrives (a pre-probe daemon, or truncated).
+	machine: Option<Machine>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, PeerRec>>>;
 
-fn beacon_loop(port: u16) {
+// The device table is MEASURED once (probe, at serve start) and rebroadcast
+// unchanged; only the lightweight NodeInfo (MemAvailable) is re-probed per
+// beacon. The machine rides as one extra newline-delimited line after the
+// NodeInfo block — an old receiver decodes NodeInfo and ignores the tail.
+fn beacon_loop(machine: Option<Arc<Machine>>) {
 	let host = hostname();
+	let mach_line = machine.as_ref().map(|m| m.beacon_encode());
 	loop {
 		let info = NodeInfo::probe();
 		for i in ifaces() {
 			let Ok(s) = std::net::UdpSocket::bind((i.ip, 0)) else { continue };
 			let _ = s.set_broadcast(true);
 			let kind = if i.wireless { "wlan" } else { "eth" };
+			let mut body =
+				format!("{host}\n{kind}\n{PORT}\n{}", String::from_utf8_lossy(&info.encode()));
+			if let Some(ml) = &mach_line {
+				body.push('\n');
+				body.push_str(ml);
+			}
 			let mut buf = BEACON_MAGIC.to_le_bytes().to_vec();
-			buf.extend_from_slice(
-				format!("{host}\n{kind}\n{port}\n{}", String::from_utf8_lossy(&info.encode()))
-					.as_bytes(),
-			);
+			buf.extend_from_slice(body.as_bytes());
 			let _ = s.send_to(&buf, (i.bcast, PORT));
 		}
 		thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
 	}
 }
 
-fn listen_loop(reg: Registry) {
+fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let sock = match std::net::UdpSocket::bind(("0.0.0.0", PORT)) {
 		Ok(s) => s,
 		Err(e) => {
@@ -255,8 +267,8 @@ fn listen_loop(reg: Registry) {
 			return;
 		}
 	};
-	let own = hostname();
-	let mut buf = [0u8; 512];
+	let me = hostname();
+	let mut buf = [0u8; 2048];
 	loop {
 		let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
 		if n < 4 || buf[0..4] != BEACON_MAGIC.to_le_bytes() {
@@ -267,18 +279,54 @@ fn listen_loop(reg: Registry) {
 		let (Some(host), Some(kind), Some(port)) = (it.next(), it.next(), it.next()) else {
 			continue;
 		};
-		if host == own || host.is_empty() {
+		if host == me || host.is_empty() {
 			continue;
 		}
-		let Ok(info) = NodeInfo::decode(it.next().unwrap_or("").as_bytes()) else { continue };
+		let rest = it.next().unwrap_or("");
+		let Ok(info) = NodeInfo::decode(rest.as_bytes()) else { continue };
+		// Machine tail: the 5th line onward (after arch/gpus/vram/ram); one line,
+		// so `nth(4)` is exactly it. Absent on a pre-probe daemon's beacon.
+		let machine = rest.splitn(5, '\n').nth(4).and_then(|ml| Machine::beacon_decode(ml).ok());
 		let addr = format!("{}:{}", from.ip(), port);
+		let mut changed = false;
 		if let Ok(mut g) = reg.lock() {
-			let rec = g
-				.entry(host.to_string())
-				.or_insert_with(|| PeerRec { info: info.clone(), addrs: HashMap::new() });
+			let rec = g.entry(host.to_string()).or_insert_with(|| PeerRec {
+				info: info.clone(),
+				addrs: HashMap::new(),
+				machine: None,
+			});
 			rec.info = info;
 			rec.addrs.insert(kind.to_string(), (addr, std::time::Instant::now()));
+			if rec.machine != machine {
+				rec.machine = machine;
+				changed = true;
+			}
 		}
+		// Detecting a new/changed machine rewrites the registry file (DHCP →
+		// /etc/hosts). Done outside the lock to avoid nesting under the rewrite.
+		if changed {
+			rewrite_config(&reg, &own);
+		}
+	}
+}
+
+// Snapshot own + every heard machine into config.ogdl (atomic). Only rates and
+// sizes we've actually measured/heard land — a peer with no machine table yet
+// contributes nothing (absence, not zeros).
+fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
+	let mut machines: Vec<Machine> = Vec::new();
+	if let Some(m) = own {
+		machines.push(m.as_ref().clone());
+	}
+	if let Ok(g) = reg.lock() {
+		for rec in g.values() {
+			if let Some(m) = &rec.machine {
+				machines.push(m.clone());
+			}
+		}
+	}
+	if let Err(e) = crate::probe::write_config_atomic(&machines) {
+		eprintln!("recipe serve: config write failed: {e}");
 	}
 }
 
@@ -469,6 +517,9 @@ pub struct Server {
 	store: Store,
 	runners: Arc<HashMap<u16, RunFn>>,
 	reg: Registry,
+	// This node's measured device table (probe). Broadcast in the beacon and
+	// written as this host's config.ogdl entry. None on a bare/test server.
+	machine: Option<Arc<Machine>>,
 }
 
 impl Server {
@@ -478,15 +529,31 @@ impl Server {
 			store: Arc::new(Mutex::new(HashMap::new())),
 			runners: Arc::new(runners),
 			reg: Arc::new(Mutex::new(HashMap::new())),
+			machine: None,
 		}
+	}
+
+	/// Attach this node's probed device table: it rides the beacon and seeds this
+	/// host's entry in config.ogdl at serve start.
+	pub fn machine(mut self, m: Machine) -> Server {
+		self.machine = Some(Arc::new(m));
+		self
 	}
 
 	pub fn serve(self, addr: &str) -> Result<()> {
 		let listener = TcpListener::bind(addr)?;
-		let port = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(PORT);
-		thread::spawn(move || beacon_loop(port));
+		let machine = self.machine.clone();
+		// Own entry lands in the registry file immediately; peers append as heard.
+		if let Some(m) = &machine {
+			if let Err(e) = crate::probe::write_config_atomic(std::slice::from_ref(m.as_ref())) {
+				eprintln!("recipe serve: config write failed: {e}");
+			}
+		}
+		let bm = machine.clone();
+		thread::spawn(move || beacon_loop(bm));
 		let reg = Arc::clone(&self.reg);
-		thread::spawn(move || listen_loop(reg));
+		let lm = machine.clone();
+		thread::spawn(move || listen_loop(reg, lm));
 		eprintln!(
 			"recipe serve: {} ({}) on {addr} (ram {} MiB)",
 			self.info.arch,

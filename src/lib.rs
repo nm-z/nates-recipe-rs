@@ -41,6 +41,8 @@ pub use pantry::data;
 pub mod dataset;
 #[path = "utils/ooc.rs"]
 pub mod ooc;
+#[path = "utils/probe.rs"]
+pub mod probe;
 #[path = "utils/wire.rs"]
 pub mod wire;
 
