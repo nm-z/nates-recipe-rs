@@ -24,9 +24,11 @@ pub use gpu_core::tiered;
 // One-claim device arena, surfaced so pantry can back the detector's forward in
 // a single memset-committed slab (bump-carves, no per-buffer pool growth — the
 // same lifecycle fit uses) rather than the flake-prone fresh-page path.
+pub use gpu_core::hip::device_synchronize;
 pub use gpu_core::memory::{
-	GpuBuffer, Stage, claim_device_arena_bytes, claim_device_arena_bytes_with_image,
-	device_arena_active, release_device_arena,
+	ExitD2H, GpuBuffer, Stage, adopt_run_backing_with_image, claim_device_arena_bytes,
+	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes,
+	device_arena_active, exit_d2h_enqueue, park_run_backing, release_device_arena,
 };
 pub use ogdl::*;
 pub use params::*;
@@ -41,6 +43,7 @@ pub fn init() -> Result<(), gpu_core::hip::HipError> {
 
 /// Release GPU resources at process exit.
 pub fn shutdown() {
+	scratch::free_pinned_pair();
 	gpu_core::kernels::gpu_shutdown();
 }
 

@@ -9,8 +9,8 @@ use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
 /// The 12 constant scalar operands every Scratch carries, in the fixed order
-/// `new_staged` reads them from its staged view — push this array verbatim
-/// into the run's init stage so the constants ride the ONE upload.
+/// `carve` reads them from its image view — push this array verbatim into the
+/// run's init stage so the constants ride the ONE upload.
 pub const SCRATCH_CONSTS: [f64; 12] = [
 	1.0,                                // c_one
 	-1.0,                               // c_neg_one
@@ -105,11 +105,10 @@ pub struct Scratch {
 	// compute kernel launches), recorded only while `timing` is set — the fit
 	// loop arms it on log epochs so non-logged epochs run untouched. One event
 	// SET per timed epoch (outer index = `timing_slot`), each L+1 events:
-	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse. The
-	// pooled path keeps a single reused slot (read+synced in-loop each log epoch);
-	// the staged path pre-allocates one slot per logged epoch, records into them
-	// transfer-free, and reads them ALL at exit (after the exit drain) so the loop
-	// itself does zero event syncs.
+	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse. A
+	// single reused slot is read+synced in-loop each log epoch; a per-epoch set of
+	// slots can instead be recorded transfer-free and read ALL at exit (after the
+	// drain) so the loop itself does zero event syncs.
 	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
 	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
 	timing: std::cell::Cell<bool>,
@@ -117,8 +116,8 @@ pub struct Scratch {
 }
 
 /// Per-layer (forward_ms, backward_ms) from an already-completed event set — no
-/// sync (the caller drained the device first, e.g. the staged exit's Scratch
-/// drop). `ev_fwd`/`ev_bwd` are one timed epoch's L+1 boundary events.
+/// sync (the caller drained the device first). `ev_fwd`/`ev_bwd` are one timed
+/// epoch's L+1 boundary events.
 pub fn layer_ms_from(
 	ev_fwd: &[gpu_core::hip::Event],
 	ev_bwd: &[gpu_core::hip::Event],
@@ -141,26 +140,19 @@ impl Scratch {
 		Self::new_inner(params, n, forward_only, false, None, 1)
 	}
 
-	/// Out-of-core companion: ONLY what the fit loop reads directly — the last
-	/// layer output (metrics/loss), metric buffers, reduce workspace, embed_grad,
-	/// streams and pinned scalars. Every big full-batch buffer is len-1; the Ooc
-	/// owns the real ones with waterfall homes.
-	pub fn new_light(params: &[LayerParams], n: usize) -> Scratch {
-		Self::new_inner(params, n, false, true, None, 1)
-	}
-
-	/// One-claim fit path: the 12 constant operands are views of `consts` (a
-	/// `SCRATCH_CONSTS`-ordered block in the run's staged init image) instead
-	/// of 12 separate uploads — the constants ride the run's ONE sync H2D.
-	/// `n_timed` pre-allocates that many per-epoch roofline event sets so the loop
-	/// records boundaries transfer-free and the exit reads them after the drain.
-	pub fn new_staged(params: &[LayerParams], n: usize, light: bool, consts: &GpuBuffer, n_timed: usize) -> Scratch {
-		Self::new_inner(params, n, false, light, Some(consts), n_timed)
+	/// THE fit scratch: the windowed engine's minimal resident set (every big
+	/// full-batch buffer len-1, the Ooc owns the real ones) with the 12 constant
+	/// operands carved as views of `consts` — a `SCRATCH_CONSTS`-ordered block in
+	/// the run's init image — so the constants ride the run's ONE sync H2D instead
+	/// of 12 separate uploads. `n_timed` pre-allocates that many per-epoch roofline
+	/// event sets. No mode flags: fit is always full-backward + windowed.
+	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> Scratch {
+		Self::new_inner(params, n, false, true, Some(consts), n_timed)
 	}
 
 	/// One-claim forward-only path (the detector): backward buffers len-1 like
-	/// `new(.., forward_only=true)`, constants as staged views like `new_staged`.
-	pub fn new_staged_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
+	/// `new(.., forward_only=true)`, constants as image views like `carve`.
+	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
 		Self::new_inner(params, n, true, false, Some(consts), 0)
 	}
 
@@ -319,7 +311,7 @@ impl Scratch {
 		} else {
 			(alloc(1, "conv_temp"), 0)
 		};
-		// Constant operands: views of the staged block when the run composed
+		// Constant operands: views of the image block when the run composed
 		// one (fit), individual uploads otherwise (eval / tests / standalone).
 		let cbuf = |i: usize| -> GpuBuffer {
 			match consts {
@@ -328,7 +320,7 @@ impl Scratch {
 					.unwrap_or_else(|e| panic!("scratch const {i}: {e:?}")),
 			}
 		};
-		let pinned_pair = gpu_core::hip::host_malloc(16, 0).expect("pinned scalars") as *mut f64;
+		let pinned_pair = pinned_scalar_pair();
 		Scratch {
 			acts,
 			preact,
@@ -408,9 +400,9 @@ impl Scratch {
 		self.timing.set(on);
 	}
 
-	/// Select which per-epoch event set the next `mark_*` calls record into (the
-	/// staged loop advances this once per logged epoch; the pooled path leaves it 0
-	/// and reuses the single set every log epoch).
+	/// Select which per-epoch event set the next `mark_*` calls record into (a
+	/// per-epoch-set caller advances this once per logged epoch; a single-slot
+	/// caller leaves it 0 and reuses the one set every log epoch).
 	pub fn set_timing_slot(&self, slot: usize) {
 		self.timing_slot.set(slot);
 	}
@@ -433,9 +425,9 @@ impl Scratch {
 	}
 
 	/// Per-layer (forward_ms, backward_ms) for the current slot. Waits on the final
-	/// boundary event (bwd[0], recorded last) — the pooled path's in-loop read at
-	/// log time. The staged path instead moves the event sets out with `take_events`
-	/// and reads them after the exit drain (no in-loop sync).
+	/// boundary event (bwd[0], recorded last) — the in-loop read at log time. A
+	/// caller can instead move the event sets out with `take_events` and read them
+	/// after an exit drain (no in-loop sync).
 	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
 		let s = self.timing_slot.get();
 		self.ev_bwd[s][0].synchronize().expect("sync bwd event");
@@ -443,8 +435,8 @@ impl Scratch {
 	}
 
 	/// Move the per-epoch timing event sets out of the Scratch so their handles
-	/// outlive the Scratch drop (whose `device_synchronize` completes them). Used
-	/// by the staged exit to read every logged epoch's roofline after the drain.
+	/// outlive the Scratch drop. Lets an exit read every logged epoch's roofline
+	/// after its own drain.
 	pub fn take_events(&mut self) -> (Vec<Vec<gpu_core::hip::Event>>, Vec<Vec<gpu_core::hip::Event>>) {
 		(std::mem::take(&mut self.ev_fwd), std::mem::take(&mut self.ev_bwd))
 	}
@@ -505,17 +497,61 @@ impl Scratch {
 
 impl Drop for Scratch {
 	fn drop(&mut self) {
-		// Drain all in-flight GPU work BEFORE any buffer field is hipFreeAsync'd:
-		// rocBLAS GEMMs that fall back to their own stream can still be running when
-		// this Scratch's acts/scratch buffers free, racing → "Memory access fault /
-		// GPU Hang" at the phase boundary. One sync here covers every phase
-		// (fit / score / eval / inference). Cheap — only at jawn transitions.
-		let _ = gpu_core::hip::device_synchronize();
-		// pinned_scalar is the base of the shared 16-byte pinned pair (b is base+1):
-		// one free releases both.
-		if !self.pinned_scalar.is_null() {
-			let _ = unsafe { gpu_core::hip::host_free(self.pinned_scalar as *mut std::ffi::c_void) };
+		// Drain in-flight GPU work BEFORE any POOL-OWNED buffer field is
+		// hipFreeAsync'd: a GEMM on its own stream can still be running when an
+		// owned buffer frees, racing → "Memory access fault / GPU Hang" at the
+		// phase boundary. Carved buffers (arena bump-carves + the const/window
+		// views) own nothing and free nothing, so a Scratch made entirely of
+		// carves has no free to race — drain only when at least one field is
+		// pool-owned. The drain covers every phase (fit / score / eval / infer).
+		let owned_any = self.acts.iter().any(GpuBuffer::is_pool_owned)
+			|| self.preact.iter().any(GpuBuffer::is_pool_owned)
+			|| [
+				&self.da_a, &self.da_b, &self.dz, &self.dw, &self.dw_partials, &self.db,
+				&self.metric_t0, &self.metric_t1, &self.metric_t2,
+				&self.metric_scalar, &self.metric_scalar_b,
+				&self.c_one, &self.c_neg_one, &self.c_half, &self.c_eps, &self.c_one_minus_eps,
+				&self.c_leaky_alpha, &self.c_elu_alpha, &self.c_selu_alpha, &self.c_selu_lambda,
+				&self.c_focal_gamma, &self.c_focal_alpha, &self.c_rope_theta,
+				&self.reduce_ws, &self.embed_grad,
+				&self.a_q, &self.a_k, &self.a_v, &self.a_ctx, &self.a_lse,
+				&self.a_dctx, &self.a_dq, &self.a_dk, &self.a_dv, &self.a_dsum,
+				&self.a_gw, &self.a_dbias,
+				&self.prelu_t0, &self.prelu_t1, &self.prelu_scalar,
+				&self.concat, &self.concat_dgrad, &self.conv_temp,
+			]
+			.iter()
+			.any(|b| b.is_pool_owned());
+		if owned_any {
+			let _ = gpu_core::hip::device_synchronize();
 		}
+		// pinned_scalar points into the process-static pinned pair — never freed
+		// here (one host_malloc per process, reused by every Scratch).
+	}
+}
+
+// The 16-byte pinned scalar pair every Scratch shares: allocated once per
+// process on first use, reused forever — a per-run host_malloc/host_free would
+// tick the run's init alloc for a pin whose lifetime is really the process.
+static PINNED_PAIR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+fn pinned_scalar_pair() -> *mut f64 {
+	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
+	if *g == 0 {
+		*g = gpu_core::hip::host_malloc(16, 0).expect("pinned scalars") as usize;
+	}
+	*g as *mut f64
+}
+
+/// Release the process-static pinned pair at shutdown (exit frees ALL RAM
+/// explicitly, never by process teardown). Drain first: a not-yet-retired
+/// deferred scalar copy into the pair would read freed host pages.
+pub fn free_pinned_pair() {
+	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
+	if *g != 0 {
+		let _ = gpu_core::hip::device_synchronize();
+		let _ = unsafe { gpu_core::hip::host_free(*g as *mut std::ffi::c_void) };
+		*g = 0;
 	}
 }
 

@@ -360,28 +360,78 @@ fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
 	ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
 }
 
+/// Bump-carve the run's init-image prefix off the arena FRONT (kernel-clean,
+/// ledgered "weights") so every later scratch carve lands past it. No HIP call —
+/// the image bytes themselves are written into the arena base by the owning
+/// claim/adopt op's `commit_with_image`; this only advances the offset. The carve
+/// is non-owning (dropping it is a no-op), so the reservation persists.
+fn carve_image_front(image: &[f64]) {
+	if image.is_empty() {
+		return;
+	}
+	let _t = tag_scope("weights");
+	let _img = GpuBuffer::alloc(image.len()).expect("arena image carve");
+}
+
+/// The ONE blocking drain of a claim/adopt op: zero the WHOLE slab, then (if the
+/// run has a composed init image) stage it through the run pin and enqueue ONE
+/// H2D into the arena base, then EXACTLY ONE device drain. Null-stream ordering
+/// serializes the memset before the image copy; the drain lets the KFD page-table
+/// update settle before the first kernel touches the slab. This is the claim op's
+/// sole `hipDeviceSynchronize` — the map (`claim_map_bytes`) does none.
+fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<(), HipError> {
+	// SAFETY: base spans `size` bytes (the just-mapped slab).
+	unsafe { memset_dev(base, 0, size, std::ptr::null_mut())? };
+	if !image.is_empty() {
+		let bytes = std::mem::size_of_val(image);
+		H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+		H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+		// The pin is image-sized, so ONE enqueue moves any size (no chunk loop).
+		let pin = run_pin(bytes);
+		par_copy(pin, image.as_ptr() as *const u8, bytes);
+		// SAFETY: pin spans `bytes`; base spans `size` >= bytes; null-stream ordered
+		// after the memset above.
+		unsafe { dev_copy(base, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())? };
+	}
+	crate::hip::device_synchronize()
+}
+
 /// The run's ONE claim: everything the driver reports free minus the user's
 /// gigabyte, memset-committed and registered as the process device arena.
 /// Every later `GpuBuffer` allocation bump-carves from it (non-owning, zero
 /// pool traffic) until `release_device_arena` — init → one claim, exit → one
 /// free. Returns None when even 1 MB cannot be mapped.
 pub fn claim_device_arena() -> Option<GpuBuffer> {
-	// Never size from raw free (the waterfall invariant): after a freed backing
-	// its bytes may sit as retained pool slack, which vram_free_base subtracts —
-	// free alone would ask ~0 and silently demote every following staged run to
-	// pooled. Ask the LARGER of the pool's re-servable retention (an ask under
-	// the proven peak skips the growth gate entirely — already-committed pages)
-	// or the growable headroom the gate admits; summing both in one ask would
-	// only be judged fresh in full and walk back down to the headroom anyway.
+	claim_device_arena_with_image(&[])
+}
+
+/// Claim exactly `want` bytes (walking down 1/16 per refusal, waterfall-style).
+pub fn claim_device_arena_bytes(want: usize) -> Option<GpuBuffer> {
+	claim_device_arena_bytes_with_image(want, &[])
+}
+
+/// Claim the process arena AND commit the run's composed init image to its front
+/// in one operation — the H2D rides the claim (no standalone upload). Sizes the
+/// ask as the LARGER of the pool's re-servable retention (an ask under the proven
+/// peak skips the growth gate — already-committed pages) or the growable headroom
+/// the gate admits; summing both would be judged fresh in full and walk back down
+/// to the headroom anyway. Returns the slab (image resident at offset 0, arena
+/// offset past it); None if even the minimum arena cannot be mapped.
+pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
 	let reusable = POOL_VERIFIED
 		.load(Ordering::Relaxed)
 		.saturating_sub(POOL_LIVE.load(Ordering::Relaxed));
 	let grow = vram_free_base().saturating_sub(USER_GB);
-	claim_device_arena_bytes(reusable.max(grow) & !((1 << 21) - 1))
+	claim_device_arena_bytes_with_image(reusable.max(grow) & !((1 << 21) - 1), image)
 }
 
-/// Claim exactly `want` bytes (walking down 1/16 per refusal, waterfall-style).
-pub fn claim_device_arena_bytes(mut want: usize) -> Option<GpuBuffer> {
+/// Claim exactly `want` bytes AND commit the image to the arena front in one
+/// operation (the detector's sized claim + fused init image). The map
+/// (`claim_map_bytes`, no drain) walks `want` down 1/16 per refusal; on success
+/// the arena is registered, the image prefix is bump-carved, and `commit_with_image`
+/// does the op's single memset+image+drain. Returns the slab (image resident at
+/// offset 0); None if even 1 MB cannot be mapped.
+pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Option<GpuBuffer> {
 	assert_eq!(
 		ARENA_BASE.load(Ordering::Relaxed),
 		0,
@@ -389,53 +439,17 @@ pub fn claim_device_arena_bytes(mut want: usize) -> Option<GpuBuffer> {
 	);
 	let _t = tag_scope("unclaimed");
 	while want > (1 << 20) {
-		match GpuBuffer::try_alloc_bytes(want) {
+		match GpuBuffer::claim_map_bytes(want) {
 			Some(slab) => {
 				set_device_arena(slab.ptr_raw(), want);
+				carve_image_front(image);
+				commit_with_image(slab.ptr_raw(), want, image).expect("claim commit");
 				return Some(slab);
 			}
 			None => want -= want / 16,
 		}
 	}
 	None
-}
-
-/// Carve the run's staged init image off the FRONT of the just-claimed/adopted
-/// arena and upload it — the H2D that used to be a standalone `Stage::upload` now
-/// rides the claim/adopt operation. The carve bumps the arena offset past the
-/// image (kernel-clean, ledgered as "weights") so every later scratch carve lands
-/// after it; the image lives at the arena base, so `slab.view(off, len)` addresses
-/// any block. Blocking H2D through the pinned bounce (inside the claim window, not
-/// the fit loop — the AllocGuard is not yet armed).
-fn upload_arena_front(image: &[f64]) {
-	if image.is_empty() {
-		return;
-	}
-	let _t = tag_scope("weights");
-	let img = GpuBuffer::alloc(image.len()).expect("arena image carve");
-	let bytes = std::mem::size_of_val(image);
-	// SAFETY: img spans image.len() f64s at the arena front; image spans `bytes`.
-	unsafe { xfer_sync(img.ptr, image.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }
-		.expect("arena image H2D");
-}
-
-/// Claim the process arena AND upload the run's composed init image to its front
-/// in one operation — the H2D rides the claim (no standalone upload). Returns the
-/// slab (image resident at offset 0, arena offset past it); None if even the
-/// minimum arena cannot be mapped.
-pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
-	let slab = claim_device_arena()?;
-	upload_arena_front(image);
-	Some(slab)
-}
-
-/// Claim exactly `want` bytes AND upload the image to the arena front in one
-/// operation (the detector's sized claim + fused init image — the H2D rides the
-/// claim). Returns the slab (image resident at offset 0); None if refused.
-pub fn claim_device_arena_bytes_with_image(want: usize, image: &[f64]) -> Option<GpuBuffer> {
-	let slab = claim_device_arena_bytes(want)?;
-	upload_arena_front(image);
-	Some(slab)
 }
 
 /// The run's ONE free: drain the device (no carve may be in flight), unregister
@@ -492,18 +506,17 @@ pub fn live_parked_gen() -> Option<usize> {
 	(g != 0).then_some(g)
 }
 
-/// Re-arm the previous run's parked backing as THIS run's arena when it can
-/// hold `need` bytes: no free, no realloc, no unmap — the freeAsync lazy-unmap
-/// / VA-reuse race and the post-free counter depression (driver still counting
-/// the freed slab, refusing even 8-byte growth) structurally cannot fire. The
-/// prior run's carve ledger is swept, the bump pointer rewound, and the pages
-/// re-zeroed with one memset so carves see exactly the fresh-claim contents
-/// (accumulator carves rely on the claim-time zero fill). Prior params carved
-/// from the slab are invalidated via the park generation — their models
-/// rebuild from the host weight mirror. Returns None when nothing is parked
-/// (first run: caller claims fresh) or the parked slab is too small / not the
-/// registered arena (released here; caller claims fresh).
-pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
+/// Take the parked backing and re-arm it as THIS run's arena when it can hold
+/// `need` bytes: no free, no realloc, no unmap — the freeAsync lazy-unmap /
+/// VA-reuse race and the post-free counter depression (driver still counting the
+/// freed slab, refusing even 8-byte growth) structurally cannot fire. The prior
+/// run's carve ledger is swept and the bump pointer rewound. NO memset, NO drain
+/// here — the caller's `commit_with_image` does the op's single memset+image+drain
+/// (accumulator carves rely on the claim-time zero fill). Returns None when
+/// nothing is parked (first run: caller claims fresh) or the parked slab is too
+/// small / not the registered arena (released here, keeping its existing syncs;
+/// caller claims fresh).
+fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
 	let parked = match PARKED.lock() {
 		Ok(mut g) => g.take(),
 		Err(p) => p.into_inner().take(),
@@ -528,18 +541,27 @@ pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
 	}
 	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
 	ARENA_OFFSET.store(0, Ordering::Relaxed);
-	parked.memset_zero(parked.len()).expect("adopt commit memset");
-	crate::hip::device_synchronize().expect("adopt commit sync");
 	Some(parked)
 }
 
-/// Adopt the parked backing AND upload the run's composed init image to its front
-/// in one operation — the H2D rides the adopt (no standalone upload). Returns the
-/// re-armed slab (image resident at offset 0); None when nothing is parked or the
-/// parked slab is too small (caller claims fresh with the image).
+/// Re-arm the previous run's parked backing as THIS run's arena (no image): the
+/// inner take/validate/rewind, then `commit_with_image` re-zeroes the whole slab
+/// with the op's single memset + drain. Prior params carved from the slab are
+/// invalidated via the park generation — their models rebuild from the host
+/// weight mirror. None when nothing is parked or the slab is too small.
+pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
+	adopt_run_backing_with_image(need, &[])
+}
+
+/// Adopt the parked backing AND commit the run's composed init image to its front
+/// in one operation — the H2D rides the adopt (no standalone upload). ONE drain
+/// total (`commit_with_image`). Returns the re-armed slab (image resident at
+/// offset 0); None when nothing is parked or the parked slab is too small (caller
+/// claims fresh with the image).
 pub fn adopt_run_backing_with_image(need: usize, image: &[f64]) -> Option<GpuBuffer> {
-	let slab = adopt_run_backing(need)?;
-	upload_arena_front(image);
+	let slab = adopt_run_backing_inner(need)?;
+	carve_image_front(image);
+	commit_with_image(slab.ptr_raw(), slab.len(), image).expect("adopt commit");
 	Some(slab)
 }
 
@@ -742,6 +764,37 @@ pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 const BOUNCE_BYTES: usize = 64 << 20;
 static BOUNCE: Mutex<usize> = Mutex::new(0);
 
+/// Right-sized pinned staging owned by the claim/adopt ops: the init-image H2D
+/// (`commit_with_image`) and the exit prefix D2H (`exit_d2h_enqueue`) ride it,
+/// replacing the fixed 64 MB BOUNCE for those two op paths. (ptr, bytes) — grows
+/// to fit the largest image/prefix asked, never shrinks; freed at shutdown.
+static RUN_PIN: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+/// Grow the (already-locked) run pin to hold at least `bytes` and return its
+/// base. The old pin is host-freed before the larger one is allocated, so at most
+/// one pin is live. host_malloc/host_free tick HOST_MALLOC/HOST_FREE (wanted).
+fn pin_ensure(g: &mut (usize, usize), bytes: usize) -> *mut u8 {
+	if g.1 < bytes {
+		if g.0 != 0 {
+			let _ = unsafe { crate::hip::host_free(g.0 as *mut c_void) };
+		}
+		g.0 = crate::hip::host_malloc(bytes, 0).expect("run_pin host_malloc") as usize;
+		g.1 = bytes;
+	}
+	g.0 as *mut u8
+}
+
+/// Run pin base sized to at least `bytes` (grows on demand). Used by
+/// `commit_with_image`, which drains before returning — the lock need not be held
+/// across the copy. `exit_d2h_enqueue` instead holds the guard in its handle.
+fn run_pin(bytes: usize) -> *mut u8 {
+	let mut g = match RUN_PIN.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	pin_ensure(&mut g, bytes)
+}
+
 /// Pinned bounce arena [base, base+len) if allocated — the fault autopsy names
 /// a faulting VA that lands inside it.
 pub(crate) fn bounce_range() -> Option<(usize, usize)> {
@@ -783,6 +836,21 @@ pub(crate) fn free_bounce() {
 	if *guard != 0 {
 		let _ = unsafe { crate::hip::host_free(*guard as *mut c_void) };
 		*guard = 0;
+	}
+}
+
+/// Explicitly release the run pin at shutdown — the companion of `free_bounce`
+/// (the claim/adopt ops' staging vs. the generic bounce). Drain first: an
+/// in-flight async copy touching the pin would read freed host pages.
+pub(crate) fn free_run_pin() {
+	let mut guard = match RUN_PIN.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if guard.0 != 0 {
+		let _ = crate::hip::device_synchronize();
+		let _ = unsafe { crate::hip::host_free(guard.0 as *mut c_void) };
+		*guard = (0, 0);
 	}
 }
 
@@ -848,43 +916,40 @@ unsafe fn h2d_pinned_async(dst: *mut c_void, src: *const c_void, bytes: usize) -
 pub const BOUNCE_LIMIT: usize = BOUNCE_BYTES;
 
 /// In-flight handle for the exit's two-phase D2H: the device→pin copy is already
-/// enqueued (async, no wait) and the bounce lock is held so nothing else can
+/// enqueued (async, no wait) and the run-pin lock is held so nothing else can
 /// reuse the pin. The caller drains the device by OTHER means — the Scratch
 /// drop's mandated `device_synchronize` — then calls `finish` to fan the pin
 /// into the host buffer on all cores. One enqueue, zero dedicated waits.
 pub struct ExitD2H {
-	_guard: std::sync::MutexGuard<'static, usize>,
+	_guard: std::sync::MutexGuard<'static, (usize, usize)>,
 	pin: usize,
 	bytes: usize,
 }
 
 impl ExitD2H {
 	/// Fan the (already-drained) pin into `dst`. Call ONLY after the device has
-	/// been synchronized so the enqueued copy is complete; releases the bounce lock.
+	/// been synchronized so the enqueued copy is complete; releases the pin lock.
 	pub fn finish(self, dst: &mut [f64]) {
 		assert_eq!(std::mem::size_of_val(dst), self.bytes, "ExitD2H::finish size mismatch");
-		// SAFETY: pin spans BOUNCE_BYTES ≥ bytes; dst spans `bytes`; copy is complete.
+		// SAFETY: pin spans >= bytes; dst spans `bytes`; copy is complete.
 		par_copy(dst.as_mut_ptr() as *mut u8, self.pin as *const u8, self.bytes);
 	}
 }
 
-/// Phase 1 of the blocking-free exit D2H: enqueue the device→pin copy on the null
-/// stream (async, counted as one logical D2H) and hold the bounce lock. Single
-/// chunk only (`bytes ≤ BOUNCE_BYTES`). The returned handle's `finish` completes
-/// the transfer host-side after the caller's own device drain.
+/// Phase 1 of the blocking-free exit D2H: grow the run pin to fit, enqueue the
+/// device→pin copy on the null stream (async, counted as one logical D2H) and
+/// hold the pin lock in the returned handle. Any size — the pin grows to `bytes`,
+/// so one enqueue moves it. The handle's `finish` completes the transfer
+/// host-side after the caller's own device drain.
 pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD2H, HipError> {
-	assert!(bytes <= BOUNCE_BYTES, "exit_d2h_enqueue: {bytes} exceeds bounce");
-	let mut guard = match BOUNCE.lock() {
+	let mut guard = match RUN_PIN.lock() {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	if *guard == 0 {
-		*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
-	}
-	let pin = *guard as *mut u8;
+	let pin = pin_ensure(&mut guard, bytes);
 	D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
 	D2H_CALLS.fetch_add(1, Ordering::Relaxed);
-	// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES ≥ bytes.
+	// SAFETY: caller guarantees src spans `bytes`; pin spans >= bytes.
 	unsafe { dev_copy(pin as *mut c_void, src, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
 	Ok(ExitD2H { _guard: guard, pin: pin as usize, bytes })
 }
@@ -974,70 +1039,22 @@ pub(crate) unsafe fn memset_sync(dst: *mut c_void, value: i32, bytes: usize) -> 
 
 static POOL_INIT: std::sync::Once = std::sync::Once::new();
 
-thread_local! {
-	// Set only on the thread currently running the warm, so its own re-entrant
-	// 1 GiB alloc skips the warm. Other threads must NOT skip — they block in
-	// call_once until the warm finishes, then allocate from a warmed pool.
-	static WARMING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Warm the stream-ordered pool exactly once — on the first allocation of the
-/// process, or when `init()` calls `retain_mempool`, whichever comes first. Pins
-/// the pool's release threshold and force-commits a chunk so that async device
-/// copies (the only copy primitive now) never touch an uncommitted page and
-/// fault "page not present". Re-entrant-safe: the warm's own 1 GiB alloc re-enters
-/// `alloc_bytes` → here, but the thread-local WARMING guard short-circuits it.
-/// Retires only when the one-claim arena lifecycle replaces pool growth per-run.
+/// One-time pool setup on the first allocation of the process: SDMA off,
+/// release threshold pinned, fault autopsy + thrash watchdog registered. The
+/// old 1 GiB warm is gone — the run's arena claim is larger and commits its own
+/// pages (memset + drain inside the claim op), so pre-touching the pool would
+/// only shrink the claim (the no-warmup invariant).
 pub(crate) fn ensure_pool_init() {
-	if POOL_INIT.is_completed() || WARMING.with(|w| w.get()) {
-		return;
-	}
 	POOL_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
-		// RECIPE_SKIP_POOL_WARM: per-process env form of skip_pool_warm() for
-		// single-test suite children (SUITE SPEC R9) — one test per process has
-		// no cross-thread first-touch storm to serialize.
-		if WARM_SKIP.load(Ordering::Relaxed)
-			|| std::env::var_os("RECIPE_SKIP_POOL_WARM").is_some()
-		{
-			return;
+		if let Err(e) = crate::hip::set_pool_retain(0) {
+			eprintln!("GPU pool retain failed: {e}");
 		}
-		WARMING.with(|w| w.set(true));
-		if let Err(e) = crate::hip::set_pool_retain(0).and_then(|_| warm_pool()) {
-			eprintln!("GPU pool warm failed: {e}");
-		}
-		WARMING.with(|w| w.set(false));
-		// HSA is up by now (the warm's HIP calls initialized it) — register the
-		// GPU memory-fault autopsy and the KFD thrash watchdog here so EVERY
-		// GPU process gets them, not just callers of set_device.
 		crate::hip::register_fault_autopsy_once();
 		crate::hw::spawn_thrash_watchdog();
 	});
 }
 
-static WARM_SKIP: AtomicBool = AtomicBool::new(false);
-
-/// One-claim lifecycle mode (the waterfall claim is the process's ONLY pool
-/// allocation): skip the churn-protection warm — there is no churn to protect,
-/// and the retained warm gigabyte would just shrink the claim.
-pub fn skip_pool_warm() {
-	WARM_SKIP.store(true, Ordering::Relaxed);
-}
-
-pub(crate) fn warm_pool() -> Result<(), HipError> {
-	let _t = tag_scope("warmup");
-	let warm: usize = 1usize << 30; // 1 GiB
-	let buf = GpuBuffer::alloc_bytes(warm)?;
-	buf.memset_zero(warm)?;
-	crate::hip::device_synchronize()?;
-	// Retained for process lifetime. Freeing here (even behind a device sync)
-	// re-opens the freeAsync VA-reuse race at setup: the next allocation gets
-	// this VA back while the driver-side unmap is still in flight and faults
-	// page-not-present on a VA in no recorded allocation — the ~50% first-init
-	// flake (diffusion test, LLM fit setups). No frees mid-run, warm included.
-	std::mem::forget(buf);
-	Ok(())
-}
 
 // Bytes currently held by pool (owned) allocations, and the co-mapped total a
 // disposable child has PROVEN the system can hold alongside this process.
@@ -1156,25 +1173,48 @@ impl GpuBuffer {
 		}
 	}
 
+	pub fn is_pool_owned(&self) -> bool { self.owned }
+
 	pub fn alloc(n_floats: usize) -> Result<Self, HipError> {
 		Self::alloc_bytes(n_floats * std::mem::size_of::<f64>())
 	}
 
 	/// Waterfall probe: allocate or quietly refuse. A `None` is the "VRAM is
 	/// full" signal the waterfall fills against — no autopsy spam, no error.
-	/// Routes through the same single `hipMallocAsync` site as `alloc_bytes`.
+	/// Routes through the same single `hipMallocAsync` site as `alloc_bytes`;
+	/// quiet by construction (`alloc_bytes_inner` never reports).
 	pub fn try_alloc_bytes(n_bytes: usize) -> Option<Self> {
-		match Self::alloc_bytes_inner(n_bytes, true) {
-			Ok(buf) => Some(buf),
-			Err(_) => None,
+		Self::alloc_bytes_inner(n_bytes).ok()
+	}
+
+	/// The loud hand-out: on refusal, print the VRAM autopsy before returning the
+	/// error. `alloc_bytes_inner` stays silent so `try_alloc_bytes` (the waterfall
+	/// probe) does not spam — the report lives in this wrapper alone.
+	pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
+		match Self::alloc_bytes_inner(n_bytes) {
+			Ok(buf) => Ok(buf),
+			Err(e) => {
+				oom_report(n_bytes);
+				Err(e)
+			}
 		}
 	}
 
-	pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
-		Self::alloc_bytes_inner(n_bytes, false)
+	/// THE single `hipMallocAsync` call site: tick, map, check. Nothing else —
+	/// no commit, no ledger, no admission. Both the pool hand-out
+	/// (`alloc_bytes_inner`) and the claim op's mapping (`claim_map_bytes`) funnel
+	/// their one map through here.
+	fn map_bytes(n_bytes: usize) -> Result<*mut c_void, HipError> {
+		let mut ptr: *mut c_void = std::ptr::null_mut();
+		crate::callspy::tick(&crate::callspy::MALLOC_ASYNC);
+		check(unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) })?;
+		Ok(ptr)
 	}
 
-	fn alloc_bytes_inner(n_bytes: usize, quiet_oom: bool) -> Result<Self, HipError> {
+	/// The pool hand-out: arena bump-carve if a claim is active, else a growth-band
+	/// admitted map committed with a memset + drain. Refuses SILENTLY (the loud
+	/// `alloc_bytes` wrapper reports); every non-claim device buffer is born here.
+	fn alloc_bytes_inner(n_bytes: usize) -> Result<Self, HipError> {
 		ensure_pool_init();
 		ALLOC_FROZEN.with(|f| {
 			assert!(
@@ -1214,41 +1254,22 @@ impl GpuBuffer {
 			}
 		}
 		// Growing the pool past what has been PROVEN co-mappable risks the
-		// driver's uncatchable VmHeap::MapPhysMemory assert. Two regimes, two
-		// checks, both required before the map is attempted:
-		//   1. Counters (heavy-parent regime): the growth cannot exceed
-		//      min(hip_free, sysfs_free) − pool_slack. A fresh probe process
-		//      would pass here anyway — its mapping gets eviction-assisted —
-		//      so counters, not a probe, are the honest signal once this
-		//      process is the one holding the card.
-		//   2. Probe (fresh/light regime): counters over-report near the
-		//      ceiling for big asks, so a disposable child takes the assert
-		//      risk and its exit status is the verdict.
-		// Re-asks under the proven peak skip both — the pool never shrinks
-		// mid-run (retain threshold = max), so no new mapping is needed.
+		// driver's uncatchable VmHeap::MapPhysMemory assert. The growth cannot
+		// exceed min(hip_free, sysfs_free) − pool_slack − the user's gigabyte
+		// (which also covers the counters' over-report of the true ceiling,
+		// observed well under 1 GB). Re-asks under the proven peak skip the band —
+		// the pool never shrinks mid-run (retain threshold = max), so no new
+		// mapping is needed.
 		let live = POOL_LIVE.load(Ordering::Relaxed);
 		let projected = live + n_bytes;
 		let fresh = projected > POOL_VERIFIED.load(Ordering::Relaxed);
 		if fresh {
 			let remaining = vram_free_base();
-			// THE law: 1 GB of VRAM belongs to the user, always. Growth is
-			// refused inside that band — which also covers the counters'
-			// over-report of the true VmHeap ceiling (observed well under
-			// 1 GB), so no per-ask probe children, no ratios, no guesses.
 			if n_bytes > remaining.saturating_sub(USER_GB) {
-				if !quiet_oom {
-					oom_report(n_bytes);
-				}
 				return Err(HipError(2));
 			}
 		}
-		let mut ptr: *mut c_void = std::ptr::null_mut();
-		crate::callspy::tick(&crate::callspy::MALLOC_ASYNC);
-		let code = unsafe { hipMallocAsync(&mut ptr, n_bytes, std::ptr::null_mut()) };
-		if code == 2 && !quiet_oom {
-			oom_report(n_bytes);
-		}
-		check(code)?;
+		let ptr = Self::map_bytes(n_bytes)?;
 		// EVERY pool hand-out gets a commit memset + device drain — growth AND
 		// reuse. Growth returns uncommitted pages (blit H2D into one is a
 		// gfxhub fault, kernel reads see stale zeros). Reuse is NOT safe
@@ -1272,6 +1293,48 @@ impl GpuBuffer {
 		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
 		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
 		Ok(Self {
+			ptr,
+			len: n_bytes,
+			owned: true,
+			tag,
+		})
+	}
+
+	/// The claim/adopt op's own mapping — the FIRST HALF of a claim op, its own
+	/// contract distinct from `alloc_bytes_inner`: the same growth-band admission
+	/// and `map_bytes`, the same ledger/POOL_LIVE/note_range bookkeeping, but NO
+	/// memset and NO drain — the claim op commits the WHOLE slab itself (one
+	/// memset + the init image + ONE drain, in `commit_with_image`). A claim can
+	/// only happen with no arena active (asserted); there is no bump-carve branch.
+	/// Refuses SILENTLY (the claim walks `want` down 1/16 on `None`).
+	pub(crate) fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
+		ensure_pool_init();
+		ALLOC_FROZEN.with(|f| {
+			assert!(!f.get(), "GPU claim inside frozen training loop (requested {n_bytes} bytes)")
+		});
+		assert_eq!(
+			ARENA_BASE.load(Ordering::Relaxed),
+			0,
+			"claim_map_bytes: a device arena is already active"
+		);
+		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+		let tag = CURRENT_TAG.with(|t| t.get());
+		let live = POOL_LIVE.load(Ordering::Relaxed);
+		let projected = live + n_bytes;
+		let fresh = projected > POOL_VERIFIED.load(Ordering::Relaxed);
+		if fresh {
+			let remaining = vram_free_base();
+			if n_bytes > remaining.saturating_sub(USER_GB) {
+				return None;
+			}
+		}
+		let ptr = Self::map_bytes(n_bytes).ok()?;
+		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
+		tag_add(tag, n_bytes);
+		note_range(ptr as usize, n_bytes, tag);
+		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
+		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
+		Some(Self {
 			ptr,
 			len: n_bytes,
 			owned: true,

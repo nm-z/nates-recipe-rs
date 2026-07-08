@@ -384,20 +384,14 @@ impl Train {
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
-			// One-claim arena, adopt-first — now OWNED by `fit_staged` (the compose →
-			// claim-with-image → park lifecycle): a staged-eligible run composes its init
-			// image and claims/adopts the arena WITH it (the training H2D rides the claim
-			// op, not a standalone upload) then parks the slab at exit (the prefix D2H
-			// rides the park op). Adopt re-arms the prior run's parked slab (sweep +
-			// rewind + one memset — no free/realloc, so the freeAsync VA-reuse race can't
-			// fire); the slab stays PARKED past run() for scoring/save/eval. run() only
-			// releases the prior park for an INELIGIBLE (pooled) run — a staged run must
-			// keep it so fit_staged can adopt it. A refused claim inside fit_staged prints
-			// its own demotion and falls through to the pooled path.
-			let eligible = model.staged_eligible(self);
-			if !eligible {
-				gpu_core::memory::release_run_backing();
-			}
+			// One-claim arena, adopt-first — OWNED by `fit` (the compose →
+			// claim-with-image → park lifecycle): the run composes its init image and
+			// claims/adopts the arena WITH it (the training H2D rides the claim op, not
+			// a standalone upload) then parks the slab at exit (the prefix D2H rides the
+			// park op). Adopt re-arms the prior run's parked slab (sweep + rewind + one
+			// memset — no free/realloc, so the freeAsync VA-reuse race can't fire); the
+			// slab stays PARKED past run() for scoring/save/eval, and the next run adopts
+			// it. Params are rebuilt from the host mirror when the park generation moved.
 			// pre-fit block: sync-class ops between run entry and fit — the detector's
 			// claim + release during data prep. The training claim/adopt (with its H2D)
 			// and the park (with its D2H) ride INSIDE fit's own init/exit blocks now.
@@ -415,16 +409,15 @@ impl Train {
 			// invariant under the affine target scaling, so the z-scored-target score
 			// equals the raw-scale one.
 			let score = model.fit_score.get();
-			// post-fit block: fit already parked (staged) or freed/trimmed (pooled) its
-			// backing, so this window carries only a pooled fit's pool_trim (empty for
-			// a staged run — its park/D2H rode fit's exit block).
+			// post-fit block: empty — fit parked its backing inside its own exit
+			// block (the park's D2H rode that op), so no sync-class ops land here.
 			if let Some(p) = post_fit.as_ref() {
 				eprint!("── run post-fit ──\n{}", gpu_core::callspy::report_since(p));
 			}
-			// Record which parked backing this run's params view is carved from (None
-			// when nothing was parked — a pooled out-of-core run keeps pool-owned
-			// params). A later run that frees this backing is then detectable, so a
-			// forward-only read rebuilds the weights instead of faulting.
+			// Record the parked-backing generation this run's params view is carved
+			// from; the next run adopts this same parked slab. A later park-generation
+			// move is then detectable, so a forward-only read rebuilds the weights from
+			// the host mirror instead of faulting.
 			model.arena_gen.set(gpu_core::memory::live_parked_gen());
 			let mut last = self.last.borrow_mut();
 			last.model = model as *const ModelInner;
@@ -695,7 +688,7 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: boo
 	// (carve Drop is a no-op) — bytes `vram_estimate`'s loop-resident term does not
 	// count. Budget them here (claim gate only) so a model that fits solely by that
 	// slack goes out-of-core cleanly instead of overflowing the arena mid-run. d_sc
-	// mirrors fit_staged's z-score width: categorical branch for an embed model, the
+	// mirrors fit's z-score width: categorical branch for an embed model, the
 	// whole matrix otherwise, 0 for pure embed/text (no z-scored branch).
 	let d_sc = if embed_first { cat_cols } else { d };
 	let zscore_transient = if d_sc > 0 {

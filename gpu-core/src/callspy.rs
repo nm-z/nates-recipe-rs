@@ -26,6 +26,8 @@ counters!(
 	MEM_UNMAP, MEM_SET_ACCESS, MEM_RELEASE, MEM_MAP,
 	MEM_GET_ALLOCATION_GRANULARITY, MEM_CREATE, MEM_ADDRESS_RESERVE, MEM_ADDRESS_FREE,
 	HIPBLAS,
+	HOST_REGISTER, HOST_UNREGISTER,
+	MANAGED_MALLOC, MEM_ADVISE, HOST_GET_DEVICE_POINTER,
 );
 
 #[inline]
@@ -33,7 +35,7 @@ pub(crate) fn tick(c: &AtomicU64) {
 	c.fetch_add(1, Ordering::Relaxed);
 }
 
-pub const N: usize = 42;
+pub const N: usize = 47;
 static ALL: [&AtomicU64; N] = [
 	&HOST_MALLOC, &HOST_FREE,
 	&MEMCPY_ASYNC, &MALLOC_ASYNC, &MEMSET_ASYNC, &FREE_ASYNC,
@@ -49,6 +51,9 @@ static ALL: [&AtomicU64; N] = [
 	&MEM_UNMAP, &MEM_SET_ACCESS, &MEM_RELEASE, &MEM_MAP,
 	&MEM_GET_ALLOCATION_GRANULARITY, &MEM_CREATE, &MEM_ADDRESS_RESERVE, &MEM_ADDRESS_FREE,
 	&HIPBLAS,
+	&HOST_REGISTER, &HOST_UNREGISTER,        // ← add
+	&MANAGED_MALLOC, &MEM_ADVISE,            // ← add
+	&HOST_GET_DEVICE_POINTER,                // ← add
 ];
 
 /// Counter values right now — pass to `report_since` for a run-scoped delta.
@@ -199,17 +204,17 @@ pub fn state_report(run_start: &[u64; N]) -> Option<String> {
 		out.push_str(&format!(
 			"        {:<8}{:>7}\n",
 			"alloc",
-			format!("{}x", cell(a, b, &[&HOST_MALLOC, &MALLOC_ASYNC, &MEM_CREATE]))
+			format!("{}x", cell(a, b, &[&HOST_MALLOC, &MALLOC_ASYNC, &MEM_CREATE, &MANAGED_MALLOC, &HOST_REGISTER]))
 		));
 		out.push_str("    transfers\n");
-		out.push_str(&format!("        {:<8}{:>7}\n", "async", format!("{}x", cell(a, b, &[&XFER_ASYNC]))));
+		out.push_str(&format!("        {:<8}{:>7}\n", "async", format!("{}x", cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER]))));
 		out.push_str(&format!(
 			"        {:<8}{:>7}\n",
 			"sync",
 			format!("{}x", cell(a, b, &[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]))
 		));
 		hipblas[i] = cell(a, b, &[&HIPBLAS]);
-		frees[i] = cell(a, b, &[&HOST_FREE, &FREE_ASYNC, &MEM_RELEASE]);
+		frees[i] = cell(a, b, &[&HOST_FREE, &FREE_ASYNC, &MEM_RELEASE, &HOST_UNREGISTER]);
 	}
 	for (what, v) in [("hipBLAS", hipblas), ("free", frees)] {
 		if v.iter().sum::<u64>() > 0 {

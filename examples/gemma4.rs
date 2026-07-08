@@ -859,7 +859,6 @@ fn main() -> Result<()> {
 	// forward (custom gemm_bt_f64/scale_f64 kernels only), so there is no
 	// hipBLAS workspace to preallocate.
 	// init → one precalculated claim; exit → its one free.
-	gpu_core::memory::skip_pool_warm();
 	recipe_infer::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 	// Probe child: attempt exactly one allocation and report by exit code. An
 	// oversize ask dies in an uncatchable VmHeap abort — in THIS process, which

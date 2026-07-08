@@ -42,16 +42,16 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	ids
 }
 
-// Releases the detector's one-claim slab on every exit (normal return or a
-// panic in the GPU calls) so a fault can never leave the arena registered and
-// wedge the next claim. `None` when nothing was claimed (an arena was already
-// active, or the claim was refused) — Drop is then a no-op.
+// Parks the detector's backing slab on every exit — normal return or a panic
+// during the forward — so the arena is never left registered-and-live and the
+// next call adopts it instead of reclaiming. No HIP calls in park, so drop
+// drains nothing. `None` once the slab has already been parked/handed off.
 struct ArenaGuard(Option<recipe_infer::GpuBuffer>);
 
 impl Drop for ArenaGuard {
 	fn drop(&mut self) {
 		if let Some(slab) = self.0.take() {
-			recipe_infer::release_device_arena(slab);
+			recipe_infer::park_run_backing(slab);
 		}
 	}
 }
@@ -77,54 +77,53 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 		recipe_infer::LayerSpec::Dense(64, recipe_infer::Activation::LeakyRelu),
 		recipe_infer::LayerSpec::Dense(N_CLASS, recipe_infer::Activation::Linear),
 	];
-	// One-claim arena for the detector's forward. Sized by the same estimator
-	// fit uses (input + weights + scratch, forward-only) plus a margin, so
-	// build/upload/scratch all bump-carve from one memset-committed slab instead
-	// of growing the pool per buffer — the fresh-page memset-commit that faults
-	// ~30-50% of fresh-process data loads. Only claim when no arena is already
-	// active: a parked training backing already carves reliably, and a second
-	// claim asserts. A refused claim (None) falls back to the pool path unchanged.
+	// Uniform adopt→forward→park backing for the detector's forward. Weights
+	// (resume-composed host image), the 12 scratch constants, and the tokenized
+	// input compose ONE staged image; build/upload/scratch all bump-carve from
+	// one memset-committed slab — no per-buffer pool growth (the fresh-page
+	// commit that faults ~30-50% of fresh-process loads).
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);
-	// AOT init: weights (resume-composed host image), the 12 scratch constants,
-	// and the tokenized input ride ONE staged H2D on the claim — was ~37
-	// per-buffer uploads (per-layer weights, 12 constants, x) through the same
-	// data. Scratch still bump-carves from the slab; nothing else transfers
-	// until the single logits D2H below.
 	let plan = recipe_infer::plan_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, true)
 		.unwrap_or_else(|e| panic!("detect plan_layer_params: {e}"));
 	let mut stage = recipe_infer::Stage::new();
 	let w_off = stage.push(plan.host());
 	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
 	let x_off = stage.push(x.as_slice().expect("detect: x contiguous"));
-	// Claim the detector's arena WITH the composed image when no arena is already
-	// active (the H2D rides the claim, not a standalone upload); a second claim
-	// would assert while a training slab is parked+registered, so in that case carve
-	// from it and upload into the carve. Either way the whole init moves in ONE H2D.
 	let image = stage.into_host();
 	let image_floats = image.len();
-	let claim = (!recipe_infer::device_arena_active())
-		.then(|| {
-			let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, true);
-			recipe_infer::claim_device_arena_bytes_with_image(est + est / 2 + (1 << 20), &image)
-		})
-		.flatten();
-	let (arena, base) = match claim {
-		Some(slab) => {
-			let b = slab.view(0, image_floats);
-			(Some(slab), b)
-		}
-		None => (None, recipe_infer::GpuBuffer::upload(&image).expect("detect image upload")),
-	};
-	let _arena = ArenaGuard(arena);
+	// Detector claim (ONE drain): re-arm a parked training backing when present,
+	// else claim a fresh arena — the composed image rides the adopt/claim H2D, no
+	// standalone upload. Both refusing means nothing is parked and the card cannot
+	// hold the footprint: fail clean with the numbers, no pool fallback.
+	let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, true);
+	let need = est + est / 2 + (1 << 20);
+	let slab = recipe_infer::adopt_run_backing_with_image(need, &image)
+		.or_else(|| recipe_infer::claim_device_arena_with_image(&image))
+		.unwrap_or_else(|| {
+			panic!(
+				"detect: no device backing — footprint {}, claimable {}",
+				recipe_infer::human_bytes(need),
+				recipe_infer::human_bytes(recipe_infer::claimable_bytes()),
+			)
+		});
+	let base = slab.view(0, image_floats);
+	// Park-on-drop: on normal return the slab is parked for the next call to
+	// adopt; on an unwind through the forward it is parked (not freed) too.
+	let _arena = ArenaGuard(Some(slab));
 	let params = plan.materialize(&base, w_off);
 	let xbuf = base.view(x_off, n * CONTEXT);
 	let consts_view = base.view(consts_off, 12);
-	let sc = recipe_infer::Scratch::new_staged_infer(&params, n, &consts_view);
+	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view);
 	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 	let last = params.len() - 1;
-	// preds copies to host here; params/xbuf/sc are non-owning carves, so the
-	// guard's release (after this scope) frees them with the slab.
-	let preds = recipe_infer::download_vec(&sc.acts[last], n * N_CLASS);
+	// Detector release (ONE drain): enqueue the logits D2H (async, no wait), then
+	// the single device_synchronize completes it; finish fans the pin into preds.
+	// Scratch (all carves) drops after this drain, so its Drop drains nothing.
+	let mut preds = vec![0.0f64; n * N_CLASS];
+	let exit = unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
+		.expect("detect exit d2h enqueue");
+	recipe_infer::device_synchronize().expect("detect release sync");
+	exit.finish(&mut preds);
 	(0..n)
 		.map(|r| {
 			let lg = &preds[r * N_CLASS..r * N_CLASS + N_CLASS];

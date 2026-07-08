@@ -545,6 +545,7 @@ unsafe extern "C" {
 	);
 	fn launch_exp(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_log(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_copy_f64(src: *const c_void, dst: *mut c_void, n: i64, stream: *mut c_void);
 	fn launch_sqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_abs(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_neg(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
@@ -1579,6 +1580,7 @@ pub fn gpu_shutdown() {
 	// Free the pinned H2D bounce (the one hipHostMalloc) — exit frees ALL RAM
 	// and VRAM explicitly, not by process teardown.
 	crate::memory::free_bounce();
+	crate::memory::free_run_pin();
 	// Return retained pool VRAM to the driver before the process dies — see
 	// trim_mempool: async teardown reclaim races the next process's first touch.
 	let _ = crate::hip::trim_mempool(0);
@@ -2852,17 +2854,19 @@ pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	Ok(())
 }
 
-/// Device-to-device copy of `n` f64s into `out`.
+/// Element-wise copy of `n` f64s into `out` — an identity calc into an existing
+/// buffer, dispatched like every other elementwise op. The transfer engines
+/// (`xfer`) are reserved for tier traffic; a VRAM-internal copy is device work.
 pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		crate::memory::xfer(
-			out.ptr,
+		launch_copy_f64(
 			src.ptr as *const c_void,
-			n * std::mem::size_of::<f64>(),
-			crate::hip::HIP_MEMCPY_D2D,
+			out.ptr,
+			n as i64,
 			std::ptr::null_mut(),
-		)
-	}?;
+		);
+	}
+	check_launch();
 	Ok(())
 }
 

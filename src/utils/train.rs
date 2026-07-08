@@ -6,14 +6,14 @@ use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, RunData, Train};
 use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
-	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, build_layer_params, concat_layer,
-	forward_into, infer_scored, load_ogdl, load_ogdl_str, metric_gpu, metric_gpu_into,
-	pinned_vocab, plan_layer_params, upload, zscore_apply, zscore_fit,
+	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
+	infer_scored, load_ogdl, load_ogdl_str, metric_gpu_into,
+	pinned_vocab, plan_layer_params, upload, zscore_apply,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::symbols::{self, Marker};
@@ -21,7 +21,6 @@ use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
 use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 /// Set by the SIGINT handler so headless (cooked-mode) Ctrl+C exits gracefully
 /// — in TUI raw mode Ctrl+C arrives as a key event instead and is handled there.
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -183,51 +182,6 @@ impl ModelInner {
 			Metric::R2 => "r2",
 			Metric::Hip => "hip",
 		}
-	}
-	/// One line per layer under each log line: measured fwd+bwd seconds (null-
-	/// stream boundary events), analytic GFLOP and VRAM GB from the actual dims,
-	/// and the achieved rates as % of the two on-card rooflines (our measured
-	/// GEMM ceiling, gfx1101 memory BW). The OOC path prints its streamed-tier
-	/// counterpart per sweep with the PCIe/NVMe rooflines it measures at build.
-	fn roofline_block(params: &[LayerParams], n: usize, fms: &[f64], bms: &[f64]) -> String {
-		let mut out = String::new();
-		let (mut t_ms, mut t_flop, mut t_bytes) = (0.0f64, 0.0f64, 0.0f64);
-		for (l, p) in params.iter().enumerate() {
-			let w = recipe_infer::layer_fwd(p, n).plus(recipe_infer::layer_bwd(p, n, l == 0));
-			let ms = fms[l] + bms[l];
-			t_ms += ms;
-			t_flop += w.flop;
-			t_bytes += w.bytes;
-			out.push_str(&Self::roofline_line(
-				&format!("L{l} {:<5} {}→{}", Self::kind_label(p), p.in_dim, p.out_dim),
-				ms, w.flop, w.bytes,
-			));
-		}
-		if params.len() > 1 {
-			out.push_str(&Self::roofline_line("total", t_ms, t_flop, t_bytes));
-		}
-		out
-	}
-
-	fn kind_label(p: &LayerParams) -> &'static str {
-		match p.kind {
-			LayerKind::Dense => "dense",
-			LayerKind::Attn => "attn",
-			LayerKind::Conv => "conv",
-			LayerKind::Embed => "embed",
-		}
-	}
-
-	fn roofline_line(label: &str, ms: f64, flop: f64, bytes: f64) -> String {
-		let gfs = flop / ms / 1e6; // flop / (ms·1e-3 s) / 1e9
-		let gbs = bytes / ms / 1e6;
-		format!(
-			"    {label:<24} {ms:>8.2}ms  {:>8.3} GFLOP {gfs:>6.1} GF/s {:>3.0}% gemm  {:>7.3} GB {gbs:>6.1} GB/s {:>3.0}% vram\n",
-			flop / 1e9,
-			100.0 * gfs / recipe_infer::GEMM_GFLOPS,
-			bytes / 1e9,
-			100.0 * gbs / recipe_infer::VRAM_GBS,
-		)
 	}
 
 	/// The colored, aligned metric line: `vals[i]` is the precomputed value of
@@ -716,619 +670,22 @@ impl ModelInner {
 			flip = !flip;
 		}
 	}
-	/// Whether every logged AND plotted metric is servable by the zero-transfer
-	/// staged loop. The device metric ring holds one per-epoch scalar row per
-	/// device-computed metric (loss / R² / accuracy); epoch / lr / time / hip are
-	/// host-free. That covers the entire closed metric set, so this is true for any
-	/// metric list today — kept as a method so a future non-ring metric has exactly
-	/// one gate to fall through to the pooled path.
-	pub(crate) fn ring_metrics(&self, cfg: &Train) -> bool {
-		cfg.metrics.iter().chain(cfg.plot.iter()).all(|m| {
-			matches!(
-				m,
-				Metric::Loss
-					| Metric::R2 | Metric::Accuracy
-					| Metric::Epoch | Metric::Lr
-					| Metric::Time | Metric::Hip
-			)
-		})
-	}
-	/// Whether this run can take the one-claim staged path (`fit_staged`): an
-	/// in-VRAM fit whose logged/plotted metrics are all ring-servable and — for a
-	/// rerun — whose current weights left a host mirror to warm-start from (a
-	/// pooled fit leaves none). Checkpoint/resume (`.resume`), the TUI plot, and
-	/// reruns all stage; out-of-core keeps the pooled path. The arena CLAIM in
-	/// `Train::run` is gated on exactly this so the pooled path never runs under
-	/// an arena (a pooled fit leaves no host weight mirror, so a later cross-model
-	/// eval would find its arena backing freed with nothing to rebuild from).
-	/// `fit` re-checks the same predicate before dispatching.
-	pub(crate) fn staged_eligible(&self, cfg: &Train) -> bool {
-		let rerun = !self.params.borrow().is_empty();
-		(!rerun || self.saved_ogdl.borrow().is_some()) && self.ring_metrics(cfg)
-	}
+	/// THE fit: one path, one claim, one loop, one park. The entire init is composed
+	/// into ONE `Stage` image and moved with ONE sync H2D that rides the arena
+	/// claim/adopt: weights (plan image — device-randn-initialized in place, or
+	/// warm-started host-side from a `.resume` file or the rerun mirror), the 12
+	/// scratch constants, the 4 step scalars, x/cat/y, and z-score slots (reserved on
+	/// a first fit; pushed from the host Scaler on a rerun and broadcast-applied,
+	/// never re-fit). Every run drives the windowed `Ooc` engine (all-VRAM runs stream
+	/// zero windows → zero loop transfers/syncs); per-epoch metrics reduce into a
+	/// device ring brought home in the ONE exit D2H that rides the park op, which then
+	/// replays the log lines, the checkpoint divergence semantics, and the end-of-run
+	/// TUI plot. Stats cross to the host Scaler exactly ONCE, at exit. The composed
+	/// image rides `claim_device_arena_with_image`, so the training H2D is part of the
+	/// claim op; the exit prefix D2H rides `park`, so it is part of the park op. A
+	/// device that cannot map even the walked-down minimum panics — there is no
+	/// routing decision, only fit.
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) {
-		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
-		// Ledger transfer-CALL snapshots parallel to the callspy ones: authoritative
-		// per-phase H2D/D2H logical-upload counts (the pinned bounce chunks a single
-		// upload into many callspy MEMCPY_ASYNC ticks, so callspy overcounts).
-		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
-		let rerun = !self.params.borrow().is_empty();
-		// One-claim staged fit: a staged-eligible in-VRAM run composes the whole init
-		// as ONE image that rides the arena claim/adopt (the training H2D is part of
-		// the claim op), runs a zero-transfer loop, and brings everything home in one
-		// exit D2H that rides the park op. `fit_staged` now owns the arena decision:
-		// it claims/adopts WITH the image and returns false only when the claim is
-		// refused, in which case we fall through to the proven pooled path (out-of-core,
-		// a non-ring metric, a rerun with no host mirror also stay pooled).
-		if self.staged_eligible(cfg) && self.fit_staged(data, cfg, resume) {
-			return;
-		}
-		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
-		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
-		let (collapsed_x, collapsed_embed_cols, collapsed_vocab) = if embed_cats {
-			let (x, ec, v) = collapse_onehot(data);
-			(Some(x), ec, v)
-		} else {
-			(None, Vec::new(), 0)
-		};
-		let effective_x = collapsed_x.as_ref().unwrap_or(&data.x);
-		let effective_text = if embed_cats { &collapsed_embed_cols } else { &data.text_cols };
-		let cat_cols: Vec<usize> = if embed_first {
-			(0..effective_x.ncols())
-				.filter(|c| !effective_text.contains(c))
-				.collect()
-		} else {
-			Vec::new()
-		};
-		let c_cat = cat_cols.len();
-		let xinput = if embed_first {
-			effective_x.select(ndarray::Axis(1), effective_text)
-		} else {
-			effective_x.clone()
-		};
-		let vocab = if let Some(v) = pinned_vocab(&self.specs) {
-			v
-		} else if embed_first {
-			if embed_cats {
-				collapsed_vocab
-			} else {
-				xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1
-			}
-		} else {
-			0
-		};
-		let start = std::time::Instant::now();
-		let _t_data = gpu_core::memory::tag_scope("data");
-		let (xraw, n, d) = upload(&xinput);
-		// Text token ids pass RAW to the embed lookup (no z-score). The categorical
-		// branch IS z-scored on the train set (raw frequency-encoded columns span
-		// wildly different magnitudes; unscaled they saturate the dense head). For a
-		// non-embed model the whole matrix is the categorical branch. The scaler is
-		// fit once here and reused verbatim on eval (no leakage).
-		let (xbuf, x_cat) = if embed_first {
-			if cat_cols.is_empty() {
-				if !rerun {
-					*self.scaler.borrow_mut() = Some(Scaler {
-						mean: vec![],
-						std: vec![],
-					});
-				}
-				(xraw, None)
-			} else {
-				let cat = effective_x.select(ndarray::Axis(1), &cat_cols);
-				let (craw, _, c) = upload(&cat);
-				if rerun {
-					let sc = self.scaler.borrow();
-					let sc = sc.as_ref().expect("rerun without scaler");
-					(xraw, Some(zscore_apply(&craw, n, c, sc)))
-				} else {
-					let ccat = zscore_fit(&craw, n, c, &self.scaler);
-					(xraw, Some(ccat))
-				}
-			}
-		} else if rerun {
-			let sc = self.scaler.borrow();
-			let sc = sc.as_ref().expect("rerun without scaler");
-			(zscore_apply(&xraw, n, d, sc), None)
-		} else {
-			(zscore_fit(&xraw, n, d, &self.scaler), None)
-		};
-		let y_host = {
-			let ys = data.y.as_slice().expect("train: y contiguous");
-			let mut ydata = ys.to_vec();
-			if !self.loss.is_classification() && !rerun {
-				let ymean = ydata.iter().sum::<f64>() / ydata.len() as f64;
-				let yvar = ydata.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / ydata.len() as f64;
-				let ystd = (yvar + 1e-8).sqrt();
-				for v in ydata.iter_mut() {
-					*v = (*v - ymean) / ystd;
-				}
-				*self.yscaler.borrow_mut() = Some((ymean, ystd));
-			} else if !self.loss.is_classification() && rerun {
-				if let Some((ymean, ystd)) = *self.yscaler.borrow() {
-					for v in ydata.iter_mut() {
-						*v = (*v - ymean) / ystd;
-					}
-				}
-			}
-			ydata
-		};
-		// Resumed weights (per-neuron, in save order) or empty for random init.
-		let resumed = resume.map(load_ogdl).unwrap_or_default();
-		// On a checkpoint/architecture mismatch, ask whether to overwrite with random
-		// weights (y) or abort (n). build_layer_params(.., false) re-runs construction with
-		// random init, so "overwrite" is a clean fresh start the next save writes over the stale file.
-		let mut did_resume = !resumed.is_empty();
-		let ask_overwrite = |what: &str| -> bool {
-			use std::io::Write;
-			eprintln!(
-				"\x1b[32mresume\x1b[0m\n    \x1b[1;31mdata does not match\x1b[0m\n        {what}\n        file path={}\n        data path={}",
-				resume.unwrap_or(""),
-				data.source,
-			);
-			if !std::io::stdin().is_terminal() {
-				return false;
-			}
-			eprint!("overwrite checkpoint with random weights? [y/N] ");
-			std::io::stderr().flush().ok();
-			let mut line = String::new();
-			std::io::stdin().read_line(&mut line).ok();
-			matches!(line.trim(), "y" | "Y" | "yes" | "YES")
-		};
-		// Build every layer's params, consuming parsed checkpoint blocks when try_resume.
-		// A shape/order mismatch returns Err(reason) (not abort) so the caller can prompt.
-		// `si` indexes blocks: one per embed/attn layer, one per dense neuron, in order.
-		let params = {
-			let _t_weights = gpu_core::memory::tag_scope("weights");
-			match build_layer_params(&self.specs, d, c_cat, vocab, &resumed, did_resume) {
-				Ok(p) => p,
-				Err(what) => {
-					if ask_overwrite(&what) {
-						did_resume = false;
-						build_layer_params(&self.specs, d, c_cat, vocab, &resumed, false).unwrap_or_else(|e| panic!("{e}"))
-					} else {
-						panic!("checkpoint mismatch — user declined overwrite");
-					}
-				}
-			}
-		};
-		let last = params.len() - 1;
-		// A categorical target arrives as ONE class-index column; for multi-class CE
-		// the model's output width IS the class count, so expand the index to a
-		// one-hot of `out_dim` here (reusing the dense one-hot CE/accuracy path).
-		// Binary (bce, out_dim==1) and regression/multi-output use the column as-is.
-		let n_targets = data.n_targets.max(1);
-		let out_dim = params[last].out_dim;
-		let expand_ce = self.loss.is_classification() && n_targets == 1 && out_dim > 1;
-		let k = if expand_ce { out_dim } else { n_targets };
-		// Output units must equal the target width: y is flat n*k and acts[last] is
-		// n*out_dim — they must align element-for-element (the expanded one-hot does).
-		assert_eq!(
-			out_dim, k,
-			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
-		);
-		let ybuf = if expand_ce {
-			let mut oh = vec![0.0f64; n * out_dim];
-			for (i, &idx) in y_host.iter().enumerate() {
-				if idx.is_finite() {
-					let c = idx as usize;
-					if c < out_dim {
-						oh[i * out_dim + c] = 1.0;
-					}
-				}
-			}
-			GpuBuffer::upload(&oh).expect("upload y onehot")
-		} else {
-			GpuBuffer::upload(&y_host).expect("upload y")
-		};
-		let summary = if cfg.metrics.is_empty() {
-			String::new()
-		} else {
-			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-			let out = params[last].out_dim;
-			let row = |x: usize, l1: &str, y: usize, l2: &str| {
-				format!("    {x:>5}  {l1:<11}{y:>5}  {l2}")
-			};
-			[
-				"arch".to_string(),
-				row(neurons, "neurons", params.len(), "layers"),
-				row(n, "samples", d, "features"),
-				row(d, "input_dim", out, "output_dim"),
-				"data".to_string(),
-				row(n + 1, "rows", d + 1, "columns"),
-				row(d, "predictors", out, "targets"),
-			]
-			.join("\n")
-		};
-		// Epoch is the x-axis; Time is wall-clock (an axis quantity), not a
-		// y-series. Both are excluded from the facets — they're independent
-		// variables, not datapoints. They still appear in the metrics header.
-		let plot_ys: Vec<Metric> = cfg
-			.plot
-			.iter()
-			.copied()
-			.filter(|&m| m != Metric::Epoch && m != Metric::Time)
-			.collect();
-		let mut plot_rows: Vec<Vec<f64>> = Vec::new();
-		// Only take over the screen when stdout is a real terminal; piped or
-		// headless runs fall through to the stderr log path. ratatui owns the
-		// terminal (alt screen, raw mode, panic-restore hook); Ctrl+C arrives
-		// as a key event in raw mode and is handled in the loop.
-		let plotting = !cfg.plot.is_empty() && std::io::stdout().is_terminal();
-		if !plotting && !rerun {
-			if did_resume && let Some(path) = resume {
-				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-				eprintln!("resumed: {}", full.display());
-			}
-			if !summary.is_empty() {
-				eprintln!("{summary}");
-				eprintln!(
-					"roofline  gemm {} GF/s  vram {} GB/s",
-					recipe_infer::GEMM_GFLOPS,
-					recipe_infer::VRAM_GBS
-				);
-			}
-		}
-		let mut terminal = plotting.then(ratatui::init);
-		let mut last_draw = start;
-		let checkpoint_path = cfg.resume.as_deref().map(Train::resolve);
-		let checkpointing = checkpoint_path.is_some();
-		let classify = self.loss.is_classification();
-		let mut loss_prev = f64::INFINITY;
-		let mut saved = false;
-		// Per-epoch metrics reduce to a scalar on the GPU; only the requested ones
-		// are downloaded. SS_tot (R²'s denominator) depends only on the constant
-		// targets, so compute it once here.
-		// On the SAME (z-scored) scale as the training-loop ss_res — `out` predicts
-		// the z-scored target, so ss_tot must use the z-scored y too. Using raw
-		// data.y here made R² ≈ 1 always (huge ss_tot vs a z-scored residual).
-		let ss_tot = {
-			let total = y_host.len() as f64;
-			let ybar = y_host.iter().sum::<f64>() / total;
-			y_host.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
-		};
-		// Activation + gradient buffers, allocated once and reused every epoch
-		// so steady-state VRAM is flat (no per-epoch sawtooth).
-		// Waterfall: when the full-batch scratch exceeds free VRAM, homes spill
-		// VRAM → RAM → DISK and every op streams sample windows (crate::ooc).
-		let cc_fit = concat_layer(&params);
-		let scratch_need = Scratch::vram_bytes(&params, n, false);
-		let use_ooc = scratch_need > gpu_core::memory::claimable_bytes();
-		let sc = {
-			let _t_scratch = gpu_core::memory::tag_scope("scratch");
-			if use_ooc { Scratch::new_light(&params, n) } else { Scratch::new(&params, n, false) }
-		};
-		// Device-scalar operands for SGD (-lr) and the batch-mean loss gradient
-		// (1/n, 2/n) + a reusable zero — uploaded once here, reused every epoch.
-		// BEFORE Ooc::build: the OOC claim seals its whole slab (residents +
-		// window region), so any allocation after it would fall to pool growth
-		// under a full card; these four scalars belong with the pre-claim allocs.
-		let ss = StepScalars::new(self.lr, n);
-		let mut ooc = use_ooc.then(|| {
-			let _t_scratch = gpu_core::memory::tag_scope("waterfall");
-			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone());
-			o.report();
-			o
-		});
-		let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
-		// Saturation law, executable: the GPU must hit 100% at least once in
-		// every 5s window of the compute loop or the process aborts.
-		gpu_core::hw::arm_saturation_crash();
-		INTERRUPTED.store(false, Ordering::SeqCst);
-		unsafe {
-			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
-		}
-		gpu_core::callspy::mark_loop_start();
-		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
-		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
-		let mut fit_score = f64::NAN;
-		for e in 0..cfg.epochs {
-			if INTERRUPTED.load(Ordering::SeqCst) {
-				break;
-			}
-			let log_now = cfg.log_every > 0
-				&& !cfg.metrics.is_empty()
-				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-			// Per-layer boundary events armed only for epochs whose log line will
-			// print (the OOC path prints its own per-sweep roofline lines).
-			let time_layers = log_now && !plotting && ooc.is_none();
-			sc.set_timing(time_layers);
-			// Forward with this epoch's weights, then backprop + SGD update.
-			match ooc.as_mut() {
-				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
-				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
-			}
-			if INTERRUPTED.load(Ordering::SeqCst) {
-				break;
-			}
-			let stop_metric = if classify {
-				Metric::Accuracy
-			} else {
-				Metric::R2
-			};
-			let want_score = checkpointing
-				|| (log_now && cfg.metrics.contains(&stop_metric))
-				|| (plotting && plot_ys.contains(&stop_metric));
-			match ooc.as_mut() {
-				Some(o) => o.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, cc_fit),
-				None => self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss),
-			}
-			// Disarm before the metric re-forward so it can't overwrite the epoch's
-			// recorded boundaries.
-			sc.set_timing(false);
-			let need_metric = want_score
-				|| (log_now && !cfg.metrics.is_empty())
-				|| (plotting && !plot_ys.is_empty());
-			if need_metric {
-				match ooc.as_mut() {
-					Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
-					None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
-				}
-			}
-			// ^C mid metric-forward bails the OOC sweep early: acts[last] still
-			// holds the previous weights' output and the loss line would repeat
-			// verbatim after an update. Break before computing/printing from it.
-			if INTERRUPTED.load(Ordering::SeqCst) {
-				break;
-			}
-			let out = &sc.acts[last];
-			// Per-epoch metrics ride the async copy stream and sync ONCE (no blocking
-			// 8-byte D2H per metric): score → metric_scalar_b, loss → metric_scalar.
-			let score_is_acc = if want_score {
-				if classify {
-					if k == 1 {
-						kernels::gpu_accuracy_into(out, &ybuf, n, &sc.metric_scalar_b).expect("accuracy");
-					} else {
-						kernels::gpu_argmax_accuracy_into(out, &ybuf, n, k, &sc.metric_scalar_b).expect("argmax accuracy");
-					}
-					Some(true)
-				} else {
-					kernels::gpu_ss_res_into(out, &ybuf, n * k, &sc.metric_scalar_b).expect("ss_res");
-					Some(false)
-				}
-			} else {
-				None
-			};
-			if score_is_acc.is_some() {
-				sc.download_scalar_b_deferred();
-			}
-			let loss_scale = if checkpointing {
-				let (sign, div) = metric_gpu_into(self.loss, Metric::Loss, out, &ybuf, &sc, n, k, ss_tot, &sc.metric_scalar);
-				sc.download_scalar_deferred();
-				Some((sign, div))
-			} else {
-				None
-			};
-			if score_is_acc.is_some() || loss_scale.is_some() {
-				sc.sync_copy_stream();
-			}
-			let score = match score_is_acc {
-				Some(true) => sc.deferred_scalar_b(),
-				Some(false) => 1.0 - sc.deferred_scalar_b() / ss_tot,
-				None => f64::NAN,
-			};
-			if score.is_finite() {
-				fit_score = score;
-			}
-			let loss = if let Some((sign, div)) = loss_scale {
-				sign * sc.deferred_scalar() / div
-			} else {
-				f64::NAN
-			};
-			if checkpointing && loss.is_nan() {
-				eprintln!("NaN loss at epoch {e} — stopping (weights diverged)");
-				break;
-			}
-			let mut checkpointed = false;
-			if checkpointing {
-				if !saved && e > 0 && loss > loss_prev {
-					saved = true;
-					let path = checkpoint_path.as_ref().expect("checkpoint path");
-					let key = self.loss.score_key();
-					if recipe_infer::saved_score(path, key).is_none_or(|best| score > best) {
-						recipe_infer::write_ogdl(
-							path,
-							&recipe_infer::dump_ogdl(&params, None, key, score),
-						);
-						checkpointed = true;
-					}
-				}
-				if loss.is_finite() {
-					loss_prev = loss;
-				}
-			}
-			let last_epoch = e + 1 == cfg.epochs;
-			if log_now || checkpointed || plotting {
-				let elapsed = start.elapsed().as_secs_f64();
-				if !plotting && (log_now || checkpointed) {
-					let vals: Vec<f64> = cfg
-						.metrics
-						.iter()
-						.map(|&m| {
-							if m == stop_metric {
-								score
-							} else {
-								metric_gpu(
-									self.loss, self.lr, m, out, &ybuf, &sc, n, k, ss_tot, e, elapsed,
-								)
-							}
-						})
-						.collect();
-					let mut line = self.metrics_line(&cfg.metrics, &vals);
-					if checkpointed {
-						line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
-					}
-					eprintln!("{line}");
-					if time_layers {
-						let (fms, bms) = sc.layer_ms(params.len());
-							eprint!("{}", Self::roofline_block(&params, n, &fms, &bms));
-					}
-				}
-				if plotting {
-					let mut row = vec![elapsed]; // x = elapsed wall-clock seconds
-					for &m in &plot_ys {
-						row.push(if m == stop_metric {
-							score
-						} else {
-							metric_gpu(
-								self.loss, self.lr, m, out, &ybuf, &sc, n, k, ss_tot, e, elapsed,
-							)
-						});
-					}
-					plot_rows.push(row);
-					// Throttle live redraws to ~25 fps; always draw the last frame.
-					if (e == 0 || last_epoch || last_draw.elapsed().as_millis() >= 40)
-						&& let Some(term) = terminal.as_mut()
-					{
-						let _ = term.draw(|frame| {
-							self.render_dashboard(
-								frame, &summary, &plot_rows, &plot_ys,
-							);
-						});
-						last_draw = std::time::Instant::now();
-					}
-					// Quit early on q / Ctrl+C (raw mode delivers them as keys).
-					if event::poll(Duration::ZERO).unwrap_or(false)
-						&& let Ok(Event::Key(k)) = event::read()
-						&& (k.code == KeyCode::Char('q')
-							|| (k.code == KeyCode::Char('c')
-								&& k.modifiers.contains(KeyModifiers::CONTROL)))
-					{
-						break;
-					}
-				}
-			}
-		}
-		gpu_core::hw::disarm_saturation_crash();
-		gpu_core::callspy::mark_loop_end();
-		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
-		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
-		drop(_alloc_guard);
-		unsafe {
-			libc::signal(libc::SIGINT, libc::SIG_DFL);
-		}
-		if plotting {
-			ratatui::restore();
-		}
-		let mut ooc_end = ooc;
-		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
-		// Post-update score: `run()` no longer re-forwards to score (the arena that
-		// held x/y/params is freed right after fit), so fit computes the
-		// authoritative end score here for EVERY completed fit — the same buffers
-		// are still resident. Except on ^C, where the OOC forward would bail on its
-		// first window and read stale mixed-epoch activations; the last per-epoch
-		// score stands instead.
-		let want_end = !was_interrupted;
-		let end_score = want_end.then(|| {
-			match ooc_end.as_mut() {
-				Some(o) => o.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit),
-				None => forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc),
-			}
-			if classify {
-				if k == 1 {
-					kernels::gpu_accuracy_into(
-						&sc.acts[last],
-						&ybuf,
-						n,
-						&sc.metric_scalar,
-					).expect("accuracy");
-				} else {
-					kernels::gpu_argmax_accuracy_into(
-						&sc.acts[last],
-						&ybuf,
-						n,
-						k,
-						&sc.metric_scalar,
-					).expect("argmax accuracy");
-				}
-				sc.read_metric_scalar()
-			} else {
-				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &sc.metric_scalar).expect("ss_res");
-				1.0 - sc.read_metric_scalar() / ss_tot
-			}
-		});
-		*self.params.borrow_mut() = params;
-		// The pooled fit just replaced the weights, so a staged mirror from an
-		// earlier run now describes dead state. Clearing it sends the next rerun
-		// to the pooled path (mirror-less) instead of silently warm-starting from
-		// stale weights, and keeps save() reading the live params — never an old
-		// image keyed with this run's score.
-		*self.saved_ogdl.borrow_mut() = None;
-		self.arena_gen.set(None);
-		if let Some(s) = end_score
-			&& s.is_finite()
-		{
-			fit_score = s;
-		}
-		self.fit_score.set(fit_score);
-		if let Some(path) = checkpoint_path.as_ref() {
-			if was_interrupted {
-				// ^C save is unconditional — the weights in memory are the only
-				// copy — scored with the best available (end score for an
-				// in-VRAM fit, last per-epoch score for OOC, NaN if no epoch
-				// finished; honest, never fabricated from a bailed forward).
-				let key = self.loss.score_key();
-				recipe_infer::write_ogdl(
-					path,
-					&recipe_infer::dump_ogdl(&self.params.borrow(), None, key, fit_score),
-				);
-				let full =
-					std::fs::canonicalize(path).unwrap_or_else(|_| path.as_str().into());
-				eprintln!("saved {} ({key} {fit_score:.4})", full.display());
-			} else if let Some(s) = end_score {
-				self.save_checkpoint(path, s);
-			}
-		}
-		// A fit leaves its scratch (~all of VRAM for an out-of-core run) as
-		// freed pool slack with a stale verified high-water; a later
-		// differently-shaped allocation storm would skip the growth gate yet
-		// still map new physical out of fragmented slack (the VmHeap assert),
-		// and every claimable-VRAM read would see the slack as gone. Trim +
-		// reset after EVERY fit so the gate and the measure stay honest.
-		drop(ooc_end);
-		drop(sc);
-		gpu_core::memory::pool_trim();
-		if let (Some(base), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
-			for (phase, a, b) in [
-				("init", &base, &init),
-				("loop", &init, &lp),
-				("exit", &lp, &gpu_core::callspy::snapshot()),
-			] {
-				eprint!("── hip {phase} ──\n{}", gpu_core::callspy::report_between(a, b));
-			}
-		}
-		// Authoritative per-phase transfer-call ledger (one increment per logical
-		// upload/download, bounce chunking not counted). One-claim target for an
-		// in-VRAM fit: init H2D 1, loop 0, exit D2H 1.
-		if let (Some(s), Some(i), Some(l)) = (led_snap, led_init, led_loop) {
-			let e = gpu_core::memory::xfer_calls();
-			let dh = |a: (usize, usize, usize), b: (usize, usize, usize)| (b.0 - a.0, b.1 - a.1);
-			for (phase, (h2d, d2h)) in [
-				("init", dh(s, i)),
-				("loop", dh(i, l)),
-				("exit", dh(l, e)),
-			] {
-				eprintln!("── ledger {phase} ── H2D calls {h2d}  D2H calls {d2h}");
-			}
-		}
-	}
-	/// One-claim staged fit (in-VRAM; out-of-core, non-ring metrics, and a rerun
-	/// with no host mirror keep the pooled `fit` above). The entire init is
-	/// composed into ONE `Stage` image and moved with ONE sync H2D: weights (plan
-	/// image — device-randn-initialized in place, or warm-started host-side from a
-	/// `.resume` file or the rerun mirror), the 12 scratch constants, the 4 step
-	/// scalars, x/cat/y, and z-score slots (reserved on a first fit; pushed from
-	/// the host Scaler on a rerun and broadcast-applied, never re-fit). The loop is
-	/// transfer-free: per-epoch metrics reduce into a device ring brought home in
-	/// the ONE exit D2H, which then replays the log lines, the checkpoint
-	/// divergence semantics, and the end-of-run TUI plot. Stats cross to the host
-	/// Scaler exactly ONCE, at exit.
-	/// Returns true if the staged fit ran; false if the arena claim was refused
-	/// (the caller falls through to the pooled path). The composed init image rides
-	/// the arena claim/adopt (`claim_device_arena_with_image`), so the training H2D
-	/// is part of the claim op, not a standalone upload; the exit prefix D2H rides
-	/// `park_staged`, so it is part of the park op.
-	fn fit_staged(&self, data: &Dataset, cfg: &Train, resume: Option<&str>) -> bool {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let start = std::time::Instant::now();
@@ -1382,14 +739,14 @@ impl ModelInner {
 		// ── plan weights (host image), derive output width / y ──
 		// Warm-start blocks ride the plan's host image into the one H2D: an existing
 		// `.resume` file wins; else a rerun warm-starts from the host mirror the prior
-		// staged exit D2H left (the gate guarantees it exists); else random init.
+		// exit D2H left; else random init.
 		let resumed = resume.map(load_ogdl).unwrap_or_default();
 		let mut did_resume = !resumed.is_empty();
 		let source = if did_resume {
 			resumed
 		} else if rerun {
 			let m = self.saved_ogdl.borrow();
-			load_ogdl_str(&m.as_ref().expect("staged rerun without host weight mirror").text)
+			load_ogdl_str(&m.as_ref().expect("rerun without host weight mirror").text)
 		} else {
 			Vec::new()
 		};
@@ -1450,9 +807,8 @@ impl ModelInner {
 					}
 				}
 			}
-			// R²'s denominator from the PRE-expansion column, matching the pooled
-			// path's y_host — an ss_tot over the one-hot expansion differs and the
-			// two paths must print identical values for the same run.
+			// R²'s denominator from the PRE-expansion column — an ss_tot over the
+			// one-hot expansion differs; the pre-expansion value is the reported one.
 			let total = yd.len() as f64;
 			let ybar = yd.iter().sum::<f64>() / total;
 			let ss_tot: f64 = yd.iter().map(|v| (v - ybar).powi(2)).sum();
@@ -1472,7 +828,7 @@ impl ModelInner {
 			};
 			(y_flat, ss_tot)
 		};
-		// ── compose the ONE staged image: exit-region prefix, upload-only suffix ──
+		// ── compose the ONE init image: exit-region prefix, upload-only suffix ──
 		let epochs = cfg.epochs.max(1);
 		// Device metric ring rows: the stop metric (always — for fit_score and a ^C
 		// snapshot) plus every logged/plotted device-computed metric (loss / R² /
@@ -1495,15 +851,10 @@ impl ModelInner {
 			}
 		}
 		let n_rows = ring_row.len();
-		// Roofline event sets to pre-allocate: one per epoch whose log line prints a
-		// per-layer block (time_layers = log_now && !plotting). The loop records into
-		// them transfer-free; the exit reads them all after the drain (loop event
-		// syncs → 0). Zero when plotting or nothing logs.
-		let n_timed = if plotting || cfg.metrics.is_empty() || cfg.log_every == 0 {
-			0
-		} else {
-			(0..cfg.epochs).filter(|&e| e % cfg.log_every == 0 || e + 1 == cfg.epochs).count()
-		};
+		// The windowed engine owns the per-layer roofline (its streamed-sweep lines).
+		// The Scratch carries no timing event sets — a Scratch-timed forward is never
+		// run here (every forward rides the engine), so zero sets to pre-allocate.
+		let n_timed = 0usize;
 		// ── host-composed z-score (item 1): mean / std / scaled features computed on
 		// the host so the init runs ZERO device zscore kernels (in-place 0). The math
 		// is the device path's op-for-op (population mean/var, +1e-8, sqrt,
@@ -1559,39 +910,47 @@ impl ModelInner {
 		let y_off = stage.push(&y_flat);
 		// ── claim the arena WITH the image (the training H2D rides the claim/adopt op,
 		// not a standalone upload). adopt-first: re-arm the prior run's parked slab
-		// (rewind + re-zero + image H2D + one drain); else claim fresh. A refused claim
-		// returns false → the caller runs the pooled path. The image lives at the arena
-		// front, so `base` is a view spanning it and `base.view(off,len)` addresses any
-		// block; scratch bump-carves after it. ──
+		// (rewind + re-zero + image H2D + one drain); else claim fresh, walking the ask
+		// down 1/16 per refusal. `footprint` is only the adopt size ask — there is no
+		// fit/no-fit gate: the windowed engine sizes itself to whatever the claim
+		// mapped. The image lives at the arena front, so `base` is a view spanning it
+		// and `base.view(off,len)` addresses any block; scratch bump-carves after it. ──
 		let image = stage.into_host();
 		let image_floats = image.len();
-		let footprint = crate::model::plan_footprint(self, data, false);
-		let slab = gpu_core::memory::adopt_run_backing_with_image(footprint, &image).or_else(|| {
-			gpu_core::memory::release_run_backing();
-			(footprint <= gpu_core::memory::claimable_bytes())
-				.then(|| gpu_core::memory::claim_device_arena_with_image(&image))
-				.flatten()
-		});
-		let slab = match slab {
-			Some(s) => s,
-			None => {
-				eprintln!(
-					"arena: claim refused — footprint {} claimable {} free {} (falling to pooled)",
-					crate::data::human_bytes(footprint),
+		// The adopt ask = image + the engine's static carve floor (residents +
+		// 1-sample windows) — NOT the run's working set: the engine sizes windows
+		// to whatever arena remains and waterfalls the overflow, so any slab above
+		// the floor is adoptable. Asking for the full working set would free a
+		// perfectly good slab (its bytes become pool slack the fresh claim's
+		// counters can't see) and shrink every later run; asking image-only lets a
+		// contention-shrunken slab through and the residents overflow it mid-build.
+		let cc_pre = recipe_infer::concat_layer_dims(&plan.dims());
+		let need = image_floats * 8
+			+ crate::ooc::Ooc::min_bytes(&plan.dims(), n, cc_pre.map(|(_, a, c)| (a, c)));
+		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
+			.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
+			.unwrap_or_else(|| {
+				// Nothing parked AND the walk-down claim failed even at 1 MB: the device
+				// cannot map the run at all — a broken device, not a routing event.
+				panic!(
+					"arena: claim failed — image {} claimable {} free {}",
+					crate::data::human_bytes(need),
 					crate::data::human_bytes(gpu_core::memory::claimable_bytes()),
 					crate::data::human_bytes(gpu_core::memory::vram_free_base()),
-				);
-				return false;
-			}
-		};
+				)
+			});
 		let base = slab.view(0, image_floats);
 		// ── materialize weights from the image (pure carve, no init kernel/transfer) ──
 		let params = plan.materialize(&base, w_off);
 		let last = params.len() - 1;
+		let cc_fit = concat_layer(&params);
 		let consts_view = base.view(consts_off, 12);
-		let mut sc = {
+		// THE fit scratch: the windowed engine owns every big full-batch buffer, so the
+		// Scratch is the minimal resident set with its 12 constants carved from the
+		// image. Carved BEFORE `Ooc::build` seals the arena tail.
+		let sc = {
 			let _t = gpu_core::memory::tag_scope("scratch");
-			Scratch::new_staged(&params, n, false, &consts_view, n_timed)
+			Scratch::carve(&params, n, &consts_view, n_timed)
 		};
 		let ss = StepScalars {
 			neg_lr: base.view(sc_off, 1),
@@ -1615,8 +974,8 @@ impl ModelInner {
 			(base.view(x_off, xinput.len()), None)
 		};
 		let ybuf = base.view(y_off, n * k);
-		// ── summary + roofline header (matches the pooled print: stderr on a plain
-		// first fit, dashboard header when plotting, silent on a rerun) ──
+		// ── summary + roofline header (stderr on a plain first fit, dashboard header
+		// when plotting, silent on a rerun) ──
 		let summary = if cfg.metrics.is_empty() {
 			String::new()
 		} else {
@@ -1648,6 +1007,16 @@ impl ModelInner {
 				);
 			}
 		}
+		// ── the windowed engine: carves its residents/windows/homes from the arena
+		// remainder and seals the tail (must run AFTER the Scratch carve above). An
+		// all-VRAM run streams zero windows — every op reads full-batch residents, so
+		// the loop moves nothing and syncs nothing. ──
+		let mut ooc = {
+			let _t = gpu_core::memory::tag_scope("waterfall");
+			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone());
+			o.report();
+			o
+		};
 		// ── loop: zero device allocations (AllocGuard); saturation watchdog live ──
 		let _guard = gpu_core::memory::AllocGuard::freeze();
 		gpu_core::hw::arm_saturation_crash();
@@ -1660,21 +1029,18 @@ impl ModelInner {
 		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
 		// Per-recorded-epoch host records replayed AFTER the loop (batch logging
-		// keeps the loop transfer-free): epoch, wall-clock, whether it was a
-		// scheduled log epoch, and its roofline event-set index (None when the epoch
-		// records no per-layer block). The boundaries themselves are recorded on the
-		// null stream into that set; the ONE exit drain completes them and the replay
-		// reads them with NO further sync — so the loop does zero event syncs.
-		// Checkpoint and plot runs record EVERY epoch (the divergence test and the
-		// plot series replay per-epoch from the ring); otherwise only log epochs. The
-		// metric values themselves go into the device ring — raw kernel outputs
-		// (ss_res / accuracy / loss reduction), transformed host-side at replay.
-		let mut epoch_meta: Vec<(usize, f64, bool, Option<usize>)> = Vec::new();
+		// keeps the loop transfer-free): epoch, wall-clock, and whether it was a
+		// scheduled log epoch. Checkpoint and plot runs record EVERY epoch (the
+		// divergence test and the plot series replay per-epoch from the ring);
+		// otherwise only log epochs. The metric values themselves go into the device
+		// ring — raw kernel outputs (ss_res / accuracy / loss reduction), transformed
+		// host-side at replay. Per-layer roofline is the engine's own streamed-sweep
+		// lines, not a Scratch event replay.
+		let mut epoch_meta: Vec<(usize, f64, bool)> = Vec::new();
 		let ring_every = checkpointing || plotting;
 		// Host-side (sign, div) rescale for each ring row, filled once in the loop;
 		// constant across epochs (depends only on loss / metric / n / ss_tot).
 		let mut ring_scale: Vec<(f64, f64)> = vec![(1.0, 1.0); n_rows];
-		let mut timed_slot = 0usize; // next roofline event set to record into
 		for e in 0..cfg.epochs {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
@@ -1682,24 +1048,13 @@ impl ModelInner {
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-			let time_layers = log_now && !plotting;
-			// Record this epoch's boundaries into its own event set (read at exit).
-			let this_slot = time_layers.then_some(timed_slot);
-			if let Some(s) = this_slot {
-				sc.set_timing_slot(s);
-			}
-			sc.set_timing(time_layers);
-			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit);
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				break;
 			}
-			self.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
-			sc.set_timing(false);
-			if time_layers {
-				timed_slot += 1;
-			}
+			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, cc_fit);
 			if log_now || ring_every {
-				forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+				ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit);
 				if INTERRUPTED.load(Ordering::SeqCst) {
 					break;
 				}
@@ -1711,7 +1066,7 @@ impl ModelInner {
 					let slot = base.view(ring_off + mi * epochs + e, 1);
 					ring_scale[mi] = metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot);
 				}
-				epoch_meta.push((e, start.elapsed().as_secs_f64(), log_now, this_slot));
+				epoch_meta.push((e, start.elapsed().as_secs_f64(), log_now));
 			}
 		}
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
@@ -1719,7 +1074,7 @@ impl ModelInner {
 		// the reserved end-score slot on device (no D2H). Executed BEFORE the
 		// loop-boundary snapshot so its launches/GEMMs count as loop work, not exit.
 		if !was_interrupted {
-			forward_into(&params, &xbuf, x_cat.as_ref(), n, &sc.acts, &sc);
+			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit);
 			let end_slot = base.view(end_off, 1);
 			if classify {
 				if k == 1 {
@@ -1739,15 +1094,16 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
 		}
-		// ── exit: bring the exit-region prefix home INSIDE the park op (`park_staged`)
-		// — the prefix D2H enqueue rides the park, the Scratch drop's mandated
-		// device_synchronize is the ONE blocking drain (it also completes every
-		// roofline event), then the slab is PARKED (not freed) for later eval/save.
-		// The per-epoch event sets are moved out first so their handles outlive the
-		// drop. This is the D2H fold: the exit does no standalone transfer. ──
-		let (ev_fwd, ev_bwd) = sc.take_events();
+		// ── exit: bring the exit-region prefix home INSIDE the park op (`park`) — the
+		// prefix D2H enqueue rides the park, then ONE explicit device_synchronize is
+		// the exit's single blocking drain, then the slab is PARKED (not freed) for
+		// later eval/save. This is the D2H fold: the exit does no standalone transfer.
+		// The engine drops first (its buffers are non-owning arena views; an all-VRAM
+		// run's write-behind barrier drains zero lanes) — it never touches the arena,
+		// whose park/free the caller owns. ──
+		drop(ooc);
 		let src = base.as_ptr_offset(0);
-		let host = self.park_staged(slab, src, prefix_len, sc);
+		let host = self.park(slab, src, prefix_len, sc);
 		// stats → host Scaler (the one crossing to RAM, per the invariant). A rerun
 		// pushed the SAME stats in and never re-fit, so nothing crosses back.
 		if d_sc > 0 && !rerun {
@@ -1776,15 +1132,15 @@ impl ModelInner {
 		};
 		let key = self.loss.score_key();
 		// Deferred per-epoch replay in epoch order: the scheduled log lines, and —
-		// when checkpointing — the pooled divergence semantics reproduced from the
-		// ring rows (first loss rise → save once under the best-score guard, keyed
-		// with THAT epoch's score; NaN loss → stop). The bytes written are the exit
-		// image's weights — the run's only host copy, so a divergence save carries
-		// the final weights, not the epoch-e snapshot the pooled path writes (the
-		// per-epoch weights never come home under the one-D2H exit contract).
+		// when checkpointing — the divergence semantics reproduced from the ring rows
+		// (first loss rise → save once under the best-score guard, keyed with THAT
+		// epoch's score; NaN loss → stop). The bytes written are the exit image's
+		// weights — the run's only host copy, so a divergence save carries the final
+		// weights (the per-epoch weights never come home under the one-D2H exit
+		// contract).
 		let mut loss_prev = f64::INFINITY;
 		let mut ckpt_saved = false;
-		for (e, elapsed, was_log, roof_slot) in &epoch_meta {
+		for (e, elapsed, was_log) in &epoch_meta {
 			let score = val_of(stop_metric, *e);
 			if score.is_finite() {
 				fit_score = score;
@@ -1828,13 +1184,6 @@ impl ModelInner {
 					line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
 				}
 				eprintln!("{line}");
-				// Roofline block read from the epoch's event set AFTER the exit drain —
-				// the events are complete, so this needs no further sync (loop stayed
-				// event-sync-free). Byte-identical to the old in-loop print.
-				if *was_log && let Some(s) = roof_slot {
-					let (fms, bms) = recipe_infer::layer_ms_from(&ev_fwd[*s], &ev_bwd[*s], params.len());
-					eprint!("{}", Self::roofline_block(&params, n, &fms, &bms));
-				}
 			}
 		}
 		// TUI plot fed ONCE from the ring (full series) — same renderer, same
@@ -1842,7 +1191,7 @@ impl ModelInner {
 		if plotting && !epoch_meta.is_empty() {
 			let plot_rows: Vec<Vec<f64>> = epoch_meta
 				.iter()
-				.map(|(e, elapsed, _, _)| {
+				.map(|(e, elapsed, _)| {
 					let mut row = vec![*elapsed];
 					for &m in &plot_ys {
 						row.push(match m {
@@ -1858,9 +1207,9 @@ impl ModelInner {
 			let _ = term.draw(|frame| {
 				self.render_dashboard(frame, &summary, &plot_rows, &plot_ys);
 			});
-			// One frame post-loop (the staged loop is transfer-free, nothing renders
-			// live) — hold the alt screen until a key press so the dashboard is
-			// actually seen; an instant restore made a staged .plot() run invisible.
+			// One frame post-loop (the loop is transfer-free, nothing renders live) —
+			// hold the alt screen until a key press so the dashboard is actually seen;
+			// an instant restore made a batch-replayed .plot() run invisible.
 			if std::io::stdin().is_terminal() {
 				loop {
 					match event::read() {
@@ -1895,10 +1244,10 @@ impl ModelInner {
 		// the ^C flush writes the exit image (the only in-memory copy) UNLESS the
 		// file already holds a strictly better-scored checkpoint — an interrupted
 		// (or NaN-scored) flush must never destroy a good prior run's weights.
-		// A completed run keeps the pooled best-only guard on the end score.
+		// A completed run keeps the best-only guard on the end score.
 		if let Some(path) = checkpoint_path.as_deref() {
 			let sw = self.saved_ogdl.borrow();
-			let text = &sw.as_ref().expect("staged fit leaves a mirror").text;
+			let text = &sw.as_ref().expect("fit leaves a mirror").text;
 			if was_interrupted {
 				let better_on_disk = recipe_infer::saved_score(path, key)
 					.is_some_and(|best| !(fit_score.is_finite() && fit_score > best));
@@ -1920,11 +1269,10 @@ impl ModelInner {
 		}
 		*self.params.borrow_mut() = params;
 		self.fit_score.set(fit_score);
-		// No pool_trim here (unlike the pooled path): a staged fit only bump-carves
-		// from the arena — it never grows the pool, so there is no freed slack to
-		// trim and no stale high-water. pool_trim's device_synchronize would be a
-		// SECOND exit blocking sync; the exit contract is exactly one (the Scratch
-		// drop drain above).
+		// No pool_trim: the fit only bump-carves from the arena — it never grows the
+		// pool, so there is no freed slack to trim and no stale high-water. A
+		// pool_trim's device_synchronize would be a SECOND exit blocking sync; the exit
+		// contract is exactly one (the explicit drain inside `park`).
 		if let (Some(b0), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
 			for (phase, a, b) in [
 				("init", &b0, &init),
@@ -1941,45 +1289,25 @@ impl ModelInner {
 				eprintln!("── ledger {phase} ── H2D calls {h}  D2H calls {dd}");
 			}
 		}
-		true
 	}
 	/// The exit/park op: enqueue the prefix D2H INSIDE this call (so the exit does no
-	/// standalone transfer), let the Scratch drop be the ONE blocking drain, fan the
-	/// pinned bounce into `host` on all cores, then park the slab (kept resident, not
-	/// freed, for later eval/save). `src` is the arena front (prefix start). A prefix
-	/// larger than the bounce falls back to a blocking chunked download — same fold,
-	/// the transfer still lives inside this park call.
-	fn park_staged(&self, slab: GpuBuffer, src: *mut std::ffi::c_void, prefix_len: usize, sc: Scratch) -> Vec<f64> {
+	/// standalone transfer), take ONE explicit `device_synchronize` as the exit's
+	/// single blocking drain (the Scratch is all arena carves now — its drop drains
+	/// nothing), fan the pinned run-pin into `host` on all cores, then park the slab
+	/// (kept resident, not freed, for later eval/save). `src` is the arena front
+	/// (prefix start); the run-pin grows to any prefix size, so one enqueue moves it.
+	fn park(&self, slab: GpuBuffer, src: *mut std::ffi::c_void, prefix_len: usize, sc: Scratch) -> Vec<f64> {
 		let mut host = vec![0.0f64; prefix_len];
 		let prefix_bytes = prefix_len * 8;
-		if prefix_bytes <= gpu_core::memory::BOUNCE_LIMIT {
-			let inflight = unsafe {
-				gpu_core::memory::exit_d2h_enqueue(src, prefix_bytes).expect("exit prefix d2h enqueue")
-			};
-			drop(sc); // the ONE exit blocking sync: drains the enqueued D2H + completes events
-			inflight.finish(&mut host);
-		} else {
-			drop(sc); // drain first, then a blocking chunked download of the oversize prefix
-			GpuBuffer::borrow(src, prefix_bytes).download(&mut host).expect("exit prefix d2h");
-		}
+		let inflight = unsafe {
+			gpu_core::memory::exit_d2h_enqueue(src, prefix_bytes).expect("exit prefix d2h enqueue")
+		};
+		// The ONE exit blocking sync: drains the enqueued prefix D2H (and all loop work).
+		gpu_core::hip::device_synchronize().expect("exit drain");
+		drop(sc); // ordering: released before the pin is fanned into host, drains nothing
+		inflight.finish(&mut host);
 		gpu_core::memory::park_run_backing(slab);
 		host
-	}
-	fn save_checkpoint(&self, path: &str, score: f64) {
-		let params = self.params.borrow();
-		assert!(!params.is_empty(), "save: call train() first");
-		let key = self.loss.score_key();
-		if !score.is_finite() || recipe_infer::saved_score(path, key).is_some_and(|best| score <= best)
-		{
-			return;
-		}
-		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-		recipe_infer::write_ogdl(path, &recipe_infer::dump_ogdl(&params, None, key, score));
-		let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-		eprintln!(
-			"saved {} ({neurons} neurons, {key} {score:.4})",
-			full.display()
-		);
 	}
 	/// Adapt a `Dataset` to GPU input buffers exactly as training did — collapse
 	/// one-hot for an embed-first model, split text vs categorical columns, and

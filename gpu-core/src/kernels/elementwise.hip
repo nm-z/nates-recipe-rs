@@ -673,6 +673,21 @@ extern "C" void launch_argmax_rows(const double* x, double* out, int rows, int c
     hipLaunchKernelGGL(argmax_rows_kernel, grid, block, 0, stream, x, out, rows, cols);
 }
 
+// ── Copy ────────────────────────────────────────────────────────────────────────
+
+extern "C" __global__ void copy_f64_kernel(const double* __restrict__ src, double* __restrict__ dst, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) dst[i] = src[i];
+}
+
+extern "C" void launch_copy_f64(const double* src, double* dst, long long n, hipStream_t stream) {
+    dim3 block(256);
+    long long want = (n + 255) / 256;
+    dim3 grid((unsigned)(want > 65535 ? 65535 : (want < 1 ? 1 : want)));
+    hipLaunchKernelGGL(copy_f64_kernel, grid, block, 0, stream, src, dst, n);
+}
+
 // ── Leaky ReLU ──────────────────────────────────────────────────────────────
 
 extern "C" __global__ void leaky_relu_kernel(const double* x, double* out, int n, const double* alpha_ptr) {

@@ -39,7 +39,7 @@ fn main() {
 	let nn_train = Train::new()
 		.epochs(20)
 		.net(["archy", "sentry"])
-		.log([Loss, Accuracy]);
+		.log([Loss, Accuracy, hip]);
 
 	let cnn = Model::new()            // CNN
 		.loss(ce)
@@ -59,7 +59,7 @@ fn main() {
 	let cnn_train = Train::new()
 		.epochs(20)
 		.net(["archy", "sentry"])
-		.log([Loss, Accuracy]);
+		.log([Loss, Accuracy, hip]);
 
 	let mlp = Model::new()          // MLP
 		.loss(mse)
@@ -94,7 +94,7 @@ fn main() {
 	let llm_train = Train::new()
 		.epochs(1)
 		.net(["archy", "sentry"])
-		.log([Loss, Accuracy]);
+		.log([Loss, Accuracy, hip]);
 
 	for (model, data, train)
 		in [(&nn , &nn_data , &nn_train ),
