@@ -669,6 +669,13 @@ pub unsafe fn xfer(
 	};
 	b.fetch_add(bytes, Ordering::Relaxed);
 	c.fetch_add(1, Ordering::Relaxed);
+	if kind != HIP_MEMCPY_H2D {
+		// Standalone async transfer call — the run state table's `async` cell.
+		// H2D is excluded (the bounce makes it blocking; its chunk waits land in
+		// the sync cell), as are the claim/park riding paths (they never enter
+		// this choke — the transfer is part of the claim/park op itself).
+		crate::callspy::tick(&crate::callspy::XFER_ASYNC);
+	}
 	if kind == HIP_MEMCPY_H2D {
 		// H2D goes through a pinned bounce: with SDMA disabled (gfx-L2 staleness
 		// on reused pool pages — see hip::disable_sdma_once) the blit engine does
@@ -927,14 +934,19 @@ pub(crate) unsafe fn xfer_sync(
 		}
 		return Ok(());
 	}
-	// SAFETY: forwarded from the caller's validated pointers.
-	unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) }?;
 	if kind == HIP_MEMCPY_H2D {
-		// h2d_pinned already held the bounce lock across a per-chunk stream
-		// sync — the copy is complete here; a trailing wait would be the
+		// h2d_pinned holds the bounce lock across a per-chunk stream sync — the
+		// copy is complete when xfer returns; a trailing wait would be the
 		// second stall for the same transfer.
-		return Ok(());
+		// SAFETY: forwarded from the caller's validated pointers.
+		return unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) };
 	}
+	// Blocking D2D: counted here, not through `xfer` — the async choke's
+	// XFER_ASYNC tick is for enqueue-only calls and this one waits.
+	D2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+	D2D_CALLS.fetch_add(1, Ordering::Relaxed);
+	// SAFETY: forwarded from the caller's validated pointers.
+	unsafe { dev_copy(dst, src, bytes, kind, std::ptr::null_mut()) }?;
 	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
 	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
 }

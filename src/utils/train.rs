@@ -1018,6 +1018,7 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
+		gpu_core::callspy::mark_loop_start();
 		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
@@ -1199,6 +1200,7 @@ impl ModelInner {
 			}
 		}
 		gpu_core::hw::disarm_saturation_crash();
+		gpu_core::callspy::mark_loop_end();
 		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		drop(_alloc_guard);
@@ -1653,6 +1655,7 @@ impl ModelInner {
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
+		gpu_core::callspy::mark_loop_start();
 		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
@@ -1729,6 +1732,7 @@ impl ModelInner {
 			}
 		}
 		gpu_core::hw::disarm_saturation_crash();
+		gpu_core::callspy::mark_loop_end();
 		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
 		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		drop(_guard);

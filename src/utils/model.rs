@@ -324,6 +324,11 @@ impl Train {
 		// — the detector's claim/forward/release during data prep and the training
 		// arena claim show up in the pre-fit block, the exit park in the post-fit one.
 		let run_hip = self.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
+		// The run state table's init boundary: every training run prints the spec's
+		// init/loop/exit tree at its end, phases cut at run entry / first epoch /
+		// last epoch / run end. Unconditional — the state is the run's report card,
+		// not an opt-in metric.
+		let run_state = gpu_core::callspy::snapshot();
 		// A scenario whose encoded matrix exceeds the combined VRAM+RAM+disk ceiling
 		// is skipped instead of crashing the whole program. tiered::admit prints the
 		// size before bailing; catch that here, report the skip, and move on. Any
@@ -430,6 +435,10 @@ impl Train {
 			last.target_names = data.target_names();
 			last.raw_test_rows = data.raw_rows();
 			last.raw_test_headers = data.raw_headers();
+			drop(last);
+			if let Some(t) = gpu_core::callspy::state_report(&run_state) {
+				eprint!("{t}");
+			}
 		} else {
 			// Rebuild the params from the host mirror if a later run freed their arena
 			// backing, so scoring never dereferences freed device memory.
