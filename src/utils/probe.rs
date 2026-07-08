@@ -15,6 +15,9 @@ use std::time::Instant;
 // ── device table ─────────────────────────────────────────────────────────────
 /// One GPU's measured resources. Sizes queried, rates timed at probe.
 #[derive(Clone, Debug, PartialEq)]
+/// All rates are PAYLOAD throughput — the number `size / bandwidth = time`
+/// divides by (a D2D copy's bus traffic is 2x its payload; the scheduler
+/// never needs the bus figure).
 pub struct GpuDev {
 	pub vram: u64,          // total bytes (hipMemGetInfo)
 	pub pcie_gbs: f64,      // H2D upload GB/s
@@ -68,10 +71,10 @@ impl Machine {
 		eprintln!("recipe probe: measuring cpu (ddr5 + flops)");
 		let ddr5_gbs = bench_ddr5();
 		let cpu_gflops = bench_cpu_flops();
-		let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-		let disk_size = disk_total(&cwd)?;
+		let dd = data_dir();
+		let disk_size = disk_total(&dd)?;
 		eprintln!("recipe probe: measuring disk (sata)");
-		let sata_gbs = bench_disk(&cwd)?;
+		let sata_gbs = bench_disk(&dd)?;
 		Ok(Machine { host, gpus, ram, ddr5_gbs, cpu_gflops, disk_size, sata_gbs })
 	}
 
@@ -293,30 +296,54 @@ fn bench_ddr5() -> f64 {
 	bytes as f64 / best / 1e9
 }
 
+/// The disk device's ONE home: ~/.cache/recipe — the probe measures THIS
+/// filesystem and the runtime spills to it, so SIZE/SATA are the numbers the
+/// scheduler's disk tier actually gets, independent of the process cwd.
+pub fn data_dir() -> std::path::PathBuf {
+	let base = std::env::var("XDG_CACHE_HOME")
+		.map(std::path::PathBuf::from)
+		.unwrap_or_else(|_| {
+			std::path::PathBuf::from(std::env::var("HOME").expect("HOME unset")).join(".cache")
+		});
+	let dir = base.join("recipe");
+	std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("data_dir {}: {e}", dir.display()));
+	dir
+}
+
 // One f64 FMA per iter across all cores; black_box the operand so the chain is
 // not folded away. 2 flops per FMA.
 fn bench_cpu_flops() -> f64 {
+	// 8 independent FMA lanes per thread: a single serial chain measures FMA
+	// LATENCY (one op waiting on the last); independent lanes fill the pipeline
+	// and vectorize, measuring the compute the scheduler can actually buy.
 	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-	let iters: u64 = 200_000_000;
+	let iters: u64 = 100_000_000;
 	let t = Instant::now();
 	let sum: f64 = std::thread::scope(|sc| {
 		let handles: Vec<_> = (0..threads)
 			.map(|kk| {
 				sc.spawn(move || {
-					let mut a = 0.5_f64 + kk as f64 * 1e-9;
-					let b = 0.9999999_f64;
-					let c = 0.0000001_f64;
-					for _ in 0..iters {
-						a = a.mul_add(std::hint::black_box(b), std::hint::black_box(c));
+					let mut lanes = [0.5_f64 + kk as f64 * 1e-9; 8];
+					for (i, l) in lanes.iter_mut().enumerate() {
+						*l += i as f64 * 1e-9;
 					}
-					a
+					let b = std::hint::black_box(0.9999999_f64);
+					let c = std::hint::black_box(0.0000001_f64);
+					for _ in 0..iters {
+						for l in lanes.iter_mut() {
+							// plain mul+add: baseline x86-64 has no FMA instruction, so
+							// mul_add is a libm CALL — this vectorizes, that doesn't.
+							*l = *l * b + c;
+						}
+					}
+					lanes.iter().sum::<f64>()
 				})
 			})
 			.collect();
 		handles.into_iter().map(|h| h.join().unwrap_or(0.0)).sum()
 	});
 	std::hint::black_box(sum);
-	let flops = threads as f64 * iters as f64 * 2.0;
+	let flops = threads as f64 * iters as f64 * 8.0 * 2.0;
 	flops / t.elapsed().as_secs_f64() / 1e9
 }
 

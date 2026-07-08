@@ -107,9 +107,9 @@ fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
 // the fd keeps it alive and the space reclaims however the process dies (a
 // SIGKILLed run leaked a 40 GB spill on disk once).
 fn open_spill() -> File {
-	let path = std::env::current_dir()
-		.unwrap_or_else(|_| ".".into())
-		.join(".recipe_spill");
+	// The disk device's ONE home (same filesystem the probe measured): the
+	// registry's SIZE/SATA describe exactly where windows spill.
+	let path = crate::probe::data_dir().join(".recipe_spill");
 	let f = OpenOptions::new()
 		.read(true)
 		.write(true)
@@ -408,8 +408,7 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-	let disk_avail = disk_free(&cwd).saturating_sub(USER_GB);
+	let disk_avail = disk_free(&crate::probe::data_dir()).saturating_sub(USER_GB);
 	if need > vram_avail + ram_avail + disk_avail + net_ram {
 		return None;
 	}
@@ -711,7 +710,7 @@ impl Ooc {
 		// Disk fills to ITS reserve line, then windows go remote: each pooled
 		// node takes up to its HELLO-reported MemAvailable minus the same 1 GB
 		// user reserve (the reserve law applies on the far side too).
-		let disk_budget = disk_free(&std::env::current_dir().unwrap_or_else(|_| ".".into()))
+		let disk_budget = disk_free(&crate::probe::data_dir())
 			.saturating_sub(USER_GB);
 		let net_caps: Vec<usize> = net.as_ref().map_or(Vec::new(), |ns| {
 			ns.iter().map(|c| (c.info.ram as usize).saturating_sub(USER_GB)).collect()
