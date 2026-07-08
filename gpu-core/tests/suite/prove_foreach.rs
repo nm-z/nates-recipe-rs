@@ -104,7 +104,7 @@ type LaunchU = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void
 type LaunchB = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, *mut c_void);
 
 fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		f(
@@ -116,12 +116,12 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn run_b(f: LaunchB, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	unsafe {
 		f(
@@ -134,7 +134,7 @@ fn run_b(f: LaunchB, a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; a.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

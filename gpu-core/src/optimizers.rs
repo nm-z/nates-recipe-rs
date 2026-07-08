@@ -230,38 +230,6 @@ pub fn gpu_lamb_phase2(
 	Ok(())
 }
 
-// not-an-op: driver — LAMB orchestration; allocates workspace, uploads scalars, composes
-// gpu_lamb_phase1 + gpu_lamb_phase2 with norms staying device-side (no D2H roundtrip).
-pub fn gpu_lamb_update(
-	w: &GpuBuffer,
-	m: &GpuBuffer,
-	v: &GpuBuffer,
-	g: &GpuBuffer,
-	lr: f64,
-	b1: f64,
-	b2: f64,
-	eps: f64,
-	wd: f64,
-	t: i32,
-	n: usize,
-) -> Result<(), HipError> {
-	let tmp_upd = GpuBuffer::alloc(n)?;
-	let w_norm_sq = GpuBuffer::alloc(1)?;
-	let u_norm_sq = GpuBuffer::alloc(1)?;
-	let lr_b = GpuBuffer::upload(&[lr])?;
-	let b1_b = GpuBuffer::upload(&[b1])?;
-	let b2_b = GpuBuffer::upload(&[b2])?;
-	let eps_b = GpuBuffer::upload(&[eps])?;
-	let wd_b = GpuBuffer::upload(&[wd])?;
-
-	gpu_lamb_phase1(
-		g, &b1_b, &b2_b, &eps_b, &wd_b, t as usize, n, w, m, v, &tmp_upd, &w_norm_sq,
-		&u_norm_sq,
-	)?;
-	gpu_lamb_phase2(&tmp_upd, &lr_b, &w_norm_sq, &u_norm_sq, n, w)?;
-	Ok(())
-}
-
 /// Lion: update = sign(b1*m + (1-b1)*g); w -= lr*(update + wd*w); m = b2*m + (1-b2)*g (in-place).
 pub fn gpu_lion_update(
 	g: &GpuBuffer,

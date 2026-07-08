@@ -7,24 +7,6 @@
 //! framework's f64-only buffers.
 
 use anyhow::{Result, anyhow, bail};
-use gpu_core::memory::GpuBuffer;
-use std::collections::BTreeMap;
-use std::path::Path;
-
-/// Load a `.safetensors` file into one GPU buffer per tensor, keyed by name (the
-/// `BTreeMap` sorts and dedups). Every tensor's bytes are decoded to f64 on the host
-/// and uploaded once. A missing/short header or an offset outside the blob is a hard
-/// error — a clear cause beats a silently truncated tensor.
-pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<BTreeMap<String, GpuBuffer>> {
-	let path = path.as_ref();
-	let bytes =
-		std::fs::read(path).map_err(|e| anyhow!("safetensors: read {}: {e}", path.display()))?;
-	let mut out = BTreeMap::new();
-	for (name, vals) in parse_safetensors(&bytes)? {
-		out.insert(name, GpuBuffer::upload(&vals)?);
-	}
-	Ok(out)
-}
 
 /// Decode a safetensors byte image into `(name, shape, values)` triples in header order
 /// — the GPU-free host core, unit-testable without a device. Skips the optional
@@ -142,8 +124,8 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<(usize, Vec<TensorEntry>
 	Ok((data_start, out))
 }
 
-/// `(name, values)` pairs, dropping shape — the original flat view used by
-/// `load_safetensors`. Thin wrapper over [`parse_safetensors_shaped`].
+/// `(name, values)` pairs, dropping shape — the flat host view. Thin wrapper
+/// over [`parse_safetensors_shaped`].
 pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<(String, Vec<f64>)>> {
 	Ok(parse_safetensors_shaped(bytes)?.into_iter().map(|(n, _, v)| (n, v)).collect())
 }

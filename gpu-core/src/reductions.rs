@@ -397,7 +397,8 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	let mut work = GpuBuffer::alloc(pn)?;
 	work.copy_from(x, n * 8)?;
 	if pn > n {
-		let sentinel = GpuBuffer::upload(&[f64::MAX])?;
+		let sentinel = GpuBuffer::alloc(1)?;
+		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&work, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;
@@ -422,7 +423,8 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	keys.copy_from(x, n * 8)?;
 	gpu_init_idx(pn, &vals)?;
 	if pn > n {
-		let sentinel = GpuBuffer::upload(&[f64::MAX])?;
+		let sentinel = GpuBuffer::alloc(1)?;
+		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&keys, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;
@@ -453,7 +455,8 @@ pub fn gpu_sort_by_key(
 	wk.copy_from(keys, n * 8)?;
 	wv.copy_from(vals, n * 8)?;
 	if pn > n {
-		let sentinel = GpuBuffer::upload(&[f64::MAX])?;
+		let sentinel = GpuBuffer::alloc(1)?;
+		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&wk, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;

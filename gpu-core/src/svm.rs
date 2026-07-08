@@ -200,13 +200,15 @@ fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	unsafe {
 		let src = (buf.ptr_raw() as *const u8).add(idx * std::mem::size_of::<f64>())
 			as *const c_void;
-		crate::memory::xfer_sync(
+		crate::memory::xfer(
 			v.as_mut_ptr() as *mut c_void,
 			src,
 			std::mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_D2H,
+			std::ptr::null_mut(),
 		)?;
 	}
+	crate::hip::device_synchronize()?;
 	Ok(v[0])
 }
 
@@ -214,11 +216,12 @@ fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 	let v = [val];
 	unsafe {
-		crate::memory::xfer_sync(
+		crate::memory::xfer(
 			buf.ptr_raw(),
 			v.as_ptr() as *const c_void,
 			std::mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_H2D,
+			std::ptr::null_mut(),
 		)?;
 	}
 	Ok(())
@@ -250,12 +253,14 @@ pub fn gpu_smo_train(
 	tol: f64,
 	max_iter: i32,
 ) -> Result<(Vec<f64>, f64), HipError> {
-	let y_buf = GpuBuffer::upload(y_pm1)?;
+	let y_buf = GpuBuffer::alloc(n)?;
+	y_buf.load(y_pm1)?;
 	let alpha_buf = GpuBuffer::alloc(n)?;
 	alpha_buf.memset_zero(n * std::mem::size_of::<f64>())?;
 
 	// Gradient G[t] = -1 initially (all alphas = 0).
-	let grad_buf = GpuBuffer::upload(&vec![-1.0_f64; n])?;
+	let grad_buf = GpuBuffer::alloc(n)?;
+	grad_buf.load(&vec![-1.0_f64; n])?;
 
 	let score_i_buf = GpuBuffer::alloc(n)?;
 	let score_j_buf = GpuBuffer::alloc(n)?;
@@ -264,10 +269,14 @@ pub fn gpu_smo_train(
 	let argmax_out = GpuBuffer::alloc(2)?;
 
 	// 1-elem device scalars the conforming ops consume.
-	let gamma_buf = GpuBuffer::upload(&[gamma])?;
-	let coef0_buf = GpuBuffer::upload(&[coef0])?;
-	let degree_buf = GpuBuffer::upload(&[degree])?;
-	let c_buf = GpuBuffer::upload(&[c])?;
+	let gamma_buf = GpuBuffer::alloc(1)?;
+	gamma_buf.load(&[gamma])?;
+	let coef0_buf = GpuBuffer::alloc(1)?;
+	coef0_buf.load(&[coef0])?;
+	let degree_buf = GpuBuffer::alloc(1)?;
+	degree_buf.load(&[degree])?;
+	let c_buf = GpuBuffer::alloc(1)?;
+	c_buf.load(&[c])?;
 	let di_buf = GpuBuffer::alloc(1)?;
 	let dj_buf = GpuBuffer::alloc(1)?;
 	let kind_u = kind as usize;
@@ -282,10 +291,12 @@ pub fn gpu_smo_train(
 		// Working-set selection on the GPU: i = argmax(score_i), j = argmax(score_j).
 		let mut o = [0.0_f64; 2];
 		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
-		argmax_out.download(&mut o)?;
+		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()?;
 		let (val_i, i) = (o[0], o[1] as usize);
 		gpu_smo_argmax(&score_j_buf, n, &argmax_out)?;
-		argmax_out.download(&mut o)?;
+		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()?;
 		let (val_j, j) = (o[0], o[1] as usize);
 		if val_i - val_j < tol {
 			break;

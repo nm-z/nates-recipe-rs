@@ -80,7 +80,7 @@ const TOL: f64 = 1e-6;
 
 // quantize: f64 x -> i8 codes (carried as u8 via two's complement reinterpret).
 fn gpu_quantize(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) -> Vec<i32> {
-	let bx = GpuBuffer::upload(x).unwrap();
+	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let bq = GpuBuffer::alloc_bytes(x.len()).unwrap();
 	unsafe {
 		let f = if i4 {
@@ -108,7 +108,7 @@ fn gpu_quantize(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) 
 // dequantize: i8 codes -> f64.
 fn gpu_dequantize(codes: &[i32], scale: f64, zp: i32) -> Vec<f64> {
 	let codes_u8: Vec<u8> = codes.iter().map(|&c| c as i8 as u8).collect();
-	let bq = GpuBuffer::upload_u8(&codes_u8).unwrap();
+	let bq = { let __u = &codes_u8; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
 	let bx = GpuBuffer::alloc(codes.len()).unwrap();
 	unsafe {
 		launch_quantizedx_dequantize_i8(
@@ -122,13 +122,13 @@ fn gpu_dequantize(codes: &[i32], scale: f64, zp: i32) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; codes.len()];
-	bx.download(&mut out).unwrap();
+	unsafe { bx.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 // fake_quant: f64 x -> f64 (dequant of quant), stays on f64 buffer.
 fn gpu_fake_quant(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) -> Vec<f64> {
-	let bx = GpuBuffer::upload(x).unwrap();
+	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let bo = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		let f = if i4 {
@@ -149,7 +149,7 @@ fn gpu_fake_quant(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	bo.download(&mut out).unwrap();
+	unsafe { bo.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

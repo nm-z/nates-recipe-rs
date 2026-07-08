@@ -21,16 +21,16 @@ fn test_csr_spmv() {
 	let row_ptr_h: [i32; 4] = [0, 2, 4, 5];
 	let x_h: [f64; 3] = [1.0, 2.0, 3.0];
 
-	let values = GpuBuffer::upload(&values_h).unwrap();
+	let values = { let __up = &values_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let col_idx = GpuBuffer::upload_i32(&col_idx_h).unwrap();
 	let row_ptr = GpuBuffer::upload_i32(&row_ptr_h).unwrap();
-	let x = GpuBuffer::upload(&x_h).unwrap();
+	let x = { let __up = &x_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	let y_gpu = GpuBuffer::alloc(3).unwrap();
 	graph::gpu_csr_spmv(&values, &col_idx, &row_ptr, &x, 3, &y_gpu).unwrap();
 
 	let mut y = [0.0f64; 3];
-	y_gpu.download(&mut y).unwrap();
+	unsafe { y_gpu.download_async(&mut y, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("SpMV y = {:?}", y);
 	assert!(y.iter().all(|v| v.is_finite()), "NaN/Inf in SpMV output");
@@ -50,16 +50,16 @@ fn test_csr_spmm() {
 	let row_ptr_h: [i32; 4] = [0, 2, 4, 5];
 	let b_h: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 
-	let values = GpuBuffer::upload(&values_h).unwrap();
+	let values = { let __up = &values_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let col_idx = GpuBuffer::upload_i32(&col_idx_h).unwrap();
 	let row_ptr = GpuBuffer::upload_i32(&row_ptr_h).unwrap();
-	let b = GpuBuffer::upload(&b_h).unwrap();
+	let b = { let __up = &b_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	let c_gpu = GpuBuffer::alloc(6).unwrap();
 	graph::gpu_csr_spmm(&values, &col_idx, &row_ptr, &b, 3, 2, &c_gpu).unwrap();
 
 	let mut c = [0.0f64; 6];
-	c_gpu.download(&mut c).unwrap();
+	unsafe { c_gpu.download_async(&mut c, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("SpMM C = {:?}", c);
 	let expected = [7.0, 10.0, 29.0, 36.0, 5.0, 10.0];
@@ -86,7 +86,7 @@ fn test_neighbor_aggregate_sum() {
 	let edge_src_h: [i32; 3] = [0, 2, 2];
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
 
-	let features = GpuBuffer::upload(&features_h).unwrap();
+	let features = { let __up = &features_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let edge_src = GpuBuffer::upload_i32(&edge_src_h).unwrap();
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
 
@@ -96,7 +96,7 @@ fn test_neighbor_aggregate_sum() {
 		.unwrap();
 
 	let mut agg = [0.0f64; 8];
-	agg_gpu.download(&mut agg).unwrap();
+	unsafe { agg_gpu.download_async(&mut agg, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("NeighborAgg sum = {:?}", agg);
 	let expected = [0.0, 0.0, 6.0, 8.0, 0.0, 0.0, 5.0, 6.0];
@@ -126,7 +126,7 @@ fn test_neighbor_aggregate_mean() {
 	let edge_src_h: [i32; 3] = [0, 2, 2];
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
 
-	let features = GpuBuffer::upload(&features_h).unwrap();
+	let features = { let __up = &features_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let edge_src = GpuBuffer::upload_i32(&edge_src_h).unwrap();
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
 
@@ -136,7 +136,7 @@ fn test_neighbor_aggregate_mean() {
 		.unwrap();
 
 	let mut agg = [0.0f64; 8];
-	agg_gpu.download(&mut agg).unwrap();
+	unsafe { agg_gpu.download_async(&mut agg, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("NeighborAgg mean = {:?}", agg);
 	let expected = [0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0];
@@ -168,7 +168,7 @@ fn test_gpu_degree() {
 	graph::gpu_degree(&edge_dst, 4, 3, &deg_gpu).unwrap();
 
 	let mut deg = [0.0f64; 4];
-	deg_gpu.download(&mut deg).unwrap();
+	unsafe { deg_gpu.download_async(&mut deg, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("Degree = {:?}", deg);
 	let expected = [0.0, 2.0, 0.0, 1.0];
@@ -194,12 +194,12 @@ fn test_gpu_gcn_norm() {
 	let mut features_h: [f64; 8] = [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
 	let deg_h: [f64; 4] = [1.0, 4.0, 9.0, 16.0];
 
-	let features = GpuBuffer::upload(&features_h).unwrap();
-	let deg = GpuBuffer::upload(&deg_h).unwrap();
+	let features = { let __up = &features_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let deg = { let __up = &deg_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	graph::gpu_gcn_norm(&deg, 4, 2, &features).unwrap();
 
-	features.download(&mut features_h).unwrap();
+	unsafe { features.download_async(&mut features_h, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("GCN norm features = {:?}", features_h);
 	assert!(
@@ -242,8 +242,8 @@ fn test_forward_backward() {
 		0.2f64.ln(),
 	];
 
-	let log_trans = GpuBuffer::upload(&log_trans_h).unwrap();
-	let log_emit = GpuBuffer::upload(&log_emit_h).unwrap();
+	let log_trans = { let __up = &log_trans_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let log_emit = { let __up = &log_emit_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	let alpha_gpu = GpuBuffer::alloc(6).unwrap();
 	let beta_gpu = GpuBuffer::alloc(6).unwrap();
@@ -257,9 +257,9 @@ fn test_forward_backward() {
 	let mut log_beta = [0.0f64; 6];
 	let mut log_gamma = [0.0f64; 6];
 
-	alpha_gpu.download(&mut log_alpha).unwrap();
-	beta_gpu.download(&mut log_beta).unwrap();
-	gamma_gpu.download(&mut log_gamma).unwrap();
+	unsafe { alpha_gpu.download_async(&mut log_alpha, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { beta_gpu.download_async(&mut log_beta, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { gamma_gpu.download_async(&mut log_gamma, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("log_alpha = {:?}", log_alpha);
 	println!("log_beta  = {:?}", log_beta);
@@ -348,8 +348,8 @@ fn test_viterbi() {
 		0.2f64.ln(),
 	];
 
-	let log_trans = GpuBuffer::upload(&log_trans_h).unwrap();
-	let log_emit = GpuBuffer::upload(&log_emit_h).unwrap();
+	let log_trans = { let __up = &log_trans_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let log_emit = { let __up = &log_emit_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	let delta = GpuBuffer::alloc(6).unwrap();
 	let backptr = GpuBuffer::alloc_bytes(6 * std::mem::size_of::<i32>()).unwrap();
@@ -441,7 +441,7 @@ fn test_boruvka_mst() {
 
 	let edge_src = GpuBuffer::upload_i32(&edge_src_h).unwrap();
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
-	let edge_w = GpuBuffer::upload(&edge_w_h).unwrap();
+	let edge_w = { let __up = &edge_w_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 	let result = cluster::gpu_boruvka_mst(&edge_src, &edge_dst, &edge_w, 4, 4).unwrap();
 
@@ -485,12 +485,12 @@ fn test_core_distance() {
 	// point 3: dists=[8,9,10] → 2nd = 9.0
 	let points_h: [f64; 4] = [0.0, 1.0, 2.0, 10.0];
 
-	let points = GpuBuffer::upload(&points_h).unwrap();
+	let points = { let __up = &points_h; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let core_dist_gpu = GpuBuffer::alloc(4).unwrap();
 	cluster::gpu_core_distance(&points, 4, 1, 2, &core_dist_gpu).unwrap();
 
 	let mut cd = [0.0f64; 4];
-	core_dist_gpu.download(&mut cd).unwrap();
+	unsafe { core_dist_gpu.download_async(&mut cd, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	println!("core_distance = {:?}", cd);
 	assert!(cd.iter().all(|v| v.is_finite()), "NaN/Inf in core_distance");

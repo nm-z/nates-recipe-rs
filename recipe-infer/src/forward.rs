@@ -4,154 +4,10 @@
 //! single-scalar device→host downloads, and the fused GPU metric reductions.
 
 use crate::enums::{Activation, LayerKind, Loss, Metric};
-use crate::params::{LayerParams, Scaler, concat_layer};
+use crate::params::{LayerParams, concat_layer};
 use crate::scratch::Scratch;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
-use std::cell::RefCell;
-
-/// One metric this epoch as a single GPU-reduced scalar, downloading only that
-/// scalar (never the n predictions). `out` = output activations (n×1, on GPU);
-/// `ss_tot` is precomputed once since the targets are fixed. R²/MSE/accuracy go
-/// through fused single-pass kernels (`gpu_ss_res_into`/`gpu_mse_into`/
-/// `gpu_accuracy_into`); MAE/Huber/CE go through `_into` variants writing into the
-/// preallocated `sc.metric_t*` temporaries — so the whole path allocates nothing.
-/// Matches `metric_num` exactly except accuracy differs only at the measure-zero
-/// p==0.5 tie (sigmoid outputs never land there).
-pub fn metric_gpu(
-	loss: Loss,
-	lr: f64,
-	m: Metric,
-	out: &GpuBuffer,
-	ybuf: &GpuBuffer,
-	sc: &Scratch,
-	n: usize,
-	k: usize,
-	ss_tot: f64,
-	epoch: usize,
-	elapsed: f64,
-) -> f64 {
-	let nk = n * k; // element count: n samples × k outputs, flat row-major
-	match m {
-		// Hip is not a per-epoch scalar — the trainer prints the call-count
-		// tree at run end and filters it out of the metric line.
-		Metric::Hip => f64::NAN,
-		Metric::Epoch => epoch as f64,
-		Metric::Lr => lr,
-		Metric::Time => elapsed,
-		Metric::R2 => {
-			kernels::gpu_ss_res_into(out, ybuf, nk, &sc.metric_scalar).expect("ss_res");
-			1.0 - sc.read_metric_scalar() / ss_tot
-		}
-		Metric::Accuracy => {
-			if k == 1 {
-				kernels::gpu_accuracy_into(out, ybuf, n, &sc.metric_scalar).expect("accuracy");
-			} else {
-				kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, &sc.metric_scalar).expect("argmax accuracy");
-			}
-			sc.read_metric_scalar()
-		}
-		// The Loss metric is the model's ACTUAL loss (self.loss), not hardcoded.
-		Metric::Loss => {
-			let nf = nk as f64;
-			match loss {
-				Loss::Mse => {
-					kernels::gpu_mse_into(out, ybuf, nk, &sc.metric_scalar).expect("mse");
-					sc.read_metric_scalar()
-				}
-				Loss::Mae => {
-					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0).expect("sub");
-					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0).expect("abs");
-					kernels::gpu_reduce_sum_cols_into(
-						&sc.metric_t0,
-						&sc.reduce_ws,
-						nk,
-						1,
-						&sc.metric_scalar,
-					).expect("reduce");
-					sc.read_metric_scalar() / nf
-				}
-				Loss::Huber => {
-					// delta=1: 0.5 r² for |r|≤1 else |r|-0.5, written as
-					// 0.5·clamp(r,-1,1)² + |r| - |clamp(r,-1,1)|.
-					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0).expect("sub"); // r
-					kernels::gpu_clamp_into(
-						&sc.metric_t0,
-						&sc.c_neg_one,
-						&sc.c_one,
-						nk,
-						&sc.metric_t1,
-					).expect("clamp"); // rc
-					kernels::gpu_copy_into(&sc.metric_t1, nk, &sc.metric_t2).expect("copy"); // e = rc
-					kernels::gpu_mul_inplace(&sc.metric_t1, nk, &sc.metric_t2).expect("mul"); // e = rc²
-					kernels::gpu_scale_inplace(&sc.c_half, nk, &sc.metric_t2).expect("scale"); // e = 0.5 rc²
-					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0).expect("abs"); // |r|
-					kernels::gpu_add_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("add"); // e += |r|
-					kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1).expect("abs"); // |rc|
-					kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2).expect("sub"); // e -= |rc|
-					kernels::gpu_reduce_sum_cols_into(
-						&sc.metric_t2,
-						&sc.reduce_ws,
-						nk,
-						1,
-						&sc.metric_scalar,
-					).expect("reduce");
-					sc.read_metric_scalar() / nf
-				}
-				Loss::Ce => {
-					// Categorical CE: p = softmax(logits); −Σ y·ln(p) / n. y is
-					// one-hot so only the true class contributes per sample.
-					kernels::gpu_softmax_rows_into(out, n, k, &sc.metric_t0).expect("softmax"); // p
-					kernels::gpu_clamp_into(
-						&sc.metric_t0,
-						&sc.c_eps,
-						&sc.c_one,
-						nk,
-						&sc.metric_t0,
-					).expect("clamp"); // avoid ln(0)
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0).expect("log"); // ln p
-					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0).expect("mul"); // y·ln p
-					kernels::gpu_reduce_sum_cols_into(
-						&sc.metric_t0,
-						&sc.reduce_ws,
-						nk,
-						1,
-						&sc.metric_scalar,
-					).expect("reduce");
-					-sc.read_metric_scalar() / n as f64
-				}
-				Loss::Bce => {
-					kernels::gpu_clamp_into(out, &sc.c_eps, &sc.c_one_minus_eps, nk, &sc.metric_t0).expect("clamp"); // pc
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t1).expect("log"); // ln pc
-					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t1).expect("mul"); // y·ln pc
-					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t0).expect("scale"); // -pc
-					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t0).expect("add"); // 1-pc
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0).expect("log"); // ln(1-pc)
-					kernels::gpu_copy_into(ybuf, nk, &sc.metric_t2).expect("copy"); // y
-					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t2).expect("scale"); // -y
-					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t2).expect("add"); // 1-y
-					kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("mul"); // (1-y)·ln(1-pc)
-					kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1).expect("add"); // sum terms
-					kernels::gpu_reduce_sum_cols_into(
-						&sc.metric_t1,
-						&sc.reduce_ws,
-						nk,
-						1,
-						&sc.metric_scalar,
-					).expect("reduce");
-					-sc.read_metric_scalar() / nf
-				}
-				Loss::Focal => {
-					// Per-element focal loss (already positive) → mean. t1 is a
-					// throwaway sink for the grad the kernel also emits.
-					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.c_focal_gamma, &sc.c_focal_alpha, nk, &sc.metric_t0, &sc.metric_t1).expect("focal");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, &sc.metric_scalar).expect("reduce");
-					sc.read_metric_scalar() / nf
-				}
-			}
-		}
-	}
-}
 
 /// Device-side metric: the raw kernel reduction lands in `dst` (a 1-elem device
 /// buffer — the scratch metric scalar, or a staged metric-ring slot written in
@@ -242,63 +98,11 @@ pub fn metric_gpu_into(
 	}
 }
 
-pub fn upload(x: &ndarray::Array2<f64>) -> (GpuBuffer, usize, usize) {
-	let std = x.as_standard_layout();
-	let slice = std.as_slice().expect("upload: non-contiguous");
-	(
-		GpuBuffer::upload(slice).expect("upload x"),
-		x.nrows(),
-		x.ncols(),
-	)
-}
-
 /// Per-column z-score fit on the TRAIN set; store mean/std in `scaler` (reused
 /// verbatim at eval, no leakage) and return the scaled [n×d] buffer.
 /// The value the staged z-score fit's `eps` view must hold (push `[ZSCORE_EPS]`
 /// into the run's init stage).
 pub const ZSCORE_EPS: f64 = 1e-8;
-
-/// Device-only z-score fit: mean/std are written IN PLACE into caller-provided
-/// views (the run's persist region — they cross to RAM once, in the exit
-/// block) and `eps` is a staged 1-float view. In-place calcs + carves only:
-/// no upload, no download.
-pub fn zscore_fit_views(
-	xraw: &GpuBuffer,
-	n: usize,
-	d: usize,
-	mean: &GpuBuffer,
-	std: &GpuBuffer,
-	eps: &GpuBuffer,
-) -> GpuBuffer {
-	// var_cols needs align(sum_ws,256)+d·8 bytes; mean/sum need only sum_ws — size
-	// the shared workspace to the larger (var) requirement.
-	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
-	let ws_bytes = ((seg + 255) & !255usize) + d * 8;
-	let ws = GpuBuffer::alloc_bytes(ws_bytes).expect("zscore reduce ws");
-	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean).expect("mean");
-	let var = GpuBuffer::alloc(d).expect("var");
-	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var).expect("var");
-	kernels::gpu_add_scalar_inplace(eps, d, &var).expect("var eps add");
-	kernels::gpu_sqrt(&var, d, std).expect("std");
-	zscore_apply_views(xraw, n, d, mean, std)
-}
-
-pub fn zscore_fit(
-	xraw: &GpuBuffer,
-	n: usize,
-	d: usize,
-	scaler: &RefCell<Option<Scaler>>,
-) -> GpuBuffer {
-	let mean = GpuBuffer::alloc(d).expect("mean");
-	let std = GpuBuffer::alloc(d).expect("std");
-	let eps = GpuBuffer::upload(&[ZSCORE_EPS]).expect("var eps");
-	let xbuf = zscore_fit_views(xraw, n, d, &mean, &std, &eps);
-	*scaler.borrow_mut() = Some(Scaler {
-		mean: download_vec(&mean, d),
-		std: download_vec(&std, d),
-	});
-	xbuf
-}
 
 /// Apply with device-resident mean/std (views of the staged image on the fit
 /// rerun path) — no uploads.
@@ -310,7 +114,7 @@ pub fn zscore_apply_views(
 	std: &GpuBuffer,
 ) -> GpuBuffer {
 	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
 	let xbuf = GpuBuffer::alloc(n * d).expect("scale");
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, &xbuf).expect("scale");
 	xbuf
@@ -339,7 +143,7 @@ pub fn zscore_fit_into(
 	kernels::gpu_add_scalar_inplace(eps, d, &var).expect("var eps");
 	kernels::gpu_sqrt(&var, d, std).expect("std");
 	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
 }
 
@@ -356,7 +160,7 @@ pub fn zscore_apply_into(
 	out: &GpuBuffer,
 ) {
 	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub(xraw, mean, n * d, d, &xc).expect("center");
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
 }
 
@@ -405,14 +209,6 @@ pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64
 		}
 	}
 	scaled
-}
-
-pub fn zscore_apply(xraw: &GpuBuffer, n: usize, d: usize, scaler: &Scaler) -> GpuBuffer {
-	assert_eq!(scaler.mean.len(), d, "eval: feature count changed");
-	assert_eq!(scaler.std.len(), d, "eval: feature count changed");
-	let mean = GpuBuffer::upload(&scaler.mean).expect("upload eval mean");
-	let std = GpuBuffer::upload(&scaler.std).expect("upload eval std");
-	zscore_apply_views(xraw, n, d, &mean, &std)
 }
 
 /// Forward pass writing each layer's output into the preallocated `acts`
@@ -638,7 +434,8 @@ pub fn attn_forward_cached(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: u
 /// Copy a GPU buffer of `len` f64s back to host.
 pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; len];
-	buf.download(&mut v).expect("gpu download");
+	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("gpu download");
+	gpu_core::hip::device_synchronize().expect("gpu download sync");
 	v
 }
 
@@ -657,19 +454,26 @@ pub fn infer_scored(
 	yscaler: Option<(f64, f64)>,
 	ybuf: Option<&GpuBuffer>,
 	loss: Loss,
-	lr: f64,
+	_lr: f64,
 	metrics: &[Metric],
 	ss_tot: f64,
 ) -> (Vec<f64>, Vec<f64>) {
 	let last = params.len() - 1;
 	let k = params[last].out_dim;
-	let sc = Scratch::new(params, n, true);
+	// The 12 scratch constants ride ONE 12-float load (not 12 single-scalar
+	// uploads); `consts` outlives `sc`, whose const fields are views into it.
+	let consts = {
+		let b = GpuBuffer::alloc(crate::scratch::SCRATCH_CONSTS.len()).expect("scratch consts");
+		b.load(&crate::scratch::SCRATCH_CONSTS).expect("scratch consts");
+		b
+	};
+	let sc = Scratch::new_infer(params, n, &consts);
 	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc);
 	if let Some((ymean, ystd)) = yscaler {
 		// One-shot inverse target scaler (single forward, not a loop): upload the
 		// two run-specific scalars as device buffers for the scale/shift ops.
-		let ystd_b = GpuBuffer::upload(&[ystd]).expect("ystd");
-		let ymean_b = GpuBuffer::upload(&[ymean]).expect("ymean");
+		let ystd_b = { let __up = &[ystd]; let __ub = GpuBuffer::alloc(__up.len()).expect("ystd"); __ub.load(__up).expect("ystd"); __ub };
+		let ymean_b = { let __up = &[ymean]; let __ub = GpuBuffer::alloc(__up.len()).expect("ymean"); __ub.load(__up).expect("ymean"); __ub };
 		kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last]).expect("y unscale");
 		kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last]).expect("y unshift");
 	}
@@ -678,8 +482,16 @@ pub fn infer_scored(
 		Some(yb) => metrics
 			.iter()
 			.map(|&m| match m {
-				Metric::Lr | Metric::Epoch | Metric::Time => f64::NAN,
-				_ => metric_gpu(loss, lr, m, out, yb, &sc, n, k, ss_tot, 0, 0.0),
+				Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => f64::NAN,
+				// One device reduction into the scratch scalar, then the async+drain
+				// D2H at THIS call site; metric_gpu_into returns the host (sign,div)
+				// rescale (R2's raw is ss_res → reported 1 − ss_res/ss_tot).
+				_ => {
+					let (sign, div) =
+						metric_gpu_into(loss, m, out, yb, &sc, n, k, ss_tot, &sc.metric_scalar);
+					let v = sign * download_scalar(&sc.metric_scalar) / div;
+					if m == Metric::R2 { 1.0 - v } else { v }
+				}
 			})
 			.collect(),
 		None => Vec::new(),
@@ -690,7 +502,8 @@ pub fn infer_scored(
 /// Download a single-element GPU buffer (a reduced scalar) to the host.
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64];
-	buf.download(&mut v).expect("scalar download");
+	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("scalar download");
+	gpu_core::hip::device_synchronize().expect("scalar download sync");
 	v[0]
 }
 
@@ -712,12 +525,20 @@ mod tests {
 		b
 	}
 
+	// The 12 scratch constants as ONE owned 12-float device block; each Scratch
+	// carves its const views from this (must outlive the Scratch).
+	fn consts_buf() -> GpuBuffer {
+		let b = GpuBuffer::alloc(crate::scratch::SCRATCH_CONSTS.len()).expect("consts");
+		b.load(&crate::scratch::SCRATCH_CONSTS).expect("consts");
+		b
+	}
+
 	fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, GpuBuffer) {
 		let in_dim = s * d;
 		let params = vec![LayerParams {
 			kind: LayerKind::Attn,
 			w: randn(d * d, 1),
-			b: GpuBuffer::upload(&vec![0.0f64; d]).expect("b"),
+			b: { let __up = &vec![0.0f64; d]; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub },
 			in_dim,
 			out_dim: in_dim,
 			act: Activation::Linear,
@@ -727,7 +548,7 @@ mod tests {
 			wv: randn(d * d, 3),
 			wo: randn(d * d, 4),
 			heads,
-			palpha: GpuBuffer::upload(&[0.0f64]).expect("pa"),
+			palpha: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("pa"); __ub.load(__up).expect("pa"); __ub },
 			conv_cin: 0, conv_k: 0, conv_stride: 0,
 		}];
 		(params, randn(n * in_dim, 7))
@@ -747,13 +568,14 @@ mod tests {
 		let in_dim = s * d;
 		let (params, h) = attn_layer(n, heads, d, s);
 
-		let sc_ref = Scratch::new(&params, n, false);
+		let consts = consts_buf();
+		let sc_ref = Scratch::new_full(&params, n, &consts);
 		assert!(!sc_ref.infer, "ref must use the full-batch path");
 		forward_into(&params, &h, None, n, &sc_ref.acts, &sc_ref);
 		let reference = download_vec(&sc_ref.acts[0], n * in_dim);
 		drop(sc_ref);
 
-		let sc = Scratch::new(&params, n, true);
+		let sc = Scratch::new_infer(&params, n, &consts);
 		assert!(sc.infer, "inference must use the KV-cache path");
 		forward_into(&params, &h, None, n, &sc.acts, &sc);
 		let cached = download_vec(&sc.acts[0], n * in_dim);
@@ -794,7 +616,8 @@ mod tests {
 		assert!(scratch_bytes < full_scores_bytes / 10, "kernel-path memory must be a fraction of the L² buffer");
 
 		let (params, h) = attn_layer(n, heads, d, s);
-		let sc = Scratch::new(&params, n, true);
+		let consts = consts_buf();
+		let sc = Scratch::new_infer(&params, n, &consts);
 		// Warm up (kernel JIT / allocator), then time a forward to a host sync.
 		forward_into(&params, &h, None, n, &sc.acts, &sc);
 		let _ = download_vec(&sc.acts[0], 1);

@@ -171,8 +171,8 @@ fn probes(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 }
 
 fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	unsafe {
 		f(
@@ -185,22 +185,22 @@ fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; a.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn run_wrap(f: GpuBin, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	f(&ba, &bb, a.len(), &o).unwrap();
 	let mut out = vec![0.0; a.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn registry() -> HashMap<&'static str, BinOp> {
-	use gpu_core::kernels::{gpu_add, gpu_div, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub};
+	use gpu_core::kernels::{gpu_add_into, gpu_div_into, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub};
 	use gpu_core::math_ops::{gpu_atan2, gpu_fmod, gpu_max, gpu_min};
 	let mut m: HashMap<&'static str, BinOp> = HashMap::new();
 	// existing wrappers
@@ -239,10 +239,10 @@ fn registry() -> HashMap<&'static str, BinOp> {
 	}
 
 	// --- existing ops (proved directly) ---
-	w!("add", gpu_add, |a, b| a + b, -3.0, 3.0, -2.3, 3.7);
+	w!("add", gpu_add_into, |a, b| a + b, -3.0, 3.0, -2.3, 3.7);
 	w!("sub", gpu_sub, |a, b| a - b, -3.0, 3.0, -2.3, 3.7);
 	w!("mul", gpu_mul, |a, b| a * b, -3.0, 3.0, -2.3, 3.7);
-	w!("div", gpu_div, |a, b| a / b, -3.0, 3.0, 0.5, 4.0);
+	w!("div", gpu_div_into, |a, b| a / b, -3.0, 3.0, 0.5, 4.0);
 	w!("atan2", gpu_atan2, |a, b| a.atan2(b), -3.0, 3.0, 0.5, 3.7);
 	w!("fmod", gpu_fmod, |a, b| a % b, 1.0, 4.0, 1.7, 4.7);
 	w!("maximum", gpu_max, |a, b| a.max(b), -3.0, 3.0, -2.3, 3.7);

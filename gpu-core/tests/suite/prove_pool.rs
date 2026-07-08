@@ -57,7 +57,7 @@ const TOL: f64 = 1e-7;
 
 fn dl(b: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0; n];
-	b.download(&mut v).unwrap();
+	unsafe { b.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 
@@ -87,7 +87,7 @@ fn prove_avg_pool_1d() {
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| (i as f64) * 0.5 - 1.0)
 		.collect();
-	let b = GpuBuffer::upload(&x).unwrap();
+	let b = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(n * nf).unwrap();
 	gpu_avg_pool_1d(&b, n, out_len, nf, &out).unwrap();
 	let got = dl(&out, n * nf);
@@ -109,7 +109,7 @@ fn prove_avg_pool_2d() {
 	use gpu_core::kernels::gpu_avg_pool_2d;
 	let (n, c, h, w, kh, kw, sh, sw) = (2usize, 2, 4, 4, 2, 2, 2, 2);
 	let x: Vec<f64> = (0..n * c * h * w).map(|i| (i as f64).sin() * 3.0).collect();
-	let b = GpuBuffer::upload(&x).unwrap();
+	let b = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
 	let out = GpuBuffer::alloc(n * c * oh * ow).unwrap();
@@ -148,7 +148,7 @@ fn prove_max_pool_1d_and_argmax() {
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| ((i * 37 + 11) % 97) as f64)
 		.collect();
-	let b = GpuBuffer::upload(&x).unwrap();
+	let b = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let vb = GpuBuffer::alloc(n * nf).unwrap();
 	let ib = GpuBuffer::alloc(n * nf).unwrap();
 	gpu_max_pool_1d(&b, n, out_len, nf, &vb, &ib).unwrap();
@@ -182,7 +182,7 @@ fn prove_max_pool_2d() {
 	let x: Vec<f64> = (0..n * c * h * w)
 		.map(|i| ((i * 53 + 7) % 211) as f64)
 		.collect();
-	let b = GpuBuffer::upload(&x).unwrap();
+	let b = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
 	let vb = GpuBuffer::alloc(n * c * oh * ow).unwrap();
@@ -223,7 +223,7 @@ fn prove_avg_pool_grad() {
 	// 1d expand
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
 	let g: Vec<f64> = (0..n * nf).map(|i| (i as f64) + 1.0).collect();
-	let gb = GpuBuffer::upload(&g).unwrap();
+	let gb = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(n * out_len * nf).unwrap();
 	gpu_pool_grad_expand(&gb, n, out_len, nf, &out).unwrap();
 	let got = dl(&out, n * out_len * nf);
@@ -242,7 +242,7 @@ fn prove_avg_pool_grad() {
 	let go: Vec<f64> = (0..n2 * c * oh * ow)
 		.map(|i| (i as f64) * 0.5 + 1.0)
 		.collect();
-	let gob = GpuBuffer::upload(&go).unwrap();
+	let gob = { let __up = &go; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let goutb = GpuBuffer::alloc(n2 * c * h * w).unwrap();
 	gpu_avg_pool_2d_backward(&gob, n2, c, h, w, kh, kw, sh, sw, &goutb).unwrap();
 	let gi = dl(&goutb, n2 * c * h * w);
@@ -286,12 +286,12 @@ fn prove_max_pool_grad() {
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| ((i * 37 + 11) % 97) as f64)
 		.collect();
-	let xb = GpuBuffer::upload(&x).unwrap();
+	let xb = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let _vb = GpuBuffer::alloc(n * nf).unwrap();
 	let ib = GpuBuffer::alloc(n * nf).unwrap();
 	gpu_max_pool_1d(&xb, n, out_len, nf, &_vb, &ib).unwrap();
 	let g: Vec<f64> = (0..n * nf).map(|i| (i as f64) + 2.0).collect();
-	let gb = GpuBuffer::upload(&g).unwrap();
+	let gb = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let mpb = GpuBuffer::alloc(n * out_len * nf).unwrap();
 	gpu_max_pool_1d_backward(&gb, &ib, n, out_len, nf, &mpb).unwrap();
 	let got = dl(&mpb, n * out_len * nf);
@@ -312,14 +312,14 @@ fn prove_max_pool_grad() {
 	let x2: Vec<f64> = (0..n2 * c * h * w)
 		.map(|i| ((i * 53 + 7) % 211) as f64)
 		.collect();
-	let x2b = GpuBuffer::upload(&x2).unwrap();
+	let x2b = { let __up = &x2; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let _v2 = GpuBuffer::alloc(n2 * c * oh * ow).unwrap();
 	let i2 = GpuBuffer::alloc(n2 * c * oh * ow).unwrap();
 	gpu_max_pool_2d(&x2b, n2, c, h, w, kh, kw, sh, sw, &_v2, &i2).unwrap();
 	let g2: Vec<f64> = (0..n2 * c * oh * ow)
 		.map(|i| (i as f64) * 0.5 + 1.0)
 		.collect();
-	let g2b = GpuBuffer::upload(&g2).unwrap();
+	let g2b = { let __up = &g2; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let mp2b = GpuBuffer::alloc(n2 * c * h * w).unwrap();
 	gpu_max_pool_2d_backward(&g2b, &i2, n2, c, h, w, oh, ow, &mp2b).unwrap();
 	let got2 = dl(&mp2b, n2 * c * h * w);
@@ -346,7 +346,7 @@ fn run_poolx_span(
 	span: usize,
 	ch: usize,
 ) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(rows * ch).unwrap();
 	unsafe {
 		launch(
@@ -405,7 +405,7 @@ fn prove_lp_pool() {
 	let x: Vec<f64> = (0..rows * span * ch)
 		.map(|i| (i as f64) * 0.4 - 1.5)
 		.collect();
-	let b = GpuBuffer::upload(&x).unwrap();
+	let b = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(rows * ch).unwrap();
 	unsafe {
 		launch_poolx_lp_pool(
@@ -439,7 +439,7 @@ fn run_poolx_adaptive(
 	in_len: usize,
 	out_len: usize,
 ) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(rows * out_len).unwrap();
 	unsafe {
 		launch(

@@ -2,32 +2,9 @@ use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
-use rand::SeedableRng;
-use rand::seq::SliceRandom;
-use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::fs;
 use std::path::Path;
-
-pub fn train_test_split(x: &Mat, y: &Vec1, test_size: f64, seed: u64) -> (Mat, Mat, Vec1, Vec1) {
-	let n = x.nrows();
-	let n_test = (n as f64 * test_size).round() as usize;
-	let n_train = n - n_test;
-
-	let mut indices: Vec<usize> = (0..n).collect();
-	let mut rng = ChaCha8Rng::seed_from_u64(seed);
-	indices.shuffle(&mut rng);
-
-	let train_idx = &indices[..n_train];
-	let test_idx = &indices[n_train..];
-
-	let x_train = x.select(ndarray::Axis(0), train_idx);
-	let x_test = x.select(ndarray::Axis(0), test_idx);
-	let y_train = y.select(ndarray::Axis(0), train_idx);
-	let y_test = y.select(ndarray::Axis(0), test_idx);
-
-	(x_train, x_test, y_train, y_test)
-}
 
 pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let disk = std::fs::metadata(path)

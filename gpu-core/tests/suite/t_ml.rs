@@ -9,7 +9,7 @@ use gpu_core::catboost::{
 use gpu_core::forest::{
 	gpu_bootstrap_sample, gpu_feature_subset, gpu_oob_mask, gpu_random_threshold_split,
 };
-use gpu_core::kernels::gpu_rand_uniform;
+use gpu_core::kernels::gpu_rand_uniform_into;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::rl::{
 	gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob,
@@ -22,12 +22,12 @@ const EPS: f64 = 1e-9;
 
 #[test]
 fn test_rl_discounted_returns() {
-	let rewards = GpuBuffer::upload(&[1.0_f64, 1.0, 1.0]).unwrap();
-	let gamma = GpuBuffer::upload(&[0.5_f64]).unwrap();
+	let rewards = { let __up = &[1.0_f64, 1.0, 1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let gamma = { let __up = &[0.5_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_discounted_returns(&rewards, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// G[2] = 1.0
 	// G[1] = 1.0 + 0.5 * 1.0 = 1.5
@@ -53,16 +53,16 @@ fn test_rl_discounted_returns() {
 #[test]
 fn test_rl_gae() {
 	// Simple 3-step case: r=[1,1,1], v=[1,1,1], gamma=0.9, lam=0.95
-	let rewards = GpuBuffer::upload(&[1.0_f64, 1.0, 1.0]).unwrap();
-	let values = GpuBuffer::upload(&[1.0_f64, 1.0, 1.0]).unwrap();
+	let rewards = { let __up = &[1.0_f64, 1.0, 1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let values = { let __up = &[1.0_f64, 1.0, 1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let gamma = 0.9_f64;
 	let lam = 0.95_f64;
-	let gamma_buf = GpuBuffer::upload(&[gamma]).unwrap();
-	let lam_buf = GpuBuffer::upload(&[lam]).unwrap();
+	let gamma_buf = { let __up = &[gamma]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let lam_buf = { let __up = &[lam]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_gae(&rewards, &values, &gamma_buf, &lam_buf, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// Hand compute:
 	// delta[t] = r[t] + gamma * v[t+1] - v[t]   (v[3]=0)
@@ -90,14 +90,14 @@ fn test_rl_gae() {
 #[test]
 fn test_rl_td_targets() {
 	// r=[1,2,3], v_next=[4,5,6], done=[0,1,0], gamma=0.99
-	let rewards = GpuBuffer::upload(&[1.0_f64, 2.0, 3.0]).unwrap();
-	let values_next = GpuBuffer::upload(&[4.0_f64, 5.0, 6.0]).unwrap();
-	let done = GpuBuffer::upload(&[0.0_f64, 1.0, 0.0]).unwrap();
-	let gamma = GpuBuffer::upload(&[0.99_f64]).unwrap();
+	let rewards = { let __up = &[1.0_f64, 2.0, 3.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let values_next = { let __up = &[4.0_f64, 5.0, 6.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let done = { let __up = &[0.0_f64, 1.0, 0.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let gamma = { let __up = &[0.99_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_td_targets(&rewards, &values_next, &done, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// t[0] = 1 + 0.99*4*(1-0) = 1 + 3.96 = 4.96
 	// t[1] = 2 + 0.99*5*(1-1) = 2
@@ -120,12 +120,12 @@ fn test_rl_categorical_logprob() {
 	// n=1, n_actions=3, logits=[0,1,2], action=2
 	// softmax: exp([0,1,2])/sum = [1, e, e^2] / (1+e+e^2)
 	// log_softmax[2] = 2 - log(1 + e + e^2)
-	let logits = GpuBuffer::upload(&[0.0_f64, 1.0, 2.0]).unwrap();
+	let logits = { let __up = &[0.0_f64, 1.0, 2.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let actions = GpuBuffer::upload_i32(&[2_i32]).unwrap();
 	let out = GpuBuffer::alloc(1).unwrap();
 	gpu_categorical_logprob(&logits, &actions, 1, 3, &out).unwrap();
 	let mut result = [0.0_f64; 1];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	let log_z = (1.0_f64.exp() + 2.0_f64.exp() + 1.0_f64).ln();
 	let expected = 2.0 - log_z;
@@ -150,13 +150,13 @@ fn test_rl_categorical_logprob() {
 fn test_rl_gaussian_logprob() {
 	// n=1, dim=1, mu=0, log_std=0 (sigma=1), action=1.0
 	// logp = -0.5*(1)^2 - 0 - 0.5*log(2*pi)
-	let mu = GpuBuffer::upload(&[0.0_f64]).unwrap();
-	let log_std = GpuBuffer::upload(&[0.0_f64]).unwrap();
-	let actions = GpuBuffer::upload(&[1.0_f64]).unwrap();
+	let mu = { let __up = &[0.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let log_std = { let __up = &[0.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let actions = { let __up = &[1.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(1).unwrap();
 	gpu_gaussian_logprob(&mu, &log_std, &actions, 1, 1, &out).unwrap();
 	let mut result = [0.0_f64; 1];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	let half_log2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
 	let expected = -0.5 - 0.0 - half_log2pi;
@@ -181,16 +181,15 @@ fn test_bayes_nb_feature_log_prob() {
 	// 2 classes, 3 features. counts:
 	// class 0: [1, 2, 3]  sum=6, alpha=1 -> smoothed: [2,3,4]/9
 	// class 1: [4, 5, 6]  sum=15, alpha=1 -> smoothed: [5,6,7]/18
-	let counts = GpuBuffer::upload(&[
+	let counts = { let __up = &[
 		1.0_f64, 2.0, 3.0, // class 0
 		4.0, 5.0, 6.0, // class 1
-	])
-	.unwrap();
-	let alpha = GpuBuffer::upload(&[1.0_f64]).unwrap();
+	]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let alpha = { let __up = &[1.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_nb_feature_log_prob(&counts, &alpha, 2, 3, &out).unwrap();
 	let mut result = [0.0_f64; 6];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// class 0: log([2,3,4]) - log(9)
 	let log9 = 9.0_f64.ln();
@@ -235,12 +234,12 @@ fn test_bayes_nb_count_table() {
 	// n=3, n_features=2, n_classes=2
 	// x_counts: [[1,0],[0,1],[1,1]], y=[0,1,0]
 	// expected count_table: class0=[2,1], class1=[0,1]
-	let x = GpuBuffer::upload(&[1.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+	let x = { let __up = &[1.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let y = GpuBuffer::upload_i32(&[0_i32, 1, 0]).unwrap();
-	let out = GpuBuffer::zeros_bytes(4 * std::mem::size_of::<f64>()).unwrap();
+	let out = { let __zb = GpuBuffer::alloc_bytes(4 * std::mem::size_of::<f64>()).unwrap(); __zb.memset_zero(4 * std::mem::size_of::<f64>()).unwrap(); __zb };
 	gpu_nb_count_table(&x, &y, 3, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 4];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// row-major: class0=[result[0],result[1]], class1=[result[2],result[3]]
 	assert!((result[0] - 2.0).abs() < 1e-9, "c0f0={}", result[0]);
@@ -258,19 +257,18 @@ fn test_bayes_multinomial_nb_logprob() {
 	// x=[1,1]
 	// out[0] = log(0.5) + 1*log(0.3) + 1*log(0.7)
 	// out[1] = log(0.5) + 1*log(0.6) + 1*log(0.4)
-	let log_prior = GpuBuffer::upload(&[0.5_f64.ln(), 0.5_f64.ln()]).unwrap();
-	let flp = GpuBuffer::upload(&[
+	let log_prior = { let __up = &[0.5_f64.ln(), 0.5_f64.ln()]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let flp = { let __up = &[
 		0.3_f64.ln(),
 		0.7_f64.ln(), // class 0
 		0.6_f64.ln(),
 		0.4_f64.ln(), // class 1
-	])
-	.unwrap();
-	let x = GpuBuffer::upload(&[1.0_f64, 1.0]).unwrap();
+	]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let x = { let __up = &[1.0_f64, 1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(2).unwrap();
 	gpu_multinomial_nb_logprob(&log_prior, &flp, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	let exp0 = 0.5_f64.ln() + 0.3_f64.ln() + 0.7_f64.ln();
 	let exp1 = 0.5_f64.ln() + 0.6_f64.ln() + 0.4_f64.ln();
@@ -301,16 +299,16 @@ fn test_bayes_bernoulli_nb_logprob() {
 	//        = log_prior[0] + log(0.3) + log(0.3)
 	// out[1] = log_prior[1] + 1*log(0.6) + 0*log(0.4) + 0*log(0.4) + 1*log(0.6)
 	//        = log_prior[1] + log(0.6) + log(0.6)
-	let log_prior = GpuBuffer::upload(&[0.5_f64.ln(), 0.5_f64.ln()]).unwrap();
+	let log_prior = { let __up = &[0.5_f64.ln(), 0.5_f64.ln()]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let log_p =
-		GpuBuffer::upload(&[0.3_f64.ln(), 0.7_f64.ln(), 0.6_f64.ln(), 0.4_f64.ln()]).unwrap();
+		{ let __up = &[0.3_f64.ln(), 0.7_f64.ln(), 0.6_f64.ln(), 0.4_f64.ln()]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let log_neg =
-		GpuBuffer::upload(&[0.7_f64.ln(), 0.3_f64.ln(), 0.4_f64.ln(), 0.6_f64.ln()]).unwrap();
-	let x = GpuBuffer::upload(&[1.0_f64, 0.0]).unwrap();
+		{ let __up = &[0.7_f64.ln(), 0.3_f64.ln(), 0.4_f64.ln(), 0.6_f64.ln()]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let x = { let __up = &[1.0_f64, 0.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(2).unwrap();
 	gpu_bernoulli_nb_logprob(&log_prior, &log_p, &log_neg, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	// x=[1,0]: feat0 present (use log_p[c,0]), feat1 absent (use log_neg[c,1])
 	let exp0 = 0.5_f64.ln() + 0.3_f64.ln() + 0.3_f64.ln();
@@ -339,7 +337,7 @@ fn test_forest_bootstrap_sample() {
 	let n = 10_usize;
 	let n_samples = 20_usize;
 	let uniform_ws = GpuBuffer::alloc(n_samples).unwrap();
-	gpu_rand_uniform(n_samples, 42, &uniform_ws).unwrap();
+	gpu_rand_uniform_into(42, n_samples, &uniform_ws).unwrap();
 	let buf = GpuBuffer::alloc_bytes(n_samples * std::mem::size_of::<i32>()).unwrap();
 	gpu_bootstrap_sample(&uniform_ws, n, n_samples, 42, &buf).unwrap();
 	// buf.len() is bytes = n_samples * 4
@@ -387,13 +385,13 @@ fn test_forest_feature_subset() {
 #[test]
 fn test_forest_random_threshold_split() {
 	let col_data = vec![1.0_f64, 3.0, 2.0, 5.0, 4.0];
-	let col = GpuBuffer::upload(&col_data).unwrap();
+	let col = { let __up = &col_data; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let d_min_ws = GpuBuffer::alloc(1).unwrap();
 	let d_max_ws = GpuBuffer::alloc(1).unwrap();
 	let thr_buf = GpuBuffer::alloc(1).unwrap();
 	gpu_random_threshold_split(&col, &d_min_ws, &d_max_ws, col_data.len(), 99, &thr_buf).unwrap();
 	let mut thr = [0.0_f64; 1];
-	thr_buf.download(&mut thr).unwrap();
+	unsafe { thr_buf.download_async(&mut thr, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let threshold = thr[0];
 	assert!(threshold.is_finite(), "threshold not finite: {}", threshold);
 	let col_min = 1.0_f64;
@@ -487,19 +485,19 @@ fn test_catboost_ordered_target_stats() {
 	//   p=3, row=3, cat=1: sum=20,cnt=1-> TS=(20+0)/(1+1)=10.  after: sum[1]=60,cnt[1]=2
 	// encoded_out = [0, 0, 5, 10] (indexed by original row)
 	let cat_col = GpuBuffer::upload_i32(&[0_i32, 1, 0, 1]).unwrap();
-	let target = GpuBuffer::upload(&[10.0_f64, 20.0, 30.0, 40.0]).unwrap();
+	let target = { let __up = &[10.0_f64, 20.0, 30.0, 40.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let perm = GpuBuffer::upload_i32(&[0_i32, 1, 2, 3]).unwrap();
-	let prior = GpuBuffer::upload(&[0.0_f64]).unwrap();
-	let smoothing = GpuBuffer::upload(&[1.0_f64]).unwrap();
-	let cat_sum = GpuBuffer::zeros_bytes(2 * std::mem::size_of::<f64>()).unwrap();
-	let cat_cnt = GpuBuffer::zeros_bytes(2 * std::mem::size_of::<f64>()).unwrap();
+	let prior = { let __up = &[0.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let smoothing = { let __up = &[1.0_f64]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let cat_sum = { let __zb = GpuBuffer::alloc_bytes(2 * std::mem::size_of::<f64>()).unwrap(); __zb.memset_zero(2 * std::mem::size_of::<f64>()).unwrap(); __zb };
+	let cat_cnt = { let __zb = GpuBuffer::alloc_bytes(2 * std::mem::size_of::<f64>()).unwrap(); __zb.memset_zero(2 * std::mem::size_of::<f64>()).unwrap(); __zb };
 	let out = GpuBuffer::alloc(4).unwrap();
 	gpu_ordered_target_stats(
 		&cat_col, &target, &perm, &prior, &smoothing, &cat_sum, &cat_cnt, 4, 2, &out,
 	)
 	.unwrap();
 	let mut result = [0.0_f64; 4];
-	out.download(&mut result).unwrap();
+	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 	let expected = [0.0_f64, 0.0, 5.0, 10.0];
 	for i in 0..4 {

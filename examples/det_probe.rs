@@ -64,20 +64,20 @@ fn cpu_gemm_bt(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
 fn check_gemm(label: &str, m: usize, n: usize, k: usize) {
 	let av = host(m * k, 1000 + m as u64);
 	let bv = host(n * k, 2000 + n as u64 + k as u64);
-	let a = GpuBuffer::upload(&av).expect("a");
-	let b = GpuBuffer::upload(&bv).expect("b");
+	let a = { let __up = &av; let __ub = GpuBuffer::alloc(__up.len()).expect("a"); __ub.load(__up).expect("a"); __ub };
+	let b = { let __up = &bv; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
 	let cpu = cpu_gemm_bt(&av, &bv, m, n, k);
 
 	let out_c = GpuBuffer::alloc(m * n).expect("out_c");
 	gpu_gemm_bt_f64(&a, &b, m, n, k, &out_c).expect("gemm_bt_f64");
 	let mut gc = vec![0.0f64; m * n];
-	out_c.download(&mut gc).expect("dl gc");
+	unsafe { out_c.download_async(&mut gc, std::ptr::null_mut()) }.expect("dl gc"); gpu_core::hip::device_synchronize().expect("dl gc");
 	let err_cpu = gc.iter().zip(&cpu).map(|(x, y)| (x - y).abs()).fold(0.0f64, f64::max);
 
 	let out_r = GpuBuffer::alloc(m * n).expect("out_r");
 	gpu_gemm_bt_into(&a, &b, m, n, k, &out_r).expect("rocblas gemm");
 	let mut gr = vec![0.0f64; m * n];
-	out_r.download(&mut gr).expect("dl gr");
+	unsafe { out_r.download_async(&mut gr, std::ptr::null_mut()) }.expect("dl gr"); gpu_core::hip::device_synchronize().expect("dl gr");
 	let err_roc = gc.iter().zip(&gr).map(|(x, y)| (x - y).abs()).fold(0.0f64, f64::max);
 
 	let pass = if err_cpu < 1e-9 { "PASS" } else { "FAIL" };
@@ -92,8 +92,8 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) {
 // one (m,n,k) shape, report ms + effective GB/s (B read once, the dominant
 // bandwidth term) against the 432GB/s gfx1101 floor.
 fn bench_shape(label: &str, m: usize, n: usize, k: usize) {
-	let a = GpuBuffer::upload(&host(m * k, 3000)).expect("a");
-	let b = GpuBuffer::upload(&host(n * k, 4000)).expect("b");
+	let a = { let __up = &host(m * k, 3000); let __ub = GpuBuffer::alloc(__up.len()).expect("a"); __ub.load(__up).expect("a"); __ub };
+	let b = { let __up = &host(n * k, 4000); let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
 	let out = GpuBuffer::alloc(m * n).expect("out");
 	const ITERS: usize = 50;
 
@@ -127,9 +127,9 @@ fn twice(name: &str, n_out: usize, mut f: impl FnMut(&GpuBuffer)) {
 	let mut r1 = vec![0.0f64; n_out];
 	let mut r2 = vec![0.0f64; n_out];
 	f(&out);
-	out.download(&mut r1).expect("dl1");
+	unsafe { out.download_async(&mut r1, std::ptr::null_mut()) }.expect("dl1"); gpu_core::hip::device_synchronize().expect("dl1");
 	f(&out);
-	out.download(&mut r2).expect("dl2");
+	unsafe { out.download_async(&mut r2, std::ptr::null_mut()) }.expect("dl2"); gpu_core::hip::device_synchronize().expect("dl2");
 	cmp(name, &r1, &r2);
 }
 
@@ -137,11 +137,11 @@ fn main() {
 	recipe_infer::init().expect("gpu init");
 	gpu_core::memory::set_alloc_sync(true);
 
-	let x = GpuBuffer::upload(&host(T * NE, 7)).expect("x");
-	let g = GpuBuffer::upload(&host(NE, 11)).expect("g");
-	let w = GpuBuffer::upload(&host(8192 * NE, 13)).expect("w");
-	let eps = GpuBuffer::upload(&[1e-6f64]).expect("eps");
-	let scale = GpuBuffer::upload(&[0.735f64]).expect("scale");
+	let x = { let __up = &host(T * NE, 7); let __ub = GpuBuffer::alloc(__up.len()).expect("x"); __ub.load(__up).expect("x"); __ub };
+	let g = { let __up = &host(NE, 11); let __ub = GpuBuffer::alloc(__up.len()).expect("g"); __ub.load(__up).expect("g"); __ub };
+	let w = { let __up = &host(8192 * NE, 13); let __ub = GpuBuffer::alloc(__up.len()).expect("w"); __ub.load(__up).expect("w"); __ub };
+	let eps = { let __up = &[1e-6f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("eps"); __ub.load(__up).expect("eps"); __ub };
+	let scale = { let __up = &[0.735f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("scale"); __ub.load(__up).expect("scale"); __ub };
 
 	twice("rmsnorm", T * NE, |o| gpu_rmsnorm_f64(&x, &g, &eps, T, NE, o).expect("rmsnorm"));
 	twice("gemm_bt 54x8192x2816", T * 8192, |o| {
@@ -161,10 +161,10 @@ fn main() {
 		let q0 = host(T * 16 * hd, 17);
 		let k0 = host(T * nkv * hd, 19);
 		let v0 = host(T * nkv * hd, 23);
-		let q = GpuBuffer::upload(&q0).expect("q");
-		let k = GpuBuffer::upload(&k0).expect("k");
-		let v = GpuBuffer::upload(&v0).expect("v");
-		let theta_buf = GpuBuffer::upload(&[theta]).expect("theta");
+		let q = { let __up = &q0; let __ub = GpuBuffer::alloc(__up.len()).expect("q"); __ub.load(__up).expect("q"); __ub };
+		let k = { let __up = &k0; let __ub = GpuBuffer::alloc(__up.len()).expect("k"); __ub.load(__up).expect("k"); __ub };
+		let v = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).expect("v"); __ub.load(__up).expect("v"); __ub };
+		let theta_buf = { let __up = &[theta]; let __ub = GpuBuffer::alloc(__up.len()).expect("theta"); __ub.load(__up).expect("theta"); __ub };
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
 		gpu_rope_partial(&theta_buf, T * nkv, hd, rotary, nkv, &k).expect("rope k");
 		twice(label, T * 16 * hd, |o| gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, o).expect("gqa"));
@@ -174,17 +174,17 @@ fn main() {
 		let mut b = vec![0.0f64; T * 16 * hd];
 		q.load(&q0).expect("reload q");
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
-		q.download(&mut a).expect("dl");
+		unsafe { q.download_async(&mut a, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 		q.load(&q0).expect("reload q");
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
-		q.download(&mut b).expect("dl");
+		unsafe { q.download_async(&mut b, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 		cmp(&format!("rope {label}"), &a, &b);
 	}
 
-	let a2 = GpuBuffer::upload(&host(T * 2112, 29)).expect("a2");
-	let b2 = GpuBuffer::upload(&host(T * 2112, 31)).expect("b2");
+	let a2 = { let __up = &host(T * 2112, 29); let __ub = GpuBuffer::alloc(__up.len()).expect("a2"); __ub.load(__up).expect("a2"); __ub };
+	let b2 = { let __up = &host(T * 2112, 31); let __ub = GpuBuffer::alloc(__up.len()).expect("b2"); __ub.load(__up).expect("b2"); __ub };
 	twice("gelu_mul", T * 2112, |o| gpu_gelu_mul(&a2, &b2, T * 2112, o).expect("gelu_mul"));
-	let gu = GpuBuffer::upload(&host(T * 2 * 704, 37)).expect("gu");
+	let gu = { let __up = &host(T * 2 * 704, 37); let __ub = GpuBuffer::alloc(__up.len()).expect("gu"); __ub.load(__up).expect("gu"); __ub };
 	twice("glu_gelu", T * 704, |o| gpu_glu_gelu(&gu, T, 704, o).expect("glu_gelu"));
 	twice("add", T * NE, |o| gpu_add_into(&x, &x, T * NE, o).expect("add"));
 
@@ -203,10 +203,10 @@ fn main() {
 	let x0 = host(T * NE, 43);
 	x.load(&x0).expect("reload");
 	gpu_scale_inplace(&scale, T * NE, &x).expect("scale");
-	x.download(&mut s1).expect("dl");
+	unsafe { x.download_async(&mut s1, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	x.load(&x0).expect("reload");
 	gpu_scale_inplace(&scale, T * NE, &x).expect("scale");
-	x.download(&mut s2).expect("dl");
+	unsafe { x.download_async(&mut s2, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	cmp("scale_inplace", &s1, &s2);
 
 	// scale_f64: in-place, so reload between runs.
@@ -214,10 +214,10 @@ fn main() {
 	let mut sf2 = vec![0.0f64; T * NE];
 	x.load(&x0).expect("reload");
 	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
-	x.download(&mut sf1).expect("dl");
+	unsafe { x.download_async(&mut sf1, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	x.load(&x0).expect("reload");
 	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
-	x.download(&mut sf2).expect("dl");
+	unsafe { x.download_async(&mut sf2, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	cmp("scale_f64", &sf1, &sf2);
 	let err_scale = s1.iter().zip(&sf1).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
 	eprintln!("scale_f64 vs hipblasDscal   max_err={err_scale:e}");

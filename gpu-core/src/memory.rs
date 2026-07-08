@@ -660,7 +660,16 @@ impl Stage {
 				if bytes <= BOUNCE_BYTES {
 					h2d_pinned_async(buf.ptr, src, bytes)?;
 				} else {
-					xfer_sync(buf.ptr, src, bytes, HIP_MEMCPY_H2D)?;
+					// Larger than the fixed bounce: stage through the run pin sized
+					// to the whole image (ONE enqueue, no chunk loop) and drain HERE —
+					// this Stage is the op that owns completion (mirrors
+					// commit_with_image). Counts one logical H2D.
+					let pin = run_pin(bytes);
+					H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+					H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+					par_copy(pin, src as *const u8, bytes);
+					dev_copy(buf.ptr, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())?;
+					crate::hip::device_synchronize()?;
 				}
 			}
 		}
@@ -954,69 +963,6 @@ pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD
 	Ok(ExitD2H { _guard: guard, pin: pin as usize, bytes })
 }
 
-/// Blocking transfer: enqueue on the default stream, then wait on that stream —
-/// the drop-in for the old synchronous `hipMemcpy`. Fresh buffers come from the
-/// initialized pool (see `ensure_pool_init`), so the async SDMA copy
-/// never touches an uncommitted page.
-pub(crate) unsafe fn xfer_sync(
-	dst: *mut c_void,
-	src: *const c_void,
-	bytes: usize,
-	kind: i32,
-) -> Result<(), HipError> {
-	// Synchronous D2H to pageable memory otherwise crawls through the driver's
-	// single-threaded internal staging — bounce it through the pinned arena and
-	// fan the host copy across all cores. The ASYNC D2H path (deferred metric
-	// scalars, one sync per epoch) is untouched.
-	if kind == HIP_MEMCPY_D2H {
-		D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
-		D2H_CALLS.fetch_add(1, Ordering::Relaxed);
-		let mut guard = match BOUNCE.lock() {
-			Ok(g) => g,
-			Err(p) => p.into_inner(),
-		};
-		if *guard == 0 {
-			*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
-		}
-		let pin = *guard as *mut u8;
-		let mut done = 0usize;
-		while done < bytes {
-			let chunk = BOUNCE_BYTES.min(bytes - done);
-			// SAFETY: caller guarantees src spans `bytes`; pin spans BOUNCE_BYTES.
-			unsafe {
-				dev_copy(
-					pin as *mut c_void,
-					(src as *const u8).add(done) as *const c_void,
-					chunk,
-					HIP_MEMCPY_D2H,
-					std::ptr::null_mut(),
-				)
-			}?;
-			crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
-			check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })?;
-			par_copy(unsafe { (dst as *mut u8).add(done) }, pin, chunk);
-			done += chunk;
-		}
-		return Ok(());
-	}
-	if kind == HIP_MEMCPY_H2D {
-		// h2d_pinned holds the bounce lock across a per-chunk stream sync — the
-		// copy is complete when xfer returns; a trailing wait would be the
-		// second stall for the same transfer.
-		// SAFETY: forwarded from the caller's validated pointers.
-		return unsafe { xfer(dst, src, bytes, kind, std::ptr::null_mut()) };
-	}
-	// Blocking D2D: counted here, not through `xfer` — the async choke's
-	// XFER_ASYNC tick is for enqueue-only calls and this one waits.
-	D2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
-	D2D_CALLS.fetch_add(1, Ordering::Relaxed);
-	// SAFETY: forwarded from the caller's validated pointers.
-	unsafe { dev_copy(dst, src, bytes, kind, std::ptr::null_mut()) }?;
-	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
-	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
-}
-
-
 /// THE single hipMemsetAsync call site. Enqueues on `stream`, no host sync.
 pub(crate) unsafe fn memset_dev(
 	dst: *mut c_void,
@@ -1029,23 +975,20 @@ pub(crate) unsafe fn memset_dev(
 	check(unsafe { hipMemsetAsync(dst, value, bytes, stream) })
 }
 
-/// Blocking device memset: enqueue then wait — drop-in for the old `hipMemset`.
-pub(crate) unsafe fn memset_sync(dst: *mut c_void, value: i32, bytes: usize) -> Result<(), HipError> {
-	// SAFETY: forwarded from the caller's validated pointer.
-	unsafe { memset_dev(dst, value, bytes, std::ptr::null_mut()) }?;
-	crate::callspy::tick(&crate::callspy::STREAM_SYNCHRONIZE);
-	check(unsafe { hipStreamSynchronize(std::ptr::null_mut()) })
-}
+static DEVICE_INIT: std::sync::Once = std::sync::Once::new();
 
-static POOL_INIT: std::sync::Once = std::sync::Once::new();
+/// atexit half of the birth claim: free what you allocate, drained, before death.
+extern "C" fn release_birth_claim_at_exit() {
+	release_run_backing();
+}
 
 /// One-time pool setup on the first allocation of the process: SDMA off,
 /// release threshold pinned, fault autopsy + thrash watchdog registered. The
 /// old 1 GiB warm is gone — the run's arena claim is larger and commits its own
 /// pages (memset + drain inside the claim op), so pre-touching the pool would
 /// only shrink the claim (the no-warmup invariant).
-pub(crate) fn ensure_pool_init() {
-	POOL_INIT.call_once(|| {
+pub(crate) fn device_init_once() {
+	DEVICE_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
 		if let Err(e) = crate::hip::set_pool_retain(0) {
 			eprintln!("GPU pool retain failed: {e}");
@@ -1195,6 +1138,14 @@ impl GpuBuffer {
 			Ok(buf) => Ok(buf),
 			Err(e) => {
 				oom_report(n_bytes);
+				if device_arena_active() {
+					// A must-succeed carve missing a live claim cannot occur in a
+					// correct program — placement exceeded the claim. Die loud.
+					panic!(
+						"arena carve miss: {n_bytes} B asked, {} B remain — placement exceeded the claim",
+						arena_remaining()
+					);
+				}
 				Err(e)
 			}
 		}
@@ -1211,11 +1162,11 @@ impl GpuBuffer {
 		Ok(ptr)
 	}
 
-	/// The pool hand-out: arena bump-carve if a claim is active, else a growth-band
-	/// admitted map committed with a memset + drain. Refuses SILENTLY (the loud
-	/// `alloc_bytes` wrapper reports); every non-claim device buffer is born here.
+	/// Arena carve. A claimless process's first byte births the process claim
+	/// (freed at exit); everything after carves. Refuses SILENTLY (the loud
+	/// `alloc_bytes` wrapper reports).
 	fn alloc_bytes_inner(n_bytes: usize) -> Result<Self, HipError> {
-		ensure_pool_init();
+		device_init_once();
 		ALLOC_FROZEN.with(|f| {
 			assert!(
 				!f.get(),
@@ -1253,51 +1204,23 @@ impl GpuBuffer {
 				}
 			}
 		}
-		// Growing the pool past what has been PROVEN co-mappable risks the
-		// driver's uncatchable VmHeap::MapPhysMemory assert. The growth cannot
-		// exceed min(hip_free, sysfs_free) − pool_slack − the user's gigabyte
-		// (which also covers the counters' over-report of the true ceiling,
-		// observed well under 1 GB). Re-asks under the proven peak skip the band —
-		// the pool never shrinks mid-run (retain threshold = max), so no new
-		// mapping is needed.
-		let live = POOL_LIVE.load(Ordering::Relaxed);
-		let projected = live + n_bytes;
-		let fresh = projected > POOL_VERIFIED.load(Ordering::Relaxed);
-		if fresh {
-			let remaining = vram_free_base();
-			if n_bytes > remaining.saturating_sub(USER_GB) {
-				return Err(HipError(2));
+		if base != 0 {
+			// Carve miss on a live claim: the probes' quiet fill signal
+			// (try_alloc_bytes → None); must-succeed callers die in alloc_bytes.
+			return Err(HipError(2));
+		}
+		// First device byte of the process: birth the ONE claim, carve from it,
+		// free it at exit. No per-buffer pool path exists.
+		match claim_device_arena() {
+			Some(slab) => {
+				park_run_backing(slab);
+				unsafe {
+					libc::atexit(release_birth_claim_at_exit);
+				}
+				Self::alloc_bytes_inner(n_bytes)
 			}
+			None => Err(HipError(2)),
 		}
-		let ptr = Self::map_bytes(n_bytes)?;
-		// EVERY pool hand-out gets a commit memset + device drain — growth AND
-		// reuse. Growth returns uncommitted pages (blit H2D into one is a
-		// gfxhub fault, kernel reads see stale zeros). Reuse is NOT safe
-		// either on this driver despite retention (threshold=max): the named
-		// autopsy caught an H2D faulting 6 MB INTO a reused "data" buffer —
-		// the prior life's lazy unmap lands after the re-hand-out, exactly the
-		// disease set_pool_retain was meant to fence. The memset touches every
-		// page and the drain lets the KFD page-table update (ordered with no
-		// stream) finish before first engine touch. Setup-only cost: AllocGuard
-		// keeps all of this out of the fit loop.
-		unsafe { memset_dev(ptr, 0, n_bytes, std::ptr::null_mut())? };
-		crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
-		check(unsafe { hipDeviceSynchronize() })?;
-		ALLOC_TOTAL.fetch_add(1, Ordering::Relaxed);
-		if ALLOC_SYNC.load(Ordering::Relaxed) {
-			crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
-			check(unsafe { hipDeviceSynchronize() })?;
-		}
-		tag_add(tag, n_bytes);
-		note_range(ptr as usize, n_bytes, tag);
-		let live = POOL_LIVE.fetch_add(n_bytes, Ordering::Relaxed) + n_bytes;
-		POOL_VERIFIED.fetch_max(live, Ordering::Relaxed);
-		Ok(Self {
-			ptr,
-			len: n_bytes,
-			owned: true,
-			tag,
-		})
 	}
 
 	/// The claim/adopt op's own mapping — the FIRST HALF of a claim op, its own
@@ -1308,7 +1231,7 @@ impl GpuBuffer {
 	/// only happen with no arena active (asserted); there is no bump-carve branch.
 	/// Refuses SILENTLY (the claim walks `want` down 1/16 on `None`).
 	pub(crate) fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
-		ensure_pool_init();
+		device_init_once();
 		ALLOC_FROZEN.with(|f| {
 			assert!(!f.get(), "GPU claim inside frozen training loop (requested {n_bytes} bytes)")
 		});
@@ -1342,21 +1265,11 @@ impl GpuBuffer {
 		})
 	}
 
-	pub fn upload(data: &[f64]) -> Result<Self, HipError> {
-		let buf = Self::alloc(data.len())?;
-		let bytes = std::mem::size_of_val(data);
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }?;
-		Ok(buf)
-	}
-
-	pub fn upload_u8(data: &[u8]) -> Result<Self, HipError> {
-		let buf = Self::alloc_bytes(data.len())?;
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D) }?;
-		Ok(buf)
-	}
-
-	/// Copy host bytes into this (already-allocated) buffer — the reuse path for
-	/// a persistent staging window, avoiding a fresh alloc per upload.
+	/// Copy host bytes into this (already-carved) buffer — the reuse path for a
+	/// persistent staging window, avoiding a fresh alloc per upload. H2D rides the
+	/// pinned bounce, which is synchronous on return (the bounce holds its lock
+	/// across each chunk's stream sync), so the bytes are resident when this
+	/// returns; no caller drain is needed.
 	pub fn write_u8(&self, data: &[u8]) -> Result<(), HipError> {
 		assert!(
 			data.len() <= self.len,
@@ -1364,62 +1277,71 @@ impl GpuBuffer {
 			data.len(),
 			self.len
 		);
-		unsafe { xfer_sync(self.ptr, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D) }
+		unsafe {
+			xfer(self.ptr, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}
 	}
 
 	/// Overwrite this buffer's device bytes with host f64 data (H2D into the
-	/// existing allocation — no fresh alloc). Length must fit.
+	/// existing carve — no fresh alloc). The replacement for the deleted `upload`:
+	/// carve the buffer, then `load` into it. H2D is synchronous through the pinned
+	/// bounce, so the data is resident on return. Length must fit.
 	pub fn load(&self, data: &[f64]) -> Result<(), HipError> {
 		let bytes = std::mem::size_of_val(data);
 		assert!(bytes <= self.len, "load: {bytes} bytes into a {}-byte buffer", self.len);
-		unsafe { xfer_sync(self.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }
+		unsafe {
+			xfer(self.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}
 	}
 
 	pub fn upload_f32(data: &[f32]) -> Result<Self, HipError> {
 		let bytes = data.len() * 4;
 		let buf = Self::alloc_bytes(bytes)?;
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }?;
+		unsafe {
+			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}?;
 		Ok(buf)
 	}
 
 	pub fn upload_i32(data: &[i32]) -> Result<Self, HipError> {
 		let bytes = data.len() * 4;
 		let buf = Self::alloc_bytes(bytes)?;
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }?;
-		Ok(buf)
-	}
-
-	pub fn zeros_bytes(n_bytes: usize) -> Result<Self, HipError> {
-		let buf = Self::alloc_bytes(n_bytes)?;
-		unsafe { memset_sync(buf.ptr, 0, n_bytes) }?;
+		unsafe {
+			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}?;
 		Ok(buf)
 	}
 
 	pub fn zeros_f32(n: usize) -> Result<Self, HipError> {
-		Self::zeros_bytes(n * 4)
+		let buf = Self::alloc_bytes(n * 4)?;
+		buf.memset_zero(n * 4)?;
+		Ok(buf)
 	}
 
+	/// Zero this buffer's device bytes: the ONE memset choke (`memset_dev`)
+	/// enqueued on the null stream, then the drain — this method is the op that
+	/// owns completion, so the memset is done on return. Callers that previously
+	/// used the deleted `zeros_bytes` alloc + this method's zero.
 	pub fn memset_zero(&self, n_bytes: usize) -> Result<(), HipError> {
-		unsafe { memset_sync(self.ptr, 0, n_bytes) }
-	}
-
-	pub fn download(&self, dst: &mut [f64]) -> Result<(), HipError> {
-		let bytes = std::mem::size_of_val(dst);
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H) }
+		unsafe { memset_dev(self.ptr, 0, n_bytes, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn download_f32(&self, dst: &mut [f32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H) }
+		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn download_u8(&self, dst: &mut [u8]) -> Result<(), HipError> {
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len(), HIP_MEMCPY_D2H) }
+		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len(), HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn download_i32(&self, dst: &mut [i32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H) }
+		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn len(&self) -> usize {
@@ -1454,11 +1376,13 @@ impl GpuBuffer {
 	}
 
 	pub fn copy_from(&mut self, src: &GpuBuffer, n_bytes: usize) -> Result<(), HipError> {
-		unsafe { xfer_sync(self.ptr, src.ptr as *const c_void, n_bytes, HIP_MEMCPY_D2D) }
+		unsafe { xfer(self.ptr, src.ptr as *const c_void, n_bytes, HIP_MEMCPY_D2D, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn fill_bytes(&self, value: u8, n_bytes: usize) -> Result<(), HipError> {
-		unsafe { memset_sync(self.ptr, value as i32, n_bytes) }
+		unsafe { memset_dev(self.ptr, value as i32, n_bytes, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub unsafe fn upload_async(data: &[f64], stream: *mut c_void) -> Result<Self, HipError> {
@@ -1479,40 +1403,34 @@ impl GpuBuffer {
 		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, stream) }
 	}
 
-	pub fn download_vec(&self) -> Result<Vec<f64>, HipError> {
-		let mut v = vec![0.0f64; self.n_floats()];
-		self.download(&mut v)?;
-		Ok(v)
-	}
-
-	pub fn download_vec_f32(&self) -> Result<Vec<f32>, HipError> {
-		let mut v = vec![0.0f32; self.len / 4];
-		self.download_f32(&mut v)?;
-		Ok(v)
-	}
-
 	pub fn upload_f16(data: &[half::f16]) -> Result<Self, HipError> {
 		let bytes = data.len() * 2;
 		let buf = Self::alloc_bytes(bytes)?;
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }?;
+		unsafe {
+			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}?;
 		Ok(buf)
 	}
 
 	pub fn download_f16(&self, dst: &mut [half::f16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H) }
+		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 
 	pub fn upload_bf16(data: &[half::bf16]) -> Result<Self, HipError> {
 		let bytes = data.len() * 2;
 		let buf = Self::alloc_bytes(bytes)?;
-		unsafe { xfer_sync(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) }?;
+		unsafe {
+			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+		}?;
 		Ok(buf)
 	}
 
 	pub fn download_bf16(&self, dst: &mut [half::bf16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;
-		unsafe { xfer_sync(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H) }
+		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()
 	}
 }
 

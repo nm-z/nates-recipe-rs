@@ -98,8 +98,8 @@ fn sync_check() {
 }
 
 fn run2(f: Launch2, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	unsafe {
 		f(
@@ -112,7 +112,7 @@ fn run2(f: Launch2, a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	sync_check();
 	let mut out = vec![0.0; a.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -121,8 +121,8 @@ fn run2_param(
 	a: &[f64],
 	b: &[f64],
 ) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	launch(
 		ba.ptr_raw() as *const c_void,
@@ -132,7 +132,7 @@ fn run2_param(
 	);
 	sync_check();
 	let mut out = vec![0.0; a.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -332,16 +332,16 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"focal",
 		move |a, b| {
-			let ba = GpuBuffer::upload(a).unwrap();
-			let bb = GpuBuffer::upload(b).unwrap();
-			let bgamma = GpuBuffer::upload(&[gamma]).unwrap();
-			let balpha = GpuBuffer::upload(&[alpha]).unwrap();
+			let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+			let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+			let bgamma = { let __up = &[gamma]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+			let balpha = { let __up = &[alpha]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 			let loss = GpuBuffer::alloc(a.len()).unwrap();
 			let grad = GpuBuffer::alloc(a.len()).unwrap();
-			gpu_core::losses::gpu_focal_loss(&ba, &bb, &bgamma, &balpha, a.len(), &loss, &grad)
+			gpu_core::losses::gpu_focal_into(&ba, &bb, &bgamma, &balpha, a.len(), &loss, &grad)
 				.unwrap();
 			let mut out = vec![0.0; a.len()];
-			loss.download(&mut out).unwrap();
+			unsafe { loss.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 			out
 		},
 		move |p, t| {
@@ -359,13 +359,13 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"hinge",
 		|a, b| {
-			let ba = GpuBuffer::upload(a).unwrap();
-			let bb = GpuBuffer::upload(b).unwrap();
+			let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+			let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 			let loss = GpuBuffer::alloc(a.len()).unwrap();
 			let grad = GpuBuffer::alloc(a.len()).unwrap();
 			gpu_core::losses::gpu_hinge_loss(&ba, &bb, a.len(), &loss, &grad).unwrap();
 			let mut out = vec![0.0; a.len()];
-			loss.download(&mut out).unwrap();
+			unsafe { loss.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 			out
 		},
 		|s, y| (1.0 - y * s).max(0.0),

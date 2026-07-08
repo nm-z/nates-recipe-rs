@@ -209,7 +209,7 @@ fn cpu_log_softmax(x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
 // ── GPU runners ──────────────────────────────────────────────────────────────
 fn dl(b: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut o = vec![0.0; n];
-	b.download(&mut o).unwrap();
+	unsafe { b.download_async(&mut o, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	o
 }
 
@@ -224,29 +224,29 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		}
 	};
 
-	// ── layernorm (existing gpu_layernorm, eps=1e-5 fixed, affine) ──
+	// ── layernorm (existing gpu_layernorm_into, eps=1e-5 fixed, affine) ──
 	{
-		use gpu_core::kernels::gpu_layernorm;
+		use gpu_core::kernels::gpu_layernorm_into;
 		let (rows, cols) = (4usize, 7usize);
 		let x = ramp(rows * cols, 0.13, -1.7);
 		let gamma = ramp(cols, 0.05, 0.8);
 		let beta = ramp(cols, -0.03, -0.2);
-		let bx = GpuBuffer::upload(&x).unwrap();
-		let bg = GpuBuffer::upload(&gamma).unwrap();
-		let bb = GpuBuffer::upload(&beta).unwrap();
-		let beps = GpuBuffer::upload(&[1e-5]).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bg = { let __up = &gamma; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bb = { let __up = &beta; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let beps = { let __up = &[1e-5]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let g = GpuBuffer::alloc(rows * cols).unwrap();
-		gpu_layernorm(&bx, &bg, &bb, &beps, rows, cols, &g).unwrap();
+		gpu_layernorm_into(&bx, &bg, &bb, &beps, rows, cols, &g).unwrap();
 		let got = dl(&g, rows * cols);
 		let want = cpu_layernorm(&x, rows, cols, &gamma, &beta, 1e-5);
 		put("layernorm", close(&got, &want), &mut fails);
 		// jax.nn.standardize == layernorm without affine (gamma=1,beta=0)
 		let one = vec![1.0; cols];
 		let zero = vec![0.0; cols];
-		let bone = GpuBuffer::upload(&one).unwrap();
-		let bzero = GpuBuffer::upload(&zero).unwrap();
+		let bone = { let __up = &one; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bzero = { let __up = &zero; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let g2 = GpuBuffer::alloc(rows * cols).unwrap();
-		gpu_layernorm(&bx, &bone, &bzero, &beps, rows, cols, &g2).unwrap();
+		gpu_layernorm_into(&bx, &bone, &bzero, &beps, rows, cols, &g2).unwrap();
 		let got2 = dl(&g2, rows * cols);
 		let want2 = cpu_layernorm(&x, rows, cols, &one, &zero, 1e-5);
 		put("standardize", close(&got2, &want2), &mut fails);
@@ -260,10 +260,10 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let x = ramp(n * c, 0.07, -0.9);
 		let gamma = ramp(c, 0.04, 1.1);
 		let beta = ramp(c, -0.06, 0.3);
-		let bx = GpuBuffer::upload(&x).unwrap();
-		let bg = GpuBuffer::upload(&gamma).unwrap();
-		let bb = GpuBuffer::upload(&beta).unwrap();
-		let beps = GpuBuffer::upload(&[eps]).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bg = { let __up = &gamma; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bb = { let __up = &beta; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let out = GpuBuffer::alloc(n * c).unwrap();
 		let mean = GpuBuffer::alloc(c).unwrap();
 		let inv_std = GpuBuffer::alloc(c).unwrap();
@@ -278,7 +278,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		use gpu_core::kernels::{gpu_log_softmax_rows, gpu_softmax_rows_into};
 		let (rows, cols) = (3usize, 5usize);
 		let x = ramp(rows * cols, 0.21, -1.5);
-		let bx = GpuBuffer::upload(&x).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let g = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_softmax_rows_into(&bx, rows, cols, &g).unwrap();
 		put(
@@ -302,8 +302,8 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let x = ramp(rows * cols, 0.17, -1.3);
 		let sm = cpu_softmax(&x, rows, cols);
 		let grad = ramp(rows * cols, -0.09, 0.5);
-		let bsm = GpuBuffer::upload(&sm).unwrap();
-		let bgrad = GpuBuffer::upload(&grad).unwrap();
+		let bsm = { let __up = &sm; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bgrad = { let __up = &grad; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let bout = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_softmax_backward_into(&bgrad, &bsm, rows, cols, &bout).unwrap();
 		let got = dl(&bout, rows * cols);
@@ -325,9 +325,9 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let eps = 1e-6;
 		let x = ramp(rows * cols, 0.11, -0.8);
 		let gamma = ramp(cols, 0.03, 0.9);
-		let bx = GpuBuffer::upload(&x).unwrap();
-		let bg = GpuBuffer::upload(&gamma).unwrap();
-		let beps = GpuBuffer::upload(&[eps]).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bg = { let __up = &gamma; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let out = GpuBuffer::alloc(rows * cols).unwrap();
 		unsafe {
 			launch_normx_rmsnorm(
@@ -358,9 +358,9 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let x = ramp(n * c * l, 0.05, -1.2);
 		let gamma = ramp(c, 0.04, 0.7);
 		let beta = ramp(c, -0.02, 0.1);
-		let bx = GpuBuffer::upload(&x).unwrap();
-		let bg = GpuBuffer::upload(&gamma).unwrap();
-		let bb = GpuBuffer::upload(&beta).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bg = { let __up = &gamma; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bb = { let __up = &beta; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let out = GpuBuffer::alloc(n * c * l).unwrap();
 		unsafe {
 			launch_normx_groupnorm(
@@ -394,9 +394,9 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let x = ramp(n * c * l, 0.06, -1.0);
 		let gamma = ramp(c, 0.05, 0.8);
 		let beta = ramp(c, -0.03, 0.2);
-		let bx = GpuBuffer::upload(&x).unwrap();
-		let bg = GpuBuffer::upload(&gamma).unwrap();
-		let bb = GpuBuffer::upload(&beta).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bg = { let __up = &gamma; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bb = { let __up = &beta; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let out = GpuBuffer::alloc(n * c * l).unwrap();
 		unsafe {
 			launch_normx_instancenorm(
@@ -427,7 +427,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let (rows, cols) = (4usize, 5usize);
 		let eps = 1e-12;
 		let x = ramp(rows * cols, 0.17, -1.3);
-		let bx = GpuBuffer::upload(&x).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let out = GpuBuffer::alloc(rows * cols).unwrap();
 		unsafe {
 			launch_normx_l2_normalize(

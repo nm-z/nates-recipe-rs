@@ -74,7 +74,7 @@ fn approx(g: f64, want: f64) -> bool {
 // ── runners ─────────────────────────────────────────────────────────────────
 type LaunchU = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		f(
@@ -86,18 +86,18 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 // existing k_* unary ops: (x, n, out) -> ()
 type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -138,26 +138,26 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	}
 
 	// ── existing public activation ops (oracles copied verbatim from inventory_proof.rs) ──
-	use gpu_core::kernels::{gpu_relu, gpu_sigmoid, gpu_silu, gpu_tanh};
-	km!("relu", gpu_relu, |x| x.max(0.0), -3.0, 3.0);
+	use gpu_core::kernels::{gpu_relu_into, gpu_sigmoid_into, gpu_silu_into, gpu_tanh_into};
+	km!("relu", gpu_relu_into, |x| x.max(0.0), -3.0, 3.0);
 	km!(
 		"sigmoid",
-		gpu_sigmoid,
+		gpu_sigmoid_into,
 		|x| 1.0 / (1.0 + (-x).exp()),
 		-6.0,
 		6.0
 	);
-	km!("tanh", gpu_tanh, |x| x.tanh(), -3.0, 3.0);
-	km!("silu", gpu_silu, |x| x / (1.0 + (-x).exp()), -6.0, 6.0);
+	km!("tanh", gpu_tanh_into, |x| x.tanh(), -3.0, 3.0);
+	km!("silu", gpu_silu_into, |x| x / (1.0 + (-x).exp()), -6.0, 6.0);
 
 	use gpu_core::k_gapact::{gpu_hardswish, gpu_mish, gpu_selu, gpu_softplus};
 	fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let a = GpuBuffer::upload(&[1.0f64])?;
+		let a = { let __up = &[1.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_core::k_gapact::gpu_elu(x, &a, n, out)
 	}
 	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let a = GpuBuffer::upload(&[1.6732632423543772f64])?;
-		let l = GpuBuffer::upload(&[1.0507009873554805f64])?;
+		let a = { let __up = &[1.6732632423543772f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+		let l = { let __up = &[1.0507009873554805f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_selu(x, &a, &l, n, out)
 	}
 	km!(
@@ -204,15 +204,15 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		gpu_softshrink, gpu_softsign, gpu_tanhshrink,
 	};
 	fn celu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let p = GpuBuffer::upload(&[1.0f64])?;
+		let p = { let __up = &[1.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_core::k_actx::gpu_celu(x, &p, n, out)
 	}
 	fn hardshrink05(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let p = GpuBuffer::upload(&[0.5f64])?;
+		let p = { let __up = &[0.5f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_core::k_actx::gpu_hardshrink(x, &p, n, out)
 	}
 	fn thresh1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let p = GpuBuffer::upload(&[1.0f64])?;
+		let p = { let __up = &[1.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_core::k_actx::gpu_thresholdedrelu(x, &p, n, out)
 	}
 	km!("relu6", gpu_relu6, |x| x.clamp(0.0, 6.0), -4.0, 8.0);
@@ -301,7 +301,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 fn check_squareplus() -> Option<String> {
 	let b = 4.0;
 	let xs = probes(-3.0, 3.0, 32);
-	let bx = GpuBuffer::upload(&xs).unwrap();
+	let bx = { let __up = &xs; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(xs.len()).unwrap();
 	unsafe {
 		launch_activationx_squareplus(
@@ -314,7 +314,7 @@ fn check_squareplus() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for (x, g) in xs.iter().zip(&got) {
 		let want = 0.5 * (x + (x * x + b).sqrt());
 		if !approx(*g, want) {
@@ -327,7 +327,7 @@ fn check_squareplus() -> Option<String> {
 fn check_star_relu() -> Option<String> {
 	let (sc, b) = (0.8, -0.5);
 	let xs = probes(-3.0, 3.0, 32);
-	let bx = GpuBuffer::upload(&xs).unwrap();
+	let bx = { let __up = &xs; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(xs.len()).unwrap();
 	unsafe {
 		launch_activationx_star_relu(
@@ -341,7 +341,7 @@ fn check_star_relu() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for (x, g) in xs.iter().zip(&got) {
 		let r = x.max(0.0);
 		let want = sc * r * r + b;
@@ -359,8 +359,8 @@ fn check_prelu() -> Option<String> {
 	let alpha: Vec<f64> = (0..xs.len())
 		.map(|i| 0.01 + 0.3 * (i as f64) / xs.len() as f64)
 		.collect();
-	let bx = GpuBuffer::upload(&xs).unwrap();
-	let ba = GpuBuffer::upload(&alpha).unwrap();
+	let bx = { let __up = &xs; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = { let __up = &alpha; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(xs.len()).unwrap();
 	unsafe {
 		launch_activationx_prelu(
@@ -373,7 +373,7 @@ fn check_prelu() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for ((x, a), g) in xs.iter().zip(&alpha).zip(&got) {
 		let want = if *x > 0.0 { *x } else { a * x };
 		if !approx(*g, want) {
@@ -387,7 +387,7 @@ fn check_glu() -> Option<String> {
 	let half = 24usize;
 	let mut x: Vec<f64> = probes(-3.0, 3.0, half);
 	x.extend(probes(-5.0, 5.0, half)); // gate part b
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(half).unwrap();
 	unsafe {
 		launch_activationx_glu(
@@ -399,7 +399,7 @@ fn check_glu() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; half];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for i in 0..half {
 		let (a, b) = (x[i], x[i + half]);
 		let want = a * (1.0 / (1.0 + (-b).exp()));
@@ -414,7 +414,7 @@ fn check_reglu() -> Option<String> {
 	let half = 24usize;
 	let mut x: Vec<f64> = probes(-3.0, 3.0, half);
 	x.extend(probes(-5.0, 5.0, half));
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(half).unwrap();
 	unsafe {
 		launch_activationx_reglu(
@@ -426,7 +426,7 @@ fn check_reglu() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; half];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for i in 0..half {
 		let (a, b) = (x[i], x[i + half]);
 		let want = a * b.max(0.0);
@@ -440,7 +440,7 @@ fn check_reglu() -> Option<String> {
 fn check_crelu() -> Option<String> {
 	let xs = probes(-3.0, 3.0, 32);
 	let n = xs.len();
-	let bx = GpuBuffer::upload(&xs).unwrap();
+	let bx = { let __up = &xs; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(2 * n).unwrap();
 	unsafe {
 		launch_activationx_crelu(
@@ -452,7 +452,7 @@ fn check_crelu() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; 2 * n];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for (i, x) in xs.iter().enumerate() {
 		let want_pos = x.max(0.0);
 		let want_neg = (-x).max(0.0);
@@ -477,7 +477,7 @@ fn check_softmin() -> Option<String> {
 			x[r * cols + c] = ((r as f64) - 2.0) + 0.5 * (c as f64) - 1.5;
 		}
 	}
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(rows * cols).unwrap();
 	unsafe {
 		launch_activationx_softmin(
@@ -490,7 +490,7 @@ fn check_softmin() -> Option<String> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; rows * cols];
-	o.download(&mut got).unwrap();
+	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	for r in 0..rows {
 		let row = &x[r * cols..(r + 1) * cols];
 		let neg: Vec<f64> = row.iter().map(|v| -v).collect();
@@ -671,16 +671,16 @@ fn prove_activation() {
 				x[r * cols + c] = ((r as f64) - 2.0) + 0.4 * (c as f64) - 1.2;
 			}
 		}
-		let bx = GpuBuffer::upload(&x).unwrap();
+		let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 
 		let sm = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_softmax_rows_into(&bx, rows, cols, &sm).unwrap();
 		let mut gsm = vec![0.0; rows * cols];
-		sm.download(&mut gsm).unwrap();
+		unsafe { sm.download_async(&mut gsm, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		let lsm = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_log_softmax_rows(&bx, rows, cols, &lsm).unwrap();
 		let mut glsm = vec![0.0; rows * cols];
-		lsm.download(&mut glsm).unwrap();
+		unsafe { lsm.download_async(&mut glsm, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 
 		let mut sm_ok = true;
 		let mut lsm_ok = true;
@@ -712,15 +712,15 @@ fn prove_activation() {
 
 	// ── leaky_relu (existing, has alpha param) ──
 	{
-		use gpu_core::kernels::gpu_leaky_relu;
+		use gpu_core::kernels::gpu_leaky_relu_into;
 		let alpha = 0.01;
 		let xs = probes(-3.0, 3.0, 32);
-		let bx = GpuBuffer::upload(&xs).unwrap();
-		let ba = GpuBuffer::upload(&[alpha]).unwrap();
+		let bx = { let __up = &xs; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ba = { let __up = &[alpha]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let o = GpuBuffer::alloc(xs.len()).unwrap();
-		gpu_leaky_relu(&bx, &ba, xs.len(), &o).unwrap();
+		gpu_leaky_relu_into(&bx, &ba, xs.len(), &o).unwrap();
 		let mut got = vec![0.0; xs.len()];
-		o.download(&mut got).unwrap();
+		unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		let ok = xs
 			.iter()
 			.zip(&got)
@@ -736,16 +736,16 @@ fn prove_activation() {
 		use gpu_core::k_gapact::{gpu_geglu, gpu_swiglu};
 		let a = probes(-3.0, 3.0, 32);
 		let b = probes(-5.0, 5.0, 32);
-		let ba = GpuBuffer::upload(&a).unwrap();
-		let bb = GpuBuffer::upload(&b).unwrap();
+		let ba = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let sw = GpuBuffer::alloc(a.len()).unwrap();
 		gpu_swiglu(&ba, &bb, a.len(), &sw).unwrap();
 		let mut gsw = vec![0.0; a.len()];
-		sw.download(&mut gsw).unwrap();
+		unsafe { sw.download_async(&mut gsw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		let ge = GpuBuffer::alloc(a.len()).unwrap();
 		gpu_geglu(&ba, &bb, a.len(), &ge).unwrap();
 		let mut gge = vec![0.0; a.len()];
-		ge.download(&mut gge).unwrap();
+		unsafe { ge.download_async(&mut gge, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		let mut sw_ok = true;
 		let mut ge_ok = true;
 		for i in 0..a.len() {

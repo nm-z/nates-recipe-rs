@@ -111,12 +111,12 @@ fn prove_sgd() -> bool {
 	let (lr, n) = (0.05, N);
 	let w = wv(n);
 	let g = gv(n);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let bneg_lr = GpuBuffer::upload(&[-lr]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bneg_lr = { let __up = &[-lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::kernels::gpu_sgd_update(&bg, &bneg_lr, n, &bw).unwrap();
 	let mut got = vec![0.0; n];
-	bw.download(&mut got).unwrap();
+	unsafe { bw.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want: Vec<f64> = (0..n).map(|i| w[i] - lr * g[i]).collect();
 	close(&got, &want)
 }
@@ -127,16 +127,16 @@ fn prove_momentum() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let v0 = sv(n, 0.4, -0.02);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bmu = GpuBuffer::upload(&[mu]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bmu = { let __up = &[mu]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::optimizers::gpu_momentum_update(&bg, &blr, &bmu, n, &bw, &bv).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gvb = vec![0.0; n];
-	bv.download(&mut gvb).unwrap();
+	unsafe { bv.download_async(&mut gvb, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want_v: Vec<f64> = (0..n).map(|i| mu * v0[i] - lr * g[i]).collect();
 	let want_w: Vec<f64> = (0..n).map(|i| w[i] + want_v[i]).collect();
 	close(&gw, &want_w) && close(&gvb, &want_v)
@@ -148,17 +148,17 @@ fn prove_rmsprop() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let c0 = sv(n, 0.5, 0.01);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bc = GpuBuffer::upload(&c0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bdecay = GpuBuffer::upload(&[decay]).unwrap();
-	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bc = { let __up = &c0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bdecay = { let __up = &[decay]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::optimizers::gpu_rmsprop_update(&bg, &blr, &bdecay, &beps, n, &bw, &bc).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gc = vec![0.0; n];
-	bc.download(&mut gc).unwrap();
+	unsafe { bc.download_async(&mut gc, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want_c: Vec<f64> = (0..n)
 		.map(|i| decay * c0[i] + (1.0 - decay) * g[i] * g[i])
 		.collect();
@@ -174,16 +174,16 @@ fn prove_adagrad() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let a0 = sv(n, 0.3, 0.02);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let ba = GpuBuffer::upload(&a0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = { let __up = &a0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::optimizers::gpu_adagrad_update(&bg, &blr, &beps, n, &bw, &ba).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut ga = vec![0.0; n];
-	ba.download(&mut ga).unwrap();
+	unsafe { ba.download_async(&mut ga, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want_a: Vec<f64> = (0..n).map(|i| a0[i] + g[i] * g[i]).collect();
 	let want_w: Vec<f64> = (0..n)
 		.map(|i| w[i] - lr * g[i] / (want_a[i].sqrt() + eps))
@@ -197,18 +197,18 @@ fn prove_lion() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let m0 = sv(n, -0.15, 0.02);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
-	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
-	let bwd = GpuBuffer::upload(&[wd]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb1 = { let __up = &[b1]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb2 = { let __up = &[b2]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bwd = { let __up = &[wd]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::optimizers::gpu_lion_update(&bg, &blr, &bb1, &bb2, &bwd, n, &bw, &bm).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gm = vec![0.0; n];
-	bm.download(&mut gm).unwrap();
+	unsafe { bm.download_async(&mut gm, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let sign = |x: f64| {
 		if x > 0.0 {
 			1.0
@@ -235,17 +235,17 @@ fn prove_adam() -> bool {
 	let g = gv(n);
 	let m0 = sv(n, 0.05, 0.01);
 	let v0 = sv(n, 0.2, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
-	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
-	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb1 = { let __up = &[b1]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb2 = { let __up = &[b2]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::kernels::gpu_adam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
 	let bc2 = 1.0 - b2.powi(t as i32);
 	let want: Vec<f64> = (0..n)
@@ -265,19 +265,19 @@ fn prove_adamw() -> bool {
 	let g = gv(n);
 	let m0 = sv(n, 0.05, 0.01);
 	let v0 = sv(n, 0.2, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
-	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
-	let beps = GpuBuffer::upload(&[eps]).unwrap();
-	let bwd = GpuBuffer::upload(&[wd]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb1 = { let __up = &[b1]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb2 = { let __up = &[b2]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bwd = { let __up = &[wd]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::kernels::gpu_adamw_update(&bg, &blr, &bb1, &bb2, &beps, &bwd, t, n, &bw, &bm, &bv)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
 	let bc2 = 1.0 - b2.powi(t as i32);
 	let want: Vec<f64> = (0..n)
@@ -298,18 +298,18 @@ fn prove_nadam() -> bool {
 	let g = gv(n);
 	let m0 = sv(n, 0.05, 0.01);
 	let v0 = sv(n, 0.2, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	let blr = GpuBuffer::upload(&[lr]).unwrap();
-	let bb1 = GpuBuffer::upload(&[b1]).unwrap();
-	let bb2 = GpuBuffer::upload(&[b2]).unwrap();
-	let beps = GpuBuffer::upload(&[eps]).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let blr = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb1 = { let __up = &[b1]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb2 = { let __up = &[b2]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beps = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	gpu_core::optimizers::gpu_nadam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let bc1t = 1.0 - b1.powi(t as i32);
 	let bc1t1 = 1.0 - b1.powi(t as i32 + 1);
 	let bc2 = 1.0 - b2.powi(t as i32);
@@ -331,13 +331,27 @@ fn prove_lamb() -> bool {
 	let g = gv(n);
 	let m0 = sv(n, 0.05, 0.01);
 	let v0 = sv(n, 0.2, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
-	gpu_core::optimizers::gpu_lamb_update(&bw, &bm, &bv, &bg, lr, b1, b2, eps, wd, t, n).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	// LAMB = phase1 (Adam moments + trust-ratio norms, device-side) then phase2 (scaled update).
+	let tmp_upd = GpuBuffer::alloc(n).unwrap();
+	let w_norm_sq = GpuBuffer::alloc(1).unwrap();
+	let u_norm_sq = GpuBuffer::alloc(1).unwrap();
+	let lr_b = { let __up = &[lr]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b1_b = { let __up = &[b1]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b2_b = { let __up = &[b2]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let eps_b = { let __up = &[eps]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let wd_b = { let __up = &[wd]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	gpu_core::optimizers::gpu_lamb_phase1(
+		&bg, &b1_b, &b2_b, &eps_b, &wd_b, t as usize, n, &bw, &bm, &bv, &tmp_upd, &w_norm_sq,
+		&u_norm_sq,
+	)
+	.unwrap();
+	gpu_core::optimizers::gpu_lamb_phase2(&tmp_upd, &lr_b, &w_norm_sq, &u_norm_sq, n, &bw).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t);
 	let bc2 = 1.0 - b2.powi(t);
 	let upd: Vec<f64> = (0..n)
@@ -362,9 +376,9 @@ fn prove_nesterov() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let b0 = sv(n, 0.1, 0.01);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	unsafe {
 		launch_optimizerx_nesterov(
 			bw.ptr_raw(),
@@ -378,9 +392,9 @@ fn prove_nesterov() -> bool {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gb = vec![0.0; n];
-	bb.download(&mut gb).unwrap();
+	unsafe { bb.download_async(&mut gb, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want_b: Vec<f64> = (0..n).map(|i| mu * b0[i] + g[i]).collect();
 	let want_w: Vec<f64> = (0..n)
 		.map(|i| w[i] - lr * (g[i] + mu * want_b[i]))
@@ -395,10 +409,10 @@ fn prove_adadelta() -> bool {
 	let g = gv(n);
 	let eg0 = sv(n, 0.3, 0.01);
 	let edx0 = sv(n, 0.15, 0.008);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let beg = GpuBuffer::upload(&eg0).unwrap();
-	let bedx = GpuBuffer::upload(&edx0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let beg = { let __up = &eg0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bedx = { let __up = &edx0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	unsafe {
 		launch_optimizerx_adadelta(
 			bw.ptr_raw(),
@@ -414,11 +428,11 @@ fn prove_adadelta() -> bool {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut geg = vec![0.0; n];
-	beg.download(&mut geg).unwrap();
+	unsafe { beg.download_async(&mut geg, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gedx = vec![0.0; n];
-	bedx.download(&mut gedx).unwrap();
+	unsafe { bedx.download_async(&mut gedx, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let want_eg: Vec<f64> = (0..n)
 		.map(|i| rho * eg0[i] + (1.0 - rho) * g[i] * g[i])
 		.collect();
@@ -439,10 +453,10 @@ fn radam_step(t: usize) -> (Vec<f64>, Vec<f64>) {
 	let g = gv(n);
 	let m0 = sv(n, 0.05, 0.01);
 	let v0 = sv(n, 0.2, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bm = GpuBuffer::upload(&m0).unwrap();
-	let bv = GpuBuffer::upload(&v0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = { let __up = &m0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bv = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	unsafe {
 		launch_optimizerx_radam(
 			bw.ptr_raw(),
@@ -460,7 +474,7 @@ fn radam_step(t: usize) -> (Vec<f64>, Vec<f64>) {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let b1t = b1.powi(t as i32);
 	let b2t = b2.powi(t as i32);
 	let rho_inf = 2.0 / (1.0 - b2) - 1.0;
@@ -514,9 +528,9 @@ fn prove_lars() -> bool {
 	let w = wv(n);
 	let g = gv(n);
 	let b0 = sv(n, 0.1, 0.005);
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b0).unwrap();
-	let bg = GpuBuffer::upload(&g).unwrap();
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b0; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bg = { let __up = &g; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let wns = GpuBuffer::alloc(1).unwrap();
 	let gns = GpuBuffer::alloc(1).unwrap();
 	wns.memset_zero(8).unwrap();
@@ -535,8 +549,8 @@ fn prove_lars() -> bool {
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut wn = [0.0];
 	let mut gn = [0.0];
-	wns.download(&mut wn).unwrap();
-	gns.download(&mut gn).unwrap();
+	unsafe { wns.download_async(&mut wn, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { gns.download_async(&mut gn, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	unsafe {
 		launch_optimizerx_lars_phase2(
 			bw.ptr_raw(),
@@ -555,9 +569,9 @@ fn prove_lars() -> bool {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	bw.download(&mut gw).unwrap();
+	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut gb = vec![0.0; n];
-	bb.download(&mut gb).unwrap();
+	unsafe { bb.download_async(&mut gb, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	// independent oracle
 	let w_norm = w.iter().map(|x| x * x).sum::<f64>().sqrt();
 	let g_norm = g.iter().map(|x| x * x).sum::<f64>().sqrt();

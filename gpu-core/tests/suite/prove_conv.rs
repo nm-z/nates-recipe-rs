@@ -173,7 +173,7 @@ fn run_gpu<F: FnOnce(*mut c_void)>(out_len: usize, launch: F) -> Vec<f64> {
 	launch(o.ptr_raw());
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; out_len];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -185,9 +185,9 @@ fn prove_conv1d() -> bool {
 	let x = fill(n * cin * l, 1);
 	let w = fill(cout * cin * k, 2);
 	let b = fill(cout, 3);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * lout, |y| unsafe {
 		launch_convx_conv1d(
 			bx.ptr_raw() as *const c_void,
@@ -228,9 +228,9 @@ fn prove_conv2d() -> bool {
 	let x = fill(n * cin * h * w_, 11);
 	let w = fill(cout * cin * kh * kw, 12);
 	let b = fill(cout, 13);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * hout * wout, |y| unsafe {
 		launch_convx_conv2d(
 			bx.ptr_raw() as *const c_void,
@@ -278,9 +278,9 @@ fn prove_conv3d() -> bool {
 	let x = fill(n * cin * d * h * w_, 21);
 	let w = fill(cout * cin * kd * kh * kw, 22);
 	let b = fill(cout, 23);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * dout * hout * wout, |y| unsafe {
 		launch_convx_conv3d(
 			bx.ptr_raw() as *const c_void,
@@ -341,9 +341,9 @@ fn prove_depthwise_conv1d() -> bool {
 	let x = fill(n * cin * l, 31);
 	let w = fill(cin * m * k, 32);
 	let b = fill(cout, 33);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * lout, |y| unsafe {
 		launch_convx_dwconv1d(
 			bx.ptr_raw() as *const c_void,
@@ -383,9 +383,9 @@ fn prove_depthwise_conv2d() -> bool {
 	let x = fill(n * cin * h * w_, 41);
 	let w = fill(cin * m * kh * kw, 42);
 	let b = fill(cout, 43);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * hout * wout, |y| unsafe {
 		launch_convx_dwconv2d(
 			bx.ptr_raw() as *const c_void,
@@ -434,9 +434,9 @@ fn prove_grouped_conv2d() -> bool {
 	let x = fill(n * cin * h * w_, 51);
 	let w = fill(cout * cin_g * kh * kw, 52);
 	let b = fill(cout, 53);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * hout * wout, |y| unsafe {
 		launch_convx_gconv2d(
 			bx.ptr_raw() as *const c_void,
@@ -488,9 +488,9 @@ fn prove_convtranspose2d() -> bool {
 	let x = fill(n * cin * h * w_, 61);
 	let w = fill(cin * cout * kh * kw, 62);
 	let b = fill(cout, 63);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
-	let bb = GpuBuffer::upload(&b).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * cout * hout * wout, |y| unsafe {
 		launch_convx_convtranspose2d(
 			bx.ptr_raw() as *const c_void,
@@ -548,8 +548,8 @@ fn prove_dilation2d(erode: bool) -> bool {
 	let (hout, wout) = (h - kh + 1, w_ - kw + 1);
 	let x = fill(n * c * h * w_, 71);
 	let w = fill(c * kh * kw, 72);
-	let bx = GpuBuffer::upload(&x).unwrap();
-	let bw = GpuBuffer::upload(&w).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bw = { let __up = &w; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let got = run_gpu(n * c * hout * wout, |y| unsafe {
 		launch_convx_dilation2d(
 			bx.ptr_raw() as *const c_void,
@@ -600,11 +600,11 @@ fn prove_im2col_2d() -> bool {
 	let (kh, kw) = (2, 3);
 	let (oh, ow) = (h - kh + 1, w - kw + 1);
 	let x = fill(n * c * h * w, 81);
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let mut got = vec![0.0; n * oh * ow * c * kh * kw];
 	let bout = GpuBuffer::alloc(n * oh * ow * c * kh * kw).unwrap();
 	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &bout).unwrap();
-	bout.download(&mut got).unwrap();
+	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	// Oracle: patches[(n*oh*ow), (c*kh*kw)], patch[(...,p),(c,ph,pw)] = x[n,c,oh+ph,ow+pw]
 	let ps = c * kh * kw;
 	let mut want = vec![0.0; n * oh * ow * ps];
@@ -632,11 +632,11 @@ fn prove_im2col_1d() -> bool {
 	let (n, p, ks) = (3, 8, 3);
 	let out_len = p - ks + 1;
 	let x = fill(n * p, 91);
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let mut got = vec![0.0; n * out_len * ks];
 	let bout = GpuBuffer::alloc(n * out_len * ks).unwrap();
 	gpu_im2col_1d(&bx, n, p, ks, &bout).unwrap();
-	bout.download(&mut got).unwrap();
+	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut want = vec![0.0; n * out_len * ks];
 	for i in 0..n {
 		for t in 0..out_len {
@@ -655,14 +655,14 @@ fn prove_col2im_2d() -> bool {
 	let (n, c, h, w) = (1, 2, 5, 4);
 	let (kh, kw) = (2, 3);
 	let x = fill(n * c * h * w, 101);
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let (poh, pow) = (h - kh + 1, w - kw + 1);
 	let patches = GpuBuffer::alloc(n * poh * pow * c * kh * kw).unwrap();
 	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &patches).unwrap();
 	let mut got = vec![0.0; n * c * h * w];
 	let bout = GpuBuffer::alloc(n * c * h * w).unwrap();
 	gpu_col2im_2d(&patches, n, c, h, w, kh, kw, &bout).unwrap();
-	bout.download(&mut got).unwrap();
+	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	// Oracle: scatter-add the same patch values back; equals x scaled by per-cell
 	// overlap multiplicity (number of (oh,ow) windows covering that cell).
 	let (oh, ow) = (h - kh + 1, w - kw + 1);
@@ -691,13 +691,13 @@ fn prove_col2im_1d() -> bool {
 	let (n, p, ks) = (2, 8, 3);
 	let out_len = p - ks + 1;
 	let x = fill(n * p, 111);
-	let bx = GpuBuffer::upload(&x).unwrap();
+	let bx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let patches = GpuBuffer::alloc(n * out_len * ks).unwrap();
 	gpu_im2col_1d(&bx, n, p, ks, &patches).unwrap();
 	let mut got = vec![0.0; n * p];
 	let bout = GpuBuffer::alloc(n * p).unwrap();
 	gpu_col2im_1d(&patches, n, p, ks, &bout).unwrap();
-	bout.download(&mut got).unwrap();
+	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	let mut want = vec![0.0; n * p];
 	for i in 0..n {
 		for t in 0..out_len {

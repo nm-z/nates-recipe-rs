@@ -8,7 +8,7 @@ fn approx_eq(a: f64, b: f64) -> bool {
 }
 
 fn upload(data: &[f64]) -> GpuBuffer {
-	GpuBuffer::upload(data).expect("upload")
+	{ let __up = data; let __ub = GpuBuffer::alloc(__up.len()).expect("upload"); __ub.load(__up).expect("upload"); __ub }
 }
 
 fn out_buf(n: usize) -> GpuBuffer {
@@ -17,7 +17,7 @@ fn out_buf(n: usize) -> GpuBuffer {
 
 fn download(buf: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; n];
-	buf.download(&mut v).expect("download");
+	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download"); gpu_core::hip::device_synchronize().expect("download");
 	v
 }
 
@@ -633,8 +633,8 @@ fn test_pairwise_l1_2x2() {
 #[test]
 fn test_pairwise_hamming_identical() {
 	// [1,2] vs [1,2] → 0/2 = 0.0
-	let q_u8 = GpuBuffer::upload_u8(&[1u8, 2u8]).unwrap();
-	let t_u8 = GpuBuffer::upload_u8(&[1u8, 2u8]).unwrap();
+	let q_u8 = { let __u = &[1u8, 2u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let t_u8 = { let __u = &[1u8, 2u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
 	let out = out_buf(1);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
@@ -649,8 +649,8 @@ fn test_pairwise_hamming_identical() {
 #[test]
 fn test_pairwise_hamming_half_mismatch() {
 	// [1,0] vs [0,0] → 1/2 = 0.5
-	let q_u8 = GpuBuffer::upload_u8(&[1u8, 0u8]).unwrap();
-	let t_u8 = GpuBuffer::upload_u8(&[0u8, 0u8]).unwrap();
+	let q_u8 = { let __u = &[1u8, 0u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let t_u8 = { let __u = &[0u8, 0u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
 	let out = out_buf(1);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
@@ -669,8 +669,8 @@ fn test_pairwise_hamming_2x2() {
 	// out[1]=hamming([0,1],[1,1])=1/2=0.5
 	// out[2]=hamming([1,0],[0,1])=2/2=1.0
 	// out[3]=hamming([1,0],[1,1])=1/2=0.5
-	let q_u8 = GpuBuffer::upload_u8(&[0u8, 1, 1, 0]).unwrap();
-	let t_u8 = GpuBuffer::upload_u8(&[0u8, 1, 1, 1]).unwrap();
+	let q_u8 = { let __u = &[0u8, 1, 1, 0]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let t_u8 = { let __u = &[0u8, 1, 1, 1]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
 	let out = out_buf(4);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 4);
@@ -862,7 +862,7 @@ fn test_focal_loss_target1() {
 	let alpha = upload(&[1.0]);
 	let loss_buf = out_buf(1);
 	let grad_buf = out_buf(1);
-	gpu_focal_loss(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
+	gpu_focal_into(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let p_t = 0.9f64;
@@ -888,7 +888,7 @@ fn test_focal_loss_target0() {
 	let alpha = upload(&[1.0]);
 	let loss_buf = out_buf(1);
 	let grad_buf = out_buf(1);
-	gpu_focal_loss(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
+	gpu_focal_into(&prob, &target, &gamma, &alpha, 1, &loss_buf, &grad_buf).unwrap();
 	let loss = download(&loss_buf, 1);
 	let grad = download(&grad_buf, 1);
 	let p_t = 0.9f64;

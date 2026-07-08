@@ -74,7 +74,7 @@ unsafe extern "C" {
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
 fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		f(
@@ -86,17 +86,17 @@ fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 type UnaryGpu = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_existing(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -126,8 +126,8 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		gpu_sinh, gpu_square,
 	};
 	use gpu_core::kernels::{
-		gpu_abs, gpu_exp, gpu_leaky_relu, gpu_log, gpu_neg, gpu_relu, gpu_sigmoid, gpu_sign,
-		gpu_silu, gpu_sqrt, gpu_tanh,
+		gpu_abs_into, gpu_exp, gpu_leaky_relu_into, gpu_log_into, gpu_neg, gpu_relu_into, gpu_sigmoid_into, gpu_sign_into,
+		gpu_silu_into, gpu_sqrt, gpu_tanh_into,
 	};
 	use gpu_core::math_ops::{
 		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round,
@@ -136,8 +136,8 @@ fn registry() -> BTreeMap<&'static str, Op> {
 
 	// selu carries two scalar params (alpha, lambda); wrap to the standard unary form.
 	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let a = GpuBuffer::upload(&[1.6732632423543772f64])?;
-		let l = GpuBuffer::upload(&[1.0507009873554805f64])?;
+		let a = { let __up = &[1.6732632423543772f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+		let l = { let __up = &[1.0507009873554805f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 		gpu_selu(x, &a, &l, n, out)
 	}
 
@@ -188,7 +188,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	}
 
 	// ── existing ops (49) ──
-	e!("abs", gpu_abs, |x| x.abs(), std_probe);
+	e!("abs", gpu_abs_into, |x| x.abs(), std_probe);
 	e!("acos", gpu_acos, |x| x.acos(), dom1);
 	e!("acosh", gpu_acosh, |x| x.acosh(), gt1);
 	e!("asin", gpu_asin, |x| x.asin(), dom1);
@@ -230,7 +230,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		probes(-4.0, 4.0, 64)
 	);
 	e!("lgamma", gpu_lgamma, |x| libm::lgamma(x), pos_probe);
-	e!("log", gpu_log, |x| x.ln(), pos_probe);
+	e!("log", gpu_log_into, |x| x.ln(), pos_probe);
 	e!("log10", gpu_log10, |x| x.log10(), pos_probe);
 	e!("log1p", gpu_log1p, |x| x.ln_1p(), probes(-0.9, 5.0, 64));
 	e!("log2", gpu_log2, |x| x.log2(), pos_probe);
@@ -243,7 +243,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!("neg", gpu_neg, |x| -x, std_probe);
 	e!("rad2deg", gpu_rad2deg, |x| x.to_degrees(), std_probe);
 	e!("reciprocal", gpu_reciprocal, |x| 1.0 / x, pos_probe);
-	e!("relu", gpu_relu, |x| x.max(0.0), std_probe);
+	e!("relu", gpu_relu_into, |x| x.max(0.0), std_probe);
 	e!(
 		"relu6",
 		gpu_relu6,
@@ -263,13 +263,13 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	);
 	e!(
 		"sigmoid",
-		gpu_sigmoid,
+		gpu_sigmoid_into,
 		|x| 1.0 / (1.0 + (-x).exp()),
 		probes(-6.0, 6.0, 64)
 	);
 	e!(
 		"sign",
-		gpu_sign,
+		gpu_sign_into,
 		|x| if x > 0.0 {
 			1.0
 		} else if x < 0.0 {
@@ -281,7 +281,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	);
 	e!(
 		"silu",
-		gpu_silu,
+		gpu_silu_into,
 		|x| x / (1.0 + (-x).exp()),
 		probes(-6.0, 6.0, 64)
 	);
@@ -297,17 +297,17 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!("sqrt", gpu_sqrt, |x| x.sqrt(), probes(0.0, 9.0, 64));
 	e!("square", gpu_square, |x| x * x, std_probe);
 	e!("tan", gpu_tan, |x| x.tan(), probes(-1.2, 1.2, 64));
-	e!("tanh", gpu_tanh, |x| x.tanh(), std_probe);
+	e!("tanh", gpu_tanh_into, |x| x.tanh(), std_probe);
 	e!("trunc", gpu_trunc, |x| x.trunc(), std_probe);
 	{
 		// elu/leaky_relu take a param; wrap to the standard unary form
 		fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-			let a = GpuBuffer::upload(&[1.0f64])?;
+			let a = { let __up = &[1.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 			gpu_core::k_gapact::gpu_elu(x, &a, n, out)
 		}
 		fn lrelu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-			let a = GpuBuffer::upload(&[0.01f64])?;
-			gpu_leaky_relu(x, &a, n, out)
+			let a = { let __up = &[0.01f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+			gpu_leaky_relu_into(x, &a, n, out)
 		}
 		e!(
 			"elu",

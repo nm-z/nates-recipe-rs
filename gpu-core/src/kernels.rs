@@ -1587,75 +1587,6 @@ pub fn gpu_shutdown() {
 	eprint!("{}", crate::callspy::report());
 }
 
-/// Fused linear: out = X @ W + bias. X is (m,k), W is (k,n), bias is (1,n), out is (m,n).
-///
-/// Pre-fills output with bias broadcast, then dgemm with beta=1.0 adds the matmul on top.
-/// One output buffer, zero intermediates. The bias addition rides free in GEMM's write-back.
-pub fn gpu_linear(
-	x: &GpuBuffer,
-	w: &GpuBuffer,
-	bias: &GpuBuffer,
-	m: usize,
-	n: usize,
-	k: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	// Broadcast bias into every row of C
-	unsafe {
-		launch_repeat_rows(
-			bias.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			(m * n) as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	// C = 1.0 * X @ W + 1.0 * C_bias
-	let alpha = 1.0_f64;
-	let beta = 1.0_f64;
-	let status = unsafe {
-		hipblasDgemm(
-			hipblas_handle(),
-			HIPBLAS_OP_N,
-			HIPBLAS_OP_N,
-			n as i32,
-			m as i32,
-			k as i32,
-			&alpha,
-			w.ptr as *const f64,
-			n as i32,
-			x.ptr as *const f64,
-			k as i32,
-			&beta,
-			out.ptr as *mut f64,
-			n as i32,
-		)
-	};
-	check(status)
-}
-
-/// Linear backward: returns (grad_input, grad_w, grad_b).
-/// Three separate GEMM/reduce dispatches — no fusion, just API cleanliness.
-// not-an-op: driver — composite of gemm_at / reduce_sum_cols_into / gemm_bt_into into three allocated grads
-pub fn gpu_linear_backward(
-	grad: &GpuBuffer,
-	input: &GpuBuffer,
-	weight: &GpuBuffer,
-	m: usize,
-	n: usize,
-	k: usize,
-) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), HipError> {
-	let grad_w = GpuBuffer::alloc(k * n)?;
-	gpu_gemm_at(input, grad, k, n, m, &grad_w)?;
-	let grad_b = GpuBuffer::alloc(n)?;
-	let ws_bytes = gpu_reduce_sum_cols_workspace_bytes(m, n);
-	let reduce_ws = GpuBuffer::alloc_bytes(ws_bytes)?;
-	gpu_reduce_sum_cols_into(grad, &reduce_ws, m, n, &grad_b)?;
-	let grad_input = GpuBuffer::alloc(m * k)?;
-	gpu_gemm_bt_into(grad, weight, m, k, n, &grad_input)?;
-	Ok((grad_input, grad_w, grad_b))
-}
-
 /// C = A @ B, A is (m x k) row-major, B is (k x n) row-major, C is (m x n) row-major.
 ///
 /// hipBLAS is column-major. The identity C_rm = (C_cm)^T = (B_cm @ A_cm)^T lets us call:
@@ -2275,19 +2206,6 @@ pub fn gpu_scaled_exp(
 	Ok(())
 }
 
-pub fn gpu_sigmoid(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	gpu_sigmoid_into(x, n, out)
-}
-
-pub fn gpu_sigmoid_backward(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	gpu_sigmoid_backward_into(grad, act, n, out)
-}
-
 pub fn gpu_sigmoid_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_sigmoid(
@@ -2318,19 +2236,6 @@ pub fn gpu_sigmoid_backward_into(
 	}
 	check_launch();
 	Ok(())
-}
-
-pub fn gpu_tanh(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	gpu_tanh_into(x, n, out)
-}
-
-pub fn gpu_tanh_backward(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	gpu_tanh_backward_into(grad, act, n, out)
 }
 
 /// Alloc-free tanh forward (out may alias x) and backward (act = tanh output; tanh'=1-out²).
@@ -2437,19 +2342,6 @@ pub fn gpu_silu_backward_into(
 	Ok(())
 }
 
-pub fn gpu_relu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	gpu_relu_into(x, n, out)
-}
-
-pub fn gpu_relu_backward(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	gpu_relu_backward_into(grad, act, n, out)
-}
-
 pub fn gpu_relu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_relu(
@@ -2480,10 +2372,6 @@ pub fn gpu_relu_backward_into(
 	}
 	check_launch();
 	Ok(())
-}
-
-pub fn gpu_add(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	gpu_add_into(a, b, n, out)
 }
 
 /// `out = a + b` into a caller-owned buffer (no alloc). Aliasing `out == a` or
@@ -2521,10 +2409,6 @@ pub fn gpu_add_scalar(
 	Ok(())
 }
 
-pub fn gpu_div(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	gpu_div_into(a, b, n, out)
-}
-
 pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_div(
@@ -2537,20 +2421,6 @@ pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> 
 	}
 	check_launch();
 	Ok(())
-}
-
-pub fn gpu_scale(
-	x: &GpuBuffer,
-	scalar: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	let bytes = n * std::mem::size_of::<f64>();
-	// Copy x → out, then scale in-place with the own device-scalar kernel.
-	// hipblasDscal is out: host-pointer-mode alpha host-derefs the device
-	// scalar (SIGSEGV) and device pointer mode would be a new vendor call.
-	unsafe { crate::memory::xfer_sync(out.ptr, x.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
-	crate::infer_ops::gpu_scale_f64_inplace(scalar, n, out)
 }
 
 /// In-place scale: x *= scalar (no alloc, no copy)
@@ -3106,90 +2976,6 @@ pub fn gpu_rand_uniform_into(seed: usize, n: usize, out: &GpuBuffer) -> Result<(
 	Ok(())
 }
 
-pub fn gpu_linear_backward_into(
-	grad: &GpuBuffer,
-	input: &GpuBuffer,
-	weight: &GpuBuffer,
-	m: usize,
-	n: usize,
-	k: usize,
-	grad_input: &GpuBuffer,
-	grad_w: &GpuBuffer,
-	grad_b: &GpuBuffer,
-) -> Result<(), HipError> {
-	// grad_w = inputᵀ @ grad
-	gpu_gemm_at(input, grad, k, n, m, grad_w)?;
-	// grad_b = sum_cols(grad) — reduce scratch is op-internal here (superseded path;
-	// the workspace-threaded form is gpu_linear_backward_full_into).
-	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr as *const c_void, m as i32, n as i32, std::ptr::null_mut())
-	};
-	let tmp = GpuBuffer::alloc_bytes(ws)?;
-	unsafe {
-		launch_reduce_sum_cols(
-			grad.ptr as *const c_void,
-			grad_b.ptr as *mut c_void,
-			m as i32,
-			n as i32,
-			tmp.ptr,
-			ws,
-			std::ptr::null_mut(),
-		);
-	}
-	// grad_input = grad @ weightᵀ
-	let alpha = 1.0_f64;
-	let beta = 0.0_f64;
-	let status = unsafe {
-		hipblasDgemm(
-			hipblas_handle(),
-			HIPBLAS_OP_T,
-			HIPBLAS_OP_N,
-			k as i32,
-			m as i32,
-			n as i32,
-			&alpha,
-			weight.ptr as *const f64,
-			n as i32,
-			grad.ptr as *const f64,
-			n as i32,
-			&beta,
-			grad_input.ptr as *mut f64,
-			k as i32,
-		)
-	};
-	check(status)?;
-	Ok(())
-}
-
-pub fn gpu_layernorm_backward_into(
-	grad_y: &GpuBuffer,
-	x: &GpuBuffer,
-	gamma: &GpuBuffer,
-	eps: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	grad_x: &GpuBuffer,
-	grad_gamma: &GpuBuffer,
-	grad_beta: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_layernorm_backward(
-			grad_y.ptr as *const c_void,
-			x.ptr as *const c_void,
-			gamma.ptr as *const c_void,
-			grad_x.ptr as *mut c_void,
-			grad_gamma.ptr as *mut c_void,
-			grad_beta.ptr as *mut c_void,
-			rows as i32,
-			cols as i32,
-			eps.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 pub fn gpu_softmax_ce_grad_into(
 	logits: &GpuBuffer,
 	targets: &GpuBuffer,
@@ -3208,38 +2994,6 @@ pub fn gpu_softmax_ce_grad_into(
 			n as i32,
 			nc as i32,
 			scale.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_linear_backward_weights_only(
-	grad: &GpuBuffer,
-	input: &GpuBuffer,
-	partials: &GpuBuffer,
-	reduce_ws: &GpuBuffer,
-	m: usize,
-	n: usize,
-	k: usize,
-	grad_w: &GpuBuffer,
-	grad_b: &GpuBuffer,
-) -> Result<(), HipError> {
-	// grad_w = inputᵀ @ grad — split-K across all CUs.
-	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
-	// grad_b = sum_cols(grad)
-	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr as *const c_void, m as i32, n as i32, std::ptr::null_mut())
-	};
-	unsafe {
-		launch_reduce_sum_cols(
-			grad.ptr as *const c_void,
-			grad_b.ptr as *mut c_void,
-			m as i32,
-			n as i32,
-			reduce_ws.ptr,
-			ws,
 			std::ptr::null_mut(),
 		);
 	}
@@ -3814,7 +3568,8 @@ pub fn gpu_tree_build_into(
 	};
 	let hist_elems = max_level * p * n_bins;
 
-	let node_assign = GpuBuffer::zeros_bytes(n_tr * isz).expect("tb node_assign"); // fill 0
+	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz).expect("tb node_assign");
+	node_assign.memset_zero(n_tr * isz).expect("tb node_assign zero"); // fill 0
 	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_feat");
 	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_bin");
 	sf.fill_bytes(0xFF, max_nodes * isz)
@@ -4386,7 +4141,16 @@ pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuf
 pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; n];
 	let bytes = n * std::mem::size_of::<i32>();
-	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
+	unsafe {
+		crate::memory::xfer(
+			result.as_mut_ptr() as *mut c_void,
+			buf.ptr,
+			bytes,
+			crate::hip::HIP_MEMCPY_D2H,
+			std::ptr::null_mut(),
+		)
+	}?;
+	crate::hip::device_synchronize()?;
 	Ok(result)
 }
 
@@ -4446,7 +4210,16 @@ pub fn download_topk_indices(buf: &GpuBuffer, rows: usize, k: usize) -> Result<V
 	let n = rows * k;
 	let mut result = vec![0i32; n];
 	let bytes = n * std::mem::size_of::<i32>();
-	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
+	unsafe {
+		crate::memory::xfer(
+			result.as_mut_ptr() as *mut c_void,
+			buf.ptr,
+			bytes,
+			crate::hip::HIP_MEMCPY_D2H,
+			std::ptr::null_mut(),
+		)
+	}?;
+	crate::hip::device_synchronize()?;
 	Ok(result)
 }
 
@@ -4543,36 +4316,6 @@ pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer)
 			out.ptr as *mut c_void,
 			rows as i32,
 			cols as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_reduce_sum_cols(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	workspace: &GpuBuffer,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(
-			x.ptr as *const c_void,
-			rows as i32,
-			cols as i32,
-			std::ptr::null_mut(),
-		)
-	};
-	unsafe {
-		launch_reduce_sum_cols(
-			x.ptr as *const c_void,
-			out.ptr,
-			rows as i32,
-			cols as i32,
-			workspace.ptr,
-			ws,
 			std::ptr::null_mut(),
 		);
 	}
@@ -4726,102 +4469,20 @@ pub fn gpu_partial_argsort(
 pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; k];
 	let bytes = k * std::mem::size_of::<i32>();
-	unsafe { crate::memory::xfer_sync(result.as_mut_ptr() as *mut c_void, buf.ptr, bytes, crate::hip::HIP_MEMCPY_D2H) }?;
+	unsafe {
+		crate::memory::xfer(
+			result.as_mut_ptr() as *mut c_void,
+			buf.ptr,
+			bytes,
+			crate::hip::HIP_MEMCPY_D2H,
+			std::ptr::null_mut(),
+		)
+	}?;
+	crate::hip::device_synchronize()?;
 	Ok(result)
 }
 
 // ── New kernel wrappers ─────────────────────────────────────────────────────
-
-pub fn gpu_leaky_relu(
-	x: &GpuBuffer,
-	alpha: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_leaky_relu(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			alpha.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_leaky_relu_backward(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	alpha: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_leaky_relu_backward(
-			grad.ptr as *const c_void,
-			act.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			alpha.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-/// Row-wise layer normalization with affine (gamma, beta) and caller-supplied eps.
-pub fn gpu_layernorm(
-	x: &GpuBuffer,
-	gamma: &GpuBuffer,
-	beta: &GpuBuffer,
-	eps: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_layernorm(
-			x.ptr as *const c_void,
-			out.ptr,
-			gamma.ptr as *const c_void,
-			beta.ptr as *const c_void,
-			rows as i32,
-			cols as i32,
-			eps.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-/// Dropout with pre-generated mask (uniform [0,1) values). out[i] = mask[i] < p ? 0 : x[i] * scale.
-/// p and scale (= 1/(1-p)) are caller-supplied 1-elem device buffers.
-pub fn gpu_dropout(
-	x: &GpuBuffer,
-	mask: &GpuBuffer,
-	p: &GpuBuffer,
-	scale: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_dropout(
-			x.ptr as *const c_void,
-			mask.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			p.ptr as *const f64,
-			scale.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
 
 pub fn gpu_bernoulli_u8(
 	p: &GpuBuffer,
@@ -4864,29 +4525,6 @@ pub fn gpu_dropout_u8_into(
 }
 
 /// Concatenate (rows, d1) and (rows, d2) into (rows, d1+d2).
-pub fn gpu_concat(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	rows: usize,
-	d1: usize,
-	d2: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_concat(
-			a.ptr as *const c_void,
-			b.ptr as *const c_void,
-			out.ptr,
-			rows as i32,
-			d1 as i32,
-			d2 as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 /// Alloc-free row-major concat: out[rows×(d1+d2)] = [a_row(d1) | b_row(d2)] per row.
 pub fn gpu_concat_into(
 	a: &GpuBuffer,
@@ -4979,19 +4617,6 @@ pub fn gpu_exp(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	Ok(())
 }
 
-pub fn gpu_log(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_log(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_sqrt(
@@ -5005,35 +4630,9 @@ pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	Ok(())
 }
 
-pub fn gpu_abs(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_abs(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 pub fn gpu_neg(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_neg(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_sign(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_sign(
 			x.ptr as *const c_void,
 			out.ptr,
 			n as i32,
@@ -5069,27 +4668,6 @@ pub fn gpu_pow(
 			out.ptr,
 			n as i32,
 			p.ptr as *const f64,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_clamp(
-	x: &GpuBuffer,
-	lo: &GpuBuffer,
-	hi: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_clamp(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			lo.ptr as *const f64,
-			hi.ptr as *const f64,
 			std::ptr::null_mut(),
 		);
 	}
@@ -5169,13 +4747,6 @@ pub fn gpu_eye(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	Ok(())
 }
 
-/// Device-to-device buffer copy. n is number of f64 elements.
-pub fn gpu_copy(src: &GpuBuffer, n: usize, dst: &GpuBuffer) -> Result<(), HipError> {
-	let bytes = n * std::mem::size_of::<f64>();
-	unsafe { crate::memory::xfer_sync(dst.ptr, src.ptr as *const c_void, bytes, crate::hip::HIP_MEMCPY_D2D) }?;
-	Ok(())
-}
-
 /// Conditional selection: out[i] = cond[i] != 0.0 ? a[i] : b[i].
 pub fn gpu_where_mask(
 	cond: &GpuBuffer,
@@ -5218,28 +4789,6 @@ pub fn gpu_slice_rows(
 			out.ptr,
 			start as i32,
 			count as i32,
-			cols as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-/// Broadcast subtract: out[i] = X[i] - v[i % cols]. X is [rows, cols], v is [1, cols].
-pub fn gpu_broadcast_sub(
-	x: &GpuBuffer,
-	v: &GpuBuffer,
-	n: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_broadcast_sub(
-			x.ptr as *const c_void,
-			v.ptr as *const c_void,
-			out.ptr,
-			n as i32,
 			cols as i32,
 			std::ptr::null_mut(),
 		);
@@ -5318,27 +4867,6 @@ pub fn gpu_broadcast_div(
 
 // ── New ops ────────────────────────────────────────────────────────────────
 
-pub fn gpu_softmax_backward(
-	grad: &GpuBuffer,
-	sm: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_softmax_backward(
-			grad.ptr as *const c_void,
-			sm.ptr as *const c_void,
-			out.ptr,
-			rows as i32,
-			cols as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 /// Alloc-free row-softmax backward into a preallocated `out`: given upstream
 /// `grad` and the softmax output `sm` (both rows×cols), writes dL/dz per row.
 pub fn gpu_softmax_backward_into(
@@ -5394,27 +4922,6 @@ pub fn gpu_cross_entropy(
 			targets.ptr as *const c_void,
 			out.ptr,
 			rows as i32,
-			cols as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_gather_rows(
-	table: &GpuBuffer,
-	indices: &GpuBuffer,
-	n: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_gather_rows(
-			table.ptr as *const c_void,
-			indices.ptr as *const c_void,
-			out.ptr,
-			n as i32,
 			cols as i32,
 			std::ptr::null_mut(),
 		);
@@ -5905,57 +5412,6 @@ pub fn gpu_lt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) 
 
 // ── GELU / SiLU ───────────────────────────────────────────────────────────
 
-pub fn gpu_gelu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_gelu(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-pub fn gpu_gelu_backward(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_gelu_backward(
-			grad.ptr as *const c_void,
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-pub fn gpu_silu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_silu(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-pub fn gpu_silu_backward(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_silu_backward(
-			grad.ptr as *const c_void,
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
 // ── BatchNorm ──────────────────────────────────────────────────────────────
 
 pub fn gpu_batchnorm_forward(
@@ -6040,37 +5496,6 @@ pub fn gpu_batchnorm_backward(
 			grad_beta.ptr,
 			n as i32,
 			c as i32,
-			std::ptr::null_mut(),
-		);
-	}
-	check_launch();
-	Ok(())
-}
-
-// ── LayerNorm backward ────────────────────────────────────────────────────
-
-pub fn gpu_layernorm_backward(
-	grad_y: &GpuBuffer,
-	x: &GpuBuffer,
-	gamma: &GpuBuffer,
-	eps: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	grad_x: &GpuBuffer,
-	grad_gamma: &GpuBuffer,
-	grad_beta: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_layernorm_backward(
-			grad_y.ptr as *const c_void,
-			x.ptr as *const c_void,
-			gamma.ptr as *const c_void,
-			grad_x.ptr,
-			grad_gamma.ptr,
-			grad_beta.ptr,
-			rows as i32,
-			cols as i32,
-			eps.ptr as *const f64,
 			std::ptr::null_mut(),
 		);
 	}
@@ -6178,15 +5603,19 @@ pub fn gpu_vconcat(
 ) -> Result<(), HipError> {
 	let a_bytes = a_n * std::mem::size_of::<f64>();
 	let b_bytes = b_n * std::mem::size_of::<f64>();
-	unsafe { crate::memory::xfer_sync(out.ptr, a.ptr as *const c_void, a_bytes, crate::hip::HIP_MEMCPY_D2D) }?;
 	unsafe {
-		crate::memory::xfer_sync(
+		crate::memory::xfer(out.ptr, a.ptr as *const c_void, a_bytes, crate::hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+	}?;
+	unsafe {
+		crate::memory::xfer(
 			(out.ptr as *mut u8).add(a_bytes) as *mut c_void,
 			b.ptr as *const c_void,
 			b_bytes,
 			crate::hip::HIP_MEMCPY_D2D,
+			std::ptr::null_mut(),
 		)
 	}?;
+	crate::hip::device_synchronize()?;
 	Ok(())
 }
 
@@ -6459,81 +5888,6 @@ pub fn gpu_data_partition(
 	Ok(())
 }
 
-pub fn gpu_tree_build(
-	tr_bins: &GpuBuffer,
-	te_bins: &GpuBuffer,
-	grad: &GpuBuffer,
-	hess: &GpuBuffer,
-	lambda: &GpuBuffer,
-	min_cw: &GpuBuffer,
-	n_tr: usize,
-	n_te: usize,
-	p: usize,
-	n_bins: usize,
-	max_depth: usize,
-	tr_pred: &GpuBuffer,
-	te_pred: &GpuBuffer,
-) -> Result<(), HipError> {
-	gpu_tree_build_into(
-		tr_bins, te_bins, grad, hess, n_tr, n_te, p, n_bins, max_depth, lambda, min_cw,
-		tr_pred, te_pred,
-	)?;
-	Ok(())
-}
-
-/// Fused gradient + hessian for multiclass boosting, class k.
-/// grad_k = (softmax_k - (target==k)) * weight * subsample_mask
-/// hess_k = softmax_k * (1-softmax_k) * weight * subsample_mask, clamped [0.001, 1e6]
-/// Returns (grad [n,1], hess [n,1]).
-// not-an-op: driver — composes slice_cols/fill/eq/sub/mul into softmax-CE grad for class k
-pub fn gpu_grad(
-	probs: &GpuBuffer,
-	targets: &GpuBuffer,
-	weights: &GpuBuffer,
-	n: usize,
-	nc: usize,
-	k: usize,
-) -> Result<GpuBuffer, HipError> {
-	let pk = GpuBuffer::alloc(n)?;
-	gpu_slice_cols(probs, n, nc, k, 1, &pk)?;
-	let kval = GpuBuffer::upload(&[k as f64])?;
-	let kfill = GpuBuffer::alloc(n)?;
-	gpu_fill(&kval, n, &kfill)?;
-	let yk = GpuBuffer::alloc(n)?;
-	gpu_eq(targets, &kfill, n, &yk)?;
-	let diff = GpuBuffer::alloc(n)?;
-	gpu_sub(&pk, &yk, n, &diff)?;
-	let out = GpuBuffer::alloc(n)?;
-	gpu_mul(&diff, weights, n, &out)?;
-	Ok(out)
-}
-
-// not-an-op: driver — composes slice_cols/fill/sub/mul/clamp into softmax hessian for class k
-pub fn gpu_hessian(
-	probs: &GpuBuffer,
-	weights: &GpuBuffer,
-	n: usize,
-	nc: usize,
-	k: usize,
-) -> Result<GpuBuffer, HipError> {
-	let pk = GpuBuffer::alloc(n)?;
-	gpu_slice_cols(probs, n, nc, k, 1, &pk)?;
-	let one_val = GpuBuffer::upload(&[1.0])?;
-	let ones = GpuBuffer::alloc(n)?;
-	gpu_fill(&one_val, n, &ones)?;
-	let omp = GpuBuffer::alloc(n)?;
-	gpu_sub(&ones, &pk, n, &omp)?;
-	let pq = GpuBuffer::alloc(n)?;
-	gpu_mul(&pk, &omp, n, &pq)?;
-	let hw = GpuBuffer::alloc(n)?;
-	gpu_mul(&pq, weights, n, &hw)?;
-	let lo = GpuBuffer::upload(&[0.001])?;
-	let hi = GpuBuffer::upload(&[1e6])?;
-	let out = GpuBuffer::alloc(n)?;
-	gpu_clamp(&hw, &lo, &hi, n, &out)?;
-	Ok(out)
-}
-
 /// Update column k of an [n, cols] matrix: out[i, k] = matrix[i, k] + col[i].
 /// Returns new matrix (other columns unchanged).
 // not-an-op: driver — rebuilds matrix column k += col via copy/slice/add/concat (host branch on k)
@@ -6545,23 +5899,23 @@ pub fn gpu_add_col(
 	col: &GpuBuffer,
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n * cols)?;
-	gpu_copy(matrix, n * cols, &out)?;
+	gpu_copy_into(matrix, n * cols, &out)?;
 	// Extract col k, add, then rebuild the matrix by concat of slices.
 	let old_col = GpuBuffer::alloc(n)?;
 	gpu_slice_cols(&out, n, cols, k, 1, &old_col)?;
 	let new_col = GpuBuffer::alloc(n)?;
-	gpu_add(&old_col, col, n, &new_col)?;
+	gpu_add_into(&old_col, col, n, &new_col)?;
 	if k == 0 {
 		let right = GpuBuffer::alloc(n * (cols - 1))?;
 		gpu_slice_cols(&out, n, cols, 1, cols - 1, &right)?;
 		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat(&new_col, &right, n, 1, cols - 1, &result)?;
+		gpu_concat_into(&new_col, &right, n, 1, cols - 1, &result)?;
 		Ok(result)
 	} else if k == cols - 1 {
 		let left = GpuBuffer::alloc(n * (cols - 1))?;
 		gpu_slice_cols(&out, n, cols, 0, cols - 1, &left)?;
 		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat(&left, &new_col, n, cols - 1, 1, &result)?;
+		gpu_concat_into(&left, &new_col, n, cols - 1, 1, &result)?;
 		Ok(result)
 	} else {
 		let left = GpuBuffer::alloc(n * k)?;
@@ -6569,9 +5923,9 @@ pub fn gpu_add_col(
 		let right = GpuBuffer::alloc(n * (cols - k - 1))?;
 		gpu_slice_cols(&out, n, cols, k + 1, cols - k - 1, &right)?;
 		let tmp = GpuBuffer::alloc(n * (k + 1))?;
-		gpu_concat(&left, &new_col, n, k, 1, &tmp)?;
+		gpu_concat_into(&left, &new_col, n, k, 1, &tmp)?;
 		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat(&tmp, &right, n, k + 1, cols - k - 1, &result)?;
+		gpu_concat_into(&tmp, &right, n, k + 1, cols - k - 1, &result)?;
 		Ok(result)
 	}
 }
@@ -6589,7 +5943,8 @@ pub fn gpu_report(
 	let preds = GpuBuffer::alloc(n)?;
 	gpu_argmax_rows(logits, n, nc, &preds)?;
 	let mut preds_cpu = vec![0.0f64; n];
-	preds.download(&mut preds_cpu)?;
+	unsafe { preds.download_async(&mut preds_cpu, std::ptr::null_mut()) }?;
+	crate::hip::device_synchronize()?;
 	let mut correct = vec![0.0f64; nc];
 	let mut total = vec![0.0f64; nc];
 	for i in 0..n {
@@ -6693,25 +6048,9 @@ pub fn gpu_candidate_generate(
 
 // ── Philox GPU RNG ───────────────────────────────────────────────────────
 
-pub fn gpu_rand_uniform(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_rand_uniform(out.ptr, n as i32, seed as u32, std::ptr::null_mut());
-	}
-	check_launch();
-	Ok(())
-}
-
 pub fn gpu_randn(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_randn(out.ptr, n as i32, seed as u32, std::ptr::null_mut());
-	}
-	check_launch();
-	Ok(())
-}
-
-pub fn gpu_bernoulli(p: &GpuBuffer, n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	unsafe {
-		launch_bernoulli(out.ptr, n as i32, p.ptr as *const f64, seed as u32, std::ptr::null_mut());
 	}
 	check_launch();
 	Ok(())

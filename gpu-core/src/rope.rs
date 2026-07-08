@@ -116,26 +116,35 @@ mod tests {
 		let xk: Vec<f64> = (0..m * d).map(|i| ((i * 5 % 11) as f64 - 5.0) * 0.1).collect();
 		let g: Vec<f64> = (0..m * d).map(|i| ((i * 3 % 17) as f64 - 8.0) * 0.1).collect();
 
-		let theta = GpuBuffer::upload(&[ROPE_THETA]).expect("theta");
-		let sgn_bwd = GpuBuffer::upload(&[-1.0f64]).expect("sgn_bwd");
-		let sgn_fwd = GpuBuffer::upload(&[1.0f64]).expect("sgn_fwd");
+		let theta = GpuBuffer::alloc(1).expect("theta");
+		theta.load(&[ROPE_THETA]).expect("theta load");
+		let sgn_bwd = GpuBuffer::alloc(1).expect("sgn_bwd");
+		sgn_bwd.load(&[-1.0f64]).expect("sgn_bwd load");
+		let sgn_fwd = GpuBuffer::alloc(1).expect("sgn_fwd");
+		sgn_fwd.load(&[1.0f64]).expect("sgn_fwd load");
 		// analytic: dL/dq = R(-angle)·g = rope(g, -1) on the q slot
-		let gq = GpuBuffer::upload(&g).expect("g");
-		let gk = GpuBuffer::upload(&vec![0.0f64; m * d]).expect("gk");
+		let gq = GpuBuffer::alloc(g.len()).expect("g");
+		gq.load(&g).expect("g load");
+		let gk = GpuBuffer::alloc(m * d).expect("gk");
+		gk.load(&vec![0.0f64; m * d]).expect("gk load");
 		gpu_rope_qk_heads_inplace(&sgn_bwd, &theta, m, d, heads, seq, &gq, &gk).expect("rope bwd");
 		let analytic = {
 			let mut v = vec![0.0f64; m * d];
-			gq.download(&mut v).expect("dl");
+			unsafe { gq.download_async(&mut v, std::ptr::null_mut()) }.expect("dl");
+			crate::hip::device_synchronize().expect("dl sync");
 			v
 		};
 
 		let eps = 1e-6;
 		let loss = |x: &[f64]| -> f64 {
-			let q = GpuBuffer::upload(x).expect("q");
-			let k = GpuBuffer::upload(&xk).expect("k");
+			let q = GpuBuffer::alloc(x.len()).expect("q");
+			q.load(x).expect("q load");
+			let k = GpuBuffer::alloc(xk.len()).expect("k");
+			k.load(&xk).expect("k load");
 			gpu_rope_qk_heads_inplace(&sgn_fwd, &theta, m, d, heads, seq, &q, &k).expect("rope fwd");
 			let mut o = vec![0.0f64; m * d];
-			q.download(&mut o).expect("o");
+			unsafe { q.download_async(&mut o, std::ptr::null_mut()) }.expect("o");
+			crate::hip::device_synchronize().expect("o sync");
 			o.iter().zip(&g).map(|(a, b)| a * b).sum()
 		};
 		let mut maxdiff = 0.0f64;

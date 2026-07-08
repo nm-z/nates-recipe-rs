@@ -2,7 +2,7 @@ use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, Scaler, build_layer_params, infer_scored, load_ogdl_str, pinned_vocab,
+	LayerParams, Scaler, infer_scored, load_ogdl_str, pinned_vocab, plan_layer_params,
 	vram_estimate,
 };
 use std::cell::{Cell, RefCell};
@@ -442,7 +442,7 @@ impl Train {
 			let k = params[params.len() - 1].out_dim;
 			let yscaler = *model.yscaler.borrow();
 			let (score, preds) = if ds.has_target && !self.metrics.is_empty() {
-				let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("y contig")).expect("ybuf");
+				let ybuf = { let __up = ds.y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 				let total = (n * k) as f64;
 				let ybar = ds.y.iter().sum::<f64>() / total;
 				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
@@ -604,6 +604,11 @@ pub struct ModelInner {
 	// run freed this model's device weights, so a forward-only read rebuilds them
 	// from `saved_ogdl` before use rather than dereferencing freed memory.
 	pub(crate) arena_gen: Cell<Option<usize>>,
+	// Owns the single staged weight image that mirror-rebuilt / `Model::load` params
+	// (composed by `plan_layer_params` + `materialize`) are non-owning views into,
+	// so it outlives them. `None` until such a rebuild composes one; replaced (old
+	// image dropped) whenever the params are rebuilt again.
+	pub(crate) rebuild_backing: RefCell<Option<GpuBuffer>>,
 }
 
 pub struct Model {
@@ -721,8 +726,18 @@ impl ModelInner {
 				 there is no host mirror to restore them (pooled out-of-core arena run)",
 			);
 			let saved = load_ogdl_str(&m.text);
-			build_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
-				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"))
+			let plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
+				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"));
+			// ONE owned image + ONE load, then materialize views into it — the same
+			// resumed weights the fit builder produced, but composed on the host
+			// and uploaded once instead of per-layer alloc+upload. `staged` is stored
+			// in `rebuild_backing` so it outlives the views.
+			let host = plan.host();
+			let staged = GpuBuffer::alloc(host.len().max(1)).expect("rebuild staged alloc");
+			staged.load(host).expect("rebuild staged load");
+			let params = plan.materialize(&staged, 0);
+			*self.rebuild_backing.borrow_mut() = Some(staged);
+			params
 		};
 		*self.params.borrow_mut() = params;
 		self.arena_gen.set(gpu_core::memory::live_parked_gen());
@@ -847,6 +862,7 @@ impl Model {
 			fit_score: Cell::new(f64::NAN),
 			saved_ogdl: RefCell::new(None),
 			arena_gen: Cell::new(None),
+			rebuild_backing: RefCell::new(None),
 		});
 		register_model(&*inner as *const ModelInner);
 		Model { inner }
@@ -863,8 +879,15 @@ impl Model {
 		let saved = load_ogdl_str(weights);
 		let vocab = pinned_vocab(&proto.specs)
 			.expect("Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
-		let params = build_layer_params(&proto.specs, d, 0, vocab, &saved, true)
+		let plan = plan_layer_params(&proto.specs, d, 0, vocab, &saved, true)
 			.unwrap_or_else(|e| panic!("Model::load: {e}"));
+		// ONE owned image + ONE load, then materialize views (backing kept in
+		// `rebuild_backing` for the model's life) — replaces per-layer alloc+upload.
+		let host = plan.host();
+		let staged = GpuBuffer::alloc(host.len().max(1)).expect("Model::load staged alloc");
+		staged.load(host).expect("Model::load staged load");
+		let params = plan.materialize(&staged, 0);
+		*proto.rebuild_backing.borrow_mut() = Some(staged);
 		*proto.params.borrow_mut() = params;
 		*proto.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
 		*proto.yscaler.borrow_mut() = None;
@@ -946,6 +969,24 @@ mod metric_gpu_tests {
 	use std::cell::RefCell;
 	use std::sync::LazyLock;
 
+	// Local carve+load helper (the crate `upload` fn was retired for the staged
+	// one-image path); tests still need a plain owned host→device matrix.
+	fn upload(x: &ndarray::Array2<f64>) -> (GpuBuffer, usize, usize) {
+		let s = x.as_standard_layout();
+		let sl = s.as_slice().expect("upload: non-contiguous");
+		let b = GpuBuffer::alloc(sl.len()).expect("upload");
+		b.load(sl).expect("upload");
+		(b, x.nrows(), x.ncols())
+	}
+
+	// The 12 scratch constants as ONE owned 12-float device block; each Scratch
+	// carves its const views from this (must outlive the Scratch).
+	fn consts_buf() -> GpuBuffer {
+		let b = GpuBuffer::alloc(SCRATCH_CONSTS.len()).expect("consts");
+		b.load(&SCRATCH_CONSTS).expect("consts");
+		b
+	}
+
 	static CHURN: LazyLock<Option<crate::dataset::Dataset>> = LazyLock::new(|| {
 		const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
 		if !std::path::Path::new(TRAIN).exists() {
@@ -973,10 +1014,10 @@ mod metric_gpu_tests {
 		let h = 8usize;
 		let w1 = GpuBuffer::alloc(d * h).expect("w1 alloc");
 		kernels::gpu_randn(d * h, 11, &w1).expect("w1");
-		let b1 = GpuBuffer::upload(&vec![0.0f64; h]).expect("b1");
+		let b1 = { let __up = &vec![0.0f64; h]; let __ub = GpuBuffer::alloc(__up.len()).expect("b1"); __ub.load(__up).expect("b1"); __ub };
 		let w2 = GpuBuffer::alloc(h).expect("w2 alloc");
 		kernels::gpu_randn(h, 22, &w2).expect("w2");
-		let b2 = GpuBuffer::upload(&[0.0f64; 1]).expect("b2");
+		let b2 = { let __up = &[0.0f64; 1]; let __ub = GpuBuffer::alloc(__up.len()).expect("b2"); __ub.load(__up).expect("b2"); __ub };
 		let params = vec![
 			LayerParams {
 				kind: LayerKind::Dense,
@@ -987,11 +1028,11 @@ mod metric_gpu_tests {
 				act: Activation::Relu,
 				dim: 0,
 				vocab: 0,
-				wk: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wv: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wo: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				wk: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wv: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wo: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 				heads: 0,
-				palpha: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				palpha: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 			conv_cin: 0, conv_k: 0, conv_stride: 0,
 			},
 			LayerParams {
@@ -1003,19 +1044,20 @@ mod metric_gpu_tests {
 				act: Activation::Sigmoid,
 				dim: 0,
 				vocab: 0,
-				wk: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wv: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wo: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				wk: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wv: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wo: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 				heads: 0,
-				palpha: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				palpha: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 			conv_cin: 0, conv_k: 0, conv_stride: 0,
 			},
 		];
 
 		let (xbuf, nn, _d) = upload(x);
 		assert_eq!(nn, n);
-		let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
-		let sc = Scratch::new(&params, n, false);
+		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
+		let consts = consts_buf();
+		let sc = Scratch::new_full(&params, n, &consts);
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let last = params.len() - 1;
 		let p = download_vec(&sc.acts[last], n);
@@ -1055,51 +1097,22 @@ mod metric_gpu_tests {
 				(a - b).abs()
 			);
 		};
-		// metric_gpu reads only loss + lr; lr (0.01) is irrelevant to every metric
-		// tested here (it surfaces only for Metric::Lr), so pass it verbatim.
+		// Reduce into the scratch scalar via metric_gpu_into, download at the call
+		// site (async+drain), then apply the returned host (sign,div) rescale — the
+		// exact value the deleted metric_gpu returned (R2's raw ss_res → 1 − ss_res/ss_tot).
 		let out = &sc.acts[last];
-		close(
-			metric_gpu(Loss::Mse, 0.01, Metric::R2, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
-			r2_ref,
-			"R2",
-		);
-		close(
-			metric_gpu(
-				Loss::Mse,
-				0.01,
-				Metric::Accuracy,
-				out,
-				&ybuf,
-				&sc,
-				n,
-				1,
-				ss_tot,
-				0,
-				0.0,
-			),
-			acc_ref,
-			"Accuracy",
-		);
-		close(
-			metric_gpu(Loss::Mse, 0.01, Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
-			mse_ref,
-			"MSE",
-		);
-		close(
-			metric_gpu(Loss::Mae, 0.01, Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
-			mae_ref,
-			"MAE",
-		);
-		close(
-			metric_gpu(Loss::Huber, 0.01, Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
-			huber_ref,
-			"Huber",
-		);
-		close(
-			metric_gpu(Loss::Bce, 0.01, Metric::Loss, out, &ybuf, &sc, n, 1, ss_tot, 0, 0.0),
-			bce_ref,
-			"BCE",
-		);
+		let metric = |m: Metric, loss: Loss| -> f64 {
+			let (sign, div) =
+				metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar);
+			let v = sign * download_scalar(&sc.metric_scalar) / div;
+			if m == Metric::R2 { 1.0 - v } else { v }
+		};
+		close(metric(Metric::R2, Loss::Mse), r2_ref, "R2");
+		close(metric(Metric::Accuracy, Loss::Mse), acc_ref, "Accuracy");
+		close(metric(Metric::Loss, Loss::Mse), mse_ref, "MSE");
+		close(metric(Metric::Loss, Loss::Mae), mae_ref, "MAE");
+		close(metric(Metric::Loss, Loss::Huber), huber_ref, "Huber");
+		close(metric(Metric::Loss, Loss::Bce), bce_ref, "BCE");
 
 		eprintln!(
 			"OK n={n} d={d}  R2={r2_ref:.6}  acc={acc_ref:.6}  mse={mse_ref:.6}  mae={mae_ref:.6}  huber={huber_ref:.6}  bce={bce_ref:.6}"
@@ -1131,15 +1144,15 @@ mod metric_gpu_tests {
 		kernels::gpu_reduce_mean_cols(&xraw, n, d, &ws, &mean).expect("mean");
 		let var = GpuBuffer::alloc(d).expect("var");
 		kernels::gpu_reduce_var_cols(&xraw, n, d, &ws, &var).expect("var");
-		let eps = GpuBuffer::upload(&[1e-8]).expect("eps");
+		let eps = { let __up = &[1e-8]; let __ub = GpuBuffer::alloc(__up.len()).expect("eps"); __ub.load(__up).expect("eps"); __ub };
 		kernels::gpu_add_scalar_inplace(&eps, d, &var).expect("var eps");
 		let std = GpuBuffer::alloc(d).expect("std");
 		kernels::gpu_sqrt(&var, d, &std).expect("std");
 		let xc = GpuBuffer::alloc(n * d).expect("center");
-		kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d, &xc).expect("center");
+		kernels::gpu_broadcast_sub_into(&xraw, &mean, n * d, d, &xc).expect("center");
 		let xbuf = GpuBuffer::alloc(n * d).expect("scale");
 		kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
-		let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
+		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 
 		// Two-layer relu→sigmoid, He init exactly as fit does.
 		let h = 16usize;
@@ -1147,9 +1160,9 @@ mod metric_gpu_tests {
 			let scale = (2.0 / fan_in as f64).sqrt();
 			let w = GpuBuffer::alloc(fan_in * units).expect("randn alloc");
 			kernels::gpu_randn(fan_in * units, seed as usize, &w).expect("randn");
-			let sbuf = GpuBuffer::upload(&[scale]).expect("he scale");
+			let sbuf = { let __up = &[scale]; let __ub = GpuBuffer::alloc(__up.len()).expect("he scale"); __ub.load(__up).expect("he scale"); __ub };
 			kernels::gpu_scale_inplace(&sbuf, fan_in * units, &w).expect("he scale");
-			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
+			let b = { let __up = &vec![0.0f64; units]; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
 			LayerParams {
 				kind: LayerKind::Dense,
 				w,
@@ -1159,11 +1172,11 @@ mod metric_gpu_tests {
 				act,
 				dim: 0,
 				vocab: 0,
-				wk: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wv: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wo: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				wk: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wv: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wo: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 				heads: 0,
-				palpha: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				palpha: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 			conv_cin: 0, conv_k: 0, conv_stride: 0,
 			}
 		};
@@ -1174,13 +1187,14 @@ mod metric_gpu_tests {
 		let last = params.len() - 1;
 
 		// (1) Two independent forward passes must agree.
-		let sc_ref = Scratch::new(&params, n, true);
+		let consts = consts_buf();
+		let sc_ref = Scratch::new_infer(&params, n, &consts);
 		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
 		let out_ref = download_vec(&sc_ref.acts[last], n);
 		drop(sc_ref);
 		let sc = {
 			let _t_scratch = gpu_core::memory::tag_scope("scratch");
-			Scratch::new(&params, n, false)
+			Scratch::new_full(&params, n, &consts)
 		};
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let out_into = download_vec(&sc.acts[last], n);
@@ -1208,6 +1222,7 @@ mod metric_gpu_tests {
 				fit_score: Cell::new(f64::NAN),
 				saved_ogdl: RefCell::new(None),
 				arena_gen: Cell::new(None),
+				rebuild_backing: RefCell::new(None),
 			}),
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
@@ -1259,15 +1274,15 @@ mod metric_gpu_tests {
 		kernels::gpu_reduce_mean_cols(&xraw, n, d, &ws, &mean).expect("mean");
 		let var = GpuBuffer::alloc(d).expect("var");
 		kernels::gpu_reduce_var_cols(&xraw, n, d, &ws, &var).expect("var");
-		let eps = GpuBuffer::upload(&[1e-8]).expect("eps");
+		let eps = { let __up = &[1e-8]; let __ub = GpuBuffer::alloc(__up.len()).expect("eps"); __ub.load(__up).expect("eps"); __ub };
 		kernels::gpu_add_scalar_inplace(&eps, d, &var).expect("var eps");
 		let std = GpuBuffer::alloc(d).expect("std");
 		kernels::gpu_sqrt(&var, d, &std).expect("std");
 		let xc = GpuBuffer::alloc(n * d).expect("center");
-		kernels::gpu_broadcast_sub(&xraw, &mean, n * d, d, &xc).expect("center");
+		kernels::gpu_broadcast_sub_into(&xraw, &mean, n * d, d, &xc).expect("center");
 		let xbuf = GpuBuffer::alloc(n * d).expect("scale");
 		kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
-		let ybuf = GpuBuffer::upload(y.as_slice().expect("y contig")).expect("ybuf");
+		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 
 		let h = 16usize;
 		let lr = 0.01;
@@ -1275,9 +1290,9 @@ mod metric_gpu_tests {
 			let scale = (2.0 / fan_in as f64).sqrt();
 			let w = GpuBuffer::alloc(fan_in * units).expect("randn alloc");
 			kernels::gpu_randn(fan_in * units, seed as usize, &w).expect("randn");
-			let sbuf = GpuBuffer::upload(&[scale]).expect("he scale");
+			let sbuf = { let __up = &[scale]; let __ub = GpuBuffer::alloc(__up.len()).expect("he scale"); __ub.load(__up).expect("he scale"); __ub };
 			kernels::gpu_scale_inplace(&sbuf, fan_in * units, &w).expect("he scale");
-			let b = GpuBuffer::upload(&vec![0.0f64; units]).expect("b");
+			let b = { let __up = &vec![0.0f64; units]; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
 			LayerParams {
 				kind: LayerKind::Dense,
 				w,
@@ -1287,11 +1302,11 @@ mod metric_gpu_tests {
 				act,
 				dim: 0,
 				vocab: 0,
-				wk: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wv: GpuBuffer::upload(&[0.0f64]).expect("d"),
-				wo: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				wk: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wv: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
+				wo: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 				heads: 0,
-				palpha: GpuBuffer::upload(&[0.0f64]).expect("d"),
+				palpha: { let __up = &[0.0f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("d"); __ub.load(__up).expect("d"); __ub },
 			conv_cin: 0, conv_k: 0, conv_stride: 0,
 			}
 		};
@@ -1323,10 +1338,12 @@ mod metric_gpu_tests {
 				fit_score: Cell::new(f64::NAN),
 				saved_ogdl: RefCell::new(None),
 				arena_gen: Cell::new(None),
+				rebuild_backing: RefCell::new(None),
 			}),
 		};
 		let ss = crate::train::StepScalars::new(lr, n);
-		let sc = Scratch::new(&params, n, false);
+		let consts = consts_buf();
+		let sc = Scratch::new_full(&params, n, &consts);
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 		let pp_w: Vec<Vec<f64>> = params

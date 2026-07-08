@@ -94,7 +94,7 @@ fn data() -> Vec<f64> {
 // scratch the launcher sorts into, plus the hipcub temp workspace.
 fn run_unique(x: &[f64]) -> Vec<f64> {
 	let n = x.len();
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let keys_sorted = GpuBuffer::alloc(n).unwrap();
 	let out = GpuBuffer::alloc(n).unwrap();
 	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
@@ -117,7 +117,7 @@ fn run_unique(x: &[f64]) -> Vec<f64> {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut buf = vec![0.0; n];
-	out.download(&mut buf).unwrap();
+	unsafe { out.download_async(&mut buf, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	buf.truncate(k);
 	buf
 }
@@ -126,7 +126,7 @@ fn run_unique(x: &[f64]) -> Vec<f64> {
 // just the hipcub DeviceSelect::Unique temp workspace.
 fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 	let n = x.len();
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let out = GpuBuffer::alloc(n).unwrap();
 	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
 	let wb = unsafe { launch_setx_unique_consecutive_workspace_bytes(n as i32) };
@@ -147,14 +147,14 @@ fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut buf = vec![0.0; n];
-	out.download(&mut buf).unwrap();
+	unsafe { out.download_async(&mut buf, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	buf.truncate(k);
 	buf
 }
 
 fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 	let n = x.len();
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let keys_sorted = GpuBuffer::alloc(n).unwrap();
 	let vals = GpuBuffer::alloc(n).unwrap();
 	let counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
@@ -179,7 +179,7 @@ fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut v = vec![0.0; n];
-	vals.download(&mut v).unwrap();
+	unsafe { vals.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v.truncate(k);
 	let mut c = vec![0i32; n];
 	counts.download_i32(&mut c).unwrap();
@@ -188,8 +188,8 @@ fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 }
 
 fn run_isin(a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = GpuBuffer::upload(a).unwrap();
-	let bb = GpuBuffer::upload(b).unwrap();
+	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let mask = GpuBuffer::alloc(a.len()).unwrap();
 	// hipcub DeviceRadixSort sorts b internally: needs a b_sorted output + temp storage.
 	let b_sorted = GpuBuffer::alloc(b.len()).unwrap();
@@ -210,7 +210,7 @@ fn run_isin(a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	lasterr();
 	let mut out = vec![0.0; a.len()];
-	mask.download(&mut out).unwrap();
+	unsafe { mask.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

@@ -110,8 +110,10 @@ pub fn gpu_diffusion_sample(
 ) -> Result<(GpuBuffer, usize), HipError> {
 	let canvas = GpuBuffer::alloc(n_positions)?;
 	gpu_copy_into(initial_canvas, n_positions, &canvas)?;
-	let committed = GpuBuffer::zeros_bytes(n_positions * std::mem::size_of::<f64>())?;
-	let bound = GpuBuffer::upload(&[entropy_bound])?;
+	let committed = GpuBuffer::alloc_bytes(n_positions * std::mem::size_of::<f64>())?;
+	committed.memset_zero(n_positions * std::mem::size_of::<f64>())?;
+	let bound = GpuBuffer::alloc(1)?;
+	bound.load(&[entropy_bound])?;
 	let accepted = GpuBuffer::alloc(n_positions)?;
 	let renoise = GpuBuffer::alloc(n_positions)?;
 	let mut host = vec![0.0f64; n_positions];
@@ -129,7 +131,8 @@ pub fn gpu_diffusion_sample(
 			&renoise,
 		)?;
 		gpu_diffusion_commit(&accepted, &renoise, n_positions, &canvas, &committed)?;
-		committed.download(&mut host)?;
+		unsafe { committed.download_async(&mut host, std::ptr::null_mut()) }?;
+		crate::hip::device_synchronize()?;
 		if host.iter().all(|&c| c != 0.0) {
 			break;
 		}
@@ -151,14 +154,16 @@ mod tests {
 		crate::hip::set_device(0).expect("set_device");
 		let (n, vocab) = (5usize, 4usize);
 		let bound = 0.5; // 0 < bound < ln(vocab)=1.386 → peaked=confident, uniform=uncertain
-		let initial = GpuBuffer::upload(&vec![-1.0f64; n]).expect("init"); // -1 = open slot
+		let initial = GpuBuffer::alloc(n).expect("init"); // -1 = open slot
+		initial.load(&vec![-1.0f64; n]).expect("init load");
 
 		// Position p is confident (peaked at class 0) iff p <= #committed; otherwise
 		// uniform logits (entropy ln(vocab) > bound). Committed positions hold a real
 		// token id (>= 0); open positions hold the -1 sentinel.
 		let logits_fn = |canvas: &GpuBuffer| -> Result<GpuBuffer, HipError> {
 			let mut c = vec![0.0f64; n];
-			canvas.download(&mut c)?;
+			unsafe { canvas.download_async(&mut c, std::ptr::null_mut()) }?;
+			crate::hip::device_synchronize()?;
 			let committed_count = c.iter().filter(|&&v| v >= 0.0).count();
 			let mut logits = vec![0.0f64; n * vocab];
 			for p in 0..n {
@@ -166,13 +171,16 @@ mod tests {
 					logits[p * vocab] = 10.0; // peaked → entropy ~0 < bound
 				}
 			}
-			GpuBuffer::upload(&logits)
+			let lb = GpuBuffer::alloc(logits.len())?;
+			lb.load(&logits)?;
+			Ok(lb)
 		};
 
 		let (canvas, steps) =
 			gpu_diffusion_sample(logits_fn, &initial, bound, 100, n, vocab).expect("sample");
 		let mut out = vec![0.0f64; n];
-		canvas.download(&mut out).expect("dl");
+		unsafe { canvas.download_async(&mut out, std::ptr::null_mut()) }.expect("dl");
+		crate::hip::device_synchronize().expect("dl sync");
 		eprintln!("diffusion block-AR: steps={steps} canvas={out:?}");
 		assert_eq!(steps, n, "one position commits per step → n steps");
 		assert!(out.iter().all(|&v| v == 0.0), "every position decoded to argmax class 0");

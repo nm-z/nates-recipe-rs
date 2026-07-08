@@ -338,7 +338,7 @@ pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 /// same one-time warm that the first allocation triggers, so calling it from
 /// `init()` and allocating without `init()` both warm the pool exactly once.
 pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
-	crate::memory::ensure_pool_init();
+	crate::memory::device_init_once();
 	Ok(())
 }
 

@@ -133,11 +133,13 @@ pub fn layer_ms_from(
 }
 
 impl Scratch {
-	/// `forward_only` (eval/predict) sizes every BACKWARD-only buffer to len-1 —
-	/// they're never read in a forward pass — so inference allocates ~half the VRAM
-	/// of training (no second `a_dsum`, no `da`/`dw`/grad mirrors).
-	pub fn new(params: &[LayerParams], n: usize, forward_only: bool) -> Scratch {
-		Self::new_inner(params, n, forward_only, false, None, 1)
+	/// Full (forward + backward) training scratch, non-windowed: every backward
+	/// buffer is sized real (unlike `carve`, which len-1s them because the Ooc owns
+	/// the real ones). The 12 constant operands are carved as views of `consts` — a
+	/// `SCRATCH_CONSTS`-ordered block the caller composed with ONE load — never 12
+	/// separate single-scalar uploads.
+	pub fn new_full(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
+		Self::new_inner(params, n, false, false, consts, 1)
 	}
 
 	/// THE fit scratch: the windowed engine's minimal resident set (every big
@@ -147,13 +149,13 @@ impl Scratch {
 	/// of 12 separate uploads. `n_timed` pre-allocates that many per-epoch roofline
 	/// event sets. No mode flags: fit is always full-backward + windowed.
 	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> Scratch {
-		Self::new_inner(params, n, false, true, Some(consts), n_timed)
+		Self::new_inner(params, n, false, true, consts, n_timed)
 	}
 
-	/// One-claim forward-only path (the detector): backward buffers len-1 like
-	/// `new(.., forward_only=true)`, constants as image views like `carve`.
+	/// One-claim forward-only path (the detector): backward buffers len-1
+	/// (forward-only), constants as image views like `carve`.
 	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
-		Self::new_inner(params, n, true, false, Some(consts), 0)
+		Self::new_inner(params, n, true, false, consts, 0)
 	}
 
 	fn new_inner(
@@ -161,7 +163,7 @@ impl Scratch {
 		n: usize,
 		forward_only: bool,
 		light: bool,
-		consts: Option<&GpuBuffer>,
+		consts: &GpuBuffer,
 		n_timed: usize,
 	) -> Scratch {
 		let bw = move |sz: usize| if forward_only { 1 } else { sz };
@@ -311,15 +313,10 @@ impl Scratch {
 		} else {
 			(alloc(1, "conv_temp"), 0)
 		};
-		// Constant operands: views of the image block when the run composed
-		// one (fit), individual uploads otherwise (eval / tests / standalone).
-		let cbuf = |i: usize| -> GpuBuffer {
-			match consts {
-				Some(v) => v.view(i, 1),
-				None => GpuBuffer::upload(&[SCRATCH_CONSTS[i]])
-					.unwrap_or_else(|e| panic!("scratch const {i}: {e:?}")),
-			}
-		};
+		// Constant operands: views of the caller's SCRATCH_CONSTS block (composed
+		// with ONE load into its init image / a standalone 12-float carve), never
+		// 12 separate single-scalar uploads.
+		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
 		let pinned_pair = pinned_scalar_pair();
 		Scratch {
 			acts,

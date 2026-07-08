@@ -54,7 +54,7 @@ unsafe extern "C" {
 }
 
 // Bootstrap indices via floor(u * n). uniform_ws is a caller-provided n_samples
-// f64 workspace pre-filled by a separate gpu_rand_uniform op. idx_out: n_samples i32.
+// f64 workspace pre-filled by a separate gpu_rand_uniform_into op. idx_out: n_samples i32.
 pub fn gpu_bootstrap_sample(
 	uniform_ws: &GpuBuffer,
 	n: usize,
@@ -62,7 +62,7 @@ pub fn gpu_bootstrap_sample(
 	seed: usize,
 	idx_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let _ = seed; // RNG init lives in the upstream gpu_rand_uniform that fills uniform_ws
+	let _ = seed; // RNG init lives in the upstream gpu_rand_uniform_into that fills uniform_ws
 	unsafe {
 		launch_floor_scale_to_idx(
 			uniform_ws.ptr_raw() as *const c_void,

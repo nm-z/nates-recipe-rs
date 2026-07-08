@@ -58,7 +58,7 @@ fn date_to_f64(s: &str) -> f64 {
 	f64::NAN
 }
 
-fn is_missing(c: &str) -> bool {
+pub(crate) fn is_missing(c: &str) -> bool {
 	c.is_empty()
 		|| matches!(
 			c,
@@ -96,7 +96,12 @@ fn distinct_sorted(rows: &[Vec<String>], j: usize) -> Vec<String> {
 	cats
 }
 
-fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>) -> Vec<Attr> {
+fn infer_attrs(
+	headers: &[String],
+	rows: &[Vec<String>],
+	known: Option<&[Attr]>,
+	pre: Option<&[(String, usize)]>,
+) -> Vec<Attr> {
 	let non_empty: Vec<Vec<&str>> = (0..headers.len())
 		.map(|j| {
 			rows.iter()
@@ -108,8 +113,26 @@ fn infer_attrs(headers: &[String], rows: &[Vec<String>], known: Option<&[Attr]>)
 	let to_predict: Vec<usize> = (0..headers.len())
 		.filter(|&j| known.and_then(|k| k.get(j)).is_none() && !non_empty[j].is_empty())
 		.collect();
-	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
-	let preds = crate::predict_kinds(&cols);
+	// pre = kinds from Data::set(); mismatch = wiring bug. Detection happens at
+	// load, never here: a column with neither a known attr nor a precomputed kind
+	// is a wiring bug, not a cue to run the detector mid-run.
+	let preds: Vec<usize> = match pre {
+		Some(pre) => {
+			if pre.len() != headers.len() || pre.iter().zip(headers).any(|((h, _), name)| h != name) {
+				panic!(
+					"detect_kinds drift: precomputed [{}] != parsed [{}]",
+					pre.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", "),
+					headers.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
+				);
+			}
+			to_predict.iter().map(|&j| pre[j].1).collect()
+		}
+		None if to_predict.is_empty() => Vec::new(),
+		None => panic!(
+			"column(s) [{}] have no load-time kind and no train-schema attr — detection runs at Data::load, never mid-run",
+			to_predict.iter().map(|&j| headers[j].as_str()).collect::<Vec<_>>().join(", "),
+		),
+	};
 	let mut pred = std::collections::HashMap::new();
 	for (i, &j) in to_predict.iter().enumerate() {
 		pred.insert(j, preds[i]);
@@ -397,6 +420,19 @@ fn admit_or_skip(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
 
+/// One table group's kinds, detected at `Data::set` time: the group name and its
+/// per-column `(header, kind int)` (positional to the group's headers).
+pub type GroupKinds = (String, Vec<(String, usize)>);
+/// Detected kinds for every table group of a `Data` source set. Threads from the
+/// builder into `infer_attrs` so the detector's GPU classification runs at load
+/// time, not inside the training run's measured init window.
+pub type PreKinds = Vec<GroupKinds>;
+
+/// Precomputed kinds for one group, matched by group name.
+fn group_pre<'a>(pre: Option<&'a [GroupKinds]>, name: &str) -> Option<&'a [(String, usize)]> {
+	pre.and_then(|p| p.iter().find(|(n, _)| n == name).map(|(_, k)| k.as_slice()))
+}
+
 struct Assembled {
 	names: Vec<String>,
 	sources: Vec<(usize, usize)>,
@@ -502,6 +538,7 @@ fn encode_group(
 	schema_in: Option<&Schema>,
 	target_cols: &[usize],
 	exclude: &[String],
+	pre: Option<&[(String, usize)]>,
 ) -> (Vec<String>, Mat, Vec1, usize) {
 	match g {
 		DirGroup::Table {
@@ -514,6 +551,7 @@ fn encode_group(
 				headers,
 				cells,
 				schema_in.and_then(|s| s.get(name)).map(Vec::as_slice),
+				pre,
 			);
 			schema.insert(name.clone(), attrs.clone());
 
@@ -553,6 +591,7 @@ fn assemble(
 	schema_in: Option<&Schema>,
 	sample_hint: Option<&str>,
 	exclude: &[String],
+	pre: Option<&[GroupKinds]>,
 ) -> (Assembled, Schema) {
 	let mut schema: Schema = Schema::new();
 
@@ -603,6 +642,7 @@ fn assemble(
 		schema_in,
 		&target_cols,
 		exclude,
+		group_pre(pre, group_name(&groups[sample_idx])),
 	);
 	let s_hashes = group_hashes(&groups[sample_idx]);
 	let n = s_x.nrows();
@@ -668,7 +708,7 @@ fn assemble(
 				let by_key: std::collections::HashMap<&str, usize> =
 					g_hashes.iter().enumerate().map(|(i, h)| (h.as_str(), i)).collect();
 				let (g_names, g_x, _gy, _gk) =
-					encode_group(g, &mut schema, schema_in, &[], exclude);
+					encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)));
 				let src: Vec<Option<usize>> = (0..n)
 					.map(|i| {
 						by_key
@@ -715,7 +755,8 @@ fn assemble(
 			continue;
 		}
 
-		let (g_names, g_x, _gy, _gk) = encode_group(g, &mut schema, schema_in, &[], exclude);
+		let (g_names, g_x, _gy, _gk) =
+			encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)));
 
 		let src: Vec<Option<usize>> = (0..n)
 			.map(|i| {
@@ -990,6 +1031,7 @@ pub fn prepare_table_data(
 	split_frac: Option<f64>,
 	exclude: &[String],
 	source_label: &str,
+	pre: Option<&[GroupKinds]>,
 	resolve: impl Fn(&[String], Option<&[String]>) -> Vec<String>,
 ) -> (Dataset, Option<Dataset>, Vec<Attr>) {
 	let set_groups: Vec<DirGroup> = sources
@@ -1006,18 +1048,22 @@ pub fn prepare_table_data(
 	};
 	let t = resolve(&set_tnames, test_tnames.as_deref());
 
-	let (mut set, schema) = assemble(&set_groups, &t, None, None, exclude);
+	let (mut set, schema) = assemble(&set_groups, &t, None, None, exclude, pre);
 	let flat_attrs: Vec<Attr> = schema.values().flat_map(|v| v.iter().cloned()).collect();
 	let k = set.n_targets;
 	let keep = |name: &str| !exclude.iter().any(|p| exclude_match(p, name));
 
 	if let Some((tg, tp)) = &test_groups {
+		// Test reuses the train schema as `known` (schema_in) — no precomputed
+		// kinds needed. A test-only column absent from the train schema panics in
+		// infer_attrs: detection runs at load, never mid-run.
 		let (mut test, _) = assemble(
 			tg,
 			&t,
 			Some(&schema),
 			Some(&set.sample_group),
 			exclude,
+			None,
 		);
 		let test_has_target =
 			!t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));

@@ -82,8 +82,8 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
 
       let want = cpu_bmm(&a, &b, batch, m, n, k, ta, tb);
 
-      let ag = GpuBuffer::upload(&a).unwrap();
-      let bg = GpuBuffer::upload(&b).unwrap();
+      let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+      let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
       let cg = GpuBuffer::alloc(batch * m * n).unwrap();
 
       linalg::gpu_bmm_into(
@@ -108,7 +108,7 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
       )
       .unwrap();
 
-      let got = cg.download_vec().unwrap();
+      let got = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
       let d = max_abs_diff(&want, &got);
       assert!(
             d < 1e-9,
@@ -156,14 +156,14 @@ fn bmm_parity_two_batch_explicit() {
       let b: Vec<f64> = (0..batch * k * n).map(|i| (i as f64 + 1.0) * 0.5).collect();
       let want = cpu_bmm(&a, &b, batch, m, n, k, false, false);
 
-      let ag = GpuBuffer::upload(&a).unwrap();
-      let bg = GpuBuffer::upload(&b).unwrap();
+      let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+      let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
       let cg = GpuBuffer::alloc(batch * m * n).unwrap();
       linalg::gpu_bmm_into(
             &ag, &bg, batch, m, n, k, k, n, n, m * k, k * n, m * n, 0, 0, 0, 0, 0, &cg,
       )
       .unwrap();
-      let got = cg.download_vec().unwrap();
+      let got = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
       let d = max_abs_diff(&want, &got);
       assert!(d < 1e-9, "explicit 2-batch bmm maxdiff={d:.3e}");
 }
@@ -185,21 +185,21 @@ fn gemm_pipeline_compose_parity() {
       let y_cpu = cpu_gemm(&h_cpu, &w2, rows, f2, f1);
 
       // GPU: chain two gpu_gemm calls, keeping intermediates on device.
-      let xg = GpuBuffer::upload(&x).unwrap();
-      let w1g = GpuBuffer::upload(&w1).unwrap();
-      let w2g = GpuBuffer::upload(&w2).unwrap();
+      let xg = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+      let w1g = { let __up = &w1; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+      let w2g = { let __up = &w2; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
       let hg = GpuBuffer::alloc(rows * f1).unwrap();
       kernels::gpu_gemm(&xg, &w1g, rows, f1, f0, &hg).unwrap();
       let yg = GpuBuffer::alloc(rows * f2).unwrap();
       kernels::gpu_gemm(&hg, &w2g, rows, f2, f1, &yg).unwrap();
 
       // Intermediate parity.
-      let h_gpu = hg.download_vec().unwrap();
+      let h_gpu = { let mut __dv = vec![0.0f64; hg.n_floats()]; unsafe { hg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
       let dh = max_abs_diff(&h_cpu, &h_gpu);
       assert!(dh < 1e-9, "pipeline H maxdiff={dh:.3e}");
 
       // Final parity.
-      let y_gpu = yg.download_vec().unwrap();
+      let y_gpu = { let mut __dv = vec![0.0f64; yg.n_floats()]; unsafe { yg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
       let dy = max_abs_diff(&y_cpu, &y_gpu);
       assert!(dy < 1e-9, "pipeline Y maxdiff={dy:.3e}");
 }

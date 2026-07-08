@@ -94,11 +94,11 @@ unsafe extern "C" {
 }
 
 fn upload(x: &[f64]) -> GpuBuffer {
-	GpuBuffer::upload(x).unwrap()
+	{ let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub }
 }
 fn download(o: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut out = vec![0.0; n];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn check_last() {

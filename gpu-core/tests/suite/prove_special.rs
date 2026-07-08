@@ -47,7 +47,7 @@ unsafe extern "C" {
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
 fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		f(
@@ -59,18 +59,18 @@ fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 // Existing k_mathx unary ops carry signature (x, n, out) -> ().
 type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::hip::HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -251,8 +251,8 @@ fn bessel_i1_series(x: f64) -> f64 {
 
 // xlogy is binary: x*log(y), x==0 -> 0.
 fn run_xlogy(x: &[f64], y: &[f64]) -> Vec<f64> {
-	let bx = GpuBuffer::upload(x).unwrap();
-	let by = GpuBuffer::upload(y).unwrap();
+	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let by = { let __up = y; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		launch_specialx_xlogy(
@@ -265,7 +265,7 @@ fn run_xlogy(x: &[f64], y: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

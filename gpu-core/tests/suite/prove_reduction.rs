@@ -51,7 +51,7 @@ type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void)
 
 // rocprim-backed launcher: query temp size, allocate, run, return `slots` doubles.
 fn run_ws(query: Query, f: LaunchWs, x: &[f64], slots: usize) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(slots).unwrap();
 	let wsb = unsafe { query(b.ptr_raw() as *const c_void, o.ptr_raw(), x.len() as i32) };
 	let ws = GpuBuffer::alloc_bytes(wsb.max(1)).unwrap();
@@ -61,7 +61,7 @@ fn run_ws(query: Query, f: LaunchWs, x: &[f64], slots: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; slots];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn scalar_ws(query: Query, f: LaunchWs, x: &[f64]) -> f64 {
@@ -70,7 +70,7 @@ fn scalar_ws(query: Query, f: LaunchWs, x: &[f64]) -> f64 {
 
 // sumsqdev: Σ(x-μ)² — also needs a `mu` device scalar alongside the temp storage.
 fn sumsqdev(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(1).unwrap();
 	let mu = GpuBuffer::alloc(1).unwrap();
 	let wsb = unsafe {
@@ -83,13 +83,13 @@ fn sumsqdev(x: &[f64]) -> f64 {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = [0.0; 1];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 
 // Self-contained launcher (argmax/argmin): no workspace.
 fn run_slots(f: Launch, x: &[f64], slots: usize) -> Vec<f64> {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(slots).unwrap();
 	unsafe {
 		f(
@@ -101,7 +101,7 @@ fn run_slots(f: Launch, x: &[f64], slots: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; slots];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn scalar(f: Launch, x: &[f64]) -> f64 {
@@ -112,11 +112,11 @@ fn scalar(f: Launch, x: &[f64]) -> f64 {
 // Each closure uploads x, runs the device op, returns the finished scalar.
 fn download1(o: &GpuBuffer) -> f64 {
 	let mut out = [0.0; 1];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 fn g_sum(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_sum_all_workspace_bytes(x.len()).max(1),
 	)
@@ -126,7 +126,7 @@ fn g_sum(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_mean(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_mean_all_workspace_bytes(x.len()).max(1),
 	)
@@ -136,7 +136,7 @@ fn g_mean(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_max(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_max_all_workspace_bytes(x.len()).max(1),
 	)
@@ -146,7 +146,7 @@ fn g_max(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_min(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_min_all_workspace_bytes(x.len()).max(1),
 	)
@@ -156,7 +156,7 @@ fn g_min(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_l2(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_l2_norm_workspace_bytes(x.len()).max(1),
 	)
@@ -167,13 +167,13 @@ fn g_l2(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_asum(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(1).unwrap();
 	gpu_core::linalg::gpu_dasum(&b, x.len(), &o).unwrap();
 	download1(&o)
 }
 fn g_dot(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_dot_workspace_bytes(x.len()).max(1),
 	)
@@ -232,7 +232,7 @@ fn g_argmin(x: &[f64]) -> f64 {
 }
 // iamax: index of element with largest |x| (BLAS Idamax/Isamax family). 0-based.
 fn g_iamax(x: &[f64]) -> f64 {
-	let b = GpuBuffer::upload(x).unwrap();
+	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(1).unwrap();
 	gpu_core::linalg::gpu_idamax(&b, x.len(), &o).unwrap();
 	download1(&o)

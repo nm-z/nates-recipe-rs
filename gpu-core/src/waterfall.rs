@@ -71,46 +71,17 @@ impl Waterfall {
 		}
 	}
 
-	/// The one-claim lifecycle: init → ONE pool allocation of everything the
-	/// driver reports free, which becomes the process device arena — every
-	/// later `GpuBuffer` allocation (norms, activations, staging, blobs, the
-	/// hipBLAS workspace) carves from it with zero pool traffic — and exit →
-	/// the slab's single free. One growth event (this driver's allocator
-	/// stochastically wedges during growth), one memset commits every page
-	/// before any bytes land (fresh pool pages read back as stale zeros).
-	/// The counters' best guess at claimable VRAM (the shared vram_free_base
-	/// measure), 2 MB-floored. NOT sufficient alone — both counters over-report
-	/// what the pool can physically map (an ask past the real ceiling is an
-	/// uncatchable VmHeap abort), so the caller must child-process-probe
-	/// downward from here and claim the size that SURVIVED.
-	pub fn claim_guess() -> usize {
-		let want = crate::memory::vram_free_base() & !((1 << 21) - 1);
-		eprintln!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64);
-		want
-	}
-
-	pub fn claim() -> Self {
-		Self::claim_bytes(Self::claim_guess())
-	}
-
-	/// Claim exactly `want` bytes (a size the caller has verified mappable).
-	pub fn claim_bytes(mut want: usize) -> Self {
+	/// Wrap an already-claimed process device arena (the ONE slab handed back by
+	/// `memory::claim_device_arena_bytes`, which registered it as the arena and
+	/// committed its pages) as the store's VRAM tier. The one-claim lifecycle
+	/// itself — the sizing/probe/claim/memset/register — lives in memory.rs now;
+	/// the store only bump-places blobs into the registered arena and holds the
+	/// slab alive (its Drop is the run's single arena free). Blobs placed after
+	/// this carve from the arena with zero pool traffic until it is exhausted.
+	pub fn from_arena(slab: GpuBuffer) -> Self {
 		let mut w = Self::new();
-		let _t = tag_scope("unclaimed");
-		while want > (1 << 20) {
-			match GpuBuffer::try_alloc_bytes(want) {
-				Some(slab) => {
-					if slab.memset_zero(want).is_err() {
-						break;
-					}
-					crate::memory::set_device_arena(slab.ptr_raw(), want);
-					w.slab = Some(slab);
-					w.vram_full = false;
-					break;
-				}
-				None => want -= want / 16,
-			}
-		}
+		w.slab = Some(slab);
+		w.vram_full = false;
 		w
 	}
 

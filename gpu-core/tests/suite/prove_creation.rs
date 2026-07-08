@@ -68,7 +68,7 @@ fn run_arange(start: f64, step: f64, n: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
@@ -78,7 +78,7 @@ fn run_linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_logspace(start: f64, stop: f64, base: f64, n: usize) -> Vec<f64> {
@@ -95,7 +95,7 @@ fn run_logspace(start: f64, stop: f64, base: f64, n: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_geomspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
@@ -105,7 +105,7 @@ fn run_geomspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_tri(rows: usize, cols: usize, k: i32) -> Vec<f64> {
@@ -121,7 +121,7 @@ fn run_tri(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_eye_rect(rows: usize, cols: usize, k: i32) -> Vec<f64> {
@@ -137,7 +137,7 @@ fn run_eye_rect(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];
-	o.download(&mut v).unwrap();
+	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_arange_i32(start: i32, step: i32, n: usize) -> Vec<i32> {
@@ -173,21 +173,21 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let n = 37usize;
 		let val = std::f64::consts::PI;
 		let g = GpuBuffer::alloc(n).unwrap();
-		gpu_fill(&GpuBuffer::upload(&[val]).unwrap(), n, &g).unwrap();
+		gpu_fill(&{ let __up = &[val]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub }, n, &g).unwrap();
 		let mut got = vec![0.0; n];
-		g.download(&mut got).unwrap();
+		unsafe { g.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		let want = vec![val; n];
 		prove!("full", close(&got, &want));
 		// zeros & ones ride the same proven fill kernel, but assert distinctly.
 		let z = GpuBuffer::alloc(n).unwrap();
-		gpu_fill(&GpuBuffer::upload(&[0.0]).unwrap(), n, &z).unwrap();
+		gpu_fill(&{ let __up = &[0.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub }, n, &z).unwrap();
 		let mut gz = vec![9.0; n];
-		z.download(&mut gz).unwrap();
+		unsafe { z.download_async(&mut gz, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		prove!("zeros", gz.iter().all(|v| *v == 0.0));
 		let o = GpuBuffer::alloc(n).unwrap();
-		gpu_fill(&GpuBuffer::upload(&[1.0]).unwrap(), n, &o).unwrap();
+		gpu_fill(&{ let __up = &[1.0]; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub }, n, &o).unwrap();
 		let mut go = vec![0.0; n];
-		o.download(&mut go).unwrap();
+		unsafe { o.download_async(&mut go, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		prove!("ones", go.iter().all(|v| *v == 1.0));
 	}
 
@@ -198,7 +198,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let g = GpuBuffer::alloc(n * n).unwrap();
 		gpu_eye(n, &g).unwrap();
 		let mut got = vec![0.0; n * n];
-		g.download(&mut got).unwrap();
+		unsafe { g.download_async(&mut got, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 		// diagonal == 1, off-diagonal == 0 (assert BOTH).
 		let mut diag_ok = true;
 		let mut off_ok = true;

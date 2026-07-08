@@ -31,12 +31,27 @@ fn main() -> Result<()> {
 		gpu_core::hip::set_device(0)?;
 		for i in 0..iters {
 			// The LLM scenario's real dims: x [45982×768], cat [45982×128].
-			let scaler = std::cell::RefCell::new(None);
 			let x = ndarray::Array2::<f64>::from_elem((45982, 768), 1.0);
-			let (xraw, _, _) = recipe_infer::upload(&x);
 			let cat = ndarray::Array2::<f64>::from_elem((45982, 128), 1.0);
-			let (craw, nn, cc) = recipe_infer::upload(&cat);
-			let xb = recipe_infer::zscore_fit(&craw, nn, cc, &scaler);
+			// One staged image + ONE H2D for the whole setup (features + categorical),
+			// the fit's single-upload arc; xraw/craw are views of that one buffer.
+			let mut stage = gpu_core::memory::Stage::new();
+			let x_off = stage.push(x.as_standard_layout().as_slice().expect("x contig"));
+			let cat_off = stage.push(cat.as_standard_layout().as_slice().expect("cat contig"));
+			let staged = stage.upload().expect("setup-race stage");
+			let xraw = staged.view(x_off, x.len());
+			let craw = staged.view(cat_off, cat.len());
+			let (nn, cc) = (cat.nrows(), cat.ncols());
+			// z-score the categorical block into carved views (device-only, no readback).
+			let eps = {
+				let e = gpu_core::memory::GpuBuffer::alloc(1).expect("eps");
+				e.load(&[recipe_infer::ZSCORE_EPS]).expect("eps load");
+				e
+			};
+			let mean = gpu_core::memory::GpuBuffer::alloc(cc).expect("mean");
+			let std = gpu_core::memory::GpuBuffer::alloc(cc).expect("std");
+			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc).expect("zscored");
+			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb);
 			// The rest of the real setup arc: OOC residents at LLM scale
 			// (lse/dsum are n·heads·S ≈ 1.1 GB each), then fill VRAM to refusal
 			// in window-sized steps like Ooc::build's place(), then one more
@@ -49,7 +64,7 @@ fn main() -> Result<()> {
 			}
 			let mut probe1k = vec![0u8; 1024];
 			lse.download_u8(&mut probe1k).expect("d2h under pressure");
-			drop((xraw, craw, xb, lse, dsum, fills));
+			drop((xraw, craw, xb, lse, dsum, fills, staged, eps, mean, std));
 			gpu_core::memory::pool_trim();
 			eprintln!("setup-race iter {i}: clean");
 		}

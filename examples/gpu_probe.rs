@@ -24,7 +24,9 @@ fn gpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
       let bb = GpuBuffer::zeros_f32(n).expect("zero bias");
       let out = GpuBuffer::zeros_f32(m * n).expect("alloc out");
       gpu_linear_f32(&xb, &wb, &bb, m, n, k, &out).expect("sgemm");
-      out.download_vec_f32().expect("download")
+      let mut got = vec![0.0f32; m * n];
+      out.download_f32(&mut got).expect("download");
+      got
 }
 
 fn main() {

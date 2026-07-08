@@ -3,7 +3,8 @@
 // CPU oracle within 1e-9 absolute. Matching on both backends == parity.
 
 use gpu_core::memory::GpuBuffer;
-use gpu_core::{hip, linalg};
+use gpu_core::hip;
+use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
 
 const TOL: f64 = 1e-9;
 
@@ -82,11 +83,11 @@ fn dgemv_notrans_parity() {
 		let a = fill(m * n, 0x1111 ^ ((m as u64) << 16) ^ n as u64);
 		let x = fill(n, 0x2222 ^ ((m as u64) << 8) ^ n as u64);
 
-		let ga = GpuBuffer::upload(&a).unwrap();
-		let gx = GpuBuffer::upload(&x).unwrap();
+		let ga = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let gy = GpuBuffer::alloc(m).unwrap();
-		linalg::gpu_dgemv(&ga, &gx, m, n, 0, &gy).unwrap();
-		let got = gy.download_vec().unwrap();
+		gpu_dgemv_into(&ga, &gx, m, n, 0, &gy).unwrap();
+		let got = { let mut __dv = vec![0.0f64; gy.n_floats()]; unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 
 		let expect = cpu_gemv_notrans(&a, &x, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);
@@ -105,11 +106,11 @@ fn dgemv_trans_parity() {
 		let a = fill(m * n, 0x3333 ^ ((m as u64) << 16) ^ n as u64);
 		let x = fill(m, 0x4444 ^ ((m as u64) << 8) ^ n as u64);
 
-		let ga = GpuBuffer::upload(&a).unwrap();
-		let gx = GpuBuffer::upload(&x).unwrap();
+		let ga = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let gy = GpuBuffer::alloc(n).unwrap();
-		linalg::gpu_dgemv(&ga, &gx, m, n, 1, &gy).unwrap();
-		let got = gy.download_vec().unwrap();
+		gpu_dgemv_into(&ga, &gx, m, n, 1, &gy).unwrap();
+		let got = { let mut __dv = vec![0.0f64; gy.n_floats()]; unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 
 		let expect = cpu_gemv_trans(&a, &x, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);
@@ -128,12 +129,12 @@ fn dger_parity() {
 		let x = fill(m, 0x5555 ^ ((m as u64) << 16) ^ n as u64);
 		let y = fill(n, 0x6666 ^ ((m as u64) << 8) ^ n as u64);
 
-		let gx = GpuBuffer::upload(&x).unwrap();
-		let gy = GpuBuffer::upload(&y).unwrap();
+		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let gy = { let __up = &y; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let ga = GpuBuffer::alloc(m * n).unwrap();
 		ga.memset_zero(m * n * 8).unwrap();
-		linalg::gpu_dger(&gx, &gy, m, n, &ga).unwrap();
-		let got = ga.download_vec().unwrap();
+		gpu_dger_into(&gx, &gy, m, n, &ga).unwrap();
+		let got = { let mut __dv = vec![0.0f64; ga.n_floats()]; unsafe { ga.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 
 		let expect = cpu_ger(&x, &y, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);

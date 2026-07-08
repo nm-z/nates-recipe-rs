@@ -1,9 +1,10 @@
-// Parity tests for hipBLAS L1 reductions (gpu_ddot / gpu_dnrm2 / gpu_dasum /
+// Parity tests for L1 reductions (gpu_dot / gpu_l2_norm / gpu_dasum /
 // gpu_idamax). The GPU result must match a plain-Rust CPU oracle within 1e-9.
 // The same test runs on AMD (native hipBLAS) and NVIDIA (cuBLAS shim); matching
 // the CPU oracle on both backends == parity.
 
 use gpu_core::memory::GpuBuffer;
+use gpu_core::reductions::{gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes};
 use gpu_core::{hip, linalg};
 
 const TOL: f64 = 1e-9;
@@ -59,11 +60,13 @@ fn ddot_parity() {
       for &n in SIZES {
             let a = make_seq(n, 1);
             let b = make_seq(n, 2);
-            let ga = GpuBuffer::upload(&a).unwrap();
-            let gb = GpuBuffer::upload(&b).unwrap();
+            let ga = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+            let gb = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+            let ws = GpuBuffer::alloc_bytes(gpu_dot_workspace_bytes(n)).unwrap();
+            let prod = GpuBuffer::alloc(n).unwrap();
             let out = GpuBuffer::alloc(1).unwrap();
-            linalg::gpu_ddot(&ga, &gb, n, &out).unwrap();
-            let got = out.download_vec().unwrap()[0];
+            gpu_dot(&ga, &gb, &ws, &prod, n, &out).unwrap();
+            let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv }[0];
             let want = cpu_ddot(&a, &b);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -83,10 +86,12 @@ fn dnrm2_parity() {
       let mut max_diff = 0.0f64;
       for &n in SIZES {
             let x = make_seq(n, 3);
-            let gx = GpuBuffer::upload(&x).unwrap();
+            let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+            let ws = GpuBuffer::alloc_bytes(gpu_l2_norm_workspace_bytes(n)).unwrap();
+            let sq = GpuBuffer::alloc(n).unwrap();
             let out = GpuBuffer::alloc(1).unwrap();
-            linalg::gpu_dnrm2(&gx, n, &out).unwrap();
-            let got = out.download_vec().unwrap()[0];
+            gpu_l2_norm(&gx, &ws, &sq, n, &out).unwrap();
+            let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv }[0];
             let want = cpu_dnrm2(&x);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -106,10 +111,10 @@ fn dasum_parity() {
       let mut max_diff = 0.0f64;
       for &n in SIZES {
             let x = make_seq(n, 4);
-            let gx = GpuBuffer::upload(&x).unwrap();
+            let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
             let out = GpuBuffer::alloc(1).unwrap();
             linalg::gpu_dasum(&gx, n, &out).unwrap();
-            let got = out.download_vec().unwrap()[0];
+            let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv }[0];
             let want = cpu_dasum(&x);
             let diff = (got - want).abs();
             if diff > max_diff {
@@ -128,10 +133,10 @@ fn idamax_parity() {
       hip::set_device(0).unwrap();
       for &n in SIZES {
             let x = make_seq(n, 5);
-            let gx = GpuBuffer::upload(&x).unwrap();
+            let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
             let out = GpuBuffer::alloc(1).unwrap();
             linalg::gpu_idamax(&gx, n, &out).unwrap();
-            let got = out.download_vec().unwrap()[0].round() as usize;
+            let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv }[0].round() as usize;
             let want = cpu_idamax(&x);
             assert_eq!(
                   got, want,
@@ -143,9 +148,9 @@ fn idamax_parity() {
       // 32-aligned boundary, to pin down 0-based indexing + sign handling.
       let mut x = make_seq(50, 6);
       x[37] = -99.0;
-      let gx = GpuBuffer::upload(&x).unwrap();
+      let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
       let out = GpuBuffer::alloc(1).unwrap();
       linalg::gpu_idamax(&gx, x.len(), &out).unwrap();
-      let got = out.download_vec().unwrap()[0].round() as usize;
+      let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv }[0].round() as usize;
       assert_eq!(got, 37, "idamax negative-spike: gpu={got} want=37");
 }

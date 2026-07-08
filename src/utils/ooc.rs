@@ -1752,18 +1752,18 @@ mod tests {
 		let chunk = 3usize; // windows (0,3) (3,3) (6,1) — ragged
 		let p = [0.9, 0.2, 0.7, 0.4, 0.6, 0.15, 0.85];
 		let y = [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
-		let bp = GpuBuffer::upload(&p).expect("p");
-		let by = GpuBuffer::upload(&y).expect("y");
-		let inv_n = GpuBuffer::upload(&[1.0 / n as f64]).expect("inv_n");
+		let bp = { let __up = &p; let __ub = GpuBuffer::alloc(__up.len()).expect("p"); __ub.load(__up).expect("p"); __ub };
+		let by = { let __up = &y; let __ub = GpuBuffer::alloc(__up.len()).expect("y"); __ub.load(__up).expect("y"); __ub };
+		let inv_n = { let __up = &[1.0 / n as f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("inv_n"); __ub.load(__up).expect("inv_n"); __ub };
 		let (gamma, alpha) = (2.0, 0.25);
-		let bgamma = GpuBuffer::upload(&[gamma]).expect("gamma");
-		let balpha = GpuBuffer::upload(&[alpha]).expect("alpha");
+		let bgamma = { let __up = &[gamma]; let __ub = GpuBuffer::alloc(__up.len()).expect("gamma"); __ub.load(__up).expect("gamma"); __ub };
+		let balpha = { let __up = &[alpha]; let __ub = GpuBuffer::alloc(__up.len()).expect("alpha"); __ub.load(__up).expect("alpha"); __ub };
 
 		// full batch on GPU vs CPU analytic
 		let da_full = GpuBuffer::alloc(n).expect("da");
 		kernels::gpu_bce_grad_into(&bp, &by, &inv_n, n, &da_full).expect("bce full");
 		let mut got = vec![0.0; n];
-		da_full.download(&mut got).expect("dl");
+		unsafe { da_full.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl sync");
 		let want = cpu_bce_grad(&p, &y, n);
 		for i in 0..n {
 			assert!((got[i] - want[i]).abs() < 1e-12, "bce full[{i}] {} vs {}", got[i], want[i]);
@@ -1777,7 +1777,7 @@ mod tests {
 			let dw = view(&da_win, s0 * 8, cnt * 8);
 			kernels::gpu_bce_grad_into(&pw, &yw, &inv_n, cnt, &dw).expect("bce win");
 		}
-		da_win.download(&mut got).expect("dl");
+		unsafe { da_win.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl sync");
 		for i in 0..n {
 			assert!((got[i] - want[i]).abs() < 1e-12, "bce win[{i}] {} vs {}", got[i], want[i]);
 		}
@@ -1786,13 +1786,13 @@ mod tests {
 		// must NOT reproduce the full-batch gradient.
 		let da_raw = GpuBuffer::alloc(n).expect("da_raw");
 		for (s0, cnt) in chunks(n, chunk) {
-			let inv_cnt = GpuBuffer::upload(&[1.0 / cnt as f64]).expect("inv_cnt");
+			let inv_cnt = { let __up = &[1.0 / cnt as f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("inv_cnt"); __ub.load(__up).expect("inv_cnt"); __ub };
 			let pw = view(&bp, s0 * 8, cnt * 8);
 			let yw = view(&by, s0 * 8, cnt * 8);
 			let dw = view(&da_raw, s0 * 8, cnt * 8);
 			kernels::gpu_bce_grad_into(&pw, &yw, &inv_cnt, cnt, &dw).expect("bce raw win");
 		}
-		da_raw.download(&mut got).expect("dl");
+		unsafe { da_raw.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl sync");
 		let max_dev = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
 		assert!(max_dev > 1e-3, "per-window 1/cnt unexpectedly matched full batch (max dev {max_dev})");
 
@@ -1801,7 +1801,7 @@ mod tests {
 		let da_f = GpuBuffer::alloc(n).expect("da_f");
 		gpu_core::losses::gpu_focal_grad_into(&bp, &by, &bgamma, &balpha, &inv_n, n, &da_f)
 			.expect("focal full");
-		da_f.download(&mut got).expect("dl");
+		unsafe { da_f.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl sync");
 		for i in 0..n {
 			assert!((got[i] - want_f[i]).abs() < 1e-12, "focal full[{i}] {} vs {}", got[i], want_f[i]);
 		}
@@ -1813,7 +1813,7 @@ mod tests {
 			gpu_core::losses::gpu_focal_grad_into(&pw, &yw, &bgamma, &balpha, &inv_n, cnt, &dw)
 				.expect("focal win");
 		}
-		da_fw.download(&mut got).expect("dl");
+		unsafe { da_fw.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl sync");
 		for i in 0..n {
 			assert!((got[i] - want_f[i]).abs() < 1e-12, "focal win[{i}] {} vs {}", got[i], want_f[i]);
 		}

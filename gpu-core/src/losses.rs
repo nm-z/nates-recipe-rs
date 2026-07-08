@@ -154,31 +154,6 @@ pub fn gpu_bce_with_logits(
 	Ok(())
 }
 
-pub fn gpu_focal_loss(
-	prob: &GpuBuffer,
-	target: &GpuBuffer,
-	gamma: &GpuBuffer,
-	alpha: &GpuBuffer,
-	n: usize,
-	loss_out: &GpuBuffer,
-	grad_out: &GpuBuffer,
-) -> Result<(), HipError> {
-	unsafe {
-		launch_focal_loss(
-			prob.ptr_raw() as *const c_void,
-			target.ptr_raw() as *const c_void,
-			loss_out.ptr_raw(),
-			grad_out.ptr_raw(),
-			n as i32,
-			gamma.ptr_raw() as *const c_void,
-			alpha.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
-		);
-	}
-	crate::kernels::check_launch();
-	Ok(())
-}
-
 /// Focal loss + grad into preallocated buffers (no allocation — training-loop safe).
 pub fn gpu_focal_into(
 	prob: &GpuBuffer,

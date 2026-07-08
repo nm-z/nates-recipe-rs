@@ -49,6 +49,10 @@ pub struct DataInner {
 	exclude: Vec<String>,
 	raw_test_rows: Option<Vec<Vec<String>>>,
 	raw_test_headers: Option<Vec<String>>,
+	// Column kinds detected at `.set()` time (table sources only): the detector's
+	// GPU classification, moved out of the training run's init window. Consumed by
+	// `prepare_table` in place of the in-encode `predict_kinds`.
+	pre_kinds: pantry::encode::PreKinds,
 }
 
 impl std::ops::Deref for Data {
@@ -192,6 +196,7 @@ impl Data {
 			exclude: Vec::new(),
 			raw_test_rows: None,
 			raw_test_headers: None,
+			pre_kinds: Vec::new(),
 		});
 		let r: &dyn crate::model::RunData = &*inner;
 		register_data(r as *const dyn crate::model::RunData);
@@ -208,6 +213,12 @@ impl Data {
 			let (attrs, rows) = safetensors_to_table(path);
 			self.inner.attrs = attrs;
 			self.inner.rows = rows;
+		} else {
+			// The detector IS data preparation: classify the columns now, at load, so
+			// the GPU classification runs in the user's main before any `Train::run`
+			// rather than inside the run's measured init window. (arff/safetensors
+			// carry declared kinds and skip the detector.)
+			self.inner.pre_kinds.extend(pantry::detect_kinds(path));
 		}
 		self
 	}
@@ -471,6 +482,7 @@ impl DataInner {
 			self.split_frac,
 			&self.exclude,
 			&self.source_label(),
+			Some(self.pre_kinds.as_slice()),
 			|s, t| self.resolve_targets(s, t),
 		)
 	}

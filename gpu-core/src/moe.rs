@@ -1,6 +1,7 @@
 use crate::hip::{HipError, check};
+use crate::infer_ops::gpu_gemm_bt_f64;
 use crate::kernels::{
-	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_gemm_bt_into,
+	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at,
 	gpu_softmax_backward_into, gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
@@ -123,7 +124,8 @@ pub fn gpu_moe_route(
 	let gate = GpuBuffer::alloc(n_tokens * n_experts)?;
 	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 
-	let out = GpuBuffer::zeros_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	let out = GpuBuffer::alloc_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	out.memset_zero(n_tokens * d_model * std::mem::size_of::<f64>())?;
 	let expert_stride = d_model * d_model;
 	let ye = GpuBuffer::alloc(n_tokens * d_model)?;
 	for e in 0..n_experts {
@@ -163,7 +165,8 @@ pub fn gpu_moe_backward(
 	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 	let expert_stride = d_model * d_model;
 
-	let d_hidden = GpuBuffer::zeros_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	let d_hidden = GpuBuffer::alloc_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	d_hidden.memset_zero(n_tokens * d_model * std::mem::size_of::<f64>())?;
 	let d_gate = GpuBuffer::alloc(n_tokens * n_experts)?;
 	let d_expert_w = GpuBuffer::alloc(n_experts * expert_stride)?;
 	let d_ye = GpuBuffer::alloc(n_tokens * d_model)?;
@@ -178,7 +181,7 @@ pub fn gpu_moe_backward(
 			d_out, &gate, &ye, n_tokens, d_model, n_experts, e, &d_ye, &d_gate,
 		)?;
 		// d_hidden += d_ye · Weᵀ
-		gpu_gemm_bt_into(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
+		gpu_gemm_bt_f64(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
 		gpu_add_inplace(&dh_e, n_tokens * d_model, &d_hidden)?;
 		// d_We = hiddenᵀ · d_ye  →  d_expert_w[e]
 		gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens, &dwe)?;
@@ -188,7 +191,7 @@ pub fn gpu_moe_backward(
 	let d_logits = GpuBuffer::alloc(n_tokens * n_experts)?;
 	gpu_softmax_backward_into(&d_gate, &gate, n_tokens, n_experts, &d_logits)?;
 	let dh_r = GpuBuffer::alloc(n_tokens * d_model)?;
-	gpu_gemm_bt_into(&d_logits, gate_w, n_tokens, d_model, n_experts, &dh_r)?;
+	gpu_gemm_bt_f64(&d_logits, gate_w, n_tokens, d_model, n_experts, &dh_r)?;
 	gpu_add_inplace(&dh_r, n_tokens * d_model, &d_hidden)?;
 	let d_gate_w = GpuBuffer::alloc(d_model * n_experts)?;
 	gpu_gemm_at(hidden, &d_logits, d_model, n_experts, n_tokens, &d_gate_w)?;
@@ -217,15 +220,20 @@ mod tests {
 		let expert_w = mk(3, e * d * d, 1.0);
 		let g = mk(4, n * d, 1.0); // upstream grad = d_out
 
-		let hb = GpuBuffer::upload(&hidden).expect("h");
-		let gwb = GpuBuffer::upload(&gate_w).expect("gw");
-		let ewb = GpuBuffer::upload(&expert_w).expect("ew");
-		let gb = GpuBuffer::upload(&g).expect("g");
+		let hb = GpuBuffer::alloc(hidden.len()).expect("h");
+		hb.load(&hidden).expect("h load");
+		let gwb = GpuBuffer::alloc(gate_w.len()).expect("gw");
+		gwb.load(&gate_w).expect("gw load");
+		let ewb = GpuBuffer::alloc(expert_w.len()).expect("ew");
+		ewb.load(&expert_w).expect("ew load");
+		let gb = GpuBuffer::alloc(g.len()).expect("g");
+		gb.load(&g).expect("g load");
 		let (d_hidden, d_gate_w, d_expert_w) =
 			gpu_moe_backward(&hb, &gwb, &ewb, &gb, n, d, e).expect("bwd");
 		let dl = |buf: &GpuBuffer, len: usize| -> Vec<f64> {
 			let mut v = vec![0.0f64; len];
-			buf.download(&mut v).expect("download");
+			unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download");
+			crate::hip::device_synchronize().expect("download sync");
 			v
 		};
 		let dh = dl(&d_hidden, n * d);
@@ -234,17 +242,16 @@ mod tests {
 
 		let eps = 1e-6;
 		let loss = |hh: &[f64], gw: &[f64], ew: &[f64]| -> f64 {
-			let out = gpu_moe_route(
-				&GpuBuffer::upload(hh).expect("h"),
-				&GpuBuffer::upload(gw).expect("gw"),
-				&GpuBuffer::upload(ew).expect("ew"),
-				n,
-				d,
-				e,
-			)
-			.expect("fwd");
+			let hhb = GpuBuffer::alloc(hh.len()).expect("h");
+			hhb.load(hh).expect("h load");
+			let gwb = GpuBuffer::alloc(gw.len()).expect("gw");
+			gwb.load(gw).expect("gw load");
+			let ewb = GpuBuffer::alloc(ew.len()).expect("ew");
+			ewb.load(ew).expect("ew load");
+			let out = gpu_moe_route(&hhb, &gwb, &ewb, n, d, e).expect("fwd");
 			let mut o = vec![0.0f64; n * d];
-			out.download(&mut o).expect("download out");
+			unsafe { out.download_async(&mut o, std::ptr::null_mut()) }.expect("download out");
+			crate::hip::device_synchronize().expect("download out sync");
 			o.iter().zip(&g).map(|(a, b)| a * b).sum()
 		};
 		let fd = |base: &[f64], idx: usize, which: u8| -> f64 {

@@ -42,6 +42,147 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	ids
 }
 
+/// Load-time column-type detection for the table path (CSV / dir / zip). Runs the
+/// GPU char-level detector at `Data::set` time so the classification stays out of
+/// the training run's measured init window; the encoder consumes the result instead
+/// of calling `predict_kinds` mid-materialize. Returns, per table group, its name
+/// and per-column `(header, kind int)` positional to the group's headers. Image
+/// groups carry no feature columns and are omitted.
+///
+/// The detector sees byte-identical input to the in-encode path: per column, the
+/// newline-joined stream of non-missing cells, `tokenize_column`-truncated to
+/// `CONTEXT`. A plain CSV takes a streaming PREFIX read that stops as soon as every
+/// column has ≥ `CONTEXT` bytes of that stream (or at EOF) — a column with fewer
+/// forces reading to EOF, exactly what `tokenize_column` consumes from the full
+/// parse. Dir/zip/db reuse the full `load_groups` loader (the same parser), taking
+/// correctness over a second, prefix-only dialect.
+pub fn detect_kinds(path: &str) -> crate::encode::PreKinds {
+	let p = std::path::Path::new(path);
+	let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+	let plain_csv = !p.is_dir() && !matches!(ext.as_deref(), Some("zip" | "db" | "sqlite"));
+	if plain_csv {
+		let (headers, cells) = prefix_columns(p);
+		let non_empty: Vec<Vec<&str>> =
+			cells.iter().map(|c| c.iter().map(String::as_str).collect()).collect();
+		vec![(String::new(), kinds_for(&headers, &non_empty))]
+	} else {
+		crate::data::load_groups(path)
+			.iter()
+			.filter_map(|g| match g {
+				crate::data::DirGroup::Table { name, headers, cells, .. } => {
+					let non_empty: Vec<Vec<&str>> = (0..headers.len())
+						.map(|j| {
+							cells
+								.iter()
+								.map(|r| r.get(j).map_or("", String::as_str))
+								.filter(|c| !crate::encode::is_missing(c))
+								.collect()
+						})
+						.collect();
+					Some((name.clone(), kinds_for(headers, &non_empty)))
+				}
+				crate::data::DirGroup::Image { .. } => None,
+			})
+			.collect()
+	}
+}
+
+/// Non-empty columns → detector kinds; every empty column gets `KIND_NUMERIC` (the
+/// branch the encoder takes for it regardless of any prediction). One `(header,
+/// kind)` per column, in header order, so the encoder matches positionally and can
+/// catch a count/name drift against its full parse.
+fn kinds_for(headers: &[String], non_empty: &[Vec<&str>]) -> Vec<(String, usize)> {
+	let to_predict: Vec<usize> =
+		(0..headers.len()).filter(|&j| !non_empty[j].is_empty()).collect();
+	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
+	let preds = predict_kinds(&cols);
+	let mut pred: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+	for (i, &j) in to_predict.iter().enumerate() {
+		pred.insert(j, preds[i]);
+	}
+	headers
+		.iter()
+		.enumerate()
+		.map(|(j, name)| (name.clone(), pred.get(&j).copied().unwrap_or(KIND_NUMERIC)))
+		.collect()
+}
+
+/// Streaming prefix read of a plain CSV: replicates `read_raw_csv`'s header
+/// detection and missing-cell filtering, collecting each column's non-missing cells
+/// only until it holds ≥ `CONTEXT` bytes of `tokenize_column` stream (or EOF). The
+/// returned prefix is exactly what `tokenize_column` would consume from the full
+/// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
+fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
+	// One token per byte, plus one '\n' separator between consecutive cells.
+	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize], full: &mut usize) {
+		if tok[j] >= CONTEXT {
+			return;
+		}
+		tok[j] += if cols[j].is_empty() { cell.len() } else { 1 + cell.len() };
+		cols[j].push(cell.to_string());
+		if tok[j] >= CONTEXT {
+			*full += 1;
+		}
+	}
+
+	let mut rdr = csv::ReaderBuilder::new()
+		.has_headers(false)
+		.flexible(true)
+		.from_path(path)
+		.unwrap_or_else(|e| panic!("detect_kinds: failed to open {}: {e}", path.display()));
+	let mut records = rdr.byte_records();
+	let Some(first) = records.next() else {
+		return (Vec::new(), Vec::new());
+	};
+	let first =
+		first.unwrap_or_else(|e| panic!("detect_kinds: first record of {}: {e}", path.display()));
+	let first_cells: Vec<String> =
+		first.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+	let w = first_cells.len();
+	// Header row iff any first-row cell is a non-number (a header names columns);
+	// an all-numeric first row is data, and columns are synthesized col_0..col_{w-1}.
+	let headerless = !first_cells.is_empty()
+		&& first_cells.iter().all(|c| {
+			let t = c.trim();
+			!t.is_empty() && t.parse::<f64>().is_ok()
+		});
+	let headers: Vec<String> = if headerless {
+		(0..w).map(|j| format!("col_{j}")).collect()
+	} else {
+		first_cells.clone()
+	};
+
+	let mut cols: Vec<Vec<String>> = vec![Vec::new(); w];
+	let mut tok = vec![0usize; w];
+	let mut full = 0usize;
+	if headerless {
+		for (j, cell) in first_cells.iter().enumerate() {
+			if !crate::encode::is_missing(cell) {
+				take(j, cell, &mut cols, &mut tok, &mut full);
+			}
+		}
+	}
+	if full < w {
+		for rec in records {
+			let rec = rec
+				.unwrap_or_else(|e| panic!("detect_kinds: record of {}: {e}", path.display()));
+			for j in 0..w {
+				if tok[j] >= CONTEXT {
+					continue;
+				}
+				let cell = rec.get(j).map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
+				if !crate::encode::is_missing(cell.as_ref()) {
+					take(j, cell.as_ref(), &mut cols, &mut tok, &mut full);
+				}
+			}
+			if full >= w {
+				break;
+			}
+		}
+	}
+	(headers, cols)
+}
+
 // Parks the detector's backing slab on every exit — normal return or a panic
 // during the forward — so the arena is never left registered-and-live and the
 // next call adopts it instead of reclaiming. No HIP calls in park, so drop

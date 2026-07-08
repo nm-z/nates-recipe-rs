@@ -68,7 +68,7 @@ fn chk() {
 
 // ── GPU runners ─────────────────────────────────────────────────────────────
 fn gpu_lookup(table: &[f64], indices: &[i32], n: usize, d: usize) -> Vec<f64> {
-	let bt = GpuBuffer::upload(table).unwrap();
+	let bt = { let __up = table; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let bi = GpuBuffer::upload_i32(indices).unwrap();
 	let o = GpuBuffer::alloc(n * d).unwrap();
 	unsafe {
@@ -83,7 +83,7 @@ fn gpu_lookup(table: &[f64], indices: &[i32], n: usize, d: usize) -> Vec<f64> {
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -95,7 +95,7 @@ fn gpu_bag(
 	d: usize,
 	mode: i32,
 ) -> Vec<f64> {
-	let bt = GpuBuffer::upload(table).unwrap();
+	let bt = { let __up = table; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let bi = GpuBuffer::upload_i32(indices).unwrap();
 	let bo = GpuBuffer::upload_i32(offsets).unwrap();
 	let o = GpuBuffer::alloc(n_bags * d).unwrap();
@@ -113,7 +113,7 @@ fn gpu_bag(
 	}
 	chk();
 	let mut out = vec![0.0; n_bags * d];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -131,14 +131,14 @@ fn gpu_one_hot(indices: &[i32], n: usize, c: usize) -> Vec<f64> {
 	}
 	chk();
 	let mut out = vec![0.0; n * c];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn gpu_rope(x: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> Vec<f64> {
-	let bx = GpuBuffer::upload(x).unwrap();
-	let bc = GpuBuffer::upload(cosb).unwrap();
-	let bs = GpuBuffer::upload(sinb).unwrap();
+	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bc = { let __up = cosb; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = { let __up = sinb; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(n * d).unwrap();
 	unsafe {
 		launch_embeddingx_rope(
@@ -153,14 +153,14 @@ fn gpu_rope(x: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> Vec<f6
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn gpu_rope_bwd(dy: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> Vec<f64> {
-	let bd = GpuBuffer::upload(dy).unwrap();
-	let bc = GpuBuffer::upload(cosb).unwrap();
-	let bs = GpuBuffer::upload(sinb).unwrap();
+	let bd = { let __up = dy; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bc = { let __up = cosb; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = { let __up = sinb; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(n * d).unwrap();
 	unsafe {
 		launch_embeddingx_rope_bwd(
@@ -175,7 +175,7 @@ fn gpu_rope_bwd(dy: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> V
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

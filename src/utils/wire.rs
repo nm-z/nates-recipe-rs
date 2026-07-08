@@ -419,9 +419,6 @@ impl Conn {
 		Ok(f)
 	}
 
-	pub fn store(&self, id: u64, bytes: Vec<u8>) -> Result<()> {
-		self.call(Op::Store, 0, id, bytes).map(|_| ())
-	}
 	/// Store borrowing the payload — ooc write-behind lanes reuse pooled window
 	/// buffers and must not clone a window per STORE.
 	pub fn store_from(&self, id: u64, data: &[u8]) -> Result<()> {
@@ -657,7 +654,7 @@ mod tests {
                   x ^= x << 17;
                   w.copy_from_slice(&x.to_le_bytes());
             }
-            c.store(42, blob.clone())?;
+            c.store_from(42, &blob)?;
             let back = c.fetch(42, 0, blob.len() as u64)?;
             assert_eq!(back, blob, "full fetch must round-trip the stored blob");
             let off = 1usize << 20;

@@ -31,26 +31,6 @@ const HIPFFT_BACKWARD: i32 = 1;
 // Enums are u32, hipblas_stride is i64, size_t is usize.
 unsafe extern "C" {
 	// ── hipBLAS L1 ─────────────────────────────────────────────────────
-	// hipblasDdot(handle, n, x, incx, y, incy, result) -> i32
-	fn hipblasDdot(
-		handle: *mut c_void,
-		n: i32,
-		x: *const f64,
-		incx: i32,
-		y: *const f64,
-		incy: i32,
-		result: *mut f64,
-	) -> i32;
-
-	// hipblasDnrm2(handle, n, x, incx, result) -> i32
-	fn hipblasDnrm2(
-		handle: *mut c_void,
-		n: i32,
-		x: *const f64,
-		incx: i32,
-		result: *mut f64,
-	) -> i32;
-
 	// hipblasDasum(handle, n, x, incx, result) -> i32
 	fn hipblasDasum(
 		handle: *mut c_void,
@@ -67,37 +47,6 @@ unsafe extern "C" {
 		x: *const f64,
 		incx: i32,
 		result: *mut i32,
-	) -> i32;
-
-	// ── hipBLAS L2 ─────────────────────────────────────────────────────
-	// hipblasDgemv(handle, trans, m, n, alpha, A, lda, x, incx, beta, y, incy) -> i32
-	fn hipblasDgemv(
-		handle: *mut c_void,
-		trans: u32,
-		m: i32,
-		n: i32,
-		alpha: *const f64,
-		A: *const f64,
-		lda: i32,
-		x: *const f64,
-		incx: i32,
-		beta: *const f64,
-		y: *mut f64,
-		incy: i32,
-	) -> i32;
-
-	// hipblasDger(handle, m, n, alpha, x, incx, y, incy, A, lda) -> i32
-	fn hipblasDger(
-		handle: *mut c_void,
-		m: i32,
-		n: i32,
-		alpha: *const f64,
-		x: *const f64,
-		incx: i32,
-		y: *const f64,
-		incy: i32,
-		A: *mut f64,
-		lda: i32,
 	) -> i32;
 
 	// ── hipBLAS L3 ─────────────────────────────────────────────────────
@@ -325,40 +274,6 @@ unsafe extern "C" {
 // vendor call). The scalar the vendor writes to a host stack slot is then
 // stored into the caller's 1-elem device `out` via the H2D choke point.
 
-// Dot product: a · b  (n elements, stride 1). Result -> out (1-elem f64).
-pub fn gpu_ddot(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	let mut result = 0.0f64;
-	let status = unsafe {
-		hipblasDdot(
-			hipblas_handle(),
-			safe_i32(n),
-			a.ptr_raw() as *const f64,
-			1,
-			b.ptr_raw() as *const f64,
-			1,
-			&mut result,
-		)
-	};
-	check(status)?;
-	out.load(&[result])
-}
-
-// Euclidean norm: ||x||_2  (n elements, stride 1). Result -> out (1-elem f64).
-pub fn gpu_dnrm2(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	let mut result = 0.0f64;
-	let status = unsafe {
-		hipblasDnrm2(
-			hipblas_handle(),
-			safe_i32(n),
-			x.ptr_raw() as *const f64,
-			1,
-			&mut result,
-		)
-	};
-	check(status)?;
-	out.load(&[result])
-}
-
 // Sum of absolute values: sum |x_i|  (n elements, stride 1). Result -> out.
 pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
@@ -408,39 +323,6 @@ pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErr
 //   hipblasDgemv(NONE, n, m, 1, A, n, x, 1, 0, y, 1)
 // trans is a plan-time flag encoded as usize (0 = A@x, nonzero = A^T@x).
 // out is caller-provided: length m when trans==0, else n.
-pub fn gpu_dgemv(
-	a: &GpuBuffer,
-	x: &GpuBuffer,
-	m: usize,
-	n: usize,
-	trans: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	let alpha = 1.0f64;
-	let beta = 0.0f64;
-	let (rb_trans, rb_m, rb_n) = if trans != 0 {
-		(OP_NONE, n as i32, m as i32)
-	} else {
-		(OP_TRANS, n as i32, m as i32)
-	};
-	let status = unsafe {
-		hipblasDgemv(
-			hipblas_handle(),
-			rb_trans,
-			rb_m,
-			rb_n,
-			&alpha,
-			a.ptr_raw() as *const f64,
-			rb_m,
-			x.ptr_raw() as *const f64,
-			1,
-			&beta,
-			out.ptr_raw() as *mut f64,
-			1,
-		)
-	};
-	check(status)
-}
 
 // Rank-1 update: A = x ⊗ y^T  (outer product), A is (m x n) row-major output.
 // Allocates zeroed output first (hipblasDger accumulates into A).
@@ -452,30 +334,6 @@ pub fn gpu_dgemv(
 // with m_rb=n, n_rb=m, lda=n — hipBLAS writes A_cm(j,i)=y[j]*x[i]=A_rm(i,j). ✓
 // hipblasDger ACCUMULATES into out, so the caller must pre-zero out (m*n)
 // before the call; the op does no internal memset (conforming ops never init).
-pub fn gpu_dger(
-	x: &GpuBuffer,
-	y: &GpuBuffer,
-	m: usize,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	let alpha = 1.0f64;
-	let status = unsafe {
-		hipblasDger(
-			hipblas_handle(),
-			n as i32,
-			m as i32, // m_rb=n, n_rb=m (column-major transposed layout)
-			&alpha,
-			y.ptr_raw() as *const f64,
-			1, // "x" operand in hipBLAS
-			x.ptr_raw() as *const f64,
-			1, // "y" operand in hipBLAS
-			out.ptr_raw() as *mut f64,
-			n as i32, // lda=n (stride between col-major cols = n)
-		)
-	};
-	check(status)
-}
 
 // ── Symmetric rank-k update ───────────────────────────────────────────────
 
@@ -520,52 +378,6 @@ pub fn gpu_dsyrk(
 
 // ── Strided batched GEMM ──────────────────────────────────────────────────
 
-// C[i] = A[i] @ B[i]  for i in 0..batch.  A is (m×k), B is (k×n), C is (m×n), all row-major.
-// Strides: stride_a = m*k, stride_b = k*n, stride_c = m*n.
-//
-// Mirror gpu_gemm's column-major identity: C_rm = (B_cm @ A_cm)^T.
-// hipblasDgemmStridedBatched(N, N, n, m, k, 1, B, n, stride_b, A, k, stride_a, 0, C, n, stride_c, batch).
-// hipBLAS "A" = our B (lda=n, stride=k*n), "B" = our A (ldb=k, stride=m*k). ✓
-// out is (batch × m × n). Strides are the natural contiguous ones.
-pub fn gpu_dgemm_strided_batched(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	batch: usize,
-	m: usize,
-	n: usize,
-	k: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
-	let alpha = 1.0f64;
-	let beta = 0.0f64;
-	let stride_a = (m * k) as i64;
-	let stride_b = (k * n) as i64;
-	let stride_c = (m * n) as i64;
-	let status = unsafe {
-		hipblasDgemmStridedBatched(
-			hipblas_handle(),
-			OP_NONE,
-			OP_NONE,
-			n as i32,
-			m as i32,
-			k as i32,
-			&alpha,
-			b.ptr_raw() as *const f64,
-			n as i32,
-			stride_b, // hipBLAS "A" = our B
-			a.ptr_raw() as *const f64,
-			k as i32,
-			stride_a, // hipBLAS "B" = our A
-			&beta,
-			out.ptr_raw() as *mut f64,
-			n as i32,
-			stride_c,
-			batch as i32,
-		)
-	};
-	check(status)
-}
-
 /// Alloc-free batched GEMM into a preallocated `c`, per batch i (all row-major):
 ///   C_i(m×n, ld=ldc) = opA(A_i) @ opB(B_i),  opX = transpose iff trans_x.
 /// A_i begins at element `a_off + i*stride_a` (row stride `lda`), B_i at
@@ -575,7 +387,7 @@ pub fn gpu_dgemm_strided_batched(
 ///
 /// hipBLAS is column-major; a row-major (r×c, ld) matrix is its col-major transpose.
 /// So C_rm = opA(A)@opB(B) is computed as C_cm = (Cᵀ): hipBLAS(transA=opB, transB=opA,
-/// m=n, n=m, k=k, A_roc=B, B_roc=A) — derived op-by-op, matches gpu_dgemm_strided_batched
+/// m=n, n=m, k=k, A_roc=B, B_roc=A) — derived op-by-op, matches the legacy no-transpose batched GEMM
 /// for the no-transpose case.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_bmm_into(
@@ -659,7 +471,7 @@ pub fn gpu_lu_factor(
 	ipiv_out: &GpuBuffer,
 	info_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy(a, n * n, lu_out)?;
+	crate::kernels::gpu_copy_into(a, n * n, lu_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgetrf_bufferSize(
@@ -723,7 +535,7 @@ pub fn gpu_lu_solve(
 	info_out: &GpuBuffer,
 	x_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy(b, n * nrhs, x_out)?;
+	crate::kernels::gpu_copy_into(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgetrs_bufferSize(
@@ -794,7 +606,7 @@ pub fn gpu_potrs(
 	info_out: &GpuBuffer,
 	x_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy(b, n * nrhs, x_out)?;
+	crate::kernels::gpu_copy_into(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDpotrs_bufferSize(
@@ -988,7 +800,7 @@ pub fn gpu_eigh_sym(
 	evals_out: &GpuBuffer,
 	evecs_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy(a, n * n, evecs_out)?;
+	crate::kernels::gpu_copy_into(a, n * n, evecs_out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDsyevd_bufferSize(

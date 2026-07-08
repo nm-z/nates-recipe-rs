@@ -407,9 +407,9 @@ impl Model {
 fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 	if plus_one {
 		let v: Vec<f64> = vals.iter().map(|x| x + 1.0).collect();
-		Ok(GpuBuffer::upload(&v)?)
+		Ok({ let __up = &v; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub })
 	} else {
-		Ok(GpuBuffer::upload(vals)?)
+		Ok({ let __up = vals; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub })
 	}
 }
 
@@ -481,9 +481,9 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		gis: Vec::new(),
 		pe: Vec::new(),
 		emb: Vec::new(),
-		eps: GpuBuffer::upload(&[EPS])?,
-		theta_full: GpuBuffer::upload(&[1_000_000.0f64])?,
-		theta_slide: GpuBuffer::upload(&[10_000.0f64])?,
+		eps: { let __up = &[EPS]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
+		theta_full: { let __up = &[1_000_000.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
+		theta_slide: { let __up = &[10_000.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
 		ls_dev: Vec::new(),
 	};
 
@@ -501,16 +501,16 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		m.gis.push(m.small_f64(&p("router.scale"))?);
 		m.pe.push(m.small_f64(&p("router.per_expert_scale"))?);
 		let lsv = m.small_f64(&p("layer_scalar"))?[0];
-		m.ls_dev.push(GpuBuffer::upload(&[lsv])?);
+		m.ls_dev.push({ let __up = &[lsv]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub });
 	}
 
 	// Globals.
 	eprintln!("\rglobals + embedding table...");
 	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
 	m.sc_pre = upload_gamma(&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?, plus_one)?;
-	m.sc_gate = GpuBuffer::upload(&m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?)?;
-	m.sc_up = GpuBuffer::upload(&m.small_f64("model.decoder.self_conditioning.up_proj.weight")?)?;
-	m.sc_down = GpuBuffer::upload(&m.small_f64("model.decoder.self_conditioning.down_proj.weight")?)?;
+	m.sc_gate = { let __up = &m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+	m.sc_up = { let __up = &m.small_f64("model.decoder.self_conditioning.up_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+	m.sc_down = { let __up = &m.small_f64("model.decoder.self_conditioning.down_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
 
 	// Embedding table: keep raw bf16 bytes resident on host.
 	let et = m.big.get("model.decoder.embed_tokens.weight").ok_or_else(|| anyhow!("no embed_tokens"))?;
@@ -692,8 +692,11 @@ fn layer(
 	let _tmoe = Instant::now();
 	gpu_rmsnorm_f64(&ar.attn_out, &nm["pn2"], &m.eps, t, NE, &ar.cmoes)?;
 	let _rt = Instant::now();
-	let ao_host = ar.attn_out.download_vec()?;
-	let cmoes_host = ar.cmoes.download_vec()?;
+	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
+	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
+	unsafe { ar.attn_out.download_async(&mut ao_host, std::ptr::null_mut()) }?;
+	unsafe { ar.cmoes.download_async(&mut cmoes_host, std::ptr::null_mut()) }?;
+	gpu_core::hip::device_synchronize()?;
 	acc(&MOE_RT_NS, _rt);
 	let _tr = Instant::now();
 	let (rw, gis, pe) = (&m.rw[l], &m.gis[l], &m.pe[l]);
@@ -737,7 +740,8 @@ fn layer(
 		let dn_w = m.widen_from(&es, GU_BYTES, NE * NFFE);
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, NE, NFFE, &ar.moe_dv)?;
 		let _rt = Instant::now();
-		ar.moe_dv.download(&mut dv_host[..np * NE])?;
+		unsafe { ar.moe_dv.download_async(&mut dv_host[..np * NE], std::ptr::null_mut()) }?;
+		gpu_core::hip::device_synchronize()?;
 		acc(&MOE_RT_NS, _rt);
 		for (i, &(p, w)) in poslist.iter().enumerate() {
 			let s = w * pe[e];
@@ -781,7 +785,8 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 			}
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, NE, &ar.lm_out)?;
-		ar.lm_out.download(&mut out_host[..ncanvas * cn])?;
+		unsafe { ar.lm_out.download_async(&mut out_host[..ncanvas * cn], std::ptr::null_mut()) }?;
+		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
 			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
 		}
@@ -875,7 +880,8 @@ fn main() -> Result<()> {
 	// MEASURED: spawn probe children (cores off — the corpse is the signal)
 	// from the counters' guess downward; claim the first size that survives.
 	let claim = {
-		let mut want = Waterfall::claim_guess();
+		let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
+		eprintln!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64);
 		loop {
 			if want < (1 << 30) {
 				bail!("claim probe: nothing mappable above 1 GB");
@@ -900,7 +906,9 @@ fn main() -> Result<()> {
 			want -= want / 16;
 		}
 		eprintln!("claim: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
-		let w = Waterfall::claim_bytes(want);
+		let slab = gpu_core::memory::claim_device_arena_bytes(want)
+			.context("claim device arena")?;
+		let w = Waterfall::from_arena(slab);
 		eprintln!("[right after claim] {}", gpu_core::memory::ledger_report());
 		w
 	};
@@ -982,7 +990,8 @@ fn main() -> Result<()> {
 		// 30 transformer layers, ping-ponging the hidden state between ha/hb.
 		let bithash = |b: &GpuBuffer, n: usize| -> Result<u64> {
 			let mut v = vec![0.0f64; n];
-			b.view(0, n).download(&mut v)?;
+			unsafe { b.view(0, n).download_async(&mut v, std::ptr::null_mut()) }?;
+			gpu_core::hip::device_synchronize()?;
 			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x100000001b3)))
 		};
 		if step == 0 {
@@ -1000,7 +1009,10 @@ fn main() -> Result<()> {
 		}
 		eprint!("\r\x1b[K");
 		let hbuf = src; // last buffer written
-		let nan = hbuf.download_vec()?.iter().filter(|v| !v.is_finite()).count();
+		let mut hbuf_host = vec![0.0f64; hbuf.n_floats()];
+		unsafe { hbuf.download_async(&mut hbuf_host, std::ptr::null_mut()) }?;
+		gpu_core::hip::device_synchronize()?;
+		let nan = hbuf_host.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {
 			bail!("step {step}: {nan} non-finite in h after layers");
 		}

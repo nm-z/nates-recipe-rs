@@ -53,8 +53,8 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 		.map(|i| (i as f64 * 0.9).cos())
 		.collect();
 	let want = cpu_bmm(&a, &b, batch, m, n, k, ta, tb);
-	let ag = GpuBuffer::upload(&a).expect("a");
-	let bg = GpuBuffer::upload(&b).expect("b");
+	let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).expect("a"); __ub.load(__up).expect("a"); __ub };
+	let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
 	let cg = GpuBuffer::alloc(batch * m * n).expect("c");
 	gpu_bmm_into(
 		&ag,
@@ -78,7 +78,7 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 	)
 	.unwrap();
 	let mut got = vec![0.0f64; batch * m * n];
-	cg.download(&mut got).expect("dl");
+	unsafe { cg.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	let maxd = want
 		.iter()
 		.zip(&got)
@@ -104,8 +104,8 @@ fn bmm_per_head_offset() {
 	// Q,K packed [n, S, d]; compute scores_h[i] = Q_i,h(S×hd) · K_i,hᵀ(hd×S) per head.
 	let q: Vec<f64> = (0..n * s * d).map(|i| (i as f64 * 0.3).sin()).collect();
 	let kk: Vec<f64> = (0..n * s * d).map(|i| (i as f64 * 0.5).cos()).collect();
-	let qg = GpuBuffer::upload(&q).expect("q");
-	let kg = GpuBuffer::upload(&kk).expect("k");
+	let qg = { let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).expect("q"); __ub.load(__up).expect("q"); __ub };
+	let kg = { let __up = &kk; let __ub = GpuBuffer::alloc(__up.len()).expect("k"); __ub.load(__up).expect("k"); __ub };
 	let scores = GpuBuffer::alloc(heads * n * s * s).expect("sc");
 	for h in 0..heads {
 		// batch over n: A=Q head block, B=K head block, C=scores_h, opB=trans
@@ -132,7 +132,7 @@ fn bmm_per_head_offset() {
 		.unwrap();
 	}
 	let mut got = vec![0.0f64; heads * n * s * s];
-	scores.download(&mut got).expect("dl");
+	unsafe { scores.download_async(&mut got, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
 	// CPU ref
 	for h in 0..heads {
 		for i in 0..n {

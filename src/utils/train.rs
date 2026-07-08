@@ -8,7 +8,7 @@ use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
 	infer_scored, load_ogdl, load_ogdl_str, metric_gpu_into,
-	pinned_vocab, plan_layer_params, upload, zscore_apply,
+	pinned_vocab, plan_layer_params, zscore_apply_views,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
@@ -114,10 +114,10 @@ impl StepScalars {
 	pub(crate) fn new(lr: f64, n: usize) -> StepScalars {
 		let inv = 1.0 / n as f64;
 		StepScalars {
-			neg_lr: GpuBuffer::upload(&[-lr]).expect("neg_lr"),
-			inv_n: GpuBuffer::upload(&[inv]).expect("inv_n"),
-			two_inv_n: GpuBuffer::upload(&[2.0 * inv]).expect("two_inv_n"),
-			zero: GpuBuffer::upload(&[0.0]).expect("zero"),
+			neg_lr: { let __up = &[-lr]; let __ub = GpuBuffer::alloc(__up.len()).expect("neg_lr"); __ub.load(__up).expect("neg_lr"); __ub },
+			inv_n: { let __up = &[inv]; let __ub = GpuBuffer::alloc(__up.len()).expect("inv_n"); __ub.load(__up).expect("inv_n"); __ub },
+			two_inv_n: { let __up = &[2.0 * inv]; let __ub = GpuBuffer::alloc(__up.len()).expect("two_inv_n"); __ub.load(__up).expect("two_inv_n"); __ub },
+			zero: { let __up = &[0.0]; let __ub = GpuBuffer::alloc(__up.len()).expect("zero"); __ub.load(__up).expect("zero"); __ub },
 		}
 	}
 }
@@ -1339,18 +1339,38 @@ impl ModelInner {
 		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
 		let scaler_ref = scaler.as_ref().expect("eval: missing scaler; train first");
+		// Carve+load a raw feature matrix (owned; fed straight to forward).
+		let up = |m: &ndarray::Array2<f64>| -> GpuBuffer {
+			let s = m.as_standard_layout();
+			let sl = s.as_slice().expect("eval upload: non-contiguous");
+			let b = GpuBuffer::alloc(sl.len()).expect("eval upload");
+			b.load(sl).expect("eval upload");
+			b
+		};
+		// z-score apply with the fitted scaler: mean/std ride ONE staged image (two
+		// carved views), not a fresh upload each eval; the scaled result is owned.
+		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> GpuBuffer {
+			assert_eq!(sc.mean.len(), cols, "eval: feature count changed");
+			assert_eq!(sc.std.len(), cols, "eval: feature count changed");
+			let mut st = Stage::new();
+			let m_off = st.push(&sc.mean);
+			let s_off = st.push(&sc.std);
+			let img = st.upload().expect("eval scaler stage");
+			zscore_apply_views(xraw, rows, cols, &img.view(m_off, cols), &img.view(s_off, cols))
+		};
 		if embed_first {
-			let (xraw, _, _) = upload(&xinput);
+			let xraw = up(&xinput);
 			if cat_cols.is_empty() {
 				(xraw, None, n)
 			} else {
 				let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-				let (craw, _, c) = upload(&cat);
-				(xraw, Some(zscore_apply(&craw, n, c, scaler_ref)), n)
+				let craw = up(&cat);
+				let c = cat.ncols();
+				(xraw, Some(apply(&craw, n, c, scaler_ref)), n)
 			}
 		} else {
-			let (xraw, _, _) = upload(&xinput);
-			(zscore_apply(&xraw, n, d, scaler_ref), None, n)
+			let xraw = up(&xinput);
+			(apply(&xraw, n, d, scaler_ref), None, n)
 		}
 	}
 	/// Forward-only evaluation of the trained model on `data`, reporting the
@@ -1368,8 +1388,9 @@ impl ModelInner {
 		let yscaler = *self.yscaler.borrow();
 		let metric = if self.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
 		if ds.has_target {
-			let ybuf = GpuBuffer::upload(ds.y.as_slice().expect("eval: y contiguous"))
-				.expect("eval ybuf");
+			let __yb = ds.y.as_slice().expect("eval: y contiguous");
+			let ybuf = GpuBuffer::alloc(__yb.len()).expect("eval ybuf");
+			ybuf.load(__yb).expect("eval ybuf load");
 			let k = params[params.len() - 1].out_dim;
 			let total = (n * k) as f64;
 			let ybar = ds.y.iter().sum::<f64>() / total;

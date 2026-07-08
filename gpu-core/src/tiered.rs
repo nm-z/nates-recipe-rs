@@ -574,12 +574,16 @@ mod tests {
                   h
             };
             // ---- all device buffers BEFORE any VMM buffer ----
-            let x_dev = GpuBuffer::upload(&xh).expect("x");
-            let y_dev = GpuBuffer::upload(&yh).expect("y");
+            let x_dev = GpuBuffer::alloc(xh.len()).expect("x");
+            x_dev.load(&xh).expect("x load");
+            let y_dev = GpuBuffer::alloc(yh.len()).expect("y");
+            y_dev.load(&yh).expect("y load");
             let make = |sz: usize| GpuBuffer::alloc(sz).expect("buf");
             let scale = lr / n as f64;
-            let zero = GpuBuffer::upload(&[0.0f64]).expect("zero");
-            let neg_scale = GpuBuffer::upload(&[-scale]).expect("neg_scale");
+            let zero = GpuBuffer::alloc(1).expect("zero");
+            zero.load(&[0.0f64]).expect("zero load");
+            let neg_scale = GpuBuffer::alloc(1).expect("neg_scale");
+            neg_scale.load(&[-scale]).expect("neg_scale load");
             let (w_ref, b_ref) = (make(d * o), make(o));
             let (w_t, b_t) = (make(d * o), make(o));
             kernels::gpu_scale_inplace(&zero, d * o, &w_ref).expect("enq");

@@ -5,10 +5,12 @@ use gpu_core::memory::GpuBuffer;
 fn main() {
 	let n = (64usize << 20) / 8;
 	let host = vec![4.0f64; n];
-	let x = GpuBuffer::upload(&host).expect("probe: upload");
+	let x = GpuBuffer::alloc(n).expect("probe: alloc");
+	x.load(&host).expect("probe: upload");
 	gpu_core::math_ops::gpu_rsqrt(&x, n, &x).expect("probe: kernel");
 	let mut back = vec![0.0f64; n];
-	x.download(&mut back).expect("probe: download");
+	unsafe { x.download_async(&mut back, std::ptr::null_mut()) }.expect("probe: download");
+	gpu_core::hip::device_synchronize().expect("probe: download sync");
 	for (i, v) in back.iter().enumerate() {
 		if (v - 0.5).abs() > 1e-12 {
 			eprintln!("probe: mismatch at {i}: {v}");

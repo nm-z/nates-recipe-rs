@@ -96,8 +96,8 @@ type FlatLaunch =
 	unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, i32, *mut c_void);
 
 fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: usize) -> Vec<f64> {
-	let bq = GpuBuffer::upload(q).unwrap();
-	let bt = GpuBuffer::upload(t).unwrap();
+	let bq = { let __up = q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bt = { let __up = t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 	let o = GpuBuffer::alloc(nq * nt).unwrap();
 	unsafe {
 		f(
@@ -112,7 +112,7 @@ fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: 
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; nq * nt];
-	o.download(&mut out).unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -234,15 +234,15 @@ fn prove_distance() {
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::kernels::gpu_pairwise_l2(
-			&GpuBuffer::upload(&q).unwrap(),
-			&GpuBuffer::upload(&t).unwrap(),
+			&{ let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
+			&{ let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
 			nq,
 			nt,
 			dim,
 			&out,
 		)
 		.unwrap();
-		let got = out.download_vec().unwrap();
+		let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 		});
@@ -252,15 +252,15 @@ fn prove_distance() {
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::encoding::gpu_pairwise_cosine(
-			&GpuBuffer::upload(&q).unwrap(),
-			&GpuBuffer::upload(&t).unwrap(),
+			&{ let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
+			&{ let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
 			nq,
 			nt,
 			dim,
 			&out,
 		)
 		.unwrap();
-		let got = out.download_vec().unwrap();
+		let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
 			let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -274,15 +274,15 @@ fn prove_distance() {
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::encoding::gpu_pairwise_l1(
-			&GpuBuffer::upload(&q).unwrap(),
-			&GpuBuffer::upload(&t).unwrap(),
+			&{ let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
+			&{ let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
 			nq,
 			nt,
 			dim,
 			&out,
 		)
 		.unwrap();
-		let got = out.download_vec().unwrap();
+		let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
 		});
@@ -303,15 +303,15 @@ fn prove_distance() {
 		}
 		let out = GpuBuffer::alloc(nqh * nth).unwrap();
 		gpu_core::encoding::gpu_pairwise_hamming(
-			&GpuBuffer::upload_u8(&qu).unwrap(),
-			&GpuBuffer::upload_u8(&tu).unwrap(),
+			&{ let __u = &qu; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b },
+			&{ let __u = &tu; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b },
 			nqh,
 			nth,
 			qd,
 			&out,
 		)
 		.unwrap();
-		let got = out.download_vec().unwrap();
+		let got = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let mut want = vec![0.0; nqh * nth];
 		for qi in 0..nqh {
 			for ti in 0..nth {
@@ -350,8 +350,8 @@ fn prove_distance() {
 	// minkowski(p=3): (Σ|diff|^p)^(1/p)
 	{
 		let p = 3.0_f64;
-		let bq = GpuBuffer::upload(&q).unwrap();
-		let bt = GpuBuffer::upload(&t).unwrap();
+		let bq = { let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bt = { let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let o = GpuBuffer::alloc(nq * nt).unwrap();
 		unsafe {
 			launch_distancex_minkowski(
@@ -366,7 +366,7 @@ fn prove_distance() {
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
-		let got = o.download_vec().unwrap();
+		let got = { let mut __dv = vec![0.0f64; o.n_floats()]; unsafe { o.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			let s: f64 = a.iter().zip(b).map(|(x, y)| (x - y).abs().powf(p)).sum();
 			s.powf(1.0 / p)
@@ -376,8 +376,8 @@ fn prove_distance() {
 	// minkowski(p=2) cross-check == sqrt(l2-squared kernel output)
 	{
 		let p = 2.0_f64;
-		let bq = GpuBuffer::upload(&q).unwrap();
-		let bt = GpuBuffer::upload(&t).unwrap();
+		let bq = { let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let bt = { let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
 		let o = GpuBuffer::alloc(nq * nt).unwrap();
 		unsafe {
 			launch_distancex_minkowski(
@@ -392,7 +392,7 @@ fn prove_distance() {
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
-		let mink2 = o.download_vec().unwrap();
+		let mink2 = { let mut __dv = vec![0.0f64; o.n_floats()]; unsafe { o.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		// CPU oracle: true euclidean = sqrt(Σ diff²)
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter()
@@ -405,15 +405,15 @@ fn prove_distance() {
 		// bonus cross-check: GPU minkowski(p=2) == sqrt(GPU squared-L2 kernel)
 		let l2out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::kernels::gpu_pairwise_l2(
-			&GpuBuffer::upload(&q).unwrap(),
-			&GpuBuffer::upload(&t).unwrap(),
+			&{ let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
+			&{ let __up = &t; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub },
 			nq,
 			nt,
 			dim,
 			&l2out,
 		)
 		.unwrap();
-		let l2sq = l2out.download_vec().unwrap();
+		let l2sq = { let mut __dv = vec![0.0f64; l2out.n_floats()]; unsafe { l2out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
 		let l2root: Vec<f64> = l2sq.iter().map(|v| v.sqrt()).collect();
 		if close(&mink2, &l2root).is_some() {
 			failures.push("minkowski(p=2) != sqrt(l2_squared)".into());

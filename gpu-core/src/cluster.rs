@@ -184,7 +184,8 @@ pub fn gpu_fixed_radius_neighbors(
 	dim: usize,
 	eps: f64,
 ) -> Result<NeighborCsr, HipError> {
-	let eps_buf = GpuBuffer::upload(&[eps])?;
+	let eps_buf = GpuBuffer::alloc(1)?;
+	eps_buf.load(&[eps])?;
 	let count = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
 	fixed_radius_count(points, &eps_buf, n, dim, &count)?;
 
@@ -387,7 +388,8 @@ pub fn gpu_boruvka_mst(
 	n_nodes: usize,
 	n_edges: usize,
 ) -> Result<BoruvkaResult, HipError> {
-	let in_mst = GpuBuffer::zeros_bytes(n_edges)?;
+	let in_mst = GpuBuffer::alloc_bytes(n_edges)?;
+	in_mst.memset_zero(n_edges)?;
 	let parent = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
 	let best_edge = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
 	let best_w = GpuBuffer::alloc(n_nodes)?;
@@ -450,7 +452,8 @@ pub fn gpu_boruvka_mst(
 	let total_buf = GpuBuffer::alloc(1)?;
 	masked_weight_sum(edge_w, &in_mst, n_edges, &total_buf)?;
 	let mut tw = [0.0f64; 1];
-	total_buf.download(&mut tw)?;
+	unsafe { total_buf.download_async(&mut tw, std::ptr::null_mut()) }?;
+	crate::hip::device_synchronize()?;
 
 	Ok(BoruvkaResult { in_mst, total_weight: tw[0] })
 }
