@@ -88,17 +88,20 @@ fn main() -> Result<()> {
 	// (MOE_FFN) register into the same map once the gemma expert path is wired.
 	// A storage node (no GPU) probes CPU/disk only — no device is ever inited.
 	if args[1] == "serve" {
+		// Bind FIRST: a port conflict must fail in milliseconds, not after a
+		// full GPU probe (a crashlooping unit re-probing every 2s pegs the card).
+		let listener = std::net::TcpListener::bind(("0.0.0.0", recipe::wire::PORT))?;
 		let machine = recipe::probe::Machine::probe()?;
 		let info = recipe::wire::NodeInfo::probe();
 		let runners = std::collections::HashMap::new();
 		recipe::wire::Server::new(info, runners)
 			.machine(machine)
-			.serve(&format!("0.0.0.0:{}", recipe::wire::PORT))?;
+			.serve_bound(listener)?;
 		return Ok(());
 	}
 
 	// recipe install — probe this machine, write its config.ogdl entry, generate
-	// the systemd user unit from it, and copy the running binary to /usr/local/bin.
+	// the systemd user unit from it, and copy the running binary to ~/.local/bin.
 	if args[1] == "install" {
 		let machine = recipe::probe::Machine::probe()?;
 		recipe::probe::install(&machine)?;

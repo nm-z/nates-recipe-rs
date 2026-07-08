@@ -541,7 +541,12 @@ impl Server {
 	}
 
 	pub fn serve(self, addr: &str) -> Result<()> {
-		let listener = TcpListener::bind(addr)?;
+		self.serve_bound(TcpListener::bind(addr)?)
+	}
+
+	/// Serve on a caller-bound listener (bind-before-probe: the daemon binds 7845
+	/// before any expensive probing so a port conflict fails fast).
+	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {
 		let machine = self.machine.clone();
 		// Own entry lands in the registry file immediately; peers append as heard.
 		if let Some(m) = &machine {
@@ -555,9 +560,10 @@ impl Server {
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
 		eprintln!(
-			"recipe serve: {} ({}) on {addr} (ram {} MiB)",
+			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
+			listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
 			self.info.ram >> 20
 		);
 		self.serve_on(listener)

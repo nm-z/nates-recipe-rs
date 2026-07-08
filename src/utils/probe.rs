@@ -58,7 +58,10 @@ impl Machine {
 		// process claim (~all VRAM); an idle daemon must hold ~nothing.
 		if ngpu > 0 {
 			gpu_core::hip::set_device(0)?;
+			// Free the benches' birth claim AND trim: the freed claim otherwise sits
+			// as retained pool slack (threshold=max) and the idle daemon squats VRAM.
 			gpu_core::memory::release_run_backing();
+			gpu_core::memory::pool_trim();
 		}
 		let ram = mem_total()?;
 		eprintln!("recipe probe: measuring cpu (ddr5 + flops)");
@@ -461,7 +464,7 @@ pub fn service_unit(_config_ogdl: &str) -> String {
 		"Wants=network-online.target",
 		"",
 		"[Service]",
-		"ExecStart=/usr/local/bin/recipe serve",
+		"ExecStart=%h/.local/bin/recipe serve",
 		"Restart=always",
 		"RestartSec=2",
 		"",
@@ -478,7 +481,7 @@ fn service_path() -> Result<PathBuf> {
 }
 
 /// `recipe install`: write this machine's config.ogdl entry, generate the
-/// systemd user unit from it, and copy the running binary to /usr/local/bin.
+/// systemd user unit from it, and copy the running binary to ~/.local/bin.
 /// A permission failure on the system path is loud with the exact sudo command.
 pub fn install(machine: &Machine) -> Result<()> {
 	let cfg_text = write_config(std::slice::from_ref(machine));
@@ -493,7 +496,11 @@ pub fn install(machine: &Machine) -> Result<()> {
 	eprintln!("recipe install: wrote {}", svc.display());
 
 	let exe = std::env::current_exe()?;
-	let dest = Path::new("/usr/local/bin/recipe");
+	let home = std::env::var("HOME").expect("HOME unset");
+	let bin_dir = Path::new(&home).join(".local/bin");
+	std::fs::create_dir_all(&bin_dir).map_err(|e| anyhow::anyhow!("recipe install: mkdir {}: {e}", bin_dir.display()))?;
+	let dest = bin_dir.join("recipe");
+	let dest = dest.as_path();
 	match std::fs::copy(&exe, dest) {
 		Ok(_) => eprintln!("recipe install: copied {} -> {}", exe.display(), dest.display()),
 		Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
