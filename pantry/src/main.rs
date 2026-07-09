@@ -42,7 +42,7 @@ fn main() -> Result<()> {
 						.collect()
 				})
 				.collect();
-			let kinds = pantry::predict_kinds(&columns);
+			let kinds = pantry::predict_kinds(&columns)?;
 			for (h, k) in headers.iter().zip(kinds) {
 				if name.is_empty() {
 					println!("{h} -> {}", kind_name(k));

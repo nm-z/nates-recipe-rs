@@ -48,8 +48,10 @@ pub use model::{
 
 pub struct Recipe;
 
-#[allow(non_upper_case_globals)]
-pub static recipe: Recipe = Recipe;
+mod alias {
+	pub static RECIPE: super::Recipe = super::Recipe;
+}
+pub use alias::RECIPE as recipe;
 
 impl Recipe {
 	pub fn data(&self, path: &str) -> Data {

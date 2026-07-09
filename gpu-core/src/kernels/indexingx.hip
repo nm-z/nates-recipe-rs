@@ -1,11 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 
-// ── indexing-category GPU kernels (collision-safe indexingx_ / launch_indexingx_) ─
-// All compute in f64. Index inputs are i32 (int*). Oracles = CPU.
 
-// index_select / take (gather by i32 indices, row-major [rows,cols]) ──────────
-// out[i,:] = src[idx[i], :]   (i in [0,n), cols-wide rows)
 extern "C" __global__ void indexingx_index_select_kernel(
     const double* src, const int* idx, double* out, int n, int cols
 ) {
@@ -22,7 +18,6 @@ extern "C" void launch_indexingx_index_select(
     hipLaunchKernelGGL(indexingx_index_select_kernel, g, b, 0, s, src, idx, out, n, cols);
 }
 
-// where(cond, a, b): out[i] = cond[i] != 0 ? a[i] : b[i] ─────────────────────
 extern "C" __global__ void indexingx_where_kernel(
     const double* cond, const double* a, const double* b, double* out, int n
 ) {
@@ -36,8 +31,6 @@ extern "C" void launch_indexingx_where(
     hipLaunchKernelGGL(indexingx_where_kernel, g, b_, 0, s, cond, a, b, out, n);
 }
 
-// index_add: out (copy of base, [rows,cols]); out[idx[i],:] += src[i,:] ──────
-// Accumulates with atomicAdd so duplicate indices sum correctly.
 extern "C" __global__ void indexingx_index_add_kernel(
     double* out, const int* idx, const double* src, int n, int cols
 ) {
@@ -54,7 +47,6 @@ extern "C" void launch_indexingx_index_add(
     hipLaunchKernelGGL(indexingx_index_add_kernel, g, b, 0, s, out, idx, src, n, cols);
 }
 
-// diagonal (extract main diagonal of [n,n] matrix): out[i] = m[i*n+i] ────────
 extern "C" __global__ void indexingx_diagonal_kernel(const double* m, double* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = m[i * n + i];
@@ -64,8 +56,6 @@ extern "C" void launch_indexingx_diagonal(const double* m, double* out, int n, h
     hipLaunchKernelGGL(indexingx_diagonal_kernel, g, b, 0, s, m, out, n);
 }
 
-// take_along_axis (torch.gather along last dim): src [rows,cols], idx [rows,k] ─
-// out[i,j] = src[i, idx[i,j]]   (j in [0,k))
 extern "C" __global__ void indexingx_take_along_axis_kernel(
     const double* src, const int* idx, double* out, int rows, int cols, int k
 ) {
@@ -82,7 +72,6 @@ extern "C" void launch_indexingx_take_along_axis(
     hipLaunchKernelGGL(indexingx_take_along_axis_kernel, g, b, 0, s, src, idx, out, rows, cols, k);
 }
 
-// tril (lower triangle of [n,n], zero above main diag): out[i,j]= i>=j? m:0 ──
 extern "C" __global__ void indexingx_tril_kernel(const double* m, double* out, int n) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n * n) return;
@@ -95,7 +84,6 @@ extern "C" void launch_indexingx_tril(const double* m, double* out, int n, hipSt
     hipLaunchKernelGGL(indexingx_tril_kernel, g, b, 0, s, m, out, n);
 }
 
-// triu (upper triangle of [n,n], zero below main diag): out[i,j]= i<=j? m:0 ──
 extern "C" __global__ void indexingx_triu_kernel(const double* m, double* out, int n) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n * n) return;
@@ -108,10 +96,6 @@ extern "C" void launch_indexingx_triu(const double* m, double* out, int n, hipSt
     hipLaunchKernelGGL(indexingx_triu_kernel, g, b, 0, s, m, out, n);
 }
 
-// masked_select via hipcub::DeviceSelect::Flagged ───────────────────────────
-// in [n], flags [n] (u8: nonzero=keep); out [n] (worst-case), num_out written
-// to d_num (1 int). Caller allocates d_temp (size from _workspace_bytes) and
-// reads d_num back to host after syncing the stream.
 extern "C" size_t indexingx_masked_select_workspace_bytes(int n) {
     void* d_temp = nullptr;
     size_t temp_bytes = 0;

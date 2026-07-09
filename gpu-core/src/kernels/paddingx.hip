@@ -1,16 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── Padding kernels, f64. 1D (length L) and 2D (row-major H×W). ───────────────
-// Each thread owns ONE output element and maps it back to a source index per the
-// pad convention, or writes the constant value for constant-pad OOB.
-//
-//   constant : OOB -> cval
-//   reflect  : mirror WITHOUT repeating the edge  (abcd, pad2 left -> cb|abcd)
-//   replicate: clamp to [0,L-1] (edge)            (abcd, pad2 left -> aa|abcd)
-//   circular : wrap modulo L                      (abcd, pad2 left -> cd|abcd)
 
-// reflect a coordinate into [0, L-1] without repeating the boundary; loops so it
-// works for pad >= L. L>=2 required for reflect (matches PyTorch).
 __device__ __forceinline__ int reflect_idx(int p, int L) {
       if (L == 1) return 0;
       int period = 2 * L - 2;
@@ -29,8 +19,6 @@ __device__ __forceinline__ int circular_idx(int p, int L) {
       return q;
 }
 
-// ─────────────────────────── 1D ───────────────────────────
-// out length = L + lpad + rpad ; n = out length.
 extern "C" __global__ void paddingx_constant1d_kernel(
             const double* x, double* out, int L, int lpad, int n, double cval) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -55,9 +43,6 @@ extern "C" __global__ void paddingx_circular1d_kernel(
       if (i < n) out[i] = x[circular_idx(i - lpad, L)];
 }
 
-// ─────────────────────────── 2D ───────────────────────────
-// input H×W row-major; output OH×OW with OH=H+tpad+bpad, OW=W+lpad+rpad.
-// n = OH*OW ; thread index -> (or,oc).
 extern "C" __global__ void paddingx_constant2d_kernel(
             const double* x, double* out, int H, int W, int tpad, int lpad,
             int OH, int OW, int n, double cval) {
@@ -99,7 +84,6 @@ extern "C" __global__ void paddingx_circular2d_kernel(
       }
 }
 
-// ─────────────────────────── launchers ───────────────────────────
 #define G(n) dim3 grid(((n) + 255) / 256)
 extern "C" void launch_paddingx_constant1d(
             const double* x, double* out, int L, int lpad, int n, double cval, hipStream_t s) {

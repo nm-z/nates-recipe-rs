@@ -1,0 +1,469 @@
+    Checking pantry v0.1.0 (/home/nate/Desktop/nates-recipe-rs/pantry)
+    Checking recipe-infer v0.1.0 (/home/nate/Desktop/nates-recipe-rs/recipe-infer)
+    Checking ogdl v0.1.0 (/home/nate/Desktop/nates-recipe-rs/ogdl)
+    Checking gpu-core v0.1.0 (/home/nate/Desktop/nates-recipe-rs/gpu-core)
+    Checking recipe v0.1.0 (/home/nate/Desktop/nates-recipe-rs)
+warning: associated function `new` is never used
+  --> src/utils/train.rs:95:16
+   |
+94 | impl StepScalars {
+   | ---------------- associated function in this implementation
+95 |     pub(crate) fn new(lr: f64, n: usize) -> StepScalars {
+   |                   ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `attn_backward` and `backward_step` are never used
+   --> src/utils/train.rs:280:5
+    |
+105 | impl ModelInner {
+    | --------------- methods in this implementation
+...
+280 |     fn attn_backward(
+    |        ^^^^^^^^^^^^^
+...
+370 |     pub(crate) fn backward_step(
+    |                   ^^^^^^^^^^^^^
+
+warning: unused `Result` that must be used
+   --> src/utils/model.rs:384:3
+    |
+384 |         recipe_infer::write_ogdl(&path, &text);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+384 |         let _ = recipe_infer::write_ogdl(&path, &text);
+    |         +++++++
+
+warning: `recipe` (lib) generated 3 warnings
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+   --> src/utils/model.rs:893:45
+    |
+893 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+    |                                                   ^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+893 |         forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+    |                                                   +++++++++
+
+error[E0308]: mismatched types
+   --> src/utils/model.rs:893:51
+    |
+893 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+    |         ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+    |         |
+    |         arguments to this function are incorrect
+    |
+    = note: expected reference `&recipe_infer::Scratch`
+               found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+   --> recipe-infer/src/forward.rs:181:8
+    |
+181 | pub fn forward_into(
+    |        ^^^^^^^^^^^^
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+   --> src/utils/model.rs:895:28
+    |
+895 |         let p = download_vec(&sc.acts[last], n);
+    |                                  ^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+895 |         let p = download_vec(&sc.unwrap().acts[last], n);
+    |                                  +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+   --> src/utils/model.rs:931:17
+    |
+931 |         let out = &sc.acts[last];
+    |                       ^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+931 |         let out = &sc.unwrap().acts[last];
+    |                       +++++++++
+
+error[E0609]: no field `metric_scalar` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+   --> src/utils/model.rs:934:65
+    |
+934 |                 metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar);
+    |                                                                             ^^^^^^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+934 |                 metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.unwrap().metric_scalar);
+    |                                                                             +++++++++
+
+error[E0308]: mismatched types
+   --> src/utils/model.rs:934:42
+    |
+934 |                 metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar);
+    |                 ---------------                      ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+    = note: expected reference `&recipe_infer::Scratch`
+               found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+   --> recipe-infer/src/forward.rs:7:8
+    |
+  7 | pub fn metric_gpu_into(
+    |        ^^^^^^^^^^^^^^^
+
+error[E0609]: no field `metric_scalar` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+   --> src/utils/model.rs:935:39
+    |
+935 |             let v = sign * download_scalar(&sc.metric_scalar) / div;
+    |                                                ^^^^^^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+935 |             let v = sign * download_scalar(&sc.unwrap().metric_scalar) / div;
+    |                                                +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1009:49
+     |
+1009 |         forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
+     |                                                       ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1009 |         forward_into(&params, &xbuf, None, n, &sc_ref.unwrap().acts, &sc_ref);
+     |                                                       +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1009:55
+     |
+1009 |         forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
+     |         ------------                                        ^^^^^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1010:38
+     |
+1010 |         let out_ref = download_vec(&sc_ref.acts[last], n);
+     |                                            ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1010 |         let out_ref = download_vec(&sc_ref.unwrap().acts[last], n);
+     |                                            +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1016:45
+     |
+1016 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                                                   ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1016 |         forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+     |                                                   +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1016:51
+     |
+1016 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |         ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1017:35
+     |
+1017 |         let out_into = download_vec(&sc.acts[last], n);
+     |                                         ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1017 |         let out_into = download_vec(&sc.unwrap().acts[last], n);
+     |                                         +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1044:45
+     |
+1044 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                                                   ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1044 |         forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+     |                                                   +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1044:51
+     |
+1044 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |         ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1045:49
+     |
+1045 |         model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
+     |               -------------                           ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |               |
+     |               arguments to this method are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: method defined here
+    --> src/utils/train.rs:370:16
+     |
+ 370 |     pub(crate) fn backward_step(
+     |                   ^^^^^^^^^^^^^
+...
+ 376 |         sc: &Scratch,
+     |         ------------
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1052:47
+     |
+1052 |                 forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                                                           ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1052 |                 forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+     |                                                           +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1052:53
+     |
+1052 |                 forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                 ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |                 |
+     |                 arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1053:51
+     |
+1053 |                 model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
+     |                       -------------                           ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |                       |
+     |                       arguments to this method are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: method defined here
+    --> src/utils/train.rs:370:16
+     |
+ 370 |     pub(crate) fn backward_step(
+     |                   ^^^^^^^^^^^^^
+...
+ 376 |         sc: &Scratch,
+     |         ------------
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1054:34
+     |
+1054 |                 kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
+     |                                              ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1054 |                 kernels::gpu_ss_res_into(&sc.unwrap().acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
+     |                                              +++++++++
+
+error[E0609]: no field `metric_scalar` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1054:60
+     |
+1054 |                 kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
+     |                                                                        ^^^^^^^^^^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1054 |                 kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.unwrap().metric_scalar).expect("ss_res");
+     |                                                                        +++++++++
+
+error[E0609]: no field `metric_scalar` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1055:40
+     |
+1055 |                 r2s.push(1.0 - download_scalar(&sc.metric_scalar) / ss_tot);
+     |                                                    ^^^^^^^^^^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1055 |                 r2s.push(1.0 - download_scalar(&sc.unwrap().metric_scalar) / ss_tot);
+     |                                                    +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1152:45
+     |
+1152 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                                                   ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1152 |         forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+     |                                                   +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1152:51
+     |
+1152 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |         ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1153:49
+     |
+1153 |         model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
+     |               -------------                           ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |               |
+     |               arguments to this method are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: method defined here
+    --> src/utils/train.rs:370:16
+     |
+ 370 |     pub(crate) fn backward_step(
+     |                   ^^^^^^^^^^^^^
+...
+ 376 |         sc: &Scratch,
+     |         ------------
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1168:45
+     |
+1168 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |                                                   ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1168 |         forward_into(&params, &xbuf, None, n, &sc.unwrap().acts, &sc);
+     |                                                   +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1168:51
+     |
+1168 |         forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+     |         ------------                                    ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: function defined here
+    --> recipe-infer/src/forward.rs:181:8
+     |
+ 181 | pub fn forward_into(
+     |        ^^^^^^^^^^^^
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1199:8
+     |
+1199 |             &sc.acts[last],
+     |                 ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1199 |             &sc.unwrap().acts[last],
+     |                 +++++++++
+
+error[E0308]: mismatched types
+    --> src/utils/model.rs:1204:4
+     |
+1197 |         ModelInner::loss_grad_into(
+     |         -------------------------- arguments to this function are incorrect
+...
+1204 |             &sc,
+     |             ^^^ expected `&Scratch`, found `&Result<Scratch, Error>`
+     |
+     = note: expected reference `&recipe_infer::Scratch`
+                found reference `&std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+note: associated function defined here
+    --> src/utils/train.rs:106:16
+     |
+ 106 |     pub(crate) fn loss_grad_into(
+     |                   ^^^^^^^^^^^^^^
+...
+ 113 |         sc: &Scratch,
+     |         ------------
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1214:11
+     |
+1214 |                         &sc.acts[l],
+     |                             ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1214 |                         &sc.unwrap().acts[l],
+     |                             +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1223:11
+     |
+1223 |                         &sc.acts[l],
+     |                             ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1223 |                         &sc.unwrap().acts[l],
+     |                             +++++++++
+
+error[E0609]: no field `acts` on type `std::result::Result<recipe_infer::Scratch, anyhow::Error>`
+    --> src/utils/model.rs:1232:48
+     |
+1232 |             let a_prev = if l == 0 { &xbuf } else { &sc.acts[l - 1] };
+     |                                                         ^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1232 |             let a_prev = if l == 0 { &xbuf } else { &sc.unwrap().acts[l - 1] };
+     |                                                         +++++++++
+
+Some errors have detailed explanations: E0308, E0609.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `recipe` (lib test) due to 32 previous errors

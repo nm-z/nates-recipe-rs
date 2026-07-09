@@ -33,7 +33,6 @@ pub struct DataInner {
 	target_names: Vec<String>,
 	pub(crate) attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
-	targets: Vec<usize>,
 	sources: Vec<String>,
 	test_path: Option<String>,
 	split_frac: Option<f64>,
@@ -41,17 +40,13 @@ pub struct DataInner {
 	raw_test_rows: Option<Vec<Vec<String>>>,
 	raw_test_headers: Option<Vec<String>>,
 	pre_kinds: pantry::encode::PreKinds,
+	deferred: Option<anyhow::Error>,
 }
 
 impl std::ops::Deref for Data {
 	type Target = DataInner;
 	fn deref(&self) -> &DataInner {
 		&self.inner
-	}
-}
-impl std::ops::DerefMut for Data {
-	fn deref_mut(&mut self) -> &mut DataInner {
-		&mut self.inner
 	}
 }
 pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
@@ -102,19 +97,19 @@ fn is_safetensors(path: &str) -> bool {
 	std::path::Path::new(path).extension().and_then(|e| e.to_str()) == Some("safetensors")
 }
 
-fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
-	let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("safetensors: read {path}: {e}"));
+fn safetensors_to_table(path: &str) -> anyhow::Result<(Vec<Attr>, Vec<Vec<String>>)> {
+	let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
 	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
-		.unwrap_or_else(|e| panic!("safetensors: {path}: {e}"));
-	assert!(!tensors.is_empty(), "safetensors: {path} has no tensors");
-	let n = tensors[0].1.first().copied().unwrap_or_else(|| {
-		panic!("safetensors: tensor '{}' has no leading row dim", tensors[0].0)
-	});
+		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
+	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
+	let n = tensors[0].1.first().copied().ok_or_else(|| {
+		anyhow::anyhow!("safetensors: tensor '{}' has no leading row dim", tensors[0].0)
+	})?;
 	let mut attrs = Vec::new();
 	let mut cols: Vec<Vec<f64>> = Vec::new();
 	for (name, shape, vals) in &tensors {
 		let leading = shape.first().copied().unwrap_or(0);
-		assert_eq!(leading, n, "safetensors: tensor '{name}' leading dim {leading} != {n}");
+		anyhow::ensure!(leading == n, "safetensors: tensor '{name}' leading dim {leading} != {n}");
 		let width = shape.iter().skip(1).product::<usize>().max(1);
 		for c in 0..width {
 			let aname = if width == 1 { name.clone() } else { format!("{name}:{c}") };
@@ -125,7 +120,7 @@ fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 	let rows = (0..n)
 		.map(|i| cols.iter().map(|col| format!("{}", col[i])).collect())
 		.collect();
-	(attrs, rows)
+	Ok((attrs, rows))
 }
 
 impl Data {
@@ -136,7 +131,6 @@ impl Data {
 				target_names: Vec::new(),
 				attrs: Vec::new(),
 				rows: Vec::new(),
-				targets: Vec::new(),
 				sources: Vec::new(),
 				test_path: None,
 				split_frac: None,
@@ -144,6 +138,7 @@ impl Data {
 				raw_test_rows: None,
 				raw_test_headers: None,
 				pre_kinds: Vec::new(),
+				deferred: None,
 			}),
 		};
 		data.set(path)
@@ -156,11 +151,18 @@ impl Data {
 			self.inner.attrs = attrs;
 			self.inner.rows = rows;
 		} else if is_safetensors(path) {
-			let (attrs, rows) = safetensors_to_table(path);
-			self.inner.attrs = attrs;
-			self.inner.rows = rows;
+			match safetensors_to_table(path) {
+				Ok((attrs, rows)) => {
+					self.inner.attrs = attrs;
+					self.inner.rows = rows;
+				}
+				Err(e) => self.inner.defer(e),
+			}
 		} else {
-			self.inner.pre_kinds.extend(pantry::detect_kinds(path));
+			match pantry::detect_kinds(path) {
+				Ok(kinds) => self.inner.pre_kinds.extend(kinds),
+				Err(e) => self.inner.defer(e),
+			}
 		}
 		self
 	}
@@ -168,23 +170,6 @@ impl Data {
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.inner.target_names = t.into_targets();
 		self.inner.target = self.inner.target_names.first().cloned().unwrap_or_default();
-		if !self.inner.attrs.is_empty() {
-			let attrs = &self.inner.attrs;
-			let targets = self
-				.inner
-				.target_names
-				.iter()
-				.map(|name| {
-					attrs
-						.iter()
-						.position(|a| a.name == *name)
-						.unwrap_or_else(|| {
-							panic!("Data::target: no attribute named '{name}'")
-						})
-				})
-				.collect();
-			self.inner.targets = targets;
-		}
 		if let Some(tp) = &self.inner.test_path {
 			if let Ok((headers, rows)) = crate::data::read_raw_csv(std::path::Path::new(tp)) {
 				if !headers.is_empty() {
@@ -222,10 +207,20 @@ impl DataInner {
 		self.sources.join(", ")
 	}
 
+	fn defer(&mut self, e: anyhow::Error) {
+		if self.deferred.is_none() {
+			self.deferred = Some(e);
+		}
+	}
+
 	pub fn datasets(&self) -> (Dataset, Option<Dataset>) {
-		let (train, test, attrs) = self.prepare();
+		self.try_datasets().expect("Data::datasets")
+	}
+
+	pub(crate) fn try_datasets(&self) -> anyhow::Result<(Dataset, Option<Dataset>)> {
+		let (train, test, attrs) = self.prepare()?;
 		self.print_summary(&train, test.as_ref(), &attrs);
-		(train, test)
+		Ok((train, test))
 	}
 
 	fn feature_type_counts(&self, attrs: &[Attr]) -> Vec<(&'static str, usize)> {
@@ -331,7 +326,7 @@ impl DataInner {
 				eprintln!("        {count} × [{}]", range.join(", "));
 			}
 		}
-		eprintln!("    {} features → model", train.x.ncols(),);
+		eprintln!("    {} features -> model", train.x.ncols(),);
 		if let Some(test) = test {
 			if let Some(tp) = &self.test_path {
 				let test_raw_cols =
@@ -348,7 +343,7 @@ impl DataInner {
 					disk_size(tp),
 				);
 				print_types("        ");
-				eprintln!("    {} features → model", test.x.ncols(),);
+				eprintln!("    {} features -> model", test.x.ncols(),);
 			} else if self.split_frac.is_some() {
 				eprintln!(
 					"\x1b[32msplit\x1b[0m  {} train / {} test",
@@ -362,35 +357,43 @@ impl DataInner {
 		}
 	}
 
-	fn prepare(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
+	fn prepare(&self) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
+		if let Some(e) = &self.deferred {
+			anyhow::bail!("{e:#}");
+		}
 		let (mut train, mut test, attrs) = if self.attrs.is_empty() {
-			self.prepare_table()
+			self.prepare_table()?
 		} else {
-			let (tr, te) = self.prepare_arff();
+			let (tr, te) = self.prepare_arff()?;
 			(tr, te, self.attrs.clone())
 		};
 		pantry::encode::clean_dataset(&mut train);
 		if let Some(t) = test.as_mut() {
 			pantry::encode::clean_dataset(t);
 		}
-		assert!(train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
-		assert!(train.x.ncols() > 0, "dataset has 0 feature columns");
+		anyhow::ensure!(train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
+		anyhow::ensure!(train.x.ncols() > 0, "dataset has 0 feature columns");
 		let k = train.n_targets;
-		assert_eq!(
-			train.y.len(),
-			train.x.nrows() * k,
+		anyhow::ensure!(
+			train.y.len() == train.x.nrows() * k,
 			"x/y dimension mismatch: {} rows × {k} targets but y has {} elements",
 			train.x.nrows(),
 			train.y.len(),
 		);
-		(train, test, attrs)
+		Ok((train, test, attrs))
 	}
 
-	fn prepare_arff(&self) -> (Dataset, Option<Dataset>) {
+	fn prepare_arff(&self) -> anyhow::Result<(Dataset, Option<Dataset>)> {
+		let names: Vec<String> = self.attrs.iter().map(|a| a.name.clone()).collect();
+		let resolved = self.resolve_targets(&names, None)?;
+		let targets: Vec<usize> = resolved
+			.iter()
+			.map(|t| names.iter().position(|n| n == t).expect("resolved from names"))
+			.collect();
 		pantry::encode::prepare_arff_data(
 			&self.attrs,
 			&self.rows,
-			&self.targets,
+			&targets,
 			&self.exclude,
 			self.split_frac,
 			self.test_path.as_deref(),
@@ -398,7 +401,7 @@ impl DataInner {
 		)
 	}
 
-	fn prepare_table(&self) -> (Dataset, Option<Dataset>, Vec<Attr>) {
+	fn prepare_table(&self) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
 		pantry::encode::prepare_table_data(
 			&self.sources,
 			self.test_path.as_deref(),
@@ -414,7 +417,7 @@ impl DataInner {
 		&self,
 		set_names: &[String],
 		test_names: Option<&[String]>,
-	) -> Vec<String> {
+	) -> anyhow::Result<Vec<String>> {
 		if !self.target_names.is_empty() {
 			return self
 				.target_names
@@ -431,30 +434,30 @@ impl DataInner {
 							)
 						})
 						.cloned()
-						.unwrap_or_else(|| {
+						.ok_or_else(|| {
 							let avail: Vec<&str> =
 								set_names.iter().map(|s| s.as_str()).collect();
-							panic!(
+							anyhow::anyhow!(
 								"target '{want}' not found — available columns: {}",
 								avail.join(", ")
-							);
+							)
 						})
 				})
 				.collect();
 		}
 		if let Some(tn) = test_names {
 			if set_names.len() == tn.len() + 1 {
-				return vec![set_names.last().expect("set has columns").clone()];
+				return Ok(vec![set_names.last().expect("set has columns").clone()]);
 			}
 		}
-		Vec::new()
+		Ok(Vec::new())
 	}
 }
 
 impl crate::model::RunData for DataInner {
-	fn prepared(&self) -> crate::model::Prepared<'_> {
-		let (train, _test) = self.datasets();
-		crate::model::Prepared::Owned(train)
+	fn prepared(&self) -> anyhow::Result<crate::model::Prepared<'_>> {
+		let (train, _test) = self.try_datasets()?;
+		Ok(crate::model::Prepared::Owned(train))
 	}
 	fn target_names(&self) -> Vec<String> {
 		self.target_names.clone()
@@ -471,7 +474,7 @@ impl crate::model::RunData for DataInner {
 }
 
 impl crate::model::RunData for Data {
-	fn prepared(&self) -> crate::model::Prepared<'_> {
+	fn prepared(&self) -> anyhow::Result<crate::model::Prepared<'_>> {
 		self.inner.prepared()
 	}
 	fn target_names(&self) -> Vec<String> {
@@ -511,7 +514,7 @@ mod safetensors_source_tests {
 		std::fs::write(&path, &bytes).expect("write temp safetensors");
 		let p = path.to_str().expect("temp path utf8");
 
-		let (attrs, rows) = safetensors_to_table(p);
+		let (attrs, rows) = safetensors_to_table(p).expect("safetensors table");
 		assert_eq!(
 			attrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
 			vec!["x:0", "x:1", "y"]

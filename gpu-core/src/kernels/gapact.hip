@@ -1,8 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// ── Gap activations the swarm did not ship (forward + backward), f64 ─────────
-// Unique symbol names (gapact_*) to avoid any collision with existing kernels.
-// Backward kernels take the PRE-activation x. Hyperparameters are runtime args.
 
 extern "C" __global__ void gapact_elu_kernel(const double* x, double* out, int n, const double* alpha_) {
     double alpha = *alpha_;

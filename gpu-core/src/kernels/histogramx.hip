@@ -1,15 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// ── histogram-category kernels (unique histogramx_ / launch_histogramx_ names) ──
-//
-// histc:    count f64 values into B equal-width bins over [lo, hi].
-//           Convention: bin index = floor((x - lo) / w), w = (hi - lo) / B.
-//           Out-of-range values (x < lo or x > hi) are dropped; x == hi maps to
-//           the last bin (right edge closed, matches numpy/torch histc). Counts
-//           accumulate via atomicAdd into a zero-initialized int buffer.
-//
-// bincount: count occurrences of non-negative int labels into out[0..n_bins).
-//           out_len must be >= max(label)+1; labels >= out_len are dropped.
 
 extern "C" __global__ void histogramx_histc_kernel(
       const double* x, int* counts, int n, double lo, double hi, int bins) {
@@ -19,7 +9,7 @@ extern "C" __global__ void histogramx_histc_kernel(
       if (v < lo || v > hi) return;
       double w = (hi - lo) / (double)bins;
       int b = (int)((v - lo) / w);
-      if (b == bins) b = bins - 1;          // x == hi -> last bin
+      if (b == bins) b = bins - 1;
       if (b < 0) b = 0;
       if (b >= bins) b = bins - 1;
       atomicAdd(&counts[b], 1);

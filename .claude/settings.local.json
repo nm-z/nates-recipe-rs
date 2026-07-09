@@ -1,8 +1,8 @@
 {
-  "outputStyle": "Proactive",
   "skillOverrides": {
     "arduino-due": "off",
     "csun-apporto-login": "off",
     "grill-me": "off"
-  }
+  },
+  "outputStyle": "default"
 }

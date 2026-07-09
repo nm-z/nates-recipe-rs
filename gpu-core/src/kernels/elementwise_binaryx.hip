@@ -1,9 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// ── Missing elementwise-binary math ops, f64 (collision-safe names) ───────────
-// Two input arrays a,b -> out. Authoritative numpy/torch/IEEE conventions baked
-// into the expression so the CPU oracle in prove_elementwise_binary.rs matches.
 #define EB(fn, expr)                                                                       \
     extern "C" __global__ void elementwise_binaryx_##fn##_kernel(                          \
             const double* a, const double* b, double* out, int n) {                        \

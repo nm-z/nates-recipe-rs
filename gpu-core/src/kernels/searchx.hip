@@ -2,28 +2,16 @@
 #include <float.h>
 #include <math.h>
 
-// ── "search" category kernels, f64 in / i32 out (collision-safe searchx_/launch_searchx_) ─
-// Binary-search family, membership, find, sortedness, arg-extrema, signal extrema.
-// Index outputs are i32 and are proven by EXACT equality against a CPU oracle.
-//
-// searchsorted(side): parallel per-needle binary search into a sorted array `a`.
-//   side==0 (left  / numpy side='left'  / lower_bound): first i with a[i] >= v
-//   side==1 (right / numpy side='right' / upper_bound): first i with a[i] >  v
-// This one kernel backs searchsorted, lower_bound, upper_bound, binary_search,
-// digitize and bucketize; each gets its OWN CPU oracle in the Rust harness
-// (the `right`/`side` conventions differ between numpy and torch).
 
 extern "C" __global__ void searchx_searchsorted_kernel(
             const double* a, int na, const double* v, int* out, int nv, int side) {
       int t = blockIdx.x * blockDim.x + threadIdx.x;
       if (t >= nv) return;
       double key = v[t];
-      int lo = 0, hi = na;          // search in [lo, hi)
+      int lo = 0, hi = na;
       while (lo < hi) {
             int mid = lo + ((hi - lo) >> 1);
             double am = a[mid];
-            // side==0: move right while a[mid] <  key  -> lower_bound
-            // side==1: move right while a[mid] <= key  -> upper_bound
             bool go_right = (side == 0) ? (am < key) : (am <= key);
             if (go_right) lo = mid + 1; else hi = mid;
       }
@@ -35,7 +23,6 @@ extern "C" void launch_searchx_searchsorted(
       hipLaunchKernelGGL(searchx_searchsorted_kernel, grid, block, 0, s, a, na, v, out, nv, side);
 }
 
-// isin: for each x[i], 1 if present in sorted haystack `a` else 0. Binary search.
 extern "C" __global__ void searchx_isin_kernel(
             const double* a, int na, const double* x, int* out, int nx) {
       int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -54,9 +41,6 @@ extern "C" void launch_searchx_isin(
       hipLaunchKernelGGL(searchx_isin_kernel, grid, block, 0, s, a, na, x, out, nx);
 }
 
-// nonzero: compact indices i where x[i] != 0, in increasing order.
-// Single-block sequential scan (deterministic order). out[] holds the indices,
-// cnt[0] holds how many were written. Mirrors the scanx.hip sequential contract.
 extern "C" __global__ void searchx_nonzero_kernel(
             const double* x, int n, int* out, int* cnt) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -71,7 +55,6 @@ extern "C" void launch_searchx_nonzero(
       hipLaunchKernelGGL(searchx_nonzero_kernel, g, b, 0, s, x, n, out, cnt);
 }
 
-// find: first index i where x[i] == target, else n. Sequential (first occurrence).
 extern "C" __global__ void searchx_find_kernel(
             const double* x, int n, double target, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -86,7 +69,6 @@ extern "C" void launch_searchx_find(
       hipLaunchKernelGGL(searchx_find_kernel, g, b, 0, s, x, n, target, out);
 }
 
-// find_n: first start index of a run of k consecutive elements == target, else n.
 extern "C" __global__ void searchx_find_n_kernel(
             const double* x, int n, double target, int k, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -104,7 +86,6 @@ extern "C" void launch_searchx_find_n(
       hipLaunchKernelGGL(searchx_find_n_kernel, g, b, 0, s, x, n, target, k, out);
 }
 
-// is_sorted: out[0] = 1 if x is non-decreasing, else 0.
 extern "C" __global__ void searchx_is_sorted_kernel(const double* x, int n, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
             int ok = 1;
@@ -117,9 +98,6 @@ extern "C" void launch_searchx_is_sorted(const double* x, int n, int* out, hipSt
       hipLaunchKernelGGL(searchx_is_sorted_kernel, g, b, 0, s, x, n, out);
 }
 
-// is_sorted_until: index of the first element that breaks non-decreasing order
-// (the first i with x[i] < x[i-1]); n if fully sorted. Same value as
-// thrust::is_sorted_until's iterator position. partition_point shares this kernel.
 extern "C" __global__ void searchx_is_sorted_until_kernel(const double* x, int n, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
             int idx = n;
@@ -132,16 +110,13 @@ extern "C" void launch_searchx_is_sorted_until(const double* x, int n, int* out,
       hipLaunchKernelGGL(searchx_is_sorted_until_kernel, g, b, 0, s, x, n, out);
 }
 
-// partition_point: on a range partitioned so a prefix satisfies pred (x[i] < pivot)
-// and the suffix does not, return the first index where the predicate is false.
-// Binary search (the range is partitioned, not necessarily sorted by value).
 extern "C" __global__ void searchx_partition_point_kernel(
             const double* x, int n, double pivot, int* out) {
       int lo = 0, hi = n;
       if (blockIdx.x == 0 && threadIdx.x == 0) {
             while (lo < hi) {
                   int mid = lo + ((hi - lo) >> 1);
-                  if (x[mid] < pivot) lo = mid + 1; else hi = mid;   // pred = (x<pivot)
+                  if (x[mid] < pivot) lo = mid + 1; else hi = mid;
             }
             out[0] = lo;
       }
@@ -152,7 +127,6 @@ extern "C" void launch_searchx_partition_point(
       hipLaunchKernelGGL(searchx_partition_point_kernel, g, b, 0, s, x, n, pivot, out);
 }
 
-// mismatch: first index i where a[i] != b[i], else n (thrust::mismatch).
 extern "C" __global__ void searchx_mismatch_kernel(
             const double* a, const double* b, int n, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -167,11 +141,6 @@ extern "C" void launch_searchx_mismatch(
       hipLaunchKernelGGL(searchx_mismatch_kernel, g, b1, 0, s, a, b, n, out);
 }
 
-// arg-extrema. mode selects the comparison; all return the index of the FIRST
-//   occurrence of the extreme element (BLAS/thrust convention).
-//   mode 0 argmax (max value)        1 argmin (min value)
-//   mode 2 idamax (max |value|)      3 idamin (min |value|)
-// max_element == argmax, min_element == argmin (same kernel, mode 0/1).
 extern "C" __global__ void searchx_argextreme_kernel(
             const double* x, int n, int mode, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -191,7 +160,6 @@ extern "C" void launch_searchx_argextreme(
       hipLaunchKernelGGL(searchx_argextreme_kernel, g, b, 0, s, x, n, mode, out);
 }
 
-// minmax_element: out[0]=argmin index, out[1]=argmax index (first occurrences).
 extern "C" __global__ void searchx_minmax_element_kernel(const double* x, int n, int* out) {
       if (blockIdx.x == 0 && threadIdx.x == 0) {
             int lo = 0, hi = 0; double mn = x[0], mx = x[0];
@@ -208,12 +176,6 @@ extern "C" void launch_searchx_minmax_element(const double* x, int n, int* out, 
       hipLaunchKernelGGL(searchx_minmax_element_kernel, g, b, 0, s, x, n, out);
 }
 
-// argrel/find_peaks: strict local extrema with order=1 (compare to both
-// immediate neighbors). Produces a 0/1 i32 mask over interior + endpoints.
-//   mode 0 argrelmax / find_peaks : x[i] > x[i-1] && x[i] > x[i+1]
-//   mode 1 argrelmin              : x[i] < x[i-1] && x[i] < x[i+1]
-//   mode 2 argrelextrema          : either of the above
-// Endpoints (i==0, i==n-1) are never extrema (scipy.signal default, no wrap).
 extern "C" __global__ void searchx_argrel_kernel(const double* x, int n, int mode, int* mask) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;

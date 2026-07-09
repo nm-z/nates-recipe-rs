@@ -1,18 +1,13 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// ── f32 neural network hot-path kernels ────────────────────────────────────
-// All kernels use float (not double). Launchers take float* typed pointers.
-// f16 kernels work on __half stored as uint16_t.
 
 #define GRID256(n) dim3 block(256); dim3 grid(((n) + 255) / 256)
 
-// ── ReLU f32 ───────────────────────────────────────────────────────────────
 extern "C" __global__ void relu_f32_kernel(const float* x, float* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = x[i] > 0.0f ? x[i] : 0.0f;
 }
-// backward: grad * (act > 0)
 extern "C" __global__ void relu_backward_f32_kernel(const float* grad, const float* act, float* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = act[i] > 0.0f ? grad[i] : 0.0f;
@@ -24,7 +19,6 @@ extern "C" void launch_relu_backward_f32(const float* grad, const float* act, fl
       GRID256(n); hipLaunchKernelGGL(relu_backward_f32_kernel, grid, block, 0, stream, grad, act, out, n);
 }
 
-// ── GELU f32 (tanh approximation matching the f64 version) ────────────────
 #define GELU_COEFF_F 0.7978845608028654f
 #define GELU_CUBIC_F 0.044715f
 
@@ -54,7 +48,6 @@ extern "C" void launch_gelu_backward_f32(const float* grad, const float* x, floa
       GRID256(n); hipLaunchKernelGGL(gelu_backward_f32_kernel, grid, block, 0, stream, grad, x, out, n);
 }
 
-// ── Bias add f32: out[i] = x[i] + bias[i % cols] ─────────────────────────
 extern "C" __global__ void bias_add_f32_kernel(const float* x, const float* bias, float* out, int rows, int cols) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < rows * cols) out[i] = x[i] + bias[i % cols];
@@ -64,8 +57,6 @@ extern "C" void launch_bias_add_f32(const float* x, const float* bias, float* ou
       GRID256(n); hipLaunchKernelGGL(bias_add_f32_kernel, grid, block, 0, stream, x, bias, out, rows, cols);
 }
 
-// ── Repeat rows f32: broadcast src[cols] into dst[total] (fill dst with repeating src) ──
-// Used in gpu_linear_f32 to pre-fill bias before sgemm beta=1.
 extern "C" __global__ void repeat_rows_f32_kernel(const float* src, float* dst, int cols, int total) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < total) dst[i] = src[i % cols];
@@ -74,8 +65,6 @@ extern "C" void launch_repeat_rows_f32(const float* src, float* dst, int cols, i
       GRID256(total); hipLaunchKernelGGL(repeat_rows_f32_kernel, grid, block, 0, stream, src, dst, cols, total);
 }
 
-// ── LayerNorm f32 ─────────────────────────────────────────────────────────
-// One block per row. gamma/beta are required (never null in this API).
 extern "C" __global__ void layernorm_f32_kernel(
       const float* x, float* out,
       const float* gamma, const float* beta,
@@ -131,8 +120,6 @@ extern "C" void launch_layernorm_f32(
             x, out, gamma, beta, rows, cols, eps);
 }
 
-// ── LayerNorm backward f32 ────────────────────────────────────────────────
-// One block per row. Accumulates grad_gamma/beta via atomicAdd.
 extern "C" __global__ void layernorm_backward_f32_kernel(
       const float* grad_y, const float* x, const float* gamma,
       float* grad_x, float* grad_gamma, float* grad_beta,
@@ -211,7 +198,6 @@ extern "C" void launch_layernorm_backward_f32(
             grad_y, x, gamma, grad_x, grad_gamma, grad_beta, rows, cols, eps);
 }
 
-// ── Avg pool 2D f32 ───────────────────────────────────────────────────────
 extern "C" __global__ void avg_pool_2d_f32_kernel(
       const float* input, float* output,
       int N, int C, int H, int W, int kH, int kW, int sH, int sW, int outH, int outW
@@ -239,7 +225,6 @@ extern "C" void launch_avg_pool_2d_f32(
             input, output, N, C, H, W, kH, kW, sH, sW, outH, outW);
 }
 
-// ── Avg pool 2D backward f32 ──────────────────────────────────────────────
 extern "C" __global__ void avg_pool_2d_backward_f32_kernel(
       const float* grad_out, float* grad_in,
       int N, int C, int H, int W, int kH, int kW, int sH, int sW, int outH, int outW
@@ -271,8 +256,6 @@ extern "C" void launch_avg_pool_2d_backward_f32(
             grad_out, grad_in, N, C, H, W, kH, kW, sH, sW, outH, outW);
 }
 
-// ── Max pool 2D f32 ───────────────────────────────────────────────────────
-// out_idx stores the flat index (ih*W+iw) as float bits encoding an int.
 extern "C" __global__ void max_pool_2d_f32_kernel(
       const float* input, float* out_vals, float* out_idx,
       int N, int C, int H, int W, int kH, int kW, int sH, int sW, int outH, int outW
@@ -304,7 +287,6 @@ extern "C" void launch_max_pool_2d_f32(
             input, out_vals, out_idx, N, C, H, W, kH, kW, sH, sW, outH, outW);
 }
 
-// ── Max pool 2D backward f32 ──────────────────────────────────────────────
 extern "C" __global__ void max_pool_2d_backward_f32_kernel(
       const float* grad_out, const float* indices, float* grad_in,
       int N, int C, int outH, int outW, int HW
@@ -325,8 +307,6 @@ extern "C" void launch_max_pool_2d_backward_f32(
             grad_out, indices, grad_in, N, C, outH, outW, H * W);
 }
 
-// ── LSTM cell f32 ─────────────────────────────────────────────────────────
-// gates layout per sample: [forget(hs), input(hs), cell_cand(hs), output(hs)]
 extern "C" __global__ void lstm_cell_f32_kernel(const float* gates, float* c, float* h, int n, int hs) {
       int idx = blockIdx.x * blockDim.x + threadIdx.x;
       if (idx >= n * hs) return;
@@ -346,8 +326,6 @@ extern "C" void launch_lstm_cell_f32(const float* gates, float* c, float* h, int
       hipLaunchKernelGGL(lstm_cell_f32_kernel, grid, block, 0, stream, gates, c, h, n, hs);
 }
 
-// ── GRU cell f32 ──────────────────────────────────────────────────────────
-// gates layout: [z_pre(hs), r_pre(hs), n_x(hs), n_h(hs)] per sample
 extern "C" __global__ void gru_cell_f32_kernel(const float* gates, const float* h, float* h_new, int n, int hs) {
       int idx = blockIdx.x * blockDim.x + threadIdx.x;
       if (idx >= n * hs) return;
@@ -364,8 +342,6 @@ extern "C" void launch_gru_cell_f32(const float* gates, const float* h, float* h
       hipLaunchKernelGGL(gru_cell_f32_kernel, gr, bl, 0, stream, gates, h, h_new, n, hs);
 }
 
-// ── f16 elementwise kernels ───────────────────────────────────────────────
-// Scalar __half — load to float, compute, store back.
 
 extern "C" __global__ void relu_f16_kernel(const __half* x, __half* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -406,7 +382,6 @@ extern "C" void launch_mul_f16(const __half* a, const __half* b, __half* out, in
       GRID256(n); hipLaunchKernelGGL(mul_f16_kernel, grid, block, 0, stream, a, b, out, n);
 }
 
-// ── SGD update f32: weights[i] -= lr[0] * grad[i] (own axpy, lr device-side) ──
 extern "C" __global__ void sgd_update_f32_kernel(const float* grad, const float* lr, float* weights, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) weights[i] -= lr[0] * grad[i];

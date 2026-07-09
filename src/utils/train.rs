@@ -1,11 +1,12 @@
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, Train};
 use recipe_infer::{
-	Activation, LayerKind, LayerParams, LayerSpec,
+	LayerSpec,
 	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
 	load_ogdl, load_ogdl_str, metric_gpu_into,
 	pinned_vocab, plan_layer_params, zscore_apply_views,
 };
+use recipe_infer::{Activation, LayerKind, LayerParams};
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
 use ratatui::Frame;
@@ -155,27 +156,25 @@ impl ModelInner {
 			.zip(vals)
 			.filter(|(m, _)| **m != Metric::Hip)
 			.enumerate()
-			.map(|(i, (&m, &v))| {
-				let num = if v.is_nan() && matches!(m, Metric::Lr | Metric::Epoch | Metric::Time) {
-					match m {
-						Metric::Epoch => format!("{:>5}", "N/A"),
-						Metric::Lr => format!("{:>7}", "N/A"),
-						Metric::Time => format!("{:>9}", "N/A"),
-						_ => unreachable!(),
-					}
-				} else {
-					match m {
-						Metric::Epoch => format!("{:>5}", v as usize),
-						Metric::Lr => format!("{v:>7}"),
-						Metric::Time => format!("{:>9}", fmt_time(v)),
-						Metric::Loss => format!("{v:>7.4}"),
-						Metric::Accuracy => format!("{v:>6.4}"),
-						Metric::R2 => format!("{v:>8.4}"),
-						Metric::Hip => unreachable!("Hip filtered from metric line"),
-					}
+			.filter_map(|(i, (&m, &v))| {
+				let nan_width = match m {
+					Metric::Epoch if v.is_nan() => Some(5),
+					Metric::Lr if v.is_nan() => Some(7),
+					Metric::Time if v.is_nan() => Some(9),
+					_ => None,
+				};
+				let num = match (nan_width, m) {
+					(Some(w), _) => format!("{:>w$}", "N/A"),
+					(None, Metric::Epoch) => format!("{:>5}", v as usize),
+					(None, Metric::Lr) => format!("{v:>7}"),
+					(None, Metric::Time) => format!("{:>9}", fmt_time(v)),
+					(None, Metric::Loss) => format!("{v:>7.4}"),
+					(None, Metric::Accuracy) => format!("{v:>6.4}"),
+					(None, Metric::R2) => format!("{v:>8.4}"),
+					(None, Metric::Hip) => return None,
 				};
 				let (r, g, b) = palette(i);
-				format!("{} \x1b[38;2;{r};{g};{b}m{num}\x1b[0m", Self::label(m))
+				Some(format!("{} \x1b[38;2;{r};{g};{b}m{num}\x1b[0m", Self::label(m)))
 			})
 			.collect();
 		parts.join("  ")
@@ -585,7 +584,7 @@ impl ModelInner {
 			flip = !flip;
 		}
 	}
-	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) {
+	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<()> {
 		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
 		let start = std::time::Instant::now();
@@ -633,13 +632,17 @@ impl ModelInner {
 		let cat = (embed_first && c_cat > 0).then(|| effective_x.select(ndarray::Axis(1), &cat_cols));
 		let c = cat.as_ref().map_or(0, |m| m.ncols());
 		let d_sc = if embed_first { c } else { d };
-		let resumed = resume.map(load_ogdl).unwrap_or_default();
+		let resumed = resume.map(load_ogdl).transpose()?.unwrap_or_default();
 		let mut did_resume = !resumed.is_empty();
 		let source = if did_resume {
 			resumed
 		} else if rerun {
 			let m = self.saved_ogdl.borrow();
-			load_ogdl_str(&m.as_ref().expect("rerun without host weight mirror").text)
+			let mirror = m
+				.as_ref()
+				.ok_or_else(|| anyhow::anyhow!("rerun without host weight mirror"))?;
+			load_ogdl_str(&mirror.text)
+				.map_err(|e| anyhow::anyhow!("rerun: parse host weight mirror: {e}"))?
 		} else {
 			Vec::new()
 		};
@@ -666,11 +669,11 @@ impl ModelInner {
 				if did_resume && ask_overwrite(&what) {
 					did_resume = false;
 					plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
-						.unwrap_or_else(|e| panic!("{e}"))
+						.map_err(|e| anyhow::anyhow!(e))?
 				} else if did_resume {
-					panic!("checkpoint mismatch — user declined overwrite");
+					anyhow::bail!("checkpoint mismatch — user declined overwrite");
 				} else {
-					panic!("rerun: host weight mirror does not match this run — {what}");
+					anyhow::bail!("rerun: host weight mirror does not match this run — {what}");
 				}
 			}
 		};
@@ -779,14 +782,14 @@ impl ModelInner {
 			+ crate::ooc::Ooc::min_bytes(&plan.dims(), n, cc_pre.map(|(_, a, c)| (a, c)));
 		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
 			.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
-			.unwrap_or_else(|| {
-				panic!(
+			.ok_or_else(|| {
+				anyhow::anyhow!(
 					"arena: claim failed — image {} claimable {} free {}",
 					crate::data::human_bytes(need),
 					crate::data::human_bytes(gpu_core::memory::claimable_bytes()),
 					crate::data::human_bytes(gpu_core::memory::vram_free_base()),
 				)
-			});
+			})?;
 		let base = slab.view(0, image_floats);
 		let params = plan.materialize(&base, w_off);
 		let last = params.len() - 1;
@@ -794,7 +797,7 @@ impl ModelInner {
 		let consts_view = base.view(consts_off, 12);
 		let sc = {
 			let _t = gpu_core::memory::tag_scope("scratch");
-			Scratch::carve(&params, n, &consts_view, n_timed)
+			Scratch::carve(&params, n, &consts_view, n_timed)?
 		};
 		let ss = StepScalars {
 			neg_lr: base.view(sc_off, 1),
@@ -849,7 +852,7 @@ impl ModelInner {
 		}
 		let mut ooc = {
 			let _t = gpu_core::memory::tag_scope("waterfall");
-			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone());
+			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone())?;
 			o.report();
 			o
 		};
@@ -959,7 +962,7 @@ impl ModelInner {
 						recipe_infer::write_ogdl(
 							path,
 							&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
-						);
+						)?;
 						checkpointed = true;
 					}
 				}
@@ -981,7 +984,7 @@ impl ModelInner {
 					.collect();
 				let mut line = self.metrics_line(&cfg.metrics, &vals);
 				if checkpointed {
-					line.push_str("  \x1b[1;32m← checkpoint\x1b[0m");
+					line.push_str("  \x1b[1;32m<- checkpoint\x1b[0m");
 				}
 				eprintln!("{line}");
 			}
@@ -1039,7 +1042,7 @@ impl ModelInner {
 				if better_on_disk {
 					eprintln!("keeping {path} (better prior {key} on disk)");
 				} else {
-					recipe_infer::write_ogdl(path, text);
+					recipe_infer::write_ogdl(path, text)?;
 					let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
 					eprintln!("saved {} ({key} {fit_score:.4})", full.display());
 				}
@@ -1047,7 +1050,7 @@ impl ModelInner {
 				&& s.is_finite()
 				&& recipe_infer::saved_score(path, key).is_none_or(|best| s > best)
 			{
-				recipe_infer::write_ogdl(path, text);
+				recipe_infer::write_ogdl(path, text)?;
 				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
 				eprintln!("saved {} ({neurons} neurons, {key} {s:.4})", full.display());
 			}
@@ -1060,16 +1063,17 @@ impl ModelInner {
 				("loop", &init, &lp),
 				("exit", &lp, &gpu_core::callspy::snapshot()),
 			] {
-				eprint!("── hip {phase} ──\n{}", gpu_core::callspy::report_between(a, b));
+				eprint!("-- hip {phase} --\n{}", gpu_core::callspy::report_between(a, b));
 			}
 		}
 		if let (Some(s0), Some(i), Some(l)) = (led_snap, led_init, led_loop) {
 			let ee = gpu_core::memory::xfer_calls();
 			let dh = |a: (usize, usize, usize), b: (usize, usize, usize)| (b.0 - a.0, b.1 - a.1);
 			for (phase, (h, dd)) in [("init", dh(s0, i)), ("loop", dh(i, l)), ("exit", dh(l, ee))] {
-				eprintln!("── ledger {phase} ── H2D calls {h}  D2H calls {dd}");
+				eprintln!("-- ledger {phase} -- H2D calls {h}  D2H calls {dd}");
 			}
 		}
+		Ok(())
 	}
 	fn park(&self, slab: GpuBuffer, src: *mut std::ffi::c_void, prefix_len: usize, sc: Scratch) -> Vec<f64> {
 		let mut host = vec![0.0f64; prefix_len];

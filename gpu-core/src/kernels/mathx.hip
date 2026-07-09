@@ -1,6 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// ── Missing elementwise-unary math ops, f64 (collision-safe launch_mx_* names) ─
 #define MX(fn, expr)                                                              \
     extern "C" __global__ void mx_##fn##_kernel(const double* x, double* out, int n) { \
         int i = blockIdx.x * blockDim.x + threadIdx.x;                            \

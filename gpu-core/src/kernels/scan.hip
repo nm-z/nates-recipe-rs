@@ -3,10 +3,6 @@
 #include <rocprim/rocprim.hpp>
 #include <float.h>
 
-// ── Scalar all-reduce helpers ────────────────────────────────────────────────
-// rocprim temps are caller-allocated. <fn>_workspace_bytes(n) returns the byte
-// size to allocate; pass that buffer + its size into the launch wrapper.
-// Synchronization and the scalar download are owned by the Rust caller.
 
 extern "C" size_t launch_sum_all_workspace_bytes(int n) {
       size_t tmp = 0;
@@ -41,7 +37,6 @@ extern "C" void launch_min_all(const double* x, double* out, void* workspace, si
       rocprim::reduce(workspace, tmp, x, out, DBL_MAX, (size_t)n, rocprim::minimum<double>(), stream);
 }
 
-// mean_all: caller downloads out[0] and divides by n (avoids a second kernel)
 extern "C" size_t launch_mean_all_workspace_bytes(int n) {
       return launch_sum_all_workspace_bytes(n);
 }
@@ -55,8 +50,6 @@ extern "C" void launch_mean_all(const double* x, double* out, void* workspace, s
       hipLaunchKernelGGL(scale_inv_n_kernel, dim3(1), dim3(1), 0, stream, out, n);
 }
 
-// L2 norm: sum(x^2) — caller downloads and takes sqrt.
-// sq is a caller-allocated n-double scratch buffer for the squared values.
 __global__ void square_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = x[i] * x[i];
@@ -77,8 +70,6 @@ extern "C" void launch_l2_norm(const double* x, double* sq, double* out, void* w
       hipLaunchKernelGGL(sqrt_scalar_kernel, dim3(1), dim3(1), 0, stream, out);
 }
 
-// Dot product: sum(a*b) — caller downloads out[0].
-// prod is a caller-allocated n-double scratch buffer for the products.
 __global__ void mul_kernel_dot(const double* a, const double* b, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n) out[i] = a[i] * b[i];
@@ -94,16 +85,6 @@ extern "C" void launch_dot(const double* a, const double* b, double* prod, doubl
       launch_sum_all(prod, out, workspace, workspace_bytes, n, stream);
 }
 
-// ── Bitonic sort ─────────────────────────────────────────────────────────────
-// Pads to next power-of-two with +INF sentinels (ascending sort).
-// Padded slots are filled with DBL_MAX so they sink to the tail.
-// After sort, only the first n elements are valid.
-//
-// The count loop (over k, j) and the D2D copies into/out of the work buffer are
-// owned by the Rust caller. The caller allocates the padded work buffer(s)
-// (pn = next_pow2(n) elements), copies the input in, calls launch_fill_sentinel
-// (and launch_init_idx for argsort), then drives the bitonic step launcher in
-// the nested k/j loop, then copies the first n elements back out.
 
 __global__ void bitonic_step_kernel(double* data, int j, int k, int padded_n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -165,7 +146,6 @@ extern "C" void launch_bitonic_step_idx(double* keys, int* vals, int j, int k, i
       hipLaunchKernelGGL(bitonic_step_idx_kernel, g, b, 0, stream, keys, vals, j, k, padded_n);
 }
 
-// Sort (double keys, double vals) pairs ascending by key.
 __global__ void bitonic_step_dd_kernel(double* keys, double* vals, int j, int k, int padded_n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= padded_n) return;
@@ -186,9 +166,6 @@ extern "C" void launch_bitonic_step_dd(double* keys, double* vals, int j, int k,
       hipLaunchKernelGGL(bitonic_step_dd_kernel, g, b, 0, stream, keys, vals, j, k, padded_n);
 }
 
-// Segment sort: sort within each contiguous segment.
-// seg_offsets[s..s+1] are the start/end of segment s; seg_offsets[n_segs] = n.
-// Uses insertion sort in shared memory — conservative, correct for segments <= 1024.
 __global__ void segment_sort_kernel(
       const double* data, double* out, const int* seg_offsets, int n_segs
 ) {
@@ -226,10 +203,7 @@ extern "C" void launch_segment_sort(
             data, out, seg_offsets, n_segs);
 }
 
-// ── Inclusive scans ───────────────────────────────────────────────────────────
 
-// cumsum_rows: for each row, inclusive prefix sum over columns.
-// One block per row; sequential within thread 0, parallel across rows.
 __global__ void cumsum_rows_kernel(const double* x, double* out, int rows, int cols) {
       int row = blockIdx.x;
       if (row >= rows) return;
@@ -248,7 +222,6 @@ extern "C" void launch_cumsum_rows(const double* x, double* out, int rows, int c
       hipLaunchKernelGGL(cumsum_rows_kernel, dim3(rows), dim3(1), 0, stream, x, out, rows, cols);
 }
 
-// cumsum_cols: for each column, inclusive prefix sum over rows.
 __global__ void cumsum_cols_kernel(const double* x, double* out, int rows, int cols) {
       int col = blockIdx.x * blockDim.x + threadIdx.x;
       if (col >= cols) return;
@@ -264,7 +237,6 @@ extern "C" void launch_cumsum_cols(const double* x, double* out, int rows, int c
       hipLaunchKernelGGL(cumsum_cols_kernel, g, b, 0, stream, x, out, rows, cols);
 }
 
-// cumprod: inclusive product scan via rocprim (caller-allocated workspace)
 extern "C" size_t launch_cumprod_workspace_bytes(int n) {
       size_t tmp = 0;
       rocprim::inclusive_scan(nullptr, tmp, (const double*)nullptr, (double*)nullptr, n, rocprim::multiplies<double>(), hipStream_t(0));
@@ -276,7 +248,6 @@ extern "C" void launch_cumprod(const double* x, double* out, void* workspace, si
       rocprim::inclusive_scan(workspace, tmp, x, out, n, rocprim::multiplies<double>(), stream);
 }
 
-// cummax: inclusive max scan
 struct MaxOp {
       __host__ __device__ double operator()(double a, double b) const { return a > b ? a : b; }
 };
@@ -292,10 +263,6 @@ extern "C" void launch_cummax(const double* x, double* out, void* workspace, siz
       rocprim::inclusive_scan(workspace, tmp, x, out, n, MaxOp{}, stream);
 }
 
-// ── Segmented reduce by key ───────────────────────────────────────────────────
-// seg_ids[i] = segment index for element i. Segments must be dense 0..n_segs-1.
-// Elements need not be contiguous by segment; atomicAdd handles arbitrary order.
-// out (n_segs doubles) must be zeroed by the caller before this launch.
 
 __global__ void segment_sum_kernel(const double* vals, const int* seg_ids, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -310,7 +277,6 @@ extern "C" void launch_segment_sum(
       hipLaunchKernelGGL(segment_sum_kernel, g, b, 0, stream, vals, seg_ids, out, n);
 }
 
-// segment_max: atomic CAS loop for double (no native atomicMax for f64)
 __global__ void segment_max_init_kernel(double* out, int n_segs) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i < n_segs) out[i] = -DBL_MAX;
@@ -342,13 +308,6 @@ extern "C" void launch_segment_max(
       hipLaunchKernelGGL(segment_max_kernel, g, b, 0, stream, vals, seg_ids, out, n);
 }
 
-// ── S4/Mamba linear recurrence scan ──────────────────────────────────────────
-// h_t = a_t * h_{t-1} + b_t  for each channel d in parallel.
-// Layout: a[t*dim+d], b[t*dim+d], states[t*dim+d].
-// Each thread owns one channel and loops over n_steps sequentially.
-// Complexity: O(n_steps) sequential per channel; O(dim) parallel across threads.
-// This is the conservative correct baseline. Parallel prefix (Blelloch) is possible
-// with associative (a,b) pairs but requires 2x workspace and more complexity.
 __global__ void scan_linear_recurrence_kernel(
       const double* a, const double* b, double* states, int n_steps, int dim
 ) {

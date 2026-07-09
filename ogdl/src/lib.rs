@@ -1,5 +1,3 @@
-#![allow(non_upper_case_globals)]
-
 use std::fmt;
 use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -160,7 +158,11 @@ impl Graph {
       }
 }
 
-pub static ogdl: LazyLock<Graph> = LazyLock::new(Graph::empty);
+mod alias {
+      use super::{Graph, LazyLock};
+      pub static OGDL: LazyLock<Graph> = LazyLock::new(Graph::empty);
+}
+pub use alias::OGDL as ogdl;
 
 pub struct Ogdl;
 

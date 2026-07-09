@@ -2,8 +2,6 @@
 #include <hip/hip_runtime.h>
 #include <rocprim/rocprim.hpp>
 
-// Column-transposed view: flat index i in [col*rows, (col+1)*rows) maps to x[(i%rows)*cols+(i/rows)].
-// This lets device_segmented_reduce treat each column as a contiguous segment of length rows.
 struct ColTransposeOp {
     const double* x;
     int rows;
@@ -46,7 +44,6 @@ extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, i
         rocprim::make_counting_iterator<int>(0),
         ColTransposeOp{x, rows, cols});
 
-    // begin_offsets[c] = c*rows, end_offsets[c] = (c+1)*rows
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -75,7 +72,6 @@ extern "C" size_t reduce_sum_rows_workspace_bytes(const double* x, int rows, int
 }
 
 extern "C" void launch_reduce_sum_rows(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
-    // Row-major: each row is contiguous, segment i = [i*cols, (i+1)*cols)
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{cols});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -97,11 +93,6 @@ extern "C" void launch_reduce_mean_cols(const double* x, double* out, int rows, 
     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
-// Squared-deviation view for variance: index i (column-transposed, like
-// ColTransposeOp) → (x[row,col] - means[col])². Feeding this through the same
-// device_segmented_reduce that powers launch_reduce_sum_cols gives a fully
-// parallel variance pass (one segment per column, fixed-order → deterministic),
-// replacing the old one-thread-per-column serial scan.
 struct ColDevSqOp {
     const double* x;
     const double* means;
@@ -114,8 +105,6 @@ struct ColDevSqOp {
     }
 };
 
-// Workspace = the segmented-reduce scratch + a column-mean buffer carved from the
-// 256B-aligned tail, so variance stays allocate-once (no per-call hipMalloc).
 extern "C" size_t reduce_var_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
     size_t off = (seg + 255) & ~((size_t)255);
@@ -126,10 +115,8 @@ extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, i
     size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
     size_t off = (seg + 255) & ~((size_t)255);
     double* means = (double*)((char*)tmp + off);
-    // Pass 1: column means (parallel segmented sum / rows).
     launch_reduce_sum_cols(x, means, rows, cols, tmp, seg, stream);
     rocprim::transform(means, means, (size_t)cols, DivByRows{1.0 / rows}, stream);
-    // Pass 2: column variance = mean of squared deviations, same parallel reduce.
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
         ColDevSqOp{x, means, rows, cols});
@@ -144,29 +131,23 @@ extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, i
     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
-// Argmin per row with warp shuffle reduction.
-// One warp (64 threads on AMD) cooperates per row. Each thread handles cols/warpSize elements,
-// then warp shuffle reduces to find global min.
 __global__ void argmin_rows_kernel(const double* dists, int* assignments, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
     const double* r = dists + row * cols;
 
-    // Each thread in the block scans a strided subset of columns
     double local_min = 1e308;
     int local_idx = 0;
     for (int j = threadIdx.x; j < cols; j += blockDim.x) {
         if (r[j] < local_min) { local_min = r[j]; local_idx = j; }
     }
 
-    // Warp shuffle reduction for min
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         double other_val = __shfl_down(local_min, offset);
         int other_idx = __shfl_down(local_idx, offset);
         if (other_val < local_min) { local_min = other_val; local_idx = other_idx; }
     }
 
-    // Cross-warp reduction via shared memory
     __shared__ double s_val[16];
     __shared__ int s_idx[16];
     int lane = threadIdx.x % warpSize;
@@ -190,11 +171,6 @@ extern "C" void launch_argmin_rows(const double* dists, int* assignments, int ro
     hipLaunchKernelGGL(argmin_rows_kernel, dim3(rows), dim3(threads), 0, stream, dists, assignments, rows, cols);
 }
 
-// Centroid update: scatter-add approach.
-// Phase 1: zero centroids + counts.
-// Phase 2: each thread handles a chunk of points, atomically adds to centroid sums.
-// Phase 3: divide by counts.
-// Much better than scanning all n per cluster — each point visited exactly once.
 
 __global__ void centroid_zero_kernel(double* centroids, int* counts, int k, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -220,8 +196,6 @@ __global__ void centroid_divide_kernel(double* centroids, const int* counts, int
     if (cnt > 0) centroids[idx] /= cnt;
 }
 
-// 1D average pool: input (n * out_len, n_filters) → output (n, n_filters)
-// Each output[i, fi] = mean(input[i*out_len .. (i+1)*out_len, fi])
 __global__ void avg_pool_1d_kernel(const double* input, double* output, int n, int out_len, int n_filters) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n * n_filters;
@@ -235,7 +209,6 @@ __global__ void avg_pool_1d_kernel(const double* input, double* output, int n, i
     output[i * n_filters + fi] = sum / out_len;
 }
 
-// Pool gradient expand: replicate (n x n_filters) gradient back to (n*out_len x n_filters), divide by out_len
 __global__ void pool_grad_expand_kernel(const double* grad_pool, double* grad_out, int n, int out_len, int n_filters) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n * out_len * n_filters;
@@ -269,10 +242,6 @@ extern "C" void launch_centroid_update(const double* x, const int* assignments, 
     hipLaunchKernelGGL(centroid_divide_kernel, g3, b3, 0, stream, centroids, counts, k, dim);
 }
 
-// ── Reduce max/min ─────────────────────────────────────────────────────────
-// Uses rocprim::segmented_reduce with maximum/minimum operators.
-// Row reductions: contiguous segments of length cols.
-// Column reductions: virtual transposed segments via ColTransposeOp.
 
 extern "C" size_t reduce_max_rows_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto begin_offsets = rocprim::make_transform_iterator(
@@ -390,16 +359,12 @@ extern "C" void launch_reduce_min_cols(const double* x, double* out, int rows, i
         rocprim::minimum<double>(), 1e308, stream);
 }
 
-// ── Log-sum-exp per row ────────────────────────────────────────────────────
-// out[i] = max_j(x[i,j]) + log(sum_j(exp(x[i,j] - max_j(x[i,j]))))
-// Cooperative row-wise: one block per row.
 
 extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
     const double* r = x + row * cols;
 
-    // Find max
     double lmax = -1e308;
     for (int j = threadIdx.x; j < cols; j += blockDim.x)
         if (r[j] > lmax) lmax = r[j];
@@ -417,7 +382,6 @@ extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out,
     __syncthreads();
     double row_max = sm[0];
 
-    // Sum exp(x - max)
     double lsum = 0.0;
     for (int j = threadIdx.x; j < cols; j += blockDim.x) lsum += exp(r[j] - row_max);
     for (int off = warpSize/2; off > 0; off /= 2) lsum += __shfl_down(lsum, off);
@@ -434,7 +398,6 @@ extern "C" __global__ void log_sum_exp_rows_kernel(const double* x, double* out,
     if (threadIdx.x == 0) out[row] = row_max + log(ss[0]);
 }
 
-// ── Prefix sum (parallel scan) ─────────────────────────────────────────────
 
 extern "C" size_t prefix_sum_inclusive_workspace_bytes(const double* x, int n, hipStream_t stream) {
     size_t tmp_bytes = 0;

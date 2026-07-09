@@ -242,7 +242,7 @@ fn encode(
 	rows: &[Vec<String>],
 	targets: &[usize],
 	skip: &[bool],
-) -> (Vec<String>, Mat, Vec1, usize) {
+) -> anyhow::Result<(Vec<String>, Mat, Vec1, usize)> {
 	let n = rows.len();
 
 	let is_target = |ai: usize| targets.contains(&ai);
@@ -293,7 +293,7 @@ fn encode(
 		.filter(|(ai, a)| !is_target(*ai) && !is_skip(*ai) && width(*ai, a) > 1)
 		.map(|(ai, a)| (a.name.as_str(), width(ai, a)))
 		.collect();
-	admit_or_skip(n, proj_w, "encoded", &top);
+	admit_ceiling(n, proj_w, "encoded", &top)?;
 
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
 	// Scatter each encoded feature column straight into the row-major output and drop
@@ -346,25 +346,53 @@ fn encode(
 			ydata[i * k + j] = *v;
 		}
 	}
-	(
+	Ok((
 		names,
 		Mat::from_shape_vec((n, w), data).expect("encode: reshape"),
 		Vec1::from(ydata),
 		k,
-	)
+	))
 }
 
 fn oom_pair(name: &str, val: &str) -> String {
 	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
 }
 
+/// The one typed over-ceiling error: raised here where the budgets are measured,
+/// matched by type (never by message text) in the training crate's preflight to
+/// skip the scenario.
+#[derive(Debug)]
+pub struct CeilingExceeded {
+	pub label: String,
+	pub rows: usize,
+	pub cols: usize,
+	pub need: usize,
+	pub cap: usize,
+}
+
+impl std::fmt::Display for CeilingExceeded {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"{} buffer exceeds VRAM+RAM+disk ceiling: {} rows × {} cols × 8B = {} (ceiling {})",
+			self.label,
+			self.rows,
+			self.cols,
+			crate::data::human_bytes(self.need),
+			crate::data::human_bytes(self.cap),
+		)
+	}
+}
+
+impl std::error::Error for CeilingExceeded {}
+
 /// Admit check — replaces the old RAM-only guard for both the per-group encode
 /// and the cross-group selection. The run stops for one reason only: the encoded
 /// matrix `n × w × 8B` exceeds the combined VRAM+RAM+disk ceiling, decided from
 /// live budgets (`tiered::admit`) before the matrix is built. On over-ceiling it
-/// prints a one-line autopsy (largest bucket first) then panics; the preflight in
-/// the training crate catches that and skips the scenario.
-fn admit_or_skip(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
+/// prints a one-line autopsy (largest bucket first) then returns the typed
+/// `CeilingExceeded`.
+fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) -> anyhow::Result<()> {
 	let bytes = n
 		.saturating_mul(w)
 		.saturating_mul(std::mem::size_of::<f64>());
@@ -372,7 +400,7 @@ fn admit_or_skip(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 	// sized against that filesystem's free space.
 	let spill = std::path::Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
-		Ok(_) => return,
+		Ok(_) => return Ok(()),
 		Err(f) => f,
 	};
 	let hb = crate::data::human_bytes;
@@ -411,11 +439,14 @@ fn admit_or_skip(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
 	eprintln!("{}", line.join(", "));
-	panic!(
-		"{label} buffer exceeds VRAM+RAM+disk ceiling: {n} rows × {w} cols × 8B = {} (ceiling {})",
-		hb(full.need),
-		hb(full.cap)
-	);
+	Err(CeilingExceeded {
+		label: label.to_string(),
+		rows: n,
+		cols: w,
+		need: full.need,
+		cap: full.cap,
+	}
+	.into())
 }
 
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
@@ -447,7 +478,7 @@ struct Assembled {
 }
 
 impl Assembled {
-	fn select(&mut self, keep: &[String]) -> Mat {
+	fn select(&mut self, keep: &[String]) -> anyhow::Result<Mat> {
 		let n = self.samples;
 		let w = keep.len();
 		let idx: std::collections::HashMap<&str, usize> = self
@@ -485,7 +516,7 @@ impl Assembled {
 					}
 				}
 				buf.truncate(n * w);
-				return Mat::from_shape_vec((n, w), buf).expect("select reshape");
+				return Ok(Mat::from_shape_vec((n, w), buf).expect("select reshape"));
 			}
 		}
 
@@ -498,7 +529,7 @@ impl Assembled {
 				.or_insert(0) += 1;
 		}
 		let top: Vec<(&str, usize)> = by_col.into_iter().collect();
-		admit_or_skip(n, w, "selection", &top);
+		admit_ceiling(n, w, "selection", &top)?;
 		let mut data = vec![0.0f64; n * w];
 		for (jc, name) in keep.iter().enumerate() {
 			let (mi, col) = self.sources[idx[name.as_str()]];
@@ -508,7 +539,7 @@ impl Assembled {
 				data[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
 			}
 		}
-		Mat::from_shape_vec((n, w), data).expect("select reshape")
+		Ok(Mat::from_shape_vec((n, w), data).expect("select reshape"))
 	}
 }
 
@@ -539,8 +570,8 @@ fn encode_group(
 	target_cols: &[usize],
 	exclude: &[String],
 	pre: Option<&[(String, usize)]>,
-) -> (Vec<String>, Mat, Vec1, usize) {
-	match g {
+) -> anyhow::Result<(Vec<String>, Mat, Vec1, usize)> {
+	Ok(match g {
 		DirGroup::Table {
 			name,
 			headers,
@@ -556,7 +587,7 @@ fn encode_group(
 			schema.insert(name.clone(), attrs.clone());
 
 			let skip = exclude_mask(&attrs, name, exclude);
-			let (fnames, x, y, k) = encode(&attrs, cells, target_cols, &skip);
+			let (fnames, x, y, k) = encode(&attrs, cells, target_cols, &skip)?;
 			let names = fnames.iter().map(|f| namespaced(name, f)).collect();
 			(names, x, y, k)
 		}
@@ -576,7 +607,7 @@ fn encode_group(
 			let x = Mat::from_shape_vec((n, *dim), data).expect("image reshape");
 			(names, x, Vec1::zeros(n), 0)
 		}
-	}
+	})
 }
 
 fn group_hashes(g: &DirGroup) -> &[String] {
@@ -592,7 +623,7 @@ fn assemble(
 	sample_hint: Option<&str>,
 	exclude: &[String],
 	pre: Option<&[GroupKinds]>,
-) -> (Assembled, Schema) {
+) -> anyhow::Result<(Assembled, Schema)> {
 	let mut schema: Schema = Schema::new();
 
 	let mut sample_idx = 0usize;
@@ -629,7 +660,7 @@ fn assemble(
 				match (groups.len(), tables.as_slice()) {
 					(1, _) => 0,
 					(_, [only]) => *only,
-					_ => panic!(
+					_ => anyhow::bail!(
 						"multiple groups and no resolvable target — name it with .target() so the sample file is known"
 					),
 				}
@@ -643,7 +674,7 @@ fn assemble(
 		&target_cols,
 		exclude,
 		group_pre(pre, group_name(&groups[sample_idx])),
-	);
+	)?;
 	let s_hashes = group_hashes(&groups[sample_idx]);
 	let n = s_x.nrows();
 	// Raw sample cells — an image vector joins by matching the filename it holds in
@@ -708,7 +739,7 @@ fn assemble(
 				let by_key: std::collections::HashMap<&str, usize> =
 					g_hashes.iter().enumerate().map(|(i, h)| (h.as_str(), i)).collect();
 				let (g_names, g_x, _gy, _gk) =
-					encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)));
+					encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)))?;
 				let src: Vec<Option<usize>> = (0..n)
 					.map(|i| {
 						by_key
@@ -756,7 +787,7 @@ fn assemble(
 		}
 
 		let (g_names, g_x, _gy, _gk) =
-			encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)));
+			encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)))?;
 
 		let src: Vec<Option<usize>> = (0..n)
 			.map(|i| {
@@ -779,7 +810,7 @@ fn assemble(
 		mats.push(g_x);
 	}
 
-	(
+	Ok((
 		Assembled {
 			names,
 			sources,
@@ -792,7 +823,7 @@ fn assemble(
 			sample_group: group_name(&groups[sample_idx]).to_string(),
 		},
 		schema,
-	)
+	))
 }
 
 fn group_name(g: &DirGroup) -> &str {
@@ -991,18 +1022,18 @@ pub fn prepare_arff_data(
 	split_frac: Option<f64>,
 	test_path: Option<&str>,
 	source_label: &str,
-) -> (Dataset, Option<Dataset>) {
+) -> anyhow::Result<(Dataset, Option<Dataset>)> {
 	let skip = exclude_mask(attrs, "", exclude);
-	let (names, x, y, enc_k) = encode(attrs, rows, targets, &skip);
+	let (names, x, y, enc_k) = encode(attrs, rows, targets, &skip)?;
 	let k = enc_k.max(1);
 	let tc = text_col_indices(&names);
 	let oh = onehot_group_indices(&names);
-	if let Some(frac) = split_frac {
+	Ok(if let Some(frac) = split_frac {
 		let (tr, te) = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
 		let (_, trows) = crate::data::parse_arff(tp);
-		let (_, tx, ty, _) = encode(attrs, &trows, targets, &skip);
+		let (_, tx, ty, _) = encode(attrs, &trows, targets, &skip)?;
 		(
 			Dataset {
 				x,
@@ -1036,7 +1067,7 @@ pub fn prepare_arff_data(
 			},
 			None,
 		)
-	}
+	})
 }
 
 /// Table path (CSV/dir/zip): load groups, resolve targets (via the caller's
@@ -1049,8 +1080,8 @@ pub fn prepare_table_data(
 	exclude: &[String],
 	source_label: &str,
 	pre: Option<&[GroupKinds]>,
-	resolve: impl Fn(&[String], Option<&[String]>) -> Vec<String>,
-) -> (Dataset, Option<Dataset>, Vec<Attr>) {
+	resolve: impl Fn(&[String], Option<&[String]>) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
 	let set_groups: Vec<DirGroup> = sources
 		.iter()
 		.flat_map(|s| crate::data::load_groups(s))
@@ -1063,9 +1094,9 @@ pub fn prepare_table_data(
 		(None, Some(_)) => Some(set_tnames.clone()),
 		(None, None) => None,
 	};
-	let t = resolve(&set_tnames, test_tnames.as_deref());
+	let t = resolve(&set_tnames, test_tnames.as_deref())?;
 
-	let (mut set, schema) = assemble(&set_groups, &t, None, None, exclude, pre);
+	let (mut set, schema) = assemble(&set_groups, &t, None, None, exclude, pre)?;
 	let flat_attrs: Vec<Attr> = schema.values().flat_map(|v| v.iter().cloned()).collect();
 	let k = set.n_targets;
 	let keep = |name: &str| !exclude.iter().any(|p| exclude_match(p, name));
@@ -1081,14 +1112,14 @@ pub fn prepare_table_data(
 			Some(&set.sample_group),
 			exclude,
 			None,
-		);
+		)?;
 		let test_has_target =
 			!t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
 		let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
 		let tc = text_col_indices(&feats);
 		let oh = onehot_group_indices(&feats);
 		let train = Dataset {
-			x: set.select(&feats),
+			x: set.select(&feats)?,
 			y: set.y,
 			source: source_label.to_string(),
 			n_targets: k,
@@ -1100,7 +1131,7 @@ pub fn prepare_table_data(
 			test.names.iter().filter(|n| keep(n)).cloned().collect();
 		let oh_test = onehot_group_indices(&test_feats);
 		let testds = Dataset {
-			x: test.select(&test_feats),
+			x: test.select(&test_feats)?,
 			y: test.y,
 			source: tp.clone(),
 			n_targets: test.n_targets,
@@ -1108,18 +1139,18 @@ pub fn prepare_table_data(
 			text_cols: tc,
 			onehot_groups: oh_test,
 		};
-		return (train, Some(testds), flat_attrs);
+		return Ok((train, Some(testds), flat_attrs));
 	}
 
 	let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
-	let x = set.select(&feats);
+	let x = set.select(&feats)?;
 	let tc = text_col_indices(&feats);
 	let oh = onehot_group_indices(&feats);
 	if let Some(frac) = split_frac {
 		let (tr, te) = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
-		return (tr, Some(te), flat_attrs);
+		return Ok((tr, Some(te), flat_attrs));
 	}
-	(
+	Ok((
 		Dataset {
 			x,
 			y: set.y,
@@ -1131,7 +1162,7 @@ pub fn prepare_table_data(
 		},
 		None,
 		flat_attrs,
-	)
+	))
 }
 
 #[cfg(test)]

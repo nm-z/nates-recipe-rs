@@ -373,7 +373,6 @@ pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	v
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn infer_scored(
 	params: &[LayerParams],
 	xbuf: &GpuBuffer,
@@ -385,7 +384,7 @@ pub fn infer_scored(
 	_lr: f64,
 	metrics: &[Metric],
 	ss_tot: f64,
-) -> (Vec<f64>, Vec<f64>) {
+) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
 	let last = params.len() - 1;
 	let k = params[last].out_dim;
 	let consts = {
@@ -393,7 +392,7 @@ pub fn infer_scored(
 		b.load(&crate::scratch::SCRATCH_CONSTS).expect("scratch consts");
 		b
 	};
-	let sc = Scratch::new_infer(params, n, &consts);
+	let sc = Scratch::new_infer(params, n, &consts)?;
 	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc);
 	if let Some((ymean, ystd)) = yscaler {
 		let ystd_b = { let __up = &[ystd]; let __ub = GpuBuffer::alloc(__up.len()).expect("ystd"); __ub.load(__up).expect("ystd"); __ub };
@@ -417,7 +416,7 @@ pub fn infer_scored(
 			.collect(),
 		None => Vec::new(),
 	};
-	(download_vec(out, n * k), vals)
+	Ok((download_vec(out, n * k), vals))
 }
 
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
@@ -477,13 +476,13 @@ mod tests {
 		let (params, h) = attn_layer(n, heads, d, s);
 
 		let consts = consts_buf();
-		let sc_ref = Scratch::new_full(&params, n, &consts);
+		let sc_ref = Scratch::new_full(&params, n, &consts).expect("scratch");
 		assert!(!sc_ref.infer, "ref must use the full-batch path");
 		forward_into(&params, &h, None, n, &sc_ref.acts, &sc_ref);
 		let reference = download_vec(&sc_ref.acts[0], n * in_dim);
 		drop(sc_ref);
 
-		let sc = Scratch::new_infer(&params, n, &consts);
+		let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 		assert!(sc.infer, "inference must use the KV-cache path");
 		forward_into(&params, &h, None, n, &sc.acts, &sc);
 		let cached = download_vec(&sc.acts[0], n * in_dim);
@@ -520,7 +519,7 @@ mod tests {
 
 		let (params, h) = attn_layer(n, heads, d, s);
 		let consts = consts_buf();
-		let sc = Scratch::new_infer(&params, n, &consts);
+		let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 		forward_into(&params, &h, None, n, &sc.acts, &sc);
 		let _ = download_vec(&sc.acts[0], 1);
 		let t0 = std::time::Instant::now();

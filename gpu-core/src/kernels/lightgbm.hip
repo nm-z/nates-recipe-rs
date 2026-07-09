@@ -1,24 +1,13 @@
 #include <hip/hip_runtime.h>
 #include <float.h>
 
-// ══════════════════════════════════════════════════════════════════════════════
-// LightGBM leaf-wise kernels — i32 leaf-slot index, f32 grad/hess/count histograms.
-// EXCLUSIVE to lightgbm-rs. The shared oblivious_* / leaf_reduce kernels in tree.hip
-// keep their u8 leaf index for catboost-rs + nates-gpu-ruby and are NOT touched here.
-//
-// Histogram layout (size_t throughout — slot*n_eff*n_bins can exceed 2^31):
-//   base = ((size_t)slot * n_eff + feat) * n_bins + bin
-// ══════════════════════════════════════════════════════════════════════════════
 
-// ── lgbm_histogram ─────────────────────────────────────────────────────────
-// Build grad/hess/count histograms for ONE leaf slot. One block per feature,
-// shared-mem [256] accumulators. Scans all rows, accumulates only target_slot's.
 extern "C" __global__
 void lgbm_histogram_kernel(
-      const unsigned char* bins_fm,   // [n_eff * n_rows] feature-major u8
-      const int*           node_idx,  // [n_rows] i32 leaf slot per row
-      const float*         grad,      // [n_rows]
-      const float*         hess,      // [n_rows]
+      const unsigned char* bins_fm,
+      const int*           node_idx,
+      const float*         grad,
+      const float*         hess,
       float*               grad_hist,
       float*               hess_hist,
       float*               count_hist,
@@ -74,10 +63,6 @@ extern "C" void launch_lgbm_histogram(
             target_slot, n_rows, n_eff, n_bins);
 }
 
-// ── lgbm_hist_subtract ─────────────────────────────────────────────────────
-// In-place histogram subtraction: hist[dst_slot] -= hist[src_slot] for all
-// three (grad/hess/count). One block per feature. Used to derive the larger
-// child (parent − smaller sibling); parent stays in dst_slot until this runs.
 extern "C" __global__
 void lgbm_hist_subtract_kernel(
       float* grad_hist,
@@ -109,22 +94,16 @@ extern "C" void launch_lgbm_hist_subtract(
             grad_hist, hess_hist, count_hist, dst_slot, src_slot, n_eff, n_bins);
 }
 
-// ── lgbm_best_split ────────────────────────────────────────────────────────
-// One block per evaluated slot. For each feature: Hillis-Steele inclusive prefix
-// scan over bins (linear, NOT O(n_bins^2)), Newton gain gated by min_child_weight,
-// per-thread best across features. Then a shared-array + thread-0 reduction (the
-// codebase has no float atomicMax) picks the winning (feat,bin) and its left count.
-// Outputs are packed by EVAL INDEX (slot_idx), not by slot id.
 extern "C" __global__
 void lgbm_best_split_kernel(
       const float* grad_hist,
       const float* hess_hist,
       const float* count_hist,
-      const int*   slot_ids,        // [n_eval]
-      float*       best_gain,       // [n_eval]
-      int*         best_feat,       // [n_eval]
-      int*         best_bin,        // [n_eval]
-      int*         best_left_count, // [n_eval]
+      const int*   slot_ids,
+      float*       best_gain,
+      int*         best_feat,
+      int*         best_bin,
+      int*         best_left_count,
       int          n_eval,
       int          n_eff,
       int          n_bins,
@@ -216,9 +195,6 @@ extern "C" void launch_lgbm_best_split(
             n_eval, n_eff, n_bins, lambda, min_child_weight);
 }
 
-// ── lgbm_leaf_reduce ───────────────────────────────────────────────────────
-// Scatter grad/hess into per-slot buckets via atomics (i32 leaf slot). Pairs with
-// the shared tree.hip leaf_finalize kernel (no node_idx) for value = -G/(H+λ).
 extern "C" __global__
 void lgbm_leaf_reduce_kernel(
       const int*   node_idx,
@@ -245,9 +221,6 @@ extern "C" void launch_lgbm_leaf_reduce(
             node_idx, grad, hess, leaf_grad, leaf_hess, n_rows);
 }
 
-// ── goss_sample ────────────────────────────────────────────────────────────
-// sorted_idx[0..top_k-1] = top-a rows by |grad| (argsorted on host).
-// weights_out[row] = 1.0 (top-a), (1-a)/b if uniform_rand[row] < (1-a)/b (rest), else 0.
 extern "C" __global__
 void goss_sample_kernel(
       const int*   sorted_idx,
@@ -255,8 +228,8 @@ void goss_sample_kernel(
       const float* uniform_rand,
       int          n_rows,
       int          top_k,
-      const float* sample_rate_p,    // keep a rest row with prob = sample_rate (= goss_b)
-      const float* keep_weight_p     // amplification weight = (1-a)/b applied to kept rest rows
+      const float* sample_rate_p,
+      const float* keep_weight_p
 ) {
       float sample_rate = *sample_rate_p, keep_weight = *keep_weight_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -279,9 +252,6 @@ extern "C" void launch_goss_sample(
             sorted_idx, weights_out, uniform_rand, n_rows, top_k, sample_rate, keep_weight);
 }
 
-// ── leaf_split_apply ───────────────────────────────────────────────────────
-// Route rows of target_leaf: bin <= split_bin → new_leaf_left, else new_leaf_right.
-// node_idx is i32 (widened from u8 — lightgbm-exclusive, supports > 256 leaves).
 extern "C" __global__
 void leaf_split_apply_kernel(
       const unsigned char* bins_fm,

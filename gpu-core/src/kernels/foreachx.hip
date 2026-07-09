@@ -1,13 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// ── foreach_* ops: same elementwise op applied over a flattened batch ─────────
-// torch._foreach_<op> applies <op> to a list of tensors. Flattening the list to
-// one contiguous buffer makes this an ordinary elementwise op — a single launch
-// over n = sum(numel) elements is exactly the per-tensor semantics. Unique
-// foreachx_/launch_foreachx_ names avoid collision with the rest of the library.
 
-// Unary: x -> out
 #define FE1(fn, expr)                                                                 \
     extern "C" __global__ void foreachx_##fn##_kernel(const double* x, double* out, int n) { \
         int i = blockIdx.x * blockDim.x + threadIdx.x;                                \
@@ -18,7 +12,6 @@
         hipLaunchKernelGGL(foreachx_##fn##_kernel, grid, block, 0, s, x, out, n);     \
     }
 
-// Binary: a,b -> out (elementwise tensorlist op)
 #define FE2(fn, expr)                                                                 \
     extern "C" __global__ void foreachx_##fn##_kernel(const double* a, const double* b, double* out, int n) { \
         int i = blockIdx.x * blockDim.x + threadIdx.x;                                \
@@ -29,7 +22,6 @@
         hipLaunchKernelGGL(foreachx_##fn##_kernel, grid, block, 0, s, a, b, out, n);  \
     }
 
-// ── core 9 (task-mandated) ──
 FE2(add, x + y)
 FE2(sub, x - y)
 FE2(mul, x * y)
@@ -40,7 +32,6 @@ FE1(sqrt, sqrt(v))
 FE1(exp, exp(v))
 FE1(sigmoid, 1.0 / (1.0 + exp(-v)))
 
-// ── extra exact-oracle elementwise foreach ops (honest coverage) ──
 FE1(reciprocal, 1.0 / v)
 FE1(log,    log(v))
 FE1(log2,   log2(v))

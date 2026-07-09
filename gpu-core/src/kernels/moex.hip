@@ -1,15 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── MoE routing GPU kernel (collision-safe moex_ / launch_moex_) ─────────────
-//
-// moex_weighted_accumulate : out[i,j] += gate[i, e] * ye[i,j] for one expert e.
-//   Dense combine step of mixture-of-experts: every token's expert-e output Ye
-//   is scaled by that token's gate probability for expert e and summed into out.
-//   Caller zeros `out` once, then calls this once per expert e in [0, n_experts).
 
-// ── weighted per-token accumulate ───────────────────────────────────────────
-// ye:(n,d) row-major expert-e output. gate:(n,n_experts) row-major gate probs.
-// out:(n,d) row-major accumulator. e: expert column index into gate.
 extern "C" __global__ void moex_weighted_accumulate_kernel(
     const double* ye, const double* gate, double* out,
     int n, int d, int n_experts, int e
@@ -29,10 +20,6 @@ extern "C" void launch_moex_weighted_accumulate(
     hipLaunchKernelGGL(moex_weighted_accumulate_kernel, grid, block, 0, s, ye, gate, out, n, d, n_experts, e);
 }
 
-// ── backward of the weighted accumulate (out[i,j] += gate[i,e]*ye[i,j]) ──────
-// Given d_out, for expert e:
-//   d_ye[i,j]   = gate[i,e] * d_out[i,j]           (n*d threads)
-//   d_gate[i,e] = Σ_j ye[i,j] * d_out[i,j]         (n threads, reduce over d)
 extern "C" __global__ void moex_dye_kernel(
     const double* d_out, const double* gate, double* d_ye,
     int n, int d, int n_experts, int e

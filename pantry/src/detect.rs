@@ -56,15 +56,15 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 /// forces reading to EOF, exactly what `tokenize_column` consumes from the full
 /// parse. Dir/zip/db reuse the full `load_groups` loader (the same parser), taking
 /// correctness over a second, prefix-only dialect.
-pub fn detect_kinds(path: &str) -> crate::encode::PreKinds {
+pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 	let p = std::path::Path::new(path);
 	let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
 	let plain_csv = !p.is_dir() && !matches!(ext.as_deref(), Some("zip" | "db" | "sqlite"));
 	if plain_csv {
-		let (headers, cells) = prefix_columns(p);
+		let (headers, cells) = prefix_columns(p)?;
 		let non_empty: Vec<Vec<&str>> =
 			cells.iter().map(|c| c.iter().map(String::as_str).collect()).collect();
-		vec![(String::new(), kinds_for(&headers, &non_empty))]
+		Ok(vec![(String::new(), kinds_for(&headers, &non_empty)?)])
 	} else {
 		crate::data::load_groups(path)
 			.iter()
@@ -79,7 +79,7 @@ pub fn detect_kinds(path: &str) -> crate::encode::PreKinds {
 								.collect()
 						})
 						.collect();
-					Some((name.clone(), kinds_for(headers, &non_empty)))
+					Some(kinds_for(headers, &non_empty).map(|k| (name.clone(), k)))
 				}
 				crate::data::DirGroup::Image { .. } => None,
 			})
@@ -91,20 +91,20 @@ pub fn detect_kinds(path: &str) -> crate::encode::PreKinds {
 /// branch the encoder takes for it regardless of any prediction). One `(header,
 /// kind)` per column, in header order, so the encoder matches positionally and can
 /// catch a count/name drift against its full parse.
-fn kinds_for(headers: &[String], non_empty: &[Vec<&str>]) -> Vec<(String, usize)> {
+fn kinds_for(headers: &[String], non_empty: &[Vec<&str>]) -> anyhow::Result<Vec<(String, usize)>> {
 	let to_predict: Vec<usize> =
 		(0..headers.len()).filter(|&j| !non_empty[j].is_empty()).collect();
 	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
-	let preds = predict_kinds(&cols);
+	let preds = predict_kinds(&cols)?;
 	let mut pred: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 	for (i, &j) in to_predict.iter().enumerate() {
 		pred.insert(j, preds[i]);
 	}
-	headers
+	Ok(headers
 		.iter()
 		.enumerate()
 		.map(|(j, name)| (name.clone(), pred.get(&j).copied().unwrap_or(KIND_NUMERIC)))
-		.collect()
+		.collect())
 }
 
 /// Streaming prefix read of a plain CSV: replicates `read_raw_csv`'s header
@@ -112,7 +112,7 @@ fn kinds_for(headers: &[String], non_empty: &[Vec<&str>]) -> Vec<(String, usize)
 /// only until it holds ≥ `CONTEXT` bytes of `tokenize_column` stream (or EOF). The
 /// returned prefix is exactly what `tokenize_column` would consume from the full
 /// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
-fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
+fn prefix_columns(path: &std::path::Path) -> anyhow::Result<(Vec<String>, Vec<Vec<String>>)> {
 	// One token per byte, plus one '\n' separator between consecutive cells.
 	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize], full: &mut usize) {
 		if tok[j] >= CONTEXT {
@@ -130,13 +130,13 @@ fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
 		.flexible(true)
 		.delimiter(crate::data::sniff_delimiter(path))
 		.from_path(path)
-		.unwrap_or_else(|e| panic!("detect_kinds: failed to open {}: {e}", path.display()));
+		.map_err(|e| anyhow::anyhow!("detect_kinds: failed to open {}: {e}", path.display()))?;
 	let mut records = rdr.byte_records();
 	let Some(first) = records.next() else {
-		return (Vec::new(), Vec::new());
+		return Ok((Vec::new(), Vec::new()));
 	};
 	let first =
-		first.unwrap_or_else(|e| panic!("detect_kinds: first record of {}: {e}", path.display()));
+		first.map_err(|e| anyhow::anyhow!("detect_kinds: first record of {}: {e}", path.display()))?;
 	let first_cells: Vec<String> =
 		first.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
 	let w = first_cells.len();
@@ -166,7 +166,7 @@ fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
 	if full < w {
 		for rec in records {
 			let rec = rec
-				.unwrap_or_else(|e| panic!("detect_kinds: record of {}: {e}", path.display()));
+				.map_err(|e| anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display()))?;
 			for j in 0..w {
 				if tok[j] >= CONTEXT {
 					continue;
@@ -181,7 +181,7 @@ fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
 			}
 		}
 	}
-	(headers, cols)
+	Ok((headers, cols))
 }
 
 // Parks the detector's backing slab on every exit — normal return or a panic
@@ -203,9 +203,9 @@ impl Drop for ArenaGuard {
 /// `recipe_infer::LayerSpec` values, loads the inline checkpoint into it, and runs
 /// a single forward pass. The byte-id stream is the embed input, so no feature
 /// scaling and no categorical side-input (`x_cat = None`).
-pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
+pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	if columns.is_empty() {
-		return Vec::new();
+		return Ok(Vec::new());
 	}
 	let n = columns.len();
 	let mut data = Vec::with_capacity(n * CONTEXT);
@@ -224,9 +224,9 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	// input compose ONE init image; build/upload/scratch all bump-carve from
 	// one memset-committed slab — no per-buffer pool growth (the fresh-page
 	// commit that faults ~30-50% of fresh-process loads).
-	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL);
+	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL)?;
 	let plan = recipe_infer::plan_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, true)
-		.unwrap_or_else(|e| panic!("detect plan_layer_params: {e}"));
+		.map_err(|e| anyhow::anyhow!("detect plan_layer_params: {e}"))?;
 	let mut stage = recipe_infer::Stage::new();
 	let w_off = stage.push(plan.host());
 	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
@@ -241,13 +241,13 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	let need = est + est / 2 + (1 << 20);
 	let slab = recipe_infer::adopt_run_backing_with_image(need, &image)
 		.or_else(|| recipe_infer::claim_device_arena_with_image(&image))
-		.unwrap_or_else(|| {
-			panic!(
+		.ok_or_else(|| {
+			anyhow::anyhow!(
 				"detect: no device backing — footprint {}, claimable {}",
 				recipe_infer::human_bytes(need),
 				recipe_infer::human_bytes(recipe_infer::claimable_bytes()),
 			)
-		});
+		})?;
 	let base = slab.view(0, image_floats);
 	// Park-on-drop: on normal return the slab is parked for the next call to
 	// adopt; on an unwind through the forward it is parked (not freed) too.
@@ -255,7 +255,7 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	let params = plan.materialize(&base, w_off);
 	let xbuf = base.view(x_off, n * CONTEXT);
 	let consts_view = base.view(consts_off, 12);
-	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view);
+	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view)?;
 	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 	let last = params.len() - 1;
 	// Detector release (ONE drain): enqueue the logits D2H (async, no wait), then
@@ -263,10 +263,10 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 	// Scratch (all carves) drops after this drain, so its Drop drains nothing.
 	let mut preds = vec![0.0f64; n * N_CLASS];
 	let exit = unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
-		.expect("detect exit d2h enqueue");
-	recipe_infer::device_synchronize().expect("detect release sync");
+		.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
+	recipe_infer::device_synchronize().map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
 	exit.finish(&mut preds);
-	(0..n)
+	Ok((0..n)
 		.map(|r| {
 			let lg = &preds[r * N_CLASS..r * N_CLASS + N_CLASS];
 			let mut best = 0;
@@ -277,5 +277,5 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> Vec<usize> {
 			}
 			best
 		})
-		.collect()
+		.collect())
 }

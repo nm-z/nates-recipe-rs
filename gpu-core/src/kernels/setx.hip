@@ -1,24 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 
-// ── "set" category kernels (collision-safe setx_ / launch_setx_ names) ──
-// Sorted-distinct (unique), adjacent-dedup (unique_consecutive), membership
-// (isin), and run-length unique+counts. All dedup is delegated to hipcub
-// (DeviceSelect::Unique / DeviceRunLengthEncode::Encode); sorting to
-// DeviceRadixSort. Oracle for all = CPU set ops (see tests/prove_set.rs).
-//
-// Zero HIP memory APIs in this file. Every buffer is caller-allocated:
-//   - variable-length output buffer (capacity n) + a device int* out_count
-//     that hipcub fills (d_num_selected),
-//   - the sorted intermediate (keys_sorted / b_sorted, capacity n / nb),
-//   - the hipcub temp workspace (tmp, tmp_bytes). Its size comes from the
-//     matching launch_*_workspace_bytes() query, which the Rust caller calls
-//     first to size the allocation. One workspace is reused across the two
-//     sequential hipcub calls (sort then select/encode) sized to their max.
-// hipcub takes the const input directly, so no device-to-device input copy.
 
-// ── unique_consecutive: collapse ADJACENT duplicates only (no sort) ──
-// out[0..*out_count) = run-leaders of x in original order.
 extern "C" size_t launch_setx_unique_consecutive_workspace_bytes(int n) {
       size_t tmp_bytes = 0;
       hipcub::DeviceSelect::Unique(
@@ -33,7 +16,6 @@ extern "C" void launch_setx_unique_consecutive(
       hipcub::DeviceSelect::Unique(tmp, tmp_bytes, x, out, out_count, n, s);
 }
 
-// ── unique: sorted distinct = radix sort then adjacent dedup ──
 extern "C" size_t launch_setx_unique_workspace_bytes(int n) {
       size_t sort_bytes = 0;
       hipcub::DeviceRadixSort::SortKeys(
@@ -49,14 +31,10 @@ extern "C" size_t launch_setx_unique_workspace_bytes(int n) {
 extern "C" void launch_setx_unique(
       const double* x, double* keys_sorted, double* out, int* out_count,
       void* tmp, size_t tmp_bytes, int n, hipStream_t s) {
-      // sort ascending
       hipcub::DeviceRadixSort::SortKeys(tmp, tmp_bytes, x, keys_sorted, n, 0, sizeof(double) * 8, s);
-      // adjacent dedup on the sorted array == global distinct
       hipcub::DeviceSelect::Unique(tmp, tmp_bytes, keys_sorted, out, out_count, n, s);
 }
 
-// ── unique_counts: sorted distinct values + their multiplicities ──
-// vals_out[0..*out_count) sorted distinct; counts_out[i] = # occurrences.
 extern "C" size_t launch_setx_unique_counts_workspace_bytes(int n) {
       size_t sort_bytes = 0;
       hipcub::DeviceRadixSort::SortKeys(
@@ -76,14 +54,12 @@ extern "C" void launch_setx_unique_counts(
       hipcub::DeviceRunLengthEncode::Encode(tmp, tmp_bytes, keys_sorted, vals_out, counts_out, out_count, n, s);
 }
 
-// ── isin: mask[i] = (a[i] in b) ? 1.0 : 0.0, via sort(b) + binary search ──
-// One thread per element of a; lower_bound on sorted b, exact-equality check.
 extern "C" __global__ void setx_isin_kernel(
       const double* a, const double* b_sorted, double* mask, int na, int nb) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= na) return;
       double key = a[i];
-      int lo = 0, hi = nb;            // lower_bound: first index with b_sorted[idx] >= key
+      int lo = 0, hi = nb;
       while (lo < hi) {
             int mid = lo + ((hi - lo) >> 1);
             if (b_sorted[mid] < key) lo = mid + 1; else hi = mid;

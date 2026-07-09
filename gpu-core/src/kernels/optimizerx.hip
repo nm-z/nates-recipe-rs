@@ -1,13 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// ── New optimizer weight-update kernels (collision-safe optimizerx_ names) ───
-// Each kernel performs ONE in-place step over per-element weights/state.
 
-// Nesterov accelerated SGD (PyTorch form):
-//   buf = momentum*buf + g
-//   d   = g + momentum*buf
-//   w  -= lr * d
 extern "C" __global__ void optimizerx_nesterov_kernel(
       double* w, double* buf, const double* g,
       double lr, double momentum, int n)
@@ -29,11 +23,6 @@ extern "C" void launch_optimizerx_nesterov(
             w, buf, g, lr, momentum, n);
 }
 
-// Adadelta (Zeiler 2012):
-//   Eg = rho*Eg + (1-rho)*g^2
-//   dx = -sqrt(Edx + eps)/sqrt(Eg + eps) * g
-//   Edx = rho*Edx + (1-rho)*dx^2
-//   w += lr * dx     (lr usually 1.0)
 extern "C" __global__ void optimizerx_adadelta_kernel(
       double* w, double* eg, double* edx, const double* g,
       double lr, double rho, double eps, int n)
@@ -57,17 +46,6 @@ extern "C" void launch_optimizerx_adadelta(
             w, eg, edx, g, lr, rho, eps, n);
 }
 
-// RAdam (Liu et al. 2019), rectified Adam:
-//   m = b1*m + (1-b1)*g ;  v = b2*v + (1-b2)*g^2
-//   m_hat = m/(1-b1^t)
-//   rho_inf = 2/(1-b2) - 1
-//   rho_t   = rho_inf - 2*t*b2^t/(1-b2^t)
-//   if rho_t > 4:
-//       l = sqrt((1-b2^t)/v)             (adaptive lr term, v not v_hat)
-//       r = sqrt(((rho_t-4)*(rho_t-2)*rho_inf)/((rho_inf-4)*(rho_inf-2)*rho_t))
-//       w -= lr * r * m_hat * l
-//   else:
-//       w -= lr * m_hat
 extern "C" __global__ void optimizerx_radam_kernel(
       double* w, double* m, double* v, const double* g,
       double lr, double b1, double b2, double eps, int t, int n)
@@ -104,11 +82,6 @@ extern "C" void launch_optimizerx_radam(
             w, m, v, g, lr, b1, b2, eps, t, n);
 }
 
-// LARS (You et al. 2017), Layer-wise Adaptive Rate Scaling. Single vector = one layer.
-// Two-phase: phase1 accumulates ||w||^2 and ||g||^2; phase2 applies the update.
-//   trust = (||w||>0 && ||g||>0) ? lambda*||w|| / (||g|| + wd*||w|| + eps) : 1.0
-//   buf = momentum*buf + trust*(g + wd*w)
-//   w  -= lr * buf
 extern "C" __global__ void optimizerx_lars_phase1_kernel(
       const double* w, const double* g, int n,
       double* w_norm_sq, double* g_norm_sq)

@@ -1,14 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── Embedding-category GPU kernels (collision-safe embeddingx_ / launch_embeddingx_) ─
-//
-// embeddingx_lookup   : gather rows of (V,D) f64 table by i32 indices -> (N,D)
-// embeddingx_bag      : pooled lookup (sum/mean) over variable bags via i32 offsets -> (B,D)
-// embeddingx_one_hot  : i32 class ids (N) -> f64 one-hot (N,C)
-// embeddingx_rope     : NeoX-style rotary position embedding forward (x,cos,sin)->y
-// embeddingx_rope_bwd : RoPE backward; transpose of the forward rotation (dy,cos,sin)->dx
 
-// ── embedding lookup: out[i,j] = table[indices[i], j] ───────────────────────
 extern "C" __global__ void embeddingx_lookup_kernel(
     const double* table, const int* indices, double* out, int n, int d
 ) {
@@ -27,8 +19,6 @@ extern "C" void launch_embeddingx_lookup(
     hipLaunchKernelGGL(embeddingx_lookup_kernel, grid, block, 0, s, table, indices, out, n, d);
 }
 
-// ── embedding bag: pool rows[offsets[b]..offsets[b+1]) into out[b,:] ─────────
-// mode 0 = sum, mode 1 = mean. One thread per (bag, dim) output element.
 extern "C" __global__ void embeddingx_bag_kernel(
     const double* table, const int* indices, const int* offsets,
     double* out, int n_bags, int d, int mode
@@ -57,7 +47,6 @@ extern "C" void launch_embeddingx_bag(
     hipLaunchKernelGGL(embeddingx_bag_kernel, grid, block, 0, s, table, indices, offsets, out, n_bags, d, mode);
 }
 
-// ── one-hot: out[i, indices[i]] = 1, else 0 ─────────────────────────────────
 extern "C" __global__ void embeddingx_one_hot_kernel(
     const int* indices, double* out, int n, int c
 ) {
@@ -75,19 +64,14 @@ extern "C" void launch_embeddingx_one_hot(
     hipLaunchKernelGGL(embeddingx_one_hot_kernel, grid, block, 0, s, indices, out, n, c);
 }
 
-// ── RoPE forward (NeoX half-split convention) ───────────────────────────────
-// x:(n,d) row-major. cos,sin:(n, d/2) per-position rotation factors.
-// Pair element k in [0,d/2) with element k+d/2:
-//   y[k]      = x[k]*cos[k] - x[k+d/2]*sin[k]
-//   y[k+d/2]  = x[k+d/2]*cos[k] + x[k]*sin[k]
 extern "C" __global__ void embeddingx_rope_kernel(
     const double* x, const double* cosb, const double* sinb, double* y, int n, int d
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = d / 2;
     if (idx >= n * half) return;
-    int i = idx / half;          // position row
-    int k = idx % half;          // pair index
+    int i = idx / half;
+    int k = idx % half;
     long base = (long)i * d;
     double a = x[base + k];
     double b = x[base + k + half];
@@ -104,9 +88,6 @@ extern "C" void launch_embeddingx_rope(
     hipLaunchKernelGGL(embeddingx_rope_kernel, grid, block, 0, s, x, cosb, sinb, y, n, d);
 }
 
-// ── RoPE backward: dx = R^T dy (rotation by -theta) ─────────────────────────
-//   dx[k]      = dy[k]*cos[k] + dy[k+d/2]*sin[k]
-//   dx[k+d/2]  = dy[k+d/2]*cos[k] - dy[k]*sin[k]
 extern "C" __global__ void embeddingx_rope_bwd_kernel(
     const double* dy, const double* cosb, const double* sinb, double* dx, int n, int d
 ) {

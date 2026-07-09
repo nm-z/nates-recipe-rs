@@ -3,8 +3,6 @@
 #include <float.h>
 #include <rocprim/rocprim.hpp>
 
-// ── iota ──────────────────────────────────────────────────────────────────────
-// Fills out[i] = i for i in [0, n).
 
 __global__ void iota_kernel(int* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -17,13 +15,6 @@ extern "C" void launch_iota(int* out, int n, hipStream_t stream) {
       hipLaunchKernelGGL(iota_kernel, grid, block, 0, stream, out, n);
 }
 
-// ── Bitonic argsort building blocks (ascending by f64 key) ───────────────────
-// Keys padded with +INF sentinels so they sort to the tail. The caller drives
-// the bitonic schedule: it allocates keys[pn] (f64) and vals[pn] (i32) with
-// pn = next_pow2(n), fills keys[0..n) with the random keys, sets keys[n..pn) to
-// the sentinel via launch_fill_sentinel_f64, inits vals via launch_init_int_idx,
-// then runs the k/j double loop of launch_bitonic_step_idx. After the sort,
-// vals[0..n) is the permutation (the caller copies it to its perm output).
 
 __global__ void fill_sentinel_f64_kernel(double* data, int real_n, int padded_n, double sentinel) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -45,22 +36,16 @@ extern "C" void launch_init_int_idx(int* idx, int n, hipStream_t stream) {
       hipLaunchKernelGGL(init_int_idx_kernel, g, b, 0, stream, idx, n);
 }
 
-// ── random_permutation ────────────────────────────────────────────────────────
-// Uses a simple LCG on device to fill rand_keys[i]; argsorting those keys (via
-// the bitonic building blocks above) yields the permutation. The caller fills
-// the keys with launch_lcg_rand, then runs the bitonic schedule.
 
 __global__ void lcg_rand_kernel(double* out, int n, unsigned int seed) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
       if (i >= n) return;
-      // Per-element LCG seeded from (seed, i)
       unsigned int state = seed ^ ((unsigned int)i * 2654435761u);
       state ^= state >> 16;
       state *= 0x45d9f3b;
       state ^= state >> 16;
       state *= 0x45d9f3b;
       state ^= state >> 16;
-      // Map to [0, 1)
       out[i] = (double)(state & 0x00FFFFFFu) / (double)0x01000000;
 }
 
@@ -69,43 +54,20 @@ extern "C" void launch_lcg_rand(double* out, int n, unsigned int seed, hipStream
       hipLaunchKernelGGL(lcg_rand_kernel, grid, block, 0, stream, out, n, seed);
 }
 
-// ── ordered_target_stats ──────────────────────────────────────────────────────
-// Ordered (target-leakage-free) target statistics for CatBoost:
-//   For each row r, walking along perm[0], perm[1], ..., perm[n-1] in order,
-//   when we arrive at position p (row = perm[p]):
-//     seen_sum[cat]   = sum of target[perm[0..p-1]] where cat_col[perm[j]] == cat
-//     seen_cnt[cat]   = count of such rows
-//     TS = (seen_sum[cat] + prior * smoothing) / (seen_cnt[cat] + smoothing)
-//   encoded_out[ perm[p] ] = TS
-//
-// This is a single sequential scan along the permutation — no thread divergence
-// on writes (each category's accumulators are written by the single thread that
-// owns that position in the sweep). The kernel runs with 1 block of 1 thread so
-// the sequential ordering is preserved exactly.
-//
-// Correctness note: we read perm[p] to get the original row index, look up its
-// category, compute TS from accumulators built from rows perm[0..p-1] only (no
-// current row in numerator/denominator), then update the accumulator AFTER
-// writing. This is identical to what CatBoost's CPU path does and prevents the
-// target from leaking into its own statistic.
-//
-// The cat_sum / cat_cnt accumulators (n_categories doubles each) are caller-owned
-// scratch and must be zero-filled by the caller before launch.
 
 __global__ void ordered_target_stats_kernel(
-      const int*    cat_col,       // i32[n] — category index per row, 0-based
-      const double* target,        // f64[n] — regression target per row
-      const int*    perm,          // i32[n] — permutation order (from gpu_random_permutation)
-      double*       encoded_out,   // f64[n] — output: TS value for each row
-      double*       cat_sum,       // f64[n_categories] — scratch: per-category running sum
-      double*       cat_cnt,       // f64[n_categories] — scratch: per-category running count
+      const int*    cat_col,
+      const double* target,
+      const int*    perm,
+      double*       encoded_out,
+      double*       cat_sum,
+      double*       cat_cnt,
       int           n,
       const double* prior_p,
       const double* smoothing_p
 ) {
       double prior     = *prior_p;
       double smoothing = *smoothing_p;
-      // Sequential kernel: single thread walks perm order
       if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
       for (int p = 0; p < n; p++) {
@@ -113,9 +75,7 @@ __global__ void ordered_target_stats_kernel(
             int cat = cat_col[row];
             double s = cat_sum[cat];
             double c = cat_cnt[cat];
-            // TS uses only history BEFORE current position
             encoded_out[row] = (s + prior * smoothing) / (c + smoothing);
-            // Update accumulator with current row (available to subsequent rows)
             cat_sum[cat] = s + target[row];
             cat_cnt[cat] = c + 1.0;
       }
@@ -126,10 +86,10 @@ extern "C" void launch_ordered_target_stats(
       const double* target,
       const int*    perm,
       double*       encoded_out,
-      double*       cat_sum,       // scratch: n_categories doubles, caller zero-fills
-      double*       cat_cnt,       // scratch: n_categories doubles, caller zero-fills
+      double*       cat_sum,
+      double*       cat_cnt,
       int           n,
-      int           n_categories,  // scratch sizing only; unused inside the wrapper
+      int           n_categories,
       const double* prior,
       const double* smoothing,
       hipStream_t   stream
@@ -140,11 +100,6 @@ extern "C" void launch_ordered_target_stats(
             n, prior, smoothing);
 }
 
-// ── O(n) random permutation via rocPRIM radix sort ───────────────────────────
-// Replaces the O(n log²n) bitonic argsort (and its power-of-two padding): sort
-// (random f64 key, index) pairs by key; the reordered indices are the permutation.
-// Caller owns the temp buffer (queried via radix_perm_workspace_bytes) and the
-// double-buffer key/value outputs — matching the reduce.hip workspace convention.
 extern "C" size_t radix_perm_workspace_bytes(int n, hipStream_t stream) {
       size_t tmp_bytes = 0;
       rocprim::radix_sort_pairs(

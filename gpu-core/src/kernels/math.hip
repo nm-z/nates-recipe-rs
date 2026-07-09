@@ -1,8 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// Multiprocessor count of the current device via hipGetDeviceProperties →
-// prop.multiProcessorCount (CUs in CU mode, half-CUs in WGP mode). Returned as a
-// plain int so Rust never has to bind the ~800-byte hipDeviceProp_t struct.
 extern "C" int hip_multiprocessor_count() {
       int dev = 0;
       if (hipGetDevice(&dev) != hipSuccess) return 0;
@@ -11,7 +8,6 @@ extern "C" int hip_multiprocessor_count() {
       return prop.multiProcessorCount;
 }
 
-// ── Unary elementwise ──────────────────────────────────────────────────────
 
 extern "C" __global__ void rsqrt_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -68,7 +64,6 @@ extern "C" __global__ void trunc_kernel(const double* x, double* out, int n) {
       if (i < n) out[i] = trunc(x[i]);
 }
 
-// ── Binary elementwise ─────────────────────────────────────────────────────
 
 extern "C" __global__ void emax_kernel(const double* a, const double* b, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -90,7 +85,6 @@ extern "C" __global__ void fmod_kernel(const double* a, const double* b, double*
       if (i < n) out[i] = fmod(a[i], b[i]);
 }
 
-// ── Scalar ops ─────────────────────────────────────────────────────────────
 
 extern "C" __global__ void sub_scalar_kernel(const double* x, double* out, int n, const double* s) {
       double sv = *s;
@@ -116,10 +110,6 @@ extern "C" __global__ void rdiv_scalar_kernel(const double* x, double* out, int 
       if (i < n) out[i] = sv / x[i];
 }
 
-// ── Reduce: has_nan / isfinite_all ────────────────────────────────────────
-// flag buffer is a single i32, initialised to 0 by caller.
-// has_nan: sets flag to 1 if any element is NaN.
-// isfinite_all: sets flag to 1 if any element is NOT finite.
 
 extern "C" __global__ void has_nan_kernel(const double* x, int* flag, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,7 +121,6 @@ extern "C" __global__ void isfinite_all_kernel(const double* x, int* flag, int n
       if (i < n && !isfinite(x[i])) atomicOr(flag, 1);
 }
 
-// ── Launchers ──────────────────────────────────────────────────────────────
 
 extern "C" void launch_rsqrt(const double* x, double* out, int n, hipStream_t stream) {
       int threads = 256; int blocks = (n + threads - 1) / threads;
@@ -262,32 +251,23 @@ extern "C" void launch_tall_skinny_dgemm(
       hipLaunchKernelGGL(tall_skinny_dgemm_kernel, blocks, threads, 0, stream, X, W, C, M, N, K);
 }
 
-// ── Split-K backward weight gradient ───────────────────────────────────────
-// dW[i,j] = Σ_r X[r,i]·dZ[r,j], X is [m×k], dZ is [m×n], dW is [k×n] (all
-// row-major). The reduction axis r (= batch rows, ~475K) is the only large dim;
-// the output k×n is tiny (e.g. 42×64), so a plain GEMM launches ~4 workgroups and
-// leaves 50 of 54 CUs idle. Split the reduction into P slices: pass 1 has one
-// workgroup per (output tile, slice) accumulating a partial dW into a [P×k×n]
-// scratch with register micro-tiling + LDS staging; pass 2 sums the P partials.
-// Two-pass reduce (NOT f64 atomicAdd) keeps the sum order fixed → deterministic.
 #define SK_BM 64
 #define SK_BN 64
 #define SK_BK 16
 #define SK_TM 4
 #define SK_TN 4
-// threads = (SK_BM/SK_TM)*(SK_BN/SK_TN) = 16*16 = 256
 
 __global__ void splitk_dw_pass1(
-      const double* __restrict__ X,    // [m×k] row-major (a_prev / input)
-      const double* __restrict__ dZ,   // [m×n] row-major (grad)
-      double* __restrict__ partials,   // [P×k×n]
+      const double* __restrict__ X,
+      const double* __restrict__ dZ,
+      double* __restrict__ partials,
       int m, int n, int k, int P
 ) {
       int n_mtiles = (k + SK_BM - 1) / SK_BM;
       int tile = blockIdx.x;
-      int tm = tile % n_mtiles;        // BM tile along k (output rows)
-      int tn = tile / n_mtiles;        // BN tile along n (output cols)
-      int p  = blockIdx.y;             // reduction slice
+      int tm = tile % n_mtiles;
+      int tn = tile / n_mtiles;
+      int p  = blockIdx.y;
       int m0 = tm * SK_BM;
       int n0 = tn * SK_BN;
 
@@ -296,12 +276,12 @@ __global__ void splitk_dw_pass1(
       long long r_end    = r_begin + rows_per;
       if (r_end > (long long)m) r_end = (long long)m;
 
-      __shared__ double As[SK_BK][SK_BM];   // As[kk][mm] = X[(r0+kk)*k + m0+mm]
-      __shared__ double Bs[SK_BK][SK_BN];   // Bs[kk][nn] = dZ[(r0+kk)*n + n0+nn]
+      __shared__ double As[SK_BK][SK_BM];
+      __shared__ double Bs[SK_BK][SK_BN];
 
-      int tid  = threadIdx.x;               // 0..255
-      int tcol = tid % (SK_BN / SK_TN);     // 0..15
-      int trow = tid / (SK_BN / SK_TN);     // 0..15
+      int tid  = threadIdx.x;
+      int tcol = tid % (SK_BN / SK_TN);
+      int trow = tid / (SK_BN / SK_TN);
 
       double acc[SK_TM][SK_TN];
       #pragma unroll

@@ -1,7 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// CSR SpMV: y[i] = sum_{j in row i} values[k] * x[col_idx[k]]
-// One thread per row.
 extern "C" __global__ void csr_spmv_kernel(
     const double* values, const int* col_idx, const int* row_ptr,
     const double* x, double* y, int n_rows
@@ -27,8 +25,6 @@ extern "C" void launch_csr_spmv(
         values, col_idx, row_ptr, x, y, n_rows);
 }
 
-// CSR SpMM: C[i, f] = sum_{j in row i} values[k] * B[col_idx[k], f]
-// Grid: (ceil(feat/TILE_F), ceil(n_rows/TILE_R)); block: (TILE_F, TILE_R).
 #define TILE_F 16
 #define TILE_R 16
 
@@ -58,8 +54,6 @@ extern "C" void launch_csr_spmm(
         values, col_idx, row_ptr, B, C, n_rows, feat);
 }
 
-// Neighbor aggregation via atomicAdd scatter: for each edge (src->dst), add features[src] to agg[dst].
-// If mean=1, divide by in-degree at the end (second kernel).
 extern "C" __global__ void neighbor_agg_scatter_kernel(
     const double* features, const int* edge_src, const int* edge_dst,
     double* agg, int feat, int n_edges
@@ -73,7 +67,6 @@ extern "C" __global__ void neighbor_agg_scatter_kernel(
     atomicAdd(&agg[dst * feat + f], features[src * feat + f]);
 }
 
-// Divide each node's aggregated features by its in-degree.
 extern "C" __global__ void neighbor_agg_mean_kernel(
     double* agg, const double* deg, int n_nodes, int feat
 ) {
@@ -102,7 +95,6 @@ extern "C" void launch_neighbor_aggregate(
     }
 }
 
-// Compute in-degree as f64: deg[dst] += 1 for each edge.
 extern "C" __global__ void degree_kernel(
     const int* edge_dst, double* deg, int n_edges
 ) {
@@ -120,8 +112,6 @@ extern "C" void launch_degree(
         edge_dst, deg, n_edges);
 }
 
-// GCN normalization: scale features[node, f] by deg[node]^{-1/2}.
-// Nodes with deg=0 are left unchanged.
 extern "C" __global__ void gcn_norm_kernel(
     double* features, const double* deg, int n_nodes, int feat
 ) {

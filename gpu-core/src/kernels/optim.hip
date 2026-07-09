@@ -1,7 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// Momentum SGD: v = momentum*v - lr*g; w += v  (in-place, updates both w and v)
 extern "C" __global__ void momentum_update_kernel(
       double* w, double* v, const double* g,
       const double* lr_p, const double* momentum_p, int n)
@@ -26,7 +25,6 @@ extern "C" void launch_momentum_update(
             w, v, g, lr, momentum, n);
 }
 
-// RMSProp: cache = decay*cache + (1-decay)*g^2; w -= lr*g/(sqrt(cache)+eps)
 extern "C" __global__ void rmsprop_update_kernel(
       double* w, double* cache, const double* g,
       const double* lr_p, const double* decay_p, const double* eps_p, int n)
@@ -53,7 +51,6 @@ extern "C" void launch_rmsprop_update(
             w, cache, g, lr, decay, eps, n);
 }
 
-// Adagrad: accum += g^2; w -= lr*g/(sqrt(accum)+eps)
 extern "C" __global__ void adagrad_update_kernel(
       double* w, double* accum, const double* g,
       const double* lr_p, const double* eps_p, int n)
@@ -79,8 +76,6 @@ extern "C" void launch_adagrad_update(
             w, accum, g, lr, eps, n);
 }
 
-// LAMB phase 1: compute Adam moments, write per-element update to tmp_upd,
-// and accumulate ||w||^2 and ||update||^2 into single-element buffers via atomicAdd.
 extern "C" __global__ void lamb_phase1_kernel(
       double* w, double* m, double* v, const double* g,
       const double* b1_p, const double* b2_p, const double* eps_p, const double* wd_p, int t, int n,
@@ -122,8 +117,6 @@ extern "C" __global__ void lamb_phase1_kernel(
       }
 }
 
-// LAMB phase 2: w -= lr * trust_ratio * tmp_upd
-// trust_ratio = ||w|| / ||update||, clamped to 1.0 if either norm is 0.
 extern "C" __global__ void lamb_phase2_kernel(
       double* w, const double* tmp_upd,
       const double* lr_p, const double* w_norm_sq, const double* u_norm_sq, int n)
@@ -161,7 +154,6 @@ extern "C" void launch_lamb_phase2(
             w, tmp_upd, lr, w_norm_sq, u_norm_sq, n);
 }
 
-// Lion: update = sign(b1*m + (1-b1)*g); w -= lr*(update + wd*w); m = b2*m + (1-b2)*g
 extern "C" __global__ void lion_update_kernel(
       double* w, double* m, const double* g,
       const double* lr_p, const double* b1_p, const double* b2_p, const double* wd_p, int n)
@@ -191,12 +183,6 @@ extern "C" void launch_lion_update(
             w, m, g, lr, b1, b2, wd, n);
 }
 
-// Nadam: Nesterov-accelerated Adam
-// m = b1*m + (1-b1)*g
-// v = b2*v + (1-b2)*g^2
-// m_hat_nesterov = b1*m/(1-b1^(t+1)) + (1-b1)*g/(1-b1^t)
-// v_hat = v / (1 - b2^t)
-// w -= lr * m_hat_nesterov / (sqrt(v_hat) + eps)
 extern "C" __global__ void nadam_update_kernel(
       double* w, double* m, double* v, const double* g,
       const double* lr_p, const double* b1_p, const double* b2_p, const double* eps_p, int t, int n)
@@ -233,7 +219,6 @@ extern "C" void launch_nadam_update(
             w, m, v, g, lr, b1, b2, eps, t, n);
 }
 
-// Clip value in-place: x[i] = clamp(x[i], lo, hi)
 extern "C" __global__ void clip_value_kernel(double* x, const double* lo_p, const double* hi_p, int n) {
       double lo = *lo_p;
       double hi = *hi_p;
@@ -253,7 +238,6 @@ extern "C" void launch_clip_value(double* x, const double* lo, const double* hi,
             x, lo, hi, n);
 }
 
-// Plain SGD step: weights[i] += neg_lr * grad[i] (neg_lr = -lr, device scalar)
 extern "C" __global__ void sgd_update_f64_kernel(double* w, const double* g, const double* neg_lr_p, int n) {
       double neg_lr = *neg_lr_p;
       int i = blockIdx.x * blockDim.x + threadIdx.x;

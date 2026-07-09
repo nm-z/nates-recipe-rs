@@ -2,9 +2,6 @@
 
 #define TILE 16
 
-// ── pairwise cosine ──────────────────────────────────────────────────────────
-// query (nq x dim), train (nt x dim) → out (nq x nt), each entry = cosine similarity.
-// Tiled: accumulates dot(q,t), ||q||², ||t||² in shared memory.
 __global__ void pairwise_cosine_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim
@@ -57,9 +54,6 @@ extern "C" void launch_pairwise_cosine(
                          query, train, out, nq, nt, dim);
 }
 
-// ── pairwise L1 ──────────────────────────────────────────────────────────────
-// query (nq x dim), train (nt x dim) → out (nq x nt), each entry = L1 distance.
-// Tiled shared memory same pattern as L2.
 __global__ void pairwise_l1_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim
@@ -102,11 +96,6 @@ extern "C" void launch_pairwise_l1(
                          query, train, out, nq, nt, dim);
 }
 
-// ── pairwise Hamming ─────────────────────────────────────────────────────────
-// query_u8 (nq x dim), train_u8 (nt x dim) → out (nq x nt) as f64.
-// Each entry = fraction of differing positions (Hamming distance / dim).
-// Inputs are uint8 (e.g. quantized bins or binary features).
-// Tiled with uint8 shared memory to maximise occupancy.
 __global__ void pairwise_hamming_kernel(
       const unsigned char* query, const unsigned char* train, double* out,
       int nq, int nt, int dim

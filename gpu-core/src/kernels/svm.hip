@@ -1,12 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// ── Kernel matrix computation ────────────────────────────────────────────────
-// kind: 0=linear  k(a,b) = a·b
-//       1=rbf     k(a,b) = exp(-gamma * ||a-b||^2)
-//       2=poly    k(a,b) = (gamma * a·b + coef0)^degree
-//       3=sigmoid k(a,b) = tanh(gamma * a·b + coef0)
-// Output: K[n*n], row-major.
 
 #define TILE 16
 
@@ -90,13 +84,6 @@ extern "C" void launch_kernel_matrix(
             x, k_out, n, dim, kind, gamma, coef0, degree);
 }
 
-// ── SMO gradient vector update ────────────────────────────────────────────────
-// After picking working pair (i, j) on host, update:
-//   grad[t] += delta_i * K[i,t] + delta_j * K[j,t]   for all t
-// where delta_i = y[i] * (new_alpha_i - old_alpha_i),
-//       delta_j = y[j] * (new_alpha_j - old_alpha_j)
-// The gradient here is the dual objective gradient: G[t] = sum_s alpha[s]*y[s]*K[s,t] - 1
-// We accumulate the change from the two updated alphas.
 
 __global__ void smo_update_gradient_kernel(
       double*       grad,
@@ -128,21 +115,13 @@ extern "C" void launch_smo_update_gradient(
             grad, K, n, row_i, row_j, delta_i, delta_j);
 }
 
-// ── KKT violation scoring ─────────────────────────────────────────────────────
-// For working-set selection we score each sample by its KKT violation magnitude.
-// F[t] = y[t] * G[t]  (the functional margin).
-// For the "i" side (upper bound candidates): score_i[t] = -F[t]
-//   valid when alpha[t] < C (if y[t]=+1) or alpha[t] > 0 (if y[t]=-1)
-// For the "j" side (lower bound candidates): score_j[t] = +F[t]
-//   valid when alpha[t] > 0 (if y[t]=+1) or alpha[t] < C (if y[t]=-1)
-// We write per-sample scores; host picks argmax for i and argmax for j.
 
 __global__ void smo_kkt_score_kernel(
-      const double* grad,    // G[t]: gradient of dual objective
-      const double* alpha,   // current alphas
-      const double* y,       // labels in {-1,+1}
-      double*       score_i, // upper-set violation: -y[t]*G[t], -inf if inactive
-      double*       score_j, // lower-set violation: +y[t]*G[t], -inf if inactive
+      const double* grad,
+      const double* alpha,
+      const double* y,
+      double*       score_i,
+      double*       score_j,
       int           n,
       const double* C_p
 ) {
@@ -154,9 +133,7 @@ __global__ void smo_kkt_score_kernel(
       double at    = alpha[t];
       double F_t   = yt * grad[t];
 
-      // Upper bound set I_up: {t : (y=+1 && a<C) || (y=-1 && a>0)}
       bool in_up = (yt > 0.0) ? (at < C) : (at > 0.0);
-      // Lower bound set I_down: {t : (y=+1 && a>0) || (y=-1 && a<C)}
       bool in_down = (yt > 0.0) ? (at > 0.0) : (at < C);
 
       score_i[t] = in_up   ? (-F_t) : (-1e308);
@@ -179,9 +156,6 @@ extern "C" void launch_smo_kkt_score(
             grad, alpha, y, score_i, score_j, n, C);
 }
 
-// ── Matrix-free SMO support ──────────────────────────────────────────────────
-// Compute one kernel-matrix ROW on demand: krow[t] = K(x_row, x_t) for all t.
-// Lets SMO run without ever materializing the n×n matrix (item 5: no O(n²) alloc).
 __global__ void smo_kernel_row_kernel(
       const double* x, double* krow, int n, int dim, int row,
       int kind, const double* gamma_p, const double* coef0_p, const double* degree_p
@@ -223,8 +197,6 @@ extern "C" void launch_smo_kernel_row(
             x, krow, n, dim, row, kind, gamma, coef0, degree);
 }
 
-// Single-block argmax over s[n] → out[0]=max value, out[1]=index (as double).
-// Keeps working-set selection on the GPU (item 3: no per-iter O(n) score download).
 __global__ void smo_argmax_kernel(const double* s, double* out, int n) {
       __shared__ double vbuf[256];
       __shared__ int    ibuf[256];
@@ -250,8 +222,6 @@ extern "C" void launch_smo_argmax(const double* s, double* out, int n, hipStream
       hipLaunchKernelGGL(smo_argmax_kernel, dim3(1), dim3(256), 0, stream, s, out, n);
 }
 
-// Gradient update from two precomputed kernel rows (matrix-free variant):
-//   grad[t] += di * krow_i[t] + dj * krow_j[t]
 __global__ void smo_update_gradient_rows_kernel(
       double* grad, const double* ki, const double* kj, int n, const double* di_p, const double* dj_p
 ) {

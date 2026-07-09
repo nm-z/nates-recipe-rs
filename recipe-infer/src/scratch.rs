@@ -90,15 +90,15 @@ pub fn layer_ms_from(
 }
 
 impl Scratch {
-	pub fn new_full(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
+	pub fn new_full(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, false, false, consts, 1)
 	}
 
-	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> Scratch {
+	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, false, true, consts, n_timed)
 	}
 
-	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
+	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, true, false, consts, 0)
 	}
 
@@ -109,12 +109,12 @@ impl Scratch {
 		light: bool,
 		consts: &GpuBuffer,
 		n_timed: usize,
-	) -> Scratch {
+	) -> anyhow::Result<Scratch> {
 		let bw = move |sz: usize| if forward_only { 1 } else { sz };
 		let lt = move |sz: usize| if light { 1 } else { sz };
-		let alloc = |sz: usize, label: &str| -> GpuBuffer {
-			GpuBuffer::alloc(sz).unwrap_or_else(|e| {
-				panic!(
+		let alloc = |sz: usize, label: &str| -> anyhow::Result<GpuBuffer> {
+			GpuBuffer::alloc(sz).map_err(|e| {
+				anyhow::anyhow!(
 					"{label}: GPU alloc of {} ({sz} × f64) failed — {e:?}",
 					crate::human_bytes(sz * 8)
 				)
@@ -203,7 +203,7 @@ impl Scratch {
 		let mut acts = Vec::with_capacity(params.len());
 		let mut preact = Vec::with_capacity(params.len());
 		for p in params {
-			acts.push(alloc(if light && acts.len() + 1 != params.len() { 1 } else { n * p.out_dim }, "scratch acts"));
+			acts.push(alloc(if light && acts.len() + 1 != params.len() { 1 } else { n * p.out_dim }, "scratch acts")?);
 			let needs_pre = matches!(
 				p.act,
 				Activation::Silu
@@ -213,7 +213,7 @@ impl Scratch {
 			preact.push(alloc(
 				if needs_pre { lt(n * p.out_dim) } else { 1 },
 				"scratch preact",
-			));
+			)?);
 		}
 		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
 		let (concat_sz, concat_grad_sz) = match concat_layer(params) {
@@ -235,29 +235,29 @@ impl Scratch {
 			unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
 			let usable = free / 2;
 			let chunks = (usable / (max_conv_fsz * 8)).min(n).max(1);
-			let buf = alloc(max_conv_fsz * chunks, "conv_temp");
+			let buf = alloc(max_conv_fsz * chunks, "conv_temp")?;
 			let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunks, max_conv_fsz);
 			if ws > max_ws { max_ws = ws; }
 			(buf, chunks)
 		} else {
-			(alloc(1, "conv_temp"), 0)
+			(alloc(1, "conv_temp")?, 0)
 		};
 		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
 		let pinned_pair = pinned_scalar_pair();
-		Scratch {
+		Ok(Scratch {
 			acts,
 			preact,
-			da_a: alloc(lt(bw(max_act)), "da_a"),
-			da_b: alloc(lt(bw(max_act)), "da_b"),
-			dz: alloc(lt(bw(max_act)), "dz"),
-			dw: alloc(lt(bw(max_wt)), "dw"),
-			dw_partials: alloc(lt(bw(max_dw_partials)), "dw_partials"),
-			db: alloc(lt(bw(max_bias)), "db"),
-			metric_t0: alloc(out_elems, "metric_t0"),
-			metric_t1: alloc(out_elems, "metric_t1"),
-			metric_t2: alloc(out_elems, "metric_t2"),
-			metric_scalar: alloc(1, "metric_scalar"),
-			metric_scalar_b: alloc(1, "metric_scalar_b"),
+			da_a: alloc(lt(bw(max_act)), "da_a")?,
+			da_b: alloc(lt(bw(max_act)), "da_b")?,
+			dz: alloc(lt(bw(max_act)), "dz")?,
+			dw: alloc(lt(bw(max_wt)), "dw")?,
+			dw_partials: alloc(lt(bw(max_dw_partials)), "dw_partials")?,
+			db: alloc(lt(bw(max_bias)), "db")?,
+			metric_t0: alloc(out_elems, "metric_t0")?,
+			metric_t1: alloc(out_elems, "metric_t1")?,
+			metric_t2: alloc(out_elems, "metric_t2")?,
+			metric_scalar: alloc(1, "metric_scalar")?,
+			metric_scalar_b: alloc(1, "metric_scalar_b")?,
 			c_one: cbuf(0),
 			c_neg_one: cbuf(1),
 			c_half: cbuf(2),
@@ -270,30 +270,30 @@ impl Scratch {
 			c_focal_gamma: cbuf(9),
 			c_focal_alpha: cbuf(10),
 			c_rope_theta: cbuf(11),
-			reduce_ws: GpuBuffer::alloc_bytes(max_ws).unwrap_or_else(|e| {
-				panic!(
+			reduce_ws: GpuBuffer::alloc_bytes(max_ws).map_err(|e| {
+				anyhow::anyhow!(
 					"reduce_ws: GPU alloc of {} failed — {e:?}",
 					crate::human_bytes(max_ws)
 				)
-			}),
-			embed_grad: alloc(bw(max_embed_grad), "embed_grad"),
-			a_q: alloc(lt(max_seqd), "a_q"),
-			a_k: alloc(lt(max_seqd), "a_k"),
-			a_v: alloc(lt(max_seqd), "a_v"),
-			a_ctx: alloc(lt(max_seqd), "a_ctx"),
-			a_lse: alloc(if forward_only || light { 1 } else { max_lse }, "a_lse"),
-			a_dctx: alloc(lt(bw(max_seqd)), "a_dctx"),
-			a_dq: alloc(lt(bw(max_seqd)), "a_dq"),
-			a_dk: alloc(lt(bw(max_seqd)), "a_dk"),
-			a_dv: alloc(lt(bw(max_seqd)), "a_dv"),
-			a_dsum: alloc(lt(bw(max_lse)), "a_dsum"),
-			a_gw: alloc(bw(max_dd), "a_gw"),
-			a_dbias: alloc(bw(max_dd), "a_dbias"),
-			prelu_t0: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t0"),
-			prelu_t1: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t1"),
-			prelu_scalar: alloc(1, "prelu_scalar"),
-			concat: alloc(lt(concat_sz), "concat"),
-			concat_dgrad: alloc(lt(bw(concat_grad_sz)), "concat_dgrad"),
+			})?,
+			embed_grad: alloc(bw(max_embed_grad), "embed_grad")?,
+			a_q: alloc(lt(max_seqd), "a_q")?,
+			a_k: alloc(lt(max_seqd), "a_k")?,
+			a_v: alloc(lt(max_seqd), "a_v")?,
+			a_ctx: alloc(lt(max_seqd), "a_ctx")?,
+			a_lse: alloc(if forward_only || light { 1 } else { max_lse }, "a_lse")?,
+			a_dctx: alloc(lt(bw(max_seqd)), "a_dctx")?,
+			a_dq: alloc(lt(bw(max_seqd)), "a_dq")?,
+			a_dk: alloc(lt(bw(max_seqd)), "a_dk")?,
+			a_dv: alloc(lt(bw(max_seqd)), "a_dv")?,
+			a_dsum: alloc(lt(bw(max_lse)), "a_dsum")?,
+			a_gw: alloc(bw(max_dd), "a_gw")?,
+			a_dbias: alloc(bw(max_dd), "a_dbias")?,
+			prelu_t0: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t0")?,
+			prelu_t1: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t1")?,
+			prelu_scalar: alloc(1, "prelu_scalar")?,
+			concat: alloc(lt(concat_sz), "concat")?,
+			concat_dgrad: alloc(lt(bw(concat_grad_sz)), "concat_dgrad")?,
 			conv_temp: conv_temp_buf,
 			conv_wg: conv_wg_count,
 			infer: forward_only,
@@ -308,7 +308,7 @@ impl Scratch {
 				.collect(),
 			timing: std::cell::Cell::new(false),
 			timing_slot: std::cell::Cell::new(0),
-		}
+		})
 	}
 
 	pub fn set_timing(&self, on: bool) {

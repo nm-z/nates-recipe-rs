@@ -1,14 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── Quantization primitives (affine per-tensor) ──────────────────────────────
-// Convention (PyTorch / TFLite / ONNX affine quant):
-//   quantize   : q = clamp(round(x/scale) + zero_point, qmin, qmax)
-//   dequantize : x = (q - zero_point) * scale
-//   fake_quant : x' = (clamp(round(x/scale)+zp, qmin, qmax) - zp) * scale
-// round() is half-away-from-zero (HIP device round == C round == f64::round).
-// int8 storage uses signed char (i8); int4 uses one value per byte in [-8,7].
 
-// ── quantize_per_tensor → i8 (qmin=-128, qmax=127) ───────────────────────────
 extern "C" __global__ void quantizedx_quantize_i8_kernel(
       const double* x, signed char* q, double scale, int zero_point,
       int qmin, int qmax, int n
@@ -31,7 +23,6 @@ extern "C" void launch_quantizedx_quantize_i8(
                          x, q, scale, zero_point, qmin, qmax, n);
 }
 
-// ── dequantize from i8 ───────────────────────────────────────────────────────
 extern "C" __global__ void quantizedx_dequantize_i8_kernel(
       const signed char* q, double* x, double scale, int zero_point, int n
 ) {
@@ -48,7 +39,6 @@ extern "C" void launch_quantizedx_dequantize_i8(
                          q, x, scale, zero_point, n);
 }
 
-// ── fake_quant i8 (dequant of quant, stays in f64) ───────────────────────────
 extern "C" __global__ void quantizedx_fake_quant_i8_kernel(
       const double* x, double* out, double scale, int zero_point,
       int qmin, int qmax, int n
@@ -71,7 +61,6 @@ extern "C" void launch_quantizedx_fake_quant_i8(
                          x, out, scale, zero_point, qmin, qmax, n);
 }
 
-// ── int4 variants (qmin=-8, qmax=7), one value per signed-char byte ──────────
 extern "C" __global__ void quantizedx_quantize_i4_kernel(
       const double* x, signed char* q, double scale, int zero_point,
       int qmin, int qmax, int n

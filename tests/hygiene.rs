@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const SRC_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src"];
+const KERNEL_ROOTS: &[&str] = &["gpu-core/src/kernels"];
 const LEAK_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "examples"];
 const LIB_ROOTS: &[&str] = &["src/lib.rs", "src/utils", "recipe-infer/src", "ogdl/src"];
 
@@ -21,25 +22,44 @@ const SPY_COUNTERS: usize = 47;
 const MAX_DOC_LINES_ON_PUB_FN: usize = 1;
 const MAX_FILE_LINES: usize = 2000;
 
+const MATH_ROOTS: &[&str] = &["src", "recipe-infer/src"];
+const LOOP_KEYWORDS: &[&str] = &["for ", "while ", "loop "];
+const NESTED_TYPES: &[&str] = &["Option<Option", "Result<Result", "Option<Result<Result"];
+const AS_CASTS: &[&str] =
+      &[" as f64", " as f32", " as usize", " as i32", " as u32", " as i64", " as u64"];
+const CRASH_PATTERNS: &[&str] = &["panic!", "unreachable!", ".unwrap()", ".expect("];
+const SUPPRESSED_LINTS: &[&str] = &["#[allow(", "#![allow("];
+const MAGIC_NUMBERS: &[&str] = &["1024", "2048", "4096", "65536", "1048576", "67108864"];
+const SNEAK_HIP_APIS: &[&str] =
+      &["hipHostRegister", "hipMallocManaged", "hipMemAdvise", "hipHostGetDevicePointer"];
+const SLEEP_ALLOWED: &[&str] = &["src/utils/wire.rs", "src/utils/probe.rs"];
+const UNSAFE_ALLOWED: &[&str] = &["src/utils/ooc.rs"];
+const AS_CAST_BUDGET: usize = 20;
+const PUB_FIELD_BUDGET: usize = 10;
+
 fn rs_files(roots: &[&str]) -> Vec<PathBuf> {
+      files_with_ext(roots, "rs")
+}
+
+fn files_with_ext(roots: &[&str], ext: &str) -> Vec<PathBuf> {
       let mut out = Vec::new();
       for r in roots {
-            collect_rs(&Path::new(ROOT).join(r), &mut out);
+            collect_ext(&Path::new(ROOT).join(r), ext, &mut out);
       }
       out.sort();
       out
 }
 
-fn collect_rs(p: &Path, out: &mut Vec<PathBuf>) {
+fn collect_ext(p: &Path, ext: &str, out: &mut Vec<PathBuf>) {
       if p.is_file() {
-            if p.extension().is_some_and(|e| e == "rs") {
+            if p.extension().is_some_and(|e| e == ext) {
                   out.push(p.to_path_buf());
             }
             return;
       }
       let Ok(rd) = fs::read_dir(p) else { return };
       for e in rd.flatten() {
-            collect_rs(&e.path(), out);
+            collect_ext(&e.path(), ext, out);
       }
 }
 
@@ -57,6 +77,55 @@ fn read(p: &Path) -> String {
 
 fn assert_absent(check: &str, hits: &[String]) {
       assert!(hits.is_empty(), "FAIL: {check}\n  {}", hits.join("\n  "));
+}
+
+fn warn(check: &str, hits: &[String]) {
+      for h in hits.iter().take(10) {
+            eprintln!("  {h}");
+      }
+      if !hits.is_empty() {
+            eprintln!("WARN: {check} ({} sites)", hits.len());
+      }
+}
+
+fn allowed(p: &Path, list: &[&str]) -> bool {
+      list.contains(&rel(p).as_str())
+}
+
+fn code_lines(p: &Path) -> Vec<String> {
+      let src = read(p);
+      let (m, is_test) = non_test_lines(&src);
+      (0..m.nlines())
+            .map(|l| if is_test[l] { String::new() } else { m.without_comments(l) })
+            .collect()
+}
+
+fn token_at(line: &str, tok: &str) -> bool {
+      let b = line.as_bytes();
+      line.match_indices(tok).any(|(i, s)| {
+            let before = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let j = i + s.len();
+            let after = j >= b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+            before && after
+      })
+}
+
+fn static_eprintln(line: &str) -> bool {
+      let Some(i) = line.find("eprintln!(\"") else { return false };
+      let rest = &line[i + "eprintln!(\"".len()..];
+      let Some(end) = rest.find('"') else { return false };
+      let body = &rest[..end];
+      !body.contains('{') && rest[end..].starts_with("\")")
+}
+
+fn pub_field(line: &str) -> bool {
+      let t = line.trim_start();
+      if t.starts_with("pub(") {
+            return false;
+      }
+      let Some(rest) = t.strip_prefix("pub ") else { return false };
+      let name: String = rest.chars().take_while(|c| c.is_ascii_lowercase() || *c == '_').collect();
+      !name.is_empty() && rest[name.len()..].trim_start().starts_with(':')
 }
 
 struct Marks {
@@ -338,6 +407,8 @@ fn h00_scanner_sees_sources() {
       for want in ["src/lib.rs", "src/utils/train.rs", "recipe-infer/src/params.rs"] {
             assert!(f.iter().any(|p| rel(p) == want), "scanner missed {want}");
       }
+      let hip = files_with_ext(KERNEL_ROOTS, "hip");
+      assert!(hip.len() >= 50, "scanner found only {} .hip kernels", hip.len());
 }
 
 #[test]
@@ -370,8 +441,10 @@ fn h02_no_static_mut_return() {
 
 #[test]
 fn h03_no_comments() {
+      let mut sources = rs_files(SRC_ROOTS);
+      sources.extend(files_with_ext(KERNEL_ROOTS, "hip"));
       let mut hits = Vec::new();
-      for p in rs_files(SRC_ROOTS) {
+      for p in sources {
             if path_contains(&p, "test") {
                   continue;
             }
@@ -383,6 +456,22 @@ fn h03_no_comments() {
             }
       }
       assert_absent("comment", &hits);
+}
+
+#[test]
+fn h16_no_compiler_warnings() {
+      let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+      let out = std::process::Command::new(cargo)
+            .args(["build", "--workspace", "--release"])
+            .current_dir(ROOT)
+            .output()
+            .expect("spawn cargo build");
+      let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+      text.push_str(&String::from_utf8_lossy(&out.stderr));
+      assert!(out.status.success(), "cargo build --workspace --release failed\n{text}");
+      let hits: Vec<String> =
+            text.lines().filter(|l| l.contains("warning")).map(|l| l.trim().to_owned()).collect();
+      assert_absent("compiler warning", &hits);
 }
 
 #[test]
@@ -593,4 +682,281 @@ fn h15_spy_counter_count() {
             .parse()
             .unwrap_or_else(|e| panic!("{SPY}: N is not a number: {e}"));
       assert_eq!(n, SPY_COUNTERS, "FAIL: callspy N={n}, expected {SPY_COUNTERS}");
+}
+
+#[test]
+fn h33_clone_in_loop_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(MATH_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains(".clone()") && LOOP_KEYWORDS.iter().any(|k| l.contains(k)) {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      warn("clone inside loop", &hits);
+}
+
+#[test]
+fn h17_no_cfg_test_on_functions() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            let src = read(&p);
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                  if !l.contains("#[cfg(test)]") {
+                        continue;
+                  }
+                  let next = lines.get(i + 1).map(|s| s.trim_start()).unwrap_or("");
+                  if !(next.starts_with("mod ") || next.starts_with("pub mod ")) {
+                        hits.push(format!("{}:{}: gates `{}`", rel(&p), i + 1, next.trim()));
+                  }
+            }
+      }
+      assert_absent("#[cfg(test)] on a non-module item", &hits);
+}
+
+#[test]
+fn h18_string_struct_field_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.trim_start().starts_with("pub") && l.contains(": String,") {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      warn("String struct fields (review if &str or enum fits)", &hits);
+}
+
+#[test]
+fn h19_no_nested_option_or_result() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  for pat in NESTED_TYPES {
+                        if l.contains(pat) {
+                              hits.push(format!("{}:{}: {pat}", rel(&p), i + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("nested Option/Result", &hits);
+}
+
+#[test]
+fn h20_as_cast_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if AS_CASTS.iter().any(|c| l.contains(c)) {
+                        hits.push(format!("{}:{}", rel(&p), i + 1));
+                  }
+            }
+      }
+      if hits.len() > AS_CAST_BUDGET {
+            warn("as-casts, review for silent truncation", &hits);
+      }
+}
+
+#[test]
+fn h21_discarded_result_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains(".ok();") {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      warn("swallowed Result with .ok()", &hits);
+}
+
+#[test]
+fn h22_no_thread_sleep() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") || allowed(&p, SLEEP_ALLOWED) {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains("thread::sleep") {
+                        hits.push(format!("{}:{}", rel(&p), i + 1));
+                  }
+            }
+      }
+      assert_absent("thread::sleep in shipped code", &hits);
+}
+
+#[test]
+fn h23_no_crash_pattern_in_library() {
+      let mut hits = Vec::new();
+      for p in rs_files(LIB_ROOTS) {
+            if path_contains(&p, "test") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  for pat in CRASH_PATTERNS {
+                        if l.contains(pat) {
+                              hits.push(format!("{}:{}: {pat}", rel(&p), i + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("crash pattern in library code", &hits);
+}
+
+#[test]
+fn h24_no_process_exit_in_library() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") || path_contains(&p, "main") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains("process::exit") {
+                        hits.push(format!("{}:{}", rel(&p), i + 1));
+                  }
+            }
+      }
+      assert_absent("process::exit in library", &hits);
+}
+
+#[test]
+fn h25_unsafe_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") || allowed(&p, UNSAFE_ALLOWED) {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if token_at(l, "unsafe") {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      warn("unsafe outside gpu-core", &hits);
+}
+
+#[test]
+fn h26_no_dbg() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains("dbg!") {
+                        hits.push(format!("{}:{}", rel(&p), i + 1));
+                  }
+            }
+      }
+      assert_absent("dbg! left in code", &hits);
+}
+
+#[test]
+fn h27_no_suppressed_dead_code() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in read(&p).lines().enumerate() {
+                  for pat in SUPPRESSED_LINTS {
+                        if l.contains(pat) {
+                              hits.push(format!("{}:{}: {pat}", rel(&p), i + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("suppressed dead code warning", &hits);
+}
+
+#[test]
+fn h28_magic_number_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(MATH_ROOTS) {
+            if path_contains(&p, "test") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains("const ") {
+                        continue;
+                  }
+                  for n in MAGIC_NUMBERS {
+                        if token_at(l, n) {
+                              hits.push(format!("{}:{}: {n}", rel(&p), i + 1));
+                        }
+                  }
+            }
+      }
+      warn("magic number", &hits);
+}
+
+#[test]
+fn h29_static_eprintln_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            if path_contains(&p, "test") {
+                  continue;
+            }
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if static_eprintln(l) {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      warn("static eprintln (dead debug?)", &hits);
+}
+
+#[test]
+fn h30_no_empty_expect() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if l.contains(".expect(\"\")") {
+                        hits.push(format!("{}:{}", rel(&p), i + 1));
+                  }
+            }
+      }
+      assert_absent("empty expect message", &hits);
+}
+
+#[test]
+fn h31_pub_field_report() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            for (i, l) in code_lines(&p).iter().enumerate() {
+                  if pub_field(l) {
+                        hits.push(format!("{}:{}: {}", rel(&p), i + 1, l.trim()));
+                  }
+            }
+      }
+      if hits.len() > PUB_FIELD_BUDGET {
+            warn("pub struct fields, review encapsulation", &hits);
+      }
+}
+
+#[test]
+fn h32_no_sneak_hip_api() {
+      let mut hits = Vec::new();
+      for p in rs_files(MATH_ROOTS) {
+            for (i, l) in read(&p).lines().enumerate() {
+                  for pat in SNEAK_HIP_APIS {
+                        if l.contains(pat) {
+                              hits.push(format!("{}:{}: {pat}", rel(&p), i + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("sneak HIP API outside callspy", &hits);
+}
+
+#[test]
+fn h33_single_log_file() {
+      let logs = files_with_ext(&[""], "log");
+      if logs.len() > 1 {
+            let hits: Vec<String> = logs.iter().map(|p| rel(p)).collect();
+            assert_absent("multiple .log files in repo root", &hits);
+      }
 }

@@ -50,7 +50,7 @@ impl Machine {
 		let ddr5_gbs = bench_ddr5();
 		let cpu_transfer_gbs = bench_cpu_read();
 		let cpu_gflops = bench_cpu_flops();
-		let dd = data_dir();
+		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
 		eprintln!("recipe probe: measuring disk (sata)");
 		let sata_gbs = bench_disk(&dd)?;
@@ -210,17 +210,9 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 	}
 }
 
-pub fn probe_gpu_child_main(dev: i32) -> ! {
-	match measure_gpu(dev) {
-		Ok(g) => {
-			println!("{}|{}|{}|{}", g.vram, g.pcie_gbs, g.flops_gflops, g.transfer_gbs);
-			std::process::exit(0);
-		}
-		Err(e) => {
-			eprintln!("probe child gpu{dev}: {e}");
-			std::process::exit(2);
-		}
-	}
+pub fn probe_gpu_child_record(dev: i32) -> Result<String> {
+	let g = measure_gpu(dev)?;
+	Ok(format!("{}|{}|{}|{}", g.vram, g.pcie_gbs, g.flops_gflops, g.transfer_gbs))
 }
 
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
@@ -337,15 +329,15 @@ fn bench_cpu_read() -> f64 {
 	bytes as f64 / best / 1e9
 }
 
-pub fn data_dir() -> std::path::PathBuf {
+pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
 	let base = std::env::var("XDG_CACHE_HOME")
 		.map(std::path::PathBuf::from)
 		.unwrap_or_else(|_| {
 			std::path::PathBuf::from(std::env::var("HOME").expect("HOME unset")).join(".cache")
 		});
 	let dir = base.join("recipe");
-	std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("data_dir {}: {e}", dir.display()));
-	dir
+	std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
+	Ok(dir)
 }
 
 fn bench_cpu_flops() -> f64 {

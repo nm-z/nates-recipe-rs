@@ -1,11 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// ── Multinomial NB count table ─────────────────────────────────────────────
-// x_counts: [n * n_features] feature counts (f64)
-// y:        [n] class labels (i32)
-// out:      [n_classes * n_features] count table, zeroed by caller
-// Each thread owns one (sample, feature) pair and atomically adds x_counts[i,f]
-// to out[class, f].  HIP provides atomicAdd for double via __longlong_as_double.
 
 extern "C" __global__ void nb_count_table_kernel(
       const double* x_counts, const int* y, double* out,
@@ -31,10 +25,6 @@ extern "C" void launch_nb_count_table(
             x_counts, y, out, n, n_features, n_classes);
 }
 
-// ── Feature log-prob (Laplace smoothing) ──────────────────────────────────
-// count_table: [n_classes * n_features]
-// out:         [n_classes * n_features]  log P(feature|class)
-// Each row (class) is smoothed with alpha and normalised.
 
 extern "C" __global__ void nb_feature_log_prob_kernel(
       const double* count_table, double* out,
@@ -63,12 +53,6 @@ extern "C" void launch_nb_feature_log_prob(
             count_table, out, n_classes, n_features, alpha);
 }
 
-// ── Multinomial NB log-posterior ──────────────────────────────────────────
-// log_class_prior:  [n_classes]
-// feature_log_prob: [n_classes * n_features]  (row = class)
-// x:                [n * n_features]
-// out:              [n * n_classes]  log P(class|x) (unnormalised)
-// out[i, c] = log_prior[c] + sum_f x[i,f] * feature_log_prob[c,f]
 
 extern "C" __global__ void multinomial_nb_logprob_kernel(
       const double* log_class_prior, const double* feature_log_prob,
@@ -96,13 +80,6 @@ extern "C" void launch_multinomial_nb_logprob(
             log_class_prior, feature_log_prob, x, out, n, n_features, n_classes);
 }
 
-// ── Bernoulli NB log-posterior ────────────────────────────────────────────
-// log_class_prior:  [n_classes]
-// feature_log_prob: [n_classes * n_features]  log P(f=1|c)
-// feature_log_neg:  [n_classes * n_features]  log P(f=0|c) = log(1 - P(f=1|c))
-// x_binary:         [n * n_features]  (0.0 or 1.0)
-// out:              [n * n_classes]
-// out[i,c] = log_prior[c] + sum_f [ x[i,f]*log_p[c,f] + (1-x[i,f])*log_neg[c,f] ]
 
 extern "C" __global__ void bernoulli_nb_logprob_kernel(
       const double* log_class_prior,

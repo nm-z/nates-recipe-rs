@@ -1,14 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── f64 streaming-inference kernels ──────────────────────────────────────────
-// General, model-agnostic ops for running a bf16-weight transformer entirely in
-// f64: widen bf16 bytes to f64 in VRAM, a GQA attention with a mixed
-// causal/bidirectional prefix mask (kq_scale = 1.0), and two gated-GELU fusions
-// (tanh-approx GELU, matching gelu_pytorch_tanh). Weights arrive as raw bf16
-// bytes and are widened just before each GEMM into a reusable VRAM window.
 
-// bf16 (upper 16 bits of an f32) → f64. `in` is the raw little-endian bf16 half
-// reinterpreted as u16; the pad to f32 is exact (lossless), then f32 → f64.
 extern "C" __global__ void widen_bf16_f64(const unsigned short* in, double* out, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -22,7 +14,6 @@ extern "C" void launch_widen_bf16_f64(const unsigned short* in, double* out, lon
     hipLaunchKernelGGL(widen_bf16_f64, dim3((unsigned int)blocks), dim3(t), 0, s, in, out, n);
 }
 
-// Block sum-reduce (warp shuffle + shared), broadcast to all threads via smem[0].
 __device__ __forceinline__ double fi_block_sum(double v, double* smem) {
     int lane = threadIdx.x % warpSize;
     int wid  = threadIdx.x / warpSize;
@@ -41,11 +32,6 @@ __device__ __forceinline__ double fi_block_sum(double v, double* smem) {
     return tot;
 }
 
-// GQA self-attention, one block per (query position p, query head h). q is
-// (t, nqh*hd), k/v are (t, nkv*hd), out is (t, nqh*hd), all row-major f64. Each
-// q-head maps to kv-head h/(nqh/nkv). kq_scale = 1.0 (NOT 1/sqrt(hd)). Mask:
-// prompt positions (p < prefix) are causal (attend sp <= p); canvas positions
-// (p >= prefix) are fully bidirectional. Dynamic shared holds the t scores.
 extern "C" __global__ void gqa_masked_attn(
     const double* q, const double* k, const double* v, double* out,
     int t, int nqh, int nkv, int hd, int prefix
@@ -60,7 +46,7 @@ extern "C" __global__ void gqa_masked_attn(
     const double* qrow = q + (long)p * qd + (long)h * hd;
 
     __shared__ double red[64];
-    extern __shared__ double sc[];   // t doubles
+    extern __shared__ double sc[];
 
     for (int sp = 0; sp < t; sp++) {
         const double* krow = k + (long)sp * kd + (long)kv * hd;
@@ -99,11 +85,6 @@ extern "C" void launch_gqa_masked_attn(
         q, k, v, out, t, nqh, nkv, hd, prefix);
 }
 
-// NeoX partial rotary embedding, in-place on `buf` (rows, head_dim). Only the
-// first `rotary_dim` dims of each head are rotated (rotate-half over that block:
-// pair (i, i+rotary_dim/2)); the remaining head_dim-rotary_dim dims pass
-// through. Each row's position is row/heads_per_tok. rotary_dim == head_dim is
-// full rotary. angle = pos * theta^(-2i/rotary_dim).
 extern "C" __global__ void rope_partial(
     double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta_p
 ) {
@@ -136,7 +117,6 @@ __device__ __forceinline__ double fi_gelu_tanh(double x) {
     return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 }
 
-// out = gelu(a) * b, elementwise (n). Separate gate/up buffers.
 extern "C" __global__ void gelu_mul(const double* a, const double* b, double* out, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = fi_gelu_tanh(a[i]) * b[i];
@@ -147,8 +127,6 @@ extern "C" void launch_gelu_mul(const double* a, const double* b, double* out, l
     hipLaunchKernelGGL(gelu_mul, dim3((unsigned)blk), dim3(t), 0, s, a, b, out, n);
 }
 
-// Fused gate|up row layout: in is (rows, 2*half), out is (rows, half) with
-// out[r,i] = gelu(in[r,i]) * in[r,half+i]. For MoE experts' gate_up_proj.
 extern "C" __global__ void glu_gelu(const double* in, double* out, int rows, int half) {
     long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)rows * half;

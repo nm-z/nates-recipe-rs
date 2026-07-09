@@ -1,11 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── distancex_ pairwise distance kernels (f64) ───────────────────────────────
-// Convention shared with the existing distance/metrics kernels:
-//   query (nq x dim), train (nt x dim) → out (nq x nt), row-major out[q*nt+t].
-// One thread per (q,t) pair; flat index over nq*nt.
 
-// manhattan / L1: Σ |qᵢ − tᵢ|
 extern "C" __global__ void distancex_manhattan_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim
@@ -32,7 +27,6 @@ extern "C" void launch_distancex_manhattan(
       hipLaunchKernelGGL(distancex_manhattan_kernel, g, b, 0, s, query, train, out, nq, nt, dim);
 }
 
-// chebyshev / Linf: max_i |qᵢ − tᵢ|
 extern "C" __global__ void distancex_chebyshev_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim
@@ -59,7 +53,6 @@ extern "C" void launch_distancex_chebyshev(
       hipLaunchKernelGGL(distancex_chebyshev_kernel, g, b, 0, s, query, train, out, nq, nt, dim);
 }
 
-// minkowski (order p): (Σ |qᵢ − tᵢ|^p)^(1/p)
 extern "C" __global__ void distancex_minkowski_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim, double p
@@ -86,7 +79,6 @@ extern "C" void launch_distancex_minkowski(
       hipLaunchKernelGGL(distancex_minkowski_kernel, g, b, 0, s, query, train, out, nq, nt, dim, p);
 }
 
-// bray-curtis: Σ |qᵢ − tᵢ| / Σ |qᵢ + tᵢ|   (denom==0 → 0)
 extern "C" __global__ void distancex_braycurtis_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim
@@ -113,7 +105,6 @@ extern "C" void launch_distancex_braycurtis(
       hipLaunchKernelGGL(distancex_braycurtis_kernel, g, b, 0, s, query, train, out, nq, nt, dim);
 }
 
-// canberra: Σ |qᵢ − tᵢ| / (|qᵢ| + |tᵢ|)   (per-term 0/0 → 0)
 extern "C" __global__ void distancex_canberra_kernel(
       const double* query, const double* train, double* out,
       int nq, int nt, int dim

@@ -470,9 +470,8 @@ pub fn plan_layer_params(
 			in_dim = filters * lout;
 			continue;
 		}
-		let (units, act) = match *spec {
-			LayerSpec::Dense(u, a) => (u, a),
-			_ => unreachable!(),
+		let LayerSpec::Dense(units, act) = *spec else {
+			return Err("plan_layer_params: layer spec not handled by an earlier arm".to_owned());
 		};
 		if c_cat > 0
 			&& matches!(
@@ -599,18 +598,18 @@ impl Saved {
 	}
 }
 
-pub fn load_ogdl(path: &str) -> Vec<Saved> {
+pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match std::fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
 			eprintln!("no data in {path}, initialized random weights and biases");
-			return Vec::new();
+			return Ok(Vec::new());
 		}
 	};
 	load_ogdl_str(&text)
 }
 
-pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
+pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 	let root = ogdl::text(text).itnl("");
 	let vals = |n: &ogdl::Node| -> Vec<f64> {
 		n.children.iter().filter_map(|g| g.name.parse::<f64>().ok()).collect()
@@ -661,7 +660,7 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 						{
 							w.push(vals(c).first().copied().expect("resume: dense w{n}"));
 						}
-						key => panic!(
+						key => anyhow::bail!(
 							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
 						),
 					}
@@ -670,7 +669,7 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 			}
 		}
 	}
-	out
+	Ok(out)
 }
 
 pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
@@ -740,14 +739,14 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 	})
 }
 
-pub fn write_ogdl(path: &str, out: &str) {
+pub fn write_ogdl(path: &str, out: &str) -> anyhow::Result<()> {
 	if let Some(parent) = std::path::Path::new(path).parent()
 		&& !parent.as_os_str().is_empty()
 	{
 		std::fs::create_dir_all(parent)
-			.unwrap_or_else(|e| panic!("save: mkdir {}: {e}", parent.display()));
+			.map_err(|e| anyhow::anyhow!("save: mkdir {}: {e}", parent.display()))?;
 	}
-	std::fs::write(path, out).unwrap_or_else(|e| panic!("save: write {path}: {e}"));
+	std::fs::write(path, out).map_err(|e| anyhow::anyhow!("save: write {path}: {e}"))
 }
 
 pub fn saved_score(path: &str, key: &str) -> Option<f64> {
@@ -793,7 +792,7 @@ z2
     b=0.002
 ";
 		std::fs::write(&path, text).expect("write tmp ogdl");
-		let parsed = load_ogdl(path.to_str().expect("utf8 path"));
+		let parsed = load_ogdl(path.to_str().expect("utf8 path")).expect("load_ogdl");
 		std::fs::remove_file(&path).ok();
 		assert_eq!(parsed.len(), 4);
 		assert_eq!(
@@ -841,7 +840,7 @@ z2
 			g.add(vec![-0.4_f64, 0.5], "z2.w");
 			g.add(0.02_f64, "z2.b");
 		});
-		let saved = load_ogdl_str(&text);
+		let saved = load_ogdl_str(&text).expect("load_ogdl_str");
 		assert_eq!(saved.len(), 2, "two dense neurons, metric header skipped");
 		assert_eq!(saved[0], Saved::Dense { w: vec![0.1, 0.2, 0.3], b: 0.01, a: Some(0.05) });
 		assert_eq!(saved[1], Saved::Dense { w: vec![-0.4, 0.5], b: 0.02, a: None });

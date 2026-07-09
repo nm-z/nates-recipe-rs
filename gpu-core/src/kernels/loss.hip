@@ -1,8 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-// ── MAE gradient ──────────────────────────────────────────────────────────
-// grad = sign(pred - target) / n
 
 extern "C" __global__ void mae_grad_kernel(
       const double* pred, const double* target, double* out, int n
@@ -21,9 +19,6 @@ extern "C" void launch_mae_grad(
       hipLaunchKernelGGL(mae_grad_kernel, dim3(blocks), dim3(threads), 0, stream, pred, target, out, n);
 }
 
-// ── Huber (smooth-L1) gradient ────────────────────────────────────────────
-// |d| <= delta: d/n
-// |d| >  delta: delta * sign(d) / n
 
 extern "C" __global__ void huber_grad_kernel(
       const double* pred, const double* target, double* out, int n, const double* delta_p
@@ -46,9 +41,6 @@ extern "C" void launch_huber_grad(
       hipLaunchKernelGGL(huber_grad_kernel, dim3(blocks), dim3(threads), 0, stream, pred, target, out, n, delta);
 }
 
-// ── Binary cross-entropy with logits ─────────────────────────────────────
-// loss[i] = max(z,0) - z*y + log1p(exp(-|z|))   (numerically stable)
-// grad[i] = sigmoid(z) - y
 
 extern "C" __global__ void bce_logits_kernel(
       const double* z, const double* y, double* loss_out, double* grad_out, int n
@@ -71,11 +63,6 @@ extern "C" void launch_bce_logits(
       hipLaunchKernelGGL(bce_logits_kernel, dim3(blocks), dim3(threads), 0, stream, z, y, loss_out, grad_out, n);
 }
 
-// ── Focal loss ────────────────────────────────────────────────────────────
-// prob[i] in (0,1), target[i] in {0,1}
-// p_t = target ? prob : 1-prob
-// loss[i] = -alpha * (1-p_t)^gamma * log(p_t)
-// grad[i] = d loss / d prob[i]  (by chain rule through p_t)
 
 extern "C" __global__ void focal_loss_kernel(
       const double* prob, const double* target, double* loss_out, double* grad_out,
@@ -96,10 +83,6 @@ extern "C" __global__ void focal_loss_kernel(
       double focal_wt = alpha * pow(wt, gamma);
       loss_out[i] = -focal_wt * log_pt;
 
-      // grad = d loss / d p
-      // = -alpha * [ gamma * (1-p_t)^(gamma-1) * (-d(p_t)/dp) * log(p_t)
-      //              + (1-p_t)^gamma * (1/p_t) * d(p_t)/dp ]
-      // d(p_t)/dp = +1 if t=1, -1 if t=0
       double sign_pt = t > 0.5 ? 1.0 : -1.0;
       double g = -alpha * (
             gamma * pow(wt, gamma - 1.0) * (-sign_pt) * log_pt
@@ -118,8 +101,6 @@ extern "C" void launch_focal_loss(
             prob, target, loss_out, grad_out, n, gamma, alpha);
 }
 
-// Grad-only focal, scaled by 1/n into a preallocated buffer (matches bce_grad's
-// convention so it can drop into the training loop with no allocation).
 extern "C" __global__ void focal_grad_kernel(
       const double* prob, const double* target, double* grad_out,
       int n, const double* gamma_p, const double* alpha_p, const double* inv_n_p
@@ -155,9 +136,6 @@ extern "C" void launch_focal_grad(
             prob, target, grad_out, n, gamma, alpha, inv_n);
 }
 
-// ── KL divergence (categorical) ───────────────────────────────────────────
-// out[i] = target[i] * (log(target[i]) - log_p[i])
-// guard: target[i] == 0 → 0
 
 extern "C" __global__ void kl_div_loss_kernel(
       const double* log_p, const double* target, double* out, int n
@@ -176,10 +154,6 @@ extern "C" void launch_kl_div_loss(
       hipLaunchKernelGGL(kl_div_loss_kernel, dim3(blocks), dim3(threads), 0, stream, log_p, target, out, n);
 }
 
-// ── Hinge loss ───────────────────────────────────────────────────────────
-// labels in {-1, +1}
-// loss[i] = max(0, 1 - y*s)
-// grad[i] = -y if y*s < 1, else 0
 
 extern "C" __global__ void hinge_kernel(
       const double* scores, const double* labels, double* loss_out, double* grad_out, int n
@@ -202,11 +176,6 @@ extern "C" void launch_hinge(
       hipLaunchKernelGGL(hinge_kernel, dim3(blocks), dim3(threads), 0, stream, scores, labels, loss_out, grad_out, n);
 }
 
-// ── Cosine embedding loss ─────────────────────────────────────────────────
-// a,b: (n x dim) row-major; label in {+1,-1}
-// cos_sim = dot(a_i,b_i)/(||a_i||*||b_i||)
-// label=+1: loss[i] = 1 - cos_sim
-// label=-1: loss[i] = max(0, cos_sim - margin)
 
 extern "C" __global__ void cosine_emb_kernel(
       const double* a, const double* b, const double* label, double* out,
@@ -244,9 +213,6 @@ extern "C" void launch_cosine_emb(
             a, b, label, out, n, dim, margin);
 }
 
-// ── Triplet loss ──────────────────────────────────────────────────────────
-// anchor,pos,neg: (n x dim) row-major
-// loss[i] = max(0, ||a-p||^2 - ||a-n||^2 + margin)
 
 extern "C" __global__ void triplet_kernel(
       const double* anchor, const double* pos, const double* neg, double* out,
@@ -279,10 +245,6 @@ extern "C" void launch_triplet(
             anchor, pos, neg, out, n, dim, margin);
 }
 
-// ── Contrastive loss ──────────────────────────────────────────────────────
-// a,b: (n x dim); label in {0,1} (1=similar, 0=dissimilar)
-// dist2[i] = ||a_i - b_i||^2
-// loss[i] = label*dist2 + (1-label)*max(0, margin - sqrt(dist2))^2
 
 extern "C" __global__ void contrastive_kernel(
       const double* a, const double* b, const double* label, double* out,

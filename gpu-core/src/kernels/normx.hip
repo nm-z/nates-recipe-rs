@@ -1,12 +1,6 @@
 #include <hip/hip_runtime.h>
 
-// ── Fused normalization kernels for the "norm" inventory category ────────────
-// One block per normalization instance. Block-reduce sum via warp shuffle +
-// shared memory (copied from elementwise.hip layernorm/softmax pattern), then
-// standardize (x-mean)/sqrt(var+eps) with optional gamma/beta affine.
 
-// Block sum-reduce helper: every thread contributes `val`, returns block total
-// broadcast to all threads via smem[0]. Caller passes a __shared__ double[32].
 __device__ __forceinline__ double block_sum_bcast(double val, double* smem) {
     int lane = threadIdx.x % warpSize;
     int wid  = threadIdx.x / warpSize;
@@ -25,19 +19,15 @@ __device__ __forceinline__ double block_sum_bcast(double val, double* smem) {
     return total;
 }
 
-// ── Group Norm ───────────────────────────────────────────────────────────────
-// x: (N, C, L) row-major. G groups partition C (C % G == 0). Each (sample n,
-// group g) instance normalizes over its (C/G)*L elements. gamma/beta are
-// per-channel (length C), applied after standardize. One block per (n,g).
 extern "C" __global__ void normx_groupnorm_kernel(
     const double* x, double* out, const double* gamma, const double* beta,
     int N, int C, int L, int G, double eps
 ) {
-    int inst = blockIdx.x;            // inst in [0, N*G)
+    int inst = blockIdx.x;
     int n = inst / G;
     int g = inst % G;
-    int cpg = C / G;                  // channels per group
-    int m = cpg * L;                  // elements in this instance
+    int cpg = C / G;
+    int m = cpg * L;
     long base = (long)n * C * L + (long)g * cpg * L;
 
     __shared__ double smem[32];
@@ -50,7 +40,7 @@ extern "C" __global__ void normx_groupnorm_kernel(
     double inv_std = 1.0 / sqrt(block_sum_bcast(vacc, smem) / m + eps);
 
     for (int i = threadIdx.x; i < m; i += blockDim.x) {
-        int c = g * cpg + i / L;      // global channel index
+        int c = g * cpg + i / L;
         double normed = (x[base + i] - mean) * inv_std;
         out[base + i] = gamma ? normed * gamma[c] + beta[c] : normed;
     }
@@ -66,14 +56,11 @@ extern "C" void launch_normx_groupnorm(
         x, out, gamma, beta, N, C, L, G, eps);
 }
 
-// ── Instance Norm ────────────────────────────────────────────────────────────
-// x: (N, C, L). Each (sample n, channel c) instance normalizes over its L
-// spatial elements. gamma/beta per-channel (length C). == groupnorm with G=C.
 extern "C" __global__ void normx_instancenorm_kernel(
     const double* x, double* out, const double* gamma, const double* beta,
     int N, int C, int L, double eps
 ) {
-    int inst = blockIdx.x;            // inst in [0, N*C)
+    int inst = blockIdx.x;
     int c = inst % C;
     long base = (long)inst * L;
 
@@ -101,10 +88,6 @@ extern "C" void launch_normx_instancenorm(
         x, out, gamma, beta, N, C, L, eps);
 }
 
-// ── L2 Normalize ─────────────────────────────────────────────────────────────
-// x: (rows, cols). Each row r -> x[r] / sqrt(max(sum(x^2), eps)).
-// Matches tf.nn.l2_normalize / torch.nn.functional.normalize(p=2) convention:
-// denominator is sqrt(max(||x||^2, eps)) (NOT sqrt(||x||^2)+eps).
 extern "C" __global__ void normx_l2_normalize_kernel(
     const double* x, double* out, int rows, int cols, double eps
 ) {
@@ -130,9 +113,6 @@ extern "C" void launch_normx_l2_normalize(
         x, out, rows, cols, eps);
 }
 
-// ── RMS Norm (f64, fused) ────────────────────────────────────────────────────
-// x: (rows, cols). out = x / sqrt(mean(x^2)+eps) * gamma (gamma optional,
-// per-column length cols). torch.nn.functional.rms_norm / llama convention.
 extern "C" __global__ void normx_rmsnorm_kernel(
     const double* x, double* out, const double* gamma, int rows, int cols, const double* eps_p
 ) {

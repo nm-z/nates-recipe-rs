@@ -82,7 +82,7 @@ fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
 }
 
 fn open_spill() -> File {
-	let path = crate::probe::data_dir().join(".recipe_spill");
+	let path = crate::probe::data_dir().expect("spill dir").join(".recipe_spill");
 	let f = OpenOptions::new()
 		.read(true)
 		.write(true)
@@ -339,7 +339,7 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let disk_avail = disk_free(&crate::probe::data_dir()).saturating_sub(USER_GB);
+	let disk_avail = disk_free(&crate::probe::data_dir().expect("data_dir")).saturating_sub(USER_GB);
 	if need > vram_avail + ram_avail + disk_avail + net_ram {
 		return None;
 	}
@@ -479,7 +479,7 @@ impl Ooc {
 			+ (1 << 20)
 	}
 
-	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>, net: Option<Arc<Vec<crate::wire::Conn>>>) -> Ooc {
+	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>, net: Option<Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<Ooc> {
 		let attn = params.iter().find(|p| p.kind == LayerKind::Attn);
 		let (seq_spb, hs) = attn.map_or((1, 1), |p| (p.in_dim, p.heads * (p.in_dim / p.dim)));
 		let max_act_spb = params.iter().map(|p| p.out_dim.max(p.in_dim)).max().unwrap_or(1);
@@ -569,7 +569,7 @@ impl Ooc {
 		let mut disk_cursor: u64 = 0;
 		let mut spill: Option<File> = None;
 		let mut nonvram = 0usize;
-		let disk_budget = disk_free(&crate::probe::data_dir())
+		let disk_budget = disk_free(&crate::probe::data_dir()?)
 			.saturating_sub(USER_GB);
 		let net_caps: Vec<usize> = net.as_ref().map_or(Vec::new(), |ns| {
 			ns.iter().map(|c| (c.info.ram as usize).saturating_sub(USER_GB)).collect()
@@ -584,7 +584,7 @@ impl Ooc {
 			h << 32
 		};
 		let mut next_id: u64 = 0;
-		let mut place = |spb: usize| -> Paged {
+		let mut place = |spb: usize| -> anyhow::Result<Paged> {
 			let n_wins = n.div_ceil(chunk);
 			let mut homes = Vec::with_capacity(n_wins);
 			for w in 0..n_wins {
@@ -615,7 +615,7 @@ impl Ooc {
 				}
 				let node = (0..net_caps.len()).find(|&nd| net_used[nd] + bytes <= net_caps[nd]);
 				let Some(node) = node else {
-					panic!(
+					anyhow::bail!(
 						"ooc: window has no home — disk {disk_cursor}B of {disk_budget}B, remote {net_used:?} of {net_caps:?} (admit passed what placement cannot hold)"
 					);
 				};
@@ -623,21 +623,21 @@ impl Ooc {
 				homes.push(Home::Remote { node, id: id_base | next_id });
 				next_id += 1;
 			}
-			Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()), net: net.clone() }
+			Ok(Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()), net: net.clone() })
 		};
 
-		let da_a = place(max_spb);
-		let da_b = place(max_spb);
-		let a_ctx = place(seq_spb);
-		let a_q = place(seq_spb);
-		let a_k = place(seq_spb);
-		let a_v = place(seq_spb);
-		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect();
-		let concat = place(if ca + cc > 0 { ca + cc } else { 1 });
-		let a_dctx = place(seq_spb);
-		let a_dq = place(seq_spb);
-		let a_dk = place(seq_spb);
-		let a_dv = place(seq_spb);
+		let da_a = place(max_spb)?;
+		let da_b = place(max_spb)?;
+		let a_ctx = place(seq_spb)?;
+		let a_q = place(seq_spb)?;
+		let a_k = place(seq_spb)?;
+		let a_v = place(seq_spb)?;
+		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect::<anyhow::Result<_>>()?;
+		let concat = place(if ca + cc > 0 { ca + cc } else { 1 })?;
+		let a_dctx = place(seq_spb)?;
+		let a_dq = place(seq_spb)?;
+		let a_dk = place(seq_spb)?;
+		let a_dv = place(seq_spb)?;
 		let preacts: Vec<Option<Paged>> = params
 			.iter()
 			.map(|p| {
@@ -648,8 +648,9 @@ impl Ooc {
 						| Activation::Selu | Activation::PRelu
 				)
 				.then(|| place(p.out_dim))
+				.transpose()
 			})
-			.collect();
+			.collect::<anyhow::Result<_>>()?;
 		if let Some(f) = spill.as_ref() {
 			f.set_len(disk_cursor).expect("size spill file");
 		}
@@ -710,7 +711,7 @@ impl Ooc {
 			pool_give(&host, buf);
 		}
 
-		Ooc {
+		Ok(Ooc {
 			n,
 			chunk,
 			wins,
@@ -752,7 +753,7 @@ impl Ooc {
 			rate_net_r,
 			rate_net_w,
 			net,
-		}
+		})
 	}
 
 	pub fn report(&self) {
@@ -782,7 +783,7 @@ impl Ooc {
 			tally(b);
 		}
 		eprintln!(
-			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB → NET {:.2} GB, {}-sample windows",
+			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
 			gb(v),
 			gb(r),
 			gb(d),
@@ -927,29 +928,26 @@ impl Ooc {
 							kernels::gpu_linear_into(&prev, &p.w, &p.b, cnt, p.out_dim, p.in_dim, &out).expect("linear");
 						}
 						let m = cnt * p.out_dim;
-						if let Some(pa) = self.preacts[l].as_mut() {
+						let saved = self.preacts[l].as_mut().map(|pa| {
 							let pre = pa.write_view(s0, cnt, &self.wins[2]);
 							kernels::gpu_copy_into(&out, m, &pre).expect("copy preact");
 							pa.commit(s0, cnt, &pre, &self.writer, &self.host);
-							match p.act {
-								Activation::PRelu => {
-									kernels::gpu_leaky_relu_into(&pre, &p.palpha, m, &out).expect("prelu");
-								}
-								Activation::Elu => gpu_core::k_gapact::gpu_elu(&pre, &sc.c_elu_alpha, m, &out).expect("elu"),
-								Activation::Selu => gpu_core::k_gapact::gpu_selu(&pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &out).expect("selu"),
-								Activation::Silu => kernels::gpu_silu_into(&pre, m, &out).expect("silu"),
-								Activation::Gelu => kernels::gpu_gelu_into(&pre, m, &out).expect("gelu"),
-								_ => unreachable!("preact only saved for z-based activations"),
+							pre
+						});
+						let z = || saved.as_ref().expect("z-based activation without preact");
+						match p.act {
+							Activation::PRelu => {
+								kernels::gpu_leaky_relu_into(z(), &p.palpha, m, &out).expect("prelu");
 							}
-						} else {
-							match p.act {
-								Activation::Relu => kernels::gpu_relu_into(&out, m, &out).expect("relu"),
-								Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, m, &out).expect("sigmoid"),
-								Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &sc.c_leaky_alpha, m, &out).expect("leaky"),
-								Activation::Tanh => kernels::gpu_tanh_into(&out, m, &out).expect("tanh"),
-								Activation::Linear => {}
-								_ => unreachable!("z-based activation without preact"),
-							}
+							Activation::Elu => gpu_core::k_gapact::gpu_elu(z(), &sc.c_elu_alpha, m, &out).expect("elu"),
+							Activation::Selu => gpu_core::k_gapact::gpu_selu(z(), &sc.c_selu_alpha, &sc.c_selu_lambda, m, &out).expect("selu"),
+							Activation::Silu => kernels::gpu_silu_into(z(), m, &out).expect("silu"),
+							Activation::Gelu => kernels::gpu_gelu_into(z(), m, &out).expect("gelu"),
+							Activation::Relu => kernels::gpu_relu_into(&out, m, &out).expect("relu"),
+							Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, m, &out).expect("sigmoid"),
+							Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &sc.c_leaky_alpha, m, &out).expect("leaky"),
+							Activation::Tanh => kernels::gpu_tanh_into(&out, m, &out).expect("tanh"),
+							Activation::Linear => {}
 						}
 						if l != last {
 							self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host);
@@ -961,7 +959,6 @@ impl Ooc {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn backward(
 		&mut self,
 		params: &[LayerParams],
@@ -1025,7 +1022,7 @@ impl Ooc {
 					if p.act == Activation::PRelu {
 						kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).expect("conv scalar_acc zero");
 					}
-					self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
+					self.set_da_below_spb(flip, if l > 0 { in_dim } else { 1 });
 					self.writer.barrier(self.spill.as_ref());
 					for (s0, cnt) in chunks(n, self.chunk) {
 						if self.bail() {
@@ -1129,7 +1126,7 @@ impl Ooc {
 			if p.act == Activation::PRelu {
 				kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).expect("scalar_acc zero");
 			}
-			self.da_below(flip).spb = if l > 0 { in_dim } else { 1 };
+			self.set_da_below_spb(flip, if l > 0 { in_dim } else { 1 });
 			self.writer.barrier(self.spill.as_ref());
 			for (s0, cnt) in chunks(n, self.chunk) {
 				if self.bail() {
@@ -1235,7 +1232,7 @@ impl Ooc {
 			if let Some((pf, a, _)) = concat_at
 				&& l == pf
 			{
-				self.da_below(flip).spb = a;
+				self.set_da_below_spb(flip, a);
 			}
 			kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, in_dim * out_dim, &p.w).expect("sgd w");
 			kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, out_dim, &p.b).expect("sgd b");
@@ -1259,7 +1256,7 @@ impl Ooc {
 		} else {
 			recipe_infer::layer_bwd(p, self.n, l == 0)
 		};
-		self.sweep_line_work(phase, l, kind, &format!("{}→{}", p.in_dim, p.out_dim), w, s);
+		self.sweep_line_work(phase, l, kind, &format!("{}->{}", p.in_dim, p.out_dim), w, s);
 	}
 
 	fn sweep_line_work(&self, phase: &str, l: usize, kind: &str, dims: &str, w: recipe_infer::Work, s: SweepStart) {
@@ -1370,8 +1367,8 @@ impl Ooc {
 	fn da(&self, flip: bool) -> &Paged {
 		if flip { &self.da_b } else { &self.da_a }
 	}
-	fn da_below(&mut self, flip: bool) -> &mut Paged {
-		if flip { &mut self.da_a } else { &mut self.da_b }
+	fn set_da_below_spb(&mut self, flip: bool, spb: usize) {
+		if flip { self.da_a.spb = spb } else { self.da_b.spb = spb }
 	}
 
 	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, sc: &Scratch, ss: &StepScalars, flip: bool) {
@@ -1422,7 +1419,7 @@ impl Ooc {
 			self.a_dk.commit(s0, cnt, &dk, &self.writer, &self.host);
 			self.a_dv.commit(s0, cnt, &dv, &self.writer, &self.host);
 		}
-		self.da_below(flip).spb = p.in_dim;
+		self.set_da_below_spb(flip, p.in_dim);
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwq_acc).expect("dwq zero");
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwk_acc).expect("dwk zero");
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwv_acc).expect("dwv zero");

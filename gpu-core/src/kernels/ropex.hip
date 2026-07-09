@@ -1,13 +1,5 @@
 #include <hip/hip_runtime.h>
 
-// ── ropex_: NeoX half-split RoPE, EXPLICIT per-row positions, applied to Q & K ─
-//
-// q,k:(n_rows,d) row-major f64. pos:(n_rows) f64, cast to int per row.
-// theta: rotation base (e.g. 10000.0). Pair element i in [0,d/2) with i+d/2;
-// angle = pos / theta^(2i/d):
-//   out[i]      = x[i]*cos(angle) - x[i+d/2]*sin(angle)
-//   out[i+d/2]  = x[i+d/2]*cos(angle) + x[i]*sin(angle)
-// Identical rotation applied to both Q and K. Fresh outputs qo, ko.
 extern "C" __global__ void ropex_qk_kernel(
     const double* q, const double* k, const double* pos,
     double* qo, double* ko, int n_rows, int d, const double* theta_p
@@ -16,8 +8,8 @@ extern "C" __global__ void ropex_qk_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = d / 2;
     if (idx >= n_rows * half) return;
-    int row = idx / half;          // position row
-    int i = idx % half;            // pair index
+    int row = idx / half;
+    int i = idx % half;
     double p = (double)(int)pos[row];
     double angle = p / pow(theta, (2.0 * (double)i) / (double)d);
     double c = cos(angle);
@@ -41,13 +33,6 @@ extern "C" void launch_ropex_qk(
     hipLaunchKernelGGL(ropex_qk_kernel, grid, block, 0, s, q, k, pos, qo, ko, n_rows, d, theta);
 }
 
-// ── Multi-head RoPE, IN-PLACE, implicit position = token's sequence index ──────
-//
-// q,k:(m,d) row-major f64, d = heads*hd. Rotate WITHIN each head block [h*hd,
-// h*hd+hd): pair (j, j+hd/2) by angle = (row % seq) / theta^(2j/hd). Position is
-// the token's index within its sequence (row r = sample*seq + pos → pos = r%seq).
-// `sgn` selects direction: +1 forward (Q_rot = R(angle)·Q), -1 backward — a
-// rotation is orthogonal so dQ = R(-angle)·dQ_rot, the SAME kernel with sgn=-1.
 extern "C" __global__ void ropex_qk_heads_kernel(
     double* q, double* k, int m, int d, int heads, int seq, const double* theta_p, const double* sgn_p
 ) {
@@ -58,11 +43,11 @@ extern "C" __global__ void ropex_qk_heads_kernel(
     int total = m * heads * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    int j = idx % half;            // pair index within the head
+    int j = idx % half;
     int t = idx / half;
-    int h = t % heads;             // head
-    int row = t / heads;           // token row
-    int pos = row % seq;           // sequence position
+    int h = t % heads;
+    int row = t / heads;
+    int pos = row % seq;
     double angle = (double)pos / pow(theta, (2.0 * (double)j) / (double)hd);
     double c = cos(angle);
     double s = sgn * sin(angle);

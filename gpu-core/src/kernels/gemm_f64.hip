@@ -1,23 +1,13 @@
 #include <hip/hip_runtime.h>
 
-// ── custom f64 GEMM-BT (no hipBLAS) ──────────────────────────────────────────
-// out(m,n) = A(m,k) . B(n,k)^T, all row-major f64. Shapes are bandwidth-bound:
-// m is tiny (1..54), n/k are the big streamed dims. One block per B row (n
-// blocks total, always >> 54 CUs for every real shape) stages that row into
-// LDS once (the only global read of B — coalesced, vectorized double2 where k
-// is even), then every warp in the block independently computes the dot
-// product against a distinct subset of A's m rows (round-robin over warps) via
-// warp-shuffle reduction. A is tiny (<=1.2MB across all shapes) and reread from
-// global once per block, but stays resident in L2/Infinity Cache after warm-up.
-// No atomics anywhere -> fixed shuffle reduction order -> bit-identical reruns.
 
 extern "C" __global__ void gemm_bt_f64(
-    const double* __restrict__ A,   // (m,k) row-major
-    const double* __restrict__ B,   // (n,k) row-major
-    double* __restrict__ C,         // (m,n) row-major
+    const double* __restrict__ A,
+    const double* __restrict__ B,
+    double* __restrict__ C,
     int m, int n, int k
 ) {
-    extern __shared__ double bs[];   // k doubles: this block's staged B row
+    extern __shared__ double bs[];
     int j = blockIdx.x;
     const double* brow = B + (long)j * k;
 
@@ -53,7 +43,6 @@ extern "C" void launch_gemm_bt_f64(
     hipLaunchKernelGGL(gemm_bt_f64, dim3((unsigned)n), dim3(threads), shmem, s, a, b, c, m, n, k);
 }
 
-// x[i] *= scalar, elementwise. Replaces hipblasDscal.
 extern "C" __global__ void scale_f64(double* x, const double* scalar_p, long n) {
     double scalar = *scalar_p;
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

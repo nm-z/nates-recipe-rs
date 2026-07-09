@@ -62,55 +62,46 @@ pub enum Metric {
 	Hip,
 }
 
-#[allow(non_upper_case_globals)]
-pub const relu: Activation = Activation::Relu;
-#[allow(non_upper_case_globals)]
-pub const sig: Activation = Activation::Sigmoid;
-#[allow(non_upper_case_globals)]
-pub const linear: Activation = Activation::Linear;
-#[allow(non_upper_case_globals)]
-pub const leak: Activation = Activation::LeakyRelu;
-#[allow(non_upper_case_globals)]
-pub const prelu: Activation = Activation::PRelu;
-#[allow(non_upper_case_globals)]
-pub const elu: Activation = Activation::Elu;
-#[allow(non_upper_case_globals)]
-pub const selu: Activation = Activation::Selu;
-#[allow(non_upper_case_globals)]
-pub const tanh: Activation = Activation::Tanh;
-#[allow(non_upper_case_globals)]
-pub const silu: Activation = Activation::Silu;
-#[allow(non_upper_case_globals)]
-pub const swish: Activation = Activation::Silu;
-#[allow(non_upper_case_globals)]
-pub const gelu: Activation = Activation::Gelu;
-#[allow(non_upper_case_globals)]
-pub const mse: Loss = Loss::Mse;
-#[allow(non_upper_case_globals)]
-pub const mae: Loss = Loss::Mae;
-#[allow(non_upper_case_globals)]
-pub const ce: Loss = Loss::Ce;
-#[allow(non_upper_case_globals)]
-pub const bce: Loss = Loss::Bce;
-#[allow(non_upper_case_globals)]
-pub const huber: Loss = Loss::Huber;
-#[allow(non_upper_case_globals)]
-pub const focal: Loss = Loss::Focal;
+mod alias {
+	use super::{Activation, Loss, Metric};
 
-#[allow(non_upper_case_globals)]
-pub const Loss: Metric = Metric::Loss;
-#[allow(non_upper_case_globals)]
-pub const Accuracy: Metric = Metric::Accuracy;
-#[allow(non_upper_case_globals)]
-pub const Epoch: Metric = Metric::Epoch;
-#[allow(non_upper_case_globals)]
-pub const Lr: Metric = Metric::Lr;
-#[allow(non_upper_case_globals)]
-pub const Time: Metric = Metric::Time;
-#[allow(non_upper_case_globals)]
-pub const R2: Metric = Metric::R2;
-#[allow(non_upper_case_globals)]
-pub const hip: Metric = Metric::Hip;
+	pub const RELU: Activation = Activation::Relu;
+	pub const SIG: Activation = Activation::Sigmoid;
+	pub const LINEAR: Activation = Activation::Linear;
+	pub const LEAK: Activation = Activation::LeakyRelu;
+	pub const PRELU: Activation = Activation::PRelu;
+	pub const ELU: Activation = Activation::Elu;
+	pub const SELU: Activation = Activation::Selu;
+	pub const TANH: Activation = Activation::Tanh;
+	pub const SILU: Activation = Activation::Silu;
+	pub const SWISH: Activation = Activation::Silu;
+	pub const GELU: Activation = Activation::Gelu;
+
+	pub const MSE: Loss = Loss::Mse;
+	pub const MAE: Loss = Loss::Mae;
+	pub const CE: Loss = Loss::Ce;
+	pub const BCE: Loss = Loss::Bce;
+	pub const HUBER: Loss = Loss::Huber;
+	pub const FOCAL: Loss = Loss::Focal;
+
+	pub const LOSS: Metric = Metric::Loss;
+	pub const ACCURACY: Metric = Metric::Accuracy;
+	pub const EPOCH: Metric = Metric::Epoch;
+	pub const LR: Metric = Metric::Lr;
+	pub const TIME: Metric = Metric::Time;
+	pub const R_TWO: Metric = Metric::R2;
+	pub const HIP: Metric = Metric::Hip;
+}
+
+pub use alias::{
+	BCE as bce, CE as ce, ELU as elu, FOCAL as focal, GELU as gelu, HUBER as huber, LEAK as leak,
+	LINEAR as linear, MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu,
+	SIG as sig, SILU as silu, SWISH as swish, TANH as tanh,
+};
+pub use alias::{
+	ACCURACY as Accuracy, EPOCH as Epoch, HIP as hip, LOSS as Loss, LR as Lr, R_TWO as R2,
+	TIME as Time,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Param {

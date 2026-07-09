@@ -29,7 +29,6 @@ impl IntoLayer for (usize, Activation) {
 }
 
 pub struct EmbedSpec(usize, Option<usize>);
-#[allow(non_upper_case_globals)]
 pub fn embed(dim: usize) -> EmbedSpec {
 	EmbedSpec(dim, None)
 }
@@ -46,7 +45,6 @@ impl IntoLayer for EmbedSpec {
 }
 
 pub struct AttnSpec(usize);
-#[allow(non_upper_case_globals)]
 pub fn attn(heads: usize) -> AttnSpec {
 	AttnSpec(heads)
 }
@@ -92,7 +90,7 @@ impl Prepared<'_> {
 }
 
 pub trait RunData {
-	fn prepared(&self) -> Prepared<'_>;
+	fn prepared(&self) -> anyhow::Result<Prepared<'_>>;
 	fn target_names(&self) -> Vec<String>;
 	fn raw_rows(&self) -> Option<Vec<Vec<String>>>;
 	fn raw_headers(&self) -> Option<Vec<String>>;
@@ -100,8 +98,8 @@ pub trait RunData {
 }
 
 impl RunData for Dataset {
-	fn prepared(&self) -> Prepared<'_> {
-		Prepared::Borrowed(self)
+	fn prepared(&self) -> anyhow::Result<Prepared<'_>> {
+		Ok(Prepared::Borrowed(self))
 	}
 	fn target_names(&self) -> Vec<String> {
 		Vec::new()
@@ -118,8 +116,11 @@ impl RunData for Dataset {
 }
 
 impl RunData for Option<Dataset> {
-	fn prepared(&self) -> Prepared<'_> {
-		Prepared::Borrowed(self.as_ref().expect("no test dataset — use .test() or .split()"))
+	fn prepared(&self) -> anyhow::Result<Prepared<'_>> {
+		let ds = self
+			.as_ref()
+			.ok_or_else(|| anyhow::anyhow!("no test dataset — use .test() or .split()"))?;
+		Ok(Prepared::Borrowed(ds))
 	}
 	fn target_names(&self) -> Vec<String> {
 		Vec::new()
@@ -233,46 +234,23 @@ impl Train {
 		self
 	}
 
-	#[allow(dead_code)]
-	pub(crate) fn preds(&self) -> Option<(Vec<f64>, usize)> {
-		let last = self.last.borrow();
-		last.preds.clone().map(|p| (p, last.k))
-	}
 
 	pub fn run(&self, data: &dyn RunData, model: &Model) -> &Train {
 		let handle = model;
 		let model: &ModelInner = &model.inner;
 		let run_hip = self.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
 		let run_state = gpu_core::callspy::snapshot();
-		let prev = std::panic::take_hook();
-		std::panic::set_hook(Box::new(|info| {
-			let ram = info
-				.payload()
-				.downcast_ref::<String>()
-				.is_some_and(|s| s.contains("exceeds VRAM+RAM+disk"));
-			if !ram {
-				eprintln!("{info}");
+		let prepared = match data.prepared() {
+			Err(e) if e.downcast_ref::<pantry::encode::CeilingExceeded>().is_some() => {
+				eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
+				return self;
 			}
-		}));
-		let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| data.prepared()));
-		std::panic::set_hook(prev);
-		let prepared = match prepared {
-			Ok(p) => p,
-			Err(payload) => {
-				if payload
-					.downcast_ref::<String>()
-					.is_some_and(|s| s.contains("exceeds VRAM+RAM+disk"))
-				{
-					eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
-					return self;
-				}
-				std::panic::resume_unwind(payload);
-			}
+			other => other.expect("run: prepare data"),
 		};
 		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = self.net.as_ref().map(|net| {
-			let cs = net.connect().unwrap_or_else(|e| panic!("net: {e}"));
+			let cs = net.connect().expect("net: connect");
 			for c in &cs {
 				eprintln!(
 					"\x1b[33mnet\x1b[0m  pooled {} ({} RAM)",
@@ -293,16 +271,16 @@ impl Train {
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
 			if let Some(a) = run_hip.as_ref() {
-				eprint!("── run pre-fit ──\n{}", gpu_core::callspy::report_since(a));
+				eprint!("-- run pre-fit --\n{}", gpu_core::callspy::report_since(a));
 			}
-			model.fit(ds, self, resume.as_deref(), conns);
+			model.fit(ds, self, resume.as_deref(), conns).expect("run: fit");
 			let post_fit = run_hip.map(|_| gpu_core::callspy::snapshot());
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
 			}
 			let score = model.fit_score.get();
 			if let Some(p) = post_fit.as_ref() {
-				eprint!("── run post-fit ──\n{}", gpu_core::callspy::report_since(p));
+				eprint!("-- run post-fit --\n{}", gpu_core::callspy::report_since(p));
 			}
 			model.arena_gen.set(gpu_core::memory::live_parked_gen());
 			let mut last = self.last.borrow_mut();
@@ -333,7 +311,7 @@ impl Train {
 				let (preds, vals) = infer_scored(
 					&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
 					model.loss, model.lr, &self.metrics, ss_tot,
-				);
+				).expect("run: eval metrics");
 				eprintln!("eval  {}", model.metrics_line(&self.metrics, &vals));
 				let stop = if model.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
 				let score = self
@@ -347,7 +325,7 @@ impl Train {
 				let (preds, _) = infer_scored(
 					&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
 					model.loss, model.lr, &[], 0.0,
-				);
+				).expect("run: eval predictions");
 				(f64::NAN, preds)
 			};
 			let mut last = self.last.borrow_mut();
@@ -503,9 +481,9 @@ impl ModelInner {
 				"eval: this model's device weights were freed by a later training run and \
 				 there is no host mirror to restore them (pooled out-of-core arena run)",
 			);
-			let saved = load_ogdl_str(&m.text);
+			let saved = load_ogdl_str(&m.text).expect("eval: parse host weight mirror");
 			let plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
-				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"));
+				.expect("eval: rebuild weights from mirror");
 			let host = plan.host();
 			let staged = GpuBuffer::alloc(host.len().max(1)).expect("rebuild staged alloc");
 			staged.load(host).expect("rebuild staged load");
@@ -573,7 +551,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool, net_ram: usiz
 					String::new()
 				};
 				eprintln!(
-					"\x1b[33mwaterfall\x1b[0m  scratch {} → VRAM {} + RAM {} + DISK {}{net_part}",
+					"\x1b[33mwaterfall\x1b[0m  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
 					crate::data::human_bytes(need),
 					crate::data::human_bytes(p.vram),
 					crate::data::human_bytes(p.ram),
@@ -638,12 +616,12 @@ impl Model {
 	}
 
 	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
-		let saved = load_ogdl_str(weights);
+		let saved = load_ogdl_str(weights).expect("Model::load: parse weights");
 		let inner = &proto.inner;
 		let vocab = pinned_vocab(&inner.specs)
 			.expect("Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
 		let plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true)
-			.unwrap_or_else(|e| panic!("Model::load: {e}"));
+			.expect("Model::load: plan layer params");
 		let host = plan.host();
 		let staged = GpuBuffer::alloc(host.len().max(1)).expect("Model::load staged alloc");
 		staged.load(host).expect("Model::load staged load");
@@ -660,11 +638,17 @@ impl Model {
 		self
 	}
 
-	fn set_last_activation(mut self, act: Activation) -> Model {
+	fn last_activation_slot(&mut self) -> Option<&mut Activation> {
 		match self.inner.specs.last_mut() {
-			Some(LayerSpec::Dense(_, a)) | Some(LayerSpec::Conv(_, _, _, a)) => *a = act,
-			_ => panic!("activation method called but last layer is not dense or conv"),
+			Some(LayerSpec::Dense(_, a)) | Some(LayerSpec::Conv(_, _, _, a)) => Some(a),
+			_ => None,
 		}
+	}
+
+	fn set_last_activation(mut self, act: Activation) -> Model {
+		*self
+			.last_activation_slot()
+			.expect("activation method called but last layer is not dense or conv") = act;
 		self
 	}
 
@@ -713,7 +697,7 @@ impl Model {
 
 	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
 		let inner = &self.inner;
-		let prepared = data.prepared();
+		let prepared = data.prepared().expect("eval: prepare data");
 		let ds = prepared.get();
 		let arena = self.begin_forward();
 		let (xbuf, x_cat, n) = inner.prep_eval_input(ds);
@@ -732,7 +716,7 @@ impl Model {
 			let (preds, vals) = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
 				inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
-			);
+			).expect("eval: metrics");
 			let label = if inner.loss.is_classification() { "accuracy" } else { "R2" };
 			eprintln!("eval: {label} = {:.4} ({n} samples)", vals[0]);
 			preds
@@ -740,7 +724,7 @@ impl Model {
 			let (preds, _) = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
 				inner.loss, inner.lr, &[], 0.0,
-			);
+			).expect("eval: predictions");
 			eprintln!("eval: {n} samples (no target column, score unavailable)");
 			preds
 		};

@@ -50,7 +50,7 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>,
 				raw.len()
 			);
 		}
-		out.push((name, shape.iter().map(|&d| d as usize).collect(), decode(&dtype, raw)));
+		out.push((name, shape.iter().map(|&d| d as usize).collect(), decode(&dtype, raw)?));
 	}
 	Ok(out)
 }
@@ -119,8 +119,8 @@ fn elem_size(dtype: &str) -> Option<usize> {
 	})
 }
 
-fn decode(dtype: &str, raw: &[u8]) -> Vec<f64> {
-	match dtype {
+fn decode(dtype: &str, raw: &[u8]) -> Result<Vec<f64>> {
+	Ok(match dtype {
 		"BOOL" | "U8" => raw.iter().map(|&x| x as f64).collect(),
 		"I8" => raw.iter().map(|&x| x as i8 as f64).collect(),
 		"I16" => raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect(),
@@ -136,8 +136,8 @@ fn decode(dtype: &str, raw: &[u8]) -> Vec<f64> {
 		"I64" => raw.chunks_exact(8).map(|c| i64::from_le_bytes(arr8(c)) as f64).collect(),
 		"U64" => raw.chunks_exact(8).map(|c| u64::from_le_bytes(arr8(c)) as f64).collect(),
 		"F64" => raw.chunks_exact(8).map(|c| f64::from_le_bytes(arr8(c))).collect(),
-		_ => unreachable!("decode: dtype '{dtype}' passed elem_size but has no decode arm"),
-	}
+		_ => bail!("decode: unsupported dtype '{dtype}'"),
+	})
 }
 
 fn arr4(c: &[u8]) -> [u8; 4] {
@@ -434,7 +434,7 @@ mod tests {
 		f.seek(SeekFrom::Start(data_start + begin)).expect("seek tensor");
 		let mut raw = vec![0u8; (end - begin) as usize];
 		f.read_exact(&mut raw).expect("read tensor bytes");
-		let vals = decode(&dtype, &raw);
+		let vals = decode(&dtype, &raw).expect("decode F32 tensor");
 		assert_eq!(vals, vec![1.5, -2.5, 3.0, 4.0], "decoded F32 tensor, widened to f64");
 		let _ = std::fs::remove_file(&path);
 	}
