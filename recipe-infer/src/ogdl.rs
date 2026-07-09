@@ -166,91 +166,72 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
 	let want_w = filter.map_or(true, |f| f.contains(&Param::W));
 	let want_b = filter.map_or(true, |f| f.contains(&Param::B));
-	let join = |v: &[f64]| {
-		v.iter()
-			.map(|x| x.to_string())
-			.collect::<Vec<_>>()
-			.join(" ")
-	};
-	let mut out = format!("{key}={score}\n");
-	let mut z = 1;
-	for p in params.iter() {
-		match p.kind {
-			LayerKind::Embed => {
-				out.push_str("embed\n");
-				if want_w {
-					let table = download_vec(&p.w, p.vocab * p.dim);
-					for id in 0..p.vocab {
-						let row = &table[id * p.dim..(id + 1) * p.dim];
-						out.push_str(&format!("    {id}={}\n", join(row)));
-					}
-				}
-			}
-			LayerKind::Attn => {
-				out.push_str("attn\n");
-				let dd = p.dim * p.dim;
-				if want_w {
-					for (nm, buf) in [
-						("wq", &p.w),
-						("wk", &p.wk),
-						("wv", &p.wv),
-						("wo", &p.wo),
-					] {
-						out.push_str(&format!(
-							"    {nm}={}\n",
-							join(&download_vec(buf, dd))
-						));
-					}
-				}
-				if want_b {
-					// Bare attention has a single shared (zero) bias [d];
-					// emit it as bq/bk/bv/bo for format completeness.
-					let bias = download_vec(&p.b, p.dim);
-					for nm in ["bq", "bk", "bv", "bo"] {
-						out.push_str(&format!("    {nm}={}\n", join(&bias)));
-					}
-				}
-			}
-			LayerKind::Conv => {
-				let lin = p.in_dim / p.conv_cin;
-				let lout = (lin - p.conv_k) / p.conv_stride + 1;
-				let cout = p.out_dim / lout;
-				let w_count = cout * p.conv_cin * p.conv_k;
-				out.push_str(&format!("conv {} {} {} {}\n", cout, p.conv_cin, p.conv_k, p.conv_stride));
-				if want_w {
-					let w = download_vec(&p.w, w_count);
-					out.push_str(&format!("    w={}\n", join(&w)));
-				}
-				if want_b {
-					let b = download_vec(&p.b, cout);
-					out.push_str(&format!("    b={}\n", join(&b)));
-				}
-			}
-			LayerKind::Dense => {
-				let w = download_vec(&p.w, p.in_dim * p.out_dim);
-				let b = download_vec(&p.b, p.out_dim);
-				let slope = (p.act == Activation::PRelu)
-					.then(|| download_scalar(&p.palpha));
-				for j in 0..p.out_dim {
-					out.push_str(&format!("z{z}\n"));
+	// Same walk as `dump_ogdl_host`, downloading each block from the GPU, but the
+	// serialization itself is just `add` calls through the ogdl four-method API.
+	crate::params::ogdl_text(|g| {
+		g.add(score, key); // metric header: `{key} {score}`
+		let mut z = 1;
+		for p in params.iter() {
+			match p.kind {
+				LayerKind::Embed => {
 					if want_w {
-						let row: Vec<f64> = (0..p.in_dim)
-							.map(|i| w[i * p.out_dim + j])
-							.collect();
-						out.push_str(&format!("    w={}\n", join(&row)));
-						if let Some(a) = slope {
-							out.push_str(&format!("    a={a}\n"));
+						let table = download_vec(&p.w, p.vocab * p.dim);
+						for id in 0..p.vocab {
+							g.add(table[id * p.dim..(id + 1) * p.dim].to_vec(), &format!("embed.{id}"));
 						}
 					}
-					if want_b {
-						out.push_str(&format!("    b={}\n", b[j]));
+				}
+				LayerKind::Attn => {
+					let dd = p.dim * p.dim;
+					if want_w {
+						g.add(download_vec(&p.w, dd), "attn.wq");
+						g.add(download_vec(&p.wk, dd), "attn.wk");
+						g.add(download_vec(&p.wv, dd), "attn.wv");
+						g.add(download_vec(&p.wo, dd), "attn.wo");
 					}
-					z += 1;
+					if want_b {
+						// Bare attention has a single shared (zero) bias [d];
+						// emit it as bq/bk/bv/bo for format completeness.
+						let bias = download_vec(&p.b, p.dim);
+						for nm in ["bq", "bk", "bv", "bo"] {
+							g.add(bias.clone(), &format!("attn.{nm}"));
+						}
+					}
+				}
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					let w_count = cout * p.conv_cin * p.conv_k;
+					g.add(vec![cout as f64, p.conv_cin as f64, p.conv_k as f64, p.conv_stride as f64], "conv");
+					if want_w {
+						g.add(download_vec(&p.w, w_count), "conv.w");
+					}
+					if want_b {
+						g.add(download_vec(&p.b, cout), "conv.b");
+					}
+				}
+				LayerKind::Dense => {
+					let w = download_vec(&p.w, p.in_dim * p.out_dim);
+					let b = download_vec(&p.b, p.out_dim);
+					let slope = (p.act == Activation::PRelu).then(|| download_scalar(&p.palpha));
+					for j in 0..p.out_dim {
+						if want_w {
+							let row: Vec<f64> = (0..p.in_dim).map(|i| w[i * p.out_dim + j]).collect();
+							g.add(row, &format!("z{z}.w"));
+							if let Some(a) = slope {
+								g.add(a, &format!("z{z}.a"));
+							}
+						}
+						if want_b {
+							g.add(b[j], &format!("z{z}.b"));
+						}
+						z += 1;
+					}
 				}
 			}
 		}
-	}
-	out
+	})
 }
 
 /// Write OGDL text, creating any missing parent dirs — saving should make the
@@ -270,7 +251,9 @@ pub fn write_ogdl(path: &str, out: &str) {
 pub fn saved_score(path: &str, key: &str) -> Option<f64> {
 	let text = std::fs::read_to_string(path).ok()?;
 	for line in text.lines() {
-		if let Some((k, v)) = line.trim().split_once('=')
+		// Header is `{key} {score}` (ogdl space form) or legacy `{key}={score}`.
+		let line = line.trim();
+		if let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(char::is_whitespace))
 			&& k.trim() == key
 		{
 			return v.trim().parse().ok();
@@ -349,5 +332,24 @@ z2
 				a: Some(0.25)
 			}
 		);
+	}
+
+	// The migrated path end-to-end: build a checkpoint purely with `ogdl.add`
+	// (the new save mechanics) and load it back into `Saved` — no hand-rolled
+	// format on either side.
+	#[test]
+	fn dump_add_api_roundtrips() {
+		let text = crate::params::ogdl_text(|g| {
+			g.add(0.42_f64, "r2"); // metric header
+			g.add(vec![0.1_f64, 0.2, 0.3], "z1.w");
+			g.add(0.05_f64, "z1.a"); // PReLU slope
+			g.add(0.01_f64, "z1.b");
+			g.add(vec![-0.4_f64, 0.5], "z2.w");
+			g.add(0.02_f64, "z2.b");
+		});
+		let saved = load_ogdl_str(&text);
+		assert_eq!(saved.len(), 2, "two dense neurons, metric header skipped");
+		assert_eq!(saved[0], Saved::Dense { w: vec![0.1, 0.2, 0.3], b: 0.01, a: Some(0.05) });
+		assert_eq!(saved[1], Saved::Dense { w: vec![-0.4, 0.5], b: 0.02, a: None });
 	}
 }

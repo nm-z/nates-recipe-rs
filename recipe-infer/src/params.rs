@@ -279,57 +279,72 @@ impl LayerPlan {
 	/// z-numbering, same row/col order, same `f64::to_string` precision). `image`
 	/// begins at the weight block (plan-image offset 0).
 	pub fn dump_ogdl_host(&self, image: &[f64], key: &str, score: f64) -> String {
-		let join = |v: &[f64]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
-		let blk = |bp: &BlockPlan| &image[bp.off..bp.off + bp.len];
-		let mut out = format!("{key}={score}\n");
-		let mut z = 1;
-		for e in &self.entries {
-			let d = &e.dims;
-			match d.kind {
-				LayerKind::Embed => {
-					out.push_str("embed\n");
-					let table = blk(&e.w);
-					for id in 0..d.vocab {
-						out.push_str(&format!("    {id}={}\n", join(&table[id * d.dim..(id + 1) * d.dim])));
-					}
-				}
-				LayerKind::Attn => {
-					out.push_str("attn\n");
-					for (nm, bp) in [("wq", &e.w), ("wk", &e.wk), ("wv", &e.wv), ("wo", &e.wo)] {
-						out.push_str(&format!("    {nm}={}\n", join(blk(bp))));
-					}
-					let bias = blk(&e.b);
-					for nm in ["bq", "bk", "bv", "bo"] {
-						out.push_str(&format!("    {nm}={}\n", join(bias)));
-					}
-				}
-				LayerKind::Conv => {
-					let lin = d.in_dim / d.conv_cin;
-					let lout = (lin - d.conv_k) / d.conv_stride + 1;
-					let cout = d.out_dim / lout;
-					out.push_str(&format!("conv {} {} {} {}\n", cout, d.conv_cin, d.conv_k, d.conv_stride));
-					out.push_str(&format!("    w={}\n", join(blk(&e.w))));
-					out.push_str(&format!("    b={}\n", join(blk(&e.b))));
-				}
-				LayerKind::Dense => {
-					let w = blk(&e.w);
-					let b = blk(&e.b);
-					let slope = (d.act == Activation::PRelu).then(|| image[e.palpha.off]);
-					for j in 0..d.out_dim {
-						out.push_str(&format!("z{z}\n"));
-						let row: Vec<f64> = (0..d.in_dim).map(|i| w[i * d.out_dim + j]).collect();
-						out.push_str(&format!("    w={}\n", join(&row)));
-						if let Some(a) = slope {
-							out.push_str(&format!("    a={a}\n"));
+		let blk = |bp: &BlockPlan| image[bp.off..bp.off + bp.len].to_vec();
+		ogdl_text(|g| {
+			g.add(score, key); // metric header: `{key} {score}`
+			let mut z = 1;
+			for e in &self.entries {
+				let d = &e.dims;
+				match d.kind {
+					LayerKind::Embed => {
+						let table = blk(&e.w);
+						for id in 0..d.vocab {
+							g.add(table[id * d.dim..(id + 1) * d.dim].to_vec(), &format!("embed.{id}"));
 						}
-						out.push_str(&format!("    b={}\n", b[j]));
-						z += 1;
+					}
+					LayerKind::Attn => {
+						g.add(blk(&e.w), "attn.wq");
+						g.add(blk(&e.wk), "attn.wk");
+						g.add(blk(&e.wv), "attn.wv");
+						g.add(blk(&e.wo), "attn.wo");
+						let bias = blk(&e.b);
+						for nm in ["bq", "bk", "bv", "bo"] {
+							g.add(bias.clone(), &format!("attn.{nm}"));
+						}
+					}
+					LayerKind::Conv => {
+						let lin = d.in_dim / d.conv_cin;
+						let lout = (lin - d.conv_k) / d.conv_stride + 1;
+						let cout = d.out_dim / lout;
+						g.add(vec![cout as f64, d.conv_cin as f64, d.conv_k as f64, d.conv_stride as f64], "conv");
+						g.add(blk(&e.w), "conv.w");
+						g.add(blk(&e.b), "conv.b");
+					}
+					LayerKind::Dense => {
+						let w = blk(&e.w);
+						let b = blk(&e.b);
+						let slope = (d.act == Activation::PRelu).then(|| image[e.palpha.off]);
+						for j in 0..d.out_dim {
+							let row: Vec<f64> = (0..d.in_dim).map(|i| w[i * d.out_dim + j]).collect();
+							g.add(row, &format!("z{z}.w"));
+							if let Some(a) = slope {
+								g.add(a, &format!("z{z}.a"));
+							}
+							g.add(b[j], &format!("z{z}.b"));
+							z += 1;
+						}
 					}
 				}
 			}
-		}
-		out
+		})
 	}
+}
+
+// Serialize an ogdl graph built by `build` to text through the crate's own
+// four-method API (build → `file` → read). The crate writes to files, so this
+// round-trips a private temp — the checkpoint codec is now just `add` calls.
+pub(crate) fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
+	static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let tmp = std::env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", std::process::id()));
+	let tp = tmp.to_str().expect("utf8 tmp");
+	let _ = std::fs::remove_file(tp);
+	let g = ogdl::file(tp); // fresh empty graph (tmp absent)
+	build(g);
+	g.file(tp); // populated graph → write out
+	let text = std::fs::read_to_string(tp).unwrap_or_default();
+	let _ = std::fs::remove_file(tp);
+	text
 }
 
 /// Host-only plan pass: same walk, same shapes, same seeds, same resume
