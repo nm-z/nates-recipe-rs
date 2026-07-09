@@ -93,10 +93,10 @@ fn main() {
 		.log([Loss, Accuracy, hip]);
 
 	for (model, data, train)
-		in [(nn , nn_data , nn_train ),
-			(cnn, cnn_data, cnn_train),
-			(mlp, mlp_data, mlp_train),
-			(llm, llm_data, llm_train),]
+		in [(&nn , &nn_data , &nn_train ),
+			(&cnn, &cnn_data, &cnn_train),
+			(&mlp, &mlp_data, &mlp_train),
+			(&llm, &llm_data, &llm_train),]
 		{ train.run(data, model); }
 }
 

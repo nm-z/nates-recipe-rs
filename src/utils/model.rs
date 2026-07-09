@@ -198,10 +198,11 @@ pub struct Train {
 }
 
 impl Train {
-	/// Constructor. Like `Data::load` / `Model::new`, hands back a
-	/// `&'static mut Train` so the whole builder takes `&mut self`.
-	pub fn new() -> &'static mut Train {
-		Box::leak(Box::new(Train {
+	/// Constructor. Like `Data::load` / `Model::new`, hands back an owned value:
+	/// the builder consumes and returns it, so the chain's result is what the
+	/// caller's `let` binds and drops.
+	pub fn new() -> Train {
+		Train {
 			epochs: 1,
 			log_every: 1,
 			metrics: Vec::new(),
@@ -209,7 +210,7 @@ impl Train {
 			resume: None,
 			net: None,
 			last: RefCell::new(LastRun::default()),
-		}))
+		}
 	}
 
 	/// Resolve a path arg: `""` → `model.ogdl` (cwd), `"*"` → next to the
@@ -229,29 +230,29 @@ impl Train {
 		expand_tilde(&raw)
 	}
 
-	pub fn epochs(&mut self, n: usize) -> &mut Train {
+	pub fn epochs(mut self, n: usize) -> Train {
 		self.epochs = n;
 		self
 	}
 
-	pub fn log_every(&mut self, every: usize) -> &mut Train {
+	pub fn log_every(mut self, every: usize) -> Train {
 		self.log_every = every;
 		self
 	}
 
-	pub fn log(&mut self, metrics: impl IntoIterator<Item = Metric>) -> &mut Train {
+	pub fn log(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
 		self.metrics = metrics.into_iter().collect();
 		self
 	}
 
-	pub fn plot(&mut self, metrics: impl IntoIterator<Item = Metric>) -> &mut Train {
+	pub fn plot(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
 		self.plot = metrics.into_iter().collect();
 		self
 	}
 
 	/// Warm-start from a checkpoint (skips silently if absent). `.resume(())` uses
 	/// `model.ogdl` in the cwd; `.resume("custom.ogdl")` uses an explicit path.
-	pub fn resume(&mut self, path: impl SavePath) -> &mut Train {
+	pub fn resume(mut self, path: impl SavePath) -> Train {
 		self.resume = Some(path.or_default());
 		self
 	}
@@ -261,7 +262,7 @@ impl Train {
 	/// (eth before wlan), falling back to ssh config. Remote RAM joins the
 	/// waterfall as the tier below local disk; a named node that can't be
 	/// reached fails the run loudly at start.
-	pub fn net<'a>(&mut self, nodes: impl IntoIterator<Item = &'a str>) -> &mut Train {
+	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Train {
 		let mut net = crate::wire::Net::new();
 		for alias in nodes {
 			net = net.node(alias);
@@ -283,7 +284,7 @@ impl Train {
 	/// Train (or infer) `model` on `data`. `data` is anything that can produce a
 	/// `Dataset` — a `Data` builder, a `Dataset`, an `Option<Dataset>` (holdout,
 	/// forward-only). Returns `&mut self` so `.save()` chains straight off it.
-	pub fn run(&mut self, data: &dyn RunData, model: &Model) -> &mut Train {
+	pub fn run(&self, data: &dyn RunData, model: &Model) -> &Train {
 		let handle = model;
 		let model: &ModelInner = &model.inner;
 		// Whole-run callspy bracket (gated on the Hip metric, like fit's per-phase
@@ -460,7 +461,7 @@ impl Train {
 	/// Save the FULL trained checkpoint — every param the model allocated — as
 	/// OGDL. `.save(())` writes `model.ogdl` in the cwd; `.save("custom.ogdl")`
 	/// writes an explicit path. Best-only guard applies.
-	pub fn save(&mut self, path: impl SavePath) -> &mut Train {
+	pub fn save(&self, path: impl SavePath) -> &Train {
 		self.save_ogdl(None, &path.or_default());
 		self
 	}
@@ -503,6 +504,12 @@ impl Train {
 		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
 	}
 
+}
+
+impl Default for Train {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 /// Expand a leading `~` (the shell doesn't, since the path arrives as a literal
@@ -774,10 +781,12 @@ fn confirm_issues(issues: &[Issue]) -> bool {
 }
 
 impl Model {
-	/// Constructor: an empty architecture. Hands back a `&'static mut Model` so
-	/// every builder method can take `&mut self` and return `&mut Self`.
-	pub fn new() -> &'static mut Model {
-		Box::leak(Box::new(Model {
+	/// Constructor: an empty architecture. Hands back an owned value; the builder
+	/// consumes and returns it, so the chain's result is what the caller's `let`
+	/// binds and drops. The state lives in a heap-pinned [`ModelInner`] so those
+	/// by-value moves never shift its address.
+	pub fn new() -> Model {
+		Model {
 			inner: Box::new(ModelInner {
 				specs: Vec::new(),
 				loss: Loss::Mse,
@@ -790,7 +799,7 @@ impl Model {
 				arena_gen: Cell::new(None),
 				rebuild_backing: RefCell::new(None),
 			}),
-		}))
+		}
 	}
 
 	/// Load shipped weights into a freshly-built model for forward-only use, with
@@ -800,7 +809,7 @@ impl Model {
 	/// params are built straight from the checkpoint blocks (same builder `fit`
 	/// uses); the scaler is set empty (the detector's pure-embed path z-scores
 	/// nothing) so `run`'s infer branch finds a scaler and skips scaling.
-	pub fn load<'a>(weights: &str, proto: &'a mut Model, d: usize) -> &'a mut Model {
+	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
 		let saved = load_ogdl_str(weights);
 		let inner = &proto.inner;
 		let vocab = pinned_vocab(&inner.specs)
@@ -820,12 +829,12 @@ impl Model {
 		proto
 	}
 
-	pub fn layer(&mut self, spec: impl IntoLayer) -> &mut Model {
+	pub fn layer(mut self, spec: impl IntoLayer) -> Model {
 		self.inner.specs.push(spec.into_layer());
 		self
 	}
 
-	fn set_last_activation(&mut self, act: Activation) -> &mut Model {
+	fn set_last_activation(mut self, act: Activation) -> Model {
 		match self.inner.specs.last_mut() {
 			Some(LayerSpec::Dense(_, a)) | Some(LayerSpec::Conv(_, _, _, a)) => *a = act,
 			_ => panic!("activation method called but last layer is not dense or conv"),
@@ -833,51 +842,95 @@ impl Model {
 		self
 	}
 
-	pub fn relu(&mut self) -> &mut Model {
+	pub fn relu(self) -> Model {
 		self.set_last_activation(Activation::Relu)
 	}
-	pub fn leak(&mut self) -> &mut Model {
+	pub fn leak(self) -> Model {
 		self.set_last_activation(Activation::LeakyRelu)
 	}
-	pub fn sigmoid(&mut self) -> &mut Model {
+	pub fn sigmoid(self) -> Model {
 		self.set_last_activation(Activation::Sigmoid)
 	}
-	pub fn tanh(&mut self) -> &mut Model {
+	pub fn tanh(self) -> Model {
 		self.set_last_activation(Activation::Tanh)
 	}
-	pub fn selu(&mut self) -> &mut Model {
+	pub fn selu(self) -> Model {
 		self.set_last_activation(Activation::Selu)
 	}
-	pub fn gelu(&mut self) -> &mut Model {
+	pub fn gelu(self) -> Model {
 		self.set_last_activation(Activation::Gelu)
 	}
-	pub fn silu(&mut self) -> &mut Model {
+	pub fn silu(self) -> Model {
 		self.set_last_activation(Activation::Silu)
 	}
-	pub fn elu(&mut self) -> &mut Model {
+	pub fn elu(self) -> Model {
 		self.set_last_activation(Activation::Elu)
 	}
-	pub fn prelu(&mut self) -> &mut Model {
+	pub fn prelu(self) -> Model {
 		self.set_last_activation(Activation::PRelu)
 	}
 
 	/// 1D conv: `filters` output channels, `kernel` width, `stride` downsample
 	/// factor (1 = none). Stride is a conv parameter, not a separate step.
-	pub fn conv(&mut self, filters: usize, kernel: usize, stride: usize) -> &mut Model {
+	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Model {
 		self.inner.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
 		self
 	}
 
-	pub fn loss(&mut self, loss: Loss) -> &mut Model {
+	pub fn loss(mut self, loss: Loss) -> Model {
 		self.inner.loss = loss;
 		self
 	}
 
-	/// Set the learning rate. Reset it between runs by chaining again:
-	/// `train.run(data, model.lr(1e-8));`.
-	pub fn lr(&mut self, lr: f64) -> &mut Model {
+	/// Set the learning rate. To reset between runs, rebind:
+	/// `let model = model.lr(1e-8); train.run(&data, &model);`.
+	pub fn lr(mut self, lr: f64) -> Model {
 		self.inner.lr = lr;
 		self
+	}
+
+	/// Forward-only evaluation of the trained model on `data`, reporting the
+	/// loss-appropriate score (accuracy for classification, R² for regression).
+	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the
+	/// Dataset. Returns the raw `n*k` predictions.
+	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
+		let inner = &self.inner;
+		let prepared = data.prepared();
+		let ds = prepared.get();
+		// Adopt the previous run's parked backing as this pass's arena and rebuild the
+		// params into it from the host mirror; parked back in `end_forward` below.
+		let arena = self.begin_forward();
+		let (xbuf, x_cat, n) = inner.prep_eval_input(ds);
+		let params = inner.params.borrow();
+		assert!(!params.is_empty(), "eval: call train() first");
+		let yscaler = *inner.yscaler.borrow();
+		let metric = if inner.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
+		let preds = if ds.has_target {
+			let yslice = ds.y.as_slice().expect("eval: y contiguous");
+			let ybuf = GpuBuffer::alloc(yslice.len()).expect("eval ybuf");
+			ybuf.load(yslice).expect("eval ybuf load");
+			let k = params[params.len() - 1].out_dim;
+			let total = (n * k) as f64;
+			let ybar = ds.y.iter().sum::<f64>() / total;
+			let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
+			let (preds, vals) = infer_scored(
+				&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
+				inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
+			);
+			let label = if inner.loss.is_classification() { "accuracy" } else { "R2" };
+			eprintln!("eval: {label} = {:.4} ({n} samples)", vals[0]);
+			preds
+		} else {
+			let (preds, _) = infer_scored(
+				&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
+				inner.loss, inner.lr, &[], 0.0,
+			);
+			eprintln!("eval: {n} samples (no target column, score unavailable)");
+			preds
+		};
+		drop(params);
+		self.end_forward(arena);
+		preds
 	}
 
 	/// Open a forward-only pass. A forward pass IS a run, and a fit leaves the
@@ -908,6 +961,66 @@ impl Model {
 	}
 }
 
+impl Default for Model {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[cfg(test)]
+mod builder_ownership_tests {
+	use super::*;
+
+	fn rss_bytes() -> usize {
+		let statm = std::fs::read_to_string("/proc/self/statm").expect("read /proc/self/statm");
+		let pages: usize = statm
+			.split_whitespace()
+			.nth(1)
+			.expect("statm resident field")
+			.parse()
+			.expect("statm resident pages");
+		pages * 4096
+	}
+
+	// The builders hand back OWNED values, so a loop that builds N of them holds one
+	// at a time and RSS is flat. Constructors that `Box::leak` a `&'static mut` retain
+	// every Model/Train/Data ever built — roughly a kilobyte per cycle here, tens of
+	// megabytes across this loop. Self-created arff input (no GPU, no committed
+	// fixture); the warm-up settles the allocator before the baseline is read.
+	#[test]
+	fn builders_are_owned_not_leaked() {
+		let path = std::env::temp_dir()
+			.join(format!("recipe_builder_own_{}.arff", std::process::id()));
+		std::fs::write(
+			&path,
+			"@relation t\n@attribute a numeric\n@attribute y numeric\n@data\n1,2\n3,4\n",
+		)
+		.expect("write arff");
+		let p = path.to_str().expect("temp path utf8");
+
+		let cycle = |p: &str| {
+			let _m = Model::new().layer(64).relu().layer(1).loss(mse).lr(0.01);
+			let _t = Train::new().epochs(10).log_every(2);
+			let _d = crate::dataset::Data::load(p).split(0.5).exclude("none").target("y");
+		};
+		const WARM: usize = 5_000;
+		const N: usize = 50_000;
+		for _ in 0..WARM {
+			cycle(p);
+		}
+		let before = rss_bytes();
+		for _ in 0..N {
+			cycle(p);
+		}
+		let growth = rss_bytes().saturating_sub(before);
+		let _ = std::fs::remove_file(&path);
+		assert!(
+			growth < 8 << 20,
+			"builders leak: RSS grew {growth} B across {N} build cycles (owned builders keep it flat)"
+		);
+	}
+}
+
 #[cfg(test)]
 mod metric_gpu_tests {
 	use super::*;
@@ -934,21 +1047,24 @@ mod metric_gpu_tests {
 		b
 	}
 
-	static CHURN: LazyLock<Option<crate::dataset::Dataset>> = LazyLock::new(|| {
-		const TRAIN: &str = "/home/nate/Desktop/playground-series-s6e3/train.csv";
-		if !std::path::Path::new(TRAIN).exists() {
-			return None;
-		}
+	// The committed (Git LFS) churn set, repo-relative — SUITE SPEC R10: a test reads
+	// only committed or self-created files. This used to name an absolute path outside
+	// the repo, which never existed, so all three GPU tests below returned `ok` in 0.00s
+	// without launching a kernel. Absent = FAIL, loudly: a test that did not run did not
+	// pass, and this one has real data to run on.
+	static CHURN: LazyLock<crate::dataset::Dataset> = LazyLock::new(|| {
+		const TRAIN: &str = "datasets/playground-series-s6e3/train.csv";
+		assert!(
+			std::path::Path::new(TRAIN).exists(),
+			"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",
+		);
 		let data = crate::dataset::Data::load(TRAIN).target("Churn");
-		Some(data.datasets().0)
+		data.datasets().0
 	});
 
 	#[test]
 	fn gpu_metrics_match_cpu_reference() {
-		let Some(train) = CHURN.as_ref() else {
-			eprintln!("skip: churn dataset absent");
-			return;
-		};
+		let train: &crate::dataset::Dataset = &CHURN;
 		gpu_core::hip::set_device(0).expect("set_device");
 		let x = &train.x;
 		let y = &train.y;
@@ -1072,10 +1188,7 @@ mod metric_gpu_tests {
 	// sigmoid — a well-posed problem on real data, not a hand-rolled scaler.
 	#[test]
 	fn fit_loop_memory_flat() {
-		let Some(train) = CHURN.as_ref() else {
-			eprintln!("skip: churn dataset absent");
-			return;
-		};
+		let train: &crate::dataset::Dataset = &CHURN;
 		gpu_core::hip::set_device(0).expect("set_device");
 		let x = &train.x;
 		let y = &train.y;
@@ -1200,10 +1313,7 @@ mod metric_gpu_tests {
 
 	#[test]
 	fn ping_pong_gradients_match_per_layer() {
-		let Some(train) = CHURN.as_ref() else {
-			eprintln!("skip: churn dataset absent");
-			return;
-		};
+		let train: &crate::dataset::Dataset = &CHURN;
 		gpu_core::hip::set_device(0).expect("set_device");
 		let x = &train.x;
 		let y = &train.y;

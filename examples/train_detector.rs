@@ -13,7 +13,7 @@ use pantry::{
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
 };
 
-fn model() -> &'static mut Model {
+fn model() -> Model {
 	Model::new()
 		.layer(embed(EMBED_DIM).vocab(VOCAB))
 		.layer(attn(HEADS))
@@ -455,8 +455,8 @@ fn main() {
 	let _ = std::fs::remove_file("pantry/detector.ogdl");
 	let model = model();
 	let trainer = Train::new().epochs(20000).resume("pantry/detector.ogdl").log([Epoch, Loss, Accuracy]);
-	trainer.run(&train, model);
+	trainer.run(&train, &model);
 	trainer.save("pantry/detector.ogdl");
 	eprintln!("=== held-out test set (60%) — datatype-detection accuracy ===");
-	Train::new().log([Accuracy]).run(&Some(test), model);
+	Train::new().log([Accuracy]).run(&Some(test), &model);
 }

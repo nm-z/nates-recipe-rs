@@ -28,16 +28,17 @@ impl IntoTargets for &[&str] {
 /// — so building a `Data`, even many of them, costs only the config it holds.
 /// `Data` describes; `Train` executes.
 ///
-/// `Data::load` hands back a `&'static mut Data` so every builder method can
-/// take `&mut self` and return `&mut Self`: the chain and the `let` binding it
-/// produces name the same heap-pinned config, whose address never moves.
+/// The builder consumes and returns `Data` by value, so the chain's result is an
+/// owned value the caller's `let` binds and drops — no leak, and a loop that
+/// builds a thousand of them holds one at a time. The config lives in a
+/// heap-pinned [`DataInner`] so those by-value moves never shift its address.
 pub struct Data {
 	pub(crate) inner: Box<DataInner>,
 }
 
 #[doc(hidden)]
 pub struct DataInner {
-	pub target: &'static str,
+	pub target: String,
 	target_names: Vec<String>,
 	pub(crate) attrs: Vec<Attr>,
 	rows: Vec<Vec<String>>,
@@ -152,10 +153,10 @@ fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 impl Data {
 	/// Constructor: describe a dataset rooted at `path` (CSV / ARFF /
 	/// `.safetensors` / image dir). Chain `.set()` to add further sources.
-	pub fn load(path: &str) -> &'static mut Data {
-		let data: &'static mut Data = Box::leak(Box::new(Data {
+	pub fn load(path: &str) -> Data {
+		let data = Data {
 			inner: Box::new(DataInner {
-				target: "",
+				target: String::new(),
 				target_names: Vec::new(),
 				attrs: Vec::new(),
 				rows: Vec::new(),
@@ -168,11 +169,11 @@ impl Data {
 				raw_test_headers: None,
 				pre_kinds: Vec::new(),
 			}),
-		}));
+		};
 		data.set(path)
 	}
 
-	pub fn set(&mut self, path: &str) -> &mut Data {
+	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
 		if is_arff(path) {
 			let (attrs, rows) = crate::data::parse_arff(path);
@@ -192,13 +193,9 @@ impl Data {
 		self
 	}
 
-	pub fn target(&mut self, t: impl IntoTargets) -> &mut Data {
+	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.inner.target_names = t.into_targets();
-		self.inner.target = self
-			.inner
-			.target_names
-			.first()
-			.map_or("", |s| Box::leak(s.clone().into_boxed_str()));
+		self.inner.target = self.inner.target_names.first().cloned().unwrap_or_default();
 		if !self.inner.attrs.is_empty() {
 			let attrs = &self.inner.attrs;
 			let targets = self
@@ -236,17 +233,17 @@ impl Data {
 		self
 	}
 
-	pub fn test(&mut self, path: &str) -> &mut Data {
+	pub fn test(mut self, path: &str) -> Data {
 		self.inner.test_path = Some(path.to_string());
 		self
 	}
 
-	pub fn exclude(&mut self, pattern: &str) -> &mut Data {
+	pub fn exclude(mut self, pattern: &str) -> Data {
 		self.inner.exclude.push(pattern.to_string());
 		self
 	}
 
-	pub fn split(&mut self, train_frac: f64) -> &mut Data {
+	pub fn split(mut self, train_frac: f64) -> Data {
 		assert!(
 			(0.0..1.0).contains(&train_frac),
 			"split fraction must be in (0, 1), got {train_frac}",

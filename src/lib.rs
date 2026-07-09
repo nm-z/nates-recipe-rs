@@ -5,13 +5,17 @@
 //! Three import styles, one crate, the same methods. Only the door differs —
 //! everything after the constructor is dot chaining.
 //!
+//! Every constructor returns an owned value and every builder method consumes and
+//! returns it, so the chain's result is what your `let` binds — and drops. Nothing
+//! is leaked; a loop that builds a thousand models holds one at a time.
+//!
 //! ```rust,no_run
 //! // style 1: static (dot syntax)
 //! use recipe::*;
 //!
 //! let data  = recipe.data("train.csv").split(0.8).target("Price");
 //! let model = recipe.model().layer(64).leak().layer(1).loss(mse).lr(0.001);
-//! recipe.train().epochs(100).log([Loss, R2]).run(data, model).save("model.ogdl");
+//! recipe.train().epochs(100).log([Loss, R2]).run(&data, &model).save("model.ogdl");
 //! ```
 //!
 //! ```rust,no_run
@@ -20,16 +24,16 @@
 //!
 //! let data  = Data::load("train.csv").split(0.8).target("Price");
 //! let model = Model::new().layer(64).leak().layer(1).loss(mse).lr(0.001);
-//! Train::new().epochs(100).run(data, model);
-//! model.eval(data);
+//! Train::new().epochs(100).run(&data, &model);
+//! model.eval(&data);
 //! ```
 //!
 //! ```rust,no_run
 //! // style 3: crate path (free function)
 //! let data  = recipe::data("train.csv").split(0.8).target("Price");
 //! let model = recipe::model().layer(64).leak().layer(1).loss(recipe::mse);
-//! recipe::train().epochs(100).run(data, model);
-//! recipe::eval(model, data);
+//! recipe::train().epochs(100).run(&data, &model);
+//! recipe::eval(&model, &data);
 //! ```
 
 #[doc(hidden)]
@@ -93,13 +97,13 @@ pub struct Recipe;
 pub static recipe: Recipe = Recipe;
 
 impl Recipe {
-	pub fn data(&self, path: &str) -> &'static mut Data {
+	pub fn data(&self, path: &str) -> Data {
 		Data::load(path)
 	}
-	pub fn model(&self) -> &'static mut Model {
+	pub fn model(&self) -> Model {
 		Model::new()
 	}
-	pub fn train(&self) -> &'static mut Train {
+	pub fn train(&self) -> Train {
 		Train::new()
 	}
 	pub fn eval(&self, model: &Model, data: &dyn RunData) -> Vec<f64> {
@@ -108,15 +112,15 @@ impl Recipe {
 }
 
 /// Style 3: `recipe::data("train.csv")`.
-pub fn data(path: &str) -> &'static mut Data {
+pub fn data(path: &str) -> Data {
 	Data::load(path)
 }
 /// Style 3: `recipe::model()`.
-pub fn model() -> &'static mut Model {
+pub fn model() -> Model {
 	Model::new()
 }
 /// Style 3: `recipe::train()`.
-pub fn train() -> &'static mut Train {
+pub fn train() -> Train {
 	Train::new()
 }
 /// Style 3: `recipe::eval(model, data)`.

@@ -44,31 +44,33 @@ ROCm default `/opt/rocm` (symlink to ~/.rocm-install/rocm); overrides: `ROCM_PAT
 ## User API
 
 Three import styles, one crate, the same methods — only the door differs. Everything
-after the constructor is dot chaining. Constructors return `&'static mut Self`, so
-every builder method takes `&mut self` and returns `&mut Self`.
+after the constructor is dot chaining. Constructors return an OWNED value and every
+builder method consumes and returns it, so the chain's result is what the `let` binds
+and drops. **No `Box::leak` anywhere** — a loop building 1000 models holds one at a time
+(pinned by `builders_are_owned_not_leaked`, an RSS test over 50k build cycles).
 
 ```rust
 use recipe::*;                                              // style 1: static
 recipe.data("train.csv").split(0.8).target("Price");
 recipe.model().layer(64).leak().layer(1).loss(mse).lr(0.001);
-recipe.train().epochs(100).run(data, model);
-recipe.eval(model, data);
+recipe.train().epochs(100).run(&data, &model);
+recipe.eval(&model, &data);
 
 let data  = Data::load("train.csv").split(0.8).target("Price");   // style 2: struct
 let model = Model::new().layer(64).leak().layer(1).loss(mse).lr(0.001);
-Train::new().epochs(100).log([Loss, R2, Lr]).run(data, model).save(());
-model.eval(data);                             // SavePath: () = "model.ogdl"
+Train::new().epochs(100).log([Loss, R2, Lr]).run(&data, &model).save(());
+model.eval(&data);                            // SavePath: () = "model.ogdl"
 
 let data  = recipe::data("train.csv").split(0.8).target("Price"); // style 3: free fn
-recipe::train().epochs(100).run(data, recipe::model().layer(1));
-recipe::eval(model, data);
+recipe::train().epochs(100).run(&data, &recipe::model().layer(1));
+recipe::eval(&model, &data);
 ```
 
 `recipe` is a unit static (value namespace), so `recipe.data(…)` and `recipe::data(…)` coexist.
 
 - `Data`: `Data::load(path)` then `.set() .test() .split() .exclude() .target() .datasets()` — lazy; `.target()` only describes, `Train::run` materializes+frees per run.
-- `Model`: `.layer(n)` + chained activation (`.relu() .leak() .gelu() …`), `.layer(embed(dim))`, `.layer(attn(heads))`, `conv(filters, kernel, stride)`, `.eval(data)`. `ModelInner` is crate-private; eval lives on `Model`.
-- `Train`: `.epochs() .log_every() .log() .plot() .net() .resume(path)`; `.run(data, model)` takes both explicitly (`data` is any `&dyn RunData`) and returns `&mut Train` so `.save(path)` chains off it. Resume shape mismatch crashes with a diagnostic, never silently reinitializes. Preflight checks VRAM/embed/loss before GPU work; over-ceiling scenarios skip gracefully.
+- `Model`: `.layer(n)` + chained activation (`.relu() .leak() .gelu() …`), `.layer(embed(dim))`, `.layer(attn(heads))`, `conv(filters, kernel, stride)`, `.eval(&data)`. `ModelInner` is crate-private; `eval` lives on `Model`, in `model.rs` beside it.
+- `Train`: `.epochs() .log_every() .log() .plot() .net() .resume(path)`; `.run(&data, &model)` takes both explicitly (`data` is any `&dyn RunData`), takes `&self` and returns `&Train` so `.save(path)` chains off it. Resume shape mismatch crashes with a diagnostic, never silently reinitializes. Preflight checks VRAM/embed/loss before GPU work; over-ceiling scenarios skip gracefully.
 - A forward-only pass is a run: it **adopts** the previous run's parked arena (rewind + memset, no free), rebuilds weights from the host mirror, and parks it again. A fit leaves `arena_remaining() == 0`, so it cannot carve otherwise.
 - Consts: losses `mse mae huber ce bce focal`; metrics `Loss Accuracy R2 Lr Epoch Time hip`.
 
