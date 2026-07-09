@@ -18,7 +18,6 @@ const ASSERTION_KEYWORDS: &[&str] = &["assert", "panic", "expect", "should_panic
 const SPY: &str = "gpu-core/src/callspy.rs";
 const SPY_DECL: &str = "pub const N: usize = ";
 const SPY_COUNTERS: usize = 47;
-const MAX_COMMENT_RUN: usize = 2;
 const MAX_DOC_LINES_ON_PUB_FN: usize = 1;
 const MAX_FILE_LINES: usize = 2000;
 
@@ -291,6 +290,7 @@ fn returns_mut_type(line: &str) -> bool {
             .any(|(i, s)| line[i + s.len()..].starts_with(|c: char| c.is_ascii_uppercase()))
 }
 
+
 fn doc_lines_above(lines: &[&str], i: usize) -> usize {
       let mut d = 0usize;
       while i > d && lines[i - 1 - d].trim_start().starts_with("///") {
@@ -490,6 +490,25 @@ fn h09_dead_import_report() {
       }
       eprintln!("WARN: check above for dead imports (manual review)");
       assert!(!uses.is_empty(), "no `use` lines found: scanner is broken");
+}
+
+#[test]
+fn h10_pub_fn_doc_at_most_one_line() {
+      let mut hits = Vec::new();
+      for p in rs_files(SRC_ROOTS) {
+            let src = read(&p);
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                  if !l.contains("pub fn") {
+                        continue;
+                  }
+                  let d = doc_lines_above(&lines, i);
+                  if d > MAX_DOC_LINES_ON_PUB_FN {
+                        hits.push(format!("{}:{}: {d}-line doc comment", rel(&p), i + 1));
+                  }
+            }
+      }
+      assert_absent("multi-line doc comment on pub fn", &hits);
 }
 
 #[test]
