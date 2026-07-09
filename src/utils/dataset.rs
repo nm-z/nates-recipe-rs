@@ -23,15 +23,6 @@ impl IntoTargets for &[&str] {
 	}
 }
 
-/// A lazy description of a dataset: which sources, target, split, exclusions.
-/// Nothing is loaded or encoded until `Train::run` (or `datasets()`) asks for it
-/// — so building a `Data`, even many of them, costs only the config it holds.
-/// `Data` describes; `Train` executes.
-///
-/// The builder consumes and returns `Data` by value, so the chain's result is an
-/// owned value the caller's `let` binds and drops — no leak, and a loop that
-/// builds a thousand of them holds one at a time. The config lives in a
-/// heap-pinned [`DataInner`] so those by-value moves never shift its address.
 pub struct Data {
 	pub(crate) inner: Box<DataInner>,
 }
@@ -49,9 +40,6 @@ pub struct DataInner {
 	exclude: Vec<String>,
 	raw_test_rows: Option<Vec<Vec<String>>>,
 	raw_test_headers: Option<Vec<String>>,
-	// Column kinds detected at `.set()` time (table sources only): the detector's
-	// GPU classification, moved out of the training run's init window. Consumed by
-	// `prepare_table` in place of the in-encode `predict_kinds`.
 	pre_kinds: pantry::encode::PreKinds,
 }
 
@@ -66,12 +54,6 @@ impl std::ops::DerefMut for Data {
 		&mut self.inner
 	}
 }
-/// The `Dataset → Mat` seam for the embed-on-categoricals path: collapse each
-/// one-hot group back to a single integer-index column (each category a unique
-/// id, offset across groups) so an `embed` layer can look them up directly.
-/// Returns `(collapsed matrix, the new embed-column indices, total vocab size)`.
-/// Lives here, not in `pantry`, because it is the one place inference needs to
-/// know what a `Dataset` is — and that knowledge stays up in this crate.
 pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
@@ -120,10 +102,6 @@ fn is_safetensors(path: &str) -> bool {
 	std::path::Path::new(path).extension().and_then(|e| e.to_str()) == Some("safetensors")
 }
 
-/// A `.safetensors` source as a numeric table: each tensor's leading dim is the row
-/// count, its trailing dims flatten to columns (`name` for a 1-D tensor, `name:c` per
-/// column above that). Every column is `Numeric`; `.target(name)` selects which tensor
-/// is the target, the rest are features. Feeds the same arff encode path.
 fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 	let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("safetensors: read {path}: {e}"));
 	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
@@ -151,8 +129,6 @@ fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 }
 
 impl Data {
-	/// Constructor: describe a dataset rooted at `path` (CSV / ARFF /
-	/// `.safetensors` / image dir). Chain `.set()` to add further sources.
 	pub fn load(path: &str) -> Data {
 		let data = Data {
 			inner: Box::new(DataInner {
@@ -184,10 +160,6 @@ impl Data {
 			self.inner.attrs = attrs;
 			self.inner.rows = rows;
 		} else {
-			// The detector IS data preparation: classify the columns now, at load, so
-			// the GPU classification runs in the user's main before any `Train::run`
-			// rather than inside the run's measured init window. (arff/safetensors
-			// carry declared kinds and skip the detector.)
 			self.inner.pre_kinds.extend(pantry::detect_kinds(path));
 		}
 		self
@@ -258,10 +230,6 @@ impl DataInner {
 		self.sources.join(", ")
 	}
 
-	/// Materialize this description into encoded `(train, Option<test>)` datasets,
-	/// printing the summary as it goes. This is the ONLY place loading + encoding
-	/// happens; `Train::run` calls it per run so exactly one dataset is resident at
-	/// a time. Public so the CLI / tests can force materialization explicitly.
 	pub fn datasets(&self) -> (Dataset, Option<Dataset>) {
 		let (train, test, attrs) = self.prepare();
 		self.print_summary(&train, test.as_ref(), &attrs);
@@ -409,9 +377,6 @@ impl DataInner {
 			let (tr, te) = self.prepare_arff();
 			(tr, te, self.attrs.clone())
 		};
-		// The ONE NaN call site: each dataset's column-vectors are cleaned once here
-		// as they enter the pipeline (missing-target rows dropped, feature NaNs
-		// imputed). After this nothing downstream handles NaN again.
 		pantry::encode::clean_dataset(&mut train);
 		if let Some(t) = test.as_mut() {
 			pantry::encode::clean_dataset(t);
@@ -513,9 +478,6 @@ impl crate::model::RunData for DataInner {
 	}
 }
 
-// `Data` forwards to its inner so an explicit `train.run((&model, &data))` (the
-// only form a loop over several datasets can use) accepts a `&Data` directly,
-// while the live-data registry holds the heap-pinned `DataInner`.
 impl crate::model::RunData for Data {
 	fn prepared(&self) -> crate::model::Prepared<'_> {
 		self.inner.prepared()
@@ -538,9 +500,6 @@ impl crate::model::RunData for Data {
 mod safetensors_source_tests {
 	use super::*;
 
-	// Build a tiny .safetensors image (x: [3,2] F64 features, y: [3] F64 target), write
-	// it to a temp file, and load it through the public Data builder. Host-only — encode
-	// builds an ndarray Mat, no GPU. Proves .set("*.safetensors") is a real Data source.
 	#[test]
 	fn data_load_reads_safetensors_source() {
 		let header = concat!(
@@ -579,11 +538,6 @@ mod safetensors_source_tests {
 		let _ = std::fs::remove_file(&path);
 	}
 
-	// Shard-shaped source: several weight tensors sharing a leading dim become a
-	// table (F32 widened to f64, trailing dims flattened to `name:c` columns), with
-	// one tensor named as the target. Pins the materialized rows × cols and two
-	// values through the real Data::load path. A no-target load instead trips the
-	// x/y guard in prepare(), so naming a target is what makes a shard a dataset.
 	#[test]
 	fn data_load_materializes_safetensors_shard() {
 		let header = concat!(

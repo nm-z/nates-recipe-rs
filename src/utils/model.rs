@@ -9,16 +9,11 @@ use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::sync::atomic::Ordering;
 
-// The execution-description enums and their user-facing constructor constants now
-// live in `recipe-infer` (the inference engine that interprets them); re-export
-// them so the existing `recipe::*` / `crate::model::*` API is unchanged.
 pub use recipe_infer::{
 	Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu, focal, gelu,
 	hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
-/// Accepts `units` (linear dense) or `embed(dim)` / `attn(heads)` for
-/// `Model::layer`. Chain `.relu()`, `.leak()`, etc. for activations.
 pub trait IntoLayer {
 	fn into_layer(self) -> LayerSpec;
 }
@@ -33,18 +28,12 @@ impl IntoLayer for (usize, Activation) {
 	}
 }
 
-/// `embed(dim)` layer: a learned `dim`-wide embedding looked up per input token
-/// id (the encoder emits free-text columns as token-id sequences). The output is
-/// `(input columns) × dim` wide — the flattened sequence of token vectors.
 pub struct EmbedSpec(usize, Option<usize>);
 #[allow(non_upper_case_globals)]
 pub fn embed(dim: usize) -> EmbedSpec {
 	EmbedSpec(dim, None)
 }
 impl EmbedSpec {
-	/// Pin the token table to exactly `v` rows instead of deriving it from the
-	/// data. Use when the vocabulary is a fixed alphabet (e.g. `embed(32).vocab(257)`
-	/// for the byte-level detector). `fit`/resume/preflight then use `v` verbatim.
 	pub fn vocab(mut self, v: usize) -> EmbedSpec {
 		self.1 = Some(v);
 		self
@@ -56,9 +45,6 @@ impl IntoLayer for EmbedSpec {
 	}
 }
 
-/// `attn(heads)` layer: bare multi-head self-attention over the token sequence
-/// (Q/K/V projections → scaled dot-product per head → softmax → context → output
-/// projection). Input/output width unchanged (`S×d`). `d` must divide by `heads`.
 pub struct AttnSpec(usize);
 #[allow(non_upper_case_globals)]
 pub fn attn(heads: usize) -> AttnSpec {
@@ -70,13 +56,8 @@ impl IntoLayer for AttnSpec {
 	}
 }
 
-/// Param selector for the OGDL codec; `save` writes every param (no filter), so
-/// this is now only the internal `save_ogdl` filter type. Defined in recipe-infer.
 pub use recipe_infer::Param;
 
-/// Optional path argument for [`save`](Train::save) / [`resume`](Train::resume):
-/// pass nothing (`()`) for the default `model.ogdl`, or a `&str`/`String` for an
-/// explicit path. Rust has no zero-arg/one-arg overload, so "nothing" is `()`.
 pub trait SavePath {
 	fn or_default(self) -> String;
 }
@@ -96,10 +77,6 @@ impl SavePath for String {
 	}
 }
 
-/// A `Dataset` ready for a single `run`, either freshly materialized by a lazy
-/// builder (`Owned`) or borrowed from one the caller already holds (`Borrowed`).
-/// `run` binds this for the duration of the run, so an `Owned` dataset is freed
-/// the moment the run returns — only one is ever alive at a time.
 pub enum Prepared<'a> {
 	Owned(Dataset),
 	Borrowed(&'a Dataset),
@@ -115,9 +92,6 @@ impl Prepared<'_> {
 }
 
 pub trait RunData {
-	/// Produce the `Dataset` for this run. Lazy builders load + encode HERE — not
-	/// before — so describing a `Data` costs nothing and `Train` is the only thing
-	/// that executes. If `run` never calls this, the data is never materialized.
 	fn prepared(&self) -> Prepared<'_>;
 	fn target_names(&self) -> Vec<String>;
 	fn raw_rows(&self) -> Option<Vec<Vec<String>>>;
@@ -198,9 +172,6 @@ pub struct Train {
 }
 
 impl Train {
-	/// Constructor. Like `Data::load` / `Model::new`, hands back an owned value:
-	/// the builder consumes and returns it, so the chain's result is what the
-	/// caller's `let` binds and drops.
 	pub fn new() -> Train {
 		Train {
 			epochs: 1,
@@ -213,8 +184,6 @@ impl Train {
 		}
 	}
 
-	/// Resolve a path arg: `""` → `model.ogdl` (cwd), `"*"` → next to the
-	/// running binary, anything else → used verbatim.
 	pub(crate) fn resolve(path: &str) -> String {
 		let raw = if path.is_empty() {
 			"model.ogdl".to_string()
@@ -250,18 +219,11 @@ impl Train {
 		self
 	}
 
-	/// Warm-start from a checkpoint (skips silently if absent). `.resume(())` uses
-	/// `model.ogdl` in the cwd; `.resume("custom.ogdl")` uses an explicit path.
 	pub fn resume(mut self, path: impl SavePath) -> Train {
 		self.resume = Some(path.or_default());
 		self
 	}
 
-	/// Pool remote machines into the run: `.net(["archy", "sentry"])`. Names are
-	/// hostnames — resolved through this machine's own daemon's peer registry
-	/// (eth before wlan), falling back to ssh config. Remote RAM joins the
-	/// waterfall as the tier below local disk; a named node that can't be
-	/// reached fails the run loudly at start.
 	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Train {
 		let mut net = crate::wire::Net::new();
 		for alias in nodes {
@@ -271,36 +233,17 @@ impl Train {
 		self
 	}
 
-	/// The raw forward outputs from the most recent infer `run`, as `(preds, k)`:
-	/// `preds` is row-major `n*k` logits, `k` the output width. `None` if the last
-	/// run trained (no preds) or never ran. Used by the type detector to read the
-	/// per-column class logits without downloading through the save path.
 	#[allow(dead_code)]
 	pub(crate) fn preds(&self) -> Option<(Vec<f64>, usize)> {
 		let last = self.last.borrow();
 		last.preds.clone().map(|p| (p, last.k))
 	}
 
-	/// Train (or infer) `model` on `data`. `data` is anything that can produce a
-	/// `Dataset` — a `Data` builder, a `Dataset`, an `Option<Dataset>` (holdout,
-	/// forward-only). Returns `&mut self` so `.save()` chains straight off it.
 	pub fn run(&self, data: &dyn RunData, model: &Model) -> &Train {
 		let handle = model;
 		let model: &ModelInner = &model.inner;
-		// Whole-run callspy bracket (gated on the Hip metric, like fit's per-phase
-		// blocks): a run-entry snapshot so the sync-class ops OUTSIDE fit are visible
-		// — the detector's claim/forward/release during data prep and the training
-		// arena claim show up in the pre-fit block, the exit park in the post-fit one.
 		let run_hip = self.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
-		// The run state table's init boundary: every training run prints the spec's
-		// init/loop/exit tree at its end, phases cut at run entry / first epoch /
-		// last epoch / run end. Unconditional — the state is the run's report card,
-		// not an opt-in metric.
 		let run_state = gpu_core::callspy::snapshot();
-		// A scenario whose encoded matrix exceeds the combined VRAM+RAM+disk ceiling
-		// is skipped instead of crashing the whole program. tiered::admit prints the
-		// size before bailing; catch that here, report the skip, and move on. Any
-		// OTHER panic is re-raised unchanged.
 		let prev = std::panic::take_hook();
 		std::panic::set_hook(Box::new(|info| {
 			let ram = info
@@ -328,9 +271,6 @@ impl Train {
 		};
 		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
-		// Pool the named nodes before preflight so the remote-RAM tier counts
-		// toward the combined ceiling. A named node that can't be reached fails
-		// the run loudly here — a node-pooling run with a missing member is a bug.
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = self.net.as_ref().map(|net| {
 			let cs = net.connect().unwrap_or_else(|e| panic!("net: {e}"));
 			for c in &cs {
@@ -352,17 +292,6 @@ impl Train {
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
-			// One-claim arena, adopt-first — OWNED by `fit` (the compose →
-			// claim-with-image → park lifecycle): the run composes its init image and
-			// claims/adopts the arena WITH it (the training H2D rides the claim op, not
-			// a standalone upload) then parks the slab at exit (the prefix D2H rides the
-			// park op). Adopt re-arms the prior run's parked slab (sweep + rewind + one
-			// memset — no free/realloc, so the freeAsync VA-reuse race can't fire); the
-			// slab stays PARKED past run() for scoring/save/eval, and the next run adopts
-			// it. Params are rebuilt from the host mirror when the park generation moved.
-			// pre-fit block: sync-class ops between run entry and fit — the detector's
-			// claim + release during data prep. The training claim/adopt (with its H2D)
-			// and the park (with its D2H) ride INSIDE fit's own init/exit blocks now.
 			if let Some(a) = run_hip.as_ref() {
 				eprint!("── run pre-fit ──\n{}", gpu_core::callspy::report_since(a));
 			}
@@ -371,21 +300,10 @@ impl Train {
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
 			}
-			// fit computes the authoritative post-update score into fit_score (its exit
-			// block), so scoring never re-uploads x/y or re-forwards — the buffers a
-			// scoring forward would need are the very ones fit just used, and R2 is
-			// invariant under the affine target scaling, so the z-scored-target score
-			// equals the raw-scale one.
 			let score = model.fit_score.get();
-			// post-fit block: empty — fit parked its backing inside its own exit
-			// block (the park's D2H rode that op), so no sync-class ops land here.
 			if let Some(p) = post_fit.as_ref() {
 				eprint!("── run post-fit ──\n{}", gpu_core::callspy::report_since(p));
 			}
-			// Record the parked-backing generation this run's params view is carved
-			// from; the next run adopts this same parked slab. A later park-generation
-			// move is then detectable, so a forward-only read rebuilds the weights from
-			// the host mirror instead of faulting.
 			model.arena_gen.set(gpu_core::memory::live_parked_gen());
 			let mut last = self.last.borrow_mut();
 			last.model = model as *const ModelInner;
@@ -401,9 +319,6 @@ impl Train {
 				eprint!("{t}");
 			}
 		} else {
-			// Adopt the previous run's parked backing as this pass's arena and rebuild
-			// the params into it from the host mirror, so the forward has memory to
-			// carve its inputs from and never dereferences a zeroed weight view.
 			let arena = handle.begin_forward();
 			let (xbuf, x_cat, n) = model.prep_eval_input(ds);
 			let params = model.params.borrow();
@@ -458,17 +373,11 @@ impl Train {
 		self
 	}
 
-	/// Save the FULL trained checkpoint — every param the model allocated — as
-	/// OGDL. `.save(())` writes `model.ogdl` in the cwd; `.save("custom.ogdl")`
-	/// writes an explicit path. Best-only guard applies.
 	pub fn save(&self, path: impl SavePath) -> &Train {
 		self.save_ogdl(None, &path.or_default());
 		self
 	}
 
-	/// Write the model's params to `path` as OGDL. `filter: None` = everything the
-	/// model holds; `Some(parts)` = subset. Best-only guard: skips if the file
-	/// already holds a better score.
 	fn save_ogdl(&self, filter: Option<&[Param]>, path: &str) {
 		let last = self.last.borrow();
 		if last.model.is_null() {
@@ -483,11 +392,6 @@ impl Train {
 		{
 			return;
 		}
-		// An in-VRAM fit already brought the trained weights home in its single exit
-		// D2H and formatted them to OGDL text (the write-only save mirror) — write
-		// that verbatim, zero device transfers. `last.score` is the fit score the
-		// mirror was keyed with, so the text is consistent. An out-of-core run left no
-		// mirror; its params are resident, so dump them directly (honoring filter).
 		let mirror = model.saved_ogdl.borrow();
 		let (text, neurons) = if let Some(m) = mirror.as_ref() {
 			(m.text.clone(), m.neurons)
@@ -512,8 +416,6 @@ impl Default for Train {
 	}
 }
 
-/// Expand a leading `~` (the shell doesn't, since the path arrives as a literal
-/// string) to `$HOME`. Anything else is returned unchanged.
 fn expand_tilde(path: &str) -> String {
 	match std::env::var("HOME") {
 		Ok(home) if path == "~" => home,
@@ -525,29 +427,7 @@ fn expand_tilde(path: &str) -> String {
 	}
 }
 
-/// Neural network architecture: layers, loss, and learning rate.
-///
-/// ```rust,no_run
-/// # use recipe::*;
-/// Model::new()
-///     .layer(embed(16))
-///     .layer(attn(4))
-///     .layer(64).relu()
-///     .layer(1)
-///     .loss(mse)
-///     .lr(0.001);
-/// ```
-/// The model's actual state, heap-pinned inside [`Model`] so its address stays
-/// fixed across the builder's by-value moves (`Model::new().layer()…` moves the
-/// struct at every step). `run`/`save` and the live-model registry keep raw
-/// `*const ModelInner` into this box; the box outlives every run because the
-/// user's `Model` binding owns it until it drops.
 #[doc(hidden)]
-/// Host mirror of an in-VRAM fit's trained weights: the OGDL text (byte-identical
-/// to a device dump) plus the neuron count for the save banner and the exact
-/// input / categorical / vocab widths the fit derived, so a forward-only read
-/// can rebuild fresh device params from it (same builder resume uses) after the
-/// arena backing is freed by a later run.
 pub(crate) struct SavedWeights {
 	pub(crate) text: String,
 	pub(crate) neurons: usize,
@@ -564,23 +444,8 @@ pub(crate) struct ModelInner {
 	pub(crate) scaler: RefCell<Option<Scaler>>,
 	pub(crate) yscaler: RefCell<Option<(f64, f64)>>,
 	pub(crate) fit_score: Cell<f64>,
-	// Write-only host save mirror: the in-VRAM-fit exit D2H brings the trained
-	// weights home once and formats them to OGDL text here (with the neuron count).
-	// `save` writes it verbatim — zero device transfers on save. Also the source a
-	// forward-only read rebuilds from once the params' arena backing is freed.
-	// `None` for an out-of-core (plotting / resume) run, whose params stay live.
 	pub(crate) saved_ogdl: RefCell<Option<SavedWeights>>,
-	// Id of the parked arena backing this model's `params` views were carved from
-	// (see gpu_core::memory::live_parked_gen). `None` when the params are pool-owned
-	// (out-of-core / Model::load / not yet trained) and thus never freed by a later
-	// run. When `Some(g)` stops matching the live parked backing, a later training
-	// run freed this model's device weights, so a forward-only read rebuilds them
-	// from `saved_ogdl` before use rather than dereferencing freed memory.
 	pub(crate) arena_gen: Cell<Option<usize>>,
-	// Owns the single composed weight image that mirror-rebuilt / `Model::load` params
-	// (composed by `plan_layer_params` + `materialize`) are non-owning views into,
-	// so it outlives them. `None` until such a rebuild composes one; replaced (old
-	// image dropped) whenever the params are rebuilt again.
 	pub(crate) rebuild_backing: RefCell<Option<GpuBuffer>>,
 }
 
@@ -594,10 +459,6 @@ struct Issue {
 	need: String,
 }
 
-/// The run's whole device footprint (scratch + weights + data buffers) as an
-/// exact host-side estimate — the same `vram_estimate` preflight reports, factored
-/// out so the arena claim and preflight share one number. Derives the embed/text
-/// vs categorical column split (and pinned/derived vocab) exactly as fit does.
 pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: bool) -> usize {
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
@@ -619,13 +480,6 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: boo
 	if forward_only {
 		return base;
 	}
-	// The in-VRAM fit z-scores on device via `zscore_fit_into`, which carves
-	// a center buffer (n*d_sc) and a reduce workspace that never free under the arena
-	// (carve Drop is a no-op) — bytes `vram_estimate`'s loop-resident term does not
-	// count. Budget them here (claim gate only) so a model that fits solely by that
-	// slack goes out-of-core cleanly instead of overflowing the arena mid-run. d_sc
-	// mirrors fit's z-score width: categorical branch for an embed model, the
-	// whole matrix otherwise, 0 for pure embed/text (no z-scored branch).
 	let d_sc = if embed_first { cat_cols } else { d };
 	let zscore_transient = if d_sc > 0 {
 		n * d_sc * 8 + gpu_core::kernels::gpu_reduce_sum_cols_workspace_bytes(n, d_sc)
@@ -636,13 +490,6 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, forward_only: boo
 }
 
 impl ModelInner {
-	/// Make `self.params` safe to read for a forward-only pass. After an in-VRAM fit
-	/// the params are non-owning views into the run's parked arena slab; a later
-	/// training run frees that slab. When it has (the recorded backing id no longer
-	/// matches the live parked one), rebuild fresh device params from the host weight
-	/// mirror the in-VRAM exit left behind — the same builder resume uses, so the
-	/// weights are bit-identical. Params that are pool-owned (arena_gen None) or still
-	/// backed by the live parked slab are left untouched (no re-upload).
 	pub(crate) fn ensure_params_live(&self) {
 		let Some(g) = self.arena_gen.get() else {
 			return;
@@ -659,10 +506,6 @@ impl ModelInner {
 			let saved = load_ogdl_str(&m.text);
 			let plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
 				.unwrap_or_else(|e| panic!("eval: rebuild weights from mirror: {e}"));
-			// ONE owned image + ONE load, then materialize views into it — the same
-			// resumed weights the fit builder produced, but composed on the host
-			// and uploaded once instead of per-layer alloc+upload. The composed image
-			// is stored in `rebuild_backing` so it outlives the views.
 			let host = plan.host();
 			let staged = GpuBuffer::alloc(host.len().max(1)).expect("rebuild staged alloc");
 			staged.load(host).expect("rebuild staged load");
@@ -722,10 +565,6 @@ fn preflight(model: &ModelInner, ds: &Dataset, forward_only: bool, net_ram: usiz
 	let need = plan_footprint(model, ds, forward_only);
 	if need > free_vram {
 		let mode = if forward_only { "inference" } else { "training" };
-		// Training waterfalls VRAM → RAM → DISK (crate::ooc): over-VRAM is not an
-		// issue while the COMBINED ceiling holds — announce the tier plan and
-		// proceed. Inference has no streaming path yet; either mode aborts only
-		// when even the combined ceiling is exceeded.
 		match (forward_only, crate::ooc::plan(need, net_ram)) {
 			(false, Some(p)) => {
 				let net_part = if p.remote > 0 {
@@ -781,10 +620,6 @@ fn confirm_issues(issues: &[Issue]) -> bool {
 }
 
 impl Model {
-	/// Constructor: an empty architecture. Hands back an owned value; the builder
-	/// consumes and returns it, so the chain's result is what the caller's `let`
-	/// binds and drops. The state lives in a heap-pinned [`ModelInner`] so those
-	/// by-value moves never shift its address.
 	pub fn new() -> Model {
 		Model {
 			inner: Box::new(ModelInner {
@@ -802,13 +637,6 @@ impl Model {
 		}
 	}
 
-	/// Load shipped weights into a freshly-built model for forward-only use, with
-	/// NO data and NO file path (`weights` is the OGDL text, e.g. `include_str!`ed).
-	/// `proto` carries the architecture (`specs`/`loss`/`lr`); its first `embed`
-	/// must pin a fixed vocab. `d` is the model input width (token columns). The
-	/// params are built straight from the checkpoint blocks (same builder `fit`
-	/// uses); the scaler is set empty (the detector's pure-embed path z-scores
-	/// nothing) so `run`'s infer branch finds a scaler and skips scaling.
 	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
 		let saved = load_ogdl_str(weights);
 		let inner = &proto.inner;
@@ -816,8 +644,6 @@ impl Model {
 			.expect("Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
 		let plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true)
 			.unwrap_or_else(|e| panic!("Model::load: {e}"));
-		// ONE owned image + ONE load, then materialize views (backing kept in
-		// `rebuild_backing` for the model's life) — replaces per-layer alloc+upload.
 		let host = plan.host();
 		let staged = GpuBuffer::alloc(host.len().max(1)).expect("Model::load staged alloc");
 		staged.load(host).expect("Model::load staged load");
@@ -870,8 +696,6 @@ impl Model {
 		self.set_last_activation(Activation::PRelu)
 	}
 
-	/// 1D conv: `filters` output channels, `kernel` width, `stride` downsample
-	/// factor (1 = none). Stride is a conv parameter, not a separate step.
 	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Model {
 		self.inner.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
 		self
@@ -882,23 +706,15 @@ impl Model {
 		self
 	}
 
-	/// Set the learning rate. To reset between runs, rebind:
-	/// `let model = model.lr(1e-8); train.run(&data, &model);`.
 	pub fn lr(mut self, lr: f64) -> Model {
 		self.inner.lr = lr;
 		self
 	}
 
-	/// Forward-only evaluation of the trained model on `data`, reporting the
-	/// loss-appropriate score (accuracy for classification, R² for regression).
-	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the
-	/// Dataset. Returns the raw `n*k` predictions.
 	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
 		let inner = &self.inner;
 		let prepared = data.prepared();
 		let ds = prepared.get();
-		// Adopt the previous run's parked backing as this pass's arena and rebuild the
-		// params into it from the host mirror; parked back in `end_forward` below.
 		let arena = self.begin_forward();
 		let (xbuf, x_cat, n) = inner.prep_eval_input(ds);
 		let params = inner.params.borrow();
@@ -933,26 +749,12 @@ impl Model {
 		preds
 	}
 
-	/// Open a forward-only pass. A forward pass IS a run, and a fit leaves the
-	/// arena carved to the last byte (the out-of-core engine budgets its windows
-	/// straight from `arena_remaining()`), so a forward pass cannot carve even one
-	/// input buffer out of what the previous run parked. Re-arm that parked backing
-	/// as this pass's arena: bump pointer rewound, one memset, no free and no
-	/// realloc — the freeAsync VA-reuse race stays structurally impossible, and the
-	/// driver's post-free counter depression (which refuses the re-claim) never
-	/// happens. Zeroing the slab drops the weights, so rebuild them from the host
-	/// mirror — the same rebuild a later training run forces. A model whose params
-	/// were never carved from a run backing (`Model::load`, untrained) owns its
-	/// memory: leave the arena alone. `0` is "no minimum": whatever was parked is
-	/// the arena, and a pass too big for it dies on a loud carve miss.
 	pub(crate) fn begin_forward(&self) -> Option<GpuBuffer> {
 		let slab = self.inner.arena_gen.get().and_then(|_| gpu_core::memory::adopt_run_backing(0));
 		self.inner.ensure_params_live();
 		slab
 	}
 
-	/// Close the pass: park the arena it adopted so the next run adopts it in turn,
-	/// and record the generation this model's params are now carved from.
 	pub(crate) fn end_forward(&self, slab: Option<GpuBuffer>) {
 		if let Some(slab) = slab {
 			gpu_core::memory::park_run_backing(slab);
@@ -982,11 +784,6 @@ mod builder_ownership_tests {
 		pages * 4096
 	}
 
-	// The builders hand back OWNED values, so a loop that builds N of them holds one
-	// at a time and RSS is flat. Constructors that `Box::leak` a `&'static mut` retain
-	// every Model/Train/Data ever built — roughly a kilobyte per cycle here, tens of
-	// megabytes across this loop. Self-created arff input (no GPU, no committed
-	// fixture); the warm-up settles the allocator before the baseline is read.
 	#[test]
 	fn builders_are_owned_not_leaked() {
 		let path = std::env::temp_dir()
@@ -1029,8 +826,6 @@ mod metric_gpu_tests {
 	use std::cell::RefCell;
 	use std::sync::LazyLock;
 
-	// Local carve+load helper (the crate `upload` fn was removed in favor of the
-	// one-image arena path); tests still need a plain owned host→device matrix.
 	fn upload(x: &ndarray::Array2<f64>) -> (GpuBuffer, usize, usize) {
 		let s = x.as_standard_layout();
 		let sl = s.as_slice().expect("upload: non-contiguous");
@@ -1039,19 +834,12 @@ mod metric_gpu_tests {
 		(b, x.nrows(), x.ncols())
 	}
 
-	// The 12 scratch constants as ONE owned 12-float device block; each Scratch
-	// carves its const views from this (must outlive the Scratch).
 	fn consts_buf() -> GpuBuffer {
 		let b = GpuBuffer::alloc(SCRATCH_CONSTS.len()).expect("consts");
 		b.load(&SCRATCH_CONSTS).expect("consts");
 		b
 	}
 
-	// The committed (Git LFS) churn set, repo-relative — SUITE SPEC R10: a test reads
-	// only committed or self-created files. This used to name an absolute path outside
-	// the repo, which never existed, so all three GPU tests below returned `ok` in 0.00s
-	// without launching a kernel. Absent = FAIL, loudly: a test that did not run did not
-	// pass, and this one has real data to run on.
 	static CHURN: LazyLock<crate::dataset::Dataset> = LazyLock::new(|| {
 		const TRAIN: &str = "datasets/playground-series-s6e3/train.csv";
 		assert!(
@@ -1071,7 +859,6 @@ mod metric_gpu_tests {
 		let n = x.nrows();
 		let d = x.ncols();
 
-		// Two-layer params, random init (as fit does) — just to get real GPU preds.
 		let h = 8usize;
 		let w1 = GpuBuffer::alloc(d * h).expect("w1 alloc");
 		kernels::gpu_randn(d * h, 11, &w1).expect("w1");
@@ -1125,7 +912,6 @@ mod metric_gpu_tests {
 		let ybar = y.iter().sum::<f64>() / n as f64;
 		let ss_tot = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>();
 
-		// Independent CPU references.
 		let ss_res: f64 = (0..n).map(|i| (y[i] - p[i]).powi(2)).sum();
 		let r2_ref = 1.0 - ss_res / ss_tot;
 		let acc_ref =
@@ -1158,9 +944,6 @@ mod metric_gpu_tests {
 				(a - b).abs()
 			);
 		};
-		// Reduce into the scratch scalar via metric_gpu_into, download at the call
-		// site (async+drain), then apply the returned host (sign,div) rescale — the
-		// exact value the deleted metric_gpu returned (R2's raw ss_res → 1 − ss_res/ss_tot).
 		let out = &sc.acts[last];
 		let metric = |m: Metric, loss: Loss| -> f64 {
 			let (sign, div) =
@@ -1180,12 +963,6 @@ mod metric_gpu_tests {
 		);
 	}
 
-	// The preallocated training loop must (1) compute the same forward as the
-	// retained allocate-return path, (2) allocate ZERO GPU buffers per epoch in
-	// steady state (flat VRAM, no sawtooth), and (3) still gradient-descend
-	// (train R² rises). Features are standardized on-GPU with existing reduce +
-	// broadcast kernels so the raw frequency-encoded churn columns don't saturate
-	// sigmoid — a well-posed problem on real data, not a hand-rolled scaler.
 	#[test]
 	fn fit_loop_memory_flat() {
 		let train: &crate::dataset::Dataset = &CHURN;
@@ -1212,7 +989,6 @@ mod metric_gpu_tests {
 		kernels::gpu_broadcast_div(&xc, &std, n * d, d, &xbuf).expect("scale");
 		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 
-		// Two-layer relu→sigmoid, He init exactly as fit does.
 		let h = 16usize;
 		let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
 			let scale = (2.0 / fan_in as f64).sqrt();
@@ -1244,7 +1020,6 @@ mod metric_gpu_tests {
 		];
 		let last = params.len() - 1;
 
-		// (1) Two independent forward passes must agree.
 		let consts = consts_buf();
 		let sc_ref = Scratch::new_infer(&params, n, &consts);
 		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
@@ -1266,9 +1041,6 @@ mod metric_gpu_tests {
 			"forward_into not deterministic, maxdiff={fwd_diff}"
 		);
 
-		// (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
-		// allocations and train R². download_vec is host-only (no GpuBuffer
-		// alloc), so reading R² never perturbs the count.
 		let model = ModelInner {
 			specs: vec![],
 			loss: Loss::Mse,
@@ -1364,7 +1136,6 @@ mod metric_gpu_tests {
 			}
 		};
 
-		// --- save initial weights ---
 		let params = vec![
 			mk(d, h, 11, Activation::Relu),
 			mk(h, 1, 22, Activation::Sigmoid),
@@ -1379,7 +1150,6 @@ mod metric_gpu_tests {
 			.map(|p| download_vec(&p.b, p.out_dim))
 			.collect();
 
-		// --- ping-pong backward (modifies weights via SGD) ---
 		let model = ModelInner {
 			specs: vec![],
 			loss: Loss::Mse,
@@ -1406,13 +1176,11 @@ mod metric_gpu_tests {
 			.map(|p| download_vec(&p.b, p.out_dim))
 			.collect();
 
-		// --- restore initial weights ---
 		for (l, p) in params.iter().enumerate() {
 			p.w.load(&init_w[l]).expect("restore w");
 			p.b.load(&init_b[l]).expect("restore b");
 		}
 
-		// --- per-layer reference backward with same lr ---
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let mut ref_da: Vec<GpuBuffer> = Vec::new();
 		let mut ref_dz: Vec<GpuBuffer> = Vec::new();
@@ -1515,7 +1283,6 @@ mod metric_gpu_tests {
 			.map(|p| download_vec(&p.b, p.out_dim))
 			.collect();
 
-		// --- compare updated weights ---
 		let mut max_w_diff = 0.0f64;
 		let mut max_b_diff = 0.0f64;
 		for (l, p) in params.iter().enumerate() {

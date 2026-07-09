@@ -1,12 +1,9 @@
-//! OGDL — an indentation tree. Four inherent methods (`itnl`/`file`/`add`/`del`) on a
-//! shared `Graph` handle; three import styles; whitespace-separated, 4-space on write.
 #![allow(non_upper_case_globals)]
 
 use std::fmt;
 use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
 
-// A node's value is its child node(s) (`VRAM 12` = node VRAM, child 12); fields + Index read it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
       pub name: String,
@@ -22,7 +19,6 @@ impl Node {
             self.children.is_empty()
       }
 
-      // Indentation tree; tokens after the first are leaf children; legacy `=` is the first separator.
       pub(crate) fn parse(text: &str) -> Node {
             let mut root = Node::leaf("");
             let mut path: Vec<usize> = Vec::new();
@@ -59,7 +55,6 @@ impl Node {
             n
       }
 
-      // Path selectors `a.b`, `a.1`, `a.b{n}`, `a.b{}`, `a[n]` (1-indexed); returns the first match.
       pub(crate) fn select(&self, path: &str) -> Option<&Node> {
             let mut cur = self;
             for seg in path.split('.').filter(|s| !s.is_empty()) {
@@ -109,7 +104,6 @@ impl Node {
             self.children.iter().position(|c| c.name == seg)
       }
 
-      // 4-space indent; all-leaf children go inline (`VRAM 12`), else nested (order preserved).
       fn write_to(&self, out: &mut String, depth: usize) {
             for c in &self.children {
                   for _ in 0..depth {
@@ -136,7 +130,6 @@ impl Node {
       }
 }
 
-// `a[2]` — positional child access.
 impl std::ops::Index<usize> for Node {
       type Output = Node;
       fn index(&self, i: usize) -> &Node {
@@ -144,7 +137,6 @@ impl std::ops::Index<usize> for Node {
       }
 }
 
-// Display = the node's value (leaf children joined by space); file I/O uses `serialize`.
 impl fmt::Display for Node {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let vals: Vec<&str> = self.children.iter().filter(|c| c.is_leaf()).map(|c| c.name.as_str()).collect();
@@ -152,8 +144,6 @@ impl fmt::Display for Node {
       }
 }
 
-// A `Graph` is a shared handle (`Arc<Mutex<Node>>`): clone shares the tree, the last drop
-// frees it; methods take `&self` and return a fresh shared handle for chaining.
 #[derive(Clone)]
 pub struct Graph {
       root: Arc<Mutex<Node>>,
@@ -170,25 +160,20 @@ impl Graph {
       }
 }
 
-/// The process-wide default graph — import style 1 (`use ogdl::*; ogdl.file(..)`).
 pub static ogdl: LazyLock<Graph> = LazyLock::new(Graph::empty);
 
-/// Constructor namespace for import style 2 (`Ogdl::file("g.ogdl")`).
 pub struct Ogdl;
 
 impl Ogdl {
-      /// Read a file into a new graph.
       pub fn file(path: &str) -> Graph {
             Graph::read(path)
       }
 }
 
-/// Free-function entry point — import style 3 (`ogdl::file("g.ogdl")`).
 pub fn file(path: &str) -> Graph {
       Graph::read(path)
 }
 
-// itnl dispatch: `()` → handle, `"a.b"` → the Node there, `node`/`handle` → bind.
 pub trait ItnlArg {
       type Out;
       fn apply(self, g: Graph) -> Self::Out;
@@ -205,7 +190,6 @@ impl ItnlArg for &str {
       type Out = Node;
       fn apply(self, g: Graph) -> Node {
             g.with(|root| {
-                  // tag the returned subtree with its path so add/del can locate it
                   let mut n = root.select(self).cloned().unwrap_or_default();
                   n.name = self.to_string();
                   n
@@ -230,7 +214,6 @@ impl ItnlArg for Node {
       }
 }
 
-// del dispatch: `a[2]`/`&node` (by node), `("1", &a)` (name under node), `del!` (all matching).
 pub trait DelArg {
       fn apply(self, g: Graph);
 }
@@ -260,12 +243,10 @@ impl DelArg for &Node {
       }
 }
 
-// A value becomes leaf child node(s) — this is how weights/scalars/strings serialize.
 pub trait Value {
       fn into_nodes(self) -> Vec<Node>;
 }
 
-// One macro instead of a dozen impls: scalars via Display, strings via AsRef, vectors element-wise.
 macro_rules! value {
       (scalar: $($t:ty),*) => {$( impl Value for $t {
             fn into_nodes(self) -> Vec<Node> { vec![Node::leaf(&self.to_string())] }
@@ -285,7 +266,6 @@ value!(str: &str, String, &String);
 value!(floats: Vec<f64>, &[f64]);
 value!(strs: Vec<String>, &[String]);
 
-// Navigate/create `path` (dot-separated names), returning the target to append children under.
 fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
       let mut cur = root;
       for seg in path.split('.').filter(|s| !s.is_empty()) {
@@ -301,7 +281,6 @@ fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
       cur
 }
 
-// The four methods, inherent on the handle.
 impl Graph {
       fn read(path: &str) -> Graph {
             let g = Graph::empty();
@@ -314,12 +293,10 @@ impl Graph {
             self.with(|root| root.clone())
       }
 
-      /// `itnl(())` → handle; `itnl("a.b")` → the Node there; `itnl(node)` → bind.
       pub fn itnl<A: ItnlArg>(&self, a: A) -> A::Out {
             a.apply(self.clone())
       }
 
-      /// Read into an empty graph / write a populated one — direction from state.
       pub fn file(&self, path: &str) -> Graph {
             let empty = self.with(|root| root.children.is_empty());
             if empty {
@@ -332,21 +309,18 @@ impl Graph {
             self.clone()
       }
 
-      /// Add typed `value` under `path` (creating it): scalars, `Vec<f64>`, strings, bools.
       pub fn add<V: Value>(&self, value: V, path: &str) -> Graph {
             let kids = value.into_nodes();
             self.with(|root| ensure_path(root, path).children.extend(kids));
             self.clone()
       }
 
-      /// Delete per the argument: `del(a[2])`, `del(&node)`, `del(("1", &a))`.
       pub fn del<D: DelArg>(&self, d: D) -> Graph {
             d.apply(self.clone());
             self.clone()
       }
 }
 
-/// `del!(g, a.b{})` — delete every `b` under `a` (the `a.b{}` form needs a macro).
 #[macro_export]
 macro_rules! del {
       ($g:expr, $a:ident . $b:ident {}) => {{
@@ -354,7 +328,6 @@ macro_rules! del {
       }};
 }
 
-/// `del!` internals — `pub` only so the exported macro can name it; not `ogdl::del_all` at the root.
 #[doc(hidden)]
 pub mod __macro_support {
       use super::{Graph, Node};
@@ -407,7 +380,6 @@ mod tests {
             assert_eq!(a.select("[2]").expect("[2]").name, "b");
       }
 
-      // Leak fix: a tree frees when its last handle drops; chain returns don't accumulate.
       #[test]
       fn handles_free_on_drop() {
             let g = Graph::empty();
@@ -442,7 +414,6 @@ mod tests {
             assert!(!g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "b"));
       }
 
-      // Universal serializer: typed values written by path, read back typed.
       #[test]
       fn typed_serialize_roundtrip() {
             let g = Graph::empty();

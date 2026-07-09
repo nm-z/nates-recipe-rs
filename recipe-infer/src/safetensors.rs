@@ -1,17 +1,5 @@
-//! Safetensors reader: parse the binary container — an 8-byte little-endian header
-//! length, a JSON header mapping each tensor name to its dtype/shape/byte-range, then
-//! the raw tensor blob — and upload every tensor into a named GPU buffer. Hand-rolled:
-//! the header is a flat, predictable object, so a tiny recursive-descent JSON parser
-//! beats pulling serde. Read side only — bytes in, named `GpuBuffer`s out; it knows
-//! nothing of layers or models. Integer/half dtypes are widened to f64 to match the
-//! framework's f64-only buffers.
-
 use anyhow::{Result, anyhow, bail};
 
-/// Decode a safetensors byte image into `(name, shape, values)` triples in header order
-/// — the GPU-free host core, unit-testable without a device. Skips the optional
-/// `__metadata__` entry. Each tensor's `data_offsets` index the blob that follows the
-/// JSON header; the byte span is checked against `shape * dtype-size`.
 pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>, Vec<f64>)>> {
 	if bytes.len() < 8 {
 		bail!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len());
@@ -67,8 +55,6 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>,
 	Ok(out)
 }
 
-/// A single tensor's header record: name, dtype, shape, and the byte range
-/// `[begin, end)` *relative to the blob* (i.e. relative to `data_start`).
 pub struct TensorEntry {
 	pub name: String,
 	pub dtype: String,
@@ -77,11 +63,6 @@ pub struct TensorEntry {
 	pub end: usize,
 }
 
-/// Parse only the JSON header of a safetensors image — no blob decode. Returns
-/// `(data_start, entries)` where `data_start = 8 + header_len` is the file
-/// offset of the blob, so a tensor's file bytes are `[data_start+begin,
-/// data_start+end)`. Lets a caller memory-map / seek huge shards and stage
-/// individual tensors on demand rather than widening the whole file to f64.
 pub fn parse_safetensors_header(bytes: &[u8]) -> Result<(usize, Vec<TensorEntry>)> {
 	if bytes.len() < 8 {
 		bail!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len());
@@ -124,14 +105,10 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<(usize, Vec<TensorEntry>
 	Ok((data_start, out))
 }
 
-/// `(name, values)` pairs, dropping shape — the flat host view. Thin wrapper
-/// over [`parse_safetensors_shaped`].
 pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<(String, Vec<f64>)>> {
 	Ok(parse_safetensors_shaped(bytes)?.into_iter().map(|(n, _, v)| (n, v)).collect())
 }
 
-/// Bytes per element for the supported dtypes (`None` = unsupported), used to validate
-/// the declared byte span before decoding. Kept in lockstep with `decode`'s arms.
 fn elem_size(dtype: &str) -> Option<usize> {
 	Some(match dtype {
 		"BOOL" | "U8" | "I8" => 1,
@@ -142,9 +119,6 @@ fn elem_size(dtype: &str) -> Option<usize> {
 	})
 }
 
-/// Decode a tensor's raw little-endian bytes to f64. The dtype and byte length are
-/// pre-validated by `parse_safetensors`/`elem_size`, so `chunks_exact` never drops a
-/// remainder and the final arm is unreachable.
 fn decode(dtype: &str, raw: &[u8]) -> Vec<f64> {
 	match dtype {
 		"BOOL" | "U8" => raw.iter().map(|&x| x as f64).collect(),
@@ -174,8 +148,6 @@ fn arr8(c: &[u8]) -> [u8; 8] {
 	c.try_into().expect("chunks_exact(8) yields 8 bytes")
 }
 
-/// IEEE-754 half (binary16) → f64: split sign/exponent/mantissa, handling subnormals,
-/// infinities, and NaN. No `half` dependency — the bit math is a handful of shifts.
 fn f16_to_f64(h: u16) -> f64 {
 	let sign = if h >> 15 == 1 { -1.0 } else { 1.0 };
 	let exp = (h >> 10) & 0x1f;
@@ -188,10 +160,6 @@ fn f16_to_f64(h: u16) -> f64 {
 	};
 	sign * val
 }
-
-// --- Minimal JSON for the flat safetensors header. Per spec every value is an object,
-// array, string (dtype, __metadata__ values), or number (shape, data_offsets) — there
-// are no bools/nulls to handle. Just enough to read the documented fields. ---
 
 enum Json {
 	Obj(Vec<(String, Json)>),
@@ -253,7 +221,7 @@ fn parse_value(b: &[u8], p: &mut usize) -> Result<Json> {
 }
 
 fn parse_obj(b: &[u8], p: &mut usize) -> Result<Json> {
-	*p += 1; // consume '{'
+	*p += 1;
 	let mut out = Vec::new();
 	skip_ws(b, p);
 	if b.get(*p) == Some(&b'}') {
@@ -283,7 +251,7 @@ fn parse_obj(b: &[u8], p: &mut usize) -> Result<Json> {
 }
 
 fn parse_arr(b: &[u8], p: &mut usize) -> Result<Json> {
-	*p += 1; // consume '['
+	*p += 1;
 	let mut out = Vec::new();
 	skip_ws(b, p);
 	if b.get(*p) == Some(&b']') {
@@ -368,9 +336,6 @@ fn parse_num(b: &[u8], p: &mut usize) -> Result<Json> {
 mod tests {
 	use super::*;
 
-	// Host-only (no GPU): build a tiny safetensors image in memory and confirm the
-	// parser honors the 8-byte length prefix, skips __metadata__, preserves header
-	// order, and decodes F32/F64/I64 byte spans to f64.
 	#[test]
 	fn parse_safetensors_decodes_header_and_blob() {
 		let header = concat!(
@@ -399,22 +364,16 @@ mod tests {
 		assert_eq!(parsed[2].1, vec![-7.0, 9.0]);
 	}
 
-	// A data_offsets range past the end of the blob is a hard error, not a truncation.
 	#[test]
 	fn parse_safetensors_rejects_out_of_range_offsets() {
 		let header = r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
 		let mut bytes = Vec::new();
 		bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
 		bytes.extend_from_slice(header.as_bytes());
-		bytes.extend_from_slice(&1.5f32.to_le_bytes()); // only 4 of the claimed 8 bytes
+		bytes.extend_from_slice(&1.5f32.to_le_bytes());
 		assert!(parse_safetensors(&bytes).is_err());
 	}
 
-	// Real-file path, hermetic: write a two-tensor image (F32 [2,2], F64 [3]) with
-	// byte-exact contents to a temp file, then walk it the way a shard-header reader
-	// does — 8-byte length, JSON header, parse_json, pick the smallest tensor by byte
-	// span, seek to its blob range and decode through the real dtype path — asserting
-	// the decoded values exactly. The 16-byte F32 tensor wins over the 24-byte F64 one.
 	#[test]
 	fn read_safetensors_header_and_decode_min() {
 		use std::io::{Read, Seek, SeekFrom};

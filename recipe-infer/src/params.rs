@@ -1,22 +1,13 @@
-//! Layer parameters and their construction: the per-layer GPU weight buffers,
-//! the resume-checkpoint block type, the positional-encoding table, the
-//! two-branch concat detector, and `plan_layer_params` (host-composed init or resume).
-
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
 use gpu_core::memory::GpuBuffer;
 
-/// Leaky-ReLU negative slope, and PReLU's initial (then learned) slope.
 pub const LEAKY_ALPHA: f64 = 0.01;
 pub const PRELU_INIT: f64 = 0.25;
-/// ELU negative-saturation scale (SELU's fixed constants live in gpu-core's selu).
 pub const ELU_ALPHA: f64 = 1.0;
 pub const FOCAL_GAMMA: f64 = 2.0;
 pub const FOCAL_ALPHA: f64 = 0.25;
 
-/// Sinusoidal positional encoding table [seq*dim], row-major: PE[s,2i]=sin(s/10000^(2i/dim)),
-/// PE[s,2i+1]=cos(...). `negate` returns -PE (so a broadcast-SUB adds it). Built on host
-/// once (no GPU PE kernel); added per row in the embed forward.
 pub fn sinusoidal_pe(seq: usize, dim: usize, negate: bool) -> Vec<f64> {
 	let sign = if negate { -1.0 } else { 1.0 };
 	let mut pe = vec![0.0f64; seq * dim];
@@ -33,39 +24,27 @@ pub fn sinusoidal_pe(seq: usize, dim: usize, negate: bool) -> Vec<f64> {
 
 pub struct LayerParams {
 	pub kind: LayerKind,
-	// Dense: weight [in_dim×out_dim]. Embed: token table [vocab×dim]. Attn: Wq [d×d].
 	pub w: GpuBuffer,
-	// Dense: bias [out_dim]. Embed: negated positional encoding [in_dim*dim]. Attn: zero bias [d].
 	pub b: GpuBuffer,
 	pub in_dim: usize,
 	pub out_dim: usize,
 	pub act: Activation,
-	// Embed: embedding width / table rows. Attn: model dim d (per token) / heads.
 	pub dim: usize,
 	pub vocab: usize,
-	// Attn only: K/V/output projections [d×d] each, and head count (else dummy len-1 / 0).
 	pub wk: GpuBuffer,
 	pub wv: GpuBuffer,
 	pub wo: GpuBuffer,
 	pub heads: usize,
-	// PRelu only: the learnable negative slope (a single [1] scalar, SGD-updated).
-	// Dummy len-1 for every other activation.
 	pub palpha: GpuBuffer,
-	// Conv only: input channels, kernel size, stride. Dense/Embed/Attn: all 0.
 	pub conv_cin: usize,
 	pub conv_k: usize,
 	pub conv_stride: usize,
 }
 
-/// If the network is an embed/attn text prefix followed by a dense head, return
-/// `(first_dense_index, attn_out_dim A, categorical_dim C)` — the dense at that
-/// index reads `concat(prefix_output[A], x_cat[C])`. None when there's no prefix
-/// or no extra categorical features (C==0, e.g. all columns are text).
 pub fn concat_layer(params: &[LayerParams]) -> Option<(usize, usize, usize)> {
 	concat_layer_dims_iter(params.iter().map(|p| (p.kind, p.in_dim, p.out_dim)))
 }
 
-/// `concat_layer` over the host-only dims mirror (plan pass, no GPU buffers).
 pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<(usize, usize, usize)> {
 	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
 }
@@ -86,16 +65,11 @@ fn concat_layer_dims_iter(
 	None
 }
 
-/// Per-feature standardizer fit on the train set, reused verbatim on eval so
-/// train and eval see the same scaling (no leakage, no drift).
 pub struct Scaler {
 	pub mean: Vec<f64>,
 	pub std: Vec<f64>,
 }
 
-/// The fixed vocab pinned on the first `embed` layer, if any. When `Some`, the
-/// embed token table is sized to this verbatim and the `max id + 1` data
-/// derivation is bypassed everywhere (fit, resume, preflight).
 pub fn pinned_vocab(specs: &[LayerSpec]) -> Option<usize> {
 	specs.iter().find_map(|s| match s {
 		LayerSpec::Embed(_, v) => *v,
@@ -103,8 +77,6 @@ pub fn pinned_vocab(specs: &[LayerSpec]) -> Option<usize> {
 	})
 }
 
-/// Dims-only mirror of `LayerParams` — everything sizing/preflight needs,
-/// available from the host-only plan pass before any GPU work.
 #[derive(Clone, Copy)]
 pub struct LayerDims {
 	pub kind: LayerKind,
@@ -136,9 +108,6 @@ impl From<&LayerParams> for LayerDims {
 	}
 }
 
-/// Philox-2x32 (10 rounds) — the exact host mirror of the `philox2x32` device
-/// kernel, so the host-composed randn init draws from the same stream the old
-/// device `gpu_randn` did (bit-identical up to libm transcendental ULPs).
 fn philox2x32(counter: u32, key: u32) -> u32 {
 	let (mut x, mut y) = (counter, key);
 	for i in 0..10u32 {
@@ -154,10 +123,6 @@ fn philox_uniform(idx: u32, seed: u32) -> f64 {
 	philox2x32(idx, seed) as f64 / 4294967296.0
 }
 
-/// Host randn matching the device `randn_kernel` op-for-op: Box-Muller over two
-/// philox uniforms, then scaled by the per-layer-kind init scale (He / 0.1 /
-/// 1/√d_tok) — the same scale the device `gpu_scale_inplace` applied. Fills the
-/// block host-side so the init runs ZERO device kernels.
 fn host_randn(seed: u32, scale: f64, out: &mut [f64]) {
 	for (i, o) in out.iter_mut().enumerate() {
 		let u1 = philox_uniform((2 * i) as u32, seed).max(1e-30);
@@ -166,11 +131,8 @@ fn host_randn(seed: u32, scale: f64, out: &mut [f64]) {
 	}
 }
 
-/// A planned block's location in the plan's host image. Every block is composed
-/// host-side (resumed weights, PE tables, biases, zeros, and now randn init too),
-/// so `materialize` only carves views — no device init kernels remain.
 struct BlockPlan {
-	off: usize, // f64 offset into the plan's host image
+	off: usize,
 	len: usize,
 }
 
@@ -184,17 +146,12 @@ struct PlanEntry {
 	palpha: BlockPlan,
 }
 
-/// The AOT weight plan: every layer's block sizes, offsets, and initial host
-/// bytes composed on the host with ZERO GPU calls. The run pushes `host()`
-/// into its one init image (the run's persist prefix — the exit block
-/// downloads it back in the same single D2H), then `materialize` carves views
-/// and runs the randn init kernels.
 pub struct LayerPlan {
 	entries: Vec<PlanEntry>,
 	host: Vec<f64>,
 }
 
-const PLAN_ALIGN_F64: usize = 32; // 256-byte blocks, kernel-clean views
+const PLAN_ALIGN_F64: usize = 32;
 
 impl LayerPlan {
 	fn pad(&mut self) {
@@ -218,8 +175,6 @@ impl LayerPlan {
 		BlockPlan { off, len }
 	}
 
-	/// Compose a randn-init block directly into the host image (host Box-Muller +
-	/// scale), returning a plain host-composed block — the device runs no init kernel.
 	fn randn(&mut self, len: usize, seed: usize, scale: f64) -> BlockPlan {
 		self.pad();
 		let off = self.host.len();
@@ -228,7 +183,6 @@ impl LayerPlan {
 		BlockPlan { off, len }
 	}
 
-	/// The composed host image — push this (whole) into the run's init stage.
 	pub fn host(&self) -> &[f64] {
 		&self.host
 	}
@@ -241,10 +195,6 @@ impl LayerPlan {
 		self.entries.last().map_or(0, |e| e.dims.out_dim)
 	}
 
-	/// Carve every block as a view of the uploaded image (`base_off` = where the
-	/// image landed in the init image buffer, in f64s). The image already holds every
-	/// block's contents (weights, PE tables, biases, host-composed randn init), so
-	/// this is pure pointer arithmetic — ZERO device kernels, ZERO transfers.
 	pub fn materialize(&self, staged: &GpuBuffer, base_off: usize) -> Vec<LayerParams> {
 		let view = |bp: &BlockPlan| -> GpuBuffer {
 			staged.view(base_off + bp.off, bp.len.max(1))
@@ -272,16 +222,10 @@ impl LayerPlan {
 			.collect()
 	}
 
-	/// Byte-identical `ogdl::dump_ogdl` from a HOST image of the (trained) weights
-	/// in this plan's layout — the write-only save mirror. The run's single exit
-	/// D2H brings the weight prefix home; this formats it to OGDL with ZERO device
-	/// transfers, field-for-field matching the per-buffer device dump (same
-	/// z-numbering, same row/col order, same `f64::to_string` precision). `image`
-	/// begins at the weight block (plan-image offset 0).
 	pub fn dump_ogdl_host(&self, image: &[f64], key: &str, score: f64) -> String {
 		let blk = |bp: &BlockPlan| image[bp.off..bp.off + bp.len].to_vec();
 		ogdl_text(|g| {
-			g.add(score, key); // metric header: `{key} {score}`
+			g.add(score, key);
 			let mut z = 1;
 			for e in &self.entries {
 				let d = &e.dims;
@@ -330,27 +274,20 @@ impl LayerPlan {
 	}
 }
 
-// Serialize an ogdl graph built by `build` to text through the crate's own
-// four-method API (build → `file` → read). The crate writes to files, so this
-// round-trips a private temp — the checkpoint codec is now just `add` calls.
 pub(crate) fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let tmp = std::env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", std::process::id()));
 	let tp = tmp.to_str().expect("utf8 tmp");
 	let _ = std::fs::remove_file(tp);
-	let g = ogdl::file(tp); // fresh empty graph (tmp absent)
-	build(g.clone()); // a Graph handle is shared, not Copy: clone shares the tree
-	g.file(tp); // populated graph → write out
+	let g = ogdl::file(tp);
+	build(g.clone());
+	g.file(tp);
 	let text = std::fs::read_to_string(tp).unwrap_or_default();
 	let _ = std::fs::remove_file(tp);
 	text
 }
 
-/// Host-only plan pass: same walk, same shapes, same seeds, same resume
-/// validation the fit builder does, but composes every block into a host
-/// image instead of touching the GPU. The fit path plans → sizes scratch →
-/// claims the arena → uploads ONE init image → materializes.
 pub fn plan_layer_params(
 	specs: &[LayerSpec],
 	d: usize,
@@ -360,8 +297,6 @@ pub fn plan_layer_params(
 	try_resume: bool,
 ) -> Result<LayerPlan, String> {
 	let mut plan = LayerPlan { entries: Vec::new(), host: Vec::new() };
-	// One shared zero scalar backs every never-touched dummy slot (non-attn
-	// wk/wv/wo, non-PRelu palpha) — they are read-only placeholders.
 	let dummy_off = plan.zeros(1).off;
 	let dummy = || BlockPlan { off: dummy_off, len: 1 };
 	let mut si = 0usize;
@@ -615,14 +550,6 @@ pub fn plan_layer_params(
 	Ok(plan)
 }
 
-// ── OGDL checkpoint codec (folded in from the former ogdl.rs) ───────────────
-// Parse a saved-weights dump into one `Saved` per layer/neuron and serialize
-// back out — both halves now go through the ogdl four-method API, so this is
-// the model-specific field mapping only, co-located with the plan it serves.
-/// One parsed OGDL block, in layer/neuron order — the resume counterpart of the
-/// per-layer save format. `Embed` is the flat [vocab*dim] token table; `Attn` holds
-/// the four [d*d] projections and their (zero) [d] biases; `Dense` is one neuron's
-/// weight row, bias, and optional learned PReLU slope `a`.
 #[derive(Debug, PartialEq)]
 pub enum Saved {
 	Embed(Vec<f64>),
@@ -648,7 +575,6 @@ pub enum Saved {
 }
 
 impl Saved {
-	/// Element count of this block (weights + biases), for the NaN-fraction report.
 	pub fn len(&self) -> usize {
 		match self {
 			Saved::Embed(t) => t.len(),
@@ -673,10 +599,6 @@ impl Saved {
 	}
 }
 
-/// Parse an OGDL dump into one `Saved` block per layer/neuron, in save order
-/// (embed table, attn projections+biases, or one dense neuron each). A missing
-/// file is not an error: it just means "first run" — return empty so training
-/// starts from random init and a later run can resume.
 pub fn load_ogdl(path: &str) -> Vec<Saved> {
 	let text = match std::fs::read_to_string(path) {
 		Ok(t) => t,
@@ -688,27 +610,16 @@ pub fn load_ogdl(path: &str) -> Vec<Saved> {
 	load_ogdl_str(&text)
 }
 
-/// Parse OGDL checkpoint text into `Saved` blocks (the cwd-independent core of
-/// `load_ogdl` — used by `Model::load` with `include_str!`-embedded weights).
-/// The `ogdl` crate turns the text into a name/value tree; this fn interprets
-/// what each top-level block means for model weights. The block layout is fixed
-/// by `dump_ogdl`: a scalar metric header (`r2=`/`acc=`/…), then one bare-named
-/// block per layer with its fields indented underneath.
 pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
-	// The four-method ogdl API reads FILES; stage the text through a temp file,
-	// then walk the returned tree (public `Node` fields; `itnl("")` = the root).
 	let tmp = std::env::temp_dir().join(format!("nrs_load_ogdl_{:x}.ogdl", text.len()));
 	std::fs::write(&tmp, text).expect("resume: stage ogdl text");
 	let root = ogdl::file(tmp.to_str().expect("utf8 temp")).itnl("");
 	let _ = std::fs::remove_file(&tmp);
-	// value of a node = its leaf children parsed as f64 (`w 0.01 -0.02`).
 	let vals = |n: &ogdl::Node| -> Vec<f64> {
 		n.children.iter().filter_map(|g| g.name.parse::<f64>().ok()).collect()
 	};
 	let mut out: Vec<Saved> = Vec::new();
 	for block in &root.children {
-		// A top-level node whose children are all leaves is the scalar metric
-		// header (`r2 0.987`), not a weight block — skip it.
 		if !block.children.is_empty() && block.children.iter().all(|c| c.children.is_empty()) {
 			continue;
 		}
@@ -738,7 +649,6 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 				bo: field("bo"),
 			}),
 			"conv" => out.push(Saved::Conv { w: field("w"), b: field("b") }),
-			// z{k}: one dense neuron — w row, scalar b, optional PReLU slope a.
 			_ => {
 				let mut w = Vec::new();
 				let mut b = 0.0;
@@ -748,8 +658,6 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 						"w" => w = vals(c),
 						"b" => b = vals(c).first().copied().expect("resume: dense b"),
 						"a" => a = vals(c).first().copied(),
-						// Back-compat: the old format wrote one weight per line
-						// (w1, w2, …) in order — append each to the vector.
 						key if key.starts_with('w')
 							&& key.len() > 1
 							&& key[1..].chars().all(|ch| ch.is_ascii_digit()) =>
@@ -768,20 +676,11 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 	out
 }
 
-/// One OGDL block per layer, in layer order: `embed` (one `{id}=` row per vocab
-/// token), `attn` (`wq/wk/wv/wo` + `bq/bk/bv/bo`), `conv` (`w=`/`b=`), or one `z{k}`
-/// block per dense neuron (`w=` row, `b=` scalar, plus `a=` for a PReLU layer's
-/// learned slope). W rows are laid out to match `load_ogdl`'s distribution.
-/// `filter: None` saves everything the model allocated (full checkpoint —
-/// future-proof as new param kinds are added per layer below). `Some(parts)`
-/// restricts to a subset. Each layer block downloads exactly the buffers it holds.
 pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
 	let want_w = filter.map_or(true, |f| f.contains(&Param::W));
 	let want_b = filter.map_or(true, |f| f.contains(&Param::B));
-	// Same walk as `dump_ogdl_host`, downloading each block from the GPU, but the
-	// serialization itself is just `add` calls through the ogdl four-method API.
 	crate::params::ogdl_text(|g| {
-		g.add(score, key); // metric header: `{key} {score}`
+		g.add(score, key);
 		let mut z = 1;
 		for p in params.iter() {
 			match p.kind {
@@ -802,8 +701,6 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 						g.add(download_vec(&p.wo, dd), "attn.wo");
 					}
 					if want_b {
-						// Bare attention has a single shared (zero) bias [d];
-						// emit it as bq/bk/bv/bo for format completeness.
 						let bias = download_vec(&p.b, p.dim);
 						for nm in ["bq", "bk", "bv", "bo"] {
 							g.add(bias.clone(), &format!("attn.{nm}"));
@@ -846,8 +743,6 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 	})
 }
 
-/// Write OGDL text, creating any missing parent dirs — saving should make the
-/// file, not fail because the directory isn't there yet.
 pub fn write_ogdl(path: &str, out: &str) {
 	if let Some(parent) = std::path::Path::new(path).parent()
 		&& !parent.as_os_str().is_empty()
@@ -858,12 +753,9 @@ pub fn write_ogdl(path: &str, out: &str) {
 	std::fs::write(path, out).unwrap_or_else(|e| panic!("save: write {path}: {e}"));
 }
 
-/// Read the score recorded on the first line of a saved checkpoint (`{key}={score}`),
-/// used by the best-only save guard. `None` if the file is absent or unparseable.
 pub fn saved_score(path: &str, key: &str) -> Option<f64> {
 	let text = std::fs::read_to_string(path).ok()?;
 	for line in text.lines() {
-		// Header is `{key} {score}` (ogdl space form) or legacy `{key}={score}`.
 		let line = line.trim();
 		if let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(char::is_whitespace))
 			&& k.trim() == key
@@ -878,10 +770,6 @@ pub fn saved_score(path: &str, key: &str) -> Option<f64> {
 mod tests {
 	use super::*;
 
-	// Host-only: the OGDL parser must read back the documented embed/attn/dense
-	// format exactly (no GPU — pure file parse). Mirrors what dump_ogdl writes:
-	// an embed table by token id, attn projections + zero biases, and dense
-	// neurons with optional PReLU slope `a`.
 	#[test]
 	fn ogdl_format_roundtrips_host_side() {
 		let path = std::env::temp_dir().join("nrs_ogdl_roundtrip.ogdl");
@@ -946,15 +834,12 @@ z2
 		);
 	}
 
-	// The migrated path end-to-end: build a checkpoint purely with `ogdl.add`
-	// (the new save mechanics) and load it back into `Saved` — no hand-rolled
-	// format on either side.
 	#[test]
 	fn dump_add_api_roundtrips() {
 		let text = crate::params::ogdl_text(|g| {
-			g.add(0.42_f64, "r2"); // metric header
+			g.add(0.42_f64, "r2");
 			g.add(vec![0.1_f64, 0.2, 0.3], "z1.w");
-			g.add(0.05_f64, "z1.a"); // PReLU slope
+			g.add(0.05_f64, "z1.a");
 			g.add(0.01_f64, "z1.b");
 			g.add(vec![-0.4_f64, 0.5], "z2.w");
 			g.add(0.02_f64, "z2.b");

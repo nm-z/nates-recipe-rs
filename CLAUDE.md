@@ -144,7 +144,7 @@ recipe::eval(&model, &data);
 
 ## Conventions
 
-Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. Comments: minimal, no prose blocks, no arrows/em-dashes inline; one-line box-drawn section dividers are fine. The code is the spec.
+Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. **Zero comments** — no `//`, no `///`, no `//!`, no `/* */`, no section dividers, in `src/`, `recipe-infer/src/`, `ogdl/src/`. Enforced by `h03_no_comments` in `tests/hygiene.rs` (lexer-based: catches trailing and block comments too). Naming and structure carry the meaning; a constraint the code cannot express goes in the commit message or `docs/MANUAL.md`. The code is the spec.
 
 ## Active State (2026-07)
 

@@ -1,54 +1,37 @@
-//! The reusable GPU scratch arena: every activation, gradient, metric, and
-//! attention temporary, allocated once at fit/eval and reused across epochs so
-//! steady-state VRAM is flat. Plus the exact-size pre-checks (`vram_bytes`,
-//! `vram_estimate`) that gate a forward/backward pass against free VRAM.
-
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{LayerDims, LayerParams, concat_layer};
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
-/// The 12 constant scalar operands every Scratch carries, in the fixed order
-/// `carve` reads them from its image view — push this array verbatim into the
-/// run's init stage so the constants ride the ONE upload.
 pub const SCRATCH_CONSTS: [f64; 12] = [
-	1.0,                                // c_one
-	-1.0,                               // c_neg_one
-	0.5,                                // c_half
-	1e-7,                               // c_eps
-	1.0 - 1e-7,                         // c_one_minus_eps
-	crate::params::LEAKY_ALPHA,         // c_leaky_alpha
-	crate::params::ELU_ALPHA,           // c_elu_alpha
-	gpu_core::k_gapact::SELU_ALPHA,     // c_selu_alpha
-	gpu_core::k_gapact::SELU_LAMBDA,    // c_selu_lambda
-	crate::params::FOCAL_GAMMA,         // c_focal_gamma
-	crate::params::FOCAL_ALPHA,         // c_focal_alpha
-	gpu_core::rope::ROPE_THETA,         // c_rope_theta
+	1.0,
+	-1.0,
+	0.5,
+	1e-7,
+	1.0 - 1e-7,
+	crate::params::LEAKY_ALPHA,
+	crate::params::ELU_ALPHA,
+	gpu_core::k_gapact::SELU_ALPHA,
+	gpu_core::k_gapact::SELU_LAMBDA,
+	crate::params::FOCAL_GAMMA,
+	crate::params::FOCAL_ALPHA,
+	gpu_core::rope::ROPE_THETA,
 ];
 
 pub struct Scratch {
 	pub acts: Vec<GpuBuffer>,
-	// Per-layer pre-activation, saved ONLY for Silu/Gelu (their backward needs the
-	// input z, which the in-place activation would otherwise overwrite). Len-1
-	// dummy for every other layer.
 	pub preact: Vec<GpuBuffer>,
 	pub da_a: GpuBuffer,
 	pub da_b: GpuBuffer,
 	pub dz: GpuBuffer,
 	pub dw: GpuBuffer,
-	// Split-K weight-grad partials [P×in_dim·out_dim], summed in pass 2 into dw.
-	// Sized to the widest Dense layer's P·k·n; len-1 in forward-only.
 	pub dw_partials: GpuBuffer,
 	pub db: GpuBuffer,
 	pub metric_t0: GpuBuffer,
 	pub metric_t1: GpuBuffer,
 	pub metric_t2: GpuBuffer,
 	pub metric_scalar: GpuBuffer,
-	// Second scalar slot so the per-epoch score and loss can both ride the async
-	// copy stream and sync once, instead of one blocking 8-byte D2H per metric.
 	pub metric_scalar_b: GpuBuffer,
-	// Constant scalar operands, uploaded once (ops take device-scalar pointers now,
-	// never host f64s): activation / loss / clamp / rope constants, reused every step.
 	pub c_one: GpuBuffer,
 	pub c_neg_one: GpuBuffer,
 	pub c_half: GpuBuffer,
@@ -62,14 +45,7 @@ pub struct Scratch {
 	pub c_focal_alpha: GpuBuffer,
 	pub c_rope_theta: GpuBuffer,
 	pub reduce_ws: GpuBuffer,
-	// Embed layers accumulate the table gradient here ([vocab×dim]) before the
-	// SGD step — scatter-add target, separate from the table so the update is
-	// `table -= lr·grad`. Len 1 when there's no embed layer.
 	pub embed_grad: GpuBuffer,
-	// Attention scratch (len 1 when there is no attn layer). q/k/v/ctx are the
-	// projected sequences [n*S*d]; a_lse is the flash forward's per-row logsumexp
-	// and a_dsum the backward's rowsum(dO∘O) — both [n*heads*S], never S×S; the
-	// d* mirrors hold backward gradients; gw is a [d*d] weight-grad temp.
 	pub a_q: GpuBuffer,
 	pub a_k: GpuBuffer,
 	pub a_v: GpuBuffer,
@@ -82,42 +58,23 @@ pub struct Scratch {
 	pub a_dsum: GpuBuffer,
 	pub a_gw: GpuBuffer,
 	pub a_dbias: GpuBuffer,
-	// PRelu d_alpha scratch (act-sized temps + a scalar accumulator). Len-1 when
-	// no PRelu layer exists.
 	pub prelu_t0: GpuBuffer,
 	pub prelu_t1: GpuBuffer,
 	pub prelu_scalar: GpuBuffer,
-	// Two-branch concat: `concat` [n×(A+C)] holds [attn_output | categorical] fed to
-	// the first dense layer; `concat_dgrad` [n×A] compacts that dense's input-grad
-	// back to the attention width on the backward pass. Len-1 when no concat exists.
 	pub concat: GpuBuffer,
 	pub concat_dgrad: GpuBuffer,
 	pub conv_temp: GpuBuffer,
 	pub conv_wg: usize,
-	// Inference (forward-only) path: attention uses the fused KV-cache forward and
-	// a_lse/a_dsum are len-1 stubs. Training runs the flash kernels too — the L×L
-	// score matrix is never materialized on either path.
 	pub infer: bool,
 	pub copy_stream: gpu_core::hip::Stream,
 	pub pinned_scalar: *mut f64,
 	pub pinned_scalar_b: *mut f64,
-	// Per-layer roofline timing: boundary events on the null stream (where every
-	// compute kernel launches), recorded only while `timing` is set — the fit
-	// loop arms it on log epochs so non-logged epochs run untouched. One event
-	// SET per timed epoch (outer index = `timing_slot`), each L+1 events:
-	// fwd[l]→fwd[l+1] brackets layer l's forward, bwd walks L..0 in reverse. A
-	// single reused slot is read+synced in-loop each log epoch; a per-epoch set of
-	// slots can instead be recorded transfer-free and read ALL at exit (after the
-	// drain) so the loop itself does zero event syncs.
 	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
 	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
 	timing: std::cell::Cell<bool>,
 	timing_slot: std::cell::Cell<usize>,
 }
 
-/// Per-layer (forward_ms, backward_ms) from an already-completed event set — no
-/// sync (the caller drained the device first). `ev_fwd`/`ev_bwd` are one timed
-/// epoch's L+1 boundary events.
 pub fn layer_ms_from(
 	ev_fwd: &[gpu_core::hip::Event],
 	ev_bwd: &[gpu_core::hip::Event],
@@ -133,27 +90,14 @@ pub fn layer_ms_from(
 }
 
 impl Scratch {
-	/// Full (forward + backward) training scratch, non-windowed: every backward
-	/// buffer is sized real (unlike `carve`, which len-1s them because the Ooc owns
-	/// the real ones). The 12 constant operands are carved as views of `consts` — a
-	/// `SCRATCH_CONSTS`-ordered block the caller composed with ONE load — never 12
-	/// separate single-scalar uploads.
 	pub fn new_full(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
 		Self::new_inner(params, n, false, false, consts, 1)
 	}
 
-	/// THE fit scratch: the windowed engine's minimal resident set (every big
-	/// full-batch buffer len-1, the Ooc owns the real ones) with the 12 constant
-	/// operands carved as views of `consts` — a `SCRATCH_CONSTS`-ordered block in
-	/// the run's init image — so the constants ride the run's ONE sync H2D instead
-	/// of 12 separate uploads. `n_timed` pre-allocates that many per-epoch roofline
-	/// event sets. No mode flags: fit is always full-backward + windowed.
 	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> Scratch {
 		Self::new_inner(params, n, false, true, consts, n_timed)
 	}
 
-	/// One-claim forward-only path (the detector): backward buffers len-1
-	/// (forward-only), constants as image views like `carve`.
 	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> Scratch {
 		Self::new_inner(params, n, true, false, consts, 0)
 	}
@@ -168,8 +112,6 @@ impl Scratch {
 	) -> Scratch {
 		let bw = move |sz: usize| if forward_only { 1 } else { sz };
 		let lt = move |sz: usize| if light { 1 } else { sz };
-		// On OOM, report the buffer name and the size it tried to grab (f64 count →
-		// bytes) instead of a bare HipError(2) — full-batch attention scores dominate.
 		let alloc = |sz: usize, label: &str| -> GpuBuffer {
 			GpuBuffer::alloc(sz).unwrap_or_else(|e| {
 				panic!(
@@ -189,8 +131,6 @@ impl Scratch {
 		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
 		for p in params {
-			// Split-K dW partials: Dense reduces n×(in_dim×out_dim); each Attn
-			// projection (Wq/Wk/Wv/Wo) reduces (n·s)×(d×d) through the same kernel.
 			let dw_dp = match p.kind {
 				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
 				LayerKind::Attn => {
@@ -213,16 +153,10 @@ impl Scratch {
 			if w > max_ws {
 				max_ws = w;
 			}
-			// da_a/da_b must hold both this layer's output-grad (n·out_dim) and
-			// its input-grad da_below (n·in_dim) — the concat dense's in_dim
-			// (A+C) can exceed every out_dim, so size to the wider of the two.
 			let a = n * p.out_dim.max(p.in_dim);
 			if a > max_act {
 				max_act = a;
 			}
-			// dw holds ONLY Dense/Conv weight grads. Attn projections write their
-			// d×d grads to a_gw and Embed writes to embed_grad, so neither sizes dw —
-			// an attn in_dim×out_dim here is (S·d)² and would blow VRAM for nothing.
 			let wt = match p.kind {
 				LayerKind::Conv => {
 					let lin = p.in_dim / p.conv_cin;
@@ -260,7 +194,6 @@ impl Scratch {
 				if p.dim * p.dim > max_dd {
 					max_dd = p.dim * p.dim;
 				}
-				// Attn backward reduces over (n*s rows, dim cols) for the bias grad.
 				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * s, p.dim);
 				if ws > max_ws {
 					max_ws = ws;
@@ -282,11 +215,7 @@ impl Scratch {
 				"scratch preact",
 			));
 		}
-		// Metric temps hold the output (n * out_dim of the last layer) — sized to
-		// it so multi-output (k>1) element-wise loss metrics don't overrun.
 		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
-		// Two-branch concat buffers: `concat` [n×(A+C)] is a FORWARD buffer (eval
-		// builds it too); `concat_dgrad` [n×A] is backward-only.
 		let (concat_sz, concat_grad_sz) = match concat_layer(params) {
 			Some((_, a, c)) => (n * (a + c), n * a),
 			None => (1, 1),
@@ -313,9 +242,6 @@ impl Scratch {
 		} else {
 			(alloc(1, "conv_temp"), 0)
 		};
-		// Constant operands: views of the caller's SCRATCH_CONSTS block (composed
-		// with ONE load into its init image / a standalone 12-float carve), never
-		// 12 separate single-scalar uploads.
 		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
 		let pinned_pair = pinned_scalar_pair();
 		Scratch {
@@ -355,8 +281,6 @@ impl Scratch {
 			a_k: alloc(lt(max_seqd), "a_k"),
 			a_v: alloc(lt(max_seqd), "a_v"),
 			a_ctx: alloc(lt(max_seqd), "a_ctx"),
-			// Training flash forward writes the per-row logsumexp here for the
-			// backward tile recompute; inference never needs it.
 			a_lse: alloc(if forward_only || light { 1 } else { max_lse }, "a_lse"),
 			a_dctx: alloc(lt(bw(max_seqd)), "a_dctx"),
 			a_dq: alloc(lt(bw(max_seqd)), "a_dq"),
@@ -374,9 +298,6 @@ impl Scratch {
 			conv_wg: conv_wg_count,
 			infer: forward_only,
 			copy_stream: gpu_core::hip::Stream::new().expect("copy stream"),
-			// One pinned block for both scalars — a & b at +0/+8 — so the whole
-			// Scratch costs a single blocking host alloc (budget: ≤2 per run
-			// including the transfer bounce).
 			pinned_scalar: pinned_pair,
 			pinned_scalar_b: unsafe { pinned_pair.add(1) },
 			ev_fwd: (0..n_timed)
@@ -390,50 +311,32 @@ impl Scratch {
 		}
 	}
 
-	/// Arm/disarm per-layer boundary timing. Armed only for the epoch a log line
-	/// will print; the metric re-forward runs disarmed so it can't overwrite the
-	/// recorded boundaries.
 	pub fn set_timing(&self, on: bool) {
 		self.timing.set(on);
 	}
 
-	/// Select which per-epoch event set the next `mark_*` calls record into (a
-	/// per-epoch-set caller advances this once per logged epoch; a single-slot
-	/// caller leaves it 0 and reuses the one set every log epoch).
 	pub fn set_timing_slot(&self, slot: usize) {
 		self.timing_slot.set(slot);
 	}
 
-	/// Record forward layer boundary `i` (0 = before layer 0) on the null stream.
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
-			// SAFETY: null stream — the stream every compute kernel launches on.
 			unsafe { self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record fwd event") }
 		}
 	}
 
-	/// Record backward layer boundary `i` (params.len() = before the top layer,
-	/// recorded in descending order as backward walks down).
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
-			// SAFETY: null stream — the stream every compute kernel launches on.
 			unsafe { self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record bwd event") }
 		}
 	}
 
-	/// Per-layer (forward_ms, backward_ms) for the current slot. Waits on the final
-	/// boundary event (bwd[0], recorded last) — the in-loop read at log time. A
-	/// caller can instead move the event sets out with `take_events` and read them
-	/// after an exit drain (no in-loop sync).
 	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
 		let s = self.timing_slot.get();
 		self.ev_bwd[s][0].synchronize().expect("sync bwd event");
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
-	/// Move the per-epoch timing event sets out of the Scratch so their handles
-	/// outlive the Scratch drop. Lets an exit read every logged epoch's roofline
-	/// after its own drain.
 	pub fn take_events(&mut self) -> (Vec<Vec<gpu_core::hip::Event>>, Vec<Vec<gpu_core::hip::Event>>) {
 		(std::mem::take(&mut self.ev_fwd), std::mem::take(&mut self.ev_bwd))
 	}
@@ -450,8 +353,6 @@ impl Scratch {
 		}
 	}
 
-	/// Enqueue the async D2H of `metric_scalar_b` onto the same copy stream — used
-	/// for the per-epoch score so it batches into one sync with the loss copy.
 	pub fn download_scalar_b_deferred(&self) {
 		unsafe {
 			let _ = gpu_core::memory::xfer(
@@ -469,21 +370,15 @@ impl Scratch {
 		unsafe { *self.pinned_scalar }
 	}
 
-	/// Async read of `metric_scalar`: `hipMemcpyAsync` on the copy stream then a
-	/// targeted copy-stream sync — never a blocking default-stream `hipMemcpy`.
-	/// Used by every per-epoch metric so no metric scalar stalls the compute stream.
 	pub fn read_metric_scalar(&self) -> f64 {
 		self.download_scalar_deferred();
 		self.sync_deferred_scalar()
 	}
 
-	/// Drain the copy stream once (both deferred scalar copies complete).
 	pub fn sync_copy_stream(&self) {
 		self.copy_stream.synchronize().expect("sync copy stream");
 	}
 
-	/// Last value copied by `download_scalar_deferred` / `download_scalar_b_deferred`.
-	/// Valid only after `sync_copy_stream` (or `sync_deferred_scalar`).
 	pub fn deferred_scalar(&self) -> f64 {
 		unsafe { *self.pinned_scalar }
 	}
@@ -494,13 +389,6 @@ impl Scratch {
 
 impl Drop for Scratch {
 	fn drop(&mut self) {
-		// Drain in-flight GPU work BEFORE any POOL-OWNED buffer field is
-		// hipFreeAsync'd: a GEMM on its own stream can still be running when an
-		// owned buffer frees, racing → "Memory access fault / GPU Hang" at the
-		// phase boundary. Carved buffers (arena bump-carves + the const/window
-		// views) own nothing and free nothing, so a Scratch made entirely of
-		// carves has no free to race — drain only when at least one field is
-		// pool-owned. The drain covers every phase (fit / score / eval / infer).
 		let owned_any = self.acts.iter().any(GpuBuffer::is_pool_owned)
 			|| self.preact.iter().any(GpuBuffer::is_pool_owned)
 			|| [
@@ -522,14 +410,9 @@ impl Drop for Scratch {
 		if owned_any {
 			let _ = gpu_core::hip::device_synchronize();
 		}
-		// pinned_scalar points into the process-static pinned pair — never freed
-		// here (one host_malloc per process, reused by every Scratch).
 	}
 }
 
-// The 16-byte pinned scalar pair every Scratch shares: allocated once per
-// process on first use, reused forever — a per-run host_malloc/host_free would
-// tick the run's init alloc for a pin whose lifetime is really the process.
 static PINNED_PAIR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
 fn pinned_scalar_pair() -> *mut f64 {
@@ -540,9 +423,6 @@ fn pinned_scalar_pair() -> *mut f64 {
 	*g as *mut f64
 }
 
-/// Release the process-static pinned pair at shutdown (exit frees ALL RAM
-/// explicitly, never by process teardown). Drain first: a not-yet-retired
-/// deferred scalar copy into the pair would read freed host pages.
 pub fn free_pinned_pair() {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
 	if *g != 0 {
@@ -553,18 +433,11 @@ pub fn free_pinned_pair() {
 }
 
 impl Scratch {
-	/// Exact bytes `new()` will allocate for these params at row count `n` — the
-	/// SUM of every buffer, mirroring `new()` field-for-field. Used to pre-check a
-	/// forward pass (esp. eval, where attention's scores + per-head buffers are
-	/// huge) against free VRAM, since an over-budget alloc HIP-asserts (core dump)
-	/// rather than returning a catchable error.
 	pub fn vram_bytes(params: &[LayerParams], n: usize, forward_only: bool) -> usize {
 		let dims: Vec<LayerDims> = params.iter().map(LayerDims::from).collect();
 		Self::vram_bytes_dims(&dims, n, forward_only)
 	}
 
-	/// `vram_bytes` over the host-only dims mirror — the plan pass sizes the
-	/// scratch (and decides in-VRAM vs out-of-core) before any GPU work.
 	pub fn vram_bytes_dims(params: &[LayerDims], n: usize, forward_only: bool) -> usize {
 		let bw = |sz: usize| if forward_only { 1 } else { sz };
 		let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
@@ -573,9 +446,9 @@ impl Scratch {
 			(1usize, 1usize, 1usize, 1usize);
 		let mut max_dw_partials = 1usize;
 		let mut has_prelu = false;
-		let mut floats = 0usize; // acts + preact (per-layer, variable)
+		let mut floats = 0usize;
 		for p in params {
-			floats += n * p.out_dim; // acts[l]
+			floats += n * p.out_dim;
 			let dw_dp = match p.kind {
 				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
 				LayerKind::Attn => {
@@ -593,7 +466,7 @@ impl Scratch {
 					| Activation::Gelu | Activation::Elu
 					| Activation::Selu | Activation::PRelu
 			);
-			floats += if needs_pre { n * p.out_dim } else { 1 }; // preact[l]
+			floats += if needs_pre { n * p.out_dim } else { 1 };
 			if p.act == Activation::PRelu {
 				has_prelu = true;
 				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * p.out_dim, 1);
@@ -608,7 +481,6 @@ impl Scratch {
 			if n * p.out_dim.max(p.in_dim) > max_act {
 				max_act = n * p.out_dim.max(p.in_dim);
 			}
-			// Mirror new(): dw is sized only by Dense/Conv (Attn→a_gw, Embed→embed_grad).
 			let wt = match p.kind {
 				LayerKind::Conv => {
 					let lin = p.in_dim / p.conv_cin;
@@ -646,24 +518,21 @@ impl Scratch {
 			}
 		}
 		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
-		floats += 3 * bw(max_act); // da_a, da_b, dz
-		floats += bw(max_wt) + bw(max_dw_partials) + bw(max_bias); // dw, dw_partials, db
-		floats += 3 * out_elems + 2; // metric_t0/t1/t2, metric_scalar, metric_scalar_b
-		floats += 12; // constant scalar operands c_one … c_rope_theta
-		floats += bw(max_embed_grad); // embed_grad
-		floats += 4 * max_seqd; // a_q,a_k,a_v,a_ctx (forward)
-		floats += 4 * bw(max_seqd); // a_dctx,a_dq,a_dk,a_dv (backward)
+		floats += 3 * bw(max_act);
+		floats += bw(max_wt) + bw(max_dw_partials) + bw(max_bias);
+		floats += 3 * out_elems + 2;
+		floats += 12;
+		floats += bw(max_embed_grad);
+		floats += 4 * max_seqd;
+		floats += 4 * bw(max_seqd);
 		if forward_only {
-			// FlashAttention inference: no L×L score buffer at all (the fused kernel
-			// streams K,V through shared memory). a_lse/a_dsum are len-1 stubs.
 			floats += 2;
 		} else {
-			floats += 2 * max_lse; // a_lse (fwd), a_dsum (bwd)
+			floats += 2 * max_lse;
 		}
-		floats += 2 * bw(max_dd); // a_gw, a_dbias
-		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1; // prelu_t0/t1, prelu_scalar
+		floats += 2 * bw(max_dd);
+		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1;
 		match crate::params::concat_layer_dims(params) {
-			// concat (fwd) + concat_dgrad (bwd)
 			Some((_, a, c)) => {
 				floats += n * (a + c) + bw(n * a);
 			}
@@ -746,10 +615,6 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 	let dummy_params: Vec<LayerParams> = fake_params
 		.iter()
 		.map(|&(i, o, kind, dim, vocab, act, heads)| {
-			// Plan-time dims carrier: vram_bytes only reads shapes, never the
-			// buffers — a null borrow costs zero device traffic and cannot be
-			// refused by the growth gate (an 8-byte ask was observed refused
-			// under post-free counter depression, crashing footprint sizing).
 			let dummy = || GpuBuffer::borrow(std::ptr::null_mut(), 0);
 			let (cc, ck, cs) = if kind == LayerKind::Conv { (dim, vocab, heads) } else { (0, 0, 0) };
 			LayerParams {

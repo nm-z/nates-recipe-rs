@@ -1,17 +1,3 @@
-// ── wire.rs — minimal TCP RPC for distributed inference ──────────────────────
-// llama.cpp's rpc-server splits vertically (one machine busy at a time) and
-// blocks per-op. This splits horizontally: the coordinator ships weights ONCE
-// (STORE, bf16 on the wire), then fires RUN frames for remotely-homed experts
-// back-to-back without awaiting replies while the local GPU computes its own —
-// local trunk ∥ remote experts ∥ duplex wire, nobody idle. The RUN handler is
-// a caller-registered closure, so this module carries zero GPU deps; the gemma
-// expert path registers MOE_FFN into the same map.
-//
-// Frame: 32-byte little-endian header + raw payload.
-//   magic u32 | op u8 | flags u8 | tag u16 | seq u32 | id u64 | len u64 | rsvd u32
-// Weights ride as bf16 (the on-disk format); widening to f64 happens wherever
-// the compute lands, so the wire never carries an f64 weight. All math stays f64.
-
 use crate::probe::Machine;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -21,17 +7,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub const MAGIC: u32 = 0x5243_5031; // "RCP1"
+pub const MAGIC: u32 = 0x5243_5031;
 pub const PORT: u16 = 7845;
 const HDR: usize = 32;
 
-// ── discovery protocol constants ─────────────────────────────────────────────
-const BEACON_MAGIC: u32 = 0x5243_5042; // "RCPB", UDP beacon on the same port
+const BEACON_MAGIC: u32 = 0x5243_5042;
 const BEACON_SECS: u64 = 2;
 const STALE_MS: u128 = 3 * BEACON_SECS as u128 * 1000;
 const CONNECT_TIMEOUT_SECS: u64 = 2;
 
-// fn_id values carried in `tag` for RUN. Registered handlers key off these.
 pub const FN_MOE_FFN: u16 = 1;
 
 #[repr(u8)]
@@ -89,7 +73,6 @@ fn write_frame_raw(s: &mut TcpStream, op: Op, flags: u8, tag: u16, seq: u32, id:
 	h[8..12].copy_from_slice(&seq.to_le_bytes());
 	h[12..20].copy_from_slice(&id.to_le_bytes());
 	h[20..28].copy_from_slice(&(data.len() as u64).to_le_bytes());
-	// one syscall for the small frames; payload follows uncopied
 	s.write_all(&h)?;
 	if !data.is_empty() {
 		s.write_all(data)?;
@@ -120,7 +103,6 @@ fn read_frame(s: &mut TcpStream) -> Result<Frame> {
 	Ok(Frame { op, flags, tag, seq, id, data })
 }
 
-// ── node capability descriptor (HELLO payload) ──────────────────────────────
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
 	pub arch: String,
@@ -130,8 +112,6 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-	// This node's own capabilities. RAM is MemAvailable now; a storage-only
-	// node reports gpus=0/vram=0 (genuinely none, not a papered-over default).
 	pub fn probe() -> NodeInfo {
 		let arch = std::env::var("GPU_ARCH").unwrap_or_else(|_| "storage".to_string());
 		NodeInfo { arch, gpus: 0, vram: 0, ram: mem_available() }
@@ -163,15 +143,6 @@ fn mem_available() -> u64 {
 	0
 }
 
-// ── discovery ────────────────────────────────────────────────────────────────
-// Every daemon broadcasts a beacon per up interface every BEACON_SECS and
-// accumulates every beacon it hears into a peer table; running `recipe serve`
-// IS the registration. A client asks its OWN local daemon (PEERS) for the
-// network view — symmetric, no hierarchy, no coordinator role in the protocol.
-// Beacons go out tagged eth/wlan; a dead cable drops IFF_RUNNING, its beacons
-// stop, receivers age the address out — eth-preferred with wlan fallback needs
-// no special-casing beyond preference order at connect.
-
 fn hostname() -> String {
 	std::fs::read_to_string("/proc/sys/kernel/hostname")
 		.map(|s| s.trim().to_string())
@@ -184,7 +155,6 @@ struct Iface {
 	wireless: bool,
 }
 
-// Up+running non-loopback IPv4 interfaces with their directed broadcast addr.
 fn ifaces() -> Vec<Iface> {
 	let mut out = Vec::new();
 	unsafe {
@@ -221,21 +191,14 @@ fn ifaces() -> Vec<Iface> {
 	out
 }
 
-// kind → (reachable "ip:port", last heard)
 struct PeerRec {
 	info: NodeInfo,
 	addrs: HashMap<String, (String, std::time::Instant)>,
-	// Last device table heard from this host; folded into config.ogdl. None
-	// until a machine-bearing beacon arrives (a pre-probe daemon, or truncated).
 	machine: Option<Machine>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, PeerRec>>>;
 
-// The device table is MEASURED once (probe, at serve start) and rebroadcast
-// unchanged; only the lightweight NodeInfo (MemAvailable) is re-probed per
-// beacon. The machine rides as one extra newline-delimited line after the
-// NodeInfo block — an old receiver decodes NodeInfo and ignores the tail.
 fn beacon_loop(machine: Option<Arc<Machine>>) {
 	let host = hostname();
 	let mach_line = machine.as_ref().map(|m| m.beacon_encode());
@@ -284,8 +247,6 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 		}
 		let rest = it.next().unwrap_or("");
 		let Ok(info) = NodeInfo::decode(rest.as_bytes()) else { continue };
-		// Machine tail: the 5th line onward (after arch/gpus/vram/ram); one line,
-		// so `nth(4)` is exactly it. Absent on a pre-probe daemon's beacon.
 		let machine = rest.splitn(5, '\n').nth(4).and_then(|ml| Machine::beacon_decode(ml).ok());
 		let addr = format!("{}:{}", from.ip(), port);
 		let mut changed = false;
@@ -302,17 +263,12 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 				changed = true;
 			}
 		}
-		// Detecting a new/changed machine rewrites the registry file (DHCP →
-		// /etc/hosts). Done outside the lock to avoid nesting under the rewrite.
 		if changed {
 			rewrite_config(&reg, &own);
 		}
 	}
 }
 
-// Snapshot own + every heard machine into config.ogdl (atomic). Only rates and
-// sizes we've actually measured/heard land — a peer with no machine table yet
-// contributes nothing (absence, not zeros).
 fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 	let mut machines: Vec<Machine> = Vec::new();
 	if let Some(m) = own {
@@ -330,8 +286,6 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 	}
 }
 
-// PEERS reply: one peer per line, live addrs eth-first:
-//   host \t kind=ip:port@age_ms,... \t arch \t gpus \t vram \t ram
 fn encode_peers(reg: &Registry) -> Result<Vec<u8>> {
 	let g = reg.lock().map_err(|_| anyhow::anyhow!("wire: registry poisoned"))?;
 	let mut lines = Vec::new();
@@ -352,8 +306,6 @@ fn encode_peers(reg: &Registry) -> Result<Vec<u8>> {
 	Ok(lines.join("\n").into_bytes())
 }
 
-// A peer as seen from the local daemon's registry: live addrs in
-// preference order (eth before wlan, stale dropped).
 #[derive(Clone, Debug)]
 pub struct PeerEntry {
 	pub host: String,
@@ -389,16 +341,11 @@ fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
 	out
 }
 
-// Ask this machine's own daemon for the network view.
 pub fn local_peers() -> Result<Vec<PeerEntry>> {
 	let c = Conn::connect(&format!("127.0.0.1:{PORT}"))?;
 	Ok(decode_peers(&c.call(Op::Peers, 0, 0, Vec::new())?.data))
 }
 
-// ── client connection ───────────────────────────────────────────────────────
-// One TCP connection per node. A dedicated reader thread parses replies and
-// routes each to the waiter registered under its seq, so RUN frames pipeline:
-// fire many, collect out of order, accumulate in expert-index order after.
 pub struct Conn {
 	pub info: NodeInfo,
 	wr: Mutex<TcpStream>,
@@ -429,7 +376,7 @@ impl Conn {
 							let _ = tx.send(f);
 						}
 					}
-					Err(_) => break, // peer closed
+					Err(_) => break,
 				}
 			}
 		});
@@ -445,7 +392,6 @@ impl Conn {
 		Ok(*g)
 	}
 
-	// Fire a frame; return a receiver for its reply (pipelined, non-blocking).
 	pub fn send(&self, op: Op, tag: u16, id: u64, data: Vec<u8>) -> Result<Receiver<Frame>> {
 		let seq = self.next_seq()?;
 		let (tx, rx) = channel();
@@ -458,7 +404,6 @@ impl Conn {
 		Ok(rx)
 	}
 
-	// Fire and block for the reply. Err frames surface as a hard error.
 	pub fn call(&self, op: Op, tag: u16, id: u64, data: Vec<u8>) -> Result<Frame> {
 		let f = self.send(op, tag, id, data)?.recv()?;
 		if f.op == Op::Err {
@@ -467,8 +412,6 @@ impl Conn {
 		Ok(f)
 	}
 
-	/// Store borrowing the payload — ooc write-behind lanes reuse window buffers
-	/// from a fixed pool and must not clone a window per STORE.
 	pub fn store_from(&self, id: u64, data: &[u8]) -> Result<()> {
 		let seq = self.next_seq()?;
 		let (tx, rx) = channel();
@@ -503,12 +446,8 @@ impl Conn {
 	}
 }
 
-// ── server ──────────────────────────────────────────────────────────────────
 pub type RunFn = Arc<dyn Fn(u64, &[u8]) -> Result<Vec<u8>> + Send + Sync>;
 
-// Remote backing store. Today a RAM map (the remote-RAM tier, one hop below
-// local disk on 1GbE); a compute node routes STORE through its own Waterfall so
-// the recursive VRAM→RAM→DISK homing applies on the far side too.
 type Store = Arc<Mutex<HashMap<u64, Vec<u8>>>>;
 
 #[derive(Clone)]
@@ -517,8 +456,6 @@ pub struct Server {
 	store: Store,
 	runners: Arc<HashMap<u16, RunFn>>,
 	reg: Registry,
-	// This node's measured device table (probe). Broadcast in the beacon and
-	// written as this host's config.ogdl entry. None on a bare/test server.
 	machine: Option<Arc<Machine>>,
 }
 
@@ -533,8 +470,6 @@ impl Server {
 		}
 	}
 
-	/// Attach this node's probed device table: it rides the beacon and seeds this
-	/// host's entry in config.ogdl at serve start.
 	pub fn machine(mut self, m: Machine) -> Server {
 		self.machine = Some(Arc::new(m));
 		self
@@ -544,11 +479,8 @@ impl Server {
 		self.serve_bound(TcpListener::bind(addr)?)
 	}
 
-	/// Serve on a caller-bound listener (bind-before-probe: the daemon binds 7845
-	/// before any expensive probing so a port conflict fails fast).
 	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {
 		let machine = self.machine.clone();
-		// Own entry lands in the registry file immediately; peers append as heard.
 		if let Some(m) = &machine {
 			if let Err(e) = crate::probe::write_config_atomic(std::slice::from_ref(m.as_ref())) {
 				eprintln!("recipe serve: config write failed: {e}");
@@ -569,10 +501,6 @@ impl Server {
 		self.serve_on(listener)
 	}
 
-	// The bare TCP request/reply loop over an already-bound listener. `serve` layers
-	// the discovery beacon and peer listener on top and binds by address; a caller
-	// that only needs the frame path (a loopback test) binds its own listener and
-	// drives this, skipping the UDP discovery halves.
 	pub fn serve_on(self, listener: TcpListener) -> Result<()> {
 		for stream in listener.incoming() {
 			let stream = stream?;
@@ -591,7 +519,7 @@ impl Server {
 		loop {
 			let f = match read_frame(&mut s) {
 				Ok(f) => f,
-				Err(_) => return Ok(()), // peer closed
+				Err(_) => return Ok(()),
 			};
 			let reply = self.dispatch(&f);
 			let out = match reply {
@@ -648,10 +576,6 @@ impl Server {
 	}
 }
 
-// ── user API ────────────────────────────────────────────────────────────────
-// let net = Net::new().node("archy").node("sentry");
-// Aliases resolve through the user's ssh config (`ssh -G`), so the same names
-// that work for `ssh archy` work here — no IPs in code.
 pub struct Net {
 	nodes: Vec<String>,
 }
@@ -671,14 +595,11 @@ impl Net {
 		self
 	}
 
-	// HELLO every node; a node that fails to answer fails the run loudly (no
-	// silent drop — a distributed run with a missing member is a bug).
 	pub fn connect(&self) -> Result<Vec<Conn>> {
 		let peers = local_peers().unwrap_or_default();
 		self.nodes.iter().map(|n| connect_first(n, &candidates(n, &peers)?)).collect()
 	}
 
-	// Every live peer the local daemon has heard — the whole network, no list.
 	pub fn all() -> Result<Vec<Conn>> {
 		let peers = local_peers()
 			.map_err(|e| anyhow::anyhow!("wire: no local daemon for discovery (recipe serve): {e}"))?;
@@ -704,10 +625,6 @@ fn connect_first(name: &str, addrs: &[String]) -> Result<Conn> {
 mod tests {
       use super::*;
 
-      // Loopback round-trip: bind an ephemeral port, run the accept loop in a
-      // thread, and drive the same store / fetch / run frames the cross-machine
-      // test drove: the wire framing, the RAM store, and runner dispatch end to
-      // end with no remote daemon and no GPU. A missing runner must answer Err.
       #[test]
       fn wire_loopback_roundtrip() -> Result<()> {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -741,12 +658,6 @@ mod tests {
       }
 }
 
-// Addresses to try for an alias. The ssh config is THE naming layer, enforced:
-// every alias must map to a HostName in ~/.ssh/config with keys set up — the
-// exact contract that makes `ssh archy` trivial is what makes `.net(["archy"])`
-// work, and there is no second registry to keep in sync. The daemon's peer
-// table then upgrades that one address to the live set (eth before wlan) when
-// a heard beacon matches, so eth preference and wlan fallback ride on top.
 fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 	if alias.contains(':') {
 		return Ok(vec![alias.to_string()]);

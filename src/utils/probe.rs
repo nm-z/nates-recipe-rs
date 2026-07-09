@@ -1,10 +1,3 @@
-//! Machine probe → beacon → config.ogdl registry. The probe MEASURES this box's
-//! device table once (sizes are queries, rates are timed one-shots), the beacon
-//! (wire.rs) TRANSMITS it, and the daemon WRITES the OGDL tree — a live registry
-//! of detected machines, the DHCP-writes-/etc/hosts pattern. Everything here is
-//! pure data + timed benches; wire.rs holds/ships a `Machine` without ever
-//! touching the GPU (only `Machine::probe` does).
-
 use anyhow::{anyhow, bail, Result};
 use gpu_core::memory::{par_copy, par_touch, GpuBuffer};
 use std::fs::{File, OpenOptions};
@@ -12,83 +5,68 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-// ── device table ─────────────────────────────────────────────────────────────
-/// One GPU's measured resources. Sizes queried, rates timed at probe.
 #[derive(Clone, Debug, PartialEq)]
-/// All rates are PAYLOAD throughput — the number `size / bandwidth = time`
-/// divides by (a D2D copy's bus traffic is 2x its payload; the scheduler
-/// never needs the bus figure).
 pub struct GpuDev {
-	pub vram: u64,          // total bytes (hipMemGetInfo)
-	pub pcie_gbs: f64,      // H2D upload GB/s
-	pub flops_gflops: f64,  // f64 GEMM GFLOP/s
-	pub transfer_gbs: f64,  // device-to-device copy GB/s
+	pub vram: u64,
+	pub pcie_gbs: f64,
+	pub flops_gflops: f64,
+	pub transfer_gbs: f64,
 }
 
-/// One machine's full device table — the per-host entry in config.ogdl. A box
-/// with no GPU carries an empty `gpus` (absence, not zeros).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
 	pub host: String,
 	pub gpus: Vec<GpuDev>,
-	pub ram: u64,          // MemTotal bytes
-	pub ddr5_gbs: f64,     // host memcpy GB/s
-	pub cpu_gflops: f64,   // threaded f64 FMA GFLOP/s
-	pub disk_size: u64,    // filesystem total bytes (statvfs)
-	pub sata_gbs: f64,     // disk read GB/s (post cache-drop)
+	pub ram: u64,
+	pub ddr5_gbs: f64,
+	pub cpu_transfer_gbs: f64,
+	pub cpu_gflops: f64,
+	pub disk_size: u64,
+	pub sata_gbs: f64,
+	pub eth_gbs: f64,
 }
 
 impl Machine {
-	/// Measure THIS machine's device table. One-shot at daemon start: sizes are
-	/// runtime queries, rates are timed production paths (few iters, best time).
-	/// GPU presence is detected via the HIP device count — zero devices means no
-	/// GPU block at all, and no device is ever initialised on a storage node.
 	pub fn probe() -> Result<Machine> {
 		let host = hostname();
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
 			eprintln!("recipe probe: measuring gpu{d}");
-			// Disposable child per device: an unsupported arch can WEDGE inside the
-			// driver (ROCm 7 on gfx900 hangs, not errors), so the bench runs in a
-			// child the parent can kill — hang/abort/refusal all read the same way:
-			// not drivable, storage node. Loud, never silent, never a crashloop.
 			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
 				Err(e) => eprintln!("recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"),
 			}
 		}
-		// Free what the benches allocated: the probe's first alloc birthed the
-		// process claim (~all VRAM); an idle daemon must hold ~nothing.
 		if ngpu > 0 {
 			gpu_core::hip::set_device(0)?;
-			// Free the benches' birth claim AND trim: the freed claim otherwise sits
-			// as retained pool slack (threshold=max) and the idle daemon squats VRAM.
 			gpu_core::memory::release_run_backing();
 			gpu_core::memory::pool_trim();
 		}
 		let ram = mem_total()?;
-		eprintln!("recipe probe: measuring cpu (ddr5 + flops)");
+		eprintln!("recipe probe: measuring cpu (ddr5 + transfer + flops)");
 		let ddr5_gbs = bench_ddr5();
+		let cpu_transfer_gbs = bench_cpu_read();
 		let cpu_gflops = bench_cpu_flops();
 		let dd = data_dir();
 		let disk_size = disk_total(&dd)?;
 		eprintln!("recipe probe: measuring disk (sata)");
 		let sata_gbs = bench_disk(&dd)?;
-		Ok(Machine { host, gpus, ram, ddr5_gbs, cpu_gflops, disk_size, sata_gbs })
+		let eth_gbs = link_speed_gbs();
+		eprintln!("recipe probe: link {eth_gbs:.3} GB/s ({})", eth_label(eth_gbs));
+		Ok(Machine { host, gpus, ram, ddr5_gbs, cpu_transfer_gbs, cpu_gflops, disk_size, sata_gbs, eth_gbs })
 	}
 
-	/// Compact single-line beacon body (no interior newline — wire.rs appends it
-	/// after the NodeInfo block and splits it back off by line):
-	///   host|ram|ddr5|cpu_gflops|disk_size|sata|ngpu|(vram|pcie|flops|transfer)*
 	pub fn beacon_encode(&self) -> String {
 		let mut parts = vec![
 			self.host.clone(),
 			self.ram.to_string(),
 			self.ddr5_gbs.to_string(),
+			self.cpu_transfer_gbs.to_string(),
 			self.cpu_gflops.to_string(),
 			self.disk_size.to_string(),
 			self.sata_gbs.to_string(),
+			self.eth_gbs.to_string(),
 			self.gpus.len().to_string(),
 		];
 		for g in &self.gpus {
@@ -102,13 +80,13 @@ impl Machine {
 
 	pub fn beacon_decode(s: &str) -> Result<Machine> {
 		let f: Vec<&str> = s.split('|').collect();
-		if f.len() < 7 {
+		if f.len() < 9 {
 			bail!("probe: short beacon machine ({} fields)", f.len());
 		}
-		let ngpu: usize = f[6].parse()?;
+		let ngpu: usize = f[8].parse()?;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for i in 0..ngpu {
-			let b = 7 + i * 4;
+			let b = 9 + i * 4;
 			if b + 4 > f.len() {
 				bail!("probe: truncated gpu{i} in beacon");
 			}
@@ -124,14 +102,15 @@ impl Machine {
 			gpus,
 			ram: f[1].parse()?,
 			ddr5_gbs: f[2].parse()?,
-			cpu_gflops: f[3].parse()?,
-			disk_size: f[4].parse()?,
-			sata_gbs: f[5].parse()?,
+			cpu_transfer_gbs: f[3].parse()?,
+			cpu_gflops: f[4].parse()?,
+			disk_size: f[5].parse()?,
+			sata_gbs: f[6].parse()?,
+			eth_gbs: f[7].parse()?,
 		})
 	}
 }
 
-// ── local queries ────────────────────────────────────────────────────────────
 fn hostname() -> String {
 	std::fs::read_to_string("/proc/sys/kernel/hostname")
 		.map(|s| s.trim().to_string())
@@ -158,10 +137,41 @@ fn disk_total(path: &Path) -> Result<u64> {
 	Ok((st.f_blocks as u64).saturating_mul(st.f_frsize as u64))
 }
 
-// ── GPU benches (device i current) ───────────────────────────────────────────
+fn link_speed_gbs() -> f64 {
+	let mut best_mbps = 0i64;
+	if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+		for e in entries.flatten() {
+			let name = e.file_name();
+			if name == "lo" {
+				continue;
+			}
+			let sp = e.path().join("speed");
+			if let Ok(txt) = std::fs::read_to_string(&sp) {
+				if let Ok(mbps) = txt.trim().parse::<i64>() {
+					if mbps > best_mbps {
+						best_mbps = mbps;
+					}
+				}
+			}
+		}
+	}
+	if best_mbps <= 0 { 0.0 } else { best_mbps as f64 / 8000.0 }
+}
 
-/// Run `measure_gpu(dev)` in a disposable child (RECIPE_PROBE_GPU hook in main)
-/// with a hard timeout; the child prints "vram|pcie|flops|transfer" on success.
+fn eth_label(gbs: f64) -> String {
+	let mbps = (gbs * 8000.0).round() as i64;
+	match mbps {
+		m if m <= 0 => "none".to_string(),
+		100 => "100M".to_string(),
+		1000 => "1GbE".to_string(),
+		2500 => "2.5GbE".to_string(),
+		5000 => "5GbE".to_string(),
+		10000 => "10GbE".to_string(),
+		25000 => "25GbE".to_string(),
+		m => format!("{m}M"),
+	}
+}
+
 fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 	let exe = std::env::current_exe()?;
 	let mut child = std::process::Command::new(exe)
@@ -198,7 +208,6 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 	}
 }
 
-/// The RECIPE_PROBE_GPU child body: measure one device, print the fields, exit.
 pub fn probe_gpu_child_main(dev: i32) -> ! {
 	match measure_gpu(dev) {
 		Ok(g) => {
@@ -223,7 +232,6 @@ fn measure_gpu(dev: i32) -> Result<GpuDev> {
 	})
 }
 
-// One 64 MiB pinned-bounce H2D through the real choke, timed; best of a few.
 fn bench_pcie_h2d() -> Result<f64> {
 	let bytes = 64usize << 20;
 	let host = vec![0u8; bytes];
@@ -239,7 +247,6 @@ fn bench_pcie_h2d() -> Result<f64> {
 	Ok(bytes as f64 / best / 1e9)
 }
 
-// One saturating 2048³ f64 GEMM through the production entry, timed.
 fn bench_gemm() -> Result<f64> {
 	let (m, n, k) = (2048usize, 2048usize, 2048usize);
 	let x = GpuBuffer::alloc(m * k)?;
@@ -261,9 +268,8 @@ fn bench_gemm() -> Result<f64> {
 	Ok(flop / best / 1e9)
 }
 
-// One 256 MiB device-to-device copy (payload throughput), timed.
 fn bench_transfer() -> Result<f64> {
-	let n = 32usize << 20; // 32M f64 = 256 MiB
+	let n = 32usize << 20;
 	let src = GpuBuffer::alloc(n)?;
 	let dst = GpuBuffer::alloc(n)?;
 	src.memset_zero(n * 8)?;
@@ -279,8 +285,6 @@ fn bench_transfer() -> Result<f64> {
 	Ok(bytes as f64 / best / 1e9)
 }
 
-// ── CPU / disk benches ───────────────────────────────────────────────────────
-// Multi-threaded 1 GiB host memcpy, payload GB/s, best of a few.
 fn bench_ddr5() -> f64 {
 	let bytes = 1usize << 30;
 	let mut src = vec![0u8; bytes];
@@ -296,9 +300,41 @@ fn bench_ddr5() -> f64 {
 	bytes as f64 / best / 1e9
 }
 
-/// The disk device's ONE home: ~/.cache/recipe — the probe measures THIS
-/// filesystem and the runtime spills to it, so SIZE/SATA are the numbers the
-/// scheduler's disk tier actually gets, independent of the process cwd.
+fn bench_cpu_read() -> f64 {
+	let bytes = 1usize << 30;
+	let mut buf = vec![0u8; bytes];
+	par_touch(&mut buf);
+	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let per = bytes.div_ceil(threads);
+	let base = buf.as_ptr() as usize;
+	let mut best = f64::INFINITY;
+	for _ in 0..5 {
+		let t = Instant::now();
+		let sum: u64 = std::thread::scope(|sc| {
+			let handles: Vec<_> = (0..threads)
+				.map(|k| {
+					sc.spawn(move || {
+						let off = k * per;
+						if off >= bytes {
+							return 0u64;
+						}
+						let len = per.min(bytes - off);
+						let mut acc = 0u64;
+						for i in (off..off + len).step_by(64) {
+							acc = acc.wrapping_add(unsafe { std::ptr::read_volatile((base + i) as *const u8) } as u64);
+						}
+						acc
+					})
+				})
+				.collect();
+			handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+		});
+		std::hint::black_box(sum);
+		best = best.min(t.elapsed().as_secs_f64());
+	}
+	bytes as f64 / best / 1e9
+}
+
 pub fn data_dir() -> std::path::PathBuf {
 	let base = std::env::var("XDG_CACHE_HOME")
 		.map(std::path::PathBuf::from)
@@ -310,12 +346,7 @@ pub fn data_dir() -> std::path::PathBuf {
 	dir
 }
 
-// One f64 FMA per iter across all cores; black_box the operand so the chain is
-// not folded away. 2 flops per FMA.
 fn bench_cpu_flops() -> f64 {
-	// 8 independent FMA lanes per thread: a single serial chain measures FMA
-	// LATENCY (one op waiting on the last); independent lanes fill the pipeline
-	// and vectorize, measuring the compute the scheduler can actually buy.
 	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 	let iters: u64 = 100_000_000;
 	let t = Instant::now();
@@ -331,8 +362,6 @@ fn bench_cpu_flops() -> f64 {
 					let c = std::hint::black_box(0.0000001_f64);
 					for _ in 0..iters {
 						for l in lanes.iter_mut() {
-							// plain mul+add: baseline x86-64 has no FMA instruction, so
-							// mul_add is a libm CALL — this vectorizes, that doesn't.
 							*l = *l * b + c;
 						}
 					}
@@ -347,8 +376,6 @@ fn bench_cpu_flops() -> f64 {
 	flops / t.elapsed().as_secs_f64() / 1e9
 }
 
-// Write+read 256 MiB with the page cache dropped between, so the read is a real
-// disk read. SATA = that sustained read GB/s.
 fn bench_disk(dir: &Path) -> Result<f64> {
 	let bytes = 256usize << 20;
 	let mut buf = vec![0u8; bytes];
@@ -374,7 +401,6 @@ fn bench_disk(dir: &Path) -> Result<f64> {
 	Ok(read_gbs)
 }
 
-// Force the range to disk and drop it from cache — the probe file is never hot.
 fn drop_cache(f: &File, off: u64, len: usize) {
 	use std::os::unix::io::AsRawFd;
 	unsafe {
@@ -390,38 +416,39 @@ fn drop_cache(f: &File, off: u64, len: usize) {
 	}
 }
 
-// ── config.ogdl registry ─────────────────────────────────────────────────────
-// The tab-nested OGDL tree — the human-readable source of truth. Sizes are raw
-// bytes (exact, round-trips); rates are GB/s (GFLOP/s for FLOPs). A GPU-less
-// machine emits no gpu block.
 pub fn write_config(machines: &[Machine]) -> String {
 	let mut s = String::from("machines\n");
 	for m in machines {
 		s.push_str(&format!("\t{}\n", m.host));
+		s.push_str("\t\tETH\n");
+		s.push_str(&format!("\t\t\t{}\t{:.3}\n", eth_label(m.eth_gbs), m.eth_gbs));
+		s.push_str("\t\tDISK\n");
+		s.push_str(&format!("\t\t\tSIZE\t{}\n", m.disk_size));
+		s.push_str(&format!("\t\t\tSATA\t{:.3}\n", m.sata_gbs));
 		for (i, g) in m.gpus.iter().enumerate() {
-			s.push_str(&format!("\t\tgpu{i}\n"));
+			s.push_str(&format!("\t\tGPU{i}\n"));
 			s.push_str(&format!("\t\t\tVRAM\t{}\n", g.vram));
 			s.push_str(&format!("\t\t\tPCIe\t{:.3}\n", g.pcie_gbs));
 			s.push_str(&format!("\t\t\tFLOPs\t{:.1}\n", g.flops_gflops));
 			s.push_str(&format!("\t\t\tTransfer\t{:.3}\n", g.transfer_gbs));
 		}
-		s.push_str("\t\tcpu\n");
+		s.push_str("\t\tCPU\n");
 		s.push_str(&format!("\t\t\tRAM\t{}\n", m.ram));
 		s.push_str(&format!("\t\t\tDDR5\t{:.3}\n", m.ddr5_gbs));
 		s.push_str(&format!("\t\t\tFLOPs\t{:.1}\n", m.cpu_gflops));
-		s.push_str("\t\tdisk\n");
-		s.push_str(&format!("\t\t\tSIZE\t{}\n", m.disk_size));
-		s.push_str(&format!("\t\t\tSATA\t{:.3}\n", m.sata_gbs));
+		s.push_str(&format!("\t\t\tTransfer\t{:.3}\n", m.cpu_transfer_gbs));
 	}
+	s.push_str("schema\n");
+	s.push_str("\tsizes\tbytes\n");
+	s.push_str("\tbandwidths\tGB/s\n");
+	s.push_str("\tFLOPs\tGFLOP/s\n");
 	s
 }
 
-// Read the tree back into device tables (the scheduler's view). Depth is the
-// leading-tab count; a field line is `key<ws>value` (value never has interior
-// whitespace here). Malformed lines are skipped — a partial file is not fatal.
 pub fn parse_config(text: &str) -> Vec<Machine> {
 	enum Sect {
 		None,
+		Eth,
 		Gpu(usize),
 		Cpu,
 		Disk,
@@ -429,14 +456,25 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 	let mut machines: Vec<Machine> = Vec::new();
 	let mut cur: Option<Machine> = None;
 	let mut sect = Sect::None;
+	let mut in_schema = false;
 	for raw in text.lines() {
 		if raw.trim().is_empty() {
+			continue;
+		}
+		if in_schema {
 			continue;
 		}
 		let depth = raw.chars().take_while(|c| *c == '\t').count();
 		let line = raw.trim_start_matches('\t');
 		match depth {
-			0 => {} // "machines" root
+			0 => {
+				if line.trim() == "schema" {
+					if let Some(m) = cur.take() {
+						machines.push(m);
+					}
+					in_schema = true;
+				}
+			}
 			1 => {
 				if let Some(m) = cur.take() {
 					machines.push(m);
@@ -446,16 +484,20 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 					gpus: Vec::new(),
 					ram: 0,
 					ddr5_gbs: 0.0,
+					cpu_transfer_gbs: 0.0,
 					cpu_gflops: 0.0,
 					disk_size: 0,
 					sata_gbs: 0.0,
+					eth_gbs: 0.0,
 				});
 				sect = Sect::None;
 			}
 			2 => {
-				let name = line.trim();
+				let name = line.trim().to_ascii_lowercase();
 				if let Some(m) = cur.as_mut() {
-					if name == "cpu" {
+					if name == "eth" {
+						sect = Sect::Eth;
+					} else if name == "cpu" {
 						sect = Sect::Cpu;
 					} else if name == "disk" {
 						sect = Sect::Disk;
@@ -477,6 +519,7 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 				let v = v.trim();
 				let Some(m) = cur.as_mut() else { continue };
 				match sect {
+					Sect::Eth => m.eth_gbs = v.parse().unwrap_or(0.0),
 					Sect::Gpu(i) => {
 						if let Some(g) = m.gpus.get_mut(i) {
 							match k {
@@ -492,6 +535,7 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 						"RAM" => m.ram = v.parse().unwrap_or(0),
 						"DDR5" => m.ddr5_gbs = v.parse().unwrap_or(0.0),
 						"FLOPs" => m.cpu_gflops = v.parse().unwrap_or(0.0),
+						"Transfer" => m.cpu_transfer_gbs = v.parse().unwrap_or(0.0),
 						_ => {}
 					},
 					Sect::Disk => match k {
@@ -522,7 +566,6 @@ pub fn config_path() -> Result<PathBuf> {
 	Ok(config_dir()?.join("config.ogdl"))
 }
 
-/// Rewrite config.ogdl atomically (temp + rename), creating parents.
 pub fn write_config_atomic(machines: &[Machine]) -> Result<()> {
 	let path = config_path()?;
 	if let Some(parent) = path.parent() {
@@ -534,13 +577,10 @@ pub fn write_config_atomic(machines: &[Machine]) -> Result<()> {
 	Ok(())
 }
 
-// ── systemd unit + install ───────────────────────────────────────────────────
-/// The .ogdl → .service converter. Today the unit is the owner's fixed sample
-/// (the config is the input so a future version can template limits from it).
 pub fn service_unit(_config_ogdl: &str) -> String {
 	[
 		"[Unit]",
-		"Description=recipe distributed training node",
+		"Description=recipe RPC daemon",
 		"After=network-online.target",
 		"Wants=network-online.target",
 		"",
@@ -561,9 +601,6 @@ fn service_path() -> Result<PathBuf> {
 	Ok(PathBuf::from(home).join(".config/systemd/user/recipe.service"))
 }
 
-/// `recipe install`: write this machine's config.ogdl entry, generate the
-/// systemd user unit from it, and copy the running binary to ~/.local/bin.
-/// A permission failure on the system path is loud with the exact sudo command.
 pub fn install(machine: &Machine) -> Result<()> {
 	let cfg_text = write_config(std::slice::from_ref(machine));
 	write_config_atomic(std::slice::from_ref(machine))?;
@@ -582,7 +619,6 @@ pub fn install(machine: &Machine) -> Result<()> {
 	std::fs::create_dir_all(&bin_dir).map_err(|e| anyhow::anyhow!("recipe install: mkdir {}: {e}", bin_dir.display()))?;
 	let dest = bin_dir.join("recipe");
 	let dest = dest.as_path();
-	// Running FROM the install path: nothing to copy (self-copy is ETXTBSY).
 	if std::fs::canonicalize(&exe).ok() == std::fs::canonicalize(dest).ok() {
 		eprintln!("recipe install: {} is already the installed binary", dest.display());
 		return Ok(());
@@ -611,14 +647,14 @@ mod tests {
 			gpus,
 			ram: 67_169_726_464,
 			ddr5_gbs: 38.4,
+			cpu_transfer_gbs: 42.5,
 			cpu_gflops: 89.2,
 			disk_size: 500_107_862_016,
 			sata_gbs: 1.9,
+			eth_gbs: 0.125,
 		}
 	}
 
-	// Host-only: the compact beacon line round-trips a Machine EXACTLY (full f64
-	// precision), including the GPU-less shape (empty gpus, absence not zeros).
 	#[test]
 	fn beacon_roundtrips_exact() {
 		let m = sample(vec![GpuDev {
@@ -635,8 +671,6 @@ mod tests {
 		assert_eq!(back, storage);
 	}
 
-	// Host-only: the OGDL tree round-trips at its written precision (values chosen
-	// to survive {:.3}/{:.1}). A GPU-less machine emits and parses back no gpu block.
 	#[test]
 	fn config_ogdl_roundtrips() {
 		let a = sample(vec![GpuDev {
@@ -649,9 +683,45 @@ mod tests {
 		b.host = "archy".to_string();
 		let text = write_config(&[a.clone(), b.clone()]);
 		let parsed = parse_config(&text);
-		assert_eq!(parsed.len(), 2);
+		assert_eq!(parsed.len(), 2, "trailing schema block must not parse as a host");
 		assert_eq!(parsed[0], a);
 		assert_eq!(parsed[1], b);
 		assert!(parsed[1].gpus.is_empty());
+	}
+
+	#[test]
+	fn config_emits_eth_transfer_schema() {
+		let m = sample(vec![GpuDev {
+			vram: 12_884_901_888,
+			pcie_gbs: 11.581,
+			flops_gflops: 254.7,
+			transfer_gbs: 402.3,
+		}]);
+		let text = write_config(&[m]);
+		assert!(text.contains("\t\tETH\n"), "ETH section present");
+		assert!(text.contains("\t\t\t1GbE\t0.125\n"), "ETH link line present");
+		assert!(text.contains("\t\tGPU0\n"), "uppercase GPU0 section");
+		assert!(text.contains("\t\tCPU\n"), "uppercase CPU section");
+		assert!(text.contains("\t\tDISK\n"), "uppercase DISK section");
+		assert!(text.contains("\t\t\tDDR5\t38.400\n"), "CPU DDR5 line");
+		assert!(text.contains("\t\t\tTransfer\t42.500\n"), "CPU Transfer line");
+		assert!(text.trim_end().ends_with("FLOPs\tGFLOP/s"), "schema is the trailing block");
+		let (eth, disk, gpu, cpu) = (
+			text.find("\t\tETH\n").unwrap(),
+			text.find("\t\tDISK\n").unwrap(),
+			text.find("\t\tGPU0\n").unwrap(),
+			text.find("\t\tCPU\n").unwrap(),
+		);
+		assert!(eth < disk && disk < gpu && gpu < cpu, "tier order ETH<DISK<GPU<CPU");
+	}
+
+	#[test]
+	fn service_unit_is_canonical() {
+		let u = service_unit("");
+		assert!(u.contains("Description=recipe RPC daemon"));
+		assert!(u.contains("ExecStart=%h/.local/bin/recipe serve"));
+		assert!(u.contains("WantedBy=default.target"));
+		assert!(!u.contains("User="), "user unit needs no User=");
+		assert!(!u.contains("LD_LIBRARY_PATH"), "no machine-specific env baked in");
 	}
 }
