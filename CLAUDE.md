@@ -28,7 +28,7 @@ cargo build --release                    # thin LTO, links ROCm
 cargo test all                           # THE suite: every test in every crate, one OS process per
                                          #   test, 60s SIGKILL deadline each (kill = that test's FAIL,
                                          #   suite continues), single log at suite.log, verdict:
-                                         #   rg '\[FAIL\]' suite.log   (SUITE SPEC v3; tests/all.rs)
+                                         #   rg '^FAIL' suite.log   (SUITE SPEC v3; tests/all.rs)
 cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
 cargo test -p gpu-core --release --test suite   # kernel proof suite alone (target renamed from `all`;
                                          #   no test id may contain substring "all" — cargo filter)

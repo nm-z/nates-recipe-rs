@@ -29,7 +29,7 @@ cargo test all                           # THE suite (SUITE SPEC v3): every test
                                          #   OS process per test, 60s SIGKILL deadline each = that
                                          #   test's FAIL (suite continues), device-health probe after
                                          #   any crash/kill, one log: suite.log; verdict:
-                                         #   rg '\[FAIL\]' suite.log
+                                         #   rg '^FAIL' suite.log
 cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
 cargo test -p recipe model::metric_gpu_tests::   # GPU metric/gradient tests
 cargo test -p gpu-core --release --test suite    # kernel proof suite (tests/suite/: inventory_proof,

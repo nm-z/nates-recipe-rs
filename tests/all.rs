@@ -73,9 +73,13 @@ struct Log {
 }
 
 impl Log {
-      fn line(&mut self, s: &str) {
+      fn file(&mut self, s: &str) {
             writeln!(self.f, "{s}").expect("suite.log write");
             self.f.flush().expect("suite.log flush");
+      }
+
+      fn line(&mut self, s: &str) {
+            self.file(s);
             errline(s);
       }
 }
@@ -191,12 +195,13 @@ fn run() -> i32 {
       }
       tests.sort_by(|a, b| a.id.cmp(&b.id));
       let discovered = tests.len();
+      let width = tests.iter().map(|t| t.id.len()).max().unwrap_or(0);
 
       let mut log = Log {
             f: File::create(Path::new(ROOT).join("suite.log")).expect("create suite.log"),
       };
       let head = format!("[S] discovered={} binaries={}", discovered, binaries.len());
-      log.line(&head);
+      log.file(&head);
       out(&head);
       let mut tally = Tally { discovered, passed: 0, failed: 0, unattempted: 0 };
       if discovered == 0 {
@@ -219,7 +224,7 @@ fn run() -> i32 {
       let mut test_secs = 0.0f64;
 
       let ended = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            dispatch(&mut log, &probe, &tests, &known, &mut done, &mut tally, &mut test_secs)
+            dispatch(&mut log, &probe, &tests, &known, &mut done, &mut tally, &mut test_secs, width)
       }));
       let abort = match ended {
             Ok(Some(reason)) => reason,
@@ -230,7 +235,7 @@ fn run() -> i32 {
                   reason
             }
       };
-      fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort));
+      fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort), width);
       finish(&mut log, &tally, t0, dispatch_t0, test_secs)
 }
 
@@ -242,6 +247,7 @@ fn dispatch(
       done: &mut [bool],
       tally: &mut Tally,
       test_secs: &mut f64,
+      width: usize,
 ) -> Option<String> {
       let mut prev_violent: Option<String> = None;
       let mut rerun: Vec<(usize, Attempt, String)> = Vec::new();
@@ -249,7 +255,8 @@ fn dispatch(
 
       for (i, t) in tests.iter().enumerate() {
             if t.ignored {
-                  log.line(&format!("[FAIL] {} 0.0 ignored", t.id));
+                  log.line(&test_line("FAIL", &t.id, 0.0, width));
+                  log.line("     ignored");
                   tally.failed += 1;
                   done[i] = true;
                   prev_violent = None;
@@ -272,7 +279,7 @@ fn dispatch(
                   }
                   continue;
             }
-            record(log, &t.id, &att, tally, test_secs, None);
+            record(log, t, width, &att, tally, test_secs, None);
             done[i] = true;
             prev_violent = if violent { Some(t.id.clone()) } else { None };
             if violent && !probe_ok(probe) {
@@ -292,7 +299,7 @@ fn dispatch(
                   }
                   let att = run_test(t);
                   let violent = matches!(att.outcome, Outcome::Signal(_) | Outcome::Deadline);
-                  record(log, &t.id, &att, tally, test_secs, Some((first, culprit.as_str())));
+                  record(log, t, width, &att, tally, test_secs, Some((first, culprit.as_str())));
                   done[*i] = true;
                   if violent && !probe_ok(probe) {
                         abort = Some(poison(log, &t.id));
@@ -312,10 +319,11 @@ fn oneline(s: &str) -> String {
       s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str) {
+fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str, width: usize) {
       for (i, t) in tests.iter().enumerate() {
             if !done.get(i).copied().unwrap_or(false) {
-                  log.line(&format!("[FAIL] {} 0.0 not-attempted {abort}", t.id));
+                  log.line(&test_line("FAIL", &t.id, 0.0, width));
+                  log.line(&format!("     not attempted: {abort}"));
                   tally.unattempted += 1;
             }
       }
@@ -353,40 +361,72 @@ fn settled_holders(log: &mut Log, known: &[i32]) -> Vec<i32> {
 
 fn record(
       log: &mut Log,
-      id: &str,
+      t: &Test,
+      width: usize,
       att: &Attempt,
       tally: &mut Tally,
       test_secs: &mut f64,
       first_try: Option<(&Attempt, &str)>,
 ) {
       *test_secs += att.secs;
-      let mut k = 0usize;
       match &att.outcome {
             Outcome::Pass => {
-                  log.line(&format!("[PASS] {} {:.1}", id, att.secs));
+                  log.line(&test_line("PASS", &t.id, att.secs, width));
                   tally.passed += 1;
             }
-            o => {
-                  log.line(&format!("[FAIL] {} {:.1} {}", id, att.secs, reason(o)));
+            _ => {
+                  log.line(&test_line("FAIL", &t.id, att.secs, width));
                   tally.failed += 1;
-                  for line in &att.capture {
-                        k += 1;
-                        log.line(&format!("[E{k}] {line}"));
+                  for line in details(&t.name, att) {
+                        log.line(&format!("     {line}"));
                   }
             }
       }
       if let Some((first, culprit)) = first_try {
-            k += 1;
             log.line(&format!(
-                  "[E{k}] first-try: FAIL {:.1} {} suspect-contamination culprit={culprit}",
+                  "     first try: FAIL {:.1}s {} suspect-contamination culprit={culprit}",
                   first.secs,
                   reason(&first.outcome)
             ));
-            for line in &first.capture {
-                  k += 1;
-                  log.line(&format!("[E{k}] first-try: {line}"));
+            for line in capture_lines(&t.name, &first.capture) {
+                  log.line(&format!("     first try: {line}"));
             }
       }
+}
+
+fn test_line(verdict: &str, id: &str, secs: f64, width: usize) -> String {
+      format!("{verdict} {id:<width$} {dur:>5}", dur = format!("{secs:.1}s"))
+}
+
+fn details(name: &str, att: &Attempt) -> Vec<String> {
+      let mut lines = capture_lines(name, &att.capture);
+      match &att.outcome {
+            Outcome::Signal(_) | Outcome::Deadline => lines.insert(0, reason(&att.outcome)),
+            _ if lines.is_empty() => lines.push(reason(&att.outcome)),
+            _ => {}
+      }
+      lines
+}
+
+fn capture_lines(name: &str, capture: &[String]) -> Vec<String> {
+      capture
+            .iter()
+            .filter(|l| !boilerplate(name, l))
+            .map(|l| l.trim_end().to_owned())
+            .collect()
+}
+
+fn boilerplate(name: &str, line: &str) -> bool {
+      let t = line.trim();
+      t.is_empty()
+            || t == name
+            || t == "failures:"
+            || t.starts_with("running ")
+            || (t.starts_with("test ") && t.contains(" ... "))
+            || t.starts_with("test result:")
+            || t.starts_with("note: run with `RUST_BACKTRACE")
+            || (t.starts_with("---- ") && t.ends_with(" ----"))
+            || (t.starts_with("thread '") && t.contains("panicked at"))
 }
 
 fn reason(o: &Outcome) -> String {
@@ -430,9 +470,6 @@ fn finish(
                   tally.ran()
             ));
       }
-      if tally.failed_total() > 0 {
-            faults.push(format!("{} tests FAILED", tally.failed_total()));
-      }
       match std::fs::read_to_string(Path::new(ROOT).join("suite.log")) {
             Ok(text) => {
                   if let Some(bad) = text.lines().find(|l| !grammar_ok(l)) {
@@ -443,36 +480,57 @@ fn finish(
       }
       let code = if faults.is_empty() && tally.green() { 0 } else { 1 };
       for f in &faults {
-            log.line(&format!("[S] FAIL: {f}"));
+            log.file(&format!("[S] FAIL: {f}"));
+            out(&format!("FAIL: {f}"));
       }
-      let tail = format!(
+      log.file(&format!(
             "[S] passed={} failed={} unattempted={} discovered={} wall={wall:.1}s overhead={:.1}s exit={code}",
             tally.passed,
             tally.failed,
             tally.unattempted,
             tally.discovered,
             wall - test_secs
-      );
-      log.line(&tail);
-      for f in &faults {
-            out(&format!("FAIL: {f}"));
+      ));
+      let mut summary = format!("{}/{} passed.", tally.passed, tally.discovered);
+      if tally.failed_total() > 0 {
+            summary.push_str(&format!(" {} FAILED.", tally.failed_total()));
       }
-      out(&tail);
+      log.file("");
+      log.file(&summary);
+      out("");
+      out(&summary);
       code
 }
 
 fn grammar_ok(line: &str) -> bool {
-      if line.starts_with("[S] ") || line.starts_with("[PASS] ") || line.starts_with("[FAIL] ") {
+      if line.is_empty()
+            || line.starts_with("[S] ")
+            || line.starts_with("PASS ")
+            || line.starts_with("FAIL ")
+      {
             return true;
       }
-      if let Some(rest) = line.strip_prefix("[E") {
-            if let Some(close) = rest.find(']') {
-                  return close > 0
-                        && rest[..close].bytes().all(|b| b.is_ascii_digit())
-                        && (rest[close + 1..].starts_with(' ') || rest[close + 1..].is_empty());
-            }
+      if let Some(rest) = line.strip_prefix("     ") {
+            return !rest.trim().is_empty();
       }
-      false
+      summary_ok(line)
+}
+
+fn summary_ok(line: &str) -> bool {
+      let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+      let Some((frac, rest)) = line.split_once(" passed.") else {
+            return false;
+      };
+      let Some((p, d)) = frac.split_once('/') else {
+            return false;
+      };
+      if !digits(p) || !digits(d) {
+            return false;
+      }
+      match rest.strip_prefix(' ').and_then(|r| r.strip_suffix(" FAILED.")) {
+            None => rest.is_empty(),
+            Some(n) => digits(n),
+      }
 }
 
 fn await_kfd_teardown(pid: u32) {
