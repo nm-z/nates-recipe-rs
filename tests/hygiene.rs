@@ -967,3 +967,28 @@ fn h33_single_log_file() {
             assert_absent("multiple .log files in repo root", &hits);
       }
 }
+
+#[test]
+fn h34_no_recursive_symlinks() {
+      let out = std::process::Command::new("sh")
+            .args(["-c", "find -L . -maxdepth 20 -name '__nofile__' 2>&1 | rg -q 'loop'"])
+            .current_dir(ROOT)
+            .output()
+            .expect("spawn find");
+      assert!(!out.status.success(), "FAIL: recursive symlink");
+}
+
+#[test]
+fn h35_no_binary_self_copies() {
+      let out = std::process::Command::new("rg")
+            .args(["-n", r"copy.*exe|\.local/bin|install.*recipe", "src/", "--type", "rust"])
+            .current_dir(ROOT)
+            .output()
+            .expect("spawn rg");
+      let hits: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.contains("test"))
+            .map(|l| l.trim().to_owned())
+            .collect();
+      assert_absent("binary self-copy", &hits);
+}
