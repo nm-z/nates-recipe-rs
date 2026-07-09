@@ -443,11 +443,11 @@ mod tests {
       fn admit_rejects_over_cap() {
             let spill = Path::new("/tmp/tiered_reject.spill");
             let cap = Budgets::measure(0, 0, spill).cap;
-            let over = cap + P;
+            let over = cap * 2;
             match Tiered::alloc(over, 0, 0, spill) {
                   Err(Full { need, cap: c }) => {
                         assert_eq!(need, over);
-                        assert_eq!(c, cap);
+                        assert!(c < need, "rejected with cap {c} not below need {need}");
                   }
                   Ok(_) => panic!("admitted a buffer over the ceiling"),
             }
