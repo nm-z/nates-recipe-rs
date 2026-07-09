@@ -173,7 +173,11 @@ Detection logic contains **zero picked numeric thresholds** — every such const
 
 Trainer lives in `examples/train_detector.rs` (corpus + labels don't ship in the library). Retraining gotchas: (1) on a corpus change, delete `pantry/detector.ogdl` first — the best-only save guard blocks incomparable scores; (2) `include_str!` bakes weights at compile time — rebuild after training. Current weights: train 0.957 / held-out 0.934 on the expanded corpus (wide numeric files are column-sampled so one file can't flood the Numeric class; it overfits past ~10k epochs — don't chase the last points with more epochs).
 
-### 5.2 Directory loading & the hash join
+### 5.2 Delimiter sniffing
+
+The separator is a property of the file, never an argument — `Data::load` takes no delimiter and never will. `sniff_delimiter` reads the first two records, parses them quote-aware at each of `;` `\t` `,`, and keeps the delimiters that yield the SAME field count on both rows with width > 1; the widest wins. A table has equal fields on every row, so steadiness identifies the separator where counting cannot: `uci-sms-tab/SMSSpamCollection` is a TSV whose message text carries commas (tab 2,2 vs comma 2,1), and `id,"a;b;c;d;e;f",z` is a comma CSV that raw counting would shatter on `;` (comma 3,3 vs semicolon 6,1). When nothing is steady — one record, one column, ragged rows — the first-line majority count decides, ties to comma. Both `csv::ReaderBuilder` sites sniff (`read_raw_csv`, which funnels file/dir/zip loading, and `detect.rs::prefix_columns`), so column-type detection and encoding can never disagree about a file's shape. ARFF is exempt: `@data` rows and `{a,b,c}` nominal specs are comma-delimited by the format, so `split_fields` stays comma.
+
+### 5.3 Directory loading & the hash join
 
 `load_dir_groups` parses a directory into GROUPS by file type (`feature_group` = part after `__` in the filename, or the extension). CSVs within a group STACK rows (rows = samples; no collapse, no aggregation, ever). A single file = one un-grouped Table. Raw string cells are kept; typing + encoding happen later once roles are known.
 
@@ -183,7 +187,7 @@ Trainer lives in `examples/train_detector.rs` (corpus + labels don't ship in the
 
 Target resolution: explicit `.target` wins; else if a test file exists and exactly one table column is train-only, that's the target; else None.
 
-### 5.3 Encoding
+### 5.4 Encoding
 
 - Numeric → passthrough (blank/unparseable → NaN).
 - Categorical FEATURE → one-hot `col=cat` (categories inferred from the train set; test reuses them BY NAME, not position).
@@ -191,11 +195,11 @@ Target resolution: explicit `.target` wins; else if a test file exists and exact
 - Text / high-cardinality → feature hashing: tokenize → hash mod D → fixed-width D-vector of counts. One-hot is the special case where the vocab fits D. High-cardinality columns are never excluded, never collapsed to a frequency column, never cardinality-capped — the fix for a too-big matrix is a clean failure naming the size and culprit columns.
 - Temporal → days.
 
-### 5.4 NaN policy — one adapter
+### 5.5 NaN policy — one adapter
 
 All NaN VALUE-policy lives in `pantry::encode::nan_clean(v, strategy, name)` (`enum Nan { Drop, ImputeMean, Error }`), invoked once per column-vector by `clean_dataset` at `Data::prepare`: features → ImputeMean, targets → Drop (a missing label can't be invented). After it the matrix has no NaN; nothing downstream handles NaN. The missing→NaN *producers* (parse/join/image) are data representation, not policy — they stay. GPU `has_nan`/`isfinite_all` are test-only diagnostics.
 
-### 5.5 RAM guard
+### 5.6 RAM guard
 
 `pantry::available_ram_bytes`-based guard panics if the projected parse exceeds 90% of available memory (`libc::malloc_trim(0)` runs first so glibc-retained pages don't skew it). Corpus measurement lesson: encoding bloat is usually concentrated in one pathological file, not systemic — measure (per-file f64-matrix projection) before generalizing any fix.
 
