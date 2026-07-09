@@ -1,19 +1,12 @@
-//! OGDL — an indentation-defined tree. Public API is FOUR methods on the graph
-//! handle: `itnl`, `file`, `add`, `del`, reachable three ways (a static `ogdl`,
-//! the `Ogdl::file` constructor, or the free `ogdl::file`). The methods are
-//! INHERENT on the handle, so no trait import is needed to chain them. Values are
-//! child nodes; whitespace is the separator; the writer uses a 4-space indent.
-//! Tabs and spaces (and legacy `=`) are accepted on read.
+//! OGDL — an indentation tree. Four inherent methods (`itnl`/`file`/`add`/`del`) on a
+//! shared `Graph` handle; three import styles; whitespace-separated, 4-space on write.
 #![allow(non_upper_case_globals)]
 
 use std::fmt;
 use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
 
-// ── Node ─────────────────────────────────────────────────────────────────────
-// The tree. A node's "value" is its child node(s): `VRAM 12` is a node named
-// VRAM with one child named 12. Fields are public and `Index<usize>` walks the
-// children — that is the whole read/traverse surface (no getter methods).
+// A node's value is its child node(s) (`VRAM 12` = node VRAM, child 12); fields + Index read it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
       pub name: String,
@@ -29,9 +22,7 @@ impl Node {
             self.children.is_empty()
       }
 
-      // ── parse: indentation tree; tokens after the first are leaf children ──
-      // Depth by leading-whitespace width on a stack (tabs or spaces, internally
-      // consistent per file). A legacy `=` is treated as the first separator.
+      // Indentation tree; tokens after the first are leaf children; legacy `=` is the first separator.
       pub(crate) fn parse(text: &str) -> Node {
             let mut root = Node::leaf("");
             let mut path: Vec<usize> = Vec::new();
@@ -68,9 +59,7 @@ impl Node {
             n
       }
 
-      // ── path selectors (OGDL spec): a.b  a.1  a.b{n}  a.b{}  a[n] ──
-      // `{n}`/`[n]` are 1-indexed per the OGDL path spec (n-1'th subnode). `{}`
-      // is handled by the `del!` macro. Returns the FIRST match here.
+      // Path selectors `a.b`, `a.1`, `a.b{n}`, `a.b{}`, `a[n]` (1-indexed); returns the first match.
       pub(crate) fn select(&self, path: &str) -> Option<&Node> {
             let mut cur = self;
             for seg in path.split('.').filter(|s| !s.is_empty()) {
@@ -120,8 +109,7 @@ impl Node {
             self.children.iter().position(|c| c.name == seg)
       }
 
-      // ── writer: 4-space indent. All-leaf children go inline (`VRAM 12`);
-      // otherwise each child nests on its own line (order preserved → lossless).
+      // 4-space indent; all-leaf children go inline (`VRAM 12`), else nested (order preserved).
       fn write_to(&self, out: &mut String, depth: usize) {
             for c in &self.children {
                   for _ in 0..depth {
@@ -148,7 +136,7 @@ impl Node {
       }
 }
 
-// `a[2]` — positional child access, verbatim as the spec's Index impl.
+// `a[2]` — positional child access.
 impl std::ops::Index<usize> for Node {
       type Output = Node;
       fn index(&self, i: usize) -> &Node {
@@ -156,9 +144,7 @@ impl std::ops::Index<usize> for Node {
       }
 }
 
-// A node's Display is its VALUE: the leaf children joined by spaces (what
-// `println!("{}", ogdl.itnl("engi.GPU0.VRAM"))` prints). File serialization uses
-// `serialize`, not Display, so the two never collide.
+// Display = the node's value (leaf children joined by space); file I/O uses `serialize`.
 impl fmt::Display for Node {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let vals: Vec<&str> = self.children.iter().filter(|c| c.is_leaf()).map(|c| c.name.as_str()).collect();
@@ -166,11 +152,8 @@ impl fmt::Display for Node {
       }
 }
 
-// ── graph storage ────────────────────────────────────────────────────────────
-// A `Graph` is a shared handle to one tree (`Arc<Mutex<Node>>`). Cloning a handle
-// shares the tree; when the LAST handle drops, the tree is freed — there is no
-// global slab that accumulates. Every method takes `&self` and hands back a fresh
-// (shared) handle for chaining, and the same handle stays usable after `.add()`.
+// A `Graph` is a shared handle (`Arc<Mutex<Node>>`): clone shares the tree, the last drop
+// frees it; methods take `&self` and return a fresh shared handle for chaining.
 #[derive(Clone)]
 pub struct Graph {
       root: Arc<Mutex<Node>>,
@@ -188,30 +171,24 @@ impl Graph {
 }
 
 /// The process-wide default graph — import style 1 (`use ogdl::*; ogdl.file(..)`).
-/// A single persistent tree; lazily created, never accumulates.
 pub static ogdl: LazyLock<Graph> = LazyLock::new(Graph::empty);
 
-/// Constructor namespace — import style 2 (`Ogdl::file("g.ogdl")`). Distinct from
-/// the handle so the associated `file` constructor and the chaining `file` method
-/// can share the name without colliding.
+/// Constructor namespace for import style 2 (`Ogdl::file("g.ogdl")`).
 pub struct Ogdl;
 
 impl Ogdl {
-      /// Read a file into a NEW graph and return its handle.
+      /// Read a file into a new graph.
       pub fn file(path: &str) -> Graph {
             Graph::read(path)
       }
 }
 
-/// The free-function entry point — import style 3 (`ogdl::file("g.ogdl")`).
+/// Free-function entry point — import style 3 (`ogdl::file("g.ogdl")`).
 pub fn file(path: &str) -> Graph {
       Graph::read(path)
 }
 
-// ── itnl argument dispatch ───────────────────────────────────────────────────
-// `itnl(())` returns the handle (chain on to `.file`), `itnl("a.b")` selects and
-// returns the Node there (Display = its value; `.children`/Index to traverse),
-// `itnl(node/handle)` binds that graph as the handle's tree.
+// itnl dispatch: `()` → handle, `"a.b"` → the Node there, `node`/`handle` → bind.
 pub trait ItnlArg {
       type Out;
       fn apply(self, g: Graph) -> Self::Out;
@@ -228,9 +205,7 @@ impl ItnlArg for &str {
       type Out = Node;
       fn apply(self, g: Graph) -> Node {
             g.with(|root| {
-                  // Return the selected subtree tagged with the path it was found
-                  // at, so it can be handed straight to add/del as a locatable
-                  // target. Display uses the children (the value), not this name.
+                  // tag the returned subtree with its path so add/del can locate it
                   let mut n = root.select(self).cloned().unwrap_or_default();
                   n.name = self.to_string();
                   n
@@ -255,9 +230,7 @@ impl ItnlArg for Node {
       }
 }
 
-// ── del argument dispatch ────────────────────────────────────────────────────
-// `del(a[2])` / `del(&node)` (positional/by-node), `del(("1", &a))` (name under a
-// node), `del!(g, a.b{})` (all matching, via the macro).
+// del dispatch: `a[2]`/`&node` (by node), `("1", &a)` (name under node), `del!` (all matching).
 pub trait DelArg {
       fn apply(self, g: Graph);
 }
@@ -287,16 +260,12 @@ impl DelArg for &Node {
       }
 }
 
-// ── add value dispatch ───────────────────────────────────────────────────────
-// A value becomes leaf child node(s): a scalar → one child, a Vec → one per
-// element. This is the whole reason the crate can serialize weights/scalars/
-// strings directly (`ogdl.add(0.0312, "z1.w")`) — no bespoke checkpoint codec.
+// A value becomes leaf child node(s) — this is how weights/scalars/strings serialize.
 pub trait Value {
       fn into_nodes(self) -> Vec<Node>;
 }
 
-// One macro instead of a dozen near-identical impls: scalars via Display, strings
-// via AsRef<str>, and vectors element-wise (Display for floats, leaf for strings).
+// One macro instead of a dozen impls: scalars via Display, strings via AsRef, vectors element-wise.
 macro_rules! value {
       (scalar: $($t:ty),*) => {$( impl Value for $t {
             fn into_nodes(self) -> Vec<Node> { vec![Node::leaf(&self.to_string())] }
@@ -316,8 +285,7 @@ value!(str: &str, String, &String);
 value!(floats: Vec<f64>, &[f64]);
 value!(strs: Vec<String>, &[String]);
 
-// Navigate `path` (dot-separated names), creating any missing node along the way,
-// and return the target for children to be appended under.
+// Navigate/create `path` (dot-separated names), returning the target to append children under.
 fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
       let mut cur = root;
       for seg in path.split('.').filter(|s| !s.is_empty()) {
@@ -333,7 +301,7 @@ fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
       cur
 }
 
-// ── the four methods (inherent — no trait import to chain) ───────────────────
+// The four methods, inherent on the handle.
 impl Graph {
       fn read(path: &str) -> Graph {
             let g = Graph::empty();
@@ -351,8 +319,7 @@ impl Graph {
             a.apply(self.clone())
       }
 
-      /// Read an empty graph in / write a populated graph out — direction from
-      /// state. (Same name both ways; the crate figures it out.)
+      /// Read into an empty graph / write a populated one — direction from state.
       pub fn file(&self, path: &str) -> Graph {
             let empty = self.with(|root| root.children.is_empty());
             if empty {
@@ -365,11 +332,7 @@ impl Graph {
             self.clone()
       }
 
-      /// Add a typed `value` under the node at `path`, creating the path as needed.
-      /// The value serializes to one or more leaf children: `add(0.0312, "z1.w")`,
-      /// `add(weights, "z1.w")` (Vec<f64>), `add("relu", "z1.act")`, `add(true, …)`,
-      /// `add(42, …)`, `add(labels, …)` (Vec<String>). This is what lets the crate
-      /// serialize weights directly at the callsite — no separate codec module.
+      /// Add typed `value` under `path` (creating it): scalars, `Vec<f64>`, strings, bools.
       pub fn add<V: Value>(&self, value: V, path: &str) -> Graph {
             let kids = value.into_nodes();
             self.with(|root| ensure_path(root, path).children.extend(kids));
@@ -383,10 +346,7 @@ impl Graph {
       }
 }
 
-/// `del!(g, a.b{})` — delete every child named `b` under `a`. The `a.b{}` form is
-/// not a legal expression in argument position, so it rides a macro. It expands to
-/// [`__macro_support::del_all`], which is macro-internal — not part of the crate
-/// root's public surface.
+/// `del!(g, a.b{})` — delete every `b` under `a` (the `a.b{}` form needs a macro).
 #[macro_export]
 macro_rules! del {
       ($g:expr, $a:ident . $b:ident {}) => {{
@@ -394,10 +354,7 @@ macro_rules! del {
       }};
 }
 
-/// Implementation detail of the [`del!`] macro. A `#[macro_export]` macro must be
-/// able to name the helper from the caller's crate, so it is `pub` — but confined
-/// to this hidden module, so it is NOT `ogdl::del_all` at the crate root. Do not
-/// call directly.
+/// `del!` internals — `pub` only so the exported macro can name it; not `ogdl::del_all` at the root.
 #[doc(hidden)]
 pub mod __macro_support {
       use super::{Graph, Node};
@@ -443,15 +400,14 @@ mod tests {
             let root = Node::parse("a\n    b\n        x\n    b\n        y\n    1\n        z\n");
             let a = &root.children[0];
             assert_eq!(a.name, "a");
-            assert_eq!(a[0].name, "b"); // Index<usize> = children[i]
-            assert_eq!(a.select("b").expect("b").children[0].name, "x"); // first b
-            assert_eq!(a.select("b{2}").expect("b{2}").children[0].name, "y"); // 2nd b
-            assert_eq!(a.select("1").expect("1").children[0].name, "z"); // name "1"
-            assert_eq!(a.select("[2]").expect("[2]").name, "b"); // 2nd subnode (n-1)
+            assert_eq!(a[0].name, "b");
+            assert_eq!(a.select("b").expect("b").children[0].name, "x");
+            assert_eq!(a.select("b{2}").expect("b{2}").children[0].name, "y");
+            assert_eq!(a.select("1").expect("1").children[0].name, "z");
+            assert_eq!(a.select("[2]").expect("[2]").name, "b");
       }
 
-      // The leak fix: a handle's tree is freed when its last clone drops, and
-      // chain-method returns don't accumulate references (no global slab).
+      // Leak fix: a tree frees when its last handle drops; chain returns don't accumulate.
       #[test]
       fn handles_free_on_drop() {
             let g = Graph::empty();
@@ -460,20 +416,19 @@ mod tests {
             assert_eq!(Arc::strong_count(&g.root), 2);
             drop(g2);
             assert_eq!(Arc::strong_count(&g.root), 1);
-            g.add("x", "a"); // returns a fresh shared handle that drops at the `;`
+            g.add("x", "a");
             assert_eq!(Arc::strong_count(&g.root), 1, "chain temporaries leak no refs");
       }
 
-      // The variable-arity call sites the ItnlArg/DelArg dispatch produces.
       #[test]
       fn arity_forms_dispatch() {
             let g = Graph::empty();
             g.with(|r| *r = Node::parse("a\n    x\n    y\n"));
-            let _ = g.itnl(()).itnl("a"); // itnl(()) -> handle, then itnl(path) -> Node
-            let a = g.itnl("a"); // Node{name:"a", children:[x, y]}
-            g.del(&a[0]); // del(a[2]) form: &Node via Index -> deletes x
+            let _ = g.itnl(()).itnl("a");
+            let a = g.itnl("a");
+            g.del(&a[0]);
             assert!(g.itnl("a").children.iter().all(|c| c.name != "x"));
-            g.del(("y", &a)); // del(("1", &a)) form: (&str, &Node) -> deletes y under a
+            g.del(("y", &a));
             assert!(g.itnl("a").children.is_empty());
       }
 
@@ -481,14 +436,13 @@ mod tests {
       fn add_del() {
             let g = Graph::empty();
             g.with(|r| *r = Node::parse("a\n    b\n"));
-            g.add("c", "a"); // add child "c" under a
+            g.add("c", "a");
             assert!(g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "c"));
             del!(g, a.b {});
             assert!(!g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "b"));
       }
 
-      // The universal-serializer capability: typed values written by path, read
-      // back typed — the whole point of folding the checkpoint codec into `add`.
+      // Universal serializer: typed values written by path, read back typed.
       #[test]
       fn typed_serialize_roundtrip() {
             let g = Graph::empty();
