@@ -9,7 +9,6 @@
 
 pub mod enums;
 pub mod forward;
-pub mod ogdl;
 pub mod params;
 pub mod safetensors;
 pub mod scratch;
@@ -30,7 +29,6 @@ pub use gpu_core::memory::{
 	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes,
 	device_arena_active, exit_d2h_enqueue, park_run_backing, release_device_arena,
 };
-pub use ogdl::*;
 pub use params::*;
 pub use scratch::*;
 
