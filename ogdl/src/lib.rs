@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::fs;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 // ── Node ─────────────────────────────────────────────────────────────────────
 // The tree. A node's "value" is its child node(s): `VRAM 12` is a node named
@@ -166,40 +166,30 @@ impl fmt::Display for Node {
       }
 }
 
-// ── graph registry ───────────────────────────────────────────────────────────
-// Every graph lives in a global slab; a `Graph` is a Copy handle (an index into
-// it). This is why every method can take `&self` and hand back a fresh handle for
-// chaining, and why the same handle stays usable after `.add().del()`.
-struct Reg {
-      graphs: Vec<Node>,
+// ── graph storage ────────────────────────────────────────────────────────────
+// A `Graph` is a shared handle to one tree (`Arc<Mutex<Node>>`). Cloning a handle
+// shares the tree; when the LAST handle drops, the tree is freed — there is no
+// global slab that accumulates. Every method takes `&self` and hands back a fresh
+// (shared) handle for chaining, and the same handle stays usable after `.add()`.
+#[derive(Clone)]
+pub struct Graph {
+      root: Arc<Mutex<Node>>,
 }
 
-fn reg() -> &'static Mutex<Reg> {
-      static REG: OnceLock<Mutex<Reg>> = OnceLock::new();
-      REG.get_or_init(|| Mutex::new(Reg { graphs: vec![Node::leaf("")] }))
-}
-
-fn with<R>(id: usize, f: impl FnOnce(&mut Node) -> R) -> R {
-      let mut g = reg().lock().unwrap_or_else(|p| p.into_inner());
-      while g.graphs.len() <= id {
-            g.graphs.push(Node::leaf(""));
+impl Graph {
+      fn empty() -> Graph {
+            Graph { root: Arc::new(Mutex::new(Node::leaf(""))) }
       }
-      f(&mut g.graphs[id])
-}
 
-fn fresh() -> usize {
-      let mut g = reg().lock().unwrap_or_else(|p| p.into_inner());
-      g.graphs.push(Node::leaf(""));
-      g.graphs.len() - 1
+      fn with<R>(&self, f: impl FnOnce(&mut Node) -> R) -> R {
+            let mut n = self.root.lock().unwrap_or_else(|p| p.into_inner());
+            f(&mut n)
+      }
 }
-
-/// A handle to one graph. Copy; the tree lives in the registry. The four methods
-/// are INHERENT here, so the chaining surface needs no trait in scope.
-#[derive(Clone, Copy, Debug)]
-pub struct Graph(usize);
 
 /// The process-wide default graph — import style 1 (`use ogdl::*; ogdl.file(..)`).
-pub static ogdl: Graph = Graph(0);
+/// A single persistent tree; lazily created, never accumulates.
+pub static ogdl: LazyLock<Graph> = LazyLock::new(Graph::empty);
 
 /// Constructor namespace — import style 2 (`Ogdl::file("g.ogdl")`). Distinct from
 /// the handle so the associated `file` constructor and the chaining `file` method
@@ -237,7 +227,7 @@ impl ItnlArg for () {
 impl ItnlArg for &str {
       type Out = Node;
       fn apply(self, g: Graph) -> Node {
-            with(g.0, |root| {
+            g.with(|root| {
                   // Return the selected subtree tagged with the path it was found
                   // at, so it can be handed straight to add/del as a locatable
                   // target. Display uses the children (the value), not this name.
@@ -252,7 +242,7 @@ impl ItnlArg for Graph {
       type Out = Graph;
       fn apply(self, g: Graph) -> Graph {
             let src = self.snapshot();
-            with(g.0, |root| *root = src);
+            g.with(|root| *root = src);
             g
       }
 }
@@ -260,7 +250,7 @@ impl ItnlArg for Graph {
 impl ItnlArg for Node {
       type Out = Graph;
       fn apply(self, g: Graph) -> Graph {
-            with(g.0, |root| *root = self);
+            g.with(|root| *root = self);
             g
       }
 }
@@ -275,7 +265,7 @@ pub trait DelArg {
 impl DelArg for (&str, &Node) {
       fn apply(self, g: Graph) {
             let (name, parent) = self;
-            with(g.0, |root| {
+            g.with(|root| {
                   if let Some(p) = root.select_mut(&parent.name) {
                         p.children.retain(|c| c.name != name);
                   } else {
@@ -293,7 +283,7 @@ impl DelArg for &Node {
                         strip(c, target);
                   }
             }
-            with(g.0, |root| strip(root, self));
+            g.with(|root| strip(root, self));
       }
 }
 
@@ -305,66 +295,26 @@ pub trait Value {
       fn into_nodes(self) -> Vec<Node>;
 }
 
-impl Value for f64 {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(&self.to_string())]
-      }
+// One macro instead of a dozen near-identical impls: scalars via Display, strings
+// via AsRef<str>, and vectors element-wise (Display for floats, leaf for strings).
+macro_rules! value {
+      (scalar: $($t:ty),*) => {$( impl Value for $t {
+            fn into_nodes(self) -> Vec<Node> { vec![Node::leaf(&self.to_string())] }
+      } )*};
+      (str: $($t:ty),*) => {$( impl Value for $t {
+            fn into_nodes(self) -> Vec<Node> { vec![Node::leaf(self.as_ref())] }
+      } )*};
+      (floats: $($t:ty),*) => {$( impl Value for $t {
+            fn into_nodes(self) -> Vec<Node> { self.iter().map(|x| Node::leaf(&x.to_string())).collect() }
+      } )*};
+      (strs: $($t:ty),*) => {$( impl Value for $t {
+            fn into_nodes(self) -> Vec<Node> { self.iter().map(|s| Node::leaf(s)).collect() }
+      } )*};
 }
-impl Value for i64 {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(&self.to_string())]
-      }
-}
-impl Value for i32 {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(&self.to_string())]
-      }
-}
-impl Value for usize {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(&self.to_string())]
-      }
-}
-impl Value for bool {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(if self { "true" } else { "false" })]
-      }
-}
-impl Value for &str {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(self)]
-      }
-}
-impl Value for String {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(&self)]
-      }
-}
-impl Value for &String {
-      fn into_nodes(self) -> Vec<Node> {
-            vec![Node::leaf(self)]
-      }
-}
-impl Value for Vec<f64> {
-      fn into_nodes(self) -> Vec<Node> {
-            self.iter().map(|x| Node::leaf(&x.to_string())).collect()
-      }
-}
-impl Value for &[f64] {
-      fn into_nodes(self) -> Vec<Node> {
-            self.iter().map(|x| Node::leaf(&x.to_string())).collect()
-      }
-}
-impl Value for Vec<String> {
-      fn into_nodes(self) -> Vec<Node> {
-            self.into_iter().map(|s| Node::leaf(&s)).collect()
-      }
-}
-impl Value for &[String] {
-      fn into_nodes(self) -> Vec<Node> {
-            self.iter().map(|s| Node::leaf(s)).collect()
-      }
-}
+value!(scalar: f64, i64, i32, usize, bool);
+value!(str: &str, String, &String);
+value!(floats: Vec<f64>, &[f64]);
+value!(strs: Vec<String>, &[String]);
 
 // Navigate `path` (dot-separated names), creating any missing node along the way,
 // and return the target for children to be appended under.
@@ -386,33 +336,33 @@ fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
 // ── the four methods (inherent — no trait import to chain) ───────────────────
 impl Graph {
       fn read(path: &str) -> Graph {
-            let id = fresh();
+            let g = Graph::empty();
             let text = fs::read_to_string(path).unwrap_or_default();
-            with(id, |root| *root = Node::parse(&text));
-            Graph(id)
+            g.with(|root| *root = Node::parse(&text));
+            g
       }
 
-      pub(crate) fn snapshot(self) -> Node {
-            with(self.0, |root| root.clone())
+      pub(crate) fn snapshot(&self) -> Node {
+            self.with(|root| root.clone())
       }
 
       /// `itnl(())` → handle; `itnl("a.b")` → the Node there; `itnl(node)` → bind.
       pub fn itnl<A: ItnlArg>(&self, a: A) -> A::Out {
-            a.apply(*self)
+            a.apply(self.clone())
       }
 
       /// Read an empty graph in / write a populated graph out — direction from
       /// state. (Same name both ways; the crate figures it out.)
       pub fn file(&self, path: &str) -> Graph {
-            let empty = with(self.0, |root| root.children.is_empty());
+            let empty = self.with(|root| root.children.is_empty());
             if empty {
                   let text = fs::read_to_string(path).unwrap_or_default();
-                  with(self.0, |root| *root = Node::parse(&text));
+                  self.with(|root| *root = Node::parse(&text));
             } else {
-                  let text = with(self.0, |root| root.serialize());
+                  let text = self.with(|root| root.serialize());
                   let _ = fs::write(path, text);
             }
-            *self
+            self.clone()
       }
 
       /// Add a typed `value` under the node at `path`, creating the path as needed.
@@ -422,35 +372,45 @@ impl Graph {
       /// serialize weights directly at the callsite — no separate codec module.
       pub fn add<V: Value>(&self, value: V, path: &str) -> Graph {
             let kids = value.into_nodes();
-            with(self.0, |root| ensure_path(root, path).children.extend(kids));
-            *self
+            self.with(|root| ensure_path(root, path).children.extend(kids));
+            self.clone()
       }
 
       /// Delete per the argument: `del(a[2])`, `del(&node)`, `del(("1", &a))`.
       pub fn del<D: DelArg>(&self, d: D) -> Graph {
-            d.apply(*self);
-            *self
+            d.apply(self.clone());
+            self.clone()
       }
 }
 
 /// `del!(g, a.b{})` — delete every child named `b` under `a`. The `a.b{}` form is
-/// not a legal expression in argument position, so it rides a macro.
+/// not a legal expression in argument position, so it rides a macro. It expands to
+/// [`__macro_support::del_all`], which is macro-internal — not part of the crate
+/// root's public surface.
 #[macro_export]
 macro_rules! del {
       ($g:expr, $a:ident . $b:ident {}) => {{
-            $crate::__del_all($g, stringify!($a), stringify!($b))
+            $crate::__macro_support::del_all(&$g, stringify!($a), stringify!($b))
       }};
 }
 
+/// Implementation detail of the [`del!`] macro. A `#[macro_export]` macro must be
+/// able to name the helper from the caller's crate, so it is `pub` — but confined
+/// to this hidden module, so it is NOT `ogdl::del_all` at the crate root. Do not
+/// call directly.
 #[doc(hidden)]
-pub fn __del_all(g: Graph, parent: &str, name: &str) -> Graph {
-      with(g.0, |root| {
-            let target = if parent.is_empty() { Some(&mut *root) } else { root.select_mut(parent) };
-            if let Some(p) = target {
-                  p.children.retain(|c| c.name != name);
-            }
-      });
-      g
+pub mod __macro_support {
+      use super::{Graph, Node};
+
+      pub fn del_all(g: &Graph, parent: &str, name: &str) -> Graph {
+            g.with(|root: &mut Node| {
+                  let target = if parent.is_empty() { Some(&mut *root) } else { root.select_mut(parent) };
+                  if let Some(p) = target {
+                        p.children.retain(|c| c.name != name);
+                  }
+            });
+            g.clone()
+      }
 }
 
 #[cfg(test)]
@@ -472,8 +432,8 @@ mod tests {
 
       #[test]
       fn select_value() {
-            let g = Graph(fresh());
-            with(g.0, |r| *r = Node::parse(SAMPLE));
+            let g = Graph::empty();
+            g.with(|r| *r = Node::parse(SAMPLE));
             assert_eq!(format!("{}", g.itnl("engi.GPU0.VRAM")), "12");
             assert_eq!(format!("{}", g.itnl("engi.CPU.RAM")), "31");
       }
@@ -490,11 +450,25 @@ mod tests {
             assert_eq!(a.select("[2]").expect("[2]").name, "b"); // 2nd subnode (n-1)
       }
 
+      // The leak fix: a handle's tree is freed when its last clone drops, and
+      // chain-method returns don't accumulate references (no global slab).
+      #[test]
+      fn handles_free_on_drop() {
+            let g = Graph::empty();
+            assert_eq!(Arc::strong_count(&g.root), 1);
+            let g2 = g.clone();
+            assert_eq!(Arc::strong_count(&g.root), 2);
+            drop(g2);
+            assert_eq!(Arc::strong_count(&g.root), 1);
+            g.add("x", "a"); // returns a fresh shared handle that drops at the `;`
+            assert_eq!(Arc::strong_count(&g.root), 1, "chain temporaries leak no refs");
+      }
+
       // The variable-arity call sites the ItnlArg/DelArg dispatch produces.
       #[test]
       fn arity_forms_dispatch() {
-            let g = Graph(fresh());
-            with(g.0, |r| *r = Node::parse("a\n    x\n    y\n"));
+            let g = Graph::empty();
+            g.with(|r| *r = Node::parse("a\n    x\n    y\n"));
             let _ = g.itnl(()).itnl("a"); // itnl(()) -> handle, then itnl(path) -> Node
             let a = g.itnl("a"); // Node{name:"a", children:[x, y]}
             g.del(&a[0]); // del(a[2]) form: &Node via Index -> deletes x
@@ -505,8 +479,8 @@ mod tests {
 
       #[test]
       fn add_del() {
-            let g = Graph(fresh());
-            with(g.0, |r| *r = Node::parse("a\n    b\n"));
+            let g = Graph::empty();
+            g.with(|r| *r = Node::parse("a\n    b\n"));
             g.add("c", "a"); // add child "c" under a
             assert!(g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "c"));
             del!(g, a.b {});
@@ -517,7 +491,7 @@ mod tests {
       // back typed — the whole point of folding the checkpoint codec into `add`.
       #[test]
       fn typed_serialize_roundtrip() {
-            let g = Graph(fresh());
+            let g = Graph::empty();
             let weights = vec![0.01_f64, -0.02, 0.03];
             let labels = vec!["cat".to_string(), "dog".to_string()];
             g.add(weights.clone(), "z1.w")

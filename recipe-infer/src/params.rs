@@ -340,7 +340,7 @@ pub(crate) fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	let tp = tmp.to_str().expect("utf8 tmp");
 	let _ = std::fs::remove_file(tp);
 	let g = ogdl::file(tp); // fresh empty graph (tmp absent)
-	build(g);
+	build(g.clone()); // a Graph handle is shared, not Copy: clone shares the tree
 	g.file(tp); // populated graph → write out
 	let text = std::fs::read_to_string(tp).unwrap_or_default();
 	let _ = std::fs::remove_file(tp);
