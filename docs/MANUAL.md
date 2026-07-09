@@ -121,18 +121,39 @@ Notes: `svm`/`cluster` neighbor/perm fns are standalone prototypes with no produ
 
 ## 4. User API
 
+Three import styles, one crate, the same methods — only the door differs. Everything
+after the constructor is dot chaining, identical whichever door you came in by.
+
 ```rust
-use recipe::*;
-let data  = Data::load().set("train.csv").split(0.8).target("Price");
-let model = Model::new().layer(64).leak().layer(32).leak().layer(1).loss(mse).lr(0.001);
-let train = Train::new().epochs(100).log([Loss, R2, Lr]).plot([Loss, R2]);
-train.run((&model, &data));
-train.save(());
+// style 1: static (dot syntax)          use recipe::*;
+recipe.data("train.csv").split(0.8).target("Price");
+recipe.model().layer(64).leak().layer(1).loss(mse).lr(0.001);
+recipe.train().epochs(100).run(data, model);
+
+// style 2: struct (associated function)  use recipe::{Data, Model, Train};
+let data  = Data::load("train.csv").split(0.8).target("Price");
+let model = Model::new().layer(64).leak().layer(1).loss(mse).lr(0.001);
+Train::new().epochs(100).log([Loss, R2, Lr]).plot([Loss, R2]).run(data, model).save(());
+model.eval(data);
+
+// style 3: crate path (free function)
+let data  = recipe::data("train.csv").split(0.8).target("Price");
+let model = recipe::model().layer(64).leak().layer(1).loss(recipe::mse);
+recipe::train().epochs(100).run(data, model);
+recipe::eval(model, data);
 ```
 
-- **`Data`** — `.set(path)` accepts CSV, ARFF, zip, or a directory. `.exclude(pattern)` (exact / `group:*` / group / bare header). `.test(path)`, `.split(frac)`, `.target("col")` / `.target(["a","b"])`. **Lazy**: `.target()` only records config; `Train::run`/`eval` materializes via `Prepared{Owned,Borrowed}` and frees the Owned dataset when the run returns — only one scenario resident at a time (this is what lets the 4-scenario cookbook run without OOM).
-- **`Model`** — `.layer(n)` + chained activation: `.relu() .leak() .sigmoid() .tanh() .selu() .gelu() .silu()` (also prelu/elu in enums). `.layer(embed(dim))`, `.layer(attn(heads))`, `conv(filters, kernel, stride)` — stride is the downsampling mechanism (no pool API). Embed behavior: text cols → embed token ids; no text but categoricals → embed categorical indices (one-hot groups collapsed to integer indices via `collapse_onehot`); no embed → categoricals stay one-hot. `.loss()`, `.lr()`.
-- **`Train`** — `.epochs() .log([..]) .plot([..])`. `.run(())` / `.run(model)` / `.run((model, data))`: missing pieces resolve from a thread-local registry of live Model/Data (their inners are Boxed for stable addresses; registered at `new()`, deregistered on Drop; 0 or >1 live → clear panic). `.run(())` makes bindings look textually unused — allow the lint. Training vs inference is decided by the data (no target / 0 epochs → forward only).
+`recipe` is a unit `static` in the value namespace, so `recipe.data(…)` (style 1) and
+`recipe::data(…)` (style 3, the crate path) coexist without ambiguity.
+
+Every constructor returns `&'static mut Self` (`Box::leak` of the heap-pinned inner),
+so every builder method can take `&mut self` and return `&mut Self`: the chain and the
+`let` binding it produces name the same config, at an address that never moves.
+
+- **`Data`** — `Data::load(path)` accepts CSV, ARFF, `.safetensors`, zip, or a directory; `.set(path)` adds a further source. `.exclude(pattern)` (exact / `group:*` / group / bare header). `.test(path)`, `.split(frac)`, `.target("col")` / `.target(["a","b"])`, `.datasets()`. **Lazy**: `.target()` only records config; `Train::run`/`Model::eval` materializes via `Prepared{Owned,Borrowed}` and frees the Owned dataset when the run returns — only one scenario resident at a time (this is what lets the 4-scenario cookbook run without OOM).
+- **`Model`** — `.layer(n)` + chained activation: `.relu() .leak() .sigmoid() .tanh() .selu() .gelu() .silu()` (also prelu/elu in enums). `.layer(embed(dim))`, `.layer(attn(heads))`, `conv(filters, kernel, stride)` — stride is the downsampling mechanism (no pool API). Embed behavior: text cols → embed token ids; no text but categoricals → embed categorical indices (one-hot groups collapsed to integer indices via `collapse_onehot`); no embed → categoricals stay one-hot. `.loss()`, `.lr()`, `.eval(data)`. `Model::load(weights, proto, d)` builds forward-only from shipped OGDL text. `ModelInner` is crate-private — `eval` lives on `Model`.
+- **`Train`** — `.epochs() .log_every(n) .log([..]) .plot([..]) .resume(p) .net([..])`. `.run(data, model)` takes both explicitly (`data` is any `&dyn RunData`: a `Data`, a `Dataset`, an `Option<Dataset>` holdout) and returns `&mut Train`, so `.save(p)` chains straight off it. Training vs inference is decided by the data (no target / 0 epochs → forward only).
+- **Forward-only arena** — a fit carves the arena to the last byte (`ooc` budgets its windows from `arena_remaining()`), so a forward pass cannot carve even one input buffer out of what the run parked. `Model::begin_forward` re-arms that parked backing as the pass's arena (rewind + one memset, **no free, no realloc** — the freeAsync VA-reuse race and the driver's post-free counter depression both stay impossible), rebuilds the weights from the host mirror, and `end_forward` parks it again for the next run.
 - **save/resume** — `.save(p)` / `.resume(p)` take `impl SavePath`; `()` means `"model.ogdl"` (Rust can't overload arity, so it's `.save(())`, not `.save()`). `save` writes ALL params with a best-only guard (only overwrites if the new score beats the saved `saved_score`). Resume shape mismatch prints OGDL-vs-model dims and exits(1) — never silently reinitializes. NaN cells in a loaded OGDL are individually re-randomized (He-scaled) with a report, not rejected.
 - **Preflight** checks VRAM (`Scratch::vram_bytes`), embed/text, and loss/output shape before any GPU work; over-ceiling scenarios are skipped gracefully (the RAM guard bail is caught via catch_unwind in `run()`), not crashed.
 - **Consts** — losses `mse mae huber ce bce focal`; metrics `Loss Accuracy R2 Lr Epoch Time hip` (hip = HIP call report).

@@ -59,8 +59,8 @@ train
 		.log_every(n)
 		.resume(path)
 	run
-		train.run(&model, &data)        train
-		train.run(&model, &data.test)   inference
+		train.run(data, model)         train
+		train.run(data.test, model)    inference
 	save
 		train.save([w, b], path)                   weights to OGDL
 		train.save(["Id", data.target], path)      predictions to CSV

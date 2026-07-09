@@ -31,8 +31,7 @@ fn main() {
 		.layer(1)
 		.sigmoid()
 		.lr(0.001);
-	let nn_data = Data::load()
-		.set(SET.categoric)
+	let nn_data = Data::load(SET.categoric)
 		.split(0.8)
 		.exclude("id")
 		.target("Churn");
@@ -51,8 +50,7 @@ fn main() {
 		.leak()
 		.layer(36)
 		.lr(0.001);
-	let cnn_data = Data::load()
-		.set(SET.image[0])
+	let cnn_data = Data::load(SET.image[0])
 		.set(SET.image[1])
 		.split(0.8)
 		.target("label");
@@ -69,8 +67,7 @@ fn main() {
 		.leak()
 		.layer(1)
 		.lr(0.0001);
-	let mlp_data = Data::load()
-		.set(SET.numeric)
+	let mlp_data = Data::load(SET.numeric)
 		.split(0.8)
 		.exclude("Id")
 		.target("SalePrice");
@@ -86,8 +83,7 @@ fn main() {
 		.layer(32).leak()
 		.layer(3)
 		.lr(0.001);
-	let llm_data = Data::load()
-		.set(SET.text)
+	let llm_data = Data::load(SET.text)
 		.split(0.8)
 		.exclude("id")
 		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
@@ -97,11 +93,11 @@ fn main() {
 		.log([Loss, Accuracy, hip]);
 
 	for (model, data, train)
-		in [(&nn , &nn_data , &nn_train ),
-			(&cnn, &cnn_data, &cnn_train),
-			(&mlp, &mlp_data, &mlp_train),
-			(&llm, &llm_data, &llm_train),]
-		{ train.run((model, data)) }
+		in [(nn , nn_data , nn_train ),
+			(cnn, cnn_data, cnn_train),
+			(mlp, mlp_data, mlp_train),
+			(llm, llm_data, llm_train),]
+		{ train.run(data, model); }
 }
 
 

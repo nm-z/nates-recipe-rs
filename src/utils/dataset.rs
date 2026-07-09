@@ -1,7 +1,6 @@
 use crate::Mat;
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
-use std::cell::RefCell;
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
@@ -29,9 +28,9 @@ impl IntoTargets for &[&str] {
 /// — so building a `Data`, even many of them, costs only the config it holds.
 /// `Data` describes; `Train` executes.
 ///
-/// The config lives in a heap-pinned [`DataInner`] so the builder's by-value
-/// moves don't shift its address; the live-data registry holds a raw pointer to
-/// it for the no-argument `.run()` / `.run(model)` resolution.
+/// `Data::load` hands back a `&'static mut Data` so every builder method can
+/// take `&mut self` and return `&mut Self`: the chain and the `let` binding it
+/// produces name the same heap-pinned config, whose address never moves.
 pub struct Data {
 	pub(crate) inner: Box<DataInner>,
 }
@@ -66,38 +65,6 @@ impl std::ops::DerefMut for Data {
 		&mut self.inner
 	}
 }
-impl Drop for Data {
-	fn drop(&mut self) {
-		let r: &dyn crate::model::RunData = &*self.inner;
-		deregister_data(r as *const dyn crate::model::RunData);
-	}
-}
-
-// Every live `Data` registers the stable address of its heap config here, so
-// `.run(())` / `.run(model)` can resolve "the Data in scope" with no argument.
-thread_local! {
-	static DATAS: RefCell<Vec<*const dyn crate::model::RunData>> =
-		const { RefCell::new(Vec::new()) };
-}
-fn register_data(p: *const dyn crate::model::RunData) {
-	DATAS.with(|d| d.borrow_mut().push(p));
-}
-fn deregister_data(p: *const dyn crate::model::RunData) {
-	DATAS.with(|d| d.borrow_mut().retain(|&x| !std::ptr::addr_eq(x, p)));
-}
-/// The one live `Data`, or a clear panic when zero or several exist — backs the
-/// no-argument `.run()` / `.run(model)` "use what's in scope" resolution.
-pub(crate) fn the_data() -> *const dyn crate::model::RunData {
-	DATAS.with(|d| {
-		let d = d.borrow();
-		match d.len() {
-			1 => d[0],
-			0 => panic!("run(): no Data in scope — build one with Data::load()…, or pass it: train.run((model, data))"),
-			n => panic!("run(): {n} Datasets in scope — ambiguous; pass the one to run, e.g. train.run((model, data))"),
-		}
-	})
-}
-
 /// The `Dataset → Mat` seam for the embed-on-categoricals path: collapse each
 /// one-hot group back to a single integer-index column (each category a unique
 /// id, offset across groups) so an `embed` layer can look them up directly.
@@ -183,27 +150,29 @@ fn safetensors_to_table(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 }
 
 impl Data {
-	pub fn load() -> Data {
-		let inner = Box::new(DataInner {
-			target: "",
-			target_names: Vec::new(),
-			attrs: Vec::new(),
-			rows: Vec::new(),
-			targets: Vec::new(),
-			sources: Vec::new(),
-			test_path: None,
-			split_frac: None,
-			exclude: Vec::new(),
-			raw_test_rows: None,
-			raw_test_headers: None,
-			pre_kinds: Vec::new(),
-		});
-		let r: &dyn crate::model::RunData = &*inner;
-		register_data(r as *const dyn crate::model::RunData);
-		Data { inner }
+	/// Constructor: describe a dataset rooted at `path` (CSV / ARFF /
+	/// `.safetensors` / image dir). Chain `.set()` to add further sources.
+	pub fn load(path: &str) -> &'static mut Data {
+		let data: &'static mut Data = Box::leak(Box::new(Data {
+			inner: Box::new(DataInner {
+				target: "",
+				target_names: Vec::new(),
+				attrs: Vec::new(),
+				rows: Vec::new(),
+				targets: Vec::new(),
+				sources: Vec::new(),
+				test_path: None,
+				split_frac: None,
+				exclude: Vec::new(),
+				raw_test_rows: None,
+				raw_test_headers: None,
+				pre_kinds: Vec::new(),
+			}),
+		}));
+		data.set(path)
 	}
 
-	pub fn set(mut self, path: &str) -> Data {
+	pub fn set(&mut self, path: &str) -> &mut Data {
 		self.inner.sources.push(path.to_string());
 		if is_arff(path) {
 			let (attrs, rows) = crate::data::parse_arff(path);
@@ -223,7 +192,7 @@ impl Data {
 		self
 	}
 
-	pub fn target(mut self, t: impl IntoTargets) -> Data {
+	pub fn target(&mut self, t: impl IntoTargets) -> &mut Data {
 		self.inner.target_names = t.into_targets();
 		self.inner.target = self
 			.inner
@@ -267,17 +236,17 @@ impl Data {
 		self
 	}
 
-	pub fn test(mut self, path: &str) -> Data {
+	pub fn test(&mut self, path: &str) -> &mut Data {
 		self.inner.test_path = Some(path.to_string());
 		self
 	}
 
-	pub fn exclude(mut self, pattern: &str) -> Data {
+	pub fn exclude(&mut self, pattern: &str) -> &mut Data {
 		self.inner.exclude.push(pattern.to_string());
 		self
 	}
 
-	pub fn split(mut self, train_frac: f64) -> Data {
+	pub fn split(&mut self, train_frac: f64) -> &mut Data {
 		assert!(
 			(0.0..1.0).contains(&train_frac),
 			"split fraction must be in (0, 1), got {train_frac}",
@@ -604,7 +573,7 @@ mod safetensors_source_tests {
 		assert_eq!(rows[0], vec!["1", "2", "10"]);
 		assert_eq!(rows[2], vec!["5", "6", "30"]);
 
-		let data = Data::load().set(p).split(0.66).target("y");
+		let data = Data::load(p).split(0.66).target("y");
 		let (set, test) = data.datasets();
 		assert_eq!(set.x.ncols(), 2, "two feature columns (x:0, x:1)");
 		assert_eq!(set.n_targets, 1, "single target (y)");
@@ -642,7 +611,7 @@ mod safetensors_source_tests {
 		std::fs::write(&path, &bytes).expect("write temp safetensors shard");
 		let p = path.to_str().expect("temp path utf8");
 
-		let data = Data::load().set(p).target("label");
+		let data = Data::load(p).target("label");
 		let (set, test) = data.datasets();
 		assert_eq!(set.x.nrows(), 4, "four rows from the shared leading dim");
 		assert_eq!(set.x.ncols(), 3, "three feature cols (blk.0.w:0, blk.0.w:1, blk.0.b)");

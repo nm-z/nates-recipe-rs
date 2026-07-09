@@ -180,11 +180,10 @@ fn main() -> Result<()> {
 	}
 
 	let data = if let Some(t) = target {
-		recipe::Data::load().set(path).target(t)
+		recipe::Data::load(path).target(t)
 	} else {
-		let d = recipe::Data::load().set(path);
 		eprintln!("no --target specified");
-		d
+		recipe::Data::load(path)
 	};
 	let (set, _test) = data.datasets();
 	eprintln!(

@@ -3,7 +3,7 @@
 //! the ratatui live dashboard. The forward engine and execution enums live in the
 //! `recipe-infer` crate; this module drives them but they never depend back on it.
 use crate::dataset::{Dataset, collapse_onehot};
-use crate::model::{ModelInner, RunData, Train};
+use crate::model::{Model, ModelInner, RunData, Train};
 use recipe_infer::{
 	Activation, LayerKind, LayerParams, LayerSpec,
 	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
@@ -1375,21 +1375,26 @@ impl ModelInner {
 			(apply(&xraw, n, d, scaler_ref), None, n)
 		}
 	}
+}
+
+impl Model {
 	/// Forward-only evaluation of the trained model on `data`, reporting the
 	/// loss-appropriate score (accuracy for classification, R² for regression).
 	/// The forward+score is recipe-infer's `infer_scored`; this only adapts the
 	/// Dataset. Returns the raw `n*k` predictions.
-	pub fn eval(&self, data: &impl RunData) -> Vec<f64> {
+	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
+		let inner = &self.inner;
 		let prepared = data.prepared();
 		let ds = prepared.get();
-		// Rebuild params from the host mirror if a later run freed their arena backing.
-		self.ensure_params_live();
-		let (xbuf, x_cat, n) = self.prep_eval_input(ds);
-		let params = self.params.borrow();
+		// Adopt the previous run's parked backing as this pass's arena and rebuild the
+		// params into it from the host mirror; parked back in `end_forward` below.
+		let arena = self.begin_forward();
+		let (xbuf, x_cat, n) = inner.prep_eval_input(ds);
+		let params = inner.params.borrow();
 		assert!(!params.is_empty(), "eval: call train() first");
-		let yscaler = *self.yscaler.borrow();
-		let metric = if self.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
-		if ds.has_target {
+		let yscaler = *inner.yscaler.borrow();
+		let metric = if inner.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
+		let preds = if ds.has_target {
 			let __yb = ds.y.as_slice().expect("eval: y contiguous");
 			let ybuf = GpuBuffer::alloc(__yb.len()).expect("eval ybuf");
 			ybuf.load(__yb).expect("eval ybuf load");
@@ -1399,18 +1404,21 @@ impl ModelInner {
 			let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
 			let (preds, vals) = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
-				self.loss, self.lr, std::slice::from_ref(&metric), ss_tot,
+				inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
 			);
-			let label = if self.loss.is_classification() { "accuracy" } else { "R2" };
+			let label = if inner.loss.is_classification() { "accuracy" } else { "R2" };
 			eprintln!("eval: {label} = {:.4} ({n} samples)", vals[0]);
 			preds
 		} else {
 			let (preds, _) = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
-				self.loss, self.lr, &[], 0.0,
+				inner.loss, inner.lr, &[], 0.0,
 			);
 			eprintln!("eval: {n} samples (no target column, score unavailable)");
 			preds
-		}
+		};
+		drop(params);
+		self.end_forward(arena);
+		preds
 	}
 }

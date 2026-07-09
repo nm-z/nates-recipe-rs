@@ -161,38 +161,6 @@ impl RunData for Option<Dataset> {
 	}
 }
 
-/// What [`Train::run`] accepts. Rust can't overload one method name across
-/// zero/one/two arguments, so the "use what's in scope" forms collapse onto a
-/// single argument:
-///
-/// - `()` — the one live `Model` and the one live `Data` (panics if either is ambiguous).
-/// - `&Model` — that model, with the one live `Data`.
-/// - `(&Model, &data)` — both explicit (the only form a loop over several
-///   models/datasets can use, since then nothing is unambiguous "in scope").
-///
-/// Resolution returns raw pointers into heap-pinned state that the caller's
-/// bindings own for the duration of the `run` call (same lifetime contract the
-/// old `&Model`/`&data` arguments carried).
-pub trait RunArgs {
-	fn resolve(self) -> (*const ModelInner, *const dyn RunData);
-}
-impl RunArgs for () {
-	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
-		(the_model(), crate::dataset::the_data())
-	}
-}
-impl RunArgs for &Model {
-	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
-		(&*self.inner as *const ModelInner, crate::dataset::the_data())
-	}
-}
-impl<D: RunData + 'static> RunArgs for (&Model, &D) {
-	fn resolve(self) -> (*const ModelInner, *const dyn RunData) {
-		let data: &dyn RunData = self.1;
-		(&*self.0.inner as *const ModelInner, data as *const dyn RunData)
-	}
-}
-
 struct LastRun {
 	model: *const ModelInner,
 	score: f64,
@@ -230,8 +198,10 @@ pub struct Train {
 }
 
 impl Train {
-	pub fn new() -> Train {
-		Train {
+	/// Constructor. Like `Data::load` / `Model::new`, hands back a
+	/// `&'static mut Train` so the whole builder takes `&mut self`.
+	pub fn new() -> &'static mut Train {
+		Box::leak(Box::new(Train {
 			epochs: 1,
 			log_every: 1,
 			metrics: Vec::new(),
@@ -239,7 +209,7 @@ impl Train {
 			resume: None,
 			net: None,
 			last: RefCell::new(LastRun::default()),
-		}
+		}))
 	}
 
 	/// Resolve a path arg: `""` → `model.ogdl` (cwd), `"*"` → next to the
@@ -259,29 +229,29 @@ impl Train {
 		expand_tilde(&raw)
 	}
 
-	pub fn epochs(mut self, n: usize) -> Train {
+	pub fn epochs(&mut self, n: usize) -> &mut Train {
 		self.epochs = n;
 		self
 	}
 
-	pub fn log_every(mut self, every: usize) -> Train {
+	pub fn log_every(&mut self, every: usize) -> &mut Train {
 		self.log_every = every;
 		self
 	}
 
-	pub fn log(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
+	pub fn log(&mut self, metrics: impl IntoIterator<Item = Metric>) -> &mut Train {
 		self.metrics = metrics.into_iter().collect();
 		self
 	}
 
-	pub fn plot(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
+	pub fn plot(&mut self, metrics: impl IntoIterator<Item = Metric>) -> &mut Train {
 		self.plot = metrics.into_iter().collect();
 		self
 	}
 
 	/// Warm-start from a checkpoint (skips silently if absent). `.resume(())` uses
 	/// `model.ogdl` in the cwd; `.resume("custom.ogdl")` uses an explicit path.
-	pub fn resume(mut self, path: impl SavePath) -> Train {
+	pub fn resume(&mut self, path: impl SavePath) -> &mut Train {
 		self.resume = Some(path.or_default());
 		self
 	}
@@ -291,7 +261,7 @@ impl Train {
 	/// (eth before wlan), falling back to ssh config. Remote RAM joins the
 	/// waterfall as the tier below local disk; a named node that can't be
 	/// reached fails the run loudly at start.
-	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Train {
+	pub fn net<'a>(&mut self, nodes: impl IntoIterator<Item = &'a str>) -> &mut Train {
 		let mut net = crate::wire::Net::new();
 		for alias in nodes {
 			net = net.node(alias);
@@ -310,15 +280,12 @@ impl Train {
 		last.preds.clone().map(|p| (p, last.k))
 	}
 
-	/// Train (or infer) the model on the data. The argument selects what to run:
-	/// `()` uses the one model + one data in scope, `model` pins the model (data
-	/// from scope), `(model, data)` pins both. See [`RunArgs`].
-	pub fn run<A: RunArgs>(&self, args: A) {
-		let (model_ptr, data_ptr) = args.resolve();
-		// Borrows live for the whole call: explicit args are owned by the caller's
-		// `let` bindings, registry pointers by the boxed state those bindings own.
-		let model: &ModelInner = unsafe { &*model_ptr };
-		let data: &dyn RunData = unsafe { &*data_ptr };
+	/// Train (or infer) `model` on `data`. `data` is anything that can produce a
+	/// `Dataset` — a `Data` builder, a `Dataset`, an `Option<Dataset>` (holdout,
+	/// forward-only). Returns `&mut self` so `.save()` chains straight off it.
+	pub fn run(&mut self, data: &dyn RunData, model: &Model) -> &mut Train {
+		let handle = model;
+		let model: &ModelInner = &model.inner;
 		// Whole-run callspy bracket (gated on the Hip metric, like fit's per-phase
 		// blocks): a run-entry snapshot so the sync-class ops OUTSIDE fit are visible
 		// — the detector's claim/forward/release during data prep and the training
@@ -353,7 +320,7 @@ impl Train {
 					.is_some_and(|s| s.contains("exceeds VRAM+RAM+disk"))
 				{
 					eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
-					return;
+					return self;
 				}
 				std::panic::resume_unwind(payload);
 			}
@@ -380,7 +347,7 @@ impl Train {
 		let issues = preflight(model, ds, forward_only, net_ram);
 		if !issues.is_empty() && !confirm_issues(&issues) {
 			eprintln!("\x1b[33maborted\x1b[0m");
-			return;
+			return self;
 		}
 		if !forward_only {
 			let resume = self.resume.as_deref().map(Self::resolve);
@@ -433,9 +400,10 @@ impl Train {
 				eprint!("{t}");
 			}
 		} else {
-			// Rebuild the params from the host mirror if a later run freed their arena
-			// backing, so scoring never dereferences freed device memory.
-			model.ensure_params_live();
+			// Adopt the previous run's parked backing as this pass's arena and rebuild
+			// the params into it from the host mirror, so the forward has memory to
+			// carve its inputs from and never dereferences a zeroed weight view.
+			let arena = handle.begin_forward();
 			let (xbuf, x_cat, n) = model.prep_eval_input(ds);
 			let params = model.params.borrow();
 			assert!(!params.is_empty(), "run: call train first");
@@ -482,14 +450,19 @@ impl Train {
 			if let Some(headers) = data.raw_headers() {
 				last.raw_test_headers = Some(headers);
 			}
+			drop(last);
+			drop(params);
+			handle.end_forward(arena);
 		}
+		self
 	}
 
 	/// Save the FULL trained checkpoint — every param the model allocated — as
 	/// OGDL. `.save(())` writes `model.ogdl` in the cwd; `.save("custom.ogdl")`
 	/// writes an explicit path. Best-only guard applies.
-	pub fn save(&self, path: impl SavePath) {
+	pub fn save(&mut self, path: impl SavePath) -> &mut Train {
 		self.save_ogdl(None, &path.or_default());
+		self
 	}
 
 	/// Write the model's params to `path` as OGDL. `filter: None` = everything the
@@ -531,13 +504,6 @@ impl Train {
 	}
 
 }
-
-impl Default for Train {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
 
 /// Expand a leading `~` (the shell doesn't, since the path arrives as a literal
 /// string) to `$HOME`. Anything else is returned unchanged.
@@ -583,7 +549,7 @@ pub(crate) struct SavedWeights {
 	pub(crate) vocab: usize,
 }
 
-pub struct ModelInner {
+pub(crate) struct ModelInner {
 	pub(crate) specs: Vec<LayerSpec>,
 	pub(crate) loss: Loss,
 	pub(crate) lr: f64,
@@ -613,48 +579,6 @@ pub struct ModelInner {
 
 pub struct Model {
 	pub(crate) inner: Box<ModelInner>,
-}
-
-impl std::ops::Deref for Model {
-	type Target = ModelInner;
-	fn deref(&self) -> &ModelInner {
-		&self.inner
-	}
-}
-impl std::ops::DerefMut for Model {
-	fn deref_mut(&mut self) -> &mut ModelInner {
-		&mut self.inner
-	}
-}
-impl Drop for Model {
-	fn drop(&mut self) {
-		deregister_model(&*self.inner as *const ModelInner);
-	}
-}
-
-// Every live `Model` registers the stable address of its heap state here, so
-// `.run(())` / `.run(model)` can resolve "the Model in scope" with no argument.
-// Single-threaded GPU program; the table is per-thread by construction.
-thread_local! {
-	static MODELS: RefCell<Vec<*const ModelInner>> = const { RefCell::new(Vec::new()) };
-}
-fn register_model(p: *const ModelInner) {
-	MODELS.with(|m| m.borrow_mut().push(p));
-}
-fn deregister_model(p: *const ModelInner) {
-	MODELS.with(|m| m.borrow_mut().retain(|&x| !std::ptr::eq(x, p)));
-}
-/// The one live `Model`, or a clear panic when zero or several exist — backs the
-/// no-argument `.run()` / `.run(model)` "use what's in scope" resolution.
-fn the_model() -> *const ModelInner {
-	MODELS.with(|m| {
-		let m = m.borrow();
-		match m.len() {
-			1 => m[0],
-			0 => panic!("run(): no Model in scope — build one with Model::new()…, or pass it: train.run(model)"),
-			n => panic!("run(): {n} Models in scope — ambiguous; pass the one to run, e.g. train.run(model)"),
-		}
-	})
 }
 
 struct Issue {
@@ -850,22 +774,23 @@ fn confirm_issues(issues: &[Issue]) -> bool {
 }
 
 impl Model {
-
-	pub fn new() -> Model {
-		let inner = Box::new(ModelInner {
-			specs: Vec::new(),
-			loss: Loss::Mse,
-			lr: 0.01,
-			params: RefCell::new(Vec::new()),
-			scaler: RefCell::new(None),
-			yscaler: RefCell::new(None),
-			fit_score: Cell::new(f64::NAN),
-			saved_ogdl: RefCell::new(None),
-			arena_gen: Cell::new(None),
-			rebuild_backing: RefCell::new(None),
-		});
-		register_model(&*inner as *const ModelInner);
-		Model { inner }
+	/// Constructor: an empty architecture. Hands back a `&'static mut Model` so
+	/// every builder method can take `&mut self` and return `&mut Self`.
+	pub fn new() -> &'static mut Model {
+		Box::leak(Box::new(Model {
+			inner: Box::new(ModelInner {
+				specs: Vec::new(),
+				loss: Loss::Mse,
+				lr: 0.01,
+				params: RefCell::new(Vec::new()),
+				scaler: RefCell::new(None),
+				yscaler: RefCell::new(None),
+				fit_score: Cell::new(f64::NAN),
+				saved_ogdl: RefCell::new(None),
+				arena_gen: Cell::new(None),
+				rebuild_backing: RefCell::new(None),
+			}),
+		}))
 	}
 
 	/// Load shipped weights into a freshly-built model for forward-only use, with
@@ -875,11 +800,12 @@ impl Model {
 	/// params are built straight from the checkpoint blocks (same builder `fit`
 	/// uses); the scaler is set empty (the detector's pure-embed path z-scores
 	/// nothing) so `run`'s infer branch finds a scaler and skips scaling.
-	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
+	pub fn load<'a>(weights: &str, proto: &'a mut Model, d: usize) -> &'a mut Model {
 		let saved = load_ogdl_str(weights);
-		let vocab = pinned_vocab(&proto.specs)
+		let inner = &proto.inner;
+		let vocab = pinned_vocab(&inner.specs)
 			.expect("Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
-		let plan = plan_layer_params(&proto.specs, d, 0, vocab, &saved, true)
+		let plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true)
 			.unwrap_or_else(|e| panic!("Model::load: {e}"));
 		// ONE owned image + ONE load, then materialize views (backing kept in
 		// `rebuild_backing` for the model's life) — replaces per-layer alloc+upload.
@@ -887,77 +813,98 @@ impl Model {
 		let staged = GpuBuffer::alloc(host.len().max(1)).expect("Model::load staged alloc");
 		staged.load(host).expect("Model::load staged load");
 		let params = plan.materialize(&staged, 0);
-		*proto.rebuild_backing.borrow_mut() = Some(staged);
-		*proto.params.borrow_mut() = params;
-		*proto.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
-		*proto.yscaler.borrow_mut() = None;
+		*inner.rebuild_backing.borrow_mut() = Some(staged);
+		*inner.params.borrow_mut() = params;
+		*inner.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+		*inner.yscaler.borrow_mut() = None;
 		proto
 	}
 
-	pub fn layer(mut self, spec: impl IntoLayer) -> Model {
-		self.specs.push(spec.into_layer());
+	pub fn layer(&mut self, spec: impl IntoLayer) -> &mut Model {
+		self.inner.specs.push(spec.into_layer());
 		self
 	}
 
-	fn set_last_activation(mut self, act: Activation) -> Model {
-		match self.specs.last_mut() {
+	fn set_last_activation(&mut self, act: Activation) -> &mut Model {
+		match self.inner.specs.last_mut() {
 			Some(LayerSpec::Dense(_, a)) | Some(LayerSpec::Conv(_, _, _, a)) => *a = act,
 			_ => panic!("activation method called but last layer is not dense or conv"),
 		}
 		self
 	}
 
-	pub fn relu(self) -> Model {
+	pub fn relu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Relu)
 	}
-	pub fn leak(self) -> Model {
+	pub fn leak(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::LeakyRelu)
 	}
-	pub fn sigmoid(self) -> Model {
+	pub fn sigmoid(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Sigmoid)
 	}
-	pub fn tanh(self) -> Model {
+	pub fn tanh(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Tanh)
 	}
-	pub fn selu(self) -> Model {
+	pub fn selu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Selu)
 	}
-	pub fn gelu(self) -> Model {
+	pub fn gelu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Gelu)
 	}
-	pub fn silu(self) -> Model {
+	pub fn silu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Silu)
 	}
-	pub fn elu(self) -> Model {
+	pub fn elu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::Elu)
 	}
-	pub fn prelu(self) -> Model {
+	pub fn prelu(&mut self) -> &mut Model {
 		self.set_last_activation(Activation::PRelu)
 	}
 
 	/// 1D conv: `filters` output channels, `kernel` width, `stride` downsample
 	/// factor (1 = none). Stride is a conv parameter, not a separate step.
-	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Model {
-		self.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
+	pub fn conv(&mut self, filters: usize, kernel: usize, stride: usize) -> &mut Model {
+		self.inner.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
 		self
 	}
 
-	pub fn loss(mut self, loss: Loss) -> Model {
-		self.loss = loss;
+	pub fn loss(&mut self, loss: Loss) -> &mut Model {
+		self.inner.loss = loss;
 		self
 	}
 
-	/// Set the learning rate. To reset between runs, rebind:
-	/// `let model = model.lr(1e-8); train.run((&model, &data));`.
-	pub fn lr(mut self, lr: f64) -> Model {
-		self.lr = lr;
+	/// Set the learning rate. Reset it between runs by chaining again:
+	/// `train.run(data, model.lr(1e-8));`.
+	pub fn lr(&mut self, lr: f64) -> &mut Model {
+		self.inner.lr = lr;
 		self
 	}
-}
 
-impl Default for Model {
-	fn default() -> Self {
-		Self::new()
+	/// Open a forward-only pass. A forward pass IS a run, and a fit leaves the
+	/// arena carved to the last byte (the out-of-core engine budgets its windows
+	/// straight from `arena_remaining()`), so a forward pass cannot carve even one
+	/// input buffer out of what the previous run parked. Re-arm that parked backing
+	/// as this pass's arena: bump pointer rewound, one memset, no free and no
+	/// realloc — the freeAsync VA-reuse race stays structurally impossible, and the
+	/// driver's post-free counter depression (which refuses the re-claim) never
+	/// happens. Zeroing the slab drops the weights, so rebuild them from the host
+	/// mirror — the same rebuild a later training run forces. A model whose params
+	/// were never carved from a run backing (`Model::load`, untrained) owns its
+	/// memory: leave the arena alone. `0` is "no minimum": whatever was parked is
+	/// the arena, and a pass too big for it dies on a loud carve miss.
+	pub(crate) fn begin_forward(&self) -> Option<GpuBuffer> {
+		let slab = self.inner.arena_gen.get().and_then(|_| gpu_core::memory::adopt_run_backing(0));
+		self.inner.ensure_params_live();
+		slab
+	}
+
+	/// Close the pass: park the arena it adopted so the next run adopts it in turn,
+	/// and record the generation this model's params are now carved from.
+	pub(crate) fn end_forward(&self, slab: Option<GpuBuffer>) {
+		if let Some(slab) = slab {
+			gpu_core::memory::park_run_backing(slab);
+			self.inner.arena_gen.set(gpu_core::memory::live_parked_gen());
+		}
 	}
 }
 
@@ -992,9 +939,7 @@ mod metric_gpu_tests {
 		if !std::path::Path::new(TRAIN).exists() {
 			return None;
 		}
-		let data = crate::dataset::Data::load()
-			.set(TRAIN)
-			.target("Churn");
+		let data = crate::dataset::Data::load(TRAIN).target("Churn");
 		Some(data.datasets().0)
 	});
 
@@ -1211,19 +1156,17 @@ mod metric_gpu_tests {
 		// (2)+(3) Train through the preallocated loop, measuring per-epoch GPU
 		// allocations and train R². download_vec is host-only (no GpuBuffer
 		// alloc), so reading R² never perturbs the count.
-		let model = Model {
-			inner: Box::new(ModelInner {
-				specs: vec![],
-				loss: Loss::Mse,
-				lr: 0.5,
-				params: RefCell::new(vec![]),
-				scaler: RefCell::new(None),
-				yscaler: RefCell::new(None),
-				fit_score: Cell::new(f64::NAN),
-				saved_ogdl: RefCell::new(None),
-				arena_gen: Cell::new(None),
-				rebuild_backing: RefCell::new(None),
-			}),
+		let model = ModelInner {
+			specs: vec![],
+			loss: Loss::Mse,
+			lr: 0.5,
+			params: RefCell::new(vec![]),
+			scaler: RefCell::new(None),
+			yscaler: RefCell::new(None),
+			fit_score: Cell::new(f64::NAN),
+			saved_ogdl: RefCell::new(None),
+			arena_gen: Cell::new(None),
+			rebuild_backing: RefCell::new(None),
 		};
 		let ybar = y.iter().sum::<f64>() / n as f64;
 		let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
@@ -1327,19 +1270,17 @@ mod metric_gpu_tests {
 			.collect();
 
 		// --- ping-pong backward (modifies weights via SGD) ---
-		let model = Model {
-			inner: Box::new(ModelInner {
-				specs: vec![],
-				loss: Loss::Mse,
-				lr,
-				params: RefCell::new(vec![]),
-				scaler: RefCell::new(None),
-				yscaler: RefCell::new(None),
-				fit_score: Cell::new(f64::NAN),
-				saved_ogdl: RefCell::new(None),
-				arena_gen: Cell::new(None),
-				rebuild_backing: RefCell::new(None),
-			}),
+		let model = ModelInner {
+			specs: vec![],
+			loss: Loss::Mse,
+			lr,
+			params: RefCell::new(vec![]),
+			scaler: RefCell::new(None),
+			yscaler: RefCell::new(None),
+			fit_score: Cell::new(f64::NAN),
+			saved_ogdl: RefCell::new(None),
+			arena_gen: Cell::new(None),
+			rebuild_backing: RefCell::new(None),
 		};
 		let ss = crate::train::StepScalars::new(lr, n);
 		let consts = consts_buf();
