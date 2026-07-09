@@ -4,7 +4,7 @@ pkgver=0.0.r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)
 pkgrel=1
 url=https://github.com/nm-z/nates-recipe-rs
 arch=(x86_64)
-license=(LicenseRef-WIP)
+license=(MIT)
 depends=(rust hip-runtime-amd hipblas hipsolver gcc-libs xz bzip2)
 options=(!debug !lto)
 source=("nates-recipe-rs::git+file://$(dirname "$PWD")")
@@ -38,4 +38,5 @@ package() {
     install -m644 "$t/libpantry.rlib" "$pkgdir/usr/lib/recipe/"
     install -m644 "$t/librecipe_infer.rlib" "$pkgdir/usr/lib/recipe/"
     xargs -a "$srcdir/deps.files" install -m644 -t "$pkgdir/usr/lib/recipe/deps/"
+    install -Dm644 "$srcdir/nates-recipe-rs/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
