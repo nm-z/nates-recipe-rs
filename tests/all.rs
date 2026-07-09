@@ -2,8 +2,10 @@ use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
@@ -41,6 +43,35 @@ struct Attempt {
       capture: Vec<String>,
 }
 
+struct Tally {
+      discovered: usize,
+      passed: usize,
+      failed: usize,
+      unattempted: usize,
+}
+
+impl Tally {
+      fn ran(&self) -> usize {
+            self.passed + self.failed
+      }
+
+      fn failed_total(&self) -> usize {
+            self.failed + self.unattempted
+      }
+
+      fn green(&self) -> bool {
+            self.discovered > 0 && self.passed == self.discovered
+      }
+}
+
+fn out(s: &str) {
+      let _ = writeln!(std::io::stdout(), "{s}");
+}
+
+fn errline(s: &str) {
+      let _ = writeln!(std::io::stderr(), "{s}");
+}
+
 struct Log {
       f: File,
 }
@@ -49,7 +80,7 @@ impl Log {
       fn line(&mut self, s: &str) {
             writeln!(self.f, "{s}").expect("suite.log write");
             self.f.flush().expect("suite.log flush");
-            eprintln!("{s}");
+            errline(s);
       }
 }
 
@@ -132,7 +163,10 @@ fn install_traps() {
 
 fn main() {
       install_traps();
-      let code = run();
+      let code = match std::panic::catch_unwind(run) {
+            Ok(c) => c,
+            Err(p) => fatal(&format!("suite panicked: {}", panic_msg(&*p))),
+      };
       let pgid = CHILD_PGID.load(Ordering::SeqCst);
       if pgid > 0 {
             unsafe {
@@ -140,6 +174,22 @@ fn main() {
             }
       }
       std::process::exit(code);
+}
+
+fn acquire_lock() -> Option<File> {
+      let f = File::create(Path::new(ROOT).join("target").join(".suite.lock")).ok()?;
+      let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+      if rc == 0 { Some(f) } else { None }
+}
+
+fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
+      if let Some(s) = p.downcast_ref::<&str>() {
+            return (*s).to_owned();
+      }
+      if let Some(s) = p.downcast_ref::<String>() {
+            return s.clone();
+      }
+      "unknown payload".to_owned()
 }
 
 fn run() -> i32 {
@@ -150,33 +200,30 @@ fn run() -> i32 {
             [a] if a == "all" => None,
             [a] => Some(a.clone()),
             _ => {
-                  eprintln!("suite: takes at most one arg (\"all\" or an id substring), got {args:?}");
-                  return 2;
+                  return fatal(&format!(
+                        "suite takes at most one arg (\"all\" or an id substring), got {args:?}"
+                  ));
             }
+      };
+
+      let _lock = match acquire_lock() {
+            Some(f) => f,
+            None => return fatal("another suite run already holds target/.suite.lock"),
       };
 
       let binaries = match discover_binaries() {
             Ok(b) => b,
-            Err(e) => {
-                  eprintln!("suite: discovery failed: {e}");
-                  return 2;
-            }
+            Err(e) => return fatal(&format!("discovery failed: {e}")),
       };
       let probe = match build_probe() {
             Ok(p) => p,
-            Err(e) => {
-                  eprintln!("suite: probe build failed: {e}");
-                  return 2;
-            }
+            Err(e) => return fatal(&format!("probe build failed: {e}")),
       };
       let mut tests: Vec<Test> = Vec::new();
       for (pkg, target, exe, cwd) in &binaries {
             let (names, ignored) = match list_tests(exe, cwd) {
                   Ok(v) => v,
-                  Err(e) => {
-                        eprintln!("suite: --list failed for {}: {e}", exe.display());
-                        return 2;
-                  }
+                  Err(e) => return fatal(&format!("--list failed for {}: {e}", exe.display())),
             };
             for name in names {
                   tests.push(Test {
@@ -188,14 +235,16 @@ fn run() -> i32 {
                   });
             }
       }
-      let colliding: Vec<&str> =
-            tests.iter().filter(|t| t.id.contains("all")).map(|t| t.id.as_str()).collect();
+      let colliding: Vec<&str> = tests
+            .iter()
+            .filter(|t| t.id.starts_with("recipe/") && t.id.contains("all"))
+            .map(|t| t.id.as_str())
+            .collect();
       if !colliding.is_empty() {
-            eprintln!("suite: test ids may not contain \"all\" (cargo filter collision):");
-            for id in colliding {
-                  eprintln!("  {id}");
-            }
-            return 2;
+            return fatal(&format!(
+                  "root-package test ids may not contain \"all\" (cargo filter collision): {}",
+                  colliding.join(" ")
+            ));
       }
       if let Some(f) = &filter {
             tests.retain(|t| t.id.contains(f.as_str()));
@@ -208,41 +257,65 @@ fn run() -> i32 {
       };
       let head = format!("[S] discovered={} binaries={}", discovered, binaries.len());
       log.line(&head);
-      println!("{head}");
+      out(&head);
+      let mut tally = Tally { discovered, passed: 0, failed: 0, unattempted: 0 };
       if discovered == 0 {
             let mut gate = DeviceGate { state: Device::Clear, holders: Vec::new(), restored: true };
-            return finish(&mut log, 0, 0, 0, t0, 0.0, 3, &mut gate);
+            return finish(&mut log, &tally, t0, Instant::now(), 0.0, &mut gate);
       }
 
       let mut gate = DeviceGate::open(&mut log, &probe);
-      if gate.skip_all() {
-            let reason = gate.skip_reason();
-            for t in &tests {
-                  log.line(&format!("[SKIP] {} 0.0 {reason}", t.id));
-            }
-            log.line("[S] SKIP-MODE no test ran: free /dev/kfd or stop its holder by hand");
-            return finish(&mut log, 0, 0, discovered, t0, 0.0, 4, &mut gate);
+      let mut done = vec![false; tests.len()];
+      if gate.device_unusable() {
+            let abort = gate.unusable_reason();
+            fail_rest(&mut log, &mut tally, &tests, &done, &abort);
+            return finish(&mut log, &tally, t0, Instant::now(), 0.0, &mut gate);
       }
       let known = gate.known();
-
-      let (mut passed, mut failed) = (0usize, 0usize);
+      let dispatch_t0 = Instant::now();
       let mut test_secs = 0.0f64;
+
+      let ended = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            dispatch(&mut log, &probe, &tests, &known, &mut done, &mut tally, &mut test_secs)
+      }));
+      let abort = match ended {
+            Ok(Some(reason)) => reason,
+            Ok(None) => "suite ended early".to_owned(),
+            Err(p) => {
+                  let reason = oneline(&format!("suite panicked: {}", panic_msg(&*p)));
+                  log.line(&format!("[S] SUITE-PANIC {reason}"));
+                  reason
+            }
+      };
+      fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort));
+      finish(&mut log, &tally, t0, dispatch_t0, test_secs, &mut gate)
+}
+
+fn dispatch(
+      log: &mut Log,
+      probe: &Path,
+      tests: &[Test],
+      known: &[i32],
+      done: &mut [bool],
+      tally: &mut Tally,
+      test_secs: &mut f64,
+) -> Option<String> {
       let mut prev_violent: Option<String> = None;
       let mut rerun: Vec<(usize, Attempt, String)> = Vec::new();
-      let mut poisoned: Option<String> = None;
-      let mut busy_abort = false;
+      let mut abort: Option<String> = None;
 
       for (i, t) in tests.iter().enumerate() {
             if t.ignored {
                   log.line(&format!("[FAIL] {} 0.0 ignored", t.id));
-                  failed += 1;
+                  tally.failed += 1;
+                  done[i] = true;
                   prev_violent = None;
                   continue;
             }
-            let leaked = new_holders(&known);
+            let leaked = settled_holders(log, known);
             if !leaked.is_empty() {
                   log.line(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
-                  busy_abort = true;
+                  abort = Some(format!("device-busy pids={leaked:?}"));
                   break;
             }
             let att = run_test(t);
@@ -250,78 +323,96 @@ fn run() -> i32 {
             if let Some(culprit) = prev_violent.clone().filter(|_| att.outcome != Outcome::Pass) {
                   rerun.push((i, att, culprit));
                   prev_violent = if violent { Some(t.id.clone()) } else { None };
-                  if violent && !probe_ok(&probe) {
-                        poisoned = Some(t.id.clone());
+                  if violent && !probe_ok(probe) {
+                        abort = Some(poison(log, &t.id));
                         break;
                   }
                   continue;
             }
-            record(&mut log, &t.id, &att, &mut passed, &mut failed, &mut test_secs, None);
+            record(log, &t.id, &att, tally, test_secs, None);
+            done[i] = true;
             prev_violent = if violent { Some(t.id.clone()) } else { None };
-            if violent && !probe_ok(&probe) {
-                  poisoned = Some(t.id.clone());
+            if violent && !probe_ok(probe) {
+                  abort = Some(poison(log, &t.id));
                   break;
             }
       }
 
-      if busy_abort {
-            return finish(&mut log, passed, failed, 0, t0, test_secs, 4, &mut gate);
-      }
-
-      if poisoned.is_none() {
+      if abort.is_none() {
             for (i, first, culprit) in &rerun {
                   let t = &tests[*i];
-                  let leaked = new_holders(&known);
+                  let leaked = settled_holders(log, known);
                   if !leaked.is_empty() {
                         log.line(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
-                        return finish(&mut log, passed, failed, 0, t0, test_secs, 4, &mut gate);
+                        abort = Some(format!("device-busy pids={leaked:?}"));
+                        break;
                   }
                   let att = run_test(t);
                   let violent = matches!(att.outcome, Outcome::Signal(_) | Outcome::Deadline);
-                  record(
-                        &mut log,
-                        &t.id,
-                        &att,
-                        &mut passed,
-                        &mut failed,
-                        &mut test_secs,
-                        Some((first, culprit.as_str())),
-                  );
-                  if violent && !probe_ok(&probe) {
-                        poisoned = Some(t.id.clone());
+                  record(log, &t.id, &att, tally, test_secs, Some((first, culprit.as_str())));
+                  done[*i] = true;
+                  if violent && !probe_ok(probe) {
+                        abort = Some(poison(log, &t.id));
                         break;
                   }
             }
       }
+      abort
+}
 
-      if let Some(after) = &poisoned {
-            log.line(&format!("[S] DEVICE-POISONED after={after}"));
-            return finish(&mut log, passed, failed, 0, t0, test_secs, 4, &mut gate);
+fn poison(log: &mut Log, after: &str) -> String {
+      log.line(&format!("[S] DEVICE-POISONED after={after}"));
+      format!("device-poisoned after={after}")
+}
+
+fn oneline(s: &str) -> String {
+      s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str) {
+      for (i, t) in tests.iter().enumerate() {
+            if !done.get(i).copied().unwrap_or(false) {
+                  log.line(&format!("[FAIL] {} 0.0 not-attempted {abort}", t.id));
+                  tally.unattempted += 1;
+            }
       }
+}
 
-      let total = passed + failed;
-      let code = if total != discovered {
-            5
-      } else if failed > 0 {
-            1
-      } else if t0.elapsed().as_secs_f64() > WALL_BUDGET_SECS {
-            6
-      } else {
-            0
-      };
-      finish(&mut log, passed, failed, 0, t0, test_secs, code, &mut gate)
+fn fatal(msg: &str) -> i32 {
+      out(&format!("FAIL: {msg}"));
+      errline(&format!("FAIL: {msg}"));
+      1
 }
 
 fn new_holders(known: &[i32]) -> Vec<i32> {
       kfd_holders().into_iter().filter(|p| !known.contains(p)).collect()
 }
 
+fn settled_holders(log: &mut Log, known: &[i32]) -> Vec<i32> {
+      let first = new_holders(known);
+      if first.is_empty() {
+            return first;
+      }
+      log.line(&format!("[S] DEVICE-WAIT pids={first:?}"));
+      let t0 = Instant::now();
+      loop {
+            let leaked = new_holders(known);
+            if leaked.is_empty() {
+                  log.line(&format!("[S] DEVICE-CLEAR waited={:.1}s", t0.elapsed().as_secs_f64()));
+                  return leaked;
+            }
+            if t0.elapsed().as_secs_f64() >= DEVICE_FREE_DEADLINE_SECS {
+                  return leaked;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+      }
+}
+
 fn record(
       log: &mut Log,
       id: &str,
       att: &Attempt,
-      passed: &mut usize,
-      failed: &mut usize,
+      tally: &mut Tally,
       test_secs: &mut f64,
       first_try: Option<(&Attempt, &str)>,
 ) {
@@ -330,11 +421,11 @@ fn record(
       match &att.outcome {
             Outcome::Pass => {
                   log.line(&format!("[PASS] {} {:.1}", id, att.secs));
-                  *passed += 1;
+                  tally.passed += 1;
             }
             o => {
                   log.line(&format!("[FAIL] {} {:.1} {}", id, att.secs, reason(o)));
-                  *failed += 1;
+                  tally.failed += 1;
                   for line in &att.capture {
                         k += 1;
                         log.line(&format!("[E{k}] {line}"));
@@ -366,39 +457,71 @@ fn reason(o: &Outcome) -> String {
 
 fn finish(
       log: &mut Log,
-      passed: usize,
-      failed: usize,
-      skipped: usize,
+      tally: &Tally,
       t0: Instant,
+      dispatch_t0: Instant,
       test_secs: f64,
-      code: i32,
       gate: &mut DeviceGate,
 ) -> i32 {
       gate.restore(log);
       let wall = t0.elapsed().as_secs_f64();
+      let dispatch_secs = dispatch_t0.elapsed().as_secs_f64();
+      if dispatch_secs > WALL_BUDGET_SECS {
+            log.line(&format!(
+                  "[S] WALL-OVER dispatch={dispatch_secs:.1}s budget={WALL_BUDGET_SECS:.1}s"
+            ));
+      }
+      let mut faults: Vec<String> = Vec::new();
+      if tally.discovered == 0 {
+            faults.push("no tests discovered, nothing ran".to_owned());
+      }
+      if tally.passed + tally.failed + tally.unattempted != tally.discovered {
+            faults.push(format!(
+                  "accounting bug: passed={} + failed={} + unattempted={} != discovered={}",
+                  tally.passed, tally.failed, tally.unattempted, tally.discovered
+            ));
+      }
+      if tally.unattempted > 0 {
+            faults.push(format!(
+                  "{} tests not attempted (discovered={}, ran={})",
+                  tally.unattempted,
+                  tally.discovered,
+                  tally.ran()
+            ));
+      }
+      if tally.failed_total() > 0 {
+            faults.push(format!("{} tests FAILED", tally.failed_total()));
+      }
+      match std::fs::read_to_string(Path::new(ROOT).join("suite.log")) {
+            Ok(text) => {
+                  if let Some(bad) = text.lines().find(|l| !grammar_ok(l)) {
+                        faults.push(format!("log grammar violation: {bad:?}"));
+                  }
+            }
+            Err(e) => faults.push(format!("cannot reread suite.log: {e}")),
+      }
+      let code = if faults.is_empty() && tally.green() { 0 } else { 1 };
+      for f in &faults {
+            log.line(&format!("[S] FAIL: {f}"));
+      }
       let tail = format!(
-            "[S] passed={passed} failed={failed} skipped={skipped} total={} wall={wall:.1}s overhead={:.1}s exit={code}",
-            passed + failed + skipped,
+            "[S] passed={} failed={} unattempted={} discovered={} wall={wall:.1}s overhead={:.1}s exit={code}",
+            tally.passed,
+            tally.failed,
+            tally.unattempted,
+            tally.discovered,
             wall - test_secs
       );
       log.line(&tail);
-      println!("{tail}");
-      let text = std::fs::read_to_string(Path::new(ROOT).join("suite.log")).expect("reread log");
-      for line in text.lines() {
-            if !grammar_ok(line) {
-                  eprintln!("suite: log grammar violation: {line:?}");
-                  return 2;
-            }
+      for f in &faults {
+            out(&format!("FAIL: {f}"));
       }
+      out(&tail);
       code
 }
 
 fn grammar_ok(line: &str) -> bool {
-      if line.starts_with("[S] ")
-            || line.starts_with("[PASS] ")
-            || line.starts_with("[FAIL] ")
-            || line.starts_with("[SKIP] ")
-      {
+      if line.starts_with("[S] ") || line.starts_with("[PASS] ") || line.starts_with("[FAIL] ") {
             return true;
       }
       if let Some(rest) = line.strip_prefix("[E") {
@@ -416,7 +539,7 @@ fn await_kfd_teardown(pid: u32) {
       let t0 = Instant::now();
       while Path::new(&path).exists() {
             if t0.elapsed().as_secs_f64() >= KFD_TEARDOWN_DEADLINE_SECS {
-                  eprintln!("[RUN] kfd teardown of pid {pid} still live after {:.0}s — proceeding", t0.elapsed().as_secs_f64());
+                  errline(&format!("[RUN] kfd teardown of pid {pid} still live after {:.0}s — proceeding", t0.elapsed().as_secs_f64()));
                   return;
             }
             std::thread::sleep(Duration::from_millis(3));
@@ -450,7 +573,7 @@ fn run_test(t: &Test) -> Attempt {
                   None => {
                         let el = start.elapsed().as_secs_f64();
                         if el >= next_tick as f64 {
-                              eprintln!("[RUN] {} {}s", t.id, next_tick);
+                              errline(&format!("[RUN] {} {}s", t.id, next_tick));
                               next_tick += 10;
                         }
                         if el >= TEST_DEADLINE_SECS {
@@ -599,7 +722,7 @@ impl DeviceGate {
             DeviceGate { state: probe_state(log, probe), holders, restored: true }
       }
 
-      fn skip_all(&self) -> bool {
+      fn device_unusable(&self) -> bool {
             matches!(self.state, Device::Unusable)
       }
 
@@ -610,7 +733,7 @@ impl DeviceGate {
             }
       }
 
-      fn skip_reason(&self) -> String {
+      fn unusable_reason(&self) -> String {
             format!("device-busy probe=fail pids={:?}", self.known())
       }
 
@@ -652,7 +775,7 @@ impl Drop for DeviceGate {
                   if let Some(sc) = find_systemctl() {
                         for u in units {
                               let (rc, _) = systemctl_run(&sc, &["--user", "start", u]);
-                              eprintln!("[RUN] daemon restart on unwind: unit={u} rc={rc}");
+                              errline(&format!("[RUN] daemon restart on unwind: unit={u} rc={rc}"));
                         }
                   }
             }
