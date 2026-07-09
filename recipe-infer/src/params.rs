@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
 use gpu_core::memory::GpuBuffer;
@@ -278,7 +279,10 @@ pub(crate) fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let tmp = std::env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", std::process::id()));
-	let tp = tmp.to_str().expect("utf8 tmp");
+	let Some(tp) = tmp.to_str() else {
+		assert!(false, "utf8 tmp");
+		return String::new();
+	};
 	let _ = std::fs::remove_file(tp);
 	let g = ogdl::file(tp);
 	build(g.clone());
@@ -624,11 +628,11 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 		};
 		match block.name.as_str() {
 			"embed" => {
-				let mut rows: Vec<(usize, Vec<f64>)> = block
-					.children
-					.iter()
-					.map(|c| (c.name.parse().expect("resume: embed row id"), vals(c)))
-					.collect();
+				let mut rows: Vec<(usize, Vec<f64>)> = Vec::with_capacity(block.children.len());
+				for c in &block.children {
+					let id = c.name.parse().context("resume: embed row id")?;
+					rows.push((id, vals(c)));
+				}
 				rows.sort_by_key(|(id, _)| *id);
 				out.push(Saved::Embed(
 					rows.into_iter().flat_map(|(_, v)| v).collect(),
@@ -652,13 +656,13 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 				for c in &block.children {
 					match c.name.as_str() {
 						"w" => w = vals(c),
-						"b" => b = vals(c).first().copied().expect("resume: dense b"),
+						"b" => b = vals(c).first().copied().ok_or_else(|| anyhow::anyhow!("resume: dense b"))?,
 						"a" => a = vals(c).first().copied(),
 						key if key.starts_with('w')
 							&& key.len() > 1
 							&& key[1..].chars().all(|ch| ch.is_ascii_digit()) =>
 						{
-							w.push(vals(c).first().copied().expect("resume: dense w{n}"));
+							w.push(vals(c).first().copied().ok_or_else(|| anyhow::anyhow!("resume: dense w{{n}}"))?);
 						}
 						key => anyhow::bail!(
 							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"

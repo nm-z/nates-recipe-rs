@@ -82,7 +82,9 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
 		offset += len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let x = Mat::from_shape_vec((n, new_ncols), data).expect("collapse_onehot");
+	let r = Mat::from_shape_vec((n, new_ncols), data);
+	assert!(r.is_ok(), "collapse_onehot: {}", r.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
+	let Ok(x) = r else { loop {} };
 	(x, embed_cols, offset)
 }
 
@@ -214,7 +216,10 @@ impl DataInner {
 	}
 
 	pub fn datasets(&self) -> (Dataset, Option<Dataset>) {
-		self.try_datasets().expect("Data::datasets")
+		let r = self.try_datasets();
+		assert!(r.is_ok(), "Data::datasets: {}", r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		let Ok(v) = r else { loop {} };
+		v
 	}
 
 	pub(crate) fn try_datasets(&self) -> anyhow::Result<(Dataset, Option<Dataset>)> {
@@ -388,8 +393,8 @@ impl DataInner {
 		let resolved = self.resolve_targets(&names, None)?;
 		let targets: Vec<usize> = resolved
 			.iter()
-			.map(|t| names.iter().position(|n| n == t).expect("resolved from names"))
-			.collect();
+			.map(|t| names.iter().position(|n| n == t).ok_or_else(|| anyhow::anyhow!("resolved from names")))
+			.collect::<anyhow::Result<Vec<_>>>()?;
 		pantry::encode::prepare_arff_data(
 			&self.attrs,
 			&self.rows,
@@ -447,7 +452,7 @@ impl DataInner {
 		}
 		if let Some(tn) = test_names {
 			if set_names.len() == tn.len() + 1 {
-				return Ok(vec![set_names.last().expect("set has columns").clone()]);
+				return Ok(vec![set_names.last().ok_or_else(|| anyhow::anyhow!("set has columns"))?.clone()]);
 			}
 		}
 		Ok(Vec::new())

@@ -245,21 +245,30 @@ impl Train {
 				eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
 				return self;
 			}
-			other => other.expect("run: prepare data"),
+			other => {
+				assert!(other.is_ok(), "run: prepare data: {}", other.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				let Ok(v) = other else { loop {} };
+				v
+			}
 		};
 		let ds = prepared.get();
 		let forward_only = data.infer_only() || !ds.has_target || self.epochs == 0;
-		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = self.net.as_ref().map(|net| {
-			let cs = net.connect().expect("net: connect");
-			for c in &cs {
-				eprintln!(
-					"\x1b[33mnet\x1b[0m  pooled {} ({} RAM)",
-					c.info.arch,
-					crate::data::human_bytes(c.info.ram as usize),
-				);
+		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
+			Some(net) => {
+				let cs = net.connect();
+				assert!(cs.is_ok(), "net: connect: {}", cs.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				let Ok(cs) = cs else { loop {} };
+				for c in &cs {
+					eprintln!(
+						"\x1b[33mnet\x1b[0m  pooled {} ({} RAM)",
+						c.info.arch,
+						crate::data::human_bytes(c.info.ram as usize),
+					);
+				}
+				Some(std::sync::Arc::new(cs))
 			}
-			std::sync::Arc::new(cs)
-		});
+			None => None,
+		};
 		let net_ram: usize = conns.as_ref().map_or(0, |cs| {
 			cs.iter().map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB)).sum()
 		});
@@ -273,7 +282,8 @@ impl Train {
 			if let Some(a) = run_hip.as_ref() {
 				eprint!("-- run pre-fit --\n{}", gpu_core::callspy::report_since(a));
 			}
-			model.fit(ds, self, resume.as_deref(), conns).expect("run: fit");
+			let __fit = model.fit(ds, self, resume.as_deref(), conns);
+			assert!(__fit.is_ok(), "run: fit: {}", __fit.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let post_fit = run_hip.map(|_| gpu_core::callspy::snapshot());
 			if INTERRUPTED.load(Ordering::SeqCst) {
 				eprintln!("\x1b[33minterrupted\x1b[0m");
@@ -304,14 +314,26 @@ impl Train {
 			let k = params[params.len() - 1].out_dim;
 			let yscaler = *model.yscaler.borrow();
 			let (score, preds) = if ds.has_target && !self.metrics.is_empty() {
-				let ybuf = { let __up = ds.y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
+				let ybuf = {
+					let __up = ds.y.as_slice();
+					assert!(__up.is_some(), "run: eval metrics: y contig");
+					let Some(__up) = __up else { loop {} };
+					let __ub = GpuBuffer::alloc(__up.len());
+					assert!(__ub.is_ok(), "run: eval metrics: ybuf: {}", __ub.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+					let Ok(__ub) = __ub else { loop {} };
+					let __ld = __ub.load(__up);
+					assert!(__ld.is_ok(), "run: eval metrics: ybuf: {}", __ld.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+					__ub
+				};
 				let total = (n * k) as f64;
 				let ybar = ds.y.iter().sum::<f64>() / total;
 				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-				let (preds, vals) = infer_scored(
+				let __sc = infer_scored(
 					&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
 					model.loss, model.lr, &self.metrics, ss_tot,
-				).expect("run: eval metrics");
+				);
+				assert!(__sc.is_ok(), "run: eval metrics: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				let Ok((preds, vals)) = __sc else { loop {} };
 				eprintln!("eval  {}", model.metrics_line(&self.metrics, &vals));
 				let stop = if model.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
 				let score = self
@@ -322,10 +344,12 @@ impl Train {
 					.map_or(f64::NAN, |(_, v)| *v);
 				(score, preds)
 			} else {
-				let (preds, _) = infer_scored(
+				let __sc = infer_scored(
 					&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
 					model.loss, model.lr, &[], 0.0,
-				).expect("run: eval predictions");
+				);
+				assert!(__sc.is_ok(), "run: eval predictions: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				let Ok((preds, _)) = __sc else { loop {} };
 				(f64::NAN, preds)
 			};
 			let mut last = self.last.borrow_mut();
@@ -381,7 +405,8 @@ impl Train {
 				params.iter().map(|p| p.out_dim).sum::<usize>(),
 			)
 		};
-		recipe_infer::write_ogdl(&path, &text);
+		let __wr = recipe_infer::write_ogdl(&path, &text);
+		assert!(__wr.is_ok(), "write model file: {}", __wr.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_| path.as_str().into());
 		eprintln!("saved {} ({neurons} neurons, {key} {score:.4})", full.display());
 	}
@@ -477,16 +502,24 @@ impl ModelInner {
 		}
 		let params = {
 			let mirror = self.saved_ogdl.borrow();
-			let m = mirror.as_ref().expect(
+			assert!(
+				mirror.is_some(),
 				"eval: this model's device weights were freed by a later training run and \
 				 there is no host mirror to restore them (pooled out-of-core arena run)",
 			);
-			let saved = load_ogdl_str(&m.text).expect("eval: parse host weight mirror");
-			let plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true)
-				.expect("eval: rebuild weights from mirror");
+			let Some(m) = mirror.as_ref() else { loop {} };
+			let __saved = load_ogdl_str(&m.text);
+			assert!(__saved.is_ok(), "eval: parse host weight mirror: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok(saved) = __saved else { loop {} };
+			let __plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true);
+			assert!(__plan.is_ok(), "eval: rebuild weights from mirror: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok(plan) = __plan else { loop {} };
 			let host = plan.host();
-			let staged = GpuBuffer::alloc(host.len().max(1)).expect("rebuild staged alloc");
-			staged.load(host).expect("rebuild staged load");
+			let __staged = GpuBuffer::alloc(host.len().max(1));
+			assert!(__staged.is_ok(), "rebuild staged alloc: {}", __staged.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok(staged) = __staged else { loop {} };
+			let __sl = staged.load(host);
+			assert!(__sl.is_ok(), "rebuild staged load: {}", __sl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let params = plan.materialize(&staged, 0);
 			*self.rebuild_backing.borrow_mut() = Some(staged);
 			params
@@ -616,15 +649,22 @@ impl Model {
 	}
 
 	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
-		let saved = load_ogdl_str(weights).expect("Model::load: parse weights");
+		let __saved = load_ogdl_str(weights);
+		assert!(__saved.is_ok(), "Model::load: parse weights: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		let Ok(saved) = __saved else { loop {} };
 		let inner = &proto.inner;
-		let vocab = pinned_vocab(&inner.specs)
-			.expect("Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
-		let plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true)
-			.expect("Model::load: plan layer params");
+		let __vocab = pinned_vocab(&inner.specs);
+		assert!(__vocab.is_some(), "Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
+		let Some(vocab) = __vocab else { loop {} };
+		let __plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true);
+		assert!(__plan.is_ok(), "Model::load: plan layer params: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		let Ok(plan) = __plan else { loop {} };
 		let host = plan.host();
-		let staged = GpuBuffer::alloc(host.len().max(1)).expect("Model::load staged alloc");
-		staged.load(host).expect("Model::load staged load");
+		let __staged = GpuBuffer::alloc(host.len().max(1));
+		assert!(__staged.is_ok(), "Model::load staged alloc: {}", __staged.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		let Ok(staged) = __staged else { loop {} };
+		let __sl = staged.load(host);
+		assert!(__sl.is_ok(), "Model::load staged load: {}", __sl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let params = plan.materialize(&staged, 0);
 		*inner.rebuild_backing.borrow_mut() = Some(staged);
 		*inner.params.borrow_mut() = params;
@@ -646,9 +686,10 @@ impl Model {
 	}
 
 	fn set_last_activation(mut self, act: Activation) -> Model {
-		*self
-			.last_activation_slot()
-			.expect("activation method called but last layer is not dense or conv") = act;
+		let __slot = self.last_activation_slot();
+		assert!(__slot.is_some(), "activation method called but last layer is not dense or conv");
+		let Some(__slot) = __slot else { loop {} };
+		*__slot = act;
 		self
 	}
 
@@ -697,7 +738,9 @@ impl Model {
 
 	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
 		let inner = &self.inner;
-		let prepared = data.prepared().expect("eval: prepare data");
+		let __prep = data.prepared();
+		assert!(__prep.is_ok(), "eval: prepare data: {}", __prep.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		let Ok(prepared) = __prep else { loop {} };
 		let ds = prepared.get();
 		let arena = self.begin_forward();
 		let (xbuf, x_cat, n) = inner.prep_eval_input(ds);
@@ -706,25 +749,34 @@ impl Model {
 		let yscaler = *inner.yscaler.borrow();
 		let metric = if inner.loss.is_classification() { Metric::Accuracy } else { Metric::R2 };
 		let preds = if ds.has_target {
-			let yslice = ds.y.as_slice().expect("eval: y contiguous");
-			let ybuf = GpuBuffer::alloc(yslice.len()).expect("eval ybuf");
-			ybuf.load(yslice).expect("eval ybuf load");
+			let __ys = ds.y.as_slice();
+			assert!(__ys.is_some(), "eval: y contiguous");
+			let Some(yslice) = __ys else { loop {} };
+			let __yb = GpuBuffer::alloc(yslice.len());
+			assert!(__yb.is_ok(), "eval ybuf: {}", __yb.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok(ybuf) = __yb else { loop {} };
+			let __yl = ybuf.load(yslice);
+			assert!(__yl.is_ok(), "eval ybuf load: {}", __yl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let k = params[params.len() - 1].out_dim;
 			let total = (n * k) as f64;
 			let ybar = ds.y.iter().sum::<f64>() / total;
 			let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-			let (preds, vals) = infer_scored(
+			let __sc = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, Some(&ybuf),
 				inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
-			).expect("eval: metrics");
+			);
+			assert!(__sc.is_ok(), "eval: metrics: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok((preds, vals)) = __sc else { loop {} };
 			let label = if inner.loss.is_classification() { "accuracy" } else { "R2" };
 			eprintln!("eval: {label} = {:.4} ({n} samples)", vals[0]);
 			preds
 		} else {
-			let (preds, _) = infer_scored(
+			let __sc = infer_scored(
 				&params, &xbuf, x_cat.as_ref(), n, yscaler, None,
 				inner.loss, inner.lr, &[], 0.0,
-			).expect("eval: predictions");
+			);
+			assert!(__sc.is_ok(), "eval: predictions: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let Ok((preds, _)) = __sc else { loop {} };
 			eprintln!("eval: {n} samples (no target column, score unavailable)");
 			preds
 		};
@@ -890,7 +942,7 @@ mod metric_gpu_tests {
 		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 		let consts = consts_buf();
 		let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
-		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+		forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 		let last = params.len() - 1;
 		let p = download_vec(&sc.acts[last], n);
 		let ybar = y.iter().sum::<f64>() / n as f64;
@@ -931,7 +983,7 @@ mod metric_gpu_tests {
 		let out = &sc.acts[last];
 		let metric = |m: Metric, loss: Loss| -> f64 {
 			let (sign, div) =
-				metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar);
+				metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar).expect("metric");
 			let v = sign * download_scalar(&sc.metric_scalar) / div;
 			if m == Metric::R2 { 1.0 - v } else { v }
 		};
@@ -1006,14 +1058,14 @@ mod metric_gpu_tests {
 
 		let consts = consts_buf();
 		let sc_ref = Scratch::new_infer(&params, n, &consts).expect("scratch");
-		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
+		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref).expect("forward");
 		let out_ref = download_vec(&sc_ref.acts[last], n);
 		drop(sc_ref);
 		let sc = {
 			let _t_scratch = gpu_core::memory::tag_scope("scratch");
 			Scratch::new_full(&params, n, &consts).expect("scratch")
 		};
-		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+		forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 		let out_into = download_vec(&sc.acts[last], n);
 		let fwd_diff = out_ref
 			.iter()
@@ -1041,7 +1093,7 @@ mod metric_gpu_tests {
 		let ss_tot: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
 		let ss = crate::train::StepScalars::new(0.5, n);
 
-		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+		forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 
 		const EPOCHS: usize = 10;
@@ -1049,7 +1101,7 @@ mod metric_gpu_tests {
 		{
 			let _alloc_guard = gpu_core::memory::AllocGuard::freeze();
 			for _ in 0..EPOCHS {
-				forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+				forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 				model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
 				r2s.push(1.0 - download_scalar(&sc.metric_scalar) / ss_tot);
@@ -1149,7 +1201,7 @@ mod metric_gpu_tests {
 		let ss = crate::train::StepScalars::new(lr, n);
 		let consts = consts_buf();
 		let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
-		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+		forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 		let pp_w: Vec<Vec<f64>> = params
 			.iter()
@@ -1165,7 +1217,7 @@ mod metric_gpu_tests {
 			p.b.load(&init_b[l]).expect("restore b");
 		}
 
-		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+		forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 		let mut ref_da: Vec<GpuBuffer> = Vec::new();
 		let mut ref_dz: Vec<GpuBuffer> = Vec::new();
 		let mut ref_dw: Vec<GpuBuffer> = Vec::new();

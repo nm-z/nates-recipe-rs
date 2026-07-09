@@ -189,7 +189,7 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 			}
 			let mut out = String::new();
 			use std::io::Read as _;
-			child.stdout.take().expect("probe child stdout").read_to_string(&mut out)?;
+			child.stdout.take().ok_or_else(|| anyhow::anyhow!("probe child stdout"))?.read_to_string(&mut out)?;
 			let f: Vec<&str> = out.trim().split('|').collect();
 			if f.len() != 4 {
 				bail!("probe child output malformed: {out:?}");

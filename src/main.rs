@@ -86,7 +86,7 @@ fn main() -> Result<()> {
 			let mean = gpu_core::memory::GpuBuffer::alloc(cc).expect("mean");
 			let std = gpu_core::memory::GpuBuffer::alloc(cc).expect("std");
 			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc).expect("zscored");
-			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb);
+			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
 			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).expect("lse");
 			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).expect("dsum");
 			let mut fills = Vec::new();

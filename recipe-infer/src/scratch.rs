@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{LayerDims, LayerParams, concat_layer};
 use gpu_core::kernels;
@@ -81,10 +82,18 @@ pub fn layer_ms_from(
 	layers: usize,
 ) -> (Vec<f64>, Vec<f64>) {
 	let f = (0..layers)
-		.map(|l| gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]).expect("fwd elapsed") as f64)
+		.map(|l| {
+			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
+			assert!(e.is_ok(), "fwd elapsed: {}", e.as_ref().err().map(|x| x.to_string()).unwrap_or_default());
+			e.unwrap_or(0.0) as f64
+		})
 		.collect();
 	let b = (0..layers)
-		.map(|l| gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]).expect("bwd elapsed") as f64)
+		.map(|l| {
+			let e = gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]);
+			assert!(e.is_ok(), "bwd elapsed: {}", e.as_ref().err().map(|x| x.to_string()).unwrap_or_default());
+			e.unwrap_or(0.0) as f64
+		})
 		.collect();
 	(f, b)
 }
@@ -244,6 +253,19 @@ impl Scratch {
 		};
 		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
 		let pinned_pair = pinned_scalar_pair();
+		let copy_stream = gpu_core::hip::Stream::new().context("copy stream")?;
+		let mut ev_fwd = Vec::with_capacity(n_timed);
+		let mut ev_bwd = Vec::with_capacity(n_timed);
+		for _ in 0..n_timed {
+			let mut f = Vec::with_capacity(params.len() + 1);
+			let mut b = Vec::with_capacity(params.len() + 1);
+			for _ in 0..=params.len() {
+				f.push(gpu_core::hip::Event::new().context("layer timing event")?);
+				b.push(gpu_core::hip::Event::new().context("layer timing event")?);
+			}
+			ev_fwd.push(f);
+			ev_bwd.push(b);
+		}
 		Ok(Scratch {
 			acts,
 			preact,
@@ -297,15 +319,11 @@ impl Scratch {
 			conv_temp: conv_temp_buf,
 			conv_wg: conv_wg_count,
 			infer: forward_only,
-			copy_stream: gpu_core::hip::Stream::new().expect("copy stream"),
+			copy_stream,
 			pinned_scalar: pinned_pair,
 			pinned_scalar_b: unsafe { pinned_pair.add(1) },
-			ev_fwd: (0..n_timed)
-				.map(|_| (0..=params.len()).map(|_| gpu_core::hip::Event::new().expect("layer timing event")).collect())
-				.collect(),
-			ev_bwd: (0..n_timed)
-				.map(|_| (0..=params.len()).map(|_| gpu_core::hip::Event::new().expect("layer timing event")).collect())
-				.collect(),
+			ev_fwd,
+			ev_bwd,
 			timing: std::cell::Cell::new(false),
 			timing_slot: std::cell::Cell::new(0),
 		})
@@ -321,19 +339,22 @@ impl Scratch {
 
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
-			unsafe { self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record fwd event") }
+			let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut()) };
+			assert!(r.is_ok(), "record fwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 		}
 	}
 
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
-			unsafe { self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut()).expect("record bwd event") }
+			let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut()) };
+			assert!(r.is_ok(), "record bwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 		}
 	}
 
 	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
 		let s = self.timing_slot.get();
-		self.ev_bwd[s][0].synchronize().expect("sync bwd event");
+		let r = self.ev_bwd[s][0].synchronize();
+		assert!(r.is_ok(), "sync bwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
@@ -366,7 +387,8 @@ impl Scratch {
 	}
 
 	pub fn sync_deferred_scalar(&self) -> f64 {
-		self.copy_stream.synchronize().expect("sync copy stream");
+		let r = self.copy_stream.synchronize();
+		assert!(r.is_ok(), "sync copy stream: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 		unsafe { *self.pinned_scalar }
 	}
 
@@ -376,7 +398,8 @@ impl Scratch {
 	}
 
 	pub fn sync_copy_stream(&self) {
-		self.copy_stream.synchronize().expect("sync copy stream");
+		let r = self.copy_stream.synchronize();
+		assert!(r.is_ok(), "sync copy stream: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 	}
 
 	pub fn deferred_scalar(&self) -> f64 {
@@ -418,7 +441,9 @@ static PINNED_PAIR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 fn pinned_scalar_pair() -> *mut f64 {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
 	if *g == 0 {
-		*g = gpu_core::hip::host_malloc(16, 0).expect("pinned scalars") as usize;
+		let hm = gpu_core::hip::host_malloc(16, 0);
+		assert!(hm.is_ok(), "pinned scalars: {}", hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
+		*g = hm.unwrap_or(std::ptr::null_mut()) as usize;
 	}
 	*g as *mut f64
 }
@@ -578,8 +603,10 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 					if *kind == LayerKind::Conv { 0 } else { 1 }
 				});
 				let cin = if cin == 0 {
-					let prev = fake_params.last().expect("conv cin");
-					prev.1 / ((prev.0 / prev.3.max(1) - prev.4) / prev.6.max(1) + 1).max(1)
+					match fake_params.last() {
+						Some(prev) => prev.1 / ((prev.0 / prev.3.max(1) - prev.4) / prev.6.max(1) + 1).max(1),
+						None => { assert!(false, "conv cin"); 0 }
+					}
 				} else {
 					cin
 				};

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::enums::{Activation, LayerKind, Loss, Metric};
 use crate::params::{LayerParams, concat_layer};
 use crate::scratch::Scratch;
@@ -14,78 +15,78 @@ pub fn metric_gpu_into(
 	k: usize,
 	ss_tot: f64,
 	dst: &GpuBuffer,
-) -> (f64, f64) {
+) -> anyhow::Result<(f64, f64)> {
 	let nk = n * k;
-	match m {
+	Ok(match m {
 		Metric::Loss => {
 			match loss {
 				Loss::Mse => {
-					kernels::gpu_mse_into(out, ybuf, nk, dst).expect("mse");
+					kernels::gpu_mse_into(out, ybuf, nk, dst)?;
 					(1.0, 1.0)
 				}
 				Loss::Mae => {
-					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0).expect("sub");
-					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0).expect("abs");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
+					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
+					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
 					(1.0, nk as f64)
 				}
 				Loss::Huber => {
-					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0).expect("sub");
-					kernels::gpu_clamp_into(&sc.metric_t0, &sc.c_neg_one, &sc.c_one, nk, &sc.metric_t1).expect("clamp");
-					kernels::gpu_copy_into(&sc.metric_t1, nk, &sc.metric_t2).expect("copy");
-					kernels::gpu_mul_inplace(&sc.metric_t1, nk, &sc.metric_t2).expect("mul");
-					kernels::gpu_scale_inplace(&sc.c_half, nk, &sc.metric_t2).expect("scale");
-					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0).expect("abs");
-					kernels::gpu_add_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("add");
-					kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1).expect("abs");
-					kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2).expect("sub");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.reduce_ws, nk, 1, dst).expect("reduce");
+					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
+					kernels::gpu_clamp_into(&sc.metric_t0, &sc.c_neg_one, &sc.c_one, nk, &sc.metric_t1)?;
+					kernels::gpu_copy_into(&sc.metric_t1, nk, &sc.metric_t2)?;
+					kernels::gpu_mul_inplace(&sc.metric_t1, nk, &sc.metric_t2)?;
+					kernels::gpu_scale_inplace(&sc.c_half, nk, &sc.metric_t2)?;
+					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+					kernels::gpu_add_inplace(&sc.metric_t0, nk, &sc.metric_t2)?;
+					kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1)?;
+					kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2)?;
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.reduce_ws, nk, 1, dst)?;
 					(1.0, nk as f64)
 				}
 				Loss::Ce => {
-					kernels::gpu_softmax_rows_into(out, n, k, &sc.metric_t0).expect("softmax");
-					kernels::gpu_clamp_into(&sc.metric_t0, &sc.c_eps, &sc.c_one, nk, &sc.metric_t0).expect("clamp");
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0).expect("log");
-					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0).expect("mul");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
+					kernels::gpu_softmax_rows_into(out, n, k, &sc.metric_t0)?;
+					kernels::gpu_clamp_into(&sc.metric_t0, &sc.c_eps, &sc.c_one, nk, &sc.metric_t0)?;
+					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0)?;
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
 					(-1.0, n as f64)
 				}
 				Loss::Bce => {
-					kernels::gpu_clamp_into(out, &sc.c_eps, &sc.c_one_minus_eps, nk, &sc.metric_t0).expect("clamp");
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t1).expect("log");
-					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t1).expect("mul");
-					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t0).expect("scale");
-					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t0).expect("add");
-					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0).expect("log");
-					kernels::gpu_copy_into(ybuf, nk, &sc.metric_t2).expect("copy");
-					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t2).expect("scale");
-					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t2).expect("add");
-					kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2).expect("mul");
-					kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1).expect("add");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.reduce_ws, nk, 1, dst).expect("reduce");
+					kernels::gpu_clamp_into(out, &sc.c_eps, &sc.c_one_minus_eps, nk, &sc.metric_t0)?;
+					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t1)?;
+					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t1)?;
+					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t0)?;
+					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t0)?;
+					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+					kernels::gpu_copy_into(ybuf, nk, &sc.metric_t2)?;
+					kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t2)?;
+					kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t2)?;
+					kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2)?;
+					kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1)?;
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.reduce_ws, nk, 1, dst)?;
 					(-1.0, nk as f64)
 				}
 				Loss::Focal => {
-					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.c_focal_gamma, &sc.c_focal_alpha, nk, &sc.metric_t0, &sc.metric_t1).expect("focal");
-					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst).expect("reduce");
+					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.c_focal_gamma, &sc.c_focal_alpha, nk, &sc.metric_t0, &sc.metric_t1)?;
+					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
 					(1.0, nk as f64)
 				}
 			}
 		}
 		Metric::R2 => {
-			kernels::gpu_ss_res_into(out, ybuf, nk, dst).expect("ss_res");
+			kernels::gpu_ss_res_into(out, ybuf, nk, dst)?;
 			(1.0, ss_tot)
 		}
 		Metric::Accuracy => {
 			if k == 1 {
-				kernels::gpu_accuracy_into(out, ybuf, n, dst).expect("accuracy");
+				kernels::gpu_accuracy_into(out, ybuf, n, dst)?;
 			} else {
-				kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst).expect("argmax accuracy");
+				kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst)?;
 			}
 			(1.0, 1.0)
 		}
 		_ => (1.0, 1.0),
-	}
+	})
 }
 
 pub const ZSCORE_EPS: f64 = 1e-8;
@@ -96,12 +97,12 @@ pub fn zscore_apply_views(
 	d: usize,
 	mean: &GpuBuffer,
 	std: &GpuBuffer,
-) -> GpuBuffer {
-	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
-	let xbuf = GpuBuffer::alloc(n * d).expect("scale");
-	kernels::gpu_broadcast_div(&xc, std, n * d, d, &xbuf).expect("scale");
-	xbuf
+) -> anyhow::Result<GpuBuffer> {
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	let xbuf = GpuBuffer::alloc(n * d).context("scale")?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, &xbuf)?;
+	Ok(xbuf)
 }
 
 pub fn zscore_fit_into(
@@ -112,17 +113,18 @@ pub fn zscore_fit_into(
 	mean: &GpuBuffer,
 	std: &GpuBuffer,
 	out: &GpuBuffer,
-) {
+) -> anyhow::Result<()> {
 	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
-	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).expect("zscore ws");
-	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean).expect("mean");
-	let var = GpuBuffer::alloc(d).expect("var");
-	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var).expect("var");
-	kernels::gpu_add_scalar_inplace(eps, d, &var).expect("var eps");
-	kernels::gpu_sqrt(&var, d, std).expect("std");
-	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
-	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
+	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).context("zscore ws")?;
+	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean)?;
+	let var = GpuBuffer::alloc(d).context("var")?;
+	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var)?;
+	kernels::gpu_add_scalar_inplace(eps, d, &var)?;
+	kernels::gpu_sqrt(&var, d, std)?;
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out)?;
+	Ok(())
 }
 
 pub fn zscore_apply_into(
@@ -132,10 +134,11 @@ pub fn zscore_apply_into(
 	mean: &GpuBuffer,
 	std: &GpuBuffer,
 	out: &GpuBuffer,
-) {
-	let xc = GpuBuffer::alloc(n * d).expect("center");
-	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc).expect("center");
-	kernels::gpu_broadcast_div(&xc, std, n * d, d, out).expect("scale");
+) -> anyhow::Result<()> {
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out)?;
+	Ok(())
 }
 
 pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -185,7 +188,7 @@ pub fn forward_into(
 	n: usize,
 	acts: &[GpuBuffer],
 	sc: &Scratch,
-) {
+) -> anyhow::Result<()> {
 	let cc = concat_layer(params);
 	sc.mark_fwd(0);
 	for (l, p) in params.iter().enumerate() {
@@ -194,12 +197,12 @@ pub fn forward_into(
 		{
 			kernels::gpu_concat_into(
 				&acts[l - 1],
-				x_cat.expect("concat: x_cat missing"),
+				x_cat.ok_or_else(|| anyhow::anyhow!("concat: x_cat missing"))?,
 				n,
 				a,
 				c,
 				&sc.concat,
-			).expect("concat");
+			)?;
 		}
 		let prev = if l == 0 {
 			x
@@ -216,20 +219,20 @@ pub fn forward_into(
 					n * p.in_dim,
 					p.dim,
 					&acts[l],
-				).expect("gather");
+				)?;
 				kernels::gpu_broadcast_sub_into(
 					&acts[l],
 					&p.b,
 					n * p.out_dim,
 					p.out_dim,
 					&acts[l],
-				).expect("pe add");
+				)?;
 			}
 			LayerKind::Attn => {
 				if sc.infer {
-					attn_forward_cached(p, prev, &acts[l], n, sc)
+					attn_forward_cached(p, prev, &acts[l], n, sc)?
 				} else {
-					attn_forward(p, prev, &acts[l], n, sc)
+					attn_forward(p, prev, &acts[l], n, sc)?
 				}
 			}
 			LayerKind::Conv => {
@@ -240,7 +243,7 @@ pub fn forward_into(
 					prev, &p.w, &p.b,
 					n, cin, lin, cout, k, stride,
 					&acts[l],
-				).expect("conv1d");
+				)?;
 				let m = n * p.out_dim;
 				if matches!(
 					p.act,
@@ -248,20 +251,20 @@ pub fn forward_into(
 						| Activation::Gelu | Activation::Elu
 						| Activation::Selu | Activation::PRelu
 				) {
-					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l]).expect("copy preact");
+					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l])?;
 				}
 				match p.act {
-					Activation::Relu => kernels::gpu_relu_into(&acts[l], m, &acts[l]).expect("relu"),
-					Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], m, &acts[l]).expect("sigmoid"),
-					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&acts[l], &sc.c_leaky_alpha, m, &acts[l]).expect("leaky"),
+					Activation::Relu => kernels::gpu_relu_into(&acts[l], m, &acts[l])?,
+					Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], m, &acts[l])?,
+					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&acts[l], &sc.c_leaky_alpha, m, &acts[l])?,
 					Activation::PRelu => {
-						kernels::gpu_leaky_relu_into(&sc.preact[l], &p.palpha, m, &acts[l]).expect("prelu");
+						kernels::gpu_leaky_relu_into(&sc.preact[l], &p.palpha, m, &acts[l])?;
 					}
-					Activation::Elu => gpu_core::k_gapact::gpu_elu(&sc.preact[l], &sc.c_elu_alpha, m, &acts[l]).expect("elu"),
-					Activation::Selu => gpu_core::k_gapact::gpu_selu(&sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &acts[l]).expect("selu"),
-					Activation::Tanh => kernels::gpu_tanh_into(&acts[l], m, &acts[l]).expect("tanh"),
-					Activation::Silu => kernels::gpu_silu_into(&sc.preact[l], m, &acts[l]).expect("silu"),
-					Activation::Gelu => kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l]).expect("gelu"),
+					Activation::Elu => gpu_core::k_gapact::gpu_elu(&sc.preact[l], &sc.c_elu_alpha, m, &acts[l])?,
+					Activation::Selu => gpu_core::k_gapact::gpu_selu(&sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &acts[l])?,
+					Activation::Tanh => kernels::gpu_tanh_into(&acts[l], m, &acts[l])?,
+					Activation::Silu => kernels::gpu_silu_into(&sc.preact[l], m, &acts[l])?,
+					Activation::Gelu => kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l])?,
 					Activation::Linear => {}
 				}
 			}
@@ -274,11 +277,11 @@ pub fn forward_into(
 	n,
 	p.in_dim,
 	&acts[l],
-).expect("matvec");
+)?;
 				} else {
 					kernels::gpu_linear_into(
 						prev, &p.w, &p.b, n, p.out_dim, p.in_dim, &acts[l],
-					).expect("linear");
+					)?;
 				}
 				let m = n * p.out_dim;
 				if matches!(
@@ -287,50 +290,50 @@ pub fn forward_into(
 						| Activation::Gelu | Activation::Elu
 						| Activation::Selu | Activation::PRelu
 				) {
-					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l]).expect("copy preact");
+					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l])?;
 				}
 				match p.act {
 					Activation::Relu => {
-						kernels::gpu_relu_into(&acts[l], m, &acts[l]).expect("relu")
+						kernels::gpu_relu_into(&acts[l], m, &acts[l])?
 					}
 					Activation::Sigmoid => {
-						kernels::gpu_sigmoid_into(&acts[l], m, &acts[l]).expect("sigmoid")
+						kernels::gpu_sigmoid_into(&acts[l], m, &acts[l])?
 					}
 					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(
 						&acts[l],
 						&sc.c_leaky_alpha,
 						m,
 						&acts[l],
-					).expect("leaky"),
+					)?,
 					Activation::PRelu => {
 						kernels::gpu_leaky_relu_into(
 							&sc.preact[l],
 							&p.palpha,
 							m,
 							&acts[l],
-						).expect("prelu");
+						)?;
 					}
 					Activation::Elu => gpu_core::k_gapact::gpu_elu(
 						&sc.preact[l],
 						&sc.c_elu_alpha,
 						m,
 						&acts[l],
-					).expect("elu"),
+					)?,
 					Activation::Selu => gpu_core::k_gapact::gpu_selu(
 						&sc.preact[l],
 						&sc.c_selu_alpha,
 						&sc.c_selu_lambda,
 						m,
 						&acts[l],
-					).expect("selu"),
+					)?,
 					Activation::Tanh => {
-						kernels::gpu_tanh_into(&acts[l], m, &acts[l]).expect("tanh")
+						kernels::gpu_tanh_into(&acts[l], m, &acts[l])?
 					}
 					Activation::Silu => {
-						kernels::gpu_silu_into(&sc.preact[l], m, &acts[l]).expect("silu")
+						kernels::gpu_silu_into(&sc.preact[l], m, &acts[l])?
 					}
 					Activation::Gelu => {
-						kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l]).expect("gelu")
+						kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l])?
 					}
 					Activation::Linear => {}
 				}
@@ -338,38 +341,43 @@ pub fn forward_into(
 		}
 		sc.mark_fwd(l + 1);
 	}
+	Ok(())
 }
 
-pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, sc: &Scratch) {
+pub fn attn_forward(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, sc: &Scratch) -> anyhow::Result<()> {
 	let d = p.dim;
 	let heads = p.heads;
 	let s = p.in_dim / d;
 	let m = n * s;
-	kernels::gpu_linear_into(h, &p.w, &p.b, m, d, d, &sc.a_q).expect("attn q");
-	kernels::gpu_linear_into(h, &p.wk, &p.b, m, d, d, &sc.a_k).expect("attn k");
-	kernels::gpu_linear_into(h, &p.wv, &p.b, m, d, d, &sc.a_v).expect("attn v");
-	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k).expect("rope");
-	kernels::gpu_flash_attention_train_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx, &sc.a_lse).expect("flash attn");
-	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, m, d, d, out).expect("attn out");
+	kernels::gpu_linear_into(h, &p.w, &p.b, m, d, d, &sc.a_q)?;
+	kernels::gpu_linear_into(h, &p.wk, &p.b, m, d, d, &sc.a_k)?;
+	kernels::gpu_linear_into(h, &p.wv, &p.b, m, d, d, &sc.a_v)?;
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k)?;
+	kernels::gpu_flash_attention_train_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx, &sc.a_lse)?;
+	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, m, d, d, out)?;
+	Ok(())
 }
 
-pub fn attn_forward_cached(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, sc: &Scratch) {
+pub fn attn_forward_cached(p: &LayerParams, h: &GpuBuffer, out: &GpuBuffer, n: usize, sc: &Scratch) -> anyhow::Result<()> {
 	let d = p.dim;
 	let heads = p.heads;
 	let s = p.in_dim / d;
 	let m = n * s;
-	kernels::gpu_linear_into(h, &p.w, &p.b, m, d, d, &sc.a_q).expect("attn q");
-	kernels::gpu_linear_into(h, &p.wk, &p.b, m, d, d, &sc.a_k).expect("attn k");
-	kernels::gpu_linear_into(h, &p.wv, &p.b, m, d, d, &sc.a_v).expect("attn v");
-	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k).expect("rope");
-	kernels::gpu_flash_attention_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx).expect("flash attn");
-	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, m, d, d, out).expect("attn out");
+	kernels::gpu_linear_into(h, &p.w, &p.b, m, d, d, &sc.a_q)?;
+	kernels::gpu_linear_into(h, &p.wk, &p.b, m, d, d, &sc.a_k)?;
+	kernels::gpu_linear_into(h, &p.wv, &p.b, m, d, d, &sc.a_v)?;
+	gpu_core::rope::gpu_rope_qk_heads_inplace(&sc.c_one, &sc.c_rope_theta, m, d, heads, s, &sc.a_q, &sc.a_k)?;
+	kernels::gpu_flash_attention_into(&sc.a_q, &sc.a_k, &sc.a_v, n, s, d, heads, &sc.a_ctx)?;
+	kernels::gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, m, d, d, out)?;
+	Ok(())
 }
 
 pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; len];
-	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("gpu download");
-	gpu_core::hip::device_synchronize().expect("gpu download sync");
+	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
+	assert!(dl.is_ok(), "gpu download: {}", dl.err().map(|e| e.to_string()).unwrap_or_default());
+	let sync = gpu_core::hip::device_synchronize();
+	assert!(sync.is_ok(), "gpu download sync: {}", sync.err().map(|e| e.to_string()).unwrap_or_default());
 	v
 }
 
@@ -388,32 +396,35 @@ pub fn infer_scored(
 	let last = params.len() - 1;
 	let k = params[last].out_dim;
 	let consts = {
-		let b = GpuBuffer::alloc(crate::scratch::SCRATCH_CONSTS.len()).expect("scratch consts");
-		b.load(&crate::scratch::SCRATCH_CONSTS).expect("scratch consts");
+		let b = GpuBuffer::alloc(crate::scratch::SCRATCH_CONSTS.len()).context("scratch consts")?;
+		b.load(&crate::scratch::SCRATCH_CONSTS).context("scratch consts")?;
 		b
 	};
 	let sc = Scratch::new_infer(params, n, &consts)?;
-	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc);
+	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc)?;
 	if let Some((ymean, ystd)) = yscaler {
-		let ystd_b = { let __up = &[ystd]; let __ub = GpuBuffer::alloc(__up.len()).expect("ystd"); __ub.load(__up).expect("ystd"); __ub };
-		let ymean_b = { let __up = &[ymean]; let __ub = GpuBuffer::alloc(__up.len()).expect("ymean"); __ub.load(__up).expect("ymean"); __ub };
-		kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last]).expect("y unscale");
-		kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last]).expect("y unshift");
+		let ystd_b = { let __up = &[ystd]; let __ub = GpuBuffer::alloc(__up.len()).context("ystd")?; __ub.load(__up).context("ystd")?; __ub };
+		let ymean_b = { let __up = &[ymean]; let __ub = GpuBuffer::alloc(__up.len()).context("ymean")?; __ub.load(__up).context("ymean")?; __ub };
+		kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last])?;
+		kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last])?;
 	}
 	let out = &sc.acts[last];
 	let vals: Vec<f64> = match ybuf {
-		Some(yb) => metrics
-			.iter()
-			.map(|&m| match m {
-				Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => f64::NAN,
-				_ => {
-					let (sign, div) =
-						metric_gpu_into(loss, m, out, yb, &sc, n, k, ss_tot, &sc.metric_scalar);
-					let v = sign * download_scalar(&sc.metric_scalar) / div;
-					if m == Metric::R2 { 1.0 - v } else { v }
-				}
-			})
-			.collect(),
+		Some(yb) => {
+			let mut acc = Vec::with_capacity(metrics.len());
+			for &m in metrics {
+				acc.push(match m {
+					Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => f64::NAN,
+					_ => {
+						let (sign, div) =
+							metric_gpu_into(loss, m, out, yb, &sc, n, k, ss_tot, &sc.metric_scalar)?;
+						let v = sign * download_scalar(&sc.metric_scalar) / div;
+						if m == Metric::R2 { 1.0 - v } else { v }
+					}
+				});
+			}
+			acc
+		}
 		None => Vec::new(),
 	};
 	Ok((download_vec(out, n * k), vals))
@@ -421,8 +432,10 @@ pub fn infer_scored(
 
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64];
-	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("scalar download");
-	gpu_core::hip::device_synchronize().expect("scalar download sync");
+	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
+	assert!(dl.is_ok(), "scalar download: {}", dl.err().map(|e| e.to_string()).unwrap_or_default());
+	let sync = gpu_core::hip::device_synchronize();
+	assert!(sync.is_ok(), "scalar download sync: {}", sync.err().map(|e| e.to_string()).unwrap_or_default());
 	v[0]
 }
 
@@ -478,13 +491,13 @@ mod tests {
 		let consts = consts_buf();
 		let sc_ref = Scratch::new_full(&params, n, &consts).expect("scratch");
 		assert!(!sc_ref.infer, "ref must use the full-batch path");
-		forward_into(&params, &h, None, n, &sc_ref.acts, &sc_ref);
+		forward_into(&params, &h, None, n, &sc_ref.acts, &sc_ref).expect("forward");
 		let reference = download_vec(&sc_ref.acts[0], n * in_dim);
 		drop(sc_ref);
 
 		let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 		assert!(sc.infer, "inference must use the KV-cache path");
-		forward_into(&params, &h, None, n, &sc.acts, &sc);
+		forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 		let cached = download_vec(&sc.acts[0], n * in_dim);
 
 		let (mut maxdiff, mut maxabs) = (0.0f64, 0.0f64);
@@ -520,10 +533,10 @@ mod tests {
 		let (params, h) = attn_layer(n, heads, d, s);
 		let consts = consts_buf();
 		let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
-		forward_into(&params, &h, None, n, &sc.acts, &sc);
+		forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 		let _ = download_vec(&sc.acts[0], 1);
 		let t0 = std::time::Instant::now();
-		forward_into(&params, &h, None, n, &sc.acts, &sc);
+		forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 		let out = download_vec(&sc.acts[0], n * in_dim);
 		let ms = t0.elapsed().as_secs_f64() * 1e3;
 		assert!(out.iter().all(|v| v.is_finite()), "flash-attn output not finite");

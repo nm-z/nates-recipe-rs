@@ -1,10 +1,10 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>, Vec<f64>)>> {
 	if bytes.len() < 8 {
 		bail!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len());
 	}
-	let n = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte header len")) as usize;
+	let n = u64::from_le_bytes(bytes[..8].try_into().context("8-byte header len")?) as usize;
 	let data_start = 8 + n;
 	if bytes.len() < data_start {
 		bail!("safetensors: header length {n} exceeds file size {}", bytes.len());
@@ -67,7 +67,7 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<(usize, Vec<TensorEntry>
 	if bytes.len() < 8 {
 		bail!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len());
 	}
-	let n = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte header len")) as usize;
+	let n = u64::from_le_bytes(bytes[..8].try_into().context("8-byte header len")?) as usize;
 	let data_start = 8 + n;
 	if bytes.len() < data_start {
 		bail!("safetensors: header length {n} exceeds file size {}", bytes.len());
@@ -141,11 +141,15 @@ fn decode(dtype: &str, raw: &[u8]) -> Result<Vec<f64>> {
 }
 
 fn arr4(c: &[u8]) -> [u8; 4] {
-	c.try_into().expect("chunks_exact(4) yields 4 bytes")
+	let mut a = [0u8; 4];
+	a.copy_from_slice(c);
+	a
 }
 
 fn arr8(c: &[u8]) -> [u8; 8] {
-	c.try_into().expect("chunks_exact(8) yields 8 bytes")
+	let mut a = [0u8; 8];
+	a.copy_from_slice(c);
+	a
 }
 
 fn f16_to_f64(h: u16) -> f64 {

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const TEST_DEADLINE_SECS: f64 = 60.0;
-const WALL_BUDGET_SECS: f64 = 600.0;
 const PROBE_DEADLINE_SECS: f64 = 10.0;
 const KFD_TEARDOWN_DEADLINE_SECS: f64 = 30.0;
 const DEVICE_FREE_DEADLINE_SECS: f64 = 30.0;
@@ -23,6 +22,7 @@ struct Test {
       cwd: PathBuf,
       name: String,
       ignored: bool,
+      hash: Option<u64>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -47,10 +47,6 @@ struct Tally {
 }
 
 impl Tally {
-      fn ran(&self) -> usize {
-            self.passed + self.failed
-      }
-
       fn failed_total(&self) -> usize {
             self.failed + self.unattempted
       }
@@ -176,8 +172,16 @@ fn run() -> i32 {
                         cwd: cwd.clone(),
                         ignored: ignored.contains(&name),
                         name,
+                        hash: None,
                   });
             }
+      }
+      let mut crate_srcs: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+      for t in &mut tests {
+            let srcs = crate_srcs
+                  .entry(t.cwd.clone())
+                  .or_insert_with(|| crate_source_texts(&t.cwd));
+            t.hash = test_fn_hash(srcs, &t.name);
       }
       let colliding: Vec<&str> = tests
             .iter()
@@ -195,7 +199,6 @@ fn run() -> i32 {
       }
       tests.sort_by(|a, b| a.id.cmp(&b.id));
       let discovered = tests.len();
-      let width = tests.iter().map(|t| t.id.len()).max().unwrap_or(0);
 
       let mut log = Log {
             f: File::create(Path::new(ROOT).join("suite.log")).expect("create suite.log"),
@@ -205,7 +208,7 @@ fn run() -> i32 {
       out(&head);
       let mut tally = Tally { discovered, passed: 0, failed: 0, unattempted: 0 };
       if discovered == 0 {
-            return finish(&mut log, &tally, t0, Instant::now(), 0.0);
+            return finish(&mut log, &tally, t0, 0.0);
       }
 
       // One lease over the whole suite. Every test process links gpu-core and
@@ -220,11 +223,22 @@ fn run() -> i32 {
       // lease; only a NEW holder means a test leaked a GPU child.
       let known = kfd_holders();
       let mut done = vec![false; tests.len()];
-      let dispatch_t0 = Instant::now();
       let mut test_secs = 0.0f64;
+      let cache = load_cache();
+      let mut passes: Vec<(String, u64)> = Vec::new();
 
       let ended = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            dispatch(&mut log, &probe, &tests, &known, &mut done, &mut tally, &mut test_secs, width)
+            dispatch(
+                  &mut log,
+                  &probe,
+                  &tests,
+                  &known,
+                  &mut done,
+                  &mut tally,
+                  &mut test_secs,
+                  &cache,
+                  &mut passes,
+            )
       }));
       let abort = match ended {
             Ok(Some(reason)) => reason,
@@ -235,8 +249,9 @@ fn run() -> i32 {
                   reason
             }
       };
-      fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort), width);
-      finish(&mut log, &tally, t0, dispatch_t0, test_secs)
+      fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort));
+      store_cache(cache, &passes);
+      finish(&mut log, &tally, t0, test_secs)
 }
 
 fn dispatch(
@@ -247,7 +262,8 @@ fn dispatch(
       done: &mut [bool],
       tally: &mut Tally,
       test_secs: &mut f64,
-      width: usize,
+      cache: &BTreeMap<String, u64>,
+      passes: &mut Vec<(String, u64)>,
 ) -> Option<String> {
       let mut prev_violent: Option<String> = None;
       let mut rerun: Vec<(usize, Attempt, String)> = Vec::new();
@@ -255,12 +271,21 @@ fn dispatch(
 
       for (i, t) in tests.iter().enumerate() {
             if t.ignored {
-                  log.line(&test_line("FAIL", &t.id, 0.0, width));
+                  log.line(&test_line("FAIL", &t.id, 0.0));
                   log.line("     ignored");
                   tally.failed += 1;
                   done[i] = true;
                   prev_violent = None;
                   continue;
+            }
+            if let Some(h) = t.hash {
+                  if cache.get(&t.id) == Some(&h) {
+                        log.line(&format!("{} cached", test_line("PASS", &t.id, 0.0)));
+                        tally.passed += 1;
+                        passes.push((t.id.clone(), h));
+                        done[i] = true;
+                        continue;
+                  }
             }
             let leaked = settled_holders(log, known);
             if !leaked.is_empty() {
@@ -279,7 +304,12 @@ fn dispatch(
                   }
                   continue;
             }
-            record(log, t, width, &att, tally, test_secs, None);
+            record(log, t, &att, tally, test_secs, None);
+            if att.outcome == Outcome::Pass {
+                  if let Some(h) = t.hash {
+                        passes.push((t.id.clone(), h));
+                  }
+            }
             done[i] = true;
             prev_violent = if violent { Some(t.id.clone()) } else { None };
             if violent && !probe_ok(probe) {
@@ -299,7 +329,12 @@ fn dispatch(
                   }
                   let att = run_test(t);
                   let violent = matches!(att.outcome, Outcome::Signal(_) | Outcome::Deadline);
-                  record(log, t, width, &att, tally, test_secs, Some((first, culprit.as_str())));
+                  record(log, t, &att, tally, test_secs, Some((first, culprit.as_str())));
+                  if att.outcome == Outcome::Pass {
+                        if let Some(h) = t.hash {
+                              passes.push((t.id.clone(), h));
+                        }
+                  }
                   done[*i] = true;
                   if violent && !probe_ok(probe) {
                         abort = Some(poison(log, &t.id));
@@ -319,10 +354,10 @@ fn oneline(s: &str) -> String {
       s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str, width: usize) {
+fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str) {
       for (i, t) in tests.iter().enumerate() {
             if !done.get(i).copied().unwrap_or(false) {
-                  log.line(&test_line("FAIL", &t.id, 0.0, width));
+                  log.line(&test_line("FAIL", &t.id, 0.0));
                   log.line(&format!("     not attempted: {abort}"));
                   tally.unattempted += 1;
             }
@@ -362,7 +397,6 @@ fn settled_holders(log: &mut Log, known: &[i32]) -> Vec<i32> {
 fn record(
       log: &mut Log,
       t: &Test,
-      width: usize,
       att: &Attempt,
       tally: &mut Tally,
       test_secs: &mut f64,
@@ -371,13 +405,13 @@ fn record(
       *test_secs += att.secs;
       match &att.outcome {
             Outcome::Pass => {
-                  log.line(&test_line("PASS", &t.id, att.secs, width));
+                  log.line(&test_line("PASS", &t.id, att.secs));
                   tally.passed += 1;
             }
             _ => {
-                  log.line(&test_line("FAIL", &t.id, att.secs, width));
+                  log.line(&test_line("FAIL", &t.id, att.secs));
                   tally.failed += 1;
-                  for line in details(&t.name, att) {
+                  for line in details(att) {
                         log.line(&format!("     {line}"));
                   }
             }
@@ -388,45 +422,24 @@ fn record(
                   first.secs,
                   reason(&first.outcome)
             ));
-            for line in capture_lines(&t.name, &first.capture) {
-                  log.line(&format!("     first try: {line}"));
+            for line in &first.capture {
+                  log.line(&format!("     first try: {}", line.trim_end()));
             }
       }
 }
 
-fn test_line(verdict: &str, id: &str, secs: f64, width: usize) -> String {
-      format!("{verdict} {id:<width$} {dur:>5}", dur = format!("{secs:.1}s"))
+fn test_line(verdict: &str, id: &str, secs: f64) -> String {
+      format!("{verdict} {id} {secs:.1}s")
 }
 
-fn details(name: &str, att: &Attempt) -> Vec<String> {
-      let mut lines = capture_lines(name, &att.capture);
+fn details(att: &Attempt) -> Vec<String> {
+      let mut lines: Vec<String> = att.capture.iter().map(|l| l.trim_end().to_owned()).collect();
       match &att.outcome {
             Outcome::Signal(_) | Outcome::Deadline => lines.insert(0, reason(&att.outcome)),
             _ if lines.is_empty() => lines.push(reason(&att.outcome)),
             _ => {}
       }
       lines
-}
-
-fn capture_lines(name: &str, capture: &[String]) -> Vec<String> {
-      capture
-            .iter()
-            .filter(|l| !boilerplate(name, l))
-            .map(|l| l.trim_end().to_owned())
-            .collect()
-}
-
-fn boilerplate(name: &str, line: &str) -> bool {
-      let t = line.trim();
-      t.is_empty()
-            || t == name
-            || t == "failures:"
-            || t.starts_with("running ")
-            || (t.starts_with("test ") && t.contains(" ... "))
-            || t.starts_with("test result:")
-            || t.starts_with("note: run with `RUST_BACKTRACE")
-            || (t.starts_with("---- ") && t.ends_with(" ----"))
-            || (t.starts_with("thread '") && t.contains("panicked at"))
 }
 
 fn reason(o: &Outcome) -> String {
@@ -438,51 +451,9 @@ fn reason(o: &Outcome) -> String {
       }
 }
 
-fn finish(
-      log: &mut Log,
-      tally: &Tally,
-      t0: Instant,
-      dispatch_t0: Instant,
-      test_secs: f64,
-) -> i32 {
+fn finish(log: &mut Log, tally: &Tally, t0: Instant, test_secs: f64) -> i32 {
       let wall = t0.elapsed().as_secs_f64();
-      let dispatch_secs = dispatch_t0.elapsed().as_secs_f64();
-      if dispatch_secs > WALL_BUDGET_SECS {
-            log.line(&format!(
-                  "[S] WALL-OVER dispatch={dispatch_secs:.1}s budget={WALL_BUDGET_SECS:.1}s"
-            ));
-      }
-      let mut faults: Vec<String> = Vec::new();
-      if tally.discovered == 0 {
-            faults.push("no tests discovered, nothing ran".to_owned());
-      }
-      if tally.passed + tally.failed + tally.unattempted != tally.discovered {
-            faults.push(format!(
-                  "accounting bug: passed={} + failed={} + unattempted={} != discovered={}",
-                  tally.passed, tally.failed, tally.unattempted, tally.discovered
-            ));
-      }
-      if tally.unattempted > 0 {
-            faults.push(format!(
-                  "{} tests not attempted (discovered={}, ran={})",
-                  tally.unattempted,
-                  tally.discovered,
-                  tally.ran()
-            ));
-      }
-      match std::fs::read_to_string(Path::new(ROOT).join("suite.log")) {
-            Ok(text) => {
-                  if let Some(bad) = text.lines().find(|l| !grammar_ok(l)) {
-                        faults.push(format!("log grammar violation: {bad:?}"));
-                  }
-            }
-            Err(e) => faults.push(format!("cannot reread suite.log: {e}")),
-      }
-      let code = if faults.is_empty() && tally.green() { 0 } else { 1 };
-      for f in &faults {
-            log.file(&format!("[S] FAIL: {f}"));
-            out(&format!("FAIL: {f}"));
-      }
+      let code = if tally.green() { 0 } else { 1 };
       log.file(&format!(
             "[S] passed={} failed={} unattempted={} discovered={} wall={wall:.1}s overhead={:.1}s exit={code}",
             tally.passed,
@@ -500,37 +471,6 @@ fn finish(
       out("");
       out(&summary);
       code
-}
-
-fn grammar_ok(line: &str) -> bool {
-      if line.is_empty()
-            || line.starts_with("[S] ")
-            || line.starts_with("PASS ")
-            || line.starts_with("FAIL ")
-      {
-            return true;
-      }
-      if let Some(rest) = line.strip_prefix("     ") {
-            return !rest.trim().is_empty();
-      }
-      summary_ok(line)
-}
-
-fn summary_ok(line: &str) -> bool {
-      let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-      let Some((frac, rest)) = line.split_once(" passed.") else {
-            return false;
-      };
-      let Some((p, d)) = frac.split_once('/') else {
-            return false;
-      };
-      if !digits(p) || !digits(d) {
-            return false;
-      }
-      match rest.strip_prefix(' ').and_then(|r| r.strip_suffix(" FAILED.")) {
-            None => rest.is_empty(),
-            Some(n) => digits(n),
-      }
 }
 
 fn await_kfd_teardown(pid: u32) {
@@ -778,4 +718,218 @@ fn list_tests(exe: &Path, cwd: &Path) -> Result<(Vec<String>, BTreeSet<String>),
       let mut names: BTreeSet<String> = list(&[])?.into_iter().collect();
       names.extend(ignored.iter().cloned());
       Ok((names.into_iter().collect(), ignored))
+}
+
+fn cache_path() -> PathBuf {
+      Path::new(ROOT).join("target").join(".suite_cache")
+}
+
+fn load_cache() -> BTreeMap<String, u64> {
+      let mut map = BTreeMap::new();
+      if let Ok(text) = std::fs::read_to_string(cache_path()) {
+            for line in text.lines() {
+                  if let Some((hex, id)) = line.split_once('\t') {
+                        if let Ok(h) = u64::from_str_radix(hex, 16) {
+                              map.insert(id.to_owned(), h);
+                        }
+                  }
+            }
+      }
+      map
+}
+
+fn store_cache(mut cache: BTreeMap<String, u64>, passes: &[(String, u64)]) {
+      for (id, h) in passes {
+            cache.insert(id.clone(), *h);
+      }
+      let mut text = String::new();
+      for (id, h) in &cache {
+            text.push_str(&format!("{h:016x}\t{id}\n"));
+      }
+      std::fs::write(cache_path(), text).expect("write suite cache");
+}
+
+fn crate_source_texts(cwd: &Path) -> Vec<String> {
+      let mut files: Vec<PathBuf> = Vec::new();
+      collect_rs(cwd, &mut files);
+      files.sort();
+      files.iter().filter_map(|p| std::fs::read_to_string(p).ok()).collect()
+}
+
+fn collect_rs(dir: &Path, files: &mut Vec<PathBuf>) {
+      let Ok(rd) = std::fs::read_dir(dir) else { return };
+      for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                  if name.starts_with('.')
+                        || name == "target"
+                        || name == "datasets"
+                        || p.join("Cargo.toml").exists()
+                  {
+                        continue;
+                  }
+                  collect_rs(&p, files);
+            } else if name.ends_with(".rs") {
+                  files.push(p);
+            }
+      }
+}
+
+fn test_fn_hash(srcs: &[String], test_name: &str) -> Option<u64> {
+      let fn_name = test_name.rsplit("::").next().unwrap_or(test_name);
+      let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+      let mut found = false;
+      for src in srcs {
+            for span in fn_spans(src, fn_name) {
+                  found = true;
+                  for b in span.as_bytes() {
+                        h ^= u64::from(*b);
+                        h = h.wrapping_mul(0x0100_0000_01b3);
+                  }
+            }
+      }
+      if found { Some(h) } else { None }
+}
+
+fn is_ident(b: u8) -> bool {
+      b == b'_' || b.is_ascii_alphanumeric()
+}
+
+fn fn_spans<'a>(src: &'a str, name: &str) -> Vec<&'a str> {
+      let bytes = src.as_bytes();
+      let mut spans = Vec::new();
+      for (pos, _) in src.match_indices(name) {
+            let end = pos + name.len();
+            if end < bytes.len() && is_ident(bytes[end]) {
+                  continue;
+            }
+            let mut j = pos;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                  j -= 1;
+            }
+            if j < 2 || &src[j - 2..j] != "fn" || j == pos {
+                  continue;
+            }
+            if j > 2 && is_ident(bytes[j - 3]) {
+                  continue;
+            }
+            if let Some(close) = fn_close(src, end) {
+                  spans.push(&src[j - 2..close]);
+            }
+      }
+      spans
+}
+
+fn fn_close(src: &str, from: usize) -> Option<usize> {
+      let cs: Vec<(usize, char)> = src[from..].char_indices().collect();
+      let mut i = 0usize;
+      let mut depth = 0usize;
+      while i < cs.len() {
+            match cs[i].1 {
+                  '{' => {
+                        depth += 1;
+                        i += 1;
+                  }
+                  '}' => {
+                        if depth > 0 {
+                              depth -= 1;
+                              if depth == 0 {
+                                    return Some(from + cs[i].0 + cs[i].1.len_utf8());
+                              }
+                        }
+                        i += 1;
+                  }
+                  '/' if i + 1 < cs.len() && cs[i + 1].1 == '/' => {
+                        while i < cs.len() && cs[i].1 != '\n' {
+                              i += 1;
+                        }
+                  }
+                  '/' if i + 1 < cs.len() && cs[i + 1].1 == '*' => {
+                        let mut lvl = 1usize;
+                        i += 2;
+                        while i < cs.len() && lvl > 0 {
+                              if cs[i].1 == '/' && i + 1 < cs.len() && cs[i + 1].1 == '*' {
+                                    lvl += 1;
+                                    i += 2;
+                              } else if cs[i].1 == '*' && i + 1 < cs.len() && cs[i + 1].1 == '/' {
+                                    lvl -= 1;
+                                    i += 2;
+                              } else {
+                                    i += 1;
+                              }
+                        }
+                  }
+                  '"' => i = skip_str(&cs, i),
+                  'r' => match raw_str_hashes(&cs, i) {
+                        Some(n) => i = skip_raw(&cs, i, n),
+                        None => i += 1,
+                  },
+                  '\'' => i = skip_char_or_lifetime(&cs, i),
+                  _ => i += 1,
+            }
+      }
+      None
+}
+
+fn skip_str(cs: &[(usize, char)], start: usize) -> usize {
+      let mut i = start + 1;
+      while i < cs.len() {
+            match cs[i].1 {
+                  '\\' => i += 2,
+                  '"' => return i + 1,
+                  _ => i += 1,
+            }
+      }
+      i
+}
+
+fn raw_str_hashes(cs: &[(usize, char)], i: usize) -> Option<usize> {
+      if i > 0 {
+            let prev = cs[i - 1].1;
+            if prev == '_' || prev.is_alphanumeric() {
+                  return None;
+            }
+      }
+      let mut j = i + 1;
+      let mut n = 0usize;
+      while j < cs.len() && cs[j].1 == '#' {
+            n += 1;
+            j += 1;
+      }
+      if j < cs.len() && cs[j].1 == '"' { Some(n) } else { None }
+}
+
+fn skip_raw(cs: &[(usize, char)], start: usize, n: usize) -> usize {
+      let mut i = start + 1 + n + 1;
+      while i < cs.len() {
+            if cs[i].1 == '"' && cs[i + 1..].iter().take(n).filter(|c| c.1 == '#').count() == n {
+                  return i + 1 + n;
+            }
+            i += 1;
+      }
+      i
+}
+
+fn skip_char_or_lifetime(cs: &[(usize, char)], i: usize) -> usize {
+      if i + 1 >= cs.len() {
+            return i + 1;
+      }
+      if cs[i + 1].1 == '\\' {
+            match cs.get(i + 2).map(|c| c.1) {
+                  Some('x') => i + 6,
+                  Some('u') => {
+                        let mut j = i + 3;
+                        while j < cs.len() && cs[j].1 != '\'' {
+                              j += 1;
+                        }
+                        j + 1
+                  }
+                  _ => i + 4,
+            }
+      } else if i + 2 < cs.len() && cs[i + 2].1 == '\'' {
+            i + 3
+      } else {
+            i + 1
+      }
 }

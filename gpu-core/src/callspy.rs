@@ -1,7 +1,3 @@
-//! Runtime tally of every HIP call the framework makes. Every hip API is
-//! wrapped at exactly one choke point, so each wrapper ticks its counter and
-//! `report()` prints the full tree at shutdown. Relaxed atomics — a tick is
-//! one fetch_add, safe on the hottest paths (kernel launches).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,12 +47,11 @@ static ALL: [&AtomicU64; N] = [
 	&MEM_UNMAP, &MEM_SET_ACCESS, &MEM_RELEASE, &MEM_MAP,
 	&MEM_GET_ALLOCATION_GRANULARITY, &MEM_CREATE, &MEM_ADDRESS_RESERVE, &MEM_ADDRESS_FREE,
 	&HIPBLAS,
-	&HOST_REGISTER, &HOST_UNREGISTER,        // ← add
-	&MANAGED_MALLOC, &MEM_ADVISE,            // ← add
-	&HOST_GET_DEVICE_POINTER,                // ← add
+	&HOST_REGISTER, &HOST_UNREGISTER,
+	&MANAGED_MALLOC, &MEM_ADVISE,
+	&HOST_GET_DEVICE_POINTER,
 ];
 
-/// Counter values right now — pass to `report_since` for a run-scoped delta.
 pub fn snapshot() -> [u64; N] {
 	let mut s = [0u64; N];
 	for (i, c) in ALL.iter().enumerate() {
@@ -73,7 +68,6 @@ pub fn report_since(base: &[u64; N]) -> String {
 	report_between(base, &snapshot())
 }
 
-/// Delta between two snapshots — phase-scoped counts (init/loop/exit).
 pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 	let g = |c: &AtomicU64| {
 		let i = ALL
@@ -157,32 +151,18 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 	out
 }
 
-// ── The run state table ──────────────────────────────────────────────────────
-// Every training run prints the spec's init/loop/exit tree from raw counter
-// deltas at the phase boundaries (run entry → first epoch → last epoch → run
-// end). Cells: in-place = kernel launches; alloc = hipHostMalloc + hipMallocAsync
-// + hipMemCreate; async = standalone enqueue-only transfer calls (XFER_ASYNC —
-// transfers riding a claim/park op and blocking transfers are not standalone);
-// sync = every call that blocks the calling thread (hipStreamSynchronize +
-// hipDeviceSynchronize + hipEventSynchronize). Vendor hipBLAS and hipFreeAsync
-// have no spec cell — nonzero counts print below the tree, never silently.
 
 static LOOP_START: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
 static LOOP_END: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
 
-/// First epoch is about to run — everything before this is the run's init.
 pub fn mark_loop_start() {
 	*LOOP_START.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot());
 }
 
-/// Last epoch just finished — everything after this is the run's exit.
 pub fn mark_loop_end() {
 	*LOOP_END.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot());
 }
 
-/// The per-run state table: raw deltas between `run_start`, the two loop marks,
-/// and now. `None` when no loop ran (forward-only / skipped run). Consumes the
-/// marks so a later run can never mix phases across runs.
 pub fn state_report(run_start: &[u64; N]) -> Option<String> {
 	let ls = LOOP_START.lock().unwrap_or_else(|p| p.into_inner()).take()?;
 	let le = LOOP_END.lock().unwrap_or_else(|p| p.into_inner()).take()?;
