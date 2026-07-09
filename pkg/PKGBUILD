@@ -4,8 +4,8 @@ pkgver=0.0.r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)
 pkgrel=1
 url=https://github.com/nm-z/nates-recipe-rs
 arch=(x86_64)
+license=(LicenseRef-WIP)
 depends=(rust hip-runtime-amd hipblas hipsolver gcc-libs xz bzip2)
-makedepends=(cargo hip-runtime-amd)
 options=(!debug !lto)
 
 pkgver() {
@@ -18,22 +18,23 @@ prepare() {
 }
 
 build() {
+    set -o pipefail
     cd nates-recipe-rs
     unset RUSTFLAGS DEBUG_RUSTFLAGS CFLAGS CXXFLAGS LDFLAGS
-    cargo build --release --workspace
-    cargo build --release -p ogdl
+    cargo build --release -p recipe -p gpu-core -p pantry -p recipe-infer -p ogdl \
+        --message-format=json-render-diagnostics \
+        | perl -nle 'while (m{"([^"]+/deps/lib[^"]+\.(?:rlib|so))"}g) { print $1 }' \
+        | sort -u > "$srcdir/deps.files"
 }
 
 package() {
     cd nates-recipe-rs
     install -Dm755 target/release/recipe "$pkgdir/usr/bin/recipe"
-    install -d "$pkgdir/usr/lib/recipe"
     install -d "$pkgdir/usr/lib/recipe/deps"
     install -m644 target/release/librecipe.rlib "$pkgdir/usr/lib/recipe/"
     install -m644 target/release/libogdl.rlib "$pkgdir/usr/lib/recipe/"
     install -m644 target/release/libgpu_core.rlib "$pkgdir/usr/lib/recipe/"
     install -m644 target/release/libpantry.rlib "$pkgdir/usr/lib/recipe/"
     install -m644 target/release/librecipe_infer.rlib "$pkgdir/usr/lib/recipe/"
-    install -m644 target/release/deps/lib*.rlib "$pkgdir/usr/lib/recipe/deps/"
-    install -m644 target/release/deps/lib*.so "$pkgdir/usr/lib/recipe/deps/"
+    xargs -a "$srcdir/deps.files" install -m644 -t "$pkgdir/usr/lib/recipe/deps/"
 }

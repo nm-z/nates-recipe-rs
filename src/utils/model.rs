@@ -889,7 +889,7 @@ mod metric_gpu_tests {
 		assert_eq!(nn, n);
 		let ybuf = { let __up = y.as_slice().expect("y contig"); let __ub = GpuBuffer::alloc(__up.len()).expect("ybuf"); __ub.load(__up).expect("ybuf"); __ub };
 		let consts = consts_buf();
-		let sc = Scratch::new_full(&params, n, &consts);
+		let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let last = params.len() - 1;
 		let p = download_vec(&sc.acts[last], n);
@@ -1005,13 +1005,13 @@ mod metric_gpu_tests {
 		let last = params.len() - 1;
 
 		let consts = consts_buf();
-		let sc_ref = Scratch::new_infer(&params, n, &consts);
+		let sc_ref = Scratch::new_infer(&params, n, &consts).expect("scratch");
 		forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref);
 		let out_ref = download_vec(&sc_ref.acts[last], n);
 		drop(sc_ref);
 		let sc = {
 			let _t_scratch = gpu_core::memory::tag_scope("scratch");
-			Scratch::new_full(&params, n, &consts)
+			Scratch::new_full(&params, n, &consts).expect("scratch")
 		};
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		let out_into = download_vec(&sc.acts[last], n);
@@ -1148,7 +1148,7 @@ mod metric_gpu_tests {
 		};
 		let ss = crate::train::StepScalars::new(lr, n);
 		let consts = consts_buf();
-		let sc = Scratch::new_full(&params, n, &consts);
+		let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
 		forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
 		model.backward_step(&params, &xbuf, &ybuf, n, &sc, &ss);
 		let pp_w: Vec<Vec<f64>> = params

@@ -330,11 +330,15 @@ fn bench_cpu_read() -> f64 {
 }
 
 pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
-	let base = std::env::var("XDG_CACHE_HOME")
-		.map(std::path::PathBuf::from)
-		.unwrap_or_else(|_| {
-			std::path::PathBuf::from(std::env::var("HOME").expect("HOME unset")).join(".cache")
-		});
+	let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+		Some(x) => std::path::PathBuf::from(x),
+		None => {
+			let home = std::env::var_os("HOME")
+				.filter(|v| !v.is_empty())
+				.ok_or_else(|| anyhow::anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
+			std::path::PathBuf::from(home).join(".cache")
+		}
+	};
 	let dir = base.join("recipe");
 	std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
 	Ok(dir)

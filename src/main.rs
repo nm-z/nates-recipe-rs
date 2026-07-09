@@ -25,16 +25,23 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	h.write_u128(mtime.duration_since(std::time::UNIX_EPOCH)?.as_nanos());
 	let bin = recipe::probe::data_dir()?.join(format!("{:016x}", h.finish()));
 	if !bin.exists() {
-		let status = std::process::Command::new("rustc")
-			.arg(path)
-			.args(["-L", "/usr/lib/recipe", "-L", "/usr/lib/recipe/deps", "-L", "/opt/rocm/lib"])
-			.args(["--extern", "recipe=/usr/lib/recipe/librecipe.rlib"])
+		let rocm = std::env::var_os("ROCM_PATH")
+			.filter(|v| !v.is_empty())
+			.map(std::path::PathBuf::from)
+			.unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm"));
+		let mut cmd = std::process::Command::new("rustc");
+		cmd.arg(path)
+			.args(["-L", "/usr/lib/recipe", "-L", "/usr/lib/recipe/deps"])
+			.arg("-L")
+			.arg(rocm.join("lib"))
 			.args(["--edition", "2024"])
 			.args(["-l", "amdhip64", "-l", "hipblas", "-l", "hipsolver", "-l", "stdc++"])
 			.arg("-o")
-			.arg(&bin)
-			.status()
-			.map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
+			.arg(&bin);
+		for name in ["recipe", "ogdl", "gpu_core", "pantry", "recipe_infer"] {
+			cmd.arg("--extern").arg(format!("{name}=/usr/lib/recipe/lib{name}.rlib"));
+		}
+		let status = cmd.status().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
 		if !status.success() {
 			anyhow::bail!("rustc failed on {path}: {status}");
 		}
