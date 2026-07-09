@@ -78,8 +78,6 @@ fn e() -> Result<(), HipError> {
 	check(unsafe { crate::hip::hipGetLastError() })
 }
 
-// ELU/SELU (backward takes the PRE-activation x, not the output). Hyperparameters
-// ride as caller-uploaded 1-elem device buffers (alpha/lambda).
 pub fn gpu_elu(
 	x: &GpuBuffer,
 	alpha: &GpuBuffer,

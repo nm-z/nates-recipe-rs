@@ -3,7 +3,6 @@ use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// ── FFI: encode.hip ──────────────────────────────────────────────────────────
 unsafe extern "C" {
 	fn launch_bin_edges_uniform(
 		x: *const c_void,
@@ -62,7 +61,6 @@ unsafe extern "C" {
 	);
 }
 
-// ── FFI: metrics.hip ─────────────────────────────────────────────────────────
 unsafe extern "C" {
 	fn launch_pairwise_cosine(
 		query: *const c_void,
@@ -93,10 +91,7 @@ unsafe extern "C" {
 	);
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
 
-// gpu_bin_edges_uniform
-// edges_out: caller-provided f64[cols * (n_bins + 1)] (edges per column, equal-width).
 pub fn gpu_bin_edges_uniform(
 	x: &GpuBuffer,
 	rows: usize,
@@ -118,10 +113,6 @@ pub fn gpu_bin_edges_uniform(
 	Ok(())
 }
 
-// gpu_bin_edges_quantile
-// edges_out: caller-provided f64[cols * (n_bins + 1)] (edges per column, equal-frequency).
-// tmp_col: caller-provided f64[cols * rows] workspace.
-// Precondition: rows <= 1024 (bitonic sort shared-memory limit).
 pub fn gpu_bin_edges_quantile(
 	x: &GpuBuffer,
 	rows: usize,
@@ -145,11 +136,6 @@ pub fn gpu_bin_edges_quantile(
 	Ok(())
 }
 
-// gpu_quantize_features
-// out: caller-provided byte-sized u8[rows * cols].
-// Each element is the bin index [0, n_bins-1] for the corresponding x value.
-// edges must be the output of gpu_bin_edges_uniform or gpu_bin_edges_quantile
-// with matching (cols, n_bins).
 pub fn gpu_quantize_features(
 	x: &GpuBuffer,
 	edges: &GpuBuffer,
@@ -173,8 +159,6 @@ pub fn gpu_quantize_features(
 	Ok(())
 }
 
-// gpu_one_hot
-// labels_i32: GpuBuffer of i32[n]. out: caller-provided f64[n * n_classes].
 pub fn gpu_one_hot(
 	labels_i32: &GpuBuffer,
 	n: usize,
@@ -194,18 +178,10 @@ pub fn gpu_one_hot(
 	Ok(())
 }
 
-// gpu_count_distinct_workspace_bytes
-// Plan-time size query for the `temp` workspace of gpu_count_distinct.
-// not-an-op: plan-time helper — rocPRIM temp-size query needs the real device ptr
 pub fn gpu_count_distinct_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	unsafe { count_distinct_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut()) }
 }
 
-// gpu_count_distinct
-// x must be a sorted i32 GpuBuffer of length n.
-// count_out: caller-provided 1-elem i32 buffer receiving the distinct-value count.
-// unique_vals/run_counts: caller-provided n*i32 scratch.
-// temp: caller-provided workspace sized via gpu_count_distinct_workspace_bytes.
 pub fn gpu_count_distinct(
 	x: &GpuBuffer,
 	n: usize,
@@ -230,18 +206,10 @@ pub fn gpu_count_distinct(
 	Ok(())
 }
 
-// gpu_run_length_workspace_bytes
-// Plan-time size query for the `temp` workspace of gpu_run_length.
-// not-an-op: plan-time helper — rocPRIM temp-size query needs the real device ptr
 pub fn gpu_run_length_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	unsafe { run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut()) }
 }
 
-// gpu_run_length
-// Precondition: x must be a sorted i32 GpuBuffer of length n.
-// values_out/counts_out: caller-provided max-sized n*i32 buffers, valid for 0..n_runs.
-// n_runs_out: caller-provided 1-elem i32 buffer receiving the run count.
-// temp: caller-provided workspace sized via gpu_run_length_workspace_bytes.
 pub fn gpu_run_length(
 	x: &GpuBuffer,
 	n: usize,
@@ -266,9 +234,6 @@ pub fn gpu_run_length(
 	Ok(())
 }
 
-// gpu_pairwise_cosine
-// query: GpuBuffer f64[nq * dim], train: GpuBuffer f64[nt * dim].
-// out: caller-provided f64[nq * nt] of cosine similarities.
 pub fn gpu_pairwise_cosine(
 	query: &GpuBuffer,
 	train: &GpuBuffer,
@@ -292,9 +257,6 @@ pub fn gpu_pairwise_cosine(
 	Ok(())
 }
 
-// gpu_pairwise_l1
-// query: GpuBuffer f64[nq * dim], train: GpuBuffer f64[nt * dim].
-// out: caller-provided f64[nq * nt] of L1 distances.
 pub fn gpu_pairwise_l1(
 	query: &GpuBuffer,
 	train: &GpuBuffer,
@@ -318,9 +280,6 @@ pub fn gpu_pairwise_l1(
 	Ok(())
 }
 
-// gpu_pairwise_hamming
-// query_u8: GpuBuffer u8[nq * dim], train_u8: GpuBuffer u8[nt * dim].
-// out: caller-provided f64[nq * nt] of normalized Hamming distances (mismatches / dim).
 pub fn gpu_pairwise_hamming(
 	query_u8: &GpuBuffer,
 	train_u8: &GpuBuffer,

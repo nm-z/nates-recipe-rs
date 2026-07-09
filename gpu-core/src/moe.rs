@@ -13,10 +13,6 @@ fn cl() -> Result<(), HipError> {
 	check(unsafe { crate::hip::hipGetLastError() })
 }
 
-// FFI declaration — slot-for-slot with the launcher in moex.hip
-//
-// C: launch_moex_weighted_accumulate(ye, gate, out, n, d, n_experts, e, stream)
-//    const double*, const double*, double*, int, int, int, int, hipStream_t
 
 unsafe extern "C" {
 	fn launch_moex_weighted_accumulate(
@@ -43,8 +39,6 @@ unsafe extern "C" {
 	);
 }
 
-// Weighted expert accumulate (forward primitive): out += gate[:,e] * ye, in
-// place on `out` (n_tokens, d) accumulator. `e` is the loop index of the expert.
 pub fn gpu_moe_weighted_accumulate(
 	ye: &GpuBuffer,
 	gate: &GpuBuffer,
@@ -69,8 +63,6 @@ pub fn gpu_moe_weighted_accumulate(
 	cl()
 }
 
-// Weighted expert accumulate backward (primitive): from d_out/gate/ye produce
-// d_ye (n_tokens, d) and d_gate[:,e] (column e of an n_tokens*n_experts buffer).
 pub fn gpu_moe_weighted_accumulate_backward(
 	d_out: &GpuBuffer,
 	gate: &GpuBuffer,
@@ -99,18 +91,6 @@ pub fn gpu_moe_weighted_accumulate_backward(
 	cl()
 }
 
-// ── gpu_moe_route ────────────────────────────────────────────────────────────
-// Dense mixture-of-experts routing forward (all experts evaluated per token).
-//   hidden:   f64 (n_tokens, d_model) row-major.
-//   gate_w:   f64 (d_model, n_experts).
-//   expert_w: f64 (n_experts, d_model, d_model) flattened — each expert a
-//             d_model→d_model linear, contiguous d_model*d_model block per expert.
-// router logits = hidden @ gate_w → (n_tokens, n_experts); softmax over experts
-// per token → gate probs; for each expert e, Ye = hidden @ expert_w[e]; the
-// output O = Σ_e gate[:,e] * Ye, shape (n_tokens, d_model) == hidden.
-// not-an-op: driver — orchestrates gpu_gemm/gpu_softmax_rows_into + a per-expert
-// gpu_gemm/gpu_moe_weighted_accumulate loop; allocates the returned output and
-// intermediates.
 pub fn gpu_moe_route(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -136,20 +116,6 @@ pub fn gpu_moe_route(
 	Ok(out)
 }
 
-// ── gpu_moe_backward ─────────────────────────────────────────────────────────
-// Backward through every op of gpu_moe_route. Given d_out (n_tokens, d_model),
-// returns (d_hidden, d_gate_w, d_expert_w) matching the forward inputs' shapes.
-// Recomputes the forward intermediates (gate, per-expert Ye) so it is fully
-// self-contained. Reuses the dense GEMM/softmax-backward kernels; the only new
-// op is the weighted-accumulate backward.
-//   per expert e: d_ye = gate[:,e]·d_out ; d_gate[:,e] = Σ_j Ye[:,j]·d_out[:,j]
-//                 d_hidden += d_ye · Weᵀ ; d_We = hiddenᵀ · d_ye
-//   router: d_logits = softmax_bwd(d_gate, gate)
-//           d_hidden += d_logits · gate_wᵀ ; d_gate_w = hiddenᵀ · d_logits
-// not-an-op: driver — recomputes the forward intermediates, loops experts with
-// gpu_moe_weighted_accumulate_backward + gpu_gemm_bt/gpu_gemm_at/gpu_add_inplace/
-// gpu_copy_into, then the router grads via gpu_softmax_backward_into; allocates
-// all returned grads and intermediates.
 pub fn gpu_moe_backward(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -180,10 +146,8 @@ pub fn gpu_moe_backward(
 		gpu_moe_weighted_accumulate_backward(
 			d_out, &gate, &ye, n_tokens, d_model, n_experts, e, &d_ye, &d_gate,
 		)?;
-		// d_hidden += d_ye · Weᵀ
 		gpu_gemm_bt_f64(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
 		gpu_add_inplace(&dh_e, n_tokens * d_model, &d_hidden)?;
-		// d_We = hiddenᵀ · d_ye  →  d_expert_w[e]
 		gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens, &dwe)?;
 		gpu_copy_into(&dwe, expert_stride, &d_expert_w.view(e * expert_stride, expert_stride))?;
 	}
@@ -203,9 +167,6 @@ pub fn gpu_moe_backward(
 mod tests {
 	use super::*;
 
-	// Backward through every MoE op must match a finite difference of the forward
-	// for the loss L = Σ (out ⊙ G): the analytic d_gate_w / d_expert_w / d_hidden
-	// from gpu_moe_backward (with d_out = G) equal (L(θ+ε) − L(θ−ε)) / 2ε.
 	#[test]
 	fn moe_backward_matches_finite_diff() {
 		crate::hip::set_device(0).expect("set_device");
@@ -218,7 +179,7 @@ mod tests {
 		let hidden = mk(1, n * d, 1.0);
 		let gate_w = mk(2, d * e, 1.0);
 		let expert_w = mk(3, e * d * d, 1.0);
-		let g = mk(4, n * d, 1.0); // upstream grad = d_out
+		let g = mk(4, n * d, 1.0);
 
 		let hb = GpuBuffer::alloc(hidden.len()).expect("h");
 		hb.load(&hidden).expect("h load");

@@ -31,11 +31,6 @@ pub fn check(code: i32) -> Result<(), HipError> {
 	}
 }
 
-/// Multiprocessor count of the current device (hipGetDeviceProperties →
-/// prop.multiProcessorCount), cached after the first query. Used to size GPU
-/// launches to the real hardware instead of a hardcoded CU count. No fallback:
-/// if the query fails (e.g. called before the device is initialized) it panics
-/// with a clear cause rather than returning a silent wrong value.
 pub fn cu_count() -> usize {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	static CU: AtomicUsize = AtomicUsize::new(0);
@@ -71,12 +66,9 @@ unsafe extern "C" {
 	pub fn hipStreamSynchronize(stream: *mut c_void) -> i32;
 	pub fn hipStreamDestroy(stream: *mut c_void) -> i32;
 	pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
-	// Error string helpers — used by HipError::Display
 	pub fn hipGetErrorName(error: i32) -> *const i8;
 	pub fn hipGetErrorString(error: i32) -> *const i8;
-	// Peek at last error without clearing it
 	pub fn hipPeekAtLastError() -> i32;
-	// Async transfers
 	pub(crate) fn hipMemcpyAsync(
 		dst: *mut c_void,
 		src: *const c_void,
@@ -85,33 +77,23 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	) -> i32;
 	pub(crate) fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
-	// Pinned host memory
 	pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	pub(crate) fn hipHostFree(ptr: *mut c_void) -> i32;
-	// Device count and attributes
-	// Note: hipDeviceProp_t is a ~800-byte struct; we expose hipDeviceGetAttribute instead
-	// to avoid defining it in Rust and to allow querying individual fields by attribute enum int.
 	pub fn hipGetDeviceCount(count: *mut i32) -> i32;
 	pub fn hipDeviceGetAttribute(pi: *mut i32, attr: i32, device_id: i32) -> i32;
-	// Defined in kernels/math.hip: hipGetDeviceProperties → prop.multiProcessorCount,
-	// returned as a plain int so we never bind the hipDeviceProp_t struct in Rust.
 	pub fn hip_multiprocessor_count() -> i32;
-	// Peer access
 	pub fn hipDeviceCanAccessPeer(
 		can_access_peer: *mut i32,
 		device_id: i32,
 		peer_device_id: i32,
 	) -> i32;
 	pub fn hipDeviceEnablePeerAccess(peer_device_id: i32, flags: u32) -> i32;
-	// Stream-ordered allocation
 	pub(crate) fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
 	pub(crate) fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
 	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub(crate) fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
-	// VRAM tier of the tiered buffer — VMM wrappers (src/kernels/vmm.hip). Handles
-	// are opaque, carried as *mut c_void.
 	pub fn vmm_granularity(out: *mut usize) -> i32;
 	pub fn vmm_create(handle_out: *mut *mut c_void, size: usize) -> i32;
 	pub fn vmm_reserve(va_out: *mut *mut c_void, size: usize) -> i32;
@@ -119,7 +101,6 @@ unsafe extern "C" {
 	pub fn vmm_unmap(va: *mut c_void, size: usize) -> i32;
 	pub fn vmm_release(handle: *mut c_void) -> i32;
 	pub fn vmm_addr_free(va: *mut c_void, size: usize) -> i32;
-	// hipBLAS — matrix-vector multiply (out_dim == 1 fast path)
 	pub fn hipblasDgemv(
 		handle: *mut c_void,
 		trans: u32,
@@ -134,7 +115,6 @@ unsafe extern "C" {
 		y: *mut f64,
 		incy: i32,
 	) -> i32;
-	// hipBLAS — rank-1 update: A = alpha * x * yᵀ + A (column-major)
 	pub fn hipblasDger(
 		handle: *mut c_void,
 		m: i32,
@@ -164,19 +144,10 @@ pub fn device_synchronize() -> Result<(), HipError> {
 	check(unsafe { hipDeviceSynchronize() })
 }
 
-// The SDMA copy engine is incoherent with the gfx L2 on reused hipMallocAsync
-// pool pages (ROCm 7.2.1 / gfx1101): an SDMA H2D lands in memory while compute
-// reads stale L2 lines (silent wrong gemm results) or a stale mapping
-// (intermittent "page not present" fault). Measured on inventory_proof: ~55%
-// failure with SDMA, 8/8 clean without. Force blit-kernel copies — coherent
-// with gfx L2 by construction — unless the user set the variable themselves.
-// Must run before the first HIP call of the process; both GPU entry funnels
-// (set_device, first allocation) call it.
 pub(crate) fn disable_sdma_once() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	ONCE.call_once(|| {
 		if std::env::var_os("HSA_ENABLE_SDMA").is_none() {
-			// SAFETY: first GPU touch is effectively single-threaded, before HSA init.
 			unsafe { std::env::set_var("HSA_ENABLE_SDMA", "0") };
 		}
 	});
@@ -191,23 +162,15 @@ pub fn set_device(device: i32) -> Result<(), HipError> {
 	check(unsafe { hipSetDevice(device) })
 }
 
-/// HSA event payload for `hsa_amd_register_system_event_handler` — only the
-/// memory-fault arm is read (event_type 0 = HSA_AMD_GPU_MEMORY_FAULT_EVENT,
-/// hsa_ext_amd.h:2656/2701).
 #[repr(C)]
 struct HsaAmdEvent {
 	event_type: u32,
-	// union arm: hsa_amd_gpu_memory_fault_info_t
 	agent: u64,
 	virtual_address: u64,
 	fault_reason_mask: u32,
 }
 
 extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i32 {
-	// Runs on an HSA runtime thread right before the abort() that today only
-	// leaves a core: print the faulting VA and decoded reason so the crash
-	// names itself, then return non-success so the runtime still aborts (the
-	// queues are dead; the core stays available for deeper digs).
 	let e = unsafe { &*event };
 	if e.event_type == 0 {
 		const REASONS: [(u32, &str); 8] = [
@@ -245,50 +208,33 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			e.virtual_address,
 			crate::memory::ledger_report(),
 		);
-		// Give the KFD SMI watchdog thread a beat to drain its event lines
-		// before the runtime aborts the process.
 		std::thread::sleep(std::time::Duration::from_millis(150));
 	}
-	1 // HSA_STATUS_ERROR — let the runtime abort as before
+	1
 }
 
-/// Register the GPU memory-fault autopsy once. Resolved via dlsym (same
-/// pattern as the vramspy hooks): the symbol lives in libhsa-runtime64,
-/// which amdhip64 loads at runtime — no new link dependency.
 pub(crate) fn register_fault_autopsy_once() {
 	use std::sync::atomic::{AtomicBool, Ordering};
-	// Success-latched, not Once: a call before HSA is initialized fails with a
-	// status (observed via set_device pre-init) and must retry at pool warm.
 	static REGISTERED: AtomicBool = AtomicBool::new(false);
 	if REGISTERED.load(Ordering::Relaxed) {
 		return;
 	}
-	// SAFETY: RTLD_DEFAULT + literal NUL-terminated name.
 	let sym = unsafe {
 		libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
 	};
 	if sym.is_null() {
-		return; // runtime without HSA (never on ROCm) — autopsy simply absent
+		return;
 	}
 	type Register = extern "C" fn(
 		extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
 		*mut c_void,
 	) -> i32;
-	// SAFETY: sym resolved from the documented HSA entry with this signature.
 	let register = unsafe { std::mem::transmute::<*mut c_void, Register>(sym) };
 	if register(fault_autopsy, std::ptr::null_mut()) == 0 {
 		REGISTERED.store(true, Ordering::Relaxed);
 	}
 }
 
-/// Make the default stream-ordered memory pool retain freed memory instead of
-/// releasing it to the OS (release threshold = u64::MAX). Without this the pool
-/// unmaps freed pages on sync and a later hipMallocAsync can hand back an
-/// address whose backing is not yet remapped when a kernel touches it — an
-/// intermittent GPU page fault under heavy alloc/free churn (weight streaming).
-/// Bytes the default pool has reserved from the driver but not handed out —
-/// growth for a new allocation comes on top of this, so a "how much can I
-/// still ask for" computation must subtract it.
 pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	crate::gate::acquire();
 	const RESERVED_MEM_CURRENT: i32 = 0x5;
@@ -305,10 +251,6 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	Ok(reserved.saturating_sub(used) as usize)
 }
 
-/// Physical VRAM the kernel reports free across ALL clients (compositor
-/// included) — `hipMemGetInfo` only sees KFD's own accounting, and an ask
-/// beyond real physical free is an uncatchable `VmHeap::MapPhysMemory` abort,
-/// so the slab pre-check needs the amdgpu sysfs ground truth.
 pub fn sysfs_vram_free() -> Option<usize> {
 	for card in std::fs::read_dir("/sys/class/drm").ok()? {
 		let dev = card.ok()?.path().join("device");
@@ -338,20 +280,11 @@ pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	})
 }
 
-/// Pin the pool's release threshold and warm it (commit + retain a chunk) so no
-/// async copy faults on an uncommitted page. Idempotent — funnels through the
-/// same one-time warm that the first allocation triggers, so calling it from
-/// `init()` and allocating without `init()` both warm the pool exactly once.
 pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
 	crate::memory::device_init_once();
 	Ok(())
 }
 
-/// Release all retained pool VRAM back to the driver. Retention (threshold=max)
-/// must not outlive the process: teardown reclaim is asynchronous, so a process
-/// launched milliseconds later (cargo's next test binary) can touch pages whose
-/// remap is still in flight — an intermittent gfxhub fault in the FIRST heavy
-/// test of the next binary. Called from gpu_shutdown's atexit hook.
 pub(crate) fn trim_mempool(device: i32) -> Result<(), HipError> {
 	let mut pool: *mut c_void = std::ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
@@ -391,7 +324,6 @@ pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 }
 
 pub unsafe fn host_free(ptr: *mut c_void) -> Result<(), HipError> {
-	// SAFETY: FFI call — caller must ensure pointer validity and size.
 	crate::callspy::tick(&crate::callspy::HOST_FREE);
 	check(unsafe { hipHostFree(ptr) })
 }
@@ -408,12 +340,10 @@ pub fn enable_peer_access(peer: i32, flags: u32) -> Result<(), HipError> {
 	check(unsafe { hipDeviceEnablePeerAccess(peer, flags) })
 }
 
-/// RAII wrapper for a HIP stream.
 pub struct Stream {
 	raw: *mut c_void,
 }
 
-// SAFETY: HIP device pointers are thread-safe; the runtime serializes kernel launches per-stream.
 unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
@@ -445,12 +375,10 @@ impl Drop for Stream {
 	}
 }
 
-/// RAII wrapper for a HIP event.
 pub struct Event {
 	raw: *mut c_void,
 }
 
-// SAFETY: HIP device pointers are thread-safe; the runtime serializes kernel launches per-stream.
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 
@@ -464,7 +392,6 @@ impl Event {
 	}
 
 	pub unsafe fn record(&self, stream: *mut c_void) -> Result<(), HipError> {
-		// SAFETY: FFI call — caller must ensure pointer validity and size.
 		crate::callspy::tick(&crate::callspy::EVENT_RECORD);
 		check(unsafe { hipEventRecord(self.raw, stream) })
 	}

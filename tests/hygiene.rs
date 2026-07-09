@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const SRC_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src"];
+const COMMENT_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "gpu-core/src"];
 const KERNEL_ROOTS: &[&str] = &["gpu-core/src/kernels"];
 const LEAK_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "examples"];
 const LIB_ROOTS: &[&str] = &["src/lib.rs", "src/utils", "recipe-infer/src", "ogdl/src"];
@@ -441,7 +442,7 @@ fn h02_no_static_mut_return() {
 
 #[test]
 fn h03_no_comments() {
-      let mut sources = rs_files(SRC_ROOTS);
+      let mut sources = rs_files(COMMENT_ROOTS);
       sources.extend(files_with_ext(KERNEL_ROOTS, "hip"));
       let mut hits = Vec::new();
       for p in sources {

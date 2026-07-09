@@ -49,9 +49,6 @@ unsafe extern "C" {
 	);
 }
 
-// CSR sparse matrix-vector product: y = A * x, A stored in CSR format.
-// values/col_idx have nnz elements; row_ptr has n_rows+1 elements (i32).
-// x has n_cols elements (f64); y_out is n_rows (f64).
 pub fn gpu_csr_spmv(
 	values: &GpuBuffer,
 	col_idx: &GpuBuffer,
@@ -75,8 +72,6 @@ pub fn gpu_csr_spmv(
 	Ok(())
 }
 
-// CSR sparse matrix times dense node-feature matrix: C = A * B.
-// A: n_rows x n_cols (CSR). B: n_cols x feat (row-major f64). c_out: n_rows x feat.
 pub fn gpu_csr_spmm(
 	values: &GpuBuffer,
 	col_idx: &GpuBuffer,
@@ -102,10 +97,6 @@ pub fn gpu_csr_spmm(
 	Ok(())
 }
 
-// Scatter-based neighbor aggregation over edges given as (src, dst) i32 index lists.
-// features: n_nodes x feat (f64). edge_src/edge_dst: n_edges (i32).
-// mean=1 divides each node's aggregated features by its in-degree.
-// deg_ws: caller-provided n_nodes f64 scratch. agg_out: n_nodes x feat (f64).
 pub fn gpu_neighbor_aggregate(
 	features: &GpuBuffer,
 	edge_src: &GpuBuffer,
@@ -148,8 +139,6 @@ pub fn gpu_neighbor_aggregate(
 	Ok(())
 }
 
-// Compute in-degree for each node as f64 from an edge list (i32 dst indices).
-// deg_out: n_nodes (f64); zeroed internally before the scatter.
 pub fn gpu_degree(
 	edge_dst: &GpuBuffer,
 	n_nodes: usize,
@@ -169,9 +158,6 @@ pub fn gpu_degree(
 	Ok(())
 }
 
-// Scale each row of a node-feature matrix by deg[node]^{-1/2} in place (GCN normalization).
-// features: n_nodes x feat (f64, in-place out). deg: n_nodes (f64).
-// in-place: writes features (D^-1/2 A D^-1/2 normalization)
 pub fn gpu_gcn_norm(
 	deg: &GpuBuffer,
 	n_nodes: usize,

@@ -53,8 +53,6 @@ unsafe extern "C" {
 	);
 }
 
-// Bootstrap indices via floor(u * n). uniform_ws is a caller-provided n_samples
-// f64 workspace pre-filled by a separate gpu_rand_uniform_into op. idx_out: n_samples i32.
 pub fn gpu_bootstrap_sample(
 	uniform_ws: &GpuBuffer,
 	n: usize,
@@ -62,7 +60,7 @@ pub fn gpu_bootstrap_sample(
 	seed: usize,
 	idx_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let _ = seed; // RNG init lives in the upstream gpu_rand_uniform_into that fills uniform_ws
+	let _ = seed;
 	unsafe {
 		launch_floor_scale_to_idx(
 			uniform_ws.ptr_raw() as *const c_void,
@@ -76,8 +74,6 @@ pub fn gpu_bootstrap_sample(
 	Ok(())
 }
 
-// Random feature subset via random-key bitonic argsort. keys_ws: caller-provided
-// n_features f64 scratch. idx_out: n_features i32 (first k are the chosen subset).
 pub fn gpu_feature_subset(
 	keys_ws: &GpuBuffer,
 	n_features: usize,
@@ -99,8 +95,6 @@ pub fn gpu_feature_subset(
 	Ok(())
 }
 
-// Random threshold in [col_min, col_max]. d_min_ws/d_max_ws: caller-provided
-// 1-elem scratch. threshold_out: 1-elem (caller reads it back).
 pub fn gpu_random_threshold_split(
 	feature_col: &GpuBuffer,
 	d_min_ws: &GpuBuffer,
@@ -124,11 +118,6 @@ pub fn gpu_random_threshold_split(
 	Ok(())
 }
 
-// GPU forest inference for leaf-wise trees with arbitrary (global) child
-// indices. `bins` is feature-major [n_eff*n] u8; node arrays are the
-// concatenation of every tree's nodes; `tree_root` holds each tree's global
-// root index. out = lr * sum_t leaf_value per sample (length n). lr is a 1-elem
-// device buffer.
 pub fn gpu_tree_ensemble_predict(
 	bins: &GpuBuffer,
 	node_feature: &GpuBuffer,
@@ -164,8 +153,6 @@ pub fn gpu_tree_ensemble_predict(
 	Ok(())
 }
 
-// Out-of-bag mask: oob_out[i]=1 where sample i never appears in bootstrap_idx.
-// used_ws: caller-provided n-byte scratch (zeroed internally). oob_out: n bytes.
 pub fn gpu_oob_mask(
 	bootstrap_idx: &GpuBuffer,
 	used_ws: &GpuBuffer,

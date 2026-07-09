@@ -3,10 +3,6 @@ use crate::kernels::{gpu_copy_into, safe_i32};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// FFI declaration — slot-for-slot with launcher in diffusionx.hip
-//
-// C: launch_diffusionx_entropy_gated_step(logits, canvas, accepted, renoise, bound, n_positions, vocab, stream)
-//    const double*, const double*, double*, double*, const double*, int, int, hipStream_t
 
 unsafe extern "C" {
 	fn launch_diffusionx_entropy_gated_step(
@@ -35,12 +31,6 @@ fn e() -> Result<(), HipError> {
 	check(unsafe { crate::hip::hipGetLastError() })
 }
 
-// ── gpu_entropy_gated_step ────────────────────────────────────────────────
-// Entropy-gated discrete diffusion sampler STEP. One fused thread per position.
-// logits: f64 (n_positions, vocab) row-major. canvas: f64 (n_positions,) token ids.
-// entropy_bound: scalar threshold on the natural-log Shannon entropy of softmax(logits[p,:]).
-//   H_p <  bound -> commit argmax (renoise 0); H_p >= bound -> keep canvas (renoise 1).
-// Returns (accepted_canvas f64 (n_positions,), renoise_mask f64 (n_positions,) 0/1).
 pub fn gpu_entropy_gated_step(
 	logits: &GpuBuffer,
 	canvas: &GpuBuffer,
@@ -65,10 +55,6 @@ pub fn gpu_entropy_gated_step(
 	e()
 }
 
-// ── gpu_diffusion_commit ──────────────────────────────────────────────────────
-// One block-autoregressive commit step. Already-committed positions are FROZEN;
-// every other position takes `accepted`, and a newly-confident one (renoise==0)
-// is marked committed. canvas + committed are in/out.
 pub fn gpu_diffusion_commit(
 	accepted: &GpuBuffer,
 	renoise: &GpuBuffer,
@@ -89,17 +75,6 @@ pub fn gpu_diffusion_commit(
 	e()
 }
 
-// ── gpu_diffusion_sample ─────────────────────────────────────────────────────
-// Block-autoregressive entropy-gated diffusion decoding loop. Each iteration:
-//   1. `logits_fn(canvas)` produces the model's logits for the current canvas
-//      (the committed tokens condition the still-open positions);
-//   2. the entropy-gated step commits the confident positions of this block;
-//   3. committed positions are FROZEN; the loop repeats on the rest.
-// Terminates when every position is committed or `max_steps` is reached. Returns
-// the final canvas and the number of steps taken. `initial_canvas` holds the
-// starting token ids (any sentinel for "open"); it is not mutated.
-// not-an-op: driver — host loop over the logits_fn closure with a mid-flow D2H of
-// `committed` and a convergence branch; composes gpu_entropy_gated_step + gpu_diffusion_commit.
 pub fn gpu_diffusion_sample(
 	mut logits_fn: impl FnMut(&GpuBuffer) -> Result<GpuBuffer, HipError>,
 	initial_canvas: &GpuBuffer,
@@ -144,22 +119,14 @@ pub fn gpu_diffusion_sample(
 mod tests {
 	use super::*;
 
-	// The block-autoregressive loop must commit progressively: a position becomes
-	// confident only once its predecessors are committed (its logits depend on the
-	// canvas), so exactly one position commits per step and the loop converges in
-	// `n` steps with every position decoded — proving iteration, the freeze of
-	// committed positions, and convergence detection.
 	#[test]
 	fn diffusion_block_ar_progressive_commit() {
 		crate::hip::set_device(0).expect("set_device");
 		let (n, vocab) = (5usize, 4usize);
-		let bound = 0.5; // 0 < bound < ln(vocab)=1.386 → peaked=confident, uniform=uncertain
-		let initial = GpuBuffer::alloc(n).expect("init"); // -1 = open slot
+		let bound = 0.5;
+		let initial = GpuBuffer::alloc(n).expect("init");
 		initial.load(&vec![-1.0f64; n]).expect("init load");
 
-		// Position p is confident (peaked at class 0) iff p <= #committed; otherwise
-		// uniform logits (entropy ln(vocab) > bound). Committed positions hold a real
-		// token id (>= 0); open positions hold the -1 sentinel.
 		let logits_fn = |canvas: &GpuBuffer| -> Result<GpuBuffer, HipError> {
 			let mut c = vec![0.0f64; n];
 			unsafe { canvas.download_async(&mut c, std::ptr::null_mut()) }?;
@@ -168,7 +135,7 @@ mod tests {
 			let mut logits = vec![0.0f64; n * vocab];
 			for p in 0..n {
 				if p <= committed_count {
-					logits[p * vocab] = 10.0; // peaked → entropy ~0 < bound
+					logits[p * vocab] = 10.0;
 				}
 			}
 			let lb = GpuBuffer::alloc(logits.len())?;

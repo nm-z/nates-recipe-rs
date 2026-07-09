@@ -1,20 +1,3 @@
-//! VRAM→RAM→DISK waterfall for immutable byte blobs (model weights).
-//!
-//! Strict fill order — the water never pools in two layers at once:
-//!   1. VRAM: `claim()` takes ONE allocation of everything the driver reports
-//!      free at init (memset-committed, so the water level is touched pages,
-//!      not reservations) and registers it as the process device arena; every
-//!      later GpuBuffer — activations, norms, staging, library workspace,
-//!      weight blobs — carves from the claim until it is exhausted. The pool
-//!      is never touched again; exit frees the one claim.
-//!   2. RAM until the next blob would push past 90% of MemAvailable measured
-//!      at fill start (the same guard law pantry applies to dataset parsing).
-//!   3. DISK: once both tiers have refused, every later blob stays on disk
-//!      and its bytes are never read at fill time.
-//!
-//! Location is this module's output, never the caller's choice. The GPU side
-//! lands in the ledger under tag "waterfall"; `report()` prints all three
-//! water levels.
 
 use crate::memory::{GpuBuffer, tag_scope};
 use std::collections::HashMap;
@@ -27,11 +10,11 @@ pub enum Home {
 }
 
 pub struct Waterfall {
-	slab: Option<GpuBuffer>, // ONE pool allocation; blobs are bump-placed views
+	slab: Option<GpuBuffer>,
 	homes: HashMap<String, Home>,
 	vram_full: bool,
 	ram_full: bool,
-	ram_floor: usize, // MemAvailable value that means "RAM is full"
+	ram_floor: usize,
 	vram_bytes: usize,
 	ram_bytes: usize,
 	disk_bytes: usize,
@@ -56,8 +39,6 @@ impl Default for Waterfall {
 }
 
 impl Waterfall {
-	/// An empty store: no slab, every lookup misses to DISK. Placeholder only —
-	/// the real store comes from `claim()` at init.
 	pub fn new() -> Self {
 		Waterfall {
 			slab: None,
@@ -71,13 +52,6 @@ impl Waterfall {
 		}
 	}
 
-	/// Wrap an already-claimed process device arena (the ONE slab handed back by
-	/// `memory::claim_device_arena_bytes`, which registered it as the arena and
-	/// committed its pages) as the store's VRAM tier. The one-claim lifecycle
-	/// itself — the sizing/probe/claim/memset/register — lives in memory.rs now;
-	/// the store only bump-places blobs into the registered arena and holds the
-	/// slab alive (its Drop is the run's single arena free). Blobs placed after
-	/// this carve from the arena with zero pool traffic until it is exhausted.
 	pub fn from_arena(slab: GpuBuffer) -> Self {
 		let mut w = Self::new();
 		w.slab = Some(slab);
@@ -85,8 +59,6 @@ impl Waterfall {
 		w
 	}
 
-	/// Place one blob. `fill` is called at most once, only when the blob lands
-	/// in VRAM or RAM; a DISK placement never reads the bytes.
 	pub fn place(
 		&mut self,
 		name: &str,
@@ -104,9 +76,6 @@ impl Waterfall {
 
 	fn settle(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
 		if !self.vram_full {
-			// "Full" = the next blob doesn't fit in what's left of the claim.
-			// Carves are non-owning and cost zero pool traffic; checking the
-			// remainder first means the pool is NEVER touched past the claim.
 			if crate::memory::arena_remaining() < len {
 				self.vram_full = true;
 			} else {

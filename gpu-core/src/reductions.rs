@@ -165,7 +165,6 @@ fn next_pow2(n: usize) -> usize {
 	p
 }
 
-// ── Plan-time workspace-size helpers (not_an_op: usize-only rocPRIM temp query) ──
 pub fn gpu_sum_all_workspace_bytes(n: usize) -> usize {
 	unsafe { launch_sum_all_workspace_bytes(safe_i32(n)) }
 }
@@ -239,7 +238,6 @@ pub fn gpu_min_all(
 	scalar_reduce(launch_min_all, x, workspace, n, out)
 }
 
-// out holds the mean; the /n divide runs device-side inside launch_mean_all.
 pub fn gpu_mean_all(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
@@ -249,7 +247,6 @@ pub fn gpu_mean_all(
 	scalar_reduce(launch_mean_all, x, workspace, n, out)
 }
 
-// out holds the norm; sq is n-length scratch, sqrt runs device-side.
 pub fn gpu_l2_norm(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
@@ -272,7 +269,6 @@ pub fn gpu_l2_norm(
 	Ok(())
 }
 
-// prod is n-length scratch for the elementwise products.
 pub fn gpu_dot(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -297,7 +293,6 @@ pub fn gpu_dot(
 	Ok(())
 }
 
-// ── Bitonic primitives (conforming ops; the schedule lives in the drivers below) ──
 
 pub fn gpu_fill_sentinel(
 	data: &GpuBuffer,
@@ -318,7 +313,6 @@ pub fn gpu_fill_sentinel(
 	Ok(())
 }
 
-// in-place: writes idx (iota init)
 pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_init_idx(idx.ptr_raw(), safe_i32(n), std::ptr::null_mut());
@@ -327,7 +321,6 @@ pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	Ok(())
 }
 
-// in-place: writes data (one compare-exchange stage)
 pub fn gpu_bitonic_step(
 	j: usize,
 	k: usize,
@@ -347,7 +340,6 @@ pub fn gpu_bitonic_step(
 	Ok(())
 }
 
-// in-place: writes keys+idx (keyed stage)
 pub fn gpu_bitonic_step_idx(
 	j: usize,
 	k: usize,
@@ -369,7 +361,6 @@ pub fn gpu_bitonic_step_idx(
 	Ok(())
 }
 
-// in-place: writes keys+vals (key/value stage)
 pub fn gpu_bitonic_step_dd(
 	j: usize,
 	k: usize,
@@ -391,7 +382,6 @@ pub fn gpu_bitonic_step_dd(
 	Ok(())
 }
 
-// not-an-op: driver — bitonic k/j schedule, owns the pow2 pad buffer, copies into caller out
 pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
 	let mut work = GpuBuffer::alloc(pn)?;
@@ -415,7 +405,6 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	Ok(())
 }
 
-// not-an-op: driver — index-bitonic schedule, owns pad keys/vals scratch, copies into caller out
 pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
 	let mut keys = GpuBuffer::alloc(pn)?;
@@ -441,7 +430,6 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	Ok(())
 }
 
-// not-an-op: driver — key/value bitonic schedule, owns pad scratch, writes two caller outs
 pub fn gpu_sort_by_key(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,
@@ -574,7 +562,6 @@ pub fn gpu_cummax(
 	Ok(())
 }
 
-// Caller must pre-zero out (n_segs doubles): the kernel scatter-accumulates via atomicAdd.
 pub fn gpu_segment_sum(
 	vals: &GpuBuffer,
 	seg_ids: &GpuBuffer,

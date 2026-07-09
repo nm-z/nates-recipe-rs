@@ -154,7 +154,6 @@ pub fn gpu_bce_with_logits(
 	Ok(())
 }
 
-/// Focal loss + grad into preallocated buffers (no allocation — training-loop safe).
 pub fn gpu_focal_into(
 	prob: &GpuBuffer,
 	target: &GpuBuffer,
@@ -180,7 +179,6 @@ pub fn gpu_focal_into(
 	Ok(())
 }
 
-/// Focal gradient (d loss / d prob, scaled 1/n) into a preallocated buffer.
 pub fn gpu_focal_grad_into(
 	prob: &GpuBuffer,
 	target: &GpuBuffer,

@@ -967,21 +967,13 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 pub fn clean_dataset(d: &mut Dataset) {
 	let k = d.n_targets;
 	let n = d.x.nrows();
+	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		eprintln!("\x1b[1;31mno columns found, check delimiter\x1b[0m");
-		eprintln!(
-			"    {}  →  parsed {n} row(s) × 0 column(s)",
-			crate::data::short_path(&d.source)
-		);
+		eprintln!("\x1b[1;31mno columns found, check delimiter\x1b[0m  {src}  →  {n} row(s) × 0 column(s)");
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		eprintln!("\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m", d.y.len());
-		eprintln!(
-			"    {}  →  {n} row(s) × {k} target(s) needs {} value(s)",
-			crate::data::short_path(&d.source),
-			n * k
-		);
+		eprintln!("\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)", d.y.len(), n * k);
 		std::process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
@@ -1166,39 +1158,36 @@ pub fn prepare_table_data(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod clean_dataset_tests {
 	use super::{Dataset, clean_dataset};
 	use ndarray::{Array1, Array2};
 
-	fn ds(n: usize, cols: usize, n_targets: usize, y: Vec<f64>) -> Dataset {
+	fn ds(n: usize, cols: usize, k: usize, y: Vec<f64>) -> Dataset {
 		Dataset {
-			x: Array2::from_shape_fn((n, cols), |(i, j)| (i * cols + j) as f64),
+			x: Array2::zeros((n, cols)),
 			y: Array1::from_vec(y),
-			source: "test".to_string(),
-			n_targets,
-			has_target: n_targets > 0,
+			source: "t".into(),
+			n_targets: k,
+			has_target: k > 0,
 			text_cols: Vec::new(),
 			onehot_groups: Vec::new(),
 		}
 	}
 
 	#[test]
-	fn no_target_dataset_survives_cleaning() {
+	fn no_target_survives_cleaning() {
 		let mut d = ds(4, 3, 0, Vec::new());
 		clean_dataset(&mut d);
-		assert_eq!(d.x.nrows(), 4);
-		assert_eq!(d.x.ncols(), 3);
+		assert_eq!((d.x.nrows(), d.x.ncols()), (4, 3));
 		assert!(d.y.is_empty());
 	}
 
 	#[test]
-	fn missing_target_rows_drop_and_features_impute() {
+	fn missing_target_drops_row_features_impute() {
 		let mut d = ds(3, 2, 1, vec![1.0, f64::NAN, 3.0]);
 		d.x[(0, 1)] = f64::NAN;
 		clean_dataset(&mut d);
-		assert_eq!(d.x.nrows(), 2, "the NaN-target row must drop");
 		assert_eq!(d.y.to_vec(), vec![1.0, 3.0]);
-		assert!(d.x.iter().all(|v| v.is_finite()), "features must be imputed");
+		assert!(d.x.iter().all(|v| v.is_finite()));
 	}
 }

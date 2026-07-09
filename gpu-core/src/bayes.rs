@@ -43,9 +43,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Accumulate per-class feature count table [n_classes * n_features] via
-/// atomicAdd.  `x_counts` is [n * n_features] f64 feature counts; `y` is
-/// [n] i32 class labels.  `out` must be zeroed by the caller (kernel accumulates).
 pub fn gpu_nb_count_table(
 	x_counts: &GpuBuffer,
 	y: &GpuBuffer,
@@ -69,8 +66,6 @@ pub fn gpu_nb_count_table(
 	Ok(())
 }
 
-/// Compute smoothed log P(feature|class) from a count table into `out`
-/// [n_classes * n_features]. `alpha` is a 1-elem device buffer (Laplace smoothing).
 pub fn gpu_nb_feature_log_prob(
 	count_table: &GpuBuffer,
 	alpha: &GpuBuffer,
@@ -92,8 +87,6 @@ pub fn gpu_nb_feature_log_prob(
 	Ok(())
 }
 
-/// Multinomial NB log-posterior [n * n_classes] into `out`.
-/// out[i,c] = log_prior[c] + sum_f x[i,f] * feature_log_prob[c,f]
 pub fn gpu_multinomial_nb_logprob(
 	log_class_prior: &GpuBuffer,
 	feature_log_prob: &GpuBuffer,
@@ -119,8 +112,6 @@ pub fn gpu_multinomial_nb_logprob(
 	Ok(())
 }
 
-/// Bernoulli NB log-posterior [n * n_classes] into `out`, including the (1-x)*log(1-p) term.
-/// out[i,c] = log_prior[c] + sum_f [ x[i,f]*log_p[c,f] + (1-x[i,f])*log_neg[c,f] ]
 pub fn gpu_bernoulli_nb_logprob(
 	log_class_prior: &GpuBuffer,
 	feature_log_prob: &GpuBuffer,

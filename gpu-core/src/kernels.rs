@@ -1,11 +1,8 @@
-//! HIP/ROCm C FFI kernel wrappers. Caller must ensure buffer sizes match the declared
-//! dimensions. Each launch is followed by check_launch() which asserts hipGetLastError()==0.
 
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// not-an-op: plumbing — launch-status assert used by drivers; ops use hip::check
 pub(crate) fn check_launch() {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
 	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
@@ -13,24 +10,20 @@ pub(crate) fn check_launch() {
 	assert!(err == 0, "HIP kernel launch failed with error code {}", err);
 }
 
-// not-an-op: plumbing — usize->i32 FFI cast guard
 pub(crate) fn safe_i32(v: usize) -> i32 {
 	assert!(v <= i32::MAX as usize, "size {} overflows i32", v);
 	v as i32
 }
 
-// hipBLAS operation constants
 const HIPBLAS_OP_N: u32 = 111;
 const HIPBLAS_OP_T: u32 = 112;
 
 unsafe extern "C" {
-	// hipBLAS handle management
 	fn hipblasCreate(handle: *mut *mut c_void) -> i32;
 	fn hipblasDestroy(handle: *mut c_void) -> i32;
 	fn hipblasSetStream(handle: *mut c_void, stream: *mut c_void) -> i32;
 	fn hipblasSetWorkspace(handle: *mut c_void, addr: *mut c_void, size: usize) -> i32;
 
-	// hipBLAS GEMM: column-major C = alpha * op(A) * op(B) + beta * C
 	fn hipblasDgemm(
 		handle: *mut c_void,
 		transA: u32,
@@ -48,7 +41,6 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	// own SGD step kernel (optim.hip): w[i] += neg_lr * g[i], neg_lr device scalar
 	fn launch_sgd_update_f64(
 		w: *mut f64,
 		g: *const f64,
@@ -57,8 +49,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// hipSOLVER (→ rocSOLVER on AMD, cuSOLVER on NVIDIA). Explicit-workspace model:
-	// query *_bufferSize, allocate a device work buffer, pass work/lwork + devInfo.
 	fn hipsolverCreate(handle: *mut *mut c_void) -> i32;
 	fn hipsolverDestroy(handle: *mut c_void) -> i32;
 	fn hipsolverDpotrf_bufferSize(
@@ -84,13 +74,12 @@ unsafe extern "C" {
 		ipiv: *mut i32, B: *mut f64, ldb: i32, work: *mut f64, lwork: i32, info: *mut i32,
 	) -> i32;
 
-	// hipBLAS triangular solve: op(A) * X = alpha * B (in-place, overwrites B)
 	fn hipblasDtrsm(
 		handle: *mut c_void,
-		side: u32,   // 141 = left
-		uplo: u32,   // 121 = lower, 122 = upper
-		transA: u32, // 111 = none, 112 = transpose
-		diag: u32,   // 131 = non-unit, 132 = unit
+		side: u32,
+		uplo: u32,
+		transA: u32,
+		diag: u32,
 		m: i32,
 		n: i32,
 		alpha: *const f64,
@@ -100,7 +89,6 @@ unsafe extern "C" {
 		ldb: i32,
 	) -> i32;
 
-	// Remaining custom kernels
 	fn launch_add_diag(A: *mut c_void, n: i32, val: *const f64, stream: *mut c_void);
 	fn launch_reparameterize(
 		mu: *const c_void,
@@ -615,7 +603,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Softmax backward, log-softmax, cross-entropy
 	fn launch_softmax_backward(
 		grad: *const c_void,
 		sm: *const c_void,
@@ -640,7 +627,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Gather/scatter
 	fn launch_gather_rows(
 		table: *const c_void,
 		indices: *const c_void,
@@ -658,7 +644,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Conv backward
 	fn launch_col2im_1d(
 		patches: *const c_void,
 		out: *mut c_void,
@@ -682,7 +667,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Max pool 1D
 	fn launch_max_pool_1d(
 		input: *const c_void,
 		out_vals: *mut c_void,
@@ -702,7 +686,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Pool 2D
 	fn launch_avg_pool_2d(
 		input: *const c_void,
 		output: *mut c_void,
@@ -762,7 +745,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Reduce max/min
 	fn launch_reduce_max_rows(
 		x: *const c_void,
 		out: *mut c_void,
@@ -824,7 +806,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	) -> usize;
 
-	// Comparisons
 	fn launch_gt(
 		a: *const c_void,
 		b: *const c_void,
@@ -861,7 +842,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// GELU / SiLU
 	fn launch_gelu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_gelu_backward(
 		grad: *const c_void,
@@ -879,7 +859,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// BatchNorm
 	fn launch_batchnorm_forward(
 		x: *const c_void,
 		gamma: *const c_void,
@@ -918,7 +897,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// LayerNorm backward
 	fn launch_layernorm_backward(
 		grad_y: *const c_void,
 		x: *const c_void,
@@ -932,7 +910,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Adam/AdamW
 	fn launch_adam_update(
 		w: *mut c_void,
 		m: *mut c_void,
@@ -961,7 +938,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// GRU
 	fn launch_gru_cell(
 		gates: *const c_void,
 		h: *const c_void,
@@ -971,7 +947,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Structural
 	fn launch_slice_cols(
 		src: *const c_void,
 		dst: *mut c_void,
@@ -1002,7 +977,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Reductions
 	fn launch_log_sum_exp_rows(
 		x: *const c_void,
 		out: *mut c_void,
@@ -1018,7 +992,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Prefix sum
 	fn launch_prefix_sum_inclusive(
 		x: *const c_void,
 		out: *mut c_void,
@@ -1046,7 +1019,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	) -> usize;
 
-	// Tree
 	fn launch_histogram_build(
 		bins: *const c_void,
 		grad: *const c_void,
@@ -1082,7 +1054,6 @@ unsafe extern "C" {
 		split_bin: i32,
 		stream: *mut c_void,
 	);
-	// Tree build per-step launchers (the depth loop + scratch live in Rust now)
 	fn launch_tb_histogram(
 		tr_bins: *const c_void,
 		grad: *const c_void,
@@ -1155,7 +1126,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Oblivious tree kernels (u8 bins, f32 grad/hess)
 	fn launch_mse_grad(
 		pred: *const c_void,
 		target: *const c_void,
@@ -1311,7 +1281,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// metrics_fused.hip — fused single-pass metric reductions (double, atomicAdd into scalar out)
 	fn launch_ss_res(
 		pred: *const c_void,
 		y: *const c_void,
@@ -1351,7 +1320,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// DTW
 	fn launch_dtw_init(dp: *mut c_void, dp_size: i32, stream: *mut c_void);
 	fn launch_dtw_antidiag(
 		cost: *const c_void,
@@ -1362,7 +1330,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Apriori
 	fn launch_itemset_support(
 		trans: *const c_void,
 		cands: *const c_void,
@@ -1382,12 +1349,10 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// Philox GPU RNG
 	fn launch_rand_uniform(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
 	fn launch_randn(out: *mut c_void, n: i32, seed: u32, stream: *mut c_void);
 	fn launch_bernoulli(out: *mut c_void, n: i32, p: *const f64, seed: u32, stream: *mut c_void);
 
-	// LightGBM leaf-wise kernels (i32 leaf-slot index, f32 grad/hess/count histograms)
 	fn launch_lgbm_histogram(
 		bins_fm: *const c_void,
 		node_idx: *const c_void,
@@ -1497,7 +1462,6 @@ unsafe extern "C" fn atexit_gpu_shutdown() {
 	gpu_shutdown();
 }
 
-// not-an-op: lifecycle — thread-local vendor handle getter
 pub(crate) fn hipblas_handle() -> *mut c_void {
 	crate::callspy::tick(&crate::callspy::HIPBLAS);
 	HIPBLAS_HANDLE.with(|h| {
@@ -1518,10 +1482,6 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 			"hipblasCreate failed with status {}",
 			status
 		);
-		// Bind hipBLAS to the null stream so its GEMMs are ordered with every
-		// other gpu-core kernel (all launched on stream 0); otherwise hipBLAS
-		// runs on its own stream and can read inputs a null-stream kernel has
-		// not finished writing (a cross-stream data race).
 		let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
 		assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
 		h.store(handle, Ordering::Relaxed);
@@ -1529,16 +1489,11 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 	})
 }
 
-/// Point hipBLAS at a caller-owned device workspace so it never allocates its
-/// own — required by the one-claim lifecycle (the library's hidden pool alloc
-/// would be a second allocation). Caller keeps `buf` alive for the process.
-// not-an-op: lifecycle — hipBLAS workspace config, no kernel launch
 pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
 	assert_eq!(status, 0, "hipblasSetWorkspace failed with status {}", status);
 }
 
-// not-an-op: lifecycle — thread-local vendor handle getter
 pub(crate) fn hipsolver_handle() -> *mut c_void {
 	HIPSOLVER_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
@@ -1557,7 +1512,6 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 	})
 }
 
-// not-an-op: lifecycle — device/handle teardown, no kernel launch
 pub fn gpu_shutdown() {
 	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 	unsafe { crate::hip::hipDeviceSynchronize() };
@@ -1577,27 +1531,12 @@ pub fn gpu_shutdown() {
 			}
 		}
 	});
-	// Free the pinned H2D bounce (the one hipHostMalloc) — exit frees ALL RAM
-	// and VRAM explicitly, not by process teardown.
 	crate::memory::free_bounce();
 	crate::memory::free_run_pin();
-	// Return retained pool VRAM to the driver before the process dies — see
-	// trim_mempool: async teardown reclaim races the next process's first touch.
 	let _ = crate::hip::trim_mempool(0);
 	eprint!("{}", crate::callspy::report());
-	// The gpu gate is NOT released here. atexit runs LIFO and the HIP runtime
-	// registered its own destructor before this one, so it frees the arena
-	// AFTER this function returns: releasing now would wake the next process in
-	// the queue onto a card that still holds this run's VRAM (a probe child
-	// measured that as an allocation failure). The kernel drops the flock when
-	// it closes the fd during exit_files — strictly after every atexit handler.
-	// A process that outlives its GPU work (the daemon) hands off with a Lease.
 }
 
-/// C = A @ B, A is (m x k) row-major, B is (k x n) row-major, C is (m x n) row-major.
-///
-/// hipBLAS is column-major. The identity C_rm = (C_cm)^T = (B_cm @ A_cm)^T lets us call:
-///   hipblasDgemm(N, N, n, m, k, 1.0, B, n, A, k, 0.0, C, n)
 pub fn gpu_gemm(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1629,10 +1568,6 @@ pub fn gpu_gemm(
 	check(status)
 }
 
-/// C = A^T @ B, A is (k x m) row-major, B is (k x n) row-major, C is (m x n) row-major.
-///
-/// Column-major: C_cm = B_cm @ A_cm^T →
-///   hipblasDgemm(N, T, n, m, k, 1.0, B, n, A, m, 0.0, C, n)
 pub fn gpu_gemm_at(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1664,13 +1599,6 @@ pub fn gpu_gemm_at(
 	check(status)
 }
 
-/// C = A @ B^T, A is (m x k) row-major, B is (n x k) row-major, C is (m x n) row-major.
-///
-/// Column-major: C_cm = B_cm^T @ A_cm →
-///   hipblasDgemm(T, N, n, m, k, 1.0, B, k, A, k, 0.0, C, n)
-/// `gpu_gemm_bt` into a caller-owned `c` (`m×n`, no alloc). `beta = 0` so `c` is
-/// fully overwritten; `c` must be distinct from `a`/`b`. The streaming-inference
-/// hot loop calls this to keep steady-state device allocations at zero.
 pub fn gpu_gemm_bt_into(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -1702,11 +1630,6 @@ pub fn gpu_gemm_bt_into(
 	check(status)
 }
 
-/// GPU Cholesky solve: solve A x = b where A is symmetric positive-definite (n x n).
-/// Uses rocsolver dpotrf (factorize) + hipblas dtrsm (triangular solve).
-/// Copies inputs (dpotrf destroys A, dtrsm overwrites b). Returns solution on GPU.
-/// Worst-case hipSOLVER potrf workspace bytes for an n×n Cholesky. Dims-only; no allocation.
-// not-an-op: plan-time helper — hipSOLVER potrf workspace size query
 pub fn gpu_cholesky_solve_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -1734,12 +1657,11 @@ pub fn gpu_cholesky_solve(
 	gpu_copy_into(a, n * n, a_copy)?;
 	gpu_copy_into(b, n, out)?;
 
-	// Cholesky factorize: A = L L^T
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDpotrf_bufferSize(
 			hipsolver_handle(),
-			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			122,
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
@@ -1749,7 +1671,7 @@ pub fn gpu_cholesky_solve(
 	let status = unsafe {
 		hipsolverDpotrf(
 			hipsolver_handle(),
-			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			122,
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
@@ -1760,15 +1682,14 @@ pub fn gpu_cholesky_solve(
 	};
 	check(status)?;
 
-	// Forward solve: L z = b
 	let alpha = 1.0_f64;
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
-			141, // left
-			122, // lower (matches the L·Lᵀ factor)
-			111, // no transpose
-			131, // non-unit diagonal
+			141,
+			122,
+			111,
+			131,
 			n as i32,
 			1,
 			&alpha,
@@ -1780,14 +1701,13 @@ pub fn gpu_cholesky_solve(
 	};
 	check(status)?;
 
-	// Backward solve: L^T x = z
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
-			141, // left
-			122, // lower (matches the L·Lᵀ factor)
-			112, // transpose
-			131, // non-unit diagonal
+			141,
+			122,
+			112,
+			131,
 			n as i32,
 			1,
 			&alpha,
@@ -1800,16 +1720,10 @@ pub fn gpu_cholesky_solve(
 	check(status)
 }
 
-/// GPU matrix inversion via Cholesky: A^{-1} where A is SPD (n x n).
-/// Copies A (dpotrf destroys it), creates identity on GPU. Returns A^{-1} on GPU.
-/// Worst-case hipSOLVER potrf workspace bytes for an n×n Cholesky inverse. Dims-only.
-// not-an-op: plan-time helper — hipSOLVER potrf workspace size query
 pub fn gpu_cholesky_inv_workspace_bytes(n: usize) -> usize {
 	gpu_cholesky_solve_workspace_bytes(n)
 }
 
-/// A^{-1} via Cholesky. Caller pre-fills `out` with the n×n identity (via gpu_eye);
-/// the two triangular solves overwrite it with the inverse in place.
 pub fn gpu_cholesky_inv(
 	a: &GpuBuffer,
 	n: usize,
@@ -1820,12 +1734,11 @@ pub fn gpu_cholesky_inv(
 ) -> Result<(), HipError> {
 	gpu_copy_into(a, n * n, a_copy)?;
 
-	// Cholesky factorize: A = L L^T
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDpotrf_bufferSize(
 			hipsolver_handle(),
-			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			122,
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
@@ -1835,7 +1748,7 @@ pub fn gpu_cholesky_inv(
 	let status = unsafe {
 		hipsolverDpotrf(
 			hipsolver_handle(),
-			122, // fill lower (L·Lᵀ; matches the dtrsm solves)
+			122,
 			n as i32,
 			a_copy.ptr as *mut f64,
 			n as i32,
@@ -1847,12 +1760,11 @@ pub fn gpu_cholesky_inv(
 	check(status)?;
 
 	let alpha = 1.0_f64;
-	// Forward solve: L Z = I
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
 			141,
-			122, // lower — match this function's own potrf(122)
+			122,
 			111,
 			131,
 			n as i32,
@@ -1866,12 +1778,11 @@ pub fn gpu_cholesky_inv(
 	};
 	check(status)?;
 
-	// Backward solve: L^T X = Z
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
 			141,
-			122, // lower — match this function's own potrf(122)
+			122,
 			112,
 			131,
 			n as i32,
@@ -1886,10 +1797,6 @@ pub fn gpu_cholesky_inv(
 	check(status)
 }
 
-/// GPU general linear solve via LU: solve A*X = B. A is [n,n], B is [n,nrhs].
-/// Copies both (dgesv destroys A and overwrites B). Returns solution on GPU.
-/// hipSOLVER getrf (LU factor) workspace bytes for an n×n solve. Dims-only.
-// not-an-op: plan-time helper — hipSOLVER getrf workspace size query
 pub fn gpu_solve_getrf_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -1905,8 +1812,6 @@ pub fn gpu_solve_getrf_workspace_bytes(n: usize) -> usize {
 	(lwork.max(1) as usize) * 8
 }
 
-/// hipSOLVER getrs (LU solve) workspace bytes for an n×n system with nrhs. Dims-only.
-// not-an-op: plan-time helper — hipSOLVER getrs workspace size query
 pub fn gpu_solve_getrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	let mut lwork_s: i32 = 0;
 	unsafe {
@@ -1941,7 +1846,6 @@ pub fn gpu_solve(
 	gpu_copy_into(a, n * n, a_copy)?;
 	gpu_copy_into(b, n * nrhs, out)?;
 
-	// LU factorize: A = P L U
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDgetrf_bufferSize(
@@ -1968,12 +1872,11 @@ pub fn gpu_solve(
 	};
 	check(status)?;
 
-	// Solve A X = B using the LU factors
 	let mut lwork_s: i32 = 0;
 	unsafe {
 		hipsolverDgetrs_bufferSize(
 			hipsolver_handle(),
-			111, // op none
+			111,
 			n as i32,
 			nrhs as i32,
 			a_copy.ptr as *mut f64,
@@ -1987,7 +1890,7 @@ pub fn gpu_solve(
 	let status = unsafe {
 		hipsolverDgetrs(
 			hipsolver_handle(),
-			111, // op none
+			111,
 			n as i32,
 			nrhs as i32,
 			a_copy.ptr as *mut f64,
@@ -2003,10 +1906,6 @@ pub fn gpu_solve(
 	check(status)
 }
 
-/// GPU Cholesky factorization: A = L*L^T. Returns L (lower triangular) on GPU.
-/// Copies A (dpotrf destroys it).
-/// Worst-case hipSOLVER potrf workspace bytes for an n×n Cholesky factor. Dims-only.
-// not-an-op: plan-time helper — hipSOLVER potrf workspace size query
 pub fn gpu_cholesky_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -2029,18 +1928,12 @@ pub fn gpu_cholesky(
 	info: &GpuBuffer,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// Factor-only: callers read the result row-major and expect the lower-triangular
-	// L (L·Lᵀ=A). hipSOLVER/cuSOLVER are column-major, so asking for the col-major
-	// UPPER (121) writes the factor into the row-major LOWER triangle — the L we want.
-	// (The solve helpers above stay 122: they keep potrf+dtrsm column-major-consistent
-	// and only return the solution vector, so layout never escapes.)
-	// Caller copies A → out; we factor out in place.
 	gpu_copy_into(a, n * n, out)?;
 	let mut lwork: i32 = 0;
 	unsafe {
 		hipsolverDpotrf_bufferSize(
 			hipsolver_handle(),
-			121, // col-major UPPER ⇒ row-major LOWER factor L
+			121,
 			n as i32,
 			out.ptr as *mut f64,
 			n as i32,
@@ -2050,7 +1943,7 @@ pub fn gpu_cholesky(
 	let status = unsafe {
 		hipsolverDpotrf(
 			hipsolver_handle(),
-			121, // col-major UPPER ⇒ row-major LOWER factor L
+			121,
 			n as i32,
 			out.ptr as *mut f64,
 			n as i32,
@@ -2062,8 +1955,6 @@ pub fn gpu_cholesky(
 	check(status)
 }
 
-/// GPU triangular solve: L*X = B (or L^T*X = B if trans=true).
-/// dtrsm does NOT destroy L, only overwrites B. Copies b only.
 pub fn gpu_tri_solve(
 	l: &GpuBuffer,
 	b: &GpuBuffer,
@@ -2078,10 +1969,10 @@ pub fn gpu_tri_solve(
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
-			141, // left
-			121, // upper — gpu_cholesky factors col-major UPPER; read the same triangle
+			141,
+			121,
 			trans_flag,
-			131, // non-unit
+			131,
 			n as i32,
 			nrhs as i32,
 			&alpha,
@@ -2094,7 +1985,6 @@ pub fn gpu_tri_solve(
 	check(status)
 }
 
-/// Add scalar to diagonal of n x n matrix in-place
 pub fn gpu_add_diag(val: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_add_diag(a.ptr, n as i32, val.ptr as *const f64, std::ptr::null_mut());
@@ -2103,7 +1993,6 @@ pub fn gpu_add_diag(val: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipE
 	Ok(())
 }
 
-/// Reparameterize: z = mu + exp(0.5 * log_var) * eps
 pub fn gpu_reparameterize(
 	mu: &GpuBuffer,
 	log_var: &GpuBuffer,
@@ -2125,7 +2014,6 @@ pub fn gpu_reparameterize(
 	Ok(())
 }
 
-/// KL divergence: 0.5 * (mu^2 + exp(log_var) - log_var - 1) per element
 pub fn gpu_kl_div(
 	mu: &GpuBuffer,
 	log_var: &GpuBuffer,
@@ -2145,9 +2033,6 @@ pub fn gpu_kl_div(
 	Ok(())
 }
 
-/// Fused VAE backward: computes grad_mu and grad_logvar in one dispatch.
-/// grad_mu = grad_z + kl_weight * mu
-/// grad_lv = grad_z * 0.5 * exp(0.5*lv) * eps + kl_weight * 0.5 * (exp(lv) - 1)
 pub fn gpu_vae_backward_latent(
 	grad_z: &GpuBuffer,
 	mu: &GpuBuffer,
@@ -2175,8 +2060,6 @@ pub fn gpu_vae_backward_latent(
 	Ok(())
 }
 
-/// Log-determinant from Cholesky factor: 2 * sum(log(diag(L))).
-/// L is the factorized matrix from dpotrf (n x n on GPU). Returns scalar.
 pub fn gpu_log_det_cholesky(
 	l: &GpuBuffer,
 	n: usize,
@@ -2245,7 +2128,6 @@ pub fn gpu_sigmoid_backward_into(
 	Ok(())
 }
 
-/// Alloc-free tanh forward (out may alias x) and backward (act = tanh output; tanh'=1-out²).
 pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_tanh_act(
@@ -2277,7 +2159,6 @@ pub fn gpu_tanh_backward_into(
 	Ok(())
 }
 
-/// Alloc-free leaky-ReLU forward/backward (act = output; slope `alpha` for x<0). Output-based grad.
 pub fn gpu_leaky_relu_into(
 	x: &GpuBuffer,
 	alpha: &GpuBuffer,
@@ -2317,7 +2198,6 @@ pub fn gpu_leaky_relu_backward_into(
 	Ok(())
 }
 
-/// Alloc-free SiLU/Swish forward, and backward (takes the PRE-activation `x`, not the output).
 pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_silu(
@@ -2381,8 +2261,6 @@ pub fn gpu_relu_backward_into(
 	Ok(())
 }
 
-/// `out = a + b` into a caller-owned buffer (no alloc). Aliasing `out == a` or
-/// `out == b` is safe — thread `i` reads `a[i]`/`b[i]` before writing `out[i]`.
 pub fn gpu_add_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_add(
@@ -2430,7 +2308,6 @@ pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> 
 	Ok(())
 }
 
-/// In-place scale: x *= scalar (no alloc, no copy)
 pub fn gpu_scale_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	crate::infer_ops::gpu_scale_f64_inplace(scalar, n, x)
 }
@@ -2456,9 +2333,6 @@ pub fn gpu_fma(
 	Ok(())
 }
 
-/// SGD weight update: W += neg_lr·G (gradient descent step, neg_lr = -lr).
-/// Own kernel with a device-scalar neg_lr — a hipblas host-pointer-mode alpha
-/// would host-deref the device buffer.
 pub fn gpu_sgd_update(
 	grad: &GpuBuffer,
 	neg_lr: &GpuBuffer,
@@ -2602,7 +2476,6 @@ pub fn gpu_linear_into(
 	}
 }
 
-/// Fused R² residual sum of squares Σ(y-pred)² reduced into scalar `out` (atomicAdd).
 pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
@@ -2620,7 +2493,6 @@ pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffe
 	Ok(())
 }
 
-/// Fused mean squared error Σ(pred-y)²/n reduced into scalar `out` (atomicAdd).
 pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
@@ -2638,7 +2510,6 @@ pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) 
 	Ok(())
 }
 
-/// Fused accuracy Σ[round(pred)==round(y)]/n reduced into scalar `out` (atomicAdd).
 pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
@@ -2656,7 +2527,6 @@ pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuf
 	Ok(())
 }
 
-/// Two-sided binary cross-entropy gradient da = (pred-y)/(pred(1-pred))/n, element-wise.
 pub fn gpu_bce_grad_into(
 	pred: &GpuBuffer,
 	y: &GpuBuffer,
@@ -2678,7 +2548,6 @@ pub fn gpu_bce_grad_into(
 	Ok(())
 }
 
-/// Multi-class accuracy Σ[argmax(pred_row)==argmax(y_row)]/n into scalar `out` (rows are k-wide).
 pub fn gpu_argmax_accuracy_into(
 	pred: &GpuBuffer,
 	y: &GpuBuffer,
@@ -2703,7 +2572,6 @@ pub fn gpu_argmax_accuracy_into(
 	Ok(())
 }
 
-/// Element-wise absolute value into `out` (in==out allowed).
 pub fn gpu_abs_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_abs(
@@ -2717,7 +2585,6 @@ pub fn gpu_abs_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	Ok(())
 }
 
-/// Element-wise natural log into `out`.
 pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_log(
@@ -2731,9 +2598,6 @@ pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	Ok(())
 }
 
-/// Element-wise copy of `n` f64s into `out` — an identity calc into an existing
-/// buffer, dispatched like every other elementwise op. The transfer engines
-/// (`xfer`) are reserved for tier traffic; a VRAM-internal copy is device work.
 pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_copy_f64(
@@ -2747,7 +2611,6 @@ pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), H
 	Ok(())
 }
 
-/// Column-wise sum of (rows×cols) into preallocated `out` (cols-long), allocation-free for the result.
 pub fn gpu_reduce_sum_cols_into(
 	x: &GpuBuffer,
 	reduce_ws: &GpuBuffer,
@@ -2778,8 +2641,6 @@ pub fn gpu_reduce_sum_cols_into(
 	Ok(())
 }
 
-/// Worst-case reduce_sum_cols scratch bytes for a (rows×cols) reduction — for sizing the
-/// persistent Scratch.reduce_ws once from model dimensions. Dims-only; no allocation.
 pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 	unsafe {
 		reduce_sum_cols_workspace_bytes(
@@ -2791,12 +2652,6 @@ pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 	}
 }
 
-/// out(n) = X(n×in_dim) @ w(in_dim) + b, for the out_dim==1 forward fast path.
-///
-/// X is row-major (n×in_dim) = column-major (in_dim×n), lda=in_dim. With op=TRANSPOSE
-/// hipBLAS computes (X_cm)ᵀ @ w = X @ w. Bias is broadcast with the SAME primitive the
-/// out_dim>1 path (`gpu_linear_into`) uses — `launch_repeat_rows` pre-fills `out`, then
-/// dgemv with beta=1 accumulates the matvec on top.
 pub fn gpu_matvec_bias_into(
 	x: &GpuBuffer,
 	w: &GpuBuffer,
@@ -2836,9 +2691,6 @@ pub fn gpu_matvec_bias_into(
 	Ok(())
 }
 
-/// dw(in_dim) = aᵀ @ grad, for the out_dim==1 backward fast path. `a` is (n×in_dim)
-/// row-major = (in_dim×n) column-major (lda=in_dim); `trans=true` means "transpose the
-/// row-major a", which maps to hipBLAS op=NONE on that view → (a_cm) @ grad = aᵀ @ grad.
 pub fn gpu_dgemv_into(
 	a: &GpuBuffer,
 	x: &GpuBuffer,
@@ -2874,9 +2726,6 @@ pub fn gpu_dgemv_into(
 	Ok(())
 }
 
-/// da_prev(n×in_dim) = grad(n) ⊗ w(in_dim), the rank-1 outer product for the out_dim==1
-/// backward path. Row-major `out` = column-major (in_dim×n), lda=in_dim; dger writes
-/// A_cm[j,i] = w[j]·grad[i], i.e. da_prev[i,j] = grad[i]·w[j].
 pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, n: usize, in_dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		let _ = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
@@ -3008,19 +2857,10 @@ pub fn gpu_softmax_ce_grad_into(
 	Ok(())
 }
 
-/// Element count of the `[P×k×n]` partial scratch the split-K dW kernel needs for
-/// this shape. Scratch sizes its `dw_partials` buffer from this so the kernel and
-/// the allocation always agree on P.
-// not-an-op: plan-time helper — split-K dW partial-scratch element count
 pub fn gpu_splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
 	crate::math_ops::splitk_dw_partials_elems(m, k, n)
 }
 
-/// Two-pass split-K backward weight gradient: `grad_w` [k×n] = `input`ᵀ·`grad`
-/// reduced over the `m` batch rows, fanned across all CUs (the vendor BLAS GEMM
-/// leaves ~50 of 54 idle on this tiny output). `partials` must hold ≥
-/// `gpu_splitk_dw_partials_elems(m, k, n)` elements. Deterministic (two-pass
-/// reduce, fixed sum order — no f64 atomicAdd).
 pub fn gpu_splitk_dw_into(
 	input: &GpuBuffer,
 	grad: &GpuBuffer,
@@ -3067,7 +2907,6 @@ pub fn gpu_linear_backward_weights_only_into(
 			std::ptr::null_mut(),
 		)
 	};
-	// grad_w = inputᵀ @ grad — split-K across all CUs.
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
 	unsafe {
 		launch_reduce_sum_cols(
@@ -3097,11 +2936,9 @@ pub fn gpu_linear_backward_full_into(
 	grad_w: &GpuBuffer,
 	grad_b: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// grad_w = input^T @ grad — split-K across all CUs.
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
-	// grad_b = sum_cols(grad)
 	let ws = unsafe {
 		reduce_sum_cols_workspace_bytes(
 			grad.ptr as *const c_void,
@@ -3121,7 +2958,6 @@ pub fn gpu_linear_backward_full_into(
 			std::ptr::null_mut(),
 		);
 	}
-	// grad_input = grad @ weight^T
 	let gi_status = unsafe {
 		hipblasDgemm(
 			hipblas_handle(),
@@ -3187,10 +3023,6 @@ pub fn gpu_softmax_rows_into(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuB
 	Ok(())
 }
 
-/// Fused multi-head self-attention (f64, FlashAttention-style) for inference.
-/// q/k/v/out are [n, seq, d] row-major, d = heads*hd. K,V are streamed through
-/// shared-memory tiles with an online softmax — the L×L score matrix is never
-/// materialized. Bidirectional, numerically equal to the full softmax path.
 pub fn gpu_flash_attention_into(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -3218,10 +3050,6 @@ pub fn gpu_flash_attention_into(
 	Ok(())
 }
 
-/// Training flash attention: same fused stream as `gpu_flash_attention_into`
-/// but also writes the per-row logsumexp (`lse`, [n][heads][seq]) that the
-/// backward kernels use to recompute score tiles — no L×L buffer in training
-/// either.
 pub fn gpu_flash_attention_train_into(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -3251,9 +3079,6 @@ pub fn gpu_flash_attention_train_into(
 	Ok(())
 }
 
-/// Flash-attention backward, three deterministic passes (no atomics, no L×L):
-/// dsum rows, then dQ (query-major), then dK+dV (key-major). All inputs are the
-/// forward's q/k/v (post-RoPE), the pre-Wo context and its gradient, and lse.
 pub fn gpu_flash_attention_backward_into(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -3364,9 +3189,6 @@ pub fn gpu_grad_hess_into(
 	Ok(())
 }
 
-// ── tree-build (XGBoost-style) conforming primitives ───────────────────────
-// One thin op per tree.hip launcher; the depth loop + scratch live in the
-// gpu_tree_build_into driver below.
 
 pub fn gpu_tb_histogram(
 	tr_bins: &GpuBuffer,
@@ -3545,9 +3367,6 @@ pub fn gpu_tb_apply_tree(
 	Ok(())
 }
 
-// not-an-op: driver — per-depth XGBoost tree build; owns scratch + the depth
-// loop, composing the conforming gpu_tb_* ops. lambda/min_cw uploaded to 1-elem
-// device buffers once, then threaded through the split/leaf ops.
 pub fn gpu_tree_build_into(
 	tr_bins: &GpuBuffer,
 	te_bins: &GpuBuffer,
@@ -3563,8 +3382,6 @@ pub fn gpu_tree_build_into(
 	tr_pred: &GpuBuffer,
 	te_pred: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// Per-step depth loop. Scratch, fills, zeroing and the loop live here;
-	// the .hip side only exposes the individual launchers.
 	let isz = std::mem::size_of::<i32>();
 	let fsz = std::mem::size_of::<f64>();
 	let max_nodes = (1usize << (max_depth + 1)) - 1;
@@ -3576,11 +3393,11 @@ pub fn gpu_tree_build_into(
 	let hist_elems = max_level * p * n_bins;
 
 	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz).expect("tb node_assign");
-	node_assign.memset_zero(n_tr * isz).expect("tb node_assign zero"); // fill 0
+	node_assign.memset_zero(n_tr * isz).expect("tb node_assign zero");
 	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_feat");
 	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_bin");
 	sf.fill_bytes(0xFF, max_nodes * isz)
-		.expect("tb split_feat fill"); // -1 leaf sentinel
+		.expect("tb split_feat fill");
 	sb.fill_bytes(0xFF, max_nodes * isz)
 		.expect("tb split_bin fill");
 	let gh = GpuBuffer::alloc(hist_elems).expect("tb grad_hist");
@@ -3612,7 +3429,6 @@ pub fn gpu_tree_build_into(
 	Ok(())
 }
 
-// ── Oblivious tree GPU primitives ──────────────────────────────────────────
 
 pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, n: usize, grad: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -4062,7 +3878,6 @@ pub fn gpu_sub(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	Ok(())
 }
 
-/// (a - b) * scale, element-wise. For gradient = (softmax - onehot) / n.
 pub fn gpu_sub_scale_into(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -4084,7 +3899,6 @@ pub fn gpu_sub_scale_into(
 	Ok(())
 }
 
-/// GPU 1D avg pool: (n*out_len x n_filters) → (n x n_filters). out is n*n_filters.
 pub fn gpu_avg_pool_1d(
 	input: &GpuBuffer,
 	n: usize,
@@ -4106,7 +3920,6 @@ pub fn gpu_avg_pool_1d(
 	Ok(())
 }
 
-/// GPU pool gradient expand: (n x n_filters) → (n*out_len x n_filters), divided by out_len.
 pub fn gpu_pool_grad_expand(
 	grad: &GpuBuffer,
 	n: usize,
@@ -4128,7 +3941,6 @@ pub fn gpu_pool_grad_expand(
 	Ok(())
 }
 
-/// Argmin per row: writes int32 assignments (rows,) — index of min column per row.
 pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_argmin_rows(
@@ -4143,8 +3955,6 @@ pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuf
 	Ok(())
 }
 
-// not-an-op: plumbing — D2H readback
-/// Download i32 assignments from GPU.
 pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; n];
 	let bytes = n * std::mem::size_of::<i32>();
@@ -4161,8 +3971,6 @@ pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipEr
 	Ok(result)
 }
 
-/// Segmented centroid update: compute new centroids from data + assignments, all on GPU.
-/// Returns (centroids_buf (k*dim f64), counts_buf (k i32)).
 pub fn gpu_centroid_update(
 	x: &GpuBuffer,
 	assignments: &GpuBuffer,
@@ -4188,8 +3996,6 @@ pub fn gpu_centroid_update(
 	Ok(())
 }
 
-/// Per-row top-k: for each row of (rows x cols) distance matrix, find k nearest
-/// indices. out is (rows x k) i32.
 pub fn gpu_topk_per_row(
 	dists: &GpuBuffer,
 	rows: usize,
@@ -4211,8 +4017,6 @@ pub fn gpu_topk_per_row(
 	Ok(())
 }
 
-// not-an-op: plumbing — D2H readback
-/// Download (rows x k) i32 indices from GPU.
 pub fn download_topk_indices(buf: &GpuBuffer, rows: usize, k: usize) -> Result<Vec<i32>, HipError> {
 	let n = rows * k;
 	let mut result = vec![0i32; n];
@@ -4251,8 +4055,6 @@ pub fn gpu_bias_add(
 	Ok(())
 }
 
-/// Fused LSTM cell: apply gate activations and update C, H in-place on GPU.
-/// gates: (n × 4*hs), c: (n × hs), h: (n × hs).
 pub fn gpu_lstm_cell(gates: &GpuBuffer, n: usize, hs: usize, c: &GpuBuffer, h: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_lstm_cell(
@@ -4268,8 +4070,6 @@ pub fn gpu_lstm_cell(gates: &GpuBuffer, n: usize, hs: usize, c: &GpuBuffer, h: &
 	Ok(())
 }
 
-/// Gaussian log-likelihood matrix: out[i,c] = log_prior[c] - 0.5 * sum_j(log(var)+diff²/var)
-/// x: (n×p), means: (k×p), vars: (k×p), log_priors: (k) → out: (n×k)
 pub fn gpu_gaussian_ll(
 	x: &GpuBuffer,
 	means: &GpuBuffer,
@@ -4297,7 +4097,6 @@ pub fn gpu_gaussian_ll(
 	Ok(())
 }
 
-/// im2col for 1D conv: X (n×p) → patches (n*out_len × ks), out_len = p - ks + 1.
 pub fn gpu_im2col_1d(x: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
 	unsafe {
@@ -4315,7 +4114,6 @@ pub fn gpu_im2col_1d(x: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuff
 	Ok(())
 }
 
-/// Argmax per row: out[i] = argmax_j(x[i,j]) as f64 index
 pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_argmax_rows(
@@ -4443,10 +4241,6 @@ pub fn gpu_pairwise_l2(
 	Ok(())
 }
 
-/// Full-sort n i32 index pairs ascending via hipCUB radix; the first k indices are
-/// the k nearest. Caller provides scratch: sorted-keys (`keys_ws`, n f64), the
-/// identity values the kernel fills (`vals_ws`, n i32), and the radix temp
-/// (`radix_ws`, sized via `partial_argsort_workspace_bytes`). out is n i32 elements.
 pub fn gpu_partial_argsort(
 	data: &GpuBuffer,
 	n: usize,
@@ -4472,7 +4266,6 @@ pub fn gpu_partial_argsort(
 	Ok(())
 }
 
-// not-an-op: plumbing — D2H readback
 pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; k];
 	let bytes = k * std::mem::size_of::<i32>();
@@ -4489,7 +4282,6 @@ pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError>
 	Ok(result)
 }
 
-// ── New kernel wrappers ─────────────────────────────────────────────────────
 
 pub fn gpu_bernoulli_u8(
 	p: &GpuBuffer,
@@ -4531,8 +4323,6 @@ pub fn gpu_dropout_u8_into(
 	Ok(())
 }
 
-/// Concatenate (rows, d1) and (rows, d2) into (rows, d1+d2).
-/// Alloc-free row-major concat: out[rows×(d1+d2)] = [a_row(d1) | b_row(d2)] per row.
 pub fn gpu_concat_into(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -4556,7 +4346,6 @@ pub fn gpu_concat_into(
 	Ok(())
 }
 
-/// Copy the first `take` columns of each row of src[rows×src_cols] into out[rows×take].
 pub fn gpu_slice_lead_into(
 	src: &GpuBuffer,
 	rows: usize,
@@ -4578,8 +4367,6 @@ pub fn gpu_slice_lead_into(
 	Ok(())
 }
 
-/// 2D im2col: extract patches from NCHW images for GEMM-based convolution.
-/// Output: (N*outH*outW, C*kH*kW) patch matrix.
 pub fn gpu_im2col_2d(
 	x: &GpuBuffer,
 	n: usize,
@@ -4703,7 +4490,6 @@ pub fn gpu_clamp_into(
 	Ok(())
 }
 
-/// Transpose: (rows x cols) row-major → (cols x rows) row-major.
 pub fn gpu_transpose(
 	x: &GpuBuffer,
 	rows: usize,
@@ -4723,9 +4509,6 @@ pub fn gpu_transpose(
 	Ok(())
 }
 
-/// Pack the upper triangle of a column-major (m×n, lda=m) factor into a packed
-/// column-major (n×n) R on the GPU: R[j*n+i] = factor[j*m+i] for i<=j, else 0.
-/// Avoids the GPU→CPU→GPU round trip when extracting R from a QR factorization.
 pub fn gpu_pack_upper_tri(
 	factor: &GpuBuffer,
 	m: usize,
@@ -4745,7 +4528,6 @@ pub fn gpu_pack_upper_tri(
 	Ok(())
 }
 
-/// Identity matrix (n x n) on device.
 pub fn gpu_eye(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_eye(out.ptr, n as i32, std::ptr::null_mut());
@@ -4754,7 +4536,6 @@ pub fn gpu_eye(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	Ok(())
 }
 
-/// Conditional selection: out[i] = cond[i] != 0.0 ? a[i] : b[i].
 pub fn gpu_where_mask(
 	cond: &GpuBuffer,
 	a: &GpuBuffer,
@@ -4776,7 +4557,6 @@ pub fn gpu_where_mask(
 	Ok(())
 }
 
-/// Extract rows [start, start+count) from (total_rows x cols) matrix.
 pub fn gpu_slice_rows(
 	x: &GpuBuffer,
 	start: usize,
@@ -4804,9 +4584,6 @@ pub fn gpu_slice_rows(
 	Ok(())
 }
 
-/// Alloc-free broadcast subtract into `out`: out[i] = X[i] - v[i % cols]. Adding a
-/// per-row vector (e.g. positional encoding) is this with a negated `v`. In-place
-/// safe (out may alias x).
 pub fn gpu_broadcast_sub_into(
 	x: &GpuBuffer,
 	v: &GpuBuffer,
@@ -4828,7 +4605,6 @@ pub fn gpu_broadcast_sub_into(
 	Ok(())
 }
 
-/// Broadcast multiply: out[i] = X[i] * v[i % cols]. X is [rows, cols], v is [1, cols].
 pub fn gpu_broadcast_mul(
 	x: &GpuBuffer,
 	v: &GpuBuffer,
@@ -4850,7 +4626,6 @@ pub fn gpu_broadcast_mul(
 	Ok(())
 }
 
-/// Broadcast divide: out[i] = X[i] / v[i % cols]. X is [rows, cols], v is [1, cols].
 pub fn gpu_broadcast_div(
 	x: &GpuBuffer,
 	v: &GpuBuffer,
@@ -4872,10 +4647,7 @@ pub fn gpu_broadcast_div(
 	Ok(())
 }
 
-// ── New ops ────────────────────────────────────────────────────────────────
 
-/// Alloc-free row-softmax backward into a preallocated `out`: given upstream
-/// `grad` and the softmax output `sm` (both rows×cols), writes dL/dz per row.
 pub fn gpu_softmax_backward_into(
 	grad: &GpuBuffer,
 	sm: &GpuBuffer,
@@ -4937,8 +4709,6 @@ pub fn gpu_cross_entropy(
 	Ok(())
 }
 
-/// Alloc-free gather: `out[i,:] = table[(int)indices[i], :]`, writing into a
-/// preallocated `out` (n*cols). The frozen-loop embedding forward.
 pub fn gpu_gather_rows_into(
 	table: &GpuBuffer,
 	indices: &GpuBuffer,
@@ -4989,7 +4759,6 @@ pub fn gpu_col2im_1d(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
-	// col2im folds overlapping patches via atomicAdd → the accumulator must start at 0.
 	out.memset_zero(n * p * 8)?;
 	unsafe {
 		launch_col2im_1d(
@@ -5018,7 +4787,6 @@ pub fn gpu_col2im_2d(
 ) -> Result<(), HipError> {
 	let out_h = h - kh + 1;
 	let out_w = w - kw + 1;
-	// col2im folds overlapping patches via atomicAdd → the accumulator must start at 0.
 	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_col2im_2d(
@@ -5070,8 +4838,6 @@ pub fn gpu_max_pool_1d_backward(
 	n_filters: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// Kernel writes only the argmax cell per window; every other cell must be 0
-	// (GpuBuffer::alloc is not zeroed — pool memory is recycled non-zeroed).
 	out.memset_zero(n * out_len * n_filters * 8)?;
 	unsafe {
 		launch_max_pool_1d_backward(
@@ -5137,8 +4903,6 @@ pub fn gpu_avg_pool_2d_backward(
 ) -> Result<(), HipError> {
 	let out_h = (h - kh) / sh + 1;
 	let out_w = (w - kw) / sw + 1;
-	// Kernel atomic-adds grad/count into each window cell; uncovered cells and the
-	// accumulation base must be 0 (alloc is not zeroed on all backends).
 	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_avg_pool_2d_backward(
@@ -5209,7 +4973,6 @@ pub fn gpu_max_pool_2d_backward(
 	out_w: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// Kernel atomic-adds only into the argmax cell; every other cell must be 0.
 	out.memset_zero(n * c * h * w * 8)?;
 	unsafe {
 		launch_max_pool_2d_backward(
@@ -5349,7 +5112,6 @@ pub fn gpu_reduce_min_cols(
 	Ok(())
 }
 
-// ── Comparisons ────────────────────────────────────────────────────────────
 
 pub fn gpu_gt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -5417,9 +5179,7 @@ pub fn gpu_lt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) 
 	Ok(())
 }
 
-// ── GELU / SiLU ───────────────────────────────────────────────────────────
 
-// ── BatchNorm ──────────────────────────────────────────────────────────────
 
 pub fn gpu_batchnorm_forward(
 	x: &GpuBuffer,
@@ -5510,7 +5270,6 @@ pub fn gpu_batchnorm_backward(
 	Ok(())
 }
 
-// ── Adam / AdamW ──────────────────────────────────────────────────────────
 
 pub fn gpu_adam_update(
 	g: &GpuBuffer,
@@ -5576,7 +5335,6 @@ pub fn gpu_adamw_update(
 	Ok(())
 }
 
-// ── GRU ───────────────────────────────────────────────────────────────────
 
 pub fn gpu_gru_cell(
 	gates: &GpuBuffer,
@@ -5599,7 +5357,6 @@ pub fn gpu_gru_cell(
 	Ok(())
 }
 
-// ── Structural ────────────────────────────────────────────────────────────
 
 pub fn gpu_vconcat(
 	a: &GpuBuffer,
@@ -5712,7 +5469,6 @@ pub fn gpu_upsample_nearest_2d(
 	Ok(())
 }
 
-// ── Reductions ────────────────────────────────────────────────────────────
 
 pub fn gpu_log_sum_exp_rows(
 	x: &GpuBuffer,
@@ -5752,7 +5508,6 @@ pub fn gpu_grad_clip_norm(
 	Ok(())
 }
 
-// ── Prefix sum ────────────────────────────────────────────────────────────
 
 pub fn gpu_prefix_sum_inclusive(
 	x: &GpuBuffer,
@@ -5808,7 +5563,6 @@ pub fn gpu_prefix_sum_exclusive(
 	Ok(())
 }
 
-// ── Tree ──────────────────────────────────────────────────────────────────
 
 pub fn gpu_histogram_build(
 	bins: &GpuBuffer,
@@ -5895,9 +5649,6 @@ pub fn gpu_data_partition(
 	Ok(())
 }
 
-/// Update column k of an [n, cols] matrix: out[i, k] = matrix[i, k] + col[i].
-/// Returns new matrix (other columns unchanged).
-// not-an-op: driver — rebuilds matrix column k += col via copy/slice/add/concat (host branch on k)
 pub fn gpu_add_col(
 	matrix: &GpuBuffer,
 	n: usize,
@@ -5907,7 +5658,6 @@ pub fn gpu_add_col(
 ) -> Result<GpuBuffer, HipError> {
 	let out = GpuBuffer::alloc(n * cols)?;
 	gpu_copy_into(matrix, n * cols, &out)?;
-	// Extract col k, add, then rebuild the matrix by concat of slices.
 	let old_col = GpuBuffer::alloc(n)?;
 	gpu_slice_cols(&out, n, cols, k, 1, &old_col)?;
 	let new_col = GpuBuffer::alloc(n)?;
@@ -5937,9 +5687,6 @@ pub fn gpu_add_col(
 	}
 }
 
-/// Balanced accuracy from [n, nc] logits vs integer class labels.
-/// Downloads argmax, computes ba on CPU, prints to stderr. Returns ba.
-// not-an-op: driver — device argmax then host D2H + balanced-accuracy reduction + stderr print
 pub fn gpu_report(
 	logits: &GpuBuffer,
 	val_targets: &[i32],
@@ -5975,12 +5722,9 @@ pub fn gpu_report(
 	Ok(ba)
 }
 
-// ── DTW ───────────────────────────────────────────────────────────────────
 
 pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(), HipError> {
 	let dp_size = (m + 1) * (n + 1);
-	// The .hip init kernel fills the DP border; the caller drives the anti-diagonal
-	// sweep d = 0..=m+n-2 (the loop moved out of the .hip).
 	unsafe {
 		launch_dtw_init(dp.ptr, dp_size as i32, std::ptr::null_mut());
 	}
@@ -6000,7 +5744,6 @@ pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(
 	Ok(())
 }
 
-// ── Apriori ───────────────────────────────────────────────────────────────
 
 pub fn gpu_itemset_support(
 	trans: &GpuBuffer,
@@ -6027,10 +5770,6 @@ pub fn gpu_itemset_support(
 	Ok(())
 }
 
-// out is pre-sized by the caller to the worst case n_freq*(n_freq-1)/2*(k+1) doubles;
-// n_generated is a 1-elem i32 buffer that receives the real candidate count (the write
-// kernel's atomic write position, which ends equal to the number written). Overflow is
-// impossible against the worst-case cap; a caller reading n_generated sees the true count.
 pub fn gpu_candidate_generate(
 	freq: &GpuBuffer,
 	n_freq: usize,
@@ -6053,7 +5792,6 @@ pub fn gpu_candidate_generate(
 	Ok(())
 }
 
-// ── Philox GPU RNG ───────────────────────────────────────────────────────
 
 pub fn gpu_randn(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {

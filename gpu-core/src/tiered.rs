@@ -1,20 +1,3 @@
-//! Tiered paged buffer. One logical buffer of `B` bytes whose 2 MiB pages are
-//! distributed across three tiers — hot in VRAM, warm in anonymous RAM, cold in a
-//! disk file — where disk stores only the overflow past VRAM+RAM. A buffer fits
-//! whenever `B ≤ vram_data + ram_data + disk_data`, and each tier has a hard
-//! resident cap that is its own no-OOM proof:
-//!
-//!   G2 (VRAM never OOM): device residency ≤ `n_v` fixed VMM handles, `n_v·P ≤ vram_data`.
-//!   G3 (RAM  never OOM): anon residency  ≤ `n_r` fixed anon blocks, `n_r·P ≤ ram_data`.
-//!
-//! The sole failure in the program is the admit check `B > cap`, decided once, up
-//! front, before a single physical page is acquired. It replaces every `check_ram`.
-//!
-//! Volatility caveat (stated in the spec): the VRAM and RAM tiers are working
-//! memory that vanishes on a crash; the buffer is rebuilt from source per run.
-//! That volatility is what buys the additive ceiling. `ram_data` is sized to free
-//! RAM measured at `alloc`, so G3 guards the framework's own allocations, not a
-//! third process ballooning underneath it — no allocator can promise the latter.
 
 use crate::hip::{self, HipError};
 use std::ffi::c_void;
@@ -22,25 +5,19 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-/// Page size — 2 MiB, ≥ the VMM minimum granularity and ≥ the OS page.
 pub const P: usize = 2 << 20;
 
-// Reserves layered on top of the model's own weight/grad footprint (VRAM), the
-// kernel page cache (RAM), and filesystem metadata (disk). Headroom each tier
-// must never dip into — not thresholds on the buffer, floors under the OS.
-const RESERVE_V: usize = 1 << 30; // the 1 GB-per-tier user reserve law
-const RESERVE_R: usize = 1 << 30; //  1 GiB  OS headroom
-const RESERVE_D: usize = 1 << 30; //  1 GiB  filesystem headroom
+const RESERVE_V: usize = 1 << 30;
+const RESERVE_R: usize = 1 << 30;
+const RESERVE_D: usize = 1 << 30;
 
-/// Where each logical page currently lives.
 #[derive(Clone, Copy, Debug)]
 pub enum Residence {
-      Vram(u32), // ring slot
-      Ram(u32),  // anon pool index
-      Disk(u64), // byte offset in the spill file
+      Vram(u32),
+      Ram(u32),
+      Disk(u64),
 }
 
-/// The one failure: requested buffer exceeds the combined ceiling.
 #[derive(Debug)]
 pub struct Full {
       pub need: usize,
@@ -58,7 +35,6 @@ impl std::fmt::Display for Full {
       }
 }
 
-/// Live budgets, measured at `alloc` — never from a stale log.
 #[derive(Clone, Copy, Debug)]
 pub struct Budgets {
       pub vram_data: usize,
@@ -89,10 +65,6 @@ impl Budgets {
       }
 }
 
-/// The admit check that replaces every `check_ram`: the run stops for one reason
-/// only — the requested buffer exceeds VRAM+RAM+disk combined — decided from live
-/// budgets before anything is allocated. Returns the measured budgets on success
-/// (so the caller can log the ceiling it fit under).
 pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Result<Budgets, Full> {
       let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
       if b > bud.cap {
@@ -104,13 +76,11 @@ pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) ->
 
 fn vram_total_free() -> (usize, usize) {
       let (mut free, mut total) = (0usize, 0usize);
-      // SAFETY: FFI query into two owned stack usizes.
       crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
       unsafe { hip::hipMemGetInfo(&mut free, &mut total) };
       (free, total)
 }
 
-/// Free host RAM, measured now (spec: `meminfo_free()`).
 fn meminfo_free() -> usize {
       let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
       for l in s.lines() {
@@ -124,7 +94,6 @@ fn meminfo_free() -> usize {
       0
 }
 
-/// Free bytes on the filesystem holding `spill` (`statvfs` blocks_available·frag_size).
 fn disk_free(spill: &Path) -> usize {
       use std::os::unix::ffi::OsStrExt;
       let dir = spill.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
@@ -132,46 +101,33 @@ fn disk_free(spill: &Path) -> usize {
             return 0;
       };
       let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-      // SAFETY: c is a valid NUL-terminated path, st is owned.
       if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return 0;
       }
       (st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
 }
 
-/// A logical buffer paged across the three tiers.
 pub struct Tiered {
-      b: usize,   // logical byte length
-      n_pg: usize, // ceil(B / P)
+      b: usize,
+      n_pg: usize,
       res: Vec<Residence>,
       budgets: Budgets,
 
-      // VRAM tier: a reserved contiguous VA of `slots·P`, each slot backed by one
-      // permanently-mapped VMM handle. Staging overwrites a slot's device bytes.
       va: *mut c_void,
       handles: Vec<*mut c_void>,
-      // Resident-tracking for the >VRAM streaming path (stage/evict on the
-      // sequential sweep); the fits-in-VRAM path never migrates a slot.
       #[allow(dead_code)]
-      slot_page: Vec<Option<usize>>, // slot -> logical page currently resident
+      slot_page: Vec<Option<usize>>,
       slots: usize,
 
-      // RAM tier: fixed pool of anon P-blocks.
       ram: Vec<Box<[u8]>>,
 
-      // DISK tier: spill file holding only the overflow pages.
       disk: Option<File>,
       spill_path: PathBuf,
 }
 
-// SAFETY: device VA / handles are process-global; the buffer is single-owner.
 unsafe impl Send for Tiered {}
 
 impl Tiered {
-      /// Admit `B` iff it fits the combined ceiling, then lay pages out across the
-      /// tiers and acquire the physical backing. `weights_bytes`/`grad_bytes` are
-      /// reserved off VRAM so training params keep their room; `spill` is the disk
-      /// file for overflow pages.
       pub fn alloc(
             b: usize,
             weights_bytes: usize,
@@ -191,10 +147,6 @@ impl Tiered {
             Ok(Self::build(b, n_pg, n_vram, n_ram, budgets, spill))
       }
 
-      /// Test-only: lay a buffer out with explicit per-tier resident caps, so a
-      /// small buffer can be forced to span all three tiers on a machine with
-      /// gigabytes of headroom. Budgets are still measured (for the record) but the
-      /// caps override the resident split.
       #[cfg(test)]
       pub(crate) fn alloc_capped(b: usize, n_v: usize, n_r: usize, spill: &Path) -> Self {
             let budgets = Budgets::measure(0, 0, spill);
@@ -214,20 +166,12 @@ impl Tiered {
       ) -> Self {
             let n_disk = n_pg - n_vram - n_ram;
 
-            // VRAM tier: reserve one contiguous VA window, create+map `n_vram`
-            // handles into it. For a buffer that fits VRAM this is the whole thing,
-            // contiguous — the GEMM uses it directly.
             let (va, handles) = reserve_and_map(n_vram).expect("vmm reserve/map");
-            // The VMM-mapped VRAM handles live outside the stream-ordered pool, so
-            // the alloc choke never sees them — note their physical bytes into the
-            // ledger directly under tag "tiered-vram".
             crate::memory::tag_note_alloc("tiered-vram", handles.len() * P);
             let slot_page: Vec<Option<usize>> = (0..n_vram).map(Some).collect();
 
-            // RAM tier: anon P-blocks.
             let ram: Vec<Box<[u8]>> = (0..n_ram).map(|_| vec![0u8; P].into_boxed_slice()).collect();
 
-            // DISK tier: only the overflow past VRAM+RAM.
             let disk = if n_disk > 0 {
                   let f = File::options()
                         .read(true)
@@ -281,14 +225,10 @@ impl Tiered {
             self.n_pg
       }
 
-      /// True when the entire buffer is VRAM-resident and contiguous — the GEMM can
-      /// treat it as a plain device pointer via [`device_ptr`].
       pub fn is_contiguous_vram(&self) -> bool {
             self.slots == self.n_pg && self.disk.is_none() && self.ram.is_empty()
       }
 
-      /// Contiguous device pointer over the whole buffer. Only valid when
-      /// [`is_contiguous_vram`] holds (buffer ≤ VRAM data budget).
       pub fn device_ptr(&self) -> *mut c_void {
             assert!(
                   self.is_contiguous_vram(),
@@ -297,8 +237,6 @@ impl Tiered {
             self.va
       }
 
-      /// Write `src` into the buffer, spreading it across the resident tiers. `src`
-      /// is the host image of the logical bytes; page `p` takes `src[p·P ..]`.
       pub fn fill(&mut self, src: &[u8]) {
             assert!(src.len() <= self.b, "fill src longer than buffer");
             for p in 0..self.n_pg {
@@ -315,7 +253,6 @@ impl Tiered {
             match self.res[p] {
                   Residence::Vram(s) => {
                         let dst = unsafe { (self.va as *mut u8).add(s as usize * P) as *mut c_void };
-                        // SAFETY: dst is the s-th mapped P-window; bytes ≤ P.
                         unsafe {
                               crate::memory::xfer(
                                     dst,
@@ -344,11 +281,6 @@ impl Tiered {
             hip::device_synchronize()
       }
 
-      /// Stage an arbitrary logical byte range `[off, off+len)` into the device
-      /// `window` (contiguous, ≥ `len` bytes), gathering each overlapping page's
-      /// sub-range from its home tier. Rows do not align to pages, so the row-tiled
-      /// trainer stages exact row ranges (`off = r0·d·8`, `len = R·d·8`) and gets a
-      /// contiguous `[R×d]` device block.
       pub fn stage_bytes(&self, off: usize, len: usize, window: *mut c_void) {
             let mut scratch = vec![0u8; P];
             let mut done = 0usize;
@@ -358,8 +290,6 @@ impl Tiered {
                   let poff = gpos % P;
                   let chunk = (P - poff).min(len - done);
                   let dst = unsafe { (window as *mut u8).add(done) as *mut c_void };
-                  // SAFETY: dst = window+done covers `chunk`; each tier src is a valid
-                  // page sub-range at `poff`.
                   match self.res[p] {
                         Residence::Vram(s) => unsafe {
                               let src = (self.va as *mut u8).add(s as usize * P + poff) as *const c_void;
@@ -393,12 +323,6 @@ impl Tiered {
             }
       }
 
-      /// Stage a contiguous run of pages `[first_page, first_page+n_pages)` into the
-      /// device `window` (contiguous, ≥ `n_pages·P` bytes), gathering each page from
-      /// its home tier — VRAM→D2D, RAM→H2D, disk→read+H2D. This is the sequential
-      /// sweep's access: the row-tiled GEMM consumes `window` as one contiguous
-      /// device block. `window` is the fixed staging buffer of G3; home pages never
-      /// move, so there is no writeback and read-only pages evict as a drop.
       pub fn stage_into(&self, first_page: usize, n_pages: usize, window: *mut c_void) {
             let mut disk_scratch = vec![0u8; P];
             for k in 0..n_pages {
@@ -408,8 +332,6 @@ impl Tiered {
                   }
                   let bytes = P.min(self.b - p * P);
                   let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
-                  // SAFETY: dst is the k-th P-window of `window`; src per tier is a
-                  // valid P-region; `bytes` ≤ P.
                   match self.res[p] {
                         Residence::Vram(s) => unsafe {
                               let src = (self.va as *mut u8).add(s as usize * P) as *const c_void;
@@ -427,7 +349,6 @@ impl Tiered {
                                     .expect("disk tier")
                                     .read_exact_at(&mut disk_scratch[..bytes], off)
                                     .expect("stage read");
-                              // SAFETY: scratch holds `bytes` valid host bytes.
                               unsafe {
                                     crate::memory::xfer(
                                           dst,
@@ -449,7 +370,6 @@ impl Drop for Tiered {
             crate::memory::tag_note_free("tiered-vram", self.slots * P);
             for (s, h) in self.handles.iter().enumerate() {
                   let va = unsafe { (self.va as *mut u8).add(s * P) as *mut c_void };
-                  // SAFETY: unmap then release each slot we mapped; free the VA range.
                   unsafe {
                         crate::callspy::tick(&crate::callspy::MEM_UNMAP);
                         hip::vmm_unmap(va, P);
@@ -467,8 +387,6 @@ impl Drop for Tiered {
       }
 }
 
-/// Reserve a contiguous VA of `slots·P` and back each slot with a fresh VMM
-/// handle. Returns the base VA and the per-slot handles.
 fn reserve_and_map(slots: usize) -> Result<(*mut c_void, Vec<*mut c_void>), HipError> {
       if slots == 0 {
             return Ok((std::ptr::null_mut(), Vec::new()));
@@ -535,17 +453,12 @@ mod tests {
             }
       }
 
-      // G1 "and runs": a buffer forced to span VRAM+RAM+disk is trained by a
-      // row-tiled full-batch linear model (stream each block through a fixed staging
-      // window, accumulate dW/db across blocks, ONE SGD update per epoch) and must
-      // reach the SAME weights as the whole-batch trainer on the same data. All
-      // device buffers are allocated before the VMM buffer (pool-after-VMM faults).
       #[test]
       fn tiled_full_batch_runs_and_matches_whole() {
             use crate::kernels;
             use crate::memory::GpuBuffer;
             hip::set_device(0).expect("dev");
-            let (n, d, o) = (60000usize, 16usize, 4usize); // 7.68 MB → 4 pages
+            let (n, d, o) = (60000usize, 16usize, 4usize);
             let epochs = 20;
             let lr = 0.05;
             let mut xh = vec![0f64; n * d];
@@ -573,7 +486,6 @@ mod tests {
                   hip::device_synchronize().expect("sync");
                   h
             };
-            // ---- all device buffers BEFORE any VMM buffer ----
             let x_dev = GpuBuffer::alloc(xh.len()).expect("x");
             x_dev.load(&xh).expect("x load");
             let y_dev = GpuBuffer::alloc(yh.len()).expect("y");
@@ -600,11 +512,9 @@ mod tests {
             let dw_partials = make(kernels::gpu_splitk_dw_partials_elems(n, d, o));
             let rows_per_block = 4096usize;
             let window = make(rows_per_block * d);
-            // warm hipBLAS workspace before the VMM buffer exists
             kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, 1, o, d, &yhat).expect("enq");
             hip::device_synchronize().expect("warmup");
 
-            // ---- reference: whole-batch full-batch GD ----
             for _ in 0..epochs {
                   kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, n, o, d, &yhat).expect("enq");
                   kernels::gpu_sub_inplace(&y_dev, n * o, &yhat).expect("enq");
@@ -614,9 +524,8 @@ mod tests {
             }
             let w_ref_h = dl(&w_ref, d * o);
 
-            // ---- tiled: X in a forced-spill Tiered buffer, streamed row-blocks ----
             let bytes = n * d * 8;
-            let mut t = Tiered::alloc_capped(bytes, 1, 1, Path::new("/tmp/tiled_train.spill")); // 1 VRAM,1 RAM,2 disk
+            let mut t = Tiered::alloc_capped(bytes, 1, 1, Path::new("/tmp/tiled_train.spill"));
             let xbytes = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, bytes) };
             t.fill(xbytes);
             t.sync().expect("fill");
@@ -655,11 +564,8 @@ mod tests {
             let spill = Path::new("/tmp/tiered_3tier.spill");
             let pages = 6usize;
             let bytes = pages * P;
-            // Allocate + prove the window BEFORE any VMM buffer exists, to bisect
-            // whether VMM setup corrupts the stream-ordered pool.
             let window_buf = crate::memory::GpuBuffer::alloc_bytes(bytes).expect("window");
             let window = window_buf.ptr;
-            // Force 2 pages per tier so the sweep exercises VRAM, RAM, and disk.
             let mut t = Tiered::alloc_capped(bytes, 2, 2, spill);
             assert_eq!(t.pages(), pages);
             assert!(!t.is_contiguous_vram(), "capped buffer must span >1 tier");
@@ -671,12 +577,9 @@ mod tests {
             }
             t.fill(&src);
             t.sync().expect("sync");
-            // Stage every page into a contiguous device window, read it back, verify
-            // each page survived a round trip through its home tier.
             t.stage_into(0, pages, window);
             hip::device_synchronize().expect("sync");
             let mut back = vec![0u8; bytes];
-            // SAFETY: window covers `bytes`; back owns `bytes`.
             unsafe {
                   crate::memory::xfer(
                         back.as_mut_ptr() as *mut c_void,
@@ -699,7 +602,7 @@ mod tests {
       fn vram_fits_roundtrips() {
             hip::set_device(0).expect("set device");
             let spill = Path::new("/tmp/tiered_fit.spill");
-            let bytes = 4 * P; // 4 pages, well within VRAM
+            let bytes = 4 * P;
             let mut t = Tiered::alloc(bytes, 0, 0, spill).expect("alloc");
             assert!(t.is_contiguous_vram(), "small buffer must be contiguous VRAM");
             assert_eq!(t.pages(), 4);
@@ -712,7 +615,6 @@ mod tests {
             t.fill(&src);
             t.sync().expect("sync");
             let mut back = vec![0u8; bytes];
-            // SAFETY: device_ptr covers `bytes`; back owns `bytes`.
             unsafe {
                   crate::memory::xfer(
                         back.as_mut_ptr() as *mut c_void,

@@ -1,7 +1,3 @@
-//! f64 streaming-inference ops: widen bf16 weights to f64 in VRAM, fused f64
-//! RMSNorm (gamma / no-gamma variants), GQA attention with a mixed causal/
-//! bidirectional prefix mask, and gated-GELU fusions. General and model-agnostic
-//! — a bf16 transformer's forward composes from these plus the GEMMs.
 
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
@@ -59,11 +55,6 @@ unsafe extern "C" {
 	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void);
 }
 
-/// NeoX partial rotary embedding, in-place on `buf` `(rows, head_dim)`. The
-/// first `rotary_dim` dims of each head rotate (rotate-half); the rest pass
-/// through. Row `r`'s position is `r / heads_per_tok`. `rotary_dim == head_dim`
-/// gives full rotary. `theta` is a caller-supplied 1-elem device buffer.
-// in-place: writes x (rotary embedding over leading dims)
 pub fn gpu_rope_partial(
 	theta: &GpuBuffer,
 	rows: usize,
@@ -86,8 +77,6 @@ pub fn gpu_rope_partial(
 	cl()
 }
 
-/// Widen `n` bf16 halves (raw little-endian u16 bytes in `raw`, length `2*n`
-/// bytes) into a caller-owned f64 buffer `out` of `n` elements. Exact pad.
 pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_widen_bf16_f64(raw.ptr_raw() as *const c_void, out.ptr_raw(), n as i64, std::ptr::null_mut());
@@ -95,10 +84,6 @@ pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), 
 	cl()
 }
 
-/// Fused RMSNorm with per-column `gamma`: `out[r,j] = x[r,j] / sqrt(mean_j(x^2)
-/// + eps) * gamma[j]`. `eps` is a caller-supplied 1-elem device buffer. Aliasing
-/// `out == x` is safe: every thread reads all its `x` columns into the
-/// sum-of-squares before the block barrier, and only then writes `out`.
 pub fn gpu_rmsnorm_f64(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -121,9 +106,6 @@ pub fn gpu_rmsnorm_f64(
 	cl()
 }
 
-/// Scale-less RMSNorm (no gamma factor): `out[r,j] = x[r,j] / sqrt(mean_j(x^2)
-/// + eps)`. `eps` is a caller-supplied 1-elem device buffer. Aliasing `out == x`
-/// is safe (same read-before-write ordering as `gpu_rmsnorm_f64`).
 pub fn gpu_rmsnorm_f64_nogamma(
 	x: &GpuBuffer,
 	eps: &GpuBuffer,
@@ -145,10 +127,6 @@ pub fn gpu_rmsnorm_f64_nogamma(
 	cl()
 }
 
-/// GQA attention into a caller-owned `out` `(t, nqh*hd)`. `q` is `(t, nqh*hd)`,
-/// `k`/`v` are `(t, nkv*hd)`, all f64 row-major. kq_scale = 1.0. Prompt rows
-/// (`p < prefix`) are causal; canvas rows are bidirectional. `out` must be
-/// distinct from `q`/`k`/`v` — each block reads the whole q/k/v sequence.
 pub fn gpu_gqa_attn(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -177,9 +155,6 @@ pub fn gpu_gqa_attn(
 	cl()
 }
 
-/// Elementwise `out = gelu(a) * b` (tanh-approx GELU), `n` elements, into a
-/// caller-owned buffer. Aliasing `out == a` or `out == b` is safe — thread `i`
-/// reads `a[i]`/`b[i]` before writing `out[i]`.
 pub fn gpu_gelu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_mul(a.ptr_raw() as *const c_void, b.ptr_raw() as *const c_void, out.ptr_raw(), n as i64, std::ptr::null_mut());
@@ -187,9 +162,6 @@ pub fn gpu_gelu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> 
 	cl()
 }
 
-/// Fused gate|up split into a caller-owned `out` `(rows, half)`: `input` is
-/// `(rows, 2*half)` = `[gate | up]` per row; `out = gelu(gate) * up`. `out` must
-/// be distinct from `input` (different shape).
 pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_glu_gelu(input.ptr_raw() as *const c_void, out.ptr_raw(), rows as i32, half as i32, std::ptr::null_mut());
@@ -197,9 +169,6 @@ pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize, out: &GpuBuffer
 	cl()
 }
 
-/// Custom f64 GEMM-BT (no hipBLAS): `out(m,n) = a(m,k) . b(n,k)^T`, all
-/// row-major, into a caller-owned `out` (no alloc). `out` must be distinct
-/// from `a`/`b`.
 pub fn gpu_gemm_bt_f64(a: &GpuBuffer, b: &GpuBuffer, m: usize, n: usize, k: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gemm_bt_f64(
@@ -215,9 +184,6 @@ pub fn gpu_gemm_bt_f64(a: &GpuBuffer, b: &GpuBuffer, m: usize, n: usize, k: usiz
 	cl()
 }
 
-/// In-place scale `x *= scalar` (no alloc, no copy). `scalar` is a caller-
-/// supplied 1-elem device buffer.
-// in-place: writes x (x *= scalar)
 pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_scale_f64(x.ptr_raw(), scalar.ptr_raw() as *const c_void, n as i64, std::ptr::null_mut());

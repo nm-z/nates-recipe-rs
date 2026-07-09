@@ -1,5 +1,3 @@
-// Device-health probe (SUITE SPEC v3 R5): alloc 64MB, one kernel, readback,
-// compare, device-sync error check. Exit 0 = healthy; any panic/mismatch = poisoned.
 use gpu_core::memory::GpuBuffer;
 
 fn main() {

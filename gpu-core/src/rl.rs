@@ -52,9 +52,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Discounted returns for a single trajectory (reverse scan on one thread).
-/// rewards: [t_len], gamma: 1-elem device buffer (discount factor).
-/// Writes G[t_len] where G_t = r_t + gamma * G_{t+1} into `returns`.
 pub fn gpu_discounted_returns(
 	rewards: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -74,9 +71,6 @@ pub fn gpu_discounted_returns(
 	Ok(())
 }
 
-/// Generalized Advantage Estimation (reverse scan on one thread).
-/// rewards: [t_len], values: [t_len], gamma/lam: 1-elem device buffers.
-/// Writes advantages[t_len].
 pub fn gpu_gae(
 	rewards: &GpuBuffer,
 	values: &GpuBuffer,
@@ -100,8 +94,6 @@ pub fn gpu_gae(
 	Ok(())
 }
 
-/// TD targets: targets[i] = r[i] + gamma * V_next[i] * (1 - done[i]).
-/// done_mask: f64 buffer with 0.0 (not done) or 1.0 (done). gamma: 1-elem device buffer.
 pub fn gpu_td_targets(
 	rewards: &GpuBuffer,
 	values_next: &GpuBuffer,
@@ -125,9 +117,6 @@ pub fn gpu_td_targets(
 	Ok(())
 }
 
-/// Categorical log-prob: logp[i] = log_softmax(logits[i])[actions[i]].
-/// logits: [n * n_actions] f64.
-/// actions_i32: [n] i32 buffer (upload_i32).
 pub fn gpu_categorical_logprob(
 	logits: &GpuBuffer,
 	actions_i32: &GpuBuffer,
@@ -149,8 +138,6 @@ pub fn gpu_categorical_logprob(
 	Ok(())
 }
 
-/// Gaussian log-prob: logp[i] = sum_d [ -0.5*((a-mu)/sigma)^2 - log_std - 0.5*log(2pi) ].
-/// mu, log_std, actions: [n * dim] f64.
 pub fn gpu_gaussian_logprob(
 	mu: &GpuBuffer,
 	log_std: &GpuBuffer,

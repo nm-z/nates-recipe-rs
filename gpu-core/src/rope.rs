@@ -3,9 +3,6 @@ use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// ── FFI: ropex.hip ───────────────────────────────────────────────────────────
-// C: launch_ropex_qk(q, k, pos, qo, ko, n_rows, d, theta, stream)
-//    const double*, const double*, const double*, double*, double*, int, int, const double*, hipStream_t
 unsafe extern "C" {
 	fn launch_ropex_qk(
 		q: *const c_void,
@@ -31,16 +28,8 @@ unsafe extern "C" {
 	);
 }
 
-/// Default RoPE base frequency (the value from the RoPE paper).
 pub const ROPE_THETA: f64 = 10000.0;
 
-/// Multi-head rotary position embedding applied IN-PLACE to Q and K, each
-/// `(m, d)` row-major with `d = heads*hd`. Rotates per head by the token's
-/// sequence position (`row % seq`). `sgn`: 1-elem f64 buffer, `+1.0` forward
-/// (Q_rot = R(angle)·Q), `-1.0` backward (un-rotate a gradient — a rotation's
-/// inverse is itself negated). `theta`: 1-elem f64 base-frequency buffer.
-/// q,k are mutated in place (serve as both input and output).
-// in-place: writes q+k (rotary over heads)
 pub fn gpu_rope_qk_heads_inplace(
 	sgn: &GpuBuffer,
 	theta: &GpuBuffer,
@@ -68,11 +57,6 @@ pub fn gpu_rope_qk_heads_inplace(
 	Ok(())
 }
 
-// ── gpu_rope_qk ──────────────────────────────────────────────────────────────
-// Q, K: f64 (n_rows, dim) row-major. positions: f64 (n_rows,), cast to int in-kernel.
-// NeoX half-split rotary: pair (i, i+dim/2) rotated by angle = pos / theta^(2i/dim).
-// Same rotation applied to both Q and K. theta: 1-elem f64 base-frequency buffer.
-// qo, ko: caller-provided f64[n_rows * dim] rotated outputs.
 pub fn gpu_rope_qk(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -104,14 +88,10 @@ pub fn gpu_rope_qk(
 mod tests {
 	use super::*;
 
-	// The multi-head RoPE backward (sgn=-1) must be the exact inverse rotation of
-	// the forward (sgn=+1) — i.e. for L = Σ g·rope(x,+1), dL/dx = rope(g,-1).
-	// This is precisely the chain-rule step attn_backward relies on (un-rotating
-	// the Q,K gradients), checked against a finite difference of the forward.
 	#[test]
 	fn rope_heads_backward_is_inverse_rotation() {
 		crate::hip::set_device(0).expect("set_device");
-		let (m, d, heads, seq) = (6usize, 8usize, 2usize, 3usize); // hd=4, half=2
+		let (m, d, heads, seq) = (6usize, 8usize, 2usize, 3usize);
 		let xq: Vec<f64> = (0..m * d).map(|i| ((i * 7 % 13) as f64 - 6.0) * 0.1).collect();
 		let xk: Vec<f64> = (0..m * d).map(|i| ((i * 5 % 11) as f64 - 5.0) * 0.1).collect();
 		let g: Vec<f64> = (0..m * d).map(|i| ((i * 3 % 17) as f64 - 8.0) * 0.1).collect();
@@ -122,7 +102,6 @@ mod tests {
 		sgn_bwd.load(&[-1.0f64]).expect("sgn_bwd load");
 		let sgn_fwd = GpuBuffer::alloc(1).expect("sgn_fwd");
 		sgn_fwd.load(&[1.0f64]).expect("sgn_fwd load");
-		// analytic: dL/dq = R(-angle)·g = rope(g, -1) on the q slot
 		let gq = GpuBuffer::alloc(g.len()).expect("g");
 		gq.load(&g).expect("g load");
 		let gk = GpuBuffer::alloc(m * d).expect("gk");

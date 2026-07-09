@@ -98,19 +98,13 @@ unsafe extern "C" {
 	);
 }
 
-// Compact CSR adjacency: `row_ptr` (i32[n+1]) gives each point's [start,end) span in
-// `indices` (i32[nnz]), the flattened neighbor j-indices (self included). Memory is
-// O(nnz), never O(n²) — a dense mask at n=100k would be 10 GB; this is the actual
-// neighbor count.
 pub struct NeighborCsr {
 	pub row_ptr: GpuBuffer,
 	pub indices: GpuBuffer,
 	pub nnz: usize,
 }
 
-// ── Fixed-radius neighbor CSR: count → scan → fill schedulable ops ───────────
 
-// Pass 1: per-point neighbor counts (one thread per point — no n×n buffer).
 pub fn fixed_radius_count(
 	points: &GpuBuffer,
 	eps: &GpuBuffer,
@@ -132,8 +126,6 @@ pub fn fixed_radius_count(
 	Ok(())
 }
 
-// Exclusive prefix sum of the length-n count vector → CSR row offsets. Writes
-// row_ptr_out[0..n] and row_ptr_out[n] = nnz.
 pub fn exclusive_scan_i32(
 	count_in: &GpuBuffer,
 	n: usize,
@@ -151,7 +143,6 @@ pub fn exclusive_scan_i32(
 	Ok(())
 }
 
-// Pass 2: fill the compact adjacency (one thread per point owns its row).
 pub fn fixed_radius_fill_csr(
 	points: &GpuBuffer,
 	row_ptr: &GpuBuffer,
@@ -175,9 +166,6 @@ pub fn fixed_radius_fill_csr(
 	Ok(())
 }
 
-// content_sized CSR (nnz unknown at plan time): composes count → scan → row_ptr[n]
-// readback to size indices → fill; owns the eps upload and the nnz download.
-// not-an-op: driver — count/scan/read/fill composite with a mid-flow nnz readback
 pub fn gpu_fixed_radius_neighbors(
 	points: &GpuBuffer,
 	n: usize,
@@ -192,7 +180,6 @@ pub fn gpu_fixed_radius_neighbors(
 	let row_ptr_buf = GpuBuffer::alloc_bytes((n + 1) * std::mem::size_of::<i32>())?;
 	exclusive_scan_i32(&count, n, &row_ptr_buf)?;
 
-	// nnz = row_ptr[n], read back as a plan-time size query to size `indices`.
 	let mut row_ptr_h = vec![0i32; n + 1];
 	row_ptr_buf.download_i32(&mut row_ptr_h)?;
 	let nnz = row_ptr_h[n] as usize;
@@ -203,7 +190,6 @@ pub fn gpu_fixed_radius_neighbors(
 	Ok(NeighborCsr { row_ptr: row_ptr_buf, indices, nnz })
 }
 
-// ── Union-Find connected components: per-step ops + convergence driver ───────
 
 pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -242,7 +228,6 @@ pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipErro
 	Ok(())
 }
 
-// not-an-op: driver — hook→compress convergence loop branching on the `changed` readback
 pub fn gpu_union_find_cc(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -272,7 +257,6 @@ pub struct BoruvkaResult {
 	pub total_weight: f64,
 }
 
-// ── Borůvka MST: per-step ops + round/dedup/inner-UF driver ──────────────────
 
 pub fn boruvka_init(
 	n_nodes: usize,
@@ -358,7 +342,6 @@ pub fn boruvka_mark(
 	Ok(())
 }
 
-// Device MST total-weight reduction over marked edges → 1-elem total_out.
 pub fn masked_weight_sum(
 	edge_w: &GpuBuffer,
 	in_mst: &GpuBuffer,
@@ -378,9 +361,6 @@ pub fn masked_weight_sum(
 	Ok(())
 }
 
-// round loop with host edge-endpoint download, HashSet dedup of selected edges,
-// selected-list upload, inner union-find convergence, and final weight download.
-// not-an-op: driver — Borůvka round/dedup/inner-UF orchestration over the step ops
 pub fn gpu_boruvka_mst(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -395,8 +375,6 @@ pub fn gpu_boruvka_mst(
 	let best_w = GpuBuffer::alloc(n_nodes)?;
 	let changed = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
 
-	// Host copies of the edge endpoints: needed to materialize the selected-edge
-	// list that drives the inter-round union-find.
 	let mut src_h = vec![0i32; n_edges];
 	let mut dst_h = vec![0i32; n_edges];
 	edge_src.download_i32(&mut src_h)?;
@@ -407,9 +385,6 @@ pub fn gpu_boruvka_mst(
 	let mut best_edge_h = vec![0i32; n_nodes];
 	let mut flag = [0i32; 1];
 	loop {
-		// Per-round reset then a two-pass race-free min: pass 1 atomicMin's the
-		// monotonic weight encoding per component, pass 2 atomicMin's the edge
-		// index among edges attaining that min (deterministic tie-break).
 		boruvka_init(n_nodes, &best_edge, &best_w)?;
 		boruvka_min_w(edge_src, edge_dst, edge_w, &parent, n_edges, &best_w)?;
 		boruvka_min_e(edge_src, edge_dst, edge_w, &parent, &best_w, n_edges, &best_edge)?;
@@ -417,8 +392,6 @@ pub fn gpu_boruvka_mst(
 
 		best_edge.download_i32(&mut best_edge_h)?;
 
-		// Dedup selected edges: a single cheapest edge can be picked by both of
-		// its endpoint components.
 		let mut seen: HashSet<i32> = HashSet::new();
 		let mut sel_src: Vec<i32> = Vec::new();
 		let mut sel_dst: Vec<i32> = Vec::new();
@@ -429,14 +402,13 @@ pub fn gpu_boruvka_mst(
 			}
 		}
 		if sel_src.is_empty() {
-			break; // no outgoing edges → all components final
+			break;
 		}
 
 		let sel_src_buf = GpuBuffer::upload_i32(&sel_src)?;
 		let sel_dst_buf = GpuBuffer::upload_i32(&sel_dst)?;
 		let n_sel = sel_src.len();
 
-		// Merge the selected components via union-find until it stabilizes.
 		loop {
 			changed.memset_zero(std::mem::size_of::<i32>())?;
 			uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
@@ -448,7 +420,6 @@ pub fn gpu_boruvka_mst(
 		}
 	}
 
-	// Device MST total-weight reduction over the marked edges; driver reads it back.
 	let total_buf = GpuBuffer::alloc(1)?;
 	masked_weight_sum(edge_w, &in_mst, n_edges, &total_buf)?;
 	let mut tw = [0.0f64; 1];

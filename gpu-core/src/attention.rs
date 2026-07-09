@@ -9,7 +9,6 @@ fn check_launch() -> Result<(), HipError> {
 	check(err)
 }
 
-// not-an-op: plan-time helper — im2col/col2im output spatial dims (host arithmetic)
 pub fn conv_out_hw(
 	h: usize,
 	w: usize,
@@ -27,32 +26,6 @@ pub fn conv_out_hw(
 	(out_h, out_w)
 }
 
-// FFI declarations — slot-for-slot with launchers in attention.hip
-//
-// C: launch_scaled_dot_product_attention(q, k, v, out, n_rows, seq, dim, causal, stream)
-//    const float*, const float*, const float*, float*, int, int, int, int, hipStream_t
-// C: launch_causal_softmax_rows(x, rows, cols, stream)
-//    float*, int, int, hipStream_t
-// C: launch_mha_split(x, out, seq, n_heads, head_dim, stream)
-//    const float*, float*, int, int, int, hipStream_t
-// C: launch_mha_merge(x, out, seq, n_heads, head_dim, stream)
-//    const float*, float*, int, int, int, hipStream_t
-// C: launch_rope(x, out, seq, dim, base, stream)
-//    const float*, float*, int, int, const float*, hipStream_t
-// C: launch_positional_encoding(out, seq, dim, stream)
-//    float*, int, int, hipStream_t
-// C: launch_rmsnorm(x, gamma, out, rows, cols, eps, stream)
-//    const float*, const float*, float*, int, int, const float*, hipStream_t
-// C: launch_rmsnorm_backward(grad_out, x, gamma, grad_x, grad_gamma, rows, cols, eps, stream)
-//    const float*, const float*, const float*, float*, float*, int, int, const float*, hipStream_t
-// C: launch_im2col_2d_ext(x, patches, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w, out_h, out_w, stream)
-//    const float*, float*, int, int, int, int, int, int, int, int, int, int, int, int, int, int, hipStream_t
-// C: launch_col2im_2d_ext(patches, x, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w, out_h, out_w, stream)
-//    const float*, float*, int, int, int, int, int, int, int, int, int, int, int, int, int, int, hipStream_t
-// C: launch_embedding_backward(grad_out, indices, grad_table, n, cols, vocab, stream)
-//    const float*, const int*, float*, int, int, int, hipStream_t
-// C: launch_bn_update_running(run_mean, run_var, save_mean, save_var, momentum, c, stream)
-//    float*, float*, const float*, const float*, const float*, int, hipStream_t
 
 unsafe extern "C" {
 	fn launch_scaled_dot_product_attention(
@@ -170,9 +143,6 @@ unsafe extern "C" {
 	);
 }
 
-// ── gpu_scaled_dot_product_attention ─────────────────────────────────────
-// Q, K, V: f32 buffers shaped (n_rows, seq, dim). out: same shape.
-// causal=true: query i only attends to keys j <= i.
 pub fn gpu_scaled_dot_product_attention(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -199,10 +169,6 @@ pub fn gpu_scaled_dot_product_attention(
 	check_launch()
 }
 
-// ── gpu_causal_softmax_rows ───────────────────────────────────────────────
-// In-place: upper triangle (j > i) masked to 0 before normalization.
-// x: f32 buffer shaped (rows, cols), modified in place.
-// in-place: writes scores (rows softmaxed under causal mask)
 pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_causal_softmax_rows(x.ptr_raw(), rows as i32, cols as i32, std::ptr::null_mut());
@@ -210,8 +176,6 @@ pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Resul
 	check_launch()
 }
 
-// ── gpu_mha_split ─────────────────────────────────────────────────────────
-// x: (seq, n_heads*head_dim) → out: (n_heads, seq, head_dim). f32.
 pub fn gpu_mha_split(
 	x: &GpuBuffer,
 	seq: usize,
@@ -232,8 +196,6 @@ pub fn gpu_mha_split(
 	check_launch()
 }
 
-// ── gpu_mha_merge ─────────────────────────────────────────────────────────
-// x: (n_heads, seq, head_dim) → out: (seq, n_heads*head_dim). f32.
 pub fn gpu_mha_merge(
 	x: &GpuBuffer,
 	seq: usize,
@@ -254,9 +216,6 @@ pub fn gpu_mha_merge(
 	check_launch()
 }
 
-// ── gpu_rope ─────────────────────────────────────────────────────────────
-// x: f32 (seq, dim). Rotary positional embedding with given base frequency.
-// base: typically 10000.0. Uses sinf/cosf device intrinsics — no external dep.
 pub fn gpu_rope(
 	x: &GpuBuffer,
 	seq: usize,
@@ -277,8 +236,6 @@ pub fn gpu_rope(
 	check_launch()
 }
 
-// ── gpu_positional_encoding ───────────────────────────────────────────────
-// Returns f32 sinusoidal table of shape (seq, dim).
 pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_positional_encoding(out.ptr_raw(), seq as i32, dim as i32, std::ptr::null_mut());
@@ -286,8 +243,6 @@ pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Resul
 	check_launch()
 }
 
-// ── gpu_rmsnorm ──────────────────────────────────────────────────────────
-// x: f32 (rows, cols). gamma: f32 (cols,). eps: small positive stabilizer.
 pub fn gpu_rmsnorm(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -310,9 +265,6 @@ pub fn gpu_rmsnorm(
 	check_launch()
 }
 
-// ── gpu_rmsnorm_backward ─────────────────────────────────────────────────
-// grad_x (rows*cols) and grad_gamma (cols) are caller-provided outputs.
-// grad_gamma must be pre-zeroed by the caller — the kernel accumulates via atomicAdd.
 pub fn gpu_rmsnorm_backward(
 	grad_out: &GpuBuffer,
 	x: &GpuBuffer,
@@ -339,11 +291,6 @@ pub fn gpu_rmsnorm_backward(
 	check_launch()
 }
 
-// ── gpu_im2col_2d_ext ─────────────────────────────────────────────────────
-// x: f32 NCHW (n, c, h, w).
-// out_h = (h + 2*pad_h - dil_h*(kh-1) - 1) / sh + 1
-// out_w = (w + 2*pad_w - dil_w*(kw-1) - 1) / sw + 1
-// Output: f32 (n * out_h * out_w, c * kh * kw). Zero-pads out-of-bounds.
 pub fn gpu_im2col_2d_ext(
 	x: &GpuBuffer,
 	n: usize,
@@ -385,9 +332,6 @@ pub fn gpu_im2col_2d_ext(
 	check_launch()
 }
 
-// ── gpu_col2im_2d_ext ─────────────────────────────────────────────────────
-// Inverse of gpu_im2col_2d_ext. Accumulates patch gradients into image grad.
-// out: zeroed f32 NCHW (n, c, h, w). Formula same as im2col_2d_ext.
 pub fn gpu_col2im_2d_ext(
 	patches: &GpuBuffer,
 	n: usize,
@@ -429,11 +373,6 @@ pub fn gpu_col2im_2d_ext(
 	check_launch()
 }
 
-// ── gpu_embedding_backward ────────────────────────────────────────────────
-// grad_out: f32 (n, cols). indices: i32 (n,) token ids in [0, vocab).
-// Returns grad_table f32 (vocab, cols) — zeroed, then accumulated via atomicAdd.
-// Atomic path: every (row, col) writes to grad_table[indices[row], col].
-// Concurrent same-token rows accumulate correctly; no dedup required.
 pub fn gpu_embedding_backward(
 	grad_out: &GpuBuffer,
 	indices: &GpuBuffer,
@@ -456,9 +395,6 @@ pub fn gpu_embedding_backward(
 	check_launch()
 }
 
-// ── gpu_bn_update_running ─────────────────────────────────────────────────
-// In-place update: run = (1-momentum)*run + momentum*save.
-// run_mean, run_var: mutable f32 (c,). save_mean, save_var: f32 (c,) from forward.
 pub fn gpu_bn_update_running(
 	save_mean: &GpuBuffer,
 	save_var: &GpuBuffer,

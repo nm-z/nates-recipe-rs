@@ -1,34 +1,13 @@
-//! Kernel-side HW truth: the KFD SMI thrash watchdog. Subscribes to the
-//! driver's per-process event stream (/dev/kfd, kfd_ioctl.h:528-547) and turns
-//! silent driver pathology into loud lines: queue eviction of OUR compute
-//! queues aborts (fail clean beats limping through a thrash storm), migrations
-//! and throttles print. The HSA memory-fault autopsy lives in hip.rs; this
-//! file is everything the kernel can tell us that HIP cannot.
 
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// ── Saturation crash ───────────────────────────────────────────────────────
-// The saturation invariant, executable: while armed (the fit's compute loop),
-// the GPU must hit 100% busy at least once in every 5-second window; a window
-// that never pins aborts the process. Momentary dips (the one scalar download
-// at an epoch boundary) are not serialization; five straight seconds without
-// a single pinned sample is.
 
 static SAT_ARMED: AtomicBool = AtomicBool::new(false);
 const SAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 const SAT_ENFORCE: bool = false;
 
-// ── Fast death ──────────────────────────────────────────────────────────────
-// A GPU-scale process holds tens of GB; SIGABRT's default core dump pipes the
-// whole image through systemd-coredump, which drains it even past its size
-// cap — the terminal sits minutes in an uninterruptible dump where ^C is
-// undeliverable. The autopsy + ledger on stderr are the real forensics; the
-// giant core is not. RLIMIT_CORE is NOT enforced for piped core_patterns
-// (core(5)), so the working switch is PR_SET_DUMPABLE=0: do_coredump refuses
-// non-dumpable processes outright and the re-raise dies instantly, dump-free.
-// RECIPE_CORE=1 skips installation for a session where a core is wanted.
 
 extern "C" fn fast_death(sig: libc::c_int) {
 	unsafe {
@@ -60,12 +39,6 @@ fn busy_path() -> std::path::PathBuf {
 	panic!("saturation watchdog: no gpu_busy_percent under /sys/class/drm");
 }
 
-/// Arm for the duration of a compute phase. First call spawns the sampler.
-/// DORMANT until post-AOT (user directive 2026-07-07): the pre-AOT OOC loop
-/// streams windows without compute/transfer overlap, so a disk-bound sweep
-/// legitimately idles the GPU past the window — the abort would kill valid
-/// runs. The AOT schedule restores the overlap that makes the law enforceable;
-/// re-arm by deleting the early return.
 pub fn arm_saturation_crash() {
 	if !SAT_ENFORCE {
 		return;
@@ -82,7 +55,6 @@ pub fn arm_saturation_crash() {
 				let armed = SAT_ARMED.load(Ordering::SeqCst);
 				if armed {
 					if !was_armed {
-						// Fresh compute phase gets a fresh window.
 						last_pinned = std::time::Instant::now();
 					}
 					let busy: u32 = std::fs::read_to_string(&path)
@@ -112,7 +84,6 @@ pub fn disarm_saturation_crash() {
 	SAT_ARMED.store(false, Ordering::SeqCst);
 }
 
-// _IOWR('K', 0x1F, struct kfd_ioctl_smi_events_args{u32,u32}) — kfd_ioctl.h:1735.
 const AMDKFD_IOC_SMI_EVENTS: libc::c_ulong = 0xC008_4B1F;
 
 #[repr(C)]
@@ -121,7 +92,6 @@ struct SmiArgs {
 	anon_fd: u32,
 }
 
-/// First non-zero gpu_id under the KFD topology (0 = CPU node).
 fn gpu_id() -> Option<u32> {
 	for e in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes").ok()? {
 		let p = e.ok()?.path().join("gpu_id");
@@ -134,11 +104,6 @@ fn gpu_id() -> Option<u32> {
 	None
 }
 
-/// Crash-on-thrash: QUEUE_EVICTION(9) / UNMAP_FROM_GPU(11) of this process
-/// means the driver suspended our queues to shuffle memory out from under us —
-/// print the raw event and abort. VMFAULT/THROTTLE/MIGRATE/PAGE_FAULT print
-/// only. Failures to arm are reported once and non-fatal (the watchdog is
-/// diagnosis, not a dependency).
 pub fn spawn_thrash_watchdog() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	ONCE.call_once(|| {
@@ -154,15 +119,11 @@ pub fn spawn_thrash_watchdog() {
 			}
 		};
 		let mut args = SmiArgs { gpuid: gpu, anon_fd: 0 };
-		// SAFETY: ioctl with an owned struct, layout per kfd_ioctl.h:575.
 		if unsafe { libc::ioctl(kfd.as_raw_fd(), AMDKFD_IOC_SMI_EVENTS, &mut args) } != 0 {
 			eprintln!("thrash watchdog: SMI ioctl: {}", std::io::Error::last_os_error());
 			return;
 		}
-		// SAFETY: the ioctl hands us ownership of anon_fd.
 		let mut smi = unsafe { std::fs::File::from_raw_fd(args.anon_fd as i32) };
-		// Subscribe mask: bit i-1 = event i (VMFAULT, THROTTLE, MIGRATE_START/END,
-		// PAGE_FAULT_START/END, QUEUE_EVICTION, QUEUE_RESTORE, UNMAP_FROM_GPU).
 		let mask: u64 = [1u32, 2, 5, 6, 7, 8, 9, 10, 11]
 			.iter()
 			.map(|i| 1u64 << (i - 1))
@@ -179,7 +140,6 @@ pub fn spawn_thrash_watchdog() {
 					Ok(n) => n,
 				};
 				for ev in String::from_utf8_lossy(&buf[..n]).split_terminator('\n') {
-					// Line starts with the event id in hex (kfd_smi_events.c).
 					let id = ev
 						.split_whitespace()
 						.next()

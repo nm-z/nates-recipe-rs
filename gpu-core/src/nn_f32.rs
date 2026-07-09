@@ -2,8 +2,6 @@ use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-// ── hipBLAS f32 ────────────────────────────────────────────────────────────
-// Same column-major conventions as kernels.rs dgemm section.
 const HIPBLAS_OP_N: u32 = 111;
 
 unsafe extern "C" {
@@ -24,7 +22,6 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	// f32 kernels
 	fn launch_relu_f32(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_relu_backward_f32(
 		grad: *const c_void,
@@ -153,7 +150,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	// f16 kernels — buffers are alloc_bytes(n*2), cast as raw u16 bit patterns
 	fn launch_relu_f16(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_gelu_f16(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_add_f16(
@@ -191,9 +187,6 @@ fn safe_i32(v: usize) -> i32 {
 	v as i32
 }
 
-// ── gpu_linear_f32 ─────────────────────────────────────────────────────────
-// out = X @ W + bias. X is (m,k) f32, W is (k,n) f32, bias is (n,) f32.
-// Prefills out with bias broadcast, then sgemm with beta=1.0 adds the matmul.
 pub fn gpu_linear_f32(
 	x: &GpuBuffer,
 	w: &GpuBuffer,
@@ -236,7 +229,6 @@ pub fn gpu_linear_f32(
 	check(status)
 }
 
-// ── gpu_relu_f32 / backward ────────────────────────────────────────────────
 pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_relu_f32(
@@ -267,8 +259,6 @@ pub fn gpu_relu_backward_f32(
 	check_launch()
 }
 
-// ── gpu_gelu_f32 / backward ────────────────────────────────────────────────
-// backward takes pre-activation x (not the output), matching the f64 convention
 pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_f32(
@@ -299,7 +289,6 @@ pub fn gpu_gelu_backward_f32(
 	check_launch()
 }
 
-// ── gpu_layernorm_f32 / backward ───────────────────────────────────────────
 pub fn gpu_layernorm_f32(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -352,7 +341,6 @@ pub fn gpu_layernorm_backward_f32(
 	check_launch()
 }
 
-// ── gpu_bias_add_f32 ───────────────────────────────────────────────────────
 pub fn gpu_bias_add_f32(
 	x: &GpuBuffer,
 	bias: &GpuBuffer,
@@ -373,8 +361,6 @@ pub fn gpu_bias_add_f32(
 	check_launch()
 }
 
-// ── gpu_avg_pool_2d_f32 / backward ────────────────────────────────────────
-// Input is NCHW layout. outH = (H-kH)/sH+1, outW = (W-kW)/sW+1.
 pub fn gpu_avg_pool_2d_f32(
 	input: &GpuBuffer,
 	n_batch: usize,
@@ -443,9 +429,6 @@ pub fn gpu_avg_pool_2d_backward_f32(
 	check_launch()
 }
 
-// ── gpu_max_pool_2d_f32 / backward ────────────────────────────────────────
-// Returns (pooled_values, argmax_indices) both as f32 GpuBuffers.
-// out_idx stores the flat intra-channel index (ih*W+iw) as f32.
 pub fn gpu_max_pool_2d_f32(
 	input: &GpuBuffer,
 	n_batch: usize,
@@ -510,9 +493,6 @@ pub fn gpu_max_pool_2d_backward_f32(
 	check_launch()
 }
 
-// ── gpu_lstm_cell_f32 ─────────────────────────────────────────────────────
-// gates: (n, 4*hs) f32, layout [forget|input|cell_cand|output] per sample.
-// c and h are updated in-place (n, hs).
 pub fn gpu_lstm_cell_f32(
 	gates: &GpuBuffer,
 	n: usize,
@@ -533,9 +513,6 @@ pub fn gpu_lstm_cell_f32(
 	check_launch()
 }
 
-// ── gpu_gru_cell_f32 ──────────────────────────────────────────────────────
-// gates: (n, 4*hs) f32, layout [z_pre|r_pre|n_x|n_h] per sample.
-// h: previous hidden (n, hs). Returns new hidden (n, hs).
 pub fn gpu_gru_cell_f32(
 	gates: &GpuBuffer,
 	h: &GpuBuffer,
@@ -556,9 +533,6 @@ pub fn gpu_gru_cell_f32(
 	check_launch()
 }
 
-// ── f16 kernels ───────────────────────────────────────────────────────────
-// Buffers hold raw __half bit patterns. Allocate with alloc_bytes(n * 2).
-// Upload via upload_u8 (reinterpret &[u16] as &[u8]) or via half::f16 helpers.
 
 pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -610,8 +584,6 @@ pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> R
 	check_launch()
 }
 
-// ── gpu_sgd_update_f32 ────────────────────────────────────────────────────
-// In-place: weights -= lr * grad. lr rides as a 1-elem f32 device buffer.
 pub fn gpu_sgd_update_f32(
 	grad: &GpuBuffer,
 	lr: &GpuBuffer,

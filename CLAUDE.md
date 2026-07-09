@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-> Deep manual: **`docs/MANUAL.md`** — 17 sections covering the data pipeline, training engine, GPU memory system, driver workarounds, gemma engine, kernel development, hardware reference, and side projects in full detail. Read the relevant section before working in any of those areas; this file is the condensed version.
-
 ## What This Is
 
 GPU-native neural-network training framework in Rust: builder API for models, data loading (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, evaluation. All compute runs on GPU through `gpu-core`; no CPU ML crates. 5-member workspace, strict one-way DAG:
@@ -144,7 +142,7 @@ recipe::eval(&model, &data);
 
 ## Conventions
 
-Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. **Zero comments** — no `//`, no `///`, no `//!`, no `/* */`, no section dividers, in `src/`, `recipe-infer/src/`, `ogdl/src/`. Enforced by `h03_no_comments` in `tests/hygiene.rs` (lexer-based: catches trailing and block comments too). Naming and structure carry the meaning; a constraint the code cannot express goes in the commit message or `docs/MANUAL.md`. The code is the spec.
+Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. **Zero comments** — no `//`, no `///`, no `//!`, no `/* */`, no section dividers, in `src/`, `recipe-infer/src/`, `ogdl/src/`. Enforced by `h03_no_comments` in `tests/hygiene.rs` (lexer-based: catches trailing and block comments too). Naming and structure carry the meaning; a constraint the code cannot express goes in the commit message. The code is the spec.
 
 ## Active State (2026-07)
 

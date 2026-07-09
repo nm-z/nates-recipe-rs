@@ -90,7 +90,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Momentum SGD: v = momentum*v - lr*g; w += v (in-place, updates both w and v).
 pub fn gpu_momentum_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -114,7 +113,6 @@ pub fn gpu_momentum_update(
 	Ok(())
 }
 
-/// RMSProp: cache = decay*cache + (1-decay)*g^2; w -= lr*g/(sqrt(cache)+eps) (in-place).
 pub fn gpu_rmsprop_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -140,7 +138,6 @@ pub fn gpu_rmsprop_update(
 	Ok(())
 }
 
-/// Adagrad: accum += g^2; w -= lr*g/(sqrt(accum)+eps) (in-place).
 pub fn gpu_adagrad_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -164,8 +161,6 @@ pub fn gpu_adagrad_update(
 	Ok(())
 }
 
-/// LAMB phase 1: Adam moments + per-element update into tmp_upd, accumulating ||w||^2
-/// and ||update||^2 on device (norm buffers zeroed here before the atomicAdd pass).
 pub fn gpu_lamb_phase1(
 	g: &GpuBuffer,
 	b1: &GpuBuffer,
@@ -205,8 +200,6 @@ pub fn gpu_lamb_phase1(
 	Ok(())
 }
 
-/// LAMB phase 2: w -= lr * (||w||/||update||) * tmp_upd (trust ratio 1.0 if a norm is 0).
-/// Norm buffers are the device-side squared norms produced by phase1 — no D2H roundtrip.
 pub fn gpu_lamb_phase2(
 	tmp_upd: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -230,7 +223,6 @@ pub fn gpu_lamb_phase2(
 	Ok(())
 }
 
-/// Lion: update = sign(b1*m + (1-b1)*g); w -= lr*(update + wd*w); m = b2*m + (1-b2)*g (in-place).
 pub fn gpu_lion_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -258,7 +250,6 @@ pub fn gpu_lion_update(
 	Ok(())
 }
 
-/// Nadam (Nesterov-accelerated Adam): uses next-step bias-corrected first moment.
 pub fn gpu_nadam_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -290,7 +281,6 @@ pub fn gpu_nadam_update(
 	Ok(())
 }
 
-/// In-place elementwise clamp: x[i] = clamp(x[i], lo, hi).
 pub fn gpu_clip_value(
 	lo: &GpuBuffer,
 	hi: &GpuBuffer,

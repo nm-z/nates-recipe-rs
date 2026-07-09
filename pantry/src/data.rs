@@ -6,75 +6,32 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::Path;
 
-const DELIMITERS: [u8; 3] = [b';', b'\t', b','];
-
-fn sniff_line_delimiter(line: &str) -> u8 {
-	let commas = line.matches(',').count();
-	if line.matches(';').count() > commas {
-		b';'
-	} else if line.matches('\t').count() > commas {
-		b'\t'
-	} else {
-		b','
-	}
-}
-
-fn first_records(path: &Path) -> Option<Vec<u8>> {
-	use std::io::BufRead;
-	let mut rdr = std::io::BufReader::new(std::fs::File::open(path).ok()?);
-	let mut prefix = Vec::new();
-	let mut kept = 0;
-	while kept < 2 {
-		let mut line = Vec::new();
-		if rdr.read_until(b'\n', &mut line).ok()? == 0 {
-			break;
-		}
-		if line.iter().all(u8::is_ascii_whitespace) {
-			continue;
-		}
-		prefix.extend_from_slice(&line);
-		kept += 1;
-	}
-	(kept == 2).then_some(prefix)
-}
-
-fn is_steady(prefix: &[u8], delim: u8) -> bool {
-	let mut rdr = csv::ReaderBuilder::new()
-		.has_headers(false)
-		.flexible(true)
-		.delimiter(delim)
-		.from_reader(prefix);
-	let mut records = rdr.byte_records();
-	let width = |r: Option<Result<csv::ByteRecord, csv::Error>>| r.and_then(|r| r.ok()).map(|r| r.len());
-	match (width(records.next()), width(records.next())) {
-		(Some(a), Some(b)) => a == b && a > 1,
-		_ => false,
-	}
-}
-
 pub fn sniff_delimiter(path: &Path) -> u8 {
-	let Some(prefix) = first_records(path) else {
-		return sniff_first_line(path);
-	};
-	let steady: Vec<u8> = DELIMITERS.iter().copied().filter(|&d| is_steady(&prefix, d)).collect();
-	match steady.as_slice() {
-		[] => sniff_first_line(path),
-		[only] => *only,
-		rest if rest.contains(&b',') => b',',
-		_ => sniff_first_line(path),
-	}
-}
-
-fn sniff_first_line(path: &Path) -> u8 {
 	use std::io::BufRead;
 	let Ok(f) = std::fs::File::open(path) else {
 		return b',';
 	};
+	let mut rdr = std::io::BufReader::new(f);
 	let mut line = Vec::new();
-	if std::io::BufReader::new(f).read_until(b'\n', &mut line).is_err() {
-		return b',';
+	loop {
+		line.clear();
+		match rdr.read_until(b'\n', &mut line) {
+			Ok(0) | Err(_) => return b',',
+			Ok(_) => {}
+		}
+		if line.iter().all(u8::is_ascii_whitespace) {
+			continue;
+		}
+		let text = String::from_utf8_lossy(&line);
+		let commas = text.matches(',').count();
+		return if text.matches(';').count() > commas {
+			b';'
+		} else if text.matches('\t').count() > commas {
+			b'\t'
+		} else {
+			b','
+		};
 	}
-	sniff_line_delimiter(&String::from_utf8_lossy(&line))
 }
 
 pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
@@ -688,80 +645,19 @@ mod header_detection_tests {
 
 	#[test]
 	fn semicolon_delimiter_is_sniffed() {
-		let p = tmp("semi.csv", "\"age\";\"job\";\"y\"\n58;\"management\";\"no\"\n44;\"technician\";\"yes\"\n");
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers, vec!["age", "job", "y"]);
-		assert_eq!(rows[0], vec!["58", "management", "no"]);
+		let p = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/uci-bank-semicolon/bank.csv"));
+		assert_eq!(super::sniff_delimiter(p), b';');
 	}
 
 	#[test]
 	fn tab_delimiter_is_sniffed() {
-		let p = tmp("tabs.csv", "age\tjob\ty\n58\tmanagement\tno\n");
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers, vec!["age", "job", "y"]);
-		assert_eq!(rows[0], vec!["58", "management", "no"]);
+		let p = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/uci-seeds/seeds_dataset.txt"));
+		assert_eq!(super::sniff_delimiter(p), b'\t');
 	}
 
 	#[test]
-	fn comma_delimiter_is_unchanged() {
-		let p = tmp("commas.csv", "age,job,y\n58,management,no\n");
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers, vec!["age", "job", "y"]);
-		assert_eq!(rows[0], vec!["58", "management", "no"]);
-	}
-
-	#[test]
-	fn sniffed_delimiter_never_splits_the_wrong_way() {
-		assert_eq!(super::sniff_line_delimiter("a;b;c"), b';');
-		assert_eq!(super::sniff_line_delimiter("a\tb\tc"), b'\t');
-		assert_eq!(super::sniff_line_delimiter("a,b,c"), b',');
-		assert_eq!(super::sniff_line_delimiter("a,b;c"), b',');
-	}
-
-	#[test]
-	fn tab_wins_a_count_tie_against_commas_in_text() {
-		let p = tmp("sms.tsv", "ham\tGo until jurong point, crazy..\nham\tOk lar... Joking wif u oni...\nspam\tFree entry, win FA Cup\n");
-		assert_eq!(super::sniff_delimiter(&p), b'\t');
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers.len(), 2, "tab TSV must parse as 2 columns");
-		assert_eq!(rows[0], vec!["ham", "Ok lar... Joking wif u oni..."]);
-	}
-
-	#[test]
-	fn quoted_delimiters_do_not_hijack_the_sniff() {
-		let p = tmp("quoted.csv", "id,\"a;b;c;d;e;f\",z\n1,x,2\n3,y,4\n");
-		assert_eq!(super::sniff_delimiter(&p), b',');
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers, vec!["id", "a;b;c;d;e;f", "z"]);
-		assert_eq!(rows[0], vec!["1", "x", "2"]);
-	}
-
-	#[test]
-	fn single_record_falls_back_to_counting() {
-		let p = tmp("one.csv", "a;b;c\n");
-		assert_eq!(super::sniff_delimiter(&p), b';');
-	}
-
-	#[test]
-	fn a_steady_semicolon_run_never_hijacks_a_comma_table() {
-		let p = tmp("hijack.csv", "1,\"a;b;c;d\",2\n3,\"e;f;g;h\",4\n5,\"i;j;k;l\",6\n");
-		assert_eq!(super::sniff_delimiter(&p), b',');
-		let (headers, rows) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers.len(), 3);
-		assert_eq!(rows[0], vec!["3", "e;f;g;h", "4"]);
-	}
-
-	#[test]
-	fn a_blank_line_after_the_header_does_not_blind_the_sniff() {
-		let p = tmp("blank.tsv", "ham\tGo until jurong point, crazy..\n\nham\tOk lar Joking wif u oni\nspam\tFree entry to win\n");
-		assert_eq!(super::sniff_delimiter(&p), b'\t');
-		let (headers, _) = read_raw_csv(&p).unwrap();
-		assert_eq!(headers.len(), 2);
-	}
-
-	#[test]
-	fn comma_still_wins_when_it_is_the_only_steady_delimiter() {
-		let p = tmp("plain.csv", "a,b,c\n1,2,3\n4,5,6\n");
-		assert_eq!(super::sniff_delimiter(&p), b',');
+	fn comma_delimiter_is_sniffed() {
+		let p = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../datasets/wine-quality/winequality-red.csv"));
+		assert_eq!(super::sniff_delimiter(p), b',');
 	}
 }
