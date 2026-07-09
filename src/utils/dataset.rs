@@ -384,7 +384,7 @@ impl DataInner {
 		}
 		assert!(train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
 		assert!(train.x.ncols() > 0, "dataset has 0 feature columns");
-		let k = train.n_targets.max(1);
+		let k = train.n_targets;
 		assert_eq!(
 			train.y.len(),
 			train.x.nrows() * k,

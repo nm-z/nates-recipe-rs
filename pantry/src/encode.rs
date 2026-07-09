@@ -854,7 +854,7 @@ pub fn shuffle_split(
 			y: Vec1::from(yd),
 			source: source.to_string(),
 			n_targets: k,
-			has_target: true,
+			has_target: k > 0,
 			text_cols: text_cols.to_vec(),
 			onehot_groups: onehot_groups.to_vec(),
 		}
@@ -934,25 +934,30 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 /// invented); features use `ImputeMean`. Afterwards the matrix holds no NaN, so
 /// nothing downstream handles NaN again.
 pub fn clean_dataset(d: &mut Dataset) {
-	let k = d.n_targets.max(1);
+	let k = d.n_targets;
 	let n = d.x.nrows();
-	if d.x.ncols() == 0 || (d.has_target && d.y.len() < n * k) {
+	if d.x.ncols() == 0 {
 		eprintln!("\x1b[1;31mno columns found, check delimiter\x1b[0m");
 		eprintln!(
-			"    {}  →  parsed {n} row(s) × {} column(s), {} target value(s)",
+			"    {}  →  parsed {n} row(s) × 0 column(s)",
+			crate::data::short_path(&d.source)
+		);
+		std::process::exit(1);
+	}
+	if d.y.len() < n * k {
+		eprintln!("\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m", d.y.len());
+		eprintln!(
+			"    {}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			crate::data::short_path(&d.source),
-			d.x.ncols(),
-			d.y.len()
+			n * k
 		);
 		std::process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
-	if d.has_target {
-		for j in 0..k {
-			let mut col: Vec<f64> = (0..n).map(|i| d.y[i * k + j]).collect();
-			let kj = nan_clean(&mut col, Nan::Drop, "target");
-			keep.retain(|i| kj.binary_search(i).is_ok());
-		}
+	for j in 0..k {
+		let mut col: Vec<f64> = (0..n).map(|i| d.y[i * k + j]).collect();
+		let kj = nan_clean(&mut col, Nan::Drop, "target");
+		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
 		eprintln!("\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target", n - keep.len());
@@ -1004,7 +1009,7 @@ pub fn prepare_arff_data(
 				y,
 				source: source_label.to_string(),
 				n_targets: k,
-				has_target: true,
+				has_target: k > 0,
 				text_cols: tc.clone(),
 				onehot_groups: oh.clone(),
 			},
@@ -1087,7 +1092,7 @@ pub fn prepare_table_data(
 			y: set.y,
 			source: source_label.to_string(),
 			n_targets: k,
-			has_target: true,
+			has_target: k > 0,
 			text_cols: tc.clone(),
 			onehot_groups: oh.clone(),
 		};
@@ -1111,7 +1116,7 @@ pub fn prepare_table_data(
 	let tc = text_col_indices(&feats);
 	let oh = onehot_group_indices(&feats);
 	if let Some(frac) = split_frac {
-		let (tr, te) = shuffle_split(&x, &set.y, k.max(1), frac, source_label, &tc, &oh);
+		let (tr, te) = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
 		return (tr, Some(te), flat_attrs);
 	}
 	(
@@ -1127,4 +1132,42 @@ pub fn prepare_table_data(
 		None,
 		flat_attrs,
 	)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod clean_dataset_tests {
+	use super::{Dataset, clean_dataset};
+	use ndarray::{Array1, Array2};
+
+	fn ds(n: usize, cols: usize, n_targets: usize, y: Vec<f64>) -> Dataset {
+		Dataset {
+			x: Array2::from_shape_fn((n, cols), |(i, j)| (i * cols + j) as f64),
+			y: Array1::from_vec(y),
+			source: "test".to_string(),
+			n_targets,
+			has_target: n_targets > 0,
+			text_cols: Vec::new(),
+			onehot_groups: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn no_target_dataset_survives_cleaning() {
+		let mut d = ds(4, 3, 0, Vec::new());
+		clean_dataset(&mut d);
+		assert_eq!(d.x.nrows(), 4);
+		assert_eq!(d.x.ncols(), 3);
+		assert!(d.y.is_empty());
+	}
+
+	#[test]
+	fn missing_target_rows_drop_and_features_impute() {
+		let mut d = ds(3, 2, 1, vec![1.0, f64::NAN, 3.0]);
+		d.x[(0, 1)] = f64::NAN;
+		clean_dataset(&mut d);
+		assert_eq!(d.x.nrows(), 2, "the NaN-target row must drop");
+		assert_eq!(d.y.to_vec(), vec![1.0, 3.0]);
+		assert!(d.x.iter().all(|v| v.is_finite()), "features must be imputed");
+	}
 }
