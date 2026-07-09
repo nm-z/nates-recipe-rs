@@ -8,7 +8,7 @@ use std::path::Path;
 
 const DELIMITERS: [u8; 3] = [b';', b'\t', b','];
 
-pub fn sniff_line_delimiter(line: &str) -> u8 {
+fn sniff_line_delimiter(line: &str) -> u8 {
 	let commas = line.matches(',').count();
 	if line.matches(';').count() > commas {
 		b';'
@@ -441,15 +441,14 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 	}
 }
 
-pub fn split_fields_delim(line: &str, delim: u8) -> Vec<String> {
-	let sep = delim as char;
+pub fn split_fields(line: &str) -> Vec<String> {
 	let mut out = Vec::new();
 	let mut cur = String::new();
 	let mut quoted = false;
 	for c in line.chars() {
 		match c {
 			'\'' => quoted = !quoted,
-			_ if c == sep && !quoted => {
+			',' if !quoted => {
 				out.push(cur.trim().to_string());
 				cur.clear();
 			}
@@ -458,10 +457,6 @@ pub fn split_fields_delim(line: &str, delim: u8) -> Vec<String> {
 	}
 	out.push(cur.trim().to_string());
 	out
-}
-
-pub fn split_fields(line: &str) -> Vec<String> {
-	split_fields_delim(line, b',')
 }
 
 fn parse_attribute(line: &str) -> Attr {

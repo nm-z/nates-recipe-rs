@@ -186,19 +186,10 @@ impl Data {
 			self.inner.targets = targets;
 		}
 		if let Some(tp) = &self.inner.test_path {
-			if let Ok(text) = std::fs::read_to_string(tp) {
-				let mut lines = text.lines();
-				if let Some(header_line) = lines.next() {
-					let delim = crate::data::sniff_delimiter(std::path::Path::new(tp));
-					let headers = crate::data::split_fields_delim(header_line, delim)
-						.into_iter()
-						.map(|s| s.trim().to_string())
-						.collect();
-					let rows = lines
-						.filter(|l| !l.trim().is_empty())
-						.map(|l| crate::data::split_fields_delim(l, delim))
-						.collect();
-					self.inner.raw_test_headers = Some(headers);
+			if let Ok((headers, rows)) = crate::data::read_raw_csv(std::path::Path::new(tp)) {
+				if !headers.is_empty() {
+					self.inner.raw_test_headers =
+						Some(headers.into_iter().map(|h| h.trim().to_string()).collect());
 					self.inner.raw_test_rows = Some(rows);
 				}
 			}
