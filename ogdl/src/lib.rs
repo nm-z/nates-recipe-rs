@@ -1,8 +1,9 @@
 //! OGDL — an indentation-defined tree. Public API is FOUR methods on the graph
 //! handle: `itnl`, `file`, `add`, `del`, reachable three ways (a static `ogdl`,
-//! the `Ogdl::file` constructor, or the free `ogdl::file`). Values are child
-//! nodes; whitespace is the separator; the writer uses a 4-space indent. Tabs and
-//! spaces (and legacy `=`) are accepted on read.
+//! the `Ogdl::file` constructor, or the free `ogdl::file`). The methods are
+//! INHERENT on the handle, so no trait import is needed to chain them. Values are
+//! child nodes; whitespace is the separator; the writer uses a 4-space indent.
+//! Tabs and spaces (and legacy `=`) are accepted on read.
 #![allow(non_upper_case_globals)]
 
 use std::fmt;
@@ -69,7 +70,7 @@ impl Node {
 
       // ── path selectors (OGDL spec): a.b  a.1  a.b{n}  a.b{}  a[n] ──
       // `{n}`/`[n]` are 1-indexed per the OGDL path spec (n-1'th subnode). `{}`
-      // is handled by `select_all`. Returns the FIRST match here.
+      // is handled by the `del!` macro. Returns the FIRST match here.
       pub(crate) fn select(&self, path: &str) -> Option<&Node> {
             let mut cur = self;
             for seg in path.split('.').filter(|s| !s.is_empty()) {
@@ -166,9 +167,9 @@ impl fmt::Display for Node {
 }
 
 // ── graph registry ───────────────────────────────────────────────────────────
-// Every graph lives in a global slab; an `Ogdl` is a Copy handle (an index into
+// Every graph lives in a global slab; a `Graph` is a Copy handle (an index into
 // it). This is why every method can take `&self` and hand back a fresh handle for
-// chaining, and why the same `Ogdl` value stays usable after `.add().del()`.
+// chaining, and why the same handle stays usable after `.add().del()`.
 struct Reg {
       graphs: Vec<Node>,
 }
@@ -192,31 +193,29 @@ fn fresh() -> usize {
       g.graphs.len() - 1
 }
 
-/// A handle to one graph. Copy; the tree lives in the registry.
+/// A handle to one graph. Copy; the tree lives in the registry. The four methods
+/// are INHERENT here, so the chaining surface needs no trait in scope.
 #[derive(Clone, Copy, Debug)]
-pub struct Ogdl(usize);
+pub struct Graph(usize);
 
 /// The process-wide default graph — import style 1 (`use ogdl::*; ogdl.file(..)`).
-pub static ogdl: Ogdl = Ogdl(0);
+pub static ogdl: Graph = Graph(0);
+
+/// Constructor namespace — import style 2 (`Ogdl::file("g.ogdl")`). Distinct from
+/// the handle so the associated `file` constructor and the chaining `file` method
+/// can share the name without colliding.
+pub struct Ogdl;
 
 impl Ogdl {
-      /// Constructor form of `file` (import styles 2 & 3): read a file into a NEW
-      /// graph and return its handle. `Ogdl::file("g.ogdl")` / `ogdl::file(..)`.
-      pub fn file(path: &str) -> Ogdl {
-            let id = fresh();
-            let text = fs::read_to_string(path).unwrap_or_default();
-            with(id, |root| *root = Node::parse(&text));
-            Ogdl(id)
-      }
-
-      pub(crate) fn snapshot(self) -> Node {
-            with(self.0, |root| root.clone())
+      /// Read a file into a NEW graph and return its handle.
+      pub fn file(path: &str) -> Graph {
+            Graph::read(path)
       }
 }
 
 /// The free-function entry point — import style 3 (`ogdl::file("g.ogdl")`).
-pub fn file(path: &str) -> Ogdl {
-      Ogdl::file(path)
+pub fn file(path: &str) -> Graph {
+      Graph::read(path)
 }
 
 // ── itnl argument dispatch ───────────────────────────────────────────────────
@@ -225,19 +224,19 @@ pub fn file(path: &str) -> Ogdl {
 // `itnl(node/handle)` binds that graph as the handle's tree.
 pub trait Itnl {
       type Out;
-      fn apply(self, g: Ogdl) -> Self::Out;
+      fn apply(self, g: Graph) -> Self::Out;
 }
 
 impl Itnl for () {
-      type Out = Ogdl;
-      fn apply(self, g: Ogdl) -> Ogdl {
+      type Out = Graph;
+      fn apply(self, g: Graph) -> Graph {
             g
       }
 }
 
 impl Itnl for &str {
       type Out = Node;
-      fn apply(self, g: Ogdl) -> Node {
+      fn apply(self, g: Graph) -> Node {
             with(g.0, |root| {
                   // Return the selected subtree tagged with the path it was found
                   // at, so it can be handed straight to add/del as a locatable
@@ -249,9 +248,9 @@ impl Itnl for &str {
       }
 }
 
-impl Itnl for Ogdl {
-      type Out = Ogdl;
-      fn apply(self, g: Ogdl) -> Ogdl {
+impl Itnl for Graph {
+      type Out = Graph;
+      fn apply(self, g: Graph) -> Graph {
             let src = self.snapshot();
             with(g.0, |root| *root = src);
             g
@@ -259,22 +258,22 @@ impl Itnl for Ogdl {
 }
 
 impl Itnl for Node {
-      type Out = Ogdl;
-      fn apply(self, g: Ogdl) -> Ogdl {
+      type Out = Graph;
+      fn apply(self, g: Graph) -> Graph {
             with(g.0, |root| *root = self);
             g
       }
 }
 
 // ── del argument dispatch ────────────────────────────────────────────────────
-// `del("1", a)` (name + node), `del(a[2])` (positional node), `del!(a.b{})`
-// (all matching, via the macro). Each yields a path the graph deletes.
+// `del(a[2])` / `del(&node)` (positional/by-node), `del(("1", &a))` (name under a
+// node), `del!(g, a.b{})` (all matching, via the macro).
 pub trait DelArg {
-      fn apply(self, g: Ogdl);
+      fn apply(self, g: Graph);
 }
 
 impl DelArg for (&str, &Node) {
-      fn apply(self, g: Ogdl) {
+      fn apply(self, g: Graph) {
             let (name, parent) = self;
             with(g.0, |root| {
                   if let Some(p) = root.select_mut(&parent.name) {
@@ -287,29 +286,32 @@ impl DelArg for (&str, &Node) {
 }
 
 impl DelArg for &Node {
-      fn apply(self, g: Ogdl) {
+      fn apply(self, g: Graph) {
             with(g.0, |root| root.children.retain(|c| c != self));
       }
 }
 
-// ── the four methods ─────────────────────────────────────────────────────────
-/// The chaining surface: `itnl` / `file` / `add` / `del`. Import styles 2 and 3
-/// bring this into scope (`use ogdl::Chain;`); style 1's glob does it for free.
-pub trait Chain {
-      fn itnl<A: Itnl>(&self, a: A) -> A::Out;
-      fn file(&self, path: &str) -> Ogdl;
-      fn add(&self, name: &str, target: &Node) -> Ogdl;
-      fn del<D: DelArg>(&self, d: D) -> Ogdl;
-}
+// ── the four methods (inherent — no trait import to chain) ───────────────────
+impl Graph {
+      fn read(path: &str) -> Graph {
+            let id = fresh();
+            let text = fs::read_to_string(path).unwrap_or_default();
+            with(id, |root| *root = Node::parse(&text));
+            Graph(id)
+      }
 
-impl Chain for Ogdl {
-      fn itnl<A: Itnl>(&self, a: A) -> A::Out {
+      pub(crate) fn snapshot(self) -> Node {
+            with(self.0, |root| root.clone())
+      }
+
+      /// `itnl(())` → handle; `itnl("a.b")` → the Node there; `itnl(node)` → bind.
+      pub fn itnl<A: Itnl>(&self, a: A) -> A::Out {
             a.apply(*self)
       }
 
-      // Direction from state: an empty graph reads the file in, a populated one
-      // writes it out. (Same name both ways — the crate figures it out.)
-      fn file(&self, path: &str) -> Ogdl {
+      /// Read an empty graph in / write a populated graph out — direction from
+      /// state. (Same name both ways; the crate figures it out.)
+      pub fn file(&self, path: &str) -> Graph {
             let empty = with(self.0, |root| root.children.is_empty());
             if empty {
                   let text = fs::read_to_string(path).unwrap_or_default();
@@ -321,13 +323,10 @@ impl Chain for Ogdl {
             *self
       }
 
-      fn add(&self, name: &str, target: &Node) -> Ogdl {
+      /// Add a child `name` under `target` (addressed by its `itnl`-tagged path).
+      pub fn add(&self, name: &str, target: &Node) -> Graph {
             with(self.0, |root| {
-                  let dst = if target.name.is_empty() {
-                        Some(&mut *root)
-                  } else {
-                        root.select_mut(&target.name)
-                  };
+                  let dst = if target.name.is_empty() { Some(&mut *root) } else { root.select_mut(&target.name) };
                   if let Some(dst) = dst {
                         dst.children.push(Node::leaf(name));
                   }
@@ -335,7 +334,8 @@ impl Chain for Ogdl {
             *self
       }
 
-      fn del<D: DelArg>(&self, d: D) -> Ogdl {
+      /// Delete per the argument: `del(a[2])`, `del(&node)`, `del(("1", &a))`.
+      pub fn del<D: DelArg>(&self, d: D) -> Graph {
             d.apply(*self);
             *self
       }
@@ -351,7 +351,7 @@ macro_rules! del {
 }
 
 #[doc(hidden)]
-pub fn __del_all(g: Ogdl, parent: &str, name: &str) -> Ogdl {
+pub fn __del_all(g: Graph, parent: &str, name: &str) -> Graph {
       with(g.0, |root| {
             let target = if parent.is_empty() { Some(&mut *root) } else { root.select_mut(parent) };
             if let Some(p) = target {
@@ -380,7 +380,7 @@ mod tests {
 
       #[test]
       fn select_value() {
-            let g = Ogdl(fresh());
+            let g = Graph(fresh());
             with(g.0, |r| *r = Node::parse(SAMPLE));
             assert_eq!(format!("{}", g.itnl("engi.GPU0.VRAM")), "12");
             assert_eq!(format!("{}", g.itnl("engi.CPU.RAM")), "31");
@@ -400,7 +400,7 @@ mod tests {
 
       #[test]
       fn add_del() {
-            let g = Ogdl(fresh());
+            let g = Graph(fresh());
             with(g.0, |r| *r = Node::parse("a\n    b\n"));
             let a = Node::leaf("a");
             g.add("c", &a);

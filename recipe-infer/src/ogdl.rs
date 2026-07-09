@@ -83,7 +83,6 @@ pub fn load_ogdl(path: &str) -> Vec<Saved> {
 /// by `dump_ogdl`: a scalar metric header (`r2=`/`acc=`/…), then one bare-named
 /// block per layer with its fields indented underneath.
 pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
-	use ogdl::Chain;
 	// The four-method ogdl API reads FILES; stage the text through a temp file,
 	// then walk the returned tree (public `Node` fields; `itnl("")` = the root).
 	let tmp = std::env::temp_dir().join(format!("nrs_load_ogdl_{:x}.ogdl", text.len()));
