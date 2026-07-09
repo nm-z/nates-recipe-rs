@@ -19,47 +19,49 @@ pub fn sniff_line_delimiter(line: &str) -> u8 {
 	}
 }
 
-fn first_lines(path: &Path) -> Option<Vec<u8>> {
+fn first_records(path: &Path) -> Option<Vec<u8>> {
 	use std::io::BufRead;
 	let mut rdr = std::io::BufReader::new(std::fs::File::open(path).ok()?);
-	let mut buf = Vec::new();
-	rdr.read_until(b'\n', &mut buf).ok()?;
-	let head = buf.len();
-	rdr.read_until(b'\n', &mut buf).ok()?;
-	(buf.len() > head).then_some(buf)
+	let mut prefix = Vec::new();
+	let mut kept = 0;
+	while kept < 2 {
+		let mut line = Vec::new();
+		if rdr.read_until(b'\n', &mut line).ok()? == 0 {
+			break;
+		}
+		if line.iter().all(u8::is_ascii_whitespace) {
+			continue;
+		}
+		prefix.extend_from_slice(&line);
+		kept += 1;
+	}
+	(kept == 2).then_some(prefix)
 }
 
-fn steady_width(prefix: &[u8], delim: u8) -> Option<usize> {
+fn is_steady(prefix: &[u8], delim: u8) -> bool {
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
 		.delimiter(delim)
 		.from_reader(prefix);
 	let mut records = rdr.byte_records();
-	let a = records.next()?.ok()?.len();
-	let b = records.next()?.ok()?.len();
-	(a == b && a > 1).then_some(a)
+	let width = |r: Option<Result<csv::ByteRecord, csv::Error>>| r.and_then(|r| r.ok()).map(|r| r.len());
+	match (width(records.next()), width(records.next())) {
+		(Some(a), Some(b)) => a == b && a > 1,
+		_ => false,
+	}
 }
 
 pub fn sniff_delimiter(path: &Path) -> u8 {
-	let Some(prefix) = first_lines(path) else {
+	let Some(prefix) = first_records(path) else {
 		return sniff_first_line(path);
 	};
-	let steady: Vec<(u8, usize)> = DELIMITERS
-		.iter()
-		.filter_map(|&d| steady_width(&prefix, d).map(|w| (d, w)))
-		.collect();
-	let widest = steady.iter().map(|&(_, w)| w).max();
-	match widest {
-		None => sniff_first_line(path),
-		Some(w) => {
-			let mut winners = steady.iter().filter(|&&(_, x)| x == w).map(|&(d, _)| d);
-			let first = winners.next().unwrap_or(b',');
-			match winners.next() {
-				None => first,
-				Some(_) => sniff_first_line(path),
-			}
-		}
+	let steady: Vec<u8> = DELIMITERS.iter().copied().filter(|&d| is_steady(&prefix, d)).collect();
+	match steady.as_slice() {
+		[] => sniff_first_line(path),
+		[only] => *only,
+		rest if rest.contains(&b',') => b',',
+		_ => sniff_first_line(path),
 	}
 }
 
@@ -743,5 +745,28 @@ mod header_detection_tests {
 	fn single_record_falls_back_to_counting() {
 		let p = tmp("one.csv", "a;b;c\n");
 		assert_eq!(super::sniff_delimiter(&p), b';');
+	}
+
+	#[test]
+	fn a_steady_semicolon_run_never_hijacks_a_comma_table() {
+		let p = tmp("hijack.csv", "1,\"a;b;c;d\",2\n3,\"e;f;g;h\",4\n5,\"i;j;k;l\",6\n");
+		assert_eq!(super::sniff_delimiter(&p), b',');
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers.len(), 3);
+		assert_eq!(rows[0], vec!["3", "e;f;g;h", "4"]);
+	}
+
+	#[test]
+	fn a_blank_line_after_the_header_does_not_blind_the_sniff() {
+		let p = tmp("blank.tsv", "ham\tGo until jurong point, crazy..\n\nham\tOk lar Joking wif u oni\nspam\tFree entry to win\n");
+		assert_eq!(super::sniff_delimiter(&p), b'\t');
+		let (headers, _) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers.len(), 2);
+	}
+
+	#[test]
+	fn comma_still_wins_when_it_is_the_only_steady_delimiter() {
+		let p = tmp("plain.csv", "a,b,c\n1,2,3\n4,5,6\n");
+		assert_eq!(super::sniff_delimiter(&p), b',');
 	}
 }
