@@ -16,8 +16,7 @@ fn style1_static() {
       std::fs::write(&p, SRC).expect("seed");
       ogdl.file(&p).itnl(()); // start of chain: read the file in
       assert_eq!(format!("{}", ogdl.itnl("engi.GPU0.VRAM")), "12");
-      let cpu = ogdl.itnl("engi.CPU");
-      ogdl.add("HTT", &cpu);
+      ogdl.add("HTT", "engi.CPU"); // add child "HTT" under engi.CPU
       ogdl.itnl(()).file(&p); // end of chain: write it back out
       assert!(std::fs::read_to_string(&p).expect("read").contains("HTT"));
 }

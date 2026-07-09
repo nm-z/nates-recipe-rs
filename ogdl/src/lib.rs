@@ -297,6 +297,92 @@ impl DelArg for &Node {
       }
 }
 
+// ── add value dispatch ───────────────────────────────────────────────────────
+// A value becomes leaf child node(s): a scalar → one child, a Vec → one per
+// element. This is the whole reason the crate can serialize weights/scalars/
+// strings directly (`ogdl.add(0.0312, "z1.w")`) — no bespoke checkpoint codec.
+pub trait Value {
+      fn into_nodes(self) -> Vec<Node>;
+}
+
+impl Value for f64 {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(&self.to_string())]
+      }
+}
+impl Value for i64 {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(&self.to_string())]
+      }
+}
+impl Value for i32 {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(&self.to_string())]
+      }
+}
+impl Value for usize {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(&self.to_string())]
+      }
+}
+impl Value for bool {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(if self { "true" } else { "false" })]
+      }
+}
+impl Value for &str {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(self)]
+      }
+}
+impl Value for String {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(&self)]
+      }
+}
+impl Value for &String {
+      fn into_nodes(self) -> Vec<Node> {
+            vec![Node::leaf(self)]
+      }
+}
+impl Value for Vec<f64> {
+      fn into_nodes(self) -> Vec<Node> {
+            self.iter().map(|x| Node::leaf(&x.to_string())).collect()
+      }
+}
+impl Value for &[f64] {
+      fn into_nodes(self) -> Vec<Node> {
+            self.iter().map(|x| Node::leaf(&x.to_string())).collect()
+      }
+}
+impl Value for Vec<String> {
+      fn into_nodes(self) -> Vec<Node> {
+            self.into_iter().map(|s| Node::leaf(&s)).collect()
+      }
+}
+impl Value for &[String] {
+      fn into_nodes(self) -> Vec<Node> {
+            self.iter().map(|s| Node::leaf(s)).collect()
+      }
+}
+
+// Navigate `path` (dot-separated names), creating any missing node along the way,
+// and return the target for children to be appended under.
+fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
+      let mut cur = root;
+      for seg in path.split('.').filter(|s| !s.is_empty()) {
+            let idx = match cur.children.iter().position(|c| c.name == seg) {
+                  Some(i) => i,
+                  None => {
+                        cur.children.push(Node::leaf(seg));
+                        cur.children.len() - 1
+                  }
+            };
+            cur = &mut cur.children[idx];
+      }
+      cur
+}
+
 // ── the four methods (inherent — no trait import to chain) ───────────────────
 impl Graph {
       fn read(path: &str) -> Graph {
@@ -329,14 +415,14 @@ impl Graph {
             *self
       }
 
-      /// Add a child `name` under `target` (addressed by its `itnl`-tagged path).
-      pub fn add(&self, name: &str, target: &Node) -> Graph {
-            with(self.0, |root| {
-                  let dst = if target.name.is_empty() { Some(&mut *root) } else { root.select_mut(&target.name) };
-                  if let Some(dst) = dst {
-                        dst.children.push(Node::leaf(name));
-                  }
-            });
+      /// Add a typed `value` under the node at `path`, creating the path as needed.
+      /// The value serializes to one or more leaf children: `add(0.0312, "z1.w")`,
+      /// `add(weights, "z1.w")` (Vec<f64>), `add("relu", "z1.act")`, `add(true, …)`,
+      /// `add(42, …)`, `add(labels, …)` (Vec<String>). This is what lets the crate
+      /// serialize weights directly at the callsite — no separate codec module.
+      pub fn add<V: Value>(&self, value: V, path: &str) -> Graph {
+            let kids = value.into_nodes();
+            with(self.0, |root| ensure_path(root, path).children.extend(kids));
             *self
       }
 
@@ -421,10 +507,32 @@ mod tests {
       fn add_del() {
             let g = Graph(fresh());
             with(g.0, |r| *r = Node::parse("a\n    b\n"));
-            let a = Node::leaf("a");
-            g.add("c", &a);
+            g.add("c", "a"); // add child "c" under a
             assert!(g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "c"));
             del!(g, a.b {});
             assert!(!g.snapshot().select("a").expect("a").children.iter().any(|c| c.name == "b"));
+      }
+
+      // The universal-serializer capability: typed values written by path, read
+      // back typed — the whole point of folding the checkpoint codec into `add`.
+      #[test]
+      fn typed_serialize_roundtrip() {
+            let g = Graph(fresh());
+            let weights = vec![0.01_f64, -0.02, 0.03];
+            let labels = vec!["cat".to_string(), "dog".to_string()];
+            g.add(weights.clone(), "z1.w")
+                  .add(0.5_f64, "z1.b")
+                  .add(42_i64, "z1.neurons")
+                  .add(true, "z1.bias")
+                  .add("relu", "z1.act")
+                  .add(labels.clone(), "z1.classes");
+            let w: Vec<f64> = g.itnl("z1.w").children.iter().filter_map(|c| c.name.parse().ok()).collect();
+            assert_eq!(w, weights);
+            assert_eq!(format!("{}", g.itnl("z1.b")), "0.5");
+            assert_eq!(format!("{}", g.itnl("z1.neurons")), "42");
+            assert_eq!(format!("{}", g.itnl("z1.bias")), "true");
+            assert_eq!(format!("{}", g.itnl("z1.act")), "relu");
+            let classes: Vec<String> = g.itnl("z1.classes").children.iter().map(|c| c.name.clone()).collect();
+            assert_eq!(classes, labels);
       }
 }
