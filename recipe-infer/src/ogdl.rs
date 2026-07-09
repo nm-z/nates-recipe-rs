@@ -83,35 +83,33 @@ pub fn load_ogdl(path: &str) -> Vec<Saved> {
 /// by `dump_ogdl`: a scalar metric header (`r2=`/`acc=`/…), then one bare-named
 /// block per layer with its fields indented underneath.
 pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
-	let vals = |s: &str| -> Vec<f64> {
-		s.split_whitespace()
-			.map(|t| t.parse::<f64>().expect("resume: parse value"))
-			.collect()
+	use ogdl::Chain;
+	// The four-method ogdl API reads FILES; stage the text through a temp file,
+	// then walk the returned tree (public `Node` fields; `itnl("")` = the root).
+	let tmp = std::env::temp_dir().join(format!("nrs_load_ogdl_{:x}.ogdl", text.len()));
+	std::fs::write(&tmp, text).expect("resume: stage ogdl text");
+	let root = ogdl::file(tmp.to_str().expect("utf8 temp")).itnl("");
+	let _ = std::fs::remove_file(&tmp);
+	// value of a node = its leaf children parsed as f64 (`w 0.01 -0.02`).
+	let vals = |n: &ogdl::Node| -> Vec<f64> {
+		n.children.iter().filter_map(|g| g.name.parse::<f64>().ok()).collect()
 	};
 	let mut out: Vec<Saved> = Vec::new();
-	for block in ogdl::Node::parse(text).children {
-		// A top-level `key=value` line is the scalar metric header, not a weight
-		// block — skip it whatever the metric is named.
-		if block.value.is_some() {
+	for block in &root.children {
+		// A top-level node whose children are all leaves is the scalar metric
+		// header (`r2 0.987`), not a weight block — skip it.
+		if !block.children.is_empty() && block.children.iter().all(|c| c.children.is_empty()) {
 			continue;
 		}
 		let field = |name: &str| -> Vec<f64> {
-			block
-				.children
-				.iter()
-				.find(|c| c.name == name)
-				.and_then(|c| c.value.as_deref())
-				.map_or_else(Vec::new, vals)
+			block.children.iter().find(|c| c.name == name).map_or_else(Vec::new, &vals)
 		};
 		match block.name.as_str() {
 			"embed" => {
 				let mut rows: Vec<(usize, Vec<f64>)> = block
 					.children
 					.iter()
-					.map(|c| {
-						let v = c.value.as_deref().map_or_else(Vec::new, vals);
-						(c.name.parse().expect("resume: embed row id"), v)
-					})
+					.map(|c| (c.name.parse().expect("resume: embed row id"), vals(c)))
 					.collect();
 				rows.sort_by_key(|(id, _)| *id);
 				out.push(Saved::Embed(
@@ -128,27 +126,24 @@ pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
 				bv: field("bv"),
 				bo: field("bo"),
 			}),
-			name if name.starts_with("conv ") => {
-				out.push(Saved::Conv { w: field("w"), b: field("b") })
-			}
+			"conv" => out.push(Saved::Conv { w: field("w"), b: field("b") }),
 			// z{k}: one dense neuron — w row, scalar b, optional PReLU slope a.
 			_ => {
 				let mut w = Vec::new();
 				let mut b = 0.0;
 				let mut a = None;
 				for c in &block.children {
-					let v = c.value.as_deref().unwrap_or("");
 					match c.name.as_str() {
-						"w" => w = vals(v),
-						"b" => b = v.trim().parse().expect("resume: dense b"),
-						"a" => a = Some(v.trim().parse().expect("resume: dense a")),
+						"w" => w = vals(c),
+						"b" => b = vals(c).first().copied().expect("resume: dense b"),
+						"a" => a = vals(c).first().copied(),
 						// Back-compat: the old format wrote one weight per line
-						// (w1=, w2=, …) in order — append each to the vector.
+						// (w1, w2, …) in order — append each to the vector.
 						key if key.starts_with('w')
 							&& key.len() > 1
-							&& key[1..].chars().all(|c| c.is_ascii_digit()) =>
+							&& key[1..].chars().all(|ch| ch.is_ascii_digit()) =>
 						{
-							w.push(v.trim().parse().expect("resume: dense w{n}"));
+							w.push(vals(c).first().copied().expect("resume: dense w{n}"));
 						}
 						key => panic!(
 							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
