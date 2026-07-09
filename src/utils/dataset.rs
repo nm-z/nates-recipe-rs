@@ -189,13 +189,14 @@ impl Data {
 			if let Ok(text) = std::fs::read_to_string(tp) {
 				let mut lines = text.lines();
 				if let Some(header_line) = lines.next() {
-					let headers = crate::data::split_fields(header_line)
+					let delim = crate::data::sniff_line_delimiter(header_line);
+					let headers = crate::data::split_fields_delim(header_line, delim)
 						.into_iter()
 						.map(|s| s.trim().to_string())
 						.collect();
 					let rows = lines
 						.filter(|l| !l.trim().is_empty())
-						.map(|l| crate::data::split_fields(l))
+						.map(|l| crate::data::split_fields_delim(l, delim))
 						.collect();
 					self.inner.raw_test_headers = Some(headers);
 					self.inner.raw_test_rows = Some(rows);

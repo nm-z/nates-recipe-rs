@@ -936,11 +936,23 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 pub fn clean_dataset(d: &mut Dataset) {
 	let k = d.n_targets.max(1);
 	let n = d.x.nrows();
+	if d.x.ncols() == 0 || (d.has_target && d.y.len() < n * k) {
+		eprintln!("\x1b[1;31mno columns found, check delimiter\x1b[0m");
+		eprintln!(
+			"    {}  →  parsed {n} row(s) × {} column(s), {} target value(s)",
+			crate::data::short_path(&d.source),
+			d.x.ncols(),
+			d.y.len()
+		);
+		std::process::exit(1);
+	}
 	let mut keep: Vec<usize> = (0..n).collect();
-	for j in 0..k {
-		let mut col: Vec<f64> = (0..n).map(|i| d.y[i * k + j]).collect();
-		let kj = nan_clean(&mut col, Nan::Drop, "target");
-		keep.retain(|i| kj.binary_search(i).is_ok());
+	if d.has_target {
+		for j in 0..k {
+			let mut col: Vec<f64> = (0..n).map(|i| d.y[i * k + j]).collect();
+			let kj = nan_clean(&mut col, Nan::Drop, "target");
+			keep.retain(|i| kj.binary_search(i).is_ok());
+		}
 	}
 	if keep.len() < n {
 		eprintln!("\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target", n - keep.len());

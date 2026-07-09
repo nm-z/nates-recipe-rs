@@ -6,6 +6,29 @@ use rayon::prelude::*;
 use std::fs;
 use std::path::Path;
 
+pub fn sniff_line_delimiter(line: &str) -> u8 {
+	let commas = line.matches(',').count();
+	if line.matches(';').count() > commas {
+		b';'
+	} else if line.matches('\t').count() > commas {
+		b'\t'
+	} else {
+		b','
+	}
+}
+
+pub fn sniff_delimiter(path: &Path) -> u8 {
+	use std::io::BufRead;
+	let Ok(f) = std::fs::File::open(path) else {
+		return b',';
+	};
+	let mut line = Vec::new();
+	if std::io::BufReader::new(f).read_until(b'\n', &mut line).is_err() {
+		return b',';
+	}
+	sniff_line_delimiter(&String::from_utf8_lossy(&line))
+}
+
 pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let disk = std::fs::metadata(path)
 		.map(|m| m.len() as usize)
@@ -15,6 +38,7 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
+		.delimiter(sniff_delimiter(path))
 		.from_path(path)
 		.with_context(|| format!("failed to open {}", path.display()))?;
 	let mut records = rdr.byte_records();
@@ -369,14 +393,15 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 	}
 }
 
-pub fn split_fields(line: &str) -> Vec<String> {
+pub fn split_fields_delim(line: &str, delim: u8) -> Vec<String> {
+	let sep = delim as char;
 	let mut out = Vec::new();
 	let mut cur = String::new();
 	let mut quoted = false;
 	for c in line.chars() {
 		match c {
 			'\'' => quoted = !quoted,
-			',' if !quoted => {
+			_ if c == sep && !quoted => {
 				out.push(cur.trim().to_string());
 				cur.clear();
 			}
@@ -385,6 +410,10 @@ pub fn split_fields(line: &str) -> Vec<String> {
 	}
 	out.push(cur.trim().to_string());
 	out
+}
+
+pub fn split_fields(line: &str) -> Vec<String> {
+	split_fields_delim(line, b',')
 }
 
 fn parse_attribute(line: &str) -> Attr {
@@ -612,5 +641,37 @@ mod header_detection_tests {
 		let (headers, rows) = read_raw_csv(&p).unwrap();
 		assert_eq!(headers, vec!["col_0"]);
 		assert_eq!(rows.len(), 4);
+	}
+
+	#[test]
+	fn semicolon_delimiter_is_sniffed() {
+		let p = tmp("semi.csv", "\"age\";\"job\";\"y\"\n58;\"management\";\"no\"\n44;\"technician\";\"yes\"\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["age", "job", "y"]);
+		assert_eq!(rows[0], vec!["58", "management", "no"]);
+	}
+
+	#[test]
+	fn tab_delimiter_is_sniffed() {
+		let p = tmp("tabs.csv", "age\tjob\ty\n58\tmanagement\tno\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["age", "job", "y"]);
+		assert_eq!(rows[0], vec!["58", "management", "no"]);
+	}
+
+	#[test]
+	fn comma_delimiter_is_unchanged() {
+		let p = tmp("commas.csv", "age,job,y\n58,management,no\n");
+		let (headers, rows) = read_raw_csv(&p).unwrap();
+		assert_eq!(headers, vec!["age", "job", "y"]);
+		assert_eq!(rows[0], vec!["58", "management", "no"]);
+	}
+
+	#[test]
+	fn sniffed_delimiter_never_splits_the_wrong_way() {
+		assert_eq!(super::sniff_line_delimiter("a;b;c"), b';');
+		assert_eq!(super::sniff_line_delimiter("a\tb\tc"), b'\t');
+		assert_eq!(super::sniff_line_delimiter("a,b,c"), b',');
+		assert_eq!(super::sniff_line_delimiter("a,b;c"), b',');
 	}
 }

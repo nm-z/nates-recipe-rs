@@ -128,6 +128,7 @@ fn prefix_columns(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
+		.delimiter(crate::data::sniff_delimiter(path))
 		.from_path(path)
 		.unwrap_or_else(|e| panic!("detect_kinds: failed to open {}: {e}", path.display()));
 	let mut records = rdr.byte_records();
