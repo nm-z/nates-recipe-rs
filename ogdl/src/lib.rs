@@ -222,19 +222,19 @@ pub fn file(path: &str) -> Graph {
 // `itnl(())` returns the handle (chain on to `.file`), `itnl("a.b")` selects and
 // returns the Node there (Display = its value; `.children`/Index to traverse),
 // `itnl(node/handle)` binds that graph as the handle's tree.
-pub trait Itnl {
+pub trait ItnlArg {
       type Out;
       fn apply(self, g: Graph) -> Self::Out;
 }
 
-impl Itnl for () {
+impl ItnlArg for () {
       type Out = Graph;
       fn apply(self, g: Graph) -> Graph {
             g
       }
 }
 
-impl Itnl for &str {
+impl ItnlArg for &str {
       type Out = Node;
       fn apply(self, g: Graph) -> Node {
             with(g.0, |root| {
@@ -248,7 +248,7 @@ impl Itnl for &str {
       }
 }
 
-impl Itnl for Graph {
+impl ItnlArg for Graph {
       type Out = Graph;
       fn apply(self, g: Graph) -> Graph {
             let src = self.snapshot();
@@ -257,7 +257,7 @@ impl Itnl for Graph {
       }
 }
 
-impl Itnl for Node {
+impl ItnlArg for Node {
       type Out = Graph;
       fn apply(self, g: Graph) -> Graph {
             with(g.0, |root| *root = self);
@@ -287,7 +287,13 @@ impl DelArg for (&str, &Node) {
 
 impl DelArg for &Node {
       fn apply(self, g: Graph) {
-            with(g.0, |root| root.children.retain(|c| c != self));
+            fn strip(n: &mut Node, target: &Node) {
+                  n.children.retain(|c| c != target);
+                  for c in &mut n.children {
+                        strip(c, target);
+                  }
+            }
+            with(g.0, |root| strip(root, self));
       }
 }
 
@@ -305,7 +311,7 @@ impl Graph {
       }
 
       /// `itnl(())` → handle; `itnl("a.b")` → the Node there; `itnl(node)` → bind.
-      pub fn itnl<A: Itnl>(&self, a: A) -> A::Out {
+      pub fn itnl<A: ItnlArg>(&self, a: A) -> A::Out {
             a.apply(*self)
       }
 
@@ -396,6 +402,19 @@ mod tests {
             assert_eq!(a.select("b{2}").expect("b{2}").children[0].name, "y"); // 2nd b
             assert_eq!(a.select("1").expect("1").children[0].name, "z"); // name "1"
             assert_eq!(a.select("[2]").expect("[2]").name, "b"); // 2nd subnode (n-1)
+      }
+
+      // The variable-arity call sites the ItnlArg/DelArg dispatch produces.
+      #[test]
+      fn arity_forms_dispatch() {
+            let g = Graph(fresh());
+            with(g.0, |r| *r = Node::parse("a\n    x\n    y\n"));
+            let _ = g.itnl(()).itnl("a"); // itnl(()) -> handle, then itnl(path) -> Node
+            let a = g.itnl("a"); // Node{name:"a", children:[x, y]}
+            g.del(&a[0]); // del(a[2]) form: &Node via Index -> deletes x
+            assert!(g.itnl("a").children.iter().all(|c| c.name != "x"));
+            g.del(("y", &a)); // del(("1", &a)) form: (&str, &Node) -> deletes y under a
+            assert!(g.itnl("a").children.is_empty());
       }
 
       #[test]
