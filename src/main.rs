@@ -11,7 +11,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	use std::os::unix::process::CommandExt;
 	let rlib = std::path::Path::new("/usr/lib/recipe/librecipe.rlib");
 	if !rlib.exists() {
-		anyhow::bail!("{} missing: install the recipe package", rlib.display());
+		anyhow::bail!("{} missing: the recipe package is not installed", rlib.display());
 	}
 	let src = std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
 	let mtime = rlib.metadata()?.modified()?;

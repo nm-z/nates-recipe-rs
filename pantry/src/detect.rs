@@ -256,7 +256,7 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	let xbuf = base.view(x_off, n * CONTEXT);
 	let consts_view = base.view(consts_off, 12);
 	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view)?;
-	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc);
+	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc)?;
 	let last = params.len() - 1;
 	// Detector release (ONE drain): enqueue the logits D2H (async, no wait), then
 	// the single device_synchronize completes it; finish fans the pin into preds.
