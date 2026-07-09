@@ -1585,6 +1585,13 @@ pub fn gpu_shutdown() {
 	// trim_mempool: async teardown reclaim races the next process's first touch.
 	let _ = crate::hip::trim_mempool(0);
 	eprint!("{}", crate::callspy::report());
+	// The gpu gate is NOT released here. atexit runs LIFO and the HIP runtime
+	// registered its own destructor before this one, so it frees the arena
+	// AFTER this function returns: releasing now would wake the next process in
+	// the queue onto a card that still holds this run's VRAM (a probe child
+	// measured that as an allocation failure). The kernel drops the flock when
+	// it closes the fd during exit_files — strictly after every atexit handler.
+	// A process that outlives its GPU work (the daemon) hands off with a Lease.
 }
 
 /// C = A @ B, A is (m x k) row-major, B is (k x n) row-major, C is (m x n) row-major.

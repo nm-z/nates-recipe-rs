@@ -916,7 +916,12 @@ extern "C" fn release_birth_claim_at_exit() {
 /// old 1 GiB warm is gone — the run's arena claim is larger and commits its own
 /// pages (memset + drain inside the claim op), so pre-touching the pool would
 /// only shrink the claim (the no-warmup invariant).
+///
+/// The gate is taken outside the Once: a daemon that released the GPU after an
+/// earlier job must queue for it again before this allocation, not walk past a
+/// latch it already tripped.
 pub(crate) fn device_init_once() {
+	crate::gate::acquire();
 	DEVICE_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
 		if let Err(e) = crate::hip::set_pool_retain(0) {

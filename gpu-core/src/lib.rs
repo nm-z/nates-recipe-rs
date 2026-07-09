@@ -13,6 +13,7 @@ pub mod cluster;
 pub mod diffusion;
 pub mod encoding;
 pub mod forest;
+pub mod gate;
 pub mod graph;
 pub mod hip;
 pub mod hw;

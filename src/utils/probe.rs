@@ -29,6 +29,7 @@ pub struct Machine {
 impl Machine {
 	pub fn probe() -> Result<Machine> {
 		let host = hostname();
+		let job = gpu_core::gate::Lease::new();
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
@@ -43,6 +44,7 @@ impl Machine {
 			gpu_core::memory::release_run_backing();
 			gpu_core::memory::pool_trim();
 		}
+		drop(job);
 		let ram = mem_total()?;
 		eprintln!("recipe probe: measuring cpu (ddr5 + transfer + flops)");
 		let ddr5_gbs = bench_ddr5();

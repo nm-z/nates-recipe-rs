@@ -43,6 +43,7 @@ pub fn cu_count() -> usize {
 	if cached != 0 {
 		return cached;
 	}
+	crate::gate::acquire();
 	crate::callspy::tick(&crate::callspy::GET_DEVICE_PROPERTIES);
 	let n = unsafe { hip_multiprocessor_count() };
 	assert!(
@@ -149,6 +150,7 @@ unsafe extern "C" {
 }
 
 pub fn mem_info() -> Result<(usize, usize), HipError> {
+	crate::gate::acquire();
 	let mut free: usize = 0;
 	let mut total: usize = 0;
 	crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
@@ -157,6 +159,7 @@ pub fn mem_info() -> Result<(usize, usize), HipError> {
 }
 
 pub fn device_synchronize() -> Result<(), HipError> {
+	crate::gate::acquire();
 	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
 	check(unsafe { hipDeviceSynchronize() })
 }
@@ -180,6 +183,7 @@ pub(crate) fn disable_sdma_once() {
 }
 
 pub fn set_device(device: i32) -> Result<(), HipError> {
+	crate::gate::acquire();
 	disable_sdma_once();
 	register_fault_autopsy_once();
 	crate::hw::install_fast_death();
@@ -286,6 +290,7 @@ pub(crate) fn register_fault_autopsy_once() {
 /// growth for a new allocation comes on top of this, so a "how much can I
 /// still ask for" computation must subtract it.
 pub fn pool_slack(device: i32) -> Result<usize, HipError> {
+	crate::gate::acquire();
 	const RESERVED_MEM_CURRENT: i32 = 0x5;
 	const USED_MEM_CURRENT: i32 = 0x7;
 	let mut pool: *mut c_void = std::ptr::null_mut();
@@ -361,6 +366,7 @@ pub fn peek_last_error() -> i32 {
 }
 
 pub fn device_count() -> Result<i32, HipError> {
+	crate::gate::acquire();
 	let mut count: i32 = 0;
 	crate::callspy::tick(&crate::callspy::GET_DEVICE_COUNT);
 	check(unsafe { hipGetDeviceCount(&mut count) })?;
@@ -368,6 +374,7 @@ pub fn device_count() -> Result<i32, HipError> {
 }
 
 pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
+	crate::gate::acquire();
 	let mut val: i32 = 0;
 	crate::callspy::tick(&crate::callspy::DEVICE_GET_ATTRIBUTE);
 	check(unsafe { hipDeviceGetAttribute(&mut val, attr, device) })?;
@@ -375,6 +382,7 @@ pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 }
 
 pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
+	crate::gate::acquire();
 	let mut ptr: *mut c_void = std::ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::HOST_MALLOC);
 	check(unsafe { hipHostMalloc(&mut ptr, size, flags) })?;
@@ -411,6 +419,7 @@ unsafe impl Sync for Stream {}
 
 impl Stream {
 	pub fn new() -> Result<Self, HipError> {
+		crate::gate::acquire();
 		let mut raw: *mut c_void = std::ptr::null_mut();
 		crate::callspy::tick(&crate::callspy::STREAM_CREATE);
 		check(unsafe { hipStreamCreate(&mut raw) })?;
@@ -447,6 +456,7 @@ unsafe impl Sync for Event {}
 
 impl Event {
 	pub fn new() -> Result<Self, HipError> {
+		crate::gate::acquire();
 		let mut raw: *mut c_void = std::ptr::null_mut();
 		crate::callspy::tick(&crate::callspy::EVENT_CREATE);
 		check(unsafe { hipEventCreate(&mut raw) })?;

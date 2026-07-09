@@ -611,10 +611,7 @@ pub fn load_ogdl(path: &str) -> Vec<Saved> {
 }
 
 pub fn load_ogdl_str(text: &str) -> Vec<Saved> {
-	let tmp = std::env::temp_dir().join(format!("nrs_load_ogdl_{:x}.ogdl", text.len()));
-	std::fs::write(&tmp, text).expect("resume: stage ogdl text");
-	let root = ogdl::file(tmp.to_str().expect("utf8 temp")).itnl("");
-	let _ = std::fs::remove_file(&tmp);
+	let root = ogdl::text(text).itnl("");
 	let vals = |n: &ogdl::Node| -> Vec<f64> {
 		n.children.iter().filter_map(|g| g.name.parse::<f64>().ok()).collect()
 	};

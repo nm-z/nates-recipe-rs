@@ -1,14 +1,12 @@
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const TEST_DEADLINE_SECS: f64 = 60.0;
@@ -16,8 +14,6 @@ const WALL_BUDGET_SECS: f64 = 600.0;
 const PROBE_DEADLINE_SECS: f64 = 10.0;
 const KFD_TEARDOWN_DEADLINE_SECS: f64 = 30.0;
 const DEVICE_FREE_DEADLINE_SECS: f64 = 30.0;
-const MAX_RESTART_UNITS: usize = 8;
-const MAX_CMDLINE_CHARS: usize = 120;
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
@@ -86,61 +82,6 @@ impl Log {
 
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 
-#[repr(C)]
-struct Restart {
-      exe: *const libc::c_char,
-      n: usize,
-      argv: [*const *const libc::c_char; MAX_RESTART_UNITS],
-}
-
-static RESTART: AtomicPtr<Restart> = AtomicPtr::new(std::ptr::null_mut());
-
-fn arm_restart(systemctl: &Path, units: &[String]) {
-      let exe = CString::new(systemctl.as_os_str().as_bytes()).expect("systemctl path");
-      let mut r = Restart {
-            exe: exe.into_raw(),
-            n: 0,
-            argv: [std::ptr::null(); MAX_RESTART_UNITS],
-      };
-      for u in units.iter().take(MAX_RESTART_UNITS) {
-            let mut v: Vec<*const libc::c_char> = Vec::with_capacity(5);
-            for s in ["systemctl", "--user", "start", u.as_str()] {
-                  v.push(CString::new(s).expect("argv element").into_raw());
-            }
-            v.push(std::ptr::null());
-            r.argv[r.n] = Box::leak(v.into_boxed_slice()).as_ptr();
-            r.n += 1;
-      }
-      RESTART.store(Box::into_raw(Box::new(r)), Ordering::SeqCst);
-}
-
-fn disarm_restart() {
-      RESTART.store(std::ptr::null_mut(), Ordering::SeqCst);
-}
-
-fn restart_units_from_handler() {
-      let p = RESTART.load(Ordering::SeqCst);
-      if p.is_null() {
-            return;
-      }
-      unsafe {
-            let r = &*p;
-            for i in 0..r.n {
-                  match libc::fork() {
-                        0 => {
-                              libc::execv(r.exe, r.argv[i]);
-                              libc::_exit(127);
-                        }
-                        pid if pid > 0 => {
-                              let mut st: libc::c_int = 0;
-                              libc::waitpid(pid, &mut st, 0);
-                        }
-                        _ => {}
-                  }
-            }
-      }
-}
-
 extern "C" fn kill_child_group(_sig: i32) {
       let pgid = CHILD_PGID.load(Ordering::SeqCst);
       if pgid > 0 {
@@ -148,7 +89,6 @@ extern "C" fn kill_child_group(_sig: i32) {
                   libc::kill(-pgid, libc::SIGKILL);
             }
       }
-      restart_units_from_handler();
       unsafe { libc::_exit(130) }
 }
 
@@ -260,18 +200,21 @@ fn run() -> i32 {
       out(&head);
       let mut tally = Tally { discovered, passed: 0, failed: 0, unattempted: 0 };
       if discovered == 0 {
-            let mut gate = DeviceGate { state: Device::Clear, holders: Vec::new(), restored: true };
-            return finish(&mut log, &tally, t0, Instant::now(), 0.0, &mut gate);
+            return finish(&mut log, &tally, t0, Instant::now(), 0.0);
       }
 
-      let mut gate = DeviceGate::open(&mut log, &probe);
+      // One lease over the whole suite. Every test process links gpu-core and
+      // would take this lock at its first device touch; instead they inherit
+      // ours through RECIPE_GPU_LOCK_FD and no daemon job can slip between two
+      // tests. A daemon that wants the GPU queues in the kernel until we exit,
+      // so the suite no longer stops anyone's service to get the card.
+      let waited = Instant::now();
+      gpu_core::gate::acquire();
+      log.line(&format!("[S] GPU-LOCK acquired wait={:.1}s", waited.elapsed().as_secs_f64()));
+      // Processes already holding /dev/kfd open cannot use it while we hold the
+      // lease; only a NEW holder means a test leaked a GPU child.
+      let known = kfd_holders();
       let mut done = vec![false; tests.len()];
-      if gate.device_unusable() {
-            let abort = gate.unusable_reason();
-            fail_rest(&mut log, &mut tally, &tests, &done, &abort);
-            return finish(&mut log, &tally, t0, Instant::now(), 0.0, &mut gate);
-      }
-      let known = gate.known();
       let dispatch_t0 = Instant::now();
       let mut test_secs = 0.0f64;
 
@@ -288,7 +231,7 @@ fn run() -> i32 {
             }
       };
       fail_rest(&mut log, &mut tally, &tests, &done, &oneline(&abort));
-      finish(&mut log, &tally, t0, dispatch_t0, test_secs, &mut gate)
+      finish(&mut log, &tally, t0, dispatch_t0, test_secs)
 }
 
 fn dispatch(
@@ -461,9 +404,7 @@ fn finish(
       t0: Instant,
       dispatch_t0: Instant,
       test_secs: f64,
-      gate: &mut DeviceGate,
 ) -> i32 {
-      gate.restore(log);
       let wall = t0.elapsed().as_secs_f64();
       let dispatch_secs = dispatch_t0.elapsed().as_secs_f64();
       if dispatch_secs > WALL_BUDGET_SECS {
@@ -648,217 +589,6 @@ fn probe_ok(probe: &Path) -> bool {
       CHILD_PGID.store(0, Ordering::SeqCst);
       await_kfd_teardown(pid);
       ok
-}
-
-struct Holder {
-      pid: i32,
-      unit: Option<String>,
-      comm: String,
-      cmd: String,
-}
-
-enum Device {
-      Clear,
-      Stopped(Vec<String>),
-      Shared,
-      Unusable,
-}
-
-struct DeviceGate {
-      state: Device,
-      holders: Vec<Holder>,
-      restored: bool,
-}
-
-impl DeviceGate {
-      fn open(log: &mut Log, probe: &Path) -> DeviceGate {
-            let pids = kfd_holders();
-            if pids.is_empty() {
-                  return DeviceGate { state: Device::Clear, holders: Vec::new(), restored: true };
-            }
-            let systemctl = find_systemctl();
-            let holders: Vec<Holder> = pids
-                  .iter()
-                  .map(|&pid| Holder {
-                        pid,
-                        unit: systemctl.as_ref().and_then(|_| user_unit_of(pid)),
-                        comm: proc_field(pid, "comm"),
-                        cmd: proc_cmdline(pid),
-                  })
-                  .collect();
-            for h in &holders {
-                  log.line(&format!(
-                        "[S] HOLDER pid={} unit={} comm={} cmd={}",
-                        h.pid,
-                        h.unit.as_deref().unwrap_or("-"),
-                        h.comm,
-                        h.cmd
-                  ));
-            }
-
-            if let Some(sc) = systemctl.filter(|_| holders.iter().all(|h| h.unit.is_some())) {
-                  let mut units: Vec<String> =
-                        holders.iter().filter_map(|h| h.unit.clone()).collect();
-                  units.sort();
-                  units.dedup();
-                  let mut stopped_clean = true;
-                  for u in &units {
-                        let (rc, err) = systemctl_run(&sc, &["--user", "stop", u]);
-                        log.line(&format!("[S] DAEMON-STOP unit={u} rc={rc}{}", note(rc, &err)));
-                        stopped_clean &= rc == 0;
-                  }
-                  arm_restart(&sc, &units);
-                  let t0 = Instant::now();
-                  if stopped_clean && wait_device_free(&pids) {
-                        log.line(&format!("[S] DEVICE-FREE wait={:.1}s", t0.elapsed().as_secs_f64()));
-                        return DeviceGate { state: Device::Stopped(units), holders, restored: false };
-                  }
-                  let mut g = DeviceGate { state: Device::Stopped(units), holders, restored: false };
-                  g.restore(log);
-                  g.state = probe_state(log, probe);
-                  return g;
-            }
-
-            DeviceGate { state: probe_state(log, probe), holders, restored: true }
-      }
-
-      fn device_unusable(&self) -> bool {
-            matches!(self.state, Device::Unusable)
-      }
-
-      fn known(&self) -> Vec<i32> {
-            match self.state {
-                  Device::Shared | Device::Unusable => self.holders.iter().map(|h| h.pid).collect(),
-                  Device::Clear | Device::Stopped(_) => Vec::new(),
-            }
-      }
-
-      fn unusable_reason(&self) -> String {
-            format!("device-busy probe=fail pids={:?}", self.known())
-      }
-
-      fn restore(&mut self, log: &mut Log) {
-            if self.restored {
-                  return;
-            }
-            self.restored = true;
-            if let Device::Stopped(units) = &self.state {
-                  match find_systemctl() {
-                        Some(sc) => {
-                              for u in units {
-                                    let (rc, err) = systemctl_run(&sc, &["--user", "start", u]);
-                                    log.line(&format!(
-                                          "[S] DAEMON-START unit={u} rc={rc}{}",
-                                          note(rc, &err)
-                                    ));
-                              }
-                        }
-                        None => {
-                              for u in units {
-                                    log.line(&format!(
-                                          "[S] DAEMON-START unit={u} rc=-1 err=systemctl-not-found"
-                                    ));
-                              }
-                        }
-                  }
-            }
-            disarm_restart();
-      }
-}
-
-impl Drop for DeviceGate {
-      fn drop(&mut self) {
-            if self.restored {
-                  return;
-            }
-            if let Device::Stopped(units) = &self.state {
-                  if let Some(sc) = find_systemctl() {
-                        for u in units {
-                              let (rc, _) = systemctl_run(&sc, &["--user", "start", u]);
-                              errline(&format!("[RUN] daemon restart on unwind: unit={u} rc={rc}"));
-                        }
-                  }
-            }
-            disarm_restart();
-      }
-}
-
-fn probe_state(log: &mut Log, probe: &Path) -> Device {
-      if probe_ok(probe) {
-            log.line("[S] DEVICE-SHARED probe=ok holder is not a systemd --user service");
-            Device::Shared
-      } else {
-            log.line("[S] DEVICE-UNUSABLE probe=fail holder is not a systemd --user service");
-            Device::Unusable
-      }
-}
-
-fn user_unit_of(pid: i32) -> Option<String> {
-      let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-      let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?;
-      if !path.contains("/user@") {
-            return None;
-      }
-      let last = path.rsplit('/').next()?;
-      if last.starts_with("user@") || !last.ends_with(".service") {
-            return None;
-      }
-      Some(last.to_owned())
-}
-
-fn find_systemctl() -> Option<PathBuf> {
-      let path = std::env::var("PATH").ok()?;
-      path.split(':').map(|d| Path::new(d).join("systemctl")).find(|p| p.is_file())
-}
-
-fn systemctl_run(systemctl: &Path, args: &[&str]) -> (i32, String) {
-      match Command::new(systemctl).args(args).stdin(Stdio::null()).output() {
-            Ok(o) => (
-                  o.status.code().unwrap_or(-1),
-                  String::from_utf8_lossy(&o.stderr).split_whitespace().collect::<Vec<_>>().join(" "),
-            ),
-            Err(e) => (-1, e.to_string()),
-      }
-}
-
-fn note(rc: i32, err: &str) -> String {
-      if rc == 0 || err.is_empty() { String::new() } else { format!(" err={err}") }
-}
-
-fn wait_device_free(pids: &[i32]) -> bool {
-      for p in pids {
-            await_kfd_teardown(*p as u32);
-      }
-      let t0 = Instant::now();
-      while !kfd_holders().is_empty() {
-            if t0.elapsed().as_secs_f64() >= DEVICE_FREE_DEADLINE_SECS {
-                  return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-      }
-      true
-}
-
-fn proc_field(pid: i32, field: &str) -> String {
-      std::fs::read_to_string(format!("/proc/{pid}/{field}"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_else(|_| "?".into())
-}
-
-fn proc_cmdline(pid: i32) -> String {
-      let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-      let joined: String = raw
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-      let flat = joined.split_whitespace().collect::<Vec<_>>().join(" ");
-      if flat.is_empty() {
-            "?".into()
-      } else {
-            flat.chars().take(MAX_CMDLINE_CHARS).collect()
-      }
 }
 
 fn kfd_holders() -> Vec<i32> {

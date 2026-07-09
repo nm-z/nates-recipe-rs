@@ -457,6 +457,7 @@ pub struct Server {
 	runners: Arc<HashMap<u16, RunFn>>,
 	reg: Registry,
 	machine: Option<Arc<Machine>>,
+	jobs: Arc<Mutex<()>>,
 }
 
 impl Server {
@@ -467,6 +468,7 @@ impl Server {
 			runners: Arc::new(runners),
 			reg: Arc::new(Mutex::new(HashMap::new())),
 			machine: None,
+			jobs: Arc::new(Mutex::new(())),
 		}
 	}
 
@@ -555,6 +557,9 @@ impl Server {
 					.runners
 					.get(&f.tag)
 					.ok_or_else(|| anyhow::anyhow!("wire: no runner for fn {}", f.tag))?;
+				let _queued =
+					self.jobs.lock().map_err(|_| anyhow::anyhow!("wire: job queue poisoned"))?;
+				let _gpu = gpu_core::gate::Lease::new();
 				h(f.id, &f.data)
 			}
 			Op::Stat => {

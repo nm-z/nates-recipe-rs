@@ -174,6 +174,12 @@ pub fn file(path: &str) -> Graph {
       Graph::read(path)
 }
 
+pub fn text(src: &str) -> Graph {
+      let g = Graph::empty();
+      g.with(|root| *root = Node::parse(src));
+      g
+}
+
 pub trait ItnlArg {
       type Out;
       fn apply(self, g: Graph) -> Self::Out;
