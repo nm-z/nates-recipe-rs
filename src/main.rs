@@ -11,10 +11,50 @@ fn kind_name(k: usize) -> &'static str {
 	}
 }
 
+fn run_rs(path: &str, extra: &[String]) -> Result<()> {
+	use std::hash::Hasher;
+	use std::os::unix::process::CommandExt;
+	let rlib = std::path::Path::new("/usr/lib/recipe/librecipe.rlib");
+	if !rlib.exists() {
+		anyhow::bail!("{} missing: install the recipe package", rlib.display());
+	}
+	let src = std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+	let mtime = rlib.metadata()?.modified()?;
+	let mut h = std::hash::DefaultHasher::new();
+	h.write(&src);
+	h.write_u128(mtime.duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+	let bin = recipe::probe::data_dir()?.join(format!("{:016x}", h.finish()));
+	if !bin.exists() {
+		let status = std::process::Command::new("rustc")
+			.arg(path)
+			.args(["-L", "/usr/lib/recipe", "-L", "/usr/lib/recipe/deps", "-L", "/opt/rocm/lib"])
+			.args(["--extern", "recipe=/usr/lib/recipe/librecipe.rlib"])
+			.args(["--edition", "2024"])
+			.args(["-l", "amdhip64", "-l", "hipblas", "-l", "hipsolver", "-l", "stdc++"])
+			.arg("-o")
+			.arg(&bin)
+			.status()
+			.map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
+		if !status.success() {
+			anyhow::bail!("rustc failed on {path}: {status}");
+		}
+	}
+	Err(std::process::Command::new(&bin).args(extra).exec().into())
+}
+
 fn main() -> Result<()> {
 	if let Some(d) = std::env::var_os("RECIPE_PROBE_GPU") {
 		let dev: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
-		recipe::probe::probe_gpu_child_main(dev);
+		match recipe::probe::probe_gpu_child_record(dev) {
+			Ok(rec) => {
+				println!("{rec}");
+				std::process::exit(0);
+			}
+			Err(e) => {
+				eprintln!("probe child gpu{dev}: {e}");
+				std::process::exit(2);
+			}
+		}
 	}
 	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
 		let n: usize = sz.to_string_lossy().parse().expect("VRAM_PROBE parse");
@@ -63,6 +103,7 @@ fn main() -> Result<()> {
 	let args: Vec<String> = std::env::args().collect();
 	if args.len() < 2 {
 		eprintln!("usage: recipe <train.csv> [--target <col>]");
+		eprintln!("       recipe <file.rs> [args]  # compile user file + run");
 		eprintln!("       recipe detect <path>");
 		eprintln!("       recipe serve            # discovery + RPC node on 7845");
 		eprintln!("       recipe peers            # live network view");
@@ -100,6 +141,10 @@ fn main() -> Result<()> {
 		return Ok(());
 	}
 
+	if args[1].ends_with(".rs") {
+		return run_rs(&args[1], &args[2..]);
+	}
+
 	gpu_core::hip::set_device(0)?;
 
 	if args[1] == "detect" {
@@ -120,7 +165,7 @@ fn main() -> Result<()> {
 						.collect()
 				})
 				.collect();
-			let kinds = pantry::predict_kinds(&columns);
+			let kinds = pantry::predict_kinds(&columns)?;
 			for (h, k) in headers.iter().zip(kinds) {
 				if name.is_empty() {
 					println!("{h} -> {}", kind_name(k));
