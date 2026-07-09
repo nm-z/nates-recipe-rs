@@ -1,14 +1,9 @@
 use anyhow::Result;
 
-fn kind_name(k: usize) -> &'static str {
-	match k {
-		pantry::KIND_NUMERIC => "Numeric",
-		pantry::KIND_TEMPORAL => "Temporal",
-		pantry::KIND_CATEGORICAL => "Categorical",
-		pantry::KIND_ORDINAL => "Ordinal",
-		pantry::KIND_TEXT => "Text",
-		_ => "Image",
-	}
+fn usage(code: i32) -> ! {
+	eprintln!("usage: recipe <file.rs> [args]  # compile + run");
+	eprintln!("       recipe serve            # daemon on 7845");
+	std::process::exit(code);
 }
 
 fn run_rs(path: &str, extra: &[String]) -> Result<()> {
@@ -109,13 +104,10 @@ fn main() -> Result<()> {
 	}
 	let args: Vec<String> = std::env::args().collect();
 	if args.len() < 2 {
-		eprintln!("usage: recipe <train.csv> [--target <col>]");
-		eprintln!("       recipe <file.rs> [args]  # compile user file + run");
-		eprintln!("       recipe detect <path>");
-		eprintln!("       recipe serve            # discovery + RPC node on 7845");
-		eprintln!("       recipe peers            # live network view");
-		eprintln!("       recipe install          # probe + config.ogdl + systemd unit");
-		std::process::exit(1);
+		usage(1);
+	}
+	if args[1] == "-h" || args[1] == "--help" {
+		usage(0);
 	}
 
 	if args[1] == "serve" {
@@ -129,91 +121,12 @@ fn main() -> Result<()> {
 		return Ok(());
 	}
 
-	if args[1] == "install" {
-		let machine = recipe::probe::Machine::probe()?;
-		recipe::probe::install(&machine)?;
-		return Ok(());
-	}
-
-	if args[1] == "peers" {
-		for p in recipe::wire::local_peers()? {
-			println!(
-				"{}\t{}\t{} MiB ram\t{}",
-				p.host,
-				p.addrs.join(","),
-				p.info.ram >> 20,
-				p.info.arch
-			);
-		}
-		return Ok(());
-	}
-
 	if args[1].ends_with(".rs") {
+		if !std::path::Path::new(&args[1]).exists() {
+			usage(1);
+		}
 		return run_rs(&args[1], &args[2..]);
 	}
 
-	gpu_core::hip::set_device(0)?;
-
-	if args[1] == "detect" {
-		let Some(path) = args.get(2) else {
-			eprintln!("usage: recipe detect <path>");
-			std::process::exit(1);
-		};
-		for group in pantry::data::load_groups(path) {
-			let pantry::data::DirGroup::Table { name, headers, cells, .. } = group else {
-				continue;
-			};
-			let columns: Vec<Vec<&str>> = (0..headers.len())
-				.map(|j| {
-					cells
-						.iter()
-						.filter_map(|r| r.get(j).map(String::as_str))
-						.filter(|c| !c.is_empty())
-						.collect()
-				})
-				.collect();
-			let kinds = pantry::predict_kinds(&columns)?;
-			for (h, k) in headers.iter().zip(kinds) {
-				if name.is_empty() {
-					println!("{h} -> {}", kind_name(k));
-				} else {
-					println!("{name}:{h} -> {}", kind_name(k));
-				}
-			}
-		}
-		gpu_core::kernels::gpu_shutdown();
-		return Ok(());
-	}
-
-	let mut target = None;
-	let mut path = &args[1];
-	let mut i = 2;
-	while i < args.len() {
-		match args[i].as_str() {
-			"--target" => {
-				target = Some(args[i + 1].as_str());
-				i += 2;
-			}
-			_ => {
-				path = &args[i];
-				i += 1;
-			}
-		}
-	}
-
-	let data = if let Some(t) = target {
-		recipe::Data::load(path).target(t)
-	} else {
-		eprintln!("no --target specified");
-		recipe::Data::load(path)
-	};
-	let (set, _test) = data.datasets();
-	eprintln!(
-		"loaded {} samples × {} features",
-		set.x.nrows(),
-		set.x.ncols()
-	);
-
-	gpu_core::kernels::gpu_shutdown();
-	Ok(())
+	usage(1)
 }

@@ -575,66 +575,6 @@ pub fn write_config_atomic(machines: &[Machine]) -> Result<()> {
 	Ok(())
 }
 
-pub fn service_unit(_config_ogdl: &str) -> String {
-	[
-		"[Unit]",
-		"Description=recipe RPC daemon",
-		"After=network-online.target",
-		"Wants=network-online.target",
-		"",
-		"[Service]",
-		"ExecStart=%h/.local/bin/recipe serve",
-		"Restart=always",
-		"RestartSec=2",
-		"",
-		"[Install]",
-		"WantedBy=default.target",
-		"",
-	]
-	.join("\n")
-}
-
-fn service_path() -> Result<PathBuf> {
-	let home = std::env::var("HOME").map_err(|_| anyhow!("probe: HOME not set"))?;
-	Ok(PathBuf::from(home).join(".config/systemd/user/recipe.service"))
-}
-
-pub fn install(machine: &Machine) -> Result<()> {
-	let cfg_text = write_config(std::slice::from_ref(machine));
-	write_config_atomic(std::slice::from_ref(machine))?;
-	eprintln!("recipe install: wrote {}", config_path()?.display());
-
-	let svc = service_path()?;
-	if let Some(p) = svc.parent() {
-		std::fs::create_dir_all(p)?;
-	}
-	std::fs::write(&svc, service_unit(&cfg_text))?;
-	eprintln!("recipe install: wrote {}", svc.display());
-
-	let exe = std::env::current_exe()?;
-	let home = std::env::var("HOME").expect("HOME unset");
-	let bin_dir = Path::new(&home).join(".local/bin");
-	std::fs::create_dir_all(&bin_dir).map_err(|e| anyhow::anyhow!("recipe install: mkdir {}: {e}", bin_dir.display()))?;
-	let dest = bin_dir.join("recipe");
-	let dest = dest.as_path();
-	if std::fs::canonicalize(&exe).ok() == std::fs::canonicalize(dest).ok() {
-		eprintln!("recipe install: {} is already the installed binary", dest.display());
-		return Ok(());
-	}
-	match std::fs::copy(&exe, dest) {
-		Ok(_) => eprintln!("recipe install: copied {} -> {}", exe.display(), dest.display()),
-		Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
-			"recipe install: cannot write {} ({e}); run:\n  sudo install -m755 {} {}",
-			dest.display(),
-			exe.display(),
-			dest.display()
-		),
-		Err(e) => bail!("recipe install: copy {} -> {}: {e}", exe.display(), dest.display()),
-	}
-	eprintln!("recipe install: done — enable with: systemctl --user enable --now recipe.service");
-	Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -713,13 +653,4 @@ mod tests {
 		assert!(eth < disk && disk < gpu && gpu < cpu, "tier order ETH<DISK<GPU<CPU");
 	}
 
-	#[test]
-	fn service_unit_is_canonical() {
-		let u = service_unit("");
-		assert!(u.contains("Description=recipe RPC daemon"));
-		assert!(u.contains("ExecStart=%h/.local/bin/recipe serve"));
-		assert!(u.contains("WantedBy=default.target"));
-		assert!(!u.contains("User="), "user unit needs no User=");
-		assert!(!u.contains("LD_LIBRARY_PATH"), "no machine-specific env baked in");
-	}
 }

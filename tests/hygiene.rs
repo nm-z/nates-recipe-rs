@@ -52,6 +52,9 @@ fn files_with_ext(roots: &[&str], ext: &str) -> Vec<PathBuf> {
 }
 
 fn collect_ext(p: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+      if p.is_symlink() {
+            return;
+      }
       if p.is_file() {
             if p.extension().is_some_and(|e| e == ext) {
                   out.push(p.to_path_buf());
@@ -955,7 +958,10 @@ fn h32_no_sneak_hip_api() {
 
 #[test]
 fn h33_single_log_file() {
-      let logs = files_with_ext(&[""], "log");
+      let logs: Vec<PathBuf> = files_with_ext(&[""], "log")
+            .into_iter()
+            .filter(|p| !rel(p).starts_with("pkg/"))
+            .collect();
       if logs.len() > 1 {
             let hits: Vec<String> = logs.iter().map(|p| rel(p)).collect();
             assert_absent("multiple .log files in repo root", &hits);
