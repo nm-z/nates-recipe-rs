@@ -5,8 +5,13 @@ edition = "2024"
 
 [lib]
 name = "recipe"
+test = false
 
-# SUITE SPEC v3 R1: `cargo test all` dispatches the suite orchestrator.
+[[bin]]
+name = "recipe"
+path = "src/main.rs"
+test = false
+
 [[test]]
 name = "all"
 harness = false
