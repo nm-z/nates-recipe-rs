@@ -1,6 +1,7 @@
 use anyhow::Context;
+use std::cmp::Ordering;
 use crate::enums::{Activation, LayerKind, Loss, Metric};
-use crate::params::{LayerParams, concat_layer};
+use crate::params::{ConcatDims, LayerParams, concat_layer};
 use crate::scratch::Scratch;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
@@ -9,21 +10,6 @@ use gpu_core::memory::GpuBuffer;
 pub struct LossScale {
 	pub sign: f64,
 	pub div: f64,
-}
-
-pub fn metric_gpu_into_s(
-	loss: Loss,
-	m: Metric,
-	out: &GpuBuffer,
-	ybuf: &GpuBuffer,
-	sc: &Scratch,
-	n: usize,
-	k: usize,
-	ss_tot: f64,
-	dst: &GpuBuffer,
-) -> anyhow::Result<LossScale> {
-	let (sign, div) = metric_gpu_into(loss, m, out, ybuf, sc, n, k, ss_tot, dst)?;
-	Ok(LossScale { sign, div })
 }
 
 pub fn metric_gpu_into(
@@ -36,20 +22,20 @@ pub fn metric_gpu_into(
 	k: usize,
 	ss_tot: f64,
 	dst: &GpuBuffer,
-) -> anyhow::Result<(f64, f64)> {
+) -> anyhow::Result<LossScale> {
 	let nk = n * k;
 	Ok(match m {
 		Metric::Loss => {
 			match loss {
 				Loss::Mse => {
 					kernels::gpu_mse_into(out, ybuf, nk, dst)?;
-					(1.0, 1.0)
+					LossScale { sign: 1.0, div: 1.0 }
 				}
 				Loss::Mae => {
 					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
 					kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0)?;
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
-					(1.0, nk as f64)
+					LossScale { sign: 1.0, div: nk as f64 }
 				}
 				Loss::Huber => {
 					kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
@@ -62,7 +48,7 @@ pub fn metric_gpu_into(
 					kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1)?;
 					kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2)?;
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t2, &sc.reduce_ws, nk, 1, dst)?;
-					(1.0, nk as f64)
+					LossScale { sign: 1.0, div: nk as f64 }
 				}
 				Loss::Ce => {
 					kernels::gpu_softmax_rows_into(out, n, k, &sc.metric_t0)?;
@@ -70,7 +56,7 @@ pub fn metric_gpu_into(
 					kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0)?;
 					kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0)?;
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
-					(-1.0, n as f64)
+					LossScale { sign: -1.0, div: n as f64 }
 				}
 				Loss::Bce => {
 					kernels::gpu_clamp_into(out, &sc.c_eps, &sc.c_one_minus_eps, nk, &sc.metric_t0)?;
@@ -85,28 +71,27 @@ pub fn metric_gpu_into(
 					kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2)?;
 					kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1)?;
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t1, &sc.reduce_ws, nk, 1, dst)?;
-					(-1.0, nk as f64)
+					LossScale { sign: -1.0, div: nk as f64 }
 				}
 				Loss::Focal => {
 					gpu_core::losses::gpu_focal_into(out, ybuf, &sc.c_focal_gamma, &sc.c_focal_alpha, nk, &sc.metric_t0, &sc.metric_t1)?;
 					kernels::gpu_reduce_sum_cols_into(&sc.metric_t0, &sc.reduce_ws, nk, 1, dst)?;
-					(1.0, nk as f64)
+					LossScale { sign: 1.0, div: nk as f64 }
 				}
 			}
 		}
 		Metric::R2 => {
 			kernels::gpu_ss_res_into(out, ybuf, nk, dst)?;
-			(1.0, ss_tot)
+			LossScale { sign: 1.0, div: ss_tot }
 		}
 		Metric::Accuracy => {
-			if k == 1 {
-				kernels::gpu_accuracy_into(out, ybuf, n, dst)?;
-			} else {
-				kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst)?;
+			match k.cmp(&1) {
+				Ordering::Equal => kernels::gpu_accuracy_into(out, ybuf, n, dst)?,
+				Ordering::Less | Ordering::Greater => kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst)?,
 			}
-			(1.0, 1.0)
+			LossScale { sign: 1.0, div: 1.0 }
 		}
-		_ => (1.0, 1.0),
+		Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => LossScale { sign: 1.0, div: 1.0 },
 	})
 }
 
@@ -168,12 +153,7 @@ pub struct ZFit {
 	pub scaled: Vec<f64>,
 }
 
-pub fn zscore_fit_s(x: &[f64], n: usize, d: usize) -> ZFit {
-	let (mean, std, scaled) = zscore_fit_host(x, n, d);
-	ZFit { mean, std, scaled }
-}
-
-pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> ZFit {
 	let nf = n as f64;
 	let mut mean = vec![0.0f64; d];
 	for i in 0..n {
@@ -200,7 +180,7 @@ pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Ve
 			scaled[i * d + j] = (x[i * d + j] - mean[j]) / std[j];
 		}
 	}
-	(mean, std, scaled)
+	ZFit { mean, std, scaled }
 }
 
 pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64]) -> Vec<f64> {
@@ -223,10 +203,9 @@ pub fn forward_into(
 ) -> anyhow::Result<()> {
 	let cc = concat_layer(params);
 	sc.mark_fwd(0);
-	for (l, p) in params.iter().enumerate() {
-		if let Some((pf, a, c)) = cc
-			&& l == pf
-		{
+	for l in 0..params.len() {
+		let p = &params[l];
+		for ConcatDims { a, c, .. } in cc.filter(|cd| cd.pf == l).into_iter() {
 			kernels::gpu_concat_into(
 				&acts[l - 1],
 				x_cat.ok_or_else(|| anyhow::anyhow!("concat: x_cat missing"))?,
@@ -236,12 +215,12 @@ pub fn forward_into(
 				&sc.concat,
 			)?;
 		}
-		let prev = if l == 0 {
-			x
-		} else if Some(l) == cc.map(|t| t.0) {
-			&sc.concat
-		} else {
-			&acts[l - 1]
+		let prev = match l.checked_sub(1) {
+			None => x,
+			Some(lm1) => match cc.filter(|cd| cd.pf == l) {
+				Some(_cd) => &sc.concat,
+				None => &acts[lm1],
+			},
 		};
 		match p.kind {
 			LayerKind::Embed => {
@@ -261,14 +240,15 @@ pub fn forward_into(
 				)?;
 			}
 			LayerKind::Attn => {
-				if sc.infer {
-					attn_forward_cached(p, prev, &acts[l], n, sc)?
-				} else {
-					attn_forward(p, prev, &acts[l], n, sc)?
+				match Some(()).filter(|_u| sc.infer) {
+					Some(()) => attn_forward_cached(p, prev, &acts[l], n, sc)?,
+					None => attn_forward(p, prev, &acts[l], n, sc)?,
 				}
 			}
 			LayerKind::Conv => {
-				let (cin, k, stride) = (p.conv_cin, p.conv_k, p.conv_stride);
+				let cin = p.conv_cin;
+				let k = p.conv_k;
+				let stride = p.conv_stride;
 				let lin = p.in_dim / cin;
 				let cout = p.out_dim / ((lin - k) / stride + 1);
 				kernels::gpu_conv1d_into(
@@ -277,98 +257,64 @@ pub fn forward_into(
 					&acts[l],
 				)?;
 				let m = n * p.out_dim;
-				if matches!(
+				match Some(()).filter(|_u| matches!(
 					p.act,
 					Activation::Silu
 						| Activation::Gelu | Activation::Elu
 						| Activation::Selu | Activation::PRelu
-				) {
-					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l])?;
-				}
+				)) {
+					Some(()) => kernels::gpu_copy_into(&acts[l], m, &sc.preact[l]),
+					None => Ok(()),
+				}?;
 				match p.act {
-					Activation::Relu => kernels::gpu_relu_into(&acts[l], m, &acts[l])?,
-					Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], m, &acts[l])?,
-					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&acts[l], &sc.c_leaky_alpha, m, &acts[l])?,
-					Activation::PRelu => {
-						kernels::gpu_leaky_relu_into(&sc.preact[l], &p.palpha, m, &acts[l])?;
-					}
-					Activation::Elu => gpu_core::k_gapact::gpu_elu(&sc.preact[l], &sc.c_elu_alpha, m, &acts[l])?,
-					Activation::Selu => gpu_core::k_gapact::gpu_selu(&sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &acts[l])?,
-					Activation::Tanh => kernels::gpu_tanh_into(&acts[l], m, &acts[l])?,
-					Activation::Silu => kernels::gpu_silu_into(&sc.preact[l], m, &acts[l])?,
-					Activation::Gelu => kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l])?,
-					Activation::Linear => {}
-				}
+					Activation::Relu => kernels::gpu_relu_into(&acts[l], m, &acts[l]),
+					Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], m, &acts[l]),
+					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&acts[l], &sc.c_leaky_alpha, m, &acts[l]),
+					Activation::PRelu => kernels::gpu_leaky_relu_into(&sc.preact[l], &p.palpha, m, &acts[l]),
+					Activation::Elu => gpu_core::k_gapact::gpu_elu(&sc.preact[l], &sc.c_elu_alpha, m, &acts[l]),
+					Activation::Selu => gpu_core::k_gapact::gpu_selu(&sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &acts[l]),
+					Activation::Tanh => kernels::gpu_tanh_into(&acts[l], m, &acts[l]),
+					Activation::Silu => kernels::gpu_silu_into(&sc.preact[l], m, &acts[l]),
+					Activation::Gelu => kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l]),
+					Activation::Linear => Ok(()),
+				}?;
 			}
 			LayerKind::Dense => {
-				if p.out_dim == 1 {
-					kernels::gpu_matvec_bias_into(
-	prev,
-	&p.w,
-	&p.b,
-	n,
-	p.in_dim,
-	&acts[l],
-)?;
-				} else {
-					kernels::gpu_linear_into(
+				match p.out_dim.cmp(&1) {
+					Ordering::Equal => kernels::gpu_matvec_bias_into(
+						prev,
+						&p.w,
+						&p.b,
+						n,
+						p.in_dim,
+						&acts[l],
+					)?,
+					Ordering::Less | Ordering::Greater => kernels::gpu_linear_into(
 						prev, &p.w, &p.b, n, p.out_dim, p.in_dim, &acts[l],
-					)?;
+					)?,
 				}
 				let m = n * p.out_dim;
-				if matches!(
+				match Some(()).filter(|_u| matches!(
 					p.act,
 					Activation::Silu
 						| Activation::Gelu | Activation::Elu
 						| Activation::Selu | Activation::PRelu
-				) {
-					kernels::gpu_copy_into(&acts[l], m, &sc.preact[l])?;
-				}
+				)) {
+					Some(()) => kernels::gpu_copy_into(&acts[l], m, &sc.preact[l]),
+					None => Ok(()),
+				}?;
 				match p.act {
-					Activation::Relu => {
-						kernels::gpu_relu_into(&acts[l], m, &acts[l])?
-					}
-					Activation::Sigmoid => {
-						kernels::gpu_sigmoid_into(&acts[l], m, &acts[l])?
-					}
-					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(
-						&acts[l],
-						&sc.c_leaky_alpha,
-						m,
-						&acts[l],
-					)?,
-					Activation::PRelu => {
-						kernels::gpu_leaky_relu_into(
-							&sc.preact[l],
-							&p.palpha,
-							m,
-							&acts[l],
-						)?;
-					}
-					Activation::Elu => gpu_core::k_gapact::gpu_elu(
-						&sc.preact[l],
-						&sc.c_elu_alpha,
-						m,
-						&acts[l],
-					)?,
-					Activation::Selu => gpu_core::k_gapact::gpu_selu(
-						&sc.preact[l],
-						&sc.c_selu_alpha,
-						&sc.c_selu_lambda,
-						m,
-						&acts[l],
-					)?,
-					Activation::Tanh => {
-						kernels::gpu_tanh_into(&acts[l], m, &acts[l])?
-					}
-					Activation::Silu => {
-						kernels::gpu_silu_into(&sc.preact[l], m, &acts[l])?
-					}
-					Activation::Gelu => {
-						kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l])?
-					}
-					Activation::Linear => {}
-				}
+					Activation::Relu => kernels::gpu_relu_into(&acts[l], m, &acts[l]),
+					Activation::Sigmoid => kernels::gpu_sigmoid_into(&acts[l], m, &acts[l]),
+					Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&acts[l], &sc.c_leaky_alpha, m, &acts[l]),
+					Activation::PRelu => kernels::gpu_leaky_relu_into(&sc.preact[l], &p.palpha, m, &acts[l]),
+					Activation::Elu => gpu_core::k_gapact::gpu_elu(&sc.preact[l], &sc.c_elu_alpha, m, &acts[l]),
+					Activation::Selu => gpu_core::k_gapact::gpu_selu(&sc.preact[l], &sc.c_selu_alpha, &sc.c_selu_lambda, m, &acts[l]),
+					Activation::Tanh => kernels::gpu_tanh_into(&acts[l], m, &acts[l]),
+					Activation::Silu => kernels::gpu_silu_into(&sc.preact[l], m, &acts[l]),
+					Activation::Gelu => kernels::gpu_gelu_into(&sc.preact[l], m, &acts[l]),
+					Activation::Linear => Ok(()),
+				}?;
 			}
 		}
 		sc.mark_fwd(l + 1);
@@ -418,13 +364,13 @@ pub fn infer_scored(
 	xbuf: &GpuBuffer,
 	x_cat: Option<&GpuBuffer>,
 	n: usize,
-	yscaler: Option<(f64, f64)>,
+	yscaler: Option<YScaler>,
 	ybuf: Option<&GpuBuffer>,
 	loss: Loss,
 	_lr: f64,
 	metrics: &[Metric],
 	ss_tot: f64,
-) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
+) -> anyhow::Result<Scored> {
 	let last = params.len() - 1;
 	let k = params[last].out_dim;
 	let consts = {
@@ -434,7 +380,7 @@ pub fn infer_scored(
 	};
 	let sc = Scratch::new_infer(params, n, &consts)?;
 	forward_into(params, xbuf, x_cat, n, &sc.acts, &sc)?;
-	if let Some((ymean, ystd)) = yscaler {
+	for YScaler { mean: ymean, std: ystd } in yscaler.into_iter() {
 		let ystd_b = { let __up = &[ystd]; let __ub = GpuBuffer::alloc(__up.len()).context("ystd")?; __ub.load(__up).context("ystd")?; __ub };
 		let ymean_b = { let __up = &[ymean]; let __ub = GpuBuffer::alloc(__up.len()).context("ymean")?; __ub.load(__up).context("ymean")?; __ub };
 		kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last])?;
@@ -447,11 +393,14 @@ pub fn infer_scored(
 			for &m in metrics {
 				acc.push(match m {
 					Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => f64::NAN,
-					_ => {
-						let (sign, div) =
+					Metric::Loss | Metric::Accuracy | Metric::R2 => {
+						let LossScale { sign, div } =
 							metric_gpu_into(loss, m, out, yb, &sc, n, k, ss_tot, &sc.metric_scalar)?;
 						let v = sign * download_scalar(&sc.metric_scalar) / div;
-						if m == Metric::R2 { 1.0 - v } else { v }
+						match m {
+							Metric::R2 => 1.0 - v,
+							Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => v,
+						}
 					}
 				});
 			}
@@ -459,7 +408,7 @@ pub fn infer_scored(
 		}
 		None => Vec::new(),
 	};
-	Ok((download_vec(out, n * k), vals))
+	Ok(Scored { preds: download_vec(out, n * k), vals })
 }
 
 #[derive(Clone, Copy)]
@@ -471,33 +420,6 @@ pub struct YScaler {
 pub struct Scored {
 	pub preds: Vec<f64>,
 	pub vals: Vec<f64>,
-}
-
-pub fn infer_scored_struct(
-	params: &[LayerParams],
-	xbuf: &GpuBuffer,
-	x_cat: Option<&GpuBuffer>,
-	n: usize,
-	yscaler: Option<YScaler>,
-	ybuf: Option<&GpuBuffer>,
-	loss: Loss,
-	lr: f64,
-	metrics: &[Metric],
-	ss_tot: f64,
-) -> anyhow::Result<Scored> {
-	let (preds, vals) = infer_scored(
-		params,
-		xbuf,
-		x_cat,
-		n,
-		yscaler.map(|s| (s.mean, s.std)),
-		ybuf,
-		loss,
-		lr,
-		metrics,
-		ss_tot,
-	)?;
-	Ok(Scored { preds, vals })
 }
 
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {

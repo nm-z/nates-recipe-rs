@@ -202,6 +202,16 @@ fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 	Ok(())
 }
 
+pub struct SmoModel {
+	pub alpha: Vec<f64>,
+	pub b: f64,
+}
+
+struct Bounds {
+	lo: f64,
+	hi: f64,
+}
+
 pub fn gpu_smo_train(
 	x: &GpuBuffer,
 	y_pm1: &[f64],
@@ -214,7 +224,7 @@ pub fn gpu_smo_train(
 	c: f64,
 	tol: f64,
 	max_iter: i32,
-) -> Result<(Vec<f64>, f64), HipError> {
+) -> Result<SmoModel, HipError> {
 	let y_buf = GpuBuffer::alloc(n)?;
 	y_buf.load(y_pm1)?;
 	let alpha_buf = GpuBuffer::alloc(n)?;
@@ -252,69 +262,84 @@ pub fn gpu_smo_train(
 		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
 		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
-		let (val_i, i) = (o[0], o[1] as usize);
+		let val_i = o[0];
+		let i = o[1] as usize;
 		gpu_smo_argmax(&score_j_buf, n, &argmax_out)?;
 		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
-		let (val_j, j) = (o[0], o[1] as usize);
-		if val_i - val_j < tol {
-			break;
-		}
+		let val_j = o[0];
+		let j = o[1] as usize;
+		match (val_i - val_j).partial_cmp(&tol) {
+			Some(std::cmp::Ordering::Less) => break,
+			Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) | None => {
+				gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, i, &krow_i)?;
+				gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, j, &krow_j)?;
+				let kii = read_at(&krow_i, i)?;
+				let kij = read_at(&krow_i, j)?;
+				let kjj = read_at(&krow_j, j)?;
 
-		gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, i, &krow_i)?;
-		gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, j, &krow_j)?;
-		let kii = read_at(&krow_i, i)?;
-		let kij = read_at(&krow_i, j)?;
-		let kjj = read_at(&krow_j, j)?;
+				let yi = y_pm1[i];
+				let yj = y_pm1[j];
+				let eta = kii + kjj - 2.0 * kij;
 
-		let yi = y_pm1[i];
-		let yj = y_pm1[j];
-		let eta = kii + kjj - 2.0 * kij;
+				let old_ai = alpha_host[i];
+				let old_aj = alpha_host[j];
 
-		let old_ai = alpha_host[i];
-		let old_aj = alpha_host[j];
+				let grad_diff = -(val_i - val_j);
+				let new_aj_raw = match eta.abs().partial_cmp(&1e-12) {
+					Some(std::cmp::Ordering::Greater) => old_aj + yj * grad_diff / eta,
+					Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => old_aj,
+				};
 
-		let grad_diff = -(val_i - val_j);
-		let new_aj_raw = if eta.abs() > 1e-12 {
-			old_aj + yj * grad_diff / eta
-		} else {
-			old_aj
-		};
+				let bounds = match (yi - yj).abs().partial_cmp(&1e-9) {
+					Some(std::cmp::Ordering::Less) => {
+						let s = old_ai + old_aj;
+						Bounds { lo: f64::max(0.0, s - c), hi: f64::min(c, s) }
+					}
+					Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) | None => {
+						let s = old_ai - old_aj;
+						Bounds { lo: f64::max(0.0, -s), hi: f64::min(c, c - s) }
+					}
+				};
 
-		let (lo, hi) = if (yi - yj).abs() < 1e-9 {
-			let s = old_ai + old_aj;
-			(f64::max(0.0, s - c), f64::min(c, s))
-		} else {
-			let s = old_ai - old_aj;
-			(f64::max(0.0, -s), f64::min(c, c - s))
-		};
+				let new_aj = new_aj_raw.clamp(bounds.lo, bounds.hi);
+				let new_ai = (old_ai + yi * yj * (old_aj - new_aj)).clamp(0.0, c);
 
-		let new_aj = new_aj_raw.clamp(lo, hi);
-		let new_ai = (old_ai + yi * yj * (old_aj - new_aj)).clamp(0.0, c);
+				let delta_ai = new_ai - old_ai;
+				let delta_aj = new_aj - old_aj;
+				let both_small = Some(())
+					.filter(|_u| delta_ai.abs() < 1e-12)
+					.filter(|_u| delta_aj.abs() < 1e-12);
+				match both_small {
+					Some(()) => break,
+					None => {
+						write1(&di_buf, yi * delta_ai)?;
+						write1(&dj_buf, yj * delta_aj)?;
+						gpu_smo_update_gradient_rows(&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf)?;
 
-		let delta_ai = new_ai - old_ai;
-		let delta_aj = new_aj - old_aj;
-		if delta_ai.abs() < 1e-12 && delta_aj.abs() < 1e-12 {
-			break;
-		}
+						alpha_host[i] = new_ai;
+						alpha_host[j] = new_aj;
 
-		write1(&di_buf, yi * delta_ai)?;
-		write1(&dj_buf, yj * delta_aj)?;
-		gpu_smo_update_gradient_rows(&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf)?;
+						let in_bounds_i = Some(new_ai).filter(|v| *v > 0.0 && *v < c);
+						for _slot in in_bounds_i.into_iter() {
+							b += -read_at(&grad_buf, i)? / yi;
+							b_count += 1;
+						}
 
-		alpha_host[i] = new_ai;
-		alpha_host[j] = new_aj;
-
-		if new_ai > 0.0 && new_ai < c {
-			b += -read_at(&grad_buf, i)? / yi;
-			b_count += 1;
-		}
-		if new_aj > 0.0 && new_aj < c {
-			b += -read_at(&grad_buf, j)? / yj;
-			b_count += 1;
+						let in_bounds_j = Some(new_aj).filter(|v| *v > 0.0 && *v < c);
+						for _slot in in_bounds_j.into_iter() {
+							b += -read_at(&grad_buf, j)? / yj;
+							b_count += 1;
+						}
+					}
+				}
+			}
 		}
 	}
 
-	let b_final = if b_count > 0 { b / b_count as f64 } else { 0.0 };
-	Ok((alpha_host, b_final))
+	let b_final = match b_count.cmp(&0) {
+		std::cmp::Ordering::Greater => b / b_count as f64,
+		std::cmp::Ordering::Equal | std::cmp::Ordering::Less => 0.0,
+	};
+	Ok(SmoModel { alpha: alpha_host, b: b_final })
 }

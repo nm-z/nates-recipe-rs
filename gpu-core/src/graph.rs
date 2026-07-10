@@ -110,17 +110,21 @@ pub fn gpu_neighbor_aggregate(
 ) -> Result<(), HipError> {
 	agg_out.memset_zero(n_nodes * feat * std::mem::size_of::<f64>())?;
 	deg_ws.memset_zero(n_nodes * std::mem::size_of::<f64>())?;
-	if mean != 0 {
-		unsafe {
-			launch_degree(
-				edge_dst.ptr_raw() as *const c_void,
-				deg_ws.ptr_raw(),
-				n_edges as i32,
-				std::ptr::null_mut(),
-			);
+	match Some(mean).filter(|m| *m != 0) {
+		Some(_run) => {
+			unsafe {
+				launch_degree(
+					edge_dst.ptr_raw() as *const c_void,
+					deg_ws.ptr_raw(),
+					n_edges as i32,
+					std::ptr::null_mut(),
+				);
+			}
+			crate::kernels::check_launch();
+			Ok::<(), HipError>(())
 		}
-		crate::kernels::check_launch();
-	}
+		None => Ok(()),
+	}?;
 	unsafe {
 		launch_neighbor_aggregate(
 			features.ptr_raw() as *const c_void,

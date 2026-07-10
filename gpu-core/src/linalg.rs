@@ -1,6 +1,7 @@
 use crate::hip::{HipError, check};
 use crate::kernels::{hipblas_handle, hipsolver_handle, safe_i32};
 use crate::memory::GpuBuffer;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
@@ -331,8 +332,14 @@ pub fn gpu_bmm_into(
 ) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
-	let op_a = if trans_a != 0 { OP_TRANS } else { OP_NONE };
-	let op_b = if trans_b != 0 { OP_TRANS } else { OP_NONE };
+	let op_a = match trans_a.cmp(&0) {
+		Ordering::Equal => OP_NONE,
+		Ordering::Less | Ordering::Greater => OP_TRANS,
+	};
+	let op_b = match trans_b.cmp(&0) {
+		Ordering::Equal => OP_NONE,
+		Ordering::Less | Ordering::Greater => OP_TRANS,
+	};
 	let status = unsafe {
 		hipblasDgemmStridedBatched(
 			hipblas_handle(),
@@ -765,21 +772,31 @@ struct CachedFftPlan {
 }
 unsafe impl Send for CachedFftPlan {}
 
-static FFT_CACHE: OnceLock<Mutex<HashMap<(i32, usize), CachedFftPlan>>> = OnceLock::new();
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct FftKey {
+	fft_type: i32,
+	n: usize,
+}
+
+static FFT_CACHE: OnceLock<Mutex<HashMap<FftKey, CachedFftPlan>>> = OnceLock::new();
 
 fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	let mut cache = FFT_CACHE
 		.get_or_init(|| Mutex::new(HashMap::new()))
 		.lock()
 		.expect("fft cache poisoned");
-	if let Some(entry) = cache.get(&(fft_type, n)) {
-		return Ok(entry.plan as *mut c_void);
+	let key = FftKey { fft_type, n };
+	let cached = cache.get(&key).map(|entry| entry.plan);
+	match cached {
+		Some(plan) => Ok(plan as *mut c_void),
+		None => {
+			let mut plan: *mut c_void = std::ptr::null_mut();
+			let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
+			check(status)?;
+			cache.insert(key, CachedFftPlan { plan: plan as usize });
+			Ok(plan)
+		}
 	}
-	let mut plan: *mut c_void = std::ptr::null_mut();
-	let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
-	check(status)?;
-	cache.insert((fft_type, n), CachedFftPlan { plan: plan as usize });
-	Ok(plan)
 }
 
 pub fn gpu_fft_c2c_1d(
@@ -789,10 +806,9 @@ pub fn gpu_fft_c2c_1d(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let plan = fft_plan(HIPFFT_Z2Z, n)?;
-	let direction = if forward != 0 {
-		HIPFFT_FORWARD
-	} else {
-		HIPFFT_BACKWARD
+	let direction = match forward.cmp(&0) {
+		Ordering::Equal => HIPFFT_BACKWARD,
+		Ordering::Less | Ordering::Greater => HIPFFT_FORWARD,
 	};
 	let status = unsafe { hipfftExecZ2Z(plan, input.ptr_raw(), out.ptr_raw(), direction) };
 	check(status)

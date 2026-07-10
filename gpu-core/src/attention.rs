@@ -9,6 +9,12 @@ fn check_launch() -> Result<(), HipError> {
 	check(err)
 }
 
+#[derive(Clone, Copy)]
+pub struct ConvOut {
+	pub h: usize,
+	pub w: usize,
+}
+
 pub fn conv_out_hw(
 	h: usize,
 	w: usize,
@@ -20,10 +26,10 @@ pub fn conv_out_hw(
 	pad_w: usize,
 	dil_h: usize,
 	dil_w: usize,
-) -> (usize, usize) {
+) -> ConvOut {
 	let out_h = (h + 2 * pad_h - dil_h * (kh - 1) - 1) / sh + 1;
 	let out_w = (w + 2 * pad_w - dil_w * (kw - 1) - 1) / sw + 1;
-	(out_h, out_w)
+	ConvOut { h: out_h, w: out_w }
 }
 
 
@@ -307,7 +313,7 @@ pub fn gpu_im2col_2d_ext(
 	dil_w: usize,
 	patches: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let (out_h, out_w) = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
+	let dims = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
 	unsafe {
 		launch_im2col_2d_ext(
 			x.ptr_raw() as *const c_void,
@@ -324,8 +330,8 @@ pub fn gpu_im2col_2d_ext(
 			pad_w as i32,
 			dil_h as i32,
 			dil_w as i32,
-			out_h as i32,
-			out_w as i32,
+			dims.h as i32,
+			dims.w as i32,
 			std::ptr::null_mut(),
 		);
 	}
@@ -348,7 +354,7 @@ pub fn gpu_col2im_2d_ext(
 	dil_w: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let (out_h, out_w) = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
+	let dims = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
 	unsafe {
 		launch_col2im_2d_ext(
 			patches.ptr_raw() as *const c_void,
@@ -365,8 +371,8 @@ pub fn gpu_col2im_2d_ext(
 			pad_w as i32,
 			dil_h as i32,
 			dil_w as i32,
-			out_h as i32,
-			out_w as i32,
+			dims.h as i32,
+			dims.w as i32,
 			std::ptr::null_mut(),
 		);
 	}

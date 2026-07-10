@@ -219,7 +219,7 @@ pub fn probe_gpu_child_record(dev: i32) -> Result<String> {
 
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
 	gpu_core::hip::set_device(dev)?;
-	let total = gpu_core::hip::mem_info_s()?.total;
+	let total = gpu_core::hip::mem_info()?.total;
 	Ok(GpuDev {
 		vram: total as u64,
 		pcie_gbs: bench_pcie_h2d()?,

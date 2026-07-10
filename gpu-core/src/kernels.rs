@@ -1446,18 +1446,18 @@ unsafe extern "C" {
 	);
 }
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 thread_local! {
     static HIPBLAS_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
     static HIPSOLVER_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(std::ptr::null_mut()) };
 }
 
-static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ATEXIT_REGISTERED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn atexit_gpu_shutdown() {
 	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);
-	let _ = unsafe { crate::hip::hipDeviceSynchronize() };
+	let _sync = unsafe { crate::hip::hipDeviceSynchronize() };
 	crate::memory::mark_shutting_down();
 	gpu_shutdown();
 }
@@ -1466,26 +1466,31 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 	crate::callspy::tick(&crate::callspy::HIPBLAS);
 	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
-		if !ptr.is_null() {
-			return ptr;
-		}
-		if !ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
-			unsafe extern "C" {
-				fn atexit(f: unsafe extern "C" fn()) -> i32;
+		match std::ptr::NonNull::new(ptr) {
+			Some(existing) => existing.as_ptr(),
+			None => {
+				Some(ATEXIT_REGISTERED.swap(1, Ordering::Relaxed))
+					.filter(|prev| *prev == 0)
+					.map(|_prev| {
+						unsafe extern "C" {
+							fn atexit(f: unsafe extern "C" fn()) -> i32;
+						}
+						let _atexit = unsafe { atexit(atexit_gpu_shutdown) };
+					})
+					.unwrap_or(());
+				let mut handle: *mut c_void = std::ptr::null_mut();
+				let status = unsafe { hipblasCreate(&mut handle) };
+				assert_eq!(
+					status, 0,
+					"hipblasCreate failed with status {}",
+					status
+				);
+				let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
+				assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
+				h.store(handle, Ordering::Relaxed);
+				handle
 			}
-			unsafe { atexit(atexit_gpu_shutdown) };
 		}
-		let mut handle: *mut c_void = std::ptr::null_mut();
-		let status = unsafe { hipblasCreate(&mut handle) };
-		assert_eq!(
-			status, 0,
-			"hipblasCreate failed with status {}",
-			status
-		);
-		let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
-		assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
-		h.store(handle, Ordering::Relaxed);
-		handle
 	})
 }
 
@@ -1497,18 +1502,20 @@ pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
 pub(crate) fn hipsolver_handle() -> *mut c_void {
 	HIPSOLVER_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
-		if !ptr.is_null() {
-			return ptr;
+		match std::ptr::NonNull::new(ptr) {
+			Some(existing) => existing.as_ptr(),
+			None => {
+				let mut handle: *mut c_void = std::ptr::null_mut();
+				let status = unsafe { hipsolverCreate(&mut handle) };
+				assert_eq!(
+					status, 0,
+					"hipsolverCreate failed with status {}",
+					status
+				);
+				h.store(handle, Ordering::Relaxed);
+				handle
+			}
 		}
-		let mut handle: *mut c_void = std::ptr::null_mut();
-		let status = unsafe { hipsolverCreate(&mut handle) };
-		assert_eq!(
-			status, 0,
-			"hipsolverCreate failed with status {}",
-			status
-		);
-		h.store(handle, Ordering::Relaxed);
-		handle
 	})
 }
 
@@ -1517,23 +1524,23 @@ pub fn gpu_shutdown() {
 	unsafe { crate::hip::hipDeviceSynchronize() };
 	HIPBLAS_HANDLE.with(|h| {
 		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
-		if !ptr.is_null() {
-			unsafe {
-				hipblasDestroy(ptr);
-			}
-		}
+		std::ptr::NonNull::new(ptr)
+			.map(|existing| unsafe {
+				hipblasDestroy(existing.as_ptr());
+			})
+			.unwrap_or(());
 	});
 	HIPSOLVER_HANDLE.with(|h| {
 		let ptr = h.swap(std::ptr::null_mut(), Ordering::Relaxed);
-		if !ptr.is_null() {
-			unsafe {
-				hipsolverDestroy(ptr);
-			}
-		}
+		std::ptr::NonNull::new(ptr)
+			.map(|existing| unsafe {
+				hipsolverDestroy(existing.as_ptr());
+			})
+			.unwrap_or(());
 	});
 	crate::memory::free_bounce();
 	crate::memory::free_run_pin();
-	let _ = crate::hip::trim_mempool(0);
+	let _trim = crate::hip::trim_mempool(0);
 	eprint!("{}", crate::callspy::report());
 }
 
@@ -1965,7 +1972,10 @@ pub fn gpu_tri_solve(
 ) -> Result<(), HipError> {
 	gpu_copy_into(b, n * nrhs, out)?;
 	let alpha = 1.0_f64;
-	let trans_flag = if trans != 0 { 112u32 } else { 111u32 };
+	let trans_flag = match trans.cmp(&0) {
+		std::cmp::Ordering::Equal => 111u32,
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => 112u32,
+	};
 	let status = unsafe {
 		hipblasDtrsm(
 			hipblas_handle(),
@@ -2439,46 +2449,49 @@ pub fn gpu_linear_into(
 			std::ptr::null_mut(),
 		);
 	}
-	if n <= 16 {
-		unsafe {
-			crate::math_ops::launch_tall_skinny_dgemm(
-				x.ptr as *const c_void,
-				w.ptr as *const c_void,
-				out.ptr as *mut c_void,
-				m as i32, n as i32, k as i32,
-				std::ptr::null_mut(),
-			);
+	match n.cmp(&16) {
+		std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+			unsafe {
+				crate::math_ops::launch_tall_skinny_dgemm(
+					x.ptr as *const c_void,
+					w.ptr as *const c_void,
+					out.ptr as *mut c_void,
+					m as i32, n as i32, k as i32,
+					std::ptr::null_mut(),
+				);
+			}
+			check_launch();
+			Ok(())
 		}
-		check_launch();
-		Ok(())
-	} else {
-		let alpha = 1.0_f64;
-		let beta = 1.0_f64;
-		let status = unsafe {
-			hipblasDgemm(
-				hipblas_handle(),
-				HIPBLAS_OP_N,
-				HIPBLAS_OP_N,
-				n as i32,
-				m as i32,
-				k as i32,
-				&alpha,
-				w.ptr as *const f64,
-				n as i32,
-				x.ptr as *const f64,
-				k as i32,
-				&beta,
-				out.ptr as *mut f64,
-				n as i32,
-			)
-		};
-		check(status)
+		std::cmp::Ordering::Greater => {
+			let alpha = 1.0_f64;
+			let beta = 1.0_f64;
+			let status = unsafe {
+				hipblasDgemm(
+					hipblas_handle(),
+					HIPBLAS_OP_N,
+					HIPBLAS_OP_N,
+					n as i32,
+					m as i32,
+					k as i32,
+					&alpha,
+					w.ptr as *const f64,
+					n as i32,
+					x.ptr as *const f64,
+					k as i32,
+					&beta,
+					out.ptr as *mut f64,
+					n as i32,
+				)
+			};
+			check(status)
+		}
 	}
 }
 
 pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_ss_res(
@@ -2495,7 +2508,7 @@ pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffe
 
 pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_mse(
@@ -2512,7 +2525,7 @@ pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) 
 
 pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_accuracy_metric(
@@ -2556,7 +2569,7 @@ pub fn gpu_argmax_accuracy_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _ = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	unsafe {
 		launch_argmax_acc(
@@ -2699,10 +2712,9 @@ pub fn gpu_dgemv_into(
 	trans: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let op = if trans != 0 {
-		HIPBLAS_OP_N
-	} else {
-		HIPBLAS_OP_T
+	let op = match trans.cmp(&0) {
+		std::cmp::Ordering::Equal => HIPBLAS_OP_T,
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => HIPBLAS_OP_N,
 	};
 	let alpha = 1.0_f64;
 	let beta = 0.0_f64;
@@ -2728,7 +2740,7 @@ pub fn gpu_dgemv_into(
 
 pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, n: usize, in_dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		let _ = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
 	}
 	let alpha = 1.0_f64;
 	let status = unsafe {
@@ -3385,10 +3397,9 @@ pub fn gpu_tree_build_into(
 	let isz = std::mem::size_of::<i32>();
 	let fsz = std::mem::size_of::<f64>();
 	let max_nodes = (1usize << (max_depth + 1)) - 1;
-	let max_level = if max_depth <= 1 {
-		1usize
-	} else {
-		1usize << (max_depth - 1)
+	let max_level = match max_depth.cmp(&1) {
+		std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 1usize,
+		std::cmp::Ordering::Greater => 1usize << (max_depth - 1),
 	};
 	let hist_elems = max_level * p * n_bins;
 
@@ -5662,28 +5673,34 @@ pub fn gpu_add_col(
 	gpu_slice_cols(&out, n, cols, k, 1, &old_col)?;
 	let new_col = GpuBuffer::alloc(n)?;
 	gpu_add_into(&old_col, col, n, &new_col)?;
-	if k == 0 {
-		let right = GpuBuffer::alloc(n * (cols - 1))?;
-		gpu_slice_cols(&out, n, cols, 1, cols - 1, &right)?;
-		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat_into(&new_col, &right, n, 1, cols - 1, &result)?;
-		Ok(result)
-	} else if k == cols - 1 {
-		let left = GpuBuffer::alloc(n * (cols - 1))?;
-		gpu_slice_cols(&out, n, cols, 0, cols - 1, &left)?;
-		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat_into(&left, &new_col, n, cols - 1, 1, &result)?;
-		Ok(result)
-	} else {
-		let left = GpuBuffer::alloc(n * k)?;
-		gpu_slice_cols(&out, n, cols, 0, k, &left)?;
-		let right = GpuBuffer::alloc(n * (cols - k - 1))?;
-		gpu_slice_cols(&out, n, cols, k + 1, cols - k - 1, &right)?;
-		let tmp = GpuBuffer::alloc(n * (k + 1))?;
-		gpu_concat_into(&left, &new_col, n, k, 1, &tmp)?;
-		let result = GpuBuffer::alloc(n * cols)?;
-		gpu_concat_into(&tmp, &right, n, k + 1, cols - k - 1, &result)?;
-		Ok(result)
+	match k {
+		0 => {
+			let right = GpuBuffer::alloc(n * (cols - 1))?;
+			gpu_slice_cols(&out, n, cols, 1, cols - 1, &right)?;
+			let result = GpuBuffer::alloc(n * cols)?;
+			gpu_concat_into(&new_col, &right, n, 1, cols - 1, &result)?;
+			Ok(result)
+		}
+		pos => match pos.cmp(&(cols - 1)) {
+			std::cmp::Ordering::Equal => {
+				let left = GpuBuffer::alloc(n * (cols - 1))?;
+				gpu_slice_cols(&out, n, cols, 0, cols - 1, &left)?;
+				let result = GpuBuffer::alloc(n * cols)?;
+				gpu_concat_into(&left, &new_col, n, cols - 1, 1, &result)?;
+				Ok(result)
+			}
+			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+				let left = GpuBuffer::alloc(n * k)?;
+				gpu_slice_cols(&out, n, cols, 0, k, &left)?;
+				let right = GpuBuffer::alloc(n * (cols - k - 1))?;
+				gpu_slice_cols(&out, n, cols, k + 1, cols - k - 1, &right)?;
+				let tmp = GpuBuffer::alloc(n * (k + 1))?;
+				gpu_concat_into(&left, &new_col, n, k, 1, &tmp)?;
+				let result = GpuBuffer::alloc(n * cols)?;
+				gpu_concat_into(&tmp, &right, n, k + 1, cols - k - 1, &result)?;
+				Ok(result)
+			}
+		},
 	}
 }
 
@@ -5704,17 +5721,17 @@ pub fn gpu_report(
 	for i in 0..n {
 		let c = val_targets[i] as usize;
 		total[c] += 1.0;
-		if preds_cpu[i] as usize == c {
-			correct[c] += 1.0;
-		}
+		correct[c] += match (preds_cpu[i] as usize).cmp(&c) {
+			std::cmp::Ordering::Equal => 1.0,
+			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => 0.0,
+		};
 	}
 	let ba: f64 = (0..nc)
-		.map(|k| {
-			if total[k] > 0.0 {
-				correct[k] / total[k]
-			} else {
-				0.0
-			}
+		.map(|k| match total[k].partial_cmp(&0.0) {
+			Some(std::cmp::Ordering::Greater) => correct[k] / total[k],
+			Some(std::cmp::Ordering::Equal)
+			| Some(std::cmp::Ordering::Less)
+			| None => 0.0,
 		})
 		.sum::<f64>()
 		/ nc as f64;

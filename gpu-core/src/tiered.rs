@@ -25,7 +25,7 @@ pub struct Full {
 }
 
 impl std::fmt::Display for Full {
-      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      fn fmt<'f>(&self, f: &mut std::fmt::Formatter<'f>) -> std::fmt::Result {
             write!(
                   f,
                   "buffer {} exceeds VRAM+RAM+disk ceiling {}",
@@ -47,7 +47,7 @@ pub struct Budgets {
 
 impl Budgets {
       pub fn measure(weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Self {
-            let (_free, total) = vram_total_free();
+            let total = vram_total_free().total;
             let vram_data = total
                   .saturating_sub(weights_bytes)
                   .saturating_sub(grad_bytes)
@@ -67,29 +67,30 @@ impl Budgets {
 
 pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Result<Budgets, Full> {
       let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
-      if b > bud.cap {
-            Err(Full { need: b, cap: bud.cap })
-      } else {
-            Ok(bud)
+      match b.cmp(&bud.cap) {
+            std::cmp::Ordering::Greater => Err(Full { need: b, cap: bud.cap }),
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(bud),
       }
 }
 
-fn vram_total_free() -> (usize, usize) {
-      let (mut free, mut total) = (0usize, 0usize);
+fn vram_total_free() -> hip::MemInfo {
+      let mut free = 0usize;
+      let mut total = 0usize;
       crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
       unsafe { hip::hipMemGetInfo(&mut free, &mut total) };
-      (free, total)
+      hip::MemInfo { free, total }
 }
 
 fn meminfo_free() -> usize {
       let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
       for l in s.lines() {
-            if let Some(r) = l.strip_prefix("MemAvailable:") {
-                  if let Some(kb) = r.split_whitespace().next().and_then(|v| v.parse::<usize>().ok())
-                  {
-                        return kb.saturating_mul(1024);
-                  }
-            }
+            let Some(r) = l.strip_prefix("MemAvailable:") else {
+                  continue;
+            };
+            let Some(kb) = r.split_whitespace().next().and_then(|v| v.parse::<usize>().ok()) else {
+                  continue;
+            };
+            return kb.saturating_mul(1024);
       }
       0
 }
@@ -101,10 +102,13 @@ fn disk_free(spill: &Path) -> usize {
             return 0;
       };
       let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-      if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-            return 0;
+      let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+      match rc.cmp(&0) {
+            std::cmp::Ordering::Equal => {
+                  (st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
+            }
+            std::cmp::Ordering::Less | std::cmp::Ordering::Greater => 0,
       }
-      (st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
 }
 
 pub struct Tiered {
@@ -135,16 +139,18 @@ impl Tiered {
             spill: &Path,
       ) -> Result<Self, Full> {
             let budgets = Budgets::measure(weights_bytes, grad_bytes, spill);
-            if b > budgets.cap {
-                  return Err(Full {
+            match b.cmp(&budgets.cap) {
+                  std::cmp::Ordering::Greater => Err(Full {
                         need: b,
                         cap: budgets.cap,
-                  });
+                  }),
+                  std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        let n_pg = b.div_ceil(P);
+                        let n_vram = n_pg.min(budgets.n_v);
+                        let n_ram = (n_pg - n_vram).min(budgets.n_r);
+                        Ok(Self::build(b, n_pg, n_vram, n_ram, budgets, spill))
+                  }
             }
-            let n_pg = b.div_ceil(P);
-            let n_vram = n_pg.min(budgets.n_v);
-            let n_ram = (n_pg - n_vram).min(budgets.n_r);
-            Ok(Self::build(b, n_pg, n_vram, n_ram, budgets, spill))
       }
 
       pub fn alloc_capped(b: usize, n_v: usize, n_r: usize, spill: &Path) -> Self {
@@ -165,24 +171,21 @@ impl Tiered {
       ) -> Self {
             let n_disk = n_pg - n_vram - n_ram;
 
-            let (va, handles) = reserve_and_map(n_vram).expect("vmm reserve/map");
+            let mapping = reserve_and_map(n_vram).expect("vmm reserve/map");
+            let va = mapping.va;
+            let handles = mapping.handles;
             crate::memory::tag_note_alloc("tiered-vram", handles.len() * P);
             let slot_page: Vec<Option<usize>> = (0..n_vram).map(Some).collect();
 
-            let ram: Vec<Box<[u8]>> = (0..n_ram).map(|_| vec![0u8; P].into_boxed_slice()).collect();
+            let ram: Vec<Box<[u8]>> = (0..n_ram).map(|_k| vec![0u8; P].into_boxed_slice()).collect();
 
-            let disk = if n_disk > 0 {
-                  let f = File::options()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(spill)
-                        .expect("open spill file");
-                  f.set_len((n_disk * P) as u64).expect("size spill file");
-                  Some(f)
-            } else {
-                  None
+            let disk = match n_disk.cmp(&0) {
+                  std::cmp::Ordering::Greater => {
+                        let f = crate::bridge::open_spill(spill).expect("open spill file");
+                        f.set_len((n_disk * P) as u64).expect("size spill file");
+                        Some(f)
+                  }
+                  std::cmp::Ordering::Less | std::cmp::Ordering::Equal => None,
             };
 
             let mut res = Vec::with_capacity(n_pg);
@@ -240,11 +243,13 @@ impl Tiered {
             assert!(src.len() <= self.b, "fill src longer than buffer");
             for p in 0..self.n_pg {
                   let lo = p * P;
-                  if lo >= src.len() {
-                        break;
+                  match lo.cmp(&src.len()) {
+                        std::cmp::Ordering::Less => {
+                              let hi = (lo + P).min(src.len());
+                              self.write_page(p, &src[lo..hi]);
+                        }
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break,
                   }
-                  let hi = (lo + P).min(src.len());
-                  self.write_page(p, &src[lo..hi]);
             }
       }
 
@@ -326,39 +331,41 @@ impl Tiered {
             let mut disk_scratch = vec![0u8; P];
             for k in 0..n_pages {
                   let p = first_page + k;
-                  if p >= self.n_pg {
-                        break;
-                  }
-                  let bytes = P.min(self.b - p * P);
-                  let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
-                  match self.res[p] {
-                        Residence::Vram(s) => unsafe {
-                              let src = (self.va as *mut u8).add(s as usize * P) as *const c_void;
-                              crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
-                                    .expect("stage D2D");
-                        },
-                        Residence::Ram(i) => unsafe {
-                              let src = self.ram[i as usize].as_ptr() as *const c_void;
-                              crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
-                                    .expect("stage H2D");
-                        },
-                        Residence::Disk(off) => {
-                              self.disk
-                                    .as_ref()
-                                    .expect("disk tier")
-                                    .read_exact_at(&mut disk_scratch[..bytes], off)
-                                    .expect("stage read");
-                              unsafe {
-                                    crate::memory::xfer(
-                                          dst,
-                                          disk_scratch.as_ptr() as *const c_void,
-                                          bytes,
-                                          hip::HIP_MEMCPY_H2D,
-                                          std::ptr::null_mut(),
-                                    )
-                                    .expect("stage disk H2D");
+                  match p.cmp(&self.n_pg) {
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break,
+                        std::cmp::Ordering::Less => {
+                              let bytes = P.min(self.b - p * P);
+                              let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
+                              match self.res[p] {
+                                    Residence::Vram(s) => unsafe {
+                                          let src = (self.va as *mut u8).add(s as usize * P) as *const c_void;
+                                          crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+                                                .expect("stage D2D");
+                                    },
+                                    Residence::Ram(i) => unsafe {
+                                          let src = self.ram[i as usize].as_ptr() as *const c_void;
+                                          crate::memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_H2D, std::ptr::null_mut())
+                                                .expect("stage H2D");
+                                    },
+                                    Residence::Disk(off) => {
+                                          self.disk
+                                                .as_ref()
+                                                .expect("disk tier")
+                                                .read_exact_at(&mut disk_scratch[..bytes], off)
+                                                .expect("stage read");
+                                          unsafe {
+                                                crate::memory::xfer(
+                                                      dst,
+                                                      disk_scratch.as_ptr() as *const c_void,
+                                                      bytes,
+                                                      hip::HIP_MEMCPY_H2D,
+                                                      std::ptr::null_mut(),
+                                                )
+                                                .expect("stage disk H2D");
+                                          }
+                                    },
                               }
-                        },
+                        }
                   }
             }
       }
@@ -367,29 +374,35 @@ impl Tiered {
 impl Drop for Tiered {
       fn drop(&mut self) {
             crate::memory::tag_note_free("tiered-vram", self.slots * P);
-            for (s, h) in self.handles.iter().enumerate() {
+            for s in 0..self.handles.len() {
+                  let h = self.handles[s];
                   let va = unsafe { (self.va as *mut u8).add(s * P) as *mut c_void };
                   unsafe {
                         crate::callspy::tick(&crate::callspy::MEM_UNMAP);
                         hip::vmm_unmap(va, P);
                         crate::callspy::tick(&crate::callspy::MEM_RELEASE);
-                        hip::vmm_release(*h);
+                        hip::vmm_release(h);
                   }
             }
-            if !self.va.is_null() && self.slots > 0 {
+            for _region in std::ptr::NonNull::new(self.va).filter(|_p| self.slots > 0).into_iter() {
                   crate::callspy::tick(&crate::callspy::MEM_ADDRESS_FREE);
                   unsafe { hip::vmm_addr_free(self.va, self.slots * P) };
             }
-            if self.disk.is_some() {
-                  let _ = std::fs::remove_file(&self.spill_path);
+            for _f in self.disk.as_ref().into_iter() {
+                  std::fs::remove_file(&self.spill_path).ok().unwrap_or(());
             }
       }
 }
 
-fn reserve_and_map(slots: usize) -> Result<(*mut c_void, Vec<*mut c_void>), HipError> {
-      if slots == 0 {
-            return Ok((std::ptr::null_mut(), Vec::new()));
-      }
+struct Mapping {
+      va: *mut c_void,
+      handles: Vec<*mut c_void>,
+}
+
+fn reserve_and_map(slots: usize) -> Result<Mapping, HipError> {
+      let Some(_count) = std::num::NonZeroUsize::new(slots) else {
+            return Ok(Mapping { va: std::ptr::null_mut(), handles: Vec::new() });
+      };
       let mut va: *mut c_void = std::ptr::null_mut();
       crate::callspy::tick(&crate::callspy::MEM_ADDRESS_RESERVE);
       hip::check(unsafe { hip::vmm_reserve(&mut va, slots * P) })?;
@@ -404,12 +417,13 @@ fn reserve_and_map(slots: usize) -> Result<(*mut c_void, Vec<*mut c_void>), HipE
             hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })?;
             handles.push(h);
       }
-      Ok((va, handles))
+      Ok(Mapping { va, handles })
 }
 
 pub fn human(b: usize) -> String {
       const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-      let (mut v, mut i) = (b as f64, 0);
+      let mut v = b as f64;
+      let mut i = 0;
       while v >= 1024.0 && i < 4 {
             v /= 1024.0;
             i += 1;

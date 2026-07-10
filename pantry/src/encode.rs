@@ -20,21 +20,13 @@ pub struct Dataset {
 	pub n_targets: usize,
 	pub has_target: bool,
 	pub text_cols: Vec<usize>,
-	pub onehot_groups: Vec<(usize, usize)>,
+	pub onehot_groups: Vec<GroupSpan>,
 }
 
+#[derive(Clone, Copy)]
 pub struct GroupSpan {
 	pub start: usize,
 	pub len: usize,
-}
-
-impl Dataset {
-	pub fn onehot_spans(&self) -> Vec<GroupSpan> {
-		self.onehot_groups
-			.iter()
-			.map(|&(start, len)| GroupSpan { start, len })
-			.collect()
-	}
 }
 
 fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
@@ -114,7 +106,7 @@ fn infer_attrs(
 	headers: &[String],
 	rows: &[Vec<String>],
 	known: Option<&[Attr]>,
-	pre: Option<&[(String, usize)]>,
+	pre: Option<&[ColKind]>,
 ) -> Vec<Attr> {
 	let non_empty: Vec<Vec<&str>> = (0..headers.len())
 		.map(|j| {
@@ -132,14 +124,14 @@ fn infer_attrs(
 	// is a wiring bug, not a cue to run the detector mid-run.
 	let preds: Vec<usize> = match pre {
 		Some(pre) => {
-			if pre.len() != headers.len() || pre.iter().zip(headers).any(|((h, _), name)| h != name) {
+			if pre.len() != headers.len() || pre.iter().zip(headers).any(|(c, name)| &c.header != name) {
 				panic!(
 					"detect_kinds drift: precomputed [{}] != parsed [{}]",
-					pre.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", "),
+					pre.iter().map(|c| c.header.as_str()).collect::<Vec<_>>().join(", "),
 					headers.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
 				);
 			}
-			to_predict.iter().map(|&j| pre[j].1).collect()
+			to_predict.iter().map(|&j| pre[j].kind).collect()
 		}
 		None if to_predict.is_empty() => Vec::new(),
 		None => panic!(
@@ -495,16 +487,25 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
 
 /// One table group's kinds, detected at `Data::set` time: the group name and its
-/// per-column `(header, kind int)` (positional to the group's headers).
-pub type GroupKinds = (String, Vec<(String, usize)>);
+/// per-column kinds (positional to the group's headers).
+pub struct GroupKinds {
+	pub name: String,
+	pub cols: Vec<ColKind>,
+}
+
+/// One column's detected kind: its header name and the kind integer.
+pub struct ColKind {
+	pub header: String,
+	pub kind: usize,
+}
 /// Detected kinds for every table group of a `Data` source set. Threads from the
 /// builder into `infer_attrs` so the detector's GPU classification runs at load
 /// time, not inside the training run's measured init window.
 pub type PreKinds = Vec<GroupKinds>;
 
 /// Precomputed kinds for one group, matched by group name.
-fn group_pre<'a>(pre: Option<&'a [GroupKinds]>, name: &str) -> Option<&'a [(String, usize)]> {
-	pre.and_then(|p| p.iter().find(|(n, _)| n == name).map(|(_, k)| k.as_slice()))
+fn group_pre<'a>(pre: Option<&'a [GroupKinds]>, name: &str) -> Option<&'a [ColKind]> {
+	pre.and_then(|p| p.iter().find(|g| g.name == name).map(|g| g.cols.as_slice()))
 }
 
 struct Assembled {
@@ -612,7 +613,7 @@ fn encode_group(
 	schema_in: Option<&Schema>,
 	target_cols: &[usize],
 	exclude: &[String],
-	pre: Option<&[(String, usize)]>,
+	pre: Option<&[ColKind]>,
 ) -> anyhow::Result<(Vec<String>, Mat, Vec1, usize)> {
 	Ok(match g {
 		DirGroup::Table {
@@ -902,6 +903,11 @@ fn col_after(c: &str) -> &str {
 	c.split_once(':').map_or(c, |(_, s)| s)
 }
 
+pub struct Split {
+	pub train: Dataset,
+	pub test: Dataset,
+}
+
 pub fn shuffle_split(
 	x: &Mat,
 	y: &Vec1,
@@ -909,8 +915,8 @@ pub fn shuffle_split(
 	train_frac: f64,
 	source: &str,
 	text_cols: &[usize],
-	onehot_groups: &[(usize, usize)],
-) -> (Dataset, Dataset) {
+	onehot_groups: &[GroupSpan],
+) -> Split {
 	let n = x.nrows();
 	let mut idx: Vec<usize> = (0..n).collect();
 	idx.shuffle(&mut ChaCha8Rng::seed_from_u64(42));
@@ -933,7 +939,7 @@ pub fn shuffle_split(
 			onehot_groups: onehot_groups.to_vec(),
 		}
 	};
-	(take(&idx[..n_train]), take(&idx[n_train..]))
+	Split { train: take(&idx[..n_train]), test: take(&idx[n_train..]) }
 }
 
 fn text_col_indices(feats: &[String]) -> Vec<usize> {
@@ -945,7 +951,7 @@ fn text_col_indices(feats: &[String]) -> Vec<usize> {
 		.collect()
 }
 
-fn onehot_group_indices(feats: &[String]) -> Vec<(usize, usize)> {
+fn onehot_group_indices(feats: &[String]) -> Vec<GroupSpan> {
 	let mut groups = Vec::new();
 	let mut i = 0;
 	while i < feats.len() {
@@ -955,7 +961,7 @@ fn onehot_group_indices(feats: &[String]) -> Vec<(usize, usize)> {
 			while i < feats.len() && feats[i].starts_with(prefix) {
 				i += 1;
 			}
-			groups.push((start, i - start));
+			groups.push(GroupSpan { start, len: i - start });
 		} else {
 			i += 1;
 		}
@@ -1057,17 +1063,17 @@ pub fn prepare_arff_data(
 	split_frac: Option<f64>,
 	test_path: Option<&str>,
 	source_label: &str,
-) -> anyhow::Result<(Dataset, Option<Dataset>)> {
+) -> anyhow::Result<PreparedArff> {
 	let skip = exclude_mask(attrs, "", exclude);
 	let (names, x, y, enc_k) = encode(attrs, rows, targets, &skip)?;
 	let k = enc_k.max(1);
 	let tc = text_col_indices(&names);
 	let oh = onehot_group_indices(&names);
-	Ok(if let Some(frac) = split_frac {
-		let (tr, te) = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
+	let (train, test) = if let Some(frac) = split_frac {
+		let Split { train: tr, test: te } = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
-		let (_, trows) = crate::data::parse_arff(tp);
+		let trows = crate::data::parse_arff(tp).rows;
 		let (_, tx, ty, _) = encode(attrs, &trows, targets, &skip)?;
 		(
 			Dataset {
@@ -1102,33 +1108,13 @@ pub fn prepare_arff_data(
 			},
 			None,
 		)
-	})
+	};
+	Ok(PreparedArff { train, test })
 }
 
 pub struct PreparedArff {
 	pub train: Dataset,
 	pub test: Option<Dataset>,
-}
-
-pub fn prepare_arff_data_t(
-	attrs: &[Attr],
-	rows: &[Vec<String>],
-	targets: &[usize],
-	exclude: &[String],
-	split_frac: Option<f64>,
-	test_path: Option<&str>,
-	source_label: &str,
-) -> anyhow::Result<PreparedArff> {
-	let (train, test) = prepare_arff_data(
-		attrs,
-		rows,
-		targets,
-		exclude,
-		split_frac,
-		test_path,
-		source_label,
-	)?;
-	Ok(PreparedArff { train, test })
 }
 
 /// Table path (CSV/dir/zip): load groups, resolve targets (via the caller's
@@ -1142,7 +1128,7 @@ pub fn prepare_table_data(
 	source_label: &str,
 	pre: Option<&[GroupKinds]>,
 	resolve: impl Fn(&[String], Option<&[String]>) -> anyhow::Result<Vec<String>>,
-) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
+) -> anyhow::Result<PreparedTable> {
 	let set_groups: Vec<DirGroup> = sources
 		.iter()
 		.flat_map(|s| crate::data::load_groups(s))
@@ -1200,7 +1186,7 @@ pub fn prepare_table_data(
 			text_cols: tc,
 			onehot_groups: oh_test,
 		};
-		return Ok((train, Some(testds), flat_attrs));
+		return Ok(PreparedTable { train, test: Some(testds), attrs: flat_attrs });
 	}
 
 	let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
@@ -1208,11 +1194,11 @@ pub fn prepare_table_data(
 	let tc = text_col_indices(&feats);
 	let oh = onehot_group_indices(&feats);
 	if let Some(frac) = split_frac {
-		let (tr, te) = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
-		return Ok((tr, Some(te), flat_attrs));
+		let Split { train: tr, test: te } = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
+		return Ok(PreparedTable { train: tr, test: Some(te), attrs: flat_attrs });
 	}
-	Ok((
-		Dataset {
+	Ok(PreparedTable {
+		train: Dataset {
 			x,
 			y: set.y,
 			source: source_label.to_string(),
@@ -1221,9 +1207,9 @@ pub fn prepare_table_data(
 			text_cols: tc,
 			onehot_groups: oh,
 		},
-		None,
-		flat_attrs,
-	))
+		test: None,
+		attrs: flat_attrs,
+	})
 }
 
 pub struct PreparedTable {
@@ -1232,23 +1218,3 @@ pub struct PreparedTable {
 	pub attrs: Vec<Attr>,
 }
 
-pub fn prepare_table_data_t(
-	sources: &[String],
-	test_path: Option<&str>,
-	split_frac: Option<f64>,
-	exclude: &[String],
-	source_label: &str,
-	pre: Option<&[GroupKinds]>,
-	resolve: impl Fn(&[String], Option<&[String]>) -> anyhow::Result<Vec<String>>,
-) -> anyhow::Result<PreparedTable> {
-	let (train, test, attrs) = prepare_table_data(
-		sources,
-		test_path,
-		split_frac,
-		exclude,
-		source_label,
-		pre,
-		resolve,
-	)?;
-	Ok(PreparedTable { train, test, attrs })
-}

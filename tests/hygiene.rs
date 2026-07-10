@@ -993,7 +993,26 @@ fn h35_no_binary_self_copies() {
       assert_absent("binary self-copy", &hits);
 }
 
-const NO_IF_TUPLE_ROOTS: &[&str] = &["src"];
+const NO_IF_TUPLE_ROOTS: &[&str] = &[
+      "src",
+      "build.rs",
+      "ogdl/src",
+      "gpu-core/src",
+      "gpu-core/build.rs",
+      "recipe-infer/src",
+      "recipe-infer/build.rs",
+      "pantry/src",
+      "pantry/build.rs",
+      "vramspy/src",
+];
+const NO_IF_TUPLE_EXEMPT: &[&str] = &["gpu-core/src/bridge.rs", "recipe-infer/src/bridge.rs"];
+
+fn ban_files() -> Vec<PathBuf> {
+      ban_files()
+            .into_iter()
+            .filter(|p| !allowed(p, NO_IF_TUPLE_EXEMPT))
+            .collect()
+}
 const TUPLE_CONTEXT_KEYWORDS: &[&str] = &["return", "in", "match", "move", "break", "for"];
 
 fn code_joined(p: &Path) -> String {
@@ -1116,9 +1135,9 @@ fn empty_arm_sites(code: &str) -> Vec<usize> {
 
 #[test]
 fn h36_no_if_or_wildcard_in_source() {
-      let banned = ["if", "_", "bool", "true", "false"];
+      let banned = ["if", "_", "bool", "true", "false", "union"];
       let mut hits = Vec::new();
-      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+      for p in ban_files() {
             let src = read(&p);
             let (m, is_test) = non_test_lines(&src);
             for l in 0..m.nlines() {
@@ -1159,7 +1178,7 @@ fn bool_position_hits(line: &str) -> Vec<String> {
 #[test]
 fn h40_no_bool_positions() {
       let mut hits = Vec::new();
-      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+      for p in ban_files() {
             let src = read(&p);
             let (m, is_test) = non_test_lines(&src);
             for l in 0..m.nlines() {
@@ -1176,7 +1195,7 @@ fn h40_no_bool_positions() {
 #[test]
 fn h37_no_tuple_in_source() {
       let mut hits = Vec::new();
-      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+      for p in ban_files() {
             let code = code_joined(&p);
             for i in tuple_sites(&code) {
                   hits.push(format!("{}:{} tuple", rel(&p), line_of(&code, i)));
@@ -1192,9 +1211,28 @@ fn h37_no_tuple_in_source() {
 }
 
 #[test]
+fn h41_no_integer_coded_bool() {
+      let banned = ["usize::from(", "once(()).take(", "checked_sub(1).into_iter("];
+      let mut hits = Vec::new();
+      for p in ban_files() {
+            let src = read(&p);
+            let (m, is_test) = non_test_lines(&src);
+            for l in 0..m.nlines() {
+                  let code = m.code_only(l);
+                  for pat in banned {
+                        if !is_test[l] && code.contains(pat) {
+                              hits.push(format!("{}:{} {pat}", rel(&p), l + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("integer-coded bool in source", &hits);
+}
+
+#[test]
 fn h39_no_then_combinator() {
       let mut hits = Vec::new();
-      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+      for p in ban_files() {
             let src = read(&p);
             let (m, is_test) = non_test_lines(&src);
             for l in 0..m.nlines() {
@@ -1210,7 +1248,7 @@ fn h39_no_then_combinator() {
 #[test]
 fn h38_no_empty_match_arm() {
       let mut hits = Vec::new();
-      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+      for p in ban_files() {
             let code = code_joined(&p);
             for l in empty_arm_sites(&code) {
                   hits.push(format!("{}:{}", rel(&p), l));

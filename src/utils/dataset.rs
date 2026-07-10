@@ -86,13 +86,13 @@ impl std::ops::Deref for Data {
 pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
-	let mut in_group = vec![0usize; ncols];
-	for grp in ds.onehot_spans() {
+	let mut in_group: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+	for grp in &ds.onehot_groups {
 		for c in grp.start..grp.start + grp.len {
-			in_group[c] = 1;
+			in_group.insert(c);
 		}
 	}
-	let passthrough: Vec<usize> = (0..ncols).filter(|c| in_group[*c] == 0).collect();
+	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group.contains(c)).collect();
 	let n_cat = ds.onehot_groups.len();
 	let new_ncols = passthrough.len() + n_cat;
 	let mut data = vec![0.0f64; n * new_ncols];
@@ -104,7 +104,7 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	}
 	let embed_start = passthrough.len();
 	let mut offset = 0usize;
-	let spans = ds.onehot_spans();
+	let spans = &ds.onehot_groups;
 	for g in 0..spans.len() {
 		let grp = &spans[g];
 		let new_j = embed_start + g;
@@ -130,16 +130,15 @@ enum FileFormat {
 }
 
 fn file_format(path: &str) -> FileFormat {
-	match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
-		Some("arff") => FileFormat::Arff,
-		Some("safetensors") => FileFormat::Safetensors,
-		_other => FileFormat::Table,
-	}
+	let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str());
+	let arff = ext.filter(|e| *e == "arff").and(Some(FileFormat::Arff));
+	let safet = ext.filter(|e| *e == "safetensors").and(Some(FileFormat::Safetensors));
+	arff.or(safet).unwrap_or(FileFormat::Table)
 }
 
 pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 	let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
-	let tensors = recipe_infer::safetensors::parse_safetensors_shaped_struct(&bytes)
+	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
 		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
 	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
 	let n = {
@@ -200,7 +199,7 @@ impl Data {
 		self.inner.sources.push(path.to_string());
 		match file_format(path) {
 			FileFormat::Arff => {
-				let table = crate::data::parse_arff_t(path);
+				let table = crate::data::parse_arff(path);
 				self.inner.attrs = table.attrs;
 				self.inner.rows = table.rows;
 			}
@@ -225,12 +224,12 @@ impl Data {
 		let Some(tp) = self.inner.test_path.clone() else {
 			return self;
 		};
-		let Ok(raw) = crate::data::read_raw_csv_t(std::path::Path::new(&tp)) else {
+		let Ok(raw) = crate::data::read_raw_csv(std::path::Path::new(&tp)) else {
 			return self;
 		};
-		match raw.headers.len() {
-			0 => return self,
-			_n => {
+		match raw.headers.len().checked_sub(1) {
+			None => return self,
+			Some(_last) => {
 				self.inner.raw_test_headers =
 					Some(raw.headers.into_iter().map(|h| h.trim().to_string()).collect());
 				self.inner.raw_test_rows = Some(raw.rows);
@@ -354,12 +353,9 @@ impl DataInner {
 		};
 		let raw_cols = attrs.len();
 		let types = self.feature_type_counts(attrs);
-		let print_types = |indent: &str| match types.as_slice() {
-			[only] => eprintln!("{indent}{} {}", only.count, only.label),
-			_rest => {
-				for tc in &types {
-					eprintln!("{indent}{} {}", tc.count, tc.label);
-				}
+		let print_types = |indent: &str| {
+			for tc in &types {
+				eprintln!("{indent}{} {}", tc.count, tc.label);
 			}
 		};
 		let set_rows = match self.split_frac {
@@ -454,7 +450,7 @@ impl DataInner {
 			.iter()
 			.map(|t| names.iter().position(|n| n == t).ok_or_else(|| anyhow::anyhow!("resolved from names")))
 			.collect::<anyhow::Result<Vec<usize>>>()?;
-		let prepared = pantry::encode::prepare_arff_data_t(
+		let prepared = pantry::encode::prepare_arff_data(
 			&self.attrs,
 			&self.rows,
 			&targets,
@@ -467,7 +463,7 @@ impl DataInner {
 	}
 
 	fn prepare_table(&self) -> anyhow::Result<PreparedSets> {
-		let prepared = pantry::encode::prepare_table_data_t(
+		let prepared = pantry::encode::prepare_table_data(
 			&self.sources,
 			self.test_path.as_deref(),
 			self.split_frac,

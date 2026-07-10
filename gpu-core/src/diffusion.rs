@@ -75,6 +75,11 @@ pub fn gpu_diffusion_commit(
 	e()
 }
 
+pub struct DiffusionSample {
+	pub canvas: GpuBuffer,
+	pub steps: usize,
+}
+
 pub fn gpu_diffusion_sample(
 	mut logits_fn: impl FnMut(&GpuBuffer) -> Result<GpuBuffer, HipError>,
 	initial_canvas: &GpuBuffer,
@@ -82,7 +87,7 @@ pub fn gpu_diffusion_sample(
 	max_steps: usize,
 	n_positions: usize,
 	vocab: usize,
-) -> Result<(GpuBuffer, usize), HipError> {
+) -> Result<DiffusionSample, HipError> {
 	let canvas = GpuBuffer::alloc(n_positions)?;
 	gpu_copy_into(initial_canvas, n_positions, &canvas)?;
 	let committed = GpuBuffer::alloc_bytes(n_positions * std::mem::size_of::<f64>())?;
@@ -108,9 +113,10 @@ pub fn gpu_diffusion_sample(
 		gpu_diffusion_commit(&accepted, &renoise, n_positions, &canvas, &committed)?;
 		unsafe { committed.download_async(&mut host, std::ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
-		if host.iter().all(|&c| c != 0.0) {
-			break;
+		match host.iter().find(|&&c| c == 0.0) {
+			None => break,
+			Some(_pending) => continue,
 		}
 	}
-	Ok((canvas, steps))
+	Ok(DiffusionSample { canvas, steps })
 }

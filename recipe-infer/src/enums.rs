@@ -43,10 +43,19 @@ impl Loss {
 		matches!(self, Loss::Ce | Loss::Bce | Loss::Focal)
 	}
 	pub fn score_key(self) -> &'static str {
-		if self.is_classification() {
-			"acc"
-		} else {
-			"r2"
+		match self {
+			Loss::Ce | Loss::Bce | Loss::Focal => "acc",
+			Loss::Mse | Loss::Mae | Loss::Huber => "r2",
+		}
+	}
+	pub fn name(self) -> &'static str {
+		match self {
+			Loss::Mse => "mse",
+			Loss::Mae => "mae",
+			Loss::Ce => "ce",
+			Loss::Bce => "bce",
+			Loss::Huber => "huber",
+			Loss::Focal => "focal",
 		}
 	}
 }
@@ -60,6 +69,52 @@ pub enum Metric {
 	Time,
 	R2,
 	Hip,
+}
+
+pub struct MetricFmt {
+	pub label: &'static str,
+	pub width: usize,
+}
+
+impl Metric {
+	pub fn fmt(self) -> MetricFmt {
+		match self {
+			Metric::Epoch => MetricFmt { label: "epoch", width: 5 },
+			Metric::Lr => MetricFmt { label: "lr", width: 7 },
+			Metric::Time => MetricFmt { label: "time", width: 9 },
+			Metric::Loss => MetricFmt { label: "loss", width: 7 },
+			Metric::Accuracy => MetricFmt { label: "acc", width: 6 },
+			Metric::R2 => MetricFmt { label: "r2", width: 8 },
+			Metric::Hip => MetricFmt { label: "hip", width: 0 },
+		}
+	}
+
+	pub fn render(self, v: f64) -> String {
+		let w = self.fmt().width;
+		v.partial_cmp(&v).map_or(
+			format!("{:>w$}", "N/A"),
+			|_finite| match self {
+				Metric::Epoch => format!("{:>w$}", v as usize),
+				Metric::Time => format!("{:>w$}", fmt_time(v)),
+				Metric::Hip => String::new(),
+				Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => format!("{v:>w$.4}"),
+			},
+		)
+	}
+}
+
+pub fn fmt_time(secs: f64) -> String {
+	let s = secs as u64;
+	let h = s / 3600;
+	let m = (s % 3600) / 60;
+	let sec = s % 60;
+	match h.checked_sub(1) {
+		Some(_hh) => format!("{h}h {m:02}m {sec:02}s"),
+		None => match m.checked_sub(1) {
+			Some(_mm) => format!("{m}m {sec:02}s"),
+			None => format!("{secs:.1}s"),
+		},
+	}
 }
 
 mod alias {

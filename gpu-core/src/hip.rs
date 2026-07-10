@@ -5,18 +5,23 @@ use std::fmt;
 pub struct HipError(pub i32);
 
 impl fmt::Display for HipError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+	fn fmt<'a>(&self, f: &mut fmt::Formatter<'a>) -> fmt::Result {
+		let &HipError(code) = self;
 		unsafe {
 			crate::callspy::tick(&crate::callspy::GET_ERROR_NAME);
 			crate::callspy::tick(&crate::callspy::GET_ERROR_STRING);
-			let name_ptr = hipGetErrorName(self.0);
-			let str_ptr = hipGetErrorString(self.0);
-			if !name_ptr.is_null() && !str_ptr.is_null() {
-				let name = CStr::from_ptr(name_ptr).to_string_lossy();
-				let msg = CStr::from_ptr(str_ptr).to_string_lossy();
-				write!(f, "{}: {} (code {})", name, msg, self.0)
-			} else {
-				write!(f, "HIP error code {}", self.0)
+			let name_ptr = hipGetErrorName(code);
+			let str_ptr = hipGetErrorString(code);
+			match std::ptr::NonNull::new(name_ptr.cast_mut()) {
+				Some(name_nn) => match std::ptr::NonNull::new(str_ptr.cast_mut()) {
+					Some(str_nn) => {
+						let name = CStr::from_ptr(name_nn.as_ptr()).to_string_lossy();
+						let msg = CStr::from_ptr(str_nn.as_ptr()).to_string_lossy();
+						write!(f, "{}: {} (code {})", name, msg, code)
+					}
+					None => write!(f, "HIP error code {}", code),
+				},
+				None => write!(f, "HIP error code {}", code),
 			}
 		}
 	}
@@ -24,29 +29,29 @@ impl fmt::Display for HipError {
 impl std::error::Error for HipError {}
 
 pub fn check(code: i32) -> Result<(), HipError> {
-	if code == 0 {
-		Ok(())
-	} else {
-		Err(HipError(code))
+	match code {
+		0 => Ok(()),
+		nonzero => Err(HipError(nonzero)),
 	}
 }
 
 pub fn cu_count() -> usize {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	static CU: AtomicUsize = AtomicUsize::new(0);
-	let cached = CU.load(Ordering::Relaxed);
-	if cached != 0 {
-		return cached;
+	match std::num::NonZeroUsize::new(CU.load(Ordering::Relaxed)) {
+		Some(cached) => cached.get(),
+		None => {
+			crate::gate::acquire();
+			crate::callspy::tick(&crate::callspy::GET_DEVICE_PROPERTIES);
+			let n = unsafe { hip_multiprocessor_count() };
+			assert!(
+				n > 0,
+				"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
+			);
+			CU.store(n as usize, Ordering::Relaxed);
+			n as usize
+		}
 	}
-	crate::gate::acquire();
-	crate::callspy::tick(&crate::callspy::GET_DEVICE_PROPERTIES);
-	let n = unsafe { hip_multiprocessor_count() };
-	assert!(
-		n > 0,
-		"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
-	);
-	CU.store(n as usize, Ordering::Relaxed);
-	n as usize
 }
 
 pub const HIP_MEMCPY_H2D: i32 = 1;
@@ -129,22 +134,17 @@ unsafe extern "C" {
 	) -> i32;
 }
 
-pub fn mem_info() -> Result<(usize, usize), HipError> {
-	crate::gate::acquire();
-	let mut free: usize = 0;
-	let mut total: usize = 0;
-	crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
-	check(unsafe { hipMemGetInfo(&mut free, &mut total) })?;
-	Ok((free, total))
-}
-
 pub struct MemInfo {
 	pub free: usize,
 	pub total: usize,
 }
 
-pub fn mem_info_s() -> Result<MemInfo, HipError> {
-	let (free, total) = mem_info()?;
+pub fn mem_info() -> Result<MemInfo, HipError> {
+	crate::gate::acquire();
+	let mut free: usize = 0;
+	let mut total: usize = 0;
+	crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
+	check(unsafe { hipMemGetInfo(&mut free, &mut total) })?;
 	Ok(MemInfo { free, total })
 }
 
@@ -157,7 +157,7 @@ pub fn device_synchronize() -> Result<(), HipError> {
 pub(crate) fn disable_sdma_once() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	ONCE.call_once(|| {
-		if std::env::var_os("HSA_ENABLE_SDMA").is_none() {
+		for _absent in Some(()).filter(|_u| std::env::var_os("HSA_ENABLE_SDMA").is_none()).into_iter() {
 			unsafe { std::env::set_var("HSA_ENABLE_SDMA", "0") };
 		}
 	});
@@ -180,36 +180,45 @@ struct HsaAmdEvent {
 	fault_reason_mask: u32,
 }
 
+struct FaultReason {
+	bit: u32,
+	name: &'static str,
+}
+
 extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i32 {
 	let e = unsafe { &*event };
-	if e.event_type == 0 {
-		const REASONS: [(u32, &str); 8] = [
-			(1 << 0, "page-not-present"),
-			(1 << 1, "read-only"),
-			(1 << 2, "nx"),
-			(1 << 3, "host-only"),
-			(1 << 4, "dram-ecc"),
-			(1 << 5, "imprecise"),
-			(1 << 6, "sram-ecc"),
-			(1 << 31, "hang"),
+	for _fault in Some(()).filter(|_u| e.event_type == 0).into_iter() {
+		const REASONS: [FaultReason; 8] = [
+			FaultReason { bit: 1 << 0, name: "page-not-present" },
+			FaultReason { bit: 1 << 1, name: "read-only" },
+			FaultReason { bit: 1 << 2, name: "nx" },
+			FaultReason { bit: 1 << 3, name: "host-only" },
+			FaultReason { bit: 1 << 4, name: "dram-ecc" },
+			FaultReason { bit: 1 << 5, name: "imprecise" },
+			FaultReason { bit: 1 << 6, name: "sram-ecc" },
+			FaultReason { bit: 1 << 31, name: "hang" },
 		];
 		let mut why = String::new();
-		for (bit, name) in REASONS {
-			if e.fault_reason_mask & bit != 0 {
-				if !why.is_empty() {
+		for reason in REASONS {
+			for _set in Some(()).filter(|_u| e.fault_reason_mask & reason.bit != 0).into_iter() {
+				for _sep in Some(()).filter(|_u| !why.is_empty()).into_iter() {
 					why.push('+');
 				}
-				why.push_str(name);
+				why.push_str(reason.name);
 			}
 		}
+		let va = e.virtual_address as usize;
 		let locate = match crate::memory::bounce_range() {
-			Some((b, len)) if (e.virtual_address as usize) >= b && (e.virtual_address as usize) < b + len => {
-				format!("INSIDE pinned h2d bounce (+0x{:x})", e.virtual_address as usize - b)
-			}
-			Some((b, _)) => format!("outside bounce (bounce base 0x{b:x})"),
+			Some(r) => match va.cmp(&r.base) {
+				std::cmp::Ordering::Less => format!("outside bounce (bounce base 0x{:x})", r.base),
+				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => match va.cmp(&(r.base + r.len)) {
+					std::cmp::Ordering::Less => format!("INSIDE pinned h2d bounce (+0x{:x})", va - r.base),
+					std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => format!("outside bounce (bounce base 0x{:x})", r.base),
+				},
+			},
 			None => "bounce not yet allocated".to_string(),
 		};
-		let locate = match crate::memory::locate_va(e.virtual_address as usize) {
+		let locate = match crate::memory::locate_va(va) {
 			Some(hit) => format!("{locate}; {hit}"),
 			None => format!("{locate}; va in NO recorded allocation"),
 		};
@@ -224,24 +233,22 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 }
 
 pub(crate) fn register_fault_autopsy_once() {
-	use std::sync::atomic::{AtomicBool, Ordering};
-	static REGISTERED: AtomicBool = AtomicBool::new(false);
-	if REGISTERED.load(Ordering::Relaxed) {
-		return;
-	}
-	let sym = unsafe {
-		libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
-	};
-	if sym.is_null() {
-		return;
-	}
-	type Register = extern "C" fn(
-		extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
-		*mut c_void,
-	) -> i32;
-	let register = unsafe { std::mem::transmute::<*mut c_void, Register>(sym) };
-	if register(fault_autopsy, std::ptr::null_mut()) == 0 {
-		REGISTERED.store(true, Ordering::Relaxed);
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	static REGISTERED: AtomicUsize = AtomicUsize::new(0);
+	for _first in Some(()).filter(|_u| REGISTERED.load(Ordering::Relaxed) == 0).into_iter() {
+		let sym = unsafe {
+			libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
+		};
+		for found in std::ptr::NonNull::new(sym).into_iter() {
+			type Register = extern "C" fn(
+				extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
+				*mut c_void,
+			) -> i32;
+			let register = unsafe { std::mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
+			for _ok in Some(()).filter(|_u| register(fault_autopsy, std::ptr::null_mut()) == 0).into_iter() {
+				REGISTERED.store(1, Ordering::Relaxed);
+			}
+		}
 	}
 }
 
@@ -267,8 +274,12 @@ pub fn sysfs_vram_free() -> Option<usize> {
 		let read = |f: &str| -> Option<usize> {
 			std::fs::read_to_string(dev.join(f)).ok()?.trim().parse().ok()
 		};
-		if let (Some(total), Some(used)) = (read("mem_info_vram_total"), read("mem_info_vram_used")) {
-			return Some(total.saturating_sub(used));
+		let total = read("mem_info_vram_total");
+		let used = read("mem_info_vram_used");
+		for got_total in total.into_iter() {
+			for got_used in used.into_iter() {
+				return Some(got_total.saturating_sub(got_used));
+			}
 		}
 	}
 	None

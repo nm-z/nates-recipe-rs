@@ -57,10 +57,9 @@ pub fn gpu_bootstrap_sample(
 	uniform_ws: &GpuBuffer,
 	n: usize,
 	n_samples: usize,
-	seed: usize,
+	_seed: usize,
 	idx_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let _ = seed;
 	unsafe {
 		launch_floor_scale_to_idx(
 			uniform_ws.ptr_raw() as *const c_void,

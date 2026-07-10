@@ -1,6 +1,6 @@
 use anyhow::Context;
 use crate::enums::{Activation, LayerKind, LayerSpec};
-use crate::params::{LayerDims, LayerParams, concat_layer};
+use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
@@ -76,11 +76,21 @@ pub struct Scratch {
 	timing_slot: std::cell::Cell<usize>,
 }
 
+pub struct LayerMs {
+	pub fwd: Vec<f64>,
+	pub bwd: Vec<f64>,
+}
+
+pub struct LayerEvents {
+	pub fwd: Vec<Vec<gpu_core::hip::Event>>,
+	pub bwd: Vec<Vec<gpu_core::hip::Event>>,
+}
+
 pub fn layer_ms_from(
 	ev_fwd: &[gpu_core::hip::Event],
 	ev_bwd: &[gpu_core::hip::Event],
 	layers: usize,
-) -> (Vec<f64>, Vec<f64>) {
+) -> LayerMs {
 	let f = (0..layers)
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
@@ -95,7 +105,7 @@ pub fn layer_ms_from(
 			e.unwrap_or(0.0) as f64
 		})
 		.collect();
-	(f, b)
+	LayerMs { fwd: f, bwd: b }
 }
 
 impl Scratch {
@@ -226,7 +236,7 @@ impl Scratch {
 		}
 		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
 		let (concat_sz, concat_grad_sz) = match concat_layer(params) {
-			Some((_, a, c)) => (n * (a + c), n * a),
+			Some(ConcatDims { a, c, .. }) => (n * (a + c), n * a),
 			None => (1, 1),
 		};
 		let mut max_conv_fsz = 0usize;
@@ -351,15 +361,15 @@ impl Scratch {
 		}
 	}
 
-	pub fn layer_ms(&self, layers: usize) -> (Vec<f64>, Vec<f64>) {
+	pub fn layer_ms(&self, layers: usize) -> LayerMs {
 		let s = self.timing_slot.get();
 		let r = self.ev_bwd[s][0].synchronize();
 		assert!(r.is_ok(), "sync bwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
-	pub fn take_events(&mut self) -> (Vec<Vec<gpu_core::hip::Event>>, Vec<Vec<gpu_core::hip::Event>>) {
-		(std::mem::take(&mut self.ev_fwd), std::mem::take(&mut self.ev_bwd))
+	pub fn take_events(&mut self) -> LayerEvents {
+		LayerEvents { fwd: std::mem::take(&mut self.ev_fwd), bwd: std::mem::take(&mut self.ev_bwd) }
 	}
 
 	pub fn download_scalar_deferred(&self) {
@@ -558,7 +568,7 @@ impl Scratch {
 		floats += 2 * bw(max_dd);
 		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1;
 		match crate::params::concat_layer_dims(params) {
-			Some((_, a, c)) => {
+			Some(ConcatDims { a, c, .. }) => {
 				floats += n * (a + c) + bw(n * a);
 			}
 			None => {

@@ -33,14 +33,21 @@ pub fn shutdown() {
 	gpu_core::kernels::gpu_shutdown();
 }
 
+struct ByteUnit {
+	floor: f64,
+	div: f64,
+	prec: usize,
+	label: &'static str,
+}
+
 pub fn human_bytes(b: usize) -> String {
 	const K: f64 = 1024.0;
 	let f = b as f64;
-	if f >= K * K * K {
-		format!("{:.2} GB", f / (K * K * K))
-	} else if f >= K * K {
-		format!("{:.1} MB", f / (K * K))
-	} else {
-		format!("{:.1} KB", f / K)
-	}
+	let units = [
+		ByteUnit { floor: K * K * K, div: K * K * K, prec: 2, label: "GB" },
+		ByteUnit { floor: K * K, div: K * K, prec: 1, label: "MB" },
+		ByteUnit { floor: 0.0, div: K, prec: 1, label: "KB" },
+	];
+	let pick = units.iter().find(|u| f >= u.floor).unwrap_or(&units[2]);
+	format!("{:.prec$} {}", f / pick.div, pick.label, prec = pick.prec)
 }

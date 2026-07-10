@@ -13,19 +13,13 @@ impl Node {
             Node { name: name.to_string(), children: Vec::new() }
       }
 
-      fn is_leaf(&self) -> bool {
-            self.children.is_empty()
-      }
-
       pub fn parse(text: &str) -> Node {
             let mut root = Node::leaf("");
             let mut path: Vec<usize> = Vec::new();
             let mut widths: Vec<usize> = Vec::new();
             for raw in text.lines() {
                   let content = raw.trim();
-                  if content.is_empty() {
-                        continue;
-                  }
+                  let Some(_c) = content.chars().next() else { continue };
                   let width = raw.len() - raw.trim_start().len();
                   while widths.last().is_some_and(|&w| w >= width) {
                         widths.pop();
@@ -62,16 +56,24 @@ impl Node {
       }
 
       fn step(&self, seg: &str) -> Option<&Node> {
-            if let Some(rest) = seg.strip_prefix('[') {
-                  let i: usize = rest.trim_end_matches(']').parse().ok()?;
-                  return self.children.get(i.wrapping_sub(1));
+            match seg.strip_prefix('[') {
+                  Some(rest) => {
+                        let i: usize = rest.trim_end_matches(']').parse().ok()?;
+                        self.children.get(i.wrapping_sub(1))
+                  }
+                  None => match seg.find('{') {
+                        Some(brace) => {
+                              let name = &seg[..brace];
+                              let sel = seg[brace + 1..].trim_end_matches('}');
+                              let nth: usize = match sel.chars().next() {
+                                    Some(_c) => sel.parse().ok()?,
+                                    None => 1,
+                              };
+                              self.children.iter().filter(|c| c.name == name).nth(nth.wrapping_sub(1))
+                        }
+                        None => self.children.iter().find(|c| c.name == seg),
+                  },
             }
-            if let Some((name, sel)) = seg.split_once('{') {
-                  let sel = sel.trim_end_matches('}');
-                  let nth: usize = if sel.is_empty() { 1 } else { sel.parse().ok()? };
-                  return self.children.iter().filter(|c| c.name == name).nth(nth.wrapping_sub(1));
-            }
-            self.children.iter().find(|c| c.name == seg)
       }
 
       pub(crate) fn select_mut(&mut self, path: &str) -> Option<&mut Node> {
@@ -84,39 +86,50 @@ impl Node {
       }
 
       fn step_index(&self, seg: &str) -> Option<usize> {
-            if let Some(rest) = seg.strip_prefix('[') {
-                  let i: usize = rest.trim_end_matches(']').parse().ok()?;
-                  return i.checked_sub(1).filter(|&i| i < self.children.len());
+            match seg.strip_prefix('[') {
+                  Some(rest) => {
+                        let i: usize = rest.trim_end_matches(']').parse().ok()?;
+                        i.checked_sub(1).filter(|&i| i < self.children.len())
+                  }
+                  None => match seg.find('{') {
+                        Some(brace) => {
+                              let name = &seg[..brace];
+                              let sel = seg[brace + 1..].trim_end_matches('}');
+                              let nth: usize = match sel.chars().next() {
+                                    Some(_c) => sel.parse().ok()?,
+                                    None => 1,
+                              };
+                              (0..self.children.len())
+                                    .filter(|&i| self.children[i].name == name)
+                                    .nth(nth.wrapping_sub(1))
+                        }
+                        None => self.children.iter().position(|c| c.name == seg),
+                  },
             }
-            if let Some((name, sel)) = seg.split_once('{') {
-                  let sel = sel.trim_end_matches('}');
-                  let nth: usize = if sel.is_empty() { 1 } else { sel.parse().ok()? };
-                  return self
-                        .children
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.name == name)
-                        .map(|(i, _)| i)
-                        .nth(nth.wrapping_sub(1));
-            }
-            self.children.iter().position(|c| c.name == seg)
       }
 
       fn write_to(&self, out: &mut String, depth: usize) {
             for c in &self.children {
-                  for _ in 0..depth {
+                  for _d in 0..depth {
                         out.push_str("    ");
                   }
                   out.push_str(&c.name);
-                  if !c.children.is_empty() && c.children.iter().all(Node::is_leaf) {
-                        for g in &c.children {
-                              out.push(' ');
-                              out.push_str(&g.name);
+                  let eligible = match c.children.iter().find(|g| !g.children.is_empty()) {
+                        Some(_nonleaf) => None,
+                        None => c.children.first(),
+                  };
+                  match eligible {
+                        Some(_first) => {
+                              for g in &c.children {
+                                    out.push(' ');
+                                    out.push_str(&g.name);
+                              }
+                              out.push('\n');
                         }
-                        out.push('\n');
-                  } else {
-                        out.push('\n');
-                        c.write_to(out, depth + 1);
+                        None => {
+                              out.push('\n');
+                              c.write_to(out, depth + 1);
+                        }
                   }
             }
       }
@@ -136,8 +149,8 @@ impl std::ops::Index<usize> for Node {
 }
 
 impl fmt::Display for Node {
-      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let vals: Vec<&str> = self.children.iter().filter(|c| c.is_leaf()).map(|c| c.name.as_str()).collect();
+      fn fmt<'z>(&self, f: &mut fmt::Formatter<'z>) -> fmt::Result {
+            let vals: Vec<&str> = self.children.iter().filter(|c| c.children.is_empty()).map(|c| c.name.as_str()).collect();
             f.write_str(&vals.join(" "))
       }
 }
@@ -226,14 +239,23 @@ pub trait DelArg {
       fn apply(self, g: Graph);
 }
 
-impl DelArg for (&str, &Node) {
+pub struct NamedChild<'a> {
+      pub name: &'a str,
+      pub parent: &'a Node,
+}
+
+impl<'a> DelArg for NamedChild<'a> {
       fn apply(self, g: Graph) {
-            let (name, parent) = self;
+            let name = self.name;
+            let parent = self.parent;
             g.with(|root| {
-                  if let Some(p) = root.select_mut(&parent.name) {
-                        p.children.retain(|c| c.name != name);
-                  } else {
-                        root.children.retain(|c| c.name != name);
+                  match root.select_mut(&parent.name) {
+                        Some(p) => {
+                              p.children.retain(|c| c.name != name);
+                        }
+                        None => {
+                              root.children.retain(|c| c.name != name);
+                        }
                   }
             });
       }
@@ -269,7 +291,7 @@ macro_rules! value {
             fn into_nodes(self) -> Vec<Node> { self.iter().map(|s| Node::leaf(s)).collect() }
       } )*};
 }
-value!(scalar: f64, i64, i32, usize, bool);
+value!(scalar: f64, i64, i32, usize);
 value!(str: &str, String, &String);
 value!(floats: Vec<f64>, &[f64]);
 value!(strs: Vec<String>, &[String]);
@@ -306,13 +328,16 @@ impl Graph {
       }
 
       pub fn file(&self, path: &str) -> Graph {
-            let empty = self.with(|root| root.children.is_empty());
-            if empty {
-                  let text = fs::read_to_string(path).unwrap_or_default();
-                  self.with(|root| *root = Node::parse(&text));
-            } else {
-                  let text = self.with(|root| root.serialize());
-                  let _ = fs::write(path, text);
+            let head = self.with(|root| root.children.first().map(|_c| ()));
+            match head {
+                  None => {
+                        let text = fs::read_to_string(path).unwrap_or_default();
+                        self.with(|root| *root = Node::parse(&text));
+                  }
+                  Some(_head) => {
+                        let text = self.with(|root| root.serialize());
+                        fs::write(path, text).ok();
+                  }
             }
             self.clone()
       }
@@ -342,10 +367,12 @@ pub mod __macro_support {
 
       pub fn del_all(g: &Graph, parent: &str, name: &str) -> Graph {
             g.with(|root: &mut Node| {
-                  let target = if parent.is_empty() { Some(&mut *root) } else { root.select_mut(parent) };
-                  if let Some(p) = target {
-                        p.children.retain(|c| c.name != name);
-                  }
+                  let target = match parent.chars().next() {
+                        None => Some(&mut *root),
+                        Some(_c) => root.select_mut(parent),
+                  };
+                  let Some(p) = target else { return };
+                  p.children.retain(|c| c.name != name);
             });
             g.clone()
       }

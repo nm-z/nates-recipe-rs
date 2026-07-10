@@ -43,7 +43,7 @@ struct Xfer {
 }
 
 fn xfer() -> Xfer {
-	let b = gpu_core::memory::xfer_bytes_named();
+	let b = gpu_core::memory::xfer_bytes();
 	Xfer { h2d: b.h2d, d2h: b.d2h }
 }
 
@@ -76,9 +76,9 @@ fn disk_free(path: &std::path::Path) -> usize {
 		return 0;
 	};
 	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-	let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) } {
-		0 => Ok(()),
-		_rc => Err(()),
+	let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) }.cmp(&0) {
+		std::cmp::Ordering::Equal => Ok(()),
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Err(()),
 	}) else {
 		return 0;
 	};
@@ -144,10 +144,17 @@ fn prelu_gate(act: &Activation) -> Option<()> {
 }
 
 fn interrupted() -> Interrupt {
-	match crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-		0 => Interrupt::No,
-		_set => Interrupt::Yes,
+	match crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst).cmp(&0) {
+		std::cmp::Ordering::Equal => Interrupt::No,
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Interrupt::Yes,
 	}
+}
+
+struct BwdWin {
+	da: GpuBuffer,
+	act_l: GpuBuffer,
+	dz: GpuBuffer,
+	m: usize,
 }
 
 pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = Window> {
@@ -351,8 +358,8 @@ struct Lane {
 	worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
-fn make_chan(depth: usize) -> gpu_core::memory::Chan<WriteMsg> {
-	gpu_core::memory::sync_chan::<WriteMsg>(depth)
+fn make_chan(depth: usize) -> gpu_core::bridge::Chan<WriteMsg> {
+	gpu_core::bridge::sync_chan::<WriteMsg>(depth)
 }
 
 struct Writer {
@@ -596,9 +603,10 @@ impl Ooc {
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
 		}
-		for _conv in max_conv_fsz.checked_sub(1).into_iter() {
-			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz));
-		}
+		ws = ws.max(match max_conv_fsz.cmp(&0) {
+			std::cmp::Ordering::Greater => kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz),
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+		});
 		let align256 = |b: usize| (b + 255) & !255;
 		WINS * align256(chunk * max_spb * 8)
 			+ 2 * align256(n * hs * 8)
@@ -673,9 +681,10 @@ impl Ooc {
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
 		}
-		for _conv in max_conv_fsz.checked_sub(1).into_iter() {
-			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz));
-		}
+		ws = ws.max(match max_conv_fsz.cmp(&0) {
+			std::cmp::Ordering::Greater => kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz),
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+		});
 
 		let wins: Vec<GpuBuffer> = (0..WINS)
 			.map(|_slot| GpuBuffer::alloc(chunk * max_spb).context("ooc window"))
@@ -827,29 +836,35 @@ impl Ooc {
 		let mut rate_disk_w = 0.0;
 		let mut rate_net_r = 0.0;
 		let mut rate_net_w = 0.0;
-		for _pcie in nonvram.checked_sub(1).into_iter() {
-			gpu_core::hip::device_synchronize().context("ooc calibrate sync")?;
-			let mut buf = pool_take(&host)?;
-			let t = std::time::Instant::now();
-			wins[0].write_u8(&buf[..wbytes]).context("calibrate h2d")?;
-			rate_h2d = bps(wbytes, t);
-			let t = std::time::Instant::now();
-			wins[0].download_u8(&mut buf[..wbytes]).context("calibrate d2h")?;
-			rate_d2h = bps(wbytes, t);
-			pool_give(&host, buf)?;
-		}
-		for _disk in disk_cursor.checked_sub(1).into_iter() {
-			let f = spill.as_ref().ok_or_else(|| anyhow::anyhow!("disk calibrate without spill file"))?;
-			let mut buf = pool_take(&host)?;
-			let t = std::time::Instant::now();
-			f.write_all_at(&buf[..wbytes], 0).context("calibrate spill write")?;
-			drop_cache(f, 0, wbytes);
-			rate_disk_w = bps(wbytes, t);
-			let t = std::time::Instant::now();
-			f.read_exact_at(&mut buf[..wbytes], 0).context("calibrate spill read")?;
-			rate_disk_r = bps(wbytes, t);
-			pool_give(&host, buf)?;
-		}
+		match nonvram.cmp(&0) {
+			std::cmp::Ordering::Greater => {
+				gpu_core::hip::device_synchronize().context("ooc calibrate sync")?;
+				let mut buf = pool_take(&host)?;
+				let t = std::time::Instant::now();
+				wins[0].write_u8(&buf[..wbytes]).context("calibrate h2d")?;
+				rate_h2d = bps(wbytes, t);
+				let t = std::time::Instant::now();
+				wins[0].download_u8(&mut buf[..wbytes]).context("calibrate d2h")?;
+				rate_d2h = bps(wbytes, t);
+				pool_give(&host, buf)
+			}
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+		}?;
+		match disk_cursor.cmp(&0) {
+			std::cmp::Ordering::Greater => {
+				let f = spill.as_ref().ok_or_else(|| anyhow::anyhow!("disk calibrate without spill file"))?;
+				let mut buf = pool_take(&host)?;
+				let t = std::time::Instant::now();
+				f.write_all_at(&buf[..wbytes], 0).context("calibrate spill write")?;
+				drop_cache(f, 0, wbytes);
+				rate_disk_w = bps(wbytes, t);
+				let t = std::time::Instant::now();
+				f.read_exact_at(&mut buf[..wbytes], 0).context("calibrate spill read")?;
+				rate_disk_r = bps(wbytes, t);
+				pool_give(&host, buf)
+			}
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+		}?;
 		for _net in net_used.iter().find(|u| **u > 0).into_iter() {
 			let ns = net.as_ref().ok_or_else(|| anyhow::anyhow!("net used without net"))?;
 			let cal_id = id_base | 0xffff_ffff;
@@ -1182,7 +1197,7 @@ impl Ooc {
 			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
-			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss);
+			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss)?;
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host)?;
 		}
 		let mut flip = Flip::A;
@@ -1221,11 +1236,7 @@ impl Ooc {
 					let lin = in_dim / cin;
 					let lout = (lin - kk) / stride + 1;
 					let cout = out_dim / lout;
-					kernels::gpu_scale_inplace(&ss.zero, cout * cin * kk, &self.dw_acc).context("conv dw_acc zero")?;
-					kernels::gpu_scale_inplace(&ss.zero, cout, &self.db_acc).context("conv db_acc zero")?;
-					for _prelu in prelu_gate(&p.act).into_iter() {
-						kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("conv scalar_acc zero")?;
-					}
+					self.zero_accs(ss, cout * cin * kk, cout, &p.act)?;
 					self.set_da_below_spb(flip, match l {
 						0 => 1,
 						_positive => in_dim,
@@ -1237,68 +1248,8 @@ impl Ooc {
 						let Flow::Go = self.bail()? else {
 							return Ok(());
 						};
-						let m = cnt * out_dim;
-						let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
-						let act_l = match l.cmp(&last) {
-							std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
-							std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?,
-						};
-						let dz = view(&self.wins[2], 0, m * 8);
-						let grad: &GpuBuffer = match p.act {
-							Activation::Relu => {
-								kernels::gpu_relu_backward_into(&da, &act_l, m, &dz).context("relu bwd")?;
-								&dz
-							}
-							Activation::Sigmoid => {
-								kernels::gpu_sigmoid_backward_into(&da, &act_l, m, &dz).context("sigmoid bwd")?;
-								&dz
-							}
-							Activation::LeakyRelu => {
-								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &sc.c_leaky_alpha, m, &dz).context("leaky bwd")?;
-								&dz
-							}
-							Activation::PRelu => {
-								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &p.palpha, m, &dz).context("prelu bwd")?;
-								let pre = self.preacts[l]
-									.as_ref()
-									.ok_or_else(|| anyhow::anyhow!("prelu preact"))?
-									.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								let t0 = view(&self.wins[4], 0, m * 8);
-								let t1 = view(&self.wins[5], 0, m * 8);
-								kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
-								kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
-								kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
-								kernels::gpu_mul_inplace(&da, m, &t1).context("prelu mul")?;
-								kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).context("prelu reduce")?;
-								kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).context("prelu acc")?;
-								&dz
-							}
-							Activation::Tanh => {
-								kernels::gpu_tanh_backward_into(&da, &act_l, m, &dz).context("tanh bwd")?;
-								&dz
-							}
-							Activation::Elu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("elu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								gpu_core::k_gapact::gpu_elu_backward(&da, &pre, &sc.c_elu_alpha, m, &dz).context("elu bwd")?;
-								&dz
-							}
-							Activation::Selu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("selu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								gpu_core::k_gapact::gpu_selu_backward(&da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &dz).context("selu bwd")?;
-								&dz
-							}
-							Activation::Silu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("silu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								kernels::gpu_silu_backward_into(&da, &pre, m, &dz).context("silu bwd")?;
-								&dz
-							}
-							Activation::Gelu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("gelu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								kernels::gpu_gelu_backward_into(&da, &pre, m, &dz).context("gelu bwd")?;
-								&dz
-							}
-							Activation::Linear => &da,
-						};
+						let w = self.bwd_win(flip, l, last, out_dim, s0, cnt, sc)?;
+						let grad = self.act_grad(p, l, &w.da, &w.act_l, &w.dz, w.m, s0, cnt, sc)?;
 						let a_prev = match l {
 							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
 							_positive => self.acts[l - 1].read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?,
@@ -1310,30 +1261,25 @@ impl Ooc {
 						).context("conv filter bwd")?;
 						kernels::gpu_add_inplace(&self.dw_tmp, cout * cin * kk, &self.dw_acc).context("conv dw acc")?;
 						kernels::gpu_conv1d_backward_bias_into(grad, cnt, cout, lout, &self.db_acc).context("conv bias bwd")?;
-						for _below in l.checked_sub(1).into_iter() {
-							let below_pg = match flip {
-								Flip::B => &mut self.da_a,
-								Flip::A => &mut self.da_b,
-							};
-							let below = below_pg.write_view(s0, cnt, &self.wins[7]);
-							kernels::gpu_conv1d_backward_data_into(grad, &p.w, cnt, cin, lin, cout, kk, stride, &below).context("conv data bwd")?;
-							below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?;
-						}
+						match l.checked_sub(1) {
+							Some(_below_l) => {
+								let below_pg = match flip {
+									Flip::B => &mut self.da_a,
+									Flip::A => &mut self.da_b,
+								};
+								let below = below_pg.write_view(s0, cnt, &self.wins[7]);
+								kernels::gpu_conv1d_backward_data_into(grad, &p.w, cnt, cin, lin, cout, kk, stride, &below).context("conv data bwd")?;
+								below_pg.commit(s0, cnt, &below, &self.writer, &self.host)
+							}
+							None => Ok(()),
+						}?;
 					}
-					kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, cout * cin * kk, &p.w).context("sgd conv w")?;
-					kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, cout, &p.b).context("sgd conv b")?;
-					for _prelu in prelu_gate(&p.act).into_iter() {
-						kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd conv prelu")?;
-					}
+					self.sgd_step(ss, p, cout * cin * kk, cout)?;
 					self.sweep_line("bwd", l, p, s_l)?;
 					flip = flip.toggle();
 				}
 				LayerKind::Dense => {
-					kernels::gpu_scale_inplace(&ss.zero, in_dim * out_dim, &self.dw_acc).context("dw_acc zero")?;
-					kernels::gpu_scale_inplace(&ss.zero, out_dim, &self.db_acc).context("db_acc zero")?;
-					for _prelu in prelu_gate(&p.act).into_iter() {
-						kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("scalar_acc zero")?;
-					}
+					self.zero_accs(ss, in_dim * out_dim, out_dim, &p.act)?;
 					self.set_da_below_spb(flip, match l {
 						0 => 1,
 						_positive => in_dim,
@@ -1345,68 +1291,8 @@ impl Ooc {
 						let Flow::Go = self.bail()? else {
 							return Ok(());
 						};
-						let m = cnt * out_dim;
-						let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
-						let act_l = match l.cmp(&last) {
-							std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
-							std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?,
-						};
-						let dz = view(&self.wins[2], 0, m * 8);
-						let grad: &GpuBuffer = match p.act {
-							Activation::Relu => {
-								kernels::gpu_relu_backward_into(&da, &act_l, m, &dz).context("relu bwd")?;
-								&dz
-							}
-							Activation::Sigmoid => {
-								kernels::gpu_sigmoid_backward_into(&da, &act_l, m, &dz).context("sigmoid bwd")?;
-								&dz
-							}
-							Activation::LeakyRelu => {
-								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &sc.c_leaky_alpha, m, &dz).context("leaky bwd")?;
-								&dz
-							}
-							Activation::PRelu => {
-								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &p.palpha, m, &dz).context("prelu bwd")?;
-								let pre = self.preacts[l]
-									.as_ref()
-									.ok_or_else(|| anyhow::anyhow!("prelu preact"))?
-									.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								let t0 = view(&self.wins[4], 0, m * 8);
-								let t1 = view(&self.wins[5], 0, m * 8);
-								kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
-								kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
-								kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
-								kernels::gpu_mul_inplace(&da, m, &t1).context("prelu mul")?;
-								kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).context("prelu reduce")?;
-								kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).context("prelu acc")?;
-								&dz
-							}
-							Activation::Tanh => {
-								kernels::gpu_tanh_backward_into(&da, &act_l, m, &dz).context("tanh bwd")?;
-								&dz
-							}
-							Activation::Elu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("elu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								gpu_core::k_gapact::gpu_elu_backward(&da, &pre, &sc.c_elu_alpha, m, &dz).context("elu bwd")?;
-								&dz
-							}
-							Activation::Selu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("selu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								gpu_core::k_gapact::gpu_selu_backward(&da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &dz).context("selu bwd")?;
-								&dz
-							}
-							Activation::Silu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("silu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								kernels::gpu_silu_backward_into(&da, &pre, m, &dz).context("silu bwd")?;
-								&dz
-							}
-							Activation::Gelu => {
-								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("gelu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-								kernels::gpu_gelu_backward_into(&da, &pre, m, &dz).context("gelu bwd")?;
-								&dz
-							}
-							Activation::Linear => &da,
-						};
+						let w = self.bwd_win(flip, l, last, out_dim, s0, cnt, sc)?;
+						let grad = self.act_grad(p, l, &w.da, &w.act_l, &w.dz, w.m, s0, cnt, sc)?;
 						let a_prev = match l {
 							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
 							_positive => match concat_at.filter(|cf| cf.pf == l) {
@@ -1451,11 +1337,7 @@ impl Ooc {
 					for cf in concat_at.filter(|cf| l == cf.pf).into_iter() {
 						self.set_da_below_spb(flip, cf.a);
 					}
-					kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, in_dim * out_dim, &p.w).context("sgd w")?;
-					kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, out_dim, &p.b).context("sgd b")?;
-					for _prelu in prelu_gate(&p.act).into_iter() {
-						kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd prelu")?;
-					}
+					self.sgd_step(ss, p, in_dim * out_dim, out_dim)?;
 					self.sweep_line("bwd", l, p, s_l)?;
 					flip = flip.toggle();
 				}
@@ -1488,45 +1370,46 @@ impl Ooc {
 		let net_w = NET_W_BYTES.load(Ordering::Relaxed);
 		let streamed = (h2d - s.h2d) + (d2h - s.d2h) + (disk_r - s.disk_r) + (disk_w - s.disk_w)
 			+ (net_r - s.net_r) + (net_w - s.net_w);
-		for _stream in streamed.checked_sub(1).into_iter() {
-			gpu_core::hip::device_synchronize().context("sweep sync")?;
-			let sec = s.t.elapsed().as_secs_f64();
-			let gfs = w.flop / sec / 1e9;
-			let gbs = w.bytes / sec / 1e9;
-			let mut line = format!(
-				"ooc {phase} L{l} {kind} {dims}  {} windows  {sec:.1}s  {:.2} GFLOP {gfs:.1} GF/s {:.0}% gemm  {:.2} GB {gbs:.1} GB/s {:.0}% vram",
-				self.n.div_ceil(self.chunk),
-				w.flop / 1e9,
-				100.0 * gfs / recipe_infer::GEMM_GFLOPS,
-				w.bytes / 1e9,
-				100.0 * gbs / recipe_infer::VRAM_GBS,
+		let std::cmp::Ordering::Greater = streamed.cmp(&0) else {
+			return Ok(());
+		};
+		gpu_core::hip::device_synchronize().context("sweep sync")?;
+		let sec = s.t.elapsed().as_secs_f64();
+		let gfs = w.flop / sec / 1e9;
+		let gbs = w.bytes / sec / 1e9;
+		let mut line = format!(
+			"ooc {phase} L{l} {kind} {dims}  {} windows  {sec:.1}s  {:.2} GFLOP {gfs:.1} GF/s {:.0}% gemm  {:.2} GB {gbs:.1} GB/s {:.0}% vram",
+			self.n.div_ceil(self.chunk),
+			w.flop / 1e9,
+			100.0 * gfs / recipe_infer::GEMM_GFLOPS,
+			w.bytes / 1e9,
+			100.0 * gbs / recipe_infer::VRAM_GBS,
+		);
+		for st in [
+			Stream { label: "h2d", delta: h2d - s.h2d, rate: self.rate_h2d },
+			Stream { label: "d2h", delta: d2h - s.d2h, rate: self.rate_d2h },
+			Stream { label: "disk-r", delta: disk_r - s.disk_r, rate: self.rate_disk_r },
+			Stream { label: "disk-w", delta: disk_w - s.disk_w, rate: self.rate_disk_w },
+			Stream { label: "net-r", delta: net_r - s.net_r, rate: self.rate_net_r },
+			Stream { label: "net-w", delta: net_w - s.net_w, rate: self.rate_net_w },
+		]
+		.into_iter()
+		.filter(|st| st.delta > 0)
+		{
+			let bps = st.delta as f64 / sec;
+			line += &format!(
+				"  {} {:.2} GB {:.2} GB/s {:.0}%",
+				st.label,
+				st.delta as f64 / 1e9,
+				bps / 1e9,
+				100.0 * bps / st.rate,
 			);
-			for st in [
-				Stream { label: "h2d", delta: h2d - s.h2d, rate: self.rate_h2d },
-				Stream { label: "d2h", delta: d2h - s.d2h, rate: self.rate_d2h },
-				Stream { label: "disk-r", delta: disk_r - s.disk_r, rate: self.rate_disk_r },
-				Stream { label: "disk-w", delta: disk_w - s.disk_w, rate: self.rate_disk_w },
-				Stream { label: "net-r", delta: net_r - s.net_r, rate: self.rate_net_r },
-				Stream { label: "net-w", delta: net_w - s.net_w, rate: self.rate_net_w },
-			]
-			.into_iter()
-			.filter(|st| st.delta > 0)
-			{
-				let bps = st.delta as f64 / sec;
-				line += &format!(
-					"  {} {:.2} GB {:.2} GB/s {:.0}%",
-					st.label,
-					st.delta as f64 / 1e9,
-					bps / 1e9,
-					100.0 * bps / st.rate,
-				);
-			}
-			let drain = self.writer.drained.take();
-			for _drained in drain.partial_cmp(&0.0).filter(|ord| matches!(ord, std::cmp::Ordering::Greater)).into_iter() {
-				line += &format!("  drain {drain:.1}s");
-			}
-			eprintln!("{line}");
 		}
+		let drain = self.writer.drained.take();
+		for _drained in drain.partial_cmp(&0.0).filter(|ord| matches!(ord, std::cmp::Ordering::Greater)).into_iter() {
+			line += &format!("  drain {drain:.1}s");
+		}
+		eprintln!("{line}");
 		Ok(())
 	}
 
@@ -1567,6 +1450,110 @@ impl Ooc {
 			Flip::B => &self.da_b,
 			Flip::A => &self.da_a,
 		}
+	}
+
+	fn zero_accs(&self, ss: &StepScalars, dw_len: usize, db_len: usize, act: &Activation) -> anyhow::Result<()> {
+		kernels::gpu_scale_inplace(&ss.zero, dw_len, &self.dw_acc).context("dw_acc zero")?;
+		kernels::gpu_scale_inplace(&ss.zero, db_len, &self.db_acc).context("db_acc zero")?;
+		match prelu_gate(act) {
+			Some(_p) => kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("scalar_acc zero"),
+			None => Ok(()),
+		}?;
+		Ok(())
+	}
+
+	fn sgd_step(&self, ss: &StepScalars, p: &LayerParams, dw_len: usize, db_len: usize) -> anyhow::Result<()> {
+		kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, dw_len, &p.w).context("sgd w")?;
+		kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, db_len, &p.b).context("sgd b")?;
+		match prelu_gate(&p.act) {
+			Some(_p) => kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd prelu"),
+			None => Ok(()),
+		}?;
+		Ok(())
+	}
+
+	fn bwd_win(&self, flip: Flip, l: usize, last: usize, out_dim: usize, s0: usize, cnt: usize, sc: &Scratch) -> anyhow::Result<BwdWin> {
+		let m = cnt * out_dim;
+		let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
+		let act_l = match l.cmp(&last) {
+			std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
+			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?,
+		};
+		let dz = view(&self.wins[2], 0, m * 8);
+		Ok(BwdWin { da, act_l, dz, m })
+	}
+
+	fn act_grad<'g>(
+		&self,
+		p: &LayerParams,
+		l: usize,
+		da: &'g GpuBuffer,
+		act_l: &GpuBuffer,
+		dz: &'g GpuBuffer,
+		m: usize,
+		s0: usize,
+		cnt: usize,
+		sc: &Scratch,
+	) -> anyhow::Result<&'g GpuBuffer> {
+		match p.act {
+			Activation::Relu => {
+				kernels::gpu_relu_backward_into(da, act_l, m, dz).context("relu bwd")?;
+				Ok(dz)
+			}
+			Activation::Sigmoid => {
+				kernels::gpu_sigmoid_backward_into(da, act_l, m, dz).context("sigmoid bwd")?;
+				Ok(dz)
+			}
+			Activation::LeakyRelu => {
+				kernels::gpu_leaky_relu_backward_into(da, act_l, &sc.c_leaky_alpha, m, dz).context("leaky bwd")?;
+				Ok(dz)
+			}
+			Activation::PRelu => {
+				kernels::gpu_leaky_relu_backward_into(da, act_l, &p.palpha, m, dz).context("prelu bwd")?;
+				let pre = self.preacts[l]
+					.as_ref()
+					.ok_or_else(|| anyhow::anyhow!("prelu preact"))?
+					.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+				let t0 = view(&self.wins[4], 0, m * 8);
+				let t1 = view(&self.wins[5], 0, m * 8);
+				kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
+				kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
+				kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
+				kernels::gpu_mul_inplace(da, m, &t1).context("prelu mul")?;
+				kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).context("prelu reduce")?;
+				kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).context("prelu acc")?;
+				Ok(dz)
+			}
+			Activation::Tanh => {
+				kernels::gpu_tanh_backward_into(da, act_l, m, dz).context("tanh bwd")?;
+				Ok(dz)
+			}
+			Activation::Elu => {
+				let pre = self.preact(l, "elu")?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+				gpu_core::k_gapact::gpu_elu_backward(da, &pre, &sc.c_elu_alpha, m, dz).context("elu bwd")?;
+				Ok(dz)
+			}
+			Activation::Selu => {
+				let pre = self.preact(l, "selu")?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+				gpu_core::k_gapact::gpu_selu_backward(da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, dz).context("selu bwd")?;
+				Ok(dz)
+			}
+			Activation::Silu => {
+				let pre = self.preact(l, "silu")?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+				kernels::gpu_silu_backward_into(da, &pre, m, dz).context("silu bwd")?;
+				Ok(dz)
+			}
+			Activation::Gelu => {
+				let pre = self.preact(l, "gelu")?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+				kernels::gpu_gelu_backward_into(da, &pre, m, dz).context("gelu bwd")?;
+				Ok(dz)
+			}
+			Activation::Linear => Ok(da),
+		}
+	}
+
+	fn preact(&self, l: usize, who: &str) -> anyhow::Result<&Paged> {
+		self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("{who} preact"))
 	}
 	fn set_da_below_spb(&mut self, flip: Flip, spb: usize) {
 		match flip {
@@ -1672,9 +1659,10 @@ impl Ooc {
 					_other => &self.dwv_acc,
 				};
 				kernels::gpu_add_inplace(&self.dw_tmp, d * d, acc).context("acc add")?;
-				for _mix in wi.checked_sub(1).into_iter() {
-					kernels::gpu_add_inplace(&dh_tmp, cnt * p.in_dim, &below).context("dh add")?;
-				}
+				match wi.cmp(&0) {
+					std::cmp::Ordering::Greater => kernels::gpu_add_inplace(&dh_tmp, cnt * p.in_dim, &below).context("dh add"),
+					std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+				}?;
 			}
 			below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?;
 		}

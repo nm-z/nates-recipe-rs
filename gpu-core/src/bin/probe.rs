@@ -9,10 +9,14 @@ fn main() {
 	let mut back = vec![0.0f64; n];
 	unsafe { x.download_async(&mut back, std::ptr::null_mut()) }.expect("probe: download");
 	gpu_core::hip::device_synchronize().expect("probe: download sync");
-	for (i, v) in back.iter().enumerate() {
-		if (v - 0.5).abs() > 1e-12 {
-			eprintln!("probe: mismatch at {i}: {v}");
-			std::process::exit(1);
+	for i in 0..back.len() {
+		let v = back[i];
+		match (v - 0.5).abs().partial_cmp(&1e-12) {
+			Some(std::cmp::Ordering::Greater) => {
+				eprintln!("probe: mismatch at {i}: {v}");
+				std::process::exit(1);
+			}
+			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => continue,
 		}
 	}
 	gpu_core::hip::device_synchronize().expect("probe: device sync");

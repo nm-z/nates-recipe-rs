@@ -3,10 +3,10 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN: AtomicU8 = AtomicU8::new(0);
 
 static FREE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
@@ -24,40 +24,43 @@ thread_local! {
 	static CURRENT_TAG: Cell<&'static str> = const { Cell::new("other") };
 }
 
-pub struct TagScope(&'static str);
+pub struct TagScope {
+	prev: &'static str,
+}
 
 pub fn tag_scope(name: &'static str) -> TagScope {
 	let prev = CURRENT_TAG.with(|t| t.replace(name));
-	TagScope(prev)
+	TagScope { prev }
 }
 
 impl Drop for TagScope {
 	fn drop(&mut self) {
-		CURRENT_TAG.with(|t| t.set(self.0));
+		CURRENT_TAG.with(|t| t.set(self.prev));
 	}
 }
 
 fn tag_add(tag: &'static str, n: usize) {
-	let live = if let Ok(mut m) = TAG_BYTES.lock() {
-		let e = m.entry(tag).or_insert(0);
-		*e += n;
-		*e
-	} else {
+	let live = match TAG_BYTES.lock() {
+		Ok(mut m) => {
+			let e = m.entry(tag).or_insert(0);
+			*e += n;
+			*e
+		}
+		Err(_p) => return,
+	};
+	let Ok(mut p) = TAG_PEAK.lock() else {
 		return;
 	};
-	if let Ok(mut p) = TAG_PEAK.lock() {
-		let e = p.entry(tag).or_insert(0);
-		if live > *e {
-			*e = live;
-		}
-	}
+	let e = p.entry(tag).or_insert(0);
+	*e = (*e).max(live);
 }
 
 fn tag_sub(tag: &'static str, n: usize) {
-	if let Ok(mut m) = TAG_BYTES.lock() {
-		let e = m.entry(tag).or_insert(0);
-		*e = e.saturating_sub(n);
-	}
+	let Ok(mut m) = TAG_BYTES.lock() else {
+		return;
+	};
+	let e = m.entry(tag).or_insert(0);
+	*e = e.saturating_sub(n);
 }
 
 pub(crate) fn tag_note_alloc(tag: &'static str, n: usize) {
@@ -71,14 +74,17 @@ pub(crate) fn tag_note_free(tag: &'static str, n: usize) {
 fn fmt_bytes(b: usize) -> String {
 	const K: f64 = 1024.0;
 	let f = b as f64;
-	if f >= K * K * K {
-		format!("{:.2} GB", f / (K * K * K))
-	} else if f >= K * K {
-		format!("{:.2} MB", f / (K * K))
-	} else if f >= K {
-		format!("{:.2} KB", f / K)
-	} else {
-		format!("{b} B")
+	let gb = K * K * K;
+	let mb = K * K;
+	match f.partial_cmp(&gb) {
+		Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} GB", f / gb),
+		Some(std::cmp::Ordering::Less) | None => match f.partial_cmp(&mb) {
+			Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} MB", f / mb),
+			Some(std::cmp::Ordering::Less) | None => match f.partial_cmp(&K) {
+				Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} KB", f / K),
+				Some(std::cmp::Ordering::Less) | None => format!("{b} B"),
+			},
+		},
 	}
 }
 
@@ -86,14 +92,27 @@ fn oom_pair(name: &str, val: &str) -> String {
 	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
 }
 
+struct TagBytes {
+	tag: &'static str,
+	bytes: usize,
+}
+
 fn oom_report(req: usize) {
-	let (free, total) = crate::hip::mem_info().unwrap_or((0, 0));
-	let mut autopsy: Vec<(&'static str, usize)> = TAG_BYTES
-		.lock()
-		.map(|m| m.iter().map(|(k, v)| (*k, *v)).filter(|(_, v)| *v > 0).collect())
-		.unwrap_or_default();
-	autopsy.sort_by(|a, b| b.1.cmp(&a.1));
-	let mut line: Vec<String> = autopsy.iter().map(|(k, v)| oom_pair(k, &fmt_bytes(*v))).collect();
+	let mi = crate::hip::mem_info().unwrap_or(crate::hip::MemInfo { free: 0, total: 0 });
+	let free = mi.free;
+	let total = mi.total;
+	let mut autopsy: Vec<TagBytes> = match TAG_BYTES.lock() {
+		Ok(m) => m
+			.keys()
+			.filter_map(|k| {
+				let bytes = m.get(k).copied().unwrap_or(0);
+				Some(TagBytes { tag: *k, bytes }).filter(|tb| tb.bytes > 0)
+			})
+			.collect(),
+		Err(_p) => Vec::new(),
+	};
+	autopsy.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+	let mut line: Vec<String> = autopsy.iter().map(|tb| oom_pair(tb.tag, &fmt_bytes(tb.bytes))).collect();
 	line.push(oom_pair("req", &fmt_bytes(req)));
 	line.push(oom_pair("free", &fmt_bytes(free)));
 	line.push(oom_pair("total", &fmt_bytes(total)));
@@ -110,9 +129,14 @@ fn oom_report(req: usize) {
 }
 
 
-fn kernel_fdinfo() -> Option<(u64, u64)> {
+struct FdinfoMem {
+	vram_kib: u64,
+	gtt_kib: u64,
+}
+
+fn kernel_fdinfo() -> Option<FdinfoMem> {
 	let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
-	let mut by_client: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+	let mut by_client: BTreeMap<String, FdinfoMem> = BTreeMap::new();
 	for e in entries.flatten() {
 		let Ok(info) = std::fs::read_to_string(e.path()) else {
 			continue;
@@ -121,36 +145,57 @@ fn kernel_fdinfo() -> Option<(u64, u64)> {
 		let mut vram_kib = 0u64;
 		let mut gtt_kib = 0u64;
 		for line in info.lines() {
-			if let Some(v) = line.strip_prefix("drm-client-id:") {
-				client_id = Some(v.trim().to_string());
-			} else if let Some(v) = line.strip_prefix("drm-memory-vram:") {
-				vram_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
-			} else if let Some(v) = line.strip_prefix("drm-memory-gtt:") {
-				gtt_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
+			match line.strip_prefix("drm-client-id:") {
+				Some(v) => client_id = Some(v.trim().to_string()),
+				None => match line.strip_prefix("drm-memory-vram:") {
+					Some(v) => vram_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0),
+					None => match line.strip_prefix("drm-memory-gtt:") {
+						Some(v) => gtt_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0),
+						None => continue,
+					},
+				},
 			}
 		}
-		if let Some(id) = client_id {
-			by_client.entry(id).or_insert((vram_kib, gtt_kib));
-		}
+		let Some(id) = client_id else {
+			continue;
+		};
+		by_client.entry(id).or_insert(FdinfoMem { vram_kib, gtt_kib });
 	}
-	let vram_total: u64 = by_client.values().map(|(v, _)| v).sum();
-	let gtt_total: u64 = by_client.values().map(|(_, g)| g).sum();
-	Some((vram_total, gtt_total))
+	let vram_total: u64 = by_client.values().map(|cm| cm.vram_kib).sum();
+	let gtt_total: u64 = by_client.values().map(|cm| cm.gtt_kib).sum();
+	Some(FdinfoMem { vram_kib: vram_total, gtt_kib: gtt_total })
+}
+
+struct KindLabel {
+	kind: u32,
+	label: &'static str,
+}
+
+struct VramspyRow {
+	label: &'static str,
+	live: u64,
+	peak: u64,
+	al: u64,
+	fr: u64,
 }
 
 pub fn ledger_report() -> String {
-	let mut live: Vec<(&'static str, usize)> = TAG_BYTES
+	let mut live: Vec<TagBytes> = TAG_BYTES
 		.lock()
-		.map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+		.map(|m| {
+			m.keys()
+				.map(|k| TagBytes { tag: *k, bytes: m.get(k).copied().unwrap_or(0) })
+				.collect()
+		})
 		.unwrap_or_default();
-	live.sort_by(|a, b| b.1.cmp(&a.1));
+	live.sort_by(|a, b| b.bytes.cmp(&a.bytes));
 	let peak = TAG_PEAK.lock().map(|m| m.clone()).unwrap_or_default();
 	let mut s = String::from("──────── GPU MEMORY LEDGER ────────\n");
 	let mut total_live = 0usize;
-	for (tag, v) in &live {
-		total_live += *v;
-		let pk = peak.get(tag).copied().unwrap_or(0);
-		s += &format!("  {tag:<14} live {:>11}  peak {:>11}\n", fmt_bytes(*v), fmt_bytes(pk));
+	for tb in &live {
+		total_live += tb.bytes;
+		let pk = peak.get(tb.tag).copied().unwrap_or(0);
+		s += &format!("  {:<14} live {:>11}  peak {:>11}\n", tb.tag, fmt_bytes(tb.bytes), fmt_bytes(pk));
 	}
 	s += &format!("  {:<14} live {:>11}\n", "TOTAL", fmt_bytes(total_live));
 	s += &format!(
@@ -167,46 +212,64 @@ pub fn ledger_report() -> String {
 	s += &format!("  device     allocs {a}  frees {f}  live-buffers {}\n", a.saturating_sub(f));
 
 	let live_sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_live".as_ptr()) };
-	if live_sym.is_null() {
-		s += "  global: vramspy NOT loaded (LD_PRELOAD libvramspy.so)\n";
-	} else {
-		let sym = |name: &std::ffi::CStr| -> *mut c_void {
-			unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }
-		};
-		let to_u32_u64 = |p: *mut c_void| -> extern "C" fn(u32) -> u64 {
-			unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(u32) -> u64>(p) }
-		};
-		let live_fn = to_u32_u64(live_sym);
-		let peak_fn = to_u32_u64(sym(c"vramspy_peak"));
-		let allocs_fn = to_u32_u64(sym(c"vramspy_allocs"));
-		let frees_fn = to_u32_u64(sym(c"vramspy_frees"));
-		let unknown_frees_fn = unsafe {
-			std::mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(c"vramspy_unknown_frees"))
-		};
-
-		s += "  global (vramspy, every byte incl. runtime+libs)\n";
-		let mut device_live = 0u64;
-		for (kind, label) in [(0u32, "device"), (1, "pinned"), (2, "kernarg"), (3, "other")] {
-			let (live, peak, al, fr) = (live_fn(kind), peak_fn(kind), allocs_fn(kind), frees_fn(kind));
-			if kind == 0 {
-				device_live = live;
-			}
-			s += &format!(
-				"    {label:<10} live {:>11}  peak {:>11}  (allocs {al} frees {fr})\n",
-				fmt_bytes(live as usize),
-				fmt_bytes(peak as usize)
-			);
+	match std::ptr::NonNull::new(live_sym) {
+		None => {
+			s += "  global: vramspy NOT loaded (LD_PRELOAD libvramspy.so)\n";
 		}
-		let delta = (device_live as usize).saturating_sub(total_live);
-		s += &format!("    library delta: {} (unknown frees: {})\n", fmt_bytes(delta), unknown_frees_fn());
+		Some(_present) => {
+			let sym = |name: &std::ffi::CStr| -> *mut c_void {
+				unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }
+			};
+			let to_u32_u64 = |p: *mut c_void| -> extern "C" fn(u32) -> u64 {
+				unsafe { std::mem::transmute::<*mut c_void, extern "C" fn(u32) -> u64>(p) }
+			};
+			let live_fn = to_u32_u64(live_sym);
+			let peak_fn = to_u32_u64(sym(c"vramspy_peak"));
+			let allocs_fn = to_u32_u64(sym(c"vramspy_allocs"));
+			let frees_fn = to_u32_u64(sym(c"vramspy_frees"));
+			let unknown_frees_fn = unsafe {
+				std::mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(c"vramspy_unknown_frees"))
+			};
+
+			s += "  global (vramspy, every byte incl. runtime+libs)\n";
+			let kinds = [
+				KindLabel { kind: 0, label: "device" },
+				KindLabel { kind: 1, label: "pinned" },
+				KindLabel { kind: 2, label: "kernarg" },
+				KindLabel { kind: 3, label: "other" },
+			];
+			let rows: Vec<VramspyRow> = kinds
+				.into_iter()
+				.map(|kl| VramspyRow {
+					label: kl.label,
+					live: live_fn(kl.kind),
+					peak: peak_fn(kl.kind),
+					al: allocs_fn(kl.kind),
+					fr: frees_fn(kl.kind),
+				})
+				.collect();
+			let device_live = rows.first().map(|r| r.live).unwrap_or(0);
+			for r in &rows {
+				s += &format!(
+					"    {:<10} live {:>11}  peak {:>11}  (allocs {} frees {})\n",
+					r.label,
+					fmt_bytes(r.live as usize),
+					fmt_bytes(r.peak as usize),
+					r.al,
+					r.fr
+				);
+			}
+			let delta = (device_live as usize).saturating_sub(total_live);
+			s += &format!("    library delta: {} (unknown frees: {})\n", fmt_bytes(delta), unknown_frees_fn());
+		}
 	}
 
 	match kernel_fdinfo() {
-		Some((vram_kib, gtt_kib)) => {
+		Some(m) => {
 			s += &format!(
 				"  kernel (fdinfo)  vram {}  gtt {}\n",
-				fmt_bytes((vram_kib * 1024) as usize),
-				fmt_bytes((gtt_kib * 1024) as usize)
+				fmt_bytes((m.vram_kib * 1024) as usize),
+				fmt_bytes((m.gtt_kib * 1024) as usize)
 			);
 		}
 		None => {
@@ -217,12 +280,30 @@ pub fn ledger_report() -> String {
 	s
 }
 
+enum Lifecycle {
+	Running,
+	Down,
+}
+
+fn lifecycle() -> Lifecycle {
+	match SHUTTING_DOWN.load(Ordering::Relaxed).cmp(&0) {
+		std::cmp::Ordering::Equal => Lifecycle::Running,
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Lifecycle::Down,
+	}
+}
+
 pub fn mark_shutting_down() {
-      SHUTTING_DOWN.store(true, Ordering::SeqCst);
+      SHUTTING_DOWN.store(1, Ordering::SeqCst);
+}
+
+#[derive(Clone, Copy)]
+enum Frozen {
+	No,
+	Yes,
 }
 
 thread_local! {
-	static ALLOC_FROZEN: Cell<bool> = const { Cell::new(false) };
+	static ALLOC_FROZEN: Cell<Frozen> = const { Cell::new(Frozen::No) };
 }
 
 pub fn alloc_count_reset() -> usize {
@@ -237,52 +318,44 @@ pub fn device_free_count() -> usize {
 	FREE_TOTAL.load(Ordering::Relaxed)
 }
 
-pub fn xfer_bytes() -> (usize, usize, usize) {
-	(
-		H2D_BYTES.load(Ordering::Relaxed),
-		D2H_BYTES.load(Ordering::Relaxed),
-		D2D_BYTES.load(Ordering::Relaxed),
-	)
-}
-
 pub struct XferBytes {
 	pub h2d: usize,
 	pub d2h: usize,
 	pub d2d: usize,
 }
 
-pub fn xfer_bytes_named() -> XferBytes {
-	let (h2d, d2h, d2d) = xfer_bytes();
-	XferBytes { h2d, d2h, d2d }
+pub fn xfer_bytes() -> XferBytes {
+	XferBytes {
+		h2d: H2D_BYTES.load(Ordering::Relaxed),
+		d2h: D2H_BYTES.load(Ordering::Relaxed),
+		d2d: D2D_BYTES.load(Ordering::Relaxed),
+	}
 }
 
-pub fn xfer_calls() -> (usize, usize, usize) {
-	(
-		H2D_CALLS.load(Ordering::Relaxed),
-		D2H_CALLS.load(Ordering::Relaxed),
-		D2D_CALLS.load(Ordering::Relaxed),
-	)
-}
-
-pub fn xfer_calls_named() -> XferBytes {
-	let (h2d, d2h, d2d) = xfer_calls();
-	XferBytes { h2d, d2h, d2d }
+pub fn xfer_calls() -> XferBytes {
+	XferBytes {
+		h2d: H2D_CALLS.load(Ordering::Relaxed),
+		d2h: D2H_CALLS.load(Ordering::Relaxed),
+		d2d: D2D_CALLS.load(Ordering::Relaxed),
+	}
 }
 
 pub fn alloc_freeze() {
-	ALLOC_FROZEN.with(|f| f.set(true));
+	ALLOC_FROZEN.with(|f| f.set(Frozen::Yes));
 }
 
 pub fn alloc_unfreeze() {
-	ALLOC_FROZEN.with(|f| f.set(false));
+	ALLOC_FROZEN.with(|f| f.set(Frozen::No));
 }
 
-pub struct AllocGuard(std::marker::PhantomData<*const ()>);
+pub struct AllocGuard {
+	_marker: std::marker::PhantomData<*const ()>,
+}
 
 impl AllocGuard {
       pub fn freeze() -> Self {
             alloc_freeze();
-            AllocGuard(std::marker::PhantomData)
+            AllocGuard { _marker: std::marker::PhantomData }
       }
 }
 
@@ -301,23 +374,26 @@ static ARENA_CARVED: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap:
 static ARENA_CARVED_ALIGNED: AtomicUsize = AtomicUsize::new(0);
 
 fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
-	if let Ok(mut m) = ARENA_CARVED.lock() {
-		*m.entry(tag).or_insert(0) += n_bytes;
-	}
+	let Ok(mut m) = ARENA_CARVED.lock() else {
+		ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
+		return;
+	};
+	*m.entry(tag).or_insert(0) += n_bytes;
+	drop(m);
 	ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
 }
 
 fn carve_image_front(image: &[f64]) {
-	if image.is_empty() {
+	let Some(_first) = image.first() else {
 		return;
-	}
+	};
 	let _t = tag_scope("weights");
 	let _img = GpuBuffer::alloc(image.len()).expect("arena image carve");
 }
 
 fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<(), HipError> {
 	unsafe { memset_dev(base, 0, size, std::ptr::null_mut())? };
-	if !image.is_empty() {
+	for _first in image.first().into_iter() {
 		let bytes = std::mem::size_of_val(image);
 		H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
 		H2D_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -370,14 +446,24 @@ pub fn release_device_arena(slab: GpuBuffer) {
 	);
 	crate::hip::device_synchronize().expect("arena release sync");
 	set_device_arena(std::ptr::null_mut(), 0);
-	if let Ok(mut m) = ARENA_CARVED.lock() {
-		for (tag, bytes) in m.iter() {
-			tag_sub(tag, *bytes);
-		}
-		m.clear();
-	}
-	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
+	drain_arena_carve();
 	drop(slab);
+}
+
+fn drain_arena_carve() {
+	drain_arena_carve_map();
+	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
+}
+
+fn drain_arena_carve_map() {
+	let Ok(mut m) = ARENA_CARVED.lock() else {
+		return;
+	};
+	for tag in m.keys() {
+		let bytes = m.get(tag).copied().unwrap_or(0);
+		tag_sub(*tag, bytes);
+	}
+	m.clear();
 }
 
 static PARKED: Mutex<Option<GpuBuffer>> = Mutex::new(None);
@@ -396,8 +482,18 @@ pub fn park_run_backing(buf: GpuBuffer) {
 }
 
 pub fn live_parked_gen() -> Option<usize> {
-	let g = PARKED_GEN.load(Ordering::Relaxed);
-	(g != 0).then_some(g)
+	std::num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed)).map(std::num::NonZeroUsize::get)
+}
+
+enum ParkKind {
+	Registered,
+	Foreign,
+}
+
+enum Disposition {
+	Adopt,
+	ReleaseArena,
+	DropForeign,
 }
 
 fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
@@ -406,26 +502,34 @@ fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
 		Err(p) => p.into_inner().take(),
 	}?;
 	PARKED_GEN.store(0, Ordering::Relaxed);
-	let registered = ARENA_BASE.load(Ordering::Relaxed) == parked.ptr_addr();
-	if !registered || parked.len() < need {
-		if registered {
-			release_device_arena(parked);
-		} else {
+	let kind = match ARENA_BASE.load(Ordering::Relaxed).cmp(&parked.ptr_addr()) {
+		std::cmp::Ordering::Equal => ParkKind::Registered,
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => ParkKind::Foreign,
+	};
+	let decision = match kind {
+		ParkKind::Foreign => Disposition::DropForeign,
+		ParkKind::Registered => match parked.len().cmp(&need) {
+			std::cmp::Ordering::Less => Disposition::ReleaseArena,
+			std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => Disposition::Adopt,
+		},
+	};
+	match decision {
+		Disposition::DropForeign => {
 			crate::hip::device_synchronize().expect("parked release sync");
 			drop(parked);
 			pool_trim();
+			None
 		}
-		return None;
-	}
-	if let Ok(mut m) = ARENA_CARVED.lock() {
-		for (tag, bytes) in m.iter() {
-			tag_sub(tag, *bytes);
+		Disposition::ReleaseArena => {
+			release_device_arena(parked);
+			None
 		}
-		m.clear();
+		Disposition::Adopt => {
+			drain_arena_carve();
+			ARENA_OFFSET.store(0, Ordering::Relaxed);
+			Some(parked)
+		}
 	}
-	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
-	ARENA_OFFSET.store(0, Ordering::Relaxed);
-	Some(parked)
 }
 
 pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
@@ -445,10 +549,12 @@ pub fn release_run_backing() {
 		Err(p) => p.into_inner().take(),
 	};
 	PARKED_GEN.store(0, Ordering::Relaxed);
-	if let Some(b) = parked {
-		if ARENA_BASE.load(Ordering::Relaxed) == b.ptr_addr() {
-			release_device_arena(b);
-		} else {
+	let Some(b) = parked else {
+		return;
+	};
+	match ARENA_BASE.load(Ordering::Relaxed).cmp(&b.ptr_addr()) {
+		std::cmp::Ordering::Equal => release_device_arena(b),
+		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
 			crate::hip::device_synchronize().expect("parked release sync");
 			drop(b);
 		}
@@ -474,9 +580,8 @@ impl Stage {
 
 	fn pad(&mut self) {
 		let rem = self.host.len() % STAGE_ALIGN_F64;
-		if rem != 0 {
-			self.host.resize(self.host.len() + STAGE_ALIGN_F64 - rem, 0.0);
-		}
+		let add = (STAGE_ALIGN_F64 - rem) % STAGE_ALIGN_F64;
+		self.host.resize(self.host.len() + add, 0.0);
 	}
 
 	pub fn push(&mut self, data: &[f64]) -> usize {
@@ -508,6 +613,12 @@ impl Stage {
 }
 
 
+enum Dir {
+	H2D,
+	D2H,
+	D2D,
+}
+
 pub unsafe fn xfer(
 	dst: *mut c_void,
 	src: *const c_void,
@@ -515,20 +626,30 @@ pub unsafe fn xfer(
 	kind: i32,
 	stream: *mut c_void,
 ) -> Result<(), HipError> {
-	let (b, c) = match kind {
-		HIP_MEMCPY_H2D => (&H2D_BYTES, &H2D_CALLS),
-		HIP_MEMCPY_D2H => (&D2H_BYTES, &D2H_CALLS),
-		_ => (&D2D_BYTES, &D2D_CALLS),
-	};
-	b.fetch_add(bytes, Ordering::Relaxed);
-	c.fetch_add(1, Ordering::Relaxed);
-	if kind != HIP_MEMCPY_H2D {
-		crate::callspy::tick(&crate::callspy::XFER_ASYNC);
+	let dir = Some(kind)
+		.filter(|k| *k == HIP_MEMCPY_H2D)
+		.map(|_k| Dir::H2D)
+		.or_else(|| Some(kind).filter(|k| *k == HIP_MEMCPY_D2H).map(|_k| Dir::D2H))
+		.unwrap_or(Dir::D2D);
+	match dir {
+		Dir::H2D => {
+			H2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+			H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+			unsafe { h2d_pinned(dst, src, bytes, stream) }
+		}
+		Dir::D2H => {
+			D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
+			D2H_CALLS.fetch_add(1, Ordering::Relaxed);
+			crate::callspy::tick(&crate::callspy::XFER_ASYNC);
+			unsafe { dev_copy(dst, src, bytes, kind, stream) }
+		}
+		Dir::D2D => {
+			D2D_BYTES.fetch_add(bytes, Ordering::Relaxed);
+			D2D_CALLS.fetch_add(1, Ordering::Relaxed);
+			crate::callspy::tick(&crate::callspy::XFER_ASYNC);
+			unsafe { dev_copy(dst, src, bytes, kind, stream) }
+		}
 	}
-	if kind == HIP_MEMCPY_H2D {
-		return unsafe { h2d_pinned(dst, src, bytes, stream) };
-	}
-	unsafe { dev_copy(dst, src, bytes, kind, stream) }
 }
 
 unsafe fn dev_copy(
@@ -559,14 +680,16 @@ pub fn par_touch(v: &mut [u8]) {
 pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 	let per = bytes.div_ceil(threads);
-	let (d, s0) = (dst as usize, src as usize);
+	let d = dst as usize;
+	let s0 = src as usize;
 	std::thread::scope(|sc| {
 		for t in 0..threads {
 			let off = t * per;
-			if off >= bytes {
-				break;
-			}
-			let len = per.min(bytes - off);
+			let remaining = match off.cmp(&bytes) {
+				std::cmp::Ordering::Less => bytes - off,
+				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break,
+			};
+			let len = per.min(remaining);
 			sc.spawn(move || unsafe {
 				std::ptr::copy_nonoverlapping((s0 as *const u8).add(off), (d as *mut u8).add(off), len);
 			});
@@ -577,17 +700,27 @@ pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 const BOUNCE_BYTES: usize = 64 << 20;
 static BOUNCE: Mutex<usize> = Mutex::new(0);
 
-static RUN_PIN: Mutex<(usize, usize)> = Mutex::new((0, 0));
+struct PinBuf {
+	ptr: usize,
+	cap: usize,
+}
 
-fn pin_ensure(g: &mut (usize, usize), bytes: usize) -> *mut u8 {
-	if g.1 < bytes {
-		if g.0 != 0 {
-			let _ = unsafe { crate::hip::host_free(g.0 as *mut c_void) };
-		}
-		g.0 = crate::hip::host_malloc(bytes, 0).expect("run_pin host_malloc") as usize;
-		g.1 = bytes;
+static RUN_PIN: Mutex<PinBuf> = Mutex::new(PinBuf { ptr: 0, cap: 0 });
+
+fn pin_ensure(g: &mut PinBuf, bytes: usize) -> *mut u8 {
+	grow_pin(g, bytes);
+	g.ptr as *mut u8
+}
+
+fn grow_pin(g: &mut PinBuf, bytes: usize) {
+	let std::cmp::Ordering::Less = g.cap.cmp(&bytes) else {
+		return;
+	};
+	for _old in std::num::NonZeroUsize::new(g.ptr).into_iter() {
+		unsafe { crate::hip::host_free(g.ptr as *mut c_void) }.ok();
 	}
-	g.0 as *mut u8
+	g.ptr = crate::hip::host_malloc(bytes, 0).expect("run_pin host_malloc") as usize;
+	g.cap = bytes;
 }
 
 fn run_pin(bytes: usize) -> *mut u8 {
@@ -598,28 +731,48 @@ fn run_pin(bytes: usize) -> *mut u8 {
 	pin_ensure(&mut g, bytes)
 }
 
-pub(crate) fn bounce_range() -> Option<(usize, usize)> {
-	let base = *BOUNCE.lock().ok()?;
-	(base != 0).then_some((base, BOUNCE_BYTES))
+pub(crate) struct BounceRange {
+	pub base: usize,
+	pub len: usize,
 }
 
-static RECENT_RANGES: Mutex<Vec<(usize, usize, &'static str)>> = Mutex::new(Vec::new());
+pub(crate) fn bounce_range() -> Option<BounceRange> {
+	let base = *BOUNCE.lock().ok()?;
+	std::num::NonZeroUsize::new(base).map(|nz| BounceRange { base: nz.get(), len: BOUNCE_BYTES })
+}
+
+struct Range {
+	base: usize,
+	len: usize,
+	what: &'static str,
+}
+
+static RECENT_RANGES: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 
 pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
-	if let Ok(mut r) = RECENT_RANGES.lock() {
-		if r.len() >= 256 {
-			r.remove(0);
-		}
-		r.push((base, len, what));
+	let Ok(mut r) = RECENT_RANGES.lock() else {
+		return;
+	};
+	for _full in Some(()).filter(|_u| r.len() >= 256).into_iter() {
+		r.remove(0);
 	}
+	r.push(Range { base, len, what });
 }
 
 pub(crate) fn locate_va(va: usize) -> Option<String> {
 	let r = RECENT_RANGES.lock().ok()?;
 	r.iter()
 		.rev()
-		.find(|(b, l, _)| va >= *b && va < b + l)
-		.map(|(b, l, what)| format!("{what} [base 0x{b:x} len {}] +0x{:x}", fmt_bytes(*l), va - b))
+		.find(|range| va >= range.base && va < range.base + range.len)
+		.map(|range| {
+			format!(
+				"{} [base 0x{:x} len {}] +0x{:x}",
+				range.what,
+				range.base,
+				fmt_bytes(range.len),
+				va - range.base
+			)
+		})
 }
 
 pub(crate) fn free_bounce() {
@@ -627,8 +780,8 @@ pub(crate) fn free_bounce() {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	if *guard != 0 {
-		let _ = unsafe { crate::hip::host_free(*guard as *mut c_void) };
+	for _live in std::num::NonZeroUsize::new(*guard).into_iter() {
+		unsafe { crate::hip::host_free(*guard as *mut c_void) }.ok();
 		*guard = 0;
 	}
 }
@@ -638,10 +791,11 @@ pub(crate) fn free_run_pin() {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	if guard.0 != 0 {
-		let _ = crate::hip::device_synchronize();
-		let _ = unsafe { crate::hip::host_free(guard.0 as *mut c_void) };
-		*guard = (0, 0);
+	for _live in std::num::NonZeroUsize::new(guard.ptr).into_iter() {
+		crate::hip::device_synchronize().ok();
+		unsafe { crate::hip::host_free(guard.ptr as *mut c_void) }.ok();
+		guard.ptr = 0;
+		guard.cap = 0;
 	}
 }
 
@@ -655,10 +809,15 @@ unsafe fn h2d_pinned(
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	if *guard == 0 {
-		*guard = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
-	}
-	let pin = *guard as *mut u8;
+	let base = match std::num::NonZeroUsize::new(*guard) {
+		Some(nz) => nz.get(),
+		None => {
+			let fresh = crate::hip::host_malloc(BOUNCE_BYTES, 0)? as usize;
+			*guard = fresh;
+			fresh
+		}
+	};
+	let pin = base as *mut u8;
 	let mut done = 0usize;
 	while done < bytes {
 		let chunk = BOUNCE_BYTES.min(bytes - done);
@@ -682,7 +841,7 @@ unsafe fn h2d_pinned(
 pub const BOUNCE_LIMIT: usize = BOUNCE_BYTES;
 
 pub struct ExitD2H {
-	_guard: std::sync::MutexGuard<'static, (usize, usize)>,
+	_guard: std::sync::MutexGuard<'static, PinBuf>,
 	pin: usize,
 	bytes: usize,
 }
@@ -726,7 +885,7 @@ pub(crate) fn device_init_once() {
 	crate::gate::acquire();
 	DEVICE_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
-		if let Err(e) = crate::hip::set_pool_retain(0) {
+		for e in crate::hip::set_pool_retain(0).err().into_iter() {
 			eprintln!("GPU pool retain failed: {e}");
 		}
 		crate::hip::register_fault_autopsy_once();
@@ -743,7 +902,7 @@ pub fn pool_trim() {
 pub const USER_GB: usize = 1 << 30;
 
 pub fn vram_free_base() -> usize {
-	let hip_free = crate::hip::mem_info().expect("hipMemGetInfo").0;
+	let hip_free = crate::hip::mem_info().expect("hipMemGetInfo").free;
 	let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
 	let slack = crate::hip::pool_slack(0).expect("pool_slack");
 	hip_free.min(sys_free).saturating_sub(slack)
@@ -760,10 +919,10 @@ pub fn set_device_arena(base: *mut c_void, size: usize) {
 }
 
 pub fn arena_remaining() -> usize {
-	if ARENA_BASE.load(Ordering::Relaxed) == 0 {
-		return 0;
+	match std::num::NonZeroUsize::new(ARENA_BASE.load(Ordering::Relaxed)) {
+		None => 0,
+		Some(_base) => ARENA_SIZE.load(Ordering::Relaxed).saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed)),
 	}
-	ARENA_SIZE.load(Ordering::Relaxed).saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed))
 }
 
 pub fn device_arena_active() -> bool {
@@ -773,7 +932,7 @@ pub fn device_arena_active() -> bool {
 pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<usize> {
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
-		if probe_survives(want) {
+		for _ok in Some(()).filter(|_u| probe_survives(want)).into_iter() {
 			eprintln!("claim probe: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
 			return Some(want);
 		}
@@ -784,10 +943,16 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 }
 
 
+#[derive(Clone, Copy)]
+enum Ownership {
+	Pool,
+	Borrow,
+}
+
 pub struct GpuBuffer {
 	pub(crate) ptr: *mut c_void,
 	len: usize,
-	owned: bool,
+	owned: Ownership,
 	tag: &'static str,
 }
 
@@ -799,12 +964,12 @@ impl GpuBuffer {
 		Self {
 			ptr,
 			len,
-			owned: false,
+			owned: Ownership::Borrow,
 			tag: "borrow",
 		}
 	}
 
-	pub fn is_pool_owned(&self) -> bool { self.owned }
+	pub fn is_pool_owned(&self) -> bool { matches!(self.owned, Ownership::Pool) }
 
 	pub fn alloc(n_floats: usize) -> Result<Self, HipError> {
 		Self::alloc_bytes(n_floats * std::mem::size_of::<f64>())
@@ -819,13 +984,13 @@ impl GpuBuffer {
 			Ok(buf) => Ok(buf),
 			Err(e) => {
 				oom_report(n_bytes);
-				if device_arena_active() {
-					panic!(
+				match std::num::NonZeroUsize::new(ARENA_BASE.load(Ordering::Relaxed)) {
+					Some(_active) => panic!(
 						"arena carve miss: {n_bytes} B asked, {} B remain — placement exceeded the claim",
 						arena_remaining()
-					);
+					),
+					None => Err(e),
 				}
-				Err(e)
 			}
 		}
 	}
@@ -841,14 +1006,14 @@ impl GpuBuffer {
 		device_init_once();
 		ALLOC_FROZEN.with(|f| {
 			assert!(
-				!f.get(),
+				matches!(f.get(), Frozen::No),
 				"GPU allocation inside frozen training loop (requested {n_bytes} bytes)"
 			)
 		});
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
 		let base = ARENA_BASE.load(Ordering::Relaxed);
-		if base != 0 {
+		for _active in std::num::NonZeroUsize::new(base).into_iter() {
 			let size = ARENA_SIZE.load(Ordering::Relaxed);
 			let aligned = (n_bytes + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1);
 			let mut off = ARENA_OFFSET.load(Ordering::Relaxed);
@@ -859,7 +1024,7 @@ impl GpuBuffer {
 					Ordering::Relaxed,
 					Ordering::Relaxed,
 				) {
-					Ok(_) => {
+					Ok(_prev) => {
 						let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
 						tag_sub("unclaimed", aligned);
 						tag_add(tag, n_bytes);
@@ -868,15 +1033,13 @@ impl GpuBuffer {
 						return Ok(Self {
 							ptr,
 							len: n_bytes,
-							owned: false,
+							owned: Ownership::Borrow,
 							tag,
 						});
 					}
 					Err(cur) => off = cur,
 				}
 			}
-		}
-		if base != 0 {
 			return Err(HipError(2));
 		}
 		match claim_device_arena() {
@@ -894,7 +1057,7 @@ impl GpuBuffer {
 	pub(crate) fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
 		device_init_once();
 		ALLOC_FROZEN.with(|f| {
-			assert!(!f.get(), "GPU claim inside frozen training loop (requested {n_bytes} bytes)")
+			assert!(matches!(f.get(), Frozen::No), "GPU claim inside frozen training loop (requested {n_bytes} bytes)")
 		});
 		assert_eq!(
 			ARENA_BASE.load(Ordering::Relaxed),
@@ -904,7 +1067,8 @@ impl GpuBuffer {
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
 		let remaining = vram_free_base();
-		if n_bytes > remaining.saturating_sub(USER_GB) {
+		let cap = remaining.saturating_sub(USER_GB);
+		for _over in Some(()).filter(|_u| matches!(n_bytes.cmp(&cap), std::cmp::Ordering::Greater)).into_iter() {
 			return None;
 		}
 		let ptr = Self::map_bytes(n_bytes).ok()?;
@@ -913,7 +1077,7 @@ impl GpuBuffer {
 		Some(Self {
 			ptr,
 			len: n_bytes,
-			owned: true,
+			owned: Ownership::Pool,
 			tag,
 		})
 	}
@@ -1074,28 +1238,25 @@ impl GpuBuffer {
 
 impl Drop for GpuBuffer {
 	fn drop(&mut self) {
-		if self.owned && !self.ptr.is_null() && !SHUTTING_DOWN.load(Ordering::Relaxed) {
-			tag_sub(self.tag, self.len);
-			FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
-			crate::callspy::tick(&crate::callspy::FREE_ASYNC);
-			let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
-			if code != 0 {
-				eprintln!(
-					"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:p}",
-					self.len, self.tag, self.ptr
-				);
-			}
-			self.ptr = std::ptr::null_mut();
+		let Ownership::Pool = self.owned else {
+			return;
+		};
+		let Some(_nn) = std::ptr::NonNull::new(self.ptr) else {
+			return;
+		};
+		let Lifecycle::Running = lifecycle() else {
+			return;
+		};
+		tag_sub(self.tag, self.len);
+		FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
+		crate::callspy::tick(&crate::callspy::FREE_ASYNC);
+		let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
+		for _fail in std::num::NonZeroI32::new(code).into_iter() {
+			eprintln!(
+				"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:p}",
+				self.len, self.tag, self.ptr
+			);
 		}
+		self.ptr = std::ptr::null_mut();
 	}
-}
-
-pub struct Chan<T> {
-	pub tx: std::sync::mpsc::SyncSender<T>,
-	pub rx: std::sync::mpsc::Receiver<T>,
-}
-
-pub fn sync_chan<T>(depth: usize) -> Chan<T> {
-	let (tx, rx) = std::sync::mpsc::sync_channel::<T>(depth);
-	Chan { tx, rx }
 }

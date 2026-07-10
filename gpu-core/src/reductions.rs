@@ -386,7 +386,7 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	let pn = next_pow2(n);
 	let mut work = GpuBuffer::alloc(pn)?;
 	work.copy_from(x, n * 8)?;
-	if pn > n {
+	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&work, n, pn, &sentinel)?;
@@ -411,7 +411,7 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	let vals = GpuBuffer::alloc_bytes(pn * 4)?;
 	keys.copy_from(x, n * 8)?;
 	gpu_init_idx(pn, &vals)?;
-	if pn > n {
+	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&keys, n, pn, &sentinel)?;
@@ -442,7 +442,7 @@ pub fn gpu_sort_by_key(
 	let mut wv = GpuBuffer::alloc(pn)?;
 	wk.copy_from(keys, n * 8)?;
 	wv.copy_from(vals, n * 8)?;
-	if pn > n {
+	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&wk, n, pn, &sentinel)?;

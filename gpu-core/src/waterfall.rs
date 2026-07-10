@@ -9,11 +9,22 @@ pub enum Home {
 	Disk,
 }
 
+#[derive(Clone, Copy)]
+enum Fill {
+	Open,
+	Full,
+}
+
+enum Tier {
+	Use,
+	Skip,
+}
+
 pub struct Waterfall {
 	slab: Option<GpuBuffer>,
 	homes: HashMap<String, Home>,
-	vram_full: bool,
-	ram_full: bool,
+	vram_full: Fill,
+	ram_full: Fill,
 	ram_floor: usize,
 	vram_bytes: usize,
 	ram_bytes: usize,
@@ -43,8 +54,8 @@ impl Waterfall {
 		Waterfall {
 			slab: None,
 			homes: HashMap::new(),
-			vram_full: true,
-			ram_full: false,
+			vram_full: Fill::Full,
+			ram_full: Fill::Open,
 			ram_floor: mem_available() / 10,
 			vram_bytes: 0,
 			ram_bytes: 0,
@@ -55,7 +66,7 @@ impl Waterfall {
 	pub fn from_arena(slab: GpuBuffer) -> Self {
 		let mut w = Self::new();
 		w.slab = Some(slab);
-		w.vram_full = false;
+		w.vram_full = Fill::Open;
 		w
 	}
 
@@ -67,35 +78,56 @@ impl Waterfall {
 	) -> Result<&Home> {
 		let home = self.settle(len, fill)?;
 		match &home {
-			Home::Vram(_) => self.vram_bytes += len,
-			Home::Ram(_) => self.ram_bytes += len,
+			Home::Vram(..) => self.vram_bytes += len,
+			Home::Ram(..) => self.ram_bytes += len,
 			Home::Disk => self.disk_bytes += len,
 		}
 		Ok(self.homes.entry(name.to_string()).or_insert(home))
 	}
 
 	fn settle(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
-		if !self.vram_full {
-			if crate::memory::arena_remaining() < len {
-				self.vram_full = true;
-			} else {
+		let vram = match self.vram_full {
+			Fill::Full => Tier::Skip,
+			Fill::Open => match crate::memory::arena_remaining().cmp(&len) {
+				std::cmp::Ordering::Less => {
+					self.vram_full = Fill::Full;
+					Tier::Skip
+				}
+				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => Tier::Use,
+			},
+		};
+		match vram {
+			Tier::Use => {
 				let _t = tag_scope("waterfall");
 				let view = GpuBuffer::alloc_bytes(len).map_err(|e| Error::other(format!("carve: {e}")))?;
 				let mut host = vec![0u8; len];
 				fill(&mut host)?;
 				view.write_u8(&host).map_err(|e| Error::other(format!("waterfall H2D: {e}")))?;
-				return Ok(Home::Vram(view));
+				Ok(Home::Vram(view))
 			}
+			Tier::Skip => self.settle_host(len, fill),
 		}
-		if !self.ram_full {
-			if mem_available().saturating_sub(len) > self.ram_floor {
+	}
+
+	fn settle_host(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
+		let ram = match self.ram_full {
+			Fill::Full => Tier::Skip,
+			Fill::Open => match mem_available().saturating_sub(len).cmp(&self.ram_floor) {
+				std::cmp::Ordering::Greater => Tier::Use,
+				std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+					self.ram_full = Fill::Full;
+					Tier::Skip
+				}
+			},
+		};
+		match ram {
+			Tier::Use => {
 				let mut host = vec![0u8; len];
 				fill(&mut host)?;
-				return Ok(Home::Ram(host));
+				Ok(Home::Ram(host))
 			}
-			self.ram_full = true;
+			Tier::Skip => Ok(Home::Disk),
 		}
-		Ok(Home::Disk)
 	}
 
 	pub fn home(&self, name: &str) -> Option<&Home> {

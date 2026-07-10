@@ -42,31 +42,24 @@ pub struct LayerParams {
 	pub conv_stride: usize,
 }
 
-pub fn concat_layer(params: &[LayerParams]) -> Option<(usize, usize, usize)> {
-	concat_layer_dims_iter(params.iter().map(|p| (p.kind, p.in_dim, p.out_dim)))
-}
-
-pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<(usize, usize, usize)> {
-	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
-}
-
+#[derive(Clone, Copy)]
 pub struct ConcatDims {
 	pub pf: usize,
 	pub a: usize,
 	pub c: usize,
 }
 
-pub fn concat_layer_s(params: &[LayerParams]) -> Option<ConcatDims> {
-	concat_layer(params).map(|(pf, a, c)| ConcatDims { pf, a, c })
+pub fn concat_layer(params: &[LayerParams]) -> Option<ConcatDims> {
+	concat_layer_dims_iter(params.iter().map(|p| (p.kind, p.in_dim, p.out_dim)))
 }
 
-pub fn concat_layer_dims_s(dims: &[LayerDims]) -> Option<ConcatDims> {
-	concat_layer_dims(dims).map(|(pf, a, c)| ConcatDims { pf, a, c })
+pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<ConcatDims> {
+	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
 }
 
 fn concat_layer_dims_iter(
 	it: impl Iterator<Item = (LayerKind, usize, usize)>,
-) -> Option<(usize, usize, usize)> {
+) -> Option<ConcatDims> {
 	let layers: Vec<(LayerKind, usize, usize)> = it.collect();
 	for l in 1..layers.len() {
 		let (prev_kind, _, prev_out) = layers[l - 1];
@@ -74,7 +67,7 @@ fn concat_layer_dims_iter(
 		if kind == LayerKind::Dense && matches!(prev_kind, LayerKind::Embed | LayerKind::Attn) {
 			let a = prev_out;
 			let c = in_dim.saturating_sub(a);
-			return (c > 0).then_some((l, a, c));
+			return (c > 0).then_some(ConcatDims { pf: l, a, c });
 		}
 	}
 	None
@@ -312,7 +305,7 @@ pub enum PlanMode {
 	Warm,
 }
 
-pub fn plan_layer_params_m(
+pub fn plan_layer_params(
 	specs: &[LayerSpec],
 	d: usize,
 	c_cat: usize,
@@ -320,17 +313,7 @@ pub fn plan_layer_params_m(
 	resumed: &[Saved],
 	mode: PlanMode,
 ) -> Result<LayerPlan, String> {
-	plan_layer_params(specs, d, c_cat, vocab, resumed, mode == PlanMode::Warm)
-}
-
-pub fn plan_layer_params(
-	specs: &[LayerSpec],
-	d: usize,
-	c_cat: usize,
-	vocab: usize,
-	resumed: &[Saved],
-	try_resume: bool,
-) -> Result<LayerPlan, String> {
+	let try_resume = mode == PlanMode::Warm;
 	let mut plan = LayerPlan { entries: Vec::new(), host: Vec::new() };
 	let dummy_off = plan.zeros(1).off;
 	let dummy = || BlockPlan { off: dummy_off, len: 1 };

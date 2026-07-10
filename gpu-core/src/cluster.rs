@@ -245,8 +245,9 @@ pub fn gpu_union_find_cc(
 		uf_hook(edge_src, edge_dst, n_edges, &labels, &changed)?;
 		uf_compress(n_nodes, &labels)?;
 		changed.download_i32(&mut flag)?;
-		if flag[0] == 0 {
-			break;
+		match flag[0].cmp(&0) {
+			std::cmp::Ordering::Equal => break,
+			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => continue,
 		}
 	}
 	Ok(labels)
@@ -396,26 +397,32 @@ pub fn gpu_boruvka_mst(
 		let mut sel_src: Vec<i32> = Vec::new();
 		let mut sel_dst: Vec<i32> = Vec::new();
 		for &e in &best_edge_h {
-			if e >= 0 && (e as usize) < n_edges && seen.insert(e) {
-				sel_src.push(src_h[e as usize]);
-				sel_dst.push(dst_h[e as usize]);
+			for i in usize::try_from(e).ok()
+				.filter(|&idx| idx < n_edges)
+				.filter(|_idx| seen.insert(e))
+				.into_iter()
+			{
+				sel_src.push(src_h[i]);
+				sel_dst.push(dst_h[i]);
 			}
 		}
-		if sel_src.is_empty() {
-			break;
-		}
+		match sel_src.len().cmp(&0) {
+			std::cmp::Ordering::Equal | std::cmp::Ordering::Less => break,
+			std::cmp::Ordering::Greater => {
+				let sel_src_buf = GpuBuffer::upload_i32(&sel_src)?;
+				let sel_dst_buf = GpuBuffer::upload_i32(&sel_dst)?;
+				let n_sel = sel_src.len();
 
-		let sel_src_buf = GpuBuffer::upload_i32(&sel_src)?;
-		let sel_dst_buf = GpuBuffer::upload_i32(&sel_dst)?;
-		let n_sel = sel_src.len();
-
-		loop {
-			changed.memset_zero(std::mem::size_of::<i32>())?;
-			uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
-			uf_compress(n_nodes, &parent)?;
-			changed.download_i32(&mut flag)?;
-			if flag[0] == 0 {
-				break;
+				loop {
+					changed.memset_zero(std::mem::size_of::<i32>())?;
+					uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
+					uf_compress(n_nodes, &parent)?;
+					changed.download_i32(&mut flag)?;
+					match flag[0].cmp(&0) {
+						std::cmp::Ordering::Equal => break,
+						std::cmp::Ordering::Less | std::cmp::Ordering::Greater => continue,
+					}
+				}
 			}
 		}
 	}

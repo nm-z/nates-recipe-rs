@@ -2,8 +2,8 @@ use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, PlanMode, Scaler, infer_scored_struct, load_ogdl_str, pinned_vocab,
-	plan_layer_params_m, vram_estimate,
+	LayerParams, PlanMode, Scaler, infer_scored, load_ogdl_str, pinned_vocab,
+	plan_layer_params, vram_estimate,
 };
 use std::cell::{Cell, RefCell};
 use std::io::IsTerminal;
@@ -280,9 +280,9 @@ impl Train {
 		let ds = prepared.get();
 		let pass = match data.infer_only() {
 			InferOnly::Forward => Pass::Forward,
-			InferOnly::Fit => match [usize::from(ds.has_target), self.epochs.min(1)] {
-				[1, 1] => Pass::Fit,
-				_other => Pass::Forward,
+			InferOnly::Fit => match self.epochs.checked_sub(1).filter(|_e| ds.has_target) {
+				Some(_go) => Pass::Fit,
+				None => Pass::Forward,
 			},
 		};
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
@@ -362,13 +362,13 @@ impl Train {
 						let total = (ei.n * k) as f64;
 						let ybar = ds.y.iter().sum::<f64>() / total;
 						let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-						let __sc = infer_scored_struct(
+						let __sc = infer_scored(
 							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
 							model.loss, model.lr, &self.metrics, ss_tot,
 						);
 						assert!(__sc.is_ok(), "run: eval metrics: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 						let Ok(sc) = __sc else { loop {} };
-						eprintln!("eval  {}", model.metrics_line(&self.metrics, &sc.vals));
+						eprintln!("eval  {}", crate::train::metrics_line(&self.metrics, &sc.vals));
 						let stop = Some(Metric::Accuracy)
 							.filter(|_m| model.loss.is_classification())
 							.unwrap_or(Metric::R2);
@@ -378,7 +378,7 @@ impl Train {
 						ScorePreds { score, preds: sc.preds }
 					}
 					None => {
-						let __sc = infer_scored_struct(
+						let __sc = infer_scored(
 							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
 							model.loss, model.lr, &[], 0.0,
 						);
@@ -528,7 +528,7 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, pass: Pass) -> us
 	let shape = Some(())
 		.filter(|_probe| embed_cats)
 		.map(|_probe| {
-			let n_oh: usize = ds.onehot_spans().iter().map(|g| g.len).sum();
+			let n_oh: usize = ds.onehot_groups.iter().map(|g| g.len).sum();
 			CatShape { cat_cols: d - n_oh, text_d: ds.onehot_groups.len(), vocab: n_oh }
 		})
 		.or_else(|| {
@@ -575,7 +575,7 @@ impl ModelInner {
 			let __saved = load_ogdl_str(&m.text);
 			assert!(__saved.is_ok(), "eval: parse host weight mirror: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let Ok(saved) = __saved else { loop {} };
-			let __plan = plan_layer_params_m(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm);
+			let __plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm);
 			assert!(__plan.is_ok(), "eval: rebuild weights from mirror: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let Ok(plan) = __plan else { loop {} };
 			let host = plan.host();
@@ -591,6 +591,19 @@ impl ModelInner {
 		*self.params.borrow_mut() = params;
 		self.arena_gen.set(gpu_core::memory::live_parked_gen());
 	}
+}
+
+fn output_check(loss: Loss, last_out: usize, n_layers: usize, k: usize) -> Option<Issue> {
+	let (want, need) = match loss {
+		Loss::Bce | Loss::Focal => (1, "1 (.layer(1).sigmoid())".to_string()),
+		Loss::Ce if k > 1 => (k, format!("{k} (one per target column)")),
+		Loss::Ce | Loss::Mse | Loss::Mae | Loss::Huber => return None,
+	};
+	(last_out != want).then(|| Issue {
+		what: format!("dense layer {n_layers} outputs {last_out}, {} loss expects {want}", loss.name()),
+		have: format!("{last_out} output units"),
+		need,
+	})
 }
 
 fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Vec<Issue> {
@@ -613,27 +626,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 		_other => 0,
 	};
 	let n_layers = model.specs.len();
-	Some(()).filter(|_probe| model.loss == Loss::Bce && last_out != 1).map(|_probe| {
-		issues.push(Issue {
-			what: format!("dense layer {n_layers} outputs {last_out}, bce loss expects 1"),
-			have: format!("{last_out} output units"),
-			need: "1 (.layer(1).sigmoid())".into(),
-		})
-	}).unwrap_or(());
-	Some(()).filter(|_probe| model.loss == Loss::Focal && last_out != 1).map(|_probe| {
-		issues.push(Issue {
-			what: format!("dense layer {n_layers} outputs {last_out}, focal loss expects 1"),
-			have: format!("{last_out} output units"),
-			need: "1 (.layer(1).sigmoid())".into(),
-		})
-	}).unwrap_or(());
-	Some(()).filter(|_probe| model.loss == Loss::Ce && k > 1 && last_out != k).map(|_probe| {
-		issues.push(Issue {
-			what: format!("dense layer {n_layers} outputs {last_out}, ce loss expects {k}"),
-			have: format!("{last_out} output units"),
-			need: format!("{k} (one per target column)"),
-		})
-	}).unwrap_or(());
+	issues.extend(output_check(model.loss, last_out, n_layers, k));
 
 	let mut free_vram = 0usize;
 	let mut total_vram = 0usize;
@@ -736,7 +729,7 @@ impl Model {
 		let __vocab = pinned_vocab(&inner.specs);
 		assert!(__vocab.is_some(), "Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
 		let Some(vocab) = __vocab else { loop {} };
-		let __plan = plan_layer_params_m(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm);
+		let __plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm);
 		assert!(__plan.is_ok(), "Model::load: plan layer params: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let Ok(plan) = __plan else { loop {} };
 		let host = plan.host();
@@ -845,7 +838,7 @@ impl Model {
 				let total = (ei.n * k) as f64;
 				let ybar = ds.y.iter().sum::<f64>() / total;
 				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-				let __sc = infer_scored_struct(
+				let __sc = infer_scored(
 					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
 					inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
 				);
@@ -858,7 +851,7 @@ impl Model {
 				sc.preds
 			}
 			None => {
-				let __sc = infer_scored_struct(
+				let __sc = infer_scored(
 					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
 					inner.loss, inner.lr, &[], 0.0,
 				);

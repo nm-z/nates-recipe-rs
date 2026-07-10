@@ -23,24 +23,42 @@ impl Work {
 
 const F8: f64 = 8.0;
 
-fn saves_preact(a: Activation) -> bool {
-	matches!(
-		a,
-		Activation::Silu | Activation::Gelu | Activation::Elu | Activation::Selu | Activation::PRelu
-	)
+fn saves_preact(a: Activation) -> Option<()> {
+	Some(()).filter(|_u| {
+		matches!(
+			a,
+			Activation::Silu | Activation::Gelu | Activation::Elu | Activation::Selu | Activation::PRelu
+		)
+	})
 }
 
 fn act_fwd(a: Activation, m: f64) -> Work {
 	match a {
 		Activation::Linear => Work::default(),
-		_ => Work { flop: 4.0 * m, bytes: 2.0 * F8 * m },
+		Activation::Relu
+		| Activation::Sigmoid
+		| Activation::LeakyRelu
+		| Activation::PRelu
+		| Activation::Elu
+		| Activation::Selu
+		| Activation::Tanh
+		| Activation::Silu
+		| Activation::Gelu => Work { flop: 4.0 * m, bytes: 2.0 * F8 * m },
 	}
 }
 
 fn act_bwd(a: Activation, m: f64) -> Work {
 	match a {
 		Activation::Linear => Work::default(),
-		_ => Work { flop: 4.0 * m, bytes: 3.0 * F8 * m },
+		Activation::Relu
+		| Activation::Sigmoid
+		| Activation::LeakyRelu
+		| Activation::PRelu
+		| Activation::Elu
+		| Activation::Selu
+		| Activation::Tanh
+		| Activation::Silu
+		| Activation::Gelu => Work { flop: 4.0 * m, bytes: 3.0 * F8 * m },
 	}
 }
 
@@ -49,12 +67,14 @@ fn sgd(e: f64) -> Work {
 }
 
 pub fn layer_fwd(p: &LayerParams, n: usize) -> Work {
-	let (nf, i, o) = (n as f64, p.in_dim as f64, p.out_dim as f64);
+	let nf = n as f64;
+	let i = p.in_dim as f64;
+	let o = p.out_dim as f64;
 	let mut w = Work::default();
 	match p.kind {
 		LayerKind::Dense => {
 			w.add(2.0 * nf * i * o, F8 * (nf * i + i * o + o + nf * o));
-			if saves_preact(p.act) {
+			for _u in saves_preact(p.act).into_iter() {
 				w.add(0.0, 2.0 * F8 * nf * o);
 			}
 			w = w.plus(act_fwd(p.act, nf * o));
@@ -69,11 +89,12 @@ pub fn layer_fwd(p: &LayerParams, n: usize) -> Work {
 			w.add(4.0 * nf * s * s * d + 4.0 * nf * h * s * s, F8 * (4.0 * m * d + nf * h * s));
 		}
 		LayerKind::Conv => {
-			let (cin, k) = (p.conv_cin as f64, p.conv_k as f64);
+			let cin = p.conv_cin as f64;
+			let k = p.conv_k as f64;
 			let lout = ((p.in_dim / p.conv_cin - p.conv_k) / p.conv_stride + 1) as f64;
 			let cout = o / lout;
 			w.add(2.0 * nf * cout * lout * cin * k, F8 * (nf * i + cout * cin * k + cout + nf * o));
-			if saves_preact(p.act) {
+			for _u in saves_preact(p.act).into_iter() {
 				w.add(0.0, 2.0 * F8 * nf * o);
 			}
 			w = w.plus(act_fwd(p.act, nf * o));
@@ -88,14 +109,16 @@ pub fn layer_fwd(p: &LayerParams, n: usize) -> Work {
 }
 
 pub fn layer_bwd(p: &LayerParams, n: usize, first: bool) -> Work {
-	let (nf, i, o) = (n as f64, p.in_dim as f64, p.out_dim as f64);
+	let nf = n as f64;
+	let i = p.in_dim as f64;
+	let o = p.out_dim as f64;
 	let mut w = Work::default();
 	match p.kind {
 		LayerKind::Dense => {
 			w = w.plus(act_bwd(p.act, nf * o));
 			w.add(2.0 * nf * i * o, F8 * (nf * i + nf * o + i * o));
 			w.add(nf * o, F8 * (nf * o + o));
-			if !first {
+			for _u in Some(()).filter(|_g| !first).into_iter() {
 				w.add(2.0 * nf * i * o, F8 * (nf * o + i * o + nf * i));
 			}
 			w = w.plus(sgd(i * o)).plus(sgd(o));
@@ -111,13 +134,14 @@ pub fn layer_bwd(p: &LayerParams, n: usize, first: bool) -> Work {
 			w = w.plus(sgd(4.0 * d * d));
 		}
 		LayerKind::Conv => {
-			let (cin, k) = (p.conv_cin as f64, p.conv_k as f64);
+			let cin = p.conv_cin as f64;
+			let k = p.conv_k as f64;
 			let lout = ((p.in_dim / p.conv_cin - p.conv_k) / p.conv_stride + 1) as f64;
 			let cout = o / lout;
 			w = w.plus(act_bwd(p.act, nf * o));
 			w.add(2.0 * nf * cout * lout * cin * k, F8 * (nf * o + nf * i + cout * cin * k));
 			w.add(nf * o, F8 * (nf * o + cout));
-			if !first {
+			for _u in Some(()).filter(|_g| !first).into_iter() {
 				w.add(2.0 * nf * cout * lout * cin * k, F8 * (nf * o + cout * cin * k + nf * i));
 			}
 			w = w.plus(sgd(cout * cin * k)).plus(sgd(cout));

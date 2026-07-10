@@ -50,15 +50,20 @@ static FREES: [AtomicU64; N_KINDS] =
 	[AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static UNKNOWN_FREES: AtomicU64 = AtomicU64::new(0);
 
-// ptr -> (size, kind). Plain std Mutex/HashMap: the hooks never wrap malloc,
-// so allocating inside a hook cannot recurse into a hook.
-static MAP: OnceLock<Mutex<HashMap<usize, (u64, u8)>>> = OnceLock::new();
+struct Alloc {
+	size: u64,
+	kind: u8,
+}
 
-fn map() -> &'static Mutex<HashMap<usize, (u64, u8)>> {
+// ptr -> Alloc record. Plain std Mutex/HashMap: the hooks never wrap malloc,
+// so allocating inside a hook cannot recurse into a hook.
+static MAP: OnceLock<Mutex<HashMap<usize, Alloc>>> = OnceLock::new();
+
+fn map() -> &'static Mutex<HashMap<usize, Alloc>> {
 	MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_map() -> std::sync::MutexGuard<'static, HashMap<usize, (u64, u8)>> {
+fn lock_map() -> std::sync::MutexGuard<'static, HashMap<usize, Alloc>> {
 	match map().lock() {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
@@ -67,7 +72,7 @@ fn lock_map() -> std::sync::MutexGuard<'static, HashMap<usize, (u64, u8)>> {
 
 fn record_alloc(ptr: usize, size: u64, kind: u8) {
 	let k = kind as usize;
-	lock_map().insert(ptr, (size, kind));
+	lock_map().insert(ptr, Alloc { size, kind });
 	let live = LIVE[k].fetch_add(size, Ordering::Relaxed) + size;
 	ALLOCS[k].fetch_add(1, Ordering::Relaxed);
 	PEAK[k].fetch_max(live, Ordering::Relaxed);
@@ -75,9 +80,9 @@ fn record_alloc(ptr: usize, size: u64, kind: u8) {
 
 fn record_free(ptr: usize) {
 	match lock_map().remove(&ptr) {
-		Some((size, kind)) => {
-			let k = kind as usize;
-			LIVE[k].fetch_sub(size, Ordering::Relaxed);
+		Some(a) => {
+			let k = a.kind as usize;
+			LIVE[k].fetch_sub(a.size, Ordering::Relaxed);
 			FREES[k].fetch_add(1, Ordering::Relaxed);
 		}
 		None => {
@@ -101,12 +106,14 @@ fn resolve_next(name: &CStr) -> usize {
 	// SAFETY: dlsym with a valid NUL-terminated name; RTLD_NEXT is well-defined
 	// when this library was loaded via LD_PRELOAD.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-	if p.is_null() {
-		eprintln!("vramspy: RTLD_NEXT resolution failed for {}", name.to_string_lossy());
-		// SAFETY: abort() takes no arguments and never returns.
-		unsafe { libc::abort() };
+	match std::ptr::NonNull::new(p) {
+		Some(nn) => nn.as_ptr() as usize,
+		None => {
+			eprintln!("vramspy: RTLD_NEXT resolution failed for {}", name.to_string_lossy());
+			// SAFETY: abort() takes no arguments and never returns.
+			unsafe { libc::abort() }
+		}
 	}
-	p as usize
 }
 
 fn real() -> &'static Real {
@@ -129,53 +136,79 @@ fn real() -> &'static Real {
 
 fn resolve_next_or_default(name: &CStr) -> Option<usize> {
 	// SAFETY: dlsym with a valid NUL-terminated name.
-	let mut p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-	if p.is_null() {
+	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+	let q = match std::ptr::NonNull::new(p) {
+		Some(nn) => nn.as_ptr(),
 		// SAFETY: same call, different pseudo-handle.
-		p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-	}
-	if p.is_null() { None } else { Some(p as usize) }
+		None => unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) },
+	};
+	std::ptr::NonNull::new(q).map(|nn| nn.as_ptr() as usize)
 }
 
-struct BuildCtx<'a> {
-	pools: &'a mut HashMap<u64, u8>,
+enum DevKind {
+	Gpu,
+	Other,
+}
+
+fn dev_kind(dev_type: u32) -> DevKind {
+	match Some(()).filter(|_u| dev_type == HSA_DEVICE_TYPE_GPU) {
+		Some(_u) => DevKind::Gpu,
+		None => DevKind::Other,
+	}
+}
+
+struct BuildCtx<'ctx> {
+	pools: &'ctx mut HashMap<u64, u8>,
 	agent_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 	iterate_pools: unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 }
 
-struct PoolCtx<'a> {
-	pools: &'a mut HashMap<u64, u8>,
-	is_gpu: bool,
+struct PoolCtx<'ctx> {
+	pools: &'ctx mut HashMap<u64, u8>,
+	dev: DevKind,
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
+}
+
+struct Syms {
+	ia: usize,
+	agi: usize,
+	ip: usize,
+	pgi: usize,
+}
+
+fn pool_kind(ctx: &PoolCtx, pool: u64) -> u8 {
+	let mut segment: u32 = u32::MAX;
+	// SAFETY: FFI query; segment is a valid out-param for the call's duration.
+	let r1 = unsafe {
+		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &mut segment as *mut u32 as *mut c_void)
+	};
+	let global = Some(()).filter(|_u| r1 == HSA_STATUS_SUCCESS && segment == HSA_AMD_SEGMENT_GLOBAL);
+	let Some(_g) = global else {
+		return KIND_OTHER;
+	};
+	let mut flags: u32 = 0;
+	// SAFETY: FFI query; flags is a valid out-param for the call's duration.
+	let r2 = unsafe {
+		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &mut flags as *mut u32 as *mut c_void)
+	};
+	let kernarg = Some(()).filter(|_u| {
+		r2 == HSA_STATUS_SUCCESS && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) != 0
+	});
+	match kernarg {
+		Some(_k) => KIND_KERNARG,
+		None => match ctx.dev {
+			DevKind::Gpu => KIND_DEVICE,
+			DevKind::Other => KIND_HOST_PINNED,
+		},
+	}
 }
 
 extern "C" fn pool_cb(pool: u64, data: *mut c_void) -> i32 {
 	// SAFETY: data is a live &mut PoolCtx for the duration of the enclosing
 	// hsa_amd_agent_iterate_memory_pools call (set up in pool_kinds).
 	let ctx = unsafe { &mut *(data as *mut PoolCtx) };
-	let mut segment: u32 = u32::MAX;
-	// SAFETY: FFI query; segment is a valid out-param for the call's duration.
-	let r1 = unsafe {
-		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &mut segment as *mut u32 as *mut c_void)
-	};
-	if r1 != HSA_STATUS_SUCCESS || segment != HSA_AMD_SEGMENT_GLOBAL {
-		ctx.pools.insert(pool, KIND_OTHER);
-		return HSA_STATUS_SUCCESS;
-	}
-	let mut flags: u32 = 0;
-	// SAFETY: FFI query; flags is a valid out-param for the call's duration.
-	let r2 = unsafe {
-		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &mut flags as *mut u32 as *mut c_void)
-	};
-	let kernarg = r2 == HSA_STATUS_SUCCESS && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) != 0;
-	let kind = if kernarg {
-		KIND_KERNARG
-	} else if ctx.is_gpu {
-		KIND_DEVICE
-	} else {
-		KIND_HOST_PINNED
-	};
+	let kind = pool_kind(ctx, pool);
 	ctx.pools.insert(pool, kind);
 	HSA_STATUS_SUCCESS
 }
@@ -187,27 +220,31 @@ extern "C" fn agent_cb(agent: u64, data: *mut c_void) -> i32 {
 	let mut dev_type: u32 = u32::MAX;
 	// SAFETY: FFI query; dev_type is a valid out-param for the call's duration.
 	let r = unsafe { (ctx.agent_get_info)(agent, HSA_AGENT_INFO_DEVICE, &mut dev_type as *mut u32 as *mut c_void) };
-	if r != HSA_STATUS_SUCCESS {
-		return HSA_STATUS_SUCCESS; // skip this agent, keep iterating
+	match Some(dev_type).filter(|_d| r == HSA_STATUS_SUCCESS) {
+		None => HSA_STATUS_SUCCESS,
+		Some(dt) => {
+			let mut pool_ctx =
+				PoolCtx { pools: ctx.pools, dev: dev_kind(dt), pool_get_info: ctx.pool_get_info };
+			// SAFETY: FFI iterate call; pool_ctx outlives the call (stack frame does not
+			// return until hsa_amd_agent_iterate_memory_pools does).
+			unsafe { (ctx.iterate_pools)(agent, pool_cb, &mut pool_ctx as *mut PoolCtx as *mut c_void) };
+			HSA_STATUS_SUCCESS
+		}
 	}
-	let mut pool_ctx =
-		PoolCtx { pools: ctx.pools, is_gpu: dev_type == HSA_DEVICE_TYPE_GPU, pool_get_info: ctx.pool_get_info };
-	// SAFETY: FFI iterate call; pool_ctx outlives the call (stack frame does not
-	// return until hsa_amd_agent_iterate_memory_pools does).
-	unsafe { (ctx.iterate_pools)(agent, pool_cb, &mut pool_ctx as *mut PoolCtx as *mut c_void) };
-	HSA_STATUS_SUCCESS
 }
 
 fn pool_kinds() -> &'static HashMap<u64, u8> {
 	static MAP: OnceLock<HashMap<u64, u8>> = OnceLock::new();
 	MAP.get_or_init(|| {
 		let mut pools = HashMap::new();
-		let (Some(ia), Some(agi), Some(ip), Some(pgi)) = (
-			resolve_next_or_default(c"hsa_iterate_agents"),
-			resolve_next_or_default(c"hsa_agent_get_info"),
-			resolve_next_or_default(c"hsa_amd_agent_iterate_memory_pools"),
-			resolve_next_or_default(c"hsa_amd_memory_pool_get_info"),
-		) else {
+		let Some(syms) = (|| {
+			Some(Syms {
+				ia: resolve_next_or_default(c"hsa_iterate_agents")?,
+				agi: resolve_next_or_default(c"hsa_agent_get_info")?,
+				ip: resolve_next_or_default(c"hsa_amd_agent_iterate_memory_pools")?,
+				pgi: resolve_next_or_default(c"hsa_amd_memory_pool_get_info")?,
+			})
+		})() else {
 			eprintln!("vramspy: agent/pool classification symbols unavailable — all pools classify OTHER");
 			return pools;
 		};
@@ -216,13 +253,13 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 		let iterate_agents: unsafe extern "C" fn(
 			extern "C" fn(u64, *mut c_void) -> i32,
 			*mut c_void,
-		) -> i32 = unsafe { std::mem::transmute(ia) };
+		) -> i32 = unsafe { std::mem::transmute(syms.ia) };
 		let mut ctx = BuildCtx {
 			pools: &mut pools,
 			// SAFETY: same as above.
-			agent_get_info: unsafe { std::mem::transmute(agi) },
-			iterate_pools: unsafe { std::mem::transmute(ip) },
-			pool_get_info: unsafe { std::mem::transmute(pgi) },
+			agent_get_info: unsafe { std::mem::transmute(syms.agi) },
+			iterate_pools: unsafe { std::mem::transmute(syms.ip) },
+			pool_get_info: unsafe { std::mem::transmute(syms.pgi) },
 		};
 		// SAFETY: agent_cb matches the callback signature hsa_iterate_agents expects;
 		// ctx outlives this call.
@@ -246,13 +283,15 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 ) -> i32 {
 	// SAFETY: forwarding the caller's arguments unchanged to the real HSA runtime.
 	let status = unsafe { (real().pool_allocate)(pool, size, flags, ptr) };
-	if status == HSA_STATUS_SUCCESS {
-		// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
-		let p = unsafe { *ptr };
-		if !p.is_null() {
-			record_alloc(p as usize, size as u64, classify_pool(pool));
-		}
-	}
+	let Some(_ok) = Some(()).filter(|_u| status == HSA_STATUS_SUCCESS) else {
+		return status;
+	};
+	// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
+	let p = unsafe { *ptr };
+	let Some(nn) = std::ptr::NonNull::new(p) else {
+		return status;
+	};
+	record_alloc(nn.as_ptr() as usize, size as u64, classify_pool(pool));
 	status
 }
 
@@ -260,9 +299,10 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's pointer unchanged to the real HSA runtime.
 	let status = unsafe { (real().pool_free)(ptr) };
-	if status == HSA_STATUS_SUCCESS {
-		record_free(ptr as usize);
-	}
+	let Some(_ok) = Some(()).filter(|_u| status == HSA_STATUS_SUCCESS) else {
+		return status;
+	};
+	record_free(ptr as usize);
 	status
 }
 
@@ -270,16 +310,18 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 pub unsafe extern "C" fn hsa_memory_allocate(region: u64, size: usize, ptr: *mut *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's arguments unchanged to the real HSA runtime.
 	let status = unsafe { (real().mem_allocate)(region, size, ptr) };
-	if status == HSA_STATUS_SUCCESS {
-		// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
-		let p = unsafe { *ptr };
-		if !p.is_null() {
-			// Legacy region API: ROCr on AMD uses the pool API for everything that
-			// matters, so this path is classified Other unconditionally (bytes
-			// still counted).
-			record_alloc(p as usize, size as u64, KIND_OTHER);
-		}
-	}
+	let Some(_ok) = Some(()).filter(|_u| status == HSA_STATUS_SUCCESS) else {
+		return status;
+	};
+	// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
+	let p = unsafe { *ptr };
+	let Some(nn) = std::ptr::NonNull::new(p) else {
+		return status;
+	};
+	// Legacy region API: ROCr on AMD uses the pool API for everything that
+	// matters, so this path is classified Other unconditionally (bytes
+	// still counted).
+	record_alloc(nn.as_ptr() as usize, size as u64, KIND_OTHER);
 	status
 }
 
@@ -287,9 +329,10 @@ pub unsafe extern "C" fn hsa_memory_allocate(region: u64, size: usize, ptr: *mut
 pub unsafe extern "C" fn hsa_memory_free(ptr: *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's pointer unchanged to the real HSA runtime.
 	let status = unsafe { (real().mem_free)(ptr) };
-	if status == HSA_STATUS_SUCCESS {
-		record_free(ptr as usize);
-	}
+	let Some(_ok) = Some(()).filter(|_u| status == HSA_STATUS_SUCCESS) else {
+		return status;
+	};
+	record_free(ptr as usize);
 	status
 }
 
@@ -302,22 +345,22 @@ pub extern "C" fn vramspy_loaded() -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_live(kind: u32) -> u64 {
-	if kind > 3 { 0 } else { LIVE[kind as usize].load(Ordering::Relaxed) }
+	LIVE.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_peak(kind: u32) -> u64 {
-	if kind > 3 { 0 } else { PEAK[kind as usize].load(Ordering::Relaxed) }
+	PEAK.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_allocs(kind: u32) -> u64 {
-	if kind > 3 { 0 } else { ALLOCS[kind as usize].load(Ordering::Relaxed) }
+	ALLOCS.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_frees(kind: u32) -> u64 {
-	if kind > 3 { 0 } else { FREES[kind as usize].load(Ordering::Relaxed) }
+	FREES.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]

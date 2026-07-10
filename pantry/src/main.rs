@@ -5,28 +5,24 @@
 use anyhow::Result;
 
 fn kind_name(k: usize) -> &'static str {
-	match k {
-		pantry::KIND_NUMERIC => "Numeric",
-		pantry::KIND_TEMPORAL => "Temporal",
-		pantry::KIND_CATEGORICAL => "Categorical",
-		pantry::KIND_ORDINAL => "Ordinal",
-		pantry::KIND_TEXT => "Text",
-		_ => "Image",
-	}
+	["Numeric", "Temporal", "Categorical", "Ordinal", "Text"]
+		.get(k)
+		.copied()
+		.unwrap_or("Image")
 }
 
 fn main() -> Result<()> {
 	let paths: Vec<String> = std::env::args().skip(1).collect();
-	if paths.is_empty() {
+	let Some(_probe) = paths.first() else {
 		eprintln!("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
 		std::process::exit(1);
-	}
+	};
 
 	recipe_infer::init()?;
 
-	let multi = paths.len() > 1;
+	let multi = paths.get(1);
 	for path in &paths {
-		if multi {
+		for _extra in multi.into_iter() {
 			println!("\n# {path}");
 		}
 		for group in pantry::data::load_groups(path) {
@@ -43,12 +39,14 @@ fn main() -> Result<()> {
 				})
 				.collect();
 			let kinds = pantry::predict_kinds(&columns)?;
-			for (h, k) in headers.iter().zip(kinds) {
-				if name.is_empty() {
-					println!("{h} -> {}", kind_name(k));
-				} else {
-					println!("{name}:{h} -> {}", kind_name(k));
-				}
+			let prefix = match name.chars().next() {
+				Some(_first) => format!("{name}:"),
+				None => String::new(),
+			};
+			for idx in 0..headers.len().min(kinds.len()) {
+				let h = &headers[idx];
+				let k = kinds[idx];
+				println!("{prefix}{h} -> {}", kind_name(k));
 			}
 		}
 	}

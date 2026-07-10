@@ -36,18 +36,21 @@ pub enum Op {
 
 impl Op {
 	fn from(b: u8) -> Result<Op> {
-		Ok(match b {
-			1 => Op::Hello,
-			2 => Op::Store,
-			3 => Op::Run,
-			4 => Op::Fetch,
-			5 => Op::Stat,
-			6 => Op::Reply,
-			7 => Op::Err,
-			8 => Op::Peers,
-			9 => Op::Free,
-			_other => bail!("wire: bad op byte {b}"),
-		})
+		const TABLE: [Op; 9] = [
+			Op::Hello,
+			Op::Store,
+			Op::Run,
+			Op::Fetch,
+			Op::Stat,
+			Op::Reply,
+			Op::Err,
+			Op::Peers,
+			Op::Free,
+		];
+		b.checked_sub(1)
+			.and_then(|i| TABLE.get(i as usize))
+			.copied()
+			.ok_or_else(|| anyhow::anyhow!("wire: bad op byte {b}"))
 	}
 }
 
@@ -164,7 +167,7 @@ fn ifaces() -> Vec<Iface> {
 	let mut out = Vec::new();
 	unsafe {
 		let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-		let 0 = libc::getifaddrs(&mut ifap) else {
+		let Ordering::Equal = libc::getifaddrs(&mut ifap).cmp(&0) else {
 			return out;
 		};
 		let mut p = ifap;
@@ -367,7 +370,7 @@ fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
 				let addr = &kv[eq + 1..];
 				match age.parse::<u128>().ok()?.cmp(&STALE_MS) {
 					Ordering::Less => Some(addr.to_string()),
-					_other => None,
+					Ordering::Equal | Ordering::Greater => None,
 				}
 			})
 			.collect();
@@ -615,7 +618,7 @@ impl Server {
 					.remove(&f.id);
 				Ok(Vec::new())
 			}
-			other => bail!("wire: server got client-only op {other:?}"),
+			op @ (Op::Reply | Op::Err) => bail!("wire: server got client-only op {op:?}"),
 		}
 	}
 }
