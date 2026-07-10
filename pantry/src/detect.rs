@@ -59,7 +59,9 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 	let p = std::path::Path::new(path);
 	let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-	let plain_csv = !p.is_dir() && !matches!(ext.as_deref(), Some("zip" | "db" | "sqlite"));
+	let plain_csv = !p.is_dir()
+		&& !matches!(ext.as_deref(), Some("zip" | "db" | "sqlite"))
+		&& crate::data::sniff_delimiter(p) != b' ';
 	if plain_csv {
 		let (headers, cells) = prefix_columns(p)?;
 		let non_empty: Vec<Vec<&str>> =

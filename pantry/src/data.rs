@@ -24,9 +24,17 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 		}
 		let text = String::from_utf8_lossy(&line);
 		let commas = text.matches(',').count();
-		return if text.matches(';').count() > commas {
+		let semis = text.matches(';').count();
+		let tabs = text.matches('\t').count();
+		if commas == 0 && semis == 0 && tabs == 0 {
+			let tokens: Vec<&str> = text.split_whitespace().collect();
+			if tokens.len() >= 2 && tokens.iter().all(|t| t.parse::<f64>().is_ok()) {
+				return b' ';
+			}
+		}
+		return if semis > commas {
 			b';'
-		} else if text.matches('\t').count() > commas {
+		} else if tabs > commas {
 			b'\t'
 		} else {
 			b','
@@ -35,6 +43,10 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 }
 
 pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+	let delim = sniff_delimiter(path);
+	if delim == b' ' {
+		return read_raw_whitespace(path);
+	}
 	let disk = std::fs::metadata(path)
 		.map(|m| m.len() as usize)
 		.unwrap_or(0);
@@ -43,7 +55,7 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
-		.delimiter(sniff_delimiter(path))
+		.delimiter(delim)
 		.from_path(path)
 		.with_context(|| format!("failed to open {}", path.display()))?;
 	let mut records = rdr.byte_records();
@@ -106,6 +118,69 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 		for j in 0..w {
 			let cell = record.get(j).map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
 			row.push(na(cell.as_ref()));
+		}
+		rows.push(row);
+	}
+	Ok((headers, rows))
+}
+
+fn read_raw_whitespace(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+	use std::io::BufRead;
+	let disk = std::fs::metadata(path)
+		.map(|m| m.len() as usize)
+		.unwrap_or(0);
+	let f = std::fs::File::open(path)
+		.with_context(|| format!("failed to open {}", path.display()))?;
+	let rdr = std::io::BufReader::with_capacity(1 << 20, f);
+	let mut lines = rdr.lines();
+	let first = loop {
+		match lines.next() {
+			None => return Ok((Vec::new(), Vec::new())),
+			Some(l) => {
+				let l = l.with_context(|| format!("failed to read {}", path.display()))?;
+				if !l.trim().is_empty() {
+					break l;
+				}
+			}
+		}
+	};
+	let first_cells: Vec<String> = first.split_whitespace().map(str::to_string).collect();
+	let w = first_cells.len();
+	let headers: Vec<String> = (0..w).map(|j| format!("col_{j}")).collect();
+
+	let overhead = std::mem::size_of::<String>();
+	let est_rows = count_lines(path)?;
+	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
+	let avail = crate::available_ram_bytes();
+	if proj > avail {
+		eprintln!("\x1b[1;31mcsv too large to parse into RAM\x1b[0m");
+		eprintln!(
+			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
+			short_path(path.to_str().unwrap_or_default()),
+			human_bytes(proj),
+			human_bytes(avail)
+		);
+		panic!(
+			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
+			path.display(),
+			human_bytes(proj),
+			human_bytes(avail)
+		);
+	}
+	let na = |cell: &str| match cell {
+		"NA" | "NaN" | "nan" => String::new(),
+		s => s.to_string(),
+	};
+	let mut rows: Vec<Vec<String>> = Vec::new();
+	rows.push(first_cells.iter().map(|c| na(c)).collect());
+	for line in lines {
+		let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+		if line.trim().is_empty() {
+			continue;
+		}
+		let mut row = vec![String::new(); w];
+		for (j, tok) in line.split_whitespace().take(w).enumerate() {
+			row[j] = na(tok);
 		}
 		rows.push(row);
 	}
@@ -179,13 +254,38 @@ pub enum DirGroup {
 	},
 }
 
+fn junk_name(name: &str) -> bool {
+	name.starts_with('.') || name == "__MACOSX"
+}
+
+fn walk_data_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+	for entry in
+		fs::read_dir(dir).with_context(|| format!("failed to read directory: {}", dir.display()))?
+	{
+		let entry =
+			entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+		if junk_name(&entry.file_name().to_string_lossy()) {
+			continue;
+		}
+		let ft = entry
+			.file_type()
+			.with_context(|| format!("failed to stat {}", entry.path().display()))?;
+		if ft.is_symlink() {
+			continue;
+		}
+		let p = entry.path();
+		if ft.is_dir() {
+			walk_data_files(&p, out)?;
+		} else if ft.is_file() {
+			out.push(p);
+		}
+	}
+	Ok(())
+}
+
 pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
-	let mut files: Vec<std::path::PathBuf> = fs::read_dir(dir)
-		.with_context(|| format!("failed to read directory: {dir}"))?
-		.filter_map(|e| e.ok())
-		.map(|e| e.path())
-		.filter(|p| p.is_file())
-		.collect();
+	let mut files: Vec<std::path::PathBuf> = Vec::new();
+	walk_data_files(Path::new(dir), &mut files)?;
 	files.sort();
 	anyhow::ensure!(!files.is_empty(), "no files in {dir}");
 
@@ -340,16 +440,54 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 	}
 	let guard = TempDir(tmp.clone());
 
-	let file = fs::File::open(path).with_context(|| format!("failed to open zip {path}"))?;
-	let mut archive =
-		zip::ZipArchive::new(file).with_context(|| format!("failed to read zip {path}"))?;
+	extract_zip_file(Path::new(path), &tmp)?;
+	loop {
+		let mut files: Vec<std::path::PathBuf> = Vec::new();
+		walk_data_files(&tmp, &mut files)?;
+		let inner: Vec<std::path::PathBuf> = files
+			.into_iter()
+			.filter(|p| {
+				p.extension()
+					.and_then(|e| e.to_str())
+					.is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+			})
+			.collect();
+		if inner.is_empty() {
+			break;
+		}
+		for z in inner {
+			let dest = z.with_extension("");
+			extract_zip_file(&z, &dest)?;
+			fs::remove_file(&z)
+				.with_context(|| format!("failed to remove inner zip {}", z.display()))?;
+		}
+	}
+
+	let dir = tmp.to_str().context("temp dir path is not valid UTF-8")?;
+	let groups = load_groups(dir);
+	drop(guard);
+	Ok(groups)
+}
+
+fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
+	fs::create_dir_all(dest)
+		.with_context(|| format!("failed to create {}", dest.display()))?;
+	let file = fs::File::open(zip_path)
+		.with_context(|| format!("failed to open zip {}", zip_path.display()))?;
+	let mut archive = zip::ZipArchive::new(file)
+		.with_context(|| format!("failed to read zip {}", zip_path.display()))?;
 	for i in 0..archive.len() {
 		let mut entry = archive.by_index(i)?;
-
 		let Some(rel) = entry.enclosed_name() else {
 			continue;
 		};
-		let out = tmp.join(rel);
+		if rel
+			.components()
+			.any(|c| junk_name(&c.as_os_str().to_string_lossy()))
+		{
+			continue;
+		}
+		let out = dest.join(rel);
 		if entry.is_dir() {
 			continue;
 		}
@@ -362,11 +500,7 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 		std::io::copy(&mut entry, &mut w)
 			.with_context(|| format!("failed to extract {}", out.display()))?;
 	}
-
-	let dir = tmp.to_str().context("temp dir path is not valid UTF-8")?;
-	let groups = load_groups(dir);
-	drop(guard);
-	Ok(groups)
+	Ok(())
 }
 
 // ── file → columns: all source parsing (csv / arff / dir / zip / sqlite) ─────
