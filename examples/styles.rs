@@ -35,6 +35,6 @@ fn main() {
 
 	// ── holdout: `run(data, model)` with a forward-only data source ──────
 	eprintln!("\x1b[1;36m── holdout: run(&Option<Dataset>, model) ──\x1b[0m");
-	let (_set, test) = data.datasets();
+	let test = data.datasets().test;
 	Train::new().log([Loss, R2]).run(&test, &model);
 }

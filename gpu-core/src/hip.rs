@@ -138,6 +138,16 @@ pub fn mem_info() -> Result<(usize, usize), HipError> {
 	Ok((free, total))
 }
 
+pub struct MemInfo {
+	pub free: usize,
+	pub total: usize,
+}
+
+pub fn mem_info_s() -> Result<MemInfo, HipError> {
+	let (free, total) = mem_info()?;
+	Ok(MemInfo { free, total })
+}
+
 pub fn device_synchronize() -> Result<(), HipError> {
 	crate::gate::acquire();
 	crate::callspy::tick(&crate::callspy::DEVICE_SYNCHRONIZE);

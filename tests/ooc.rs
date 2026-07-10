@@ -1,6 +1,6 @@
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
-use recipe::ooc::{chunks, view};
+use recipe::ooc::{Window, chunks, view};
 
 fn cpu_bce_grad(p: &[f64], y: &[f64], n_total: usize) -> Vec<f64> {
 	let eps = 1e-7;
@@ -54,7 +54,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 	}
 
 	let da_win = GpuBuffer::alloc(n).expect("da_win");
-	for (s0, cnt) in chunks(n, chunk) {
+	for Window { s0, cnt } in chunks(n, chunk) {
 		let pw = view(&bp, s0 * 8, cnt * 8);
 		let yw = view(&by, s0 * 8, cnt * 8);
 		let dw = view(&da_win, s0 * 8, cnt * 8);
@@ -66,7 +66,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 	}
 
 	let da_raw = GpuBuffer::alloc(n).expect("da_raw");
-	for (s0, cnt) in chunks(n, chunk) {
+	for Window { s0, cnt } in chunks(n, chunk) {
 		let inv_cnt = { let __up = &[1.0 / cnt as f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("inv_cnt"); __ub.load(__up).expect("inv_cnt"); __ub };
 		let pw = view(&bp, s0 * 8, cnt * 8);
 		let yw = view(&by, s0 * 8, cnt * 8);
@@ -86,7 +86,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 		assert!((got[i] - want_f[i]).abs() < 1e-12, "focal full[{i}] {} vs {}", got[i], want_f[i]);
 	}
 	let da_fw = GpuBuffer::alloc(n).expect("da_fw");
-	for (s0, cnt) in chunks(n, chunk) {
+	for Window { s0, cnt } in chunks(n, chunk) {
 		let pw = view(&bp, s0 * 8, cnt * 8);
 		let yw = view(&by, s0 * 8, cnt * 8);
 		let dw = view(&da_fw, s0 * 8, cnt * 8);

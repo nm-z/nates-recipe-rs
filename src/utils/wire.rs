@@ -1,11 +1,13 @@
 use crate::probe::Machine;
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use recipe_infer::bridge::{chan, recv_from, Chan};
 
 pub const MAGIC: u32 = 0x5243_5031;
 pub const PORT: u16 = 7845;
@@ -44,7 +46,7 @@ impl Op {
 			7 => Op::Err,
 			8 => Op::Peers,
 			9 => Op::Free,
-			_ => bail!("wire: bad op byte {b}"),
+			_other => bail!("wire: bad op byte {b}"),
 		})
 	}
 }
@@ -74,8 +76,8 @@ fn write_frame_raw(s: &mut TcpStream, op: Op, flags: u8, tag: u16, seq: u32, id:
 	h[12..20].copy_from_slice(&id.to_le_bytes());
 	h[20..28].copy_from_slice(&(data.len() as u64).to_le_bytes());
 	s.write_all(&h)?;
-	if !data.is_empty() {
-		s.write_all(data)?;
+	for payload in Some(data).filter(|d| !d.is_empty()).into_iter() {
+		s.write_all(payload)?;
 	}
 	s.flush()?;
 	Ok(())
@@ -89,9 +91,7 @@ fn read_frame(s: &mut TcpStream) -> Result<Frame> {
 	let mut h = [0u8; HDR];
 	s.read_exact(&mut h)?;
 	let magic = u32::from_le_bytes(h[0..4].try_into()?);
-	if magic != MAGIC {
-		bail!("wire: bad magic {magic:#010x}");
-	}
+	ensure!(magic == MAGIC, "wire: bad magic {magic:#010x}");
 	let op = Op::from(h[4])?;
 	let flags = h[5];
 	let tag = u16::from_le_bytes(h[6..8].try_into()?);
@@ -113,7 +113,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
 	pub fn probe() -> NodeInfo {
-		let arch = std::env::var("GPU_ARCH").unwrap_or_else(|_| "storage".to_string());
+		let arch = std::env::var("GPU_ARCH").unwrap_or_else(|_env| "storage".to_string());
 		NodeInfo { arch, gpus: 0, vram: 0, ram: mem_available() }
 	}
 	fn encode(&self) -> Vec<u8> {
@@ -134,13 +134,13 @@ fn mem_available() -> u64 {
 	let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
 		return 0;
 	};
-	for l in s.lines() {
-		if let Some(kb) = l.strip_prefix("MemAvailable:") {
+	s.lines()
+		.find_map(|l| {
+			let kb = l.strip_prefix("MemAvailable:")?;
 			let kb: u64 = kb.trim().trim_end_matches(" kB").parse().unwrap_or(0);
-			return kb * 1024;
-		}
-	}
-	0
+			Some(kb * 1024)
+		})
+		.unwrap_or(0)
 }
 
 fn hostname() -> String {
@@ -149,39 +149,47 @@ fn hostname() -> String {
 		.unwrap_or_default()
 }
 
+enum Link {
+	Wired,
+	Wireless,
+}
+
 struct Iface {
 	ip: std::net::Ipv4Addr,
 	bcast: std::net::Ipv4Addr,
-	wireless: bool,
+	link: Link,
 }
 
 fn ifaces() -> Vec<Iface> {
 	let mut out = Vec::new();
 	unsafe {
 		let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-		if libc::getifaddrs(&mut ifap) != 0 {
+		let 0 = libc::getifaddrs(&mut ifap) else {
 			return out;
-		}
+		};
 		let mut p = ifap;
 		while !p.is_null() {
 			let a = &*p;
 			let up = a.ifa_flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32
 				== (libc::IFF_UP | libc::IFF_RUNNING) as u32;
 			let lo = a.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
-			if up && !lo && !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET {
+			let want = up && !lo && !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET;
+			for _present in Some(()).filter(|_unit| want).into_iter() {
 				let sin = &*(a.ifa_addr as *const libc::sockaddr_in);
 				let ip = u32::from_be(sin.sin_addr.s_addr);
-				let mask = if a.ifa_netmask.is_null() {
-					0
-				} else {
-					u32::from_be((*(a.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr)
+				let mask = match a.ifa_netmask.cast::<libc::sockaddr_in>().as_ref() {
+					Some(nm) => u32::from_be(nm.sin_addr.s_addr),
+					None => 0,
 				};
 				let name = std::ffi::CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
-				let wireless = std::path::Path::new(&format!("/sys/class/net/{name}/wireless")).exists();
+				let link = match std::fs::metadata(format!("/sys/class/net/{name}/wireless")).ok() {
+					Some(_meta) => Link::Wireless,
+					None => Link::Wired,
+				};
 				out.push(Iface {
 					ip: std::net::Ipv4Addr::from(ip),
 					bcast: std::net::Ipv4Addr::from(ip | !mask),
-					wireless,
+					link,
 				});
 			}
 			p = a.ifa_next;
@@ -191,9 +199,17 @@ fn ifaces() -> Vec<Iface> {
 	out
 }
 
+#[derive(Clone)]
+struct AddrStamp {
+	kind: String,
+	addr: String,
+	seen: std::time::Instant,
+}
+
 struct PeerRec {
+	host: String,
 	info: NodeInfo,
-	addrs: HashMap<String, (String, std::time::Instant)>,
+	addrs: Vec<AddrStamp>,
 	machine: Option<Machine>,
 }
 
@@ -205,25 +221,31 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 	loop {
 		let info = NodeInfo::probe();
 		for i in ifaces() {
-			let Ok(s) = std::net::UdpSocket::bind((i.ip, 0)) else { continue };
-			let _ = s.set_broadcast(true);
-			let kind = if i.wireless { "wlan" } else { "eth" };
+			let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(i.ip), 0);
+			let Ok(s) = std::net::UdpSocket::bind(bind) else { continue };
+			drop(s.set_broadcast(true));
+			let kind = match i.link {
+				Link::Wireless => "wlan",
+				Link::Wired => "eth",
+			};
 			let mut body =
 				format!("{host}\n{kind}\n{PORT}\n{}", String::from_utf8_lossy(&info.encode()));
-			if let Some(ml) = &mach_line {
+			for ml in mach_line.as_ref().into_iter() {
 				body.push('\n');
 				body.push_str(ml);
 			}
 			let mut buf = BEACON_MAGIC.to_le_bytes().to_vec();
 			buf.extend_from_slice(body.as_bytes());
-			let _ = s.send_to(&buf, (i.bcast, PORT));
+			let dst = std::net::SocketAddr::new(std::net::IpAddr::V4(i.bcast), PORT);
+			drop(s.send_to(&buf, dst));
 		}
 		thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
 	}
 }
 
 fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
-	let sock = match std::net::UdpSocket::bind(("0.0.0.0", PORT)) {
+	let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), PORT);
+	let sock = match std::net::UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
 			eprintln!("recipe serve: discovery listener bind failed: {e}");
@@ -233,74 +255,91 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let me = hostname();
 	let mut buf = [0u8; 2048];
 	loop {
-		let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
-		if n < 4 || buf[0..4] != BEACON_MAGIC.to_le_bytes() {
-			continue;
-		}
-		let Ok(text) = std::str::from_utf8(&buf[4..n]) else { continue };
-		let mut it = text.splitn(4, '\n');
-		let (Some(host), Some(kind), Some(port)) = (it.next(), it.next(), it.next()) else {
-			continue;
-		};
-		if host == me || host.is_empty() {
-			continue;
-		}
-		let rest = it.next().unwrap_or("");
-		let Ok(info) = NodeInfo::decode(rest.as_bytes()) else { continue };
-		let machine = rest.splitn(5, '\n').nth(4).and_then(|ml| Machine::beacon_decode(ml).ok());
-		let addr = format!("{}:{}", from.ip(), port);
-		let mut changed = false;
-		if let Ok(mut g) = reg.lock() {
-			let rec = g.entry(host.to_string()).or_insert_with(|| PeerRec {
-				info: info.clone(),
-				addrs: HashMap::new(),
-				machine: None,
-			});
-			rec.info = info;
-			rec.addrs.insert(kind.to_string(), (addr, std::time::Instant::now()));
-			if rec.machine != machine {
-				rec.machine = machine;
-				changed = true;
+		match recv_from(&sock, &mut buf) {
+			Ok(r) => {
+				let Some(_avail) = r.n.checked_sub(4) else { continue };
+				let Ordering::Equal = buf[0..4].cmp(BEACON_MAGIC.to_le_bytes().as_slice()) else { continue };
+				let Ok(text) = std::str::from_utf8(&buf[4..r.n]) else { continue };
+				let mut it = text.splitn(4, '\n');
+				let Some(host) = it.next() else { continue };
+				let Some(kind) = it.next() else { continue };
+				let Some(port) = it.next() else { continue };
+				let Some(_ok_host) = Some(host).filter(|h| !h.is_empty() && *h != me.as_str()) else { continue };
+				let rest = it.next().unwrap_or("");
+				let Ok(info) = NodeInfo::decode(rest.as_bytes()) else { continue };
+				let machine = rest.splitn(5, '\n').nth(4).and_then(|ml| Machine::beacon_decode(ml).ok());
+				let addr = format!("{}:{}", r.from.ip(), port);
+				let changed = match reg.lock() {
+					Ok(mut g) => {
+						let rec = g.entry(host.to_string()).or_insert_with(|| PeerRec {
+							host: host.to_string(),
+							info: info.clone(),
+							addrs: Vec::new(),
+							machine: None,
+						});
+						rec.info = info;
+						match rec.addrs.iter_mut().find(|e| e.kind == kind) {
+							Some(e) => {
+								e.addr = addr;
+								e.seen = std::time::Instant::now();
+							}
+							None => rec.addrs.push(AddrStamp {
+								kind: kind.to_string(),
+								addr,
+								seen: std::time::Instant::now(),
+							}),
+						}
+						let diff = rec.machine != machine;
+						match Some(machine).filter(|_moved| diff) {
+							Some(moved) => {
+								rec.machine = moved;
+								Some(())
+							}
+							None => None,
+						}
+					}
+					Err(_poison) => None,
+				};
+				for _rw in changed.into_iter() {
+					rewrite_config(&reg, &own);
+				}
 			}
-		}
-		if changed {
-			rewrite_config(&reg, &own);
+			Err(_recv_err) => continue,
 		}
 	}
 }
 
 fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 	let mut machines: Vec<Machine> = Vec::new();
-	if let Some(m) = own {
+	for m in own.into_iter() {
 		machines.push(m.as_ref().clone());
 	}
-	if let Ok(g) = reg.lock() {
+	for g in reg.lock().into_iter() {
 		for rec in g.values() {
-			if let Some(m) = &rec.machine {
+			for m in rec.machine.iter() {
 				machines.push(m.clone());
 			}
 		}
 	}
-	if let Err(e) = crate::probe::write_config_atomic(&machines) {
+	for e in crate::probe::write_config_atomic(&machines).err().into_iter() {
 		eprintln!("recipe serve: config write failed: {e}");
 	}
 }
 
 fn encode_peers(reg: &Registry) -> Result<Vec<u8>> {
-	let g = reg.lock().map_err(|_| anyhow::anyhow!("wire: registry poisoned"))?;
+	let g = reg.lock().map_err(|_poison| anyhow::anyhow!("wire: registry poisoned"))?;
 	let mut lines = Vec::new();
-	for (host, rec) in g.iter() {
-		let mut addrs: Vec<_> = rec
-			.addrs
+	for rec in g.values() {
+		let mut addrs: Vec<AddrStamp> = rec.addrs.clone();
+		addrs.sort_by_key(|e| e.kind != "eth");
+		let addrs = addrs
 			.iter()
-			.map(|(k, (a, t))| (k.clone(), a.clone(), t.elapsed().as_millis()))
-			.collect();
-		addrs.sort_by_key(|(k, _, _)| k != "eth");
-		let addrs =
-			addrs.iter().map(|(k, a, ms)| format!("{k}={a}@{ms}")).collect::<Vec<_>>().join(",");
+			.map(|e| format!("{}={}@{}", e.kind, e.addr, e.seen.elapsed().as_millis()))
+			.collect::<Vec<String>>()
+			.join(",");
 		lines.push(format!(
-			"{host}\t{addrs}\t{}\t{}\t{}\t{}",
-			rec.info.arch, rec.info.gpus, rec.info.vram, rec.info.ram
+			"{}\t{addrs}\t{}\t{}\t{}\t{}",
+			rec.host, rec.info.arch, rec.info.gpus, rec.info.vram, rec.info.ram
 		));
 	}
 	Ok(lines.join("\n").into_bytes())
@@ -317,15 +356,19 @@ fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
 	let mut out = Vec::new();
 	for line in String::from_utf8_lossy(b).lines() {
 		let f: Vec<&str> = line.split('\t').collect();
-		if f.len() != 6 {
-			continue;
-		}
+		let 6 = f.len() else { continue };
 		let addrs: Vec<String> = f[1]
 			.split(',')
 			.filter_map(|e| {
-				let (kv, age) = e.rsplit_once('@')?;
-				let (_, addr) = kv.split_once('=')?;
-				(age.parse::<u128>().ok()? < STALE_MS).then(|| addr.to_string())
+				let at = e.rfind('@')?;
+				let kv = &e[..at];
+				let age = &e[at + 1..];
+				let eq = kv.find('=')?;
+				let addr = &kv[eq + 1..];
+				match age.parse::<u128>().ok()?.cmp(&STALE_MS) {
+					Ordering::Less => Some(addr.to_string()),
+					_other => None,
+				}
 			})
 			.collect();
 		let info = NodeInfo {
@@ -334,9 +377,8 @@ fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
 			vram: f[4].parse().unwrap_or(0),
 			ram: f[5].parse().unwrap_or(0),
 		};
-		if !addrs.is_empty() {
-			out.push(PeerEntry { host: f[0].to_string(), addrs, info });
-		}
+		let Some(_first_addr) = addrs.first() else { continue };
+		out.push(PeerEntry { host: f[0].to_string(), addrs, info });
 	}
 	out
 }
@@ -372,11 +414,14 @@ impl Conn {
 				match read_frame(&mut r) {
 					Ok(f) => {
 						let waiter = pend.lock().ok().and_then(|mut m| m.remove(&f.seq));
-						if let Some(tx) = waiter {
-							let _ = tx.send(f);
+						match waiter {
+							Some(tx) => {
+								drop(tx.send(f));
+							}
+							None => continue,
 						}
 					}
-					Err(_) => break,
+					Err(_read_err) => break,
 				}
 			}
 		});
@@ -387,46 +432,42 @@ impl Conn {
 	}
 
 	fn next_seq(&self) -> Result<u32> {
-		let mut g = self.seq.lock().map_err(|_| anyhow::anyhow!("wire: seq poisoned"))?;
+		let mut g = self.seq.lock().map_err(|_poison| anyhow::anyhow!("wire: seq poisoned"))?;
 		*g = g.wrapping_add(1);
 		Ok(*g)
 	}
 
 	pub fn send(&self, op: Op, tag: u16, id: u64, data: Vec<u8>) -> Result<Receiver<Frame>> {
 		let seq = self.next_seq()?;
-		let (tx, rx) = channel();
+		let Chan { tx, rx } = chan::<Frame>();
 		self.pending
 			.lock()
-			.map_err(|_| anyhow::anyhow!("wire: pending poisoned"))?
+			.map_err(|_poison| anyhow::anyhow!("wire: pending poisoned"))?
 			.insert(seq, tx);
-		let mut s = self.wr.lock().map_err(|_| anyhow::anyhow!("wire: writer poisoned"))?;
+		let mut s = self.wr.lock().map_err(|_poison| anyhow::anyhow!("wire: writer poisoned"))?;
 		write_frame(&mut s, &Frame::new(op, tag, seq, id, data))?;
 		Ok(rx)
 	}
 
 	pub fn call(&self, op: Op, tag: u16, id: u64, data: Vec<u8>) -> Result<Frame> {
 		let f = self.send(op, tag, id, data)?.recv()?;
-		if f.op == Op::Err {
-			bail!("wire: remote error: {}", String::from_utf8_lossy(&f.data));
-		}
+		ensure!(f.op != Op::Err, "wire: remote error: {}", String::from_utf8_lossy(&f.data));
 		Ok(f)
 	}
 
 	pub fn store_from(&self, id: u64, data: &[u8]) -> Result<()> {
 		let seq = self.next_seq()?;
-		let (tx, rx) = channel();
+		let Chan { tx, rx } = chan::<Frame>();
 		self.pending
 			.lock()
-			.map_err(|_| anyhow::anyhow!("wire: pending poisoned"))?
+			.map_err(|_poison| anyhow::anyhow!("wire: pending poisoned"))?
 			.insert(seq, tx);
 		{
-			let mut s = self.wr.lock().map_err(|_| anyhow::anyhow!("wire: writer poisoned"))?;
+			let mut s = self.wr.lock().map_err(|_poison| anyhow::anyhow!("wire: writer poisoned"))?;
 			write_frame_raw(&mut s, Op::Store, 0, 0, seq, id, data)?;
 		}
 		let f = rx.recv()?;
-		if f.op == Op::Err {
-			bail!("wire: remote error: {}", String::from_utf8_lossy(&f.data));
-		}
+		ensure!(f.op != Op::Err, "wire: remote error: {}", String::from_utf8_lossy(&f.data));
 		Ok(())
 	}
 	pub fn run(&self, fn_id: u16, id: u64, payload: Vec<u8>) -> Result<Receiver<Frame>> {
@@ -439,7 +480,7 @@ impl Conn {
 		Ok(self.call(Op::Fetch, 0, id, p)?.data)
 	}
 	pub fn free(&self, id: u64) -> Result<()> {
-		self.call(Op::Free, 0, id, Vec::new()).map(|_| ())
+		self.call(Op::Free, 0, id, Vec::new()).map(|_frame| ())
 	}
 	pub fn stat(&self) -> Result<String> {
 		Ok(String::from_utf8_lossy(&self.call(Op::Stat, 0, 0, Vec::new())?.data).into_owned())
@@ -483,8 +524,8 @@ impl Server {
 
 	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {
 		let machine = self.machine.clone();
-		if let Some(m) = &machine {
-			if let Err(e) = crate::probe::write_config_atomic(std::slice::from_ref(m.as_ref())) {
+		for m in machine.iter() {
+			for e in crate::probe::write_config_atomic(std::slice::from_ref(m.as_ref())).err().into_iter() {
 				eprintln!("recipe serve: config write failed: {e}");
 			}
 		}
@@ -497,7 +538,7 @@ impl Server {
 			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
-			listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
+			listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_addr_err| "?".into()),
 			self.info.ram >> 20
 		);
 		self.serve_on(listener)
@@ -508,7 +549,7 @@ impl Server {
 			let stream = stream?;
 			let srv = self.clone();
 			thread::spawn(move || {
-				if let Err(e) = srv.handle(stream) {
+				for e in srv.handle(stream).err().into_iter() {
 					eprintln!("recipe serve: connection ended: {e}");
 				}
 			});
@@ -521,7 +562,7 @@ impl Server {
 		loop {
 			let f = match read_frame(&mut s) {
 				Ok(f) => f,
-				Err(_) => return Ok(()),
+				Err(_frame_err) => return Ok(()),
 			};
 			let reply = self.dispatch(&f);
 			let out = match reply {
@@ -538,18 +579,16 @@ impl Server {
 			Op::Store => {
 				self.store
 					.lock()
-					.map_err(|_| anyhow::anyhow!("wire: store poisoned"))?
+					.map_err(|_poison| anyhow::anyhow!("wire: store poisoned"))?
 					.insert(f.id, f.data.clone());
 				Ok(Vec::new())
 			}
 			Op::Fetch => {
 				let off = u64::from_le_bytes(f.data[0..8].try_into()?) as usize;
 				let len = u64::from_le_bytes(f.data[8..16].try_into()?) as usize;
-				let g = self.store.lock().map_err(|_| anyhow::anyhow!("wire: store poisoned"))?;
+				let g = self.store.lock().map_err(|_poison| anyhow::anyhow!("wire: store poisoned"))?;
 				let blob = g.get(&f.id).ok_or_else(|| anyhow::anyhow!("wire: no id {}", f.id))?;
-				if off + len > blob.len() {
-					bail!("wire: fetch {off}+{len} past {} for id {}", blob.len(), f.id);
-				}
+				ensure!(off + len <= blob.len(), "wire: fetch {off}+{len} past {} for id {}", blob.len(), f.id);
 				Ok(blob[off..off + len].to_vec())
 			}
 			Op::Run => {
@@ -558,12 +597,12 @@ impl Server {
 					.get(&f.tag)
 					.ok_or_else(|| anyhow::anyhow!("wire: no runner for fn {}", f.tag))?;
 				let _queued =
-					self.jobs.lock().map_err(|_| anyhow::anyhow!("wire: job queue poisoned"))?;
+					self.jobs.lock().map_err(|_poison| anyhow::anyhow!("wire: job queue poisoned"))?;
 				let _gpu = gpu_core::gate::Lease::new();
 				h(f.id, &f.data)
 			}
 			Op::Stat => {
-				let g = self.store.lock().map_err(|_| anyhow::anyhow!("wire: store poisoned"))?;
+				let g = self.store.lock().map_err(|_poison| anyhow::anyhow!("wire: store poisoned"))?;
 				let bytes: usize = g.values().map(Vec::len).sum();
 				Ok(format!("{}: {} blobs, {} MiB stored", self.info.arch, g.len(), bytes >> 20)
 					.into_bytes())
@@ -572,7 +611,7 @@ impl Server {
 			Op::Free => {
 				self.store
 					.lock()
-					.map_err(|_| anyhow::anyhow!("wire: store poisoned"))?
+					.map_err(|_poison| anyhow::anyhow!("wire: store poisoned"))?
 					.remove(&f.id);
 				Ok(Vec::new())
 			}
@@ -608,9 +647,7 @@ impl Net {
 	pub fn all() -> Result<Vec<Conn>> {
 		let peers = local_peers()
 			.map_err(|e| anyhow::anyhow!("wire: no local daemon for discovery (recipe serve): {e}"))?;
-		if peers.is_empty() {
-			bail!("wire: local daemon hears no peers");
-		}
+		ensure!(!peers.is_empty(), "wire: local daemon hears no peers");
 		peers.iter().map(|p| connect_first(&p.host, &p.addrs)).collect()
 	}
 }
@@ -627,9 +664,9 @@ fn connect_first(name: &str, addrs: &[String]) -> Result<Conn> {
 }
 
 fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
-	if alias.contains(':') {
+	let None = alias.find(':') else {
 		return Ok(vec![alias.to_string()]);
-	}
+	};
 	let ssh = std::process::Command::new("ssh").args(["-G", alias]).output()?;
 	let text = String::from_utf8_lossy(&ssh.stdout);
 	let host = text
@@ -638,18 +675,17 @@ fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 		.map(str::trim)
 		.filter(|h| !h.is_empty())
 		.unwrap_or(alias);
-	if host == alias {
-		bail!(
-			"wire: '{alias}' is not an ssh alias — add to ~/.ssh/config:\n  Host {alias}\n      HostName <address>\nwith keys so `ssh {alias}` works, then retry"
-		);
-	}
+	ensure!(
+		host != alias,
+		"wire: '{alias}' is not an ssh alias — add to ~/.ssh/config:\n  Host {alias}\n      HostName <address>\nwith keys so `ssh {alias}` works, then retry"
+	);
 	let ssh_addr = format!("{host}:{PORT}");
-	if let Some(p) = peers.iter().find(|p| p.host == alias || p.addrs.contains(&ssh_addr)) {
-		let mut out = p.addrs.clone();
-		if !out.contains(&ssh_addr) {
-			out.push(ssh_addr);
+	match peers.iter().find(|p| p.host == alias || p.addrs.contains(&ssh_addr)) {
+		Some(p) => {
+			let mut out = p.addrs.clone();
+			out.extend(Some(ssh_addr).filter(|s| !p.addrs.contains(s)));
+			Ok(out)
 		}
-		return Ok(out);
+		None => Ok(vec![ssh_addr]),
 	}
-	Ok(vec![ssh_addr])
 }

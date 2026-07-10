@@ -50,6 +50,20 @@ pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<(usize, usize, usize)> {
 	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
 }
 
+pub struct ConcatDims {
+	pub pf: usize,
+	pub a: usize,
+	pub c: usize,
+}
+
+pub fn concat_layer_s(params: &[LayerParams]) -> Option<ConcatDims> {
+	concat_layer(params).map(|(pf, a, c)| ConcatDims { pf, a, c })
+}
+
+pub fn concat_layer_dims_s(dims: &[LayerDims]) -> Option<ConcatDims> {
+	concat_layer_dims(dims).map(|(pf, a, c)| ConcatDims { pf, a, c })
+}
+
 fn concat_layer_dims_iter(
 	it: impl Iterator<Item = (LayerKind, usize, usize)>,
 ) -> Option<(usize, usize, usize)> {

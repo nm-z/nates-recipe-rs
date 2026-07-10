@@ -19,15 +19,43 @@ static NET_W_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 type HostPool = Arc<Mutex<Vec<Vec<u8>>>>;
 
+pub struct Window {
+	pub s0: usize,
+	pub cnt: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ConcatAc {
+	pub a: usize,
+	pub c: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ConcatFit {
+	pub pf: usize,
+	pub a: usize,
+	pub c: usize,
+}
+
+struct Xfer {
+	h2d: usize,
+	d2h: usize,
+}
+
+fn xfer() -> Xfer {
+	let b = gpu_core::memory::xfer_bytes_named();
+	Xfer { h2d: b.h2d, d2h: b.d2h }
+}
+
 fn pool_take(p: &HostPool) -> anyhow::Result<Vec<u8>> {
 	p.lock()
-		.map_err(|_| anyhow::anyhow!("host pool lock"))?
+		.map_err(|_e| anyhow::anyhow!("host pool lock"))?
 		.pop()
 		.ok_or_else(|| anyhow::anyhow!("host pool exhausted — transient window count exceeded POOL_BUFS"))
 }
 
 fn pool_give(p: &HostPool, v: Vec<u8>) -> anyhow::Result<()> {
-	p.lock().map_err(|_| anyhow::anyhow!("host pool lock"))?.push(v);
+	p.lock().map_err(|_e| anyhow::anyhow!("host pool lock"))?.push(v);
 	Ok(())
 }
 
@@ -48,9 +76,12 @@ fn disk_free(path: &std::path::Path) -> usize {
 		return 0;
 	};
 	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-	if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+	let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) } {
+		0 => Ok(()),
+		_rc => Err(()),
+	}) else {
 		return 0;
-	}
+	};
 	(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
 }
 
@@ -74,12 +105,53 @@ fn drop_cache(f: &File, off: u64, len: usize) {
 	}
 }
 
-fn interrupted() -> bool {
-	crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+enum Interrupt {
+	Yes,
+	No,
 }
 
-pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = (usize, usize)> {
-	(0..n.div_ceil(c)).map(move |i| (i * c, c.min(n - i * c)))
+enum Flow {
+	Go,
+	Halt,
+}
+
+#[derive(Clone, Copy)]
+enum Gate {
+	Open,
+	Closed,
+}
+
+#[derive(Clone, Copy)]
+enum Flip {
+	A,
+	B,
+}
+
+impl Flip {
+	fn toggle(self) -> Flip {
+		match self {
+			Flip::A => Flip::B,
+			Flip::B => Flip::A,
+		}
+	}
+}
+
+fn prelu_gate(act: &Activation) -> Option<()> {
+	match act {
+		Activation::PRelu => Some(()),
+		_other => None,
+	}
+}
+
+fn interrupted() -> Interrupt {
+	match u8::from(crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)) {
+		0 => Interrupt::No,
+		_set => Interrupt::Yes,
+	}
+}
+
+pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = Window> {
+	(0..n.div_ceil(c)).map(move |i| Window { s0: i * c, cnt: c.min(n - i * c) })
 }
 
 fn open_spill() -> anyhow::Result<File> {
@@ -91,7 +163,7 @@ fn open_spill() -> anyhow::Result<File> {
 		.truncate(true)
 		.open(&path)
 		.context("open spill file")?;
-	let _ = std::fs::remove_file(&path);
+	drop(std::fs::remove_file(&path));
 	Ok(f)
 }
 
@@ -102,11 +174,17 @@ enum Home {
 	Remote { node: usize, id: u64 },
 }
 
+struct Ahead {
+	s0: usize,
+	cnt: usize,
+	handle: std::thread::JoinHandle<anyhow::Result<Vec<u8>>>,
+}
+
 struct Paged {
 	homes: Vec<Home>,
 	spb: usize,
 	chunk: usize,
-	ahead: RefCell<std::collections::VecDeque<(usize, usize, std::thread::JoinHandle<anyhow::Result<Vec<u8>>>)>>,
+	ahead: RefCell<std::collections::VecDeque<Ahead>>,
 	net: Option<Arc<Vec<crate::wire::Conn>>>,
 }
 
@@ -115,9 +193,29 @@ impl Paged {
 		assert!(s0 % self.chunk == 0 && cnt <= self.chunk, "ooc access not window-aligned");
 		s0 / self.chunk
 	}
+	fn fresh_disk_read(&self, host: &HostPool, f: &File, off: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+		self.drain_ahead(host)?;
+		let mut buf = pool_take(host)?;
+		f.read_exact_at(&mut buf[..len], off).context("ooc spill read")?;
+		DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
+		unsafe {
+			use std::os::unix::io::AsRawFd;
+			libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+		}
+		Ok(buf)
+	}
+	fn fresh_net_read(&self, host: &HostPool, node: usize, id: u64, len: usize) -> anyhow::Result<Vec<u8>> {
+		self.drain_ahead(host)?;
+		let mut buf = pool_take(host)?;
+		let nt = self.net.as_ref().ok_or_else(|| anyhow::anyhow!("remote home without net"))?;
+		let v = nt[node].fetch(id, 0, len as u64).context("ooc net read")?;
+		buf[..len].copy_from_slice(&v);
+		NET_R_BYTES.fetch_add(len, Ordering::Relaxed);
+		Ok(buf)
+	}
 	fn kick_ahead(&self, s0: usize, cnt: usize, n: usize, spill: Option<&File>, host: &HostPool) -> anyhow::Result<()> {
 		let mut q = self.ahead.borrow_mut();
-		let mut next0 = q.back().map_or(s0 + cnt, |(p0, pc, _)| p0 + pc);
+		let mut next0 = q.back().map_or(s0 + cnt, |a| a.s0 + a.cnt);
 		while q.len() < AHEAD && next0 < n {
 			let next_cnt = cnt.min(n - next0);
 			let len = next_cnt * self.spb * 8;
@@ -138,7 +236,8 @@ impl Paged {
 					})
 				}
 				Home::Remote { node, id } => {
-					let (node, id) = (*node, *id);
+					let node = *node;
+					let id = *id;
 					let nt = Arc::clone(self.net.as_ref().ok_or_else(|| anyhow::anyhow!("remote home without net"))?);
 					let hp = host.clone();
 					std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
@@ -149,16 +248,16 @@ impl Paged {
 						Ok(buf)
 					})
 				}
-				_ => return Ok(()),
+				_resident => return Ok(()),
 			};
-			q.push_back((next0, next_cnt, h));
+			q.push_back(Ahead { s0: next0, cnt: next_cnt, handle: h });
 			next0 += next_cnt;
 		}
 		Ok(())
 	}
 	fn drain_ahead(&self, host: &HostPool) -> anyhow::Result<()> {
-		for (_, _, h) in self.ahead.borrow_mut().drain(..) {
-			let r = h.join().map_err(|_| anyhow::anyhow!("read-ahead thread"))?;
+		for a in self.ahead.borrow_mut().drain(..) {
+			let r = a.handle.join().map_err(|_e| anyhow::anyhow!("read-ahead thread"))?;
 			pool_give(host, r?)?;
 		}
 		Ok(())
@@ -172,25 +271,19 @@ impl Paged {
 				view(win, 0, len)
 			}
 			Home::Disk(off) => {
+				let off = *off;
 				let f = spill.ok_or_else(|| anyhow::anyhow!("disk read without spill file"))?;
 				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
-					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().map_err(|_| anyhow::anyhow!("read-ahead thread"))??,
-					other => {
-						if let Some((_, _, h)) = other {
-							let r = h.join().map_err(|_| anyhow::anyhow!("read-ahead thread"))?;
+					Some(a) => match [a.s0, a.cnt].cmp(&[s0, cnt]) {
+						std::cmp::Ordering::Equal => a.handle.join().map_err(|_e| anyhow::anyhow!("read-ahead thread"))??,
+						_mismatch => {
+							let r = a.handle.join().map_err(|_e| anyhow::anyhow!("read-ahead thread"))?;
 							pool_give(host, r?)?;
+							self.fresh_disk_read(host, f, off, len)?
 						}
-						self.drain_ahead(host)?;
-						let mut buf = pool_take(host)?;
-						f.read_exact_at(&mut buf[..len], *off).context("ooc spill read")?;
-						DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
-						unsafe {
-							use std::os::unix::io::AsRawFd;
-							libc::posix_fadvise(f.as_raw_fd(), *off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
-						}
-						buf
-					}
+					},
+					None => self.fresh_disk_read(host, f, off, len)?,
 				};
 				self.kick_ahead(s0, cnt, n, spill, host)?;
 				win.write_u8(&bytes[..len]).context("ooc H2D")?;
@@ -198,22 +291,19 @@ impl Paged {
 				view(win, 0, len)
 			}
 			Home::Remote { node, id } => {
+				let node = *node;
+				let id = *id;
 				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
-					Some((p0, pc, h)) if p0 == s0 && pc == cnt => h.join().map_err(|_| anyhow::anyhow!("read-ahead thread"))??,
-					other => {
-						if let Some((_, _, h)) = other {
-							let r = h.join().map_err(|_| anyhow::anyhow!("read-ahead thread"))?;
+					Some(a) => match [a.s0, a.cnt].cmp(&[s0, cnt]) {
+						std::cmp::Ordering::Equal => a.handle.join().map_err(|_e| anyhow::anyhow!("read-ahead thread"))??,
+						_mismatch => {
+							let r = a.handle.join().map_err(|_e| anyhow::anyhow!("read-ahead thread"))?;
 							pool_give(host, r?)?;
+							self.fresh_net_read(host, node, id, len)?
 						}
-						self.drain_ahead(host)?;
-						let mut buf = pool_take(host)?;
-						let nt = self.net.as_ref().ok_or_else(|| anyhow::anyhow!("remote home without net"))?;
-						let v = nt[*node].fetch(*id, 0, len as u64).context("ooc net read")?;
-						buf[..len].copy_from_slice(&v);
-						NET_R_BYTES.fetch_add(len, Ordering::Relaxed);
-						buf
-					}
+					},
+					None => self.fresh_net_read(host, node, id, len)?,
 				};
 				self.kick_ahead(s0, cnt, n, spill, host)?;
 				win.write_u8(&bytes[..len]).context("ooc H2D")?;
@@ -226,27 +316,26 @@ impl Paged {
 		let len = cnt * self.spb * 8;
 		match &self.homes[self.win(s0, cnt)] {
 			Home::Vram(b) => view(b, 0, len),
-			_ => view(win, 0, len),
+			_spilled => view(win, 0, len),
 		}
 	}
 	fn commit(&mut self, s0: usize, cnt: usize, v: &GpuBuffer, writer: &Writer, host: &HostPool) -> anyhow::Result<()> {
 		let len = cnt * self.spb * 8;
 		let w = self.win(s0, cnt);
 		match &mut self.homes[w] {
-			Home::Vram(_) => {}
-			Home::Ram(dst) => v.download_u8(&mut dst[..len]).context("ooc D2H")?,
+			Home::Vram(_buf) => Ok(()),
+			Home::Ram(dst) => v.download_u8(&mut dst[..len]).context("ooc D2H"),
 			Home::Disk(off) => {
 				let mut buf = pool_take(host)?;
 				v.download_u8(&mut buf[..len]).context("ooc D2H")?;
-				writer.send(Dest::Disk(*off), buf, len)?;
+				writer.send(Dest::Disk(*off), buf, len)
 			}
 			Home::Remote { node, id } => {
 				let mut buf = pool_take(host)?;
 				v.download_u8(&mut buf[..len]).context("ooc D2H")?;
-				writer.send(Dest::Remote { node: *node, id: *id }, buf, len)?;
+				writer.send(Dest::Remote { node: *node, id: *id }, buf, len)
 			}
 		}
-		Ok(())
 	}
 }
 
@@ -256,8 +345,23 @@ enum Dest {
 	Remote { node: usize, id: u64 },
 }
 
+struct WriteMsg {
+	dest: Dest,
+	buf: Vec<u8>,
+	len: usize,
+}
+
+struct Lane {
+	tx: Option<std::sync::mpsc::SyncSender<WriteMsg>>,
+	worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+fn make_chan(depth: usize) -> gpu_core::memory::Chan<WriteMsg> {
+	gpu_core::memory::sync_chan::<WriteMsg>(depth)
+}
+
 struct Writer {
-	lanes: Vec<(Option<std::sync::mpsc::SyncSender<(Dest, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<anyhow::Result<()>>>)>,
+	lanes: Vec<Lane>,
 	next: std::cell::Cell<usize>,
 	host: HostPool,
 	net: Option<Arc<Vec<crate::wire::Conn>>>,
@@ -271,7 +375,7 @@ const AHEAD: usize = 2;
 const MAX_READERS: usize = 5;
 const POOL_BUFS: usize = MAX_READERS * AHEAD + 1 + W_LANES * (WQ_DEPTH + 1) + 1;
 
-fn spawn_lane(spill: Option<&File>, host: &HostPool, net: &Option<Arc<Vec<crate::wire::Conn>>>, pending: &Arc<AtomicUsize>) -> anyhow::Result<(Option<std::sync::mpsc::SyncSender<(Dest, Vec<u8>, usize)>>, Option<std::thread::JoinHandle<anyhow::Result<()>>>)> {
+fn spawn_lane(spill: Option<&File>, host: &HostPool, net: &Option<Arc<Vec<crate::wire::Conn>>>, pending: &Arc<AtomicUsize>) -> anyhow::Result<Lane> {
 	let f: Option<File> = match spill {
 		Some(s) => Some(s.try_clone().context("spill clone")?),
 		None => None,
@@ -279,9 +383,10 @@ fn spawn_lane(spill: Option<&File>, host: &HostPool, net: &Option<Arc<Vec<crate:
 	let hp = host.clone();
 	let nt = net.clone();
 	let pend = pending.clone();
-	let (tx, rx) = std::sync::mpsc::sync_channel::<(Dest, Vec<u8>, usize)>(WQ_DEPTH);
+	let chan = make_chan(WQ_DEPTH);
 	let worker = std::thread::spawn(move || -> anyhow::Result<()> {
-		for (dest, buf, len) in rx {
+		for msg in chan.rx {
+			let WriteMsg { dest, buf, len } = msg;
 			match dest {
 				Dest::Disk(off) => {
 					let f = f.as_ref().ok_or_else(|| anyhow::anyhow!("disk dest without spill file"))?;
@@ -300,14 +405,14 @@ fn spawn_lane(spill: Option<&File>, host: &HostPool, net: &Option<Arc<Vec<crate:
 		}
 		Ok(())
 	});
-	Ok((Some(tx), Some(worker)))
+	Ok(Lane { tx: Some(chan.tx), worker: Some(worker) })
 }
 
 impl Writer {
 	fn new(spill: Option<&File>, host: HostPool, net: Option<Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<Writer> {
 		let pending = Arc::new(AtomicUsize::new(0));
 		Ok(Writer {
-			lanes: (0..W_LANES).map(|_| spawn_lane(spill, &host, &net, &pending)).collect::<anyhow::Result<Vec<_>>>()?,
+			lanes: (0..W_LANES).map(|_lane| spawn_lane(spill, &host, &net, &pending)).collect::<anyhow::Result<Vec<Lane>>>()?,
 			next: std::cell::Cell::new(0),
 			host,
 			net,
@@ -319,19 +424,19 @@ impl Writer {
 		self.pending.fetch_add(1, Ordering::Relaxed);
 		let i = self.next.get();
 		self.next.set((i + 1) % W_LANES);
-		self.lanes[i].0.as_ref().ok_or_else(|| anyhow::anyhow!("writer live"))?.send((dest, buf, len)).map_err(|_| anyhow::anyhow!("writer send"))?;
+		self.lanes[i].tx.as_ref().ok_or_else(|| anyhow::anyhow!("writer live"))?.send(WriteMsg { dest, buf, len }).map_err(|_e| anyhow::anyhow!("writer send"))?;
 		Ok(())
 	}
 	fn barrier(&mut self, spill: Option<&File>) -> anyhow::Result<()> {
 		while self.pending.load(Ordering::Relaxed) > 0 {
 			let t = std::time::Instant::now();
 			for lane in &mut self.lanes {
-				if let Some(tx) = lane.0.take() {
-					drop(tx);
-				}
-				if let Some(w) = lane.1.take() {
-					w.join().map_err(|_| anyhow::anyhow!("writer join"))??;
-				}
+				drop(lane.tx.take());
+				lane.worker
+					.take()
+					.map(|w| w.join().map_err(|_join_err| anyhow::anyhow!("writer join")))
+					.transpose()?
+					.transpose()?;
 				*lane = spawn_lane(spill, &self.host, &self.net, &self.pending)?;
 			}
 			self.drained.set(self.drained.get() + t.elapsed().as_secs_f64());
@@ -356,13 +461,12 @@ pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	assert!(dir.is_ok(), "data_dir: {}", dir.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 	let Ok(dir) = dir else { loop {} };
 	let disk_avail = disk_free(&dir).saturating_sub(USER_GB);
-	if need > vram_avail + ram_avail + disk_avail + net_ram {
-		return None;
-	}
 	let vram = need.min(vram_avail);
 	let ram = (need - vram).min(ram_avail);
 	let disk = (need - vram - ram).min(disk_avail);
-	Some(Plan { vram, ram, disk, remote: need - vram - ram - disk })
+	(vram_avail + ram_avail + disk_avail + net_ram)
+		.checked_sub(need)
+		.map(|_slack| Plan { vram, ram, disk, remote: need - vram - ram - disk })
 }
 
 pub struct Ooc {
@@ -419,12 +523,23 @@ struct SweepStart {
 	net_w: usize,
 }
 
+struct Rate {
+	label: &'static str,
+	bps: f64,
+}
+
+struct Stream {
+	label: &'static str,
+	delta: usize,
+	rate: f64,
+}
+
 fn sweep_start() -> SweepStart {
-	let (h2d, d2h, _) = gpu_core::memory::xfer_bytes();
+	let x = xfer();
 	SweepStart {
 		t: std::time::Instant::now(),
-		h2d,
-		d2h,
+		h2d: x.h2d,
+		d2h: x.d2h,
 		disk_r: DISK_R_BYTES.load(Ordering::Relaxed),
 		disk_w: DISK_W_BYTES.load(Ordering::Relaxed),
 		net_r: NET_R_BYTES.load(Ordering::Relaxed),
@@ -433,12 +548,12 @@ fn sweep_start() -> SweepStart {
 }
 
 impl Ooc {
-	pub fn min_bytes(dims: &[recipe_infer::LayerDims], n: usize, concat_ac: Option<(usize, usize)>) -> usize {
+	pub fn min_bytes(dims: &[recipe_infer::LayerDims], n: usize, concat_ac: Option<ConcatAc>) -> usize {
 		let attn = dims.iter().find(|p| p.kind == LayerKind::Attn);
-		let (_, hs) = attn.map_or((1, 1), |p| (p.in_dim, p.heads * (p.in_dim / p.dim)));
+		let hs = attn.map_or(1, |p| p.heads * (p.in_dim / p.dim));
 		let max_act_spb = dims.iter().map(|p| p.out_dim.max(p.in_dim)).max().unwrap_or(1);
 		let seq_spb = attn.map_or(1, |p| p.in_dim);
-		let (ca, cc) = concat_ac.unwrap_or((0, 0));
+		let ConcatAc { a: ca, c: cc } = concat_ac.unwrap_or(ConcatAc { a: 0, c: 0 });
 		let max_spb = seq_spb.max(max_act_spb).max(ca + cc);
 		let max_wt = dims
 			.iter()
@@ -465,7 +580,10 @@ impl Ooc {
 			.unwrap_or(0);
 		const WINS: usize = 10;
 		let chunk = 1usize;
-		let conv_wg = if max_conv_fsz > 0 { chunk } else { 0 };
+		let conv_wg = match max_conv_fsz.cmp(&0) {
+			std::cmp::Ordering::Greater => chunk,
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+		};
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
 		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
@@ -473,14 +591,17 @@ impl Ooc {
 			let e = match p.kind {
 				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(chunk, p.in_dim, p.out_dim),
 				LayerKind::Attn => kernels::gpu_splitk_dw_partials_elems(seq_rows, p.dim, p.dim),
-				_ => 0,
+				LayerKind::Embed | LayerKind::Conv => 0,
 			};
 			dwp = dwp.max(e);
-			let rows = if p.kind == LayerKind::Attn { seq_rows } else { chunk };
+			let rows = match p.kind {
+				LayerKind::Attn => seq_rows,
+				LayerKind::Dense | LayerKind::Embed | LayerKind::Conv => chunk,
+			};
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
 		}
-		if max_conv_fsz > 0 {
+		for _conv in max_conv_fsz.checked_sub(1).into_iter() {
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz));
 		}
 		let align256 = |b: usize| (b + 255) & !255;
@@ -495,11 +616,12 @@ impl Ooc {
 			+ (1 << 20)
 	}
 
-	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<(usize, usize)>, net: Option<Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<Ooc> {
+	pub fn build(params: &[LayerParams], n: usize, concat_ac: Option<ConcatAc>, net: Option<Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<Ooc> {
 		let attn = params.iter().find(|p| p.kind == LayerKind::Attn);
-		let (seq_spb, hs) = attn.map_or((1, 1), |p| (p.in_dim, p.heads * (p.in_dim / p.dim)));
+		let seq_spb = attn.map_or(1, |p| p.in_dim);
+		let hs = attn.map_or(1, |p| p.heads * (p.in_dim / p.dim));
 		let max_act_spb = params.iter().map(|p| p.out_dim.max(p.in_dim)).max().unwrap_or(1);
-		let (ca, cc) = concat_ac.unwrap_or((0, 0));
+		let ConcatAc { a: ca, c: cc } = concat_ac.unwrap_or(ConcatAc { a: 0, c: 0 });
 		let max_spb = seq_spb.max(max_act_spb).max(ca + cc);
 
 		assert!(
@@ -535,7 +657,10 @@ impl Ooc {
 		let win_budget = gpu_core::memory::arena_remaining().saturating_sub(fixed_res) / 2;
 		let chunk = (win_budget / (((WINS + 2) * max_spb + max_conv_fsz) * 8)).clamp(1, n);
 		let wbytes = chunk * max_spb * 8;
-		let conv_wg = if max_conv_fsz > 0 { chunk } else { 0 };
+		let conv_wg = match max_conv_fsz.cmp(&0) {
+			std::cmp::Ordering::Greater => chunk,
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+		};
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
 		let mut ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunk, 1);
@@ -543,20 +668,23 @@ impl Ooc {
 			let e = match p.kind {
 				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(chunk, p.in_dim, p.out_dim),
 				LayerKind::Attn => kernels::gpu_splitk_dw_partials_elems(seq_rows, p.dim, p.dim),
-				_ => 0,
+				LayerKind::Embed | LayerKind::Conv => 0,
 			};
 			dwp = dwp.max(e);
-			let rows = if p.kind == LayerKind::Attn { seq_rows } else { chunk };
+			let rows = match p.kind {
+				LayerKind::Attn => seq_rows,
+				LayerKind::Dense | LayerKind::Embed | LayerKind::Conv => chunk,
+			};
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows, p.out_dim.max(p.dim)));
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(rows * p.out_dim.max(p.dim), 1));
 		}
-		if max_conv_fsz > 0 {
+		for _conv in max_conv_fsz.checked_sub(1).into_iter() {
 			ws = ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz));
 		}
 
 		let wins: Vec<GpuBuffer> = (0..WINS)
-			.map(|_| GpuBuffer::alloc(chunk * max_spb).context("ooc window"))
-			.collect::<anyhow::Result<Vec<_>>>()?;
+			.map(|_slot| GpuBuffer::alloc(chunk * max_spb).context("ooc window"))
+			.collect::<anyhow::Result<Vec<GpuBuffer>>>()?;
 
 		let lse = GpuBuffer::alloc(n * hs).context("ooc lse")?;
 		let dsum = GpuBuffer::alloc(n * hs).context("ooc dsum")?;
@@ -581,7 +709,7 @@ impl Ooc {
 		let ram_start = mem_available().saturating_sub(POOL_BUFS * wbytes);
 		let ram_floor = USER_GB;
 		let mut ram_used = 0usize;
-		let mut vram_open = true;
+		let mut vram_gate = Gate::Open;
 		let mut disk_cursor: u64 = 0;
 		let mut spill: Option<File> = None;
 		let mut nonvram = 0usize;
@@ -606,40 +734,54 @@ impl Ooc {
 			for w in 0..n_wins {
 				let cnt = chunk.min(n - w * chunk);
 				let bytes = cnt * spb * 8;
-				if vram_open {
-					let aligned = (bytes + 4095) & !4095;
-					if slab_off + aligned <= slab_bytes {
-						homes.push(Home::Vram(view(&seal, slab_off, bytes)));
-						slab_off += aligned;
-						continue;
-					}
-					vram_open = false;
-				}
-				nonvram += 1;
-				if ram_start.saturating_sub(ram_used + bytes) > ram_floor {
-					ram_used += bytes;
-					let mut v = vec![0u8; bytes];
-					gpu_core::memory::par_touch(&mut v);
-					homes.push(Home::Ram(v));
-					continue;
-				}
-				if disk_cursor as usize + bytes <= disk_budget {
-					if spill.is_none() {
-						spill = Some(open_spill()?);
-					}
-					homes.push(Home::Disk(disk_cursor));
-					disk_cursor += bytes as u64;
-					continue;
-				}
-				let node = (0..net_caps.len()).find(|&nd| net_used[nd] + bytes <= net_caps[nd]);
-				let Some(node) = node else {
-					anyhow::bail!(
-						"ooc: window has no home — disk {disk_cursor}B of {disk_budget}B, remote {net_used:?} of {net_caps:?} (admit passed what placement cannot hold)"
-					);
+				let aligned = (bytes + 4095) & !4095;
+				let vram_room = match vram_gate {
+					Gate::Open => slab_bytes.checked_sub(slab_off + aligned),
+					Gate::Closed => None,
 				};
-				net_used[node] += bytes;
-				homes.push(Home::Remote { node, id: id_base | next_id });
-				next_id += 1;
+				let home = match vram_room {
+					Some(_room) => {
+						let h = Home::Vram(view(&seal, slab_off, bytes));
+						slab_off += aligned;
+						h
+					}
+					None => {
+						vram_gate = Gate::Closed;
+						nonvram += 1;
+						match ram_start.saturating_sub(ram_used + bytes).cmp(&ram_floor) {
+							std::cmp::Ordering::Greater => {
+								ram_used += bytes;
+								let mut v = vec![0u8; bytes];
+								gpu_core::memory::par_touch(&mut v);
+								Home::Ram(v)
+							}
+							std::cmp::Ordering::Less | std::cmp::Ordering::Equal => match (disk_cursor as usize + bytes).cmp(&disk_budget) {
+								std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+									spill = Some(match spill.take() {
+										Some(existing) => existing,
+										None => open_spill()?,
+									});
+									let h = Home::Disk(disk_cursor);
+									disk_cursor += bytes as u64;
+									h
+								}
+								std::cmp::Ordering::Greater => {
+									let node = (0..net_caps.len()).find(|&nd| net_used[nd] + bytes <= net_caps[nd]);
+									let Some(node) = node else {
+										anyhow::bail!(
+											"ooc: window has no home — disk {disk_cursor}B of {disk_budget}B, remote {net_used:?} of {net_caps:?} (admit passed what placement cannot hold)"
+										);
+									};
+									net_used[node] += bytes;
+									let h = Home::Remote { node, id: id_base | next_id };
+									next_id += 1;
+									h
+								}
+							},
+						}
+					}
+				};
+				homes.push(home);
 			}
 			Ok(Paged { homes, spb, chunk, ahead: RefCell::new(std::collections::VecDeque::new()), net: net.clone() })
 		};
@@ -650,33 +792,31 @@ impl Ooc {
 		let a_q = place(seq_spb)?;
 		let a_k = place(seq_spb)?;
 		let a_v = place(seq_spb)?;
-		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect::<anyhow::Result<_>>()?;
-		let concat = place(if ca + cc > 0 { ca + cc } else { 1 })?;
+		let acts: Vec<Paged> = params.iter().map(|p| place(p.out_dim)).collect::<anyhow::Result<Vec<Paged>>>()?;
+		let concat = place(match (ca + cc).cmp(&0) {
+			std::cmp::Ordering::Greater => ca + cc,
+			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 1,
+		})?;
 		let a_dctx = place(seq_spb)?;
 		let a_dq = place(seq_spb)?;
 		let a_dk = place(seq_spb)?;
 		let a_dv = place(seq_spb)?;
 		let preacts: Vec<Option<Paged>> = params
 			.iter()
-			.map(|p| {
-				matches!(
-					p.act,
-					Activation::Silu
-						| Activation::Gelu | Activation::Elu
-						| Activation::Selu | Activation::PRelu
-				)
-				.then(|| place(p.out_dim))
-				.transpose()
+			.map(|p| match p.act {
+				Activation::Silu
+				| Activation::Gelu | Activation::Elu
+				| Activation::Selu | Activation::PRelu => place(p.out_dim).map(Some),
+				Activation::Relu | Activation::Sigmoid | Activation::LeakyRelu
+				| Activation::Tanh | Activation::Linear => Ok(None),
 			})
-			.collect::<anyhow::Result<_>>()?;
-		if let Some(f) = spill.as_ref() {
-			f.set_len(disk_cursor).context("size spill file")?;
-		}
+			.collect::<anyhow::Result<Vec<Option<Paged>>>>()?;
+		spill.as_ref().map(|f| f.set_len(disk_cursor).context("size spill file")).transpose()?;
 
 		let pool_bufs = nonvram.min(POOL_BUFS);
 		let host: HostPool = Arc::new(Mutex::new(
 			(0..pool_bufs)
-				.map(|_| {
+				.map(|_buf_idx| {
 					let mut v = vec![0u8; wbytes];
 					gpu_core::memory::par_touch(&mut v);
 					v
@@ -685,14 +825,14 @@ impl Ooc {
 		));
 		let writer = Writer::new(spill.as_ref(), host.clone(), net.clone())?;
 
-		let used_pcie = nonvram > 0;
-		let used_disk = disk_cursor > 0;
-		let used_net = net_used.iter().any(|u| *u > 0);
 		let bps = |b: usize, t: std::time::Instant| b as f64 / t.elapsed().as_secs_f64();
-		let (mut rate_h2d, mut rate_d2h) = (0.0, 0.0);
-		let (mut rate_disk_r, mut rate_disk_w) = (0.0, 0.0);
-		let (mut rate_net_r, mut rate_net_w) = (0.0, 0.0);
-		for _ in 0..used_pcie as usize {
+		let mut rate_h2d = 0.0;
+		let mut rate_d2h = 0.0;
+		let mut rate_disk_r = 0.0;
+		let mut rate_disk_w = 0.0;
+		let mut rate_net_r = 0.0;
+		let mut rate_net_w = 0.0;
+		for _pcie in nonvram.checked_sub(1).into_iter() {
 			gpu_core::hip::device_synchronize().context("ooc calibrate sync")?;
 			let mut buf = pool_take(&host)?;
 			let t = std::time::Instant::now();
@@ -703,7 +843,7 @@ impl Ooc {
 			rate_d2h = bps(wbytes, t);
 			pool_give(&host, buf)?;
 		}
-		for _ in 0..used_disk as usize {
+		for _disk in disk_cursor.checked_sub(1).into_iter() {
 			let f = spill.as_ref().ok_or_else(|| anyhow::anyhow!("disk calibrate without spill file"))?;
 			let mut buf = pool_take(&host)?;
 			let t = std::time::Instant::now();
@@ -715,7 +855,7 @@ impl Ooc {
 			rate_disk_r = bps(wbytes, t);
 			pool_give(&host, buf)?;
 		}
-		for _ in 0..used_net as usize {
+		for _net in net_used.iter().find(|u| **u > 0).into_iter() {
 			let ns = net.as_ref().ok_or_else(|| anyhow::anyhow!("net used without net"))?;
 			let cal_id = id_base | 0xffff_ffff;
 			let buf = pool_take(&host)?;
@@ -725,7 +865,7 @@ impl Ooc {
 			let t = std::time::Instant::now();
 			let v = ns[0].fetch(cal_id, 0, wbytes as u64).context("calibrate net read")?;
 			rate_net_r = bps(v.len(), t);
-			let _ = ns[0].free(cal_id);
+			drop(ns[0].free(cal_id));
 			pool_give(&host, buf)?;
 		}
 
@@ -776,14 +916,18 @@ impl Ooc {
 
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-		let (mut v, mut r, mut d, mut nt) = (0usize, 0usize, 0usize, 0usize);
+		let mut v = 0usize;
+		let mut r = 0usize;
+		let mut d = 0usize;
+		let mut nt = 0usize;
 		let mut tally = |p: &Paged| {
-			for (w, h) in p.homes.iter().enumerate() {
+			for w in 0..p.homes.len() {
+				let h = &p.homes[w];
 				let cnt = p.chunk.min(self.n - w * p.chunk);
 				match h {
-					Home::Vram(_) => v += cnt * p.spb * 8,
+					Home::Vram(_buf) => v += cnt * p.spb * 8,
 					Home::Ram(x) => r += x.len(),
-					Home::Disk(_) => d += cnt * p.spb * 8,
+					Home::Disk(_off) => d += cnt * p.spb * 8,
 					Home::Remote { .. } => nt += cnt * p.spb * 8,
 				}
 			}
@@ -813,17 +957,18 @@ impl Ooc {
 			recipe_infer::GEMM_GFLOPS,
 			recipe_infer::VRAM_GBS,
 		);
-		for (label, rate) in [
-			("h2d", self.rate_h2d),
-			("d2h", self.rate_d2h),
-			("disk-r", self.rate_disk_r),
-			("disk-w", self.rate_disk_w),
-			("net-r", self.rate_net_r),
-			("net-w", self.rate_net_w),
-		] {
-			if rate > 0.0 {
-				roof += &format!("  {label} {:.3} GB/s", rate / 1e9);
-			}
+		for rt in [
+			Rate { label: "h2d", bps: self.rate_h2d },
+			Rate { label: "d2h", bps: self.rate_d2h },
+			Rate { label: "disk-r", bps: self.rate_disk_r },
+			Rate { label: "disk-w", bps: self.rate_disk_w },
+			Rate { label: "net-r", bps: self.rate_net_r },
+			Rate { label: "net-w", bps: self.rate_net_w },
+		]
+		.into_iter()
+		.filter(|rt| rt.bps > 0.0)
+		{
+			roof += &format!("  {} {:.3} GB/s", rt.label, rt.bps / 1e9);
 		}
 		eprintln!("{roof}");
 	}
@@ -834,36 +979,24 @@ impl Ooc {
 		x: &GpuBuffer,
 		x_cat: Option<&GpuBuffer>,
 		sc: &Scratch,
-		concat_at: Option<(usize, usize, usize)>,
+		concat_at: Option<ConcatFit>,
 	) -> anyhow::Result<()> {
 		let last = params.len() - 1;
-		for (l, p) in params.iter().enumerate() {
-			if let Some((pf, a, c)) = concat_at
-				&& l == pf
-			{
-				let s_c = sweep_start();
-				self.writer.barrier(self.spill.as_ref())?;
-				for (s0, cnt) in chunks(self.n, self.chunk) {
-					if self.bail()? {
-						return Ok(());
-					}
-					let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
-					let xc = view(x_cat.ok_or_else(|| anyhow::anyhow!("x_cat"))?, s0 * c * 8, cnt * c * 8);
-					let out = self.concat.write_view(s0, cnt, &self.wins[1]);
-					kernels::gpu_concat_into(&prev, &xc, cnt, a, c, &out).context("concat")?;
-					self.concat.commit(s0, cnt, &out, &self.writer, &self.host)?;
-				}
-				let cw = recipe_infer::Work { flop: 0.0, bytes: 16.0 * (self.n * (a + c)) as f64 };
-				self.sweep_line_work("fwd", l, "concat", &format!("{a}+{c}"), cw, s_c)?;
-			}
+		for l in 0..params.len() {
+			let p = &params[l];
+			let Flow::Go = self.concat_prefix(l, concat_at, x_cat)? else {
+				return Ok(());
+			};
 			let s_l = sweep_start();
 			match p.kind {
 				LayerKind::Embed => {
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(self.n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
 						kernels::gpu_gather_rows_into(&p.w, &ids, cnt * p.in_dim, p.dim, &out).context("gather")?;
@@ -876,10 +1009,12 @@ impl Ooc {
 					let heads = p.heads;
 					let s = p.in_dim / d;
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(self.n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 						let m = cnt * s;
 						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
@@ -894,10 +1029,12 @@ impl Ooc {
 						self.a_v.commit(s0, cnt, &v, &self.writer, &self.host)?;
 					}
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(self.n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let q = self.a_q.read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 						let k = self.a_k.read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?;
 						let v = self.a_v.read(s0, cnt, &self.wins[2], self.spill.as_ref(), self.n, &self.host)?;
@@ -907,10 +1044,12 @@ impl Ooc {
 						self.a_ctx.commit(s0, cnt, &ctx, &self.writer, &self.host)?;
 					}
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(self.n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let ctx = self.a_ctx.read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
 						kernels::gpu_linear_into(&ctx, &p.wo, &p.b, cnt * s, d, d, &out).context("attn out")?;
@@ -919,31 +1058,37 @@ impl Ooc {
 				}
 				LayerKind::Dense | LayerKind::Conv => {
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(self.n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(self.n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
-						let prev = if l == 0 {
-							view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
-						} else if Some(l) == concat_at.map(|t| t.0) {
-							self.concat.read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?
-						} else {
-							self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?
 						};
-						let out = if l == last {
-							view(&sc.acts[last], s0 * p.out_dim * 8, cnt * p.out_dim * 8)
-						} else {
-							self.acts[l].write_view(s0, cnt, &self.wins[1])
+						let concat_here = concat_at.filter(|cf| cf.pf == l);
+						let prev = match l {
+							0 => view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8),
+							_nonzero => match concat_here {
+								Some(_cf) => self.concat.read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?,
+								None => self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?,
+							},
 						};
-						if p.kind == LayerKind::Conv {
-							let (cin, kk, stride) = (p.conv_cin, p.conv_k, p.conv_stride);
-							let lin = p.in_dim / cin;
-							let cout = p.out_dim / ((lin - kk) / stride + 1);
-							kernels::gpu_conv1d_into(&prev, &p.w, &p.b, cnt, cin, lin, cout, kk, stride, &out).context("conv1d")?;
-						} else if p.out_dim == 1 {
-							kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, cnt, p.in_dim, &out).context("matvec")?;
-						} else {
-							kernels::gpu_linear_into(&prev, &p.w, &p.b, cnt, p.out_dim, p.in_dim, &out).context("linear")?;
+						let out = match l.cmp(&last) {
+							std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * p.out_dim * 8, cnt * p.out_dim * 8),
+							std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].write_view(s0, cnt, &self.wins[1]),
+						};
+						match p.kind {
+							LayerKind::Conv => {
+								let cin = p.conv_cin;
+								let kk = p.conv_k;
+								let stride = p.conv_stride;
+								let lin = p.in_dim / cin;
+								let cout = p.out_dim / ((lin - kk) / stride + 1);
+								kernels::gpu_conv1d_into(&prev, &p.w, &p.b, cnt, cin, lin, cout, kk, stride, &out).context("conv1d")?;
+							}
+							LayerKind::Dense | LayerKind::Embed | LayerKind::Attn => match p.out_dim.cmp(&1) {
+								std::cmp::Ordering::Equal => kernels::gpu_matvec_bias_into(&prev, &p.w, &p.b, cnt, p.in_dim, &out).context("matvec")?,
+								std::cmp::Ordering::Less | std::cmp::Ordering::Greater => kernels::gpu_linear_into(&prev, &p.w, &p.b, cnt, p.out_dim, p.in_dim, &out).context("linear")?,
+							},
 						}
 						let m = cnt * p.out_dim;
 						let saved = match self.preacts[l].as_mut() {
@@ -958,31 +1103,31 @@ impl Ooc {
 						match p.act {
 							Activation::PRelu => {
 								let zz = saved.as_ref().ok_or_else(|| anyhow::anyhow!("z-based activation without preact"))?;
-								kernels::gpu_leaky_relu_into(zz, &p.palpha, m, &out).context("prelu")?;
+								kernels::gpu_leaky_relu_into(zz, &p.palpha, m, &out).context("prelu")
 							}
 							Activation::Elu => {
 								let zz = saved.as_ref().ok_or_else(|| anyhow::anyhow!("z-based activation without preact"))?;
-								gpu_core::k_gapact::gpu_elu(zz, &sc.c_elu_alpha, m, &out).context("elu")?;
+								gpu_core::k_gapact::gpu_elu(zz, &sc.c_elu_alpha, m, &out).context("elu")
 							}
 							Activation::Selu => {
 								let zz = saved.as_ref().ok_or_else(|| anyhow::anyhow!("z-based activation without preact"))?;
-								gpu_core::k_gapact::gpu_selu(zz, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &out).context("selu")?;
+								gpu_core::k_gapact::gpu_selu(zz, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &out).context("selu")
 							}
 							Activation::Silu => {
 								let zz = saved.as_ref().ok_or_else(|| anyhow::anyhow!("z-based activation without preact"))?;
-								kernels::gpu_silu_into(zz, m, &out).context("silu")?;
+								kernels::gpu_silu_into(zz, m, &out).context("silu")
 							}
 							Activation::Gelu => {
 								let zz = saved.as_ref().ok_or_else(|| anyhow::anyhow!("z-based activation without preact"))?;
-								kernels::gpu_gelu_into(zz, m, &out).context("gelu")?;
+								kernels::gpu_gelu_into(zz, m, &out).context("gelu")
 							}
-							Activation::Relu => kernels::gpu_relu_into(&out, m, &out).context("relu")?,
-							Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, m, &out).context("sigmoid")?,
-							Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &sc.c_leaky_alpha, m, &out).context("leaky")?,
-							Activation::Tanh => kernels::gpu_tanh_into(&out, m, &out).context("tanh")?,
-							Activation::Linear => {}
-						}
-						if l != last {
+							Activation::Relu => kernels::gpu_relu_into(&out, m, &out).context("relu"),
+							Activation::Sigmoid => kernels::gpu_sigmoid_into(&out, m, &out).context("sigmoid"),
+							Activation::LeakyRelu => kernels::gpu_leaky_relu_into(&out, &sc.c_leaky_alpha, m, &out).context("leaky"),
+							Activation::Tanh => kernels::gpu_tanh_into(&out, m, &out).context("tanh"),
+							Activation::Linear => Ok(()),
+						}?;
+						for _mid in Some(()).filter(|_unit| l != last).into_iter() {
 							self.acts[l].commit(s0, cnt, &out, &self.writer, &self.host)?;
 						}
 					}
@@ -993,6 +1138,31 @@ impl Ooc {
 		Ok(())
 	}
 
+	fn concat_prefix(&mut self, l: usize, concat_at: Option<ConcatFit>, x_cat: Option<&GpuBuffer>) -> anyhow::Result<Flow> {
+		let Some(cf) = concat_at.filter(|cf| l == cf.pf) else {
+			return Ok(Flow::Go);
+		};
+		let a = cf.a;
+		let c = cf.c;
+		let s_c = sweep_start();
+		self.writer.barrier(self.spill.as_ref())?;
+		for win in chunks(self.n, self.chunk) {
+			let s0 = win.s0;
+			let cnt = win.cnt;
+			let Flow::Go = self.bail()? else {
+				return Ok(Flow::Halt);
+			};
+			let prev = self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
+			let xc = view(x_cat.ok_or_else(|| anyhow::anyhow!("x_cat"))?, s0 * c * 8, cnt * c * 8);
+			let out = self.concat.write_view(s0, cnt, &self.wins[1]);
+			kernels::gpu_concat_into(&prev, &xc, cnt, a, c, &out).context("concat")?;
+			self.concat.commit(s0, cnt, &out, &self.writer, &self.host)?;
+		}
+		let cw = recipe_infer::Work { flop: 0.0, bytes: 16.0 * (self.n * (a + c)) as f64 };
+		self.sweep_line_work("fwd", l, "concat", &format!("{a}+{c}"), cw, s_c)?;
+		Ok(Flow::Go)
+	}
+
 	pub(crate) fn backward(
 		&mut self,
 		params: &[LayerParams],
@@ -1001,16 +1171,18 @@ impl Ooc {
 		sc: &Scratch,
 		ss: &StepScalars,
 		loss: Loss,
-		concat_at: Option<(usize, usize, usize)>,
+		concat_at: Option<ConcatFit>,
 	) -> anyhow::Result<()> {
 		let last = params.len() - 1;
 		let n = self.n;
 		self.da_a.spb = params[last].out_dim;
 		self.writer.barrier(self.spill.as_ref())?;
-		for (s0, cnt) in chunks(n, self.chunk) {
-			if self.bail()? {
+		for win in chunks(n, self.chunk) {
+			let s0 = win.s0;
+			let cnt = win.cnt;
+			let Flow::Go = self.bail()? else {
 				return Ok(());
-			}
+			};
 			let k = params[last].out_dim;
 			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
@@ -1018,56 +1190,63 @@ impl Ooc {
 			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss);
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host)?;
 		}
-		let mut flip = false;
+		let mut flip = Flip::A;
 		for l in (0..params.len()).rev() {
 			let p = &params[l];
 			let s_l = sweep_start();
-			let (in_dim, out_dim) = (p.in_dim, p.out_dim);
+			let in_dim = p.in_dim;
+			let out_dim = p.out_dim;
 			match p.kind {
 				LayerKind::Embed => {
 					kernels::gpu_scale_inplace(&ss.zero, p.vocab * p.dim, &sc.embed_grad).context("embed zero")?;
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
 						kernels::gpu_scatter_add(&ids, &da, cnt * p.in_dim, p.dim, &sc.embed_grad).context("embed scatter")?;
 					}
 					kernels::gpu_sgd_update(&sc.embed_grad, &ss.neg_lr, p.vocab * p.dim, &p.w).context("sgd embed")?;
 					self.sweep_line("bwd", l, p, s_l)?;
-					flip = !flip;
-					continue;
+					flip = flip.toggle();
 				}
 				LayerKind::Attn => {
 					self.attn_backward(params, l, x, sc, ss, flip)?;
 					self.sweep_line("bwd", l, p, s_l)?;
-					flip = !flip;
-					continue;
+					flip = flip.toggle();
 				}
 				LayerKind::Conv => {
-					let (cin, kk, stride) = (p.conv_cin, p.conv_k, p.conv_stride);
+					let cin = p.conv_cin;
+					let kk = p.conv_k;
+					let stride = p.conv_stride;
 					let lin = in_dim / cin;
 					let lout = (lin - kk) / stride + 1;
 					let cout = out_dim / lout;
 					kernels::gpu_scale_inplace(&ss.zero, cout * cin * kk, &self.dw_acc).context("conv dw_acc zero")?;
 					kernels::gpu_scale_inplace(&ss.zero, cout, &self.db_acc).context("conv db_acc zero")?;
-					if p.act == Activation::PRelu {
+					for _prelu in prelu_gate(&p.act).into_iter() {
 						kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("conv scalar_acc zero")?;
 					}
-					self.set_da_below_spb(flip, if l > 0 { in_dim } else { 1 });
+					self.set_da_below_spb(flip, match l {
+						0 => 1,
+						_positive => in_dim,
+					});
 					self.writer.barrier(self.spill.as_ref())?;
-					for (s0, cnt) in chunks(n, self.chunk) {
-						if self.bail()? {
+					for win in chunks(n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
 							return Ok(());
-						}
+						};
 						let m = cnt * out_dim;
 						let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
-						let act_l = if l == last {
-							view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
-						} else {
-							self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?
+						let act_l = match l.cmp(&last) {
+							std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
+							std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?,
 						};
 						let dz = view(&self.wins[2], 0, m * 8);
 						let grad: &GpuBuffer = match p.act {
@@ -1125,10 +1304,9 @@ impl Ooc {
 							}
 							Activation::Linear => &da,
 						};
-						let a_prev = if l == 0 {
-							view(x, s0 * in_dim * 8, cnt * in_dim * 8)
-						} else {
-							self.acts[l - 1].read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?
+						let a_prev = match l {
+							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
+							_positive => self.acts[l - 1].read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?,
 						};
 						kernels::gpu_conv1d_backward_filter_into(
 							grad, &a_prev, &self.conv_temp, &self.reduce_ws,
@@ -1137,8 +1315,11 @@ impl Ooc {
 						).context("conv filter bwd")?;
 						kernels::gpu_add_inplace(&self.dw_tmp, cout * cin * kk, &self.dw_acc).context("conv dw acc")?;
 						kernels::gpu_conv1d_backward_bias_into(grad, cnt, cout, lout, &self.db_acc).context("conv bias bwd")?;
-						if l > 0 {
-							let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
+						for _below in l.checked_sub(1).into_iter() {
+							let below_pg = match flip {
+								Flip::B => &mut self.da_a,
+								Flip::A => &mut self.da_b,
+							};
 							let below = below_pg.write_view(s0, cnt, &self.wins[7]);
 							kernels::gpu_conv1d_backward_data_into(grad, &p.w, cnt, cin, lin, cout, kk, stride, &below).context("conv data bwd")?;
 							below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?;
@@ -1146,135 +1327,144 @@ impl Ooc {
 					}
 					kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, cout * cin * kk, &p.w).context("sgd conv w")?;
 					kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, cout, &p.b).context("sgd conv b")?;
-					if p.act == Activation::PRelu {
+					for _prelu in prelu_gate(&p.act).into_iter() {
 						kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd conv prelu")?;
 					}
 					self.sweep_line("bwd", l, p, s_l)?;
-					flip = !flip;
-					continue;
+					flip = flip.toggle();
 				}
-				LayerKind::Dense => {}
-			}
-			kernels::gpu_scale_inplace(&ss.zero, in_dim * out_dim, &self.dw_acc).context("dw_acc zero")?;
-			kernels::gpu_scale_inplace(&ss.zero, out_dim, &self.db_acc).context("db_acc zero")?;
-			if p.act == Activation::PRelu {
-				kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("scalar_acc zero")?;
-			}
-			self.set_da_below_spb(flip, if l > 0 { in_dim } else { 1 });
-			self.writer.barrier(self.spill.as_ref())?;
-			for (s0, cnt) in chunks(n, self.chunk) {
-				if self.bail()? {
-					return Ok(());
+				LayerKind::Dense => {
+					kernels::gpu_scale_inplace(&ss.zero, in_dim * out_dim, &self.dw_acc).context("dw_acc zero")?;
+					kernels::gpu_scale_inplace(&ss.zero, out_dim, &self.db_acc).context("db_acc zero")?;
+					for _prelu in prelu_gate(&p.act).into_iter() {
+						kernels::gpu_scale_inplace(&ss.zero, 1, &self.scalar_acc).context("scalar_acc zero")?;
+					}
+					self.set_da_below_spb(flip, match l {
+						0 => 1,
+						_positive => in_dim,
+					});
+					self.writer.barrier(self.spill.as_ref())?;
+					for win in chunks(n, self.chunk) {
+						let s0 = win.s0;
+						let cnt = win.cnt;
+						let Flow::Go = self.bail()? else {
+							return Ok(());
+						};
+						let m = cnt * out_dim;
+						let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
+						let act_l = match l.cmp(&last) {
+							std::cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
+							std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?,
+						};
+						let dz = view(&self.wins[2], 0, m * 8);
+						let grad: &GpuBuffer = match p.act {
+							Activation::Relu => {
+								kernels::gpu_relu_backward_into(&da, &act_l, m, &dz).context("relu bwd")?;
+								&dz
+							}
+							Activation::Sigmoid => {
+								kernels::gpu_sigmoid_backward_into(&da, &act_l, m, &dz).context("sigmoid bwd")?;
+								&dz
+							}
+							Activation::LeakyRelu => {
+								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &sc.c_leaky_alpha, m, &dz).context("leaky bwd")?;
+								&dz
+							}
+							Activation::PRelu => {
+								kernels::gpu_leaky_relu_backward_into(&da, &act_l, &p.palpha, m, &dz).context("prelu bwd")?;
+								let pre = self.preacts[l]
+									.as_ref()
+									.ok_or_else(|| anyhow::anyhow!("prelu preact"))?
+									.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+								let t0 = view(&self.wins[4], 0, m * 8);
+								let t1 = view(&self.wins[5], 0, m * 8);
+								kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
+								kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
+								kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
+								kernels::gpu_mul_inplace(&da, m, &t1).context("prelu mul")?;
+								kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).context("prelu reduce")?;
+								kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).context("prelu acc")?;
+								&dz
+							}
+							Activation::Tanh => {
+								kernels::gpu_tanh_backward_into(&da, &act_l, m, &dz).context("tanh bwd")?;
+								&dz
+							}
+							Activation::Elu => {
+								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("elu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+								gpu_core::k_gapact::gpu_elu_backward(&da, &pre, &sc.c_elu_alpha, m, &dz).context("elu bwd")?;
+								&dz
+							}
+							Activation::Selu => {
+								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("selu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+								gpu_core::k_gapact::gpu_selu_backward(&da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &dz).context("selu bwd")?;
+								&dz
+							}
+							Activation::Silu => {
+								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("silu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+								kernels::gpu_silu_backward_into(&da, &pre, m, &dz).context("silu bwd")?;
+								&dz
+							}
+							Activation::Gelu => {
+								let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("gelu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
+								kernels::gpu_gelu_backward_into(&da, &pre, m, &dz).context("gelu bwd")?;
+								&dz
+							}
+							Activation::Linear => &da,
+						};
+						let a_prev = match l {
+							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
+							_positive => match concat_at.filter(|cf| cf.pf == l) {
+								Some(_cf) => self.concat.read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?,
+								None => self.acts[l - 1].read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?,
+							},
+						};
+						match l {
+							0 => {
+								kernels::gpu_linear_backward_weights_only_into(
+									grad, &a_prev, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+									&self.dw_tmp, &self.db_tmp,
+								).context("linear weights bwd")?;
+							}
+							_positive => {
+								let below_pg = match flip {
+									Flip::B => &mut self.da_a,
+									Flip::A => &mut self.da_b,
+								};
+								let below = below_pg.write_view(s0, cnt, &self.wins[7]);
+								kernels::gpu_linear_backward_full_into(
+									grad, &a_prev, &p.w, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
+									&below, &self.dw_tmp, &self.db_tmp,
+								).context("linear full bwd")?;
+								match concat_at.filter(|cf| l == cf.pf) {
+									Some(cf) => {
+										let a = cf.a;
+										let c = cf.c;
+										let compact = view(&self.wins[8], 0, cnt * a * 8);
+										kernels::gpu_slice_lead_into(&below, cnt, a + c, a, &compact).context("concat slice")?;
+										below_pg.spb = a;
+										below_pg.commit(s0, cnt, &compact, &self.writer, &self.host)?;
+										below_pg.spb = a + c;
+									}
+									None => below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?,
+								}
+							}
+						}
+						kernels::gpu_add_inplace(&self.dw_tmp, in_dim * out_dim, &self.dw_acc).context("dw acc")?;
+						kernels::gpu_add_inplace(&self.db_tmp, out_dim, &self.db_acc).context("db acc")?;
+					}
+					for cf in concat_at.filter(|cf| l == cf.pf).into_iter() {
+						self.set_da_below_spb(flip, cf.a);
+					}
+					kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, in_dim * out_dim, &p.w).context("sgd w")?;
+					kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, out_dim, &p.b).context("sgd b")?;
+					for _prelu in prelu_gate(&p.act).into_iter() {
+						kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd prelu")?;
+					}
+					self.sweep_line("bwd", l, p, s_l)?;
+					flip = flip.toggle();
 				}
-				let m = cnt * out_dim;
-				let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
-				let act_l = if l == last {
-					view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
-				} else {
-					self.acts[l].read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?
-				};
-				let dz = view(&self.wins[2], 0, m * 8);
-				let grad: &GpuBuffer = match p.act {
-					Activation::Relu => {
-						kernels::gpu_relu_backward_into(&da, &act_l, m, &dz).context("relu bwd")?;
-						&dz
-					}
-					Activation::Sigmoid => {
-						kernels::gpu_sigmoid_backward_into(&da, &act_l, m, &dz).context("sigmoid bwd")?;
-						&dz
-					}
-					Activation::LeakyRelu => {
-						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &sc.c_leaky_alpha, m, &dz).context("leaky bwd")?;
-						&dz
-					}
-					Activation::PRelu => {
-						kernels::gpu_leaky_relu_backward_into(&da, &act_l, &p.palpha, m, &dz).context("prelu bwd")?;
-						let pre = self.preacts[l]
-							.as_ref()
-							.ok_or_else(|| anyhow::anyhow!("prelu preact"))?
-							.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-						let t0 = view(&self.wins[4], 0, m * 8);
-						let t1 = view(&self.wins[5], 0, m * 8);
-						kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
-						kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
-						kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
-						kernels::gpu_mul_inplace(&da, m, &t1).context("prelu mul")?;
-						kernels::gpu_reduce_sum_cols_into(&t1, &self.reduce_ws, m, 1, &self.scalar_tmp).context("prelu reduce")?;
-						kernels::gpu_add_inplace(&self.scalar_tmp, 1, &self.scalar_acc).context("prelu acc")?;
-						&dz
-					}
-					Activation::Tanh => {
-						kernels::gpu_tanh_backward_into(&da, &act_l, m, &dz).context("tanh bwd")?;
-						&dz
-					}
-					Activation::Elu => {
-						let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("elu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-						gpu_core::k_gapact::gpu_elu_backward(&da, &pre, &sc.c_elu_alpha, m, &dz).context("elu bwd")?;
-						&dz
-					}
-					Activation::Selu => {
-						let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("selu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-						gpu_core::k_gapact::gpu_selu_backward(&da, &pre, &sc.c_selu_alpha, &sc.c_selu_lambda, m, &dz).context("selu bwd")?;
-						&dz
-					}
-					Activation::Silu => {
-						let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("silu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-						kernels::gpu_silu_backward_into(&da, &pre, m, &dz).context("silu bwd")?;
-						&dz
-					}
-					Activation::Gelu => {
-						let pre = self.preacts[l].as_ref().ok_or_else(|| anyhow::anyhow!("gelu preact"))?.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-						kernels::gpu_gelu_backward_into(&da, &pre, m, &dz).context("gelu bwd")?;
-						&dz
-					}
-					Activation::Linear => &da,
-				};
-				let a_prev = if l == 0 {
-					view(x, s0 * in_dim * 8, cnt * in_dim * 8)
-				} else if Some(l) == concat_at.map(|t| t.0) {
-					self.concat.read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?
-				} else {
-					self.acts[l - 1].read(s0, cnt, &self.wins[6], self.spill.as_ref(), self.n, &self.host)?
-				};
-				if l > 0 {
-					let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
-					let below = below_pg.write_view(s0, cnt, &self.wins[7]);
-					kernels::gpu_linear_backward_full_into(
-						grad, &a_prev, &p.w, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
-						&below, &self.dw_tmp, &self.db_tmp,
-					).context("linear full bwd")?;
-					if let Some((pf, a, c)) = concat_at
-						&& l == pf
-					{
-						let compact = view(&self.wins[8], 0, cnt * a * 8);
-						kernels::gpu_slice_lead_into(&below, cnt, a + c, a, &compact).context("concat slice")?;
-						below_pg.spb = a;
-						below_pg.commit(s0, cnt, &compact, &self.writer, &self.host)?;
-						below_pg.spb = a + c;
-					} else {
-						below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?;
-					}
-				} else {
-					kernels::gpu_linear_backward_weights_only_into(
-						grad, &a_prev, &self.reduce_ws, &self.dw_partials, cnt, out_dim, in_dim,
-						&self.dw_tmp, &self.db_tmp,
-					).context("linear weights bwd")?;
-				}
-				kernels::gpu_add_inplace(&self.dw_tmp, in_dim * out_dim, &self.dw_acc).context("dw acc")?;
-				kernels::gpu_add_inplace(&self.db_tmp, out_dim, &self.db_acc).context("db acc")?;
 			}
-			if let Some((pf, a, _)) = concat_at
-				&& l == pf
-			{
-				self.set_da_below_spb(flip, a);
-			}
-			kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, in_dim * out_dim, &p.w).context("sgd w")?;
-			kernels::gpu_sgd_update(&self.db_acc, &ss.neg_lr, out_dim, &p.b).context("sgd b")?;
-			if p.act == Activation::PRelu {
-				kernels::gpu_sgd_update(&self.scalar_acc, &ss.neg_lr, 1, &p.palpha).context("sgd prelu")?;
-			}
-			self.sweep_line("bwd", l, p, s_l)?;
-			flip = !flip;
 		}
 		Ok(())
 	}
@@ -1286,26 +1476,28 @@ impl Ooc {
 			LayerKind::Conv => "conv",
 			LayerKind::Dense => "dense",
 		};
-		let w = if phase == "fwd" {
-			recipe_infer::layer_fwd(p, self.n)
-		} else {
-			recipe_infer::layer_bwd(p, self.n, l == 0)
+		let w = match phase {
+			"fwd" => recipe_infer::layer_fwd(p, self.n),
+			_other => recipe_infer::layer_bwd(p, self.n, l == 0),
 		};
 		self.sweep_line_work(phase, l, kind, &format!("{}->{}", p.in_dim, p.out_dim), w, s)
 	}
 
 	fn sweep_line_work(&self, phase: &str, l: usize, kind: &str, dims: &str, w: recipe_infer::Work, s: SweepStart) -> anyhow::Result<()> {
-		let (h2d, d2h, _) = gpu_core::memory::xfer_bytes();
+		let x = xfer();
+		let h2d = x.h2d;
+		let d2h = x.d2h;
 		let disk_r = DISK_R_BYTES.load(Ordering::Relaxed);
 		let disk_w = DISK_W_BYTES.load(Ordering::Relaxed);
 		let net_r = NET_R_BYTES.load(Ordering::Relaxed);
 		let net_w = NET_W_BYTES.load(Ordering::Relaxed);
 		let streamed = (h2d - s.h2d) + (d2h - s.d2h) + (disk_r - s.disk_r) + (disk_w - s.disk_w)
 			+ (net_r - s.net_r) + (net_w - s.net_w);
-		for _ in 0..(streamed > 0) as usize {
+		for _stream in streamed.checked_sub(1).into_iter() {
 			gpu_core::hip::device_synchronize().context("sweep sync")?;
 			let sec = s.t.elapsed().as_secs_f64();
-			let (gfs, gbs) = (w.flop / sec / 1e9, w.bytes / sec / 1e9);
+			let gfs = w.flop / sec / 1e9;
+			let gbs = w.bytes / sec / 1e9;
 			let mut line = format!(
 				"ooc {phase} L{l} {kind} {dims}  {} windows  {sec:.1}s  {:.2} GFLOP {gfs:.1} GF/s {:.0}% gemm  {:.2} GB {gbs:.1} GB/s {:.0}% vram",
 				self.n.div_ceil(self.chunk),
@@ -1314,26 +1506,28 @@ impl Ooc {
 				w.bytes / 1e9,
 				100.0 * gbs / recipe_infer::VRAM_GBS,
 			);
-			for (label, delta, rate) in [
-				("h2d", h2d - s.h2d, self.rate_h2d),
-				("d2h", d2h - s.d2h, self.rate_d2h),
-				("disk-r", disk_r - s.disk_r, self.rate_disk_r),
-				("disk-w", disk_w - s.disk_w, self.rate_disk_w),
-				("net-r", net_r - s.net_r, self.rate_net_r),
-				("net-w", net_w - s.net_w, self.rate_net_w),
-			] {
-				if delta > 0 {
-					let bps = delta as f64 / sec;
-					line += &format!(
-						"  {label} {:.2} GB {:.2} GB/s {:.0}%",
-						delta as f64 / 1e9,
-						bps / 1e9,
-						100.0 * bps / rate,
-					);
-				}
+			for st in [
+				Stream { label: "h2d", delta: h2d - s.h2d, rate: self.rate_h2d },
+				Stream { label: "d2h", delta: d2h - s.d2h, rate: self.rate_d2h },
+				Stream { label: "disk-r", delta: disk_r - s.disk_r, rate: self.rate_disk_r },
+				Stream { label: "disk-w", delta: disk_w - s.disk_w, rate: self.rate_disk_w },
+				Stream { label: "net-r", delta: net_r - s.net_r, rate: self.rate_net_r },
+				Stream { label: "net-w", delta: net_w - s.net_w, rate: self.rate_net_w },
+			]
+			.into_iter()
+			.filter(|st| st.delta > 0)
+			{
+				let bps = st.delta as f64 / sec;
+				line += &format!(
+					"  {} {:.2} GB {:.2} GB/s {:.0}%",
+					st.label,
+					st.delta as f64 / 1e9,
+					bps / 1e9,
+					100.0 * bps / st.rate,
+				);
 			}
 			let drain = self.writer.drained.take();
-			if drain > 0.0 {
+			for _drained in drain.partial_cmp(&0.0).filter(|ord| matches!(ord, std::cmp::Ordering::Greater)).into_iter() {
 				line += &format!("  drain {drain:.1}s");
 			}
 			eprintln!("{line}");
@@ -1343,12 +1537,6 @@ impl Ooc {
 
 	fn all_paged(&self) -> impl Iterator<Item = &Paged> {
 		let Ooc {
-			n: _,
-			chunk: _,
-			wins: _,
-			spill: _,
-			writer: _,
-			host: _,
 			acts,
 			preacts,
 			a_q,
@@ -1362,52 +1550,37 @@ impl Ooc {
 			concat,
 			da_a,
 			da_b,
-			lse: _,
-			dsum: _,
-			dw_acc: _,
-			db_acc: _,
-			dw_tmp: _,
-			db_tmp: _,
-			scalar_acc: _,
-			scalar_tmp: _,
-			dwq_acc: _,
-			dwk_acc: _,
-			dwv_acc: _,
-			dw_partials: _,
-			reduce_ws: _,
-			conv_temp: _,
-			conv_wg: _,
-			rate_h2d: _,
-			rate_d2h: _,
-			rate_disk_r: _,
-			rate_disk_w: _,
-			rate_net_r: _,
-			rate_net_w: _,
-			net: _,
+			..
 		} = self;
 		acts.iter().chain(preacts.iter().flatten()).chain([
 			a_q, a_k, a_v, a_ctx, a_dctx, a_dq, a_dk, a_dv, concat, da_a, da_b,
 		])
 	}
 
-	fn bail(&self) -> anyhow::Result<bool> {
-		if !interrupted() {
-			return Ok(false);
-		}
+	fn bail(&self) -> anyhow::Result<Flow> {
+		let Interrupt::Yes = interrupted() else {
+			return Ok(Flow::Go);
+		};
 		for p in self.all_paged() {
 			p.drain_ahead(&self.host)?;
 		}
-		Ok(true)
+		Ok(Flow::Halt)
 	}
 
-	fn da(&self, flip: bool) -> &Paged {
-		if flip { &self.da_b } else { &self.da_a }
+	fn da(&self, flip: Flip) -> &Paged {
+		match flip {
+			Flip::B => &self.da_b,
+			Flip::A => &self.da_a,
+		}
 	}
-	fn set_da_below_spb(&mut self, flip: bool, spb: usize) {
-		if flip { self.da_a.spb = spb } else { self.da_b.spb = spb }
+	fn set_da_below_spb(&mut self, flip: Flip, spb: usize) {
+		match flip {
+			Flip::B => self.da_a.spb = spb,
+			Flip::A => self.da_b.spb = spb,
+		}
 	}
 
-	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, sc: &Scratch, ss: &StepScalars, flip: bool) -> anyhow::Result<()> {
+	fn attn_backward(&mut self, params: &[LayerParams], l: usize, x: &GpuBuffer, sc: &Scratch, ss: &StepScalars, flip: Flip) -> anyhow::Result<()> {
 		let p = &params[l];
 		let d = p.dim;
 		let heads = p.heads;
@@ -1415,10 +1588,12 @@ impl Ooc {
 		let n = self.n;
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dw_acc).context("dw_acc zero")?;
 		self.writer.barrier(self.spill.as_ref())?;
-		for (s0, cnt) in chunks(n, self.chunk) {
-			if self.bail()? {
+		for win in chunks(n, self.chunk) {
+			let s0 = win.s0;
+			let cnt = win.cnt;
+			let Flow::Go = self.bail()? else {
 				return Ok(());
-			}
+			};
 			let m = cnt * s;
 			let da = self.da(flip).read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 			let ctx = self.a_ctx.read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?;
@@ -1432,10 +1607,12 @@ impl Ooc {
 		}
 		kernels::gpu_sgd_update(&self.dw_acc, &ss.neg_lr, d * d, &p.wo).context("sgd wo")?;
 		self.writer.barrier(self.spill.as_ref())?;
-		for (s0, cnt) in chunks(n, self.chunk) {
-			if self.bail()? {
+		for win in chunks(n, self.chunk) {
+			let s0 = win.s0;
+			let cnt = win.cnt;
+			let Flow::Go = self.bail()? else {
 				return Ok(());
-			}
+			};
 			let q = self.a_q.read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?;
 			let k = self.a_k.read(s0, cnt, &self.wins[1], self.spill.as_ref(), self.n, &self.host)?;
 			let v = self.a_v.read(s0, cnt, &self.wins[2], self.spill.as_ref(), self.n, &self.host)?;
@@ -1460,25 +1637,36 @@ impl Ooc {
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwk_acc).context("dwk zero")?;
 		kernels::gpu_scale_inplace(&ss.zero, d * d, &self.dwv_acc).context("dwv zero")?;
 		self.writer.barrier(self.spill.as_ref())?;
-		for (s0, cnt) in chunks(n, self.chunk) {
-			if self.bail()? {
+		for win in chunks(n, self.chunk) {
+			let s0 = win.s0;
+			let cnt = win.cnt;
+			let Flow::Go = self.bail()? else {
 				return Ok(());
-			}
-			let m = cnt * s;
-			let h = if l == 0 {
-				view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8)
-			} else {
-				self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?
 			};
-			let below_pg = if flip { &mut self.da_a } else { &mut self.da_b };
+			let m = cnt * s;
+			let h = match l {
+				0 => view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8),
+				_positive => self.acts[l - 1].read(s0, cnt, &self.wins[0], self.spill.as_ref(), self.n, &self.host)?,
+			};
+			let below_pg = match flip {
+				Flip::B => &mut self.da_a,
+				Flip::A => &mut self.da_b,
+			};
 			let below = below_pg.write_view(s0, cnt, &self.wins[1]);
 			let dh_tmp = view(&self.wins[2], 0, cnt * p.in_dim * 8);
-			for (wi, (w, dbuf)) in [(&p.w, &self.a_dq), (&p.wk, &self.a_dk), (&p.wv, &self.a_dv)]
-				.into_iter()
-				.enumerate()
-			{
+			let qkv = [
+				Qkv { w: &p.w, dbuf: &self.a_dq },
+				Qkv { w: &p.wk, dbuf: &self.a_dk },
+				Qkv { w: &p.wv, dbuf: &self.a_dv },
+			];
+			for wi in 0..qkv.len() {
+				let w = qkv[wi].w;
+				let dbuf = qkv[wi].dbuf;
 				let dg = dbuf.read(s0, cnt, &self.wins[3], self.spill.as_ref(), self.n, &self.host)?;
-				let dst = if wi == 0 { &below } else { &dh_tmp };
+				let dst = match wi {
+					0 => &below,
+					_other => &dh_tmp,
+				};
 				kernels::gpu_linear_backward_full_into(
 					&dg, &h, w, &self.reduce_ws, &self.dw_partials, m, d, d,
 					dst, &self.dw_tmp, &self.db_tmp,
@@ -1486,10 +1674,10 @@ impl Ooc {
 				let acc = match wi {
 					0 => &self.dwq_acc,
 					1 => &self.dwk_acc,
-					_ => &self.dwv_acc,
+					_other => &self.dwv_acc,
 				};
 				kernels::gpu_add_inplace(&self.dw_tmp, d * d, acc).context("acc add")?;
-				if wi > 0 {
+				for _mix in wi.checked_sub(1).into_iter() {
 					kernels::gpu_add_inplace(&dh_tmp, cnt * p.in_dim, &below).context("dh add")?;
 				}
 			}
@@ -1502,20 +1690,26 @@ impl Ooc {
 	}
 }
 
+struct Qkv<'a> {
+	w: &'a GpuBuffer,
+	dbuf: &'a Paged,
+}
+
 impl Drop for Ooc {
 	fn drop(&mut self) {
 		let Ooc { writer, spill, .. } = &mut *self;
 		let r = writer.barrier(spill.as_ref());
 		assert!(r.is_ok(), "ooc drop barrier: {}", r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		if let Some(net) = self.net.clone() {
-			for p in self.all_paged() {
-				for h in &p.homes {
-					if let Home::Remote { node, id } = h {
-						let _ = net[*node].free(*id);
-					}
-				}
+		let Some(net) = self.net.clone() else {
+			return;
+		};
+		for p in self.all_paged() {
+			for h in &p.homes {
+				let Home::Remote { node, id } = h else {
+					continue;
+				};
+				drop(net[*node].free(*id));
 			}
 		}
 	}
 }
-

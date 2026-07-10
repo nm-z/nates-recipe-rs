@@ -69,7 +69,7 @@ static CHURN: LazyLock<recipe::dataset::Dataset> = LazyLock::new(|| {
 		"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",
 	);
 	let data = recipe::dataset::Data::load(TRAIN).target("Churn");
-	data.datasets().0
+	data.datasets().train
 });
 
 fn step_scalars(lr: f64, n: usize) -> StepScalars {

@@ -5,6 +5,27 @@ use crate::scratch::Scratch;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
+#[derive(Clone, Copy)]
+pub struct LossScale {
+	pub sign: f64,
+	pub div: f64,
+}
+
+pub fn metric_gpu_into_s(
+	loss: Loss,
+	m: Metric,
+	out: &GpuBuffer,
+	ybuf: &GpuBuffer,
+	sc: &Scratch,
+	n: usize,
+	k: usize,
+	ss_tot: f64,
+	dst: &GpuBuffer,
+) -> anyhow::Result<LossScale> {
+	let (sign, div) = metric_gpu_into(loss, m, out, ybuf, sc, n, k, ss_tot, dst)?;
+	Ok(LossScale { sign, div })
+}
+
 pub fn metric_gpu_into(
 	loss: Loss,
 	m: Metric,
@@ -139,6 +160,17 @@ pub fn zscore_apply_into(
 	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
 	kernels::gpu_broadcast_div(&xc, std, n * d, d, out)?;
 	Ok(())
+}
+
+pub struct ZFit {
+	pub mean: Vec<f64>,
+	pub std: Vec<f64>,
+	pub scaled: Vec<f64>,
+}
+
+pub fn zscore_fit_s(x: &[f64], n: usize, d: usize) -> ZFit {
+	let (mean, std, scaled) = zscore_fit_host(x, n, d);
+	ZFit { mean, std, scaled }
 }
 
 pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -428,6 +460,44 @@ pub fn infer_scored(
 		None => Vec::new(),
 	};
 	Ok((download_vec(out, n * k), vals))
+}
+
+#[derive(Clone, Copy)]
+pub struct YScaler {
+	pub mean: f64,
+	pub std: f64,
+}
+
+pub struct Scored {
+	pub preds: Vec<f64>,
+	pub vals: Vec<f64>,
+}
+
+pub fn infer_scored_struct(
+	params: &[LayerParams],
+	xbuf: &GpuBuffer,
+	x_cat: Option<&GpuBuffer>,
+	n: usize,
+	yscaler: Option<YScaler>,
+	ybuf: Option<&GpuBuffer>,
+	loss: Loss,
+	lr: f64,
+	metrics: &[Metric],
+	ss_tot: f64,
+) -> anyhow::Result<Scored> {
+	let (preds, vals) = infer_scored(
+		params,
+		xbuf,
+		x_cat,
+		n,
+		yscaler.map(|s| (s.mean, s.std)),
+		ybuf,
+		loss,
+		lr,
+		metrics,
+		ss_tot,
+	)?;
+	Ok(Scored { preds, vals })
 }
 
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {

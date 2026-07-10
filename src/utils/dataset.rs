@@ -4,6 +4,8 @@ use pantry::{Attr, Kind};
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
+type InferOnly = bool;
+
 pub trait IntoTargets {
 	fn into_targets(self) -> Vec<String>;
 }
@@ -25,6 +27,38 @@ impl IntoTargets for &[&str] {
 
 pub struct Data {
 	pub(crate) inner: Box<DataInner>,
+}
+
+pub struct Datasets {
+	pub train: Dataset,
+	pub test: Option<Dataset>,
+}
+
+struct PreparedSets {
+	train: Dataset,
+	test: Option<Dataset>,
+	attrs: Vec<Attr>,
+}
+
+pub(crate) struct CollapsedOnehot {
+	pub x: Mat,
+	pub embed_cols: Vec<usize>,
+	pub vocab: usize,
+}
+
+pub struct SafeTable {
+	pub attrs: Vec<Attr>,
+	pub rows: Vec<Vec<String>>,
+}
+
+struct TypeCount {
+	label: &'static str,
+	count: usize,
+}
+
+struct CardCount {
+	card: usize,
+	count: usize,
 }
 
 #[doc(hidden)]
@@ -49,12 +83,12 @@ impl std::ops::Deref for Data {
 		&self.inner
 	}
 }
-pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
+pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
 	let mut in_group = vec![false; ncols];
-	for &(start, len) in &ds.onehot_groups {
-		for c in start..start + len {
+	for grp in ds.onehot_spans() {
+		for c in grp.start..grp.start + grp.len {
 			in_group[c] = true;
 		}
 	}
@@ -62,59 +96,75 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> (Mat, Vec<usize>, usize) {
 	let n_cat = ds.onehot_groups.len();
 	let new_ncols = passthrough.len() + n_cat;
 	let mut data = vec![0.0f64; n * new_ncols];
-	for (new_j, &orig_j) in passthrough.iter().enumerate() {
+	for new_j in 0..passthrough.len() {
+		let orig_j = passthrough[new_j];
 		for i in 0..n {
 			data[i * new_ncols + new_j] = ds.x[[i, orig_j]];
 		}
 	}
 	let embed_start = passthrough.len();
 	let mut offset = 0usize;
-	for (g, &(start, len)) in ds.onehot_groups.iter().enumerate() {
+	let spans = ds.onehot_spans();
+	for g in 0..spans.len() {
+		let grp = &spans[g];
 		let new_j = embed_start + g;
 		for i in 0..n {
-			for c in 0..len {
-				if ds.x[[i, start + c]] > 0.5 {
-					data[i * new_ncols + new_j] = (offset + c) as f64;
-					break;
-				}
-			}
+			let Some(c) = (0..grp.len).find(|&c| ds.x[[i, grp.start + c]] > 0.5) else {
+				continue;
+			};
+			data[i * new_ncols + new_j] = (offset + c) as f64;
 		}
-		offset += len;
+		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let r = Mat::from_shape_vec((n, new_ncols), data);
+	let r = Mat::from_shape_vec([n, new_ncols], data);
 	assert!(r.is_ok(), "collapse_onehot: {}", r.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
 	let Ok(x) = r else { loop {} };
-	(x, embed_cols, offset)
+	CollapsedOnehot { x, embed_cols, vocab: offset }
 }
 
-fn is_arff(path: &str) -> bool {
-	std::path::Path::new(path)
-		.extension()
-		.and_then(|e| e.to_str())
-		== Some("arff")
+enum FileFormat {
+	Arff,
+	Safetensors,
+	Table,
 }
 
-fn is_safetensors(path: &str) -> bool {
-	std::path::Path::new(path).extension().and_then(|e| e.to_str()) == Some("safetensors")
+fn file_format(path: &str) -> FileFormat {
+	match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+		Some("arff") => FileFormat::Arff,
+		Some("safetensors") => FileFormat::Safetensors,
+		_other => FileFormat::Table,
+	}
 }
 
-pub fn safetensors_to_table(path: &str) -> anyhow::Result<(Vec<Attr>, Vec<Vec<String>>)> {
+pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 	let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
-	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
+	let tensors = recipe_infer::safetensors::parse_safetensors_shaped_struct(&bytes)
 		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
 	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
-	let n = tensors[0].1.first().copied().ok_or_else(|| {
-		anyhow::anyhow!("safetensors: tensor '{}' has no leading row dim", tensors[0].0)
-	})?;
+	let n = {
+		let head = &tensors[0];
+		let hname = &head.name;
+		head.shape.first().copied().ok_or_else(|| {
+			anyhow::anyhow!("safetensors: tensor '{hname}' has no leading row dim")
+		})?
+	};
 	let mut attrs = Vec::new();
 	let mut cols: Vec<Vec<f64>> = Vec::new();
-	for (name, shape, vals) in &tensors {
+	for t in &tensors {
+		let name = &t.name;
+		let shape = &t.shape;
+		let vals = &t.values;
 		let leading = shape.first().copied().unwrap_or(0);
 		anyhow::ensure!(leading == n, "safetensors: tensor '{name}' leading dim {leading} != {n}");
 		let width = shape.iter().skip(1).product::<usize>().max(1);
 		for c in 0..width {
-			let aname = if width == 1 { name.clone() } else { format!("{name}:{c}") };
+			let aname = match width.cmp(&1) {
+				std::cmp::Ordering::Equal => name.clone(),
+				std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+					format!("{name}:{c}")
+				}
+			};
 			attrs.push(Attr { name: aname, kind: Kind::Numeric });
 			cols.push((0..n).map(|i| vals[i * width + c]).collect());
 		}
@@ -122,7 +172,7 @@ pub fn safetensors_to_table(path: &str) -> anyhow::Result<(Vec<Attr>, Vec<Vec<St
 	let rows = (0..n)
 		.map(|i| cols.iter().map(|col| format!("{}", col[i])).collect())
 		.collect();
-	Ok((attrs, rows))
+	Ok(SafeTable { attrs, rows })
 }
 
 impl Data {
@@ -148,23 +198,23 @@ impl Data {
 
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
-		if is_arff(path) {
-			let (attrs, rows) = crate::data::parse_arff(path);
-			self.inner.attrs = attrs;
-			self.inner.rows = rows;
-		} else if is_safetensors(path) {
-			match safetensors_to_table(path) {
-				Ok((attrs, rows)) => {
-					self.inner.attrs = attrs;
-					self.inner.rows = rows;
+		match file_format(path) {
+			FileFormat::Arff => {
+				let table = crate::data::parse_arff_t(path);
+				self.inner.attrs = table.attrs;
+				self.inner.rows = table.rows;
+			}
+			FileFormat::Safetensors => match safetensors_to_table(path) {
+				Ok(table) => {
+					self.inner.attrs = table.attrs;
+					self.inner.rows = table.rows;
 				}
 				Err(e) => self.inner.defer(e),
-			}
-		} else {
-			match pantry::detect_kinds(path) {
+			},
+			FileFormat::Table => match pantry::detect_kinds(path) {
 				Ok(kinds) => self.inner.pre_kinds.extend(kinds),
 				Err(e) => self.inner.defer(e),
-			}
+			},
 		}
 		self
 	}
@@ -172,13 +222,18 @@ impl Data {
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.inner.target_names = t.into_targets();
 		self.inner.target = self.inner.target_names.first().cloned().unwrap_or_default();
-		if let Some(tp) = &self.inner.test_path {
-			if let Ok((headers, rows)) = crate::data::read_raw_csv(std::path::Path::new(tp)) {
-				if !headers.is_empty() {
-					self.inner.raw_test_headers =
-						Some(headers.into_iter().map(|h| h.trim().to_string()).collect());
-					self.inner.raw_test_rows = Some(rows);
-				}
+		let Some(tp) = self.inner.test_path.clone() else {
+			return self;
+		};
+		let Ok(raw) = crate::data::read_raw_csv_t(std::path::Path::new(&tp)) else {
+			return self;
+		};
+		match raw.headers.len() {
+			0 => return self,
+			_n => {
+				self.inner.raw_test_headers =
+					Some(raw.headers.into_iter().map(|h| h.trim().to_string()).collect());
+				self.inner.raw_test_rows = Some(raw.rows);
 			}
 		}
 		self
@@ -210,109 +265,106 @@ impl DataInner {
 	}
 
 	fn defer(&mut self, e: anyhow::Error) {
-		if self.deferred.is_none() {
-			self.deferred = Some(e);
-		}
+		self.deferred.get_or_insert_with(|| e);
 	}
 
-	pub fn datasets(&self) -> (Dataset, Option<Dataset>) {
+	pub fn datasets(&self) -> Datasets {
 		let r = self.try_datasets();
 		assert!(r.is_ok(), "Data::datasets: {}", r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let Ok(v) = r else { loop {} };
 		v
 	}
 
-	pub(crate) fn try_datasets(&self) -> anyhow::Result<(Dataset, Option<Dataset>)> {
-		let (train, test, attrs) = self.prepare()?;
-		self.print_summary(&train, test.as_ref(), &attrs);
-		Ok((train, test))
+	pub(crate) fn try_datasets(&self) -> anyhow::Result<Datasets> {
+		let prepared = self.prepare()?;
+		self.print_summary(&prepared.train, prepared.test.as_ref(), &prepared.attrs);
+		Ok(Datasets { train: prepared.train, test: prepared.test })
 	}
 
-	fn feature_type_counts(&self, attrs: &[Attr]) -> Vec<(&'static str, usize)> {
+	fn feature_type_counts(&self, attrs: &[Attr]) -> Vec<TypeCount> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
-		let (mut numeric, mut temporal, mut categorical, mut ordinal, mut text, mut image) =
-			(0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-		for a in attrs {
-			if is_target(&a.name) || is_excluded(&a.name) {
-				continue;
-			}
+		let mut numeric = 0usize;
+		let mut temporal = 0usize;
+		let mut categorical = 0usize;
+		let mut ordinal = 0usize;
+		let mut text = 0usize;
+		let mut image = 0usize;
+		for a in attrs
+			.iter()
+			.filter(|a| !is_target(a.name.as_str()) && !is_excluded(a.name.as_str()))
+		{
 			match &a.kind {
 				Kind::Numeric => numeric += 1,
 				Kind::Temporal => temporal += 1,
-				Kind::Categorical(_) => categorical += 1,
-				Kind::Ordinal(_) => ordinal += 1,
-				Kind::Text(_) => text += 1,
+				Kind::Categorical(_cats) => categorical += 1,
+				Kind::Ordinal(_ord) => ordinal += 1,
+				Kind::Text(_txt) => text += 1,
 				Kind::Image => image += 1,
 			}
 		}
-		let mut out = Vec::new();
-		if numeric > 0 {
-			out.push(("numeric", numeric));
-		}
-		if temporal > 0 {
-			out.push(("temporal", temporal));
-		}
-		if categorical > 0 {
-			out.push(("categorical", categorical));
-		}
-		if ordinal > 0 {
-			out.push(("ordinal", ordinal));
-		}
-		if text > 0 {
-			out.push(("text", text));
-		}
-		if image > 0 {
-			out.push(("image", image));
-		}
-		out
+		[
+			TypeCount { label: "numeric", count: numeric },
+			TypeCount { label: "temporal", count: temporal },
+			TypeCount { label: "categorical", count: categorical },
+			TypeCount { label: "ordinal", count: ordinal },
+			TypeCount { label: "text", count: text },
+			TypeCount { label: "image", count: image },
+		]
+		.into_iter()
+		.filter(|cand| cand.count > 0)
+		.collect()
 	}
 
-	fn cat_cardinality_counts(&self, attrs: &[Attr]) -> Vec<(usize, usize)> {
+	fn cat_cardinality_counts(&self, attrs: &[Attr]) -> Vec<CardCount> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
 		let mut card: std::collections::BTreeMap<usize, usize> =
 			std::collections::BTreeMap::new();
-		for a in attrs {
-			if is_target(&a.name) || is_excluded(&a.name) {
+		for a in attrs
+			.iter()
+			.filter(|a| !is_target(a.name.as_str()) && !is_excluded(a.name.as_str()))
+		{
+			let Kind::Categorical(cats) = &a.kind else {
 				continue;
-			}
-			if let Kind::Categorical(cats) = &a.kind {
-				*card.entry(cats.len()).or_default() += 1;
-			}
+			};
+			*card.entry(cats.len()).or_default() += 1;
 		}
-		card.into_iter().collect()
+		let mut out = Vec::new();
+		for card_key in card.keys() {
+			out.push(CardCount { card: *card_key, count: card[card_key] });
+		}
+		out
 	}
 
 	fn print_summary(&self, train: &Dataset, test: Option<&Dataset>, attrs: &[Attr]) {
 		let disk_size = |path: &str| -> String {
 			std::fs::metadata(path)
 				.map(|m| crate::data::human_bytes(m.len() as usize))
-				.unwrap_or_else(|_| "?".into())
+				.unwrap_or_else(|_err| "?".into())
 		};
 		let short = |path: &str| -> String {
-			if let Some(home) = std::env::var("HOME").ok() {
-				if let Some(rest) = path.strip_prefix(&home) {
-					return format!("~{rest}");
-				}
-			}
-			path.to_string()
+			let Ok(home) = std::env::var("HOME") else {
+				return path.to_string();
+			};
+			let Some(rest) = path.strip_prefix(&home) else {
+				return path.to_string();
+			};
+			format!("~{rest}")
 		};
 		let raw_cols = attrs.len();
 		let types = self.feature_type_counts(attrs);
-		let print_types = |indent: &str| {
-			if types.len() == 1 {
-				eprintln!("{indent}{} {}", types[0].1, types[0].0);
-			} else {
-				for (kind, count) in &types {
-					eprintln!("{indent}{count} {kind}");
+		let print_types = |indent: &str| match types.as_slice() {
+			[only] => eprintln!("{indent}{} {}", only.count, only.label),
+			_rest => {
+				for tc in &types {
+					eprintln!("{indent}{} {}", tc.count, tc.label);
 				}
 			}
 		};
-		let set_rows = if self.split_frac.is_some() {
-			train.x.nrows() + test.map_or(0, |t| t.x.nrows())
-		} else {
-			train.x.nrows()
+		let set_rows = match self.split_frac {
+			Some(_frac) => train.x.nrows() + test.map_or(0, |t| t.x.nrows()),
+			None => train.x.nrows(),
 		};
 		for src in &self.sources {
 			eprintln!("\x1b[32mset\x1b[0m  {}", short(src),);
@@ -324,37 +376,42 @@ impl DataInner {
 			eprintln!("    excluded  {ex}");
 		}
 		let cards = self.cat_cardinality_counts(attrs);
-		if !cards.is_empty() {
+		for _present in cards.first().into_iter() {
 			eprintln!("    encoding");
-			for (card, count) in &cards {
-				let range: Vec<String> = (0..*card).map(|i| i.to_string()).collect();
-				eprintln!("        {count} × [{}]", range.join(", "));
-			}
+		}
+		for cc in &cards {
+			let range: Vec<String> = (0..cc.card).map(|i| i.to_string()).collect();
+			eprintln!("        {} × [{}]", cc.count, range.join(", "));
 		}
 		eprintln!("    {} features -> model", train.x.ncols(),);
-		if let Some(test) = test {
-			if let Some(tp) = &self.test_path {
-				let test_raw_cols =
-					self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
-				let test_raw_rows = self
-					.raw_test_rows
-					.as_ref()
-					.map_or(test.x.nrows(), |r| r.len());
-				eprintln!("\x1b[32mtest\x1b[0m  {}", short(tp),);
-				eprintln!(
-					"    {} rows  {} cols  {}",
-					test_raw_rows,
-					test_raw_cols,
-					disk_size(tp),
-				);
-				print_types("        ");
-				eprintln!("    {} features -> model", test.x.ncols(),);
-			} else if self.split_frac.is_some() {
-				eprintln!(
-					"\x1b[32msplit\x1b[0m  {} train / {} test",
-					train.x.nrows(),
-					test.x.nrows(),
-				);
+		for test in test.into_iter() {
+			match &self.test_path {
+				Some(tp) => {
+					let test_raw_cols =
+						self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
+					let test_raw_rows = self
+						.raw_test_rows
+						.as_ref()
+						.map_or(test.x.nrows(), |r| r.len());
+					eprintln!("\x1b[32mtest\x1b[0m  {}", short(tp),);
+					eprintln!(
+						"    {} rows  {} cols  {}",
+						test_raw_rows,
+						test_raw_cols,
+						disk_size(tp),
+					);
+					print_types("        ");
+					eprintln!("    {} features -> model", test.x.ncols(),);
+				}
+				None => {
+					for _frac in self.split_frac.iter() {
+						eprintln!(
+							"\x1b[32msplit\x1b[0m  {} train / {} test",
+							train.x.nrows(),
+							test.x.nrows(),
+						);
+					}
+				}
 			}
 		}
 		for t in &self.target_names {
@@ -362,40 +419,42 @@ impl DataInner {
 		}
 	}
 
-	fn prepare(&self) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
-		if let Some(e) = &self.deferred {
-			anyhow::bail!("{e:#}");
-		}
-		let (mut train, mut test, attrs) = if self.attrs.is_empty() {
-			self.prepare_table()?
-		} else {
-			let (tr, te) = self.prepare_arff()?;
-			(tr, te, self.attrs.clone())
+	fn prepare(&self) -> anyhow::Result<PreparedSets> {
+		self.deferred
+			.as_ref()
+			.map(|e| anyhow::anyhow!("{e:#}"))
+			.map_or(Ok(()), Err)?;
+		let mut prepared = match self.attrs.first() {
+			None => self.prepare_table()?,
+			Some(_first) => {
+				let arff = self.prepare_arff()?;
+				PreparedSets { train: arff.train, test: arff.test, attrs: self.attrs.clone() }
+			}
 		};
-		pantry::encode::clean_dataset(&mut train);
-		if let Some(t) = test.as_mut() {
-			pantry::encode::clean_dataset(t);
+		pantry::encode::clean_dataset(&mut prepared.train);
+		for ds in prepared.test.as_mut().into_iter() {
+			pantry::encode::clean_dataset(ds);
 		}
-		anyhow::ensure!(train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
-		anyhow::ensure!(train.x.ncols() > 0, "dataset has 0 feature columns");
-		let k = train.n_targets;
+		anyhow::ensure!(prepared.train.x.nrows() > 0, "dataset has 0 rows after NaN removal");
+		anyhow::ensure!(prepared.train.x.ncols() > 0, "dataset has 0 feature columns");
+		let k = prepared.train.n_targets;
 		anyhow::ensure!(
-			train.y.len() == train.x.nrows() * k,
+			prepared.train.y.len() == prepared.train.x.nrows() * k,
 			"x/y dimension mismatch: {} rows × {k} targets but y has {} elements",
-			train.x.nrows(),
-			train.y.len(),
+			prepared.train.x.nrows(),
+			prepared.train.y.len(),
 		);
-		Ok((train, test, attrs))
+		Ok(prepared)
 	}
 
-	fn prepare_arff(&self) -> anyhow::Result<(Dataset, Option<Dataset>)> {
+	fn prepare_arff(&self) -> anyhow::Result<Datasets> {
 		let names: Vec<String> = self.attrs.iter().map(|a| a.name.clone()).collect();
 		let resolved = self.resolve_targets(&names, None)?;
 		let targets: Vec<usize> = resolved
 			.iter()
 			.map(|t| names.iter().position(|n| n == t).ok_or_else(|| anyhow::anyhow!("resolved from names")))
-			.collect::<anyhow::Result<Vec<_>>>()?;
-		pantry::encode::prepare_arff_data(
+			.collect::<anyhow::Result<Vec<usize>>>()?;
+		let prepared = pantry::encode::prepare_arff_data_t(
 			&self.attrs,
 			&self.rows,
 			&targets,
@@ -403,11 +462,12 @@ impl DataInner {
 			self.split_frac,
 			self.test_path.as_deref(),
 			&self.source_label(),
-		)
+		)?;
+		Ok(Datasets { train: prepared.train, test: prepared.test })
 	}
 
-	fn prepare_table(&self) -> anyhow::Result<(Dataset, Option<Dataset>, Vec<Attr>)> {
-		pantry::encode::prepare_table_data(
+	fn prepare_table(&self) -> anyhow::Result<PreparedSets> {
+		let prepared = pantry::encode::prepare_table_data_t(
 			&self.sources,
 			self.test_path.as_deref(),
 			self.split_frac,
@@ -415,7 +475,8 @@ impl DataInner {
 			&self.source_label(),
 			Some(self.pre_kinds.as_slice()),
 			|s, t| self.resolve_targets(s, t),
-		)
+		)?;
+		Ok(PreparedSets { train: prepared.train, test: prepared.test, attrs: prepared.attrs })
 	}
 
 	fn resolve_targets(
@@ -423,8 +484,8 @@ impl DataInner {
 		set_names: &[String],
 		test_names: Option<&[String]>,
 	) -> anyhow::Result<Vec<String>> {
-		if !self.target_names.is_empty() {
-			return self
+		match self.target_names.first() {
+			Some(_first) => self
 				.target_names
 				.iter()
 				.map(|want| {
@@ -448,21 +509,22 @@ impl DataInner {
 							)
 						})
 				})
-				.collect();
+				.collect(),
+			None => match test_names {
+				Some(tn) => match set_names.len().cmp(&(tn.len() + 1)) {
+					std::cmp::Ordering::Equal => Ok(vec![set_names.last().ok_or_else(|| anyhow::anyhow!("set has columns"))?.clone()]),
+					std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Ok(Vec::new()),
+				},
+				None => Ok(Vec::new()),
+			},
 		}
-		if let Some(tn) = test_names {
-			if set_names.len() == tn.len() + 1 {
-				return Ok(vec![set_names.last().ok_or_else(|| anyhow::anyhow!("set has columns"))?.clone()]);
-			}
-		}
-		Ok(Vec::new())
 	}
 }
 
 impl crate::model::RunData for DataInner {
-	fn prepared(&self) -> anyhow::Result<crate::model::Prepared<'_>> {
-		let (train, _test) = self.try_datasets()?;
-		Ok(crate::model::Prepared::Owned(train))
+	fn prepared<'a>(&'a self) -> anyhow::Result<crate::model::Prepared<'a>> {
+		let sets = self.try_datasets()?;
+		Ok(crate::model::Prepared::Owned(sets.train))
 	}
 	fn target_names(&self) -> Vec<String> {
 		self.target_names.clone()
@@ -473,13 +535,13 @@ impl crate::model::RunData for DataInner {
 	fn raw_headers(&self) -> Option<Vec<String>> {
 		self.raw_test_headers.clone()
 	}
-	fn infer_only(&self) -> bool {
+	fn infer_only(&self) -> InferOnly {
 		false
 	}
 }
 
 impl crate::model::RunData for Data {
-	fn prepared(&self) -> anyhow::Result<crate::model::Prepared<'_>> {
+	fn prepared<'a>(&'a self) -> anyhow::Result<crate::model::Prepared<'a>> {
 		self.inner.prepared()
 	}
 	fn target_names(&self) -> Vec<String> {
@@ -491,8 +553,7 @@ impl crate::model::RunData for Data {
 	fn raw_headers(&self) -> Option<Vec<String>> {
 		self.inner.raw_headers()
 	}
-	fn infer_only(&self) -> bool {
+	fn infer_only(&self) -> InferOnly {
 		self.inner.infer_only()
 	}
 }
-

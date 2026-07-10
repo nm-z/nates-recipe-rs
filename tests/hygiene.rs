@@ -992,3 +992,229 @@ fn h35_no_binary_self_copies() {
             .collect();
       assert_absent("binary self-copy", &hits);
 }
+
+const NO_IF_TUPLE_ROOTS: &[&str] = &["src"];
+const TUPLE_CONTEXT_KEYWORDS: &[&str] = &["return", "in", "match", "move", "break", "for"];
+
+fn code_joined(p: &Path) -> String {
+      let src = read(p);
+      let (m, is_test) = non_test_lines(&src);
+      (0..m.nlines())
+            .map(|l| if is_test[l] { String::new() } else { m.code_only(l) })
+            .collect::<Vec<_>>()
+            .join("\n")
+}
+
+fn line_of(code: &str, i: usize) -> usize {
+      code[..i].matches('\n').count() + 1
+}
+
+fn prev_nonspace(b: &[char], i: usize) -> Option<usize> {
+      (0..i).rev().find(|&j| !b[j].is_whitespace())
+}
+
+fn word_before(b: &[char], end: usize) -> String {
+      let mut s = end + 1;
+      while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == '_') {
+            s -= 1;
+      }
+      b[s..=end].iter().collect()
+}
+
+fn tuple_open_context(b: &[char], i: usize) -> bool {
+      let Some(j) = prev_nonspace(b, i) else { return true };
+      let c = b[j];
+      if "=,([{|&:;".contains(c) {
+            return true;
+      }
+      if c == '>' && j > 0 && (b[j - 1] == '-' || b[j - 1] == '=') {
+            return true;
+      }
+      if c.is_ascii_alphanumeric() || c == '_' {
+            return TUPLE_CONTEXT_KEYWORDS.contains(&word_before(b, j).as_str());
+      }
+      false
+}
+
+fn tuple_sites(code: &str) -> Vec<usize> {
+      let b: Vec<char> = code.chars().collect();
+      let mut out = Vec::new();
+      let mut stack: Vec<(char, usize, bool, bool)> = Vec::new();
+      for (i, &c) in b.iter().enumerate() {
+            match c {
+                  '(' => stack.push(('(', i, tuple_open_context(&b, i), false)),
+                  '[' => stack.push(('[', i, false, false)),
+                  '{' => stack.push(('{', i, false, false)),
+                  ',' => {
+                        if let Some(top) = stack.last_mut() {
+                              top.3 = true;
+                        }
+                  }
+                  ')' | ']' | '}' => {
+                        if let Some((k, open, ctx, comma)) = stack.pop() {
+                              if k == '(' && c == ')' && ctx && comma {
+                                    out.push(open);
+                              }
+                        }
+                  }
+                  _ => {}
+            }
+      }
+      out
+}
+
+fn tuple_struct_lines(code: &str) -> Vec<usize> {
+      code.lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                  l.split("struct ").skip(1).any(|rest| {
+                        let name: String = rest
+                              .chars()
+                              .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '<' || *c == '>')
+                              .collect();
+                        !name.is_empty() && rest[name.len()..].trim_start().starts_with('(')
+                  })
+            })
+            .map(|(i, _)| i + 1)
+            .collect()
+}
+
+fn tuple_index_lines(code: &str) -> Vec<usize> {
+      let b: Vec<char> = code.chars().collect();
+      let mut out = Vec::new();
+      for i in 1..b.len().saturating_sub(1) {
+            if b[i] == '.' && b[i + 1].is_ascii_digit() {
+                  let p = b[i - 1];
+                  if p.is_ascii_alphabetic() || p == '_' || p == ')' || p == ']' {
+                        out.push(i);
+                  }
+            }
+      }
+      out.into_iter().map(|i| line_of(code, i)).collect()
+}
+
+fn empty_arm_sites(code: &str) -> Vec<usize> {
+      let b: Vec<char> = code.chars().collect();
+      let mut out = Vec::new();
+      for i in 1..b.len() {
+            if b[i - 1] != '=' || b[i] != '>' {
+                  continue;
+            }
+            let Some(j) = (i + 1..b.len()).find(|&k| !b[k].is_whitespace()) else { continue };
+            let close = match b[j] {
+                  '(' => ')',
+                  '{' => '}',
+                  _ => continue,
+            };
+            let Some(k) = (j + 1..b.len()).find(|&k| !b[k].is_whitespace()) else { continue };
+            if b[k] == close {
+                  out.push(i);
+            }
+      }
+      out.into_iter().map(|i| line_of(code, i)).collect()
+}
+
+#[test]
+fn h36_no_if_or_wildcard_in_source() {
+      let banned = ["if", "_"];
+      let mut hits = Vec::new();
+      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+            let src = read(&p);
+            let (m, is_test) = non_test_lines(&src);
+            for l in 0..m.nlines() {
+                  let code = m.code_only(l);
+                  for tok in banned {
+                        if !is_test[l] && token_at(&code, tok) {
+                              hits.push(format!("{}:{} {tok}", rel(&p), l + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("if/wildcard token in source", &hits);
+}
+
+fn bool_position_hits(line: &str) -> Vec<String> {
+      let b = line.as_bytes();
+      let boundary_after = |j: usize| j >= b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+      let boundary_before = |i: usize| i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+      let mut v = Vec::new();
+      for pat in ["-> bool", ": bool", "let true", "let false"] {
+            for (i, s) in line.match_indices(pat) {
+                  if boundary_before(i) && boundary_after(i + s.len()) {
+                        v.push(pat.to_owned());
+                  }
+            }
+      }
+      for lit in ["true", "false"] {
+            for (i, s) in line.match_indices(lit) {
+                  let arm = line[i + s.len()..].trim_start().starts_with("=>");
+                  if boundary_before(i) && boundary_after(i + s.len()) && arm {
+                        v.push(format!("{lit} =>"));
+                  }
+            }
+      }
+      v
+}
+
+#[test]
+fn h40_no_bool_positions() {
+      let mut hits = Vec::new();
+      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+            let src = read(&p);
+            let (m, is_test) = non_test_lines(&src);
+            for l in 0..m.nlines() {
+                  if !is_test[l] {
+                        for form in bool_position_hits(&m.code_only(l)) {
+                              hits.push(format!("{}:{} {form}", rel(&p), l + 1));
+                        }
+                  }
+            }
+      }
+      assert_absent("bool in banned position", &hits);
+}
+
+#[test]
+fn h37_no_tuple_in_source() {
+      let mut hits = Vec::new();
+      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+            let code = code_joined(&p);
+            for i in tuple_sites(&code) {
+                  hits.push(format!("{}:{} tuple", rel(&p), line_of(&code, i)));
+            }
+            for l in tuple_struct_lines(&code) {
+                  hits.push(format!("{}:{} tuple struct", rel(&p), l));
+            }
+            for l in tuple_index_lines(&code) {
+                  hits.push(format!("{}:{} tuple index", rel(&p), l));
+            }
+      }
+      assert_absent("tuple in source", &hits);
+}
+
+#[test]
+fn h39_no_then_combinator() {
+      let mut hits = Vec::new();
+      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+            let src = read(&p);
+            let (m, is_test) = non_test_lines(&src);
+            for l in 0..m.nlines() {
+                  let code = m.code_only(l);
+                  if !is_test[l] && (code.contains(".then(") || code.contains(".then_some(")) {
+                        hits.push(format!("{}:{}", rel(&p), l + 1));
+                  }
+            }
+      }
+      assert_absent("then combinator in source", &hits);
+}
+
+#[test]
+fn h38_no_empty_match_arm() {
+      let mut hits = Vec::new();
+      for p in rs_files(NO_IF_TUPLE_ROOTS) {
+            let code = code_joined(&p);
+            for l in empty_arm_sites(&code) {
+                  hits.push(format!("{}:{}", rel(&p), l));
+            }
+      }
+      assert_absent("empty match arm in source", &hits);
+}

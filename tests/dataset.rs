@@ -1,5 +1,5 @@
 use pantry::Kind;
-use recipe::dataset::{Data, safetensors_to_table};
+use recipe::dataset::{Data, Datasets, SafeTable, safetensors_to_table};
 
 #[test]
 fn data_load_reads_safetensors_source() {
@@ -20,7 +20,7 @@ fn data_load_reads_safetensors_source() {
 	std::fs::write(&path, &bytes).expect("write temp safetensors");
 	let p = path.to_str().expect("temp path utf8");
 
-	let (attrs, rows) = safetensors_to_table(p).expect("safetensors table");
+	let SafeTable { attrs, rows } = safetensors_to_table(p).expect("safetensors table");
 	assert_eq!(
 		attrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
 		vec!["x:0", "x:1", "y"]
@@ -31,7 +31,7 @@ fn data_load_reads_safetensors_source() {
 	assert_eq!(rows[2], vec!["5", "6", "30"]);
 
 	let data = Data::load(p).split(0.66).target("y");
-	let (set, test) = data.datasets();
+	let Datasets { train: set, test } = data.datasets();
 	assert_eq!(set.x.ncols(), 2, "two feature columns (x:0, x:1)");
 	assert_eq!(set.n_targets, 1, "single target (y)");
 	let total = set.x.nrows() + test.as_ref().map_or(0, |t| t.x.nrows());
@@ -64,7 +64,7 @@ fn data_load_materializes_safetensors_shard() {
 	let p = path.to_str().expect("temp path utf8");
 
 	let data = Data::load(p).target("label");
-	let (set, test) = data.datasets();
+	let Datasets { train: set, test } = data.datasets();
 	assert_eq!(set.x.nrows(), 4, "four rows from the shared leading dim");
 	assert_eq!(set.x.ncols(), 3, "three feature cols (blk.0.w:0, blk.0.w:1, blk.0.b)");
 	assert_eq!(set.n_targets, 1, "label is the single target");
@@ -77,7 +77,7 @@ fn data_load_materializes_safetensors_shard() {
 #[test]
 fn no_target_datasets_is_features_only() {
 	let d = Data::load("datasets/uci-wine/wine.data");
-	let (set, test) = d.datasets();
+	let Datasets { train: set, test } = d.datasets();
 	assert_eq!(set.n_targets, 0, "no .target() yields zero targets");
 	assert!(set.y.is_empty(), "zero targets carry no y");
 	assert_eq!(set.x.nrows(), 178, "every wine row survives");

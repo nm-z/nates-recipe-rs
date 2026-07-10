@@ -23,6 +23,20 @@ pub struct Dataset {
 	pub onehot_groups: Vec<(usize, usize)>,
 }
 
+pub struct GroupSpan {
+	pub start: usize,
+	pub len: usize,
+}
+
+impl Dataset {
+	pub fn onehot_spans(&self) -> Vec<GroupSpan> {
+		self.onehot_groups
+			.iter()
+			.map(|&(start, len)| GroupSpan { start, len })
+			.collect()
+	}
+}
+
 fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 	s.split(|c: char| !c.is_alphanumeric())
 		.filter(|t| !t.is_empty())
@@ -1091,6 +1105,32 @@ pub fn prepare_arff_data(
 	})
 }
 
+pub struct PreparedArff {
+	pub train: Dataset,
+	pub test: Option<Dataset>,
+}
+
+pub fn prepare_arff_data_t(
+	attrs: &[Attr],
+	rows: &[Vec<String>],
+	targets: &[usize],
+	exclude: &[String],
+	split_frac: Option<f64>,
+	test_path: Option<&str>,
+	source_label: &str,
+) -> anyhow::Result<PreparedArff> {
+	let (train, test) = prepare_arff_data(
+		attrs,
+		rows,
+		targets,
+		exclude,
+		split_frac,
+		test_path,
+		source_label,
+	)?;
+	Ok(PreparedArff { train, test })
+}
+
 /// Table path (CSV/dir/zip): load groups, resolve targets (via the caller's
 /// `resolve` closure, which lives up in the builder), assemble + join, select
 /// the kept feature columns, and optionally split or align a separate test set.
@@ -1184,4 +1224,31 @@ pub fn prepare_table_data(
 		None,
 		flat_attrs,
 	))
+}
+
+pub struct PreparedTable {
+	pub train: Dataset,
+	pub test: Option<Dataset>,
+	pub attrs: Vec<Attr>,
+}
+
+pub fn prepare_table_data_t(
+	sources: &[String],
+	test_path: Option<&str>,
+	split_frac: Option<f64>,
+	exclude: &[String],
+	source_label: &str,
+	pre: Option<&[GroupKinds]>,
+	resolve: impl Fn(&[String], Option<&[String]>) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<PreparedTable> {
+	let (train, test, attrs) = prepare_table_data(
+		sources,
+		test_path,
+		split_frac,
+		exclude,
+		source_label,
+		pre,
+		resolve,
+	)?;
+	Ok(PreparedTable { train, test, attrs })
 }

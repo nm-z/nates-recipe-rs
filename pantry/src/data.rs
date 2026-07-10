@@ -124,6 +124,16 @@ pub fn read_raw_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	Ok((headers, rows))
 }
 
+pub struct RawCsv {
+	pub headers: Vec<String>,
+	pub rows: Vec<Vec<String>>,
+}
+
+pub fn read_raw_csv_t(path: &Path) -> Result<RawCsv> {
+	let (headers, rows) = read_raw_csv(path)?;
+	Ok(RawCsv { headers, rows })
+}
+
 fn read_raw_whitespace(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
 	use std::io::BufRead;
 	let disk = std::fs::metadata(path)
@@ -607,6 +617,16 @@ pub fn parse_arff(path: &str) -> (Vec<Attr>, Vec<Vec<String>>) {
 	assert!(!attrs.is_empty(), "Data: no @attribute lines in {path}");
 	assert!(!rows.is_empty(), "Data: no @data rows in {path}");
 	(attrs, rows)
+}
+
+pub struct ArffTable {
+	pub attrs: Vec<Attr>,
+	pub rows: Vec<Vec<String>>,
+}
+
+pub fn parse_arff_t(path: &str) -> ArffTable {
+	let (attrs, rows) = parse_arff(path);
+	ArffTable { attrs, rows }
 }
 
 pub fn load_sqlite_groups(path: &str) -> Result<Vec<DirGroup>> {

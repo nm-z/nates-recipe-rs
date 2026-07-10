@@ -55,6 +55,19 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<(String, Vec<usize>,
 	Ok(out)
 }
 
+pub struct ShapedTensor {
+	pub name: String,
+	pub shape: Vec<usize>,
+	pub values: Vec<f64>,
+}
+
+pub fn parse_safetensors_shaped_struct(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
+	Ok(parse_safetensors_shaped(bytes)?
+		.into_iter()
+		.map(|(name, shape, values)| ShapedTensor { name, shape, values })
+		.collect())
+}
+
 pub struct TensorEntry {
 	pub name: String,
 	pub dtype: String,

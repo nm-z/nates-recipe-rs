@@ -1,88 +1,136 @@
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, Train};
-use anyhow::Context as _;
+use anyhow::Context;
 use recipe_infer::{
 	LayerSpec,
-	Loss, Metric, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
-	load_ogdl, load_ogdl_str, metric_gpu_into,
-	pinned_vocab, plan_layer_params, zscore_apply_views,
+	Loss, Metric, Pt, SCRATCH_CONSTS, Scaler, Scratch, concat_layer_s,
+	load_ogdl, load_ogdl_str, metric_gpu_into_s,
+	pinned_vocab, plan_layer_params, pt, zscore_apply_views,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Style};
 use ratatui::symbols::{self, Marker};
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
-use std::io::IsTerminal as _;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-extern "C" fn on_sigint(_: i32) {
-	if INTERRUPTED.swap(true, Ordering::SeqCst) {
+extern "C" fn on_sigint(_sig: i32) {
+	for _run in std::iter::once(()).take(usize::from(INTERRUPTED.swap(true, Ordering::SeqCst))) {
 		unsafe { libc::_exit(130) };
 	}
 }
-const PALETTE: [(u8, u8, u8); 12] = [
-	(242, 40, 60),
-	(39, 125, 255),
-	(0, 174, 107),
-	(255, 194, 0),
-	(215, 46, 130),
-	(135, 90, 251),
-	(255, 122, 0),
-	(91, 192, 235),
-	(157, 121, 188),
-	(46, 83, 57),
-	(3, 252, 186),
-	(194, 1, 20),
+#[derive(Clone, Copy)]
+struct Rgb {
+	r: u8,
+	g: u8,
+	b: u8,
+}
+#[derive(Clone, Copy)]
+enum Logged {
+	Yes,
+	No,
+}
+enum YesNo {
+	Yes,
+	No,
+}
+enum CellFix {
+	Fill,
+	Corner,
+	Leave,
+}
+enum Step {
+	Go,
+	Stop,
+}
+fn gate(flag: usize) -> Step {
+	match flag {
+		1 => Step::Go,
+		_other => Step::Stop,
+	}
+}
+struct YPrep {
+	y_flat: Vec<f64>,
+	ss_tot: f64,
+}
+struct EpochMeta {
+	epoch: usize,
+	elapsed: f64,
+	logged: Logged,
+}
+struct Found {
+	cx: u16,
+	style: Style,
+}
+pub(crate) struct EvalInput {
+	pub x: GpuBuffer,
+	pub x_cat: Option<GpuBuffer>,
+	pub n: usize,
+}
+const PALETTE: [Rgb; 12] = [
+	Rgb { r: 242, g: 40, b: 60 },
+	Rgb { r: 39, g: 125, b: 255 },
+	Rgb { r: 0, g: 174, b: 107 },
+	Rgb { r: 255, g: 194, b: 0 },
+	Rgb { r: 215, g: 46, b: 130 },
+	Rgb { r: 135, g: 90, b: 251 },
+	Rgb { r: 255, g: 122, b: 0 },
+	Rgb { r: 91, g: 192, b: 235 },
+	Rgb { r: 157, g: 121, b: 188 },
+	Rgb { r: 46, g: 83, b: 57 },
+	Rgb { r: 3, g: 252, b: 186 },
+	Rgb { r: 194, g: 1, b: 20 },
 ];
-fn palette(i: usize) -> (u8, u8, u8) {
+fn palette(i: usize) -> Rgb {
 	PALETTE[i % PALETTE.len()]
 }
 fn symlog(y: f64) -> f64 {
-	if y.abs() <= 1.0 {
-		y
-	} else {
-		y.signum() * (1.0 + y.abs().log10())
+	match usize::from(y.abs() <= 1.0) {
+		1 => y,
+		_other => y.signum() * (1.0 + y.abs().log10()),
 	}
 }
 fn inv_symlog(v: f64) -> f64 {
-	if v.abs() <= 1.0 {
-		v
-	} else {
-		v.signum() * 10f64.powf(v.abs() - 1.0)
+	match usize::from(v.abs() <= 1.0) {
+		1 => v,
+		_other => v.signum() * 10f64.powf(v.abs() - 1.0),
 	}
 }
 fn fmt_time_axis(secs: f64) -> String {
-	if secs >= 3600.0 {
-		format!("{:.1}h", secs / 3600.0)
-	} else if secs >= 60.0 {
-		format!("{:.1}m", secs / 60.0)
-	} else {
-		format!("{secs:.0}s")
+	match usize::from(secs >= 3600.0) {
+		1 => format!("{:.1}h", secs / 3600.0),
+		_other => match usize::from(secs >= 60.0) {
+			1 => format!("{:.1}m", secs / 60.0),
+			_other => format!("{secs:.0}s"),
+		},
 	}
 }
 fn fmt_time(secs: f64) -> String {
 	let s = secs as u64;
-	let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
-	if h > 0 {
-		format!("{h}h {m:02}m {sec:02}s")
-	} else if m > 0 {
-		format!("{m}m {sec:02}s")
-	} else {
-		format!("{secs:.1}s")
+	let h = s / 3600;
+	let m = (s % 3600) / 60;
+	let sec = s % 60;
+	match usize::from(h > 0) {
+		1 => format!("{h}h {m:02}m {sec:02}s"),
+		_other => match usize::from(m > 0) {
+			1 => format!("{m}m {sec:02}s"),
+			_other => format!("{secs:.1}s"),
+		},
 	}
 }
 fn fmt_axis(v: f64) -> String {
 	let a = v.abs();
-	if a >= 1000.0 || (a > 0.0 && a < 0.01) {
-		format!("{v:.1e}")
-	} else if a >= 1.0 {
-		format!("{v:.1}")
-	} else {
-		format!("{v:.3}")
+	match usize::from(a >= 1000.0 || (a > 0.0 && a < 0.01)) {
+		1 => format!("{v:.1e}"),
+		_other => match usize::from(a >= 1.0) {
+			1 => format!("{v:.1}"),
+			_other => format!("{v:.3}"),
+		},
 	}
 }
 pub struct StepScalars {
@@ -153,32 +201,53 @@ impl ModelInner {
 	}
 
 	pub(crate) fn metrics_line(&self, metrics: &[Metric], vals: &[f64]) -> String {
-		let parts: Vec<String> = metrics
-			.iter()
-			.zip(vals)
-			.filter(|(m, _)| **m != Metric::Hip)
-			.enumerate()
-			.filter_map(|(i, (&m, &v))| {
-				let nan_width = match m {
-					Metric::Epoch if v.is_nan() => Some(5),
-					Metric::Lr if v.is_nan() => Some(7),
-					Metric::Time if v.is_nan() => Some(9),
-					_ => None,
-				};
-				let num = match (nan_width, m) {
-					(Some(w), _) => format!("{:>w$}", "N/A"),
-					(None, Metric::Epoch) => format!("{:>5}", v as usize),
-					(None, Metric::Lr) => format!("{v:>7}"),
-					(None, Metric::Time) => format!("{:>9}", fmt_time(v)),
-					(None, Metric::Loss) => format!("{v:>7.4}"),
-					(None, Metric::Accuracy) => format!("{v:>6.4}"),
-					(None, Metric::R2) => format!("{v:>8.4}"),
-					(None, Metric::Hip) => return None,
-				};
-				let (r, g, b) = palette(i);
-				Some(format!("{} \x1b[38;2;{r};{g};{b}m{num}\x1b[0m", Self::label(m)))
-			})
-			.collect();
+		let mut parts: Vec<String> = Vec::new();
+		let mut ci = 0usize;
+		for mi in 0..metrics.len().min(vals.len()) {
+			let m = metrics[mi];
+			let v = vals[mi];
+			match usize::from(m == Metric::Hip) {
+				1 => continue,
+				_nothip => {
+					let nan_width = match m {
+						Metric::Epoch => match usize::from(v.is_nan()) {
+							1 => Some(5usize),
+							_other => None,
+						},
+						Metric::Lr => match usize::from(v.is_nan()) {
+							1 => Some(7usize),
+							_other => None,
+						},
+						Metric::Time => match usize::from(v.is_nan()) {
+							1 => Some(9usize),
+							_other => None,
+						},
+						_other => None,
+					};
+					let num = match nan_width {
+						Some(w) => format!("{:>w$}", "N/A"),
+						None => match m {
+							Metric::Epoch => format!("{:>5}", v as usize),
+							Metric::Lr => format!("{v:>7}"),
+							Metric::Time => format!("{:>9}", fmt_time(v)),
+							Metric::Loss => format!("{v:>7.4}"),
+							Metric::Accuracy => format!("{v:>6.4}"),
+							Metric::R2 => format!("{v:>8.4}"),
+							Metric::Hip => continue,
+						},
+					};
+					let c = palette(ci);
+					ci += 1;
+					parts.push(format!(
+						"{} \x1b[38;2;{};{};{}m{num}\x1b[0m",
+						Self::label(m),
+						c.r,
+						c.g,
+						c.b
+					));
+				}
+			}
+		}
 		parts.join("  ")
 	}
 	fn render_dashboard(
@@ -190,38 +259,57 @@ impl ModelInner {
 	) {
 		let header_h = summary.lines().count() as u16;
 		let mut constraints = vec![Constraint::Length(header_h)];
-		constraints.extend(ys.iter().map(|_| Constraint::Fill(1)));
+		constraints.extend(ys.iter().map(|_m| Constraint::Fill(1)));
 		let areas = Layout::vertical(constraints).split(frame.area());
 		frame.render_widget(Paragraph::new(summary), areas[0]);
 		let xmax = rows.last().map_or(1.0, |r| r[0]).max(1.0);
 		let lxmax = xmax.log10().max(1e-9);
-		for (j, &m) in ys.iter().enumerate() {
-			let pts: Vec<(f64, f64)> = rows
+		for j in 0..ys.len() {
+			let m = ys[j];
+			let lo = rows
 				.iter()
-				.map(|r| (r[0].max(1.0).log10(), symlog(r[1 + j])))
-				.collect();
-			let lo = pts
-				.iter()
-				.map(|p| p.1)
-				.filter(|v| v.is_finite())
+				.map(|r| symlog(r[1 + j]))
+				.filter(|y| y.is_finite())
 				.fold(f64::INFINITY, f64::min);
-			let hi = pts
+			let hi = rows
 				.iter()
-				.map(|p| p.1)
-				.filter(|v| v.is_finite())
+				.map(|r| symlog(r[1 + j]))
+				.filter(|y| y.is_finite())
 				.fold(f64::NEG_INFINITY, f64::max);
-			let (ymin, ymax) = if hi > lo {
-				let pad = (hi - lo) * 0.05;
-				(lo - pad, hi + pad)
-			} else if lo.is_finite() {
-				(lo - 1.0, lo + 1.0)
-			} else {
-				(0.0, 1.0)
+			let pts: Vec<Pt> = rows
+				.iter()
+				.map(|r| pt(r[0].max(1.0).log10(), symlog(r[1 + j])))
+				.collect();
+			let mut ymin = 0.0;
+			let mut ymax = 1.0;
+			match usize::from(hi > lo) {
+				1 => {
+					let pad = (hi - lo) * 0.05;
+					ymin = lo - pad;
+					ymax = hi + pad;
+				}
+				_other => {
+					let span = usize::from(lo.is_finite());
+					ymin = match span {
+						1 => lo - 1.0,
+						_other => ymin,
+					};
+					ymax = match span {
+						1 => lo + 1.0,
+						_other => ymax,
+					};
+				}
+			}
+			let real_lo = match usize::from(lo.is_finite()) {
+				1 => inv_symlog(lo),
+				_other => 0.0,
 			};
-			let real_lo = if lo.is_finite() { inv_symlog(lo) } else { 0.0 };
-			let real_hi = if hi.is_finite() { inv_symlog(hi) } else { 1.0 };
-			let (r, g, b) = palette(j);
-			let color = Color::Rgb(r, g, b);
+			let real_hi = match usize::from(hi.is_finite()) {
+				1 => inv_symlog(hi),
+				_other => 1.0,
+			};
+			let c = palette(j);
+			let color = Color::Rgb(c.r, c.g, c.b);
 			let ds = ChartDataset::default()
 				.marker(Marker::Braille)
 				.graph_type(GraphType::Line)
@@ -245,43 +333,61 @@ impl ModelInner {
 				]));
 			frame.render_widget(chart, areas[j + 1]);
 		}
-		if areas.len() >= 2 {
-			let (first, last) = (areas[1], areas[areas.len() - 1]);
-			let buf = frame.buffer_mut();
-			let mut found = None;
-			'find: for x in first.left()..first.right() {
-				for y in first.top()..first.bottom() {
-					if let Some(c) = buf.cell((x, y))
-						&& c.symbol() == symbols::line::VERTICAL
-					{
-						found = Some((x, c.style()));
+		let Some(first) = areas.get(1).copied() else {
+			return;
+		};
+		let last = areas[areas.len() - 1];
+		let buf = frame.buffer_mut();
+		let mut found: Option<Found> = None;
+		'find: for x in first.left()..first.right() {
+			for y in first.top()..first.bottom() {
+				let Some(c) = buf.cell(Position::new(x, y)) else {
+					continue;
+				};
+				match usize::from(c.symbol() == symbols::line::VERTICAL) {
+					1 => {
+						found = Some(Found { cx: x, style: c.style() });
 						break 'find;
 					}
+					_other => continue,
 				}
 			}
-			if let Some((cx, style)) = found {
-				for y in first.top()..last.bottom().saturating_sub(1) {
-					if let Some(c) = buf.cell_mut((cx, y)) {
-						match c.symbol() {
-							" " | "" => {
-								c.set_symbol(symbols::line::VERTICAL);
-								c.set_style(style);
-							}
-							s if s == symbols::line::BOTTOM_LEFT
-								&& y < last.top() =>
-							{
-								c.set_symbol(symbols::line::VERTICAL_RIGHT);
-							}
-							_ => {}
-						}
-					}
+		}
+		let Some(f) = found else {
+			return;
+		};
+		for y in first.top()..last.bottom().saturating_sub(1) {
+			let Some(c) = buf.cell_mut(Position::new(f.cx, y)) else {
+				continue;
+			};
+			let sym = c.symbol();
+			let blank = sym == " " || sym.is_empty();
+			let corner = sym == symbols::line::BOTTOM_LEFT && y < last.top();
+			let fix = match usize::from(blank) {
+				1 => CellFix::Fill,
+				_other => match usize::from(corner) {
+					1 => CellFix::Corner,
+					_other => CellFix::Leave,
+				},
+			};
+			match fix {
+				CellFix::Fill => {
+					c.set_symbol(symbols::line::VERTICAL);
+					c.set_style(f.style);
 				}
+				CellFix::Corner => {
+					c.set_symbol(symbols::line::VERTICAL_RIGHT);
+				}
+				CellFix::Leave => continue,
 			}
 		}
 	}
 	pub(crate) fn fit(&self, data: &Dataset, cfg: &Train, resume: Option<&str>, net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>) -> anyhow::Result<()> {
-		let hip_snap = cfg.metrics.contains(&Metric::Hip).then(gpu_core::callspy::snapshot);
-		let led_snap = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		let hip_snap = match usize::from(cfg.metrics.contains(&Metric::Hip)) {
+			1 => Some(gpu_core::callspy::snapshot()),
+			_other => None,
+		};
+		let led_snap = hip_snap.map(|_snap| gpu_core::memory::xfer_calls_named());
 		let start = std::time::Instant::now();
 		let classify = self.loss.is_classification();
 		let rerun = !self.params.borrow().is_empty();
@@ -296,185 +402,240 @@ impl ModelInner {
 			.collect();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
-		let (collapsed_x, collapsed_ec, collapsed_vocab) = if embed_cats {
-			let (x, ec, v) = collapse_onehot(data);
-			(Some(x), ec, v)
-		} else {
-			(None, Vec::new(), 0)
+		let coll = match usize::from(embed_cats) {
+			1 => Some(collapse_onehot(data)),
+			_other => None,
 		};
-		let effective_x = collapsed_x.as_ref().unwrap_or(&data.x);
-		let effective_text = if embed_cats { &collapsed_ec } else { &data.text_cols };
-		let cat_cols: Vec<usize> = if embed_first {
-			(0..effective_x.ncols()).filter(|c| !effective_text.contains(c)).collect()
-		} else {
-			Vec::new()
+		let collapsed_vocab = coll.as_ref().map_or(0, |c| c.vocab);
+		let effective_x = coll.as_ref().map_or(&data.x, |c| &c.x);
+		let effective_text = match &coll {
+			Some(c) => &c.embed_cols,
+			None => &data.text_cols,
+		};
+		let cat_cols: Vec<usize> = match usize::from(embed_first) {
+			1 => Vec::from_iter((0..effective_x.ncols()).filter(|c| !effective_text.contains(c))),
+			_other => Vec::new(),
 		};
 		let c_cat = cat_cols.len();
-		let xinput = if embed_first {
-			effective_x.select(ndarray::Axis(1), effective_text)
-		} else {
-			effective_x.clone()
+		let xinput = match usize::from(embed_first) {
+			1 => effective_x.select(ndarray::Axis(1), effective_text),
+			_other => effective_x.clone(),
 		};
 		let n = xinput.nrows();
 		let d = xinput.ncols();
-		let vocab = if let Some(v) = pinned_vocab(&self.specs) {
-			v
-		} else if embed_first {
-			if embed_cats { collapsed_vocab } else { xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1 }
-		} else {
-			0
+		let vocab = match pinned_vocab(&self.specs) {
+			Some(v) => v,
+			None => match usize::from(embed_first) {
+				1 => match usize::from(embed_cats) {
+					1 => collapsed_vocab,
+					_other => xinput.iter().cloned().fold(0.0f64, f64::max) as usize + 1,
+				},
+				_other => 0,
+			},
 		};
-		let cat = (embed_first && c_cat > 0).then(|| effective_x.select(ndarray::Axis(1), &cat_cols));
+		let cat = match usize::from(embed_first && c_cat > 0) {
+			1 => Some(effective_x.select(ndarray::Axis(1), &cat_cols)),
+			_other => None,
+		};
 		let c = cat.as_ref().map_or(0, |m| m.ncols());
-		let d_sc = if embed_first { c } else { d };
+		let d_sc = match usize::from(embed_first) {
+			1 => c,
+			_other => d,
+		};
 		let resumed = resume.map(load_ogdl).transpose()?.unwrap_or_default();
 		let mut did_resume = !resumed.is_empty();
-		let source = if did_resume {
-			resumed
-		} else if rerun {
-			let m = self.saved_ogdl.borrow();
-			let mirror = m
-				.as_ref()
-				.ok_or_else(|| anyhow::anyhow!("rerun without host weight mirror"))?;
-			load_ogdl_str(&mirror.text)
-				.map_err(|e| anyhow::anyhow!("rerun: parse host weight mirror: {e}"))?
-		} else {
-			Vec::new()
+		let source = match usize::from(did_resume) {
+			1 => resumed,
+			_other => match usize::from(rerun) {
+				1 => {
+					let m = self.saved_ogdl.borrow();
+					let mirror = m
+						.as_ref()
+						.ok_or_else(|| anyhow::anyhow!("rerun without host weight mirror"))?;
+					load_ogdl_str(&mirror.text)
+						.map_err(|e| anyhow::anyhow!("rerun: parse host weight mirror: {e}"))?
+				}
+				_other => Vec::new(),
+			},
 		};
-		let ask_overwrite = |what: &str| -> bool {
+		let ask_overwrite = |what: &str| -> YesNo {
 			use std::io::Write;
 			eprintln!(
 				"\x1b[32mresume\x1b[0m\n    \x1b[1;31mdata does not match\x1b[0m\n        {what}\n        file path={}\n        data path={}",
 				resume.unwrap_or(""),
 				data.source,
 			);
-			if !std::io::stdin().is_terminal() {
-				return false;
+			for _run in std::iter::once(()).take(usize::from(!std::io::stdin().is_terminal())) {
+				return YesNo::No;
 			}
 			eprint!("overwrite checkpoint with random weights? [y/N] ");
 			std::io::stderr().flush().ok();
 			let mut line = String::new();
 			std::io::stdin().read_line(&mut line).ok();
-			matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+			match usize::from(matches!(line.trim(), "y" | "Y" | "yes" | "YES")) {
+				1 => YesNo::Yes,
+				_other => YesNo::No,
+			}
 		};
 		let warm = did_resume || rerun;
 		let plan = match plan_layer_params(&self.specs, d, c_cat, vocab, &source, warm) {
 			Ok(p) => p,
 			Err(what) => {
-				if did_resume && ask_overwrite(&what) {
-					did_resume = false;
-					plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
-						.map_err(|e| anyhow::anyhow!(e))?
-				} else if did_resume {
-					anyhow::bail!("checkpoint mismatch — user declined overwrite");
-				} else {
-					anyhow::bail!("rerun: host weight mirror does not match this run — {what}");
+				let overwrite = did_resume && matches!(ask_overwrite(&what), YesNo::Yes);
+				match usize::from(overwrite) {
+					1 => {
+						did_resume = false;
+						plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
+							.map_err(|e| anyhow::anyhow!(e))?
+					}
+					_other => match usize::from(did_resume) {
+						1 => anyhow::bail!("checkpoint mismatch — user declined overwrite"),
+						_other => anyhow::bail!(
+							"rerun: host weight mirror does not match this run — {what}"
+						),
+					},
 				}
 			}
 		};
 		let out_dim = plan.out_dim_last();
 		let n_targets = data.n_targets.max(1);
 		let expand_ce = classify && n_targets == 1 && out_dim > 1;
-		let k = if expand_ce { out_dim } else { n_targets };
+		let k = match usize::from(expand_ce) {
+			1 => out_dim,
+			_other => n_targets,
+		};
 		assert_eq!(
 			out_dim, k,
 			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
 		);
-		let (y_flat, ss_tot) = {
+		let yp = {
 			let ys = data.y.as_slice().ok_or_else(|| anyhow::anyhow!("train: y contiguous"))?;
 			let mut yd = ys.to_vec();
-			if !classify && !rerun {
-				let ymean = yd.iter().sum::<f64>() / yd.len() as f64;
-				let yvar = yd.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / yd.len() as f64;
-				let ystd = (yvar + 1e-8).sqrt();
-				for v in yd.iter_mut() {
-					*v = (*v - ymean) / ystd;
-				}
-				*self.yscaler.borrow_mut() = Some((ymean, ystd));
-			} else if !classify && rerun {
-				if let Some((ymean, ystd)) = *self.yscaler.borrow() {
+			match usize::from(!classify && !rerun) {
+				1 => {
+					let ymean = yd.iter().sum::<f64>() / yd.len() as f64;
+					let yvar = yd.iter().map(|v| (v - ymean).powi(2)).sum::<f64>() / yd.len() as f64;
+					let ystd = (yvar + 1e-8).sqrt();
 					for v in yd.iter_mut() {
 						*v = (*v - ymean) / ystd;
+					}
+					*self.yscaler.borrow_mut() = Some(recipe_infer::YScaler { mean: ymean, std: ystd });
+				}
+				_other => {
+					let ys_opt = *self.yscaler.borrow();
+					for _run in std::iter::once(()).take(usize::from(!classify && rerun)) {
+						ys_opt.map(|ysc| {
+							for v in yd.iter_mut() {
+								*v = (*v - ysc.mean) / ysc.std;
+							}
+						});
 					}
 				}
 			}
 			let total = yd.len() as f64;
 			let ybar = yd.iter().sum::<f64>() / total;
 			let ss_tot: f64 = yd.iter().map(|v| (v - ybar).powi(2)).sum();
-			let y_flat = if expand_ce {
-				let mut oh = vec![0.0f64; n * out_dim];
-				for (i, &idx) in yd.iter().enumerate() {
-					if idx.is_finite() {
+			let y_flat = match usize::from(expand_ce) {
+				1 => {
+					let mut oh = vec![0.0f64; n * out_dim];
+					for i in 0..yd.len() {
+						let idx = yd[i];
 						let cc = idx as usize;
-						if cc < out_dim {
+						for _run in std::iter::once(()).take(usize::from(idx.is_finite() && cc < out_dim)) {
 							oh[i * out_dim + cc] = 1.0;
 						}
 					}
+					oh
 				}
-				oh
-			} else {
-				yd
+				_other => yd,
 			};
-			(y_flat, ss_tot)
+			YPrep { y_flat, ss_tot }
 		};
+		let ss_tot = yp.ss_tot;
 		let epochs = cfg.epochs.max(1);
-		let stop_metric = if classify { Metric::Accuracy } else { Metric::R2 };
+		let stop_metric = match usize::from(classify) {
+			1 => Metric::Accuracy,
+			_other => Metric::R2,
+		};
 		let mut ring_row: Vec<Metric> = vec![stop_metric];
+		let ckpt_loss = match usize::from(checkpointing) {
+			1 => Some(Metric::Loss),
+			_other => None,
+		};
 		for m in cfg
 			.metrics
 			.iter()
 			.copied()
-			.chain(checkpointing.then_some(Metric::Loss))
+			.chain(ckpt_loss)
 			.chain(plot_ys.iter().copied())
 		{
-			if matches!(m, Metric::Loss | Metric::R2 | Metric::Accuracy) && !ring_row.contains(&m) {
-				ring_row.push(m);
-			}
+			let keep = matches!(m, Metric::Loss | Metric::R2 | Metric::Accuracy) && !ring_row.contains(&m);
+			ring_row.extend(std::iter::once(m).take(usize::from(keep)));
 		}
 		let n_rows = ring_row.len();
 		let n_timed = 0usize;
-		let (mean_host, std_host, scaled_host) = if d_sc == 0 {
-			(Vec::new(), Vec::new(), Vec::new())
-		} else {
-			let src = if embed_first { cat.as_ref().ok_or_else(|| anyhow::anyhow!("cat matrix"))? } else { &xinput };
-			let src_std = src.as_standard_layout();
-			let sl = src_std.as_slice().ok_or_else(|| anyhow::anyhow!("scale src contiguous"))?;
-			if rerun {
-				let sc_host = self.scaler.borrow();
-				let s = sc_host.as_ref().ok_or_else(|| anyhow::anyhow!("rerun without scaler"))?;
-				assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
-				let scaled = recipe_infer::zscore_apply_host(sl, n, d_sc, &s.mean, &s.std);
-				(s.mean.clone(), s.std.clone(), scaled)
-			} else {
-				recipe_infer::zscore_fit_host(sl, n, d_sc)
+		let zf: recipe_infer::ZFit = match usize::from(d_sc == 0) {
+			1 => recipe_infer::ZFit {
+				mean: Vec::new(),
+				std: Vec::new(),
+				scaled: Vec::new(),
+			},
+			_other => {
+				let src = match usize::from(embed_first) {
+					1 => cat.as_ref().ok_or_else(|| anyhow::anyhow!("cat matrix"))?,
+					_other => &xinput,
+				};
+				let src_std = src.as_standard_layout();
+				let sl = src_std.as_slice().ok_or_else(|| anyhow::anyhow!("scale src contiguous"))?;
+				match usize::from(rerun) {
+					1 => {
+						let sc_host = self.scaler.borrow();
+						let s = sc_host.as_ref().ok_or_else(|| anyhow::anyhow!("rerun without scaler"))?;
+						assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
+						let scaled = recipe_infer::zscore_apply_host(sl, n, d_sc, &s.mean, &s.std);
+						recipe_infer::ZFit {
+							mean: s.mean.clone(),
+							std: s.std.clone(),
+							scaled,
+						}
+					}
+					_other => recipe_infer::zscore_fit_s(sl, n, d_sc),
+				}
 			}
 		};
 		let mut stage = Stage::new();
 		let w_off = stage.push(plan.host());
-		let (mean_off, std_off) = if d_sc == 0 {
-			(0, 0)
-		} else {
-			(stage.push(&mean_host), stage.push(&std_host))
-		};
+		let mut mean_off = 0;
+		let mut std_off = 0;
+		for _run in std::iter::once(()).take(usize::from(d_sc != 0)) {
+			mean_off = stage.push(&zf.mean);
+			std_off = stage.push(&zf.std);
+		}
 		let ring_off = stage.reserve(n_rows * epochs);
 		let end_off = stage.reserve(1);
 		let w_len = plan.host().len();
 		let prefix_len = stage.len_floats();
 		let consts_off = stage.push(&SCRATCH_CONSTS);
 		let sc_off = stage.push(&[-self.lr, 1.0 / n as f64, 2.0 / n as f64, 0.0]);
-		let scaled_off = if d_sc > 0 { stage.push(&scaled_host) } else { 0 };
-		let x_off = if embed_first {
-			let x_std = xinput.as_standard_layout();
-			stage.push(x_std.as_slice().ok_or_else(|| anyhow::anyhow!("xinput contiguous"))?)
-		} else {
-			0
+		let scaled_off = match usize::from(d_sc > 0) {
+			1 => stage.push(&zf.scaled),
+			_other => 0,
 		};
-		let y_off = stage.push(&y_flat);
+		let x_off = match usize::from(embed_first) {
+			1 => {
+				let x_std = xinput.as_standard_layout();
+				stage.push(x_std.as_slice().ok_or_else(|| anyhow::anyhow!("xinput contiguous"))?)
+			}
+			_other => 0,
+		};
+		let y_off = stage.push(&yp.y_flat);
 		let image = stage.into_host();
 		let image_floats = image.len();
-		let cc_pre = recipe_infer::concat_layer_dims(&plan.dims());
-		let need = image_floats * 8
-			+ crate::ooc::Ooc::min_bytes(&plan.dims(), n, cc_pre.map(|(_, a, c)| (a, c)));
+		let ac_pre = match recipe_infer::concat_layer_dims_s(&plan.dims()) {
+			Some(d) => Some(crate::ooc::ConcatAc { a: d.a, c: d.c }),
+			None => None,
+		};
+		let need = image_floats * 8 + crate::ooc::Ooc::min_bytes(&plan.dims(), n, ac_pre);
 		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
 			.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
 			.ok_or_else(|| {
@@ -488,7 +649,15 @@ impl ModelInner {
 		let base = slab.view(0, image_floats);
 		let params = plan.materialize(&base, w_off);
 		let last = params.len() - 1;
-		let cc_fit = concat_layer(&params);
+		let concat_fit_raw = concat_layer_s(&params);
+		let ac_fit = match &concat_fit_raw {
+			Some(d) => Some(crate::ooc::ConcatAc { a: d.a, c: d.c }),
+			None => None,
+		};
+		let concat_fit = match &concat_fit_raw {
+			Some(d) => Some(crate::ooc::ConcatFit { pf: d.pf, a: d.a, c: d.c }),
+			None => None,
+		};
 		let consts_view = base.view(consts_off, 12);
 		let sc = {
 			let _t = gpu_core::memory::tag_scope("scratch");
@@ -500,43 +669,47 @@ impl ModelInner {
 			two_inv_n: base.view(sc_off + 2, 1),
 			zero: base.view(sc_off + 3, 1),
 		};
-		let (xbuf, x_cat) = if d_sc > 0 {
-			let scaled = base.view(scaled_off, n * d_sc);
-			if embed_first {
-				(base.view(x_off, n * d), Some(scaled))
-			} else {
-				(scaled, None)
-			}
-		} else {
-			if !rerun {
-				*self.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
-			}
-			(base.view(x_off, xinput.len()), None)
+		for _run in std::iter::once(()).take(usize::from(d_sc == 0 && !rerun)) {
+			*self.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+		}
+		let x_cat = match usize::from(d_sc > 0 && embed_first) {
+			1 => Some(base.view(scaled_off, n * d_sc)),
+			_other => None,
+		};
+		let xbuf = match usize::from(d_sc > 0) {
+			1 => match usize::from(embed_first) {
+				1 => base.view(x_off, n * d),
+				_other => base.view(scaled_off, n * d_sc),
+			},
+			_other => base.view(x_off, xinput.len()),
 		};
 		let ybuf = base.view(y_off, n * k);
-		let summary = if cfg.metrics.is_empty() {
-			String::new()
-		} else {
-			let neurons: usize = params.iter().map(|p| p.out_dim).sum();
-			let out = params[last].out_dim;
-			let row = |x: usize, l1: &str, y: usize, l2: &str| format!("    {x:>5}  {l1:<11}{y:>5}  {l2}");
-			[
-				"arch".to_string(),
-				row(neurons, "neurons", params.len(), "layers"),
-				row(n, "samples", d, "features"),
-				row(d, "input_dim", out, "output_dim"),
-				"data".to_string(),
-				row(n + 1, "rows", d + 1, "columns"),
-				row(d, "predictors", out, "targets"),
-			]
-			.join("\n")
-		};
-		if !plotting && !rerun {
-			if did_resume && let Some(path) = resume {
-				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-				eprintln!("resumed: {}", full.display());
+		let summary = match usize::from(cfg.metrics.is_empty()) {
+			1 => String::new(),
+			_other => {
+				let neurons: usize = params.iter().map(|p| p.out_dim).sum();
+				let out = params[last].out_dim;
+				let row = |x: usize, l1: &str, y: usize, l2: &str| format!("    {x:>5}  {l1:<11}{y:>5}  {l2}");
+				[
+					"arch".to_string(),
+					row(neurons, "neurons", params.len(), "layers"),
+					row(n, "samples", d, "features"),
+					row(d, "input_dim", out, "output_dim"),
+					"data".to_string(),
+					row(n + 1, "rows", d + 1, "columns"),
+					row(d, "predictors", out, "targets"),
+				]
+				.join("\n")
 			}
-			if !summary.is_empty() {
+		};
+		for _run in std::iter::once(()).take(usize::from(!plotting && !rerun)) {
+			for _run2 in std::iter::once(()).take(usize::from(did_resume)) {
+				resume.map(|path| {
+					let full = std::fs::canonicalize(path).unwrap_or_else(|_err| path.into());
+					eprintln!("resumed: {}", full.display());
+				});
+			}
+			for _run3 in std::iter::once(()).take(usize::from(!summary.is_empty())) {
 				eprintln!("{summary}");
 				eprintln!(
 					"roofline  gemm {} GF/s  vram {} GB/s",
@@ -547,7 +720,7 @@ impl ModelInner {
 		}
 		let mut ooc = {
 			let _t = gpu_core::memory::tag_scope("waterfall");
-			let o = crate::ooc::Ooc::build(&params, n, cc_fit.map(|(_, a, c)| (a, c)), net.clone())?;
+			let o = crate::ooc::Ooc::build(&params, n, ac_fit, net.clone())?;
 			o.report();
 			o
 		};
@@ -558,55 +731,63 @@ impl ModelInner {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
 		gpu_core::callspy::mark_loop_start();
-		let hip_init = hip_snap.map(|_| gpu_core::callspy::snapshot());
-		let led_init = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		let hip_init = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
+		let led_init = hip_snap.map(|_snap| gpu_core::memory::xfer_calls_named());
 		let mut fit_score = f64::NAN;
-		let mut epoch_meta: Vec<(usize, f64, bool)> = Vec::new();
+		let mut epoch_meta: Vec<EpochMeta> = Vec::new();
 		let ring_every = checkpointing || plotting;
-		let mut ring_scale: Vec<(f64, f64)> = vec![(1.0, 1.0); n_rows];
+		let mut ring_scale: Vec<recipe_infer::LossScale> =
+			vec![recipe_infer::LossScale { sign: 1.0, div: 1.0 }; n_rows];
 		for e in 0..cfg.epochs {
-			if INTERRUPTED.load(Ordering::SeqCst) {
+			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
 				break;
-			}
+			};
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
-			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit)?;
-			if INTERRUPTED.load(Ordering::SeqCst) {
+			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
+			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
 				break;
+			};
+			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, concat_fit)?;
+			let Step::Go = gate(usize::from(log_now || ring_every)) else {
+				continue;
+			};
+			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
+			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
+				break;
+			};
+			let out = &sc.acts[last];
+			for mi in 0..ring_row.len() {
+				let m = ring_row[mi];
+				let slot = base.view(ring_off + mi * epochs + e, 1);
+				ring_scale[mi] = metric_gpu_into_s(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot)?;
 			}
-			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, cc_fit)?;
-			if log_now || ring_every {
-				ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit)?;
-				if INTERRUPTED.load(Ordering::SeqCst) {
-					break;
-				}
-				let out = &sc.acts[last];
-				for (mi, &m) in ring_row.iter().enumerate() {
-					let slot = base.view(ring_off + mi * epochs + e, 1);
-					ring_scale[mi] = metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot)?;
-				}
-				epoch_meta.push((e, start.elapsed().as_secs_f64(), log_now));
-			}
+			epoch_meta.push(EpochMeta {
+				epoch: e,
+				elapsed: start.elapsed().as_secs_f64(),
+				logged: match usize::from(log_now) {
+					1 => Logged::Yes,
+					_other => Logged::No,
+				},
+			});
 		}
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
-		if !was_interrupted {
-			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, cc_fit)?;
+		for _run in std::iter::once(()).take(usize::from(!was_interrupted)) {
+			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
 			let end_slot = base.view(end_off, 1);
-			if classify {
-				if k == 1 {
-					kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, n, &end_slot).context("accuracy")?;
-				} else {
-					kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, n, k, &end_slot).context("argmax accuracy")?;
-				}
-			} else {
-				kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &end_slot).context("ss_res")?;
+			match usize::from(classify) {
+				1 => match usize::from(k == 1) {
+					1 => kernels::gpu_accuracy_into(&sc.acts[last], &ybuf, n, &end_slot).context("accuracy")?,
+					_other => kernels::gpu_argmax_accuracy_into(&sc.acts[last], &ybuf, n, k, &end_slot).context("argmax accuracy")?,
+				},
+				_other => kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n * k, &end_slot).context("ss_res")?,
 			}
 		}
 		gpu_core::hw::disarm_saturation_crash();
 		gpu_core::callspy::mark_loop_end();
-		let hip_loop = hip_snap.map(|_| gpu_core::callspy::snapshot());
-		let led_loop = hip_snap.map(|_| gpu_core::memory::xfer_calls());
+		let hip_loop = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
+		let led_loop = hip_snap.map(|_snap| gpu_core::memory::xfer_calls_named());
 		drop(_guard);
 		unsafe {
 			libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -614,7 +795,7 @@ impl ModelInner {
 		drop(ooc);
 		let src = base.as_ptr_offset(0);
 		let host = self.park(slab, src, prefix_len, sc)?;
-		if d_sc > 0 && !rerun {
+		for _run in std::iter::once(()).take(usize::from(d_sc > 0 && !rerun)) {
 			*self.scaler.borrow_mut() = Some(Scaler {
 				mean: host[mean_off..mean_off + d_sc].to_vec(),
 				std: host[std_off..std_off + d_sc].to_vec(),
@@ -629,97 +810,123 @@ impl ModelInner {
 				Metric::R2 => 1.0 - raw / ss_tot,
 				Metric::Accuracy => raw,
 				Metric::Loss => {
-					let (sign, div) = ring_scale[mi];
-					sign * raw / div
+					let sc = ring_scale[mi];
+					sc.sign * raw / sc.div
 				}
-				_ => f64::NAN,
+				_other => f64::NAN,
 			}
 		};
 		let key = self.loss.score_key();
 		let mut loss_prev = f64::INFINITY;
 		let mut ckpt_saved = false;
-		for (e, elapsed, was_log) in &epoch_meta {
-			let score = val_of(stop_metric, *e);
-			if score.is_finite() {
-				fit_score = score;
-			}
+		for meta in &epoch_meta {
+			let e = meta.epoch;
+			let score = val_of(stop_metric, e);
+			fit_score = match usize::from(score.is_finite()) {
+				1 => score,
+				_other => fit_score,
+			};
 			let mut checkpointed = false;
-			if checkpointing {
-				let loss = val_of(Metric::Loss, *e);
-				if loss.is_nan() {
-					eprintln!("NaN loss at epoch {e} — stopping (weights diverged)");
-					break;
-				}
-				if !ckpt_saved && *e > 0 && loss > loss_prev {
-					ckpt_saved = true;
-					let path = checkpoint_path.as_ref().ok_or_else(|| anyhow::anyhow!("checkpoint path"))?;
-					if recipe_infer::saved_score(path, key).is_none_or(|best| score > best) {
-						recipe_infer::write_ogdl(
-							path,
-							&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
-						)?;
-						checkpointed = true;
+			let nan_stop = match usize::from(checkpointing) {
+				1 => {
+					let loss = val_of(Metric::Loss, e);
+					let stop = loss.is_nan();
+					match usize::from(stop) {
+						1 => eprintln!("NaN loss at epoch {e} — stopping (weights diverged)"),
+						_other => {
+							let carve = !ckpt_saved && e > 0 && loss > loss_prev;
+							for _run in std::iter::once(()).take(usize::from(carve)) {
+								ckpt_saved = true;
+								let path = checkpoint_path.as_ref().ok_or_else(|| anyhow::anyhow!("checkpoint path"))?;
+								let better = recipe_infer::saved_score(path, key)
+									.is_none_or(|best| score > best);
+								for _run2 in std::iter::once(()).take(usize::from(better)) {
+									recipe_infer::write_ogdl(
+										path,
+										&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
+									)?;
+									checkpointed = true;
+								}
+							}
+							loss_prev = match usize::from(loss.is_finite()) {
+								1 => loss,
+								_other => loss_prev,
+							};
+						}
 					}
+					stop
 				}
-				if loss.is_finite() {
-					loss_prev = loss;
-				}
-			}
-			if (*was_log || checkpointed) && !plotting {
-				let vals: Vec<f64> = cfg
-					.metrics
-					.iter()
-					.map(|&m| match m {
-						Metric::Epoch => *e as f64,
-						Metric::Lr => self.lr,
-						Metric::Time => *elapsed,
-						Metric::Hip => f64::NAN,
-						_ => val_of(m, *e),
-					})
-					.collect();
-				let mut line = self.metrics_line(&cfg.metrics, &vals);
-				if checkpointed {
-					line.push_str("  \x1b[1;32m<- checkpoint\x1b[0m");
-				}
-				eprintln!("{line}");
-			}
+				_other => false,
+			};
+			let Step::Go = gate(usize::from(!nan_stop)) else {
+				break;
+			};
+			let logged_flag = matches!(meta.logged, Logged::Yes);
+			let Step::Go = gate(usize::from((logged_flag || checkpointed) && !plotting)) else {
+				continue;
+			};
+			let vals: Vec<f64> = cfg
+				.metrics
+				.iter()
+				.map(|&m| match m {
+					Metric::Epoch => e as f64,
+					Metric::Lr => self.lr,
+					Metric::Time => meta.elapsed,
+					Metric::Hip => f64::NAN,
+					_other => val_of(m, e),
+				})
+				.collect();
+			let mut line = self.metrics_line(&cfg.metrics, &vals);
+			let suffix = match usize::from(checkpointed) {
+				1 => "  \x1b[1;32m<- checkpoint\x1b[0m",
+				_other => "",
+			};
+			line.push_str(suffix);
+			eprintln!("{line}");
 		}
-		if plotting && !epoch_meta.is_empty() {
+		for _run in std::iter::once(()).take(usize::from(plotting && !epoch_meta.is_empty())) {
 			let plot_rows: Vec<Vec<f64>> = epoch_meta
 				.iter()
-				.map(|(e, elapsed, _)| {
-					let mut row = vec![*elapsed];
+				.map(|meta| {
+					let mut row = vec![meta.elapsed];
 					for &m in &plot_ys {
 						row.push(match m {
 							Metric::Lr => self.lr,
 							Metric::Hip => f64::NAN,
-							_ => val_of(m, *e),
+							_other => val_of(m, meta.epoch),
 						});
 					}
 					row
 				})
 				.collect();
 			let mut term = ratatui::init();
-			let _ = term.draw(|frame| {
+			let _drawn = term.draw(|frame| {
 				self.render_dashboard(frame, &summary, &plot_rows, &plot_ys);
 			});
-			if std::io::stdin().is_terminal() {
+			for _run2 in std::iter::once(()).take(usize::from(std::io::stdin().is_terminal())) {
 				loop {
 					match event::read() {
-						Ok(Event::Key(_)) | Err(_) => break,
-						_ => {}
+						Err(_err) => break,
+						Ok(ev) => match ev {
+							Event::Key(_key) => break,
+							_other => continue,
+						},
 					}
 				}
 			}
 			ratatui::restore();
 		}
-		let end_val = (!was_interrupted)
-			.then(|| if classify { host[end_off] } else { 1.0 - host[end_off] / ss_tot });
-		if let Some(s) = end_val
-			&& s.is_finite()
-		{
-			fit_score = s;
-		}
+		let end_val = match usize::from(!was_interrupted) {
+			1 => Some(match usize::from(classify) {
+				1 => host[end_off],
+				_other => 1.0 - host[end_off] / ss_tot,
+			}),
+			_other => None,
+		};
+		end_val
+			.into_iter()
+			.filter(|s| s.is_finite())
+			.for_each(|s| fit_score = s);
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 		*self.saved_ogdl.borrow_mut() = Some(crate::model::SavedWeights {
 			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, fit_score),
@@ -728,46 +935,64 @@ impl ModelInner {
 			c_cat,
 			vocab,
 		});
-		if let Some(path) = checkpoint_path.as_deref() {
-			let sw = self.saved_ogdl.borrow();
-			let text = &sw.as_ref().ok_or_else(|| anyhow::anyhow!("fit leaves a mirror"))?.text;
-			if was_interrupted {
-				let better_on_disk = recipe_infer::saved_score(path, key)
-					.is_some_and(|best| !(fit_score.is_finite() && fit_score > best));
-				if better_on_disk {
-					eprintln!("keeping {path} (better prior {key} on disk)");
-				} else {
-					recipe_infer::write_ogdl(path, text)?;
-					let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-					eprintln!("saved {} ({key} {fit_score:.4})", full.display());
+		checkpoint_path
+			.as_deref()
+			.map(|path| -> anyhow::Result<()> {
+				let sw = self.saved_ogdl.borrow();
+				let text = &sw.as_ref().ok_or_else(|| anyhow::anyhow!("fit leaves a mirror"))?.text;
+				match usize::from(was_interrupted) {
+					1 => {
+						let better_on_disk = recipe_infer::saved_score(path, key)
+							.is_some_and(|best| !(fit_score.is_finite() && fit_score > best));
+						match usize::from(better_on_disk) {
+							1 => eprintln!("keeping {path} (better prior {key} on disk)"),
+							_other => {
+								recipe_infer::write_ogdl(path, text)?;
+								let full = std::fs::canonicalize(path).unwrap_or_else(|_err| path.into());
+								eprintln!("saved {} ({key} {fit_score:.4})", full.display());
+							}
+						}
+					}
+					_other => {
+						end_val
+							.filter(|s| s.is_finite())
+							.filter(|&s| recipe_infer::saved_score(path, key).is_none_or(|best| s > best))
+							.map(|s| -> anyhow::Result<()> {
+								recipe_infer::write_ogdl(path, text)?;
+								let full = std::fs::canonicalize(path).unwrap_or_else(|_err| path.into());
+								eprintln!("saved {} ({neurons} neurons, {key} {s:.4})", full.display());
+								Ok(())
+							})
+							.transpose()?;
+					}
 				}
-			} else if let Some(s) = end_val
-				&& s.is_finite()
-				&& recipe_infer::saved_score(path, key).is_none_or(|best| s > best)
-			{
-				recipe_infer::write_ogdl(path, text)?;
-				let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-				eprintln!("saved {} ({neurons} neurons, {key} {s:.4})", full.display());
-			}
-		}
+				Ok(())
+			})
+			.transpose()?;
 		*self.params.borrow_mut() = params;
 		self.fit_score.set(fit_score);
-		if let (Some(b0), Some(init), Some(lp)) = (hip_snap, hip_init, hip_loop) {
-			for (phase, a, b) in [
-				("init", &b0, &init),
-				("loop", &init, &lp),
-				("exit", &lp, &gpu_core::callspy::snapshot()),
-			] {
-				eprint!("-- hip {phase} --\n{}", gpu_core::callspy::report_between(a, b));
-			}
-		}
-		if let (Some(s0), Some(i), Some(l)) = (led_snap, led_init, led_loop) {
-			let ee = gpu_core::memory::xfer_calls();
-			let dh = |a: (usize, usize, usize), b: (usize, usize, usize)| (b.0 - a.0, b.1 - a.1);
-			for (phase, (h, dd)) in [("init", dh(s0, i)), ("loop", dh(i, l)), ("exit", dh(l, ee))] {
-				eprintln!("-- ledger {phase} -- H2D calls {h}  D2H calls {dd}");
-			}
-		}
+		let hip_dump = || -> Option<()> {
+			let b0 = hip_snap?;
+			let init = hip_init?;
+			let lp = hip_loop?;
+			let exit = gpu_core::callspy::snapshot();
+			eprint!("-- hip init --\n{}", gpu_core::callspy::report_between(&b0, &init));
+			eprint!("-- hip loop --\n{}", gpu_core::callspy::report_between(&init, &lp));
+			eprint!("-- hip exit --\n{}", gpu_core::callspy::report_between(&lp, &exit));
+			Some(())
+		};
+		hip_dump();
+		let led_dump = || -> Option<()> {
+			let s0 = led_snap?;
+			let i = led_init?;
+			let l = led_loop?;
+			let ee = gpu_core::memory::xfer_calls_named();
+			eprintln!("-- ledger init -- H2D calls {}  D2H calls {}", i.h2d - s0.h2d, i.d2h - s0.d2h);
+			eprintln!("-- ledger loop -- H2D calls {}  D2H calls {}", l.h2d - i.h2d, l.d2h - i.d2h);
+			eprintln!("-- ledger exit -- H2D calls {}  D2H calls {}", ee.h2d - l.h2d, ee.d2h - l.d2h);
+			Some(())
+		};
+		led_dump();
 		Ok(())
 	}
 	fn park(&self, slab: GpuBuffer, src: *mut std::ffi::c_void, prefix_len: usize, sc: Scratch) -> anyhow::Result<Vec<f64>> {
@@ -782,27 +1007,26 @@ impl ModelInner {
 		gpu_core::memory::park_run_backing(slab);
 		Ok(host)
 	}
-	pub(crate) fn prep_eval_input(&self, ds: &Dataset) -> (GpuBuffer, Option<GpuBuffer>, usize) {
+	pub(crate) fn prep_eval_input(&self, ds: &Dataset) -> EvalInput {
 		let n = ds.x.nrows();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
-		let (collapsed_x, collapsed_embed_cols, _v) = if embed_cats {
-			let (x, ec, v) = collapse_onehot(ds);
-			(Some(x), ec, v)
-		} else {
-			(None, Vec::new(), 0)
+		let coll = match usize::from(embed_cats) {
+			1 => Some(collapse_onehot(ds)),
+			_other => None,
 		};
-		let eff_x = collapsed_x.as_ref().unwrap_or(&ds.x);
-		let eff_text = if embed_cats { &collapsed_embed_cols } else { &ds.text_cols };
-		let cat_cols: Vec<usize> = if embed_first {
-			(0..eff_x.ncols()).filter(|c| !eff_text.contains(c)).collect()
-		} else {
-			Vec::new()
+		let eff_x = coll.as_ref().map_or(&ds.x, |c| &c.x);
+		let eff_text = match &coll {
+			Some(c) => &c.embed_cols,
+			None => &ds.text_cols,
 		};
-		let xinput = if embed_first {
-			eff_x.select(ndarray::Axis(1), eff_text)
-		} else {
-			eff_x.clone()
+		let cat_cols: Vec<usize> = match usize::from(embed_first) {
+			1 => Vec::from_iter((0..eff_x.ncols()).filter(|c| !eff_text.contains(c))),
+			_other => Vec::new(),
+		};
+		let xinput = match usize::from(embed_first) {
+			1 => eff_x.select(ndarray::Axis(1), eff_text),
+			_other => eff_x.clone(),
 		};
 		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
@@ -838,19 +1062,35 @@ impl ModelInner {
 			let Ok(z) = rz else { loop {} };
 			z
 		};
-		if embed_first {
-			let xraw = up(&xinput);
-			if cat_cols.is_empty() {
-				(xraw, None, n)
-			} else {
-				let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-				let craw = up(&cat);
-				let c = cat.ncols();
-				(xraw, Some(apply(&craw, n, c, scaler_ref)), n)
+		match usize::from(embed_first) {
+			1 => {
+				let xraw = up(&xinput);
+				match usize::from(cat_cols.is_empty()) {
+					1 => EvalInput {
+						x: xraw,
+						x_cat: None,
+						n,
+					},
+					_other => {
+						let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
+						let craw = up(&cat);
+						let c = cat.ncols();
+						EvalInput {
+							x: xraw,
+							x_cat: Some(apply(&craw, n, c, scaler_ref)),
+							n,
+						}
+					}
+				}
 			}
-		} else {
-			let xraw = up(&xinput);
-			(apply(&xraw, n, d, scaler_ref), None, n)
+			_other => {
+				let xraw = up(&xinput);
+				EvalInput {
+					x: apply(&xraw, n, d, scaler_ref),
+					x_cat: None,
+					n,
+				}
+			}
 		}
 	}
 }

@@ -245,12 +245,28 @@ pub fn xfer_bytes() -> (usize, usize, usize) {
 	)
 }
 
+pub struct XferBytes {
+	pub h2d: usize,
+	pub d2h: usize,
+	pub d2d: usize,
+}
+
+pub fn xfer_bytes_named() -> XferBytes {
+	let (h2d, d2h, d2d) = xfer_bytes();
+	XferBytes { h2d, d2h, d2d }
+}
+
 pub fn xfer_calls() -> (usize, usize, usize) {
 	(
 		H2D_CALLS.load(Ordering::Relaxed),
 		D2H_CALLS.load(Ordering::Relaxed),
 		D2D_CALLS.load(Ordering::Relaxed),
 	)
+}
+
+pub fn xfer_calls_named() -> XferBytes {
+	let (h2d, d2h, d2d) = xfer_calls();
+	XferBytes { h2d, d2h, d2d }
 }
 
 pub fn alloc_freeze() {
@@ -1072,4 +1088,14 @@ impl Drop for GpuBuffer {
 			self.ptr = std::ptr::null_mut();
 		}
 	}
+}
+
+pub struct Chan<T> {
+	pub tx: std::sync::mpsc::SyncSender<T>,
+	pub rx: std::sync::mpsc::Receiver<T>,
+}
+
+pub fn sync_chan<T>(depth: usize) -> Chan<T> {
+	let (tx, rx) = std::sync::mpsc::sync_channel::<T>(depth);
+	Chan { tx, rx }
 }

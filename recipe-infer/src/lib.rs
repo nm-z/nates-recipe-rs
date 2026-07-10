@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::match_wild_err_arm)]
 
+pub mod bridge;
 pub mod enums;
 pub mod forward;
 pub mod params;
@@ -8,6 +9,7 @@ pub mod safetensors;
 pub mod scratch;
 pub mod work;
 
+pub use bridge::*;
 pub use enums::*;
 pub use forward::*;
 pub use work::{GEMM_GFLOPS, VRAM_GBS, Work, layer_bwd, layer_fwd};

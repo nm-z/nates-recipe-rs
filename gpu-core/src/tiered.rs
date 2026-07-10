@@ -84,7 +84,7 @@ fn vram_total_free() -> (usize, usize) {
 fn meminfo_free() -> usize {
       let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
       for l in s.lines() {
-            if let Some(r) = l.strip_prefix("MemFree:") {
+            if let Some(r) = l.strip_prefix("MemAvailable:") {
                   if let Some(kb) = r.split_whitespace().next().and_then(|v| v.parse::<usize>().ok())
                   {
                         return kb.saturating_mul(1024);
