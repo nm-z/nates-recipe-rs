@@ -573,3 +573,19 @@ mod safetensors_source_tests {
 		let _ = std::fs::remove_file(&path);
 	}
 }
+
+#[cfg(test)]
+mod no_target_tests {
+	use super::*;
+
+	#[test]
+	fn no_target_datasets_is_features_only() {
+		let d = Data::load("datasets/uci-wine/wine.data");
+		let (set, test) = d.datasets();
+		assert_eq!(set.n_targets, 0, "no .target() yields zero targets");
+		assert!(set.y.is_empty(), "zero targets carry no y");
+		assert_eq!(set.x.nrows(), 178, "every wine row survives");
+		assert_eq!(set.x.ncols(), 14, "every wine column becomes a feature");
+		assert!(test.is_none(), "no split and no test path yields one dataset");
+	}
+}

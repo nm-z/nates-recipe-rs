@@ -302,7 +302,7 @@ fn encode(
 	// ~n×proj_w matrix (the measured 2× peak). proj_w is the exact feature width, so
 	// the output is sized once up front and filled column by column.
 	let w = proj_w;
-	let mut data = vec![0.0f64; n * w];
+	let mut data = alloc_matrix(n, w, "encoded")?;
 	let mut jc = 0usize;
 	let mut tcols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); targets.len()];
 	for (ai, attr) in attrs.iter().enumerate() {
@@ -374,7 +374,7 @@ impl std::fmt::Display for CeilingExceeded {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(
 			f,
-			"{} buffer exceeds VRAM+RAM+disk ceiling: {} rows × {} cols × 8B = {} (ceiling {})",
+			"{} buffer exceeds memory ceiling: {} rows × {} cols × 8B = {} (ceiling {})",
 			self.label,
 			self.rows,
 			self.cols,
@@ -386,12 +386,14 @@ impl std::fmt::Display for CeilingExceeded {
 
 impl std::error::Error for CeilingExceeded {}
 
-/// Admit check — replaces the old RAM-only guard for both the per-group encode
-/// and the cross-group selection. The run stops for one reason only: the encoded
-/// matrix `n × w × 8B` exceeds the combined VRAM+RAM+disk ceiling, decided from
-/// live budgets (`tiered::admit`) before the matrix is built. On over-ceiling it
-/// prints a one-line autopsy (largest bucket first) then returns the typed
-/// `CeilingExceeded`.
+/// Admit check for both the per-group encode and the cross-group selection. The
+/// run stops for two reasons, decided from live budgets (`tiered::admit`) before
+/// the matrix is built: the encoded matrix `n × w × 8B` exceeds the combined
+/// VRAM+RAM+disk ceiling, or it exceeds the host-RAM budget alone — encode
+/// materializes the full matrix in RAM before the fit can stream it, so the disk
+/// tier is unreachable during this phase and admitting against it produced 64 GB
+/// allocator aborts instead of diagnostics. On rejection it prints a one-line
+/// autopsy (largest bucket first) then returns the typed `CeilingExceeded`.
 fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) -> anyhow::Result<()> {
 	let bytes = n
 		.saturating_mul(w)
@@ -400,6 +402,9 @@ fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) ->
 	// sized against that filesystem's free space.
 	let spill = std::path::Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
+		Ok(bud) if bytes > bud.ram_data => {
+			recipe_infer::tiered::Full { need: bytes, cap: bud.ram_data }
+		}
 		Ok(_) => return Ok(()),
 		Err(f) => f,
 	};
@@ -447,6 +452,30 @@ fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) ->
 		cap: full.cap,
 	}
 	.into())
+}
+
+/// Fallible host allocation for a row-major `n × w` matrix. `admit_ceiling`
+/// bounds the steady state; this catches allocator refusal under concurrent
+/// memory pressure so the failure stays a diagnostic instead of an abort.
+fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
+	let cells = n.saturating_mul(w);
+	let mut data: Vec<f64> = Vec::new();
+	if data.try_reserve_exact(cells).is_err() {
+		let spill = std::path::Path::new(".recipe_spill");
+		let cap = recipe_infer::tiered::admit(0, 0, 0, spill)
+			.map(|b| b.ram_data)
+			.unwrap_or(0);
+		return Err(CeilingExceeded {
+			label: label.to_string(),
+			rows: n,
+			cols: w,
+			need: cells.saturating_mul(std::mem::size_of::<f64>()),
+			cap,
+		}
+		.into());
+	}
+	data.resize(cells, 0.0);
+	Ok(data)
 }
 
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
@@ -530,7 +559,7 @@ impl Assembled {
 		}
 		let top: Vec<(&str, usize)> = by_col.into_iter().collect();
 		admit_ceiling(n, w, "selection", &top)?;
-		let mut data = vec![0.0f64; n * w];
+		let mut data = alloc_matrix(n, w, "selection")?;
 		for (jc, name) in keep.iter().enumerate() {
 			let (mi, col) = self.sources[idx[name.as_str()]];
 			let m = &self.mats[mi];
