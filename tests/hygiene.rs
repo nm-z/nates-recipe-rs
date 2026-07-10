@@ -1116,7 +1116,7 @@ fn empty_arm_sites(code: &str) -> Vec<usize> {
 
 #[test]
 fn h36_no_if_or_wildcard_in_source() {
-      let banned = ["if", "_"];
+      let banned = ["if", "_", "bool", "true", "false"];
       let mut hits = Vec::new();
       for p in rs_files(NO_IF_TUPLE_ROOTS) {
             let src = read(&p);

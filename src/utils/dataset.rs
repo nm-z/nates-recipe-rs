@@ -4,7 +4,7 @@ use pantry::{Attr, Kind};
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
-type InferOnly = bool;
+use crate::model::InferOnly;
 
 pub trait IntoTargets {
 	fn into_targets(self) -> Vec<String>;
@@ -86,13 +86,13 @@ impl std::ops::Deref for Data {
 pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
-	let mut in_group = vec![false; ncols];
+	let mut in_group = vec![0usize; ncols];
 	for grp in ds.onehot_spans() {
 		for c in grp.start..grp.start + grp.len {
-			in_group[c] = true;
+			in_group[c] = 1;
 		}
 	}
-	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group[*c]).collect();
+	let passthrough: Vec<usize> = (0..ncols).filter(|c| in_group[*c] == 0).collect();
 	let n_cat = ds.onehot_groups.len();
 	let new_ncols = passthrough.len() + n_cat;
 	let mut data = vec![0.0f64; n * new_ncols];
@@ -536,7 +536,7 @@ impl crate::model::RunData for DataInner {
 		self.raw_test_headers.clone()
 	}
 	fn infer_only(&self) -> InferOnly {
-		false
+		InferOnly::Fit
 	}
 }
 

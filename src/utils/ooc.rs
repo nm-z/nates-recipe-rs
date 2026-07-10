@@ -7,7 +7,7 @@ use recipe_infer::{
 };
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,7 +144,7 @@ fn prelu_gate(act: &Activation) -> Option<()> {
 }
 
 fn interrupted() -> Interrupt {
-	match u8::from(crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)) {
+	match crate::train::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
 		0 => Interrupt::No,
 		_set => Interrupt::Yes,
 	}
@@ -156,12 +156,7 @@ pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = Window> {
 
 fn open_spill() -> anyhow::Result<File> {
 	let path = crate::probe::data_dir().context("spill dir")?.join(".recipe_spill");
-	let f = OpenOptions::new()
-		.read(true)
-		.write(true)
-		.create(true)
-		.truncate(true)
-		.open(&path)
+	let f = recipe_infer::bridge::open_rw(&path)
 		.context("open spill file")?;
 	drop(std::fs::remove_file(&path));
 	Ok(f)

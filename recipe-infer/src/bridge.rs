@@ -23,3 +23,20 @@ pub type Pt = (f64, f64);
 pub fn pt(x: f64, y: f64) -> Pt {
 	(x, y)
 }
+
+pub fn open_rw(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+	std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.open(path)
+}
+
+pub fn broadcast_on(s: &std::net::UdpSocket) -> std::io::Result<()> {
+	s.set_broadcast(true)
+}
+
+pub fn nodelay_on(s: &std::net::TcpStream) -> std::io::Result<()> {
+	s.set_nodelay(true)
+}

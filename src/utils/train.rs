@@ -3,9 +3,9 @@ use crate::model::{ModelInner, Train};
 use anyhow::Context;
 use recipe_infer::{
 	LayerSpec,
-	Loss, Metric, Pt, SCRATCH_CONSTS, Scaler, Scratch, concat_layer_s,
+	Loss, Metric, PlanMode, Pt, SCRATCH_CONSTS, Scaler, Scratch, concat_layer_s,
 	load_ogdl, load_ogdl_str, metric_gpu_into_s,
-	pinned_vocab, plan_layer_params, pt, zscore_apply_views,
+	pinned_vocab, plan_layer_params, plan_layer_params_m, pt, zscore_apply_views,
 };
 use gpu_core::kernels;
 use gpu_core::memory::{GpuBuffer, Stage};
@@ -17,10 +17,10 @@ use ratatui::symbols::{self, Marker};
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
-pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) static INTERRUPTED: std::sync::atomic::AtomicUsize = AtomicUsize::new(0);
 extern "C" fn on_sigint(_sig: i32) {
-	for _run in std::iter::once(()).take(usize::from(INTERRUPTED.swap(true, Ordering::SeqCst))) {
+	for _run in std::iter::once(()).take(INTERRUPTED.swap(1, Ordering::SeqCst)) {
 		unsafe { libc::_exit(130) };
 	}
 }
@@ -443,8 +443,8 @@ impl ModelInner {
 			_other => d,
 		};
 		let resumed = resume.map(load_ogdl).transpose()?.unwrap_or_default();
-		let mut did_resume = !resumed.is_empty();
-		let source = match usize::from(did_resume) {
+		let mut did_resume = usize::from(!resumed.is_empty());
+		let source = match did_resume {
 			1 => resumed,
 			_other => match usize::from(rerun) {
 				1 => {
@@ -477,18 +477,18 @@ impl ModelInner {
 				_other => YesNo::No,
 			}
 		};
-		let warm = did_resume || rerun;
+		let warm = did_resume != 0 || rerun;
 		let plan = match plan_layer_params(&self.specs, d, c_cat, vocab, &source, warm) {
 			Ok(p) => p,
 			Err(what) => {
-				let overwrite = did_resume && matches!(ask_overwrite(&what), YesNo::Yes);
+				let overwrite = did_resume != 0 && matches!(ask_overwrite(&what), YesNo::Yes);
 				match usize::from(overwrite) {
 					1 => {
-						did_resume = false;
-						plan_layer_params(&self.specs, d, c_cat, vocab, &[], false)
+						did_resume = 0;
+						plan_layer_params_m(&self.specs, d, c_cat, vocab, &[], PlanMode::Fresh)
 							.map_err(|e| anyhow::anyhow!(e))?
 					}
-					_other => match usize::from(did_resume) {
+					_other => match did_resume {
 						1 => anyhow::bail!("checkpoint mismatch — user declined overwrite"),
 						_other => anyhow::bail!(
 							"rerun: host weight mirror does not match this run — {what}"
@@ -703,7 +703,7 @@ impl ModelInner {
 			}
 		};
 		for _run in std::iter::once(()).take(usize::from(!plotting && !rerun)) {
-			for _run2 in std::iter::once(()).take(usize::from(did_resume)) {
+			for _run2 in std::iter::once(()).take(did_resume) {
 				resume.map(|path| {
 					let full = std::fs::canonicalize(path).unwrap_or_else(|_err| path.into());
 					eprintln!("resumed: {}", full.display());
@@ -726,7 +726,7 @@ impl ModelInner {
 		};
 		let _guard = gpu_core::memory::AllocGuard::freeze();
 		gpu_core::hw::arm_saturation_crash();
-		INTERRUPTED.store(false, Ordering::SeqCst);
+		INTERRUPTED.store(0, Ordering::SeqCst);
 		unsafe {
 			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
 		}
@@ -739,14 +739,14 @@ impl ModelInner {
 		let mut ring_scale: Vec<recipe_infer::LossScale> =
 			vec![recipe_infer::LossScale { sign: 1.0, div: 1.0 }; n_rows];
 		for e in 0..cfg.epochs {
-			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
+			let Step::Go = gate(1_usize.saturating_sub(INTERRUPTED.load(Ordering::SeqCst))) else {
 				break;
 			};
 			let log_now = cfg.log_every > 0
 				&& !cfg.metrics.is_empty()
 				&& (e % cfg.log_every == 0 || e + 1 == cfg.epochs);
 			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
-			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
+			let Step::Go = gate(1_usize.saturating_sub(INTERRUPTED.load(Ordering::SeqCst))) else {
 				break;
 			};
 			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, concat_fit)?;
@@ -754,7 +754,7 @@ impl ModelInner {
 				continue;
 			};
 			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
-			let Step::Go = gate(usize::from(!INTERRUPTED.load(Ordering::SeqCst))) else {
+			let Step::Go = gate(1_usize.saturating_sub(INTERRUPTED.load(Ordering::SeqCst))) else {
 				break;
 			};
 			let out = &sc.acts[last];
@@ -772,7 +772,7 @@ impl ModelInner {
 				},
 			});
 		}
-		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst);
+		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst) != 0;
 		for _run in std::iter::once(()).take(usize::from(!was_interrupted)) {
 			ooc.forward(&params, &xbuf, x_cat.as_ref(), &sc, concat_fit)?;
 			let end_slot = base.view(end_off, 1);
@@ -818,7 +818,7 @@ impl ModelInner {
 		};
 		let key = self.loss.score_key();
 		let mut loss_prev = f64::INFINITY;
-		let mut ckpt_saved = false;
+		let mut ckpt_saved = 0usize;
 		for meta in &epoch_meta {
 			let e = meta.epoch;
 			let score = val_of(stop_metric, e);
@@ -826,7 +826,7 @@ impl ModelInner {
 				1 => score,
 				_other => fit_score,
 			};
-			let mut checkpointed = false;
+			let mut checkpointed = 0usize;
 			let nan_stop = match usize::from(checkpointing) {
 				1 => {
 					let loss = val_of(Metric::Loss, e);
@@ -834,9 +834,9 @@ impl ModelInner {
 					match usize::from(stop) {
 						1 => eprintln!("NaN loss at epoch {e} — stopping (weights diverged)"),
 						_other => {
-							let carve = !ckpt_saved && e > 0 && loss > loss_prev;
+							let carve = ckpt_saved == 0 && e > 0 && loss > loss_prev;
 							for _run in std::iter::once(()).take(usize::from(carve)) {
-								ckpt_saved = true;
+								ckpt_saved = 1;
 								let path = checkpoint_path.as_ref().ok_or_else(|| anyhow::anyhow!("checkpoint path"))?;
 								let better = recipe_infer::saved_score(path, key)
 									.is_none_or(|best| score > best);
@@ -845,7 +845,7 @@ impl ModelInner {
 										path,
 										&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
 									)?;
-									checkpointed = true;
+									checkpointed = 1;
 								}
 							}
 							loss_prev = match usize::from(loss.is_finite()) {
@@ -854,15 +854,15 @@ impl ModelInner {
 							};
 						}
 					}
-					stop
+					usize::from(stop)
 				}
-				_other => false,
+				_other => 0,
 			};
-			let Step::Go = gate(usize::from(!nan_stop)) else {
+			let Step::Go = gate(1_usize.saturating_sub(nan_stop)) else {
 				break;
 			};
 			let logged_flag = matches!(meta.logged, Logged::Yes);
-			let Step::Go = gate(usize::from((logged_flag || checkpointed) && !plotting)) else {
+			let Step::Go = gate(usize::from((logged_flag || checkpointed != 0) && !plotting)) else {
 				continue;
 			};
 			let vals: Vec<f64> = cfg
@@ -877,7 +877,7 @@ impl ModelInner {
 				})
 				.collect();
 			let mut line = self.metrics_line(&cfg.metrics, &vals);
-			let suffix = match usize::from(checkpointed) {
+			let suffix = match checkpointed {
 				1 => "  \x1b[1;32m<- checkpoint\x1b[0m",
 				_other => "",
 			};

@@ -223,7 +223,7 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 		for i in ifaces() {
 			let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(i.ip), 0);
 			let Ok(s) = std::net::UdpSocket::bind(bind) else { continue };
-			drop(s.set_broadcast(true));
+			drop(recipe_infer::bridge::broadcast_on(&s));
 			let kind = match i.link {
 				Link::Wireless => "wlan",
 				Link::Wired => "eth",
@@ -404,7 +404,7 @@ impl Conn {
 			.ok_or_else(|| anyhow::anyhow!("wire: {addr} resolves to nothing"))?;
 		let stream =
 			TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
-		stream.set_nodelay(true)?;
+		recipe_infer::bridge::nodelay_on(&stream)?;
 		let reader = stream.try_clone()?;
 		let pending: Arc<Mutex<HashMap<u32, Sender<Frame>>>> = Arc::new(Mutex::new(HashMap::new()));
 		let pend = Arc::clone(&pending);
@@ -558,7 +558,7 @@ impl Server {
 	}
 
 	fn handle(&self, mut s: TcpStream) -> Result<()> {
-		s.set_nodelay(true)?;
+		recipe_infer::bridge::nodelay_on(&s)?;
 		loop {
 			let f = match read_frame(&mut s) {
 				Ok(f) => f,

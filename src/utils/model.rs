@@ -2,8 +2,8 @@ use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, Scaler, infer_scored_struct, load_ogdl_str, pinned_vocab, plan_layer_params,
-	vram_estimate,
+	LayerParams, PlanMode, Scaler, infer_scored_struct, load_ogdl_str, pinned_vocab,
+	plan_layer_params_m, vram_estimate,
 };
 use std::cell::{Cell, RefCell};
 use std::io::IsTerminal;
@@ -99,7 +99,10 @@ impl<'a> Prepared<'a> {
 	}
 }
 
-type InferOnly = bool;
+pub enum InferOnly {
+	Fit,
+	Forward,
+}
 
 pub trait RunData {
 	fn prepared<'a>(&'a self) -> anyhow::Result<Prepared<'a>>;
@@ -123,7 +126,7 @@ impl RunData for Dataset {
 		None
 	}
 	fn infer_only(&self) -> InferOnly {
-		false
+		InferOnly::Fit
 	}
 }
 
@@ -144,7 +147,7 @@ impl RunData for Option<Dataset> {
 		None
 	}
 	fn infer_only(&self) -> InferOnly {
-		true
+		InferOnly::Forward
 	}
 }
 
@@ -275,10 +278,13 @@ impl Train {
 			}
 		};
 		let ds = prepared.get();
-		let pass = [data.infer_only(), !ds.has_target, self.epochs == 0]
-			.into_iter()
-			.find(|flag| *flag)
-			.map_or(Pass::Fit, |_forward| Pass::Forward);
+		let pass = match data.infer_only() {
+			InferOnly::Forward => Pass::Forward,
+			InferOnly::Fit => match [usize::from(ds.has_target), self.epochs.min(1)] {
+				[1, 1] => Pass::Fit,
+				_other => Pass::Forward,
+			},
+		};
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(net) => {
 				let cs = net.connect();
@@ -313,7 +319,7 @@ impl Train {
 				assert!(__fit.is_ok(), "run: fit: {}", __fit.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())
-					.filter(|_probe| INTERRUPTED.load(Ordering::SeqCst))
+					.filter(|_probe| INTERRUPTED.load(Ordering::SeqCst) != 0)
 					.map(|_flag| eprintln!("\x1b[33minterrupted\x1b[0m"))
 					.unwrap_or(());
 				let score = model.fit_score.get();
@@ -569,7 +575,7 @@ impl ModelInner {
 			let __saved = load_ogdl_str(&m.text);
 			assert!(__saved.is_ok(), "eval: parse host weight mirror: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let Ok(saved) = __saved else { loop {} };
-			let __plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, true);
+			let __plan = plan_layer_params_m(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm);
 			assert!(__plan.is_ok(), "eval: rebuild weights from mirror: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 			let Ok(plan) = __plan else { loop {} };
 			let host = plan.host();
@@ -730,7 +736,7 @@ impl Model {
 		let __vocab = pinned_vocab(&inner.specs);
 		assert!(__vocab.is_some(), "Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
 		let Some(vocab) = __vocab else { loop {} };
-		let __plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, true);
+		let __plan = plan_layer_params_m(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm);
 		assert!(__plan.is_ok(), "Model::load: plan layer params: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let Ok(plan) = __plan else { loop {} };
 		let host = plan.host();

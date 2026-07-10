@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, ensure, Result};
 use gpu_core::memory::{par_copy, par_touch, GpuBuffer};
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -383,12 +383,7 @@ fn bench_disk(dir: &Path) -> Result<f64> {
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
 	let path = dir.join(".recipe_probe");
-	let f = OpenOptions::new()
-		.read(true)
-		.write(true)
-		.create(true)
-		.truncate(true)
-		.open(&path)?;
+	let f = recipe_infer::bridge::open_rw(&path)?;
 	let tw = Instant::now();
 	f.write_all_at(&buf, 0)?;
 	f.sync_all()?;

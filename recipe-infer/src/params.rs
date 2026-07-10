@@ -306,6 +306,23 @@ pub fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	text
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlanMode {
+	Fresh,
+	Warm,
+}
+
+pub fn plan_layer_params_m(
+	specs: &[LayerSpec],
+	d: usize,
+	c_cat: usize,
+	vocab: usize,
+	resumed: &[Saved],
+	mode: PlanMode,
+) -> Result<LayerPlan, String> {
+	plan_layer_params(specs, d, c_cat, vocab, resumed, mode == PlanMode::Warm)
+}
+
 pub fn plan_layer_params(
 	specs: &[LayerSpec],
 	d: usize,
