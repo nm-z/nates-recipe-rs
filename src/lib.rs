@@ -24,7 +24,7 @@ pub mod wire;
 
 #[doc(hidden)]
 #[path = "utils/train.rs"]
-mod train;
+pub mod train;
 
 #[doc(hidden)]
 #[path = "utils/model.rs"]
