@@ -41,7 +41,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-      for d in std::env::var_os("RECIPE_PROBE_GPU").into_iter() {
+      if let Some(d) = std::env::var_os("RECIPE_PROBE_GPU") {
             let dev: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
             match recipe::probe::probe_gpu_child_record(dev) {
                   Ok(rec) => {
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
                   }
             }
       }
-      for sz in std::env::var_os("VRAM_PROBE").into_iter() {
+      if let Some(sz) = std::env::var_os("VRAM_PROBE") {
             let n: usize = sz.to_string_lossy().parse().expect("VRAM_PROBE parse");
             let code = match gpu_core::memory::GpuBuffer::try_alloc_bytes(n) {
                   Some(probe) => {
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
             };
             std::process::exit(code);
       }
-      for it in std::env::var_os("SETUP_RACE").into_iter() {
+      if let Some(it) = std::env::var_os("SETUP_RACE") {
             let iters: usize = it.to_string_lossy().parse().expect("SETUP_RACE parse");
             gpu_core::hip::set_device(0)?;
             for i in 0..iters {

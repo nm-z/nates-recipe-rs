@@ -962,19 +962,12 @@ impl ModelInner {
 			.unwrap_or_else(|| eff_x.clone());
 		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
-		let scaler_opt = scaler.as_ref();
-		assert!(scaler_opt.is_some(), "eval: missing scaler; train first");
-		let Some(scaler_ref) = scaler_opt else { loop {} };
+		let scaler_ref = crate::some_or_die(scaler.as_ref(), "eval: missing scaler; train first");
 		let up = |m: &ndarray::Array2<f64>| -> GpuBuffer {
 			let s = m.as_standard_layout();
-			let rs = s.as_slice();
-			assert!(rs.is_some(), "eval upload: non-contiguous");
-			let Some(sl) = rs else { loop {} };
-			let rb = GpuBuffer::alloc(sl.len());
-			assert!(rb.is_ok(), "eval upload: {}", rb.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(b) = rb else { loop {} };
-			let rl = b.load(sl);
-			assert!(rl.is_ok(), "eval upload: {}", rl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let sl = crate::some_or_die(s.as_slice(), "eval upload: non-contiguous");
+			let b = crate::ok_or_die(GpuBuffer::alloc(sl.len()), "eval upload");
+			crate::ok_or_die(b.load(sl), "eval upload");
 			b
 		};
 		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> GpuBuffer {
@@ -984,15 +977,12 @@ impl ModelInner {
 			let m_off = st.push(&sc.mean);
 			let s_off = st.push(&sc.std);
 			let host = st.into_host();
-			let ri = GpuBuffer::alloc(host.len().max(1));
-			assert!(ri.is_ok(), "eval scaler stage: {}", ri.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(img) = ri else { loop {} };
-			let rl = img.load(&host);
-			assert!(rl.is_ok(), "eval scaler stage: {}", rl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let rz = zscore_apply_views(xraw, rows, cols, &img.view(m_off, cols), &img.view(s_off, cols));
-			assert!(rz.is_ok(), "eval zscore: {}", rz.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(z) = rz else { loop {} };
-			z
+			let img = crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "eval scaler stage");
+			crate::ok_or_die(img.load(&host), "eval scaler stage");
+			crate::ok_or_die(
+				zscore_apply_views(xraw, rows, cols, &img.view(m_off, cols), &img.view(s_off, cols)),
+				"eval zscore",
+			)
 		};
 		match Some(()).filter(|_probe| embed_first) {
 			Some(_ef) => {

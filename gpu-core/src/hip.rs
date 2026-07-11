@@ -276,10 +276,8 @@ pub fn sysfs_vram_free() -> Option<usize> {
 		};
 		let total = read("mem_info_vram_total");
 		let used = read("mem_info_vram_used");
-		for got_total in total.into_iter() {
-			for got_used in used.into_iter() {
-				return Some(got_total.saturating_sub(got_used));
-			}
+		if let (Some(got_total), Some(got_used)) = (total, used) {
+			return Some(got_total.saturating_sub(got_used));
 		}
 	}
 	None

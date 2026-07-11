@@ -24,7 +24,7 @@ const SET: Sets = Sets {
 };
 
 fn main() {
-	let nn = Model::new()             // NN
+	let nn = Model::new() // NN
 		.loss(bce)
 		.layer(64)
 		.leak()
@@ -40,7 +40,7 @@ fn main() {
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 
-	let cnn = Model::new()            // CNN
+	let cnn = Model::new() // CNN
 		.loss(ce)
 		.conv(32, 3, 1)
 		.leak()
@@ -59,7 +59,7 @@ fn main() {
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 
-	let mlp = Model::new()          // MLP
+	let mlp = Model::new() // MLP
 		.loss(mse)
 		.layer(128)
 		.leak()
@@ -76,50 +76,30 @@ fn main() {
 		.net(["archy", "sentry"])
 		.log([Loss, R2, hip]);
 
-	let llm = Model::new()          // LLM
+	let llm = Model::new() // LLM
 		.loss(ce)
 		.layer(embed(16))
 		.layer(attn(4))
-		.layer(32).leak()
+		.layer(32)
+		.leak()
 		.layer(3)
 		.lr(0.001);
-	let llm_data = Data::load(SET.text)
-		.split(0.8)
-		.exclude("id")
-		.target(["winner_model_a", "winner_model_b", "winner_tie"]);
+	let llm_data = Data::load(SET.text).split(0.8).exclude("id").target([
+		"winner_model_a",
+		"winner_model_b",
+		"winner_tie",
+	]);
 	let llm_train = Train::new()
 		.epochs(1)
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 
-	for (model, data, train)
-		in [(&nn , &nn_data , &nn_train ),
-			(&cnn, &cnn_data, &cnn_train),
-			(&mlp, &mlp_data, &mlp_train),
-			(&llm, &llm_data, &llm_train),]
-		{ train.run(data, model); }
+	for (model, data, train) in [
+		(&nn, &nn_data, &nn_train),
+		(&cnn, &cnn_data, &cnn_train),
+		(&mlp, &mlp_data, &mlp_train),
+		(&llm, &llm_data, &llm_train),
+	] {
+		train.run(data, model);
+	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

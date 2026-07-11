@@ -932,7 +932,7 @@ pub fn device_arena_active() -> bool {
 pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<usize> {
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
-		for _ok in Some(()).filter(|_u| probe_survives(want)).into_iter() {
+		if probe_survives(want) {
 			eprintln!("claim probe: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
 			return Some(want);
 		}
@@ -1013,7 +1013,7 @@ impl GpuBuffer {
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
 		let base = ARENA_BASE.load(Ordering::Relaxed);
-		for _active in std::num::NonZeroUsize::new(base).into_iter() {
+		if base != 0 {
 			let size = ARENA_SIZE.load(Ordering::Relaxed);
 			let aligned = (n_bytes + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1);
 			let mut off = ARENA_OFFSET.load(Ordering::Relaxed);
@@ -1068,7 +1068,7 @@ impl GpuBuffer {
 		let tag = CURRENT_TAG.with(|t| t.get());
 		let remaining = vram_free_base();
 		let cap = remaining.saturating_sub(USER_GB);
-		for _over in Some(()).filter(|_u| matches!(n_bytes.cmp(&cap), std::cmp::Ordering::Greater)).into_iter() {
+		if n_bytes > cap {
 			return None;
 		}
 		let ptr = Self::map_bytes(n_bytes).ok()?;

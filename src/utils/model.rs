@@ -270,9 +270,10 @@ impl Train {
 		let prepared = match data.prepared() {
 			Ok(v) => v,
 			Err(e) => {
-				let __ceiling = e.downcast_ref::<pantry::encode::CeilingExceeded>();
-				assert!(__ceiling.is_some(), "run: prepare data: {e:#}");
-				let Some(_ceiling) = __ceiling else { loop {} };
+				assert!(
+					e.downcast_ref::<pantry::encode::CeilingExceeded>().is_some(),
+					"run: prepare data: {e:#}"
+				);
 				eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
 				return self;
 			}
@@ -287,9 +288,7 @@ impl Train {
 		};
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(net) => {
-				let cs = net.connect();
-				assert!(cs.is_ok(), "net: connect: {}", cs.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-				let Ok(cs) = cs else { loop {} };
+				let cs = crate::ok_or_die(net.connect(), "net: connect");
 				for c in &cs {
 					eprintln!(
 						"\x1b[33mnet\x1b[0m  pooled {} ({} RAM)",
@@ -349,12 +348,8 @@ impl Train {
 				let sp = match Some(()).filter(|_probe| ds.has_target && !self.metrics.is_empty()) {
 					Some(_scored) => {
 						let ybuf = {
-							let __up = ds.y.as_slice();
-							assert!(__up.is_some(), "run: eval metrics: y contig");
-							let Some(__up) = __up else { loop {} };
-							let __ub = GpuBuffer::alloc(__up.len());
-							assert!(__ub.is_ok(), "run: eval metrics: ybuf: {}", __ub.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-							let Ok(__ub) = __ub else { loop {} };
+							let __up = crate::some_or_die(ds.y.as_slice(), "run: eval metrics: y contig");
+							let __ub = crate::ok_or_die(GpuBuffer::alloc(__up.len()), "run: eval metrics: ybuf");
 							let __ld = __ub.load(__up);
 							assert!(__ld.is_ok(), "run: eval metrics: ybuf: {}", __ld.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 							__ub
@@ -366,8 +361,7 @@ impl Train {
 							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
 							model.loss, model.lr, &self.metrics, ss_tot,
 						);
-						assert!(__sc.is_ok(), "run: eval metrics: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-						let Ok(sc) = __sc else { loop {} };
+						let sc = crate::ok_or_die(__sc, "run: eval metrics");
 						eprintln!("eval  {}", crate::train::metrics_line(&self.metrics, &sc.vals));
 						let stop = Some(Metric::Accuracy)
 							.filter(|_m| model.loss.is_classification())
@@ -382,8 +376,7 @@ impl Train {
 							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
 							model.loss, model.lr, &[], 0.0,
 						);
-						assert!(__sc.is_ok(), "run: eval predictions: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-						let Ok(sc) = __sc else { loop {} };
+						let sc = crate::ok_or_die(__sc, "run: eval predictions");
 						ScorePreds { score: f64::NAN, preds: sc.preds }
 					}
 				};
@@ -561,29 +554,24 @@ impl ModelInner {
 		let Some(g) = self.arena_gen.get() else {
 			return;
 		};
-		let Some(_stale) = Some(()).filter(|_probe| gpu_core::memory::live_parked_gen() != Some(g)) else {
+		if gpu_core::memory::live_parked_gen() == Some(g) {
 			return;
-		};
+		}
 		let params = {
 			let mirror = self.saved_ogdl.borrow();
-			assert!(
-				mirror.is_some(),
+			let m = crate::some_or_die(
+				mirror.as_ref(),
 				"eval: this model's device weights were freed by a later training run and \
 				 there is no host mirror to restore them (pooled out-of-core arena run)",
 			);
-			let Some(m) = mirror.as_ref() else { loop {} };
-			let __saved = load_ogdl_str(&m.text);
-			assert!(__saved.is_ok(), "eval: parse host weight mirror: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(saved) = __saved else { loop {} };
-			let __plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm);
-			assert!(__plan.is_ok(), "eval: rebuild weights from mirror: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(plan) = __plan else { loop {} };
+			let saved = crate::ok_or_die(load_ogdl_str(&m.text), "eval: parse host weight mirror");
+			let plan = crate::ok_or_die(
+				plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm),
+				"eval: rebuild weights from mirror",
+			);
 			let host = plan.host();
-			let __staged = GpuBuffer::alloc(host.len().max(1));
-			assert!(__staged.is_ok(), "rebuild staged alloc: {}", __staged.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-			let Ok(staged) = __staged else { loop {} };
-			let __sl = staged.load(host);
-			assert!(__sl.is_ok(), "rebuild staged load: {}", __sl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+			let staged = crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "rebuild staged alloc");
+			crate::ok_or_die(staged.load(host), "rebuild staged load");
 			let params = plan.materialize(&staged, 0);
 			*self.rebuild_backing.borrow_mut() = Some(staged);
 			params
@@ -722,20 +710,18 @@ impl Model {
 	}
 
 	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
-		let __saved = load_ogdl_str(weights);
-		assert!(__saved.is_ok(), "Model::load: parse weights: {}", __saved.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		let Ok(saved) = __saved else { loop {} };
+		let saved = crate::ok_or_die(load_ogdl_str(weights), "Model::load: parse weights");
 		let inner = &proto.inner;
-		let __vocab = pinned_vocab(&inner.specs);
-		assert!(__vocab.is_some(), "Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))");
-		let Some(vocab) = __vocab else { loop {} };
-		let __plan = plan_layer_params(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm);
-		assert!(__plan.is_ok(), "Model::load: plan layer params: {}", __plan.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		let Ok(plan) = __plan else { loop {} };
+		let vocab = crate::some_or_die(
+			pinned_vocab(&inner.specs),
+			"Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))",
+		);
+		let plan = crate::ok_or_die(
+			plan_layer_params(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm),
+			"Model::load: plan layer params",
+		);
 		let host = plan.host();
-		let __staged = GpuBuffer::alloc(host.len().max(1));
-		assert!(__staged.is_ok(), "Model::load staged alloc: {}", __staged.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		let Ok(staged) = __staged else { loop {} };
+		let staged = crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "Model::load staged alloc");
 		let __sl = staged.load(host);
 		assert!(__sl.is_ok(), "Model::load staged load: {}", __sl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 		let params = plan.materialize(&staged, 0);
@@ -760,9 +746,10 @@ impl Model {
 	}
 
 	fn set_last_activation(mut self, act: Activation) -> Model {
-		let __slot = self.last_activation_slot();
-		assert!(__slot.is_some(), "activation method called but last layer is not dense or conv");
-		let Some(__slot) = __slot else { loop {} };
+		let __slot = crate::some_or_die(
+			self.last_activation_slot(),
+			"activation method called but last layer is not dense or conv",
+		);
 		*__slot = act;
 		self
 	}
@@ -812,9 +799,7 @@ impl Model {
 
 	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
 		let inner = &self.inner;
-		let __prep = data.prepared();
-		assert!(__prep.is_ok(), "eval: prepare data: {}", __prep.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		let Ok(prepared) = __prep else { loop {} };
+		let prepared = crate::ok_or_die(data.prepared(), "eval: prepare data");
 		let ds = prepared.get();
 		let arena = self.begin_forward();
 		let ei = inner.prep_eval_input(ds);
@@ -826,12 +811,8 @@ impl Model {
 			.unwrap_or(Metric::R2);
 		let preds = match Some(()).filter(|_probe| ds.has_target) {
 			Some(_present) => {
-				let __ys = ds.y.as_slice();
-				assert!(__ys.is_some(), "eval: y contiguous");
-				let Some(yslice) = __ys else { loop {} };
-				let __yb = GpuBuffer::alloc(yslice.len());
-				assert!(__yb.is_ok(), "eval ybuf: {}", __yb.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-				let Ok(ybuf) = __yb else { loop {} };
+				let yslice = crate::some_or_die(ds.y.as_slice(), "eval: y contiguous");
+				let ybuf = crate::ok_or_die(GpuBuffer::alloc(yslice.len()), "eval ybuf");
 				let __yl = ybuf.load(yslice);
 				assert!(__yl.is_ok(), "eval ybuf load: {}", __yl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
 				let k = params[params.len() - 1].out_dim;
@@ -842,8 +823,7 @@ impl Model {
 					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
 					inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
 				);
-				assert!(__sc.is_ok(), "eval: metrics: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-				let Ok(sc) = __sc else { loop {} };
+				let sc = crate::ok_or_die(__sc, "eval: metrics");
 				let label = Some("accuracy")
 					.filter(|_l| inner.loss.is_classification())
 					.unwrap_or("R2");
@@ -855,8 +835,7 @@ impl Model {
 					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
 					inner.loss, inner.lr, &[], 0.0,
 				);
-				assert!(__sc.is_ok(), "eval: predictions: {}", __sc.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-				let Ok(sc) = __sc else { loop {} };
+				let sc = crate::ok_or_die(__sc, "eval: predictions");
 				eprintln!("eval: {} samples (no target column, score unavailable)", ei.n);
 				sc.preds
 			}

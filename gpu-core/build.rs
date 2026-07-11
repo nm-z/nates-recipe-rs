@@ -84,10 +84,10 @@ fn ban_direct_blas() {
 	for f in files {
 		let text = std::fs::read_to_string(&f).unwrap_or_default();
 		let lines: Vec<&str> = text.lines().collect();
-		for i in 0..lines.len() {
-			let low = lines[i].to_lowercase();
+		for (i, line) in lines.iter().enumerate() {
+			let low = line.to_lowercase();
 			for pat in &banned {
-				for _hit in Some(()).filter(|_u| low.contains(pat)).into_iter() {
+				if low.contains(pat) {
 					panic!(
 						"{}:{}: direct {} banned — call hipBLAS (hipblas*) instead",
 						f.display(),
@@ -134,20 +134,17 @@ fn enforce_memory_chokepoints() {
 	for f in &files {
 		let text = std::fs::read_to_string(f).unwrap_or_default();
 		let lines: Vec<&str> = text.lines().collect();
-		for i in 0..lines.len() {
-			let line = lines[i];
-			for k in 0..apis.len() {
-				let api = apis[k];
-				for _hit in Some(()).filter(|_u| line.contains(api)).into_iter() {
+		for (i, line) in lines.iter().enumerate() {
+			for (k, api) in apis.iter().enumerate() {
+				if line.contains(api) {
 					counts[k] += 1;
 					sites[k].push(format!("{}:{}", f.display(), i + 1));
 				}
 			}
 		}
 	}
-	for k in 0..apis.len() {
-		let api = apis[k];
-		for _over in Some(()).filter(|_u| counts[k] > 2).into_iter() {
+	for (k, api) in apis.iter().enumerate() {
+		if counts[k] > 2 {
 			panic!(
 				"{}: {} occurrences (max 2 = decl + choke call site): {}",
 				api,
@@ -180,13 +177,13 @@ fn main() {
 			let p = entry.path();
 			let stale = p.to_str().is_some_and(|s| s.ends_with("_hip.o") || s.ends_with("_shim.o"))
 				&& !objects.iter().any(|o| Path::new(o) == p);
-			for _rm in Some(()).filter(|_u| stale).into_iter() {
+			if stale {
 				drop(std::fs::remove_file(&p));
 			}
 		}
 	}
 
-	for _lib in Some(()).filter(|_u| !objects.is_empty()).into_iter() {
+	if !objects.is_empty() {
 		let lib_path = format!("{}/libhipkernels.a", out_dir);
 		drop(std::fs::remove_file(&lib_path));
 		let mut ar = std::process::Command::new("ar");

@@ -10,9 +10,11 @@ fn columns(path: &str) -> recipe::data::RawCsv {
 }
 
 fn main() {
-	for (path, want, sep) in
-		[(BANK, 17usize, "semicolon"), (SEEDS, 8, "tab"), (WINE, 14, "comma")]
-	{
+	for (path, want, sep) in [
+		(BANK, 17usize, "semicolon"),
+		(SEEDS, 8, "tab"),
+		(WINE, 14, "comma"),
+	] {
 		let recipe::data::RawCsv { headers, rows } = columns(path);
 		assert_eq!(
 			headers.len(),
@@ -30,11 +32,28 @@ fn main() {
 
 	let rows = columns(BANK).rows.len();
 	let data = Data::load(BANK).target("y");
-	let model = Model::new().loss(bce).layer(64).leak().layer(1).sigmoid().lr(0.001);
-	Train::new().epochs(20).log([Loss, Accuracy, hip]).run(&data, &model);
+	let model = Model::new()
+		.loss(bce)
+		.layer(64)
+		.leak()
+		.layer(1)
+		.sigmoid()
+		.lr(0.001);
+	Train::new()
+		.epochs(20)
+		.log([Loss, Accuracy, hip])
+		.run(&data, &model);
 
 	let preds = model.eval(&data);
-	assert_eq!(preds.len(), rows, "eval returned {} preds for {rows} rows", preds.len());
-	assert!(preds.iter().all(|p| p.is_finite()), "eval produced non-finite predictions");
+	assert_eq!(
+		preds.len(),
+		rows,
+		"eval returned {} preds for {rows} rows",
+		preds.len()
+	);
+	assert!(
+		preds.iter().all(|p| p.is_finite()),
+		"eval produced non-finite predictions"
+	);
 	eprintln!("\x1b[36mstress\x1b[0m  ok");
 }

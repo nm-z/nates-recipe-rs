@@ -80,3 +80,19 @@ pub fn train() -> Train {
 pub fn eval(model: &Model, data: &dyn RunData) -> Vec<f64> {
       model.eval(data)
 }
+
+pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
+      assert!(
+            r.is_ok(),
+            "{ctx}: {}",
+            r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default()
+      );
+      let Ok(v) = r else { std::process::abort() };
+      v
+}
+
+pub(crate) fn some_or_die<T>(o: Option<T>, msg: &str) -> T {
+      assert!(o.is_some(), "{msg}");
+      let Some(v) = o else { std::process::abort() };
+      v
+}

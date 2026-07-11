@@ -14,8 +14,18 @@ const OGDL: &str = "/tmp/recipe-styles.ogdl";
 fn main() {
 	// ── style 1: static (dot syntax) ────────────────────────────────────
 	eprintln!("\x1b[1;36m── style 1: recipe.data() ──\x1b[0m");
-	let data = recipe.data(CSV).split(0.8).exclude("Id").target("SalePrice");
-	let model = recipe.model().layer(64).leak().layer(1).loss(mse).lr(0.0001);
+	let data = recipe
+		.data(CSV)
+		.split(0.8)
+		.exclude("Id")
+		.target("SalePrice");
+	let model = recipe
+		.model()
+		.layer(64)
+		.leak()
+		.layer(1)
+		.loss(mse)
+		.lr(0.0001);
 	recipe.train().epochs(5).log([Loss, R2]).run(&data, &model);
 	recipe.eval(&model, &data);
 
@@ -28,9 +38,22 @@ fn main() {
 
 	// ── style 3: crate path (free function) ─────────────────────────────
 	eprintln!("\x1b[1;36m── style 3: recipe::data() ──\x1b[0m");
-	let data = recipe::data(CSV).split(0.8).exclude("Id").target("SalePrice");
-	let model = recipe::model().layer(64).leak().layer(1).loss(mse).lr(0.0001);
-	recipe::train().epochs(5).log_every(1).log([Loss, R2]).run(&data, &model).save(OGDL);
+	let data = recipe::data(CSV)
+		.split(0.8)
+		.exclude("Id")
+		.target("SalePrice");
+	let model = recipe::model()
+		.layer(64)
+		.leak()
+		.layer(1)
+		.loss(mse)
+		.lr(0.0001);
+	recipe::train()
+		.epochs(5)
+		.log_every(1)
+		.log([Loss, R2])
+		.run(&data, &model)
+		.save(OGDL);
 	recipe::eval(&model, &data);
 
 	// ── holdout: `run(data, model)` with a forward-only data source ──────

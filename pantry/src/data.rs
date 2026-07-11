@@ -30,11 +30,7 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 		let tabs = text.matches('\t').count();
 		let total_sep = commas + semis + tabs;
 		let tokens: Vec<&str> = text.split_whitespace().collect();
-		let space = Some(())
-			.filter(|_u| total_sep == 0)
-			.filter(|_u| tokens.len() >= 2)
-			.filter(|_u| tokens.iter().all(|t| t.parse::<f64>().is_ok()));
-		for _sp in space.into_iter() {
+		if total_sep == 0 && tokens.len() >= 2 && tokens.iter().all(|t| t.parse::<f64>().is_ok()) {
 			return b' ';
 		}
 		return match semis.cmp(&commas) {
@@ -255,7 +251,7 @@ struct GroupHash {
 
 fn group_and_hash(p: &Path, prefixes: &std::collections::HashSet<String>) -> GroupHash {
 	let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-	for idx in name.find("__").into_iter() {
+	if let Some(idx) = name.find("__") {
 		let h = &name[..idx];
 		let rest = &name[idx + 2..];
 		return GroupHash {
@@ -268,7 +264,7 @@ fn group_and_hash(p: &Path, prefixes: &std::collections::HashSet<String>) -> Gro
 		.and_then(|s| s.to_str())
 		.unwrap_or(name)
 		.to_string();
-	for _hit in Some(()).filter(|_u| prefixes.contains(&stem)).into_iter() {
+	if prefixes.contains(&stem) {
 		let ext = p
 			.extension()
 			.and_then(|e| e.to_str())
@@ -606,16 +602,13 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 		.and_then(|e| e.to_str())
 		.map(str::to_ascii_lowercase);
 	let ext_ref = ext.as_deref();
-	for _z in Some(()).filter(|_u| ext_ref == Some("zip")).into_iter() {
+	if ext_ref == Some("zip") {
 		return load_zip_groups(path).expect("load zip");
 	}
-	for _s in Some(())
-		.filter(|_u| matches!(ext_ref, Some("db" | "sqlite")))
-		.into_iter()
-	{
+	if matches!(ext_ref, Some("db" | "sqlite")) {
 		return load_sqlite_groups(path).expect("load sqlite");
 	}
-	for _dir in Some(()).filter(|_u| p.is_dir()).into_iter() {
+	if p.is_dir() {
 		return load_dir_groups(path).expect("load dir");
 	}
 	let RawCsv { headers, rows: cells } = read_raw_csv(p).expect("read csv");
@@ -706,10 +699,7 @@ enum Section {
 
 pub fn parse_arff(path: &str) -> ArffTable {
 	let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-		for _nf in Some(())
-			.filter(|_u| e.kind() == std::io::ErrorKind::NotFound)
-			.into_iter()
-		{
+		if e.kind() == std::io::ErrorKind::NotFound {
 			let cwd = std::env::current_dir()
 				.map(|p| p.display().to_string())
 				.unwrap_or_else(|_e| ".".to_string());

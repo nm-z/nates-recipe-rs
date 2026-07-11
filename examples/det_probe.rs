@@ -5,8 +5,8 @@
 //   cargo run --release --example det_probe
 
 use gpu_core::infer_ops::{
-	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn,
-	gpu_rmsnorm_f64, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
+	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
+	gpu_scale_f64_inplace, gpu_widen_bf16,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::memory::GpuBuffer;
@@ -33,16 +33,27 @@ fn bithash(a: &[f64]) -> u64 {
 }
 
 fn cmp(name: &str, a: &[f64], b: &[f64]) {
-	let diff = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+	let diff = a
+		.iter()
+		.zip(b)
+		.filter(|(x, y)| x.to_bits() != y.to_bits())
+		.count();
 	if diff == 0 {
-		eprintln!("{name:<26} DETERMINISTIC ({} elems)  hash={:016x}", a.len(), bithash(a));
+		eprintln!(
+			"{name:<26} DETERMINISTIC ({} elems)  hash={:016x}",
+			a.len(),
+			bithash(a)
+		);
 	} else {
 		let mx = a
 			.iter()
 			.zip(b)
 			.map(|(x, y)| (x - y).abs())
 			.fold(0.0f64, f64::max);
-		eprintln!("{name:<26} DIVERGED: {diff}/{} elems differ, max abs {mx:e}", a.len());
+		eprintln!(
+			"{name:<26} DIVERGED: {diff}/{} elems differ, max abs {mx:e}",
+			a.len()
+		);
 	}
 }
 
@@ -64,36 +75,68 @@ fn cpu_gemm_bt(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
 fn check_gemm(label: &str, m: usize, n: usize, k: usize) {
 	let av = host(m * k, 1000 + m as u64);
 	let bv = host(n * k, 2000 + n as u64 + k as u64);
-	let a = { let __up = &av; let __ub = GpuBuffer::alloc(__up.len()).expect("a"); __ub.load(__up).expect("a"); __ub };
-	let b = { let __up = &bv; let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
+	let a = {
+		let __up = &av;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("a");
+		__ub.load(__up).expect("a");
+		__ub
+	};
+	let b = {
+		let __up = &bv;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("b");
+		__ub.load(__up).expect("b");
+		__ub
+	};
 	let cpu = cpu_gemm_bt(&av, &bv, m, n, k);
 
 	let out_c = GpuBuffer::alloc(m * n).expect("out_c");
 	gpu_gemm_bt_f64(&a, &b, m, n, k, &out_c).expect("gemm_bt_f64");
 	let mut gc = vec![0.0f64; m * n];
-	unsafe { out_c.download_async(&mut gc, std::ptr::null_mut()) }.expect("dl gc"); gpu_core::hip::device_synchronize().expect("dl gc");
-	let err_cpu = gc.iter().zip(&cpu).map(|(x, y)| (x - y).abs()).fold(0.0f64, f64::max);
+	unsafe { out_c.download_async(&mut gc, std::ptr::null_mut()) }.expect("dl gc");
+	gpu_core::hip::device_synchronize().expect("dl gc");
+	let err_cpu = gc
+		.iter()
+		.zip(&cpu)
+		.map(|(x, y)| (x - y).abs())
+		.fold(0.0f64, f64::max);
 
 	let out_r = GpuBuffer::alloc(m * n).expect("out_r");
 	gpu_gemm_bt_into(&a, &b, m, n, k, &out_r).expect("rocblas gemm");
 	let mut gr = vec![0.0f64; m * n];
-	unsafe { out_r.download_async(&mut gr, std::ptr::null_mut()) }.expect("dl gr"); gpu_core::hip::device_synchronize().expect("dl gr");
-	let err_roc = gc.iter().zip(&gr).map(|(x, y)| (x - y).abs()).fold(0.0f64, f64::max);
+	unsafe { out_r.download_async(&mut gr, std::ptr::null_mut()) }.expect("dl gr");
+	gpu_core::hip::device_synchronize().expect("dl gr");
+	let err_roc = gc
+		.iter()
+		.zip(&gr)
+		.map(|(x, y)| (x - y).abs())
+		.fold(0.0f64, f64::max);
 
 	let pass = if err_cpu < 1e-9 { "PASS" } else { "FAIL" };
 	eprintln!(
 		"{label:<24} m={m:<3} n={n:<5} k={k:<5} max_err_cpu={err_cpu:e} max_err_rocblas={err_roc:e} {pass}"
 	);
 
-	twice(&format!("gemm_bt_f64 {label}"), m * n, |o| gpu_gemm_bt_f64(&a, &b, m, n, k, o).expect("gemm_bt_f64"));
+	twice(&format!("gemm_bt_f64 {label}"), m * n, |o| {
+		gpu_gemm_bt_f64(&a, &b, m, n, k, o).expect("gemm_bt_f64")
+	});
 }
 
 // Time ITERS iterations of rocBLAS gpu_gemm_bt_into vs the custom kernel for
 // one (m,n,k) shape, report ms + effective GB/s (B read once, the dominant
 // bandwidth term) against the 432GB/s gfx1101 floor.
 fn bench_shape(label: &str, m: usize, n: usize, k: usize) {
-	let a = { let __up = &host(m * k, 3000); let __ub = GpuBuffer::alloc(__up.len()).expect("a"); __ub.load(__up).expect("a"); __ub };
-	let b = { let __up = &host(n * k, 4000); let __ub = GpuBuffer::alloc(__up.len()).expect("b"); __ub.load(__up).expect("b"); __ub };
+	let a = {
+		let __up = &host(m * k, 3000);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("a");
+		__ub.load(__up).expect("a");
+		__ub
+	};
+	let b = {
+		let __up = &host(n * k, 4000);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("b");
+		__ub.load(__up).expect("b");
+		__ub
+	};
 	let out = GpuBuffer::alloc(m * n).expect("out");
 	const ITERS: usize = 50;
 
@@ -127,22 +170,51 @@ fn twice(name: &str, n_out: usize, mut f: impl FnMut(&GpuBuffer)) {
 	let mut r1 = vec![0.0f64; n_out];
 	let mut r2 = vec![0.0f64; n_out];
 	f(&out);
-	unsafe { out.download_async(&mut r1, std::ptr::null_mut()) }.expect("dl1"); gpu_core::hip::device_synchronize().expect("dl1");
+	unsafe { out.download_async(&mut r1, std::ptr::null_mut()) }.expect("dl1");
+	gpu_core::hip::device_synchronize().expect("dl1");
 	f(&out);
-	unsafe { out.download_async(&mut r2, std::ptr::null_mut()) }.expect("dl2"); gpu_core::hip::device_synchronize().expect("dl2");
+	unsafe { out.download_async(&mut r2, std::ptr::null_mut()) }.expect("dl2");
+	gpu_core::hip::device_synchronize().expect("dl2");
 	cmp(name, &r1, &r2);
 }
 
 fn main() {
 	recipe_infer::init().expect("gpu init");
 
-	let x = { let __up = &host(T * NE, 7); let __ub = GpuBuffer::alloc(__up.len()).expect("x"); __ub.load(__up).expect("x"); __ub };
-	let g = { let __up = &host(NE, 11); let __ub = GpuBuffer::alloc(__up.len()).expect("g"); __ub.load(__up).expect("g"); __ub };
-	let w = { let __up = &host(8192 * NE, 13); let __ub = GpuBuffer::alloc(__up.len()).expect("w"); __ub.load(__up).expect("w"); __ub };
-	let eps = { let __up = &[1e-6f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("eps"); __ub.load(__up).expect("eps"); __ub };
-	let scale = { let __up = &[0.735f64]; let __ub = GpuBuffer::alloc(__up.len()).expect("scale"); __ub.load(__up).expect("scale"); __ub };
+	let x = {
+		let __up = &host(T * NE, 7);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("x");
+		__ub.load(__up).expect("x");
+		__ub
+	};
+	let g = {
+		let __up = &host(NE, 11);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("g");
+		__ub.load(__up).expect("g");
+		__ub
+	};
+	let w = {
+		let __up = &host(8192 * NE, 13);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("w");
+		__ub.load(__up).expect("w");
+		__ub
+	};
+	let eps = {
+		let __up = &[1e-6f64];
+		let __ub = GpuBuffer::alloc(__up.len()).expect("eps");
+		__ub.load(__up).expect("eps");
+		__ub
+	};
+	let scale = {
+		let __up = &[0.735f64];
+		let __ub = GpuBuffer::alloc(__up.len()).expect("scale");
+		__ub.load(__up).expect("scale");
+		__ub
+	};
 
-	twice("rmsnorm", T * NE, |o| gpu_rmsnorm_f64(&x, &g, &eps, T, NE, o).expect("rmsnorm"));
+	twice("rmsnorm", T * NE, |o| {
+		gpu_rmsnorm_f64(&x, &g, &eps, T, NE, o).expect("rmsnorm")
+	});
 	twice("gemm_bt 54x8192x2816", T * 8192, |o| {
 		gpu_gemm_bt_into(&x, &w, T, 8192, NE, o).expect("gemm")
 	});
@@ -160,32 +232,77 @@ fn main() {
 		let q0 = host(T * 16 * hd, 17);
 		let k0 = host(T * nkv * hd, 19);
 		let v0 = host(T * nkv * hd, 23);
-		let q = { let __up = &q0; let __ub = GpuBuffer::alloc(__up.len()).expect("q"); __ub.load(__up).expect("q"); __ub };
-		let k = { let __up = &k0; let __ub = GpuBuffer::alloc(__up.len()).expect("k"); __ub.load(__up).expect("k"); __ub };
-		let v = { let __up = &v0; let __ub = GpuBuffer::alloc(__up.len()).expect("v"); __ub.load(__up).expect("v"); __ub };
-		let theta_buf = { let __up = &[theta]; let __ub = GpuBuffer::alloc(__up.len()).expect("theta"); __ub.load(__up).expect("theta"); __ub };
+		let q = {
+			let __up = &q0;
+			let __ub = GpuBuffer::alloc(__up.len()).expect("q");
+			__ub.load(__up).expect("q");
+			__ub
+		};
+		let k = {
+			let __up = &k0;
+			let __ub = GpuBuffer::alloc(__up.len()).expect("k");
+			__ub.load(__up).expect("k");
+			__ub
+		};
+		let v = {
+			let __up = &v0;
+			let __ub = GpuBuffer::alloc(__up.len()).expect("v");
+			__ub.load(__up).expect("v");
+			__ub
+		};
+		let theta_buf = {
+			let __up = &[theta];
+			let __ub = GpuBuffer::alloc(__up.len()).expect("theta");
+			__ub.load(__up).expect("theta");
+			__ub
+		};
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
 		gpu_rope_partial(&theta_buf, T * nkv, hd, rotary, nkv, &k).expect("rope k");
-		twice(label, T * 16 * hd, |o| gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, o).expect("gqa"));
+		twice(label, T * 16 * hd, |o| {
+			gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, o).expect("gqa")
+		});
 
 		// rope itself: re-upload, rotate, download, twice.
 		let mut a = vec![0.0f64; T * 16 * hd];
 		let mut b = vec![0.0f64; T * 16 * hd];
 		q.load(&q0).expect("reload q");
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
-		unsafe { q.download_async(&mut a, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+		unsafe { q.download_async(&mut a, std::ptr::null_mut()) }.expect("dl");
+		gpu_core::hip::device_synchronize().expect("dl");
 		q.load(&q0).expect("reload q");
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).expect("rope q");
-		unsafe { q.download_async(&mut b, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+		unsafe { q.download_async(&mut b, std::ptr::null_mut()) }.expect("dl");
+		gpu_core::hip::device_synchronize().expect("dl");
 		cmp(&format!("rope {label}"), &a, &b);
 	}
 
-	let a2 = { let __up = &host(T * 2112, 29); let __ub = GpuBuffer::alloc(__up.len()).expect("a2"); __ub.load(__up).expect("a2"); __ub };
-	let b2 = { let __up = &host(T * 2112, 31); let __ub = GpuBuffer::alloc(__up.len()).expect("b2"); __ub.load(__up).expect("b2"); __ub };
-	twice("gelu_mul", T * 2112, |o| gpu_gelu_mul(&a2, &b2, T * 2112, o).expect("gelu_mul"));
-	let gu = { let __up = &host(T * 2 * 704, 37); let __ub = GpuBuffer::alloc(__up.len()).expect("gu"); __ub.load(__up).expect("gu"); __ub };
-	twice("glu_gelu", T * 704, |o| gpu_glu_gelu(&gu, T, 704, o).expect("glu_gelu"));
-	twice("add", T * NE, |o| gpu_add_into(&x, &x, T * NE, o).expect("add"));
+	let a2 = {
+		let __up = &host(T * 2112, 29);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("a2");
+		__ub.load(__up).expect("a2");
+		__ub
+	};
+	let b2 = {
+		let __up = &host(T * 2112, 31);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("b2");
+		__ub.load(__up).expect("b2");
+		__ub
+	};
+	twice("gelu_mul", T * 2112, |o| {
+		gpu_gelu_mul(&a2, &b2, T * 2112, o).expect("gelu_mul")
+	});
+	let gu = {
+		let __up = &host(T * 2 * 704, 37);
+		let __ub = GpuBuffer::alloc(__up.len()).expect("gu");
+		__ub.load(__up).expect("gu");
+		__ub
+	};
+	twice("glu_gelu", T * 704, |o| {
+		gpu_glu_gelu(&gu, T, 704, o).expect("glu_gelu")
+	});
+	twice("add", T * NE, |o| {
+		gpu_add_into(&x, &x, T * NE, o).expect("add")
+	});
 
 	let bf: Vec<u8> = host(T * NE, 41)
 		.iter()
@@ -194,7 +311,9 @@ fn main() {
 		.collect();
 	let stage = GpuBuffer::alloc_bytes(bf.len()).expect("stage");
 	stage.write_u8(&bf).expect("write");
-	twice("widen_bf16", T * NE, |o| gpu_widen_bf16(&stage, T * NE, o).expect("widen"));
+	twice("widen_bf16", T * NE, |o| {
+		gpu_widen_bf16(&stage, T * NE, o).expect("widen")
+	});
 
 	// scale_inplace: in-place, so reload between runs.
 	let mut s1 = vec![0.0f64; T * NE];
@@ -202,10 +321,12 @@ fn main() {
 	let x0 = host(T * NE, 43);
 	x.load(&x0).expect("reload");
 	gpu_scale_inplace(&scale, T * NE, &x).expect("scale");
-	unsafe { x.download_async(&mut s1, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+	unsafe { x.download_async(&mut s1, std::ptr::null_mut()) }.expect("dl");
+	gpu_core::hip::device_synchronize().expect("dl");
 	x.load(&x0).expect("reload");
 	gpu_scale_inplace(&scale, T * NE, &x).expect("scale");
-	unsafe { x.download_async(&mut s2, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+	unsafe { x.download_async(&mut s2, std::ptr::null_mut()) }.expect("dl");
+	gpu_core::hip::device_synchronize().expect("dl");
 	cmp("scale_inplace", &s1, &s2);
 
 	// scale_f64: in-place, so reload between runs.
@@ -213,12 +334,18 @@ fn main() {
 	let mut sf2 = vec![0.0f64; T * NE];
 	x.load(&x0).expect("reload");
 	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
-	unsafe { x.download_async(&mut sf1, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+	unsafe { x.download_async(&mut sf1, std::ptr::null_mut()) }.expect("dl");
+	gpu_core::hip::device_synchronize().expect("dl");
 	x.load(&x0).expect("reload");
 	gpu_scale_f64_inplace(&scale, T * NE, &x).expect("scale_f64");
-	unsafe { x.download_async(&mut sf2, std::ptr::null_mut()) }.expect("dl"); gpu_core::hip::device_synchronize().expect("dl");
+	unsafe { x.download_async(&mut sf2, std::ptr::null_mut()) }.expect("dl");
+	gpu_core::hip::device_synchronize().expect("dl");
 	cmp("scale_f64", &sf1, &sf2);
-	let err_scale = s1.iter().zip(&sf1).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+	let err_scale = s1
+		.iter()
+		.zip(&sf1)
+		.map(|(a, b)| (a - b).abs())
+		.fold(0.0f64, f64::max);
 	eprintln!("scale_f64 vs hipblasDscal   max_err={err_scale:e}");
 
 	// Custom f64 GEMM-BT: correctness (CPU oracle + rocBLAS cross-check + bit

@@ -35,7 +35,8 @@ use std::time::Instant;
 /// libvramspy.so) are hard errors, not silently-degraded fallbacks.
 fn ensure_vramspy_preloaded() -> Result<()> {
 	// SAFETY: dlsym query only, no side effects on the process's allocations.
-	let loaded = !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_loaded".as_ptr()) }.is_null();
+	let loaded =
+		!unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_loaded".as_ptr()) }.is_null();
 	if loaded {
 		return Ok(());
 	}
@@ -47,9 +48,17 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 		.parent()
 		.and_then(|p| p.parent())
 		.map(|p| p.join("libvramspy.so"))
-		.ok_or_else(|| anyhow!("could not resolve libvramspy.so path from current_exe {}", exe.display()))?;
+		.ok_or_else(|| {
+			anyhow!(
+				"could not resolve libvramspy.so path from current_exe {}",
+				exe.display()
+			)
+		})?;
 	if !shim.exists() {
-		bail!("vramspy: {} not found — build it with `cargo build --release -p vramspy`", shim.display());
+		bail!(
+			"vramspy: {} not found — build it with `cargo build --release -p vramspy`",
+			shim.display()
+		);
 	}
 	let ld_preload = match std::env::var("LD_PRELOAD") {
 		Ok(existing) if !existing.is_empty() => format!("{existing}:{}", shim.display()),
@@ -61,7 +70,11 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 		std::env::set_var("VRAMSPY_REEXEC", "1");
 	}
 	eprintln!("re-exec with vramspy");
-	Err(anyhow!(std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).exec()))
+	Err(anyhow!(
+		std::process::Command::new(std::env::current_exe()?)
+			.args(std::env::args_os().skip(1))
+			.exec()
+	))
 }
 
 // DEBUG timing accumulators (ns): disk read, H2D upload (write_u8), widen kernel.
@@ -111,9 +124,19 @@ struct Dims {
 }
 fn dims(l: usize) -> Dims {
 	if l % 6 == 5 {
-		Dims { hd: 512, nkv: 2, rotary: 128, has_v: false }
+		Dims {
+			hd: 512,
+			nkv: 2,
+			rotary: 128,
+			has_v: false,
+		}
 	} else {
-		Dims { hd: 256, nkv: 8, rotary: 256, has_v: true }
+		Dims {
+			hd: 256,
+			nkv: 8,
+			rotary: 256,
+			has_v: true,
+		}
 	}
 }
 
@@ -144,7 +167,10 @@ const SLOT_BYTES: usize = GU_BYTES + DN_BYTES;
 // Byte-granular device view (GpuBuffer::view is f64-granular; all our bf16
 // offsets are multiples of NE*2 = 5632, so /8 is exact — asserted).
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
-	assert!(off_bytes % 8 == 0 && len_bytes % 8 == 0, "bview: unaligned {off_bytes}/{len_bytes}");
+	assert!(
+		off_bytes % 8 == 0 && len_bytes % 8 == 0,
+		"bview: unaligned {off_bytes}/{len_bytes}"
+	);
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
 
@@ -174,7 +200,9 @@ fn arm_watchdog() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
 			}
 			let b = BEAT.load(Ordering::Relaxed);
 			if b == last {
-				eprintln!("\nLOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting.");
+				eprintln!(
+					"\nLOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting."
+				);
 				std::process::abort();
 			}
 			last = b;
@@ -321,7 +349,14 @@ impl Model {
 	}
 
 	// Disk → device through the reusable host buffer: no per-read alloc/zero.
-	fn read_into(&self, t: &Tensor, off: usize, len: usize, dst: &GpuBuffer, dst_off: usize) -> Result<()> {
+	fn read_into(
+		&self,
+		t: &Tensor,
+		off: usize,
+		len: usize,
+		dst: &GpuBuffer,
+		dst_off: usize,
+	) -> Result<()> {
 		let mut rb = self.rbuf.borrow_mut();
 		if rb.len() < len {
 			rb.resize(len, 0);
@@ -339,9 +374,14 @@ impl Model {
 
 	// Decode a small tensor fully to host f64.
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self
+			.big
+			.get(name)
+			.ok_or_else(|| anyhow!("missing {name}"))?;
 		let raw = self.read_bytes(t, 0, t.nbytes)?;
-		Ok(raw.chunks_exact(2).map(|c| bf16(u16::from_le_bytes([c[0], c[1]]))).collect())
+		Ok(raw.chunks_exact(2)
+			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
+			.collect())
 	}
 
 	// Widen `n` bf16 elems at `off_bytes` of a device bf16 buffer into the shared
@@ -365,7 +405,10 @@ impl Model {
 	// Whole-tensor weight through the waterfall: VRAM home widens in place, RAM
 	// home bounces to stage, DISK home streams the shard.
 	fn stream(&self, name: &str) -> Result<GpuBuffer> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self
+			.big
+			.get(name)
+			.ok_or_else(|| anyhow!("missing {name}"))?;
 		let n = t.nbytes / 2;
 		match self.store.home(name) {
 			Some(Home::Vram(dev)) => Ok(self.widen_from(dev, 0, n)),
@@ -394,8 +437,14 @@ impl Model {
 			}
 			_ => {
 				E_DISK.fetch_add(1, Ordering::Relaxed);
-				let gu = self.big.get(&layer_name(l, "experts.gate_up_proj")).ok_or_else(|| anyhow!("no gate_up {l}"))?;
-				let dn = self.big.get(&layer_name(l, "experts.down_proj")).ok_or_else(|| anyhow!("no down {l}"))?;
+				let gu = self
+					.big
+					.get(&layer_name(l, "experts.gate_up_proj"))
+					.ok_or_else(|| anyhow!("no gate_up {l}"))?;
+				let dn = self
+					.big
+					.get(&layer_name(l, "experts.down_proj"))
+					.ok_or_else(|| anyhow!("no down {l}"))?;
 				self.read_into(gu, e * GU_BYTES, GU_BYTES, &self.stage, 0)?;
 				self.read_into(dn, e * DN_BYTES, DN_BYTES, &self.stage, GU_BYTES)?;
 				Ok(bview(&self.stage, 0, SLOT_BYTES))
@@ -407,19 +456,34 @@ impl Model {
 fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 	if plus_one {
 		let v: Vec<f64> = vals.iter().map(|x| x + 1.0).collect();
-		Ok({ let __up = &v; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub })
+		Ok({
+			let __up = &v;
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		})
 	} else {
-		Ok({ let __up = vals; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub })
+		Ok({
+			let __up = vals;
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		})
 	}
 }
 
 fn load_model(dir: &PathBuf) -> Result<Model> {
 	let index: serde_json::Value =
 		serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
-	let wm = index["weight_map"].as_object().ok_or_else(|| anyhow!("no weight_map"))?;
+	let wm = index["weight_map"]
+		.as_object()
+		.ok_or_else(|| anyhow!("no weight_map"))?;
 
 	// Open each shard once; parse its header for byte ranges.
-	let mut shard_paths: Vec<String> = wm.values().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+	let mut shard_paths: Vec<String> = wm
+		.values()
+		.map(|v| v.as_str().unwrap_or("").to_string())
+		.collect();
 	shard_paths.sort();
 	shard_paths.dedup();
 	let mut shard_idx: HashMap<String, usize> = HashMap::new();
@@ -435,7 +499,10 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		let hlen = u64::from_le_bytes(lenb) as usize;
 		let mut hdr = vec![0u8; 8 + hlen];
 		f.read_exact_at(&mut hdr, 0)?;
-		let SafetensorsHeader { data_start, entries } = parse_safetensors_header(&hdr)?;
+		let SafetensorsHeader {
+			data_start,
+			entries,
+		} = parse_safetensors_header(&hdr)?;
 		for e in entries {
 			if !e.name.starts_with("model.decoder.") {
 				continue; // text path only; skip encoder/vision tower
@@ -445,7 +512,12 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 			}
 			big.insert(
 				e.name,
-				Tensor { shard: i, off: data_start + e.begin, nbytes: e.end - e.begin, shape: e.shape },
+				Tensor {
+					shard: i,
+					off: data_start + e.begin,
+					nbytes: e.end - e.begin,
+					shape: e.shape,
+				},
 			);
 		}
 		shards.push(f);
@@ -454,14 +526,25 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 	// Norm convention: gemma stores gamma as (1+w) when the mean is ~0; if a
 	// checkpoint has folded the +1 the mean is ~1. Decide from layer-0 input norm.
 	let probe: Vec<f64> = {
-		let t = big.get("model.decoder.layers.0.input_layernorm.weight").ok_or_else(|| anyhow!("no probe norm"))?;
+		let t = big
+			.get("model.decoder.layers.0.input_layernorm.weight")
+			.ok_or_else(|| anyhow!("no probe norm"))?;
 		let mut buf = vec![0u8; t.nbytes];
 		shards[t.shard].read_exact_at(&mut buf, t.off as u64)?;
-		buf.chunks_exact(2).map(|c| bf16(u16::from_le_bytes([c[0], c[1]]))).collect()
+		buf.chunks_exact(2)
+			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
+			.collect()
 	};
 	let mean = probe.iter().sum::<f64>() / probe.len() as f64;
 	let plus_one = mean.abs() < 0.5;
-	eprintln!("norm probe mean={mean:.4} -> {}", if plus_one { "(1+w) HF convention" } else { "folded x*w" });
+	eprintln!(
+		"norm probe mean={mean:.4} -> {}",
+		if plus_one {
+			"(1+w) HF convention"
+		} else {
+			"folded x*w"
+		}
+	);
 
 	eprintln!("allocating stage+win...");
 	let mut m = Model {
@@ -481,9 +564,24 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		gis: Vec::new(),
 		pe: Vec::new(),
 		emb: Vec::new(),
-		eps: { let __up = &[EPS]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
-		theta_full: { let __up = &[1_000_000.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
-		theta_slide: { let __up = &[10_000.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub },
+		eps: {
+			let __up = &[EPS];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		},
+		theta_full: {
+			let __up = &[1_000_000.0f64];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		},
+		theta_slide: {
+			let __up = &[10_000.0f64];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		},
 		ls_dev: Vec::new(),
 	};
 
@@ -501,19 +599,44 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		m.gis.push(m.small_f64(&p("router.scale"))?);
 		m.pe.push(m.small_f64(&p("router.per_expert_scale"))?);
 		let lsv = m.small_f64(&p("layer_scalar"))?[0];
-		m.ls_dev.push({ let __up = &[lsv]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub });
+		m.ls_dev.push({
+			let __up = &[lsv];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		});
 	}
 
 	// Globals.
 	eprintln!("\rglobals + embedding table...");
 	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
-	m.sc_pre = upload_gamma(&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?, plus_one)?;
-	m.sc_gate = { let __up = &m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
-	m.sc_up = { let __up = &m.small_f64("model.decoder.self_conditioning.up_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
-	m.sc_down = { let __up = &m.small_f64("model.decoder.self_conditioning.down_proj.weight")?; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+	m.sc_pre = upload_gamma(
+		&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?,
+		plus_one,
+	)?;
+	m.sc_gate = {
+		let __up = &m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?;
+		let __ub = GpuBuffer::alloc(__up.len())?;
+		__ub.load(__up)?;
+		__ub
+	};
+	m.sc_up = {
+		let __up = &m.small_f64("model.decoder.self_conditioning.up_proj.weight")?;
+		let __ub = GpuBuffer::alloc(__up.len())?;
+		__ub.load(__up)?;
+		__ub
+	};
+	m.sc_down = {
+		let __up = &m.small_f64("model.decoder.self_conditioning.down_proj.weight")?;
+		let __ub = GpuBuffer::alloc(__up.len())?;
+		__ub.load(__up)?;
+		__ub
+	};
 
 	// Embedding table: keep raw bf16 bytes resident on host.
-	let et = m.big.get("model.decoder.embed_tokens.weight").ok_or_else(|| anyhow!("no embed_tokens"))?;
+	let et =
+		m.big.get("model.decoder.embed_tokens.weight")
+			.ok_or_else(|| anyhow!("no embed_tokens"))?;
 	if et.shape != vec![VOCAB, NE] {
 		bail!("embed_tokens shape {:?}", et.shape);
 	}
@@ -548,7 +671,14 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 	beat();
 	gpu_gemm_bt_f64(&ar.act, &m.win.view(0, NE * NFF), t, NE, NFF, &ar.mlp0)?;
 	beat();
-	gpu_gemm_bt_f64(&ar.moe_xg, &m.win.view(0, 2 * NFFE * NE), t, 2 * NFFE, NE, &ar.moe_gu)?;
+	gpu_gemm_bt_f64(
+		&ar.moe_xg,
+		&m.win.view(0, 2 * NFFE * NE),
+		t,
+		2 * NFFE,
+		NE,
+		&ar.moe_gu,
+	)?;
 	gpu_core::hip::device_synchronize()?;
 	beat();
 	Ok(())
@@ -569,17 +699,27 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	for l in 0..NL {
 		for name in fixed_names(l) {
 			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
-			store.place(&name, t.nbytes, |dst| m.shards[t.shard].read_exact_at(dst, t.off as u64))?;
+			store.place(&name, t.nbytes, |dst| {
+				m.shards[t.shard].read_exact_at(dst, t.off as u64)
+			})?;
 			beat();
 		}
 	}
 	for e in 0..NEXP {
 		for l in 0..NL {
-			let gu = m.big.get(&layer_name(l, "experts.gate_up_proj")).ok_or_else(|| anyhow!("no gate_up {l}"))?;
-			let dn = m.big.get(&layer_name(l, "experts.down_proj")).ok_or_else(|| anyhow!("no down {l}"))?;
+			let gu =
+				m.big.get(&layer_name(l, "experts.gate_up_proj"))
+					.ok_or_else(|| anyhow!("no gate_up {l}"))?;
+			let dn =
+				m.big.get(&layer_name(l, "experts.down_proj"))
+					.ok_or_else(|| anyhow!("no down {l}"))?;
 			store.place(&ekey(l, e), SLOT_BYTES, |dst| {
-				m.shards[gu.shard].read_exact_at(&mut dst[..GU_BYTES], (gu.off + e * GU_BYTES) as u64)?;
-				m.shards[dn.shard].read_exact_at(&mut dst[GU_BYTES..], (dn.off + e * DN_BYTES) as u64)
+				m.shards[gu.shard].read_exact_at(
+					&mut dst[..GU_BYTES],
+					(gu.off + e * GU_BYTES) as u64,
+				)?;
+				m.shards[dn.shard]
+					.read_exact_at(&mut dst[GU_BYTES..], (dn.off + e * DN_BYTES) as u64)
 			})?;
 			beat();
 		}
@@ -592,7 +732,9 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	for name in [
 		"model.decoder.embed_tokens.weight".to_string(),
 		fixed_names(0).remove(0),
-		fixed_names(NL - 1).pop().ok_or_else(|| anyhow!("no names"))?,
+		fixed_names(NL - 1)
+			.pop()
+			.ok_or_else(|| anyhow!("no names"))?,
 	] {
 		if let Some(Home::Vram(dev)) = m.store.home(&name) {
 			let t = &m.big[&name];
@@ -606,7 +748,9 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 				let mut got = vec![0u8; n];
 				bview(dev, off, n).download_u8(&mut got)?;
 				if got != want {
-					bail!("waterfall {name} stale at byte {off}: upload not visible to GPU reads");
+					bail!(
+						"waterfall {name} stale at byte {off}: upload not visible to GPU reads"
+					);
 				}
 			}
 		}
@@ -655,15 +799,33 @@ fn layer(
 	let nm = &m.norms[l];
 	let d = dims(l);
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, NQH * d.hd, d.nkv * d.hd);
-	let theta = if l % 6 == 5 { &m.theta_full } else { &m.theta_slide };
+	let theta = if l % 6 == 5 {
+		&m.theta_full
+	} else {
+		&m.theta_slide
+	};
 	// Attention. Full layers have no v_proj: v reuses the k_proj weight window.
 	let _ta = Instant::now();
 	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, NE, &ar.x)?;
-	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, NE, &ar.q)?;
+	gpu_gemm_bt_f64(
+		&ar.x,
+		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
+		t,
+		qd,
+		NE,
+		&ar.q,
+	)?;
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &wk, t, kd, NE, &ar.k)?;
 	if d.has_v {
-		gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, NE, &ar.v)?;
+		gpu_gemm_bt_f64(
+			&ar.x,
+			&m.stream(&layer_name(l, "self_attn.v_proj.weight"))?,
+			t,
+			kd,
+			NE,
+			&ar.v,
+		)?;
 	} else {
 		gpu_gemm_bt_f64(&ar.x, &wk, t, kd, NE, &ar.v)?;
 	}
@@ -673,7 +835,14 @@ fn layer(
 	gpu_rope_partial(theta, t * NQH, hd, d.rotary, NQH, &ar.q)?;
 	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
 	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, NQH, nkv, hd, prefix, &ar.attn)?;
-	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, NE, qd, &ar.o)?;
+	gpu_gemm_bt_f64(
+		&ar.attn,
+		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
+		t,
+		NE,
+		qd,
+		&ar.o,
+	)?;
 	gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, NE, &ar.o)?;
 	gpu_add_into(&ar.o, h_in, t * NE, &ar.attn_out)?;
 	acc(&ATTN_NS, _ta);
@@ -681,10 +850,31 @@ fn layer(
 	// Shared MLP branch.
 	let _tm = Instant::now();
 	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, NE, &ar.cms)?;
-	gpu_gemm_bt_f64(&ar.cms, &m.stream(&layer_name(l, "mlp.gate_proj.weight"))?, t, NFF, NE, &ar.g)?;
-	gpu_gemm_bt_f64(&ar.cms, &m.stream(&layer_name(l, "mlp.up_proj.weight"))?, t, NFF, NE, &ar.u)?;
+	gpu_gemm_bt_f64(
+		&ar.cms,
+		&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
+		t,
+		NFF,
+		NE,
+		&ar.g,
+	)?;
+	gpu_gemm_bt_f64(
+		&ar.cms,
+		&m.stream(&layer_name(l, "mlp.up_proj.weight"))?,
+		t,
+		NFF,
+		NE,
+		&ar.u,
+	)?;
 	gpu_gelu_mul(&ar.g, &ar.u, t * NFF, &ar.act)?;
-	gpu_gemm_bt_f64(&ar.act, &m.stream(&layer_name(l, "mlp.down_proj.weight"))?, t, NE, NFF, &ar.mlp0)?;
+	gpu_gemm_bt_f64(
+		&ar.act,
+		&m.stream(&layer_name(l, "mlp.down_proj.weight"))?,
+		t,
+		NE,
+		NFF,
+		&ar.mlp0,
+	)?;
 	gpu_rmsnorm_f64(&ar.mlp0, &nm["pf1"], &m.eps, t, NE, &ar.mlp)?;
 	acc(&MLP_NS, _tm);
 
@@ -694,8 +884,14 @@ fn layer(
 	let _rt = Instant::now();
 	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
 	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
-	unsafe { ar.attn_out.download_async(&mut ao_host, std::ptr::null_mut()) }?;
-	unsafe { ar.cmoes.download_async(&mut cmoes_host, std::ptr::null_mut()) }?;
+	unsafe {
+		ar.attn_out
+			.download_async(&mut ao_host, std::ptr::null_mut())
+	}?;
+	unsafe {
+		ar.cmoes
+			.download_async(&mut cmoes_host, std::ptr::null_mut())
+	}?;
 	gpu_core::hip::device_synchronize()?;
 	acc(&MOE_RT_NS, _rt);
 	let _tr = Instant::now();
@@ -714,7 +910,10 @@ fn layer(
 		}
 		softmax(&mut rl);
 		let mut idx: Vec<usize> = (0..NEXP).collect();
-		idx.sort_by(|a, b| rl[*b].partial_cmp(&rl[*a]).unwrap_or(std::cmp::Ordering::Equal));
+		idx.sort_by(|a, b| {
+			rl[*b].partial_cmp(&rl[*a])
+				.unwrap_or(std::cmp::Ordering::Equal)
+		});
 		idx.truncate(USED);
 		let ws: f64 = idx.iter().map(|&e| rl[e]).sum();
 		for &e in &idx {
@@ -740,7 +939,10 @@ fn layer(
 		let dn_w = m.widen_from(&es, GU_BYTES, NE * NFFE);
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, NE, NFFE, &ar.moe_dv)?;
 		let _rt = Instant::now();
-		unsafe { ar.moe_dv.download_async(&mut dv_host[..np * NE], std::ptr::null_mut()) }?;
+		unsafe {
+			ar.moe_dv
+				.download_async(&mut dv_host[..np * NE], std::ptr::null_mut())
+		}?;
 		gpu_core::hip::device_synchronize()?;
 		acc(&MOE_RT_NS, _rt);
 		for (i, &(p, w)) in poslist.iter().enumerate() {
@@ -785,10 +987,14 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 			}
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, NE, &ar.lm_out)?;
-		unsafe { ar.lm_out.download_async(&mut out_host[..ncanvas * cn], std::ptr::null_mut()) }?;
+		unsafe {
+			ar.lm_out
+				.download_async(&mut out_host[..ncanvas * cn], std::ptr::null_mut())
+		}?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
-			logits[p * VOCAB + c0..p * VOCAB + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
+			logits[p * VOCAB + c0..p * VOCAB + c0 + cn]
+				.copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
 		}
 		c0 += cn;
 	}
@@ -828,10 +1034,13 @@ fn main() -> Result<()> {
 	ensure_vramspy_preloaded()?;
 
 	let dir = PathBuf::from("/home/nate/Desktop/gemma4/diffusiongemma-26B-A4B-it");
-	let prompt = std::env::args().nth(1).unwrap_or_else(|| "The capital of France is".to_string());
+	let prompt = std::env::args()
+		.nth(1)
+		.unwrap_or_else(|| "The capital of France is".to_string());
 
 	// Vocab: id->token and token->id from tokenizer.json (model.vocab + added).
-	let tok_json: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("tokenizer.json"))?)?;
+	let tok_json: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(dir.join("tokenizer.json"))?)?;
 	let mut vocab = vec![String::new(); VOCAB];
 	let mut rev: HashMap<String, u32> = HashMap::new();
 	if let Some(map) = tok_json["model"]["vocab"].as_object() {
@@ -891,7 +1100,10 @@ fn main() -> Result<()> {
 				c.env("VRAM_PROBE", want.to_string());
 				unsafe {
 					c.pre_exec(|| {
-						let z = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+						let z = libc::rlimit {
+							rlim_cur: 0,
+							rlim_max: 0,
+						};
 						libc::setrlimit(libc::RLIMIT_CORE, &z);
 						Ok(())
 					});
@@ -902,12 +1114,18 @@ fn main() -> Result<()> {
 			if status.success() {
 				break;
 			}
-			eprintln!("claim probe: {:.2} GB unmappable, backing off", want as f64 / (1u64 << 30) as f64);
+			eprintln!(
+				"claim probe: {:.2} GB unmappable, backing off",
+				want as f64 / (1u64 << 30) as f64
+			);
 			want -= want / 16;
 		}
-		eprintln!("claim: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
-		let slab = gpu_core::memory::claim_device_arena_bytes(want)
-			.context("claim device arena")?;
+		eprintln!(
+			"claim: {:.2} GB (probe-verified)",
+			want as f64 / (1u64 << 30) as f64
+		);
+		let slab =
+			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 		let w = Waterfall::from_arena(slab);
 		eprintln!("[right after claim] {}", gpu_core::memory::ledger_report());
 		w
@@ -952,7 +1170,9 @@ fn main() -> Result<()> {
 		for (p, &tk) in toks.iter().enumerate() {
 			let b = tk as usize * NE * 2;
 			for x in 0..NE {
-				base[p * NE + x] = bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scl;
+				base[p * NE + x] =
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]))
+						* scl;
 			}
 		}
 		ar.ha.load(&base)?;
@@ -967,7 +1187,10 @@ fn main() -> Result<()> {
 				for &(id, pr) in top {
 					let b = id * NE * 2;
 					for x in 0..NE {
-						soft[c * NE + x] += pr * bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
+						soft[c * NE + x] += pr * bf16(u16::from_le_bytes([
+							m.emb[b + x * 2],
+							m.emb[b + x * 2 + 1],
+						]));
 					}
 				}
 				for x in 0..NE {
@@ -983,7 +1206,13 @@ fn main() -> Result<()> {
 			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, clen, &ar.cur)?;
 			gpu_rmsnorm_f64_nogamma(&ar.cur, &m.eps, NCANVAS, NE, &ar.normed)?;
 		} else {
-			gpu_rmsnorm_f64_nogamma(&ar.ha.view(coff, clen), &m.eps, NCANVAS, NE, &ar.normed)?;
+			gpu_rmsnorm_f64_nogamma(
+				&ar.ha.view(coff, clen),
+				&m.eps,
+				NCANVAS,
+				NE,
+				&ar.normed,
+			)?;
 		}
 		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
 
@@ -992,7 +1221,9 @@ fn main() -> Result<()> {
 			let mut v = vec![0.0f64; n];
 			unsafe { b.view(0, n).download_async(&mut v, std::ptr::null_mut()) }?;
 			gpu_core::hip::device_synchronize()?;
-			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x100000001b3)))
+			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| {
+				(h ^ x.to_bits()).wrapping_mul(0x100000001b3)
+			}))
 		};
 		if step == 0 {
 			eprintln!("[hash] step0 input {:016x}", bithash(&ar.ha, t * NE)?);
@@ -1000,7 +1231,11 @@ fn main() -> Result<()> {
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..NL {
-			eprint!("\rstep {step} layer {}/{NL} ({:.0}s)", l + 1, t0.elapsed().as_secs_f64());
+			eprint!(
+				"\rstep {step} layer {}/{NL} ({:.0}s)",
+				l + 1,
+				t0.elapsed().as_secs_f64()
+			);
 			layer(&m, l, src, dst, t, prefix, &ar)?;
 			std::mem::swap(&mut src, &mut dst);
 			if step == 0 {
@@ -1018,7 +1253,14 @@ fn main() -> Result<()> {
 		}
 
 		// LM head over canvas positions.
-		gpu_rmsnorm_f64(&hbuf.view(coff, clen), &m.decoder_norm, &m.eps, NCANVAS, NE, &ar.hfs)?;
+		gpu_rmsnorm_f64(
+			&hbuf.view(coff, clen),
+			&m.decoder_norm,
+			&m.eps,
+			NCANVAS,
+			NE,
+			&ar.hfs,
+		)?;
 		let logits = lm_head(&m, &ar.hfs, NCANVAS, &ar)?;
 
 		// Sample each canvas position (top-50, temperature, xorshift) — host.
@@ -1032,7 +1274,8 @@ fn main() -> Result<()> {
 			cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 			cand.truncate(50);
 			let ml = cand[0].1;
-			let mut probs: Vec<f64> = cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
+			let mut probs: Vec<f64> =
+				cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
 			let sum: f64 = probs.iter().sum();
 			for x in probs.iter_mut() {
 				*x /= sum;
@@ -1051,14 +1294,22 @@ fn main() -> Result<()> {
 				}
 			}
 			pred[c] = sel as u32;
-			let mut top: Vec<(usize, f64)> = cand.iter().zip(probs.iter()).take(8).map(|(&(id, _), &pr)| (id, pr)).collect();
+			let mut top: Vec<(usize, f64)> = cand
+				.iter()
+				.zip(probs.iter())
+				.take(8)
+				.map(|(&(id, _), &pr)| (id, pr))
+				.collect();
 			let s8: f64 = top.iter().map(|&(_, pr)| pr).sum();
 			for e in top.iter_mut() {
 				e.1 /= s8;
 			}
 			sck[c] = top;
 		}
-		let text: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
+		let text: String = pred
+			.iter()
+			.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
+			.collect();
 		eprintln!("step {step} ({:.0}s): {text}", t0.elapsed().as_secs_f64());
 	}
 
@@ -1068,19 +1319,31 @@ fn main() -> Result<()> {
 	let s = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
 	eprintln!(
 		"[breakdown] total={tot:.1}s  disk={:.1}s  h2d(write_u8)={:.1}s  widen(launch)={:.1}s",
-		s(&DISK_NS), s(&H2D_NS), s(&WIDEN_NS),
+		s(&DISK_NS),
+		s(&H2D_NS),
+		s(&WIDEN_NS),
 	);
 	eprintln!(
 		"[sections]  attn={:.1}s  mlp={:.1}s  moe={:.1}s (route={:.1}s roundtrips={:.1}s)  lm_head={:.1}s",
-		s(&ATTN_NS), s(&MLP_NS), s(&MOE_NS), s(&ROUTE_NS), s(&MOE_RT_NS), s(&LM_NS),
+		s(&ATTN_NS),
+		s(&MLP_NS),
+		s(&MOE_NS),
+		s(&ROUTE_NS),
+		s(&MOE_RT_NS),
+		s(&LM_NS),
 	);
 	eprintln!(
 		"[experts]   from VRAM={}  from RAM={}  from DISK={}",
-		E_VRAM.load(Ordering::Relaxed), E_RAM.load(Ordering::Relaxed), E_DISK.load(Ordering::Relaxed),
+		E_VRAM.load(Ordering::Relaxed),
+		E_RAM.load(Ordering::Relaxed),
+		E_DISK.load(Ordering::Relaxed),
 	);
 	m.store.report();
 
-	let out: String = pred.iter().map(|&tk| vocab[tk as usize].replace('\u{2581}', " ")).collect();
+	let out: String = pred
+		.iter()
+		.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
+		.collect();
 	println!("\n=== OUTPUT ===\n{out}");
 	eprintln!("{}", gpu_core::memory::ledger_report());
 	// exit → free all: the claim (the process's ONE owned device allocation)
@@ -1088,7 +1351,10 @@ fn main() -> Result<()> {
 	// skipped and VRAM only returns via process death.
 	drop(ar);
 	drop(m);
-	eprintln!("exit: device frees {}", gpu_core::memory::device_free_count());
+	eprintln!(
+		"exit: device frees {}",
+		gpu_core::memory::device_free_count()
+	);
 	recipe_infer::shutdown();
 	Ok(())
 }

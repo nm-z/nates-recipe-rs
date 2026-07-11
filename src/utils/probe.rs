@@ -566,7 +566,7 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-	for xdg in std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).into_iter() {
+	if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
 		return Ok(PathBuf::from(xdg).join("recipe"));
 	}
 	let home = std::env::var("HOME").map_err(|_e| anyhow!("probe: HOME not set"))?;

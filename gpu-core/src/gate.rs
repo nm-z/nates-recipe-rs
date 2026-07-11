@@ -57,10 +57,10 @@ fn open_lock() -> std::io::Result<std::fs::File> {
 	let uid = unsafe { libc::getuid() };
 	let path = std::path::PathBuf::from(format!("/run/user/{uid}")).join(LOCK_NAME);
 	let f = std::fs::OpenOptions::new()
-		.read(0 == 0)
-		.write(0 == 0)
-		.create(0 == 0)
-		.truncate(0 != 0)
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(false)
 		.open(&path)
 		.map_err(|e| std::io::Error::other(format!("open {}: {e}", path.display())))?;
 	let fd = f.as_raw_fd();
@@ -186,7 +186,7 @@ pub fn acquire() {
 	let None = std::num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else { return };
 	let mut g = locked();
 	match g.grip {
-		Grip::Taken => return,
+		Grip::Taken => {}
 		Grip::Free => mark_taken(&mut g),
 	}
 }
@@ -204,7 +204,7 @@ fn mark_taken(g: &mut Gate) {
 pub fn release() {
 	let mut g = locked();
 	match g.grip {
-		Grip::Free => return,
+		Grip::Free => {}
 		Grip::Taken => shutdown(&mut g),
 	}
 }

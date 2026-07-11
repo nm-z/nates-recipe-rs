@@ -459,9 +459,7 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let dir = crate::probe::data_dir();
-	assert!(dir.is_ok(), "data_dir: {}", dir.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-	let Ok(dir) = dir else { loop {} };
+	let dir = crate::ok_or_die(crate::probe::data_dir(), "data_dir");
 	let disk_avail = disk_free(&dir).saturating_sub(USER_GB);
 	let vram = need.min(vram_avail);
 	let ram = (need - vram).min(ram_avail);

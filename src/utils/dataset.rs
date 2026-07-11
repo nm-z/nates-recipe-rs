@@ -117,9 +117,7 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let r = Mat::from_shape_vec([n, new_ncols], data);
-	assert!(r.is_ok(), "collapse_onehot: {}", r.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
-	let Ok(x) = r else { loop {} };
+	let x = crate::ok_or_die(Mat::from_shape_vec([n, new_ncols], data), "collapse_onehot");
 	CollapsedOnehot { x, embed_cols, vocab: offset }
 }
 
@@ -268,10 +266,7 @@ impl DataInner {
 	}
 
 	pub fn datasets(&self) -> Datasets {
-		let r = self.try_datasets();
-		assert!(r.is_ok(), "Data::datasets: {}", r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-		let Ok(v) = r else { loop {} };
-		v
+		crate::ok_or_die(self.try_datasets(), "Data::datasets")
 	}
 
 	pub(crate) fn try_datasets(&self) -> anyhow::Result<Datasets> {
