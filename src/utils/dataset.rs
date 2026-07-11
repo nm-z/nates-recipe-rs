@@ -29,6 +29,27 @@ pub struct Data {
 	pub(crate) inner: Box<DataInner>,
 }
 
+thread_local! {
+	static PARKED_DATA: std::cell::RefCell<Option<Box<DataInner>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+impl Drop for Data {
+	fn drop(&mut self) {
+		let inner = std::mem::replace(&mut self.inner, Box::new(DataInner::blank()));
+		PARKED_DATA.with(|slot| slot.borrow_mut().replace(inner));
+	}
+}
+
+pub(crate) fn parked_data() -> Data {
+	let inner = PARKED_DATA.with(|slot| slot.borrow_mut().take());
+	let inner = crate::some_or_die(
+		inner,
+		"run: no data configured — chain recipe.data(path) before run(data, …)",
+	);
+	Data { inner }
+}
+
 pub struct Datasets {
 	pub train: Dataset,
 	pub test: Option<Dataset>,
@@ -75,6 +96,25 @@ pub struct DataInner {
 	raw_test_headers: Option<Vec<String>>,
 	pre_kinds: pantry::encode::PreKinds,
 	deferred: Option<anyhow::Error>,
+}
+
+impl DataInner {
+	fn blank() -> DataInner {
+		DataInner {
+			target: String::new(),
+			target_names: Vec::new(),
+			attrs: Vec::new(),
+			rows: Vec::new(),
+			sources: Vec::new(),
+			test_path: None,
+			split_frac: None,
+			exclude: Vec::new(),
+			raw_test_rows: None,
+			raw_test_headers: None,
+			pre_kinds: Vec::new(),
+			deferred: None,
+		}
+	}
 }
 
 impl std::ops::Deref for Data {
@@ -190,20 +230,7 @@ pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 impl Data {
 	pub fn load(path: &str) -> Data {
 		let data = Data {
-			inner: Box::new(DataInner {
-				target: String::new(),
-				target_names: Vec::new(),
-				attrs: Vec::new(),
-				rows: Vec::new(),
-				sources: Vec::new(),
-				test_path: None,
-				split_frac: None,
-				exclude: Vec::new(),
-				raw_test_rows: None,
-				raw_test_headers: None,
-				pre_kinds: Vec::new(),
-				deferred: None,
-			}),
+			inner: Box::new(DataInner::blank()),
 		};
 		data.set(path)
 	}

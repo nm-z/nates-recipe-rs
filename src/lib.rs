@@ -42,8 +42,8 @@ pub use model::{
 };
 #[doc(hidden)]
 pub use model::{
-	Activation, IntoLayer, LayerSpec, Prepared, RunData, SavePath, elu, gelu, leak, linear,
-	prelu, relu, selu, sig, silu, swish, tanh,
+	Activation, DataHandle, IntoLayer, LayerSpec, ModelArg, ModelHandle, Prepared, RunArg,
+	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
 pub struct Recipe;
@@ -63,8 +63,9 @@ impl Recipe {
 	pub fn train(&self) -> Train {
 		Train::new()
 	}
-	pub fn eval(&self, model: &Model, data: &dyn RunData) -> Vec<f64> {
-		model.eval(data)
+	pub fn eval(&self, model: impl ModelArg, data: impl RunArg) -> Vec<f64> {
+		let mh = model.resolve();
+		mh.get().eval(data)
 	}
 }
 
@@ -77,8 +78,9 @@ pub fn model() -> Model {
 pub fn train() -> Train {
 	Train::new()
 }
-pub fn eval(model: &Model, data: &dyn RunData) -> Vec<f64> {
-	model.eval(data)
+pub fn eval(model: impl ModelArg, data: impl RunArg) -> Vec<f64> {
+	let mh = model.resolve();
+	mh.get().eval(data)
 }
 
 pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> T {

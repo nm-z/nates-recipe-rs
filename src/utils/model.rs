@@ -151,6 +151,84 @@ impl RunData for Option<Dataset> {
 	}
 }
 
+pub enum DataHandle<'a> {
+	Ref(&'a dyn RunData),
+	Parked(crate::dataset::Data),
+}
+
+impl DataHandle<'_> {
+	pub fn get(&self) -> &dyn RunData {
+		match self {
+			DataHandle::Ref(d) => *d,
+			DataHandle::Parked(d) => d,
+		}
+	}
+}
+
+pub trait RunArg {
+	fn resolve(&self) -> DataHandle<'_>;
+}
+
+impl RunArg for &crate::dataset::Data {
+	fn resolve(&self) -> DataHandle<'_> {
+		DataHandle::Ref(*self)
+	}
+}
+
+impl RunArg for &Dataset {
+	fn resolve(&self) -> DataHandle<'_> {
+		DataHandle::Ref(*self)
+	}
+}
+
+impl RunArg for &Option<Dataset> {
+	fn resolve(&self) -> DataHandle<'_> {
+		DataHandle::Ref(*self)
+	}
+}
+
+impl RunArg for &dyn RunData {
+	fn resolve(&self) -> DataHandle<'_> {
+		DataHandle::Ref(*self)
+	}
+}
+
+impl<F: for<'a> Fn(&'a str) -> crate::dataset::Data> RunArg for F {
+	fn resolve(&self) -> DataHandle<'_> {
+		DataHandle::Parked(crate::dataset::parked_data())
+	}
+}
+
+pub enum ModelHandle<'a> {
+	Ref(&'a Model),
+	Parked(Model),
+}
+
+impl ModelHandle<'_> {
+	pub fn get(&self) -> &Model {
+		match self {
+			ModelHandle::Ref(m) => m,
+			ModelHandle::Parked(m) => m,
+		}
+	}
+}
+
+pub trait ModelArg {
+	fn resolve(&self) -> ModelHandle<'_>;
+}
+
+impl ModelArg for &Model {
+	fn resolve(&self) -> ModelHandle<'_> {
+		ModelHandle::Ref(self)
+	}
+}
+
+impl<F: Fn() -> Model> ModelArg for F {
+	fn resolve(&self) -> ModelHandle<'_> {
+		ModelHandle::Parked(parked_model())
+	}
+}
+
 struct LastRun {
 	model: *const ModelInner,
 	score: f64,
@@ -257,7 +335,13 @@ impl Train {
 		self
 	}
 
-	pub fn run(&self, data: &dyn RunData, model: &Model) -> &Train {
+	pub fn run(&self, data: impl RunArg, model: impl ModelArg) -> &Train {
+		let dh = data.resolve();
+		let mh = model.resolve();
+		self.run_on(dh.get(), mh.get())
+	}
+
+	fn run_on(&self, data: &dyn RunData, model: &Model) -> &Train {
 		let handle = model;
 		let model: &ModelInner = &model.inner;
 		let run_hip = self
@@ -567,6 +651,27 @@ pub struct Model {
 	pub(crate) inner: Box<ModelInner>,
 }
 
+thread_local! {
+	static PARKED_MODEL: std::cell::RefCell<Option<Box<ModelInner>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+impl Drop for Model {
+	fn drop(&mut self) {
+		let inner = std::mem::replace(&mut self.inner, Box::new(ModelInner::blank()));
+		PARKED_MODEL.with(|slot| slot.borrow_mut().replace(inner));
+	}
+}
+
+pub(crate) fn parked_model() -> Model {
+	let inner = PARKED_MODEL.with(|slot| slot.borrow_mut().take());
+	let inner = crate::some_or_die(
+		inner,
+		"run: no model configured — chain recipe.model().layer(…) before run(…, model)",
+	);
+	Model { inner }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Pass {
 	Forward,
@@ -654,6 +759,21 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, pass: Pass) -> us
 }
 
 impl ModelInner {
+	fn blank() -> ModelInner {
+		ModelInner {
+			specs: Vec::new(),
+			loss: Loss::Mse,
+			lr: 0.01,
+			params: RefCell::new(Vec::new()),
+			scaler: RefCell::new(None),
+			yscaler: RefCell::new(None),
+			fit_score: Cell::new(f64::NAN),
+			saved_ogdl: RefCell::new(None),
+			arena_gen: Cell::new(None),
+			rebuild_backing: RefCell::new(None),
+		}
+	}
+
 	pub(crate) fn ensure_params_live(&self) {
 		let Some(g) = self.arena_gen.get() else {
 			return;
@@ -821,18 +941,7 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 impl Model {
 	pub fn new() -> Model {
 		Model {
-			inner: Box::new(ModelInner {
-				specs: Vec::new(),
-				loss: Loss::Mse,
-				lr: 0.01,
-				params: RefCell::new(Vec::new()),
-				scaler: RefCell::new(None),
-				yscaler: RefCell::new(None),
-				fit_score: Cell::new(f64::NAN),
-				saved_ogdl: RefCell::new(None),
-				arena_gen: Cell::new(None),
-				rebuild_backing: RefCell::new(None),
-			}),
+			inner: Box::new(ModelInner::blank()),
 		}
 	}
 
@@ -939,7 +1048,12 @@ impl Model {
 		self
 	}
 
-	pub fn eval(&self, data: &dyn RunData) -> Vec<f64> {
+	pub fn eval(&self, data: impl RunArg) -> Vec<f64> {
+		let dh = data.resolve();
+		self.eval_on(dh.get())
+	}
+
+	fn eval_on(&self, data: &dyn RunData) -> Vec<f64> {
 		let inner = &self.inner;
 		let prepared = crate::ok_or_die(data.prepared(), "eval: prepare data");
 		let ds = prepared.get();
