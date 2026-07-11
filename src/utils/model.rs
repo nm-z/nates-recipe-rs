@@ -2,16 +2,16 @@ use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
-	LayerParams, PlanMode, Scaler, infer_scored, load_ogdl_str, pinned_vocab,
-	plan_layer_params, vram_estimate,
+	LayerParams, PlanMode, Scaler, infer_scored, load_ogdl_str, pinned_vocab, plan_layer_params,
+	vram_estimate,
 };
 use std::cell::{Cell, RefCell};
 use std::io::IsTerminal;
 use std::sync::atomic::Ordering;
 
 pub use recipe_infer::{
-	Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu, focal, gelu,
-	hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
+	Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu, focal,
+	gelu, hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
 pub trait IntoLayer {
@@ -257,7 +257,6 @@ impl Train {
 		self
 	}
 
-
 	pub fn run(&self, data: &dyn RunData, model: &Model) -> &Train {
 		let handle = model;
 		let model: &ModelInner = &model.inner;
@@ -271,10 +270,13 @@ impl Train {
 			Ok(v) => v,
 			Err(e) => {
 				assert!(
-					e.downcast_ref::<pantry::encode::CeilingExceeded>().is_some(),
+					e.downcast_ref::<pantry::encode::CeilingExceeded>()
+						.is_some(),
 					"run: prepare data: {e:#}"
 				);
-				eprintln!("\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)");
+				eprintln!(
+					"\x1b[33mskipped\x1b[0m  scenario exceeds the VRAM+RAM+disk ceiling (size above)"
+				);
 				return self;
 			}
 		};
@@ -301,7 +303,9 @@ impl Train {
 			None => None,
 		};
 		let net_ram: usize = conns.as_ref().map_or(0, |cs| {
-			cs.iter().map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB)).sum()
+			cs.iter()
+				.map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB))
+				.sum()
 		});
 		let issues = preflight(model, ds, pass, net_ram);
 		let Gate::Proceed = confirm_issues(&issues) else {
@@ -311,20 +315,39 @@ impl Train {
 		match pass {
 			Pass::Fit => {
 				let resume = self.resume.as_deref().map(Self::resolve);
-				run_hip.as_ref().map(|a| {
-					eprint!("-- run pre-fit --\n{}", gpu_core::callspy::report_since(a))
-				}).unwrap_or(());
+				run_hip
+					.as_ref()
+					.map(|a| {
+						eprint!(
+							"-- run pre-fit --\n{}",
+							gpu_core::callspy::report_since(a)
+						)
+					})
+					.unwrap_or(());
 				let __fit = model.fit(ds, self, resume.as_deref(), conns);
-				assert!(__fit.is_ok(), "run: fit: {}", __fit.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				assert!(
+					__fit.is_ok(),
+					"run: fit: {}",
+					__fit.as_ref()
+						.err()
+						.map(|e| format!("{e:#}"))
+						.unwrap_or_default()
+				);
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())
 					.filter(|_probe| INTERRUPTED.load(Ordering::SeqCst) != 0)
 					.map(|_flag| eprintln!("\x1b[33minterrupted\x1b[0m"))
 					.unwrap_or(());
 				let score = model.fit_score.get();
-				post_fit.as_ref().map(|p| {
-					eprint!("-- run post-fit --\n{}", gpu_core::callspy::report_since(p))
-				}).unwrap_or(());
+				post_fit
+					.as_ref()
+					.map(|p| {
+						eprint!(
+							"-- run post-fit --\n{}",
+							gpu_core::callspy::report_since(p)
+						)
+					})
+					.unwrap_or(());
 				model.arena_gen.set(gpu_core::memory::live_parked_gen());
 				let mut last = self.last.borrow_mut();
 				last.model = model as *const ModelInner;
@@ -336,7 +359,9 @@ impl Train {
 				last.raw_test_rows = data.raw_rows();
 				last.raw_test_headers = data.raw_headers();
 				drop(last);
-				gpu_core::callspy::state_report(&run_state).map(|t| eprint!("{t}")).unwrap_or(());
+				gpu_core::callspy::state_report(&run_state)
+					.map(|t| eprint!("{t}"))
+					.unwrap_or(());
 			}
 			Pass::Forward => {
 				let arena = handle.begin_forward();
@@ -345,39 +370,79 @@ impl Train {
 				assert!(!params.is_empty(), "run: call train first");
 				let k = params[params.len() - 1].out_dim;
 				let yscaler = *model.yscaler.borrow();
-				let sp = match Some(()).filter(|_probe| ds.has_target && !self.metrics.is_empty()) {
+				let sp = match Some(())
+					.filter(|_probe| ds.has_target && !self.metrics.is_empty())
+				{
 					Some(_scored) => {
 						let ybuf = {
-							let __up = crate::some_or_die(ds.y.as_slice(), "run: eval metrics: y contig");
-							let __ub = crate::ok_or_die(GpuBuffer::alloc(__up.len()), "run: eval metrics: ybuf");
+							let __up = crate::some_or_die(
+								ds.y.as_slice(),
+								"run: eval metrics: y contig",
+							);
+							let __ub = crate::ok_or_die(
+								GpuBuffer::alloc(__up.len()),
+								"run: eval metrics: ybuf",
+							);
 							let __ld = __ub.load(__up);
-							assert!(__ld.is_ok(), "run: eval metrics: ybuf: {}", __ld.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+							assert!(
+								__ld.is_ok(),
+								"run: eval metrics: ybuf: {}",
+								__ld.as_ref()
+									.err()
+									.map(|e| format!("{e:#}"))
+									.unwrap_or_default()
+							);
 							__ub
 						};
 						let total = (ei.n * k) as f64;
 						let ybar = ds.y.iter().sum::<f64>() / total;
 						let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
 						let __sc = infer_scored(
-							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
-							model.loss, model.lr, &self.metrics, ss_tot,
+							&params,
+							&ei.x,
+							ei.x_cat.as_ref(),
+							ei.n,
+							yscaler,
+							Some(&ybuf),
+							model.loss,
+							model.lr,
+							&self.metrics,
+							ss_tot,
 						);
 						let sc = crate::ok_or_die(__sc, "run: eval metrics");
-						eprintln!("eval  {}", crate::train::metrics_line(&self.metrics, &sc.vals));
+						eprintln!(
+							"eval  {}",
+							crate::train::metrics_line(&self.metrics, &sc.vals)
+						);
 						let stop = Some(Metric::Accuracy)
 							.filter(|_m| model.loss.is_classification())
 							.unwrap_or(Metric::R2);
 						let score = (0..self.metrics.len())
 							.find(|mi| self.metrics[*mi] == stop)
 							.map_or(f64::NAN, |mi| sc.vals[mi]);
-						ScorePreds { score, preds: sc.preds }
+						ScorePreds {
+							score,
+							preds: sc.preds,
+						}
 					}
 					None => {
 						let __sc = infer_scored(
-							&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
-							model.loss, model.lr, &[], 0.0,
+							&params,
+							&ei.x,
+							ei.x_cat.as_ref(),
+							ei.n,
+							yscaler,
+							None,
+							model.loss,
+							model.lr,
+							&[],
+							0.0,
 						);
 						let sc = crate::ok_or_die(__sc, "run: eval predictions");
-						ScorePreds { score: f64::NAN, preds: sc.preds }
+						ScorePreds {
+							score: f64::NAN,
+							preds: sc.preds,
+						}
 					}
 				};
 				let mut last = self.last.borrow_mut();
@@ -426,7 +491,10 @@ impl Train {
 		};
 		let mirror = model.saved_ogdl.borrow();
 		let rendered = match mirror.as_ref() {
-			Some(m) => Rendered { text: m.text.clone(), neurons: m.neurons },
+			Some(m) => Rendered {
+				text: m.text.clone(),
+				neurons: m.neurons,
+			},
 			None => {
 				let params = model.params.borrow();
 				assert!(!params.is_empty(), "save: model has no trained params");
@@ -437,11 +505,21 @@ impl Train {
 			}
 		};
 		let __wr = recipe_infer::write_ogdl(&path, &rendered.text);
-		assert!(__wr.is_ok(), "write model file: {}", __wr.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		assert!(
+			__wr.is_ok(),
+			"write model file: {}",
+			__wr.as_ref()
+				.err()
+				.map(|e| format!("{e:#}"))
+				.unwrap_or_default()
+		);
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
-		eprintln!("saved {} ({} neurons, {key} {score:.4})", full.display(), rendered.neurons);
+		eprintln!(
+			"saved {} ({} neurons, {key} {score:.4})",
+			full.display(),
+			rendered.neurons
+		);
 	}
-
 }
 
 impl Default for Train {
@@ -522,27 +600,53 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, pass: Pass) -> us
 		.filter(|_probe| embed_cats)
 		.map(|_probe| {
 			let n_oh: usize = ds.onehot_groups.iter().map(|g| g.len).sum();
-			CatShape { cat_cols: d - n_oh, text_d: ds.onehot_groups.len(), vocab: n_oh }
+			CatShape {
+				cat_cols: d - n_oh,
+				text_d: ds.onehot_groups.len(),
+				vocab: n_oh,
+			}
 		})
 		.or_else(|| {
-			Some(())
-				.filter(|_probe| embed_first)
-				.map(|_probe| {
-					let tc = ds.text_cols.len();
-					let vocab = pinned_vocab(&model.specs)
-						.unwrap_or_else(|| ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1);
-					CatShape { cat_cols: d - tc, text_d: tc, vocab }
-				})
+			Some(()).filter(|_probe| embed_first).map(|_probe| {
+				let tc = ds.text_cols.len();
+				let vocab = pinned_vocab(&model.specs).unwrap_or_else(|| {
+					ds.x.iter().cloned().fold(0.0f64, f64::max) as usize + 1
+				});
+				CatShape {
+					cat_cols: d - tc,
+					text_d: tc,
+					vocab,
+				}
+			})
 		})
-		.unwrap_or_else(|| CatShape { cat_cols: 0, text_d: d, vocab: 0 });
-	let base = vram_estimate(&model.specs, n, shape.text_d, k, shape.vocab, shape.cat_cols, matches!(pass, Pass::Forward));
+		.unwrap_or(CatShape {
+			cat_cols: 0,
+			text_d: d,
+			vocab: 0,
+		});
+	let base = vram_estimate(
+		&model.specs,
+		n,
+		shape.text_d,
+		k,
+		shape.vocab,
+		shape.cat_cols,
+		matches!(pass, Pass::Forward),
+	);
 	match pass {
 		Pass::Fit => base,
 		Pass::Forward => {
-			let d_sc = Some(shape.cat_cols).filter(|_probe| embed_first).unwrap_or(d);
+			let d_sc = Some(shape.cat_cols)
+				.filter(|_probe| embed_first)
+				.unwrap_or(d);
 			let zscore_transient = Some(())
 				.filter(|_probe| d_sc > 0)
-				.map(|_probe| n * d_sc * 8 + gpu_core::kernels::gpu_reduce_sum_cols_workspace_bytes(n, d_sc))
+				.map(|_probe| {
+					n * d_sc * 8
+						+ gpu_core::kernels::gpu_reduce_sum_cols_workspace_bytes(
+							n, d_sc,
+						)
+				})
 				.unwrap_or(0);
 			base + zscore_transient
 		}
@@ -564,13 +668,24 @@ impl ModelInner {
 				"eval: this model's device weights were freed by a later training run and \
 				 there is no host mirror to restore them (pooled out-of-core arena run)",
 			);
-			let saved = crate::ok_or_die(load_ogdl_str(&m.text), "eval: parse host weight mirror");
+			let saved =
+				crate::ok_or_die(load_ogdl_str(&m.text), "eval: parse host weight mirror");
 			let plan = crate::ok_or_die(
-				plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm),
+				plan_layer_params(
+					&self.specs,
+					m.d,
+					m.c_cat,
+					m.vocab,
+					&saved,
+					PlanMode::Warm,
+				),
 				"eval: rebuild weights from mirror",
 			);
 			let host = plan.host();
-			let staged = crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "rebuild staged alloc");
+			let staged = crate::ok_or_die(
+				GpuBuffer::alloc(host.len().max(1)),
+				"rebuild staged alloc",
+			);
 			crate::ok_or_die(staged.load(host), "rebuild staged load");
 			let params = plan.materialize(&staged, 0);
 			*self.rebuild_backing.borrow_mut() = Some(staged);
@@ -588,7 +703,10 @@ fn output_check(loss: Loss, last_out: usize, n_layers: usize, k: usize) -> Optio
 		Loss::Ce | Loss::Mse | Loss::Mae | Loss::Huber => return None,
 	};
 	(last_out != want).then(|| Issue {
-		what: format!("dense layer {n_layers} outputs {last_out}, {} loss expects {want}", loss.name()),
+		what: format!(
+			"dense layer {n_layers} outputs {last_out}, {} loss expects {want}",
+			loss.name()
+		),
 		have: format!("{last_out} output units"),
 		need,
 	})
@@ -620,43 +738,52 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 	let mut total_vram = 0usize;
 	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
 	let need = plan_footprint(model, ds, pass);
-	Some(()).filter(|_probe| need > free_vram).map(|_probe| {
-		let mode = Some("inference").filter(|_p| matches!(pass, Pass::Forward)).unwrap_or("training");
-		let planned = crate::ooc::plan(need, net_ram);
-		let waterfall_plan = match pass {
-			Pass::Fit => planned,
-			Pass::Forward => None,
-		};
-		match waterfall_plan {
-			Some(p) => {
-				let net_part = Some(())
-					.filter(|_p| p.remote > 0)
-					.map(|_p| format!(" + NET {}", crate::data::human_bytes(p.remote)))
-					.unwrap_or_default();
-				eprintln!(
-					"\x1b[33mwaterfall\x1b[0m  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
-					crate::data::human_bytes(need),
-					crate::data::human_bytes(p.vram),
-					crate::data::human_bytes(p.ram),
-					crate::data::human_bytes(p.disk),
-				);
+	Some(())
+		.filter(|_probe| need > free_vram)
+		.map(|_probe| {
+			let mode = Some("inference")
+				.filter(|_p| matches!(pass, Pass::Forward))
+				.unwrap_or("training");
+			let planned = crate::ooc::plan(need, net_ram);
+			let waterfall_plan = match pass {
+				Pass::Fit => planned,
+				Pass::Forward => None,
+			};
+			match waterfall_plan {
+				Some(p) => {
+					let net_part = Some(())
+						.filter(|_p| p.remote > 0)
+						.map(|_p| {
+							format!(" + NET {}", crate::data::human_bytes(p.remote))
+						})
+						.unwrap_or_default();
+					eprintln!(
+						"\x1b[33mwaterfall\x1b[0m  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
+						crate::data::human_bytes(need),
+						crate::data::human_bytes(p.vram),
+						crate::data::human_bytes(p.ram),
+						crate::data::human_bytes(p.disk),
+					);
+				}
+				None => {
+					issues.push(Issue {
+						what: format!(
+							"{mode} on {n} rows × {d} features exceeds {}",
+							Some("GPU memory")
+								.filter(|_p| matches!(pass, Pass::Forward))
+								.unwrap_or("VRAM+RAM+DISK")
+						),
+						have: format!(
+							"{} free of {} total",
+							crate::data::human_bytes(free_vram),
+							crate::data::human_bytes(total_vram)
+						),
+						need: crate::data::human_bytes(need),
+					});
+				}
 			}
-			None => {
-				issues.push(Issue {
-					what: format!(
-						"{mode} on {n} rows × {d} features exceeds {}",
-						Some("GPU memory").filter(|_p| matches!(pass, Pass::Forward)).unwrap_or("VRAM+RAM+DISK")
-					),
-					have: format!(
-						"{} free of {} total",
-						crate::data::human_bytes(free_vram),
-						crate::data::human_bytes(total_vram)
-					),
-					need: crate::data::human_bytes(need),
-				});
-			}
-		}
-	}).unwrap_or(());
+		})
+		.unwrap_or(());
 
 	issues
 }
@@ -721,13 +848,26 @@ impl Model {
 			"Model::load: plan layer params",
 		);
 		let host = plan.host();
-		let staged = crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "Model::load staged alloc");
+		let staged = crate::ok_or_die(
+			GpuBuffer::alloc(host.len().max(1)),
+			"Model::load staged alloc",
+		);
 		let __sl = staged.load(host);
-		assert!(__sl.is_ok(), "Model::load staged load: {}", __sl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+		assert!(
+			__sl.is_ok(),
+			"Model::load staged load: {}",
+			__sl.as_ref()
+				.err()
+				.map(|e| format!("{e:#}"))
+				.unwrap_or_default()
+		);
 		let params = plan.materialize(&staged, 0);
 		*inner.rebuild_backing.borrow_mut() = Some(staged);
 		*inner.params.borrow_mut() = params;
-		*inner.scaler.borrow_mut() = Some(Scaler { mean: vec![], std: vec![] });
+		*inner.scaler.borrow_mut() = Some(Scaler {
+			mean: vec![],
+			std: vec![],
+		});
 		*inner.yscaler.borrow_mut() = None;
 		proto
 	}
@@ -783,7 +923,9 @@ impl Model {
 	}
 
 	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Model {
-		self.inner.specs.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
+		self.inner
+			.specs
+			.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
 		self
 	}
 
@@ -814,14 +956,29 @@ impl Model {
 				let yslice = crate::some_or_die(ds.y.as_slice(), "eval: y contiguous");
 				let ybuf = crate::ok_or_die(GpuBuffer::alloc(yslice.len()), "eval ybuf");
 				let __yl = ybuf.load(yslice);
-				assert!(__yl.is_ok(), "eval ybuf load: {}", __yl.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+				assert!(
+					__yl.is_ok(),
+					"eval ybuf load: {}",
+					__yl.as_ref()
+						.err()
+						.map(|e| format!("{e:#}"))
+						.unwrap_or_default()
+				);
 				let k = params[params.len() - 1].out_dim;
 				let total = (ei.n * k) as f64;
 				let ybar = ds.y.iter().sum::<f64>() / total;
 				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
 				let __sc = infer_scored(
-					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, Some(&ybuf),
-					inner.loss, inner.lr, std::slice::from_ref(&metric), ss_tot,
+					&params,
+					&ei.x,
+					ei.x_cat.as_ref(),
+					ei.n,
+					yscaler,
+					Some(&ybuf),
+					inner.loss,
+					inner.lr,
+					std::slice::from_ref(&metric),
+					ss_tot,
 				);
 				let sc = crate::ok_or_die(__sc, "eval: metrics");
 				let label = Some("accuracy")
@@ -832,11 +989,22 @@ impl Model {
 			}
 			None => {
 				let __sc = infer_scored(
-					&params, &ei.x, ei.x_cat.as_ref(), ei.n, yscaler, None,
-					inner.loss, inner.lr, &[], 0.0,
+					&params,
+					&ei.x,
+					ei.x_cat.as_ref(),
+					ei.n,
+					yscaler,
+					None,
+					inner.loss,
+					inner.lr,
+					&[],
+					0.0,
 				);
 				let sc = crate::ok_or_die(__sc, "eval: predictions");
-				eprintln!("eval: {} samples (no target column, score unavailable)", ei.n);
+				eprintln!(
+					"eval: {} samples (no target column, score unavailable)",
+					ei.n
+				);
 				sc.preds
 			}
 		};
@@ -846,7 +1014,11 @@ impl Model {
 	}
 
 	pub(crate) fn begin_forward(&self) -> Option<GpuBuffer> {
-		let slab = self.inner.arena_gen.get().and_then(|_gen| gpu_core::memory::adopt_run_backing(0));
+		let slab = self
+			.inner
+			.arena_gen
+			.get()
+			.and_then(|_gen| gpu_core::memory::adopt_run_backing(0));
 		self.inner.ensure_params_live();
 		slab
 	}
@@ -854,8 +1026,11 @@ impl Model {
 	pub(crate) fn end_forward(&self, slab: Option<GpuBuffer>) {
 		slab.map(|inner_slab| {
 			gpu_core::memory::park_run_backing(inner_slab);
-			self.inner.arena_gen.set(gpu_core::memory::live_parked_gen());
-		}).unwrap_or(());
+			self.inner
+				.arena_gen
+				.set(gpu_core::memory::live_parked_gen());
+		})
+		.unwrap_or(());
 	}
 }
 

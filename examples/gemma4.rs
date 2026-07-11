@@ -168,7 +168,7 @@ const SLOT_BYTES: usize = GU_BYTES + DN_BYTES;
 // offsets are multiples of NE*2 = 5632, so /8 is exact — asserted).
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 	assert!(
-		off_bytes % 8 == 0 && len_bytes % 8 == 0,
+		off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8),
 		"bview: unaligned {off_bytes}/{len_bytes}"
 	);
 	buf.view(off_bytes / 8, len_bytes / 8)
@@ -1045,21 +1045,21 @@ fn main() -> Result<()> {
 	let mut rev: HashMap<String, u32> = HashMap::new();
 	if let Some(map) = tok_json["model"]["vocab"].as_object() {
 		for (k, v) in map {
-			if let Some(id) = v.as_u64() {
-				if (id as usize) < VOCAB {
-					vocab[id as usize] = k.clone();
-					rev.insert(k.clone(), id as u32);
-				}
+			if let Some(id) = v.as_u64()
+				&& (id as usize) < VOCAB
+			{
+				vocab[id as usize] = k.clone();
+				rev.insert(k.clone(), id as u32);
 			}
 		}
 	}
 	if let Some(added) = tok_json["added_tokens"].as_array() {
 		for a in added {
-			if let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str()) {
-				if (id as usize) < VOCAB {
-					vocab[id as usize] = c.to_string();
-					rev.insert(c.to_string(), id as u32);
-				}
+			if let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str())
+				&& (id as usize) < VOCAB
+			{
+				vocab[id as usize] = c.to_string();
+				rev.insert(c.to_string(), id as u32);
 			}
 		}
 	}
@@ -1144,7 +1144,7 @@ fn main() -> Result<()> {
 	eprintln!("prompt tokens={prefix} canvas={NCANVAS} total={t}");
 
 	let mut sck: Vec<Vec<(usize, f64)>> = vec![vec![]; NCANVAS];
-	let mut pred = vec![MASK as u32; NCANVAS];
+	let mut pred = [MASK as u32; NCANVAS];
 
 	// Preallocate the whole forward arena once (t is now known). After this point
 	// the hot loop allocates nothing — the acceptance invariant is that the device

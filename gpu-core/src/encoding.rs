@@ -91,7 +91,6 @@ unsafe extern "C" {
 	);
 }
 
-
 pub fn gpu_bin_edges_uniform(
 	x: &GpuBuffer,
 	rows: usize,
@@ -179,7 +178,13 @@ pub fn gpu_one_hot(
 }
 
 pub fn gpu_count_distinct_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
-	unsafe { count_distinct_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut()) }
+	unsafe {
+		count_distinct_workspace_bytes(
+			x.ptr_raw() as *const c_void,
+			n as i32,
+			std::ptr::null_mut(),
+		)
+	}
 }
 
 pub fn gpu_count_distinct(
@@ -207,7 +212,9 @@ pub fn gpu_count_distinct(
 }
 
 pub fn gpu_run_length_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
-	unsafe { run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut()) }
+	unsafe {
+		run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut())
+	}
 }
 
 pub fn gpu_run_length(

@@ -6,9 +6,9 @@
 )]
 
 pub mod attention;
-pub mod callspy;
 pub mod bayes;
 pub mod bridge;
+pub mod callspy;
 pub mod catboost;
 pub mod cluster;
 pub mod diffusion;

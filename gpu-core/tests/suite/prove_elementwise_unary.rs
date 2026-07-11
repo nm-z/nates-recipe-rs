@@ -74,7 +74,12 @@ unsafe extern "C" {
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
 fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	unsafe {
 		f(
@@ -86,17 +91,24 @@ fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 type UnaryGpu = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_existing(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -126,8 +138,8 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		gpu_sinh, gpu_square,
 	};
 	use gpu_core::kernels::{
-		gpu_abs_into, gpu_exp, gpu_leaky_relu_into, gpu_log_into, gpu_neg, gpu_relu_into, gpu_sigmoid_into, gpu_sign_into,
-		gpu_silu_into, gpu_sqrt, gpu_tanh_into,
+		gpu_abs_into, gpu_exp, gpu_leaky_relu_into, gpu_log_into, gpu_neg, gpu_relu_into,
+		gpu_sigmoid_into, gpu_sign_into, gpu_silu_into, gpu_sqrt, gpu_tanh_into,
 	};
 	use gpu_core::math_ops::{
 		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round,
@@ -136,8 +148,18 @@ fn registry() -> BTreeMap<&'static str, Op> {
 
 	// selu carries two scalar params (alpha, lambda); wrap to the standard unary form.
 	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-		let a = { let __up = &[1.6732632423543772f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
-		let l = { let __up = &[1.0507009873554805f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+		let a = {
+			let __up = &[1.6732632423543772f64];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		};
+		let l = {
+			let __up = &[1.0507009873554805f64];
+			let __ub = GpuBuffer::alloc(__up.len())?;
+			__ub.load(__up)?;
+			__ub
+		};
 		gpu_selu(x, &a, &l, n, out)
 	}
 
@@ -302,11 +324,21 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	{
 		// elu/leaky_relu take a param; wrap to the standard unary form
 		fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-			let a = { let __up = &[1.0f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+			let a = {
+				let __up = &[1.0f64];
+				let __ub = GpuBuffer::alloc(__up.len())?;
+				__ub.load(__up)?;
+				__ub
+			};
 			gpu_core::k_gapact::gpu_elu(x, &a, n, out)
 		}
 		fn lrelu(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-			let a = { let __up = &[0.01f64]; let __ub = GpuBuffer::alloc(__up.len())?; __ub.load(__up)?; __ub };
+			let a = {
+				let __up = &[0.01f64];
+				let __ub = GpuBuffer::alloc(__up.len())?;
+				__ub.load(__up)?;
+				__ub
+			};
 			gpu_leaky_relu_into(x, &a, n, out)
 		}
 		e!(

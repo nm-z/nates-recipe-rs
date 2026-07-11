@@ -104,7 +104,6 @@ pub struct NeighborCsr {
 	pub nnz: usize,
 }
 
-
 pub fn fixed_radius_count(
 	points: &GpuBuffer,
 	eps: &GpuBuffer,
@@ -187,9 +186,12 @@ pub fn gpu_fixed_radius_neighbors(
 	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * std::mem::size_of::<i32>())?;
 	fixed_radius_fill_csr(points, &row_ptr_buf, &eps_buf, n, dim, &indices)?;
 
-	Ok(NeighborCsr { row_ptr: row_ptr_buf, indices, nnz })
+	Ok(NeighborCsr {
+		row_ptr: row_ptr_buf,
+		indices,
+		nnz,
+	})
 }
-
 
 pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -257,7 +259,6 @@ pub struct BoruvkaResult {
 	pub in_mst: GpuBuffer,
 	pub total_weight: f64,
 }
-
 
 pub fn boruvka_init(
 	n_nodes: usize,
@@ -388,7 +389,9 @@ pub fn gpu_boruvka_mst(
 	loop {
 		boruvka_init(n_nodes, &best_edge, &best_w)?;
 		boruvka_min_w(edge_src, edge_dst, edge_w, &parent, n_edges, &best_w)?;
-		boruvka_min_e(edge_src, edge_dst, edge_w, &parent, &best_w, n_edges, &best_edge)?;
+		boruvka_min_e(
+			edge_src, edge_dst, edge_w, &parent, &best_w, n_edges, &best_edge,
+		)?;
 		boruvka_mark(&best_edge, n_nodes, n_edges, &in_mst)?;
 
 		best_edge.download_i32(&mut best_edge_h)?;
@@ -397,7 +400,8 @@ pub fn gpu_boruvka_mst(
 		let mut sel_src: Vec<i32> = Vec::new();
 		let mut sel_dst: Vec<i32> = Vec::new();
 		for &e in &best_edge_h {
-			for i in usize::try_from(e).ok()
+			for i in usize::try_from(e)
+				.ok()
 				.filter(|&idx| idx < n_edges)
 				.filter(|_idx| seen.insert(e))
 				.into_iter()
@@ -420,7 +424,9 @@ pub fn gpu_boruvka_mst(
 					changed.download_i32(&mut flag)?;
 					match flag[0].cmp(&0) {
 						std::cmp::Ordering::Equal => break,
-						std::cmp::Ordering::Less | std::cmp::Ordering::Greater => continue,
+						std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+							continue;
+						}
 					}
 				}
 			}
@@ -433,7 +439,10 @@ pub fn gpu_boruvka_mst(
 	unsafe { total_buf.download_async(&mut tw, std::ptr::null_mut()) }?;
 	crate::hip::device_synchronize()?;
 
-	Ok(BoruvkaResult { in_mst, total_weight: tw[0] })
+	Ok(BoruvkaResult {
+		in_mst,
+		total_weight: tw[0],
+	})
 }
 
 pub fn gpu_core_distance(

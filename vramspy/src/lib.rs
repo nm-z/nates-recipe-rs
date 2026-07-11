@@ -40,14 +40,30 @@ const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: i32 = 1;
 // set — confirmed by reading the header, not assumed from the spec's "value 4".
 const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
 
-static LIVE: [AtomicU64; N_KINDS] =
-	[AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static PEAK: [AtomicU64; N_KINDS] =
-	[AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static ALLOCS: [AtomicU64; N_KINDS] =
-	[AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static FREES: [AtomicU64; N_KINDS] =
-	[AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static LIVE: [AtomicU64; N_KINDS] = [
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+];
+static PEAK: [AtomicU64; N_KINDS] = [
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+];
+static ALLOCS: [AtomicU64; N_KINDS] = [
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+];
+static FREES: [AtomicU64; N_KINDS] = [
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+	AtomicU64::new(0),
+];
 static UNKNOWN_FREES: AtomicU64 = AtomicU64::new(0);
 
 struct Alloc {
@@ -109,7 +125,10 @@ fn resolve_next(name: &CStr) -> usize {
 	match std::ptr::NonNull::new(p) {
 		Some(nn) => nn.as_ptr() as usize,
 		None => {
-			eprintln!("vramspy: RTLD_NEXT resolution failed for {}", name.to_string_lossy());
+			eprintln!(
+				"vramspy: RTLD_NEXT resolution failed for {}",
+				name.to_string_lossy()
+			);
 			// SAFETY: abort() takes no arguments and never returns.
 			unsafe { libc::abort() }
 		}
@@ -123,7 +142,9 @@ fn real() -> &'static Real {
 		// the resolved symbol; resolve_next() guarantees a non-null pointer.
 		unsafe {
 			Real {
-				pool_allocate: std::mem::transmute(resolve_next(c"hsa_amd_memory_pool_allocate")),
+				pool_allocate: std::mem::transmute(resolve_next(
+					c"hsa_amd_memory_pool_allocate",
+				)),
 				pool_free: std::mem::transmute(resolve_next(c"hsa_amd_memory_pool_free")),
 				mem_allocate: std::mem::transmute(resolve_next(c"hsa_memory_allocate")),
 				mem_free: std::mem::transmute(resolve_next(c"hsa_memory_free")),
@@ -160,7 +181,8 @@ fn dev_kind(dev_type: u32) -> DevKind {
 struct BuildCtx<'ctx> {
 	pools: &'ctx mut HashMap<u64, u8>,
 	agent_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
-	iterate_pools: unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
+	iterate_pools:
+		unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 }
 
@@ -181,16 +203,25 @@ fn pool_kind(ctx: &PoolCtx, pool: u64) -> u8 {
 	let mut segment: u32 = u32::MAX;
 	// SAFETY: FFI query; segment is a valid out-param for the call's duration.
 	let r1 = unsafe {
-		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &mut segment as *mut u32 as *mut c_void)
+		(ctx.pool_get_info)(
+			pool,
+			HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
+			&mut segment as *mut u32 as *mut c_void,
+		)
 	};
-	let global = Some(()).filter(|_u| r1 == HSA_STATUS_SUCCESS && segment == HSA_AMD_SEGMENT_GLOBAL);
+	let global =
+		Some(()).filter(|_u| r1 == HSA_STATUS_SUCCESS && segment == HSA_AMD_SEGMENT_GLOBAL);
 	let Some(_g) = global else {
 		return KIND_OTHER;
 	};
 	let mut flags: u32 = 0;
 	// SAFETY: FFI query; flags is a valid out-param for the call's duration.
 	let r2 = unsafe {
-		(ctx.pool_get_info)(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &mut flags as *mut u32 as *mut c_void)
+		(ctx.pool_get_info)(
+			pool,
+			HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+			&mut flags as *mut u32 as *mut c_void,
+		)
 	};
 	let kernarg = Some(()).filter(|_u| {
 		r2 == HSA_STATUS_SUCCESS && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) != 0
@@ -219,15 +250,30 @@ extern "C" fn agent_cb(agent: u64, data: *mut c_void) -> i32 {
 	let ctx = unsafe { &mut *(data as *mut BuildCtx) };
 	let mut dev_type: u32 = u32::MAX;
 	// SAFETY: FFI query; dev_type is a valid out-param for the call's duration.
-	let r = unsafe { (ctx.agent_get_info)(agent, HSA_AGENT_INFO_DEVICE, &mut dev_type as *mut u32 as *mut c_void) };
+	let r = unsafe {
+		(ctx.agent_get_info)(
+			agent,
+			HSA_AGENT_INFO_DEVICE,
+			&mut dev_type as *mut u32 as *mut c_void,
+		)
+	};
 	match Some(dev_type).filter(|_d| r == HSA_STATUS_SUCCESS) {
 		None => HSA_STATUS_SUCCESS,
 		Some(dt) => {
-			let mut pool_ctx =
-				PoolCtx { pools: ctx.pools, dev: dev_kind(dt), pool_get_info: ctx.pool_get_info };
+			let mut pool_ctx = PoolCtx {
+				pools: ctx.pools,
+				dev: dev_kind(dt),
+				pool_get_info: ctx.pool_get_info,
+			};
 			// SAFETY: FFI iterate call; pool_ctx outlives the call (stack frame does not
 			// return until hsa_amd_agent_iterate_memory_pools does).
-			unsafe { (ctx.iterate_pools)(agent, pool_cb, &mut pool_ctx as *mut PoolCtx as *mut c_void) };
+			unsafe {
+				(ctx.iterate_pools)(
+					agent,
+					pool_cb,
+					&mut pool_ctx as *mut PoolCtx as *mut c_void,
+				)
+			};
 			HSA_STATUS_SUCCESS
 		}
 	}
@@ -245,7 +291,9 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 				pgi: resolve_next_or_default(c"hsa_amd_memory_pool_get_info")?,
 			})
 		})() else {
-			eprintln!("vramspy: agent/pool classification symbols unavailable — all pools classify OTHER");
+			eprintln!(
+				"vramspy: agent/pool classification symbols unavailable — all pools classify OTHER"
+			);
 			return pools;
 		};
 		// SAFETY: each transmute target is the exact C signature documented for
@@ -307,7 +355,11 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hsa_memory_allocate(region: u64, size: usize, ptr: *mut *mut c_void) -> i32 {
+pub unsafe extern "C" fn hsa_memory_allocate(
+	region: u64,
+	size: usize,
+	ptr: *mut *mut c_void,
+) -> i32 {
 	// SAFETY: forwarding the caller's arguments unchanged to the real HSA runtime.
 	let status = unsafe { (real().mem_allocate)(region, size, ptr) };
 	let Some(_ok) = Some(()).filter(|_u| status == HSA_STATUS_SUCCESS) else {
@@ -345,22 +397,30 @@ pub extern "C" fn vramspy_loaded() -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_live(kind: u32) -> u64 {
-	LIVE.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+	LIVE.get(kind as usize)
+		.map(|a| a.load(Ordering::Relaxed))
+		.unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_peak(kind: u32) -> u64 {
-	PEAK.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+	PEAK.get(kind as usize)
+		.map(|a| a.load(Ordering::Relaxed))
+		.unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_allocs(kind: u32) -> u64 {
-	ALLOCS.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+	ALLOCS.get(kind as usize)
+		.map(|a| a.load(Ordering::Relaxed))
+		.unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_frees(kind: u32) -> u64 {
-	FREES.get(kind as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+	FREES.get(kind as usize)
+		.map(|a| a.load(Ordering::Relaxed))
+		.unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]

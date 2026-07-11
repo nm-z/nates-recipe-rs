@@ -58,19 +58,36 @@ fn data_load_materializes_safetensors_shard() {
 	for v in [1.0f64, 2.0, 3.0, 4.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	let path = std::env::temp_dir()
-		.join(format!("recipe_st_shard_{}.safetensors", std::process::id()));
+	let path = std::env::temp_dir().join(format!(
+		"recipe_st_shard_{}.safetensors",
+		std::process::id()
+	));
 	std::fs::write(&path, &bytes).expect("write temp safetensors shard");
 	let p = path.to_str().expect("temp path utf8");
 
 	let data = Data::load(p).target("label");
 	let Datasets { train: set, test } = data.datasets();
 	assert_eq!(set.x.nrows(), 4, "four rows from the shared leading dim");
-	assert_eq!(set.x.ncols(), 3, "three feature cols (blk.0.w:0, blk.0.w:1, blk.0.b)");
+	assert_eq!(
+		set.x.ncols(),
+		3,
+		"three feature cols (blk.0.w:0, blk.0.w:1, blk.0.b)"
+	);
 	assert_eq!(set.n_targets, 1, "label is the single target");
-	assert!(test.is_none(), "no split and no test set yields one dataset");
-	assert_eq!(set.x[[0, 0]], 10.0, "F32 weight widened to f64, column order kept");
-	assert_eq!(set.x[[3, 2]], 400.0, "F64 bias, last feature column, last row");
+	assert!(
+		test.is_none(),
+		"no split and no test set yields one dataset"
+	);
+	assert_eq!(
+		set.x[[0, 0]],
+		10.0,
+		"F32 weight widened to f64, column order kept"
+	);
+	assert_eq!(
+		set.x[[3, 2]],
+		400.0,
+		"F64 bias, last feature column, last row"
+	);
 	let _ = std::fs::remove_file(&path);
 }
 
@@ -82,5 +99,8 @@ fn no_target_datasets_is_features_only() {
 	assert!(set.y.is_empty(), "zero targets carry no y");
 	assert_eq!(set.x.nrows(), 178, "every wine row survives");
 	assert_eq!(set.x.ncols(), 14, "every wine column becomes a feature");
-	assert!(test.is_none(), "no split and no test path yields one dataset");
+	assert!(
+		test.is_none(),
+		"no split and no test path yields one dataset"
+	);
 }

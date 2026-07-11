@@ -26,13 +26,18 @@ fn main() -> Result<()> {
 			println!("\n# {path}");
 		}
 		for group in pantry::data::load_groups(path) {
-			let pantry::data::DirGroup::Table { name, headers, cells, .. } = group else {
+			let pantry::data::DirGroup::Table {
+				name,
+				headers,
+				cells,
+				..
+			} = group
+			else {
 				continue;
 			};
 			let columns: Vec<Vec<&str>> = (0..headers.len())
 				.map(|j| {
-					cells
-						.iter()
+					cells.iter()
 						.filter_map(|r| r.get(j).map(String::as_str))
 						.filter(|c| !c.is_empty())
 						.collect()

@@ -11,7 +11,10 @@ fn main() {
 		return;
 	};
 	let hipblas = std::env::var("HIPBLAS_NV_PREFIX").unwrap_or_else(|_e| {
-		format!("{}/../gpu-core/vendor/hipblas-nvidia", env!("CARGO_MANIFEST_DIR"))
+		format!(
+			"{}/../gpu-core/vendor/hipblas-nvidia",
+			env!("CARGO_MANIFEST_DIR")
+		)
 	});
 	println!("cargo:rustc-link-arg=-Wl,-rpath,{hipblas}/lib");
 }

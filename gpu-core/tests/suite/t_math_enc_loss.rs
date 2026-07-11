@@ -8,7 +8,12 @@ fn approx_eq(a: f64, b: f64) -> bool {
 }
 
 fn upload(data: &[f64]) -> GpuBuffer {
-	{ let __up = data; let __ub = GpuBuffer::alloc(__up.len()).expect("upload"); __ub.load(__up).expect("upload"); __ub }
+	{
+		let __up = data;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("upload");
+		__ub.load(__up).expect("upload");
+		__ub
+	}
 }
 
 fn out_buf(n: usize) -> GpuBuffer {
@@ -17,7 +22,8 @@ fn out_buf(n: usize) -> GpuBuffer {
 
 fn download(buf: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; n];
-	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download"); gpu_core::hip::device_synchronize().expect("download");
+	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download");
+	gpu_core::hip::device_synchronize().expect("download");
 	v
 }
 
@@ -493,7 +499,8 @@ fn test_count_distinct() {
 	let n = 6;
 	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
 	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
-	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let temp =
+		GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
 	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
 	let mut c = [0i32; 1];
@@ -509,7 +516,8 @@ fn test_count_distinct_uniform() {
 	let n = 3;
 	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
 	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
-	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let temp =
+		GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
 	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
 	let mut c = [0i32; 1];
@@ -633,8 +641,18 @@ fn test_pairwise_l1_2x2() {
 #[test]
 fn test_pairwise_hamming_identical() {
 	// [1,2] vs [1,2] → 0/2 = 0.0
-	let q_u8 = { let __u = &[1u8, 2u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
-	let t_u8 = { let __u = &[1u8, 2u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let q_u8 = {
+		let __u = &[1u8, 2u8];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
+	let t_u8 = {
+		let __u = &[1u8, 2u8];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
 	let out = out_buf(1);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
@@ -649,8 +667,18 @@ fn test_pairwise_hamming_identical() {
 #[test]
 fn test_pairwise_hamming_half_mismatch() {
 	// [1,0] vs [0,0] → 1/2 = 0.5
-	let q_u8 = { let __u = &[1u8, 0u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
-	let t_u8 = { let __u = &[0u8, 0u8]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let q_u8 = {
+		let __u = &[1u8, 0u8];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
+	let t_u8 = {
+		let __u = &[0u8, 0u8];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
 	let out = out_buf(1);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 1, 1, 2, &out).unwrap();
 	let r = download(&out, 1);
@@ -669,8 +697,18 @@ fn test_pairwise_hamming_2x2() {
 	// out[1]=hamming([0,1],[1,1])=1/2=0.5
 	// out[2]=hamming([1,0],[0,1])=2/2=1.0
 	// out[3]=hamming([1,0],[1,1])=1/2=0.5
-	let q_u8 = { let __u = &[0u8, 1, 1, 0]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
-	let t_u8 = { let __u = &[0u8, 1, 1, 1]; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let q_u8 = {
+		let __u = &[0u8, 1, 1, 0];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
+	let t_u8 = {
+		let __u = &[0u8, 1, 1, 1];
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
 	let out = out_buf(4);
 	gpu_pairwise_hamming(&q_u8, &t_u8, 2, 2, 2, &out).unwrap();
 	let r = download(&out, 4);

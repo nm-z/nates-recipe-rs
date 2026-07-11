@@ -3,7 +3,6 @@ use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-
 unsafe extern "C" {
 	fn launch_iota(out: *mut c_void, n: i32, stream: *mut c_void);
 
@@ -36,7 +35,6 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 }
-
 
 pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {

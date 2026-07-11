@@ -28,7 +28,10 @@ struct Gate {
 	grip: Grip,
 }
 
-static GATE: Mutex<Gate> = Mutex::new(Gate { lock: Lock::Closed, grip: Grip::Free });
+static GATE: Mutex<Gate> = Mutex::new(Gate {
+	lock: Lock::Closed,
+	grip: Grip::Free,
+});
 static HOLDING: AtomicU32 = AtomicU32::new(CLEAN);
 
 fn locked() -> MutexGuard<'static, Gate> {
@@ -39,7 +42,9 @@ fn locked() -> MutexGuard<'static, Gate> {
 }
 
 fn inherited() -> std::io::Result<Option<RawFd>> {
-	let Ok(raw) = std::env::var(INHERIT_VAR) else { return Ok(None) };
+	let Ok(raw) = std::env::var(INHERIT_VAR) else {
+		return Ok(None);
+	};
 	let fd: RawFd = raw
 		.parse()
 		.map_err(|_e| std::io::Error::other(format!("{INHERIT_VAR}={raw}")))?;
@@ -135,10 +140,14 @@ fn await_teardown(pid: u32) {
 		let None = expired(t0, pid) else { return };
 		std::thread::sleep(std::time::Duration::from_millis(2));
 	}
-	let Some(mut free) = crate::hip::sysfs_vram_free() else { return };
+	let Some(mut free) = crate::hip::sysfs_vram_free() else {
+		return;
+	};
 	loop {
 		std::thread::sleep(RECLAIM_STEP);
-		let Some(now) = crate::hip::sysfs_vram_free() else { return };
+		let Some(now) = crate::hip::sysfs_vram_free() else {
+			return;
+		};
 		match now.cmp(&free) {
 			std::cmp::Ordering::Greater => free = now,
 			std::cmp::Ordering::Equal => return,
@@ -153,7 +162,9 @@ fn expired(t0: std::time::Instant, pid: u32) -> Option<()> {
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
 		Some(std::cmp::Ordering::Less) | None => None,
 		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => {
-			eprintln!("gpu gate: pid {pid} still holds the device after {waited:.0}s — proceeding");
+			eprintln!(
+				"gpu gate: pid {pid} still holds the device after {waited:.0}s — proceeding"
+			);
 			Some(())
 		}
 	}
@@ -183,7 +194,9 @@ fn open_or_adopt() -> std::io::Result<Lock> {
 }
 
 pub fn acquire() {
-	let None = std::num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else { return };
+	let None = std::num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else {
+		return;
+	};
 	let mut g = locked();
 	match g.grip {
 		Grip::Taken => {}
@@ -234,7 +247,9 @@ impl Default for Lease {
 impl Lease {
 	pub fn new() -> Lease {
 		acquire();
-		Lease { _p: std::marker::PhantomData }
+		Lease {
+			_p: std::marker::PhantomData,
+		}
 	}
 }
 

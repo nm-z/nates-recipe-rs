@@ -293,7 +293,6 @@ pub fn gpu_dot(
 	Ok(())
 }
 
-
 pub fn gpu_fill_sentinel(
 	data: &GpuBuffer,
 	real_n: usize,

@@ -6,7 +6,13 @@ pub const SELU_ALPHA: f64 = 1.6732632423543772848170429916717;
 pub const SELU_LAMBDA: f64 = 1.0507009873554804934193349852946;
 
 unsafe extern "C" {
-	fn launch_gapact_elu(x: *const c_void, out: *mut c_void, n: i32, alpha: *const c_void, s: *mut c_void);
+	fn launch_gapact_elu(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		alpha: *const c_void,
+		s: *mut c_void,
+	);
 	fn launch_gapact_elu_backward(
 		g: *const c_void,
 		x: *const c_void,
@@ -172,7 +178,12 @@ macro_rules! u {
 }
 macro_rules! ub {
 	($name:ident, $launch:ident) => {
-		pub fn $name(g: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		pub fn $name(
+			g: &GpuBuffer,
+			x: &GpuBuffer,
+			n: usize,
+			out: &GpuBuffer,
+		) -> Result<(), HipError> {
 			unsafe {
 				$launch(
 					g.ptr_raw() as *const c_void,
@@ -188,7 +199,12 @@ macro_rules! ub {
 }
 macro_rules! gate {
 	($name:ident, $launch:ident) => {
-		pub fn $name(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+		pub fn $name(
+			a: &GpuBuffer,
+			b: &GpuBuffer,
+			n: usize,
+			out: &GpuBuffer,
+		) -> Result<(), HipError> {
 			unsafe {
 				$launch(
 					a.ptr_raw() as *const c_void,

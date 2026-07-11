@@ -20,10 +20,12 @@ fn detect_platform() -> Platform {
 			None => Platform::Amd,
 		},
 		None => {
-			let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
+			let cuda =
+				std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
 			let have_nvcc = Path::new(&format!("{cuda}/bin/nvcc")).exists();
 			let nvidia_gpu = Path::new("/proc/driver/nvidia").exists();
-			let amd_gpu = Path::new("/sys/module/amdgpu").exists() || Path::new("/dev/kfd").exists();
+			let amd_gpu =
+				Path::new("/sys/module/amdgpu").exists() || Path::new("/dev/kfd").exists();
 			match Some(()).filter(|_u| nvidia_gpu && have_nvcc && !amd_gpu) {
 				Some(()) => Platform::Nvidia,
 				None => Platform::Amd,
@@ -67,7 +69,9 @@ fn needs_rebuild(src: &Path, obj: &str) -> Option<()> {
 fn ban_direct_blas() {
 	let banned = ["rocblas", "cublas"];
 	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-		let Ok(rd) = std::fs::read_dir(dir) else { return };
+		let Ok(rd) = std::fs::read_dir(dir) else {
+			return;
+		};
 		for e in rd.flatten() {
 			let p = e.path();
 			match Some(()).filter(|_u| p.is_dir()) {
@@ -115,7 +119,9 @@ fn enforce_memory_chokepoints() {
 		"hipMemPoolTrimTo(",
 	];
 	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-		let Ok(rd) = std::fs::read_dir(dir) else { return };
+		let Ok(rd) = std::fs::read_dir(dir) else {
+			return;
+		};
 		for e in rd.flatten() {
 			let p = e.path();
 			match Some(()).filter(|_u| p.is_dir()) {
@@ -175,7 +181,9 @@ fn main() {
 	for entries in std::fs::read_dir(&out_dir).into_iter() {
 		for entry in entries.flatten() {
 			let p = entry.path();
-			let stale = p.to_str().is_some_and(|s| s.ends_with("_hip.o") || s.ends_with("_shim.o"))
+			let stale = p
+				.to_str()
+				.is_some_and(|s| s.ends_with("_hip.o") || s.ends_with("_shim.o"))
 				&& !objects.iter().any(|o| Path::new(o) == p);
 			if stale {
 				drop(std::fs::remove_file(&p));
@@ -278,7 +286,10 @@ fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>)
 	let nvhip = format!("{out_dir}/nvhip");
 	drop(std::fs::remove_dir_all(&nvhip));
 	std::fs::create_dir_all(&nvhip).expect("mkdir nvhip");
-	drop(std::os::unix::fs::symlink(format!("{rocm}/include/hip"), format!("{nvhip}/hip")));
+	drop(std::os::unix::fs::symlink(
+		format!("{rocm}/include/hip"),
+		format!("{nvhip}/hip"),
+	));
 
 	for src_path in hip_files {
 		let src = src_path.to_str().unwrap();
@@ -294,18 +305,43 @@ fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>)
 			let status = match Some(()).filter(|_u| uses_device_lib) {
 				Some(()) => std::process::Command::new(&nvcc)
 					.args([
-						"-x", "cu", "-c", "-O3", &arch_flag, "-diag-suppress", "2810",
-						"-isystem", &compat, "-isystem", &nvhip, "-include", &shfl_compat,
-						"-D__HIP_PLATFORM_NVIDIA__=1", "-DTHRUST_IGNORE_CUB_VERSION_CHECK",
-						"-Xcompiler", "-fPIC", &cu, "-o", &obj,
+						"-x",
+						"cu",
+						"-c",
+						"-O3",
+						&arch_flag,
+						"-diag-suppress",
+						"2810",
+						"-isystem",
+						&compat,
+						"-isystem",
+						&nvhip,
+						"-include",
+						&shfl_compat,
+						"-D__HIP_PLATFORM_NVIDIA__=1",
+						"-DTHRUST_IGNORE_CUB_VERSION_CHECK",
+						"-Xcompiler",
+						"-fPIC",
+						&cu,
+						"-o",
+						&obj,
 					])
 					.status()
 					.expect("nvcc (nvidia kernel) failed"),
 				None => std::process::Command::new(&hipcc)
 					.env("HIP_PLATFORM", "nvidia")
 					.args([
-						"-c", "-fPIC", "-O3", &arch_flag, "-diag-suppress", "2810",
-						"-include", &shfl_compat, &cu, "-o", &obj,
+						"-c",
+						"-fPIC",
+						"-O3",
+						&arch_flag,
+						"-diag-suppress",
+						"2810",
+						"-include",
+						&shfl_compat,
+						&cu,
+						"-o",
+						&obj,
 					])
 					.status()
 					.expect("hipcc (nvidia) failed"),
@@ -322,8 +358,15 @@ fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>)
 	for _rebuild in needs_rebuild(shim_src, &shim_obj).into_iter() {
 		let status = std::process::Command::new(&nvcc)
 			.args([
-				"-c", "-O3", &arch_flag, "-Xcompiler", "-fPIC",
-				&format!("-I{cuda}/include"), "src/shim_nvidia.cu", "-o", &shim_obj,
+				"-c",
+				"-O3",
+				&arch_flag,
+				"-Xcompiler",
+				"-fPIC",
+				&format!("-I{cuda}/include"),
+				"src/shim_nvidia.cu",
+				"-o",
+				&shim_obj,
 			])
 			.status()
 			.expect("nvcc shim failed");

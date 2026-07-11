@@ -30,7 +30,10 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 		let tabs = text.matches('\t').count();
 		let total_sep = commas + semis + tabs;
 		let tokens: Vec<&str> = text.split_whitespace().collect();
-		if total_sep == 0 && tokens.len() >= 2 && tokens.iter().all(|t| t.parse::<f64>().is_ok()) {
+		if total_sep == 0
+			&& tokens.len() >= 2
+			&& tokens.iter().all(|t| t.parse::<f64>().is_ok())
+		{
 			return b' ';
 		}
 		return match semis.cmp(&commas) {
@@ -66,7 +69,10 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		.with_context(|| format!("failed to open {}", path.display()))?;
 	let mut records = rdr.byte_records();
 	let Some(first) = records.next() else {
-		return Ok(RawCsv { headers: Vec::new(), rows: Vec::new() });
+		return Ok(RawCsv {
+			headers: Vec::new(),
+			rows: Vec::new(),
+		});
 	};
 	let first = first.with_context(|| "failed to read first CSV record")?;
 	let first_cells: Vec<String> = first
@@ -130,7 +136,9 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		let record = result.with_context(|| "failed to read CSV record")?;
 		let mut row = Vec::with_capacity(w);
 		for j in 0..w {
-			let cell = record.get(j).map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
+			let cell = record
+				.get(j)
+				.map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
 			row.push(na(cell.as_ref()));
 		}
 		rows.push(row);
@@ -154,7 +162,10 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let mut lines = rdr.lines();
 	let first = loop {
 		let Some(l) = lines.next() else {
-			return Ok(RawCsv { headers: Vec::new(), rows: Vec::new() });
+			return Ok(RawCsv {
+				headers: Vec::new(),
+				rows: Vec::new(),
+			});
 		};
 		let l = l.with_context(|| format!("failed to read {}", path.display()))?;
 		let Some(_c0) = l.trim().chars().next() else {
@@ -322,8 +333,8 @@ fn is_junk_name(name: &str) -> Option<()> {
 }
 
 fn walk_data_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-	for entry in
-		fs::read_dir(dir).with_context(|| format!("failed to read directory: {}", dir.display()))?
+	for entry in fs::read_dir(dir)
+		.with_context(|| format!("failed to read directory: {}", dir.display()))?
 	{
 		let entry =
 			entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
@@ -449,11 +460,9 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 	eprintln!("found images in {}", short_path(dir));
 	let pb = ProgressBar::new(total as u64);
 	pb.set_style(
-		ProgressStyle::with_template(
-			"    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}",
-		)
-		.expect("progress template")
-		.progress_chars("=>-"),
+		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
+			.expect("progress template")
+			.progress_chars("=>-"),
 	);
 	pb.enable_steady_tick(std::time::Duration::from_millis(120));
 	let leaf = std::path::Path::new(dir)
@@ -560,8 +569,7 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 }
 
 fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
-	fs::create_dir_all(dest)
-		.with_context(|| format!("failed to create {}", dest.display()))?;
+	fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
 	let file = fs::File::open(zip_path)
 		.with_context(|| format!("failed to open zip {}", zip_path.display()))?;
 	let mut archive = zip::ZipArchive::new(file)
@@ -611,7 +619,10 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 	if p.is_dir() {
 		return load_dir_groups(path).expect("load dir");
 	}
-	let RawCsv { headers, rows: cells } = read_raw_csv(p).expect("read csv");
+	let RawCsv {
+		headers,
+		rows: cells,
+	} = read_raw_csv(p).expect("read csv");
 	let hashes = vec![String::new(); cells.len()];
 	vec![DirGroup::Table {
 		name: String::new(),
@@ -729,7 +740,8 @@ pub fn parse_arff(path: &str) -> ArffTable {
 				match lower.strip_prefix("@attribute") {
 					Some(_rest) => attrs.push(parse_attribute(line)),
 					None => {
-						let Some(()) = Some(()).filter(|_u| lower.starts_with("@data")) else {
+						let Some(()) = Some(()).filter(|_u| lower.starts_with("@data"))
+						else {
 							continue;
 						};
 						section = Section::Data;

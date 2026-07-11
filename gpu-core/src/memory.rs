@@ -77,11 +77,17 @@ fn fmt_bytes(b: usize) -> String {
 	let gb = K * K * K;
 	let mb = K * K;
 	match f.partial_cmp(&gb) {
-		Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} GB", f / gb),
+		Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+			format!("{:.2} GB", f / gb)
+		}
 		Some(std::cmp::Ordering::Less) | None => match f.partial_cmp(&mb) {
-			Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} MB", f / mb),
+			Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+				format!("{:.2} MB", f / mb)
+			}
 			Some(std::cmp::Ordering::Less) | None => match f.partial_cmp(&K) {
-				Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => format!("{:.2} KB", f / K),
+				Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+					format!("{:.2} KB", f / K)
+				}
 				Some(std::cmp::Ordering::Less) | None => format!("{b} B"),
 			},
 		},
@@ -106,18 +112,24 @@ fn oom_report(req: usize) {
 			.keys()
 			.filter_map(|k| {
 				let bytes = m.get(k).copied().unwrap_or(0);
-				Some(TagBytes { tag: *k, bytes }).filter(|tb| tb.bytes > 0)
+				Some(TagBytes { tag: k, bytes }).filter(|tb| tb.bytes > 0)
 			})
 			.collect(),
 		Err(_p) => Vec::new(),
 	};
 	autopsy.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-	let mut line: Vec<String> = autopsy.iter().map(|tb| oom_pair(tb.tag, &fmt_bytes(tb.bytes))).collect();
+	let mut line: Vec<String> = autopsy
+		.iter()
+		.map(|tb| oom_pair(tb.tag, &fmt_bytes(tb.bytes)))
+		.collect();
 	line.push(oom_pair("req", &fmt_bytes(req)));
 	line.push(oom_pair("free", &fmt_bytes(free)));
 	line.push(oom_pair("total", &fmt_bytes(total)));
 	line.push(oom_pair("over", &fmt_bytes(req.saturating_sub(free))));
-	line.push(oom_pair("slack", &fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0))));
+	line.push(oom_pair(
+		"slack",
+		&fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0)),
+	));
 	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
 	eprintln!("{}", line.join(", "));
 	eprintln!(
@@ -127,7 +139,6 @@ fn oom_report(req: usize) {
 		oom_pair("D2D", &fmt_bytes(D2D_BYTES.load(Ordering::Relaxed))),
 	);
 }
-
 
 struct FdinfoMem {
 	vram_kib: u64,
@@ -148,9 +159,23 @@ fn kernel_fdinfo() -> Option<FdinfoMem> {
 			match line.strip_prefix("drm-client-id:") {
 				Some(v) => client_id = Some(v.trim().to_string()),
 				None => match line.strip_prefix("drm-memory-vram:") {
-					Some(v) => vram_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0),
+					Some(v) => {
+						vram_kib = v
+							.trim()
+							.trim_end_matches("KiB")
+							.trim()
+							.parse()
+							.unwrap_or(0)
+					}
 					None => match line.strip_prefix("drm-memory-gtt:") {
-						Some(v) => gtt_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0),
+						Some(v) => {
+							gtt_kib = v
+								.trim()
+								.trim_end_matches("KiB")
+								.trim()
+								.parse()
+								.unwrap_or(0)
+						}
 						None => continue,
 					},
 				},
@@ -159,11 +184,16 @@ fn kernel_fdinfo() -> Option<FdinfoMem> {
 		let Some(id) = client_id else {
 			continue;
 		};
-		by_client.entry(id).or_insert(FdinfoMem { vram_kib, gtt_kib });
+		by_client
+			.entry(id)
+			.or_insert(FdinfoMem { vram_kib, gtt_kib });
 	}
 	let vram_total: u64 = by_client.values().map(|cm| cm.vram_kib).sum();
 	let gtt_total: u64 = by_client.values().map(|cm| cm.gtt_kib).sum();
-	Some(FdinfoMem { vram_kib: vram_total, gtt_kib: gtt_total })
+	Some(FdinfoMem {
+		vram_kib: vram_total,
+		gtt_kib: gtt_total,
+	})
 }
 
 struct KindLabel {
@@ -184,7 +214,10 @@ pub fn ledger_report() -> String {
 		.lock()
 		.map(|m| {
 			m.keys()
-				.map(|k| TagBytes { tag: *k, bytes: m.get(k).copied().unwrap_or(0) })
+				.map(|k| TagBytes {
+					tag: k,
+					bytes: m.get(k).copied().unwrap_or(0),
+				})
 				.collect()
 		})
 		.unwrap_or_default();
@@ -195,7 +228,12 @@ pub fn ledger_report() -> String {
 	for tb in &live {
 		total_live += tb.bytes;
 		let pk = peak.get(tb.tag).copied().unwrap_or(0);
-		s += &format!("  {:<14} live {:>11}  peak {:>11}\n", tb.tag, fmt_bytes(tb.bytes), fmt_bytes(pk));
+		s += &format!(
+			"  {:<14} live {:>11}  peak {:>11}\n",
+			tb.tag,
+			fmt_bytes(tb.bytes),
+			fmt_bytes(pk)
+		);
 	}
 	s += &format!("  {:<14} live {:>11}\n", "TOTAL", fmt_bytes(total_live));
 	s += &format!(
@@ -209,7 +247,10 @@ pub fn ledger_report() -> String {
 	);
 	let a = crate::callspy::MALLOC_ASYNC.load(Ordering::Relaxed) as usize;
 	let f = FREE_TOTAL.load(Ordering::Relaxed);
-	s += &format!("  device     allocs {a}  frees {f}  live-buffers {}\n", a.saturating_sub(f));
+	s += &format!(
+		"  device     allocs {a}  frees {f}  live-buffers {}\n",
+		a.saturating_sub(f)
+	);
 
 	let live_sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_live".as_ptr()) };
 	match std::ptr::NonNull::new(live_sym) {
@@ -228,15 +269,29 @@ pub fn ledger_report() -> String {
 			let allocs_fn = to_u32_u64(sym(c"vramspy_allocs"));
 			let frees_fn = to_u32_u64(sym(c"vramspy_frees"));
 			let unknown_frees_fn = unsafe {
-				std::mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(c"vramspy_unknown_frees"))
+				std::mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(
+					c"vramspy_unknown_frees",
+				))
 			};
 
 			s += "  global (vramspy, every byte incl. runtime+libs)\n";
 			let kinds = [
-				KindLabel { kind: 0, label: "device" },
-				KindLabel { kind: 1, label: "pinned" },
-				KindLabel { kind: 2, label: "kernarg" },
-				KindLabel { kind: 3, label: "other" },
+				KindLabel {
+					kind: 0,
+					label: "device",
+				},
+				KindLabel {
+					kind: 1,
+					label: "pinned",
+				},
+				KindLabel {
+					kind: 2,
+					label: "kernarg",
+				},
+				KindLabel {
+					kind: 3,
+					label: "other",
+				},
 			];
 			let rows: Vec<VramspyRow> = kinds
 				.into_iter()
@@ -260,7 +315,11 @@ pub fn ledger_report() -> String {
 				);
 			}
 			let delta = (device_live as usize).saturating_sub(total_live);
-			s += &format!("    library delta: {} (unknown frees: {})\n", fmt_bytes(delta), unknown_frees_fn());
+			s += &format!(
+				"    library delta: {} (unknown frees: {})\n",
+				fmt_bytes(delta),
+				unknown_frees_fn()
+			);
 		}
 	}
 
@@ -293,7 +352,7 @@ fn lifecycle() -> Lifecycle {
 }
 
 pub fn mark_shutting_down() {
-      SHUTTING_DOWN.store(1, Ordering::SeqCst);
+	SHUTTING_DOWN.store(1, Ordering::SeqCst);
 }
 
 #[derive(Clone, Copy)]
@@ -353,16 +412,18 @@ pub struct AllocGuard {
 }
 
 impl AllocGuard {
-      pub fn freeze() -> Self {
-            alloc_freeze();
-            AllocGuard { _marker: std::marker::PhantomData }
-      }
+	pub fn freeze() -> Self {
+		alloc_freeze();
+		AllocGuard {
+			_marker: std::marker::PhantomData,
+		}
+	}
 }
 
 impl Drop for AllocGuard {
-      fn drop(&mut self) {
-            alloc_unfreeze();
-      }
+	fn drop(&mut self) {
+		alloc_unfreeze();
+	}
 }
 
 const ARENA_ALIGN: usize = 256;
@@ -399,7 +460,15 @@ fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<()
 		H2D_CALLS.fetch_add(1, Ordering::Relaxed);
 		let pin = run_pin(bytes);
 		par_copy(pin, image.as_ptr() as *const u8, bytes);
-		unsafe { dev_copy(base, pin as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())? };
+		unsafe {
+			dev_copy(
+				base,
+				pin as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)?
+		};
 	}
 	crate::hip::device_synchronize()
 }
@@ -461,7 +530,7 @@ fn drain_arena_carve_map() {
 	};
 	for tag in m.keys() {
 		let bytes = m.get(tag).copied().unwrap_or(0);
-		tag_sub(*tag, bytes);
+		tag_sub(tag, bytes);
 	}
 	m.clear();
 }
@@ -476,13 +545,20 @@ pub fn park_run_backing(buf: GpuBuffer) {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	assert!(g.is_none(), "park_run_backing: a parked run backing already exists");
+	assert!(
+		g.is_none(),
+		"park_run_backing: a parked run backing already exists"
+	);
 	*g = Some(buf);
-	PARKED_GEN.store(PARK_GEN.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+	PARKED_GEN.store(
+		PARK_GEN.fetch_add(1, Ordering::Relaxed) + 1,
+		Ordering::Relaxed,
+	);
 }
 
 pub fn live_parked_gen() -> Option<usize> {
-	std::num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed)).map(std::num::NonZeroUsize::get)
+	std::num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed))
+		.map(std::num::NonZeroUsize::get)
 }
 
 enum ParkKind {
@@ -609,9 +685,7 @@ impl Stage {
 	pub fn is_empty(&self) -> bool {
 		self.host.is_empty()
 	}
-
 }
-
 
 enum Dir {
 	H2D,
@@ -629,7 +703,11 @@ pub unsafe fn xfer(
 	let dir = Some(kind)
 		.filter(|k| *k == HIP_MEMCPY_H2D)
 		.map(|_k| Dir::H2D)
-		.or_else(|| Some(kind).filter(|k| *k == HIP_MEMCPY_D2H).map(|_k| Dir::D2H))
+		.or_else(|| {
+			Some(kind)
+				.filter(|k| *k == HIP_MEMCPY_D2H)
+				.map(|_k| Dir::D2H)
+		})
 		.unwrap_or(Dir::D2D);
 	match dir {
 		Dir::H2D => {
@@ -664,7 +742,9 @@ unsafe fn dev_copy(
 }
 
 pub fn par_touch(v: &mut [u8]) {
-	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let threads = std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(1);
 	let per = v.len().div_ceil(threads).div_ceil(4096) * 4096;
 	std::thread::scope(|sc| {
 		for ch in v.chunks_mut(per.max(4096)) {
@@ -678,7 +758,9 @@ pub fn par_touch(v: &mut [u8]) {
 }
 
 pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
-	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let threads = std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(1);
 	let per = bytes.div_ceil(threads);
 	let d = dst as usize;
 	let s0 = src as usize;
@@ -691,7 +773,11 @@ pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 			};
 			let len = per.min(remaining);
 			sc.spawn(move || unsafe {
-				std::ptr::copy_nonoverlapping((s0 as *const u8).add(off), (d as *mut u8).add(off), len);
+				std::ptr::copy_nonoverlapping(
+					(s0 as *const u8).add(off),
+					(d as *mut u8).add(off),
+					len,
+				);
 			});
 		}
 	});
@@ -738,7 +824,10 @@ pub(crate) struct BounceRange {
 
 pub(crate) fn bounce_range() -> Option<BounceRange> {
 	let base = *BOUNCE.lock().ok()?;
-	std::num::NonZeroUsize::new(base).map(|nz| BounceRange { base: nz.get(), len: BOUNCE_BYTES })
+	std::num::NonZeroUsize::new(base).map(|nz| BounceRange {
+		base: nz.get(),
+		len: BOUNCE_BYTES,
+	})
 }
 
 struct Range {
@@ -848,8 +937,16 @@ pub struct ExitD2H {
 
 impl ExitD2H {
 	pub fn finish(self, dst: &mut [f64]) {
-		assert_eq!(std::mem::size_of_val(dst), self.bytes, "ExitD2H::finish size mismatch");
-		par_copy(dst.as_mut_ptr() as *mut u8, self.pin as *const u8, self.bytes);
+		assert_eq!(
+			std::mem::size_of_val(dst),
+			self.bytes,
+			"ExitD2H::finish size mismatch"
+		);
+		par_copy(
+			dst.as_mut_ptr() as *mut u8,
+			self.pin as *const u8,
+			self.bytes,
+		);
 	}
 }
 
@@ -861,8 +958,20 @@ pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD
 	let pin = pin_ensure(&mut guard, bytes);
 	D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
 	D2H_CALLS.fetch_add(1, Ordering::Relaxed);
-	unsafe { dev_copy(pin as *mut c_void, src, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
-	Ok(ExitD2H { _guard: guard, pin: pin as usize, bytes })
+	unsafe {
+		dev_copy(
+			pin as *mut c_void,
+			src,
+			bytes,
+			HIP_MEMCPY_D2H,
+			std::ptr::null_mut(),
+		)
+	}?;
+	Ok(ExitD2H {
+		_guard: guard,
+		pin: pin as usize,
+		bytes,
+	})
 }
 
 pub(crate) unsafe fn memset_dev(
@@ -893,7 +1002,6 @@ pub(crate) fn device_init_once() {
 	});
 }
 
-
 pub fn pool_trim() {
 	crate::hip::device_synchronize().expect("pool_trim sync");
 	crate::hip::trim_mempool(0).expect("pool_trim");
@@ -921,7 +1029,9 @@ pub fn set_device_arena(base: *mut c_void, size: usize) {
 pub fn arena_remaining() -> usize {
 	match std::num::NonZeroUsize::new(ARENA_BASE.load(Ordering::Relaxed)) {
 		None => 0,
-		Some(_base) => ARENA_SIZE.load(Ordering::Relaxed).saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed)),
+		Some(_base) => ARENA_SIZE
+			.load(Ordering::Relaxed)
+			.saturating_sub(ARENA_OFFSET.load(Ordering::Relaxed)),
 	}
 }
 
@@ -933,15 +1043,20 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
 		if probe_survives(want) {
-			eprintln!("claim probe: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64);
+			eprintln!(
+				"claim probe: {:.2} GB (probe-verified)",
+				want as f64 / (1u64 << 30) as f64
+			);
 			return Some(want);
 		}
-		eprintln!("claim probe: {:.2} GB unmappable, backing off", want as f64 / (1u64 << 30) as f64);
+		eprintln!(
+			"claim probe: {:.2} GB unmappable, backing off",
+			want as f64 / (1u64 << 30) as f64
+		);
 		want -= want / 16;
 	}
 	None
 }
-
 
 #[derive(Clone, Copy)]
 enum Ownership {
@@ -969,7 +1084,9 @@ impl GpuBuffer {
 		}
 	}
 
-	pub fn is_pool_owned(&self) -> bool { matches!(self.owned, Ownership::Pool) }
+	pub fn is_pool_owned(&self) -> bool {
+		matches!(self.owned, Ownership::Pool)
+	}
 
 	pub fn alloc(n_floats: usize) -> Result<Self, HipError> {
 		Self::alloc_bytes(n_floats * std::mem::size_of::<f64>())
@@ -1057,7 +1174,10 @@ impl GpuBuffer {
 	pub(crate) fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
 		device_init_once();
 		ALLOC_FROZEN.with(|f| {
-			assert!(matches!(f.get(), Frozen::No), "GPU claim inside frozen training loop (requested {n_bytes} bytes)")
+			assert!(
+				matches!(f.get(), Frozen::No),
+				"GPU claim inside frozen training loop (requested {n_bytes} bytes)"
+			)
 		});
 		assert_eq!(
 			ARENA_BASE.load(Ordering::Relaxed),
@@ -1090,15 +1210,31 @@ impl GpuBuffer {
 			self.len
 		);
 		unsafe {
-			xfer(self.ptr, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				self.ptr,
+				data.as_ptr() as *const c_void,
+				data.len(),
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}
 	}
 
 	pub fn load(&self, data: &[f64]) -> Result<(), HipError> {
 		let bytes = std::mem::size_of_val(data);
-		assert!(bytes <= self.len, "load: {bytes} bytes into a {}-byte buffer", self.len);
+		assert!(
+			bytes <= self.len,
+			"load: {bytes} bytes into a {}-byte buffer",
+			self.len
+		);
 		unsafe {
-			xfer(self.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				self.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}
 	}
 
@@ -1106,7 +1242,13 @@ impl GpuBuffer {
 		let bytes = data.len() * 4;
 		let buf = Self::alloc_bytes(bytes)?;
 		unsafe {
-			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				buf.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}?;
 		Ok(buf)
 	}
@@ -1115,7 +1257,13 @@ impl GpuBuffer {
 		let bytes = data.len() * 4;
 		let buf = Self::alloc_bytes(bytes)?;
 		unsafe {
-			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				buf.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}?;
 		Ok(buf)
 	}
@@ -1133,18 +1281,42 @@ impl GpuBuffer {
 
 	pub fn download_f32(&self, dst: &mut [f32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 
 	pub fn download_u8(&self, dst: &mut [u8]) -> Result<(), HipError> {
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len(), HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				dst.len(),
+				HIP_MEMCPY_D2H,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 
 	pub fn download_i32(&self, dst: &mut [i32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 
@@ -1180,7 +1352,15 @@ impl GpuBuffer {
 	}
 
 	pub fn copy_from(&mut self, src: &GpuBuffer, n_bytes: usize) -> Result<(), HipError> {
-		unsafe { xfer(self.ptr, src.ptr as *const c_void, n_bytes, HIP_MEMCPY_D2D, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				self.ptr,
+				src.ptr as *const c_void,
+				n_bytes,
+				HIP_MEMCPY_D2D,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 
@@ -1192,7 +1372,15 @@ impl GpuBuffer {
 	pub unsafe fn upload_async(data: &[f64], stream: *mut c_void) -> Result<Self, HipError> {
 		let bytes = std::mem::size_of_val(data);
 		let buf = Self::alloc(data.len())?;
-		unsafe { xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, stream) }?;
+		unsafe {
+			xfer(
+				buf.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				stream,
+			)
+		}?;
 		Ok(buf)
 	}
 
@@ -1202,21 +1390,43 @@ impl GpuBuffer {
 		stream: *mut c_void,
 	) -> Result<(), HipError> {
 		let bytes = std::mem::size_of_val(dst);
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, stream) }
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				stream,
+			)
+		}
 	}
 
 	pub fn upload_f16(data: &[half::f16]) -> Result<Self, HipError> {
 		let bytes = data.len() * 2;
 		let buf = Self::alloc_bytes(bytes)?;
 		unsafe {
-			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				buf.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}?;
 		Ok(buf)
 	}
 
 	pub fn download_f16(&self, dst: &mut [half::f16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 
@@ -1224,14 +1434,28 @@ impl GpuBuffer {
 		let bytes = data.len() * 2;
 		let buf = Self::alloc_bytes(bytes)?;
 		unsafe {
-			xfer(buf.ptr, data.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D, std::ptr::null_mut())
+			xfer(
+				buf.ptr,
+				data.as_ptr() as *const c_void,
+				bytes,
+				HIP_MEMCPY_H2D,
+				std::ptr::null_mut(),
+			)
 		}?;
 		Ok(buf)
 	}
 
 	pub fn download_bf16(&self, dst: &mut [half::bf16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;
-		unsafe { xfer(dst.as_mut_ptr() as *mut c_void, self.ptr, bytes, HIP_MEMCPY_D2H, std::ptr::null_mut()) }?;
+		unsafe {
+			xfer(
+				dst.as_mut_ptr() as *mut c_void,
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				std::ptr::null_mut(),
+			)
+		}?;
 		crate::hip::device_synchronize()
 	}
 }

@@ -1,8 +1,8 @@
 use crate::hip::{HipError, check};
 use crate::infer_ops::gpu_gemm_bt_f64;
 use crate::kernels::{
-	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at,
-	gpu_softmax_backward_into, gpu_softmax_rows_into,
+	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_softmax_backward_into,
+	gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
@@ -12,7 +12,6 @@ fn cl() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	check(unsafe { crate::hip::hipGetLastError() })
 }
-
 
 unsafe extern "C" {
 	fn launch_moex_weighted_accumulate(
@@ -149,7 +148,11 @@ pub fn gpu_moe_backward(
 		gpu_gemm_bt_f64(&d_ye, &we, n_tokens, d_model, d_model, &dh_e)?;
 		gpu_add_inplace(&dh_e, n_tokens * d_model, &d_hidden)?;
 		gpu_gemm_at(hidden, &d_ye, d_model, d_model, n_tokens, &dwe)?;
-		gpu_copy_into(&dwe, expert_stride, &d_expert_w.view(e * expert_stride, expert_stride))?;
+		gpu_copy_into(
+			&dwe,
+			expert_stride,
+			&d_expert_w.view(e * expert_stride, expert_stride),
+		)?;
 	}
 
 	let d_logits = GpuBuffer::alloc(n_tokens * n_experts)?;

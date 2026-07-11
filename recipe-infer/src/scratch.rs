@@ -1,6 +1,6 @@
-use anyhow::Context;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
+use anyhow::Context;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 
@@ -94,14 +94,22 @@ pub fn layer_ms_from(
 	let f = (0..layers)
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
-			assert!(e.is_ok(), "fwd elapsed: {}", e.as_ref().err().map(|x| x.to_string()).unwrap_or_default());
+			assert!(
+				e.is_ok(),
+				"fwd elapsed: {}",
+				e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+			);
 			e.unwrap_or(0.0) as f64
 		})
 		.collect();
 	let b = (0..layers)
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]);
-			assert!(e.is_ok(), "bwd elapsed: {}", e.as_ref().err().map(|x| x.to_string()).unwrap_or_default());
+			assert!(
+				e.is_ok(),
+				"bwd elapsed: {}",
+				e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+			);
 			e.unwrap_or(0.0) as f64
 		})
 		.collect();
@@ -109,15 +117,28 @@ pub fn layer_ms_from(
 }
 
 impl Scratch {
-	pub fn new_full(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> anyhow::Result<Scratch> {
+	pub fn new_full(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+	) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, false, false, consts, 1)
 	}
 
-	pub fn carve(params: &[LayerParams], n: usize, consts: &GpuBuffer, n_timed: usize) -> anyhow::Result<Scratch> {
+	pub fn carve(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+		n_timed: usize,
+	) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, false, true, consts, n_timed)
 	}
 
-	pub fn new_infer(params: &[LayerParams], n: usize, consts: &GpuBuffer) -> anyhow::Result<Scratch> {
+	pub fn new_infer(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+	) -> anyhow::Result<Scratch> {
 		Self::new_inner(params, n, true, false, consts, 0)
 	}
 
@@ -151,7 +172,9 @@ impl Scratch {
 		let mut has_prelu = false;
 		for p in params {
 			let dw_dp = match p.kind {
-				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
+				LayerKind::Dense => {
+					kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim)
+				}
 				LayerKind::Attn => {
 					let s = p.in_dim / p.dim;
 					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
@@ -222,7 +245,14 @@ impl Scratch {
 		let mut acts = Vec::with_capacity(params.len());
 		let mut preact = Vec::with_capacity(params.len());
 		for p in params {
-			acts.push(alloc(if light && acts.len() + 1 != params.len() { 1 } else { n * p.out_dim }, "scratch acts")?);
+			acts.push(alloc(
+				if light && acts.len() + 1 != params.len() {
+					1
+				} else {
+					n * p.out_dim
+				},
+				"scratch acts",
+			)?);
 			let needs_pre = matches!(
 				p.act,
 				Activation::Silu
@@ -246,7 +276,9 @@ impl Scratch {
 				let lout = (lin - p.conv_k) / p.conv_stride + 1;
 				let cout = p.out_dim / lout;
 				let fsz = cout * p.conv_cin * p.conv_k;
-				if fsz > max_conv_fsz { max_conv_fsz = fsz; }
+				if fsz > max_conv_fsz {
+					max_conv_fsz = fsz;
+				}
 			}
 		}
 		let (conv_temp_buf, conv_wg_count) = if !forward_only && !light && max_conv_fsz > 0 {
@@ -256,7 +288,9 @@ impl Scratch {
 			let chunks = (usable / (max_conv_fsz * 8)).min(n).max(1);
 			let buf = alloc(max_conv_fsz * chunks, "conv_temp")?;
 			let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunks, max_conv_fsz);
-			if ws > max_ws { max_ws = ws; }
+			if ws > max_ws {
+				max_ws = ws;
+			}
 			(buf, chunks)
 		} else {
 			(alloc(1, "conv_temp")?, 0)
@@ -349,27 +383,46 @@ impl Scratch {
 
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut()) };
-			assert!(r.is_ok(), "record fwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
+			let r = unsafe {
+				self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
+			};
+			assert!(
+				r.is_ok(),
+				"record fwd event: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			);
 		}
 	}
 
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut()) };
-			assert!(r.is_ok(), "record bwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
+			let r = unsafe {
+				self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
+			};
+			assert!(
+				r.is_ok(),
+				"record bwd event: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			);
 		}
 	}
 
 	pub fn layer_ms(&self, layers: usize) -> LayerMs {
 		let s = self.timing_slot.get();
 		let r = self.ev_bwd[s][0].synchronize();
-		assert!(r.is_ok(), "sync bwd event: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
+		assert!(
+			r.is_ok(),
+			"sync bwd event: {}",
+			r.err().map(|e| e.to_string()).unwrap_or_default()
+		);
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
 	pub fn take_events(&mut self) -> LayerEvents {
-		LayerEvents { fwd: std::mem::take(&mut self.ev_fwd), bwd: std::mem::take(&mut self.ev_bwd) }
+		LayerEvents {
+			fwd: std::mem::take(&mut self.ev_fwd),
+			bwd: std::mem::take(&mut self.ev_bwd),
+		}
 	}
 
 	pub fn download_scalar_deferred(&self) {
@@ -398,7 +451,11 @@ impl Scratch {
 
 	pub fn sync_deferred_scalar(&self) -> f64 {
 		let r = self.copy_stream.synchronize();
-		assert!(r.is_ok(), "sync copy stream: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
+		assert!(
+			r.is_ok(),
+			"sync copy stream: {}",
+			r.err().map(|e| e.to_string()).unwrap_or_default()
+		);
 		unsafe { *self.pinned_scalar }
 	}
 
@@ -409,7 +466,11 @@ impl Scratch {
 
 	pub fn sync_copy_stream(&self) {
 		let r = self.copy_stream.synchronize();
-		assert!(r.is_ok(), "sync copy stream: {}", r.err().map(|e| e.to_string()).unwrap_or_default());
+		assert!(
+			r.is_ok(),
+			"sync copy stream: {}",
+			r.err().map(|e| e.to_string()).unwrap_or_default()
+		);
 	}
 
 	pub fn deferred_scalar(&self) -> f64 {
@@ -425,18 +486,49 @@ impl Drop for Scratch {
 		let owned_any = self.acts.iter().any(GpuBuffer::is_pool_owned)
 			|| self.preact.iter().any(GpuBuffer::is_pool_owned)
 			|| [
-				&self.da_a, &self.da_b, &self.dz, &self.dw, &self.dw_partials, &self.db,
-				&self.metric_t0, &self.metric_t1, &self.metric_t2,
-				&self.metric_scalar, &self.metric_scalar_b,
-				&self.c_one, &self.c_neg_one, &self.c_half, &self.c_eps, &self.c_one_minus_eps,
-				&self.c_leaky_alpha, &self.c_elu_alpha, &self.c_selu_alpha, &self.c_selu_lambda,
-				&self.c_focal_gamma, &self.c_focal_alpha, &self.c_rope_theta,
-				&self.reduce_ws, &self.embed_grad,
-				&self.a_q, &self.a_k, &self.a_v, &self.a_ctx, &self.a_lse,
-				&self.a_dctx, &self.a_dq, &self.a_dk, &self.a_dv, &self.a_dsum,
-				&self.a_gw, &self.a_dbias,
-				&self.prelu_t0, &self.prelu_t1, &self.prelu_scalar,
-				&self.concat, &self.concat_dgrad, &self.conv_temp,
+				&self.da_a,
+				&self.da_b,
+				&self.dz,
+				&self.dw,
+				&self.dw_partials,
+				&self.db,
+				&self.metric_t0,
+				&self.metric_t1,
+				&self.metric_t2,
+				&self.metric_scalar,
+				&self.metric_scalar_b,
+				&self.c_one,
+				&self.c_neg_one,
+				&self.c_half,
+				&self.c_eps,
+				&self.c_one_minus_eps,
+				&self.c_leaky_alpha,
+				&self.c_elu_alpha,
+				&self.c_selu_alpha,
+				&self.c_selu_lambda,
+				&self.c_focal_gamma,
+				&self.c_focal_alpha,
+				&self.c_rope_theta,
+				&self.reduce_ws,
+				&self.embed_grad,
+				&self.a_q,
+				&self.a_k,
+				&self.a_v,
+				&self.a_ctx,
+				&self.a_lse,
+				&self.a_dctx,
+				&self.a_dq,
+				&self.a_dk,
+				&self.a_dv,
+				&self.a_dsum,
+				&self.a_gw,
+				&self.a_dbias,
+				&self.prelu_t0,
+				&self.prelu_t1,
+				&self.prelu_scalar,
+				&self.concat,
+				&self.concat_dgrad,
+				&self.conv_temp,
 			]
 			.iter()
 			.any(|b| b.is_pool_owned());
@@ -452,7 +544,11 @@ fn pinned_scalar_pair() -> *mut f64 {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
 	if *g == 0 {
 		let hm = gpu_core::hip::host_malloc(16, 0);
-		assert!(hm.is_ok(), "pinned scalars: {}", hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default());
+		assert!(
+			hm.is_ok(),
+			"pinned scalars: {}",
+			hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+		);
 		*g = hm.unwrap_or(std::ptr::null_mut()) as usize;
 	}
 	*g as *mut f64
@@ -485,7 +581,9 @@ impl Scratch {
 		for p in params {
 			floats += n * p.out_dim;
 			let dw_dp = match p.kind {
-				LayerKind::Dense => kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim),
+				LayerKind::Dense => {
+					kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim)
+				}
 				LayerKind::Attn => {
 					let s = p.in_dim / p.dim;
 					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
@@ -579,7 +677,15 @@ impl Scratch {
 	}
 }
 
-pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: usize, c_cat: usize, forward_only: bool) -> usize {
+pub fn vram_estimate(
+	specs: &[LayerSpec],
+	n: usize,
+	d: usize,
+	k: usize,
+	vocab: usize,
+	c_cat: usize,
+	forward_only: bool,
+) -> usize {
 	let f8 = std::mem::size_of::<f64>();
 	let mut bytes = 0usize;
 	bytes += 2 * n * d * f8;
@@ -590,7 +696,8 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 	bytes += n * k * f8;
 	let mut in_dim = d;
 	let mut embed_dim = 0usize;
-	let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation, usize)> = Vec::new();
+	let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation, usize)> =
+		Vec::new();
 	for spec in specs {
 		match *spec {
 			LayerSpec::Embed(dim, _) => {
@@ -599,14 +706,30 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 				bytes += seq * dim * f8;
 				let out = seq * dim;
 				embed_dim = dim;
-				fake_params.push((in_dim, out, LayerKind::Embed, dim, vocab, Activation::Linear, 0));
+				fake_params.push((
+					in_dim,
+					out,
+					LayerKind::Embed,
+					dim,
+					vocab,
+					Activation::Linear,
+					0,
+				));
 				in_dim = out;
 			}
 			LayerSpec::Attn(heads) => {
 				let d_tok = if embed_dim > 0 { embed_dim } else { in_dim };
 				bytes += 4 * d_tok * d_tok * f8;
 				bytes += 4 * d_tok * f8;
-				fake_params.push((in_dim, in_dim, LayerKind::Attn, d_tok, 0, Activation::Linear, heads));
+				fake_params.push((
+					in_dim,
+					in_dim,
+					LayerKind::Attn,
+					d_tok,
+					0,
+					Activation::Linear,
+					heads,
+				));
 			}
 			LayerSpec::Conv(filters, kernel, stride, act) => {
 				let cin = fake_params.last().map_or(1, |(_, _, kind, ..)| {
@@ -614,8 +737,15 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 				});
 				let cin = if cin == 0 {
 					match fake_params.last() {
-						Some(prev) => prev.1 / ((prev.0 / prev.3.max(1) - prev.4) / prev.6.max(1) + 1).max(1),
-						None => { assert!(false, "conv cin"); 0 }
+						Some(prev) => {
+							prev.1 / ((prev.0 / prev.3.max(1) - prev.4)
+								/ prev.6.max(1) + 1)
+								.max(1)
+						}
+						None => {
+							assert!(false, "conv cin");
+							0
+						}
 					}
 				} else {
 					cin
@@ -632,9 +762,12 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 				in_dim = out;
 			}
 			LayerSpec::Dense(units, act) => {
-				let actual_in = if c_cat > 0 && !fake_params.is_empty()
-					&& matches!(fake_params.last(), Some((_, _, LayerKind::Embed | LayerKind::Attn, ..)))
-				{
+				let actual_in = if c_cat > 0
+					&& !fake_params.is_empty()
+					&& matches!(
+						fake_params.last(),
+						Some((_, _, LayerKind::Embed | LayerKind::Attn, ..))
+					) {
 					in_dim + c_cat
 				} else {
 					in_dim
@@ -653,16 +786,28 @@ pub fn vram_estimate(specs: &[LayerSpec], n: usize, d: usize, k: usize, vocab: u
 		.iter()
 		.map(|&(i, o, kind, dim, vocab, act, heads)| {
 			let dummy = || GpuBuffer::borrow(std::ptr::null_mut(), 0);
-			let (cc, ck, cs) = if kind == LayerKind::Conv { (dim, vocab, heads) } else { (0, 0, 0) };
+			let (cc, ck, cs) = if kind == LayerKind::Conv {
+				(dim, vocab, heads)
+			} else {
+				(0, 0, 0)
+			};
 			LayerParams {
 				kind,
-				w: dummy(), b: dummy(),
-				in_dim: i, out_dim: o, act,
-				dim: dim.max(1), vocab,
-				wk: dummy(), wv: dummy(), wo: dummy(),
+				w: dummy(),
+				b: dummy(),
+				in_dim: i,
+				out_dim: o,
+				act,
+				dim: dim.max(1),
+				vocab,
+				wk: dummy(),
+				wv: dummy(),
+				wo: dummy(),
 				heads,
 				palpha: dummy(),
-				conv_cin: cc, conv_k: ck, conv_stride: cs,
+				conv_cin: cc,
+				conv_k: ck,
+				conv_stride: cs,
 			}
 		})
 		.collect();

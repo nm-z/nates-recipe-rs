@@ -247,7 +247,6 @@ unsafe extern "C" {
 	fn hipfftExecD2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void) -> i32;
 }
 
-
 pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
 	let status = unsafe {
@@ -278,16 +277,7 @@ pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErr
 	out.load(&[(result - 1).max(0) as f64])
 }
 
-
-
-
-
-pub fn gpu_dsyrk(
-	a: &GpuBuffer,
-	n: usize,
-	k: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
 	let status = unsafe {
@@ -307,7 +297,6 @@ pub fn gpu_dsyrk(
 	};
 	check(status)
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_bmm_into(
@@ -364,7 +353,6 @@ pub fn gpu_bmm_into(
 	};
 	check(status)
 }
-
 
 pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
@@ -481,7 +469,6 @@ pub fn gpu_lu_solve(
 	check(status)
 }
 
-
 pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -541,7 +528,6 @@ pub fn gpu_potrs(
 	};
 	check(status)
 }
-
 
 pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 	let k = m.min(n);
@@ -642,7 +628,6 @@ pub fn gpu_qr(
 	check(status)
 }
 
-
 pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
 	unsafe {
@@ -698,7 +683,6 @@ pub fn gpu_eigh_sym(
 	};
 	check(status)
 }
-
 
 pub fn gpu_svd_workspace_bytes(m: usize, n: usize) -> usize {
 	let mut lwork: i32 = 0;
@@ -766,7 +750,6 @@ pub fn gpu_svd(
 	crate::kernels::gpu_transpose(&v, n, n, vt_out)
 }
 
-
 struct CachedFftPlan {
 	plan: usize,
 }
@@ -793,7 +776,12 @@ fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 			let mut plan: *mut c_void = std::ptr::null_mut();
 			let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
 			check(status)?;
-			cache.insert(key, CachedFftPlan { plan: plan as usize });
+			cache.insert(
+				key,
+				CachedFftPlan {
+					plan: plan as usize,
+				},
+			);
 			Ok(plan)
 		}
 	}

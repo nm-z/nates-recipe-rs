@@ -17,103 +17,126 @@ use gpu_core::{hip, kernels, linalg};
 // Per batch: C(m×n) = opA(A)·opB(B). A is (m×k) unless ta (then stored k×m),
 // B is (k×n) unless tb (then stored n×k). All batches packed contiguously.
 fn cpu_bmm(
-      a: &[f64],
-      b: &[f64],
-      batch: usize,
-      m: usize,
-      n: usize,
-      k: usize,
-      ta: bool,
-      tb: bool,
+	a: &[f64],
+	b: &[f64],
+	batch: usize,
+	m: usize,
+	n: usize,
+	k: usize,
+	ta: bool,
+	tb: bool,
 ) -> Vec<f64> {
-      let mut c = vec![0.0f64; batch * m * n];
-      for bi in 0..batch {
-            let ao = bi * m * k;
-            let bo = bi * k * n;
-            let co = bi * m * n;
-            for i in 0..m {
-                  for j in 0..n {
-                        let mut s = 0.0;
-                        for p in 0..k {
-                              // A row-major: untransposed (m×k) -> a[i*k+p];
-                              //              transposed   (k×m) -> a[p*m+i].
-                              let av = if ta { a[ao + p * m + i] } else { a[ao + i * k + p] };
-                              // B row-major: untransposed (k×n) -> b[p*n+j];
-                              //              transposed   (n×k) -> b[j*k+p].
-                              let bv = if tb { b[bo + j * k + p] } else { b[bo + p * n + j] };
-                              s += av * bv;
-                        }
-                        c[co + i * n + j] = s;
-                  }
-            }
-      }
-      c
+	let mut c = vec![0.0f64; batch * m * n];
+	for bi in 0..batch {
+		let ao = bi * m * k;
+		let bo = bi * k * n;
+		let co = bi * m * n;
+		for i in 0..m {
+			for j in 0..n {
+				let mut s = 0.0;
+				for p in 0..k {
+					// A row-major: untransposed (m×k) -> a[i*k+p];
+					//              transposed   (k×m) -> a[p*m+i].
+					let av = if ta {
+						a[ao + p * m + i]
+					} else {
+						a[ao + i * k + p]
+					};
+					// B row-major: untransposed (k×n) -> b[p*n+j];
+					//              transposed   (n×k) -> b[j*k+p].
+					let bv = if tb {
+						b[bo + j * k + p]
+					} else {
+						b[bo + p * n + j]
+					};
+					s += av * bv;
+				}
+				c[co + i * n + j] = s;
+			}
+		}
+	}
+	c
 }
 
 // Single C(m×n) = A(m×k)·B(k×n), row-major.
 fn cpu_gemm(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
-      cpu_bmm(a, b, 1, m, n, k, false, false)
+	cpu_bmm(a, b, 1, m, n, k, false, false)
 }
 
 fn max_abs_diff(want: &[f64], got: &[f64]) -> f64 {
-      want.iter()
-            .zip(got)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f64::max)
+	want.iter()
+		.zip(got)
+		.map(|(x, y)| (x - y).abs())
+		.fold(0.0, f64::max)
 }
 
 // Drive gpu_bmm_into for fully contiguous, no-offset batches (the common case).
 fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
-      hip::set_device(0).unwrap();
+	hip::set_device(0).unwrap();
 
-      // Stored dims account for transpose: A is (a_rows × a_cols), B is (b_rows × b_cols).
-      let a_rows = if ta { k } else { m };
-      let a_cols = if ta { m } else { k };
-      let b_rows = if tb { n } else { k };
-      let b_cols = if tb { k } else { n };
+	// Stored dims account for transpose: A is (a_rows × a_cols), B is (b_rows × b_cols).
+	let a_rows = if ta { k } else { m };
+	let a_cols = if ta { m } else { k };
+	let b_rows = if tb { n } else { k };
+	let b_cols = if tb { k } else { n };
 
-      // Deterministic, well-conditioned data.
-      let a: Vec<f64> = (0..batch * a_rows * a_cols)
-            .map(|i| (i as f64 * 0.37).sin() + 0.1 * i as f64)
-            .collect();
-      let b: Vec<f64> = (0..batch * b_rows * b_cols)
-            .map(|i| (i as f64 * 0.53).cos() - 0.05 * i as f64)
-            .collect();
+	// Deterministic, well-conditioned data.
+	let a: Vec<f64> = (0..batch * a_rows * a_cols)
+		.map(|i| (i as f64 * 0.37).sin() + 0.1 * i as f64)
+		.collect();
+	let b: Vec<f64> = (0..batch * b_rows * b_cols)
+		.map(|i| (i as f64 * 0.53).cos() - 0.05 * i as f64)
+		.collect();
 
-      let want = cpu_bmm(&a, &b, batch, m, n, k, ta, tb);
+	let want = cpu_bmm(&a, &b, batch, m, n, k, ta, tb);
 
-      let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let cg = GpuBuffer::alloc(batch * m * n).unwrap();
+	let ag = {
+		let __up = &a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bg = {
+		let __up = &b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let cg = GpuBuffer::alloc(batch * m * n).unwrap();
 
-      linalg::gpu_bmm_into(
-            &ag,
-            &bg,
-            batch,
-            m,
-            n,
-            k,
-            a_cols,            // lda = row length of stored A
-            b_cols,            // ldb = row length of stored B
-            n,                 // ldc
-            a_rows * a_cols,   // stride_a
-            b_rows * b_cols,   // stride_b
-            m * n,             // stride_c
-            0,
-            0,
-            0,
-            ta as usize,
-            tb as usize,
-            &cg,
-      )
-      .unwrap();
+	linalg::gpu_bmm_into(
+		&ag,
+		&bg,
+		batch,
+		m,
+		n,
+		k,
+		a_cols,          // lda = row length of stored A
+		b_cols,          // ldb = row length of stored B
+		n,               // ldc
+		a_rows * a_cols, // stride_a
+		b_rows * b_cols, // stride_b
+		m * n,           // stride_c
+		0,
+		0,
+		0,
+		ta as usize,
+		tb as usize,
+		&cg,
+	)
+	.unwrap();
 
-      let got = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
-      let d = max_abs_diff(&want, &got);
-      assert!(
-            d < 1e-9,
-            "bmm parity failed batch={batch} m={m} n={n} k={k} ta={ta} tb={tb} maxdiff={d:.3e}"
-      );
+	let got = {
+		let mut __dv = vec![0.0f64; cg.n_floats()];
+		unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		gpu_core::hip::device_synchronize().unwrap();
+		__dv
+	};
+	let d = max_abs_diff(&want, &got);
+	assert!(
+		d < 1e-9,
+		"bmm parity failed batch={batch} m={m} n={n} k={k} ta={ta} tb={tb} maxdiff={d:.3e}"
+	);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -121,51 +144,83 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
 // Square, multiple-of-32 size: clean warp-aligned path.
 #[test]
 fn bmm_parity_square_aligned() {
-      run_bmm_case(4, 32, 32, 32, false, false);
+	run_bmm_case(4, 32, 32, 32, false, false);
 }
 
 // Non-square AND not a multiple of 32: stresses ragged warp tails.
 #[test]
 fn bmm_parity_nonsquare_ragged() {
-      run_bmm_case(3, 17, 23, 11, false, false);
-      run_bmm_case(2, 13, 5, 19, false, false);
+	run_bmm_case(3, 17, 23, 11, false, false);
+	run_bmm_case(2, 13, 5, 19, false, false);
 }
 
 // All four transpose modes at a ragged size.
 #[test]
 fn bmm_parity_transpose_modes() {
-      run_bmm_case(3, 7, 13, 5, false, false);
-      run_bmm_case(3, 7, 13, 5, false, true);
-      run_bmm_case(3, 7, 13, 5, true, false);
-      run_bmm_case(3, 7, 13, 5, true, true);
+	run_bmm_case(3, 7, 13, 5, false, false);
+	run_bmm_case(3, 7, 13, 5, false, true);
+	run_bmm_case(3, 7, 13, 5, true, false);
+	run_bmm_case(3, 7, 13, 5, true, true);
 }
 
 // Single batch must agree with the single-matrix oracle too.
 #[test]
 fn bmm_parity_single_batch() {
-      run_bmm_case(1, 9, 6, 14, false, false);
+	run_bmm_case(1, 9, 6, 14, false, false);
 }
 
 // Explicit 2-batch case asserted element-by-element against a hand oracle,
 // as a self-contained sanity check independent of run_bmm_case plumbing.
 #[test]
 fn bmm_parity_two_batch_explicit() {
-      hip::set_device(0).unwrap();
-      let (batch, m, n, k) = (2usize, 3usize, 2usize, 4usize);
-      let a: Vec<f64> = (0..batch * m * k).map(|i| i as f64 + 1.0).collect();
-      let b: Vec<f64> = (0..batch * k * n).map(|i| (i as f64 + 1.0) * 0.5).collect();
-      let want = cpu_bmm(&a, &b, batch, m, n, k, false, false);
+	hip::set_device(0).unwrap();
+	let (batch, m, n, k) = (2usize, 3usize, 2usize, 4usize);
+	let a: Vec<f64> = (0..batch * m * k).map(|i| i as f64 + 1.0).collect();
+	let b: Vec<f64> = (0..batch * k * n).map(|i| (i as f64 + 1.0) * 0.5).collect();
+	let want = cpu_bmm(&a, &b, batch, m, n, k, false, false);
 
-      let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let cg = GpuBuffer::alloc(batch * m * n).unwrap();
-      linalg::gpu_bmm_into(
-            &ag, &bg, batch, m, n, k, k, n, n, m * k, k * n, m * n, 0, 0, 0, 0, 0, &cg,
-      )
-      .unwrap();
-      let got = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
-      let d = max_abs_diff(&want, &got);
-      assert!(d < 1e-9, "explicit 2-batch bmm maxdiff={d:.3e}");
+	let ag = {
+		let __up = &a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bg = {
+		let __up = &b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let cg = GpuBuffer::alloc(batch * m * n).unwrap();
+	linalg::gpu_bmm_into(
+		&ag,
+		&bg,
+		batch,
+		m,
+		n,
+		k,
+		k,
+		n,
+		n,
+		m * k,
+		k * n,
+		m * n,
+		0,
+		0,
+		0,
+		0,
+		0,
+		&cg,
+	)
+	.unwrap();
+	let got = {
+		let mut __dv = vec![0.0f64; cg.n_floats()];
+		unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		gpu_core::hip::device_synchronize().unwrap();
+		__dv
+	};
+	let d = max_abs_diff(&want, &got);
+	assert!(d < 1e-9, "explicit 2-batch bmm maxdiff={d:.3e}");
 }
 
 // End-to-end full-pipeline sanity: compose two single gpu_gemm matmuls
@@ -173,33 +228,58 @@ fn bmm_parity_two_batch_explicit() {
 // This mirrors how the forward pass stacks linear layers.
 #[test]
 fn gemm_pipeline_compose_parity() {
-      hip::set_device(0).unwrap();
-      // Deterministic tiny linear "dataset": X (rows×f0), W1 (f0×f1), W2 (f1×f2).
-      let (rows, f0, f1, f2) = (10usize, 6usize, 13usize, 4usize); // ragged, non-aligned
-      let x: Vec<f64> = (0..rows * f0).map(|i| (i as f64 * 0.11).sin()).collect();
-      let w1: Vec<f64> = (0..f0 * f1).map(|i| (i as f64 * 0.07).cos()).collect();
-      let w2: Vec<f64> = (0..f1 * f2).map(|i| (i as f64 * 0.13).sin()).collect();
+	hip::set_device(0).unwrap();
+	// Deterministic tiny linear "dataset": X (rows×f0), W1 (f0×f1), W2 (f1×f2).
+	let (rows, f0, f1, f2) = (10usize, 6usize, 13usize, 4usize); // ragged, non-aligned
+	let x: Vec<f64> = (0..rows * f0).map(|i| (i as f64 * 0.11).sin()).collect();
+	let w1: Vec<f64> = (0..f0 * f1).map(|i| (i as f64 * 0.07).cos()).collect();
+	let w2: Vec<f64> = (0..f1 * f2).map(|i| (i as f64 * 0.13).sin()).collect();
 
-      // CPU oracle: H = X·W1, Y = H·W2.
-      let h_cpu = cpu_gemm(&x, &w1, rows, f1, f0);
-      let y_cpu = cpu_gemm(&h_cpu, &w2, rows, f2, f1);
+	// CPU oracle: H = X·W1, Y = H·W2.
+	let h_cpu = cpu_gemm(&x, &w1, rows, f1, f0);
+	let y_cpu = cpu_gemm(&h_cpu, &w2, rows, f2, f1);
 
-      // GPU: chain two gpu_gemm calls, keeping intermediates on device.
-      let xg = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let w1g = { let __up = &w1; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let w2g = { let __up = &w2; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-      let hg = GpuBuffer::alloc(rows * f1).unwrap();
-      kernels::gpu_gemm(&xg, &w1g, rows, f1, f0, &hg).unwrap();
-      let yg = GpuBuffer::alloc(rows * f2).unwrap();
-      kernels::gpu_gemm(&hg, &w2g, rows, f2, f1, &yg).unwrap();
+	// GPU: chain two gpu_gemm calls, keeping intermediates on device.
+	let xg = {
+		let __up = &x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let w1g = {
+		let __up = &w1;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let w2g = {
+		let __up = &w2;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let hg = GpuBuffer::alloc(rows * f1).unwrap();
+	kernels::gpu_gemm(&xg, &w1g, rows, f1, f0, &hg).unwrap();
+	let yg = GpuBuffer::alloc(rows * f2).unwrap();
+	kernels::gpu_gemm(&hg, &w2g, rows, f2, f1, &yg).unwrap();
 
-      // Intermediate parity.
-      let h_gpu = { let mut __dv = vec![0.0f64; hg.n_floats()]; unsafe { hg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
-      let dh = max_abs_diff(&h_cpu, &h_gpu);
-      assert!(dh < 1e-9, "pipeline H maxdiff={dh:.3e}");
+	// Intermediate parity.
+	let h_gpu = {
+		let mut __dv = vec![0.0f64; hg.n_floats()];
+		unsafe { hg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		gpu_core::hip::device_synchronize().unwrap();
+		__dv
+	};
+	let dh = max_abs_diff(&h_cpu, &h_gpu);
+	assert!(dh < 1e-9, "pipeline H maxdiff={dh:.3e}");
 
-      // Final parity.
-      let y_gpu = { let mut __dv = vec![0.0f64; yg.n_floats()]; unsafe { yg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
-      let dy = max_abs_diff(&y_cpu, &y_gpu);
-      assert!(dy < 1e-9, "pipeline Y maxdiff={dy:.3e}");
+	// Final parity.
+	let y_gpu = {
+		let mut __dv = vec![0.0f64; yg.n_floats()];
+		unsafe { yg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		gpu_core::hip::device_synchronize().unwrap();
+		__dv
+	};
+	let dy = max_abs_diff(&y_cpu, &y_gpu);
+	assert!(dy < 1e-9, "pipeline Y maxdiff={dy:.3e}");
 }

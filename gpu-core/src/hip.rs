@@ -81,7 +81,12 @@ unsafe extern "C" {
 		kind: i32,
 		stream: *mut c_void,
 	) -> i32;
-	pub(crate) fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
+	pub(crate) fn hipMemsetAsync(
+		dst: *mut c_void,
+		value: i32,
+		size: usize,
+		stream: *mut c_void,
+	) -> i32;
 	pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	pub(crate) fn hipHostFree(ptr: *mut c_void) -> i32;
 	pub fn hipGetDeviceCount(count: *mut i32) -> i32;
@@ -93,10 +98,15 @@ unsafe extern "C" {
 		peer_device_id: i32,
 	) -> i32;
 	pub fn hipDeviceEnablePeerAccess(peer_device_id: i32, flags: u32) -> i32;
-	pub(crate) fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
+	pub(crate) fn hipMallocAsync(
+		dev_ptr: *mut *mut c_void,
+		size: usize,
+		stream: *mut c_void,
+	) -> i32;
 	pub(crate) fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
-	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
+	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void)
+	-> i32;
 	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub(crate) fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
 	pub fn vmm_granularity(out: *mut usize) -> i32;
@@ -157,7 +167,10 @@ pub fn device_synchronize() -> Result<(), HipError> {
 pub(crate) fn disable_sdma_once() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	ONCE.call_once(|| {
-		for _absent in Some(()).filter(|_u| std::env::var_os("HSA_ENABLE_SDMA").is_none()).into_iter() {
+		for _absent in Some(())
+			.filter(|_u| std::env::var_os("HSA_ENABLE_SDMA").is_none())
+			.into_iter()
+		{
 			unsafe { std::env::set_var("HSA_ENABLE_SDMA", "0") };
 		}
 	});
@@ -189,18 +202,45 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 	let e = unsafe { &*event };
 	for _fault in Some(()).filter(|_u| e.event_type == 0).into_iter() {
 		const REASONS: [FaultReason; 8] = [
-			FaultReason { bit: 1 << 0, name: "page-not-present" },
-			FaultReason { bit: 1 << 1, name: "read-only" },
-			FaultReason { bit: 1 << 2, name: "nx" },
-			FaultReason { bit: 1 << 3, name: "host-only" },
-			FaultReason { bit: 1 << 4, name: "dram-ecc" },
-			FaultReason { bit: 1 << 5, name: "imprecise" },
-			FaultReason { bit: 1 << 6, name: "sram-ecc" },
-			FaultReason { bit: 1 << 31, name: "hang" },
+			FaultReason {
+				bit: 1 << 0,
+				name: "page-not-present",
+			},
+			FaultReason {
+				bit: 1 << 1,
+				name: "read-only",
+			},
+			FaultReason {
+				bit: 1 << 2,
+				name: "nx",
+			},
+			FaultReason {
+				bit: 1 << 3,
+				name: "host-only",
+			},
+			FaultReason {
+				bit: 1 << 4,
+				name: "dram-ecc",
+			},
+			FaultReason {
+				bit: 1 << 5,
+				name: "imprecise",
+			},
+			FaultReason {
+				bit: 1 << 6,
+				name: "sram-ecc",
+			},
+			FaultReason {
+				bit: 1 << 31,
+				name: "hang",
+			},
 		];
 		let mut why = String::new();
 		for reason in REASONS {
-			for _set in Some(()).filter(|_u| e.fault_reason_mask & reason.bit != 0).into_iter() {
+			for _set in Some(())
+				.filter(|_u| e.fault_reason_mask & reason.bit != 0)
+				.into_iter()
+			{
 				for _sep in Some(()).filter(|_u| !why.is_empty()).into_iter() {
 					why.push('+');
 				}
@@ -210,11 +250,19 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 		let va = e.virtual_address as usize;
 		let locate = match crate::memory::bounce_range() {
 			Some(r) => match va.cmp(&r.base) {
-				std::cmp::Ordering::Less => format!("outside bounce (bounce base 0x{:x})", r.base),
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => match va.cmp(&(r.base + r.len)) {
-					std::cmp::Ordering::Less => format!("INSIDE pinned h2d bounce (+0x{:x})", va - r.base),
-					std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => format!("outside bounce (bounce base 0x{:x})", r.base),
-				},
+				std::cmp::Ordering::Less => {
+					format!("outside bounce (bounce base 0x{:x})", r.base)
+				}
+				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+					match va.cmp(&(r.base + r.len)) {
+						std::cmp::Ordering::Less => {
+							format!("INSIDE pinned h2d bounce (+0x{:x})", va - r.base)
+						}
+						std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+							format!("outside bounce (bounce base 0x{:x})", r.base)
+						}
+					}
+				}
 			},
 			None => "bounce not yet allocated".to_string(),
 		};
@@ -235,17 +283,27 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 pub(crate) fn register_fault_autopsy_once() {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	static REGISTERED: AtomicUsize = AtomicUsize::new(0);
-	for _first in Some(()).filter(|_u| REGISTERED.load(Ordering::Relaxed) == 0).into_iter() {
+	for _first in Some(())
+		.filter(|_u| REGISTERED.load(Ordering::Relaxed) == 0)
+		.into_iter()
+	{
 		let sym = unsafe {
-			libc::dlsym(libc::RTLD_DEFAULT, c"hsa_amd_register_system_event_handler".as_ptr())
+			libc::dlsym(
+				libc::RTLD_DEFAULT,
+				c"hsa_amd_register_system_event_handler".as_ptr(),
+			)
 		};
 		for found in std::ptr::NonNull::new(sym).into_iter() {
 			type Register = extern "C" fn(
 				extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
 				*mut c_void,
 			) -> i32;
-			let register = unsafe { std::mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
-			for _ok in Some(()).filter(|_u| register(fault_autopsy, std::ptr::null_mut()) == 0).into_iter() {
+			let register =
+				unsafe { std::mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
+			for _ok in Some(())
+				.filter(|_u| register(fault_autopsy, std::ptr::null_mut()) == 0)
+				.into_iter()
+			{
 				REGISTERED.store(1, Ordering::Relaxed);
 			}
 		}
@@ -262,9 +320,17 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	let mut reserved: u64 = 0;
 	let mut used: u64 = 0;
 	crate::callspy::tick(&crate::callspy::MEMPOOL_GET_ATTRIBUTE);
-	check(unsafe { hipMemPoolGetAttribute(pool, RESERVED_MEM_CURRENT, &mut reserved as *mut u64 as *mut c_void) })?;
+	check(unsafe {
+		hipMemPoolGetAttribute(
+			pool,
+			RESERVED_MEM_CURRENT,
+			&mut reserved as *mut u64 as *mut c_void,
+		)
+	})?;
 	crate::callspy::tick(&crate::callspy::MEMPOOL_GET_ATTRIBUTE);
-	check(unsafe { hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, &mut used as *mut u64 as *mut c_void) })?;
+	check(unsafe {
+		hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, &mut used as *mut u64 as *mut c_void)
+	})?;
 	Ok(reserved.saturating_sub(used) as usize)
 }
 
@@ -272,7 +338,11 @@ pub fn sysfs_vram_free() -> Option<usize> {
 	for card in std::fs::read_dir("/sys/class/drm").ok()? {
 		let dev = card.ok()?.path().join("device");
 		let read = |f: &str| -> Option<usize> {
-			std::fs::read_to_string(dev.join(f)).ok()?.trim().parse().ok()
+			std::fs::read_to_string(dev.join(f))
+				.ok()?
+				.trim()
+				.parse()
+				.ok()
 		};
 		let total = read("mem_info_vram_total");
 		let used = read("mem_info_vram_used");

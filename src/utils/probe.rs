@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, ensure, Result};
-use gpu_core::memory::{par_copy, par_touch, GpuBuffer};
+use anyhow::{Result, anyhow, bail, ensure};
+use gpu_core::memory::{GpuBuffer, par_copy, par_touch};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -37,7 +37,9 @@ impl Machine {
 			eprintln!("recipe probe: measuring gpu{d}");
 			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
-				Err(e) => eprintln!("recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"),
+				Err(e) => eprintln!(
+					"recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"
+				),
 			}
 		}
 		for _present in (0..ngpu).next().into_iter() {
@@ -56,8 +58,21 @@ impl Machine {
 		eprintln!("recipe probe: measuring disk (sata)");
 		let sata_gbs = bench_disk(&dd)?;
 		let eth_gbs = link_speed_gbs();
-		eprintln!("recipe probe: link {eth_gbs:.3} GB/s ({})", eth_label(eth_gbs));
-		Ok(Machine { host, gpus, ram, ddr5_gbs, cpu_transfer_gbs, cpu_gflops, disk_size, sata_gbs, eth_gbs })
+		eprintln!(
+			"recipe probe: link {eth_gbs:.3} GB/s ({})",
+			eth_label(eth_gbs)
+		);
+		Ok(Machine {
+			host,
+			gpus,
+			ram,
+			ddr5_gbs,
+			cpu_transfer_gbs,
+			cpu_gflops,
+			disk_size,
+			sata_gbs,
+			eth_gbs,
+		})
 	}
 
 	pub fn beacon_encode(&self) -> String {
@@ -83,7 +98,11 @@ impl Machine {
 
 	pub fn beacon_decode(s: &str) -> Result<Machine> {
 		let f: Vec<&str> = s.split('|').collect();
-		ensure!(f.len() >= 9, "probe: short beacon machine ({} fields)", f.len());
+		ensure!(
+			f.len() >= 9,
+			"probe: short beacon machine ({} fields)",
+			f.len()
+		);
 		let ngpu: usize = f[8].parse()?;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for i in 0..ngpu {
@@ -196,8 +215,7 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 		ensure!(status.success(), "probe child exited {status}");
 		let mut out = String::new();
 		use std::io::Read;
-		child
-			.stdout
+		child.stdout
 			.take()
 			.ok_or_else(|| anyhow::anyhow!("probe child stdout"))?
 			.read_to_string(&mut out)?;
@@ -214,7 +232,10 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 
 pub fn probe_gpu_child_record(dev: i32) -> Result<String> {
 	let g = measure_gpu(dev)?;
-	Ok(format!("{}|{}|{}|{}", g.vram, g.pcie_gbs, g.flops_gflops, g.transfer_gbs))
+	Ok(format!(
+		"{}|{}|{}|{}",
+		g.vram, g.pcie_gbs, g.flops_gflops, g.transfer_gbs
+	))
 }
 
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
@@ -302,7 +323,9 @@ fn bench_cpu_read() -> f64 {
 	let bytes = 1usize << 30;
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
-	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let threads = std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(1);
 	let per = bytes.div_ceil(threads);
 	let base = buf.as_ptr() as usize;
 	let mut best = f64::INFINITY;
@@ -318,7 +341,11 @@ fn bench_cpu_read() -> f64 {
 							let len = per.min(bytes - off);
 							let mut acc = 0u64;
 							for i in (off..off + len).step_by(64) {
-								acc = acc.wrapping_add(unsafe { std::ptr::read_volatile((base + i) as *const u8) } as u64);
+								acc = acc.wrapping_add(unsafe {
+									std::ptr::read_volatile(
+										(base + i) as *const u8,
+									)
+								} as u64);
 							}
 							acc
 						}
@@ -345,12 +372,15 @@ pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
 		}
 	};
 	let dir = base.join("recipe");
-	std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
+	std::fs::create_dir_all(&dir)
+		.map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
 	Ok(dir)
 }
 
 fn bench_cpu_flops() -> f64 {
-	let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+	let threads = std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(1);
 	let iters: u64 = 100_000_000;
 	let t = Instant::now();
 	let sum: f64 = std::thread::scope(|sc| {
@@ -409,7 +439,12 @@ fn drop_cache(f: &File, off: u64, len: usize) {
 				| libc::SYNC_FILE_RANGE_WRITE
 				| libc::SYNC_FILE_RANGE_WAIT_AFTER,
 		);
-		libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+		libc::posix_fadvise(
+			f.as_raw_fd(),
+			off as i64,
+			len as i64,
+			libc::POSIX_FADV_DONTNEED,
+		);
 	}
 }
 
@@ -418,7 +453,11 @@ pub fn write_config(machines: &[Machine]) -> String {
 	for m in machines {
 		s.push_str(&format!("\t{}\n", m.host));
 		s.push_str("\t\tETH\n");
-		s.push_str(&format!("\t\t\t{}\t{:.3}\n", eth_label(m.eth_gbs), m.eth_gbs));
+		s.push_str(&format!(
+			"\t\t\t{}\t{:.3}\n",
+			eth_label(m.eth_gbs),
+			m.eth_gbs
+		));
 		s.push_str("\t\tDISK\n");
 		s.push_str(&format!("\t\t\tSIZE\t{}\n", m.disk_size));
 		s.push_str(&format!("\t\t\tSATA\t{:.3}\n", m.sata_gbs));
@@ -509,7 +548,9 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 												flops_gflops: 0.0,
 												transfer_gbs: 0.0,
 											});
-											Some(Sect::Gpu { i: m.gpus.len() - 1 })
+											Some(Sect::Gpu {
+												i: m.gpus.len() - 1,
+											})
 										}
 										None => None,
 									},
@@ -531,24 +572,50 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 								Sect::Gpu { i } => {
 									for g in m.gpus.get_mut(i).into_iter() {
 										match k {
-											"VRAM" => g.vram = v.parse().unwrap_or(0),
-											"PCIe" => g.pcie_gbs = v.parse().unwrap_or(0.0),
-											"FLOPs" => g.flops_gflops = v.parse().unwrap_or(0.0),
-											"Transfer" => g.transfer_gbs = v.parse().unwrap_or(0.0),
+											"VRAM" => {
+												g.vram =
+													v.parse().unwrap_or(0)
+											}
+											"PCIe" => {
+												g.pcie_gbs = v
+													.parse()
+													.unwrap_or(0.0)
+											}
+											"FLOPs" => {
+												g.flops_gflops = v
+													.parse()
+													.unwrap_or(0.0)
+											}
+											"Transfer" => {
+												g.transfer_gbs = v
+													.parse()
+													.unwrap_or(0.0)
+											}
 											_key => continue,
 										}
 									}
 								}
 								Sect::Cpu => match k {
 									"RAM" => m.ram = v.parse().unwrap_or(0),
-									"DDR5" => m.ddr5_gbs = v.parse().unwrap_or(0.0),
-									"FLOPs" => m.cpu_gflops = v.parse().unwrap_or(0.0),
-									"Transfer" => m.cpu_transfer_gbs = v.parse().unwrap_or(0.0),
+									"DDR5" => {
+										m.ddr5_gbs = v.parse().unwrap_or(0.0)
+									}
+									"FLOPs" => {
+										m.cpu_gflops = v.parse().unwrap_or(0.0)
+									}
+									"Transfer" => {
+										m.cpu_transfer_gbs =
+											v.parse().unwrap_or(0.0)
+									}
 									_key => continue,
 								},
 								Sect::Disk => match k {
-									"SIZE" => m.disk_size = v.parse().unwrap_or(0),
-									"SATA" => m.sata_gbs = v.parse().unwrap_or(0.0),
+									"SIZE" => {
+										m.disk_size = v.parse().unwrap_or(0)
+									}
+									"SATA" => {
+										m.sata_gbs = v.parse().unwrap_or(0.0)
+									}
 									_key => continue,
 								},
 								Sect::None => continue,

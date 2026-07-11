@@ -16,7 +16,9 @@ fn main() {
 				eprintln!("probe: mismatch at {i}: {v}");
 				std::process::exit(1);
 			}
-			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => continue,
+			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => {
+				continue;
+			}
 		}
 	}
 	gpu_core::hip::device_synchronize().expect("probe: device sync");

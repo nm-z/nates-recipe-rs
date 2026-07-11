@@ -171,8 +171,18 @@ fn probes(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 }
 
 fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bb = {
+		let __up = b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	unsafe {
 		f(
@@ -185,22 +195,36 @@ fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn run_wrap(f: GpuBin, a: &[f64], b: &[f64]) -> Vec<f64> {
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bb = {
+		let __up = b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	f(&ba, &bb, a.len(), &o).unwrap();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn registry() -> HashMap<&'static str, BinOp> {
-	use gpu_core::kernels::{gpu_add_into, gpu_div_into, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub};
+	use gpu_core::kernels::{
+		gpu_add_into, gpu_div_into, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub,
+	};
 	use gpu_core::math_ops::{gpu_atan2, gpu_fmod, gpu_max, gpu_min};
 	let mut m: HashMap<&'static str, BinOp> = HashMap::new();
 	// existing wrappers

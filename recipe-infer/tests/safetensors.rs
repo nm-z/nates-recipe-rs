@@ -1,4 +1,6 @@
-use recipe_infer::safetensors::{parse_safetensors, parse_json, field_str, field_arr, decode, Json, Member};
+use recipe_infer::safetensors::{
+	Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors,
+};
 
 #[test]
 fn parse_safetensors_decodes_header_and_blob() {
@@ -95,10 +97,15 @@ fn read_safetensors_header_and_decode_min() {
 	let (name, dtype, begin, end) = min_tensor.expect("a smallest tensor by byte span");
 	assert_eq!(name, "a", "F32 [2,2] 16B is smaller than F64 [3] 24B");
 	assert_eq!(dtype, "F32");
-	f.seek(SeekFrom::Start(data_start + begin)).expect("seek tensor");
+	f.seek(SeekFrom::Start(data_start + begin))
+		.expect("seek tensor");
 	let mut raw = vec![0u8; (end - begin) as usize];
 	f.read_exact(&mut raw).expect("read tensor bytes");
 	let vals = decode(&dtype, &raw).expect("decode F32 tensor");
-	assert_eq!(vals, vec![1.5, -2.5, 3.0, 4.0], "decoded F32 tensor, widened to f64");
+	assert_eq!(
+		vals,
+		vec![1.5, -2.5, 3.0, 4.0],
+		"decoded F32 tensor, widened to f64"
+	);
 	let _ = std::fs::remove_file(&path);
 }

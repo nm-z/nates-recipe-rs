@@ -36,7 +36,11 @@ impl MergeTable {
 		for pair in merges {
 			let merged_id = 256 + rank;
 			let None = ranks.insert(pair, Merge { rank, merged_id }) else {
-				bail!("duplicate merge pair ({}, {}) at rank {rank}", pair.left, pair.right);
+				bail!(
+					"duplicate merge pair ({}, {}) at rank {rank}",
+					pair.left,
+					pair.right
+				);
 			};
 			rank += 1;
 		}
@@ -74,8 +78,14 @@ pub fn encode(bytes: &[u8], table: &MergeTable) -> Vec<u32> {
 	loop {
 		let mut best: Option<Best> = None;
 		for i in 0..ids.len().saturating_sub(1) {
-			let Some(m) = table.lookup(ids[i], ids[i + 1]) else { continue };
-			let cand = Best { rank: m.rank, pos: i, merged_id: m.merged_id };
+			let Some(m) = table.lookup(ids[i], ids[i + 1]) else {
+				continue;
+			};
+			let cand = Best {
+				rank: m.rank,
+				pos: i,
+				merged_id: m.merged_id,
+			};
 			let better = match best {
 				None => Some(cand),
 				Some(cur) => Some(cand).filter(|c| c.rank < cur.rank),

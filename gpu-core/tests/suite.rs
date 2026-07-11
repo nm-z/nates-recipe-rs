@@ -1,12 +1,10 @@
 mod common;
 #[path = "suite/_gpu_live.rs"]
 mod gpu_live;
-#[path = "suite/oversize_oom.rs"]
-mod oversize_oom;
-#[path = "suite/prove_flash_train.rs"]
-mod prove_flash_train;
 #[path = "suite/inventory_proof.rs"]
 mod inventory_proof;
+#[path = "suite/oversize_oom.rs"]
+mod oversize_oom;
 #[path = "suite/parity_blas_batched.rs"]
 mod parity_blas_batched;
 #[path = "suite/parity_blas_l1.rs"]
@@ -31,6 +29,8 @@ mod prove_elementwise_binary;
 mod prove_elementwise_unary;
 #[path = "suite/prove_embedding.rs"]
 mod prove_embedding;
+#[path = "suite/prove_flash_train.rs"]
+mod prove_flash_train;
 #[path = "suite/prove_foreach.rs"]
 mod prove_foreach;
 #[path = "suite/prove_histogram.rs"]

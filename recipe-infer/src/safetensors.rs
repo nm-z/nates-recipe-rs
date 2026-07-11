@@ -2,12 +2,18 @@ use anyhow::{Context, Result, anyhow, bail};
 
 pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 	let head = bytes.get(..8).ok_or_else(|| {
-		anyhow!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len())
+		anyhow!(
+			"safetensors: {} bytes is too short for the 8-byte header length",
+			bytes.len()
+		)
 	})?;
 	let n = u64::from_le_bytes(head.try_into().context("8-byte header len")?) as usize;
 	let data_start = 8 + n;
 	let body = bytes.get(8..data_start).ok_or_else(|| {
-		anyhow!("safetensors: header length {n} exceeds file size {}", bytes.len())
+		anyhow!(
+			"safetensors: header length {n} exceeds file size {}",
+			bytes.len()
+		)
 	})?;
 	let header = std::str::from_utf8(body)
 		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
@@ -42,15 +48,18 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 				data.len()
 			)
 		})?;
-		let elem = elem_size(&dtype)
-			.ok_or_else(|| anyhow!("safetensors: tensor '{name}' unsupported dtype '{dtype}'"))?;
-		let count: usize = shape.iter().map(|&d| d as usize).product();
-		Some(raw.len()).filter(|&len| len == count * elem).ok_or_else(|| {
-			anyhow!(
-				"safetensors: tensor '{name}' byte span {} != shape product {count} * {elem} bytes",
-				raw.len()
-			)
+		let elem = elem_size(&dtype).ok_or_else(|| {
+			anyhow!("safetensors: tensor '{name}' unsupported dtype '{dtype}'")
 		})?;
+		let count: usize = shape.iter().map(|&d| d as usize).product();
+		Some(raw.len())
+			.filter(|&len| len == count * elem)
+			.ok_or_else(|| {
+				anyhow!(
+					"safetensors: tensor '{name}' byte span {} != shape product {count} * {elem} bytes",
+					raw.len()
+				)
+			})?;
 		out.push(ShapedTensor {
 			name,
 			shape: shape.iter().map(|&d| d as usize).collect(),
@@ -81,12 +90,18 @@ pub struct SafetensorsHeader {
 
 pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader> {
 	let head = bytes.get(..8).ok_or_else(|| {
-		anyhow!("safetensors: {} bytes is too short for the 8-byte header length", bytes.len())
+		anyhow!(
+			"safetensors: {} bytes is too short for the 8-byte header length",
+			bytes.len()
+		)
 	})?;
 	let n = u64::from_le_bytes(head.try_into().context("8-byte header len")?) as usize;
 	let data_start = 8 + n;
 	let body = bytes.get(8..data_start).ok_or_else(|| {
-		anyhow!("safetensors: header length {n} exceeds file size {}", bytes.len())
+		anyhow!(
+			"safetensors: header length {n} exceeds file size {}",
+			bytes.len()
+		)
 	})?;
 	let header = std::str::from_utf8(body)
 		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
@@ -120,11 +135,17 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader> {
 			end: *end_f as usize,
 		});
 	}
-	Ok(SafetensorsHeader { data_start, entries: out })
+	Ok(SafetensorsHeader {
+		data_start,
+		entries: out,
+	})
 }
 
 pub fn parse_safetensors(bytes: &[u8]) -> Result<Vec<(String, Vec<f64>)>> {
-	Ok(parse_safetensors_shaped(bytes)?.into_iter().map(|t| (t.name, t.values)).collect())
+	Ok(parse_safetensors_shaped(bytes)?
+		.into_iter()
+		.map(|t| (t.name, t.values))
+		.collect())
 }
 
 fn elem_size(dtype: &str) -> Option<usize> {
@@ -141,19 +162,46 @@ pub fn decode(dtype: &str, raw: &[u8]) -> Result<Vec<f64>> {
 	Ok(match dtype {
 		"BOOL" | "U8" => raw.iter().map(|&x| x as f64).collect(),
 		"I8" => raw.iter().map(|&x| x as i8 as f64).collect(),
-		"I16" => raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect(),
-		"U16" => raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as f64).collect(),
-		"F16" => raw.chunks_exact(2).map(|c| f16_to_f64(u16::from_le_bytes([c[0], c[1]]))).collect(),
+		"I16" => raw
+			.chunks_exact(2)
+			.map(|c| i16::from_le_bytes([c[0], c[1]]) as f64)
+			.collect(),
+		"U16" => raw
+			.chunks_exact(2)
+			.map(|c| u16::from_le_bytes([c[0], c[1]]) as f64)
+			.collect(),
+		"F16" => raw
+			.chunks_exact(2)
+			.map(|c| f16_to_f64(u16::from_le_bytes([c[0], c[1]])))
+			.collect(),
 		"BF16" => raw
 			.chunks_exact(2)
 			.map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64)
 			.collect(),
-		"I32" => raw.chunks_exact(4).map(|c| i32::from_le_bytes(arr4(c)) as f64).collect(),
-		"U32" => raw.chunks_exact(4).map(|c| u32::from_le_bytes(arr4(c)) as f64).collect(),
-		"F32" => raw.chunks_exact(4).map(|c| f32::from_le_bytes(arr4(c)) as f64).collect(),
-		"I64" => raw.chunks_exact(8).map(|c| i64::from_le_bytes(arr8(c)) as f64).collect(),
-		"U64" => raw.chunks_exact(8).map(|c| u64::from_le_bytes(arr8(c)) as f64).collect(),
-		"F64" => raw.chunks_exact(8).map(|c| f64::from_le_bytes(arr8(c))).collect(),
+		"I32" => raw
+			.chunks_exact(4)
+			.map(|c| i32::from_le_bytes(arr4(c)) as f64)
+			.collect(),
+		"U32" => raw
+			.chunks_exact(4)
+			.map(|c| u32::from_le_bytes(arr4(c)) as f64)
+			.collect(),
+		"F32" => raw
+			.chunks_exact(4)
+			.map(|c| f32::from_le_bytes(arr4(c)) as f64)
+			.collect(),
+		"I64" => raw
+			.chunks_exact(8)
+			.map(|c| i64::from_le_bytes(arr8(c)) as f64)
+			.collect(),
+		"U64" => raw
+			.chunks_exact(8)
+			.map(|c| u64::from_le_bytes(arr8(c)) as f64)
+			.collect(),
+		"F64" => raw
+			.chunks_exact(8)
+			.map(|c| f64::from_le_bytes(arr8(c)))
+			.collect(),
 		_other => bail!("decode: unsupported dtype '{dtype}'"),
 	})
 }
@@ -201,7 +249,9 @@ pub struct Member {
 }
 
 fn field<'a>(fields: &'a [Member], name: &str) -> Option<&'a Json> {
-	fields.iter().find(|m| m.key.as_str() == name).map(|m| &m.val)
+	fields.iter()
+		.find(|m| m.key.as_str() == name)
+		.map(|m| &m.val)
 }
 
 pub fn field_str(fields: &[Member], name: &str) -> Option<String> {
@@ -331,14 +381,17 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 					Some(b'b') => '\u{8}',
 					Some(b'f') => '\u{c}',
 					Some(b'u') => {
-						let hex = b
-							.get(*p + 1..*p + 5)
-							.ok_or_else(|| anyhow!("safetensors: truncated \\u escape"))?;
+						let hex = b.get(*p + 1..*p + 5).ok_or_else(|| {
+							anyhow!("safetensors: truncated \\u escape")
+						})?;
 						let code = u32::from_str_radix(std::str::from_utf8(hex)?, 16)
-							.map_err(|e| anyhow!("safetensors: bad \\u escape: {e}"))?;
+							.map_err(|e| {
+							anyhow!("safetensors: bad \\u escape: {e}")
+						})?;
 						*p += 4;
-						char::from_u32(code)
-							.ok_or_else(|| anyhow!("safetensors: invalid unicode {code}"))?
+						char::from_u32(code).ok_or_else(|| {
+							anyhow!("safetensors: invalid unicode {code}")
+						})?
 					}
 					_other => bail!("safetensors: bad escape at offset {}", *p),
 				};
@@ -360,6 +413,8 @@ fn parse_num(b: &[u8], p: &mut usize) -> Result<Json> {
 	}
 	let s = std::str::from_utf8(&b[start..*p])
 		.map_err(|e| anyhow!("safetensors: number is not utf8: {e}"))?;
-	let v: f64 = s.parse().map_err(|_e| anyhow!("safetensors: bad number '{s}'"))?;
+	let v: f64 = s
+		.parse()
+		.map_err(|_e| anyhow!("safetensors: bad number '{s}'"))?;
 	Ok(Json::Num(v))
 }

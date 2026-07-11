@@ -80,7 +80,12 @@ fn last_err() {
 // index_select / take: gather rows of [rows,cols] by i32 idx -> [n,cols].
 fn gpu_index_select(src: &[f64], idx: &[i32], cols: usize) -> Vec<f64> {
 	let n = idx.len();
-	let bs = { let __up = src; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = {
+		let __up = src;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let bi = GpuBuffer::upload_i32(idx).unwrap();
 	let o = GpuBuffer::alloc(n * cols).unwrap();
 	unsafe {
@@ -95,15 +100,31 @@ fn gpu_index_select(src: &[f64], idx: &[i32], cols: usize) -> Vec<f64> {
 	}
 	last_err();
 	let mut out = vec![0.0; n * cols];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn gpu_where(cond: &[f64], a: &[f64], b: &[f64]) -> Vec<f64> {
 	let n = cond.len();
-	let bc = { let __up = cond; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bc = {
+		let __up = cond;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bb = {
+		let __up = b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
 		launch_indexingx_where(
@@ -117,7 +138,8 @@ fn gpu_where(cond: &[f64], a: &[f64], b: &[f64]) -> Vec<f64> {
 	}
 	last_err();
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -125,9 +147,19 @@ fn gpu_where(cond: &[f64], a: &[f64], b: &[f64]) -> Vec<f64> {
 fn gpu_index_add(base: &[f64], idx: &[i32], src: &[f64], cols: usize) -> Vec<f64> {
 	let rows = base.len() / cols;
 	let n = idx.len();
-	let bo = { let __up = base; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub }; // start from base
+	let bo = {
+		let __up = base;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	}; // start from base
 	let bi = GpuBuffer::upload_i32(idx).unwrap();
-	let bs = { let __up = src; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = {
+		let __up = src;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	unsafe {
 		launch_indexingx_index_add(
 			bo.ptr_raw(),
@@ -140,12 +172,18 @@ fn gpu_index_add(base: &[f64], idx: &[i32], src: &[f64], cols: usize) -> Vec<f64
 	}
 	last_err();
 	let mut out = vec![0.0; rows * cols];
-	unsafe { bo.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { bo.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn gpu_diagonal(m: &[f64], n: usize) -> Vec<f64> {
-	let bm = { let __up = m; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = {
+		let __up = m;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
 		launch_indexingx_diagonal(
@@ -157,13 +195,19 @@ fn gpu_diagonal(m: &[f64], n: usize) -> Vec<f64> {
 	}
 	last_err();
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 // take_along_axis: src [rows,cols], idx [rows,k] -> out[i,j] = src[i, idx[i,j]].
 fn gpu_take_along(src: &[f64], idx: &[i32], rows: usize, cols: usize, k: usize) -> Vec<f64> {
-	let bs = { let __up = src; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = {
+		let __up = src;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let bi = GpuBuffer::upload_i32(idx).unwrap();
 	let o = GpuBuffer::alloc(rows * k).unwrap();
 	unsafe {
@@ -179,12 +223,18 @@ fn gpu_take_along(src: &[f64], idx: &[i32], rows: usize, cols: usize, k: usize) 
 	}
 	last_err();
 	let mut out = vec![0.0; rows * k];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn gpu_tri(m: &[f64], n: usize, upper: bool) -> Vec<f64> {
-	let bm = { let __up = m; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bm = {
+		let __up = m;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(n * n).unwrap();
 	unsafe {
 		if upper {
@@ -205,15 +255,26 @@ fn gpu_tri(m: &[f64], n: usize, upper: bool) -> Vec<f64> {
 	}
 	last_err();
 	let mut out = vec![0.0; n * n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 // masked_select: in [n], flags u8 -> (num_out, out[0..num_out]).
 fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	let n = input.len();
-	let bi = { let __up = input; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bf = { let __u = flags; let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap(); __b.write_u8(__u).unwrap(); __b };
+	let bi = {
+		let __up = input;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bf = {
+		let __u = flags;
+		let __b = GpuBuffer::alloc_bytes(__u.len()).unwrap();
+		__b.write_u8(__u).unwrap();
+		__b
+	};
 	let o = GpuBuffer::alloc(n).unwrap();
 	let bn = GpuBuffer::alloc_bytes(4).unwrap();
 	// hipcub DeviceSelect::Flagged is two-phase: query temp size, allocate, then run.
@@ -236,7 +297,8 @@ fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	bn.download_i32(&mut num).unwrap();
 	let num = num[0] as usize;
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	(num, out[..num].to_vec())
 }
 

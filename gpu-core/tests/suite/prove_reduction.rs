@@ -21,47 +21,162 @@ use std::ffi::c_void;
 // argmax/argmin are self-contained (a file-scope device scalar), so they keep the
 // bare 4-arg (x, out, n, stream) shape. sumsqdev also needs a `mu` device scalar.
 unsafe extern "C" {
-	fn launch_reductionx_prod_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_prod(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_nansum_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_nansum(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_mean_abs_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_mean_abs(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_sumsq_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_sumsq(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_count_nonzero_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_count_nonzero(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_any_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_any(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_all_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_all(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_ptp_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_ptp(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_logsumexp_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_logsumexp(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
-	fn launch_reductionx_sumsqdev_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32) -> usize;
-	fn launch_reductionx_sumsqdev(x: *const c_void, out: *mut c_void, mu: *mut c_void, n: i32, s: *mut c_void, ws: *mut c_void, wsb: usize);
+	fn launch_reductionx_prod_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_prod(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_nansum_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_nansum(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_mean_abs_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_mean_abs(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_sumsq_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_sumsq(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_count_nonzero_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_count_nonzero(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_any_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32)
+	-> usize;
+	fn launch_reductionx_any(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_all_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32)
+	-> usize;
+	fn launch_reductionx_all(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_ptp_workspace_bytes(x: *const c_void, out: *mut c_void, n: i32)
+	-> usize;
+	fn launch_reductionx_ptp(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_logsumexp_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_logsumexp(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
+	fn launch_reductionx_sumsqdev_workspace_bytes(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+	) -> usize;
+	fn launch_reductionx_sumsqdev(
+		x: *const c_void,
+		out: *mut c_void,
+		mu: *mut c_void,
+		n: i32,
+		s: *mut c_void,
+		ws: *mut c_void,
+		wsb: usize,
+	);
 	fn launch_reductionx_argmax(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_reductionx_argmin(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type Query = unsafe extern "C" fn(*const c_void, *mut c_void, i32) -> usize;
-type LaunchWs = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void, *mut c_void, usize);
+type LaunchWs =
+	unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void, *mut c_void, usize);
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
 // rocprim-backed launcher: query temp size, allocate, run, return `slots` doubles.
 fn run_ws(query: Query, f: LaunchWs, x: &[f64], slots: usize) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(slots).unwrap();
 	let wsb = unsafe { query(b.ptr_raw() as *const c_void, o.ptr_raw(), x.len() as i32) };
 	let ws = GpuBuffer::alloc_bytes(wsb.max(1)).unwrap();
 	unsafe {
-		f(b.ptr_raw() as *const c_void, o.ptr_raw(), x.len() as i32,
-			std::ptr::null_mut(), ws.ptr_raw(), wsb);
+		f(
+			b.ptr_raw() as *const c_void,
+			o.ptr_raw(),
+			x.len() as i32,
+			std::ptr::null_mut(),
+			ws.ptr_raw(),
+			wsb,
+		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; slots];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn scalar_ws(query: Query, f: LaunchWs, x: &[f64]) -> f64 {
@@ -70,26 +185,48 @@ fn scalar_ws(query: Query, f: LaunchWs, x: &[f64]) -> f64 {
 
 // sumsqdev: Σ(x-μ)² — also needs a `mu` device scalar alongside the temp storage.
 fn sumsqdev(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(1).unwrap();
 	let mu = GpuBuffer::alloc(1).unwrap();
 	let wsb = unsafe {
-		launch_reductionx_sumsqdev_workspace_bytes(b.ptr_raw() as *const c_void, o.ptr_raw(), x.len() as i32)
+		launch_reductionx_sumsqdev_workspace_bytes(
+			b.ptr_raw() as *const c_void,
+			o.ptr_raw(),
+			x.len() as i32,
+		)
 	};
 	let ws = GpuBuffer::alloc_bytes(wsb.max(1)).unwrap();
 	unsafe {
-		launch_reductionx_sumsqdev(b.ptr_raw() as *const c_void, o.ptr_raw(), mu.ptr_raw(),
-			x.len() as i32, std::ptr::null_mut(), ws.ptr_raw(), wsb);
+		launch_reductionx_sumsqdev(
+			b.ptr_raw() as *const c_void,
+			o.ptr_raw(),
+			mu.ptr_raw(),
+			x.len() as i32,
+			std::ptr::null_mut(),
+			ws.ptr_raw(),
+			wsb,
+		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = [0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 
 // Self-contained launcher (argmax/argmin): no workspace.
 fn run_slots(f: Launch, x: &[f64], slots: usize) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(slots).unwrap();
 	unsafe {
 		f(
@@ -101,7 +238,8 @@ fn run_slots(f: Launch, x: &[f64], slots: usize) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; slots];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 fn scalar(f: Launch, x: &[f64]) -> f64 {
@@ -112,11 +250,17 @@ fn scalar(f: Launch, x: &[f64]) -> f64 {
 // Each closure uploads x, runs the device op, returns the finished scalar.
 fn download1(o: &GpuBuffer) -> f64 {
 	let mut out = [0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 fn g_sum(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_sum_all_workspace_bytes(x.len()).max(1),
 	)
@@ -126,7 +270,12 @@ fn g_sum(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_mean(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_mean_all_workspace_bytes(x.len()).max(1),
 	)
@@ -136,7 +285,12 @@ fn g_mean(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_max(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_max_all_workspace_bytes(x.len()).max(1),
 	)
@@ -146,7 +300,12 @@ fn g_max(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_min(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_min_all_workspace_bytes(x.len()).max(1),
 	)
@@ -156,7 +315,12 @@ fn g_min(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_l2(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let ws = GpuBuffer::alloc_bytes(
 		gpu_core::reductions::gpu_l2_norm_workspace_bytes(x.len()).max(1),
 	)
@@ -167,49 +331,96 @@ fn g_l2(x: &[f64]) -> f64 {
 	download1(&o)
 }
 fn g_asum(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(1).unwrap();
 	gpu_core::linalg::gpu_dasum(&b, x.len(), &o).unwrap();
 	download1(&o)
 }
 fn g_dot(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let ws = GpuBuffer::alloc_bytes(
-		gpu_core::reductions::gpu_dot_workspace_bytes(x.len()).max(1),
-	)
-	.unwrap();
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let ws =
+		GpuBuffer::alloc_bytes(gpu_core::reductions::gpu_dot_workspace_bytes(x.len()).max(1))
+			.unwrap();
 	let prod = GpuBuffer::alloc(x.len()).unwrap();
 	let o = GpuBuffer::alloc(1).unwrap();
 	gpu_core::reductions::gpu_dot(&b, &b, &ws, &prod, x.len(), &o).unwrap(); // dot(x,x) = Σx²
 	download1(&o)
 }
 fn g_prod(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_prod_workspace_bytes, launch_reductionx_prod, x)
+	scalar_ws(
+		launch_reductionx_prod_workspace_bytes,
+		launch_reductionx_prod,
+		x,
+	)
 }
 fn g_nansum(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_nansum_workspace_bytes, launch_reductionx_nansum, x)
+	scalar_ws(
+		launch_reductionx_nansum_workspace_bytes,
+		launch_reductionx_nansum,
+		x,
+	)
 }
 fn g_mean_abs(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_mean_abs_workspace_bytes, launch_reductionx_mean_abs, x) / x.len() as f64
+	scalar_ws(
+		launch_reductionx_mean_abs_workspace_bytes,
+		launch_reductionx_mean_abs,
+		x,
+	) / x.len() as f64
 }
 fn g_sumsq(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_sumsq_workspace_bytes, launch_reductionx_sumsq, x)
+	scalar_ws(
+		launch_reductionx_sumsq_workspace_bytes,
+		launch_reductionx_sumsq,
+		x,
+	)
 }
 fn g_count_nonzero(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_count_nonzero_workspace_bytes, launch_reductionx_count_nonzero, x)
+	scalar_ws(
+		launch_reductionx_count_nonzero_workspace_bytes,
+		launch_reductionx_count_nonzero,
+		x,
+	)
 }
 fn g_any(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_any_workspace_bytes, launch_reductionx_any, x)
+	scalar_ws(
+		launch_reductionx_any_workspace_bytes,
+		launch_reductionx_any,
+		x,
+	)
 }
 fn g_all(x: &[f64]) -> f64 {
-	scalar_ws(launch_reductionx_all_workspace_bytes, launch_reductionx_all, x)
+	scalar_ws(
+		launch_reductionx_all_workspace_bytes,
+		launch_reductionx_all,
+		x,
+	)
 }
 fn g_ptp(x: &[f64]) -> f64 {
-	let s = run_ws(launch_reductionx_ptp_workspace_bytes, launch_reductionx_ptp, x, 2);
+	let s = run_ws(
+		launch_reductionx_ptp_workspace_bytes,
+		launch_reductionx_ptp,
+		x,
+		2,
+	);
 	s[0] - s[1]
 }
 fn g_logsumexp(x: &[f64]) -> f64 {
-	let s = run_ws(launch_reductionx_logsumexp_workspace_bytes, launch_reductionx_logsumexp, x, 2);
+	let s = run_ws(
+		launch_reductionx_logsumexp_workspace_bytes,
+		launch_reductionx_logsumexp,
+		x,
+		2,
+	);
 	s[0] + s[1].ln()
 }
 fn g_var_pop(x: &[f64]) -> f64 {
@@ -232,7 +443,12 @@ fn g_argmin(x: &[f64]) -> f64 {
 }
 // iamax: index of element with largest |x| (BLAS Idamax/Isamax family). 0-based.
 fn g_iamax(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(1).unwrap();
 	gpu_core::linalg::gpu_idamax(&b, x.len(), &o).unwrap();
 	download1(&o)

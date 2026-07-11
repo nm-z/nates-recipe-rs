@@ -133,7 +133,12 @@ fn run_keys(
 	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 ) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	let wbytes = unsafe { wb(x.len() as i32) };
 	let ws = GpuBuffer::alloc_bytes(wbytes.max(1)).unwrap();
@@ -149,12 +154,18 @@ fn run_keys(
 	}
 	lasterr();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
 fn run_argsort(x: &[f64]) -> Vec<i32> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
 	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
 	let vals_in = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
@@ -193,7 +204,12 @@ fn run_argextreme(
 	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 ) -> i32 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc_bytes(4).unwrap();
 	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
 	let vals_in = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
@@ -220,7 +236,12 @@ fn run_argextreme(
 }
 
 fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(k).unwrap();
 	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
 	let wbytes = unsafe { sortx_topk_workspace_bytes(x.len() as i32) };
@@ -239,7 +260,8 @@ fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
 	}
 	lasterr();
 	let mut out = vec![0.0; k];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -258,7 +280,12 @@ fn run_scalar(
 	x: &[f64],
 	k: i32,
 ) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(1).unwrap();
 	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
 	let wbytes = unsafe { wb(x.len() as i32) };
@@ -277,12 +304,18 @@ fn run_scalar(
 	}
 	lasterr();
 	let mut out = vec![0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 
 fn run_median(x: &[f64]) -> f64 {
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(1).unwrap();
 	let keys_out = GpuBuffer::alloc(x.len()).unwrap();
 	let wbytes = unsafe { sortx_median_workspace_bytes(x.len() as i32) };
@@ -300,13 +333,24 @@ fn run_median(x: &[f64]) -> f64 {
 	}
 	lasterr();
 	let mut out = vec![0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
 
 fn run_searchsorted(sorted: &[f64], q: &[f64]) -> Vec<i32> {
-	let bs = { let __up = sorted; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bq = { let __up = q; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bs = {
+		let __up = sorted;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bq = {
+		let __up = q;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc_bytes(q.len() * 4).unwrap();
 	unsafe {
 		launch_sortx_searchsorted(
@@ -402,7 +446,12 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		let mut all = true;
 		for k in [1usize, 7, n] {
-			let g = run_scalar(launch_sortx_kthvalue, sortx_kthvalue_workspace_bytes, &x, k as i32);
+			let g = run_scalar(
+				launch_sortx_kthvalue,
+				sortx_kthvalue_workspace_bytes,
+				&x,
+				k as i32,
+			);
 			let want = asc[k - 1];
 			if (g - want).abs() > TOL {
 				all = false;

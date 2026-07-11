@@ -8,20 +8,21 @@ fn main() {
 }
 
 fn nvidia_rpath() -> Option<String> {
-	match is_nvidia() {
-		Some(()) => Some(hipblas_prefix()),
-		None => None,
-	}
+	is_nvidia().map(|()| hipblas_prefix())
 }
 
 fn hipblas_prefix() -> String {
 	std::env::var("HIPBLAS_NV_PREFIX").unwrap_or_else(|_e| {
-		format!("{}/../gpu-core/vendor/hipblas-nvidia", env!("CARGO_MANIFEST_DIR"))
+		format!(
+			"{}/../gpu-core/vendor/hipblas-nvidia",
+			env!("CARGO_MANIFEST_DIR")
+		)
 	})
 }
 
 fn is_nvidia() -> Option<()> {
-	let forced = std::env::var("GPU_PLATFORM").ok()
+	let forced = std::env::var("GPU_PLATFORM")
+		.ok()
 		.or_else(|| std::env::var("HIP_PLATFORM").ok());
 	match forced {
 		Some(p) => nvidia_from_str(&p),

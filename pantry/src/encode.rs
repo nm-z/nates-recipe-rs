@@ -49,17 +49,14 @@ fn cell(row: &[String], j: usize) -> &str {
 }
 
 fn date_to_f64(s: &str) -> f64 {
-	let parts: Vec<&str> = s
-		.split(|c: char| c == '-' || c == '/' || c == 'T' || c == ' ')
-		.collect();
-	if parts.len() >= 3 {
-		if let (Ok(y), Ok(m), Ok(d)) = (
+	let parts: Vec<&str> = s.split(['-', '/', 'T', ' ']).collect();
+	if parts.len() >= 3
+		&& let (Ok(y), Ok(m), Ok(d)) = (
 			parts[0].parse::<f64>(),
 			parts[1].parse::<f64>(),
 			parts[2].parse::<f64>(),
 		) {
-			return y * 365.25 + m * 30.44 + d;
-		}
+		return y * 365.25 + m * 30.44 + d;
 	}
 	f64::NAN
 }
@@ -68,7 +65,10 @@ pub(crate) fn is_missing(c: &str) -> bool {
 	c.is_empty()
 		|| matches!(
 			c,
-			"NA" | "NaN" | "nan" | "N/A" | "NULL" | "null" | "None" | "none" | "?" | "." | "-"
+			"NA" | "NaN"
+				| "nan" | "N/A" | "NULL"
+				| "null" | "None" | "none"
+				| "?" | "." | "-"
 		)
 }
 
@@ -124,11 +124,20 @@ fn infer_attrs(
 	// is a wiring bug, not a cue to run the detector mid-run.
 	let preds: Vec<usize> = match pre {
 		Some(pre) => {
-			if pre.len() != headers.len() || pre.iter().zip(headers).any(|(c, name)| &c.header != name) {
+			if pre.len() != headers.len()
+				|| pre.iter().zip(headers).any(|(c, name)| &c.header != name)
+			{
 				panic!(
 					"detect_kinds drift: precomputed [{}] != parsed [{}]",
-					pre.iter().map(|c| c.header.as_str()).collect::<Vec<_>>().join(", "),
-					headers.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
+					pre.iter()
+						.map(|c| c.header.as_str())
+						.collect::<Vec<_>>()
+						.join(", "),
+					headers
+						.iter()
+						.map(String::as_str)
+						.collect::<Vec<_>>()
+						.join(", "),
 				);
 			}
 			to_predict.iter().map(|&j| pre[j].kind).collect()
@@ -136,7 +145,11 @@ fn infer_attrs(
 		None if to_predict.is_empty() => Vec::new(),
 		None => panic!(
 			"column(s) [{}] have no load-time kind and no train-schema attr — detection runs at Data::load, never mid-run",
-			to_predict.iter().map(|&j| headers[j].as_str()).collect::<Vec<_>>().join(", "),
+			to_predict
+				.iter()
+				.map(|&j| headers[j].as_str())
+				.collect::<Vec<_>>()
+				.join(", "),
 		),
 	};
 	let mut pred = std::collections::HashMap::new();
@@ -155,13 +168,18 @@ fn infer_attrs(
 				match pred[&j] {
 					crate::KIND_NUMERIC => Kind::Numeric,
 					crate::KIND_TEMPORAL => Kind::Temporal,
-					crate::KIND_CATEGORICAL => Kind::Categorical(distinct_sorted(rows, j)),
+					crate::KIND_CATEGORICAL => {
+						Kind::Categorical(distinct_sorted(rows, j))
+					}
 					crate::KIND_ORDINAL => Kind::Ordinal(distinct_sorted(rows, j)),
 					crate::KIND_TEXT => Kind::Text(col_vocab(rows, j)),
 					_ => Kind::Image,
 				}
 			};
-			Attr { name: name.clone(), kind }
+			Attr {
+				name: name.clone(),
+				kind,
+			}
 		})
 		.collect()
 }
@@ -218,13 +236,16 @@ fn encode_kind(
 			(vec![attr.name.clone()], vec![col])
 		}
 		Kind::Text(vocab) => {
-			let names = (0..seq_len).map(|s| format!("{}#t{s}", attr.name)).collect();
+			let names = (0..seq_len)
+				.map(|s| format!("{}#t{s}", attr.name))
+				.collect();
 			let per_row: Vec<Vec<f64>> = rows
 				.par_iter()
 				.map(|row| {
 					let mut ids = vec![0.0f64; seq_len];
 					for (s, tok) in tokenize(cell(row, ai)).take(seq_len).enumerate() {
-						ids[s] = vocab.binary_search(&tok).map_or(0.0, |p| (p + 1) as f64);
+						ids[s] =
+							vocab.binary_search(&tok).map_or(0.0, |p| (p + 1) as f64);
 					}
 					ids
 				})
@@ -400,7 +421,12 @@ impl std::error::Error for CeilingExceeded {}
 /// tier is unreachable during this phase and admitting against it produced 64 GB
 /// allocator aborts instead of diagnostics. On rejection it prints a one-line
 /// autopsy (largest bucket first) then returns the typed `CeilingExceeded`.
-fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) -> anyhow::Result<()> {
+fn admit_ceiling(
+	n: usize,
+	w: usize,
+	label: &str,
+	top_cols: &[(&str, usize)],
+) -> anyhow::Result<()> {
 	let bytes = n
 		.saturating_mul(w)
 		.saturating_mul(std::mem::size_of::<f64>());
@@ -408,9 +434,10 @@ fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) ->
 	// sized against that filesystem's free space.
 	let spill = std::path::Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
-		Ok(bud) if bytes > bud.ram_data => {
-			recipe_infer::tiered::Full { need: bytes, cap: bud.ram_data }
-		}
+		Ok(bud) if bytes > bud.ram_data => recipe_infer::tiered::Full {
+			need: bytes,
+			cap: bud.ram_data,
+		},
 		Ok(_) => return Ok(()),
 		Err(f) => f,
 	};
@@ -421,17 +448,24 @@ fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) ->
 		.filter(|(nm, _)| nm.contains("#t"))
 		.map(|(_, c)| *c)
 		.sum();
-	let onehot_cols: usize = top_cols.iter().filter(|(_, c)| *c > 1).map(|(_, c)| *c).sum();
+	let onehot_cols: usize = top_cols
+		.iter()
+		.filter(|(_, c)| *c > 1)
+		.map(|(_, c)| *c)
+		.sum();
 	let scalar_cols: usize = top_cols
 		.iter()
 		.filter(|(nm, c)| *c == 1 && !nm.contains("#t"))
 		.map(|(_, c)| *c)
 		.sum();
-	let mut autopsy: Vec<(&str, usize)> =
-		[("tokens", tokens_cols), ("scalar", scalar_cols), ("onehot", onehot_cols)]
-			.into_iter()
-			.filter(|(_, c)| *c > 0)
-			.collect();
+	let mut autopsy: Vec<(&str, usize)> = [
+		("tokens", tokens_cols),
+		("scalar", scalar_cols),
+		("onehot", onehot_cols),
+	]
+	.into_iter()
+	.filter(|(_, c)| *c > 0)
+	.collect();
 	autopsy.sort_by(|a, b| cols_bytes(b.1).cmp(&cols_bytes(a.1)));
 	let mut line = vec![oom_pair("OVER CEILING", label)];
 	line.extend(
@@ -441,7 +475,8 @@ fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) ->
 	);
 	let mut bases: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
 	for (nm, _) in top_cols.iter().filter(|(nm, _)| nm.contains("#t")) {
-		*bases.entry(nm.split("#t").next().unwrap_or(nm)).or_insert(0) += 1;
+		*bases.entry(nm.split("#t").next().unwrap_or(nm))
+			.or_insert(0) += 1;
 	}
 	line.push(oom_pair("rows", &n.to_string()));
 	line.push(oom_pair("ceiling", &hb(full.cap)));
@@ -531,8 +566,10 @@ impl Assembled {
 			.enumerate()
 			.map(|(i, s)| (s.as_str(), i))
 			.collect();
-		let picks: Vec<(usize, usize)> =
-			keep.iter().map(|name| self.sources[idx[name.as_str()]]).collect();
+		let picks: Vec<(usize, usize)> = keep
+			.iter()
+			.map(|name| self.sources[idx[name.as_str()]])
+			.collect();
 
 		// Left-compaction fast path: when every kept column comes from a single source
 		// matrix whose row-gather is the identity and whose column indices stay
@@ -546,7 +583,10 @@ impl Assembled {
 			let cols: Vec<usize> = picks.iter().map(|&(_, c)| c).collect();
 			let compact = picks.iter().all(|&(m, _)| m == mi)
 				&& self.gather[mi].len() == n
-				&& self.gather[mi].iter().enumerate().all(|(i, g)| *g == Some(i))
+				&& self.gather[mi]
+					.iter()
+					.enumerate()
+					.all(|(i, g)| *g == Some(i))
 				&& cols.windows(2).all(|p| p[0] < p[1])
 				&& self.mats[mi].is_standard_layout();
 			if compact {
@@ -764,7 +804,13 @@ fn assemble(
 		// filename; a sample column of filenames is a vector of those keys. Pick the
 		// sample column whose cell stems best match this image vector's filenames,
 		// then gather each row's image by that key (index = filename, data = image).
-		if let (DirGroup::Image { hashes: g_hashes, .. }, Some(cells)) = (g, sample_cells) {
+		if let (
+			DirGroup::Image {
+				hashes: g_hashes, ..
+			},
+			Some(cells),
+		) = (g, sample_cells)
+		{
 			let key_set: std::collections::HashSet<&str> =
 				g_hashes.iter().map(String::as_str).collect();
 			let ncols = cells.first().map_or(0, Vec::len);
@@ -772,7 +818,9 @@ fn assemble(
 			for c in 0..ncols {
 				let hits = cells
 					.iter()
-					.filter(|r| key_set.contains(file_stem(r.get(c).map_or("", String::as_str))))
+					.filter(|r| {
+						key_set.contains(file_stem(r.get(c).map_or("", String::as_str)))
+					})
 					.count();
 				if hits > best {
 					best = hits;
@@ -780,15 +828,25 @@ fn assemble(
 				}
 			}
 			if best > 0 {
-				let by_key: std::collections::HashMap<&str, usize> =
-					g_hashes.iter().enumerate().map(|(i, h)| (h.as_str(), i)).collect();
-				let (g_names, g_x, _gy, _gk) =
-					encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)))?;
+				let by_key: std::collections::HashMap<&str, usize> = g_hashes
+					.iter()
+					.enumerate()
+					.map(|(i, h)| (h.as_str(), i))
+					.collect();
+				let (g_names, g_x, _gy, _gk) = encode_group(
+					g,
+					&mut schema,
+					schema_in,
+					&[],
+					exclude,
+					group_pre(pre, group_name(g)),
+				)?;
 				let src: Vec<Option<usize>> = (0..n)
 					.map(|i| {
-						by_key
-							.get(file_stem(cells[i].get(best_col).map_or("", String::as_str)))
-							.copied()
+						by_key.get(file_stem(
+							cells[i].get(best_col).map_or("", String::as_str),
+						))
+						.copied()
 					})
 					.collect();
 				let mi = mats.len();
@@ -830,8 +888,14 @@ fn assemble(
 			continue;
 		}
 
-		let (g_names, g_x, _gy, _gk) =
-			encode_group(g, &mut schema, schema_in, &[], exclude, group_pre(pre, group_name(g)))?;
+		let (g_names, g_x, _gy, _gk) = encode_group(
+			g,
+			&mut schema,
+			schema_in,
+			&[],
+			exclude,
+			group_pre(pre, group_name(g)),
+		)?;
 
 		let src: Vec<Option<usize>> = (0..n)
 			.map(|i| {
@@ -877,8 +941,7 @@ fn group_name(g: &DirGroup) -> &str {
 }
 
 pub fn exclude_mask(attrs: &[Attr], group: &str, exclude: &[String]) -> Vec<bool> {
-	attrs
-		.iter()
+	attrs.iter()
 		.map(|a| {
 			let nm = namespaced(group, &a.name);
 			exclude.iter().any(|p| exclude_match(p, &nm))
@@ -939,12 +1002,14 @@ pub fn shuffle_split(
 			onehot_groups: onehot_groups.to_vec(),
 		}
 	};
-	Split { train: take(&idx[..n_train]), test: take(&idx[n_train..]) }
+	Split {
+		train: take(&idx[..n_train]),
+		test: take(&idx[n_train..]),
+	}
 }
 
 fn text_col_indices(feats: &[String]) -> Vec<usize> {
-	feats
-		.iter()
+	feats.iter()
 		.enumerate()
 		.filter(|(_, n)| n.contains("#t"))
 		.map(|(i, _)| i)
@@ -961,7 +1026,10 @@ fn onehot_group_indices(feats: &[String]) -> Vec<GroupSpan> {
 			while i < feats.len() && feats[i].starts_with(prefix) {
 				i += 1;
 			}
-			groups.push(GroupSpan { start, len: i - start });
+			groups.push(GroupSpan {
+				start,
+				len: i - start,
+			});
 		} else {
 			i += 1;
 		}
@@ -1018,11 +1086,17 @@ pub fn clean_dataset(d: &mut Dataset) {
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		eprintln!("\x1b[1;31mno columns found, check delimiter\x1b[0m  {src}  →  {n} row(s) × 0 column(s)");
+		eprintln!(
+			"\x1b[1;31mno columns found, check delimiter\x1b[0m  {src}  →  {n} row(s) × 0 column(s)"
+		);
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		eprintln!("\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)", d.y.len(), n * k);
+		eprintln!(
+			"\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
+			d.y.len(),
+			n * k
+		);
 		std::process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
@@ -1032,7 +1106,10 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		eprintln!("\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target", n - keep.len());
+		eprintln!(
+			"\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target",
+			n - keep.len()
+		);
 		d.x = d.x.select(ndarray::Axis(0), &keep);
 		let mut yd = Vec::with_capacity(keep.len() * k);
 		for &i in &keep {
@@ -1070,7 +1147,10 @@ pub fn prepare_arff_data(
 	let tc = text_col_indices(&names);
 	let oh = onehot_group_indices(&names);
 	let (train, test) = if let Some(frac) = split_frac {
-		let Split { train: tr, test: te } = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
+		let Split {
+			train: tr,
+			test: te,
+		} = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
 		let trows = crate::data::parse_arff(tp).rows;
@@ -1174,8 +1254,7 @@ pub fn prepare_table_data(
 			text_cols: tc.clone(),
 			onehot_groups: oh.clone(),
 		};
-		let test_feats: Vec<String> =
-			test.names.iter().filter(|n| keep(n)).cloned().collect();
+		let test_feats: Vec<String> = test.names.iter().filter(|n| keep(n)).cloned().collect();
 		let oh_test = onehot_group_indices(&test_feats);
 		let testds = Dataset {
 			x: test.select(&test_feats)?,
@@ -1186,7 +1265,11 @@ pub fn prepare_table_data(
 			text_cols: tc,
 			onehot_groups: oh_test,
 		};
-		return Ok(PreparedTable { train, test: Some(testds), attrs: flat_attrs });
+		return Ok(PreparedTable {
+			train,
+			test: Some(testds),
+			attrs: flat_attrs,
+		});
 	}
 
 	let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
@@ -1194,8 +1277,15 @@ pub fn prepare_table_data(
 	let tc = text_col_indices(&feats);
 	let oh = onehot_group_indices(&feats);
 	if let Some(frac) = split_frac {
-		let Split { train: tr, test: te } = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
-		return Ok(PreparedTable { train: tr, test: Some(te), attrs: flat_attrs });
+		let Split {
+			train: tr,
+			test: te,
+		} = shuffle_split(&x, &set.y, k, frac, source_label, &tc, &oh);
+		return Ok(PreparedTable {
+			train: tr,
+			test: Some(te),
+			attrs: flat_attrs,
+		});
 	}
 	Ok(PreparedTable {
 		train: Dataset {
@@ -1217,4 +1307,3 @@ pub struct PreparedTable {
 	pub test: Option<Dataset>,
 	pub attrs: Vec<Attr>,
 }
-

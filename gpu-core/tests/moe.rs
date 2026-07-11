@@ -6,11 +6,15 @@ use gpu_core::moe::{gpu_moe_backward, gpu_moe_route};
 fn moe_backward_matches_finite_diff() {
 	hip::set_device(0).expect("set_device");
 	let (n, d, e) = (5usize, 4usize, 3usize);
-	let mk = |seed: usize, len: usize, scale: f64| -> Vec<f64> {
-		(0..len)
-			.map(|i| (((i * 1103515245 + seed * 12345) % 1000) as f64 / 1000.0 - 0.5) * scale)
-			.collect()
-	};
+	let mk =
+		|seed: usize, len: usize, scale: f64| -> Vec<f64> {
+			(0..len)
+				.map(|i| {
+					(((i * 1103515245 + seed * 12345) % 1000) as f64 / 1000.0 - 0.5)
+						* scale
+				})
+				.collect()
+		};
 	let hidden = mk(1, n * d, 1.0);
 	let gate_w = mk(2, d * e, 1.0);
 	let expert_w = mk(3, e * d * d, 1.0);

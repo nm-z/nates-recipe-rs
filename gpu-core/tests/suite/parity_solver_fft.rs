@@ -9,7 +9,8 @@ use gpu_core::{hip, kernels, linalg};
 fn spd(n: usize, seed: u64) -> Vec<f64> {
 	let mut s = seed;
 	let mut rnd = || {
-		s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		s = s.wrapping_mul(6364136223846793005)
+			.wrapping_add(1442695040888963407);
 		((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0
 	};
 	let m: Vec<f64> = (0..n * n).map(|_| rnd()).collect();
@@ -27,11 +28,15 @@ fn spd(n: usize, seed: u64) -> Vec<f64> {
 }
 
 fn matvec(a: &[f64], x: &[f64], n: usize) -> Vec<f64> {
-	(0..n).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect()
+	(0..n).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum())
+		.collect()
 }
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
-	a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+	a.iter()
+		.zip(b)
+		.map(|(x, y)| (x - y).abs())
+		.fold(0.0, f64::max)
 }
 
 #[test]
@@ -41,14 +46,30 @@ fn cholesky_solve_residual() {
 		let a = spd(n, 11);
 		let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).sin()).collect();
 		let b = matvec(&a, &x, n);
-		let da = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let db = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let work = GpuBuffer::alloc_bytes(kernels::gpu_cholesky_solve_workspace_bytes(n)).unwrap();
+		let da = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let db = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let work =
+			GpuBuffer::alloc_bytes(kernels::gpu_cholesky_solve_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n).unwrap();
 		kernels::gpu_cholesky_solve(&da, &db, n, &work, &info, &a_copy, &out).unwrap();
-		let xg = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let xg = {
+			let mut __dv = vec![0.0f64; out.n_floats()];
+			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let d = max_abs_diff(&xg, &x);
 		assert!(d < 1e-6, "cholesky_solve n={n}: max diff {d:e}");
 	}
@@ -61,16 +82,33 @@ fn lu_solve_residual() {
 		let a = spd(n, 23); // symmetric → layout-unambiguous
 		let x: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64 * 0.21).cos()).collect();
 		let b = matvec(&a, &x, n);
-		let da = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let db = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let da = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let db = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let work = GpuBuffer::alloc_bytes(kernels::gpu_solve_getrf_workspace_bytes(n)).unwrap();
-		let work_s = GpuBuffer::alloc_bytes(kernels::gpu_solve_getrs_workspace_bytes(n, 1)).unwrap();
+		let work_s =
+			GpuBuffer::alloc_bytes(kernels::gpu_solve_getrs_workspace_bytes(n, 1)).unwrap();
 		let ipiv = GpuBuffer::alloc(n).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n).unwrap();
-		kernels::gpu_solve(&da, &db, n, 1, &work, &work_s, &ipiv, &info, &a_copy, &out).unwrap();
-		let xg = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		kernels::gpu_solve(&da, &db, n, 1, &work, &work_s, &ipiv, &info, &a_copy, &out)
+			.unwrap();
+		let xg = {
+			let mut __dv = vec![0.0f64; out.n_floats()];
+			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let d = max_abs_diff(&xg, &x);
 		assert!(d < 1e-6, "gpu_solve n={n}: max diff {d:e}");
 	}
@@ -82,17 +120,33 @@ fn eigh_eigenvalue_sum_equals_trace() {
 	for &n in &[8usize, 17] {
 		let a = spd(n, 31);
 		let trace: f64 = (0..n).map(|i| a[i * n + i]).sum();
-		let da = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let da = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let work = GpuBuffer::alloc_bytes(linalg::gpu_eigh_sym_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let evals = GpuBuffer::alloc(n).unwrap();
 		let evecs = GpuBuffer::alloc(n * n).unwrap();
 		linalg::gpu_eigh_sym(&da, n, &work, &info, &evals, &evecs).unwrap();
-		let ev = { let mut __dv = vec![0.0f64; evals.n_floats()]; unsafe { evals.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let ev = {
+			let mut __dv = vec![0.0f64; evals.n_floats()];
+			unsafe { evals.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let sum: f64 = ev.iter().sum();
 		// SPD → all eigenvalues strictly positive; sum == trace (invariant)
-		assert!((sum - trace).abs() < 1e-6, "eigh n={n}: sum {sum} vs trace {trace}");
-		assert!(ev.iter().all(|&l| l > 0.0), "eigh n={n}: non-positive eigenvalue");
+		assert!(
+			(sum - trace).abs() < 1e-6,
+			"eigh n={n}: sum {sum} vs trace {trace}"
+		);
+		assert!(
+			ev.iter().all(|&l| l > 0.0),
+			"eigh n={n}: non-positive eigenvalue"
+		);
 	}
 }
 
@@ -102,12 +156,22 @@ fn fft_roundtrip() {
 	for &n in &[8usize, 16, 64] {
 		// interleaved re/im, n complex elements
 		let inp: Vec<f64> = (0..2 * n).map(|i| (i as f64 * 0.13).sin()).collect();
-		let din = { let __up = &inp; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let din = {
+			let __up = &inp;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let fwd = GpuBuffer::alloc(2 * n).unwrap();
 		linalg::gpu_fft_c2c_1d(&din, n, 1, &fwd).unwrap();
 		let inv_buf = GpuBuffer::alloc(2 * n).unwrap();
 		linalg::gpu_fft_c2c_1d(&fwd, n, 0, &inv_buf).unwrap();
-		let inv = { let mut __dv = vec![0.0f64; inv_buf.n_floats()]; unsafe { inv_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let inv = {
+			let mut __dv = vec![0.0f64; inv_buf.n_floats()];
+			unsafe { inv_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		// hipFFT is unnormalized: inverse(forward(x)) = n·x
 		let recovered: Vec<f64> = inv.iter().map(|v| v / n as f64).collect();
 		let d = max_abs_diff(&recovered, &inp);
@@ -123,14 +187,25 @@ fn cholesky_inv_times_a_is_identity() {
 	hip::set_device(0).unwrap();
 	for &n in &[8usize, 16, 31] {
 		let a = spd(n, 41);
-		let da = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let work = GpuBuffer::alloc_bytes(kernels::gpu_cholesky_inv_workspace_bytes(n)).unwrap();
+		let da = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let work =
+			GpuBuffer::alloc_bytes(kernels::gpu_cholesky_inv_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n * n).unwrap();
 		kernels::gpu_eye(n, &out).unwrap();
 		kernels::gpu_cholesky_inv(&da, n, &work, &info, &a_copy, &out).unwrap();
-		let inv = { let mut __dv = vec![0.0f64; out.n_floats()]; unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let inv = {
+			let mut __dv = vec![0.0f64; out.n_floats()];
+			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let mut maxoff = 0.0f64;
 		for i in 0..n {
 			for j in 0..n {
@@ -142,7 +217,10 @@ fn cholesky_inv_times_a_is_identity() {
 				maxoff = maxoff.max((acc - want).abs());
 			}
 		}
-		assert!(maxoff < 1e-6, "cholesky_inv n={n}: max |A·A⁻¹ − I| = {maxoff:e}");
+		assert!(
+			maxoff < 1e-6,
+			"cholesky_inv n={n}: max |A·A⁻¹ − I| = {maxoff:e}"
+		);
 	}
 }
 
@@ -156,8 +234,18 @@ fn cholesky_factor_then_tri_solve() {
 		let a = spd(n, 53);
 		let x_true: Vec<f64> = (0..n).map(|i| (i as f64 * 0.41).cos() + 0.5).collect();
 		let b = matvec(&a, &x_true, n);
-		let da = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let db = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let da = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let db = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let work = GpuBuffer::alloc_bytes(kernels::gpu_cholesky_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let l = GpuBuffer::alloc(n * n).unwrap();
@@ -166,7 +254,12 @@ fn cholesky_factor_then_tri_solve() {
 		kernels::gpu_tri_solve(&l, &db, n, 1, 1, &z).unwrap();
 		let x_buf = GpuBuffer::alloc(n).unwrap();
 		kernels::gpu_tri_solve(&l, &z, n, 1, 0, &x_buf).unwrap();
-		let x = { let mut __dv = vec![0.0f64; x_buf.n_floats()]; unsafe { x_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let x = {
+			let mut __dv = vec![0.0f64; x_buf.n_floats()];
+			unsafe { x_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let d = max_abs_diff(&x, &x_true);
 		assert!(d < 1e-6, "cholesky+tri_solve n={n}: max diff {d:e}");
 	}

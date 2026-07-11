@@ -1,4 +1,3 @@
-
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
@@ -52,26 +51,67 @@ unsafe extern "C" {
 	fn hipsolverCreate(handle: *mut *mut c_void) -> i32;
 	fn hipsolverDestroy(handle: *mut c_void) -> i32;
 	fn hipsolverDpotrf_bufferSize(
-		handle: *mut c_void, uplo: u32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32,
+		handle: *mut c_void,
+		uplo: u32,
+		n: i32,
+		A: *mut f64,
+		lda: i32,
+		lwork: *mut i32,
 	) -> i32;
 	fn hipsolverDpotrf(
-		handle: *mut c_void, uplo: u32, n: i32, A: *mut f64, lda: i32,
-		work: *mut f64, lwork: i32, info: *mut i32,
+		handle: *mut c_void,
+		uplo: u32,
+		n: i32,
+		A: *mut f64,
+		lda: i32,
+		work: *mut f64,
+		lwork: i32,
+		info: *mut i32,
 	) -> i32;
 	fn hipsolverDgetrf_bufferSize(
-		handle: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32,
+		handle: *mut c_void,
+		m: i32,
+		n: i32,
+		A: *mut f64,
+		lda: i32,
+		lwork: *mut i32,
 	) -> i32;
 	fn hipsolverDgetrf(
-		handle: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32,
-		work: *mut f64, lwork: i32, ipiv: *mut i32, info: *mut i32,
+		handle: *mut c_void,
+		m: i32,
+		n: i32,
+		A: *mut f64,
+		lda: i32,
+		work: *mut f64,
+		lwork: i32,
+		ipiv: *mut i32,
+		info: *mut i32,
 	) -> i32;
 	fn hipsolverDgetrs_bufferSize(
-		handle: *mut c_void, trans: u32, n: i32, nrhs: i32, A: *mut f64, lda: i32,
-		ipiv: *mut i32, B: *mut f64, ldb: i32, lwork: *mut i32,
+		handle: *mut c_void,
+		trans: u32,
+		n: i32,
+		nrhs: i32,
+		A: *mut f64,
+		lda: i32,
+		ipiv: *mut i32,
+		B: *mut f64,
+		ldb: i32,
+		lwork: *mut i32,
 	) -> i32;
 	fn hipsolverDgetrs(
-		handle: *mut c_void, trans: u32, n: i32, nrhs: i32, A: *mut f64, lda: i32,
-		ipiv: *mut i32, B: *mut f64, ldb: i32, work: *mut f64, lwork: i32, info: *mut i32,
+		handle: *mut c_void,
+		trans: u32,
+		n: i32,
+		nrhs: i32,
+		A: *mut f64,
+		lda: i32,
+		ipiv: *mut i32,
+		B: *mut f64,
+		ldb: i32,
+		work: *mut f64,
+		lwork: i32,
+		info: *mut i32,
 	) -> i32;
 
 	fn hipblasDtrsm(
@@ -155,7 +195,13 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_add_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const f64, stream: *mut c_void);
+	fn launch_add_scalar(
+		x: *const c_void,
+		out: *mut c_void,
+		n: i32,
+		s: *const f64,
+		stream: *mut c_void,
+	);
 	fn launch_div(
 		a: *const c_void,
 		b: *const c_void,
@@ -492,7 +538,13 @@ unsafe extern "C" {
 		scale: *const f64,
 		stream: *mut c_void,
 	);
-	fn launch_bernoulli_u8(mask: *mut c_void, n: i32, seed: u32, p: *const f64, stream: *mut c_void);
+	fn launch_bernoulli_u8(
+		mask: *mut c_void,
+		n: i32,
+		seed: u32,
+		p: *const f64,
+		stream: *mut c_void,
+	);
 	fn launch_dropout_u8(
 		x: *const c_void,
 		mask: *const c_void,
@@ -1425,23 +1477,52 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_convx_conv1d(
-		x: *const c_void, w: *const c_void, bias: *const c_void, y: *mut c_void,
-		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
+		x: *const c_void,
+		w: *const c_void,
+		bias: *const c_void,
+		y: *mut c_void,
+		n: i32,
+		cin: i32,
+		l: i32,
+		cout: i32,
+		k: i32,
+		lout: i32,
+		s: i32,
 		stream: *mut c_void,
 	);
 	fn launch_convx_conv1d_backward_data(
-		dy: *const c_void, w: *const c_void, dx: *mut c_void,
-		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
+		dy: *const c_void,
+		w: *const c_void,
+		dx: *mut c_void,
+		n: i32,
+		cin: i32,
+		l: i32,
+		cout: i32,
+		k: i32,
+		lout: i32,
+		s: i32,
 		stream: *mut c_void,
 	);
 	fn launch_convx_conv1d_backward_filter(
-		dy: *const c_void, x: *const c_void, temp: *mut c_void,
-		n: i32, cin: i32, l: i32, cout: i32, k: i32, lout: i32, s: i32,
-		chunks: i32, stream: *mut c_void,
+		dy: *const c_void,
+		x: *const c_void,
+		temp: *mut c_void,
+		n: i32,
+		cin: i32,
+		l: i32,
+		cout: i32,
+		k: i32,
+		lout: i32,
+		s: i32,
+		chunks: i32,
+		stream: *mut c_void,
 	);
 	fn launch_convx_conv1d_backward_bias(
-		dy: *const c_void, db: *mut c_void,
-		n: i32, cout: i32, lout: i32,
+		dy: *const c_void,
+		db: *mut c_void,
+		n: i32,
+		cout: i32,
+		lout: i32,
 		stream: *mut c_void,
 	);
 }
@@ -1480,11 +1561,7 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 					.unwrap_or(());
 				let mut handle: *mut c_void = std::ptr::null_mut();
 				let status = unsafe { hipblasCreate(&mut handle) };
-				assert_eq!(
-					status, 0,
-					"hipblasCreate failed with status {}",
-					status
-				);
+				assert_eq!(status, 0, "hipblasCreate failed with status {}", status);
 				let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
 				assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
 				h.store(handle, Ordering::Relaxed);
@@ -1496,7 +1573,11 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 
 pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
-	assert_eq!(status, 0, "hipblasSetWorkspace failed with status {}", status);
+	assert_eq!(
+		status, 0,
+		"hipblasSetWorkspace failed with status {}",
+		status
+	);
 }
 
 pub(crate) fn hipsolver_handle() -> *mut c_void {
@@ -1507,11 +1588,7 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 			None => {
 				let mut handle: *mut c_void = std::ptr::null_mut();
 				let status = unsafe { hipsolverCreate(&mut handle) };
-				assert_eq!(
-					status, 0,
-					"hipsolverCreate failed with status {}",
-					status
-				);
+				assert_eq!(status, 0, "hipsolverCreate failed with status {}", status);
 				h.store(handle, Ordering::Relaxed);
 				handle
 			}
@@ -2070,11 +2147,7 @@ pub fn gpu_vae_backward_latent(
 	Ok(())
 }
 
-pub fn gpu_log_det_cholesky(
-	l: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_log_det_cholesky(l: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_log_det_cholesky(
 			l.ptr as *const c_void,
@@ -2271,7 +2344,12 @@ pub fn gpu_relu_backward_into(
 	Ok(())
 }
 
-pub fn gpu_add_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_add_into(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_add(
 			a.ptr as *const c_void,
@@ -2304,7 +2382,12 @@ pub fn gpu_add_scalar(
 	Ok(())
 }
 
-pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_div_into(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_div(
 			a.ptr as *const c_void,
@@ -2456,7 +2539,9 @@ pub fn gpu_linear_into(
 					x.ptr as *const c_void,
 					w.ptr as *const c_void,
 					out.ptr as *mut c_void,
-					m as i32, n as i32, k as i32,
+					m as i32,
+					n as i32,
+					k as i32,
 					std::ptr::null_mut(),
 				);
 			}
@@ -2489,9 +2574,19 @@ pub fn gpu_linear_into(
 	}
 }
 
-pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_ss_res_into(
+	pred: &GpuBuffer,
+	y: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(
+			out.ptr,
+			0,
+			std::mem::size_of::<f64>(),
+			std::ptr::null_mut(),
+		);
 	}
 	unsafe {
 		launch_ss_res(
@@ -2506,9 +2601,19 @@ pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffe
 	Ok(())
 }
 
-pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_mse_into(
+	pred: &GpuBuffer,
+	y: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(
+			out.ptr,
+			0,
+			std::mem::size_of::<f64>(),
+			std::ptr::null_mut(),
+		);
 	}
 	unsafe {
 		launch_mse(
@@ -2523,9 +2628,19 @@ pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) 
 	Ok(())
 }
 
-pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_accuracy_into(
+	pred: &GpuBuffer,
+	y: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(
+			out.ptr,
+			0,
+			std::mem::size_of::<f64>(),
+			std::ptr::null_mut(),
+		);
 	}
 	unsafe {
 		launch_accuracy_metric(
@@ -2569,7 +2684,12 @@ pub fn gpu_argmax_accuracy_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(out.ptr, 0, std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(
+			out.ptr,
+			0,
+			std::mem::size_of::<f64>(),
+			std::ptr::null_mut(),
+		);
 	}
 	unsafe {
 		launch_argmax_acc(
@@ -2738,9 +2858,20 @@ pub fn gpu_dgemv_into(
 	Ok(())
 }
 
-pub fn gpu_dger_into(grad: &GpuBuffer, w: &GpuBuffer, n: usize, in_dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_dger_into(
+	grad: &GpuBuffer,
+	w: &GpuBuffer,
+	n: usize,
+	in_dim: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(out.ptr, 0, n * in_dim * std::mem::size_of::<f64>(), std::ptr::null_mut());
+		let _memset = crate::memory::memset_dev(
+			out.ptr,
+			0,
+			n * in_dim * std::mem::size_of::<f64>(),
+			std::ptr::null_mut(),
+		);
 	}
 	let alpha = 1.0_f64;
 	let status = unsafe {
@@ -2799,7 +2930,12 @@ pub fn gpu_gelu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	Ok(())
 }
 
-pub fn gpu_gelu_backward_into(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_gelu_backward_into(
+	grad: &GpuBuffer,
+	x: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gelu_backward(
 			grad.ptr as *const c_void,
@@ -2838,7 +2974,12 @@ pub fn gpu_dropout_into(
 
 pub fn gpu_rand_uniform_into(seed: usize, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_rand_uniform(out.ptr as *mut c_void, n as i32, seed as u32, std::ptr::null_mut());
+		launch_rand_uniform(
+			out.ptr as *mut c_void,
+			n as i32,
+			seed as u32,
+			std::ptr::null_mut(),
+		);
 	}
 	check_launch();
 	Ok(())
@@ -3021,7 +3162,12 @@ pub fn gpu_layernorm_backward_full_into(
 	Ok(())
 }
 
-pub fn gpu_softmax_rows_into(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_softmax_rows_into(
+	x: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_softmax_rows(
 			x.ptr as *const c_void,
@@ -3158,7 +3304,12 @@ pub fn gpu_flash_attention_backward_into(
 	Ok(())
 }
 
-pub fn gpu_bernoulli_into(p: &GpuBuffer, seed: usize, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_bernoulli_into(
+	p: &GpuBuffer,
+	seed: usize,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_bernoulli(
 			out.ptr as *mut c_void,
@@ -3200,7 +3351,6 @@ pub fn gpu_grad_hess_into(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_tb_histogram(
 	tr_bins: &GpuBuffer,
@@ -3404,7 +3554,9 @@ pub fn gpu_tree_build_into(
 	let hist_elems = max_level * p * n_bins;
 
 	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz).expect("tb node_assign");
-	node_assign.memset_zero(n_tr * isz).expect("tb node_assign zero");
+	node_assign
+		.memset_zero(n_tr * isz)
+		.expect("tb node_assign zero");
 	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_feat");
 	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_bin");
 	sf.fill_bytes(0xFF, max_nodes * isz)
@@ -3423,8 +3575,21 @@ pub fn gpu_tree_build_into(
 		let level_bytes = n_level * p * n_bins * fsz;
 		gh.memset_zero(level_bytes).expect("tb grad_hist zero");
 		hh.memset_zero(level_bytes).expect("tb hess_hist zero");
-		gpu_tb_histogram(tr_bins, grad, hess, &node_assign, n_tr, p, n_bins, level_base, &gh, &hh)?;
-		gpu_tb_split_eval(&gh, &hh, &lambda, &min_cw, n_level, p, n_bins, level_base, &sf, &sb)?;
+		gpu_tb_histogram(
+			tr_bins,
+			grad,
+			hess,
+			&node_assign,
+			n_tr,
+			p,
+			n_bins,
+			level_base,
+			&gh,
+			&hh,
+		)?;
+		gpu_tb_split_eval(
+			&gh, &hh, lambda, min_cw, n_level, p, n_bins, level_base, &sf, &sb,
+		)?;
 		gpu_tb_repartition(tr_bins, &sf, &sb, n_tr, p, &node_assign)?;
 	}
 
@@ -3434,14 +3599,18 @@ pub fn gpu_tree_build_into(
 		.expect("tb node_sum_h zero");
 	lv.memset_zero(max_nodes * fsz).expect("tb leaf_val zero");
 	gpu_tb_leaf_sum(grad, hess, &node_assign, n_tr, &sum_g, &sum_h)?;
-	gpu_tb_leaf_val(&sum_g, &sum_h, &lambda, max_nodes, 0, &lv)?;
+	gpu_tb_leaf_val(&sum_g, &sum_h, lambda, max_nodes, 0, &lv)?;
 	gpu_tb_scatter(&node_assign, &lv, n_tr, tr_pred)?;
 	gpu_tb_apply_tree(te_bins, &sf, &sb, &lv, n_te, p, max_depth, te_pred)?;
 	Ok(())
 }
 
-
-pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, n: usize, grad: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_mse_grad_into(
+	pred: &GpuBuffer,
+	target: &GpuBuffer,
+	n: usize,
+	grad: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_mse_grad(
 			pred.ptr as *const c_void,
@@ -3516,7 +3685,12 @@ pub fn gpu_argmax_f32(data: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(),
 
 pub fn gpu_fill_f32(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_fill_f32(out.ptr as *mut c_void, val.ptr as *const f32, n as i32, std::ptr::null_mut());
+		launch_fill_f32(
+			out.ptr as *mut c_void,
+			val.ptr as *const f32,
+			n as i32,
+			std::ptr::null_mut(),
+		);
 	}
 	check_launch();
 	Ok(())
@@ -3952,7 +4126,12 @@ pub fn gpu_pool_grad_expand(
 	Ok(())
 }
 
-pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_argmin_rows(
+	dists: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_argmin_rows(
 			dists.ptr as *const c_void,
@@ -4066,7 +4245,13 @@ pub fn gpu_bias_add(
 	Ok(())
 }
 
-pub fn gpu_lstm_cell(gates: &GpuBuffer, n: usize, hs: usize, c: &GpuBuffer, h: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_lstm_cell(
+	gates: &GpuBuffer,
+	n: usize,
+	hs: usize,
+	c: &GpuBuffer,
+	h: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_lstm_cell(
 			gates.ptr as *const c_void,
@@ -4108,7 +4293,13 @@ pub fn gpu_gaussian_ll(
 	Ok(())
 }
 
-pub fn gpu_im2col_1d(x: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_im2col_1d(
+	x: &GpuBuffer,
+	n: usize,
+	p: usize,
+	ks: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
 	unsafe {
 		launch_im2col_1d(
@@ -4125,7 +4316,12 @@ pub fn gpu_im2col_1d(x: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuff
 	Ok(())
 }
 
-pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_argmax_rows(
+	x: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_argmax_rows(
 			x.ptr as *const c_void,
@@ -4292,7 +4488,6 @@ pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError>
 	crate::hip::device_synchronize()?;
 	Ok(result)
 }
-
 
 pub fn gpu_bernoulli_u8(
 	p: &GpuBuffer,
@@ -4461,12 +4656,7 @@ pub fn gpu_sign_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	Ok(())
 }
 
-pub fn gpu_pow(
-	x: &GpuBuffer,
-	p: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_pow(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_pow(
 			x.ptr as *const c_void,
@@ -4657,7 +4847,6 @@ pub fn gpu_broadcast_div(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_softmax_backward_into(
 	grad: &GpuBuffer,
@@ -5123,7 +5312,6 @@ pub fn gpu_reduce_min_cols(
 	Ok(())
 }
 
-
 pub fn gpu_gt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_gt(
@@ -5163,7 +5351,12 @@ pub fn gpu_eq(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result
 	check_launch();
 	Ok(())
 }
-pub fn gpu_gt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_gt_scalar(
+	x: &GpuBuffer,
+	val: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gt_scalar(
 			x.ptr as *const c_void,
@@ -5176,7 +5369,12 @@ pub fn gpu_gt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) 
 	check_launch();
 	Ok(())
 }
-pub fn gpu_lt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_lt_scalar(
+	x: &GpuBuffer,
+	val: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_lt_scalar(
 			x.ptr as *const c_void,
@@ -5189,8 +5387,6 @@ pub fn gpu_lt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) 
 	check_launch();
 	Ok(())
 }
-
-
 
 pub fn gpu_batchnorm_forward(
 	x: &GpuBuffer,
@@ -5281,7 +5477,6 @@ pub fn gpu_batchnorm_backward(
 	Ok(())
 }
 
-
 pub fn gpu_adam_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -5346,7 +5541,6 @@ pub fn gpu_adamw_update(
 	Ok(())
 }
 
-
 pub fn gpu_gru_cell(
 	gates: &GpuBuffer,
 	h: &GpuBuffer,
@@ -5368,7 +5562,6 @@ pub fn gpu_gru_cell(
 	Ok(())
 }
 
-
 pub fn gpu_vconcat(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -5379,7 +5572,13 @@ pub fn gpu_vconcat(
 	let a_bytes = a_n * std::mem::size_of::<f64>();
 	let b_bytes = b_n * std::mem::size_of::<f64>();
 	unsafe {
-		crate::memory::xfer(out.ptr, a.ptr as *const c_void, a_bytes, crate::hip::HIP_MEMCPY_D2D, std::ptr::null_mut())
+		crate::memory::xfer(
+			out.ptr,
+			a.ptr as *const c_void,
+			a_bytes,
+			crate::hip::HIP_MEMCPY_D2D,
+			std::ptr::null_mut(),
+		)
 	}?;
 	unsafe {
 		crate::memory::xfer(
@@ -5419,7 +5618,12 @@ pub fn gpu_slice_cols(
 
 pub fn gpu_tril_mask(fill_val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_tril_mask(out.ptr, n as i32, fill_val.ptr as *const f64, std::ptr::null_mut());
+		launch_tril_mask(
+			out.ptr,
+			n as i32,
+			fill_val.ptr as *const f64,
+			std::ptr::null_mut(),
+		);
 	}
 	check_launch();
 	Ok(())
@@ -5427,7 +5631,12 @@ pub fn gpu_tril_mask(fill_val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<
 
 pub fn gpu_fill(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_fill(out.ptr, n as i32, val.ptr as *const f64, std::ptr::null_mut());
+		launch_fill(
+			out.ptr,
+			n as i32,
+			val.ptr as *const f64,
+			std::ptr::null_mut(),
+		);
 	}
 	check_launch();
 	Ok(())
@@ -5480,7 +5689,6 @@ pub fn gpu_upsample_nearest_2d(
 	Ok(())
 }
 
-
 pub fn gpu_log_sum_exp_rows(
 	x: &GpuBuffer,
 	rows: usize,
@@ -5518,7 +5726,6 @@ pub fn gpu_grad_clip_norm(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_prefix_sum_inclusive(
 	x: &GpuBuffer,
@@ -5573,7 +5780,6 @@ pub fn gpu_prefix_sum_exclusive(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_histogram_build(
 	bins: &GpuBuffer,
@@ -5729,16 +5935,13 @@ pub fn gpu_report(
 	let ba: f64 = (0..nc)
 		.map(|k| match total[k].partial_cmp(&0.0) {
 			Some(std::cmp::Ordering::Greater) => correct[k] / total[k],
-			Some(std::cmp::Ordering::Equal)
-			| Some(std::cmp::Ordering::Less)
-			| None => 0.0,
+			Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Less) | None => 0.0,
 		})
 		.sum::<f64>()
 		/ nc as f64;
 	eprintln!("      r={:4}  val={:.4}", round + 1, ba);
 	Ok(ba)
 }
-
 
 pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(), HipError> {
 	let dp_size = (m + 1) * (n + 1);
@@ -5760,7 +5963,6 @@ pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_itemset_support(
 	trans: &GpuBuffer,
@@ -5808,7 +6010,6 @@ pub fn gpu_candidate_generate(
 	check_launch();
 	Ok(())
 }
-
 
 pub fn gpu_randn(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
@@ -5991,16 +6192,31 @@ pub fn gpu_leaf_split_apply(
 }
 
 pub fn gpu_conv1d_into(
-	x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer,
-	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+	x: &GpuBuffer,
+	w: &GpuBuffer,
+	bias: &GpuBuffer,
+	n: usize,
+	cin: usize,
+	l: usize,
+	cout: usize,
+	k: usize,
+	stride: usize,
 	y: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let lout = (l - k) / stride + 1;
 	unsafe {
 		launch_convx_conv1d(
-			x.ptr as *const c_void, w.ptr as *const c_void,
-			bias.ptr as *const c_void, y.ptr as *mut c_void,
-			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
+			x.ptr as *const c_void,
+			w.ptr as *const c_void,
+			bias.ptr as *const c_void,
+			y.ptr as *mut c_void,
+			n as i32,
+			cin as i32,
+			l as i32,
+			cout as i32,
+			k as i32,
+			lout as i32,
+			stride as i32,
 			std::ptr::null_mut(),
 		);
 	}
@@ -6009,15 +6225,29 @@ pub fn gpu_conv1d_into(
 }
 
 pub fn gpu_conv1d_backward_data_into(
-	dy: &GpuBuffer, w: &GpuBuffer,
-	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+	dy: &GpuBuffer,
+	w: &GpuBuffer,
+	n: usize,
+	cin: usize,
+	l: usize,
+	cout: usize,
+	k: usize,
+	stride: usize,
 	dx: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let lout = (l - k) / stride + 1;
 	unsafe {
 		launch_convx_conv1d_backward_data(
-			dy.ptr as *const c_void, w.ptr as *const c_void, dx.ptr as *mut c_void,
-			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
+			dy.ptr as *const c_void,
+			w.ptr as *const c_void,
+			dx.ptr as *mut c_void,
+			n as i32,
+			cin as i32,
+			l as i32,
+			cout as i32,
+			k as i32,
+			lout as i32,
+			stride as i32,
 			std::ptr::null_mut(),
 		);
 	}
@@ -6026,9 +6256,16 @@ pub fn gpu_conv1d_backward_data_into(
 }
 
 pub fn gpu_conv1d_backward_filter_into(
-	dy: &GpuBuffer, x: &GpuBuffer,
-	temp: &GpuBuffer, ws: &GpuBuffer,
-	n: usize, cin: usize, l: usize, cout: usize, k: usize, stride: usize,
+	dy: &GpuBuffer,
+	x: &GpuBuffer,
+	temp: &GpuBuffer,
+	ws: &GpuBuffer,
+	n: usize,
+	cin: usize,
+	l: usize,
+	cout: usize,
+	k: usize,
+	stride: usize,
 	chunks: usize,
 	dw: &GpuBuffer,
 ) -> Result<(), HipError> {
@@ -6036,9 +6273,18 @@ pub fn gpu_conv1d_backward_filter_into(
 	let fsz = cout * cin * k;
 	unsafe {
 		launch_convx_conv1d_backward_filter(
-			dy.ptr as *const c_void, x.ptr as *const c_void, temp.ptr as *mut c_void,
-			n as i32, cin as i32, l as i32, cout as i32, k as i32, lout as i32, stride as i32,
-			chunks as i32, std::ptr::null_mut(),
+			dy.ptr as *const c_void,
+			x.ptr as *const c_void,
+			temp.ptr as *mut c_void,
+			n as i32,
+			cin as i32,
+			l as i32,
+			cout as i32,
+			k as i32,
+			lout as i32,
+			stride as i32,
+			chunks as i32,
+			std::ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -6048,13 +6294,18 @@ pub fn gpu_conv1d_backward_filter_into(
 
 pub fn gpu_conv1d_backward_bias_into(
 	dy: &GpuBuffer,
-	n: usize, cout: usize, lout: usize,
+	n: usize,
+	cout: usize,
+	lout: usize,
 	db: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
 		launch_convx_conv1d_backward_bias(
-			dy.ptr as *const c_void, db.ptr as *mut c_void,
-			n as i32, cout as i32, lout as i32,
+			dy.ptr as *const c_void,
+			db.ptr as *mut c_void,
+			n as i32,
+			cout as i32,
+			lout as i32,
 			std::ptr::null_mut(),
 		);
 	}

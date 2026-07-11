@@ -50,8 +50,17 @@ unsafe extern "C" {
 const TOL: f64 = 1e-6;
 
 fn gpu_histc(x: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<i32> {
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let counts = { let __zb = GpuBuffer::alloc_bytes(bins * std::mem::size_of::<i32>()).unwrap(); __zb.memset_zero(bins * std::mem::size_of::<i32>()).unwrap(); __zb };
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let counts = {
+		let __zb = GpuBuffer::alloc_bytes(bins * std::mem::size_of::<i32>()).unwrap();
+		__zb.memset_zero(bins * std::mem::size_of::<i32>()).unwrap();
+		__zb
+	};
 	unsafe {
 		launch_histogramx_histc(
 			bx.ptr_raw() as *const c_void,
@@ -71,7 +80,12 @@ fn gpu_histc(x: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<i32> {
 
 fn gpu_bincount(labels: &[i32], out_len: usize) -> Vec<i32> {
 	let bl = GpuBuffer::upload_i32(labels).unwrap();
-	let counts = { let __zb = GpuBuffer::alloc_bytes(out_len * std::mem::size_of::<i32>()).unwrap(); __zb.memset_zero(out_len * std::mem::size_of::<i32>()).unwrap(); __zb };
+	let counts = {
+		let __zb = GpuBuffer::alloc_bytes(out_len * std::mem::size_of::<i32>()).unwrap();
+		__zb.memset_zero(out_len * std::mem::size_of::<i32>())
+			.unwrap();
+		__zb
+	};
 	unsafe {
 		launch_histogramx_bincount(
 			bl.ptr_raw() as *const c_void,

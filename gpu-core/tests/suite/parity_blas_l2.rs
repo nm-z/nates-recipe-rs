@@ -2,14 +2,20 @@
 // GPU result (cuBLAS via shim on NVIDIA, rocBLAS on AMD) must match a plain-Rust
 // CPU oracle within 1e-9 absolute. Matching on both backends == parity.
 
-use gpu_core::memory::GpuBuffer;
 use gpu_core::hip;
 use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
+use gpu_core::memory::GpuBuffer;
 
 const TOL: f64 = 1e-9;
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> (f64, usize) {
-	assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+	assert_eq!(
+		a.len(),
+		b.len(),
+		"length mismatch: {} vs {}",
+		a.len(),
+		b.len()
+	);
 	let mut worst = 0.0;
 	let mut idx = 0;
 	for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -83,18 +89,34 @@ fn dgemv_notrans_parity() {
 		let a = fill(m * n, 0x1111 ^ ((m as u64) << 16) ^ n as u64);
 		let x = fill(n, 0x2222 ^ ((m as u64) << 8) ^ n as u64);
 
-		let ga = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ga = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let gx = {
+			let __up = &x;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let gy = GpuBuffer::alloc(m).unwrap();
 		gpu_dgemv_into(&ga, &gx, m, n, 0, &gy).unwrap();
-		let got = { let mut __dv = vec![0.0f64; gy.n_floats()]; unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let got = {
+			let mut __dv = vec![0.0f64; gy.n_floats()];
+			unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 
 		let expect = cpu_gemv_notrans(&a, &x, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);
 		assert!(
 			d < TOL,
 			"dgemv notrans m={m} n={n}: max abs diff {d:e} at idx {idx} (got {}, expect {})",
-			got[idx], expect[idx]
+			got[idx],
+			expect[idx]
 		);
 	}
 }
@@ -106,18 +128,34 @@ fn dgemv_trans_parity() {
 		let a = fill(m * n, 0x3333 ^ ((m as u64) << 16) ^ n as u64);
 		let x = fill(m, 0x4444 ^ ((m as u64) << 8) ^ n as u64);
 
-		let ga = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ga = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let gx = {
+			let __up = &x;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let gy = GpuBuffer::alloc(n).unwrap();
 		gpu_dgemv_into(&ga, &gx, m, n, 1, &gy).unwrap();
-		let got = { let mut __dv = vec![0.0f64; gy.n_floats()]; unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let got = {
+			let mut __dv = vec![0.0f64; gy.n_floats()];
+			unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 
 		let expect = cpu_gemv_trans(&a, &x, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);
 		assert!(
 			d < TOL,
 			"dgemv trans m={m} n={n}: max abs diff {d:e} at idx {idx} (got {}, expect {})",
-			got[idx], expect[idx]
+			got[idx],
+			expect[idx]
 		);
 	}
 }
@@ -129,19 +167,35 @@ fn dger_parity() {
 		let x = fill(m, 0x5555 ^ ((m as u64) << 16) ^ n as u64);
 		let y = fill(n, 0x6666 ^ ((m as u64) << 8) ^ n as u64);
 
-		let gx = { let __up = &x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let gy = { let __up = &y; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let gx = {
+			let __up = &x;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let gy = {
+			let __up = &y;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let ga = GpuBuffer::alloc(m * n).unwrap();
 		ga.memset_zero(m * n * 8).unwrap();
 		gpu_dger_into(&gx, &gy, m, n, &ga).unwrap();
-		let got = { let mut __dv = vec![0.0f64; ga.n_floats()]; unsafe { ga.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let got = {
+			let mut __dv = vec![0.0f64; ga.n_floats()];
+			unsafe { ga.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 
 		let expect = cpu_ger(&x, &y, m, n);
 		let (d, idx) = max_abs_diff(&got, &expect);
 		assert!(
 			d < TOL,
 			"dger m={m} n={n}: max abs diff {d:e} at idx {idx} (got {}, expect {})",
-			got[idx], expect[idx]
+			got[idx],
+			expect[idx]
 		);
 	}
 }

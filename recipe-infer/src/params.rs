@@ -1,6 +1,6 @@
-use anyhow::Context;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
+use anyhow::Context;
 use gpu_core::memory::GpuBuffer;
 
 pub const LEAKY_ALPHA: f64 = 0.01;
@@ -165,7 +165,8 @@ impl LayerPlan {
 	fn pad(&mut self) {
 		let rem = self.host.len() % PLAN_ALIGN_F64;
 		if rem != 0 {
-			self.host.resize(self.host.len() + PLAN_ALIGN_F64 - rem, 0.0);
+			self.host
+				.resize(self.host.len() + PLAN_ALIGN_F64 - rem, 0.0);
 		}
 	}
 
@@ -173,7 +174,10 @@ impl LayerPlan {
 		self.pad();
 		let off = self.host.len();
 		self.host.extend_from_slice(data);
-		BlockPlan { off, len: data.len() }
+		BlockPlan {
+			off,
+			len: data.len(),
+		}
 	}
 
 	fn zeros(&mut self, len: usize) -> BlockPlan {
@@ -204,9 +208,8 @@ impl LayerPlan {
 	}
 
 	pub fn materialize(&self, staged: &GpuBuffer, base_off: usize) -> Vec<LayerParams> {
-		let view = |bp: &BlockPlan| -> GpuBuffer {
-			staged.view(base_off + bp.off, bp.len.max(1))
-		};
+		let view =
+			|bp: &BlockPlan| -> GpuBuffer { staged.view(base_off + bp.off, bp.len.max(1)) };
 		self.entries
 			.iter()
 			.map(|e| LayerParams {
@@ -241,7 +244,10 @@ impl LayerPlan {
 					LayerKind::Embed => {
 						let table = blk(&e.w);
 						for id in 0..d.vocab {
-							g.add(table[id * d.dim..(id + 1) * d.dim].to_vec(), &format!("embed.{id}"));
+							g.add(
+								table[id * d.dim..(id + 1) * d.dim].to_vec(),
+								&format!("embed.{id}"),
+							);
 						}
 					}
 					LayerKind::Attn => {
@@ -258,16 +264,27 @@ impl LayerPlan {
 						let lin = d.in_dim / d.conv_cin;
 						let lout = (lin - d.conv_k) / d.conv_stride + 1;
 						let cout = d.out_dim / lout;
-						g.add(vec![cout as f64, d.conv_cin as f64, d.conv_k as f64, d.conv_stride as f64], "conv");
+						g.add(
+							vec![
+								cout as f64,
+								d.conv_cin as f64,
+								d.conv_k as f64,
+								d.conv_stride as f64,
+							],
+							"conv",
+						);
 						g.add(blk(&e.w), "conv.w");
 						g.add(blk(&e.b), "conv.b");
 					}
 					LayerKind::Dense => {
 						let w = blk(&e.w);
 						let b = blk(&e.b);
-						let slope = (d.act == Activation::PRelu).then(|| image[e.palpha.off]);
+						let slope =
+							(d.act == Activation::PRelu).then(|| image[e.palpha.off]);
 						for j in 0..d.out_dim {
-							let row: Vec<f64> = (0..d.in_dim).map(|i| w[i * d.out_dim + j]).collect();
+							let row: Vec<f64> = (0..d.in_dim)
+								.map(|i| w[i * d.out_dim + j])
+								.collect();
 							g.add(row, &format!("z{z}.w"));
 							if let Some(a) = slope {
 								g.add(a, &format!("z{z}.a"));
@@ -314,9 +331,15 @@ pub fn plan_layer_params(
 	mode: PlanMode,
 ) -> Result<LayerPlan, String> {
 	let try_resume = mode == PlanMode::Warm;
-	let mut plan = LayerPlan { entries: Vec::new(), host: Vec::new() };
+	let mut plan = LayerPlan {
+		entries: Vec::new(),
+		host: Vec::new(),
+	};
 	let dummy_off = plan.zeros(1).off;
-	let dummy = || BlockPlan { off: dummy_off, len: 1 };
+	let dummy = || BlockPlan {
+		off: dummy_off,
+		len: 1,
+	};
 	let mut si = 0usize;
 	let mut in_dim = d;
 	for (li, spec) in specs.iter().enumerate() {
@@ -324,7 +347,11 @@ pub fn plan_layer_params(
 			let w = if try_resume {
 				let t = match resumed.get(si) {
 					Some(Saved::Embed(t)) => t,
-					_ => return Err(format!("layer {li}: checkpoint has no embed block here")),
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no embed block here"
+						));
+					}
 				};
 				if t.len() != vocab * dim {
 					return Err(format!(
@@ -364,10 +391,14 @@ pub fn plan_layer_params(
 		}
 		if let LayerSpec::Attn(heads) = *spec {
 			let d_tok = plan.entries.last().map_or(in_dim, |e| {
-				if e.dims.kind == LayerKind::Embed { e.dims.dim } else { e.dims.out_dim }
+				if e.dims.kind == LayerKind::Embed {
+					e.dims.dim
+				} else {
+					e.dims.out_dim
+				}
 			});
 			assert!(
-				in_dim % d_tok == 0,
+				in_dim.is_multiple_of(d_tok),
 				"attn: input {in_dim} not a multiple of token dim {d_tok}"
 			);
 			assert!(
@@ -378,7 +409,11 @@ pub fn plan_layer_params(
 			let (w, wk, wv, wo) = if try_resume {
 				let (sq, sk, sv, so) = match resumed.get(si) {
 					Some(Saved::Attn { wq, wk, wv, wo, .. }) => (wq, wk, wv, wo),
-					_ => return Err(format!("layer {li}: checkpoint has no attn block here")),
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no attn block here"
+						));
+					}
 				};
 				for (nm, v) in [("wq", sq), ("wk", sk), ("wv", sv), ("wo", so)] {
 					if v.len() != need {
@@ -425,8 +460,9 @@ pub fn plan_layer_params(
 		if let LayerSpec::Conv(filters, kernel, stride, act) = *spec {
 			let cin = if let Some(prev) = plan.entries.last() {
 				if prev.dims.kind == LayerKind::Conv {
-					let prev_lout = (prev.dims.in_dim / prev.dims.conv_cin - prev.dims.conv_k)
-						/ prev.dims.conv_stride + 1;
+					let prev_lout = (prev.dims.in_dim / prev.dims.conv_cin
+						- prev.dims.conv_k) / prev.dims.conv_stride
+						+ 1;
 					prev.dims.out_dim / prev_lout
 				} else {
 					1
@@ -443,7 +479,11 @@ pub fn plan_layer_params(
 			} else {
 				let (ws, bs) = match resumed.get(si) {
 					Some(Saved::Conv { w, b }) => (w, b),
-					_ => return Err(format!("layer {li}: checkpoint has no conv block here")),
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no conv block here"
+						));
+					}
 				};
 				if ws.len() != w_count {
 					return Err(format!(
@@ -489,7 +529,9 @@ pub fn plan_layer_params(
 			continue;
 		}
 		let LayerSpec::Dense(units, act) = *spec else {
-			return Err("plan_layer_params: layer spec not handled by an earlier arm".to_owned());
+			return Err(
+				"plan_layer_params: layer spec not handled by an earlier arm".to_owned(),
+			);
 		};
 		if c_cat > 0
 			&& matches!(
@@ -500,7 +542,11 @@ pub fn plan_layer_params(
 		}
 		let (w, b, slope) = if !try_resume {
 			let scale = (2.0 / in_dim as f64).sqrt();
-			(plan.randn(in_dim * units, li, scale), plan.zeros(units), None)
+			(
+				plan.randn(in_dim * units, li, scale),
+				plan.zeros(units),
+				None,
+			)
 		} else {
 			let mut wh = vec![0.0f64; in_dim * units];
 			let mut bh = vec![0.0f64; units];
@@ -630,7 +676,10 @@ pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 	let root = ogdl::text(text).itnl("");
 	let vals = |n: &ogdl::Node| -> Vec<f64> {
-		n.children.iter().filter_map(|g| g.name.parse::<f64>().ok()).collect()
+		n.children
+			.iter()
+			.filter_map(|g| g.name.parse::<f64>().ok())
+			.collect()
 	};
 	let mut out: Vec<Saved> = Vec::new();
 	for block in &root.children {
@@ -638,11 +687,15 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 			continue;
 		}
 		let field = |name: &str| -> Vec<f64> {
-			block.children.iter().find(|c| c.name == name).map_or_else(Vec::new, &vals)
+			block.children
+				.iter()
+				.find(|c| c.name == name)
+				.map_or_else(Vec::new, &vals)
 		};
 		match block.name.as_str() {
 			"embed" => {
-				let mut rows: Vec<(usize, Vec<f64>)> = Vec::with_capacity(block.children.len());
+				let mut rows: Vec<(usize, Vec<f64>)> =
+					Vec::with_capacity(block.children.len());
 				for c in &block.children {
 					let id = c.name.parse().context("resume: embed row id")?;
 					rows.push((id, vals(c)));
@@ -662,7 +715,10 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 				bv: field("bv"),
 				bo: field("bo"),
 			}),
-			"conv" => out.push(Saved::Conv { w: field("w"), b: field("b") }),
+			"conv" => out.push(Saved::Conv {
+				w: field("w"),
+				b: field("b"),
+			}),
 			_ => {
 				let mut w = Vec::new();
 				let mut b = 0.0;
@@ -670,13 +726,21 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 				for c in &block.children {
 					match c.name.as_str() {
 						"w" => w = vals(c),
-						"b" => b = vals(c).first().copied().ok_or_else(|| anyhow::anyhow!("resume: dense b"))?,
+						"b" => {
+							b = vals(c)
+								.first()
+								.copied()
+								.ok_or_else(|| anyhow::anyhow!("resume: dense b"))?
+						}
 						"a" => a = vals(c).first().copied(),
 						key if key.starts_with('w')
-							&& key.len() > 1
-							&& key[1..].chars().all(|ch| ch.is_ascii_digit()) =>
+							&& key.len() > 1 && key[1..]
+							.chars()
+							.all(|ch| ch.is_ascii_digit()) =>
 						{
-							w.push(vals(c).first().copied().ok_or_else(|| anyhow::anyhow!("resume: dense w{{n}}"))?);
+							w.push(vals(c).first().copied().ok_or_else(|| {
+								anyhow::anyhow!("resume: dense w{{n}}")
+							})?);
 						}
 						key => anyhow::bail!(
 							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
@@ -690,9 +754,14 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 	Ok(out)
 }
 
-pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, score: f64) -> String {
-	let want_w = filter.map_or(true, |f| f.contains(&Param::W));
-	let want_b = filter.map_or(true, |f| f.contains(&Param::B));
+pub fn dump_ogdl(
+	params: &[LayerParams],
+	filter: Option<&[Param]>,
+	key: &str,
+	score: f64,
+) -> String {
+	let want_w = filter.is_none_or(|f| f.contains(&Param::W));
+	let want_b = filter.is_none_or(|f| f.contains(&Param::B));
 	crate::params::ogdl_text(|g| {
 		g.add(score, key);
 		let mut z = 1;
@@ -702,7 +771,10 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 					if want_w {
 						let table = download_vec(&p.w, p.vocab * p.dim);
 						for id in 0..p.vocab {
-							g.add(table[id * p.dim..(id + 1) * p.dim].to_vec(), &format!("embed.{id}"));
+							g.add(
+								table[id * p.dim..(id + 1) * p.dim].to_vec(),
+								&format!("embed.{id}"),
+							);
 						}
 					}
 				}
@@ -726,7 +798,15 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 					let lout = (lin - p.conv_k) / p.conv_stride + 1;
 					let cout = p.out_dim / lout;
 					let w_count = cout * p.conv_cin * p.conv_k;
-					g.add(vec![cout as f64, p.conv_cin as f64, p.conv_k as f64, p.conv_stride as f64], "conv");
+					g.add(
+						vec![
+							cout as f64,
+							p.conv_cin as f64,
+							p.conv_k as f64,
+							p.conv_stride as f64,
+						],
+						"conv",
+					);
 					if want_w {
 						g.add(download_vec(&p.w, w_count), "conv.w");
 					}
@@ -737,10 +817,13 @@ pub fn dump_ogdl(params: &[LayerParams], filter: Option<&[Param]>, key: &str, sc
 				LayerKind::Dense => {
 					let w = download_vec(&p.w, p.in_dim * p.out_dim);
 					let b = download_vec(&p.b, p.out_dim);
-					let slope = (p.act == Activation::PRelu).then(|| download_scalar(&p.palpha));
+					let slope = (p.act == Activation::PRelu)
+						.then(|| download_scalar(&p.palpha));
 					for j in 0..p.out_dim {
 						if want_w {
-							let row: Vec<f64> = (0..p.in_dim).map(|i| w[i * p.out_dim + j]).collect();
+							let row: Vec<f64> = (0..p.in_dim)
+								.map(|i| w[i * p.out_dim + j])
+								.collect();
 							g.add(row, &format!("z{z}.w"));
 							if let Some(a) = slope {
 								g.add(a, &format!("z{z}.a"));
@@ -771,7 +854,9 @@ pub fn saved_score(path: &str, key: &str) -> Option<f64> {
 	let text = std::fs::read_to_string(path).ok()?;
 	for line in text.lines() {
 		let line = line.trim();
-		if let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(char::is_whitespace))
+		if let Some((k, v)) = line
+			.split_once('=')
+			.or_else(|| line.split_once(char::is_whitespace))
 			&& k.trim() == key
 		{
 			return v.trim().parse().ok();

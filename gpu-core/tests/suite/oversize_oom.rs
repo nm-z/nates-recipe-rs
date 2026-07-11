@@ -35,7 +35,10 @@ fn oversize_request_is_clean_oom_not_abort() {
 	unsafe {
 		use std::os::unix::process::CommandExt;
 		cmd.pre_exec(|| {
-			let lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			let lim = libc::rlimit {
+				rlim_cur: 0,
+				rlim_max: 0,
+			};
 			libc::setrlimit(libc::RLIMIT_CORE, &lim);
 			Ok(())
 		});

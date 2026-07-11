@@ -32,7 +32,6 @@ pub fn conv_out_hw(
 	ConvOut { h: out_h, w: out_w }
 }
 
-
 unsafe extern "C" {
 	fn launch_scaled_dot_product_attention(
 		q: *const c_void,

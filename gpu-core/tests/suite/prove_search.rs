@@ -96,8 +96,18 @@ unsafe extern "C" {
 // ── GPU runners (upload f64, download i32) ───────────────────────────────────
 
 fn searchsorted_gpu(a: &[f64], v: &[f64], side: i32) -> Vec<i32> {
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bv = { let __up = v; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bv = {
+		let __up = v;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(v.len() * 4).unwrap();
 	unsafe {
 		launch_searchx_searchsorted(
@@ -117,8 +127,18 @@ fn searchsorted_gpu(a: &[f64], v: &[f64], side: i32) -> Vec<i32> {
 }
 
 fn isin_gpu(a: &[f64], x: &[f64]) -> Vec<i32> {
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
 	unsafe {
 		launch_searchx_isin(
@@ -137,7 +157,12 @@ fn isin_gpu(a: &[f64], x: &[f64]) -> Vec<i32> {
 }
 
 fn nonzero_gpu(x: &[f64]) -> Vec<i32> {
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(x.len().max(1) * 4).unwrap();
 	let cnt = GpuBuffer::alloc_bytes(4).unwrap();
 	unsafe {
@@ -159,7 +184,12 @@ fn nonzero_gpu(x: &[f64]) -> Vec<i32> {
 }
 
 fn scalar_i32(x: &[f64], launch: impl Fn(*const c_void, i32, *mut c_void)) -> i32 {
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(4).unwrap();
 	launch(bx.ptr_raw() as *const c_void, x.len() as i32, out.ptr_raw());
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -200,8 +230,18 @@ fn argextreme_gpu(x: &[f64], mode: i32) -> i32 {
 }
 
 fn mismatch_gpu(a: &[f64], b: &[f64]) -> i32 {
-	let ba = { let __up = a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-	let bb = { let __up = b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let ba = {
+		let __up = a;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
+	let bb = {
+		let __up = b;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(4).unwrap();
 	unsafe {
 		launch_searchx_mismatch(
@@ -219,7 +259,12 @@ fn mismatch_gpu(a: &[f64], b: &[f64]) -> i32 {
 }
 
 fn minmax_element_gpu(x: &[f64]) -> (i32, i32) {
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(8).unwrap();
 	unsafe {
 		launch_searchx_minmax_element(
@@ -236,7 +281,12 @@ fn minmax_element_gpu(x: &[f64]) -> (i32, i32) {
 }
 
 fn argrel_gpu(x: &[f64], mode: i32) -> Vec<i32> {
-	let bx = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let bx = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let out = GpuBuffer::alloc_bytes(x.len() * 4).unwrap();
 	unsafe {
 		launch_searchx_argrel(

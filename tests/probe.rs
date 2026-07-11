@@ -22,7 +22,10 @@ fn beacon_roundtrips_exact() {
 		flops_gflops: 254.7,
 		transfer_gbs: 402.3,
 	}]);
-	assert_eq!(Machine::beacon_decode(&m.beacon_encode()).expect("decode"), m);
+	assert_eq!(
+		Machine::beacon_decode(&m.beacon_encode()).expect("decode"),
+		m
+	);
 
 	let storage = sample(Vec::new());
 	let back = Machine::beacon_decode(&storage.beacon_encode()).expect("decode");
@@ -42,7 +45,11 @@ fn config_ogdl_roundtrips() {
 	b.host = "archy".to_string();
 	let text = write_config(&[a.clone(), b.clone()]);
 	let parsed = parse_config(&text);
-	assert_eq!(parsed.len(), 2, "trailing schema block must not parse as a host");
+	assert_eq!(
+		parsed.len(),
+		2,
+		"trailing schema block must not parse as a host"
+	);
 	assert_eq!(parsed[0], a);
 	assert_eq!(parsed[1], b);
 	assert!(parsed[1].gpus.is_empty());
@@ -58,18 +65,30 @@ fn config_emits_eth_transfer_schema() {
 	}]);
 	let text = write_config(&[m]);
 	assert!(text.contains("\t\tETH\n"), "ETH section present");
-	assert!(text.contains("\t\t\t1GbE\t0.125\n"), "ETH link line present");
+	assert!(
+		text.contains("\t\t\t1GbE\t0.125\n"),
+		"ETH link line present"
+	);
 	assert!(text.contains("\t\tGPU0\n"), "uppercase GPU0 section");
 	assert!(text.contains("\t\tCPU\n"), "uppercase CPU section");
 	assert!(text.contains("\t\tDISK\n"), "uppercase DISK section");
 	assert!(text.contains("\t\t\tDDR5\t38.400\n"), "CPU DDR5 line");
-	assert!(text.contains("\t\t\tTransfer\t42.500\n"), "CPU Transfer line");
-	assert!(text.trim_end().ends_with("FLOPs\tGFLOP/s"), "schema is the trailing block");
+	assert!(
+		text.contains("\t\t\tTransfer\t42.500\n"),
+		"CPU Transfer line"
+	);
+	assert!(
+		text.trim_end().ends_with("FLOPs\tGFLOP/s"),
+		"schema is the trailing block"
+	);
 	let (eth, disk, gpu, cpu) = (
 		text.find("\t\tETH\n").unwrap(),
 		text.find("\t\tDISK\n").unwrap(),
 		text.find("\t\tGPU0\n").unwrap(),
 		text.find("\t\tCPU\n").unwrap(),
 	);
-	assert!(eth < disk && disk < gpu && gpu < cpu, "tier order ETH<DISK<GPU<CPU");
+	assert!(
+		eth < disk && disk < gpu && gpu < cpu,
+		"tier order ETH<DISK<GPU<CPU"
+	);
 }

@@ -533,7 +533,6 @@ pub fn gpu_gru_cell_f32(
 	check_launch()
 }
 
-
 pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
 		launch_relu_f16(
@@ -558,7 +557,12 @@ pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	check_launch()
 }
 
-pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_add_f16(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_add_f16(
 			a.ptr_raw() as *const c_void,
@@ -571,7 +575,12 @@ pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> R
 	check_launch()
 }
 
-pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_mul_f16(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_mul_f16(
 			a.ptr_raw() as *const c_void,

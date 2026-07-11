@@ -1,13 +1,10 @@
-
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-
 static SAT_ARMED: AtomicBool = AtomicBool::new(0 == 1);
 const SAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 const SAT_ENFORCE: Option<()> = None;
-
 
 extern "C" fn fast_death(sig: libc::c_int) {
 	unsafe {
@@ -30,7 +27,11 @@ pub fn install_fast_death() {
 }
 
 fn busy_path() -> std::path::PathBuf {
-	for card in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+	for card in std::fs::read_dir("/sys/class/drm")
+		.into_iter()
+		.flatten()
+		.flatten()
+	{
 		let p = card.path().join("device/gpu_busy_percent");
 		let Some(found) = Some(p).filter(|q| q.exists()) else {
 			continue;

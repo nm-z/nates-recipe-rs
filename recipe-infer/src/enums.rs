@@ -79,27 +79,48 @@ pub struct MetricFmt {
 impl Metric {
 	pub fn fmt(self) -> MetricFmt {
 		match self {
-			Metric::Epoch => MetricFmt { label: "epoch", width: 5 },
-			Metric::Lr => MetricFmt { label: "lr", width: 7 },
-			Metric::Time => MetricFmt { label: "time", width: 9 },
-			Metric::Loss => MetricFmt { label: "loss", width: 7 },
-			Metric::Accuracy => MetricFmt { label: "acc", width: 6 },
-			Metric::R2 => MetricFmt { label: "r2", width: 8 },
-			Metric::Hip => MetricFmt { label: "hip", width: 0 },
+			Metric::Epoch => MetricFmt {
+				label: "epoch",
+				width: 5,
+			},
+			Metric::Lr => MetricFmt {
+				label: "lr",
+				width: 7,
+			},
+			Metric::Time => MetricFmt {
+				label: "time",
+				width: 9,
+			},
+			Metric::Loss => MetricFmt {
+				label: "loss",
+				width: 7,
+			},
+			Metric::Accuracy => MetricFmt {
+				label: "acc",
+				width: 6,
+			},
+			Metric::R2 => MetricFmt {
+				label: "r2",
+				width: 8,
+			},
+			Metric::Hip => MetricFmt {
+				label: "hip",
+				width: 0,
+			},
 		}
 	}
 
 	pub fn render(self, v: f64) -> String {
 		let w = self.fmt().width;
-		v.partial_cmp(&v).map_or(
-			format!("{:>w$}", "N/A"),
-			|_finite| match self {
+		v.partial_cmp(&v)
+			.map_or(format!("{:>w$}", "N/A"), |_finite| match self {
 				Metric::Epoch => format!("{:>w$}", v as usize),
 				Metric::Time => format!("{:>w$}", fmt_time(v)),
 				Metric::Hip => String::new(),
-				Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => format!("{v:>w$.4}"),
-			},
-		)
+				Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => {
+					format!("{v:>w$.4}")
+				}
+			})
 	}
 }
 
@@ -149,13 +170,13 @@ mod alias {
 }
 
 pub use alias::{
+	ACCURACY as Accuracy, EPOCH as Epoch, HIP as hip, LOSS as Loss, LR as Lr, R_TWO as R2,
+	TIME as Time,
+};
+pub use alias::{
 	BCE as bce, CE as ce, ELU as elu, FOCAL as focal, GELU as gelu, HUBER as huber, LEAK as leak,
 	LINEAR as linear, MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu,
 	SIG as sig, SILU as silu, SWISH as swish, TANH as tanh,
-};
-pub use alias::{
-	ACCURACY as Accuracy, EPOCH as Epoch, HIP as hip, LOSS as Loss, LR as Lr, R_TWO as R2,
-	TIME as Time,
 };
 
 #[derive(Clone, Copy, PartialEq)]

@@ -1,4 +1,3 @@
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
@@ -8,22 +7,53 @@ macro_rules! counters {
 }
 
 counters!(
-	HOST_MALLOC, HOST_FREE,
-	MEMCPY_ASYNC, MALLOC_ASYNC, MEMSET_ASYNC, FREE_ASYNC,
+	HOST_MALLOC,
+	HOST_FREE,
+	MEMCPY_ASYNC,
+	MALLOC_ASYNC,
+	MEMSET_ASYNC,
+	FREE_ASYNC,
 	XFER_ASYNC,
 	LAUNCH,
-	GET_LAST_ERROR, PEEK_AT_LAST_ERROR, GET_ERROR_STRING, GET_ERROR_NAME,
-	EVENT_RECORD, EVENT_ELAPSED_TIME, EVENT_DESTROY, EVENT_CREATE,
-	STREAM_SYNCHRONIZE, DEVICE_SYNCHRONIZE, EVENT_SYNCHRONIZE,
-	STREAM_DESTROY, STREAM_CREATE,
-	MEM_GET_INFO, SET_DEVICE, GET_DEVICE_COUNT, DEVICE_GET_ATTRIBUTE,
-	DEVICE_ENABLE_PEER_ACCESS, DEVICE_CAN_ACCESS_PEER, GET_DEVICE_PROPERTIES, GET_DEVICE,
-	GET_DEFAULT_MEMPOOL, MEMPOOL_GET_ATTRIBUTE, MEMPOOL_TRIM_TO, MEMPOOL_SET_ATTRIBUTE,
-	MEM_UNMAP, MEM_SET_ACCESS, MEM_RELEASE, MEM_MAP,
-	MEM_GET_ALLOCATION_GRANULARITY, MEM_CREATE, MEM_ADDRESS_RESERVE, MEM_ADDRESS_FREE,
+	GET_LAST_ERROR,
+	PEEK_AT_LAST_ERROR,
+	GET_ERROR_STRING,
+	GET_ERROR_NAME,
+	EVENT_RECORD,
+	EVENT_ELAPSED_TIME,
+	EVENT_DESTROY,
+	EVENT_CREATE,
+	STREAM_SYNCHRONIZE,
+	DEVICE_SYNCHRONIZE,
+	EVENT_SYNCHRONIZE,
+	STREAM_DESTROY,
+	STREAM_CREATE,
+	MEM_GET_INFO,
+	SET_DEVICE,
+	GET_DEVICE_COUNT,
+	DEVICE_GET_ATTRIBUTE,
+	DEVICE_ENABLE_PEER_ACCESS,
+	DEVICE_CAN_ACCESS_PEER,
+	GET_DEVICE_PROPERTIES,
+	GET_DEVICE,
+	GET_DEFAULT_MEMPOOL,
+	MEMPOOL_GET_ATTRIBUTE,
+	MEMPOOL_TRIM_TO,
+	MEMPOOL_SET_ATTRIBUTE,
+	MEM_UNMAP,
+	MEM_SET_ACCESS,
+	MEM_RELEASE,
+	MEM_MAP,
+	MEM_GET_ALLOCATION_GRANULARITY,
+	MEM_CREATE,
+	MEM_ADDRESS_RESERVE,
+	MEM_ADDRESS_FREE,
 	HIPBLAS,
-	HOST_REGISTER, HOST_UNREGISTER,
-	MANAGED_MALLOC, MEM_ADVISE, HOST_GET_DEVICE_POINTER,
+	HOST_REGISTER,
+	HOST_UNREGISTER,
+	MANAGED_MALLOC,
+	MEM_ADVISE,
+	HOST_GET_DEVICE_POINTER,
 );
 
 #[inline]
@@ -33,22 +63,52 @@ pub(crate) fn tick(c: &AtomicU64) {
 
 pub const N: usize = 47;
 static ALL: [&AtomicU64; N] = [
-	&HOST_MALLOC, &HOST_FREE,
-	&MEMCPY_ASYNC, &MALLOC_ASYNC, &MEMSET_ASYNC, &FREE_ASYNC,
+	&HOST_MALLOC,
+	&HOST_FREE,
+	&MEMCPY_ASYNC,
+	&MALLOC_ASYNC,
+	&MEMSET_ASYNC,
+	&FREE_ASYNC,
 	&XFER_ASYNC,
 	&LAUNCH,
-	&GET_LAST_ERROR, &PEEK_AT_LAST_ERROR, &GET_ERROR_STRING, &GET_ERROR_NAME,
-	&EVENT_RECORD, &EVENT_ELAPSED_TIME, &EVENT_DESTROY, &EVENT_CREATE,
-	&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE,
-	&STREAM_DESTROY, &STREAM_CREATE,
-	&MEM_GET_INFO, &SET_DEVICE, &GET_DEVICE_COUNT, &DEVICE_GET_ATTRIBUTE,
-	&DEVICE_ENABLE_PEER_ACCESS, &DEVICE_CAN_ACCESS_PEER, &GET_DEVICE_PROPERTIES, &GET_DEVICE,
-	&GET_DEFAULT_MEMPOOL, &MEMPOOL_GET_ATTRIBUTE, &MEMPOOL_TRIM_TO, &MEMPOOL_SET_ATTRIBUTE,
-	&MEM_UNMAP, &MEM_SET_ACCESS, &MEM_RELEASE, &MEM_MAP,
-	&MEM_GET_ALLOCATION_GRANULARITY, &MEM_CREATE, &MEM_ADDRESS_RESERVE, &MEM_ADDRESS_FREE,
+	&GET_LAST_ERROR,
+	&PEEK_AT_LAST_ERROR,
+	&GET_ERROR_STRING,
+	&GET_ERROR_NAME,
+	&EVENT_RECORD,
+	&EVENT_ELAPSED_TIME,
+	&EVENT_DESTROY,
+	&EVENT_CREATE,
+	&STREAM_SYNCHRONIZE,
+	&DEVICE_SYNCHRONIZE,
+	&EVENT_SYNCHRONIZE,
+	&STREAM_DESTROY,
+	&STREAM_CREATE,
+	&MEM_GET_INFO,
+	&SET_DEVICE,
+	&GET_DEVICE_COUNT,
+	&DEVICE_GET_ATTRIBUTE,
+	&DEVICE_ENABLE_PEER_ACCESS,
+	&DEVICE_CAN_ACCESS_PEER,
+	&GET_DEVICE_PROPERTIES,
+	&GET_DEVICE,
+	&GET_DEFAULT_MEMPOOL,
+	&MEMPOOL_GET_ATTRIBUTE,
+	&MEMPOOL_TRIM_TO,
+	&MEMPOOL_SET_ATTRIBUTE,
+	&MEM_UNMAP,
+	&MEM_SET_ACCESS,
+	&MEM_RELEASE,
+	&MEM_MAP,
+	&MEM_GET_ALLOCATION_GRANULARITY,
+	&MEM_CREATE,
+	&MEM_ADDRESS_RESERVE,
+	&MEM_ADDRESS_FREE,
 	&HIPBLAS,
-	&HOST_REGISTER, &HOST_UNREGISTER,
-	&MANAGED_MALLOC, &MEM_ADVISE,
+	&HOST_REGISTER,
+	&HOST_UNREGISTER,
+	&MANAGED_MALLOC,
+	&MEM_ADVISE,
 	&HOST_GET_DEVICE_POINTER,
 ];
 
@@ -87,67 +147,216 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 		end[i].saturating_sub(base[i])
 	};
 	let groups: &[CounterGroup] = &[
-		CounterGroup { group: "sync", entries: &[
-			CounterEntry { n: g(&HOST_MALLOC), name: "allocations" },
-			CounterEntry { n: g(&HOST_FREE), name: "frees" },
-		] },
-		CounterGroup { group: "async", entries: &[
-			CounterEntry { n: g(&MEMCPY_ASYNC), name: "transfers" },
-			CounterEntry { n: g(&MALLOC_ASYNC), name: "allocations" },
-			CounterEntry { n: g(&MEMSET_ASYNC), name: "memsets" },
-			CounterEntry { n: g(&FREE_ASYNC), name: "frees" },
-		] },
-		CounterGroup { group: "kernel launch", entries: &[
-			CounterEntry { n: g(&LAUNCH), name: "hipLaunchKernelGGL" },
-		] },
-		CounterGroup { group: "reporting", entries: &[
-			CounterEntry { n: g(&GET_LAST_ERROR), name: "hipGetLastError" },
-			CounterEntry { n: g(&PEEK_AT_LAST_ERROR), name: "hipPeekAtLastError" },
-			CounterEntry { n: g(&GET_ERROR_STRING), name: "hipGetErrorString" },
-			CounterEntry { n: g(&GET_ERROR_NAME), name: "hipGetErrorName" },
-			CounterEntry { n: g(&EVENT_RECORD), name: "hipEventRecord" },
-			CounterEntry { n: g(&EVENT_ELAPSED_TIME), name: "hipEventElapsedTime" },
-			CounterEntry { n: g(&EVENT_DESTROY), name: "hipEventDestroy" },
-			CounterEntry { n: g(&EVENT_CREATE), name: "hipEventCreate" },
-		] },
-		CounterGroup { group: "syncs", entries: &[
-			CounterEntry { n: g(&STREAM_SYNCHRONIZE), name: "hipStreamSynchronize" },
-			CounterEntry { n: g(&DEVICE_SYNCHRONIZE), name: "hipDeviceSynchronize" },
-			CounterEntry { n: g(&EVENT_SYNCHRONIZE), name: "hipEventSynchronize" },
-		] },
-		CounterGroup { group: "streams", entries: &[
-			CounterEntry { n: g(&STREAM_DESTROY), name: "hipStreamDestroy" },
-			CounterEntry { n: g(&STREAM_CREATE), name: "hipStreamCreate" },
-		] },
-		CounterGroup { group: "device/settings", entries: &[
-			CounterEntry { n: g(&MEM_GET_INFO), name: "hipMemGetInfo" },
-			CounterEntry { n: g(&SET_DEVICE), name: "hipSetDevice" },
-			CounterEntry { n: g(&GET_DEVICE_COUNT), name: "hipGetDeviceCount" },
-			CounterEntry { n: g(&DEVICE_GET_ATTRIBUTE), name: "hipDeviceGetAttribute" },
-			CounterEntry { n: g(&DEVICE_ENABLE_PEER_ACCESS), name: "hipDeviceEnablePeerAccess" },
-			CounterEntry { n: g(&DEVICE_CAN_ACCESS_PEER), name: "hipDeviceCanAccessPeer" },
-			CounterEntry { n: g(&GET_DEVICE_PROPERTIES), name: "hipGetDeviceProperties" },
-			CounterEntry { n: g(&GET_DEVICE), name: "hipGetDevice" },
-		] },
-		CounterGroup { group: "pool", entries: &[
-			CounterEntry { n: g(&GET_DEFAULT_MEMPOOL), name: "hipDeviceGetDefaultMemPool" },
-			CounterEntry { n: g(&MEMPOOL_GET_ATTRIBUTE), name: "hipMemPoolGetAttribute" },
-			CounterEntry { n: g(&MEMPOOL_TRIM_TO), name: "hipMemPoolTrimTo" },
-			CounterEntry { n: g(&MEMPOOL_SET_ATTRIBUTE), name: "hipMemPoolSetAttribute" },
-		] },
-		CounterGroup { group: "VMM", entries: &[
-			CounterEntry { n: g(&MEM_UNMAP), name: "hipMemUnmap" },
-			CounterEntry { n: g(&MEM_SET_ACCESS), name: "hipMemSetAccess" },
-			CounterEntry { n: g(&MEM_RELEASE), name: "hipMemRelease" },
-			CounterEntry { n: g(&MEM_MAP), name: "hipMemMap" },
-			CounterEntry { n: g(&MEM_GET_ALLOCATION_GRANULARITY), name: "hipMemGetAllocationGranularity" },
-			CounterEntry { n: g(&MEM_CREATE), name: "hipMemCreate" },
-			CounterEntry { n: g(&MEM_ADDRESS_RESERVE), name: "hipMemAddressReserve" },
-			CounterEntry { n: g(&MEM_ADDRESS_FREE), name: "hipMemAddressFree" },
-		] },
-		CounterGroup { group: "other", entries: &[
-			CounterEntry { n: g(&HIPBLAS), name: "hipBLAS" },
-		] },
+		CounterGroup {
+			group: "sync",
+			entries: &[
+				CounterEntry {
+					n: g(&HOST_MALLOC),
+					name: "allocations",
+				},
+				CounterEntry {
+					n: g(&HOST_FREE),
+					name: "frees",
+				},
+			],
+		},
+		CounterGroup {
+			group: "async",
+			entries: &[
+				CounterEntry {
+					n: g(&MEMCPY_ASYNC),
+					name: "transfers",
+				},
+				CounterEntry {
+					n: g(&MALLOC_ASYNC),
+					name: "allocations",
+				},
+				CounterEntry {
+					n: g(&MEMSET_ASYNC),
+					name: "memsets",
+				},
+				CounterEntry {
+					n: g(&FREE_ASYNC),
+					name: "frees",
+				},
+			],
+		},
+		CounterGroup {
+			group: "kernel launch",
+			entries: &[CounterEntry {
+				n: g(&LAUNCH),
+				name: "hipLaunchKernelGGL",
+			}],
+		},
+		CounterGroup {
+			group: "reporting",
+			entries: &[
+				CounterEntry {
+					n: g(&GET_LAST_ERROR),
+					name: "hipGetLastError",
+				},
+				CounterEntry {
+					n: g(&PEEK_AT_LAST_ERROR),
+					name: "hipPeekAtLastError",
+				},
+				CounterEntry {
+					n: g(&GET_ERROR_STRING),
+					name: "hipGetErrorString",
+				},
+				CounterEntry {
+					n: g(&GET_ERROR_NAME),
+					name: "hipGetErrorName",
+				},
+				CounterEntry {
+					n: g(&EVENT_RECORD),
+					name: "hipEventRecord",
+				},
+				CounterEntry {
+					n: g(&EVENT_ELAPSED_TIME),
+					name: "hipEventElapsedTime",
+				},
+				CounterEntry {
+					n: g(&EVENT_DESTROY),
+					name: "hipEventDestroy",
+				},
+				CounterEntry {
+					n: g(&EVENT_CREATE),
+					name: "hipEventCreate",
+				},
+			],
+		},
+		CounterGroup {
+			group: "syncs",
+			entries: &[
+				CounterEntry {
+					n: g(&STREAM_SYNCHRONIZE),
+					name: "hipStreamSynchronize",
+				},
+				CounterEntry {
+					n: g(&DEVICE_SYNCHRONIZE),
+					name: "hipDeviceSynchronize",
+				},
+				CounterEntry {
+					n: g(&EVENT_SYNCHRONIZE),
+					name: "hipEventSynchronize",
+				},
+			],
+		},
+		CounterGroup {
+			group: "streams",
+			entries: &[
+				CounterEntry {
+					n: g(&STREAM_DESTROY),
+					name: "hipStreamDestroy",
+				},
+				CounterEntry {
+					n: g(&STREAM_CREATE),
+					name: "hipStreamCreate",
+				},
+			],
+		},
+		CounterGroup {
+			group: "device/settings",
+			entries: &[
+				CounterEntry {
+					n: g(&MEM_GET_INFO),
+					name: "hipMemGetInfo",
+				},
+				CounterEntry {
+					n: g(&SET_DEVICE),
+					name: "hipSetDevice",
+				},
+				CounterEntry {
+					n: g(&GET_DEVICE_COUNT),
+					name: "hipGetDeviceCount",
+				},
+				CounterEntry {
+					n: g(&DEVICE_GET_ATTRIBUTE),
+					name: "hipDeviceGetAttribute",
+				},
+				CounterEntry {
+					n: g(&DEVICE_ENABLE_PEER_ACCESS),
+					name: "hipDeviceEnablePeerAccess",
+				},
+				CounterEntry {
+					n: g(&DEVICE_CAN_ACCESS_PEER),
+					name: "hipDeviceCanAccessPeer",
+				},
+				CounterEntry {
+					n: g(&GET_DEVICE_PROPERTIES),
+					name: "hipGetDeviceProperties",
+				},
+				CounterEntry {
+					n: g(&GET_DEVICE),
+					name: "hipGetDevice",
+				},
+			],
+		},
+		CounterGroup {
+			group: "pool",
+			entries: &[
+				CounterEntry {
+					n: g(&GET_DEFAULT_MEMPOOL),
+					name: "hipDeviceGetDefaultMemPool",
+				},
+				CounterEntry {
+					n: g(&MEMPOOL_GET_ATTRIBUTE),
+					name: "hipMemPoolGetAttribute",
+				},
+				CounterEntry {
+					n: g(&MEMPOOL_TRIM_TO),
+					name: "hipMemPoolTrimTo",
+				},
+				CounterEntry {
+					n: g(&MEMPOOL_SET_ATTRIBUTE),
+					name: "hipMemPoolSetAttribute",
+				},
+			],
+		},
+		CounterGroup {
+			group: "VMM",
+			entries: &[
+				CounterEntry {
+					n: g(&MEM_UNMAP),
+					name: "hipMemUnmap",
+				},
+				CounterEntry {
+					n: g(&MEM_SET_ACCESS),
+					name: "hipMemSetAccess",
+				},
+				CounterEntry {
+					n: g(&MEM_RELEASE),
+					name: "hipMemRelease",
+				},
+				CounterEntry {
+					n: g(&MEM_MAP),
+					name: "hipMemMap",
+				},
+				CounterEntry {
+					n: g(&MEM_GET_ALLOCATION_GRANULARITY),
+					name: "hipMemGetAllocationGranularity",
+				},
+				CounterEntry {
+					n: g(&MEM_CREATE),
+					name: "hipMemCreate",
+				},
+				CounterEntry {
+					n: g(&MEM_ADDRESS_RESERVE),
+					name: "hipMemAddressReserve",
+				},
+				CounterEntry {
+					n: g(&MEM_ADDRESS_FREE),
+					name: "hipMemAddressFree",
+				},
+			],
+		},
+		CounterGroup {
+			group: "other",
+			entries: &[CounterEntry {
+				n: g(&HIPBLAS),
+				name: "hipBLAS",
+			}],
+		},
 	];
 	let mut out = String::new();
 	for grp in groups {
@@ -165,7 +374,6 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 	}
 	out
 }
-
 
 static LOOP_START: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
 static LOOP_END: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
@@ -190,19 +398,36 @@ struct Tail<'a> {
 }
 
 pub fn state_report(run_start: &[u64; N]) -> Option<String> {
-	let ls = LOOP_START.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+	let ls = LOOP_START
+		.lock()
+		.unwrap_or_else(|p| p.into_inner())
+		.take()?;
 	let le = LOOP_END.lock().unwrap_or_else(|p| p.into_inner()).take()?;
 	let end = snapshot();
 	let idx = |c: &AtomicU64| {
-		ALL.iter().position(|x| std::ptr::eq(*x, c)).expect("counter registered in ALL")
+		ALL.iter()
+			.position(|x| std::ptr::eq(*x, c))
+			.expect("counter registered in ALL")
 	};
 	let cell = |a: &[u64; N], b: &[u64; N], cs: &[&AtomicU64]| -> u64 {
 		cs.iter().map(|c| b[idx(c)].saturating_sub(a[idx(c)])).sum()
 	};
 	let phases: [Phase; 3] = [
-		Phase { name: "init", a: run_start, b: &ls },
-		Phase { name: "loop", a: &ls, b: &le },
-		Phase { name: "exit", a: &le, b: &end },
+		Phase {
+			name: "init",
+			a: run_start,
+			b: &ls,
+		},
+		Phase {
+			name: "loop",
+			a: &ls,
+			b: &le,
+		},
+		Phase {
+			name: "exit",
+			a: &le,
+			b: &end,
+		},
 	];
 	let mut out = String::new();
 	let mut hipblas = [0u64; 3];
@@ -213,31 +438,75 @@ pub fn state_report(run_start: &[u64; N]) -> Option<String> {
 		let a = ph.a;
 		let b = ph.b;
 		out.push_str(&format!("{name}\n    calcs\n"));
-		out.push_str(&format!("        {:<8}{:>7}\n", "in-place", format!("{}x", cell(a, b, &[&LAUNCH]))));
+		out.push_str(&format!(
+			"        {:<8}{:>7}\n",
+			"in-place",
+			format!("{}x", cell(a, b, &[&LAUNCH]))
+		));
 		out.push_str(&format!(
 			"        {:<8}{:>7}\n",
 			"alloc",
-			format!("{}x", cell(a, b, &[&HOST_MALLOC, &MALLOC_ASYNC, &MEM_CREATE, &MANAGED_MALLOC, &HOST_REGISTER]))
+			format!(
+				"{}x",
+				cell(
+					a,
+					b,
+					&[
+						&HOST_MALLOC,
+						&MALLOC_ASYNC,
+						&MEM_CREATE,
+						&MANAGED_MALLOC,
+						&HOST_REGISTER
+					]
+				)
+			)
 		));
 		out.push_str("    transfers\n");
-		out.push_str(&format!("        {:<8}{:>7}\n", "async", format!("{}x", cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER]))));
+		out.push_str(&format!(
+			"        {:<8}{:>7}\n",
+			"async",
+			format!(
+				"{}x",
+				cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER])
+			)
+		));
 		out.push_str(&format!(
 			"        {:<8}{:>7}\n",
 			"sync",
-			format!("{}x", cell(a, b, &[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]))
+			format!(
+				"{}x",
+				cell(
+					a,
+					b,
+					&[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]
+				)
+			)
 		));
 		hipblas[i] = cell(a, b, &[&HIPBLAS]);
-		frees[i] = cell(a, b, &[&HOST_FREE, &FREE_ASYNC, &MEM_RELEASE, &HOST_UNREGISTER]);
+		frees[i] = cell(
+			a,
+			b,
+			&[&HOST_FREE, &FREE_ASYNC, &MEM_RELEASE, &HOST_UNREGISTER],
+		);
 	}
 	let tails: [Tail; 2] = [
-		Tail { what: "hipBLAS", v: hipblas },
-		Tail { what: "free", v: frees },
+		Tail {
+			what: "hipBLAS",
+			v: hipblas,
+		},
+		Tail {
+			what: "free",
+			v: frees,
+		},
 	];
 	for t in tails {
 		for _present in t.v.iter().find(|x| **x != 0).into_iter() {
 			let line = format!(
 				"{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x\n",
-				what = t.what, i0 = t.v[0], i1 = t.v[1], i2 = t.v[2]
+				what = t.what,
+				i0 = t.v[0],
+				i1 = t.v[1],
+				i2 = t.v[2]
 			);
 			out.push_str(&line);
 		}

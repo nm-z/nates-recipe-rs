@@ -1,4 +1,3 @@
-
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
@@ -32,8 +31,20 @@ unsafe extern "C" {
 		prefix: i32,
 		stream: *mut c_void,
 	);
-	fn launch_gelu_mul(a: *const c_void, b: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
-	fn launch_glu_gelu(input: *const c_void, out: *mut c_void, rows: i32, half: i32, stream: *mut c_void);
+	fn launch_gelu_mul(
+		a: *const c_void,
+		b: *const c_void,
+		out: *mut c_void,
+		n: i64,
+		stream: *mut c_void,
+	);
+	fn launch_glu_gelu(
+		input: *const c_void,
+		out: *mut c_void,
+		rows: i32,
+		half: i32,
+		stream: *mut c_void,
+	);
 	fn launch_rope_partial(
 		buf: *mut c_void,
 		rows: i32,
@@ -79,7 +90,12 @@ pub fn gpu_rope_partial(
 
 pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_widen_bf16_f64(raw.ptr_raw() as *const c_void, out.ptr_raw(), n as i64, std::ptr::null_mut());
+		launch_widen_bf16_f64(
+			raw.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			n as i64,
+			std::ptr::null_mut(),
+		);
 	}
 	cl()
 }
@@ -155,21 +171,50 @@ pub fn gpu_gqa_attn(
 	cl()
 }
 
-pub fn gpu_gelu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_gelu_mul(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	n: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		launch_gelu_mul(a.ptr_raw() as *const c_void, b.ptr_raw() as *const c_void, out.ptr_raw(), n as i64, std::ptr::null_mut());
+		launch_gelu_mul(
+			a.ptr_raw() as *const c_void,
+			b.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			n as i64,
+			std::ptr::null_mut(),
+		);
 	}
 	cl()
 }
 
-pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_glu_gelu(
+	input: &GpuBuffer,
+	rows: usize,
+	half: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
-		launch_glu_gelu(input.ptr_raw() as *const c_void, out.ptr_raw(), rows as i32, half as i32, std::ptr::null_mut());
+		launch_glu_gelu(
+			input.ptr_raw() as *const c_void,
+			out.ptr_raw(),
+			rows as i32,
+			half as i32,
+			std::ptr::null_mut(),
+		);
 	}
 	cl()
 }
 
-pub fn gpu_gemm_bt_f64(a: &GpuBuffer, b: &GpuBuffer, m: usize, n: usize, k: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_gemm_bt_f64(
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	m: usize,
+	n: usize,
+	k: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
 	unsafe {
 		launch_gemm_bt_f64(
 			a.ptr_raw() as *const c_void,
@@ -186,7 +231,12 @@ pub fn gpu_gemm_bt_f64(a: &GpuBuffer, b: &GpuBuffer, m: usize, n: usize, k: usiz
 
 pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_scale_f64(x.ptr_raw(), scalar.ptr_raw() as *const c_void, n as i64, std::ptr::null_mut());
+		launch_scale_f64(
+			x.ptr_raw(),
+			scalar.ptr_raw() as *const c_void,
+			n as i64,
+			std::ptr::null_mut(),
+		);
 	}
 	cl()
 }

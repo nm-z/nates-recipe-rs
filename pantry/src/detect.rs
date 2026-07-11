@@ -59,15 +59,21 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 /// correctness over a second, prefix-only dialect.
 pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 	let p = std::path::Path::new(path);
-	let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+	let ext = p
+		.extension()
+		.and_then(|e| e.to_str())
+		.map(str::to_ascii_lowercase);
 	let plain_csv = !p.is_dir()
 		&& !matches!(ext.as_deref(), Some("zip" | "db" | "sqlite"))
 		&& crate::data::sniff_delimiter(p) != b' ';
 	match Some(()).filter(|_u| plain_csv) {
 		Some(()) => {
 			let pref = prefix_columns(p)?;
-			let non_empty: Vec<Vec<&str>> =
-				pref.cols.iter().map(|c| c.iter().map(String::as_str).collect()).collect();
+			let non_empty: Vec<Vec<&str>> = pref
+				.cols
+				.iter()
+				.map(|c| c.iter().map(String::as_str).collect())
+				.collect();
 			Ok(vec![crate::encode::GroupKinds {
 				name: String::new(),
 				cols: kinds_for(&pref.headers, &non_empty)?,
@@ -76,19 +82,25 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 		None => crate::data::load_groups(path)
 			.iter()
 			.filter_map(|g| match g {
-				crate::data::DirGroup::Table { name, headers, cells, .. } => {
+				crate::data::DirGroup::Table {
+					name,
+					headers,
+					cells,
+					..
+				} => {
 					let non_empty: Vec<Vec<&str>> = (0..headers.len())
 						.map(|j| {
-							cells
-								.iter()
+							cells.iter()
 								.map(|r| r.get(j).map_or("", String::as_str))
 								.filter(|c| !crate::encode::is_missing(c))
 								.collect()
 						})
 						.collect();
-					Some(kinds_for(headers, &non_empty).map(|k| crate::encode::GroupKinds {
-						name: name.clone(),
-						cols: k,
+					Some(kinds_for(headers, &non_empty).map(|k| {
+						crate::encode::GroupKinds {
+							name: name.clone(),
+							cols: k,
+						}
 					}))
 				}
 				crate::data::DirGroup::Image { .. } => None,
@@ -101,9 +113,13 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 /// branch the encoder takes for it regardless of any prediction). One `(header,
 /// kind)` per column, in header order, so the encoder matches positionally and can
 /// catch a count/name drift against its full parse.
-fn kinds_for(headers: &[String], non_empty: &[Vec<&str>]) -> anyhow::Result<Vec<crate::encode::ColKind>> {
-	let to_predict: Vec<usize> =
-		(0..headers.len()).filter(|&j| !non_empty[j].is_empty()).collect();
+fn kinds_for(
+	headers: &[String],
+	non_empty: &[Vec<&str>],
+) -> anyhow::Result<Vec<crate::encode::ColKind>> {
+	let to_predict: Vec<usize> = (0..headers.len())
+		.filter(|&j| !non_empty[j].is_empty())
+		.collect();
 	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
 	let preds = predict_kinds(&cols)?;
 	let mut pred: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -155,12 +171,18 @@ fn prefix_columns(path: &std::path::Path) -> anyhow::Result<PrefixCols> {
 		.map_err(|e| anyhow::anyhow!("detect_kinds: failed to open {}: {e}", path.display()))?;
 	let mut records = rdr.byte_records();
 	let Some(first) = records.next() else {
-		return Ok(PrefixCols { headers: Vec::new(), cols: Vec::new() });
+		return Ok(PrefixCols {
+			headers: Vec::new(),
+			cols: Vec::new(),
+		});
 	};
-	let first =
-		first.map_err(|e| anyhow::anyhow!("detect_kinds: first record of {}: {e}", path.display()))?;
-	let first_cells: Vec<String> =
-		first.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+	let first = first.map_err(|e| {
+		anyhow::anyhow!("detect_kinds: first record of {}: {e}", path.display())
+	})?;
+	let first_cells: Vec<String> = first
+		.iter()
+		.map(|s| String::from_utf8_lossy(s).into_owned())
+		.collect();
 	let w = first_cells.len();
 	// Header row iff any first-row cell is a non-number (a header names columns);
 	// an all-numeric first row is data, and columns are synthesized col_0..col_{w-1}.
@@ -197,14 +219,19 @@ fn prefix_columns(path: &std::path::Path) -> anyhow::Result<PrefixCols> {
 			break 'records;
 		};
 		for rec in records {
-			let rec = rec
-				.map_err(|e| anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display()))?;
+			let rec = rec.map_err(|e| {
+				anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display())
+			})?;
 			for j in 0..w {
 				let std::cmp::Ordering::Less = tok[j].cmp(&CONTEXT) else {
 					continue;
 				};
-				let cell = rec.get(j).map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
-				let Some(()) = Some(()).filter(|_u| !crate::encode::is_missing(cell.as_ref())) else {
+				let cell = rec
+					.get(j)
+					.map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
+				let Some(()) =
+					Some(()).filter(|_u| !crate::encode::is_missing(cell.as_ref()))
+				else {
 					continue;
 				};
 				take(j, cell.as_ref(), &mut cols, &mut tok);
@@ -247,7 +274,8 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	for col in columns {
 		data.extend(tokenize_column(col));
 	}
-	let x = ndarray::Array2::from_shape_vec(ndarray::Ix2(n, CONTEXT), data).expect("detect: shape");
+	let x =
+		ndarray::Array2::from_shape_vec(ndarray::Ix2(n, CONTEXT), data).expect("detect: shape");
 	let specs = vec![
 		recipe_infer::LayerSpec::Embed(EMBED_DIM, Some(VOCAB)),
 		recipe_infer::LayerSpec::Attn(HEADS),
@@ -260,8 +288,15 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	// one memset-committed slab — no per-buffer pool growth (the fresh-page
 	// commit that faults ~30-50% of fresh-process loads).
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL)?;
-	let plan = recipe_infer::plan_layer_params(&specs, CONTEXT, 0, VOCAB, &saved, recipe_infer::PlanMode::Warm)
-		.map_err(|e| anyhow::anyhow!("detect plan_layer_params: {e}"))?;
+	let plan = recipe_infer::plan_layer_params(
+		&specs,
+		CONTEXT,
+		0,
+		VOCAB,
+		&saved,
+		recipe_infer::PlanMode::Warm,
+	)
+	.map_err(|e| anyhow::anyhow!("detect plan_layer_params: {e}"))?;
 	let mut stage = recipe_infer::Stage::new();
 	let w_off = stage.push(plan.host());
 	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
@@ -297,9 +332,11 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	// the single device_synchronize completes it; finish fans the pin into preds.
 	// Scratch (all carves) drops after this drain, so its Drop drains nothing.
 	let mut preds = vec![0.0f64; n * N_CLASS];
-	let exit = unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
-		.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
-	recipe_infer::device_synchronize().map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
+	let exit =
+		unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
+			.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
+	recipe_infer::device_synchronize()
+		.map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
 	exit.finish(&mut preds);
 	Ok((0..n)
 		.map(|r| {

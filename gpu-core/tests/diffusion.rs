@@ -33,5 +33,8 @@ fn diffusion_block_ar_progressive_commit() {
 	hip::device_synchronize().expect("dl sync");
 	eprintln!("diffusion block-AR: steps={steps} canvas={out:?}");
 	assert_eq!(steps, n, "one position commits per step → n steps");
-	assert!(out.iter().all(|&v| v == 0.0), "every position decoded to argmax class 0");
+	assert!(
+		out.iter().all(|&v| v == 0.0),
+		"every position decoded to argmax class 0"
+	);
 }

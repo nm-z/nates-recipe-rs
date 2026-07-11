@@ -4,7 +4,9 @@ use gpu_core::memory::GpuBuffer;
 // Deterministic pseudo-random fill (no rand dep in this crate's tests).
 fn lcg_fill(v: &mut [f64], mut state: u64) {
 	for x in v.iter_mut() {
-		state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		state = state
+			.wrapping_mul(6364136223846793005)
+			.wrapping_add(1442695040888963407);
 		*x = ((state >> 33) as f64 / (1u64 << 31) as f64) - 0.5;
 	}
 }
@@ -86,7 +88,10 @@ fn cpu_attention(
 }
 
 fn maxdiff(a: &[f64], b: &[f64]) -> f64 {
-	a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+	a.iter()
+		.zip(b)
+		.map(|(x, y)| (x - y).abs())
+		.fold(0.0, f64::max)
 }
 
 // Flash training forward (context + logsumexp) and the three backward kernels
@@ -108,10 +113,30 @@ fn flash_train_matches_cpu_oracle() {
 
 	let (c_ctx, c_lse, c_dq, c_dk, c_dv) = cpu_attention(&q, &k, &v, &dctx, n, s, d, heads);
 
-	let gq = { let __up = &q; let __ub = GpuBuffer::alloc(__up.len()).expect("q"); __ub.load(__up).expect("q"); __ub };
-	let gk = { let __up = &k; let __ub = GpuBuffer::alloc(__up.len()).expect("k"); __ub.load(__up).expect("k"); __ub };
-	let gv = { let __up = &v; let __ub = GpuBuffer::alloc(__up.len()).expect("v"); __ub.load(__up).expect("v"); __ub };
-	let gdctx = { let __up = &dctx; let __ub = GpuBuffer::alloc(__up.len()).expect("dctx"); __ub.load(__up).expect("dctx"); __ub };
+	let gq = {
+		let __up = &q;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("q");
+		__ub.load(__up).expect("q");
+		__ub
+	};
+	let gk = {
+		let __up = &k;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("k");
+		__ub.load(__up).expect("k");
+		__ub
+	};
+	let gv = {
+		let __up = &v;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("v");
+		__ub.load(__up).expect("v");
+		__ub
+	};
+	let gdctx = {
+		let __up = &dctx;
+		let __ub = GpuBuffer::alloc(__up.len()).expect("dctx");
+		__ub.load(__up).expect("dctx");
+		__ub
+	};
 	let gctx = GpuBuffer::alloc(len).expect("ctx");
 	let glse = GpuBuffer::alloc(n * heads * s).expect("lse");
 	let gdsum = GpuBuffer::alloc(n * heads * s).expect("dsum");
@@ -127,7 +152,8 @@ fn flash_train_matches_cpu_oracle() {
 
 	let dl = |b: &GpuBuffer, l: usize| {
 		let mut h = vec![0.0; l];
-		unsafe { b.download_async(&mut h, std::ptr::null_mut()) }.expect("download"); gpu_core::hip::device_synchronize().expect("download");
+		unsafe { b.download_async(&mut h, std::ptr::null_mut()) }.expect("download");
+		gpu_core::hip::device_synchronize().expect("download");
 		h
 	};
 	let checks = [
@@ -139,6 +165,9 @@ fn flash_train_matches_cpu_oracle() {
 	];
 	for (name, diff) in checks {
 		eprintln!("flash-train {name}: maxdiff={diff:e}");
-		assert!(diff < 1e-12, "flash-train {name} diverged from CPU oracle: {diff:e}");
+		assert!(
+			diff < 1e-12,
+			"flash-train {name} diverged from CPU oracle: {diff:e}"
+		);
 	}
 }

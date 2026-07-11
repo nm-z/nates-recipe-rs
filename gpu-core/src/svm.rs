@@ -80,7 +80,6 @@ pub fn gpu_kernel_matrix(
 	Ok(())
 }
 
-
 pub fn gpu_smo_kkt_score(
 	grad: &GpuBuffer,
 	alpha: &GpuBuffer,
@@ -256,7 +255,15 @@ pub fn gpu_smo_train(
 	let mut b_count = 0_usize;
 
 	for _iter in 0..max_iter {
-		gpu_smo_kkt_score(&grad_buf, &alpha_buf, &y_buf, &c_buf, n, &score_i_buf, &score_j_buf)?;
+		gpu_smo_kkt_score(
+			&grad_buf,
+			&alpha_buf,
+			&y_buf,
+			&c_buf,
+			n,
+			&score_i_buf,
+			&score_j_buf,
+		)?;
 
 		let mut o = [0.0_f64; 2];
 		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
@@ -272,8 +279,28 @@ pub fn gpu_smo_train(
 		match (val_i - val_j).partial_cmp(&tol) {
 			Some(std::cmp::Ordering::Less) => break,
 			Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) | None => {
-				gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, i, &krow_i)?;
-				gpu_smo_kernel_row(x, &gamma_buf, &coef0_buf, &degree_buf, n, dim, kind_u, j, &krow_j)?;
+				gpu_smo_kernel_row(
+					x,
+					&gamma_buf,
+					&coef0_buf,
+					&degree_buf,
+					n,
+					dim,
+					kind_u,
+					i,
+					&krow_i,
+				)?;
+				gpu_smo_kernel_row(
+					x,
+					&gamma_buf,
+					&coef0_buf,
+					&degree_buf,
+					n,
+					dim,
+					kind_u,
+					j,
+					&krow_j,
+				)?;
 				let kii = read_at(&krow_i, i)?;
 				let kij = read_at(&krow_i, j)?;
 				let kjj = read_at(&krow_j, j)?;
@@ -288,17 +315,27 @@ pub fn gpu_smo_train(
 				let grad_diff = -(val_i - val_j);
 				let new_aj_raw = match eta.abs().partial_cmp(&1e-12) {
 					Some(std::cmp::Ordering::Greater) => old_aj + yj * grad_diff / eta,
-					Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => old_aj,
+					Some(std::cmp::Ordering::Less)
+					| Some(std::cmp::Ordering::Equal)
+					| None => old_aj,
 				};
 
 				let bounds = match (yi - yj).abs().partial_cmp(&1e-9) {
 					Some(std::cmp::Ordering::Less) => {
 						let s = old_ai + old_aj;
-						Bounds { lo: f64::max(0.0, s - c), hi: f64::min(c, s) }
+						Bounds {
+							lo: f64::max(0.0, s - c),
+							hi: f64::min(c, s),
+						}
 					}
-					Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) | None => {
+					Some(std::cmp::Ordering::Equal)
+					| Some(std::cmp::Ordering::Greater)
+					| None => {
 						let s = old_ai - old_aj;
-						Bounds { lo: f64::max(0.0, -s), hi: f64::min(c, c - s) }
+						Bounds {
+							lo: f64::max(0.0, -s),
+							hi: f64::min(c, c - s),
+						}
 					}
 				};
 
@@ -315,7 +352,9 @@ pub fn gpu_smo_train(
 					None => {
 						write1(&di_buf, yi * delta_ai)?;
 						write1(&dj_buf, yj * delta_aj)?;
-						gpu_smo_update_gradient_rows(&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf)?;
+						gpu_smo_update_gradient_rows(
+							&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf,
+						)?;
 
 						alpha_host[i] = new_ai;
 						alpha_host[j] = new_aj;
@@ -341,5 +380,8 @@ pub fn gpu_smo_train(
 		std::cmp::Ordering::Greater => b / b_count as f64,
 		std::cmp::Ordering::Equal | std::cmp::Ordering::Less => 0.0,
 	};
-	Ok(SmoModel { alpha: alpha_host, b: b_final })
+	Ok(SmoModel {
+		alpha: alpha_host,
+		b: b_final,
+	})
 }

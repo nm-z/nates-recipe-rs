@@ -198,7 +198,12 @@ fn oracle_2d(
 fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	let l = x.len() as i32;
 	let n = l + lpad + rpad;
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(n as usize).unwrap();
 	let (xp, op) = (b.ptr_raw() as *const c_void, o.ptr_raw());
 	unsafe {
@@ -218,7 +223,8 @@ fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; n as usize];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 
@@ -236,7 +242,12 @@ fn gpu_2d(
 	let oh = h + tpad + bpad;
 	let ow = w + lpad + rpad;
 	let n = oh * ow;
-	let b = { let __up = x; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+	let b = {
+		let __up = x;
+		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+		__ub.load(__up).unwrap();
+		__ub
+	};
 	let o = GpuBuffer::alloc(n as usize).unwrap();
 	let (xp, op) = (b.ptr_raw() as *const c_void, o.ptr_raw());
 	unsafe {
@@ -295,7 +306,8 @@ fn gpu_2d(
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; n as usize];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap();
+	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
 

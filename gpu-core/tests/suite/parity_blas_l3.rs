@@ -15,7 +15,13 @@ use gpu_core::{hip, kernels, linalg};
 const TOL: f64 = 1e-9;
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> (f64, usize) {
-	assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+	assert_eq!(
+		a.len(),
+		b.len(),
+		"length mismatch: {} vs {}",
+		a.len(),
+		b.len()
+	);
 	let mut worst = 0.0;
 	let mut idx = 0;
 	for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -117,7 +123,10 @@ fn assert_parity(label: &str, gpu: &[f64], cpu: &[f64]) {
 		gpu[idx],
 		cpu[idx],
 	);
-	eprintln!("{label}: OK (max abs diff {worst:e} over {} elems)", gpu.len());
+	eprintln!(
+		"{label}: OK (max abs diff {worst:e} over {} elems)",
+		gpu.len()
+	);
 }
 
 // Sizes: square, two non-square, and several NOT multiples of 32 (7,11,13,33,17,40)
@@ -138,11 +147,26 @@ fn gemm_matches_cpu_oracle() {
 	for &(m, n, k) in GEMM_SIZES {
 		let a = fill(m * k, 0x1111 ^ ((m * 100 + k) as u64));
 		let b = fill(k * n, 0x2222 ^ ((k * 100 + n) as u64));
-		let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ag = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let bg = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let cg = GpuBuffer::alloc(m * n).unwrap();
 		kernels::gpu_gemm(&ag, &bg, m, n, k, &cg).unwrap();
-		let gpu = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let gpu = {
+			let mut __dv = vec![0.0f64; cg.n_floats()];
+			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let cpu = cpu_gemm(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm m={m} n={n} k={k}"), &gpu, &cpu);
 	}
@@ -157,11 +181,26 @@ fn gemm_at_matches_cpu_oracle() {
 		// A is (k×m) row-major, B is (k×n) row-major.
 		let a = fill(k * m, 0x3333 ^ ((k * 100 + m) as u64));
 		let b = fill(k * n, 0x4444 ^ ((k * 100 + n) as u64));
-		let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ag = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let bg = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let cg = GpuBuffer::alloc(m * n).unwrap();
 		kernels::gpu_gemm_at(&ag, &bg, m, n, k, &cg).unwrap();
-		let gpu = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let gpu = {
+			let mut __dv = vec![0.0f64; cg.n_floats()];
+			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let cpu = cpu_gemm_at(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm_at m={m} n={n} k={k}"), &gpu, &cpu);
 	}
@@ -176,11 +215,26 @@ fn gemm_bt_matches_cpu_oracle() {
 		// A is (m×k) row-major, B is (n×k) row-major.
 		let a = fill(m * k, 0x5555 ^ ((m * 100 + k) as u64));
 		let b = fill(n * k, 0x6666 ^ ((n * 100 + k) as u64));
-		let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
-		let bg = { let __up = &b; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ag = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
+		let bg = {
+			let __up = &b;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let cg = GpuBuffer::alloc(m * n).unwrap();
 		kernels::gpu_gemm_bt_into(&ag, &bg, m, n, k, &cg).unwrap();
-		let gpu = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let gpu = {
+			let mut __dv = vec![0.0f64; cg.n_floats()];
+			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let cpu = cpu_gemm_bt(&a, &b, m, n, k);
 		assert_parity(&format!("gpu_gemm_bt m={m} n={n} k={k}"), &gpu, &cpu);
 	}
@@ -202,10 +256,20 @@ fn dsyrk_lower_triangle_matches_cpu_oracle() {
 	for &n in &[4usize, 7, 17, 33] {
 		let k = n;
 		let a = fill(k * n, 0x7777 ^ (n as u64));
-		let ag = { let __up = &a; let __ub = GpuBuffer::alloc(__up.len()).unwrap(); __ub.load(__up).unwrap(); __ub };
+		let ag = {
+			let __up = &a;
+			let __ub = GpuBuffer::alloc(__up.len()).unwrap();
+			__ub.load(__up).unwrap();
+			__ub
+		};
 		let cg = GpuBuffer::alloc(n * n).unwrap();
 		linalg::gpu_dsyrk(&ag, n, k, &cg).unwrap();
-		let gpu = { let mut __dv = vec![0.0f64; cg.n_floats()]; unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap(); gpu_core::hip::device_synchronize().unwrap(); __dv };
+		let gpu = {
+			let mut __dv = vec![0.0f64; cg.n_floats()];
+			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			gpu_core::hip::device_synchronize().unwrap();
+			__dv
+		};
 		let gram = cpu_gram(&a, n, k);
 
 		// Compare only the populated lower triangle (i >= j) of the row-major output.

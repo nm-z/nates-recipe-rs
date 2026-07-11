@@ -1,4 +1,3 @@
-
 use crate::memory::{GpuBuffer, tag_scope};
 use std::collections::HashMap;
 use std::io::{Error, Result};
@@ -99,17 +98,23 @@ impl Waterfall {
 		match vram {
 			Tier::Use => {
 				let _t = tag_scope("waterfall");
-				let view = GpuBuffer::alloc_bytes(len).map_err(|e| Error::other(format!("carve: {e}")))?;
+				let view = GpuBuffer::alloc_bytes(len)
+					.map_err(|e| Error::other(format!("carve: {e}")))?;
 				let mut host = vec![0u8; len];
 				fill(&mut host)?;
-				view.write_u8(&host).map_err(|e| Error::other(format!("waterfall H2D: {e}")))?;
+				view.write_u8(&host)
+					.map_err(|e| Error::other(format!("waterfall H2D: {e}")))?;
 				Ok(Home::Vram(view))
 			}
 			Tier::Skip => self.settle_host(len, fill),
 		}
 	}
 
-	fn settle_host(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
+	fn settle_host(
+		&mut self,
+		len: usize,
+		fill: impl FnOnce(&mut [u8]) -> Result<()>,
+	) -> Result<Home> {
 		let ram = match self.ram_full {
 			Fill::Full => Tier::Skip,
 			Fill::Open => match mem_available().saturating_sub(len).cmp(&self.ram_floor) {

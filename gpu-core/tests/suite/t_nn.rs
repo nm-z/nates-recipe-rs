@@ -205,7 +205,15 @@ fn test_layernorm_backward_f32() {
 	let grad_gamma = GpuBuffer::zeros_f32(cols).unwrap();
 	let grad_beta = GpuBuffer::zeros_f32(cols).unwrap();
 	gpu_layernorm_backward_f32(
-		&grad_y, &x, &gamma, &eps_buf, rows, cols, &grad_x, &grad_gamma, &grad_beta,
+		&grad_y,
+		&x,
+		&gamma,
+		&eps_buf,
+		rows,
+		cols,
+		&grad_x,
+		&grad_gamma,
+		&grad_beta,
 	)
 	.unwrap();
 	sync();
@@ -749,7 +757,17 @@ fn test_rmsnorm_backward() {
 
 	let grad_x = GpuBuffer::zeros_f32(rows * cols).unwrap();
 	let grad_gamma = GpuBuffer::zeros_f32(cols).unwrap();
-	gpu_rmsnorm_backward(&grad_out, &x, &gamma, &eps_buf, rows, cols, &grad_x, &grad_gamma).unwrap();
+	gpu_rmsnorm_backward(
+		&grad_out,
+		&x,
+		&gamma,
+		&eps_buf,
+		rows,
+		cols,
+		&grad_x,
+		&grad_gamma,
+	)
+	.unwrap();
 	sync();
 
 	let mut gx = vec![0.0f32; rows * cols];
@@ -801,7 +819,10 @@ fn test_im2col_2d_ext() {
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
 	let patches = GpuBuffer::zeros_f32(n * out_h * out_w * c * kh * kw).unwrap();
-	gpu_im2col_2d_ext(&x, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w, &patches).unwrap();
+	gpu_im2col_2d_ext(
+		&x, n, c, h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w, &patches,
+	)
+	.unwrap();
 	sync();
 
 	let patch_count = n * out_h * out_w;

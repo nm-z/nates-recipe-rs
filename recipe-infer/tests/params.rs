@@ -1,4 +1,4 @@
-use recipe_infer::{load_ogdl, load_ogdl_str, Saved};
+use recipe_infer::{Saved, load_ogdl, load_ogdl_str};
 
 #[test]
 fn ogdl_format_roundtrips_host_side() {
@@ -76,6 +76,20 @@ fn dump_add_api_roundtrips() {
 	});
 	let saved = load_ogdl_str(&text).expect("load_ogdl_str");
 	assert_eq!(saved.len(), 2, "two dense neurons, metric header skipped");
-	assert_eq!(saved[0], Saved::Dense { w: vec![0.1, 0.2, 0.3], b: 0.01, a: Some(0.05) });
-	assert_eq!(saved[1], Saved::Dense { w: vec![-0.4, 0.5], b: 0.02, a: None });
+	assert_eq!(
+		saved[0],
+		Saved::Dense {
+			w: vec![0.1, 0.2, 0.3],
+			b: 0.01,
+			a: Some(0.05)
+		}
+	);
+	assert_eq!(
+		saved[1],
+		Saved::Dense {
+			w: vec![-0.4, 0.5],
+			b: 0.02,
+			a: None
+		}
+	);
 }

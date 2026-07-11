@@ -3,7 +3,6 @@ use crate::kernels::{gpu_copy_into, safe_i32};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
-
 unsafe extern "C" {
 	fn launch_diffusionx_entropy_gated_step(
 		logits: *const c_void,
