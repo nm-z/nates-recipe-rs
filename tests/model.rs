@@ -193,7 +193,8 @@ fn backward_step(
 		n * params[last].out_dim,
 		sc,
 		ss,
-	);
+	)
+	.expect("loss grad");
 	sc.mark_bwd(params.len());
 	let mut flip = false;
 	for l in (0..params.len()).rev() {
@@ -336,7 +337,7 @@ fn backward_step(
 			}
 			Activation::Linear => da,
 		};
-		let at_concat = Some(l) == cc.map(|t| t.0);
+		let at_concat = Some(l) == cc.map(|t| t.pf);
 		let a_prev = if l == 0 {
 			x
 		} else if at_concat {
@@ -379,7 +380,7 @@ fn backward_step(
 		}
 		kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, in_dim * out_dim, &params[l].w).expect("sgd w");
 		kernels::gpu_sgd_update(&sc.db, &ss.neg_lr, out_dim, &params[l].b).expect("sgd b");
-		if let Some((pf, a, c)) = cc
+		if let Some(ConcatDims { pf, a, c }) = cc
 			&& l == pf
 		{
 			kernels::gpu_slice_lead_into(da_below, n, a + c, a, &sc.concat_dgrad).expect("concat slice");
@@ -486,7 +487,7 @@ fn gpu_metrics_match_cpu_reference() {
 	};
 	let out = &sc.acts[last];
 	let metric = |m: Metric, loss: Loss| -> f64 {
-		let (sign, div) =
+		let LossScale { sign, div } =
 			metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar).expect("metric");
 		let v = sign * download_scalar(&sc.metric_scalar) / div;
 		if m == Metric::R2 { 1.0 - v } else { v }
@@ -735,7 +736,8 @@ fn ping_pong_gradients_match_per_layer() {
 		n * params[last].out_dim,
 		&sc,
 		&ss,
-	);
+	)
+	.expect("loss grad");
 	for l in (0..params.len()).rev() {
 		let (in_dim, out_dim) = (params[l].in_dim, params[l].out_dim);
 		let m = n * out_dim;

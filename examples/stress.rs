@@ -4,7 +4,7 @@ const BANK: &str = "datasets/uci-bank-semicolon/bank-full.csv";
 const SEEDS: &str = "datasets/uci-seeds/seeds_dataset.txt";
 const WINE: &str = "datasets/uci-wine/wine.data";
 
-fn columns(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
+fn columns(path: &str) -> recipe::data::RawCsv {
 	recipe::data::read_raw_csv(std::path::Path::new(path))
 		.unwrap_or_else(|e| panic!("stress: {path}: {e}"))
 }
@@ -13,7 +13,7 @@ fn main() {
 	for (path, want, sep) in
 		[(BANK, 17usize, "semicolon"), (SEEDS, 8, "tab"), (WINE, 14, "comma")]
 	{
-		let (headers, rows) = columns(path);
+		let recipe::data::RawCsv { headers, rows } = columns(path);
 		assert_eq!(
 			headers.len(),
 			want,
@@ -28,7 +28,7 @@ fn main() {
 		);
 	}
 
-	let rows = columns(BANK).1.len();
+	let rows = columns(BANK).rows.len();
 	let data = Data::load(BANK).target("y");
 	let model = Model::new().loss(bce).layer(64).leak().layer(1).sigmoid().lr(0.001);
 	Train::new().epochs(20).log([Loss, Accuracy, hip]).run(&data, &model);

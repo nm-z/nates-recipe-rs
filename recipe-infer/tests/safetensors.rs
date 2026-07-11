@@ -1,4 +1,4 @@
-use recipe_infer::safetensors::{parse_safetensors, parse_json, field_str, field_arr, decode, Json};
+use recipe_infer::safetensors::{parse_safetensors, parse_json, field_str, field_arr, decode, Json, Member};
 
 #[test]
 fn parse_safetensors_decodes_header_and_blob() {
@@ -70,7 +70,7 @@ fn read_safetensors_header_and_decode_min() {
 	};
 	let (mut count, mut params, mut min_bytes) = (0usize, 0u128, u64::MAX);
 	let mut min_tensor: Option<(String, String, u64, u64)> = None;
-	for (name, val) in &entries {
+	for Member { key: name, val } in &entries {
 		if name == "__metadata__" {
 			continue;
 		}

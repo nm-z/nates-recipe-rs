@@ -1,4 +1,4 @@
-use ogdl::{Graph, Node, Ogdl};
+use ogdl::{Graph, NamedChild, Node, Ogdl};
 use ogdl::del;
 use std::fs;
 use std::sync::Arc;
@@ -56,7 +56,7 @@ fn arity_forms_dispatch() {
       let a = g.itnl("a");
       g.del(&a[0]);
       assert!(g.itnl("a").children.iter().all(|c| c.name != "x"));
-      g.del(("y", &a));
+      g.del(NamedChild { name: "y", parent: &a });
       assert!(g.itnl("a").children.is_empty());
 }
 

@@ -291,7 +291,7 @@ macro_rules! value {
             fn into_nodes(self) -> Vec<Node> { self.iter().map(|s| Node::leaf(s)).collect() }
       } )*};
 }
-value!(scalar: f64, i64, i32, usize);
+value!(scalar: f64, i64, i32, usize, bool);
 value!(str: &str, String, &String);
 value!(floats: Vec<f64>, &[f64]);
 value!(strs: Vec<String>, &[String]);

@@ -1,4 +1,4 @@
-use gpu_core::diffusion::gpu_diffusion_sample;
+use gpu_core::diffusion::{DiffusionSample, gpu_diffusion_sample};
 use gpu_core::hip::{self, HipError};
 use gpu_core::memory::GpuBuffer;
 
@@ -26,7 +26,7 @@ fn diffusion_block_ar_progressive_commit() {
 		Ok(lb)
 	};
 
-	let (canvas, steps) =
+	let DiffusionSample { canvas, steps } =
 		gpu_diffusion_sample(logits_fn, &initial, bound, 100, n, vocab).expect("sample");
 	let mut out = vec![0.0f64; n];
 	unsafe { canvas.download_async(&mut out, std::ptr::null_mut()) }.expect("dl");

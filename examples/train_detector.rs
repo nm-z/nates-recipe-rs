@@ -6,7 +6,7 @@
 //!
 //!   cargo run --release --example train_detector
 
-use recipe::data::read_raw_csv;
+use recipe::data::{RawCsv, read_raw_csv};
 use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
 use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
@@ -175,7 +175,7 @@ const MARCH: &[(&str, &[&str], usize)] = &[
 ];
 
 fn column_cells(path: &str, col: &str) -> Vec<String> {
-	let (headers, rows) = read_raw_csv(std::path::Path::new(path)).expect("read corpus csv");
+	let RawCsv { headers, rows } = read_raw_csv(std::path::Path::new(path)).expect("read corpus csv");
 	let Some(j) = headers.iter().position(|h| h == col) else {
 		panic!("corpus: column '{col}' not in {path}");
 	};

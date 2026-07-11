@@ -17,7 +17,7 @@ use gpu_core::infer_ops::{
 use gpu_core::kernels::gpu_add_into;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::waterfall::{Home, Waterfall};
-use recipe_infer::safetensors::parse_safetensors_header;
+use recipe_infer::safetensors::{SafetensorsHeader, parse_safetensors_header};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -435,7 +435,7 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		let hlen = u64::from_le_bytes(lenb) as usize;
 		let mut hdr = vec![0u8; 8 + hlen];
 		f.read_exact_at(&mut hdr, 0)?;
-		let (data_start, entries) = parse_safetensors_header(&hdr)?;
+		let SafetensorsHeader { data_start, entries } = parse_safetensors_header(&hdr)?;
 		for e in entries {
 			if !e.name.starts_with("model.decoder.") {
 				continue; // text path only; skip encoder/vision tower
