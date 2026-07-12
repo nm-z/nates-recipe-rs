@@ -1,3 +1,4 @@
+use recipe_infer::log::{Write, data};
 use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -85,7 +86,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 
 	// Header detection is a CSV-format question, not a content heuristic: a header
 	// row names columns, so at least one cell is a non-number. If EVERY cell parses
-	// as f64 (ints, decimals, signs, scientific notation), the first row is data,
+	// as f64 (ints, decimals, signs, scientific notation), the first row is dat,
 	// not names — synthesize col_0..col_{w-1} and keep the row. Binary structural
 	// test, no thresholds.
 	let first_row = match first_cells.first() {
@@ -112,8 +113,8 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	let Some(_headroom) = avail.checked_sub(proj) else {
-		recipe_infer::log::Write::err("csv too large to parse into RAM");
-		recipe_infer::log::Write::err(&format!(
+		Write::err("csv too large to parse into RAM");
+		Write::err(&format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
@@ -184,8 +185,8 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	let Some(_headroom) = avail.checked_sub(proj) else {
-		recipe_infer::log::Write::err("csv too large to parse into RAM");
-		recipe_infer::log::Write::err(&format!(
+		Write::err("csv too large to parse into RAM");
+		Write::err(&format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
@@ -408,7 +409,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					recipe_infer::log::Write::err(&format!("WARN: skipping {}: {e}", hp.path.display()));
+					Write::err(&format!("WARN: skipping {}: {e}", hp.path.display()));
 					None
 				}
 			})
@@ -459,7 +460,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		return Ok(groups);
 	};
 	let total: usize = images.values().map(|v| v.len()).sum();
-	recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!("found images in {}", short_path(dir)));
+	Write::line(data, &format!("found images in {}", short_path(dir)));
 	let pb = ProgressBar::new(total as u64);
 	pb.set_style(
 		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
@@ -498,7 +499,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					recipe_infer::log::Write::err(&format!("WARN: skipping image {}: {e}", p.display()));
+					Write::err(&format!("WARN: skipping image {}: {e}", p.display()));
 					vec![f64::NAN; dim]
 				}
 			};
@@ -519,7 +520,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		pixels,
 	});
 	pb.finish();
-	recipe_infer::log::Write::line(recipe_infer::log::dev().data, "");
+	Write::line(data, "");
 	Ok(groups)
 }
 
@@ -822,7 +823,7 @@ pub fn load_image_dir(dir: &str, width: u32, height: u32) -> Result<Mat> {
 	anyhow::ensure!(!paths.is_empty(), "no image files found in {dir}");
 
 	let row_len = (width * height * 3) as usize;
-	let mut data = Vec::with_capacity(paths.len() * row_len);
+	let mut dat = Vec::with_capacity(paths.len() * row_len);
 
 	for path in &paths {
 		let row = image_to_row(
@@ -830,11 +831,11 @@ pub fn load_image_dir(dir: &str, width: u32, height: u32) -> Result<Mat> {
 			width,
 			height,
 		)?;
-		data.extend(row.iter());
+		dat.extend(row.iter());
 	}
 
-	let n = data.len() / row_len;
-	Ok(Array2::from_shape_vec([n, row_len], data)?)
+	let n = dat.len() / row_len;
+	Ok(Array2::from_shape_vec([n, row_len], dat)?)
 }
 
 pub struct LabeledImages {
@@ -875,7 +876,7 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 	};
 
 	let row_len = (width * height * 3) as usize;
-	let mut data = Vec::new();
+	let mut dat = Vec::new();
 	let mut labels = Vec::new();
 
 	let mut idx = 0usize;
@@ -890,7 +891,7 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 				width,
 				height,
 			)?;
-			data.extend(row.iter());
+			dat.extend(row.iter());
 			labels.push(label);
 		}
 	}
@@ -900,7 +901,7 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 		"no images found in any subdirectory of {dir}"
 	);
 	let n = labels.len();
-	let x = Array2::from_shape_vec([n, row_len], data)?;
+	let x = Array2::from_shape_vec([n, row_len], dat)?;
 	let y = Array1::from_vec(labels);
 	Ok(LabeledImages { x, y })
 }

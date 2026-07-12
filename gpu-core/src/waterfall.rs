@@ -1,3 +1,4 @@
+use crate::log::{Write, gpu};
 use crate::memory::{GpuBuffer, tag_scope};
 use std::collections::HashMap;
 use std::io::{Error, Result};
@@ -141,7 +142,7 @@ impl Waterfall {
 
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-		crate::log::Write::line(crate::log::dev().gpu, &format!(
+		Write::line(gpu, &format!(
 			"waterfall: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB ({} blobs)",
 			gb(self.vram_bytes),
 			gb(self.ram_bytes),

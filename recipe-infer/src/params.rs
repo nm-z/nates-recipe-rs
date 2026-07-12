@@ -1,3 +1,4 @@
+use gpu_core::log::Write;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
 use anyhow::Context;
@@ -666,7 +667,7 @@ pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match std::fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
-			gpu_core::log::Write::err(&format!("no data in {path}, initialized random weights and biases"));
+			Write::err(&format!("no data in {path}, initialized random weights and biases"));
 			return Ok(Vec::new());
 		}
 	};

@@ -1,3 +1,4 @@
+use gpu_core::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, Train};
 use anyhow::Context;
@@ -17,7 +18,6 @@ use recipe_infer::{
 };
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
-const NLS: &str = "\u{a}";
 pub(crate) static INTERRUPTED: std::sync::atomic::AtomicUsize = AtomicUsize::new(0);
 extern "C" fn on_sigint(_sig: i32) {
 	let Some(_second) = Some(()).filter(|_probe| INTERRUPTED.swap(1, Ordering::SeqCst) != 0)
@@ -180,7 +180,7 @@ pub struct StepScalars {
 	pub zero: GpuBuffer,
 }
 pub fn loss_grad_into(
-	loss: Loss,
+	lossfn: Loss,
 	out: &GpuBuffer,
 	y: &GpuBuffer,
 	da: &GpuBuffer,
@@ -189,7 +189,7 @@ pub fn loss_grad_into(
 	sc: &Scratch,
 	ss: &StepScalars,
 ) -> anyhow::Result<()> {
-	match loss {
+	match lossfn {
 		Loss::Mse => {
 			kernels::gpu_sub_scale_into(out, y, &ss.two_inv_n, total, da).context("mse")?;
 		}
@@ -234,15 +234,8 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 		let Some(_w) = m.fmt().width.checked_sub(1) else {
 			continue;
 		};
-		let c = palette(parts.len());
 		let num = m.render(vals[mi]);
-		parts.push(format!(
-			"{} \x1b[38;2;{};{};{}m{num}\x1b[0m",
-			m.fmt().label,
-			c.r,
-			c.g,
-			c.b
-		));
+		parts.push(format!("{} {num}", m.fmt().label));
 	}
 	parts.join("  ")
 }
@@ -380,7 +373,7 @@ impl ModelInner {
 	}
 	pub(crate) fn fit(
 		&self,
-		data: &Dataset,
+		dat: &Dataset,
 		cfg: &Train,
 		resume: Option<&str>,
 		net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>,
@@ -403,15 +396,15 @@ impl ModelInner {
 			.collect();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats =
-			embed_first && data.text_cols.is_empty() && !data.onehot_groups.is_empty();
+			embed_first && dat.text_cols.is_empty() && !dat.onehot_groups.is_empty();
 		let coll = Some(())
 			.filter(|_probe| embed_cats)
-			.map(|_probe| collapse_onehot(data));
+			.map(|_probe| collapse_onehot(dat));
 		let collapsed_vocab = coll.as_ref().map_or(0, |c| c.vocab);
-		let effective_x = coll.as_ref().map_or(&data.x, |c| &c.x);
+		let effective_x = coll.as_ref().map_or(&dat.x, |c| &c.x);
 		let effective_text = match &coll {
 			Some(c) => &c.embed_cols,
-			None => &data.text_cols,
+			None => &dat.text_cols,
 		};
 		let cat_cols: Vec<usize> = Some(())
 			.filter(|_probe| embed_first)
@@ -471,17 +464,17 @@ impl ModelInner {
 			},
 		};
 		let ask_overwrite = |what: &str| -> YesNo {
-			use std::io::Write;
-			gpu_core::log::Write::err("resume");
-			gpu_core::log::Write::err("    data does not match");
-			gpu_core::log::Write::err(&format!("        {what}"));
-			gpu_core::log::Write::err(&format!("        file path={}", resume.unwrap_or("")));
-			gpu_core::log::Write::err(&format!("        data path={}", data.source));
+			use std::io::Write as _;
+			Write::err("resume");
+			Write::err("    data does not match");
+			Write::err(&format!("        {what}"));
+			Write::err(&format!("        file path={}", resume.unwrap_or("")));
+			Write::err(&format!("        data path={}", dat.source));
 			let Some(_tty) = Some(()).filter(|_probe| std::io::stdin().is_terminal()) else {
 				return YesNo::No;
 			};
-			gpu_core::log::Write::line(
-				gpu_core::log::dev().prompt,
+			Write::line(
+				prompt,
 				"overwrite checkpoint with random weights? [y/N] ",
 			);
 			std::io::stderr().flush().ok();
@@ -525,7 +518,7 @@ impl ModelInner {
 			}
 		};
 		let out_dim = plan.out_dim_last();
-		let n_targets = data.n_targets.max(1);
+		let n_targets = dat.n_targets.max(1);
 		let expand_ce = classify && n_targets == 1 && out_dim > 1;
 		let k = Some(())
 			.filter(|_probe| expand_ce)
@@ -537,7 +530,7 @@ impl ModelInner {
 		);
 		let yp = {
 			let ys =
-				data.y.as_slice()
+				dat.y.as_slice()
 					.ok_or_else(|| anyhow::anyhow!("train: y contiguous"))?;
 			let mut yd = ys.to_vec();
 			match Some(()).filter(|_probe| !classify && !rerun) {
@@ -740,26 +733,48 @@ impl ModelInner {
 			})
 			.unwrap_or_else(|| base.view(x_off, xinput.len()));
 		let ybuf = base.view(y_off, n * k);
-		let summary = Some(())
+		let summary_graph = Some(())
 			.filter(|_probe| !cfg.metrics.is_empty())
 			.map(|_probe| {
 				let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 				let out = params[last].out_dim;
-				let row = |x: usize, l1: &str, y: usize, l2: &str| {
-					format!("    {x:>5}  {l1:<11}{y:>5}  {l2}")
+				let kv = |name: &str, val: usize| ogdl::Node {
+					name: name.to_string(),
+					children: vec![ogdl::Node {
+						name: val.to_string(),
+						children: Vec::new(),
+					}],
 				};
-				[
-					"arch".to_string(),
-					row(neurons, "neurons", params.len(), "layers"),
-					row(n, "samples", d, "features"),
-					row(d, "input_dim", out, "output_dim"),
-					"data".to_string(),
-					row(n + 1, "rows", d + 1, "columns"),
-					row(d, "predictors", out, "targets"),
-				]
-				.join(NLS)
-			})
-			.unwrap_or_default();
+				let sect = |name: &str, kids: Vec<ogdl::Node>| ogdl::Node {
+					name: name.to_string(),
+					children: kids,
+				};
+				ogdl::Node {
+					name: String::new(),
+					children: vec![
+						sect(
+							"arch",
+							vec![
+								kv("neurons", neurons),
+								kv("layers", params.len()),
+								kv("samples", n),
+								kv("features", d),
+								kv("input_dim", d),
+								kv("output_dim", out),
+							],
+						),
+						sect(
+							"data",
+							vec![
+								kv("rows", n + 1),
+								kv("columns", d + 1),
+								kv("predictors", d),
+								kv("targets", out),
+							],
+						),
+					],
+				}
+			});
 		Some(())
 			.filter(|_probe| !plotting && !rerun)
 			.map(|_probe| {
@@ -769,16 +784,18 @@ impl ModelInner {
 						resume.map(|path| {
 							let full = std::fs::canonicalize(path)
 								.unwrap_or_else(|_err| path.into());
-							gpu_core::log::Write::line(gpu_core::log::dev().save, &format!("resumed: {}", full.display()));
+							Write::line(save, &format!("resumed: {}", full.display()));
 						})
 						.unwrap_or(())
 					})
 					.unwrap_or(());
 				Some(())
-					.filter(|_probe| !summary.is_empty())
+					.filter(|_probe| summary_graph.is_some())
 					.map(|_probe| {
-						gpu_core::log::Write::block(gpu_core::log::dev().data, &summary);
-						gpu_core::log::Write::line(gpu_core::log::dev().gpu, &format!(
+						for g in summary_graph.iter() {
+							Write::block(data, g);
+						}
+						Write::line(gpu, &format!(
 							"roofline  gemm {} GF/s  vram {} GB/s",
 							recipe_infer::GEMM_GFLOPS,
 							recipe_infer::VRAM_GBS
@@ -934,17 +951,17 @@ impl ModelInner {
 			let nan_stop =
 				match Some(()).filter(|_probe| checkpointing) {
 					Some(_ckpt) => {
-						let loss = val_of(Metric::Loss, e);
-						match Some(()).filter(|_probe| loss.is_nan()) {
+						let lossv = val_of(Metric::Loss, e);
+						match Some(()).filter(|_probe| lossv.is_nan()) {
 							Some(_nan) => {
-								gpu_core::log::Write::err(&format!(
+								Write::err(&format!(
 									"NaN loss at epoch {e} — stopping (weights diverged)"
 								));
 								Halt::Stop
 							}
 							None => {
 								let carve = ckpt_saved.is_none()
-									&& e > 0 && loss > loss_prev;
+									&& e > 0 && lossv > loss_prev;
 								Some(())
 									.filter(|_probe| carve)
 									.map(|_probe| -> anyhow::Result<()> {
@@ -975,8 +992,8 @@ impl ModelInner {
 									})
 									.transpose()?;
 								loss_prev = Some(())
-									.filter(|_probe| loss.is_finite())
-									.map(|_probe| loss)
+									.filter(|_probe| lossv.is_finite())
+									.map(|_probe| lossv)
 									.unwrap_or(loss_prev);
 								Halt::Continue
 							}
@@ -993,7 +1010,6 @@ impl ModelInner {
 			else {
 				continue;
 			};
-			let o = gpu_core::log::opt();
 			for m in cfg.metrics.iter().filter(|m| **m != Metric::Hip) {
 				let v = match m {
 					Metric::Epoch => e as f64,
@@ -1002,20 +1018,20 @@ impl ModelInner {
 					_other => val_of(*m, e),
 				};
 				let flag = match m {
-					Metric::Loss => o.loss,
-					Metric::Accuracy => o.acc,
-					Metric::Epoch => o.epoch,
-					Metric::Lr => o.lr,
-					Metric::Time => o.time,
-					Metric::R2 => o.r2,
-					Metric::Hip => o.device,
+					Metric::Loss => loss,
+					Metric::Accuracy => acc,
+					Metric::Epoch => epoch,
+					Metric::Lr => lr,
+					Metric::Time => time,
+					Metric::R2 => r2,
+					Metric::Hip => device,
 				};
-				gpu_core::log::Write::line(flag, &metrics_line(&[*m], &[v]));
+				Write::line(flag, &metrics_line(&[*m], &[v]));
 			}
 			for _ck in checkpointed.iter() {
-				gpu_core::log::Write::line(
-					gpu_core::log::dev().save,
-					"\x1b[1;32m<- checkpoint\x1b[0m",
+				Write::line(
+					save,
+					"<- checkpoint",
 				);
 			}
 		}
@@ -1036,9 +1052,10 @@ impl ModelInner {
 						row
 					})
 					.collect();
+				let summary_text = summary_graph.as_ref().map(|g| g.serialize()).unwrap_or_default();
 				let mut term = ratatui::init();
 				let _drawn = term.draw(|frame| {
-					self.render_dashboard(frame, &summary, &plot_rows, &plot_ys);
+					self.render_dashboard(frame, &summary_text, &plot_rows, &plot_ys);
 				});
 				Some(())
 					.filter(|_probe| std::io::stdin().is_terminal())
@@ -1090,14 +1107,14 @@ impl ModelInner {
 								!(fit_score.is_finite() && fit_score > best)
 							});
 						match Some(()).filter(|_probe| better_on_disk) {
-							Some(_keep) => gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
+							Some(_keep) => Write::line(save, &format!(
 								"keeping {path} (better prior {key} on disk)"
 							)),
 							None => {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = std::fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
+								Write::line(save, &format!(
 									"saved {} ({key} {fit_score:.4})",
 									full.display()
 								));
@@ -1115,7 +1132,7 @@ impl ModelInner {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = std::fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
+								Write::line(save, &format!(
 									"saved {} ({neurons} neurons, {key} {s:.4})",
 									full.display()
 								));
@@ -1134,20 +1151,20 @@ impl ModelInner {
 			let init = hip_init?;
 			let lp = hip_loop?;
 			let exit = gpu_core::callspy::snapshot();
-			gpu_core::log::Write::line(gpu_core::log::opt().device, "-- hip init --");
-			gpu_core::log::Write::block(
-				gpu_core::log::opt().device,
-				gpu_core::callspy::report_between(&b0, &init).trim_end(),
+			Write::line(device, "-- hip init --");
+			Write::block(
+				device,
+				&gpu_core::callspy::report_between(&b0, &init),
 			);
-			gpu_core::log::Write::line(gpu_core::log::opt().device, "-- hip loop --");
-			gpu_core::log::Write::block(
-				gpu_core::log::opt().device,
-				gpu_core::callspy::report_between(&init, &lp).trim_end(),
+			Write::line(device, "-- hip loop --");
+			Write::block(
+				device,
+				&gpu_core::callspy::report_between(&init, &lp),
 			);
-			gpu_core::log::Write::line(gpu_core::log::opt().device, "-- hip exit --");
-			gpu_core::log::Write::block(
-				gpu_core::log::opt().device,
-				gpu_core::callspy::report_between(&lp, &exit).trim_end(),
+			Write::line(device, "-- hip exit --");
+			Write::block(
+				device,
+				&gpu_core::callspy::report_between(&lp, &exit),
 			);
 			Some(())
 		};
@@ -1157,17 +1174,17 @@ impl ModelInner {
 			let i = led_init?;
 			let l = led_loop?;
 			let ee = gpu_core::memory::xfer_calls();
-			gpu_core::log::Write::block(gpu_core::log::opt().device, &format!(
+			Write::line(device, format!(
 				"-- ledger init -- H2D calls {}  D2H calls {}",
 				i.h2d - s0.h2d,
 				i.d2h - s0.d2h
 			));
-			gpu_core::log::Write::block(gpu_core::log::opt().device, &format!(
+			Write::line(device, format!(
 				"-- ledger loop -- H2D calls {}  D2H calls {}",
 				l.h2d - i.h2d,
 				l.d2h - i.d2h
 			));
-			gpu_core::log::Write::block(gpu_core::log::opt().device, &format!(
+			Write::line(device, format!(
 				"-- ledger exit -- H2D calls {}  D2H calls {}",
 				ee.h2d - l.h2d,
 				ee.d2h - l.d2h

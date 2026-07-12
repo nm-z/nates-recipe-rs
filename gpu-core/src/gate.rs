@@ -1,4 +1,5 @@
-use std::io::{Read, Seek, Write};
+use crate::log::{Write, gpu};
+use std::io::{Read, Seek, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -125,8 +126,8 @@ fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Resu
 		None => Err(e),
 		Some(()) => {
 			match holder_pid(f) {
-				Some(pid) => crate::log::Write::line(crate::log::dev().gpu, &format!("gpu gate: queued behind pid {pid}")),
-				None => crate::log::Write::line(crate::log::dev().gpu, "gpu gate: queued behind the current holder"),
+				Some(pid) => Write::line(gpu, &format!("gpu gate: queued behind pid {pid}")),
+				None => Write::line(gpu, "gpu gate: queued behind the current holder"),
 			}
 			flock(fd, libc::LOCK_EX)
 		}
@@ -162,7 +163,7 @@ fn expired(t0: std::time::Instant, pid: u32) -> Option<()> {
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
 		Some(std::cmp::Ordering::Less) | None => None,
 		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => {
-			crate::log::Write::err(&format!(
+			Write::err(&format!(
 				"gpu gate: pid {pid} still holds the device after {waited:.0}s — proceeding"
 			));
 			Some(())
@@ -225,10 +226,10 @@ pub fn release() {
 fn shutdown(g: &mut Gate) {
 	let Lock::Own(f) = &mut g.lock else { return };
 	for e in stamp(f, CLEAN).err().into_iter() {
-		crate::log::Write::err(&format!("gpu gate: clean stamp: {e}"));
+		Write::err(&format!("gpu gate: clean stamp: {e}"));
 	}
 	for e in flock(f.as_raw_fd(), libc::LOCK_UN).err().into_iter() {
-		crate::log::Write::err(&format!("gpu gate: unlock: {e}"));
+		Write::err(&format!("gpu gate: unlock: {e}"));
 	}
 	g.grip = Grip::Free;
 	HOLDING.store(CLEAN, Ordering::Release);

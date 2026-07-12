@@ -1,3 +1,4 @@
+use gpu_core::log::{Write, gpu};
 use crate::train::StepScalars;
 use anyhow::Context;
 use gpu_core::kernels;
@@ -1192,7 +1193,7 @@ impl Ooc {
 		] {
 			tally(b);
 		}
-		gpu_core::log::Write::line(gpu_core::log::dev().gpu, &format!(
+		Write::line(gpu, &format!(
 			"waterfall  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
 			gb(v),
 			gb(r),
@@ -1236,7 +1237,7 @@ impl Ooc {
 		{
 			roof += &format!("  {} {:.3} GB/s", rt.label, rt.bps / 1e9);
 		}
-		gpu_core::log::Write::line(gpu_core::log::dev().gpu, &roof);
+		Write::line(gpu, &roof);
 	}
 
 	pub fn forward(
@@ -2033,7 +2034,7 @@ impl Ooc {
 		{
 			line += &format!("  drain {drain:.1}s");
 		}
-		gpu_core::log::Write::line(gpu_core::log::dev().gpu, &line);
+		Write::line(gpu, &line);
 		Ok(())
 	}
 

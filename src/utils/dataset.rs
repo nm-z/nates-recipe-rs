@@ -1,3 +1,4 @@
+use gpu_core::log::{Write, data};
 use crate::Mat;
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
@@ -135,11 +136,11 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group.contains(c)).collect();
 	let n_cat = ds.onehot_groups.len();
 	let new_ncols = passthrough.len() + n_cat;
-	let mut data = vec![0.0f64; n * new_ncols];
+	let mut dat = vec![0.0f64; n * new_ncols];
 	for new_j in 0..passthrough.len() {
 		let orig_j = passthrough[new_j];
 		for i in 0..n {
-			data[i * new_ncols + new_j] = ds.x[[i, orig_j]];
+			dat[i * new_ncols + new_j] = ds.x[[i, orig_j]];
 		}
 	}
 	let embed_start = passthrough.len();
@@ -152,12 +153,12 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 			let Some(c) = (0..grp.len).find(|&c| ds.x[[i, grp.start + c]] > 0.5) else {
 				continue;
 			};
-			data[i * new_ncols + new_j] = (offset + c) as f64;
+			dat[i * new_ncols + new_j] = (offset + c) as f64;
 		}
 		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let x = crate::ok_or_die(Mat::from_shape_vec([n, new_ncols], data), "collapse_onehot");
+	let x = crate::ok_or_die(Mat::from_shape_vec([n, new_ncols], dat), "collapse_onehot");
 	CollapsedOnehot {
 		x,
 		embed_cols,
@@ -229,10 +230,10 @@ pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 
 impl Data {
 	pub fn load(path: &str) -> Data {
-		let data = Data {
+		let dat = Data {
 			inner: Box::new(DataInner::blank()),
 		};
-		data.set(path)
+		dat.set(path)
 	}
 
 	pub fn set(mut self, path: &str) -> Data {
@@ -419,7 +420,7 @@ impl DataInner {
 		let types = self.feature_type_counts(attrs);
 		let print_types = |indent: &str| {
 			for tc in &types {
-				gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("{indent}{} {}", tc.count, tc.label));
+				Write::line(data, &format!("{indent}{} {}", tc.count, tc.label));
 			}
 		};
 		let set_rows = match self.split_frac {
@@ -427,23 +428,23 @@ impl DataInner {
 			None => train.x.nrows(),
 		};
 		for src in &self.sources {
-			gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("set  {}", short(src)));
-			gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("    {}", disk_size(src)));
+			Write::line(data, &format!("set  {}", short(src)));
+			Write::line(data, &format!("    {}", disk_size(src)));
 		}
-		gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("    {} rows  {} cols", set_rows, raw_cols));
+		Write::line(data, &format!("    {} rows  {} cols", set_rows, raw_cols));
 		print_types("        ");
 		for ex in &self.exclude {
-			gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("    excluded  {ex}"));
+			Write::line(data, &format!("    excluded  {ex}"));
 		}
 		let cards = self.cat_cardinality_counts(attrs);
 		for _present in cards.first().into_iter() {
-			gpu_core::log::Write::line(gpu_core::log::dev().data, "    encoding");
+			Write::line(data, "    encoding");
 		}
 		for cc in &cards {
 			let range: Vec<String> = (0..cc.card).map(|i| i.to_string()).collect();
-			gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("        {} × [{}]", cc.count, range.join(", ")));
+			Write::line(data, &format!("        {} × [{}]", cc.count, range.join(", ")));
 		}
-		gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("    {} features -> model", train.x.ncols()));
+		Write::line(data, &format!("    {} features -> model", train.x.ncols()));
 		for test in test.into_iter() {
 			match &self.test_path {
 				Some(tp) => {
@@ -453,22 +454,22 @@ impl DataInner {
 						.raw_test_rows
 						.as_ref()
 						.map_or(test.x.nrows(), |r| r.len());
-					gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("test  {}", short(tp)));
-					gpu_core::log::Write::line(gpu_core::log::dev().data, &format!(
+					Write::line(data, &format!("test  {}", short(tp)));
+					Write::line(data, &format!(
 						"    {} rows  {} cols  {}",
 						test_raw_rows,
 						test_raw_cols,
 						disk_size(tp),
 					));
 					print_types("        ");
-					gpu_core::log::Write::line(gpu_core::log::dev().data, &format!(
+					Write::line(data, &format!(
 						"    {} features -> model",
 						test.x.ncols()
 					));
 				}
 				None => {
 					for _frac in self.split_frac.iter() {
-						gpu_core::log::Write::line(gpu_core::log::dev().data, &format!(
+						Write::line(data, &format!(
 							"split  {} train / {} test",
 							train.x.nrows(),
 							test.x.nrows(),
@@ -478,7 +479,7 @@ impl DataInner {
 			}
 		}
 		for t in &self.target_names {
-			gpu_core::log::Write::line(gpu_core::log::dev().data, &format!("target  {t}"));
+			Write::line(data, &format!("target  {t}"));
 		}
 	}
 

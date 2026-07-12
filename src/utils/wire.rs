@@ -1,9 +1,10 @@
+use gpu_core::log::{Write, net};
 use crate::probe::Machine;
 use anyhow::{Result, bail, ensure};
 use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -297,7 +298,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let sock = match std::net::UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
-			gpu_core::log::Write::err(&format!(
+			Write::err(&format!(
 				"recipe serve: discovery listener bind failed: {e}"
 			));
 			return;
@@ -393,7 +394,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 		.err()
 		.into_iter()
 	{
-		gpu_core::log::Write::err(&format!("recipe serve: config write failed: {e}"));
+		Write::err(&format!("recipe serve: config write failed: {e}"));
 	}
 }
 
@@ -637,7 +638,7 @@ impl Server {
 				.err()
 				.into_iter()
 			{
-				gpu_core::log::Write::err(&format!("recipe serve: config write failed: {e}"));
+				Write::err(&format!("recipe serve: config write failed: {e}"));
 			}
 		}
 		let bm = machine.clone();
@@ -645,7 +646,7 @@ impl Server {
 		let reg = Arc::clone(&self.reg);
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
-		gpu_core::log::Write::line(gpu_core::log::dev().net, &format!(
+		Write::line(net, &format!(
 			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
@@ -664,7 +665,7 @@ impl Server {
 			let srv = self.clone();
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
-					gpu_core::log::Write::err(&format!(
+					Write::err(&format!(
 						"recipe serve: connection ended: {e}"
 					));
 				}

@@ -1,8 +1,9 @@
 //! All predictor/target encoding: detected column `Kind`s → numeric matrices,
 //! the multi-file assemble/join, RAM guards, NaN handling, and the train/test
-//! split. Pure data work — turns parsed rows (from `data`) into a `Dataset`. The
+//! split. Pure dat work — turns parsed rows (from `dat`) into a `Dataset`. The
 //! trainer crate above interprets what that `Dataset` means for a model; this
 //! module knows nothing of models, GPUs, or the forward pass.
+use recipe_infer::log::{Write, data};
 
 use crate::data::DirGroup;
 use crate::{Attr, Kind, Mat, Vec1};
@@ -291,7 +292,7 @@ fn encode(
 					.unwrap_or(1);
 				let capped = raw.min(crate::TEXT_CONTEXT);
 				if raw > capped {
-					recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!(
+					Write::line(data, &format!(
 						"    context  {} tokens/{} → capped to {capped}",
 						raw, a.name
 					));
@@ -325,11 +326,11 @@ fn encode(
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
 	// Scatter each encoded feature column straight into the row-major output and drop
 	// it, instead of accumulating every column in a `Vec<Vec<f64>>` and copying the
-	// whole lot into `data` afterwards — holding both was a full second copy of the
+	// whole lot into `dat` afterwards — holding both was a full second copy of the
 	// ~n×proj_w matrix (the measured 2× peak). proj_w is the exact feature width, so
 	// the output is sized once up front and filled column by column.
 	let w = proj_w;
-	let mut data = alloc_matrix(n, w, "encoded")?;
+	let mut dat = alloc_matrix(n, w, "encoded")?;
 	let mut jc = 0usize;
 	let mut tcols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); targets.len()];
 	for (ai, attr) in attrs.iter().enumerate() {
@@ -338,7 +339,7 @@ fn encode(
 		}
 		// A categorical TARGET encodes to ONE class-index column (0..N-1), not a
 		// one-hot — the trainer expands it to the model's output width for CE (so a
-		// declared class count above what the data shows still works). Features keep
+		// declared class count above what the dat shows still works). Features keep
 		// their one-hot encoding (role decides target-index vs feature-one-hot here).
 		let (cnames, ccols) = match (&attr.kind, is_target(ai)) {
 			(Kind::Categorical(cats), true) => {
@@ -358,7 +359,7 @@ fn encode(
 				for (cn, col) in cnames.into_iter().zip(ccols) {
 					names.push(cn);
 					for (i, v) in col.iter().enumerate() {
-						data[i * w + jc] = *v;
+						dat[i * w + jc] = *v;
 					}
 					jc += 1;
 				}
@@ -375,7 +376,7 @@ fn encode(
 	}
 	Ok((
 		names,
-		Mat::from_shape_vec((n, w), data).expect("encode: reshape"),
+		Mat::from_shape_vec((n, w), dat).expect("encode: reshape"),
 		Vec1::from(ydata),
 		k,
 	))
@@ -484,7 +485,7 @@ fn admit_ceiling(
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
-	recipe_infer::log::Write::err(&line.join(", "));
+	Write::err(&line.join(", "));
 	Err(CeilingExceeded {
 		label: label.to_string(),
 		rows: n,
@@ -500,8 +501,8 @@ fn admit_ceiling(
 /// memory pressure so the failure stays a diagnostic instead of an abort.
 fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 	let cells = n.saturating_mul(w);
-	let mut data: Vec<f64> = Vec::new();
-	if data.try_reserve_exact(cells).is_err() {
+	let mut dat: Vec<f64> = Vec::new();
+	if dat.try_reserve_exact(cells).is_err() {
 		let spill = std::path::Path::new(".recipe_spill");
 		let cap = recipe_infer::tiered::admit(0, 0, 0, spill)
 			.map(|b| b.ram_data)
@@ -515,8 +516,8 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 		}
 		.into());
 	}
-	data.resize(cells, 0.0);
-	Ok(data)
+	dat.resize(cells, 0.0);
+	Ok(dat)
 }
 
 type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
@@ -614,16 +615,16 @@ impl Assembled {
 		}
 		let top: Vec<(&str, usize)> = by_col.into_iter().collect();
 		admit_ceiling(n, w, "selection", &top)?;
-		let mut data = alloc_matrix(n, w, "selection")?;
+		let mut dat = alloc_matrix(n, w, "selection")?;
 		for (jc, name) in keep.iter().enumerate() {
 			let (mi, col) = self.sources[idx[name.as_str()]];
 			let m = &self.mats[mi];
 			let g = &self.gather[mi];
 			for i in 0..n {
-				data[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
+				dat[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
 			}
 		}
-		Ok(Mat::from_shape_vec((n, w), data).expect("select reshape"))
+		Ok(Mat::from_shape_vec((n, w), dat).expect("select reshape"))
 	}
 }
 
@@ -679,16 +680,16 @@ fn encode_group(
 			name, dim, pixels, ..
 		} => {
 			let n = pixels.len();
-			let mut data = vec![0.0f64; n * dim];
+			let mut dat = vec![0.0f64; n * dim];
 			for (i, px) in pixels.iter().enumerate() {
 				for (j, v) in px.iter().take(*dim).enumerate() {
-					data[i * dim + j] = *v;
+					dat[i * dim + j] = *v;
 				}
 			}
 			let names = (0..*dim)
 				.map(|i| namespaced(name, &format!("px{i}")))
 				.collect();
-			let x = Mat::from_shape_vec((n, *dim), data).expect("image reshape");
+			let x = Mat::from_shape_vec((n, *dim), dat).expect("image reshape");
 			(names, x, Vec1::zeros(n), 0)
 		}
 	})
@@ -803,7 +804,7 @@ fn assemble(
 		// Image vector ⋈ filename column: a dir of files is a vector indexed by
 		// filename; a sample column of filenames is a vector of those keys. Pick the
 		// sample column whose cell stems best match this image vector's filenames,
-		// then gather each row's image by that key (index = filename, data = image).
+		// then gather each row's image by that key (index = filename, dat = image).
 		if let (
 			DirGroup::Image {
 				hashes: g_hashes, ..
@@ -1086,13 +1087,13 @@ pub fn clean_dataset(d: &mut Dataset) {
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		recipe_infer::log::Write::err(&format!(
+		Write::err(&format!(
 			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
 		));
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		recipe_infer::log::Write::err(&format!(
+		Write::err(&format!(
 			"{k} target column(s) but {} target value(s)  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			d.y.len(),
 			n * k
@@ -1106,7 +1107,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!(
+		Write::line(data, &format!(
 			"nan  dropped {} row(s) with a missing target",
 			n - keep.len()
 		));

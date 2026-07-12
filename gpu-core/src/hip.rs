@@ -1,3 +1,4 @@
+use crate::log::Write;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 
@@ -270,7 +271,7 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			Some(hit) => format!("{locate}; {hit}"),
 			None => format!("{locate}; va in NO recorded allocation"),
 		};
-		crate::log::Write::err(&format!(
+		Write::err(&format!(
 			"gpu fault autopsy  va=0x{:x}  reason={why}  {locate}\n{}",
 			e.virtual_address,
 			crate::memory::ledger_report(),

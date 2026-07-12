@@ -1,4 +1,5 @@
-use std::io::{Read, Write};
+use crate::log::{Write, gpu};
+use std::io::{Read, Write as _};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,7 +70,7 @@ pub fn arm_saturation_crash() {
 					}
 					let stalled = SAT_ARMED.load(Ordering::SeqCst) && last_pinned.elapsed() > SAT_WINDOW;
 					let None = Some(()).filter(|_u| stalled) else {
-						crate::log::Write::err(&format!(
+						Write::err(&format!(
 							"GPU NOT PINNED  no 100% gpu_busy_percent sample in {}s (latest {busy}%) during compute — aborting (saturation law)",
 							SAT_WINDOW.as_secs()
 						));
@@ -119,24 +120,24 @@ fn gpu_id() -> Option<u32> {
 pub fn spawn_thrash_watchdog() {
 	static ONCE: std::sync::Once = std::sync::Once::new();
 	ONCE.call_once(|| {
-		let Some(gpu) = gpu_id() else {
-			crate::log::Write::err("thrash watchdog: no kfd gpu_id");
+		let Some(gpu_idx) = gpu_id() else {
+			Write::err("thrash watchdog: no kfd gpu_id");
 			return;
 		};
 		let raw = unsafe { libc::open(c"/dev/kfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 		let kfd = match raw.cmp(&0) {
 			std::cmp::Ordering::Less => {
-				crate::log::Write::err(&format!("thrash watchdog: /dev/kfd: {}", std::io::Error::last_os_error()));
+				Write::err(&format!("thrash watchdog: /dev/kfd: {}", std::io::Error::last_os_error()));
 				return;
 			}
 			std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
 				unsafe { std::fs::File::from_raw_fd(raw) }
 			}
 		};
-		let mut args = SmiArgs { gpuid: gpu, anon_fd: 0 };
+		let mut args = SmiArgs { gpuid: gpu_idx, anon_fd: 0 };
 		let rc = unsafe { libc::ioctl(kfd.as_raw_fd(), AMDKFD_IOC_SMI_EVENTS, &mut args) };
 		let std::cmp::Ordering::Equal = rc.cmp(&0) else {
-			crate::log::Write::err(&format!("thrash watchdog: SMI ioctl: {}", std::io::Error::last_os_error()));
+			Write::err(&format!("thrash watchdog: SMI ioctl: {}", std::io::Error::last_os_error()));
 			return;
 		};
 		let mut smi = unsafe { std::fs::File::from_raw_fd(args.anon_fd as i32) };
@@ -146,7 +147,7 @@ pub fn spawn_thrash_watchdog() {
 			.sum();
 		match (&smi).write_all(&mask.to_le_bytes()) {
 			Err(e) => {
-				crate::log::Write::err(&format!("thrash watchdog: mask write: {e}"));
+				Write::err(&format!("thrash watchdog: mask write: {e}"));
 			}
 			Ok(()) => {
 				std::thread::spawn(move || {
@@ -170,17 +171,17 @@ pub fn spawn_thrash_watchdog() {
 								.unwrap_or(GpuEvent::Other);
 							match kind {
 								GpuEvent::Thrash => {
-									crate::log::Write::err(&format!(
+									Write::err(&format!(
 										"gpu thrash  {}  — driver evicted our queues/mappings; aborting per fail-clean",
 										ev.trim()
 									));
 									std::process::abort();
 								}
 								GpuEvent::Restored => {
-									crate::log::Write::line(crate::log::dev().gpu, &format!("gpu event  queue restored  {}", ev.trim()))
+									Write::line(gpu, &format!("gpu event  queue restored  {}", ev.trim()))
 								}
 								GpuEvent::Other => {
-									crate::log::Write::line(crate::log::dev().gpu, &format!("gpu event  {}", ev.trim()))
+									Write::line(gpu, &format!("gpu event  {}", ev.trim()))
 								}
 							}
 						}

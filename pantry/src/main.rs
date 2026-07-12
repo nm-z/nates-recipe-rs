@@ -2,6 +2,7 @@
 //! (CSV / ARFF / dir / zip) and it prints each column → datatype.
 //! Links only `pantry` + `recipe-infer` + the embedded detector weights —
 //! no training framework.
+use recipe_infer::log::{Opt, Write, data, set_opt};
 use anyhow::Result;
 
 fn kind_name(k: usize) -> &'static str {
@@ -12,10 +13,10 @@ fn kind_name(k: usize) -> &'static str {
 }
 
 fn main() -> Result<()> {
-	recipe_infer::log::set_dev(recipe_infer::log::Dev { data: true, ..recipe_infer::log::Dev::default() });
+	set_opt(Opt { data: true, ..Opt::default() });
 	let paths: Vec<String> = std::env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		recipe_infer::log::Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
+		Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
 		std::process::exit(1);
 	};
 
@@ -24,8 +25,8 @@ fn main() -> Result<()> {
 	let multi = paths.get(1);
 	for path in &paths {
 		for _extra in multi.into_iter() {
-			recipe_infer::log::Write::line(recipe_infer::log::dev().data, "");
-			recipe_infer::log::Write::line(recipe_infer::log::dev().data, format!("# {path}"));
+			Write::line(data, "");
+			Write::line(data, format!("# {path}"));
 		}
 		for group in pantry::data::load_groups(path) {
 			let pantry::data::DirGroup::Table {
@@ -53,7 +54,7 @@ fn main() -> Result<()> {
 			for idx in 0..headers.len().min(kinds.len()) {
 				let h = &headers[idx];
 				let k = kinds[idx];
-				recipe_infer::log::Write::line(recipe_infer::log::dev().data, format!("{prefix}{h} -> {}", kind_name(k)));
+				Write::line(data, format!("{prefix}{h} -> {}", kind_name(k)));
 			}
 		}
 	}

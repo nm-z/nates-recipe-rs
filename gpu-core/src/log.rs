@@ -4,45 +4,28 @@ use std::fs::File;
 use std::io::Write as _;
 use std::sync::Mutex;
 
-static OPT: Mutex<Opt> = Mutex::new(Opt {
-	loss: false,
-	acc: false,
-	epoch: false,
-	lr: false,
-	time: false,
-	r2: false,
-	device: false,
-});
-
-static DEV: Mutex<Dev> = Mutex::new(Dev {
-	data: false,
-	gpu: false,
-	probe: false,
-	save: false,
-	net: false,
-	prompt: false,
-});
-
-#[derive(Clone, Copy, Default)]
-pub struct Opt {
-	pub loss: bool,
-	pub acc: bool,
-	pub epoch: bool,
-	pub lr: bool,
-	pub time: bool,
-	pub r2: bool,
-	pub device: bool,
+macro_rules! flags {
+	($($f:ident),+) => {
+		#[derive(Clone, Copy, Default)]
+		pub struct Opt {
+			$(pub $f: bool,)+
+		}
+		#[derive(Clone, Copy, PartialEq)]
+		pub enum Flag {
+			$($f,)+
+		}
+		static OPT: Mutex<Opt> = Mutex::new(Opt { $($f: false,)+ });
+		fn on(f: Flag) -> bool {
+			let o = opt();
+			match f {
+				$(Flag::$f => o.$f,)+
+			}
+		}
+	};
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct Dev {
-	pub data: bool,
-	pub gpu: bool,
-	pub probe: bool,
-	pub save: bool,
-	pub net: bool,
-	pub prompt: bool,
-}
+flags!(loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt);
+pub use Flag::*;
 
 #[derive(Clone, Copy)]
 pub struct Err;
@@ -67,14 +50,6 @@ pub fn opt() -> Opt {
 	*OPT.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-pub fn set_dev(d: Dev) {
-	*DEV.lock().unwrap_or_else(|p| p.into_inner()) = d;
-}
-
-pub fn dev() -> Dev {
-	*DEV.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 fn log(t: &impl Display) {
 	std::fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
 	let path = format!("/tmp/recipe/run{:03x}.log", std::process::id() & 0xfff);
@@ -92,17 +67,19 @@ fn print(t: &impl Display) {
 
 pub mod Write {
 	use super::*;
-	pub fn line(on: bool, t: impl Display) {
+	pub fn line(f: Flag, t: impl Display) {
 		log(&t);
-		match on {
+		match on(f) {
 			true => print(&t),
 			false => {}
 		}
 	}
-	pub fn block(on: bool, graph: &str) {
-		log(&graph);
-		match on {
-			true => print(&graph),
+	pub fn block(f: Flag, graph: &ogdl::Node) {
+		let text = graph.serialize();
+		let t = text.trim_end();
+		log(&t);
+		match on(f) {
+			true => print(&t),
 			false => {}
 		}
 	}

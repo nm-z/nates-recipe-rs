@@ -1,3 +1,4 @@
+use crate::log::{Write, device, gpu};
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
@@ -1618,7 +1619,7 @@ pub fn gpu_shutdown() {
 	crate::memory::free_bounce();
 	crate::memory::free_run_pin();
 	let _trim = crate::hip::trim_mempool(0);
-	crate::log::Write::block(crate::log::opt().device, crate::callspy::report().trim_end());
+	Write::block(device, &crate::callspy::report());
 }
 
 pub fn gpu_gemm(
@@ -5939,7 +5940,7 @@ pub fn gpu_report(
 		})
 		.sum::<f64>()
 		/ nc as f64;
-	crate::log::Write::line(crate::log::dev().gpu, &format!("      r={:4}  val={:.4}", round + 1, ba));
+	Write::line(gpu, &format!("      r={:4}  val={:.4}", round + 1, ba));
 	Ok(ba)
 }
 

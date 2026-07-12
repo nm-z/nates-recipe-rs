@@ -120,12 +120,22 @@ pub fn snapshot() -> [u64; N] {
 	s
 }
 
-pub fn report() -> String {
+pub fn report() -> ogdl::Node {
 	report_since(&[0u64; N])
 }
 
-pub fn report_since(base: &[u64; N]) -> String {
+pub fn report_since(base: &[u64; N]) -> ogdl::Node {
 	report_between(base, &snapshot())
+}
+
+fn kv(name: &str, val: String) -> ogdl::Node {
+	ogdl::Node {
+		name: name.to_string(),
+		children: vec![ogdl::Node {
+			name: val,
+			children: Vec::new(),
+		}],
+	}
 }
 
 struct CounterEntry<'a> {
@@ -138,7 +148,7 @@ struct CounterGroup<'a> {
 	entries: &'a [CounterEntry<'a>],
 }
 
-pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
+pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 	let g = |c: &AtomicU64| {
 		let i = ALL
 			.iter()
@@ -358,21 +368,22 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> String {
 			}],
 		},
 	];
-	let mut out = String::new();
+	let mut root = ogdl::Node::default();
 	for grp in groups {
-		for _present in grp.entries.iter().find(|e| e.n != 0).into_iter() {
-			out.push_str(grp.group);
-			out.push('\n');
-		}
-		let body: String = grp
+		let kids: Vec<ogdl::Node> = grp
 			.entries
 			.iter()
 			.filter(|e| e.n != 0)
-			.map(|e| format!("{n:>13} {name}\n", n = e.n, name = e.name))
+			.map(|e| kv(e.name, e.n.to_string()))
 			.collect();
-		out.push_str(&body);
+		for _present in Some(()).filter(|_k| !kids.is_empty()).into_iter() {
+			root.children.push(ogdl::Node {
+				name: grp.group.to_string(),
+				children: kids.clone(),
+			});
+		}
 	}
-	out
+	root
 }
 
 static LOOP_START: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
@@ -397,7 +408,7 @@ struct Tail<'a> {
 	v: [u64; 3],
 }
 
-pub fn state_report(run_start: &[u64; N]) -> Option<(String, Vec<String>)> {
+pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let ls = LOOP_START
 		.lock()
 		.unwrap_or_else(|p| p.into_inner())
@@ -429,59 +440,63 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(String, Vec<String>)> {
 			b: &end,
 		},
 	];
-	let mut out = String::new();
+	let mut tree = ogdl::Node::default();
 	let mut hipblas = [0u64; 3];
 	let mut frees = [0u64; 3];
 	for i in 0..phases.len() {
 		let ph = &phases[i];
-		let name = ph.name;
 		let a = ph.a;
 		let b = ph.b;
-		out.push_str(&format!("{name}\n    calcs\n"));
-		out.push_str(&format!(
-			"        {:<8}{:>7}\n",
-			"in-place",
-			format!("{}x", cell(a, b, &[&LAUNCH]))
-		));
-		out.push_str(&format!(
-			"        {:<8}{:>7}\n",
-			"alloc",
-			format!(
-				"{}x",
-				cell(
-					a,
-					b,
-					&[
-						&HOST_MALLOC,
-						&MALLOC_ASYNC,
-						&MEM_CREATE,
-						&MANAGED_MALLOC,
-						&HOST_REGISTER
-					]
-				)
-			)
-		));
-		out.push_str("    transfers\n");
-		out.push_str(&format!(
-			"        {:<8}{:>7}\n",
-			"async",
-			format!(
-				"{}x",
-				cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER])
-			)
-		));
-		out.push_str(&format!(
-			"        {:<8}{:>7}\n",
-			"sync",
-			format!(
-				"{}x",
-				cell(
-					a,
-					b,
-					&[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]
-				)
-			)
-		));
+		let calcs = ogdl::Node {
+			name: "calcs".to_string(),
+			children: vec![
+				kv("in-place", format!("{}x", cell(a, b, &[&LAUNCH]))),
+				kv(
+					"alloc",
+					format!(
+						"{}x",
+						cell(
+							a,
+							b,
+							&[
+								&HOST_MALLOC,
+								&MALLOC_ASYNC,
+								&MEM_CREATE,
+								&MANAGED_MALLOC,
+								&HOST_REGISTER
+							]
+						)
+					),
+				),
+			],
+		};
+		let transfers = ogdl::Node {
+			name: "transfers".to_string(),
+			children: vec![
+				kv(
+					"async",
+					format!(
+						"{}x",
+						cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER])
+					),
+				),
+				kv(
+					"sync",
+					format!(
+						"{}x",
+						cell(
+							a,
+							b,
+							&[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]
+						)
+					),
+				),
+			],
+		};
+		tree.children.push(ogdl::Node {
+			name: ph.name.to_string(),
+			children: vec![calcs, transfers],
+		});
 		hipblas[i] = cell(a, b, &[&HIPBLAS]);
 		frees[i] = cell(
 			a,
@@ -511,5 +526,5 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(String, Vec<String>)> {
 			));
 		}
 	}
-	Some((out.trim_end().to_string(), errs))
+	Some((tree, errs))
 }

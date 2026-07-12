@@ -1,3 +1,4 @@
+use gpu_core::log::{Opt, Write, gpu, set_opt};
 use gpu_core::memory::GpuBuffer;
 
 fn main() {
@@ -13,7 +14,7 @@ fn main() {
 		let v = back[i];
 		match (v - 0.5).abs().partial_cmp(&1e-12) {
 			Some(std::cmp::Ordering::Greater) => {
-				gpu_core::log::Write::err(&format!("probe: mismatch at {i}: {v}"));
+				Write::err(&format!("probe: mismatch at {i}: {v}"));
 				std::process::exit(1);
 			}
 			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => {
@@ -22,9 +23,9 @@ fn main() {
 		}
 	}
 	gpu_core::hip::device_synchronize().expect("probe: device sync");
-	gpu_core::log::set_dev(gpu_core::log::Dev {
+	set_opt(Opt {
 		gpu: true,
-		..gpu_core::log::Dev::default()
+		..Opt::default()
 	});
-	gpu_core::log::Write::line(gpu_core::log::dev().gpu, "probe: ok");
+	Write::line(gpu, "probe: ok");
 }

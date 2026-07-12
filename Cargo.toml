@@ -24,6 +24,7 @@ exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
 gpu-core = { path = "gpu-core" }
 recipe-infer = { path = "recipe-infer" }
 pantry = { path = "pantry" }
+ogdl = { path = "ogdl" }
 anyhow = "1"
 csv = "1"
 ndarray = { version = "0.16", features = ["rayon"] }
