@@ -4,9 +4,6 @@ use std::fs::File;
 use std::io::Write as _;
 use std::sync::Mutex;
 
-pub const RUN_LOG_DIR: &str = "/tmp/recipe";
-pub const RUN_LOG_PATH: &str = concat!("/tmp/recipe/run", env!("RECIPE_GIT_HASH"), ".log");
-
 static SINK: Mutex<std::option::Option<File>> = Mutex::new(None);
 static OPT: Mutex<Opt> = Mutex::new(Opt {
 	loss: false,
@@ -105,11 +102,12 @@ fn strip_ansi(s: &str) -> String {
 fn log(t: &impl Display) {
 	let mut g = SINK.lock().unwrap_or_else(|p| p.into_inner());
 	if g.is_none() {
-		std::fs::create_dir_all(RUN_LOG_DIR).expect("log: create /tmp/recipe");
+		std::fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
+		let path = format!("/tmp/recipe/run{:03x}.log", std::process::id() & 0xfff);
 		let f = File::options()
 			.append(true)
 			.create(true)
-			.open(RUN_LOG_PATH)
+			.open(path)
 			.expect("log: open run log");
 		*g = Some(f);
 	}

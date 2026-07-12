@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 fn log(t: &impl Display) {
 	use std::io::Write as _;
-	let path = concat!("/tmp/recipe/run", env!("RECIPE_GIT_HASH"), ".log");
+	let path = format!("/tmp/recipe/run{:03x}.log", std::process::id() & 0xfff);
 	let Ok(()) = std::fs::create_dir_all("/tmp/recipe") else {
 		return;
 	};

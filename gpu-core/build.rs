@@ -161,52 +161,9 @@ fn enforce_memory_chokepoints() {
 	}
 }
 
-fn git(args: &[&str]) -> String {
-	let out = std::process::Command::new("git")
-		.args(args)
-		.output()
-		.unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")));
-	assert!(
-		out.status.success(),
-		"git {}: {}",
-		args.join(" "),
-		String::from_utf8_lossy(&out.stderr)
-	);
-	String::from_utf8(out.stdout)
-		.expect("git output utf8")
-		.trim()
-		.to_string()
-}
-
-// Bakes the build's git identity for the run-log filename
-// (/tmp/recipe/run{hash}.log). rerun-if-changed on HEAD + the checked-out ref
-// keeps the bake honest across commits and branch switches; packed-refs covers
-// gc'd loose refs. A missing .git is a hard build failure by design.
-fn emit_git_hash() {
-	println!("cargo:rustc-env=RECIPE_GIT_HASH={}", git(&["rev-parse", "--short", "HEAD"]));
-	let gd = git(&["rev-parse", "--absolute-git-dir"]);
-	println!("cargo:rerun-if-changed={gd}/HEAD");
-	for ref_file in [
-		std::process::Command::new("git")
-			.args(["symbolic-ref", "-q", "HEAD"])
-			.output()
-			.ok()
-			.filter(|o| o.status.success())
-			.map(|o| format!("{gd}/{}", String::from_utf8_lossy(&o.stdout).trim())),
-		Some(format!("{gd}/packed-refs")),
-	]
-	.into_iter()
-	.flatten()
-	.filter(|p| Path::new(p).exists())
-	{
-		println!("cargo:rerun-if-changed={ref_file}");
-	}
-}
-
 fn main() {
 	ban_direct_blas();
 	enforce_memory_chokepoints();
-	emit_git_hash();
 	let platform = detect_platform();
 	let out_dir = std::env::var("OUT_DIR").unwrap();
 
