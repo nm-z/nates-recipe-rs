@@ -5939,7 +5939,7 @@ pub fn gpu_report(
 		})
 		.sum::<f64>()
 		/ nc as f64;
-	crate::log::Write::line(crate::log::opt().gpu, &format!("      r={:4}  val={:.4}", round + 1, ba));
+	crate::log::Write::line(crate::log::dev().gpu, &format!("      r={:4}  val={:.4}", round + 1, ba));
 	Ok(ba)
 }
 

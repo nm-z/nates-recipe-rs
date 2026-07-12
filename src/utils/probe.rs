@@ -36,10 +36,10 @@ impl Machine {
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
-			gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!("recipe probe: measuring gpu{d}"));
+			gpu_core::log::Write::line(gpu_core::log::dev().probe, &format!("recipe probe: measuring gpu{d}"));
 			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
-				Err(e) => gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
+				Err(e) => gpu_core::log::Write::line(gpu_core::log::dev().probe, &format!(
 					"recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"
 				)),
 			}
@@ -51,16 +51,16 @@ impl Machine {
 		}
 		drop(job);
 		let ram = mem_total()?;
-		gpu_core::log::Write::line(gpu_core::log::opt().probe, "recipe probe: measuring cpu (ddr5 + transfer + flops)");
+		gpu_core::log::Write::line(gpu_core::log::dev().probe, "recipe probe: measuring cpu (ddr5 + transfer + flops)");
 		let ddr5_gbs = bench_ddr5();
 		let cpu_transfer_gbs = bench_cpu_read();
 		let cpu_gflops = bench_cpu_flops();
 		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
-		gpu_core::log::Write::line(gpu_core::log::opt().probe, "recipe probe: measuring disk (sata)");
+		gpu_core::log::Write::line(gpu_core::log::dev().probe, "recipe probe: measuring disk (sata)");
 		let sata_gbs = bench_disk(&dd)?;
 		let eth_gbs = link_speed_gbs();
-		gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
+		gpu_core::log::Write::line(gpu_core::log::dev().probe, &format!(
 			"recipe probe: link {eth_gbs:.3} GB/s ({})",
 			eth_label(eth_gbs)
 		));
@@ -429,7 +429,7 @@ fn bench_disk(dir: &Path) -> Result<f64> {
 	let read_gbs = bytes as f64 / tr.elapsed().as_secs_f64() / 1e9;
 	drop(f);
 	std::fs::remove_file(&path).ok();
-	gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
+	gpu_core::log::Write::line(gpu_core::log::dev().probe, &format!(
 		"recipe probe: disk write {write_gbs:.3} GB/s, read {read_gbs:.3} GB/s"
 	));
 	Ok(read_gbs)

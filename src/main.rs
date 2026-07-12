@@ -59,11 +59,11 @@ fn main() -> Result<()> {
 		let dev: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
 		match recipe::probe::probe_gpu_child_record(dev) {
 			Ok(rec) => {
-				gpu_core::log::set_opt(gpu_core::log::Opt {
+				gpu_core::log::set_dev(gpu_core::log::Dev {
 					probe: true,
-					..gpu_core::log::Opt::default()
+					..gpu_core::log::Dev::default()
 				});
-				gpu_core::log::Write::line(gpu_core::log::opt().probe, &rec);
+				gpu_core::log::Write::line(gpu_core::log::dev().probe, &rec);
 				std::process::exit(0);
 			}
 			Err(e) => {
@@ -129,7 +129,7 @@ fn main() -> Result<()> {
 			drop(mean);
 			drop(std);
 			gpu_core::memory::pool_trim();
-			gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!("setup-race iter {i}: clean"));
+			gpu_core::log::Write::line(gpu_core::log::dev().gpu, &format!("setup-race iter {i}: clean"));
 		}
 		gpu_core::kernels::gpu_shutdown();
 		std::process::exit(0);
@@ -142,9 +142,9 @@ fn main() -> Result<()> {
 	match cmd {
 		"-h" | "--help" => usage(0),
 		"serve" => {
-			gpu_core::log::set_opt(gpu_core::log::Opt {
+			gpu_core::log::set_dev(gpu_core::log::Dev {
 				probe: true,
-				..gpu_core::log::Opt::default()
+				..gpu_core::log::Dev::default()
 			});
 			let bind = std::net::SocketAddr::new(
 				std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),

@@ -481,7 +481,7 @@ impl ModelInner {
 				return YesNo::No;
 			};
 			gpu_core::log::Write::line(
-				gpu_core::log::opt().prompt,
+				gpu_core::log::dev().prompt,
 				"overwrite checkpoint with random weights? [y/N] ",
 			);
 			std::io::stderr().flush().ok();
@@ -769,7 +769,7 @@ impl ModelInner {
 						resume.map(|path| {
 							let full = std::fs::canonicalize(path)
 								.unwrap_or_else(|_err| path.into());
-							gpu_core::log::Write::line(gpu_core::log::opt().save, &format!("resumed: {}", full.display()));
+							gpu_core::log::Write::line(gpu_core::log::dev().save, &format!("resumed: {}", full.display()));
 						})
 						.unwrap_or(())
 					})
@@ -777,8 +777,8 @@ impl ModelInner {
 				Some(())
 					.filter(|_probe| !summary.is_empty())
 					.map(|_probe| {
-						gpu_core::log::Write::block(gpu_core::log::opt().data, &summary);
-						gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!(
+						gpu_core::log::Write::block(gpu_core::log::dev().data, &summary);
+						gpu_core::log::Write::line(gpu_core::log::dev().gpu, &format!(
 							"roofline  gemm {} GF/s  vram {} GB/s",
 							recipe_infer::GEMM_GFLOPS,
 							recipe_infer::VRAM_GBS
@@ -1013,7 +1013,10 @@ impl ModelInner {
 				gpu_core::log::Write::line(flag, &metrics_line(&[*m], &[v]));
 			}
 			for _ck in checkpointed.iter() {
-				gpu_core::log::Write::line(o.save, "\x1b[1;32m<- checkpoint\x1b[0m");
+				gpu_core::log::Write::line(
+					gpu_core::log::dev().save,
+					"\x1b[1;32m<- checkpoint\x1b[0m",
+				);
 			}
 		}
 		Some(())
@@ -1087,14 +1090,14 @@ impl ModelInner {
 								!(fit_score.is_finite() && fit_score > best)
 							});
 						match Some(()).filter(|_probe| better_on_disk) {
-							Some(_keep) => gpu_core::log::Write::line(gpu_core::log::opt().save, &format!(
+							Some(_keep) => gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
 								"keeping {path} (better prior {key} on disk)"
 							)),
 							None => {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = std::fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								gpu_core::log::Write::line(gpu_core::log::opt().save, &format!(
+								gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
 									"saved {} ({key} {fit_score:.4})",
 									full.display()
 								));
@@ -1112,7 +1115,7 @@ impl ModelInner {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = std::fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								gpu_core::log::Write::line(gpu_core::log::opt().save, &format!(
+								gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
 									"saved {} ({neurons} neurons, {key} {s:.4})",
 									full.display()
 								));

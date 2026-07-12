@@ -13,15 +13,18 @@ static OPT: Mutex<Opt> = Mutex::new(Opt {
 	time: false,
 	r2: false,
 	device: false,
+});
+
+static DEV: Mutex<Dev> = Mutex::new(Dev {
 	data: false,
 	gpu: false,
 	probe: false,
 	save: false,
 	net: false,
-	prompt: true,
+	prompt: false,
 });
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Opt {
 	pub loss: bool,
 	pub acc: bool,
@@ -30,32 +33,16 @@ pub struct Opt {
 	pub time: bool,
 	pub r2: bool,
 	pub device: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Dev {
 	pub data: bool,
 	pub gpu: bool,
 	pub probe: bool,
 	pub save: bool,
 	pub net: bool,
 	pub prompt: bool,
-}
-
-impl Default for Opt {
-	fn default() -> Opt {
-		Opt {
-			loss: false,
-			acc: false,
-			epoch: false,
-			lr: false,
-			time: false,
-			r2: false,
-			device: false,
-			data: false,
-			gpu: false,
-			probe: false,
-			save: false,
-			net: false,
-			prompt: true,
-		}
-	}
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +66,14 @@ pub fn set_opt(o: Opt) {
 
 pub fn opt() -> Opt {
 	*OPT.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+pub fn set_dev(d: Dev) {
+	*DEV.lock().unwrap_or_else(|p| p.into_inner()) = d;
+}
+
+pub fn dev() -> Dev {
+	*DEV.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn strip_ansi(s: &str) -> String {

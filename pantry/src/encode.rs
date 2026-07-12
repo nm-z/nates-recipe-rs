@@ -291,7 +291,7 @@ fn encode(
 					.unwrap_or(1);
 				let capped = raw.min(crate::TEXT_CONTEXT);
 				if raw > capped {
-					recipe_infer::log::Write::line(recipe_infer::log::opt().data, &format!(
+					recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!(
 						"    context  {} tokens/{} → capped to {capped}",
 						raw, a.name
 					));
@@ -1106,7 +1106,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		recipe_infer::log::Write::line(recipe_infer::log::opt().data, &format!(
+		recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!(
 			"nan  dropped {} row(s) with a missing target",
 			n - keep.len()
 		));

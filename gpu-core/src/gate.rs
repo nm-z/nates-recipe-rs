@@ -125,8 +125,8 @@ fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Resu
 		None => Err(e),
 		Some(()) => {
 			match holder_pid(f) {
-				Some(pid) => crate::log::Write::line(crate::log::opt().gpu, &format!("gpu gate: queued behind pid {pid}")),
-				None => crate::log::Write::line(crate::log::opt().gpu, "gpu gate: queued behind the current holder"),
+				Some(pid) => crate::log::Write::line(crate::log::dev().gpu, &format!("gpu gate: queued behind pid {pid}")),
+				None => crate::log::Write::line(crate::log::dev().gpu, "gpu gate: queued behind the current holder"),
 			}
 			flock(fd, libc::LOCK_EX)
 		}

@@ -645,7 +645,7 @@ impl Server {
 		let reg = Arc::clone(&self.reg);
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
-		gpu_core::log::Write::line(gpu_core::log::opt().net, &format!(
+		gpu_core::log::Write::line(gpu_core::log::dev().net, &format!(
 			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),

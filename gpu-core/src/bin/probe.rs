@@ -22,9 +22,9 @@ fn main() {
 		}
 	}
 	gpu_core::hip::device_synchronize().expect("probe: device sync");
-	gpu_core::log::set_opt(gpu_core::log::Opt {
+	gpu_core::log::set_dev(gpu_core::log::Dev {
 		gpu: true,
-		..gpu_core::log::Opt::default()
+		..gpu_core::log::Dev::default()
 	});
-	gpu_core::log::Write::line(gpu_core::log::opt().gpu, "probe: ok");
+	gpu_core::log::Write::line(gpu_core::log::dev().gpu, "probe: ok");
 }

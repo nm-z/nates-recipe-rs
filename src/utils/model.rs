@@ -358,8 +358,11 @@ impl Train {
 			time: self.metrics.contains(&Metric::Time),
 			r2: self.metrics.contains(&Metric::R2),
 			device: run_hip.is_some(),
+		});
+		gpu_core::log::set_dev(gpu_core::log::Dev {
 			save: !self.metrics.is_empty(),
-			..gpu_core::log::Opt::default()
+			prompt: true,
+			..gpu_core::log::Dev::default()
 		});
 		let prepared = match data.prepared() {
 			Ok(v) => v,
@@ -387,7 +390,7 @@ impl Train {
 			Some(net) => {
 				let cs = crate::ok_or_die(net.connect(), "net: connect");
 				for c in &cs {
-					gpu_core::log::Write::line(gpu_core::log::opt().net, &format!(
+					gpu_core::log::Write::line(gpu_core::log::dev().net, &format!(
 						"net  pooled {} ({} RAM)",
 						c.info.arch,
 						crate::data::human_bytes(c.info.ram as usize),
@@ -629,7 +632,7 @@ impl Train {
 				.unwrap_or_default()
 		);
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
-		gpu_core::log::Write::line(gpu_core::log::opt().save, &format!(
+		gpu_core::log::Write::line(gpu_core::log::dev().save, &format!(
 			"saved {} ({} neurons, {key} {score:.4})",
 			full.display(),
 			rendered.neurons
@@ -908,7 +911,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 							format!(" + NET {}", crate::data::human_bytes(p.remote))
 						})
 						.unwrap_or_default();
-					gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!(
+					gpu_core::log::Write::line(gpu_core::log::dev().gpu, &format!(
 						"waterfall  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
 						crate::data::human_bytes(need),
 						crate::data::human_bytes(p.vram),
@@ -959,7 +962,7 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 		return Gate::Abort;
 	};
 	use std::io::Write;
-	gpu_core::log::Write::line(gpu_core::log::opt().prompt, "continue anyway? [y/N] ");
+	gpu_core::log::Write::line(gpu_core::log::dev().prompt, "continue anyway? [y/N] ");
 	std::io::stderr().flush().ok();
 	let mut line = String::new();
 	std::io::stdin().read_line(&mut line).ok();
@@ -1153,7 +1156,7 @@ impl Model {
 					0.0,
 				);
 				let sc = crate::ok_or_die(__sc, "eval: predictions");
-				gpu_core::log::Write::line(gpu_core::log::opt().data, &format!(
+				gpu_core::log::Write::line(gpu_core::log::dev().data, &format!(
 					"eval: {} samples (no target column, score unavailable)",
 					ei.n
 				));

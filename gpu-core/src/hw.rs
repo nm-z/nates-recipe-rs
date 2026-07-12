@@ -177,10 +177,10 @@ pub fn spawn_thrash_watchdog() {
 									std::process::abort();
 								}
 								GpuEvent::Restored => {
-									crate::log::Write::line(crate::log::opt().gpu, &format!("gpu event  queue restored  {}", ev.trim()))
+									crate::log::Write::line(crate::log::dev().gpu, &format!("gpu event  queue restored  {}", ev.trim()))
 								}
 								GpuEvent::Other => {
-									crate::log::Write::line(crate::log::opt().gpu, &format!("gpu event  {}", ev.trim()))
+									crate::log::Write::line(crate::log::dev().gpu, &format!("gpu event  {}", ev.trim()))
 								}
 							}
 						}

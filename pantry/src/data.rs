@@ -459,7 +459,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		return Ok(groups);
 	};
 	let total: usize = images.values().map(|v| v.len()).sum();
-	recipe_infer::log::Write::line(recipe_infer::log::opt().data, &format!("found images in {}", short_path(dir)));
+	recipe_infer::log::Write::line(recipe_infer::log::dev().data, &format!("found images in {}", short_path(dir)));
 	let pb = ProgressBar::new(total as u64);
 	pb.set_style(
 		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
@@ -519,7 +519,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		pixels,
 	});
 	pb.finish();
-	recipe_infer::log::Write::line(recipe_infer::log::opt().data, "");
+	recipe_infer::log::Write::line(recipe_infer::log::dev().data, "");
 	Ok(groups)
 }
 

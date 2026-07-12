@@ -1043,13 +1043,13 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
 		if probe_survives(want) {
-			crate::log::Write::line(crate::log::opt().gpu, &format!(
+			crate::log::Write::line(crate::log::dev().gpu, &format!(
 				"claim probe: {:.2} GB (probe-verified)",
 				want as f64 / (1u64 << 30) as f64
 			));
 			return Some(want);
 		}
-		crate::log::Write::line(crate::log::opt().gpu, &format!(
+		crate::log::Write::line(crate::log::dev().gpu, &format!(
 			"claim probe: {:.2} GB unmappable, backing off",
 			want as f64 / (1u64 << 30) as f64
 		));
