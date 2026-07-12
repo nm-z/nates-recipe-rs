@@ -666,7 +666,7 @@ pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match std::fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
-			gpu_core::log::line(gpu_core::log::Log::Error, &format!("no data in {path}, initialized random weights and biases"));
+			gpu_core::log::Write::err(&format!("no data in {path}, initialized random weights and biases"));
 			return Ok(Vec::new());
 		}
 	};

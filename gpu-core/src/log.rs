@@ -1,26 +1,87 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+use std::fmt::Display;
+use std::fs::File;
+use std::io::Write as _;
 use std::sync::Mutex;
-
-macro_rules! buckets {
-	($($name:ident),+ $(,)?) => {
-		#[derive(Clone, Copy, PartialEq, Debug)]
-		pub enum Log {
-			$($name,)+
-		}
-	};
-}
-
-buckets!(Error, Info, Metrics, Hip);
 
 pub const RUN_LOG_DIR: &str = "/tmp/recipe";
 pub const RUN_LOG_PATH: &str = concat!("/tmp/recipe/run", env!("RECIPE_GIT_HASH"), ".log");
 
-static SINK: Mutex<Option<File>> = Mutex::new(None);
-static SUBSCRIBED: Mutex<Vec<Log>> = Mutex::new(Vec::new());
+static SINK: Mutex<std::option::Option<File>> = Mutex::new(None);
+static OPT: Mutex<Opt> = Mutex::new(Opt {
+	loss: false,
+	acc: false,
+	epoch: false,
+	lr: false,
+	time: false,
+	r2: false,
+	device: false,
+	data: false,
+	gpu: false,
+	probe: false,
+	save: false,
+	net: false,
+	prompt: true,
+});
 
-pub fn subscribe(buckets: &[Log]) {
-	*SUBSCRIBED.lock().unwrap_or_else(|p| p.into_inner()) = buckets.to_vec();
+#[derive(Clone, Copy)]
+pub struct Opt {
+	pub loss: bool,
+	pub acc: bool,
+	pub epoch: bool,
+	pub lr: bool,
+	pub time: bool,
+	pub r2: bool,
+	pub device: bool,
+	pub data: bool,
+	pub gpu: bool,
+	pub probe: bool,
+	pub save: bool,
+	pub net: bool,
+	pub prompt: bool,
+}
+
+impl Default for Opt {
+	fn default() -> Opt {
+		Opt {
+			loss: false,
+			acc: false,
+			epoch: false,
+			lr: false,
+			time: false,
+			r2: false,
+			device: false,
+			data: false,
+			gpu: false,
+			probe: false,
+			save: false,
+			net: false,
+			prompt: true,
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+pub struct Err;
+impl Err {
+	pub const log: bool = true;
+	pub const print: bool = true;
+	pub const line: bool = true;
+}
+
+pub struct Optusr(pub Opt);
+pub struct OptDev(pub Opt, pub Err);
+pub struct Option {
+	pub user: Optusr,
+	pub dev: OptDev,
+}
+
+pub fn set_opt(o: Opt) {
+	*OPT.lock().unwrap_or_else(|p| p.into_inner()) = o;
+}
+
+pub fn opt() -> Opt {
+	*OPT.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -41,34 +102,49 @@ fn strip_ansi(s: &str) -> String {
 	out
 }
 
-fn file_line(bucket: Log, msg: &str) {
+fn log(t: &impl Display) {
 	let mut g = SINK.lock().unwrap_or_else(|p| p.into_inner());
 	if g.is_none() {
 		std::fs::create_dir_all(RUN_LOG_DIR).expect("log: create /tmp/recipe");
-		let f = OpenOptions::new()
-			.create(true)
+		let f = File::options()
 			.append(true)
+			.create(true)
 			.open(RUN_LOG_PATH)
 			.expect("log: open run log");
 		*g = Some(f);
 	}
 	let f = g.as_mut().expect("log: sink");
-	let tag = format!("{bucket:?}").to_lowercase();
-	writeln!(f, "[{tag}] {}", strip_ansi(msg)).expect("log: write run log");
+	writeln!(f, "{}", strip_ansi(&t.to_string())).expect("log: write run log");
 }
 
-pub fn line(bucket: Log, msg: &str) {
-	match bucket {
-		Log::Error => eprintln!("\x1b[1;31m{msg}\x1b[0m"),
-		_other => {
-			let sub = SUBSCRIBED
-				.lock()
-				.unwrap_or_else(|p| p.into_inner())
-				.contains(&bucket);
-			if sub {
-				println!("{msg}");
-			}
+fn print(t: &impl Display) {
+	writeln!(std::io::stderr(), "{t}").expect("log: stderr");
+}
+
+pub mod Write {
+	use super::*;
+	pub fn line(on: bool, t: impl Display) {
+		log(&t);
+		match on {
+			true => print(&t),
+			false => {}
 		}
 	}
-	file_line(bucket, msg);
+	pub fn block(on: bool, graph: &str) {
+		log(&graph);
+		match on {
+			true => print(&graph),
+			false => {}
+		}
+	}
+	pub fn err(t: impl Display) {
+		match Err::log {
+			true => log(&t),
+			false => {}
+		}
+		match Err::print {
+			true => print(&format!("\x1b[1;31m{t}\x1b[0m")),
+			false => {}
+		}
+	}
 }

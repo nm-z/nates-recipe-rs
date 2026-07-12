@@ -141,7 +141,7 @@ impl Waterfall {
 
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-		crate::log::line(crate::log::Log::Info, &format!(
+		crate::log::Write::line(crate::log::opt().gpu, &format!(
 			"waterfall: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB ({} blobs)",
 			gb(self.vram_bytes),
 			gb(self.ram_bytes),

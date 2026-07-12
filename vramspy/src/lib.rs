@@ -9,11 +9,37 @@
 //! table — LD_PRELOAD makes this library resolve first.
 
 #![deny(clippy::unwrap_used)]
+#![allow(non_snake_case)]
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
+use std::fmt::Display;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+fn log(t: &impl Display) {
+	use std::io::Write as _;
+	let path = concat!("/tmp/recipe/run", env!("RECIPE_GIT_HASH"), ".log");
+	let Ok(()) = std::fs::create_dir_all("/tmp/recipe") else {
+		return;
+	};
+	let Ok(mut f) = std::fs::File::options().append(true).create(true).open(path) else {
+		return;
+	};
+	drop(writeln!(f, "{t}"));
+}
+
+fn print(t: &impl Display) {
+	use std::io::Write as _;
+	drop(writeln!(std::io::stderr(), "\x1b[1;31m{t}\x1b[0m"));
+}
+
+mod Write {
+	pub fn err(t: impl std::fmt::Display) {
+		super::log(&t);
+		super::print(&t);
+	}
+}
 
 pub const KIND_DEVICE: u8 = 0;
 pub const KIND_HOST_PINNED: u8 = 1;
@@ -125,10 +151,10 @@ fn resolve_next(name: &CStr) -> usize {
 	match std::ptr::NonNull::new(p) {
 		Some(nn) => nn.as_ptr() as usize,
 		None => {
-			eprintln!(
+			Write::err(format!(
 				"vramspy: RTLD_NEXT resolution failed for {}",
 				name.to_string_lossy()
-			);
+			));
 			// SAFETY: abort() takes no arguments and never returns.
 			unsafe { libc::abort() }
 		}
@@ -291,7 +317,7 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 				pgi: resolve_next_or_default(c"hsa_amd_memory_pool_get_info")?,
 			})
 		})() else {
-			eprintln!(
+			Write::err(
 				"vramspy: agent/pool classification symbols unavailable — all pools classify OTHER"
 			);
 			return pools;

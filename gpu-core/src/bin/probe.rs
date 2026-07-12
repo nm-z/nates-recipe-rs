@@ -13,7 +13,7 @@ fn main() {
 		let v = back[i];
 		match (v - 0.5).abs().partial_cmp(&1e-12) {
 			Some(std::cmp::Ordering::Greater) => {
-				gpu_core::log::line(gpu_core::log::Log::Error, &format!("probe: mismatch at {i}: {v}"));
+				gpu_core::log::Write::err(&format!("probe: mismatch at {i}: {v}"));
 				std::process::exit(1);
 			}
 			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => {
@@ -22,5 +22,9 @@ fn main() {
 		}
 	}
 	gpu_core::hip::device_synchronize().expect("probe: device sync");
-	println!("probe: ok");
+	gpu_core::log::set_opt(gpu_core::log::Opt {
+		gpu: true,
+		..gpu_core::log::Opt::default()
+	});
+	gpu_core::log::Write::line(gpu_core::log::opt().gpu, "probe: ok");
 }

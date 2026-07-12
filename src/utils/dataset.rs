@@ -419,7 +419,7 @@ impl DataInner {
 		let types = self.feature_type_counts(attrs);
 		let print_types = |indent: &str| {
 			for tc in &types {
-				gpu_core::log::line(gpu_core::log::Log::Info, &format!("{indent}{} {}", tc.count, tc.label));
+				gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("{indent}{} {}", tc.count, tc.label));
 			}
 		};
 		let set_rows = match self.split_frac {
@@ -427,23 +427,23 @@ impl DataInner {
 			None => train.x.nrows(),
 		};
 		for src in &self.sources {
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("set  {}", short(src)));
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("    {}", disk_size(src)));
+			gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("set  {}", short(src)));
+			gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("    {}", disk_size(src)));
 		}
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!("    {} rows  {} cols", set_rows, raw_cols));
+		gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("    {} rows  {} cols", set_rows, raw_cols));
 		print_types("        ");
 		for ex in &self.exclude {
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("    excluded  {ex}"));
+			gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("    excluded  {ex}"));
 		}
 		let cards = self.cat_cardinality_counts(attrs);
 		for _present in cards.first().into_iter() {
-			gpu_core::log::line(gpu_core::log::Log::Info, "    encoding");
+			gpu_core::log::Write::line(gpu_core::log::opt().data, "    encoding");
 		}
 		for cc in &cards {
 			let range: Vec<String> = (0..cc.card).map(|i| i.to_string()).collect();
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("        {} × [{}]", cc.count, range.join(", ")));
+			gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("        {} × [{}]", cc.count, range.join(", ")));
 		}
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!("    {} features -> model", train.x.ncols()));
+		gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("    {} features -> model", train.x.ncols()));
 		for test in test.into_iter() {
 			match &self.test_path {
 				Some(tp) => {
@@ -453,22 +453,22 @@ impl DataInner {
 						.raw_test_rows
 						.as_ref()
 						.map_or(test.x.nrows(), |r| r.len());
-					gpu_core::log::line(gpu_core::log::Log::Info, &format!("test  {}", short(tp)));
-					gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+					gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("test  {}", short(tp)));
+					gpu_core::log::Write::line(gpu_core::log::opt().data, &format!(
 						"    {} rows  {} cols  {}",
 						test_raw_rows,
 						test_raw_cols,
 						disk_size(tp),
 					));
 					print_types("        ");
-					gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+					gpu_core::log::Write::line(gpu_core::log::opt().data, &format!(
 						"    {} features -> model",
 						test.x.ncols()
 					));
 				}
 				None => {
 					for _frac in self.split_frac.iter() {
-						gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+						gpu_core::log::Write::line(gpu_core::log::opt().data, &format!(
 							"split  {} train / {} test",
 							train.x.nrows(),
 							test.x.nrows(),
@@ -478,7 +478,7 @@ impl DataInner {
 			}
 		}
 		for t in &self.target_names {
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("target  {t}"));
+			gpu_core::log::Write::line(gpu_core::log::opt().data, &format!("target  {t}"));
 		}
 	}
 

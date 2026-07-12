@@ -397,7 +397,7 @@ struct Tail<'a> {
 	v: [u64; 3],
 }
 
-pub fn state_report(run_start: &[u64; N]) -> Option<Vec<(crate::log::Log, String)>> {
+pub fn state_report(run_start: &[u64; N]) -> Option<(String, Vec<String>)> {
 	let ls = LOOP_START
 		.lock()
 		.unwrap_or_else(|p| p.into_inner())
@@ -499,20 +499,17 @@ pub fn state_report(run_start: &[u64; N]) -> Option<Vec<(crate::log::Log, String
 			v: frees,
 		},
 	];
-	let mut evs = vec![(crate::log::Log::Hip, out.trim_end().to_string())];
+	let mut errs: Vec<String> = Vec::new();
 	for t in tails {
 		for _present in t.v.iter().find(|x| **x != 0).into_iter() {
-			evs.push((
-				crate::log::Log::Error,
-				format!(
-					"{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x",
-					what = t.what,
-					i0 = t.v[0],
-					i1 = t.v[1],
-					i2 = t.v[2]
-				),
+			errs.push(format!(
+				"{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x",
+				what = t.what,
+				i0 = t.v[0],
+				i1 = t.v[1],
+				i2 = t.v[2]
 			));
 		}
 	}
-	Some(evs)
+	Some((out.trim_end().to_string(), errs))
 }

@@ -2,6 +2,8 @@ use std::fmt;
 use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
 
+const NL: char = '\u{a}';
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
 	pub name: String,
@@ -132,10 +134,10 @@ impl Node {
 						out.push(' ');
 						out.push_str(&g.name);
 					}
-					out.push('\n');
+					out.push(NL);
 				}
 				None => {
-					out.push('\n');
+					out.push(NL);
 					c.write_to(out, depth + 1);
 				}
 			}

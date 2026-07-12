@@ -1192,7 +1192,7 @@ impl Ooc {
 		] {
 			tally(b);
 		}
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+		gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!(
 			"waterfall  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
 			gb(v),
 			gb(r),
@@ -1236,7 +1236,7 @@ impl Ooc {
 		{
 			roof += &format!("  {} {:.3} GB/s", rt.label, rt.bps / 1e9);
 		}
-		gpu_core::log::line(gpu_core::log::Log::Info, &roof);
+		gpu_core::log::Write::line(gpu_core::log::opt().gpu, &roof);
 	}
 
 	pub fn forward(
@@ -2033,7 +2033,7 @@ impl Ooc {
 		{
 			line += &format!("  drain {drain:.1}s");
 		}
-		gpu_core::log::line(gpu_core::log::Log::Info, &line);
+		gpu_core::log::Write::line(gpu_core::log::opt().gpu, &line);
 		Ok(())
 	}
 

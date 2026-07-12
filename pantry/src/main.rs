@@ -12,9 +12,10 @@ fn kind_name(k: usize) -> &'static str {
 }
 
 fn main() -> Result<()> {
+	recipe_infer::log::set_opt(recipe_infer::log::Opt { data: true, ..recipe_infer::log::Opt::default() });
 	let paths: Vec<String> = std::env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		recipe_infer::log::line(recipe_infer::log::Log::Error, "usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
+		recipe_infer::log::Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
 		std::process::exit(1);
 	};
 
@@ -23,7 +24,8 @@ fn main() -> Result<()> {
 	let multi = paths.get(1);
 	for path in &paths {
 		for _extra in multi.into_iter() {
-			println!("\n# {path}");
+			recipe_infer::log::Write::line(recipe_infer::log::opt().data, "");
+			recipe_infer::log::Write::line(recipe_infer::log::opt().data, format!("# {path}"));
 		}
 		for group in pantry::data::load_groups(path) {
 			let pantry::data::DirGroup::Table {
@@ -51,7 +53,7 @@ fn main() -> Result<()> {
 			for idx in 0..headers.len().min(kinds.len()) {
 				let h = &headers[idx];
 				let k = kinds[idx];
-				println!("{prefix}{h} -> {}", kind_name(k));
+				recipe_infer::log::Write::line(recipe_infer::log::opt().data, format!("{prefix}{h} -> {}", kind_name(k)));
 			}
 		}
 	}

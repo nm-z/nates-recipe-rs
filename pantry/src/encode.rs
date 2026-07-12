@@ -291,7 +291,7 @@ fn encode(
 					.unwrap_or(1);
 				let capped = raw.min(crate::TEXT_CONTEXT);
 				if raw > capped {
-					recipe_infer::log::line(recipe_infer::log::Log::Info, &format!(
+					recipe_infer::log::Write::line(recipe_infer::log::opt().data, &format!(
 						"    context  {} tokens/{} → capped to {capped}",
 						raw, a.name
 					));
@@ -484,7 +484,7 @@ fn admit_ceiling(
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
-	recipe_infer::log::line(recipe_infer::log::Log::Error, &line.join(", "));
+	recipe_infer::log::Write::err(&line.join(", "));
 	Err(CeilingExceeded {
 		label: label.to_string(),
 		rows: n,
@@ -1086,13 +1086,13 @@ pub fn clean_dataset(d: &mut Dataset) {
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+		recipe_infer::log::Write::err(&format!(
 			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
 		));
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+		recipe_infer::log::Write::err(&format!(
 			"{k} target column(s) but {} target value(s)  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			d.y.len(),
 			n * k
@@ -1106,7 +1106,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		recipe_infer::log::line(recipe_infer::log::Log::Info, &format!(
+		recipe_infer::log::Write::line(recipe_infer::log::opt().data, &format!(
 			"nan  dropped {} row(s) with a missing target",
 			n - keep.len()
 		));

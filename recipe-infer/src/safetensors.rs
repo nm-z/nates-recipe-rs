@@ -285,8 +285,11 @@ pub fn parse_json(s: &str) -> Result<Json> {
 	}
 }
 
+const NLB: u8 = 10;
+const NL: char = '\u{a}';
+
 fn skip_ws(b: &[u8], p: &mut usize) {
-	while *p < b.len() && matches!(b[*p], b' ' | b'\t' | b'\n' | b'\r') {
+	while *p < b.len() && matches!(b[*p], b' ' | b'\t' | NLB | b'\r') {
 		*p += 1;
 	}
 }
@@ -375,7 +378,7 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 					Some(b'"') => '"',
 					Some(b'\\') => '\\',
 					Some(b'/') => '/',
-					Some(b'n') => '\n',
+					Some(b'n') => NL,
 					Some(b't') => '\t',
 					Some(b'r') => '\r',
 					Some(b'b') => '\u{8}',

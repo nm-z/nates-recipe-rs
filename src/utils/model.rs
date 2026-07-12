@@ -350,14 +350,17 @@ impl Train {
 			.find(|m| **m == Metric::Hip)
 			.map(|_hip| gpu_core::callspy::snapshot());
 		let run_state = gpu_core::callspy::snapshot();
-		let mut subs: Vec<gpu_core::log::Log> = Vec::new();
-		if self.metrics.iter().any(|m| *m != Metric::Hip) {
-			subs.push(gpu_core::log::Log::Metrics);
-		}
-		if run_hip.is_some() {
-			subs.push(gpu_core::log::Log::Hip);
-		}
-		gpu_core::log::subscribe(&subs);
+		gpu_core::log::set_opt(gpu_core::log::Opt {
+			loss: self.metrics.contains(&Metric::Loss),
+			acc: self.metrics.contains(&Metric::Accuracy),
+			epoch: self.metrics.contains(&Metric::Epoch),
+			lr: self.metrics.contains(&Metric::Lr),
+			time: self.metrics.contains(&Metric::Time),
+			r2: self.metrics.contains(&Metric::R2),
+			device: run_hip.is_some(),
+			save: !self.metrics.is_empty(),
+			..gpu_core::log::Opt::default()
+		});
 		let prepared = match data.prepared() {
 			Ok(v) => v,
 			Err(e) => {
@@ -366,7 +369,7 @@ impl Train {
 						.is_some(),
 					"run: prepare data: {e:#}"
 				);
-				gpu_core::log::line(gpu_core::log::Log::Error, 
+				gpu_core::log::Write::err(
 					"skipped  scenario exceeds the VRAM+RAM+disk ceiling (size above)",
 				);
 				return self;
@@ -384,7 +387,7 @@ impl Train {
 			Some(net) => {
 				let cs = crate::ok_or_die(net.connect(), "net: connect");
 				for c in &cs {
-					gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+					gpu_core::log::Write::line(gpu_core::log::opt().net, &format!(
 						"net  pooled {} ({} RAM)",
 						c.info.arch,
 						crate::data::human_bytes(c.info.ram as usize),
@@ -401,7 +404,7 @@ impl Train {
 		});
 		let issues = preflight(model, ds, pass, net_ram);
 		let Gate::Proceed = confirm_issues(&issues) else {
-			gpu_core::log::line(gpu_core::log::Log::Error, "aborted");
+			gpu_core::log::Write::err("aborted");
 			return self;
 		};
 		match pass {
@@ -410,10 +413,11 @@ impl Train {
 				run_hip
 					.as_ref()
 					.map(|a| {
-						gpu_core::log::line(gpu_core::log::Log::Hip, &format!(
-							"-- run pre-fit --\n{}",
-							gpu_core::callspy::report_since(a).trim_end()
-						))
+						gpu_core::log::Write::line(gpu_core::log::opt().device, "-- run pre-fit --");
+						gpu_core::log::Write::block(
+							gpu_core::log::opt().device,
+							gpu_core::callspy::report_since(a).trim_end(),
+						)
 					})
 					.unwrap_or(());
 				let __fit = model.fit(ds, self, resume.as_deref(), conns);
@@ -428,16 +432,17 @@ impl Train {
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())
 					.filter(|_probe| INTERRUPTED.load(Ordering::SeqCst) != 0)
-					.map(|_flag| gpu_core::log::line(gpu_core::log::Log::Error, "interrupted"))
+					.map(|_flag| gpu_core::log::Write::err("interrupted"))
 					.unwrap_or(());
 				let score = model.fit_score.get();
 				post_fit
 					.as_ref()
 					.map(|p| {
-						gpu_core::log::line(gpu_core::log::Log::Hip, &format!(
-							"-- run post-fit --\n{}",
-							gpu_core::callspy::report_since(p).trim_end()
-						))
+						gpu_core::log::Write::line(gpu_core::log::opt().device, "-- run post-fit --");
+						gpu_core::log::Write::block(
+							gpu_core::log::opt().device,
+							gpu_core::callspy::report_since(p).trim_end(),
+						)
 					})
 					.unwrap_or(());
 				model.arena_gen.set(gpu_core::memory::live_parked_gen());
@@ -451,11 +456,11 @@ impl Train {
 				last.raw_test_rows = data.raw_rows();
 				last.raw_test_headers = data.raw_headers();
 				drop(last);
-				for (bucket, msg) in gpu_core::callspy::state_report(&run_state)
-					.into_iter()
-					.flatten()
-				{
-					gpu_core::log::line(bucket, &msg);
+				if let Some((tree, errs)) = gpu_core::callspy::state_report(&run_state) {
+					gpu_core::log::Write::block(gpu_core::log::opt().device, &tree);
+					for e in errs {
+						gpu_core::log::Write::err(&e);
+					}
 				}
 			}
 			Pass::Forward => {
@@ -505,10 +510,25 @@ impl Train {
 							ss_tot,
 						);
 						let sc = crate::ok_or_die(__sc, "run: eval metrics");
-						gpu_core::log::line(gpu_core::log::Log::Metrics, &format!(
-							"eval  {}",
-							crate::train::metrics_line(&self.metrics, &sc.vals)
-						));
+						let o = gpu_core::log::opt();
+						for (mi, m) in self.metrics.iter().enumerate() {
+							let flag = match m {
+								Metric::Loss => o.loss,
+								Metric::Accuracy => o.acc,
+								Metric::Epoch => o.epoch,
+								Metric::Lr => o.lr,
+								Metric::Time => o.time,
+								Metric::R2 => o.r2,
+								Metric::Hip => o.device,
+							};
+							gpu_core::log::Write::line(
+								flag,
+								&format!(
+									"eval  {}",
+									crate::train::metrics_line(&[*m], &[sc.vals[mi]])
+								),
+							);
+						}
 						let stop = Some(Metric::Accuracy)
 							.filter(|_m| model.loss.is_classification())
 							.unwrap_or(Metric::R2);
@@ -609,7 +629,7 @@ impl Train {
 				.unwrap_or_default()
 		);
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+		gpu_core::log::Write::line(gpu_core::log::opt().save, &format!(
 			"saved {} ({} neurons, {key} {score:.4})",
 			full.display(),
 			rendered.neurons
@@ -888,7 +908,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 							format!(" + NET {}", crate::data::human_bytes(p.remote))
 						})
 						.unwrap_or_default();
-					gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+					gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!(
 						"waterfall  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
 						crate::data::human_bytes(need),
 						crate::data::human_bytes(p.vram),
@@ -926,20 +946,20 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 	let interactive = std::io::stdin().is_terminal();
 	for i in 0..issues.len() {
 		let issue = &issues[i];
-		gpu_core::log::line(gpu_core::log::Log::Error, &format!(
-			"preflight {}/{}  {}\n    have: {}\n    need: {}",
+		gpu_core::log::Write::err(&format!(
+			"preflight {}/{}  {}",
 			i + 1,
 			issues.len(),
 			issue.what,
-			issue.have,
-			issue.need,
 		));
+		gpu_core::log::Write::err(&format!("    have: {}", issue.have));
+		gpu_core::log::Write::err(&format!("    need: {}", issue.need));
 	}
 	let Some(_probe) = Some(()).filter(|_gate| interactive) else {
 		return Gate::Abort;
 	};
 	use std::io::Write;
-	eprint!("continue anyway? [y/N] ");
+	gpu_core::log::Write::line(gpu_core::log::opt().prompt, "continue anyway? [y/N] ");
 	std::io::stderr().flush().ok();
 	let mut line = String::new();
 	std::io::stdin().read_line(&mut line).ok();
@@ -1109,7 +1129,11 @@ impl Model {
 				let label = Some("accuracy")
 					.filter(|_l| inner.loss.is_classification())
 					.unwrap_or("R2");
-				gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+				let flag = match metric {
+					Metric::Accuracy => gpu_core::log::opt().acc,
+					_other => gpu_core::log::opt().r2,
+				};
+				gpu_core::log::Write::line(flag, &format!(
 					"eval: {label} = {:.4} ({} samples)",
 					sc.vals[0], ei.n
 				));
@@ -1129,7 +1153,7 @@ impl Model {
 					0.0,
 				);
 				let sc = crate::ok_or_die(__sc, "eval: predictions");
-				gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+				gpu_core::log::Write::line(gpu_core::log::opt().data, &format!(
 					"eval: {} samples (no target column, score unavailable)",
 					ei.n
 				));

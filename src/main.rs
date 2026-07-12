@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 fn usage(code: i32) -> ! {
-	gpu_core::log::line(gpu_core::log::Log::Error, "usage: recipe <file.rs> [args]  # compile + run");
-	gpu_core::log::line(gpu_core::log::Log::Error, "       recipe serve            # daemon on 7845");
+	gpu_core::log::Write::err("usage: recipe <file.rs> [args]  # compile + run");
+	gpu_core::log::Write::err("       recipe serve            # daemon on 7845");
 	std::process::exit(code);
 }
 
@@ -59,11 +59,15 @@ fn main() -> Result<()> {
 		let dev: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
 		match recipe::probe::probe_gpu_child_record(dev) {
 			Ok(rec) => {
-				println!("{rec}");
+				gpu_core::log::set_opt(gpu_core::log::Opt {
+					probe: true,
+					..gpu_core::log::Opt::default()
+				});
+				gpu_core::log::Write::line(gpu_core::log::opt().probe, &rec);
 				std::process::exit(0);
 			}
 			Err(e) => {
-				gpu_core::log::line(gpu_core::log::Log::Error, &format!("probe child gpu{dev}: {e}"));
+				gpu_core::log::Write::err(&format!("probe child gpu{dev}: {e}"));
 				std::process::exit(2);
 			}
 		}
@@ -125,7 +129,7 @@ fn main() -> Result<()> {
 			drop(mean);
 			drop(std);
 			gpu_core::memory::pool_trim();
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("setup-race iter {i}: clean"));
+			gpu_core::log::Write::line(gpu_core::log::opt().gpu, &format!("setup-race iter {i}: clean"));
 		}
 		gpu_core::kernels::gpu_shutdown();
 		std::process::exit(0);
@@ -138,6 +142,10 @@ fn main() -> Result<()> {
 	match cmd {
 		"-h" | "--help" => usage(0),
 		"serve" => {
+			gpu_core::log::set_opt(gpu_core::log::Opt {
+				probe: true,
+				..gpu_core::log::Opt::default()
+			});
 			let bind = std::net::SocketAddr::new(
 				std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
 				recipe::wire::PORT,

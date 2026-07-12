@@ -6,6 +6,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+const NL: char = '\u{a}';
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuDev {
 	pub vram: u64,
@@ -34,10 +36,10 @@ impl Machine {
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
-			gpu_core::log::line(gpu_core::log::Log::Info, &format!("recipe probe: measuring gpu{d}"));
+			gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!("recipe probe: measuring gpu{d}"));
 			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
-				Err(e) => gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+				Err(e) => gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
 					"recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"
 				)),
 			}
@@ -49,16 +51,16 @@ impl Machine {
 		}
 		drop(job);
 		let ram = mem_total()?;
-		gpu_core::log::line(gpu_core::log::Log::Info, "recipe probe: measuring cpu (ddr5 + transfer + flops)");
+		gpu_core::log::Write::line(gpu_core::log::opt().probe, "recipe probe: measuring cpu (ddr5 + transfer + flops)");
 		let ddr5_gbs = bench_ddr5();
 		let cpu_transfer_gbs = bench_cpu_read();
 		let cpu_gflops = bench_cpu_flops();
 		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
-		gpu_core::log::line(gpu_core::log::Log::Info, "recipe probe: measuring disk (sata)");
+		gpu_core::log::Write::line(gpu_core::log::opt().probe, "recipe probe: measuring disk (sata)");
 		let sata_gbs = bench_disk(&dd)?;
 		let eth_gbs = link_speed_gbs();
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+		gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
 			"recipe probe: link {eth_gbs:.3} GB/s ({})",
 			eth_label(eth_gbs)
 		));
@@ -194,8 +196,7 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 	let exe = std::env::current_exe()?;
 	let mut child = std::process::Command::new(exe)
 		.env("RECIPE_PROBE_GPU", dev.to_string())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::null())
+		.stderr(std::process::Stdio::piped())
 		.spawn()?;
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
 	loop {
@@ -215,12 +216,16 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 		ensure!(status.success(), "probe child exited {status}");
 		let mut out = String::new();
 		use std::io::Read;
-		child.stdout
+		child.stderr
 			.take()
-			.ok_or_else(|| anyhow::anyhow!("probe child stdout"))?
+			.ok_or_else(|| anyhow::anyhow!("probe child stderr"))?
 			.read_to_string(&mut out)?;
-		let f: Vec<&str> = out.trim().split('|').collect();
-		ensure!(f.len() == 4, "probe child output malformed: {out:?}");
+		let f: Vec<&str> = out
+			.lines()
+			.rev()
+			.map(|l| l.trim().split('|').collect::<Vec<&str>>())
+			.find(|p| p.len() == 4)
+			.ok_or_else(|| anyhow::anyhow!("probe child output malformed: {out:?}"))?;
 		return Ok(GpuDev {
 			vram: f[0].parse()?,
 			pcie_gbs: f[1].parse()?,
@@ -424,7 +429,7 @@ fn bench_disk(dir: &Path) -> Result<f64> {
 	let read_gbs = bytes as f64 / tr.elapsed().as_secs_f64() / 1e9;
 	drop(f);
 	std::fs::remove_file(&path).ok();
-	gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+	gpu_core::log::Write::line(gpu_core::log::opt().probe, &format!(
 		"recipe probe: disk write {write_gbs:.3} GB/s, read {read_gbs:.3} GB/s"
 	));
 	Ok(read_gbs)
@@ -451,36 +456,44 @@ fn drop_cache(f: &File, off: u64, len: usize) {
 }
 
 pub fn write_config(machines: &[Machine]) -> String {
-	let mut s = String::from("machines\n");
+	let mut s = String::from("machines");
+	s.push(NL);
 	for m in machines {
-		s.push_str(&format!("\t{}\n", m.host));
-		s.push_str("\t\tETH\n");
+		s.push_str(&format!("\t{}{NL}", m.host));
+		s.push_str("\t\tETH");
+		s.push(NL);
 		s.push_str(&format!(
-			"\t\t\t{}\t{:.3}\n",
+			"\t\t\t{}\t{:.3}{NL}",
 			eth_label(m.eth_gbs),
 			m.eth_gbs
 		));
-		s.push_str("\t\tDISK\n");
-		s.push_str(&format!("\t\t\tSIZE\t{}\n", m.disk_size));
-		s.push_str(&format!("\t\t\tSATA\t{:.3}\n", m.sata_gbs));
+		s.push_str("\t\tDISK");
+		s.push(NL);
+		s.push_str(&format!("\t\t\tSIZE\t{}{NL}", m.disk_size));
+		s.push_str(&format!("\t\t\tSATA\t{:.3}{NL}", m.sata_gbs));
 		for i in 0..m.gpus.len() {
 			let g = &m.gpus[i];
-			s.push_str(&format!("\t\tGPU{i}\n"));
-			s.push_str(&format!("\t\t\tVRAM\t{}\n", g.vram));
-			s.push_str(&format!("\t\t\tPCIe\t{:.3}\n", g.pcie_gbs));
-			s.push_str(&format!("\t\t\tFLOPs\t{:.1}\n", g.flops_gflops));
-			s.push_str(&format!("\t\t\tTransfer\t{:.3}\n", g.transfer_gbs));
+			s.push_str(&format!("\t\tGPU{i}{NL}"));
+			s.push_str(&format!("\t\t\tVRAM\t{}{NL}", g.vram));
+			s.push_str(&format!("\t\t\tPCIe\t{:.3}{NL}", g.pcie_gbs));
+			s.push_str(&format!("\t\t\tFLOPs\t{:.1}{NL}", g.flops_gflops));
+			s.push_str(&format!("\t\t\tTransfer\t{:.3}{NL}", g.transfer_gbs));
 		}
-		s.push_str("\t\tCPU\n");
-		s.push_str(&format!("\t\t\tRAM\t{}\n", m.ram));
-		s.push_str(&format!("\t\t\tDDR5\t{:.3}\n", m.ddr5_gbs));
-		s.push_str(&format!("\t\t\tFLOPs\t{:.1}\n", m.cpu_gflops));
-		s.push_str(&format!("\t\t\tTransfer\t{:.3}\n", m.cpu_transfer_gbs));
+		s.push_str("\t\tCPU");
+		s.push(NL);
+		s.push_str(&format!("\t\t\tRAM\t{}{NL}", m.ram));
+		s.push_str(&format!("\t\t\tDDR5\t{:.3}{NL}", m.ddr5_gbs));
+		s.push_str(&format!("\t\t\tFLOPs\t{:.1}{NL}", m.cpu_gflops));
+		s.push_str(&format!("\t\t\tTransfer\t{:.3}{NL}", m.cpu_transfer_gbs));
 	}
-	s.push_str("schema\n");
-	s.push_str("\tsizes\tbytes\n");
-	s.push_str("\tbandwidths\tGB/s\n");
-	s.push_str("\tFLOPs\tGFLOP/s\n");
+	s.push_str("schema");
+	s.push(NL);
+	s.push_str("\tsizes\tbytes");
+	s.push(NL);
+	s.push_str("\tbandwidths\tGB/s");
+	s.push(NL);
+	s.push_str("\tFLOPs\tGFLOP/s");
+	s.push(NL);
 	s
 }
 

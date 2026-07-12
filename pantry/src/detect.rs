@@ -18,13 +18,14 @@ pub const EMBED_DIM: usize = 32;
 pub const HEADS: usize = 4;
 
 const DETECTOR_OGDL: &str = include_str!("../detector.ogdl");
+const NLB: u8 = 10;
 
 /// One column → one variable-length byte stream (every cell, newline-delimited),
 /// read up to the context window, `id = byte + 1`, PAD(0) to `CONTEXT`.
 /// No sampling, no per-cell windowing — the whole stream as far as the context reads.
 pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	let mut ids = Vec::with_capacity(CONTEXT);
-	let sep = b'\n' as f64 + 1.0;
+	let sep = NLB as f64 + 1.0;
 	'outer: for j in 0..cells.len() {
 		for lead in cells[..j].first().map(|_prev| sep).into_iter() {
 			match ids.len().cmp(&CONTEXT) {
@@ -151,7 +152,7 @@ enum FirstRow {
 /// returned prefix is exactly what `tokenize_column` would consume from the full
 /// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
 fn prefix_columns(path: &std::path::Path) -> anyhow::Result<PrefixCols> {
-	// One token per byte, plus one '\n' separator between consecutive cells.
+	// One token per byte, plus one newline separator between consecutive cells.
 	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize]) {
 		let std::cmp::Ordering::Less = tok[j].cmp(&CONTEXT) else {
 			return;

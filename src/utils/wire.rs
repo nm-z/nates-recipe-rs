@@ -12,6 +12,8 @@ use std::thread;
 pub const MAGIC: u32 = 0x5243_5031;
 pub const PORT: u16 = 7845;
 const HDR: usize = 32;
+const NL: char = '\u{a}';
+const NLS: &str = "\u{a}";
 
 const BEACON_MAGIC: u32 = 0x5243_5042;
 const BEACON_SECS: u64 = 2;
@@ -147,11 +149,11 @@ impl NodeInfo {
 		}
 	}
 	fn encode(&self) -> Vec<u8> {
-		format!("{}\n{}\n{}\n{}", self.arch, self.gpus, self.vram, self.ram).into_bytes()
+		format!("{}{NL}{}{NL}{}{NL}{}", self.arch, self.gpus, self.vram, self.ram).into_bytes()
 	}
 	fn decode(b: &[u8]) -> Result<NodeInfo> {
 		let s = std::str::from_utf8(b)?;
-		let mut it = s.split('\n');
+		let mut it = s.split(NL);
 		let arch = it.next().unwrap_or("").to_string();
 		let gpus = it.next().unwrap_or("0").parse()?;
 		let vram = it.next().unwrap_or("0").parse()?;
@@ -273,11 +275,11 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 				Link::Wired => "eth",
 			};
 			let mut body = format!(
-				"{host}\n{kind}\n{PORT}\n{}",
+				"{host}{NL}{kind}{NL}{PORT}{NL}{}",
 				String::from_utf8_lossy(&info.encode())
 			);
 			for ml in mach_line.as_ref().into_iter() {
-				body.push('\n');
+				body.push(NL);
 				body.push_str(ml);
 			}
 			let mut buf = BEACON_MAGIC.to_le_bytes().to_vec();
@@ -295,7 +297,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let sock = match std::net::UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
-			gpu_core::log::line(gpu_core::log::Log::Error, &format!(
+			gpu_core::log::Write::err(&format!(
 				"recipe serve: discovery listener bind failed: {e}"
 			));
 			return;
@@ -316,7 +318,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 				let Ok(text) = std::str::from_utf8(&buf[4..r.n]) else {
 					continue;
 				};
-				let mut it = text.splitn(4, '\n');
+				let mut it = text.splitn(4, NL);
 				let Some(host) = it.next() else { continue };
 				let Some(kind) = it.next() else { continue };
 				let Some(port) = it.next() else { continue };
@@ -330,7 +332,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 					continue;
 				};
 				let machine = rest
-					.splitn(5, '\n')
+					.splitn(5, NL)
 					.nth(4)
 					.and_then(|ml| Machine::beacon_decode(ml).ok());
 				let addr = format!("{}:{}", r.from.ip(), port);
@@ -391,7 +393,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 		.err()
 		.into_iter()
 	{
-		gpu_core::log::line(gpu_core::log::Log::Error, &format!("recipe serve: config write failed: {e}"));
+		gpu_core::log::Write::err(&format!("recipe serve: config write failed: {e}"));
 	}
 }
 
@@ -413,7 +415,7 @@ fn encode_peers(reg: &Registry) -> Result<Vec<u8>> {
 			rec.host, rec.info.arch, rec.info.gpus, rec.info.vram, rec.info.ram
 		));
 	}
-	Ok(lines.join("\n").into_bytes())
+	Ok(lines.join(NLS).into_bytes())
 }
 
 #[derive(Clone, Debug)]
@@ -635,7 +637,7 @@ impl Server {
 				.err()
 				.into_iter()
 			{
-				gpu_core::log::line(gpu_core::log::Log::Error, &format!("recipe serve: config write failed: {e}"));
+				gpu_core::log::Write::err(&format!("recipe serve: config write failed: {e}"));
 			}
 		}
 		let bm = machine.clone();
@@ -643,7 +645,7 @@ impl Server {
 		let reg = Arc::clone(&self.reg);
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
-		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+		gpu_core::log::Write::line(gpu_core::log::opt().net, &format!(
 			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
@@ -662,7 +664,7 @@ impl Server {
 			let srv = self.clone();
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
-					gpu_core::log::line(gpu_core::log::Log::Error, &format!(
+					gpu_core::log::Write::err(&format!(
 						"recipe serve: connection ended: {e}"
 					));
 				}
@@ -821,7 +823,7 @@ fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 		.unwrap_or(alias);
 	ensure!(
 		host != alias,
-		"wire: '{alias}' is not an ssh alias — add to ~/.ssh/config:\n  Host {alias}\n      HostName <address>\nwith keys so `ssh {alias}` works, then retry"
+		"wire: '{alias}' is not an ssh alias — add to ~/.ssh/config:{NL}  Host {alias}{NL}      HostName <address>{NL}with keys so `ssh {alias}` works, then retry"
 	);
 	let ssh_addr = format!("{host}:{PORT}");
 	match peers
