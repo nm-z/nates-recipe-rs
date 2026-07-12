@@ -1237,6 +1237,9 @@ fn main() -> Result<()> {
 
 	let mut sck: Vec<Vec<(usize, f64)>> = vec![vec![]; NCANVAS];
 	let mut pred = [MASK as u32; NCANVAS];
+	let mut prev = pred;
+	let mut ages = [0u8; NCANVAS];
+	let mut heats = [0f32; NCANVAS];
 
 	// Preallocate the whole forward arena once (t is now known). After this point
 	// the hot loop allocates nothing — the acceptance invariant is that the device
@@ -1378,14 +1381,17 @@ fn main() -> Result<()> {
 			let r = xs(&mut st);
 			let mut cum = 0.0;
 			let mut sel = cand[0].0;
+			let mut selp = probs[0];
 			for (k, &pr) in probs.iter().enumerate() {
 				cum += pr;
 				if r <= cum {
 					sel = cand[k].0;
+					selp = pr;
 					break;
 				}
 			}
 			pred[c] = sel as u32;
+			heats[c] = selp as f32;
 			let mut top: Vec<(usize, f64)> = cand
 				.iter()
 				.zip(probs.iter())
@@ -1398,11 +1404,38 @@ fn main() -> Result<()> {
 			}
 			sck[c] = top;
 		}
-		let text: String = pred
-			.iter()
-			.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
+		let toks: Vec<recipe::tui::Tok> = (0..NCANVAS)
+			.map(|c| {
+				let tk = pred[c] as usize;
+				let status = if tk == MASK || tk == MASK_SIGNAL {
+					recipe::tui::TokStatus::Draft
+				} else if pred[c] != prev[c] {
+					recipe::tui::TokStatus::Recent
+				} else {
+					recipe::tui::TokStatus::Accepted
+				};
+				ages[c] = if pred[c] != prev[c] {
+					0
+				} else {
+					ages[c].saturating_add(1)
+				};
+				recipe::tui::Tok {
+					text: vocab[tk].replace('\u{2581}', " "),
+					status,
+					age: ages[c],
+					heat: heats[c],
+				}
+			})
 			.collect();
-		Write::line(prompt, format!("step {step} ({:.0}s): {text}", t0.elapsed().as_secs_f64()));
+		prev = pred;
+		Write::line(
+			prompt,
+			format!(
+				"step {step} ({:.0}s): {}",
+				t0.elapsed().as_secs_f64(),
+				recipe::tui::render_toks(&toks)
+			),
+		);
 	}
 
 	let allocs_after = gpu_core::memory::device_alloc_count();

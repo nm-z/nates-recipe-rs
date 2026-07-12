@@ -19,6 +19,8 @@ pub mod dataset;
 pub mod ooc;
 #[path = "utils/probe.rs"]
 pub mod probe;
+#[path = "utils/tui.rs"]
+pub mod tui;
 #[path = "utils/wire.rs"]
 pub mod wire;
 

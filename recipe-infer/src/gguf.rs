@@ -110,7 +110,10 @@ impl Gguf {
 		if magic.as_slice() != b"GGUF" {
 			bail!("gguf: bad magic {magic:?}");
 		}
-		let _version = rd.u32v()?;
+		let version = rd.u32v()?;
+		if version < 2 {
+			bail!("gguf: version {version} uses u32 counts and lengths; only v2+ (u64) is supported");
+		}
 		let n_tensors = rd.u64v()?;
 		let n_kv = rd.u64v()?;
 		let mut kv = HashMap::new();
