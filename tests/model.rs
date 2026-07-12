@@ -75,11 +75,11 @@ static CHURN: LazyLock<recipe::dataset::Dataset> = LazyLock::new(|| {
 	data.datasets().train
 });
 
-fn step_scalars(lr: f64, n: usize) -> StepScalars {
+fn step_scalars(rate: f64, n: usize) -> StepScalars {
 	let inv = 1.0 / n as f64;
 	StepScalars {
 		neg_lr: {
-			let __up = &[-lr];
+			let __up = &[-rate];
 			let __ub = GpuBuffer::alloc(__up.len()).expect("neg_lr");
 			__ub.load(__up).expect("neg_lr");
 			__ub
@@ -199,7 +199,7 @@ fn attn_backward(
 }
 
 fn backward_step(
-	loss: Loss,
+	lossfn: Loss,
 	params: &[LayerParams],
 	x: &GpuBuffer,
 	ybuf: &GpuBuffer,
@@ -211,7 +211,7 @@ fn backward_step(
 	let cc = concat_layer(params);
 	let (da_cur, da_next) = (&sc.da_a, &sc.da_b);
 	recipe::train::loss_grad_into(
-		loss,
+		lossfn,
 		&sc.acts[last],
 		ybuf,
 		da_cur,
@@ -677,9 +677,9 @@ fn gpu_metrics_match_cpu_reference() {
 		);
 	};
 	let out = &sc.acts[last];
-	let metric = |m: Metric, loss: Loss| -> f64 {
+	let metric = |m: Metric, lossfn: Loss| -> f64 {
 		let LossScale { sign, div } =
-			metric_gpu_into(loss, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar)
+			metric_gpu_into(lossfn, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar)
 				.expect("metric");
 		let v = sign * download_scalar(&sc.metric_scalar) / div;
 		if m == Metric::R2 { 1.0 - v } else { v }
@@ -884,7 +884,7 @@ fn ping_pong_gradients_match_per_layer() {
 	};
 
 	let h = 16usize;
-	let lr = 0.01;
+	let rate = 0.01;
 	let mk = |fan_in: usize, units: usize, seed: u32, act: Activation| {
 		let scale = (2.0 / fan_in as f64).sqrt();
 		let w = GpuBuffer::alloc(fan_in * units).expect("randn alloc");
@@ -956,7 +956,7 @@ fn ping_pong_gradients_match_per_layer() {
 		.map(|p| download_vec(&p.b, p.out_dim))
 		.collect();
 
-	let ss = step_scalars(lr, n);
+	let ss = step_scalars(rate, n);
 	let consts = consts_buf();
 	let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
 	forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
@@ -1111,4 +1111,24 @@ fn ping_pong_gradients_match_per_layer() {
 		max_b_diff < 1e-10,
 		"biases mismatch after backward: max abs diff = {max_b_diff:.2e}"
 	);
+}
+
+#[test]
+fn metric_consts_both_casings() {
+	let pairs = [
+		(recipe::loss, recipe::Loss),
+		(recipe::accuracy, recipe::Accuracy),
+		(recipe::epoch, recipe::Epoch),
+		(recipe::lr, recipe::Lr),
+		(recipe::time, recipe::Time),
+		(recipe::r2, recipe::R2),
+		(recipe::Hip, recipe::hip),
+	];
+	for (a, b) in pairs {
+		assert!(a == b, "casing aliases diverge");
+	}
+	let t = Train::new()
+		.log([recipe::hip, recipe::epoch, recipe::loss, recipe::lr])
+		.log([recipe::Hip, recipe::Epoch, recipe::Loss, recipe::Lr]);
+	drop(t);
 }

@@ -502,7 +502,7 @@ pub fn state_report(run_start: &[u64; N]) -> Option<String> {
 	for t in tails {
 		for _present in t.v.iter().find(|x| **x != 0).into_iter() {
 			let line = format!(
-				"{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x\n",
+				"\x1b[1;31m{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x\x1b[0m\n",
 				what = t.what,
 				i0 = t.v[0],
 				i1 = t.v[1],

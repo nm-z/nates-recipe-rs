@@ -45,6 +45,8 @@ pub use model::{
 	Activation, DataHandle, IntoLayer, LayerSpec, ModelArg, ModelHandle, Prepared, RunArg,
 	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
+#[doc(hidden)]
+pub use recipe_infer::{Hip, accuracy, epoch, loss, lr, r2, time};
 
 pub struct Recipe;
 
