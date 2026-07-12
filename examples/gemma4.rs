@@ -140,11 +140,17 @@ fn dims(l: usize) -> Dims {
 	}
 }
 
+// gt = ggml quant type of the on-disk bytes; GT_BF16 marks raw bf16 (safetensors).
+// For quantized tensors, off/nbytes address DEQUANTED bf16 space: nbytes is the
+// bf16 byte count callers reason in, off is the absolute quant-data offset.
+const GT_BF16: u32 = u32::MAX;
+
 struct Tensor {
 	shard: usize,
 	off: usize, // absolute file byte offset of the blob start
 	nbytes: usize,
 	shape: Vec<usize>,
+	gt: u32,
 }
 
 // Largest single streamed weight: full-layer q_proj / o_proj = 8192*2816 f64.
@@ -337,15 +343,40 @@ const LAYER_NORMS: [(&str, &str); 9] = [
 ];
 
 impl Model {
-	// Read a tensor's raw bytes (or a byte sub-range) from its shard.
+	// Map a bf16-space sub-range of a quantized tensor to its quant blocks.
+	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
+		let (bb, be) = recipe_infer::dequant::block_layout(t.gt);
+		anyhow::ensure!(
+			off.is_multiple_of(2) && len.is_multiple_of(2) && (off / 2).is_multiple_of(be),
+			"qrange: read {off}+{len} not block-aligned (be={be})"
+		);
+		let qoff = off / 2 / be * bb;
+		let qlen = (len / 2).div_ceil(be) * bb;
+		Ok((qoff, qlen))
+	}
+
+	// Read a tensor's bf16 bytes (or a bf16-space sub-range): raw for GT_BF16,
+	// read-quant-then-dequant otherwise.
 	fn read_bytes(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
-		let mut buf = vec![0u8; len];
+		if t.gt == GT_BF16 {
+			let mut buf = vec![0u8; len];
+			let _d = Instant::now();
+			self.shards[t.shard]
+				.read_exact_at(&mut buf, (t.off + off) as u64)
+				.with_context(|| format!("read {len} bytes at shard {}", t.shard))?;
+			acc(&DISK_NS, _d);
+			return Ok(buf);
+		}
+		let (qoff, qlen) = Self::qrange(t, off, len)?;
+		let mut qbuf = vec![0u8; qlen];
 		let _d = Instant::now();
 		self.shards[t.shard]
-			.read_exact_at(&mut buf, (t.off + off) as u64)
-			.with_context(|| format!("read {len} bytes at shard {}", t.shard))?;
+			.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
+			.with_context(|| format!("read {qlen} quant bytes"))?;
 		acc(&DISK_NS, _d);
-		Ok(buf)
+		let mut out = recipe_infer::dequant::dequant_bf16(t.gt, &qbuf);
+		out.truncate(len);
+		Ok(out)
 	}
 
 	// Disk → device through the reusable host buffer: no per-read alloc/zero.
@@ -357,6 +388,13 @@ impl Model {
 		dst: &GpuBuffer,
 		dst_off: usize,
 	) -> Result<()> {
+		if t.gt != GT_BF16 {
+			let bytes = self.read_bytes(t, off, len)?;
+			let _h = Instant::now();
+			bview(dst, dst_off, len).write_u8(&bytes)?;
+			acc(&H2D_NS, _h);
+			return Ok(());
+		}
 		let mut rb = self.rbuf.borrow_mut();
 		if rb.len() < len {
 			rb.resize(len, 0);
@@ -372,16 +410,44 @@ impl Model {
 		Ok(())
 	}
 
-	// Decode a small tensor fully to host f64.
+	// Decode a small tensor fully to host f64 (quant tensors skip the bf16
+	// roundtrip: dequant straight to f32 then widen).
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
 		let t = self
 			.big
 			.get(name)
 			.ok_or_else(|| anyhow!("missing {name}"))?;
+		if t.gt != GT_BF16 {
+			let (qoff, qlen) = Self::qrange(t, 0, t.nbytes)?;
+			let mut qbuf = vec![0u8; qlen];
+			self.shards[t.shard]
+				.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
+				.with_context(|| format!("small {name}"))?;
+			let mut f = Vec::new();
+			recipe_infer::dequant::dequant_f32(t.gt, &qbuf, &mut f);
+			f.truncate(t.nbytes / 2);
+			return Ok(f.iter().map(|&x| x as f64).collect());
+		}
 		let raw = self.read_bytes(t, 0, t.nbytes)?;
 		Ok(raw.chunks_exact(2)
 			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
 			.collect())
+	}
+
+	// Fill a host slice with a tensor's bf16 bytes (dequanting when needed) —
+	// the waterfall place() closures use this so every tier holds bf16.
+	fn read_host(&self, t: &Tensor, off: usize, dst: &mut [u8]) -> Result<()> {
+		if t.gt == GT_BF16 {
+			let _d = Instant::now();
+			self.shards[t.shard]
+				.read_exact_at(dst, (t.off + off) as u64)
+				.with_context(|| format!("read_host {} bytes", dst.len()))?;
+			acc(&DISK_NS, _d);
+			return Ok(());
+		}
+		let bytes = self.read_bytes(t, off, dst.len())?;
+		dst.copy_from_slice(&bytes);
+		Ok(())
 	}
 
 	// Widen `n` bf16 elems at `off_bytes` of a device bf16 buffer into the shared
@@ -517,35 +583,84 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 					off: data_start + e.begin,
 					nbytes: e.end - e.begin,
 					shape: e.shape,
+					gt: GT_BF16,
 				},
 			);
 		}
 		shards.push(f);
 	}
+	finish_load(shards, big)
+}
 
-	// Norm convention: gemma stores gamma as (1+w) when the mean is ~0; if a
-	// checkpoint has folded the +1 the mean is ~1. Decide from layer-0 input norm.
-	let probe: Vec<f64> = {
-		let t = big
-			.get("model.decoder.layers.0.input_layernorm.weight")
-			.ok_or_else(|| anyhow!("no probe norm"))?;
-		let mut buf = vec![0u8; t.nbytes];
-		shards[t.shard].read_exact_at(&mut buf, t.off as u64)?;
-		buf.chunks_exact(2)
-			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
-			.collect()
+// GGUF tensor name -> the HF-style name the rest of the engine keys on.
+fn hf_name(gg: &str) -> Option<String> {
+	let global = |n: &str| Some(format!("model.decoder.{n}"));
+	match gg {
+		"token_embd.weight" => return global("embed_tokens.weight"),
+		"output_norm.weight" => return global("norm.weight"),
+		"self_cond_pre_norm.weight" => return global("self_conditioning.pre_norm.weight"),
+		"self_cond_gate.weight" => return global("self_conditioning.gate_proj.weight"),
+		"self_cond_up.weight" => return global("self_conditioning.up_proj.weight"),
+		"self_cond_down.weight" => return global("self_conditioning.down_proj.weight"),
+		_other => {}
+	}
+	let rest = gg.strip_prefix("blk.")?;
+	let dot = rest.find('.')?;
+	let l: usize = rest[..dot].parse().ok()?;
+	let suf = match &rest[dot + 1..] {
+		"attn_norm.weight" => "input_layernorm.weight",
+		"post_attention_norm.weight" => "post_attention_layernorm.weight",
+		"attn_q_norm.weight" => "self_attn.q_norm.weight",
+		"attn_k_norm.weight" => "self_attn.k_norm.weight",
+		"ffn_norm.weight" => "pre_feedforward_layernorm.weight",
+		"post_ffw_norm_1.weight" => "post_feedforward_layernorm_1.weight",
+		"pre_ffw_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
+		"post_ffw_norm_2.weight" => "post_feedforward_layernorm_2.weight",
+		"post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+		"attn_q.weight" => "self_attn.q_proj.weight",
+		"attn_k.weight" => "self_attn.k_proj.weight",
+		"attn_v.weight" => "self_attn.v_proj.weight",
+		"attn_output.weight" => "self_attn.o_proj.weight",
+		"ffn_gate.weight" => "mlp.gate_proj.weight",
+		"ffn_up.weight" => "mlp.up_proj.weight",
+		"ffn_down.weight" => "mlp.down_proj.weight",
+		"ffn_gate_up_exps.weight" => "experts.gate_up_proj",
+		"ffn_down_exps.weight" => "experts.down_proj",
+		"ffn_gate_inp.weight" => "router.proj.weight",
+		"ffn_gate_inp.scale" => "router.scale",
+		"ffn_down_exps.scale" => "router.per_expert_scale",
+		"layer_output_scale.weight" => "layer_scalar",
+		_other => return None,
 	};
-	let mean = probe.iter().sum::<f64>() / probe.len() as f64;
-	let plus_one = mean.abs() < 0.5;
-	eprintln!(
-		"norm probe mean={mean:.4} -> {}",
-		if plus_one {
-			"(1+w) HF convention"
-		} else {
-			"folded x*w"
-		}
-	);
+	Some(format!("model.decoder.layers.{l}.{suf}"))
+}
 
+fn load_model_gguf(path: &PathBuf) -> Result<Model> {
+	let g = recipe_infer::gguf::Gguf::open(path)?;
+	let f = File::open(path)?;
+	let mut big: HashMap<String, Tensor> = HashMap::new();
+	for (name, info) in &g.tensors {
+		let Some(hf) = hf_name(name) else {
+			continue;
+		};
+		let elems: usize = info.dims.iter().product();
+		let mut shape: Vec<usize> = info.dims.clone();
+		shape.reverse();
+		big.insert(
+			hf,
+			Tensor {
+				shard: 0,
+				off: info.offset as usize,
+				nbytes: elems * 2,
+				shape,
+				gt: info.ggml_type,
+			},
+		);
+	}
+	finish_load(vec![f], big)
+}
+
+fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>) -> Result<Model> {
 	eprintln!("allocating stage+win...");
 	let mut m = Model {
 		shards,
@@ -584,6 +699,20 @@ fn load_model(dir: &PathBuf) -> Result<Model> {
 		},
 		ls_dev: Vec::new(),
 	};
+
+	// Norm convention: gemma stores gamma as (1+w) when the mean is ~0; if a
+	// checkpoint has folded the +1 the mean is ~1. Decide from layer-0 input norm.
+	let probe = m.small_f64("model.decoder.layers.0.input_layernorm.weight")?;
+	let mean = probe.iter().sum::<f64>() / probe.len() as f64;
+	let plus_one = mean.abs() < 0.5;
+	eprintln!(
+		"norm probe mean={mean:.4} -> {}",
+		if plus_one {
+			"(1+w) HF convention"
+		} else {
+			"folded x*w"
+		}
+	);
 
 	// Per-layer resident tensors.
 	for l in 0..NL {
@@ -699,9 +828,7 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	for l in 0..NL {
 		for name in fixed_names(l) {
 			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
-			store.place(&name, t.nbytes, |dst| {
-				m.shards[t.shard].read_exact_at(dst, t.off as u64)
-			})?;
+			store.place(&name, t.nbytes, |dst| m.read_host(t, 0, dst).map_err(std::io::Error::other))?;
 			beat();
 		}
 	}
@@ -714,13 +841,10 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 				m.big.get(&layer_name(l, "experts.down_proj"))
 					.ok_or_else(|| anyhow!("no down {l}"))?;
 			store.place(&ekey(l, e), SLOT_BYTES, |dst| {
-				m.shards[gu.shard].read_exact_at(
-					&mut dst[..GU_BYTES],
-					(gu.off + e * GU_BYTES) as u64,
-				)?;
-				m.shards[dn.shard]
-					.read_exact_at(&mut dst[GU_BYTES..], (dn.off + e * DN_BYTES) as u64)
-			})?;
+				m.read_host(gu, e * GU_BYTES, &mut dst[..GU_BYTES])
+					.and_then(|_g| m.read_host(dn, e * DN_BYTES, &mut dst[GU_BYTES..]))
+					.map_err(std::io::Error::other)
+				})?;
 			beat();
 		}
 	}
@@ -1002,67 +1126,35 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	Ok(logits)
 }
 
-// Greedy longest-match tokenizer over the ▁-prefixed vocab (BOS prepended).
-fn tokenize(prompt: &str, rev: &HashMap<String, u32>) -> Vec<u32> {
-	let text = format!("\u{2581}{}", prompt.replace(' ', "\u{2581}"));
-	let ch: Vec<char> = text.chars().collect();
+// BOS prepended; segmentation delegated to the model's own tokenizer.json.
+fn tokenize(ask: &str, tk: &recipe_infer::tokenizer::Tokenizer) -> Result<Vec<u32>> {
+	let enc = tk
+		.encode(ask, false)
+		.map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
 	let mut toks = vec![BOS];
-	let mut i = 0;
-	while i < ch.len() {
-		let mut best: Option<u32> = None;
-		let mut blen = 0;
-		for l in (1..=ch.len() - i).rev() {
-			let s: String = ch[i..i + l].iter().collect();
-			if let Some(&id) = rev.get(&s) {
-				best = Some(id);
-				blen = l;
-				break;
-			}
-		}
-		match best {
-			Some(id) => {
-				toks.push(id);
-				i += blen;
-			}
-			None => i += 1,
-		}
-	}
-	toks
+	toks.extend_from_slice(enc.get_ids());
+	Ok(toks)
 }
 
 fn main() -> Result<()> {
+	use gpu_core::log::{Opt, Write, prompt, set_opt};
+	set_opt(Opt { prompt: true, ..Opt::default() });
 	ensure_vramspy_preloaded()?;
 
-	let dir = PathBuf::from("/home/nate/Desktop/gemma4/diffusiongemma-26B-A4B-it");
-	let prompt = std::env::args()
+	let gguf_path =
+		PathBuf::from("/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf");
+	let ask = std::env::args()
 		.nth(1)
 		.unwrap_or_else(|| "The capital of France is".to_string());
 
-	// Vocab: id->token and token->id from tokenizer.json (model.vocab + added).
-	let tok_json: serde_json::Value =
-		serde_json::from_slice(&std::fs::read(dir.join("tokenizer.json"))?)?;
-	let mut vocab = vec![String::new(); VOCAB];
-	let mut rev: HashMap<String, u32> = HashMap::new();
-	if let Some(map) = tok_json["model"]["vocab"].as_object() {
-		for (k, v) in map {
-			if let Some(id) = v.as_u64()
-				&& (id as usize) < VOCAB
-			{
-				vocab[id as usize] = k.clone();
-				rev.insert(k.clone(), id as u32);
-			}
-		}
-	}
-	if let Some(added) = tok_json["added_tokens"].as_array() {
-		for a in added {
-			if let (Some(id), Some(c)) = (a["id"].as_u64(), a["content"].as_str())
-				&& (id as usize) < VOCAB
-			{
-				vocab[id as usize] = c.to_string();
-				rev.insert(c.to_string(), id as u32);
-			}
-		}
-	}
+	// Tokenizer + vocab from the GGUF's own metadata (recipe_infer::tokenizer).
+	let (tokenizer, vocab) = {
+		let g = recipe_infer::gguf::Gguf::open(&gguf_path)?;
+		(
+			recipe_infer::tokenizer::from_gguf(&g)?,
+			recipe_infer::tokenizer::gguf_vocab(&g, VOCAB)?,
+		)
+	};
 
 	eprintln!("loading model...");
 	let t_load = Instant::now();
@@ -1131,10 +1223,10 @@ fn main() -> Result<()> {
 		w
 	};
 	beat();
-	let mut m = load_model(&dir)?;
+	let mut m = load_model_gguf(&gguf_path)?;
 
 	// Build the diffusion canvas: prompt tokens + NCANVAS masks.
-	let mut toks = tokenize(&prompt, &rev);
+	let mut toks = tokenize(&ask, &tokenizer)?;
 	let prefix = toks.len();
 	for _ in 0..NCANVAS {
 		toks.push(MASK as u32);
@@ -1310,7 +1402,7 @@ fn main() -> Result<()> {
 			.iter()
 			.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
 			.collect();
-		eprintln!("step {step} ({:.0}s): {text}", t0.elapsed().as_secs_f64());
+		Write::line(prompt, format!("step {step} ({:.0}s): {text}", t0.elapsed().as_secs_f64()));
 	}
 
 	let allocs_after = gpu_core::memory::device_alloc_count();
@@ -1344,7 +1436,9 @@ fn main() -> Result<()> {
 		.iter()
 		.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
 		.collect();
-	println!("\n=== OUTPUT ===\n{out}");
+	Write::line(prompt, "");
+	Write::line(prompt, "=== OUTPUT ===");
+	Write::line(prompt, &out);
 	eprintln!("{}", gpu_core::memory::ledger_report());
 	// exit → free all: the claim (the process's ONE owned device allocation)
 	// must drop BEFORE shutdown marks the runtime down, or its hipFreeAsync is

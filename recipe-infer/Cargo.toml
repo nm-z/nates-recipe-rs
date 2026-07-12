@@ -9,5 +9,6 @@ name = "recipe_infer"
 [dependencies]
 anyhow = "1"
 gpu-core = { path = "../gpu-core" }
+tokenizers = "0.21"
 ndarray = "0.16"
 ogdl = { path = "../ogdl" }

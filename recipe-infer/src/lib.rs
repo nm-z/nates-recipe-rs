@@ -2,11 +2,14 @@
 #![deny(clippy::match_wild_err_arm)]
 
 pub mod bridge;
+pub mod dequant;
 pub mod enums;
 pub mod forward;
+pub mod gguf;
 pub mod params;
 pub mod safetensors;
 pub mod scratch;
+pub mod tokenizer;
 pub mod work;
 
 pub use bridge::*;
