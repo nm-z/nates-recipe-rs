@@ -291,10 +291,10 @@ fn encode(
 					.unwrap_or(1);
 				let capped = raw.min(crate::TEXT_CONTEXT);
 				if raw > capped {
-					eprintln!(
-						"    \x1b[33mcontext\x1b[0m  {} tokens/{} → capped to {capped}",
+					recipe_infer::log::line(recipe_infer::log::Log::Info, &format!(
+						"    context  {} tokens/{} → capped to {capped}",
 						raw, a.name
-					);
+					));
 				}
 				capped
 			}
@@ -382,7 +382,7 @@ fn encode(
 }
 
 fn oom_pair(name: &str, val: &str) -> String {
-	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
+	format!("{name}: {val}")
 }
 
 /// The one typed over-ceiling error: raised here where the budgets are measured,
@@ -484,7 +484,7 @@ fn admit_ceiling(
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
-	eprintln!("{}", line.join(", "));
+	recipe_infer::log::line(recipe_infer::log::Log::Error, &line.join(", "));
 	Err(CeilingExceeded {
 		label: label.to_string(),
 		rows: n,
@@ -1086,17 +1086,17 @@ pub fn clean_dataset(d: &mut Dataset) {
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		eprintln!(
-			"\x1b[1;31mno columns found, check delimiter\x1b[0m  {src}  →  {n} row(s) × 0 column(s)"
-		);
+		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
+		));
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		eprintln!(
-			"\x1b[1;31m{k} target column(s) but {} target value(s)\x1b[0m  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
+		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+			"{k} target column(s) but {} target value(s)  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			d.y.len(),
 			n * k
-		);
+		));
 		std::process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
@@ -1106,10 +1106,10 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		eprintln!(
-			"\x1b[32mnan\x1b[0m  dropped {} row(s) with a missing target",
+		recipe_infer::log::line(recipe_infer::log::Log::Info, &format!(
+			"nan  dropped {} row(s) with a missing target",
 			n - keep.len()
-		);
+		));
 		d.x = d.x.select(ndarray::Axis(0), &keep);
 		let mut yd = Vec::with_capacity(keep.len() * k);
 		for &i in &keep {

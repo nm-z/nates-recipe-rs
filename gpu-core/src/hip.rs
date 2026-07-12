@@ -270,11 +270,11 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			Some(hit) => format!("{locate}; {hit}"),
 			None => format!("{locate}; va in NO recorded allocation"),
 		};
-		eprintln!(
-			"\x1b[1;31mgpu fault autopsy\x1b[0m  va=0x{:x}  reason={why}  {locate}\n{}",
+		crate::log::line(crate::log::Log::Error, &format!(
+			"gpu fault autopsy  va=0x{:x}  reason={why}  {locate}\n{}",
 			e.virtual_address,
 			crate::memory::ledger_report(),
-		);
+		));
 		std::thread::sleep(std::time::Duration::from_millis(150));
 	}
 	1

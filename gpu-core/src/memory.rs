@@ -95,7 +95,7 @@ fn fmt_bytes(b: usize) -> String {
 }
 
 fn oom_pair(name: &str, val: &str) -> String {
-	format!("\x1b[1;31m{name}:\x1b[0m \x1b[1m{val}\x1b[0m")
+	format!("{name}: {val}")
 }
 
 struct TagBytes {
@@ -131,13 +131,13 @@ fn oom_report(req: usize) {
 		&fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0)),
 	));
 	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
-	eprintln!("{}", line.join(", "));
-	eprintln!(
+	crate::log::line(crate::log::Log::Error, &line.join(", "));
+	crate::log::line(crate::log::Log::Error, &format!(
 		"{}, {}, {}",
 		oom_pair("H2D", &fmt_bytes(H2D_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2H", &fmt_bytes(D2H_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2D", &fmt_bytes(D2D_BYTES.load(Ordering::Relaxed))),
-	);
+	));
 }
 
 struct FdinfoMem {
@@ -995,7 +995,7 @@ pub(crate) fn device_init_once() {
 	DEVICE_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
 		for e in crate::hip::set_pool_retain(0).err().into_iter() {
-			eprintln!("GPU pool retain failed: {e}");
+			crate::log::line(crate::log::Log::Error, &format!("GPU pool retain failed: {e}"));
 		}
 		crate::hip::register_fault_autopsy_once();
 		crate::hw::spawn_thrash_watchdog();
@@ -1043,16 +1043,16 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
 		if probe_survives(want) {
-			eprintln!(
+			crate::log::line(crate::log::Log::Info, &format!(
 				"claim probe: {:.2} GB (probe-verified)",
 				want as f64 / (1u64 << 30) as f64
-			);
+			));
 			return Some(want);
 		}
-		eprintln!(
+		crate::log::line(crate::log::Log::Info, &format!(
 			"claim probe: {:.2} GB unmappable, backing off",
 			want as f64 / (1u64 << 30) as f64
-		);
+		));
 		want -= want / 16;
 	}
 	None
@@ -1476,10 +1476,10 @@ impl Drop for GpuBuffer {
 		crate::callspy::tick(&crate::callspy::FREE_ASYNC);
 		let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 		for _fail in std::num::NonZeroI32::new(code).into_iter() {
-			eprintln!(
+			crate::log::line(crate::log::Log::Error, &format!(
 				"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:p}",
 				self.len, self.tag, self.ptr
-			);
+			));
 		}
 		self.ptr = std::ptr::null_mut();
 	}

@@ -1192,16 +1192,16 @@ impl Ooc {
 		] {
 			tally(b);
 		}
-		eprintln!(
-			"\x1b[33mwaterfall\x1b[0m  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
+		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
+			"waterfall  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
 			gb(v),
 			gb(r),
 			gb(d),
 			gb(nt),
 			self.chunk
-		);
+		));
 		let mut roof = format!(
-			"\x1b[33mwaterfall\x1b[0m  measured rooflines: gemm {} GF/s  vram {} GB/s",
+			"waterfall  measured rooflines: gemm {} GF/s  vram {} GB/s",
 			recipe_infer::GEMM_GFLOPS,
 			recipe_infer::VRAM_GBS,
 		);
@@ -1236,7 +1236,7 @@ impl Ooc {
 		{
 			roof += &format!("  {} {:.3} GB/s", rt.label, rt.bps / 1e9);
 		}
-		eprintln!("{roof}");
+		gpu_core::log::line(gpu_core::log::Log::Info, &roof);
 	}
 
 	pub fn forward(
@@ -2033,7 +2033,7 @@ impl Ooc {
 		{
 			line += &format!("  drain {drain:.1}s");
 		}
-		eprintln!("{line}");
+		gpu_core::log::line(gpu_core::log::Log::Info, &line);
 		Ok(())
 	}
 

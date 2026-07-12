@@ -110,13 +110,12 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	let Some(_headroom) = avail.checked_sub(proj) else {
-		eprintln!("\x1b[1;31mcsv too large to parse into RAM\x1b[0m");
-		eprintln!(
-			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
+		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+			"csv too large to parse into RAM\n    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		);
+		));
 		panic!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
@@ -182,13 +181,12 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	let Some(_headroom) = avail.checked_sub(proj) else {
-		eprintln!("\x1b[1;31mcsv too large to parse into RAM\x1b[0m");
-		eprintln!(
-			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
+		recipe_infer::log::line(recipe_infer::log::Log::Error, &format!(
+			"csv too large to parse into RAM\n    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		);
+		));
 		panic!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
@@ -406,7 +404,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					eprintln!("WARN: skipping {}: {e}", hp.path.display());
+					recipe_infer::log::line(recipe_infer::log::Log::Error, &format!("WARN: skipping {}: {e}", hp.path.display()));
 					None
 				}
 			})
@@ -457,7 +455,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		return Ok(groups);
 	};
 	let total: usize = images.values().map(|v| v.len()).sum();
-	eprintln!("found images in {}", short_path(dir));
+	recipe_infer::log::line(recipe_infer::log::Log::Info, &format!("found images in {}", short_path(dir)));
 	let pb = ProgressBar::new(total as u64);
 	pb.set_style(
 		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
@@ -496,7 +494,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					eprintln!("WARN: skipping image {}: {e}", p.display());
+					recipe_infer::log::line(recipe_infer::log::Log::Error, &format!("WARN: skipping image {}: {e}", p.display()));
 					vec![f64::NAN; dim]
 				}
 			};
@@ -517,7 +515,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		pixels,
 	});
 	pb.finish();
-	eprintln!();
+	recipe_infer::log::line(recipe_infer::log::Log::Info, "");
 	Ok(groups)
 }
 

@@ -1618,7 +1618,7 @@ pub fn gpu_shutdown() {
 	crate::memory::free_bounce();
 	crate::memory::free_run_pin();
 	let _trim = crate::hip::trim_mempool(0);
-	eprint!("{}", crate::callspy::report());
+	crate::log::line(crate::log::Log::Hip, crate::callspy::report().trim_end());
 }
 
 pub fn gpu_gemm(
@@ -5939,7 +5939,7 @@ pub fn gpu_report(
 		})
 		.sum::<f64>()
 		/ nc as f64;
-	eprintln!("      r={:4}  val={:.4}", round + 1, ba);
+	crate::log::line(crate::log::Log::Info, &format!("      r={:4}  val={:.4}", round + 1, ba));
 	Ok(ba)
 }
 

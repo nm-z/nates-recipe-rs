@@ -295,7 +295,9 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let sock = match std::net::UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
-			eprintln!("recipe serve: discovery listener bind failed: {e}");
+			gpu_core::log::line(gpu_core::log::Log::Error, &format!(
+				"recipe serve: discovery listener bind failed: {e}"
+			));
 			return;
 		}
 	};
@@ -389,7 +391,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 		.err()
 		.into_iter()
 	{
-		eprintln!("recipe serve: config write failed: {e}");
+		gpu_core::log::line(gpu_core::log::Log::Error, &format!("recipe serve: config write failed: {e}"));
 	}
 }
 
@@ -633,7 +635,7 @@ impl Server {
 				.err()
 				.into_iter()
 			{
-				eprintln!("recipe serve: config write failed: {e}");
+				gpu_core::log::line(gpu_core::log::Log::Error, &format!("recipe serve: config write failed: {e}"));
 			}
 		}
 		let bm = machine.clone();
@@ -641,7 +643,7 @@ impl Server {
 		let reg = Arc::clone(&self.reg);
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
-		eprintln!(
+		gpu_core::log::line(gpu_core::log::Log::Info, &format!(
 			"recipe serve: {} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
@@ -650,7 +652,7 @@ impl Server {
 				.map(|a| a.to_string())
 				.unwrap_or_else(|_addr_err| "?".into()),
 			self.info.ram >> 20
-		);
+		));
 		self.serve_on(listener)
 	}
 
@@ -660,7 +662,9 @@ impl Server {
 			let srv = self.clone();
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
-					eprintln!("recipe serve: connection ended: {e}");
+					gpu_core::log::line(gpu_core::log::Log::Error, &format!(
+						"recipe serve: connection ended: {e}"
+					));
 				}
 			});
 		}

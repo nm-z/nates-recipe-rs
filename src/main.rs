@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 fn usage(code: i32) -> ! {
-	eprintln!("usage: recipe <file.rs> [args]  # compile + run");
-	eprintln!("       recipe serve            # daemon on 7845");
+	gpu_core::log::line(gpu_core::log::Log::Error, "usage: recipe <file.rs> [args]  # compile + run");
+	gpu_core::log::line(gpu_core::log::Log::Error, "       recipe serve            # daemon on 7845");
 	std::process::exit(code);
 }
 
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
 				std::process::exit(0);
 			}
 			Err(e) => {
-				eprintln!("probe child gpu{dev}: {e}");
+				gpu_core::log::line(gpu_core::log::Log::Error, &format!("probe child gpu{dev}: {e}"));
 				std::process::exit(2);
 			}
 		}
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
 			drop(mean);
 			drop(std);
 			gpu_core::memory::pool_trim();
-			eprintln!("setup-race iter {i}: clean");
+			gpu_core::log::line(gpu_core::log::Log::Info, &format!("setup-race iter {i}: clean"));
 		}
 		gpu_core::kernels::gpu_shutdown();
 		std::process::exit(0);

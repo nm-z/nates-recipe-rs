@@ -13,7 +13,7 @@ fn main() {
 		let v = back[i];
 		match (v - 0.5).abs().partial_cmp(&1e-12) {
 			Some(std::cmp::Ordering::Greater) => {
-				eprintln!("probe: mismatch at {i}: {v}");
+				gpu_core::log::line(gpu_core::log::Log::Error, &format!("probe: mismatch at {i}: {v}"));
 				std::process::exit(1);
 			}
 			Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) | None => {

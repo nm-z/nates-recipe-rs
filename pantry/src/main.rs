@@ -14,7 +14,7 @@ fn kind_name(k: usize) -> &'static str {
 fn main() -> Result<()> {
 	let paths: Vec<String> = std::env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		eprintln!("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
+		recipe_infer::log::line(recipe_infer::log::Log::Error, "usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
 		std::process::exit(1);
 	};
 
