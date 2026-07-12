@@ -31,7 +31,7 @@ fn log(t: &impl Display) {
 
 fn print(t: &impl Display) {
 	use std::io::Write as _;
-	drop(writeln!(std::io::stderr(), "\x1b[1;31m{t}\x1b[0m"));
+	drop(writeln!(std::io::stderr(), "{t}"));
 }
 
 mod Write {
