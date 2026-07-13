@@ -34,6 +34,25 @@ fn detect_platform() -> Platform {
 	}
 }
 
+// ROCm install discovery: explicit ROCM_PATH wins, then `hipconfig --path`
+// (authoritative on any box with HIP installed), then the documented /opt/rocm
+// default. link_amd appends /lib to this for the rustc link search.
+fn rocm_path() -> String {
+	match std::env::var("ROCM_PATH") {
+		Ok(p) => p,
+		Err(_e) => {
+			let out = std::process::Command::new("hipconfig").arg("--path").output();
+			let found = out.ok().filter(|o| o.status.success()).map(|o| {
+				String::from_utf8_lossy(&o.stdout).trim().to_string()
+			});
+			match found.filter(|p| !p.is_empty()) {
+				Some(p) => p,
+				None => "/opt/rocm".to_string(),
+			}
+		}
+	}
+}
+
 fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	let Ok(entries) = std::fs::read_dir(dir) else {
 		return;
@@ -212,7 +231,7 @@ fn main() {
 
 // ── AMD / ROCm backend ─────────────────────────────────────────────────────
 fn build_amd(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
-	let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_string());
+	let rocm = rocm_path();
 	let rocm_extra_inc =
 		std::env::var("ROCM_EXTRA_INCLUDE").unwrap_or_else(|_e| format!("{rocm}/include"));
 	let gpu_arch = std::env::var("GPU_ARCH").unwrap_or_else(|_e| "gfx1101".to_string());
@@ -254,7 +273,7 @@ fn build_amd(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
 }
 
 fn link_amd() {
-	let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_string());
+	let rocm = rocm_path();
 	let rocm_extra_lib =
 		std::env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
 	println!("cargo:rustc-link-search=native={rocm}/lib");
@@ -273,7 +292,7 @@ fn link_amd() {
 // instead (ROCm's bundled CCCL is version-skewed against the system one).
 // shim_nvidia.cu supplies the HIP host-runtime symbols.
 fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
-	let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_string());
+	let rocm = rocm_path();
 	let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
 	let hipcc = std::env::var("HIPCC").unwrap_or_else(|_e| format!("{rocm}/bin/hipcc"));
 	let nvcc = std::env::var("NVCC").unwrap_or_else(|_e| format!("{cuda}/bin/nvcc"));
