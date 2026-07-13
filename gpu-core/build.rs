@@ -1,6 +1,46 @@
 use std::path::{Path, PathBuf};
 
-include!("../hipdetect.rs");
+// Backend truth comes from hipconfig alone — runtime detection, not hardware:
+// no env overrides, no filesystem probes, no hardcoded default. Installing is
+// the package manager's job, never the build's: a missing or undecided HIP
+// runtime fails the build with the package names.
+#[derive(Clone, Copy)]
+enum Platform {
+	Amd,
+	Nvidia,
+}
+
+fn hipconfig(flag: &str) -> String {
+	let out = match std::process::Command::new("hipconfig").arg(flag).output() {
+		Ok(out) => out,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			panic!("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
+		}
+		Err(e) => panic!("hipconfig {flag}: cannot run: {e}"),
+	};
+	assert!(
+		out.status.success(),
+		"hipconfig {flag}: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn detect_platform() -> Platform {
+	match hipconfig("--platform").as_str() {
+		"amd" => Platform::Amd,
+		"nvidia" => Platform::Nvidia,
+		other => panic!(
+			"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
+		),
+	}
+}
+
+fn rocm_path() -> String {
+	let p = hipconfig("--rocmpath");
+	assert!(!p.is_empty(), "hipconfig --rocmpath: empty output");
+	p
+}
 
 fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	let Ok(entries) = std::fs::read_dir(dir) else {
@@ -147,7 +187,6 @@ fn archive(out_dir: &str, name: &str, objects: &[String]) {
 fn main() {
 	ban_direct_blas();
 	enforce_memory_chokepoints();
-	println!("cargo:rerun-if-changed=../hipdetect.rs");
 	let platform = detect_platform();
 	let out_dir = std::env::var("OUT_DIR").unwrap();
 
