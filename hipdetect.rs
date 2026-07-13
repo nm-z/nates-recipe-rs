@@ -1,9 +1,8 @@
 // Shared by every build.rs via include!(). Backend truth comes from hipconfig
 // alone — runtime detection, not hardware: no env overrides, no filesystem
-// probes, no hardcoded default. `hipconfig --platform` names the platform; an
-// empty answer defers to `hipconfig --runtime` (rocclr = AMD, cuda = NVIDIA),
-// i.e. whichever HIP runtime is installed. Anything else fails the build with
-// the raw output.
+// probes, no hardcoded default. Installing is the package manager's job, never
+// the build's: a missing or undecided HIP runtime fails the build with the
+// package names.
 #[derive(Clone, Copy)]
 enum Platform {
 	Amd,
@@ -11,10 +10,13 @@ enum Platform {
 }
 
 fn hipconfig(flag: &str) -> String {
-	let out = std::process::Command::new("hipconfig")
-		.arg(flag)
-		.output()
-		.unwrap_or_else(|e| panic!("hipconfig {flag}: cannot run: {e}"));
+	let out = match std::process::Command::new("hipconfig").arg(flag).output() {
+		Ok(out) => out,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			panic!("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
+		}
+		Err(e) => panic!("hipconfig {flag}: cannot run: {e}"),
+	};
 	assert!(
 		out.status.success(),
 		"hipconfig {flag}: {}",
@@ -27,12 +29,9 @@ fn detect_platform() -> Platform {
 	match hipconfig("--platform").as_str() {
 		"amd" => Platform::Amd,
 		"nvidia" => Platform::Nvidia,
-		"" => match hipconfig("--runtime").as_str() {
-			"rocclr" => Platform::Amd,
-			"cuda" => Platform::Nvidia,
-			other => panic!("hipconfig --runtime: unrecognized output {other:?}"),
-		},
-		other => panic!("hipconfig --platform: unrecognized output {other:?}"),
+		other => panic!(
+			"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
+		),
 	}
 }
 
