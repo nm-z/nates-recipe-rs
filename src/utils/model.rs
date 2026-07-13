@@ -573,7 +573,10 @@ impl Infer {
 		});
 		match &model.inner.gguf {
 			Some(path) => {
-				recipe_infer::llm::vram_probe_gate();
+				assert!(
+					std::env::var_os("VRAM_PROBE").is_none(),
+					"infer: VRAM_PROBE set — the binary's main must call recipe_infer::llm::vram_probe_ask() and exit with its code before run()"
+				);
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
 						crate::tui::chat(path);

@@ -44,6 +44,9 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+	if let Some(code) = recipe_infer::llm::vram_probe_ask() {
+		std::process::exit(code);
+	}
 	set_opt(Opt {
 		prompt: true,
 		gpu: true,

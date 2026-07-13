@@ -6,7 +6,10 @@ pub fn block_layout(t: u32) -> (usize, usize) {
 		8 => (34, 32),
 		12 => (144, 256),
 		14 => (210, 256),
-		_other => panic!("gguf: unsupported ggml type {t}"),
+		_other => {
+			gpu_core::log::Write::err(format!("gguf: unsupported ggml type {t}"));
+			std::process::abort()
+		}
 	}
 }
 
@@ -119,7 +122,10 @@ fn deqblock(t: u32, raw: &[u8], out: &mut Vec<f32>) {
 			}
 			out.extend_from_slice(&blk);
 		}
-		_other => panic!("gguf: dequant unsupported ggml type {t}"),
+		_other => {
+			gpu_core::log::Write::err(format!("gguf: dequant unsupported ggml type {t}"));
+			std::process::abort()
+		}
 	}
 }
 

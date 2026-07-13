@@ -108,17 +108,14 @@ fn str_kv(g: &Gguf, key: &str) -> Result<String> {
 	}
 }
 
-#[allow(dead_code)]
 struct LayerDims {
 	hd: usize,
 	nkv: usize,
 	rotary: usize,
-	theta: f64,
 	has_v: bool,
 	sliding: bool,
 }
 
-#[allow(dead_code)]
 struct Hparams {
 	arch: String,
 	nl: usize,
@@ -206,16 +203,15 @@ impl Hparams {
 		for l in 0..nl {
 			let sliding = pattern[l];
 			let has_v = g.tensors.contains_key(&format!("blk.{l}.attn_v.weight"));
-			let (hd, rotary, theta) = if sliding {
-				(key_length_swa, key_length_swa, freq_base_swa)
+			let (hd, rotary) = if sliding {
+				(key_length_swa, key_length_swa)
 			} else {
-				(key_length, 128, freq_base)
+				(key_length, 128)
 			};
 			dims.push(LayerDims {
 				hd,
 				nkv: head_count_kv[l],
 				rotary,
-				theta,
 				has_v,
 				sliding,
 			});
@@ -309,14 +305,31 @@ fn beat() {
 	BEAT.fetch_add(1, Ordering::Relaxed);
 }
 
-fn arm_watchdog() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-	let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-	let flag = armed.clone();
+struct Watchdog {
+	state: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Watchdog {
+	fn disarm(self) {
+		let (lock, cv) = &*self.state;
+		*lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+		cv.notify_all();
+	}
+}
+
+fn arm_watchdog() -> Watchdog {
+	let state = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+	let shared = state.clone();
 	std::thread::spawn(move || {
+		let (lock, cv) = &*shared;
+		let mut disarmed = lock.lock().unwrap_or_else(|p| p.into_inner());
 		let mut last = u64::MAX;
 		loop {
-			std::thread::sleep(std::time::Duration::from_secs(20));
-			if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+			let (g, _t) = cv
+				.wait_timeout(disarmed, std::time::Duration::from_secs(20))
+				.unwrap_or_else(|p| p.into_inner());
+			disarmed = g;
+			if *disarmed {
 				return;
 			}
 			let b = BEAT.load(Ordering::Relaxed);
@@ -329,7 +342,7 @@ fn arm_watchdog() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
 			last = b;
 		}
 	});
-	armed
+	Watchdog { state }
 }
 
 fn ekey(l: usize, e: usize) -> String {
@@ -551,11 +564,12 @@ impl Model {
 		Ok(())
 	}
 
-	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> GpuBuffer {
+	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> Result<GpuBuffer> {
 		let _w = Instant::now();
-		gpu_widen_bf16(&bview(src, off_bytes, n * 2), n, &self.win).expect("widen_bf16 launch");
+		gpu_widen_bf16(&bview(src, off_bytes, n * 2), n, &self.win)
+			.map_err(|e| anyhow!("widen_bf16 launch: {e:?}"))?;
 		acc(&WIDEN_NS, _w);
-		self.win.view(0, n)
+		Ok(self.win.view(0, n))
 	}
 
 	fn to_stage(&self, bytes: &[u8]) -> Result<()> {
@@ -569,14 +583,14 @@ impl Model {
 		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
 		let n = t.nbytes / 2;
 		match self.store.home(name) {
-			Some(Home::Vram(dev)) => Ok(self.widen_from(dev, 0, n)),
+			Some(Home::Vram(dev)) => self.widen_from(dev, 0, n),
 			Some(Home::Ram(bytes)) => {
 				self.to_stage(bytes)?;
-				Ok(self.widen_from(&self.stage, 0, n))
+				self.widen_from(&self.stage, 0, n)
 			}
 			_other => {
 				self.read_into(t, 0, t.nbytes, &self.stage, 0)?;
-				Ok(self.widen_from(&self.stage, 0, n))
+				self.widen_from(&self.stage, 0, n)
 			}
 		}
 	}
@@ -1084,10 +1098,10 @@ fn layer(
 		ar.moe_xg.load(&xg[..np * ne])?;
 		acc(&MOE_RT_NS, _rt);
 		let es = m.expert_slot(l, e)?;
-		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne);
+		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
 		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
 		gpu_glu_gelu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
-		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe);
+		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
 		let _rt = Instant::now();
 		unsafe {
@@ -1126,10 +1140,10 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	while c0 < hp.vocab {
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
 		let w = match m.store.home("model.decoder.embed_tokens.weight") {
-			Some(Home::Vram(dev)) => m.widen_from(dev, c0 * hp.ne * 2, cn * hp.ne),
+			Some(Home::Vram(dev)) => m.widen_from(dev, c0 * hp.ne * 2, cn * hp.ne)?,
 			_other => {
 				m.to_stage(&m.emb[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
-				m.widen_from(&m.stage, 0, cn * hp.ne)
+				m.widen_from(&m.stage, 0, cn * hp.ne)?
 			}
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
@@ -1147,21 +1161,18 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	Ok(logits)
 }
 
-pub fn vram_probe_gate() {
-	let Some(sz) = std::env::var_os("VRAM_PROBE") else {
-		return;
-	};
+pub fn vram_probe_ask() -> Option<i32> {
+	let sz = std::env::var_os("VRAM_PROBE")?;
 	if crate::init().is_err() {
-		std::process::exit(2);
+		return Some(2);
 	}
-	let n: usize = match sz.to_string_lossy().parse() {
-		Ok(n) => n,
-		Err(_e) => std::process::exit(2),
+	let Ok(n) = sz.to_string_lossy().parse::<usize>() else {
+		return Some(2);
 	};
-	std::process::exit(match GpuBuffer::try_alloc_bytes(n) {
+	Some(match GpuBuffer::try_alloc_bytes(n) {
 		Some(_kept) => 0,
 		None => 2,
-	});
+	})
 }
 
 pub fn generate(
@@ -1169,7 +1180,10 @@ pub fn generate(
 	prompt: &str,
 	on_round: &mut dyn FnMut(&[Tok]),
 ) -> Result<String> {
-	vram_probe_gate();
+	assert!(
+		std::env::var_os("VRAM_PROBE").is_none(),
+		"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work"
+	);
 	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 
 	let t_load = Instant::now();
@@ -1259,13 +1273,23 @@ pub fn generate(
 	preflight(&m, &ar, t)?;
 	Write::line(data, "waterfall fill");
 	fill_store(&mut m, claim)?;
-	watchdog.store(false, Ordering::Relaxed);
+	watchdog.disarm();
 	Write::line(gpu, format!("loaded in {:.1}s", t_load.elapsed().as_secs_f64()));
 	Write::line(
 		gpu,
 		format!(
-			"hparams arch={} nl={} ne={} experts={} canvas={} vocab={}",
-			m.hp.arch, m.hp.nl, m.hp.ne, m.hp.nexp, m.hp.ncanvas, m.hp.vocab
+			"hparams arch={} nl={} ne={} experts={} canvas={} vocab={} kd={}/{} vd={}/{} softcap={}",
+			m.hp.arch,
+			m.hp.nl,
+			m.hp.ne,
+			m.hp.nexp,
+			m.hp.ncanvas,
+			m.hp.vocab,
+			m.hp.key_length,
+			m.hp.key_length_swa,
+			m.hp.value_length,
+			m.hp.value_length_swa,
+			m.hp.softcap,
 		),
 	);
 
