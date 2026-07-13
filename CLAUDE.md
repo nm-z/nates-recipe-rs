@@ -133,8 +133,7 @@ recipe::eval(&model, &data);
 ## Gotchas
 
 - `kernel_inventory.db` (repo root, committed, ~3.7MB SQLite) is live test data for the gpu-core proof suite — ~20 tests fail without it (SUITE SPEC R10: a test reads only committed or self-created files; env-var paths banned; any #[ignore] reds the suite).
-- gpu-core duplicate-symbol link errors have two causes: stale old-named `.o` in OUT_DIR (delete them + libhipkernels.a, touch a .hip) or a genuine duplicate `extern "C"` definition across two .hip sources (delete the redundant source copy).
-- After adding a NEW .hip file, `touch` an existing one so build.rs re-discovers the set. build.rs must rebuild the archive from scratch each run (`ar r` never removes stale members).
+- gpu-core kernels compile through the `cc` crate (parallel feature, jobserver-shared): build.rs sweeps every `.o` + `libhip*.a` from OUT_DIR then recompiles the full set fresh, so a duplicate-symbol link error is always a genuine duplicate `extern "C"` definition across two .hip sources (delete the redundant source copy). `cargo:rerun-if-changed=src/kernels` watches the directory — new .hip files are discovered without touching anything.
 - rocPRIM in .hip files needs `#include <rocprim/rocprim.hpp>` AND `#include <cstring>`; device temp is caller-owned (`*_workspace_bytes` query + launcher taking tmp) — see reduce.hip.
 - FFI parity is the silent killer: C linkage matches names only; check per-slot type parity between every `.hip` launcher and its Rust decl.
 - Detector retrain: delete `pantry/detector.ogdl` first on a corpus change (best-only save guard blocks incomparable scores), and rebuild after training (`include_str!` bakes weights at compile time).

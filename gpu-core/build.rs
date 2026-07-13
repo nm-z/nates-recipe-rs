@@ -58,17 +58,6 @@ fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	}
 }
 
-fn needs_rebuild(src: &Path, obj: &str) -> Option<()> {
-	let src_mtime = std::fs::metadata(src).and_then(|m| m.modified()).ok();
-	let obj_mtime = std::fs::metadata(obj).and_then(|m| m.modified()).ok();
-	match src_mtime {
-		Some(s) => match obj_mtime {
-			Some(o) => Some(()).filter(|_u| s > o),
-			None => Some(()),
-		},
-		None => Some(()),
-	}
-}
 
 // The framework must call hipBLAS only — direct rocBLAS and cuBLAS are banned in
 // gpu-core's Rust sources. cuBLAS lives solely in shim_nvidia.cu (the NVIDIA
@@ -169,19 +158,24 @@ fn enforce_memory_chokepoints() {
 	}
 }
 
-fn archive(out_dir: &str, name: &str, objects: &[String]) {
-	let lib_path = format!("{out_dir}/lib{name}.a");
-	drop(std::fs::remove_file(&lib_path));
-	if objects.is_empty() {
+fn sweep(dir: &Path) {
+	let Ok(rd) = std::fs::read_dir(dir) else {
 		return;
+	};
+	for e in rd.flatten() {
+		let p = e.path();
+		match Some(()).filter(|_u| p.is_dir()) {
+			Some(()) => sweep(&p),
+			None => {
+				let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+				let stale = p.extension().is_some_and(|e| e == "o")
+					|| (name.starts_with("libhip") && name.ends_with(".a"));
+				if stale {
+					drop(std::fs::remove_file(&p));
+				}
+			}
+		}
 	}
-	let mut ar = std::process::Command::new("ar");
-	ar.args(["rcs", &lib_path]);
-	for obj in objects {
-		ar.arg(obj);
-	}
-	let status = ar.status().expect("ar failed");
-	assert!(status.success(), "ar failed for {lib_path}");
 }
 
 fn main() {
@@ -192,30 +186,15 @@ fn main() {
 
 	let mut hip_files = Vec::new();
 	collect_hip_files(Path::new("src/kernels"), &mut hip_files);
+	hip_files.sort();
+	println!("cargo:rerun-if-changed=src/kernels");
 
-	let mut objects = Vec::new();
+	sweep(Path::new(&out_dir));
 
 	match platform {
-		Platform::Amd => build_amd(&hip_files, &out_dir, &mut objects),
-		Platform::Nvidia => build_nvidia(&hip_files, &out_dir, &mut objects),
+		Platform::Amd => build_amd(&hip_files),
+		Platform::Nvidia => build_nvidia(&hip_files, &out_dir),
 	}
-
-	// Drop stale kernel/shim objects from previous builds (OUT_DIR .o files are
-	// exclusively ours, so a platform flip also sweeps the other backend's set).
-	for entries in std::fs::read_dir(&out_dir).into_iter() {
-		for entry in entries.flatten() {
-			let p = entry.path();
-			let stale = p.extension().is_some_and(|e| e == "o")
-				&& !objects.iter().any(|o| Path::new(o) == p);
-			if stale {
-				drop(std::fs::remove_file(&p));
-			}
-		}
-	}
-
-	archive(&out_dir, "hipkernels", &objects);
-	println!("cargo:rustc-link-search=native={}", out_dir);
-	println!("cargo:rustc-link-lib=static=hipkernels");
 
 	match platform {
 		Platform::Amd => link_amd(),
@@ -224,7 +203,7 @@ fn main() {
 }
 
 // ── AMD / ROCm backend ─────────────────────────────────────────────────────
-fn build_amd(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
+fn build_amd(hip_files: &[PathBuf]) {
 	let rocm = rocm_path();
 	let rocm_extra_inc =
 		std::env::var("ROCM_EXTRA_INCLUDE").unwrap_or_else(|_e| format!("{rocm}/include"));
@@ -237,33 +216,19 @@ fn build_amd(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
 		}
 	});
 
-	for src_path in hip_files {
-		let src = src_path.to_str().unwrap();
-		let rel = src_path.strip_prefix("src/kernels").unwrap();
-		let obj_name = rel.to_str().unwrap().replace(['/', '\\', '.'], "_");
-		let obj = format!("{}/{}.o", out_dir, obj_name);
-		println!("cargo:rerun-if-changed={}", src);
-		for _rebuild in needs_rebuild(src_path, &obj).into_iter() {
-			let status = std::process::Command::new(&hipcc)
-				.args([
-					"-x",
-					"hip",
-					&format!("--rocm-path={rocm}"),
-					&format!("-I{rocm_extra_inc}"),
-					"-c",
-					"-fPIC",
-					&format!("--offload-arch={gpu_arch}"),
-					"-O3",
-					src,
-					"-o",
-					&obj,
-				])
-				.status()
-				.expect("hipcc failed");
-			assert!(status.success(), "hipcc failed for {}", src);
-		}
-		objects.push(obj);
-	}
+	cc::Build::new()
+		.compiler(&hipcc)
+		.no_default_flags(true)
+		.warnings(false)
+		.flag("-x")
+		.flag("hip")
+		.flag(format!("--rocm-path={rocm}"))
+		.flag(format!("-I{rocm_extra_inc}"))
+		.flag("-fPIC")
+		.flag(format!("--offload-arch={gpu_arch}"))
+		.flag("-O3")
+		.files(hip_files)
+		.compile("hipkernels");
 }
 
 fn link_amd() {
@@ -285,7 +250,7 @@ fn link_amd() {
 // Files that pull rocPRIM/hipCUB go through plain nvcc + the nvidia_compat shims
 // instead (ROCm's bundled CCCL is version-skewed against the system one).
 // shim_nvidia.cu supplies the HIP host-runtime symbols.
-fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>) {
+fn build_nvidia(hip_files: &[PathBuf], out_dir: &str) {
 	let rocm = rocm_path();
 	let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
 	let hipcc = std::env::var("HIPCC").unwrap_or_else(|_e| format!("{rocm}/bin/hipcc"));
@@ -304,88 +269,79 @@ fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>)
 		format!("{nvhip}/hip"),
 	));
 
+	let cudir = format!("{out_dir}/cu");
+	drop(std::fs::remove_dir_all(&cudir));
+	std::fs::create_dir_all(&cudir).expect("mkdir cu");
+	let mut device_lib_cus = Vec::new();
+	let mut plain_cus = Vec::new();
 	for src_path in hip_files {
 		let src = src_path.to_str().unwrap();
 		let rel = src_path.strip_prefix("src/kernels").unwrap();
-		let obj_name = rel.to_str().unwrap().replace(['/', '\\', '.'], "_");
-		let obj = format!("{}/{}.o", out_dir, obj_name);
-		println!("cargo:rerun-if-changed={}", src);
-		for _rebuild in needs_rebuild(src_path, &obj).into_iter() {
-			let text = std::fs::read_to_string(src_path).unwrap_or_default();
-			let uses_device_lib = text.contains("rocprim") || text.contains("hipcub");
-			let cu = format!("{}/{}.cu", out_dir, obj_name);
-			std::fs::copy(src, &cu).expect("copy .hip -> .cu failed");
-			let status = match Some(()).filter(|_u| uses_device_lib) {
-				Some(()) => std::process::Command::new(&nvcc)
-					.args([
-						"-x",
-						"cu",
-						"-c",
-						"-O3",
-						&arch_flag,
-						"-diag-suppress",
-						"2810",
-						"-isystem",
-						&compat,
-						"-isystem",
-						&nvhip,
-						"-include",
-						&shfl_compat,
-						"-D__HIP_PLATFORM_NVIDIA__=1",
-						"-DTHRUST_IGNORE_CUB_VERSION_CHECK",
-						"-Xcompiler",
-						"-fPIC",
-						&cu,
-						"-o",
-						&obj,
-					])
-					.status()
-					.expect("nvcc (nvidia kernel) failed"),
-				None => std::process::Command::new(&hipcc)
-					.env("HIP_PLATFORM", "nvidia")
-					.args([
-						"-c",
-						"-fPIC",
-						"-O3",
-						&arch_flag,
-						"-diag-suppress",
-						"2810",
-						"-include",
-						&shfl_compat,
-						&cu,
-						"-o",
-						&obj,
-					])
-					.status()
-					.expect("hipcc (nvidia) failed"),
-			};
-			assert!(status.success(), "kernel compile failed for {}", src);
+		let cu_name = rel.to_str().unwrap().replace(['/', '\\', '.'], "_");
+		let cu = format!("{cudir}/{cu_name}.cu");
+		std::fs::copy(src, &cu).expect("copy .hip -> .cu failed");
+		let text = std::fs::read_to_string(src_path).unwrap_or_default();
+		match text.contains("rocprim") || text.contains("hipcub") {
+			true => device_lib_cus.push(cu),
+			false => plain_cus.push(cu),
 		}
-		objects.push(obj);
 	}
 
-	// HIP host-runtime shim.
-	let shim_src = Path::new("src/shim_nvidia.cu");
-	let shim_obj = format!("{}/shim_nvidia_shim.o", out_dir);
-	println!("cargo:rerun-if-changed=src/shim_nvidia.cu");
-	for _rebuild in needs_rebuild(shim_src, &shim_obj).into_iter() {
-		let status = std::process::Command::new(&nvcc)
-			.args([
-				"-c",
-				"-O3",
-				&arch_flag,
-				"-Xcompiler",
-				"-fPIC",
-				&format!("-I{cuda}/include"),
-				"src/shim_nvidia.cu",
-				"-o",
-				&shim_obj,
-			])
-			.status()
-			.expect("nvcc shim failed");
-		assert!(status.success(), "nvcc failed for shim_nvidia.cu");
+	if !device_lib_cus.is_empty() {
+		cc::Build::new()
+			.compiler(&nvcc)
+			.no_default_flags(true)
+			.warnings(false)
+			.flag("-x")
+			.flag("cu")
+			.flag("-O3")
+			.flag(&arch_flag)
+			.flag("-diag-suppress")
+			.flag("2810")
+			.flag("-isystem")
+			.flag(&compat)
+			.flag("-isystem")
+			.flag(&nvhip)
+			.flag("-include")
+			.flag(&shfl_compat)
+			.flag("-D__HIP_PLATFORM_NVIDIA__=1")
+			.flag("-DTHRUST_IGNORE_CUB_VERSION_CHECK")
+			.flag("-Xcompiler")
+			.flag("-fPIC")
+			.files(&device_lib_cus)
+			.compile("hipkernels_devlib");
 	}
-	objects.push(shim_obj);
+
+	if !plain_cus.is_empty() {
+		unsafe { std::env::set_var("HIP_PLATFORM", "nvidia") };
+		cc::Build::new()
+			.compiler(&hipcc)
+			.no_default_flags(true)
+			.warnings(false)
+			.flag("-fPIC")
+			.flag("-O3")
+			.flag(&arch_flag)
+			.flag("-diag-suppress")
+			.flag("2810")
+			.flag("-include")
+			.flag(&shfl_compat)
+			.files(&plain_cus)
+			.compile("hipkernels");
+		unsafe { std::env::remove_var("HIP_PLATFORM") };
+	}
+
+	println!("cargo:rerun-if-changed=src/shim_nvidia.cu");
+	cc::Build::new()
+		.compiler(&nvcc)
+		.no_default_flags(true)
+		.warnings(false)
+		.flag("-O3")
+		.flag(&arch_flag)
+		.flag("-Xcompiler")
+		.flag("-fPIC")
+		.flag(format!("-I{cuda}/include"))
+		.file("src/shim_nvidia.cu")
+		.compile("hipshim");
 }
 
 fn link_nvidia() {
