@@ -767,7 +767,7 @@ fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	let mut cache = FFT_CACHE
 		.get_or_init(|| Mutex::new(HashMap::new()))
 		.lock()
-		.expect("fft cache poisoned");
+		.unwrap_or_else(|p| p.into_inner());
 	let key = FftKey { fft_type, n };
 	let cached = cache.get(&key).map(|entry| entry.plan);
 	match cached {

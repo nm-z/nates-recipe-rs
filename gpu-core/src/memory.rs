@@ -132,13 +132,13 @@ fn oom_report(req: usize) {
 		&fmt_bytes(crate::hip::pool_slack(0).unwrap_or(0)),
 	));
 	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
-	Write::err(&line.join(", "));
-	Write::err(&format!(
+	drop(Write::err(&line.join(", ")));
+	drop(Write::err(&format!(
 		"{}, {}, {}",
 		oom_pair("H2D", &fmt_bytes(H2D_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2H", &fmt_bytes(D2H_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2D", &fmt_bytes(D2D_BYTES.load(Ordering::Relaxed))),
-	));
+	)));
 }
 
 struct FdinfoMem {
@@ -450,7 +450,10 @@ fn carve_image_front(image: &[f64]) {
 		return;
 	};
 	let _t = tag_scope("weights");
-	let _img = GpuBuffer::alloc(image.len()).expect("arena image carve");
+	let _img = GpuBuffer::alloc(image.len()).unwrap_or_else(|e| {
+		drop(Write::err(&format!("arena image carve: {e}")));
+		std::process::abort()
+	});
 }
 
 fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<(), HipError> {
@@ -488,18 +491,20 @@ pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
 }
 
 pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Option<GpuBuffer> {
-	assert_eq!(
-		ARENA_BASE.load(Ordering::Relaxed),
-		0,
-		"claim_device_arena: a device arena is already active"
-	);
+	if ARENA_BASE.load(Ordering::Relaxed) != 0 {
+		drop(Write::err("claim_device_arena: a device arena is already active"));
+		std::process::abort();
+	}
 	let _t = tag_scope("unclaimed");
 	while want > (1 << 20) {
 		match GpuBuffer::claim_map_bytes(want) {
 			Some(slab) => {
 				set_device_arena(slab.ptr_raw(), want);
 				carve_image_front(image);
-				commit_with_image(slab.ptr_raw(), want, image).expect("claim commit");
+				commit_with_image(slab.ptr_raw(), want, image).unwrap_or_else(|e| {
+					drop(Write::err(&format!("claim commit: {e}")));
+					std::process::abort()
+				});
 				return Some(slab);
 			}
 			None => want -= want / 16,
@@ -509,12 +514,14 @@ pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Op
 }
 
 pub fn release_device_arena(slab: GpuBuffer) {
-	assert_eq!(
-		ARENA_BASE.load(Ordering::Relaxed),
-		slab.ptr_addr(),
-		"release_device_arena: slab is not the active claim"
-	);
-	crate::hip::device_synchronize().expect("arena release sync");
+	if ARENA_BASE.load(Ordering::Relaxed) != slab.ptr_addr() {
+		drop(Write::err("release_device_arena: slab is not the active claim"));
+		std::process::abort();
+	}
+	crate::hip::device_synchronize().unwrap_or_else(|e| {
+		drop(Write::err(&format!("arena release sync: {e}")));
+		std::process::abort()
+	});
 	set_device_arena(std::ptr::null_mut(), 0);
 	drain_arena_carve();
 	drop(slab);
@@ -546,10 +553,10 @@ pub fn park_run_backing(buf: GpuBuffer) {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
 	};
-	assert!(
-		g.is_none(),
-		"park_run_backing: a parked run backing already exists"
-	);
+	if !g.is_none() {
+		drop(Write::err("park_run_backing: a parked run backing already exists"));
+		std::process::abort();
+	}
 	*g = Some(buf);
 	PARKED_GEN.store(
 		PARK_GEN.fetch_add(1, Ordering::Relaxed) + 1,
@@ -592,7 +599,10 @@ fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
 	};
 	match decision {
 		Disposition::DropForeign => {
-			crate::hip::device_synchronize().expect("parked release sync");
+			crate::hip::device_synchronize().unwrap_or_else(|e| {
+				drop(Write::err(&format!("parked release sync: {e}")));
+				std::process::abort()
+			});
 			drop(parked);
 			pool_trim();
 			None
@@ -616,7 +626,10 @@ pub fn adopt_run_backing(need: usize) -> Option<GpuBuffer> {
 pub fn adopt_run_backing_with_image(need: usize, image: &[f64]) -> Option<GpuBuffer> {
 	let slab = adopt_run_backing_inner(need)?;
 	carve_image_front(image);
-	commit_with_image(slab.ptr_raw(), slab.len(), image).expect("adopt commit");
+	commit_with_image(slab.ptr_raw(), slab.len(), image).unwrap_or_else(|e| {
+		drop(Write::err(&format!("adopt commit: {e}")));
+		std::process::abort()
+	});
 	Some(slab)
 }
 
@@ -632,7 +645,10 @@ pub fn release_run_backing() {
 	match ARENA_BASE.load(Ordering::Relaxed).cmp(&b.ptr_addr()) {
 		std::cmp::Ordering::Equal => release_device_arena(b),
 		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
-			crate::hip::device_synchronize().expect("parked release sync");
+			crate::hip::device_synchronize().unwrap_or_else(|e| {
+				drop(Write::err(&format!("parked release sync: {e}")));
+				std::process::abort()
+			});
 			drop(b);
 		}
 	}
@@ -806,7 +822,10 @@ fn grow_pin(g: &mut PinBuf, bytes: usize) {
 	for _old in std::num::NonZeroUsize::new(g.ptr).into_iter() {
 		unsafe { crate::hip::host_free(g.ptr as *mut c_void) }.ok();
 	}
-	g.ptr = crate::hip::host_malloc(bytes, 0).expect("run_pin host_malloc") as usize;
+	g.ptr = crate::hip::host_malloc(bytes, 0).unwrap_or_else(|e| {
+		drop(Write::err(&format!("run_pin host_malloc: {e}")));
+		std::process::abort()
+	}) as usize;
 	g.cap = bytes;
 }
 
@@ -938,11 +957,14 @@ pub struct ExitD2H {
 
 impl ExitD2H {
 	pub fn finish(self, dst: &mut [f64]) {
-		assert_eq!(
-			std::mem::size_of_val(dst),
-			self.bytes,
-			"ExitD2H::finish size mismatch"
-		);
+		if std::mem::size_of_val(dst) != self.bytes {
+			drop(Write::err(&format!(
+				"ExitD2H::finish size mismatch: {} vs {}",
+				std::mem::size_of_val(dst),
+				self.bytes
+			)));
+			std::process::abort();
+		}
 		par_copy(
 			dst.as_mut_ptr() as *mut u8,
 			self.pin as *const u8,
@@ -996,7 +1018,7 @@ pub(crate) fn device_init_once() {
 	DEVICE_INIT.call_once(|| {
 		crate::hip::disable_sdma_once();
 		for e in crate::hip::set_pool_retain(0).err().into_iter() {
-			Write::err(&format!("GPU pool retain failed: {e}"));
+			drop(Write::err(&format!("GPU pool retain failed: {e}")));
 		}
 		crate::hip::register_fault_autopsy_once();
 		crate::hw::spawn_thrash_watchdog();
@@ -1004,16 +1026,28 @@ pub(crate) fn device_init_once() {
 }
 
 pub fn pool_trim() {
-	crate::hip::device_synchronize().expect("pool_trim sync");
-	crate::hip::trim_mempool(0).expect("pool_trim");
+	crate::hip::device_synchronize().unwrap_or_else(|e| {
+		drop(Write::err(&format!("pool_trim sync: {e}")));
+		std::process::abort()
+	});
+	crate::hip::trim_mempool(0).unwrap_or_else(|e| {
+		drop(Write::err(&format!("pool_trim: {e}")));
+		std::process::abort()
+	});
 }
 
 pub const USER_GB: usize = 1 << 30;
 
 pub fn vram_free_base() -> usize {
-	let hip_free = crate::hip::mem_info().expect("hipMemGetInfo").free;
+	let hip_free = crate::hip::mem_info().unwrap_or_else(|e| {
+		drop(Write::err(&format!("hipMemGetInfo: {e}")));
+		std::process::abort()
+	}).free;
 	let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
-	let slack = crate::hip::pool_slack(0).expect("pool_slack");
+	let slack = crate::hip::pool_slack(0).unwrap_or_else(|e| {
+		drop(Write::err(&format!("pool_slack: {e}")));
+		std::process::abort()
+	});
 	hip_free.min(sys_free).saturating_sub(slack)
 }
 
@@ -1103,10 +1137,13 @@ impl GpuBuffer {
 			Err(e) => {
 				oom_report(n_bytes);
 				match std::num::NonZeroUsize::new(ARENA_BASE.load(Ordering::Relaxed)) {
-					Some(_active) => panic!(
-						"arena carve miss: {n_bytes} B asked, {} B remain — placement exceeded the claim",
-						arena_remaining()
-					),
+					Some(_active) => {
+						drop(Write::err(&format!(
+							"arena carve miss: {n_bytes} B asked, {} B remain — placement exceeded the claim",
+							arena_remaining()
+						)));
+						std::process::abort();
+					}
 					None => Err(e),
 				}
 			}
@@ -1123,10 +1160,12 @@ impl GpuBuffer {
 	fn alloc_bytes_inner(n_bytes: usize) -> Result<Self, HipError> {
 		device_init_once();
 		ALLOC_FROZEN.with(|f| {
-			assert!(
-				matches!(f.get(), Frozen::No),
-				"GPU allocation inside frozen training loop (requested {n_bytes} bytes)"
-			)
+			if !matches!(f.get(), Frozen::No) {
+				drop(Write::err(&format!(
+					"GPU allocation inside frozen training loop (requested {n_bytes} bytes)"
+				)));
+				std::process::abort();
+			}
 		});
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
@@ -1175,16 +1214,17 @@ impl GpuBuffer {
 	pub(crate) fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
 		device_init_once();
 		ALLOC_FROZEN.with(|f| {
-			assert!(
-				matches!(f.get(), Frozen::No),
-				"GPU claim inside frozen training loop (requested {n_bytes} bytes)"
-			)
+			if !matches!(f.get(), Frozen::No) {
+				drop(Write::err(&format!(
+					"GPU claim inside frozen training loop (requested {n_bytes} bytes)"
+				)));
+				std::process::abort();
+			}
 		});
-		assert_eq!(
-			ARENA_BASE.load(Ordering::Relaxed),
-			0,
-			"claim_map_bytes: a device arena is already active"
-		);
+		if ARENA_BASE.load(Ordering::Relaxed) != 0 {
+			drop(Write::err("claim_map_bytes: a device arena is already active"));
+			std::process::abort();
+		}
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
 		let tag = CURRENT_TAG.with(|t| t.get());
 		let remaining = vram_free_base();
@@ -1204,12 +1244,14 @@ impl GpuBuffer {
 	}
 
 	pub fn write_u8(&self, data: &[u8]) -> Result<(), HipError> {
-		assert!(
-			data.len() <= self.len,
-			"write_u8: {} bytes into a {}-byte buffer",
-			data.len(),
-			self.len
-		);
+		if !(data.len() <= self.len) {
+			drop(Write::err(&format!(
+				"write_u8: {} bytes into a {}-byte buffer",
+				data.len(),
+				self.len
+			)));
+			std::process::abort();
+		}
 		unsafe {
 			xfer(
 				self.ptr,
@@ -1223,11 +1265,13 @@ impl GpuBuffer {
 
 	pub fn load(&self, data: &[f64]) -> Result<(), HipError> {
 		let bytes = std::mem::size_of_val(data);
-		assert!(
-			bytes <= self.len,
-			"load: {bytes} bytes into a {}-byte buffer",
-			self.len
-		);
+		if !(bytes <= self.len) {
+			drop(Write::err(&format!(
+				"load: {bytes} bytes into a {}-byte buffer",
+				self.len
+			)));
+			std::process::abort();
+		}
 		unsafe {
 			xfer(
 				self.ptr,
@@ -1339,12 +1383,14 @@ impl GpuBuffer {
 	}
 
 	pub fn as_ptr_offset(&self, n_floats: usize) -> *mut c_void {
-		assert!(
-			n_floats * 8 <= self.len,
-			"as_ptr_offset: offset {} bytes exceeds buffer len {}",
-			n_floats * 8,
-			self.len
-		);
+		if !(n_floats * 8 <= self.len) {
+			drop(Write::err(&format!(
+				"as_ptr_offset: offset {} bytes exceeds buffer len {}",
+				n_floats * 8,
+				self.len
+			)));
+			std::process::abort();
+		}
 		unsafe { (self.ptr as *mut u8).add(n_floats * 8) as *mut c_void }
 	}
 
@@ -1477,10 +1523,10 @@ impl Drop for GpuBuffer {
 		crate::callspy::tick(&crate::callspy::FREE_ASYNC);
 		let code = unsafe { hipFreeAsync(self.ptr, std::ptr::null_mut()) };
 		for _fail in std::num::NonZeroI32::new(code).into_iter() {
-			Write::err(&format!(
+			drop(Write::err(&format!(
 				"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:p}",
 				self.len, self.tag, self.ptr
-			));
+			)));
 		}
 		self.ptr = std::ptr::null_mut();
 	}

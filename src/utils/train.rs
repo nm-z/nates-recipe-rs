@@ -212,11 +212,11 @@ impl ModelInner {
 		};
 		let ask_overwrite = |what: &str| -> YesNo {
 			use std::io::Write as _;
-			Write::err("resume");
-			Write::err("    data does not match");
-			Write::err(&format!("        {what}"));
-			Write::err(&format!("        file path={}", resume.unwrap_or("")));
-			Write::err(&format!("        data path={}", dat.source));
+			drop(Write::err("resume"));
+			drop(Write::err("    data does not match"));
+			drop(Write::err(&format!("        {what}")));
+			drop(Write::err(&format!("        file path={}", resume.unwrap_or(""))));
+			drop(Write::err(&format!("        data path={}", dat.source)));
 			let Some(_tty) = Some(()).filter(|_probe| std::io::stdin().is_terminal()) else {
 				return YesNo::No;
 			};
@@ -271,10 +271,11 @@ impl ModelInner {
 			.filter(|_probe| expand_ce)
 			.map(|_probe| out_dim)
 			.unwrap_or(n_targets);
-		assert_eq!(
-			out_dim, k,
+		if out_dim != k {
+			Write::err(format!(
 			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
-		);
+			))?;
+		}
 		let yp = {
 			let ys =
 				dat.y.as_slice()
@@ -375,7 +376,12 @@ impl ModelInner {
 						let s = sc_host
 							.as_ref()
 							.ok_or_else(|| anyhow::anyhow!("rerun without scaler"))?;
-						assert_eq!(s.mean.len(), d_sc, "rerun: feature count changed");
+						if s.mean.len() != d_sc {
+							Write::err(format!(
+								"rerun: feature count changed: {} vs {d_sc}",
+								s.mean.len()
+							))?;
+						}
 						let scaled = recipe_infer::zscore_apply_host(
 							sl, n, d_sc, &s.mean, &s.std,
 						);
@@ -540,7 +546,7 @@ impl ModelInner {
 					.filter(|_probe| summary_graph.is_some())
 					.map(|_probe| {
 						for g in summary_graph.iter() {
-							Write::block(data, g);
+							Write::block(data, &g.serialize());
 						}
 						Write::line(gpu, &format!(
 							"roofline  gemm {} GF/s  vram {} GB/s",
@@ -701,9 +707,9 @@ impl ModelInner {
 						let lossv = val_of(Metric::Loss, e);
 						match Some(()).filter(|_probe| lossv.is_nan()) {
 							Some(_nan) => {
-								Write::err(&format!(
+								drop(Write::err(&format!(
 									"NaN loss at epoch {e} — stopping (weights diverged)"
-								));
+								)));
 								Halt::Stop
 							}
 							None => {
@@ -883,17 +889,17 @@ impl ModelInner {
 			Write::line(device, "-- hip init --");
 			Write::block(
 				device,
-				&gpu_core::callspy::report_between(&b0, &init),
+				&gpu_core::callspy::report_between(&b0, &init).serialize(),
 			);
 			Write::line(device, "-- hip loop --");
 			Write::block(
 				device,
-				&gpu_core::callspy::report_between(&init, &lp),
+				&gpu_core::callspy::report_between(&init, &lp).serialize(),
 			);
 			Write::line(device, "-- hip exit --");
 			Write::block(
 				device,
-				&gpu_core::callspy::report_between(&lp, &exit),
+				&gpu_core::callspy::report_between(&lp, &exit).serialize(),
 			);
 			Some(())
 		};
@@ -976,8 +982,20 @@ impl ModelInner {
 			b
 		};
 		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> GpuBuffer {
-			assert_eq!(sc.mean.len(), cols, "eval: feature count changed");
-			assert_eq!(sc.std.len(), cols, "eval: feature count changed");
+			if sc.mean.len() != cols {
+				drop(Write::err(format!(
+					"eval: feature count changed: {} vs {cols}",
+					sc.mean.len()
+				)));
+				std::process::abort();
+			}
+			if sc.std.len() != cols {
+				drop(Write::err(format!(
+					"eval: feature count changed: {} vs {cols}",
+					sc.std.len()
+				)));
+				std::process::abort();
+			}
 			let mut st = Stage::new();
 			let m_off = st.push(&sc.mean);
 			let s_off = st.push(&sc.std);

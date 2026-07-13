@@ -2,6 +2,7 @@ use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
 use anyhow::Context;
 use gpu_core::kernels;
+use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 
 pub const SCRATCH_CONSTS: [f64; 12] = [
@@ -94,22 +95,26 @@ pub fn layer_ms_from(
 	let f = (0..layers)
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
-			assert!(
-				e.is_ok(),
-				"fwd elapsed: {}",
-				e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
-			);
+			if !e.is_ok() {
+				drop(Write::err(format!(
+					"fwd elapsed: {}",
+					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+				)));
+				std::process::abort();
+			}
 			e.unwrap_or(0.0) as f64
 		})
 		.collect();
 	let b = (0..layers)
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]);
-			assert!(
-				e.is_ok(),
-				"bwd elapsed: {}",
-				e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
-			);
+			if !e.is_ok() {
+				drop(Write::err(format!(
+					"bwd elapsed: {}",
+					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+				)));
+				std::process::abort();
+			}
 			e.unwrap_or(0.0) as f64
 		})
 		.collect();
@@ -386,11 +391,13 @@ impl Scratch {
 			let r = unsafe {
 				self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
 			};
-			assert!(
-				r.is_ok(),
-				"record fwd event: {}",
-				r.err().map(|e| e.to_string()).unwrap_or_default()
-			);
+			if !r.is_ok() {
+				drop(Write::err(format!(
+					"record fwd event: {}",
+					r.err().map(|e| e.to_string()).unwrap_or_default()
+				)));
+				std::process::abort();
+			}
 		}
 	}
 
@@ -399,22 +406,26 @@ impl Scratch {
 			let r = unsafe {
 				self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
 			};
-			assert!(
-				r.is_ok(),
-				"record bwd event: {}",
-				r.err().map(|e| e.to_string()).unwrap_or_default()
-			);
+			if !r.is_ok() {
+				drop(Write::err(format!(
+					"record bwd event: {}",
+					r.err().map(|e| e.to_string()).unwrap_or_default()
+				)));
+				std::process::abort();
+			}
 		}
 	}
 
 	pub fn layer_ms(&self, layers: usize) -> LayerMs {
 		let s = self.timing_slot.get();
 		let r = self.ev_bwd[s][0].synchronize();
-		assert!(
-			r.is_ok(),
-			"sync bwd event: {}",
-			r.err().map(|e| e.to_string()).unwrap_or_default()
-		);
+		if !r.is_ok() {
+			drop(Write::err(format!(
+				"sync bwd event: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
@@ -451,11 +462,13 @@ impl Scratch {
 
 	pub fn sync_deferred_scalar(&self) -> f64 {
 		let r = self.copy_stream.synchronize();
-		assert!(
-			r.is_ok(),
-			"sync copy stream: {}",
-			r.err().map(|e| e.to_string()).unwrap_or_default()
-		);
+		if !r.is_ok() {
+			drop(Write::err(format!(
+				"sync copy stream: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		unsafe { *self.pinned_scalar }
 	}
 
@@ -466,11 +479,13 @@ impl Scratch {
 
 	pub fn sync_copy_stream(&self) {
 		let r = self.copy_stream.synchronize();
-		assert!(
-			r.is_ok(),
-			"sync copy stream: {}",
-			r.err().map(|e| e.to_string()).unwrap_or_default()
-		);
+		if !r.is_ok() {
+			drop(Write::err(format!(
+				"sync copy stream: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 	}
 
 	pub fn deferred_scalar(&self) -> f64 {
@@ -544,11 +559,13 @@ fn pinned_scalar_pair() -> *mut f64 {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
 	if *g == 0 {
 		let hm = gpu_core::hip::host_malloc(16, 0);
-		assert!(
-			hm.is_ok(),
-			"pinned scalars: {}",
-			hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
-		);
+		if !hm.is_ok() {
+			drop(Write::err(format!(
+				"pinned scalars: {}",
+				hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		*g = hm.unwrap_or(std::ptr::null_mut()) as usize;
 	}
 	*g as *mut f64
@@ -743,8 +760,8 @@ pub fn vram_estimate(
 								.max(1)
 						}
 						None => {
-							assert!(false, "conv cin");
-							0
+							drop(Write::err("conv cin"));
+							std::process::abort();
 						}
 					}
 				} else {

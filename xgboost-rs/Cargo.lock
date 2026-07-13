@@ -31,6 +31,9 @@ name = "gpu-core"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
+ "log",
+ "ogdl",
 ]
 
 [[package]]
@@ -49,6 +52,14 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "log"
+version = "1.0.0"
+
+[[package]]
+name = "ogdl"
+version = "0.1.0"
 
 [[package]]
 name = "ppv-lite86"

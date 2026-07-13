@@ -1,3 +1,4 @@
+use crate::log::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
@@ -153,7 +154,10 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 		let i = ALL
 			.iter()
 			.position(|x| std::ptr::eq(*x, c))
-			.expect("counter registered in ALL");
+			.unwrap_or_else(|| {
+				drop(Write::err("callspy: counter not registered in ALL"));
+				std::process::abort()
+			});
 		end[i].saturating_sub(base[i])
 	};
 	let groups: &[CounterGroup] = &[
@@ -418,7 +422,10 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let idx = |c: &AtomicU64| {
 		ALL.iter()
 			.position(|x| std::ptr::eq(*x, c))
-			.expect("counter registered in ALL")
+			.unwrap_or_else(|| {
+				drop(Write::err("callspy: counter not registered in ALL"));
+				std::process::abort()
+			})
 	};
 	let cell = |a: &[u64; N], b: &[u64; N], cs: &[&AtomicU64]| -> u64 {
 		cs.iter().map(|c| b[idx(c)].saturating_sub(a[idx(c)])).sum()

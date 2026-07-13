@@ -1,4 +1,4 @@
-use recipe_infer::log::{Write, data};
+use recipe_infer::log::{Errored, Write, data};
 use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -112,21 +112,21 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	};
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
-	let Some(_headroom) = avail.checked_sub(proj) else {
-		Write::err("csv too large to parse into RAM");
-		Write::err(&format!(
+	if avail.checked_sub(proj).is_none() {
+		drop(Write::err("csv too large to parse into RAM"));
+		drop(Write::err(format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		));
-		panic!(
+		)));
+		Write::err(format!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
 			human_bytes(proj),
 			human_bytes(avail)
-		);
-	};
+		))?;
+	}
 	let na = |cell: &str| match cell {
 		"NA" | "NaN" | "nan" => String::new(),
 		s => s.to_string(),
@@ -184,21 +184,21 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let est_rows = count_lines(path)?;
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
-	let Some(_headroom) = avail.checked_sub(proj) else {
-		Write::err("csv too large to parse into RAM");
-		Write::err(&format!(
+	if avail.checked_sub(proj).is_none() {
+		drop(Write::err("csv too large to parse into RAM"));
+		drop(Write::err(format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		));
-		panic!(
+		)));
+		Write::err(format!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
 			human_bytes(proj),
 			human_bytes(avail)
-		);
-	};
+		))?;
+	}
 	let na = |cell: &str| match cell {
 		"NA" | "NaN" | "nan" => String::new(),
 		s => s.to_string(),
@@ -409,7 +409,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					Write::err(&format!("WARN: skipping {}: {e}", hp.path.display()));
+					drop(Write::err(format!("WARN: skipping {}: {e}", hp.path.display())));
 					None
 				}
 			})
@@ -464,7 +464,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 	let pb = ProgressBar::new(total as u64);
 	pb.set_style(
 		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
-			.expect("progress template")
+			.map_err(|e| Errored::new(format!("progress template: {e}")))?
 			.progress_chars("=>-"),
 	);
 	pb.enable_steady_tick(std::time::Duration::from_millis(120));
@@ -499,7 +499,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					Write::err(&format!("WARN: skipping image {}: {e}", p.display()));
+					drop(Write::err(format!("WARN: skipping image {}: {e}", p.display())));
 					vec![f64::NAN; dim]
 				}
 			};
@@ -614,18 +614,30 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 		.map(str::to_ascii_lowercase);
 	let ext_ref = ext.as_deref();
 	if ext_ref == Some("zip") {
-		return load_zip_groups(path).expect("load zip");
+		return load_zip_groups(path).unwrap_or_else(|e| {
+			drop(Write::err(format!("load zip: {e}")));
+			std::process::abort();
+		});
 	}
 	if matches!(ext_ref, Some("db" | "sqlite")) {
-		return load_sqlite_groups(path).expect("load sqlite");
+		return load_sqlite_groups(path).unwrap_or_else(|e| {
+			drop(Write::err(format!("load sqlite: {e}")));
+			std::process::abort();
+		});
 	}
 	if p.is_dir() {
-		return load_dir_groups(path).expect("load dir");
+		return load_dir_groups(path).unwrap_or_else(|e| {
+			drop(Write::err(format!("load dir: {e}")));
+			std::process::abort();
+		});
 	}
 	let RawCsv {
 		headers,
 		rows: cells,
-	} = read_raw_csv(p).expect("read csv");
+	} = read_raw_csv(p).unwrap_or_else(|e| {
+		drop(Write::err(format!("read csv: {e}")));
+		std::process::abort();
+	});
 	let hashes = vec![String::new(); cells.len()];
 	vec![DirGroup::Table {
 		name: String::new(),
@@ -676,16 +688,20 @@ fn parse_attribute(line: &str) -> Attr {
 	let rest = line["@attribute".len()..].trim();
 	let ns = match rest.strip_prefix('\'') {
 		Some(r) => {
-			let end = r.find('\'').expect("attribute: unterminated quoted name");
+			let Some(end) = r.find('\'') else {
+				drop(Write::err("attribute: unterminated quoted name"));
+				std::process::abort();
+			};
 			NameSpec {
 				name: r[..end].to_string(),
 				spec: r[end + 1..].trim().to_string(),
 			}
 		}
 		None => {
-			let end = rest
-				.find(char::is_whitespace)
-				.expect("attribute: missing type");
+			let Some(end) = rest.find(char::is_whitespace) else {
+				drop(Write::err("attribute: missing type"));
+				std::process::abort();
+			};
 			NameSpec {
 				name: rest[..end].to_string(),
 				spec: rest[end..].trim().to_string(),
@@ -721,9 +737,11 @@ pub fn parse_arff(path: &str) -> ArffTable {
 				.file_name()
 				.and_then(|s| s.to_str())
 				.unwrap_or(path);
-			panic!("couldn't find '{name}' in {cwd}");
+			drop(Write::err(format!("couldn't find '{name}' in {cwd}")));
+			std::process::abort();
 		}
-		panic!("Data: cannot read {path}: {e}");
+		drop(Write::err(format!("Data: cannot read {path}: {e}")));
+		std::process::abort();
 	});
 	let mut attrs = Vec::new();
 	let mut rows = Vec::new();
@@ -753,8 +771,14 @@ pub fn parse_arff(path: &str) -> ArffTable {
 			}
 		}
 	}
-	assert!(!attrs.is_empty(), "Data: no @attribute lines in {path}");
-	assert!(!rows.is_empty(), "Data: no @data rows in {path}");
+	if attrs.is_empty() {
+		drop(Write::err(format!("Data: no @attribute lines in {path}")));
+		std::process::abort();
+	}
+	if rows.is_empty() {
+		drop(Write::err(format!("Data: no @data rows in {path}")));
+		std::process::abort();
+	}
 	ArffTable { attrs, rows }
 }
 
@@ -827,7 +851,8 @@ pub fn load_image_dir(dir: &str, width: u32, height: u32) -> Result<Mat> {
 
 	for path in &paths {
 		let row = image_to_row(
-			path.to_str().expect("image path is not valid UTF-8"),
+			path.to_str()
+				.ok_or_else(|| Errored::new("image path is not valid UTF-8"))?,
 			width,
 			height,
 		)?;
@@ -856,10 +881,11 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 	let names: Vec<String> = subdirs
 		.iter()
 		.map(|p| {
-			p.file_name()
-				.expect("subdir path has no filename component")
-				.to_string_lossy()
-				.into_owned()
+			let Some(fname) = p.file_name() else {
+				drop(Write::err("subdir path has no filename component"));
+				std::process::abort();
+			};
+			fname.to_string_lossy().into_owned()
 		})
 		.collect();
 	let non_float = names.iter().find(|n| n.parse::<f64>().is_err());
@@ -868,8 +894,12 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 		None => names
 			.iter()
 			.map(|n| {
-				n.parse()
-					.expect("subdir name failed f64 parse after all_float check")
+				n.parse().unwrap_or_else(|e| {
+					drop(Write::err(format!(
+						"subdir name failed f64 parse after all_float check: {e}"
+					)));
+					std::process::abort();
+				})
 			})
 			.collect(),
 		Some(_nf) => (0..names.len()).map(|i| i as f64).collect(),
@@ -883,11 +913,14 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 	for subdir in &subdirs {
 		let label = label_map[idx];
 		idx += 1;
-		let subdir_str = subdir.to_str().expect("subdir path is not valid UTF-8");
+		let subdir_str = subdir
+			.to_str()
+			.ok_or_else(|| Errored::new("subdir path is not valid UTF-8"))?;
 		let paths = collect_image_paths(subdir_str)?;
 		for path in &paths {
 			let row = image_to_row(
-				path.to_str().expect("image path is not valid UTF-8"),
+				path.to_str()
+					.ok_or_else(|| Errored::new("image path is not valid UTF-8"))?,
 				width,
 				height,
 			)?;

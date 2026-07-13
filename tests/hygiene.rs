@@ -4,7 +4,40 @@ use std::path::{Path, PathBuf};
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const SRC_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src"];
-const COMMENT_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "gpu-core/src"];
+const COMMENT_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "gpu-core/src", "log/src"];
+const MACRO_ROOTS: &[&str] = &[
+	"src",
+	"gpu-core/src",
+	"recipe-infer/src",
+	"pantry/src",
+	"log/src",
+	"ogdl/src",
+	"vramspy/src",
+	"catboost-rs/src",
+	"lightgbm-rs/src",
+	"xgboost-rs/src",
+];
+const BANNED_MACROS: &[&str] = &[
+	"print!",
+	"println!",
+	"eprint!",
+	"eprintln!",
+	"dbg!",
+	"panic!",
+	"assert!",
+	"assert_eq!",
+	"assert_ne!",
+	"debug_assert!",
+	"debug_assert_eq!",
+	"debug_assert_ne!",
+	"todo!",
+	"unimplemented!",
+	"unreachable!",
+];
+const BANNED_CALLS: &[&str] = &[".unwrap()", ".expect("];
+const LOG_SRC: &str = "log/src/lib.rs";
+const LOG_WRITELN_BUDGET: usize = 2;
+const LOG_EXPECT_BUDGET: usize = 3;
 const KERNEL_ROOTS: &[&str] = &["gpu-core/src/kernels"];
 const LEAK_ROOTS: &[&str] = &["src", "recipe-infer/src", "ogdl/src", "examples"];
 const LIB_ROOTS: &[&str] = &["src/lib.rs", "src/utils", "recipe-infer/src", "ogdl/src"];
@@ -1020,6 +1053,87 @@ fn h33_single_log_file() {
 		let hits: Vec<String> = logs.iter().map(|p| rel(p)).collect();
 		assert_absent("multiple .log files in repo root", &hits);
 	}
+}
+
+fn budget_lines(p: &Path) -> Vec<String> {
+	let src = read(p);
+	let (m, is_test) = non_test_lines(&src);
+	(0..m.nlines())
+		.map(|l| {
+			if is_test[l] {
+				String::new()
+			} else {
+				m.code_only(l)
+			}
+		})
+		.collect()
+}
+
+fn count_in(p: &Path, tok: &str) -> Vec<String> {
+	budget_lines(p)
+		.iter()
+		.enumerate()
+		.flat_map(|(i, l)| {
+			let n = l
+				.match_indices(tok)
+				.filter(|(k, _)| {
+					let b = l.as_bytes();
+					*k == 0 || !(b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_')
+				})
+				.count();
+			std::iter::repeat_n(format!("{}:{}: {tok}", rel(p), i + 1), n)
+		})
+		.collect()
+}
+
+#[test]
+fn h36_no_banned_macro_anywhere() {
+	let mut hits = Vec::new();
+	for p in rs_files(MACRO_ROOTS) {
+		if path_contains(&p, "test") {
+			continue;
+		}
+		for tok in BANNED_MACROS {
+			hits.extend(count_in(&p, tok));
+		}
+		if !rel(&p).starts_with("log/") {
+			for tok in BANNED_CALLS {
+				hits.extend(count_in(&p, tok));
+			}
+		}
+	}
+	assert_absent("banned macro or crash call (route through log::Write)", &hits);
+}
+
+#[test]
+fn h37_log_crate_budgets() {
+	let log_lib = Path::new(ROOT).join(LOG_SRC);
+	let expects = count_in(&log_lib, ".expect(");
+	assert!(
+		expects.len() <= LOG_EXPECT_BUDGET,
+		"FAIL: {} .expect( in {LOG_SRC}, budget {LOG_EXPECT_BUDGET}\n  {}",
+		expects.len(),
+		expects.join("\n  ")
+	);
+	let unwraps = count_in(&log_lib, ".unwrap()");
+	assert_absent("unwrap in log crate", &unwraps);
+	let mut writelns = Vec::new();
+	for p in rs_files(MACRO_ROOTS) {
+		if path_contains(&p, "test") {
+			continue;
+		}
+		let w = count_in(&p, "writeln!");
+		if rel(&p) == LOG_SRC {
+			assert!(
+				w.len() <= LOG_WRITELN_BUDGET,
+				"FAIL: {} writeln! in {LOG_SRC}, budget {LOG_WRITELN_BUDGET}",
+				w.len()
+			);
+		} else {
+			writelns.extend(w);
+		}
+	}
+	assert_absent("writeln! outside the log crate", &writelns);
 }
 
 #[test]

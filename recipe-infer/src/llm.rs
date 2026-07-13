@@ -288,10 +288,10 @@ struct Tensor {
 }
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
-	assert!(
-		off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8),
-		"bview: unaligned {off_bytes}/{len_bytes}"
-	);
+	if !(off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8)) {
+		drop(Write::err(format!("bview: unaligned {off_bytes}/{len_bytes}")));
+		std::process::abort();
+	}
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
 
@@ -334,9 +334,9 @@ fn arm_watchdog() -> Watchdog {
 			}
 			let b = BEAT.load(Ordering::Relaxed);
 			if b == last {
-				Write::err(
+				drop(Write::err(
 					"LOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting.",
-				);
+				));
 				std::process::abort();
 			}
 			last = b;
@@ -1180,10 +1180,11 @@ pub fn generate(
 	prompt: &str,
 	on_round: &mut dyn FnMut(&[Tok]),
 ) -> Result<String> {
-	assert!(
-		std::env::var_os("VRAM_PROBE").is_none(),
-		"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work"
-	);
+	if !std::env::var_os("VRAM_PROBE").is_none() {
+		Write::err(
+			"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
+		)?;
+	}
 	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 
 	let t_load = Instant::now();
@@ -1372,8 +1373,7 @@ pub fn generate(
 		gpu_core::hip::device_synchronize()?;
 		let nan = hbuf_host.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {
-			Write::err(format!("step {step}: {nan} non-finite in h after layers"));
-			bail!("step {step}: {nan} non-finite in h after layers");
+			Write::err(format!("step {step}: {nan} non-finite in h after layers"))?;
 		}
 
 		gpu_rmsnorm_f64(&hbuf.view(coff, clen), &m.decoder_norm, &m.eps, ncanvas, ne, &ar.hfs)?;

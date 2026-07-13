@@ -212,10 +212,10 @@ struct Paged {
 
 impl Paged {
 	fn win(&self, s0: usize, cnt: usize) -> usize {
-		assert!(
-			s0.is_multiple_of(self.chunk) && cnt <= self.chunk,
-			"ooc access not window-aligned"
-		);
+		if !(s0.is_multiple_of(self.chunk) && cnt <= self.chunk) {
+			drop(Write::err("ooc access not window-aligned"));
+			std::process::abort();
+		}
 		s0 / self.chunk
 	}
 	fn fresh_disk_read(
@@ -797,10 +797,9 @@ impl Ooc {
 		let ConcatAc { a: ca, c: cc } = concat_ac.unwrap_or(ConcatAc { a: 0, c: 0 });
 		let max_spb = seq_spb.max(max_act_spb).max(ca + cc);
 
-		assert!(
-			gpu_core::memory::device_arena_active(),
-			"ooc: build requires the run's claimed arena"
-		);
+		if !gpu_core::memory::device_arena_active() {
+			Write::err("ooc: build requires the run's claimed arena")?;
+		}
 
 		let max_wt = params
 			.iter()
@@ -2518,14 +2517,16 @@ impl Drop for Ooc {
 	fn drop(&mut self) {
 		let Ooc { writer, spill, .. } = &mut *self;
 		let r = writer.barrier(spill.as_ref());
-		assert!(
-			r.is_ok(),
-			"ooc drop barrier: {}",
-			r.as_ref()
-				.err()
-				.map(|e| format!("{e:#}"))
-				.unwrap_or_default()
-		);
+		if !r.is_ok() {
+			drop(Write::err(format!(
+				"ooc drop barrier: {}",
+				r.as_ref()
+					.err()
+					.map(|e| format!("{e:#}"))
+					.unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		let Some(net) = self.net.clone() else {
 			return;
 		};

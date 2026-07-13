@@ -1,4 +1,5 @@
 use crate::hip::{self, HipError};
+use crate::log::Write;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -185,7 +186,10 @@ impl Tiered {
 	) -> Self {
 		let n_disk = n_pg - n_vram - n_ram;
 
-		let mapping = reserve_and_map(n_vram).expect("vmm reserve/map");
+		let mapping = reserve_and_map(n_vram).unwrap_or_else(|e| {
+			drop(Write::err(&format!("vmm reserve/map: {e}")));
+			std::process::abort()
+		});
 		let va = mapping.va;
 		let handles = mapping.handles;
 		crate::memory::tag_note_alloc("tiered-vram", handles.len() * P);
@@ -197,8 +201,14 @@ impl Tiered {
 
 		let disk = match n_disk.cmp(&0) {
 			std::cmp::Ordering::Greater => {
-				let f = crate::bridge::open_spill(spill).expect("open spill file");
-				f.set_len((n_disk * P) as u64).expect("size spill file");
+				let f = crate::bridge::open_spill(spill).unwrap_or_else(|e| {
+					drop(Write::err(&format!("open spill file: {e}")));
+					std::process::abort()
+				});
+				f.set_len((n_disk * P) as u64).unwrap_or_else(|e| {
+					drop(Write::err(&format!("size spill file: {e}")));
+					std::process::abort()
+				});
 				Some(f)
 			}
 			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => None,
@@ -248,15 +258,18 @@ impl Tiered {
 	}
 
 	pub fn device_ptr(&self) -> *mut c_void {
-		assert!(
-			self.is_contiguous_vram(),
-			"device_ptr on a spilled buffer — stage pages instead"
-		);
+		if !self.is_contiguous_vram() {
+			drop(Write::err("device_ptr on a spilled buffer — stage pages instead"));
+			std::process::abort();
+		}
 		self.va
 	}
 
 	pub fn fill(&mut self, src: &[u8]) {
-		assert!(src.len() <= self.b, "fill src longer than buffer");
+		if !(src.len() <= self.b) {
+			drop(Write::err("fill src longer than buffer"));
+			std::process::abort();
+		}
 		for p in 0..self.n_pg {
 			let lo = p * P;
 			match lo.cmp(&src.len()) {
@@ -283,7 +296,10 @@ impl Tiered {
 						std::ptr::null_mut(),
 					)
 				}
-				.expect("H2D page fill");
+				.unwrap_or_else(|e| {
+					drop(Write::err(&format!("H2D page fill: {e}")));
+					std::process::abort()
+				});
 			}
 			Residence::Ram(i) => {
 				self.ram[i as usize][..bytes.len()].copy_from_slice(bytes);
@@ -291,9 +307,15 @@ impl Tiered {
 			Residence::Disk(off) => {
 				self.disk
 					.as_ref()
-					.expect("disk tier")
+					.unwrap_or_else(|| {
+						drop(Write::err("disk tier missing"));
+						std::process::abort()
+					})
 					.write_all_at(bytes, off)
-					.expect("spill write");
+					.unwrap_or_else(|e| {
+						drop(Write::err(&format!("spill write: {e}")));
+						std::process::abort()
+					});
 			}
 		}
 	}
@@ -322,7 +344,10 @@ impl Tiered {
 						hip::HIP_MEMCPY_D2D,
 						std::ptr::null_mut(),
 					)
-					.expect("stage_bytes D2D");
+					.unwrap_or_else(|e| {
+						drop(Write::err(&format!("stage_bytes D2D: {e}")));
+						std::process::abort()
+					});
 				},
 				Residence::Ram(i) => unsafe {
 					let src = self.ram[i as usize].as_ptr().add(poff) as *const c_void;
@@ -333,14 +358,23 @@ impl Tiered {
 						hip::HIP_MEMCPY_H2D,
 						std::ptr::null_mut(),
 					)
-					.expect("stage_bytes H2D");
+					.unwrap_or_else(|e| {
+						drop(Write::err(&format!("stage_bytes H2D: {e}")));
+						std::process::abort()
+					});
 				},
 				Residence::Disk(diskoff) => {
 					self.disk
 						.as_ref()
-						.expect("disk tier")
+						.unwrap_or_else(|| {
+							drop(Write::err("disk tier missing"));
+							std::process::abort()
+						})
 						.read_exact_at(&mut scratch[..chunk], diskoff + poff as u64)
-						.expect("stage_bytes read");
+						.unwrap_or_else(|e| {
+							drop(Write::err(&format!("stage_bytes read: {e}")));
+							std::process::abort()
+						});
 					unsafe {
 						crate::memory::xfer(
 							dst,
@@ -349,7 +383,10 @@ impl Tiered {
 							hip::HIP_MEMCPY_H2D,
 							std::ptr::null_mut(),
 						)
-						.expect("stage_bytes disk H2D");
+						.unwrap_or_else(|e| {
+							drop(Write::err(&format!("stage_bytes disk H2D: {e}")));
+							std::process::abort()
+						});
 					}
 				}
 			}
@@ -377,7 +414,10 @@ impl Tiered {
 								hip::HIP_MEMCPY_D2D,
 								std::ptr::null_mut(),
 							)
-							.expect("stage D2D");
+							.unwrap_or_else(|e| {
+						drop(Write::err(&format!("stage D2D: {e}")));
+						std::process::abort()
+					});
 						},
 						Residence::Ram(i) => unsafe {
 							let src = self.ram[i as usize].as_ptr() as *const c_void;
@@ -388,14 +428,23 @@ impl Tiered {
 								hip::HIP_MEMCPY_H2D,
 								std::ptr::null_mut(),
 							)
-							.expect("stage H2D");
+							.unwrap_or_else(|e| {
+						drop(Write::err(&format!("stage H2D: {e}")));
+						std::process::abort()
+					});
 						},
 						Residence::Disk(off) => {
 							self.disk
 								.as_ref()
-								.expect("disk tier")
+								.unwrap_or_else(|| {
+									drop(Write::err("disk tier missing"));
+									std::process::abort()
+								})
 								.read_exact_at(&mut disk_scratch[..bytes], off)
-								.expect("stage read");
+								.unwrap_or_else(|e| {
+									drop(Write::err(&format!("stage read: {e}")));
+									std::process::abort()
+								});
 							unsafe {
 								crate::memory::xfer(
 									dst,
@@ -404,7 +453,10 @@ impl Tiered {
 									hip::HIP_MEMCPY_H2D,
 									std::ptr::null_mut(),
 								)
-								.expect("stage disk H2D");
+								.unwrap_or_else(|e| {
+							drop(Write::err(&format!("stage disk H2D: {e}")));
+							std::process::abort()
+						});
 							}
 						}
 					}

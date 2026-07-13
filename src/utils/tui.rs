@@ -452,5 +452,5 @@ pub fn chat(gguf: &str) {
 		}
 	}
 	drop(_guard);
-	let _reported = err_out.map(|e| gpu_core::log::Write::err(format!("chat: {e}")));
+	err_out.map(|e| drop(gpu_core::log::Write::err(format!("chat: {e}"))));
 }

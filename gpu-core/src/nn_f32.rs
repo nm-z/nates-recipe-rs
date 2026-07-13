@@ -1,4 +1,5 @@
 use crate::hip::{HipError, check};
+use crate::log::Write;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 
@@ -183,7 +184,10 @@ fn check_launch() -> Result<(), HipError> {
 }
 
 fn safe_i32(v: usize) -> i32 {
-	assert!(v <= i32::MAX as usize, "size {} overflows i32", v);
+	if !(v <= i32::MAX as usize) {
+		drop(Write::err(&format!("size {v} overflows i32")));
+		std::process::abort();
+	}
 	v as i32
 }
 

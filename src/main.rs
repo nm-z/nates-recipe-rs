@@ -1,9 +1,10 @@
-use gpu_core::log::{Opt, Write, gpu, probe, set_opt};
+use gpu_core::log::{Errored, Opt, Write, gpu, probe, set_opt};
 use anyhow::Result;
 
 fn usage(code: i32) -> ! {
-	Write::err("usage: recipe <file.rs> [args]  # compile + run");
-	Write::err("       recipe serve            # daemon on 7845");
+	drop(Write::err(&format!("recipe {}", env!("CARGO_PKG_VERSION"))));
+	drop(Write::err("usage: recipe <file.rs> [args]  # compile + run"));
+	drop(Write::err("       recipe serve            # daemon on 7845"));
 	std::process::exit(code);
 }
 
@@ -57,7 +58,10 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 
 fn main() -> Result<()> {
 	if let Some(d) = std::env::var_os("RECIPE_PROBE_GPU") {
-		let card: i32 = d.to_string_lossy().parse().expect("RECIPE_PROBE_GPU parse");
+		let card: i32 = d
+			.to_string_lossy()
+			.parse()
+			.map_err(|e| Errored::new(format!("RECIPE_PROBE_GPU parse: {e}")))?;
 		match recipe::probe::probe_gpu_child_record(card) {
 			Ok(rec) => {
 				set_opt(Opt {
@@ -68,13 +72,16 @@ fn main() -> Result<()> {
 				std::process::exit(0);
 			}
 			Err(e) => {
-				Write::err(&format!("probe child gpu{card}: {e}"));
+				drop(Write::err(&format!("probe child gpu{card}: {e}")));
 				std::process::exit(2);
 			}
 		}
 	}
 	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
-		let n: usize = sz.to_string_lossy().parse().expect("VRAM_PROBE parse");
+		let n: usize = sz
+			.to_string_lossy()
+			.parse()
+			.map_err(|e| Errored::new(format!("VRAM_PROBE parse: {e}")))?;
 		let code = match gpu_core::memory::GpuBuffer::try_alloc_bytes(n) {
 			Some(held) => {
 				drop(held);
@@ -85,40 +92,55 @@ fn main() -> Result<()> {
 		std::process::exit(code);
 	}
 	if let Some(it) = std::env::var_os("SETUP_RACE") {
-		let iters: usize = it.to_string_lossy().parse().expect("SETUP_RACE parse");
+		let iters: usize = it
+			.to_string_lossy()
+			.parse()
+			.map_err(|e| Errored::new(format!("SETUP_RACE parse: {e}")))?;
 		gpu_core::hip::set_device(0)?;
 		for i in 0..iters {
 			let x = ndarray::Array2::<f64>::from_elem(ndarray::Ix2(45982, 768), 1.0);
 			let cat = ndarray::Array2::<f64>::from_elem(ndarray::Ix2(45982, 128), 1.0);
 			let mut stage = gpu_core::memory::Stage::new();
-			let x_off = stage.push(x.as_standard_layout().as_slice().expect("x contig"));
-			let cat_off =
-				stage.push(cat.as_standard_layout().as_slice().expect("cat contig"));
+			let x_std = x.as_standard_layout();
+			let x_off = stage.push(
+				x_std
+					.as_slice()
+					.ok_or_else(|| Errored::new("x contig"))?,
+			);
+			let cat_std = cat.as_standard_layout();
+			let cat_off = stage.push(
+				cat_std
+					.as_slice()
+					.ok_or_else(|| Errored::new("cat contig"))?,
+			);
 			let host = stage.into_host();
 			let staged = gpu_core::memory::GpuBuffer::alloc(host.len().max(1))
-				.expect("setup-race stage");
-			staged.load(&host).expect("setup-race stage");
+				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
+			staged
+				.load(&host)
+				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
 			let xraw = staged.view(x_off, x.len());
 			let craw = staged.view(cat_off, cat.len());
 			let nn = cat.nrows();
 			let cc = cat.ncols();
 			let eps = {
-				let e = gpu_core::memory::GpuBuffer::alloc(1).expect("eps");
-				e.load(&[recipe_infer::ZSCORE_EPS]).expect("eps load");
+				let e = gpu_core::memory::GpuBuffer::alloc(1).map_err(|e| Errored::new(format!("eps: {e}")))?;
+				e.load(&[recipe_infer::ZSCORE_EPS]).map_err(|e| Errored::new(format!("eps load: {e}")))?;
 				e
 			};
-			let mean = gpu_core::memory::GpuBuffer::alloc(cc).expect("mean");
-			let std = gpu_core::memory::GpuBuffer::alloc(cc).expect("std");
-			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc).expect("zscored");
+			let mean = gpu_core::memory::GpuBuffer::alloc(cc).map_err(|e| Errored::new(format!("mean: {e}")))?;
+			let std = gpu_core::memory::GpuBuffer::alloc(cc).map_err(|e| Errored::new(format!("std: {e}")))?;
+			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc).map_err(|e| Errored::new(format!("zscored: {e}")))?;
 			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
-			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).expect("lse");
-			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).expect("dsum");
+			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).map_err(|e| Errored::new(format!("lse: {e}")))?;
+			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).map_err(|e| Errored::new(format!("dsum: {e}")))?;
 			let mut fills = Vec::new();
 			while let Some(b) = gpu_core::memory::GpuBuffer::try_alloc_bytes(256 << 20) {
 				fills.push(b);
 			}
 			let mut probe1k = vec![0u8; 1024];
-			lse.download_u8(&mut probe1k).expect("d2h under pressure");
+			lse.download_u8(&mut probe1k)
+				.map_err(|e| Errored::new(format!("d2h under pressure: {e}")))?;
 			drop(xraw);
 			drop(craw);
 			drop(xb);

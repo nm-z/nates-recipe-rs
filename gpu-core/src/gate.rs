@@ -169,9 +169,9 @@ fn expired(t0: std::time::Instant, pid: u32) -> Option<()> {
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
 		Some(std::cmp::Ordering::Less) | None => None,
 		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => {
-			Write::err(&format!(
+			drop(Write::err(&format!(
 				"gpu gate: pid {pid} still holds the device after {waited:.0}s — proceeding"
-			));
+			)));
 			Some(())
 		}
 	}
@@ -217,7 +217,10 @@ fn mark_taken(g: &mut Gate) {
 			g.grip = Grip::Taken;
 			HOLDING.store(std::process::id(), Ordering::Release);
 		}
-		Err(e) => panic!("gpu gate: {e}"),
+		Err(e) => {
+			drop(Write::err(&format!("gpu gate: {e}")));
+			std::process::abort();
+		}
 	}
 }
 
@@ -232,10 +235,10 @@ pub fn release() {
 fn shutdown(g: &mut Gate) {
 	let Lock::Own(f) = &mut g.lock else { return };
 	for e in stamp(f, CLEAN).err().into_iter() {
-		Write::err(&format!("gpu gate: clean stamp: {e}"));
+		drop(Write::err(&format!("gpu gate: clean stamp: {e}")));
 	}
 	for e in flock(f.as_raw_fd(), libc::LOCK_UN).err().into_iter() {
-		Write::err(&format!("gpu gate: unlock: {e}"));
+		drop(Write::err(&format!("gpu gate: unlock: {e}")));
 	}
 	g.grip = Grip::Free;
 	HOLDING.store(CLEAN, Ordering::Release);

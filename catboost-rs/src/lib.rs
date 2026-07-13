@@ -3,12 +3,26 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::Exp1;
 use std::collections::HashMap;
 use std::fmt;
+use gpu_core::log::{Write, Errored, epoch};
 use gpu_core::memory::GpuBuffer;
+use gpu_core::hip::HipError;
 use gpu_core::kernels::{
       gpu_oblivious_histogram, gpu_oblivious_split_eval,
       gpu_oblivious_route_step, gpu_oblivious_route_full,
       gpu_leaf_reduce, gpu_leaf_finalize,
 };
+
+fn zeros_bytes(n_bytes: usize) -> Result<GpuBuffer, HipError> {
+      let buf = GpuBuffer::alloc_bytes(n_bytes)?;
+      buf.memset_zero(n_bytes)?;
+      Ok(buf)
+}
+
+fn upload_u8(data: &[u8]) -> Result<GpuBuffer, HipError> {
+      let buf = GpuBuffer::alloc_bytes(data.len())?;
+      buf.write_u8(data)?;
+      Ok(buf)
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -20,6 +34,12 @@ impl fmt::Display for Error {
       }
 }
 impl std::error::Error for Error {}
+impl From<Errored> for Error {
+      fn from(e: Errored) -> Self { Error::InvalidInput(e.to_string()) }
+}
+impl From<HipError> for Error {
+      fn from(e: HipError) -> Self { Error::InvalidInput(e.to_string()) }
+}
 
 pub struct Params {
       pub iterations: usize,
@@ -269,13 +289,13 @@ fn build_oblivious_tree_gpu(
       hess_f32: &[f32],
       n: usize, n_features: usize, n_classes: usize, depth: usize, l2: f64,
       n_bins: usize,
-) -> (Vec<usize>, Vec<usize>, Vec<Vec<f64>>, Vec<u8>) {
+) -> Result<(Vec<usize>, Vec<usize>, Vec<Vec<f64>>, Vec<u8>), Error> {
       let n_leaves = 1usize << depth;
-      let lambda = l2 as f32;
-      let min_cw = 0.0f32;
+      let lambda_gpu = GpuBuffer::upload_f32(&[l2 as f32]).map_err(|e| Errored::new(format!("upload lambda: {e}")))?;
+      let min_cw_gpu = GpuBuffer::upload_f32(&[0.0f32]).map_err(|e| Errored::new(format!("upload min_cw: {e}")))?;
 
-      let mut node_a = GpuBuffer::zeros_bytes(n).unwrap();
-      let mut node_b = GpuBuffer::zeros_bytes(n).unwrap();
+      let mut node_a = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_a ({n} bytes): {e}")))?;
+      let mut node_b = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_b ({n} bytes): {e}")))?;
 
       let mut split_features = Vec::with_capacity(depth);
       let mut split_bins_vec = Vec::with_capacity(depth);
@@ -290,26 +310,26 @@ fn build_oblivious_tree_gpu(
             for k in 0..n_classes {
                   let grad_k: Vec<f32> = (0..n).map(|i| grad_f32[i * n_classes + k]).collect();
                   let hess_k: Vec<f32> = (0..n).map(|i| hess_f32[i * n_classes + k]).collect();
-                  let g_gpu = GpuBuffer::upload_f32(&grad_k).unwrap();
-                  let h_gpu = GpuBuffer::upload_f32(&hess_k).unwrap();
+                  let g_gpu = GpuBuffer::upload_f32(&grad_k).map_err(|e| Errored::new(format!("upload grad class {k}: {e}")))?;
+                  let h_gpu = GpuBuffer::upload_f32(&hess_k).map_err(|e| Errored::new(format!("upload hess class {k}: {e}")))?;
 
-                  let grad_hist = GpuBuffer::zeros_bytes(hist_bytes).unwrap();
-                  let hess_hist = GpuBuffer::zeros_bytes(hist_bytes).unwrap();
+                  let grad_hist = zeros_bytes(hist_bytes).map_err(|e| Errored::new(format!("alloc grad_hist ({hist_bytes} bytes): {e}")))?;
+                  let hess_hist = zeros_bytes(hist_bytes).map_err(|e| Errored::new(format!("alloc hess_hist ({hist_bytes} bytes): {e}")))?;
 
                   gpu_oblivious_histogram(
                         bins_fm_gpu, &node_a, &g_gpu, &h_gpu,
-                        &grad_hist, &hess_hist,
                         n, n_features, n_bins, n_nodes,
-                  );
+                        &grad_hist, &hess_hist,
+                  )?;
 
-                  let gain_k = GpuBuffer::zeros_bytes(gain_elems * 4).unwrap();
+                  let gain_k = zeros_bytes(gain_elems * 4).map_err(|e| Errored::new(format!("alloc gain_k ({} bytes): {e}", gain_elems * 4)))?;
                   gpu_oblivious_split_eval(
-                        &grad_hist, &hess_hist, &gain_k,
-                        n_nodes, n_features, n_bins, lambda, min_cw,
-                  );
+                        &grad_hist, &hess_hist, &lambda_gpu, &min_cw_gpu,
+                        n_nodes, n_features, n_bins, &gain_k,
+                  )?;
 
                   let mut g_host = vec![0.0f32; gain_elems];
-                  gain_k.download_f32(&mut g_host).unwrap();
+                  gain_k.download_f32(&mut g_host).map_err(|e| Errored::new(format!("download gain_k class {k}: {e}")))?;
                   for i in 0..gain_elems { gain_sum[i] += g_host[i]; }
             }
 
@@ -324,10 +344,10 @@ fn build_oblivious_tree_gpu(
             split_bins_vec.push(best_bin);
 
             gpu_oblivious_route_step(
-                  bins_rm_gpu, &node_a, &node_b,
-                  best_feat, best_bin.min(255) as u8,
-                  d, n, n_features,
-            );
+                  bins_rm_gpu, &node_a,
+                  best_feat, best_bin.min(255),
+                  d, n, n_features, &node_b,
+            )?;
             std::mem::swap(&mut node_a, &mut node_b);
       }
 
@@ -335,25 +355,25 @@ fn build_oblivious_tree_gpu(
       for k in 0..n_classes {
             let grad_k: Vec<f32> = (0..n).map(|i| grad_f32[i * n_classes + k]).collect();
             let hess_k: Vec<f32> = (0..n).map(|i| hess_f32[i * n_classes + k]).collect();
-            let g_gpu = GpuBuffer::upload_f32(&grad_k).unwrap();
-            let h_gpu = GpuBuffer::upload_f32(&hess_k).unwrap();
+            let g_gpu = GpuBuffer::upload_f32(&grad_k).map_err(|e| Errored::new(format!("upload leaf grad class {k}: {e}")))?;
+            let h_gpu = GpuBuffer::upload_f32(&hess_k).map_err(|e| Errored::new(format!("upload leaf hess class {k}: {e}")))?;
 
-            let leaf_grad = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
-            let leaf_hess = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
-            let leaf_val = GpuBuffer::zeros_bytes(n_leaves * 4).unwrap();
+            let leaf_grad = zeros_bytes(n_leaves * 4).map_err(|e| Errored::new(format!("alloc leaf_grad ({} bytes): {e}", n_leaves * 4)))?;
+            let leaf_hess = zeros_bytes(n_leaves * 4).map_err(|e| Errored::new(format!("alloc leaf_hess ({} bytes): {e}", n_leaves * 4)))?;
+            let leaf_val = zeros_bytes(n_leaves * 4).map_err(|e| Errored::new(format!("alloc leaf_val ({} bytes): {e}", n_leaves * 4)))?;
 
-            gpu_leaf_reduce(&node_a, &g_gpu, &h_gpu, &leaf_grad, &leaf_hess, n);
-            gpu_leaf_finalize(&leaf_grad, &leaf_hess, &leaf_val, lambda, n_leaves);
+            gpu_leaf_reduce(&node_a, &g_gpu, &h_gpu, n, &leaf_grad, &leaf_hess)?;
+            gpu_leaf_finalize(&leaf_grad, &leaf_hess, &lambda_gpu, n_leaves, &leaf_val)?;
 
             let mut lv_f32 = vec![0.0f32; n_leaves];
-            leaf_val.download_f32(&mut lv_f32).unwrap();
+            leaf_val.download_f32(&mut lv_f32).map_err(|e| Errored::new(format!("download leaf_val class {k}: {e}")))?;
             leaf_values.push(lv_f32.iter().map(|&v| v as f64).collect());
       }
 
       let mut leaf_idx = vec![0u8; n];
-      node_a.download_u8(&mut leaf_idx).unwrap();
+      node_a.download_u8(&mut leaf_idx).map_err(|e| Errored::new(format!("download leaf indices: {e}")))?;
 
-      (split_features, split_bins_vec, leaf_values, leaf_idx)
+      Ok((split_features, split_bins_vec, leaf_values, leaf_idx))
 }
 
 fn route_full_gpu(
@@ -361,19 +381,19 @@ fn route_full_gpu(
       split_features: &[usize],
       split_bins: &[usize],
       n: usize, n_features: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Error> {
       let depth = split_features.len();
       let sf_i32: Vec<i32> = split_features.iter().map(|&f| f as i32).collect();
       let sb_u8: Vec<u8> = split_bins.iter().map(|&b| b.min(255) as u8).collect();
-      let sf_gpu = GpuBuffer::upload_i32(&sf_i32).unwrap();
-      let sb_gpu = GpuBuffer::upload_u8(&sb_u8).unwrap();
-      let leaf_gpu = GpuBuffer::zeros_bytes(n).unwrap();
+      let sf_gpu = GpuBuffer::upload_i32(&sf_i32).map_err(|e| Errored::new(format!("upload split features: {e}")))?;
+      let sb_gpu = upload_u8(&sb_u8).map_err(|e| Errored::new(format!("upload split bins: {e}")))?;
+      let leaf_gpu = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc leaf routing buffer ({n} bytes): {e}")))?;
 
-      gpu_oblivious_route_full(bins_rm_gpu, &sf_gpu, &sb_gpu, &leaf_gpu, n, n_features, depth);
+      gpu_oblivious_route_full(bins_rm_gpu, &sf_gpu, &sb_gpu, n, n_features, depth, &leaf_gpu)?;
 
       let mut out = vec![0u8; n];
-      leaf_gpu.download_u8(&mut out).unwrap();
-      out
+      leaf_gpu.download_u8(&mut out).map_err(|e| Errored::new(format!("download leaf routing: {e}")))?;
+      Ok(out)
 }
 
 pub fn train(
@@ -425,14 +445,14 @@ pub fn train(
 
             let fm = bins_feature_major_u8(&all_bin_refs, n_total, n);
             let rm = bins_row_major_u8(&all_bin_refs, n_total, n);
-            let bins_fm_gpu = GpuBuffer::upload_u8(&fm).map_err(|e| Error::InvalidInput(e.to_string()))?;
-            let bins_rm_gpu = GpuBuffer::upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let bins_fm_gpu = upload_u8(&fm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let bins_rm_gpu = upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
 
             let (sf, sb, _leaf_values_grad, leaf_idx_u8) = build_oblivious_tree_gpu(
                   &bins_fm_gpu, &bins_rm_gpu,
                   &grads_f32, &hesses_f32,
                   n, n_total, n_classes, params.depth, params.l2_reg, n_bins,
-            );
+            )?;
 
             let n_leaves = 1usize << params.depth;
             let leaf_indices: Vec<u32> = leaf_idx_u8.iter().map(|&v| v as u32).collect();
@@ -468,9 +488,9 @@ pub fn train(
                   for col in &r_ts_cols { r_all_refs.push(col.as_slice()); }
 
                   let r_rm = bins_row_major_u8(&r_all_refs, n_total, n);
-                  let r_bins_rm_gpu = GpuBuffer::upload_u8(&r_rm).unwrap();
+                  let r_bins_rm_gpu = upload_u8(&r_rm).map_err(|e| Errored::new(format!("upload r_rm bins: {e}")))?;
 
-                  let r_leaf_u8 = route_full_gpu(&r_bins_rm_gpu, &sf, &sb, n, n_total);
+                  let r_leaf_u8 = route_full_gpu(&r_bins_rm_gpu, &sf, &sb, n, n_total)?;
                   let r_leaf_indices: Vec<u32> = r_leaf_u8.iter().map(|&v| v as u32).collect();
 
                   let r_probs = softmax_cpu(&support_logits[r], n, n_classes);
@@ -501,7 +521,7 @@ pub fn train(
                   }
             }
             trees.push(tree);
-            eprintln!("      cb iter={}/{}", t + 1, params.iterations);
+            Write::line(epoch, format!("      cb iter={}/{}", t + 1, params.iterations));
       }
 
       let mut ts_infos = Vec::new();
@@ -548,9 +568,9 @@ pub fn predict(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Error> {
             for col in &ts_columns { all_refs.push(col.as_slice()); }
 
             let rm = bins_row_major_u8(&all_refs, n_total, n);
-            let bins_rm_gpu = GpuBuffer::upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let bins_rm_gpu = upload_u8(&rm).map_err(|e| Error::InvalidInput(e.to_string()))?;
 
-            let leaf_u8 = route_full_gpu(&bins_rm_gpu, &tree.split_features, &tree.split_bins, n, n_total);
+            let leaf_u8 = route_full_gpu(&bins_rm_gpu, &tree.split_features, &tree.split_bins, n, n_total)?;
 
             for i in 0..n {
                   let leaf = leaf_u8[i] as usize;

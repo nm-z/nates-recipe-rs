@@ -62,8 +62,38 @@ fn log(t: &impl Display) {
 }
 
 fn print(t: &impl Display) {
-	writeln!(std::io::stderr(), "{t}").expect("log: stderr");
+	drop(writeln!(std::io::stderr(), "{t}"));
 }
+
+pub struct Errored(pub String);
+
+impl Errored {
+	pub fn new(t: impl Display) -> Errored {
+		match Err::log {
+			true => log(&t),
+			false => {}
+		}
+		match Err::print {
+			true => print(&t),
+			false => {}
+		}
+		Errored(t.to_string())
+	}
+}
+
+impl Display for Errored {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl std::fmt::Debug for Errored {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl std::error::Error for Errored {}
 
 pub mod Write {
 	use super::*;
@@ -74,8 +104,7 @@ pub mod Write {
 			false => {}
 		}
 	}
-	pub fn block(f: Flag, graph: &ogdl::Node) {
-		let text = graph.serialize();
+	pub fn block(f: Flag, text: &str) {
 		let t = text.trim_end();
 		log(&t);
 		match on(f) {
@@ -83,14 +112,7 @@ pub mod Write {
 			false => {}
 		}
 	}
-	pub fn err(t: impl Display) {
-		match Err::log {
-			true => log(&t),
-			false => {}
-		}
-		match Err::print {
-			true => print(&t),
-			false => {}
-		}
+	pub fn err(t: impl Display) -> std::result::Result<(), Errored> {
+		std::result::Result::Err(Errored::new(t))
 	}
 }

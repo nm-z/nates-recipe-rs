@@ -16,7 +16,7 @@ fn main() -> Result<()> {
 	set_opt(Opt { data: true, ..Opt::default() });
 	let paths: Vec<String> = std::env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
+		drop(Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)"));
 		std::process::exit(1);
 	};
 

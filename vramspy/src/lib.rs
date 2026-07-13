@@ -11,35 +11,11 @@
 #![deny(clippy::unwrap_used)]
 #![allow(non_snake_case)]
 
+use log::Write;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::fmt::Display;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-
-fn log(t: &impl Display) {
-	use std::io::Write as _;
-	let path = format!("/tmp/recipe/run{:03x}.log", std::process::id() & 0xfff);
-	let Ok(()) = std::fs::create_dir_all("/tmp/recipe") else {
-		return;
-	};
-	let Ok(mut f) = std::fs::File::options().append(true).create(true).open(path) else {
-		return;
-	};
-	drop(writeln!(f, "{t}"));
-}
-
-fn print(t: &impl Display) {
-	use std::io::Write as _;
-	drop(writeln!(std::io::stderr(), "{t}"));
-}
-
-mod Write {
-	pub fn err(t: impl std::fmt::Display) {
-		super::log(&t);
-		super::print(&t);
-	}
-}
 
 pub const KIND_DEVICE: u8 = 0;
 pub const KIND_HOST_PINNED: u8 = 1;
@@ -151,10 +127,10 @@ fn resolve_next(name: &CStr) -> usize {
 	match std::ptr::NonNull::new(p) {
 		Some(nn) => nn.as_ptr() as usize,
 		None => {
-			Write::err(format!(
+			drop(Write::err(format!(
 				"vramspy: RTLD_NEXT resolution failed for {}",
 				name.to_string_lossy()
-			));
+			)));
 			// SAFETY: abort() takes no arguments and never returns.
 			unsafe { libc::abort() }
 		}
@@ -317,9 +293,9 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 				pgi: resolve_next_or_default(c"hsa_amd_memory_pool_get_info")?,
 			})
 		})() else {
-			Write::err(
+			drop(Write::err(
 				"vramspy: agent/pool classification symbols unavailable — all pools classify OTHER"
-			);
+			));
 			return pools;
 		};
 		// SAFETY: each transmute target is the exact C signature documented for

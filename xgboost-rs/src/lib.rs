@@ -1,3 +1,4 @@
+use gpu_core::log::{Write, epoch};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
@@ -251,7 +252,7 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
 
             if (t + 1) % 100 == 0 {
                   let mse: f64 = (0..n).map(|i| (pred[i] - y[i]).powi(2)).sum::<f64>() / n as f64;
-                  eprintln!("      xgb reg iter={}/{} mse={:.4}", t + 1, params.n_estimators, mse);
+                  Write::line(epoch, format!("      xgb reg iter={}/{} mse={:.4}", t + 1, params.n_estimators, mse));
             }
       }
 
@@ -317,9 +318,9 @@ pub fn train_multiclass(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: u
                   let mut probs_log = logits.clone();
                   softmax_inplace(&mut probs_log, n, n_classes);
                   let acc = (0..n).filter(|&i| {
-                        (0..n_classes).max_by(|&a, &b| probs_log[i*n_classes+a].partial_cmp(&probs_log[i*n_classes+b]).unwrap()).unwrap() == y[i]
+                        (1..n_classes).fold(0usize, |best, k| if probs_log[i*n_classes+k].partial_cmp(&probs_log[i*n_classes+best]).unwrap_or(std::cmp::Ordering::Equal) != std::cmp::Ordering::Less { k } else { best }) == y[i]
                   }).count();
-                  eprintln!("      xgb mc iter={}/{} acc={:.3}", t + 1, params.n_estimators, acc as f64 / n as f64);
+                  Write::line(epoch, format!("      xgb mc iter={}/{} acc={:.3}", t + 1, params.n_estimators, acc as f64 / n as f64));
             }
       }
 

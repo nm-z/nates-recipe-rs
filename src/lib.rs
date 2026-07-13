@@ -88,20 +88,25 @@ pub fn infer() -> Infer {
 }
 
 pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
-	assert!(
-		r.is_ok(),
-		"{ctx}: {}",
-		r.as_ref()
-			.err()
-			.map(|e| format!("{e:#}"))
-			.unwrap_or_default()
-	);
+	if !r.is_ok() {
+		drop(gpu_core::log::Write::err(format!(
+			"{ctx}: {}",
+			r.as_ref()
+				.err()
+				.map(|e| format!("{e:#}"))
+				.unwrap_or_default()
+		)));
+		std::process::abort();
+	}
 	let Ok(v) = r else { std::process::abort() };
 	v
 }
 
 pub(crate) fn some_or_die<T>(o: Option<T>, msg: &str) -> T {
-	assert!(o.is_some(), "{msg}");
+	if !o.is_some() {
+		drop(gpu_core::log::Write::err(msg));
+		std::process::abort();
+	}
 	let Some(v) = o else { std::process::abort() };
 	v
 }

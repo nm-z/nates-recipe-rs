@@ -45,10 +45,12 @@ pub fn cu_count() -> usize {
 			crate::gate::acquire();
 			crate::callspy::tick(&crate::callspy::GET_DEVICE_PROPERTIES);
 			let n = unsafe { hip_multiprocessor_count() };
-			assert!(
-				n > 0,
-				"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
-			);
+			if !(n > 0) {
+				drop(Write::err(&format!(
+					"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
+				)));
+				std::process::abort();
+			}
 			CU.store(n as usize, Ordering::Relaxed);
 			n as usize
 		}
@@ -271,11 +273,11 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			Some(hit) => format!("{locate}; {hit}"),
 			None => format!("{locate}; va in NO recorded allocation"),
 		};
-		Write::err(&format!(
+		drop(Write::err(&format!(
 			"gpu fault autopsy  va=0x{:x}  reason={why}  {locate}\n{}",
 			e.virtual_address,
 			crate::memory::ledger_report(),
-		));
+		)));
 		std::thread::sleep(std::time::Duration::from_millis(150));
 	}
 	1

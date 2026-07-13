@@ -17,7 +17,7 @@ name = "all"
 harness = false
 
 [workspace]
-members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core"]
+members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core", "log"]
 exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
 
 [dependencies]

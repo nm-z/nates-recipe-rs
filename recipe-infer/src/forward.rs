@@ -3,6 +3,7 @@ use crate::params::{ConcatDims, LayerParams, concat_layer};
 use crate::scratch::Scratch;
 use anyhow::Context;
 use gpu_core::kernels;
+use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cmp::Ordering;
 
@@ -511,17 +512,21 @@ pub fn attn_forward_cached(
 pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; len];
 	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
-	assert!(
-		dl.is_ok(),
-		"gpu download: {}",
-		dl.err().map(|e| e.to_string()).unwrap_or_default()
-	);
+	if !dl.is_ok() {
+		drop(Write::err(format!(
+			"gpu download: {}",
+			dl.err().map(|e| e.to_string()).unwrap_or_default()
+		)));
+		std::process::abort();
+	}
 	let sync = gpu_core::hip::device_synchronize();
-	assert!(
-		sync.is_ok(),
-		"gpu download sync: {}",
-		sync.err().map(|e| e.to_string()).unwrap_or_default()
-	);
+	if !sync.is_ok() {
+		drop(Write::err(format!(
+			"gpu download sync: {}",
+			sync.err().map(|e| e.to_string()).unwrap_or_default()
+		)));
+		std::process::abort();
+	}
 	v
 }
 
@@ -624,16 +629,20 @@ pub struct Scored {
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64];
 	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
-	assert!(
-		dl.is_ok(),
-		"scalar download: {}",
-		dl.err().map(|e| e.to_string()).unwrap_or_default()
-	);
+	if !dl.is_ok() {
+		drop(Write::err(format!(
+			"scalar download: {}",
+			dl.err().map(|e| e.to_string()).unwrap_or_default()
+		)));
+		std::process::abort();
+	}
 	let sync = gpu_core::hip::device_synchronize();
-	assert!(
-		sync.is_ok(),
-		"scalar download sync: {}",
-		sync.err().map(|e| e.to_string()).unwrap_or_default()
-	);
+	if !sync.is_ok() {
+		drop(Write::err(format!(
+			"scalar download sync: {}",
+			sync.err().map(|e| e.to_string()).unwrap_or_default()
+		)));
+		std::process::abort();
+	}
 	v[0]
 }

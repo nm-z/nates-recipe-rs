@@ -7,11 +7,17 @@ pub(crate) fn check_launch() {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
 	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	let err = unsafe { crate::hip::hipGetLastError() };
-	assert!(err == 0, "HIP kernel launch failed with error code {}", err);
+	if !(err == 0) {
+		drop(Write::err(&format!("HIP kernel launch failed with error code {err}")));
+		std::process::abort();
+	}
 }
 
 pub(crate) fn safe_i32(v: usize) -> i32 {
-	assert!(v <= i32::MAX as usize, "size {} overflows i32", v);
+	if !(v <= i32::MAX as usize) {
+		drop(Write::err(&format!("size {v} overflows i32")));
+		std::process::abort();
+	}
 	v as i32
 }
 
@@ -1562,9 +1568,15 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 					.unwrap_or(());
 				let mut handle: *mut c_void = std::ptr::null_mut();
 				let status = unsafe { hipblasCreate(&mut handle) };
-				assert_eq!(status, 0, "hipblasCreate failed with status {}", status);
+				if status != 0 {
+					drop(Write::err(&format!("hipblasCreate failed with status {status}")));
+					std::process::abort();
+				}
 				let status = unsafe { hipblasSetStream(handle, std::ptr::null_mut()) };
-				assert_eq!(status, 0, "hipblasSetStream failed with status {}", status);
+				if status != 0 {
+					drop(Write::err(&format!("hipblasSetStream failed with status {status}")));
+					std::process::abort();
+				}
 				h.store(handle, Ordering::Relaxed);
 				handle
 			}
@@ -1574,11 +1586,10 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 
 pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
-	assert_eq!(
-		status, 0,
-		"hipblasSetWorkspace failed with status {}",
-		status
-	);
+	if status != 0 {
+		drop(Write::err(&format!("hipblasSetWorkspace failed with status {status}")));
+		std::process::abort();
+	}
 }
 
 pub(crate) fn hipsolver_handle() -> *mut c_void {
@@ -1589,7 +1600,10 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 			None => {
 				let mut handle: *mut c_void = std::ptr::null_mut();
 				let status = unsafe { hipsolverCreate(&mut handle) };
-				assert_eq!(status, 0, "hipsolverCreate failed with status {}", status);
+				if status != 0 {
+					drop(Write::err(&format!("hipsolverCreate failed with status {status}")));
+					std::process::abort();
+				}
 				h.store(handle, Ordering::Relaxed);
 				handle
 			}
@@ -1619,7 +1633,7 @@ pub fn gpu_shutdown() {
 	crate::memory::free_bounce();
 	crate::memory::free_run_pin();
 	let _trim = crate::hip::trim_mempool(0);
-	Write::block(device, &crate::callspy::report());
+	Write::block(device, &crate::callspy::report().serialize());
 }
 
 pub fn gpu_gemm(
@@ -3554,28 +3568,75 @@ pub fn gpu_tree_build_into(
 	};
 	let hist_elems = max_level * p * n_bins;
 
-	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz).expect("tb node_assign");
+	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb node_assign: {e}")));
+			e
+		})?;
 	node_assign
 		.memset_zero(n_tr * isz)
-		.expect("tb node_assign zero");
-	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_feat");
-	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).expect("tb split_bin");
+		.map_err(|e| {
+			drop(Write::err(&format!("tb node_assign zero: {e}")));
+			e
+		})?;
+	let sf = GpuBuffer::alloc_bytes(max_nodes * isz)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb split_feat: {e}")));
+			e
+		})?;
+	let sb = GpuBuffer::alloc_bytes(max_nodes * isz)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb split_bin: {e}")));
+			e
+		})?;
 	sf.fill_bytes(0xFF, max_nodes * isz)
-		.expect("tb split_feat fill");
+		.map_err(|e| {
+			drop(Write::err(&format!("tb split_feat fill: {e}")));
+			e
+		})?;
 	sb.fill_bytes(0xFF, max_nodes * isz)
-		.expect("tb split_bin fill");
-	let gh = GpuBuffer::alloc(hist_elems).expect("tb grad_hist");
-	let hh = GpuBuffer::alloc(hist_elems).expect("tb hess_hist");
-	let sum_g = GpuBuffer::alloc(max_nodes).expect("tb node_sum_g");
-	let sum_h = GpuBuffer::alloc(max_nodes).expect("tb node_sum_h");
-	let lv = GpuBuffer::alloc(max_nodes).expect("tb leaf_val");
+		.map_err(|e| {
+			drop(Write::err(&format!("tb split_bin fill: {e}")));
+			e
+		})?;
+	let gh = GpuBuffer::alloc(hist_elems)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb grad_hist: {e}")));
+			e
+		})?;
+	let hh = GpuBuffer::alloc(hist_elems)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb hess_hist: {e}")));
+			e
+		})?;
+	let sum_g = GpuBuffer::alloc(max_nodes)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb node_sum_g: {e}")));
+			e
+		})?;
+	let sum_h = GpuBuffer::alloc(max_nodes)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb node_sum_h: {e}")));
+			e
+		})?;
+	let lv = GpuBuffer::alloc(max_nodes)
+		.map_err(|e| {
+			drop(Write::err(&format!("tb leaf_val: {e}")));
+			e
+		})?;
 
 	for d in 0..max_depth {
 		let level_base = (1usize << d) - 1;
 		let n_level = 1usize << d;
 		let level_bytes = n_level * p * n_bins * fsz;
-		gh.memset_zero(level_bytes).expect("tb grad_hist zero");
-		hh.memset_zero(level_bytes).expect("tb hess_hist zero");
+		gh.memset_zero(level_bytes).map_err(|e| {
+			drop(Write::err(&format!("tb grad_hist zero: {e}")));
+			e
+		})?;
+		hh.memset_zero(level_bytes).map_err(|e| {
+			drop(Write::err(&format!("tb hess_hist zero: {e}")));
+			e
+		})?;
 		gpu_tb_histogram(
 			tr_bins,
 			grad,
@@ -3594,11 +3655,18 @@ pub fn gpu_tree_build_into(
 		gpu_tb_repartition(tr_bins, &sf, &sb, n_tr, p, &node_assign)?;
 	}
 
-	sum_g.memset_zero(max_nodes * fsz)
-		.expect("tb node_sum_g zero");
-	sum_h.memset_zero(max_nodes * fsz)
-		.expect("tb node_sum_h zero");
-	lv.memset_zero(max_nodes * fsz).expect("tb leaf_val zero");
+	sum_g.memset_zero(max_nodes * fsz).map_err(|e| {
+		drop(Write::err(&format!("tb node_sum_g zero: {e}")));
+		e
+	})?;
+	sum_h.memset_zero(max_nodes * fsz).map_err(|e| {
+		drop(Write::err(&format!("tb node_sum_h zero: {e}")));
+		e
+	})?;
+	lv.memset_zero(max_nodes * fsz).map_err(|e| {
+		drop(Write::err(&format!("tb leaf_val zero: {e}")));
+		e
+	})?;
 	gpu_tb_leaf_sum(grad, hess, &node_assign, n_tr, &sum_g, &sum_h)?;
 	gpu_tb_leaf_val(&sum_g, &sum_h, lambda, max_nodes, 0, &lv)?;
 	gpu_tb_scatter(&node_assign, &lv, n_tr, tr_pred)?;
@@ -4767,11 +4835,13 @@ pub fn gpu_slice_rows(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let total_rows = x.n_floats() / cols;
-	assert!(
-		start + count <= total_rows,
-		"slice_rows: start({start}) + count({count}) = {} exceeds rows({total_rows})",
-		start + count
-	);
+	if !(start + count <= total_rows) {
+		drop(Write::err(&format!(
+			"slice_rows: start({start}) + count({count}) = {} exceeds rows({total_rows})",
+			start + count
+		)));
+		std::process::abort();
+	}
 	unsafe {
 		launch_slice_rows(
 			x.ptr as *const c_void,

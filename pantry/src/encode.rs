@@ -3,7 +3,7 @@
 //! split. Pure dat work — turns parsed rows (from `dat`) into a `Dataset`. The
 //! trainer crate above interprets what that `Dataset` means for a model; this
 //! module knows nothing of models, GPUs, or the forward pass.
-use recipe_infer::log::{Write, data};
+use recipe_infer::log::{Errored, Write, data};
 
 use crate::data::DirGroup;
 use crate::{Attr, Kind, Mat, Vec1};
@@ -108,7 +108,7 @@ fn infer_attrs(
 	rows: &[Vec<String>],
 	known: Option<&[Attr]>,
 	pre: Option<&[ColKind]>,
-) -> Vec<Attr> {
+) -> anyhow::Result<Vec<Attr>> {
 	let non_empty: Vec<Vec<&str>> = (0..headers.len())
 		.map(|j| {
 			rows.iter()
@@ -128,7 +128,7 @@ fn infer_attrs(
 			if pre.len() != headers.len()
 				|| pre.iter().zip(headers).any(|(c, name)| &c.header != name)
 			{
-				panic!(
+				Write::err(format!(
 					"detect_kinds drift: precomputed [{}] != parsed [{}]",
 					pre.iter()
 						.map(|c| c.header.as_str())
@@ -139,25 +139,28 @@ fn infer_attrs(
 						.map(String::as_str)
 						.collect::<Vec<_>>()
 						.join(", "),
-				);
+				))?;
 			}
 			to_predict.iter().map(|&j| pre[j].kind).collect()
 		}
 		None if to_predict.is_empty() => Vec::new(),
-		None => panic!(
-			"column(s) [{}] have no load-time kind and no train-schema attr — detection runs at Data::load, never mid-run",
-			to_predict
-				.iter()
-				.map(|&j| headers[j].as_str())
-				.collect::<Vec<_>>()
-				.join(", "),
-		),
+		None => {
+			Write::err(format!(
+				"column(s) [{}] have no load-time kind and no train-schema attr — detection runs at Data::load, never mid-run",
+				to_predict
+					.iter()
+					.map(|&j| headers[j].as_str())
+					.collect::<Vec<_>>()
+					.join(", "),
+			))?;
+			Vec::new()
+		}
 	};
 	let mut pred = std::collections::HashMap::new();
 	for (i, &j) in to_predict.iter().enumerate() {
 		pred.insert(j, preds[i]);
 	}
-	headers
+	Ok(headers
 		.iter()
 		.enumerate()
 		.map(|(j, name)| {
@@ -182,7 +185,7 @@ fn infer_attrs(
 				kind,
 			}
 		})
-		.collect()
+		.collect())
 }
 
 /// Encode one column purely by its `Kind` — identical whether the column is a
@@ -376,7 +379,8 @@ fn encode(
 	}
 	Ok((
 		names,
-		Mat::from_shape_vec((n, w), dat).expect("encode: reshape"),
+		Mat::from_shape_vec((n, w), dat)
+			.map_err(|e| Errored::new(format!("encode: reshape: {e}")))?,
 		Vec1::from(ydata),
 		k,
 	))
@@ -485,7 +489,7 @@ fn admit_ceiling(
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
-	Write::err(&line.join(", "));
+	drop(Write::err(line.join(", ")));
 	Err(CeilingExceeded {
 		label: label.to_string(),
 		rows: n,
@@ -601,7 +605,8 @@ impl Assembled {
 					}
 				}
 				buf.truncate(n * w);
-				return Ok(Mat::from_shape_vec((n, w), buf).expect("select reshape"));
+				return Ok(Mat::from_shape_vec((n, w), buf)
+					.map_err(|e| Errored::new(format!("select reshape: {e}")))?);
 			}
 		}
 
@@ -624,7 +629,8 @@ impl Assembled {
 				dat[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
 			}
 		}
-		Ok(Mat::from_shape_vec((n, w), dat).expect("select reshape"))
+		Ok(Mat::from_shape_vec((n, w), dat)
+			.map_err(|e| Errored::new(format!("select reshape: {e}")))?)
 	}
 }
 
@@ -668,7 +674,7 @@ fn encode_group(
 				cells,
 				schema_in.and_then(|s| s.get(name)).map(Vec::as_slice),
 				pre,
-			);
+			)?;
 			schema.insert(name.clone(), attrs.clone());
 
 			let skip = exclude_mask(&attrs, name, exclude);
@@ -689,7 +695,8 @@ fn encode_group(
 			let names = (0..*dim)
 				.map(|i| namespaced(name, &format!("px{i}")))
 				.collect();
-			let x = Mat::from_shape_vec((n, *dim), dat).expect("image reshape");
+			let x = Mat::from_shape_vec((n, *dim), dat)
+				.map_err(|e| Errored::new(format!("image reshape: {e}")))?;
 			(names, x, Vec1::zeros(n), 0)
 		}
 	})
@@ -994,7 +1001,10 @@ pub fn shuffle_split(
 			yd.extend((0..k).map(|j| y[i * k + j]));
 		}
 		Dataset {
-			x: Mat::from_shape_vec((sel.len(), cols), xd).expect("split: x reshape"),
+			x: Mat::from_shape_vec((sel.len(), cols), xd).unwrap_or_else(|e| {
+				drop(Write::err(format!("split: x reshape: {e}")));
+				std::process::abort();
+			}),
 			y: Vec1::from(yd),
 			source: source.to_string(),
 			n_targets: k,
@@ -1068,10 +1078,12 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 			(0..v.len()).collect()
 		}
 		Nan::Error => {
-			assert!(
-				v.iter().all(|x| x.is_finite()),
-				"NaN/inf in '{name}' — no missing values allowed here"
-			);
+			if !v.iter().all(|x| x.is_finite()) {
+				drop(Write::err(format!(
+					"NaN/inf in '{name}' — no missing values allowed here"
+				)));
+				std::process::abort();
+			}
 			(0..v.len()).collect()
 		}
 		Nan::Drop => (0..v.len()).filter(|&i| v[i].is_finite()).collect(),
@@ -1087,17 +1099,17 @@ pub fn clean_dataset(d: &mut Dataset) {
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		Write::err(&format!(
+		drop(Write::err(format!(
 			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
-		));
+		)));
 		std::process::exit(1);
 	}
 	if d.y.len() < n * k {
-		Write::err(&format!(
+		drop(Write::err(format!(
 			"{k} target column(s) but {} target value(s)  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			d.y.len(),
 			n * k
-		));
+		)));
 		std::process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();

@@ -1,4 +1,4 @@
-use gpu_core::log::Write;
+use gpu_core::log::{Errored, Write};
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
 use anyhow::Context;
@@ -309,8 +309,8 @@ pub fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let tmp = std::env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", std::process::id()));
 	let Some(tp) = tmp.to_str() else {
-		assert!(false, "utf8 tmp");
-		return String::new();
+		drop(Write::err("utf8 tmp"));
+		std::process::abort();
 	};
 	let _ = std::fs::remove_file(tp);
 	let g = ogdl::file(tp);
@@ -402,14 +402,18 @@ pub fn plan_layer_params(
 					e.dims.out_dim
 				}
 			});
-			assert!(
-				in_dim.is_multiple_of(d_tok),
-				"attn: input {in_dim} not a multiple of token dim {d_tok}"
-			);
-			assert!(
-				d_tok.is_multiple_of(heads),
-				"attn: token dim {d_tok} not divisible by {heads} heads"
-			);
+			if !in_dim.is_multiple_of(d_tok) {
+				return Err(Errored::new(format!(
+					"attn: input {in_dim} not a multiple of token dim {d_tok}"
+				))
+				.to_string());
+			}
+			if !d_tok.is_multiple_of(heads) {
+				return Err(Errored::new(format!(
+					"attn: token dim {d_tok} not divisible by {heads} heads"
+				))
+				.to_string());
+			}
 			let need = d_tok * d_tok;
 			let (w, wk, wv, wo) = if try_resume {
 				let (sq, sk, sv, so) = match resumed.get(si) {
@@ -671,7 +675,7 @@ pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match std::fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
-			Write::err(&format!("no data in {path}, initialized random weights and biases"));
+			drop(Write::err(&format!("no data in {path}, initialized random weights and biases")));
 			return Ok(Vec::new());
 		}
 	};

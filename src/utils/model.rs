@@ -365,22 +365,25 @@ impl Train {
 		let prepared = match dat.prepared() {
 			Ok(v) => v,
 			Err(e) => {
-				assert!(
-					e.downcast_ref::<pantry::encode::CeilingExceeded>()
-						.is_some(),
-					"run: prepare data: {e:#}"
-				);
-				Write::err(
+				if e.downcast_ref::<pantry::encode::CeilingExceeded>()
+					.is_none()
+				{
+					drop(Write::err(format!("run: prepare data: {e:#}")));
+					std::process::abort();
+				}
+				drop(Write::err(
 					"skipped  scenario exceeds the VRAM+RAM+disk ceiling (size above)",
-				);
+				));
 				return self;
 			}
 		};
 		let ds = prepared.get();
-		assert!(
-			matches!(dat.infer_only(), InferOnly::Fit) && self.epochs >= 1 && ds.has_target,
-			"run: forward-only data — Train is fit-only; use recipe.infer().run(&model).eval(&data)"
-		);
+		if !(matches!(dat.infer_only(), InferOnly::Fit) && self.epochs >= 1 && ds.has_target) {
+			drop(Write::err(
+				"run: forward-only data — Train is fit-only; use recipe.infer().run(&model).eval(&data)",
+			));
+			std::process::abort();
+		}
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
 				let cs = crate::ok_or_die(wnet.connect(), "net: connect");
@@ -402,7 +405,7 @@ impl Train {
 		});
 		let issues = preflight(model, ds, net_ram);
 		let Gate::Proceed = confirm_issues(&issues) else {
-			Write::err("aborted");
+			drop(Write::err("aborted"));
 			return self;
 		};
 		{
@@ -414,23 +417,26 @@ impl Train {
 						Write::line(device, "-- run pre-fit --");
 						Write::block(
 							device,
-							&gpu_core::callspy::report_since(a),
+							&gpu_core::callspy::report_since(a).serialize(),
 						)
 					})
 					.unwrap_or(());
 				let __fit = model.fit(ds, self, resume.as_deref(), conns);
-				assert!(
-					__fit.is_ok(),
-					"run: fit: {}",
-					__fit.as_ref()
-						.err()
-						.map(|e| format!("{e:#}"))
-						.unwrap_or_default()
-				);
+				if !__fit.is_ok() {
+					drop(Write::err(format!(
+						"run: fit: {}",
+						__fit
+							.as_ref()
+							.err()
+							.map(|e| format!("{e:#}"))
+							.unwrap_or_default()
+					)));
+					std::process::abort();
+				}
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())
 					.filter(|_probe| INTERRUPTED.load(Ordering::SeqCst) != 0)
-					.map(|_flag| Write::err("interrupted"))
+					.map(|_flag| drop(Write::err("interrupted")))
 					.unwrap_or(());
 				let score = model.fit_score.get();
 				post_fit
@@ -439,7 +445,7 @@ impl Train {
 						Write::line(device, "-- run post-fit --");
 						Write::block(
 							device,
-							&gpu_core::callspy::report_since(p),
+							&gpu_core::callspy::report_since(p).serialize(),
 						)
 					})
 					.unwrap_or(());
@@ -455,9 +461,9 @@ impl Train {
 				last.raw_test_headers = dat.raw_headers();
 				drop(last);
 				if let Some((tree, errs)) = gpu_core::callspy::state_report(&run_state) {
-					Write::block(device, &tree);
+					Write::block(device, &tree.serialize());
 					for e in errs {
-						Write::err(&e);
+						drop(Write::err(&e));
 					}
 				}
 			}
@@ -492,7 +498,10 @@ impl Train {
 			},
 			None => {
 				let params = model.params.borrow();
-				assert!(!params.is_empty(), "save: model has no trained params");
+				if params.is_empty() {
+					drop(Write::err("save: model has no trained params"));
+					std::process::abort();
+				}
 				Rendered {
 					text: recipe_infer::dump_ogdl(&params, filter, key, score),
 					neurons: params.iter().map(|p| p.out_dim).sum::<usize>(),
@@ -500,14 +509,16 @@ impl Train {
 			}
 		};
 		let __wr = recipe_infer::write_ogdl(&path, &rendered.text);
-		assert!(
-			__wr.is_ok(),
-			"write model file: {}",
-			__wr.as_ref()
-				.err()
-				.map(|e| format!("{e:#}"))
-				.unwrap_or_default()
-		);
+		if !__wr.is_ok() {
+			drop(Write::err(format!(
+				"write model file: {}",
+				__wr.as_ref()
+					.err()
+					.map(|e| format!("{e:#}"))
+					.unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		let full = std::fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
 		Write::line(save, &format!(
 			"saved {} ({} neurons, {key} {score:.4})",
@@ -573,10 +584,12 @@ impl Infer {
 		});
 		match &model.inner.gguf {
 			Some(path) => {
-				assert!(
-					std::env::var_os("VRAM_PROBE").is_none(),
-					"infer: VRAM_PROBE set — the binary's main must call recipe_infer::llm::vram_probe_ask() and exit with its code before run()"
-				);
+				if std::env::var_os("VRAM_PROBE").is_some() {
+					drop(Write::err(
+						"infer: VRAM_PROBE set — the binary's main must call recipe_infer::llm::vram_probe_ask() and exit with its code before run()",
+					));
+					std::process::abort();
+				}
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
 						crate::tui::chat(path);
@@ -622,7 +635,10 @@ impl Infer {
 	fn eval_on(&self, dat: &dyn RunData) -> &Infer {
 		let last_model = {
 			let last = self.last.borrow();
-			assert!(!last.model.is_null(), "infer: call run(&model) first");
+			if last.model.is_null() {
+				drop(Write::err("infer: call run(&model) first"));
+				std::process::abort();
+			}
 			last.model
 		};
 		let model: &ModelInner = unsafe { &*last_model };
@@ -645,7 +661,10 @@ impl Infer {
 		let arena = model.begin_forward();
 		let ei = model.prep_eval_input(ds);
 		let params = model.params.borrow();
-		assert!(!params.is_empty(), "eval: call train first");
+		if params.is_empty() {
+			drop(Write::err("eval: call train first"));
+			std::process::abort();
+		}
 		let k = params[params.len() - 1].out_dim;
 		let yscaler = *model.yscaler.borrow();
 		let sp = match Some(()).filter(|_probe| ds.has_target && !metrics.is_empty()) {
@@ -657,14 +676,16 @@ impl Infer {
 						"eval: metrics: ybuf",
 					);
 					let __ld = __ub.load(__up);
-					assert!(
-						__ld.is_ok(),
-						"eval: metrics: ybuf: {}",
-						__ld.as_ref()
-							.err()
-							.map(|e| format!("{e:#}"))
-							.unwrap_or_default()
-					);
+					if !__ld.is_ok() {
+						drop(Write::err(format!(
+							"eval: metrics: ybuf: {}",
+							__ld.as_ref()
+								.err()
+								.map(|e| format!("{e:#}"))
+								.unwrap_or_default()
+						)));
+						std::process::abort();
+					}
 					__ub
 				};
 				let total = (ei.n * k) as f64;
@@ -1055,14 +1076,14 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 	let interactive = std::io::stdin().is_terminal();
 	for i in 0..issues.len() {
 		let issue = &issues[i];
-		Write::err(&format!(
+		drop(Write::err(&format!(
 			"preflight {}/{}  {}",
 			i + 1,
 			issues.len(),
 			issue.what,
-		));
-		Write::err(&format!("    have: {}", issue.have));
-		Write::err(&format!("    need: {}", issue.need));
+		)));
+		drop(Write::err(&format!("    have: {}", issue.have)));
+		drop(Write::err(&format!("    need: {}", issue.need)));
 	}
 	let Some(_probe) = Some(()).filter(|_gate| interactive) else {
 		return Gate::Abort;
@@ -1107,14 +1128,16 @@ impl Model {
 			"Model::load staged alloc",
 		);
 		let __sl = staged.load(host);
-		assert!(
-			__sl.is_ok(),
-			"Model::load staged load: {}",
-			__sl.as_ref()
-				.err()
-				.map(|e| format!("{e:#}"))
-				.unwrap_or_default()
-		);
+		if !__sl.is_ok() {
+			drop(Write::err(format!(
+				"Model::load staged load: {}",
+				__sl.as_ref()
+					.err()
+					.map(|e| format!("{e:#}"))
+					.unwrap_or_default()
+			)));
+			std::process::abort();
+		}
 		let params = plan.materialize(&staged, 0);
 		*inner.rebuild_backing.borrow_mut() = Some(staged);
 		*inner.params.borrow_mut() = params;

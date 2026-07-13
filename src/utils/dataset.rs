@@ -293,10 +293,12 @@ impl Data {
 	}
 
 	pub fn split(mut self, train_frac: f64) -> Data {
-		assert!(
-			(0.0..1.0).contains(&train_frac),
-			"split fraction must be in (0, 1), got {train_frac}",
-		);
+		if !(0.0..1.0).contains(&train_frac) {
+			drop(Write::err(format!(
+				"split fraction must be in (0, 1), got {train_frac}"
+			)));
+			std::process::abort();
+		}
 		self.inner.split_frac = Some(train_frac);
 		self
 	}

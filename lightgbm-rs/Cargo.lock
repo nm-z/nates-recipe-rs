@@ -31,6 +31,9 @@ name = "gpu-core"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
+ "log",
+ "ogdl",
 ]
 
 [[package]]
@@ -58,6 +61,14 @@ dependencies = [
  "rand",
  "rand_chacha",
 ]
+
+[[package]]
+name = "log"
+version = "1.0.0"
+
+[[package]]
+name = "ogdl"
+version = "0.1.0"
 
 [[package]]
 name = "ppv-lite86"
