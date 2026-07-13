@@ -1,4 +1,4 @@
-use gpu_core::log::{Errored, Opt, Write, gpu, probe, set_opt};
+use gpu_core::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
 use anyhow::Result;
 
 fn usage(code: i32) -> ! {
@@ -184,15 +184,22 @@ fn main() -> Result<()> {
 			Ok(())
 		}
 		"peers" => {
+			set_opt(Opt {
+				net: true,
+				..Opt::default()
+			});
 			for p in recipe::wire::local_peers()? {
-				println!(
-					"{}\t{}\t{}\t{} gpu\t{} MiB vram\t{} MiB ram",
-					p.host,
-					p.addrs.join(","),
-					p.info.arch,
-					p.info.gpus,
-					p.info.vram >> 20,
-					p.info.ram >> 20
+				Write::line(
+					net,
+					&format!(
+						"{}\t{}\t{}\t{} gpu\t{} MiB vram\t{} MiB ram",
+						p.host,
+						p.addrs.join(","),
+						p.info.arch,
+						p.info.gpus,
+						p.info.vram >> 20,
+						p.info.ram >> 20
+					),
 				);
 			}
 			Ok(())
