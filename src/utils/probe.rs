@@ -66,11 +66,11 @@ impl Machine {
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
-			Write::line(probe, &format!("recipe probe: measuring gpu{d}"));
+			Write::line(probe, &format!("measuring gpu{d}"));
 			match measure_gpu_child(d) {
 				Ok(g) => gpus.push(g),
 				Err(e) => Write::line(probe, &format!(
-					"recipe probe: gpu{d} not drivable by this binary ({e}) — storage node"
+					"gpu{d} not drivable by this binary ({e}) — storage node"
 				)),
 			}
 		}
@@ -81,24 +81,24 @@ impl Machine {
 		}
 		drop(job);
 		let ram = mem_total()?;
-		Write::line(probe, &format!("recipe probe: ram {} MiB", ram >> 20));
+		Write::line(probe, &format!("ram {} MiB", ram >> 20));
 		let copy_bytes = bench_bytes(2)?;
 		Write::line(probe, &format!(
-			"recipe probe: measuring ram bandwidth ({} MiB copy x5)",
+			"measuring ram bandwidth ({} MiB copy x5)",
 			copy_bytes >> 20
 		));
 		let ddr5_gbs = bench_ddr5(copy_bytes);
-		Write::line(probe, &format!("recipe probe: ram copy {ddr5_gbs:.3} GB/s"));
+		Write::line(probe, &format!("ram copy {ddr5_gbs:.3} GB/s"));
 		let read_bytes = bench_bytes(1)?;
 		Write::line(probe, &format!(
-			"recipe probe: measuring cpu read ({} MiB x5)",
+			"measuring cpu read ({} MiB x5)",
 			read_bytes >> 20
 		));
 		let cpu_transfer_gbs = bench_cpu_read(read_bytes);
-		Write::line(probe, &format!("recipe probe: cpu read {cpu_transfer_gbs:.3} GB/s"));
-		Write::line(probe, "recipe probe: measuring cpu flops");
+		Write::line(probe, &format!("cpu read {cpu_transfer_gbs:.3} GB/s"));
+		Write::line(probe, "measuring cpu flops");
 		let cpu_gflops = bench_cpu_flops();
-		Write::line(probe, &format!("recipe probe: cpu {cpu_gflops:.1} GFLOP/s"));
+		Write::line(probe, &format!("cpu {cpu_gflops:.1} GFLOP/s"));
 		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
 		let disk_bytes = (256usize << 20).min(host_budget(1)?);
@@ -107,13 +107,13 @@ impl Machine {
 			"probe: no free ram for the disk bench buffer"
 		);
 		Write::line(probe, &format!(
-			"recipe probe: measuring disk (sata, {} MiB)",
+			"measuring disk (sata, {} MiB)",
 			disk_bytes >> 20
 		));
 		let sata_gbs = bench_disk(&dd, disk_bytes)?;
 		let eth_gbs = link_speed_gbs();
 		Write::line(probe, &format!(
-			"recipe probe: link {eth_gbs:.3} GB/s ({})",
+			"link {eth_gbs:.3} GB/s ({})",
 			eth_label(eth_gbs)
 		));
 		Ok(Machine {
@@ -358,16 +358,16 @@ fn probe_gpu_child_record(dev: i32) -> Result<String> {
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
 	gpu_core::hip::set_device(dev)?;
 	let total = gpu_core::hip::mem_info()?.total;
-	Write::line(probe, &format!("recipe probe: gpu{dev} {} MiB vram", total >> 20));
-	Write::line(probe, &format!("recipe probe: gpu{dev} measuring pcie (64 MiB h2d x5)"));
+	Write::line(probe, &format!("gpu{dev} {} MiB vram", total >> 20));
+	Write::line(probe, &format!("gpu{dev} measuring pcie (64 MiB h2d x5)"));
 	let pcie_gbs = bench_pcie_h2d()?;
-	Write::line(probe, &format!("recipe probe: gpu{dev} pcie {pcie_gbs:.3} GB/s"));
-	Write::line(probe, &format!("recipe probe: gpu{dev} measuring flops (2048^3 f64 gemm x5)"));
+	Write::line(probe, &format!("gpu{dev} pcie {pcie_gbs:.3} GB/s"));
+	Write::line(probe, &format!("gpu{dev} measuring flops (2048^3 f64 gemm x5)"));
 	let flops_gflops = bench_gemm()?;
-	Write::line(probe, &format!("recipe probe: gpu{dev} {flops_gflops:.1} GFLOP/s"));
-	Write::line(probe, &format!("recipe probe: gpu{dev} measuring transfer (256 MiB d2d x5)"));
+	Write::line(probe, &format!("gpu{dev} {flops_gflops:.1} GFLOP/s"));
+	Write::line(probe, &format!("gpu{dev} measuring transfer (256 MiB d2d x5)"));
 	let transfer_gbs = bench_transfer()?;
-	Write::line(probe, &format!("recipe probe: gpu{dev} transfer {transfer_gbs:.3} GB/s"));
+	Write::line(probe, &format!("gpu{dev} transfer {transfer_gbs:.3} GB/s"));
 	Ok(GpuDev {
 		vram: total as u64,
 		pcie_gbs,
@@ -549,7 +549,7 @@ fn bench_disk(dir: &Path, bytes: usize) -> Result<f64> {
 	drop(f);
 	std::fs::remove_file(&path).ok();
 	Write::line(probe, &format!(
-		"recipe probe: disk write {write_gbs:.3} GB/s, read {read_gbs:.3} GB/s"
+		"disk write {write_gbs:.3} GB/s, read {read_gbs:.3} GB/s"
 	));
 	Ok(read_gbs)
 }

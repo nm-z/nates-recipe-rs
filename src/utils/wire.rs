@@ -303,7 +303,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 		Ok(s) => s,
 		Err(e) => {
 			drop(Write::err(&format!(
-				"recipe serve: discovery listener bind failed: {e}"
+				"discovery listener bind failed: {e}"
 			)));
 			return;
 		}
@@ -398,7 +398,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 		.err()
 		.into_iter()
 	{
-		drop(Write::err(&format!("recipe serve: config write failed: {e}")));
+		drop(Write::err(&format!("config write failed: {e}")));
 	}
 }
 
@@ -686,7 +686,7 @@ impl Server {
 				.err()
 				.into_iter()
 			{
-				drop(Write::err(&format!("recipe serve: config write failed: {e}")));
+				drop(Write::err(&format!("config write failed: {e}")));
 			}
 		}
 		let bm = machine.clone();
@@ -695,7 +695,7 @@ impl Server {
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
 		Write::line(net, &format!(
-			"recipe serve: {} ({}) on {} (ram {} MiB)",
+			"{} ({}) on {} (ram {} MiB)",
 			self.info.arch,
 			hostname(),
 			listener
@@ -714,7 +714,7 @@ impl Server {
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
 					drop(Write::err(&format!(
-						"recipe serve: connection ended: {e}"
+						"connection ended: {e}"
 					)));
 				}
 			});
