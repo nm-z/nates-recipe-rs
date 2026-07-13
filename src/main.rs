@@ -5,6 +5,7 @@ fn usage(code: i32) -> ! {
 	drop(Write::err(&format!("recipe {}", env!("CARGO_PKG_VERSION"))));
 	drop(Write::err("usage: recipe <file.rs> [args]  # compile + run"));
 	drop(Write::err("       recipe serve            # daemon on 7845"));
+	drop(Write::err("       recipe peers            # live network view"));
 	std::process::exit(code);
 }
 
@@ -180,6 +181,20 @@ fn main() -> Result<()> {
 			recipe::wire::Server::new(info, runners)
 				.machine(machine)
 				.serve_bound(listener)?;
+			Ok(())
+		}
+		"peers" => {
+			for p in recipe::wire::local_peers()? {
+				println!(
+					"{}\t{}\t{}\t{} gpu\t{} MiB vram\t{} MiB ram",
+					p.host,
+					p.addrs.join(","),
+					p.info.arch,
+					p.info.gpus,
+					p.info.vram >> 20,
+					p.info.ram >> 20
+				);
+			}
 			Ok(())
 		}
 		other => {
