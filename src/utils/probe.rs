@@ -660,6 +660,10 @@ pub fn config_path() -> Result<PathBuf> {
 	Ok(config_dir()?.join("config.ogdl"))
 }
 
+pub fn pool_path() -> Result<PathBuf> {
+	Ok(config_dir()?.join("pool.ogdl"))
+}
+
 pub fn write_config_atomic(machines: &[Machine]) -> Result<()> {
 	let path = config_path()?;
 	for parent in path.parent().into_iter() {

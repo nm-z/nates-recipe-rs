@@ -184,23 +184,62 @@ fn main() -> Result<()> {
 			Ok(())
 		}
 		"peers" => {
+			use std::io::IsTerminal;
 			set_opt(Opt {
 				net: true,
 				..Opt::default()
 			});
+			let off = recipe::wire::pool_deselected();
+			let me = recipe::wire::self_host();
+			let mine = recipe::wire::NodeInfo::probe();
+			let mut rows = vec![recipe::tui::PeerRow {
+				detail: format!(
+					"{}  {} gpu  {} MiB vram  {} MiB ram",
+					mine.arch,
+					mine.gpus,
+					mine.vram >> 20,
+					mine.ram >> 20
+				),
+				selected: !off.contains(&me),
+				host: me,
+				local: true,
+			}];
 			for p in recipe::wire::local_peers()? {
-				Write::line(
-					net,
-					&format!(
-						"{}\t{}\t{}\t{} gpu\t{} MiB vram\t{} MiB ram",
-						p.host,
+				rows.push(recipe::tui::PeerRow {
+					detail: format!(
+						"{}  {}  {} gpu  {} MiB vram  {} MiB ram",
 						p.addrs.join(","),
 						p.info.arch,
 						p.info.gpus,
 						p.info.vram >> 20,
 						p.info.ram >> 20
 					),
-				);
+					selected: !off.contains(&p.host),
+					host: p.host,
+					local: false,
+				});
+			}
+			match std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+				true => {
+					let save = recipe::tui::peers_picker(&mut rows);
+					for _saved in Some(()).filter(|_u| save).into_iter() {
+						let deselected: Vec<String> = rows
+							.iter()
+							.filter(|r| !r.selected)
+							.map(|r| r.host.clone())
+							.collect();
+						recipe::wire::pool_write(&deselected)?;
+					}
+				}
+				false => {
+					for r in &rows {
+						let state = match r.selected {
+							true => "on",
+							false => "off",
+						};
+						Write::line(net, &format!("{state}\t{}\t{}", r.host, r.detail));
+					}
+				}
 			}
 			Ok(())
 		}

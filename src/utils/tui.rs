@@ -388,6 +388,80 @@ fn render_chat(
 	frame.render_widget(input, outer[1]);
 }
 
+pub struct PeerRow {
+	pub host: String,
+	pub detail: String,
+	pub selected: bool,
+	pub local: bool,
+}
+
+fn render_peers(frame: &mut Frame, rows: &[PeerRow], cur: usize) {
+	let mut lines: Vec<Line> = Vec::new();
+	lines.push(Line::from(Span::styled(
+		"pool  (arrows move, space toggle, enter save, q quit)",
+		Style::default()
+			.fg(Color::Rgb(120, 200, 255))
+			.add_modifier(Modifier::BOLD),
+	)));
+	lines.push(Line::from(""));
+	for (i, r) in rows.iter().enumerate() {
+		let mark = match r.selected {
+			true => "[x]",
+			false => "[ ]",
+		};
+		let tag = match r.local {
+			true => "  (this machine)",
+			false => "",
+		};
+		let base = match r.selected {
+			true => Style::default(),
+			false => Style::default().fg(Color::DarkGray),
+		};
+		let style = match i == cur {
+			true => base.add_modifier(Modifier::REVERSED),
+			false => base,
+		};
+		lines.push(Line::from(Span::styled(
+			format!(" {mark} {}{tag}  {}", r.host, r.detail),
+			style,
+		)));
+	}
+	let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+	frame.render_widget(para, frame.area());
+}
+
+pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
+	let mut term = ratatui::init();
+	let _guard = TermRestore;
+	let mut cur = 0usize;
+	loop {
+		let _drawn = term.draw(|f| render_peers(f, rows, cur));
+		let ev = match event::read() {
+			Ok(e) => e,
+			Err(_e) => return false,
+		};
+		let Event::Key(k) = ev else { continue };
+		let KeyEventKind::Press = k.kind else { continue };
+		match (k.code, k.modifiers) {
+			(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return false,
+			(KeyCode::Esc, _mods) | (KeyCode::Char('q'), _mods) => return false,
+			(KeyCode::Enter, _mods) => return true,
+			(KeyCode::Up, _mods) | (KeyCode::Char('k'), _mods) => {
+				cur = cur.saturating_sub(1);
+			}
+			(KeyCode::Down, _mods) | (KeyCode::Char('j'), _mods) => {
+				cur = (cur + 1).min(rows.len().saturating_sub(1));
+			}
+			(KeyCode::Char(' '), _mods) => {
+				for r in rows.get_mut(cur).into_iter() {
+					r.selected = !r.selected;
+				}
+			}
+			_other => {}
+		}
+	}
+}
+
 pub fn chat(gguf: &str) {
 	crate::some_or_die(std::io::stdin().is_terminal().then_some(()), "chat: needs a tty");
 	let mut term = ratatui::init();

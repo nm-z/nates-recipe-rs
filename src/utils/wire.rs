@@ -264,6 +264,10 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 	let host = hostname();
 	let mach_line = machine.as_ref().map(|m| m.beacon_encode());
 	loop {
+		if pool_deselected().contains(&host) {
+			thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
+			continue;
+		}
 		let info = NodeInfo::probe();
 		for i in ifaces() {
 			let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(i.ip), 0);
@@ -466,6 +470,40 @@ fn decode_peers(b: &[u8]) -> Vec<PeerEntry> {
 pub fn local_peers() -> Result<Vec<PeerEntry>> {
 	let c = Conn::connect(&format!("127.0.0.1:{PORT}"))?;
 	Ok(decode_peers(&c.call(Op::Peers, 0, 0, Vec::new())?.data))
+}
+
+pub fn self_host() -> String {
+	hostname()
+}
+
+pub fn pool_deselected() -> std::collections::HashSet<String> {
+	let Ok(path) = crate::probe::pool_path() else {
+		return std::collections::HashSet::new();
+	};
+	let Ok(s) = std::fs::read_to_string(path) else {
+		return std::collections::HashSet::new();
+	};
+	s.lines()
+		.map(str::trim)
+		.filter(|l| !l.is_empty())
+		.map(str::to_string)
+		.collect()
+}
+
+pub fn pool_write(deselected: &[String]) -> Result<()> {
+	let path = crate::probe::pool_path()?;
+	for parent in path.parent().into_iter() {
+		std::fs::create_dir_all(parent)?;
+	}
+	let tmp = path.with_extension("ogdl.tmp");
+	let mut text = String::new();
+	for h in deselected {
+		text.push_str(h);
+		text.push(NL);
+	}
+	std::fs::write(&tmp, text)?;
+	std::fs::rename(&tmp, &path)?;
+	Ok(())
 }
 
 pub struct Conn {
@@ -801,7 +839,13 @@ impl Net {
 			anyhow::anyhow!("wire: no local daemon for discovery (recipe serve): {e}")
 		})?;
 		ensure!(!peers.is_empty(), "wire: local daemon hears no peers");
-		peers.iter()
+		let off = pool_deselected();
+		let picked: Vec<&PeerEntry> = peers.iter().filter(|p| !off.contains(&p.host)).collect();
+		ensure!(
+			!picked.is_empty(),
+			"wire: every live peer is deselected from the pool (recipe peers)"
+		);
+		picked.iter()
 			.map(|p| connect_first(&p.host, &p.addrs))
 			.collect()
 	}
