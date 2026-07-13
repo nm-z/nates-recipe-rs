@@ -1,57 +1,6 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy)]
-enum Platform {
-	Amd,
-	Nvidia,
-}
-
-// Selects the GPU backend. Honors an explicit GPU_PLATFORM (or HIP_PLATFORM)
-// override, otherwise detects the actual hardware/toolchain present so a plain
-// `cargo build` works on either an AMD/ROCm box or an NVIDIA/CUDA box. Defaults
-// to "amd" (the historical behavior) when nothing conclusive is found.
-fn detect_platform() -> Platform {
-	let explicit = std::env::var("GPU_PLATFORM")
-		.or_else(|_e| std::env::var("HIP_PLATFORM"))
-		.ok();
-	match explicit {
-		Some(p) => match Some(()).filter(|_u| p == "nvidia") {
-			Some(()) => Platform::Nvidia,
-			None => Platform::Amd,
-		},
-		None => {
-			let cuda =
-				std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
-			let have_nvcc = Path::new(&format!("{cuda}/bin/nvcc")).exists();
-			let nvidia_gpu = Path::new("/proc/driver/nvidia").exists();
-			let amd_gpu =
-				Path::new("/sys/module/amdgpu").exists() || Path::new("/dev/kfd").exists();
-			match Some(()).filter(|_u| nvidia_gpu && have_nvcc && !amd_gpu) {
-				Some(()) => Platform::Nvidia,
-				None => Platform::Amd,
-			}
-		}
-	}
-}
-
-// ROCm install discovery: explicit ROCM_PATH wins, then `hipconfig --path`
-// (authoritative on any box with HIP installed), then the documented /opt/rocm
-// default. link_amd appends /lib to this for the rustc link search.
-fn rocm_path() -> String {
-	match std::env::var("ROCM_PATH") {
-		Ok(p) => p,
-		Err(_e) => {
-			let out = std::process::Command::new("hipconfig").arg("--path").output();
-			let found = out.ok().filter(|o| o.status.success()).map(|o| {
-				String::from_utf8_lossy(&o.stdout).trim().to_string()
-			});
-			match found.filter(|p| !p.is_empty()) {
-				Some(p) => p,
-				None => "/opt/rocm".to_string(),
-			}
-		}
-	}
-}
+include!("../hipdetect.rs");
 
 fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	let Ok(entries) = std::fs::read_dir(dir) else {
@@ -180,9 +129,25 @@ fn enforce_memory_chokepoints() {
 	}
 }
 
+fn archive(out_dir: &str, name: &str, objects: &[String]) {
+	let lib_path = format!("{out_dir}/lib{name}.a");
+	drop(std::fs::remove_file(&lib_path));
+	if objects.is_empty() {
+		return;
+	}
+	let mut ar = std::process::Command::new("ar");
+	ar.args(["rcs", &lib_path]);
+	for obj in objects {
+		ar.arg(obj);
+	}
+	let status = ar.status().expect("ar failed");
+	assert!(status.success(), "ar failed for {lib_path}");
+}
+
 fn main() {
 	ban_direct_blas();
 	enforce_memory_chokepoints();
+	println!("cargo:rerun-if-changed=../hipdetect.rs");
 	let platform = detect_platform();
 	let out_dir = std::env::var("OUT_DIR").unwrap();
 
@@ -192,17 +157,16 @@ fn main() {
 	let mut objects = Vec::new();
 
 	match platform {
-		Platform::Nvidia => build_nvidia(&hip_files, &out_dir, &mut objects),
 		Platform::Amd => build_amd(&hip_files, &out_dir, &mut objects),
+		Platform::Nvidia => build_nvidia(&hip_files, &out_dir, &mut objects),
 	}
 
-	// Drop stale kernel/shim objects from previous builds.
+	// Drop stale kernel/shim objects from previous builds (OUT_DIR .o files are
+	// exclusively ours, so a platform flip also sweeps the other backend's set).
 	for entries in std::fs::read_dir(&out_dir).into_iter() {
 		for entry in entries.flatten() {
 			let p = entry.path();
-			let stale = p
-				.to_str()
-				.is_some_and(|s| s.ends_with("_hip.o") || s.ends_with("_shim.o"))
+			let stale = p.extension().is_some_and(|e| e == "o")
 				&& !objects.iter().any(|o| Path::new(o) == p);
 			if stale {
 				drop(std::fs::remove_file(&p));
@@ -210,22 +174,13 @@ fn main() {
 		}
 	}
 
-	if !objects.is_empty() {
-		let lib_path = format!("{}/libhipkernels.a", out_dir);
-		drop(std::fs::remove_file(&lib_path));
-		let mut ar = std::process::Command::new("ar");
-		ar.args(["rcs", &lib_path]);
-		for obj in &objects {
-			ar.arg(obj);
-		}
-		ar.status().expect("ar failed");
-		println!("cargo:rustc-link-search=native={}", out_dir);
-		println!("cargo:rustc-link-lib=static=hipkernels");
-	}
+	archive(&out_dir, "hipkernels", &objects);
+	println!("cargo:rustc-link-search=native={}", out_dir);
+	println!("cargo:rustc-link-lib=static=hipkernels");
 
 	match platform {
-		Platform::Nvidia => link_nvidia(),
 		Platform::Amd => link_amd(),
+		Platform::Nvidia => link_nvidia(),
 	}
 }
 
@@ -395,16 +350,12 @@ fn build_nvidia(hip_files: &[PathBuf], out_dir: &str, objects: &mut Vec<String>)
 }
 
 fn link_nvidia() {
+	let rocm = rocm_path();
 	let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
-	let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-	// Real hipBLAS, built from source for HIP_PLATFORM=nvidia (wraps cuBLAS).
-	// Override the location with HIPBLAS_NV_PREFIX; default is the vendored build.
-	let hipblas = std::env::var("HIPBLAS_NV_PREFIX")
-		.unwrap_or_else(|_e| format!("{manifest}/vendor/hipblas-nvidia"));
-	println!("cargo:rustc-link-search=native={hipblas}/lib");
-	println!("cargo:rustc-link-arg=-Wl,-rpath,{hipblas}/lib");
+	// hipBLAS/hipSOLVER/hipFFT built for the NVIDIA platform (wrap cuBLAS/
+	// cuSOLVER/cuFFT) live in the HIP install tree, same as on AMD.
+	println!("cargo:rustc-link-search=native={rocm}/lib");
 	println!("cargo:rustc-link-lib=dylib=hipblas");
-	// Vendored from-source hipSOLVER/hipFFT (wrap cuSOLVER/cuFFT); same dir/rpath.
 	println!("cargo:rustc-link-lib=dylib=hipsolver");
 	println!("cargo:rustc-link-lib=dylib=hipfft");
 	println!("cargo:rustc-link-search=native={cuda}/lib64");

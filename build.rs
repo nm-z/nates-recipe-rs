@@ -1,20 +1,16 @@
+include!("hipdetect.rs");
+
 fn main() {
+	println!("cargo:rerun-if-changed=hipdetect.rs");
 	match detect_platform() {
 		Platform::Nvidia => {
+			let rocm = rocm_path();
 			let cuda =
 				std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
-			// Real from-source hipBLAS (HIP_PLATFORM=nvidia → cuBLAS). HIPBLAS_NV_PREFIX
-			// overrides; default is the vendored build under gpu-core/.
-			let hipblas = std::env::var("HIPBLAS_NV_PREFIX").unwrap_or_else(|_e| {
-				format!(
-					"{}/gpu-core/vendor/hipblas-nvidia",
-					env!("CARGO_MANIFEST_DIR")
-				)
-			});
-			println!("cargo:rustc-link-search=native={hipblas}/lib");
-			println!("cargo:rustc-link-arg=-Wl,-rpath,{hipblas}/lib");
+			// hipBLAS/hipSOLVER/hipFFT for the NVIDIA platform (wrap cuBLAS/
+			// cuSOLVER/cuFFT) live in the HIP install tree, same as on AMD.
+			println!("cargo:rustc-link-search=native={rocm}/lib");
 			println!("cargo:rustc-link-lib=dylib=hipblas");
-			// Vendored from-source hipSOLVER/hipFFT (wrap cuSOLVER/cuFFT); same dir/rpath.
 			println!("cargo:rustc-link-lib=dylib=hipsolver");
 			println!("cargo:rustc-link-lib=dylib=hipfft");
 			println!("cargo:rustc-link-search=native={cuda}/lib64");
@@ -25,8 +21,7 @@ fn main() {
 			println!("cargo:rustc-link-lib=dylib=stdc++");
 		}
 		Platform::Amd => {
-			let rocm =
-				std::env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_string());
+			let rocm = rocm_path();
 			let rocm_extra =
 				std::env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
 			println!("cargo:rustc-link-search=native={rocm}/lib");
@@ -40,40 +35,6 @@ fn main() {
 		}
 	}
 	ban_sync_alloc();
-}
-
-enum Platform {
-	Nvidia,
-	Amd,
-}
-
-// Mirrors gpu-core/build.rs: explicit GPU_PLATFORM/HIP_PLATFORM override, else
-// detect the hardware/toolchain actually present. Defaults to "amd".
-fn detect_platform() -> Platform {
-	let configured = std::env::var("GPU_PLATFORM").or_else(|_e| std::env::var("HIP_PLATFORM"));
-	match configured {
-		Ok(value) => match Some(value.as_str()).filter(|name| *name == "nvidia") {
-			Some(_hit) => Platform::Nvidia,
-			None => Platform::Amd,
-		},
-		Err(_e) => {
-			let cuda =
-				std::env::var("CUDA_PATH").unwrap_or_else(|_e2| "/opt/cuda".to_string());
-			let have_nvcc = std::path::Path::new(&format!("{cuda}/bin/nvcc")).exists();
-			let nvidia_gpu = std::path::Path::new("/proc/driver/nvidia").exists();
-			let amd_gpu = std::path::Path::new("/sys/module/amdgpu").exists()
-				|| std::path::Path::new("/dev/kfd").exists();
-			// [nvidia_gpu, have_nvcc, amd_gpu]: nvidia only with an NVIDIA GPU + nvcc and no AMD.
-			match Some(())
-				.filter(|_u| nvidia_gpu)
-				.filter(|_u| have_nvcc)
-				.filter(|_u| !amd_gpu)
-			{
-				Some(()) => Platform::Nvidia,
-				None => Platform::Amd,
-			}
-		}
-	}
 }
 
 fn ban_sync_alloc() {
