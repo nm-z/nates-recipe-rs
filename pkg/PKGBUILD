@@ -21,6 +21,7 @@ build() {
     set -o pipefail
     cd nates-recipe-rs
     unset RUSTFLAGS DEBUG_RUSTFLAGS CFLAGS CXXFLAGS LDFLAGS
+    command -v sccache >/dev/null || unset RUSTC_WRAPPER
     export CARGO_TARGET_DIR="$srcdir/target-pkg"
     cargo build --release -p recipe -p gpu-core -p pantry -p recipe-infer -p ogdl \
         --message-format=json-render-diagnostics \
