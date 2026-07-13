@@ -627,8 +627,18 @@ impl Server {
 		self
 	}
 
+	pub fn bind(addr: impl std::net::ToSocketAddrs + std::fmt::Debug) -> Result<TcpListener> {
+		match TcpListener::bind(&addr) {
+			Ok(l) => Ok(l),
+			Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+				anyhow::bail!("recipe already running ({addr:?})")
+			}
+			Err(e) => Err(e.into()),
+		}
+	}
+
 	pub fn serve(self, addr: &str) -> Result<()> {
-		self.serve_bound(TcpListener::bind(addr)?)
+		self.serve_bound(Self::bind(addr)?)
 	}
 
 	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {

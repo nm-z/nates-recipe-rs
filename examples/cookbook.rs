@@ -39,6 +39,7 @@ fn main() {
 		.epochs(20)
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
+	let nn_infer = Infer::new().log([acc]);
 
 	let cnn = Model::new() // CNN
 		.loss(ce)
@@ -58,6 +59,7 @@ fn main() {
 		.epochs(20)
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
+	let cnn_infer = Infer::new().log([acc]);
 
 	let mlp = Model::new() // MLP
 		.loss(mse)
@@ -75,6 +77,7 @@ fn main() {
 		.epochs(20)
 		.net(["archy", "sentry"])
 		.log([Loss, R2, hip]);
+	let mlp_infer = Infer::new().log([r2]);
 
 	let llm = Model::new() // LLM
 		.loss(ce)
@@ -93,13 +96,15 @@ fn main() {
 		.epochs(1)
 		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
+	let llm_infer = Infer::new().log([acc]);
 
-	for (model, data, train) in [
-		(&nn, &nn_data, &nn_train),
-		(&cnn, &cnn_data, &cnn_train),
-		(&mlp, &mlp_data, &mlp_train),
-		(&llm, &llm_data, &llm_train),
+	for (model, data, train, infer) in [
+		(&nn, &nn_data, &nn_train, &nn_infer),
+		(&cnn, &cnn_data, &cnn_train, &cnn_infer),
+		(&mlp, &mlp_data, &mlp_train, &mlp_infer),
+		(&llm, &llm_data, &llm_train, &llm_infer),
 	] {
 		train.run(data, model);
+		infer.run(model).eval(&data.datasets().test);
 	}
 }

@@ -239,6 +239,8 @@ impl LayerPlan {
 		ogdl_text(|g| {
 			g.add(score, key);
 			let mut z = 1;
+			let mut at = 1;
+			let mut cv = 1;
 			for e in &self.entries {
 				let d = &e.dims;
 				match d.kind {
@@ -252,14 +254,15 @@ impl LayerPlan {
 						}
 					}
 					LayerKind::Attn => {
-						g.add(blk(&e.w), "attn.wq");
-						g.add(blk(&e.wk), "attn.wk");
-						g.add(blk(&e.wv), "attn.wv");
-						g.add(blk(&e.wo), "attn.wo");
+						g.add(blk(&e.w), &format!("attn{at}.wq"));
+						g.add(blk(&e.wk), &format!("attn{at}.wk"));
+						g.add(blk(&e.wv), &format!("attn{at}.wv"));
+						g.add(blk(&e.wo), &format!("attn{at}.wo"));
 						let bias = blk(&e.b);
 						for nm in ["bq", "bk", "bv", "bo"] {
-							g.add(bias.clone(), &format!("attn.{nm}"));
+							g.add(bias.clone(), &format!("attn{at}.{nm}"));
 						}
+						at += 1;
 					}
 					LayerKind::Conv => {
 						let lin = d.in_dim / d.conv_cin;
@@ -272,10 +275,11 @@ impl LayerPlan {
 								d.conv_k as f64,
 								d.conv_stride as f64,
 							],
-							"conv",
+							&format!("conv{cv}"),
 						);
-						g.add(blk(&e.w), "conv.w");
-						g.add(blk(&e.b), "conv.b");
+						g.add(blk(&e.w), &format!("conv{cv}.w"));
+						g.add(blk(&e.b), &format!("conv{cv}.b"));
+						cv += 1;
 					}
 					LayerKind::Dense => {
 						let w = blk(&e.w);
@@ -706,7 +710,7 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 					rows.into_iter().flat_map(|(_, v)| v).collect(),
 				));
 			}
-			"attn" => out.push(Saved::Attn {
+			name if name.starts_with("attn") => out.push(Saved::Attn {
 				wq: field("wq"),
 				wk: field("wk"),
 				wv: field("wv"),
@@ -716,7 +720,7 @@ pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
 				bv: field("bv"),
 				bo: field("bo"),
 			}),
-			"conv" => out.push(Saved::Conv {
+			name if name.starts_with("conv") => out.push(Saved::Conv {
 				w: field("w"),
 				b: field("b"),
 			}),
@@ -766,6 +770,8 @@ pub fn dump_ogdl(
 	crate::params::ogdl_text(|g| {
 		g.add(score, key);
 		let mut z = 1;
+		let mut at = 1;
+		let mut cv = 1;
 		for p in params.iter() {
 			match p.kind {
 				LayerKind::Embed => {
@@ -782,17 +788,18 @@ pub fn dump_ogdl(
 				LayerKind::Attn => {
 					let dd = p.dim * p.dim;
 					if want_w {
-						g.add(download_vec(&p.w, dd), "attn.wq");
-						g.add(download_vec(&p.wk, dd), "attn.wk");
-						g.add(download_vec(&p.wv, dd), "attn.wv");
-						g.add(download_vec(&p.wo, dd), "attn.wo");
+						g.add(download_vec(&p.w, dd), &format!("attn{at}.wq"));
+						g.add(download_vec(&p.wk, dd), &format!("attn{at}.wk"));
+						g.add(download_vec(&p.wv, dd), &format!("attn{at}.wv"));
+						g.add(download_vec(&p.wo, dd), &format!("attn{at}.wo"));
 					}
 					if want_b {
 						let bias = download_vec(&p.b, p.dim);
 						for nm in ["bq", "bk", "bv", "bo"] {
-							g.add(bias.clone(), &format!("attn.{nm}"));
+							g.add(bias.clone(), &format!("attn{at}.{nm}"));
 						}
 					}
+					at += 1;
 				}
 				LayerKind::Conv => {
 					let lin = p.in_dim / p.conv_cin;
@@ -806,14 +813,15 @@ pub fn dump_ogdl(
 							p.conv_k as f64,
 							p.conv_stride as f64,
 						],
-						"conv",
+						&format!("conv{cv}"),
 					);
 					if want_w {
-						g.add(download_vec(&p.w, w_count), "conv.w");
+						g.add(download_vec(&p.w, w_count), &format!("conv{cv}.w"));
 					}
 					if want_b {
-						g.add(download_vec(&p.b, cout), "conv.b");
+						g.add(download_vec(&p.b, cout), &format!("conv{cv}.b"));
 					}
+					cv += 1;
 				}
 				LayerKind::Dense => {
 					let w = download_vec(&p.w, p.in_dim * p.out_dim);

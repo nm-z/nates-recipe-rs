@@ -39,8 +39,8 @@ pub use dataset::Dataset;
 
 #[doc(inline)]
 pub use model::{
-	Accuracy, Epoch, Loss, Lr, Metric, Model, R2, Time, Train, attn, bce, ce, embed, focal, hip,
-	huber, mae, mse,
+	Accuracy, Epoch, Infer, Loss, Lr, Metric, Model, R2, Time, Train, attn, bce, ce, embed, focal,
+	hip, huber, mae, mse,
 };
 #[doc(hidden)]
 pub use model::{
@@ -48,7 +48,9 @@ pub use model::{
 	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 #[doc(hidden)]
-pub use recipe_infer::{Hip, accuracy, epoch, loss, lr, r2, time};
+pub use gpu_core::log::Flag;
+#[doc(hidden)]
+pub use gpu_core::log::{acc, chat, epoch, loss, lr, r2, time};
 
 pub struct Recipe;
 
@@ -67,9 +69,8 @@ impl Recipe {
 	pub fn train(&self) -> Train {
 		Train::new()
 	}
-	pub fn eval(&self, model: impl ModelArg, data: impl RunArg) -> Vec<f64> {
-		let mh = model.resolve();
-		mh.get().eval(data)
+	pub fn infer(&self) -> Infer {
+		Infer::new()
 	}
 }
 
@@ -82,9 +83,8 @@ pub fn model() -> Model {
 pub fn train() -> Train {
 	Train::new()
 }
-pub fn eval(model: impl ModelArg, data: impl RunArg) -> Vec<f64> {
-	let mh = model.resolve();
-	mh.get().eval(data)
+pub fn infer() -> Infer {
+	Infer::new()
 }
 
 pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> T {

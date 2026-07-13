@@ -44,7 +44,9 @@ fn main() {
 		.log([Loss, Accuracy, hip])
 		.run(&data, &model);
 
-	let preds = model.eval(&data);
+	let infer = Infer::new().log([r2]);
+	infer.run(&model).eval(&data);
+	let preds = infer.preds();
 	assert_eq!(
 		preds.len(),
 		rows,

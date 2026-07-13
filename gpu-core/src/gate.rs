@@ -61,7 +61,13 @@ fn inherited() -> std::io::Result<Option<RawFd>> {
 
 fn open_lock() -> std::io::Result<std::fs::File> {
 	let uid = unsafe { libc::getuid() };
-	let path = std::path::PathBuf::from(format!("/run/user/{uid}")).join(LOCK_NAME);
+	let dir = std::env::var_os("XDG_RUNTIME_DIR")
+		.filter(|v| !v.is_empty())
+		.map(std::path::PathBuf::from)
+		.unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{uid}")));
+	std::fs::create_dir_all(&dir)
+		.map_err(|e| std::io::Error::other(format!("create {}: {e}", dir.display())))?;
+	let path = dir.join(LOCK_NAME);
 	let f = std::fs::OpenOptions::new()
 		.read(true)
 		.write(true)

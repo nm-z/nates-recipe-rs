@@ -1,4 +1,4 @@
-use gpu_core::log::{Opt, Write, acc, data, device, epoch, gpu, loss, lr, net, prompt, r2, save, set_opt, time};
+use gpu_core::log::{Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2, save, set_opt, time};
 use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use gpu_core::memory::GpuBuffer;
@@ -343,7 +343,6 @@ impl Train {
 	}
 
 	fn run_on(&self, dat: &dyn RunData, model: &Model) -> &Train {
-		let handle = model;
 		let model: &ModelInner = &model.inner;
 		let run_hip = self
 			.metrics
@@ -378,13 +377,10 @@ impl Train {
 			}
 		};
 		let ds = prepared.get();
-		let pass = match dat.infer_only() {
-			InferOnly::Forward => Pass::Forward,
-			InferOnly::Fit => match self.epochs.checked_sub(1).filter(|_e| ds.has_target) {
-				Some(_go) => Pass::Fit,
-				None => Pass::Forward,
-			},
-		};
+		assert!(
+			matches!(dat.infer_only(), InferOnly::Fit) && self.epochs >= 1 && ds.has_target,
+			"run: forward-only data — Train is fit-only; use recipe.infer().run(&model).eval(&data)"
+		);
 		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
 				let cs = crate::ok_or_die(wnet.connect(), "net: connect");
@@ -404,13 +400,13 @@ impl Train {
 				.map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB))
 				.sum()
 		});
-		let issues = preflight(model, ds, pass, net_ram);
+		let issues = preflight(model, ds, net_ram);
 		let Gate::Proceed = confirm_issues(&issues) else {
 			Write::err("aborted");
 			return self;
 		};
-		match pass {
-			Pass::Fit => {
+		{
+			{
 				let resume = self.resume.as_deref().map(Self::resolve);
 				run_hip
 					.as_ref()
@@ -464,123 +460,6 @@ impl Train {
 						Write::err(&e);
 					}
 				}
-			}
-			Pass::Forward => {
-				let arena = handle.begin_forward();
-				let ei = model.prep_eval_input(ds);
-				let params = model.params.borrow();
-				assert!(!params.is_empty(), "run: call train first");
-				let k = params[params.len() - 1].out_dim;
-				let yscaler = *model.yscaler.borrow();
-				let sp = match Some(())
-					.filter(|_probe| ds.has_target && !self.metrics.is_empty())
-				{
-					Some(_scored) => {
-						let ybuf = {
-							let __up = crate::some_or_die(
-								ds.y.as_slice(),
-								"run: eval metrics: y contig",
-							);
-							let __ub = crate::ok_or_die(
-								GpuBuffer::alloc(__up.len()),
-								"run: eval metrics: ybuf",
-							);
-							let __ld = __ub.load(__up);
-							assert!(
-								__ld.is_ok(),
-								"run: eval metrics: ybuf: {}",
-								__ld.as_ref()
-									.err()
-									.map(|e| format!("{e:#}"))
-									.unwrap_or_default()
-							);
-							__ub
-						};
-						let total = (ei.n * k) as f64;
-						let ybar = ds.y.iter().sum::<f64>() / total;
-						let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-						let __sc = infer_scored(
-							&params,
-							&ei.x,
-							ei.x_cat.as_ref(),
-							ei.n,
-							yscaler,
-							Some(&ybuf),
-							model.loss,
-							model.lr,
-							&self.metrics,
-							ss_tot,
-						);
-						let sc = crate::ok_or_die(__sc, "run: eval metrics");
-						for (mi, m) in self.metrics.iter().enumerate() {
-							let flag = match m {
-								Metric::Loss => loss,
-								Metric::Accuracy => acc,
-								Metric::Epoch => epoch,
-								Metric::Lr => lr,
-								Metric::Time => time,
-								Metric::R2 => r2,
-								Metric::Hip => device,
-							};
-							Write::line(
-								flag,
-								&format!(
-									"eval  {}",
-									crate::train::metrics_line(&[*m], &[sc.vals[mi]])
-								),
-							);
-						}
-						let stop = Some(Metric::Accuracy)
-							.filter(|_m| model.loss.is_classification())
-							.unwrap_or(Metric::R2);
-						let score = (0..self.metrics.len())
-							.find(|mi| self.metrics[*mi] == stop)
-							.map_or(f64::NAN, |mi| sc.vals[mi]);
-						ScorePreds {
-							score,
-							preds: sc.preds,
-						}
-					}
-					None => {
-						let __sc = infer_scored(
-							&params,
-							&ei.x,
-							ei.x_cat.as_ref(),
-							ei.n,
-							yscaler,
-							None,
-							model.loss,
-							model.lr,
-							&[],
-							0.0,
-						);
-						let sc = crate::ok_or_die(__sc, "run: eval predictions");
-						ScorePreds {
-							score: f64::NAN,
-							preds: sc.preds,
-						}
-					}
-				};
-				let mut last = self.last.borrow_mut();
-				last.model = model as *const ModelInner;
-				last.score = sp.score;
-				last.preds = Some(sp.preds);
-				last.n = ei.n;
-				last.k = k;
-				let incoming_names = dat.target_names();
-				let kept_names = std::mem::take(&mut last.target_names);
-				last.target_names = Some(incoming_names)
-					.filter(|names| !names.is_empty())
-					.unwrap_or(kept_names);
-				let incoming_rows = dat.raw_rows();
-				let kept_rows = last.raw_test_rows.take();
-				last.raw_test_rows = incoming_rows.or(kept_rows);
-				let incoming_headers = dat.raw_headers();
-				let kept_headers = last.raw_test_headers.take();
-				last.raw_test_headers = incoming_headers.or(kept_headers);
-				drop(last);
-				drop(params);
-				handle.end_forward(arena);
 			}
 		}
 		self
@@ -644,6 +523,246 @@ impl Default for Train {
 	}
 }
 
+pub struct Infer {
+	flags: Vec<Flag>,
+	last: RefCell<LastRun>,
+}
+
+impl Infer {
+	pub fn new() -> Infer {
+		Infer {
+			flags: Vec::new(),
+			last: RefCell::new(LastRun::default()),
+		}
+	}
+
+	pub fn log(mut self, flags: impl IntoIterator<Item = Flag>) -> Infer {
+		self.flags = flags.into_iter().collect();
+		self
+	}
+
+	pub fn preds(&self) -> Vec<f64> {
+		crate::some_or_die(
+			self.last.borrow().preds.clone(),
+			"infer: no predictions — run .eval(&data) first",
+		)
+	}
+
+	pub fn run(&self, model: impl ModelArg) -> &Infer {
+		let mh = model.resolve();
+		self.run_on(mh.get())
+	}
+
+	fn run_on(&self, model: &Model) -> &Infer {
+		let has = |f: Flag| self.flags.contains(&f);
+		set_opt(Opt {
+			loss: has(loss),
+			acc: has(acc),
+			epoch: has(epoch),
+			lr: has(lr),
+			time: has(time),
+			r2: has(r2),
+			device: has(device),
+			data: has(data),
+			gpu: has(gpu),
+			probe: has(probe),
+			net: has(net),
+			chat: has(chat),
+			prompt: true,
+			save: !self.flags.is_empty(),
+		});
+		match &model.inner.gguf {
+			Some(path) => {
+				recipe_infer::llm::vram_probe_gate();
+				match Some(()).filter(|_probe| has(chat)) {
+					Some(_chat) => {
+						crate::tui::chat(path);
+						recipe_infer::shutdown();
+					}
+					None => {
+						let prompt_text = std::env::args()
+							.nth(1)
+							.unwrap_or_else(|| "The capital of France is".to_string());
+						let out = crate::ok_or_die(
+							recipe_infer::llm::generate(
+								std::path::Path::new(path),
+								&prompt_text,
+								&mut |toks| {
+									Write::line(
+										prompt,
+										recipe_infer::llm::render_toks(toks),
+									);
+								},
+							),
+							"infer: generate",
+						);
+						Write::line(prompt, out);
+						recipe_infer::shutdown();
+					}
+				}
+			}
+			None => {
+				let inner: &ModelInner = &model.inner;
+				let mut last = self.last.borrow_mut();
+				last.model = inner as *const ModelInner;
+				last.preds = None;
+			}
+		}
+		self
+	}
+
+	pub fn eval(&self, dat: impl RunArg) -> &Infer {
+		let dh = dat.resolve();
+		self.eval_on(dh.get())
+	}
+
+	fn eval_on(&self, dat: &dyn RunData) -> &Infer {
+		let last_model = {
+			let last = self.last.borrow();
+			assert!(!last.model.is_null(), "infer: call run(&model) first");
+			last.model
+		};
+		let model: &ModelInner = unsafe { &*last_model };
+		let metrics: Vec<Metric> = self
+			.flags
+			.iter()
+			.filter_map(|f| match f {
+				Flag::loss => Some(Metric::Loss),
+				Flag::acc => Some(Metric::Accuracy),
+				Flag::epoch => Some(Metric::Epoch),
+				Flag::lr => Some(Metric::Lr),
+				Flag::time => Some(Metric::Time),
+				Flag::r2 => Some(Metric::R2),
+				Flag::device => Some(Metric::Hip),
+				_other => None,
+			})
+			.collect();
+		let prepared = crate::ok_or_die(dat.prepared(), "eval: prepare data");
+		let ds = prepared.get();
+		let arena = model.begin_forward();
+		let ei = model.prep_eval_input(ds);
+		let params = model.params.borrow();
+		assert!(!params.is_empty(), "eval: call train first");
+		let k = params[params.len() - 1].out_dim;
+		let yscaler = *model.yscaler.borrow();
+		let sp = match Some(()).filter(|_probe| ds.has_target && !metrics.is_empty()) {
+			Some(_scored) => {
+				let ybuf = {
+					let __up = crate::some_or_die(ds.y.as_slice(), "eval: metrics: y contig");
+					let __ub = crate::ok_or_die(
+						GpuBuffer::alloc(__up.len()),
+						"eval: metrics: ybuf",
+					);
+					let __ld = __ub.load(__up);
+					assert!(
+						__ld.is_ok(),
+						"eval: metrics: ybuf: {}",
+						__ld.as_ref()
+							.err()
+							.map(|e| format!("{e:#}"))
+							.unwrap_or_default()
+					);
+					__ub
+				};
+				let total = (ei.n * k) as f64;
+				let ybar = ds.y.iter().sum::<f64>() / total;
+				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
+				let __sc = infer_scored(
+					&params,
+					&ei.x,
+					ei.x_cat.as_ref(),
+					ei.n,
+					yscaler,
+					Some(&ybuf),
+					model.loss,
+					model.lr,
+					&metrics,
+					ss_tot,
+				);
+				let sc = crate::ok_or_die(__sc, "eval: metrics");
+				for (mi, m) in metrics.iter().enumerate() {
+					let flag = match m {
+						Metric::Loss => loss,
+						Metric::Accuracy => acc,
+						Metric::Epoch => epoch,
+						Metric::Lr => lr,
+						Metric::Time => time,
+						Metric::R2 => r2,
+						Metric::Hip => device,
+					};
+					Write::line(
+						flag,
+						&format!(
+							"eval  {}",
+							crate::train::metrics_line(&[*m], &[sc.vals[mi]])
+						),
+					);
+				}
+				let stop = Some(Metric::Accuracy)
+					.filter(|_m| model.loss.is_classification())
+					.unwrap_or(Metric::R2);
+				let score = (0..metrics.len())
+					.find(|mi| metrics[*mi] == stop)
+					.map_or(f64::NAN, |mi| sc.vals[mi]);
+				ScorePreds {
+					score,
+					preds: sc.preds,
+				}
+			}
+			None => {
+				let __sc = infer_scored(
+					&params,
+					&ei.x,
+					ei.x_cat.as_ref(),
+					ei.n,
+					yscaler,
+					None,
+					model.loss,
+					model.lr,
+					&[],
+					0.0,
+				);
+				let sc = crate::ok_or_die(__sc, "eval: predictions");
+				Write::line(data, &format!(
+					"eval: {} samples (no target column, score unavailable)",
+					ei.n
+				));
+				ScorePreds {
+					score: f64::NAN,
+					preds: sc.preds,
+				}
+			}
+		};
+		let mut last = self.last.borrow_mut();
+		last.model = model as *const ModelInner;
+		last.score = sp.score;
+		last.preds = Some(sp.preds);
+		last.n = ei.n;
+		last.k = k;
+		let incoming_names = dat.target_names();
+		let kept_names = std::mem::take(&mut last.target_names);
+		last.target_names = Some(incoming_names)
+			.filter(|names| !names.is_empty())
+			.unwrap_or(kept_names);
+		let incoming_rows = dat.raw_rows();
+		let kept_rows = last.raw_test_rows.take();
+		last.raw_test_rows = incoming_rows.or(kept_rows);
+		let incoming_headers = dat.raw_headers();
+		let kept_headers = last.raw_test_headers.take();
+		last.raw_test_headers = incoming_headers.or(kept_headers);
+		drop(last);
+		drop(params);
+		model.end_forward(arena);
+		self
+	}
+}
+
+impl Default for Infer {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 fn expand_tilde(path: &str) -> String {
 	let Ok(home) = std::env::var("HOME") else {
 		return path.to_string();
@@ -677,6 +796,7 @@ pub(crate) struct ModelInner {
 	pub(crate) saved_ogdl: RefCell<Option<SavedWeights>>,
 	pub(crate) arena_gen: Cell<Option<usize>>,
 	pub(crate) rebuild_backing: RefCell<Option<GpuBuffer>>,
+	pub(crate) gguf: Option<String>,
 }
 
 pub struct Model {
@@ -705,11 +825,6 @@ pub(crate) fn parked_model() -> Model {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Pass {
-	Forward,
-	Fit,
-}
-
 enum Gate {
 	Proceed,
 	Abort,
@@ -727,7 +842,7 @@ struct CatShape {
 	vocab: usize,
 }
 
-pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, pass: Pass) -> usize {
+pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset) -> usize {
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
 	let k = ds.n_targets.max(1);
@@ -761,33 +876,15 @@ pub(crate) fn plan_footprint(model: &ModelInner, ds: &Dataset, pass: Pass) -> us
 			text_d: d,
 			vocab: 0,
 		});
-	let base = vram_estimate(
+	vram_estimate(
 		&model.specs,
 		n,
 		shape.text_d,
 		k,
 		shape.vocab,
 		shape.cat_cols,
-		matches!(pass, Pass::Forward),
-	);
-	match pass {
-		Pass::Fit => base,
-		Pass::Forward => {
-			let d_sc = Some(shape.cat_cols)
-				.filter(|_probe| embed_first)
-				.unwrap_or(d);
-			let zscore_transient = Some(())
-				.filter(|_probe| d_sc > 0)
-				.map(|_probe| {
-					n * d_sc * 8
-						+ gpu_core::kernels::gpu_reduce_sum_cols_workspace_bytes(
-							n, d_sc,
-						)
-				})
-				.unwrap_or(0);
-			base + zscore_transient
-		}
-	}
+		false,
+	)
 }
 
 impl ModelInner {
@@ -803,6 +900,7 @@ impl ModelInner {
 			saved_ogdl: RefCell::new(None),
 			arena_gen: Cell::new(None),
 			rebuild_backing: RefCell::new(None),
+			gguf: None,
 		}
 	}
 
@@ -846,6 +944,23 @@ impl ModelInner {
 		*self.params.borrow_mut() = params;
 		self.arena_gen.set(gpu_core::memory::live_parked_gen());
 	}
+
+	pub(crate) fn begin_forward(&self) -> Option<GpuBuffer> {
+		let slab = self
+			.arena_gen
+			.get()
+			.and_then(|_gen| gpu_core::memory::adopt_run_backing(0));
+		self.ensure_params_live();
+		slab
+	}
+
+	pub(crate) fn end_forward(&self, slab: Option<GpuBuffer>) {
+		slab.map(|inner_slab| {
+			gpu_core::memory::park_run_backing(inner_slab);
+			self.arena_gen.set(gpu_core::memory::live_parked_gen());
+		})
+		.unwrap_or(());
+	}
 }
 
 fn output_check(lossfn: Loss, last_out: usize, n_layers: usize, k: usize) -> Option<Issue> {
@@ -864,7 +979,7 @@ fn output_check(lossfn: Loss, last_out: usize, n_layers: usize, k: usize) -> Opt
 	})
 }
 
-fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Vec<Issue> {
+fn preflight(model: &ModelInner, ds: &Dataset, net_ram: usize) -> Vec<Issue> {
 	let mut issues = Vec::new();
 	let n = ds.x.nrows();
 	let d = ds.x.ncols();
@@ -889,19 +1004,12 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 	let mut free_vram = 0usize;
 	let mut total_vram = 0usize;
 	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
-	let need = plan_footprint(model, ds, pass);
+	let need = plan_footprint(model, ds);
 	Some(())
 		.filter(|_probe| need > free_vram)
 		.map(|_probe| {
-			let mode = Some("inference")
-				.filter(|_p| matches!(pass, Pass::Forward))
-				.unwrap_or("training");
 			let planned = crate::ooc::plan(need, net_ram);
-			let waterfall_plan = match pass {
-				Pass::Fit => planned,
-				Pass::Forward => None,
-			};
-			match waterfall_plan {
+			match planned {
 				Some(p) => {
 					let net_part = Some(())
 						.filter(|_p| p.remote > 0)
@@ -920,10 +1028,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, pass: Pass, net_ram: usize) -> Ve
 				None => {
 					issues.push(Issue {
 						what: format!(
-							"{mode} on {n} rows × {d} features exceeds {}",
-							Some("GPU memory")
-								.filter(|_p| matches!(pass, Pass::Forward))
-								.unwrap_or("VRAM+RAM+DISK")
+							"training on {n} rows × {d} features exceeds VRAM+RAM+DISK"
 						),
 						have: format!(
 							"{} free of {} total",
@@ -978,6 +1083,11 @@ impl Model {
 	}
 
 	pub fn load(weights: &str, proto: Model, d: usize) -> Model {
+		if weights.ends_with(".gguf") {
+			let mut proto = proto;
+			proto.inner.gguf = Some(weights.to_string());
+			return proto;
+		}
 		let saved = crate::ok_or_die(load_ogdl_str(weights), "Model::load: parse weights");
 		let inner = &proto.inner;
 		let vocab = crate::some_or_die(
@@ -1080,111 +1190,6 @@ impl Model {
 		self
 	}
 
-	pub fn eval(&self, dat: impl RunArg) -> Vec<f64> {
-		let dh = dat.resolve();
-		self.eval_on(dh.get())
-	}
-
-	fn eval_on(&self, dat: &dyn RunData) -> Vec<f64> {
-		let inner = &self.inner;
-		let prepared = crate::ok_or_die(dat.prepared(), "eval: prepare data");
-		let ds = prepared.get();
-		let arena = self.begin_forward();
-		let ei = inner.prep_eval_input(ds);
-		let params = inner.params.borrow();
-		assert!(!params.is_empty(), "eval: call train() first");
-		let yscaler = *inner.yscaler.borrow();
-		let metric = Some(Metric::Accuracy)
-			.filter(|_m| inner.loss.is_classification())
-			.unwrap_or(Metric::R2);
-		let preds = match Some(()).filter(|_probe| ds.has_target) {
-			Some(_present) => {
-				let yslice = crate::some_or_die(ds.y.as_slice(), "eval: y contiguous");
-				let ybuf = crate::ok_or_die(GpuBuffer::alloc(yslice.len()), "eval ybuf");
-				let __yl = ybuf.load(yslice);
-				assert!(
-					__yl.is_ok(),
-					"eval ybuf load: {}",
-					__yl.as_ref()
-						.err()
-						.map(|e| format!("{e:#}"))
-						.unwrap_or_default()
-				);
-				let k = params[params.len() - 1].out_dim;
-				let total = (ei.n * k) as f64;
-				let ybar = ds.y.iter().sum::<f64>() / total;
-				let ss_tot: f64 = ds.y.iter().map(|v| (v - ybar).powi(2)).sum();
-				let __sc = infer_scored(
-					&params,
-					&ei.x,
-					ei.x_cat.as_ref(),
-					ei.n,
-					yscaler,
-					Some(&ybuf),
-					inner.loss,
-					inner.lr,
-					std::slice::from_ref(&metric),
-					ss_tot,
-				);
-				let sc = crate::ok_or_die(__sc, "eval: metrics");
-				let label = Some("accuracy")
-					.filter(|_l| inner.loss.is_classification())
-					.unwrap_or("R2");
-				let flag = match metric {
-					Metric::Accuracy => acc,
-					_other => r2,
-				};
-				Write::line(flag, &format!(
-					"eval: {label} = {:.4} ({} samples)",
-					sc.vals[0], ei.n
-				));
-				sc.preds
-			}
-			None => {
-				let __sc = infer_scored(
-					&params,
-					&ei.x,
-					ei.x_cat.as_ref(),
-					ei.n,
-					yscaler,
-					None,
-					inner.loss,
-					inner.lr,
-					&[],
-					0.0,
-				);
-				let sc = crate::ok_or_die(__sc, "eval: predictions");
-				Write::line(data, &format!(
-					"eval: {} samples (no target column, score unavailable)",
-					ei.n
-				));
-				sc.preds
-			}
-		};
-		drop(params);
-		self.end_forward(arena);
-		preds
-	}
-
-	pub(crate) fn begin_forward(&self) -> Option<GpuBuffer> {
-		let slab = self
-			.inner
-			.arena_gen
-			.get()
-			.and_then(|_gen| gpu_core::memory::adopt_run_backing(0));
-		self.inner.ensure_params_live();
-		slab
-	}
-
-	pub(crate) fn end_forward(&self, slab: Option<GpuBuffer>) {
-		slab.map(|inner_slab| {
-			gpu_core::memory::park_run_backing(inner_slab);
-			self.inner
-				.arena_gen
-				.set(gpu_core::memory::live_parked_gen());
-		})
-		.unwrap_or(());
-	}
 }
 
 impl Default for Model {

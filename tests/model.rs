@@ -1,6 +1,6 @@
 use gpu_core::kernels;
 use recipe::train::StepScalars;
-use recipe::{Loss, Metric, Model, Train, mse};
+use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
 use std::sync::LazyLock;
 
@@ -1115,20 +1115,47 @@ fn ping_pong_gradients_match_per_layer() {
 
 #[test]
 fn metric_consts_both_casings() {
-	let pairs = [
-		(recipe::loss, recipe::Loss),
-		(recipe::accuracy, recipe::Accuracy),
-		(recipe::epoch, recipe::Epoch),
-		(recipe::lr, recipe::Lr),
-		(recipe::time, recipe::Time),
-		(recipe::r2, recipe::R2),
-		(recipe::Hip, recipe::hip),
-	];
-	for (a, b) in pairs {
-		assert!(a == b, "casing aliases diverge");
-	}
-	let t = Train::new()
-		.log([recipe::hip, recipe::epoch, recipe::loss, recipe::lr])
-		.log([recipe::Hip, recipe::Epoch, recipe::Loss, recipe::Lr]);
+	let t = Train::new().log([
+		recipe::Loss,
+		recipe::Accuracy,
+		recipe::Epoch,
+		recipe::Lr,
+		recipe::Time,
+		recipe::R2,
+		recipe::hip,
+	]);
 	drop(t);
+	let i = Infer::new().log([
+		recipe::loss,
+		recipe::acc,
+		recipe::epoch,
+		recipe::lr,
+		recipe::time,
+		recipe::r2,
+		recipe::chat,
+	]);
+	drop(i);
+	assert!(recipe::loss == recipe::loss, "flag self-equality");
+	assert!(recipe::loss != recipe::acc, "distinct flags compare unequal");
+	assert!(recipe::chat != recipe::r2, "chat is its own flag");
+}
+
+#[test]
+fn stacked_conv_checkpoint_roundtrip() {
+	let specs = [
+		LayerSpec::Conv(32, 3, 1, Activation::LeakyRelu),
+		LayerSpec::Conv(64, 3, 1, Activation::LeakyRelu),
+		LayerSpec::Dense(1, Activation::Linear),
+	];
+	let fresh = plan_layer_params(&specs, 784, 0, 0, &[], PlanMode::Fresh).expect("fresh plan");
+	let text = fresh.dump_ogdl_host(fresh.host(), "r2", 0.5);
+	let saved = load_ogdl_str(&text).expect("parse roundtrip");
+	let convs = saved
+		.iter()
+		.filter(|s| matches!(s, Saved::Conv { .. }))
+		.count();
+	assert_eq!(convs, 2, "two conv layers must save as two blocks, got {convs}");
+	let warm =
+		plan_layer_params(&specs, 784, 0, 0, &saved, PlanMode::Warm).expect("warm rehydrate");
+	assert_eq!(warm.host().len(), fresh.host().len(), "rehydrated image size");
 }

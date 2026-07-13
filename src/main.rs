@@ -151,7 +151,7 @@ fn main() -> Result<()> {
 				std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
 				recipe::wire::PORT,
 			);
-			let listener = std::net::TcpListener::bind(bind)?;
+			let listener = recipe::wire::Server::bind(bind)?;
 			let machine = recipe::probe::Machine::probe()?;
 			let info = recipe::wire::NodeInfo::probe();
 			let runners = std::collections::HashMap::new();

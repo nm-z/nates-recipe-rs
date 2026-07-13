@@ -269,31 +269,188 @@ pub fn show(summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
 		.unwrap_or(());
 	ratatui::restore();
 }
-pub struct Tok {
-	pub text: String,
-	pub status: TokStatus,
-	pub age: u8,
-	pub heat: f32,
-}
-pub enum TokStatus {
-	Draft,
-	Accepted,
-	Recent,
-}
-pub fn render_toks(toks: &[Tok]) -> String {
-	let mut out = String::new();
-	for t in toks {
-		out.push_str(&t.text);
+pub use recipe_infer::llm::{Tok, TokStatus, render_toks, toks_line};
+
+use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{Borders, Wrap};
+use tui_textarea::TextArea;
+
+struct TermRestore;
+impl Drop for TermRestore {
+	fn drop(&mut self) {
+		ratatui::restore();
 	}
-	out
 }
-pub fn toks_line(toks: &[Tok]) -> String {
-	let mut out = String::new();
+
+fn new_input() -> TextArea<'static> {
+	let mut ta = TextArea::default();
+	ta.set_block(
+		Block::default()
+			.borders(Borders::ALL)
+			.title("message  (Enter send, Esc quit)"),
+	);
+	ta.set_cursor_line_style(Style::default());
+	ta
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+	let t = t.clamp(0.0, 1.0);
+	let v = a as f32 + (b as f32 - a as f32) * t;
+	v.round().clamp(0.0, 255.0) as u8
+}
+
+fn tok_style(t: &Tok) -> Style {
+	match t.status {
+		TokStatus::Draft => Style::default()
+			.fg(Color::DarkGray)
+			.add_modifier(Modifier::DIM),
+		TokStatus::Recent => {
+			let h = t.heat.clamp(0.0, 1.0);
+			let g = lerp_u8(140, 245, h);
+			let b = lerp_u8(30, 120, h);
+			Style::default()
+				.fg(Color::Rgb(255, g, b))
+				.add_modifier(Modifier::BOLD)
+		}
+		TokStatus::Accepted => {
+			let a = t.age.min(6) as f32 / 6.0;
+			let r = lerp_u8(90, 190, a);
+			let g = lerp_u8(170, 190, a);
+			let b = lerp_u8(255, 190, a);
+			Style::default().fg(Color::Rgb(r, g, b))
+		}
+	}
+}
+
+fn toks_to_lines(toks: &[Tok]) -> Vec<Line<'static>> {
+	let mut lines: Vec<Line> = Vec::new();
+	let mut cur: Vec<Span> = Vec::new();
 	for t in toks {
-		let Some(_keep) = Some(()).filter(|_probe| !matches!(t.status, TokStatus::Draft)) else {
-			continue;
+		let st = tok_style(t);
+		let segs: Vec<&str> = t.text.split('\n').collect();
+		for (i, seg) in segs.iter().enumerate() {
+			let _break = Some(())
+				.filter(|_probe| i > 0)
+				.map(|_probe| lines.push(Line::from(std::mem::take(&mut cur))));
+			let _push = Some(())
+				.filter(|_probe| !seg.is_empty())
+				.map(|_probe| cur.push(Span::styled((*seg).to_string(), st)));
+		}
+	}
+	lines.push(Line::from(cur));
+	lines
+}
+
+fn render_chat(
+	frame: &mut Frame,
+	input: &TextArea,
+	scrollback: &[(String, String)],
+	pending: Option<&str>,
+	live: &[Tok],
+	generating: bool,
+) {
+	let outer =
+		Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(frame.area());
+	let head = Style::default()
+		.fg(Color::Rgb(120, 200, 255))
+		.add_modifier(Modifier::BOLD);
+	let mut lines: Vec<Line> = Vec::new();
+	for (p, r) in scrollback {
+		lines.push(Line::from(Span::styled(format!("> {p}"), head)));
+		for seg in r.split('\n') {
+			lines.push(Line::from(seg.to_string()));
+		}
+		lines.push(Line::from(String::new()));
+	}
+	let _pend = pending.map(|p| lines.push(Line::from(Span::styled(format!("> {p}"), head))));
+	for l in toks_to_lines(live) {
+		lines.push(l);
+	}
+	let _gen = Some(())
+		.filter(|_probe| generating)
+		.map(|_probe| {
+			lines.push(Line::from(Span::styled(
+				"  generating (model load + rounds, this takes minutes)".to_string(),
+				Style::default()
+					.fg(Color::Yellow)
+					.add_modifier(Modifier::ITALIC),
+			)))
+		});
+	let text = Text::from(lines);
+	let total = text.lines.len();
+	let scroll = total.saturating_sub(outer[0].height as usize) as u16;
+	let para = Paragraph::new(text)
+		.wrap(Wrap { trim: false })
+		.scroll((scroll, 0));
+	frame.render_widget(para, outer[0]);
+	frame.render_widget(input, outer[1]);
+}
+
+pub fn chat(gguf: &str) {
+	crate::some_or_die(std::io::stdin().is_terminal().then_some(()), "chat: needs a tty");
+	let mut term = ratatui::init();
+	let _guard = TermRestore;
+	let mut textarea = new_input();
+	let mut scrollback: Vec<(String, String)> = Vec::new();
+	let mut err_out: Option<String> = None;
+	loop {
+		let _idle = term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false));
+		let ev = match event::read() {
+			Ok(e) => e,
+			Err(_e) => break,
 		};
-		out.push_str(&t.text);
+		match ev {
+			Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
+				(KeyCode::Esc, _mods) => break,
+				(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => break,
+				(KeyCode::Enter, _mods) => {
+					let joined = textarea.lines().join(" ");
+					let prompt: String = joined
+						.chars()
+						.filter(|c| *c != '\r' && *c != '\n')
+						.collect::<String>()
+						.trim()
+						.to_string();
+					textarea = new_input();
+					let Some(_run) = Some(()).filter(|_probe| !prompt.is_empty()) else {
+						continue;
+					};
+					let res;
+					{
+						let sb = &scrollback;
+						let ta = &textarea;
+						let pr = prompt.as_str();
+						let mut on_round = |toks: &[Tok]| {
+							let _round =
+								term.draw(|f| render_chat(f, ta, sb, Some(pr), toks, true));
+						};
+						on_round(&[]);
+						res = recipe_infer::llm::generate(
+							std::path::Path::new(gguf),
+							&prompt,
+							&mut on_round,
+						);
+					}
+					match res {
+						Ok(resp) => scrollback.push((prompt, resp)),
+						Err(e) => {
+							err_out = Some(format!("{e:#}"));
+							break;
+						}
+					}
+				}
+				_other => {
+					let _typed = textarea.input(Event::Key(k));
+				}
+			},
+			Event::Key(_k) => {}
+			other => {
+				let _typed = textarea.input(other);
+			}
+		}
 	}
-	out
+	drop(_guard);
+	let _reported = err_out.map(|e| gpu_core::log::Write::err(format!("chat: {e}")));
 }

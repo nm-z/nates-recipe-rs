@@ -6,6 +6,7 @@ pub mod dequant;
 pub mod enums;
 pub mod forward;
 pub mod gguf;
+pub mod llm;
 pub mod params;
 pub mod safetensors;
 pub mod scratch;

@@ -24,7 +24,7 @@ macro_rules! flags {
 	};
 }
 
-flags!(loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt);
+flags!(loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat);
 pub use Flag::*;
 
 #[derive(Clone, Copy)]
