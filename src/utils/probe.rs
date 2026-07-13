@@ -1,6 +1,6 @@
-use gpu_core::log::{Write, probe};
+use gpu_core::log::{Opt, Write, probe, set_opt};
 use anyhow::{Result, anyhow, bail, ensure};
-use gpu_core::memory::{GpuBuffer, par_copy, par_touch};
+use gpu_core::memory::{GpuBuffer, USER_GB, par_copy, par_touch};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -30,8 +30,37 @@ pub struct Machine {
 	pub eth_gbs: f64,
 }
 
+pub fn gpu_child_ask() -> std::option::Option<i32> {
+	let d = std::env::var_os("RECIPE_PROBE_GPU")?;
+	set_opt(Opt {
+		probe: true,
+		..Opt::default()
+	});
+	let code = match d.to_string_lossy().parse::<i32>() {
+		Ok(card) => match probe_gpu_child_record(card) {
+			Ok(rec) => {
+				Write::line(probe, &rec);
+				0
+			}
+			Err(e) => {
+				drop(Write::err(&format!("probe child gpu{card}: {e}")));
+				2
+			}
+		},
+		Err(e) => {
+			drop(Write::err(&format!("RECIPE_PROBE_GPU parse: {e}")));
+			2
+		}
+	};
+	Some(code)
+}
+
 impl Machine {
 	pub fn probe() -> Result<Machine> {
+		ensure!(
+			std::env::var_os("RECIPE_PROBE_GPU").is_none(),
+			"probe: RECIPE_PROBE_GPU is set but this binary's main did not call recipe::probe::gpu_child_ask() and exit before Machine::probe — refusing to fork-recurse"
+		);
 		let host = hostname();
 		let job = gpu_core::gate::Lease::new();
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
@@ -52,14 +81,36 @@ impl Machine {
 		}
 		drop(job);
 		let ram = mem_total()?;
-		Write::line(probe, "recipe probe: measuring cpu (ddr5 + transfer + flops)");
-		let ddr5_gbs = bench_ddr5();
-		let cpu_transfer_gbs = bench_cpu_read();
+		Write::line(probe, &format!("recipe probe: ram {} MiB", ram >> 20));
+		let copy_bytes = bench_bytes(2)?;
+		Write::line(probe, &format!(
+			"recipe probe: measuring ram bandwidth ({} MiB copy x5)",
+			copy_bytes >> 20
+		));
+		let ddr5_gbs = bench_ddr5(copy_bytes);
+		Write::line(probe, &format!("recipe probe: ram copy {ddr5_gbs:.3} GB/s"));
+		let read_bytes = bench_bytes(1)?;
+		Write::line(probe, &format!(
+			"recipe probe: measuring cpu read ({} MiB x5)",
+			read_bytes >> 20
+		));
+		let cpu_transfer_gbs = bench_cpu_read(read_bytes);
+		Write::line(probe, &format!("recipe probe: cpu read {cpu_transfer_gbs:.3} GB/s"));
+		Write::line(probe, "recipe probe: measuring cpu flops");
 		let cpu_gflops = bench_cpu_flops();
+		Write::line(probe, &format!("recipe probe: cpu {cpu_gflops:.1} GFLOP/s"));
 		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
-		Write::line(probe, "recipe probe: measuring disk (sata)");
-		let sata_gbs = bench_disk(&dd)?;
+		let disk_bytes = (256usize << 20).min(host_budget(1)?);
+		ensure!(
+			disk_bytes > 0,
+			"probe: no free ram for the disk bench buffer"
+		);
+		Write::line(probe, &format!(
+			"recipe probe: measuring disk (sata, {} MiB)",
+			disk_bytes >> 20
+		));
+		let sata_gbs = bench_disk(&dd, disk_bytes)?;
 		let eth_gbs = link_speed_gbs();
 		Write::line(probe, &format!(
 			"recipe probe: link {eth_gbs:.3} GB/s ({})",
@@ -139,13 +190,59 @@ fn hostname() -> String {
 }
 
 fn mem_total() -> Result<u64> {
+	meminfo_bytes("MemTotal:")
+}
+
+fn mem_available() -> Result<u64> {
+	meminfo_bytes("MemAvailable:")
+}
+
+fn meminfo_bytes(key: &str) -> Result<u64> {
 	let s = std::fs::read_to_string("/proc/meminfo")?;
 	let rest = s
 		.lines()
-		.find_map(|l| l.strip_prefix("MemTotal:"))
-		.ok_or_else(|| anyhow!("probe: MemTotal missing from /proc/meminfo"))?;
+		.find_map(|l| l.strip_prefix(key))
+		.ok_or_else(|| anyhow!("probe: {key} missing from /proc/meminfo"))?;
 	let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse()?;
 	Ok(kb * 1024)
+}
+
+fn llc_bytes() -> Result<usize> {
+	let dir = "/sys/devices/system/cpu/cpu0/cache";
+	let mut best = 0usize;
+	for e in std::fs::read_dir(dir)?.flatten() {
+		let Ok(txt) = std::fs::read_to_string(e.path().join("size")) else {
+			continue;
+		};
+		let t = txt.trim();
+		let (num, mult) = match t.strip_suffix('K') {
+			Some(n) => (n, 1usize << 10),
+			None => match t.strip_suffix('M') {
+				Some(n) => (n, 1usize << 20),
+				None => (t, 1usize),
+			},
+		};
+		let Ok(v) = num.parse::<usize>() else { continue };
+		best = best.max(v.saturating_mul(mult));
+	}
+	ensure!(best > 0, "probe: no cpu cache sizes under {dir}");
+	Ok(best)
+}
+
+fn host_budget(buffers: usize) -> Result<usize> {
+	Ok((mem_available()? as usize).saturating_sub(USER_GB) / buffers.max(1))
+}
+
+fn bench_bytes(buffers: usize) -> Result<usize> {
+	let llc = llc_bytes()?;
+	let bytes = (8 * llc).min(host_budget(buffers)?);
+	ensure!(
+		bytes > llc,
+		"probe: {} MiB free per bench buffer, llc is {} MiB — not enough ram to measure bandwidth",
+		bytes >> 20,
+		llc >> 20
+	);
+	Ok(bytes)
 }
 
 fn disk_total(path: &Path) -> Result<u64> {
@@ -199,6 +296,26 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 		.env("RECIPE_PROBE_GPU", dev.to_string())
 		.stderr(std::process::Stdio::piped())
 		.spawn()?;
+	let pipe = child
+		.stderr
+		.take()
+		.ok_or_else(|| anyhow!("probe child stderr"))?;
+	let relay = std::thread::spawn(move || {
+		use std::io::BufRead;
+		let mut record = None;
+		for line in std::io::BufReader::new(pipe).lines() {
+			let Ok(l) = line else { break };
+			let t = l.trim();
+			match t.split('|').count() {
+				4 => record = Some(t.to_string()),
+				_progress => match t.is_empty() {
+					true => continue,
+					false => Write::line(probe, t),
+				},
+			}
+		}
+		record
+	});
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
 	loop {
 		let Some(status) = child.try_wait()? else {
@@ -206,6 +323,7 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 				Ordering::Greater => {
 					child.kill().ok();
 					child.wait().ok();
+					relay.join().ok();
 					bail!("probe child wedged (120s) — killed");
 				}
 				Ordering::Less | Ordering::Equal => {
@@ -214,19 +332,12 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 				}
 			}
 		};
+		let record = relay
+			.join()
+			.map_err(|_panic| anyhow!("probe relay thread panicked"))?;
 		ensure!(status.success(), "probe child exited {status}");
-		let mut out = String::new();
-		use std::io::Read;
-		child.stderr
-			.take()
-			.ok_or_else(|| anyhow::anyhow!("probe child stderr"))?
-			.read_to_string(&mut out)?;
-		let f: Vec<&str> = out
-			.lines()
-			.rev()
-			.map(|l| l.trim().split('|').collect::<Vec<&str>>())
-			.find(|p| p.len() == 4)
-			.ok_or_else(|| anyhow::anyhow!("probe child output malformed: {out:?}"))?;
+		let rec = record.ok_or_else(|| anyhow!("probe child produced no record"))?;
+		let f: Vec<&str> = rec.split('|').collect();
 		return Ok(GpuDev {
 			vram: f[0].parse()?,
 			pcie_gbs: f[1].parse()?,
@@ -236,7 +347,7 @@ fn measure_gpu_child(dev: i32) -> Result<GpuDev> {
 	}
 }
 
-pub fn probe_gpu_child_record(dev: i32) -> Result<String> {
+fn probe_gpu_child_record(dev: i32) -> Result<String> {
 	let g = measure_gpu(dev)?;
 	Ok(format!(
 		"{}|{}|{}|{}",
@@ -247,11 +358,21 @@ pub fn probe_gpu_child_record(dev: i32) -> Result<String> {
 fn measure_gpu(dev: i32) -> Result<GpuDev> {
 	gpu_core::hip::set_device(dev)?;
 	let total = gpu_core::hip::mem_info()?.total;
+	Write::line(probe, &format!("recipe probe: gpu{dev} {} MiB vram", total >> 20));
+	Write::line(probe, &format!("recipe probe: gpu{dev} measuring pcie (64 MiB h2d x5)"));
+	let pcie_gbs = bench_pcie_h2d()?;
+	Write::line(probe, &format!("recipe probe: gpu{dev} pcie {pcie_gbs:.3} GB/s"));
+	Write::line(probe, &format!("recipe probe: gpu{dev} measuring flops (2048^3 f64 gemm x5)"));
+	let flops_gflops = bench_gemm()?;
+	Write::line(probe, &format!("recipe probe: gpu{dev} {flops_gflops:.1} GFLOP/s"));
+	Write::line(probe, &format!("recipe probe: gpu{dev} measuring transfer (256 MiB d2d x5)"));
+	let transfer_gbs = bench_transfer()?;
+	Write::line(probe, &format!("recipe probe: gpu{dev} transfer {transfer_gbs:.3} GB/s"));
 	Ok(GpuDev {
 		vram: total as u64,
-		pcie_gbs: bench_pcie_h2d()?,
-		flops_gflops: bench_gemm()?,
-		transfer_gbs: bench_transfer()?,
+		pcie_gbs,
+		flops_gflops,
+		transfer_gbs,
 	})
 }
 
@@ -310,8 +431,7 @@ fn bench_transfer() -> Result<f64> {
 	Ok(bytes as f64 / best / 1e9)
 }
 
-fn bench_ddr5() -> f64 {
-	let bytes = 1usize << 30;
+fn bench_ddr5(bytes: usize) -> f64 {
 	let mut src = vec![0u8; bytes];
 	let mut dst = vec![0u8; bytes];
 	par_touch(&mut src);
@@ -325,8 +445,7 @@ fn bench_ddr5() -> f64 {
 	bytes as f64 / best / 1e9
 }
 
-fn bench_cpu_read() -> f64 {
-	let bytes = 1usize << 30;
+fn bench_cpu_read(bytes: usize) -> f64 {
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
 	let threads = std::thread::available_parallelism()
@@ -414,8 +533,7 @@ fn bench_cpu_flops() -> f64 {
 	flops / t.elapsed().as_secs_f64() / 1e9
 }
 
-fn bench_disk(dir: &Path) -> Result<f64> {
-	let bytes = 256usize << 20;
+fn bench_disk(dir: &Path, bytes: usize) -> Result<f64> {
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
 	let path = dir.join(".recipe_probe");

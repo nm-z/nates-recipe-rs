@@ -6,6 +6,7 @@ fn usage(code: i32) -> ! {
 	drop(Write::err("usage: recipe <file.rs> [args]  # compile + run"));
 	drop(Write::err("       recipe serve            # daemon on 7845"));
 	drop(Write::err("       recipe peers            # live network view"));
+	drop(Write::err("       recipe probe            # measure this machine"));
 	std::process::exit(code);
 }
 
@@ -58,25 +59,8 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-	if let Some(d) = std::env::var_os("RECIPE_PROBE_GPU") {
-		let card: i32 = d
-			.to_string_lossy()
-			.parse()
-			.map_err(|e| Errored::new(format!("RECIPE_PROBE_GPU parse: {e}")))?;
-		match recipe::probe::probe_gpu_child_record(card) {
-			Ok(rec) => {
-				set_opt(Opt {
-					probe: true,
-					..Opt::default()
-				});
-				Write::line(probe, &rec);
-				std::process::exit(0);
-			}
-			Err(e) => {
-				drop(Write::err(&format!("probe child gpu{card}: {e}")));
-				std::process::exit(2);
-			}
-		}
+	if let Some(code) = recipe::probe::gpu_child_ask() {
+		std::process::exit(code);
 	}
 	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
 		let n: usize = sz
@@ -165,6 +149,18 @@ fn main() -> Result<()> {
 	};
 	match cmd {
 		"-h" | "--help" => usage(0),
+		"probe" => {
+			set_opt(Opt {
+				probe: true,
+				..Opt::default()
+			});
+			let machine = recipe::probe::Machine::probe()?;
+			Write::block(
+				probe,
+				&recipe::probe::write_config(std::slice::from_ref(&machine)),
+			);
+			Ok(())
+		}
 		"serve" => {
 			set_opt(Opt {
 				probe: true,
