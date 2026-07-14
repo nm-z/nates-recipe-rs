@@ -65,7 +65,7 @@ b
 }
 
 #[test]
-fn star_selects_every_match() {
+fn star_selects_children() {
 	ogdl!(p7.r"
 b
 	x
@@ -75,7 +75,7 @@ b
 	ogdl!(p7.b*.k);
 	assert_eq!(
 		format!("{}", ogdl!(p7)),
-		"p7\n\tb\n\t\tx\n\t\tk\n\tb\n\t\ty\n\t\tk"
+		"p7\n\tb\n\t\tx\n\t\t\tk\n\tb\n\t\ty\n\t\t\tk"
 	);
 }
 
@@ -143,10 +143,17 @@ b
 	ogdl!(p16.r"b"*.k);
 	assert_eq!(
 		format!("{}", ogdl!(p16)),
-		"p16\n\tb\n\t\tx\n\t\tk\n\tb\n\t\ty\n\t\tz\n\t\tk"
+		"p16\n\tb\n\t\tx\n\t\t\tk\n\tb\n\t\ty\n\t\t\tk\n\t\tz\n\t\t\tk"
 	);
 	ogdl!(p16.r"b"{});
 	assert_eq!(format!("{}", ogdl!(p16)), "p16");
+}
+
+#[test]
+fn star_block_prints_children_only() {
+	ogdl!(p18.r"init	loop	exit");
+	assert_eq!(format!("{}", ogdl!(p18*)), "init\nloop\nexit");
+	assert_eq!(format!("{}", ogdl!(p18)), "p18\n\tinit\n\tloop\n\texit");
 }
 
 #[test]

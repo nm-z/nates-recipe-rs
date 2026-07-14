@@ -1,8 +1,8 @@
 use ogdl::ogdl;
 
 #[test]
-fn first_line_tab_is_edge() {
-	assert_eq!(format!("{}", ogdl!(d1.r"child	child")), "d1\n\tchild\n\t\tchild");
+fn first_line_tab_is_sibling() {
+	assert_eq!(format!("{}", ogdl!(d1.r"child	child")), "d1\n\tchild\n\tchild");
 }
 
 #[test]
@@ -53,12 +53,12 @@ parent
 }
 
 #[test]
-fn first_line_edge_then_sibling() {
+fn first_line_tabs_then_newline_siblings() {
 	ogdl!(d7.r"
 inline	tab
 newline
 ");
-	assert_eq!(format!("{}", ogdl!(d7)), "d7\n\tinline\n\t\ttab\n\tnewline");
+	assert_eq!(format!("{}", ogdl!(d7)), "d7\n\tinline\n\ttab\n\tnewline");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use ogdl::ogdl;
 fn corpus_shapes() {
 	assert_eq!(format!("{}", ogdl!(r"hello")), "hello");
 	assert_eq!(format!("{}", ogdl!(r"a".r"b".r"c")), "a\n\tb\n\t\tc");
-	assert_eq!(format!("{}", ogdl!(r"a	b	c")), "a\n\tb\n\t\tc");
+	assert_eq!(format!("{}", ogdl!(r"a	b	c")), "a\nb\nc");
 	assert_eq!(
 		format!(
 			"{}",

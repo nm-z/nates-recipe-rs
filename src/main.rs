@@ -19,7 +19,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 		.find(|d| d.join("librecipe.rlib").exists());
 	let Some(root) = root else {
 		anyhow::bail!(
-			"librecipe.rlib missing: build with cargo build (target/release or target/debug) or install the recipe package"
+			"librecipe.rlib missing: run cargo build (target/release or target/debug), or the recipe package provides /usr/lib/recipe"
 		);
 	};
 	let rlib = root.join("librecipe.rlib");

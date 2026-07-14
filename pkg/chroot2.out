@@ -1,0 +1,702 @@
+:: Synchronizing package databases...
+ core downloading...
+ extra downloading...
+:: Starting full system upgrade...
+ there is nothing to do
+==> Building in chroot for [extra] (x86_64)...
+==> Making package: recipe 0.0.r269.55702b1-1 (Sun Jul 12 21:19:43 2026)
+==> Retrieving sources...
+  -> Updating nates-recipe-rs git repo...
+==> Validating source files with sha256sums...
+==> Making package: recipe 0.0.r269.55702b1-1 (Mon Jul 13 04:19:46 2026)
+==> Checking runtime dependencies...
+==> Installing missing dependencies...
+resolving dependencies...
+looking for conflicting packages...
+
+Package (58)                New Version     Net Change 
+
+extra/blas                  3.12.1-2           0.74 MiB
+extra/cblas                 3.12.1-2           0.34 MiB
+extra/comgr                 2:7.2.4-1        158.74 MiB
+extra/compiler-rt           22.1.8-1          54.94 MiB
+extra/default-cursors       3-1                0.00 MiB
+extra/fmt                   12.2.0-1           0.74 MiB
+extra/gflags                2.2.2-6            1.05 MiB
+extra/google-glog           0.7.1-2            0.38 MiB
+extra/hipblas-common        7.2.4-1            0.02 MiB
+extra/hsa-rocr              7.2.4-1            5.16 MiB
+extra/lapack                3.12.1-2          15.06 MiB
+extra/libdrm                2.4.134-1          1.28 MiB
+core/libedit                20260512_3.1-1     0.27 MiB
+extra/libgit2               1:1.9.4-1          3.15 MiB
+extra/libglvnd              1.7.0-3            3.34 MiB
+extra/libpciaccess          0.19-1             0.06 MiB
+extra/libx11                1.8.13-1           9.78 MiB
+extra/libxau                1.0.12-1           0.02 MiB
+extra/libxcb                1.17.0-1           3.87 MiB
+extra/libxdmcp              1.1.5-2            0.13 MiB
+extra/libxext               1.3.7-1            0.30 MiB
+extra/libxshmfence          1.3.3-1            0.02 MiB
+extra/libxxf86vm            1.1.7-1            0.03 MiB
+extra/libyaml               0.2.5-3            0.18 MiB
+extra/lld                   22.1.8-1           7.14 MiB
+extra/llhttp                9.3.1-1            0.11 MiB
+extra/llvm-libs             22.1.8-1         163.72 MiB
+extra/lm_sensors            1:3.6.2-1          0.48 MiB
+extra/mesa                  1:26.1.4-1        52.68 MiB
+extra/numactl               2.0.19-1           0.24 MiB
+extra/openmp                22.1.8-1           2.03 MiB
+core/pciutils               3.15.0-1           0.41 MiB
+extra/python-prettytable    3.18.0-1           0.50 MiB
+extra/python-pyaml          26.7.0-1           0.10 MiB
+extra/python-pyelftools     0.33-1             2.57 MiB
+extra/python-wcwidth        0.8.2-1            6.63 MiB
+extra/python-yaml           6.0.3-2            0.96 MiB
+extra/rocblas               7.2.4-2         1333.40 MiB
+extra/rocfft                7.2.4-1         3479.81 MiB
+extra/rocm-core             7.2.4-1            0.12 MiB
+extra/rocm-device-libs      2:7.2.4-1          3.26 MiB
+extra/rocm-llvm             2:7.2.4-1       4689.61 MiB
+extra/rocminfo              7.2.4-1            0.08 MiB
+extra/rocprim               7.2.4-1            6.33 MiB
+extra/rocprofiler-register  7.2.4-1            0.39 MiB
+extra/rocsolver             7.2.4-1          687.73 MiB
+extra/rocsparse             7.2.4-1          130.41 MiB
+extra/roctracer             7.2.4-1            4.28 MiB
+extra/spirv-tools           1:1.4.350.1-1      7.94 MiB
+extra/suitesparse           7.12.2-2           5.15 MiB
+extra/wayland               1.25.0-1           0.84 MiB
+extra/xcb-proto             1.17.0-4           1.03 MiB
+extra/xorgproto             2025.1-1           1.47 MiB
+extra/hip-runtime-amd       7.2.4-1           31.62 MiB
+extra/hipblas               7.2.4-1            3.02 MiB
+extra/hipfft                7.2.4-1            0.24 MiB
+extra/hipsolver             7.2.4-1            0.70 MiB
+extra/rust                  1:1.97.0-1       305.62 MiB
+
+Total Installed Size:  11190.21 MiB
+
+:: Proceed with installation? [Y/n] 
+checking keyring...
+checking package integrity...
+loading package files...
+checking for file conflicts...
+:: Processing package changes...
+installing compiler-rt...
+installing llhttp...
+installing libgit2...
+installing libedit...
+installing llvm-libs...
+installing lld...
+installing rust...
+Optional dependencies for rust
+    gdb: rust-gdb script [installed]
+    lldb: rust-lldb script
+installing python-wcwidth...
+installing python-prettytable...
+installing libyaml...
+installing python-yaml...
+installing python-pyaml...
+Optional dependencies for python-pyaml
+    python-unidecode: Needed if same-id objects or recursion is used within serialized data
+installing python-pyelftools...
+installing rocm-core...
+installing numactl...
+installing libpciaccess...
+installing libdrm...
+Optional dependencies for libdrm
+    cairo: needed for modetest tool
+installing xcb-proto...
+installing xorgproto...
+installing libxdmcp...
+installing libxau...
+installing libxcb...
+installing libx11...
+installing libxext...
+installing libglvnd...
+installing libxshmfence...
+installing libxxf86vm...
+installing lm_sensors...
+Optional dependencies for lm_sensors
+    rrdtool: for logging with sensord
+    perl: for sensor detection and configuration convert [installed]
+installing spirv-tools...
+installing default-cursors...
+Optional dependencies for default-cursors
+    adwaita-cursors: default cursor theme
+installing wayland...
+installing mesa...
+Optional dependencies for mesa
+    opengl-man-pages: for the OpenGL API man pages
+installing rocm-llvm...
+installing rocm-device-libs...
+installing comgr...
+installing pciutils...
+Optional dependencies for pciutils
+    which: for update-pciids [installed]
+    grep: for update-pciids [installed]
+    curl: for update-pciids [installed]
+installing fmt...
+installing gflags...
+installing google-glog...
+installing rocprofiler-register...
+installing hsa-rocr...
+installing rocminfo...
+installing hip-runtime-amd...
+Optional dependencies for hip-runtime-amd
+    inetutils: Print hostname in hipconfig
+    cuda: Cross compile for nvidia
+installing hipblas-common...
+installing blas...
+installing cblas...
+installing openmp...
+Optional dependencies for openmp
+    cuda: offloading to NVIDIA GPUs
+    hsa-rocr: offloading to AMD GPUs [installed]
+installing roctracer...
+installing rocblas...
+Optional dependencies for rocblas
+    python-yaml: for rocblas-bench and rocblas-gemm-tune [installed]
+    gtest: for rocblas-bench and rocblas-gemm-tune
+    rocm-smi-lib: for rocblas-bench and rocblas-gemm-tune
+installing rocprim...
+installing rocsparse...
+installing rocsolver...
+installing hipblas...
+installing lapack...
+installing suitesparse...
+installing hipsolver...
+installing rocfft...
+installing hipfft...
+:: Running post-transaction hooks...
+(1/2) Reloading system manager configuration...
+  Skipped: Current root is not booted.
+(2/2) Arming ConditionNeedsUpdate...
+==> Checking buildtime dependencies...
+==> Installing missing dependencies...
+resolving dependencies...
+looking for conflicting packages...
+
+Package (6)           New Version  Net Change
+
+extra/perl-error      0.17030-3      0.04 MiB
+extra/perl-mailtools  2.22-3         0.10 MiB
+extra/perl-timedate   2.35-1         0.15 MiB
+extra/zlib-ng         2.3.3-1        0.28 MiB
+extra/git             2.55.0-1      31.33 MiB
+extra/hipcub          7.2.4-1        1.32 MiB
+
+Total Installed Size:  33.22 MiB
+
+:: Proceed with installation? [Y/n] 
+checking keyring...
+checking package integrity...
+loading package files...
+checking for file conflicts...
+:: Processing package changes...
+installing perl-error...
+installing perl-timedate...
+installing perl-mailtools...
+installing zlib-ng...
+installing git...
+Optional dependencies for git
+    git-zsh-completion: upstream zsh completion
+    tk: gitk and git gui
+    openssh: ssh transport and crypto
+    man: show help with `git command --help`
+    perl-libwww: git svn
+    perl-term-readkey: git svn and interactive.singlekey setting
+    perl-io-socket-ssl: git send-email TLS support
+    perl-authen-sasl: git send-email TLS support
+    perl-cgi: gitweb (web interface) support
+    python: git svn & git p4 [installed]
+    subversion: git svn
+    org.freedesktop.secrets: keyring credential helper
+    libsecret: libsecret credential helper [installed]
+    less: the default pager for git
+installing hipcub...
+:: Running post-transaction hooks...
+(1/3) Creating system user accounts...
+Creating group 'git' with GID 969.
+Creating user 'git' (git daemon user) with UID 969 and GID 969.
+(2/3) Reloading system manager configuration...
+  Skipped: Current root is not booted.
+(3/3) Arming ConditionNeedsUpdate...
+==> Retrieving sources...
+==> Extracting sources...
+  -> Creating working copy of nates-recipe-rs git repo...
+==> Starting pkgver()...
+==> Updated version: recipe 0.0.r272.4ed139e-1
+==> Starting build()...
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded adler2 v2.0.1
+  Downloaded aligned-vec v0.6.4
+  Downloaded ahash v0.8.12
+  Downloaded as-slice v0.2.1
+  Downloaded aligned v0.4.3
+  Downloaded v_frame v0.3.9
+  Downloaded castaway v0.2.4
+  Downloaded avif-serialize v0.8.8
+  Downloaded bit_field v0.10.3
+  Downloaded arg_enum_proc_macro v0.3.4
+  Downloaded darling_macro v0.20.11
+  Downloaded byteorder-lite v0.1.0
+  Downloaded block-buffer v0.10.4
+  Downloaded av1-grain v0.2.5
+  Downloaded arrayvec v0.7.6
+  Downloaded cassowary v0.3.0
+  Downloaded autocfg v1.5.0
+  Downloaded byteorder v1.5.0
+  Downloaded anyhow v1.0.102
+  Downloaded bzip2 v0.5.2
+  Downloaded ident_case v1.0.1
+  Downloaded version_check v0.9.5
+  Downloaded quick-error v2.0.1
+  Downloaded unicode_categories v0.1.1
+  Downloaded lebe v0.5.3
+  Downloaded rayon-cond v0.4.0
+  Downloaded zeroize_derive v1.5.0
+  Downloaded crc v3.4.0
+  Downloaded color_quant v1.1.0
+  Downloaded cpufeatures v0.2.17
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded monostate-impl v0.1.18
+  Downloaded macro_rules_attribute-proc_macro v0.2.2
+  Downloaded y4m v0.8.0
+  Downloaded monostate v0.1.18
+  Downloaded instability v0.3.12
+  Downloaded darling v0.20.11
+  Downloaded num-derive v0.4.2
+  Downloaded equator v0.4.2
+  Downloaded heck v0.5.0
+  Downloaded crypto-common v0.1.7
+  Downloaded fnv v1.0.7
+  Downloaded equator-macro v0.4.2
+  Downloaded fax_derive v0.2.0
+  Downloaded generic-array v0.14.7
+  Downloaded constant_time_eq v0.3.1
+  Downloaded macro_rules_attribute v0.2.2
+  Downloaded inout v0.1.4
+  Downloaded darling_macro v0.23.0
+  Downloaded equivalent v1.0.2
+  Downloaded errno v0.3.14
+  Downloaded lru v0.12.5
+  Downloaded itoa v1.0.18
+  Downloaded noop_proc_macro v0.3.0
+  Downloaded bytemuck v1.25.0
+  Downloaded base64 v0.13.1
+  Downloaded bitflags v2.11.0
+  Downloaded bitstream-io v4.9.0
+  Downloaded fax v0.2.6
+  Downloaded wasm-bindgen-macro v0.2.118
+  Downloaded maybe-rayon v0.1.1
+  Downloaded cipher v0.4.4
+  Downloaded displaydoc v0.2.6
+  Downloaded deranged v0.5.8
+  Downloaded subtle v2.6.1
+  Downloaded either v1.15.0
+  Downloaded indoc v2.0.7
+  Downloaded crc-catalog v2.5.0
+  Downloaded data-encoding v2.11.0
+  Downloaded csv-core v0.1.13
+  Downloaded deflate64 v0.1.12
+  Downloaded cfg-if v1.0.4
+  Downloaded derive_builder_core v0.20.2
+  Downloaded foldhash v0.1.5
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded digest v0.10.7
+  Downloaded dary_heap v0.3.9
+  Downloaded allocator-api2 v0.2.21
+  Downloaded built v0.8.0
+  Downloaded derive_builder v0.20.2
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded jobserver v0.1.34
+  Downloaded cc v1.2.60
+  Downloaded time-core v0.1.8
+  Downloaded sha1 v0.10.6
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded static_assertions v1.1.0
+  Downloaded gif v0.14.2
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded getrandom v0.2.17
+  Downloaded darling v0.23.0
+  Downloaded loop9 v0.1.5
+  Downloaded fdeflate v0.3.7
+  Downloaded core2 v0.4.0
+  Downloaded num-conv v0.2.2
+  Downloaded scopeguard v1.2.0
+  Downloaded console v0.15.11
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded crc32fast v1.5.0
+  Downloaded half v2.7.1
+  Downloaded strum_macros v0.26.4
+  Downloaded getrandom v0.3.4
+  Downloaded powerfmt v0.2.0
+  Downloaded wasm-bindgen-shared v0.2.118
+  Downloaded serde_derive v1.0.228
+  Downloaded shlex v1.3.0
+  Downloaded thiserror-impl v2.0.18
+  Downloaded hmac v0.12.1
+  Downloaded bumpalo v3.20.2
+  Downloaded profiling-procmacros v1.0.17
+  Downloaded rand_chacha v0.3.1
+  Downloaded number_prefix v0.4.0
+  Downloaded smallvec v1.15.1
+  Downloaded simd_helpers v0.1.0
+  Downloaded ryu v1.0.23
+  Downloaded indicatif v0.17.11
+  Downloaded rawpointer v0.2.1
+  Downloaded darling_core v0.23.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded new_debug_unreachable v1.0.6
+  Downloaded imgref v1.12.0
+  Downloaded signal-hook v0.3.18
+  Downloaded compact_str v0.9.1
+  Downloaded darling_core v0.20.11
+  Downloaded image-webp v0.2.4
+  Downloaded aes v0.8.4
+  Downloaded compact_str v0.8.2
+  Downloaded unicode-normalization-alignments v0.1.12
+  Downloaded pbkdf2 v0.12.2
+  Downloaded flate2 v1.1.9
+  Downloaded indexmap v2.14.0
+  Downloaded tiff v0.11.3
+  Downloaded tui-textarea v0.7.0
+  Downloaded typenum v1.20.1
+  Downloaded aho-corasick v1.1.4
+  Downloaded crossterm v0.28.1
+  Downloaded profiling v1.0.17
+  Downloaded pastey v0.1.1
+  Downloaded hashbrown v0.15.5
+  Downloaded itertools v0.13.0
+  Downloaded serde_json v1.0.149
+  Downloaded itertools v0.14.0
+  Downloaded lzma-rs v0.3.0
+  Downloaded hashbrown v0.17.0
+  Downloaded esaxx-rs v0.1.10
+  Downloaded lock_api v0.4.14
+  Downloaded tokenizers v0.21.4
+  Downloaded zune-core v0.5.1
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.2.4
+  Downloaded exr v1.74.0
+  Downloaded num-complex v0.4.6
+  Downloaded zmij v1.0.21
+  Downloaded image v0.25.10
+  Downloaded unicode-width v0.1.14
+  Downloaded weezl v0.1.12
+  Downloaded syn v2.0.117
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded strsim v0.11.1
+  Downloaded av-scenechange v0.14.1
+  Downloaded unicode-truncate v1.1.0
+  Downloaded strum v0.26.3
+  Downloaded zeroize v1.9.0
+  Downloaded bzip2-sys v0.1.13+1.0.8
+  Downloaded spm_precompiled v0.1.4
+  Downloaded csv v1.4.0
+  Downloaded paste v1.0.15
+  Downloaded noisy_float v0.2.1
+  Downloaded rand_chacha v0.9.0
+  Downloaded onig v6.5.3
+  Downloaded quote v1.0.45
+  Downloaded num-integer v0.1.46
+  Downloaded num-rational v0.4.2
+  Downloaded rustversion v1.0.22
+  Downloaded pkg-config v0.3.32
+  Downloaded rand_core v0.9.5
+  Downloaded ravif v0.13.0
+  Downloaded rgb v0.8.53
+  Downloaded rand_core v0.6.4
+  Downloaded xz2 v0.1.7
+  Downloaded simd-adler32 v0.3.9
+  Downloaded thiserror v2.0.18
+  Downloaded parking_lot_core v0.9.12
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded once_cell v1.21.4
+  Downloaded zune-inflate v0.2.54
+  Downloaded log v0.4.29
+  Downloaded matrixmultiply v0.3.10
+  Downloaded zopfli v0.8.3
+  Downloaded ndarray-stats v0.6.0
+  Downloaded proc-macro2 v1.0.106
+  Downloaded parking_lot v0.12.5
+  Downloaded wasm-bindgen v0.2.118
+  Downloaded wasm-bindgen-macro-support v0.2.118
+  Downloaded miniz_oxide v0.8.9
+  Downloaded qoi v0.4.1
+  Downloaded num-traits v0.2.19
+  Downloaded rand_distr v0.5.1
+  Downloaded minimal-lexical v0.2.1
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded zune-jpeg v0.5.15
+  Downloaded rayon-core v1.13.0
+  Downloaded rand v0.8.5
+  Downloaded memchr v2.8.0
+  Downloaded serde v1.0.228
+  Downloaded mio v1.2.0
+  Downloaded rand v0.9.2
+  Downloaded serde_core v1.0.228
+  Downloaded unicode-segmentation v1.13.2
+  Downloaded zip v2.4.2
+  Downloaded num-bigint v0.4.6
+  Downloaded png v0.18.1
+  Downloaded nom v7.1.3
+  Downloaded nom v8.0.0
+  Downloaded regex v1.12.3
+  Downloaded libm v0.2.16
+  Downloaded moxcms v0.8.1
+  Downloaded unicode-width v0.2.0
+  Downloaded rayon v1.11.0
+  Downloaded portable-atomic v1.13.1
+  Downloaded time v0.3.47
+  Downloaded ndarray v0.16.1
+  Downloaded zerocopy v0.8.48
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v0.38.44
+  Downloaded ratatui v0.29.0
+  Downloaded regex-automata v0.4.14
+  Downloaded onig_sys v69.9.3
+  Downloaded lzma-sys v0.1.20
+  Downloaded zstd-sys v2.0.16+zstd.1.5.7
+  Downloaded libc v0.2.184
+  Downloaded pxfm v0.1.28
+  Downloaded rav1e v0.8.1
+  Downloaded linux-raw-sys v0.4.15
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling libc v0.2.184
+   Compiling cfg-if v1.0.4
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling autocfg v1.5.0
+   Compiling pkg-config v0.3.32
+   Compiling libm v0.2.16
+   Compiling zerocopy v0.8.48
+   Compiling memchr v2.8.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling version_check v0.9.5
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling log v0.4.29
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling serde_core v1.0.228
+   Compiling num-traits v0.2.19
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling rustversion v1.0.22
+   Compiling getrandom v0.3.4
+   Compiling simd-adler32 v0.3.9
+   Compiling paste v1.0.15
+   Compiling crossbeam-epoch v0.9.18
+   Compiling syn v2.0.117
+   Compiling smallvec v1.15.1
+   Compiling thiserror v2.0.18
+   Compiling bitflags v2.11.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling jobserver v0.1.34
+   Compiling fnv v1.0.7
+   Compiling itoa v1.0.18
+   Compiling cc v1.2.60
+   Compiling serde v1.0.228
+   Compiling anyhow v1.0.102
+   Compiling crc32fast v1.5.0
+   Compiling adler2 v2.0.1
+   Compiling equivalent v1.0.2
+   Compiling ryu v1.0.23
+   Compiling miniz_oxide v0.8.9
+   Compiling castaway v0.2.4
+   Compiling itertools v0.14.0
+   Compiling crypto-common v0.1.7
+   Compiling stable_deref_trait v1.2.1
+   Compiling arrayvec v0.7.6
+   Compiling unicode-segmentation v1.13.2
+   Compiling static_assertions v1.1.0
+   Compiling once_cell v1.21.4
+   Compiling unicode-width v0.2.0
+   Compiling rayon v1.11.0
+   Compiling num-integer v0.1.46
+   Compiling as-slice v0.2.1
+   Compiling block-buffer v0.10.4
+   Compiling rand_core v0.9.5
+   Compiling matrixmultiply v0.3.10
+   Compiling portable-atomic v1.13.1
+   Compiling num-bigint v0.4.6
+   Compiling zmij v1.0.21
+   Compiling subtle v2.6.1
+   Compiling av-scenechange v0.14.1
+   Compiling built v0.8.0
+   Compiling digest v0.10.7
+   Compiling aligned v0.4.3
+   Compiling flate2 v1.1.9
+   Compiling errno v0.3.14
+   Compiling aho-corasick v1.1.4
+   Compiling core2 v0.4.0
+   Compiling nom v8.0.0
+   Compiling ahash v0.8.12
+   Compiling zstd-safe v7.2.4
+   Compiling pastey v0.1.1
+   Compiling rawpointer v0.2.1
+   Compiling y4m v0.8.0
+   Compiling rav1e v0.8.1
+   Compiling regex-syntax v0.8.10
+   Compiling quick-error v2.0.1
+   Compiling serde_json v1.0.149
+   Compiling signal-hook v0.3.18
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling onig_sys v69.9.3
+   Compiling bzip2-sys v0.1.13+1.0.8
+   Compiling esaxx-rs v0.1.10
+   Compiling gpu-core v0.1.0 (/build/recipe/src/nates-recipe-rs/gpu-core)
+   Compiling lzma-sys v0.1.20
+   Compiling minimal-lexical v0.2.1
+   Compiling parking_lot_core v0.9.12
+   Compiling darling_core v0.20.11
+   Compiling nom v7.1.3
+   Compiling darling_core v0.23.0
+   Compiling num-rational v0.4.2
+   Compiling maybe-rayon v0.1.1
+   Compiling regex-automata v0.4.14
+   Compiling zerocopy-derive v0.8.48
+   Compiling thiserror-impl v2.0.18
+   Compiling equator-macro v0.4.2
+   Compiling serde_derive v1.0.228
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling arg_enum_proc_macro v0.3.4
+   Compiling derive_builder_core v0.20.2
+   Compiling equator v0.4.2
+   Compiling aligned-vec v0.6.4
+   Compiling profiling-procmacros v1.0.17
+   Compiling v_frame v0.3.9
+   Compiling profiling v1.0.17
+   Compiling num-derive v0.4.2
+   Compiling av1-grain v0.2.5
+   Compiling derive_builder_macro v0.20.2
+   Compiling fax_derive v0.2.0
+   Compiling monostate-impl v0.1.18
+   Compiling bitstream-io v4.9.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling console v0.15.11
+   Compiling num-complex v0.4.6
+   Compiling inout v0.1.4
+   Compiling simd_helpers v0.1.0
+   Compiling powerfmt v0.2.0
+   Compiling hashbrown v0.17.0
+   Compiling noop_proc_macro v0.3.0
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling weezl v0.1.12
+   Compiling scopeguard v1.2.0
+   Compiling log v1.0.0 (/build/recipe/src/nates-recipe-rs/log)
+   Compiling zune-core v0.5.1
+   Compiling new_debug_unreachable v1.0.6
+   Compiling imgref v1.12.0
+   Compiling number_prefix v0.4.0
+   Compiling cpufeatures v0.2.17
+   Compiling base64 v0.13.1
+   Compiling crc-catalog v2.5.0
+   Compiling ogdl v0.1.0 (/build/recipe/src/nates-recipe-rs/ogdl)
+   Compiling rustix v0.38.44
+   Compiling indexmap v2.14.0
+   Compiling crc v3.4.0
+   Compiling indicatif v0.17.11
+   Compiling loop9 v0.1.5
+   Compiling zune-jpeg v0.5.15
+   Compiling macro_rules_attribute v0.2.2
+   Compiling lock_api v0.4.14
+   Compiling deranged v0.5.8
+   Compiling ndarray v0.16.1
+   Compiling dary_heap v0.3.9
+   Compiling compact_str v0.9.1
+   Compiling spm_precompiled v0.1.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling half v2.7.1
+   Compiling cipher v0.4.4
+   Compiling rand_chacha v0.9.0
+   Compiling monostate v0.1.18
+   Compiling fax v0.2.6
+   Compiling rand v0.9.2
+   Compiling derive_builder v0.20.2
+   Compiling regex v1.12.3
+   Compiling darling_macro v0.23.0
+   Compiling zeroize_derive v1.5.0
+   Compiling rayon-cond v0.4.0
+   Compiling hmac v0.12.1
+   Compiling avif-serialize v0.8.8
+   Compiling getrandom v0.2.17
+   Compiling mio v1.2.0
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling fdeflate v0.3.7
+   Compiling zune-inflate v0.2.54
+   Compiling itertools v0.13.0
+   Compiling rgb v0.8.53
+   Compiling foldhash v0.1.5
+   Compiling instability v0.3.12
+   Compiling unicode_categories v0.1.1
+   Compiling byteorder v1.5.0
+   Compiling color_quant v1.1.0
+   Compiling bit_field v0.10.3
+   Compiling zip v2.4.2
+   Compiling bytemuck v1.25.0
+   Compiling bumpalo v3.20.2
+   Compiling byteorder-lite v0.1.0
+   Compiling allocator-api2 v0.2.21
+   Compiling time-core v0.1.8
+   Compiling heck v0.5.0
+   Compiling linux-raw-sys v0.4.15
+   Compiling pxfm v0.1.28
+   Compiling lebe v0.5.3
+   Compiling num-conv v0.2.2
+   Compiling strum_macros v0.26.4
+   Compiling time v0.3.47
+   Compiling exr v1.74.0
+   Compiling hashbrown v0.15.5
+   Compiling zopfli v0.8.3
+   Compiling image-webp v0.2.4
+   Compiling ravif v0.13.0
+   Compiling qoi v0.4.1
+   Compiling lzma-rs v0.3.0
+   Compiling gif v0.14.2
+   Compiling png v0.18.1
+   Compiling signal-hook-mio v0.2.5
+   Compiling rand_core v0.6.4
+   Compiling zeroize v1.9.0
+   Compiling parking_lot v0.12.5
+   Compiling pbkdf2 v0.12.2
+   Compiling xz2 v0.1.7
+   Compiling moxcms v0.8.1
+   Compiling bzip2 v0.5.2
+   Compiling darling v0.23.0
+   Compiling tiff v0.11.3
+   Compiling aes v0.8.4
+   Compiling sha1 v0.10.6
+   Compiling displaydoc v0.2.6
+   Compiling csv-core v0.1.13
+   Compiling deflate64 v0.1.12
+   Compiling constant_time_eq v0.3.1
+   Compiling indoc v2.0.7
+   Compiling unicode-width v0.1.14
+   Compiling csv v1.4.0
+   Compiling unicode-truncate v1.1.0
+   Compiling crossterm v0.28.1
+   Compiling rand_chacha v0.3.1
+   Compiling strum v0.26.3
+   Compiling lru v0.12.5
+   Compiling compact_str v0.8.2
+   Compiling cassowary v0.3.0
+   Compiling data-encoding v2.11.0
+   Compiling ratatui v0.29.0
+   Compiling rand v0.8.5
+   Compiling noisy_float v0.2.1
+   Compiling recipe v0.1.0 (/build/recipe/src/nates-recipe-rs)
+   Compiling rand_distr v0.5.1
+   Compiling image v0.25.10
+   Compiling ndarray-stats v0.6.0
+   Compiling onig v6.5.3
+   Compiling tokenizers v0.21.4
+   Compiling tui-textarea v0.7.0

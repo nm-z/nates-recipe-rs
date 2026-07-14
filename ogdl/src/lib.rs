@@ -4,6 +4,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 const NL: char = '\u{a}';
 
+const FIRST_LINE_SIBLINGS: bool = true;
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
 	pub name: String,
@@ -492,18 +494,31 @@ fn parse_doc(text: &str) -> (Vec<Node>, Vec<usize>) {
 		let rest = &raw[tabs..];
 		match past_first_newline {
 			false => {
-				for (d, name) in rest.split('\t').enumerate() {
-					let parent = match d {
-						0 => Vec::new(),
-						_ => stack[d - 1].clone(),
-					};
-					let n = Node::at_mut(&mut root, &parent);
-					n.children.push(Node::leaf(name));
-					let mut path = parent;
-					path.push(n.children.len() - 1);
-					stack.truncate(d);
-					stack.push(path.clone());
-					lastpath = path;
+				match FIRST_LINE_SIBLINGS {
+					true => {
+						for name in rest.split('\t') {
+							root.children.push(Node::leaf(name));
+							let path = vec![root.children.len() - 1];
+							stack.clear();
+							stack.push(path.clone());
+							lastpath = path;
+						}
+					}
+					false => {
+						for (d, name) in rest.split('\t').enumerate() {
+							let parent = match d {
+								0 => Vec::new(),
+								_ => stack[d - 1].clone(),
+							};
+							let n = Node::at_mut(&mut root, &parent);
+							n.children.push(Node::leaf(name));
+							let mut path = parent;
+							path.push(n.children.len() - 1);
+							stack.truncate(d);
+							stack.push(path.clone());
+							lastpath = path;
+						}
+					}
 				}
 				past_first_newline = true;
 			}
@@ -740,7 +755,10 @@ pub mod __macro_support {
 						}
 						k += 1;
 					}
-					prev = d - 1;
+					prev = match super::FIRST_LINE_SIBLINGS {
+						true => 0,
+						false => d - 1,
+					};
 				}
 				true => {
 					if ntabs < anchor {
@@ -835,9 +853,12 @@ pub mod __macro_support {
 			for path in &p.cur {
 				let n = at(&*root, path);
 				for i in (0..n.children.len()).filter(|&i| n.children[i].name == name) {
-					let mut q = path.clone();
-					q.push(i);
-					next.push(q);
+					for j in 0..n.children[i].children.len() {
+						let mut q = path.clone();
+						q.push(i);
+						q.push(j);
+						next.push(q);
+					}
 				}
 			}
 			p.cur = next;
