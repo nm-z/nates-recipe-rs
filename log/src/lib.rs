@@ -104,8 +104,9 @@ pub mod Write {
 			false => {}
 		}
 	}
-	pub fn block(f: Flag, text: &str) {
-		let t = text.trim_end();
+	pub fn block(f: Flag, text: impl Display) {
+		let s = text.to_string();
+		let t = s.trim_end();
 		log(&t);
 		match on(f) {
 			true => print(&t),

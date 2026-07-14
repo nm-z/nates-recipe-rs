@@ -17,8 +17,8 @@ name = "all"
 harness = false
 
 [workspace]
-members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core", "log"]
-exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs", "ogdl"]
+members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core", "log", "ogdl"]
+exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
 
 [dependencies]
 gpu-core = { path = "gpu-core" }

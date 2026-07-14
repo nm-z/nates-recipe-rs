@@ -173,12 +173,14 @@ impl fmt::Display for Node {
 #[derive(Clone)]
 pub struct Graph {
 	pub root: Arc<Mutex<Node>>,
+	pub shown: Arc<Mutex<usize>>,
 }
 
 impl Graph {
 	pub fn empty() -> Graph {
 		Graph {
 			root: Arc::new(Mutex::new(Node::leaf(""))),
+			shown: Arc::new(Mutex::new(0)),
 		}
 	}
 
@@ -338,6 +340,28 @@ impl Graph {
 		self.with(|root| root.clone())
 	}
 
+	pub fn section(&self, path: &str) -> String {
+		self.with(|root| {
+			let depth = path
+				.split('.')
+				.filter(|s| !s.is_empty())
+				.count()
+				.saturating_sub(1);
+			match root.select(path) {
+				None => String::new(),
+				Some(n) => {
+					let wrap = Node {
+						name: String::new(),
+						children: vec![n.clone()],
+					};
+					let mut s = String::new();
+					wrap.write_to(&mut s, depth);
+					s
+				}
+			}
+		})
+	}
+
 	pub fn itnl<A: ItnlArg>(&self, a: A) -> A::Out {
 		a.apply(self.clone())
 	}
@@ -369,6 +393,134 @@ impl Graph {
 	}
 }
 
+pub struct Block(pub Node);
+
+impl fmt::Display for Block {
+	fn fmt<'z>(&self, f: &mut fmt::Formatter<'z>) -> fmt::Result {
+		let mut s = String::new();
+		match self.0.name.is_empty() {
+			true => self.0.write_to(&mut s, 0),
+			false => {
+				let wrap = Node {
+					name: String::new(),
+					children: vec![self.0.clone()],
+				};
+				wrap.write_to(&mut s, 0);
+			}
+		}
+		f.write_str(s.trim_end())
+	}
+}
+
+fn parse_doc(text: &str) -> (Vec<Node>, Vec<usize>) {
+	let all: Vec<&str> = text.split(NL).collect();
+	let Some(first) = all.iter().position(|l| !l.trim().is_empty()) else {
+		return (Vec::new(), Vec::new());
+	};
+	let last = all
+		.iter()
+		.rposition(|l| !l.trim().is_empty())
+		.unwrap_or(first);
+	let lines = &all[first..=last];
+	let anchor = lines[0].chars().take_while(|&c| c == '\t').count();
+	let mut root = Node::leaf("");
+	let mut stack: Vec<Vec<usize>> = Vec::new();
+	let mut lastpath: Vec<usize> = Vec::new();
+	let mut past_first_newline = false;
+	for raw in lines {
+		if raw.trim().is_empty() {
+			continue;
+		}
+		let tabs = raw.chars().take_while(|&c| c == '\t').count();
+		let rest = &raw[tabs..];
+		match past_first_newline {
+			false => {
+				for (d, name) in rest.split('\t').enumerate() {
+					let parent = match d {
+						0 => Vec::new(),
+						_ => stack[d - 1].clone(),
+					};
+					let n = Node::at_mut(&mut root, &parent);
+					n.children.push(Node::leaf(name));
+					let mut path = parent;
+					path.push(n.children.len() - 1);
+					stack.truncate(d);
+					stack.push(path.clone());
+					lastpath = path;
+				}
+				past_first_newline = true;
+			}
+			true => {
+				let depth = tabs.saturating_sub(anchor).min(stack.len());
+				let parent = match depth {
+					0 => Vec::new(),
+					_ => stack[depth - 1].clone(),
+				};
+				let n = Node::at_mut(&mut root, &parent);
+				n.children.push(Node::leaf(rest));
+				let mut path = parent;
+				path.push(n.children.len() - 1);
+				stack.truncate(depth);
+				stack.push(path.clone());
+				lastpath = path;
+			}
+		}
+	}
+	(root.children, lastpath)
+}
+
+#[macro_export]
+macro_rules! ogdl {
+	(@go $p:ident; $i:ident) => { $crate::__macro_support::seg(&mut $p, stringify!($i)) };
+	(@go $p:ident; $s:literal) => {{
+		const _: [(); 0] = [(); $crate::__macro_support::doc_ok($s)];
+		$crate::__macro_support::doc(&mut $p, $s);
+	}};
+	(@go $p:ident; $i:ident [$n:expr]) => {{
+		$crate::__macro_support::seg(&mut $p, stringify!($i));
+		$crate::__macro_support::idx(&mut $p, $n);
+	}};
+	(@go $p:ident; $i:ident {$n:expr}) => { $crate::__macro_support::sel(&mut $p, stringify!($i), $n) };
+	(@go $p:ident; $i:ident {$n:expr} [$m:expr]) => {{
+		$crate::__macro_support::sel(&mut $p, stringify!($i), $n);
+		$crate::__macro_support::idx(&mut $p, $m);
+	}};
+	(@go $p:ident; $i:ident *) => { $crate::__macro_support::star(&mut $p, stringify!($i)) };
+	(@go $p:ident; $i:ident {}) => { $crate::__macro_support::del(&mut $p, stringify!($i)) };
+	(@go $p:ident; $i:ident . $($rest:tt)+) => {{
+		$crate::__macro_support::seg(&mut $p, stringify!($i));
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $s:literal . $($rest:tt)+) => {{
+		const _: [(); 0] = [(); $crate::__macro_support::doc_ok($s)];
+		$crate::__macro_support::doc(&mut $p, $s);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $i:ident {$n:expr} . $($rest:tt)+) => {{
+		$crate::__macro_support::sel(&mut $p, stringify!($i), $n);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $i:ident {$n:expr} [$m:expr] . $($rest:tt)+) => {{
+		$crate::__macro_support::sel(&mut $p, stringify!($i), $n);
+		$crate::__macro_support::idx(&mut $p, $m);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $i:ident [$n:expr] . $($rest:tt)+) => {{
+		$crate::__macro_support::seg(&mut $p, stringify!($i));
+		$crate::__macro_support::idx(&mut $p, $n);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $i:ident * . $($rest:tt)+) => {{
+		$crate::__macro_support::star(&mut $p, stringify!($i));
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	($($path:tt)+) => {{
+		let mut p = $crate::__macro_support::start();
+		$crate::ogdl!(@go p; $($path)+);
+		$crate::__macro_support::fin(p)
+	}};
+}
+
 #[macro_export]
 macro_rules! del {
 	($g:expr, $a:ident . $b:ident {}) => {{ $crate::__macro_support::del_all(&$g, stringify!($a), stringify!($b)) }};
@@ -376,7 +528,7 @@ macro_rules! del {
 
 #[doc(hidden)]
 pub mod __macro_support {
-	use super::{Graph, Node};
+	use super::{Graph, Node, ogdl, parse_doc};
 
 	pub fn del_all(g: &Graph, parent: &str, name: &str) -> Graph {
 		g.with(|root: &mut Node| {
@@ -388,5 +540,208 @@ pub mod __macro_support {
 			p.children.retain(|c| c.name != name);
 		});
 		g.clone()
+	}
+
+	pub struct P {
+		pub cur: Vec<Vec<usize>>,
+		pub anchor: std::option::Option<Vec<usize>>,
+	}
+
+	pub fn start() -> P {
+		P {
+			cur: vec![Vec::new()],
+			anchor: None,
+		}
+	}
+
+	fn hold(p: &mut P) {
+		if p.anchor.is_none() {
+			p.anchor = p.cur.first().cloned();
+		}
+	}
+
+	fn at<'a>(mut n: &'a Node, path: &[usize]) -> &'a Node {
+		for &i in path {
+			n = &n.children[i];
+		}
+		n
+	}
+
+	pub fn seg(p: &mut P, name: &str) {
+		ogdl.with(|root| {
+			let mut next = Vec::new();
+			for path in &p.cur {
+				let n = Node::at_mut(root, path);
+				let i = match n.children.iter().position(|c| c.name == name) {
+					Some(i) => i,
+					None => {
+						n.children.push(Node::leaf(name));
+						n.children.len() - 1
+					}
+				};
+				let mut q = path.clone();
+				q.push(i);
+				next.push(q);
+			}
+			p.cur = next;
+		});
+		hold(p);
+	}
+
+	pub const fn doc_ok(s: &str) -> usize {
+		let b = s.as_bytes();
+		let mut i = 0;
+		let mut anchor = 0;
+		let mut prev = 0;
+		let mut seen = false;
+		while i < b.len() {
+			let start = i;
+			while i < b.len() && b[i] != 10 {
+				i += 1;
+			}
+			let end = i;
+			i += 1;
+			let mut j = start;
+			while j < end && (b[j] == 9 || b[j] == 32) {
+				j += 1;
+			}
+			if j == end {
+				continue;
+			}
+			let mut tabs = start;
+			while tabs < end && b[tabs] == 9 {
+				tabs += 1;
+			}
+			if tabs < end && b[tabs] == 32 {
+				return 2;
+			}
+			let ntabs = tabs - start;
+			match seen {
+				false => {
+					anchor = ntabs;
+					seen = true;
+					let mut k = tabs;
+					let mut d = 0;
+					let mut cell = tabs;
+					while k <= end {
+						if k == end || b[k] == 9 {
+							if k == cell {
+								return 5;
+							}
+							d += 1;
+							cell = k + 1;
+						}
+						k += 1;
+					}
+					prev = d - 1;
+				}
+				true => {
+					if ntabs < anchor {
+						return 3;
+					}
+					let depth = ntabs - anchor;
+					if depth > prev + 1 {
+						return 4;
+					}
+					prev = depth;
+				}
+			}
+		}
+		match seen {
+			false => 1,
+			true => 0,
+		}
+	}
+
+	pub fn doc(p: &mut P, text: &str) {
+		let (roots, last) = parse_doc(text);
+		if roots.is_empty() {
+			hold(p);
+			return;
+		}
+		if roots.len() == 1 && roots[0].children.is_empty() {
+			seg(p, &roots[0].name);
+			return;
+		}
+		ogdl.with(|root| {
+			let mut next = Vec::new();
+			for path in &p.cur {
+				let n = Node::at_mut(root, path);
+				let base = n.children.len();
+				n.children.extend(roots.iter().cloned());
+				let mut q = path.clone();
+				q.push(base + last[0]);
+				q.extend(&last[1..]);
+				next.push(q);
+			}
+			p.cur = next;
+		});
+		hold(p);
+	}
+
+	pub fn idx(p: &mut P, k: usize) {
+		ogdl.with(|root| {
+			let mut next = Vec::new();
+			for path in &p.cur {
+				let n = at(&*root, path);
+				if k < n.children.len() {
+					let mut q = path.clone();
+					q.push(k);
+					next.push(q);
+				}
+			}
+			p.cur = next;
+		});
+		hold(p);
+	}
+
+	pub fn sel(p: &mut P, name: &str, k: usize) {
+		ogdl.with(|root| {
+			let mut next = Vec::new();
+			for path in &p.cur {
+				let n = at(&*root, path);
+				let hit = (0..n.children.len())
+					.filter(|&i| n.children[i].name == name)
+					.nth(k);
+				if let Some(i) = hit {
+					let mut q = path.clone();
+					q.push(i);
+					next.push(q);
+				}
+			}
+			p.cur = next;
+		});
+		hold(p);
+	}
+
+	pub fn star(p: &mut P, name: &str) {
+		ogdl.with(|root| {
+			let mut next = Vec::new();
+			for path in &p.cur {
+				let n = at(&*root, path);
+				for i in (0..n.children.len()).filter(|&i| n.children[i].name == name) {
+					let mut q = path.clone();
+					q.push(i);
+					next.push(q);
+				}
+			}
+			p.cur = next;
+		});
+		hold(p);
+	}
+
+	pub fn del(p: &mut P, name: &str) {
+		ogdl.with(|root| {
+			for path in &p.cur {
+				let n = Node::at_mut(root, path);
+				n.children.retain(|c| c.name != name);
+			}
+		});
+		hold(p);
+	}
+
+	pub fn fin(p: P) -> super::Block {
+		let path = p.anchor.unwrap_or_default();
+		ogdl.with(|root| super::Block(at(&*root, &path).clone()))
 	}
 }
