@@ -4,26 +4,26 @@ use recipe_infer::{Saved, load_ogdl, load_ogdl_str};
 fn ogdl_format_roundtrips_host_side() {
 	let path = std::env::temp_dir().join("nrs_ogdl_roundtrip.ogdl");
 	let text = "\
-r2=0.42
+r2\t0.42
 embed
-    0=-0.0312 0.1847 -0.0551
-    1=0.0892 -0.2104 0.0033
+\t0\t-0.0312\t0.1847\t-0.0551
+\t1\t0.0892\t-0.2104\t0.0033
 attn
-    wq=1 2 3 4
-    wk=5 6 7 8
-    wv=9 10 11 12
-    wo=13 14 15 16
-    bq=0 0
-    bk=0 0
-    bv=0 0
-    bo=0 0
+\twq\t1\t2\t3\t4
+\twk\t5\t6\t7\t8
+\twv\t9\t10\t11\t12
+\two\t13\t14\t15\t16
+\tbq\t0\t0
+\tbk\t0\t0
+\tbv\t0\t0
+\tbo\t0\t0
 z1
-    w=0.01 -0.02 0.03
-    b=0.001
+\tw\t0.01\t-0.02\t0.03
+\tb\t0.001
 z2
-    w=0.04 0.05 0.06
-    a=0.25
-    b=0.002
+\tw\t0.04\t0.05\t0.06
+\ta\t0.25
+\tb\t0.002
 ";
 	std::fs::write(&path, text).expect("write tmp ogdl");
 	let parsed = load_ogdl(path.to_str().expect("utf8 path")).expect("load_ogdl");

@@ -10,6 +10,7 @@ use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
 };
+use anyhow::Context;
 use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use recipe::data::{RawCsv, read_raw_csv};
@@ -447,17 +448,18 @@ const MARCH: &[(&str, &[&str], usize)] = &[
 	("MTeamConferences.csv", &["ConfAbbrev"], KIND_CATEGORICAL),
 ];
 
-fn column_cells(path: &str, col: &str) -> Vec<String> {
+fn column_cells(path: &str, col: &str) -> anyhow::Result<Vec<String>> {
 	let RawCsv { headers, rows } =
-		read_raw_csv(std::path::Path::new(path)).expect("read corpus csv");
+		read_raw_csv(std::path::Path::new(path)).context("read corpus csv")?;
 	let Some(j) = headers.iter().position(|h| h == col) else {
-		panic!("corpus: column '{col}' not in {path}");
+		Write::err(format!("corpus: column '{col}' not in {path}"))?;
+		return Ok(Vec::new());
 	};
-	rows.iter()
+	Ok(rows.iter()
 		.filter_map(|r| r.get(j))
 		.filter(|v| !v.is_empty())
 		.cloned()
-		.collect()
+		.collect())
 }
 
 // ── extra corpus: VNA + UCI dumps in varied delimiters / headerless layouts ──
@@ -473,8 +475,8 @@ enum Delim {
 	Space,
 }
 
-fn columns_of(path: &str, d: &Delim, headerless: bool) -> Vec<Vec<String>> {
-	let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+fn columns_of(path: &str, d: &Delim, headerless: bool) -> anyhow::Result<Vec<Vec<String>>> {
+	let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
 	let split = |line: &str| -> Vec<String> {
 		let raw: Vec<&str> = match d {
 			Delim::Comma => line.split(',').collect(),
@@ -492,11 +494,11 @@ fn columns_of(path: &str, d: &Delim, headerless: bool) -> Vec<Vec<String>> {
 		.map(split)
 		.collect();
 	if rows.is_empty() {
-		return Vec::new();
+		return Ok(Vec::new());
 	}
 	let width = rows.iter().map(Vec::len).max().unwrap_or(0);
 	let data = if headerless { &rows[..] } else { &rows[1..] };
-	(0..width)
+	Ok((0..width)
 		.map(|j| {
 			data.iter()
 				.filter_map(|r| r.get(j))
@@ -504,7 +506,7 @@ fn columns_of(path: &str, d: &Delim, headerless: bool) -> Vec<Vec<String>> {
 				.cloned()
 				.collect()
 		})
-		.collect()
+		.collect())
 }
 
 /// Expand one column's cells into prefix variants + the full stream, same shape
@@ -538,13 +540,14 @@ fn add_indexed(
 	d: &Delim,
 	headerless: bool,
 	cols: &[(usize, usize)],
-) {
-	let columns = columns_of(path, d, headerless);
+) -> anyhow::Result<()> {
+	let columns = columns_of(path, d, headerless)?;
 	for &(j, kind) in cols {
 		if let Some(c) = columns.get(j) {
 			push_instances(out, c.clone(), kind);
 		}
 	}
+	Ok(())
 }
 
 /// Wide all-numeric matrices (VNA predictors, HAR sensor): sample ~k evenly-spaced
@@ -556,11 +559,11 @@ fn add_sampled_numeric(
 	d: &Delim,
 	headerless: bool,
 	k: usize,
-) {
-	let cols = columns_of(path, d, headerless);
+) -> anyhow::Result<()> {
+	let cols = columns_of(path, d, headerless)?;
 	let width = cols.len();
 	if width == 0 {
-		return;
+		return Ok(());
 	}
 	let step = (width / k).max(1);
 	let mut n = 0;
@@ -569,9 +572,10 @@ fn add_sampled_numeric(
 		n += 1;
 	}
 	say(format!("  {path}: sampled {n} of {width} numeric columns"));
+	Ok(())
 }
 
-fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
+fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 	use Delim::{Comma, Semicolon, Space, Tab};
 	// VNA — the headerless numeric dumps that motivated this. Targets: one column.
 	add_indexed(
@@ -580,22 +584,22 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 		&Comma,
 		true,
 		&[(0, KIND_NUMERIC)],
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/VNA/sample_targets.csv",
 		&Comma,
 		true,
 		&[(0, KIND_NUMERIC)],
-	);
-	add_sampled_numeric(out, "datasets/VNA/sample_predictors.csv", &Comma, true, 64);
+	)?;
+	add_sampled_numeric(out, "datasets/VNA/sample_predictors.csv", &Comma, true, 64)?;
 	add_sampled_numeric(
 		out,
 		"datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv",
 		&Comma,
 		true,
 		64,
-	);
+	)?;
 
 	// UCI comma headerless — numeric attributes + a trailing class/label column.
 	// Full columns (not sampled): more data generalized better than a balanced-but-
@@ -606,77 +610,77 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 		&Comma,
 		true,
 		&kinds(14, &[(0, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-glass/glass.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-ionosphere/ionosphere.data",
 		&Comma,
 		true,
 		&kinds(35, &[(34, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-sonar/sonar.all-data",
 		&Comma,
 		true,
 		&kinds(61, &[(60, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-abalone/abalone.data",
 		&Comma,
 		true,
 		&kinds(9, &[(0, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-bcw/breast-cancer-wisconsin.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-wdbc/wdbc.data",
 		&Comma,
 		true,
 		&kinds(32, &[(1, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-letter/letter-recognition.data",
 		&Comma,
 		true,
 		&kinds(17, &[(0, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-magic/magic04.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-optdigits/optdigits.tra",
 		&Comma,
 		true,
 		&kinds(65, &[(64, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-spambase/spambase.data",
 		&Comma,
 		true,
 		&kinds(58, &[(57, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-adult/adult.data",
@@ -696,7 +700,7 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 				(14, KIND_CATEGORICAL),
 			],
 		),
-	);
+	)?;
 
 	// UCI space/tab headerless numeric matrices (+ trailing class).
 	add_indexed(
@@ -705,56 +709,56 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 		&Space,
 		true,
 		&kinds(25, &[]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-satimage/sat.trn",
 		&Space,
 		true,
 		&kinds(37, &[(36, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-shuttle/shuttle.trn",
 		&Space,
 		true,
 		&kinds(10, &[(9, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-ecoli/ecoli.data",
 		&Space,
 		true,
 		&kinds(9, &[(0, KIND_TEXT), (8, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-yeast/yeast.data",
 		&Space,
 		true,
 		&kinds(10, &[(0, KIND_TEXT), (9, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-seeds/seeds_dataset.txt",
 		&Tab,
 		true,
 		&kinds(8, &[(7, KIND_CATEGORICAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-airfoil/airfoil_self_noise.dat",
 		&Tab,
 		true,
 		&kinds(6, &[]),
-	);
+	)?;
 	add_sampled_numeric(
 		out,
 		"datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt",
 		&Space,
 		true,
 		64,
-	);
+	)?;
 
 	// SMS spam: tab-delimited headerless — label + free text.
 	add_indexed(
@@ -763,7 +767,7 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 		&Tab,
 		true,
 		&[(0, KIND_CATEGORICAL), (1, KIND_TEXT)],
-	);
+	)?;
 
 	// Semicolon-delimited WITH headers (quoted fields in bank).
 	add_indexed(
@@ -772,14 +776,14 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 		&Semicolon,
 		false,
 		&kinds(12, &[(11, KIND_ORDINAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-winequality-semicolon/winequality-white.csv",
 		&Semicolon,
 		false,
 		&kinds(12, &[(11, KIND_ORDINAL)]),
-	);
+	)?;
 	add_indexed(
 		out,
 		"datasets/uci-bank-semicolon/bank-full.csv",
@@ -800,15 +804,16 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
 				(16, KIND_CATEGORICAL),
 			],
 		),
-	);
+	)?;
+	Ok(())
 }
 
 /// Every labelled column across datasets/, as `(byte-stream cells, kind)`.
-fn instances() -> Vec<(Vec<String>, usize)> {
+fn instances() -> anyhow::Result<Vec<(Vec<String>, usize)>> {
 	let mut out: Vec<(Vec<String>, usize)> = Vec::new();
-	let mut add = |path: &str, cols: &[&str], kind: usize| {
+	let mut add = |path: &str, cols: &[&str], kind: usize| -> anyhow::Result<()> {
 		for col in cols {
-			let cells = column_cells(path, col);
+			let cells = column_cells(path, col)?;
 			if cells.is_empty() {
 				continue;
 			}
@@ -823,20 +828,21 @@ fn instances() -> Vec<(Vec<String>, usize)> {
 			}
 			out.push((cells, kind));
 		}
+		Ok(())
 	};
 	for (path, cols, kind) in SOURCES {
-		add(path, cols, *kind);
+		add(path, cols, *kind)?;
 	}
 	for (file, cols, kind) in MARCH {
-		add(&format!("{MDIR}{file}"), cols, *kind);
+		add(&format!("{MDIR}{file}"), cols, *kind)?;
 	}
 	// newchic: same five image-URL columns across every category file.
 	for file in NEWCHIC_FILES {
-		add(&format!("{NCDIR}{file}.csv"), NEWCHIC_IMG, KIND_IMAGE);
+		add(&format!("{NCDIR}{file}.csv"), NEWCHIC_IMG, KIND_IMAGE)?;
 	}
 	// s&p500: ISO date column from the first STOCK_N per-ticker files.
 	let mut stocks: Vec<std::path::PathBuf> = std::fs::read_dir(STOCK_DIR)
-		.expect("stock dir")
+		.context("stock dir")?
 		.filter_map(|e| e.ok())
 		.map(|e| e.path())
 		.filter(|p| p.extension().is_some_and(|x| x == "csv"))
@@ -844,15 +850,15 @@ fn instances() -> Vec<(Vec<String>, usize)> {
 	stocks.sort();
 	for p in stocks.into_iter().take(STOCK_N) {
 		if let Some(s) = p.to_str() {
-			add(s, &["date"], KIND_TEMPORAL);
+			add(s, &["date"], KIND_TEMPORAL)?;
 		}
 	}
 	drop(add);
-	add_new_corpus(&mut out);
-	out
+	add_new_corpus(&mut out)?;
+	Ok(out)
 }
 
-fn build_dataset(insts: &[(Vec<String>, usize)]) -> Dataset {
+fn build_dataset(insts: &[(Vec<String>, usize)]) -> anyhow::Result<Dataset> {
 	let n = insts.len();
 	let mut x = Vec::with_capacity(n * CONTEXT);
 	let mut y = vec![0.0f64; n * N_CLASS];
@@ -861,34 +867,34 @@ fn build_dataset(insts: &[(Vec<String>, usize)]) -> Dataset {
 		x.extend(tokenize_column(&refs));
 		y[r * N_CLASS + kind] = 1.0;
 	}
-	Dataset {
-		x: Mat::from_shape_vec((n, CONTEXT), x).expect("corpus matrix"),
+	Ok(Dataset {
+		x: Mat::from_shape_vec((n, CONTEXT), x).context("corpus matrix")?,
 		y: Vec1::from_vec(y),
 		source: "detector-corpus".to_string(),
 		n_targets: N_CLASS,
 		has_target: true,
 		text_cols: (0..CONTEXT).collect(),
 		onehot_groups: Vec::new(),
-	}
+	})
 }
 
 /// Shuffle all labelled columns (seeded) and split into (train, test) by fraction.
 /// `test_frac = 0.6` → 40% train / 60% test.
-fn corpus_split(seed: u64, test_frac: f64) -> (Dataset, Dataset) {
+fn corpus_split(seed: u64, test_frac: f64) -> anyhow::Result<(Dataset, Dataset)> {
 	use rand::SeedableRng as _;
 	use rand::seq::SliceRandom as _;
-	let mut insts = instances();
+	let mut insts = instances()?;
 	let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 	insts.shuffle(&mut rng);
 	let n_train = ((insts.len() as f64) * (1.0 - test_frac)).round() as usize;
 	let (tr, te) = insts.split_at(n_train);
-	(build_dataset(tr), build_dataset(te))
+	Ok((build_dataset(tr)?, build_dataset(te)?))
 }
 
 /// Per-class instance counts (argmax the one-hot targets) — proves the held-out
 /// accuracy isn't a degenerate all-Numeric pass.
-fn class_balance(tag: &str, ds: &Dataset) {
-	let y = ds.y.as_slice().expect("y contiguous");
+fn class_balance(tag: &str, ds: &Dataset) -> anyhow::Result<()> {
+	let y = ds.y.as_slice().context("y contiguous")?;
 	let n = y.len() / N_CLASS;
 	let mut c = [0usize; N_CLASS];
 	for r in 0..n {
@@ -910,18 +916,19 @@ fn class_balance(tag: &str, ds: &Dataset) {
 		c[KIND_TEXT],
 		c[KIND_IMAGE]
 	));
+	Ok(())
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
 	// 40% train / 60% test over all hand-labelled real columns.
-	let (train, test) = corpus_split(0xC0FFEE, 0.6);
+	let (train, test) = corpus_split(0xC0FFEE, 0.6)?;
 	say(format!(
 		"split: {} train / {} test columns",
 		train.x.nrows(),
 		test.x.nrows()
 	));
-	class_balance("train", &train);
-	class_balance("test", &test);
+	class_balance("train", &train)?;
+	class_balance("test", &test)?;
 
 	// Retrain from scratch on the EXPANDED corpus. The prior detector.ogdl (0.987)
 	// was a different corpus, so resuming + the best-only save guard would compare
@@ -938,4 +945,5 @@ fn main() {
 	trainer.save("pantry/detector.ogdl");
 	say("=== held-out test set (60%) — datatype-detection accuracy ===");
 	Train::new().log([Accuracy]).run(&Some(test), &model);
+	Ok(())
 }

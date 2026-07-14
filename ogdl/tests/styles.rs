@@ -2,7 +2,7 @@
 // anywhere (the four methods are inherent on the handle). All read and write the
 // same graph via itnl/file/add/del and check the value back.
 
-const SRC: &str = "engi\n    GPU0\n        VRAM 12\n        FLOPs 380\n    CPU\n        RAM 31\n";
+const SRC: &str = "engi\n\tGPU0\n\t\tVRAM\t12\n\t\tFLOPs\t380\n\tCPU\n\t\tRAM\t31\n";
 
 fn tmp(tag: &str) -> String {
 	std::env::temp_dir()

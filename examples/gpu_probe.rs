@@ -1,5 +1,6 @@
 // Proof-of-life: Rust drives the attached AMD GPU through gpu-core's hipblasSgemm.
 // Small case verifies correctness vs a CPU reference; large case measures f32 TFLOP/s.
+use anyhow::Context;
 use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::nn_f32::gpu_linear_f32;
@@ -25,26 +26,26 @@ fn cpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 	out
 }
 
-fn gpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-	let xb = GpuBuffer::upload_f32(x).expect("upload x");
-	let wb = GpuBuffer::upload_f32(w).expect("upload w");
-	let bb = GpuBuffer::zeros_f32(n).expect("zero bias");
-	let out = GpuBuffer::zeros_f32(m * n).expect("alloc out");
-	gpu_linear_f32(&xb, &wb, &bb, m, n, k, &out).expect("sgemm");
+fn gpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> anyhow::Result<Vec<f32>> {
+	let xb = GpuBuffer::upload_f32(x).context("upload x")?;
+	let wb = GpuBuffer::upload_f32(w).context("upload w")?;
+	let bb = GpuBuffer::zeros_f32(n).context("zero bias")?;
+	let out = GpuBuffer::zeros_f32(m * n).context("alloc out")?;
+	gpu_linear_f32(&xb, &wb, &bb, m, n, k, &out).context("sgemm")?;
 	let mut got = vec![0.0f32; m * n];
-	out.download_f32(&mut got).expect("download");
-	got
+	out.download_f32(&mut got).context("download")?;
+	Ok(got)
 }
 
-fn main() {
-	recipe_infer::init().expect("gpu init (set_device 0)");
+fn main() -> anyhow::Result<()> {
+	recipe_infer::init().context("gpu init (set_device 0)")?;
 	say("GPU device 0 selected.");
 
 	// ── correctness: 2x3 = (2x4) @ (4x3) ───────────────────────────────
 	let (m, n, k) = (2usize, 3usize, 4usize);
 	let x: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 - 0.3).collect();
 	let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 + 0.2).collect();
-	let g = gpu_linear(&x, &w, m, n, k);
+	let g = gpu_linear(&x, &w, m, n, k)?;
 	let c = cpu_linear(&x, &w, m, n, k);
 	let max_err = g
 		.iter()
@@ -54,18 +55,20 @@ fn main() {
 	say(format!("correctness: gpu={g:?}"));
 	say(format!("             cpu={c:?}"));
 	say(format!("             max abs err = {max_err:.3e}"));
-	assert!(max_err < 1e-3, "GPU sgemm disagrees with CPU");
+	if max_err >= 1e-3 {
+		Write::err("GPU sgemm disagrees with CPU")?;
+	}
 
 	// ── throughput: 4096^3 f32 GEMM ────────────────────────────────────
 	let d = 4096usize;
 	let xl: Vec<f32> = (0..d * d).map(|i| ((i % 17) as f32) * 0.01).collect();
 	let wl: Vec<f32> = (0..d * d).map(|i| ((i % 13) as f32) * 0.01).collect();
 	// warm up (allocs, hipblas handle, kernel load)
-	let _ = gpu_linear(&xl, &wl, d, d, d);
+	let _ = gpu_linear(&xl, &wl, d, d, d)?;
 	let t = Instant::now();
 	let reps = 5;
 	for _ in 0..reps {
-		let _ = gpu_linear(&xl, &wl, d, d, d);
+		let _ = gpu_linear(&xl, &wl, d, d, d)?;
 	}
 	let secs = t.elapsed().as_secs_f64() / reps as f64;
 	let flops = 2.0 * d as f64 * d as f64 * d as f64;
@@ -76,4 +79,5 @@ fn main() {
 	));
 	say(format!("PROOF: hand-written Rust ran {reps}+2 real GEMMs on the AMD card."));
 	recipe_infer::shutdown();
+	Ok(())
 }

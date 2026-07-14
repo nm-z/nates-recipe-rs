@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::Arc;
 
 const SAMPLE: &str =
-	"engi\n    GPU0\n        VRAM 12\n        FLOPs 380\n    CPU\n        RAM 31\n";
+	"engi\n\tGPU0\n\t\tVRAM\t12\n\t\tFLOPs\t380\n\tCPU\n\t\tRAM\t31\n";
 
 #[test]
 fn round_trip_itnl_file_itnl() {
@@ -27,7 +27,7 @@ fn select_value() {
 
 #[test]
 fn index_and_selectors() {
-	let root = Node::parse("a\n    b\n        x\n    b\n        y\n    1\n        z\n");
+	let root = Node::parse("a\n\tb\n\t\tx\n\tb\n\t\ty\n\t1\n\t\tz\n");
 	let a = &root.children[0];
 	assert_eq!(a.name, "a");
 	assert_eq!(a[0].name, "b");
@@ -56,7 +56,7 @@ fn handles_free_on_drop() {
 #[test]
 fn arity_forms_dispatch() {
 	let g = Graph::empty();
-	g.with(|r| *r = Node::parse("a\n    x\n    y\n"));
+	g.with(|r| *r = Node::parse("a\n\tx\n\ty\n"));
 	let _ = g.itnl(()).itnl("a");
 	let a = g.itnl("a");
 	g.del(&a[0]);
@@ -71,7 +71,7 @@ fn arity_forms_dispatch() {
 #[test]
 fn add_del() {
 	let g = Graph::empty();
-	g.with(|r| *r = Node::parse("a\n    b\n"));
+	g.with(|r| *r = Node::parse("a\n\tb\n"));
 	g.add("c", "a");
 	assert!(
 		g.snapshot()

@@ -16,6 +16,7 @@ const MACRO_ROOTS: &[&str] = &[
 	"catboost-rs/src",
 	"lightgbm-rs/src",
 	"xgboost-rs/src",
+	"examples",
 ];
 const BANNED_MACROS: &[&str] = &[
 	"print!",
@@ -35,7 +36,6 @@ const BANNED_MACROS: &[&str] = &[
 	"unreachable!",
 ];
 const BANNED_CALLS: &[&str] = &[".unwrap()", ".expect("];
-const PRINT_MACROS: &[&str] = &["print!", "println!", "eprint!", "eprintln!", "dbg!"];
 const LOG_SRC: &str = "log/src/lib.rs";
 const LOG_WRITELN_BUDGET: usize = 2;
 const LOG_EXPECT_BUDGET: usize = 3;
@@ -1101,11 +1101,6 @@ fn h36_no_banned_macro_anywhere() {
 			for tok in BANNED_CALLS {
 				hits.extend(count_in(&p, tok));
 			}
-		}
-	}
-	for p in rs_files(&["examples"]) {
-		for tok in PRINT_MACROS {
-			hits.extend(count_in(&p, tok));
 		}
 	}
 	assert_absent("banned macro or crash call (route through log::Write)", &hits);

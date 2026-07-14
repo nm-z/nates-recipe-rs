@@ -1,3 +1,4 @@
+use anyhow::Context;
 use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use recipe::*;
@@ -11,25 +12,26 @@ fn say(t: impl std::fmt::Display) {
 	Write::block(probe, ogdl!(&t));
 }
 
-fn columns(path: &str) -> recipe::data::RawCsv {
-	recipe::data::read_raw_csv(std::path::Path::new(path))
-		.unwrap_or_else(|e| panic!("stress: {path}: {e}"))
+fn columns(path: &str) -> anyhow::Result<recipe::data::RawCsv> {
+	recipe::data::read_raw_csv(std::path::Path::new(path)).with_context(|| format!("stress: {path}"))
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
 	for (path, want, sep) in [
 		(BANK, 17usize, "semicolon"),
 		(SEEDS, 8, "tab"),
 		(WINE, 14, "comma"),
 	] {
-		let recipe::data::RawCsv { headers, rows } = columns(path);
-		assert_eq!(
-			headers.len(),
-			want,
-			"{sep} sniff failed: {path} parsed {} column(s), want {want}",
-			headers.len()
-		);
-		assert!(!rows.is_empty(), "{path}: no rows parsed");
+		let recipe::data::RawCsv { headers, rows } = columns(path)?;
+		if headers.len() != want {
+			Write::err(format!(
+				"{sep} sniff failed: {path} parsed {} column(s), want {want}",
+				headers.len()
+			))?;
+		}
+		if rows.is_empty() {
+			Write::err(format!("{path}: no rows parsed"))?;
+		}
 		say(format!(
 			"\x1b[36mstress\x1b[0m  {sep:<10} {path}  {} cols × {} rows",
 			headers.len(),
@@ -37,7 +39,7 @@ fn main() {
 		));
 	}
 
-	let rows = columns(BANK).rows.len();
+	let rows = columns(BANK)?.rows.len();
 	let data = Data::load(BANK).target("y");
 	let model = Model::new()
 		.loss(bce)
@@ -54,15 +56,15 @@ fn main() {
 	let infer = Infer::new().log([r2]);
 	infer.run(&model).eval(&data);
 	let preds = infer.preds();
-	assert_eq!(
-		preds.len(),
-		rows,
-		"eval returned {} preds for {rows} rows",
-		preds.len()
-	);
-	assert!(
-		preds.iter().all(|p| p.is_finite()),
-		"eval produced non-finite predictions"
-	);
+	if preds.len() != rows {
+		Write::err(format!(
+			"eval returned {} preds for {rows} rows",
+			preds.len()
+		))?;
+	}
+	if !preds.iter().all(|p| p.is_finite()) {
+		Write::err("eval produced non-finite predictions")?;
+	}
 	say("\x1b[36mstress\x1b[0m  ok");
+	Ok(())
 }

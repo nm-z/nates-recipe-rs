@@ -20,29 +20,29 @@ impl Node {
 
 	pub fn parse(text: &str) -> Node {
 		let mut root = Node::leaf("");
-		let mut path: Vec<usize> = Vec::new();
-		let mut widths: Vec<usize> = Vec::new();
+		let mut stack: Vec<Vec<usize>> = Vec::new();
 		for raw in text.lines() {
-			let content = raw.trim();
-			let Some(_c) = content.chars().next() else {
+			if raw.trim().is_empty() {
 				continue;
-			};
-			let width = raw.len() - raw.trim_start().len();
-			while widths.last().is_some_and(|&w| w >= width) {
-				widths.pop();
-				path.pop();
 			}
-			let line = content.replacen('=', " ", 1);
-			let mut toks = line.split_whitespace();
+			let tabs = raw.chars().take_while(|&c| c == '\t').count();
+			let depth = tabs.min(stack.len());
+			let mut toks = raw[tabs..].split('\t');
 			let name = toks.next().unwrap_or("");
 			let mut node = Node::leaf(name);
 			for v in toks {
 				node.children.push(Node::leaf(v));
 			}
-			let parent = Node::at_mut(&mut root, &path);
-			parent.children.push(node);
-			path.push(parent.children.len() - 1);
-			widths.push(width);
+			let parent = match depth {
+				0 => Vec::new(),
+				_ => stack[depth - 1].clone(),
+			};
+			let n = Node::at_mut(&mut root, &parent);
+			n.children.push(node);
+			let mut path = parent;
+			path.push(n.children.len() - 1);
+			stack.truncate(depth);
+			stack.push(path);
 		}
 		root
 	}
@@ -119,28 +119,11 @@ impl Node {
 	}
 
 	fn write_to(&self, out: &mut String, depth: usize) {
-		for c in &self.children {
-			for _d in 0..depth {
-				out.push_str("    ");
-			}
-			out.push_str(&c.name);
-			let eligible = match c.children.iter().find(|g| !g.children.is_empty()) {
-				Some(_nonleaf) => None,
-				None => c.children.first(),
-			};
-			match eligible {
-				Some(_first) => {
-					for g in &c.children {
-						out.push(' ');
-						out.push_str(&g.name);
-					}
-					out.push(NL);
-				}
-				None => {
-					out.push(NL);
-					c.write_to(out, depth + 1);
-				}
-			}
+		let mut lines = Vec::new();
+		walk_lines(self, &mut Vec::new(), depth, &mut lines);
+		for (l, _p, _r) in lines {
+			out.push_str(&l);
+			out.push(NL);
 		}
 	}
 
