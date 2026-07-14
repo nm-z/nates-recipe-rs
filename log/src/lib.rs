@@ -148,6 +148,18 @@ pub mod Write {
 		log(&t);
 		print(&t);
 	}
+
+	pub fn wait(t: impl Display) {
+		always(t);
+	}
+
+	pub fn unwait() {
+		use std::io::IsTerminal;
+		match std::io::stderr().is_terminal() {
+			true => drop(write!(std::io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
+			false => {}
+		}
+	}
 	pub fn err(t: impl Display) -> std::result::Result<(), Errored> {
 		std::result::Result::Err(Errored::new(t))
 	}

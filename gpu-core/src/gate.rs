@@ -1,4 +1,4 @@
-use crate::log::{Write, gpu};
+use crate::log::Write;
 use std::io::{Read, Seek, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -131,11 +131,13 @@ fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Resu
 	match Some(()).filter(|_u| kind == std::io::ErrorKind::WouldBlock) {
 		None => Err(e),
 		Some(()) => {
-			match holder_pid(f) {
-				Some(pid) => Write::line(gpu, &format!("gpu gate: queued behind pid {pid}")),
-				None => Write::line(gpu, "gpu gate: queued behind the current holder"),
+			match holder_pid(f).filter(|p| *p != CLEAN) {
+				Some(pid) => Write::wait(format!("Waiting for pid {pid} to release the GPU")),
+				None => Write::wait("Waiting for the GPU lock"),
 			}
-			flock(fd, libc::LOCK_EX)
+			let got = flock(fd, libc::LOCK_EX);
+			Write::unwait();
+			got
 		}
 	}
 }
@@ -143,9 +145,26 @@ fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Resu
 fn await_teardown(pid: u32) {
 	let path = std::path::PathBuf::from(KFD_PROC).join(pid.to_string());
 	let t0 = std::time::Instant::now();
+	let parked = path.exists();
+	match parked {
+		true => Write::wait(format!("Waiting for pid {pid} gpu teardown")),
+		false => {}
+	}
+	let mut wedged = false;
 	while path.exists() {
-		let None = expired(t0, pid) else { return };
-		std::thread::sleep(std::time::Duration::from_millis(2));
+		wedged = expired(t0).is_some();
+		match wedged {
+			true => break,
+			false => std::thread::sleep(std::time::Duration::from_millis(2)),
+		}
+	}
+	match parked {
+		true => Write::unwait(),
+		false => {}
+	}
+	match wedged {
+		true => return overstayed(pid, t0),
+		false => {}
 	}
 	let Some(mut free) = crate::hip::sysfs_vram_free() else {
 		return;
@@ -160,21 +179,25 @@ fn await_teardown(pid: u32) {
 			std::cmp::Ordering::Equal => return,
 			std::cmp::Ordering::Less => return,
 		}
-		let None = expired(t0, pid) else { return };
+		let None = expired(t0) else {
+			return overstayed(pid, t0);
+		};
 	}
 }
 
-fn expired(t0: std::time::Instant, pid: u32) -> Option<()> {
+fn expired(t0: std::time::Instant) -> Option<()> {
 	let waited = t0.elapsed().as_secs_f64();
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
 		Some(std::cmp::Ordering::Less) | None => None,
-		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => {
-			drop(Write::err(&format!(
-				"gpu gate: pid {pid} still holds the device after {waited:.0}s — proceeding"
-			)));
-			Some(())
-		}
+		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => Some(()),
 	}
+}
+
+fn overstayed(pid: u32, t0: std::time::Instant) {
+	drop(Write::err(&format!(
+		"gpu gate: pid {pid} still holds the device after {:.0}s — proceeding",
+		t0.elapsed().as_secs_f64()
+	)));
 }
 
 fn engage(g: &mut Gate) -> std::io::Result<()> {
