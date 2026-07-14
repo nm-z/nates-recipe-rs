@@ -1,8 +1,15 @@
 // Proof-of-life: Rust drives the attached AMD GPU through gpu-core's hipblasSgemm.
 // Small case verifies correctness vs a CPU reference; large case measures f32 TFLOP/s.
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::nn_f32::gpu_linear_f32;
+use ogdl::ogdl;
 use std::time::Instant;
+
+fn say(t: impl std::fmt::Display) {
+	set_opt(Opt { probe: true, ..opt() });
+	Write::block(probe, ogdl!(&t));
+}
 
 fn cpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 	let mut out = vec![0.0f32; m * n];
@@ -31,7 +38,7 @@ fn gpu_linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 
 fn main() {
 	recipe_infer::init().expect("gpu init (set_device 0)");
-	eprintln!("GPU device 0 selected.");
+	say("GPU device 0 selected.");
 
 	// ── correctness: 2x3 = (2x4) @ (4x3) ───────────────────────────────
 	let (m, n, k) = (2usize, 3usize, 4usize);
@@ -44,9 +51,9 @@ fn main() {
 		.zip(&c)
 		.map(|(a, b)| (a - b).abs())
 		.fold(0.0f32, f32::max);
-	eprintln!("correctness: gpu={g:?}");
-	eprintln!("             cpu={c:?}");
-	eprintln!("             max abs err = {max_err:.3e}");
+	say(format!("correctness: gpu={g:?}"));
+	say(format!("             cpu={c:?}"));
+	say(format!("             max abs err = {max_err:.3e}"));
 	assert!(max_err < 1e-3, "GPU sgemm disagrees with CPU");
 
 	// ── throughput: 4096^3 f32 GEMM ────────────────────────────────────
@@ -62,11 +69,11 @@ fn main() {
 	}
 	let secs = t.elapsed().as_secs_f64() / reps as f64;
 	let flops = 2.0 * d as f64 * d as f64 * d as f64;
-	eprintln!(
+	say(format!(
 		"throughput: {d}^3 sgemm = {:.1} ms/call, {:.2} TFLOP/s f32",
 		secs * 1e3,
 		flops / secs / 1e12
-	);
-	eprintln!("PROOF: hand-written Rust ran {reps}+2 real GEMMs on the AMD card.");
+	));
+	say(format!("PROOF: hand-written Rust ran {reps}+2 real GEMMs on the AMD card."));
 	recipe_infer::shutdown();
 }

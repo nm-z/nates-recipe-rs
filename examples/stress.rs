@@ -1,8 +1,15 @@
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::ogdl;
 use recipe::*;
 
 const BANK: &str = "datasets/uci-bank-semicolon/bank-full.csv";
 const SEEDS: &str = "datasets/uci-seeds/seeds_dataset.txt";
 const WINE: &str = "datasets/uci-wine/wine.data";
+
+fn say(t: impl std::fmt::Display) {
+	set_opt(Opt { probe: true, ..opt() });
+	Write::block(probe, ogdl!(&t));
+}
 
 fn columns(path: &str) -> recipe::data::RawCsv {
 	recipe::data::read_raw_csv(std::path::Path::new(path))
@@ -23,11 +30,11 @@ fn main() {
 			headers.len()
 		);
 		assert!(!rows.is_empty(), "{path}: no rows parsed");
-		eprintln!(
+		say(format!(
 			"\x1b[36mstress\x1b[0m  {sep:<10} {path}  {} cols × {} rows",
 			headers.len(),
 			rows.len()
-		);
+		));
 	}
 
 	let rows = columns(BANK).rows.len();
@@ -57,5 +64,5 @@ fn main() {
 		preds.iter().all(|p| p.is_finite()),
 		"eval produced non-finite predictions"
 	);
-	eprintln!("\x1b[36mstress\x1b[0m  ok");
+	say("\x1b[36mstress\x1b[0m  ok");
 }

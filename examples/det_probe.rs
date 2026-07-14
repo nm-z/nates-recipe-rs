@@ -4,12 +4,19 @@
 //
 //   cargo run --release --example det_probe
 
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::ogdl;
 use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
 	gpu_scale_f64_inplace, gpu_widen_bf16,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::memory::GpuBuffer;
+
+fn say(t: impl std::fmt::Display) {
+	set_opt(Opt { probe: true, ..opt() });
+	Write::block(probe, ogdl!(&t));
+}
 
 const T: usize = 54;
 const NE: usize = 2816;
@@ -39,21 +46,21 @@ fn cmp(name: &str, a: &[f64], b: &[f64]) {
 		.filter(|(x, y)| x.to_bits() != y.to_bits())
 		.count();
 	if diff == 0 {
-		eprintln!(
+		say(format!(
 			"{name:<26} DETERMINISTIC ({} elems)  hash={:016x}",
 			a.len(),
 			bithash(a)
-		);
+		));
 	} else {
 		let mx = a
 			.iter()
 			.zip(b)
 			.map(|(x, y)| (x - y).abs())
 			.fold(0.0f64, f64::max);
-		eprintln!(
+		say(format!(
 			"{name:<26} DIVERGED: {diff}/{} elems differ, max abs {mx:e}",
 			a.len()
-		);
+		));
 	}
 }
 
@@ -112,9 +119,9 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) {
 		.fold(0.0f64, f64::max);
 
 	let pass = if err_cpu < 1e-9 { "PASS" } else { "FAIL" };
-	eprintln!(
+	say(format!(
 		"{label:<24} m={m:<3} n={n:<5} k={k:<5} max_err_cpu={err_cpu:e} max_err_rocblas={err_roc:e} {pass}"
-	);
+	));
 
 	twice(&format!("gemm_bt_f64 {label}"), m * n, |o| {
 		gpu_gemm_bt_f64(&a, &b, m, n, k, o).expect("gemm_bt_f64")
@@ -159,10 +166,10 @@ fn bench_shape(label: &str, m: usize, n: usize, k: usize) {
 	let floor_ms = b_bytes / 432e9 * 1000.0;
 	let roc_gbs = b_bytes / (roc_ms / 1000.0) / 1e9;
 	let cus_gbs = b_bytes / (cus_ms / 1000.0) / 1e9;
-	eprintln!(
+	say(format!(
 		"{label:<24} m={m:<3} n={n:<5} k={k:<5} rocBLAS={roc_ms:8.4}ms ({roc_gbs:7.1} GB/s)  custom={cus_ms:8.4}ms ({cus_gbs:7.1} GB/s)  floor={floor_ms:7.4}ms  ratio={:.2}x",
 		cus_ms / roc_ms
-	);
+	));
 }
 
 fn twice(name: &str, n_out: usize, mut f: impl FnMut(&GpuBuffer)) {
@@ -346,12 +353,12 @@ fn main() {
 		.zip(&sf1)
 		.map(|(a, b)| (a - b).abs())
 		.fold(0.0f64, f64::max);
-	eprintln!("scale_f64 vs hipblasDscal   max_err={err_scale:e}");
+	say(format!("scale_f64 vs hipblasDscal   max_err={err_scale:e}"));
 
 	// Custom f64 GEMM-BT: correctness (CPU oracle + rocBLAS cross-check + bit
 	// identity) across every real gemma4 shape, m spanning the full MoE (1..10)
 	// through full-canvas (48/54) range.
-	eprintln!("\n-- gemm_bt_f64 correctness --");
+	say("\n-- gemm_bt_f64 correctness --");
 	check_gemm("q_proj/lm_head", 54, 8192, 2816);
 	check_gemm("k_proj", 48, 2048, 2816);
 	check_gemm("mlp.gate/up", 8, 2112, 2816);
@@ -360,7 +367,7 @@ fn main() {
 	check_gemm("moe.down", 1, 2816, 704);
 	check_gemm("moe.down", 3, 2816, 704);
 
-	eprintln!("\n-- gemm_bt_f64 benchmark (rocBLAS vs custom, 50 iters) --");
+	say("\n-- gemm_bt_f64 benchmark (rocBLAS vs custom, 50 iters) --");
 	bench_shape("q_proj/lm_head", 54, 8192, 2816);
 	bench_shape("k_proj", 48, 2048, 2816);
 	bench_shape("mlp.gate/up", 8, 2112, 2816);
@@ -368,6 +375,6 @@ fn main() {
 	bench_shape("moe.gate_up", 5, 1408, 2816);
 	bench_shape("moe.down", 1, 2816, 704);
 
-	eprintln!("{}", gpu_core::memory::ledger_report());
+	say(gpu_core::memory::ledger_report());
 	recipe_infer::shutdown();
 }

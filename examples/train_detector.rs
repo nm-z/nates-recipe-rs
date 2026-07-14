@@ -10,8 +10,15 @@ use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
 };
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::ogdl;
 use recipe::data::{RawCsv, read_raw_csv};
 use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
+
+fn say(t: impl std::fmt::Display) {
+	set_opt(Opt { probe: true, ..opt() });
+	Write::block(probe, ogdl!(&t));
+}
 
 fn model() -> Model {
 	Model::new()
@@ -561,7 +568,7 @@ fn add_sampled_numeric(
 		push_instances(out, cols[j].clone(), KIND_NUMERIC);
 		n += 1;
 	}
-	eprintln!("  {path}: sampled {n} of {width} numeric columns");
+	say(format!("  {path}: sampled {n} of {width} numeric columns"));
 }
 
 fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) {
@@ -894,7 +901,7 @@ fn class_balance(tag: &str, ds: &Dataset) {
 		}
 		c[best] += 1;
 	}
-	eprintln!(
+	say(format!(
 		"  {tag}: NUM {} TEMP {} CAT {} ORD {} TEXT {} IMG {}",
 		c[KIND_NUMERIC],
 		c[KIND_TEMPORAL],
@@ -902,17 +909,17 @@ fn class_balance(tag: &str, ds: &Dataset) {
 		c[KIND_ORDINAL],
 		c[KIND_TEXT],
 		c[KIND_IMAGE]
-	);
+	));
 }
 
 fn main() {
 	// 40% train / 60% test over all hand-labelled real columns.
 	let (train, test) = corpus_split(0xC0FFEE, 0.6);
-	eprintln!(
+	say(format!(
 		"split: {} train / {} test columns",
 		train.x.nrows(),
 		test.x.nrows()
-	);
+	));
 	class_balance("train", &train);
 	class_balance("test", &test);
 
@@ -929,6 +936,6 @@ fn main() {
 		.log([Epoch, Loss, Accuracy]);
 	trainer.run(&train, &model);
 	trainer.save("pantry/detector.ogdl");
-	eprintln!("=== held-out test set (60%) — datatype-detection accuracy ===");
+	say("=== held-out test set (60%) — datatype-detection accuracy ===");
 	Train::new().log([Accuracy]).run(&Some(test), &model);
 }
