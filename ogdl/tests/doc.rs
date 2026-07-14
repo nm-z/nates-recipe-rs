@@ -2,12 +2,12 @@ use ogdl::ogdl;
 
 #[test]
 fn first_line_tab_is_edge() {
-	assert_eq!(format!("{}", ogdl!(d1.r"child	child")), "d1\n    child child");
+	assert_eq!(format!("{}", ogdl!(d1.r"child	child")), "d1\n\tchild\n\t\tchild");
 }
 
 #[test]
 fn dot_is_depth() {
-	assert_eq!(format!("{}", ogdl!(d2.r"parent".r"child")), "d2\n    parent child");
+	assert_eq!(format!("{}", ogdl!(d2.r"parent".r"child")), "d2\n\tparent\n\t\tchild");
 }
 
 #[test]
@@ -16,9 +16,9 @@ fn newline_makes_siblings() {
 child
 child
 ");
-	assert_eq!(format!("{}", ogdl!(d3)), "d3 child child");
+	assert_eq!(format!("{}", ogdl!(d3)), "d3\n\tchild\n\tchild");
 	ogdl!(d3.child{1}.q);
-	assert_eq!(format!("{}", ogdl!(d3)), "d3\n    child\n    child q");
+	assert_eq!(format!("{}", ogdl!(d3)), "d3\n\tchild\n\tchild\n\t\tq");
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn leading_tab_is_depth() {
 parent
 	child
 ");
-	assert_eq!(format!("{}", ogdl!(d4)), "d4\n    parent child");
+	assert_eq!(format!("{}", ogdl!(d4)), "d4\n\tparent\n\t\tchild");
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn inline_tab_after_newline_is_content() {
 parent
 	child	dog
 ");
-	assert_eq!(format!("{}", ogdl!(d5)), "d5\n    parent child\tdog");
+	assert_eq!(format!("{}", ogdl!(d5)), "d5\n\tparent\n\t\tchild\tdog");
 }
 
 #[test]
@@ -46,7 +46,10 @@ parent
 	child
 	dog	parrot
 ");
-	assert_eq!(format!("{}", ogdl!(d6)), "d6\n    parent child dog\tparrot");
+	assert_eq!(
+		format!("{}", ogdl!(d6)),
+		"d6\n\tparent\n\t\tchild\n\t\tdog\tparrot"
+	);
 }
 
 #[test]
@@ -55,7 +58,7 @@ fn first_line_edge_then_sibling() {
 inline	tab
 newline
 ");
-	assert_eq!(format!("{}", ogdl!(d7)), "d7\n    inline tab\n    newline");
+	assert_eq!(format!("{}", ogdl!(d7)), "d7\n\tinline\n\t\ttab\n\tnewline");
 }
 
 #[test]
@@ -70,7 +73,7 @@ measuring:
 ");
 	assert_eq!(
 		format!("{}", ogdl!(d14)),
-		"d14\n    measuring:\n        engi\n            ETH 1GbE\n            CPU RAM"
+		"d14\n\tmeasuring:\n\t\tengi\n\t\t\tETH\n\t\t\t\t1GbE\n\t\t\tCPU\n\t\t\t\tRAM"
 	);
 }
 

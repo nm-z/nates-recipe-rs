@@ -393,22 +393,96 @@ impl Graph {
 	}
 }
 
-pub struct Block(pub Node);
+pub struct Block {
+	pub nodes: Vec<Node>,
+	pub sel: std::option::Option<Vec<usize>>,
+}
+
+fn value_leaf(n: &Node) -> bool {
+	n.children.is_empty()
+		&& !n.name.contains('\t')
+		&& (n.name.parse::<f64>().is_ok() || n.name.chars().any(|c| !c.is_ascii()))
+}
+
+fn rider(n: &Node) -> bool {
+	!n.children.is_empty() && n.children.iter().all(value_leaf)
+}
+
+fn walk_lines(
+	n: &Node,
+	path: &mut Vec<usize>,
+	depth: usize,
+	out: &mut Vec<(String, Vec<usize>, bool)>,
+) {
+	for (i, c) in n.children.iter().enumerate() {
+		path.push(i);
+		let mut line = String::new();
+		for _t in 0..depth {
+			line.push('\t');
+		}
+		line.push_str(&c.name);
+		match rider(c) {
+			true => {
+				for v in &c.children {
+					line.push('\t');
+					line.push_str(&v.name);
+				}
+				out.push((line, path.clone(), true));
+			}
+			false => {
+				out.push((line, path.clone(), false));
+				walk_lines(c, path, depth + 1, out);
+			}
+		}
+		path.pop();
+	}
+}
+
+fn lines_of(root: &Node) -> Vec<(String, Vec<usize>, bool)> {
+	let mut out = Vec::new();
+	walk_lines(root, &mut Vec::new(), 0, &mut out);
+	out
+}
 
 impl fmt::Display for Block {
 	fn fmt<'z>(&self, f: &mut fmt::Formatter<'z>) -> fmt::Result {
-		let mut s = String::new();
-		match self.0.name.is_empty() {
-			true => self.0.write_to(&mut s, 0),
-			false => {
-				let wrap = Node {
-					name: String::new(),
-					children: vec![self.0.clone()],
-				};
-				wrap.write_to(&mut s, 0);
+		let wrap = Node {
+			name: String::new(),
+			children: self.nodes.clone(),
+		};
+		let text: Vec<String> = lines_of(&wrap).into_iter().map(|(l, _p, _r)| l).collect();
+		f.write_str(&text.join("\n"))
+	}
+}
+
+impl Block {
+	pub fn show(self) -> String {
+		let Some(sel) = self.sel else {
+			return String::new();
+		};
+		ogdl.with(|root| {
+			let ls = lines_of(root);
+			let hit = ls
+				.iter()
+				.position(|(_l, p, _r)| *p == sel)
+				.or_else(|| match sel.split_last() {
+					Some((_i, par)) => ls.iter().position(|(_l, p, _r)| p == par),
+					None => None,
+				});
+			let Some(mut end) = hit else {
+				return String::new();
+			};
+			while end + 1 < ls.len() && ls[end + 1].1.starts_with(&sel) && ls[end + 1].2 {
+				end += 1;
 			}
-		}
-		f.write_str(s.trim_end())
+			let mut sh = ogdl.shown.lock().unwrap_or_else(|p| p.into_inner());
+			if end < *sh {
+				return String::new();
+			}
+			let out: Vec<&str> = ls[*sh..=end].iter().map(|(l, _p, _r)| l.as_str()).collect();
+			*sh = end + 1;
+			out.join("\n")
+		})
 	}
 }
 
@@ -487,6 +561,49 @@ macro_rules! ogdl {
 	}};
 	(@go $p:ident; $i:ident *) => { $crate::__macro_support::star(&mut $p, stringify!($i)) };
 	(@go $p:ident; $i:ident {}) => { $crate::__macro_support::del(&mut $p, stringify!($i)) };
+	(@go $p:ident; & $i:ident) => { $crate::__macro_support::val(&mut $p, &$i) };
+	(@go $p:ident; & $i:ident [$n:expr]) => {{
+		$crate::__macro_support::val(&mut $p, &$i);
+		$crate::__macro_support::idx(&mut $p, $n);
+	}};
+	(@go $p:ident; & $i:ident . $($rest:tt)+) => {{
+		$crate::__macro_support::val(&mut $p, &$i);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; & $i:ident [$n:expr] . $($rest:tt)+) => {{
+		$crate::__macro_support::val(&mut $p, &$i);
+		$crate::__macro_support::idx(&mut $p, $n);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $s:literal [$n:expr]) => {{
+		$crate::__macro_support::seg(&mut $p, $s);
+		$crate::__macro_support::idx(&mut $p, $n);
+	}};
+	(@go $p:ident; $s:literal {$n:expr}) => { $crate::__macro_support::sel(&mut $p, $s, $n) };
+	(@go $p:ident; $s:literal {$n:expr} [$m:expr]) => {{
+		$crate::__macro_support::sel(&mut $p, $s, $n);
+		$crate::__macro_support::idx(&mut $p, $m);
+	}};
+	(@go $p:ident; $s:literal *) => { $crate::__macro_support::star(&mut $p, $s) };
+	(@go $p:ident; $s:literal {}) => { $crate::__macro_support::del(&mut $p, $s) };
+	(@go $p:ident; $s:literal [$n:expr] . $($rest:tt)+) => {{
+		$crate::__macro_support::seg(&mut $p, $s);
+		$crate::__macro_support::idx(&mut $p, $n);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $s:literal {$n:expr} . $($rest:tt)+) => {{
+		$crate::__macro_support::sel(&mut $p, $s, $n);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $s:literal {$n:expr} [$m:expr] . $($rest:tt)+) => {{
+		$crate::__macro_support::sel(&mut $p, $s, $n);
+		$crate::__macro_support::idx(&mut $p, $m);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
+	(@go $p:ident; $s:literal * . $($rest:tt)+) => {{
+		$crate::__macro_support::star(&mut $p, $s);
+		$crate::ogdl!(@go $p; $($rest)+);
+	}};
 	(@go $p:ident; $i:ident . $($rest:tt)+) => {{
 		$crate::__macro_support::seg(&mut $p, stringify!($i));
 		$crate::ogdl!(@go $p; $($rest)+);
@@ -514,6 +631,9 @@ macro_rules! ogdl {
 		$crate::__macro_support::star(&mut $p, stringify!($i));
 		$crate::ogdl!(@go $p; $($rest)+);
 	}};
+	(@go $p:ident; $($bad:tt)*) => {
+		const _: [(); 0] = [(); $crate::__macro_support::invalid_path()];
+	};
 	($($path:tt)+) => {{
 		let mut p = $crate::__macro_support::start();
 		$crate::ogdl!(@go p; $($path)+);
@@ -544,7 +664,7 @@ pub mod __macro_support {
 
 	pub struct P {
 		pub cur: Vec<Vec<usize>>,
-		pub anchor: std::option::Option<Vec<usize>>,
+		pub anchor: std::option::Option<Vec<Vec<usize>>>,
 	}
 
 	pub fn start() -> P {
@@ -556,7 +676,7 @@ pub mod __macro_support {
 
 	fn hold(p: &mut P) {
 		if p.anchor.is_none() {
-			p.anchor = p.cur.first().cloned();
+			p.anchor = Some(p.cur.clone());
 		}
 	}
 
@@ -586,6 +706,10 @@ pub mod __macro_support {
 			p.cur = next;
 		});
 		hold(p);
+	}
+
+	pub const fn invalid_path() -> usize {
+		1
 	}
 
 	pub const fn doc_ok(s: &str) -> usize {
@@ -665,18 +789,26 @@ pub mod __macro_support {
 		}
 		ogdl.with(|root| {
 			let mut next = Vec::new();
+			let mut tops = Vec::new();
 			for path in &p.cur {
 				let n = Node::at_mut(root, path);
 				let base = n.children.len();
 				n.children.extend(roots.iter().cloned());
+				for r in 0..roots.len() {
+					let mut t = path.clone();
+					t.push(base + r);
+					tops.push(t);
+				}
 				let mut q = path.clone();
 				q.push(base + last[0]);
 				q.extend(&last[1..]);
 				next.push(q);
 			}
 			p.cur = next;
+			if p.anchor.is_none() {
+				p.anchor = Some(tops);
+			}
 		});
-		hold(p);
 	}
 
 	pub fn idx(p: &mut P, k: usize) {
@@ -730,6 +862,10 @@ pub mod __macro_support {
 		hold(p);
 	}
 
+	pub fn val(p: &mut P, v: impl std::fmt::Display) {
+		seg(p, &v.to_string());
+	}
+
 	pub fn del(p: &mut P, name: &str) {
 		ogdl.with(|root| {
 			for path in &p.cur {
@@ -741,7 +877,11 @@ pub mod __macro_support {
 	}
 
 	pub fn fin(p: P) -> super::Block {
-		let path = p.anchor.unwrap_or_default();
-		ogdl.with(|root| super::Block(at(&*root, &path).clone()))
+		let paths = p.anchor.unwrap_or_default();
+		let sel = p.cur.first().cloned();
+		ogdl.with(|root| super::Block {
+			nodes: paths.iter().map(|q| at(&*root, q).clone()).collect(),
+			sel,
+		})
 	}
 }

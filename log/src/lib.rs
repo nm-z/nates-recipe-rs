@@ -104,8 +104,36 @@ pub mod Write {
 			false => {}
 		}
 	}
-	pub fn block(f: Flag, text: impl Display) {
-		let s = text.to_string();
+	pub trait Show {
+		fn take(self) -> String;
+	}
+
+	impl Show for &str {
+		fn take(self) -> String {
+			self.to_string()
+		}
+	}
+
+	impl Show for String {
+		fn take(self) -> String {
+			self
+		}
+	}
+
+	impl Show for &String {
+		fn take(self) -> String {
+			self.clone()
+		}
+	}
+
+	impl Show for ogdl::Block {
+		fn take(self) -> String {
+			self.show()
+		}
+	}
+
+	pub fn block(f: Flag, text: impl Show) {
+		let s = text.take();
 		let t = s.trim_end();
 		log(&t);
 		match on(f) {
