@@ -141,6 +141,13 @@ pub mod Write {
 			false => {}
 		}
 	}
+
+	pub fn always(t: impl Display) {
+		let s = t.to_string();
+		let t = s.trim_end();
+		log(&t);
+		print(&t);
+	}
 	pub fn err(t: impl Display) -> std::result::Result<(), Errored> {
 		std::result::Result::Err(Errored::new(t))
 	}

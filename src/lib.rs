@@ -47,12 +47,11 @@ pub use model::{
 	Activation, DataHandle, IntoLayer, LayerSpec, ModelArg, ModelHandle, Prepared, RunArg,
 	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
-#[doc(hidden)]
-pub use gpu_core::log::Flag;
-#[doc(hidden)]
-pub use gpu_core::log::{acc, chat, device, epoch, loss, lr, net, probe, prompt, r2, save, time};
-pub use gpu_core::log::{Opt, Write, opt, set_opt};
 pub use ogdl::ogdl;
+
+pub fn block(content: impl std::fmt::Display) {
+	gpu_core::log::Write::always(content);
+}
 
 pub struct Recipe;
 

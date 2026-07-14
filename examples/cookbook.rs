@@ -1,4 +1,5 @@
 #!/usr/bin/env -S cargo run --release --example cookbook --
+use gpu_core::log::{acc, r2};
 use recipe::*;
 
 #[allow(dead_code)]

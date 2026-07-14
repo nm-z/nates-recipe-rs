@@ -1126,18 +1126,18 @@ fn metric_consts_both_casings() {
 	]);
 	drop(t);
 	let i = Infer::new().log([
-		recipe::loss,
-		recipe::acc,
-		recipe::epoch,
-		recipe::lr,
-		recipe::time,
-		recipe::r2,
-		recipe::chat,
+		gpu_core::log::loss,
+		gpu_core::log::acc,
+		gpu_core::log::epoch,
+		gpu_core::log::lr,
+		gpu_core::log::time,
+		gpu_core::log::r2,
+		gpu_core::log::chat,
 	]);
 	drop(i);
-	assert!(recipe::loss == recipe::loss, "flag self-equality");
-	assert!(recipe::loss != recipe::acc, "distinct flags compare unequal");
-	assert!(recipe::chat != recipe::r2, "chat is its own flag");
+	assert!(gpu_core::log::loss == gpu_core::log::loss, "flag self-equality");
+	assert!(gpu_core::log::loss != gpu_core::log::acc, "distinct flags compare unequal");
+	assert!(gpu_core::log::chat != gpu_core::log::r2, "chat is its own flag");
 }
 
 #[test]

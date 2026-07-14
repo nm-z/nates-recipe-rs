@@ -6,6 +6,7 @@
 //!
 //!   cargo run --release --example styles
 
+use gpu_core::log::{loss, r2};
 use recipe::*;
 
 const CSV: &str = "datasets/house-prices/train.csv";

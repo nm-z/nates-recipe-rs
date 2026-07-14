@@ -1,5 +1,5 @@
 use anyhow::Context;
-use gpu_core::log::{Opt, opt, probe, set_opt};
+use gpu_core::log::{Opt, Write, opt, probe, r2, set_opt};
 use recipe::*;
 
 const BANK: &str = "datasets/uci-bank-semicolon/bank-full.csv";
