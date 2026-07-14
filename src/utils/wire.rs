@@ -1,5 +1,5 @@
 use gpu_core::log::{Write, net};
-use crate::probe::Machine;
+use crate::machine::Machine;
 use anyhow::{Result, bail, ensure};
 use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
@@ -394,7 +394,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 			}
 		}
 	}
-	for e in crate::probe::write_config_atomic(&machines)
+	for e in crate::machine::write_config_atomic(&machines)
 		.err()
 		.into_iter()
 	{
@@ -477,7 +477,7 @@ pub fn self_host() -> String {
 }
 
 pub fn pool_deselected() -> std::collections::HashSet<String> {
-	let Ok(path) = crate::probe::pool_path() else {
+	let Ok(path) = crate::machine::pool_path() else {
 		return std::collections::HashSet::new();
 	};
 	let Ok(s) = std::fs::read_to_string(path) else {
@@ -491,7 +491,7 @@ pub fn pool_deselected() -> std::collections::HashSet<String> {
 }
 
 pub fn pool_write(deselected: &[String]) -> Result<()> {
-	let path = crate::probe::pool_path()?;
+	let path = crate::machine::pool_path()?;
 	for parent in path.parent().into_iter() {
 		std::fs::create_dir_all(parent)?;
 	}
@@ -682,7 +682,7 @@ impl Server {
 	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {
 		let machine = self.machine.clone();
 		for m in machine.iter() {
-			for e in crate::probe::write_config_atomic(std::slice::from_ref(m.as_ref()))
+			for e in crate::machine::write_config_atomic(std::slice::from_ref(m.as_ref()))
 				.err()
 				.into_iter()
 			{

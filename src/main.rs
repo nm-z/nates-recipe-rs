@@ -13,18 +13,22 @@ fn usage(code: i32) -> ! {
 fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	use std::hash::Hasher;
 	use std::os::unix::process::CommandExt;
-	let rlib = std::path::Path::new("/usr/lib/recipe/librecipe.rlib");
-	anyhow::ensure!(
-		rlib.exists(),
-		"{} missing: the recipe package is not installed",
-		rlib.display()
-	);
+	let root = ["target/release", "target/debug", "/usr/lib/recipe"]
+		.into_iter()
+		.map(std::path::Path::new)
+		.find(|d| d.join("librecipe.rlib").exists());
+	let Some(root) = root else {
+		anyhow::bail!(
+			"librecipe.rlib missing: build with cargo build (target/release or target/debug) or install the recipe package"
+		);
+	};
+	let rlib = root.join("librecipe.rlib");
 	let src = std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
 	let mtime = rlib.metadata()?.modified()?;
 	let mut h = std::hash::DefaultHasher::new();
 	h.write(&src);
 	h.write_u128(mtime.duration_since(std::time::UNIX_EPOCH)?.as_nanos());
-	let bin = recipe::probe::data_dir()?.join(format!("{:016x}", h.finish()));
+	let bin = recipe::machine::data_dir()?.join(format!("{:016x}", h.finish()));
 	for _absent in std::fs::metadata(&bin).err().into_iter() {
 		let rocm = std::env::var_os("ROCM_PATH")
 			.filter(|v| !v.is_empty())
@@ -32,7 +36,10 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 			.unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm"));
 		let mut cmd = std::process::Command::new("rustc");
 		cmd.arg(path)
-			.args(["-L", "/usr/lib/recipe", "-L", "/usr/lib/recipe/deps"])
+			.arg("-L")
+			.arg(root)
+			.arg("-L")
+			.arg(root.join("deps"))
 			.arg("-L")
 			.arg(rocm.join("lib"))
 			.args(["--edition", "2024"])
@@ -50,7 +57,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 			.arg(&bin);
 		for name in ["recipe", "ogdl", "gpu_core", "pantry", "recipe_infer"] {
 			cmd.arg("--extern")
-				.arg(format!("{name}=/usr/lib/recipe/lib{name}.rlib"));
+				.arg(format!("{name}={}", root.join(format!("lib{name}.rlib")).display()));
 		}
 		let status = cmd.status().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
 		anyhow::ensure!(status.success(), "rustc failed on {path}: {status}");
@@ -59,7 +66,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-	if let Some(code) = recipe::probe::gpu_child_ask() {
+	if let Some(code) = recipe::machine::gpu_child_ask() {
 		std::process::exit(code);
 	}
 	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
@@ -154,10 +161,10 @@ fn main() -> Result<()> {
 				probe: true,
 				..Opt::default()
 			});
-			let machine = recipe::probe::Machine::probe()?;
+			let machine = recipe::machine::Machine::probe()?;
 			Write::block(
 				probe,
-				&recipe::probe::write_config(std::slice::from_ref(&machine)),
+				&recipe::machine::write_config(std::slice::from_ref(&machine)),
 			);
 			Ok(())
 		}
@@ -171,7 +178,7 @@ fn main() -> Result<()> {
 				recipe::wire::PORT,
 			);
 			let listener = recipe::wire::Server::bind(bind)?;
-			let machine = recipe::probe::Machine::probe()?;
+			let machine = recipe::machine::Machine::probe()?;
 			let info = recipe::wire::NodeInfo::probe();
 			let runners = std::collections::HashMap::new();
 			recipe::wire::Server::new(info, runners)

@@ -18,7 +18,7 @@ pub mod dataset;
 #[path = "utils/ooc.rs"]
 pub mod ooc;
 #[path = "utils/probe.rs"]
-pub mod probe;
+pub mod machine;
 #[path = "utils/tui.rs"]
 pub mod tui;
 #[path = "utils/wire.rs"]
@@ -50,7 +50,7 @@ pub use model::{
 #[doc(hidden)]
 pub use gpu_core::log::Flag;
 #[doc(hidden)]
-pub use gpu_core::log::{acc, chat, device, epoch, loss, lr, net, prompt, r2, save, time};
+pub use gpu_core::log::{acc, chat, device, epoch, loss, lr, net, probe, prompt, r2, save, time};
 pub use gpu_core::log::{Opt, Write, opt, set_opt};
 pub use ogdl::ogdl;
 

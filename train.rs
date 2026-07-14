@@ -7,7 +7,10 @@ fn main() {
 	// recipe.model().load(&GGUF);
 	// recipe.infer().log(chat).run(&model);
 
-	set_opt(Opt { chat: true, ..opt() });
+	set_opt(Opt {
+		chat: true,
+		..opt()
+	});
 
 	ogdl!(a.r"a	b	c");
 

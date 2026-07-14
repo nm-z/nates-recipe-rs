@@ -181,7 +181,7 @@ pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = Window> {
 }
 
 fn open_spill() -> anyhow::Result<File> {
-	let path = crate::probe::data_dir()
+	let path = crate::machine::data_dir()
 		.context("spill dir")?
 		.join(".recipe_spill");
 	let f = recipe_infer::bridge::open_rw(&path).context("open spill file")?;
@@ -598,7 +598,7 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let dir = crate::ok_or_die(crate::probe::data_dir(), "data_dir");
+	let dir = crate::ok_or_die(crate::machine::data_dir(), "data_dir");
 	let disk_avail = disk_free(&dir).saturating_sub(USER_GB);
 	let vram = need.min(vram_avail);
 	let ram = (need - vram).min(ram_avail);
@@ -900,7 +900,7 @@ impl Ooc {
 		let mut disk_cursor: u64 = 0;
 		let mut spill: Option<File> = None;
 		let mut nonvram = 0usize;
-		let disk_budget = disk_free(&crate::probe::data_dir()?).saturating_sub(USER_GB);
+		let disk_budget = disk_free(&crate::machine::data_dir()?).saturating_sub(USER_GB);
 		let net_caps: Vec<usize> = net.as_ref().map_or(Vec::new(), |ns| {
 			ns.iter()
 				.map(|c| (c.info.ram as usize).saturating_sub(USER_GB))
