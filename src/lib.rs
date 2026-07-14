@@ -51,6 +51,8 @@ pub use model::{
 pub use gpu_core::log::Flag;
 #[doc(hidden)]
 pub use gpu_core::log::{acc, chat, epoch, loss, lr, r2, time};
+pub use gpu_core::log::Write;
+pub use ogdl::ogdl;
 
 pub struct Recipe;
 
