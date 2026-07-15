@@ -133,6 +133,14 @@ float_arithmetic = "allow"
 mod_module_files = "allow"
 default_numeric_fallback = "allow"
 as_conversions = "allow"
+arbitrary_source_item_ordering = "allow"
+impl_trait_in_params = "allow"
+integer_division = "allow"
+exhaustive_structs = "allow"
+missing_trait_methods = "allow"
+integer_division_remainder_used = "allow"
+pub_without_shorthand = "allow"
+pub_with_shorthand = "allow"
 
 
 
