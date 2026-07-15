@@ -117,6 +117,22 @@ suspicious = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
+# allows
+blanket_clippy_restriction_lints = "allow"
+min_ident_chars = "allow"
+indexing_slicing = "allow"
+needless_return = "allow"
+semicolon_outside_block = "allow"
+arithmetic_side_effects = "allow"
+question_mark_used = "allow"
+pub_use = "allow"
+single_char_lifetime_names = "allow"
+inline_trait_bounds = "allow"
+unseparated_literal_suffix = "allow"
+float_arithmetic = "allow"
+mod_module_files = "allow"
+default_numeric_fallback = "allow"
+as_conversions = "allow"
 
 
 
