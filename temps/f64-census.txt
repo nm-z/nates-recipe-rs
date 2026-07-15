@@ -3,18 +3,28 @@ produced by: hipcc -S --cuda-device-only --offload-arch=gfx1101 -O3 <kernel>.hip
 date: 2026-07-15   hipcc: HIP version: 7.2.53211-9999
 
 == totals ==
-kernel .hip files:                    57
-kernels (.amdhsa_kernel count):       5599
-total instructions:                   605228   (dual-issue pair counts as one)
-unique instruction mnemonics:         399
-f64 vector ops (v_*f64*):             80583
+kernel .hip files:                        57
+kernels:                                5599
+total instructions:                   605228
+unique instruction mnemonics:            399
+f64 vector ops:                        80583
 ops not f64:                          524645
-memory transfer instructions:         49063   (global/ds/flat/scratch/buffer/s load+store)
-  64-bit wide (b64):                  39150   (ISA memory is typeless; f64 data rides b64)
-  other widths:                       9913
-f64 FLOP mix: v_fma_f64 22307 (2 FLOP each), v_add_f64 23311 + v_mul_f64 6989 (1 FLOP each)
-  FLOP-weighted: 59.6% fused, 40.4% single-FLOP
-  op-count:      42.4% fused, 57.6% single-FLOP
+memory transfer instructions:          49063
+	64-bit wide:                     39150
+	other widths:                     9913
+f64 FLOP
+	FLOP-weighted: 59.6% fused, 40.4% single-FLOP
+	op-count:      42.4% fused, 57.6% single-FLOP
+
+== functional distribution (all 605228 instructions, classified by mnemonic) ==
+calc       46.221%   279741   produces a new value
+compare     9.092%    55026   produces a flag
+transfer   19.379%   117287   moves or converts data
+sync        5.497%    33271   burns time waiting
+branch      4.872%    29484   changes instruction pointer
+barrier     0.295%     1786   synchronizes threads
+hint       14.645%    88633   tells hardware how to schedule/cache/prefetch
+rulings: atomics and LDS read-modify-write count as transfer; cvt, permute, lane-cross count as transfer; cndmask and exec-mask ops count as calc; sendmsg, setreg, cache-inv count as hint; a dual-issue pair is one instruction classified by its first half
 
 == aggregate (all 57 kernel files) ==
   23311  28.928  28.928  v_add_f64
