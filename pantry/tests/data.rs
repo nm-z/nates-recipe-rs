@@ -9,7 +9,7 @@ fn tmp(name: &str, body: &str) -> PathBuf {
 	let p = env::temp_dir().join(format!("nrs_hdr_{}_{name}", process::id()));
 	let mut f = fs::File::create(&p).unwrap();
 	f.write_all(body.as_bytes()).unwrap();
-	p
+	return p;
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn whitespace_matrix_headerless_keeps_rows() {
 	assert_eq!(headers[0], "col_0");
 	assert_eq!(headers[560], "col_560");
 	assert_eq!(rows.len(), 7352);
-	assert!(rows.iter().all(|r| r.len() == 561));
+	assert!(rows.iter().all(|r| return r.len() == 561));
 	assert_eq!(rows[0][0].parse::<f64>().unwrap(), 2.8858451e-001);
 }
 
@@ -107,15 +107,17 @@ fn dir_groups_found_recursively() {
 	let names: Vec<String> = load_groups(d)
 		.iter()
 		.map(|g| match g {
-			DirGroup::Table { name, .. } | DirGroup::Image { name, .. } => name.clone(),
+			DirGroup::Table { name, .. } | DirGroup::Image { name, .. } => {
+				return name.clone();
+			}
 		})
 		.collect();
 	assert!(
-		names.iter().any(|n| n == "X_train"),
+		names.iter().any(|n| return n == "X_train"),
 		"X_train group from train/ subdir: {names:?}"
 	);
 	assert!(
-		names.iter().any(|n| n == "X_test"),
+		names.iter().any(|n| return n == "X_test"),
 		"X_test group from test/ subdir: {names:?}"
 	);
 }
@@ -127,8 +129,8 @@ fn har_zip_extracts_wrapped_tables() {
 		"/../datasets/uci-har-sensor/har.zip"
 	);
 	let groups = load_zip_groups(p).unwrap();
-	let mut x_train_cols = 0usize;
-	let mut y_train_rows = 0usize;
+	let mut x_train_cols = 0_usize;
+	let mut y_train_rows = 0_usize;
 	for g in &groups {
 		if let DirGroup::Table {
 			name,
@@ -152,10 +154,8 @@ fn har_zip_extracts_wrapped_tables() {
 
 #[test]
 fn nested_zip_extracts_inner_tables() {
-	let inner_path =
-		env::temp_dir().join(format!("nrs_zip_inner_{}.zip", process::id()));
-	let outer_path =
-		env::temp_dir().join(format!("nrs_zip_outer_{}.zip", process::id()));
+	let inner_path = env::temp_dir().join(format!("nrs_zip_inner_{}.zip", process::id()));
+	let outer_path = env::temp_dir().join(format!("nrs_zip_outer_{}.zip", process::id()));
 	let opts = zip::write::SimpleFileOptions::default();
 	let mut inner = zip::ZipWriter::new(fs::File::create(&inner_path).unwrap());
 	inner.start_file("wrap/points.csv", opts).unwrap();
@@ -163,8 +163,7 @@ fn nested_zip_extracts_inner_tables() {
 	inner.finish().unwrap();
 	let mut outer = zip::ZipWriter::new(fs::File::create(&outer_path).unwrap());
 	outer.start_file("bundle/inner.zip", opts).unwrap();
-	outer.write_all(&fs::read(&inner_path).unwrap())
-		.unwrap();
+	outer.write_all(&fs::read(&inner_path).unwrap()).unwrap();
 	outer.start_file("__MACOSX/bundle/._inner.zip", opts)
 		.unwrap();
 	outer.write_all(b"applejunk").unwrap();
@@ -189,8 +188,8 @@ fn nested_zip_extracts_inner_tables() {
 	assert_eq!(
 		cells,
 		&[
-			vec!["1".to_string(), "2".to_string()],
-			vec!["3".to_string(), "4".to_string()]
+			vec!["1".to_owned(), "2".to_owned()],
+			vec!["3".to_owned(), "4".to_owned()]
 		]
 	);
 }

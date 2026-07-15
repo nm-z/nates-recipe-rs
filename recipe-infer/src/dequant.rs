@@ -8,7 +8,9 @@ pub fn block_layout(t: u32) -> (usize, usize) {
 		12 => (144, 256),
 		14 => (210, 256),
 		_other => {
-			drop(gpu_core::log::Write::err(format!("gguf: unsupported ggml type {t}")));
+			drop(gpu_core::log::Write::err(format!(
+				"gguf: unsupported ggml type {t}"
+			)));
 			process::abort()
 		}
 	}
@@ -112,9 +114,11 @@ fn deqblock(t: u32, raw: &[u8], out: &mut Vec<f32>) {
 				for l in 0..32 {
 					let is = l / 16;
 					let q1 = ((qlb[l] & 0xF) | ((qhb[l] & 3) << 4)) as i32 - 32;
-					let q2 = ((qlb[l + 32] & 0xF) | (((qhb[l] >> 2) & 3) << 4)) as i32 - 32;
+					let q2 =
+						((qlb[l + 32] & 0xF) | (((qhb[l] >> 2) & 3) << 4)) as i32 - 32;
 					let q3 = ((qlb[l] >> 4) | (((qhb[l] >> 4) & 3) << 4)) as i32 - 32;
-					let q4 = ((qlb[l + 32] >> 4) | (((qhb[l] >> 6) & 3) << 4)) as i32 - 32;
+					let q4 =
+						((qlb[l + 32] >> 4) | (((qhb[l] >> 6) & 3) << 4)) as i32 - 32;
 					blk[nn * 128 + l] = d * scb[is] as f32 * q1 as f32;
 					blk[nn * 128 + l + 32] = d * scb[is + 2] as f32 * q2 as f32;
 					blk[nn * 128 + l + 64] = d * scb[is + 4] as f32 * q3 as f32;
@@ -124,7 +128,9 @@ fn deqblock(t: u32, raw: &[u8], out: &mut Vec<f32>) {
 			out.extend_from_slice(&blk);
 		}
 		_other => {
-			drop(gpu_core::log::Write::err(format!("gguf: dequant unsupported ggml type {t}")));
+			drop(gpu_core::log::Write::err(format!(
+				"gguf: dequant unsupported ggml type {t}"
+			)));
 			process::abort()
 		}
 	}

@@ -9,7 +9,10 @@ use std::fmt;
 use std::time::Instant;
 
 fn say(t: impl fmt::Display) {
-	set_opt(Opt { probe: true, ..opt() });
+	set_opt(Opt {
+		probe: true,
+		..opt()
+	});
 	Write::block(probe, ogdl!(&t));
 }
 
@@ -78,7 +81,9 @@ fn main() -> anyhow::Result<()> {
 		secs * 1e3,
 		flops / secs / 1e12
 	));
-	say(format!("PROOF: hand-written Rust ran {reps}+2 real GEMMs on the AMD card."));
+	say(format!(
+		"PROOF: hand-written Rust ran {reps}+2 real GEMMs on the AMD card."
+	));
 	recipe_infer::shutdown();
 	Ok(())
 }

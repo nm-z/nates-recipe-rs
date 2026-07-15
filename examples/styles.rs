@@ -7,7 +7,7 @@
 //!   cargo run --release --example styles
 
 use gpu_core::log::{loss, r2};
-use recipe::*;
+use recipe::{Data, Infer, Loss, Model, R2, Train, mse, recipe};
 
 const CSV: &str = "datasets/house-prices/train.csv";
 const OGDL: &str = "/tmp/recipe-styles.ogdl";

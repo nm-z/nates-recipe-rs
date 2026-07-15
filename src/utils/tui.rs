@@ -207,8 +207,7 @@ pub fn dashboard(frame: &mut Frame, summary: &str, rows: &[Vec<f64>], ys: &[Metr
 			let Some(c) = buf.cell(Position::new(x, y)) else {
 				continue;
 			};
-			let Some(_vert) =
-				Some(()).filter(|_probe| c.symbol() == symbols::line::VERTICAL)
+			let Some(_vert) = Some(()).filter(|_probe| c.symbol() == symbols::line::VERTICAL)
 			else {
 				continue;
 			};
@@ -353,8 +352,7 @@ fn render_chat(
 	live: &[Tok],
 	generating: bool,
 ) {
-	let outer =
-		Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(frame.area());
+	let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(frame.area());
 	let head = Style::default()
 		.fg(Color::Rgb(120, 200, 255))
 		.add_modifier(Modifier::BOLD);
@@ -370,16 +368,14 @@ fn render_chat(
 	for l in toks_to_lines(live) {
 		lines.push(l);
 	}
-	let _gen = Some(())
-		.filter(|_probe| generating)
-		.map(|_probe| {
-			lines.push(Line::from(Span::styled(
-				"  generating (model load + rounds, this takes minutes)".to_string(),
-				Style::default()
-					.fg(Color::Yellow)
-					.add_modifier(Modifier::ITALIC),
-			)))
-		});
+	let _gen = Some(()).filter(|_probe| generating).map(|_probe| {
+		lines.push(Line::from(Span::styled(
+			"  generating (model load + rounds, this takes minutes)".to_string(),
+			Style::default()
+				.fg(Color::Yellow)
+				.add_modifier(Modifier::ITALIC),
+		)))
+	});
 	let text = Text::from(lines);
 	let total = text.lines.len();
 	let scroll = total.saturating_sub(outer[0].height as usize) as u16;
@@ -443,7 +439,9 @@ pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 			Err(_e) => return false,
 		};
 		let Event::Key(k) = ev else { continue };
-		let KeyEventKind::Press = k.kind else { continue };
+		let KeyEventKind::Press = k.kind else {
+			continue;
+		};
 		match (k.code, k.modifiers) {
 			(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return false,
 			(KeyCode::Esc, _mods) | (KeyCode::Char('q'), _mods) => return false,
@@ -499,8 +497,9 @@ pub fn chat(gguf: &str) {
 						let ta = &textarea;
 						let pr = prompt.as_str();
 						let mut on_round = |toks: &[Tok]| {
-							let _round =
-								term.draw(|f| render_chat(f, ta, sb, Some(pr), toks, true));
+							let _round = term.draw(|f| {
+								render_chat(f, ta, sb, Some(pr), toks, true)
+							});
 						};
 						on_round(&[]);
 						res = recipe_infer::llm::generate(

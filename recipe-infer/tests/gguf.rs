@@ -1,6 +1,6 @@
-use std::path::Path;
 use recipe_infer::dequant::{block_layout, nbytes_for};
 use recipe_infer::gguf::Gguf;
+use std::path::Path;
 
 #[test]
 fn open_gemma_vocab_and_validate_layout() {

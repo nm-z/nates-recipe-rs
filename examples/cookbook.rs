@@ -1,8 +1,8 @@
 #!/usr/bin/env -S cargo run --release --example cookbook --
 use gpu_core::log::{acc, r2};
-use recipe::*;
+use recipe::{Accuracy, Data, Infer, Loss, Model, R2, Train, attn, bce, ce, embed, hip, mse};
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Sets {
 	numeric: &'static str,
 	temporal: &'static str,

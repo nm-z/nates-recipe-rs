@@ -8,11 +8,11 @@ use std::fs;
 const SRC: &str = "engi\n\tGPU0\n\t\tVRAM\t12\n\t\tFLOPs\t380\n\tCPU\n\t\tRAM\t31\n";
 
 fn tmp(tag: &str) -> String {
-	env::temp_dir()
+	return env::temp_dir()
 		.join(format!("nrs_ogdl_style_{tag}.ogdl"))
 		.to_str()
 		.expect("utf8")
-		.to_string()
+		.to_owned();
 }
 
 // ── style 1: static (dot syntax) ──

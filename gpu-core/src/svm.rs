@@ -176,8 +176,8 @@ pub fn gpu_smo_update_gradient_rows(
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
 	unsafe {
-		let src = (buf.ptr_raw() as *const u8).add(idx * mem::size_of::<f64>())
-			as *const c_void;
+		let src =
+			(buf.ptr_raw() as *const u8).add(idx * mem::size_of::<f64>()) as *const c_void;
 		crate::memory::xfer(
 			v.as_mut_ptr() as *mut c_void,
 			src,
@@ -318,9 +318,7 @@ pub fn gpu_smo_train(
 				let grad_diff = -(val_i - val_j);
 				let new_aj_raw = match eta.abs().partial_cmp(&1e-12) {
 					Some(Ordering::Greater) => old_aj + yj * grad_diff / eta,
-					Some(Ordering::Less)
-					| Some(Ordering::Equal)
-					| None => old_aj,
+					Some(Ordering::Less) | Some(Ordering::Equal) | None => old_aj,
 				};
 
 				let bounds = match (yi - yj).abs().partial_cmp(&1e-9) {
@@ -331,9 +329,7 @@ pub fn gpu_smo_train(
 							hi: f64::min(c, s),
 						}
 					}
-					Some(Ordering::Equal)
-					| Some(Ordering::Greater)
-					| None => {
+					Some(Ordering::Equal) | Some(Ordering::Greater) | None => {
 						let s = old_ai - old_aj;
 						Bounds {
 							lo: f64::max(0.0, -s),

@@ -21,8 +21,7 @@ fn rss_bytes() -> usize {
 
 #[test]
 fn builders_are_owned_not_leaked() {
-	let path =
-		env::temp_dir().join(format!("recipe_builder_own_{}.arff", process::id()));
+	let path = env::temp_dir().join(format!("recipe_builder_own_{}.arff", process::id()));
 	fs::write(
 		&path,
 		"@relation t\n@attribute a numeric\n@attribute y numeric\n@data\n1,2\n3,4\n",
@@ -667,7 +666,7 @@ fn gpu_metrics_match_cpu_reference() {
 	let bce_ref = -(0..n)
 		.map(|i| {
 			let pc = p[i].clamp(eps, 1.0 - eps);
-			y[i] * pc.ln() + (1.0 - y[i]) * (1.0 - pc).ln()
+			return (1.0 - y[i]).mul_add((1.0 - pc).ln(), y[i] * pc.ln());
 		})
 		.sum::<f64>()
 		/ n as f64;
@@ -1139,9 +1138,18 @@ fn metric_consts_both_casings() {
 		gpu_core::log::chat,
 	]);
 	drop(i);
-	assert!(gpu_core::log::loss == gpu_core::log::loss, "flag self-equality");
-	assert!(gpu_core::log::loss != gpu_core::log::acc, "distinct flags compare unequal");
-	assert!(gpu_core::log::chat != gpu_core::log::r2, "chat is its own flag");
+	assert!(
+		gpu_core::log::loss == gpu_core::log::loss,
+		"flag self-equality"
+	);
+	assert!(
+		gpu_core::log::loss != gpu_core::log::acc,
+		"distinct flags compare unequal"
+	);
+	assert!(
+		gpu_core::log::chat != gpu_core::log::r2,
+		"chat is its own flag"
+	);
 }
 
 #[test]
@@ -1158,8 +1166,15 @@ fn stacked_conv_checkpoint_roundtrip() {
 		.iter()
 		.filter(|s| matches!(s, Saved::Conv { .. }))
 		.count();
-	assert_eq!(convs, 2, "two conv layers must save as two blocks, got {convs}");
+	assert_eq!(
+		convs, 2,
+		"two conv layers must save as two blocks, got {convs}"
+	);
 	let warm =
 		plan_layer_params(&specs, 784, 0, 0, &saved, PlanMode::Warm).expect("warm rehydrate");
-	assert_eq!(warm.host().len(), fresh.host().len(), "rehydrated image size");
+	assert_eq!(
+		warm.host().len(),
+		fresh.host().len(),
+		"rehydrated image size"
+	);
 }

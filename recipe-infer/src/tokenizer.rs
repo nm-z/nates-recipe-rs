@@ -1,6 +1,6 @@
-use std::path::Path;
 use crate::gguf::Gguf;
 use anyhow::{Result, anyhow};
+use std::path::Path;
 pub use tokenizers::Tokenizer;
 
 pub fn from_file(path: &Path) -> Result<Tokenizer> {

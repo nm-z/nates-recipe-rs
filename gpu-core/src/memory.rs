@@ -1,5 +1,5 @@
-use crate::log::{Write, gpu};
 use crate::hip::*;
+use crate::log::{Write, gpu};
 use std::cell::Cell;
 use std::cmp;
 use std::collections::BTreeMap;
@@ -10,8 +10,8 @@ use std::mem;
 use std::num;
 use std::process;
 use std::ptr;
-use std::sync::{Mutex, MutexGuard, Once};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -500,7 +500,9 @@ pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
 
 pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Option<GpuBuffer> {
 	if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-		drop(Write::err("claim_device_arena: a device arena is already active"));
+		drop(Write::err(
+			"claim_device_arena: a device arena is already active",
+		));
 		process::abort();
 	}
 	let _t = tag_scope("unclaimed");
@@ -523,7 +525,9 @@ pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Op
 
 pub fn release_device_arena(slab: GpuBuffer) {
 	if ARENA_BASE.load(Ordering::Relaxed) != slab.ptr_addr() {
-		drop(Write::err("release_device_arena: slab is not the active claim"));
+		drop(Write::err(
+			"release_device_arena: slab is not the active claim",
+		));
 		process::abort();
 	}
 	crate::hip::device_synchronize().unwrap_or_else(|e| {
@@ -562,7 +566,9 @@ pub fn park_run_backing(buf: GpuBuffer) {
 		Err(p) => p.into_inner(),
 	};
 	if !g.is_none() {
-		drop(Write::err("park_run_backing: a parked run backing already exists"));
+		drop(Write::err(
+			"park_run_backing: a parked run backing already exists",
+		));
 		process::abort();
 	}
 	*g = Some(buf);
@@ -573,8 +579,7 @@ pub fn park_run_backing(buf: GpuBuffer) {
 }
 
 pub fn live_parked_gen() -> Option<usize> {
-	num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed))
-		.map(num::NonZeroUsize::get)
+	num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed)).map(num::NonZeroUsize::get)
 }
 
 enum ParkKind {
@@ -1047,10 +1052,12 @@ pub fn pool_trim() {
 pub const USER_GB: usize = 1 << 30;
 
 pub fn vram_free_base() -> usize {
-	let hip_free = crate::hip::mem_info().unwrap_or_else(|e| {
-		drop(Write::err(&format!("hipMemGetInfo: {e}")));
-		process::abort()
-	}).free;
+	let hip_free = crate::hip::mem_info()
+		.unwrap_or_else(|e| {
+			drop(Write::err(&format!("hipMemGetInfo: {e}")));
+			process::abort()
+		})
+		.free;
 	let sys_free = crate::hip::sysfs_vram_free().unwrap_or(hip_free);
 	let slack = crate::hip::pool_slack(0).unwrap_or_else(|e| {
 		drop(Write::err(&format!("pool_slack: {e}")));
@@ -1086,16 +1093,22 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	let mut want = vram_free_base().saturating_sub(USER_GB) & !((1 << 21) - 1);
 	while want > (1 << 30) {
 		if probe_survives(want) {
-			Write::line(gpu, &format!(
-				"claim probe: {:.2} GB (probe-verified)",
-				want as f64 / (1u64 << 30) as f64
-			));
+			Write::line(
+				gpu,
+				&format!(
+					"claim probe: {:.2} GB (probe-verified)",
+					want as f64 / (1u64 << 30) as f64
+				),
+			);
 			return Some(want);
 		}
-		Write::line(gpu, &format!(
-			"claim probe: {:.2} GB unmappable, backing off",
-			want as f64 / (1u64 << 30) as f64
-		));
+		Write::line(
+			gpu,
+			&format!(
+				"claim probe: {:.2} GB unmappable, backing off",
+				want as f64 / (1u64 << 30) as f64
+			),
+		);
 		want -= want / 16;
 	}
 	None
@@ -1230,7 +1243,9 @@ impl GpuBuffer {
 			}
 		});
 		if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-			drop(Write::err("claim_map_bytes: a device arena is already active"));
+			drop(Write::err(
+				"claim_map_bytes: a device arena is already active",
+			));
 			process::abort();
 		}
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);

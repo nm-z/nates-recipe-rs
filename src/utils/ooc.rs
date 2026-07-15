@@ -1,7 +1,7 @@
-use gpu_core::log::{Write, gpu};
 use crate::train::StepScalars;
 use anyhow::Context;
 use gpu_core::kernels;
+use gpu_core::log::{Write, gpu};
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{Activation, LayerKind, LayerParams, Loss, Scratch};
 use std::cell::Cell;
@@ -168,10 +168,7 @@ fn prelu_gate(act: &Activation) -> Option<()> {
 }
 
 fn interrupted() -> Interrupt {
-	match crate::train::INTERRUPTED
-		.load(Ordering::SeqCst)
-		.cmp(&0)
-	{
+	match crate::train::INTERRUPTED.load(Ordering::SeqCst).cmp(&0) {
 		cmp::Ordering::Equal => Interrupt::No,
 		cmp::Ordering::Less | cmp::Ordering::Greater => Interrupt::Yes,
 	}
@@ -919,14 +916,9 @@ impl Ooc {
 		});
 		let mut net_used = vec![0usize; net_caps.len()];
 		let id_base: u64 = {
-			let host_s =
-				fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+			let host_s = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
 			let mut h = 0xcbf2_9ce4_8422_2325u64;
-			for b in host_s
-				.trim()
-				.bytes()
-				.chain(process::id().to_le_bytes())
-			{
+			for b in host_s.trim().bytes().chain(process::id().to_le_bytes()) {
 				h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
 			}
 			h << 32
@@ -1203,14 +1195,17 @@ impl Ooc {
 		] {
 			tally(b);
 		}
-		Write::line(gpu, &format!(
-			"waterfall  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
-			gb(v),
-			gb(r),
-			gb(d),
-			gb(nt),
-			self.chunk
-		));
+		Write::line(
+			gpu,
+			&format!(
+				"waterfall  scratch homes: VRAM {:.2} GB -> RAM {:.2} GB -> DISK {:.2} GB -> NET {:.2} GB, {}-sample windows",
+				gb(v),
+				gb(r),
+				gb(d),
+				gb(nt),
+				self.chunk
+			),
+		);
 		let mut roof = format!(
 			"waterfall  measured rooflines: gemm {} GF/s  vram {} GB/s",
 			recipe_infer::GEMM_GFLOPS,
@@ -1444,8 +1439,9 @@ impl Ooc {
 								s0 * p.out_dim * 8,
 								cnt * p.out_dim * 8,
 							),
-							cmp::Ordering::Less
-							| cmp::Ordering::Greater => self.acts[l].write_view(s0, cnt, &self.wins[1]),
+							cmp::Ordering::Less | cmp::Ordering::Greater => {
+								self.acts[l].write_view(s0, cnt, &self.wins[1])
+							}
 						};
 						match p.kind {
 							LayerKind::Conv => {
@@ -2141,9 +2137,7 @@ impl Ooc {
 			&self.host,
 		)?;
 		let act_l = match l.cmp(&last) {
-			cmp::Ordering::Equal => {
-				view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
-			}
+			cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
 			cmp::Ordering::Less | cmp::Ordering::Greater => self.acts[l].read(
 				s0,
 				cnt,

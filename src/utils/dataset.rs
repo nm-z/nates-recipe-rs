@@ -1,5 +1,5 @@
-use gpu_core::log::{Write, data};
 use crate::Mat;
+use gpu_core::log::{Write, data};
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
 use std::cell::RefCell;
@@ -182,9 +182,7 @@ enum FileFormat {
 }
 
 fn file_format(path: &str) -> FileFormat {
-	let ext = Path::new(path)
-		.extension()
-		.and_then(|e| e.to_str());
+	let ext = Path::new(path).extension().and_then(|e| e.to_str());
 	let arff = ext.filter(|e| *e == "arff").and(Some(FileFormat::Arff));
 	let safet = ext
 		.filter(|e| *e == "safetensors")
@@ -193,8 +191,7 @@ fn file_format(path: &str) -> FileFormat {
 }
 
 pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
-	let bytes =
-		fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
+	let bytes = fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
 	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
 		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
 	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
@@ -391,8 +388,7 @@ impl DataInner {
 	fn cat_cardinality_counts(&self, attrs: &[Attr]) -> Vec<CardCount> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
-		let mut card: BTreeMap<usize, usize> =
-			BTreeMap::new();
+		let mut card: BTreeMap<usize, usize> = BTreeMap::new();
 		for a in attrs
 			.iter()
 			.filter(|a| !is_target(a.name.as_str()) && !is_excluded(a.name.as_str()))
@@ -453,7 +449,10 @@ impl DataInner {
 		}
 		for cc in &cards {
 			let range: Vec<String> = (0..cc.card).map(|i| i.to_string()).collect();
-			Write::line(data, &format!("        {} × [{}]", cc.count, range.join(", ")));
+			Write::line(
+				data,
+				&format!("        {} × [{}]", cc.count, range.join(", ")),
+			);
 		}
 		Write::line(data, &format!("    {} features -> model", train.x.ncols()));
 		for test in test.into_iter() {
@@ -466,25 +465,31 @@ impl DataInner {
 						.as_ref()
 						.map_or(test.x.nrows(), |r| r.len());
 					Write::line(data, &format!("test  {}", short(tp)));
-					Write::line(data, &format!(
-						"    {} rows  {} cols  {}",
-						test_raw_rows,
-						test_raw_cols,
-						disk_size(tp),
-					));
+					Write::line(
+						data,
+						&format!(
+							"    {} rows  {} cols  {}",
+							test_raw_rows,
+							test_raw_cols,
+							disk_size(tp),
+						),
+					);
 					print_types("        ");
-					Write::line(data, &format!(
-						"    {} features -> model",
-						test.x.ncols()
-					));
+					Write::line(
+						data,
+						&format!("    {} features -> model", test.x.ncols()),
+					);
 				}
 				None => {
 					for _frac in self.split_frac.iter() {
-						Write::line(data, &format!(
-							"split  {} train / {} test",
-							train.x.nrows(),
-							test.x.nrows(),
-						));
+						Write::line(
+							data,
+							&format!(
+								"split  {} train / {} test",
+								train.x.nrows(),
+								test.x.nrows(),
+							),
+						);
 					}
 				}
 			}
@@ -612,9 +617,7 @@ impl DataInner {
 						.last()
 						.ok_or_else(|| anyhow::anyhow!("set has columns"))?
 						.clone()]),
-					Ordering::Less | Ordering::Greater => {
-						Ok(Vec::new())
-					}
+					Ordering::Less | Ordering::Greater => Ok(Vec::new()),
 				},
 				None => Ok(Vec::new()),
 			},

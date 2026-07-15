@@ -6,20 +6,23 @@
 //   cargo run --release --example det_probe
 
 use anyhow::Context;
-use gpu_core::log::{Opt, Write, opt, probe, set_opt};
-use ogdl::ogdl;
 use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
 	gpu_scale_f64_inplace, gpu_widen_bf16,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
+use ogdl::ogdl;
 use std::fmt;
 use std::ptr;
 use std::time::Instant;
 
 fn say(t: impl fmt::Display) {
-	set_opt(Opt { probe: true, ..opt() });
+	set_opt(Opt {
+		probe: true,
+		..opt()
+	});
 	Write::block(probe, ogdl!(&t));
 }
 

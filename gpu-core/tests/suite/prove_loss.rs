@@ -265,9 +265,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"smooth_l1",
 		move |a, b| run2_param(
-			|p, t, o, n| unsafe {
-				launch_lossx_smooth_l1(p, t, o, n, beta, ptr::null_mut())
-			},
+			|p, t, o, n| unsafe { launch_lossx_smooth_l1(p, t, o, n, beta, ptr::null_mut()) },
 			a,
 			b
 		),
@@ -290,9 +288,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"huber",
 		move |a, b| run2_param(
-			|p, t, o, n| unsafe {
-				launch_lossx_huber(p, t, o, n, delta, ptr::null_mut())
-			},
+			|p, t, o, n| unsafe { launch_lossx_huber(p, t, o, n, delta, ptr::null_mut()) },
 			a,
 			b
 		),
@@ -315,9 +311,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"tweedie",
 		move |a, b| run2_param(
-			|p, t, o, n| unsafe {
-				launch_lossx_tweedie(p, t, o, n, power, ptr::null_mut())
-			},
+			|p, t, o, n| unsafe { launch_lossx_tweedie(p, t, o, n, power, ptr::null_mut()) },
 			a,
 			b
 		),
@@ -333,9 +327,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	op!(
 		"quantile",
 		move |a, b| run2_param(
-			|p, t, o, n| unsafe {
-				launch_lossx_quantile(p, t, o, n, q, ptr::null_mut())
-			},
+			|p, t, o, n| unsafe { launch_lossx_quantile(p, t, o, n, q, ptr::null_mut()) },
 			a,
 			b
 		),

@@ -19,8 +19,8 @@ use crate::common;
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::c_void;
 use std::f64::consts;
+use std::ffi::c_void;
 use std::fs;
 use std::mem;
 use std::ptr;
@@ -90,14 +90,7 @@ fn run_linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 fn run_logspace(start: f64, stop: f64, base: f64, n: usize) -> Vec<f64> {
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
-		launch_creationx_logspace(
-			o.ptr_raw(),
-			start,
-			stop,
-			base,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_creationx_logspace(o.ptr_raw(), start, stop, base, n as i32, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
@@ -119,13 +112,7 @@ fn run_geomspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 fn run_tri(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 	let o = GpuBuffer::alloc(rows * cols).unwrap();
 	unsafe {
-		launch_creationx_tri(
-			o.ptr_raw(),
-			rows as i32,
-			cols as i32,
-			k,
-			ptr::null_mut(),
-		);
+		launch_creationx_tri(o.ptr_raw(), rows as i32, cols as i32, k, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];
@@ -136,13 +123,7 @@ fn run_tri(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 fn run_eye_rect(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 	let o = GpuBuffer::alloc(rows * cols).unwrap();
 	unsafe {
-		launch_creationx_eye_rect(
-			o.ptr_raw(),
-			rows as i32,
-			cols as i32,
-			k,
-			ptr::null_mut(),
-		);
+		launch_creationx_eye_rect(o.ptr_raw(), rows as i32, cols as i32, k, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];

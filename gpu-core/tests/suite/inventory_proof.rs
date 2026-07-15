@@ -717,8 +717,7 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		};
 		let ga = {
 			let __zb = GpuBuffer::alloc_bytes(gm * gn * mem::size_of::<f64>()).unwrap();
-			__zb.memset_zero(gm * gn * mem::size_of::<f64>())
-				.unwrap();
+			__zb.memset_zero(gm * gn * mem::size_of::<f64>()).unwrap();
 			__zb
 		};
 		gpu_dger_into(&gx, &gy, gm, gn, &ga).unwrap();

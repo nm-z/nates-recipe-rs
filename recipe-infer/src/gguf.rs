@@ -99,8 +99,8 @@ impl Reader {
 
 impl Gguf {
 	pub fn open(path: &Path) -> Result<Gguf> {
-		let file = File::open(path)
-			.with_context(|| format!("gguf: open {}", path.display()))?;
+		let file =
+			File::open(path).with_context(|| format!("gguf: open {}", path.display()))?;
 		let clone = file.try_clone().context("gguf: clone file handle")?;
 		let mut rd = Reader {
 			r: BufReader::new(clone),
@@ -112,7 +112,9 @@ impl Gguf {
 		}
 		let version = rd.u32v()?;
 		if version < 2 {
-			bail!("gguf: version {version} uses u32 counts and lengths; only v2+ (u64) is supported");
+			bail!(
+				"gguf: version {version} uses u32 counts and lengths; only v2+ (u64) is supported"
+			);
 		}
 		let n_tensors = rd.u64v()?;
 		let n_kv = rd.u64v()?;
@@ -231,4 +233,3 @@ impl Gguf {
 		}
 	}
 }
-

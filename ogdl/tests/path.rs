@@ -14,14 +14,14 @@ fn navigate_not_duplicate() {
 
 #[test]
 fn values_ride_the_parent_line() {
-	ogdl!(p3.w.r"0.1");
-	ogdl!(p3.w.r"0.2");
+	ogdl!(p3.w."0.1");
+	ogdl!(p3.w."0.2");
 	assert_eq!(format!("{}", ogdl!(p3)), "p3\n\tw\t0.1\t0.2");
 }
 
 #[test]
 fn selector_zero_based() {
-	ogdl!(p4.r"
+	ogdl!(p4."
 b
 	x
 b
@@ -36,21 +36,18 @@ b
 
 #[test]
 fn index_zero_based() {
-	ogdl!(p5.r"
+	ogdl!(p5."
 b
 	x
 	y
 ");
 	ogdl!(p5.b[1].q);
-	assert_eq!(
-		format!("{}", ogdl!(p5)),
-		"p5\n\tb\n\t\tx\n\t\ty\n\t\t\tq"
-	);
+	assert_eq!(format!("{}", ogdl!(p5)), "p5\n\tb\n\t\tx\n\t\ty\n\t\t\tq");
 }
 
 #[test]
 fn selector_then_index() {
-	ogdl!(p6.r"
+	ogdl!(p6."
 b
 	x
 	y
@@ -66,7 +63,7 @@ b
 
 #[test]
 fn star_selects_children() {
-	ogdl!(p7.r"
+	ogdl!(p7."
 b
 	x
 b
@@ -103,19 +100,22 @@ fn missing_index_selects_nothing() {
 
 #[test]
 fn unicode_names() {
-	ogdl!(p11.r"日本語".x);
-	assert_eq!(format!("{}", ogdl!(p11)), "p11\n\t日本語\n\t\tx");
+	ogdl!(p11."\u{65e5}\u{672c}\u{8a9e}".x);
+	assert_eq!(
+		format!("{}", ogdl!(p11)),
+		"p11\n\t\u{65e5}\u{672c}\u{8a9e}\n\t\tx"
+	);
 }
 
 #[test]
 fn literal_head_path() {
-	assert_eq!(format!("{}", ogdl!(r"p12 space".k)), "p12 space\n\tk");
+	assert_eq!(format!("{}", ogdl!("p12 space".k)), "p12 space\n\tk");
 }
 
 #[test]
 fn variable_value_segment() {
 	let eth = 0.125;
-	ogdl!(p14.r"1GbE".&eth);
+	ogdl!(p14."1GbE".&eth);
 	assert_eq!(format!("{}", ogdl!(p14)), "p14\n\t1GbE\t0.125");
 }
 
@@ -133,25 +133,25 @@ fn variable_name_segment() {
 
 #[test]
 fn literal_suffix_selects() {
-	ogdl!(p16.r"
+	ogdl!(p16."
 b
 	x
 b
 	y
 ");
-	ogdl!(p16.r"b"{1}.z);
-	ogdl!(p16.r"b"*.k);
+	ogdl!(p16."b"{1}.z);
+	ogdl!(p16."b"*.k);
 	assert_eq!(
 		format!("{}", ogdl!(p16)),
 		"p16\n\tb\n\t\tx\n\t\t\tk\n\tb\n\t\ty\n\t\t\tk\n\t\tz\n\t\t\tk"
 	);
-	ogdl!(p16.r"b"{});
+	ogdl!(p16."b"{});
 	assert_eq!(format!("{}", ogdl!(p16)), "p16");
 }
 
 #[test]
 fn star_block_prints_children_only() {
-	ogdl!(p18.r"init	loop	exit");
+	ogdl!(p18."init	loop	exit");
 	assert_eq!(format!("{}", ogdl!(p18*)), "init\nloop\nexit");
 	assert_eq!(format!("{}", ogdl!(p18)), "p18\n\tinit\n\tloop\n\texit");
 }

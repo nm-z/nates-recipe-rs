@@ -214,12 +214,8 @@ fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 				launch_paddingx_constant1d(xp, op, l, lpad, n, cval, ptr::null_mut())
 			}
 			"reflect" => launch_paddingx_reflect1d(xp, op, l, lpad, n, ptr::null_mut()),
-			"replicate" => {
-				launch_paddingx_replicate1d(xp, op, l, lpad, n, ptr::null_mut())
-			}
-			"circular" => {
-				launch_paddingx_circular1d(xp, op, l, lpad, n, ptr::null_mut())
-			}
+			"replicate" => launch_paddingx_replicate1d(xp, op, l, lpad, n, ptr::null_mut()),
+			"circular" => launch_paddingx_circular1d(xp, op, l, lpad, n, ptr::null_mut()),
 			_ => unreachable!(),
 		}
 	}
@@ -398,10 +394,7 @@ fn canon(name: &str) -> &'static str {
 fn load_padding() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in fs::read_dir(&dir)
-		.expect("no kernel_inventory")
-		.flatten()
-	{
+	for e in fs::read_dir(&dir).expect("no kernel_inventory").flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
 			let Ok(txt) = fs::read_to_string(&p) else {

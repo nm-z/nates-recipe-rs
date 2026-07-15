@@ -297,7 +297,7 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 			})
 		})() else {
 			drop(Write::err(
-				"vramspy: agent/pool classification symbols unavailable — all pools classify OTHER"
+				"vramspy: agent/pool classification symbols unavailable — all pools classify OTHER",
 			));
 			return pools;
 		};

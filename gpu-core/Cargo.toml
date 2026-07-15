@@ -2,6 +2,12 @@
 name = "gpu-core"
 version = "0.1.0"
 edition = "2024"
+description = "GPU-native f64 HIP/CUDA compute kernels with a tagged memory ledger"
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["gpu", "hip", "rocm", "kernels", "cuda"]
+categories = ["science", "hardware-support"]
 
 [dependencies]
 half = "2"

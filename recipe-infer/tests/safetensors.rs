@@ -1,10 +1,10 @@
+use recipe_infer::safetensors::{
+	Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors,
+};
 use std::env;
 use std::fs;
 use std::process;
 use std::str;
-use recipe_infer::safetensors::{
-	Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors,
-};
 
 #[test]
 fn parse_safetensors_decodes_header_and_blob() {
@@ -60,8 +60,7 @@ fn read_safetensors_header_and_decode_min() {
 	for v in [10.0f64, 20.0, 30.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	let path =
-		env::temp_dir().join(format!("recipe_st_hdr_{}.safetensors", process::id()));
+	let path = env::temp_dir().join(format!("recipe_st_hdr_{}.safetensors", process::id()));
 	fs::write(&path, &bytes).expect("write temp safetensors");
 
 	let mut f = fs::File::open(&path).expect("open temp safetensors");

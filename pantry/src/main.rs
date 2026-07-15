@@ -2,8 +2,8 @@
 //! (CSV / ARFF / dir / zip) and it prints each column → datatype.
 //! Links only `pantry` + `recipe-infer` + the embedded detector weights —
 //! no training framework.
-use recipe_infer::log::{Opt, Write, data, set_opt};
 use anyhow::Result;
+use recipe_infer::log::{Opt, Write, data, set_opt};
 use std::env;
 use std::process;
 
@@ -15,10 +15,15 @@ fn kind_name(k: usize) -> &'static str {
 }
 
 fn main() -> Result<()> {
-	set_opt(Opt { data: true, ..Opt::default() });
+	set_opt(Opt {
+		data: true,
+		..Opt::default()
+	});
 	let paths: Vec<String> = env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		drop(Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)"));
+		drop(Write::err(
+			"usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)",
+		));
 		process::exit(1);
 	};
 
@@ -26,7 +31,7 @@ fn main() -> Result<()> {
 
 	let multi = paths.get(1);
 	for path in &paths {
-		for _extra in multi.into_iter() {
+		if multi.is_some() {
 			Write::line(data, "");
 			Write::line(data, format!("# {path}"));
 		}

@@ -1,5 +1,5 @@
-use crate::log::{Write, device, gpu};
 use crate::hip::{HipError, check};
+use crate::log::{Write, device, gpu};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
 use std::{cmp, mem, process, ptr};
@@ -9,7 +9,9 @@ pub(crate) fn check_launch() {
 	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
 	let err = unsafe { crate::hip::hipGetLastError() };
 	if !(err == 0) {
-		drop(Write::err(&format!("HIP kernel launch failed with error code {err}")));
+		drop(Write::err(&format!(
+			"HIP kernel launch failed with error code {err}"
+		)));
 		process::abort();
 	}
 }
@@ -1570,12 +1572,16 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 				let mut handle: *mut c_void = ptr::null_mut();
 				let status = unsafe { hipblasCreate(&mut handle) };
 				if status != 0 {
-					drop(Write::err(&format!("hipblasCreate failed with status {status}")));
+					drop(Write::err(&format!(
+						"hipblasCreate failed with status {status}"
+					)));
 					process::abort();
 				}
 				let status = unsafe { hipblasSetStream(handle, ptr::null_mut()) };
 				if status != 0 {
-					drop(Write::err(&format!("hipblasSetStream failed with status {status}")));
+					drop(Write::err(&format!(
+						"hipblasSetStream failed with status {status}"
+					)));
 					process::abort();
 				}
 				h.store(handle, Ordering::Relaxed);
@@ -1588,7 +1594,9 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 pub fn gpu_blas_workspace(buf: &crate::memory::GpuBuffer) {
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
 	if status != 0 {
-		drop(Write::err(&format!("hipblasSetWorkspace failed with status {status}")));
+		drop(Write::err(&format!(
+			"hipblasSetWorkspace failed with status {status}"
+		)));
 		process::abort();
 	}
 }
@@ -1602,7 +1610,9 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 				let mut handle: *mut c_void = ptr::null_mut();
 				let status = unsafe { hipsolverCreate(&mut handle) };
 				if status != 0 {
-					drop(Write::err(&format!("hipsolverCreate failed with status {status}")));
+					drop(Write::err(&format!(
+						"hipsolverCreate failed with status {status}"
+					)));
 					process::abort();
 				}
 				h.store(handle, Ordering::Relaxed);
@@ -2165,12 +2175,7 @@ pub fn gpu_vae_backward_latent(
 
 pub fn gpu_log_det_cholesky(l: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_log_det_cholesky(
-			l.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_log_det_cholesky(l.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -2229,12 +2234,7 @@ pub fn gpu_sigmoid_backward_into(
 
 pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_tanh_act(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_tanh_act(x.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -2299,12 +2299,7 @@ pub fn gpu_leaky_relu_backward_into(
 
 pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_silu(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_silu(x.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -2597,12 +2592,8 @@ pub fn gpu_ss_res_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(
-			out.ptr,
-			0,
-			mem::size_of::<f64>(),
-			ptr::null_mut(),
-		);
+		let _memset =
+			crate::memory::memset_dev(out.ptr, 0, mem::size_of::<f64>(), ptr::null_mut());
 	}
 	unsafe {
 		launch_ss_res(
@@ -2624,12 +2615,8 @@ pub fn gpu_mse_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(
-			out.ptr,
-			0,
-			mem::size_of::<f64>(),
-			ptr::null_mut(),
-		);
+		let _memset =
+			crate::memory::memset_dev(out.ptr, 0, mem::size_of::<f64>(), ptr::null_mut());
 	}
 	unsafe {
 		launch_mse(
@@ -2651,12 +2638,8 @@ pub fn gpu_accuracy_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(
-			out.ptr,
-			0,
-			mem::size_of::<f64>(),
-			ptr::null_mut(),
-		);
+		let _memset =
+			crate::memory::memset_dev(out.ptr, 0, mem::size_of::<f64>(), ptr::null_mut());
 	}
 	unsafe {
 		launch_accuracy_metric(
@@ -2700,12 +2683,8 @@ pub fn gpu_argmax_accuracy_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	unsafe {
-		let _memset = crate::memory::memset_dev(
-			out.ptr,
-			0,
-			mem::size_of::<f64>(),
-			ptr::null_mut(),
-		);
+		let _memset =
+			crate::memory::memset_dev(out.ptr, 0, mem::size_of::<f64>(), ptr::null_mut());
 	}
 	unsafe {
 		launch_argmax_acc(
@@ -2749,12 +2728,7 @@ pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 
 pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_copy_f64(
-			src.ptr as *const c_void,
-			out.ptr,
-			n as i64,
-			ptr::null_mut(),
-		);
+		launch_copy_f64(src.ptr as *const c_void, out.ptr, n as i64, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -2768,12 +2742,7 @@ pub fn gpu_reduce_sum_cols_into(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(
-			ptr::null(),
-			rows as i32,
-			cols as i32,
-			ptr::null_mut(),
-		)
+		reduce_sum_cols_workspace_bytes(ptr::null(), rows as i32, cols as i32, ptr::null_mut())
 	};
 	unsafe {
 		launch_reduce_sum_cols(
@@ -2792,12 +2761,7 @@ pub fn gpu_reduce_sum_cols_into(
 
 pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 	unsafe {
-		reduce_sum_cols_workspace_bytes(
-			ptr::null(),
-			rows as i32,
-			cols as i32,
-			ptr::null_mut(),
-		)
+		reduce_sum_cols_workspace_bytes(ptr::null(), rows as i32, cols as i32, ptr::null_mut())
 	}
 }
 
@@ -3569,62 +3533,50 @@ pub fn gpu_tree_build_into(
 	};
 	let hist_elems = max_level * p * n_bins;
 
-	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb node_assign: {e}")));
-			e
-		})?;
-	node_assign
-		.memset_zero(n_tr * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb node_assign zero: {e}")));
-			e
-		})?;
-	let sf = GpuBuffer::alloc_bytes(max_nodes * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb split_feat: {e}")));
-			e
-		})?;
-	let sb = GpuBuffer::alloc_bytes(max_nodes * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb split_bin: {e}")));
-			e
-		})?;
-	sf.fill_bytes(0xFF, max_nodes * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb split_feat fill: {e}")));
-			e
-		})?;
-	sb.fill_bytes(0xFF, max_nodes * isz)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb split_bin fill: {e}")));
-			e
-		})?;
-	let gh = GpuBuffer::alloc(hist_elems)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb grad_hist: {e}")));
-			e
-		})?;
-	let hh = GpuBuffer::alloc(hist_elems)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb hess_hist: {e}")));
-			e
-		})?;
-	let sum_g = GpuBuffer::alloc(max_nodes)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb node_sum_g: {e}")));
-			e
-		})?;
-	let sum_h = GpuBuffer::alloc(max_nodes)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb node_sum_h: {e}")));
-			e
-		})?;
-	let lv = GpuBuffer::alloc(max_nodes)
-		.map_err(|e| {
-			drop(Write::err(&format!("tb leaf_val: {e}")));
-			e
-		})?;
+	let node_assign = GpuBuffer::alloc_bytes(n_tr * isz).map_err(|e| {
+		drop(Write::err(&format!("tb node_assign: {e}")));
+		e
+	})?;
+	node_assign.memset_zero(n_tr * isz).map_err(|e| {
+		drop(Write::err(&format!("tb node_assign zero: {e}")));
+		e
+	})?;
+	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).map_err(|e| {
+		drop(Write::err(&format!("tb split_feat: {e}")));
+		e
+	})?;
+	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).map_err(|e| {
+		drop(Write::err(&format!("tb split_bin: {e}")));
+		e
+	})?;
+	sf.fill_bytes(0xFF, max_nodes * isz).map_err(|e| {
+		drop(Write::err(&format!("tb split_feat fill: {e}")));
+		e
+	})?;
+	sb.fill_bytes(0xFF, max_nodes * isz).map_err(|e| {
+		drop(Write::err(&format!("tb split_bin fill: {e}")));
+		e
+	})?;
+	let gh = GpuBuffer::alloc(hist_elems).map_err(|e| {
+		drop(Write::err(&format!("tb grad_hist: {e}")));
+		e
+	})?;
+	let hh = GpuBuffer::alloc(hist_elems).map_err(|e| {
+		drop(Write::err(&format!("tb hess_hist: {e}")));
+		e
+	})?;
+	let sum_g = GpuBuffer::alloc(max_nodes).map_err(|e| {
+		drop(Write::err(&format!("tb node_sum_g: {e}")));
+		e
+	})?;
+	let sum_h = GpuBuffer::alloc(max_nodes).map_err(|e| {
+		drop(Write::err(&format!("tb node_sum_h: {e}")));
+		e
+	})?;
+	let lv = GpuBuffer::alloc(max_nodes).map_err(|e| {
+		drop(Write::err(&format!("tb leaf_val: {e}")));
+		e
+	})?;
 
 	for d in 0..max_depth {
 		let level_base = (1usize << d) - 1;
@@ -4676,12 +4628,7 @@ pub fn gpu_im2col_2d(
 
 pub fn gpu_exp(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_exp(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_exp(x.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -4689,12 +4636,7 @@ pub fn gpu_exp(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 
 pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_sqrt(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_sqrt(x.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -4702,12 +4644,7 @@ pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 
 pub fn gpu_neg(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_neg(
-			x.ptr as *const c_void,
-			out.ptr,
-			n as i32,
-			ptr::null_mut(),
-		);
+		launch_neg(x.ptr as *const c_void, out.ptr, n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -5703,12 +5640,7 @@ pub fn gpu_tril_mask(fill_val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<
 
 pub fn gpu_fill(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_fill(
-			out.ptr,
-			n as i32,
-			val.ptr as *const f64,
-			ptr::null_mut(),
-		);
+		launch_fill(out.ptr, n as i32, val.ptr as *const f64, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -5806,11 +5738,7 @@ pub fn gpu_prefix_sum_inclusive(
 	tmp: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let ws = unsafe {
-		prefix_sum_inclusive_workspace_bytes(
-			x.ptr as *const c_void,
-			n as i32,
-			ptr::null_mut(),
-		)
+		prefix_sum_inclusive_workspace_bytes(x.ptr as *const c_void, n as i32, ptr::null_mut())
 	};
 	unsafe {
 		launch_prefix_sum_inclusive(
@@ -5833,11 +5761,7 @@ pub fn gpu_prefix_sum_exclusive(
 	tmp: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let ws = unsafe {
-		prefix_sum_exclusive_workspace_bytes(
-			x.ptr as *const c_void,
-			n as i32,
-			ptr::null_mut(),
-		)
+		prefix_sum_exclusive_workspace_bytes(x.ptr as *const c_void, n as i32, ptr::null_mut())
 	};
 	unsafe {
 		launch_prefix_sum_exclusive(

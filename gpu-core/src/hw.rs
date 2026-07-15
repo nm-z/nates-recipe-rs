@@ -47,7 +47,9 @@ fn busy_path() -> PathBuf {
 		};
 		return found;
 	}
-	drop(Write::err("saturation watchdog: no gpu_busy_percent under /sys/class/drm"));
+	drop(Write::err(
+		"saturation watchdog: no gpu_busy_percent under /sys/class/drm",
+	));
 	process::abort();
 }
 
@@ -142,17 +144,26 @@ pub fn spawn_thrash_watchdog() {
 		let raw = unsafe { libc::open(c"/dev/kfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 		let kfd = match raw.cmp(&0) {
 			cmp::Ordering::Less => {
-				drop(Write::err(&format!("thrash watchdog: /dev/kfd: {}", Error::last_os_error())));
+				drop(Write::err(&format!(
+					"thrash watchdog: /dev/kfd: {}",
+					Error::last_os_error()
+				)));
 				return;
 			}
-			cmp::Ordering::Equal | cmp::Ordering::Greater => {
-				unsafe { fs::File::from_raw_fd(raw) }
-			}
+			cmp::Ordering::Equal | cmp::Ordering::Greater => unsafe {
+				fs::File::from_raw_fd(raw)
+			},
 		};
-		let mut args = SmiArgs { gpuid: gpu_idx, anon_fd: 0 };
+		let mut args = SmiArgs {
+			gpuid: gpu_idx,
+			anon_fd: 0,
+		};
 		let rc = unsafe { libc::ioctl(kfd.as_raw_fd(), AMDKFD_IOC_SMI_EVENTS, &mut args) };
 		let cmp::Ordering::Equal = rc.cmp(&0) else {
-			drop(Write::err(&format!("thrash watchdog: SMI ioctl: {}", Error::last_os_error())));
+			drop(Write::err(&format!(
+				"thrash watchdog: SMI ioctl: {}",
+				Error::last_os_error()
+			)));
 			return;
 		};
 		let mut smi = unsafe { fs::File::from_raw_fd(args.anon_fd as i32) };
@@ -173,7 +184,9 @@ pub fn spawn_thrash_watchdog() {
 							Ok(0) => return,
 							Ok(n) => n,
 						};
-						for ev in String::from_utf8_lossy(&buf[..n]).split_terminator('\n') {
+						for ev in
+							String::from_utf8_lossy(&buf[..n]).split_terminator('\n')
+						{
 							let id = ev
 								.split_whitespace()
 								.next()
@@ -182,7 +195,11 @@ pub fn spawn_thrash_watchdog() {
 							let kind = Some(id)
 								.filter(|v| *v == 9 || *v == 11)
 								.map(|_v| GpuEvent::Thrash)
-								.or_else(|| Some(id).filter(|v| *v == 10).map(|_v| GpuEvent::Restored))
+								.or_else(|| {
+									Some(id)
+										.filter(|v| *v == 10)
+										.map(|_v| GpuEvent::Restored)
+								})
 								.unwrap_or(GpuEvent::Other);
 							match kind {
 								GpuEvent::Thrash => {
@@ -192,12 +209,17 @@ pub fn spawn_thrash_watchdog() {
 									)));
 									process::abort();
 								}
-								GpuEvent::Restored => {
-									Write::line(gpu, &format!("gpu event  queue restored  {}", ev.trim()))
-								}
-								GpuEvent::Other => {
-									Write::line(gpu, &format!("gpu event  {}", ev.trim()))
-								}
+								GpuEvent::Restored => Write::line(
+									gpu,
+									&format!(
+										"gpu event  queue restored  {}",
+										ev.trim()
+									),
+								),
+								GpuEvent::Other => Write::line(
+									gpu,
+									&format!("gpu event  {}", ev.trim()),
+								),
 							}
 						}
 					}

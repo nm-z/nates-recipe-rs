@@ -1,6 +1,6 @@
+use anyhow::{Context, Result, anyhow, bail};
 use std::cmp;
 use std::str;
-use anyhow::{Context, Result, anyhow, bail};
 
 pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 	let head = bytes.get(..8).ok_or_else(|| {
@@ -17,8 +17,8 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 			bytes.len()
 		)
 	})?;
-	let header = str::from_utf8(body)
-		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
+	let header =
+		str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let data = &bytes[data_start..];
 	let Json::Obj(entries) = parse_json(header)? else {
 		bail!("safetensors: header is not a JSON object");
@@ -105,8 +105,8 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader> {
 			bytes.len()
 		)
 	})?;
-	let header = str::from_utf8(body)
-		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
+	let header =
+		str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let Json::Obj(entries) = parse_json(header)? else {
 		bail!("safetensors: header is not a JSON object");
 	};
@@ -391,8 +391,8 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 						})?;
 						let code = u32::from_str_radix(str::from_utf8(hex)?, 16)
 							.map_err(|e| {
-							anyhow!("safetensors: bad \\u escape: {e}")
-						})?;
+								anyhow!("safetensors: bad \\u escape: {e}")
+							})?;
 						*p += 4;
 						char::from_u32(code).ok_or_else(|| {
 							anyhow!("safetensors: invalid unicode {code}")

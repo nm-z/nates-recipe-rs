@@ -13,10 +13,10 @@ fn data_load_reads_safetensors_source() {
 	let mut bytes = Vec::new();
 	bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
 	bytes.extend_from_slice(header.as_bytes());
-	for v in [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0] {
+	for v in [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	for v in [10.0f64, 20.0, 30.0] {
+	for v in [10.0_f64, 20.0, 30.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
 	let path = env::temp_dir().join("recipe_st_source_test.safetensors");
@@ -25,7 +25,9 @@ fn data_load_reads_safetensors_source() {
 
 	let SafeTable { attrs, rows } = safetensors_to_table(p).expect("safetensors table");
 	assert_eq!(
-		attrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+		attrs.iter()
+			.map(|a| return a.name.as_str())
+			.collect::<Vec<_>>(),
 		vec!["x:0", "x:1", "y"]
 	);
 	assert!(attrs.iter().all(|a| matches!(a.kind, Kind::Numeric)));
@@ -37,7 +39,7 @@ fn data_load_reads_safetensors_source() {
 	let Datasets { train: set, test } = data.datasets();
 	assert_eq!(set.x.ncols(), 2, "two feature columns (x:0, x:1)");
 	assert_eq!(set.n_targets, 1, "single target (y)");
-	let total = set.x.nrows() + test.as_ref().map_or(0, |t| t.x.nrows());
+	let total = set.x.nrows() + test.as_ref().map_or(0, |t| return t.x.nrows());
 	assert_eq!(total, 3, "all rows preserved across the split");
 	let _ = fs::remove_file(&path);
 }
@@ -52,19 +54,16 @@ fn data_load_materializes_safetensors_shard() {
 	let mut bytes = Vec::new();
 	bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
 	bytes.extend_from_slice(header.as_bytes());
-	for v in [10.0f32, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0] {
+	for v in [10.0_f32, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	for v in [100.0f64, 200.0, 300.0, 400.0] {
+	for v in [100.0_f64, 200.0, 300.0, 400.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	for v in [1.0f64, 2.0, 3.0, 4.0] {
+	for v in [1.0_f64, 2.0, 3.0, 4.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	let path = env::temp_dir().join(format!(
-		"recipe_st_shard_{}.safetensors",
-		process::id()
-	));
+	let path = env::temp_dir().join(format!("recipe_st_shard_{}.safetensors", process::id()));
 	fs::write(&path, &bytes).expect("write temp safetensors shard");
 	let p = path.to_str().expect("temp path utf8");
 

@@ -16,8 +16,8 @@ use crate::common;
 use gpu_core::hip::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::c_void;
 use std::f64::consts;
+use std::ffi::c_void;
 use std::fs;
 use std::ptr;
 
@@ -699,10 +699,7 @@ fn canon(name: &str) -> String {
 fn load_activation() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in fs::read_dir(&dir)
-		.expect("no kernel_inventory")
-		.flatten()
-	{
+	for e in fs::read_dir(&dir).expect("no kernel_inventory").flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
 			let Ok(txt) = fs::read_to_string(&p) else {
@@ -872,8 +869,7 @@ fn prove_activation() {
 		let mut ge_ok = true;
 		for i in 0..a.len() {
 			let w_sw = a[i] * (b[i] / (1.0 + (-b[i]).exp()));
-			let w_ge = a[i]
-				* (0.5 * b[i] * (1.0 + libm::erf(b[i] * consts::FRAC_1_SQRT_2)));
+			let w_ge = a[i] * (0.5 * b[i] * (1.0 + libm::erf(b[i] * consts::FRAC_1_SQRT_2)));
 			if !approx(gsw[i], w_sw) {
 				sw_ok = false;
 			}

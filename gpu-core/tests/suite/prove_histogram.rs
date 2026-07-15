@@ -85,8 +85,7 @@ fn gpu_bincount(labels: &[i32], out_len: usize) -> Vec<i32> {
 	let bl = GpuBuffer::upload_i32(labels).unwrap();
 	let counts = {
 		let __zb = GpuBuffer::alloc_bytes(out_len * mem::size_of::<i32>()).unwrap();
-		__zb.memset_zero(out_len * mem::size_of::<i32>())
-			.unwrap();
+		__zb.memset_zero(out_len * mem::size_of::<i32>()).unwrap();
 		__zb
 	};
 	unsafe {

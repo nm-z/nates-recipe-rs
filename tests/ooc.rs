@@ -1,8 +1,8 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
+use core::ptr;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe::ooc::{Window, chunks, view};
-use std::ptr;
 
 fn cpu_bce_grad(p: &[f64], y: &[f64], n_total: usize) -> Vec<f64> {
 	let eps = 1e-7;
@@ -25,8 +25,8 @@ fn cpu_focal_grad(p: &[f64], y: &[f64], gamma: f64, alpha: f64, n_total: usize) 
 			let wt = 1.0 - p_t;
 			let sign_pt = if t > 0.5 { 1.0 } else { -1.0 };
 			let g = -alpha
-				* (gamma * wt.powf(gamma - 1.0) * (-sign_pt) * p_t.ln()
-					+ wt.powf(gamma) * sign_pt / p_t);
+				* (gamma * wt.powf(gamma - 1.0) * (-sign_pt))
+					.mul_add(p_t.ln(), wt.powf(gamma) * sign_pt / p_t);
 			g / n_total as f64
 		})
 		.collect()

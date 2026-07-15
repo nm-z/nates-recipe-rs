@@ -1,6 +1,6 @@
-use gpu_core::log::{Write, net};
 use crate::machine::Machine;
 use anyhow::{Result, bail, ensure};
+use gpu_core::log::{Write, net};
 use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -162,7 +162,11 @@ impl NodeInfo {
 		}
 	}
 	fn encode(&self) -> Vec<u8> {
-		format!("{}{NL}{}{NL}{}{NL}{}", self.arch, self.gpus, self.vram, self.ram).into_bytes()
+		format!(
+			"{}{NL}{}{NL}{}{NL}{}",
+			self.arch, self.gpus, self.vram, self.ram
+		)
+		.into_bytes()
 	}
 	fn decode(b: &[u8]) -> Result<NodeInfo> {
 		let s = from_utf8(b)?;
@@ -233,13 +237,9 @@ fn ifaces() -> Vec<Iface> {
 					Some(nm) => u32::from_be(nm.sin_addr.s_addr),
 					None => 0,
 				};
-				let name = CStr::from_ptr(a.ifa_name)
-					.to_string_lossy()
-					.into_owned();
+				let name = CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
 				let link =
-					match fs::metadata(format!("/sys/class/net/{name}/wireless"))
-						.ok()
-					{
+					match fs::metadata(format!("/sys/class/net/{name}/wireless")).ok() {
 						Some(_meta) => Link::Wireless,
 						None => Link::Wired,
 					};
@@ -309,14 +309,11 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 }
 
 fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
-	let bind =
-		SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+	let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
 	let sock = match UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
-			drop(Write::err(&format!(
-				"discovery listener bind failed: {e}"
-			)));
+			drop(Write::err(&format!("discovery listener bind failed: {e}")));
 			return;
 		}
 	};
@@ -532,10 +529,8 @@ impl Conn {
 			.to_socket_addrs()?
 			.next()
 			.ok_or_else(|| anyhow::anyhow!("wire: {addr} resolves to nothing"))?;
-		let stream = TcpStream::connect_timeout(
-			&sa,
-			Duration::from_secs(CONNECT_TIMEOUT_SECS),
-		)?;
+		let stream =
+			TcpStream::connect_timeout(&sa, Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
 		recipe_infer::bridge::nodelay_on(&stream)?;
 		let reader = stream.try_clone()?;
 		let pending: Arc<Mutex<HashMap<u32, Sender<Frame>>>> =
@@ -706,16 +701,19 @@ impl Server {
 		let reg = Arc::clone(&self.reg);
 		let lm = machine.clone();
 		thread::spawn(move || listen_loop(reg, lm));
-		Write::line(net, &format!(
-			"{} ({}) on {} (ram {} MiB)",
-			self.info.arch,
-			hostname(),
-			listener
-				.local_addr()
-				.map(|a| a.to_string())
-				.unwrap_or_else(|_addr_err| "?".into()),
-			self.info.ram >> 20
-		));
+		Write::line(
+			net,
+			&format!(
+				"{} ({}) on {} (ram {} MiB)",
+				self.info.arch,
+				hostname(),
+				listener
+					.local_addr()
+					.map(|a| a.to_string())
+					.unwrap_or_else(|_addr_err| "?".into()),
+				self.info.ram >> 20
+			),
+		);
 		self.serve_on(listener)
 	}
 
@@ -725,9 +723,7 @@ impl Server {
 			let srv = self.clone();
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
-					drop(Write::err(&format!(
-						"connection ended: {e}"
-					)));
+					drop(Write::err(&format!("connection ended: {e}")));
 				}
 			});
 		}
@@ -878,9 +874,7 @@ fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 	let None = alias.find(':') else {
 		return Ok(vec![alias.to_string()]);
 	};
-	let ssh = process::Command::new("ssh")
-		.args(["-G", alias])
-		.output()?;
+	let ssh = process::Command::new("ssh").args(["-G", alias]).output()?;
 	let text = String::from_utf8_lossy(&ssh.stdout);
 	let host = text
 		.lines()

@@ -1,13 +1,12 @@
-use gpu_core::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
 use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, Train};
 use anyhow::Context;
 use gpu_core::kernels;
+use gpu_core::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
 use gpu_core::memory::{GpuBuffer, Stage};
 use recipe_infer::{
-	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer,
-	load_ogdl, load_ogdl_str, metric_gpu_into, pinned_vocab, plan_layer_params,
-	zscore_apply_views,
+	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
+	load_ogdl_str, metric_gpu_into, pinned_vocab, plan_layer_params, zscore_apply_views,
 };
 use std::ffi::c_void;
 use std::fs;
@@ -220,15 +219,15 @@ impl ModelInner {
 			drop(Write::err("resume"));
 			drop(Write::err("    data does not match"));
 			drop(Write::err(&format!("        {what}")));
-			drop(Write::err(&format!("        file path={}", resume.unwrap_or(""))));
+			drop(Write::err(&format!(
+				"        file path={}",
+				resume.unwrap_or("")
+			)));
 			drop(Write::err(&format!("        data path={}", dat.source)));
 			let Some(_tty) = Some(()).filter(|_probe| io::stdin().is_terminal()) else {
 				return YesNo::No;
 			};
-			Write::line(
-				prompt,
-				"overwrite checkpoint with random weights? [y/N] ",
-			);
+			Write::line(prompt, "overwrite checkpoint with random weights? [y/N] ");
 			io::stderr().flush().ok();
 			let mut line = String::new();
 			io::stdin().read_line(&mut line).ok();
@@ -278,7 +277,7 @@ impl ModelInner {
 			.unwrap_or(n_targets);
 		if out_dim != k {
 			Write::err(format!(
-			"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
+				"output layer has {out_dim} units but there are {n_targets} target column(s) — make the last .layer({n_targets})"
 			))?;
 		}
 		let yp = {
@@ -542,7 +541,10 @@ impl ModelInner {
 						resume.map(|path| {
 							let full = fs::canonicalize(path)
 								.unwrap_or_else(|_err| path.into());
-							Write::line(save, &format!("resumed: {}", full.display()));
+							Write::line(
+								save,
+								&format!("resumed: {}", full.display()),
+							);
 						})
 						.unwrap_or(())
 					})
@@ -553,11 +555,14 @@ impl ModelInner {
 						for g in summary_graph.iter() {
 							Write::block(data, &g.serialize());
 						}
-						Write::line(gpu, &format!(
-							"roofline  gemm {} GF/s  vram {} GB/s",
-							recipe_infer::GEMM_GFLOPS,
-							recipe_infer::VRAM_GBS
-						));
+						Write::line(
+							gpu,
+							&format!(
+								"roofline  gemm {} GF/s  vram {} GB/s",
+								recipe_infer::GEMM_GFLOPS,
+								recipe_infer::VRAM_GBS
+							),
+						);
 					})
 					.unwrap_or(());
 			})
@@ -787,10 +792,7 @@ impl ModelInner {
 				Write::line(flag, &metrics_line(&[*m], &[v]));
 			}
 			for _ck in checkpointed.iter() {
-				Write::line(
-					save,
-					"<- checkpoint",
-				);
+				Write::line(save, "<- checkpoint");
 			}
 		}
 		Some(())
@@ -810,7 +812,10 @@ impl ModelInner {
 						row
 					})
 					.collect();
-				let summary_text = summary_graph.as_ref().map(|g| g.serialize()).unwrap_or_default();
+				let summary_text = summary_graph
+					.as_ref()
+					.map(|g| g.serialize())
+					.unwrap_or_default();
 				crate::tui::show(&summary_text, &plot_rows, &plot_ys);
 			})
 			.unwrap_or(());
@@ -847,17 +852,23 @@ impl ModelInner {
 								!(fit_score.is_finite() && fit_score > best)
 							});
 						match Some(()).filter(|_probe| better_on_disk) {
-							Some(_keep) => Write::line(save, &format!(
-								"keeping {path} (better prior {key} on disk)"
-							)),
+							Some(_keep) => Write::line(
+								save,
+								&format!(
+									"keeping {path} (better prior {key} on disk)"
+								),
+							),
 							None => {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								Write::line(save, &format!(
-									"saved {} ({key} {fit_score:.4})",
-									full.display()
-								));
+								Write::line(
+									save,
+									&format!(
+										"saved {} ({key} {fit_score:.4})",
+										full.display()
+									),
+								);
 							}
 						}
 					}
@@ -872,10 +883,13 @@ impl ModelInner {
 								recipe_infer::write_ogdl(path, text)?;
 								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
-								Write::line(save, &format!(
-									"saved {} ({neurons} neurons, {key} {s:.4})",
-									full.display()
-								));
+								Write::line(
+									save,
+									&format!(
+										"saved {} ({neurons} neurons, {key} {s:.4})",
+										full.display()
+									),
+								);
 								Ok(())
 							})
 							.transpose()?;
@@ -914,21 +928,30 @@ impl ModelInner {
 			let i = led_init?;
 			let l = led_loop?;
 			let ee = gpu_core::memory::xfer_calls();
-			Write::line(device, format!(
-				"-- ledger init -- H2D calls {}  D2H calls {}",
-				i.h2d - s0.h2d,
-				i.d2h - s0.d2h
-			));
-			Write::line(device, format!(
-				"-- ledger loop -- H2D calls {}  D2H calls {}",
-				l.h2d - i.h2d,
-				l.d2h - i.d2h
-			));
-			Write::line(device, format!(
-				"-- ledger exit -- H2D calls {}  D2H calls {}",
-				ee.h2d - l.h2d,
-				ee.d2h - l.d2h
-			));
+			Write::line(
+				device,
+				format!(
+					"-- ledger init -- H2D calls {}  D2H calls {}",
+					i.h2d - s0.h2d,
+					i.d2h - s0.d2h
+				),
+			);
+			Write::line(
+				device,
+				format!(
+					"-- ledger loop -- H2D calls {}  D2H calls {}",
+					l.h2d - i.h2d,
+					l.d2h - i.d2h
+				),
+			);
+			Write::line(
+				device,
+				format!(
+					"-- ledger exit -- H2D calls {}  D2H calls {}",
+					ee.h2d - l.h2d,
+					ee.d2h - l.d2h
+				),
+			);
 			Some(())
 		};
 		led_dump();

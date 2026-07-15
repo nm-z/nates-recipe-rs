@@ -1,14 +1,14 @@
+use crate::enums::{Activation, LayerKind, LayerSpec};
+use crate::{Param, download_scalar, download_vec};
+use anyhow::Context;
+use gpu_core::log::{Errored, Write};
+use gpu_core::memory::GpuBuffer;
 use std::env;
 use std::f64::consts;
 use std::fs;
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use gpu_core::log::{Errored, Write};
-use crate::enums::{Activation, LayerKind, LayerSpec};
-use crate::{Param, download_scalar, download_vec};
-use anyhow::Context;
-use gpu_core::memory::GpuBuffer;
 
 pub const LEAKY_ALPHA: f64 = 0.01;
 pub const PRELU_INIT: f64 = 0.25;
@@ -681,7 +681,9 @@ pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
-			drop(Write::err(&format!("no data in {path}, initialized random weights and biases")));
+			drop(Write::err(&format!(
+				"no data in {path}, initialized random weights and biases"
+			)));
 			return Ok(Vec::new());
 		}
 	};

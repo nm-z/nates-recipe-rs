@@ -1,15 +1,15 @@
-use std::cell::Cell;
-use std::ffi::c_void;
-use std::mem;
-use std::process;
-use std::ptr;
-use std::sync::Mutex;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
 use anyhow::Context;
 use gpu_core::kernels;
 use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
+use std::cell::Cell;
+use std::ffi::c_void;
+use std::mem;
+use std::process;
+use std::ptr;
+use std::sync::Mutex;
 
 pub const SCRATCH_CONSTS: [f64; 12] = [
 	1.0,
@@ -394,9 +394,7 @@ impl Scratch {
 
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe {
-				self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut())
-			};
+			let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
 			if !r.is_ok() {
 				drop(Write::err(format!(
 					"record fwd event: {}",
@@ -409,9 +407,7 @@ impl Scratch {
 
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe {
-				self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut())
-			};
+			let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
 			if !r.is_ok() {
 				drop(Write::err(format!(
 					"record bwd event: {}",

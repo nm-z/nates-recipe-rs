@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, bail};
 use gpu_core::log::{Opt, Write, gpu, prompt as promptf, set_opt};
 use recipe_infer::llm::{generate, render_toks};
 use std::env;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process;
 
@@ -22,7 +22,10 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 		.and_then(|p| p.parent())
 		.map(|p| p.join("libvramspy.so"))
 		.ok_or_else(|| {
-			anyhow!("could not resolve libvramspy.so path from current_exe {}", exe.display())
+			anyhow!(
+				"could not resolve libvramspy.so path from current_exe {}",
+				exe.display()
+			)
 		})?;
 	if !shim.exists() {
 		bail!(
@@ -61,7 +64,7 @@ fn main() -> Result<()> {
 	let gguf = Path::new("/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf");
 	let ask = env::args()
 		.nth(1)
-		.unwrap_or_else(|| "The capital of France is".to_string());
+		.unwrap_or_else(|| return "The capital of France is".to_owned());
 
 	let mut step = 0usize;
 	let out = generate(gguf, &ask, &mut |toks| {

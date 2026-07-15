@@ -312,8 +312,7 @@ pub(crate) fn register_fault_autopsy_once() {
 				extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
 				*mut c_void,
 			) -> i32;
-			let register =
-				unsafe { mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
+			let register = unsafe { mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
 			for _ok in Some(())
 				.filter(|_u| register(fault_autopsy, ptr::null_mut()) == 0)
 				.into_iter()
@@ -352,11 +351,7 @@ pub fn sysfs_vram_free() -> Option<usize> {
 	for card in fs::read_dir("/sys/class/drm").ok()? {
 		let dev = card.ok()?.path().join("device");
 		let read = |f: &str| -> Option<usize> {
-			fs::read_to_string(dev.join(f))
-				.ok()?
-				.trim()
-				.parse()
-				.ok()
+			fs::read_to_string(dev.join(f)).ok()?.trim().parse().ok()
 		};
 		let total = read("mem_info_vram_total");
 		let used = read("mem_info_vram_used");

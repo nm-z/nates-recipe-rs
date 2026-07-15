@@ -93,11 +93,7 @@ fn test_min() {
 
 #[test]
 fn test_sin_cos_tan() {
-	let angles = [
-		0.0f64,
-		consts::PI / 6.0,
-		consts::PI / 4.0,
-	];
+	let angles = [0.0f64, consts::PI / 6.0, consts::PI / 4.0];
 	let x = upload(&angles);
 
 	let sin_out = out_buf(3);

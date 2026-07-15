@@ -154,13 +154,10 @@ struct CounterGroup<'a> {
 
 pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 	let g = |c: &AtomicU64| {
-		let i = ALL
-			.iter()
-			.position(|x| ptr::eq(*x, c))
-			.unwrap_or_else(|| {
-				drop(Write::err("callspy: counter not registered in ALL"));
-				process::abort()
-			});
+		let i = ALL.iter().position(|x| ptr::eq(*x, c)).unwrap_or_else(|| {
+			drop(Write::err("callspy: counter not registered in ALL"));
+			process::abort()
+		});
 		end[i].saturating_sub(base[i])
 	};
 	let groups: &[CounterGroup] = &[
@@ -423,12 +420,10 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let le = LOOP_END.lock().unwrap_or_else(|p| p.into_inner()).take()?;
 	let end = snapshot();
 	let idx = |c: &AtomicU64| {
-		ALL.iter()
-			.position(|x| ptr::eq(*x, c))
-			.unwrap_or_else(|| {
-				drop(Write::err("callspy: counter not registered in ALL"));
-				process::abort()
-			})
+		ALL.iter().position(|x| ptr::eq(*x, c)).unwrap_or_else(|| {
+			drop(Write::err("callspy: counter not registered in ALL"));
+			process::abort()
+		})
 	};
 	let cell = |a: &[u64; N], b: &[u64; N], cs: &[&AtomicU64]| -> u64 {
 		cs.iter().map(|c| b[idx(c)].saturating_sub(a[idx(c)])).sum()
@@ -487,7 +482,11 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 					"async",
 					format!(
 						"{}x",
-						cell(a, b, &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER])
+						cell(
+							a,
+							b,
+							&[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER]
+						)
 					),
 				),
 				kv(
@@ -497,7 +496,11 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 						cell(
 							a,
 							b,
-							&[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE]
+							&[
+								&STREAM_SYNCHRONIZE,
+								&DEVICE_SYNCHRONIZE,
+								&EVENT_SYNCHRONIZE
+							]
 						)
 					),
 				),

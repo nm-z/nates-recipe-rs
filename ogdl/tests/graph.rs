@@ -4,8 +4,7 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 
-const SAMPLE: &str =
-	"engi\n\tGPU0\n\t\tVRAM\t12\n\t\tFLOPs\t380\n\tCPU\n\t\tRAM\t31\n";
+const SAMPLE: &str = "engi\n\tGPU0\n\t\tVRAM\t12\n\t\tFLOPs\t380\n\tCPU\n\t\tRAM\t31\n";
 
 #[test]
 fn round_trip_itnl_file_itnl() {

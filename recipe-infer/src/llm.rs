@@ -1,12 +1,4 @@
-use std::cmp;
-use std::env;
-use std::io;
-use std::mem;
-use std::process;
-use std::ptr;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::Duration;
+use crate::gguf::{Gguf, Val};
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
@@ -17,14 +9,22 @@ use gpu_core::log::probe as probe_flag;
 use gpu_core::log::{Write, data, gpu};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::waterfall::{Home, Waterfall};
-use crate::gguf::{Gguf, Val};
 use std::cell::RefCell;
+use std::cmp;
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::fs::File;
+use std::io;
+use std::mem;
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 pub struct Tok {
@@ -51,7 +51,8 @@ pub fn render_toks(toks: &[Tok]) -> String {
 pub fn toks_line(toks: &[Tok]) -> String {
 	let mut out = String::new();
 	for t in toks {
-		let Some(_keep) = Some(()).filter(|_probe| !matches!(t.status, TokStatus::Draft)) else {
+		let Some(_keep) = Some(()).filter(|_probe| !matches!(t.status, TokStatus::Draft))
+		else {
 			continue;
 		};
 		out.push_str(&t.text);
@@ -74,7 +75,9 @@ fn as_uint(v: &Val) -> Option<u64> {
 }
 
 fn uint_kv(g: &Gguf, key: &str) -> Result<usize> {
-	let v = g.kv.get(key).ok_or_else(|| anyhow!("gguf: kv {key} not found"))?;
+	let v =
+		g.kv.get(key)
+			.ok_or_else(|| anyhow!("gguf: kv {key} not found"))?;
 	as_uint(v)
 		.map(|x| x as usize)
 		.ok_or_else(|| anyhow!("gguf: kv {key} is not an unsigned integer"))
@@ -85,9 +88,9 @@ fn uint_arr(g: &Gguf, key: &str) -> Result<Vec<usize>> {
 		Some(Val::Arr(items)) => items
 			.iter()
 			.map(|v| {
-				as_uint(v)
-					.map(|x| x as usize)
-					.ok_or_else(|| anyhow!("gguf: kv {key} array holds a non-uint element"))
+				as_uint(v).map(|x| x as usize).ok_or_else(|| {
+					anyhow!("gguf: kv {key} array holds a non-uint element")
+				})
 			})
 			.collect(),
 		Some(_other) => bail!("gguf: kv {key} is not an array"),
@@ -298,7 +301,9 @@ struct Tensor {
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 	if !(off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8)) {
-		drop(Write::err(format!("bview: unaligned {off_bytes}/{len_bytes}")));
+		drop(Write::err(format!(
+			"bview: unaligned {off_bytes}/{len_bytes}"
+		)));
 		process::abort();
 	}
 	buf.view(off_bytes / 8, len_bytes / 8)
@@ -540,7 +545,10 @@ impl Model {
 	}
 
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self
+			.big
+			.get(name)
+			.ok_or_else(|| anyhow!("missing {name}"))?;
 		if t.gt != GT_BF16 {
 			let (qoff, qlen) = Self::qrange(t, 0, t.nbytes)?;
 			let mut qbuf = vec![0u8; qlen];
@@ -553,8 +561,7 @@ impl Model {
 			return Ok(f.iter().map(|&x| x as f64).collect());
 		}
 		let raw = self.read_bytes(t, 0, t.nbytes)?;
-		Ok(raw
-			.chunks_exact(2)
+		Ok(raw.chunks_exact(2)
 			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
 			.collect())
 	}
@@ -589,7 +596,10 @@ impl Model {
 	}
 
 	fn stream(&self, name: &str) -> Result<GpuBuffer> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self
+			.big
+			.get(name)
+			.ok_or_else(|| anyhow!("missing {name}"))?;
 		let n = t.nbytes / 2;
 		match self.store.home(name) {
 			Some(Home::Vram(dev)) => self.widen_from(dev, 0, n),
@@ -605,7 +615,8 @@ impl Model {
 	}
 
 	fn expert_slot(&self, l: usize, e: usize) -> Result<GpuBuffer> {
-		let (gu_bytes, dn_bytes, slot_bytes) = (self.hp.gu_bytes, self.hp.dn_bytes, self.hp.slot_bytes);
+		let (gu_bytes, dn_bytes, slot_bytes) =
+			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.slot_bytes);
 		match self.store.home(&ekey(l, e)) {
 			Some(Home::Vram(dev)) => {
 				E_VRAM.fetch_add(1, Ordering::Relaxed);
@@ -820,10 +831,9 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub
 	};
 
-	let et = m
-		.big
-		.get("model.decoder.embed_tokens.weight")
-		.ok_or_else(|| anyhow!("no embed_tokens"))?;
+	let et =
+		m.big.get("model.decoder.embed_tokens.weight")
+			.ok_or_else(|| anyhow!("no embed_tokens"))?;
 	if et.shape != vec![vocab, ne] {
 		bail!("embed_tokens shape {:?}", et.shape);
 	}
@@ -849,11 +859,32 @@ fn fixed_names(hp: &Hparams, l: usize) -> Vec<String> {
 
 fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 	let hp = &m.hp;
-	gpu_gemm_bt_f64(&ar.x, &m.win.view(0, hp.qd_max * hp.ne), t, hp.qd_max, hp.ne, &ar.q)?;
+	gpu_gemm_bt_f64(
+		&ar.x,
+		&m.win.view(0, hp.qd_max * hp.ne),
+		t,
+		hp.qd_max,
+		hp.ne,
+		&ar.q,
+	)?;
 	beat();
-	gpu_gemm_bt_f64(&ar.cms, &m.win.view(0, hp.nff * hp.ne), t, hp.nff, hp.ne, &ar.g)?;
+	gpu_gemm_bt_f64(
+		&ar.cms,
+		&m.win.view(0, hp.nff * hp.ne),
+		t,
+		hp.nff,
+		hp.ne,
+		&ar.g,
+	)?;
 	beat();
-	gpu_gemm_bt_f64(&ar.act, &m.win.view(0, hp.ne * hp.nff), t, hp.ne, hp.nff, &ar.mlp0)?;
+	gpu_gemm_bt_f64(
+		&ar.act,
+		&m.win.view(0, hp.ne * hp.nff),
+		t,
+		hp.ne,
+		hp.nff,
+		&ar.mlp0,
+	)?;
 	beat();
 	gpu_gemm_bt_f64(
 		&ar.moe_xg,
@@ -892,14 +923,12 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	}
 	for e in 0..nexp {
 		for l in 0..nl {
-			let gu = m
-				.big
-				.get(&layer_name(l, "experts.gate_up_proj"))
-				.ok_or_else(|| anyhow!("no gate_up {l}"))?;
-			let dn = m
-				.big
-				.get(&layer_name(l, "experts.down_proj"))
-				.ok_or_else(|| anyhow!("no down {l}"))?;
+			let gu =
+				m.big.get(&layer_name(l, "experts.gate_up_proj"))
+					.ok_or_else(|| anyhow!("no gate_up {l}"))?;
+			let dn =
+				m.big.get(&layer_name(l, "experts.down_proj"))
+					.ok_or_else(|| anyhow!("no down {l}"))?;
 			store.place(&ekey(l, e), slot_bytes, |dst| {
 				m.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])
 					.and_then(|_g| m.read_host(dn, e * dn_bytes, &mut dst[gu_bytes..]))
@@ -930,7 +959,9 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 				let mut got = vec![0u8; n];
 				bview(dev, off, n).download_u8(&mut got)?;
 				if got != want {
-					bail!("waterfall {name} stale at byte {off}: upload not visible to GPU reads");
+					bail!(
+						"waterfall {name} stale at byte {off}: upload not visible to GPU reads"
+					);
 				}
 			}
 		}
@@ -1063,12 +1094,8 @@ fn layer(
 	let _rt = Instant::now();
 	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
 	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
-	unsafe {
-		ar.attn_out.download_async(&mut ao_host, ptr::null_mut())
-	}?;
-	unsafe {
-		ar.cmoes.download_async(&mut cmoes_host, ptr::null_mut())
-	}?;
+	unsafe { ar.attn_out.download_async(&mut ao_host, ptr::null_mut()) }?;
+	unsafe { ar.cmoes.download_async(&mut cmoes_host, ptr::null_mut()) }?;
 	gpu_core::hip::device_synchronize()?;
 	acc(&MOE_RT_NS, _rt);
 	let _tr = Instant::now();
@@ -1085,9 +1112,7 @@ fn layer(
 		}
 		softmax(&mut rl);
 		let mut idx: Vec<usize> = (0..nexp).collect();
-		idx.sort_by(|a, b| {
-			rl[*b].partial_cmp(&rl[*a]).unwrap_or(cmp::Ordering::Equal)
-		});
+		idx.sort_by(|a, b| rl[*b].partial_cmp(&rl[*a]).unwrap_or(cmp::Ordering::Equal));
 		idx.truncate(used);
 		let ws: f64 = idx.iter().map(|&e| rl[e]).sum();
 		for &e in &idx {
@@ -1114,7 +1139,8 @@ fn layer(
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
 		let _rt = Instant::now();
 		unsafe {
-			ar.moe_dv.download_async(&mut dv_host[..np * ne], ptr::null_mut())
+			ar.moe_dv
+				.download_async(&mut dv_host[..np * ne], ptr::null_mut())
 		}?;
 		gpu_core::hip::device_synchronize()?;
 		acc(&MOE_RT_NS, _rt);
@@ -1157,7 +1183,8 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
 		unsafe {
-			ar.lm_out.download_async(&mut out_host[..ncanvas * cn], ptr::null_mut())
+			ar.lm_out
+				.download_async(&mut out_host[..ncanvas * cn], ptr::null_mut())
 		}?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
@@ -1184,11 +1211,7 @@ pub fn vram_probe_ask() -> Option<i32> {
 	})
 }
 
-pub fn generate(
-	gguf: &Path,
-	prompt: &str,
-	on_round: &mut dyn FnMut(&[Tok]),
-) -> Result<String> {
+pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok])) -> Result<String> {
 	if !env::var_os("VRAM_PROBE").is_none() {
 		Write::err(
 			"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
@@ -1200,7 +1223,10 @@ pub fn generate(
 	let watchdog = arm_watchdog();
 	let claim = {
 		let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
-		Write::line(gpu, format!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64));
+		Write::line(
+			gpu,
+			format!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64),
+		);
 		loop {
 			if want < (1 << 30) {
 				bail!("claim probe: nothing mappable above 1 GB");
@@ -1235,11 +1261,18 @@ pub fn generate(
 		}
 		Write::line(
 			gpu,
-			format!("claim: {:.2} GB (probe-verified)", want as f64 / (1u64 << 30) as f64),
+			format!(
+				"claim: {:.2} GB (probe-verified)",
+				want as f64 / (1u64 << 30) as f64
+			),
 		);
-		let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
+		let slab =
+			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 		let w = Waterfall::from_arena(slab);
-		Write::line(gpu, format!("[right after claim] {}", gpu_core::memory::ledger_report()));
+		Write::line(
+			gpu,
+			format!("[right after claim] {}", gpu_core::memory::ledger_report()),
+		);
 		w
 	};
 
@@ -1273,7 +1306,10 @@ pub fn generate(
 	}
 	let t = toks.len();
 	let scl = (ne as f64).sqrt();
-	Write::line(data, format!("prompt tokens={prefix} canvas={ncanvas} total={t}"));
+	Write::line(
+		data,
+		format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
+	);
 
 	let ar = {
 		let _t = gpu_core::memory::tag_scope("arena");
@@ -1284,7 +1320,10 @@ pub fn generate(
 	Write::line(data, "waterfall fill");
 	fill_store(&mut m, claim)?;
 	watchdog.disarm();
-	Write::line(gpu, format!("loaded in {:.1}s", t_load.elapsed().as_secs_f64()));
+	Write::line(
+		gpu,
+		format!("loaded in {:.1}s", t_load.elapsed().as_secs_f64()),
+	);
 	Write::line(
 		gpu,
 		format!(
@@ -1318,7 +1357,8 @@ pub fn generate(
 			let b = tk as usize * ne * 2;
 			for x in 0..ne {
 				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scl;
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]))
+						* scl;
 			}
 		}
 		ar.ha.load(&base)?;
@@ -1331,8 +1371,10 @@ pub fn generate(
 				for &(id, pr) in top {
 					let b = id * ne * 2;
 					for x in 0..ne {
-						soft[c * ne + x] +=
-							pr * bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
+						soft[c * ne + x] += pr * bf16(u16::from_le_bytes([
+							m.emb[b + x * 2],
+							m.emb[b + x * 2 + 1],
+						]));
 					}
 				}
 				for x in 0..ne {
@@ -1348,7 +1390,13 @@ pub fn generate(
 			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, clen, &ar.cur)?;
 			gpu_rmsnorm_f64_nogamma(&ar.cur, &m.eps, ncanvas, ne, &ar.normed)?;
 		} else {
-			gpu_rmsnorm_f64_nogamma(&ar.ha.view(coff, clen), &m.eps, ncanvas, ne, &ar.normed)?;
+			gpu_rmsnorm_f64_nogamma(
+				&ar.ha.view(coff, clen),
+				&m.eps,
+				ncanvas,
+				ne,
+				&ar.normed,
+			)?;
 		}
 		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
 
@@ -1361,19 +1409,30 @@ pub fn generate(
 			}))
 		};
 		if step == 0 && gpu_core::log::opt().probe {
-			Write::line(probe_flag, format!("[hash] step0 input {:016x}", bithash(&ar.ha, t * ne)?));
+			Write::line(
+				probe_flag,
+				format!("[hash] step0 input {:016x}", bithash(&ar.ha, t * ne)?),
+			);
 		}
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
 			Write::line(
 				gpu,
-				format!("step {step} layer {}/{} ({:.0}s)", l + 1, nl, t0.elapsed().as_secs_f64()),
+				format!(
+					"step {step} layer {}/{} ({:.0}s)",
+					l + 1,
+					nl,
+					t0.elapsed().as_secs_f64()
+				),
 			);
 			layer(&m, l, src, dst, t, prefix, &ar)?;
 			mem::swap(&mut src, &mut dst);
 			if step == 0 && gpu_core::log::opt().probe {
-				Write::line(probe_flag, format!("[hash] step0 layer {l:2} {:016x}", bithash(src, t * ne)?));
+				Write::line(
+					probe_flag,
+					format!("[hash] step0 layer {l:2} {:016x}", bithash(src, t * ne)?),
+				);
 			}
 		}
 		let hbuf = src;
@@ -1385,20 +1444,30 @@ pub fn generate(
 			Write::err(format!("step {step}: {nan} non-finite in h after layers"))?;
 		}
 
-		gpu_rmsnorm_f64(&hbuf.view(coff, clen), &m.decoder_norm, &m.eps, ncanvas, ne, &ar.hfs)?;
+		gpu_rmsnorm_f64(
+			&hbuf.view(coff, clen),
+			&m.decoder_norm,
+			&m.eps,
+			ncanvas,
+			ne,
+			&ar.hfs,
+		)?;
 		let logits = lm_head(&m, &ar.hfs, ncanvas, &ar)?;
 
 		let temp = 1.0 - 0.7 * (step as f64 / 6.0);
 		for c in 0..ncanvas {
 			let row = &logits[c * vocab_size..(c + 1) * vocab_size];
 			let mut cand: Vec<(usize, f64)> = (0..vocab_size)
-				.filter(|&tk| tk >= 6 && Some(tk) != mask_signal && !vocab[tk].starts_with('<'))
+				.filter(|&tk| {
+					tk >= 6 && Some(tk) != mask_signal && !vocab[tk].starts_with('<')
+				})
 				.map(|tk| (tk, row[tk]))
 				.collect();
 			cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmp::Ordering::Equal));
 			cand.truncate(50);
 			let ml = cand[0].1;
-			let mut probs: Vec<f64> = cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
+			let mut probs: Vec<f64> =
+				cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
 			let sum: f64 = probs.iter().sum();
 			for x in probs.iter_mut() {
 				*x /= sum;
@@ -1461,7 +1530,10 @@ pub fn generate(
 	}
 
 	let allocs_after = gpu_core::memory::device_alloc_count();
-	Write::line(gpu, format!("steady-state allocs: {}", allocs_after - allocs_before));
+	Write::line(
+		gpu,
+		format!("steady-state allocs: {}", allocs_after - allocs_before),
+	);
 	let tot = t0.elapsed().as_secs_f64();
 	let s = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
 	Write::line(
@@ -1503,6 +1575,12 @@ pub fn generate(
 
 	drop(ar);
 	drop(m);
-	Write::line(gpu, format!("exit: device frees {}", gpu_core::memory::device_free_count()));
+	Write::line(
+		gpu,
+		format!(
+			"exit: device frees {}",
+			gpu_core::memory::device_free_count()
+		),
+	);
 	Ok(out)
 }

@@ -3,8 +3,11 @@ name = "catboost-rs"
 version = "0.1.0"
 edition = "2024"
 description = "CatBoost training — ordered boosting with categorical features"
-
-[workspace]
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["catboost", "gradient-boosting", "gpu", "categorical", "trees"]
+categories = ["science::ml"]
 
 [dependencies]
 gpu-core = { path = "../gpu-core" }

@@ -2,6 +2,12 @@
 name = "recipe"
 version = "0.1.1"
 edition = "2024"
+description = "ML training + inference for AMD/NVIDIA GPUs"
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["machine-learning", "gpu", "hip", "neural-network"]
+categories = ["science::ml"]
 
 [lib]
 name = "recipe"
@@ -17,8 +23,19 @@ name = "all"
 harness = false
 
 [workspace]
-members = [".", "recipe-infer", "pantry", "vramspy", "gpu-core", "log", "ogdl"]
-exclude = ["catboost-rs", "xgboost-rs", "lightgbm-rs"]
+resolver = "3"
+members = [
+	".",
+	"recipe-infer",
+	"pantry",
+	"vramspy",
+	"gpu-core",
+	"log",
+	"ogdl",
+	"catboost-rs",
+	"xgboost-rs",
+	"lightgbm-rs",
+]
 
 [dependencies]
 gpu-core = { path = "gpu-core" }
@@ -52,6 +69,7 @@ serde_json = "1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+overflow-checks = true
 
 [profile.dev]
 opt-level = 1
@@ -73,4 +91,16 @@ pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 restriction = { level = "deny", priority = -1 }
+
 blanket_clippy_restriction_lints = "allow"
+min_ident_chars = "allow"
+indexing_slicing = "allow"
+needless_return = "allow"
+arithmetic_side_effects = "allow"
+question_mark_used = "allow"
+pub_use = "allow" 
+
+
+
+
+

@@ -3,8 +3,11 @@ name = "xgboost-rs"
 version = "0.1.0"
 edition = "2024"
 description = "XGBoost-equivalent gradient boosting — level-wise trees, histogram splits, HIP GPU"
-
-[workspace]
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["xgboost", "gradient-boosting", "gpu", "hip", "gbdt"]
+categories = ["science::ml"]
 
 [dependencies]
 gpu-core = { path = "../gpu-core" }

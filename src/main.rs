@@ -1,5 +1,5 @@
-use gpu_core::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
 use anyhow::Result;
+use gpu_core::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -13,10 +13,18 @@ use std::time::UNIX_EPOCH;
 
 fn usage(code: i32) -> ! {
 	drop(Write::err(&format!("recipe {}", env!("CARGO_PKG_VERSION"))));
-	drop(Write::err("usage: recipe <file.rs> [args]  # compile + run"));
-	drop(Write::err("       recipe serve            # daemon on 7845"));
-	drop(Write::err("       recipe peers            # live network view"));
-	drop(Write::err("       recipe probe            # measure this machine"));
+	drop(Write::err(
+		"usage: recipe <file.rs> [args]  # compile + run",
+	));
+	drop(Write::err(
+		"       recipe serve            # daemon on 7845",
+	));
+	drop(Write::err(
+		"       recipe peers            # live network view",
+	));
+	drop(Write::err(
+		"       recipe probe            # measure this machine",
+	));
 	process::exit(code);
 }
 
@@ -66,8 +74,10 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 			.arg("-o")
 			.arg(&bin);
 		for name in ["recipe", "ogdl", "gpu_core", "pantry", "recipe_infer"] {
-			cmd.arg("--extern")
-				.arg(format!("{name}={}", root.join(format!("lib{name}.rlib")).display()));
+			cmd.arg("--extern").arg(format!(
+				"{name}={}",
+				root.join(format!("lib{name}.rlib")).display()
+			));
 		}
 		let status = cmd.status().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
 		anyhow::ensure!(status.success(), "rustc failed on {path}: {status}");
@@ -104,38 +114,39 @@ fn main() -> Result<()> {
 			let cat = ndarray::Array2::<f64>::from_elem(ndarray::Ix2(45982, 128), 1.0);
 			let mut stage = gpu_core::memory::Stage::new();
 			let x_std = x.as_standard_layout();
-			let x_off = stage.push(
-				x_std
-					.as_slice()
-					.ok_or_else(|| Errored::new("x contig"))?,
-			);
+			let x_off =
+				stage.push(x_std.as_slice().ok_or_else(|| Errored::new("x contig"))?);
 			let cat_std = cat.as_standard_layout();
-			let cat_off = stage.push(
-				cat_std
-					.as_slice()
-					.ok_or_else(|| Errored::new("cat contig"))?,
-			);
+			let cat_off = stage.push(cat_std
+				.as_slice()
+				.ok_or_else(|| Errored::new("cat contig"))?);
 			let host = stage.into_host();
 			let staged = gpu_core::memory::GpuBuffer::alloc(host.len().max(1))
 				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
-			staged
-				.load(&host)
+			staged.load(&host)
 				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
 			let xraw = staged.view(x_off, x.len());
 			let craw = staged.view(cat_off, cat.len());
 			let nn = cat.nrows();
 			let cc = cat.ncols();
 			let eps = {
-				let e = gpu_core::memory::GpuBuffer::alloc(1).map_err(|e| Errored::new(format!("eps: {e}")))?;
-				e.load(&[recipe_infer::ZSCORE_EPS]).map_err(|e| Errored::new(format!("eps load: {e}")))?;
+				let e = gpu_core::memory::GpuBuffer::alloc(1)
+					.map_err(|e| Errored::new(format!("eps: {e}")))?;
+				e.load(&[recipe_infer::ZSCORE_EPS])
+					.map_err(|e| Errored::new(format!("eps load: {e}")))?;
 				e
 			};
-			let mean = gpu_core::memory::GpuBuffer::alloc(cc).map_err(|e| Errored::new(format!("mean: {e}")))?;
-			let std = gpu_core::memory::GpuBuffer::alloc(cc).map_err(|e| Errored::new(format!("std: {e}")))?;
-			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc).map_err(|e| Errored::new(format!("zscored: {e}")))?;
+			let mean = gpu_core::memory::GpuBuffer::alloc(cc)
+				.map_err(|e| Errored::new(format!("mean: {e}")))?;
+			let std = gpu_core::memory::GpuBuffer::alloc(cc)
+				.map_err(|e| Errored::new(format!("std: {e}")))?;
+			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc)
+				.map_err(|e| Errored::new(format!("zscored: {e}")))?;
 			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
-			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).map_err(|e| Errored::new(format!("lse: {e}")))?;
-			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072).map_err(|e| Errored::new(format!("dsum: {e}")))?;
+			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
+				.map_err(|e| Errored::new(format!("lse: {e}")))?;
+			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
+				.map_err(|e| Errored::new(format!("dsum: {e}")))?;
 			let mut fills = Vec::new();
 			while let Some(b) = gpu_core::memory::GpuBuffer::try_alloc_bytes(256 << 20) {
 				fills.push(b);
@@ -183,10 +194,7 @@ fn main() -> Result<()> {
 				probe: true,
 				..Opt::default()
 			});
-			let bind = SocketAddr::new(
-				IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-				recipe::wire::PORT,
-			);
+			let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), recipe::wire::PORT);
 			let listener = recipe::wire::Server::bind(bind)?;
 			let machine = recipe::machine::Machine::probe()?;
 			let info = recipe::wire::NodeInfo::probe();

@@ -301,10 +301,13 @@ fn encode(
 					.unwrap_or(1);
 				let capped = raw.min(crate::TEXT_CONTEXT);
 				if raw > capped {
-					Write::line(data, &format!(
-						"    context  {} tokens/{} → capped to {capped}",
-						raw, a.name
-					));
+					Write::line(
+						data,
+						&format!(
+							"    context  {} tokens/{} → capped to {capped}",
+							raw, a.name
+						),
+					);
 				}
 				capped
 			}
@@ -438,9 +441,7 @@ fn admit_ceiling(
 	label: &str,
 	top_cols: &[(&str, usize)],
 ) -> anyhow::Result<()> {
-	let bytes = n
-		.saturating_mul(w)
-		.saturating_mul(mem::size_of::<f64>());
+	let bytes = n.saturating_mul(w).saturating_mul(mem::size_of::<f64>());
 	// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
 	// sized against that filesystem's free space.
 	let spill = Path::new(".recipe_spill");
@@ -602,8 +603,7 @@ impl Assembled {
 				&& self.mats[mi].is_standard_layout();
 			if compact {
 				let big_w = self.mats[mi].ncols();
-				let (mut buf, _) =
-					mem::take(&mut self.mats[mi]).into_raw_vec_and_offset();
+				let (mut buf, _) = mem::take(&mut self.mats[mi]).into_raw_vec_and_offset();
 				for i in 0..n {
 					let (ib, iw) = (i * big_w, i * w);
 					for (jc, &c) in cols.iter().enumerate() {
@@ -617,8 +617,7 @@ impl Assembled {
 		}
 
 		// General path: gather across sources / non-identity joins into a fresh matrix.
-		let mut by_col: BTreeMap<&str, usize> =
-			BTreeMap::new();
+		let mut by_col: BTreeMap<&str, usize> = BTreeMap::new();
 		for name in keep {
 			*by_col
 				.entry(name.split('=').next().unwrap_or(name))
@@ -825,8 +824,7 @@ fn assemble(
 			Some(cells),
 		) = (g, sample_cells)
 		{
-			let key_set: HashSet<&str> =
-				g_hashes.iter().map(String::as_str).collect();
+			let key_set: HashSet<&str> = g_hashes.iter().map(String::as_str).collect();
 			let ncols = cells.first().map_or(0, Vec::len);
 			let (mut best_col, mut best) = (0usize, 0usize);
 			for c in 0..ncols {
@@ -875,8 +873,7 @@ fn assemble(
 		}
 
 		let g_hashes = group_hashes(g);
-		let mut by_hash: HashMap<&str, Vec<usize>> =
-			HashMap::new();
+		let mut by_hash: HashMap<&str, Vec<usize>> = HashMap::new();
 		for (gi2, h) in g_hashes.iter().enumerate() {
 			by_hash.entry(h.as_str()).or_default().push(gi2);
 		}
@@ -1125,10 +1122,13 @@ pub fn clean_dataset(d: &mut Dataset) {
 		keep.retain(|i| kj.binary_search(i).is_ok());
 	}
 	if keep.len() < n {
-		Write::line(data, &format!(
-			"nan  dropped {} row(s) with a missing target",
-			n - keep.len()
-		));
+		Write::line(
+			data,
+			&format!(
+				"nan  dropped {} row(s) with a missing target",
+				n - keep.len()
+			),
+		);
 		d.x = d.x.select(ndarray::Axis(0), &keep);
 		let mut yd = Vec::with_capacity(keep.len() * k);
 		for &i in &keep {

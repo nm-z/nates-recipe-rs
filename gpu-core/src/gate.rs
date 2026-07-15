@@ -142,7 +142,9 @@ fn contend(fd: RawFd, f: &mut fs::File, e: io::Error) -> io::Result<()> {
 		None => Err(e),
 		Some(()) => {
 			match holder_pid(f).filter(|p| *p != CLEAN) {
-				Some(pid) => Write::wait(format!("Waiting for pid {pid} to release the GPU")),
+				Some(pid) => {
+					Write::wait(format!("Waiting for pid {pid} to release the GPU"))
+				}
 				None => Write::wait("Waiting for the GPU lock"),
 			}
 			let got = flock(fd, libc::LOCK_EX);
@@ -290,9 +292,7 @@ impl Default for Lease {
 impl Lease {
 	pub fn new() -> Lease {
 		acquire();
-		Lease {
-			_p: PhantomData,
-		}
+		Lease { _p: PhantomData }
 	}
 }
 

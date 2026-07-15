@@ -3,8 +3,11 @@ name = "lightgbm-rs"
 version = "0.1.0"
 edition = "2024"
 description = "LightGBM-equivalent gradient boosting — leaf-wise growth, GOSS, EFB — on ROCm/HIP"
-
-[workspace]
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["lightgbm", "gbdt", "goss", "efb", "gpu"]
+categories = ["science::ml"]
 
 [dependencies]
 gpu-core = { path = "../gpu-core" }

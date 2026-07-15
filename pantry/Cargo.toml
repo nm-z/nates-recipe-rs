@@ -2,6 +2,12 @@
 name = "pantry"
 version = "0.1.0"
 edition = "2024"
+description = "Dataset loading and encoding: CSV/ARFF/zip/image-dir parsing, NaN policy, and a trained char-level column-type detector"
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["csv", "arff", "dataset", "encoding", "parsing"]
+categories = ["science::ml", "parsing"]
 
 [lib]
 name = "pantry"

@@ -306,10 +306,9 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	let mut stage = recipe_infer::Stage::new();
 	let w_off = stage.push(plan.host());
 	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
-	let x_off = stage.push(
-		x.as_slice()
-			.ok_or_else(|| recipe_infer::log::Errored::new("detect: x contiguous"))?,
-	);
+	let x_off = stage.push(x
+		.as_slice()
+		.ok_or_else(|| recipe_infer::log::Errored::new("detect: x contiguous"))?);
 	let image = stage.into_host();
 	let image_floats = image.len();
 	// Detector claim (ONE drain): re-arm a parked training backing when present,

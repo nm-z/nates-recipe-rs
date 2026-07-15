@@ -1,5 +1,3 @@
-use std::process;
-use std::ptr;
 use crate::enums::{Activation, LayerKind, Loss, Metric};
 use crate::params::{ConcatDims, LayerParams, concat_layer};
 use crate::scratch::Scratch;
@@ -8,6 +6,8 @@ use gpu_core::kernels;
 use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cmp::Ordering;
+use std::process;
+use std::ptr;
 
 #[derive(Clone, Copy)]
 pub struct LossScale {

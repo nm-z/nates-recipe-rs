@@ -144,12 +144,15 @@ impl Waterfall {
 
 	pub fn report(&self) {
 		let gb = |b: usize| b as f64 / (1u64 << 30) as f64;
-		Write::line(gpu, &format!(
-			"waterfall: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB ({} blobs)",
-			gb(self.vram_bytes),
-			gb(self.ram_bytes),
-			gb(self.disk_bytes),
-			self.homes.len()
-		));
+		Write::line(
+			gpu,
+			&format!(
+				"waterfall: VRAM {:.2} GB → RAM {:.2} GB → DISK {:.2} GB ({} blobs)",
+				gb(self.vram_bytes),
+				gb(self.ram_bytes),
+				gb(self.disk_bytes),
+				self.homes.len()
+			),
+		);
 	}
 }

@@ -1,9 +1,9 @@
-use recipe_infer::log::{Errored, Write, data};
 use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
+use recipe_infer::log::{Errored, Write, data};
 use std::borrow::Cow;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -68,9 +68,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let Some(()) = Some(()).filter(|_u| delim != b' ') else {
 		return read_raw_whitespace(path);
 	};
-	let disk = fs::metadata(path)
-		.map(|m| m.len() as usize)
-		.unwrap_or(0);
+	let disk = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
 	// Read EVERY line as a record (no implicit header) so the first row can be
 	// inspected before deciding its role — a CSV carries no header flag.
 	let mut rdr = csv::ReaderBuilder::new()
@@ -165,11 +163,8 @@ pub struct RawCsv {
 
 fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	use std::io::BufRead;
-	let disk = fs::metadata(path)
-		.map(|m| m.len() as usize)
-		.unwrap_or(0);
-	let f = fs::File::open(path)
-		.with_context(|| format!("failed to open {}", path.display()))?;
+	let disk = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+	let f = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	let rdr = io::BufReader::with_capacity(1 << 20, f);
 	let mut lines = rdr.lines();
 	let first = loop {
@@ -250,8 +245,7 @@ pub fn human_bytes(b: usize) -> String {
 
 fn count_lines(path: &Path) -> Result<usize> {
 	use std::io::Read;
-	let f = fs::File::open(path)
-		.with_context(|| format!("failed to open {}", path.display()))?;
+	let f = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	let mut rdr = io::BufReader::with_capacity(1 << 20, f);
 	let mut buf = [0u8; 1 << 16];
 	let mut lines = 0usize;
@@ -386,10 +380,8 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		})
 		.collect();
 
-	let mut tables: BTreeMap<String, Vec<HashedPath>> =
-		BTreeMap::new();
-	let mut images: BTreeMap<String, Vec<HashedPath>> =
-		BTreeMap::new();
+	let mut tables: BTreeMap<String, Vec<HashedPath>> = BTreeMap::new();
+	let mut images: BTreeMap<String, Vec<HashedPath>> = BTreeMap::new();
 	for p in files {
 		let gh = group_and_hash(&p, &prefixes);
 		match classify_file(&p) {
@@ -418,14 +410,16 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					drop(Write::err(format!("WARN: skipping {}: {e}", hp.path.display())));
+					drop(Write::err(format!(
+						"WARN: skipping {}: {e}",
+						hp.path.display()
+					)));
 					None
 				}
 			})
 			.collect();
 		let mut headers: Vec<String> = Vec::new();
-		let mut col: HashMap<String, usize> =
-			HashMap::new();
+		let mut col: HashMap<String, usize> = HashMap::new();
 		for pt in &parsed {
 			for hd in &pt.headers {
 				let None = col.get(hd) else {
@@ -508,7 +502,10 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					drop(Write::err(format!("WARN: skipping image {}: {e}", p.display())));
+					drop(Write::err(format!(
+						"WARN: skipping image {}: {e}",
+						p.display()
+					)));
 					vec![f64::NAN; dim]
 				}
 			};

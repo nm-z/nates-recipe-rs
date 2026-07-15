@@ -9,7 +9,10 @@ const SEEDS: &str = "datasets/uci-seeds/seeds_dataset.txt";
 const WINE: &str = "datasets/uci-wine/wine.data";
 
 fn say(t: impl fmt::Display) {
-	set_opt(Opt { probe: true, ..opt() });
+	set_opt(Opt {
+		probe: true,
+		..opt()
+	});
 	Write::block(probe, ogdl!(&t));
 }
 

@@ -1,8 +1,8 @@
 use recipe::machine::{GpuDev, Machine, parse_config, write_config};
 
 fn sample(gpus: Vec<GpuDev>) -> Machine {
-	Machine {
-		host: "engi".to_string(),
+	return Machine {
+		host: "engi".to_owned(),
 		gpus,
 		ram: 67_169_726_464,
 		ddr5_gbs: 38.4,
@@ -11,7 +11,7 @@ fn sample(gpus: Vec<GpuDev>) -> Machine {
 		disk_size: 500_107_862_016,
 		sata_gbs: 1.9,
 		eth_gbs: 0.125,
-	}
+	};
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn config_ogdl_roundtrips() {
 		transfer_gbs: 402.3,
 	}]);
 	let mut b = sample(Vec::new());
-	b.host = "archy".to_string();
+	b.host = "archy".to_owned();
 	let text = write_config(&[a.clone(), b.clone()]);
 	let parsed = parse_config(&text);
 	assert_eq!(

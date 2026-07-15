@@ -1,7 +1,7 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime")]
+use core::ptr;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::rope::{ROPE_THETA, gpu_rope_qk_heads_inplace};
-use std::ptr;
 
 #[test]
 fn rope_heads_backward_is_inverse_rotation() {

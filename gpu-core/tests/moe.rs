@@ -1,8 +1,8 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime")]
+use core::ptr;
 use gpu_core::hip;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::moe::{gpu_moe_backward, gpu_moe_route};
-use std::ptr;
 
 #[test]
 fn moe_backward_matches_finite_diff() {

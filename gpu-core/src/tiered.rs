@@ -126,9 +126,7 @@ fn disk_free(spill: &Path) -> usize {
 	let mut st: libc::statvfs = unsafe { mem::zeroed() };
 	let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
 	match rc.cmp(&0) {
-		cmp::Ordering::Equal => {
-			(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
-		}
+		cmp::Ordering::Equal => (st.f_bavail as usize).saturating_mul(st.f_frsize as usize),
 		cmp::Ordering::Less | cmp::Ordering::Greater => 0,
 	}
 }
@@ -266,7 +264,9 @@ impl Tiered {
 
 	pub fn device_ptr(&self) -> *mut c_void {
 		if !self.is_contiguous_vram() {
-			drop(Write::err("device_ptr on a spilled buffer — stage pages instead"));
+			drop(Write::err(
+				"device_ptr on a spilled buffer — stage pages instead",
+			));
 			process::abort();
 		}
 		self.va
@@ -422,9 +422,9 @@ impl Tiered {
 								ptr::null_mut(),
 							)
 							.unwrap_or_else(|e| {
-						drop(Write::err(&format!("stage D2D: {e}")));
-						process::abort()
-					});
+								drop(Write::err(&format!("stage D2D: {e}")));
+								process::abort()
+							});
 						},
 						Residence::Ram(i) => unsafe {
 							let src = self.ram[i as usize].as_ptr() as *const c_void;
@@ -436,9 +436,9 @@ impl Tiered {
 								ptr::null_mut(),
 							)
 							.unwrap_or_else(|e| {
-						drop(Write::err(&format!("stage H2D: {e}")));
-						process::abort()
-					});
+								drop(Write::err(&format!("stage H2D: {e}")));
+								process::abort()
+							});
 						},
 						Residence::Disk(off) => {
 							self.disk
@@ -461,9 +461,11 @@ impl Tiered {
 									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
-							drop(Write::err(&format!("stage disk H2D: {e}")));
-							process::abort()
-						});
+									drop(Write::err(&format!(
+										"stage disk H2D: {e}"
+									)));
+									process::abort()
+								});
 							}
 						}
 					}

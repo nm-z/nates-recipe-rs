@@ -1,22 +1,22 @@
-use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
 use recipe_infer::{
 	Activation, GpuBuffer, LayerKind, LayerParams, SCRATCH_CONSTS, Scratch, download_vec,
 	forward_into, human_bytes,
 };
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
 static GPU: Mutex<()> = Mutex::new(());
 
 fn randn(n: usize, seed: usize) -> GpuBuffer {
 	let b = GpuBuffer::alloc(n).expect("randn alloc");
 	gpu_core::kernels::gpu_randn(n, seed, &b).expect("randn");
-	b
+	return b;
 }
 
 fn consts_buf() -> GpuBuffer {
 	let b = GpuBuffer::alloc(SCRATCH_CONSTS.len()).expect("consts");
 	b.load(&SCRATCH_CONSTS).expect("consts");
-	b
+	return b;
 }
 
 fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, GpuBuffer) {
@@ -25,7 +25,7 @@ fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, 
 		kind: LayerKind::Attn,
 		w: randn(d * d, 1),
 		b: {
-			let __up = &vec![0.0f64; d];
+			let __up = &vec![0.0_f64; d];
 			let __ub = GpuBuffer::alloc(__up.len()).expect("b");
 			__ub.load(__up).expect("b");
 			__ub
@@ -40,7 +40,7 @@ fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, 
 		wo: randn(d * d, 4),
 		heads,
 		palpha: {
-			let __up = &[0.0f64];
+			let __up = &[0.0_f64];
 			let __ub = GpuBuffer::alloc(__up.len()).expect("pa");
 			__ub.load(__up).expect("pa");
 			__ub
@@ -49,16 +49,14 @@ fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, 
 		conv_k: 0,
 		conv_stride: 0,
 	}];
-	(params, randn(n * in_dim, 7))
+	return (params, randn(n * in_dim, 7));
 }
 
 #[test]
 fn kv_cache_matches_full_attention() {
-	let _g = GPU
-		.lock()
-		.unwrap_or_else(PoisonError::into_inner);
+	let _g = GPU.lock().unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
-	let (n, heads, d, s) = (2usize, 4usize, 16usize, 1200usize);
+	let (n, heads, d, s) = (2_usize, 4_usize, 16_usize, 1200_usize);
 	let in_dim = s * d;
 	let (params, h) = attn_layer(n, heads, d, s);
 
@@ -74,7 +72,7 @@ fn kv_cache_matches_full_attention() {
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 	let cached = download_vec(&sc.acts[0], n * in_dim);
 
-	let (mut maxdiff, mut maxabs) = (0.0f64, 0.0f64);
+	let (mut maxdiff, mut maxabs) = (0.0_f64, 0.0_f64);
 	for i in 0..reference.len() {
 		maxdiff = maxdiff.max((reference[i] - cached[i]).abs());
 		maxabs = maxabs.max(reference[i].abs());
@@ -90,11 +88,9 @@ fn kv_cache_matches_full_attention() {
 
 #[test]
 fn kv_cache_bounded_memory_long_sequence() {
-	let _g = GPU
-		.lock()
-		.unwrap_or_else(PoisonError::into_inner);
+	let _g = GPU.lock().unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
-	let (n, heads, d, s) = (2usize, 2usize, 16usize, 8192usize);
+	let (n, heads, d, s) = (2_usize, 2_usize, 16_usize, 8192_usize);
 	let in_dim = s * d;
 	let full_scores_bytes = n * heads * s * s * 8;
 	let scratch_bytes = Scratch::vram_bytes(&attn_layer(n, heads, d, s).0, n, true);
@@ -109,7 +105,7 @@ fn kv_cache_bounded_memory_long_sequence() {
 	);
 	assert!(
 		scratch_bytes < full_scores_bytes / 10,
-		"kernel-path memory must be a fraction of the L² buffer"
+		"kernel-path memory must be a fraction of the L\u{b2} buffer"
 	);
 
 	let (params, h) = attn_layer(n, heads, d, s);
@@ -122,7 +118,7 @@ fn kv_cache_bounded_memory_long_sequence() {
 	let out = download_vec(&sc.acts[0], n * in_dim);
 	let ms = t0.elapsed().as_secs_f64() * 1e3;
 	assert!(
-		out.iter().all(|v| v.is_finite()),
+		out.iter().all(|v| return v.is_finite()),
 		"flash-attn output not finite"
 	);
 	eprintln!(
@@ -133,16 +129,14 @@ fn kv_cache_bounded_memory_long_sequence() {
 
 #[test]
 fn splitk_dw_matches_rocblas() {
-	let _g = GPU
-		.lock()
-		.unwrap_or_else(PoisonError::into_inner);
+	let _g = GPU.lock().unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
 	eprintln!(
 		"split-K uses device multiProcessorCount = {} (queried, not hardcoded)",
 		gpu_core::hip::cu_count()
 	);
 	for &(m, k, n) in &[
-		(4096usize, 42usize, 64usize),
+		(4096_usize, 42_usize, 64_usize),
 		(100_000, 42, 1),
 		(777, 130, 96),
 	] {
@@ -158,7 +152,7 @@ fn splitk_dw_matches_rocblas() {
 			.expect("splitk dw");
 		let r = download_vec(&reference, k * n);
 		let g = download_vec(&dw, k * n);
-		let (mut maxdiff, mut maxabs) = (0.0f64, 0.0f64);
+		let (mut maxdiff, mut maxabs) = (0.0_f64, 0.0_f64);
 		for i in 0..r.len() {
 			maxdiff = maxdiff.max((r[i] - g[i]).abs());
 			maxabs = maxabs.max(r[i].abs());

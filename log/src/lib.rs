@@ -1,4 +1,9 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+#![allow(
+	non_upper_case_globals,
+	non_camel_case_types,
+	non_snake_case,
+	dead_code
+)]
 use std::error;
 use std::fmt;
 use std::fmt::Display;
@@ -29,7 +34,9 @@ macro_rules! flags {
 	};
 }
 
-flags!(loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat);
+flags!(
+	loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+);
 pub use Flag::*;
 
 #[derive(Clone, Copy)]

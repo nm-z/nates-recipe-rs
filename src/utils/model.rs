@@ -1,6 +1,9 @@
-use gpu_core::log::{Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2, save, set_opt, time};
 use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
+use gpu_core::log::{
+	Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2,
+	save, set_opt, time,
+};
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{
 	LayerParams, PlanMode, Scaler, infer_scored, load_ogdl_str, pinned_vocab, plan_layer_params,
@@ -395,11 +398,14 @@ impl Train {
 			Some(wnet) => {
 				let cs = crate::ok_or_die(wnet.connect(), "net: connect");
 				for c in &cs {
-					Write::line(net, &format!(
-						"net  pooled {} ({} RAM)",
-						c.info.arch,
-						crate::data::human_bytes(c.info.ram as usize),
-					));
+					Write::line(
+						net,
+						&format!(
+							"net  pooled {} ({} RAM)",
+							c.info.arch,
+							crate::data::human_bytes(c.info.ram as usize),
+						),
+					);
 				}
 				Some(Arc::new(cs))
 			}
@@ -432,8 +438,7 @@ impl Train {
 				if !__fit.is_ok() {
 					drop(Write::err(format!(
 						"run: fit: {}",
-						__fit
-							.as_ref()
+						__fit.as_ref()
 							.err()
 							.map(|e| format!("{e:#}"))
 							.unwrap_or_default()
@@ -527,11 +532,14 @@ impl Train {
 			process::abort();
 		}
 		let full = fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
-		Write::line(save, &format!(
-			"saved {} ({} neurons, {key} {score:.4})",
-			full.display(),
-			rendered.neurons
-		));
+		Write::line(
+			save,
+			&format!(
+				"saved {} ({} neurons, {key} {score:.4})",
+				full.display(),
+				rendered.neurons
+			),
+		);
 	}
 }
 
@@ -603,9 +611,9 @@ impl Infer {
 						recipe_infer::shutdown();
 					}
 					None => {
-						let prompt_text = env::args()
-							.nth(1)
-							.unwrap_or_else(|| "The capital of France is".to_string());
+						let prompt_text = env::args().nth(1).unwrap_or_else(|| {
+							"The capital of France is".to_string()
+						});
 						let out = crate::ok_or_die(
 							recipe_infer::llm::generate(
 								Path::new(path),
@@ -677,7 +685,8 @@ impl Infer {
 		let sp = match Some(()).filter(|_probe| ds.has_target && !metrics.is_empty()) {
 			Some(_scored) => {
 				let ybuf = {
-					let __up = crate::some_or_die(ds.y.as_slice(), "eval: metrics: y contig");
+					let __up =
+						crate::some_or_die(ds.y.as_slice(), "eval: metrics: y contig");
 					let __ub = crate::ok_or_die(
 						GpuBuffer::alloc(__up.len()),
 						"eval: metrics: ybuf",
@@ -754,10 +763,13 @@ impl Infer {
 					0.0,
 				);
 				let sc = crate::ok_or_die(__sc, "eval: predictions");
-				Write::line(data, &format!(
-					"eval: {} samples (no target column, score unavailable)",
-					ei.n
-				));
+				Write::line(
+					data,
+					&format!(
+						"eval: {} samples (no target column, score unavailable)",
+						ei.n
+					),
+				);
 				ScorePreds {
 					score: f64::NAN,
 					preds: sc.preds,
@@ -1048,13 +1060,16 @@ fn preflight(model: &ModelInner, ds: &Dataset, net_ram: usize) -> Vec<Issue> {
 							format!(" + NET {}", crate::data::human_bytes(p.remote))
 						})
 						.unwrap_or_default();
-					Write::line(gpu, &format!(
-						"waterfall  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
-						crate::data::human_bytes(need),
-						crate::data::human_bytes(p.vram),
-						crate::data::human_bytes(p.ram),
-						crate::data::human_bytes(p.disk),
-					));
+					Write::line(
+						gpu,
+						&format!(
+							"waterfall  scratch {} -> VRAM {} + RAM {} + DISK {}{net_part}",
+							crate::data::human_bytes(need),
+							crate::data::human_bytes(p.vram),
+							crate::data::human_bytes(p.ram),
+							crate::data::human_bytes(p.disk),
+						),
+					);
 				}
 				None => {
 					issues.push(Issue {
@@ -1222,7 +1237,6 @@ impl Model {
 		self.inner.lr = rate;
 		self
 	}
-
 }
 
 impl Default for Model {

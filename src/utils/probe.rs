@@ -1,5 +1,5 @@
-use gpu_core::log::{Opt, Write, probe, set_opt};
 use anyhow::{Result, anyhow, bail, ensure};
+use gpu_core::log::{Opt, Write, probe, set_opt};
 use gpu_core::memory::{GpuBuffer, USER_GB, par_copy, par_touch};
 use std::cmp::Ordering;
 use std::env;
@@ -104,10 +104,13 @@ impl Machine {
 			Write::block(probe, &g.section(&base));
 			match measure_gpu_child(d, &g, &base) {
 				Ok(dev) => gpus.push(dev),
-				Err(e) => Write::line(probe, &format!(
-					"{}not drivable by this binary ({e}) — storage node",
-					"    ".repeat(3)
-				)),
+				Err(e) => Write::line(
+					probe,
+					&format!(
+						"{}not drivable by this binary ({e}) — storage node",
+						"    ".repeat(3)
+					),
+				),
 			}
 		}
 		for _present in (0..ngpu).next().into_iter() {
@@ -243,7 +246,9 @@ fn llc_bytes() -> Result<usize> {
 				None => (t, 1usize),
 			},
 		};
-		let Ok(v) = num.parse::<usize>() else { continue };
+		let Ok(v) = num.parse::<usize>() else {
+			continue;
+		};
 		best = best.max(v.saturating_mul(mult));
 	}
 	ensure!(best > 0, "probe: no cpu cache sizes under {dir}");
@@ -381,8 +386,7 @@ fn measure_gpu_child(dev: i32, g: &ogdl::Graph, base: &str) -> Result<GpuDev> {
 			},
 		}
 	};
-	reader
-		.join()
+	reader.join()
 		.map_err(|_panic| anyhow!("probe relay thread panicked"))?;
 	for l in rx.try_iter() {
 		take(&l);
@@ -505,9 +509,7 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 							let mut acc = 0u64;
 							for i in (off..off + len).step_by(64) {
 								acc = acc.wrapping_add(unsafe {
-									ptr::read_volatile(
-										(base + i) as *const u8,
-									)
+									ptr::read_volatile((base + i) as *const u8)
 								} as u64);
 							}
 							acc
@@ -535,8 +537,7 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
 		}
 	};
 	let dir = base.join("recipe");
-	fs::create_dir_all(&dir)
-		.map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
+	fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
 	Ok(dir)
 }
 

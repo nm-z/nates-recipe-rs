@@ -9,8 +9,8 @@
 use gpu_core::hip::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeMap;
-use std::ffi::c_void;
 use std::f64::consts;
+use std::ffi::c_void;
 use std::ptr;
 
 // ── FFI for the NEW tail-gap kernels (compiled from elementwise_unaryx.hip) ──

@@ -6,13 +6,13 @@
 //!
 //!   cargo run --release --example train_detector
 
+use anyhow::Context;
+use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::ogdl;
 use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
 	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
 };
-use anyhow::Context;
-use gpu_core::log::{Opt, Write, opt, probe, set_opt};
-use ogdl::ogdl;
 use recipe::data::{RawCsv, read_raw_csv};
 use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
 use std::fmt;
@@ -20,7 +20,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn say(t: impl fmt::Display) {
-	set_opt(Opt { probe: true, ..opt() });
+	set_opt(Opt {
+		probe: true,
+		..opt()
+	});
 	Write::block(probe, ogdl!(&t));
 }
 
@@ -452,13 +455,13 @@ const MARCH: &[(&str, &[&str], usize)] = &[
 ];
 
 fn column_cells(path: &str, col: &str) -> anyhow::Result<Vec<String>> {
-	let RawCsv { headers, rows } =
-		read_raw_csv(Path::new(path)).context("read corpus csv")?;
+	let RawCsv { headers, rows } = read_raw_csv(Path::new(path)).context("read corpus csv")?;
 	let Some(j) = headers.iter().position(|h| h == col) else {
 		Write::err(format!("corpus: column '{col}' not in {path}"))?;
 		return Ok(Vec::new());
 	};
-	Ok(rows.iter()
+	Ok(rows
+		.iter()
 		.filter_map(|r| r.get(j))
 		.filter(|v| !v.is_empty())
 		.cloned()

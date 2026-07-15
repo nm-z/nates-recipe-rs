@@ -2,17 +2,23 @@ use ogdl::ogdl;
 
 #[test]
 fn first_line_tab_is_sibling() {
-	assert_eq!(format!("{}", ogdl!(d1.r"child	child")), "d1\n\tchild\n\tchild");
+	assert_eq!(
+		format!("{}", ogdl!(d1."child	child")),
+		"d1\n\tchild\n\tchild"
+	);
 }
 
 #[test]
 fn dot_is_depth() {
-	assert_eq!(format!("{}", ogdl!(d2.r"parent".r"child")), "d2\n\tparent\n\t\tchild");
+	assert_eq!(
+		format!("{}", ogdl!(d2."parent"."child")),
+		"d2\n\tparent\n\t\tchild"
+	);
 }
 
 #[test]
 fn newline_makes_siblings() {
-	ogdl!(d3.r"
+	ogdl!(d3."
 child
 child
 ");
@@ -23,7 +29,7 @@ child
 
 #[test]
 fn leading_tab_is_depth() {
-	ogdl!(d4.r"
+	ogdl!(d4."
 parent
 	child
 ");
@@ -32,7 +38,7 @@ parent
 
 #[test]
 fn inline_tab_after_newline_is_content() {
-	ogdl!(d5.r"
+	ogdl!(d5."
 parent
 	child	dog
 ");
@@ -41,7 +47,7 @@ parent
 
 #[test]
 fn content_tab_only_in_own_name() {
-	ogdl!(d6.r"
+	ogdl!(d6."
 parent
 	child
 	dog	parrot
@@ -54,7 +60,7 @@ parent
 
 #[test]
 fn first_line_tabs_then_newline_siblings() {
-	ogdl!(d7.r"
+	ogdl!(d7."
 inline	tab
 newline
 ");
@@ -63,7 +69,7 @@ newline
 
 #[test]
 fn skeleton_doc_form() {
-	ogdl!(d14.r"
+	ogdl!(d14."
 measuring:
 	engi
 		ETH
