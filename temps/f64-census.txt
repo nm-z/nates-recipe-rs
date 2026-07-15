@@ -1,8 +1,22 @@
-f64 instruction census — measured from compiler-emitted gfx1101 ISA
+f64 instruction census, measured from compiler-emitted gfx1101 ISA
 produced by: hipcc -S --cuda-device-only --offload-arch=gfx1101 -O3 <kernel>.hip  (same -O3/gfx1101 as gpu-core/build.rs AMD_FLAGS)
 date: 2026-07-15   hipcc: HIP version: 7.2.53211-9999
 
-== aggregate (all 56 kernel files) ==
+== totals ==
+kernel .hip files:                    57
+kernels (.amdhsa_kernel count):       5599
+total instructions:                   605228   (dual-issue pair counts as one)
+unique instruction mnemonics:         399
+f64 vector ops (v_*f64*):             80583
+ops not f64:                          524645
+memory transfer instructions:         49063   (global/ds/flat/scratch/buffer/s load+store)
+  64-bit wide (b64):                  39150   (ISA memory is typeless; f64 data rides b64)
+  other widths:                       9913
+f64 FLOP mix: v_fma_f64 22307 (2 FLOP each), v_add_f64 23311 + v_mul_f64 6989 (1 FLOP each)
+  FLOP-weighted: 59.6% fused, 40.4% single-FLOP
+  op-count:      42.4% fused, 57.6% single-FLOP
+
+== aggregate (all 57 kernel files) ==
   23311  28.928  28.928  v_add_f64
   22307  27.682  56.610  v_fma_f64
   11688  14.504  71.114  v_cmp_lt_f64_e32
@@ -1155,7 +1169,7 @@ date: 2026-07-15   hipcc: HIP version: 7.2.53211-9999
  lightgbm neural_f32 paddingx shapex vmm
 
 == hardware-encoding cross-check (gemm_f64) ==
-hipcc --genco -> clang-offload-bundler --unbundle -> llvm-objdump -d on the gfx1101 device ELF
+hipcc --genco, then clang-offload-bundler --unbundle, then llvm-objdump -d on the gfx1101 device ELF
 mnemonic counts identical to compiler -S output (5 v_add_f64, 1 v_fma_f64, 1 v_mul_f64); encodings:
 	v_fma_f64 v[2:3], v[16:17], v[18:19], v[2:3]               // 000000002284: D6140002 040A2510
 	v_mul_f64 v[2:3], s[0:1], v[2:3]                           // 00000000247C: D7280002 00020400
