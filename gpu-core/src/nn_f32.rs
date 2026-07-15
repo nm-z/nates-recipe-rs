@@ -1,10 +1,14 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
+use crate::hip::{check, hipGetLastError};
+use crate::kernels::hipblas_handle;
 use crate::log::Write;
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
+use core::ffi::c_void;
+use core::ptr;
 use std::process;
-use std::ptr;
 
+/// hipBLAS operation code selecting a non-transposed matrix.
 const HIPBLAS_OP_N: u32 = 111;
 
 unsafe extern "C" {
@@ -178,33 +182,40 @@ unsafe extern "C" {
 	);
 }
 
+/// Polls the last HIP launch error and maps it to a [`HipError`].
 fn check_launch() -> Result<(), HipError> {
-	crate::callspy::tick(&crate::callspy::LAUNCH);
-	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-	let err = unsafe { crate::hip::hipGetLastError() };
-	check(err)
+	tick(&LAUNCH);
+	tick(&GET_LAST_ERROR);
+	// SAFETY: hipGetLastError only reads HIP's thread-local error slot; it dereferences no caller pointers.
+	let err = unsafe { hipGetLastError() };
+	return check(err);
 }
 
+/// Converts `v` to `i32`, aborting the process when it exceeds `i32::MAX`.
 fn safe_i32(v: usize) -> i32 {
-	if !(v <= i32::MAX as usize) {
-		drop(Write::err(&format!("size {v} overflows i32")));
-		process::abort();
+	if let Ok(n) = i32::try_from(v) {
+		return n;
 	}
-	v as i32
+	drop(Write::err(format!("size {v} overflows i32")));
+	process::abort();
 }
 
+/// # Errors
+/// Returns [`HipError`] if a HIP launch or GEMM call fails.
+#[inline]
 pub fn gpu_linear_f32(
-	x: &GpuBuffer,
-	w: &GpuBuffer,
+	input: &GpuBuffer,
+	weight: &GpuBuffer,
 	bias: &GpuBuffer,
 	m: usize,
 	n: usize,
 	k: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffers outlive the launch; ptr_raw yields valid device pointers and the dims are range-checked.
 	unsafe {
 		launch_repeat_rows_f32(
-			bias.ptr_raw() as *const c_void,
+			bias.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(m * n),
@@ -212,89 +223,109 @@ pub fn gpu_linear_f32(
 		);
 	}
 	check_launch()?;
-	let alpha = 1.0_f32;
-	let beta = 1.0_f32;
+	let alpha = 1.0f32;
+	let beta = 1.0f32;
+	// SAFETY: hipblasSgemm reads/writes the passed device buffers; all pointers are valid and dims range-checked.
 	let status = unsafe {
 		hipblasSgemm(
-			crate::kernels::hipblas_handle(),
+			hipblas_handle(),
 			HIPBLAS_OP_N,
 			HIPBLAS_OP_N,
 			safe_i32(n),
 			safe_i32(m),
 			safe_i32(k),
-			&alpha,
-			w.ptr_raw() as *const f32,
+			&raw const alpha,
+			weight.ptr_raw().cast::<f32>().cast_const(),
 			safe_i32(n),
-			x.ptr_raw() as *const f32,
+			input.ptr_raw().cast::<f32>().cast_const(),
 			safe_i32(k),
-			&beta,
-			out.ptr_raw() as *mut f32,
+			&raw const beta,
+			out.ptr_raw().cast::<f32>(),
 			safe_i32(n),
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: x and out outlive the launch; ptr_raw yields valid device pointers and n is range-checked.
 	unsafe {
 		launch_relu_f32(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_relu_backward_f32(
 	grad: &GpuBuffer,
 	act: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_relu_backward_f32(
-			grad.ptr_raw() as *const c_void,
-			act.ptr_raw() as *const c_void,
+			grad.ptr_raw().cast_const(),
+			act.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `Err` if the kernel launch reports failure.
+#[inline]
 pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_gelu_f32(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `Err` if the kernel launch reports failure.
+#[inline]
 pub fn gpu_gelu_backward_f32(
 	grad: &GpuBuffer,
 	x: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_gelu_backward_f32(
-			grad.ptr_raw() as *const c_void,
-			x.ptr_raw() as *const c_void,
+			grad.ptr_raw().cast_const(),
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `Err` if the kernel launch reports failure.
+#[inline]
 pub fn gpu_layernorm_f32(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -304,21 +335,25 @@ pub fn gpu_layernorm_f32(
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_layernorm_f32(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			gamma.ptr_raw() as *const c_void,
-			beta.ptr_raw() as *const c_void,
+			gamma.ptr_raw().cast_const(),
+			beta.ptr_raw().cast_const(),
 			safe_i32(rows),
 			safe_i32(cols),
-			eps.ptr_raw() as *const c_void,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `Err` if the kernel launch reports failure.
+#[inline]
 pub fn gpu_layernorm_backward_f32(
 	grad_y: &GpuBuffer,
 	x: &GpuBuffer,
@@ -330,23 +365,27 @@ pub fn gpu_layernorm_backward_f32(
 	grad_gamma: &GpuBuffer,
 	grad_beta: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_layernorm_backward_f32(
-			grad_y.ptr_raw() as *const c_void,
-			x.ptr_raw() as *const c_void,
-			gamma.ptr_raw() as *const c_void,
+			grad_y.ptr_raw().cast_const(),
+			x.ptr_raw().cast_const(),
+			gamma.ptr_raw().cast_const(),
 			grad_x.ptr_raw(),
 			grad_gamma.ptr_raw(),
 			grad_beta.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
-			eps.ptr_raw() as *const c_void,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns a [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_bias_add_f32(
 	x: &GpuBuffer,
 	bias: &GpuBuffer,
@@ -354,19 +393,23 @@ pub fn gpu_bias_add_f32(
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the GpuBuffer pointers are valid device allocations for these launch dims.
 	unsafe {
 		launch_bias_add_f32(
-			x.ptr_raw() as *const c_void,
-			bias.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
+			bias.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns a [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_avg_pool_2d_f32(
 	input: &GpuBuffer,
 	n_batch: usize,
@@ -379,11 +422,12 @@ pub fn gpu_avg_pool_2d_f32(
 	sw: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let out_h = (h - kh) / sh + 1;
-	let out_w = (w - kw) / sw + 1;
+	let out_h = (h - kh).div_euclid(sh) + 1;
+	let out_w = (w - kw).div_euclid(sw) + 1;
+	// SAFETY: the GpuBuffer pointers are valid device allocations for these launch dims.
 	unsafe {
 		launch_avg_pool_2d_f32(
-			input.ptr_raw() as *const c_void,
+			input.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n_batch),
 			safe_i32(c),
@@ -398,9 +442,12 @@ pub fn gpu_avg_pool_2d_f32(
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns a [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_avg_pool_2d_backward_f32(
 	grad_out: &GpuBuffer,
 	n_batch: usize,
@@ -415,9 +462,10 @@ pub fn gpu_avg_pool_2d_backward_f32(
 	out_w: usize,
 	grad_in: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the GpuBuffer pointers are valid device allocations for these launch dims.
 	unsafe {
 		launch_avg_pool_2d_backward_f32(
-			grad_out.ptr_raw() as *const c_void,
+			grad_out.ptr_raw().cast_const(),
 			grad_in.ptr_raw(),
 			safe_i32(n_batch),
 			safe_i32(c),
@@ -432,9 +480,12 @@ pub fn gpu_avg_pool_2d_backward_f32(
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns a [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_max_pool_2d_f32(
 	input: &GpuBuffer,
 	n_batch: usize,
@@ -448,11 +499,12 @@ pub fn gpu_max_pool_2d_f32(
 	out_vals: &GpuBuffer,
 	out_idx: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let out_h = (h - kh) / sh + 1;
-	let out_w = (w - kw) / sw + 1;
+	let out_h = (h - kh).div_euclid(sh) + 1;
+	let out_w = (w - kw).div_euclid(sw) + 1;
+	// SAFETY: the GpuBuffer pointers are valid device allocations for these launch dims.
 	unsafe {
 		launch_max_pool_2d_f32(
-			input.ptr_raw() as *const c_void,
+			input.ptr_raw().cast_const(),
 			out_vals.ptr_raw(),
 			out_idx.ptr_raw(),
 			safe_i32(n_batch),
@@ -468,9 +520,12 @@ pub fn gpu_max_pool_2d_f32(
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns a [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_max_pool_2d_backward_f32(
 	grad_out: &GpuBuffer,
 	indices: &GpuBuffer,
@@ -482,10 +537,11 @@ pub fn gpu_max_pool_2d_backward_f32(
 	out_w: usize,
 	grad_in: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_max_pool_2d_backward_f32(
-			grad_out.ptr_raw() as *const c_void,
-			indices.ptr_raw() as *const c_void,
+			grad_out.ptr_raw().cast_const(),
+			indices.ptr_raw().cast_const(),
 			grad_in.ptr_raw(),
 			safe_i32(n_batch),
 			safe_i32(c),
@@ -496,9 +552,14 @@ pub fn gpu_max_pool_2d_backward_f32(
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// Launches the fused LSTM cell kernel.
+///
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_lstm_cell_f32(
 	gates: &GpuBuffer,
 	n: usize,
@@ -506,9 +567,10 @@ pub fn gpu_lstm_cell_f32(
 	c: &GpuBuffer,
 	h: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_lstm_cell_f32(
-			gates.ptr_raw() as *const c_void,
+			gates.ptr_raw().cast_const(),
 			c.ptr_raw(),
 			h.ptr_raw(),
 			safe_i32(n),
@@ -516,9 +578,14 @@ pub fn gpu_lstm_cell_f32(
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// Launches the fused GRU cell kernel.
+///
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_gru_cell_f32(
 	gates: &GpuBuffer,
 	h: &GpuBuffer,
@@ -526,93 +593,120 @@ pub fn gpu_gru_cell_f32(
 	hs: usize,
 	h_new: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_gru_cell_f32(
-			gates.ptr_raw() as *const c_void,
-			h.ptr_raw() as *const c_void,
+			gates.ptr_raw().cast_const(),
+			h.ptr_raw().cast_const(),
 			h_new.ptr_raw(),
 			safe_i32(n),
 			safe_i32(hs),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// Launches the half-precision `ReLU` kernel.
+///
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_relu_f16(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// Launches the half-precision GELU kernel.
+///
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_gelu_f16(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// Launches the half-precision elementwise add kernel.
+///
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_add_f16(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_add_f16(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if the kernel launch fails.
+#[inline]
 pub fn gpu_mul_f16(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: FFI kernel launch; all pointers come from live GpuBuffers and n is range-checked.
 	unsafe {
 		launch_mul_f16(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if the kernel launch fails.
+#[inline]
 pub fn gpu_sgd_update_f32(
 	grad: &GpuBuffer,
 	lr: &GpuBuffer,
 	n: usize,
 	weights: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: FFI kernel launch; all pointers come from live GpuBuffers and n is range-checked.
 	unsafe {
 		launch_sgd_update_f32(
-			grad.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
+			grad.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
 			weights.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }

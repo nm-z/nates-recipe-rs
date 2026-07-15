@@ -1,8 +1,8 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::kernels::{check_launch, ci, cu, safe_i32};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_iota(out: *mut c_void, n: i32, stream: *mut c_void);
@@ -37,18 +37,35 @@ unsafe extern "C" {
 	);
 }
 
+/// Fills `out` with the sequence `0, 1, …, n-1`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `out` is a valid device buffer of at least `n` elements; the null stream is the default stream.
 	unsafe {
-		launch_iota(out.ptr_raw(), n as i32, ptr::null_mut());
+		launch_iota(out.ptr_raw(), n_i32, ptr::null_mut());
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Scratch size in bytes required to permute `n` keys via radix sort.
+#[must_use]
+#[inline]
 pub fn gpu_random_permutation_workspace_bytes(n: usize) -> usize {
-	unsafe { radix_perm_workspace_bytes(n as i32, ptr::null_mut()) }
+	let n_i32 = safe_i32(n);
+	// SAFETY: `radix_perm_workspace_bytes` only reads `n` to size scratch; the null stream is the default stream.
+	unsafe { return radix_perm_workspace_bytes(n_i32, ptr::null_mut()) }
 }
 
+/// Builds a random permutation of `0..n` into `out` by sorting random keys.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` or `seed` does not fit the launcher width.
+#[inline]
 pub fn gpu_random_permutation(
 	keys: &GpuBuffer,
 	keys_out: &GpuBuffer,
@@ -60,27 +77,39 @@ pub fn gpu_random_permutation(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let stream = ptr::null_mut();
+	let seed_u32 = cu(seed)?;
+	let n_i32 = ci(n)?;
+	// SAFETY: `keys` is a valid device buffer of at least `n` elements; the LCG fills it in place.
 	unsafe {
-		launch_lcg_rand(keys.ptr_raw(), n as i32, seed as u32, stream);
-		launch_iota(iota_scratch.ptr_raw(), n as i32, stream);
+		launch_lcg_rand(keys.ptr_raw(), n_i32, seed_u32, stream);
+	}
+	// SAFETY: `iota_scratch` is a valid device buffer of at least `n` elements.
+	unsafe {
+		launch_iota(iota_scratch.ptr_raw(), n_i32, stream);
 	}
 	check_launch();
+	// SAFETY: every buffer is a valid device allocation sized for `n`; `tmp` holds `tmp_bytes` of scratch.
 	unsafe {
 		launch_radix_sort_perm(
 			keys.ptr_raw(),
 			keys_out.ptr_raw(),
-			iota_scratch.ptr_raw() as *const c_void,
+			iota_scratch.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			tmp.ptr_raw(),
 			tmp_bytes,
 			stream,
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes ordered (CatBoost-style) target statistics into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` or `n_categories` does not fit in [`i32`].
+#[inline]
 pub fn gpu_ordered_target_stats(
 	cat_col_i32: &GpuBuffer,
 	target: &GpuBuffer,
@@ -93,21 +122,24 @@ pub fn gpu_ordered_target_stats(
 	n_categories: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	let n_categories_i32 = ci(n_categories)?;
+	// SAFETY: all pointers are valid device buffers sized for `n`/`n_categories`; the null stream is the default stream.
 	unsafe {
 		launch_ordered_target_stats(
-			cat_col_i32.ptr_raw() as *const c_void,
-			target.ptr_raw() as *const c_void,
-			perm_i32.ptr_raw() as *const c_void,
+			cat_col_i32.ptr_raw().cast_const(),
+			target.ptr_raw().cast_const(),
+			perm_i32.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			cat_sum.ptr_raw(),
 			cat_cnt.ptr_raw(),
-			n as i32,
-			n_categories as i32,
-			prior.ptr_raw() as *const c_void,
-			smoothing.ptr_raw() as *const c_void,
+			n_i32,
+			n_categories_i32,
+			prior.ptr_raw().cast_const(),
+			smoothing.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

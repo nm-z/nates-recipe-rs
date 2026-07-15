@@ -1,8 +1,8 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::kernels::{check_launch, ci};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_momentum_update(
@@ -91,6 +91,9 @@ unsafe extern "C" {
 	);
 }
 
+/// # Errors
+/// Returns [`HipError`] if the size exceeds `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_momentum_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -99,21 +102,26 @@ pub fn gpu_momentum_update(
 	w: &GpuBuffer,
 	v: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: all buffer pointers are live device allocations sized for n elements.
 	unsafe {
 		launch_momentum_update(
 			w.ptr_raw(),
 			v.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			momentum.ptr_raw() as *const c_void,
-			n as i32,
+			g.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			momentum.ptr_raw().cast_const(),
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if the size exceeds `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_rmsprop_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -123,22 +131,27 @@ pub fn gpu_rmsprop_update(
 	w: &GpuBuffer,
 	cache: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: all buffer pointers are live device allocations sized for n elements.
 	unsafe {
 		launch_rmsprop_update(
 			w.ptr_raw(),
 			cache.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			decay.ptr_raw() as *const c_void,
-			eps.ptr_raw() as *const c_void,
-			n as i32,
+			g.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			decay.ptr_raw().cast_const(),
+			eps.ptr_raw().cast_const(),
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_adagrad_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -147,50 +160,57 @@ pub fn gpu_adagrad_update(
 	w: &GpuBuffer,
 	accum: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: all buffer pointers are live device allocations sized for n elements.
 	unsafe {
 		launch_adagrad_update(
 			w.ptr_raw(),
 			accum.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			eps.ptr_raw() as *const c_void,
-			n as i32,
+			g.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			eps.ptr_raw().cast_const(),
+			ci(n)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a checked cast overflows or a device call fails.
+#[inline]
 pub fn gpu_lamb_phase1(
-	g: &GpuBuffer,
+	grad: &GpuBuffer,
 	b1: &GpuBuffer,
 	b2: &GpuBuffer,
 	eps: &GpuBuffer,
 	wd: &GpuBuffer,
-	t: usize,
-	n: usize,
-	w: &GpuBuffer,
-	m: &GpuBuffer,
-	v: &GpuBuffer,
+	step: usize,
+	count: usize,
+	weight: &GpuBuffer,
+	moment: &GpuBuffer,
+	velocity: &GpuBuffer,
 	tmp_upd: &GpuBuffer,
 	w_norm_sq: &GpuBuffer,
 	u_norm_sq: &GpuBuffer,
 ) -> Result<(), HipError> {
 	w_norm_sq.memset_zero(8)?;
 	u_norm_sq.memset_zero(8)?;
+	let step_i = ci(step)?;
+	let count_i = ci(count)?;
+	// SAFETY: buffer pointers are valid for the launch and the step/count bounds are checked above.
 	unsafe {
 		launch_lamb_phase1(
-			w.ptr_raw(),
-			m.ptr_raw(),
-			v.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			b1.ptr_raw() as *const c_void,
-			b2.ptr_raw() as *const c_void,
-			eps.ptr_raw() as *const c_void,
-			wd.ptr_raw() as *const c_void,
-			t as i32,
-			n as i32,
+			weight.ptr_raw(),
+			moment.ptr_raw(),
+			velocity.ptr_raw(),
+			grad.ptr_raw().cast_const(),
+			b1.ptr_raw().cast_const(),
+			b2.ptr_raw().cast_const(),
+			eps.ptr_raw().cast_const(),
+			wd.ptr_raw().cast_const(),
+			step_i,
+			count_i,
 			tmp_upd.ptr_raw(),
 			w_norm_sq.ptr_raw(),
 			u_norm_sq.ptr_raw(),
@@ -198,9 +218,12 @@ pub fn gpu_lamb_phase1(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a checked cast overflows or a device call fails.
+#[inline]
 pub fn gpu_lamb_phase2(
 	tmp_upd: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -209,21 +232,26 @@ pub fn gpu_lamb_phase2(
 	n: usize,
 	w: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: buffer pointers are valid for the launch and the element count is checked above.
 	unsafe {
 		launch_lamb_phase2(
 			w.ptr_raw(),
-			tmp_upd.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			w_norm_sq.ptr_raw() as *const c_void,
-			u_norm_sq.ptr_raw() as *const c_void,
-			n as i32,
+			tmp_upd.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			w_norm_sq.ptr_raw().cast_const(),
+			u_norm_sq.ptr_raw().cast_const(),
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a checked cast overflows or a device call fails.
+#[inline]
 pub fn gpu_lion_update(
 	g: &GpuBuffer,
 	lr: &GpuBuffer,
@@ -234,69 +262,82 @@ pub fn gpu_lion_update(
 	w: &GpuBuffer,
 	m: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: every pointer is a live GpuBuffer device allocation sized for n elements.
 	unsafe {
 		launch_lion_update(
 			w.ptr_raw(),
 			m.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			b1.ptr_raw() as *const c_void,
-			b2.ptr_raw() as *const c_void,
-			wd.ptr_raw() as *const c_void,
-			n as i32,
+			g.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			b1.ptr_raw().cast_const(),
+			b2.ptr_raw().cast_const(),
+			wd.ptr_raw().cast_const(),
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns an error if the kernel launch fails.
+#[inline]
 pub fn gpu_nadam_update(
-	g: &GpuBuffer,
+	grad: &GpuBuffer,
 	lr: &GpuBuffer,
 	b1: &GpuBuffer,
 	b2: &GpuBuffer,
 	eps: &GpuBuffer,
-	t: usize,
-	n: usize,
-	w: &GpuBuffer,
-	m: &GpuBuffer,
-	v: &GpuBuffer,
+	step: usize,
+	count: usize,
+	weight: &GpuBuffer,
+	moment: &GpuBuffer,
+	velocity: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let step_i = ci(step)?;
+	let count_i = ci(count)?;
+	// SAFETY: every pointer is a live GpuBuffer device allocation sized for count elements.
 	unsafe {
 		launch_nadam_update(
-			w.ptr_raw(),
-			m.ptr_raw(),
-			v.ptr_raw(),
-			g.ptr_raw() as *const c_void,
-			lr.ptr_raw() as *const c_void,
-			b1.ptr_raw() as *const c_void,
-			b2.ptr_raw() as *const c_void,
-			eps.ptr_raw() as *const c_void,
-			t as i32,
-			n as i32,
+			weight.ptr_raw(),
+			moment.ptr_raw(),
+			velocity.ptr_raw(),
+			grad.ptr_raw().cast_const(),
+			lr.ptr_raw().cast_const(),
+			b1.ptr_raw().cast_const(),
+			b2.ptr_raw().cast_const(),
+			eps.ptr_raw().cast_const(),
+			step_i,
+			count_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns an error if the kernel launch fails.
+#[inline]
 pub fn gpu_clip_value(
 	lo: &GpuBuffer,
 	hi: &GpuBuffer,
 	n: usize,
 	x: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: every pointer is a live GpuBuffer device allocation sized for n elements.
 	unsafe {
 		launch_clip_value(
 			x.ptr_raw(),
-			lo.ptr_raw() as *const c_void,
-			hi.ptr_raw() as *const c_void,
-			n as i32,
+			lo.ptr_raw().cast_const(),
+			hi.ptr_raw().cast_const(),
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

@@ -109,6 +109,10 @@ fn distinct_sorted(rows: &[Vec<String>], j: usize) -> Vec<String> {
 	cats
 }
 
+/// Column kinds come precomputed from `Data::set()` (`pre`); a mismatch is a
+/// wiring bug. Detection happens at load, never here: a column with neither a
+/// known attr nor a precomputed kind is a wiring bug, not a cue to run the
+/// detector mid-run.
 fn infer_attrs(
 	headers: &[String],
 	rows: &[Vec<String>],
@@ -126,9 +130,6 @@ fn infer_attrs(
 	let to_predict: Vec<usize> = (0..headers.len())
 		.filter(|&j| known.and_then(|k| k.get(j)).is_none() && !non_empty[j].is_empty())
 		.collect();
-	// pre = kinds from Data::set(); mismatch = wiring bug. Detection happens at
-	// load, never here: a column with neither a known attr nor a precomputed kind
-	// is a wiring bug, not a cue to run the detector mid-run.
 	let preds: Vec<usize> = match pre {
 		Some(pre) => {
 			if pre.len() != headers.len()
@@ -196,7 +197,9 @@ fn infer_attrs(
 
 /// Encode one column purely by its `Kind` — identical whether the column is a
 /// feature or a target. Role only decides where the produced columns are routed
-/// (X vs Y), never how they're encoded.
+/// (X vs Y), never how they're encoded. An image column holds filenames — it is
+/// the JOIN KEY into an image vector (handled in `assemble`), not a feature
+/// itself, so it emits no columns.
 fn encode_kind(
 	attr: &Attr,
 	rows: &[Vec<String>],
@@ -268,12 +271,21 @@ fn encode_kind(
 			}
 			(names, cols)
 		}
-		// An image column holds filenames — it is the JOIN KEY into an image vector
-		// (handled in `assemble`), not a feature itself, so it emits no columns.
 		Kind::Image => (Vec::new(), Vec::new()),
 	}
 }
 
+/// Attention is O(seq²) per row in both memory and compute; an unbounded text
+/// column (e.g. a 9641-token LLM response) makes a single row's score matrix
+/// tens of GB, so token sequences are bounded to a context window — a no-op for
+/// ordinary short text, a truncation only for long-form outliers. Image columns
+/// are join keys, not features (zero feature width). Each encoded feature
+/// column is scattered straight into the row-major output and dropped, instead
+/// of accumulating every column and copying afterwards — holding both was a
+/// full second copy of the ~n×proj_w matrix (the measured 2× peak). A
+/// categorical TARGET encodes to ONE class-index column (0..N-1), not a
+/// one-hot — the trainer expands it to the model's output width for CE;
+/// features keep their one-hot encoding.
 fn encode(
 	attrs: &[Attr],
 	rows: &[Vec<String>],
@@ -284,11 +296,6 @@ fn encode(
 
 	let is_target = |ai: usize| targets.contains(&ai);
 	let is_skip = |ai: usize| skip.get(ai).copied().unwrap_or(false);
-	// Attention is O(seq²) per row in both memory and compute; an unbounded text
-	// column (e.g. a 9641-token LLM response) makes a single row's score matrix tens
-	// of GB. Bound the token sequence to a context window — a no-op for ordinary
-	// short text (rows under the window keep their full length), a truncation only
-	// for the long-form outliers that would otherwise be untrainable.
 	let text_seq_lens: Vec<usize> = attrs
 		.iter()
 		.enumerate()
@@ -318,7 +325,6 @@ fn encode(
 		Kind::Numeric | Kind::Temporal | Kind::Ordinal(_) => 1,
 		Kind::Categorical(c) => c.len(),
 		Kind::Text(_) => text_seq_lens[ai].max(1),
-		// Image columns are join keys, not features — zero feature width.
 		Kind::Image => 0,
 	};
 	let proj_w: usize = attrs
@@ -336,11 +342,6 @@ fn encode(
 	admit_ceiling(n, proj_w, "encoded", &top)?;
 
 	let mut names: Vec<String> = Vec::with_capacity(proj_w);
-	// Scatter each encoded feature column straight into the row-major output and drop
-	// it, instead of accumulating every column in a `Vec<Vec<f64>>` and copying the
-	// whole lot into `dat` afterwards — holding both was a full second copy of the
-	// ~n×proj_w matrix (the measured 2× peak). proj_w is the exact feature width, so
-	// the output is sized once up front and filled column by column.
 	let w = proj_w;
 	let mut dat = alloc_matrix(n, w, "encoded")?;
 	let mut jc = 0usize;
@@ -349,10 +350,6 @@ fn encode(
 		if is_skip(ai) && !is_target(ai) {
 			continue;
 		}
-		// A categorical TARGET encodes to ONE class-index column (0..N-1), not a
-		// one-hot — the trainer expands it to the model's output width for CE (so a
-		// declared class count above what the dat shows still works). Features keep
-		// their one-hot encoding (role decides target-index vs feature-one-hot here).
 		let (cnames, ccols) = match (&attr.kind, is_target(ai)) {
 			(Kind::Categorical(cats), true) => {
 				let mut col = vec![f64::NAN; n];
@@ -435,6 +432,8 @@ impl error::Error for CeilingExceeded {}
 /// tier is unreachable during this phase and admitting against it produced 64 GB
 /// allocator aborts instead of diagnostics. On rejection it prints a one-line
 /// autopsy (largest bucket first) then returns the typed `CeilingExceeded`.
+/// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
+/// sized against that filesystem's free space.
 fn admit_ceiling(
 	n: usize,
 	w: usize,

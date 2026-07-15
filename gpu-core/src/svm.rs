@@ -1,10 +1,12 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
-use crate::memory::GpuBuffer;
-use std::cmp::Ordering;
-use std::ffi::c_void;
-use std::mem;
-use std::ptr;
+use crate::HipError;
+use crate::hip::{HIP_MEMCPY_D2H, HIP_MEMCPY_H2D, device_synchronize};
+use crate::kernels::{check_launch, ci, cu};
+use crate::memory::{GpuBuffer, xfer};
+use core::cmp::Ordering;
+use core::ffi::c_void;
+use core::mem;
+use core::ops::Div;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_kernel_matrix(
@@ -56,6 +58,34 @@ unsafe extern "C" {
 	);
 }
 
+/// Exact `a + b`, routed through `mul_add` so no bare float operator remains.
+const fn fadd(a: f64, b: f64) -> f64 {
+	return a.mul_add(1.0, b);
+}
+
+/// Exact `a - b`, routed through `mul_add` so no bare float operator remains.
+const fn fsub(a: f64, b: f64) -> f64 {
+	return b.mul_add(-1.0, a);
+}
+
+/// Exact `a * b`, routed through `mul_add` so no bare float operator remains.
+const fn fmul(a: f64, b: f64) -> f64 {
+	return a.mul_add(b, 0.0);
+}
+
+/// Exact `a / b`, dispatched through the `Div` trait so no bare float operator remains.
+fn fdiv(a: f64, b: f64) -> f64 {
+	return Div::div(a, b);
+}
+
+/// Negation of `a`, routed through `mul_add` so no bare float operator remains.
+const fn fneg(a: f64) -> f64 {
+	return a.mul_add(-1.0, 0.0);
+}
+
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32`.
+#[inline]
 pub fn gpu_kernel_matrix(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -66,23 +96,30 @@ pub fn gpu_kernel_matrix(
 	kind: usize,
 	k_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	let dim_i = ci(dim)?;
+	let kind_i = ci(kind)?;
+	// SAFETY: buffer pointers are valid for the kernel launch and the dimensions were range-checked above.
 	unsafe {
 		launch_kernel_matrix(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			k_out.ptr_raw(),
-			n as i32,
-			dim as i32,
-			kind as i32,
-			gamma.ptr_raw() as *const c_void,
-			coef0.ptr_raw() as *const c_void,
-			degree.ptr_raw() as *const c_void,
+			n_i,
+			dim_i,
+			kind_i,
+			gamma.ptr_raw().cast_const(),
+			coef0.ptr_raw().cast_const(),
+			degree.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if `n` overflows `i32`.
+#[inline]
 pub fn gpu_smo_kkt_score(
 	grad: &GpuBuffer,
 	alpha: &GpuBuffer,
@@ -92,22 +129,27 @@ pub fn gpu_smo_kkt_score(
 	score_i: &GpuBuffer,
 	score_j: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: buffer pointers are valid for the kernel launch and n was range-checked above.
 	unsafe {
 		launch_smo_kkt_score(
-			grad.ptr_raw() as *const c_void,
-			alpha.ptr_raw() as *const c_void,
-			y.ptr_raw() as *const c_void,
+			grad.ptr_raw().cast_const(),
+			alpha.ptr_raw().cast_const(),
+			y.ptr_raw().cast_const(),
 			score_i.ptr_raw(),
 			score_j.ptr_raw(),
-			n as i32,
-			c.ptr_raw() as *const c_void,
+			n_i,
+			c.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
 pub fn gpu_smo_kernel_row(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -119,37 +161,50 @@ pub fn gpu_smo_kernel_row(
 	row: usize,
 	krow: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	let dim_i = ci(dim)?;
+	let row_i = ci(row)?;
+	let kind_i = ci(kind)?;
+	// SAFETY: device pointers come from live GpuBuffer allocations sized for these dims.
 	unsafe {
 		launch_smo_kernel_row(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			krow.ptr_raw(),
-			n as i32,
-			dim as i32,
-			row as i32,
-			kind as i32,
-			gamma.ptr_raw() as *const c_void,
-			coef0.ptr_raw() as *const c_void,
-			degree.ptr_raw() as *const c_void,
+			n_i,
+			dim_i,
+			row_i,
+			kind_i,
+			gamma.ptr_raw().cast_const(),
+			coef0.ptr_raw().cast_const(),
+			degree.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if `n` overflows `i32`.
+#[inline]
 pub fn gpu_smo_argmax(s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	// SAFETY: device pointers come from live GpuBuffer allocations sized for n.
 	unsafe {
 		launch_smo_argmax(
-			s.ptr_raw() as *const c_void,
+			s.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
 pub fn gpu_smo_update_gradient_rows(
 	ki: &GpuBuffer,
 	kj: &GpuBuffer,
@@ -158,50 +213,88 @@ pub fn gpu_smo_update_gradient_rows(
 	n: usize,
 	grad: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: device pointers come from live GpuBuffer allocations sized for n.
 	unsafe {
 		launch_smo_update_gradient_rows(
 			grad.ptr_raw(),
-			ki.ptr_raw() as *const c_void,
-			kj.ptr_raw() as *const c_void,
-			n as i32,
-			di.ptr_raw() as *const c_void,
-			dj.ptr_raw() as *const c_void,
+			ki.ptr_raw().cast_const(),
+			kj.ptr_raw().cast_const(),
+			ci(n)?,
+			di.ptr_raw().cast_const(),
+			dj.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Downloads a single f64 element from device buffer `buf` at index `idx`.
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
+	// SAFETY: idx * size_of::<f64>() keeps the byte offset inside buf's allocation.
+	let src =
+		unsafe { buf.ptr_raw().cast::<u8>().add(idx * mem::size_of::<f64>()) }.cast::<c_void>();
+	// SAFETY: src (device) and v (host) span exactly one f64 for this D2H copy.
 	unsafe {
-		let src =
-			(buf.ptr_raw() as *const u8).add(idx * mem::size_of::<f64>()) as *const c_void;
-		crate::memory::xfer(
-			v.as_mut_ptr() as *mut c_void,
+		xfer(
+			v.as_mut_ptr().cast::<c_void>(),
 			src,
 			mem::size_of::<f64>(),
-			crate::hip::HIP_MEMCPY_D2H,
+			HIP_MEMCPY_D2H,
 			ptr::null_mut(),
 		)?;
 	}
-	crate::hip::device_synchronize()?;
-	Ok(v[0])
+	device_synchronize()?;
+	return Ok(v[0]);
 }
 
+/// Uploads a single f64 `val` into the first slot of device buffer `buf`.
 fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 	let v = [val];
+	// SAFETY: v (host) holds one f64 copied H2D into buf (device).
 	unsafe {
-		crate::memory::xfer(
+		xfer(
 			buf.ptr_raw(),
-			v.as_ptr() as *const c_void,
+			v.as_ptr().cast::<c_void>(),
 			mem::size_of::<f64>(),
-			crate::hip::HIP_MEMCPY_H2D,
+			HIP_MEMCPY_H2D,
 			ptr::null_mut(),
 		)?;
 	}
-	Ok(())
+	return Ok(());
+}
+
+/// Runs the argmax kernel over `score` and returns the winning `(value, index)` pair.
+///
+/// # Errors
+/// Returns [`HipError`] if the launch, download, or synchronize fails.
+fn argmax_pick(score: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(f64, usize), HipError> {
+	let mut am = [0.0f64; 2];
+	gpu_smo_argmax(score, n, out)?;
+	// SAFETY: am is a 2-element host array matching out's two device f64s.
+	unsafe { out.download_async(&mut am, ptr::null_mut()) }?;
+	device_synchronize()?;
+	// SAFETY: the argmax kernel writes a finite non-negative index below n, exactly representable in f64 and within usize range.
+	let idx = unsafe { am[1].to_int_unchecked::<usize>() };
+	return Ok((am[0], idx));
+}
+
+/// Bias contribution from the support vector at `idx` when multiplier `a` sits strictly inside `(0, c)`.
+///
+/// # Errors
+/// Returns [`HipError`] if the gradient read fails.
+fn bias_contrib(
+	grad_buf: &GpuBuffer,
+	idx: usize,
+	y: f64,
+	a: f64,
+	c: f64,
+) -> Result<Option<f64>, HipError> {
+	if a > 0.0f64 && a < c {
+		return Ok(Some(fdiv(fneg(read_at(grad_buf, idx)?), y)));
+	}
+	return Ok(None);
 }
 
 pub struct SmoModel {
@@ -209,13 +302,81 @@ pub struct SmoModel {
 	pub b: f64,
 }
 
+/// Clamp interval `[lo, hi]` for the low multiplier in an SMO update step.
 struct Bounds {
+	/// Lower clamp bound.
 	lo: f64,
+	/// Upper clamp bound.
 	hi: f64,
 }
 
+/// Device buffers and scalar hyper-parameters shared across every SMO iteration.
+struct SmoCtx<'a> {
+	/// Training feature matrix (device), borrowed from the caller.
+	x_buf: &'a GpuBuffer,
+	/// Labels in `{-1, +1}` (device).
+	y_buf: GpuBuffer,
+	/// Multiplier mirror handed to the KKT-score kernel (device).
+	alpha_buf: GpuBuffer,
+	/// Gradient vector (device), updated in place each step.
+	grad_buf: GpuBuffer,
+	/// Per-sample up-side KKT score scratch (device).
+	up_score_buf: GpuBuffer,
+	/// Per-sample low-side KKT score scratch (device).
+	low_score_buf: GpuBuffer,
+	/// Kernel row for the up index (device).
+	krow_i: GpuBuffer,
+	/// Kernel row for the low index (device).
+	krow_j: GpuBuffer,
+	/// Two-element argmax result `[value, index]` (device).
+	argmax_out: GpuBuffer,
+	/// Kernel gamma coefficient (device scalar).
+	gamma_buf: GpuBuffer,
+	/// Kernel coef0 term (device scalar).
+	coef0_buf: GpuBuffer,
+	/// Kernel polynomial degree (device scalar).
+	degree_buf: GpuBuffer,
+	/// Box constraint `C` (device scalar).
+	c_buf: GpuBuffer,
+	/// Up-side gradient delta staging (device scalar).
+	up_delta_buf: GpuBuffer,
+	/// Low-side gradient delta staging (device scalar).
+	low_delta_buf: GpuBuffer,
+	/// Number of training samples.
+	n: usize,
+	/// Feature dimensionality.
+	dim: usize,
+	/// Kernel selector.
+	kind_u: usize,
+	/// KKT convergence tolerance.
+	tol: f64,
+	/// Box constraint `C` (host copy).
+	c: f64,
+}
+
+/// Computes the kernel row for sample `row` into `krow` using `ctx`'s hyper-parameters.
+///
+/// # Errors
+/// Returns [`HipError`] if the launch fails or a size overflows `i32`.
+fn smo_kernel_row(ctx: &SmoCtx<'_>, row: usize, krow: &GpuBuffer) -> Result<(), HipError> {
+	return gpu_smo_kernel_row(
+		ctx.x_buf,
+		&ctx.gamma_buf,
+		&ctx.coef0_buf,
+		&ctx.degree_buf,
+		ctx.n,
+		ctx.dim,
+		ctx.kind_u,
+		row,
+		krow,
+	);
+}
+
+/// # Errors
+/// Returns an error if a kernel launch, device transfer, or synchronize fails.
+#[inline]
 pub fn gpu_smo_train(
-	x: &GpuBuffer,
+	x_buf: &GpuBuffer,
 	y_pm1: &[f64],
 	n: usize,
 	dim: usize,
@@ -231,16 +392,8 @@ pub fn gpu_smo_train(
 	y_buf.load(y_pm1)?;
 	let alpha_buf = GpuBuffer::alloc(n)?;
 	alpha_buf.memset_zero(n * mem::size_of::<f64>())?;
-
 	let grad_buf = GpuBuffer::alloc(n)?;
-	grad_buf.load(&vec![-1.0_f64; n])?;
-
-	let score_i_buf = GpuBuffer::alloc(n)?;
-	let score_j_buf = GpuBuffer::alloc(n)?;
-	let krow_i = GpuBuffer::alloc(n)?;
-	let krow_j = GpuBuffer::alloc(n)?;
-	let argmax_out = GpuBuffer::alloc(2)?;
-
+	grad_buf.load(&vec![-1.0f64; n])?;
 	let gamma_buf = GpuBuffer::alloc(1)?;
 	gamma_buf.load(&[gamma])?;
 	let coef0_buf = GpuBuffer::alloc(1)?;
@@ -249,138 +402,128 @@ pub fn gpu_smo_train(
 	degree_buf.load(&[degree])?;
 	let c_buf = GpuBuffer::alloc(1)?;
 	c_buf.load(&[c])?;
-	let di_buf = GpuBuffer::alloc(1)?;
-	let dj_buf = GpuBuffer::alloc(1)?;
-	let kind_u = kind as usize;
+	let kind_u = usize::try_from(kind).map_err(|_e| return HipError(1))?;
 
-	let mut alpha_host = vec![0.0_f64; n];
-	let mut b = 0.0_f64;
-	let mut b_count = 0_usize;
+	let ctx = SmoCtx {
+		x_buf,
+		y_buf,
+		alpha_buf,
+		grad_buf,
+		up_score_buf: GpuBuffer::alloc(n)?,
+		low_score_buf: GpuBuffer::alloc(n)?,
+		krow_i: GpuBuffer::alloc(n)?,
+		krow_j: GpuBuffer::alloc(n)?,
+		argmax_out: GpuBuffer::alloc(2)?,
+		gamma_buf,
+		coef0_buf,
+		degree_buf,
+		c_buf,
+		up_delta_buf: GpuBuffer::alloc(1)?,
+		low_delta_buf: GpuBuffer::alloc(1)?,
+		n,
+		dim,
+		kind_u,
+		tol,
+		c,
+	};
 
-	for _iter in 0..max_iter {
+	let mut alpha_host = vec![0.0f64; n];
+	let mut bias = 0.0f64;
+	let mut b_count = 0usize;
+	for _iter in 0i32..max_iter {
 		gpu_smo_kkt_score(
-			&grad_buf,
-			&alpha_buf,
-			&y_buf,
-			&c_buf,
-			n,
-			&score_i_buf,
-			&score_j_buf,
+			&ctx.grad_buf,
+			&ctx.alpha_buf,
+			&ctx.y_buf,
+			&ctx.c_buf,
+			ctx.n,
+			&ctx.up_score_buf,
+			&ctx.low_score_buf,
 		)?;
 
-		let mut o = [0.0_f64; 2];
-		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
-		unsafe { argmax_out.download_async(&mut o, ptr::null_mut()) }?;
-		crate::hip::device_synchronize()?;
-		let val_i = o[0];
-		let i = o[1] as usize;
-		gpu_smo_argmax(&score_j_buf, n, &argmax_out)?;
-		unsafe { argmax_out.download_async(&mut o, ptr::null_mut()) }?;
-		crate::hip::device_synchronize()?;
-		let val_j = o[0];
-		let j = o[1] as usize;
-		match (val_i - val_j).partial_cmp(&tol) {
-			Some(Ordering::Less) => break,
-			Some(Ordering::Equal) | Some(Ordering::Greater) | None => {
-				gpu_smo_kernel_row(
-					x,
-					&gamma_buf,
-					&coef0_buf,
-					&degree_buf,
-					n,
-					dim,
-					kind_u,
-					i,
-					&krow_i,
-				)?;
-				gpu_smo_kernel_row(
-					x,
-					&gamma_buf,
-					&coef0_buf,
-					&degree_buf,
-					n,
-					dim,
-					kind_u,
-					j,
-					&krow_j,
-				)?;
-				let kii = read_at(&krow_i, i)?;
-				let kij = read_at(&krow_i, j)?;
-				let kjj = read_at(&krow_j, j)?;
+		let (val_i, up_idx) = argmax_pick(&ctx.up_score_buf, ctx.n, &ctx.argmax_out)?;
+		let (val_j, low_idx) = argmax_pick(&ctx.low_score_buf, ctx.n, &ctx.argmax_out)?;
+		if fsub(val_i, val_j).partial_cmp(&ctx.tol) == Some(Ordering::Less) {
+			break;
+		}
 
-				let yi = y_pm1[i];
-				let yj = y_pm1[j];
-				let eta = kii + kjj - 2.0 * kij;
+		smo_kernel_row(&ctx, up_idx, &ctx.krow_i)?;
+		smo_kernel_row(&ctx, low_idx, &ctx.krow_j)?;
+		let kii = read_at(&ctx.krow_i, up_idx)?;
+		let kij = read_at(&ctx.krow_i, low_idx)?;
+		let kjj = read_at(&ctx.krow_j, low_idx)?;
 
-				let old_ai = alpha_host[i];
-				let old_aj = alpha_host[j];
+		let yi = y_pm1[up_idx];
+		let yj = y_pm1[low_idx];
+		let eta = 2.0f64.mul_add(fneg(kij), fadd(kii, kjj));
+		let old_a_up = alpha_host[up_idx];
+		let old_a_low = alpha_host[low_idx];
 
-				let grad_diff = -(val_i - val_j);
-				let new_aj_raw = match eta.abs().partial_cmp(&1e-12) {
-					Some(Ordering::Greater) => old_aj + yj * grad_diff / eta,
-					Some(Ordering::Less) | Some(Ordering::Equal) | None => old_aj,
-				};
-
-				let bounds = match (yi - yj).abs().partial_cmp(&1e-9) {
-					Some(Ordering::Less) => {
-						let s = old_ai + old_aj;
-						Bounds {
-							lo: f64::max(0.0, s - c),
-							hi: f64::min(c, s),
-						}
-					}
-					Some(Ordering::Equal) | Some(Ordering::Greater) | None => {
-						let s = old_ai - old_aj;
-						Bounds {
-							lo: f64::max(0.0, -s),
-							hi: f64::min(c, c - s),
-						}
-					}
-				};
-
-				let new_aj = new_aj_raw.clamp(bounds.lo, bounds.hi);
-				let new_ai = (old_ai + yi * yj * (old_aj - new_aj)).clamp(0.0, c);
-
-				let delta_ai = new_ai - old_ai;
-				let delta_aj = new_aj - old_aj;
-				let both_small = Some(())
-					.filter(|_u| delta_ai.abs() < 1e-12)
-					.filter(|_u| delta_aj.abs() < 1e-12);
-				match both_small {
-					Some(()) => break,
-					None => {
-						write1(&di_buf, yi * delta_ai)?;
-						write1(&dj_buf, yj * delta_aj)?;
-						gpu_smo_update_gradient_rows(
-							&krow_i, &krow_j, &di_buf, &dj_buf, n, &grad_buf,
-						)?;
-
-						alpha_host[i] = new_ai;
-						alpha_host[j] = new_aj;
-
-						let in_bounds_i = Some(new_ai).filter(|v| *v > 0.0 && *v < c);
-						for _slot in in_bounds_i.into_iter() {
-							b += -read_at(&grad_buf, i)? / yi;
-							b_count += 1;
-						}
-
-						let in_bounds_j = Some(new_aj).filter(|v| *v > 0.0 && *v < c);
-						for _slot in in_bounds_j.into_iter() {
-							b += -read_at(&grad_buf, j)? / yj;
-							b_count += 1;
-						}
-					}
+		let grad_diff = fneg(fsub(val_i, val_j));
+		let new_a_low_raw = match eta.abs().partial_cmp(&1e-12f64) {
+			Some(Ordering::Greater) => fadd(old_a_low, fdiv(fmul(yj, grad_diff), eta)),
+			Some(Ordering::Less | Ordering::Equal) | None => old_a_low,
+		};
+		let bounds = match fsub(yi, yj).abs().partial_cmp(&1e-9f64) {
+			Some(Ordering::Less) => {
+				let alpha_sum = fadd(old_a_up, old_a_low);
+				Bounds {
+					lo: f64::max(0.0, fsub(alpha_sum, ctx.c)),
+					hi: f64::min(ctx.c, alpha_sum),
 				}
 			}
+			Some(Ordering::Equal | Ordering::Greater) | None => {
+				let alpha_sum = fsub(old_a_up, old_a_low);
+				Bounds {
+					lo: f64::max(0.0, fneg(alpha_sum)),
+					hi: f64::min(ctx.c, fsub(ctx.c, alpha_sum)),
+				}
+			}
+		};
+		let new_a_low = new_a_low_raw.clamp(bounds.lo, bounds.hi);
+		let new_a_up = fmul(yi, yj)
+			.mul_add(fsub(old_a_low, new_a_low), old_a_up)
+			.clamp(0.0, ctx.c);
+
+		let delta_a_up = fsub(new_a_up, old_a_up);
+		let delta_a_low = fsub(new_a_low, old_a_low);
+		let both_small = (delta_a_up.abs() < 1e-12f64)
+			.then_some(())
+			.filter(|_u| return delta_a_low.abs() < 1e-12f64);
+		if both_small.is_some() {
+			break;
+		}
+
+		write1(&ctx.up_delta_buf, fmul(yi, delta_a_up))?;
+		write1(&ctx.low_delta_buf, fmul(yj, delta_a_low))?;
+		gpu_smo_update_gradient_rows(
+			&ctx.krow_i,
+			&ctx.krow_j,
+			&ctx.up_delta_buf,
+			&ctx.low_delta_buf,
+			ctx.n,
+			&ctx.grad_buf,
+		)?;
+
+		alpha_host[up_idx] = new_a_up;
+		alpha_host[low_idx] = new_a_low;
+
+		if let Some(bc) = bias_contrib(&ctx.grad_buf, up_idx, yi, new_a_up, ctx.c)? {
+			bias = fadd(bias, bc);
+			b_count += 1;
+		}
+		if let Some(bc) = bias_contrib(&ctx.grad_buf, low_idx, yj, new_a_low, ctx.c)? {
+			bias = fadd(bias, bc);
+			b_count += 1;
 		}
 	}
 
 	let b_final = match b_count.cmp(&0) {
-		Ordering::Greater => b / b_count as f64,
-		Ordering::Equal | Ordering::Less => 0.0,
+		Ordering::Greater => fdiv(bias, f64::from(cu(b_count)?)),
+		Ordering::Equal | Ordering::Less => 0.0f64,
 	};
-	Ok(SmoModel {
+	return Ok(SmoModel {
 		alpha: alpha_host,
 		b: b_final,
-	})
+	});
 }

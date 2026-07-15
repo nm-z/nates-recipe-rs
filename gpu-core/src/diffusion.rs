@@ -1,9 +1,11 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
+use crate::hip::{check, device_synchronize, hipGetLastError};
 use crate::kernels::{gpu_copy_into, safe_i32};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::mem;
-use std::ptr;
+use core::ffi::c_void;
+use core::mem;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_diffusionx_entropy_gated_step(
@@ -26,12 +28,19 @@ unsafe extern "C" {
 	);
 }
 
+/// Records the launch counters and returns any pending HIP launch error.
 fn e() -> Result<(), HipError> {
-	crate::callspy::tick(&crate::callspy::LAUNCH);
-	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-	check(unsafe { crate::hip::hipGetLastError() })
+	tick(&LAUNCH);
+	tick(&GET_LAST_ERROR);
+	// SAFETY: hipGetLastError only reads and clears the calling thread's last HIP error and is always sound to call.
+	return check(unsafe { hipGetLastError() });
 }
 
+/// Runs one entropy-gated diffusion step, writing the accept and renoise masks.
+///
+/// # Errors
+/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
+#[inline]
 pub fn gpu_entropy_gated_step(
 	logits: &GpuBuffer,
 	canvas: &GpuBuffer,
@@ -41,21 +50,27 @@ pub fn gpu_entropy_gated_step(
 	accepted: &GpuBuffer,
 	renoise: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: every buffer is a valid device allocation sized for n_positions and vocab, matching the launcher's bounds.
 	unsafe {
 		launch_diffusionx_entropy_gated_step(
-			logits.ptr_raw() as *const c_void,
-			canvas.ptr_raw() as *const c_void,
+			logits.ptr_raw().cast_const(),
+			canvas.ptr_raw().cast_const(),
 			accepted.ptr_raw(),
 			renoise.ptr_raw(),
-			entropy_bound.ptr_raw() as *const c_void,
+			entropy_bound.ptr_raw().cast_const(),
 			safe_i32(n_positions),
 			safe_i32(vocab),
 			ptr::null_mut(),
 		);
 	}
-	e()
+	return e();
 }
 
+/// Commits accepted tokens into `canvas` and folds renoise into `committed`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`] or the launch fails.
+#[inline]
 pub fn gpu_diffusion_commit(
 	accepted: &GpuBuffer,
 	renoise: &GpuBuffer,
@@ -63,24 +78,30 @@ pub fn gpu_diffusion_commit(
 	canvas: &GpuBuffer,
 	committed: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: every buffer is a valid device allocation of at least n elements, matching the launcher's bounds.
 	unsafe {
 		launch_diffusionx_commit(
 			canvas.ptr_raw(),
-			accepted.ptr_raw() as *const c_void,
-			renoise.ptr_raw() as *const c_void,
+			accepted.ptr_raw().cast_const(),
+			renoise.ptr_raw().cast_const(),
 			committed.ptr_raw(),
 			safe_i32(n),
 			ptr::null_mut(),
 		);
 	}
-	e()
+	return e();
 }
 
-pub struct DiffusionSample {
+pub struct Sample {
 	pub canvas: GpuBuffer,
 	pub steps: usize,
 }
 
+/// Iteratively denoises `initial_canvas` until every position has committed.
+///
+/// # Errors
+/// Returns [`HipError`] if an allocation, a launch, or a device transfer fails.
+#[inline]
 pub fn gpu_diffusion_sample(
 	mut logits_fn: impl FnMut(&GpuBuffer) -> Result<GpuBuffer, HipError>,
 	initial_canvas: &GpuBuffer,
@@ -88,7 +109,7 @@ pub fn gpu_diffusion_sample(
 	max_steps: usize,
 	n_positions: usize,
 	vocab: usize,
-) -> Result<DiffusionSample, HipError> {
+) -> Result<Sample, HipError> {
 	let canvas = GpuBuffer::alloc(n_positions)?;
 	gpu_copy_into(initial_canvas, n_positions, &canvas)?;
 	let committed = GpuBuffer::alloc_bytes(n_positions * mem::size_of::<f64>())?;
@@ -112,12 +133,12 @@ pub fn gpu_diffusion_sample(
 			&renoise,
 		)?;
 		gpu_diffusion_commit(&accepted, &renoise, n_positions, &canvas, &committed)?;
+		// SAFETY: host holds n_positions f64 slots matching committed's element count for the async copy.
 		unsafe { committed.download_async(&mut host, ptr::null_mut()) }?;
-		crate::hip::device_synchronize()?;
-		match host.iter().find(|&&c| c == 0.0) {
-			None => break,
-			Some(_pending) => continue,
+		device_synchronize()?;
+		if !host.iter().any(|&c| return c == 0.0f64) {
+			break;
 		}
 	}
-	Ok(DiffusionSample { canvas, steps })
+	return Ok(Sample { canvas, steps });
 }

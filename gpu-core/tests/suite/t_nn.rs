@@ -1,7 +1,7 @@
 use gpu_core::attention::{
 	gpu_bn_update_running, gpu_causal_softmax_rows, gpu_embedding_backward, gpu_im2col_2d_ext,
 	gpu_mha_merge, gpu_mha_split, gpu_positional_encoding, gpu_rmsnorm, gpu_rmsnorm_backward,
-	gpu_rope, gpu_scaled_dot_product_attention,
+	gpu_rope, gpu_scaled_dot_product_attn,
 };
 use gpu_core::memory::GpuBuffer;
 use gpu_core::nn_f32::{
@@ -499,7 +499,7 @@ fn test_sdpa_noncausal() {
 	let v = GpuBuffer::upload_f32(&v_data).unwrap();
 
 	let out = GpuBuffer::zeros_f32(4).unwrap();
-	gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, 0, &out).unwrap();
+	gpu_scaled_dot_product_attn(&q, &k, &v, 1, 2, 2, 0, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];
@@ -523,7 +523,7 @@ fn test_sdpa_causal() {
 	let v = GpuBuffer::upload_f32(&v_data).unwrap();
 
 	let out = GpuBuffer::zeros_f32(4).unwrap();
-	gpu_scaled_dot_product_attention(&q, &k, &v, 1, 2, 2, 1, &out).unwrap();
+	gpu_scaled_dot_product_attn(&q, &k, &v, 1, 2, 2, 1, &out).unwrap();
 	sync();
 
 	let mut got = vec![0.0f32; 4];

@@ -6,7 +6,7 @@
 // not vacuously true. New ops live in src/kernels/elementwise_unaryx.hip and are
 // reached through the auto-wired launch_elementwise_unaryx_* C symbols.
 
-use gpu_core::hip::HipError;
+use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeMap;
 use std::f64::consts;

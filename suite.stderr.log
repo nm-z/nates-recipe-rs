@@ -1,0 +1,433 @@
+   Compiling ogdl v0.1.0 (/home/nate/Desktop/nates-recipe-rs/ogdl)
+   Compiling log v1.0.0 (/home/nate/Desktop/nates-recipe-rs/log)
+   Compiling gpu-core v0.1.0 (/home/nate/Desktop/nates-recipe-rs/gpu-core)
+   Compiling recipe-infer v0.1.0 (/home/nate/Desktop/nates-recipe-rs/recipe-infer)
+   Compiling pantry v0.1.0 (/home/nate/Desktop/nates-recipe-rs/pantry)
+   Compiling recipe v0.1.1 (/home/nate/Desktop/nates-recipe-rs)
+    Finished `test` profile [optimized + debuginfo] target(s) in 15.42s
+     Running unittests src/lib.rs (target/debug/deps/recipe-63b464835d840299)
+     Running tests/all.rs (target/debug/deps/all-24506bfc28ba93e7)
+[S] GPU-LOCK acquired wait=0.0s
+PASS catboost-rs/catboost_rs/tests::test_categorical_roundtrip 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_invalid_inputs 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_multiclass_predict 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_ordered_boosting_divergent_models 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_overfit_binary 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_sanity_depth1 0.0s cached
+PASS catboost-rs/catboost_rs/tests::test_ts_feature_split_roundtrip 0.0s cached
+PASS gpu-core/diffusion/diffusion_block_ar_progressive_commit 0.2s
+PASS gpu-core/moe/moe_backward_matches_finite_diff 0.0s cached
+PASS gpu-core/rope/rope_heads_backward_is_inverse_rotation 0.0s cached
+PASS gpu-core/suite/gpu_live::roundtrip 0.0s cached
+PASS gpu-core/suite/inventory_proof::prove_inventory 0.0s cached
+PASS gpu-core/suite/oversize_oom::oversize_request_is_clean_oom_not_abort 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::bmm_parity_nonsquare_ragged 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::bmm_parity_single_batch 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::bmm_parity_square_aligned 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::bmm_parity_transpose_modes 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::bmm_parity_two_batch_explicit 0.0s cached
+PASS gpu-core/suite/parity_blas_batched::gemm_pipeline_compose_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l1::dasum_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l1::ddot_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l1::dnrm2_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l1::idamax_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l2::dgemv_notrans_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l2::dgemv_trans_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l2::dger_parity 0.0s cached
+PASS gpu-core/suite/parity_blas_l3::dsyrk_lower_triangle_matches_cpu_oracle 0.0s cached
+PASS gpu-core/suite/parity_blas_l3::gemm_at_matches_cpu_oracle 0.0s cached
+PASS gpu-core/suite/parity_blas_l3::gemm_bt_matches_cpu_oracle 0.0s cached
+PASS gpu-core/suite/parity_blas_l3::gemm_matches_cpu_oracle 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::cholesky_factor_then_tri_solve 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::cholesky_inv_times_a_is_identity 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::cholesky_solve_residual 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::eigh_eigenvalue_sum_equals_trace 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::fft_roundtrip 0.0s cached
+PASS gpu-core/suite/parity_solver_fft::lu_solve_residual 0.0s cached
+PASS gpu-core/suite/prove_activation::prove_activation 0.0s cached
+PASS gpu-core/suite/prove_conv::prove_conv 0.0s cached
+PASS gpu-core/suite/prove_creation::prove_creation 0.0s cached
+PASS gpu-core/suite/prove_distance::prove_distance 0.0s cached
+PASS gpu-core/suite/prove_elementwise_binary::prove_elementwise_binary 0.0s cached
+PASS gpu-core/suite/prove_elementwise_unary::prove_elementwise_unary 0.0s cached
+PASS gpu-core/suite/prove_embedding::prove_embedding 0.0s cached
+PASS gpu-core/suite/prove_flash_train::flash_train_matches_cpu_oracle 0.0s cached
+PASS gpu-core/suite/prove_foreach::prove_foreach 0.0s cached
+PASS gpu-core/suite/prove_histogram::prove_histogram 0.0s cached
+PASS gpu-core/suite/prove_indexing::prove_indexing 0.0s cached
+PASS gpu-core/suite/prove_loss::prove_loss 0.0s cached
+PASS gpu-core/suite/prove_norm::prove_norm 0.0s cached
+PASS gpu-core/suite/prove_optimizer::prove_optimizer 0.0s cached
+PASS gpu-core/suite/prove_padding::prove_padding 0.0s cached
+PASS gpu-core/suite/prove_pool::prove_pool 0.0s cached
+PASS gpu-core/suite/prove_quantized::prove_quantized 0.0s cached
+PASS gpu-core/suite/prove_reduction::prove_reduction 0.0s cached
+PASS gpu-core/suite/prove_scan::prove_scan 0.0s cached
+PASS gpu-core/suite/prove_search::prove_search 0.0s cached
+PASS gpu-core/suite/prove_set::prove_set 0.0s cached
+PASS gpu-core/suite/prove_shape::prove_shape 0.0s cached
+PASS gpu-core/suite/prove_sort::prove_sort 0.0s cached
+PASS gpu-core/suite/prove_special::prove_special 0.0s cached
+PASS gpu-core/suite/t_algos::test_boruvka_mst 0.0s cached
+PASS gpu-core/suite/t_algos::test_core_distance 0.0s cached
+PASS gpu-core/suite/t_algos::test_csr_spmm 0.0s cached
+PASS gpu-core/suite/t_algos::test_csr_spmv 0.0s cached
+PASS gpu-core/suite/t_algos::test_forward_backward 0.0s cached
+PASS gpu-core/suite/t_algos::test_gpu_degree 0.0s cached
+PASS gpu-core/suite/t_algos::test_gpu_gcn_norm 0.0s cached
+PASS gpu-core/suite/t_algos::test_neighbor_aggregate_mean 0.0s cached
+PASS gpu-core/suite/t_algos::test_neighbor_aggregate_sum 0.0s cached
+PASS gpu-core/suite/t_algos::test_union_find_cc 0.0s cached
+PASS gpu-core/suite/t_algos::test_viterbi 0.0s cached
+PASS gpu-core/suite/t_bmm::bmm_every_transpose_mode 0.0s cached
+PASS gpu-core/suite/t_bmm::bmm_per_head_offset 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::cumsum_rows 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::ddot 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::discounted_returns 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::one_hot 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::rsqrt_recip_max 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::sort_non_pow2 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::sort_pow2 0.0s cached
+PASS gpu-core/suite/t_lead_smoke::sum_entire 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_argsort_basic 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_argsort_non_power_of_two 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_cummax 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_cumprod 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_cumsum_cols 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_cumsum_rows 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dasum 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_ddot 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dgemm_strided_batched 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dgemv_no_trans 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dgemv_trans 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dger 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dnrm2 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dot_reductions 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_dsyrk 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_eigh_sym 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_fft_c2c_1d_and_inverse 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_idamax 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_l2_norm 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_lu_solve 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_max_entire 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_mean_entire 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_min_entire 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_potrs 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_qr_square_reconstruction 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_qr_thin_reconstruction 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_rfft_1d 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_scan_linear_recurrence 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_segment_max 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_segment_sort 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_segment_sum 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_sort_basic 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_sort_by_key 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_sort_non_power_of_two 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_sort_size_three 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_sum_entire 0.0s cached
+PASS gpu-core/suite/t_linalg_reduce::test_svd_reconstruction 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_atan2 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bce_with_logits_loss_and_grad 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bce_with_logits_negative_logit 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bce_with_logits_positive_logit 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bin_edges_quantile_sorted 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bin_edges_uniform 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_bin_edges_uniform_two_cols 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_contrastive_loss_dissimilar_no_violation 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_contrastive_loss_dissimilar_violation 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_contrastive_loss_similar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_contrastive_loss_similar_nonzero 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_cosine_embedding_loss_dissimilar_no_violation 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_cosine_embedding_loss_dissimilar_violation 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_cosine_embedding_loss_similar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_count_distinct 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_count_distinct_uniform 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_div_scalar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_floor_ceil_round_trunc 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_fmod 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_focal_loss_target0 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_focal_loss_target1 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_has_nan_false 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_has_nan_true 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_hinge_loss_margin_positive 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_hinge_loss_negative_label 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_hinge_loss_no_margin 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_huber_grad_large_negative_residual 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_huber_grad_large_residual 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_huber_grad_tiny_residual 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_isfinite_entire_false_inf 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_isfinite_entire_false_nan 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_isfinite_entire_true 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_kl_div_loss 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_kl_div_loss_skewed 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_log1p_expm1 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_mae_grad_basic 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_max 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_min 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_one_hot_layout 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_one_hot_single 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_cosine_2x2 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_cosine_identical 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_cosine_orthogonal 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_hamming_2x2 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_hamming_half_mismatch 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_hamming_identical 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_l1_2x2 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_pairwise_l1_basic 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_quantize_boundary_below_first_edge 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_quantize_features_basic 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_rdiv_scalar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_reciprocal 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_rsqrt 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_rsub_scalar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_run_length 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_sin_cos_tan 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_sub_scalar 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_triplet_loss_margin 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_triplet_loss_no_violation 0.0s cached
+PASS gpu-core/suite/t_math_enc_loss::test_triplet_loss_with_violation 0.0s cached
+PASS gpu-core/suite/t_ml::test_bayes_bernoulli_nb_logprob 0.0s cached
+PASS gpu-core/suite/t_ml::test_bayes_multinomial_nb_logprob 0.0s cached
+PASS gpu-core/suite/t_ml::test_bayes_nb_count_table 0.0s cached
+PASS gpu-core/suite/t_ml::test_bayes_nb_feature_log_prob 0.0s cached
+PASS gpu-core/suite/t_ml::test_catboost_iota 0.0s cached
+PASS gpu-core/suite/t_ml::test_catboost_ordered_target_stats 0.0s cached
+PASS gpu-core/suite/t_ml::test_catboost_random_permutation 0.0s cached
+PASS gpu-core/suite/t_ml::test_forest_bootstrap_sample 0.0s cached
+PASS gpu-core/suite/t_ml::test_forest_feature_subset 0.0s cached
+PASS gpu-core/suite/t_ml::test_forest_oob_mask 0.0s cached
+PASS gpu-core/suite/t_ml::test_forest_random_threshold_split 0.0s cached
+PASS gpu-core/suite/t_ml::test_rl_categorical_logprob 0.0s cached
+PASS gpu-core/suite/t_ml::test_rl_discounted_returns 0.0s cached
+PASS gpu-core/suite/t_ml::test_rl_gae 0.0s cached
+PASS gpu-core/suite/t_ml::test_rl_gaussian_logprob 0.0s cached
+PASS gpu-core/suite/t_ml::test_rl_td_targets 0.0s cached
+PASS gpu-core/suite/t_nn::test_add_f16 0.0s cached
+PASS gpu-core/suite/t_nn::test_avg_pool_2d_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_bias_add_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_bn_update_running 0.0s cached
+PASS gpu-core/suite/t_nn::test_causal_softmax_rows 0.0s cached
+PASS gpu-core/suite/t_nn::test_embedding_backward 0.0s cached
+PASS gpu-core/suite/t_nn::test_gelu_backward_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_gelu_f16 0.0s cached
+PASS gpu-core/suite/t_nn::test_gelu_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_gru_cell_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_im2col_2d_ext 0.0s cached
+PASS gpu-core/suite/t_nn::test_layernorm_backward_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_layernorm_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_linear_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_lstm_cell_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_max_pool_2d_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_mha_split_layout 0.0s cached
+PASS gpu-core/suite/t_nn::test_mha_split_merge_roundtrip 0.0s cached
+PASS gpu-core/suite/t_nn::test_mul_f16 0.0s cached
+PASS gpu-core/suite/t_nn::test_positional_encoding 0.0s cached
+PASS gpu-core/suite/t_nn::test_relu_backward_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_relu_f16 0.0s cached
+PASS gpu-core/suite/t_nn::test_relu_f32 0.0s cached
+PASS gpu-core/suite/t_nn::test_rmsnorm 0.0s cached
+PASS gpu-core/suite/t_nn::test_rmsnorm_backward 0.0s cached
+PASS gpu-core/suite/t_nn::test_rope_norm_preserved 0.0s cached
+PASS gpu-core/suite/t_nn::test_sdpa_causal 0.2s
+PASS gpu-core/suite/t_nn::test_sdpa_noncausal 0.1s
+PASS gpu-core/suite/t_nn::test_sgd_update_f32 0.0s cached
+PASS gpu-core/tiered/admit_rejects_over_cap 0.0s cached
+PASS gpu-core/tiered/budgets_are_the_sum 0.0s cached
+PASS gpu-core/tiered/stage_across_three_tiers 0.0s cached
+PASS gpu-core/tiered/tiled_full_batch_runs_and_matches_whole 0.0s cached
+PASS gpu-core/tiered/vram_fits_roundtrips 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_binary_classification 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_efb_bundling 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_goss_sampling 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_invalid_inputs 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_multiclass_3class 0.0s cached
+PASS lightgbm-rs/lightgbm_rs/tests::test_regression_sanity 0.0s cached
+PASS ogdl/corpus/cases::corpus_shapes 0.0s
+PASS ogdl/doc/cases::content_tab_only_in_own_name 0.0s
+PASS ogdl/doc/cases::dot_is_depth 0.0s
+PASS ogdl/doc/cases::first_line_tab_is_sibling 0.0s
+PASS ogdl/doc/cases::first_line_tabs_then_newline_siblings 0.0s
+PASS ogdl/doc/cases::inline_tab_after_newline_is_content 0.0s
+PASS ogdl/doc/cases::invalid_docs_are_compile_errors 0.0s
+PASS ogdl/doc/cases::leading_tab_is_depth 0.0s
+PASS ogdl/doc/cases::newline_makes_siblings 0.0s
+PASS ogdl/doc/cases::skeleton_doc_form 0.0s
+PASS ogdl/fill/cases::fill_and_print_then_select 0.0s
+PASS ogdl/full_probe/cases::full_probe_transcript 0.0s
+PASS ogdl/graph/cases::add_del 0.0s
+PASS ogdl/graph/cases::arity_forms_dispatch 0.0s
+PASS ogdl/graph/cases::handles_free_on_drop 0.0s
+PASS ogdl/graph/cases::index_and_selectors 0.0s
+PASS ogdl/graph/cases::round_trip_itnl_file_itnl 0.0s
+PASS ogdl/graph/cases::select_value 0.0s
+PASS ogdl/graph/cases::typed_serialize_roundtrip 0.0s
+PASS ogdl/host/cases::runtime_host_values 0.0s
+PASS ogdl/path/cases::braces_delete_branch 0.0s
+PASS ogdl/path/cases::create_and_display 0.0s
+PASS ogdl/path/cases::index_zero_based 0.0s
+PASS ogdl/path/cases::literal_head_path 0.0s
+PASS ogdl/path/cases::literal_suffix_selects 0.0s
+PASS ogdl/path/cases::missing_index_selects_nothing 0.0s
+PASS ogdl/path/cases::missing_selector_selects_nothing 0.0s
+PASS ogdl/path/cases::navigate_not_duplicate 0.0s
+PASS ogdl/path/cases::selector_then_index 0.0s
+PASS ogdl/path/cases::selector_zero_based 0.0s
+PASS ogdl/path/cases::star_block_prints_children_only 0.0s
+PASS ogdl/path/cases::star_selects_children 0.0s
+PASS ogdl/path/cases::unicode_names 0.0s
+PASS ogdl/path/cases::values_ride_the_parent_line 0.0s
+PASS ogdl/path/cases::variable_index_segment 0.0s
+PASS ogdl/path/cases::variable_name_segment 0.0s
+PASS ogdl/path/cases::variable_value_segment 0.0s
+FAIL ogdl/reconcile/cases::divergence_finds_first_changed_line 0.0s
+     
+     running 1 test
+     
+     thread 'cases::divergence_finds_first_changed_line' (4139328) panicked at ogdl/tests/reconcile/cases.rs:26:5:
+     assertion `left == right` failed
+       left: 2
+      right: 1
+     note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+     test cases::divergence_finds_first_changed_line ... FAILED
+     
+     failures:
+     
+     failures:
+         cases::divergence_finds_first_changed_line
+     
+     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+     
+PASS ogdl/reconcile/cases::nontty_delete_clamps_shown_cursor 0.0s
+PASS ogdl/reconcile/cases::reconcile_below_cursor_leaves_shown_untouched 0.0s
+PASS ogdl/reconcile/cases::reconcile_clamps_shown_to_new_length 0.0s
+PASS ogdl/reconcile/cases::reconcile_zero_shown_is_noop 0.0s
+PASS ogdl/styles/cases::style1_static 0.0s
+PASS ogdl/styles/cases::style2_struct 0.0s
+PASS ogdl/styles/cases::style3_free 0.0s
+PASS pantry/data/comma_delimiter_is_sniffed 0.0s cached
+PASS pantry/data/dir_groups_found_recursively 0.0s cached
+PASS pantry/data/har_zip_extracts_wrapped_tables 0.0s cached
+PASS pantry/data/headerless_numeric_first_row_is_data 0.0s cached
+PASS pantry/data/named_first_row_is_header 0.0s cached
+PASS pantry/data/nested_zip_extracts_inner_tables 0.0s cached
+PASS pantry/data/prose_line_is_not_space_delimited 0.0s cached
+PASS pantry/data/semicolon_delimiter_is_sniffed 0.0s cached
+PASS pantry/data/single_numeric_column_headerless 0.0s cached
+PASS pantry/data/space_delimiter_is_sniffed 0.0s cached
+PASS pantry/data/tab_delimiter_is_sniffed 0.0s cached
+PASS pantry/data/whitespace_matrix_headerless_keeps_rows 0.0s cached
+PASS pantry/encode/missing_target_drops_row_features_impute 0.0s cached
+PASS pantry/encode/no_target_survives_cleaning 0.0s cached
+PASS recipe-infer/forward/kv_cache_bounded_memory_long_sequence 0.0s cached
+PASS recipe-infer/forward/kv_cache_matches_full_attention 0.0s cached
+PASS recipe-infer/forward/splitk_dw_matches_rocblas 0.0s cached
+PASS recipe-infer/gguf/open_gemma_vocab_and_validate_layout 0.0s cached
+PASS recipe-infer/params/dump_add_api_roundtrips 0.0s
+PASS recipe-infer/params/ogdl_format_roundtrips_host_side 0.0s cached
+PASS recipe-infer/safetensors/parse_safetensors_decodes_header_and_blob 0.0s cached
+PASS recipe-infer/safetensors/parse_safetensors_rejects_out_of_range_offsets 0.0s cached
+PASS recipe-infer/safetensors/read_safetensors_header_and_decode_min 0.0s cached
+PASS recipe/dataset/data_load_materializes_safetensors_shard 0.0s cached
+PASS recipe/dataset/data_load_reads_safetensors_source 0.0s cached
+PASS recipe/dataset/no_target_datasets_is_features_only 0.0s cached
+FAIL recipe/hygiene/cases::h03_budgeted_comments 0.0s
+     
+     running 1 test
+     
+     thread 'cases::h03_budgeted_comments' (4139777) panicked at tests/hygiene/cases.rs:386:5:
+     comment-budget violations:
+       gpu-core/src/kernels.rs:1761: extra // SAFETY: comment (budget 1 per unsafe construct)
+       gpu-core/src/kernels.rs:2310: extra // SAFETY: comment (budget 1 per unsafe construct)
+       gpu-core/src/kernels.rs:2370: extra // SAFETY: comment (budget 1 per unsafe construct)
+       gpu-core/src/kernels.rs:2989: extra // SAFETY: comment (budget 1 per unsafe construct)
+       gpu-core/src/kernels.rs:4459: extra // SAFETY: comment (budget 1 per unsafe construct)
+       pantry/src/data.rs:73: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:94: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:95: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:96: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:97: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:98: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:480: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:481: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:488: more than one // comment in a function (budget 1)
+       pantry/src/data.rs:613: // comment outside a function (use /// or //!)
+       pantry/src/detect.rs:193: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:194: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:253: // comment outside a function (use /// or //!)
+       pantry/src/detect.rs:254: // comment outside a function (use /// or //!)
+       pantry/src/detect.rs:255: // comment outside a function (use /// or //!)
+       pantry/src/detect.rs:256: // comment outside a function (use /// or //!)
+       pantry/src/detect.rs:292: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:293: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:294: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:295: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:314: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:315: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:316: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:317: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:330: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:331: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:339: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:340: more than one // comment in a function (budget 1)
+       pantry/src/detect.rs:341: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:130: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:131: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:272: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:288: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:289: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:290: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:291: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:321: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:339: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:340: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:341: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:342: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:343: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:352: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:353: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:354: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:355: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:446: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:587: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:588: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:589: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:590: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:591: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:592: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:619: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:778: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:816: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:817: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:818: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:819: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:1252: more than one // comment in a function (budget 1)
+       pantry/src/encode.rs:1253: more than one // comment in a function (budget 1)
+     note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+     test cases::h03_budgeted_comments ... FAILED
+     
+     failures:
+     
+     failures:
+         cases::h03_budgeted_comments
+     
+     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     
+PASS recipe/model/builders_are_owned_not_leaked 0.0s cached
+PASS recipe/model/fit_loop_memory_flat 0.0s cached
+PASS recipe/model/gpu_metrics_match_cpu_reference 0.0s cached
+PASS recipe/model/metric_consts_both_casings 0.0s cached
+PASS recipe/model/ping_pong_gradients_match_per_layer 0.0s cached
+PASS recipe/model/stacked_conv_checkpoint_roundtrip 0.0s cached
+PASS recipe/ooc/ragged_window_bce_focal_grad_matches_full_batch 0.0s cached
+PASS recipe/probe/beacon_roundtrips_exact 0.0s cached
+PASS recipe/probe/config_emits_eth_transfer_schema 0.0s cached
+PASS recipe/probe/config_ogdl_roundtrips 0.0s cached
+PASS recipe/wire/wire_loopback_roundtrip 0.0s cached
+PASS xgboost-rs/xgboost_rs/tests::test_binary_classification 0.0s cached
+PASS xgboost-rs/xgboost_rs/tests::test_invalid_inputs 0.0s cached
+PASS xgboost-rs/xgboost_rs/tests::test_multiclass_3class 0.0s cached
+PASS xgboost-rs/xgboost_rs/tests::test_regression_sanity 0.0s cached
+error: test failed, to rerun pass `--test all`
+
+Caused by:
+  process didn't exit successfully: `/home/nate/Desktop/nates-recipe-rs/target/debug/deps/all-24506bfc28ba93e7 all` (exit status: 1)

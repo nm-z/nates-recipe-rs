@@ -243,7 +243,7 @@ impl LayerPlan {
 	pub fn dump_ogdl_host(&self, image: &[f64], key: &str, score: f64) -> String {
 		let blk = |bp: &BlockPlan| image[bp.off..bp.off + bp.len].to_vec();
 		ogdl_text(|g| {
-			g.add(score, key);
+			drop(g.add(score, key));
 			let mut z = 1;
 			let mut at = 1;
 			let mut cv = 1;
@@ -253,20 +253,20 @@ impl LayerPlan {
 					LayerKind::Embed => {
 						let table = blk(&e.w);
 						for id in 0..d.vocab {
-							g.add(
+							drop(g.add(
 								table[id * d.dim..(id + 1) * d.dim].to_vec(),
 								&format!("embed.{id}"),
-							);
+							));
 						}
 					}
 					LayerKind::Attn => {
-						g.add(blk(&e.w), &format!("attn{at}.wq"));
-						g.add(blk(&e.wk), &format!("attn{at}.wk"));
-						g.add(blk(&e.wv), &format!("attn{at}.wv"));
-						g.add(blk(&e.wo), &format!("attn{at}.wo"));
+						drop(g.add(blk(&e.w), &format!("attn{at}.wq")));
+						drop(g.add(blk(&e.wk), &format!("attn{at}.wk")));
+						drop(g.add(blk(&e.wv), &format!("attn{at}.wv")));
+						drop(g.add(blk(&e.wo), &format!("attn{at}.wo")));
 						let bias = blk(&e.b);
 						for nm in ["bq", "bk", "bv", "bo"] {
-							g.add(bias.clone(), &format!("attn{at}.{nm}"));
+							drop(g.add(bias.clone(), &format!("attn{at}.{nm}")));
 						}
 						at += 1;
 					}
@@ -274,7 +274,7 @@ impl LayerPlan {
 						let lin = d.in_dim / d.conv_cin;
 						let lout = (lin - d.conv_k) / d.conv_stride + 1;
 						let cout = d.out_dim / lout;
-						g.add(
+						drop(g.add(
 							vec![
 								cout as f64,
 								d.conv_cin as f64,
@@ -282,9 +282,9 @@ impl LayerPlan {
 								d.conv_stride as f64,
 							],
 							&format!("conv{cv}"),
-						);
-						g.add(blk(&e.w), &format!("conv{cv}.w"));
-						g.add(blk(&e.b), &format!("conv{cv}.b"));
+						));
+						drop(g.add(blk(&e.w), &format!("conv{cv}.w")));
+						drop(g.add(blk(&e.b), &format!("conv{cv}.b")));
 						cv += 1;
 					}
 					LayerKind::Dense => {
@@ -296,11 +296,11 @@ impl LayerPlan {
 							let row: Vec<f64> = (0..d.in_dim)
 								.map(|i| w[i * d.out_dim + j])
 								.collect();
-							g.add(row, &format!("z{z}.w"));
+							drop(g.add(row, &format!("z{z}.w")));
 							if let Some(a) = slope {
-								g.add(a, &format!("z{z}.a"));
+								drop(g.add(a, &format!("z{z}.a")));
 							}
-							g.add(b[j], &format!("z{z}.b"));
+							drop(g.add(b[j], &format!("z{z}.b")));
 							z += 1;
 						}
 					}
@@ -321,7 +321,7 @@ pub fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
 	let _ = fs::remove_file(tp);
 	let g = ogdl::file(tp);
 	build(g.clone());
-	g.file(tp);
+	drop(g.file(tp));
 	let text = fs::read_to_string(tp).unwrap_or_default();
 	let _ = fs::remove_file(tp);
 	text
@@ -780,7 +780,7 @@ pub fn dump_ogdl(
 	let want_w = filter.is_none_or(|f| f.contains(&Param::W));
 	let want_b = filter.is_none_or(|f| f.contains(&Param::B));
 	crate::params::ogdl_text(|g| {
-		g.add(score, key);
+		drop(g.add(score, key));
 		let mut z = 1;
 		let mut at = 1;
 		let mut cv = 1;
@@ -790,25 +790,25 @@ pub fn dump_ogdl(
 					if want_w {
 						let table = download_vec(&p.w, p.vocab * p.dim);
 						for id in 0..p.vocab {
-							g.add(
+							drop(g.add(
 								table[id * p.dim..(id + 1) * p.dim].to_vec(),
 								&format!("embed.{id}"),
-							);
+							));
 						}
 					}
 				}
 				LayerKind::Attn => {
 					let dd = p.dim * p.dim;
 					if want_w {
-						g.add(download_vec(&p.w, dd), &format!("attn{at}.wq"));
-						g.add(download_vec(&p.wk, dd), &format!("attn{at}.wk"));
-						g.add(download_vec(&p.wv, dd), &format!("attn{at}.wv"));
-						g.add(download_vec(&p.wo, dd), &format!("attn{at}.wo"));
+						drop(g.add(download_vec(&p.w, dd), &format!("attn{at}.wq")));
+						drop(g.add(download_vec(&p.wk, dd), &format!("attn{at}.wk")));
+						drop(g.add(download_vec(&p.wv, dd), &format!("attn{at}.wv")));
+						drop(g.add(download_vec(&p.wo, dd), &format!("attn{at}.wo")));
 					}
 					if want_b {
 						let bias = download_vec(&p.b, p.dim);
 						for nm in ["bq", "bk", "bv", "bo"] {
-							g.add(bias.clone(), &format!("attn{at}.{nm}"));
+							drop(g.add(bias.clone(), &format!("attn{at}.{nm}")));
 						}
 					}
 					at += 1;
@@ -818,7 +818,7 @@ pub fn dump_ogdl(
 					let lout = (lin - p.conv_k) / p.conv_stride + 1;
 					let cout = p.out_dim / lout;
 					let w_count = cout * p.conv_cin * p.conv_k;
-					g.add(
+					drop(g.add(
 						vec![
 							cout as f64,
 							p.conv_cin as f64,
@@ -826,12 +826,15 @@ pub fn dump_ogdl(
 							p.conv_stride as f64,
 						],
 						&format!("conv{cv}"),
-					);
+					));
 					if want_w {
-						g.add(download_vec(&p.w, w_count), &format!("conv{cv}.w"));
+						drop(g.add(
+							download_vec(&p.w, w_count),
+							&format!("conv{cv}.w"),
+						));
 					}
 					if want_b {
-						g.add(download_vec(&p.b, cout), &format!("conv{cv}.b"));
+						drop(g.add(download_vec(&p.b, cout), &format!("conv{cv}.b")));
 					}
 					cv += 1;
 				}
@@ -845,13 +848,13 @@ pub fn dump_ogdl(
 							let row: Vec<f64> = (0..p.in_dim)
 								.map(|i| w[i * p.out_dim + j])
 								.collect();
-							g.add(row, &format!("z{z}.w"));
+							drop(g.add(row, &format!("z{z}.w")));
 							if let Some(a) = slope {
-								g.add(a, &format!("z{z}.a"));
+								drop(g.add(a, &format!("z{z}.a")));
 							}
 						}
 						if want_b {
-							g.add(b[j], &format!("z{z}.b"));
+							drop(g.add(b[j], &format!("z{z}.b")));
 						}
 						z += 1;
 					}

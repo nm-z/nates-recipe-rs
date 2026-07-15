@@ -69,12 +69,12 @@ z2
 #[test]
 fn dump_add_api_roundtrips() {
 	let text = recipe_infer::params::ogdl_text(|g| {
-		g.add(0.42f64, "r2");
-		g.add(vec![0.1f64, 0.2, 0.3], "z1.w");
-		g.add(0.05f64, "z1.a");
-		g.add(0.01f64, "z1.b");
-		g.add(vec![-0.4f64, 0.5], "z2.w");
-		g.add(0.02f64, "z2.b");
+		drop(g.add(0.42f64, "r2"));
+		drop(g.add(vec![0.1f64, 0.2, 0.3], "z1.w"));
+		drop(g.add(0.05f64, "z1.a"));
+		drop(g.add(0.01f64, "z1.b"));
+		drop(g.add(vec![-0.4f64, 0.5], "z2.w"));
+		drop(g.add(0.02f64, "z2.b"));
 	});
 	let saved = load_ogdl_str(&text).expect("load_ogdl_str");
 	assert_eq!(saved.len(), 2, "two dense neurons, metric header skipped");

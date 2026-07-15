@@ -1,11 +1,12 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::hip::device_synchronize;
+use crate::kernels::{check_launch, ci};
 use crate::memory::GpuBuffer;
-use std::cmp::Ordering;
+use core::cmp::Ordering;
+use core::ffi::c_void;
+use core::mem;
+use core::ptr;
 use std::collections::HashSet;
-use std::ffi::c_void;
-use std::mem;
-use std::ptr;
 
 unsafe extern "C" {
 	fn launch_fixed_radius_count(
@@ -107,6 +108,9 @@ pub struct NeighborCsr {
 	pub nnz: usize,
 }
 
+/// # Errors
+/// Errors if `n` or `dim` overflows `i32`.
+#[inline]
 pub fn fixed_radius_count(
 	points: &GpuBuffer,
 	eps: &GpuBuffer,
@@ -114,37 +118,45 @@ pub fn fixed_radius_count(
 	dim: usize,
 	count_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: pointers come from live GpuBuffers valid for this launch; n/dim are range-checked.
 	unsafe {
 		launch_fixed_radius_count(
-			points.ptr_raw() as *const c_void,
+			points.ptr_raw().cast_const(),
 			count_out.ptr_raw(),
-			n as i32,
-			dim as i32,
-			eps.ptr_raw() as *const c_void,
+			ci(n)?,
+			ci(dim)?,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Errors if `n` overflows `i32`.
+#[inline]
 pub fn exclusive_scan_i32(
 	count_in: &GpuBuffer,
 	n: usize,
 	row_ptr_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: pointers come from live GpuBuffers valid for this launch; n is range-checked.
 	unsafe {
 		launch_exclusive_scan_i32(
-			count_in.ptr_raw() as *const c_void,
+			count_in.ptr_raw().cast_const(),
 			row_ptr_out.ptr_raw(),
-			n as i32,
+			ci(n)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Errors if `n` or `dim` overflows `i32`.
+#[inline]
 pub fn fixed_radius_fill_csr(
 	points: &GpuBuffer,
 	row_ptr: &GpuBuffer,
@@ -153,21 +165,25 @@ pub fn fixed_radius_fill_csr(
 	dim: usize,
 	indices_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: pointers come from live GpuBuffers valid for this launch; n/dim are range-checked.
 	unsafe {
 		launch_fixed_radius_fill_csr(
-			points.ptr_raw() as *const c_void,
-			row_ptr.ptr_raw() as *const c_void,
+			points.ptr_raw().cast_const(),
+			row_ptr.ptr_raw().cast_const(),
 			indices_out.ptr_raw(),
-			n as i32,
-			dim as i32,
-			eps.ptr_raw() as *const c_void,
+			ci(n)?,
+			ci(dim)?,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if allocation, transfer, or a kernel launch fails.
+#[inline]
 pub fn gpu_fixed_radius_neighbors(
 	points: &GpuBuffer,
 	n: usize,
@@ -184,26 +200,33 @@ pub fn gpu_fixed_radius_neighbors(
 
 	let mut row_ptr_h = vec![0i32; n + 1];
 	row_ptr_buf.download_i32(&mut row_ptr_h)?;
-	let nnz = row_ptr_h[n] as usize;
+	let nnz = usize::try_from(row_ptr_h[n]).map_err(|_err| return HipError(1))?;
 
 	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * mem::size_of::<i32>())?;
 	fixed_radius_fill_csr(points, &row_ptr_buf, &eps_buf, n, dim, &indices)?;
 
-	Ok(NeighborCsr {
+	return Ok(NeighborCsr {
 		row_ptr: row_ptr_buf,
 		indices,
 		nnz,
-	})
+	});
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: parent_out is a live GpuBuffer and the node count is a checked i32.
 	unsafe {
-		launch_uf_init(parent_out.ptr_raw(), n_nodes as i32, ptr::null_mut());
+		launch_uf_init(parent_out.ptr_raw(), ci(n_nodes)?, ptr::null_mut());
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn uf_hook(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -211,28 +234,36 @@ pub fn uf_hook(
 	parent_out: &GpuBuffer,
 	changed_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: all buffer pointers are live and n_edges is a checked i32.
 	unsafe {
 		launch_uf_hook(
-			edge_src.ptr_raw() as *const c_void,
-			edge_dst.ptr_raw() as *const c_void,
+			edge_src.ptr_raw().cast_const(),
+			edge_dst.ptr_raw().cast_const(),
 			parent_out.ptr_raw(),
 			changed_out.ptr_raw(),
-			n_edges as i32,
+			ci(n_edges)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: parent_out is a live GpuBuffer and the node count is a checked i32.
 	unsafe {
-		launch_uf_compress(parent_out.ptr_raw(), n_nodes as i32, ptr::null_mut());
+		launch_uf_compress(parent_out.ptr_raw(), ci(n_nodes)?, ptr::null_mut());
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if allocation, transfer, or a kernel launch fails.
+#[inline]
 pub fn gpu_union_find_cc(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -250,12 +281,12 @@ pub fn gpu_union_find_cc(
 		uf_hook(edge_src, edge_dst, n_edges, &labels, &changed)?;
 		uf_compress(n_nodes, &labels)?;
 		changed.download_i32(&mut flag)?;
-		match flag[0].cmp(&0) {
+		match flag[0].cmp(&0i32) {
 			Ordering::Equal => break,
-			Ordering::Less | Ordering::Greater => continue,
+			Ordering::Less | Ordering::Greater => {}
 		}
 	}
-	Ok(labels)
+	return Ok(labels);
 }
 
 pub struct BoruvkaResult {
@@ -263,23 +294,30 @@ pub struct BoruvkaResult {
 	pub total_weight: f64,
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn boruvka_init(
 	n_nodes: usize,
 	best_edge_out: &GpuBuffer,
 	best_wkey_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffers outlive the call and n_nodes is range-checked into i32.
 	unsafe {
 		launch_boruvka_init(
 			best_edge_out.ptr_raw(),
 			best_wkey_out.ptr_raw(),
-			n_nodes as i32,
+			ci(n_nodes)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn boruvka_min_w(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -288,21 +326,25 @@ pub fn boruvka_min_w(
 	n_edges: usize,
 	best_wkey_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffers outlive the call and n_edges is range-checked into i32.
 	unsafe {
 		launch_boruvka_min_w(
-			edge_src.ptr_raw() as *const c_void,
-			edge_dst.ptr_raw() as *const c_void,
-			edge_w.ptr_raw() as *const c_void,
-			parent.ptr_raw() as *const c_void,
+			edge_src.ptr_raw().cast_const(),
+			edge_dst.ptr_raw().cast_const(),
+			edge_w.ptr_raw().cast_const(),
+			parent.ptr_raw().cast_const(),
 			best_wkey_out.ptr_raw(),
-			n_edges as i32,
+			ci(n_edges)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn boruvka_min_e(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -312,60 +354,72 @@ pub fn boruvka_min_e(
 	n_edges: usize,
 	best_edge_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the buffers outlive the call and n_edges is range-checked into i32.
 	unsafe {
 		launch_boruvka_min_e(
-			edge_src.ptr_raw() as *const c_void,
-			edge_dst.ptr_raw() as *const c_void,
-			edge_w.ptr_raw() as *const c_void,
-			parent.ptr_raw() as *const c_void,
-			best_wkey.ptr_raw() as *const c_void,
+			edge_src.ptr_raw().cast_const(),
+			edge_dst.ptr_raw().cast_const(),
+			edge_w.ptr_raw().cast_const(),
+			parent.ptr_raw().cast_const(),
+			best_wkey.ptr_raw().cast_const(),
 			best_edge_out.ptr_raw(),
-			n_edges as i32,
+			ci(n_edges)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn boruvka_mark(
 	best_edge: &GpuBuffer,
 	n_nodes: usize,
 	n_edges: usize,
 	in_mst_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: raw device pointers come from live GpuBuffers valid for this launch.
 	unsafe {
 		launch_boruvka_mark(
-			best_edge.ptr_raw() as *const c_void,
+			best_edge.ptr_raw().cast_const(),
 			in_mst_out.ptr_raw(),
-			n_nodes as i32,
-			n_edges as i32,
+			ci(n_nodes)?,
+			ci(n_edges)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Errors if `n_edges` overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn masked_weight_sum(
 	edge_w: &GpuBuffer,
 	in_mst: &GpuBuffer,
 	n_edges: usize,
 	total_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: raw device pointers come from live GpuBuffers valid for this launch.
 	unsafe {
 		launch_masked_weight_sum(
-			edge_w.ptr_raw() as *const c_void,
-			in_mst.ptr_raw() as *const c_void,
+			edge_w.ptr_raw().cast_const(),
+			in_mst.ptr_raw().cast_const(),
 			total_out.ptr_raw(),
-			n_edges as i32,
+			ci(n_edges)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Errors if a size overflows `i32`, an allocation fails, or a launch fails.
+#[inline]
 pub fn gpu_boruvka_mst(
 	edge_src: &GpuBuffer,
 	edge_dst: &GpuBuffer,
@@ -403,11 +457,10 @@ pub fn gpu_boruvka_mst(
 		let mut sel_src: Vec<i32> = Vec::new();
 		let mut sel_dst: Vec<i32> = Vec::new();
 		for &e in &best_edge_h {
-			for i in usize::try_from(e)
+			if let Some(i) = usize::try_from(e)
 				.ok()
-				.filter(|&idx| idx < n_edges)
-				.filter(|_idx| seen.insert(e))
-				.into_iter()
+				.filter(|&idx| return idx < n_edges)
+				.filter(|_idx| return seen.insert(e))
 			{
 				sel_src.push(src_h[i]);
 				sel_dst.push(dst_h[i]);
@@ -425,11 +478,9 @@ pub fn gpu_boruvka_mst(
 					uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
 					uf_compress(n_nodes, &parent)?;
 					changed.download_i32(&mut flag)?;
-					match flag[0].cmp(&0) {
+					match flag[0].cmp(&0i32) {
 						Ordering::Equal => break,
-						Ordering::Less | Ordering::Greater => {
-							continue;
-						}
+						Ordering::Less | Ordering::Greater => {}
 					}
 				}
 			}
@@ -439,15 +490,19 @@ pub fn gpu_boruvka_mst(
 	let total_buf = GpuBuffer::alloc(1)?;
 	masked_weight_sum(edge_w, &in_mst, n_edges, &total_buf)?;
 	let mut tw = [0.0f64; 1];
+	// SAFETY: tw is a live host buffer sized for the async download from total_buf.
 	unsafe { total_buf.download_async(&mut tw, ptr::null_mut()) }?;
-	crate::hip::device_synchronize()?;
+	device_synchronize()?;
 
-	Ok(BoruvkaResult {
+	return Ok(BoruvkaResult {
 		in_mst,
 		total_weight: tw[0],
-	})
+	});
 }
 
+/// # Errors
+/// Errors if `n` or `dim` overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_core_distance(
 	points: &GpuBuffer,
 	n: usize,
@@ -455,16 +510,17 @@ pub fn gpu_core_distance(
 	min_pts: usize,
 	core_dist_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: raw device pointers come from live GpuBuffers valid for this launch.
 	unsafe {
 		launch_core_distance(
-			points.ptr_raw() as *const c_void,
+			points.ptr_raw().cast_const(),
 			core_dist_out.ptr_raw(),
-			n as i32,
-			dim as i32,
-			min_pts as i32,
+			ci(n)?,
+			ci(dim)?,
+			ci(min_pts)?,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

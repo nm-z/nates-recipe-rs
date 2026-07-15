@@ -1,8 +1,8 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::kernels::{check_launch, ci};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_ropex_qk(
@@ -31,6 +31,9 @@ unsafe extern "C" {
 
 pub const ROPE_THETA: f64 = 10000.0;
 
+/// # Errors
+/// Returns `HipError` when a dimension exceeds `i32` range.
+#[inline]
 pub fn gpu_rope_qk_heads_inplace(
 	sgn: &GpuBuffer,
 	theta: &GpuBuffer,
@@ -41,23 +44,31 @@ pub fn gpu_rope_qk_heads_inplace(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let mi = ci(m)?;
+	let di = ci(d)?;
+	let headsi = ci(heads)?;
+	let seqi = ci(seq)?;
+	// SAFETY: FFI launch; all buffer pointers are live GPU allocations and dims are range-checked.
 	unsafe {
 		launch_ropex_qk_heads(
 			q.ptr_raw(),
 			k.ptr_raw(),
-			m as i32,
-			d as i32,
-			heads as i32,
-			seq as i32,
-			theta.ptr_raw() as *const c_void,
-			sgn.ptr_raw() as *const c_void,
+			mi,
+			di,
+			headsi,
+			seqi,
+			theta.ptr_raw().cast_const(),
+			sgn.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when a dimension exceeds `i32` range.
+#[inline]
 pub fn gpu_rope_qk(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -68,19 +79,22 @@ pub fn gpu_rope_qk(
 	qo: &GpuBuffer,
 	ko: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_rows_i = ci(n_rows)?;
+	let dim_i = ci(dim)?;
+	// SAFETY: FFI launch; all buffer pointers are live GPU allocations and dims are range-checked.
 	unsafe {
 		launch_ropex_qk(
-			q.ptr_raw() as *const c_void,
-			k.ptr_raw() as *const c_void,
-			positions.ptr_raw() as *const c_void,
+			q.ptr_raw().cast_const(),
+			k.ptr_raw().cast_const(),
+			positions.ptr_raw().cast_const(),
 			qo.ptr_raw(),
 			ko.ptr_raw(),
-			n_rows as i32,
-			dim as i32,
-			theta.ptr_raw() as *const c_void,
+			n_rows_i,
+			dim_i,
+			theta.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

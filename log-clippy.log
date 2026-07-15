@@ -1,0 +1,861 @@
+    Checking log v1.0.0 (/home/nate/Desktop/nates-recipe-rs/log)
+error: `allow` attribute without specifying a reason
+ --> log/src/lib.rs:1:1
+  |
+1 | / #![allow(
+2 | |     non_upper_case_globals,
+3 | |     non_camel_case_types,
+4 | |     non_snake_case,
+5 | |     dead_code
+6 | | )]
+  | |__^
+  |
+  = help: try adding a reason at the end with `, reason = ".."`
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#allow_attributes_without_reason
+  = note: `-D clippy::allow-attributes-without-reason` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::allow_attributes_without_reason)]`
+
+error: inline module found
+   --> log/src/lib.rs:110:1
+    |
+110 | / pub mod Write {
+111 | |     use super::*;
+112 | |     pub fn line(f: Flag, t: impl Display) {
+113 | |         log(&t);
+...   |
+178 | | }
+    | |_^
+    |
+    = help: move the contents of the module to `log/src/Write.rs` or `log/src/Write/mod.rs`, and replace this with `pub mod Write;`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#inline_modules
+    = note: `-D clippy::inline-modules` implied by `-D clippy::restriction`
+    = help: to override `-D clippy::restriction` add `#[allow(clippy::inline_modules)]`
+
+error: incorrect ordering of items (module item groupings specify another order)
+  --> log/src/lib.rs:27:10
+   |
+27 |           static OPT: Mutex<Opt> = Mutex::new(Opt { $($f: false,)+ });
+   |                  ^^^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   |
+note: should be placed before `Flag`
+  --> log/src/lib.rs:24:12
+   |
+24 |           pub enum Flag {
+   |                    ^^^^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+   = note: `-D clippy::arbitrary-source-item-ordering` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::arbitrary_source_item_ordering)]`
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: incorrect ordering of items (module item groupings specify another order)
+  --> log/src/lib.rs:43:12
+   |
+43 | pub struct Err;
+   |            ^^^
+   |
+note: should be placed before `on`
+  --> log/src/lib.rs:28:6
+   |
+28 |           fn on(f: Flag) -> bool {
+   |              ^^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: incorrect ordering of items (module item groupings specify another order)
+  --> log/src/lib.rs:80:12
+   |
+80 | pub struct Errored(pub String);
+   |            ^^^^^^^
+   |
+note: should be placed before `print`
+  --> log/src/lib.rs:76:4
+   |
+76 | fn print(t: &impl Display) {
+   |    ^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+
+error: incorrect ordering of items (module item groupings specify another order)
+   --> log/src/lib.rs:110:9
+    |
+110 | pub mod Write {
+    |         ^^^^^
+    |
+note: should be placed before the following item
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+
+error: used import from `std` instead of `alloc`
+ --> log/src/lib.rs:8:5
+  |
+8 | use std::fmt;
+  |     ^^^ help: consider importing the item from `alloc`: `alloc`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#std_instead_of_alloc
+  = note: `-D clippy::std-instead-of-alloc` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::std_instead_of_alloc)]`
+
+error: used import from `std` instead of `core`
+ --> log/src/lib.rs:9:5
+  |
+9 | use std::fmt::Display;
+  |     ^^^ help: consider importing the item from `core`: `core`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#std_instead_of_core
+  = note: `-D clippy::std-instead-of-core` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::std_instead_of_core)]`
+
+error: missing documentation for a macro
+  --> log/src/lib.rs:17:14
+   |
+17 | macro_rules! flags {
+   |              ^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_docs_in_private_items
+   = note: `-D clippy::missing-docs-in-private-items` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::missing_docs_in_private_items)]`
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:20:3
+   |
+20 | /         pub struct Opt {
+21 | |             $(pub $f: bool,)+
+22 | |         }
+   | |_________^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+   = note: `-D clippy::exhaustive-structs` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::exhaustive_structs)]`
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try adding #[non_exhaustive]
+   |
+20 ~         #[non_exhaustive]
+21 |         pub struct Opt {
+   |
+
+error: exported enums should not be exhaustive
+  --> log/src/lib.rs:24:3
+   |
+24 | /         pub enum Flag {
+25 | |             $($f,)+
+26 | |         }
+   | |_________^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_enums
+   = note: `-D clippy::exhaustive-enums` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::exhaustive_enums)]`
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try adding #[non_exhaustive]
+   |
+24 ~         #[non_exhaustive]
+25 |         pub enum Flag {
+   |
+
+error: you are deriving `PartialEq` and can implement `Eq`
+  --> log/src/lib.rs:23:25
+   |
+23 |           #[derive(Clone, Copy, PartialEq)]
+   |                                 ^^^^^^^^^ help: consider deriving `Eq` as well: `PartialEq, Eq`
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#derive_partial_eq_without_eq
+   = note: `-D clippy::derive-partial-eq-without-eq` implied by `-D clippy::nursery`
+   = help: to override `-D clippy::nursery` add `#[allow(clippy::derive_partial_eq_without_eq)]`
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: missing `return` statement
+  --> log/src/lib.rs:31:19
+   |
+31 |                   $(Flag::$f => o.$f,)+
+   |                                 ^^^^
+...
+37 | / flags!(
+38 | |     loss, acc, epoch, lr, time, r2, device, data, gpu, probe, save, net, prompt, chat
+39 | | );
+   | |_- in this macro invocation
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+   = note: `-D clippy::implicit-return` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::implicit_return)]`
+   = note: this error originates in the macro `flags` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: add `return` as shown
+   |
+31 |                 $(Flag::$f => return o.$f,)+
+   |                               ++++++
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:43:1
+   |
+43 | pub struct Err;
+   | ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+help: try adding #[non_exhaustive]
+   |
+43 + #[non_exhaustive]
+44 | pub struct Err;
+   |
+
+error: incorrect ordering of items (must be alphabetically ordered)
+  --> log/src/lib.rs:47:12
+   |
+47 |     pub const line: bool = true;
+   |               ^^^^
+   |
+note: should be placed before `print`
+  --> log/src/lib.rs:46:12
+   |
+46 |     pub const print: bool = true;
+   |               ^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:50:1
+   |
+50 | pub struct Optusr(pub Opt);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+help: try adding #[non_exhaustive]
+   |
+50 + #[non_exhaustive]
+51 | pub struct Optusr(pub Opt);
+   |
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:51:1
+   |
+51 | pub struct OptDev(pub Opt, pub Err);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+help: try adding #[non_exhaustive]
+   |
+51 + #[non_exhaustive]
+52 | pub struct OptDev(pub Opt, pub Err);
+   |
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:52:1
+   |
+52 | / pub struct Option {
+53 | |     pub user: Optusr,
+54 | |     pub dev: OptDev,
+55 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+help: try adding #[non_exhaustive]
+   |
+52 + #[non_exhaustive]
+53 | pub struct Option {
+   |
+
+error: incorrect ordering of items (must be alphabetically ordered)
+  --> log/src/lib.rs:54:6
+   |
+54 |     pub dev: OptDev,
+   |         ^^^
+   |
+note: should be placed before `user`
+  --> log/src/lib.rs:53:6
+   |
+53 |     pub user: Optusr,
+   |         ^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+
+error: missing `#[inline]` for a function
+  --> log/src/lib.rs:57:1
+   |
+57 | / pub fn set_opt(o: Opt) {
+58 | |     *OPT.lock().unwrap_or_else(|p| p.into_inner()) = o;
+59 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+   = note: `-D clippy::missing-inline-in-public-items` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::missing_inline_in_public_items)]`
+
+error: redundant closure
+  --> log/src/lib.rs:58:29
+   |
+58 |     *OPT.lock().unwrap_or_else(|p| p.into_inner()) = o;
+   |                                ^^^^^^^^^^^^^^^^^^ help: replace the closure with the method itself: `std::sync::PoisonError::into_inner`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#redundant_closure_for_method_calls
+   = note: `-D clippy::redundant-closure-for-method-calls` implied by `-D clippy::pedantic`
+   = help: to override `-D clippy::pedantic` add `#[allow(clippy::redundant_closure_for_method_calls)]`
+
+error: missing `return` statement
+  --> log/src/lib.rs:58:33
+   |
+58 |     *OPT.lock().unwrap_or_else(|p| p.into_inner()) = o;
+   |                                    ^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+58 |     *OPT.lock().unwrap_or_else(|p| return p.into_inner()) = o;
+   |                                    ++++++
+
+error: missing `#[inline]` for a function
+  --> log/src/lib.rs:61:1
+   |
+61 | / pub fn opt() -> Opt {
+62 | |     *OPT.lock().unwrap_or_else(|p| p.into_inner())
+63 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+  --> log/src/lib.rs:62:2
+   |
+62 |     *OPT.lock().unwrap_or_else(|p| p.into_inner())
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+62 |     return *OPT.lock().unwrap_or_else(|p| p.into_inner())
+   |     ++++++
+
+error: redundant closure
+  --> log/src/lib.rs:62:29
+   |
+62 |     *OPT.lock().unwrap_or_else(|p| p.into_inner())
+   |                                ^^^^^^^^^^^^^^^^^^ help: replace the closure with the method itself: `std::sync::PoisonError::into_inner`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#redundant_closure_for_method_calls
+
+error: missing `return` statement
+  --> log/src/lib.rs:62:33
+   |
+62 |     *OPT.lock().unwrap_or_else(|p| p.into_inner())
+   |                                    ^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+62 |     *OPT.lock().unwrap_or_else(|p| return p.into_inner())
+   |                                    ++++++
+
+error: missing documentation for a function
+  --> log/src/lib.rs:65:4
+   |
+65 | fn log(t: &impl Display) {
+   |    ^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_docs_in_private_items
+
+error: used `expect()` on a `Result` value
+  --> log/src/lib.rs:66:2
+   |
+66 |     fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+   = note: `-D clippy::expect-used` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::expect_used)]`
+
+error: used `expect()` on a `Result` value
+  --> log/src/lib.rs:68:14
+   |
+68 |       let mut f = File::options()
+   |  _________________^
+69 | |         .append(true)
+70 | |         .create(true)
+71 | |         .open(path)
+72 | |         .expect("log: open run log");
+   | |____________________________________^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+error: used `expect()` on a `Result` value
+  --> log/src/lib.rs:73:2
+   |
+73 |     writeln!(f, "{t}").expect("log: write run log");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+error: missing documentation for a function
+  --> log/src/lib.rs:76:4
+   |
+76 | fn print(t: &impl Display) {
+   |    ^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_docs_in_private_items
+
+error: exported structs should not be exhaustive
+  --> log/src/lib.rs:80:1
+   |
+80 | pub struct Errored(pub String);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#exhaustive_structs
+help: try adding #[non_exhaustive]
+   |
+80 + #[non_exhaustive]
+81 | pub struct Errored(pub String);
+   |
+
+error: missing `#[inline]` for a method
+  --> log/src/lib.rs:83:2
+   |
+83 | /     pub fn new(t: impl Display) -> Errored {
+84 | |         match Err::log {
+85 | |             true => log(&t),
+86 | |             false => {}
+...  |
+92 | |         Errored(t.to_string())
+93 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+  --> log/src/lib.rs:92:3
+   |
+92 |         Errored(t.to_string())
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+92 |         return Errored(t.to_string())
+   |         ++++++
+
+error: unnecessary structure name repetition
+  --> log/src/lib.rs:83:33
+   |
+83 |     pub fn new(t: impl Display) -> Errored {
+   |                                    ^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#use_self
+   = note: `-D clippy::use-self` implied by `-D clippy::nursery`
+   = help: to override `-D clippy::nursery` add `#[allow(clippy::use_self)]`
+
+error: `match` on a boolean expression
+  --> log/src/lib.rs:84:3
+   |
+84 | /         match Err::log {
+85 | |             true => log(&t),
+86 | |             false => {}
+87 | |         }
+   | |_________^ help: consider using an `if`/`else` expression: `if Err::log { log(&t) }`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_bool
+   = note: `-D clippy::match-bool` implied by `-D clippy::pedantic`
+   = help: to override `-D clippy::pedantic` add `#[allow(clippy::match_bool)]`
+
+error: `match` on a boolean expression
+  --> log/src/lib.rs:88:3
+   |
+88 | /         match Err::print {
+89 | |             true => print(&t),
+90 | |             false => {}
+91 | |         }
+   | |_________^ help: consider using an `if`/`else` expression: `if Err::print { print(&t) }`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_bool
+
+error: unnecessary structure name repetition
+  --> log/src/lib.rs:92:3
+   |
+92 |         Errored(t.to_string())
+   |         ^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#use_self
+
+error: missing `#[inline]` for a method
+  --> log/src/lib.rs:97:2
+   |
+97 | /     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+98 | |         f.write_str(&self.0)
+99 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+  --> log/src/lib.rs:98:3
+   |
+98 |         f.write_str(&self.0)
+   |         ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+98 |         return f.write_str(&self.0)
+   |         ++++++
+
+error: missing `#[inline]` for a method
+   --> log/src/lib.rs:103:2
+    |
+103 | /     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+104 | |         f.write_str(&self.0)
+105 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:104:3
+    |
+104 |         f.write_str(&self.0)
+    |         ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+104 |         return f.write_str(&self.0)
+    |         ++++++
+
+error: missing trait method provided by default: `source`
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: implement the missing `source` method of the `error::Error` trait
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_trait_methods
+    = note: `-D clippy::missing-trait-methods` implied by `-D clippy::restriction`
+    = help: to override `-D clippy::restriction` add `#[allow(clippy::missing_trait_methods)]`
+
+error: missing trait method provided by default: `type_id`
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: implement the missing `type_id` method of the `error::Error` trait
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_trait_methods
+
+error: missing trait method provided by default: `description`
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: implement the missing `description` method of the `error::Error` trait
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_trait_methods
+
+error: missing trait method provided by default: `cause`
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: implement the missing `cause` method of the `error::Error` trait
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_trait_methods
+
+error: missing trait method provided by default: `provide`
+   --> log/src/lib.rs:108:1
+    |
+108 | impl error::Error for Errored {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: implement the missing `provide` method of the `error::Error` trait
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_trait_methods
+
+error: incorrect ordering of items (module item groupings specify another order)
+   --> log/src/lib.rs:119:12
+    |
+119 |     pub trait Show {
+    |               ^^^^
+    |
+note: should be placed before `line`
+   --> log/src/lib.rs:112:9
+    |
+112 |     pub fn line(f: Flag, t: impl Display) {
+    |            ^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arbitrary_source_item_ordering
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:112:2
+    |
+112 | /     pub fn line(f: Flag, t: impl Display) {
+113 | |         log(&t);
+114 | |         match on(f) {
+115 | |             true => print(&t),
+...   |
+118 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: `match` on a boolean expression
+   --> log/src/lib.rs:114:3
+    |
+114 | /         match on(f) {
+115 | |             true => print(&t),
+116 | |             false => {}
+117 | |         }
+    | |_________^ help: consider using an `if`/`else` expression: `if on(f) { print(&t) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_bool
+
+error: missing `#[inline]` for a method
+   --> log/src/lib.rs:124:3
+    |
+124 | /         fn take(self) -> String {
+125 | |             self.to_string()
+126 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:125:4
+    |
+125 |             self.to_string()
+    |             ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+125 |             return self.to_string()
+    |             ++++++
+
+error: `to_string()` called on a `&str`
+   --> log/src/lib.rs:125:4
+    |
+125 |             self.to_string()
+    |             ^^^^^^^^^^^^^^^^ help: try: `self.to_owned()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#str_to_string
+    = note: `-D clippy::str-to-string` implied by `-D clippy::restriction`
+    = help: to override `-D clippy::restriction` add `#[allow(clippy::str_to_string)]`
+
+error: missing `#[inline]` for a method
+   --> log/src/lib.rs:130:3
+    |
+130 | /         fn take(self) -> String {
+131 | |             self
+132 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:131:4
+    |
+131 |             self
+    |             ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+131 |             return self
+    |             ++++++
+
+error: missing `#[inline]` for a method
+   --> log/src/lib.rs:136:3
+    |
+136 | /         fn take(self) -> String {
+137 | |             self.clone()
+138 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:137:4
+    |
+137 |             self.clone()
+    |             ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+137 |             return self.clone()
+    |             ++++++
+
+error: missing `#[inline]` for a method
+   --> log/src/lib.rs:142:3
+    |
+142 | /         fn take(self) -> String {
+143 | |             self.show()
+144 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:143:4
+    |
+143 |             self.show()
+    |             ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+143 |             return self.show()
+    |             ++++++
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:147:2
+    |
+147 | /     pub fn block(f: Flag, text: impl Show) {
+148 | |         let s = text.take();
+149 | |         let t = s.trim_end();
+150 | |         log(&t);
+...   |
+155 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: `match` on a boolean expression
+   --> log/src/lib.rs:151:3
+    |
+151 | /         match on(f) {
+152 | |             true => print(&t),
+153 | |             false => {}
+154 | |         }
+    | |_________^ help: consider using an `if`/`else` expression: `if on(f) { print(&t) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_bool
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:157:2
+    |
+157 | /     pub fn always(t: impl Display) {
+158 | |         let s = t.to_string();
+159 | |         let t = s.trim_end();
+160 | |         log(&t);
+161 | |         print(&t);
+162 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: `t` shadows a previous, unrelated binding
+   --> log/src/lib.rs:159:7
+    |
+159 |         let t = s.trim_end();
+    |             ^
+    |
+note: previous binding is here
+   --> log/src/lib.rs:157:16
+    |
+157 |     pub fn always(t: impl Display) {
+    |                   ^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#shadow_unrelated
+    = note: `-D clippy::shadow-unrelated` implied by `-D clippy::restriction`
+    = help: to override `-D clippy::restriction` add `#[allow(clippy::shadow_unrelated)]`
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:164:2
+    |
+164 | /     pub fn wait(t: impl Display) {
+165 | |         always(t);
+166 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:168:2
+    |
+168 | /     pub fn unwait() {
+169 | |         use std::io::IsTerminal;
+170 | |         match io::stderr().is_terminal() {
+171 | |             true => drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
+...   |
+174 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: importing trait that is only used anonymously
+   --> log/src/lib.rs:169:16
+    |
+169 |         use std::io::IsTerminal;
+    |                      ^^^^^^^^^^ help: use: `IsTerminal as _`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unused_trait_names
+    = note: `-D clippy::unused-trait-names` implied by `-D clippy::restriction`
+    = help: to override `-D clippy::restriction` add `#[allow(clippy::unused_trait_names)]`
+
+error: `match` on a boolean expression
+   --> log/src/lib.rs:170:3
+    |
+170 | /         match io::stderr().is_terminal() {
+171 | |             true => drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
+172 | |             false => {}
+173 | |         }
+    | |_________^ help: consider using an `if`/`else` expression: `if io::stderr().is_terminal() { drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r")) }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_bool
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> log/src/lib.rs:175:2
+    |
+175 |     pub fn err(t: impl Display) -> Result<(), Errored> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_errors_doc
+    = note: `-D clippy::missing-errors-doc` implied by `-D clippy::pedantic`
+    = help: to override `-D clippy::pedantic` add `#[allow(clippy::missing_errors_doc)]`
+
+error: missing `#[inline]` for a function
+   --> log/src/lib.rs:175:2
+    |
+175 | /     pub fn err(t: impl Display) -> Result<(), Errored> {
+176 | |         Result::Err(Errored::new(t))
+177 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#missing_inline_in_public_items
+
+error: missing `return` statement
+   --> log/src/lib.rs:176:3
+    |
+176 |         Result::Err(Errored::new(t))
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+    |
+176 |         return Result::Err(Errored::new(t))
+    |         ++++++
+
+error: could not compile `log` (lib) due to 70 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `log` (lib test) due to 67 previous errors

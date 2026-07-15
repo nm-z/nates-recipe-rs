@@ -1,7 +1,8 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use core::ptr;
-use gpu_core::diffusion::{DiffusionSample, gpu_diffusion_sample};
-use gpu_core::hip::{self, HipError};
+use gpu_core::HipError;
+use gpu_core::diffusion::{Sample, gpu_diffusion_sample};
+use gpu_core::hip;
 use gpu_core::memory::GpuBuffer;
 
 #[test]
@@ -28,7 +29,7 @@ fn diffusion_block_ar_progressive_commit() {
 		return Ok(lb);
 	};
 
-	let DiffusionSample { canvas, steps } =
+	let Sample { canvas, steps } =
 		gpu_diffusion_sample(logits_fn, &initial, bound, 100, n, vocab).expect("sample");
 	let mut out = vec![0.0_f64; n];
 	unsafe { canvas.download_async(&mut out, ptr::null_mut()) }.expect("dl");

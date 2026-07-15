@@ -73,7 +73,7 @@ fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
 }
 
 // Existing k_mathx unary ops carry signature (x, n, out) -> ().
-type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::hip::HipError>;
+type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let b = {
 		let __up = x;

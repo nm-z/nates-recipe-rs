@@ -2,6 +2,7 @@
 	unsafe_code,
 	reason = "HIP_PLATFORM env toggle for the NVIDIA hipcc pass"
 )]
+use core::array::from_fn;
 use std::env;
 use std::fs;
 use std::io;
@@ -9,13 +10,52 @@ use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-// Backend truth comes from hipconfig alone — runtime detection, not hardware:
-// no env overrides, no filesystem probes, no hardcoded default. Installing is
-// the package manager's job, never the build's: a missing or undecided HIP
-// runtime fails the build with the package names.
+/// Count of HIP memory-API choke points tracked by the ledger scan.
+const NAPI: usize = 8;
+
+/// GPU BLAS libraries banned from direct use — `hipBLAS` is the only sanctioned entry.
+const BANNED: [&str; 2] = ["rocblas", "cublas"];
+
+/// HIP memory-API choke points; each may appear at most twice (decl + single ledgered call site).
+const APIS: [&str; NAPI] = [
+	"hipMemcpyAsync(",
+	"hipHostMalloc(",
+	"hipMallocAsync(",
+	"hipMemsetAsync(",
+	"hipHostFree(",
+	"hipFreeAsync(",
+	"hipMemPoolSetAttribute(",
+	"hipMemPoolTrimTo(",
+];
+
+/// Static hipcc flags for the AMD kernel archive; dynamic paths ride the `dynamics` slice.
+const AMD_FLAGS: [&str; 4] = ["-x", "hip", "-fPIC", "-O3"];
+
+/// Static nvcc flags for the NVIDIA device-library (rocPRIM/hipCUB) kernel archive.
+const NV_DEVLIB_FLAGS: [&str; 9] = [
+	"-x",
+	"cu",
+	"-O3",
+	"-diag-suppress",
+	"2810",
+	"-D__HIP_PLATFORM_NVIDIA__=1",
+	"-DTHRUST_IGNORE_CUB_VERSION_CHECK",
+	"-Xcompiler",
+	"-fPIC",
+];
+
+/// Static hipcc flags for the NVIDIA plain-kernel archive compiled under `HIP_PLATFORM=nvidia`.
+const NV_PLAIN_FLAGS: [&str; 4] = ["-fPIC", "-O3", "-diag-suppress", "2810"];
+
+/// Static nvcc flags for the NVIDIA hip→cu memory shim.
+const NV_SHIM_FLAGS: [&str; 3] = ["-O3", "-Xcompiler", "-fPIC"];
+
+/// The HIP backend platform, decided solely by `hipconfig --platform`.
 #[derive(Clone, Copy)]
 enum Platform {
+	/// AMD `ROCm`: hipBLAS/hipSOLVER/hipFFT forward to rocBLAS/rocSOLVER/rocFFT.
 	Amd,
+	/// NVIDIA CUDA: hipBLAS/hipSOLVER/hipFFT wrap cuBLAS/cuSOLVER/cuFFT.
 	Nvidia,
 }
 
@@ -28,51 +68,107 @@ fn put(s: &str) {
 	drop(o.write_all(b"\n"));
 }
 
-/// Prints a line to stderr and exits the build with status 1; never returns.
-/// The sole fatal-error path for every build-script check (chokepoint scan, hipconfig, platform detect).
-fn die(s: &str) -> ! {
-	use std::io::Write as _;
-	let mut e = io::stderr();
-	drop(e.write_all(s.as_bytes()));
-	drop(e.write_all(b"\n"));
-	process::exit(1)
+/// Emits a `cargo:rustc-link-search=native=<path>` directive.
+fn link_search(path: &str) {
+	put(&format!("cargo:rustc-link-search=native={path}"));
 }
 
-/// Unwraps `v`, or aborts the build via `die` (stderr + exit 1) with `what` as the message.
-fn need<T>(v: Option<T>, what: &str) -> T {
-	match v {
-		Some(t) => return t,
-		None => die(what),
-	}
+/// Emits a `cargo:rustc-link-lib=dylib=<name>` directive.
+fn link_lib(name: &str) {
+	put(&format!("cargo:rustc-link-lib=dylib={name}"));
+}
+
+/// Unwraps `v`, or errors the build with `what` as the message.
+fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
+	return v.ok_or_else(|| return what.to_owned());
+}
+
+/// Returns `key`'s environment value, or `default` when unset.
+fn env_or(key: &str, default: String) -> String {
+	return env::var(key).unwrap_or(default);
+}
+
+/// Prefixes `env_or(key, default)` with `prefix`, yielding a compiler flag string.
+fn envflag(prefix: &str, key: &str, default: String) -> String {
+	return format!("{prefix}{}", env_or(key, default));
 }
 
 /// Runs `hipconfig <flag>`, returning its trimmed stdout.
-/// Exits the build (die) if the binary is missing or the call fails, naming the hip-runtime package to install.
-fn hipconfig(flag: &str) -> String {
+/// Errs (naming the hip-runtime package to install) if the binary is missing or the call fails.
+fn hipconfig(flag: &str) -> Result<String, String> {
 	let out = match process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {
-			die("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
+			return Err(
+				"hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia"
+					.to_owned(),
+			);
 		}
-		Err(e) => die(&format!("hipconfig {flag}: cannot run: {e}")),
+		Err(e) => return Err(format!("hipconfig {flag}: cannot run: {e}")),
 	};
 	if !out.status.success() {
-		die(&format!(
+		return Err(format!(
 			"hipconfig {flag}: {}",
 			String::from_utf8_lossy(&out.stderr)
 		));
 	}
-	return String::from_utf8_lossy(&out.stdout).trim().to_owned();
+	return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
 }
 
-/// Returns the `ROCm` install root as reported by `hipconfig --rocmpath`, the base for every include and link path.
-/// Aborts the build (via `die`) if hipconfig is missing, errors, or yields empty output — never returns a fallback.
-fn rocm_path() -> String {
-	let p = hipconfig("--rocmpath");
-	if p.is_empty() {
-		die("hipconfig --rocmpath: empty output");
+/// Recursively scans every `.rs` under `dir`: errors on a banned BLAS symbol, else records each HIP
+/// memory-API choke-point occurrence into `sites` keyed by API index. Recurses into subdirectories.
+fn scan_sources(dir: &Path, sites: &mut [Vec<String>]) -> Result<(), String> {
+	let Ok(rd) = fs::read_dir(dir) else {
+		return Ok(());
+	};
+	for entry in rd.flatten() {
+		let p = entry.path();
+		if p.is_dir() {
+			scan_sources(&p, sites)?;
+			continue;
+		}
+		if !p.extension().is_some_and(|x| return x == "rs") {
+			continue;
+		}
+		let text = fs::read_to_string(&p).unwrap_or_default();
+		for (i, line) in text.lines().enumerate() {
+			let low = line.to_lowercase();
+			for pat in &BANNED {
+				if low.contains(pat) {
+					return Err(format!(
+						"{}:{}: direct {pat} banned — call hipBLAS (hipblas*) instead",
+						p.display(),
+						i.saturating_add(1)
+					));
+				}
+			}
+			for (k, api) in APIS.iter().enumerate() {
+				if line.contains(api) {
+					sites[k].push(format!("{}:{}", p.display(), i.saturating_add(1)));
+				}
+			}
+		}
 	}
-	return p;
+	return Ok(());
+}
+
+/// Errors if any API choke point in `sites` exceeds two occurrences (decl + single call site);
+/// walks the parallel `sites`/`apis` tails by recursion.
+fn check_counts(sites: &[Vec<String>], apis: &[&str]) -> Result<(), String> {
+	let Some((s, srest)) = sites.split_first() else {
+		return Ok(());
+	};
+	let Some((api, arest)) = apis.split_first() else {
+		return Ok(());
+	};
+	if s.len() > 2 {
+		return Err(format!(
+			"{api}: {} occurrences (max 2 = decl + choke call site): {}",
+			s.len(),
+			s.join(", ")
+		));
+	}
+	return check_counts(srest, arest);
 }
 
 /// Recursively appends every `.hip` file under `dir` to `out` in filesystem order.
@@ -83,326 +179,228 @@ fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	};
 	for entry in entries.flatten() {
 		let path = entry.path();
-		match Some(()).filter(|_u| return path.is_dir()) {
-			Some(()) => collect_hip_files(&path, out),
-			None => {
-				let hip = Some(path)
-					.filter(|p| return p.extension().is_some_and(|e| return e == "hip"));
-				out.extend(hip);
-			}
+		if path.is_dir() {
+			collect_hip_files(&path, out);
+			continue;
+		}
+		if path.extension().is_some_and(|x| return x == "hip") {
+			out.push(path);
 		}
 	}
 }
 
-/// Recursively removes every stale `.o` and `libhip*.a` under `dir` so the full kernel set recompiles fresh, keeping a leftover object from re-linking as a duplicate symbol.
+/// Copies each `.hip` in `files` to a flat `.cu` under `cudir`, bucketing device-library sources
+/// (rocPRIM/hipCUB) into `dev` and the rest into `plain`; recurses down the slice tail.
+fn stage_cus(
+	files: &[PathBuf],
+	cudir: &str,
+	dev: &mut Vec<String>,
+	plain: &mut Vec<String>,
+) -> Result<(), String> {
+	let Some((src_path, rest)) = files.split_first() else {
+		return Ok(());
+	};
+	let src = need(src_path.to_str(), "non-utf8 kernel path")?;
+	let rel = src_path
+		.strip_prefix("src/kernels")
+		.map_err(|e| return format!("{src}: outside src/kernels: {e}"))?;
+	let stem = need(rel.to_str(), "non-utf8 kernel path")?.replace(['/', '\\', '.'], "_");
+	let cu = format!("{cudir}/{stem}.cu");
+	fs::copy(src, &cu).map_err(|e| return format!("copy {src} to {cu}: {e}"))?;
+	let text = fs::read_to_string(src_path).unwrap_or_default();
+	if text.contains("rocprim") || text.contains("hipcub") {
+		dev.push(cu);
+	} else {
+		plain.push(cu);
+	}
+	return stage_cus(rest, cudir, dev, plain);
+}
+
+/// Recursively removes every stale `.o` and `libhip*.a` under `dir` so the full kernel set recompiles fresh.
 /// Unreadable dirs and failed removals are silently skipped; never fails the build.
 fn sweep(dir: &Path) {
 	let Ok(rd) = fs::read_dir(dir) else {
 		return;
 	};
-	for e in rd.flatten() {
-		let p = e.path();
-		match Some(()).filter(|_u| return p.is_dir()) {
-			Some(()) => sweep(&p),
-			None => {
-				let name = p.file_name().and_then(|n| return n.to_str()).unwrap_or("");
-				let stale = p.extension().is_some_and(|e| return e == "o")
-					|| (name.starts_with("libhip") && name.ends_with(".a"));
-				if stale {
-					drop(fs::remove_file(&p));
-				}
+	for entry in rd.flatten() {
+		let p = entry.path();
+		if p.is_dir() {
+			sweep(&p);
+		} else {
+			let name = p.file_name().and_then(|n| return n.to_str()).unwrap_or("");
+			let is_a = Path::new(name)
+				.extension()
+				.is_some_and(|x| return x.eq_ignore_ascii_case("a"));
+			let stale = p.extension().is_some_and(|x| return x == "o")
+				|| (name.starts_with("libhip") && is_a);
+			if stale {
+				drop(fs::remove_file(&p));
 			}
 		}
 	}
 }
 
-fn main() {
-	{
-		let banned = ["rocblas", "cublas"];
-		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-			let Ok(rd) = fs::read_dir(dir) else {
-				return;
-			};
-			for e in rd.flatten() {
-				let p = e.path();
-				match Some(()).filter(|_u| return p.is_dir()) {
-					Some(()) => walk(&p, out),
-					None => {
-						let rs = Some(p).filter(|q| {
-							return q.extension().is_some_and(|x| return x == "rs");
-						});
-						out.extend(rs);
-					}
-				}
-			}
-		}
-		let mut files = Vec::new();
-		walk(Path::new("src"), &mut files);
-		for f in files {
-			let text = fs::read_to_string(&f).unwrap_or_default();
-			let lines: Vec<&str> = text.lines().collect();
-			for (i, line) in lines.iter().enumerate() {
-				let low = line.to_lowercase();
-				for pat in &banned {
-					if low.contains(pat) {
-						die(&format!(
-							"{}:{}: direct {} banned — call hipBLAS (hipblas*) instead",
-							f.display(),
-							i.saturating_add(1),
-							pat
-						));
-					}
-				}
-			}
+/// Recreates `path` empty, erroring on a failed create.
+fn fresh_dir(path: &str) -> Result<(), String> {
+	drop(fs::remove_dir_all(path));
+	return fs::create_dir_all(path).map_err(|e| return format!("mkdir {path}: {e}"));
+}
+
+/// Emits the three hipBLAS/hipSOLVER/hipFFT link directives shared by both platforms.
+fn link_hip() {
+	link_lib("hipblas");
+	link_lib("hipsolver");
+	link_lib("hipfft");
+}
+
+/// Compiles `files` with `compiler` into the static archive `name`, applying `statics` then
+/// `dynamics` flags followed by one `-isystem <dir>` pair per `includes` entry.
+fn compile_kernels<P: AsRef<Path>>(
+	compiler: &str,
+	statics: &[&str],
+	dynamics: &[&str],
+	includes: &[&str],
+	files: &[P],
+	name: &str,
+) {
+	let mut b = cc::Build::new();
+	b.compiler(compiler).no_default_flags(true).warnings(false);
+	for f in statics.iter().chain(dynamics.iter()) {
+		b.flag(f);
+	}
+	for inc in includes {
+		b.flag("-isystem").flag(inc);
+	}
+	b.files(files).compile(name);
+}
+
+/// Compiles the kernel set when non-empty, optionally toggling the nvidia platform env around the call.
+fn compile_if(
+	compiler: &str,
+	statics: &[&str],
+	dynamics: &[&str],
+	includes: &[&str],
+	files: &[String],
+	name: &str,
+	nv_env: bool,
+) {
+	if files.is_empty() {
+		return;
+	}
+	if nv_env {
+		// SAFETY: the build script is single-threaded here; nothing else reads HIP_PLATFORM.
+		unsafe {
+			env::set_var("HIP_PLATFORM", "nvidia");
 		}
 	}
-	{
-		let apis = [
-			"hipMemcpyAsync(",
-			"hipHostMalloc(",
-			"hipMallocAsync(",
-			"hipMemsetAsync(",
-			"hipHostFree(",
-			"hipFreeAsync(",
-			"hipMemPoolSetAttribute(",
-			"hipMemPoolTrimTo(",
-		];
-		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-			let Ok(rd) = fs::read_dir(dir) else {
-				return;
-			};
-			for e in rd.flatten() {
-				let p = e.path();
-				match Some(()).filter(|_u| return p.is_dir()) {
-					Some(()) => walk(&p, out),
-					None => {
-						let rs = Some(p).filter(|q| {
-							return q.extension().is_some_and(|x| return x == "rs");
-						});
-						out.extend(rs);
-					}
-				}
-			}
-		}
-		let mut files = Vec::new();
-		walk(Path::new("src"), &mut files);
-		let mut counts = vec![0usize; apis.len()];
-		let mut sites: Vec<Vec<String>> = vec![Vec::new(); apis.len()];
-		for f in &files {
-			let text = fs::read_to_string(f).unwrap_or_default();
-			let lines: Vec<&str> = text.lines().collect();
-			for (i, line) in lines.iter().enumerate() {
-				for (k, api) in apis.iter().enumerate() {
-					if line.contains(api) {
-						counts[k] = counts[k].saturating_add(1);
-						sites[k].push(format!(
-							"{}:{}",
-							f.display(),
-							i.saturating_add(1)
-						));
-					}
-				}
-			}
-		}
-		for (k, api) in apis.iter().enumerate() {
-			if counts[k] > 2 {
-				die(&format!(
-					"{}: {} occurrences (max 2 = decl + choke call site): {}",
-					api,
-					counts[k],
-					sites[k].join(", ")
-				));
-			}
+	compile_kernels(compiler, statics, dynamics, includes, files, name);
+	if nv_env {
+		// SAFETY: the build script is single-threaded here; nothing else reads HIP_PLATFORM.
+		unsafe {
+			env::remove_var("HIP_PLATFORM");
 		}
 	}
-	let platform = match hipconfig("--platform").as_str() {
+}
+
+fn main() -> Result<(), String> {
+	let mut sites: [Vec<String>; NAPI] = from_fn(|_u| return Vec::new());
+	scan_sources(Path::new("src"), &mut sites)?;
+	check_counts(&sites, &APIS)?;
+	let platform = match hipconfig("--platform")?.as_str() {
 		"amd" => Platform::Amd,
 		"nvidia" => Platform::Nvidia,
-		other => die(&format!(
-			"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
-		)),
+		other => {
+			return Err(format!(
+				"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
+			));
+		}
 	};
-	let out_dir = need(env::var("OUT_DIR").ok(), "OUT_DIR unset");
-
+	let out_dir = need(env::var("OUT_DIR").ok(), "OUT_DIR unset")?;
 	let mut hip_files = Vec::new();
 	collect_hip_files(Path::new("src/kernels"), &mut hip_files);
 	hip_files.sort();
 	put("cargo:rerun-if-changed=src/kernels");
-
 	sweep(Path::new(&out_dir));
-
+	let rocm = hipconfig("--rocmpath")?;
+	if rocm.is_empty() {
+		return Err("hipconfig --rocmpath: empty output".to_owned());
+	}
+	link_search(&format!("{rocm}/lib"));
 	match platform {
 		Platform::Amd => {
-			let rocm = rocm_path();
-			let rocm_extra_inc = env::var("ROCM_EXTRA_INCLUDE")
-				.unwrap_or_else(|_e| format!("{rocm}/include"));
-			let gpu_arch =
-				env::var("GPU_ARCH").unwrap_or_else(|_e| return "gfx1101".to_owned());
 			let hipcc = env::var("HIPCC").unwrap_or_else(|_e| {
-				let hipcc_path = format!("{rocm}/bin/hipcc");
-				match Some(hipcc_path).filter(|p| return Path::new(p).exists()) {
-					Some(p) => return p,
-					None => return format!("{rocm}/bin/amdclang++"),
+				let p = format!("{rocm}/bin/hipcc");
+				if Path::new(&p).exists() {
+					return p;
 				}
+				return format!("{rocm}/bin/amdclang++");
 			});
-
-			cc::Build::new()
-				.compiler(&hipcc)
-				.no_default_flags(true)
-				.warnings(false)
-				.flag("-x")
-				.flag("hip")
-				.flag(format!("--rocm-path={rocm}"))
-				.flag(format!("-I{rocm_extra_inc}"))
-				.flag("-fPIC")
-				.flag(format!("--offload-arch={gpu_arch}"))
-				.flag("-O3")
-				.files(&hip_files)
-				.compile("hipkernels");
+			let rp = format!("--rocm-path={rocm}");
+			let ip = envflag("-I", "ROCM_EXTRA_INCLUDE", format!("{rocm}/include"));
+			let ap = envflag("--offload-arch=", "GPU_ARCH", "gfx1101".to_owned());
+			let dflags = [rp.as_str(), ip.as_str(), ap.as_str()];
+			compile_kernels(&hipcc, &AMD_FLAGS, &dflags, &[], &hip_files, "hipkernels");
+			link_lib("amdhip64");
+			link_search(&env_or("ROCM_EXTRA_LIB", format!("{rocm}/lib")));
+			link_hip();
 		}
 		Platform::Nvidia => {
-			let rocm = rocm_path();
-			let cuda =
-				env::var("CUDA_PATH").unwrap_or_else(|_e| return "/opt/cuda".to_owned());
-			let hipcc = env::var("HIPCC").unwrap_or_else(|_e| format!("{rocm}/bin/hipcc"));
-			let nvcc = env::var("NVCC").unwrap_or_else(|_e| format!("{cuda}/bin/nvcc"));
-			let cuda_arch =
-				env::var("CUDA_ARCH").unwrap_or_else(|_e| return "sm_86".to_owned());
-			let arch_flag = format!("-arch={cuda_arch}");
-			let manifest = need(
-				env::var("CARGO_MANIFEST_DIR").ok(),
-				"CARGO_MANIFEST_DIR unset",
+			let cuda = env_or("CUDA_PATH", "/opt/cuda".to_owned());
+			let nvcc = env_or("NVCC", format!("{cuda}/bin/nvcc"));
+			let arch = format!("-arch={}", env_or("CUDA_ARCH", "sm_86".to_owned()));
+			let compat = format!(
+				"{}/src/nvidia_compat",
+				need(
+					env::var("CARGO_MANIFEST_DIR").ok(),
+					"CARGO_MANIFEST_DIR unset"
+				)?
 			);
-			let compat = format!("{manifest}/src/nvidia_compat");
-			let shfl_compat = format!("{compat}/hip_shfl_compat.cuh");
-
+			let shfl = format!("{compat}/hip_shfl_compat.cuh");
 			let nvhip = format!("{out_dir}/nvhip");
-			drop(fs::remove_dir_all(&nvhip));
-			if let Err(e) = fs::create_dir_all(&nvhip) {
-				die(&format!("mkdir {nvhip}: {e}"));
-			}
+			fresh_dir(&nvhip)?;
 			drop(unix_fs::symlink(
 				format!("{rocm}/include/hip"),
 				format!("{nvhip}/hip"),
 			));
-
 			let cudir = format!("{out_dir}/cu");
-			drop(fs::remove_dir_all(&cudir));
-			if let Err(e) = fs::create_dir_all(&cudir) {
-				die(&format!("mkdir {cudir}: {e}"));
-			}
-			let mut device_lib_cus = Vec::new();
-			let mut plain_cus = Vec::new();
-			for src_path in &hip_files {
-				let src = need(src_path.to_str(), "non-utf8 kernel path");
-				let rel = match src_path.strip_prefix("src/kernels") {
-					Ok(r) => r,
-					Err(e) => die(&format!("{src}: outside src/kernels: {e}")),
-				};
-				let cu_name = need(rel.to_str(), "non-utf8 kernel path")
-					.replace(['/', '\\', '.'], "_");
-				let cu = format!("{cudir}/{cu_name}.cu");
-				if let Err(e) = fs::copy(src, &cu) {
-					die(&format!("copy {src} to {cu}: {e}"));
-				}
-				let text = fs::read_to_string(src_path).unwrap_or_default();
-				if text.contains("rocprim") || text.contains("hipcub") {
-					device_lib_cus.push(cu);
-				} else {
-					plain_cus.push(cu);
-				}
-			}
-
-			if !device_lib_cus.is_empty() {
-				cc::Build::new()
-					.compiler(&nvcc)
-					.no_default_flags(true)
-					.warnings(false)
-					.flag("-x")
-					.flag("cu")
-					.flag("-O3")
-					.flag(&arch_flag)
-					.flag("-diag-suppress")
-					.flag("2810")
-					.flag("-isystem")
-					.flag(&compat)
-					.flag("-isystem")
-					.flag(&nvhip)
-					.flag("-include")
-					.flag(&shfl_compat)
-					.flag("-D__HIP_PLATFORM_NVIDIA__=1")
-					.flag("-DTHRUST_IGNORE_CUB_VERSION_CHECK")
-					.flag("-Xcompiler")
-					.flag("-fPIC")
-					.files(&device_lib_cus)
-					.compile("hipkernels_devlib");
-			}
-
-			if !plain_cus.is_empty() {
-				unsafe { env::set_var("HIP_PLATFORM", "nvidia") };
-				cc::Build::new()
-					.compiler(&hipcc)
-					.no_default_flags(true)
-					.warnings(false)
-					.flag("-fPIC")
-					.flag("-O3")
-					.flag(&arch_flag)
-					.flag("-diag-suppress")
-					.flag("2810")
-					.flag("-include")
-					.flag(&shfl_compat)
-					.files(&plain_cus)
-					.compile("hipkernels");
-				unsafe {
-					env::remove_var("HIP_PLATFORM");
-				}
-			}
-
+			fresh_dir(&cudir)?;
+			let (mut device_lib_cus, mut plain_cus): (Vec<String>, Vec<String>) =
+				(Vec::new(), Vec::new());
+			stage_cus(&hip_files, &cudir, &mut device_lib_cus, &mut plain_cus)?;
+			compile_if(
+				&nvcc,
+				&NV_DEVLIB_FLAGS,
+				&[arch.as_str(), "-include", shfl.as_str()],
+				&[compat.as_str(), nvhip.as_str()],
+				&device_lib_cus,
+				"hipkernels_devlib",
+				false,
+			);
+			compile_if(
+				&env_or("HIPCC", format!("{rocm}/bin/hipcc")),
+				&NV_PLAIN_FLAGS,
+				&[arch.as_str(), "-include", shfl.as_str()],
+				&[],
+				&plain_cus,
+				"hipkernels",
+				true,
+			);
 			put("cargo:rerun-if-changed=src/shim_nvidia.cu");
-			cc::Build::new()
-				.compiler(&nvcc)
-				.no_default_flags(true)
-				.warnings(false)
-				.flag("-O3")
-				.flag(&arch_flag)
-				.flag("-Xcompiler")
-				.flag("-fPIC")
-				.flag(format!("-I{cuda}/include"))
-				.file("src/shim_nvidia.cu")
-				.compile("hipshim");
+			compile_kernels(
+				&nvcc,
+				&NV_SHIM_FLAGS,
+				&[arch.as_str(), format!("-I{cuda}/include").as_str()],
+				&[],
+				&["src/shim_nvidia.cu"],
+				"hipshim",
+			);
+			link_hip();
+			link_search(&format!("{cuda}/lib64"));
+			for lib in ["cudart", "cublas", "cusolver", "cufft"] {
+				link_lib(lib);
+			}
 		}
 	}
-
-	match platform {
-		Platform::Amd => {
-			let rocm = rocm_path();
-			let rocm_extra_lib =
-				env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
-			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
-			put("cargo:rustc-link-lib=dylib=amdhip64");
-			put(&format!("cargo:rustc-link-search=native={rocm_extra_lib}"));
-			// hipBLAS/hipSOLVER/hipFFT (forward to rocBLAS/rocSOLVER/rocFFT on AMD).
-			put("cargo:rustc-link-lib=dylib=hipblas");
-			put("cargo:rustc-link-lib=dylib=hipsolver");
-			put("cargo:rustc-link-lib=dylib=hipfft");
-			put("cargo:rustc-link-lib=dylib=stdc++");
-		}
-		Platform::Nvidia => {
-			let rocm = rocm_path();
-			let cuda =
-				env::var("CUDA_PATH").unwrap_or_else(|_e| return "/opt/cuda".to_owned());
-			// hipBLAS/hipSOLVER/hipFFT built for the NVIDIA platform (wrap cuBLAS/
-			// cuSOLVER/cuFFT) live in the HIP install tree, same as on AMD.
-			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
-			put("cargo:rustc-link-lib=dylib=hipblas");
-			put("cargo:rustc-link-lib=dylib=hipsolver");
-			put("cargo:rustc-link-lib=dylib=hipfft");
-			put(&format!("cargo:rustc-link-search=native={cuda}/lib64"));
-			put("cargo:rustc-link-lib=dylib=cudart");
-			put("cargo:rustc-link-lib=dylib=cublas");
-			put("cargo:rustc-link-lib=dylib=cusolver");
-			put("cargo:rustc-link-lib=dylib=cufft");
-			put("cargo:rustc-link-lib=dylib=stdc++");
-		}
-	}
+	link_lib("stdc++");
+	return Ok(());
 }

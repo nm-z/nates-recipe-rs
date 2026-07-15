@@ -1,8 +1,8 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::kernels::{check_launch, ci, cu};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_floor_scale_to_idx(
@@ -54,6 +54,9 @@ unsafe extern "C" {
 	);
 }
 
+/// # Errors
+/// Returns `HipError` when `n` or `n_samples` overflows `i32`.
+#[inline]
 pub fn gpu_bootstrap_sample(
 	uniform_ws: &GpuBuffer,
 	n: usize,
@@ -61,19 +64,25 @@ pub fn gpu_bootstrap_sample(
 	_seed: usize,
 	idx_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_samples32 = ci(n_samples)?;
+	let n32 = ci(n)?;
+	// SAFETY: FFI launcher call; buffer pointers stay live for the launch and the counts are valid.
 	unsafe {
 		launch_floor_scale_to_idx(
-			uniform_ws.ptr_raw() as *const c_void,
+			uniform_ws.ptr_raw().cast_const(),
 			idx_out.ptr_raw(),
-			n_samples as i32,
-			n as i32,
+			n_samples32,
+			n32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n_features`, `k`, or `seed` overflows its target width.
+#[inline]
 pub fn gpu_feature_subset(
 	keys_ws: &GpuBuffer,
 	n_features: usize,
@@ -81,20 +90,27 @@ pub fn gpu_feature_subset(
 	seed: usize,
 	idx_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_features32 = ci(n_features)?;
+	let k32 = ci(k)?;
+	let seed32 = cu(seed)?;
+	// SAFETY: FFI launcher call; buffer pointers stay live for the launch and the counts are valid.
 	unsafe {
 		launch_feature_subset(
 			keys_ws.ptr_raw(),
 			idx_out.ptr_raw(),
-			n_features as i32,
-			k as i32,
-			seed as u32,
+			n_features32,
+			k32,
+			seed32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n` or `seed` overflows its target width.
+#[inline]
 pub fn gpu_random_threshold_split(
 	feature_col: &GpuBuffer,
 	d_min_ws: &GpuBuffer,
@@ -103,21 +119,27 @@ pub fn gpu_random_threshold_split(
 	seed: usize,
 	threshold_out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n32 = ci(n)?;
+	let seed32 = cu(seed)?;
+	// SAFETY: FFI launcher call; buffer pointers stay live for the launch and the counts are valid.
 	unsafe {
 		launch_random_threshold_split(
-			feature_col.ptr_raw() as *const c_void,
+			feature_col.ptr_raw().cast_const(),
 			d_min_ws.ptr_raw(),
 			d_max_ws.ptr_raw(),
 			threshold_out.ptr_raw(),
-			n as i32,
-			seed as u32,
+			n32,
+			seed32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n` or `n_trees` overflows `i32`.
+#[inline]
 pub fn gpu_tree_ensemble_predict(
 	bins: &GpuBuffer,
 	node_feature: &GpuBuffer,
@@ -132,27 +154,33 @@ pub fn gpu_tree_ensemble_predict(
 	n_trees: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n32 = ci(n)?;
+	let n_trees32 = ci(n_trees)?;
+	// SAFETY: FFI launcher call; buffer pointers stay live for the launch and the counts are valid.
 	unsafe {
 		launch_tree_ensemble_predict(
-			bins.ptr_raw() as *const c_void,
-			node_feature.ptr_raw() as *const c_void,
-			node_thresh.ptr_raw() as *const c_void,
-			node_left.ptr_raw() as *const c_void,
-			node_right.ptr_raw() as *const c_void,
-			node_is_leaf.ptr_raw() as *const c_void,
-			node_value.ptr_raw() as *const c_void,
-			tree_root.ptr_raw() as *const c_void,
+			bins.ptr_raw().cast_const(),
+			node_feature.ptr_raw().cast_const(),
+			node_thresh.ptr_raw().cast_const(),
+			node_left.ptr_raw().cast_const(),
+			node_right.ptr_raw().cast_const(),
+			node_is_leaf.ptr_raw().cast_const(),
+			node_value.ptr_raw().cast_const(),
+			tree_root.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			n_trees as i32,
-			lr.ptr_raw() as *const c_void,
+			n32,
+			n_trees32,
+			lr.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when the zero-fill fails or `n_samples` or `n` overflows `i32`.
+#[inline]
 pub fn gpu_oob_mask(
 	bootstrap_idx: &GpuBuffer,
 	used_ws: &GpuBuffer,
@@ -161,16 +189,19 @@ pub fn gpu_oob_mask(
 	oob_out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	used_ws.memset_zero(n)?;
+	let n_samples32 = ci(n_samples)?;
+	let n32 = ci(n)?;
+	// SAFETY: FFI launcher call; buffer pointers stay live for the launch and the counts are valid.
 	unsafe {
 		launch_oob_mask(
-			bootstrap_idx.ptr_raw() as *const c_void,
+			bootstrap_idx.ptr_raw().cast_const(),
 			used_ws.ptr_raw(),
 			oob_out.ptr_raw(),
-			n_samples as i32,
-			n as i32,
+			n_samples32,
+			n32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

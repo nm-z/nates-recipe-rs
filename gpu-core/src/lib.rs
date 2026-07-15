@@ -3,7 +3,8 @@
 	clippy::too_many_arguments,
 	clippy::unnecessary_cast,
 	clippy::missing_safety_doc,
-	clippy::type_complexity
+	clippy::type_complexity,
+	reason = "GPU kernel launchers carry many FFI scalar args, cast between HIP integer widths at ABI boundaries, document safety at the module level, and encode tier/dim state in nested types"
 )]
 
 pub mod attention;
@@ -39,3 +40,7 @@ pub mod sequence;
 pub mod svm;
 pub mod tiered;
 pub mod waterfall;
+
+/// A HIP runtime status code wrapped as an error; the field is the raw status.
+#[derive(Debug)]
+pub struct HipError(pub i32);

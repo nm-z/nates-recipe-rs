@@ -1,5 +1,5 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime")]
-use gpu_core::hip::HipError;
+use gpu_core::HipError;
 use gpu_core::kernels::*;
 use gpu_core::log::{Write, epoch};
 use gpu_core::memory::GpuBuffer;

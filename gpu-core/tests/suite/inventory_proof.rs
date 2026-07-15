@@ -8,7 +8,7 @@ use crate::common;
 // gaps implemented. The test FAILS only on a registered-op mismatch (a real bug);
 // unmapped items are reported as the remaining backlog, not failures.
 
-use gpu_core::hip::HipError;
+use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::cmp;
 use std::collections::HashMap;

@@ -1,24 +1,39 @@
-use crate::hip::{HipError, check};
-use crate::kernels::{hipblas_handle, hipsolver_handle, safe_i32};
+use crate::HipError;
+use crate::hip::check;
+use crate::kernels::{
+	ci, gpu_copy_into, gpu_pack_upper_tri, gpu_transpose, hipblas_handle, hipsolver_handle,
+	safe_i32,
+};
 use crate::memory::GpuBuffer;
-use std::cmp::Ordering;
+use core::cmp::Ordering;
+use core::ffi::c_void;
+use core::ptr;
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
+/// hipBLAS operation: no transpose.
 const OP_NONE: u32 = 111;
+/// hipBLAS operation: transpose.
 const OP_TRANS: u32 = 112;
+/// hipBLAS fill mode: lower triangle.
 const FILL_LOWER: u32 = 121;
 
+/// hipSOLVER fill mode: lower triangle.
 const SOLVER_FILL_LOWER: u32 = 122;
+/// hipSOLVER fill mode: upper triangle.
 const SOLVER_FILL_UPPER: u32 = 121;
+/// hipSOLVER eigensolver job: compute eigenvectors.
 const SOLVER_EIG_VECTOR: u32 = 202;
+/// hipSOLVER SVD job: compute all singular vectors.
 const SOLVER_JOB_ALL: i8 = 65;
 
+/// hipFFT transform type: complex-to-complex, double precision.
 const HIPFFT_Z2Z: i32 = 0x69;
+/// hipFFT transform type: real-to-complex, double precision.
 const HIPFFT_D2Z: i32 = 0x6a;
+/// hipFFT direction: forward transform.
 const HIPFFT_FORWARD: i32 = -1;
+/// hipFFT direction: inverse transform.
 const HIPFFT_BACKWARD: i32 = 1;
 
 unsafe extern "C" {
@@ -248,61 +263,81 @@ unsafe extern "C" {
 	fn hipfftExecD2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void) -> i32;
 }
 
+/// # Errors
+/// Returns [`HipError`] if the hipBLAS reduction fails.
+#[inline]
 pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
+	// SAFETY: the hipBLAS handle is initialized and x points to n valid device f64s; result is a live host scalar.
 	let status = unsafe {
 		hipblasDasum(
 			hipblas_handle(),
 			safe_i32(n),
-			x.ptr_raw() as *const f64,
+			x.ptr_raw().cast::<f64>(),
 			1,
-			&mut result,
+			&raw mut result,
 		)
 	};
 	check(status)?;
-	out.load(&[result])
+	return out.load(&[result]);
 }
 
+/// # Errors
+/// Returns [`HipError`] if the hipBLAS call fails.
+#[inline]
 pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result: i32 = 0;
+	// SAFETY: the hipBLAS handle is initialized and x points to n valid device f64s; result is a live host i32.
 	let status = unsafe {
 		hipblasIdamax(
 			hipblas_handle(),
 			safe_i32(n),
-			x.ptr_raw() as *const f64,
+			x.ptr_raw().cast::<f64>(),
 			1,
-			&mut result,
+			&raw mut result,
 		)
 	};
 	check(status)?;
-	out.load(&[(result - 1).max(0) as f64])
+	return out.load(&[f64::from((result - 1).max(0))]);
 }
 
+/// # Errors
+/// Returns [`HipError`] if the hipBLAS rank-k update fails.
+#[inline]
 pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let alpha = 1.0f64;
 	let beta = 0.0f64;
+	let ni = ci(n)?;
+	let ki = ci(k)?;
+	// SAFETY: the hipBLAS handle is initialized and a, out are valid device buffers for the n-by-k update.
 	let status = unsafe {
 		hipblasDsyrk(
 			hipblas_handle(),
 			FILL_LOWER,
 			OP_NONE,
-			n as i32,
-			k as i32,
-			&alpha,
-			a.ptr_raw() as *const f64,
-			k as i32,
-			&beta,
-			out.ptr_raw() as *mut f64,
-			n as i32,
+			ni,
+			ki,
+			&raw const alpha,
+			a.ptr_raw().cast::<f64>(),
+			ki,
+			&raw const beta,
+			out.ptr_raw().cast::<f64>(),
+			ni,
 		)
 	};
-	check(status)
+	return check(status);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+	clippy::too_many_arguments,
+	reason = "strided-batched GEMM exposes every leading dimension, stride, offset, and transpose flag as a distinct parameter"
+)]
+/// # Errors
+/// Returns [`HipError`] if the batched GEMM fails.
+#[inline]
 pub fn gpu_bmm_into(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
+	a_mat: &GpuBuffer,
+	b_mat: &GpuBuffer,
 	batch: usize,
 	m: usize,
 	n: usize,
@@ -330,46 +365,57 @@ pub fn gpu_bmm_into(
 		Ordering::Equal => OP_NONE,
 		Ordering::Less | Ordering::Greater => OP_TRANS,
 	};
+	let ni = ci(n)?;
+	let mi = ci(m)?;
+	let ki = ci(k)?;
+	let batchi = ci(batch)?;
+	// SAFETY: every buffer pointer is a live device allocation sized by the caller, and the dimension, stride, and offset arguments are range-checked into their FFI integer types as they are passed.
 	let status = unsafe {
 		hipblasDgemmStridedBatched(
 			hipblas_handle(),
 			op_b,
 			op_a,
-			n as i32,
-			m as i32,
-			k as i32,
-			&alpha,
-			b.as_ptr_offset(b_off) as *const f64,
-			ldb as i32,
-			stride_b as i64,
-			a.as_ptr_offset(a_off) as *const f64,
-			lda as i32,
-			stride_a as i64,
-			&beta,
-			out.as_ptr_offset(c_off) as *mut f64,
-			ldc as i32,
-			stride_c as i64,
-			batch as i32,
+			ni,
+			mi,
+			ki,
+			&raw const alpha,
+			b_mat.as_ptr_offset(b_off).cast::<f64>(),
+			ci(ldb)?,
+			i64::try_from(stride_b).map_err(|_err| return HipError(1))?,
+			a_mat.as_ptr_offset(a_off).cast::<f64>(),
+			ci(lda)?,
+			i64::try_from(stride_a).map_err(|_err| return HipError(1))?,
+			&raw const beta,
+			out.as_ptr_offset(c_off).cast::<f64>(),
+			ci(ldc)?,
+			i64::try_from(stride_c).map_err(|_err| return HipError(1))?,
+			batchi,
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+#[must_use]
+#[inline]
 pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
+	// SAFETY: hipsolverDgetrf_bufferSize reads only the scalar dimension arguments and writes lwork through a valid stack pointer; the matrix pointer is null as permitted for a size-only query.
 	unsafe {
 		hipsolverDgetrf_bufferSize(
 			hipsolver_handle(),
-			n as i32,
-			n as i32,
+			safe_i32(n),
+			safe_i32(n),
 			ptr::null_mut(),
-			n as i32,
-			&mut lwork,
+			safe_i32(n),
+			&raw mut lwork,
 		);
 	}
-	(lwork.max(1) as usize) * 8
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
 }
 
+/// # Errors
+/// Returns [`HipError`] if the hipSOLVER LU factorization fails.
+#[inline]
 pub fn gpu_lu_factor(
 	a: &GpuBuffer,
 	n: usize,
@@ -378,53 +424,62 @@ pub fn gpu_lu_factor(
 	ipiv_out: &GpuBuffer,
 	info_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy_into(a, n * n, lu_out)?;
+	gpu_copy_into(a, n * n, lu_out)?;
 	let mut lwork: i32 = 0;
+	let ni = ci(n)?;
+	// SAFETY: hipSOLVER getrf buffer-size query; device pointers are valid and n is range-checked to i32.
 	unsafe {
 		hipsolverDgetrf_bufferSize(
 			hipsolver_handle(),
-			n as i32,
-			n as i32,
-			lu_out.ptr_raw() as *mut f64,
-			n as i32,
-			&mut lwork,
+			ni,
+			ni,
+			lu_out.ptr_raw().cast::<f64>(),
+			ni,
+			&raw mut lwork,
 		);
 	}
+	// SAFETY: hipSOLVER getrf factorization; device pointers are valid and n/lwork are checked.
 	let status = unsafe {
 		hipsolverDgetrf(
 			hipsolver_handle(),
-			n as i32,
-			n as i32,
-			lu_out.ptr_raw() as *mut f64,
-			n as i32,
-			work.ptr_raw() as *mut f64,
+			ni,
+			ni,
+			lu_out.ptr_raw().cast::<f64>(),
+			ni,
+			work.ptr_raw().cast::<f64>(),
 			lwork,
-			ipiv_out.ptr_raw() as *mut i32,
-			info_out.ptr_raw() as *mut i32,
+			ipiv_out.ptr_raw().cast::<i32>(),
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+#[must_use]
+#[inline]
 pub fn gpu_lu_solve_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	let mut lwork: i32 = 0;
+	// SAFETY: hipsolverDgetrs_bufferSize reads only the scalar dimension arguments and writes lwork through a valid stack pointer; every matrix pointer is null as permitted for a size-only query.
 	unsafe {
 		hipsolverDgetrs_bufferSize(
 			hipsolver_handle(),
 			OP_NONE,
-			n as i32,
-			nrhs as i32,
+			safe_i32(n),
+			safe_i32(nrhs),
 			ptr::null_mut(),
-			n as i32,
+			safe_i32(n),
 			ptr::null_mut(),
 			ptr::null_mut(),
-			n as i32,
-			&mut lwork,
+			safe_i32(n),
+			&raw mut lwork,
 		);
 	}
-	(lwork.max(1) as usize) * 8
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension exceeds `i32` range or the hipSOLVER triangular solve fails.
+#[inline]
 pub fn gpu_lu_solve(
 	lu: &GpuBuffer,
 	ipiv: &GpuBuffer,
@@ -435,59 +490,70 @@ pub fn gpu_lu_solve(
 	info_out: &GpuBuffer,
 	x_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy_into(b, n * nrhs, x_out)?;
+	use crate::kernels::{ci, gpu_copy_into};
+	gpu_copy_into(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
+	let ni = ci(n)?;
+	let nrhsi = ci(nrhs)?;
+	// SAFETY: hipsolverDgetrs_bufferSize reads the scalar dimensions and the live lu/ipiv/x_out device allocations and writes lwork through a valid stack pointer; n and nrhs were range-checked into i32 above.
 	unsafe {
 		hipsolverDgetrs_bufferSize(
 			hipsolver_handle(),
 			OP_NONE,
-			n as i32,
-			nrhs as i32,
-			lu.ptr_raw() as *mut f64,
-			n as i32,
-			ipiv.ptr_raw() as *mut i32,
-			x_out.ptr_raw() as *mut f64,
-			n as i32,
-			&mut lwork,
+			ni,
+			nrhsi,
+			lu.ptr_raw().cast::<f64>(),
+			ni,
+			ipiv.ptr_raw().cast::<i32>(),
+			x_out.ptr_raw().cast::<f64>(),
+			ni,
+			&raw mut lwork,
 		);
 	}
+	// SAFETY: lu/ipiv/x_out/work/info_out are live device buffers sized for the n-by-nrhs solve and lwork was queried above.
 	let status = unsafe {
 		hipsolverDgetrs(
 			hipsolver_handle(),
 			OP_NONE,
-			n as i32,
-			nrhs as i32,
-			lu.ptr_raw() as *mut f64,
-			n as i32,
-			ipiv.ptr_raw() as *mut i32,
-			x_out.ptr_raw() as *mut f64,
-			n as i32,
-			work.ptr_raw() as *mut f64,
+			ni,
+			nrhsi,
+			lu.ptr_raw().cast::<f64>(),
+			ni,
+			ipiv.ptr_raw().cast::<i32>(),
+			x_out.ptr_raw().cast::<f64>(),
+			ni,
+			work.ptr_raw().cast::<f64>(),
 			lwork,
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+#[inline]
+#[must_use]
 pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	let mut lwork: i32 = 0;
+	// SAFETY: buffer-size query with null data pointers; only the local lwork is written.
 	unsafe {
 		hipsolverDpotrs_bufferSize(
 			hipsolver_handle(),
 			SOLVER_FILL_UPPER,
-			n as i32,
-			nrhs as i32,
+			safe_i32(n),
+			safe_i32(nrhs),
 			ptr::null_mut(),
-			n as i32,
+			safe_i32(n),
 			ptr::null_mut(),
-			n as i32,
-			&mut lwork,
+			safe_i32(n),
+			&raw mut lwork,
 		);
 	}
-	(lwork.max(1) as usize) * 8
+	return usize::try_from(lwork.max(1)).unwrap_or_default() * 8;
 }
 
+/// # Errors
+/// Returns `HipError` if the hipsolver Cholesky solve fails.
+#[inline]
 pub fn gpu_potrs(
 	l: &GpuBuffer,
 	b: &GpuBuffer,
@@ -497,66 +563,78 @@ pub fn gpu_potrs(
 	info_out: &GpuBuffer,
 	x_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy_into(b, n * nrhs, x_out)?;
+	use crate::kernels::gpu_copy_into;
+	gpu_copy_into(b, n * nrhs, x_out)?;
 	let mut lwork: i32 = 0;
+	// SAFETY: l and x_out are valid device buffers and lwork is a valid local; the query writes only lwork.
 	unsafe {
 		hipsolverDpotrs_bufferSize(
 			hipsolver_handle(),
 			SOLVER_FILL_UPPER,
-			n as i32,
-			nrhs as i32,
-			l.ptr_raw() as *mut f64,
-			n as i32,
-			x_out.ptr_raw() as *mut f64,
-			n as i32,
-			&mut lwork,
+			safe_i32(n),
+			safe_i32(nrhs),
+			l.ptr_raw().cast::<f64>(),
+			safe_i32(n),
+			x_out.ptr_raw().cast::<f64>(),
+			ci(n)?,
+			&raw mut lwork,
 		);
 	}
+	// SAFETY: hipSOLVER FFI; handle and device buffers are valid for the call and dims are range-checked.
 	let status = unsafe {
 		hipsolverDpotrs(
 			hipsolver_handle(),
 			SOLVER_FILL_UPPER,
-			n as i32,
-			nrhs as i32,
-			l.ptr_raw() as *mut f64,
-			n as i32,
-			x_out.ptr_raw() as *mut f64,
-			n as i32,
-			work.ptr_raw() as *mut f64,
+			ci(n)?,
+			ci(nrhs)?,
+			l.ptr_raw().cast::<f64>(),
+			ci(n)?,
+			x_out.ptr_raw().cast::<f64>(),
+			ci(n)?,
+			work.ptr_raw().cast::<f64>(),
 			lwork,
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+#[must_use]
+#[inline]
 pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 	let k = m.min(n);
 	let mut lwork: i32 = 0;
 	let mut lwork_q: i32 = 0;
+	// SAFETY: hipSOLVER geqrf size query; null data pointer is valid for a size-only query and dims are range-checked.
 	unsafe {
 		hipsolverDgeqrf_bufferSize(
 			hipsolver_handle(),
-			m as i32,
-			n as i32,
+			safe_i32(m),
+			safe_i32(n),
 			ptr::null_mut(),
-			m as i32,
-			&mut lwork,
-		);
-		hipsolverDorgqr_bufferSize(
-			hipsolver_handle(),
-			m as i32,
-			n as i32,
-			k as i32,
-			ptr::null_mut(),
-			m as i32,
-			ptr::null_mut(),
-			&mut lwork_q,
+			safe_i32(m),
+			&raw mut lwork,
 		);
 	}
-	(lwork.max(lwork_q).max(1) as usize) * 8
+	// SAFETY: hipSOLVER orgqr size query; null data pointer is valid for a size-only query and dims are range-checked.
+	unsafe {
+		hipsolverDorgqr_bufferSize(
+			hipsolver_handle(),
+			safe_i32(m),
+			safe_i32(n),
+			safe_i32(k),
+			ptr::null_mut(),
+			safe_i32(m),
+			ptr::null_mut(),
+			&raw mut lwork_q,
+		);
+	}
+	return usize::try_from(lwork.max(lwork_q).max(1)).unwrap_or(1) * 8;
 }
 
+/// # Errors
+/// Returns [`HipError`] if a hipSOLVER QR routine fails or a dimension exceeds `i32`.
+#[inline]
 pub fn gpu_qr(
 	a: &GpuBuffer,
 	m: usize,
@@ -569,83 +647,95 @@ pub fn gpu_qr(
 ) -> Result<(), HipError> {
 	let k = m.min(n);
 
-	crate::kernels::gpu_transpose(a, m, n, q_out)?;
+	gpu_transpose(a, m, n, q_out)?;
 
 	let mut lwork: i32 = 0;
+	// SAFETY: hipSOLVER buffer-size query receives the live handle, the q_out device buffer, and a stack out-pointer; dims are range-checked into i32.
 	unsafe {
 		hipsolverDgeqrf_bufferSize(
 			hipsolver_handle(),
-			m as i32,
-			n as i32,
-			q_out.ptr_raw() as *mut f64,
-			m as i32,
-			&mut lwork,
+			ci(m)?,
+			ci(n)?,
+			q_out.ptr_raw().cast::<f64>(),
+			ci(m)?,
+			&raw mut lwork,
 		);
 	}
+	// SAFETY: hipSOLVER geqrf receives the live handle and device buffers for q_out/tau/work/info; dims are range-checked into i32.
 	let status = unsafe {
 		hipsolverDgeqrf(
 			hipsolver_handle(),
-			m as i32,
-			n as i32,
-			q_out.ptr_raw() as *mut f64,
-			m as i32,
-			tau.ptr_raw() as *mut f64,
-			work.ptr_raw() as *mut f64,
+			ci(m)?,
+			ci(n)?,
+			q_out.ptr_raw().cast::<f64>(),
+			ci(m)?,
+			tau.ptr_raw().cast::<f64>(),
+			work.ptr_raw().cast::<f64>(),
 			lwork,
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
 	check(status)?;
 
-	crate::kernels::gpu_pack_upper_tri(q_out, m, n, r_out)?;
+	gpu_pack_upper_tri(q_out, m, n, r_out)?;
 
 	let mut lwork_q: i32 = 0;
+	// SAFETY: hipsolver handle is initialized and q_out, tau are valid device buffers; lwork_q is a valid host out-param.
 	unsafe {
 		hipsolverDorgqr_bufferSize(
 			hipsolver_handle(),
-			m as i32,
-			n as i32,
-			k as i32,
-			q_out.ptr_raw() as *mut f64,
-			m as i32,
-			tau.ptr_raw() as *mut f64,
-			&mut lwork_q,
+			ci(m)?,
+			ci(n)?,
+			ci(k)?,
+			q_out.ptr_raw().cast::<f64>(),
+			ci(m)?,
+			tau.ptr_raw().cast::<f64>(),
+			&raw mut lwork_q,
 		);
 	}
-	let status = unsafe {
+	// SAFETY: hipsolver handle is initialized and q_out, tau, work, info_out are valid device buffers for the m-by-n factorization.
+	let status_q = unsafe {
 		hipsolverDorgqr(
 			hipsolver_handle(),
-			m as i32,
-			n as i32,
-			k as i32,
-			q_out.ptr_raw() as *mut f64,
-			m as i32,
-			tau.ptr_raw() as *mut f64,
-			work.ptr_raw() as *mut f64,
+			ci(m)?,
+			ci(n)?,
+			ci(k)?,
+			q_out.ptr_raw().cast::<f64>(),
+			safe_i32(m),
+			tau.ptr_raw().cast::<f64>(),
+			work.ptr_raw().cast::<f64>(),
 			lwork_q,
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
-	check(status)
+	return check(status_q);
 }
 
+#[inline]
+#[must_use]
 pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 	let mut lwork: i32 = 0;
+	// SAFETY: hipsolverDsyevd_bufferSize only probes workspace size; the null data pointers are its documented probe inputs
 	unsafe {
 		hipsolverDsyevd_bufferSize(
 			hipsolver_handle(),
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
-			n as i32,
+			safe_i32(n),
 			ptr::null_mut(),
-			n as i32,
+			safe_i32(n),
 			ptr::null_mut(),
-			&mut lwork,
+			&raw mut lwork,
 		);
 	}
-	(lwork.max(1) as usize) * 8
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
 }
 
+/// Symmetric eigendecomposition via hipsolver.
+///
+/// # Errors
+/// Returns `HipError` if a hipsolver call or size cast fails.
+#[inline]
 pub fn gpu_eigh_sym(
 	a: &GpuBuffer,
 	n: usize,
@@ -654,52 +744,61 @@ pub fn gpu_eigh_sym(
 	evals_out: &GpuBuffer,
 	evecs_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	crate::kernels::gpu_copy_into(a, n * n, evecs_out)?;
+	use crate::kernels;
+	kernels::gpu_copy_into(a, n * n, evecs_out)?;
 	let mut lwork: i32 = 0;
+	// SAFETY: every pointer references a live device buffer for the eigendecomposition; hipsolver writes lwork only
 	unsafe {
 		hipsolverDsyevd_bufferSize(
 			hipsolver_handle(),
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
-			n as i32,
-			evecs_out.ptr_raw() as *mut f64,
-			n as i32,
-			evals_out.ptr_raw() as *mut f64,
-			&mut lwork,
+			safe_i32(n),
+			evecs_out.ptr_raw().cast::<f64>(),
+			safe_i32(n),
+			evals_out.ptr_raw().cast::<f64>(),
+			&raw mut lwork,
 		);
 	}
+	// SAFETY: handle and device buffers are valid and dims are range-checked for the symmetric eigensolver
 	let status = unsafe {
 		hipsolverDsyevd(
 			hipsolver_handle(),
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
-			n as i32,
-			evecs_out.ptr_raw() as *mut f64,
-			n as i32,
-			evals_out.ptr_raw() as *mut f64,
-			work.ptr_raw() as *mut f64,
+			ci(n)?,
+			evecs_out.ptr_raw().cast::<f64>(),
+			ci(n)?,
+			evals_out.ptr_raw().cast::<f64>(),
+			work.ptr_raw().cast::<f64>(),
 			lwork,
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
-	check(status)
+	return check(status);
 }
 
+#[inline]
+#[must_use]
 pub fn gpu_svd_workspace_bytes(m: usize, n: usize) -> usize {
 	let mut lwork: i32 = 0;
+	// SAFETY: handle is valid; the workspace-size query only writes lwork
 	unsafe {
 		hipsolverDgesvd_bufferSize(
 			hipsolver_handle(),
 			SOLVER_JOB_ALL,
 			SOLVER_JOB_ALL,
-			m as i32,
-			n as i32,
-			&mut lwork,
+			safe_i32(m),
+			safe_i32(n),
+			&raw mut lwork,
 		);
 	}
-	((lwork.max(1) as usize) + m * n + n * n) * 8
+	return (usize::try_from(lwork.max(1)).unwrap_or(1) + m * n + n * n) * 8;
 }
 
+/// # Errors
+/// Returns [`HipError`] if the hipSOLVER SVD workspace query or factorization fails.
+#[inline]
 pub fn gpu_svd(
 	a: &GpuBuffer,
 	m: usize,
@@ -710,84 +809,105 @@ pub fn gpu_svd(
 	s_out: &GpuBuffer,
 	vt_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let a_cm = work.view(0, m * n);
-	let v = work.view(m * n, n * n);
-	let solver_off = m * n + n * n;
+	let mn = m * n;
+	let nn = n * n;
+	let a_cm = work.view(0, mn);
+	let v = work.view(mn, nn);
+	let solver_off = mn + nn;
 
-	crate::kernels::gpu_transpose(a, m, n, &a_cm)?;
+	gpu_transpose(a, m, n, &a_cm)?;
 
 	let mut lwork: i32 = 0;
+	// SAFETY: handle is valid; the workspace-size query only writes lwork
 	unsafe {
 		hipsolverDgesvd_bufferSize(
 			hipsolver_handle(),
 			SOLVER_JOB_ALL,
 			SOLVER_JOB_ALL,
-			m as i32,
-			n as i32,
-			&mut lwork,
+			ci(m)?,
+			ci(n)?,
+			&raw mut lwork,
 		);
 	}
+	let mi = ci(m)?;
+	let ni = ci(n)?;
+	// SAFETY: mi and ni are the validated i32 matrix dimensions and every pointer argument addresses a device buffer sized for the gesvd call.
 	let status = unsafe {
 		hipsolverDgesvd(
 			hipsolver_handle(),
 			SOLVER_JOB_ALL,
 			SOLVER_JOB_ALL,
-			m as i32,
-			n as i32,
-			a_cm.ptr_raw() as *mut f64,
-			m as i32,
-			s_out.ptr_raw() as *mut f64,
-			u_out.ptr_raw() as *mut f64,
-			m as i32,
-			v.ptr_raw() as *mut f64,
-			n as i32,
-			work.as_ptr_offset(solver_off) as *mut f64,
+			mi,
+			ni,
+			a_cm.ptr_raw().cast::<f64>(),
+			mi,
+			s_out.ptr_raw().cast::<f64>(),
+			u_out.ptr_raw().cast::<f64>(),
+			mi,
+			v.ptr_raw().cast::<f64>(),
+			ni,
+			work.as_ptr_offset(solver_off).cast::<f64>(),
 			lwork,
 			ptr::null_mut(),
-			info_out.ptr_raw() as *mut i32,
+			info_out.ptr_raw().cast::<i32>(),
 		)
 	};
 	check(status)?;
-	crate::kernels::gpu_transpose(&v, n, n, vt_out)
+	return gpu_transpose(&v, n, n, vt_out);
 }
 
+/// Cached hipFFT plan handle keyed by transform type and length.
 struct CachedFftPlan {
+	/// Raw hipFFT plan pointer stored as an integer address so the struct is `Send`.
 	plan: usize,
 }
+// SAFETY: the wrapped plan is an opaque driver handle only ever touched under the cache mutex, so moving it across threads is sound.
 unsafe impl Send for CachedFftPlan {}
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+/// Cache key: transform type plus length uniquely identify a plan.
 struct FftKey {
+	/// hipFFT transform-type constant (Z2Z or D2Z).
 	fft_type: i32,
+	/// Transform length in elements.
 	n: usize,
 }
 
+/// Process-wide cache of hipFFT plans, one per `(fft_type, n)` key.
 static FFT_CACHE: OnceLock<Mutex<HashMap<FftKey, CachedFftPlan>>> = OnceLock::new();
 
+/// Returns a cached hipFFT plan for `(fft_type, n)`, creating one on first use.
 fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	let mut cache = FFT_CACHE
-		.get_or_init(|| Mutex::new(HashMap::new()))
+		.get_or_init(|| return Mutex::new(HashMap::new()))
 		.lock()
-		.unwrap_or_else(|p| p.into_inner());
+		.unwrap_or_else(PoisonError::into_inner);
 	let key = FftKey { fft_type, n };
-	let cached = cache.get(&key).map(|entry| entry.plan);
-	match cached {
-		Some(plan) => Ok(plan as *mut c_void),
-		None => {
-			let mut plan: *mut c_void = ptr::null_mut();
-			let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
-			check(status)?;
-			cache.insert(
-				key,
-				CachedFftPlan {
-					plan: plan as usize,
-				},
-			);
-			Ok(plan)
-		}
+	let cached = cache.get(&key).map(|entry| return entry.plan);
+	if let Some(plan) = cached {
+		drop(cache);
+		return Ok(ptr::with_exposed_provenance_mut(plan));
 	}
+	let mut plan: *mut c_void = ptr::null_mut();
+	let nx = ci(n)?;
+	// SAFETY: nx is the validated transform length and plan is a valid out-pointer the driver fills in.
+	let status = unsafe { hipfftPlan1d(&raw mut plan, nx, fft_type, 1) };
+	check(status)?;
+	cache.insert(
+		key,
+		CachedFftPlan {
+			plan: plan.expose_provenance(),
+		},
+	);
+	drop(cache);
+	return Ok(plan);
 }
 
+/// Executes an in-place complex-to-complex 1-D FFT of length `n` on `input` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if plan creation or the hipFFT execution fails.
+#[inline]
 pub fn gpu_fft_c2c_1d(
 	input: &GpuBuffer,
 	n: usize,
@@ -799,12 +919,19 @@ pub fn gpu_fft_c2c_1d(
 		Ordering::Equal => HIPFFT_BACKWARD,
 		Ordering::Less | Ordering::Greater => HIPFFT_FORWARD,
 	};
+	// SAFETY: plan is a valid cached hipFFT handle and the buffers outlive the call.
 	let status = unsafe { hipfftExecZ2Z(plan, input.ptr_raw(), out.ptr_raw(), direction) };
-	check(status)
+	return check(status);
 }
 
+/// Executes a real-to-complex 1-D FFT of length `n` on `input_real` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if plan creation or the hipFFT execution fails.
+#[inline]
 pub fn gpu_rfft_1d(input_real: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let plan = fft_plan(HIPFFT_D2Z, n)?;
+	// SAFETY: plan is a valid cached hipFFT handle and the buffers outlive the call.
 	let status = unsafe { hipfftExecD2Z(plan, input_real.ptr_raw(), out.ptr_raw()) };
-	check(status)
+	return check(status);
 }

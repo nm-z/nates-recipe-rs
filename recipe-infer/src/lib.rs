@@ -29,7 +29,7 @@ pub use params::*;
 pub use scratch::*;
 pub use work::{GEMM_GFLOPS, VRAM_GBS, Work, layer_bwd, layer_fwd};
 
-pub fn init() -> Result<(), gpu_core::hip::HipError> {
+pub fn init() -> Result<(), gpu_core::HipError> {
 	gpu_core::hip::set_device(0)?;
 	gpu_core::hip::retain_mempool(0)
 }

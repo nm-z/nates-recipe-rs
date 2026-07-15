@@ -1,18 +1,26 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
+use crate::hip::{check, hipGetLastError};
 use crate::infer_ops::gpu_gemm_bt_f64;
 use crate::kernels::{
-	gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_softmax_backward_into,
+	ci, gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_softmax_backward_into,
 	gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::mem;
-use std::ptr;
+use core::ffi::c_void;
+use core::mem;
+use core::ptr;
 
+/// Ticks the launch counters and reports any pending HIP launch error.
+///
+/// # Errors
+/// Returns [`HipError`] if the preceding kernel launch reported a failure.
 fn cl() -> Result<(), HipError> {
-	crate::callspy::tick(&crate::callspy::LAUNCH);
-	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-	check(unsafe { crate::hip::hipGetLastError() })
+	tick(&LAUNCH);
+	tick(&GET_LAST_ERROR);
+	// SAFETY: hipGetLastError is a pure status read with no preconditions.
+	let err = unsafe { hipGetLastError() };
+	return check(err);
 }
 
 unsafe extern "C" {
@@ -40,6 +48,11 @@ unsafe extern "C" {
 	);
 }
 
+/// Accumulates expert `e`'s weighted output into `out` on device.
+///
+/// # Errors
+/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
+#[inline]
 pub fn gpu_moe_weighted_accumulate(
 	ye: &GpuBuffer,
 	gate: &GpuBuffer,
@@ -49,21 +62,31 @@ pub fn gpu_moe_weighted_accumulate(
 	e: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let ni = ci(n)?;
+	let di = ci(d)?;
+	let n_experts_i = ci(n_experts)?;
+	let ei = ci(e)?;
+	// SAFETY: every buffer outlives the launch and the sizes match the kernel contract.
 	unsafe {
 		launch_moex_weighted_accumulate(
-			ye.ptr_raw() as *const c_void,
-			gate.ptr_raw() as *const c_void,
+			ye.ptr_raw().cast_const(),
+			gate.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			d as i32,
-			n_experts as i32,
-			e as i32,
+			ni,
+			di,
+			n_experts_i,
+			ei,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// Backpropagates expert `e` through the weighted accumulate on device.
+///
+/// # Errors
+/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
+#[inline]
 pub fn gpu_moe_weighted_accumulate_backward(
 	d_out: &GpuBuffer,
 	gate: &GpuBuffer,
@@ -75,23 +98,33 @@ pub fn gpu_moe_weighted_accumulate_backward(
 	d_ye: &GpuBuffer,
 	d_gate: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let ni = ci(n)?;
+	let di = ci(d)?;
+	let n_experts_i = ci(n_experts)?;
+	let ei = ci(e)?;
+	// SAFETY: every buffer outlives the launch and the sizes match the kernel contract.
 	unsafe {
 		launch_moex_weighted_accumulate_backward(
-			d_out.ptr_raw() as *const c_void,
-			gate.ptr_raw() as *const c_void,
-			ye.ptr_raw() as *const c_void,
+			d_out.ptr_raw().cast_const(),
+			gate.ptr_raw().cast_const(),
+			ye.ptr_raw().cast_const(),
 			d_ye.ptr_raw(),
 			d_gate.ptr_raw(),
-			n as i32,
-			d as i32,
-			n_experts as i32,
-			e as i32,
+			ni,
+			di,
+			n_experts_i,
+			ei,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// Routes tokens through the softmax gate and mixes every expert on device.
+///
+/// # Errors
+/// Returns [`HipError`] if an allocation, a GEMM, or an accumulate launch fails.
+#[inline]
 pub fn gpu_moe_route(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -114,9 +147,14 @@ pub fn gpu_moe_route(
 		gpu_gemm(hidden, &we, n_tokens, d_model, d_model, &ye)?;
 		gpu_moe_weighted_accumulate(&ye, &gate, n_tokens, d_model, n_experts, e, &out)?;
 	}
-	Ok(out)
+	return Ok(out);
 }
 
+/// Backpropagates the routed mixture into hidden, gate, and expert gradients.
+///
+/// # Errors
+/// Returns [`HipError`] if an allocation, a GEMM, or a launch fails.
+#[inline]
 pub fn gpu_moe_backward(
 	hidden: &GpuBuffer,
 	gate_w: &GpuBuffer,
@@ -165,5 +203,5 @@ pub fn gpu_moe_backward(
 	let d_gate_w = GpuBuffer::alloc(d_model * n_experts)?;
 	gpu_gemm_at(hidden, &d_logits, d_model, n_experts, n_tokens, &d_gate_w)?;
 
-	Ok((d_hidden, d_gate_w, d_expert_w))
+	return Ok((d_hidden, d_gate_w, d_expert_w));
 }

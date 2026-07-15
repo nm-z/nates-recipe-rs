@@ -1,17 +1,25 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::hip::check;
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
+/// Generates elementwise unary math launcher wrappers over the `launch_mx_*` HIP kernels.
 macro_rules! mx {
     ($($name:ident => $launch:ident),* $(,)?) => {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void); )* }
         $(
+            /// # Errors
+            /// Returns `HipError` if the length overflows `i32` or the kernel launch fails.
+            #[inline]
             pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, ptr::null_mut()); }
+                let n = crate::kernels::ci(n)?;
+                // SAFETY: pointers come from live GpuBuffers valid for the kernel's duration; n is a checked i32.
+                unsafe { $launch(x.ptr_raw().cast_const(), out.ptr_raw(), n, ptr::null_mut()); }
                 crate::callspy::tick(&crate::callspy::LAUNCH);
                 crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-                check(unsafe { crate::hip::hipGetLastError() })
+                // SAFETY: hipGetLastError is an FFI query with no preconditions.
+                return check(unsafe { crate::hip::hipGetLastError() });
             }
         )*
     };

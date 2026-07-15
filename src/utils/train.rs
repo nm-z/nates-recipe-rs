@@ -495,20 +495,18 @@ impl ModelInner {
 			.map(|_probe| {
 				let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 				let out = params[last].out_dim;
-				let kv = |name: &str, val: usize| ogdl::Node {
-					name: name.to_string(),
-					children: vec![ogdl::Node {
-						name: val.to_string(),
-						children: Vec::new(),
-					}],
+				let kv = |name: &str, val: usize| {
+					return ogdl::Node::new(
+						name.to_owned(),
+						vec![ogdl::Node::leaf(&val.to_string())],
+					);
 				};
-				let sect = |name: &str, kids: Vec<ogdl::Node>| ogdl::Node {
-					name: name.to_string(),
-					children: kids,
+				let sect = |name: &str, kids: Vec<ogdl::Node>| {
+					return ogdl::Node::new(name.to_owned(), kids);
 				};
-				ogdl::Node {
-					name: String::new(),
-					children: vec![
+				ogdl::Node::new(
+					String::new(),
+					vec![
 						sect(
 							"arch",
 							vec![
@@ -530,7 +528,7 @@ impl ModelInner {
 							],
 						),
 					],
-				}
+				)
 			});
 		Some(())
 			.filter(|_probe| !plotting && !rerun)

@@ -147,7 +147,7 @@ unsafe extern "C" {
 type Launch = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, *mut c_void);
 
 // gpu_* public wrappers (existing ops) share the (a,b,n,out) signature.
-type GpuBin = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::hip::HipError>;
+type GpuBin = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::HipError>;
 
 enum Op {
 	// raw launcher from the new .hip

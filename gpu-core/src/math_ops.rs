@@ -1,9 +1,10 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
-use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::mem;
-use std::ptr;
+use crate::HipError;
+use crate::hip::cu_count;
+use crate::kernels::{check_launch, ci};
+use crate::memory::{GpuBuffer, memset_dev};
+use core::ffi::c_void;
+use core::mem;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_rsqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
@@ -97,322 +98,485 @@ unsafe extern "C" {
 	);
 }
 
+/// Split-K output-tile row height, in `k` elements.
 const SK_BM: usize = 64;
+/// Split-K output-tile column width, in `n` elements.
 const SK_BN: usize = 64;
+/// Target number of concurrent waves per compute unit for split-K.
 const SK_WAVES: usize = 8;
+/// Minimum contraction-axis rows assigned to one split-K slice.
 const SK_MIN_SLICE: usize = 256;
 
+/// Number of split-K partitions for a `dW` accumulation of the given shape.
+#[must_use]
+#[inline]
 pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
-	let target_blocks = crate::hip::cu_count() * SK_WAVES;
+	let target_blocks = cu_count() * SK_WAVES;
 	let out_tiles = k.div_ceil(SK_BM) * n.div_ceil(SK_BN);
-	let target = (target_blocks / out_tiles.max(1)).max(1);
-	let max_by_rows = (m / SK_MIN_SLICE).max(1);
-	target.min(max_by_rows).min(m.max(1))
+	let target = target_blocks.div_euclid(out_tiles.max(1)).max(1);
+	let max_by_rows = m.div_euclid(SK_MIN_SLICE).max(1);
+	return target.min(max_by_rows).min(m.max(1));
 }
 
+/// Element count of the split-K partials buffer for a `dW` of the given shape.
+#[must_use]
+#[inline]
 pub fn splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
-	splitk_dw_p(m, k, n) * k * n
+	return splitk_dw_p(m, k, n) * k * n;
 }
 
+/// Computes the elementwise reciprocal square root of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_rsqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_rsqrt(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise reciprocal of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_reciprocal(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_reciprocal(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise maximum of `a` and `b` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `a`, `b`, and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_emax(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise minimum of `a` and `b` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `a`, `b`, and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_emin(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise sine of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_sin(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_sin(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise cosine of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_cos(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_cos(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise tangent of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_tan(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_tan(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise two-argument arctangent of `a` and `b` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `a`, `b`, and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_atan2(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise `ln(1 + x)` of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_log1p(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_log1p(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise `exp(x) - 1` of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_expm1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_expm1(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise floor of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_floor(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_floor(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise ceiling of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_ceil(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_ceil(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise round-to-nearest of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_round(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_round(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise truncation of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_trunc(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_trunc(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the elementwise floating-point remainder of `a` over `b` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `a`, `b`, and `out` are valid device buffers of at least `n` elements.
 	unsafe {
 		launch_fmod(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Subtracts the device scalar `s` from each element of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_sub_scalar(
 	x: &GpuBuffer,
 	s: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
 		launch_sub_scalar(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			s.ptr_raw() as *const c_void,
+			n_i32,
+			s.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Divides each element of `x` by the device scalar `s` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_div_scalar(
 	x: &GpuBuffer,
 	s: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
 		launch_div_scalar(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			s.ptr_raw() as *const c_void,
+			n_i32,
+			s.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Subtracts each element of `x` from the device scalar `s` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_rsub_scalar(
 	x: &GpuBuffer,
 	s: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
 		launch_rsub_scalar(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			s.ptr_raw() as *const c_void,
+			n_i32,
+			s.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Divides the device scalar `s` by each element of `x` into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_rdiv_scalar(
 	x: &GpuBuffer,
 	s: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
 		launch_rdiv_scalar(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			s.ptr_raw() as *const c_void,
+			n_i32,
+			s.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Sets `flag` to nonzero when any element of `x` is NaN.
+///
+/// # Errors
+/// Returns [`HipError`] if the device memset fails or `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_has_nan(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `flag` is a valid device buffer of at least one `i32`.
 	unsafe {
-		crate::memory::memset_dev(flag.ptr_raw(), 0, mem::size_of::<i32>(), ptr::null_mut())?;
+		memset_dev(flag.ptr_raw(), 0, mem::size_of::<i32>(), ptr::null_mut())?;
+	}
+	// SAFETY: `x` and `flag` are valid device buffers of `n` and one element.
+	unsafe {
 		launch_has_nan(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			flag.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Sets `flag` to nonzero only when every element of `x` is finite.
+///
+/// # Errors
+/// Returns [`HipError`] if the device memset fails or `n` does not fit in [`i32`].
+#[inline]
 pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: `flag` is a valid device buffer of at least one `i32`.
 	unsafe {
-		crate::memory::memset_dev(flag.ptr_raw(), 0, mem::size_of::<i32>(), ptr::null_mut())?;
+		memset_dev(flag.ptr_raw(), 0, mem::size_of::<i32>(), ptr::null_mut())?;
+	}
+	// SAFETY: `x` and `flag` are valid device buffers of `n` and one element.
+	unsafe {
 		launch_isfinite_all(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			flag.ptr_raw(),
-			n as i32,
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

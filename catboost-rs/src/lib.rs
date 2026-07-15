@@ -1,4 +1,4 @@
-use gpu_core::hip::HipError;
+use gpu_core::HipError;
 use gpu_core::kernels::{
 	gpu_leaf_finalize, gpu_leaf_reduce, gpu_oblivious_histogram, gpu_oblivious_route_full,
 	gpu_oblivious_route_step, gpu_oblivious_split_eval,

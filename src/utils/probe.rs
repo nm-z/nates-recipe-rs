@@ -72,19 +72,19 @@ impl Machine {
 		let host = hostname();
 		let g = ogdl::text("");
 		let eth = format!("measuring.{host}.ETH");
-		g.add("", &eth);
+		drop(g.add("", &eth));
 		Write::block(probe, &g.section("measuring"));
 		let eth_gbs = link_speed_gbs();
 		let p = format!("{eth}.{}", eth_label(eth_gbs));
-		g.add(format!("{eth_gbs:.3}"), &p);
+		drop(g.add(format!("{eth_gbs:.3}"), &p));
 		Write::block(probe, &g.section(&p));
 		let disk = format!("measuring.{host}.DISK");
-		g.add("", &disk);
+		drop(g.add("", &disk));
 		Write::block(probe, &g.section(&disk));
 		let dd = data_dir()?;
 		let disk_size = disk_total(&dd)?;
 		let p = format!("{disk}.SIZE");
-		g.add(disk_size.to_string(), &p);
+		drop(g.add(disk_size.to_string(), &p));
 		Write::block(probe, &g.section(&p));
 		let disk_bytes = (256usize << 20).min(host_budget(1)?);
 		ensure!(
@@ -93,14 +93,14 @@ impl Machine {
 		);
 		let sata_gbs = bench_disk(&dd, disk_bytes)?;
 		let p = format!("{disk}.SATA");
-		g.add(format!("{sata_gbs:.3}"), &p);
+		drop(g.add(format!("{sata_gbs:.3}"), &p));
 		Write::block(probe, &g.section(&p));
 		let job = gpu_core::gate::Lease::new();
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
 		for d in 0..ngpu as i32 {
 			let base = format!("measuring.{host}.GPU{d}");
-			g.add("", &base);
+			drop(g.add("", &base));
 			Write::block(probe, &g.section(&base));
 			match measure_gpu_child(d, &g, &base) {
 				Ok(dev) => gpus.push(dev),
@@ -120,26 +120,28 @@ impl Machine {
 		}
 		drop(job);
 		let cpu = format!("measuring.{host}.CPU");
-		g.add("", &cpu);
+		drop(g.add("", &cpu));
 		Write::block(probe, &g.section(&cpu));
 		let ram = mem_total()?;
 		let p = format!("{cpu}.RAM");
-		g.add(ram.to_string(), &p);
+		drop(g.add(ram.to_string(), &p));
 		Write::block(probe, &g.section(&p));
 		let copy_bytes = bench_bytes(2)?;
 		let ddr5_gbs = bench_ddr5(copy_bytes);
 		let p = format!("{cpu}.DDR5");
-		g.add(format!("{ddr5_gbs:.3}"), &p);
+		drop(g.add(format!("{ddr5_gbs:.3}"), &p));
 		Write::block(probe, &g.section(&p));
 		let cpu_gflops = bench_cpu_flops();
 		let p = format!("{cpu}.FLOPs");
-		g.add(format!("{cpu_gflops:.1}"), &p);
+		drop(g.add(format!("{cpu_gflops:.1}"), &p));
 		Write::block(probe, &g.section(&p));
 		let read_bytes = bench_bytes(1)?;
 		let cpu_transfer_gbs = bench_cpu_read(read_bytes);
 		let p = format!("{cpu}.Transfer");
-		g.add(format!("{cpu_transfer_gbs:.3}"), &p);
+		drop(g.add(format!("{cpu_transfer_gbs:.3}"), &p));
 		Write::block(probe, &g.section(&p));
+		let measuring = g.itnl("measuring");
+		drop(g.del(&measuring));
 		Ok(Machine {
 			host,
 			gpus,
@@ -352,7 +354,7 @@ fn measure_gpu_child(dev: i32, g: &ogdl::Graph, base: &str) -> Result<GpuDev> {
 					_transfer => xfer = v.parse::<f64>().ok(),
 				}
 				let p = format!("{base}.{k}");
-				g.add(v, &p);
+				drop(g.add(v, &p));
 				Write::block(probe, &g.section(&p));
 			}
 			_other => match l.trim().is_empty() {

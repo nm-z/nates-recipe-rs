@@ -2,25 +2,29 @@
 	non_upper_case_globals,
 	non_camel_case_types,
 	non_snake_case,
-	dead_code
+	dead_code,
+	reason = "log crate deliberately uses lowercase type/const/flag identifiers as its frozen public API"
 )]
+use core::fmt;
+use core::fmt::Display;
 use std::error;
-use std::fmt;
-use std::fmt::Display;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write as _;
 use std::process;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 
+/// Declares the flag [`Opt`] struct, the [`Flag`] enum, and the global option state.
 macro_rules! flags {
 	($($f:ident),+) => {
 		#[derive(Clone, Copy, Default)]
 		pub struct Opt {
 			$(pub $f: bool,)+
 		}
-		#[derive(Clone, Copy, PartialEq)]
+		#[derive(Clone, Copy, PartialEq, Eq)]
+		#[non_exhaustive]
 		pub enum Flag {
 			$($f,)+
 		}
@@ -28,7 +32,7 @@ macro_rules! flags {
 		fn on(f: Flag) -> bool {
 			let o = opt();
 			match f {
-				$(Flag::$f => o.$f,)+
+				$(Flag::$f => return o.$f,)+
 			}
 		}
 	};
@@ -40,139 +44,81 @@ flags!(
 pub use Flag::*;
 
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct Err;
 impl Err {
+	pub const line: bool = true;
 	pub const log: bool = true;
 	pub const print: bool = true;
-	pub const line: bool = true;
 }
 
+#[non_exhaustive]
 pub struct Optusr(pub Opt);
+#[non_exhaustive]
 pub struct OptDev(pub Opt, pub Err);
+#[non_exhaustive]
 pub struct Option {
-	pub user: Optusr,
 	pub dev: OptDev,
+	pub user: Optusr,
 }
 
+#[inline]
 pub fn set_opt(o: Opt) {
-	*OPT.lock().unwrap_or_else(|p| p.into_inner()) = o;
+	*OPT.lock().unwrap_or_else(PoisonError::into_inner) = o;
 }
 
+#[inline]
 pub fn opt() -> Opt {
-	*OPT.lock().unwrap_or_else(|p| p.into_inner())
+	return *OPT.lock().unwrap_or_else(PoisonError::into_inner);
 }
 
+/// Appends `t` to this process's run log under `/tmp/recipe`, ignoring any I/O error.
 fn log(t: &impl Display) {
-	fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
+	if fs::create_dir_all("/tmp/recipe").is_err() {
+		return;
+	}
 	let path = format!("/tmp/recipe/run{:03x}.log", process::id() & 0xfff);
-	let mut f = File::options()
-		.append(true)
-		.create(true)
-		.open(path)
-		.expect("log: open run log");
-	writeln!(f, "{t}").expect("log: write run log");
+	let Ok(mut f) = File::options().append(true).create(true).open(path) else {
+		return;
+	};
+	drop(writeln!(f, "{t}"));
 }
 
+/// Writes `t` to stderr, ignoring any I/O error.
 fn print(t: &impl Display) {
 	drop(writeln!(io::stderr(), "{t}"));
 }
 
+#[non_exhaustive]
 pub struct Errored(pub String);
 
 impl Errored {
-	pub fn new(t: impl Display) -> Errored {
-		match Err::log {
-			true => log(&t),
-			false => {}
+	#[inline]
+	pub fn new(t: impl Display) -> Self {
+		if Err::log {
+			log(&t);
 		}
-		match Err::print {
-			true => print(&t),
-			false => {}
+		if Err::print {
+			print(&t);
 		}
-		Errored(t.to_string())
+		return Self(t.to_string());
 	}
 }
 
 impl Display for Errored {
+	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str(&self.0)
+		return f.write_str(&self.0);
 	}
 }
 
 impl fmt::Debug for Errored {
+	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str(&self.0)
+		return f.write_str(&self.0);
 	}
 }
 
 impl error::Error for Errored {}
 
-pub mod Write {
-	use super::*;
-	pub fn line(f: Flag, t: impl Display) {
-		log(&t);
-		match on(f) {
-			true => print(&t),
-			false => {}
-		}
-	}
-	pub trait Show {
-		fn take(self) -> String;
-	}
-
-	impl Show for &str {
-		fn take(self) -> String {
-			self.to_string()
-		}
-	}
-
-	impl Show for String {
-		fn take(self) -> String {
-			self
-		}
-	}
-
-	impl Show for &String {
-		fn take(self) -> String {
-			self.clone()
-		}
-	}
-
-	impl Show for ogdl::Block {
-		fn take(self) -> String {
-			self.show()
-		}
-	}
-
-	pub fn block(f: Flag, text: impl Show) {
-		let s = text.take();
-		let t = s.trim_end();
-		log(&t);
-		match on(f) {
-			true => print(&t),
-			false => {}
-		}
-	}
-
-	pub fn always(t: impl Display) {
-		let s = t.to_string();
-		let t = s.trim_end();
-		log(&t);
-		print(&t);
-	}
-
-	pub fn wait(t: impl Display) {
-		always(t);
-	}
-
-	pub fn unwait() {
-		use std::io::IsTerminal;
-		match io::stderr().is_terminal() {
-			true => drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
-			false => {}
-		}
-	}
-	pub fn err(t: impl Display) -> Result<(), Errored> {
-		Result::Err(Errored::new(t))
-	}
-}
+pub mod Write;

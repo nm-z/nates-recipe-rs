@@ -1,302 +1,341 @@
+use crate::hip::sysfs_vram_free;
 use crate::log::Write;
-use std::cmp;
+use core::cmp;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::env;
 use std::fs;
 use std::io;
-use std::io::{Read, Seek, Write as _};
-use std::marker::PhantomData;
+use std::io::{Seek as _, Write as _};
 use std::num;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::PathBuf;
 use std::process;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time;
 
+/// Basename of the per-user GPU lock file under the runtime dir.
 const LOCK_NAME: &str = "recipe-gpu.lock";
+/// Env var carrying the inherited lock fd across process re-exec.
 const INHERIT_VAR: &str = "RECIPE_GPU_LOCK_FD";
+/// KFD per-process sysfs dir; a live entry means the pid still holds the device.
 const KFD_PROC: &str = "/sys/class/kfd/kfd/proc";
+/// Seconds to wait for a prior holder's GPU teardown before proceeding.
 const TEARDOWN_DEADLINE_SECS: f64 = 30.0;
+/// Poll interval while waiting for a departing holder's VRAM to drain.
 const RECLAIM_STEP: time::Duration = time::Duration::from_millis(25);
+/// Fixed byte width of the pid stamp written into the lock file.
 const STAMP_WIDTH: usize = 20;
+/// Sentinel pid meaning the lock is unheld.
 const CLEAN: u32 = 0;
 
+/// State of this process's handle on the lock file.
 enum Lock {
+	/// No lock file has been opened yet.
 	Closed,
-	Own(fs::File),
+	/// We opened the lock file ourselves.
+	Own,
+	/// Inherited an already-open lock fd from a parent process.
 	Adopted,
 }
 
 #[derive(Clone, Copy)]
+/// Whether this process currently holds the GPU.
 enum Grip {
+	/// The device is not held by this process.
 	Free,
+	/// The device is held by this process.
 	Taken,
 }
 
+/// Per-process gate state guarding GPU acquisition.
 struct Gate {
+	/// Handle on the on-disk lock file.
 	lock: Lock,
+	/// The lock file, opened only when this process owns the lock.
+	file: Option<fs::File>,
+	/// Whether this process holds the device.
 	grip: Grip,
 }
 
+/// Single global gate serializing GPU access within this process.
 static GATE: Mutex<Gate> = Mutex::new(Gate {
 	lock: Lock::Closed,
+	file: None,
 	grip: Grip::Free,
 });
+/// Fast-path holder pid, or CLEAN when the device is free.
 static HOLDING: AtomicU32 = AtomicU32::new(CLEAN);
 
+/// Lock the global gate, recovering from a poisoned mutex.
 fn locked() -> MutexGuard<'static, Gate> {
 	match GATE.lock() {
-		Ok(g) => g,
-		Err(poisoned) => poisoned.into_inner(),
+		Ok(g) => return g,
+		Err(poisoned) => return poisoned.into_inner(),
 	}
 }
 
-fn inherited() -> io::Result<Option<RawFd>> {
-	let Ok(raw) = env::var(INHERIT_VAR) else {
-		return Ok(None);
-	};
-	let fd: RawFd = raw
-		.parse()
-		.map_err(|_e| io::Error::other(format!("{INHERIT_VAR}={raw}")))?;
-	match unsafe { libc::fcntl(fd, libc::F_GETFD) }.cmp(&0) {
-		cmp::Ordering::Less => Err(io::Error::other(format!(
-			"{INHERIT_VAR}={fd}: {}",
-			io::Error::last_os_error()
-		))),
-		cmp::Ordering::Equal => Ok(Some(fd)),
-		cmp::Ordering::Greater => Ok(Some(fd)),
-	}
-}
-
-fn open_lock() -> io::Result<fs::File> {
-	let uid = unsafe { libc::getuid() };
-	let dir = env::var_os("XDG_RUNTIME_DIR")
-		.filter(|v| !v.is_empty())
-		.map(PathBuf::from)
-		.unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
-	fs::create_dir_all(&dir)
-		.map_err(|e| io::Error::other(format!("create {}: {e}", dir.display())))?;
-	let path = dir.join(LOCK_NAME);
-	let f = fs::OpenOptions::new()
-		.read(true)
-		.write(true)
-		.create(true)
-		.truncate(false)
-		.open(&path)
-		.map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
-	let fd = f.as_raw_fd();
-	let None = num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }) else {
-		return Err(io::Error::last_os_error());
-	};
-	unsafe { env::set_var(INHERIT_VAR, fd.to_string()) };
-	Ok(f)
-}
-
+/// Apply a flock operation to the fd, retrying on interruption.
 fn flock(fd: RawFd, op: i32) -> io::Result<()> {
 	loop {
+		// SAFETY: flock operates on an owned fd and integer op; no pointers are dereferenced.
 		match num::NonZeroI32::new(unsafe { libc::flock(fd, op) }) {
 			None => return Ok(()),
 			Some(_rc) => {
 				let e = io::Error::last_os_error();
-				match Some(()).filter(|_u| e.kind() == io::ErrorKind::Interrupted) {
-					None => return Err(e),
-					Some(()) => continue,
+				if e.kind() != io::ErrorKind::Interrupted {
+					return Err(e);
 				}
 			}
 		}
 	}
 }
 
+/// Read the pid currently stamped in the lock file.
 fn holder_pid(f: &mut fs::File) -> Option<u32> {
-	let mut s = String::new();
 	f.rewind().ok()?;
-	f.read_to_string(&mut s).ok()?;
-	s.trim().parse().ok()
+	let s = io::read_to_string(&mut *f).ok()?;
+	return s.trim().parse().ok();
 }
 
+/// Write a fixed-width pid stamp at the start of the lock file.
 fn stamp(f: &mut fs::File, pid: u32) -> io::Result<()> {
 	f.rewind()?;
-	write!(f, "{pid:<w$}", w = STAMP_WIDTH)?;
-	f.flush()
+	write!(f, "{pid:<STAMP_WIDTH$}")?;
+	return f.flush();
 }
 
-fn take(f: &mut fs::File) -> io::Result<()> {
-	let fd = f.as_raw_fd();
-	match flock(fd, libc::LOCK_EX | libc::LOCK_NB) {
-		Ok(()) => Ok(()),
-		Err(e) => contend(fd, f, e),
-	}?;
-	let me = process::id();
-	let prev = holder_pid(f).filter(|p| *p != CLEAN && *p != me);
-	stamp(f, me)?;
-	for pid in prev.into_iter() {
-		await_teardown(pid);
-	}
-	Ok(())
-}
-
-fn contend(fd: RawFd, f: &mut fs::File, e: io::Error) -> io::Result<()> {
-	let kind = e.kind();
-	match Some(()).filter(|_u| kind == io::ErrorKind::WouldBlock) {
-		None => Err(e),
-		Some(()) => {
-			match holder_pid(f).filter(|p| *p != CLEAN) {
-				Some(pid) => {
-					Write::wait(format!("Waiting for pid {pid} to release the GPU"))
-				}
-				None => Write::wait("Waiting for the GPU lock"),
-			}
-			let got = flock(fd, libc::LOCK_EX);
-			Write::unwait();
-			got
-		}
-	}
-}
-
-fn await_teardown(pid: u32) {
-	let path = PathBuf::from(KFD_PROC).join(pid.to_string());
-	let t0 = time::Instant::now();
-	let parked = path.exists();
-	match parked {
-		true => Write::wait(format!("Waiting for pid {pid} gpu teardown")),
-		false => {}
-	}
-	let mut wedged = false;
-	while path.exists() {
-		wedged = expired(t0).is_some();
-		match wedged {
-			true => break,
-			false => thread::sleep(time::Duration::from_millis(2)),
-		}
-	}
-	match parked {
-		true => Write::unwait(),
-		false => {}
-	}
-	match wedged {
-		true => return overstayed(pid, t0),
-		false => {}
-	}
-	let Some(mut free) = crate::hip::sysfs_vram_free() else {
-		return;
-	};
-	loop {
-		thread::sleep(RECLAIM_STEP);
-		let Some(now) = crate::hip::sysfs_vram_free() else {
-			return;
-		};
-		match now.cmp(&free) {
-			cmp::Ordering::Greater => free = now,
-			cmp::Ordering::Equal => return,
-			cmp::Ordering::Less => return,
-		}
-		let None = expired(t0) else {
-			return overstayed(pid, t0);
-		};
-	}
-}
-
+/// Whether the teardown deadline has elapsed since the given instant.
 fn expired(t0: time::Instant) -> Option<()> {
 	let waited = t0.elapsed().as_secs_f64();
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
-		Some(cmp::Ordering::Less) | None => None,
-		Some(cmp::Ordering::Equal) | Some(cmp::Ordering::Greater) => Some(()),
+		Some(cmp::Ordering::Less) | None => return None,
+		Some(cmp::Ordering::Equal | cmp::Ordering::Greater) => return Some(()),
 	}
 }
 
+/// Warn that a prior holder overran the teardown deadline.
 fn overstayed(pid: u32, t0: time::Instant) {
-	drop(Write::err(&format!(
+	drop(Write::err(format!(
 		"gpu gate: pid {pid} still holds the device after {:.0}s — proceeding",
 		t0.elapsed().as_secs_f64()
 	)));
 }
 
-fn engage(g: &mut Gate) -> io::Result<()> {
-	let fresh = match &g.lock {
-		Lock::Closed => Some(open_or_adopt()?),
-		Lock::Own(_own) => None,
-		Lock::Adopted => None,
-	};
-	for lock in fresh.into_iter() {
-		g.lock = lock;
-	}
-	match &mut g.lock {
-		Lock::Own(f) => take(f),
-		Lock::Adopted => Ok(()),
-		Lock::Closed => Ok(()),
-	}
-}
-
-fn open_or_adopt() -> io::Result<Lock> {
-	match inherited()? {
-		Some(_fd) => Ok(Lock::Adopted),
-		None => Ok(Lock::Own(open_lock()?)),
-	}
-}
-
+/// Adopt an inherited fd or open the lock file, flock it, stamp our pid, and
+/// wait out any prior holder's KFD teardown and VRAM drain before returning.
+#[inline]
 pub fn acquire() {
 	let None = num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else {
 		return;
 	};
 	let mut g = locked();
-	match g.grip {
-		Grip::Taken => {}
-		Grip::Free => mark_taken(&mut g),
+	let Grip::Free = g.grip else {
+		return;
+	};
+	let engaged: io::Result<()> = 'engage: {
+		if matches!(g.lock, Lock::Closed) {
+			let adopted: Option<RawFd> = match env::var(INHERIT_VAR) {
+				Err(_no_var) => None,
+				Ok(raw) => {
+					let Ok(fd) = raw.parse::<RawFd>() else {
+						break 'engage Err(io::Error::other(format!(
+							"{INHERIT_VAR}={raw}"
+						)));
+					};
+					// SAFETY: fcntl(F_GETFD) only reads the fd's flags and dereferences no pointers.
+					match unsafe { libc::fcntl(fd, libc::F_GETFD) }.cmp(&0i32) {
+						cmp::Ordering::Less => {
+							break 'engage Err(io::Error::other(format!(
+								"{INHERIT_VAR}={fd}: {}",
+								io::Error::last_os_error()
+							)));
+						}
+						cmp::Ordering::Equal | cmp::Ordering::Greater => Some(fd),
+					}
+				}
+			};
+			if adopted.is_some() {
+				g.lock = Lock::Adopted;
+				g.file = None;
+			} else {
+				// SAFETY: getuid takes no arguments, cannot fail, and dereferences no pointers.
+				let uid = unsafe { libc::getuid() };
+				let dir = env::var_os("XDG_RUNTIME_DIR")
+					.filter(|v| return !v.is_empty())
+					.map_or_else(
+						|| return PathBuf::from(format!("/run/user/{uid}")),
+						PathBuf::from,
+					);
+				if let Err(e) = fs::create_dir_all(&dir) {
+					break 'engage Err(io::Error::other(format!(
+						"create {}: {e}",
+						dir.display()
+					)));
+				}
+				let path = dir.join(LOCK_NAME);
+				let opened = fs::OpenOptions::new()
+					.read(true)
+					.write(true)
+					.create(true)
+					.truncate(false)
+					.open(&path);
+				let file = match opened {
+					Ok(f) => f,
+					Err(e) => {
+						break 'engage Err(io::Error::other(format!(
+							"open {}: {e}",
+							path.display()
+						)));
+					}
+				};
+				let fd = file.as_raw_fd();
+				// SAFETY: fcntl(F_SETFD, 0) clears close-on-exec on an owned fd and dereferences no pointers.
+				let None =
+					num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })
+				else {
+					break 'engage Err(io::Error::last_os_error());
+				};
+				// SAFETY: env is mutated under the GATE mutex during single-threaded lock setup, with no concurrent readers.
+				unsafe {
+					env::set_var(INHERIT_VAR, fd.to_string());
+				}
+				g.lock = Lock::Own;
+				g.file = Some(file);
+			}
+		}
+		let Some(f) = g.file.as_mut() else {
+			break 'engage Ok(());
+		};
+		let fd = f.as_raw_fd();
+		if let Err(e) = flock(fd, libc::LOCK_EX | libc::LOCK_NB) {
+			if e.kind() != io::ErrorKind::WouldBlock {
+				break 'engage Err(e);
+			}
+			match holder_pid(f).filter(|p| return *p != CLEAN) {
+				Some(pid) => {
+					Write::wait(format!("Waiting for pid {pid} to release the GPU"));
+				}
+				None => Write::wait("Waiting for the GPU lock"),
+			}
+			let got = flock(fd, libc::LOCK_EX);
+			Write::unwait();
+			if let Err(blocked) = got {
+				break 'engage Err(blocked);
+			}
+		}
+		let me = process::id();
+		let prev = holder_pid(f).filter(|p| return *p != CLEAN && *p != me);
+		if let Err(e) = stamp(f, me) {
+			break 'engage Err(e);
+		}
+		let Some(pid) = prev else {
+			break 'engage Ok(());
+		};
+		let path = PathBuf::from(KFD_PROC).join(pid.to_string());
+		let t0 = time::Instant::now();
+		let parked = path.exists();
+		if parked {
+			Write::wait(format!("Waiting for pid {pid} gpu teardown"));
+		}
+		let mut wedged = false;
+		while path.exists() {
+			wedged = expired(t0).is_some();
+			if wedged {
+				break;
+			}
+			thread::sleep(time::Duration::from_millis(2));
+		}
+		if parked {
+			Write::unwait();
+		}
+		if wedged {
+			overstayed(pid, t0);
+			break 'engage Ok(());
+		}
+		let Some(mut free) = sysfs_vram_free() else {
+			break 'engage Ok(());
+		};
+		Write::wait(format!("Waiting for pid {pid} vram reclaim"));
+		loop {
+			thread::sleep(RECLAIM_STEP);
+			let Some(now) = sysfs_vram_free() else {
+				Write::unwait();
+				break 'engage Ok(());
+			};
+			match now.cmp(&free) {
+				cmp::Ordering::Greater => free = now,
+				cmp::Ordering::Equal | cmp::Ordering::Less => {
+					Write::unwait();
+					break 'engage Ok(());
+				}
+			}
+			let None = expired(t0) else {
+				Write::unwait();
+				overstayed(pid, t0);
+				break 'engage Ok(());
+			};
+		}
+	};
+	if engaged.is_ok() {
+		g.grip = Grip::Taken;
 	}
-}
-
-fn mark_taken(g: &mut Gate) {
-	match engage(g) {
+	drop(g);
+	match engaged {
 		Ok(()) => {
-			g.grip = Grip::Taken;
 			HOLDING.store(process::id(), Ordering::Release);
 		}
 		Err(e) => {
-			drop(Write::err(&format!("gpu gate: {e}")));
+			drop(Write::err(format!("gpu gate: {e}")));
 			process::abort();
 		}
 	}
 }
 
+#[inline]
 pub fn release() {
 	let mut g = locked();
-	match g.grip {
-		Grip::Free => {}
-		Grip::Taken => shutdown(&mut g),
+	let Grip::Taken = g.grip else {
+		return;
+	};
+	let Some(f) = g.file.as_mut() else {
+		return;
+	};
+	if let Some(e) = stamp(f, CLEAN).err() {
+		drop(Write::err(format!("gpu gate: clean stamp: {e}")));
 	}
-}
-
-fn shutdown(g: &mut Gate) {
-	let Lock::Own(f) = &mut g.lock else { return };
-	for e in stamp(f, CLEAN).err().into_iter() {
-		drop(Write::err(&format!("gpu gate: clean stamp: {e}")));
-	}
-	for e in flock(f.as_raw_fd(), libc::LOCK_UN).err().into_iter() {
-		drop(Write::err(&format!("gpu gate: unlock: {e}")));
+	if let Some(e) = flock(f.as_raw_fd(), libc::LOCK_UN).err() {
+		drop(Write::err(format!("gpu gate: unlock: {e}")));
 	}
 	g.grip = Grip::Free;
+	drop(g);
 	HOLDING.store(CLEAN, Ordering::Release);
 }
 
 pub struct Lease {
+	/// Marker preventing external construction of a lease.
 	_p: PhantomData<()>,
 }
 
 impl Default for Lease {
-	fn default() -> Lease {
-		Lease::new()
+	#[inline]
+	fn default() -> Self {
+		return Self::new();
 	}
 }
 
 impl Lease {
-	pub fn new() -> Lease {
+	#[must_use]
+	#[inline]
+	pub fn new() -> Self {
 		acquire();
-		Lease { _p: PhantomData }
+		return Self { _p: PhantomData };
 	}
 }
 
 impl Drop for Lease {
+	#[inline]
 	fn drop(&mut self) {
 		release();
 	}

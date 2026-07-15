@@ -96,11 +96,18 @@ blanket_clippy_restriction_lints = "allow"
 min_ident_chars = "allow"
 indexing_slicing = "allow"
 needless_return = "allow"
+semicolon_outside_block = "allow"
 arithmetic_side_effects = "allow"
 question_mark_used = "allow"
 pub_use = "allow" 
-
-
-
+single_char_lifetime_names = "allow"
+inline_trait_bounds = "allow"
+unseparated_literal_suffix = "allow" 
+impl_trait_in_params = "allow"
+missing_trait_methods = "allow"
+arbitrary_source_item_ordering = "allow"
+exhaustive_structs = "allow"
+pub_without_shorthand = "allow"
+pub_with_shorthand = "allow"
 
 

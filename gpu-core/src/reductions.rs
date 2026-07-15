@@ -1,8 +1,8 @@
-use crate::hip::HipError;
+use crate::HipError;
 use crate::kernels::{check_launch, safe_i32};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_sum_all_workspace_bytes(n: i32) -> usize;
@@ -158,49 +158,84 @@ unsafe extern "C" {
 	);
 }
 
-fn next_pow2(n: usize) -> usize {
+/// Rounds `n` up to the next power of two, returning `1` when `n <= 1`.
+const fn next_pow2(n: usize) -> usize {
 	let mut p = 1usize;
 	while p < n {
-		p <<= 1;
+		p <<= 1usize;
 	}
-	p
+	return p;
 }
 
+/// Queries the device workspace size in bytes required by the sum-all reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_sum_all_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_sum_all_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_sum_all_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the max-all reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_max_all_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_max_all_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_max_all_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the min-all reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_min_all_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_min_all_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_min_all_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the mean-all reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_mean_all_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_mean_all_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_mean_all_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the L2-norm reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_l2_norm_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_l2_norm_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_l2_norm_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the dot-product reduction over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_dot_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_dot_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_dot_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the cumulative-product scan over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_cumprod_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_cumprod_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_cumprod_workspace_bytes(safe_i32(n)) }
 }
+/// Queries the device workspace size in bytes required by the cumulative-max scan over `n` elements.
+#[must_use]
+#[inline]
 pub fn gpu_cummax_workspace_bytes(n: usize) -> usize {
-	unsafe { launch_cummax_workspace_bytes(safe_i32(n)) }
+	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
+	unsafe { return launch_cummax_workspace_bytes(safe_i32(n)) }
 }
 
+/// Dispatches scalar reduction launcher `f` over `x`, writing the single-element result into `out`.
 fn scalar_reduce(
 	f: unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, usize, i32, *mut c_void),
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
-) -> Result<(), HipError> {
+) {
+	// SAFETY: x, out, and workspace are live device buffers sized for n; f is an FFI reduction launcher whose signature matches this pointer/length/stream argument list.
 	unsafe {
 		f(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			workspace.ptr_raw(),
 			workspace.len(),
@@ -209,45 +244,73 @@ fn scalar_reduce(
 		);
 	}
 	check_launch();
-	Ok(())
 }
 
+/// Reduces `x` to its sum, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_sum_all(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	scalar_reduce(launch_sum_all, x, workspace, n, out)
+	scalar_reduce(launch_sum_all, x, workspace, n, out);
+	return Ok(());
 }
 
+/// Reduces `x` to its maximum, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_max_all(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	scalar_reduce(launch_max_all, x, workspace, n, out)
+	scalar_reduce(launch_max_all, x, workspace, n, out);
+	return Ok(());
 }
 
+/// Reduces `x` to its minimum, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_min_all(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	scalar_reduce(launch_min_all, x, workspace, n, out)
+	scalar_reduce(launch_min_all, x, workspace, n, out);
+	return Ok(());
 }
 
+/// Reduces `x` to its mean, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_mean_all(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	scalar_reduce(launch_mean_all, x, workspace, n, out)
+	scalar_reduce(launch_mean_all, x, workspace, n, out);
+	return Ok(());
 }
 
+/// Reduces `x` to its L2 norm using `sq` as squared-element scratch, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_l2_norm(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
@@ -255,9 +318,10 @@ pub fn gpu_l2_norm(
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x, sq, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_l2_norm(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			sq.ptr_raw(),
 			out.ptr_raw(),
 			workspace.ptr_raw(),
@@ -267,9 +331,14 @@ pub fn gpu_l2_norm(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Reduces the dot product of `a` and `b` using `prod` as elementwise-product scratch, writing the scalar into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_dot(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -278,10 +347,11 @@ pub fn gpu_dot(
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: a, b, prod, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_dot(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			prod.ptr_raw(),
 			out.ptr_raw(),
 			workspace.ptr_raw(),
@@ -291,42 +361,60 @@ pub fn gpu_dot(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Fills the padding region of `data` between `real_n` and `padded_n` with the `sentinel` value.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_fill_sentinel(
 	data: &GpuBuffer,
 	real_n: usize,
 	padded_n: usize,
 	sentinel: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: data and sentinel are live device buffers; the launcher signature matches these arguments.
 	unsafe {
 		launch_fill_sentinel(
 			data.ptr_raw(),
 			safe_i32(real_n),
 			safe_i32(padded_n),
-			sentinel.ptr_raw() as *const c_void,
+			sentinel.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Initializes `idx` with the identity permutation `0..n`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: idx is a live device buffer sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_init_idx(idx.ptr_raw(), safe_i32(n), ptr::null_mut());
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Runs one bitonic compare-exchange step over `data` for stride `j` and subsequence length `k`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_bitonic_step(
 	j: usize,
 	k: usize,
 	padded_n: usize,
 	data: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: data is a live device buffer sized for padded_n; the launcher signature matches these arguments.
 	unsafe {
 		launch_bitonic_step(
 			data.ptr_raw(),
@@ -337,9 +425,14 @@ pub fn gpu_bitonic_step(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Runs one key/index bitonic compare-exchange step over `keys` and `vals` for stride `j` and subsequence length `k`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_bitonic_step_idx(
 	j: usize,
 	k: usize,
@@ -347,6 +440,7 @@ pub fn gpu_bitonic_step_idx(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: keys and vals are live device buffers sized for padded_n; the launcher signature matches these arguments.
 	unsafe {
 		launch_bitonic_step_idx(
 			keys.ptr_raw(),
@@ -358,9 +452,14 @@ pub fn gpu_bitonic_step_idx(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Runs one key/value (both `f64`) bitonic compare-exchange step over `keys` and `vals` for stride `j` and subsequence length `k`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_bitonic_step_dd(
 	j: usize,
 	k: usize,
@@ -368,6 +467,7 @@ pub fn gpu_bitonic_step_dd(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: keys and vals are live device buffers sized for padded_n; the launcher signature matches these arguments.
 	unsafe {
 		launch_bitonic_step_dd(
 			keys.ptr_raw(),
@@ -379,57 +479,72 @@ pub fn gpu_bitonic_step_dd(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Sorts the first `n` elements of `x` ascending via bitonic sort, writing the result into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
 	let mut work = GpuBuffer::alloc(pn)?;
 	work.copy_from(x, n * 8)?;
-	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
+	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&work, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;
 	while k <= pn {
-		let mut j = k >> 1;
+		let mut j = k >> 1usize;
 		while j > 0 {
 			gpu_bitonic_step(j, k, pn, &work)?;
-			j >>= 1;
+			j >>= 1usize;
 		}
-		k <<= 1;
+		k <<= 1usize;
 	}
 	let mut dst = GpuBuffer::borrow(out.ptr_raw(), out.len());
 	dst.copy_from(&work, n * 8)?;
-	Ok(())
+	return Ok(());
 }
 
+/// Argsorts the first `n` elements of `x` ascending via bitonic sort, writing the permutation indices into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
 	let mut keys = GpuBuffer::alloc(pn)?;
 	let vals = GpuBuffer::alloc_bytes(pn * 4)?;
 	keys.copy_from(x, n * 8)?;
 	gpu_init_idx(pn, &vals)?;
-	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
+	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&keys, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;
 	while k <= pn {
-		let mut j = k >> 1;
+		let mut j = k >> 1usize;
 		while j > 0 {
 			gpu_bitonic_step_idx(j, k, pn, &keys, &vals)?;
-			j >>= 1;
+			j >>= 1usize;
 		}
-		k <<= 1;
+		k <<= 1usize;
 	}
 	let mut dst = GpuBuffer::borrow(out.ptr_raw(), out.len());
 	dst.copy_from(&vals, n * 4)?;
-	Ok(())
+	return Ok(());
 }
 
+/// Sorts `keys` ascending while permuting `vals` in lockstep, writing results into `out_keys` and `out_vals`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_sort_by_key(
 	keys: &GpuBuffer,
 	vals: &GpuBuffer,
@@ -442,27 +557,32 @@ pub fn gpu_sort_by_key(
 	let mut wv = GpuBuffer::alloc(pn)?;
 	wk.copy_from(keys, n * 8)?;
 	wv.copy_from(vals, n * 8)?;
-	for _pad in Some(pn).filter(|p| *p > n).into_iter() {
+	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
 		gpu_fill_sentinel(&wk, n, pn, &sentinel)?;
 	}
 	let mut k = 2usize;
 	while k <= pn {
-		let mut j = k >> 1;
+		let mut j = k >> 1usize;
 		while j > 0 {
 			gpu_bitonic_step_dd(j, k, pn, &wk, &wv)?;
-			j >>= 1;
+			j >>= 1usize;
 		}
-		k <<= 1;
+		k <<= 1usize;
 	}
 	let mut dk = GpuBuffer::borrow(out_keys.ptr_raw(), out_keys.len());
 	dk.copy_from(&wk, n * 8)?;
 	let mut dv = GpuBuffer::borrow(out_vals.ptr_raw(), out_vals.len());
 	dv.copy_from(&wv, n * 8)?;
-	Ok(())
+	return Ok(());
 }
 
+/// Sorts each segment of `data` delimited by `seg_offsets` independently, writing results into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_segment_sort(
 	data: &GpuBuffer,
 	seg_offsets: &GpuBuffer,
@@ -470,10 +590,11 @@ pub fn gpu_segment_sort(
 	n_segs: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: data, seg_offsets, and out are live device buffers sized for n and n_segs; the launcher signature matches these arguments.
 	unsafe {
 		launch_segment_sort(
-			data.ptr_raw() as *const c_void,
-			seg_offsets.ptr_raw() as *const c_void,
+			data.ptr_raw().cast_const(),
+			seg_offsets.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
@@ -481,18 +602,24 @@ pub fn gpu_segment_sort(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the row-wise prefix sum of the `rows`-by-`cols` matrix `x`, writing the result into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_cumsum_rows(
 	x: &GpuBuffer,
 	rows: usize,
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x and out are live device buffers sized for rows*cols; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumsum_rows(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
@@ -500,18 +627,24 @@ pub fn gpu_cumsum_rows(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the column-wise prefix sum of the `rows`-by-`cols` matrix `x`, writing the result into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_cumsum_cols(
 	x: &GpuBuffer,
 	rows: usize,
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x and out are live device buffers sized for rows*cols; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumsum_cols(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
@@ -519,18 +652,24 @@ pub fn gpu_cumsum_cols(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the inclusive cumulative product of the first `n` elements of `x`, writing the result into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_cumprod(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumprod(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			workspace.ptr_raw(),
 			workspace.len(),
@@ -539,18 +678,24 @@ pub fn gpu_cumprod(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Computes the inclusive cumulative maximum of the first `n` elements of `x`, writing the result into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_cummax(
 	x: &GpuBuffer,
 	workspace: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_cummax(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			workspace.ptr_raw(),
 			workspace.len(),
@@ -559,9 +704,14 @@ pub fn gpu_cummax(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Sums `vals` within each segment identified by `seg_ids`, writing per-segment totals into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_segment_sum(
 	vals: &GpuBuffer,
 	seg_ids: &GpuBuffer,
@@ -569,10 +719,11 @@ pub fn gpu_segment_sum(
 	n_segs: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: vals, seg_ids, and out are live device buffers sized for n and n_segs; the launcher signature matches these arguments.
 	unsafe {
 		launch_segment_sum(
-			vals.ptr_raw() as *const c_void,
-			seg_ids.ptr_raw() as *const c_void,
+			vals.ptr_raw().cast_const(),
+			seg_ids.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
@@ -580,9 +731,14 @@ pub fn gpu_segment_sum(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Reduces `vals` to the maximum within each segment identified by `seg_ids`, writing per-segment maxima into `out`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_segment_max(
 	vals: &GpuBuffer,
 	seg_ids: &GpuBuffer,
@@ -590,10 +746,11 @@ pub fn gpu_segment_max(
 	n_segs: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: vals, seg_ids, and out are live device buffers sized for n and n_segs; the launcher signature matches these arguments.
 	unsafe {
 		launch_segment_max(
-			vals.ptr_raw() as *const c_void,
-			seg_ids.ptr_raw() as *const c_void,
+			vals.ptr_raw().cast_const(),
+			seg_ids.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
@@ -601,9 +758,14 @@ pub fn gpu_segment_max(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// Runs the first-order linear recurrence scan `state = a * state + b` over `n_steps` steps of width `dim`, writing states into `states`.
+///
+/// # Errors
+/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
+#[inline]
 pub fn gpu_scan_linear_recurrence(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
@@ -611,10 +773,11 @@ pub fn gpu_scan_linear_recurrence(
 	dim: usize,
 	states: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: a, b, and states are live device buffers sized for n_steps*dim; the launcher signature matches these arguments.
 	unsafe {
 		launch_scan_linear_recurrence(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			states.ptr_raw(),
 			safe_i32(n_steps),
 			safe_i32(dim),
@@ -622,5 +785,5 @@ pub fn gpu_scan_linear_recurrence(
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

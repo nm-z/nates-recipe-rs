@@ -1,13 +1,18 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
+use crate::hip::{check, hipGetLastError};
+use crate::kernels::ci;
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
+/// Ticks the launch counters and returns any deferred HIP launch error.
 fn check_launch() -> Result<(), HipError> {
-	crate::callspy::tick(&crate::callspy::LAUNCH);
-	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-	let err = unsafe { crate::hip::hipGetLastError() };
-	check(err)
+	tick(&LAUNCH);
+	tick(&GET_LAST_ERROR);
+	// SAFETY: nullary HIP error query with no preconditions.
+	let err = unsafe { hipGetLastError() };
+	return check(err);
 }
 
 #[derive(Clone, Copy)]
@@ -16,7 +21,9 @@ pub struct ConvOut {
 	pub w: usize,
 }
 
-pub fn conv_out_hw(
+#[must_use]
+#[inline]
+pub const fn conv_out_hw(
 	h: usize,
 	w: usize,
 	kh: usize,
@@ -28,9 +35,9 @@ pub fn conv_out_hw(
 	dil_h: usize,
 	dil_w: usize,
 ) -> ConvOut {
-	let out_h = (h + 2 * pad_h - dil_h * (kh - 1) - 1) / sh + 1;
-	let out_w = (w + 2 * pad_w - dil_w * (kw - 1) - 1) / sw + 1;
-	ConvOut { h: out_h, w: out_w }
+	let out_h = (h + 2 * pad_h - dil_h * (kh - 1) - 1).div_euclid(sh) + 1;
+	let out_w = (w + 2 * pad_w - dil_w * (kw - 1) - 1).div_euclid(sw) + 1;
+	return ConvOut { h: out_h, w: out_w };
 }
 
 unsafe extern "C" {
@@ -149,7 +156,10 @@ unsafe extern "C" {
 	);
 }
 
-pub fn gpu_scaled_dot_product_attention(
+/// # Errors
+/// Returns [`HipError`] if a size overflows `i32` or the kernel launch fails.
+#[inline]
+pub fn gpu_scaled_dot_product_attn(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
 	v: &GpuBuffer,
@@ -159,29 +169,43 @@ pub fn gpu_scaled_dot_product_attention(
 	causal: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_rows_i = ci(n_rows)?;
+	let seq_i = ci(seq)?;
+	let dim_i = ci(dim)?;
+	let causal_i = ci(causal)?;
+	// SAFETY: FFI launch; pointers are live device buffers and the i32 sizes are range-checked above.
 	unsafe {
 		launch_scaled_dot_product_attention(
-			q.ptr_raw() as *const c_void,
-			k.ptr_raw() as *const c_void,
-			v.ptr_raw() as *const c_void,
+			q.ptr_raw().cast_const(),
+			k.ptr_raw().cast_const(),
+			v.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n_rows as i32,
-			seq as i32,
-			dim as i32,
-			causal as i32,
+			n_rows_i,
+			seq_i,
+			dim_i,
+			causal_i,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Result<(), HipError> {
+	let rows_i = ci(rows)?;
+	let cols_i = ci(cols)?;
+	// SAFETY: the buffer pointer is valid for the launch and dims fit i32.
 	unsafe {
-		launch_causal_softmax_rows(x.ptr_raw(), rows as i32, cols as i32, ptr::null_mut());
+		launch_causal_softmax_rows(x.ptr_raw(), rows_i, cols_i, ptr::null_mut());
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_mha_split(
 	x: &GpuBuffer,
 	seq: usize,
@@ -189,19 +213,26 @@ pub fn gpu_mha_split(
 	head_dim: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let seq_i = ci(seq)?;
+	let n_heads_i = ci(n_heads)?;
+	let head_dim_i = ci(head_dim)?;
+	// SAFETY: buffer pointers are valid for the launch and dims fit i32.
 	unsafe {
 		launch_mha_split(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			seq as i32,
-			n_heads as i32,
-			head_dim as i32,
+			seq_i,
+			n_heads_i,
+			head_dim_i,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_mha_merge(
 	x: &GpuBuffer,
 	seq: usize,
@@ -209,19 +240,26 @@ pub fn gpu_mha_merge(
 	head_dim: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let seq_i = ci(seq)?;
+	let n_heads_i = ci(n_heads)?;
+	let head_dim_i = ci(head_dim)?;
+	// SAFETY: buffer pointers are valid for the launch and dims fit i32.
 	unsafe {
 		launch_mha_merge(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			seq as i32,
-			n_heads as i32,
-			head_dim as i32,
+			seq_i,
+			n_heads_i,
+			head_dim_i,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_rope(
 	x: &GpuBuffer,
 	seq: usize,
@@ -229,26 +267,38 @@ pub fn gpu_rope(
 	base: &GpuBuffer,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let seq_i = ci(seq)?;
+	let dim_i = ci(dim)?;
+	// SAFETY: launch args are valid device pointers and checked i32 extents.
 	unsafe {
 		launch_rope(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			seq as i32,
-			dim as i32,
-			base.ptr_raw() as *const c_void,
+			seq_i,
+			dim_i,
+			base.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let seq_i = ci(seq)?;
+	let dim_i = ci(dim)?;
+	// SAFETY: launch args are valid device pointers and checked i32 extents.
 	unsafe {
-		launch_positional_encoding(out.ptr_raw(), seq as i32, dim as i32, ptr::null_mut());
+		launch_positional_encoding(out.ptr_raw(), seq_i, dim_i, ptr::null_mut());
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_rmsnorm(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -257,20 +307,26 @@ pub fn gpu_rmsnorm(
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let rows_i = ci(rows)?;
+	let cols_i = ci(cols)?;
+	// SAFETY: launch args are valid device pointers and checked i32 extents.
 	unsafe {
 		launch_rmsnorm(
-			x.ptr_raw() as *const c_void,
-			gamma.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
+			gamma.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			rows as i32,
-			cols as i32,
-			eps.ptr_raw() as *const c_void,
+			rows_i,
+			cols_i,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns [`HipError`] on launch failure or size overflow.
+#[inline]
 pub fn gpu_rmsnorm_backward(
 	grad_out: &GpuBuffer,
 	x: &GpuBuffer,
@@ -281,24 +337,28 @@ pub fn gpu_rmsnorm_backward(
 	grad_x: &GpuBuffer,
 	grad_gamma: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: the GpuBuffer pointers are live device allocations for the launch duration.
 	unsafe {
 		launch_rmsnorm_backward(
-			grad_out.ptr_raw() as *const c_void,
-			x.ptr_raw() as *const c_void,
-			gamma.ptr_raw() as *const c_void,
+			grad_out.ptr_raw().cast_const(),
+			x.ptr_raw().cast_const(),
+			gamma.ptr_raw().cast_const(),
 			grad_x.ptr_raw(),
 			grad_gamma.ptr_raw(),
-			rows as i32,
-			cols as i32,
-			eps.ptr_raw() as *const c_void,
+			ci(rows)?,
+			ci(cols)?,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns [`HipError`] on launch failure or size overflow.
+#[inline]
 pub fn gpu_im2col_2d_ext(
-	x: &GpuBuffer,
+	img: &GpuBuffer,
 	n: usize,
 	c: usize,
 	h: usize,
@@ -314,30 +374,34 @@ pub fn gpu_im2col_2d_ext(
 	patches: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let dims = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
+	// SAFETY: the GpuBuffer pointers are live device allocations for the launch duration.
 	unsafe {
 		launch_im2col_2d_ext(
-			x.ptr_raw() as *const c_void,
+			img.ptr_raw().cast_const(),
 			patches.ptr_raw(),
-			n as i32,
-			c as i32,
-			h as i32,
-			w as i32,
-			kh as i32,
-			kw as i32,
-			sh as i32,
-			sw as i32,
-			pad_h as i32,
-			pad_w as i32,
-			dil_h as i32,
-			dil_w as i32,
-			dims.h as i32,
-			dims.w as i32,
+			ci(n)?,
+			ci(c)?,
+			ci(h)?,
+			ci(w)?,
+			ci(kh)?,
+			ci(kw)?,
+			ci(sh)?,
+			ci(sw)?,
+			ci(pad_h)?,
+			ci(pad_w)?,
+			ci(dil_h)?,
+			ci(dil_w)?,
+			ci(dims.h)?,
+			ci(dims.w)?,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_col2im_2d_ext(
 	patches: &GpuBuffer,
 	n: usize,
@@ -355,30 +419,34 @@ pub fn gpu_col2im_2d_ext(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let dims = conv_out_hw(h, w, kh, kw, sh, sw, pad_h, pad_w, dil_h, dil_w);
+	// SAFETY: buffer pointers are valid for this launch and the extern signature matches launch_col2im_2d_ext.
 	unsafe {
 		launch_col2im_2d_ext(
-			patches.ptr_raw() as *const c_void,
+			patches.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i32,
-			c as i32,
-			h as i32,
-			w as i32,
-			kh as i32,
-			kw as i32,
-			sh as i32,
-			sw as i32,
-			pad_h as i32,
-			pad_w as i32,
-			dil_h as i32,
-			dil_w as i32,
-			dims.h as i32,
-			dims.w as i32,
+			ci(n)?,
+			ci(c)?,
+			ci(h)?,
+			ci(w)?,
+			ci(kh)?,
+			ci(kw)?,
+			ci(sh)?,
+			ci(sw)?,
+			ci(pad_h)?,
+			ci(pad_w)?,
+			ci(dil_h)?,
+			ci(dil_w)?,
+			ci(dims.h)?,
+			ci(dims.w)?,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_embedding_backward(
 	grad_out: &GpuBuffer,
 	indices: &GpuBuffer,
@@ -387,20 +455,27 @@ pub fn gpu_embedding_backward(
 	vocab: usize,
 	grad_table: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i = ci(n)?;
+	let cols_i = ci(cols)?;
+	let vocab_i = ci(vocab)?;
+	// SAFETY: device pointers are valid allocations that outlive the launch.
 	unsafe {
 		launch_embedding_backward(
-			grad_out.ptr_raw() as *const c_void,
-			indices.ptr_raw() as *const c_void,
+			grad_out.ptr_raw().cast_const(),
+			indices.ptr_raw().cast_const(),
 			grad_table.ptr_raw(),
-			n as i32,
-			cols as i32,
-			vocab as i32,
+			n_i,
+			cols_i,
+			vocab_i,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }
 
+/// # Errors
+/// Returns `HipError` if the kernel launch fails.
+#[inline]
 pub fn gpu_bn_update_running(
 	save_mean: &GpuBuffer,
 	save_var: &GpuBuffer,
@@ -409,16 +484,18 @@ pub fn gpu_bn_update_running(
 	run_mean: &GpuBuffer,
 	run_var: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let c_i = ci(c)?;
+	// SAFETY: every pointer is a live device allocation and c is a checked i32.
 	unsafe {
 		launch_bn_update_running(
 			run_mean.ptr_raw(),
 			run_var.ptr_raw(),
-			save_mean.ptr_raw() as *const c_void,
-			save_var.ptr_raw() as *const c_void,
-			momentum.ptr_raw() as *const c_void,
-			c as i32,
+			save_mean.ptr_raw().cast_const(),
+			save_var.ptr_raw().cast_const(),
+			momentum.ptr_raw().cast_const(),
+			c_i,
 			ptr::null_mut(),
 		);
 	}
-	check_launch()
+	return check_launch();
 }

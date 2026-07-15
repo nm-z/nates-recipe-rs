@@ -13,7 +13,7 @@ use crate::common;
 // derivatives (*_backward/*Grad/*_bwd) and structural items (keras.layers.*,
 // stax.*, cutlass epilogues, generic Activation) stay backlog — not failures.
 
-use gpu_core::hip::HipError;
+use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::f64::consts;

@@ -8,16 +8,21 @@ pub struct Chan<T> {
 	pub rx: mpsc::Receiver<T>,
 }
 
+#[must_use]
+#[inline]
 pub fn sync_chan<T>(depth: usize) -> Chan<T> {
 	let (tx, rx) = mpsc::sync_channel::<T>(depth);
-	Chan { tx, rx }
+	return Chan { tx, rx };
 }
 
+/// # Errors
+/// Returns an error if the spill file at `path` cannot be opened for read/write.
+#[inline]
 pub fn open_spill(path: &Path) -> io::Result<File> {
-	OpenOptions::new()
+	return OpenOptions::new()
 		.read(true)
 		.write(true)
 		.create(true)
 		.truncate(true)
-		.open(path)
+		.open(path);
 }

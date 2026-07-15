@@ -1,8 +1,8 @@
-use crate::hip::HipError;
-use crate::kernels::check_launch;
+use crate::HipError;
+use crate::kernels::{check_launch, ci};
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
 unsafe extern "C" {
 	fn launch_discounted_returns(
@@ -53,25 +53,33 @@ unsafe extern "C" {
 	);
 }
 
+/// # Errors
+/// Returns `HipError` when `t_len` overflows `i32`.
+#[inline]
 pub fn gpu_discounted_returns(
 	rewards: &GpuBuffer,
 	gamma: &GpuBuffer,
 	t_len: usize,
 	returns: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let t_len_i32 = ci(t_len)?;
+	// SAFETY: buffer pointers are valid device allocations and t_len bounds the launch grid.
 	unsafe {
 		launch_discounted_returns(
-			rewards.ptr_raw() as *const c_void,
+			rewards.ptr_raw().cast_const(),
 			returns.ptr_raw(),
-			gamma.ptr_raw() as *const c_void,
-			t_len as i32,
+			gamma.ptr_raw().cast_const(),
+			t_len_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `t_len` overflows `i32`.
+#[inline]
 pub fn gpu_gae(
 	rewards: &GpuBuffer,
 	values: &GpuBuffer,
@@ -80,21 +88,26 @@ pub fn gpu_gae(
 	t_len: usize,
 	advantages: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let t_len_i32 = ci(t_len)?;
+	// SAFETY: buffer pointers are valid device allocations and t_len bounds the launch grid.
 	unsafe {
 		launch_gae(
-			rewards.ptr_raw() as *const c_void,
-			values.ptr_raw() as *const c_void,
+			rewards.ptr_raw().cast_const(),
+			values.ptr_raw().cast_const(),
 			advantages.ptr_raw(),
-			gamma.ptr_raw() as *const c_void,
-			lam.ptr_raw() as *const c_void,
-			t_len as i32,
+			gamma.ptr_raw().cast_const(),
+			lam.ptr_raw().cast_const(),
+			t_len_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n` overflows `i32`.
+#[inline]
 pub fn gpu_td_targets(
 	rewards: &GpuBuffer,
 	values_next: &GpuBuffer,
@@ -103,21 +116,26 @@ pub fn gpu_td_targets(
 	n: usize,
 	targets: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	// SAFETY: buffer pointers are valid device allocations and n bounds the launch grid.
 	unsafe {
 		launch_td_targets(
-			rewards.ptr_raw() as *const c_void,
-			values_next.ptr_raw() as *const c_void,
-			done_mask.ptr_raw() as *const c_void,
+			rewards.ptr_raw().cast_const(),
+			values_next.ptr_raw().cast_const(),
+			done_mask.ptr_raw().cast_const(),
 			targets.ptr_raw(),
-			gamma.ptr_raw() as *const c_void,
-			n as i32,
+			gamma.ptr_raw().cast_const(),
+			n_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n` or `n_actions` overflows `i32`.
+#[inline]
 pub fn gpu_categorical_logprob(
 	logits: &GpuBuffer,
 	actions_i32: &GpuBuffer,
@@ -125,20 +143,26 @@ pub fn gpu_categorical_logprob(
 	n_actions: usize,
 	logp: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	let n_actions_i32 = ci(n_actions)?;
+	// SAFETY: buffer pointers are valid device allocations and n bounds the launch grid.
 	unsafe {
 		launch_categorical_logprob(
-			logits.ptr_raw() as *const c_void,
-			actions_i32.ptr_raw() as *const c_void,
+			logits.ptr_raw().cast_const(),
+			actions_i32.ptr_raw().cast_const(),
 			logp.ptr_raw(),
-			n as i32,
-			n_actions as i32,
+			n_i32,
+			n_actions_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }
 
+/// # Errors
+/// Returns `HipError` when `n` or `dim` overflows `i32`.
+#[inline]
 pub fn gpu_gaussian_logprob(
 	mu: &GpuBuffer,
 	log_std: &GpuBuffer,
@@ -147,17 +171,20 @@ pub fn gpu_gaussian_logprob(
 	dim: usize,
 	logp: &GpuBuffer,
 ) -> Result<(), HipError> {
+	let n_i32 = ci(n)?;
+	let dim_i32 = ci(dim)?;
+	// SAFETY: buffer pointers are valid device allocations and n bounds the launch grid.
 	unsafe {
 		launch_gaussian_logprob(
-			mu.ptr_raw() as *const c_void,
-			log_std.ptr_raw() as *const c_void,
-			actions.ptr_raw() as *const c_void,
+			mu.ptr_raw().cast_const(),
+			log_std.ptr_raw().cast_const(),
+			actions.ptr_raw().cast_const(),
 			logp.ptr_raw(),
-			n as i32,
-			dim as i32,
+			n_i32,
+			dim_i32,
 			ptr::null_mut(),
 		);
 	}
 	check_launch();
-	Ok(())
+	return Ok(());
 }

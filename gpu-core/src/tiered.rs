@@ -1,24 +1,36 @@
-use crate::hip::{self, HipError};
+extern crate alloc;
+use crate::HipError;
+use crate::bridge::open_spill;
+use crate::callspy;
+use crate::hip;
 use crate::log::Write;
-use std::cmp;
-use std::ffi::{CString, c_void};
-use std::fmt;
+use crate::memory;
+use crate::memory::tag_note_alloc;
+use alloc::ffi::CString;
+use core::cmp;
+use core::ffi::c_void;
+use core::fmt;
+use core::iter;
+use core::mem;
+use core::num::NonZeroUsize;
+use core::ptr;
 use std::fs;
 use std::fs::File;
-use std::mem;
-use std::num::NonZeroUsize;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::ptr;
 
 pub const P: usize = 2 << 20;
 
+/// User reserve withheld from the VRAM tier (1 GiB).
 const RESERVE_V: usize = 1 << 30;
+/// User reserve withheld from the RAM tier (1 GiB).
 const RESERVE_R: usize = 1 << 30;
+/// User reserve withheld from the disk tier (1 GiB).
 const RESERVE_D: usize = 1 << 30;
 
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum Residence {
 	Vram(u32),
 	Ram(u32),
@@ -32,13 +44,14 @@ pub struct Full {
 }
 
 impl fmt::Display for Full {
-	fn fmt<'f>(&self, f: &mut fmt::Formatter<'f>) -> fmt::Result {
-		write!(
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		return write!(
 			f,
 			"buffer {} exceeds VRAM+RAM+disk ceiling {}",
 			human(self.need),
 			human(self.cap)
-		)
+		);
 	}
 }
 
@@ -53,25 +66,66 @@ pub struct Budgets {
 }
 
 impl Budgets {
+	#[must_use]
+	#[inline]
 	pub fn measure(weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Self {
-		let total = vram_total_free().total;
+		use std::os::unix::ffi::OsStrExt as _;
+		let mut free = 0usize;
+		let mut total = 0usize;
+		callspy::tick(&callspy::MEM_GET_INFO);
+		// SAFETY: free and total are live local usize slots that hipMemGetInfo writes.
+		unsafe {
+			hip::hipMemGetInfo(&raw mut free, &raw mut total);
+		}
 		let vram_data = total
 			.saturating_sub(weights_bytes)
 			.saturating_sub(grad_bytes)
 			.saturating_sub(RESERVE_V);
-		let ram_data = meminfo_free().saturating_sub(RESERVE_R);
-		let disk_data = disk_free(spill).saturating_sub(RESERVE_D);
-		Budgets {
+
+		let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+		let ram_avail = meminfo
+			.lines()
+			.find_map(|l| {
+				let r = l.strip_prefix("MemAvailable:")?;
+				let kb = r.split_whitespace().next()?.parse::<usize>().ok()?;
+				return Some(kb.saturating_mul(1024));
+			})
+			.unwrap_or(0);
+		let ram_data = ram_avail.saturating_sub(RESERVE_R);
+
+		let dir = spill
+			.parent()
+			.filter(|p| return !p.as_os_str().is_empty())
+			.unwrap_or_else(|| return Path::new("."));
+		let disk_avail = CString::new(dir.as_os_str().as_bytes()).map_or(0, |c| {
+			// SAFETY: libc::statvfs is plain data with no invalid bit patterns; zeroed is valid.
+			let mut st: libc::statvfs = unsafe { mem::zeroed() };
+			// SAFETY: c is a valid NUL-terminated path and st is a valid writable statvfs slot.
+			let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+			match rc.cmp(&0i32) {
+				cmp::Ordering::Equal => {
+					return usize::try_from(st.f_bavail)
+						.unwrap_or(0)
+						.saturating_mul(usize::try_from(st.f_frsize).unwrap_or(0));
+				}
+				cmp::Ordering::Less | cmp::Ordering::Greater => return 0,
+			}
+		});
+		let disk_data = disk_avail.saturating_sub(RESERVE_D);
+		return Self {
 			vram_data,
 			ram_data,
 			disk_data,
 			cap: vram_data + ram_data + disk_data,
-			n_v: vram_data / P,
-			n_r: ram_data / P,
-		}
+			n_v: vram_data.div_euclid(P),
+			n_r: ram_data.div_euclid(P),
+		};
 	}
 }
 
+/// # Errors
+/// Returns [`Full`] when the requested buffer exceeds the combined VRAM+RAM+disk ceiling.
+#[inline]
 pub fn admit(
 	b: usize,
 	weights_bytes: usize,
@@ -80,78 +134,55 @@ pub fn admit(
 ) -> Result<Budgets, Full> {
 	let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
 	match b.cmp(&bud.cap) {
-		cmp::Ordering::Greater => Err(Full {
-			need: b,
-			cap: bud.cap,
-		}),
-		cmp::Ordering::Less | cmp::Ordering::Equal => Ok(bud),
-	}
-}
-
-fn vram_total_free() -> hip::MemInfo {
-	let mut free = 0usize;
-	let mut total = 0usize;
-	crate::callspy::tick(&crate::callspy::MEM_GET_INFO);
-	unsafe { hip::hipMemGetInfo(&mut free, &mut total) };
-	hip::MemInfo { free, total }
-}
-
-fn meminfo_free() -> usize {
-	let s = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-	for l in s.lines() {
-		let Some(r) = l.strip_prefix("MemAvailable:") else {
-			continue;
-		};
-		let Some(kb) = r
-			.split_whitespace()
-			.next()
-			.and_then(|v| v.parse::<usize>().ok())
-		else {
-			continue;
-		};
-		return kb.saturating_mul(1024);
-	}
-	0
-}
-
-fn disk_free(spill: &Path) -> usize {
-	use std::os::unix::ffi::OsStrExt;
-	let dir = spill
-		.parent()
-		.filter(|p| !p.as_os_str().is_empty())
-		.unwrap_or_else(|| Path::new("."));
-	let Ok(c) = CString::new(dir.as_os_str().as_bytes()) else {
-		return 0;
-	};
-	let mut st: libc::statvfs = unsafe { mem::zeroed() };
-	let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
-	match rc.cmp(&0) {
-		cmp::Ordering::Equal => (st.f_bavail as usize).saturating_mul(st.f_frsize as usize),
-		cmp::Ordering::Less | cmp::Ordering::Greater => 0,
+		cmp::Ordering::Greater => {
+			return Err(Full {
+				need: b,
+				cap: bud.cap,
+			});
+		}
+		cmp::Ordering::Less | cmp::Ordering::Equal => return Ok(bud),
 	}
 }
 
 pub struct Tiered {
+	/// Logical byte length of the buffer.
 	b: usize,
+	/// Total page count, `ceil(b / P)`.
 	n_pg: usize,
+	/// Residence tier of each page in order.
 	res: Vec<Residence>,
+	/// Tier budgets captured when the buffer was allocated.
 	budgets: Budgets,
 
+	/// Base device virtual address of the mapped VRAM slots, null when none.
 	va: *mut c_void,
+	/// Physical VMM handles, one per mapped VRAM slot.
 	handles: Vec<*mut c_void>,
-	#[allow(dead_code)]
+	/// Reverse slot-to-page map reserved for future eviction.
+	#[expect(
+		dead_code,
+		reason = "reserved slot-to-page reverse map for future eviction"
+	)]
 	slot_page: Vec<Option<usize>>,
+	/// Count of VRAM slots currently mapped.
 	slots: usize,
 
+	/// Host RAM tier pages, one boxed slab each.
 	ram: Vec<Box<[u8]>>,
 
+	/// Disk spill file backing the overflow tier, absent when unused.
 	disk: Option<File>,
+	/// Path of the spill file, removed on drop.
 	spill_path: PathBuf,
 }
 
+// SAFETY: the raw VA and handle pointers are owned solely by this Tiered and never aliased, so sending it across threads is sound.
 unsafe impl Send for Tiered {}
 
 impl Tiered {
+	/// # Errors
+	/// Returns [`Full`] when `b` exceeds the combined VRAM+RAM+disk ceiling.
+	#[inline]
 	pub fn alloc(
 		b: usize,
 		weights_bytes: usize,
@@ -160,58 +191,102 @@ impl Tiered {
 	) -> Result<Self, Full> {
 		let budgets = Budgets::measure(weights_bytes, grad_bytes, spill);
 		match b.cmp(&budgets.cap) {
-			cmp::Ordering::Greater => Err(Full {
-				need: b,
-				cap: budgets.cap,
-			}),
+			cmp::Ordering::Greater => {
+				return Err(Full {
+					need: b,
+					cap: budgets.cap,
+				});
+			}
 			cmp::Ordering::Less | cmp::Ordering::Equal => {
 				let n_pg = b.div_ceil(P);
-				let n_vram = n_pg.min(budgets.n_v);
-				let n_ram = (n_pg - n_vram).min(budgets.n_r);
-				Ok(Self::build(b, n_pg, n_vram, n_ram, budgets, spill))
+				let gpu_pages = n_pg.min(budgets.n_v);
+				let ram_pages = (n_pg - gpu_pages).min(budgets.n_r);
+				return Ok(Self::build(b, n_pg, gpu_pages, ram_pages, budgets, spill));
 			}
 		}
 	}
 
+	#[inline]
+	#[must_use]
 	pub fn alloc_capped(b: usize, n_v: usize, n_r: usize, spill: &Path) -> Self {
 		let budgets = Budgets::measure(0, 0, spill);
 		let n_pg = b.div_ceil(P);
-		let n_vram = n_pg.min(n_v);
-		let n_ram = (n_pg - n_vram).min(n_r);
-		Self::build(b, n_pg, n_vram, n_ram, budgets, spill)
+		let gpu_pages = n_pg.min(n_v);
+		let ram_pages = (n_pg - gpu_pages).min(n_r);
+		return Self::build(b, n_pg, gpu_pages, ram_pages, budgets, spill);
 	}
 
+	/// Builds a [`Tiered`] from the computed VRAM/RAM/disk page split.
 	fn build(
 		b: usize,
 		n_pg: usize,
-		n_vram: usize,
-		n_ram: usize,
+		gpu_pages: usize,
+		ram_pages: usize,
 		budgets: Budgets,
 		spill: &Path,
 	) -> Self {
-		let n_disk = n_pg - n_vram - n_ram;
+		let n_disk = n_pg - gpu_pages - ram_pages;
 
-		let mapping = reserve_and_map(n_vram).unwrap_or_else(|e| {
-			drop(Write::err(&format!("vmm reserve/map: {e}")));
-			process::abort()
-		});
-		let va = mapping.va;
-		let handles = mapping.handles;
-		crate::memory::tag_note_alloc("tiered-vram", handles.len() * P);
-		let slot_page: Vec<Option<usize>> = (0..n_vram).map(Some).collect();
+		let (va, handles): (*mut c_void, Vec<*mut c_void>) = NonZeroUsize::new(gpu_pages)
+			.map_or_else(
+				|| return (ptr::null_mut(), Vec::new()),
+				|_count| {
+					let mut va: *mut c_void = ptr::null_mut();
+					callspy::tick(&callspy::MEM_ADDRESS_RESERVE);
+					// SAFETY: va is a valid writable out-slot for the reserved base address.
+					hip::check(unsafe { hip::vmm_reserve(&raw mut va, gpu_pages * P) })
+						.unwrap_or_else(|e| {
+							drop(Write::err(format!("vmm reserve: {e}")));
+							process::abort()
+						});
+					let mut handles = Vec::with_capacity(gpu_pages);
+					for s in 0..gpu_pages {
+						let mut h: *mut c_void = ptr::null_mut();
+						callspy::tick(&callspy::MEM_CREATE);
+						// SAFETY: h is a valid writable out-slot for the new physical handle.
+						hip::check(unsafe { hip::vmm_create(&raw mut h, P) })
+							.unwrap_or_else(|e| {
+								drop(Write::err(format!("vmm create: {e}")));
+								process::abort()
+							});
+						// SAFETY: s < gpu_pages, so the offset stays within the reserved VA range.
+						let slot_va =
+							unsafe { va.cast::<u8>().add(s * P).cast::<c_void>() };
+						callspy::tick(&callspy::MEM_MAP);
+						callspy::tick(&callspy::MEM_SET_ACCESS);
+						// SAFETY: slot_va is a reserved in-range page and h its freshly created handle.
+						hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })
+							.unwrap_or_else(|e| {
+								drop(Write::err(format!("vmm map: {e}")));
+								process::abort()
+							});
+						handles.push(h);
+					}
+					return (va, handles);
+				},
+			);
+		tag_note_alloc("tiered-vram", handles.len() * P);
+		let slot_page: Vec<Option<usize>> = (0..gpu_pages).map(Some).collect();
 
-		let ram: Vec<Box<[u8]>> = (0..n_ram)
-			.map(|_k| vec![0u8; P].into_boxed_slice())
+		let ram: Vec<Box<[u8]>> = iter::repeat_with(|| return vec![0u8; P].into_boxed_slice())
+			.take(ram_pages)
 			.collect();
 
 		let disk = match n_disk.cmp(&0) {
 			cmp::Ordering::Greater => {
-				let f = crate::bridge::open_spill(spill).unwrap_or_else(|e| {
-					drop(Write::err(&format!("open spill file: {e}")));
+				let f = open_spill(spill).unwrap_or_else(|e| {
+					drop(Write::err(format!("open spill file: {e}")));
 					process::abort()
 				});
-				f.set_len((n_disk * P) as u64).unwrap_or_else(|e| {
-					drop(Write::err(&format!("size spill file: {e}")));
+				let disk_bytes = u64::try_from(n_disk * P).unwrap_or_else(|e| {
+					drop(Write::err(format!(
+						"spill size {} overflows u64: {e}",
+						n_disk * P
+					)));
+					process::abort()
+				});
+				f.set_len(disk_bytes).unwrap_or_else(|e| {
+					drop(Write::err(format!("size spill file: {e}")));
 					process::abort()
 				});
 				Some(f)
@@ -220,17 +295,29 @@ impl Tiered {
 		};
 
 		let mut res = Vec::with_capacity(n_pg);
-		for s in 0..n_vram {
-			res.push(Residence::Vram(s as u32));
+		for s in 0..gpu_pages {
+			res.push(Residence::Vram(u32::try_from(s).unwrap_or_else(|e| {
+				drop(Write::err(format!("vram slot {s} overflows u32: {e}")));
+				process::abort()
+			})));
 		}
-		for i in 0..n_ram {
-			res.push(Residence::Ram(i as u32));
+		for i in 0..ram_pages {
+			res.push(Residence::Ram(u32::try_from(i).unwrap_or_else(|e| {
+				drop(Write::err(format!("ram slot {i} overflows u32: {e}")));
+				process::abort()
+			})));
 		}
 		for i in 0..n_disk {
-			res.push(Residence::Disk((i * P) as u64));
+			res.push(Residence::Disk(u64::try_from(i * P).unwrap_or_else(|e| {
+				drop(Write::err(format!(
+					"disk offset {} overflows u64: {e}",
+					i * P
+				)));
+				process::abort()
+			})));
 		}
 
-		Tiered {
+		return Self {
 			b,
 			n_pg,
 			res,
@@ -238,42 +325,55 @@ impl Tiered {
 			va,
 			handles,
 			slot_page,
-			slots: n_vram,
+			slots: gpu_pages,
 			ram,
 			disk,
 			spill_path: spill.to_path_buf(),
-		}
+		};
 	}
 
-	pub fn budgets(&self) -> Budgets {
-		self.budgets
+	#[inline]
+	#[must_use]
+	pub const fn budgets(&self) -> Budgets {
+		return self.budgets;
 	}
-	pub fn len(&self) -> usize {
-		self.b
+	#[inline]
+	#[must_use]
+	pub const fn len(&self) -> usize {
+		return self.b;
 	}
-	pub fn is_empty(&self) -> bool {
-		self.b == 0
+	#[must_use]
+	#[inline]
+	pub const fn is_empty(&self) -> bool {
+		return self.b == 0;
 	}
-	pub fn pages(&self) -> usize {
-		self.n_pg
+	#[must_use]
+	#[inline]
+	pub const fn pages(&self) -> usize {
+		return self.n_pg;
 	}
 
-	pub fn is_contiguous_vram(&self) -> bool {
-		self.slots == self.n_pg && self.disk.is_none() && self.ram.is_empty()
+	#[must_use]
+	#[inline]
+	pub const fn is_contiguous_vram(&self) -> bool {
+		return self.slots == self.n_pg && self.disk.is_none() && self.ram.is_empty();
 	}
 
+	#[must_use]
+	#[inline]
 	pub fn device_ptr(&self) -> *mut c_void {
 		if !self.is_contiguous_vram() {
 			drop(Write::err(
-				"device_ptr on a spilled buffer — stage pages instead",
+				"device_ptr on a spilled buffer \u{2014} stage pages instead",
 			));
 			process::abort();
 		}
-		self.va
+		return self.va;
 	}
 
+	#[inline]
 	pub fn fill(&mut self, src: &[u8]) {
-		if !(src.len() <= self.b) {
+		if src.len() > self.b {
 			drop(Write::err("fill src longer than buffer"));
 			process::abort();
 		}
@@ -289,27 +389,38 @@ impl Tiered {
 		}
 	}
 
+	/// Writes `bytes` into logical page `p`, dispatching to its resident tier.
 	fn write_page(&mut self, p: usize, bytes: &[u8]) {
 		match self.res[p] {
 			Residence::Vram(s) => {
+				let off = usize::try_from(s).unwrap_or_else(|_| {
+					drop(Write::err("vram slot index overflows usize"));
+					process::abort()
+				}) * P;
 				let dst =
-					unsafe { (self.va as *mut u8).add(s as usize * P) as *mut c_void };
+					// SAFETY: off < slots*P, so va+off addresses a mapped contiguous VRAM page.
+					unsafe { self.va.cast::<u8>().add(off).cast::<c_void>() };
+				// SAFETY: dst is a mapped page pointer; src and len describe a valid host slice for the H2D copy.
 				unsafe {
-					crate::memory::xfer(
+					memory::xfer(
 						dst,
-						bytes.as_ptr() as *const c_void,
+						bytes.as_ptr().cast::<c_void>(),
 						bytes.len(),
 						hip::HIP_MEMCPY_H2D,
 						ptr::null_mut(),
 					)
 				}
 				.unwrap_or_else(|e| {
-					drop(Write::err(&format!("H2D page fill: {e}")));
+					drop(Write::err(format!("H2D page fill: {e}")));
 					process::abort()
 				});
 			}
 			Residence::Ram(i) => {
-				self.ram[i as usize][..bytes.len()].copy_from_slice(bytes);
+				let ri = usize::try_from(i).unwrap_or_else(|_| {
+					drop(Write::err("ram page index overflows usize"));
+					process::abort()
+				});
+				self.ram[ri][..bytes.len()].copy_from_slice(bytes);
 			}
 			Residence::Disk(off) => {
 				self.disk
@@ -320,56 +431,68 @@ impl Tiered {
 					})
 					.write_all_at(bytes, off)
 					.unwrap_or_else(|e| {
-						drop(Write::err(&format!("spill write: {e}")));
+						drop(Write::err(format!("spill write: {e}")));
 						process::abort()
 					});
 			}
 		}
 	}
 
+	/// # Errors
+	/// Returns [`HipError`] when the device synchronize fails.
+	#[inline]
 	pub fn sync(&self) -> Result<(), HipError> {
-		hip::device_synchronize()
+		return hip::device_synchronize();
 	}
 
+	#[inline]
 	pub fn stage_bytes(&self, off: usize, len: usize, window: *mut c_void) {
+		use crate::memory::xfer;
 		let mut scratch = vec![0u8; P];
 		let mut done = 0usize;
 		while done < len {
 			let gpos = off + done;
-			let p = gpos / P;
-			let poff = gpos % P;
+			let p = gpos.div_euclid(P);
+			let poff = gpos.rem_euclid(P);
 			let chunk = (P - poff).min(len - done);
-			let dst = unsafe { (window as *mut u8).add(done) as *mut c_void };
+			// SAFETY: done < len keeps the write offset within the staging window.
+			let dst = unsafe { window.cast::<u8>().add(done).cast::<c_void>() };
 			match self.res[p] {
-				Residence::Vram(s) => unsafe {
-					let src = (self.va as *mut u8).add(s as usize * P + poff)
-						as *const c_void;
-					crate::memory::xfer(
-						dst,
-						src,
-						chunk,
-						hip::HIP_MEMCPY_D2D,
-						ptr::null_mut(),
-					)
+				Residence::Vram(s) => {
+					// SAFETY: s indexes a mapped VRAM slot and poff < P, so the D2D source stays in-bounds.
+					let src = unsafe {
+						self.va
+							.cast::<u8>()
+							.add(usize::try_from(s).unwrap_or(0) * P + poff)
+							.cast::<c_void>()
+							.cast_const()
+					};
+					// SAFETY: src and dst are valid for chunk bytes and both live on the device.
+					unsafe {
+						xfer(dst, src, chunk, hip::HIP_MEMCPY_D2D, ptr::null_mut())
+					}
 					.unwrap_or_else(|e| {
-						drop(Write::err(&format!("stage_bytes D2D: {e}")));
+						drop(Write::err(format!("stage_bytes D2D: {e}")));
 						process::abort()
 					});
-				},
-				Residence::Ram(i) => unsafe {
-					let src = self.ram[i as usize].as_ptr().add(poff) as *const c_void;
-					crate::memory::xfer(
-						dst,
-						src,
-						chunk,
-						hip::HIP_MEMCPY_H2D,
-						ptr::null_mut(),
-					)
+				}
+				Residence::Ram(i) => {
+					// SAFETY: poff < P keeps the read within the resident RAM page.
+					let src = unsafe {
+						self.ram[usize::try_from(i).unwrap_or(0)]
+							.as_ptr()
+							.add(poff)
+							.cast::<c_void>()
+					};
+					// SAFETY: src and dst are valid for chunk bytes; H2D from host RAM into the window.
+					unsafe {
+						xfer(dst, src, chunk, hip::HIP_MEMCPY_H2D, ptr::null_mut())
+					}
 					.unwrap_or_else(|e| {
-						drop(Write::err(&format!("stage_bytes H2D: {e}")));
+						drop(Write::err(format!("stage_bytes H2D: {e}")));
 						process::abort()
 					});
-				},
+				}
 				Residence::Disk(diskoff) => {
 					self.disk
 						.as_ref()
@@ -377,21 +500,25 @@ impl Tiered {
 							drop(Write::err("disk tier missing"));
 							process::abort()
 						})
-						.read_exact_at(&mut scratch[..chunk], diskoff + poff as u64)
+						.read_exact_at(
+							&mut scratch[..chunk],
+							diskoff + u64::try_from(poff).unwrap_or(0),
+						)
 						.unwrap_or_else(|e| {
-							drop(Write::err(&format!("stage_bytes read: {e}")));
+							drop(Write::err(format!("stage_bytes read: {e}")));
 							process::abort()
 						});
+					// SAFETY: scratch holds chunk bytes just read from disk and dst is valid for chunk bytes.
 					unsafe {
-						crate::memory::xfer(
+						xfer(
 							dst,
-							scratch.as_ptr() as *const c_void,
+							scratch.as_ptr().cast::<c_void>(),
 							chunk,
 							hip::HIP_MEMCPY_H2D,
 							ptr::null_mut(),
 						)
 						.unwrap_or_else(|e| {
-							drop(Write::err(&format!("stage_bytes disk H2D: {e}")));
+							drop(Write::err(format!("stage_bytes disk H2D: {e}")));
 							process::abort()
 						});
 					}
@@ -401,6 +528,7 @@ impl Tiered {
 		}
 	}
 
+	#[inline]
 	pub fn stage_into(&self, first_page: usize, n_pages: usize, window: *mut c_void) {
 		let mut disk_scratch = vec![0u8; P];
 		for k in 0..n_pages {
@@ -409,26 +537,42 @@ impl Tiered {
 				cmp::Ordering::Equal | cmp::Ordering::Greater => break,
 				cmp::Ordering::Less => {
 					let bytes = P.min(self.b - p * P);
-					let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
+					// SAFETY: k*P stays within the staged window allocation for this batch
+					let dst = unsafe { window.cast::<u8>().add(k * P).cast::<c_void>() };
 					match self.res[p] {
-						Residence::Vram(s) => unsafe {
-							let src = (self.va as *mut u8).add(s as usize * P)
-								as *const c_void;
-							crate::memory::xfer(
-								dst,
-								src,
-								bytes,
-								hip::HIP_MEMCPY_D2D,
-								ptr::null_mut(),
-							)
+						Residence::Vram(s) => {
+							let slot = usize::try_from(s)
+								.unwrap_or_else(|_| process::abort());
+							// SAFETY: slot indexes a mapped VRAM page within the reserved VA span
+							let src = unsafe {
+								self.va
+									.cast::<u8>()
+									.add(slot * P)
+									.cast::<c_void>()
+									.cast_const()
+							};
+							// SAFETY: src and dst are valid device pointers for the copy length
+							unsafe {
+								memory::xfer(
+									dst,
+									src,
+									bytes,
+									hip::HIP_MEMCPY_D2D,
+									ptr::null_mut(),
+								)
+							}
 							.unwrap_or_else(|e| {
-								drop(Write::err(&format!("stage D2D: {e}")));
+								drop(Write::err(format!("stage D2D: {e}")));
 								process::abort()
 							});
-						},
+						}
+						// SAFETY: src points into a live RAM page; dst is a valid device pointer
 						Residence::Ram(i) => unsafe {
-							let src = self.ram[i as usize].as_ptr() as *const c_void;
-							crate::memory::xfer(
+							let src = self.ram[usize::try_from(i)
+								.unwrap_or_else(|_| process::abort())]
+							.as_ptr()
+							.cast::<c_void>();
+							memory::xfer(
 								dst,
 								src,
 								bytes,
@@ -436,7 +580,7 @@ impl Tiered {
 								ptr::null_mut(),
 							)
 							.unwrap_or_else(|e| {
-								drop(Write::err(&format!("stage H2D: {e}")));
+								drop(Write::err(format!("stage H2D: {e}")));
 								process::abort()
 							});
 						},
@@ -449,19 +593,20 @@ impl Tiered {
 								})
 								.read_exact_at(&mut disk_scratch[..bytes], off)
 								.unwrap_or_else(|e| {
-									drop(Write::err(&format!("stage read: {e}")));
+									drop(Write::err(format!("stage read: {e}")));
 									process::abort()
 								});
+							// SAFETY: disk_scratch holds the read bytes; dst is a valid device pointer
 							unsafe {
-								crate::memory::xfer(
+								memory::xfer(
 									dst,
-									disk_scratch.as_ptr() as *const c_void,
+									disk_scratch.as_ptr().cast::<c_void>(),
 									bytes,
 									hip::HIP_MEMCPY_H2D,
 									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
-									drop(Write::err(&format!(
+									drop(Write::err(format!(
 										"stage disk H2D: {e}"
 									)));
 									process::abort()
@@ -476,67 +621,48 @@ impl Tiered {
 }
 
 impl Drop for Tiered {
+	#[inline]
 	fn drop(&mut self) {
-		crate::memory::tag_note_free("tiered-vram", self.slots * P);
+		memory::tag_note_free("tiered-vram", self.slots * P);
 		for s in 0..self.handles.len() {
 			let h = self.handles[s];
-			let va = unsafe { (self.va as *mut u8).add(s * P) as *mut c_void };
+			// SAFETY: s*P is within the reserved VA span for this Tiered mapping
+			let va = unsafe { self.va.cast::<u8>().add(s * P).cast::<c_void>() };
+			callspy::tick(&callspy::MEM_UNMAP);
+			// SAFETY: va is this slot's live mapped VA; unmap once before release
 			unsafe {
-				crate::callspy::tick(&crate::callspy::MEM_UNMAP);
 				hip::vmm_unmap(va, P);
-				crate::callspy::tick(&crate::callspy::MEM_RELEASE);
+			}
+			callspy::tick(&callspy::MEM_RELEASE);
+			// SAFETY: h backs this slot; released after its VA is unmapped
+			unsafe {
 				hip::vmm_release(h);
 			}
 		}
-		for _region in ptr::NonNull::new(self.va)
-			.filter(|_p| self.slots > 0)
-			.into_iter()
-		{
-			crate::callspy::tick(&crate::callspy::MEM_ADDRESS_FREE);
-			unsafe { hip::vmm_addr_free(self.va, self.slots * P) };
+		if ptr::NonNull::new(self.va).is_some_and(|_p| return self.slots > 0) {
+			callspy::tick(&callspy::MEM_ADDRESS_FREE);
+			// SAFETY: self.va is the reserved base of self.slots contiguous mapped pages.
+			unsafe {
+				hip::vmm_addr_free(self.va, self.slots * P);
+			}
 		}
-		for _f in self.disk.as_ref().into_iter() {
+		if self.disk.is_some() {
 			fs::remove_file(&self.spill_path).ok().unwrap_or(());
 		}
 	}
 }
 
-struct Mapping {
-	va: *mut c_void,
-	handles: Vec<*mut c_void>,
-}
-
-fn reserve_and_map(slots: usize) -> Result<Mapping, HipError> {
-	let Some(_count) = NonZeroUsize::new(slots) else {
-		return Ok(Mapping {
-			va: ptr::null_mut(),
-			handles: Vec::new(),
-		});
-	};
-	let mut va: *mut c_void = ptr::null_mut();
-	crate::callspy::tick(&crate::callspy::MEM_ADDRESS_RESERVE);
-	hip::check(unsafe { hip::vmm_reserve(&mut va, slots * P) })?;
-	let mut handles = Vec::with_capacity(slots);
-	for s in 0..slots {
-		let mut h: *mut c_void = ptr::null_mut();
-		crate::callspy::tick(&crate::callspy::MEM_CREATE);
-		hip::check(unsafe { hip::vmm_create(&mut h, P) })?;
-		let slot_va = unsafe { (va as *mut u8).add(s * P) as *mut c_void };
-		crate::callspy::tick(&crate::callspy::MEM_MAP);
-		crate::callspy::tick(&crate::callspy::MEM_SET_ACCESS);
-		hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })?;
-		handles.push(h);
-	}
-	Ok(Mapping { va, handles })
-}
-
+#[must_use]
+#[inline]
 pub fn human(b: usize) -> String {
 	const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-	let mut v = b as f64;
-	let mut i = 0;
-	while v >= 1024.0 && i < 4 {
-		v /= 1024.0;
+	let mut i = 0usize;
+	let mut div = 1usize;
+	while i < 4 && b.div_euclid(div.saturating_mul(1_024)) > 0 {
+		div = div.saturating_mul(1_024);
 		i += 1;
 	}
-	format!("{v:.2} {}", U[i])
+	let whole = b.div_euclid(div);
+	let frac = b.rem_euclid(div).saturating_mul(100).div_euclid(div);
+	return format!("{whole}.{frac:02} {}", U[i]);
 }

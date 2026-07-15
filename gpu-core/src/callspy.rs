@@ -1,9 +1,10 @@
 use crate::log::Write;
+use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::process;
-use std::ptr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Declares each named counter as a private atomic tally cell initialised to zero.
 macro_rules! counters {
 	($($name:ident),* $(,)?) => {
 		$(pub(crate) static $name: AtomicU64 = AtomicU64::new(0);)*
@@ -60,12 +61,15 @@ counters!(
 	HOST_GET_DEVICE_POINTER,
 );
 
+/// Increments a counter cell by one with relaxed ordering.
 #[inline]
 pub(crate) fn tick(c: &AtomicU64) {
 	c.fetch_add(1, Ordering::Relaxed);
 }
 
 pub const N: usize = 47;
+
+/// Registry of every counter cell in the same order as [`snapshot`] reads them.
 static ALL: [&AtomicU64; N] = [
 	&HOST_MALLOC,
 	&HOST_FREE,
@@ -116,317 +120,397 @@ static ALL: [&AtomicU64; N] = [
 	&HOST_GET_DEVICE_POINTER,
 ];
 
+#[inline]
 pub fn snapshot() -> [u64; N] {
 	let mut s = [0u64; N];
-	for i in 0..N {
-		s[i] = ALL[i].load(Ordering::Relaxed);
+	for (slot, cell) in s.iter_mut().zip(ALL.iter().copied()) {
+		*slot = cell.load(Ordering::Relaxed);
 	}
-	s
+	return s;
 }
 
+#[inline]
+#[must_use]
 pub fn report() -> ogdl::Node {
-	report_since(&[0u64; N])
+	return report_since(&[0u64; N]);
 }
 
+#[inline]
+#[must_use]
 pub fn report_since(base: &[u64; N]) -> ogdl::Node {
-	report_between(base, &snapshot())
+	return report_between(base, &snapshot());
 }
 
+/// Builds a single `name -> value` OGDL leaf node.
 fn kv(name: &str, val: String) -> ogdl::Node {
-	ogdl::Node {
-		name: name.to_string(),
-		children: vec![ogdl::Node {
-			name: val,
-			children: Vec::new(),
+	return ogdl::Node::new(name.to_owned(), vec![ogdl::Node::new(val, Vec::new())]);
+}
+
+/// One counter and the human-readable label it appears under in the report.
+struct CounterEntry {
+	/// The atomic cell whose delta is reported.
+	counter: &'static AtomicU64,
+	/// Label shown for this counter in the report tree.
+	name: &'static str,
+}
+
+/// A named group of counters rendered as one subtree of the report.
+struct CounterGroup {
+	/// Group heading shown in the report tree.
+	group: &'static str,
+	/// Counters that belong to this group.
+	entries: &'static [CounterEntry],
+}
+
+/// Static grouping of every counter into the report's section layout.
+static GROUPS: &[CounterGroup] = &[
+	CounterGroup {
+		group: "sync",
+		entries: &[
+			CounterEntry {
+				counter: &HOST_MALLOC,
+				name: "allocations",
+			},
+			CounterEntry {
+				counter: &HOST_FREE,
+				name: "frees",
+			},
+		],
+	},
+	CounterGroup {
+		group: "async",
+		entries: &[
+			CounterEntry {
+				counter: &MEMCPY_ASYNC,
+				name: "transfers",
+			},
+			CounterEntry {
+				counter: &MALLOC_ASYNC,
+				name: "allocations",
+			},
+			CounterEntry {
+				counter: &MEMSET_ASYNC,
+				name: "memsets",
+			},
+			CounterEntry {
+				counter: &FREE_ASYNC,
+				name: "frees",
+			},
+		],
+	},
+	CounterGroup {
+		group: "kernel launch",
+		entries: &[CounterEntry {
+			counter: &LAUNCH,
+			name: "hipLaunchKernelGGL",
 		}],
-	}
-}
+	},
+	CounterGroup {
+		group: "reporting",
+		entries: &[
+			CounterEntry {
+				counter: &GET_LAST_ERROR,
+				name: "hipGetLastError",
+			},
+			CounterEntry {
+				counter: &PEEK_AT_LAST_ERROR,
+				name: "hipPeekAtLastError",
+			},
+			CounterEntry {
+				counter: &GET_ERROR_STRING,
+				name: "hipGetErrorString",
+			},
+			CounterEntry {
+				counter: &GET_ERROR_NAME,
+				name: "hipGetErrorName",
+			},
+			CounterEntry {
+				counter: &EVENT_RECORD,
+				name: "hipEventRecord",
+			},
+			CounterEntry {
+				counter: &EVENT_ELAPSED_TIME,
+				name: "hipEventElapsedTime",
+			},
+			CounterEntry {
+				counter: &EVENT_DESTROY,
+				name: "hipEventDestroy",
+			},
+			CounterEntry {
+				counter: &EVENT_CREATE,
+				name: "hipEventCreate",
+			},
+		],
+	},
+	CounterGroup {
+		group: "syncs",
+		entries: &[
+			CounterEntry {
+				counter: &STREAM_SYNCHRONIZE,
+				name: "hipStreamSynchronize",
+			},
+			CounterEntry {
+				counter: &DEVICE_SYNCHRONIZE,
+				name: "hipDeviceSynchronize",
+			},
+			CounterEntry {
+				counter: &EVENT_SYNCHRONIZE,
+				name: "hipEventSynchronize",
+			},
+		],
+	},
+	CounterGroup {
+		group: "streams",
+		entries: &[
+			CounterEntry {
+				counter: &STREAM_DESTROY,
+				name: "hipStreamDestroy",
+			},
+			CounterEntry {
+				counter: &STREAM_CREATE,
+				name: "hipStreamCreate",
+			},
+		],
+	},
+	CounterGroup {
+		group: "device/settings",
+		entries: &[
+			CounterEntry {
+				counter: &MEM_GET_INFO,
+				name: "hipMemGetInfo",
+			},
+			CounterEntry {
+				counter: &SET_DEVICE,
+				name: "hipSetDevice",
+			},
+			CounterEntry {
+				counter: &GET_DEVICE_COUNT,
+				name: "hipGetDeviceCount",
+			},
+			CounterEntry {
+				counter: &DEVICE_GET_ATTRIBUTE,
+				name: "hipDeviceGetAttribute",
+			},
+			CounterEntry {
+				counter: &DEVICE_ENABLE_PEER_ACCESS,
+				name: "hipDeviceEnablePeerAccess",
+			},
+			CounterEntry {
+				counter: &DEVICE_CAN_ACCESS_PEER,
+				name: "hipDeviceCanAccessPeer",
+			},
+			CounterEntry {
+				counter: &GET_DEVICE_PROPERTIES,
+				name: "hipGetDeviceProperties",
+			},
+			CounterEntry {
+				counter: &GET_DEVICE,
+				name: "hipGetDevice",
+			},
+		],
+	},
+	CounterGroup {
+		group: "pool",
+		entries: &[
+			CounterEntry {
+				counter: &GET_DEFAULT_MEMPOOL,
+				name: "hipDeviceGetDefaultMemPool",
+			},
+			CounterEntry {
+				counter: &MEMPOOL_GET_ATTRIBUTE,
+				name: "hipMemPoolGetAttribute",
+			},
+			CounterEntry {
+				counter: &MEMPOOL_TRIM_TO,
+				name: "hipMemPoolTrimTo",
+			},
+			CounterEntry {
+				counter: &MEMPOOL_SET_ATTRIBUTE,
+				name: "hipMemPoolSetAttribute",
+			},
+		],
+	},
+	CounterGroup {
+		group: "VMM",
+		entries: &[
+			CounterEntry {
+				counter: &MEM_UNMAP,
+				name: "hipMemUnmap",
+			},
+			CounterEntry {
+				counter: &MEM_SET_ACCESS,
+				name: "hipMemSetAccess",
+			},
+			CounterEntry {
+				counter: &MEM_RELEASE,
+				name: "hipMemRelease",
+			},
+			CounterEntry {
+				counter: &MEM_MAP,
+				name: "hipMemMap",
+			},
+			CounterEntry {
+				counter: &MEM_GET_ALLOCATION_GRANULARITY,
+				name: "hipMemGetAllocationGranularity",
+			},
+			CounterEntry {
+				counter: &MEM_CREATE,
+				name: "hipMemCreate",
+			},
+			CounterEntry {
+				counter: &MEM_ADDRESS_RESERVE,
+				name: "hipMemAddressReserve",
+			},
+			CounterEntry {
+				counter: &MEM_ADDRESS_FREE,
+				name: "hipMemAddressFree",
+			},
+		],
+	},
+	CounterGroup {
+		group: "other",
+		entries: &[CounterEntry {
+			counter: &HIPBLAS,
+			name: "hipBLAS",
+		}],
+	},
+];
 
-struct CounterEntry<'a> {
-	n: u64,
-	name: &'a str,
-}
-
-struct CounterGroup<'a> {
-	group: &'a str,
-	entries: &'a [CounterEntry<'a>],
-}
-
-pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
-	let g = |c: &AtomicU64| {
-		let i = ALL.iter().position(|x| ptr::eq(*x, c)).unwrap_or_else(|| {
+/// Returns the index of counter `c` within [`ALL`], aborting if it is unregistered.
+fn index_of(c: &AtomicU64) -> usize {
+	return ALL
+		.iter()
+		.position(|x| return ptr::eq(*x, c))
+		.unwrap_or_else(|| {
 			drop(Write::err("callspy: counter not registered in ALL"));
 			process::abort()
 		});
-		end[i].saturating_sub(base[i])
+}
+
+#[inline]
+#[must_use]
+pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
+	let g = |c: &AtomicU64| {
+		let i = index_of(c);
+		return end[i].saturating_sub(base[i]);
 	};
-	let groups: &[CounterGroup] = &[
-		CounterGroup {
-			group: "sync",
-			entries: &[
-				CounterEntry {
-					n: g(&HOST_MALLOC),
-					name: "allocations",
-				},
-				CounterEntry {
-					n: g(&HOST_FREE),
-					name: "frees",
-				},
-			],
-		},
-		CounterGroup {
-			group: "async",
-			entries: &[
-				CounterEntry {
-					n: g(&MEMCPY_ASYNC),
-					name: "transfers",
-				},
-				CounterEntry {
-					n: g(&MALLOC_ASYNC),
-					name: "allocations",
-				},
-				CounterEntry {
-					n: g(&MEMSET_ASYNC),
-					name: "memsets",
-				},
-				CounterEntry {
-					n: g(&FREE_ASYNC),
-					name: "frees",
-				},
-			],
-		},
-		CounterGroup {
-			group: "kernel launch",
-			entries: &[CounterEntry {
-				n: g(&LAUNCH),
-				name: "hipLaunchKernelGGL",
-			}],
-		},
-		CounterGroup {
-			group: "reporting",
-			entries: &[
-				CounterEntry {
-					n: g(&GET_LAST_ERROR),
-					name: "hipGetLastError",
-				},
-				CounterEntry {
-					n: g(&PEEK_AT_LAST_ERROR),
-					name: "hipPeekAtLastError",
-				},
-				CounterEntry {
-					n: g(&GET_ERROR_STRING),
-					name: "hipGetErrorString",
-				},
-				CounterEntry {
-					n: g(&GET_ERROR_NAME),
-					name: "hipGetErrorName",
-				},
-				CounterEntry {
-					n: g(&EVENT_RECORD),
-					name: "hipEventRecord",
-				},
-				CounterEntry {
-					n: g(&EVENT_ELAPSED_TIME),
-					name: "hipEventElapsedTime",
-				},
-				CounterEntry {
-					n: g(&EVENT_DESTROY),
-					name: "hipEventDestroy",
-				},
-				CounterEntry {
-					n: g(&EVENT_CREATE),
-					name: "hipEventCreate",
-				},
-			],
-		},
-		CounterGroup {
-			group: "syncs",
-			entries: &[
-				CounterEntry {
-					n: g(&STREAM_SYNCHRONIZE),
-					name: "hipStreamSynchronize",
-				},
-				CounterEntry {
-					n: g(&DEVICE_SYNCHRONIZE),
-					name: "hipDeviceSynchronize",
-				},
-				CounterEntry {
-					n: g(&EVENT_SYNCHRONIZE),
-					name: "hipEventSynchronize",
-				},
-			],
-		},
-		CounterGroup {
-			group: "streams",
-			entries: &[
-				CounterEntry {
-					n: g(&STREAM_DESTROY),
-					name: "hipStreamDestroy",
-				},
-				CounterEntry {
-					n: g(&STREAM_CREATE),
-					name: "hipStreamCreate",
-				},
-			],
-		},
-		CounterGroup {
-			group: "device/settings",
-			entries: &[
-				CounterEntry {
-					n: g(&MEM_GET_INFO),
-					name: "hipMemGetInfo",
-				},
-				CounterEntry {
-					n: g(&SET_DEVICE),
-					name: "hipSetDevice",
-				},
-				CounterEntry {
-					n: g(&GET_DEVICE_COUNT),
-					name: "hipGetDeviceCount",
-				},
-				CounterEntry {
-					n: g(&DEVICE_GET_ATTRIBUTE),
-					name: "hipDeviceGetAttribute",
-				},
-				CounterEntry {
-					n: g(&DEVICE_ENABLE_PEER_ACCESS),
-					name: "hipDeviceEnablePeerAccess",
-				},
-				CounterEntry {
-					n: g(&DEVICE_CAN_ACCESS_PEER),
-					name: "hipDeviceCanAccessPeer",
-				},
-				CounterEntry {
-					n: g(&GET_DEVICE_PROPERTIES),
-					name: "hipGetDeviceProperties",
-				},
-				CounterEntry {
-					n: g(&GET_DEVICE),
-					name: "hipGetDevice",
-				},
-			],
-		},
-		CounterGroup {
-			group: "pool",
-			entries: &[
-				CounterEntry {
-					n: g(&GET_DEFAULT_MEMPOOL),
-					name: "hipDeviceGetDefaultMemPool",
-				},
-				CounterEntry {
-					n: g(&MEMPOOL_GET_ATTRIBUTE),
-					name: "hipMemPoolGetAttribute",
-				},
-				CounterEntry {
-					n: g(&MEMPOOL_TRIM_TO),
-					name: "hipMemPoolTrimTo",
-				},
-				CounterEntry {
-					n: g(&MEMPOOL_SET_ATTRIBUTE),
-					name: "hipMemPoolSetAttribute",
-				},
-			],
-		},
-		CounterGroup {
-			group: "VMM",
-			entries: &[
-				CounterEntry {
-					n: g(&MEM_UNMAP),
-					name: "hipMemUnmap",
-				},
-				CounterEntry {
-					n: g(&MEM_SET_ACCESS),
-					name: "hipMemSetAccess",
-				},
-				CounterEntry {
-					n: g(&MEM_RELEASE),
-					name: "hipMemRelease",
-				},
-				CounterEntry {
-					n: g(&MEM_MAP),
-					name: "hipMemMap",
-				},
-				CounterEntry {
-					n: g(&MEM_GET_ALLOCATION_GRANULARITY),
-					name: "hipMemGetAllocationGranularity",
-				},
-				CounterEntry {
-					n: g(&MEM_CREATE),
-					name: "hipMemCreate",
-				},
-				CounterEntry {
-					n: g(&MEM_ADDRESS_RESERVE),
-					name: "hipMemAddressReserve",
-				},
-				CounterEntry {
-					n: g(&MEM_ADDRESS_FREE),
-					name: "hipMemAddressFree",
-				},
-			],
-		},
-		CounterGroup {
-			group: "other",
-			entries: &[CounterEntry {
-				n: g(&HIPBLAS),
-				name: "hipBLAS",
-			}],
-		},
-	];
 	let mut root = ogdl::Node::default();
-	for grp in groups {
+	for grp in GROUPS {
 		let kids: Vec<ogdl::Node> = grp
 			.entries
 			.iter()
-			.filter(|e| e.n != 0)
-			.map(|e| kv(e.name, e.n.to_string()))
+			.filter(|e| return g(e.counter) != 0)
+			.map(|e| return kv(e.name, g(e.counter).to_string()))
 			.collect();
-		for _present in Some(()).filter(|_k| !kids.is_empty()).into_iter() {
-			root.children.push(ogdl::Node {
-				name: grp.group.to_string(),
-				children: kids.clone(),
-			});
+		if !kids.is_empty() {
+			root.children
+				.push(ogdl::Node::new(grp.group.to_owned(), kids));
 		}
 	}
-	root
+	return root;
 }
 
+/// Counter snapshot taken when the training loop begins.
 static LOOP_START: Mutex<Option<[u64; N]>> = Mutex::new(None);
+/// Counter snapshot taken when the training loop ends.
 static LOOP_END: Mutex<Option<[u64; N]>> = Mutex::new(None);
 
+#[inline]
 pub fn mark_loop_start() {
-	*LOOP_START.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot());
+	*LOOP_START.lock().unwrap_or_else(|p| return p.into_inner()) = Some(snapshot());
 }
 
+#[inline]
 pub fn mark_loop_end() {
-	*LOOP_END.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot());
+	*LOOP_END.lock().unwrap_or_else(|p| return p.into_inner()) = Some(snapshot());
 }
 
+/// One of the three run phases and the snapshot bounds that delimit it.
 struct Phase<'a> {
+	/// Phase heading shown in the state tree.
 	name: &'a str,
+	/// Counter snapshot at the phase start.
 	a: &'a [u64; N],
+	/// Counter snapshot at the phase end.
 	b: &'a [u64; N],
 }
 
+/// A counter total that has no assigned spec cell, tracked per phase.
 struct Tail<'a> {
+	/// Label for the untracked total.
 	what: &'a str,
+	/// Per-phase counts (init, loop, exit).
 	v: [u64; 3],
 }
 
+/// A labelled value summed from several counters within one phase.
+struct Sub {
+	/// Label shown for this summed value.
+	label: &'static str,
+	/// Counters summed to produce the value.
+	counters: &'static [&'static AtomicU64],
+}
+
+/// A category grouping several summed values under one heading per phase.
+struct Cat {
+	/// Category heading shown in the state tree.
+	label: &'static str,
+	/// Summed values shown under the heading.
+	subs: &'static [Sub],
+}
+
+/// Per-phase state-tree layout: which counters roll up into which value.
+static CATS: &[Cat] = &[
+	Cat {
+		label: "calcs",
+		subs: &[
+			Sub {
+				label: "in-place",
+				counters: &[&LAUNCH],
+			},
+			Sub {
+				label: "alloc",
+				counters: &[
+					&HOST_MALLOC,
+					&MALLOC_ASYNC,
+					&MEM_CREATE,
+					&MANAGED_MALLOC,
+					&HOST_REGISTER,
+				],
+			},
+		],
+	},
+	Cat {
+		label: "transfers",
+		subs: &[
+			Sub {
+				label: "async",
+				counters: &[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER],
+			},
+			Sub {
+				label: "sync",
+				counters: &[&STREAM_SYNCHRONIZE, &DEVICE_SYNCHRONIZE, &EVENT_SYNCHRONIZE],
+			},
+		],
+	},
+];
+
+#[inline]
 pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let ls = LOOP_START
 		.lock()
-		.unwrap_or_else(|p| p.into_inner())
+		.unwrap_or_else(|p| return p.into_inner())
 		.take()?;
-	let le = LOOP_END.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+	let le = LOOP_END
+		.lock()
+		.unwrap_or_else(|p| return p.into_inner())
+		.take()?;
 	let end = snapshot();
-	let idx = |c: &AtomicU64| {
-		ALL.iter().position(|x| ptr::eq(*x, c)).unwrap_or_else(|| {
-			drop(Write::err("callspy: counter not registered in ALL"));
-			process::abort()
-		})
-	};
 	let cell = |a: &[u64; N], b: &[u64; N], cs: &[&AtomicU64]| -> u64 {
-		cs.iter().map(|c| b[idx(c)].saturating_sub(a[idx(c)])).sum()
+		return cs
+			.iter()
+			.map(|c| return b[index_of(c)].saturating_sub(a[index_of(c)]))
+			.sum();
 	};
 	let phases: [Phase; 3] = [
 		Phase {
@@ -448,68 +532,22 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let mut tree = ogdl::Node::default();
 	let mut hipblas = [0u64; 3];
 	let mut frees = [0u64; 3];
-	for i in 0..phases.len() {
-		let ph = &phases[i];
+	for (i, ph) in phases.iter().enumerate() {
 		let a = ph.a;
 		let b = ph.b;
-		let calcs = ogdl::Node {
-			name: "calcs".to_string(),
-			children: vec![
-				kv("in-place", format!("{}x", cell(a, b, &[&LAUNCH]))),
-				kv(
-					"alloc",
-					format!(
-						"{}x",
-						cell(
-							a,
-							b,
-							&[
-								&HOST_MALLOC,
-								&MALLOC_ASYNC,
-								&MEM_CREATE,
-								&MANAGED_MALLOC,
-								&HOST_REGISTER
-							]
-						)
-					),
-				),
-			],
-		};
-		let transfers = ogdl::Node {
-			name: "transfers".to_string(),
-			children: vec![
-				kv(
-					"async",
-					format!(
-						"{}x",
-						cell(
-							a,
-							b,
-							&[&XFER_ASYNC, &MEM_ADVISE, &HOST_GET_DEVICE_POINTER]
-						)
-					),
-				),
-				kv(
-					"sync",
-					format!(
-						"{}x",
-						cell(
-							a,
-							b,
-							&[
-								&STREAM_SYNCHRONIZE,
-								&DEVICE_SYNCHRONIZE,
-								&EVENT_SYNCHRONIZE
-							]
-						)
-					),
-				),
-			],
-		};
-		tree.children.push(ogdl::Node {
-			name: ph.name.to_string(),
-			children: vec![calcs, transfers],
-		});
+		let cats: Vec<ogdl::Node> = CATS
+			.iter()
+			.map(|cat| {
+				let subs: Vec<ogdl::Node> = cat
+					.subs
+					.iter()
+					.map(|s| return kv(s.label, format!("{}x", cell(a, b, s.counters))))
+					.collect();
+				return ogdl::Node::new(cat.label.to_owned(), subs);
+			})
+			.collect();
+		tree.children
+			.push(ogdl::Node::new(ph.name.to_owned(), cats));
 		hipblas[i] = cell(a, b, &[&HIPBLAS]);
 		frees[i] = cell(
 			a,
@@ -529,7 +567,7 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	];
 	let mut errs: Vec<String> = Vec::new();
 	for t in tails {
-		for _present in t.v.iter().find(|x| **x != 0).into_iter() {
+		if t.v.iter().any(|x| return *x != 0) {
 			errs.push(format!(
 				"{what} (no spec cell)  init {i0}x  loop {i1}x  exit {i2}x",
 				what = t.what,
@@ -539,5 +577,5 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 			));
 		}
 	}
-	Some((tree, errs))
+	return Some((tree, errs));
 }

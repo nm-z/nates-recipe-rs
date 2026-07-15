@@ -1,12 +1,17 @@
-use crate::hip::{HipError, check};
+use crate::HipError;
+use crate::callspy;
+use crate::hip::{check, hipGetLastError};
+use crate::kernels::ci;
 use crate::memory::GpuBuffer;
-use std::ffi::c_void;
-use std::ptr;
+use core::ffi::c_void;
+use core::ptr;
 
+/// Checks the last HIP launch for an error, ticking the launch callspy counters.
 fn cl() -> Result<(), HipError> {
-	crate::callspy::tick(&crate::callspy::LAUNCH);
-	crate::callspy::tick(&crate::callspy::GET_LAST_ERROR);
-	check(unsafe { crate::hip::hipGetLastError() })
+	callspy::tick(&callspy::LAUNCH);
+	callspy::tick(&callspy::GET_LAST_ERROR);
+	// SAFETY: hipGetLastError only reads and clears the thread-local HIP error state; it dereferences no memory.
+	return check(unsafe { hipGetLastError() });
 }
 
 unsafe extern "C" {
@@ -67,6 +72,9 @@ unsafe extern "C" {
 	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void);
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_rope_partial(
 	theta: &GpuBuffer,
 	rows: usize,
@@ -75,32 +83,40 @@ pub fn gpu_rope_partial(
 	heads_per_tok: usize,
 	buf: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: buf and theta are live GpuBuffer allocations and the dims are range-checked i32; the launcher only reads them.
 	unsafe {
 		launch_rope_partial(
 			buf.ptr_raw(),
-			rows as i32,
-			head_dim as i32,
-			rotary_dim as i32,
-			heads_per_tok as i32,
-			theta.ptr_raw() as *const c_void,
+			ci(rows)?,
+			ci(head_dim)?,
+			ci(rotary_dim)?,
+			ci(heads_per_tok)?,
+			theta.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
+#[inline]
 pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: raw and out are live GpuBuffer allocations sized for n f64 elements; the launcher only reads/writes within them.
 	unsafe {
 		launch_widen_bf16_f64(
-			raw.ptr_raw() as *const c_void,
+			raw.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i64,
+			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
 pub fn gpu_rmsnorm_f64(
 	x: &GpuBuffer,
 	gamma: &GpuBuffer,
@@ -109,20 +125,24 @@ pub fn gpu_rmsnorm_f64(
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: x, gamma, eps, and out are live GpuBuffer allocations and the launcher only reads/writes within them.
 	unsafe {
 		launch_normx_rmsnorm(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			gamma.ptr_raw() as *const c_void,
-			rows as i32,
-			cols as i32,
-			eps.ptr_raw() as *const c_void,
+			gamma.ptr_raw().cast_const(),
+			ci(rows)?,
+			ci(cols)?,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_rmsnorm_f64_nogamma(
 	x: &GpuBuffer,
 	eps: &GpuBuffer,
@@ -130,20 +150,24 @@ pub fn gpu_rmsnorm_f64_nogamma(
 	cols: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
 	unsafe {
 		launch_normx_rmsnorm(
-			x.ptr_raw() as *const c_void,
+			x.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			ptr::null(),
-			rows as i32,
-			cols as i32,
-			eps.ptr_raw() as *const c_void,
+			ci(rows)?,
+			ci(cols)?,
+			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_gqa_attn(
 	q: &GpuBuffer,
 	k: &GpuBuffer,
@@ -155,89 +179,106 @@ pub fn gpu_gqa_attn(
 	prefix: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
 	unsafe {
 		launch_gqa_masked_attn(
-			q.ptr_raw() as *const c_void,
-			k.ptr_raw() as *const c_void,
-			v.ptr_raw() as *const c_void,
+			q.ptr_raw().cast_const(),
+			k.ptr_raw().cast_const(),
+			v.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			t as i32,
-			nqh as i32,
-			nkv as i32,
-			hd as i32,
-			prefix as i32,
+			ci(t)?,
+			ci(nqh)?,
+			ci(nkv)?,
+			ci(hd)?,
+			ci(prefix)?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
+#[inline]
 pub fn gpu_gelu_mul(
 	a: &GpuBuffer,
 	b: &GpuBuffer,
 	n: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: a, b, and out outlive this synchronous launch and n matches their element counts.
 	unsafe {
 		launch_gelu_mul(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			a.ptr_raw().cast_const(),
+			b.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n as i64,
+			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if `rows` or `half` overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_glu_gelu(
 	input: &GpuBuffer,
 	rows: usize,
 	half: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: input and out outlive this synchronous launch and rows and half match their sizes.
 	unsafe {
 		launch_glu_gelu(
-			input.ptr_raw() as *const c_void,
+			input.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			rows as i32,
-			half as i32,
+			ci(rows)?,
+			ci(half)?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if `m`, `n`, or `k` overflows `i32` or the launch fails.
+#[inline]
 pub fn gpu_gemm_bt_f64(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
+	lhs: &GpuBuffer,
+	rhs: &GpuBuffer,
 	m: usize,
 	n: usize,
 	k: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
+	// SAFETY: lhs, rhs, and out outlive this synchronous launch and m, n, k match their shapes.
 	unsafe {
 		launch_gemm_bt_f64(
-			a.ptr_raw() as *const c_void,
-			b.ptr_raw() as *const c_void,
+			lhs.ptr_raw().cast_const(),
+			rhs.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			m as i32,
-			n as i32,
-			k as i32,
+			ci(m)?,
+			ci(n)?,
+			ci(k)?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
 
+/// # Errors
+/// Returns [`HipError`] if the kernel launch fails.
+#[inline]
 pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
+	// SAFETY: all pointers reference live GpuBuffers valid for the kernel launch.
 	unsafe {
 		launch_scale_f64(
 			x.ptr_raw(),
-			scalar.ptr_raw() as *const c_void,
-			n as i64,
+			scalar.ptr_raw().cast_const(),
+			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
 		);
 	}
-	cl()
+	return cl();
 }
