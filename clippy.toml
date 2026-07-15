@@ -1,3 +1,4 @@
+# overrides
 too-many-lines-threshold = 200
 cognitive-complexity-threshold = 35
 allow-unwrap-in-tests = true
@@ -5,3 +6,12 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-dbg-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# defaults
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+trivial-copy-size-limit = 8
+single-char-binding-names-threshold = 4
+max-fn-params-bools = 3
+max-struct-bools = 3
+max-trait-bounds = 3

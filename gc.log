@@ -1,0 +1,200 @@
+    Checking gpu-core v0.1.0 (/home/nate/Desktop/nates-recipe-rs/gpu-core)
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:40:2
+   |
+40 |     Ok(())
+   |     ^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+   = note: `-D clippy::implicit-return` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::implicit_return)]`
+help: add `return` as shown
+   |
+40 |     return Ok(())
+   |     ++++++
+
+error: default numeric fallback might occur
+ --> gpu-core/src/bin/probe.rs:9:22
+  |
+9 |     let n = (64usize << 20) / 8;
+  |                         ^^ help: consider adding suffix: `20_i32`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#default_numeric_fallback
+  = note: `-D clippy::default-numeric-fallback` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::default_numeric_fallback)]`
+
+error: default numeric fallback might occur
+  --> gpu-core/src/bin/probe.rs:23:38
+   |
+23 |         match (v - 0.5).abs().partial_cmp(&1e-12) {
+   |                                            ^^^^^ help: consider adding suffix: `1e-12_f64`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#default_numeric_fallback
+
+error: integer division
+ --> gpu-core/src/bin/probe.rs:9:10
+  |
+9 |     let n = (64usize << 20) / 8;
+  |             ^^^^^^^^^^^^^^^^^^^
+  |
+  = help: division of integers may cause loss of precision. consider using floats
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#integer_division
+  = note: `-D clippy::integer-division` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::integer_division)]`
+
+error: use of `/` has been disallowed in this context
+ --> gpu-core/src/bin/probe.rs:9:10
+  |
+9 |     let n = (64usize << 20) / 8;
+  |             ^^^^^^^^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#integer_division_remainder_used
+  = note: `-D clippy::integer-division-remainder-used` implied by `-D clippy::restriction`
+  = help: to override `-D clippy::restriction` add `#[allow(clippy::integer_division_remainder_used)]`
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:11:42
+   |
+11 |     let x = GpuBuffer::alloc(n).map_err(|e| Errored::new(format!("probe: alloc: {e}")))?;
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+11 |     let x = GpuBuffer::alloc(n).map_err(|e| return Errored::new(format!("probe: alloc: {e}")))?;
+   |                                             ++++++
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:13:16
+   |
+13 |         .map_err(|e| Errored::new(format!("probe: upload: {e}")))?;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+13 |         .map_err(|e| return Errored::new(format!("probe: upload: {e}")))?;
+   |                      ++++++
+
+error: consider bringing this path into scope with the `use` keyword
+  --> gpu-core/src/bin/probe.rs:14:2
+   |
+14 |     gpu_core::math_ops::gpu_rsqrt(&x, n, &x)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#absolute_paths
+   = note: `-D clippy::absolute-paths` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::absolute_paths)]`
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:15:16
+   |
+15 |         .map_err(|e| Errored::new(format!("probe: kernel: {e}")))?;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+15 |         .map_err(|e| return Errored::new(format!("probe: kernel: {e}")))?;
+   |                      ++++++
+
+error: unsafe block missing a safety comment
+  --> gpu-core/src/bin/probe.rs:17:2
+   |
+17 |     unsafe { x.download_async(&mut back, ptr::null_mut()) }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: consider adding a safety comment on the preceding line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#undocumented_unsafe_blocks
+   = note: `-D clippy::undocumented-unsafe-blocks` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::undocumented_unsafe_blocks)]`
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:18:16
+   |
+18 |         .map_err(|e| Errored::new(format!("probe: download: {e}")))?;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+18 |         .map_err(|e| return Errored::new(format!("probe: download: {e}")))?;
+   |                      ++++++
+
+error: consider bringing this path into scope with the `use` keyword
+  --> gpu-core/src/bin/probe.rs:19:2
+   |
+19 |     gpu_core::hip::device_synchronize()
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#absolute_paths
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:20:16
+   |
+20 |         .map_err(|e| Errored::new(format!("probe: download sync: {e}")))?;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+20 |         .map_err(|e| return Errored::new(format!("probe: download sync: {e}")))?;
+   |                      ++++++
+
+error: the loop variable `i` is used to index `back`
+  --> gpu-core/src/bin/probe.rs:21:11
+   |
+21 |     for i in 0..back.len() {
+   |              ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+   = note: `-D clippy::needless-range-loop` implied by `-D clippy::style`
+   = help: to override `-D clippy::style` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+   |
+21 -     for i in 0..back.len() {
+21 +     for (i, <item>) in back.iter().enumerate() {
+   |
+
+error: this `continue` expression is redundant
+  --> gpu-core/src/bin/probe.rs:29:5
+   |
+29 |                 continue;
+   |                 ^^^^^^^^
+   |
+   = help: consider dropping the `continue` expression
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_continue
+   = note: `-D clippy::needless-continue` implied by `-D clippy::pedantic`
+   = help: to override `-D clippy::pedantic` add `#[allow(clippy::needless_continue)]`
+
+error: floating-point arithmetic detected
+  --> gpu-core/src/bin/probe.rs:23:9
+   |
+23 |         match (v - 0.5).abs().partial_cmp(&1e-12) {
+   |               ^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#float_arithmetic
+   = note: `-D clippy::float-arithmetic` implied by `-D clippy::restriction`
+   = help: to override `-D clippy::restriction` add `#[allow(clippy::float_arithmetic)]`
+
+error: consider bringing this path into scope with the `use` keyword
+  --> gpu-core/src/bin/probe.rs:33:2
+   |
+33 |     gpu_core::hip::device_synchronize()
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#absolute_paths
+
+error: missing `return` statement
+  --> gpu-core/src/bin/probe.rs:34:16
+   |
+34 |         .map_err(|e| Errored::new(format!("probe: device sync: {e}")))?;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#implicit_return
+help: add `return` as shown
+   |
+34 |         .map_err(|e| return Errored::new(format!("probe: device sync: {e}")))?;
+   |                      ++++++
+
+error: could not compile `gpu-core` (bin "probe") due to 18 previous errors

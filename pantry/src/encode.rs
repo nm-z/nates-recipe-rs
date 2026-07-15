@@ -441,8 +441,6 @@ fn admit_ceiling(
 	top_cols: &[(&str, usize)],
 ) -> anyhow::Result<()> {
 	let bytes = n.saturating_mul(w).saturating_mul(mem::size_of::<f64>());
-	// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
-	// sized against that filesystem's free space.
 	let spill = Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
 		Ok(bud) if bytes > bud.ram_data => recipe_infer::tiered::Full {
@@ -568,6 +566,14 @@ struct Assembled {
 }
 
 impl Assembled {
+	/// Left-compaction fast path: when every kept column comes from a single
+	/// source matrix whose row-gather is the identity and whose column indices
+	/// stay ascending, the selection is that matrix's own columns in place —
+	/// reusing its buffer instead of allocating a second full n×w matrix
+	/// (holding both doubled peak RAM). In place is safe because each read
+	/// index `i*big_w + col` ≥ its write index `i*w + jc`, so no cell is
+	/// overwritten before it is read. Otherwise the general path gathers across
+	/// sources / non-identity joins into a fresh matrix.
 	fn select(&mut self, keep: &[String]) -> anyhow::Result<Mat> {
 		let n = self.samples;
 		let w = keep.len();
@@ -582,13 +588,6 @@ impl Assembled {
 			.map(|name| self.sources[idx[name.as_str()]])
 			.collect();
 
-		// Left-compaction fast path: when every kept column comes from a single source
-		// matrix whose row-gather is the identity and whose column indices stay
-		// ascending, the selection is just that matrix's own columns in place. Reuse
-		// its buffer instead of allocating a second full n×w matrix — holding the
-		// source and the copy at once is what doubled peak RAM. In place is safe
-		// because each read index i*big_w + col ≥ its write index i*w + jc, so no
-		// cell is overwritten before it is read.
 		if w > 0 {
 			let mi = picks[0].0;
 			let cols: Vec<usize> = picks.iter().map(|&(_, c)| c).collect();
@@ -615,7 +614,6 @@ impl Assembled {
 			}
 		}
 
-		// General path: gather across sources / non-identity joins into a fresh matrix.
 		let mut by_col: BTreeMap<&str, usize> = BTreeMap::new();
 		for name in keep {
 			*by_col
@@ -712,6 +710,11 @@ fn group_hashes(g: &DirGroup) -> &[String] {
 	}
 }
 
+/// Joins sample tables with image vectors: a dir of files is a vector indexed
+/// by filename, and a sample column of filenames is a vector of those keys
+/// (the "column of filenames" in the user's abstraction). For each image
+/// vector, picks the sample column whose cell stems best match its filenames,
+/// then gathers each row's image by that key (index = filename, dat = image).
 fn assemble(
 	groups: &[DirGroup],
 	targets: &[String],
@@ -773,8 +776,6 @@ fn assemble(
 	)?;
 	let s_hashes = group_hashes(&groups[sample_idx]);
 	let n = s_x.nrows();
-	// Raw sample cells — an image vector joins by matching the filename it holds in
-	// one of these columns (the "column of filenames" in the user's abstraction).
 	let sample_cells: Option<&[Vec<String>]> = match &groups[sample_idx] {
 		DirGroup::Table { cells, .. } => Some(cells.as_slice()),
 		_ => None,
@@ -812,10 +813,6 @@ fn assemble(
 			continue;
 		}
 
-		// Image vector ⋈ filename column: a dir of files is a vector indexed by
-		// filename; a sample column of filenames is a vector of those keys. Pick the
-		// sample column whose cell stems best match this image vector's filenames,
-		// then gather each row's image by that key (index = filename, dat = image).
 		if let (
 			DirGroup::Image {
 				hashes: g_hashes, ..
@@ -1218,6 +1215,9 @@ pub struct PreparedArff {
 /// Table path (CSV/dir/zip): load groups, resolve targets (via the caller's
 /// `resolve` closure, which lives up in the builder), assemble + join, select
 /// the kept feature columns, and optionally split or align a separate test set.
+/// Test reuses the train schema as `known` — no precomputed kinds needed; a
+/// test-only column absent from the train schema panics in `infer_attrs`,
+/// because detection runs at load, never mid-run.
 pub fn prepare_table_data(
 	sources: &[String],
 	test_path: Option<&str>,
@@ -1247,9 +1247,6 @@ pub fn prepare_table_data(
 	let keep = |name: &str| !exclude.iter().any(|p| exclude_match(p, name));
 
 	if let Some((tg, tp)) = &test_groups {
-		// Test reuses the train schema as `known` (schema_in) — no precomputed
-		// kinds needed. A test-only column absent from the train schema panics in
-		// infer_attrs: detection runs at load, never mid-run.
 		let (mut test, _) = assemble(
 			tg,
 			&t,

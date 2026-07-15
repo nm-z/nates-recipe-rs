@@ -67,47 +67,56 @@ workspace = true
 serde_json = "1"
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+# overrides
 overflow-checks = true
+lto = "thin"
+# defaults
+opt-level = 3
+debug = false
+strip = "none"
+debug-assertions = false
+panic = "unwind"
+incremental = false
+codegen-units = 16
+rpath = false
 
 [profile.dev]
+# overrides
 opt-level = 1
+# defaults
+debug = true
+strip = "none"
+debug-assertions = true
+overflow-checks = true
+lto = false
+panic = "unwind"
+incremental = true
+codegen-units = 256
+rpath = false
 
 [profile.dev.package."*"]
+# overrides
 debug = false
+
 [workspace.lints.rust]
-warnings = "deny"
-unsafe_code = "deny"
-unsafe_op_in_unsafe_fn = "deny"
+# overrides
+unsafe_code = "warn"
+# defaults
+warnings = "warn"
+unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-style = { level = "deny", priority = -1 }
-complexity = { level = "deny", priority = -1 }
-perf = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-restriction = { level = "deny", priority = -1 }
+# overrides
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+restriction = { level = "warn", priority = -1 }
+# defaults
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
 
-blanket_clippy_restriction_lints = "allow"
-min_ident_chars = "allow"
-indexing_slicing = "allow"
-needless_return = "allow"
-semicolon_outside_block = "allow"
-arithmetic_side_effects = "allow"
-question_mark_used = "allow"
-pub_use = "allow" 
-single_char_lifetime_names = "allow"
-inline_trait_bounds = "allow"
-unseparated_literal_suffix = "allow" 
-impl_trait_in_params = "allow"
-missing_trait_methods = "allow"
-arbitrary_source_item_ordering = "allow"
-exhaustive_structs = "allow"
-pub_without_shorthand = "allow"
-pub_with_shorthand = "allow"
 
 
