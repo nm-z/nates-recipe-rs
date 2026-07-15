@@ -1,6 +1,8 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe::ooc::{Window, chunks, view};
+use std::ptr;
 
 fn cpu_bce_grad(p: &[f64], y: &[f64], n_total: usize) -> Vec<f64> {
 	let eps = 1e-7;
@@ -72,7 +74,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 	let da_full = GpuBuffer::alloc(n).expect("da");
 	kernels::gpu_bce_grad_into(&bp, &by, &inv_n, n, &da_full).expect("bce full");
 	let mut got = vec![0.0; n];
-	unsafe { da_full.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { da_full.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	let want = cpu_bce_grad(&p, &y, n);
 	for i in 0..n {
@@ -91,7 +93,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 		let dw = view(&da_win, s0 * 8, cnt * 8);
 		kernels::gpu_bce_grad_into(&pw, &yw, &inv_n, cnt, &dw).expect("bce win");
 	}
-	unsafe { da_win.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { da_win.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	for i in 0..n {
 		assert!(
@@ -115,7 +117,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 		let dw = view(&da_raw, s0 * 8, cnt * 8);
 		kernels::gpu_bce_grad_into(&pw, &yw, &inv_cnt, cnt, &dw).expect("bce raw win");
 	}
-	unsafe { da_raw.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { da_raw.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	let max_dev = got
 		.iter()
@@ -131,7 +133,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 	let da_f = GpuBuffer::alloc(n).expect("da_f");
 	gpu_core::losses::gpu_focal_grad_into(&bp, &by, &bgamma, &balpha, &inv_n, n, &da_f)
 		.expect("focal full");
-	unsafe { da_f.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { da_f.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	for i in 0..n {
 		assert!(
@@ -149,7 +151,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 		gpu_core::losses::gpu_focal_grad_into(&pw, &yw, &bgamma, &balpha, &inv_n, cnt, &dw)
 			.expect("focal win");
 	}
-	unsafe { da_fw.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { da_fw.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	for i in 0..n {
 		assert!(

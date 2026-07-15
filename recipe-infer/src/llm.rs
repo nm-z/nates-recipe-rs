@@ -1,3 +1,12 @@
+use std::cmp;
+use std::env;
+use std::io;
+use std::mem;
+use std::process;
+use std::ptr;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
@@ -290,7 +299,7 @@ struct Tensor {
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 	if !(off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8)) {
 		drop(Write::err(format!("bview: unaligned {off_bytes}/{len_bytes}")));
-		std::process::abort();
+		process::abort();
 	}
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
@@ -306,7 +315,7 @@ fn beat() {
 }
 
 struct Watchdog {
-	state: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+	state: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Watchdog {
@@ -318,15 +327,15 @@ impl Watchdog {
 }
 
 fn arm_watchdog() -> Watchdog {
-	let state = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+	let state = Arc::new((Mutex::new(false), Condvar::new()));
 	let shared = state.clone();
-	std::thread::spawn(move || {
+	thread::spawn(move || {
 		let (lock, cv) = &*shared;
 		let mut disarmed = lock.lock().unwrap_or_else(|p| p.into_inner());
 		let mut last = u64::MAX;
 		loop {
 			let (g, _t) = cv
-				.wait_timeout(disarmed, std::time::Duration::from_secs(20))
+				.wait_timeout(disarmed, Duration::from_secs(20))
 				.unwrap_or_else(|p| p.into_inner());
 			disarmed = g;
 			if *disarmed {
@@ -337,7 +346,7 @@ fn arm_watchdog() -> Watchdog {
 				drop(Write::err(
 					"LOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting.",
 				));
-				std::process::abort();
+				process::abort();
 			}
 			last = b;
 		}
@@ -876,7 +885,7 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 		for name in fixed_names(&m.hp, l) {
 			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
 			store.place(&name, t.nbytes, |dst| {
-				m.read_host(t, 0, dst).map_err(std::io::Error::other)
+				m.read_host(t, 0, dst).map_err(io::Error::other)
 			})?;
 			beat();
 		}
@@ -894,7 +903,7 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 			store.place(&ekey(l, e), slot_bytes, |dst| {
 				m.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])
 					.and_then(|_g| m.read_host(dn, e * dn_bytes, &mut dst[gu_bytes..]))
-					.map_err(std::io::Error::other)
+					.map_err(io::Error::other)
 			})?;
 			beat();
 		}
@@ -1055,10 +1064,10 @@ fn layer(
 	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
 	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
 	unsafe {
-		ar.attn_out.download_async(&mut ao_host, std::ptr::null_mut())
+		ar.attn_out.download_async(&mut ao_host, ptr::null_mut())
 	}?;
 	unsafe {
-		ar.cmoes.download_async(&mut cmoes_host, std::ptr::null_mut())
+		ar.cmoes.download_async(&mut cmoes_host, ptr::null_mut())
 	}?;
 	gpu_core::hip::device_synchronize()?;
 	acc(&MOE_RT_NS, _rt);
@@ -1077,7 +1086,7 @@ fn layer(
 		softmax(&mut rl);
 		let mut idx: Vec<usize> = (0..nexp).collect();
 		idx.sort_by(|a, b| {
-			rl[*b].partial_cmp(&rl[*a]).unwrap_or(std::cmp::Ordering::Equal)
+			rl[*b].partial_cmp(&rl[*a]).unwrap_or(cmp::Ordering::Equal)
 		});
 		idx.truncate(used);
 		let ws: f64 = idx.iter().map(|&e| rl[e]).sum();
@@ -1105,7 +1114,7 @@ fn layer(
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
 		let _rt = Instant::now();
 		unsafe {
-			ar.moe_dv.download_async(&mut dv_host[..np * ne], std::ptr::null_mut())
+			ar.moe_dv.download_async(&mut dv_host[..np * ne], ptr::null_mut())
 		}?;
 		gpu_core::hip::device_synchronize()?;
 		acc(&MOE_RT_NS, _rt);
@@ -1148,7 +1157,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
 		unsafe {
-			ar.lm_out.download_async(&mut out_host[..ncanvas * cn], std::ptr::null_mut())
+			ar.lm_out.download_async(&mut out_host[..ncanvas * cn], ptr::null_mut())
 		}?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
@@ -1162,7 +1171,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 }
 
 pub fn vram_probe_ask() -> Option<i32> {
-	let sz = std::env::var_os("VRAM_PROBE")?;
+	let sz = env::var_os("VRAM_PROBE")?;
 	if crate::init().is_err() {
 		return Some(2);
 	}
@@ -1180,7 +1189,7 @@ pub fn generate(
 	prompt: &str,
 	on_round: &mut dyn FnMut(&[Tok]),
 ) -> Result<String> {
-	if !std::env::var_os("VRAM_PROBE").is_none() {
+	if !env::var_os("VRAM_PROBE").is_none() {
 		Write::err(
 			"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
 		)?;
@@ -1197,7 +1206,7 @@ pub fn generate(
 				bail!("claim probe: nothing mappable above 1 GB");
 			}
 			let status = {
-				let mut c = std::process::Command::new(std::env::current_exe()?);
+				let mut c = process::Command::new(env::current_exe()?);
 				c.env("VRAM_PROBE", want.to_string());
 				unsafe {
 					c.pre_exec(|| {
@@ -1345,7 +1354,7 @@ pub fn generate(
 
 		let bithash = |b: &GpuBuffer, n: usize| -> Result<u64> {
 			let mut v = vec![0.0f64; n];
-			unsafe { b.view(0, n).download_async(&mut v, std::ptr::null_mut()) }?;
+			unsafe { b.view(0, n).download_async(&mut v, ptr::null_mut()) }?;
 			gpu_core::hip::device_synchronize()?;
 			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| {
 				(h ^ x.to_bits()).wrapping_mul(0x100000001b3)
@@ -1362,14 +1371,14 @@ pub fn generate(
 				format!("step {step} layer {}/{} ({:.0}s)", l + 1, nl, t0.elapsed().as_secs_f64()),
 			);
 			layer(&m, l, src, dst, t, prefix, &ar)?;
-			std::mem::swap(&mut src, &mut dst);
+			mem::swap(&mut src, &mut dst);
 			if step == 0 && gpu_core::log::opt().probe {
 				Write::line(probe_flag, format!("[hash] step0 layer {l:2} {:016x}", bithash(src, t * ne)?));
 			}
 		}
 		let hbuf = src;
 		let mut hbuf_host = vec![0.0f64; hbuf.n_floats()];
-		unsafe { hbuf.download_async(&mut hbuf_host, std::ptr::null_mut()) }?;
+		unsafe { hbuf.download_async(&mut hbuf_host, ptr::null_mut()) }?;
 		gpu_core::hip::device_synchronize()?;
 		let nan = hbuf_host.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {
@@ -1386,7 +1395,7 @@ pub fn generate(
 				.filter(|&tk| tk >= 6 && Some(tk) != mask_signal && !vocab[tk].starts_with('<'))
 				.map(|tk| (tk, row[tk]))
 				.collect();
-			cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+			cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmp::Ordering::Equal));
 			cand.truncate(50);
 			let ml = cand[0].1;
 			let mut probs: Vec<f64> = cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();

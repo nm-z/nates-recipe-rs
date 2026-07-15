@@ -1,3 +1,5 @@
+use std::cmp;
+use std::str;
 use anyhow::{Context, Result, anyhow, bail};
 
 pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
@@ -15,7 +17,7 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 			bytes.len()
 		)
 	})?;
-	let header = std::str::from_utf8(body)
+	let header = str::from_utf8(body)
 		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let data = &bytes[data_start..];
 	let Json::Obj(entries) = parse_json(header)? else {
@@ -103,7 +105,7 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader> {
 			bytes.len()
 		)
 	})?;
-	let header = std::str::from_utf8(body)
+	let header = str::from_utf8(body)
 		.map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let Json::Obj(entries) = parse_json(header)? else {
 		bail!("safetensors: header is not a JSON object");
@@ -225,7 +227,7 @@ fn f16_to_f64(h: u16) -> f64 {
 	let val = match exp {
 		0 => mant * 2f64.powi(-24),
 		0x1f => match mant.partial_cmp(&0.0) {
-			Some(std::cmp::Ordering::Equal) => f64::INFINITY,
+			Some(cmp::Ordering::Equal) => f64::INFINITY,
 			_other => f64::NAN,
 		},
 		_other => {
@@ -280,7 +282,7 @@ pub fn parse_json(s: &str) -> Result<Json> {
 	let v = parse_value(b, &mut p)?;
 	skip_ws(b, &mut p);
 	match p.cmp(&b.len()) {
-		std::cmp::Ordering::Equal => Ok(v),
+		cmp::Ordering::Equal => Ok(v),
 		_other => bail!("safetensors: trailing bytes after JSON header at offset {p}"),
 	}
 }
@@ -387,7 +389,7 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 						let hex = b.get(*p + 1..*p + 5).ok_or_else(|| {
 							anyhow!("safetensors: truncated \\u escape")
 						})?;
-						let code = u32::from_str_radix(std::str::from_utf8(hex)?, 16)
+						let code = u32::from_str_radix(str::from_utf8(hex)?, 16)
 							.map_err(|e| {
 							anyhow!("safetensors: bad \\u escape: {e}")
 						})?;
@@ -414,7 +416,7 @@ fn parse_num(b: &[u8], p: &mut usize) -> Result<Json> {
 	while *p < b.len() && matches!(b[*p], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E') {
 		*p += 1;
 	}
-	let s = std::str::from_utf8(&b[start..*p])
+	let s = str::from_utf8(&b[start..*p])
 		.map_err(|e| anyhow!("safetensors: number is not utf8: {e}"))?;
 	let v: f64 = s
 		.parse()

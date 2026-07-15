@@ -1,3 +1,4 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::match_wild_err_arm)]
 

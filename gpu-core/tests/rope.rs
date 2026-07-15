@@ -1,5 +1,7 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use gpu_core::memory::GpuBuffer;
 use gpu_core::rope::{ROPE_THETA, gpu_rope_qk_heads_inplace};
+use std::ptr;
 
 #[test]
 fn rope_heads_backward_is_inverse_rotation() {
@@ -28,7 +30,7 @@ fn rope_heads_backward_is_inverse_rotation() {
 	gpu_rope_qk_heads_inplace(&sgn_bwd, &theta, m, d, heads, seq, &gq, &gk).expect("rope bwd");
 	let analytic = {
 		let mut v = vec![0.0f64; m * d];
-		unsafe { gq.download_async(&mut v, std::ptr::null_mut()) }.expect("dl");
+		unsafe { gq.download_async(&mut v, ptr::null_mut()) }.expect("dl");
 		gpu_core::hip::device_synchronize().expect("dl sync");
 		v
 	};
@@ -42,7 +44,7 @@ fn rope_heads_backward_is_inverse_rotation() {
 		gpu_rope_qk_heads_inplace(&sgn_fwd, &theta, m, d, heads, seq, &q, &k)
 			.expect("rope fwd");
 		let mut o = vec![0.0f64; m * d];
-		unsafe { q.download_async(&mut o, std::ptr::null_mut()) }.expect("o");
+		unsafe { q.download_async(&mut o, ptr::null_mut()) }.expect("o");
 		gpu_core::hip::device_synchronize().expect("o sync");
 		o.iter().zip(&g).map(|(a, b)| a * b).sum()
 	};

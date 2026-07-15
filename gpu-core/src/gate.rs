@@ -1,20 +1,30 @@
 use crate::log::Write;
+use std::cmp;
+use std::env;
+use std::fs;
+use std::io;
 use std::io::{Read, Seek, Write as _};
+use std::marker::PhantomData;
+use std::num;
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::PathBuf;
+use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::thread;
+use std::time;
 
 const LOCK_NAME: &str = "recipe-gpu.lock";
 const INHERIT_VAR: &str = "RECIPE_GPU_LOCK_FD";
 const KFD_PROC: &str = "/sys/class/kfd/kfd/proc";
 const TEARDOWN_DEADLINE_SECS: f64 = 30.0;
-const RECLAIM_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+const RECLAIM_STEP: time::Duration = time::Duration::from_millis(25);
 const STAMP_WIDTH: usize = 20;
 const CLEAN: u32 = 0;
 
 enum Lock {
 	Closed,
-	Own(std::fs::File),
+	Own(fs::File),
 	Adopted,
 }
 
@@ -42,54 +52,54 @@ fn locked() -> MutexGuard<'static, Gate> {
 	}
 }
 
-fn inherited() -> std::io::Result<Option<RawFd>> {
-	let Ok(raw) = std::env::var(INHERIT_VAR) else {
+fn inherited() -> io::Result<Option<RawFd>> {
+	let Ok(raw) = env::var(INHERIT_VAR) else {
 		return Ok(None);
 	};
 	let fd: RawFd = raw
 		.parse()
-		.map_err(|_e| std::io::Error::other(format!("{INHERIT_VAR}={raw}")))?;
+		.map_err(|_e| io::Error::other(format!("{INHERIT_VAR}={raw}")))?;
 	match unsafe { libc::fcntl(fd, libc::F_GETFD) }.cmp(&0) {
-		std::cmp::Ordering::Less => Err(std::io::Error::other(format!(
+		cmp::Ordering::Less => Err(io::Error::other(format!(
 			"{INHERIT_VAR}={fd}: {}",
-			std::io::Error::last_os_error()
+			io::Error::last_os_error()
 		))),
-		std::cmp::Ordering::Equal => Ok(Some(fd)),
-		std::cmp::Ordering::Greater => Ok(Some(fd)),
+		cmp::Ordering::Equal => Ok(Some(fd)),
+		cmp::Ordering::Greater => Ok(Some(fd)),
 	}
 }
 
-fn open_lock() -> std::io::Result<std::fs::File> {
+fn open_lock() -> io::Result<fs::File> {
 	let uid = unsafe { libc::getuid() };
-	let dir = std::env::var_os("XDG_RUNTIME_DIR")
+	let dir = env::var_os("XDG_RUNTIME_DIR")
 		.filter(|v| !v.is_empty())
-		.map(std::path::PathBuf::from)
-		.unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{uid}")));
-	std::fs::create_dir_all(&dir)
-		.map_err(|e| std::io::Error::other(format!("create {}: {e}", dir.display())))?;
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+	fs::create_dir_all(&dir)
+		.map_err(|e| io::Error::other(format!("create {}: {e}", dir.display())))?;
 	let path = dir.join(LOCK_NAME);
-	let f = std::fs::OpenOptions::new()
+	let f = fs::OpenOptions::new()
 		.read(true)
 		.write(true)
 		.create(true)
 		.truncate(false)
 		.open(&path)
-		.map_err(|e| std::io::Error::other(format!("open {}: {e}", path.display())))?;
+		.map_err(|e| io::Error::other(format!("open {}: {e}", path.display())))?;
 	let fd = f.as_raw_fd();
-	let None = std::num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }) else {
-		return Err(std::io::Error::last_os_error());
+	let None = num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }) else {
+		return Err(io::Error::last_os_error());
 	};
-	unsafe { std::env::set_var(INHERIT_VAR, fd.to_string()) };
+	unsafe { env::set_var(INHERIT_VAR, fd.to_string()) };
 	Ok(f)
 }
 
-fn flock(fd: RawFd, op: i32) -> std::io::Result<()> {
+fn flock(fd: RawFd, op: i32) -> io::Result<()> {
 	loop {
-		match std::num::NonZeroI32::new(unsafe { libc::flock(fd, op) }) {
+		match num::NonZeroI32::new(unsafe { libc::flock(fd, op) }) {
 			None => return Ok(()),
 			Some(_rc) => {
-				let e = std::io::Error::last_os_error();
-				match Some(()).filter(|_u| e.kind() == std::io::ErrorKind::Interrupted) {
+				let e = io::Error::last_os_error();
+				match Some(()).filter(|_u| e.kind() == io::ErrorKind::Interrupted) {
 					None => return Err(e),
 					Some(()) => continue,
 				}
@@ -98,26 +108,26 @@ fn flock(fd: RawFd, op: i32) -> std::io::Result<()> {
 	}
 }
 
-fn holder_pid(f: &mut std::fs::File) -> Option<u32> {
+fn holder_pid(f: &mut fs::File) -> Option<u32> {
 	let mut s = String::new();
 	f.rewind().ok()?;
 	f.read_to_string(&mut s).ok()?;
 	s.trim().parse().ok()
 }
 
-fn stamp(f: &mut std::fs::File, pid: u32) -> std::io::Result<()> {
+fn stamp(f: &mut fs::File, pid: u32) -> io::Result<()> {
 	f.rewind()?;
 	write!(f, "{pid:<w$}", w = STAMP_WIDTH)?;
 	f.flush()
 }
 
-fn take(f: &mut std::fs::File) -> std::io::Result<()> {
+fn take(f: &mut fs::File) -> io::Result<()> {
 	let fd = f.as_raw_fd();
 	match flock(fd, libc::LOCK_EX | libc::LOCK_NB) {
 		Ok(()) => Ok(()),
 		Err(e) => contend(fd, f, e),
 	}?;
-	let me = std::process::id();
+	let me = process::id();
 	let prev = holder_pid(f).filter(|p| *p != CLEAN && *p != me);
 	stamp(f, me)?;
 	for pid in prev.into_iter() {
@@ -126,9 +136,9 @@ fn take(f: &mut std::fs::File) -> std::io::Result<()> {
 	Ok(())
 }
 
-fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Result<()> {
+fn contend(fd: RawFd, f: &mut fs::File, e: io::Error) -> io::Result<()> {
 	let kind = e.kind();
-	match Some(()).filter(|_u| kind == std::io::ErrorKind::WouldBlock) {
+	match Some(()).filter(|_u| kind == io::ErrorKind::WouldBlock) {
 		None => Err(e),
 		Some(()) => {
 			match holder_pid(f).filter(|p| *p != CLEAN) {
@@ -143,8 +153,8 @@ fn contend(fd: RawFd, f: &mut std::fs::File, e: std::io::Error) -> std::io::Resu
 }
 
 fn await_teardown(pid: u32) {
-	let path = std::path::PathBuf::from(KFD_PROC).join(pid.to_string());
-	let t0 = std::time::Instant::now();
+	let path = PathBuf::from(KFD_PROC).join(pid.to_string());
+	let t0 = time::Instant::now();
 	let parked = path.exists();
 	match parked {
 		true => Write::wait(format!("Waiting for pid {pid} gpu teardown")),
@@ -155,7 +165,7 @@ fn await_teardown(pid: u32) {
 		wedged = expired(t0).is_some();
 		match wedged {
 			true => break,
-			false => std::thread::sleep(std::time::Duration::from_millis(2)),
+			false => thread::sleep(time::Duration::from_millis(2)),
 		}
 	}
 	match parked {
@@ -170,14 +180,14 @@ fn await_teardown(pid: u32) {
 		return;
 	};
 	loop {
-		std::thread::sleep(RECLAIM_STEP);
+		thread::sleep(RECLAIM_STEP);
 		let Some(now) = crate::hip::sysfs_vram_free() else {
 			return;
 		};
 		match now.cmp(&free) {
-			std::cmp::Ordering::Greater => free = now,
-			std::cmp::Ordering::Equal => return,
-			std::cmp::Ordering::Less => return,
+			cmp::Ordering::Greater => free = now,
+			cmp::Ordering::Equal => return,
+			cmp::Ordering::Less => return,
 		}
 		let None = expired(t0) else {
 			return overstayed(pid, t0);
@@ -185,22 +195,22 @@ fn await_teardown(pid: u32) {
 	}
 }
 
-fn expired(t0: std::time::Instant) -> Option<()> {
+fn expired(t0: time::Instant) -> Option<()> {
 	let waited = t0.elapsed().as_secs_f64();
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
-		Some(std::cmp::Ordering::Less) | None => None,
-		Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) => Some(()),
+		Some(cmp::Ordering::Less) | None => None,
+		Some(cmp::Ordering::Equal) | Some(cmp::Ordering::Greater) => Some(()),
 	}
 }
 
-fn overstayed(pid: u32, t0: std::time::Instant) {
+fn overstayed(pid: u32, t0: time::Instant) {
 	drop(Write::err(&format!(
 		"gpu gate: pid {pid} still holds the device after {:.0}s — proceeding",
 		t0.elapsed().as_secs_f64()
 	)));
 }
 
-fn engage(g: &mut Gate) -> std::io::Result<()> {
+fn engage(g: &mut Gate) -> io::Result<()> {
 	let fresh = match &g.lock {
 		Lock::Closed => Some(open_or_adopt()?),
 		Lock::Own(_own) => None,
@@ -216,7 +226,7 @@ fn engage(g: &mut Gate) -> std::io::Result<()> {
 	}
 }
 
-fn open_or_adopt() -> std::io::Result<Lock> {
+fn open_or_adopt() -> io::Result<Lock> {
 	match inherited()? {
 		Some(_fd) => Ok(Lock::Adopted),
 		None => Ok(Lock::Own(open_lock()?)),
@@ -224,7 +234,7 @@ fn open_or_adopt() -> std::io::Result<Lock> {
 }
 
 pub fn acquire() {
-	let None = std::num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else {
+	let None = num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else {
 		return;
 	};
 	let mut g = locked();
@@ -238,11 +248,11 @@ fn mark_taken(g: &mut Gate) {
 	match engage(g) {
 		Ok(()) => {
 			g.grip = Grip::Taken;
-			HOLDING.store(std::process::id(), Ordering::Release);
+			HOLDING.store(process::id(), Ordering::Release);
 		}
 		Err(e) => {
 			drop(Write::err(&format!("gpu gate: {e}")));
-			std::process::abort();
+			process::abort();
 		}
 	}
 }
@@ -268,7 +278,7 @@ fn shutdown(g: &mut Gate) {
 }
 
 pub struct Lease {
-	_p: std::marker::PhantomData<()>,
+	_p: PhantomData<()>,
 }
 
 impl Default for Lease {
@@ -281,7 +291,7 @@ impl Lease {
 	pub fn new() -> Lease {
 		acquire();
 		Lease {
-			_p: std::marker::PhantomData,
+			_p: PhantomData,
 		}
 	}
 }

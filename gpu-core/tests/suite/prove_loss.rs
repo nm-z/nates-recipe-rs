@@ -8,8 +8,10 @@ use crate::common;
 // bug). Unmapped items are reported as remaining backlog, not failures.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // ── New per-element loss launchers (src/kernels/lossx.hip) ────────────────────
 unsafe extern "C" {
@@ -117,12 +119,12 @@ fn run2(f: Launch2, a: &[f64], b: &[f64]) -> Vec<f64> {
 			bb.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			a.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	sync_check();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -153,7 +155,7 @@ fn run2_param(
 	);
 	sync_check();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -264,7 +266,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		"smooth_l1",
 		move |a, b| run2_param(
 			|p, t, o, n| unsafe {
-				launch_lossx_smooth_l1(p, t, o, n, beta, std::ptr::null_mut())
+				launch_lossx_smooth_l1(p, t, o, n, beta, ptr::null_mut())
 			},
 			a,
 			b
@@ -289,7 +291,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		"huber",
 		move |a, b| run2_param(
 			|p, t, o, n| unsafe {
-				launch_lossx_huber(p, t, o, n, delta, std::ptr::null_mut())
+				launch_lossx_huber(p, t, o, n, delta, ptr::null_mut())
 			},
 			a,
 			b
@@ -314,7 +316,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		"tweedie",
 		move |a, b| run2_param(
 			|p, t, o, n| unsafe {
-				launch_lossx_tweedie(p, t, o, n, power, std::ptr::null_mut())
+				launch_lossx_tweedie(p, t, o, n, power, ptr::null_mut())
 			},
 			a,
 			b
@@ -332,7 +334,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		"quantile",
 		move |a, b| run2_param(
 			|p, t, o, n| unsafe {
-				launch_lossx_quantile(p, t, o, n, q, std::ptr::null_mut())
+				launch_lossx_quantile(p, t, o, n, q, ptr::null_mut())
 			},
 			a,
 			b
@@ -391,7 +393,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 			)
 			.unwrap();
 			let mut out = vec![0.0; a.len()];
-			unsafe { loss.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+			unsafe { loss.download_async(&mut out, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			out
 		},
@@ -426,7 +428,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 			let grad = GpuBuffer::alloc(a.len()).unwrap();
 			gpu_core::losses::gpu_hinge_loss(&ba, &bb, a.len(), &loss, &grad).unwrap();
 			let mut out = vec![0.0; a.len()];
-			unsafe { loss.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+			unsafe { loss.download_async(&mut out, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			out
 		},
@@ -505,11 +507,11 @@ fn canon(name: &str) -> &'static str {
 fn load_loss_inventory() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).unwrap_or_else(|_| panic!("no kernel_inventory at {dir}"));
+	let rd = fs::read_dir(&dir).unwrap_or_else(|_| panic!("no kernel_inventory at {dir}"));
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -578,7 +580,7 @@ fn prove_loss() {
 	// Map inventory -> proven count. A proven op covers ALL its variants.
 	let mut proven_items = 0usize;
 	let total = items.len();
-	let proven_ops: std::collections::HashSet<&str> = implemented.iter().copied().collect();
+	let proven_ops: HashSet<&str> = implemented.iter().copied().collect();
 	let mut mapped_total = 0usize;
 	for name in &items {
 		let key = canon(name);

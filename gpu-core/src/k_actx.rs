@@ -1,6 +1,7 @@
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 fn e() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
@@ -13,7 +14,7 @@ macro_rules! a0 {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void); )* }
         $(
             pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, std::ptr::null_mut()); }
+                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, ptr::null_mut()); }
                 e()
             }
         )*
@@ -24,7 +25,7 @@ macro_rules! a1 {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, p: *const c_void, s: *mut c_void); )* }
         $(
             pub fn $name(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, p.ptr_raw() as *const c_void, std::ptr::null_mut()); }
+                unsafe { $launch(x.ptr_raw() as *const c_void, out.ptr_raw(), n as i32, p.ptr_raw() as *const c_void, ptr::null_mut()); }
                 e()
             }
         )*

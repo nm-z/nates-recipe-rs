@@ -1,3 +1,9 @@
+use std::cell::Cell;
+use std::ffi::c_void;
+use std::mem;
+use std::process;
+use std::ptr;
+use std::sync::Mutex;
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
 use anyhow::Context;
@@ -73,8 +79,8 @@ pub struct Scratch {
 	pub pinned_scalar_b: *mut f64,
 	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
 	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
-	timing: std::cell::Cell<bool>,
-	timing_slot: std::cell::Cell<usize>,
+	timing: Cell<bool>,
+	timing_slot: Cell<usize>,
 }
 
 pub struct LayerMs {
@@ -100,7 +106,7 @@ pub fn layer_ms_from(
 					"fwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			e.unwrap_or(0.0) as f64
 		})
@@ -113,7 +119,7 @@ pub fn layer_ms_from(
 					"bwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			e.unwrap_or(0.0) as f64
 		})
@@ -373,8 +379,8 @@ impl Scratch {
 			pinned_scalar_b: unsafe { pinned_pair.add(1) },
 			ev_fwd,
 			ev_bwd,
-			timing: std::cell::Cell::new(false),
-			timing_slot: std::cell::Cell::new(0),
+			timing: Cell::new(false),
+			timing_slot: Cell::new(0),
 		})
 	}
 
@@ -389,14 +395,14 @@ impl Scratch {
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
 			let r = unsafe {
-				self.ev_fwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
+				self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut())
 			};
 			if !r.is_ok() {
 				drop(Write::err(format!(
 					"record fwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 		}
 	}
@@ -404,14 +410,14 @@ impl Scratch {
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
 			let r = unsafe {
-				self.ev_bwd[self.timing_slot.get()][i].record(std::ptr::null_mut())
+				self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut())
 			};
 			if !r.is_ok() {
 				drop(Write::err(format!(
 					"record bwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 		}
 	}
@@ -424,23 +430,23 @@ impl Scratch {
 				"sync bwd event: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
 
 	pub fn take_events(&mut self) -> LayerEvents {
 		LayerEvents {
-			fwd: std::mem::take(&mut self.ev_fwd),
-			bwd: std::mem::take(&mut self.ev_bwd),
+			fwd: mem::take(&mut self.ev_fwd),
+			bwd: mem::take(&mut self.ev_bwd),
 		}
 	}
 
 	pub fn download_scalar_deferred(&self) {
 		unsafe {
 			let _ = gpu_core::memory::xfer(
-				self.pinned_scalar as *mut std::ffi::c_void,
-				self.metric_scalar.ptr_raw() as *const std::ffi::c_void,
+				self.pinned_scalar as *mut c_void,
+				self.metric_scalar.ptr_raw() as *const c_void,
 				8,
 				gpu_core::hip::HIP_MEMCPY_D2H,
 				self.copy_stream.raw(),
@@ -451,8 +457,8 @@ impl Scratch {
 	pub fn download_scalar_b_deferred(&self) {
 		unsafe {
 			let _ = gpu_core::memory::xfer(
-				self.pinned_scalar_b as *mut std::ffi::c_void,
-				self.metric_scalar_b.ptr_raw() as *const std::ffi::c_void,
+				self.pinned_scalar_b as *mut c_void,
+				self.metric_scalar_b.ptr_raw() as *const c_void,
 				8,
 				gpu_core::hip::HIP_MEMCPY_D2H,
 				self.copy_stream.raw(),
@@ -467,7 +473,7 @@ impl Scratch {
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
 		unsafe { *self.pinned_scalar }
 	}
@@ -484,7 +490,7 @@ impl Scratch {
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
 	}
 
@@ -553,7 +559,7 @@ impl Drop for Scratch {
 	}
 }
 
-static PINNED_PAIR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
 
 fn pinned_scalar_pair() -> *mut f64 {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
@@ -564,9 +570,9 @@ fn pinned_scalar_pair() -> *mut f64 {
 				"pinned scalars: {}",
 				hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
-		*g = hm.unwrap_or(std::ptr::null_mut()) as usize;
+		*g = hm.unwrap_or(ptr::null_mut()) as usize;
 	}
 	*g as *mut f64
 }
@@ -575,7 +581,7 @@ pub fn free_pinned_pair() {
 	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
 	if *g != 0 {
 		let _ = gpu_core::hip::device_synchronize();
-		let _ = unsafe { gpu_core::hip::host_free(*g as *mut std::ffi::c_void) };
+		let _ = unsafe { gpu_core::hip::host_free(*g as *mut c_void) };
 		*g = 0;
 	}
 }
@@ -690,7 +696,7 @@ impl Scratch {
 				floats += 1 + bw(1);
 			}
 		}
-		floats * std::mem::size_of::<f64>() + max_ws
+		floats * mem::size_of::<f64>() + max_ws
 	}
 }
 
@@ -703,7 +709,7 @@ pub fn vram_estimate(
 	c_cat: usize,
 	forward_only: bool,
 ) -> usize {
-	let f8 = std::mem::size_of::<f64>();
+	let f8 = mem::size_of::<f64>();
 	let mut bytes = 0usize;
 	bytes += 2 * n * d * f8;
 	if c_cat > 0 {
@@ -761,7 +767,7 @@ pub fn vram_estimate(
 						}
 						None => {
 							drop(Write::err("conv cin"));
-							std::process::abort();
+							process::abort();
 						}
 					}
 				} else {
@@ -802,7 +808,7 @@ pub fn vram_estimate(
 	let dummy_params: Vec<LayerParams> = fake_params
 		.iter()
 		.map(|&(i, o, kind, dim, vocab, act, heads)| {
-			let dummy = || GpuBuffer::borrow(std::ptr::null_mut(), 0);
+			let dummy = || GpuBuffer::borrow(ptr::null_mut(), 0);
 			let (cc, ck, cs) = if kind == LayerKind::Conv {
 				(dim, vocab, heads)
 			} else {

@@ -1,9 +1,13 @@
 use pantry::data::{DirGroup, RawCsv, load_groups, load_zip_groups, read_raw_csv, sniff_delimiter};
+use std::env;
+use std::fs;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process;
 
-fn tmp(name: &str, body: &str) -> std::path::PathBuf {
-	let p = std::env::temp_dir().join(format!("nrs_hdr_{}_{name}", std::process::id()));
-	let mut f = std::fs::File::create(&p).unwrap();
+fn tmp(name: &str, body: &str) -> PathBuf {
+	let p = env::temp_dir().join(format!("nrs_hdr_{}_{name}", process::id()));
+	let mut f = fs::File::create(&p).unwrap();
 	f.write_all(body.as_bytes()).unwrap();
 	p
 }
@@ -36,7 +40,7 @@ fn single_numeric_column_headerless() {
 
 #[test]
 fn semicolon_delimiter_is_sniffed() {
-	let p = std::path::Path::new(concat!(
+	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/uci-bank-semicolon/bank.csv"
 	));
@@ -45,7 +49,7 @@ fn semicolon_delimiter_is_sniffed() {
 
 #[test]
 fn tab_delimiter_is_sniffed() {
-	let p = std::path::Path::new(concat!(
+	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/uci-seeds/seeds_dataset.txt"
 	));
@@ -54,7 +58,7 @@ fn tab_delimiter_is_sniffed() {
 
 #[test]
 fn comma_delimiter_is_sniffed() {
-	let p = std::path::Path::new(concat!(
+	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/wine-quality/winequality-red.csv"
 	));
@@ -63,7 +67,7 @@ fn comma_delimiter_is_sniffed() {
 
 #[test]
 fn space_delimiter_is_sniffed() {
-	let p = std::path::Path::new(concat!(
+	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
 	));
@@ -81,7 +85,7 @@ fn prose_line_is_not_space_delimited() {
 
 #[test]
 fn whitespace_matrix_headerless_keeps_rows() {
-	let p = std::path::Path::new(concat!(
+	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
 	));
@@ -149,17 +153,17 @@ fn har_zip_extracts_wrapped_tables() {
 #[test]
 fn nested_zip_extracts_inner_tables() {
 	let inner_path =
-		std::env::temp_dir().join(format!("nrs_zip_inner_{}.zip", std::process::id()));
+		env::temp_dir().join(format!("nrs_zip_inner_{}.zip", process::id()));
 	let outer_path =
-		std::env::temp_dir().join(format!("nrs_zip_outer_{}.zip", std::process::id()));
+		env::temp_dir().join(format!("nrs_zip_outer_{}.zip", process::id()));
 	let opts = zip::write::SimpleFileOptions::default();
-	let mut inner = zip::ZipWriter::new(std::fs::File::create(&inner_path).unwrap());
+	let mut inner = zip::ZipWriter::new(fs::File::create(&inner_path).unwrap());
 	inner.start_file("wrap/points.csv", opts).unwrap();
 	inner.write_all(b"a,b\n1,2\n3,4\n").unwrap();
 	inner.finish().unwrap();
-	let mut outer = zip::ZipWriter::new(std::fs::File::create(&outer_path).unwrap());
+	let mut outer = zip::ZipWriter::new(fs::File::create(&outer_path).unwrap());
 	outer.start_file("bundle/inner.zip", opts).unwrap();
-	outer.write_all(&std::fs::read(&inner_path).unwrap())
+	outer.write_all(&fs::read(&inner_path).unwrap())
 		.unwrap();
 	outer.start_file("__MACOSX/bundle/._inner.zip", opts)
 		.unwrap();
@@ -168,8 +172,8 @@ fn nested_zip_extracts_inner_tables() {
 	outer.write_all(b"macjunk").unwrap();
 	outer.finish().unwrap();
 	let groups = load_zip_groups(outer_path.to_str().unwrap()).unwrap();
-	let _ = std::fs::remove_file(&inner_path);
-	let _ = std::fs::remove_file(&outer_path);
+	let _ = fs::remove_file(&inner_path);
+	let _ = fs::remove_file(&outer_path);
 	assert_eq!(groups.len(), 1, "junk entries must not become groups");
 	let DirGroup::Table {
 		name,

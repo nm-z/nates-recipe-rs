@@ -1,7 +1,12 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+use std::error;
+use std::fmt;
 use std::fmt::Display;
+use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::Write as _;
+use std::process;
 use std::sync::Mutex;
 
 macro_rules! flags {
@@ -51,8 +56,8 @@ pub fn opt() -> Opt {
 }
 
 fn log(t: &impl Display) {
-	std::fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
-	let path = format!("/tmp/recipe/run{:03x}.log", std::process::id() & 0xfff);
+	fs::create_dir_all("/tmp/recipe").expect("log: create /tmp/recipe");
+	let path = format!("/tmp/recipe/run{:03x}.log", process::id() & 0xfff);
 	let mut f = File::options()
 		.append(true)
 		.create(true)
@@ -62,7 +67,7 @@ fn log(t: &impl Display) {
 }
 
 fn print(t: &impl Display) {
-	drop(writeln!(std::io::stderr(), "{t}"));
+	drop(writeln!(io::stderr(), "{t}"));
 }
 
 pub struct Errored(pub String);
@@ -82,18 +87,18 @@ impl Errored {
 }
 
 impl Display for Errored {
-	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		f.write_str(&self.0)
 	}
 }
 
-impl std::fmt::Debug for Errored {
-	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl fmt::Debug for Errored {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		f.write_str(&self.0)
 	}
 }
 
-impl std::error::Error for Errored {}
+impl error::Error for Errored {}
 
 pub mod Write {
 	use super::*;
@@ -155,12 +160,12 @@ pub mod Write {
 
 	pub fn unwait() {
 		use std::io::IsTerminal;
-		match std::io::stderr().is_terminal() {
-			true => drop(write!(std::io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
+		match io::stderr().is_terminal() {
+			true => drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r")),
 			false => {}
 		}
 	}
-	pub fn err(t: impl Display) -> std::result::Result<(), Errored> {
-		std::result::Result::Err(Errored::new(t))
+	pub fn err(t: impl Display) -> Result<(), Errored> {
+		Result::Err(Errored::new(t))
 	}
 }

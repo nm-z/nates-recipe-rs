@@ -4,6 +4,11 @@
 //! through `recipe_infer` directly; the trainer that produced the weights lives
 //! up in the framework crate.
 
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::path::Path;
+
 pub const CONTEXT: usize = 256;
 pub const VOCAB: usize = 257;
 pub const N_CLASS: usize = 6;
@@ -29,14 +34,14 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	'outer: for j in 0..cells.len() {
 		for lead in cells[..j].first().map(|_prev| sep).into_iter() {
 			match ids.len().cmp(&CONTEXT) {
-				std::cmp::Ordering::Less => ids.push(lead),
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break 'outer,
+				Ordering::Less => ids.push(lead),
+				Ordering::Equal | Ordering::Greater => break 'outer,
 			}
 		}
 		for &b in cells[j].as_bytes() {
 			match ids.len().cmp(&CONTEXT) {
-				std::cmp::Ordering::Less => ids.push(b as f64 + 1.0),
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break 'outer,
+				Ordering::Less => ids.push(b as f64 + 1.0),
+				Ordering::Equal | Ordering::Greater => break 'outer,
 			}
 		}
 	}
@@ -59,7 +64,7 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 /// parse. Dir/zip/db reuse the full `load_groups` loader (the same parser), taking
 /// correctness over a second, prefix-only dialect.
 pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
-	let p = std::path::Path::new(path);
+	let p = Path::new(path);
 	let ext = p
 		.extension()
 		.and_then(|e| e.to_str())
@@ -123,7 +128,7 @@ fn kinds_for(
 		.collect();
 	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
 	let preds = predict_kinds(&cols)?;
-	let mut pred: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+	let mut pred: HashMap<usize, usize> = HashMap::new();
 	for i in 0..to_predict.len() {
 		pred.insert(to_predict[i], preds[i]);
 	}
@@ -151,10 +156,10 @@ enum FirstRow {
 /// only until it holds ≥ `CONTEXT` bytes of `tokenize_column` stream (or EOF). The
 /// returned prefix is exactly what `tokenize_column` would consume from the full
 /// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
-fn prefix_columns(path: &std::path::Path) -> anyhow::Result<PrefixCols> {
+fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 	// One token per byte, plus one newline separator between consecutive cells.
 	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize]) {
-		let std::cmp::Ordering::Less = tok[j].cmp(&CONTEXT) else {
+		let Ordering::Less = tok[j].cmp(&CONTEXT) else {
 			return;
 		};
 		match cols[j].first() {
@@ -224,12 +229,12 @@ fn prefix_columns(path: &std::path::Path) -> anyhow::Result<PrefixCols> {
 				anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display())
 			})?;
 			for j in 0..w {
-				let std::cmp::Ordering::Less = tok[j].cmp(&CONTEXT) else {
+				let Ordering::Less = tok[j].cmp(&CONTEXT) else {
 					continue;
 				};
 				let cell = rec
 					.get(j)
-					.map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
+					.map_or(Cow::Borrowed(""), String::from_utf8_lossy);
 				let Some(()) =
 					Some(()).filter(|_u| !crate::encode::is_missing(cell.as_ref()))
 				else {
@@ -347,7 +352,7 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 			let lg = &preds[r * N_CLASS..r * N_CLASS + N_CLASS];
 			let mut best = 0;
 			for j in 1..N_CLASS {
-				let Some(std::cmp::Ordering::Greater) = lg[j].partial_cmp(&lg[best]) else {
+				let Some(Ordering::Greater) = lg[j].partial_cmp(&lg[best]) else {
 					continue;
 				};
 				best = j;

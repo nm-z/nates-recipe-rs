@@ -4,6 +4,7 @@
 // and NVIDIA (cuSOLVER/cuFFT) → cross-backend parity. f64, tol generous for solvers.
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
+use std::ptr;
 
 // deterministic SPD matrix A = MᵀM + n·I (row-major == col-major since symmetric)
 fn spd(n: usize, seed: u64) -> Vec<f64> {
@@ -66,7 +67,7 @@ fn cholesky_solve_residual() {
 		kernels::gpu_cholesky_solve(&da, &db, n, &work, &info, &a_copy, &out).unwrap();
 		let xg = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -105,7 +106,7 @@ fn lu_solve_residual() {
 			.unwrap();
 		let xg = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -133,7 +134,7 @@ fn eigh_eigenvalue_sum_equals_trace() {
 		linalg::gpu_eigh_sym(&da, n, &work, &info, &evals, &evecs).unwrap();
 		let ev = {
 			let mut __dv = vec![0.0f64; evals.n_floats()];
-			unsafe { evals.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { evals.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -168,7 +169,7 @@ fn fft_roundtrip() {
 		linalg::gpu_fft_c2c_1d(&fwd, n, 0, &inv_buf).unwrap();
 		let inv = {
 			let mut __dv = vec![0.0f64; inv_buf.n_floats()];
-			unsafe { inv_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { inv_buf.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -202,7 +203,7 @@ fn cholesky_inv_times_a_is_identity() {
 		kernels::gpu_cholesky_inv(&da, n, &work, &info, &a_copy, &out).unwrap();
 		let inv = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -256,7 +257,7 @@ fn cholesky_factor_then_tri_solve() {
 		kernels::gpu_tri_solve(&l, &z, n, 1, 0, &x_buf).unwrap();
 		let x = {
 			let mut __dv = vec![0.0f64; x_buf.n_floats()];
-			unsafe { x_buf.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { x_buf.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};

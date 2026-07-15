@@ -1,9 +1,16 @@
 use crate::hip::{self, HipError};
 use crate::log::Write;
-use std::ffi::c_void;
+use std::cmp;
+use std::ffi::{CString, c_void};
+use std::fmt;
+use std::fs;
 use std::fs::File;
+use std::mem;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::ptr;
 
 pub const P: usize = 2 << 20;
 
@@ -24,8 +31,8 @@ pub struct Full {
 	pub cap: usize,
 }
 
-impl std::fmt::Display for Full {
-	fn fmt<'f>(&self, f: &mut std::fmt::Formatter<'f>) -> std::fmt::Result {
+impl fmt::Display for Full {
+	fn fmt<'f>(&self, f: &mut fmt::Formatter<'f>) -> fmt::Result {
 		write!(
 			f,
 			"buffer {} exceeds VRAM+RAM+disk ceiling {}",
@@ -73,11 +80,11 @@ pub fn admit(
 ) -> Result<Budgets, Full> {
 	let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
 	match b.cmp(&bud.cap) {
-		std::cmp::Ordering::Greater => Err(Full {
+		cmp::Ordering::Greater => Err(Full {
 			need: b,
 			cap: bud.cap,
 		}),
-		std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(bud),
+		cmp::Ordering::Less | cmp::Ordering::Equal => Ok(bud),
 	}
 }
 
@@ -90,7 +97,7 @@ fn vram_total_free() -> hip::MemInfo {
 }
 
 fn meminfo_free() -> usize {
-	let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+	let s = fs::read_to_string("/proc/meminfo").unwrap_or_default();
 	for l in s.lines() {
 		let Some(r) = l.strip_prefix("MemAvailable:") else {
 			continue;
@@ -113,16 +120,16 @@ fn disk_free(spill: &Path) -> usize {
 		.parent()
 		.filter(|p| !p.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
-	let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+	let Ok(c) = CString::new(dir.as_os_str().as_bytes()) else {
 		return 0;
 	};
-	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+	let mut st: libc::statvfs = unsafe { mem::zeroed() };
 	let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
 	match rc.cmp(&0) {
-		std::cmp::Ordering::Equal => {
+		cmp::Ordering::Equal => {
 			(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
 		}
-		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => 0,
+		cmp::Ordering::Less | cmp::Ordering::Greater => 0,
 	}
 }
 
@@ -155,11 +162,11 @@ impl Tiered {
 	) -> Result<Self, Full> {
 		let budgets = Budgets::measure(weights_bytes, grad_bytes, spill);
 		match b.cmp(&budgets.cap) {
-			std::cmp::Ordering::Greater => Err(Full {
+			cmp::Ordering::Greater => Err(Full {
 				need: b,
 				cap: budgets.cap,
 			}),
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+			cmp::Ordering::Less | cmp::Ordering::Equal => {
 				let n_pg = b.div_ceil(P);
 				let n_vram = n_pg.min(budgets.n_v);
 				let n_ram = (n_pg - n_vram).min(budgets.n_r);
@@ -188,7 +195,7 @@ impl Tiered {
 
 		let mapping = reserve_and_map(n_vram).unwrap_or_else(|e| {
 			drop(Write::err(&format!("vmm reserve/map: {e}")));
-			std::process::abort()
+			process::abort()
 		});
 		let va = mapping.va;
 		let handles = mapping.handles;
@@ -200,18 +207,18 @@ impl Tiered {
 			.collect();
 
 		let disk = match n_disk.cmp(&0) {
-			std::cmp::Ordering::Greater => {
+			cmp::Ordering::Greater => {
 				let f = crate::bridge::open_spill(spill).unwrap_or_else(|e| {
 					drop(Write::err(&format!("open spill file: {e}")));
-					std::process::abort()
+					process::abort()
 				});
 				f.set_len((n_disk * P) as u64).unwrap_or_else(|e| {
 					drop(Write::err(&format!("size spill file: {e}")));
-					std::process::abort()
+					process::abort()
 				});
 				Some(f)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => None,
+			cmp::Ordering::Less | cmp::Ordering::Equal => None,
 		};
 
 		let mut res = Vec::with_capacity(n_pg);
@@ -260,7 +267,7 @@ impl Tiered {
 	pub fn device_ptr(&self) -> *mut c_void {
 		if !self.is_contiguous_vram() {
 			drop(Write::err("device_ptr on a spilled buffer — stage pages instead"));
-			std::process::abort();
+			process::abort();
 		}
 		self.va
 	}
@@ -268,16 +275,16 @@ impl Tiered {
 	pub fn fill(&mut self, src: &[u8]) {
 		if !(src.len() <= self.b) {
 			drop(Write::err("fill src longer than buffer"));
-			std::process::abort();
+			process::abort();
 		}
 		for p in 0..self.n_pg {
 			let lo = p * P;
 			match lo.cmp(&src.len()) {
-				std::cmp::Ordering::Less => {
+				cmp::Ordering::Less => {
 					let hi = (lo + P).min(src.len());
 					self.write_page(p, &src[lo..hi]);
 				}
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break,
+				cmp::Ordering::Equal | cmp::Ordering::Greater => break,
 			}
 		}
 	}
@@ -293,12 +300,12 @@ impl Tiered {
 						bytes.as_ptr() as *const c_void,
 						bytes.len(),
 						hip::HIP_MEMCPY_H2D,
-						std::ptr::null_mut(),
+						ptr::null_mut(),
 					)
 				}
 				.unwrap_or_else(|e| {
 					drop(Write::err(&format!("H2D page fill: {e}")));
-					std::process::abort()
+					process::abort()
 				});
 			}
 			Residence::Ram(i) => {
@@ -309,12 +316,12 @@ impl Tiered {
 					.as_ref()
 					.unwrap_or_else(|| {
 						drop(Write::err("disk tier missing"));
-						std::process::abort()
+						process::abort()
 					})
 					.write_all_at(bytes, off)
 					.unwrap_or_else(|e| {
 						drop(Write::err(&format!("spill write: {e}")));
-						std::process::abort()
+						process::abort()
 					});
 			}
 		}
@@ -342,11 +349,11 @@ impl Tiered {
 						src,
 						chunk,
 						hip::HIP_MEMCPY_D2D,
-						std::ptr::null_mut(),
+						ptr::null_mut(),
 					)
 					.unwrap_or_else(|e| {
 						drop(Write::err(&format!("stage_bytes D2D: {e}")));
-						std::process::abort()
+						process::abort()
 					});
 				},
 				Residence::Ram(i) => unsafe {
@@ -356,11 +363,11 @@ impl Tiered {
 						src,
 						chunk,
 						hip::HIP_MEMCPY_H2D,
-						std::ptr::null_mut(),
+						ptr::null_mut(),
 					)
 					.unwrap_or_else(|e| {
 						drop(Write::err(&format!("stage_bytes H2D: {e}")));
-						std::process::abort()
+						process::abort()
 					});
 				},
 				Residence::Disk(diskoff) => {
@@ -368,12 +375,12 @@ impl Tiered {
 						.as_ref()
 						.unwrap_or_else(|| {
 							drop(Write::err("disk tier missing"));
-							std::process::abort()
+							process::abort()
 						})
 						.read_exact_at(&mut scratch[..chunk], diskoff + poff as u64)
 						.unwrap_or_else(|e| {
 							drop(Write::err(&format!("stage_bytes read: {e}")));
-							std::process::abort()
+							process::abort()
 						});
 					unsafe {
 						crate::memory::xfer(
@@ -381,11 +388,11 @@ impl Tiered {
 							scratch.as_ptr() as *const c_void,
 							chunk,
 							hip::HIP_MEMCPY_H2D,
-							std::ptr::null_mut(),
+							ptr::null_mut(),
 						)
 						.unwrap_or_else(|e| {
 							drop(Write::err(&format!("stage_bytes disk H2D: {e}")));
-							std::process::abort()
+							process::abort()
 						});
 					}
 				}
@@ -399,8 +406,8 @@ impl Tiered {
 		for k in 0..n_pages {
 			let p = first_page + k;
 			match p.cmp(&self.n_pg) {
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => break,
-				std::cmp::Ordering::Less => {
+				cmp::Ordering::Equal | cmp::Ordering::Greater => break,
+				cmp::Ordering::Less => {
 					let bytes = P.min(self.b - p * P);
 					let dst = unsafe { (window as *mut u8).add(k * P) as *mut c_void };
 					match self.res[p] {
@@ -412,11 +419,11 @@ impl Tiered {
 								src,
 								bytes,
 								hip::HIP_MEMCPY_D2D,
-								std::ptr::null_mut(),
+								ptr::null_mut(),
 							)
 							.unwrap_or_else(|e| {
 						drop(Write::err(&format!("stage D2D: {e}")));
-						std::process::abort()
+						process::abort()
 					});
 						},
 						Residence::Ram(i) => unsafe {
@@ -426,11 +433,11 @@ impl Tiered {
 								src,
 								bytes,
 								hip::HIP_MEMCPY_H2D,
-								std::ptr::null_mut(),
+								ptr::null_mut(),
 							)
 							.unwrap_or_else(|e| {
 						drop(Write::err(&format!("stage H2D: {e}")));
-						std::process::abort()
+						process::abort()
 					});
 						},
 						Residence::Disk(off) => {
@@ -438,12 +445,12 @@ impl Tiered {
 								.as_ref()
 								.unwrap_or_else(|| {
 									drop(Write::err("disk tier missing"));
-									std::process::abort()
+									process::abort()
 								})
 								.read_exact_at(&mut disk_scratch[..bytes], off)
 								.unwrap_or_else(|e| {
 									drop(Write::err(&format!("stage read: {e}")));
-									std::process::abort()
+									process::abort()
 								});
 							unsafe {
 								crate::memory::xfer(
@@ -451,11 +458,11 @@ impl Tiered {
 									disk_scratch.as_ptr() as *const c_void,
 									bytes,
 									hip::HIP_MEMCPY_H2D,
-									std::ptr::null_mut(),
+									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
 							drop(Write::err(&format!("stage disk H2D: {e}")));
-							std::process::abort()
+							process::abort()
 						});
 							}
 						}
@@ -479,7 +486,7 @@ impl Drop for Tiered {
 				hip::vmm_release(h);
 			}
 		}
-		for _region in std::ptr::NonNull::new(self.va)
+		for _region in ptr::NonNull::new(self.va)
 			.filter(|_p| self.slots > 0)
 			.into_iter()
 		{
@@ -487,7 +494,7 @@ impl Drop for Tiered {
 			unsafe { hip::vmm_addr_free(self.va, self.slots * P) };
 		}
 		for _f in self.disk.as_ref().into_iter() {
-			std::fs::remove_file(&self.spill_path).ok().unwrap_or(());
+			fs::remove_file(&self.spill_path).ok().unwrap_or(());
 		}
 	}
 }
@@ -498,18 +505,18 @@ struct Mapping {
 }
 
 fn reserve_and_map(slots: usize) -> Result<Mapping, HipError> {
-	let Some(_count) = std::num::NonZeroUsize::new(slots) else {
+	let Some(_count) = NonZeroUsize::new(slots) else {
 		return Ok(Mapping {
-			va: std::ptr::null_mut(),
+			va: ptr::null_mut(),
 			handles: Vec::new(),
 		});
 	};
-	let mut va: *mut c_void = std::ptr::null_mut();
+	let mut va: *mut c_void = ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::MEM_ADDRESS_RESERVE);
 	hip::check(unsafe { hip::vmm_reserve(&mut va, slots * P) })?;
 	let mut handles = Vec::with_capacity(slots);
 	for s in 0..slots {
-		let mut h: *mut c_void = std::ptr::null_mut();
+		let mut h: *mut c_void = ptr::null_mut();
 		crate::callspy::tick(&crate::callspy::MEM_CREATE);
 		hip::check(unsafe { hip::vmm_create(&mut h, P) })?;
 		let slot_va = unsafe { (va as *mut u8).add(s * P) as *mut c_void };

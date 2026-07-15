@@ -15,6 +15,10 @@ use gpu_core::rl::{
 	gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob,
 	gpu_td_targets,
 };
+use std::collections::HashSet;
+use std::f64::consts;
+use std::mem;
+use std::ptr;
 
 const EPS: f64 = 1e-9;
 
@@ -37,7 +41,7 @@ fn test_rl_discounted_returns() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_discounted_returns(&rewards, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// G[2] = 1.0
@@ -93,7 +97,7 @@ fn test_rl_gae() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_gae(&rewards, &values, &gamma_buf, &lam_buf, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// Hand compute:
@@ -149,7 +153,7 @@ fn test_rl_td_targets() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_td_targets(&rewards, &values_next, &done, &gamma, 3, &out).unwrap();
 	let mut result = [0.0_f64; 3];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// t[0] = 1 + 0.99*4*(1-0) = 1 + 3.96 = 4.96
@@ -183,7 +187,7 @@ fn test_rl_categorical_logprob() {
 	let out = GpuBuffer::alloc(1).unwrap();
 	gpu_categorical_logprob(&logits, &actions, 1, 3, &out).unwrap();
 	let mut result = [0.0_f64; 1];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	let log_z = (1.0_f64.exp() + 2.0_f64.exp() + 1.0_f64).ln();
@@ -230,10 +234,10 @@ fn test_rl_gaussian_logprob() {
 	let out = GpuBuffer::alloc(1).unwrap();
 	gpu_gaussian_logprob(&mu, &log_std, &actions, 1, 1, &out).unwrap();
 	let mut result = [0.0_f64; 1];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	let half_log2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+	let half_log2pi = 0.5 * (2.0 * consts::PI).ln();
 	let expected = -0.5 - 0.0 - half_log2pi;
 	assert!(
 		result[0].is_finite(),
@@ -274,7 +278,7 @@ fn test_bayes_nb_feature_log_prob() {
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_nb_feature_log_prob(&counts, &alpha, 2, 3, &out).unwrap();
 	let mut result = [0.0_f64; 6];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// class 0: log([2,3,4]) - log(9)
@@ -328,13 +332,13 @@ fn test_bayes_nb_count_table() {
 	};
 	let y = GpuBuffer::upload_i32(&[0_i32, 1, 0]).unwrap();
 	let out = {
-		let __zb = GpuBuffer::alloc_bytes(4 * std::mem::size_of::<f64>()).unwrap();
-		__zb.memset_zero(4 * std::mem::size_of::<f64>()).unwrap();
+		let __zb = GpuBuffer::alloc_bytes(4 * mem::size_of::<f64>()).unwrap();
+		__zb.memset_zero(4 * mem::size_of::<f64>()).unwrap();
 		__zb
 	};
 	gpu_nb_count_table(&x, &y, 3, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 4];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// row-major: class0=[result[0],result[1]], class1=[result[2],result[3]]
@@ -379,7 +383,7 @@ fn test_bayes_multinomial_nb_logprob() {
 	let out = GpuBuffer::alloc(2).unwrap();
 	gpu_multinomial_nb_logprob(&log_prior, &flp, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	let exp0 = 0.5_f64.ln() + 0.3_f64.ln() + 0.7_f64.ln();
@@ -438,7 +442,7 @@ fn test_bayes_bernoulli_nb_logprob() {
 	let out = GpuBuffer::alloc(2).unwrap();
 	gpu_bernoulli_nb_logprob(&log_prior, &log_p, &log_neg, &x, 1, 2, 2, &out).unwrap();
 	let mut result = [0.0_f64; 2];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// x=[1,0]: feat0 present (use log_p[c,0]), feat1 absent (use log_neg[c,1])
@@ -469,7 +473,7 @@ fn test_forest_bootstrap_sample() {
 	let n_samples = 20_usize;
 	let uniform_ws = GpuBuffer::alloc(n_samples).unwrap();
 	gpu_rand_uniform_into(42, n_samples, &uniform_ws).unwrap();
-	let buf = GpuBuffer::alloc_bytes(n_samples * std::mem::size_of::<i32>()).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n_samples * mem::size_of::<i32>()).unwrap();
 	gpu_bootstrap_sample(&uniform_ws, n, n_samples, 42, &buf).unwrap();
 	// buf.len() is bytes = n_samples * 4
 	assert_eq!(buf.len(), n_samples * 4, "wrong byte length");
@@ -486,7 +490,7 @@ fn test_forest_feature_subset() {
 	let n_features = 10_usize;
 	let k = 4_usize;
 	let keys_ws = GpuBuffer::alloc(n_features).unwrap();
-	let buf = GpuBuffer::alloc_bytes(n_features * std::mem::size_of::<i32>()).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n_features * mem::size_of::<i32>()).unwrap();
 	gpu_feature_subset(&keys_ws, n_features, k, 7, &buf).unwrap();
 	// buf is alloc_bytes(n_features * 4) — always returns n_features indices sorted by key
 	// the first k are the selected subset
@@ -502,7 +506,7 @@ fn test_forest_feature_subset() {
 		);
 	}
 	// Check first k are distinct
-	let subset: std::collections::HashSet<i32> = all_idx[..k].iter().cloned().collect();
+	let subset: HashSet<i32> = all_idx[..k].iter().cloned().collect();
 	assert_eq!(
 		subset.len(),
 		k,
@@ -527,7 +531,7 @@ fn test_forest_random_threshold_split() {
 	let thr_buf = GpuBuffer::alloc(1).unwrap();
 	gpu_random_threshold_split(&col, &d_min_ws, &d_max_ws, col_data.len(), 99, &thr_buf).unwrap();
 	let mut thr = [0.0_f64; 1];
-	unsafe { thr_buf.download_async(&mut thr, std::ptr::null_mut()) }.unwrap();
+	unsafe { thr_buf.download_async(&mut thr, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let threshold = thr[0];
 	assert!(threshold.is_finite(), "threshold not finite: {}", threshold);
@@ -572,7 +576,7 @@ fn test_forest_oob_mask() {
 #[test]
 fn test_catboost_iota() {
 	let n = 8_usize;
-	let buf = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>()).unwrap();
 	gpu_iota(n, &buf).unwrap();
 	let mut out = vec![0_i32; n];
 	buf.download_i32(&mut out).unwrap();
@@ -588,9 +592,9 @@ fn test_catboost_random_permutation() {
 	let tmp_bytes = gpu_random_permutation_workspace_bytes(n);
 	let keys = GpuBuffer::alloc(n).unwrap();
 	let keys_out = GpuBuffer::alloc(n).unwrap();
-	let iota_scratch = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	let iota_scratch = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>()).unwrap();
 	let tmp = GpuBuffer::alloc_bytes(tmp_bytes).unwrap();
-	let buf = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	let buf = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>()).unwrap();
 	gpu_random_permutation(
 		&keys,
 		&keys_out,
@@ -652,13 +656,13 @@ fn test_catboost_ordered_target_stats() {
 		__ub
 	};
 	let cat_sum = {
-		let __zb = GpuBuffer::alloc_bytes(2 * std::mem::size_of::<f64>()).unwrap();
-		__zb.memset_zero(2 * std::mem::size_of::<f64>()).unwrap();
+		let __zb = GpuBuffer::alloc_bytes(2 * mem::size_of::<f64>()).unwrap();
+		__zb.memset_zero(2 * mem::size_of::<f64>()).unwrap();
 		__zb
 	};
 	let cat_cnt = {
-		let __zb = GpuBuffer::alloc_bytes(2 * std::mem::size_of::<f64>()).unwrap();
-		__zb.memset_zero(2 * std::mem::size_of::<f64>()).unwrap();
+		let __zb = GpuBuffer::alloc_bytes(2 * mem::size_of::<f64>()).unwrap();
+		__zb.memset_zero(2 * mem::size_of::<f64>()).unwrap();
 		__zb
 	};
 	let out = GpuBuffer::alloc(4).unwrap();
@@ -667,7 +671,7 @@ fn test_catboost_ordered_target_stats() {
 	)
 	.unwrap();
 	let mut result = [0.0_f64; 4];
-	unsafe { out.download_async(&mut result, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	let expected = [0.0_f64, 0.0, 5.0, 10.0];

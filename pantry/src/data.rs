@@ -4,17 +4,26 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
+use std::borrow::Cow;
+use std::cmp;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 const NLB: u8 = 10;
 
 pub fn sniff_delimiter(path: &Path) -> u8 {
 	use std::io::BufRead;
-	let Ok(f) = std::fs::File::open(path) else {
+	let Ok(f) = fs::File::open(path) else {
 		return b',';
 	};
-	let mut rdr = std::io::BufReader::new(f);
+	let mut rdr = io::BufReader::new(f);
 	let mut line = Vec::new();
 	loop {
 		line.clear();
@@ -40,10 +49,10 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 			return b' ';
 		}
 		return match semis.cmp(&commas) {
-			std::cmp::Ordering::Greater => b';',
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => match tabs.cmp(&commas) {
-				std::cmp::Ordering::Greater => b'\t',
-				std::cmp::Ordering::Less | std::cmp::Ordering::Equal => b',',
+			cmp::Ordering::Greater => b';',
+			cmp::Ordering::Less | cmp::Ordering::Equal => match tabs.cmp(&commas) {
+				cmp::Ordering::Greater => b'\t',
+				cmp::Ordering::Less | cmp::Ordering::Equal => b',',
 			},
 		};
 	}
@@ -59,7 +68,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let Some(()) = Some(()).filter(|_u| delim != b' ') else {
 		return read_raw_whitespace(path);
 	};
-	let disk = std::fs::metadata(path)
+	let disk = fs::metadata(path)
 		.map(|m| m.len() as usize)
 		.unwrap_or(0);
 	// Read EVERY line as a record (no implicit header) so the first row can be
@@ -104,7 +113,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		FirstRow::Header => first_cells.clone(),
 	};
 
-	let overhead = std::mem::size_of::<String>();
+	let overhead = mem::size_of::<String>();
 	let physical = count_lines(path)?;
 	let est_rows = match first_row {
 		FirstRow::Data => physical,
@@ -141,7 +150,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		for j in 0..w {
 			let cell = record
 				.get(j)
-				.map_or(std::borrow::Cow::Borrowed(""), String::from_utf8_lossy);
+				.map_or(Cow::Borrowed(""), String::from_utf8_lossy);
 			row.push(na(cell.as_ref()));
 		}
 		rows.push(row);
@@ -156,12 +165,12 @@ pub struct RawCsv {
 
 fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	use std::io::BufRead;
-	let disk = std::fs::metadata(path)
+	let disk = fs::metadata(path)
 		.map(|m| m.len() as usize)
 		.unwrap_or(0);
-	let f = std::fs::File::open(path)
+	let f = fs::File::open(path)
 		.with_context(|| format!("failed to open {}", path.display()))?;
-	let rdr = std::io::BufReader::with_capacity(1 << 20, f);
+	let rdr = io::BufReader::with_capacity(1 << 20, f);
 	let mut lines = rdr.lines();
 	let first = loop {
 		let Some(l) = lines.next() else {
@@ -180,7 +189,7 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let w = first_cells.len();
 	let headers: Vec<String> = (0..w).map(|j| format!("col_{j}")).collect();
 
-	let overhead = std::mem::size_of::<String>();
+	let overhead = mem::size_of::<String>();
 	let est_rows = count_lines(path)?;
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
@@ -227,23 +236,23 @@ pub fn human_bytes(b: usize) -> String {
 	let gb = K * K * K;
 	let mb = K * K;
 	match f.partial_cmp(&gb) {
-		Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+		Some(cmp::Ordering::Greater | cmp::Ordering::Equal) => {
 			format!("{:.2} GB", f / gb)
 		}
-		Some(std::cmp::Ordering::Less) | None => match f.partial_cmp(&mb) {
-			Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => {
+		Some(cmp::Ordering::Less) | None => match f.partial_cmp(&mb) {
+			Some(cmp::Ordering::Greater | cmp::Ordering::Equal) => {
 				format!("{:.1} MB", f / mb)
 			}
-			Some(std::cmp::Ordering::Less) | None => format!("{:.1} KB", f / K),
+			Some(cmp::Ordering::Less) | None => format!("{:.1} KB", f / K),
 		},
 	}
 }
 
 fn count_lines(path: &Path) -> Result<usize> {
 	use std::io::Read;
-	let f = std::fs::File::open(path)
+	let f = fs::File::open(path)
 		.with_context(|| format!("failed to open {}", path.display()))?;
-	let mut rdr = std::io::BufReader::with_capacity(1 << 20, f);
+	let mut rdr = io::BufReader::with_capacity(1 << 20, f);
 	let mut buf = [0u8; 1 << 16];
 	let mut lines = 0usize;
 	loop {
@@ -263,7 +272,7 @@ struct GroupHash {
 	hash: String,
 }
 
-fn group_and_hash(p: &Path, prefixes: &std::collections::HashSet<String>) -> GroupHash {
+fn group_and_hash(p: &Path, prefixes: &HashSet<String>) -> GroupHash {
 	let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
 	if let Some(idx) = name.find("__") {
 		let h = &name[..idx];
@@ -317,7 +326,7 @@ enum FileClass {
 
 struct HashedPath {
 	hash: String,
-	path: std::path::PathBuf,
+	path: PathBuf,
 }
 
 struct ParsedTable {
@@ -335,7 +344,7 @@ fn is_junk_name(name: &str) -> Option<()> {
 	Some(()).filter(|_u| name.starts_with('.') || name == "__MACOSX")
 }
 
-fn walk_data_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+fn walk_data_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 	for entry in fs::read_dir(dir)
 		.with_context(|| format!("failed to read directory: {}", dir.display()))?
 	{
@@ -363,12 +372,12 @@ fn walk_data_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> 
 }
 
 pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
-	let mut files: Vec<std::path::PathBuf> = Vec::new();
+	let mut files: Vec<PathBuf> = Vec::new();
 	walk_data_files(Path::new(dir), &mut files)?;
 	files.sort();
 	anyhow::ensure!(!files.is_empty(), "no files in {dir}");
 
-	let prefixes: std::collections::HashSet<String> = files
+	let prefixes: HashSet<String> = files
 		.iter()
 		.filter_map(|p| {
 			let name = p.file_name().and_then(|s| s.to_str())?;
@@ -377,10 +386,10 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		})
 		.collect();
 
-	let mut tables: std::collections::BTreeMap<String, Vec<HashedPath>> =
-		std::collections::BTreeMap::new();
-	let mut images: std::collections::BTreeMap<String, Vec<HashedPath>> =
-		std::collections::BTreeMap::new();
+	let mut tables: BTreeMap<String, Vec<HashedPath>> =
+		BTreeMap::new();
+	let mut images: BTreeMap<String, Vec<HashedPath>> =
+		BTreeMap::new();
 	for p in files {
 		let gh = group_and_hash(&p, &prefixes);
 		match classify_file(&p) {
@@ -415,8 +424,8 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			})
 			.collect();
 		let mut headers: Vec<String> = Vec::new();
-		let mut col: std::collections::HashMap<String, usize> =
-			std::collections::HashMap::new();
+		let mut col: HashMap<String, usize> =
+			HashMap::new();
 		for pt in &parsed {
 			for hd in &pt.headers {
 				let None = col.get(hd) else {
@@ -467,8 +476,8 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			.map_err(|e| Errored::new(format!("progress template: {e}")))?
 			.progress_chars("=>-"),
 	);
-	pb.enable_steady_tick(std::time::Duration::from_millis(120));
-	let leaf = std::path::Path::new(dir)
+	pb.enable_steady_tick(Duration::from_millis(120));
+	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())
 		.unwrap_or(dir);
@@ -476,12 +485,12 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 	// A directory of image files is ONE vector, indexed by filename (stem) — the
 	// join key a CSV column of filenames matches against. (Previously each unique
 	// stem became its own single-image group, so nothing could join.)
-	let leaf = std::path::Path::new(dir)
+	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())
 		.unwrap_or("images")
 		.to_string();
-	let all: Vec<std::path::PathBuf> = images.into_values().flatten().map(|hp| hp.path).collect();
+	let all: Vec<PathBuf> = images.into_values().flatten().map(|hp| hp.path).collect();
 	// The images' own native resolution sets the matrix width — no picked resize target.
 	let first_img = image::open(&all[0])
 		.with_context(|| format!("failed to read image dimensions: {}", all[0].display()))?;
@@ -524,29 +533,29 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 	Ok(groups)
 }
 
-static ZIP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ZIP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
-	let n = ZIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let tmp = std::env::temp_dir().join(format!("nrecipe_zip_{}_{}", std::process::id(), n));
+	let n = ZIP_COUNT.fetch_add(1, Ordering::Relaxed);
+	let tmp = env::temp_dir().join(format!("nrecipe_zip_{}_{}", process::id(), n));
 	fs::create_dir_all(&tmp)
 		.with_context(|| format!("failed to create temp dir {}", tmp.display()))?;
 
 	struct TempDir {
-		path: std::path::PathBuf,
+		path: PathBuf,
 	}
 	impl Drop for TempDir {
 		fn drop(&mut self) {
-			std::fs::remove_dir_all(&self.path).ok();
+			fs::remove_dir_all(&self.path).ok();
 		}
 	}
 	let guard = TempDir { path: tmp.clone() };
 
 	extract_zip_file(Path::new(path), &tmp)?;
 	loop {
-		let mut files: Vec<std::path::PathBuf> = Vec::new();
+		let mut files: Vec<PathBuf> = Vec::new();
 		walk_data_files(&tmp, &mut files)?;
-		let inner: Vec<std::path::PathBuf> = files
+		let inner: Vec<PathBuf> = files
 			.into_iter()
 			.filter(|p| {
 				p.extension()
@@ -598,7 +607,7 @@ fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 		}
 		let mut w = fs::File::create(&out)
 			.with_context(|| format!("failed to create {}", out.display()))?;
-		std::io::copy(&mut entry, &mut w)
+		io::copy(&mut entry, &mut w)
 			.with_context(|| format!("failed to extract {}", out.display()))?;
 	}
 	Ok(())
@@ -607,7 +616,7 @@ fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 // ── file → columns: all source parsing (csv / arff / dir / zip / sqlite) ─────
 
 pub fn load_groups(path: &str) -> Vec<DirGroup> {
-	let p = std::path::Path::new(path);
+	let p = Path::new(path);
 	let ext = p
 		.extension()
 		.and_then(|e| e.to_str())
@@ -616,19 +625,19 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 	if ext_ref == Some("zip") {
 		return load_zip_groups(path).unwrap_or_else(|e| {
 			drop(Write::err(format!("load zip: {e}")));
-			std::process::abort();
+			process::abort();
 		});
 	}
 	if matches!(ext_ref, Some("db" | "sqlite")) {
 		return load_sqlite_groups(path).unwrap_or_else(|e| {
 			drop(Write::err(format!("load sqlite: {e}")));
-			std::process::abort();
+			process::abort();
 		});
 	}
 	if p.is_dir() {
 		return load_dir_groups(path).unwrap_or_else(|e| {
 			drop(Write::err(format!("load dir: {e}")));
-			std::process::abort();
+			process::abort();
 		});
 	}
 	let RawCsv {
@@ -636,7 +645,7 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 		rows: cells,
 	} = read_raw_csv(p).unwrap_or_else(|e| {
 		drop(Write::err(format!("read csv: {e}")));
-		std::process::abort();
+		process::abort();
 	});
 	let hashes = vec![String::new(); cells.len()];
 	vec![DirGroup::Table {
@@ -690,7 +699,7 @@ fn parse_attribute(line: &str) -> Attr {
 		Some(r) => {
 			let Some(end) = r.find('\'') else {
 				drop(Write::err("attribute: unterminated quoted name"));
-				std::process::abort();
+				process::abort();
 			};
 			NameSpec {
 				name: r[..end].to_string(),
@@ -700,7 +709,7 @@ fn parse_attribute(line: &str) -> Attr {
 		None => {
 			let Some(end) = rest.find(char::is_whitespace) else {
 				drop(Write::err("attribute: missing type"));
-				std::process::abort();
+				process::abort();
 			};
 			NameSpec {
 				name: rest[..end].to_string(),
@@ -728,20 +737,20 @@ enum Section {
 }
 
 pub fn parse_arff(path: &str) -> ArffTable {
-	let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-		if e.kind() == std::io::ErrorKind::NotFound {
-			let cwd = std::env::current_dir()
+	let text = fs::read_to_string(path).unwrap_or_else(|e| {
+		if e.kind() == io::ErrorKind::NotFound {
+			let cwd = env::current_dir()
 				.map(|p| p.display().to_string())
 				.unwrap_or_else(|_e| ".".to_string());
-			let name = std::path::Path::new(path)
+			let name = Path::new(path)
 				.file_name()
 				.and_then(|s| s.to_str())
 				.unwrap_or(path);
 			drop(Write::err(format!("couldn't find '{name}' in {cwd}")));
-			std::process::abort();
+			process::abort();
 		}
 		drop(Write::err(format!("Data: cannot read {path}: {e}")));
-		std::process::abort();
+		process::abort();
 	});
 	let mut attrs = Vec::new();
 	let mut rows = Vec::new();
@@ -773,11 +782,11 @@ pub fn parse_arff(path: &str) -> ArffTable {
 	}
 	if attrs.is_empty() {
 		drop(Write::err(format!("Data: no @attribute lines in {path}")));
-		std::process::abort();
+		process::abort();
 	}
 	if rows.is_empty() {
 		drop(Write::err(format!("Data: no @data rows in {path}")));
-		std::process::abort();
+		process::abort();
 	}
 	ArffTable { attrs, rows }
 }
@@ -792,7 +801,7 @@ pub fn load_sqlite_groups(path: &str) -> Result<Vec<DirGroup>> {
 }
 
 pub(crate) fn short_path(p: &str) -> String {
-	let Ok(home) = std::env::var("HOME") else {
+	let Ok(home) = env::var("HOME") else {
 		return p.to_string();
 	};
 	match p.strip_prefix(&home) {
@@ -822,8 +831,8 @@ fn classify_file(path: &Path) -> FileClass {
 	}
 }
 
-fn collect_image_paths(dir: &str) -> Result<Vec<std::path::PathBuf>> {
-	let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)
+fn collect_image_paths(dir: &str) -> Result<Vec<PathBuf>> {
+	let mut paths: Vec<PathBuf> = fs::read_dir(dir)
 		.with_context(|| format!("failed to read directory: {dir}"))?
 		.filter_map(|entry| entry.ok())
 		.map(|e| e.path())
@@ -869,7 +878,7 @@ pub struct LabeledImages {
 }
 
 pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<LabeledImages> {
-	let mut subdirs: Vec<std::path::PathBuf> = fs::read_dir(dir)
+	let mut subdirs: Vec<PathBuf> = fs::read_dir(dir)
 		.with_context(|| format!("failed to read directory: {dir}"))?
 		.filter_map(|entry| entry.ok())
 		.map(|e| e.path())
@@ -883,7 +892,7 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 		.map(|p| {
 			let Some(fname) = p.file_name() else {
 				drop(Write::err("subdir path has no filename component"));
-				std::process::abort();
+				process::abort();
 			};
 			fname.to_string_lossy().into_owned()
 		})
@@ -898,7 +907,7 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 					drop(Write::err(format!(
 						"subdir name failed f64 parse after all_float check: {e}"
 					)));
-					std::process::abort();
+					process::abort();
 				})
 			})
 			.collect(),

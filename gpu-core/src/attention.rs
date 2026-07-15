@@ -1,6 +1,7 @@
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 fn check_launch() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
@@ -168,7 +169,7 @@ pub fn gpu_scaled_dot_product_attention(
 			seq as i32,
 			dim as i32,
 			causal as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -176,7 +177,7 @@ pub fn gpu_scaled_dot_product_attention(
 
 pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_causal_softmax_rows(x.ptr_raw(), rows as i32, cols as i32, std::ptr::null_mut());
+		launch_causal_softmax_rows(x.ptr_raw(), rows as i32, cols as i32, ptr::null_mut());
 	}
 	check_launch()
 }
@@ -195,7 +196,7 @@ pub fn gpu_mha_split(
 			seq as i32,
 			n_heads as i32,
 			head_dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -215,7 +216,7 @@ pub fn gpu_mha_merge(
 			seq as i32,
 			n_heads as i32,
 			head_dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -235,7 +236,7 @@ pub fn gpu_rope(
 			seq as i32,
 			dim as i32,
 			base.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -243,7 +244,7 @@ pub fn gpu_rope(
 
 pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_positional_encoding(out.ptr_raw(), seq as i32, dim as i32, std::ptr::null_mut());
+		launch_positional_encoding(out.ptr_raw(), seq as i32, dim as i32, ptr::null_mut());
 	}
 	check_launch()
 }
@@ -264,7 +265,7 @@ pub fn gpu_rmsnorm(
 			rows as i32,
 			cols as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -290,7 +291,7 @@ pub fn gpu_rmsnorm_backward(
 			rows as i32,
 			cols as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -331,7 +332,7 @@ pub fn gpu_im2col_2d_ext(
 			dil_w as i32,
 			dims.h as i32,
 			dims.w as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -372,7 +373,7 @@ pub fn gpu_col2im_2d_ext(
 			dil_w as i32,
 			dims.h as i32,
 			dims.w as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -394,7 +395,7 @@ pub fn gpu_embedding_backward(
 			n as i32,
 			cols as i32,
 			vocab as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -416,7 +417,7 @@ pub fn gpu_bn_update_running(
 			save_var.ptr_raw() as *const c_void,
 			momentum.ptr_raw() as *const c_void,
 			c as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()

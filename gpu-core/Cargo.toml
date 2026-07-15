@@ -16,3 +16,6 @@ cc = { version = "1.2", features = ["parallel"] }
 serde_json = "1"
 libm = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -1,3 +1,4 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 // Determinism probe: every GPU op the diffusion forward composes, run twice on
 // identical inputs, bit-compared. A DIVERGED op is the source of the observed
 // run-to-run output variance (atomic f64 accumulation or a stream race).
@@ -13,8 +14,11 @@ use gpu_core::infer_ops::{
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::memory::GpuBuffer;
+use std::fmt;
+use std::ptr;
+use std::time::Instant;
 
-fn say(t: impl std::fmt::Display) {
+fn say(t: impl fmt::Display) {
 	set_opt(Opt { probe: true, ..opt() });
 	Write::block(probe, ogdl!(&t));
 }
@@ -100,7 +104,7 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	let out_c = GpuBuffer::alloc(m * n).context("out_c")?;
 	gpu_gemm_bt_f64(&a, &b, m, n, k, &out_c).context("gemm_bt_f64")?;
 	let mut gc = vec![0.0f64; m * n];
-	unsafe { out_c.download_async(&mut gc, std::ptr::null_mut()) }.context("dl gc")?;
+	unsafe { out_c.download_async(&mut gc, ptr::null_mut()) }.context("dl gc")?;
 	gpu_core::hip::device_synchronize().context("dl gc")?;
 	let err_cpu = gc
 		.iter()
@@ -111,7 +115,7 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	let out_r = GpuBuffer::alloc(m * n).context("out_r")?;
 	gpu_gemm_bt_into(&a, &b, m, n, k, &out_r).context("rocblas gemm")?;
 	let mut gr = vec![0.0f64; m * n];
-	unsafe { out_r.download_async(&mut gr, std::ptr::null_mut()) }.context("dl gr")?;
+	unsafe { out_r.download_async(&mut gr, ptr::null_mut()) }.context("dl gr")?;
 	gpu_core::hip::device_synchronize().context("dl gr")?;
 	let err_roc = gc
 		.iter()
@@ -150,14 +154,14 @@ fn bench_shape(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> 
 	const ITERS: usize = 50;
 
 	gpu_core::hip::device_synchronize().context("sync0")?;
-	let t0 = std::time::Instant::now();
+	let t0 = Instant::now();
 	for _ in 0..ITERS {
 		gpu_gemm_bt_into(&a, &b, m, n, k, &out).context("rocblas")?;
 	}
 	gpu_core::hip::device_synchronize().context("sync1")?;
 	let roc_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
 
-	let t1 = std::time::Instant::now();
+	let t1 = Instant::now();
 	for _ in 0..ITERS {
 		gpu_gemm_bt_f64(&a, &b, m, n, k, &out).context("gemm_bt_f64")?;
 	}
@@ -184,10 +188,10 @@ fn twice(
 	let mut r1 = vec![0.0f64; n_out];
 	let mut r2 = vec![0.0f64; n_out];
 	f(&out)?;
-	unsafe { out.download_async(&mut r1, std::ptr::null_mut()) }.context("dl1")?;
+	unsafe { out.download_async(&mut r1, ptr::null_mut()) }.context("dl1")?;
 	gpu_core::hip::device_synchronize().context("dl1")?;
 	f(&out)?;
-	unsafe { out.download_async(&mut r2, std::ptr::null_mut()) }.context("dl2")?;
+	unsafe { out.download_async(&mut r2, ptr::null_mut()) }.context("dl2")?;
 	gpu_core::hip::device_synchronize().context("dl2")?;
 	cmp(name, &r1, &r2);
 	Ok(())
@@ -282,11 +286,11 @@ fn main() -> anyhow::Result<()> {
 		let mut b = vec![0.0f64; T * 16 * hd];
 		q.load(&q0).context("reload q")?;
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).context("rope q")?;
-		unsafe { q.download_async(&mut a, std::ptr::null_mut()) }.context("dl")?;
+		unsafe { q.download_async(&mut a, ptr::null_mut()) }.context("dl")?;
 		gpu_core::hip::device_synchronize().context("dl")?;
 		q.load(&q0).context("reload q")?;
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).context("rope q")?;
-		unsafe { q.download_async(&mut b, std::ptr::null_mut()) }.context("dl")?;
+		unsafe { q.download_async(&mut b, ptr::null_mut()) }.context("dl")?;
 		gpu_core::hip::device_synchronize().context("dl")?;
 		cmp(&format!("rope {label}"), &a, &b);
 	}
@@ -336,11 +340,11 @@ fn main() -> anyhow::Result<()> {
 	let x0 = host(T * NE, 43);
 	x.load(&x0).context("reload")?;
 	gpu_scale_inplace(&scale, T * NE, &x).context("scale")?;
-	unsafe { x.download_async(&mut s1, std::ptr::null_mut()) }.context("dl")?;
+	unsafe { x.download_async(&mut s1, ptr::null_mut()) }.context("dl")?;
 	gpu_core::hip::device_synchronize().context("dl")?;
 	x.load(&x0).context("reload")?;
 	gpu_scale_inplace(&scale, T * NE, &x).context("scale")?;
-	unsafe { x.download_async(&mut s2, std::ptr::null_mut()) }.context("dl")?;
+	unsafe { x.download_async(&mut s2, ptr::null_mut()) }.context("dl")?;
 	gpu_core::hip::device_synchronize().context("dl")?;
 	cmp("scale_inplace", &s1, &s2);
 
@@ -349,11 +353,11 @@ fn main() -> anyhow::Result<()> {
 	let mut sf2 = vec![0.0f64; T * NE];
 	x.load(&x0).context("reload")?;
 	gpu_scale_f64_inplace(&scale, T * NE, &x).context("scale_f64")?;
-	unsafe { x.download_async(&mut sf1, std::ptr::null_mut()) }.context("dl")?;
+	unsafe { x.download_async(&mut sf1, ptr::null_mut()) }.context("dl")?;
 	gpu_core::hip::device_synchronize().context("dl")?;
 	x.load(&x0).context("reload")?;
 	gpu_scale_f64_inplace(&scale, T * NE, &x).context("scale_f64")?;
-	unsafe { x.download_async(&mut sf2, std::ptr::null_mut()) }.context("dl")?;
+	unsafe { x.download_async(&mut sf2, ptr::null_mut()) }.context("dl")?;
 	gpu_core::hip::device_synchronize().context("dl")?;
 	cmp("scale_f64", &sf1, &sf2);
 	let err_scale = s1

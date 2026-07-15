@@ -25,8 +25,11 @@ use crate::common;
 // stay as backlog: not mapped, not proven, not failed.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_histogramx_histc(
@@ -57,8 +60,8 @@ fn gpu_histc(x: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<i32> {
 		__ub
 	};
 	let counts = {
-		let __zb = GpuBuffer::alloc_bytes(bins * std::mem::size_of::<i32>()).unwrap();
-		__zb.memset_zero(bins * std::mem::size_of::<i32>()).unwrap();
+		let __zb = GpuBuffer::alloc_bytes(bins * mem::size_of::<i32>()).unwrap();
+		__zb.memset_zero(bins * mem::size_of::<i32>()).unwrap();
 		__zb
 	};
 	unsafe {
@@ -69,7 +72,7 @@ fn gpu_histc(x: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<i32> {
 			lo,
 			hi,
 			bins as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -81,8 +84,8 @@ fn gpu_histc(x: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<i32> {
 fn gpu_bincount(labels: &[i32], out_len: usize) -> Vec<i32> {
 	let bl = GpuBuffer::upload_i32(labels).unwrap();
 	let counts = {
-		let __zb = GpuBuffer::alloc_bytes(out_len * std::mem::size_of::<i32>()).unwrap();
-		__zb.memset_zero(out_len * std::mem::size_of::<i32>())
+		let __zb = GpuBuffer::alloc_bytes(out_len * mem::size_of::<i32>()).unwrap();
+		__zb.memset_zero(out_len * mem::size_of::<i32>())
 			.unwrap();
 		__zb
 	};
@@ -92,7 +95,7 @@ fn gpu_bincount(labels: &[i32], out_len: usize) -> Vec<i32> {
 			counts.ptr_raw(),
 			labels.len() as i32,
 			out_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -184,11 +187,11 @@ fn canon(name: &str) -> String {
 fn load_histogram() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -264,7 +267,7 @@ fn prove_histogram() {
 	let histc_ok = prove_histc();
 	let bincount_ok = prove_bincount();
 
-	let mut op_ok: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	op_ok.insert("histc", histc_ok);
 	op_ok.insert("bincount", bincount_ok);
 

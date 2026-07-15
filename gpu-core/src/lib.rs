@@ -1,3 +1,4 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 #![allow(
 	clippy::too_many_arguments,
 	clippy::unnecessary_cast,

@@ -8,6 +8,7 @@
 
 use gpu_core::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_poolx_global_avg_pool(
@@ -57,7 +58,7 @@ const TOL: f64 = 1e-7;
 
 fn dl(b: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0; n];
-	unsafe { b.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { b.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
@@ -411,7 +412,7 @@ fn run_poolx_span(
 			rows as i32,
 			span as i32,
 			ch as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	dl(&o, rows * ch)
@@ -476,7 +477,7 @@ fn prove_lp_pool() {
 			span as i32,
 			ch as i32,
 			p,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	let got = dl(&o, rows * ch);
@@ -514,7 +515,7 @@ fn run_poolx_adaptive(
 			rows as i32,
 			in_len as i32,
 			out_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	dl(&o, rows * out_len)

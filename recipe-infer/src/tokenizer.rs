@@ -1,8 +1,9 @@
+use std::path::Path;
 use crate::gguf::Gguf;
 use anyhow::{Result, anyhow};
 pub use tokenizers::Tokenizer;
 
-pub fn from_file(path: &std::path::Path) -> Result<Tokenizer> {
+pub fn from_file(path: &Path) -> Result<Tokenizer> {
 	Tokenizer::from_file(path).map_err(|e| anyhow!("tokenizer {}: {e}", path.display()))
 }
 

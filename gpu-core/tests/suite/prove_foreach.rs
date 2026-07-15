@@ -16,6 +16,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	// unary x -> out
@@ -116,12 +118,12 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -145,12 +147,12 @@ fn run_b(f: LaunchB, a: &[f64], b: &[f64]) -> Vec<f64> {
 			bb.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			a.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -441,13 +443,13 @@ fn canon(name: &str) -> String {
 fn load_foreach() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {

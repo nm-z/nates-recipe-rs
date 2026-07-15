@@ -1,9 +1,10 @@
+use std::path::Path;
 use recipe_infer::dequant::{block_layout, nbytes_for};
 use recipe_infer::gguf::Gguf;
 
 #[test]
 fn open_gemma_vocab_and_validate_layout() {
-	let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+	let path = Path::new(env!("CARGO_MANIFEST_DIR"))
 		.join("..")
 		.join("datasets")
 		.join("gguf-test")

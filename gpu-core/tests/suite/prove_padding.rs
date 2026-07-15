@@ -24,6 +24,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_paddingx_constant1d(
@@ -209,21 +211,21 @@ fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	unsafe {
 		match mode {
 			"constant" => {
-				launch_paddingx_constant1d(xp, op, l, lpad, n, cval, std::ptr::null_mut())
+				launch_paddingx_constant1d(xp, op, l, lpad, n, cval, ptr::null_mut())
 			}
-			"reflect" => launch_paddingx_reflect1d(xp, op, l, lpad, n, std::ptr::null_mut()),
+			"reflect" => launch_paddingx_reflect1d(xp, op, l, lpad, n, ptr::null_mut()),
 			"replicate" => {
-				launch_paddingx_replicate1d(xp, op, l, lpad, n, std::ptr::null_mut())
+				launch_paddingx_replicate1d(xp, op, l, lpad, n, ptr::null_mut())
 			}
 			"circular" => {
-				launch_paddingx_circular1d(xp, op, l, lpad, n, std::ptr::null_mut())
+				launch_paddingx_circular1d(xp, op, l, lpad, n, ptr::null_mut())
 			}
 			_ => unreachable!(),
 		}
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; n as usize];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -263,7 +265,7 @@ fn gpu_2d(
 				ow,
 				n,
 				cval,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			),
 			"reflect" => launch_paddingx_reflect2d(
 				xp,
@@ -275,7 +277,7 @@ fn gpu_2d(
 				oh,
 				ow,
 				n,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			),
 			"replicate" => launch_paddingx_replicate2d(
 				xp,
@@ -287,7 +289,7 @@ fn gpu_2d(
 				oh,
 				ow,
 				n,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			),
 			"circular" => launch_paddingx_circular2d(
 				xp,
@@ -299,14 +301,14 @@ fn gpu_2d(
 				oh,
 				ow,
 				n,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			),
 			_ => unreachable!(),
 		}
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; n as usize];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -396,13 +398,13 @@ fn canon(name: &str) -> &'static str {
 fn load_padding() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {

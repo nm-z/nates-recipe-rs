@@ -1,5 +1,6 @@
 use gpu_core::linalg::gpu_bmm_into;
 use gpu_core::memory::GpuBuffer;
+use std::ptr;
 
 // CPU reference: per batch, C(m×n) = opA(A)·opB(B), all row-major contiguous.
 fn cpu_bmm(
@@ -88,7 +89,7 @@ fn run_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) {
 	)
 	.unwrap();
 	let mut got = vec![0.0f64; batch * m * n];
-	unsafe { cg.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { cg.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl");
 	let maxd = want
 		.iter()
@@ -153,7 +154,7 @@ fn bmm_per_head_offset() {
 		.unwrap();
 	}
 	let mut got = vec![0.0f64; heads * n * s * s];
-	unsafe { scores.download_async(&mut got, std::ptr::null_mut()) }.expect("dl");
+	unsafe { scores.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl");
 	// CPU ref
 	for h in 0..heads {

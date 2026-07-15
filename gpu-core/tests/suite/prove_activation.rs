@@ -17,6 +17,9 @@ use gpu_core::hip::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::f64::consts;
+use std::fs;
+use std::ptr;
 
 // ── new activationx_ launchers ──────────────────────────────────────────────
 unsafe extern "C" {
@@ -86,12 +89,12 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -108,7 +111,7 @@ fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -278,7 +281,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	km!(
 		"gelu",
 		gpu_gelu_exact,
-		|x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+		|x| 0.5 * x * (1.0 + libm::erf(x * consts::FRAC_1_SQRT_2)),
 		-3.0,
 		3.0
 	);
@@ -331,7 +334,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	ax!(
 		"shifted_softplus",
 		launch_activationx_shifted_softplus,
-		|x: f64| (x.max(0.0) + (-x.abs()).exp().ln_1p()) - std::f64::consts::LN_2,
+		|x: f64| (x.max(0.0) + (-x.abs()).exp().ln_1p()) - consts::LN_2,
 		-3.0,
 		3.0
 	);
@@ -356,12 +359,12 @@ fn check_squareplus() -> Option<String> {
 			o.ptr_raw(),
 			xs.len() as i32,
 			b,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for (x, g) in xs.iter().zip(&got) {
 		let want = 0.5 * (x + (x * x + b).sqrt());
@@ -389,12 +392,12 @@ fn check_star_relu() -> Option<String> {
 			xs.len() as i32,
 			sc,
 			b,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for (x, g) in xs.iter().zip(&got) {
 		let r = x.max(0.0);
@@ -432,12 +435,12 @@ fn check_prelu() -> Option<String> {
 			ba.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			xs.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; xs.len()];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for ((x, a), g) in xs.iter().zip(&alpha).zip(&got) {
 		let want = if *x > 0.0 { *x } else { a * x };
@@ -464,12 +467,12 @@ fn check_glu() -> Option<String> {
 			bx.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			half as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; half];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for i in 0..half {
 		let (a, b) = (x[i], x[i + half]);
@@ -497,12 +500,12 @@ fn check_reglu() -> Option<String> {
 			bx.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			half as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; half];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for i in 0..half {
 		let (a, b) = (x[i], x[i + half]);
@@ -529,12 +532,12 @@ fn check_crelu() -> Option<String> {
 			bx.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; 2 * n];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for (i, x) in xs.iter().enumerate() {
 		let want_pos = x.max(0.0);
@@ -573,12 +576,12 @@ fn check_softmin() -> Option<String> {
 			o.ptr_raw(),
 			rows as i32,
 			cols as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut got = vec![0.0; rows * cols];
-	unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	for r in 0..rows {
 		let row = &x[r * cols..(r + 1) * cols];
@@ -696,13 +699,13 @@ fn canon(name: &str) -> String {
 fn load_activation() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -770,12 +773,12 @@ fn prove_activation() {
 		let sm = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_softmax_rows_into(&bx, rows, cols, &sm).unwrap();
 		let mut gsm = vec![0.0; rows * cols];
-		unsafe { sm.download_async(&mut gsm, std::ptr::null_mut()) }.unwrap();
+		unsafe { sm.download_async(&mut gsm, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let lsm = GpuBuffer::alloc(rows * cols).unwrap();
 		gpu_log_softmax_rows(&bx, rows, cols, &lsm).unwrap();
 		let mut glsm = vec![0.0; rows * cols];
-		unsafe { lsm.download_async(&mut glsm, std::ptr::null_mut()) }.unwrap();
+		unsafe { lsm.download_async(&mut glsm, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 
 		let mut sm_ok = true;
@@ -826,7 +829,7 @@ fn prove_activation() {
 		let o = GpuBuffer::alloc(xs.len()).unwrap();
 		gpu_leaky_relu_into(&bx, &ba, xs.len(), &o).unwrap();
 		let mut got = vec![0.0; xs.len()];
-		unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+		unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let ok = xs
 			.iter()
@@ -858,19 +861,19 @@ fn prove_activation() {
 		let sw = GpuBuffer::alloc(a.len()).unwrap();
 		gpu_swiglu(&ba, &bb, a.len(), &sw).unwrap();
 		let mut gsw = vec![0.0; a.len()];
-		unsafe { sw.download_async(&mut gsw, std::ptr::null_mut()) }.unwrap();
+		unsafe { sw.download_async(&mut gsw, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let ge = GpuBuffer::alloc(a.len()).unwrap();
 		gpu_geglu(&ba, &bb, a.len(), &ge).unwrap();
 		let mut gge = vec![0.0; a.len()];
-		unsafe { ge.download_async(&mut gge, std::ptr::null_mut()) }.unwrap();
+		unsafe { ge.download_async(&mut gge, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let mut sw_ok = true;
 		let mut ge_ok = true;
 		for i in 0..a.len() {
 			let w_sw = a[i] * (b[i] / (1.0 + (-b[i]).exp()));
 			let w_ge = a[i]
-				* (0.5 * b[i] * (1.0 + libm::erf(b[i] * std::f64::consts::FRAC_1_SQRT_2)));
+				* (0.5 * b[i] * (1.0 + libm::erf(b[i] * consts::FRAC_1_SQRT_2)));
 			if !approx(gsw[i], w_sw) {
 				sw_ok = false;
 			}

@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_momentum_update(
@@ -106,7 +107,7 @@ pub fn gpu_momentum_update(
 			lr.ptr_raw() as *const c_void,
 			momentum.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -131,7 +132,7 @@ pub fn gpu_rmsprop_update(
 			decay.ptr_raw() as *const c_void,
 			eps.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -154,7 +155,7 @@ pub fn gpu_adagrad_update(
 			lr.ptr_raw() as *const c_void,
 			eps.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -193,7 +194,7 @@ pub fn gpu_lamb_phase1(
 			tmp_upd.ptr_raw(),
 			w_norm_sq.ptr_raw(),
 			u_norm_sq.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -216,7 +217,7 @@ pub fn gpu_lamb_phase2(
 			w_norm_sq.ptr_raw() as *const c_void,
 			u_norm_sq.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -243,7 +244,7 @@ pub fn gpu_lion_update(
 			b2.ptr_raw() as *const c_void,
 			wd.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -274,7 +275,7 @@ pub fn gpu_nadam_update(
 			eps.ptr_raw() as *const c_void,
 			t as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -293,7 +294,7 @@ pub fn gpu_clip_value(
 			lo.ptr_raw() as *const c_void,
 			hi.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

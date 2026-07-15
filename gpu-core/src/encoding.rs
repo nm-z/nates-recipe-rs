@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_bin_edges_uniform(
@@ -105,7 +106,7 @@ pub fn gpu_bin_edges_uniform(
 			rows as i32,
 			cols as i32,
 			n_bins as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -128,7 +129,7 @@ pub fn gpu_bin_edges_quantile(
 			rows as i32,
 			cols as i32,
 			n_bins as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -151,7 +152,7 @@ pub fn gpu_quantize_features(
 			rows as i32,
 			cols as i32,
 			n_bins as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -170,7 +171,7 @@ pub fn gpu_one_hot(
 			out.ptr_raw(),
 			n as i32,
 			n_classes as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -182,7 +183,7 @@ pub fn gpu_count_distinct_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 		count_distinct_workspace_bytes(
 			x.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		)
 	}
 }
@@ -204,7 +205,7 @@ pub fn gpu_count_distinct(
 			temp.ptr_raw(),
 			temp.len(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -213,7 +214,7 @@ pub fn gpu_count_distinct(
 
 pub fn gpu_run_length_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	unsafe {
-		run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, std::ptr::null_mut())
+		run_length_workspace_bytes(x.ptr_raw() as *const c_void, n as i32, ptr::null_mut())
 	}
 }
 
@@ -234,7 +235,7 @@ pub fn gpu_run_length(
 			temp.ptr_raw(),
 			temp.len(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -257,7 +258,7 @@ pub fn gpu_pairwise_cosine(
 			nq as i32,
 			nt as i32,
 			dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -280,7 +281,7 @@ pub fn gpu_pairwise_l1(
 			nq as i32,
 			nt as i32,
 			dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -303,7 +304,7 @@ pub fn gpu_pairwise_hamming(
 			nq as i32,
 			nt as i32,
 			dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

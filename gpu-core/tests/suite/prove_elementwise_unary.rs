@@ -10,6 +10,8 @@ use gpu_core::hip::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::f64::consts;
+use std::ptr;
 
 // ── FFI for the NEW tail-gap kernels (compiled from elementwise_unaryx.hip) ──
 unsafe extern "C" {
@@ -86,12 +88,12 @@ fn run_new(f: Launch, x: &[f64]) -> Vec<f64> {
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -107,7 +109,7 @@ fn run_existing(f: UnaryGpu, x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -236,7 +238,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!(
 		"gelu",
 		gpu_gelu_exact,
-		|x| 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
+		|x| 0.5 * x * (1.0 + libm::erf(x * consts::FRAC_1_SQRT_2)),
 		std_probe
 	);
 	e!(
@@ -381,7 +383,7 @@ fn registry() -> BTreeMap<&'static str, Op> {
 			if x == 0.0 {
 				1.0
 			} else {
-				let p = std::f64::consts::PI * x;
+				let p = consts::PI * x;
 				p.sin() / p
 			}
 		},

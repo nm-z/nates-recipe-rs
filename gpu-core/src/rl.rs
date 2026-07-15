@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_discounted_returns(
@@ -64,7 +65,7 @@ pub fn gpu_discounted_returns(
 			returns.ptr_raw(),
 			gamma.ptr_raw() as *const c_void,
 			t_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -87,7 +88,7 @@ pub fn gpu_gae(
 			gamma.ptr_raw() as *const c_void,
 			lam.ptr_raw() as *const c_void,
 			t_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -110,7 +111,7 @@ pub fn gpu_td_targets(
 			targets.ptr_raw(),
 			gamma.ptr_raw() as *const c_void,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -131,7 +132,7 @@ pub fn gpu_categorical_logprob(
 			logp.ptr_raw(),
 			n as i32,
 			n_actions as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -154,7 +155,7 @@ pub fn gpu_gaussian_logprob(
 			logp.ptr_raw(),
 			n as i32,
 			dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

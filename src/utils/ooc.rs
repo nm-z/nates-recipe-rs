@@ -4,12 +4,23 @@ use anyhow::Context;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{Activation, LayerKind, LayerParams, Loss, Scratch};
+use std::cell::Cell;
 use std::cell::RefCell;
+use std::cmp;
+use std::collections::VecDeque;
+use std::ffi::CString;
 use std::ffi::c_void;
+use std::fs;
 use std::fs::File;
+use std::mem;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 
 static DISK_R_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -66,7 +77,7 @@ fn pool_give(p: &HostPool, v: Vec<u8>) -> anyhow::Result<()> {
 }
 
 fn mem_available() -> usize {
-	std::fs::read_to_string("/proc/meminfo")
+	fs::read_to_string("/proc/meminfo")
 		.ok()
 		.and_then(|s| {
 			s.lines()
@@ -77,14 +88,14 @@ fn mem_available() -> usize {
 		.map_or(0, |kb| kb.saturating_mul(1024))
 }
 
-fn disk_free(path: &std::path::Path) -> usize {
-	let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+fn disk_free(path: &Path) -> usize {
+	let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else {
 		return 0;
 	};
-	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+	let mut st: libc::statvfs = unsafe { mem::zeroed() };
 	let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) }.cmp(&0) {
-		std::cmp::Ordering::Equal => Ok(()),
-		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Err(()),
+		cmp::Ordering::Equal => Ok(()),
+		cmp::Ordering::Less | cmp::Ordering::Greater => Err(()),
 	}) else {
 		return 0;
 	};
@@ -158,11 +169,11 @@ fn prelu_gate(act: &Activation) -> Option<()> {
 
 fn interrupted() -> Interrupt {
 	match crate::train::INTERRUPTED
-		.load(std::sync::atomic::Ordering::SeqCst)
+		.load(Ordering::SeqCst)
 		.cmp(&0)
 	{
-		std::cmp::Ordering::Equal => Interrupt::No,
-		std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Interrupt::Yes,
+		cmp::Ordering::Equal => Interrupt::No,
+		cmp::Ordering::Less | cmp::Ordering::Greater => Interrupt::Yes,
 	}
 }
 
@@ -185,7 +196,7 @@ fn open_spill() -> anyhow::Result<File> {
 		.context("spill dir")?
 		.join(".recipe_spill");
 	let f = recipe_infer::bridge::open_rw(&path).context("open spill file")?;
-	drop(std::fs::remove_file(&path));
+	drop(fs::remove_file(&path));
 	Ok(f)
 }
 
@@ -199,14 +210,14 @@ enum Home {
 struct Ahead {
 	s0: usize,
 	cnt: usize,
-	handle: std::thread::JoinHandle<anyhow::Result<Vec<u8>>>,
+	handle: thread::JoinHandle<anyhow::Result<Vec<u8>>>,
 }
 
 struct Paged {
 	homes: Vec<Home>,
 	spb: usize,
 	chunk: usize,
-	ahead: RefCell<std::collections::VecDeque<Ahead>>,
+	ahead: RefCell<VecDeque<Ahead>>,
 	net: Option<Arc<Vec<crate::wire::Conn>>>,
 }
 
@@ -214,7 +225,7 @@ impl Paged {
 	fn win(&self, s0: usize, cnt: usize) -> usize {
 		if !(s0.is_multiple_of(self.chunk) && cnt <= self.chunk) {
 			drop(Write::err("ooc access not window-aligned"));
-			std::process::abort();
+			process::abort();
 		}
 		s0 / self.chunk
 	}
@@ -282,7 +293,7 @@ impl Paged {
 						.try_clone()
 						.context("spill clone")?;
 					let hp = host.clone();
-					std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+					thread::spawn(move || -> anyhow::Result<Vec<u8>> {
 						let mut buf = pool_take(&hp)?;
 						f.read_exact_at(&mut buf[..len], off)
 							.context("ooc spill read-ahead")?;
@@ -307,7 +318,7 @@ impl Paged {
 							anyhow::anyhow!("remote home without net")
 						})?);
 					let hp = host.clone();
-					std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+					thread::spawn(move || -> anyhow::Result<Vec<u8>> {
 						let mut buf = pool_take(&hp)?;
 						let v = nt[node]
 							.fetch(id, 0, len as u64)
@@ -361,7 +372,7 @@ impl Paged {
 				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
 					Some(a) => match [a.s0, a.cnt].cmp(&[s0, cnt]) {
-						std::cmp::Ordering::Equal => a
+						cmp::Ordering::Equal => a
 							.handle
 							.join()
 							.map_err(|_e| anyhow::anyhow!("read-ahead thread"))??,
@@ -386,7 +397,7 @@ impl Paged {
 				let pre = self.ahead.borrow_mut().pop_front();
 				let bytes = match pre {
 					Some(a) => match [a.s0, a.cnt].cmp(&[s0, cnt]) {
-						std::cmp::Ordering::Equal => a
+						cmp::Ordering::Equal => a
 							.handle
 							.join()
 							.map_err(|_e| anyhow::anyhow!("read-ahead thread"))??,
@@ -461,8 +472,8 @@ struct WriteMsg {
 }
 
 struct Lane {
-	tx: Option<std::sync::mpsc::SyncSender<WriteMsg>>,
-	worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+	tx: Option<mpsc::SyncSender<WriteMsg>>,
+	worker: Option<thread::JoinHandle<anyhow::Result<()>>>,
 }
 
 fn make_chan(depth: usize) -> gpu_core::bridge::Chan<WriteMsg> {
@@ -471,11 +482,11 @@ fn make_chan(depth: usize) -> gpu_core::bridge::Chan<WriteMsg> {
 
 struct Writer {
 	lanes: Vec<Lane>,
-	next: std::cell::Cell<usize>,
+	next: Cell<usize>,
 	host: HostPool,
 	net: Option<Arc<Vec<crate::wire::Conn>>>,
 	pending: Arc<AtomicUsize>,
-	drained: std::cell::Cell<f64>,
+	drained: Cell<f64>,
 }
 
 const W_LANES: usize = 3;
@@ -498,7 +509,7 @@ fn spawn_lane(
 	let nt = net.clone();
 	let pend = pending.clone();
 	let chan = make_chan(WQ_DEPTH);
-	let worker = std::thread::spawn(move || -> anyhow::Result<()> {
+	let worker = thread::spawn(move || -> anyhow::Result<()> {
 		for msg in chan.rx {
 			let WriteMsg { dest, buf, len } = msg;
 			match dest {
@@ -543,11 +554,11 @@ impl Writer {
 			lanes: (0..W_LANES)
 				.map(|_lane| spawn_lane(spill, &host, &net, &pending))
 				.collect::<anyhow::Result<Vec<Lane>>>()?,
-			next: std::cell::Cell::new(0),
+			next: Cell::new(0),
 			host,
 			net,
 			pending,
-			drained: std::cell::Cell::new(0.0),
+			drained: Cell::new(0.0),
 		})
 	}
 	fn send(&self, dest: Dest, buf: Vec<u8>, len: usize) -> anyhow::Result<()> {
@@ -564,7 +575,7 @@ impl Writer {
 	}
 	fn barrier(&mut self, spill: Option<&File>) -> anyhow::Result<()> {
 		while self.pending.load(Ordering::Relaxed) > 0 {
-			let t = std::time::Instant::now();
+			let t = Instant::now();
 			for lane in &mut self.lanes {
 				drop(lane.tx.take());
 				lane.worker
@@ -658,7 +669,7 @@ pub struct Ooc {
 }
 
 struct SweepStart {
-	t: std::time::Instant,
+	t: Instant,
 	h2d: usize,
 	d2h: usize,
 	disk_r: usize,
@@ -681,7 +692,7 @@ struct Stream {
 fn sweep_start() -> SweepStart {
 	let x = xfer();
 	SweepStart {
-		t: std::time::Instant::now(),
+		t: Instant::now(),
 		h2d: x.h2d,
 		d2h: x.d2h,
 		disk_r: DISK_R_BYTES.load(Ordering::Relaxed),
@@ -733,8 +744,8 @@ impl Ooc {
 		const WINS: usize = 10;
 		let chunk = 1usize;
 		let conv_wg = match max_conv_fsz.cmp(&0) {
-			std::cmp::Ordering::Greater => chunk,
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+			cmp::Ordering::Greater => chunk,
+			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
 		};
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
@@ -764,10 +775,10 @@ impl Ooc {
 			));
 		}
 		ws = ws.max(match max_conv_fsz.cmp(&0) {
-			std::cmp::Ordering::Greater => {
+			cmp::Ordering::Greater => {
 				kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
 		});
 		let align256 = |b: usize| (b + 255) & !255;
 		WINS * align256(chunk * max_spb * 8)
@@ -830,8 +841,8 @@ impl Ooc {
 		let chunk = (win_budget / (((WINS + 2) * max_spb + max_conv_fsz) * 8)).clamp(1, n);
 		let wbytes = chunk * max_spb * 8;
 		let conv_wg = match max_conv_fsz.cmp(&0) {
-			std::cmp::Ordering::Greater => chunk,
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+			cmp::Ordering::Greater => chunk,
+			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
 		};
 		let seq_rows = attn.map_or(chunk, |p| chunk * (p.in_dim / p.dim));
 		let mut dwp = 1usize;
@@ -861,10 +872,10 @@ impl Ooc {
 			));
 		}
 		ws = ws.max(match max_conv_fsz.cmp(&0) {
-			std::cmp::Ordering::Greater => {
+			cmp::Ordering::Greater => {
 				kernels::gpu_reduce_sum_cols_workspace_bytes(conv_wg, max_conv_fsz)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 0,
+			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
 		});
 
 		let wins: Vec<GpuBuffer> = (0..WINS)
@@ -909,12 +920,12 @@ impl Ooc {
 		let mut net_used = vec![0usize; net_caps.len()];
 		let id_base: u64 = {
 			let host_s =
-				std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+				fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
 			let mut h = 0xcbf2_9ce4_8422_2325u64;
 			for b in host_s
 				.trim()
 				.bytes()
-				.chain(std::process::id().to_le_bytes())
+				.chain(process::id().to_le_bytes())
 			{
 				h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
 			}
@@ -943,18 +954,18 @@ impl Ooc {
 						nonvram += 1;
 						match ram_start.saturating_sub(ram_used + bytes).cmp(&ram_floor)
 						{
-							std::cmp::Ordering::Greater => {
+							cmp::Ordering::Greater => {
 								ram_used += bytes;
 								let mut v = vec![0u8; bytes];
 								gpu_core::memory::par_touch(&mut v);
 								Home::Ram(v)
 							}
-							std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+							cmp::Ordering::Less | cmp::Ordering::Equal => {
 								match (disk_cursor as usize + bytes)
 									.cmp(&disk_budget)
 								{
-									std::cmp::Ordering::Less
-									| std::cmp::Ordering::Equal => {
+									cmp::Ordering::Less
+									| cmp::Ordering::Equal => {
 										spill = Some(match spill.take() {
 											Some(existing) => existing,
 											None => open_spill()?,
@@ -963,7 +974,7 @@ impl Ooc {
 										disk_cursor += bytes as u64;
 										h
 									}
-									std::cmp::Ordering::Greater => {
+									cmp::Ordering::Greater => {
 										let node =
 											(0..net_caps.len()).find(|&nd| {
 												net_used[nd] + bytes
@@ -993,7 +1004,7 @@ impl Ooc {
 				homes,
 				spb,
 				chunk,
-				ahead: RefCell::new(std::collections::VecDeque::new()),
+				ahead: RefCell::new(VecDeque::new()),
 				net: net.clone(),
 			})
 		};
@@ -1009,8 +1020,8 @@ impl Ooc {
 			.map(|p| place(p.out_dim))
 			.collect::<anyhow::Result<Vec<Paged>>>()?;
 		let concat = place(match (ca + cc).cmp(&0) {
-			std::cmp::Ordering::Greater => ca + cc,
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => 1,
+			cmp::Ordering::Greater => ca + cc,
+			cmp::Ordering::Less | cmp::Ordering::Equal => 1,
 		})?;
 		let a_dctx = place(seq_spb)?;
 		let a_dq = place(seq_spb)?;
@@ -1047,7 +1058,7 @@ impl Ooc {
 		));
 		let writer = Writer::new(spill.as_ref(), host.clone(), net.clone())?;
 
-		let bps = |b: usize, t: std::time::Instant| b as f64 / t.elapsed().as_secs_f64();
+		let bps = |b: usize, t: Instant| b as f64 / t.elapsed().as_secs_f64();
 		let mut rate_h2d = 0.0;
 		let mut rate_d2h = 0.0;
 		let mut rate_disk_r = 0.0;
@@ -1055,39 +1066,39 @@ impl Ooc {
 		let mut rate_net_r = 0.0;
 		let mut rate_net_w = 0.0;
 		match nonvram.cmp(&0) {
-			std::cmp::Ordering::Greater => {
+			cmp::Ordering::Greater => {
 				gpu_core::hip::device_synchronize().context("ooc calibrate sync")?;
 				let mut buf = pool_take(&host)?;
-				let t = std::time::Instant::now();
+				let t = Instant::now();
 				wins[0].write_u8(&buf[..wbytes]).context("calibrate h2d")?;
 				rate_h2d = bps(wbytes, t);
-				let t = std::time::Instant::now();
+				let t = Instant::now();
 				wins[0]
 					.download_u8(&mut buf[..wbytes])
 					.context("calibrate d2h")?;
 				rate_d2h = bps(wbytes, t);
 				pool_give(&host, buf)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+			cmp::Ordering::Less | cmp::Ordering::Equal => Ok(()),
 		}?;
 		match disk_cursor.cmp(&0) {
-			std::cmp::Ordering::Greater => {
+			cmp::Ordering::Greater => {
 				let f = spill.as_ref().ok_or_else(|| {
 					anyhow::anyhow!("disk calibrate without spill file")
 				})?;
 				let mut buf = pool_take(&host)?;
-				let t = std::time::Instant::now();
+				let t = Instant::now();
 				f.write_all_at(&buf[..wbytes], 0)
 					.context("calibrate spill write")?;
 				drop_cache(f, 0, wbytes);
 				rate_disk_w = bps(wbytes, t);
-				let t = std::time::Instant::now();
+				let t = Instant::now();
 				f.read_exact_at(&mut buf[..wbytes], 0)
 					.context("calibrate spill read")?;
 				rate_disk_r = bps(wbytes, t);
 				pool_give(&host, buf)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+			cmp::Ordering::Less | cmp::Ordering::Equal => Ok(()),
 		}?;
 		for _net in net_used.iter().find(|u| **u > 0).into_iter() {
 			let ns = net
@@ -1095,11 +1106,11 @@ impl Ooc {
 				.ok_or_else(|| anyhow::anyhow!("net used without net"))?;
 			let cal_id = id_base | 0xffff_ffff;
 			let buf = pool_take(&host)?;
-			let t = std::time::Instant::now();
+			let t = Instant::now();
 			ns[0].store_from(cal_id, &buf[..wbytes])
 				.context("calibrate net write")?;
 			rate_net_w = bps(wbytes, t);
-			let t = std::time::Instant::now();
+			let t = Instant::now();
 			let v = ns[0]
 				.fetch(cal_id, 0, wbytes as u64)
 				.context("calibrate net read")?;
@@ -1428,13 +1439,13 @@ impl Ooc {
 							},
 						};
 						let out = match l.cmp(&last) {
-							std::cmp::Ordering::Equal => view(
+							cmp::Ordering::Equal => view(
 								&sc.acts[last],
 								s0 * p.out_dim * 8,
 								cnt * p.out_dim * 8,
 							),
-							std::cmp::Ordering::Less
-							| std::cmp::Ordering::Greater => self.acts[l].write_view(s0, cnt, &self.wins[1]),
+							cmp::Ordering::Less
+							| cmp::Ordering::Greater => self.acts[l].write_view(s0, cnt, &self.wins[1]),
 						};
 						match p.kind {
 							LayerKind::Conv => {
@@ -1451,15 +1462,15 @@ impl Ooc {
 							}
 							LayerKind::Dense | LayerKind::Embed | LayerKind::Attn => {
 								match p.out_dim.cmp(&1) {
-									std::cmp::Ordering::Equal => {
+									cmp::Ordering::Equal => {
 										kernels::gpu_matvec_bias_into(
 											&prev, &p.w, &p.b, cnt, p.in_dim,
 											&out,
 										)
 										.context("matvec")?
 									}
-									std::cmp::Ordering::Less
-									| std::cmp::Ordering::Greater => kernels::gpu_linear_into(
+									cmp::Ordering::Less
+									| cmp::Ordering::Greater => kernels::gpu_linear_into(
 										&prev, &p.w, &p.b, cnt, p.out_dim,
 										p.in_dim, &out,
 									)
@@ -1966,7 +1977,7 @@ impl Ooc {
 			+ (disk_w - s.disk_w)
 			+ (net_r - s.net_r)
 			+ (net_w - s.net_w);
-		let std::cmp::Ordering::Greater = streamed.cmp(&0) else {
+		let cmp::Ordering::Greater = streamed.cmp(&0) else {
 			return Ok(());
 		};
 		gpu_core::hip::device_synchronize().context("sweep sync")?;
@@ -2028,7 +2039,7 @@ impl Ooc {
 		let drain = self.writer.drained.take();
 		for _drained in drain
 			.partial_cmp(&0.0)
-			.filter(|ord| matches!(ord, std::cmp::Ordering::Greater))
+			.filter(|ord| matches!(ord, cmp::Ordering::Greater))
 			.into_iter()
 		{
 			line += &format!("  drain {drain:.1}s");
@@ -2130,10 +2141,10 @@ impl Ooc {
 			&self.host,
 		)?;
 		let act_l = match l.cmp(&last) {
-			std::cmp::Ordering::Equal => {
+			cmp::Ordering::Equal => {
 				view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8)
 			}
-			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => self.acts[l].read(
+			cmp::Ordering::Less | cmp::Ordering::Greater => self.acts[l].read(
 				s0,
 				cnt,
 				&self.wins[1],
@@ -2492,11 +2503,11 @@ impl Ooc {
 				};
 				kernels::gpu_add_inplace(&self.dw_tmp, d * d, acc).context("acc add")?;
 				match wi.cmp(&0) {
-					std::cmp::Ordering::Greater => {
+					cmp::Ordering::Greater => {
 						kernels::gpu_add_inplace(&dh_tmp, cnt * p.in_dim, &below)
 							.context("dh add")
 					}
-					std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(()),
+					cmp::Ordering::Less | cmp::Ordering::Equal => Ok(()),
 				}?;
 			}
 			below_pg.commit(s0, cnt, &below, &self.writer, &self.host)?;
@@ -2525,7 +2536,7 @@ impl Drop for Ooc {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
 		let Some(net) = self.net.clone() else {
 			return;

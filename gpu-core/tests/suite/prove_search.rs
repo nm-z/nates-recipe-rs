@@ -19,6 +19,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_searchx_searchsorted(
@@ -117,7 +119,7 @@ fn searchsorted_gpu(a: &[f64], v: &[f64], side: i32) -> Vec<i32> {
 			out.ptr_raw(),
 			v.len() as i32,
 			side,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -147,7 +149,7 @@ fn isin_gpu(a: &[f64], x: &[f64]) -> Vec<i32> {
 			bx.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -171,7 +173,7 @@ fn nonzero_gpu(x: &[f64]) -> Vec<i32> {
 			x.len() as i32,
 			out.ptr_raw(),
 			cnt.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -200,32 +202,32 @@ fn scalar_i32(x: &[f64], launch: impl Fn(*const c_void, i32, *mut c_void)) -> i3
 
 fn find_gpu(x: &[f64], target: f64) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_find(p, n, target, out, std::ptr::null_mut());
+		launch_searchx_find(p, n, target, out, ptr::null_mut());
 	})
 }
 fn find_n_gpu(x: &[f64], target: f64, k: i32) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_find_n(p, n, target, k, out, std::ptr::null_mut());
+		launch_searchx_find_n(p, n, target, k, out, ptr::null_mut());
 	})
 }
 fn is_sorted_gpu(x: &[f64]) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_is_sorted(p, n, out, std::ptr::null_mut());
+		launch_searchx_is_sorted(p, n, out, ptr::null_mut());
 	})
 }
 fn is_sorted_until_gpu(x: &[f64]) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_is_sorted_until(p, n, out, std::ptr::null_mut());
+		launch_searchx_is_sorted_until(p, n, out, ptr::null_mut());
 	})
 }
 fn partition_point_gpu(x: &[f64], pivot: f64) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_partition_point(p, n, pivot, out, std::ptr::null_mut());
+		launch_searchx_partition_point(p, n, pivot, out, ptr::null_mut());
 	})
 }
 fn argextreme_gpu(x: &[f64], mode: i32) -> i32 {
 	scalar_i32(x, |p, n, out| unsafe {
-		launch_searchx_argextreme(p, n, mode, out, std::ptr::null_mut());
+		launch_searchx_argextreme(p, n, mode, out, ptr::null_mut());
 	})
 }
 
@@ -249,7 +251,7 @@ fn mismatch_gpu(a: &[f64], b: &[f64]) -> i32 {
 			bb.ptr_raw() as *const c_void,
 			a.len() as i32,
 			out.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -271,7 +273,7 @@ fn minmax_element_gpu(x: &[f64]) -> (i32, i32) {
 			bx.ptr_raw() as *const c_void,
 			x.len() as i32,
 			out.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -294,7 +296,7 @@ fn argrel_gpu(x: &[f64], mode: i32) -> Vec<i32> {
 			x.len() as i32,
 			mode,
 			out.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -818,13 +820,13 @@ fn canon(name: &str) -> String {
 fn load_search() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {

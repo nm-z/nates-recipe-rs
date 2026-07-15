@@ -2,9 +2,20 @@ use gpu_core::log::{Opt, Write, probe, set_opt};
 use anyhow::{Result, anyhow, bail, ensure};
 use gpu_core::memory::{GpuBuffer, USER_GB, par_copy, par_touch};
 use std::cmp::Ordering;
+use std::env;
+use std::ffi::CString;
+use std::fs;
 use std::fs::File;
+use std::hint;
+use std::io::BufReader;
+use std::mem;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::ptr;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 const NL: char = '\u{a}';
@@ -30,8 +41,8 @@ pub struct Machine {
 	pub eth_gbs: f64,
 }
 
-pub fn gpu_child_ask() -> std::option::Option<i32> {
-	let d = std::env::var_os("RECIPE_PROBE_GPU")?;
+pub fn gpu_child_ask() -> Option<i32> {
+	let d = env::var_os("RECIPE_PROBE_GPU")?;
 	set_opt(Opt {
 		probe: true,
 		..Opt::default()
@@ -55,7 +66,7 @@ pub fn gpu_child_ask() -> std::option::Option<i32> {
 impl Machine {
 	pub fn probe() -> Result<Machine> {
 		ensure!(
-			std::env::var_os("RECIPE_PROBE_GPU").is_none(),
+			env::var_os("RECIPE_PROBE_GPU").is_none(),
 			"probe: RECIPE_PROBE_GPU is set but this binary's main did not call recipe::machine::gpu_child_ask() and exit before Machine::probe — refusing to fork-recurse"
 		);
 		let host = hostname();
@@ -194,7 +205,7 @@ impl Machine {
 }
 
 fn hostname() -> String {
-	std::fs::read_to_string("/proc/sys/kernel/hostname")
+	fs::read_to_string("/proc/sys/kernel/hostname")
 		.map(|s| s.trim().to_string())
 		.unwrap_or_default()
 }
@@ -208,7 +219,7 @@ fn mem_available() -> Result<u64> {
 }
 
 fn meminfo_bytes(key: &str) -> Result<u64> {
-	let s = std::fs::read_to_string("/proc/meminfo")?;
+	let s = fs::read_to_string("/proc/meminfo")?;
 	let rest = s
 		.lines()
 		.find_map(|l| l.strip_prefix(key))
@@ -220,8 +231,8 @@ fn meminfo_bytes(key: &str) -> Result<u64> {
 fn llc_bytes() -> Result<usize> {
 	let dir = "/sys/devices/system/cpu/cpu0/cache";
 	let mut best = 0usize;
-	for e in std::fs::read_dir(dir)?.flatten() {
-		let Ok(txt) = std::fs::read_to_string(e.path().join("size")) else {
+	for e in fs::read_dir(dir)?.flatten() {
+		let Ok(txt) = fs::read_to_string(e.path().join("size")) else {
 			continue;
 		};
 		let t = txt.trim();
@@ -256,8 +267,8 @@ fn bench_bytes(buffers: usize) -> Result<usize> {
 }
 
 fn disk_total(path: &Path) -> Result<u64> {
-	let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-	let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+	let c = CString::new(path.as_os_str().as_encoded_bytes())?;
+	let mut st: libc::statvfs = unsafe { mem::zeroed() };
 	ensure!(
 		unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0,
 		"probe: statvfs failed for {}",
@@ -268,10 +279,10 @@ fn disk_total(path: &Path) -> Result<u64> {
 
 fn link_speed_gbs() -> f64 {
 	let mut best_mbps = 0i64;
-	for entries in std::fs::read_dir("/sys/class/net").into_iter() {
+	for entries in fs::read_dir("/sys/class/net").into_iter() {
 		for e in entries.flatten().filter(|e| e.file_name() != "lo") {
 			let sp = e.path().join("speed");
-			let m = std::fs::read_to_string(&sp)
+			let m = fs::read_to_string(&sp)
 				.ok()
 				.and_then(|txt| txt.trim().parse::<i64>().ok())
 				.unwrap_or(best_mbps);
@@ -301,19 +312,19 @@ fn eth_label(gbs: f64) -> String {
 }
 
 fn measure_gpu_child(dev: i32, g: &ogdl::Graph, base: &str) -> Result<GpuDev> {
-	let exe = std::env::current_exe()?;
-	let mut child = std::process::Command::new(exe)
+	let exe = env::current_exe()?;
+	let mut child = process::Command::new(exe)
 		.env("RECIPE_PROBE_GPU", dev.to_string())
-		.stderr(std::process::Stdio::piped())
+		.stderr(process::Stdio::piped())
 		.spawn()?;
 	let pipe = child
 		.stderr
 		.take()
 		.ok_or_else(|| anyhow!("probe child stderr"))?;
-	let (tx, rx) = std::sync::mpsc::channel::<String>();
-	let reader = std::thread::spawn(move || {
+	let (tx, rx) = mpsc::channel::<String>();
+	let reader = thread::spawn(move || {
 		use std::io::BufRead;
-		for line in std::io::BufReader::new(pipe).lines() {
+		for line in BufReader::new(pipe).lines() {
 			let Ok(l) = line else { break };
 			match tx.send(l) {
 				Ok(()) => continue,
@@ -345,21 +356,21 @@ fn measure_gpu_child(dev: i32, g: &ogdl::Graph, base: &str) -> Result<GpuDev> {
 			},
 		}
 	};
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+	let deadline = Instant::now() + Duration::from_secs(120);
 	let status = loop {
-		match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+		match rx.recv_timeout(Duration::from_millis(200)) {
 			Ok(l) => {
 				take(&l);
 				continue;
 			}
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-				std::thread::sleep(std::time::Duration::from_millis(200));
+			Err(mpsc::RecvTimeoutError::Timeout) => {}
+			Err(mpsc::RecvTimeoutError::Disconnected) => {
+				thread::sleep(Duration::from_millis(200));
 			}
 		}
 		match child.try_wait()? {
 			Some(status) => break status,
-			None => match std::time::Instant::now().cmp(&deadline) {
+			None => match Instant::now().cmp(&deadline) {
 				Ordering::Greater => {
 					child.kill().ok();
 					child.wait().ok();
@@ -475,7 +486,7 @@ fn bench_ddr5(bytes: usize) -> f64 {
 fn bench_cpu_read(bytes: usize) -> f64 {
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
-	let threads = std::thread::available_parallelism()
+	let threads = thread::available_parallelism()
 		.map(|n| n.get())
 		.unwrap_or(1);
 	let per = bytes.div_ceil(threads);
@@ -483,7 +494,7 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 	let mut best = f64::INFINITY;
 	for _rep in 0..5 {
 		let t = Instant::now();
-		let sum: u64 = std::thread::scope(|sc| {
+		let sum: u64 = thread::scope(|sc| {
 			let mut handles = Vec::new();
 			for k in 0..threads {
 				handles.push(sc.spawn(move || {
@@ -494,7 +505,7 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 							let mut acc = 0u64;
 							for i in (off..off + len).step_by(64) {
 								acc = acc.wrapping_add(unsafe {
-									std::ptr::read_volatile(
+									ptr::read_volatile(
 										(base + i) as *const u8,
 									)
 								} as u64);
@@ -507,35 +518,35 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 			}
 			handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
 		});
-		std::hint::black_box(sum);
+		hint::black_box(sum);
 		best = best.min(t.elapsed().as_secs_f64());
 	}
 	bytes as f64 / best / 1e9
 }
 
-pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
-	let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-		Some(x) => std::path::PathBuf::from(x),
+pub fn data_dir() -> anyhow::Result<PathBuf> {
+	let base = match env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+		Some(x) => PathBuf::from(x),
 		None => {
-			let home = std::env::var_os("HOME")
+			let home = env::var_os("HOME")
 				.filter(|v| !v.is_empty())
 				.ok_or_else(|| anyhow::anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
-			std::path::PathBuf::from(home).join(".cache")
+			PathBuf::from(home).join(".cache")
 		}
 	};
 	let dir = base.join("recipe");
-	std::fs::create_dir_all(&dir)
+	fs::create_dir_all(&dir)
 		.map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
 	Ok(dir)
 }
 
 fn bench_cpu_flops() -> f64 {
-	let threads = std::thread::available_parallelism()
+	let threads = thread::available_parallelism()
 		.map(|n| n.get())
 		.unwrap_or(1);
 	let iters: u64 = 100_000_000;
 	let t = Instant::now();
-	let sum: f64 = std::thread::scope(|sc| {
+	let sum: f64 = thread::scope(|sc| {
 		let mut handles = Vec::new();
 		for kk in 0..threads {
 			handles.push(sc.spawn(move || {
@@ -543,8 +554,8 @@ fn bench_cpu_flops() -> f64 {
 				for i in 0..lanes.len() {
 					lanes[i] += i as f64 * 1e-9;
 				}
-				let b = std::hint::black_box(0.9999999_f64);
-				let c = std::hint::black_box(0.0000001_f64);
+				let b = hint::black_box(0.9999999_f64);
+				let c = hint::black_box(0.0000001_f64);
 				for _iter in 0..iters {
 					for l in lanes.iter_mut() {
 						*l = *l * b + c;
@@ -555,7 +566,7 @@ fn bench_cpu_flops() -> f64 {
 		}
 		handles.into_iter().map(|h| h.join().unwrap_or(0.0)).sum()
 	});
-	std::hint::black_box(sum);
+	hint::black_box(sum);
 	let flops = threads as f64 * iters as f64 * 8.0 * 2.0;
 	flops / t.elapsed().as_secs_f64() / 1e9
 }
@@ -574,8 +585,8 @@ fn bench_disk(dir: &Path, bytes: usize) -> Result<f64> {
 	f.read_exact_at(&mut buf, 0)?;
 	let read_gbs = bytes as f64 / tr.elapsed().as_secs_f64() / 1e9;
 	drop(f);
-	std::fs::remove_file(&path).ok();
-	std::hint::black_box(write_gbs);
+	fs::remove_file(&path).ok();
+	hint::black_box(write_gbs);
 	Ok(read_gbs)
 }
 
@@ -792,10 +803,10 @@ pub fn parse_config(text: &str) -> Vec<Machine> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-	if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+	if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
 		return Ok(PathBuf::from(xdg).join("recipe"));
 	}
-	let home = std::env::var("HOME").map_err(|_e| anyhow!("probe: HOME not set"))?;
+	let home = env::var("HOME").map_err(|_e| anyhow!("probe: HOME not set"))?;
 	Ok(PathBuf::from(home).join(".config/recipe"))
 }
 
@@ -810,10 +821,10 @@ pub fn pool_path() -> Result<PathBuf> {
 pub fn write_config_atomic(machines: &[Machine]) -> Result<()> {
 	let path = config_path()?;
 	for parent in path.parent().into_iter() {
-		std::fs::create_dir_all(parent)?;
+		fs::create_dir_all(parent)?;
 	}
 	let tmp = path.with_extension("ogdl.tmp");
-	std::fs::write(&tmp, write_config(machines))?;
-	std::fs::rename(&tmp, &path)?;
+	fs::write(&tmp, write_config(machines))?;
+	fs::rename(&tmp, &path)?;
 	Ok(())
 }

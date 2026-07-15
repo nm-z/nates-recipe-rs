@@ -14,8 +14,10 @@ use crate::common;
 // never faked green.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_sortx_sort_asc(
@@ -149,12 +151,12 @@ fn run_keys(
 			x.len() as i32,
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -180,7 +182,7 @@ fn run_argsort(x: &[f64]) -> Vec<i32> {
 			vals_in.ptr_raw(),
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -226,7 +228,7 @@ fn run_argextreme(
 			vals_out.ptr_raw(),
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -255,12 +257,12 @@ fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
 			keys_out.ptr_raw(),
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
 	let mut out = vec![0.0; k];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -299,12 +301,12 @@ fn run_scalar(
 			keys_out.ptr_raw(),
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
 	let mut out = vec![0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
@@ -328,12 +330,12 @@ fn run_median(x: &[f64]) -> f64 {
 			keys_out.ptr_raw(),
 			ws.ptr_raw(),
 			wbytes,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
 	let mut out = vec![0.0; 1];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out[0]
 }
@@ -359,7 +361,7 @@ fn run_searchsorted(sorted: &[f64], q: &[f64]) -> Vec<i32> {
 			o.ptr_raw(),
 			sorted.len() as i32,
 			q.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -585,11 +587,11 @@ fn canon(name: &str) -> String {
 fn load_sort() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -627,8 +629,8 @@ fn prove_sort() {
 
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
-	let mut backlog: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
+	let mut backlog: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		match op_ok.get(key.as_str()) {

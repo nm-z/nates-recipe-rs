@@ -2,6 +2,8 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_rsqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
@@ -118,7 +120,7 @@ pub fn gpu_rsqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -131,7 +133,7 @@ pub fn gpu_reciprocal(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hi
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -145,7 +147,7 @@ pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -159,7 +161,7 @@ pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -172,7 +174,7 @@ pub fn gpu_sin(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -185,7 +187,7 @@ pub fn gpu_cos(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -198,7 +200,7 @@ pub fn gpu_tan(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -212,7 +214,7 @@ pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Res
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -225,7 +227,7 @@ pub fn gpu_log1p(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -238,7 +240,7 @@ pub fn gpu_expm1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -251,7 +253,7 @@ pub fn gpu_floor(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -264,7 +266,7 @@ pub fn gpu_ceil(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -277,7 +279,7 @@ pub fn gpu_round(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -290,7 +292,7 @@ pub fn gpu_trunc(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -304,7 +306,7 @@ pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resu
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -323,7 +325,7 @@ pub fn gpu_sub_scalar(
 			out.ptr_raw(),
 			n as i32,
 			s.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -342,7 +344,7 @@ pub fn gpu_div_scalar(
 			out.ptr_raw(),
 			n as i32,
 			s.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -361,7 +363,7 @@ pub fn gpu_rsub_scalar(
 			out.ptr_raw(),
 			n as i32,
 			s.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -380,7 +382,7 @@ pub fn gpu_rdiv_scalar(
 			out.ptr_raw(),
 			n as i32,
 			s.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -392,14 +394,14 @@ pub fn gpu_has_nan(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipE
 		crate::memory::memset_dev(
 			flag.ptr_raw(),
 			0,
-			std::mem::size_of::<i32>(),
-			std::ptr::null_mut(),
+			mem::size_of::<i32>(),
+			ptr::null_mut(),
 		)?;
 		launch_has_nan(
 			x.ptr_raw() as *const c_void,
 			flag.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -411,14 +413,14 @@ pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(),
 		crate::memory::memset_dev(
 			flag.ptr_raw(),
 			0,
-			std::mem::size_of::<i32>(),
-			std::ptr::null_mut(),
+			mem::size_of::<i32>(),
+			ptr::null_mut(),
 		)?;
 		launch_isfinite_all(
 			x.ptr_raw() as *const c_void,
 			flag.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

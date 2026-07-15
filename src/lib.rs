@@ -1,5 +1,9 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::match_wild_err_arm)]
+
+use std::fmt;
+use std::process;
 
 #[doc(hidden)]
 pub type Mat = ndarray::Array2<f64>;
@@ -49,7 +53,7 @@ pub use model::{
 };
 pub use ogdl::ogdl;
 
-pub fn block(content: impl std::fmt::Display) {
+pub fn block(content: impl fmt::Display) {
 	gpu_core::log::Write::always(content);
 }
 
@@ -88,7 +92,7 @@ pub fn infer() -> Infer {
 	Infer::new()
 }
 
-pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
+pub(crate) fn ok_or_die<T, E: fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
 	if !r.is_ok() {
 		drop(gpu_core::log::Write::err(format!(
 			"{ctx}: {}",
@@ -97,17 +101,17 @@ pub(crate) fn ok_or_die<T, E: std::fmt::Display>(r: Result<T, E>, ctx: &str) -> 
 				.map(|e| format!("{e:#}"))
 				.unwrap_or_default()
 		)));
-		std::process::abort();
+		process::abort();
 	}
-	let Ok(v) = r else { std::process::abort() };
+	let Ok(v) = r else { process::abort() };
 	v
 }
 
 pub(crate) fn some_or_die<T>(o: Option<T>, msg: &str) -> T {
 	if !o.is_some() {
 		drop(gpu_core::log::Write::err(msg));
-		std::process::abort();
+		process::abort();
 	}
-	let Some(v) = o else { std::process::abort() };
+	let Some(v) = o else { process::abort() };
 	v
 }

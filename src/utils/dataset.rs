@@ -2,6 +2,15 @@ use gpu_core::log::{Write, data};
 use crate::Mat;
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
+use std::mem;
+use std::ops::Deref;
+use std::path::Path;
+use std::process;
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
@@ -31,13 +40,13 @@ pub struct Data {
 }
 
 thread_local! {
-	static PARKED_DATA: std::cell::RefCell<Option<Box<DataInner>>> =
-		const { std::cell::RefCell::new(None) };
+	static PARKED_DATA: RefCell<Option<Box<DataInner>>> =
+		const { RefCell::new(None) };
 }
 
 impl Drop for Data {
 	fn drop(&mut self) {
-		let inner = std::mem::replace(&mut self.inner, Box::new(DataInner::blank()));
+		let inner = mem::replace(&mut self.inner, Box::new(DataInner::blank()));
 		PARKED_DATA.with(|slot| slot.borrow_mut().replace(inner));
 	}
 }
@@ -118,7 +127,7 @@ impl DataInner {
 	}
 }
 
-impl std::ops::Deref for Data {
+impl Deref for Data {
 	type Target = DataInner;
 	fn deref(&self) -> &DataInner {
 		&self.inner
@@ -127,7 +136,7 @@ impl std::ops::Deref for Data {
 pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
-	let mut in_group: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+	let mut in_group: BTreeSet<usize> = BTreeSet::new();
 	for grp in &ds.onehot_groups {
 		for c in grp.start..grp.start + grp.len {
 			in_group.insert(c);
@@ -173,7 +182,7 @@ enum FileFormat {
 }
 
 fn file_format(path: &str) -> FileFormat {
-	let ext = std::path::Path::new(path)
+	let ext = Path::new(path)
 		.extension()
 		.and_then(|e| e.to_str());
 	let arff = ext.filter(|e| *e == "arff").and(Some(FileFormat::Arff));
@@ -185,7 +194,7 @@ fn file_format(path: &str) -> FileFormat {
 
 pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 	let bytes =
-		std::fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
+		fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
 	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
 		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
 	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
@@ -210,8 +219,8 @@ pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 		let width = shape.iter().skip(1).product::<usize>().max(1);
 		for c in 0..width {
 			let aname = match width.cmp(&1) {
-				std::cmp::Ordering::Equal => name.clone(),
-				std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+				Ordering::Equal => name.clone(),
+				Ordering::Less | Ordering::Greater => {
 					format!("{name}:{c}")
 				}
 			};
@@ -265,7 +274,7 @@ impl Data {
 		let Some(tp) = self.inner.test_path.clone() else {
 			return self;
 		};
-		let Ok(raw) = crate::data::read_raw_csv(std::path::Path::new(&tp)) else {
+		let Ok(raw) = crate::data::read_raw_csv(Path::new(&tp)) else {
 			return self;
 		};
 		match raw.headers.len().checked_sub(1) {
@@ -297,7 +306,7 @@ impl Data {
 			drop(Write::err(format!(
 				"split fraction must be in (0, 1), got {train_frac}"
 			)));
-			std::process::abort();
+			process::abort();
 		}
 		self.inner.split_frac = Some(train_frac);
 		self
@@ -382,8 +391,8 @@ impl DataInner {
 	fn cat_cardinality_counts(&self, attrs: &[Attr]) -> Vec<CardCount> {
 		let is_target = |name: &str| self.target_names.iter().any(|t| t == name);
 		let is_excluded = |name: &str| self.exclude.iter().any(|p| exclude_match(p, name));
-		let mut card: std::collections::BTreeMap<usize, usize> =
-			std::collections::BTreeMap::new();
+		let mut card: BTreeMap<usize, usize> =
+			BTreeMap::new();
 		for a in attrs
 			.iter()
 			.filter(|a| !is_target(a.name.as_str()) && !is_excluded(a.name.as_str()))
@@ -405,12 +414,12 @@ impl DataInner {
 
 	fn print_summary(&self, train: &Dataset, test: Option<&Dataset>, attrs: &[Attr]) {
 		let disk_size = |path: &str| -> String {
-			std::fs::metadata(path)
+			fs::metadata(path)
 				.map(|m| crate::data::human_bytes(m.len() as usize))
 				.unwrap_or_else(|_err| "?".into())
 		};
 		let short = |path: &str| -> String {
-			let Ok(home) = std::env::var("HOME") else {
+			let Ok(home) = env::var("HOME") else {
 				return path.to_string();
 			};
 			let Some(rest) = path.strip_prefix(&home) else {
@@ -599,11 +608,11 @@ impl DataInner {
 				.collect(),
 			None => match test_names {
 				Some(tn) => match set_names.len().cmp(&(tn.len() + 1)) {
-					std::cmp::Ordering::Equal => Ok(vec![set_names
+					Ordering::Equal => Ok(vec![set_names
 						.last()
 						.ok_or_else(|| anyhow::anyhow!("set has columns"))?
 						.clone()]),
-					std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+					Ordering::Less | Ordering::Greater => {
 						Ok(Vec::new())
 					}
 				},

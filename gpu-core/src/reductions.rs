@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::{check_launch, safe_i32};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_sum_all_workspace_bytes(n: i32) -> usize;
@@ -204,7 +205,7 @@ fn scalar_reduce(
 			workspace.ptr_raw(),
 			workspace.len(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -262,7 +263,7 @@ pub fn gpu_l2_norm(
 			workspace.ptr_raw(),
 			workspace.len(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -286,7 +287,7 @@ pub fn gpu_dot(
 			workspace.ptr_raw(),
 			workspace.len(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -305,7 +306,7 @@ pub fn gpu_fill_sentinel(
 			safe_i32(real_n),
 			safe_i32(padded_n),
 			sentinel.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -314,7 +315,7 @@ pub fn gpu_fill_sentinel(
 
 pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_init_idx(idx.ptr_raw(), safe_i32(n), std::ptr::null_mut());
+		launch_init_idx(idx.ptr_raw(), safe_i32(n), ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -332,7 +333,7 @@ pub fn gpu_bitonic_step(
 			safe_i32(j),
 			safe_i32(k),
 			safe_i32(padded_n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -353,7 +354,7 @@ pub fn gpu_bitonic_step_idx(
 			safe_i32(j),
 			safe_i32(k),
 			safe_i32(padded_n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -374,7 +375,7 @@ pub fn gpu_bitonic_step_dd(
 			safe_i32(j),
 			safe_i32(k),
 			safe_i32(padded_n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -476,7 +477,7 @@ pub fn gpu_segment_sort(
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -495,7 +496,7 @@ pub fn gpu_cumsum_rows(
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -514,7 +515,7 @@ pub fn gpu_cumsum_cols(
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -534,7 +535,7 @@ pub fn gpu_cumprod(
 			workspace.ptr_raw(),
 			workspace.len(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -554,7 +555,7 @@ pub fn gpu_cummax(
 			workspace.ptr_raw(),
 			workspace.len(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -575,7 +576,7 @@ pub fn gpu_segment_sum(
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -596,7 +597,7 @@ pub fn gpu_segment_max(
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(n_segs),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -617,7 +618,7 @@ pub fn gpu_scan_linear_recurrence(
 			states.ptr_raw(),
 			safe_i32(n_steps),
 			safe_i32(dim),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

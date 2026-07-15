@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_iota(out: *mut c_void, n: i32, stream: *mut c_void);
@@ -38,14 +39,14 @@ unsafe extern "C" {
 
 pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_iota(out.ptr_raw(), n as i32, std::ptr::null_mut());
+		launch_iota(out.ptr_raw(), n as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
 }
 
 pub fn gpu_random_permutation_workspace_bytes(n: usize) -> usize {
-	unsafe { radix_perm_workspace_bytes(n as i32, std::ptr::null_mut()) }
+	unsafe { radix_perm_workspace_bytes(n as i32, ptr::null_mut()) }
 }
 
 pub fn gpu_random_permutation(
@@ -58,7 +59,7 @@ pub fn gpu_random_permutation(
 	tmp_bytes: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let stream = std::ptr::null_mut();
+	let stream = ptr::null_mut();
 	unsafe {
 		launch_lcg_rand(keys.ptr_raw(), n as i32, seed as u32, stream);
 		launch_iota(iota_scratch.ptr_raw(), n as i32, stream);
@@ -104,7 +105,7 @@ pub fn gpu_ordered_target_stats(
 			n_categories as i32,
 			prior.ptr_raw() as *const c_void,
 			smoothing.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

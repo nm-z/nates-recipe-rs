@@ -2,6 +2,8 @@ use crate::hip::{HipError, check};
 use crate::kernels::{gpu_copy_into, safe_i32};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_diffusionx_entropy_gated_step(
@@ -48,7 +50,7 @@ pub fn gpu_entropy_gated_step(
 			entropy_bound.ptr_raw() as *const c_void,
 			safe_i32(n_positions),
 			safe_i32(vocab),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	e()
@@ -68,7 +70,7 @@ pub fn gpu_diffusion_commit(
 			renoise.ptr_raw() as *const c_void,
 			committed.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	e()
@@ -89,8 +91,8 @@ pub fn gpu_diffusion_sample(
 ) -> Result<DiffusionSample, HipError> {
 	let canvas = GpuBuffer::alloc(n_positions)?;
 	gpu_copy_into(initial_canvas, n_positions, &canvas)?;
-	let committed = GpuBuffer::alloc_bytes(n_positions * std::mem::size_of::<f64>())?;
-	committed.memset_zero(n_positions * std::mem::size_of::<f64>())?;
+	let committed = GpuBuffer::alloc_bytes(n_positions * mem::size_of::<f64>())?;
+	committed.memset_zero(n_positions * mem::size_of::<f64>())?;
 	let bound = GpuBuffer::alloc(1)?;
 	bound.load(&[entropy_bound])?;
 	let accepted = GpuBuffer::alloc(n_positions)?;
@@ -110,7 +112,7 @@ pub fn gpu_diffusion_sample(
 			&renoise,
 		)?;
 		gpu_diffusion_commit(&accepted, &renoise, n_positions, &canvas, &committed)?;
-		unsafe { committed.download_async(&mut host, std::ptr::null_mut()) }?;
+		unsafe { committed.download_async(&mut host, ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
 		match host.iter().find(|&&c| c == 0.0) {
 			None => break,

@@ -18,8 +18,10 @@ use crate::common;
 // host-only schedule/state items. The test FAILS on any registered-op mismatch.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // ── FFI for the NEW optimizerx_ launchers ───────────────────────────────────
 unsafe extern "C" {
@@ -131,7 +133,7 @@ fn prove_sgd() -> bool {
 	};
 	gpu_core::kernels::gpu_sgd_update(&bg, &bneg_lr, n, &bw).unwrap();
 	let mut got = vec![0.0; n];
-	unsafe { bw.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want: Vec<f64> = (0..n).map(|i| w[i] - lr * g[i]).collect();
 	close(&got, &want)
@@ -175,10 +177,10 @@ fn prove_momentum() -> bool {
 	};
 	gpu_core::optimizers::gpu_momentum_update(&bg, &blr, &bmu, n, &bw, &bv).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gvb = vec![0.0; n];
-	unsafe { bv.download_async(&mut gvb, std::ptr::null_mut()) }.unwrap();
+	unsafe { bv.download_async(&mut gvb, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want_v: Vec<f64> = (0..n).map(|i| mu * v0[i] - lr * g[i]).collect();
 	let want_w: Vec<f64> = (0..n).map(|i| w[i] + want_v[i]).collect();
@@ -229,10 +231,10 @@ fn prove_rmsprop() -> bool {
 	};
 	gpu_core::optimizers::gpu_rmsprop_update(&bg, &blr, &bdecay, &beps, n, &bw, &bc).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gc = vec![0.0; n];
-	unsafe { bc.download_async(&mut gc, std::ptr::null_mut()) }.unwrap();
+	unsafe { bc.download_async(&mut gc, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want_c: Vec<f64> = (0..n)
 		.map(|i| decay * c0[i] + (1.0 - decay) * g[i] * g[i])
@@ -281,10 +283,10 @@ fn prove_adagrad() -> bool {
 	};
 	gpu_core::optimizers::gpu_adagrad_update(&bg, &blr, &beps, n, &bw, &ba).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut ga = vec![0.0; n];
-	unsafe { ba.download_async(&mut ga, std::ptr::null_mut()) }.unwrap();
+	unsafe { ba.download_async(&mut ga, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want_a: Vec<f64> = (0..n).map(|i| a0[i] + g[i] * g[i]).collect();
 	let want_w: Vec<f64> = (0..n)
@@ -343,10 +345,10 @@ fn prove_lion() -> bool {
 	};
 	gpu_core::optimizers::gpu_lion_update(&bg, &blr, &bb1, &bb2, &bwd, n, &bw, &bm).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gm = vec![0.0; n];
-	unsafe { bm.download_async(&mut gm, std::ptr::null_mut()) }.unwrap();
+	unsafe { bm.download_async(&mut gm, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let sign = |x: f64| {
 		if x > 0.0 {
@@ -425,7 +427,7 @@ fn prove_adam() -> bool {
 	gpu_core::kernels::gpu_adam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
 	let bc2 = 1.0 - b2.powi(t as i32);
@@ -503,7 +505,7 @@ fn prove_adamw() -> bool {
 	gpu_core::kernels::gpu_adamw_update(&bg, &blr, &bb1, &bb2, &beps, &bwd, t, n, &bw, &bm, &bv)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t as i32);
 	let bc2 = 1.0 - b2.powi(t as i32);
@@ -576,7 +578,7 @@ fn prove_nadam() -> bool {
 	gpu_core::optimizers::gpu_nadam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let bc1t = 1.0 - b1.powi(t as i32);
 	let bc1t1 = 1.0 - b1.powi(t as i32 + 1);
@@ -665,7 +667,7 @@ fn prove_lamb() -> bool {
 	gpu_core::optimizers::gpu_lamb_phase2(&tmp_upd, &lr_b, &w_norm_sq, &u_norm_sq, n, &bw)
 		.unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let bc1 = 1.0 - b1.powi(t);
 	let bc2 = 1.0 - b2.powi(t);
@@ -717,15 +719,15 @@ fn prove_nesterov() -> bool {
 			lr,
 			mu,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gb = vec![0.0; n];
-	unsafe { bb.download_async(&mut gb, std::ptr::null_mut()) }.unwrap();
+	unsafe { bb.download_async(&mut gb, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want_b: Vec<f64> = (0..n).map(|i| mu * b0[i] + g[i]).collect();
 	let want_w: Vec<f64> = (0..n)
@@ -775,18 +777,18 @@ fn prove_adadelta() -> bool {
 			rho,
 			eps,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut geg = vec![0.0; n];
-	unsafe { beg.download_async(&mut geg, std::ptr::null_mut()) }.unwrap();
+	unsafe { beg.download_async(&mut geg, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gedx = vec![0.0; n];
-	unsafe { bedx.download_async(&mut gedx, std::ptr::null_mut()) }.unwrap();
+	unsafe { bedx.download_async(&mut gedx, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let want_eg: Vec<f64> = (0..n)
 		.map(|i| rho * eg0[i] + (1.0 - rho) * g[i] * g[i])
@@ -844,12 +846,12 @@ fn radam_step(t: usize) -> (Vec<f64>, Vec<f64>) {
 			eps,
 			t as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let b1t = b1.powi(t as i32);
 	let b2t = b2.powi(t as i32);
@@ -933,16 +935,16 @@ fn prove_lars() -> bool {
 			n as i32,
 			wns.ptr_raw(),
 			gns.ptr_raw(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut wn = [0.0];
 	let mut gn = [0.0];
-	unsafe { wns.download_async(&mut wn, std::ptr::null_mut()) }.unwrap();
+	unsafe { wns.download_async(&mut wn, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { gns.download_async(&mut gn, std::ptr::null_mut()) }.unwrap();
+	unsafe { gns.download_async(&mut gn, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	unsafe {
 		launch_optimizerx_lars_phase2(
@@ -957,15 +959,15 @@ fn prove_lars() -> bool {
 			gn[0],
 			eps,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut gw = vec![0.0; n];
-	unsafe { bw.download_async(&mut gw, std::ptr::null_mut()) }.unwrap();
+	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut gb = vec![0.0; n];
-	unsafe { bb.download_async(&mut gb, std::ptr::null_mut()) }.unwrap();
+	unsafe { bb.download_async(&mut gb, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	// independent oracle
 	let w_norm = w.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -1125,11 +1127,11 @@ fn canon(name: &str) -> String {
 fn load_optimizer() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -1178,7 +1180,7 @@ fn prove_optimizer() {
 	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		if let Some(&ok) = op_ok.get(key.as_str())

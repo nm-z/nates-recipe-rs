@@ -15,6 +15,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // New normx_ launchers (see src/kernels/normx.hip).
 unsafe extern "C" {
@@ -209,7 +211,7 @@ fn cpu_log_softmax(x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
 // ── GPU runners ──────────────────────────────────────────────────────────────
 fn dl(b: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut o = vec![0.0; n];
-	unsafe { b.download_async(&mut o, std::ptr::null_mut()) }.unwrap();
+	unsafe { b.download_async(&mut o, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	o
 }
@@ -418,7 +420,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				rows as i32,
 				cols as i32,
 				beps.ptr_raw() as *const c_void,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -469,7 +471,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				l as i32,
 				g as i32,
 				eps,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -519,7 +521,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				c as i32,
 				l as i32,
 				eps,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -552,7 +554,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				rows as i32,
 				cols as i32,
 				eps,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
@@ -627,11 +629,11 @@ fn canon(name: &str) -> String {
 fn load_norm() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {

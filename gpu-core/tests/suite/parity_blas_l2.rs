@@ -5,6 +5,7 @@
 use gpu_core::hip;
 use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
 use gpu_core::memory::GpuBuffer;
+use std::ptr;
 
 const TOL: f64 = 1e-9;
 
@@ -105,7 +106,7 @@ fn dgemv_notrans_parity() {
 		gpu_dgemv_into(&ga, &gx, m, n, 0, &gy).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; gy.n_floats()];
-			unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { gy.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -144,7 +145,7 @@ fn dgemv_trans_parity() {
 		gpu_dgemv_into(&ga, &gx, m, n, 1, &gy).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; gy.n_floats()];
-			unsafe { gy.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { gy.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -184,7 +185,7 @@ fn dger_parity() {
 		gpu_dger_into(&gx, &gy, m, n, &ga).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; ga.n_floats()];
-			unsafe { ga.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { ga.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};

@@ -1,18 +1,20 @@
 use anyhow::Context;
 use gpu_core::log::{Opt, Write, opt, probe, r2, set_opt};
 use recipe::*;
+use std::fmt;
+use std::path::Path;
 
 const BANK: &str = "datasets/uci-bank-semicolon/bank-full.csv";
 const SEEDS: &str = "datasets/uci-seeds/seeds_dataset.txt";
 const WINE: &str = "datasets/uci-wine/wine.data";
 
-fn say(t: impl std::fmt::Display) {
+fn say(t: impl fmt::Display) {
 	set_opt(Opt { probe: true, ..opt() });
 	Write::block(probe, ogdl!(&t));
 }
 
 fn columns(path: &str) -> anyhow::Result<recipe::data::RawCsv> {
-	recipe::data::read_raw_csv(std::path::Path::new(path)).with_context(|| format!("stress: {path}"))
+	recipe::data::read_raw_csv(Path::new(path)).with_context(|| format!("stress: {path}"))
 }
 
 fn main() -> anyhow::Result<()> {

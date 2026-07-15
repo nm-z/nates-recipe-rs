@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::ops;
 use std::sync::{Arc, LazyLock, Mutex};
 
 const NL: char = '\u{a}';
@@ -136,7 +137,7 @@ impl Node {
 	}
 }
 
-impl std::ops::Index<usize> for Node {
+impl ops::Index<usize> for Node {
 	type Output = Node;
 	fn index(&self, i: usize) -> &Node {
 		&self.children[i]
@@ -380,7 +381,7 @@ impl Graph {
 
 pub struct Block {
 	pub nodes: Vec<Node>,
-	pub sel: std::option::Option<Vec<usize>>,
+	pub sel: Option<Vec<usize>>,
 }
 
 fn value_leaf(n: &Node) -> bool {
@@ -646,7 +647,7 @@ macro_rules! del {
 
 #[doc(hidden)]
 pub mod __macro_support {
-	use super::{Graph, Node, ogdl, parse_doc};
+	use super::{Graph, Node, fmt, ogdl, parse_doc};
 
 	pub fn del_all(g: &Graph, parent: &str, name: &str) -> Graph {
 		g.with(|root: &mut Node| {
@@ -662,7 +663,7 @@ pub mod __macro_support {
 
 	pub struct P {
 		pub cur: Vec<Vec<usize>>,
-		pub anchor: std::option::Option<Vec<Vec<usize>>>,
+		pub anchor: Option<Vec<Vec<usize>>>,
 	}
 
 	pub fn start() -> P {
@@ -866,7 +867,7 @@ pub mod __macro_support {
 		hold(p);
 	}
 
-	pub fn val(p: &mut P, v: impl std::fmt::Display) {
+	pub fn val(p: &mut P, v: impl fmt::Display) {
 		seg(p, &v.to_string());
 	}
 

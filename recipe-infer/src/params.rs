@@ -1,3 +1,9 @@
+use std::env;
+use std::f64::consts;
+use std::fs;
+use std::path::Path;
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use gpu_core::log::{Errored, Write};
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
@@ -136,7 +142,7 @@ fn host_randn(seed: u32, scale: f64, out: &mut [f64]) {
 	for (i, o) in out.iter_mut().enumerate() {
 		let u1 = philox_uniform((2 * i) as u32, seed).max(1e-30);
 		let u2 = philox_uniform((2 * i + 1) as u32, seed);
-		*o = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * scale;
+		*o = (-2.0 * u1.ln()).sqrt() * (2.0 * consts::PI * u2).cos() * scale;
 	}
 }
 
@@ -305,19 +311,19 @@ impl LayerPlan {
 }
 
 pub fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
-	static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let tmp = std::env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", std::process::id()));
+	static SEQ: AtomicU64 = AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let tmp = env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", process::id()));
 	let Some(tp) = tmp.to_str() else {
 		drop(Write::err("utf8 tmp"));
-		std::process::abort();
+		process::abort();
 	};
-	let _ = std::fs::remove_file(tp);
+	let _ = fs::remove_file(tp);
 	let g = ogdl::file(tp);
 	build(g.clone());
 	g.file(tp);
-	let text = std::fs::read_to_string(tp).unwrap_or_default();
-	let _ = std::fs::remove_file(tp);
+	let text = fs::read_to_string(tp).unwrap_or_default();
+	let _ = fs::remove_file(tp);
 	text
 }
 
@@ -672,7 +678,7 @@ impl Saved {
 }
 
 pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
-	let text = match std::fs::read_to_string(path) {
+	let text = match fs::read_to_string(path) {
 		Ok(t) => t,
 		Err(_) => {
 			drop(Write::err(&format!("no data in {path}, initialized random weights and biases")));
@@ -854,17 +860,17 @@ pub fn dump_ogdl(
 }
 
 pub fn write_ogdl(path: &str, out: &str) -> anyhow::Result<()> {
-	if let Some(parent) = std::path::Path::new(path).parent()
+	if let Some(parent) = Path::new(path).parent()
 		&& !parent.as_os_str().is_empty()
 	{
-		std::fs::create_dir_all(parent)
+		fs::create_dir_all(parent)
 			.map_err(|e| anyhow::anyhow!("save: mkdir {}: {e}", parent.display()))?;
 	}
-	std::fs::write(path, out).map_err(|e| anyhow::anyhow!("save: write {path}: {e}"))
+	fs::write(path, out).map_err(|e| anyhow::anyhow!("save: write {path}: {e}"))
 }
 
 pub fn saved_score(path: &str, key: &str) -> Option<f64> {
-	let text = std::fs::read_to_string(path).ok()?;
+	let text = fs::read_to_string(path).ok()?;
 	for line in text.lines() {
 		let line = line.trim();
 		if let Some((k, v)) = line

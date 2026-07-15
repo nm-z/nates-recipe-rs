@@ -11,8 +11,10 @@ use crate::common;
 // map to a forward op. Host-only / sparse / structural items stay as backlog.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_embeddingx_lookup(
@@ -83,12 +85,12 @@ fn gpu_lookup(table: &[f64], indices: &[i32], n: usize, d: usize) -> Vec<f64> {
 			o.ptr_raw(),
 			n as i32,
 			d as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -119,12 +121,12 @@ fn gpu_bag(
 			n_bags as i32,
 			d as i32,
 			mode,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	chk();
 	let mut out = vec![0.0; n_bags * d];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -138,12 +140,12 @@ fn gpu_one_hot(indices: &[i32], n: usize, c: usize) -> Vec<f64> {
 			o.ptr_raw(),
 			n as i32,
 			c as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	chk();
 	let mut out = vec![0.0; n * c];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -176,12 +178,12 @@ fn gpu_rope(x: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> Vec<f6
 			o.ptr_raw(),
 			n as i32,
 			d as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -214,12 +216,12 @@ fn gpu_rope_bwd(dy: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> V
 			o.ptr_raw(),
 			n as i32,
 			d as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	chk();
 	let mut out = vec![0.0; n * d];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -456,11 +458,11 @@ fn canon(name: &str) -> String {
 fn load_embedding() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -512,7 +514,7 @@ fn prove_embedding() {
 	// Walk the inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
 	let mut backlog: Vec<String> = Vec::new();
 	for name in &items {
 		let key = canon(name);

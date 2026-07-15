@@ -1,5 +1,6 @@
 use gpu_core::memory::GpuBuffer;
-use std::process::Command;
+use std::env;
+use std::process::{self, Command};
 
 // Repro of the cookbook "continue anyway? y" crash: allocations fill VRAM and
 // the first ask past the mappable ceiling dies in the uncatchable
@@ -9,17 +10,17 @@ use std::process::Command;
 // the bug.
 #[test]
 fn oversize_request_is_clean_oom_not_abort() {
-	if std::env::var("OVERSIZE_OOM_CHILD").is_ok() {
+	if env::var("OVERSIZE_OOM_CHILD").is_ok() {
 		let mut held = Vec::new();
 		loop {
 			eprintln!("fill: holding {} x 512MB, asking next", held.len());
 			match GpuBuffer::try_alloc_bytes(1usize << 29) {
 				Some(b) => held.push(b),
-				None => std::process::exit(0),
+				None => process::exit(0),
 			}
 		}
 	}
-	let exe = std::env::current_exe().expect("current_exe");
+	let exe = env::current_exe().expect("current_exe");
 	let mut cmd = Command::new(exe);
 	cmd.args([
 		"--exact",

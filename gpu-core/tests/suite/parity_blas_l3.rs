@@ -11,6 +11,7 @@
 
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
+use std::ptr;
 
 const TOL: f64 = 1e-9;
 
@@ -163,7 +164,7 @@ fn gemm_matches_cpu_oracle() {
 		kernels::gpu_gemm(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = {
 			let mut __dv = vec![0.0f64; cg.n_floats()];
-			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -197,7 +198,7 @@ fn gemm_at_matches_cpu_oracle() {
 		kernels::gpu_gemm_at(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = {
 			let mut __dv = vec![0.0f64; cg.n_floats()];
-			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -231,7 +232,7 @@ fn gemm_bt_matches_cpu_oracle() {
 		kernels::gpu_gemm_bt_into(&ag, &bg, m, n, k, &cg).unwrap();
 		let gpu = {
 			let mut __dv = vec![0.0f64; cg.n_floats()];
-			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -266,7 +267,7 @@ fn dsyrk_lower_triangle_matches_cpu_oracle() {
 		linalg::gpu_dsyrk(&ag, n, k, &cg).unwrap();
 		let gpu = {
 			let mut __dv = vec![0.0f64; cg.n_floats()];
-			unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};

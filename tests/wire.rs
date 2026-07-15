@@ -1,12 +1,14 @@
 use anyhow::Result;
 use recipe::wire::{Conn, FN_MOE_FFN, NodeInfo, Op, Server};
+use std::collections;
+use std::net;
 use std::thread;
 
 #[test]
 fn wire_loopback_roundtrip() -> Result<()> {
-	let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+	let listener = net::TcpListener::bind("127.0.0.1:0")?;
 	let addr = listener.local_addr()?.to_string();
-	let server = Server::new(NodeInfo::probe(), std::collections::HashMap::new());
+	let server = Server::new(NodeInfo::probe(), collections::HashMap::new());
 	thread::spawn(move || {
 		let _ = server.serve_on(listener);
 	});

@@ -11,6 +11,12 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error;
+use std::fmt;
+use std::mem;
+use std::path::Path;
+use std::process;
 
 /// The encoded numeric result handed to the trainer: feature matrix `x`, flat
 /// `n*n_targets` target vector `y`, and the column metadata the model needs.
@@ -39,7 +45,7 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 /// Filename → stem (drop directory + extension) so a CSV cell like
 /// `train/train_0001.png` matches an image vector keyed by `train_0001`.
 fn file_stem(s: &str) -> &str {
-	std::path::Path::new(s)
+	Path::new(s)
 		.file_stem()
 		.and_then(|x| x.to_str())
 		.unwrap_or(s)
@@ -76,11 +82,11 @@ pub(crate) fn is_missing(c: &str) -> bool {
 fn col_vocab(rows: &[Vec<String>], j: usize) -> Vec<String> {
 	let set = rows
 		.par_iter()
-		.fold(std::collections::HashSet::<String>::new, |mut acc, row| {
+		.fold(HashSet::<String>::new, |mut acc, row| {
 			acc.extend(tokenize(cell(row, j)));
 			acc
 		})
-		.reduce(std::collections::HashSet::<String>::new, |a, b| {
+		.reduce(HashSet::<String>::new, |a, b| {
 			let (mut big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
 			big.extend(small);
 			big
@@ -96,7 +102,7 @@ fn distinct_sorted(rows: &[Vec<String>], j: usize) -> Vec<String> {
 		.map(|row| cell(row, j))
 		.filter(|c| !is_missing(c))
 		.map(str::to_string)
-		.collect::<std::collections::HashSet<_>>()
+		.collect::<HashSet<_>>()
 		.into_iter()
 		.collect();
 	cats.sort_unstable();
@@ -156,7 +162,7 @@ fn infer_attrs(
 			Vec::new()
 		}
 	};
-	let mut pred = std::collections::HashMap::new();
+	let mut pred = HashMap::new();
 	for (i, &j) in to_predict.iter().enumerate() {
 		pred.insert(j, preds[i]);
 	}
@@ -402,8 +408,8 @@ pub struct CeilingExceeded {
 	pub cap: usize,
 }
 
-impl std::fmt::Display for CeilingExceeded {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CeilingExceeded {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
 			"{} buffer exceeds memory ceiling: {} rows × {} cols × 8B = {} (ceiling {})",
@@ -416,7 +422,7 @@ impl std::fmt::Display for CeilingExceeded {
 	}
 }
 
-impl std::error::Error for CeilingExceeded {}
+impl error::Error for CeilingExceeded {}
 
 /// Admit check for both the per-group encode and the cross-group selection. The
 /// run stops for two reasons, decided from live budgets (`tiered::admit`) before
@@ -434,10 +440,10 @@ fn admit_ceiling(
 ) -> anyhow::Result<()> {
 	let bytes = n
 		.saturating_mul(w)
-		.saturating_mul(std::mem::size_of::<f64>());
+		.saturating_mul(mem::size_of::<f64>());
 	// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
 	// sized against that filesystem's free space.
-	let spill = std::path::Path::new(".recipe_spill");
+	let spill = Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
 		Ok(bud) if bytes > bud.ram_data => recipe_infer::tiered::Full {
 			need: bytes,
@@ -478,7 +484,7 @@ fn admit_ceiling(
 			.iter()
 			.map(|(nm, c)| oom_pair(nm, &format!("{} ({c})", hb(cols_bytes(*c))))),
 	);
-	let mut bases: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+	let mut bases: BTreeMap<&str, usize> = BTreeMap::new();
 	for (nm, _) in top_cols.iter().filter(|(nm, _)| nm.contains("#t")) {
 		*bases.entry(nm.split("#t").next().unwrap_or(nm))
 			.or_insert(0) += 1;
@@ -507,7 +513,7 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 	let cells = n.saturating_mul(w);
 	let mut dat: Vec<f64> = Vec::new();
 	if dat.try_reserve_exact(cells).is_err() {
-		let spill = std::path::Path::new(".recipe_spill");
+		let spill = Path::new(".recipe_spill");
 		let cap = recipe_infer::tiered::admit(0, 0, 0, spill)
 			.map(|b| b.ram_data)
 			.unwrap_or(0);
@@ -515,7 +521,7 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 			label: label.to_string(),
 			rows: n,
 			cols: w,
-			need: cells.saturating_mul(std::mem::size_of::<f64>()),
+			need: cells.saturating_mul(mem::size_of::<f64>()),
 			cap,
 		}
 		.into());
@@ -524,7 +530,7 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 	Ok(dat)
 }
 
-type Schema = std::collections::BTreeMap<String, Vec<Attr>>;
+type Schema = BTreeMap<String, Vec<Attr>>;
 
 /// One table group's kinds, detected at `Data::set` time: the group name and its
 /// per-column kinds (positional to the group's headers).
@@ -565,7 +571,7 @@ impl Assembled {
 	fn select(&mut self, keep: &[String]) -> anyhow::Result<Mat> {
 		let n = self.samples;
 		let w = keep.len();
-		let idx: std::collections::HashMap<&str, usize> = self
+		let idx: HashMap<&str, usize> = self
 			.names
 			.iter()
 			.enumerate()
@@ -597,7 +603,7 @@ impl Assembled {
 			if compact {
 				let big_w = self.mats[mi].ncols();
 				let (mut buf, _) =
-					std::mem::take(&mut self.mats[mi]).into_raw_vec_and_offset();
+					mem::take(&mut self.mats[mi]).into_raw_vec_and_offset();
 				for i in 0..n {
 					let (ib, iw) = (i * big_w, i * w);
 					for (jc, &c) in cols.iter().enumerate() {
@@ -611,8 +617,8 @@ impl Assembled {
 		}
 
 		// General path: gather across sources / non-identity joins into a fresh matrix.
-		let mut by_col: std::collections::BTreeMap<&str, usize> =
-			std::collections::BTreeMap::new();
+		let mut by_col: BTreeMap<&str, usize> =
+			BTreeMap::new();
 		for name in keep {
 			*by_col
 				.entry(name.split('=').next().unwrap_or(name))
@@ -789,13 +795,13 @@ fn assemble(
 	gather.push((0..n).map(Some).collect());
 	mats.push(s_x);
 
-	let mut s_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+	let mut s_count: HashMap<&str, usize> = HashMap::new();
 	for h in s_hashes {
 		*s_count.entry(h.as_str()).or_insert(0) += 1;
 	}
 	let mut s_pos = vec![0usize; n];
 	{
-		let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+		let mut seen: HashMap<&str, usize> = HashMap::new();
 		for (i, h) in s_hashes.iter().enumerate() {
 			let c = seen.entry(h.as_str()).or_insert(0);
 			s_pos[i] = *c;
@@ -819,7 +825,7 @@ fn assemble(
 			Some(cells),
 		) = (g, sample_cells)
 		{
-			let key_set: std::collections::HashSet<&str> =
+			let key_set: HashSet<&str> =
 				g_hashes.iter().map(String::as_str).collect();
 			let ncols = cells.first().map_or(0, Vec::len);
 			let (mut best_col, mut best) = (0usize, 0usize);
@@ -836,7 +842,7 @@ fn assemble(
 				}
 			}
 			if best > 0 {
-				let by_key: std::collections::HashMap<&str, usize> = g_hashes
+				let by_key: HashMap<&str, usize> = g_hashes
 					.iter()
 					.enumerate()
 					.map(|(i, h)| (h.as_str(), i))
@@ -869,8 +875,8 @@ fn assemble(
 		}
 
 		let g_hashes = group_hashes(g);
-		let mut by_hash: std::collections::HashMap<&str, Vec<usize>> =
-			std::collections::HashMap::new();
+		let mut by_hash: HashMap<&str, Vec<usize>> =
+			HashMap::new();
 		for (gi2, h) in g_hashes.iter().enumerate() {
 			by_hash.entry(h.as_str()).or_default().push(gi2);
 		}
@@ -1003,7 +1009,7 @@ pub fn shuffle_split(
 		Dataset {
 			x: Mat::from_shape_vec((sel.len(), cols), xd).unwrap_or_else(|e| {
 				drop(Write::err(format!("split: x reshape: {e}")));
-				std::process::abort();
+				process::abort();
 			}),
 			y: Vec1::from(yd),
 			source: source.to_string(),
@@ -1082,7 +1088,7 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 				drop(Write::err(format!(
 					"NaN/inf in '{name}' — no missing values allowed here"
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			(0..v.len()).collect()
 		}
@@ -1102,7 +1108,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 		drop(Write::err(format!(
 			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
 		)));
-		std::process::exit(1);
+		process::exit(1);
 	}
 	if d.y.len() < n * k {
 		drop(Write::err(format!(
@@ -1110,7 +1116,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 			d.y.len(),
 			n * k
 		)));
-		std::process::exit(1);
+		process::exit(1);
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
 	for j in 0..k {

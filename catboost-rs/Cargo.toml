@@ -15,3 +15,5 @@ rand_distr = "0.5"
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+[lints]
+workspace = true

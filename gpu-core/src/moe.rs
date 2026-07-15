@@ -6,6 +6,8 @@ use crate::kernels::{
 };
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 fn cl() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
@@ -56,7 +58,7 @@ pub fn gpu_moe_weighted_accumulate(
 			d as i32,
 			n_experts as i32,
 			e as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -84,7 +86,7 @@ pub fn gpu_moe_weighted_accumulate_backward(
 			d as i32,
 			n_experts as i32,
 			e as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -103,8 +105,8 @@ pub fn gpu_moe_route(
 	let gate = GpuBuffer::alloc(n_tokens * n_experts)?;
 	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 
-	let out = GpuBuffer::alloc_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
-	out.memset_zero(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	let out = GpuBuffer::alloc_bytes(n_tokens * d_model * mem::size_of::<f64>())?;
+	out.memset_zero(n_tokens * d_model * mem::size_of::<f64>())?;
 	let expert_stride = d_model * d_model;
 	let ye = GpuBuffer::alloc(n_tokens * d_model)?;
 	for e in 0..n_experts {
@@ -130,8 +132,8 @@ pub fn gpu_moe_backward(
 	gpu_softmax_rows_into(&logits, n_tokens, n_experts, &gate)?;
 	let expert_stride = d_model * d_model;
 
-	let d_hidden = GpuBuffer::alloc_bytes(n_tokens * d_model * std::mem::size_of::<f64>())?;
-	d_hidden.memset_zero(n_tokens * d_model * std::mem::size_of::<f64>())?;
+	let d_hidden = GpuBuffer::alloc_bytes(n_tokens * d_model * mem::size_of::<f64>())?;
+	d_hidden.memset_zero(n_tokens * d_model * mem::size_of::<f64>())?;
 	let d_gate = GpuBuffer::alloc(n_tokens * n_experts)?;
 	let d_expert_w = GpuBuffer::alloc(n_experts * expert_stride)?;
 	let d_ye = GpuBuffer::alloc(n_tokens * d_model)?;

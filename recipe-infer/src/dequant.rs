@@ -1,3 +1,4 @@
+use std::process;
 pub fn block_layout(t: u32) -> (usize, usize) {
 	match t {
 		0 => (4, 1),
@@ -8,7 +9,7 @@ pub fn block_layout(t: u32) -> (usize, usize) {
 		14 => (210, 256),
 		_other => {
 			drop(gpu_core::log::Write::err(format!("gguf: unsupported ggml type {t}")));
-			std::process::abort()
+			process::abort()
 		}
 	}
 }
@@ -124,7 +125,7 @@ fn deqblock(t: u32, raw: &[u8], out: &mut Vec<f32>) {
 		}
 		_other => {
 			drop(gpu_core::log::Write::err(format!("gguf: dequant unsupported ggml type {t}")));
-			std::process::abort()
+			process::abort()
 		}
 	}
 }

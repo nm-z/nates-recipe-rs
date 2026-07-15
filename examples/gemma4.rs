@@ -1,8 +1,11 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use anyhow::{Result, anyhow, bail};
 use gpu_core::log::{Opt, Write, gpu, prompt as promptf, set_opt};
 use recipe_infer::llm::{generate, render_toks};
+use std::env;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process;
 
 fn ensure_vramspy_preloaded() -> Result<()> {
 	let loaded =
@@ -10,10 +13,10 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 	if loaded {
 		return Ok(());
 	}
-	if std::env::var_os("VRAMSPY_REEXEC").is_some() {
+	if env::var_os("VRAMSPY_REEXEC").is_some() {
 		bail!("vramspy re-exec loop: libvramspy.so did not load");
 	}
-	let exe = std::env::current_exe()?;
+	let exe = env::current_exe()?;
 	let shim = exe
 		.parent()
 		.and_then(|p| p.parent())
@@ -27,25 +30,25 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 			shim.display()
 		);
 	}
-	let ld_preload = match std::env::var("LD_PRELOAD") {
+	let ld_preload = match env::var("LD_PRELOAD") {
 		Ok(existing) if !existing.is_empty() => format!("{existing}:{}", shim.display()),
 		_other => shim.display().to_string(),
 	};
 	unsafe {
-		std::env::set_var("LD_PRELOAD", &ld_preload);
-		std::env::set_var("VRAMSPY_REEXEC", "1");
+		env::set_var("LD_PRELOAD", &ld_preload);
+		env::set_var("VRAMSPY_REEXEC", "1");
 	}
 	Write::line(gpu, "re-exec with vramspy");
 	Err(anyhow!(
-		std::process::Command::new(std::env::current_exe()?)
-			.args(std::env::args_os().skip(1))
+		process::Command::new(env::current_exe()?)
+			.args(env::args_os().skip(1))
 			.exec()
 	))
 }
 
 fn main() -> Result<()> {
 	if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-		std::process::exit(code);
+		process::exit(code);
 	}
 	set_opt(Opt {
 		prompt: true,
@@ -56,7 +59,7 @@ fn main() -> Result<()> {
 	ensure_vramspy_preloaded()?;
 
 	let gguf = Path::new("/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf");
-	let ask = std::env::args()
+	let ask = env::args()
 		.nth(1)
 		.unwrap_or_else(|| "The capital of France is".to_string());
 

@@ -18,8 +18,10 @@ use crate::common;
 //                      dim), tril, triu.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_indexingx_index_select(
@@ -95,12 +97,12 @@ fn gpu_index_select(src: &[f64], idx: &[i32], cols: usize) -> Vec<f64> {
 			o.ptr_raw(),
 			n as i32,
 			cols as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
 	let mut out = vec![0.0; n * cols];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -133,12 +135,12 @@ fn gpu_where(cond: &[f64], a: &[f64], b: &[f64]) -> Vec<f64> {
 			bb.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -167,12 +169,12 @@ fn gpu_index_add(base: &[f64], idx: &[i32], src: &[f64], cols: usize) -> Vec<f64
 			bs.ptr_raw() as *const c_void,
 			n as i32,
 			cols as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
 	let mut out = vec![0.0; rows * cols];
-	unsafe { bo.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { bo.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -190,12 +192,12 @@ fn gpu_diagonal(m: &[f64], n: usize) -> Vec<f64> {
 			bm.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -218,12 +220,12 @@ fn gpu_take_along(src: &[f64], idx: &[i32], rows: usize, cols: usize, k: usize) 
 			rows as i32,
 			cols as i32,
 			k as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
 	let mut out = vec![0.0; rows * k];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -242,20 +244,20 @@ fn gpu_tri(m: &[f64], n: usize, upper: bool) -> Vec<f64> {
 				bm.ptr_raw() as *const c_void,
 				o.ptr_raw(),
 				n as i32,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		} else {
 			launch_indexingx_tril(
 				bm.ptr_raw() as *const c_void,
 				o.ptr_raw(),
 				n as i32,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 	}
 	last_err();
 	let mut out = vec![0.0; n * n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -289,7 +291,7 @@ fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 			d_temp.ptr_raw(),
 			temp_bytes,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	last_err();
@@ -297,7 +299,7 @@ fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	bn.download_i32(&mut num).unwrap();
 	let num = num[0] as usize;
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	(num, out[..num].to_vec())
 }
@@ -501,11 +503,11 @@ fn canon(name: &str) -> Option<&'static str> {
 fn load_indexing() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -558,7 +560,7 @@ fn prove_indexing() {
 	// Walk the inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<&str> = Default::default();
+	let mut proven_keys: BTreeSet<&str> = Default::default();
 	for name in &items {
 		if let Some(key) = canon(name)
 			&& *op_ok.get(key).unwrap_or(&false)

@@ -5,9 +5,10 @@ use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::nn_f32::gpu_linear_f32;
 use ogdl::ogdl;
+use std::fmt;
 use std::time::Instant;
 
-fn say(t: impl std::fmt::Display) {
+fn say(t: impl fmt::Display) {
 	set_opt(Opt { probe: true, ..opt() });
 	Write::block(probe, ogdl!(&t));
 }

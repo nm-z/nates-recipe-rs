@@ -1,3 +1,4 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 //! LD_PRELOAD interposer for exactly four HSA allocation entry points:
 //! `hsa_amd_memory_pool_{allocate,free}` and `hsa_memory_{allocate,free}`.
 //! Every allocation is classified by which AGENT owns its pool (device vs.
@@ -14,8 +15,10 @@
 use log::Write;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
+use std::mem;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const KIND_DEVICE: u8 = 0;
 pub const KIND_HOST_PINNED: u8 = 1;
@@ -81,7 +84,7 @@ fn map() -> &'static Mutex<HashMap<usize, Alloc>> {
 	MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_map() -> std::sync::MutexGuard<'static, HashMap<usize, Alloc>> {
+fn lock_map() -> MutexGuard<'static, HashMap<usize, Alloc>> {
 	match map().lock() {
 		Ok(g) => g,
 		Err(p) => p.into_inner(),
@@ -124,7 +127,7 @@ fn resolve_next(name: &CStr) -> usize {
 	// SAFETY: dlsym with a valid NUL-terminated name; RTLD_NEXT is well-defined
 	// when this library was loaded via LD_PRELOAD.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-	match std::ptr::NonNull::new(p) {
+	match NonNull::new(p) {
 		Some(nn) => nn.as_ptr() as usize,
 		None => {
 			drop(Write::err(format!(
@@ -144,12 +147,12 @@ fn real() -> &'static Real {
 		// the resolved symbol; resolve_next() guarantees a non-null pointer.
 		unsafe {
 			Real {
-				pool_allocate: std::mem::transmute(resolve_next(
+				pool_allocate: mem::transmute(resolve_next(
 					c"hsa_amd_memory_pool_allocate",
 				)),
-				pool_free: std::mem::transmute(resolve_next(c"hsa_amd_memory_pool_free")),
-				mem_allocate: std::mem::transmute(resolve_next(c"hsa_memory_allocate")),
-				mem_free: std::mem::transmute(resolve_next(c"hsa_memory_free")),
+				pool_free: mem::transmute(resolve_next(c"hsa_amd_memory_pool_free")),
+				mem_allocate: mem::transmute(resolve_next(c"hsa_memory_allocate")),
+				mem_free: mem::transmute(resolve_next(c"hsa_memory_free")),
 			}
 		}
 	})
@@ -160,12 +163,12 @@ fn real() -> &'static Real {
 fn resolve_next_or_default(name: &CStr) -> Option<usize> {
 	// SAFETY: dlsym with a valid NUL-terminated name.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-	let q = match std::ptr::NonNull::new(p) {
+	let q = match NonNull::new(p) {
 		Some(nn) => nn.as_ptr(),
 		// SAFETY: same call, different pseudo-handle.
 		None => unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) },
 	};
-	std::ptr::NonNull::new(q).map(|nn| nn.as_ptr() as usize)
+	NonNull::new(q).map(|nn| nn.as_ptr() as usize)
 }
 
 enum DevKind {
@@ -303,13 +306,13 @@ fn pool_kinds() -> &'static HashMap<u64, u8> {
 		let iterate_agents: unsafe extern "C" fn(
 			extern "C" fn(u64, *mut c_void) -> i32,
 			*mut c_void,
-		) -> i32 = unsafe { std::mem::transmute(syms.ia) };
+		) -> i32 = unsafe { mem::transmute(syms.ia) };
 		let mut ctx = BuildCtx {
 			pools: &mut pools,
 			// SAFETY: same as above.
-			agent_get_info: unsafe { std::mem::transmute(syms.agi) },
-			iterate_pools: unsafe { std::mem::transmute(syms.ip) },
-			pool_get_info: unsafe { std::mem::transmute(syms.pgi) },
+			agent_get_info: unsafe { mem::transmute(syms.agi) },
+			iterate_pools: unsafe { mem::transmute(syms.ip) },
+			pool_get_info: unsafe { mem::transmute(syms.pgi) },
 		};
 		// SAFETY: agent_cb matches the callback signature hsa_iterate_agents expects;
 		// ctx outlives this call.
@@ -338,7 +341,7 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 	};
 	// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
 	let p = unsafe { *ptr };
-	let Some(nn) = std::ptr::NonNull::new(p) else {
+	let Some(nn) = NonNull::new(p) else {
 		return status;
 	};
 	record_alloc(nn.as_ptr() as usize, size as u64, classify_pool(pool));
@@ -369,7 +372,7 @@ pub unsafe extern "C" fn hsa_memory_allocate(
 	};
 	// SAFETY: status==SUCCESS guarantees the real allocator wrote a valid pointer.
 	let p = unsafe { *ptr };
-	let Some(nn) = std::ptr::NonNull::new(p) else {
+	let Some(nn) = NonNull::new(p) else {
 		return status;
 	};
 	// Legacy region API: ROCr on AMD uses the pool API for everything that

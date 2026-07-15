@@ -1,12 +1,20 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
+use std::any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const TEST_DEADLINE_SECS: f64 = 60.0;
@@ -57,11 +65,11 @@ impl Tally {
 }
 
 fn out(s: &str) {
-	let _ = writeln!(std::io::stdout(), "{s}");
+	let _ = writeln!(io::stdout(), "{s}");
 }
 
 fn errline(s: &str) {
-	let _ = writeln!(std::io::stderr(), "{s}");
+	let _ = writeln!(io::stderr(), "{s}");
 }
 
 struct Log {
@@ -103,7 +111,7 @@ fn install_traps() {
 
 fn main() {
 	install_traps();
-	let code = match std::panic::catch_unwind(run) {
+	let code = match panic::catch_unwind(run) {
 		Ok(c) => c,
 		Err(p) => fatal(&format!("suite panicked: {}", panic_msg(&*p))),
 	};
@@ -113,7 +121,7 @@ fn main() {
 			libc::kill(-pgid, libc::SIGKILL);
 		}
 	}
-	std::process::exit(code);
+	process::exit(code);
 }
 
 fn acquire_lock() -> Option<File> {
@@ -122,7 +130,7 @@ fn acquire_lock() -> Option<File> {
 	if rc == 0 { Some(f) } else { None }
 }
 
-fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
+fn panic_msg(p: &(dyn any::Any + Send)) -> String {
 	if let Some(s) = p.downcast_ref::<&str>() {
 		return (*s).to_owned();
 	}
@@ -134,7 +142,7 @@ fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
 
 fn run() -> i32 {
 	let t0 = Instant::now();
-	let args: Vec<String> = std::env::args().skip(1).collect();
+	let args: Vec<String> = env::args().skip(1).collect();
 	let filter: Option<String> = match args.as_slice() {
 		[] => None,
 		[a] if a == "all" => None,
@@ -235,7 +243,7 @@ fn run() -> i32 {
 	let cache = load_cache();
 	let mut passes: Vec<(String, u64)> = Vec::new();
 
-	let ended = std::panic::catch_unwind(AssertUnwindSafe(|| {
+	let ended = panic::catch_unwind(AssertUnwindSafe(|| {
 		dispatch(
 			&mut log,
 			&probe,
@@ -414,7 +422,7 @@ fn settled_holders(log: &mut Log, known: &[i32]) -> Vec<i32> {
 		if t0.elapsed().as_secs_f64() >= DEVICE_FREE_DEADLINE_SECS {
 			return leaked;
 		}
-		std::thread::sleep(Duration::from_millis(50));
+		thread::sleep(Duration::from_millis(50));
 	}
 }
 
@@ -512,7 +520,7 @@ fn await_kfd_teardown(pid: u32) {
 			));
 			return;
 		}
-		std::thread::sleep(Duration::from_millis(3));
+		thread::sleep(Duration::from_millis(3));
 	}
 }
 
@@ -553,7 +561,7 @@ fn run_test(t: &Test) -> Attempt {
 					child.wait().expect("waitpid after kill");
 					break (TEST_DEADLINE_SECS, None);
 				}
-				std::thread::sleep(Duration::from_millis(3));
+				thread::sleep(Duration::from_millis(3));
 			}
 		}
 	};
@@ -617,7 +625,7 @@ fn probe_ok(probe: &Path) -> bool {
 					let _ = child.wait();
 					break false;
 				}
-				std::thread::sleep(Duration::from_millis(3));
+				thread::sleep(Duration::from_millis(3));
 			}
 			Err(_) => break false,
 		}
@@ -636,7 +644,7 @@ fn kfd_holders() -> Vec<i32> {
 		Ok(o) => o,
 		Err(_) => return Vec::new(),
 	};
-	let me = std::process::id() as i32;
+	let me = process::id() as i32;
 	String::from_utf8_lossy(&out.stdout)
 		.split_whitespace()
 		.filter_map(|tok| {
@@ -780,7 +788,7 @@ fn cache_path() -> PathBuf {
 
 fn load_cache() -> BTreeMap<String, u64> {
 	let mut map = BTreeMap::new();
-	if let Ok(text) = std::fs::read_to_string(cache_path()) {
+	if let Ok(text) = fs::read_to_string(cache_path()) {
 		for line in text.lines() {
 			if let Some((hex, id)) = line.split_once('\t')
 				&& let Ok(h) = u64::from_str_radix(hex, 16)
@@ -800,7 +808,7 @@ fn store_cache(mut cache: BTreeMap<String, u64>, passes: &[(String, u64)]) {
 	for (id, h) in &cache {
 		text.push_str(&format!("{h:016x}\t{id}\n"));
 	}
-	std::fs::write(cache_path(), text).expect("write suite cache");
+	fs::write(cache_path(), text).expect("write suite cache");
 }
 
 fn crate_source_texts(cwd: &Path) -> Vec<String> {
@@ -808,12 +816,12 @@ fn crate_source_texts(cwd: &Path) -> Vec<String> {
 	collect_rs(cwd, &mut files);
 	files.sort();
 	files.iter()
-		.filter_map(|p| std::fs::read_to_string(p).ok())
+		.filter_map(|p| fs::read_to_string(p).ok())
 		.collect()
 }
 
 fn collect_rs(dir: &Path, files: &mut Vec<PathBuf>) {
-	let Ok(rd) = std::fs::read_dir(dir) else {
+	let Ok(rd) = fs::read_dir(dir) else {
 		return;
 	};
 	for e in rd.flatten() {

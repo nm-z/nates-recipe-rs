@@ -1,3 +1,6 @@
+use std::env;
+use std::fs;
+use std::process;
 use std::sync::OnceLock;
 
 static DIR: OnceLock<String> = OnceLock::new();
@@ -8,8 +11,8 @@ pub fn inventory_dir() -> String {
 
 fn hydrate() -> String {
 	let db_path = format!("{}/../kernel_inventory.db", env!("CARGO_MANIFEST_DIR"));
-	let out = std::env::temp_dir().join(format!("ki_inv_{}", std::process::id()));
-	std::fs::create_dir_all(&out).expect("create temp inventory dir");
+	let out = env::temp_dir().join(format!("ki_inv_{}", process::id()));
+	fs::create_dir_all(&out).expect("create temp inventory dir");
 	let conn =
 		rusqlite::Connection::open(&db_path).unwrap_or_else(|e| panic!("open {db_path}: {e}"));
 
@@ -44,7 +47,7 @@ fn hydrate() -> String {
                   .filter_map(Result::ok)
                   .collect();
 		let doc = serde_json::json!({ "source": src, "kernels": kernels });
-		std::fs::write(
+		fs::write(
 			out.join(format!("{src}.json")),
 			serde_json::to_string(&doc).unwrap(),
 		)

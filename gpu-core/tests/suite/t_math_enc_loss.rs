@@ -2,6 +2,8 @@ use gpu_core::encoding::*;
 use gpu_core::losses::*;
 use gpu_core::math_ops::*;
 use gpu_core::memory::GpuBuffer;
+use std::f64::consts;
+use std::ptr;
 
 fn approx_eq(a: f64, b: f64) -> bool {
 	(a - b).abs() < 1e-6 * (1.0 + b.abs())
@@ -22,7 +24,7 @@ fn out_buf(n: usize) -> GpuBuffer {
 
 fn download(buf: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; n];
-	unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download");
+	unsafe { buf.download_async(&mut v, ptr::null_mut()) }.expect("download");
 	gpu_core::hip::device_synchronize().expect("download");
 	v
 }
@@ -93,8 +95,8 @@ fn test_min() {
 fn test_sin_cos_tan() {
 	let angles = [
 		0.0f64,
-		std::f64::consts::PI / 6.0,
-		std::f64::consts::PI / 4.0,
+		consts::PI / 6.0,
+		consts::PI / 4.0,
 	];
 	let x = upload(&angles);
 
@@ -147,12 +149,12 @@ fn test_atan2() {
 	gpu_atan2(&y, &x, 3, &out).unwrap();
 	let r = download(&out, 3);
 	assert!(
-		approx_eq(r[0], std::f64::consts::PI / 4.0),
+		approx_eq(r[0], consts::PI / 4.0),
 		"atan2(1,1) expected pi/4, got {}",
 		r[0]
 	);
 	assert!(
-		approx_eq(r[1], std::f64::consts::PI / 2.0),
+		approx_eq(r[1], consts::PI / 2.0),
 		"atan2(1,0) expected pi/2, got {}",
 		r[1]
 	);

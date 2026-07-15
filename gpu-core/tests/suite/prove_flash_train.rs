@@ -1,5 +1,6 @@
 use gpu_core::kernels::{gpu_flash_attention_backward_into, gpu_flash_attention_train_into};
 use gpu_core::memory::GpuBuffer;
+use std::ptr;
 
 // Deterministic pseudo-random fill (no rand dep in this crate's tests).
 fn lcg_fill(v: &mut [f64], mut state: u64) {
@@ -152,7 +153,7 @@ fn flash_train_matches_cpu_oracle() {
 
 	let dl = |b: &GpuBuffer, l: usize| {
 		let mut h = vec![0.0; l];
-		unsafe { b.download_async(&mut h, std::ptr::null_mut()) }.expect("download");
+		unsafe { b.download_async(&mut h, ptr::null_mut()) }.expect("download");
 		gpu_core::hip::device_synchronize().expect("download");
 		h
 	};

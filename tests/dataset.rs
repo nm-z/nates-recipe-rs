@@ -1,5 +1,8 @@
 use pantry::Kind;
 use recipe::dataset::{Data, Datasets, SafeTable, safetensors_to_table};
+use std::env;
+use std::fs;
+use std::process;
 
 #[test]
 fn data_load_reads_safetensors_source() {
@@ -16,8 +19,8 @@ fn data_load_reads_safetensors_source() {
 	for v in [10.0f64, 20.0, 30.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	let path = std::env::temp_dir().join("recipe_st_source_test.safetensors");
-	std::fs::write(&path, &bytes).expect("write temp safetensors");
+	let path = env::temp_dir().join("recipe_st_source_test.safetensors");
+	fs::write(&path, &bytes).expect("write temp safetensors");
 	let p = path.to_str().expect("temp path utf8");
 
 	let SafeTable { attrs, rows } = safetensors_to_table(p).expect("safetensors table");
@@ -36,7 +39,7 @@ fn data_load_reads_safetensors_source() {
 	assert_eq!(set.n_targets, 1, "single target (y)");
 	let total = set.x.nrows() + test.as_ref().map_or(0, |t| t.x.nrows());
 	assert_eq!(total, 3, "all rows preserved across the split");
-	let _ = std::fs::remove_file(&path);
+	let _ = fs::remove_file(&path);
 }
 
 #[test]
@@ -58,11 +61,11 @@ fn data_load_materializes_safetensors_shard() {
 	for v in [1.0f64, 2.0, 3.0, 4.0] {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
-	let path = std::env::temp_dir().join(format!(
+	let path = env::temp_dir().join(format!(
 		"recipe_st_shard_{}.safetensors",
-		std::process::id()
+		process::id()
 	));
-	std::fs::write(&path, &bytes).expect("write temp safetensors shard");
+	fs::write(&path, &bytes).expect("write temp safetensors shard");
 	let p = path.to_str().expect("temp path utf8");
 
 	let data = Data::load(p).target("label");
@@ -88,7 +91,7 @@ fn data_load_materializes_safetensors_shard() {
 		400.0,
 		"F64 bias, last feature column, last row"
 	);
-	let _ = std::fs::remove_file(&path);
+	let _ = fs::remove_file(&path);
 }
 
 #[test]

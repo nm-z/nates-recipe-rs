@@ -2,6 +2,11 @@
 // no env overrides, no filesystem probes, no hardcoded default. Installing is
 // the package manager's job, never the build's: a missing or undecided HIP
 // runtime fails the build with the package names.
+use std::env;
+use std::fs;
+use std::io;
+use std::process;
+
 enum Platform {
 	Amd,
 	Nvidia,
@@ -9,23 +14,23 @@ enum Platform {
 
 fn put(s: &str) {
 	use std::io::Write as _;
-	let mut o = std::io::stdout();
+	let mut o = io::stdout();
 	drop(o.write_all(s.as_bytes()));
 	drop(o.write_all(b"\n"));
 }
 
 fn die(s: &str) -> ! {
 	use std::io::Write as _;
-	let mut e = std::io::stderr();
+	let mut e = io::stderr();
 	drop(e.write_all(s.as_bytes()));
 	drop(e.write_all(b"\n"));
-	std::process::exit(1)
+	process::exit(1)
 }
 
 fn hipconfig(flag: &str) -> String {
-	let out = match std::process::Command::new("hipconfig").arg(flag).output() {
+	let out = match process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
 			die("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
 		}
 		Err(e) => die(&format!("hipconfig {flag}: cannot run: {e}")),
@@ -62,7 +67,7 @@ fn main() {
 		Platform::Nvidia => {
 			let rocm = rocm_path();
 			let cuda =
-				std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
+				env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
 			// hipBLAS/hipSOLVER/hipFFT for the NVIDIA platform (wrap cuBLAS/
 			// cuSOLVER/cuFFT) live in the HIP install tree, same as on AMD.
 			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
@@ -79,7 +84,7 @@ fn main() {
 		Platform::Amd => {
 			let rocm = rocm_path();
 			let rocm_extra =
-				std::env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
+				env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
 			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
 			put("cargo:rustc-link-lib=dylib=amdhip64");
 			put(&format!("cargo:rustc-link-search=native={rocm_extra}"));
@@ -103,7 +108,7 @@ fn ban_sync_alloc() {
 		"fn hipFree",
 	];
 	for entry in walkdir("src") {
-		let text = std::fs::read_to_string(&entry).unwrap_or_default();
+		let text = fs::read_to_string(&entry).unwrap_or_default();
 		let mut lineno = 0usize;
 		for line in text.lines() {
 			lineno += 1;
@@ -129,7 +134,7 @@ fn ban_sync_alloc() {
 
 fn walkdir(dir: &str) -> Vec<String> {
 	let mut out = Vec::new();
-	let Ok(rd) = std::fs::read_dir(dir) else {
+	let Ok(rd) = fs::read_dir(dir) else {
 		return out;
 	};
 	for e in rd.flatten() {

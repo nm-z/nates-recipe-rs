@@ -14,8 +14,10 @@ use crate::common;
 // are NOT mapped into the forward-conv buckets and remain honest backlog.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // ── FFI: convx_ launchers (signatures must match convx.hip EXACTLY) ───────────
 unsafe extern "C" {
@@ -173,7 +175,7 @@ fn run_gpu<F: FnOnce(*mut c_void)>(out_len: usize, launch: F) -> Vec<f64> {
 	launch(o.ptr_raw());
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; out_len];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -217,7 +219,7 @@ fn prove_conv1d() -> bool {
 			k as i32,
 			lout as i32,
 			1, // stride
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * lout];
@@ -277,7 +279,7 @@ fn prove_conv2d() -> bool {
 			kw as i32,
 			hout as i32,
 			wout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * hout * wout];
@@ -345,7 +347,7 @@ fn prove_conv3d() -> bool {
 			dout as i32,
 			hout as i32,
 			wout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * dout * hout * wout];
@@ -417,7 +419,7 @@ fn prove_depthwise_conv1d() -> bool {
 			m as i32,
 			k as i32,
 			lout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * lout];
@@ -477,7 +479,7 @@ fn prove_depthwise_conv2d() -> bool {
 			kw as i32,
 			hout as i32,
 			wout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * hout * wout];
@@ -544,7 +546,7 @@ fn prove_grouped_conv2d() -> bool {
 			kw as i32,
 			hout as i32,
 			wout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * cout * hout * wout];
@@ -612,7 +614,7 @@ fn prove_convtranspose2d() -> bool {
 			kw as i32,
 			hout as i32,
 			wout as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	// Oracle: transposed convolution = adjoint of forward cross-correlation.
@@ -680,7 +682,7 @@ fn prove_dilation2d(erode: bool) -> bool {
 			hout as i32,
 			wout as i32,
 			if erode { 1 } else { 0 },
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	});
 	let mut want = vec![0.0; n * c * hout * wout];
@@ -725,7 +727,7 @@ fn prove_im2col_2d() -> bool {
 	let mut got = vec![0.0; n * oh * ow * c * kh * kw];
 	let bout = GpuBuffer::alloc(n * oh * ow * c * kh * kw).unwrap();
 	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &bout).unwrap();
-	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	// Oracle: patches[(n*oh*ow), (c*kh*kw)], patch[(...,p),(c,ph,pw)] = x[n,c,oh+ph,ow+pw]
 	let ps = c * kh * kw;
@@ -763,7 +765,7 @@ fn prove_im2col_1d() -> bool {
 	let mut got = vec![0.0; n * out_len * ks];
 	let bout = GpuBuffer::alloc(n * out_len * ks).unwrap();
 	gpu_im2col_1d(&bx, n, p, ks, &bout).unwrap();
-	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut want = vec![0.0; n * out_len * ks];
 	for i in 0..n {
@@ -795,7 +797,7 @@ fn prove_col2im_2d() -> bool {
 	let mut got = vec![0.0; n * c * h * w];
 	let bout = GpuBuffer::alloc(n * c * h * w).unwrap();
 	gpu_col2im_2d(&patches, n, c, h, w, kh, kw, &bout).unwrap();
-	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	// Oracle: scatter-add the same patch values back; equals x scaled by per-cell
 	// overlap multiplicity (number of (oh,ow) windows covering that cell).
@@ -836,7 +838,7 @@ fn prove_col2im_1d() -> bool {
 	let mut got = vec![0.0; n * p];
 	let bout = GpuBuffer::alloc(n * p).unwrap();
 	gpu_col2im_1d(&patches, n, p, ks, &bout).unwrap();
-	unsafe { bout.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut want = vec![0.0; n * p];
 	for i in 0..n {
@@ -1009,11 +1011,11 @@ fn canon(name: &str) -> Option<&'static str> {
 fn load_conv() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -1072,7 +1074,7 @@ fn prove_conv() {
 	// Walk inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<&str> = Default::default();
+	let mut proven_keys: BTreeSet<&str> = Default::default();
 	for name in &items {
 		if let Some(key) = canon(name)
 			&& *op_ok.get(key).unwrap_or(&false)

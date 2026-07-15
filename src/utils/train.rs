@@ -9,9 +9,14 @@ use recipe_infer::{
 	load_ogdl, load_ogdl_str, metric_gpu_into, pinned_vocab, plan_layer_params,
 	zscore_apply_views,
 };
-use std::io::IsTerminal;
+use std::ffi::c_void;
+use std::fs;
+use std::io::{self, IsTerminal};
+use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-pub(crate) static INTERRUPTED: std::sync::atomic::AtomicUsize = AtomicUsize::new(0);
+use std::time::Instant;
+pub(crate) static INTERRUPTED: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn on_sigint(_sig: i32) {
 	let Some(_second) = Some(()).filter(|_probe| INTERRUPTED.swap(1, Ordering::SeqCst) != 0)
 	else {
@@ -123,18 +128,18 @@ impl ModelInner {
 		dat: &Dataset,
 		cfg: &Train,
 		resume: Option<&str>,
-		net: Option<std::sync::Arc<Vec<crate::wire::Conn>>>,
+		net: Option<Arc<Vec<crate::wire::Conn>>>,
 	) -> anyhow::Result<()> {
 		let hip_snap = Some(())
 			.filter(|_probe| cfg.metrics.contains(&Metric::Hip))
 			.map(|_probe| gpu_core::callspy::snapshot());
 		let led_snap = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
-		let start = std::time::Instant::now();
+		let start = Instant::now();
 		let classify = self.loss.is_classification();
 		let rerun = !self.params.borrow().is_empty();
 		let checkpoint_path = cfg.resume.as_deref().map(Train::resolve);
 		let checkpointing = checkpoint_path.is_some();
-		let plotting = !cfg.plot.is_empty() && std::io::stdout().is_terminal();
+		let plotting = !cfg.plot.is_empty() && io::stdout().is_terminal();
 		let plot_ys: Vec<Metric> = cfg
 			.plot
 			.iter()
@@ -217,16 +222,16 @@ impl ModelInner {
 			drop(Write::err(&format!("        {what}")));
 			drop(Write::err(&format!("        file path={}", resume.unwrap_or(""))));
 			drop(Write::err(&format!("        data path={}", dat.source)));
-			let Some(_tty) = Some(()).filter(|_probe| std::io::stdin().is_terminal()) else {
+			let Some(_tty) = Some(()).filter(|_probe| io::stdin().is_terminal()) else {
 				return YesNo::No;
 			};
 			Write::line(
 				prompt,
 				"overwrite checkpoint with random weights? [y/N] ",
 			);
-			std::io::stderr().flush().ok();
+			io::stderr().flush().ok();
 			let mut line = String::new();
-			std::io::stdin().read_line(&mut line).ok();
+			io::stdin().read_line(&mut line).ok();
 			match line.trim() {
 				"y" | "Y" | "yes" | "YES" => YesNo::Yes,
 				_other => YesNo::No,
@@ -535,7 +540,7 @@ impl ModelInner {
 					.filter(|_probe| matches!(did_resume, Resumed::Yes))
 					.map(|_probe| {
 						resume.map(|path| {
-							let full = std::fs::canonicalize(path)
+							let full = fs::canonicalize(path)
 								.unwrap_or_else(|_err| path.into());
 							Write::line(save, &format!("resumed: {}", full.display()));
 						})
@@ -847,7 +852,7 @@ impl ModelInner {
 							)),
 							None => {
 								recipe_infer::write_ogdl(path, text)?;
-								let full = std::fs::canonicalize(path)
+								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
 								Write::line(save, &format!(
 									"saved {} ({key} {fit_score:.4})",
@@ -865,7 +870,7 @@ impl ModelInner {
 							})
 							.map(|s| -> anyhow::Result<()> {
 								recipe_infer::write_ogdl(path, text)?;
-								let full = std::fs::canonicalize(path)
+								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
 								Write::line(save, &format!(
 									"saved {} ({neurons} neurons, {key} {s:.4})",
@@ -932,7 +937,7 @@ impl ModelInner {
 	fn park(
 		&self,
 		slab: GpuBuffer,
-		src: *mut std::ffi::c_void,
+		src: *mut c_void,
 		prefix_len: usize,
 		sc: Scratch,
 	) -> anyhow::Result<Vec<f64>> {
@@ -987,14 +992,14 @@ impl ModelInner {
 					"eval: feature count changed: {} vs {cols}",
 					sc.mean.len()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			if sc.std.len() != cols {
 				drop(Write::err(format!(
 					"eval: feature count changed: {} vs {cols}",
 					sc.std.len()
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			let mut st = Stage::new();
 			let m_off = st.push(&sc.mean);

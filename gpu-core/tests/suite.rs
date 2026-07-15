@@ -1,3 +1,4 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 mod common;
 #[path = "suite/_gpu_live.rs"]
 mod gpu_live;

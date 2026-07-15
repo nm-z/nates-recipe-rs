@@ -13,3 +13,6 @@ gpu-core = { path = "../gpu-core" }
 tokenizers = "0.21"
 ndarray = "0.16"
 ogdl = { path = "../ogdl" }
+
+[lints]
+workspace = true

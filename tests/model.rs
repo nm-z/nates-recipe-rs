@@ -2,10 +2,14 @@ use gpu_core::kernels;
 use recipe::train::StepScalars;
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process;
 use std::sync::LazyLock;
 
 fn rss_bytes() -> usize {
-	let statm = std::fs::read_to_string("/proc/self/statm").expect("read /proc/self/statm");
+	let statm = fs::read_to_string("/proc/self/statm").expect("read /proc/self/statm");
 	let pages: usize = statm
 		.split_whitespace()
 		.nth(1)
@@ -18,8 +22,8 @@ fn rss_bytes() -> usize {
 #[test]
 fn builders_are_owned_not_leaked() {
 	let path =
-		std::env::temp_dir().join(format!("recipe_builder_own_{}.arff", std::process::id()));
-	std::fs::write(
+		env::temp_dir().join(format!("recipe_builder_own_{}.arff", process::id()));
+	fs::write(
 		&path,
 		"@relation t\n@attribute a numeric\n@attribute y numeric\n@data\n1,2\n3,4\n",
 	)
@@ -44,7 +48,7 @@ fn builders_are_owned_not_leaked() {
 		cycle(p);
 	}
 	let growth = rss_bytes().saturating_sub(before);
-	let _ = std::fs::remove_file(&path);
+	let _ = fs::remove_file(&path);
 	assert!(
 		growth < 8 << 20,
 		"builders leak: RSS grew {growth} B across {N} build cycles (owned builders keep it flat)"
@@ -68,7 +72,7 @@ fn consts_buf() -> GpuBuffer {
 static CHURN: LazyLock<recipe::dataset::Dataset> = LazyLock::new(|| {
 	const TRAIN: &str = "datasets/playground-series-s6e3/train.csv";
 	assert!(
-		std::path::Path::new(TRAIN).exists(),
+		Path::new(TRAIN).exists(),
 		"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",
 	);
 	let data = recipe::dataset::Data::load(TRAIN).target("Churn");

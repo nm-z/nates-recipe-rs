@@ -4,11 +4,23 @@ use anyhow::{Result, bail, ensure};
 use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::ffi::CStr;
+use std::fmt;
+use std::fs;
+use std::io;
 use std::io::{Read, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::process;
+use std::ptr;
+use std::slice;
+use std::str::from_utf8;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 pub const MAGIC: u32 = 0x5243_5031;
 pub const PORT: u16 = 7845;
@@ -141,7 +153,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
 	pub fn probe() -> NodeInfo {
-		let arch = std::env::var("GPU_ARCH").unwrap_or_else(|_env| "storage".to_string());
+		let arch = env::var("GPU_ARCH").unwrap_or_else(|_env| "storage".to_string());
 		NodeInfo {
 			arch,
 			gpus: 0,
@@ -153,7 +165,7 @@ impl NodeInfo {
 		format!("{}{NL}{}{NL}{}{NL}{}", self.arch, self.gpus, self.vram, self.ram).into_bytes()
 	}
 	fn decode(b: &[u8]) -> Result<NodeInfo> {
-		let s = std::str::from_utf8(b)?;
+		let s = from_utf8(b)?;
 		let mut it = s.split(NL);
 		let arch = it.next().unwrap_or("").to_string();
 		let gpus = it.next().unwrap_or("0").parse()?;
@@ -169,7 +181,7 @@ impl NodeInfo {
 }
 
 fn mem_available() -> u64 {
-	let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
+	let Ok(s) = fs::read_to_string("/proc/meminfo") else {
 		return 0;
 	};
 	s.lines()
@@ -182,7 +194,7 @@ fn mem_available() -> u64 {
 }
 
 fn hostname() -> String {
-	std::fs::read_to_string("/proc/sys/kernel/hostname")
+	fs::read_to_string("/proc/sys/kernel/hostname")
 		.map(|s| s.trim().to_string())
 		.unwrap_or_default()
 }
@@ -193,15 +205,15 @@ enum Link {
 }
 
 struct Iface {
-	ip: std::net::Ipv4Addr,
-	bcast: std::net::Ipv4Addr,
+	ip: Ipv4Addr,
+	bcast: Ipv4Addr,
 	link: Link,
 }
 
 fn ifaces() -> Vec<Iface> {
 	let mut out = Vec::new();
 	unsafe {
-		let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+		let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
 		let Ordering::Equal = libc::getifaddrs(&mut ifap).cmp(&0) else {
 			return out;
 		};
@@ -221,19 +233,19 @@ fn ifaces() -> Vec<Iface> {
 					Some(nm) => u32::from_be(nm.sin_addr.s_addr),
 					None => 0,
 				};
-				let name = std::ffi::CStr::from_ptr(a.ifa_name)
+				let name = CStr::from_ptr(a.ifa_name)
 					.to_string_lossy()
 					.into_owned();
 				let link =
-					match std::fs::metadata(format!("/sys/class/net/{name}/wireless"))
+					match fs::metadata(format!("/sys/class/net/{name}/wireless"))
 						.ok()
 					{
 						Some(_meta) => Link::Wireless,
 						None => Link::Wired,
 					};
 				out.push(Iface {
-					ip: std::net::Ipv4Addr::from(ip),
-					bcast: std::net::Ipv4Addr::from(ip | !mask),
+					ip: Ipv4Addr::from(ip),
+					bcast: Ipv4Addr::from(ip | !mask),
 					link,
 				});
 			}
@@ -248,7 +260,7 @@ fn ifaces() -> Vec<Iface> {
 struct AddrStamp {
 	kind: String,
 	addr: String,
-	seen: std::time::Instant,
+	seen: Instant,
 }
 
 struct PeerRec {
@@ -265,13 +277,13 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 	let mach_line = machine.as_ref().map(|m| m.beacon_encode());
 	loop {
 		if pool_deselected().contains(&host) {
-			thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
+			thread::sleep(Duration::from_secs(BEACON_SECS));
 			continue;
 		}
 		let info = NodeInfo::probe();
 		for i in ifaces() {
-			let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(i.ip), 0);
-			let Ok(s) = std::net::UdpSocket::bind(bind) else {
+			let bind = SocketAddr::new(IpAddr::V4(i.ip), 0);
+			let Ok(s) = UdpSocket::bind(bind) else {
 				continue;
 			};
 			drop(recipe_infer::bridge::broadcast_on(&s));
@@ -289,17 +301,17 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 			}
 			let mut buf = BEACON_MAGIC.to_le_bytes().to_vec();
 			buf.extend_from_slice(body.as_bytes());
-			let dst = std::net::SocketAddr::new(std::net::IpAddr::V4(i.bcast), PORT);
+			let dst = SocketAddr::new(IpAddr::V4(i.bcast), PORT);
 			drop(s.send_to(&buf, dst));
 		}
-		thread::sleep(std::time::Duration::from_secs(BEACON_SECS));
+		thread::sleep(Duration::from_secs(BEACON_SECS));
 	}
 }
 
 fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let bind =
-		std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), PORT);
-	let sock = match std::net::UdpSocket::bind(bind) {
+		SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+	let sock = match UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
 			drop(Write::err(&format!(
@@ -320,7 +332,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 				else {
 					continue;
 				};
-				let Ok(text) = std::str::from_utf8(&buf[4..r.n]) else {
+				let Ok(text) = from_utf8(&buf[4..r.n]) else {
 					continue;
 				};
 				let mut it = text.splitn(4, NL);
@@ -354,12 +366,12 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 						match rec.addrs.iter_mut().find(|e| e.kind == kind) {
 							Some(e) => {
 								e.addr = addr;
-								e.seen = std::time::Instant::now();
+								e.seen = Instant::now();
 							}
 							None => rec.addrs.push(AddrStamp {
 								kind: kind.to_string(),
 								addr,
-								seen: std::time::Instant::now(),
+								seen: Instant::now(),
 							}),
 						}
 						let diff = rec.machine != machine;
@@ -476,12 +488,12 @@ pub fn self_host() -> String {
 	hostname()
 }
 
-pub fn pool_deselected() -> std::collections::HashSet<String> {
+pub fn pool_deselected() -> HashSet<String> {
 	let Ok(path) = crate::machine::pool_path() else {
-		return std::collections::HashSet::new();
+		return HashSet::new();
 	};
-	let Ok(s) = std::fs::read_to_string(path) else {
-		return std::collections::HashSet::new();
+	let Ok(s) = fs::read_to_string(path) else {
+		return HashSet::new();
 	};
 	s.lines()
 		.map(str::trim)
@@ -493,7 +505,7 @@ pub fn pool_deselected() -> std::collections::HashSet<String> {
 pub fn pool_write(deselected: &[String]) -> Result<()> {
 	let path = crate::machine::pool_path()?;
 	for parent in path.parent().into_iter() {
-		std::fs::create_dir_all(parent)?;
+		fs::create_dir_all(parent)?;
 	}
 	let tmp = path.with_extension("ogdl.tmp");
 	let mut text = String::new();
@@ -501,8 +513,8 @@ pub fn pool_write(deselected: &[String]) -> Result<()> {
 		text.push_str(h);
 		text.push(NL);
 	}
-	std::fs::write(&tmp, text)?;
-	std::fs::rename(&tmp, &path)?;
+	fs::write(&tmp, text)?;
+	fs::rename(&tmp, &path)?;
 	Ok(())
 }
 
@@ -515,14 +527,14 @@ pub struct Conn {
 
 impl Conn {
 	pub fn connect(addr: &str) -> Result<Conn> {
-		use std::net::ToSocketAddrs;
+		use ToSocketAddrs;
 		let sa = addr
 			.to_socket_addrs()?
 			.next()
 			.ok_or_else(|| anyhow::anyhow!("wire: {addr} resolves to nothing"))?;
 		let stream = TcpStream::connect_timeout(
 			&sa,
-			std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+			Duration::from_secs(CONNECT_TIMEOUT_SECS),
 		)?;
 		recipe_infer::bridge::nodelay_on(&stream)?;
 		let reader = stream.try_clone()?;
@@ -665,10 +677,10 @@ impl Server {
 		self
 	}
 
-	pub fn bind(addr: impl std::net::ToSocketAddrs + std::fmt::Debug) -> Result<TcpListener> {
+	pub fn bind(addr: impl ToSocketAddrs + fmt::Debug) -> Result<TcpListener> {
 		match TcpListener::bind(&addr) {
 			Ok(l) => Ok(l),
-			Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+			Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
 				anyhow::bail!("recipe already running ({addr:?})")
 			}
 			Err(e) => Err(e.into()),
@@ -682,7 +694,7 @@ impl Server {
 	pub fn serve_bound(self, listener: TcpListener) -> Result<()> {
 		let machine = self.machine.clone();
 		for m in machine.iter() {
-			for e in crate::machine::write_config_atomic(std::slice::from_ref(m.as_ref()))
+			for e in crate::machine::write_config_atomic(slice::from_ref(m.as_ref()))
 				.err()
 				.into_iter()
 			{
@@ -866,7 +878,7 @@ fn candidates(alias: &str, peers: &[PeerEntry]) -> Result<Vec<String>> {
 	let None = alias.find(':') else {
 		return Ok(vec![alias.to_string()]);
 	};
-	let ssh = std::process::Command::new("ssh")
+	let ssh = process::Command::new("ssh")
 		.args(["-G", alias])
 		.output()?;
 	let text = String::from_utf8_lossy(&ssh.stdout);

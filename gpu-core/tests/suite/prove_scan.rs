@@ -16,6 +16,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // ── New scanx_ launchers (1-D f64 prefix scans) ──────────────────────────────
 unsafe extern "C" {
@@ -50,12 +52,12 @@ fn run_scanx(f: Launch, x: &[f64]) -> Vec<f64> {
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -72,7 +74,7 @@ fn g_cumsum(x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	gpu_core::reductions::gpu_cumsum_rows(&b, 1, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -90,7 +92,7 @@ fn g_cumprod(x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	gpu_core::reductions::gpu_cumprod(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -108,7 +110,7 @@ fn g_cummax(x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	gpu_core::reductions::gpu_cummax(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -327,11 +329,11 @@ fn canon(name: &str) -> String {
 fn load_scan() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -443,12 +445,12 @@ fn prove_scan() {
 				bb.ptr_raw() as *const c_void,
 				o.ptr_raw(),
 				a.len() as i32,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 		let mut got = vec![0.0; a.len()];
-		unsafe { o.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+		unsafe { o.download_async(&mut got, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let mut h = 0.0;
 		let want: Vec<f64> = a

@@ -5,3 +5,5 @@ edition = "2024"
 
 [lib]
 name = "ogdl"
+[lints]
+workspace = true

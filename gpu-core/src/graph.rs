@@ -1,6 +1,8 @@
 use crate::hip::HipError;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_csr_spmv(
@@ -65,7 +67,7 @@ pub fn gpu_csr_spmv(
 			x.ptr_raw() as *const c_void,
 			y_out.ptr_raw(),
 			n_rows as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -90,7 +92,7 @@ pub fn gpu_csr_spmm(
 			c_out.ptr_raw(),
 			n_rows as i32,
 			feat as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -108,8 +110,8 @@ pub fn gpu_neighbor_aggregate(
 	mean: usize,
 	agg_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	agg_out.memset_zero(n_nodes * feat * std::mem::size_of::<f64>())?;
-	deg_ws.memset_zero(n_nodes * std::mem::size_of::<f64>())?;
+	agg_out.memset_zero(n_nodes * feat * mem::size_of::<f64>())?;
+	deg_ws.memset_zero(n_nodes * mem::size_of::<f64>())?;
 	match Some(mean).filter(|m| *m != 0) {
 		Some(_run) => {
 			unsafe {
@@ -117,7 +119,7 @@ pub fn gpu_neighbor_aggregate(
 					edge_dst.ptr_raw() as *const c_void,
 					deg_ws.ptr_raw(),
 					n_edges as i32,
-					std::ptr::null_mut(),
+					ptr::null_mut(),
 				);
 			}
 			crate::kernels::check_launch();
@@ -136,7 +138,7 @@ pub fn gpu_neighbor_aggregate(
 			feat as i32,
 			n_edges as i32,
 			mean as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -149,13 +151,13 @@ pub fn gpu_degree(
 	n_edges: usize,
 	deg_out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	deg_out.memset_zero(n_nodes * std::mem::size_of::<f64>())?;
+	deg_out.memset_zero(n_nodes * mem::size_of::<f64>())?;
 	unsafe {
 		launch_degree(
 			edge_dst.ptr_raw() as *const c_void,
 			deg_out.ptr_raw(),
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -174,7 +176,7 @@ pub fn gpu_gcn_norm(
 			deg.ptr_raw() as *const c_void,
 			n_nodes as i32,
 			feat as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();

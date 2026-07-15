@@ -4,6 +4,7 @@ use crate::memory::GpuBuffer;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 const OP_NONE: u32 = 111;
@@ -361,7 +362,7 @@ pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 			hipsolver_handle(),
 			n as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
 			&mut lwork,
 		);
@@ -413,10 +414,10 @@ pub fn gpu_lu_solve_workspace_bytes(n: usize, nrhs: usize) -> usize {
 			OP_NONE,
 			n as i32,
 			nrhs as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
-			std::ptr::null_mut(),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
 			&mut lwork,
 		);
@@ -477,9 +478,9 @@ pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 			SOLVER_FILL_UPPER,
 			n as i32,
 			nrhs as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
 			&mut lwork,
 		);
@@ -538,7 +539,7 @@ pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 			hipsolver_handle(),
 			m as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			m as i32,
 			&mut lwork,
 		);
@@ -547,9 +548,9 @@ pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 			m as i32,
 			n as i32,
 			k as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			m as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			&mut lwork_q,
 		);
 	}
@@ -636,9 +637,9 @@ pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 			SOLVER_EIG_VECTOR,
 			SOLVER_FILL_LOWER,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			&mut lwork,
 		);
 	}
@@ -742,7 +743,7 @@ pub fn gpu_svd(
 			n as i32,
 			work.as_ptr_offset(solver_off) as *mut f64,
 			lwork,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 			info_out.ptr_raw() as *mut i32,
 		)
 	};
@@ -773,7 +774,7 @@ fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	match cached {
 		Some(plan) => Ok(plan as *mut c_void),
 		None => {
-			let mut plan: *mut c_void = std::ptr::null_mut();
+			let mut plan: *mut c_void = ptr::null_mut();
 			let status = unsafe { hipfftPlan1d(&mut plan, n as i32, fft_type, 1) };
 			check(status)?;
 			cache.insert(

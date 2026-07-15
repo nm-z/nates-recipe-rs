@@ -1,4 +1,7 @@
 use crate::log::Write;
+use std::process;
+use std::ptr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
@@ -153,10 +156,10 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 	let g = |c: &AtomicU64| {
 		let i = ALL
 			.iter()
-			.position(|x| std::ptr::eq(*x, c))
+			.position(|x| ptr::eq(*x, c))
 			.unwrap_or_else(|| {
 				drop(Write::err("callspy: counter not registered in ALL"));
-				std::process::abort()
+				process::abort()
 			});
 		end[i].saturating_sub(base[i])
 	};
@@ -390,8 +393,8 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 	root
 }
 
-static LOOP_START: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
-static LOOP_END: std::sync::Mutex<Option<[u64; N]>> = std::sync::Mutex::new(None);
+static LOOP_START: Mutex<Option<[u64; N]>> = Mutex::new(None);
+static LOOP_END: Mutex<Option<[u64; N]>> = Mutex::new(None);
 
 pub fn mark_loop_start() {
 	*LOOP_START.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot());
@@ -421,10 +424,10 @@ pub fn state_report(run_start: &[u64; N]) -> Option<(ogdl::Node, Vec<String>)> {
 	let end = snapshot();
 	let idx = |c: &AtomicU64| {
 		ALL.iter()
-			.position(|x| std::ptr::eq(*x, c))
+			.position(|x| ptr::eq(*x, c))
 			.unwrap_or_else(|| {
 				drop(Write::err("callspy: counter not registered in ALL"));
-				std::process::abort()
+				process::abort()
 			})
 	};
 	let cell = |a: &[u64; N], b: &[u64; N], cs: &[&AtomicU64]| -> u64 {

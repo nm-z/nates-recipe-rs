@@ -1,8 +1,11 @@
 use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_fixed_radius_count(
@@ -118,7 +121,7 @@ pub fn fixed_radius_count(
 			n as i32,
 			dim as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -135,7 +138,7 @@ pub fn exclusive_scan_i32(
 			count_in.ptr_raw() as *const c_void,
 			row_ptr_out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -158,7 +161,7 @@ pub fn fixed_radius_fill_csr(
 			n as i32,
 			dim as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -173,17 +176,17 @@ pub fn gpu_fixed_radius_neighbors(
 ) -> Result<NeighborCsr, HipError> {
 	let eps_buf = GpuBuffer::alloc(1)?;
 	eps_buf.load(&[eps])?;
-	let count = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>())?;
+	let count = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>())?;
 	fixed_radius_count(points, &eps_buf, n, dim, &count)?;
 
-	let row_ptr_buf = GpuBuffer::alloc_bytes((n + 1) * std::mem::size_of::<i32>())?;
+	let row_ptr_buf = GpuBuffer::alloc_bytes((n + 1) * mem::size_of::<i32>())?;
 	exclusive_scan_i32(&count, n, &row_ptr_buf)?;
 
 	let mut row_ptr_h = vec![0i32; n + 1];
 	row_ptr_buf.download_i32(&mut row_ptr_h)?;
 	let nnz = row_ptr_h[n] as usize;
 
-	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * std::mem::size_of::<i32>())?;
+	let indices = GpuBuffer::alloc_bytes(nnz.max(1) * mem::size_of::<i32>())?;
 	fixed_radius_fill_csr(points, &row_ptr_buf, &eps_buf, n, dim, &indices)?;
 
 	Ok(NeighborCsr {
@@ -195,7 +198,7 @@ pub fn gpu_fixed_radius_neighbors(
 
 pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_uf_init(parent_out.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
+		launch_uf_init(parent_out.ptr_raw(), n_nodes as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -215,7 +218,7 @@ pub fn uf_hook(
 			parent_out.ptr_raw(),
 			changed_out.ptr_raw(),
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -224,7 +227,7 @@ pub fn uf_hook(
 
 pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	unsafe {
-		launch_uf_compress(parent_out.ptr_raw(), n_nodes as i32, std::ptr::null_mut());
+		launch_uf_compress(parent_out.ptr_raw(), n_nodes as i32, ptr::null_mut());
 	}
 	check_launch();
 	Ok(())
@@ -236,20 +239,20 @@ pub fn gpu_union_find_cc(
 	n_nodes: usize,
 	n_edges: usize,
 ) -> Result<GpuBuffer, HipError> {
-	let labels = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
-	let changed = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	let labels = GpuBuffer::alloc_bytes(n_nodes * mem::size_of::<i32>())?;
+	let changed = GpuBuffer::alloc_bytes(mem::size_of::<i32>())?;
 
 	uf_init(n_nodes, &labels)?;
 
 	let mut flag = [0i32; 1];
 	loop {
-		changed.memset_zero(std::mem::size_of::<i32>())?;
+		changed.memset_zero(mem::size_of::<i32>())?;
 		uf_hook(edge_src, edge_dst, n_edges, &labels, &changed)?;
 		uf_compress(n_nodes, &labels)?;
 		changed.download_i32(&mut flag)?;
 		match flag[0].cmp(&0) {
-			std::cmp::Ordering::Equal => break,
-			std::cmp::Ordering::Less | std::cmp::Ordering::Greater => continue,
+			Ordering::Equal => break,
+			Ordering::Less | Ordering::Greater => continue,
 		}
 	}
 	Ok(labels)
@@ -270,7 +273,7 @@ pub fn boruvka_init(
 			best_edge_out.ptr_raw(),
 			best_wkey_out.ptr_raw(),
 			n_nodes as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -293,7 +296,7 @@ pub fn boruvka_min_w(
 			parent.ptr_raw() as *const c_void,
 			best_wkey_out.ptr_raw(),
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -318,7 +321,7 @@ pub fn boruvka_min_e(
 			best_wkey.ptr_raw() as *const c_void,
 			best_edge_out.ptr_raw(),
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -337,7 +340,7 @@ pub fn boruvka_mark(
 			in_mst_out.ptr_raw(),
 			n_nodes as i32,
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -356,7 +359,7 @@ pub fn masked_weight_sum(
 			in_mst.ptr_raw() as *const c_void,
 			total_out.ptr_raw(),
 			n_edges as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -372,10 +375,10 @@ pub fn gpu_boruvka_mst(
 ) -> Result<BoruvkaResult, HipError> {
 	let in_mst = GpuBuffer::alloc_bytes(n_edges)?;
 	in_mst.memset_zero(n_edges)?;
-	let parent = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
-	let best_edge = GpuBuffer::alloc_bytes(n_nodes * std::mem::size_of::<i32>())?;
+	let parent = GpuBuffer::alloc_bytes(n_nodes * mem::size_of::<i32>())?;
+	let best_edge = GpuBuffer::alloc_bytes(n_nodes * mem::size_of::<i32>())?;
 	let best_w = GpuBuffer::alloc(n_nodes)?;
-	let changed = GpuBuffer::alloc_bytes(std::mem::size_of::<i32>())?;
+	let changed = GpuBuffer::alloc_bytes(mem::size_of::<i32>())?;
 
 	let mut src_h = vec![0i32; n_edges];
 	let mut dst_h = vec![0i32; n_edges];
@@ -411,20 +414,20 @@ pub fn gpu_boruvka_mst(
 			}
 		}
 		match sel_src.len().cmp(&0) {
-			std::cmp::Ordering::Equal | std::cmp::Ordering::Less => break,
-			std::cmp::Ordering::Greater => {
+			Ordering::Equal | Ordering::Less => break,
+			Ordering::Greater => {
 				let sel_src_buf = GpuBuffer::upload_i32(&sel_src)?;
 				let sel_dst_buf = GpuBuffer::upload_i32(&sel_dst)?;
 				let n_sel = sel_src.len();
 
 				loop {
-					changed.memset_zero(std::mem::size_of::<i32>())?;
+					changed.memset_zero(mem::size_of::<i32>())?;
 					uf_hook(&sel_src_buf, &sel_dst_buf, n_sel, &parent, &changed)?;
 					uf_compress(n_nodes, &parent)?;
 					changed.download_i32(&mut flag)?;
 					match flag[0].cmp(&0) {
-						std::cmp::Ordering::Equal => break,
-						std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+						Ordering::Equal => break,
+						Ordering::Less | Ordering::Greater => {
 							continue;
 						}
 					}
@@ -436,7 +439,7 @@ pub fn gpu_boruvka_mst(
 	let total_buf = GpuBuffer::alloc(1)?;
 	masked_weight_sum(edge_w, &in_mst, n_edges, &total_buf)?;
 	let mut tw = [0.0f64; 1];
-	unsafe { total_buf.download_async(&mut tw, std::ptr::null_mut()) }?;
+	unsafe { total_buf.download_async(&mut tw, ptr::null_mut()) }?;
 	crate::hip::device_synchronize()?;
 
 	Ok(BoruvkaResult {
@@ -459,7 +462,7 @@ pub fn gpu_core_distance(
 			n as i32,
 			dim as i32,
 			min_pts as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

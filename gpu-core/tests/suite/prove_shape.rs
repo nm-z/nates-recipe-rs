@@ -15,8 +15,10 @@ use crate::common;
 // honest backlog, never faked.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // ── New shapex_ launchers (each with its real signature) ──
 unsafe extern "C" {
@@ -103,7 +105,7 @@ fn upload(x: &[f64]) -> GpuBuffer {
 }
 fn download(o: &GpuBuffer, n: usize) -> Vec<f64> {
 	let mut out = vec![0.0; n];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -164,7 +166,7 @@ fn prove_pad() -> bool {
 			orow as i32,
 			ocol as i32,
 			cval,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_last();
@@ -188,7 +190,7 @@ fn run_flip(x: &[f64], r: usize, c: usize, axis: i32) -> Vec<f64> {
 			r as i32,
 			c as i32,
 			axis,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_last();
@@ -257,7 +259,7 @@ fn prove_roll() -> bool {
 			c as i32,
 			sr,
 			sc,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_last();
@@ -287,7 +289,7 @@ fn prove_triu() -> bool {
 				r as i32,
 				c as i32,
 				k,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		check_last();
@@ -319,7 +321,7 @@ fn prove_tril() -> bool {
 				r as i32,
 				c as i32,
 				k,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		check_last();
@@ -354,7 +356,7 @@ fn prove_tile() -> bool {
 			c as i32,
 			rr as i32,
 			rc as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_last();
@@ -383,7 +385,7 @@ fn prove_repeat() -> bool {
 			r as i32,
 			c as i32,
 			reps as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_last();
@@ -416,7 +418,7 @@ fn prove_diagonal() -> bool {
 				c as i32,
 				k,
 				len as i32,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		check_last();
@@ -524,13 +526,13 @@ fn canon(name: &str) -> String {
 fn load_shape() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -575,7 +577,7 @@ fn prove_shape() {
 	// Walk inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		if let Some(&ok) = op_ok.get(key.as_str())

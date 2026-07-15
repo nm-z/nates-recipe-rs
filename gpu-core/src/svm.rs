@@ -1,7 +1,10 @@
 use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
+use std::cmp::Ordering;
 use std::ffi::c_void;
+use std::mem;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_kernel_matrix(
@@ -73,7 +76,7 @@ pub fn gpu_kernel_matrix(
 			gamma.ptr_raw() as *const c_void,
 			coef0.ptr_raw() as *const c_void,
 			degree.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -98,7 +101,7 @@ pub fn gpu_smo_kkt_score(
 			score_j.ptr_raw(),
 			n as i32,
 			c.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -127,7 +130,7 @@ pub fn gpu_smo_kernel_row(
 			gamma.ptr_raw() as *const c_void,
 			coef0.ptr_raw() as *const c_void,
 			degree.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -140,7 +143,7 @@ pub fn gpu_smo_argmax(s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hi
 			s.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -163,7 +166,7 @@ pub fn gpu_smo_update_gradient_rows(
 			n as i32,
 			di.ptr_raw() as *const c_void,
 			dj.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -173,14 +176,14 @@ pub fn gpu_smo_update_gradient_rows(
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
 	unsafe {
-		let src = (buf.ptr_raw() as *const u8).add(idx * std::mem::size_of::<f64>())
+		let src = (buf.ptr_raw() as *const u8).add(idx * mem::size_of::<f64>())
 			as *const c_void;
 		crate::memory::xfer(
 			v.as_mut_ptr() as *mut c_void,
 			src,
-			std::mem::size_of::<f64>(),
+			mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_D2H,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		)?;
 	}
 	crate::hip::device_synchronize()?;
@@ -193,9 +196,9 @@ fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 		crate::memory::xfer(
 			buf.ptr_raw(),
 			v.as_ptr() as *const c_void,
-			std::mem::size_of::<f64>(),
+			mem::size_of::<f64>(),
 			crate::hip::HIP_MEMCPY_H2D,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		)?;
 	}
 	Ok(())
@@ -227,7 +230,7 @@ pub fn gpu_smo_train(
 	let y_buf = GpuBuffer::alloc(n)?;
 	y_buf.load(y_pm1)?;
 	let alpha_buf = GpuBuffer::alloc(n)?;
-	alpha_buf.memset_zero(n * std::mem::size_of::<f64>())?;
+	alpha_buf.memset_zero(n * mem::size_of::<f64>())?;
 
 	let grad_buf = GpuBuffer::alloc(n)?;
 	grad_buf.load(&vec![-1.0_f64; n])?;
@@ -267,18 +270,18 @@ pub fn gpu_smo_train(
 
 		let mut o = [0.0_f64; 2];
 		gpu_smo_argmax(&score_i_buf, n, &argmax_out)?;
-		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
+		unsafe { argmax_out.download_async(&mut o, ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
 		let val_i = o[0];
 		let i = o[1] as usize;
 		gpu_smo_argmax(&score_j_buf, n, &argmax_out)?;
-		unsafe { argmax_out.download_async(&mut o, std::ptr::null_mut()) }?;
+		unsafe { argmax_out.download_async(&mut o, ptr::null_mut()) }?;
 		crate::hip::device_synchronize()?;
 		let val_j = o[0];
 		let j = o[1] as usize;
 		match (val_i - val_j).partial_cmp(&tol) {
-			Some(std::cmp::Ordering::Less) => break,
-			Some(std::cmp::Ordering::Equal) | Some(std::cmp::Ordering::Greater) | None => {
+			Some(Ordering::Less) => break,
+			Some(Ordering::Equal) | Some(Ordering::Greater) | None => {
 				gpu_smo_kernel_row(
 					x,
 					&gamma_buf,
@@ -314,22 +317,22 @@ pub fn gpu_smo_train(
 
 				let grad_diff = -(val_i - val_j);
 				let new_aj_raw = match eta.abs().partial_cmp(&1e-12) {
-					Some(std::cmp::Ordering::Greater) => old_aj + yj * grad_diff / eta,
-					Some(std::cmp::Ordering::Less)
-					| Some(std::cmp::Ordering::Equal)
+					Some(Ordering::Greater) => old_aj + yj * grad_diff / eta,
+					Some(Ordering::Less)
+					| Some(Ordering::Equal)
 					| None => old_aj,
 				};
 
 				let bounds = match (yi - yj).abs().partial_cmp(&1e-9) {
-					Some(std::cmp::Ordering::Less) => {
+					Some(Ordering::Less) => {
 						let s = old_ai + old_aj;
 						Bounds {
 							lo: f64::max(0.0, s - c),
 							hi: f64::min(c, s),
 						}
 					}
-					Some(std::cmp::Ordering::Equal)
-					| Some(std::cmp::Ordering::Greater)
+					Some(Ordering::Equal)
+					| Some(Ordering::Greater)
 					| None => {
 						let s = old_ai - old_aj;
 						Bounds {
@@ -377,8 +380,8 @@ pub fn gpu_smo_train(
 	}
 
 	let b_final = match b_count.cmp(&0) {
-		std::cmp::Ordering::Greater => b / b_count as f64,
-		std::cmp::Ordering::Equal | std::cmp::Ordering::Less => 0.0,
+		Ordering::Greater => b / b_count as f64,
+		Ordering::Equal | Ordering::Less => 0.0,
 	};
 	Ok(SmoModel {
 		alpha: alpha_host,

@@ -1,6 +1,8 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use gpu_core::hip;
 use gpu_core::memory::GpuBuffer;
 use gpu_core::moe::{gpu_moe_backward, gpu_moe_route};
+use std::ptr;
 
 #[test]
 fn moe_backward_matches_finite_diff() {
@@ -32,7 +34,7 @@ fn moe_backward_matches_finite_diff() {
 		gpu_moe_backward(&hb, &gwb, &ewb, &gb, n, d, e).expect("bwd");
 	let dl = |buf: &GpuBuffer, len: usize| -> Vec<f64> {
 		let mut v = vec![0.0f64; len];
-		unsafe { buf.download_async(&mut v, std::ptr::null_mut()) }.expect("download");
+		unsafe { buf.download_async(&mut v, ptr::null_mut()) }.expect("download");
 		hip::device_synchronize().expect("download sync");
 		v
 	};
@@ -50,7 +52,7 @@ fn moe_backward_matches_finite_diff() {
 		ewb.load(ew).expect("ew load");
 		let out = gpu_moe_route(&hhb, &gwb, &ewb, n, d, e).expect("fwd");
 		let mut o = vec![0.0f64; n * d];
-		unsafe { out.download_async(&mut o, std::ptr::null_mut()) }.expect("download out");
+		unsafe { out.download_async(&mut o, ptr::null_mut()) }.expect("download out");
 		hip::device_synchronize().expect("download out sync");
 		o.iter().zip(&g).map(|(a, b)| a * b).sum()
 	};

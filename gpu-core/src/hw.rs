@@ -1,10 +1,18 @@
 use crate::log::{Write, gpu};
-use std::io::{Read, Write as _};
+use std::cmp;
+use std::env;
+use std::fs;
+use std::io::{Error, Read, Write as _};
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::PathBuf;
+use std::process;
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 static SAT_ARMED: AtomicBool = AtomicBool::new(0 == 1);
-const SAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+const SAT_WINDOW: Duration = Duration::from_secs(5);
 const SAT_ENFORCE: Option<()> = None;
 
 extern "C" fn fast_death(sig: libc::c_int) {
@@ -16,9 +24,9 @@ extern "C" fn fast_death(sig: libc::c_int) {
 }
 
 pub fn install_fast_death() {
-	static ONCE: std::sync::Once = std::sync::Once::new();
+	static ONCE: Once = Once::new();
 	ONCE.call_once(|| {
-		let None = std::env::var_os("RECIPE_CORE") else {
+		let None = env::var_os("RECIPE_CORE") else {
 			return;
 		};
 		unsafe {
@@ -27,8 +35,8 @@ pub fn install_fast_death() {
 	});
 }
 
-fn busy_path() -> std::path::PathBuf {
-	for card in std::fs::read_dir("/sys/class/drm")
+fn busy_path() -> PathBuf {
+	for card in fs::read_dir("/sys/class/drm")
 		.into_iter()
 		.flatten()
 		.flatten()
@@ -40,40 +48,40 @@ fn busy_path() -> std::path::PathBuf {
 		return found;
 	}
 	drop(Write::err("saturation watchdog: no gpu_busy_percent under /sys/class/drm"));
-	std::process::abort();
+	process::abort();
 }
 
 pub fn arm_saturation_crash() {
 	let Some(()) = SAT_ENFORCE else {
 		return;
 	};
-	static ONCE: std::sync::Once = std::sync::Once::new();
+	static ONCE: Once = Once::new();
 	install_fast_death();
 	SAT_ARMED.store(0 != 1, Ordering::SeqCst);
 	ONCE.call_once(|| {
 		let path = busy_path();
-		std::thread::spawn(move || {
-			let mut last_pinned = std::time::Instant::now();
+		thread::spawn(move || {
+			let mut last_pinned = Instant::now();
 			let mut was_armed = 0 == 1;
 			loop {
 				let armed = SAT_ARMED.load(Ordering::SeqCst);
 				for _run in Some(()).filter(|_u| armed).into_iter() {
 					for _run in Some(()).filter(|_u| !was_armed).into_iter() {
-						last_pinned = std::time::Instant::now();
+						last_pinned = Instant::now();
 					}
-					let busy: u32 = std::fs::read_to_string(&path)
+					let busy: u32 = fs::read_to_string(&path)
 						.unwrap_or_else(|e| {
 								drop(Write::err(&format!("saturation watchdog: read {path:?}: {e}")));
-								std::process::abort()
+								process::abort()
 							})
 						.trim()
 						.parse()
 						.unwrap_or_else(|e| {
 								drop(Write::err(&format!("saturation watchdog: parse busy: {e}")));
-								std::process::abort()
+								process::abort()
 							});
 					for _run in Some(()).filter(|_u| busy >= 100).into_iter() {
-						last_pinned = std::time::Instant::now();
+						last_pinned = Instant::now();
 					}
 					let stalled = SAT_ARMED.load(Ordering::SeqCst) && last_pinned.elapsed() > SAT_WINDOW;
 					let None = Some(()).filter(|_u| stalled) else {
@@ -81,11 +89,11 @@ pub fn arm_saturation_crash() {
 							"GPU NOT PINNED  no 100% gpu_busy_percent sample in {}s (latest {busy}%) during compute — aborting (saturation law)",
 							SAT_WINDOW.as_secs()
 						)));
-						std::process::abort();
+						process::abort();
 					};
 				}
 				was_armed = armed;
-				std::thread::sleep(std::time::Duration::from_millis(10));
+				thread::sleep(Duration::from_millis(10));
 			}
 		});
 	});
@@ -110,9 +118,9 @@ enum GpuEvent {
 }
 
 fn gpu_id() -> Option<u32> {
-	for e in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes").ok()? {
+	for e in fs::read_dir("/sys/class/kfd/kfd/topology/nodes").ok()? {
 		let p = e.ok()?.path().join("gpu_id");
-		let found = std::fs::read_to_string(&p)
+		let found = fs::read_to_string(&p)
 			.ok()
 			.and_then(|s| s.trim().parse::<u32>().ok())
 			.filter(|id| *id != 0);
@@ -125,7 +133,7 @@ fn gpu_id() -> Option<u32> {
 }
 
 pub fn spawn_thrash_watchdog() {
-	static ONCE: std::sync::Once = std::sync::Once::new();
+	static ONCE: Once = Once::new();
 	ONCE.call_once(|| {
 		let Some(gpu_idx) = gpu_id() else {
 			drop(Write::err("thrash watchdog: no kfd gpu_id"));
@@ -133,21 +141,21 @@ pub fn spawn_thrash_watchdog() {
 		};
 		let raw = unsafe { libc::open(c"/dev/kfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 		let kfd = match raw.cmp(&0) {
-			std::cmp::Ordering::Less => {
-				drop(Write::err(&format!("thrash watchdog: /dev/kfd: {}", std::io::Error::last_os_error())));
+			cmp::Ordering::Less => {
+				drop(Write::err(&format!("thrash watchdog: /dev/kfd: {}", Error::last_os_error())));
 				return;
 			}
-			std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
-				unsafe { std::fs::File::from_raw_fd(raw) }
+			cmp::Ordering::Equal | cmp::Ordering::Greater => {
+				unsafe { fs::File::from_raw_fd(raw) }
 			}
 		};
 		let mut args = SmiArgs { gpuid: gpu_idx, anon_fd: 0 };
 		let rc = unsafe { libc::ioctl(kfd.as_raw_fd(), AMDKFD_IOC_SMI_EVENTS, &mut args) };
-		let std::cmp::Ordering::Equal = rc.cmp(&0) else {
-			drop(Write::err(&format!("thrash watchdog: SMI ioctl: {}", std::io::Error::last_os_error())));
+		let cmp::Ordering::Equal = rc.cmp(&0) else {
+			drop(Write::err(&format!("thrash watchdog: SMI ioctl: {}", Error::last_os_error())));
 			return;
 		};
-		let mut smi = unsafe { std::fs::File::from_raw_fd(args.anon_fd as i32) };
+		let mut smi = unsafe { fs::File::from_raw_fd(args.anon_fd as i32) };
 		let mask: u64 = [1u32, 2, 5, 6, 7, 8, 9, 10, 11]
 			.iter()
 			.map(|i| 1u64 << (i - 1))
@@ -157,7 +165,7 @@ pub fn spawn_thrash_watchdog() {
 				drop(Write::err(&format!("thrash watchdog: mask write: {e}")));
 			}
 			Ok(()) => {
-				std::thread::spawn(move || {
+				thread::spawn(move || {
 					let mut buf = [0u8; 1024];
 					loop {
 						let n = match smi.read(&mut buf) {
@@ -182,7 +190,7 @@ pub fn spawn_thrash_watchdog() {
 										"gpu thrash  {}  — driver evicted our queues/mappings; aborting per fail-clean",
 										ev.trim()
 									)));
-									std::process::abort();
+									process::abort();
 								}
 								GpuEvent::Restored => {
 									Write::line(gpu, &format!("gpu event  queue restored  {}", ev.trim()))

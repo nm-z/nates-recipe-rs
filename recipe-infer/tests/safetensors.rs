@@ -1,3 +1,7 @@
+use std::env;
+use std::fs;
+use std::process;
+use std::str;
 use recipe_infer::safetensors::{
 	Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors,
 };
@@ -57,16 +61,16 @@ fn read_safetensors_header_and_decode_min() {
 		bytes.extend_from_slice(&v.to_le_bytes());
 	}
 	let path =
-		std::env::temp_dir().join(format!("recipe_st_hdr_{}.safetensors", std::process::id()));
-	std::fs::write(&path, &bytes).expect("write temp safetensors");
+		env::temp_dir().join(format!("recipe_st_hdr_{}.safetensors", process::id()));
+	fs::write(&path, &bytes).expect("write temp safetensors");
 
-	let mut f = std::fs::File::open(&path).expect("open temp safetensors");
+	let mut f = fs::File::open(&path).expect("open temp safetensors");
 	let mut lb = [0u8; 8];
 	f.read_exact(&mut lb).expect("read header len");
 	let n = u64::from_le_bytes(lb);
 	let mut hdr = vec![0u8; n as usize];
 	f.read_exact(&mut hdr).expect("read header");
-	let header_read = std::str::from_utf8(&hdr).expect("header utf8");
+	let header_read = str::from_utf8(&hdr).expect("header utf8");
 	let Json::Obj(entries) = parse_json(header_read).expect("parse header json") else {
 		panic!("header not a JSON object");
 	};
@@ -107,5 +111,5 @@ fn read_safetensors_header_and_decode_min() {
 		vec![1.5, -2.5, 3.0, 4.0],
 		"decoded F32 tensor, widened to f64"
 	);
-	let _ = std::fs::remove_file(&path);
+	let _ = fs::remove_file(&path);
 }

@@ -1,9 +1,11 @@
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 use recipe_infer::{
 	Activation, GpuBuffer, LayerKind, LayerParams, SCRATCH_CONSTS, Scratch, download_vec,
 	forward_into, human_bytes,
 };
 
-static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GPU: Mutex<()> = Mutex::new(());
 
 fn randn(n: usize, seed: usize) -> GpuBuffer {
 	let b = GpuBuffer::alloc(n).expect("randn alloc");
@@ -54,7 +56,7 @@ fn attn_layer(n: usize, heads: usize, d: usize, s: usize) -> (Vec<LayerParams>, 
 fn kv_cache_matches_full_attention() {
 	let _g = GPU
 		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner);
+		.unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
 	let (n, heads, d, s) = (2usize, 4usize, 16usize, 1200usize);
 	let in_dim = s * d;
@@ -90,7 +92,7 @@ fn kv_cache_matches_full_attention() {
 fn kv_cache_bounded_memory_long_sequence() {
 	let _g = GPU
 		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner);
+		.unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
 	let (n, heads, d, s) = (2usize, 2usize, 16usize, 8192usize);
 	let in_dim = s * d;
@@ -115,7 +117,7 @@ fn kv_cache_bounded_memory_long_sequence() {
 	let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 	let _ = download_vec(&sc.acts[0], 1);
-	let t0 = std::time::Instant::now();
+	let t0 = Instant::now();
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
 	let out = download_vec(&sc.acts[0], n * in_dim);
 	let ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -133,7 +135,7 @@ fn kv_cache_bounded_memory_long_sequence() {
 fn splitk_dw_matches_rocblas() {
 	let _g = GPU
 		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner);
+		.unwrap_or_else(PoisonError::into_inner);
 	gpu_core::hip::set_device(0).expect("set_device");
 	eprintln!(
 		"split-K uses device multiProcessorCount = {} (queried, not hardcoded)",

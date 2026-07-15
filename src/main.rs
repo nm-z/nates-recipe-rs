@@ -1,5 +1,15 @@
 use gpu_core::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
 use anyhow::Result;
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::hash::DefaultHasher;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::slice;
+use std::time::UNIX_EPOCH;
 
 fn usage(code: i32) -> ! {
 	drop(Write::err(&format!("recipe {}", env!("CARGO_PKG_VERSION"))));
@@ -7,7 +17,7 @@ fn usage(code: i32) -> ! {
 	drop(Write::err("       recipe serve            # daemon on 7845"));
 	drop(Write::err("       recipe peers            # live network view"));
 	drop(Write::err("       recipe probe            # measure this machine"));
-	std::process::exit(code);
+	process::exit(code);
 }
 
 fn run_rs(path: &str, extra: &[String]) -> Result<()> {
@@ -15,7 +25,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	use std::os::unix::process::CommandExt;
 	let root = ["target/release", "target/debug", "/usr/lib/recipe"]
 		.into_iter()
-		.map(std::path::Path::new)
+		.map(Path::new)
 		.find(|d| d.join("librecipe.rlib").exists());
 	let Some(root) = root else {
 		anyhow::bail!(
@@ -23,18 +33,18 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 		);
 	};
 	let rlib = root.join("librecipe.rlib");
-	let src = std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+	let src = fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
 	let mtime = rlib.metadata()?.modified()?;
-	let mut h = std::hash::DefaultHasher::new();
+	let mut h = DefaultHasher::new();
 	h.write(&src);
-	h.write_u128(mtime.duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+	h.write_u128(mtime.duration_since(UNIX_EPOCH)?.as_nanos());
 	let bin = recipe::machine::data_dir()?.join(format!("{:016x}", h.finish()));
-	for _absent in std::fs::metadata(&bin).err().into_iter() {
-		let rocm = std::env::var_os("ROCM_PATH")
+	for _absent in fs::metadata(&bin).err().into_iter() {
+		let rocm = env::var_os("ROCM_PATH")
 			.filter(|v| !v.is_empty())
-			.map(std::path::PathBuf::from)
-			.unwrap_or_else(|| std::path::PathBuf::from("/opt/rocm"));
-		let mut cmd = std::process::Command::new("rustc");
+			.map(PathBuf::from)
+			.unwrap_or_else(|| PathBuf::from("/opt/rocm"));
+		let mut cmd = process::Command::new("rustc");
 		cmd.arg(path)
 			.arg("-L")
 			.arg(root)
@@ -62,14 +72,14 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 		let status = cmd.status().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
 		anyhow::ensure!(status.success(), "rustc failed on {path}: {status}");
 	}
-	Err(std::process::Command::new(&bin).args(extra).exec().into())
+	Err(process::Command::new(&bin).args(extra).exec().into())
 }
 
 fn main() -> Result<()> {
 	if let Some(code) = recipe::machine::gpu_child_ask() {
-		std::process::exit(code);
+		process::exit(code);
 	}
-	if let Some(sz) = std::env::var_os("VRAM_PROBE") {
+	if let Some(sz) = env::var_os("VRAM_PROBE") {
 		let n: usize = sz
 			.to_string_lossy()
 			.parse()
@@ -81,9 +91,9 @@ fn main() -> Result<()> {
 			}
 			None => 2,
 		};
-		std::process::exit(code);
+		process::exit(code);
 	}
-	if let Some(it) = std::env::var_os("SETUP_RACE") {
+	if let Some(it) = env::var_os("SETUP_RACE") {
 		let iters: usize = it
 			.to_string_lossy()
 			.parse()
@@ -147,9 +157,9 @@ fn main() -> Result<()> {
 			Write::line(gpu, &format!("setup-race iter {i}: clean"));
 		}
 		gpu_core::kernels::gpu_shutdown();
-		std::process::exit(0);
+		process::exit(0);
 	}
-	let args: Vec<String> = std::env::args().collect();
+	let args: Vec<String> = env::args().collect();
 	let cmd = match args.get(1) {
 		Some(first) => first.as_str(),
 		None => usage(1),
@@ -164,7 +174,7 @@ fn main() -> Result<()> {
 			let machine = recipe::machine::Machine::probe()?;
 			Write::block(
 				probe,
-				&recipe::machine::write_config(std::slice::from_ref(&machine)),
+				&recipe::machine::write_config(slice::from_ref(&machine)),
 			);
 			Ok(())
 		}
@@ -173,14 +183,14 @@ fn main() -> Result<()> {
 				probe: true,
 				..Opt::default()
 			});
-			let bind = std::net::SocketAddr::new(
-				std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+			let bind = SocketAddr::new(
+				IpAddr::V4(Ipv4Addr::UNSPECIFIED),
 				recipe::wire::PORT,
 			);
 			let listener = recipe::wire::Server::bind(bind)?;
 			let machine = recipe::machine::Machine::probe()?;
 			let info = recipe::wire::NodeInfo::probe();
-			let runners = std::collections::HashMap::new();
+			let runners = HashMap::new();
 			recipe::wire::Server::new(info, runners)
 				.machine(machine)
 				.serve_bound(listener)?;
@@ -222,7 +232,7 @@ fn main() -> Result<()> {
 					local: false,
 				});
 			}
-			match std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+			match io::stdin().is_terminal() && io::stderr().is_terminal() {
 				true => {
 					let save = recipe::tui::peers_picker(&mut rows);
 					for _saved in Some(()).filter(|_u| save).into_iter() {
@@ -247,7 +257,7 @@ fn main() -> Result<()> {
 			Ok(())
 		}
 		other => {
-			let probed = std::fs::metadata(other).ok();
+			let probed = fs::metadata(other).ok();
 			match other.strip_suffix(".rs").and(probed) {
 				Some(_meta) => run_rs(other, &args[2..]),
 				None => usage(1),

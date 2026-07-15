@@ -1,5 +1,6 @@
 use ogdl::del;
 use ogdl::{Graph, NamedChild, Node, Ogdl};
+use std::env;
 use std::fs;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ const SAMPLE: &str =
 
 #[test]
 fn round_trip_itnl_file_itnl() {
-	let dir = std::env::temp_dir();
+	let dir = env::temp_dir();
 	let p = dir.join("nrs_ogdl_spec_rt.ogdl");
 	fs::write(&p, SAMPLE).expect("write");
 	let ps = p.to_str().expect("utf8");

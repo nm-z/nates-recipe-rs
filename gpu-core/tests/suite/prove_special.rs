@@ -12,8 +12,11 @@ use crate::common;
 // (tfp.sts.*, accumulators, integrators, interpolators, ...) stay as backlog.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::f64::consts;
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // New specialx_ kernels (unary: x->out ; xlogy: x,y->out).
 unsafe extern "C" {
@@ -59,12 +62,12 @@ fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
 			b.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -81,7 +84,7 @@ fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	f(&b, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -155,7 +158,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		|x: f64| if x == 0.0 {
 			1.0
 		} else {
-			(std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+			(consts::PI * x).sin() / (consts::PI * x)
 		},
 		-3.0,
 		3.0
@@ -207,7 +210,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	sx!(
 		"ndtr",
 		launch_specialx_ndtr,
-		|x| 0.5 * libm::erfc(-x / std::f64::consts::SQRT_2),
+		|x| 0.5 * libm::erfc(-x / consts::SQRT_2),
 		-3.0,
 		3.0
 	);
@@ -215,7 +218,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	sx!(
 		"sinpi",
 		launch_specialx_sinpi,
-		|x| (std::f64::consts::PI * x).sin(),
+		|x| (consts::PI * x).sin(),
 		-2.0,
 		2.0
 	);
@@ -282,12 +285,12 @@ fn run_xlogy(x: &[f64], y: &[f64]) -> Vec<f64> {
 			by.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			x.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; x.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -362,11 +365,11 @@ fn canon(name: &str) -> String {
 fn load_special() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -413,7 +416,7 @@ fn check_special_op(key: &str, reg: &UnaryOp) -> bool {
 			let xs = probes(reg.lo, reg.hi, 24);
 			let got = (reg.run)(&xs);
 			xs.iter().zip(&got).all(|(x, g)| {
-				let rt = 0.5 * libm::erfc(-g / std::f64::consts::SQRT_2);
+				let rt = 0.5 * libm::erfc(-g / consts::SQRT_2);
 				(rt - x).abs() <= 1e-6 * (1.0 + x.abs())
 			})
 		}
@@ -470,7 +473,7 @@ fn prove_special() {
 	// Walk the inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		if let Some(&ok) = op_ok.get(key.as_str())

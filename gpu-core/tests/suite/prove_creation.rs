@@ -18,8 +18,12 @@ use crate::common;
 // returned zeros. The test FAILS on any registered-op mismatch (a real bug).
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::f64::consts;
+use std::fs;
+use std::mem;
+use std::ptr;
 
 // ── new creationx_ launchers (output-first, then f64/i32 params, then n, stream) ─
 unsafe extern "C" {
@@ -64,22 +68,22 @@ fn close(a: &[f64], b: &[f64]) -> bool {
 fn run_arange(start: f64, step: f64, n: usize) -> Vec<f64> {
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
-		launch_creationx_arange(o.ptr_raw(), start, step, n as i32, std::ptr::null_mut());
+		launch_creationx_arange(o.ptr_raw(), start, step, n as i32, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
-		launch_creationx_linspace(o.ptr_raw(), start, stop, n as i32, std::ptr::null_mut());
+		launch_creationx_linspace(o.ptr_raw(), start, stop, n as i32, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
@@ -92,23 +96,23 @@ fn run_logspace(start: f64, stop: f64, base: f64, n: usize) -> Vec<f64> {
 			stop,
 			base,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_geomspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
 	let o = GpuBuffer::alloc(n).unwrap();
 	unsafe {
-		launch_creationx_geomspace(o.ptr_raw(), start, stop, n as i32, std::ptr::null_mut());
+		launch_creationx_geomspace(o.ptr_raw(), start, stop, n as i32, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; n];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
@@ -120,12 +124,12 @@ fn run_tri(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 			rows as i32,
 			cols as i32,
 			k,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
@@ -137,19 +141,19 @@ fn run_eye_rect(rows: usize, cols: usize, k: i32) -> Vec<f64> {
 			rows as i32,
 			cols as i32,
 			k,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0.0; rows * cols];
-	unsafe { o.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v
 }
 fn run_arange_i32(start: i32, step: i32, n: usize) -> Vec<i32> {
-	let o = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+	let o = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>()).unwrap();
 	unsafe {
-		launch_creationx_arange_i32(o.ptr_raw(), start, step, n as i32, std::ptr::null_mut());
+		launch_creationx_arange_i32(o.ptr_raw(), start, step, n as i32, ptr::null_mut());
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut v = vec![0i32; n];
@@ -177,7 +181,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		use gpu_core::kernels::gpu_fill;
 		let n = 37usize;
-		let val = std::f64::consts::PI;
+		let val = consts::PI;
 		let g = GpuBuffer::alloc(n).unwrap();
 		gpu_fill(
 			&{
@@ -191,7 +195,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		)
 		.unwrap();
 		let mut got = vec![0.0; n];
-		unsafe { g.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+		unsafe { g.download_async(&mut got, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		let want = vec![val; n];
 		prove!("full", close(&got, &want));
@@ -209,7 +213,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		)
 		.unwrap();
 		let mut gz = vec![9.0; n];
-		unsafe { z.download_async(&mut gz, std::ptr::null_mut()) }.unwrap();
+		unsafe { z.download_async(&mut gz, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		prove!("zeros", gz.iter().all(|v| *v == 0.0));
 		let o = GpuBuffer::alloc(n).unwrap();
@@ -225,7 +229,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		)
 		.unwrap();
 		let mut go = vec![0.0; n];
-		unsafe { o.download_async(&mut go, std::ptr::null_mut()) }.unwrap();
+		unsafe { o.download_async(&mut go, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		prove!("ones", go.iter().all(|v| *v == 1.0));
 	}
@@ -237,7 +241,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let g = GpuBuffer::alloc(n * n).unwrap();
 		gpu_eye(n, &g).unwrap();
 		let mut got = vec![0.0; n * n];
-		unsafe { g.download_async(&mut got, std::ptr::null_mut()) }.unwrap();
+		unsafe { g.download_async(&mut got, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		// diagonal == 1, off-diagonal == 0 (assert BOTH).
 		let mut diag_ok = true;
@@ -353,7 +357,7 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		use gpu_core::catboost::gpu_iota;
 		let n = 41usize;
-		let g = GpuBuffer::alloc_bytes(n * std::mem::size_of::<i32>()).unwrap();
+		let g = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>()).unwrap();
 		gpu_iota(n, &g).unwrap();
 		let mut got = vec![0i32; n];
 		g.download_i32(&mut got).unwrap();
@@ -427,11 +431,11 @@ fn canon(name: &str) -> String {
 fn load_creation() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -470,7 +474,7 @@ fn prove_creation() {
 	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		if let Some(&ok) = op_ok.get(key.as_str())

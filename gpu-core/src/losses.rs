@@ -1,6 +1,7 @@
 use crate::hip::HipError;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_mae_grad(
@@ -105,7 +106,7 @@ pub fn gpu_mae_grad(
 			target.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -126,7 +127,7 @@ pub fn gpu_huber_grad(
 			out.ptr_raw(),
 			n as i32,
 			delta.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -147,7 +148,7 @@ pub fn gpu_bce_with_logits(
 			loss_out.ptr_raw(),
 			grad_out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -172,7 +173,7 @@ pub fn gpu_focal_into(
 			n as i32,
 			gamma.ptr_raw() as *const c_void,
 			alpha.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -197,7 +198,7 @@ pub fn gpu_focal_grad_into(
 			gamma.ptr_raw() as *const c_void,
 			alpha.ptr_raw() as *const c_void,
 			inv_n.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -216,7 +217,7 @@ pub fn gpu_kl_div_loss(
 			target.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -237,7 +238,7 @@ pub fn gpu_hinge_loss(
 			loss_out.ptr_raw(),
 			grad_out.ptr_raw(),
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -262,7 +263,7 @@ pub fn gpu_cosine_embedding_loss(
 			n as i32,
 			dim as i32,
 			margin.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -287,7 +288,7 @@ pub fn gpu_triplet_loss(
 			n as i32,
 			dim as i32,
 			margin.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -312,7 +313,7 @@ pub fn gpu_contrastive_loss(
 			n as i32,
 			dim as i32,
 			margin.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();

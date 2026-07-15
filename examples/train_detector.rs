@@ -15,8 +15,11 @@ use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use recipe::data::{RawCsv, read_raw_csv};
 use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-fn say(t: impl std::fmt::Display) {
+fn say(t: impl fmt::Display) {
 	set_opt(Opt { probe: true, ..opt() });
 	Write::block(probe, ogdl!(&t));
 }
@@ -450,7 +453,7 @@ const MARCH: &[(&str, &[&str], usize)] = &[
 
 fn column_cells(path: &str, col: &str) -> anyhow::Result<Vec<String>> {
 	let RawCsv { headers, rows } =
-		read_raw_csv(std::path::Path::new(path)).context("read corpus csv")?;
+		read_raw_csv(Path::new(path)).context("read corpus csv")?;
 	let Some(j) = headers.iter().position(|h| h == col) else {
 		Write::err(format!("corpus: column '{col}' not in {path}"))?;
 		return Ok(Vec::new());
@@ -476,7 +479,7 @@ enum Delim {
 }
 
 fn columns_of(path: &str, d: &Delim, headerless: bool) -> anyhow::Result<Vec<Vec<String>>> {
-	let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+	let text = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
 	let split = |line: &str| -> Vec<String> {
 		let raw: Vec<&str> = match d {
 			Delim::Comma => line.split(',').collect(),
@@ -841,7 +844,7 @@ fn instances() -> anyhow::Result<Vec<(Vec<String>, usize)>> {
 		add(&format!("{NCDIR}{file}.csv"), NEWCHIC_IMG, KIND_IMAGE)?;
 	}
 	// s&p500: ISO date column from the first STOCK_N per-ticker files.
-	let mut stocks: Vec<std::path::PathBuf> = std::fs::read_dir(STOCK_DIR)
+	let mut stocks: Vec<PathBuf> = fs::read_dir(STOCK_DIR)
 		.context("stock dir")?
 		.filter_map(|e| e.ok())
 		.map(|e| e.path())
@@ -935,7 +938,7 @@ fn main() -> anyhow::Result<()> {
 	// against a stale, incomparable score and silently refuse to save the retrained
 	// model. Remove it first; resume_from still sets the checkpoint path so the best
 	// weights are written during training (it just starts from random, file absent).
-	let _ = std::fs::remove_file("pantry/detector.ogdl");
+	let _ = fs::remove_file("pantry/detector.ogdl");
 	let model = model();
 	let trainer = Train::new()
 		.epochs(20000)

@@ -1,9 +1,12 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::match_wild_err_arm)]
 //! Owns all parsing: loaders (csv/arff/zip/dir) + column-type detection. Parse
 //! any format, detect column types via the char-level detector, export OGDL.
 //! Depends on `recipe-infer` (the forward engine) plus leaf utility crates only —
 //! it knows nothing of the trainer, builders, or encoded datasets above it.
+
+use std::fs;
 
 pub type Mat = ndarray::Array2<f64>;
 pub type Vec1 = ndarray::Array1<f64>;
@@ -46,7 +49,7 @@ pub struct Attr {
 /// MemAvailable from /proc/meminfo, in bytes. `usize::MAX` if it can't be read
 /// (no guard rather than a false positive). Used by the CSV/parse RAM guards.
 pub fn available_ram_bytes() -> usize {
-	std::fs::read_to_string("/proc/meminfo")
+	fs::read_to_string("/proc/meminfo")
 		.ok()
 		.and_then(|s| {
 			s.lines()

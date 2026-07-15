@@ -22,3 +22,5 @@ rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1"
 indicatif = { version = "0.17", features = ["rayon"] }
+[lints]
+workspace = true

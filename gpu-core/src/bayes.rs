@@ -1,6 +1,7 @@
 use crate::hip::HipError;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_nb_count_table(
@@ -59,7 +60,7 @@ pub fn gpu_nb_count_table(
 			n as i32,
 			n_features as i32,
 			n_classes as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -80,7 +81,7 @@ pub fn gpu_nb_feature_log_prob(
 			n_classes as i32,
 			n_features as i32,
 			alpha.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -105,7 +106,7 @@ pub fn gpu_multinomial_nb_logprob(
 			n as i32,
 			n_features as i32,
 			n_classes as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();
@@ -132,7 +133,7 @@ pub fn gpu_bernoulli_nb_logprob(
 			n as i32,
 			n_features as i32,
 			n_classes as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	crate::kernels::check_launch();

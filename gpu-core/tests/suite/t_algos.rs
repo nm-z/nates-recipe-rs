@@ -1,5 +1,9 @@
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{cluster, graph, sequence};
+use std::collections::HashSet;
+use std::f64::consts;
+use std::mem;
+use std::ptr;
 
 const EPS: f64 = 1e-5;
 
@@ -40,7 +44,7 @@ fn test_csr_spmv() {
 	graph::gpu_csr_spmv(&values, &col_idx, &row_ptr, &x, 3, &y_gpu).unwrap();
 
 	let mut y = [0.0f64; 3];
-	unsafe { y_gpu.download_async(&mut y, std::ptr::null_mut()) }.unwrap();
+	unsafe { y_gpu.download_async(&mut y, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("SpMV y = {:?}", y);
@@ -80,7 +84,7 @@ fn test_csr_spmm() {
 	graph::gpu_csr_spmm(&values, &col_idx, &row_ptr, &b, 3, 2, &c_gpu).unwrap();
 
 	let mut c = [0.0f64; 6];
-	unsafe { c_gpu.download_async(&mut c, std::ptr::null_mut()) }.unwrap();
+	unsafe { c_gpu.download_async(&mut c, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("SpMM C = {:?}", c);
@@ -125,7 +129,7 @@ fn test_neighbor_aggregate_sum() {
 	.unwrap();
 
 	let mut agg = [0.0f64; 8];
-	unsafe { agg_gpu.download_async(&mut agg, std::ptr::null_mut()) }.unwrap();
+	unsafe { agg_gpu.download_async(&mut agg, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("NeighborAgg sum = {:?}", agg);
@@ -173,7 +177,7 @@ fn test_neighbor_aggregate_mean() {
 	.unwrap();
 
 	let mut agg = [0.0f64; 8];
-	unsafe { agg_gpu.download_async(&mut agg, std::ptr::null_mut()) }.unwrap();
+	unsafe { agg_gpu.download_async(&mut agg, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("NeighborAgg mean = {:?}", agg);
@@ -206,7 +210,7 @@ fn test_gpu_degree() {
 	graph::gpu_degree(&edge_dst, 4, 3, &deg_gpu).unwrap();
 
 	let mut deg = [0.0f64; 4];
-	unsafe { deg_gpu.download_async(&mut deg, std::ptr::null_mut()) }.unwrap();
+	unsafe { deg_gpu.download_async(&mut deg, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("Degree = {:?}", deg);
@@ -248,7 +252,7 @@ fn test_gpu_gcn_norm() {
 
 	graph::gpu_gcn_norm(&deg, 4, 2, &features).unwrap();
 
-	unsafe { features.download_async(&mut features_h, std::ptr::null_mut()) }.unwrap();
+	unsafe { features.download_async(&mut features_h, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("GCN norm features = {:?}", features_h);
@@ -317,11 +321,11 @@ fn test_forward_backward() {
 	let mut log_beta = [0.0f64; 6];
 	let mut log_gamma = [0.0f64; 6];
 
-	unsafe { alpha_gpu.download_async(&mut log_alpha, std::ptr::null_mut()) }.unwrap();
+	unsafe { alpha_gpu.download_async(&mut log_alpha, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { beta_gpu.download_async(&mut log_beta, std::ptr::null_mut()) }.unwrap();
+	unsafe { beta_gpu.download_async(&mut log_beta, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { gamma_gpu.download_async(&mut log_gamma, std::ptr::null_mut()) }.unwrap();
+	unsafe { gamma_gpu.download_async(&mut log_gamma, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("log_alpha = {:?}", log_alpha);
@@ -344,7 +348,7 @@ fn test_forward_backward() {
 	// CPU reference (computed with Python logsumexp):
 	let ref_alpha: [f64; 6] = [
 		-0.798508,
-		-std::f64::consts::LN_10,
+		-consts::LN_10,
 		-3.338223,
 		-1.857899,
 		-2.544338,
@@ -425,8 +429,8 @@ fn test_viterbi() {
 	};
 
 	let delta = GpuBuffer::alloc(6).unwrap();
-	let backptr = GpuBuffer::alloc_bytes(6 * std::mem::size_of::<i32>()).unwrap();
-	let path_gpu = GpuBuffer::alloc_bytes(3 * std::mem::size_of::<i32>()).unwrap();
+	let backptr = GpuBuffer::alloc_bytes(6 * mem::size_of::<i32>()).unwrap();
+	let path_gpu = GpuBuffer::alloc_bytes(3 * mem::size_of::<i32>()).unwrap();
 	sequence::gpu_viterbi(&log_trans, &log_emit, 2, 3, &delta, &backptr, &path_gpu).unwrap();
 
 	let mut path = [0i32; 3];
@@ -483,7 +487,7 @@ fn test_union_find_cc() {
 	);
 
 	// Exactly 2 distinct component labels
-	let mut roots: std::collections::HashSet<i32> = std::collections::HashSet::new();
+	let mut roots: HashSet<i32> = HashSet::new();
 	for &p in &parent {
 		roots.insert(p);
 	}
@@ -573,7 +577,7 @@ fn test_core_distance() {
 	cluster::gpu_core_distance(&points, 4, 1, 2, &core_dist_gpu).unwrap();
 
 	let mut cd = [0.0f64; 4];
-	unsafe { core_dist_gpu.download_async(&mut cd, std::ptr::null_mut()) }.unwrap();
+	unsafe { core_dist_gpu.download_async(&mut cd, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	println!("core_distance = {:?}", cd);

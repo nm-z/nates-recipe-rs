@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_floor_scale_to_idx(
@@ -66,7 +67,7 @@ pub fn gpu_bootstrap_sample(
 			idx_out.ptr_raw(),
 			n_samples as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -87,7 +88,7 @@ pub fn gpu_feature_subset(
 			n_features as i32,
 			k as i32,
 			seed as u32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -110,7 +111,7 @@ pub fn gpu_random_threshold_split(
 			threshold_out.ptr_raw(),
 			n as i32,
 			seed as u32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -145,7 +146,7 @@ pub fn gpu_tree_ensemble_predict(
 			n as i32,
 			n_trees as i32,
 			lr.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -167,7 +168,7 @@ pub fn gpu_oob_mask(
 			oob_out.ptr_raw(),
 			n_samples as i32,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

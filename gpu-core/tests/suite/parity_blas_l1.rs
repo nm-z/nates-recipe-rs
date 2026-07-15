@@ -8,6 +8,7 @@ use gpu_core::reductions::{
 	gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes,
 };
 use gpu_core::{hip, linalg};
+use std::ptr;
 
 const TOL: f64 = 1e-9;
 
@@ -82,7 +83,7 @@ fn ddot_parity() {
 		gpu_dot(&ga, &gb, &ws, &prod, n, &out).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		}[0];
@@ -117,7 +118,7 @@ fn dnrm2_parity() {
 		gpu_l2_norm(&gx, &ws, &sq, n, &out).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		}[0];
@@ -150,7 +151,7 @@ fn dasum_parity() {
 		linalg::gpu_dasum(&gx, n, &out).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		}[0];
@@ -182,7 +183,7 @@ fn idamax_parity() {
 		linalg::gpu_idamax(&gx, n, &out).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		}[0]
@@ -208,7 +209,7 @@ fn idamax_parity() {
 	linalg::gpu_idamax(&gx, x.len(), &out).unwrap();
 	let got = {
 		let mut __dv = vec![0.0f64; out.n_floats()];
-		unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		__dv
 	}[0]

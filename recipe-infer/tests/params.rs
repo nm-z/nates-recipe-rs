@@ -1,8 +1,10 @@
+use std::env;
+use std::fs;
 use recipe_infer::{Saved, load_ogdl, load_ogdl_str};
 
 #[test]
 fn ogdl_format_roundtrips_host_side() {
-	let path = std::env::temp_dir().join("nrs_ogdl_roundtrip.ogdl");
+	let path = env::temp_dir().join("nrs_ogdl_roundtrip.ogdl");
 	let text = "\
 r2\t0.42
 embed
@@ -25,9 +27,9 @@ z2
 \ta\t0.25
 \tb\t0.002
 ";
-	std::fs::write(&path, text).expect("write tmp ogdl");
+	fs::write(&path, text).expect("write tmp ogdl");
 	let parsed = load_ogdl(path.to_str().expect("utf8 path")).expect("load_ogdl");
-	std::fs::remove_file(&path).ok();
+	fs::remove_file(&path).ok();
 	assert_eq!(parsed.len(), 4);
 	assert_eq!(
 		parsed[0],

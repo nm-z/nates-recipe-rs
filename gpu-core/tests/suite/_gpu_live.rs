@@ -1,4 +1,5 @@
 use gpu_core::memory::GpuBuffer;
+use std::ptr;
 
 #[test]
 fn roundtrip() {
@@ -9,7 +10,7 @@ fn roundtrip() {
 		__ub
 	};
 	let mut out = [0.0_f64; 3];
-	unsafe { b.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { b.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(out, [1.0, 2.0, 3.0]);
 	eprintln!("GPU round-trip OK: {:?}", out);

@@ -9,8 +9,10 @@ use crate::common;
 // registered op mismatches its oracle (a real bug).
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 // New tail kernels implemented in src/kernels/elementwise_binaryx.hip.
 unsafe extern "C" {
@@ -190,12 +192,12 @@ fn run_raw(f: Launch, a: &[f64], b: &[f64]) -> Vec<f64> {
 			bb.ptr_raw() as *const c_void,
 			o.ptr_raw(),
 			a.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -216,7 +218,7 @@ fn run_wrap(f: GpuBin, a: &[f64], b: &[f64]) -> Vec<f64> {
 	let o = GpuBuffer::alloc(a.len()).unwrap();
 	f(&ba, &bb, a.len(), &o).unwrap();
 	let mut out = vec![0.0; a.len()];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -596,13 +598,13 @@ fn canon(name: &str) -> String {
 fn load_inventory() -> Vec<(String, String)> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let Ok(rd) = std::fs::read_dir(&dir) else {
+	let Ok(rd) = fs::read_dir(&dir) else {
 		panic!("no kernel_inventory at {dir}");
 	};
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -671,10 +673,10 @@ fn prove_elementwise_binary() {
 	}
 
 	// Map inventory rows to proven ops -> coverage count.
-	let proven_keys: std::collections::HashSet<&str> = proven_ops.iter().cloned().collect();
+	let proven_keys: HashSet<&str> = proven_ops.iter().cloned().collect();
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut covered_ops: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+	let mut covered_ops: BTreeSet<String> = BTreeSet::new();
 	for (name, _) in &items {
 		let key = canon(name);
 		if reg.contains_key(key.as_str()) && proven_keys.contains(key.as_str()) {

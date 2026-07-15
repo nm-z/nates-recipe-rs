@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_ropex_qk(
@@ -50,7 +51,7 @@ pub fn gpu_rope_qk_heads_inplace(
 			seq as i32,
 			theta.ptr_raw() as *const c_void,
 			sgn.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -77,7 +78,7 @@ pub fn gpu_rope_qk(
 			n_rows as i32,
 			dim as i32,
 			theta.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

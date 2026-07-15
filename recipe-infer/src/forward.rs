@@ -1,3 +1,5 @@
+use std::process;
+use std::ptr;
 use crate::enums::{Activation, LayerKind, Loss, Metric};
 use crate::params::{ConcatDims, LayerParams, concat_layer};
 use crate::scratch::Scratch;
@@ -511,13 +513,13 @@ pub fn attn_forward_cached(
 
 pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 	let mut v = vec![0.0f64; len];
-	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
+	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
 	if !dl.is_ok() {
 		drop(Write::err(format!(
 			"gpu download: {}",
 			dl.err().map(|e| e.to_string()).unwrap_or_default()
 		)));
-		std::process::abort();
+		process::abort();
 	}
 	let sync = gpu_core::hip::device_synchronize();
 	if !sync.is_ok() {
@@ -525,7 +527,7 @@ pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
 			"gpu download sync: {}",
 			sync.err().map(|e| e.to_string()).unwrap_or_default()
 		)));
-		std::process::abort();
+		process::abort();
 	}
 	v
 }
@@ -628,13 +630,13 @@ pub struct Scored {
 
 pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64];
-	let dl = unsafe { buf.download_async(&mut v, std::ptr::null_mut()) };
+	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
 	if !dl.is_ok() {
 		drop(Write::err(format!(
 			"scalar download: {}",
 			dl.err().map(|e| e.to_string()).unwrap_or_default()
 		)));
-		std::process::abort();
+		process::abort();
 	}
 	let sync = gpu_core::hip::device_synchronize();
 	if !sync.is_ok() {
@@ -642,7 +644,7 @@ pub fn download_scalar(buf: &GpuBuffer) -> f64 {
 			"scalar download sync: {}",
 			sync.err().map(|e| e.to_string()).unwrap_or_default()
 		)));
-		std::process::abort();
+		process::abort();
 	}
 	v[0]
 }

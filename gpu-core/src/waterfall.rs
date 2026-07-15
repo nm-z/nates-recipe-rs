@@ -1,6 +1,8 @@
 use crate::log::{Write, gpu};
 use crate::memory::{GpuBuffer, tag_scope};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Error, Result};
 
 pub enum Home {
@@ -32,7 +34,7 @@ pub struct Waterfall {
 }
 
 fn mem_available() -> usize {
-	std::fs::read_to_string("/proc/meminfo")
+	fs::read_to_string("/proc/meminfo")
 		.ok()
 		.and_then(|s| {
 			s.lines()
@@ -89,11 +91,11 @@ impl Waterfall {
 		let vram = match self.vram_full {
 			Fill::Full => Tier::Skip,
 			Fill::Open => match crate::memory::arena_remaining().cmp(&len) {
-				std::cmp::Ordering::Less => {
+				Ordering::Less => {
 					self.vram_full = Fill::Full;
 					Tier::Skip
 				}
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => Tier::Use,
+				Ordering::Equal | Ordering::Greater => Tier::Use,
 			},
 		};
 		match vram {
@@ -119,8 +121,8 @@ impl Waterfall {
 		let ram = match self.ram_full {
 			Fill::Full => Tier::Skip,
 			Fill::Open => match mem_available().saturating_sub(len).cmp(&self.ram_floor) {
-				std::cmp::Ordering::Greater => Tier::Use,
-				std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+				Ordering::Greater => Tier::Use,
+				Ordering::Less | Ordering::Equal => {
 					self.ram_full = Fill::Full;
 					Tier::Skip
 				}

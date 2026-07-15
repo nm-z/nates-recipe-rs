@@ -8,3 +8,5 @@ name = "log"
 
 [dependencies]
 ogdl = { path = "../ogdl" }
+[lints]
+workspace = true

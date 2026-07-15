@@ -1,6 +1,9 @@
+#![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use gpu_core::tiered::{Budgets, Full, P, Tiered, human};
 use std::ffi::c_void;
 use std::path::Path;
+use std::ptr;
+use std::slice;
 
 #[test]
 fn budgets_are_the_sum() {
@@ -65,7 +68,7 @@ fn tiled_full_batch_runs_and_matches_whole() {
 				buf.ptr_raw(),
 				m * 8,
 				gpu_core::hip::HIP_MEMCPY_D2H,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			)
 			.expect("D2H");
 		}
@@ -123,7 +126,7 @@ fn tiled_full_batch_runs_and_matches_whole() {
 
 	let bytes = n * d * 8;
 	let mut t = Tiered::alloc_capped(bytes, 1, 1, Path::new("/tmp/tiled_train.spill"));
-	let xbytes = unsafe { std::slice::from_raw_parts(xh.as_ptr() as *const u8, bytes) };
+	let xbytes = unsafe { slice::from_raw_parts(xh.as_ptr() as *const u8, bytes) };
 	t.fill(xbytes);
 	t.sync().expect("fill");
 	assert!(!t.is_contiguous_vram(), "buffer must span >1 tier");
@@ -203,7 +206,7 @@ fn stage_across_three_tiers() {
 			window,
 			bytes,
 			gpu_core::hip::HIP_MEMCPY_D2H,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		)
 		.expect("D2H");
 	}
@@ -241,7 +244,7 @@ fn vram_fits_roundtrips() {
 			t.device_ptr(),
 			bytes,
 			gpu_core::hip::HIP_MEMCPY_D2H,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		)
 		.expect("D2H");
 	}

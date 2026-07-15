@@ -21,8 +21,10 @@ use crate::common;
 // merge, unique_inverse/all) stays backlog — reported, never faked green.
 
 use gpu_core::memory::GpuBuffer;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_setx_unique_workspace_bytes(n: i32) -> usize;
@@ -114,7 +116,7 @@ fn run_unique(x: &[f64]) -> Vec<f64> {
 			tmp.ptr_raw(),
 			wb,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -122,7 +124,7 @@ fn run_unique(x: &[f64]) -> Vec<f64> {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut buf = vec![0.0; n];
-	unsafe { out.download_async(&mut buf, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut buf, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	buf.truncate(k);
 	buf
@@ -150,7 +152,7 @@ fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 			tmp.ptr_raw(),
 			wb,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -158,7 +160,7 @@ fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut buf = vec![0.0; n];
-	unsafe { out.download_async(&mut buf, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut buf, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	buf.truncate(k);
 	buf
@@ -188,7 +190,7 @@ fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 			tmp.ptr_raw(),
 			wb,
 			n as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
@@ -196,7 +198,7 @@ fn run_unique_counts(x: &[f64]) -> (Vec<f64>, Vec<i32>) {
 	cnt.download_i32(&mut k).unwrap();
 	let k = k[0] as usize;
 	let mut v = vec![0.0; n];
-	unsafe { vals.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { vals.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v.truncate(k);
 	let mut c = vec![0i32; n];
@@ -233,12 +235,12 @@ fn run_isin(a: &[f64], b: &[f64]) -> Vec<f64> {
 			tmp_bytes,
 			a.len() as i32,
 			b.len() as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	lasterr();
 	let mut out = vec![0.0; a.len()];
-	unsafe { mask.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { mask.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -410,11 +412,11 @@ fn canon(name: &str) -> String {
 fn load_set() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = std::fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -452,8 +454,8 @@ fn prove_set() {
 
 	let total = items.len();
 	let mut proven = 0usize;
-	let mut proven_keys: std::collections::BTreeSet<String> = Default::default();
-	let mut backlog: std::collections::BTreeSet<String> = Default::default();
+	let mut proven_keys: BTreeSet<String> = Default::default();
+	let mut backlog: BTreeSet<String> = Default::default();
 	for name in &items {
 		let key = canon(name);
 		match op_ok.get(key.as_str()) {

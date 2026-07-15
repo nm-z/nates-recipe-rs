@@ -16,6 +16,7 @@ use gpu_core::reductions::{
 	gpu_min_all_workspace_bytes, gpu_scan_linear_recurrence, gpu_segment_max, gpu_segment_sort,
 	gpu_segment_sum, gpu_sort, gpu_sort_by_key, gpu_sum_all, gpu_sum_all_workspace_bytes,
 };
+use std::ptr;
 
 fn close(a: f64, b: f64) -> bool {
 	(a - b).abs() < 1e-6 * (1.0 + b.abs())
@@ -35,7 +36,7 @@ fn assert_close(label: &str, got: f64, expected: f64) {
 // Download a 1-elem device scalar to host.
 fn scalar(out: &GpuBuffer) -> f64 {
 	let mut v = [0.0f64; 1];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	v[0]
 }
@@ -149,7 +150,7 @@ fn test_sort_basic() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_sort(&x, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0]);
 }
@@ -166,7 +167,7 @@ fn test_sort_non_power_of_two() {
 	let out = GpuBuffer::alloc(5).unwrap();
 	gpu_sort(&x, 5, &out).unwrap();
 	let mut v = [0.0f64; 5];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0, 4.0, 5.0], "sort non-power-of-two");
 }
@@ -183,7 +184,7 @@ fn test_sort_size_three() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_sort(&x, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(v, [-1.0, 5.0, 9.0], "sort size 3 (padded to 4)");
 }
@@ -240,9 +241,9 @@ fn test_sort_by_key() {
 	gpu_sort_by_key(&keys, &vals, 3, &ok, &ov).unwrap();
 	let mut rk = [0.0f64; 3];
 	let mut rv = [0.0f64; 3];
-	unsafe { ok.download_async(&mut rk, std::ptr::null_mut()) }.unwrap();
+	unsafe { ok.download_async(&mut rk, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { ov.download_async(&mut rv, std::ptr::null_mut()) }.unwrap();
+	unsafe { ov.download_async(&mut rv, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(rk, [1.0, 2.0, 3.0], "sort_by_key keys");
 	assert_eq!(rv, [10.0, 20.0, 30.0], "sort_by_key vals");
@@ -263,7 +264,7 @@ fn test_segment_sort() {
 	let out = GpuBuffer::alloc(5).unwrap();
 	gpu_segment_sort(&data, &offsets, 5, 2, &out).unwrap();
 	let mut v = [0.0f64; 5];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_eq!(v, [1.0, 2.0, 3.0, 4.0, 5.0], "segment_sort: {:?}", v);
 }
@@ -283,7 +284,7 @@ fn test_cumsum_rows() {
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_cumsum_rows(&x, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [1.0, 3.0, 6.0, 4.0, 9.0, 15.0];
 	for i in 0..6 {
@@ -304,7 +305,7 @@ fn test_cumsum_cols() {
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_cumsum_cols(&x, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [1.0, 2.0, 3.0, 5.0, 7.0, 9.0];
 	for i in 0..6 {
@@ -325,7 +326,7 @@ fn test_cumprod() {
 	let out = GpuBuffer::alloc(4).unwrap();
 	gpu_cumprod(&x, &ws, 4, &out).unwrap();
 	let mut v = [0.0f64; 4];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [1.0, 2.0, 6.0, 24.0];
 	for i in 0..4 {
@@ -346,7 +347,7 @@ fn test_cummax() {
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_cummax(&x, &ws, 6, &out).unwrap();
 	let mut v = [0.0f64; 6];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [3.0, 3.0, 4.0, 4.0, 5.0, 5.0];
 	for i in 0..6 {
@@ -375,7 +376,7 @@ fn test_segment_sum() {
 	};
 	gpu_segment_sum(&vals, &seg_ids, 6, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("segment_sum[0]", v[0], 3.0);
 	assert_close("segment_sum[1]", v[1], 7.0);
@@ -396,7 +397,7 @@ fn test_segment_max() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_segment_max(&vals, &seg_ids, 6, 3, &out).unwrap();
 	let mut v = [0.0f64; 3];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("segment_max[0]", v[0], 5.0);
 	assert_close("segment_max[1]", v[1], 3.0);
@@ -435,7 +436,7 @@ fn test_scan_linear_recurrence() {
 	let out = GpuBuffer::alloc(6).unwrap();
 	gpu_scan_linear_recurrence(&a, &b, 3, 2, &out).unwrap();
 	let mut v = [0.0f64; 6];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	// v[t*2+d]
 	assert_close("recur[0,0] h1_ch0", v[0], 1.0);
@@ -536,7 +537,7 @@ fn test_dgemv_no_trans() {
 	let out = GpuBuffer::alloc(3).unwrap();
 	gpu_dgemv_into(&a, &x, 3, 2, 0, &out).unwrap();
 	let mut v = [0.0f64; 3];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("dgemv[0]", v[0], 3.0);
 	assert_close("dgemv[1]", v[1], 7.0);
@@ -562,7 +563,7 @@ fn test_dgemv_trans() {
 	let out = GpuBuffer::alloc(2).unwrap();
 	gpu_dgemv_into(&a, &x, 3, 2, 1, &out).unwrap();
 	let mut v = [0.0f64; 2];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("dgemv_t[0]", v[0], 9.0);
 	assert_close("dgemv_t[1]", v[1], 12.0);
@@ -592,7 +593,7 @@ fn test_dger() {
 	};
 	gpu_dger_into(&x, &y, 2, 3, &out).unwrap();
 	let mut v = [0.0f64; 6];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
 	for i in 0..6 {
@@ -618,7 +619,7 @@ fn test_dsyrk() {
 	let c = GpuBuffer::alloc(4).unwrap();
 	gpu_dsyrk(&a, 2, 2, &c).unwrap();
 	let mut v = [0.0f64; 4];
-	unsafe { c.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { c.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	// row-major: v[0]=C(0,0), v[1]=C(0,1), v[2]=C(1,0), v[3]=C(1,1)
 	// lower triangle: C(0,0)=10, C(1,0)=14, C(1,1)=20
@@ -656,7 +657,7 @@ fn test_dgemm_strided_batched() {
 	// batch=2, m=n=k=2, contiguous no-transpose: lda=k, ldb=n, ldc=n, strides = m*k / k*n / m*n.
 	gpu_bmm_into(&a, &b, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4, 0, 0, 0, 0, 0, &c).unwrap();
 	let mut v = [0.0f64; 8];
-	unsafe { c.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { c.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let expected = [1.0, 2.0, 3.0, 4.0, 6.0, 2.0, 2.0, 6.0];
 	for i in 0..8 {
@@ -696,7 +697,7 @@ fn test_lu_solve() {
 	gpu_lu_solve(&lu, &ipiv, &b, 2, 1, &solve_work, &info, &x).unwrap();
 
 	let mut v = [0.0f64; 2];
-	unsafe { x.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { x.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("lu_solve x[0]", v[0], 1.0);
 	assert_close("lu_solve x[1]", v[1], 3.0);
@@ -734,7 +735,7 @@ fn test_potrs() {
 	gpu_potrs(&l, &b, 2, 1, &potrs_work, &info, &x).unwrap();
 
 	let mut v = [0.0f64; 2];
-	unsafe { x.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { x.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	assert_close("potrs x[0]", v[0], 1.25);
 	assert_close("potrs x[1]", v[1], 1.5);
@@ -762,9 +763,9 @@ fn test_qr_square_reconstruction() {
 
 	let mut q_v = [0.0f64; 4];
 	let mut r_v = [0.0f64; 4];
-	unsafe { q.download_async(&mut q_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { q.download_async(&mut q_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { r.download_async(&mut r_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { r.download_async(&mut r_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	for (i, &x) in q_v.iter().enumerate() {
@@ -825,9 +826,9 @@ fn test_qr_thin_reconstruction() {
 
 	let mut q_v = [0.0f64; 6];
 	let mut r_v = [0.0f64; 4];
-	unsafe { q.download_async(&mut q_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { q.download_async(&mut q_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { r.download_async(&mut r_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { r.download_async(&mut r_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	for (i, &x) in q_v.iter().enumerate() {
@@ -890,10 +891,10 @@ fn test_eigh_sym() {
 	gpu_eigh_sym(&a, n, &work, &info, &evals, &evecs).unwrap();
 
 	let mut ev = [0.0f64; 2];
-	unsafe { evals.download_async(&mut ev, std::ptr::null_mut()) }.unwrap();
+	unsafe { evals.download_async(&mut ev, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	let mut vc = [0.0f64; 4];
-	unsafe { evecs.download_async(&mut vc, std::ptr::null_mut()) }.unwrap();
+	unsafe { evecs.download_async(&mut vc, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	assert_close("eigh eval[0]", ev[0], 1.0);
@@ -944,11 +945,11 @@ fn test_svd_reconstruction() {
 	let mut s_v = [0.0f64; 2];
 	let mut vt_v = [0.0f64; 4];
 
-	unsafe { u.download_async(&mut u_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { u.download_async(&mut u_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { s.download_async(&mut s_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { s.download_async(&mut s_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	unsafe { vt.download_async(&mut vt_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { vt.download_async(&mut vt_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	for (i, &x) in u_v.iter().enumerate() {
@@ -998,7 +999,7 @@ fn test_fft_c2c_1d_and_inverse() {
 	let fwd = GpuBuffer::alloc(2 * n).unwrap();
 	gpu_fft_c2c_1d(&x, n, 1, &fwd).unwrap();
 	let mut fwd_v = [0.0f64; 8];
-	unsafe { fwd.download_async(&mut fwd_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { fwd.download_async(&mut fwd_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// FFT([1,0,0,0]) = [1,1,1,1] (each with imag=0)
@@ -1011,7 +1012,7 @@ fn test_fft_c2c_1d_and_inverse() {
 	let inv = GpuBuffer::alloc(2 * n).unwrap();
 	gpu_fft_c2c_1d(&fwd, n, 0, &inv).unwrap();
 	let mut inv_v = [0.0f64; 8];
-	unsafe { inv.download_async(&mut inv_v, std::ptr::null_mut()) }.unwrap();
+	unsafe { inv.download_async(&mut inv_v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	// rocFFT inverse is unnormalized → multiply by n
@@ -1041,7 +1042,7 @@ fn test_rfft_1d() {
 	let out = GpuBuffer::alloc(2 * out_complex).unwrap();
 	gpu_rfft_1d(&x, n, &out).unwrap();
 	let mut v = vec![0.0f64; 2 * out_complex];
-	unsafe { out.download_async(&mut v, std::ptr::null_mut()) }.unwrap();
+	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
 	for i in 0..out_complex {

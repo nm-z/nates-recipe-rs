@@ -1,6 +1,7 @@
 use crate::hip::{HipError, check};
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 fn cl() -> Result<(), HipError> {
 	crate::callspy::tick(&crate::callspy::LAUNCH);
@@ -82,7 +83,7 @@ pub fn gpu_rope_partial(
 			rotary_dim as i32,
 			heads_per_tok as i32,
 			theta.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -94,7 +95,7 @@ pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), 
 			raw.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i64,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -116,7 +117,7 @@ pub fn gpu_rmsnorm_f64(
 			rows as i32,
 			cols as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -133,11 +134,11 @@ pub fn gpu_rmsnorm_f64_nogamma(
 		launch_normx_rmsnorm(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
-			std::ptr::null(),
+			ptr::null(),
 			rows as i32,
 			cols as i32,
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -165,7 +166,7 @@ pub fn gpu_gqa_attn(
 			nkv as i32,
 			hd as i32,
 			prefix as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -183,7 +184,7 @@ pub fn gpu_gelu_mul(
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			n as i64,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -201,7 +202,7 @@ pub fn gpu_glu_gelu(
 			out.ptr_raw(),
 			rows as i32,
 			half as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -223,7 +224,7 @@ pub fn gpu_gemm_bt_f64(
 			m as i32,
 			n as i32,
 			k as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()
@@ -235,7 +236,7 @@ pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Res
 			x.ptr_raw(),
 			scalar.ptr_raw() as *const c_void,
 			n as i64,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	cl()

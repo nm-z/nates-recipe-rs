@@ -6,7 +6,9 @@ use ratatui::symbols::{self, Marker};
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
 use recipe_infer::{Metric, Pt, pt};
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
+use std::mem;
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 struct Rgb {
@@ -254,7 +256,7 @@ pub fn show(summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
 		dashboard(frame, summary, rows, ys);
 	});
 	Some(())
-		.filter(|_probe| std::io::stdin().is_terminal())
+		.filter(|_probe| io::stdin().is_terminal())
 		.map(|_probe| {
 			loop {
 				match event::read() {
@@ -333,7 +335,7 @@ fn toks_to_lines(toks: &[Tok]) -> Vec<Line<'static>> {
 		for (i, seg) in segs.iter().enumerate() {
 			let _break = Some(())
 				.filter(|_probe| i > 0)
-				.map(|_probe| lines.push(Line::from(std::mem::take(&mut cur))));
+				.map(|_probe| lines.push(Line::from(mem::take(&mut cur))));
 			let _push = Some(())
 				.filter(|_probe| !seg.is_empty())
 				.map(|_probe| cur.push(Span::styled((*seg).to_string(), st)));
@@ -463,7 +465,7 @@ pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 }
 
 pub fn chat(gguf: &str) {
-	crate::some_or_die(std::io::stdin().is_terminal().then_some(()), "chat: needs a tty");
+	crate::some_or_die(io::stdin().is_terminal().then_some(()), "chat: needs a tty");
 	let mut term = ratatui::init();
 	let _guard = TermRestore;
 	let mut textarea = new_input();
@@ -502,7 +504,7 @@ pub fn chat(gguf: &str) {
 						};
 						on_round(&[]);
 						res = recipe_infer::llm::generate(
-							std::path::Path::new(gguf),
+							Path::new(gguf),
 							&prompt,
 							&mut on_round,
 						);

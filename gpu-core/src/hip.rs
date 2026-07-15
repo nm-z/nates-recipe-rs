@@ -1,6 +1,17 @@
 use crate::log::Write;
+use std::cmp;
+use std::env;
+use std::error::Error;
 use std::ffi::{CStr, c_void};
 use std::fmt;
+use std::fs;
+use std::mem;
+use std::num::NonZeroUsize;
+use std::process;
+use std::ptr;
+use std::sync::Once;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct HipError(pub i32);
@@ -13,8 +24,8 @@ impl fmt::Display for HipError {
 			crate::callspy::tick(&crate::callspy::GET_ERROR_STRING);
 			let name_ptr = hipGetErrorName(code);
 			let str_ptr = hipGetErrorString(code);
-			match std::ptr::NonNull::new(name_ptr.cast_mut()) {
-				Some(name_nn) => match std::ptr::NonNull::new(str_ptr.cast_mut()) {
+			match ptr::NonNull::new(name_ptr.cast_mut()) {
+				Some(name_nn) => match ptr::NonNull::new(str_ptr.cast_mut()) {
 					Some(str_nn) => {
 						let name = CStr::from_ptr(name_nn.as_ptr()).to_string_lossy();
 						let msg = CStr::from_ptr(str_nn.as_ptr()).to_string_lossy();
@@ -27,7 +38,7 @@ impl fmt::Display for HipError {
 		}
 	}
 }
-impl std::error::Error for HipError {}
+impl Error for HipError {}
 
 pub fn check(code: i32) -> Result<(), HipError> {
 	match code {
@@ -39,7 +50,7 @@ pub fn check(code: i32) -> Result<(), HipError> {
 pub fn cu_count() -> usize {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	static CU: AtomicUsize = AtomicUsize::new(0);
-	match std::num::NonZeroUsize::new(CU.load(Ordering::Relaxed)) {
+	match NonZeroUsize::new(CU.load(Ordering::Relaxed)) {
 		Some(cached) => cached.get(),
 		None => {
 			crate::gate::acquire();
@@ -49,7 +60,7 @@ pub fn cu_count() -> usize {
 				drop(Write::err(&format!(
 					"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
 				)));
-				std::process::abort();
+				process::abort();
 			}
 			CU.store(n as usize, Ordering::Relaxed);
 			n as usize
@@ -168,13 +179,13 @@ pub fn device_synchronize() -> Result<(), HipError> {
 }
 
 pub(crate) fn disable_sdma_once() {
-	static ONCE: std::sync::Once = std::sync::Once::new();
+	static ONCE: Once = Once::new();
 	ONCE.call_once(|| {
 		for _absent in Some(())
-			.filter(|_u| std::env::var_os("HSA_ENABLE_SDMA").is_none())
+			.filter(|_u| env::var_os("HSA_ENABLE_SDMA").is_none())
 			.into_iter()
 		{
-			unsafe { std::env::set_var("HSA_ENABLE_SDMA", "0") };
+			unsafe { env::set_var("HSA_ENABLE_SDMA", "0") };
 		}
 	});
 }
@@ -253,15 +264,15 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 		let va = e.virtual_address as usize;
 		let locate = match crate::memory::bounce_range() {
 			Some(r) => match va.cmp(&r.base) {
-				std::cmp::Ordering::Less => {
+				cmp::Ordering::Less => {
 					format!("outside bounce (bounce base 0x{:x})", r.base)
 				}
-				std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+				cmp::Ordering::Equal | cmp::Ordering::Greater => {
 					match va.cmp(&(r.base + r.len)) {
-						std::cmp::Ordering::Less => {
+						cmp::Ordering::Less => {
 							format!("INSIDE pinned h2d bounce (+0x{:x})", va - r.base)
 						}
-						std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+						cmp::Ordering::Equal | cmp::Ordering::Greater => {
 							format!("outside bounce (bounce base 0x{:x})", r.base)
 						}
 					}
@@ -278,7 +289,7 @@ extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i3
 			e.virtual_address,
 			crate::memory::ledger_report(),
 		)));
-		std::thread::sleep(std::time::Duration::from_millis(150));
+		thread::sleep(Duration::from_millis(150));
 	}
 	1
 }
@@ -296,15 +307,15 @@ pub(crate) fn register_fault_autopsy_once() {
 				c"hsa_amd_register_system_event_handler".as_ptr(),
 			)
 		};
-		for found in std::ptr::NonNull::new(sym).into_iter() {
+		for found in ptr::NonNull::new(sym).into_iter() {
 			type Register = extern "C" fn(
 				extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
 				*mut c_void,
 			) -> i32;
 			let register =
-				unsafe { std::mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
+				unsafe { mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
 			for _ok in Some(())
-				.filter(|_u| register(fault_autopsy, std::ptr::null_mut()) == 0)
+				.filter(|_u| register(fault_autopsy, ptr::null_mut()) == 0)
 				.into_iter()
 			{
 				REGISTERED.store(1, Ordering::Relaxed);
@@ -317,7 +328,7 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	crate::gate::acquire();
 	const RESERVED_MEM_CURRENT: i32 = 0x5;
 	const USED_MEM_CURRENT: i32 = 0x7;
-	let mut pool: *mut c_void = std::ptr::null_mut();
+	let mut pool: *mut c_void = ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
 	let mut reserved: u64 = 0;
@@ -338,10 +349,10 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 }
 
 pub fn sysfs_vram_free() -> Option<usize> {
-	for card in std::fs::read_dir("/sys/class/drm").ok()? {
+	for card in fs::read_dir("/sys/class/drm").ok()? {
 		let dev = card.ok()?.path().join("device");
 		let read = |f: &str| -> Option<usize> {
-			std::fs::read_to_string(dev.join(f))
+			fs::read_to_string(dev.join(f))
 				.ok()?
 				.trim()
 				.parse()
@@ -358,7 +369,7 @@ pub fn sysfs_vram_free() -> Option<usize> {
 
 pub(crate) fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
-	let mut pool: *mut c_void = std::ptr::null_mut();
+	let mut pool: *mut c_void = ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
 	let mut threshold: u64 = u64::MAX;
@@ -378,7 +389,7 @@ pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
 }
 
 pub(crate) fn trim_mempool(device: i32) -> Result<(), HipError> {
-	let mut pool: *mut c_void = std::ptr::null_mut();
+	let mut pool: *mut c_void = ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::GET_DEFAULT_MEMPOOL);
 	check(unsafe { hipDeviceGetDefaultMemPool(&mut pool, device) })?;
 	crate::callspy::tick(&crate::callspy::MEMPOOL_TRIM_TO);
@@ -408,7 +419,7 @@ pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 
 pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 	crate::gate::acquire();
-	let mut ptr: *mut c_void = std::ptr::null_mut();
+	let mut ptr: *mut c_void = ptr::null_mut();
 	crate::callspy::tick(&crate::callspy::HOST_MALLOC);
 	check(unsafe { hipHostMalloc(&mut ptr, size, flags) })?;
 	crate::memory::note_range(ptr as usize, size, "pinned-host");
@@ -442,7 +453,7 @@ unsafe impl Sync for Stream {}
 impl Stream {
 	pub fn new() -> Result<Self, HipError> {
 		crate::gate::acquire();
-		let mut raw: *mut c_void = std::ptr::null_mut();
+		let mut raw: *mut c_void = ptr::null_mut();
 		crate::callspy::tick(&crate::callspy::STREAM_CREATE);
 		check(unsafe { hipStreamCreate(&mut raw) })?;
 		Ok(Stream { raw })
@@ -477,7 +488,7 @@ unsafe impl Sync for Event {}
 impl Event {
 	pub fn new() -> Result<Self, HipError> {
 		crate::gate::acquire();
-		let mut raw: *mut c_void = std::ptr::null_mut();
+		let mut raw: *mut c_void = ptr::null_mut();
 		crate::callspy::tick(&crate::callspy::EVENT_CREATE);
 		check(unsafe { hipEventCreate(&mut raw) })?;
 		Ok(Event { raw })

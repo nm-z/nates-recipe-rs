@@ -2,6 +2,7 @@ use crate::hip::HipError;
 use crate::kernels::check_launch;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_forward_backward(
@@ -45,7 +46,7 @@ pub fn gpu_forward_backward(
 			log_gamma_out.ptr_raw(),
 			n_states as i32,
 			t_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();
@@ -70,7 +71,7 @@ pub fn gpu_viterbi(
 			best_path_out.ptr_raw(),
 			n_states as i32,
 			t_len as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch();

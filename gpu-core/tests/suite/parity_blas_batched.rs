@@ -11,6 +11,7 @@
 
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
+use std::ptr;
 
 // ── CPU oracles (plain Rust, row-major contiguous) ────────────────────────
 
@@ -128,7 +129,7 @@ fn run_bmm_case(batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) 
 
 	let got = {
 		let mut __dv = vec![0.0f64; cg.n_floats()];
-		unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		__dv
 	};
@@ -215,7 +216,7 @@ fn bmm_parity_two_batch_explicit() {
 	.unwrap();
 	let got = {
 		let mut __dv = vec![0.0f64; cg.n_floats()];
-		unsafe { cg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		unsafe { cg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		__dv
 	};
@@ -266,7 +267,7 @@ fn gemm_pipeline_compose_parity() {
 	// Intermediate parity.
 	let h_gpu = {
 		let mut __dv = vec![0.0f64; hg.n_floats()];
-		unsafe { hg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		unsafe { hg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		__dv
 	};
@@ -276,7 +277,7 @@ fn gemm_pipeline_compose_parity() {
 	// Final parity.
 	let y_gpu = {
 		let mut __dv = vec![0.0f64; yg.n_floats()];
-		unsafe { yg.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+		unsafe { yg.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
 		__dv
 	};

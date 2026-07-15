@@ -4,6 +4,8 @@
 //! no training framework.
 use recipe_infer::log::{Opt, Write, data, set_opt};
 use anyhow::Result;
+use std::env;
+use std::process;
 
 fn kind_name(k: usize) -> &'static str {
 	["Numeric", "Temporal", "Categorical", "Ordinal", "Text"]
@@ -14,10 +16,10 @@ fn kind_name(k: usize) -> &'static str {
 
 fn main() -> Result<()> {
 	set_opt(Opt { data: true, ..Opt::default() });
-	let paths: Vec<String> = std::env::args().skip(1).collect();
+	let paths: Vec<String> = env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
 		drop(Write::err("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)"));
-		std::process::exit(1);
+		process::exit(1);
 	};
 
 	recipe_infer::init()?;

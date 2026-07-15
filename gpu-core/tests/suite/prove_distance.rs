@@ -25,6 +25,8 @@ use crate::common;
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
+use std::fs;
+use std::ptr;
 
 unsafe extern "C" {
 	fn launch_distancex_manhattan(
@@ -117,12 +119,12 @@ fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: 
 			nq as i32,
 			nt as i32,
 			dim as i32,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 	let mut out = vec![0.0; nq * nt];
-	unsafe { o.download_async(&mut out, std::ptr::null_mut()) }.unwrap();
+	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 	out
 }
@@ -195,13 +197,13 @@ fn canon(name: &str) -> Option<&'static str> {
 fn load_distance() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in std::fs::read_dir(&dir)
+	for e in fs::read_dir(&dir)
 		.expect("no kernel_inventory")
 		.flatten()
 	{
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
-			let Ok(txt) = std::fs::read_to_string(&p) else {
+			let Ok(txt) = fs::read_to_string(&p) else {
 				continue;
 			};
 			let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
@@ -265,7 +267,7 @@ fn prove_distance() {
 		.unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -298,7 +300,7 @@ fn prove_distance() {
 		.unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -335,7 +337,7 @@ fn prove_distance() {
 		.unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -379,7 +381,7 @@ fn prove_distance() {
 		.unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
-			unsafe { out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -443,13 +445,13 @@ fn prove_distance() {
 				nt as i32,
 				dim as i32,
 				p,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 		let got = {
 			let mut __dv = vec![0.0f64; o.n_floats()];
-			unsafe { o.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { o.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -484,13 +486,13 @@ fn prove_distance() {
 				nt as i32,
 				dim as i32,
 				p,
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 			);
 		}
 		gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 		let mink2 = {
 			let mut __dv = vec![0.0f64; o.n_floats()];
-			unsafe { o.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { o.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
@@ -526,7 +528,7 @@ fn prove_distance() {
 		.unwrap();
 		let l2sq = {
 			let mut __dv = vec![0.0f64; l2out.n_floats()];
-			unsafe { l2out.download_async(&mut __dv, std::ptr::null_mut()) }.unwrap();
+			unsafe { l2out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};

@@ -7,7 +7,14 @@ use recipe_infer::{
 	vram_estimate,
 };
 use std::cell::{Cell, RefCell};
-use std::io::IsTerminal;
+use std::env;
+use std::fs;
+use std::io::{self, IsTerminal};
+use std::mem;
+use std::path::Path;
+use std::process;
+use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub use recipe_infer::{
@@ -244,7 +251,7 @@ struct LastRun {
 impl Default for LastRun {
 	fn default() -> Self {
 		LastRun {
-			model: std::ptr::null(),
+			model: ptr::null(),
 			score: f64::NAN,
 			preds: None,
 			n: 0,
@@ -292,7 +299,7 @@ impl Train {
 	pub(crate) fn resolve(path: &str) -> String {
 		let raw = match path {
 			"" => "model.ogdl".to_string(),
-			"*" => std::env::current_exe()
+			"*" => env::current_exe()
 				.ok()
 				.and_then(|e| e.parent().map(|d| d.join("model.ogdl")))
 				.map(|p| p.display().to_string())
@@ -369,7 +376,7 @@ impl Train {
 					.is_none()
 				{
 					drop(Write::err(format!("run: prepare data: {e:#}")));
-					std::process::abort();
+					process::abort();
 				}
 				drop(Write::err(
 					"skipped  scenario exceeds the VRAM+RAM+disk ceiling (size above)",
@@ -382,9 +389,9 @@ impl Train {
 			drop(Write::err(
 				"run: forward-only data — Train is fit-only; use recipe.infer().run(&model).eval(&data)",
 			));
-			std::process::abort();
+			process::abort();
 		}
-		let conns: Option<std::sync::Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
+		let conns: Option<Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
 				let cs = crate::ok_or_die(wnet.connect(), "net: connect");
 				for c in &cs {
@@ -394,7 +401,7 @@ impl Train {
 						crate::data::human_bytes(c.info.ram as usize),
 					));
 				}
-				Some(std::sync::Arc::new(cs))
+				Some(Arc::new(cs))
 			}
 			None => None,
 		};
@@ -431,7 +438,7 @@ impl Train {
 							.map(|e| format!("{e:#}"))
 							.unwrap_or_default()
 					)));
-					std::process::abort();
+					process::abort();
 				}
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())
@@ -500,7 +507,7 @@ impl Train {
 				let params = model.params.borrow();
 				if params.is_empty() {
 					drop(Write::err("save: model has no trained params"));
-					std::process::abort();
+					process::abort();
 				}
 				Rendered {
 					text: recipe_infer::dump_ogdl(&params, filter, key, score),
@@ -517,9 +524,9 @@ impl Train {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
-		let full = std::fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
+		let full = fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
 		Write::line(save, &format!(
 			"saved {} ({} neurons, {key} {score:.4})",
 			full.display(),
@@ -584,11 +591,11 @@ impl Infer {
 		});
 		match &model.inner.gguf {
 			Some(path) => {
-				if std::env::var_os("VRAM_PROBE").is_some() {
+				if env::var_os("VRAM_PROBE").is_some() {
 					drop(Write::err(
 						"infer: VRAM_PROBE set — the binary's main must call recipe_infer::llm::vram_probe_ask() and exit with its code before run()",
 					));
-					std::process::abort();
+					process::abort();
 				}
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
@@ -596,12 +603,12 @@ impl Infer {
 						recipe_infer::shutdown();
 					}
 					None => {
-						let prompt_text = std::env::args()
+						let prompt_text = env::args()
 							.nth(1)
 							.unwrap_or_else(|| "The capital of France is".to_string());
 						let out = crate::ok_or_die(
 							recipe_infer::llm::generate(
-								std::path::Path::new(path),
+								Path::new(path),
 								&prompt_text,
 								&mut |toks| {
 									Write::line(
@@ -637,7 +644,7 @@ impl Infer {
 			let last = self.last.borrow();
 			if last.model.is_null() {
 				drop(Write::err("infer: call run(&model) first"));
-				std::process::abort();
+				process::abort();
 			}
 			last.model
 		};
@@ -663,7 +670,7 @@ impl Infer {
 		let params = model.params.borrow();
 		if params.is_empty() {
 			drop(Write::err("eval: call train first"));
-			std::process::abort();
+			process::abort();
 		}
 		let k = params[params.len() - 1].out_dim;
 		let yscaler = *model.yscaler.borrow();
@@ -684,7 +691,7 @@ impl Infer {
 								.map(|e| format!("{e:#}"))
 								.unwrap_or_default()
 						)));
-						std::process::abort();
+						process::abort();
 					}
 					__ub
 				};
@@ -764,7 +771,7 @@ impl Infer {
 		last.n = ei.n;
 		last.k = k;
 		let incoming_names = dat.target_names();
-		let kept_names = std::mem::take(&mut last.target_names);
+		let kept_names = mem::take(&mut last.target_names);
 		last.target_names = Some(incoming_names)
 			.filter(|names| !names.is_empty())
 			.unwrap_or(kept_names);
@@ -788,7 +795,7 @@ impl Default for Infer {
 }
 
 fn expand_tilde(path: &str) -> String {
-	let Ok(home) = std::env::var("HOME") else {
+	let Ok(home) = env::var("HOME") else {
 		return path.to_string();
 	};
 	match path {
@@ -828,13 +835,13 @@ pub struct Model {
 }
 
 thread_local! {
-	static PARKED_MODEL: std::cell::RefCell<Option<Box<ModelInner>>> =
-		const { std::cell::RefCell::new(None) };
+	static PARKED_MODEL: RefCell<Option<Box<ModelInner>>> =
+		const { RefCell::new(None) };
 }
 
 impl Drop for Model {
 	fn drop(&mut self) {
-		let inner = std::mem::replace(&mut self.inner, Box::new(ModelInner::blank()));
+		let inner = mem::replace(&mut self.inner, Box::new(ModelInner::blank()));
 		PARKED_MODEL.with(|slot| slot.borrow_mut().replace(inner));
 	}
 }
@@ -1073,7 +1080,7 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 	let Some(_first) = issues.first() else {
 		return Gate::Proceed;
 	};
-	let interactive = std::io::stdin().is_terminal();
+	let interactive = io::stdin().is_terminal();
 	for i in 0..issues.len() {
 		let issue = &issues[i];
 		drop(Write::err(&format!(
@@ -1090,9 +1097,9 @@ fn confirm_issues(issues: &[Issue]) -> Gate {
 	};
 	use std::io::Write as _;
 	Write::line(prompt, "continue anyway? [y/N] ");
-	std::io::stderr().flush().ok();
+	io::stderr().flush().ok();
 	let mut line = String::new();
-	std::io::stdin().read_line(&mut line).ok();
+	io::stdin().read_line(&mut line).ok();
 	match line.trim() {
 		"y" | "Y" | "yes" | "YES" => Gate::Proceed,
 		_other => Gate::Abort,
@@ -1136,7 +1143,7 @@ impl Model {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			std::process::abort();
+			process::abort();
 		}
 		let params = plan.materialize(&staged, 0);
 		*inner.rebuild_backing.borrow_mut() = Some(staged);

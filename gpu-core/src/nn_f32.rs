@@ -2,6 +2,8 @@ use crate::hip::{HipError, check};
 use crate::log::Write;
 use crate::memory::GpuBuffer;
 use std::ffi::c_void;
+use std::process;
+use std::ptr;
 
 const HIPBLAS_OP_N: u32 = 111;
 
@@ -186,7 +188,7 @@ fn check_launch() -> Result<(), HipError> {
 fn safe_i32(v: usize) -> i32 {
 	if !(v <= i32::MAX as usize) {
 		drop(Write::err(&format!("size {v} overflows i32")));
-		std::process::abort();
+		process::abort();
 	}
 	v as i32
 }
@@ -206,7 +208,7 @@ pub fn gpu_linear_f32(
 			out.ptr_raw(),
 			safe_i32(n),
 			safe_i32(m * n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()?;
@@ -239,7 +241,7 @@ pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -257,7 +259,7 @@ pub fn gpu_relu_backward_f32(
 			act.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -269,7 +271,7 @@ pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -287,7 +289,7 @@ pub fn gpu_gelu_backward_f32(
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -311,7 +313,7 @@ pub fn gpu_layernorm_f32(
 			safe_i32(rows),
 			safe_i32(cols),
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -339,7 +341,7 @@ pub fn gpu_layernorm_backward_f32(
 			safe_i32(rows),
 			safe_i32(cols),
 			eps.ptr_raw() as *const c_void,
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -359,7 +361,7 @@ pub fn gpu_bias_add_f32(
 			out.ptr_raw(),
 			safe_i32(rows),
 			safe_i32(cols),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -393,7 +395,7 @@ pub fn gpu_avg_pool_2d_f32(
 			safe_i32(sw),
 			safe_i32(out_h),
 			safe_i32(out_w),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -427,7 +429,7 @@ pub fn gpu_avg_pool_2d_backward_f32(
 			safe_i32(sw),
 			safe_i32(out_h),
 			safe_i32(out_w),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -463,7 +465,7 @@ pub fn gpu_max_pool_2d_f32(
 			safe_i32(sw),
 			safe_i32(out_h),
 			safe_i32(out_w),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -491,7 +493,7 @@ pub fn gpu_max_pool_2d_backward_f32(
 			safe_i32(out_w),
 			safe_i32(h),
 			safe_i32(w),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -511,7 +513,7 @@ pub fn gpu_lstm_cell_f32(
 			h.ptr_raw(),
 			safe_i32(n),
 			safe_i32(hs),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -531,7 +533,7 @@ pub fn gpu_gru_cell_f32(
 			h_new.ptr_raw(),
 			safe_i32(n),
 			safe_i32(hs),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -543,7 +545,7 @@ pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -555,7 +557,7 @@ pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			x.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -573,7 +575,7 @@ pub fn gpu_add_f16(
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -591,7 +593,7 @@ pub fn gpu_mul_f16(
 			b.ptr_raw() as *const c_void,
 			out.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
@@ -609,7 +611,7 @@ pub fn gpu_sgd_update_f32(
 			lr.ptr_raw() as *const c_void,
 			weights.ptr_raw(),
 			safe_i32(n),
-			std::ptr::null_mut(),
+			ptr::null_mut(),
 		);
 	}
 	check_launch()
