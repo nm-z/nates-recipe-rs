@@ -7,19 +7,35 @@ enum Platform {
 	Nvidia,
 }
 
+fn put(s: &str) {
+	use std::io::Write as _;
+	let mut o = std::io::stdout();
+	drop(o.write_all(s.as_bytes()));
+	drop(o.write_all(b"\n"));
+}
+
+fn die(s: &str) -> ! {
+	use std::io::Write as _;
+	let mut e = std::io::stderr();
+	drop(e.write_all(s.as_bytes()));
+	drop(e.write_all(b"\n"));
+	std::process::exit(1)
+}
+
 fn hipconfig(flag: &str) -> String {
 	let out = match std::process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			panic!("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
+			die("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia")
 		}
-		Err(e) => panic!("hipconfig {flag}: cannot run: {e}"),
+		Err(e) => die(&format!("hipconfig {flag}: cannot run: {e}")),
 	};
-	assert!(
-		out.status.success(),
-		"hipconfig {flag}: {}",
-		String::from_utf8_lossy(&out.stderr)
-	);
+	if !out.status.success() {
+		die(&format!(
+			"hipconfig {flag}: {}",
+			String::from_utf8_lossy(&out.stderr)
+		));
+	}
 	String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -27,15 +43,17 @@ fn detect_platform() -> Platform {
 	match hipconfig("--platform").as_str() {
 		"amd" => Platform::Amd,
 		"nvidia" => Platform::Nvidia,
-		other => panic!(
+		other => die(&format!(
 			"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
-		),
+		)),
 	}
 }
 
 fn rocm_path() -> String {
 	let p = hipconfig("--rocmpath");
-	assert!(!p.is_empty(), "hipconfig --rocmpath: empty output");
+	if p.is_empty() {
+		die("hipconfig --rocmpath: empty output");
+	}
 	p
 }
 
@@ -47,29 +65,29 @@ fn main() {
 				std::env::var("CUDA_PATH").unwrap_or_else(|_e| "/opt/cuda".to_string());
 			// hipBLAS/hipSOLVER/hipFFT for the NVIDIA platform (wrap cuBLAS/
 			// cuSOLVER/cuFFT) live in the HIP install tree, same as on AMD.
-			println!("cargo:rustc-link-search=native={rocm}/lib");
-			println!("cargo:rustc-link-lib=dylib=hipblas");
-			println!("cargo:rustc-link-lib=dylib=hipsolver");
-			println!("cargo:rustc-link-lib=dylib=hipfft");
-			println!("cargo:rustc-link-search=native={cuda}/lib64");
-			println!("cargo:rustc-link-lib=dylib=cudart");
-			println!("cargo:rustc-link-lib=dylib=cublas");
-			println!("cargo:rustc-link-lib=dylib=cusolver");
-			println!("cargo:rustc-link-lib=dylib=cufft");
-			println!("cargo:rustc-link-lib=dylib=stdc++");
+			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
+			put("cargo:rustc-link-lib=dylib=hipblas");
+			put("cargo:rustc-link-lib=dylib=hipsolver");
+			put("cargo:rustc-link-lib=dylib=hipfft");
+			put(&format!("cargo:rustc-link-search=native={cuda}/lib64"));
+			put("cargo:rustc-link-lib=dylib=cudart");
+			put("cargo:rustc-link-lib=dylib=cublas");
+			put("cargo:rustc-link-lib=dylib=cusolver");
+			put("cargo:rustc-link-lib=dylib=cufft");
+			put("cargo:rustc-link-lib=dylib=stdc++");
 		}
 		Platform::Amd => {
 			let rocm = rocm_path();
 			let rocm_extra =
 				std::env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
-			println!("cargo:rustc-link-search=native={rocm}/lib");
-			println!("cargo:rustc-link-lib=dylib=amdhip64");
-			println!("cargo:rustc-link-search=native={rocm_extra}");
+			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
+			put("cargo:rustc-link-lib=dylib=amdhip64");
+			put(&format!("cargo:rustc-link-search=native={rocm_extra}"));
 			// hipBLAS/hipSOLVER/hipFFT (forward to rocBLAS/rocSOLVER/rocFFT on AMD).
-			println!("cargo:rustc-link-lib=dylib=hipblas");
-			println!("cargo:rustc-link-lib=dylib=hipsolver");
-			println!("cargo:rustc-link-lib=dylib=hipfft");
-			println!("cargo:rustc-link-lib=dylib=stdc++");
+			put("cargo:rustc-link-lib=dylib=hipblas");
+			put("cargo:rustc-link-lib=dylib=hipsolver");
+			put("cargo:rustc-link-lib=dylib=hipfft");
+			put("cargo:rustc-link-lib=dylib=stdc++");
 		}
 	}
 	ban_sync_alloc();
@@ -98,12 +116,12 @@ fn ban_sync_alloc() {
 				let Some(_fire) = Some(pat).filter(|_p| hit) else {
 					continue;
 				};
-				panic!(
+				die(&format!(
 					"{}:{}: synchronous {} banned in training crate — use hipMallocAsync/hipFreeAsync",
 					entry,
 					lineno,
 					pat.trim_end_matches('('),
-				);
+				));
 			}
 		}
 	}
@@ -126,7 +144,7 @@ fn walkdir(dir: &str) -> Vec<String> {
 			.into_iter()
 		{
 			out.push(f.to_string_lossy().into_owned());
-			println!("cargo:rerun-if-changed={}", f.display());
+			put(&format!("cargo:rerun-if-changed={}", f.display()));
 		}
 	}
 	out

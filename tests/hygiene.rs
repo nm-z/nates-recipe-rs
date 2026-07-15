@@ -17,6 +17,9 @@ const MACRO_ROOTS: &[&str] = &[
 	"lightgbm-rs/src",
 	"xgboost-rs/src",
 	"examples",
+	"build.rs",
+	"gpu-core/build.rs",
+	"recipe-infer/build.rs",
 ];
 const BANNED_MACROS: &[&str] = &[
 	"print!",
