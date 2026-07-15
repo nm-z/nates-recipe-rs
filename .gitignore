@@ -57,3 +57,10 @@ examples/*/test_images/
 .recipe_spill
 /suite.log
 /warn.log
+/check.log
+/clippy.log
+/census.log
+/gc.log
+/suite.stderr.log
+/push.log
+/log-clippy.log
