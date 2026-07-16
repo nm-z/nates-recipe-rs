@@ -341,6 +341,7 @@ fn main() -> Result<(), String> {
 			let dflags = [rp.as_str(), ip.as_str(), ap.as_str()];
 			compile_kernels(&hipcc, &AMD_FLAGS, &dflags, &[], &hip_files, "hipkernels");
 			link_lib("amdhip64");
+			link_lib("hsa-runtime64");
 			link_search(&env_or("ROCM_EXTRA_LIB", format!("{rocm}/lib")));
 			link_hip();
 		}

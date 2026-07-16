@@ -7,6 +7,7 @@
 	reason = "GPU kernel launchers carry many FFI scalar args, cast between HIP integer widths at ABI boundaries, document safety at the module level, and encode tier/dim state in nested types"
 )]
 
+pub mod asm;
 pub mod attention;
 pub mod bayes;
 pub mod bridge;
