@@ -40,6 +40,57 @@ pub fn arch_supported(arch: &str) -> bool {
 	models::supported(arch)
 }
 
+/// Headless single-pass forward for reference validation: loads `gguf`, embeds
+/// the exact `toks` (bypassing the tokenizer), runs the verified decode layers,
+/// and returns the last position's logits (length `vocab`). Claims a fixed 2 GB
+/// arena directly so there is no VRAM-probe re-exec (safe to call from a test);
+/// intended for small models. Errors if the architecture is unsupported.
+pub fn forward_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
+	anyhow::ensure!(!toks.is_empty(), "forward_logits: empty token sequence");
+	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
+	let want = (2usize << 30) & !((1 << 21) - 1);
+	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
+	let claim = Waterfall::from_arena(slab);
+	let mut m = load_model_gguf(gguf)?;
+	anyhow::ensure!(
+		models::supported(&m.hp.arch),
+		"forward_logits: unsupported architecture {:?}",
+		m.hp.arch
+	);
+	let ne = m.hp.ne;
+	let nl = m.hp.nl;
+	let t = toks.len();
+	let ar = Arena::new(&m.hp, t)?;
+	let attn_scale = {
+		let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
+		let ub = GpuBuffer::alloc(1)?;
+		ub.load(&[1.0 / (hd as f64).sqrt()])?;
+		ub
+	};
+	fill_store(&mut m, claim)?;
+	let scl = (ne as f64).sqrt();
+	let mut base = vec![0.0f64; t * ne];
+	for (p, &tk) in toks.iter().enumerate() {
+		let b = tk as usize * ne * 2;
+		for x in 0..ne {
+			base[p * ne + x] =
+				bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scl;
+		}
+	}
+	ar.ha.view(0, t * ne).load(&base)?;
+	let mut src: &GpuBuffer = &ar.ha;
+	let mut dst: &GpuBuffer = &ar.hb;
+	for l in 0..nl {
+		models::dispatch(&m, l, src, dst, t, &ar, &attn_scale)?;
+		mem::swap(&mut src, &mut dst);
+	}
+	let last = t - 1;
+	gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+	let mut logits = lm_head(&m, &ar.hfs, 1, &ar)?;
+	logits.truncate(m.hp.vocab);
+	Ok(logits)
+}
+
 pub struct Tok {
 	pub text: String,
 	pub status: TokStatus,
@@ -206,8 +257,11 @@ impl Hparams {
 		let nexp = uint_kv_or(g, &k("expert_count"), 0)?;
 		let used = uint_kv_or(g, &k("expert_used_count"), 0)?;
 		let nqh = uint_kv(g, &k("attention.head_count"))?;
-		let key_length = uint_kv(g, &k("attention.key_length"))?;
-		let value_length = uint_kv(g, &k("attention.value_length"))?;
+		// llama.cpp default: head dim = embedding_length / head_count when the
+		// explicit key_length/value_length keys are absent (minimal GGUFs).
+		let head_dim_default = if nqh > 0 { ne / nqh } else { 0 };
+		let key_length = uint_kv_or(g, &k("attention.key_length"), head_dim_default)?;
+		let value_length = uint_kv_or(g, &k("attention.value_length"), head_dim_default)?;
 		let key_length_swa = uint_kv_or(g, &k("attention.key_length_swa"), key_length)?;
 		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
 		let head_count_kv = match g.kv.get(&k("attention.head_count_kv")) {
@@ -230,9 +284,9 @@ impl Hparams {
 			}
 			_other => vec![false; nl],
 		};
-		let freq_base = g.f32_kv(&k("rope.freq_base"))? as f64;
+		let freq_base = f32_kv_or(g, &k("rope.freq_base"), 10000.0)?;
 		let freq_base_swa = f32_kv_or(g, &k("rope.freq_base_swa"), freq_base)?;
-		let eps = g.f32_kv(&k("attention.layer_norm_rms_epsilon"))? as f64;
+		let eps = f32_kv_or(g, &k("attention.layer_norm_rms_epsilon"), 1e-5)?;
 		let softcap = f32_kv_or(g, &k("final_logit_softcapping"), 0.0)?;
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
