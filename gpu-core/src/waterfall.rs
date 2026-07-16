@@ -94,6 +94,14 @@ impl Waterfall {
 		return w;
 	}
 
+	/// Hands back the claim-mapped slab (if this store owns one) so the caller
+	/// can pass it to `release_device_arena` and end the run's claim. After this
+	/// the store must not place anything further.
+	#[inline]
+	pub fn take_slab(&mut self) -> Option<GpuBuffer> {
+		return self.slab.take();
+	}
+
 	/// # Errors
 	/// Returns an error if the fill closure fails or a VRAM carve/H2D transfer fails.
 	#[inline]

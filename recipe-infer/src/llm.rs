@@ -40,38 +40,63 @@ pub fn arch_supported(arch: &str) -> bool {
 	models::supported(arch)
 }
 
-/// Headless single-pass forward for reference validation: loads `gguf`, embeds
-/// the exact `toks` (bypassing the tokenizer) and greedily generates `n_new`
-/// tokens through the verified decode layers, returning the generated ids.
-/// Claims a fixed 2 GB arena directly so there is no VRAM-probe re-exec (safe to
-/// call from a test); intended for small models. Errors if the architecture is
-/// unsupported.
-pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
-	anyhow::ensure!(!toks.is_empty(), "greedy: empty token sequence");
-	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
-	let want = (2usize << 30) & !((1 << 21) - 1);
-	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
-	let claim = Waterfall::from_arena(slab);
-	let mut m = load_model_gguf(gguf)?;
-	anyhow::ensure!(
-		models::supported(&m.hp.arch),
-		"greedy: unsupported architecture {:?}",
-		m.hp.arch
-	);
-	let ne = m.hp.ne;
-	let nl = m.hp.nl;
-	let vocab = m.hp.vocab;
-	let ar = Arena::new(&m.hp, toks.len() + n_new)?;
-	let attn_scale = {
-		let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
-		let ub = GpuBuffer::alloc(1)?;
-		ub.load(&[1.0 / (hd as f64).sqrt()])?;
-		ub
-	};
-	fill_store(&mut m, claim)?;
-	let mut seq = toks.to_vec();
-	let mut generated = Vec::with_capacity(n_new);
-	for _ in 0..n_new {
+/// Defuses to a released device arena if `Headless::open` fails partway: the
+/// claim must never leak, or the next open in the same process aborts.
+struct ArenaClaim(Option<Waterfall>);
+
+impl Drop for ArenaClaim {
+	fn drop(&mut self) {
+		let Some(mut w) = self.0.take() else {
+			return;
+		};
+		if let Some(slab) = w.take_slab() {
+			gpu_core::memory::release_device_arena(slab);
+		}
+	}
+}
+
+/// A loaded headless model for reference validation: claims a fixed 2 GB
+/// device arena at open (no VRAM-probe re-exec; intended for small models) and
+/// releases it on drop, so sequential opens in one process are valid. One
+/// claim + one free per open stays inside the blocking-op budget. Errors if
+/// the architecture is unsupported.
+struct Headless {
+	m: Model,
+	ar: Arena,
+	attn_scale: GpuBuffer,
+}
+
+impl Headless {
+	fn open(gguf: &Path, cap: usize) -> Result<Self> {
+		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
+		let want = (2usize << 30) & !((1 << 21) - 1);
+		let slab =
+			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
+		let mut guard = ArenaClaim(Some(Waterfall::from_arena(slab)));
+		let m = load_model_gguf(gguf)?;
+		anyhow::ensure!(
+			models::supported(&m.hp.arch),
+			"headless: unsupported architecture {:?}",
+			m.hp.arch
+		);
+		let ar = Arena::new(&m.hp, cap)?;
+		let attn_scale = {
+			let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
+			let ub = GpuBuffer::alloc(1)?;
+			ub.load(&[1.0 / (hd as f64).sqrt()])?;
+			ub
+		};
+		let Some(claim) = guard.0.take() else {
+			bail!("headless: claim guard empty");
+		};
+		let mut h = Self { m, ar, attn_scale };
+		fill_store(&mut h.m, claim)?;
+		return Ok(h);
+	}
+
+	fn logits_last(&self, seq: &[u32]) -> Result<Vec<f64>> {
+		let (m, ar) = (&self.m, &self.ar);
+		let (ne, nl) = (m.hp.ne, m.hp.nl);
 		let t = seq.len();
 		// llama/qwen3/xverse do NOT scale input embeddings (gemma's sqrt(n_embd)
 		// scale is arch-specific and would swamp the residual stream here).
@@ -87,15 +112,36 @@ pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
-			models::dispatch(&m, l, src, dst, t, &ar, &attn_scale)?;
+			models::dispatch(m, l, src, dst, t, ar, &self.attn_scale)?;
 			mem::swap(&mut src, &mut dst);
 		}
-		let last = t - 1;
-		gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
-		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
+		gpu_rmsnorm_f64(&src.view((t - 1) * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		let mut logits = lm_head(m, &ar.hfs, 1, ar)?;
+		logits.truncate(m.hp.vocab);
+		return Ok(logits);
+	}
+}
+
+impl Drop for Headless {
+	fn drop(&mut self) {
+		if let Some(slab) = self.m.store.take_slab() {
+			gpu_core::memory::release_device_arena(slab);
+		}
+	}
+}
+
+/// Headless greedy generation: embeds the exact `toks` (bypassing the
+/// tokenizer) and greedily generates `n_new` tokens through the verified
+/// decode layers, returning the generated ids.
+pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
+	anyhow::ensure!(!toks.is_empty(), "greedy: empty token sequence");
+	let h = Headless::open(gguf, toks.len() + n_new)?;
+	let mut seq = toks.to_vec();
+	let mut generated = Vec::with_capacity(n_new);
+	for _ in 0..n_new {
+		let logits = h.logits_last(&seq)?;
 		let next = logits
 			.iter()
-			.take(vocab)
 			.enumerate()
 			.max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(cmp::Ordering::Equal))
 			.map(|(i, _)| i as u32)
@@ -103,7 +149,16 @@ pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
 		seq.push(next);
 		generated.push(next);
 	}
-	Ok(generated)
+	return Ok(generated);
+}
+
+/// Headless single forward: the last-position logits (`vocab` long, f64) for
+/// the exact `toks`, for parity comparison against llama.cpp reference logits
+/// on the same GGUF file.
+pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
+	anyhow::ensure!(!toks.is_empty(), "last_logits: empty token sequence");
+	let h = Headless::open(gguf, toks.len())?;
+	return h.logits_last(toks);
 }
 
 pub struct Tok {
@@ -1061,8 +1116,46 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 	Ok(())
 }
 
+/// Places every weight into `store`, then hands the store to `m` UNCONDITIONALLY
+/// (even on placement failure) so the arena slab inside it stays reachable for
+/// release; the canary readback then proves uploads are GPU-visible.
 fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	let mut store = store;
+	let placed = fill_into(m, &mut store);
+	store.report();
+	m.store = store;
+	placed?;
+	let nl = m.hp.nl;
+	for name in [
+		"model.decoder.embed_tokens.weight".to_string(),
+		fixed_names(&m.hp, 0).remove(0),
+		fixed_names(&m.hp, nl - 1)
+			.pop()
+			.ok_or_else(|| anyhow!("no names"))?,
+	] {
+		if let Some(Home::Vram(dev)) = m.store.home(&name) {
+			let t = &m.big[&name];
+			let n = 4096.min(t.nbytes);
+			for off in [0, t.nbytes - n] {
+				let want = if name.ends_with("embed_tokens.weight") {
+					m.emb[off..off + n].to_vec()
+				} else {
+					m.read_bytes(t, off, n)?
+				};
+				let mut got = vec![0u8; n];
+				bview(dev, off, n).download_u8(&mut got)?;
+				if got != want {
+					bail!(
+						"waterfall {name} stale at byte {off}: upload not visible to GPU reads"
+					);
+				}
+			}
+		}
+	}
+	return Ok(());
+}
+
+fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 	let nl = m.hp.nl;
 	let nexp = m.hp.nexp;
 	let gu_bytes = m.hp.gu_bytes;
@@ -1099,36 +1192,7 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 			beat();
 		}
 	}
-	store.report();
-	m.store = store;
-
-	for name in [
-		"model.decoder.embed_tokens.weight".to_string(),
-		fixed_names(&m.hp, 0).remove(0),
-		fixed_names(&m.hp, nl - 1)
-			.pop()
-			.ok_or_else(|| anyhow!("no names"))?,
-	] {
-		if let Some(Home::Vram(dev)) = m.store.home(&name) {
-			let t = &m.big[&name];
-			let n = 4096.min(t.nbytes);
-			for off in [0, t.nbytes - n] {
-				let want = if name.ends_with("embed_tokens.weight") {
-					m.emb[off..off + n].to_vec()
-				} else {
-					m.read_bytes(t, off, n)?
-				};
-				let mut got = vec![0u8; n];
-				bview(dev, off, n).download_u8(&mut got)?;
-				if got != want {
-					bail!(
-						"waterfall {name} stale at byte {off}: upload not visible to GPU reads"
-					);
-				}
-			}
-		}
-	}
-	Ok(())
+	return Ok(());
 }
 
 fn rnp(x: &[f64], eps: f64) -> Vec<f64> {

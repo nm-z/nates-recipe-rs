@@ -5,6 +5,7 @@ use std::io::{BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+#[derive(Debug)]
 pub enum Val {
 	U8(u8),
 	I8(i8),
