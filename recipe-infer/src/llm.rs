@@ -41,12 +41,13 @@ pub fn arch_supported(arch: &str) -> bool {
 }
 
 /// Headless single-pass forward for reference validation: loads `gguf`, embeds
-/// the exact `toks` (bypassing the tokenizer), runs the verified decode layers,
-/// and returns the last position's logits (length `vocab`). Claims a fixed 2 GB
-/// arena directly so there is no VRAM-probe re-exec (safe to call from a test);
-/// intended for small models. Errors if the architecture is unsupported.
-pub fn forward_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
-	anyhow::ensure!(!toks.is_empty(), "forward_logits: empty token sequence");
+/// the exact `toks` (bypassing the tokenizer) and greedily generates `n_new`
+/// tokens through the verified decode layers, returning the generated ids.
+/// Claims a fixed 2 GB arena directly so there is no VRAM-probe re-exec (safe to
+/// call from a test); intended for small models. Errors if the architecture is
+/// unsupported.
+pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
+	anyhow::ensure!(!toks.is_empty(), "greedy: empty token sequence");
 	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 	let want = (2usize << 30) & !((1 << 21) - 1);
 	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
@@ -54,13 +55,13 @@ pub fn forward_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	let mut m = load_model_gguf(gguf)?;
 	anyhow::ensure!(
 		models::supported(&m.hp.arch),
-		"forward_logits: unsupported architecture {:?}",
+		"greedy: unsupported architecture {:?}",
 		m.hp.arch
 	);
 	let ne = m.hp.ne;
 	let nl = m.hp.nl;
-	let t = toks.len();
-	let ar = Arena::new(&m.hp, t)?;
+	let vocab = m.hp.vocab;
+	let ar = Arena::new(&m.hp, toks.len() + n_new)?;
 	let attn_scale = {
 		let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
 		let ub = GpuBuffer::alloc(1)?;
@@ -68,27 +69,41 @@ pub fn forward_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 		ub
 	};
 	fill_store(&mut m, claim)?;
-	let scl = (ne as f64).sqrt();
-	let mut base = vec![0.0f64; t * ne];
-	for (p, &tk) in toks.iter().enumerate() {
-		let b = tk as usize * ne * 2;
-		for x in 0..ne {
-			base[p * ne + x] =
-				bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scl;
+	let mut seq = toks.to_vec();
+	let mut generated = Vec::with_capacity(n_new);
+	for _ in 0..n_new {
+		let t = seq.len();
+		// llama/qwen3/xverse do NOT scale input embeddings (gemma's sqrt(n_embd)
+		// scale is arch-specific and would swamp the residual stream here).
+		let mut base = vec![0.0f64; t * ne];
+		for (p, &tk) in seq.iter().enumerate() {
+			let b = tk as usize * ne * 2;
+			for x in 0..ne {
+				base[p * ne + x] =
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
+			}
 		}
+		ar.ha.view(0, t * ne).load(&base)?;
+		let mut src: &GpuBuffer = &ar.ha;
+		let mut dst: &GpuBuffer = &ar.hb;
+		for l in 0..nl {
+			models::dispatch(&m, l, src, dst, t, &ar, &attn_scale)?;
+			mem::swap(&mut src, &mut dst);
+		}
+		let last = t - 1;
+		gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
+		let next = logits
+			.iter()
+			.take(vocab)
+			.enumerate()
+			.max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(cmp::Ordering::Equal))
+			.map(|(i, _)| i as u32)
+			.unwrap_or(0);
+		seq.push(next);
+		generated.push(next);
 	}
-	ar.ha.view(0, t * ne).load(&base)?;
-	let mut src: &GpuBuffer = &ar.ha;
-	let mut dst: &GpuBuffer = &ar.hb;
-	for l in 0..nl {
-		models::dispatch(&m, l, src, dst, t, &ar, &attn_scale)?;
-		mem::swap(&mut src, &mut dst);
-	}
-	let last = t - 1;
-	gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
-	let mut logits = lm_head(&m, &ar.hfs, 1, &ar)?;
-	logits.truncate(m.hp.vocab);
-	Ok(logits)
+	Ok(generated)
 }
 
 pub struct Tok {
@@ -409,6 +424,7 @@ fn acc(a: &AtomicU64, t: Instant) {
 
 const GT_BF16: u32 = u32::MAX;
 
+#[derive(Clone)]
 struct Tensor {
 	shard: usize,
 	off: usize,
@@ -579,6 +595,9 @@ struct Model {
 	gis: Vec<Vec<f64>>,
 	pe: Vec<Vec<f64>>,
 	emb: Vec<u8>,
+	/// Untied output projection (bf16 bytes), when the model ships a separate
+	/// `output.weight`. Empty when the LM head is tied to `emb`.
+	out: Vec<u8>,
 	eps: GpuBuffer,
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
@@ -780,6 +799,7 @@ fn hf_name(gg: &str) -> Option<String> {
 	let global = |n: &str| Some(format!("model.decoder.{n}"));
 	match gg {
 		"token_embd.weight" => return global("embed_tokens.weight"),
+		"output.weight" => return global("lm_head.weight"),
 		"output_norm.weight" => return global("norm.weight"),
 		"self_cond_pre_norm.weight" => return global("self_conditioning.pre_norm.weight"),
 		"self_cond_gate.weight" => return global("self_conditioning.gate_proj.weight"),
@@ -881,6 +901,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		gis: Vec::new(),
 		pe: Vec::new(),
 		emb: Vec::new(),
+		out: Vec::new(),
 		eps,
 		theta_full,
 		theta_slide,
@@ -970,6 +991,15 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		bail!("embed_tokens shape {:?}", et.shape);
 	}
 	m.emb = m.read_bytes(et, 0, et.nbytes)?;
+
+	// Untied LM head: some models (e.g. llama with a separate output.weight)
+	// project the final hidden state through their own matrix rather than the
+	// tied token embedding. Load it when present so lm_head uses the right one.
+	if let Some(ot) = m.big.get("model.decoder.lm_head.weight").cloned() {
+		if ot.shape == vec![vocab, ne] {
+			m.out = m.read_bytes(&ot, 0, ot.nbytes)?;
+		}
+	}
 
 	Ok(m)
 }
@@ -1306,12 +1336,17 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	let mut c0 = 0;
 	while c0 < hp.vocab {
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
-		let w = match m.store.home("model.decoder.embed_tokens.weight") {
-			Some(Home::Vram(dev)) => m.widen_from(dev, c0 * hp.ne * 2, cn * hp.ne)?,
-			_other => {
-				m.to_stage(&m.emb[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
-				m.widen_from(&m.stage, 0, cn * hp.ne)?
+		let w = if m.out.is_empty() {
+			match m.store.home("model.decoder.embed_tokens.weight") {
+				Some(Home::Vram(dev)) => m.widen_from(dev, c0 * hp.ne * 2, cn * hp.ne)?,
+				_other => {
+					m.to_stage(&m.emb[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
+					m.widen_from(&m.stage, 0, cn * hp.ne)?
+				}
 			}
+		} else {
+			m.to_stage(&m.out[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
+			m.widen_from(&m.stage, 0, cn * hp.ne)?
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
 		unsafe {
@@ -1348,7 +1383,6 @@ fn generate_causal(
 	let vocab_size = m.hp.vocab;
 	let eos = m.hp.eos;
 	let softcap = m.hp.softcap;
-	let scl = (ne as f64).sqrt();
 	let max_new = 256usize;
 	let t_max = prefix + max_new;
 
@@ -1382,8 +1416,7 @@ fn generate_causal(
 			let b = tk as usize * ne * 2;
 			for x in 0..ne {
 				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]))
-						* scl;
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
 			}
 		}
 		ar.ha.view(0, cur * ne).load(&base)?;
