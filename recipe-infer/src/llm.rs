@@ -27,6 +27,19 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+#[path = "models/mod.rs"]
+mod models;
+
+/// GGUF architecture strings recipe-infer has a verified decode composition for.
+pub fn supported_archs() -> &'static [&'static str] {
+	models::SUPPORTED
+}
+
+/// True if `arch` (a GGUF `general.architecture` string) is verified-supported.
+pub fn arch_supported(arch: &str) -> bool {
+	models::supported(arch)
+}
+
 pub struct Tok {
 	pub text: String,
 	pub status: TokStatus,
@@ -81,6 +94,26 @@ fn uint_kv(g: &Gguf, key: &str) -> Result<usize> {
 	as_uint(v)
 		.map(|x| x as usize)
 		.ok_or_else(|| anyhow!("gguf: kv {key} is not an unsigned integer"))
+}
+
+/// Reads an optional unsigned-integer kv, returning `default` when the key is absent.
+/// Absence is legal (e.g. expert params on a dense model); a present-but-wrong type still errors.
+fn uint_kv_or(g: &Gguf, key: &str, default: usize) -> Result<usize> {
+	match g.kv.get(key) {
+		None => Ok(default),
+		Some(v) => as_uint(v)
+			.map(|x| x as usize)
+			.ok_or_else(|| anyhow!("gguf: kv {key} is not an unsigned integer")),
+	}
+}
+
+/// Reads an optional f32 kv as f64, returning `default` when the key is absent.
+fn f32_kv_or(g: &Gguf, key: &str, default: f64) -> Result<f64> {
+	match g.kv.get(key) {
+		None => Ok(default),
+		Some(Val::F32(v)) => Ok(f64::from(*v)),
+		Some(_other) => bail!("gguf: kv {key} is not f32"),
+	}
 }
 
 fn uint_arr(g: &Gguf, key: &str) -> Result<Vec<usize>> {
@@ -142,6 +175,7 @@ struct Hparams {
 	ncanvas: usize,
 	mask: usize,
 	bos: u32,
+	eos: u32,
 	mask_signal: Option<usize>,
 	key_length: usize,
 	value_length: usize,
@@ -151,7 +185,8 @@ struct Hparams {
 	freq_base_swa: f64,
 	softcap: f64,
 	dims: Vec<LayerDims>,
-	maxw: usize,
+	win_elems: usize,
+	stage_bytes: usize,
 	qd_max: usize,
 	kd_max: usize,
 	lm_chunk: usize,
@@ -167,23 +202,42 @@ impl Hparams {
 		let nl = uint_kv(g, &k("block_count"))?;
 		let ne = uint_kv(g, &k("embedding_length"))?;
 		let nff = uint_kv(g, &k("feed_forward_length"))?;
-		let nffe = uint_kv(g, &k("expert_feed_forward_length"))?;
-		let nexp = uint_kv(g, &k("expert_count"))?;
-		let used = uint_kv(g, &k("expert_used_count"))?;
+		let nffe = uint_kv_or(g, &k("expert_feed_forward_length"), 0)?;
+		let nexp = uint_kv_or(g, &k("expert_count"), 0)?;
+		let used = uint_kv_or(g, &k("expert_used_count"), 0)?;
 		let nqh = uint_kv(g, &k("attention.head_count"))?;
 		let key_length = uint_kv(g, &k("attention.key_length"))?;
 		let value_length = uint_kv(g, &k("attention.value_length"))?;
-		let key_length_swa = uint_kv(g, &k("attention.key_length_swa"))?;
-		let value_length_swa = uint_kv(g, &k("attention.value_length_swa"))?;
-		let head_count_kv = uint_arr(g, &k("attention.head_count_kv"))?;
-		let pattern = bool_arr(g, &k("attention.sliding_window_pattern"))?;
+		let key_length_swa = uint_kv_or(g, &k("attention.key_length_swa"), key_length)?;
+		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
+		let head_count_kv = match g.kv.get(&k("attention.head_count_kv")) {
+			Some(Val::Arr(_items)) => uint_arr(g, &k("attention.head_count_kv"))?,
+			Some(_scalar) => vec![uint_kv(g, &k("attention.head_count_kv"))?; nl],
+			None => vec![nqh; nl],
+		};
+		let swa_window = uint_kv_or(g, &k("attention.sliding_window"), 0)?;
+		let pattern: Vec<bool> = match g.kv.get(&k("attention.sliding_window_pattern")) {
+			Some(Val::Arr(items)) if items.iter().all(|v| matches!(v, Val::Bool(_))) => {
+				bool_arr(g, &k("attention.sliding_window_pattern"))?
+			}
+			other if swa_window > 0 => {
+				let period = other
+					.and_then(as_uint)
+					.map(|x| x as usize)
+					.filter(|&p| p > 0)
+					.unwrap_or(6);
+				(0..nl).map(|l| l % period != period - 1).collect()
+			}
+			_other => vec![false; nl],
+		};
 		let freq_base = g.f32_kv(&k("rope.freq_base"))? as f64;
-		let freq_base_swa = g.f32_kv(&k("rope.freq_base_swa"))? as f64;
+		let freq_base_swa = f32_kv_or(g, &k("rope.freq_base_swa"), freq_base)?;
 		let eps = g.f32_kv(&k("attention.layer_norm_rms_epsilon"))? as f64;
-		let softcap = g.f32_kv(&k("final_logit_softcapping"))? as f64;
-		let ncanvas = uint_kv(g, "diffusion.canvas_length")?;
+		let softcap = f32_kv_or(g, &k("final_logit_softcapping"), 0.0)?;
+		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
-		let mask = uint_kv(g, "tokenizer.ggml.mask_token_id")?;
+		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
+		let mask = uint_kv_or(g, "tokenizer.ggml.mask_token_id", 0)?;
 
 		let et = g
 			.tensors
@@ -230,12 +284,20 @@ impl Hparams {
 		}
 
 		let kd_max = dims.iter().map(|d| d.nkv * d.hd).max().unwrap_or(0);
-		let qd_max = nqh * key_length;
-		let maxw = nqh * key_length * ne;
-		let lm_chunk = maxw / ne;
+		let qd_max = dims
+			.iter()
+			.map(|d| nqh * d.hd)
+			.max()
+			.unwrap_or(nqh * key_length);
 		let gu_bytes = 2 * nffe * ne * 2;
 		let dn_bytes = nffe * ne * 2;
 		let slot_bytes = gu_bytes + dn_bytes;
+		// win_elems: widest widened-f64 matrix live at once (q/k/v/o proj, dense FFN,
+		// or a widened gate_up expert). stage_bytes: widest raw bf16 region staged at
+		// once (biggest single weight, or a full combined expert slot).
+		let win_elems = qd_max.max(kd_max).max(nff).max(2 * nffe) * ne;
+		let lm_chunk = win_elems / ne;
+		let stage_bytes = (win_elems * 2).max(slot_bytes);
 
 		Ok(Hparams {
 			arch,
@@ -251,6 +313,9 @@ impl Hparams {
 			ncanvas,
 			mask,
 			bos,
+			eos,
+			win_elems,
+			stage_bytes,
 			mask_signal,
 			key_length,
 			value_length,
@@ -260,7 +325,6 @@ impl Hparams {
 			freq_base_swa,
 			softcap,
 			dims,
-			maxw,
 			qd_max,
 			kd_max,
 			lm_chunk,
@@ -401,7 +465,7 @@ struct Arena {
 
 impl Arena {
 	fn new(hp: &Hparams, t: usize) -> Result<Arena> {
-		let c = hp.ncanvas;
+		let c = hp.ncanvas.max(1);
 		let ne = hp.ne;
 		let nff = hp.nff;
 		let nffe = hp.nffe;
@@ -743,15 +807,14 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub.load(&[hp.freq_base_swa])?;
 		ub
 	};
-	let maxw = hp.maxw;
 	let nl = hp.nl;
 	let vocab = hp.vocab;
 	let ne = hp.ne;
 	let mut m = Model {
 		shards,
 		big,
-		stage: GpuBuffer::alloc_bytes(maxw * 2)?,
-		win: GpuBuffer::alloc(maxw)?,
+		stage: GpuBuffer::alloc_bytes(hp.stage_bytes)?,
+		win: GpuBuffer::alloc(hp.win_elems)?,
 		store: Waterfall::new(),
 		rbuf: RefCell::new(Vec::new()),
 		norms: Vec::new(),
@@ -792,13 +855,26 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		let p = |n: &str| format!("model.decoder.layers.{l}.{n}");
 		let mut nm = HashMap::new();
 		for (key, suffix) in LAYER_NORMS {
-			nm.insert(key, upload_gamma(&m.small_f64(&p(suffix))?, plus_one)?);
+			if m.big.contains_key(&p(suffix)) {
+				nm.insert(key, upload_gamma(&m.small_f64(&p(suffix))?, plus_one)?);
+			}
 		}
 		m.norms.push(nm);
-		m.rw.push(m.small_f64(&p("router.proj.weight"))?);
-		m.gis.push(m.small_f64(&p("router.scale"))?);
-		m.pe.push(m.small_f64(&p("router.per_expert_scale"))?);
-		let lsv = m.small_f64(&p("layer_scalar"))?[0];
+		let opt_small = |m: &Model, name: String| -> Result<Vec<f64>> {
+			if m.big.contains_key(&name) {
+				m.small_f64(&name)
+			} else {
+				Ok(Vec::new())
+			}
+		};
+		m.rw.push(opt_small(&m, p("router.proj.weight"))?);
+		m.gis.push(opt_small(&m, p("router.scale"))?);
+		m.pe.push(opt_small(&m, p("router.per_expert_scale"))?);
+		let lsv = if m.big.contains_key(&p("layer_scalar")) {
+			m.small_f64(&p("layer_scalar"))?[0]
+		} else {
+			1.0
+		};
 		m.ls_dev.push({
 			let ub = GpuBuffer::alloc(1)?;
 			ub.load(&[lsv])?;
@@ -808,28 +884,30 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 
 	Write::line(data, "globals + embedding table");
 	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
-	m.sc_pre = upload_gamma(
-		&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?,
-		plus_one,
-	)?;
-	m.sc_gate = {
-		let vals = m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?;
-		let ub = GpuBuffer::alloc(vals.len())?;
-		ub.load(&vals)?;
-		ub
-	};
-	m.sc_up = {
-		let vals = m.small_f64("model.decoder.self_conditioning.up_proj.weight")?;
-		let ub = GpuBuffer::alloc(vals.len())?;
-		ub.load(&vals)?;
-		ub
-	};
-	m.sc_down = {
-		let vals = m.small_f64("model.decoder.self_conditioning.down_proj.weight")?;
-		let ub = GpuBuffer::alloc(vals.len())?;
-		ub.load(&vals)?;
-		ub
-	};
+	if m.big.contains_key("model.decoder.self_conditioning.pre_norm.weight") {
+		m.sc_pre = upload_gamma(
+			&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?,
+			plus_one,
+		)?;
+		m.sc_gate = {
+			let vals = m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?;
+			let ub = GpuBuffer::alloc(vals.len())?;
+			ub.load(&vals)?;
+			ub
+		};
+		m.sc_up = {
+			let vals = m.small_f64("model.decoder.self_conditioning.up_proj.weight")?;
+			let ub = GpuBuffer::alloc(vals.len())?;
+			ub.load(&vals)?;
+			ub
+		};
+		m.sc_down = {
+			let vals = m.small_f64("model.decoder.self_conditioning.down_proj.weight")?;
+			let ub = GpuBuffer::alloc(vals.len())?;
+			ub.load(&vals)?;
+			ub
+		};
+	}
 
 	let et =
 		m.big.get("model.decoder.embed_tokens.weight")
@@ -1197,6 +1275,119 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	Ok(logits)
 }
 
+
+/// Autoregressive causal decode for dense (non-diffusion) models: embed the
+/// running sequence, run the causal layers, take the last position's logits,
+/// greedily pick the next token, stream it, and repeat until EOS.
+fn generate_causal(
+	mut m: Model,
+	claim: Waterfall,
+	watchdog: Watchdog,
+	t_load: Instant,
+	tokenizer: &crate::tokenizer::Tokenizer,
+	mut toks: Vec<u32>,
+	prefix: usize,
+	on_round: &mut dyn FnMut(&[Tok]) -> bool,
+) -> Result<String> {
+	let ne = m.hp.ne;
+	let nl = m.hp.nl;
+	let vocab_size = m.hp.vocab;
+	let eos = m.hp.eos;
+	let softcap = m.hp.softcap;
+	let scl = (ne as f64).sqrt();
+	let max_new = 256usize;
+	let t_max = prefix + max_new;
+
+	let ar = {
+		let _t = gpu_core::memory::tag_scope("arena");
+		Arena::new(&m.hp, t_max)?
+	};
+	let attn_scale = {
+		let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
+		let ub = GpuBuffer::alloc(1)?;
+		ub.load(&[1.0 / (hd as f64).sqrt()])?;
+		ub
+	};
+	fill_store(&mut m, claim)?;
+	watchdog.disarm();
+	Write::line(
+		gpu,
+		format!(
+			"loaded in {:.1}s (causal decode, {nl} layers, softcap={softcap})",
+			t_load.elapsed().as_secs_f64()
+		),
+	);
+
+	let mut out_ids: Vec<u32> = Vec::new();
+	let decode_start = Instant::now();
+	let mut ttft: Option<Duration> = None;
+	for _new in 0..max_new {
+		let cur = toks.len();
+		let mut base = vec![0.0f64; cur * ne];
+		for (p, &tk) in toks.iter().enumerate() {
+			let b = tk as usize * ne * 2;
+			for x in 0..ne {
+				base[p * ne + x] =
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]))
+						* scl;
+			}
+		}
+		ar.ha.view(0, cur * ne).load(&base)?;
+		let mut src: &GpuBuffer = &ar.ha;
+		let mut dst: &GpuBuffer = &ar.hb;
+		for l in 0..nl {
+			models::dispatch(&m, l, src, dst, cur, &ar, &attn_scale)?;
+			mem::swap(&mut src, &mut dst);
+		}
+		let last = cur - 1;
+		gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
+		let mut best = 0usize;
+		let mut bv = f64::MIN;
+		for (i, &v) in logits.iter().take(vocab_size).enumerate() {
+			let sv = if softcap > 0.0 {
+				softcap * (v / softcap).tanh()
+			} else {
+				v
+			};
+			if sv > bv {
+				bv = sv;
+				best = i;
+			}
+		}
+		let next = best as u32;
+		if ttft.is_none() {
+			ttft = Some(decode_start.elapsed());
+		}
+		if next == eos {
+			break;
+		}
+		toks.push(next);
+		out_ids.push(next);
+		let text = tokenizer.decode(&out_ids, true).unwrap_or_default();
+		let keep_going = on_round(&[Tok {
+			text,
+			status: TokStatus::Accepted,
+			age: 0,
+			heat: 1.0,
+		}]);
+		if !keep_going {
+			break;
+		}
+	}
+	let elapsed = decode_start.elapsed();
+	let body = tokenizer.decode(&out_ids, true).unwrap_or_default();
+	let out = format!(
+		"{body}\n\nTTFT {:.2}s, {} tokens, {:.2} tok/s",
+		ttft.map_or(0.0, |d| d.as_secs_f64()),
+		out_ids.len(),
+		out_ids.len() as f64 / elapsed.as_secs_f64().max(1e-9)
+	);
+	drop(ar);
+	drop(m);
+	Ok(out)
+}
+
 pub fn vram_probe_ask() -> Option<i32> {
 	let sz = env::var_os("VRAM_PROBE")?;
 	if crate::init().is_err() {
@@ -1211,7 +1402,11 @@ pub fn vram_probe_ask() -> Option<i32> {
 	})
 }
 
-pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok])) -> Result<String> {
+pub fn generate(
+	gguf: &Path,
+	prompt: &str,
+	on_round: &mut dyn FnMut(&[Tok]) -> bool,
+) -> Result<String> {
 	if !env::var_os("VRAM_PROBE").is_none() {
 		Write::err(
 			"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
@@ -1266,6 +1461,22 @@ pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok])) -> 
 				want as f64 / (1u64 << 30) as f64
 			),
 		);
+		let need = want + gpu_core::memory::USER_GB;
+		let reclaim_start = Instant::now();
+		while gpu_core::memory::vram_free_base() < need {
+			if reclaim_start.elapsed() > Duration::from_secs(10) {
+				Write::line(
+					gpu,
+					format!(
+						"claim: reclaim wait timed out, free={:.2} GB (probe child VRAM not returned)",
+						gpu_core::memory::vram_free_base() as f64 / (1u64 << 30) as f64
+					),
+				);
+				break;
+			}
+			thread::sleep(Duration::from_millis(50));
+			beat();
+		}
 		let slab =
 			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 		let w = Waterfall::from_arena(slab);
@@ -1310,6 +1521,10 @@ pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok])) -> 
 		data,
 		format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
 	);
+
+	if ncanvas == 0 {
+		return generate_causal(m, claim, watchdog, t_load, &tokenizer, toks, prefix, on_round);
+	}
 
 	let ar = {
 		let _t = gpu_core::memory::tag_scope("arena");
@@ -1526,7 +1741,9 @@ pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok])) -> 
 			})
 			.collect();
 		prev = pred.clone();
-		on_round(&toks_ui);
+		if !on_round(&toks_ui) {
+			break;
+		}
 	}
 
 	let allocs_after = gpu_core::memory::device_alloc_count();
