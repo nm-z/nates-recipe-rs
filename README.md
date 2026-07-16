@@ -1,153 +1,96 @@
 # recipe
 
-**ML training + inference for AMD/NVIDIA GPUs.**
+GPU-native f64 NN training/inference in Rust. All GPU math is our own `.hip` kernels via `gpu-core`; no CPU ML crates, no vendor BLAS on the hot path. AMD RDNA3 is the primary target (gfx1101), NVIDIA runs through HIP-on-CUDA over the same kernel set.
 
-`recipe` is a GPU-native neural-network framework written in Rust. Every arithmetic operation runs in `f64` on the GPU through the framework's own HIP/CUDA kernels — there is no vendor BLAS on the training or inference hot path, and no CPU ML crate does the compute. You describe a model with a chained builder API, point it at a dataset (CSV, ARFF, zip, or a directory of images), and train full-batch on the GPU. AMD RDNA3 is the primary target; an NVIDIA backend shares the same kernels. When a dataset is larger than VRAM, training streams it out-of-core (VRAM to RAM to disk) instead of failing, and the math stays full-batch throughout.
+## Setup
 
-## Features
-
-- **f64 end to end.** No fp32/fp16/bf16/mixed precision anywhere — all compute is double precision on the GPU.
-- **Own GPU kernels.** All GPU math runs through hand-written HIP/CUDA compute kernels (`gpu-core`); no rocBLAS/hipBLAS/cuBLAS on the hot path.
-- **AMD-first, NVIDIA-capable.** Built for AMD RDNA3 via HIP/ROCm, with a CUDA backend over the same kernel set.
-- **Full-batch training.** No mini-batch SGD, no gradient accumulation — the whole dataset is one GEMM shape.
-- **Out-of-core streaming.** Datasets bigger than VRAM stream VRAM→RAM→DISK with read-ahead/write-behind; the math stays full-batch.
-- **One builder, three import styles.** `Model` / `Data` / `Train` / `Infer` chain the same methods whether you reach them as `recipe.model()`, `Model::new()`, or `recipe::model()`.
-- **Model types in one API.** Dense nets, 1-D convolutional nets (`conv(filters, kernel, stride)`), MLPs, and transformer/LLM stacks (`layer(embed(dim))`, `layer(attn(heads))`) — see `examples/cookbook.rs` for NN, CNN, MLP, and LLM scenarios end to end.
-- **Activations as chained methods.** `.relu() .leak() .gelu() .elu() .sigmoid()` and more, applied directly after a `.layer(n)`.
-- **Losses & metrics as consts.** Losses `mse mae huber ce bce focal`; log metrics `Loss Accuracy R2 Lr Epoch Time hip`.
-- **Data loading built in (`pantry`).** CSV / ARFF / zip / image-directory parsing, one-adapter NaN policy, feature hashing for text/high-cardinality columns, and a trained char-level column-type detector (`detect` binary).
-- **Weight I/O.** Loads and saves weights in the project's `ogdl` format and reads `safetensors` for inference (`recipe-infer`).
-- **Multi-node training.** `Train::net([...])` distributes a run across configured peer machines.
-- **Tagged memory ledger.** Every GPU allocation, free, and transfer is tagged and accounted through a single set of choke points in `gpu-core`.
-- **Save / resume.** `.run(&data, &model).save(path)` persists a model; `Train::resume(path)` continues a run, crashing with a diagnostic on a shape mismatch rather than silently reinitializing.
-
-## Install
-
-### Prerequisites
-
-- **Rust nightly** — pinned by `rust-toolchain.toml` (`channel = "nightly"`, components `rustfmt`, `clippy`, `rust-src`); `rustup` selects it automatically inside the repo. Edition 2024, resolver 3.
-- **A HIP runtime with `hipconfig` on `PATH`.** The backend is detected at build time from `hipconfig --platform`, and the ROCm tree is located via `hipconfig --rocmpath`. If `hipconfig` is missing or reports an unrecognized platform, the build fails immediately with the package to install:
-
-  ```
-  hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia
-  ```
-
-  - **AMD:** a ROCm install providing `hipcc`/`amdclang++`, `amdhip64`, and `hipblas`/`hipsolver`/`hipfft`.
-  - **NVIDIA:** the HIP-on-CUDA runtime plus a CUDA toolkit (`nvcc`, `cudart`/`cublas`/`cusolver`/`cufft`); HIP's `hipblas`/`hipsolver`/`hipfft` wrap the CUDA libraries.
-- **Git LFS** — datasets under `datasets/` are stored as LFS objects (`.gitattributes`: `datasets/** filter=lfs diff=lfs merge=lfs -text`).
-
-### Clone
-
-A plain clone smudges the full dataset tree (~3.3 GiB):
-
-```bash
-git clone https://github.com/nm-z/nates-recipe-rs
-```
-
-For a source-only checkout (compute/serve nodes that don't need the datasets), skip the LFS smudge — this leaves ~110 MB of pointer files instead:
+- Toolchain is pinned by `rust-toolchain.toml` (nightly); rustup picks it up on its own. Edition 2024, resolver 3.
+- `hipconfig` must be on `PATH`. The build detects the backend from `hipconfig --platform` and locates the ROCm tree from `hipconfig --rocmpath`. Missing or unrecognized platform is a hard build failure that names the package to install; there is no fallback.
+- `datasets/` is Git LFS (`.gitattributes`: `datasets/** filter=lfs`), about 3.3 GiB. A plain clone smudges all of it. If the machine only needs source (compute/serve node), skip the smudge and keep the ~110 MB tree of pointer files:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/nm-z/nates-recipe-rs
 ```
 
-### Build
+## Build
 
 ```bash
 cargo build --release
 ```
 
-The release profile uses `lto = "thin"` and links the detected GPU backend. Kernels in `gpu-core/src/kernels/*.hip` are compiled through the `cc` crate with `hipcc` (or `nvcc` on the NVIDIA path). The build produces two binaries:
+Thin LTO, links the detected GPU backend. Kernels in `gpu-core/src/kernels/*.hip` compile through the `cc` crate with `hipcc` (`nvcc` on the NVIDIA path). Produces two binaries:
 
-- `target/release/recipe` — the training/eval/inference CLI
-- `target/release/detect` — the standalone column-type detector
+- `target/release/recipe` (training/eval/inference CLI)
+- `target/release/detect` (standalone column-type detector)
 
-### Environment overrides
+New `.hip` files under `gpu-core/src/kernels` are discovered automatically (`build.rs` watches the directory). Adding a new crate target or a new `-Zscript` file triggers a full ~15 min workspace rebuild, so edit the existing examples in place instead of adding drivers.
 
-The build reads the ROCm root from `hipconfig --rocmpath`; the variables below override individual pieces (each shows its default; `<rocm>` and `<cuda>` are the resolved ROCm/CUDA roots).
+### Env overrides
+
+Each shows its default; `<rocm>` and `<cuda>` are the resolved roots.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GPU_ARCH` | `gfx1101` | AMD `--offload-arch` target passed to the kernel compiler |
-| `HIPCC` | `<rocm>/bin/hipcc` (falls back to `<rocm>/bin/amdclang++` if absent) | Compiler used for `.hip` kernels |
-| `ROCM_EXTRA_INCLUDE` | `<rocm>/include` | Extra `-I` include dir for AMD kernel compilation |
+| `GPU_ARCH` | `gfx1101` | AMD `--offload-arch` passed to the kernel compiler |
+| `HIPCC` | `<rocm>/bin/hipcc` (falls back to `<rocm>/bin/amdclang++`) | Compiler for `.hip` kernels |
+| `ROCM_EXTRA_INCLUDE` | `<rocm>/include` | Extra `-I` dir for AMD kernel compilation |
 | `ROCM_EXTRA_LIB` | `<rocm>/lib` | Extra link-search dir |
 | `CUDA_PATH` | `/opt/cuda` | CUDA toolkit root (NVIDIA backend) |
 | `CUDA_ARCH` | `sm_86` | NVIDIA `-arch` target |
 | `NVCC` | `<cuda>/bin/nvcc` | CUDA compiler (NVIDIA backend) |
-| `ROCM_PATH` | `/opt/rocm` | Runtime only: ROCm `lib` search path used when the CLI JIT-compiles a Rust script target |
+| `ROCM_PATH` | `/opt/rocm` | Runtime only: ROCm lib search path when the CLI JIT-compiles a script |
 
-No override installs a runtime for you — a missing or undecided HIP backend is always a hard build failure naming the package, never a silent fallback.
-
-## Usage
-
-### Three import styles
-
-One crate, one set of methods — only the door differs. Past the constructor, the chaining, the `let` bindings, `train().run(&data, &model)`, and `infer().run(&model).eval(&data)` are identical. Each block below builds the same model on the same data.
-
-```rust
-use gpu_core::log::{loss, r2};
-use recipe::{Data, Infer, Loss, Model, R2, Train, mse, recipe};
-```
-
-**Style 1 — static (`recipe.data(...)`, dot syntax):**
-
-```rust
-let data  = recipe.data("train.csv").split(0.8).exclude("Id").target("SalePrice");
-let model = recipe.model().layer(64).leak().layer(1).loss(mse).lr(0.0001);
-recipe.train().epochs(5).log([Loss, R2]).run(&data, &model);
-recipe.infer().log([r2]).run(&model).eval(&data);
-```
-
-**Style 2 — struct (`Data::load(...)`, associated function):**
-
-```rust
-let data  = Data::load("train.csv").split(0.8).exclude("Id").target("SalePrice");
-let model = Model::new().layer(64).leak().layer(1).loss(mse).lr(0.0001);
-Train::new().epochs(5).log([Loss, R2]).run(&data, &model).save("model.ogdl");
-Infer::new().log([r2]).run(&model).eval(&data);
-```
-
-**Style 3 — free function (`recipe::data(...)`, crate path):**
-
-```rust
-let data  = recipe::data("train.csv").split(0.8).exclude("Id").target("SalePrice");
-let model = recipe::model().layer(64).leak().layer(1).loss(mse).lr(0.0001);
-recipe::train().epochs(5).log_every(1).log([Loss, R2]).run(&data, &model).save(());
-recipe::infer().log([r2]).run(&model).eval(&data);
-```
-
-`recipe` is a unit static, so `recipe.data(...)` and `recipe::data(...)` coexist in the same scope.
-
-- `Data`: `Data::load(path)` then `.set(...)`, `.split(f)`, `.exclude(col)`, `.target(col)` (or `.target([col, ...])` for multi-target), `.datasets()`. Loading is lazy; `.target()` describes, `run` materializes.
-- `Model`: `.layer(n)` with a chained activation (`.relu()`, `.leak()`, `.gelu()`, `.sigmoid()`, …), plus `.layer(embed(dim))`, `.layer(attn(heads))`, `.conv(filters, kernel, stride)`, and `.loss(...)` / `.lr(...)`. Losses: `mse mae huber ce bce focal`.
-- `Train`: `.epochs(n)`, `.log_every(n)`, `.log([...])`, `.net([...])`, `.resume(path)`; `.run(&data, &model)` returns `&Train` so `.save(path)` chains off it. `.save(())` writes `model.ogdl`; `.save("path.ogdl")` writes an explicit path. Log metrics: `Loss Accuracy R2 Lr Epoch Time hip`.
-- `Infer`: forward-only; `.run(&model).eval(&data)`.
-
-Runnable end-to-end versions of the above live in `examples/styles.rs` and `examples/cookbook.rs`:
+## Test
 
 ```bash
-cargo run --release --example styles
-cargo run --release --example cookbook
+cargo test all
 ```
 
-### Command line
-
-The two binaries built above expose the command-line surface.
-
-**`recipe`** runs a training script and exposes the network/probe subcommands:
+That is THE suite: every test in every crate, one OS process per test, 60s SIGKILL deadline each (a kill is that test's FAIL, the suite continues), one log at `suite.log`. Verdict:
 
 ```bash
-recipe train.rs            # compile the script against librecipe and run it
-recipe probe               # measure this machine (arch, GPUs, VRAM, RAM)
-recipe serve               # run the training daemon (listens on port 7845)
-recipe peers               # live network view of discoverable peers
-recipe -h                  # usage
+rg '^FAIL' suite.log
 ```
 
-A training run is a Rust script that uses the builder API above. Write it once, then hand it to `recipe`, which compiles it against the installed library, caches the compiled binary, and executes it:
+The suite skips tests whose fn-body hash matches `target/.suite_cache`; delete that file to force a full re-run.
+
+Narrower runs:
+
+```bash
+cargo test -p recipe-infer --release            # forward / KV-cache / ogdl behavioral tests (GPU)
+cargo test -p gpu-core --release --test suite   # kernel proof suite alone
+```
+
+The gpu-core test target is named `suite`, not `all`, and no test id may contain the substring "all" (cargo filters by substring, so it would collide with `cargo test all`).
+
+`kernel_inventory.db` at the repo root (committed, ~3.7 MB SQLite) is live test data for the gpu-core proof suite; around 20 tests fail without it. Leave it alone.
+
+## Run
+
+Quick train from a CSV:
+
+```bash
+cargo run --release -- train.csv --target Price
+```
+
+Column-type detection on anything loadable (csv / arff / directory / zip, globs expand):
+
+```bash
+cargo run --release -- detect <path>    # or ./target/release/detect <path>
+```
+
+The `recipe` binary's other subcommands:
+
+```bash
+recipe train.rs    # compile the script against librecipe, cache the binary, run it
+recipe probe       # measure this machine (arch, GPUs, VRAM, RAM)
+recipe serve       # training daemon, listens on 7845
+recipe peers       # live view of discoverable peers
+```
+
+A training script is plain Rust against the builder API:
 
 ```rust
-// train.rs
 use recipe::{Data, Model, Train, Loss, R2, mse};
 
 fn main() {
@@ -157,97 +100,48 @@ fn main() {
 }
 ```
 
-```bash
-recipe train.rs
-```
-
-**`detect`** is a standalone column-type detector — no training framework linked — that prints each column's inferred datatype (`Numeric`, `Temporal`, `Categorical`, `Ordinal`, `Text`, or `Image`):
+Examples:
 
 ```bash
-detect <path>...           # csv / arff / directory / zip; globs expand to many
+cargo run --release --example cookbook              # the e2e: NN/CNN/MLP/LLM scenarios
+cargo run --release --example styles                # same model through all three import styles
+cargo run --release --example train_detector        # retrain the column-type detector, writes pantry/detector.ogdl
+cargo run --release --example gemma4 -- "prompt"    # gemma-26B f64 inference
 ```
 
-```text
-SalePrice -> Numeric
-Neighborhood -> Categorical
-YearBuilt -> Temporal
-```
+One GPU process at a time. Concurrent runs OOM at weight init.
 
-## Architecture
-
-`recipe` is a Cargo workspace. The root crate (`.`) is `recipe`; the other members are listed in `Cargo.toml`:
+## Workspace
 
 | Crate | Role |
 |-------|------|
-| `gpu-core` | GPU-native f64 compute: the `.hip` kernels, the HIP/ROCm (and CUDA-shim) bindings, and the tagged memory ledger. Links ROCm. |
-| `recipe-infer` | Forward-pass inference as pure tensor functions (weights + input matrix produce an output matrix), `ogdl`/safetensors weight loading, and the GPU device lifecycle (init/shutdown). Knows nothing of datasets. |
-| `pantry` | All dataset parsing (CSV, ARFF, zip, image directories), encoding, the NaN policy, and a trained char-level column-type detector. Ships the `detect` binary. |
-| `recipe` | The user-facing builder API: `Data`/`Model`/`Train`, backward pass, in-VRAM and out-of-core `fit`, save/resume, eval, and the TUI. Delegates loading to `pantry`. |
-| `vramspy` | `LD_PRELOAD` cdylib that interposes HSA allocation entry points to count library-side VRAM by pool-owning agent, beneath the ledger's choke points. |
-| `log` | Flag-gated stderr and run-file logging with self-erasing terminal wait lines. |
-| `ogdl` | OGDL tree graphs: dotted-path selection and tab-indented serialization, used for weights and config. |
-| `catboost-rs`, `xgboost-rs`, `lightgbm-rs` | Standalone gradient-boosted-decision-tree trainers (ordered boosting; level-wise histogram trees; leaf-wise GOSS/EFB), each on `gpu-core`. |
+| `gpu-core` | f64 HIP kernels, HIP/ROCm (plus CUDA shim) bindings, tagged memory ledger. Links ROCm. Depends on nothing GPU-side. |
+| `recipe-infer` | Forward pass as pure tensor fns (weights + input matrix in, output matrix out), ogdl/safetensors loading, owns GPU device lifecycle. Knows nothing of datasets. |
+| `pantry` | ALL parsing (csv/arff/zip/image dirs), encoding, the single NaN policy, trained column-type detector, ships `detect`. |
+| `recipe` | Builder API (`Data`/`Model`/`Train`), backward, fit (in-VRAM and out-of-core), save/resume, TUI, eval. Delegates loading to `pantry`. |
+| `vramspy` | `LD_PRELOAD` cdylib interposing HSA alloc entry points; counts library-side VRAM beneath the ledger choke points. |
+| `ogdl`, `log` | Leaf utility crates (tree-graph format; stderr/run-file logging). |
+| `catboost-rs`, `xgboost-rs`, `lightgbm-rs` | Standalone GBDT crates on `gpu-core`. |
 
-### Dependency DAG
+Dependency chain for the NN path: `gpu-core`, then `recipe-infer`, then `pantry`, then `recipe`. Strict one-way, no cycles.
 
-Path dependencies form a strict one-way graph — no cycles. `ogdl` and `log` are leaf utility crates; `gpu-core` sits above them and everything GPU sits above `gpu-core`.
+## Rules that break your build if you don't know them
 
-```text
-ogdl ── log
-  │      │
-  └──► gpu-core ──► recipe-infer ──► pantry
-          │              │             │
-          │              └──────┐      │
-          ▼                     ▼      ▼
-   catboost-rs                    recipe
-   xgboost-rs        (depends on gpu-core, recipe-infer, pantry, ogdl)
-   lightgbm-rs
+- f64 only. No fp32/fp16/bf16/mixed precision anywhere.
+- Full-batch only. No `batch_size`, no mini-batch, no gradient accumulation.
+- No vendor math libs (rocBLAS/hipBLAS/cuBLAS etc.) in new code; the remaining `hipblas*` calls in kernels.rs are debt under migration, never add one.
+- Exactly one call site per HIP memory API, in `gpu-core/src/memory.rs`. Never a raw `hip::` memory call anywhere else; every byte goes through the ledger.
+- `hipMallocAsync`/`hipFreeAsync` only. The sync variants are rejected at compile time by the root `build.rs` scanner.
+- NaN handling lives in one place (`pantry::encode::nan_clean`). Do not scatter new NaN checks.
+- No caps or magic thresholds to "fix" size or speed: accelerate the code or fail clean with the size and culprit columns printed.
+- Comment budget, enforced by test: `///` doc comments unlimited, `// SAFETY:` max 1 per unsafe block, any other `//` max 1 per function. No `/* */`.
+- 6-space indentation, `anyhow::Result`, no `unwrap`, lowercase const aliases (`mse`, `w`, `b`). Progress and diagnostics go to stderr, never stdout.
 
-vramspy ── log        (standalone cdylib; not on the gpu-core path)
-```
+## Debugging
 
-The neural-network chain is `gpu-core → recipe-infer → pantry → recipe`: kernels know nothing of inference, inference knows nothing of datasets, and `recipe` composes all three. The three GBDT crates depend only on `gpu-core`. `vramspy` is built separately as an interposer and links only `log`.
-
-### Design commitments
-
-These are structural, not tunables:
-
-- **f64 only.** Every tensor and kernel is double precision — no fp32/fp16/bf16 or mixed precision anywhere.
-- **Full-batch only.** There is no `batch_size`, mini-batch SGD, or gradient accumulation; the whole dataset is one matrix per step.
-- **One call site per HIP memory API.** Alloc, free, transfer, and memset each funnel through exactly one choke point in `gpu-core/src/memory.rs`, where every byte is tagged and ledgered (live and peak per tag; cumulative H2D/D2H/D2D bytes and call counts). No raw HIP memory call exists elsewhere.
-- **Waterfall placement.** VRAM fills completely before anything spills to RAM, and RAM before disk. Fit decisions go through `gpu_core::memory::claimable_bytes()`, never a raw device query, with a fixed per-tier reserve as the only headroom constant.
-
-## Data
-
-Loading and encoding live in the `pantry` crate. `pantry::load_groups(path)` dispatches on the path and returns typed table/image groups; the trainer above it consumes the encoded matrix and never touches parsing.
-
-### Formats
-
-- **CSV / delimited text** — the delimiter is sniffed per file (comma, semicolon, tab, or whitespace). The header row is decided structurally, not heuristically: if every cell of the first row parses as `f64` the row is data and columns are named `col_0..col_N`; otherwise the first row is the header.
-- **ARFF** — `@attribute` types are read directly (`{a,b,c}` nominal sets become categorical, everything else numeric); `@data` rows follow.
-- **Zip archives** — extracted to a temp directory (nested zips are unpacked recursively), then loaded as a directory.
-- **Image directories** — each image becomes one RGB pixel row (`width * height * 3`) at the images' native resolution. A directory of images is a single matrix keyed by filename stem, joined to table rows that reference those filenames; class-labeled subdirectories are supported for labeled image sets.
-
-Directories may mix tables and images; groups sharing a key column are joined on it.
-
-### Column-type detection
-
-Column types are inferred by a trained char-level model rather than hand-written rules. Each column's cells are read as a newline-joined byte stream (up to 256 bytes), and a fixed `embed → attention → dense → dense` network classifies the stream into one of six kinds: **Numeric, Temporal, Categorical, Ordinal, Text, Image**. Classification uses only structural signal from the raw bytes — no magic thresholds. The trained weights ship inline (`pantry/detector.ogdl`) and the forward pass runs on the GPU. These inferred types drive the encoding described next, and the standalone `detect` binary (see [Command line](#command-line)) surfaces them directly.
-
-### Encoding
-
-- **Numeric / Temporal** → one column (dates parsed to a day count).
-- **Categorical** → one-hot, one column per distinct value.
-- **Ordinal** → a single integer-coded column.
-- **Text** → tokenized by splitting on non-alphanumeric characters and lowercasing; a sorted per-column vocabulary maps each row to a fixed-length sequence of token IDs (`0` = unknown/pad) for the embedding layer. The sequence length is bounded to 256 tokens, a no-op for ordinary short text and a truncation only for long-form outliers.
-- **Image** columns hold filenames and act as join keys into the image matrix, contributing no feature columns themselves.
-
-Cardinality is never capped to fit. If the encoded matrix exceeds the combined VRAM + RAM + disk ceiling, the run stops with a one-line autopsy naming the widest columns instead of silently shrinking the data.
-
-### Missing values
-
-One policy, one function (`nan_clean` applied through `clean_dataset`). Common missing markers — `""`, `NA`, `NaN`, `N/A`, `NULL`, `None`, `?`, `.`, `-` — are recognized on parse. Feature columns are **mean-imputed** (each NaN filled with that column's finite mean); rows whose **target** is missing are **dropped**, since a label cannot be invented. After this single pass the matrix contains no NaN, so nothing downstream re-handles missingness.
-
-## License
-
-Released under the MIT License.
+- rocprofv3 hangs at teardown. Always `timeout 8 rocprofv3 --hip-trace --kernel-trace -d <dir> -- <bin>`; the SQLite DB survives the kill (query `rocpd_kernel_dispatch`; workgroups come from grid/workgroup dims).
+- GPU crash forensics: `coredumpctl list` / `coredumpctl info <PID>` for the backtrace, `journalctl -k` for the amdgpu page-fault vs OOM truth. Inspect the core before rebuilding over the binary.
+- A duplicate-symbol link error out of gpu-core is always a genuine duplicate `extern "C"` definition across two `.hip` sources (the build sweeps stale `.o`/`libhip*.a` first, so it is never staleness). Delete the redundant copy.
+- FFI parity is the silent killer: C linkage matches names only. Check per-slot type parity between every `.hip` launcher and its Rust decl.
+- rocPRIM in a `.hip` file needs `#include <rocprim/rocprim.hpp>` AND `#include <cstring>`; device temp is caller-owned (`*_workspace_bytes` query plus a launcher that takes tmp). See `reduce.hip`.
+- Detector retrain: on a corpus change delete `pantry/detector.ogdl` first (the best-only save guard blocks incomparable scores), then rebuild after training (`include_str!` bakes the weights at compile time).

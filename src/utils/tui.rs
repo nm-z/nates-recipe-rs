@@ -6,8 +6,10 @@ use ratatui::symbols::{self, Marker};
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
 use recipe_infer::{Metric, Pt, pt};
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal};
 use std::mem;
+use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 
 #[derive(Clone, Copy)]
@@ -251,6 +253,7 @@ pub fn dashboard(frame: &mut Frame, summary: &str, rows: &[Vec<f64>], ys: &[Metr
 }
 pub fn show(summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
 	let mut term = ratatui::init();
+	let _guard = TermRestore::new();
 	let _drawn = term.draw(|frame| {
 		dashboard(frame, summary, rows, ys);
 	});
@@ -268,7 +271,6 @@ pub fn show(summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
 			}
 		})
 		.unwrap_or(());
-	ratatui::restore();
 }
 pub use recipe_infer::llm::{Tok, TokStatus, render_toks, toks_line};
 
@@ -278,11 +280,48 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Borders, Wrap};
 use tui_textarea::TextArea;
 
-struct TermRestore;
+/// Owns the terminal for a TUI session: while alive, fd 2 is redirected to a log
+/// file so `Write::*` diagnostics from generation cannot corrupt the ratatui
+/// screen. Dropping restores the terminal and fd 2, then reports the log path.
+struct TermRestore {
+	saved_stderr: i32,
+}
+impl TermRestore {
+	fn new() -> Self {
+		let log_path = std::env::var("RECIPE_TUI_LOG")
+			.unwrap_or_else(|_e| "/tmp/recipe-tui.log".to_owned());
+		let saved_stderr = redirect_stderr(&log_path);
+		Self { saved_stderr }
+	}
+}
 impl Drop for TermRestore {
 	fn drop(&mut self) {
 		ratatui::restore();
+		if self.saved_stderr >= 0 {
+			// SAFETY: saved_stderr is a live dup of the original fd 2 from redirect_stderr; dup2 restores it and close releases the dup.
+			unsafe {
+				libc::dup2(self.saved_stderr, 2);
+				libc::close(self.saved_stderr);
+			}
+		}
 	}
+}
+
+/// Redirects fd 2 to `path` (truncating it), returning a dup of the original fd 2
+/// to restore later, or `-1` if the redirect could not be set up.
+fn redirect_stderr(path: &str) -> i32 {
+	let Ok(file) = OpenOptions::new().create(true).write(true).truncate(true).open(path) else {
+		return -1;
+	};
+	// SAFETY: dup/dup2 on fd 2 and the open file's fd; on success fd 2 aliases the file and `saved` keeps the original open.
+	let saved = unsafe {
+		let saved = libc::dup(2);
+		if saved >= 0 {
+			libc::dup2(file.as_raw_fd(), 2);
+		}
+		saved
+	};
+	return saved;
 }
 
 fn new_input() -> TextArea<'static> {
@@ -430,7 +469,7 @@ fn render_peers(frame: &mut Frame, rows: &[PeerRow], cur: usize) {
 
 pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 	let mut term = ratatui::init();
-	let _guard = TermRestore;
+	let _guard = TermRestore::new();
 	let mut cur = 0usize;
 	loop {
 		let _drawn = term.draw(|f| render_peers(f, rows, cur));
@@ -462,13 +501,65 @@ pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 	}
 }
 
+/// Non-blocking poll for a generation-cancel key (Ctrl-C or Esc). Drains any
+/// pending input events so a cancel during a long generation is seen promptly.
+fn cancel_requested() -> bool {
+	while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+		let Ok(Event::Key(k)) = event::read() else {
+			continue;
+		};
+		if k.kind != KeyEventKind::Press {
+			continue;
+		}
+		let ctrl_c =
+			k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+		if ctrl_c || k.code == KeyCode::Esc {
+			return true;
+		}
+	}
+	false
+}
+
+pub fn render_once(gguf: &str, prompt: &str) {
+	crate::some_or_die(io::stdin().is_terminal().then_some(()), "render: needs a tty");
+	let mut term = ratatui::init();
+	let _guard = TermRestore::new();
+	let input = new_input();
+	let mut scrollback: Vec<(String, String)> = Vec::new();
+	let res = {
+		let sb = &scrollback;
+		let ta = &input;
+		let mut on_round = |toks: &[Tok]| -> bool {
+			let _round = term.draw(|f| render_chat(f, ta, sb, Some(prompt), toks, true));
+			!cancel_requested()
+		};
+		let _first = on_round(&[]);
+		recipe_infer::llm::generate(Path::new(gguf), prompt, &mut on_round)
+	};
+	match res {
+		Ok(resp) => scrollback.push((prompt.to_string(), resp)),
+		Err(e) => {
+			drop(_guard);
+			drop(gpu_core::log::Write::err(format!("render: {e:#}")));
+			return;
+		}
+	}
+	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false));
+	loop {
+		match event::read() {
+			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
+			Ok(_e) => {}
+			Err(_e) => break,
+		}
+	}
+}
+
 pub fn chat(gguf: &str) {
 	crate::some_or_die(io::stdin().is_terminal().then_some(()), "chat: needs a tty");
 	let mut term = ratatui::init();
-	let _guard = TermRestore;
+	let _guard = TermRestore::new();
 	let mut textarea = new_input();
 	let mut scrollback: Vec<(String, String)> = Vec::new();
-	let mut err_out: Option<String> = None;
 	loop {
 		let _idle = term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false));
 		let ev = match event::read() {
@@ -477,7 +568,6 @@ pub fn chat(gguf: &str) {
 		};
 		match ev {
 			Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
-				(KeyCode::Esc, _mods) => break,
 				(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => break,
 				(KeyCode::Enter, _mods) => {
 					let joined = textarea.lines().join(" ");
@@ -496,12 +586,13 @@ pub fn chat(gguf: &str) {
 						let sb = &scrollback;
 						let ta = &textarea;
 						let pr = prompt.as_str();
-						let mut on_round = |toks: &[Tok]| {
+						let mut on_round = |toks: &[Tok]| -> bool {
 							let _round = term.draw(|f| {
 								render_chat(f, ta, sb, Some(pr), toks, true)
 							});
+							!cancel_requested()
 						};
-						on_round(&[]);
+						let _first = on_round(&[]);
 						res = recipe_infer::llm::generate(
 							Path::new(gguf),
 							&prompt,
@@ -510,10 +601,7 @@ pub fn chat(gguf: &str) {
 					}
 					match res {
 						Ok(resp) => scrollback.push((prompt, resp)),
-						Err(e) => {
-							err_out = Some(format!("{e:#}"));
-							break;
-						}
+						Err(e) => scrollback.push((prompt, format!("error: {e:#}"))),
 					}
 				}
 				_other => {
@@ -527,5 +615,4 @@ pub fn chat(gguf: &str) {
 		}
 	}
 	drop(_guard);
-	err_out.map(|e| drop(gpu_core::log::Write::err(format!("chat: {e}"))));
 }

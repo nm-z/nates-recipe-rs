@@ -623,6 +623,7 @@ impl Infer {
 										prompt,
 										recipe_infer::llm::render_toks(toks),
 									);
+									true
 								},
 							),
 							"infer: generate",

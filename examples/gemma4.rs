@@ -1,10 +1,8 @@
 #![allow(unsafe_code, reason = "FFI to HIP runtime")]
 use anyhow::{Result, anyhow, bail};
-use gpu_core::log::{Opt, Write, gpu, prompt as promptf, set_opt};
-use recipe_infer::llm::{generate, render_toks};
+use gpu_core::log::{Opt, Write, gpu, set_opt};
 use std::env;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
 use std::process;
 
 fn ensure_vramspy_preloaded() -> Result<()> {
@@ -61,20 +59,11 @@ fn main() -> Result<()> {
 	});
 	ensure_vramspy_preloaded()?;
 
-	let gguf = Path::new("/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf");
-	let ask = env::args()
-		.nth(1)
-		.unwrap_or_else(|| return "The capital of France is".to_owned());
+	let gguf_str = env::var("GGUF").unwrap_or_else(|_e| {
+		"/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf".to_owned()
+	});
+	recipe::tui::chat(&gguf_str);
 
-	let mut step = 0usize;
-	let out = generate(gguf, &ask, &mut |toks| {
-		Write::line(promptf, format!("step {step}: {}", render_toks(toks)));
-		step += 1;
-	})?;
-
-	Write::line(promptf, "");
-	Write::line(promptf, "=== OUTPUT ===");
-	Write::line(promptf, &out);
 	Write::line(gpu, gpu_core::memory::ledger_report());
 	recipe_infer::shutdown();
 	Ok(())
