@@ -143,3 +143,21 @@ extern "C" void launch_glu_gelu(const double* in, double* out, int rows, int hal
     long blk = (total + t - 1) / t;
     hipLaunchKernelGGL(glu_gelu, dim3((unsigned)blk), dim3(t), 0, s, in, out, rows, half);
 }
+
+extern "C" __global__ void glu_silu(const double* in, double* out, int rows, int half) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * half;
+    if (idx < total) {
+        int r = idx / half;
+        int i = idx % half;
+        long b = (long)r * 2 * half;
+        double g = in[b + i];
+        out[idx] = (g / (1.0 + exp(-g))) * in[b + half + i];
+    }
+}
+extern "C" void launch_glu_silu(const double* in, double* out, int rows, int half, hipStream_t s) {
+    int t = 256;
+    long total = (long)rows * half;
+    long blk = (total + t - 1) / t;
+    hipLaunchKernelGGL(glu_silu, dim3((unsigned)blk), dim3(t), 0, s, in, out, rows, half);
+}

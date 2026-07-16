@@ -64,3 +64,6 @@ examples/*/test_images/
 /suite.stderr.log
 /push.log
 /log-clippy.log
+
+# Vendored llama.cpp clone (reference for arch ports; clone separately)
+llama.cpp/
