@@ -126,6 +126,74 @@ macro_rules! ogdl {
 	(@go $p:ident; $($bad:tt)*) => {
 		const _: [(); 0] = [(); $crate::__macro_support::invalid_path()];
 	};
+	(@gg $g:ident; ( $e:expr )) => { $g.push_str(&format!("({})", $e)) };
+	(@gg $g:ident; ( $e:expr ) *) => { $g.push_str(&format!("({})*", $e)) };
+	(@gg $g:ident; * ( $e:expr )) => { $g.push_str(&format!("*({})", $e)) };
+	(@gg $g:ident; [ $e:expr ]) => { $g.push_str(&format!("[{}]", $e)) };
+	(@gg $g:ident; [ $e:expr ] *) => { $g.push_str(&format!("[{}]*", $e)) };
+	(@gg $g:ident; * [ $e:expr ]) => { $g.push_str(&format!("*[{}]", $e)) };
+	(@gg $g:ident; * $i:ident) => { $g.push_str(&format!("*{}", stringify!($i))) };
+	(@gg $g:ident; $i:ident *) => { $g.push_str(&format!("{}*", stringify!($i))) };
+	(@gg $g:ident; $i:ident) => { $g.push_str(stringify!($i)) };
+	(@gg $g:ident; ( $e:expr ) . $($rest:tt)+) => {{
+		$g.push_str(&format!("({}).", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; ( $e:expr ) * . $($rest:tt)+) => {{
+		$g.push_str(&format!("({})*.", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; * ( $e:expr ) . $($rest:tt)+) => {{
+		$g.push_str(&format!("*({}).", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; [ $e:expr ] . $($rest:tt)+) => {{
+		$g.push_str(&format!("[{}].", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; [ $e:expr ] * . $($rest:tt)+) => {{
+		$g.push_str(&format!("[{}]*.", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; * [ $e:expr ] . $($rest:tt)+) => {{
+		$g.push_str(&format!("*[{}].", $e));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; * $i:ident . $($rest:tt)+) => {{
+		$g.push_str(&format!("*{}.", stringify!($i)));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; $i:ident * . $($rest:tt)+) => {{
+		$g.push_str(&format!("{}*.", stringify!($i)));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; $i:ident . $($rest:tt)+) => {{
+		$g.push_str(&format!("{}.", stringify!($i)));
+		$crate::ogdl!(@gg $g; $($rest)+);
+	}};
+	(@gg $g:ident; $($bad:tt)*) => {
+		const _: [(); 0] = [(); $crate::__macro_support::invalid_path()];
+	};
+	(( $e:expr ) $($rest:tt)*) => {{
+		let mut g = String::new();
+		$crate::ogdl!(@gg g; ( $e ) $($rest)*);
+		$crate::__macro_support::glob_block(&g)
+	}};
+	([ $e:expr ] $($rest:tt)*) => {{
+		let mut g = String::new();
+		$crate::ogdl!(@gg g; [ $e ] $($rest)*);
+		$crate::__macro_support::glob_block(&g)
+	}};
+	(* $($rest:tt)+) => {{
+		let mut g = String::new();
+		$crate::ogdl!(@gg g; * $($rest)+);
+		$crate::__macro_support::glob_block(&g)
+	}};
+	($i:ident *) => {{
+		let mut g = String::new();
+		$crate::ogdl!(@gg g; $i *);
+		$crate::__macro_support::glob_block(&g)
+	}};
 	($($path:tt)+) => {{
 		let mut p = $crate::__macro_support::start();
 		$crate::ogdl!(@go p; $($path)+);

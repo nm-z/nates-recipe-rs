@@ -307,6 +307,20 @@ pub fn del(p: &mut P, name: &str) {
 	hold(p);
 }
 
+/// Evaluates a lowered glob expression against the global graph and returns
+/// the matched names as leaf lines, in the engine's walk order.
+#[inline]
+#[must_use]
+pub fn glob_block(expr: &str) -> super::Block {
+	return ogdl.with(|root| {
+		let nodes = root
+			.glob(expr)
+			.map(|v| return v.iter().map(|n| return Node::leaf(&n.name)).collect())
+			.unwrap_or_default();
+		return super::Block { nodes, sel: None };
+	});
+}
+
 #[inline]
 pub fn fin(p: P) -> super::Block {
 	let paths = p.anchor.unwrap_or_default();
