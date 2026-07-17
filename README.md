@@ -2,32 +2,64 @@
 
 GPU-native f64 NN training/inference, own HIP kernels, full-batch only. Root crate is the builder API (`Data`/`Model`/`Train`), backward, fit, save/resume, TUI, eval.
 
+Source-only clone; a plain clone smudges ~3.3 GiB of LFS datasets:
+
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/nm-z/nates-recipe-rs   # source only; plain clone smudges ~3.3 GiB of datasets
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/nm-z/nates-recipe-rs
+```
 
-cargo build --release                              # whole workspace; needs hipconfig on PATH; GPU_ARCH=gfx1101 default
-cargo test all                                     # THE suite: every test in every crate, 60s SIGKILL each, log at suite.log
-rg '^FAIL' suite.log                               # suite verdict
-rm target/.suite_cache                             # force full re-run (suite skips fn-body-hash matches)
+Build the whole workspace. Needs `hipconfig` on `PATH`; default GPU arch is gfx1101, override with `GPU_ARCH`:
 
-cargo run --release -- train.csv --target Price    # train straight from a csv
-cargo run --release -- detect <path>               # column-type detection (csv / arff / dir / zip)
+```bash
+cargo build --release
+```
 
-cargo run --release --example cookbook             # the e2e: NN/CNN/MLP/LLM scenarios
-cargo run --release --example styles               # same model through all three import styles
-cargo run --release --example train_detector       # retrain column-type detector; delete pantry/detector.ogdl first, rebuild after
-cargo run --release --example gemma4 -- "prompt"   # gemma-26B f64 inference
-cargo run --release --example det_probe            # determinism probe: every diffusion-forward op run twice, bit-compared
-cargo run --release --example gpu_probe            # proof-of-life sgemm: correctness vs CPU ref, then f32 TFLOP/s
-cargo run --release --example stress               # train over real datasets (bank/seeds/wine), delimiter sniffing included
+THE suite: every test in every crate, one OS process per test, 60s SIGKILL each, one log at `suite.log`. The second line is the verdict; the third forces a full re-run (the suite skips tests whose fn-body hash matches the cache):
 
-cargo test --release --test dataset                # root tests standalone (all are members of `cargo test all`):
-cargo test --release --test model                  #   likewise ooc, probe, wire, hygiene
+```bash
+cargo test all
+rg '^FAIL' suite.log
+rm target/.suite_cache
+```
 
-recipe train.rs                                    # compile a script against librecipe, cache, run
-recipe probe                                       # measure this machine (arch, GPUs, VRAM, RAM)
-recipe serve                                       # training daemon on 7845
-recipe peers                                       # live view of discoverable peers
+Train straight from a csv:
+
+```bash
+cargo run --release -- train.csv --target Price
+```
+
+Column-type detection (csv / arff / directory / zip):
+
+```bash
+cargo run --release -- detect <path>
+```
+
+Examples. `cookbook` is the e2e (NN/CNN/MLP/LLM scenarios). `styles` builds the same model through all three import styles. `train_detector` retrains the column-type detector; delete `pantry/detector.ogdl` first and rebuild after, since `include_str!` bakes the weights at compile time. `gemma4` is gemma-26B f64 inference. `det_probe` runs every diffusion-forward op twice and bit-compares for determinism. `gpu_probe` is a proof-of-life sgemm with an f32 TFLOP/s measure. `stress` trains over real datasets (bank/seeds/wine):
+
+```bash
+cargo run --release --example cookbook
+cargo run --release --example styles
+cargo run --release --example train_detector
+cargo run --release --example gemma4 -- "prompt"
+cargo run --release --example det_probe
+cargo run --release --example gpu_probe
+cargo run --release --example stress
+```
+
+Root test targets standalone, all also members of `cargo test all`; same form for `ooc`, `probe`, `wire`, `hygiene`:
+
+```bash
+cargo test --release --test dataset
+cargo test --release --test model
+```
+
+The installed binary. `recipe train.rs` compiles the script against librecipe, caches the binary, and runs it. `probe` measures the machine (arch, GPUs, VRAM, RAM). `serve` is the training daemon on 7845. `peers` is a live view of discoverable peers:
+
+```bash
+recipe train.rs
+recipe probe
+recipe serve
+recipe peers
 ```
 
 One GPU process at a time; concurrent runs OOM at weight init.
@@ -36,41 +68,75 @@ One GPU process at a time; concurrent runs OOM at weight init.
 
 f64 `.hip` kernels, HIP/ROCm bindings, tagged memory ledger. Everything GPU sits on this.
 
-```bash
-cargo test -p gpu-core --release --test suite      # kernel proof suite (target named `suite`, not `all`; needs committed kernel_inventory.db)
-cargo test -p gpu-core --release --test diffusion  # likewise moe, rope, tiered
+Kernel proof suite; the test target is named `suite`, not `all`, and it needs the committed `kernel_inventory.db`:
 
-cargo run --release -p gpu-core --bin probe        # raw device probe through gpu-core's own HIP bindings
-cargo run --release -p gpu-core --bin asmrun       # load a .s/.hsaco and dispatch a kernel: asmrun <path.s> [kernel gridX blockX arg..]
+```bash
+cargo test -p gpu-core --release --test suite
+```
+
+Other test targets; same form for `moe`, `rope`, `tiered`:
+
+```bash
+cargo test -p gpu-core --release --test diffusion
+```
+
+Raw device probe through gpu-core's own HIP bindings:
+
+```bash
+cargo run --release -p gpu-core --bin probe
+```
+
+Load a `.s`/`.hsaco` and dispatch one of its kernels from the command line; path alone lists the kernels:
+
+```bash
+cargo run --release -p gpu-core --bin asmrun -- <path.s> [kernel gridX blockX arg..]
 ```
 
 ## recipe-infer
 
 Forward pass as pure tensor fns, ogdl/safetensors loading, owns GPU device lifecycle. Knows nothing of datasets.
 
-```bash
-cargo test -p recipe-infer --release               # forward / KV-cache / ogdl behavioral tests (GPU)
-cargo test -p recipe-infer --release --test forward   # likewise gguf, safetensors, params, arch_dispatch, logit_ref, tokenizer_ref
+All behavioral tests (forward / KV-cache / ogdl, GPU):
 
-cargo test --release -p recipe-infer --test archs_parity  -- --nocapture   # forward parity, GPU
-cargo test --release -p recipe-infer --test vocabs_parity -- --nocapture   # tokenizer parity, CPU
-# each prints one colored verdict row per model/vocab, then a summary line;
-# fails until full parity (red by design)
+```bash
+cargo test -p recipe-infer --release
+```
+
+Single test targets; same form for `gguf`, `safetensors`, `params`, `arch_dispatch`, `logit_ref`, `tokenizer_ref`:
+
+```bash
+cargo test -p recipe-infer --release --test forward
+```
+
+The apples-to-apples parity pair: forward parity on GPU, tokenizer parity on CPU. Each prints one colored verdict row per model/vocab, then a summary line, and fails until full parity (red by design):
+
+```bash
+cargo test --release -p recipe-infer --test archs_parity  -- --nocapture
+cargo test --release -p recipe-infer --test vocabs_parity -- --nocapture
 ```
 
 ## pantry
 
 ALL parsing (csv/arff/zip/image dirs), encoding, the single NaN policy, trained column-type detector.
 
+Build ships the standalone `detect` binary:
+
 ```bash
-cargo build --release -p pantry                    # ships target/release/detect (standalone binary)
+cargo build --release -p pantry
 ./target/release/detect <path>...
-cargo test -p pantry --release --test data         # likewise encode
+```
+
+Tests; same form for `encode`:
+
+```bash
+cargo test -p pantry --release --test data
 ```
 
 ## vramspy
 
 `LD_PRELOAD` cdylib interposing HSA alloc entry points; counts library-side VRAM beneath the ledger choke points.
+
+Build, then interpose under any GPU binary:
 
 ```bash
 cargo build --release -p vramspy
@@ -81,17 +147,26 @@ LD_PRELOAD=target/release/libvramspy.so <bin>
 
 Standalone GBDT trainers on `gpu-core` (ordered boosting; level-wise histogram trees; leaf-wise GOSS/EFB).
 
+Build; same form for `xgboost-rs`, `lightgbm-rs`:
+
 ```bash
-cargo build --release -p catboost-rs               # likewise xgboost-rs, lightgbm-rs
-cargo run --release -p catboost-rs --bin bench     # train+predict bench on a csv; each crate ships its own `bench` bin
+cargo build --release -p catboost-rs
+```
+
+Each crate ships its own `bench` bin, a train+predict bench on a csv:
+
+```bash
+cargo run --release -p catboost-rs --bin bench
 ```
 
 ## ogdl, log
 
 Leaf utility crates: OGDL tree graphs (weights/config format); flag-gated stderr and run-file logging.
 
+ogdl test targets; same form for `doc`, `fill`, `full_probe`, `graph`, `host`, `path`, `reconcile`, `styles`:
+
 ```bash
-cargo test -p ogdl --release --test corpus         # likewise doc, fill, full_probe, graph, host, path, reconcile, styles
+cargo test -p ogdl --release --test corpus
 ```
 
 `log` has no targets of its own; everything above is also a member of `cargo test all`.
