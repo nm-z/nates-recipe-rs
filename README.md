@@ -40,6 +40,11 @@ Forward pass as pure tensor fns, ogdl/safetensors loading, owns GPU device lifec
 
 ```bash
 cargo test -p recipe-infer --release               # forward / KV-cache / ogdl behavioral tests (GPU)
+
+cargo test --release -p recipe-infer --test archs_parity  -- --nocapture   # forward parity, GPU
+cargo test --release -p recipe-infer --test vocabs_parity -- --nocapture   # tokenizer parity, CPU
+# each prints one colored verdict row per model/vocab, then a summary line;
+# fails until full parity (red by design)
 ```
 
 ## pantry
