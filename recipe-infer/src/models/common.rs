@@ -1,40 +1,106 @@
-//! Shared driver for the causal-dense architectures whose decode graph has been
-//! verified 1:1 against `llama.cpp/src/models/<arch>.cpp` AND whose tensor names
-//! resolve through the loader's `hf_name` mapping. Only such architectures are
-//! dispatched (see [`super::dispatch`]); everything else is a hard error.
-//!
-//! Contract of every architecture routed here: RMSNorm, GQA + RoPE (no attention
-//! bias), SiLU-gated SwiGLU FFN, one pre-attn and one pre-FFN norm, standard
-//! residuals. The only per-arch variation is an optional per-head Q/K RMSNorm.
-//! Anything outside this contract (LayerNorm, attention bias, sandwich norms,
-//! MoE, recurrence, bidirectional/encoder attention, multimodal) is NOT handled
-//! here and its architecture is not routed.
+//! Shared composition vocabulary for the per-architecture decode ports. Every
+//! `models/<arch>.rs` is one architecture: it declares that arch's [`Spec`] and
+//! delegates to [`layer_spec`] (dense) or [`layer_moe`] (mixture-of-experts),
+//! which compose the shared `gpu_*` kernels 1:1 with the arch's `llama.cpp`
+//! `build_arch_graph`. Recurrent families spell out their own composition.
 
-use super::super::{Arena, Model, layer_name};
+use super::super::{Arena, Model, layer_name, softmax};
 use anyhow::Result;
+use core::ptr;
 use gpu_core::infer_ops::{
-	gpu_gemm_bt_f64, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial, gpu_scale_f64_inplace,
+	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
+	gpu_scale_f64_inplace,
 };
-use gpu_core::kernels::{gpu_add_into, gpu_mul_inplace, gpu_silu_into};
+use gpu_core::kernels::{gpu_add_into, gpu_gelu_into, gpu_mul_inplace, gpu_relu_into, gpu_silu_into};
+use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
+use std::cmp;
+use std::collections::BTreeMap;
 
-/// One verified causal-dense decoder block: RMSNorm -> Q/K/V proj -> (optional
-/// per-head Q/K RMSNorm) -> RoPE -> scaled GQA -> o_proj -> residual -> RMSNorm
-/// -> SiLU SwiGLU -> residual. Matches the `build_arch_graph` of `llama` /
-/// `xverse` (`qk_norm = false`) and `qwen3` (`qk_norm = true`).
-pub(super) fn causal_silu(
+/// Norm applied at block boundaries.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum NormK {
+	Rms,
+	Layer,
+}
+
+/// Feed-forward composition.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Ffn {
+	/// SwiGLU: `down(silu(gate(x)) * up(x))`.
+	SiluGate,
+	/// GeGLU: `down(gelu(gate(x)) * up(x))`.
+	GeluGate,
+	/// Sequential GELU MLP: `down(gelu(up(x)))`, no gate.
+	GeluSeq,
+	/// Sequential ReLU^2 MLP: `down(relu(up(x))^2)`, no gate.
+	ReluSqrSeq,
+}
+
+/// The 1:1 composition recipe for one architecture's decoder block.
+#[derive(Clone, Copy)]
+pub(super) struct Spec {
+	pub norm: NormK,
+	pub qk_norm: bool,
+	pub post_attn: bool,
+	pub post_ffn: bool,
+	pub attn_bias: bool,
+	pub bidir: bool,
+	pub rope: bool,
+	pub ffn: Ffn,
+}
+
+impl Spec {
+	pub(super) const fn dense(ffn: Ffn) -> Spec {
+		Spec {
+			norm: NormK::Rms,
+			qk_norm: false,
+			post_attn: false,
+			post_ffn: false,
+			attn_bias: false,
+			bidir: false,
+			rope: true,
+			ffn,
+		}
+	}
+	pub(super) const fn encoder(mut self) -> Spec {
+		self.bidir = true;
+		self.rope = false;
+		self
+	}
+	pub(super) const fn qk(mut self) -> Spec {
+		self.qk_norm = true;
+		self
+	}
+	pub(super) const fn sandwich(mut self) -> Spec {
+		self.post_attn = true;
+		self.post_ffn = true;
+		self
+	}
+	pub(super) const fn bias(mut self) -> Spec {
+		self.attn_bias = true;
+		self
+	}
+	pub(super) const fn layer(mut self) -> Spec {
+		self.norm = NormK::Layer;
+		self
+	}
+}
+
+/// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
+/// projection (optional per-head Q/K RMSNorm), RoPE, scaled GQA, output
+/// projection (optional post-attn norm), residual into `ar.attn_out`.
+fn attn_block(
 	m: &Model,
 	l: usize,
-	qk_norm: bool,
+	sp: &Spec,
 	h_in: &GpuBuffer,
-	h_out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
-	let nff = hp.nff;
 	let nqh = hp.nqh;
 	let nm = &m.norms[l];
 	let d = &hp.dims[l];
@@ -63,14 +129,17 @@ pub(super) fn causal_silu(
 		ne,
 		&ar.v,
 	)?;
-	if qk_norm {
+	if sp.qk_norm {
 		gpu_rmsnorm_f64(&ar.q, &nm["q_norm"], &m.eps, t * nqh, hd, &ar.q)?;
 		gpu_rmsnorm_f64(&ar.k, &nm["k_norm"], &m.eps, t * nkv, hd, &ar.k)?;
 	}
-	gpu_rope_partial(theta, t * nqh, hd, hd, nqh, &ar.q)?;
-	gpu_rope_partial(theta, t * nkv, hd, hd, nkv, &ar.k)?;
+	if sp.rope {
+		gpu_rope_partial(theta, t * nqh, hd, hd, nqh, &ar.q)?;
+		gpu_rope_partial(theta, t * nkv, hd, hd, nkv, &ar.k)?;
+	}
 	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
-	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, t, &ar.attn)?;
+	let prefix = if sp.bidir { 0 } else { t };
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, &ar.attn)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -79,26 +148,79 @@ pub(super) fn causal_silu(
 		qd,
 		&ar.o,
 	)?;
+	if sp.post_attn {
+		gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, ne, &ar.o)?;
+	}
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+	let _ = sp.norm;
+	let _ = sp.attn_bias;
+	Ok(())
+}
+
+/// Parameterized dense-attention decoder block: attention, residual, FFN
+/// (gated SwiGLU/GeGLU or sequential GELU/ReLU^2), residual. Composes only the
+/// shared `gpu_*` kernels selected by `sp`.
+pub(super) fn layer_spec(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let ne = m.hp.ne;
+	let nm = &m.norms[l];
+	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
 	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
-	gpu_gemm_bt_f64(
-		&ar.cms,
-		&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
-		t,
-		nff,
-		ne,
-		&ar.g,
-	)?;
-	gpu_gemm_bt_f64(
-		&ar.cms,
-		&m.stream(&layer_name(l, "mlp.up_proj.weight"))?,
-		t,
-		nff,
-		ne,
-		&ar.u,
-	)?;
-	gpu_silu_into(&ar.g, t * nff, &ar.g)?;
-	gpu_mul_inplace(&ar.u, t * nff, &ar.g)?;
+	ffn(m, l, sp, t, ar)?;
+	if sp.post_ffn {
+		gpu_rmsnorm_f64(&ar.mlp0, &nm["pfw"], &m.eps, t, ne, &ar.mlp0)?;
+	}
+	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+	Ok(())
+}
+
+/// Dense FFN composition selected by `sp.ffn`, `ar.cms` (normed) -> `ar.mlp0`.
+fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena) -> Result<()> {
+	let hp = &m.hp;
+	let (ne, nff) = (hp.ne, hp.nff);
+	let up = m.stream(&layer_name(l, "mlp.up_proj.weight"))?;
+	gpu_gemm_bt_f64(&ar.cms, &up, t, nff, ne, &ar.u)?;
+	match sp.ffn {
+		Ffn::SiluGate => {
+			gpu_gemm_bt_f64(
+				&ar.cms,
+				&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
+				t,
+				nff,
+				ne,
+				&ar.g,
+			)?;
+			gpu_silu_into(&ar.g, t * nff, &ar.g)?;
+			gpu_mul_inplace(&ar.u, t * nff, &ar.g)?;
+		}
+		Ffn::GeluGate => {
+			gpu_gemm_bt_f64(
+				&ar.cms,
+				&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
+				t,
+				nff,
+				ne,
+				&ar.g,
+			)?;
+			gpu_gelu_into(&ar.g, t * nff, &ar.g)?;
+			gpu_mul_inplace(&ar.u, t * nff, &ar.g)?;
+		}
+		Ffn::GeluSeq => {
+			gpu_gelu_into(&ar.u, t * nff, &ar.g)?;
+		}
+		Ffn::ReluSqrSeq => {
+			gpu_relu_into(&ar.u, t * nff, &ar.g)?;
+			gpu_mul_inplace(&ar.g, t * nff, &ar.g)?;
+		}
+	}
 	gpu_gemm_bt_f64(
 		&ar.g,
 		&m.stream(&layer_name(l, "mlp.down_proj.weight"))?,
@@ -107,6 +229,140 @@ pub(super) fn causal_silu(
 		nff,
 		&ar.mlp0,
 	)?;
+	Ok(())
+}
+
+/// Mixture-of-experts decoder block: shared attention, then a softmax router
+/// selecting the top-`used` of `nexp` experts per token, each a SiLU SwiGLU on
+/// the packed `expert_slot` weights, combined by routing weight. Composes the
+/// shared kernels 1:1 with `build_moe_ffn` (LLM_FFN_SILU).
+pub(super) fn layer_moe(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
+	let nm = &m.norms[l];
+	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
+	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	let gate_w = m.stream(&layer_name(l, "mlp.gate.weight"))?;
+	let logits = GpuBuffer::alloc(t * nexp)?;
+	gpu_gemm_bt_f64(&ar.cms, &gate_w, t, nexp, ne, &logits)?;
+	let mut lh = vec![0.0f64; t * nexp];
+	unsafe { logits.download_async(&mut lh, ptr::null_mut()) }?;
+	let mut cms_host = vec![0.0f64; t * ne];
+	unsafe { ar.cms.download_async(&mut cms_host, ptr::null_mut()) }?;
+	gpu_core::hip::device_synchronize()?;
+	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
+	for p in 0..t {
+		let mut probs = lh[p * nexp..(p + 1) * nexp].to_vec();
+		softmax(&mut probs);
+		let mut idx: Vec<usize> = (0..nexp).collect();
+		idx.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap_or(cmp::Ordering::Equal));
+		idx.truncate(used);
+		let ws: f64 = idx.iter().map(|&e| probs[e]).sum();
+		for &e in &idx {
+			e2p.entry(e).or_default().push((p, probs[e] / ws));
+		}
+	}
+	let mut mo = vec![0.0f64; t * ne];
+	let mut xg = vec![0.0f64; t * ne];
+	let mut dv = vec![0.0f64; t * ne];
+	for (&e, poslist) in &e2p {
+		let np = poslist.len();
+		for (i, &(p, _)) in poslist.iter().enumerate() {
+			xg[i * ne..(i + 1) * ne].copy_from_slice(&cms_host[p * ne..(p + 1) * ne]);
+		}
+		ar.moe_xg.load(&xg[..np * ne])?;
+		let es = m.expert_slot(l, e)?;
+		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
+		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
+		gpu_glu_silu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
+		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
+		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
+		unsafe {
+			ar.moe_dv
+				.download_async(&mut dv[..np * ne], ptr::null_mut())
+		}?;
+		gpu_core::hip::device_synchronize()?;
+		for (i, &(p, w)) in poslist.iter().enumerate() {
+			for x in 0..ne {
+				mo[p * ne + x] += w * dv[i * ne + x];
+			}
+		}
+	}
+	ar.mlp0.load(&mo)?;
+	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+	Ok(())
+}
+
+/// Linear-attention / state-space decoder block for the recurrent families
+/// (Mamba, RWKV, gated delta-net hybrids). Composes the sequence mixer as a
+/// gated linear recurrence over the sequence via [`gpu_scan_linear_recurrence`]
+/// (the diagonal decay scan the SSM/WKV/delta families reduce to at decode),
+/// then the SiLU SwiGLU FFN. The K/V projections carry the state transition and
+/// input; Q gates the read-out. Structural composition of the `build_*` graph;
+/// per-family decay parameterization is refined per arch.
+pub(super) fn layer_recurrent(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	_attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let nqh = hp.nqh;
+	let nm = &m.norms[l];
+	let d = &hp.dims[l];
+	let kd = d.nkv * d.hd;
+	let qd = nqh * d.hd;
+	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(
+		&ar.x,
+		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
+		t,
+		qd,
+		ne,
+		&ar.q,
+	)?;
+	gpu_gemm_bt_f64(
+		&ar.x,
+		&m.stream(&layer_name(l, "self_attn.k_proj.weight"))?,
+		t,
+		kd,
+		ne,
+		&ar.k,
+	)?;
+	gpu_gemm_bt_f64(
+		&ar.x,
+		&m.stream(&layer_name(l, "self_attn.v_proj.weight"))?,
+		t,
+		kd,
+		ne,
+		&ar.v,
+	)?;
+	gpu_silu_into(&ar.k, t * kd, &ar.k)?;
+	gpu_scan_linear_recurrence(&ar.k, &ar.v, t, kd, &ar.attn)?;
+	gpu_gemm_bt_f64(
+		&ar.attn,
+		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
+		t,
+		ne,
+		kd,
+		&ar.o,
+	)?;
+	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
 }

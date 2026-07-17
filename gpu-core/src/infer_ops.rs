@@ -70,6 +70,13 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void);
+	fn launch_glu_silu(
+		input: *const c_void,
+		out: *mut c_void,
+		rows: i32,
+		half: i32,
+		stream: *mut c_void,
+	);
 }
 
 /// # Errors
@@ -231,6 +238,28 @@ pub fn gpu_glu_gelu(
 	// SAFETY: input and out outlive this synchronous launch and rows and half match their sizes.
 	unsafe {
 		launch_glu_gelu(
+			input.ptr_raw().cast_const(),
+			out.ptr_raw(),
+			ci(rows)?,
+			ci(half)?,
+			ptr::null_mut(),
+		);
+	}
+	return cl();
+}
+
+/// # Errors
+/// Returns [`HipError`] if `rows` or `half` overflows `i32` or the launch fails.
+#[inline]
+pub fn gpu_glu_silu(
+	input: &GpuBuffer,
+	rows: usize,
+	half: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: input and out outlive this synchronous launch and rows and half match their sizes.
+	unsafe {
+		launch_glu_silu(
 			input.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			ci(rows)?,

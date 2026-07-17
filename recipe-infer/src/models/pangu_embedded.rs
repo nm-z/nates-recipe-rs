@@ -1,4 +1,4 @@
-//! `xverse`: 1:1 dense composition (see llama.cpp/src/models/xverse.cpp).
+//! `pangu_embedded`: 1:1 composition (see llama.cpp/src/models/pangu_embedded.cpp).
 use super::common::{Ffn, Spec, layer_spec};
 use super::super::{Arena, Model};
 use anyhow::Result;

@@ -1,9 +1,10 @@
-//! `llama`: graph verified 1:1 against llama.cpp/src/models/llama.cpp
-//! (llama). RMSNorm, causal GQA + RoPE, SiLU SwiGLU, no bias.
-use super::common::causal_silu;
+//! `llama`: 1:1 dense composition (see llama.cpp/src/models/llama.cpp).
+use super::common::{Ffn, Spec, layer_spec};
 use super::super::{Arena, Model};
 use anyhow::Result;
 use gpu_core::memory::GpuBuffer;
+
+const SPEC: Spec = Spec::dense(Ffn::SiluGate);
 
 pub(super) fn layer(
 	m: &Model,
@@ -14,5 +15,5 @@ pub(super) fn layer(
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
 ) -> Result<()> {
-	causal_silu(m, l, false, h_in, h_out, t, ar, attn_scale)
+	layer_spec(m, l, &SPEC, h_in, h_out, t, ar, attn_scale)
 }

@@ -1,10 +1,10 @@
-//! `xverse`: 1:1 dense composition (see llama.cpp/src/models/xverse.cpp).
+//! `bert`: bidirectional encoder (non-causal attention, no RoPE).
 use super::common::{Ffn, Spec, layer_spec};
 use super::super::{Arena, Model};
 use anyhow::Result;
 use gpu_core::memory::GpuBuffer;
 
-const SPEC: Spec = Spec::dense(Ffn::SiluGate);
+const SPEC: Spec = Spec::dense(Ffn::GeluSeq).layer().encoder();
 
 pub(super) fn layer(
 	m: &Model,

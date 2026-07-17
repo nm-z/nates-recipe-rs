@@ -1,10 +1,10 @@
-//! `xverse`: 1:1 dense composition (see llama.cpp/src/models/xverse.cpp).
+//! `llama-embed`: 1:1 composition (see llama.cpp/src/models/llama-embed.cpp).
 use super::common::{Ffn, Spec, layer_spec};
 use super::super::{Arena, Model};
 use anyhow::Result;
 use gpu_core::memory::GpuBuffer;
 
-const SPEC: Spec = Spec::dense(Ffn::SiluGate);
+const SPEC: Spec = Spec::dense(Ffn::SiluGate).encoder();
 
 pub(super) fn layer(
 	m: &Model,
