@@ -14,6 +14,7 @@ use gpu_core::infer_ops::{
 use gpu_core::kernels::{
 	gpu_add_into, gpu_bias_add, gpu_concat_into, gpu_gelu_into, gpu_layernorm_opt_into,
 	gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols, gpu_slice_lead_into,
+	gpu_ssm_conv_causal_silu, gpu_ssm_scan_mamba1,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -608,5 +609,85 @@ pub(super) fn layer_recurrent(
 	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
 	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar, &ar.cms)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+	Ok(())
+}
+
+/// The named per-layer SSM parameter buffer for layer `l`, or an error naming
+/// the missing tensor (a load gap fails that model's row, never panics a sweep).
+fn ssm_of<'m>(
+	buf: &'m [Option<GpuBuffer>],
+	l: usize,
+	arch: &str,
+	name: &str,
+) -> Result<&'m GpuBuffer> {
+	buf.get(l)
+		.and_then(|o| o.as_ref())
+		.ok_or_else(|| anyhow!("{arch}: layer {l} has no {name} SSM tensor"))
+}
+
+/// Mamba-1 selective-SSM decoder block (llama.cpp mamba-base.cpp:7-147): block
+/// pre-norm, `in_proj` split into `x`/`z`, causal depthwise conv + SiLU on `x`,
+/// the `ssm_x` low-rank projection split into `dt`/`B`/`C`, the `ssm_dt`
+/// up-projection with bias, the fused selective scan (softplus/exp/B/C/D folded
+/// in [`gpu_ssm_scan_mamba1`]), the `SiLU(z)` gate, `out_proj`, and the residual.
+/// No FFN and no attention: the block IS the mixer. All scratch is arena-resident,
+/// so the decode loop allocates nothing.
+pub(super) fn layer_mamba(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	let hp = &m.hp;
+	let arch = hp.arch.as_str();
+	let ne = hp.ne;
+	let di = hp.ssm_d_inner;
+	let ds = hp.ssm_d_state;
+	let dr = hp.ssm_dt_rank;
+	let dc = hp.ssm_d_conv;
+	let dbw = dr + 2 * ds;
+	if hp.ssm_n_group != 1 {
+		return Err(anyhow!(
+			"{arch}: mamba-1 block expects a single selective group, got n_group={}",
+			hp.ssm_n_group
+		));
+	}
+	if hp.ssm_dt_b_c_rms || m.norms[l].contains_key("ssm_dt_norm") {
+		return Err(anyhow!("{arch}: dt/B/C RMSNorm mamba variant not wired"));
+	}
+
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+
+	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, di * ne), t, di, ne, &ar.ss_x)?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(di * ne, di * ne), t, di, ne, &ar.ss_z)?;
+
+	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
+	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
+	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, conv_b, t, di, dc, &ar.ss_xc)?;
+
+	let w_x = m.stream(&layer_name(l, "self_attn.ssm_x.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_xc, &w_x, t, dbw, di, &ar.ss_db)?;
+	gpu_slice_cols(&ar.ss_db, t, dbw, 0, dr, &ar.ss_dtlr)?;
+	gpu_slice_cols(&ar.ss_db, t, dbw, dr, ds, &ar.ss_bb)?;
+	gpu_slice_cols(&ar.ss_db, t, dbw, dr + ds, ds, &ar.ss_cc)?;
+
+	let w_dt = m.stream(&layer_name(l, "self_attn.ssm_dt.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_dtlr, &w_dt, t, di, dr, &ar.ss_dt)?;
+	let dt_b = ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?;
+	gpu_bias_add(&ar.ss_dt, dt_b, t, di, &ar.ss_dt)?;
+
+	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
+	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
+	gpu_ssm_scan_mamba1(&ar.ss_xc, &ar.ss_dt, a, &ar.ss_bb, &ar.ss_cc, d, t, di, ds, &ar.ss_y)?;
+
+	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
+	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
+
+	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * ne, h_out)?;
 	Ok(())
 }

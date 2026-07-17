@@ -24,7 +24,7 @@ fn verified_is_a_measured_subset_of_composable() {
 
 #[test]
 fn composable_but_unverified_is_not_supported() {
-	for arch in ["mamba", "rwkv6", "t5", "deepseek32", "falcon", "qwen35"] {
+	for arch in ["mamba2", "rwkv6", "t5", "deepseek32", "falcon", "qwen35"] {
 		assert!(
 			arch_composable(arch),
 			"{arch} is in the dispatch table and must be composable"

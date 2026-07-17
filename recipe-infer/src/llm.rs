@@ -373,6 +373,17 @@ struct Hparams {
 	embedding_scale: f64,
 	residual_scale: f64,
 	alibi_bias: f64,
+	/// Selective-SSM dims (mamba family), all zero for non-SSM arches:
+	/// `ssm_d_conv` conv kernel width, `ssm_d_inner` inner width (=2*ne for
+	/// mamba-1), `ssm_d_state` state size N, `ssm_dt_rank` low-rank dt width,
+	/// `ssm_n_group` selective B/C groups (0 read as 1), `ssm_dt_b_c_rms` the
+	/// FalconMamba/Jamba dt/B/C RMSNorm flag.
+	ssm_d_conv: usize,
+	ssm_d_inner: usize,
+	ssm_d_state: usize,
+	ssm_dt_rank: usize,
+	ssm_n_group: usize,
+	ssm_dt_b_c_rms: bool,
 	dims: Vec<LayerDims>,
 	win_elems: usize,
 	stage_bytes: usize,
@@ -450,6 +461,16 @@ impl Hparams {
 		let embedding_scale = f32_kv_or(g, &k("embedding_scale"), 0.0)?;
 		let residual_scale = f32_kv_or(g, &k("residual_scale"), 0.0)?;
 		let alibi_bias = f32_kv_or(g, &k("attention.max_alibi_bias"), 0.0)?;
+		let ssm_d_conv = uint_kv_or(g, &k("ssm.conv_kernel"), 0)?;
+		let ssm_d_inner = uint_kv_or(g, &k("ssm.inner_size"), 0)?;
+		let ssm_d_state = uint_kv_or(g, &k("ssm.state_size"), 0)?;
+		let ssm_dt_rank = uint_kv_or(g, &k("ssm.time_step_rank"), 0)?;
+		let ssm_n_group_raw = uint_kv_or(g, &k("ssm.group_count"), 0)?;
+		let ssm_n_group = if ssm_n_group_raw == 0 { 1 } else { ssm_n_group_raw };
+		let ssm_dt_b_c_rms = match g.kv.get(&k("ssm.dt_b_c_rms")) {
+			Some(Val::Bool(b)) => *b,
+			other => other.and_then(as_uint).map(|x| x != 0).unwrap_or(false),
+		};
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
 		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
@@ -530,7 +551,24 @@ impl Hparams {
 		} else {
 			0
 		};
-		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne).max(mla_win);
+		// SSM projections can be wider than any attention/FFN weight (mamba's
+		// ssm_in is 2*d_inner*ne), so the widen window must cover them too.
+		let ssm_win = if ssm_d_inner > 0 {
+			[
+				2 * ssm_d_inner * ne,
+				(ssm_dt_rank + 2 * ssm_d_state) * ssm_d_inner,
+				ne * ssm_d_inner,
+				ssm_d_inner * ssm_dt_rank,
+			]
+			.into_iter()
+			.max()
+			.unwrap_or(0)
+		} else {
+			0
+		};
+		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne)
+			.max(mla_win)
+			.max(ssm_win);
 		let lm_chunk = win_elems / ne;
 		let stage_bytes = (win_elems * 2).max(slot_bytes);
 
@@ -568,6 +606,12 @@ impl Hparams {
 			embedding_scale,
 			residual_scale,
 			alibi_bias,
+			ssm_d_conv,
+			ssm_d_inner,
+			ssm_d_state,
+			ssm_dt_rank,
+			ssm_n_group,
+			ssm_dt_b_c_rms,
 			dims,
 			qd_max,
 			kd_max,
@@ -756,6 +800,19 @@ struct Arena {
 	mkk: GpuBuffer,
 	mrw: GpuBuffer,
 	mav: GpuBuffer,
+	/// Selective-SSM scratch (mamba family). Sized `1` for non-SSM arches.
+	/// `ss_x`/`ss_z` the in_proj split, `ss_xc` conv+SiLU output, `ss_db` the
+	/// ssm_x projection [dt_lr|B|C], `ss_dtlr`/`ss_bb`/`ss_cc` its column slices,
+	/// `ss_dt` the projected time-step, `ss_y` the scan readout.
+	ss_x: GpuBuffer,
+	ss_z: GpuBuffer,
+	ss_xc: GpuBuffer,
+	ss_db: GpuBuffer,
+	ss_dtlr: GpuBuffer,
+	ss_bb: GpuBuffer,
+	ss_cc: GpuBuffer,
+	ss_dt: GpuBuffer,
+	ss_y: GpuBuffer,
 }
 
 impl Arena {
@@ -811,6 +868,15 @@ impl Arena {
 			mkk: a((t * (hp.kv_lora_rank + hp.n_rot)).max(1))?,
 			mrw: a((t * hp.nqh * hp.kv_lora_rank).max(1))?,
 			mav: a((t * hp.nqh * hp.head_v_mla).max(1))?,
+			ss_x: a((t * hp.ssm_d_inner).max(1))?,
+			ss_z: a((t * hp.ssm_d_inner).max(1))?,
+			ss_xc: a((t * hp.ssm_d_inner).max(1))?,
+			ss_db: a((t * (hp.ssm_dt_rank + 2 * hp.ssm_d_state)).max(1))?,
+			ss_dtlr: a((t * hp.ssm_dt_rank).max(1))?,
+			ss_bb: a((t * hp.ssm_d_state).max(1))?,
+			ss_cc: a((t * hp.ssm_d_state).max(1))?,
+			ss_dt: a((t * hp.ssm_d_inner).max(1))?,
+			ss_y: a((t * hp.ssm_d_inner).max(1))?,
 		})
 	}
 }
@@ -855,6 +921,15 @@ struct Model {
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
 	ls_dev: Vec<GpuBuffer>,
+	/// Per-layer selective-SSM parameters loaded as f64 device buffers (mamba
+	/// family): `ssm_conv_w` `[d_inner, d_conv]` channel-major, `ssm_conv_b`
+	/// `[d_inner]`, `ssm_a` `[d_inner, d_state]` channel-major (used directly),
+	/// `ssm_d` `[d_inner]`, `ssm_dt_b` `[d_inner]`. Empty for non-SSM layers.
+	ssm_conv_w: Vec<Option<GpuBuffer>>,
+	ssm_conv_b: Vec<Option<GpuBuffer>>,
+	ssm_a: Vec<Option<GpuBuffer>>,
+	ssm_d: Vec<Option<GpuBuffer>>,
+	ssm_dt_b: Vec<Option<GpuBuffer>>,
 	hp: Hparams,
 }
 
@@ -1168,6 +1243,18 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("ffn_gate_inp.scale", "router.scale"),
 	("ffn_down_exps.scale", "router.per_expert_scale"),
 	("layer_output_scale.weight", "layer_scalar"),
+	("ssm_in.weight", "self_attn.ssm_in.weight"),
+	("ssm_conv1d.weight", "self_attn.ssm_conv1d.weight"),
+	("ssm_conv1d.bias", "self_attn.ssm_conv1d.bias"),
+	("ssm_x.weight", "self_attn.ssm_x.weight"),
+	("ssm_dt.weight", "self_attn.ssm_dt.weight"),
+	("ssm_dt.bias", "self_attn.ssm_dt.bias"),
+	("ssm_a", "self_attn.ssm_a"),
+	("ssm_d", "self_attn.ssm_d"),
+	("ssm_out.weight", "self_attn.ssm_out.weight"),
+	("ssm_dt_norm.weight", "self_attn.ssm_dt_norm.weight"),
+	("ssm_b_norm.weight", "self_attn.ssm_b_norm.weight"),
+	("ssm_c_norm.weight", "self_attn.ssm_c_norm.weight"),
 ];
 
 /// How a neutral tensor sources from a fused gguf tensor: a named row-subrange
@@ -1378,6 +1465,11 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		theta_full,
 		theta_slide,
 		ls_dev: Vec::new(),
+		ssm_conv_w: Vec::new(),
+		ssm_conv_b: Vec::new(),
+		ssm_a: Vec::new(),
+		ssm_d: Vec::new(),
+		ssm_dt_b: Vec::new(),
 		hp,
 	};
 
@@ -1440,6 +1532,11 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			ub.load(&[lsv])?;
 			ub
 		});
+		m.ssm_conv_w.push(opt_bias(&m, p("self_attn.ssm_conv1d.weight"))?);
+		m.ssm_conv_b.push(opt_bias(&m, p("self_attn.ssm_conv1d.bias"))?);
+		m.ssm_a.push(opt_bias(&m, p("self_attn.ssm_a"))?);
+		m.ssm_d.push(opt_bias(&m, p("self_attn.ssm_d"))?);
+		m.ssm_dt_b.push(opt_bias(&m, p("self_attn.ssm_dt.bias"))?);
 	}
 
 	Write::line(data, "globals + embedding table");
@@ -1526,7 +1623,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 /// and a fused-qkv model contributes the synthesized q/k/v — the required set
 /// derives from the composition, never a fixed per-arch list.
 fn fixed_names(m: &Model, l: usize) -> Vec<String> {
-	const ROLES: [&str; 13] = [
+	const ROLES: [&str; 17] = [
 		"self_attn.q_proj.weight",
 		"self_attn.k_proj.weight",
 		"self_attn.v_proj.weight",
@@ -1540,6 +1637,10 @@ fn fixed_names(m: &Model, l: usize) -> Vec<String> {
 		"mlp.gate_proj.weight",
 		"mlp.up_proj.weight",
 		"mlp.down_proj.weight",
+		"self_attn.ssm_in.weight",
+		"self_attn.ssm_x.weight",
+		"self_attn.ssm_dt.weight",
+		"self_attn.ssm_out.weight",
 	];
 	ROLES
 		.iter()

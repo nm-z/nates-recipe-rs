@@ -1581,6 +1581,29 @@ unsafe extern "C" {
 		lout: i32,
 		stream: *mut c_void,
 	);
+	fn launch_ssm_conv_causal_silu(
+		x: *const c_void,
+		conv_w: *const c_void,
+		bias: *const c_void,
+		out: *mut c_void,
+		t: i32,
+		d_inner: i32,
+		d_conv: i32,
+		stream: *mut c_void,
+	);
+	fn launch_ssm_scan_mamba1(
+		xc: *const c_void,
+		dt: *const c_void,
+		a: *const c_void,
+		b: *const c_void,
+		c: *const c_void,
+		d: *const c_void,
+		y: *mut c_void,
+		t: i32,
+		d_inner: i32,
+		d_state: i32,
+		stream: *mut c_void,
+	);
 }
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -4876,6 +4899,84 @@ pub fn gpu_bias_add(
 			out.ptr.cast::<c_void>(),
 			ci(rows)?,
 			ci(cols)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Causal depthwise conv1d + per-channel bias + SiLU, token-major in/out.
+/// `x`/`out` are `[t, d_inner]` token-major; `conv_w` is `[d_inner, d_conv]`
+/// channel-major (tap-contiguous). The conv is per-channel over time with an
+/// implicit `(d_conv-1)` left zero-pad, matching ggml_ssm_conv on a zeroed
+/// state prefix. Fused, so the SSM conv step costs one launch and no allocation.
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+pub fn gpu_ssm_conv_causal_silu(
+	x: &GpuBuffer,
+	conv_w: &GpuBuffer,
+	bias: &GpuBuffer,
+	t: usize,
+	d_inner: usize,
+	d_conv: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_ssm_conv_causal_silu(
+			x.ptr.cast_const(),
+			conv_w.ptr.cast_const(),
+			bias.ptr.cast_const(),
+			out.ptr,
+			ci(t)?,
+			ci(d_inner)?,
+			ci(d_conv)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Fused Mamba-1 selective scan (ggml-cuda/ssm-scan.cu:83-113). One thread per
+/// inner channel holds an `N=d_state` private state across the whole `t` loop,
+/// folding softplus(dt), exp(dt*A), the B/x accumulate, the C readout and the D
+/// skip. `xc`/`dt`/`y` are `[t, d_inner]` token-major; `a` is `[d_inner, d_state]`
+/// channel-major used directly (already `-exp(A_log)`); `b`/`c` are `[t, d_state]`
+/// single-group; `d` is `[d_inner]`.
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_ssm_scan_mamba1(
+	xc: &GpuBuffer,
+	dt: &GpuBuffer,
+	a: &GpuBuffer,
+	b: &GpuBuffer,
+	c: &GpuBuffer,
+	d: &GpuBuffer,
+	t: usize,
+	d_inner: usize,
+	d_state: usize,
+	y: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_ssm_scan_mamba1(
+			xc.ptr.cast_const(),
+			dt.ptr.cast_const(),
+			a.ptr.cast_const(),
+			b.ptr.cast_const(),
+			c.ptr.cast_const(),
+			d.ptr.cast_const(),
+			y.ptr,
+			ci(t)?,
+			ci(d_inner)?,
+			ci(d_state)?,
 			ptr::null_mut(),
 		);
 	}
