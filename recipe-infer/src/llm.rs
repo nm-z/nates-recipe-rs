@@ -252,6 +252,27 @@ fn uint_arr(g: &Gguf, key: &str) -> Result<Vec<usize>> {
 	}
 }
 
+/// Per-layer unsigned hparam: a scalar broadcasts to all `nl` layers; an array
+/// must have exactly `nl` elements. Mirrors llama.cpp `get_key_or_arr` (the
+/// `n_head_arr`/`n_ff_arr` reads), so hybrid archs that store `head_count` /
+/// `feed_forward_length` per layer parse through the same shared vocabulary a
+/// scalar arch broadcasts unchanged. `default` is used only when the key is absent.
+fn uint_or_arr(g: &Gguf, key: &str, nl: usize, default: usize) -> Result<Vec<usize>> {
+	match g.kv.get(key) {
+		None => Ok(vec![default; nl]),
+		Some(Val::Arr(_items)) => {
+			let v = uint_arr(g, key)?;
+			anyhow::ensure!(
+				v.len() == nl,
+				"gguf: kv {key} array len {} != block_count {nl}",
+				v.len()
+			);
+			Ok(v)
+		}
+		Some(_scalar) => Ok(vec![uint_kv(g, key)?; nl]),
+	}
+}
+
 fn bool_arr(g: &Gguf, key: &str) -> Result<Vec<bool>> {
 	match g.kv.get(key) {
 		Some(Val::Arr(items)) => items
@@ -276,6 +297,8 @@ fn str_kv(g: &Gguf, key: &str) -> Result<String> {
 
 struct LayerDims {
 	hd: usize,
+	nqh: usize,
+	nff: usize,
 	nkv: usize,
 	rotary: usize,
 	has_v: bool,
@@ -322,11 +345,16 @@ impl Hparams {
 		let k = |s: &str| format!("{arch}.{s}");
 		let nl = uint_kv(g, &k("block_count"))?;
 		let ne = uint_kv(g, &k("embedding_length"))?;
-		let nff = uint_kv(g, &k("feed_forward_length"))?;
-		let nffe = uint_kv_or(g, &k("expert_feed_forward_length"), 0)?;
+		let n_ff_arr = uint_or_arr(g, &k("feed_forward_length"), nl, 0)?;
+		let nff = n_ff_arr.iter().copied().max().unwrap_or(0);
+		let mut nffe = uint_kv_or(g, &k("expert_feed_forward_length"), 0)?;
 		let nexp = uint_kv_or(g, &k("expert_count"), 0)?;
+		if nexp > 0 && nffe == 0 {
+			nffe = expert_ff_from_tensors(g, nl);
+		}
 		let used = uint_kv_or(g, &k("expert_used_count"), 0)?;
-		let nqh = uint_kv(g, &k("attention.head_count"))?;
+		let n_head_arr = uint_or_arr(g, &k("attention.head_count"), nl, 0)?;
+		let nqh = n_head_arr.iter().copied().max().unwrap_or(0);
 		// llama.cpp default: head dim = embedding_length / head_count when the
 		// explicit key_length/value_length keys are absent (minimal GGUFs).
 		let head_dim_default = if nqh > 0 { ne / nqh } else { 0 };
@@ -400,6 +428,8 @@ impl Hparams {
 			};
 			dims.push(LayerDims {
 				hd,
+				nqh: n_head_arr[l],
+				nff: n_ff_arr[l],
 				nkv: head_count_kv[l],
 				rotary,
 				has_v,
@@ -410,7 +440,7 @@ impl Hparams {
 		let kd_max = dims.iter().map(|d| d.nkv * d.hd).max().unwrap_or(0);
 		let qd_max = dims
 			.iter()
-			.map(|d| nqh * d.hd)
+			.map(|d| d.nqh * d.hd)
 			.max()
 			.unwrap_or(nqh * key_length);
 		let gu_bytes = 2 * nffe * ne * 2;
@@ -461,6 +491,23 @@ impl Hparams {
 
 fn bf16(h: u16) -> f64 {
 	f32::from_bits((h as u32) << 16) as f64
+}
+
+/// Expert feed-forward width taken from the expert weight tensor's own shape, for
+/// models that omit or zero `expert_feed_forward_length` in metadata. Gate experts
+/// are `[n_embd, n_ff_exp, n_expert]`, a fused gate+up tensor `[n_embd, 2*n_ff_exp,
+/// n_expert]`; the first block carrying experts wins (dense-lead layers have none).
+/// Ground truth from the tensor, never a guessed constant.
+fn expert_ff_from_tensors(g: &Gguf, nl: usize) -> usize {
+	for l in 0..nl {
+		if let Some(ti) = g.tensors.get(&format!("blk.{l}.ffn_gate_exps.weight")) {
+			return ti.dims.get(1).copied().unwrap_or(0);
+		}
+		if let Some(ti) = g.tensors.get(&format!("blk.{l}.ffn_gate_up_exps.weight")) {
+			return ti.dims.get(1).map_or(0, |d| d / 2);
+		}
+	}
+	0
 }
 
 static DISK_NS: AtomicU64 = AtomicU64::new(0);
@@ -806,9 +853,51 @@ impl Model {
 		}
 	}
 
+	/// True if layer `l` carries expert tensors (fused or separate gate/up). The
+	/// dense-vs-MoE choice is per layer and presence-driven, so a model with a
+	/// dense-lead prefix (e.g. deepseek) routes each layer correctly with no
+	/// per-arch code.
+	fn layer_is_moe(&self, l: usize) -> bool {
+		self.big.contains_key(&layer_name(l, "experts.gate_proj"))
+			|| self.big.contains_key(&layer_name(l, "experts.gate_up_proj"))
+	}
+
+	/// Composes expert `e` of layer `l` into `dst` as the packed slot
+	/// `[gate | up | down]`, sourcing gate+up from either one fused
+	/// `experts.gate_up_proj` tensor or the separate `experts.gate_proj` and
+	/// `experts.up_proj` tensors (llama.cpp's two expert storage layouts).
+	fn fill_expert(&self, l: usize, e: usize, dst: &mut [u8]) -> Result<()> {
+		let (gu_bytes, dn_bytes, half) =
+			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.dn_bytes);
+		if let Some(gu) = self.big.get(&layer_name(l, "experts.gate_up_proj")) {
+			self.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])?;
+		} else {
+			let g = self
+				.big
+				.get(&layer_name(l, "experts.gate_proj"))
+				.ok_or_else(|| anyhow!("no expert gate {l}"))?;
+			let u = self
+				.big
+				.get(&layer_name(l, "experts.up_proj"))
+				.ok_or_else(|| anyhow!("no expert up {l}"))?;
+			self.read_host(g, e * half, &mut dst[..half])?;
+			self.read_host(u, e * half, &mut dst[half..gu_bytes])?;
+		}
+		let dn = self
+			.big
+			.get(&layer_name(l, "experts.down_proj"))
+			.ok_or_else(|| anyhow!("no expert down {l}"))?;
+		self.read_host(dn, e * dn_bytes, &mut dst[gu_bytes..])?;
+		Ok(())
+	}
+
 	fn expert_slot(&self, l: usize, e: usize) -> Result<GpuBuffer> {
-		let (gu_bytes, dn_bytes, slot_bytes) =
-			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.slot_bytes);
+		let (gu_bytes, dn_bytes, half, slot_bytes) = (
+			self.hp.gu_bytes,
+			self.hp.dn_bytes,
+			self.hp.dn_bytes,
+			self.hp.slot_bytes,
+		);
 		match self.store.home(&ekey(l, e)) {
 			Some(Home::Vram(dev)) => {
 				E_VRAM.fetch_add(1, Ordering::Relaxed);
@@ -821,15 +910,24 @@ impl Model {
 			}
 			_other => {
 				E_DISK.fetch_add(1, Ordering::Relaxed);
-				let gu = self
-					.big
-					.get(&layer_name(l, "experts.gate_up_proj"))
-					.ok_or_else(|| anyhow!("no gate_up {l}"))?;
+				if let Some(gu) = self.big.get(&layer_name(l, "experts.gate_up_proj")) {
+					self.read_into(gu, e * gu_bytes, gu_bytes, &self.stage, 0)?;
+				} else {
+					let g = self
+						.big
+						.get(&layer_name(l, "experts.gate_proj"))
+						.ok_or_else(|| anyhow!("no expert gate {l}"))?;
+					let u = self
+						.big
+						.get(&layer_name(l, "experts.up_proj"))
+						.ok_or_else(|| anyhow!("no expert up {l}"))?;
+					self.read_into(g, e * half, half, &self.stage, 0)?;
+					self.read_into(u, e * half, half, &self.stage, half)?;
+				}
 				let dn = self
 					.big
 					.get(&layer_name(l, "experts.down_proj"))
-					.ok_or_else(|| anyhow!("no down {l}"))?;
-				self.read_into(gu, e * gu_bytes, gu_bytes, &self.stage, 0)?;
+					.ok_or_else(|| anyhow!("no expert down {l}"))?;
 				self.read_into(dn, e * dn_bytes, dn_bytes, &self.stage, gu_bytes)?;
 				Ok(bview(&self.stage, 0, slot_bytes))
 			}
@@ -850,47 +948,87 @@ fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 	}
 }
 
+/// Flat gguf -> neutral tensor map for whole-model (non-per-block) tensors. The
+/// runtime composes the arch purely by resolving these transfers; no per-arch
+/// code decides where a tensor goes.
+const GLOBAL_MAP: &[(&str, &str)] = &[
+	("token_embd.weight", "embed_tokens.weight"),
+	("output.weight", "lm_head.weight"),
+	("output_norm.weight", "norm.weight"),
+	("self_cond_pre_norm.weight", "self_conditioning.pre_norm.weight"),
+	("self_cond_gate.weight", "self_conditioning.gate_proj.weight"),
+	("self_cond_up.weight", "self_conditioning.up_proj.weight"),
+	("self_cond_down.weight", "self_conditioning.down_proj.weight"),
+];
+
+/// Flat gguf `blk.N.<suffix>` -> neutral `layers.N.<suffix>` map. Norm-name
+/// variants (attn_norm vs input_layernorm, ffn_norm vs pre_feedforward, ...) and
+/// fused sources (attn_qkv, separate expert gate/up) are all vocabulary here;
+/// the loader adds nothing per arch. Fused `attn_qkv.weight` lands under one
+/// neutral fused role and [`SLICE_MAP`] then feeds q/k/v as row-subranges.
+const LAYER_MAP: &[(&str, &str)] = &[
+	("attn_norm.weight", "input_layernorm.weight"),
+	("post_attention_norm.weight", "post_attention_layernorm.weight"),
+	("attn_q_norm.weight", "self_attn.q_norm.weight"),
+	("attn_k_norm.weight", "self_attn.k_norm.weight"),
+	("ffn_norm.weight", "pre_feedforward_layernorm.weight"),
+	("post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"),
+	("pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
+	("post_ffw_norm_2.weight", "post_feedforward_layernorm_2.weight"),
+	("post_ffw_norm.weight", "post_feedforward_layernorm.weight"),
+	("attn_q.weight", "self_attn.q_proj.weight"),
+	("attn_k.weight", "self_attn.k_proj.weight"),
+	("attn_v.weight", "self_attn.v_proj.weight"),
+	("attn_output.weight", "self_attn.o_proj.weight"),
+	("attn_qkv.weight", "self_attn.qkv_proj.weight"),
+	("ffn_gate.weight", "mlp.gate_proj.weight"),
+	("ffn_up.weight", "mlp.up_proj.weight"),
+	("ffn_down.weight", "mlp.down_proj.weight"),
+	("ffn_gate_exps.weight", "experts.gate_proj"),
+	("ffn_up_exps.weight", "experts.up_proj"),
+	("ffn_gate_up_exps.weight", "experts.gate_up_proj"),
+	("ffn_down_exps.weight", "experts.down_proj"),
+	("ffn_gate_inp.weight", "router.proj.weight"),
+	("ffn_gate_inp.scale", "router.scale"),
+	("ffn_down_exps.scale", "router.per_expert_scale"),
+	("layer_output_scale.weight", "layer_scalar"),
+];
+
+/// How a neutral tensor sources from a fused gguf tensor: a named row-subrange
+/// whose split point is set by the layer's attention dims (`qd`, `kd`). This is
+/// the transfer description that lets one fused gguf tensor feed several roles.
+#[derive(Clone, Copy)]
+enum Slice {
+	QkvQ,
+	QkvK,
+	QkvV,
+}
+
+/// Derived neutral tensor <- fused source neutral tensor, sliced by [`Slice`].
+/// Resolved per layer in [`load_model_gguf`] once the dims are known, so a model
+/// shipping a fused `attn_qkv` transparently yields separate q/k/v projections.
+const SLICE_MAP: &[(&str, &str, Slice)] = &[
+	("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvQ),
+	("self_attn.k_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvK),
+	("self_attn.v_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvV),
+];
+
 fn hf_name(gg: &str) -> Option<String> {
-	let global = |n: &str| Some(format!("model.decoder.{n}"));
-	match gg {
-		"token_embd.weight" => return global("embed_tokens.weight"),
-		"output.weight" => return global("lm_head.weight"),
-		"output_norm.weight" => return global("norm.weight"),
-		"self_cond_pre_norm.weight" => return global("self_conditioning.pre_norm.weight"),
-		"self_cond_gate.weight" => return global("self_conditioning.gate_proj.weight"),
-		"self_cond_up.weight" => return global("self_conditioning.up_proj.weight"),
-		"self_cond_down.weight" => return global("self_conditioning.down_proj.weight"),
-		_other => {}
+	for (raw, neutral) in GLOBAL_MAP {
+		if gg == *raw {
+			return Some(format!("model.decoder.{neutral}"));
+		}
 	}
 	let rest = gg.strip_prefix("blk.")?;
 	let dot = rest.find('.')?;
 	let l: usize = rest[..dot].parse().ok()?;
-	let suf = match &rest[dot + 1..] {
-		"attn_norm.weight" => "input_layernorm.weight",
-		"post_attention_norm.weight" => "post_attention_layernorm.weight",
-		"attn_q_norm.weight" => "self_attn.q_norm.weight",
-		"attn_k_norm.weight" => "self_attn.k_norm.weight",
-		"ffn_norm.weight" => "pre_feedforward_layernorm.weight",
-		"post_ffw_norm_1.weight" => "post_feedforward_layernorm_1.weight",
-		"pre_ffw_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
-		"post_ffw_norm_2.weight" => "post_feedforward_layernorm_2.weight",
-		"post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
-		"attn_q.weight" => "self_attn.q_proj.weight",
-		"attn_k.weight" => "self_attn.k_proj.weight",
-		"attn_v.weight" => "self_attn.v_proj.weight",
-		"attn_output.weight" => "self_attn.o_proj.weight",
-		"ffn_gate.weight" => "mlp.gate_proj.weight",
-		"ffn_up.weight" => "mlp.up_proj.weight",
-		"ffn_down.weight" => "mlp.down_proj.weight",
-		"ffn_gate_up_exps.weight" => "experts.gate_up_proj",
-		"ffn_down_exps.weight" => "experts.down_proj",
-		"ffn_gate_inp.weight" => "router.proj.weight",
-		"ffn_gate_inp.scale" => "router.scale",
-		"ffn_down_exps.scale" => "router.per_expert_scale",
-		"layer_output_scale.weight" => "layer_scalar",
-		_other => return None,
-	};
-	Some(format!("model.decoder.layers.{l}.{suf}"))
+	let suffix = &rest[dot + 1..];
+	for (raw, neutral) in LAYER_MAP {
+		if suffix == *raw {
+			return Some(format!("model.decoder.layers.{l}.{neutral}"));
+		}
+	}
+	None
 }
 
 fn load_model_gguf(path: &Path) -> Result<Model> {
@@ -916,7 +1054,88 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 			},
 		);
 	}
+	synth_qkv_slices(&mut big, &hp);
+	synth_ffn_slices(&mut big, &hp);
 	finish_load(vec![f], big, hp)
+}
+
+/// Splits a fused gate+up FFN projection into separate `mlp.gate_proj` and
+/// `mlp.up_proj` when a gated model ships them stacked in one `ffn_up` tensor
+/// (phi3, glm4, chatglm): a `[2*nff]`-row up tensor with no gate becomes gate =
+/// rows `[0, nff)`, up = rows `[nff, 2*nff)`. Shape-driven, so nothing per-arch
+/// decides the split.
+fn synth_ffn_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
+	let nff = hp.nff;
+	for l in 0..hp.nl {
+		let up_k = layer_name(l, "mlp.up_proj.weight");
+		if big.contains_key(&layer_name(l, "mlp.gate_proj.weight")) {
+			continue;
+		}
+		let Some(up) = big.get(&up_k) else {
+			continue;
+		};
+		if up.shape.first() != Some(&(2 * nff)) || up.shape.len() != 2 {
+			continue;
+		}
+		let ne = up.shape[1];
+		let (src_shard, src_off, src_gt) = (up.shard, up.off, up.gt);
+		let (Ok((q0, _)), Ok((q1, _))) = (
+			Model::qrange(up, 0, nff * ne * 2),
+			Model::qrange(up, nff * ne * 2, nff * ne * 2),
+		) else {
+			continue;
+		};
+		let part = |qoff: usize| Tensor {
+			shard: src_shard,
+			off: src_off + qoff,
+			nbytes: nff * ne * 2,
+			shape: vec![nff, ne],
+			gt: src_gt,
+		};
+		big.insert(layer_name(l, "mlp.gate_proj.weight"), part(q0));
+		big.insert(up_k, part(q1));
+	}
+}
+
+/// Feeds q/k/v neutral projections from a fused `attn_qkv` source per [`SLICE_MAP`]
+/// when the model ships no separate q/k/v tensors. Each slice is a row-subrange
+/// of the fused tensor's data, split at `[qd | kd | kd]` from the layer's dims;
+/// a fuse whose row count does not match `qd + 2*kd` (e.g. latent MLA) is left
+/// alone, so its absent-projection error stays truthful.
+fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
+	for l in 0..hp.nl {
+		let d = &hp.dims[l];
+		let (qd, kd) = (hp.nqh * d.hd, d.nkv * d.hd);
+		for (neutral, src, slice) in SLICE_MAP {
+			let nk = layer_name(l, neutral);
+			if big.contains_key(&nk) {
+				continue;
+			}
+			let Some(src_t) = big.get(&layer_name(l, src)) else {
+				continue;
+			};
+			if src_t.shape.first() != Some(&(qd + 2 * kd)) || src_t.shape.len() != 2 {
+				continue;
+			}
+			let ne = src_t.shape[1];
+			let (row0, rows) = match slice {
+				Slice::QkvQ => (0, qd),
+				Slice::QkvK => (qd, kd),
+				Slice::QkvV => (qd + kd, kd),
+			};
+			let Ok((qoff, _qlen)) = Model::qrange(src_t, row0 * ne * 2, rows * ne * 2) else {
+				continue;
+			};
+			let sub = Tensor {
+				shard: src_t.shard,
+				off: src_t.off + qoff,
+				nbytes: rows * ne * 2,
+				shape: vec![rows, ne],
+				gt: src_t.gt,
+			};
+			big.insert(nk, sub);
+		}
+	}
 }
 
 fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> Result<Model> {
@@ -1059,19 +1278,26 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	Ok(m)
 }
 
-fn fixed_names(hp: &Hparams, l: usize) -> Vec<String> {
-	let mut names = vec![
-		layer_name(l, "self_attn.q_proj.weight"),
-		layer_name(l, "self_attn.k_proj.weight"),
-		layer_name(l, "self_attn.o_proj.weight"),
-		layer_name(l, "mlp.gate_proj.weight"),
-		layer_name(l, "mlp.up_proj.weight"),
-		layer_name(l, "mlp.down_proj.weight"),
+/// The dense-projection weights actually present for layer `l`, from the fixed
+/// role vocabulary. Presence-driven, so a non-gated FFN never demands a gate, a
+/// pure-MoE layer contributes no dense FFN weights (its experts load separately),
+/// and a fused-qkv model contributes the synthesized q/k/v — the required set
+/// derives from the composition, never a fixed per-arch list.
+fn fixed_names(m: &Model, l: usize) -> Vec<String> {
+	const ROLES: [&str; 7] = [
+		"self_attn.q_proj.weight",
+		"self_attn.k_proj.weight",
+		"self_attn.v_proj.weight",
+		"self_attn.o_proj.weight",
+		"mlp.gate_proj.weight",
+		"mlp.up_proj.weight",
+		"mlp.down_proj.weight",
 	];
-	if hp.dims[l].has_v {
-		names.push(layer_name(l, "self_attn.v_proj.weight"));
-	}
-	names
+	ROLES
+		.iter()
+		.map(|r| layer_name(l, r))
+		.filter(|n| m.big.contains_key(n))
+		.collect()
 }
 
 fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
@@ -1126,13 +1352,14 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 	m.store = store;
 	placed?;
 	let nl = m.hp.nl;
-	for name in [
-		"model.decoder.embed_tokens.weight".to_string(),
-		fixed_names(&m.hp, 0).remove(0),
-		fixed_names(&m.hp, nl - 1)
-			.pop()
-			.ok_or_else(|| anyhow!("no names"))?,
-	] {
+	let mut canary = vec!["model.decoder.embed_tokens.weight".to_string()];
+	if let Some(first) = fixed_names(m, 0).into_iter().next() {
+		canary.push(first);
+	}
+	if let Some(last) = fixed_names(m, nl - 1).into_iter().next_back() {
+		canary.push(last);
+	}
+	for name in canary {
 		if let Some(Home::Vram(dev)) = m.store.home(&name) {
 			let t = &m.big[&name];
 			let n = 4096.min(t.nbytes);
@@ -1158,8 +1385,6 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 	let nl = m.hp.nl;
 	let nexp = m.hp.nexp;
-	let gu_bytes = m.hp.gu_bytes;
-	let dn_bytes = m.hp.dn_bytes;
 	let slot_bytes = m.hp.slot_bytes;
 	beat();
 	store.place("model.decoder.embed_tokens.weight", m.emb.len(), |dst| {
@@ -1168,7 +1393,7 @@ fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 	})?;
 	beat();
 	for l in 0..nl {
-		for name in fixed_names(&m.hp, l) {
+		for name in fixed_names(m, l) {
 			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
 			store.place(&name, t.nbytes, |dst| {
 				m.read_host(t, 0, dst).map_err(io::Error::other)
@@ -1178,16 +1403,11 @@ fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 	}
 	for e in 0..nexp {
 		for l in 0..nl {
-			let gu =
-				m.big.get(&layer_name(l, "experts.gate_up_proj"))
-					.ok_or_else(|| anyhow!("no gate_up {l}"))?;
-			let dn =
-				m.big.get(&layer_name(l, "experts.down_proj"))
-					.ok_or_else(|| anyhow!("no down {l}"))?;
+			if !m.layer_is_moe(l) {
+				continue;
+			}
 			store.place(&ekey(l, e), slot_bytes, |dst| {
-				m.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])
-					.and_then(|_g| m.read_host(dn, e * dn_bytes, &mut dst[gu_bytes..]))
-					.map_err(io::Error::other)
+				m.fill_expert(l, e, dst).map_err(io::Error::other)
 			})?;
 			beat();
 		}

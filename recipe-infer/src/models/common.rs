@@ -109,8 +109,8 @@ fn attn_block(
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
-	let nqh = hp.nqh;
 	let d = &hp.dims[l];
+	let nqh = d.nqh;
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
 	let theta = if d.sliding {
 		&m.theta_slide
@@ -191,7 +191,7 @@ pub(super) fn layer_spec(
 /// Dense FFN composition selected by `sp.ffn`, `ar.cms` (normed) -> `ar.mlp0`.
 fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena) -> Result<()> {
 	let hp = &m.hp;
-	let (ne, nff) = (hp.ne, hp.nff);
+	let (ne, nff) = (hp.ne, hp.dims[l].nff);
 	let up = m.stream(&layer_name(l, "mlp.up_proj.weight"))?;
 	gpu_gemm_bt_f64(&ar.cms, &up, t, nff, ne, &ar.u)?;
 	match sp.ffn {
@@ -256,7 +256,7 @@ pub(super) fn layer_moe(
 	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
 	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
-	let gate_w = m.stream(&layer_name(l, "mlp.gate.weight"))?;
+	let gate_w = m.stream(&layer_name(l, "router.proj.weight"))?;
 	let logits = GpuBuffer::alloc(t * nexp)?;
 	gpu_gemm_bt_f64(&ar.cms, &gate_w, t, nexp, ne, &logits)?;
 	let mut lh = vec![0.0f64; t * nexp];
@@ -325,8 +325,8 @@ pub(super) fn layer_recurrent(
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
-	let nqh = hp.nqh;
 	let d = &hp.dims[l];
+	let nqh = d.nqh;
 	let kd = d.nkv * d.hd;
 	let qd = nqh * d.hd;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;

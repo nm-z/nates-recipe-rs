@@ -1,39 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-4. loads per FMA ratio (current)
-5. loads per FMA ratio (tiled)
-6. math utilization % (yours vs rocBLAS)
-7. total register file across GPU
-8. effective register file usage across GPU
-
-
 1 VGPR	= 1 value / thread
 1 SGPR	= 1 value / wavefront
 1 Thread	= max 256	VGPRs
@@ -42,7 +6,6 @@
 1 f64		= 2		VGPRs
 1 SIMD	= 1,536	VGPRs
 1 CU		= SIMDs,ALUs,L0/L1,LDS,SQC/SQ,scheduler
-
 
 GPR		physical slots
 	VGPR	vector general purpose register	(48)
@@ -65,10 +28,6 @@ SW:
 SQ		Sequencer
 SQC		Sequencer Cache
 CUs		Compute Units
-
-
-
-
 
 rust
 	HIP
@@ -98,9 +57,6 @@ DISK
 					L1/L0
 						GPR
 							ALU
-
-
-
 
 Vendor:
 	nvidia
@@ -135,77 +91,7 @@ Vendor:
 		blas		onemkl
 		dialect	sycl
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-qwen3_0_6b
-	downloads Qwen3 0.6B safetensors
-	converts
-		f16->bf16
-	quantizes bf16
-		q8_0 .. q6_k (10 formats)
-	all 12 variants
-		real text generation
-		wikitext-2 perplexity
-			gate	check_ppl
-			ppl blowout	fails the run
-			proves	quantization didn't break the model
-	imatrix generation
-	kv-cache save/load-state
-		flash-attention/offload configs	4
-ctest_with_model debug/release
-	reruns ctest
-	label filter	-L model
-	targets		the q4_0 just built
-	your failure	missing time binary
-hardware_matrix
-	same script every runner
-	env flags gate backends
-		GG_BUILD_CUDA
-		GG_BUILD_ROCM
-		GG_BUILD_VULKAN
-		GG_BUILD_SYCL
-		GG_BUILD_METAL
-		GG_BUILD_MUSA
-		GG_BUILD_WEBGPU
-		...
-	one flag per self-hosted runner
-outputs
-	tmp/results
-		per-stage logs
-		README.md summary
-	tmp/mnt	model download cache
-philosophy
-	unit tests	cheap gate up front
-	real verdict
-		clone real model from HF
-		convert quantize generate perplexity
-		hold numbers to thresholds
-	your cookbook-plus-suite	same conviction
-		e2e of real binary	the claim
-		unit green	supplementary
-
-
-
-
-
+llamacpp:
 Tokenizers (17)
 	bert-bge
 	command-r
@@ -302,6 +188,36 @@ Sampling + misc (9)
 	test-c
 		C-linkage compilation
 
+YES
+  tokenizer set (ggml-vocab + .inp/.out)
+  test-llama-archs (seeded ggufs + CPU logits)
+NO
+  test-backend-ops
+  test-backend-sampler
+  test-rope
+  test-col2im-1d
+  test-alloc
+  test-barrier
+  test-gguf
+  test-quantize-fns / test-quantize-perf
+  save/load state, fragmented restore, recurrent rollback
+  thread-safety, load-cancel, autorelease, eval-callback, downloads
+  grammar / GBNF / JSON-schema / PEG
+  chat / templates / jinja
+  sampling, reasoning-budget, batch-alloc, mtmd, log, arg-parser, double-float, test-c
+
+
+
+
+a polymath holds knowledge in one head
+	29,000 lines of graph code
+	each arch re-implements
+
+encyclopedism holds it in one structure
+	any arch is expressible
+	anyone can compose references
+
+bat recipe-infer/src/models/common.rs recipe-infer/src/models/mod.rs recipe-infer/src/llm.rs
 
 
 
@@ -310,17 +226,9 @@ Sampling + misc (9)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
+llm.rs says supported_archs() returns architectures with a verified decode composition
+mod.rs says SUPPORTED is wired into dispatch
+But the stated audit status is 134 declared, 24 execute, 0 parity. That makes this table a declaration ledger, not a verified support list. Calling all 134 supported is misleading and will let Headless::open accept models that are known not to work.
 
 
 
