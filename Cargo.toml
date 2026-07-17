@@ -12,6 +12,7 @@ categories = ["science::ml"]
 [lib]
 name = "recipe"
 test = false
+doctest = false
 
 [[bin]]
 name = "recipe"

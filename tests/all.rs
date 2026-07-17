@@ -72,6 +72,22 @@ fn errline(s: &str) {
 	let _ = writeln!(io::stderr(), "{s}");
 }
 
+fn tty(fd: i32) -> bool {
+	unsafe { libc::isatty(fd) == 1 }
+}
+
+fn paint(code: u8, s: &str, on: bool) -> String {
+	if on {
+		format!("\x1b[{code}m{s}\x1b[0m")
+	} else {
+		s.to_owned()
+	}
+}
+
+const GREEN: u8 = 32;
+const RED: u8 = 31;
+const CYAN: u8 = 36;
+
 struct Log {
 	f: File,
 }
@@ -85,6 +101,17 @@ impl Log {
 	fn line(&mut self, s: &str) {
 		self.file(s);
 		errline(s);
+	}
+
+	fn verdict(&mut self, v: &str, tail: &str) {
+		self.file(&format!("{v} {tail}"));
+		let code = if v == "PASS" { GREEN } else { RED };
+		errline(&format!("{} {tail}", paint(code, v, tty(2))));
+	}
+
+	fn status(&mut self, s: &str) {
+		self.file(s);
+		errline(&paint(CYAN, s, tty(2)));
 	}
 }
 
@@ -213,7 +240,7 @@ fn run() -> i32 {
 	};
 	let head = format!("[S] discovered={} binaries={}", discovered, binaries.len());
 	log.file(&head);
-	out(&head);
+	out(&paint(CYAN, &head, tty(1)));
 	let mut tally = Tally {
 		discovered,
 		passed: 0,
@@ -231,7 +258,7 @@ fn run() -> i32 {
 	// so the suite no longer stops anyone's service to get the card.
 	let waited = Instant::now();
 	gpu_core::gate::acquire();
-	log.line(&format!(
+	log.status(&format!(
 		"[S] GPU-LOCK acquired wait={:.1}s",
 		waited.elapsed().as_secs_f64()
 	));
@@ -261,7 +288,7 @@ fn run() -> i32 {
 		Ok(None) => "suite ended early".to_owned(),
 		Err(p) => {
 			let reason = oneline(&format!("suite panicked: {}", panic_msg(&*p)));
-			log.line(&format!("[S] SUITE-PANIC {reason}"));
+			log.status(&format!("[S] SUITE-PANIC {reason}"));
 			reason
 		}
 	};
@@ -287,7 +314,7 @@ fn dispatch(
 
 	for (i, t) in tests.iter().enumerate() {
 		if t.ignored {
-			log.line(&test_line("FAIL", &t.id, 0.0));
+			log.verdict("FAIL", &test_tail(&t.id, 0.0));
 			log.line("     ignored");
 			tally.failed += 1;
 			done[i] = true;
@@ -297,7 +324,7 @@ fn dispatch(
 		if let Some(h) = t.hash
 			&& cache.get(&t.id) == Some(&h)
 		{
-			log.line(&format!("{} cached", test_line("PASS", &t.id, 0.0)));
+			log.verdict("PASS", &format!("{} cached", test_tail(&t.id, 0.0)));
 			tally.passed += 1;
 			passes.push((t.id.clone(), h));
 			done[i] = true;
@@ -305,7 +332,7 @@ fn dispatch(
 		}
 		let leaked = settled_holders(log, known);
 		if !leaked.is_empty() {
-			log.line(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
+			log.status(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
 			abort = Some(format!("device-busy pids={leaked:?}"));
 			break;
 		}
@@ -342,7 +369,7 @@ fn dispatch(
 			let t = &tests[*i];
 			let leaked = settled_holders(log, known);
 			if !leaked.is_empty() {
-				log.line(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
+				log.status(&format!("[S] DEVICE-BUSY before={} pids={leaked:?}", t.id));
 				abort = Some(format!("device-busy pids={leaked:?}"));
 				break;
 			}
@@ -372,7 +399,7 @@ fn dispatch(
 }
 
 fn poison(log: &mut Log, after: &str) -> String {
-	log.line(&format!("[S] DEVICE-POISONED after={after}"));
+	log.status(&format!("[S] DEVICE-POISONED after={after}"));
 	format!("device-poisoned after={after}")
 }
 
@@ -383,7 +410,7 @@ fn oneline(s: &str) -> String {
 fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], abort: &str) {
 	for (i, t) in tests.iter().enumerate() {
 		if !done.get(i).copied().unwrap_or(false) {
-			log.line(&test_line("FAIL", &t.id, 0.0));
+			log.verdict("FAIL", &test_tail(&t.id, 0.0));
 			log.line(&format!("     not attempted: {abort}"));
 			tally.unattempted += 1;
 		}
@@ -391,8 +418,8 @@ fn fail_rest(log: &mut Log, tally: &mut Tally, tests: &[Test], done: &[bool], ab
 }
 
 fn fatal(msg: &str) -> i32 {
-	out(&format!("FAIL: {msg}"));
-	errline(&format!("FAIL: {msg}"));
+	out(&format!("{} {msg}", paint(RED, "FAIL:", tty(1))));
+	errline(&format!("{} {msg}", paint(RED, "FAIL:", tty(2))));
 	1
 }
 
@@ -408,12 +435,12 @@ fn settled_holders(log: &mut Log, known: &[i32]) -> Vec<i32> {
 	if first.is_empty() {
 		return first;
 	}
-	log.line(&format!("[S] DEVICE-WAIT pids={first:?}"));
+	log.status(&format!("[S] DEVICE-WAIT pids={first:?}"));
 	let t0 = Instant::now();
 	loop {
 		let leaked = new_holders(known);
 		if leaked.is_empty() {
-			log.line(&format!(
+			log.status(&format!(
 				"[S] DEVICE-CLEAR waited={:.1}s",
 				t0.elapsed().as_secs_f64()
 			));
@@ -437,13 +464,13 @@ fn record(
 	*test_secs += att.secs;
 	match &att.outcome {
 		Outcome::Pass => {
-			log.line(&test_line("PASS", &t.id, att.secs));
+			log.verdict("PASS", &test_tail(&t.id, att.secs));
 			tally.passed += 1;
 		}
 		_ => {
-			log.line(&test_line("FAIL", &t.id, att.secs));
+			log.verdict("FAIL", &test_tail(&t.id, att.secs));
 			tally.failed += 1;
-			for line in details(att) {
+			for line in details(att, &t.name) {
 				log.line(&format!("     {line}"));
 			}
 		}
@@ -454,22 +481,49 @@ fn record(
 			first.secs,
 			reason(&first.outcome)
 		));
-		for line in &first.capture {
-			log.line(&format!("     first try: {}", line.trim_end()));
+		for line in scrub(&first.capture, &t.name) {
+			log.line(&format!("     first try: {line}"));
 		}
 	}
 }
 
-fn test_line(verdict: &str, id: &str, secs: f64) -> String {
-	format!("{verdict} {id} {secs:.1}s")
+fn test_tail(id: &str, secs: f64) -> String {
+	format!("{id} {secs:.1}s")
 }
 
-fn details(att: &Attempt) -> Vec<String> {
-	let mut lines: Vec<String> = att
-		.capture
-		.iter()
-		.map(|l| l.trim_end().to_owned())
-		.collect();
+/// Drop libtest harness ceremony from a child's captured output so FAIL
+/// details show only what the test itself printed plus the panic message.
+fn scrub(capture: &[String], name: &str) -> Vec<String> {
+	let bare = name.rsplit("::").next().unwrap_or(name);
+	let mut lines: Vec<String> = Vec::new();
+	for raw in capture {
+		let l = raw.trim_end();
+		let t = l.trim_start();
+		let ceremony = (t.starts_with("running ")
+			&& (t.ends_with(" test") || t.ends_with(" tests")))
+			|| t == "failures:"
+			|| t.starts_with("test result: ")
+			|| t.starts_with("note: run with `RUST_BACKTRACE=1`")
+			|| (t.starts_with("test ")
+				&& (t.ends_with("... FAILED") || t.ends_with("... ok") || t.ends_with("... ignored")))
+			|| t == bare
+			|| t == name;
+		if ceremony {
+			continue;
+		}
+		if l.is_empty() && lines.last().is_none_or(|p| p.is_empty()) {
+			continue;
+		}
+		lines.push(l.to_owned());
+	}
+	while lines.last().is_some_and(|l| l.is_empty()) {
+		lines.pop();
+	}
+	lines
+}
+
+fn details(att: &Attempt, name: &str) -> Vec<String> {
+	let mut lines = scrub(&att.capture, name);
 	match &att.outcome {
 		Outcome::Signal(_) | Outcome::Deadline => lines.insert(0, reason(&att.outcome)),
 		_ if lines.is_empty() => lines.push(reason(&att.outcome)),
@@ -505,7 +559,8 @@ fn finish(log: &mut Log, tally: &Tally, t0: Instant, test_secs: f64) -> i32 {
 	log.file("");
 	log.file(&summary);
 	out("");
-	out(&summary);
+	let code_color = if tally.green() { GREEN } else { RED };
+	out(&paint(code_color, &summary, tty(1)));
 	code
 }
 
@@ -514,9 +569,13 @@ fn await_kfd_teardown(pid: u32) {
 	let t0 = Instant::now();
 	while Path::new(&path).exists() {
 		if t0.elapsed().as_secs_f64() >= KFD_TEARDOWN_DEADLINE_SECS {
-			errline(&format!(
-				"[RUN] kfd teardown of pid {pid} still live after {:.0}s — proceeding",
-				t0.elapsed().as_secs_f64()
+			errline(&paint(
+				CYAN,
+				&format!(
+					"[RUN] kfd teardown of pid {pid} still live after {:.0}s — proceeding",
+					t0.elapsed().as_secs_f64()
+				),
+				tty(2),
 			));
 			return;
 		}
@@ -551,7 +610,7 @@ fn run_test(t: &Test) -> Attempt {
 			None => {
 				let el = start.elapsed().as_secs_f64();
 				if el >= next_tick as f64 {
-					errline(&format!("[RUN] {} {}s", t.id, next_tick));
+					errline(&paint(CYAN, &format!("[RUN] {} {}s", t.id, next_tick), tty(2)));
 					next_tick += 10;
 				}
 				if el >= TEST_DEADLINE_SECS {

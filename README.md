@@ -14,12 +14,18 @@ Build the whole workspace. Needs `hipconfig` on `PATH`; default GPU arch is gfx1
 cargo build --release
 ```
 
-THE suite: every test in every crate, one OS process per test, 60s SIGKILL each, one log at `suite.log`. The second line is the verdict; the third forces a full re-run (the suite skips tests whose fn-body hash matches the cache):
+THE suite: every test in every crate, one OS process per test, 60s SIGKILL each, one log at `suite.log`. PASS green, FAIL red, `[S]` status cyan; FAIL details show only the test's own output plus the panic (libtest ceremony is scrubbed). The second line is the verdict; the third forces a full re-run (the suite skips tests whose fn-body hash matches the cache):
 
 ```bash
-cargo test all
+cargo test
 rg '^FAIL' suite.log
 rm target/.suite_cache
+```
+
+Filter to matching test ids (`cargo test all` also still works, unfiltered). Any positional filter makes cargo run the root lib's empty 0-test harness too; that extra block is a cargo quirk, not the suite:
+
+```bash
+cargo test <substring>
 ```
 
 Train straight from a csv:
