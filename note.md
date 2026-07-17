@@ -76,11 +76,6 @@ rust
 			HSA
 				KFD
 					CUs
-
-
-
-
-
 DISK
 	.s
 		RAM
@@ -107,6 +102,38 @@ DISK
 
 
 
+Vendor:
+	nvidia
+		tool		cuda
+		compiler	nvcc
+		runtime	cudart
+		blas		cublas
+		dialect	cuda
+	amd
+		tool		rocm
+		compiler	hipcc
+		runtime	hip
+		blas		rocblas
+		dialect	hip
+	moore_threads
+		tool		musa
+		compiler	mcc
+		runtime	musa_runtime
+		blas		mublas
+		dialect	musa
+	khronos
+		spec		sycl
+	uxl_foundation
+		spec		oneapi
+		builds_on	sycl
+		donated_by	intel
+	intel
+		tool		oneapi_toolkit
+		implements	oneapi
+		compiler	icpx
+		runtime	level_zero
+		blas		onemkl
+		dialect	sycl
 
 
 
@@ -127,6 +154,53 @@ DISK
 
 
 
+
+qwen3_0_6b
+	downloads Qwen3 0.6B safetensors
+	converts
+		f16->bf16
+	quantizes bf16
+		q8_0 .. q6_k (10 formats)
+	all 12 variants
+		real text generation
+		wikitext-2 perplexity
+			gate	check_ppl
+			ppl blowout	fails the run
+			proves	quantization didn't break the model
+	imatrix generation
+	kv-cache save/load-state
+		flash-attention/offload configs	4
+ctest_with_model debug/release
+	reruns ctest
+	label filter	-L model
+	targets		the q4_0 just built
+	your failure	missing time binary
+hardware_matrix
+	same script every runner
+	env flags gate backends
+		GG_BUILD_CUDA
+		GG_BUILD_ROCM
+		GG_BUILD_VULKAN
+		GG_BUILD_SYCL
+		GG_BUILD_METAL
+		GG_BUILD_MUSA
+		GG_BUILD_WEBGPU
+		...
+	one flag per self-hosted runner
+outputs
+	tmp/results
+		per-stage logs
+		README.md summary
+	tmp/mnt	model download cache
+philosophy
+	unit tests	cheap gate up front
+	real verdict
+		clone real model from HF
+		convert quantize generate perplexity
+		hold numbers to thresholds
+	your cookbook-plus-suite	same conviction
+		e2e of real binary	the claim
+		unit green	supplementary
 
 
 

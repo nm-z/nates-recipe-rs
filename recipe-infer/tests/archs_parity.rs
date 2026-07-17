@@ -93,8 +93,7 @@ fn archs_parity_vs_llama_cpp() {
 	assert!(!models.is_empty(), "no gguf fixtures in {}", dir.display());
 
 	let (mut ok, mut fail, mut unsup, mut err, mut noref) = (0u32, 0u32, 0u32, 0u32, 0u32);
-	eprintln!("|{:>20}|{:>7}|{:>26}|", "Model arch.", "Config", "recipe-infer vs llama.cpp");
-	eprintln!("|{}|{}|{}|", "-".repeat(20), "-".repeat(7), "-".repeat(26));
+	eprintln!("{:<20} {:<6} {}", "Model arch.", "Config", "recipe-infer vs llama.cpp");
 	for gguf in &models {
 		let stem = gguf.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
 		let (name, cfg) = match stem.rsplit_once('-') {
@@ -141,7 +140,7 @@ fn archs_parity_vs_llama_cpp() {
 				},
 			}
 		};
-		eprintln!("|{name:>20}|{cfg:>7}|{verdict}|");
+		eprintln!("{name:<20} {cfg:<6} {verdict}");
 	}
 	let referenced = ok + fail + unsup + err;
 	eprintln!(

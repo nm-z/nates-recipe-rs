@@ -69,8 +69,7 @@ fn vocabs_parity_vs_llama_cpp() {
 	assert!(!vocabs.is_empty(), "no vocab fixtures in {}", dir.display());
 
 	let (mut ok, mut fail, mut err, mut noref) = (0u32, 0u32, 0u32, 0u32);
-	eprintln!("|{:>22}|{:>26}|", "Vocab", "recipe-infer vs llama.cpp");
-	eprintln!("|{}|{}|", "-".repeat(22), "-".repeat(26));
+	eprintln!("{:<22} {}", "Vocab", "recipe-infer vs llama.cpp");
 	for gguf in &vocabs {
 		let stem = gguf.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
 		let name = stem.strip_prefix("ggml-vocab-").unwrap_or(stem);
@@ -95,7 +94,7 @@ fn vocabs_parity_vs_llama_cpp() {
 				}
 			}
 		};
-		eprintln!("|{name:>22}|{verdict}|");
+		eprintln!("{name:<22} {verdict}");
 	}
 	let referenced = ok + fail + err;
 	eprintln!("tokenizer parity: {ok} OK, {fail} FAIL, {err} ERROR of {referenced} referenced ({noref} NOREF)");
