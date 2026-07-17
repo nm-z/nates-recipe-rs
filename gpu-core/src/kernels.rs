@@ -1628,6 +1628,37 @@ unsafe extern "C" {
 		n_group: i32,
 		stream: *mut c_void,
 	);
+	fn launch_l2norm_rows(
+		x: *const c_void,
+		eps: *const c_void,
+		out: *mut c_void,
+		rows: i32,
+		cols: i32,
+		stream: *mut c_void,
+	);
+	fn launch_gated_delta_scan(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		g: *const c_void,
+		beta: *const c_void,
+		a: *const c_void,
+		out: *mut c_void,
+		t: i32,
+		hv: i32,
+		d: i32,
+		per_channel: i32,
+		scale: f64,
+		stream: *mut c_void,
+	);
+	fn launch_row_scale(
+		x: *const c_void,
+		s: *const c_void,
+		out: *mut c_void,
+		rows: i32,
+		cols: i32,
+		stream: *mut c_void,
+	);
 }
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -4942,18 +4973,19 @@ pub fn gpu_bias_add(
 pub fn gpu_ssm_conv_causal_silu(
 	x: &GpuBuffer,
 	conv_w: &GpuBuffer,
-	bias: &GpuBuffer,
+	bias: Option<&GpuBuffer>,
 	t: usize,
 	d_inner: usize,
 	d_conv: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	let bias_ptr = bias.map_or(ptr::null(), |b| b.ptr.cast_const());
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null bias is handled by the kernel (no per-channel add).
 	unsafe {
 		launch_ssm_conv_causal_silu(
 			x.ptr.cast_const(),
 			conv_w.ptr.cast_const(),
-			bias.ptr.cast_const(),
+			bias_ptr,
 			out.ptr,
 			ci(t)?,
 			ci(d_inner)?,
@@ -5082,6 +5114,115 @@ pub fn gpu_ssm_group_rmsnorm(
 			ci(rows)?,
 			ci(dpg)?,
 			ci(n_group)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Per-row L2 normalize (ggml_l2_norm): `out[row,j] = x[row,j] /
+/// max(sqrt(sum_j x^2), eps)`. Distinct from RMSNorm (no `1/cols`, no gamma; eps
+/// floors the divisor rather than adding under the root). `rows = t*n_head`,
+/// `cols = head_dim`, one block per row. In-place safe.
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+pub fn gpu_l2norm_rows(
+	x: &GpuBuffer,
+	eps: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_l2norm_rows(
+			x.ptr.cast_const(),
+			eps.ptr.cast_const(),
+			out.ptr,
+			ci(rows)?,
+			ci(cols)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Fused gated delta-rule scan (delta-net-base.cpp `build_delta_net_autoregressive`,
+/// applied sequentially over the `t` prompt tokens; state starts at zero, no
+/// cross-call cache). Per head, per token: decay `S[i,j] *= exp(g*a[h])`, `sk[j]
+/// = sum_i S[i,j]k[i]`, `d[j] = beta*(v[j]-sk[j])`, `S[i,j] += k[i]d[j]`, `o[j] =
+/// sum_i S[i,j]q[i]` with `q` pre-scaled by `scale`. One workgroup per head, `d`
+/// threads; thread `j` holds state column `S[:,j]` privately across the whole `t`
+/// loop. `q`/`k`/`v`/`out` are `[t, hv*d]` token-major head-major; `g` is `[t,hv]`
+/// for GDA (`per_channel=false`) or `[t,hv*d]` for KDA (`per_channel=true`);
+/// `beta` is `[t,hv]`; `a` is `[hv]` (the per-head `-exp(A_log)` decay coefficient).
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_gated_delta_scan(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	g: &GpuBuffer,
+	beta: &GpuBuffer,
+	a: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	hv: usize,
+	d: usize,
+	per_channel: bool,
+	scale: f64,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_gated_delta_scan(
+			q.ptr.cast_const(),
+			k.ptr.cast_const(),
+			v.ptr.cast_const(),
+			g.ptr.cast_const(),
+			beta.ptr.cast_const(),
+			a.ptr.cast_const(),
+			out.ptr,
+			ci(t)?,
+			ci(hv)?,
+			ci(d)?,
+			i32::from(per_channel),
+			scale,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Per-row scalar multiply: `out[r, c] = x[r, c] * s[r]`, one scalar per row.
+/// The gated shared-expert token gate (qwen3.5/next) scales each token's expert
+/// output by a per-token sigmoid scalar. In-place safe.
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+pub fn gpu_row_scale(
+	x: &GpuBuffer,
+	s: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_row_scale(
+			x.ptr.cast_const(),
+			s.ptr.cast_const(),
+			out.ptr,
+			ci(rows)?,
+			ci(cols)?,
 			ptr::null_mut(),
 		);
 	}

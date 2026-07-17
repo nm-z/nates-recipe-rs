@@ -11,9 +11,11 @@ use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_mla_attn, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace,
 };
+use gpu_core::k_gapact::gpu_softplus;
 use gpu_core::kernels::{
-	gpu_add_into, gpu_bias_add, gpu_broadcast_mul, gpu_concat_into, gpu_copy_into, gpu_gelu_into,
-	gpu_layernorm_opt_into, gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols,
+	gpu_add_into, gpu_bias_add, gpu_broadcast_mul, gpu_concat_into, gpu_copy_into,
+	gpu_gated_delta_scan, gpu_gelu_into, gpu_l2norm_rows, gpu_layernorm_opt_into, gpu_mul_inplace,
+	gpu_relu_into, gpu_row_scale, gpu_sigmoid_into, gpu_silu_into, gpu_slice_cols,
 	gpu_slice_lead_into, gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm, gpu_ssm_scan_mamba1,
 	gpu_ssm_scan_mamba2,
 };
@@ -211,6 +213,14 @@ pub(super) enum Recur {
 	/// RMSNorm, no grouped gated norm, no conv bias, and a per-head-interleaved
 	/// z/x split of `in_proj`.
 	Plamo2,
+	/// Gated Delta-Net (GDA) linear-attention mixer (qwen3.5/next/moe): q/k/v/z
+	/// projections, causal short conv + SiLU, per-head L2-normed q/k, a per-head
+	/// scalar log-decay, the delta-rule scan, and a SiLU(z)-gated RMSNorm output.
+	GatedDelta,
+	/// Kimi Delta-Attention (KDA) mixer (kimi-linear): separate q/k/v projections
+	/// each with its own causal conv, a per-CHANNEL log-decay LoRA, the delta-rule
+	/// scan, and a sigmoid(`g_b(g_a(x))`)-gated RMSNorm output.
+	Kda,
 }
 
 /// How a hybrid arch lays out its per-layer blocks.
@@ -228,6 +238,11 @@ pub(super) enum HyMode {
 	/// plamo2: sandwich norms wrap both halves. Pre-norm, mixer, post-norm, then a
 	/// residual; then pre-ff-norm, SwiGLU FFN, post-ff-norm, then a residual.
 	Sandwich,
+	/// qwen3.5/next/moe, kimi-linear: each layer runs one mixer (delta recurrent
+	/// OR full attention, chosen by conv-tensor presence) writing its projected
+	/// output, adds the block residual, then a `pre_ff`-normed FFN sub-block (dense
+	/// SwiGLU or MoE + shared expert) with its own residual.
+	DeltaNet,
 }
 
 /// A per-layer attention/recurrent-interleaving composition. `sp` drives both the
@@ -552,57 +567,10 @@ pub(super) fn layer_moe(
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
 ) -> Result<()> {
-	let hp = &m.hp;
-	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
+	let ne = m.hp.ne;
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
 	blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
-	let gate_w = m.stream(&layer_name(l, "router.proj.weight"))?;
-	let logits = GpuBuffer::alloc(t * nexp)?;
-	gpu_gemm_bt_f64(&ar.cms, &gate_w, t, nexp, ne, &logits)?;
-	let mut lh = vec![0.0f64; t * nexp];
-	unsafe { logits.download_async(&mut lh, ptr::null_mut()) }?;
-	let mut cms_host = vec![0.0f64; t * ne];
-	unsafe { ar.cms.download_async(&mut cms_host, ptr::null_mut()) }?;
-	gpu_core::hip::device_synchronize()?;
-	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
-	for p in 0..t {
-		let mut probs = lh[p * nexp..(p + 1) * nexp].to_vec();
-		softmax(&mut probs);
-		let mut idx: Vec<usize> = (0..nexp).collect();
-		idx.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap_or(cmp::Ordering::Equal));
-		idx.truncate(used);
-		let ws: f64 = idx.iter().map(|&e| probs[e]).sum();
-		for &e in &idx {
-			e2p.entry(e).or_default().push((p, probs[e] / ws));
-		}
-	}
-	let mut mo = vec![0.0f64; t * ne];
-	let mut xg = vec![0.0f64; t * ne];
-	let mut dv = vec![0.0f64; t * ne];
-	for (&e, poslist) in &e2p {
-		let np = poslist.len();
-		for (i, &(p, _)) in poslist.iter().enumerate() {
-			xg[i * ne..(i + 1) * ne].copy_from_slice(&cms_host[p * ne..(p + 1) * ne]);
-		}
-		ar.moe_xg.load(&xg[..np * ne])?;
-		let es = m.expert_slot(l, e)?;
-		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
-		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
-		gpu_glu_silu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
-		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
-		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
-		unsafe {
-			ar.moe_dv
-				.download_async(&mut dv[..np * ne], ptr::null_mut())
-		}?;
-		gpu_core::hip::device_synchronize()?;
-		for (i, &(p, w)) in poslist.iter().enumerate() {
-			for x in 0..ne {
-				mo[p * ne + x] += w * dv[i * ne + x];
-			}
-		}
-	}
-	ar.mlp0.load(&mo)?;
+	moe_core(m, l, &ar.cms, t, ar, false, None)?;
 	if sp.residual_scale {
 		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
 	}
@@ -744,7 +712,7 @@ fn mamba1_mix(
 
 	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
 	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
-	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, conv_b, t, di, dc, &ar.ss_xc)?;
+	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, Some(conv_b), t, di, dc, &ar.ss_xc)?;
 
 	let w_x = m.stream(&layer_name(l, "self_attn.ssm_x.weight"))?;
 	gpu_gemm_bt_f64(&ar.ss_xc, &w_x, t, dbw, di, &ar.ss_db)?;
@@ -837,7 +805,7 @@ fn mamba2_mix(
 
 	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
 	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
-	gpu_ssm_conv_causal_silu(&ar.ss_xbc, conv_w, conv_b, t, conv_dim, dc, &ar.ss_xbcc)?;
+	gpu_ssm_conv_causal_silu(&ar.ss_xbc, conv_w, Some(conv_b), t, conv_dim, dc, &ar.ss_xbcc)?;
 
 	let dt_b = ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?;
 	gpu_bias_add(&ar.ss_dtlr, dt_b, t, nh, &ar.ss_dtlr)?;
@@ -919,7 +887,7 @@ fn plamo2_mix(
 
 	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
 	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
-	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, conv_b, t, di, dc, &ar.ss_xc)?;
+	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, Some(conv_b), t, di, dc, &ar.ss_xc)?;
 
 	let w_x = m.stream(&layer_name(l, "self_attn.ssm_x.weight"))?;
 	gpu_gemm_bt_f64(&ar.ss_xc, &w_x, t, bcd, di, &ar.ss_db)?;
@@ -992,6 +960,315 @@ fn layer_is_recur(m: &Model, l: usize) -> bool {
 	return m.big.contains_key(&layer_name(l, "self_attn.ssm_in.weight"));
 }
 
+/// True if layer `l` is a gated-delta / KDA recurrent layer, keyed on the presence
+/// of its causal-conv signature tensor (the mixed `ssm_conv1d` for GDA, the `q`
+/// short-conv for KDA) — the honest per-layer interleave discriminator, absent on
+/// the arch's full-attention layers.
+fn layer_is_delta(m: &Model, l: usize) -> bool {
+	return m.big.contains_key(&layer_name(l, "self_attn.ssm_conv1d.weight"))
+		|| m.big.contains_key(&layer_name(l, "self_attn.q_conv.weight"));
+}
+
+/// The gated-delta head geometry `(d, hk, hv, key_dim, value_dim, conv_dim)`. For
+/// GDA arches `d = ssm.state_size`, `hk = ssm.group_count`, `hv =
+/// ssm.time_step_rank`; for KDA (kimi) `d = kda.head_dim` and both head counts are
+/// `kda_n_head` (separate per-projection convs, so `conv_dim = d_inner`).
+fn delta_dims(m: &Model) -> (usize, usize, usize, usize, usize, usize) {
+	let hp = &m.hp;
+	if hp.kda_head_dim > 0 {
+		let (d, h) = (hp.kda_head_dim, hp.kda_n_head);
+		let di = d * h;
+		return (d, h, h, di, di, di);
+	}
+	let (d, hk, hv) = (hp.ssm_d_state, hp.ssm_n_group, hp.ssm_dt_rank);
+	let (key_dim, value_dim) = (hk * d, hv * d);
+	return (d, hk, hv, key_dim, value_dim, 2 * key_dim + value_dim);
+}
+
+/// The gated delta-net (GDA) recurrent mixer (qwen3.5/next/moe
+/// `build_layer_attn_linear`), writing the `ssm_out`-projected mixer output to
+/// `out` without the block residual. Pre-norm, q|k|v|z projections (fused `wqkv`
+/// + `wqkv_gate`), the fused-or-separate beta/alpha, causal short conv + SiLU,
+/// per-head L2-norm of q/k, the delta-rule scan (per-head scalar decay), and the
+/// SiLU(z)-gated `ssm_norm` output. All scratch is arena-resident.
+fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let hp = &m.hp;
+	let arch = hp.arch.as_str();
+	let ne = hp.ne;
+	let (d, hk, hv, key_dim, value_dim, conv_dim) = delta_dims(m);
+	let dc = hp.ssm_d_conv;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.qkv_proj.weight"))?, t, conv_dim, ne, &ar.d_qkv)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.z_gate.weight"))?, t, value_dim, ne, &ar.d_z)?;
+	if m.big.contains_key(&layer_name(l, "self_attn.ssm_ba.weight")) {
+		gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.ssm_ba.weight"))?, t, 2 * hv, ne, &ar.d_o)?;
+		deinterleave_heads(&ar.d_o, t, 1, hv, 0, &ar.d_bt, &ar.d_q, &ar.d_k)?;
+		deinterleave_heads(&ar.d_o, t, 1, hv, 1, &ar.d_g, &ar.d_q, &ar.d_k)?;
+	} else {
+		gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.ssm_beta.weight"))?, t, hv, ne, &ar.d_bt)?;
+		gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.ssm_alpha.weight"))?, t, hv, ne, &ar.d_g)?;
+	}
+	gpu_sigmoid_into(&ar.d_bt, t * hv, &ar.d_bt)?;
+	gpu_bias_add(&ar.d_g, ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?, t, hv, &ar.d_g)?;
+	gpu_softplus(&ar.d_g, t * hv, &ar.d_g)?;
+	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
+	gpu_ssm_conv_causal_silu(&ar.d_qkv, conv_w, None, t, conv_dim, dc, &ar.d_cv)?;
+	gpu_slice_cols(&ar.d_cv, t, conv_dim, 0, key_dim, &ar.d_q)?;
+	gpu_slice_cols(&ar.d_cv, t, conv_dim, key_dim, key_dim, &ar.d_k)?;
+	gpu_slice_cols(&ar.d_cv, t, conv_dim, 2 * key_dim, value_dim, &ar.d_v)?;
+	gpu_l2norm_rows(&ar.d_q, &m.eps, t * hk, d, &ar.d_q)?;
+	gpu_l2norm_rows(&ar.d_k, &m.eps, t * hk, d, &ar.d_k)?;
+	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
+	let scale = 1.0 / (d as f64).sqrt();
+	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, hv, d, false, scale)?;
+	gpu_rmsnorm_f64(&ar.d_o, ssm_of(&m.ssm_norm, l, arch, "ssm_norm.weight")?, &m.eps, t * hv, d, &ar.d_o)?;
+	gpu_silu_into(&ar.d_z, t * value_dim, &ar.d_z)?;
+	gpu_mul_inplace(&ar.d_z, t * value_dim, &ar.d_o)?;
+	gpu_gemm_bt_f64(&ar.d_o, &m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?, t, ne, value_dim, out)?;
+	return Ok(());
+}
+
+/// The Kimi Delta-Attention (KDA) recurrent mixer (kimi-linear graph :288-372),
+/// writing the `o_proj`-projected output to `out` without the block residual.
+/// Separate q/k/v projections each with its own causal short conv + SiLU, per-head
+/// L2-norm of q/k, a per-CHANNEL log-decay LoRA (`f_b(f_a(x))`), the delta-rule
+/// scan (per-channel decay), and a sigmoid(`g_b(g_a(x))`)-gated `ssm_norm` output.
+fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let hp = &m.hp;
+	let arch = hp.arch.as_str();
+	let ne = hp.ne;
+	let (d, h) = (hp.kda_head_dim, hp.kda_n_head);
+	let di = d * h;
+	let dc = hp.ssm_d_conv;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	let qcw = ssm_of(&m.ssm_q_conv_w, l, arch, "q_conv.weight")?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, di, ne, &ar.d_qkv)?;
+	gpu_ssm_conv_causal_silu(&ar.d_qkv, qcw, None, t, di, dc, &ar.d_q)?;
+	let kcw = ssm_of(&m.ssm_k_conv_w, l, arch, "k_conv.weight")?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, di, ne, &ar.d_qkv)?;
+	gpu_ssm_conv_causal_silu(&ar.d_qkv, kcw, None, t, di, dc, &ar.d_k)?;
+	let vcw = ssm_of(&m.ssm_v_conv_w, l, arch, "v_conv.weight")?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, di, ne, &ar.d_qkv)?;
+	gpu_ssm_conv_causal_silu(&ar.d_qkv, vcw, None, t, di, dc, &ar.d_v)?;
+	gpu_l2norm_rows(&ar.d_q, &m.eps, t * h, d, &ar.d_q)?;
+	gpu_l2norm_rows(&ar.d_k, &m.eps, t * h, d, &ar.d_k)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.f_a.weight"))?, t, d, ne, &ar.d_z)?;
+	gpu_gemm_bt_f64(&ar.d_z, &m.stream(&layer_name(l, "self_attn.f_b.weight"))?, t, di, d, &ar.d_g)?;
+	gpu_bias_add(&ar.d_g, ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?, t, di, &ar.d_g)?;
+	gpu_softplus(&ar.d_g, t * di, &ar.d_g)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.ssm_beta.weight"))?, t, h, ne, &ar.d_bt)?;
+	gpu_sigmoid_into(&ar.d_bt, t * h, &ar.d_bt)?;
+	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
+	let scale = 1.0 / (d as f64).sqrt();
+	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, h, d, true, scale)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.g_a.weight"))?, t, d, ne, &ar.d_z)?;
+	gpu_gemm_bt_f64(&ar.d_z, &m.stream(&layer_name(l, "self_attn.g_b.weight"))?, t, di, d, &ar.d_qkv)?;
+	gpu_sigmoid_into(&ar.d_qkv, t * di, &ar.d_qkv)?;
+	gpu_rmsnorm_f64(&ar.d_o, ssm_of(&m.ssm_norm, l, arch, "ssm_norm.weight")?, &m.eps, t * h, d, &ar.d_o)?;
+	gpu_mul_inplace(&ar.d_qkv, t * di, &ar.d_o)?;
+	gpu_gemm_bt_f64(&ar.d_o, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, di, out)?;
+	return Ok(());
+}
+
+/// The gated delta-net full-attention companion (qwen3.5/next `build_layer_attn`),
+/// writing the `o_proj`-projected output to `out` without the block residual. A
+/// fused Q+gate projection (per-head `[Q | gate]`), per-head Q/K RMSNorm, NEOX
+/// RoPE (qwen3.5's MRoPE reduces to this for text positions), scaled GQA, then a
+/// sigmoid(gate) elementwise gate before `o_proj`.
+fn delta_full_attn(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let dd = &hp.dims[l];
+	let (nqh, hd, nkv) = (dd.nqh, dd.hd, dd.nkv);
+	let (qd, kd) = (nqh * hd, nkv * hd);
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, 2 * qd, ne, &ar.d_qkv)?;
+	deinterleave_heads(&ar.d_qkv, t, hd, nqh, 0, &ar.q, &ar.d_q, &ar.d_k)?;
+	deinterleave_heads(&ar.d_qkv, t, hd, nqh, hd, &ar.d_z, &ar.d_q, &ar.d_k)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, ne, &ar.v)?;
+	gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
+	gpu_rmsnorm_f64(&ar.k, norm_of(m, l, "k_norm")?, &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_rope_partial(&m.theta_full, t * nqh, hd, hd, nqh, &ar.q)?;
+	gpu_rope_partial(&m.theta_full, t * nkv, hd, hd, nkv, &ar.k)?;
+	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, t, 0.0, &ar.attn)?;
+	gpu_sigmoid_into(&ar.d_z, t * qd, &ar.d_z)?;
+	gpu_mul_inplace(&ar.d_z, t * qd, &ar.attn)?;
+	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, qd, out)?;
+	return Ok(());
+}
+
+/// The kimi-linear full-attention companion: absorbed MLA (deepseek2-style) with
+/// NO RoPE and NO q_a compression (kimi-linear.cpp:374-472, `wk_b`/`wv_b` present).
+/// Q rides `wq` directly, splits into a nope part (absorbed into the kv latent by
+/// `k_b`) and a pe part carried unrotated; K/V ride the `kv_a` latent (RMSNorm'd)
+/// plus the unrotated k_pe. MQA over `kv_lora+pe` keys and `kv_lora` values, then
+/// `v_b` decompress and `o_proj`. Reuses the MLA arena scratch.
+fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let nqh = hp.dims[l].nqh;
+	if nqh != 1 {
+		return Err(anyhow!("{}: kimi MLA supports n_head == 1, got {nqh}", hp.arch));
+	}
+	let (kvlr, rot) = (hp.kv_lora_rank, hp.n_rot);
+	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
+	let nope = hdk - rot;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, nqh * hdk, ne, &ar.mqb)?;
+	gpu_slice_lead_into(&ar.mqb, t * nqh, hdk, nope, &ar.mqn)?;
+	gpu_slice_cols(&ar.mqb, t * nqh, hdk, nope, rot, &ar.mqp)?;
+	gpu_gemm_bt_f64(&ar.mqn, &m.stream(&layer_name(l, "self_attn.k_b_proj.weight"))?, t, kvlr, nope, &ar.mqx)?;
+	gpu_concat_into(&ar.mqx, &ar.mqp, t, kvlr, rot, &ar.mqc)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
+	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
+	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	gpu_concat_into(&ar.mkc, &ar.mkp, t, kvlr, rot, &ar.mkk)?;
+	gpu_scale_f64_inplace(&m.attn_scale_mla, t * (kvlr + rot), &ar.mqc)?;
+	gpu_mla_attn(&ar.mqc, &ar.mkk, &ar.mkc, t, nqh, 1, kvlr + rot, kvlr, t, &ar.mrw)?;
+	gpu_gemm_bt_f64(&ar.mrw, &m.stream(&layer_name(l, "self_attn.v_b_proj.weight"))?, t, hdv, kvlr, &ar.mav)?;
+	gpu_gemm_bt_f64(&ar.mav, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, nqh * hdv, out)?;
+	return Ok(());
+}
+
+/// The routed mixture-of-experts core shared by [`layer_moe`] and the delta-net
+/// FFN: gate logits, `softmax` or `sigmoid` gating, an optional selection bias
+/// (`exp_probs_b`, added for top-k selection only), renormalized top-`used`
+/// weights, and the per-expert SwiGLU compose. Writes the routed output to
+/// `ar.mlp0`. The router/expert loop is host-driven (one D2H per expert), matching
+/// the existing MoE serialization.
+fn moe_core(
+	m: &Model,
+	l: usize,
+	cms: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	sigmoid: bool,
+	bias: Option<&GpuBuffer>,
+) -> Result<()> {
+	let hp = &m.hp;
+	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
+	let gate_w = m.stream(&layer_name(l, "router.proj.weight"))?;
+	let logits = GpuBuffer::alloc(t * nexp)?;
+	gpu_gemm_bt_f64(cms, &gate_w, t, nexp, ne, &logits)?;
+	let mut lh = vec![0.0f64; t * nexp];
+	unsafe { logits.download_async(&mut lh, ptr::null_mut()) }?;
+	let mut cms_host = vec![0.0f64; t * ne];
+	unsafe { cms.download_async(&mut cms_host, ptr::null_mut()) }?;
+	let mut bias_h = vec![0.0f64; nexp];
+	if let Some(b) = bias {
+		unsafe { b.download_async(&mut bias_h, ptr::null_mut()) }?;
+	}
+	gpu_core::hip::device_synchronize()?;
+	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
+	for p in 0..t {
+		let mut probs = lh[p * nexp..(p + 1) * nexp].to_vec();
+		if sigmoid {
+			for v in probs.iter_mut() {
+				*v = 1.0 / (1.0 + (-*v).exp());
+			}
+		} else {
+			softmax(&mut probs);
+		}
+		let mut idx: Vec<usize> = (0..nexp).collect();
+		idx.sort_by(|a, b| {
+			(probs[*b] + bias_h[*b])
+				.partial_cmp(&(probs[*a] + bias_h[*a]))
+				.unwrap_or(cmp::Ordering::Equal)
+		});
+		idx.truncate(used);
+		let ws: f64 = idx.iter().map(|&e| probs[e]).sum();
+		for &e in &idx {
+			e2p.entry(e).or_default().push((p, probs[e] / ws));
+		}
+	}
+	let mut mo = vec![0.0f64; t * ne];
+	let mut xg = vec![0.0f64; t * ne];
+	let mut dv = vec![0.0f64; t * ne];
+	for (&e, poslist) in &e2p {
+		let np = poslist.len();
+		for (i, &(p, _)) in poslist.iter().enumerate() {
+			xg[i * ne..(i + 1) * ne].copy_from_slice(&cms_host[p * ne..(p + 1) * ne]);
+		}
+		ar.moe_xg.load(&xg[..np * ne])?;
+		let es = m.expert_slot(l, e)?;
+		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
+		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
+		gpu_glu_silu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
+		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
+		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
+		unsafe {
+			ar.moe_dv.download_async(&mut dv[..np * ne], ptr::null_mut())
+		}?;
+		gpu_core::hip::device_synchronize()?;
+		for (i, &(p, w)) in poslist.iter().enumerate() {
+			for x in 0..ne {
+				mo[p * ne + x] += w * dv[i * ne + x];
+			}
+		}
+	}
+	ar.mlp0.load(&mo)?;
+	return Ok(());
+}
+
+/// The gated shared-expert branch (qwen3.5/next, kimi-linear): an unconditional
+/// SiLU-SwiGLU over the normed input `cms`, written to `out`. qwen adds a
+/// per-token sigmoid gate (`shexp.gate_inp`) scaling each row; kimi ships no gate
+/// (added straight into the MoE output).
+fn shared_expert(m: &Model, l: usize, cms: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let (ne, nffs) = (m.hp.ne, m.hp.nffe);
+	gpu_gemm_bt_f64(cms, &m.stream(&layer_name(l, "shexp.gate.weight"))?, t, nffs, ne, &ar.g)?;
+	gpu_gemm_bt_f64(cms, &m.stream(&layer_name(l, "shexp.up.weight"))?, t, nffs, ne, &ar.u)?;
+	gpu_silu_into(&ar.g, t * nffs, &ar.g)?;
+	gpu_mul_inplace(&ar.g, t * nffs, &ar.u)?;
+	gpu_gemm_bt_f64(&ar.u, &m.stream(&layer_name(l, "shexp.down.weight"))?, t, ne, nffs, out)?;
+	if m.big.contains_key(&layer_name(l, "shexp.gate_inp.weight")) {
+		gpu_gemm_bt_f64(cms, &m.stream(&layer_name(l, "shexp.gate_inp.weight"))?, t, 1, ne, &ar.d_bt)?;
+		gpu_sigmoid_into(&ar.d_bt, t, &ar.d_bt)?;
+		gpu_row_scale(out, &ar.d_bt, t, ne, out)?;
+	}
+	return Ok(());
+}
+
+/// The delta-net FFN sub-block: `pre_ff`-normed input, then a dense SwiGLU (qwen3.5)
+/// or a MoE (+ shared expert) FFN (qwen3.5-moe/next softmax + gated shexp,
+/// kimi-linear sigmoid + `exp_probs_b` bias + plain shexp), residual `resid` into
+/// `h_out`. MoE vs dense is per-layer by expert-tensor presence.
+fn delta_ffn(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	resid: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	let ne = m.hp.ne;
+	blk_norm(m, sp, l, "pre_ff", t, ne, resid, &ar.cms)?;
+	if m.layer_is_moe(l) {
+		let sigmoid = m.exp_probs_b[l].is_some();
+		moe_core(m, l, &ar.cms, t, ar, sigmoid, m.exp_probs_b[l].as_ref())?;
+		if m.big.contains_key(&layer_name(l, "shexp.down.weight")) {
+			shared_expert(m, l, &ar.cms, &ar.mo, t, ar)?;
+			gpu_add_into(&ar.mlp0, &ar.mo, t * ne, &ar.mlp0)?;
+		}
+	} else {
+		ffn(m, l, sp, t, ar, &ar.cms)?;
+	}
+	gpu_add_into(&ar.mlp0, resid, t * ne, h_out)?;
+	return Ok(());
+}
+
 /// True if layer `l` carries an attention mixer (its `q_proj` is present, fused
 /// or separate). A nemotron FFN-only layer has neither this nor `ssm_in`.
 fn layer_is_attn(m: &Model, l: usize) -> bool {
@@ -1046,6 +1323,8 @@ pub(super) fn layer_hybrid(
 			Recur::Mamba1 => mamba1_mix(m, l, h_in, out, t, ar),
 			Recur::Mamba2 => mamba2_mix(m, l, h_in, out, t, ar),
 			Recur::Plamo2 => plamo2_mix(m, l, h_in, out, t, ar),
+			Recur::GatedDelta => gated_delta_mix(m, l, h_in, out, t, ar),
+			Recur::Kda => kda_mix(m, l, h_in, out, t, ar),
 		};
 	};
 	match hy.mode {
@@ -1087,6 +1366,20 @@ pub(super) fn layer_hybrid(
 			ffn(m, l, &hy.sp, t, ar, &ar.cms)?;
 			gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
 			gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+		}
+		HyMode::DeltaNet => {
+			if layer_is_delta(m, l) {
+				match hy.recur {
+					Recur::Kda => kda_mix(m, l, h_in, &ar.o, t, ar)?,
+					_gda => gated_delta_mix(m, l, h_in, &ar.o, t, ar)?,
+				}
+			} else if hy.recur == Recur::Kda {
+				kimi_mla_attn(m, l, h_in, &ar.o, t, ar)?;
+			} else {
+				delta_full_attn(m, l, h_in, &ar.o, t, ar, attn_scale)?;
+			}
+			gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+			delta_ffn(m, l, &hy.sp, &ar.attn_out, h_out, t, ar)?;
 		}
 	}
 	return Ok(());

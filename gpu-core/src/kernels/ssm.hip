@@ -195,3 +195,112 @@ extern "C" void launch_ssm_group_rmsnorm(
     hipLaunchKernelGGL(ssm_group_rmsnorm_kernel, dim3(rows), dim3(threads), 0, stream,
         x, gamma, eps, out, rows, dpg, n_group);
 }
+
+// Per-row L2 normalize (ggml_l2_norm, ops.cpp:4174): out[row,j] = x[row,j] /
+// max(sqrt(sum_j x[row,j]^2), eps). Distinct from RMSNorm (no 1/cols factor, no
+// gamma; the divisor floors at eps, it is not added under the sqrt). rows = T*H,
+// cols = head_dim; one block per row. In-place safe.
+extern "C" __global__ void l2norm_rows_kernel(
+    const double* x, const double* eps_p, double* out, int rows, int cols
+) {
+    double eps = *eps_p;
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const double* r = x + (long)row * cols;
+    double* o = out + (long)row * cols;
+    __shared__ double smem[32];
+    double ss = 0.0;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) { double v = r[j]; ss += v * v; }
+    double tot = ssm_block_sum_bcast(ss, smem);
+    double inv = 1.0 / fmax(sqrt(tot), eps);
+    for (int j = threadIdx.x; j < cols; j += blockDim.x)
+        o[j] = r[j] * inv;
+}
+
+extern "C" void launch_l2norm_rows(
+    const double* x, const double* eps, double* out, int rows, int cols, hipStream_t stream
+) {
+    int threads = min(256, max(32, cols));
+    hipLaunchKernelGGL(l2norm_rows_kernel, dim3(rows), dim3(threads), 0, stream,
+        x, eps, out, rows, cols);
+}
+
+#define GDS_MAX_D 256
+
+// Fused gated delta-rule scan (delta-net-base.cpp build_delta_net_autoregressive
+// :289-371, applied sequentially over the T tokens of a full-batch prompt; state
+// starts at zero, no cross-call cache). Ground-truth per-token recurrence, per
+// head h, state S[i,j] (i = key/query axis, j = value/output axis):
+//   (1) decay  S[i,j] *= exp(g * a[h])   (g is a per-head scalar for GDA, a
+//              per-j vector for KDA; either way one factor per column j)
+//   (2) sk[j]  = sum_i S[i,j] * k[i]
+//   (3) d[j]   = beta[h] * (v[j] - sk[j])
+//   (4) update S[i,j] += k[i] * d[j]
+//   (5) read   o[j]  = sum_i S[i,j] * q[i]   (q pre-scaled by `scale` = 1/sqrt(d))
+// Geometry: grid = Hv workgroups (one head), blockDim = d threads. Thread j owns
+// state COLUMN S[:,j] as a private length-d register array, resident across the
+// whole T loop (zero global state traffic). k and q are staged to LDS each step
+// (every thread reads all i). v[j]/g/beta are per-thread direct reads. f64, no
+// intra-loop allocation. q/k/v are [T, Hv*d] token-major head-major; g is [T,Hv]
+// (GDA) or [T,Hv*d] (KDA); beta is [T,Hv]; a is [Hv]; out is [T, Hv*d].
+extern "C" __global__ void gated_delta_scan_kernel(
+    const double* q, const double* k, const double* v,
+    const double* g, const double* beta, const double* a,
+    double* out, int T, int Hv, int d, int per_channel, double scale
+) {
+    int h = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= d) return;
+    __shared__ double kl[GDS_MAX_D];
+    __shared__ double ql[GDS_MAX_D];
+    double state[GDS_MAX_D];
+    for (int i = 0; i < d; ++i) state[i] = 0.0;
+    double ah = a[h];
+    long stride = (long)Hv * d;
+    long hd = (long)h * d;
+    for (int t = 0; t < T; ++t) {
+        long base = (long)t * stride + hd;
+        kl[j] = k[base + j];
+        ql[j] = q[base + j] * scale;
+        __syncthreads();
+        double gval = per_channel ? g[base + j] : g[(long)t * Hv + h];
+        double dec = exp(gval * ah);
+        double sk = 0.0;
+        for (int i = 0; i < d; ++i) { state[i] *= dec; sk += state[i] * kl[i]; }
+        double dj = beta[(long)t * Hv + h] * (v[base + j] - sk);
+        double o = 0.0;
+        for (int i = 0; i < d; ++i) { state[i] += kl[i] * dj; o += state[i] * ql[i]; }
+        out[base + j] = o;
+        __syncthreads();
+    }
+}
+
+extern "C" void launch_gated_delta_scan(
+    const double* q, const double* k, const double* v,
+    const double* g, const double* beta, const double* a,
+    double* out, int T, int Hv, int d, int per_channel, double scale, hipStream_t stream
+) {
+    hipLaunchKernelGGL(gated_delta_scan_kernel, dim3(Hv), dim3(d), 0, stream,
+        q, k, v, g, beta, a, out, T, Hv, d, per_channel, scale);
+}
+
+// Per-row scalar multiply: out[r*cols + c] = x[r*cols + c] * s[r]. s is one scalar
+// per row (rows entries). The qwen3.5/next shared-expert token gate multiplies the
+// [T, n_embd] expert output by a per-token sigmoid scalar. In-place safe.
+extern "C" __global__ void row_scale_kernel(
+    const double* x, const double* s, double* out, int rows, int cols
+) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * cols;
+    if (i >= total) return;
+    out[i] = x[i] * s[i / cols];
+}
+
+extern "C" void launch_row_scale(
+    const double* x, const double* s, double* out, int rows, int cols, hipStream_t stream
+) {
+    long total = (long)rows * cols;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    hipLaunchKernelGGL(row_scale_kernel, grid, block, 0, stream, x, s, out, rows, cols);
+}

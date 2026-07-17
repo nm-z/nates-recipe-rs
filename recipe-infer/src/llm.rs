@@ -387,6 +387,17 @@ struct Hparams {
 	/// `ssm_x` projects the conv output to `[dt_dim | B | C]` with this dt width,
 	/// then `ssm_dt` up-projects it to `n_head`. Zero for the other SSM arches.
 	ssm_dt_dim: usize,
+	/// Kimi Delta Attention per-head dim (`{arch}.kda.head_dim`), the `d` of the
+	/// KDA delta-rule state; `0` for the GDA delta arches (which use `ssm_d_state`)
+	/// and non-delta arches.
+	kda_head_dim: usize,
+	/// KDA head count, derived from the recurrent-layer `ssm_dt.bias` width /
+	/// `kda_head_dim`. `0` outside kimi-linear.
+	kda_n_head: usize,
+	/// Widest gated-delta scratch element count per token (conv_dim, value_dim, the
+	/// fused Q+gate projection, the KDA g vector). `0` for non-delta arches, sizing
+	/// their delta arena buffers to 1.
+	delta_win: usize,
 	dims: Vec<LayerDims>,
 	win_elems: usize,
 	stage_bytes: usize,
@@ -472,6 +483,26 @@ impl Hparams {
 		let ssm_n_group = if ssm_n_group_raw == 0 { 1 } else { ssm_n_group_raw };
 		// plamo2 derives its low-rank dt width from n_embd (plamo2.cpp:43)
 		let ssm_dt_dim = if arch == "plamo2" { (ne / 16).max(64) } else { 0 };
+		let kda_head_dim = uint_kv_or(g, &k("kda.head_dim"), 0)?;
+		// Per-layer recurrent interleave for the delta hybrids: the declared
+		// recurrent_layers array, else n_head_kv[l]==0 (kimi, mamba-hybrid style).
+		let is_recr: Vec<bool> = match g.kv.get(&k("attention.recurrent_layers")) {
+			Some(Val::Arr(_items)) => {
+				uint_arr(g, &k("attention.recurrent_layers"))?.iter().map(|&x| x != 0).collect()
+			}
+			_other => head_count_kv.iter().map(|&kv| kv == 0).collect(),
+		};
+		// KDA head count = recurrent-layer ssm_dt.bias width / kda.head_dim.
+		let kda_n_head = if kda_head_dim > 0 {
+			is_recr
+				.iter()
+				.position(|&r| r)
+				.and_then(|l| g.tensors.get(&format!("blk.{l}.ssm_dt.bias")))
+				.map(|tt| tt.dims.iter().product::<usize>() / kda_head_dim)
+				.unwrap_or(0)
+		} else {
+			0
+		};
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
 		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
@@ -571,9 +602,20 @@ impl Hparams {
 		} else {
 			0
 		};
+		// Gated-delta activation scratch width (conv_dim, d_inner, the fused Q+gate
+		// projection, the per-head state dim). Zero for non-delta arches.
+		let delta_win = if models::is_delta_arch(&arch) {
+			let d = ssm_d_state.max(kda_head_dim);
+			let di = ssm_d_inner.max(kda_head_dim * kda_n_head);
+			let conv_dim = 2 * ssm_n_group * ssm_d_state + di;
+			[conv_dim, di, 2 * qd_max, d].into_iter().max().unwrap_or(0)
+		} else {
+			0
+		};
 		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne)
 			.max(mla_win)
-			.max(ssm_win);
+			.max(ssm_win)
+			.max(2 * qd_max * ne);
 		let lm_chunk = win_elems / ne;
 		let stage_bytes = (win_elems * 2).max(slot_bytes);
 
@@ -617,6 +659,9 @@ impl Hparams {
 			ssm_dt_rank,
 			ssm_n_group,
 			ssm_dt_dim,
+			kda_head_dim,
+			kda_n_head,
+			delta_win,
 			dims,
 			qd_max,
 			kd_max,
@@ -827,6 +872,21 @@ struct Arena {
 	/// de-interleave; sized `1` for the other SSM arches which split `in_proj`
 	/// by contiguous weight views instead.
 	ss_zx: GpuBuffer,
+	/// Gated-delta-net scratch (qwen3.5/next/moe, kimi-linear); sized `1` for the
+	/// other arches. `d_qkv` the mixed q|k|v projection, `d_cv` its conv+SiLU
+	/// output, `d_q`/`d_k`/`d_v` the per-head split + L2-normed q/k/v (and, on
+	/// full-attention layers, the fused Q+gate and its slices), `d_z` the SiLU
+	/// output gate, `d_g` the per-head (GDA) or per-channel (KDA) log-decay,
+	/// `d_bt` beta, `d_o` the delta-scan readout.
+	d_qkv: GpuBuffer,
+	d_cv: GpuBuffer,
+	d_q: GpuBuffer,
+	d_k: GpuBuffer,
+	d_v: GpuBuffer,
+	d_z: GpuBuffer,
+	d_g: GpuBuffer,
+	d_bt: GpuBuffer,
+	d_o: GpuBuffer,
 }
 
 impl Arena {
@@ -894,6 +954,15 @@ impl Arena {
 			ss_xbc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
 			ss_xbcc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
 			ss_zx: a((t * 2 * hp.ssm_d_inner * (hp.ssm_dt_dim.min(1))).max(1))?,
+			d_qkv: a((t * hp.delta_win).max(1))?,
+			d_cv: a((t * hp.delta_win).max(1))?,
+			d_q: a((t * hp.delta_win).max(1))?,
+			d_k: a((t * hp.delta_win).max(1))?,
+			d_v: a((t * hp.delta_win).max(1))?,
+			d_z: a((t * hp.delta_win).max(1))?,
+			d_g: a((t * hp.delta_win).max(1))?,
+			d_bt: a((t * hp.delta_win).max(1))?,
+			d_o: a((t * hp.delta_win).max(1))?,
 		})
 	}
 }
@@ -959,6 +1028,17 @@ struct Model {
 	ssm_dt_norm: Vec<Option<GpuBuffer>>,
 	ssm_b_norm: Vec<Option<GpuBuffer>>,
 	ssm_c_norm: Vec<Option<GpuBuffer>>,
+	/// Per-layer KDA causal-conv weights (kimi-linear), one `[d_inner, d_conv]`
+	/// channel-major buffer per q/k/v projection (kimi convolves q/k/v with three
+	/// separate depthwise kernels). `None` for the GDA arches (single mixed conv,
+	/// carried in `ssm_conv_w`) and non-recurrent layers.
+	ssm_q_conv_w: Vec<Option<GpuBuffer>>,
+	ssm_k_conv_w: Vec<Option<GpuBuffer>>,
+	ssm_v_conv_w: Vec<Option<GpuBuffer>>,
+	/// Per-layer MoE router selection bias (`exp_probs_b`, kimi-linear sigmoid
+	/// gating): added to the gating probs for top-k selection only, the weights
+	/// themselves stay unbiased. `None` for softmax-router arches.
+	exp_probs_b: Vec<Option<GpuBuffer>>,
 	hp: Hparams,
 }
 
@@ -1292,6 +1372,22 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("ssm_dt_norm", "self_attn.ssm_dt_norm.weight"),
 	("ssm_b_norm", "self_attn.ssm_b_norm.weight"),
 	("ssm_c_norm", "self_attn.ssm_c_norm.weight"),
+	("attn_gate.weight", "self_attn.z_gate.weight"),
+	("ssm_ba.weight", "self_attn.ssm_ba.weight"),
+	("ssm_alpha.weight", "self_attn.ssm_alpha.weight"),
+	("ssm_beta.weight", "self_attn.ssm_beta.weight"),
+	("ssm_conv1d_q.weight", "self_attn.q_conv.weight"),
+	("ssm_conv1d_k.weight", "self_attn.k_conv.weight"),
+	("ssm_conv1d_v.weight", "self_attn.v_conv.weight"),
+	("ssm_f_a.weight", "self_attn.f_a.weight"),
+	("ssm_f_b.weight", "self_attn.f_b.weight"),
+	("ssm_g_a.weight", "self_attn.g_a.weight"),
+	("ssm_g_b.weight", "self_attn.g_b.weight"),
+	("ffn_gate_inp_shexp.weight", "shexp.gate_inp.weight"),
+	("ffn_gate_shexp.weight", "shexp.gate.weight"),
+	("ffn_up_shexp.weight", "shexp.up.weight"),
+	("ffn_down_shexp.weight", "shexp.down.weight"),
+	("exp_probs_b.bias", "router.bias"),
 ];
 
 /// How a neutral tensor sources from a fused gguf tensor: a named row-subrange
@@ -1512,6 +1608,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ssm_dt_norm: Vec::new(),
 		ssm_b_norm: Vec::new(),
 		ssm_c_norm: Vec::new(),
+		ssm_q_conv_w: Vec::new(),
+		ssm_k_conv_w: Vec::new(),
+		ssm_v_conv_w: Vec::new(),
+		exp_probs_b: Vec::new(),
 		hp,
 	};
 
@@ -1594,6 +1694,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		m.ssm_dt_norm.push(opt_bias(&m, p("self_attn.ssm_dt_norm.weight"))?);
 		m.ssm_b_norm.push(opt_bias(&m, p("self_attn.ssm_b_norm.weight"))?);
 		m.ssm_c_norm.push(opt_bias(&m, p("self_attn.ssm_c_norm.weight"))?);
+		m.ssm_q_conv_w.push(opt_bias(&m, p("self_attn.q_conv.weight"))?);
+		m.ssm_k_conv_w.push(opt_bias(&m, p("self_attn.k_conv.weight"))?);
+		m.ssm_v_conv_w.push(opt_bias(&m, p("self_attn.v_conv.weight"))?);
+		m.exp_probs_b.push(opt_bias(&m, p("router.bias"))?);
 	}
 
 	Write::line(data, "globals + embedding table");

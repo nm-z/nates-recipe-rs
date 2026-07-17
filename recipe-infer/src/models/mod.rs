@@ -114,7 +114,11 @@ const TABLE: &[(&str, Comp)] = &[
 	})),
 	("jina-bert-v2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
 	("jina-bert-v3", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("kimi-linear", Comp::Recurrent),
+	("kimi-linear", Comp::Hybrid(Hy {
+		recur: Recur::Kda,
+		sp: Spec::dense(Ffn::SiluGate),
+		mode: HyMode::DeltaNet,
+	})),
 	("lfm2", Comp::Recurrent),
 	("lfm2moe", Comp::Recurrent),
 	("llada", Comp::Dense(Spec::dense(Ffn::SiluGate))),
@@ -171,10 +175,22 @@ const TABLE: &[(&str, Comp)] = &[
 	("qwen2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("qwen2vl", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
 	("qwen3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
-	("qwen35", Comp::Recurrent),
-	("qwen35moe", Comp::Recurrent),
+	("qwen35", Comp::Hybrid(Hy {
+		recur: Recur::GatedDelta,
+		sp: Spec::dense(Ffn::SiluGate),
+		mode: HyMode::DeltaNet,
+	})),
+	("qwen35moe", Comp::Hybrid(Hy {
+		recur: Recur::GatedDelta,
+		sp: Spec::dense(Ffn::SiluGate),
+		mode: HyMode::DeltaNet,
+	})),
 	("qwen3moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("qwen3next", Comp::Recurrent),
+	("qwen3next", Comp::Hybrid(Hy {
+		recur: Recur::GatedDelta,
+		sp: Spec::dense(Ffn::SiluGate),
+		mode: HyMode::DeltaNet,
+	})),
 	("qwen3vl", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("qwen3vlmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("refact", Comp::Dense(Spec::dense(Ffn::GeluSeq).bias())),
@@ -218,12 +234,14 @@ pub(super) const VERIFIED: &[&str] = &[
 	"cogvlm", "command-r", "dbrx", "deepseek", "deepseek2", "dots1", "dream",
 	"ernie4_5", "ernie4_5-moe", "exaone", "falcon-h1", "gemma", "gemma2", "glm-dsa",
 	"glm4moe", "granitehybrid", "grok", "grovemoe", "hunyuan-dense", "hunyuan-moe",
-	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "llada", "llada-moe", "llama4",
+	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "kimi-linear", "llada",
+	"llada-moe", "llama4",
 	"maincoder", "mamba", "mamba2", "nemotron_h", "nemotron_h_moe",
 	"minimax-m2",
 	"mistral4", "olmoe", "openelm", "paddleocr", "pangu-embedded", "phi2",
 	"phi3", "plamo", "plamo2", "qwen",
-	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen3moe", "qwen3vl",
+	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen35", "qwen35moe", "qwen3moe",
+	"qwen3next", "qwen3vl",
 	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "xverse",
 ];
 
@@ -235,6 +253,19 @@ pub(super) fn verified(arch: &str) -> bool {
 /// True if `arch` has a composition wired into [`dispatch`].
 pub(super) fn supported(arch: &str) -> bool {
 	COMPOSABLE.contains(&arch)
+}
+
+/// True if `arch` is a gated-delta-net hybrid (qwen3.5/next/moe, kimi-linear):
+/// its recurrent layers run the delta-rule scan and its dispatch is per-layer
+/// [`HyMode::DeltaNet`]. Gates the delta-scratch arena sizing so a non-delta
+/// arch pays nothing.
+pub(super) fn is_delta_arch(arch: &str) -> bool {
+	for &(name, comp) in TABLE {
+		if name == arch {
+			return matches!(comp, Comp::Hybrid(hy) if hy.mode == HyMode::DeltaNet);
+		}
+	}
+	return false;
 }
 
 /// True if `arch`'s block norm is a true LayerNorm (mean-centered). Selects the
