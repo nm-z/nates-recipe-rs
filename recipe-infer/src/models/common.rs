@@ -50,6 +50,7 @@ pub(super) struct Spec {
 	pub parallel: bool,
 	pub attn_bias: bool,
 	pub o_bias: bool,
+	pub ffn_bias: bool,
 	pub out_bias: bool,
 	pub alibi: bool,
 	pub emb_sqrt_ne: bool,
@@ -71,6 +72,7 @@ impl Spec {
 			parallel: false,
 			attn_bias: false,
 			o_bias: false,
+			ffn_bias: false,
 			out_bias: false,
 			alibi: false,
 			emb_sqrt_ne: false,
@@ -106,6 +108,10 @@ impl Spec {
 	}
 	pub(super) const fn o_bias(mut self) -> Spec {
 		self.o_bias = true;
+		self
+	}
+	pub(super) const fn ffn_bias(mut self) -> Spec {
+		self.ffn_bias = true;
 		self
 	}
 	pub(super) const fn out_bias(mut self) -> Spec {
@@ -291,6 +297,11 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) ->
 	let (ne, nff) = (hp.ne, hp.dims[l].nff);
 	let up = m.stream(&layer_name(l, "mlp.up_proj.weight"))?;
 	gpu_gemm_bt_f64(cms, &up, t, nff, ne, &ar.u)?;
+	if sp.ffn_bias
+		&& let Some(b) = &m.ffn_up_bias[l]
+	{
+		gpu_bias_add(&ar.u, b, t, nff, &ar.u)?;
+	}
 	match sp.ffn {
 		Ffn::SiluGate => {
 			gpu_gemm_bt_f64(
@@ -332,6 +343,11 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) ->
 		nff,
 		&ar.mlp0,
 	)?;
+	if sp.ffn_bias
+		&& let Some(b) = &m.ffn_down_bias[l]
+	{
+		gpu_bias_add(&ar.mlp0, b, t, ne, &ar.mlp0)?;
+	}
 	Ok(())
 }
 

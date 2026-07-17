@@ -744,6 +744,8 @@ struct Model {
 	norms: Vec<HashMap<&'static str, GpuBuffer>>,
 	norms_b: Vec<HashMap<&'static str, GpuBuffer>>,
 	o_bias: Vec<Option<GpuBuffer>>,
+	ffn_up_bias: Vec<Option<GpuBuffer>>,
+	ffn_down_bias: Vec<Option<GpuBuffer>>,
 	embed_norm: Option<(GpuBuffer, GpuBuffer)>,
 	decoder_norm: GpuBuffer,
 	decoder_norm_b: Option<GpuBuffer>,
@@ -1054,6 +1056,8 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_v.weight", "self_attn.v_proj.weight"),
 	("attn_output.weight", "self_attn.o_proj.weight"),
 	("attn_output.bias", "self_attn.o_proj.bias"),
+	("ffn_up.bias", "mlp.up_proj.bias"),
+	("ffn_down.bias", "mlp.down_proj.bias"),
 	("attn_qkv.weight", "self_attn.qkv_proj.weight"),
 	("ffn_gate.weight", "mlp.gate_proj.weight"),
 	("ffn_up.weight", "mlp.up_proj.weight"),
@@ -1248,6 +1252,8 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		norms: Vec::new(),
 		norms_b: Vec::new(),
 		o_bias: Vec::new(),
+		ffn_up_bias: Vec::new(),
+		ffn_down_bias: Vec::new(),
 		embed_norm: None,
 		decoder_norm: GpuBuffer::alloc(1)?,
 		decoder_norm_b: None,
@@ -1307,6 +1313,8 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			return Ok(None);
 		};
 		m.o_bias.push(opt_bias(&m, p("self_attn.o_proj.bias"))?);
+		m.ffn_up_bias.push(opt_bias(&m, p("mlp.up_proj.bias"))?);
+		m.ffn_down_bias.push(opt_bias(&m, p("mlp.down_proj.bias"))?);
 		let opt_small = |m: &Model, name: String| -> Result<Vec<f64>> {
 			if m.big.contains_key(&name) {
 				m.small_f64(&name)
