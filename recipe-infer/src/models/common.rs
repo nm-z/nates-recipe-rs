@@ -14,7 +14,7 @@ use gpu_core::infer_ops::{
 use gpu_core::kernels::{
 	gpu_add_into, gpu_bias_add, gpu_concat_into, gpu_gelu_into, gpu_layernorm_opt_into,
 	gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols, gpu_slice_lead_into,
-	gpu_ssm_conv_causal_silu, gpu_ssm_scan_mamba1,
+	gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm, gpu_ssm_scan_mamba1, gpu_ssm_scan_mamba2,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -685,6 +685,67 @@ pub(super) fn layer_mamba(
 
 	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
 	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
+
+	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * ne, h_out)?;
+	Ok(())
+}
+
+/// Mamba-2 grouped-SSM (SSD) decoder block (llama.cpp mamba-base.cpp:149-288):
+/// block pre-norm, one `in_proj` split into `z`/`xBC`/`dt`, a causal depthwise
+/// conv + SiLU over the WHOLE `xBC` (conv_dim = d_inner + 2*n_group*d_state), the
+/// per-head dt bias, the fused grouped selective scan (per-head scalar `A`/`D`,
+/// per-group `B`/`C` read out of the conv output by offset, D skip folded in),
+/// the `SiLU(z)` gate, the grouped gated RMSNorm (gate THEN norm), `out_proj`,
+/// and the residual. No dt/x projections (dt rides `in_proj`, B/C ride the conv);
+/// no FFN and no attention. All scratch is arena-resident.
+pub(super) fn layer_mamba2(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	let hp = &m.hp;
+	let arch = hp.arch.as_str();
+	let ne = hp.ne;
+	let di = hp.ssm_d_inner;
+	let ds = hp.ssm_d_state;
+	let ng = hp.ssm_n_group;
+	let dc = hp.ssm_d_conv;
+	let nh = hp.ssm_dt_rank;
+	let conv_dim = di + 2 * ng * ds;
+	if nh == 0 || di % nh != 0 {
+		return Err(anyhow!("{arch}: mamba-2 d_inner={di} not divisible by n_head={nh}"));
+	}
+	if ng == 0 || di % ng != 0 {
+		return Err(anyhow!("{arch}: mamba-2 d_inner={di} not divisible by n_group={ng}"));
+	}
+
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+
+	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, di * ne), t, di, ne, &ar.ss_z)?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(di * ne, conv_dim * ne), t, conv_dim, ne, &ar.ss_xbc)?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view((di + conv_dim) * ne, nh * ne), t, nh, ne, &ar.ss_dtlr)?;
+
+	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
+	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
+	gpu_ssm_conv_causal_silu(&ar.ss_xbc, conv_w, conv_b, t, conv_dim, dc, &ar.ss_xbcc)?;
+
+	let dt_b = ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?;
+	gpu_bias_add(&ar.ss_dtlr, dt_b, t, nh, &ar.ss_dtlr)?;
+
+	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
+	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
+	gpu_ssm_scan_mamba2(&ar.ss_xbcc, &ar.ss_dtlr, a, d, t, di, ds, nh, ng, conv_dim, &ar.ss_y)?;
+
+	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
+	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
+	let ssm_norm = ssm_of(&m.ssm_norm, l, arch, "ssm_norm.weight")?;
+	gpu_ssm_group_rmsnorm(&ar.ss_y, ssm_norm, &m.eps, t * ng, di / ng, ng, &ar.ss_y)?;
 
 	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
 	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, &ar.o)?;

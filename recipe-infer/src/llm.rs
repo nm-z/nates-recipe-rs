@@ -551,11 +551,14 @@ impl Hparams {
 		} else {
 			0
 		};
-		// SSM projections can be wider than any attention/FFN weight (mamba's
-		// ssm_in is 2*d_inner*ne), so the widen window must cover them too.
+		// SSM projections can be wider than any attention/FFN weight (mamba-1's
+		// ssm_in is 2*d_inner*ne; mamba-2's is d_in_proj*ne where d_in_proj =
+		// 2*d_inner + 2*n_group*d_state + n_head, with n_head=dt_rank), so the
+		// widen window must cover the widest single-tensor stream.
 		let ssm_win = if ssm_d_inner > 0 {
 			[
 				2 * ssm_d_inner * ne,
+				(2 * ssm_d_inner + 2 * ssm_n_group * ssm_d_state + ssm_dt_rank) * ne,
 				(ssm_dt_rank + 2 * ssm_d_state) * ssm_d_inner,
 				ne * ssm_d_inner,
 				ssm_d_inner * ssm_dt_rank,
@@ -803,7 +806,10 @@ struct Arena {
 	/// Selective-SSM scratch (mamba family). Sized `1` for non-SSM arches.
 	/// `ss_x`/`ss_z` the in_proj split, `ss_xc` conv+SiLU output, `ss_db` the
 	/// ssm_x projection [dt_lr|B|C], `ss_dtlr`/`ss_bb`/`ss_cc` its column slices,
-	/// `ss_dt` the projected time-step, `ss_y` the scan readout.
+	/// `ss_dt` the projected time-step, `ss_y` the scan readout. Mamba-2 adds
+	/// `ss_xbc` (in_proj xBC split, `[t, conv_dim]`) and `ss_xbcc` (its conv+SiLU
+	/// output, from which the scan reads `x`/`B`/`C` by offset); it reuses `ss_z`
+	/// for `z`, `ss_dtlr` for the `[t, n_head]` dt, and `ss_y` for the readout.
 	ss_x: GpuBuffer,
 	ss_z: GpuBuffer,
 	ss_xc: GpuBuffer,
@@ -813,6 +819,8 @@ struct Arena {
 	ss_cc: GpuBuffer,
 	ss_dt: GpuBuffer,
 	ss_y: GpuBuffer,
+	ss_xbc: GpuBuffer,
+	ss_xbcc: GpuBuffer,
 }
 
 impl Arena {
@@ -877,6 +885,8 @@ impl Arena {
 			ss_cc: a((t * hp.ssm_d_state).max(1))?,
 			ss_dt: a((t * hp.ssm_d_inner).max(1))?,
 			ss_y: a((t * hp.ssm_d_inner).max(1))?,
+			ss_xbc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
+			ss_xbcc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
 		})
 	}
 }
@@ -923,13 +933,16 @@ struct Model {
 	ls_dev: Vec<GpuBuffer>,
 	/// Per-layer selective-SSM parameters loaded as f64 device buffers (mamba
 	/// family): `ssm_conv_w` `[d_inner, d_conv]` channel-major, `ssm_conv_b`
-	/// `[d_inner]`, `ssm_a` `[d_inner, d_state]` channel-major (used directly),
-	/// `ssm_d` `[d_inner]`, `ssm_dt_b` `[d_inner]`. Empty for non-SSM layers.
+	/// `[d_inner]`, `ssm_a` `[d_inner, d_state]` (mamba-1) or `[n_head]` (mamba-2)
+	/// channel-major (used directly), `ssm_d` `[d_inner]`/`[n_head]`, `ssm_dt_b`
+	/// `[d_inner]`/`[n_head]`, `ssm_norm` the mamba-2 grouped-gated-norm gamma
+	/// `[d_inner/n_group, n_group]`. Empty for non-SSM layers.
 	ssm_conv_w: Vec<Option<GpuBuffer>>,
 	ssm_conv_b: Vec<Option<GpuBuffer>>,
 	ssm_a: Vec<Option<GpuBuffer>>,
 	ssm_d: Vec<Option<GpuBuffer>>,
 	ssm_dt_b: Vec<Option<GpuBuffer>>,
+	ssm_norm: Vec<Option<GpuBuffer>>,
 	hp: Hparams,
 }
 
@@ -1252,6 +1265,7 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("ssm_a", "self_attn.ssm_a"),
 	("ssm_d", "self_attn.ssm_d"),
 	("ssm_out.weight", "self_attn.ssm_out.weight"),
+	("ssm_norm.weight", "self_attn.ssm_norm.weight"),
 	("ssm_dt_norm.weight", "self_attn.ssm_dt_norm.weight"),
 	("ssm_b_norm.weight", "self_attn.ssm_b_norm.weight"),
 	("ssm_c_norm.weight", "self_attn.ssm_c_norm.weight"),
@@ -1470,6 +1484,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ssm_a: Vec::new(),
 		ssm_d: Vec::new(),
 		ssm_dt_b: Vec::new(),
+		ssm_norm: Vec::new(),
 		hp,
 	};
 
@@ -1537,6 +1552,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		m.ssm_a.push(opt_bias(&m, p("self_attn.ssm_a"))?);
 		m.ssm_d.push(opt_bias(&m, p("self_attn.ssm_d"))?);
 		m.ssm_dt_b.push(opt_bias(&m, p("self_attn.ssm_dt.bias"))?);
+		m.ssm_norm.push(opt_bias(&m, p("self_attn.ssm_norm.weight"))?);
 	}
 
 	Write::line(data, "globals + embedding table");

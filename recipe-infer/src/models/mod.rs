@@ -6,7 +6,10 @@ mod common;
 
 use super::{Arena, Model};
 use anyhow::{Result, bail};
-use common::{Ffn, NormK, Spec, apply_norm, layer_mamba, layer_moe, layer_recurrent, layer_spec};
+use common::{
+	Ffn, NormK, Spec, apply_norm, layer_mamba, layer_mamba2, layer_moe, layer_recurrent,
+	layer_spec,
+};
 use gpu_core::memory::GpuBuffer;
 
 /// One architecture's decode composition: a dense [`Spec`] block, a
@@ -21,6 +24,9 @@ enum Comp {
 	/// the shared recurrent mixer for the mamba family, dispatched to
 	/// [`layer_mamba`].
 	Mamba,
+	/// Mamba-2 grouped-SSM (SSD) block (norm + grouped selective scan + gated
+	/// grouped RMSNorm + residual, no FFN), dispatched to [`layer_mamba2`].
+	Mamba2,
 }
 
 /// GGUF architecture string -> decode composition. The single source of truth
@@ -102,7 +108,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("llama-embed", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
 	("maincoder", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("mamba", Comp::Mamba),
-	("mamba2", Comp::Recurrent),
+	("mamba2", Comp::Mamba2),
 	("mellum", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mimo2", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("minicpm", Comp::Dense(Spec::dense(Ffn::SiluGate).emb_scale_kv().residual_scale())),
@@ -184,7 +190,8 @@ pub(super) const VERIFIED: &[&str] = &[
 	"cogvlm", "command-r", "dbrx", "deepseek", "deepseek2", "dots1", "dream",
 	"ernie4_5", "ernie4_5-moe", "exaone", "gemma", "gemma2", "glm-dsa", "glm4moe",
 	"grok", "grovemoe", "hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3",
-	"internlm2", "llada", "llada-moe", "llama4", "maincoder", "mamba", "minimax-m2",
+	"internlm2", "llada", "llada-moe", "llama4", "maincoder", "mamba", "mamba2",
+	"minimax-m2",
 	"mistral4", "olmoe", "openelm", "paddleocr", "pangu-embedded", "phi2",
 	"phi3", "plamo", "qwen",
 	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen3moe", "qwen3vl",
@@ -211,7 +218,7 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 		if name == arch {
 			return match comp {
 				Comp::Dense(sp) | Comp::Moe(sp) => sp.norm == NormK::Layer,
-				Comp::Recurrent | Comp::Mamba => false,
+				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 => false,
 			};
 		}
 	}
@@ -226,7 +233,7 @@ fn spec_of(m: &Model) -> Option<Spec> {
 		if name == arch {
 			return match comp {
 				Comp::Dense(sp) | Comp::Moe(sp) => Some(sp),
-				Comp::Recurrent | Comp::Mamba => None,
+				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 => None,
 			};
 		}
 	}
@@ -317,6 +324,7 @@ pub(super) fn dispatch(
 				}
 				Comp::Recurrent => layer_recurrent(m, l, h_in, h_out, t, ar, attn_scale),
 				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar),
+				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar),
 			};
 		}
 	}

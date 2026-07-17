@@ -1604,6 +1604,30 @@ unsafe extern "C" {
 		d_state: i32,
 		stream: *mut c_void,
 	);
+	fn launch_ssm_scan_mamba2(
+		xbc: *const c_void,
+		dt: *const c_void,
+		a: *const c_void,
+		d: *const c_void,
+		y: *mut c_void,
+		t: i32,
+		d_inner: i32,
+		d_state: i32,
+		n_head: i32,
+		n_group: i32,
+		conv_dim: i32,
+		stream: *mut c_void,
+	);
+	fn launch_ssm_group_rmsnorm(
+		x: *const c_void,
+		gamma: *const c_void,
+		eps: *const c_void,
+		out: *mut c_void,
+		rows: i32,
+		dpg: i32,
+		n_group: i32,
+		stream: *mut c_void,
+	);
 }
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -4977,6 +5001,87 @@ pub fn gpu_ssm_scan_mamba1(
 			ci(t)?,
 			ci(d_inner)?,
 			ci(d_state)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Fused Mamba-2 grouped selective scan (ggml ssm-scan.cu mamba2 branch). One
+/// thread per inner channel holds an `N=d_state` private state across the whole
+/// `t` loop. `a`/`d` are per-head scalars `[n_head]` (used directly); `dt` is
+/// `[t, n_head]` per-head; `xbc` is the conv+SiLU output `[t, conv_dim]` whose
+/// first `d_inner` columns are `x` and whose grouped `B`/`C` blocks (offset
+/// `d_inner`) the kernel indexes by group `g = h/(n_head/n_group)`. `y` is
+/// `[t, d_inner]` token-major with the `D` skip folded in.
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_ssm_scan_mamba2(
+	xbc: &GpuBuffer,
+	dt: &GpuBuffer,
+	a: &GpuBuffer,
+	d: &GpuBuffer,
+	t: usize,
+	d_inner: usize,
+	d_state: usize,
+	n_head: usize,
+	n_group: usize,
+	conv_dim: usize,
+	y: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_ssm_scan_mamba2(
+			xbc.ptr.cast_const(),
+			dt.ptr.cast_const(),
+			a.ptr.cast_const(),
+			d.ptr.cast_const(),
+			y.ptr,
+			ci(t)?,
+			ci(d_inner)?,
+			ci(d_state)?,
+			ci(n_head)?,
+			ci(n_group)?,
+			ci(conv_dim)?,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Grouped RMSNorm with per-group gamma (Mamba-2 gated norm). The gated `[t,
+/// d_inner]` buffer is flattened to `rows = t*n_group` rows of `dpg =
+/// d_inner/n_group`; each row RMS-normalizes over `dpg` then scales by
+/// `gamma[(row % n_group)*dpg + j]`. `gamma` is `ssm_norm [dpg, n_group]`.
+/// In-place safe (`out` may alias `x`).
+///
+/// # Errors
+/// Returns [`HipError`] if a size argument overflows `i32`.
+#[inline]
+pub fn gpu_ssm_group_rmsnorm(
+	x: &GpuBuffer,
+	gamma: &GpuBuffer,
+	eps: &GpuBuffer,
+	rows: usize,
+	dpg: usize,
+	n_group: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	unsafe {
+		launch_ssm_group_rmsnorm(
+			x.ptr.cast_const(),
+			gamma.ptr.cast_const(),
+			eps.ptr.cast_const(),
+			out.ptr,
+			ci(rows)?,
+			ci(dpg)?,
+			ci(n_group)?,
 			ptr::null_mut(),
 		);
 	}
