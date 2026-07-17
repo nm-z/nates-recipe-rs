@@ -376,14 +376,17 @@ struct Hparams {
 	/// Selective-SSM dims (mamba family), all zero for non-SSM arches:
 	/// `ssm_d_conv` conv kernel width, `ssm_d_inner` inner width (=2*ne for
 	/// mamba-1), `ssm_d_state` state size N, `ssm_dt_rank` low-rank dt width,
-	/// `ssm_n_group` selective B/C groups (0 read as 1), `ssm_dt_b_c_rms` the
-	/// FalconMamba/Jamba dt/B/C RMSNorm flag.
+	/// `ssm_n_group` selective B/C groups (0 read as 1); the dt/B/C RMSNorm
+	/// is gated by tensor presence, not a flag.
 	ssm_d_conv: usize,
 	ssm_d_inner: usize,
 	ssm_d_state: usize,
 	ssm_dt_rank: usize,
 	ssm_n_group: usize,
-	ssm_dt_b_c_rms: bool,
+	/// plamo2 low-rank dt width `max(64, ne/16)` (DERIVED, not a KV): plamo2's
+	/// `ssm_x` projects the conv output to `[dt_dim | B | C]` with this dt width,
+	/// then `ssm_dt` up-projects it to `n_head`. Zero for the other SSM arches.
+	ssm_dt_dim: usize,
 	dims: Vec<LayerDims>,
 	win_elems: usize,
 	stage_bytes: usize,
@@ -467,10 +470,8 @@ impl Hparams {
 		let ssm_dt_rank = uint_kv_or(g, &k("ssm.time_step_rank"), 0)?;
 		let ssm_n_group_raw = uint_kv_or(g, &k("ssm.group_count"), 0)?;
 		let ssm_n_group = if ssm_n_group_raw == 0 { 1 } else { ssm_n_group_raw };
-		let ssm_dt_b_c_rms = match g.kv.get(&k("ssm.dt_b_c_rms")) {
-			Some(Val::Bool(b)) => *b,
-			other => other.and_then(as_uint).map(|x| x != 0).unwrap_or(false),
-		};
+		// plamo2 derives its low-rank dt width from n_embd (plamo2.cpp:43)
+		let ssm_dt_dim = if arch == "plamo2" { (ne / 16).max(64) } else { 0 };
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
 		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
@@ -560,6 +561,7 @@ impl Hparams {
 				2 * ssm_d_inner * ne,
 				(2 * ssm_d_inner + 2 * ssm_n_group * ssm_d_state + ssm_dt_rank) * ne,
 				(ssm_dt_rank + 2 * ssm_d_state) * ssm_d_inner,
+				(ssm_dt_dim + 2 * ssm_d_state) * ssm_d_inner,
 				ne * ssm_d_inner,
 				ssm_d_inner * ssm_dt_rank,
 			]
@@ -614,7 +616,7 @@ impl Hparams {
 			ssm_d_state,
 			ssm_dt_rank,
 			ssm_n_group,
-			ssm_dt_b_c_rms,
+			ssm_dt_dim,
 			dims,
 			qd_max,
 			kd_max,
@@ -821,6 +823,10 @@ struct Arena {
 	ss_y: GpuBuffer,
 	ss_xbc: GpuBuffer,
 	ss_xbcc: GpuBuffer,
+	/// plamo2 in_proj output `[t, 2*d_inner]` before the per-head z/x
+	/// de-interleave; sized `1` for the other SSM arches which split `in_proj`
+	/// by contiguous weight views instead.
+	ss_zx: GpuBuffer,
 }
 
 impl Arena {
@@ -879,14 +885,15 @@ impl Arena {
 			ss_x: a((t * hp.ssm_d_inner).max(1))?,
 			ss_z: a((t * hp.ssm_d_inner).max(1))?,
 			ss_xc: a((t * hp.ssm_d_inner).max(1))?,
-			ss_db: a((t * (hp.ssm_dt_rank + 2 * hp.ssm_d_state)).max(1))?,
-			ss_dtlr: a((t * hp.ssm_dt_rank).max(1))?,
+			ss_db: a((t * (hp.ssm_dt_rank.max(hp.ssm_dt_dim) + 2 * hp.ssm_d_state)).max(1))?,
+			ss_dtlr: a((t * hp.ssm_dt_rank.max(hp.ssm_dt_dim)).max(1))?,
 			ss_bb: a((t * hp.ssm_d_state).max(1))?,
 			ss_cc: a((t * hp.ssm_d_state).max(1))?,
 			ss_dt: a((t * hp.ssm_d_inner).max(1))?,
 			ss_y: a((t * hp.ssm_d_inner).max(1))?,
 			ss_xbc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
 			ss_xbcc: a((t * (hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state)).max(1))?,
+			ss_zx: a((t * 2 * hp.ssm_d_inner * (hp.ssm_dt_dim.min(1))).max(1))?,
 		})
 	}
 }
@@ -943,6 +950,15 @@ struct Model {
 	ssm_d: Vec<Option<GpuBuffer>>,
 	ssm_dt_b: Vec<Option<GpuBuffer>>,
 	ssm_norm: Vec<Option<GpuBuffer>>,
+	/// Per-layer FFN gate-projection bias (falcon-h1, granitehybrid SwiGLU
+	/// biases). `None` when absent.
+	ffn_gate_bias: Vec<Option<GpuBuffer>>,
+	/// Per-layer mamba-1 dt/B/C RMSNorm gammas (jamba, plamo2), applied to the
+	/// low-rank `dt`/`B`/`C` before the `ssm_dt` up-projection. `None` for the
+	/// plain mamba variant that omits them.
+	ssm_dt_norm: Vec<Option<GpuBuffer>>,
+	ssm_b_norm: Vec<Option<GpuBuffer>>,
+	ssm_c_norm: Vec<Option<GpuBuffer>>,
 	hp: Hparams,
 }
 
@@ -1244,6 +1260,7 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_output.bias", "self_attn.o_proj.bias"),
 	("ffn_up.bias", "mlp.up_proj.bias"),
 	("ffn_down.bias", "mlp.down_proj.bias"),
+	("ffn_gate.bias", "mlp.gate_proj.bias"),
 	("attn_qkv.weight", "self_attn.qkv_proj.weight"),
 	("ffn_gate.weight", "mlp.gate_proj.weight"),
 	("ffn_up.weight", "mlp.up_proj.weight"),
@@ -1269,6 +1286,12 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("ssm_dt_norm.weight", "self_attn.ssm_dt_norm.weight"),
 	("ssm_b_norm.weight", "self_attn.ssm_b_norm.weight"),
 	("ssm_c_norm.weight", "self_attn.ssm_c_norm.weight"),
+	("ffn_norm", "pre_feedforward_layernorm.weight"),
+	("post_attention_norm", "post_attention_layernorm.weight"),
+	("post_ffw_norm", "post_feedforward_layernorm.weight"),
+	("ssm_dt_norm", "self_attn.ssm_dt_norm.weight"),
+	("ssm_b_norm", "self_attn.ssm_b_norm.weight"),
+	("ssm_c_norm", "self_attn.ssm_c_norm.weight"),
 ];
 
 /// How a neutral tensor sources from a fused gguf tensor: a named row-subrange
@@ -1485,6 +1508,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ssm_d: Vec::new(),
 		ssm_dt_b: Vec::new(),
 		ssm_norm: Vec::new(),
+		ffn_gate_bias: Vec::new(),
+		ssm_dt_norm: Vec::new(),
+		ssm_b_norm: Vec::new(),
+		ssm_c_norm: Vec::new(),
 		hp,
 	};
 
@@ -1548,11 +1575,25 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			ub
 		});
 		m.ssm_conv_w.push(opt_bias(&m, p("self_attn.ssm_conv1d.weight"))?);
-		m.ssm_conv_b.push(opt_bias(&m, p("self_attn.ssm_conv1d.bias"))?);
+		// plamo2's causal conv ships no bias; synthesize a zero one for the shared launcher
+		let conv_b = match opt_bias(&m, p("self_attn.ssm_conv1d.bias"))? {
+			Some(b) => Some(b),
+			None if m.big.contains_key(&p("self_attn.ssm_conv1d.weight")) => {
+				let zb = GpuBuffer::alloc(m.hp.ssm_d_inner.max(1))?;
+				zb.load(&vec![0.0f64; m.hp.ssm_d_inner.max(1)])?;
+				Some(zb)
+			}
+			None => None,
+		};
+		m.ssm_conv_b.push(conv_b);
 		m.ssm_a.push(opt_bias(&m, p("self_attn.ssm_a"))?);
 		m.ssm_d.push(opt_bias(&m, p("self_attn.ssm_d"))?);
 		m.ssm_dt_b.push(opt_bias(&m, p("self_attn.ssm_dt.bias"))?);
 		m.ssm_norm.push(opt_bias(&m, p("self_attn.ssm_norm.weight"))?);
+		m.ffn_gate_bias.push(opt_bias(&m, p("mlp.gate_proj.bias"))?);
+		m.ssm_dt_norm.push(opt_bias(&m, p("self_attn.ssm_dt_norm.weight"))?);
+		m.ssm_b_norm.push(opt_bias(&m, p("self_attn.ssm_b_norm.weight"))?);
+		m.ssm_c_norm.push(opt_bias(&m, p("self_attn.ssm_c_norm.weight"))?);
 	}
 
 	Write::line(data, "globals + embedding table");

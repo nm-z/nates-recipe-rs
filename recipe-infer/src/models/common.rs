@@ -12,9 +12,10 @@ use gpu_core::infer_ops::{
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{
-	gpu_add_into, gpu_bias_add, gpu_concat_into, gpu_gelu_into, gpu_layernorm_opt_into,
-	gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols, gpu_slice_lead_into,
-	gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm, gpu_ssm_scan_mamba1, gpu_ssm_scan_mamba2,
+	gpu_add_into, gpu_bias_add, gpu_broadcast_mul, gpu_concat_into, gpu_copy_into, gpu_gelu_into,
+	gpu_layernorm_opt_into, gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols,
+	gpu_slice_lead_into, gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm, gpu_ssm_scan_mamba1,
+	gpu_ssm_scan_mamba2,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -189,6 +190,56 @@ impl Spec {
 		self.mla = true;
 		self
 	}
+	pub(super) const fn no_rope(mut self) -> Spec {
+		self.rope = false;
+		self
+	}
+}
+
+/// Which selective-SSM mixer a hybrid arch's recurrent layers use.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Recur {
+	/// Mamba-1 body (`ssm_x` low-rank split, `ssm_dt` up-projection, optional
+	/// dt/B/C RMSNorm), shared with jamba.
+	Mamba1,
+	/// Mamba-2 grouped-SSD body (fused `in_proj`, conv-carried B/C, per-head
+	/// scalar A/D, grouped gated RMSNorm), shared with falcon-h1, granitehybrid,
+	/// nemotron_h.
+	Mamba2,
+	/// plamo2 mixer: mamba-2 head structure (per-head scalar A/D) with mamba-1
+	/// projections (`ssm_x` -> B/C/dt, `ssm_dt` up-projection), always-on dt/B/C
+	/// RMSNorm, no grouped gated norm, no conv bias, and a per-head-interleaved
+	/// z/x split of `in_proj`.
+	Plamo2,
+}
+
+/// How a hybrid arch lays out its per-layer blocks.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum HyMode {
+	/// jamba, granitehybrid: each layer is a mixer sub-block (recurrent OR
+	/// attention, chosen per layer) followed by an FFN sub-block, two residuals.
+	MixerFfn,
+	/// falcon-h1: every layer runs the attention AND mamba-2 branches on the same
+	/// normed input, sums them, adds the residual, then an FFN sub-block.
+	Parallel,
+	/// nemotron_h: each layer is EXACTLY ONE body (mamba-2, attention, or FFN),
+	/// one residual; the triage is by tensor presence.
+	Triage,
+	/// plamo2: sandwich norms wrap both halves. Pre-norm, mixer, post-norm, then a
+	/// residual; then pre-ff-norm, SwiGLU FFN, post-ff-norm, then a residual.
+	Sandwich,
+}
+
+/// A per-layer attention/recurrent-interleaving composition. `sp` drives both the
+/// attention branch (rope/bias/qk-norm/o-bias) and the FFN branch (activation +
+/// bias); `recur` picks the SSM mixer for recurrent layers; `mode` the block
+/// layout. Per-layer routing is by tensor presence (`ssm_in` vs `q_proj`), the
+/// honest signal for which mixer a block carries.
+#[derive(Clone, Copy)]
+pub(super) struct Hy {
+	pub recur: Recur,
+	pub sp: Spec,
+	pub mode: HyMode,
 }
 
 /// The named norm weight for layer `l`, or an error carrying the arch and the
@@ -301,6 +352,8 @@ fn attn_block(
 		ne,
 		&ar.v,
 	)?;
+	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2 regress with them), so attn_bias stays a no-op
+	let _ = sp.attn_bias;
 	if sp.qk_norm {
 		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
 		gpu_rmsnorm_f64(&ar.k, norm_of(m, l, "k_norm")?, &m.eps, t * nkv, hd, &ar.k)?;
@@ -333,7 +386,6 @@ fn attn_block(
 		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.o)?;
 	}
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	let _ = sp.attn_bias;
 	Ok(())
 }
 
@@ -437,6 +489,11 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) ->
 				ne,
 				&ar.g,
 			)?;
+			if sp.ffn_bias
+				&& let Some(b) = &m.ffn_gate_bias[l]
+			{
+				gpu_bias_add(&ar.g, b, t, nff, &ar.g)?;
+			}
 			gpu_silu_into(&ar.g, t * nff, &ar.g)?;
 			gpu_mul_inplace(&ar.u, t * nff, &ar.g)?;
 		}
@@ -449,6 +506,11 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) ->
 				ne,
 				&ar.g,
 			)?;
+			if sp.ffn_bias
+				&& let Some(b) = &m.ffn_gate_bias[l]
+			{
+				gpu_bias_add(&ar.g, b, t, nff, &ar.g)?;
+			}
 			gpu_gelu_into(&ar.g, t * nff, &ar.g)?;
 			gpu_mul_inplace(&ar.u, t * nff, &ar.g)?;
 		}
@@ -640,6 +702,25 @@ pub(super) fn layer_mamba(
 	t: usize,
 	ar: &Arena,
 ) -> Result<()> {
+	mamba1_mix(m, l, h_in, &ar.o, t, ar)?;
+	gpu_add_into(&ar.o, h_in, t * m.hp.ne, h_out)?;
+	return Ok(());
+}
+
+/// The mamba-1 mixer body: block pre-norm through `out_proj`, writing the
+/// projected output to `out` WITHOUT the block residual (the caller adds it).
+/// The optional dt/B/C RMSNorm (jamba, plamo2) applies to the low-rank
+/// `dt`/`B`/`C` by presence, before the `ssm_dt` up-projection, matching
+/// `llama.cpp` mamba-base.cpp:97-101; a plain mamba layer ships none and runs
+/// the identical numeric path it did before.
+fn mamba1_mix(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
 	let ne = hp.ne;
@@ -653,9 +734,6 @@ pub(super) fn layer_mamba(
 			"{arch}: mamba-1 block expects a single selective group, got n_group={}",
 			hp.ssm_n_group
 		));
-	}
-	if hp.ssm_dt_b_c_rms || m.norms[l].contains_key("ssm_dt_norm") {
-		return Err(anyhow!("{arch}: dt/B/C RMSNorm mamba variant not wired"));
 	}
 
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
@@ -674,6 +752,16 @@ pub(super) fn layer_mamba(
 	gpu_slice_cols(&ar.ss_db, t, dbw, dr, ds, &ar.ss_bb)?;
 	gpu_slice_cols(&ar.ss_db, t, dbw, dr + ds, ds, &ar.ss_cc)?;
 
+	if let Some(g) = &m.ssm_dt_norm[l] {
+		gpu_rmsnorm_f64(&ar.ss_dtlr, g, &m.eps, t, dr, &ar.ss_dtlr)?;
+	}
+	if let Some(g) = &m.ssm_b_norm[l] {
+		gpu_rmsnorm_f64(&ar.ss_bb, g, &m.eps, t, ds, &ar.ss_bb)?;
+	}
+	if let Some(g) = &m.ssm_c_norm[l] {
+		gpu_rmsnorm_f64(&ar.ss_cc, g, &m.eps, t, ds, &ar.ss_cc)?;
+	}
+
 	let w_dt = m.stream(&layer_name(l, "self_attn.ssm_dt.weight"))?;
 	gpu_gemm_bt_f64(&ar.ss_dtlr, &w_dt, t, di, dr, &ar.ss_dt)?;
 	let dt_b = ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?;
@@ -687,9 +775,8 @@ pub(super) fn layer_mamba(
 	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
 
 	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
-	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, &ar.o)?;
-	gpu_add_into(&ar.o, h_in, t * ne, h_out)?;
-	Ok(())
+	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, out)?;
+	return Ok(());
 }
 
 /// Mamba-2 grouped-SSM (SSD) decoder block (llama.cpp mamba-base.cpp:149-288):
@@ -705,6 +792,23 @@ pub(super) fn layer_mamba2(
 	l: usize,
 	h_in: &GpuBuffer,
 	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	mamba2_mix(m, l, h_in, &ar.o, t, ar)?;
+	gpu_add_into(&ar.o, h_in, t * m.hp.ne, h_out)?;
+	return Ok(());
+}
+
+/// The mamba-2 mixer body: block pre-norm through `out_proj`, writing the
+/// projected output to `out` WITHOUT the block residual (the caller adds it).
+/// Shared verbatim by the mamba-2 hybrids (falcon-h1, granitehybrid,
+/// nemotron_h) and the pure `mamba2` arch.
+fn mamba2_mix(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
 ) -> Result<()> {
@@ -748,7 +852,242 @@ pub(super) fn layer_mamba2(
 	gpu_ssm_group_rmsnorm(&ar.ss_y, ssm_norm, &m.eps, t * ng, di / ng, ng, &ar.ss_y)?;
 
 	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
-	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, &ar.o)?;
-	gpu_add_into(&ar.o, h_in, t * ne, h_out)?;
-	Ok(())
+	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, out)?;
+	return Ok(());
+}
+
+/// De-interleaves one of the two per-head sub-vectors from a `[t, 2*head_dim*
+/// n_head]` tensor whose per-head layout is `[first_half | second_half]`, into a
+/// contiguous `[t, head_dim*n_head]` `out`. `within_off` selects the half (`0`
+/// for the first, `head_dim` for the second). `sa`/`sb` are `[t, d_inner]`
+/// scratch. plamo2's `in_proj` output splits `z`/`x` this way (plamo2.cpp:293-310).
+fn deinterleave_heads(
+	zx: &GpuBuffer,
+	t: usize,
+	head_dim: usize,
+	n_head: usize,
+	within_off: usize,
+	out: &GpuBuffer,
+	sa: &GpuBuffer,
+	sb: &GpuBuffer,
+) -> Result<()> {
+	let total = 2 * head_dim * n_head;
+	gpu_slice_cols(zx, t, total, within_off, head_dim, out)?;
+	for h in 1..n_head {
+		gpu_slice_cols(zx, t, total, h * 2 * head_dim + within_off, head_dim, sa)?;
+		gpu_concat_into(out, sa, t, h * head_dim, head_dim, sb)?;
+		gpu_copy_into(sb, t * (h + 1) * head_dim, out)?;
+	}
+	return Ok(());
+}
+
+/// The plamo2 mixer body (plamo2.cpp:258-426), writing `out_proj` to `out`
+/// without the block residual. mamba-2 head scan (per-head scalar A/D, single
+/// shared B/C) fed by mamba-1 front-end projections: per-head z/x de-interleave
+/// of `in_proj`, causal conv + SiLU (no bias), `ssm_x` -> `[B|C|dt]`, always-on
+/// dt/B/C RMSNorm, `ssm_dt` up-projection, then the packed grouped scan reused
+/// from mamba-2 (`n_group == 1`). No grouped gated RMSNorm.
+fn plamo2_mix(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	let hp = &m.hp;
+	let arch = hp.arch.as_str();
+	let ne = hp.ne;
+	let di = hp.ssm_d_inner;
+	let ds = hp.ssm_d_state;
+	let nh = hp.ssm_dt_rank;
+	let dc = hp.ssm_d_conv;
+	let dtd = hp.ssm_dt_dim;
+	if nh == 0 || di % nh != 0 {
+		return Err(anyhow!("{arch}: plamo2 d_inner={di} not divisible by n_head={nh}"));
+	}
+	let head_dim = di / nh;
+	let bcd = dtd + 2 * ds;
+	let conv_dim = di + 2 * ds;
+
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+
+	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
+	gpu_gemm_bt_f64(&ar.x, &w_in, t, 2 * di, ne, &ar.ss_zx)?;
+	deinterleave_heads(&ar.ss_zx, t, head_dim, nh, head_dim, &ar.ss_x, &ar.ss_dt, &ar.ss_y)?;
+	deinterleave_heads(&ar.ss_zx, t, head_dim, nh, 0, &ar.ss_z, &ar.ss_dt, &ar.ss_y)?;
+
+	let conv_w = ssm_of(&m.ssm_conv_w, l, arch, "ssm_conv1d.weight")?;
+	let conv_b = ssm_of(&m.ssm_conv_b, l, arch, "ssm_conv1d.bias")?;
+	gpu_ssm_conv_causal_silu(&ar.ss_x, conv_w, conv_b, t, di, dc, &ar.ss_xc)?;
+
+	let w_x = m.stream(&layer_name(l, "self_attn.ssm_x.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_xc, &w_x, t, bcd, di, &ar.ss_db)?;
+	gpu_slice_cols(&ar.ss_db, t, bcd, 0, ds, &ar.ss_bb)?;
+	gpu_slice_cols(&ar.ss_db, t, bcd, ds, ds, &ar.ss_cc)?;
+	gpu_slice_cols(&ar.ss_db, t, bcd, 2 * ds, dtd, &ar.ss_dtlr)?;
+
+	gpu_rmsnorm_f64(&ar.ss_bb, ssm_of(&m.ssm_b_norm, l, arch, "ssm_b_norm")?, &m.eps, t, ds, &ar.ss_bb)?;
+	gpu_rmsnorm_f64(&ar.ss_cc, ssm_of(&m.ssm_c_norm, l, arch, "ssm_c_norm")?, &m.eps, t, ds, &ar.ss_cc)?;
+	gpu_rmsnorm_f64(&ar.ss_dtlr, ssm_of(&m.ssm_dt_norm, l, arch, "ssm_dt_norm")?, &m.eps, t, dtd, &ar.ss_dtlr)?;
+
+	let dt = ar.ss_dt.view(0, t * nh);
+	let w_dt = m.stream(&layer_name(l, "self_attn.ssm_dt.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_dtlr, &w_dt, t, nh, dtd, &dt)?;
+	gpu_bias_add(&dt, ssm_of(&m.ssm_dt_b, l, arch, "ssm_dt.bias")?, t, nh, &dt)?;
+
+	gpu_concat_into(&ar.ss_bb, &ar.ss_cc, t, ds, ds, &ar.ss_db)?;
+	gpu_concat_into(&ar.ss_xc, &ar.ss_db.view(0, t * 2 * ds), t, di, 2 * ds, &ar.ss_xbc)?;
+
+	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
+	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
+	gpu_ssm_scan_mamba2(&ar.ss_xbc, &dt, a, d, t, di, ds, nh, 1, conv_dim, &ar.ss_y)?;
+
+	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
+	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
+
+	let w_out = m.stream(&layer_name(l, "self_attn.ssm_out.weight"))?;
+	gpu_gemm_bt_f64(&ar.ss_y, &w_out, t, ne, di, out)?;
+	return Ok(());
+}
+
+/// The plamo2 attention body (plamo2.cpp:203-256): pre-norm, fused-QKV split
+/// (via [`synth_qkv_slices`]), per-head Q/K RMSNorm (per-`(head,dim)` gamma),
+/// RoPE, GQA, `o_proj`. Writes the projection to `out` without the block
+/// residual (the sandwich wrapper adds it). No output bias.
+fn plamo2_attn(
+	m: &Model,
+	l: usize,
+	h_in: &GpuBuffer,
+	out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let d = &hp.dims[l];
+	let nqh = d.nqh;
+	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, ne, &ar.q)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, ne, &ar.v)?;
+	gpu_rmsnorm_f64_nogamma(&ar.q, &m.eps, t * nqh, hd, &ar.q)?;
+	gpu_broadcast_mul(&ar.q, norm_of(m, l, "q_norm")?, t * qd, qd, &ar.q)?;
+	gpu_rmsnorm_f64_nogamma(&ar.k, &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_broadcast_mul(&ar.k, norm_of(m, l, "k_norm")?, t * kd, kd, &ar.k)?;
+	gpu_rope_partial(&m.theta_full, t * nqh, hd, hd, nqh, &ar.q)?;
+	gpu_rope_partial(&m.theta_full, t * nkv, hd, hd, nkv, &ar.k)?;
+	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, t, 0.0, &ar.attn)?;
+	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, qd, out)?;
+	return Ok(());
+}
+
+/// True if layer `l` carries a recurrent SSM mixer (its `ssm_in` projection is
+/// present) rather than attention: the honest per-layer interleave signal, the
+/// same discriminator `llama.cpp` derives from `n_head_kv(l)==0`.
+fn layer_is_recur(m: &Model, l: usize) -> bool {
+	return m.big.contains_key(&layer_name(l, "self_attn.ssm_in.weight"));
+}
+
+/// True if layer `l` carries an attention mixer (its `q_proj` is present, fused
+/// or separate). A nemotron FFN-only layer has neither this nor `ssm_in`.
+fn layer_is_attn(m: &Model, l: usize) -> bool {
+	return m.big.contains_key(&layer_name(l, "self_attn.q_proj.weight"));
+}
+
+/// The FFN half of a hybrid block: pre-`norm_key` norm of `src` into `ar.cms`,
+/// the dense FFN into `ar.mlp0`, residual `resid` into `h_out`. Per-layer MoE
+/// FFN (real jamba/granite/nemotron-MoE checkpoints) is not wired; the parity
+/// fixtures are all dense (`expert_count == 0`), so a MoE layer fails clean here.
+fn hybrid_ffn(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	norm_key: &str,
+	src: &GpuBuffer,
+	resid: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+) -> Result<()> {
+	let ne = m.hp.ne;
+	if m.layer_is_moe(l) {
+		return Err(anyhow!(
+			"{}: hybrid per-layer MoE FFN not wired (fixtures are dense)",
+			m.hp.arch
+		));
+	}
+	blk_norm(m, sp, l, norm_key, t, ne, src, &ar.cms)?;
+	ffn(m, l, sp, t, ar, &ar.cms)?;
+	gpu_add_into(&ar.mlp0, resid, t * ne, h_out)?;
+	return Ok(());
+}
+
+/// Per-layer attention/recurrent-interleaving decoder block for the mamba
+/// hybrids. Routes each layer to its mixer by tensor presence and composes the
+/// block per `hy.mode`, reusing the verified [`attn_block`], [`mamba1_mix`],
+/// [`mamba2_mix`], and [`ffn`] drivers 1:1 with the arch's `llama.cpp` graph.
+pub(super) fn layer_hybrid(
+	m: &Model,
+	l: usize,
+	hy: &Hy,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let ne = m.hp.ne;
+	let recur_mix = |out: &GpuBuffer| -> Result<()> {
+		return match hy.recur {
+			Recur::Mamba1 => mamba1_mix(m, l, h_in, out, t, ar),
+			Recur::Mamba2 => mamba2_mix(m, l, h_in, out, t, ar),
+			Recur::Plamo2 => plamo2_mix(m, l, h_in, out, t, ar),
+		};
+	};
+	match hy.mode {
+		HyMode::Parallel => {
+			attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
+			mamba2_mix(m, l, h_in, &ar.o, t, ar)?;
+			gpu_add_into(&ar.attn_out, &ar.o, t * ne, &ar.mlp)?;
+			hybrid_ffn(m, l, &hy.sp, "pre_ff", &ar.mlp, &ar.mlp, h_out, t, ar)?;
+		}
+		HyMode::MixerFfn => {
+			if layer_is_recur(m, l) {
+				recur_mix(&ar.o)?;
+				gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+			} else {
+				attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
+			}
+			hybrid_ffn(m, l, &hy.sp, "pre_ff", &ar.attn_out, &ar.attn_out, h_out, t, ar)?;
+		}
+		HyMode::Triage => {
+			if layer_is_recur(m, l) {
+				recur_mix(&ar.o)?;
+				gpu_add_into(&ar.o, h_in, t * ne, h_out)?;
+			} else if layer_is_attn(m, l) {
+				attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
+				gpu_copy_into(&ar.attn_out, t * ne, h_out)?;
+			} else {
+				hybrid_ffn(m, l, &hy.sp, "input", h_in, h_in, h_out, t, ar)?;
+			}
+		}
+		HyMode::Sandwich => {
+			if layer_is_recur(m, l) {
+				recur_mix(&ar.o)?;
+			} else {
+				plamo2_attn(m, l, h_in, &ar.o, t, ar, attn_scale)?;
+			}
+			gpu_rmsnorm_f64(&ar.o, norm_of(m, l, "post_attn")?, &m.eps, t, ne, &ar.o)?;
+			gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+			blk_norm(m, &hy.sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
+			ffn(m, l, &hy.sp, t, ar, &ar.cms)?;
+			gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
+			gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+		}
+	}
+	return Ok(());
 }

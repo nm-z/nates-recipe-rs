@@ -7,8 +7,8 @@ mod common;
 use super::{Arena, Model};
 use anyhow::{Result, bail};
 use common::{
-	Ffn, NormK, Spec, apply_norm, layer_mamba, layer_mamba2, layer_moe, layer_recurrent,
-	layer_spec,
+	Ffn, Hy, HyMode, NormK, Recur, Spec, apply_norm, layer_hybrid, layer_mamba, layer_mamba2,
+	layer_moe, layer_recurrent, layer_spec,
 };
 use gpu_core::memory::GpuBuffer;
 
@@ -27,6 +27,10 @@ enum Comp {
 	/// Mamba-2 grouped-SSM (SSD) block (norm + grouped selective scan + gated
 	/// grouped RMSNorm + residual, no FFN), dispatched to [`layer_mamba2`].
 	Mamba2,
+	/// Per-layer attention/recurrent-interleaving block for the mamba hybrids
+	/// (jamba, falcon-h1, granitehybrid, nemotron_h): each layer's mixer is
+	/// chosen by tensor presence, dispatched to [`layer_hybrid`].
+	Hybrid(Hy),
 }
 
 /// GGUF architecture string -> decode composition. The single source of truth
@@ -68,7 +72,11 @@ const TABLE: &[(&str, Comp)] = &[
 	("exaone4", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich().no_pre_norm())),
 	("exaone-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("falcon", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().parallel().attn_norm2())),
-	("falcon-h1", Comp::Recurrent),
+	("falcon-h1", Comp::Hybrid(Hy {
+		recur: Recur::Mamba2,
+		sp: Spec::dense(Ffn::SiluGate).ffn_bias(),
+		mode: HyMode::Parallel,
+	})),
 	("gemma", Comp::Dense(Spec::dense(Ffn::GeluGate).emb_sqrt_ne())),
 	("gemma2", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().emb_sqrt_ne().final_softcap())),
 	("gemma3", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
@@ -84,7 +92,11 @@ const TABLE: &[(&str, Comp)] = &[
 	("gptneox", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias())),
 	("gpt-oss", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("granite", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
-	("granitehybrid", Comp::Recurrent),
+	("granitehybrid", Comp::Hybrid(Hy {
+		recur: Recur::Mamba2,
+		sp: Spec::dense(Ffn::SiluGate).o_bias().ffn_bias(),
+		mode: HyMode::MixerFfn,
+	})),
 	("granitemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).o_bias())),
 	("grok", Comp::Moe(Spec::dense(Ffn::SiluGate).emb_scale_kv())),
 	("grovemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
@@ -95,7 +107,11 @@ const TABLE: &[(&str, Comp)] = &[
 	("internlm2", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("jais", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
 	("jais2", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias().ffn_bias())),
-	("jamba", Comp::Recurrent),
+	("jamba", Comp::Hybrid(Hy {
+		recur: Recur::Mamba1,
+		sp: Spec::dense(Ffn::SiluGate).no_rope(),
+		mode: HyMode::MixerFfn,
+	})),
 	("jina-bert-v2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
 	("jina-bert-v3", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("kimi-linear", Comp::Recurrent),
@@ -119,8 +135,16 @@ const TABLE: &[(&str, Comp)] = &[
 	("modern-bert", Comp::Dense(Spec::dense(Ffn::GeluGate).encoder())),
 	("mpt", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
 	("nemotron", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias().ffn_bias())),
-	("nemotron_h", Comp::Recurrent),
-	("nemotron_h_moe", Comp::Recurrent),
+	("nemotron_h", Comp::Hybrid(Hy {
+		recur: Recur::Mamba2,
+		sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
+		mode: HyMode::Triage,
+	})),
+	("nemotron_h_moe", Comp::Hybrid(Hy {
+		recur: Recur::Mamba2,
+		sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
+		mode: HyMode::Triage,
+	})),
 	("neo-bert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
 	("nomic-bert", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("nomic-bert-moe", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
@@ -135,7 +159,11 @@ const TABLE: &[(&str, Comp)] = &[
 	("phi3", Comp::Moe(Spec::dense(Ffn::SiluGate).out_bias())),
 	("phimoe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("plamo", Comp::Dense(Spec::dense(Ffn::SiluGate).parallel())),
-	("plamo2", Comp::Recurrent),
+	("plamo2", Comp::Hybrid(Hy {
+		recur: Recur::Plamo2,
+		sp: Spec::dense(Ffn::SiluGate),
+		mode: HyMode::Sandwich,
+	})),
 	("plamo3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich())),
 	("plm", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
 	("qwen", Comp::Dense(Spec::dense(Ffn::SiluGate))),
@@ -188,12 +216,13 @@ pub(super) const COMPOSABLE: &[&str] = &supported_names();
 pub(super) const VERIFIED: &[&str] = &[
 	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
 	"cogvlm", "command-r", "dbrx", "deepseek", "deepseek2", "dots1", "dream",
-	"ernie4_5", "ernie4_5-moe", "exaone", "gemma", "gemma2", "glm-dsa", "glm4moe",
-	"grok", "grovemoe", "hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3",
-	"internlm2", "llada", "llada-moe", "llama4", "maincoder", "mamba", "mamba2",
+	"ernie4_5", "ernie4_5-moe", "exaone", "falcon-h1", "gemma", "gemma2", "glm-dsa",
+	"glm4moe", "granitehybrid", "grok", "grovemoe", "hunyuan-dense", "hunyuan-moe",
+	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "llada", "llada-moe", "llama4",
+	"maincoder", "mamba", "mamba2", "nemotron_h", "nemotron_h_moe",
 	"minimax-m2",
 	"mistral4", "olmoe", "openelm", "paddleocr", "pangu-embedded", "phi2",
-	"phi3", "plamo", "qwen",
+	"phi3", "plamo", "plamo2", "qwen",
 	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen3moe", "qwen3vl",
 	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "xverse",
 ];
@@ -218,7 +247,7 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 		if name == arch {
 			return match comp {
 				Comp::Dense(sp) | Comp::Moe(sp) => sp.norm == NormK::Layer,
-				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 => false,
+				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 | Comp::Hybrid(_) => false,
 			};
 		}
 	}
@@ -233,7 +262,7 @@ fn spec_of(m: &Model) -> Option<Spec> {
 		if name == arch {
 			return match comp {
 				Comp::Dense(sp) | Comp::Moe(sp) => Some(sp),
-				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 => None,
+				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 | Comp::Hybrid(_) => None,
 			};
 		}
 	}
@@ -325,6 +354,7 @@ pub(super) fn dispatch(
 				Comp::Recurrent => layer_recurrent(m, l, h_in, h_out, t, ar, attn_scale),
 				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar),
 				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar),
+				Comp::Hybrid(hy) => layer_hybrid(m, l, &hy, h_in, h_out, t, ar, attn_scale),
 			};
 		}
 	}
