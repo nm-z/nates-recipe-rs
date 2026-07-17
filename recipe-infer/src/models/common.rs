@@ -8,12 +8,12 @@ use super::super::{Arena, Model, layer_name, softmax};
 use anyhow::{Result, anyhow};
 use core::ptr;
 use gpu_core::infer_ops::{
-	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rmsnorm_f64_nogamma,
-	gpu_rope_partial, gpu_scale_f64_inplace,
+	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_mla_attn, gpu_rmsnorm_f64,
+	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{
-	gpu_add_into, gpu_bias_add, gpu_gelu_into, gpu_layernorm_opt_into, gpu_mul_inplace,
-	gpu_relu_into, gpu_silu_into,
+	gpu_add_into, gpu_bias_add, gpu_concat_into, gpu_gelu_into, gpu_layernorm_opt_into,
+	gpu_mul_inplace, gpu_relu_into, gpu_silu_into, gpu_slice_cols, gpu_slice_lead_into,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -71,6 +71,10 @@ pub(super) struct Spec {
 	pub final_softcap: bool,
 	pub bidir: bool,
 	pub rope: bool,
+	/// Multi-head Latent Attention (deepseek2 family): the attention branch reads
+	/// latent q/kv projections instead of plain q/k/v, so [`attn_block`] delegates
+	/// to [`mla_attn_block`]. The FFN branch is unaffected.
+	pub mla: bool,
 	pub ffn: Ffn,
 }
 
@@ -97,6 +101,7 @@ impl Spec {
 			final_softcap: false,
 			bidir: false,
 			rope: true,
+			mla: false,
 			ffn,
 		}
 	}
@@ -179,6 +184,10 @@ impl Spec {
 		self.rope = false;
 		self
 	}
+	pub(super) const fn mla(mut self) -> Spec {
+		self.mla = true;
+		self
+	}
 }
 
 /// The named norm weight for layer `l`, or an error carrying the arch and the
@@ -249,6 +258,9 @@ fn attn_block(
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
 ) -> Result<()> {
+	if sp.mla {
+		return mla_attn_block(m, l, sp, h_in, t, ar);
+	}
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let d = &hp.dims[l];
@@ -322,6 +334,51 @@ fn attn_block(
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
 	let _ = sp.attn_bias;
 	Ok(())
+}
+
+/// Multi-head Latent Attention block (deepseek2 family), the absorbed MLA graph
+/// of `llama.cpp` `build_deepseek2` for `n_head == 1`. Q rides the q_lora
+/// bottleneck (`q_a` -> RMSNorm -> `q_b`) then splits per head into a nope part and
+/// a RoPE part; the nope part is absorbed into the kv latent by `k_b` and
+/// concatenated with the roped q_pe to form Qcur. K/V ride the kv_lora bottleneck
+/// (`kv_a`) split into the latent (RMSNorm'd -> Vcur, also Kcur's nope half) and the
+/// shared roped k_pe. MQA attention over `kv_lora+rope` keys and `kv_lora` values
+/// then decompresses through `v_b` and projects out through `o_proj`; residual into
+/// `ar.attn_out`. Composed 1:1 from the shared `gpu_*` kernels, nothing per-arch.
+fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let nqh = hp.dims[l].nqh;
+	if nqh != 1 {
+		return Err(anyhow!("{}: MLA absorbed path supports n_head == 1, got {nqh}", hp.arch));
+	}
+	let (qlr, kvlr, rot) = (hp.q_lora_rank, hp.kv_lora_rank, hp.n_rot);
+	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
+	let nope = hdk - rot;
+	let theta = &m.theta_full;
+	blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
+	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, "q_a_norm")?, &m.eps, t, qlr, &ar.mqa)?;
+	gpu_gemm_bt_f64(&ar.mqa, &m.stream(&layer_name(l, "self_attn.q_b_proj.weight"))?, t, nqh * hdk, qlr, &ar.mqb)?;
+	// RoPE the tail rope sub-dim of every head in place (view at the nope offset).
+	let qpe_view = ar.mqb.view(nope, t * nqh * hdk - nope);
+	gpu_rope_partial(theta, t * nqh, hdk, rot, nqh, &qpe_view)?;
+	gpu_slice_lead_into(&ar.mqb, t * nqh, hdk, nope, &ar.mqn)?;
+	gpu_slice_cols(&ar.mqb, t * nqh, hdk, nope, rot, &ar.mqp)?;
+	gpu_gemm_bt_f64(&ar.mqn, &m.stream(&layer_name(l, "self_attn.k_b_proj.weight"))?, t, kvlr, nope, &ar.mqx)?;
+	gpu_concat_into(&ar.mqx, &ar.mqp, t, kvlr, rot, &ar.mqc)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
+	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
+	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	gpu_rope_partial(theta, t, rot, rot, 1, &ar.mkp)?;
+	gpu_concat_into(&ar.mkc, &ar.mkp, t, kvlr, rot, &ar.mkk)?;
+	gpu_scale_f64_inplace(&m.attn_scale_mla, t * (kvlr + rot), &ar.mqc)?;
+	gpu_mla_attn(&ar.mqc, &ar.mkk, &ar.mkc, t, nqh, 1, kvlr + rot, kvlr, t, &ar.mrw)?;
+	gpu_gemm_bt_f64(&ar.mrw, &m.stream(&layer_name(l, "self_attn.v_b_proj.weight"))?, t, hdv, kvlr, &ar.mav)?;
+	gpu_gemm_bt_f64(&ar.mav, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, nqh * hdv, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+	return Ok(());
 }
 
 /// Parameterized dense-attention decoder block: attention, residual, FFN

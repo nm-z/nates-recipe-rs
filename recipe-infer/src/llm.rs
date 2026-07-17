@@ -356,6 +356,16 @@ struct Hparams {
 	value_length: usize,
 	key_length_swa: usize,
 	value_length_swa: usize,
+	/// Multi-head Latent Attention ranks + head sub-dims (deepseek2 family). All
+	/// zero for non-MLA arches. `q_lora_rank`/`kv_lora_rank` are the latent
+	/// bottleneck widths; `head_k_mla`/`head_v_mla` the decompressed per-head key
+	/// and value dims (`attention.key_length_mla`/`value_length_mla`); `n_rot` the
+	/// RoPE sub-dim (`rope.dimension_count`), so `head_k_mla - n_rot` is the nope part.
+	q_lora_rank: usize,
+	kv_lora_rank: usize,
+	head_k_mla: usize,
+	head_v_mla: usize,
+	n_rot: usize,
 	freq_base: f64,
 	freq_base_swa: f64,
 	softcap: f64,
@@ -375,6 +385,12 @@ struct Hparams {
 }
 
 impl Hparams {
+	/// True when the arch uses Multi-head Latent Attention (deepseek2 family):
+	/// both decompressed head dims are declared, mirroring llama.cpp `is_mla()`.
+	fn is_mla(&self) -> bool {
+		return self.head_k_mla > 0 && self.head_v_mla > 0;
+	}
+
 	fn from_gguf(g: &Gguf) -> Result<Hparams> {
 		let arch = str_kv(g, "general.architecture")?;
 		let k = |s: &str| format!("{arch}.{s}");
@@ -397,6 +413,11 @@ impl Hparams {
 		let value_length = uint_kv_or(g, &k("attention.value_length"), head_dim_default)?;
 		let key_length_swa = uint_kv_or(g, &k("attention.key_length_swa"), key_length)?;
 		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
+		let q_lora_rank = uint_kv_or(g, &k("attention.q_lora_rank"), 0)?;
+		let kv_lora_rank = uint_kv_or(g, &k("attention.kv_lora_rank"), 0)?;
+		let head_k_mla = uint_kv_or(g, &k("attention.key_length_mla"), 0)?;
+		let head_v_mla = uint_kv_or(g, &k("attention.value_length_mla"), 0)?;
+		let n_rot = uint_kv_or(g, &k("rope.dimension_count"), 0)?;
 		let head_count_kv = match g.kv.get(&k("attention.head_count_kv")) {
 			Some(Val::Arr(_items)) => uint_arr(g, &k("attention.head_count_kv"))?,
 			Some(_scalar) => vec![uint_kv(g, &k("attention.head_count_kv"))?; nl],
@@ -492,7 +513,24 @@ impl Hparams {
 		// win_elems: widest widened-f64 matrix live at once (q/k/v/o proj, dense FFN,
 		// or a widened gate_up expert). stage_bytes: widest raw bf16 region staged at
 		// once (biggest single weight, or a full combined expert slot).
-		let win_elems = qd_max.max(kd_max).max(nff).max(2 * nffe) * ne;
+		// MLA latent projections (wq_b is q_lora_rank x n_head*head_k_mla) can be
+		// wider than any standard projection, so the widen window must cover them.
+		let mla_win = if head_k_mla > 0 && head_v_mla > 0 {
+			let nope = head_k_mla.saturating_sub(n_rot);
+			[
+				q_lora_rank * ne,
+				nqh * head_k_mla * q_lora_rank,
+				(kv_lora_rank + n_rot) * ne,
+				kv_lora_rank * nope,
+				head_v_mla * kv_lora_rank,
+			]
+			.into_iter()
+			.max()
+			.unwrap_or(0)
+		} else {
+			0
+		};
+		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne).max(mla_win);
 		let lm_chunk = win_elems / ne;
 		let stage_bytes = (win_elems * 2).max(slot_bytes);
 
@@ -518,6 +556,11 @@ impl Hparams {
 			value_length,
 			key_length_swa,
 			value_length_swa,
+			q_lora_rank,
+			kv_lora_rank,
+			head_k_mla,
+			head_v_mla,
+			n_rot,
 			freq_base,
 			freq_base_swa,
 			softcap,
@@ -696,6 +739,23 @@ struct Arena {
 	normed: GpuBuffer,
 	hfs: GpuBuffer,
 	lm_out: GpuBuffer,
+	/// MLA attention scratch (deepseek2 family). Sized `1` for non-MLA arches.
+	/// `mqa` q latent, `mqb` q per head, `mqn`/`mqp` q nope/rope split, `mqx`
+	/// q_nope absorbed via wk_b, `mqc` Qcur; `mkv` kv+rope compressed, `mkc`
+	/// kv latent (Vcur), `mkp` k rope, `mkk` Kcur; `mrw` raw attn out, `mav`
+	/// value-decompressed via wv_b.
+	mqa: GpuBuffer,
+	mqb: GpuBuffer,
+	mqn: GpuBuffer,
+	mqp: GpuBuffer,
+	mqx: GpuBuffer,
+	mqc: GpuBuffer,
+	mkv: GpuBuffer,
+	mkc: GpuBuffer,
+	mkp: GpuBuffer,
+	mkk: GpuBuffer,
+	mrw: GpuBuffer,
+	mav: GpuBuffer,
 }
 
 impl Arena {
@@ -739,6 +799,18 @@ impl Arena {
 			normed: a(c * ne)?,
 			hfs: a(c * ne)?,
 			lm_out: a(c * hp.lm_chunk)?,
+			mqa: a((t * hp.q_lora_rank).max(1))?,
+			mqb: a((t * hp.nqh * hp.head_k_mla).max(1))?,
+			mqn: a((t * hp.nqh * hp.head_k_mla.saturating_sub(hp.n_rot)).max(1))?,
+			mqp: a((t * hp.nqh * hp.n_rot).max(1))?,
+			mqx: a((t * hp.nqh * hp.kv_lora_rank).max(1))?,
+			mqc: a((t * hp.nqh * (hp.kv_lora_rank + hp.n_rot)).max(1))?,
+			mkv: a((t * (hp.kv_lora_rank + hp.n_rot)).max(1))?,
+			mkc: a((t * hp.kv_lora_rank).max(1))?,
+			mkp: a((t * hp.n_rot).max(1))?,
+			mkk: a((t * (hp.kv_lora_rank + hp.n_rot)).max(1))?,
+			mrw: a((t * hp.nqh * hp.kv_lora_rank).max(1))?,
+			mav: a((t * hp.nqh * hp.head_v_mla).max(1))?,
 		})
 	}
 }
@@ -777,18 +849,23 @@ struct Model {
 	pos_embd: Vec<u8>,
 	eps: GpuBuffer,
 	res_scale: GpuBuffer,
+	/// `1/sqrt(n_embd_head_k_mla)` device scalar for MLA attention pre-scaling;
+	/// `1.0` for non-MLA arches (unused there).
+	attn_scale_mla: GpuBuffer,
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
 	ls_dev: Vec<GpuBuffer>,
 	hp: Hparams,
 }
 
-const LAYER_NORMS: [(&str, &str); 10] = [
+const LAYER_NORMS: [(&str, &str); 12] = [
 	("input", "input_layernorm.weight"),
 	("attn2", "self_attn.attn_norm_2.weight"),
 	("post_attn", "post_attention_layernorm.weight"),
 	("q_norm", "self_attn.q_norm.weight"),
 	("k_norm", "self_attn.k_norm.weight"),
+	("q_a_norm", "self_attn.q_a_norm.weight"),
+	("kv_a_norm", "self_attn.kv_a_norm.weight"),
 	("pre_ff", "pre_feedforward_layernorm.weight"),
 	("pf1", "post_feedforward_layernorm_1.weight"),
 	("pn2", "pre_feedforward_layernorm_2.weight"),
@@ -1067,6 +1144,14 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_q.weight", "self_attn.q_proj.weight"),
 	("attn_k.weight", "self_attn.k_proj.weight"),
 	("attn_v.weight", "self_attn.v_proj.weight"),
+	("attn_q_a.weight", "self_attn.q_a_proj.weight"),
+	("attn_q_b.weight", "self_attn.q_b_proj.weight"),
+	("attn_kv_a_mqa.weight", "self_attn.kv_a_proj.weight"),
+	("attn_k_b.weight", "self_attn.k_b_proj.weight"),
+	("attn_v_b.weight", "self_attn.v_b_proj.weight"),
+	("attn_kv_b.weight", "self_attn.kv_b_proj.weight"),
+	("attn_q_a_norm.weight", "self_attn.q_a_norm.weight"),
+	("attn_kv_a_norm.weight", "self_attn.kv_a_norm.weight"),
 	("attn_output.weight", "self_attn.o_proj.weight"),
 	("attn_output.bias", "self_attn.o_proj.bias"),
 	("ffn_up.bias", "mlp.up_proj.bias"),
@@ -1252,6 +1337,12 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub.load(&[s])?;
 		ub
 	};
+	let attn_scale_mla = {
+		let ub = GpuBuffer::alloc(1)?;
+		let s = if hp.is_mla() { 1.0 / (hp.head_k_mla as f64).sqrt() } else { 1.0 };
+		ub.load(&[s])?;
+		ub
+	};
 	let nl = hp.nl;
 	let vocab = hp.vocab;
 	let ne = hp.ne;
@@ -1283,6 +1374,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		pos_embd: Vec::new(),
 		eps,
 		res_scale,
+		attn_scale_mla,
 		theta_full,
 		theta_slide,
 		ls_dev: Vec::new(),
@@ -1434,10 +1526,16 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 /// and a fused-qkv model contributes the synthesized q/k/v — the required set
 /// derives from the composition, never a fixed per-arch list.
 fn fixed_names(m: &Model, l: usize) -> Vec<String> {
-	const ROLES: [&str; 7] = [
+	const ROLES: [&str; 13] = [
 		"self_attn.q_proj.weight",
 		"self_attn.k_proj.weight",
 		"self_attn.v_proj.weight",
+		"self_attn.q_a_proj.weight",
+		"self_attn.q_b_proj.weight",
+		"self_attn.kv_a_proj.weight",
+		"self_attn.k_b_proj.weight",
+		"self_attn.v_b_proj.weight",
+		"self_attn.kv_b_proj.weight",
 		"self_attn.o_proj.weight",
 		"mlp.gate_proj.weight",
 		"mlp.up_proj.weight",

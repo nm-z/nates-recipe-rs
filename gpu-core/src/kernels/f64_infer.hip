@@ -93,6 +93,67 @@ extern "C" void launch_gqa_masked_attn(
         q, k, v, out, t, nqh, nkv, hd, prefix, max_bias);
 }
 
+// Multi-head Latent Attention scores/gather with distinct key and value head
+// dims. Identical causal softmax to gqa_masked_attn, but the query-key dot runs
+// over hdk (kv_lora + rope for MLA) while the value gather runs over hdv
+// (kv_lora), because MLA's compressed K carries the shared RoPE key that V omits.
+// q:[t,nqh,hdk] k:[t,nkv,hdk] v:[t,nkv,hdv] out:[t,nqh,hdv]; Q is pre-scaled.
+extern "C" __global__ void mla_masked_attn(
+    const double* q, const double* k, const double* v, double* out,
+    int t, int nqh, int nkv, int hdk, int hdv, int prefix
+) {
+    int blk = blockIdx.x;
+    int p = blk / nqh;
+    int h = blk % nqh;
+    int g2 = nqh / nkv;
+    int kv = h / g2;
+    int qdk = nqh * hdk;
+    int kdk = nkv * hdk;
+    int qdv = nqh * hdv;
+    int kdv = nkv * hdv;
+    const double* qrow = q + (long)p * qdk + (long)h * hdk;
+
+    __shared__ double red[64];
+    extern __shared__ double sc[];
+
+    for (int sp = 0; sp < t; sp++) {
+        const double* krow = k + (long)sp * kdk + (long)kv * hdk;
+        double part = 0.0;
+        for (int x = threadIdx.x; x < hdk; x += blockDim.x) part += qrow[x] * krow[x];
+        double dot = fi_block_sum(part, red);
+        if (threadIdx.x == 0) {
+            bool masked = (p < prefix) && (sp > p);
+            sc[sp] = masked ? -1e30 : dot;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        double m = -1e300;
+        for (int sp = 0; sp < t; sp++) if (sc[sp] > m) m = sc[sp];
+        double s = 0.0;
+        for (int sp = 0; sp < t; sp++) { double e = exp(sc[sp] - m); sc[sp] = e; s += e; }
+        for (int sp = 0; sp < t; sp++) sc[sp] /= s;
+    }
+    __syncthreads();
+
+    double* orow = out + (long)p * qdv + (long)h * hdv;
+    for (int x = threadIdx.x; x < hdv; x += blockDim.x) {
+        double acc = 0.0;
+        for (int sp = 0; sp < t; sp++) acc += sc[sp] * v[(long)sp * kdv + (long)kv * hdv + x];
+        orow[x] = acc;
+    }
+}
+extern "C" void launch_mla_masked_attn(
+    const double* q, const double* k, const double* v, double* out,
+    int t, int nqh, int nkv, int hdk, int hdv, int prefix, hipStream_t s
+) {
+    int wide = hdk > hdv ? hdk : hdv;
+    int threads = wide < 256 ? wide : 256;
+    size_t shmem = (size_t)t * sizeof(double);
+    hipLaunchKernelGGL(mla_masked_attn, dim3((unsigned)(t * nqh)), dim3(threads), shmem, s,
+        q, k, v, out, t, nqh, nkv, hdk, hdv, prefix);
+}
+
 extern "C" __global__ void rope_partial(
     double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta_p
 ) {

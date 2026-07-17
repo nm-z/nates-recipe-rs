@@ -38,6 +38,19 @@ unsafe extern "C" {
 		max_bias: f64,
 		stream: *mut c_void,
 	);
+	fn launch_mla_masked_attn(
+		q: *const c_void,
+		k: *const c_void,
+		v: *const c_void,
+		out: *mut c_void,
+		t: i32,
+		nqh: i32,
+		nkv: i32,
+		hdk: i32,
+		hdv: i32,
+		prefix: i32,
+		stream: *mut c_void,
+	);
 	fn launch_gelu_mul(
 		a: *const c_void,
 		b: *const c_void,
@@ -201,6 +214,45 @@ pub fn gpu_gqa_attn(
 			ci(hd)?,
 			ci(prefix)?,
 			max_bias,
+			ptr::null_mut(),
+		);
+	}
+	return cl();
+}
+
+/// Multi-head Latent Attention: causal MQA/GQA softmax where the query-key dot
+/// runs over `hdk` and the value gather over `hdv` (MLA's compressed K carries a
+/// shared RoPE key the V lacks). `q` is expected pre-scaled by `1/sqrt(n_embd_head_k)`.
+///
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_mla_attn(
+	q: &GpuBuffer,
+	k: &GpuBuffer,
+	v: &GpuBuffer,
+	t: usize,
+	nqh: usize,
+	nkv: usize,
+	hdk: usize,
+	hdv: usize,
+	prefix: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
+	unsafe {
+		launch_mla_masked_attn(
+			q.ptr_raw().cast_const(),
+			k.ptr_raw().cast_const(),
+			v.ptr_raw().cast_const(),
+			out.ptr_raw(),
+			ci(t)?,
+			ci(nqh)?,
+			ci(nkv)?,
+			ci(hdk)?,
+			ci(hdv)?,
+			ci(prefix)?,
 			ptr::null_mut(),
 		);
 	}
