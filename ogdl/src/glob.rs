@@ -5,25 +5,32 @@
 //! order (`[n]`, one node per row), levels run parents to children
 //! (`(m)`, a set per level). Atoms:
 //!
+//! Star-before looks toward an axis's minus side, star-after toward plus,
+//! uniformly: left|right for `()`, up|down for `[]`, upstm|dnstm for names.
+//!
 //! - `name`            every node with that name
 //! - `[n]`             the node at row n
 //! - `(m)`             every node at level m
-//! - `*[n]` / `[n]*`   rows below / rows above n, exclusive
+//! - `*[n]` / `[n]*`   rows above / rows below n, exclusive
 //! - `*(m)` / `(m)*`   levels left / levels right of m, exclusive
-//! - `*x` / `x*`       parents / children of every x match, exclusive
+//! - `*x` / `x*`       x with its parents / x with its children; inside a
+//!   route the anchor is the viewpoint and drops out, leaving one step
 //!
-//! Juxtaposition inside a segment intersects (`[0](0)`, `*[0][5]*` is the
-//! strictly-between interval); `.` between segments collects the union.
-//! Display is the matched lines at their native indent in document order.
-//! Empty positions select nothing: a leaf's `x*`, `*[n]` past the last
-//! row, an out-of-range coordinate are all the empty set, never an error.
-//! A trailing `{}` deletes every matched branch ([`Node::glob_del`]).
+//! Juxtaposition inside a segment intersects; a single star between two
+//! coordinates serves both sides (`[0]*(1)` is `[0]*` and `*(1)`), and an
+//! empty operand drops out as identity instead of annihilating. Across
+//! dots, a plus-view segment followed by a minus-view segment on the same
+//! axis is a bounds pair selecting the strictly-between interval
+//! (`(0)*.*(3)`, `[0]*.*[5]`); every other segment collects (union).
+//! Matches come back in walk order away from the anchor ([`Node::glob`]);
+//! [`Node::glob_show`] prints matched lines at native indent in document
+//! order. Empty positions select nothing: a leaf's `x*`, `*[0]` above the
+//! first row, an out-of-range coordinate are the empty set, never an error.
 
 use crate::Node;
 use std::collections::BTreeSet;
 
 enum Atom {
-	All,
 	Name(String),
 	NameUp(String),
 	NameDown(String),
@@ -78,9 +85,6 @@ fn coord(body: &str, seg: &str) -> Result<usize, String> {
 }
 
 fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
-	if seg == "*" {
-		return Ok(vec![Atom::All]);
-	}
 	let mut atoms: Vec<Atom> = Vec::new();
 	let mut prefix = false;
 	let mut suffixable = false;
@@ -93,11 +97,17 @@ fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
 					let last = atoms.pop().ok_or_else(|| format!("glob: dangling * in {seg:?}"))?;
 					atoms.push(match last {
 						Atom::Name(n) => Atom::NameDown(n),
-						Atom::Row(n) => Atom::RowAbove(n),
+						Atom::Row(n) => Atom::RowBelow(n),
 						Atom::Lvl(n) => Atom::LvlRight(n),
 						_other => return Err(format!("glob: star on starred atom in {seg:?}")),
 					});
 					suffixable = false;
+					let shared = bytes
+						.get(i.saturating_add(1))
+						.is_some_and(|&b| return b != b'*');
+					if shared {
+						prefix = true;
+					}
 				} else if prefix {
 					return Err(format!("glob: ** without a coordinate between in {seg:?}"));
 				} else {
@@ -135,7 +145,7 @@ fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
 			(false, Core::Name(n)) => Atom::Name(n),
 			(true, Core::Name(n)) => Atom::NameUp(n),
 			(false, Core::Row(n)) => Atom::Row(n),
-			(true, Core::Row(n)) => Atom::RowBelow(n),
+			(true, Core::Row(n)) => Atom::RowAbove(n),
 			(false, Core::Lvl(n)) => Atom::Lvl(n),
 			(true, Core::Lvl(n)) => Atom::LvlLeft(n),
 		};
@@ -152,41 +162,145 @@ fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
 	return Ok(atoms);
 }
 
-fn eval_atom(a: &Atom, g: &Grid) -> BTreeSet<usize> {
-	let rows = 0..g.name.len();
+fn by_level(g: &Grid, want: impl Fn(usize) -> bool, outward: bool) -> Vec<usize> {
+	let max = g.depth.iter().copied().max().unwrap_or(0);
+	let mut levels: Vec<usize> = (0..=max).filter(|&m| return want(m)).collect();
+	if outward {
+		levels.reverse();
+	}
+	return levels
+		.into_iter()
+		.flat_map(|m| return (0..g.name.len()).filter(move |&r| return g.depth[r] == m))
+		.collect();
+}
+
+fn eval_atom(a: &Atom, g: &Grid, route: bool) -> Vec<usize> {
+	let all = || return 0..g.name.len();
 	return match a {
-		Atom::All => rows.collect(),
-		Atom::Name(n) => rows.filter(|&r| return g.name[r] == n).collect(),
-		Atom::NameUp(n) => rows
+		Atom::Name(n) => all().filter(|&r| return g.name[r] == n).collect(),
+		Atom::NameUp(n) => all()
 			.filter(|&r| return g.name[r] == n)
-			.filter_map(|r| return g.parent[r])
+			.flat_map(|r| {
+				let mut v = Vec::new();
+				if let Some(p) = g.parent[r] {
+					if !route {
+						v.push(r);
+					}
+					v.push(p);
+				}
+				return v;
+			})
 			.collect(),
-		Atom::NameDown(n) => rows
-			.filter(|&r| return g.parent[r].is_some_and(|p| return g.name[p] == n))
+		Atom::NameDown(n) => all()
+			.filter(|&r| return g.name[r] == n)
+			.flat_map(|r| {
+				let kids: Vec<usize> =
+					all().filter(|&c| return g.parent[c] == Some(r)).collect();
+				let mut v = Vec::new();
+				if !kids.is_empty() {
+					if !route {
+						v.push(r);
+					}
+					v.extend(kids);
+				}
+				return v;
+			})
 			.collect(),
-		Atom::Row(n) => rows.filter(|&r| return r == *n).collect(),
-		Atom::RowBelow(n) => rows.filter(|&r| return r > *n).collect(),
-		Atom::RowAbove(n) => rows.filter(|&r| return r < *n).collect(),
-		Atom::Lvl(m) => rows.filter(|&r| return g.depth[r] == *m).collect(),
-		Atom::LvlLeft(m) => rows.filter(|&r| return g.depth[r] < *m).collect(),
-		Atom::LvlRight(m) => rows.filter(|&r| return g.depth[r] > *m).collect(),
+		Atom::Row(n) => all().filter(|&r| return r == *n).collect(),
+		Atom::RowBelow(n) => all().filter(|&r| return r > *n).collect(),
+		Atom::RowAbove(n) => (0..*n.min(&g.name.len())).rev().collect(),
+		Atom::Lvl(m) => all().filter(|&r| return g.depth[r] == *m).collect(),
+		Atom::LvlLeft(m) => by_level(g, |lv| return lv < *m, true),
+		Atom::LvlRight(m) => by_level(g, |lv| return lv > *m, false),
 	};
 }
 
-fn eval_rows(g: &Grid, expr: &str) -> Result<BTreeSet<usize>, String> {
-	let mut out = BTreeSet::new();
+/// A directional half-space view: which axis and which sign it looks toward.
+#[derive(Clone, Copy, PartialEq)]
+enum Axis {
+	Row,
+	Lvl,
+}
+
+fn seg_view(atoms: &[Atom]) -> Option<(Axis, bool)> {
+	let [a] = atoms else { return None };
+	return match a {
+		Atom::RowBelow(_n) => Some((Axis::Row, true)),
+		Atom::RowAbove(_n) => Some((Axis::Row, false)),
+		Atom::LvlRight(_m) => Some((Axis::Lvl, true)),
+		Atom::LvlLeft(_m) => Some((Axis::Lvl, false)),
+		_other => None,
+	};
+}
+
+fn eval_segment(g: &Grid, seg: &str, route: bool) -> Result<(Vec<usize>, Option<(Axis, bool)>), String> {
+	let atoms = parse_segment(seg)?;
+	let view = seg_view(&atoms);
+	let mut sets: Vec<Vec<usize>> = atoms
+		.iter()
+		.map(|a| return eval_atom(a, g, route))
+		.filter(|v| return !v.is_empty())
+		.collect();
+	if sets.is_empty() {
+		return Ok((Vec::new(), view));
+	}
+	let mut first = sets.remove(0);
+	let rest: Vec<BTreeSet<usize>> = sets
+		.into_iter()
+		.map(|v| return v.into_iter().collect())
+		.collect();
+	if !rest.is_empty() {
+		first.sort_unstable();
+	}
+	let rows = first
+		.into_iter()
+		.filter(|r| return rest.iter().all(|s| return s.contains(r)))
+		.collect();
+	return Ok((rows, view));
+}
+
+fn eval_rows(g: &Grid, expr: &str) -> Result<Vec<usize>, String> {
+	let route = expr.contains('.');
+	let mut out: Vec<usize> = Vec::new();
+	let mut seen = BTreeSet::new();
+	let flush = |rows: Vec<usize>, out: &mut Vec<usize>, seen: &mut BTreeSet<usize>| {
+		for r in rows {
+			if seen.insert(r) {
+				out.push(r);
+			}
+		}
+	};
+	let mut pending: Option<(Vec<usize>, Option<(Axis, bool)>)> = None;
 	for seg in expr.split('.') {
-		let atoms = parse_segment(seg)?;
-		let mut it = atoms.iter().map(|a| return eval_atom(a, g));
-		let first = it.next().unwrap_or_default();
-		let seg_rows = it.fold(first, |acc, s| return acc.intersection(&s).copied().collect());
-		out.extend(seg_rows);
+		let (rows, view) = eval_segment(g, seg, route)?;
+		let bounds = match (&pending, view) {
+			(Some((prows, Some((pa, true)))), Some((a, false))) => {
+				*pa == a && !prows.is_empty() && !rows.is_empty()
+			}
+			_other => false,
+		};
+		if bounds {
+			let (prows, _pv) = pending.take().unwrap_or_default();
+			let inside: BTreeSet<usize> = rows.into_iter().collect();
+			let mut mid: Vec<usize> =
+				prows.into_iter().filter(|r| return inside.contains(r)).collect();
+			mid.sort_unstable();
+			flush(mid, &mut out, &mut seen);
+		} else {
+			if let Some((prows, _pv)) = pending.take() {
+				flush(prows, &mut out, &mut seen);
+			}
+			pending = Some((rows, view));
+		}
+	}
+	if let Some((prows, _pv)) = pending.take() {
+		flush(prows, &mut out, &mut seen);
 	}
 	return Ok(out);
 }
 
 impl Node {
-	/// Every node matched by `expr`, in document order.
+	/// Every node matched by `expr`, in walk order away from each anchor.
 	pub fn glob(&self, expr: &str) -> Result<Vec<&Self>, String> {
 		let g = flatten(self);
 		let rows = eval_rows(&g, expr)?;
@@ -205,41 +319,12 @@ impl Node {
 	/// The matched lines at their native indent, document order, one per row.
 	pub fn glob_show(&self, expr: &str) -> Result<String, String> {
 		let g = flatten(self);
-		let rows = eval_rows(&g, expr)?;
+		let mut rows = eval_rows(&g, expr)?;
+		rows.sort_unstable();
 		return Ok(rows
 			.into_iter()
 			.map(|r| return format!("{}{}", "\t".repeat(g.depth[r]), g.name[r]))
 			.collect::<Vec<_>>()
 			.join("\n"));
-	}
-
-	/// Deletes every branch matched by `expr` (a trailing `{}` is accepted
-	/// and stripped; bare `{}` or `*{}` wipes the whole tree).
-	pub fn glob_del(&mut self, expr: &str) -> Result<usize, String> {
-		let body = expr.strip_suffix("{}").unwrap_or(expr);
-		if body.is_empty() || body == "*" {
-			let n = self.children.len();
-			self.children.clear();
-			return Ok(n);
-		}
-		let paths: Vec<Vec<usize>> = {
-			let g = flatten(self);
-			let rows = eval_rows(&g, body)?;
-			rows.into_iter().rev().map(|r| return g.path[r].clone()).collect()
-		};
-		let n = paths.len();
-		for p in paths {
-			let Some((&last, up)) = p.split_last() else {
-				continue;
-			};
-			let mut cur = &mut *self;
-			for &i in up {
-				cur = &mut cur.children[i];
-			}
-			if last < cur.children.len() {
-				cur.children.remove(last);
-			}
-		}
-		return Ok(n);
 	}
 }

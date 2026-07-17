@@ -35,17 +35,41 @@ const T5N: &str = "a\n\tb\n\tc\n\t\td\ne";
 
 #[test]
 fn case1_image_pair() {
-	assert_eq!(sel(T1, "[0]*(1)"), "c");
+	assert_eq!(sel(T1, "[0]*(1)"), "f");
 }
 
 #[test]
-fn case2_pathwise_batch() {
+fn case2_1_walk_collects() {
 	assert_eq!(set(T2, "a.d.*e"), "a d");
+}
+
+#[test]
+fn case2_2_level_bounds() {
 	assert_eq!(set(T2, "(0)*.*(3)"), "b c d e");
+}
+
+#[test]
+fn case2_3_row_bounds() {
 	assert_eq!(set(T2, "[0]*.*[5]"), "b c d e");
+}
+
+#[test]
+fn case2_4_bracket_swap_rows() {
 	assert_eq!(set(T2, "[1].[2]"), "b c d e");
+}
+
+#[test]
+fn case2_5_bracket_swap_levels() {
 	assert_eq!(set(T2, "(1).(2).(3).(4)"), "b c d e");
+}
+
+#[test]
+fn case2_6_bracket_swap_pair() {
 	assert_eq!(set(T2, "(3).(4)"), "d e");
+}
+
+#[test]
+fn case2_7_subtree_star() {
 	assert_eq!(set(T2, "a.d*"), "d e f");
 }
 
@@ -65,14 +89,14 @@ fn case4_equality_chain_bde() {
 
 #[test]
 fn case5_probe_branch_depth() {
-	for expr in ["a", "[0](0)", "*b", "[1]*"] {
+	for expr in ["a", "[0](0)", "*b", "*[1]"] {
 		assert_eq!(set(T5, expr), "a", "{expr}");
 	}
 }
 
 #[test]
 fn case6_probe_childless_star() {
-	for expr in ["b*.d", "d", "[3]", "*[2]"] {
+	for expr in ["b*.d", "d", "[3]", "[2]*"] {
 		assert_eq!(set(T6, expr), "d", "{expr}");
 	}
 }
@@ -100,16 +124,16 @@ fn case8_five_node_worksheet() {
 	assert_eq!(sel(T5N, "[2]"), "c");
 	assert_eq!(sel(T5N, "[3]"), "d");
 	assert_eq!(sel(T5N, "[4]"), "e");
-	assert_eq!(sel(T5N, "*[0]"), "b c d e");
-	assert_eq!(sel(T5N, "*[1]"), "c d e");
-	assert_eq!(sel(T5N, "*[2]"), "d e");
-	assert_eq!(sel(T5N, "*[3]"), "e");
-	assert_eq!(sel(T5N, "*[4]"), "");
-	assert_eq!(sel(T5N, "[0]*"), "");
-	assert_eq!(sel(T5N, "[1]*"), "a");
-	assert_eq!(sel(T5N, "[2]*"), "b a");
-	assert_eq!(sel(T5N, "[3]*"), "c b a");
-	assert_eq!(sel(T5N, "[4]*"), "d c b a");
+	assert_eq!(sel(T5N, "[0]*"), "b c d e");
+	assert_eq!(sel(T5N, "[1]*"), "c d e");
+	assert_eq!(sel(T5N, "[2]*"), "d e");
+	assert_eq!(sel(T5N, "[3]*"), "e");
+	assert_eq!(sel(T5N, "[4]*"), "");
+	assert_eq!(sel(T5N, "*[0]"), "");
+	assert_eq!(sel(T5N, "*[1]"), "a");
+	assert_eq!(sel(T5N, "*[2]"), "b a");
+	assert_eq!(sel(T5N, "*[3]"), "c b a");
+	assert_eq!(sel(T5N, "*[4]"), "d c b a");
 }
 
 const T3N: &str = "a\n\tb\n\t\tc";
@@ -186,12 +210,12 @@ fn coverage(tree: &str, inv: &[&str]) -> (String, String) {
 
 const INV3: &[&str] = &[
 	"*b", "b*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*",
-	"[0]", "[1]", "[2]", "*[0]", "*[1]", "*[2]", "[0]*", "[1]*", "[2]*",
+	"[0]", "[1]", "[2]", "[0]*", "[1]*", "[2]*", "*[0]", "*[1]", "*[2]",
 ];
 const INV5: &[&str] = &[
 	"*c", "c*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*",
-	"[0]", "[1]", "[2]", "[3]", "[4]", "*[0]", "*[1]", "*[2]", "*[3]", "*[4]",
-	"[0]*", "[1]*", "[2]*", "[3]*", "[4]*",
+	"[0]", "[1]", "[2]", "[3]", "[4]", "[0]*", "[1]*", "[2]*", "[3]*", "[4]*",
+	"*[0]", "*[1]", "*[2]", "*[3]", "*[4]",
 ];
 
 #[test] fn case8_1_1() { cell(T3N, "*b", "b a"); }
@@ -208,12 +232,12 @@ const INV5: &[&str] = &[
 #[test] fn case8_1_12() { cell(T3N, "[0]", "a"); }
 #[test] fn case8_1_13() { cell(T3N, "[1]", "b"); }
 #[test] fn case8_1_14() { cell(T3N, "[2]", "c"); }
-#[test] fn case8_1_15() { cell(T3N, "*[0]", "b c"); }
-#[test] fn case8_1_16() { cell(T3N, "*[1]", "c"); }
-#[test] fn case8_1_17() { cell(T3N, "*[2]", ""); }
-#[test] fn case8_1_18() { cell(T3N, "[0]*", ""); }
-#[test] fn case8_1_19() { cell(T3N, "[1]*", "a"); }
-#[test] fn case8_1_20() { cell(T3N, "[2]*", "b a"); }
+#[test] fn case8_1_15() { cell(T3N, "[0]*", "b c"); }
+#[test] fn case8_1_16() { cell(T3N, "[1]*", "c"); }
+#[test] fn case8_1_17() { cell(T3N, "[2]*", ""); }
+#[test] fn case8_1_18() { cell(T3N, "*[0]", ""); }
+#[test] fn case8_1_19() { cell(T3N, "*[1]", "a"); }
+#[test] fn case8_1_20() { cell(T3N, "*[2]", "b a"); }
 
 #[test]
 fn case8_1_21() {
@@ -246,16 +270,16 @@ fn case8_1_22() {
 #[test] fn case8_2_14() { cell(T5N, "[2]", "c"); }
 #[test] fn case8_2_15() { cell(T5N, "[3]", "d"); }
 #[test] fn case8_2_16() { cell(T5N, "[4]", "e"); }
-#[test] fn case8_2_17() { cell(T5N, "*[0]", "b c d e"); }
-#[test] fn case8_2_18() { cell(T5N, "*[1]", "c d e"); }
-#[test] fn case8_2_19() { cell(T5N, "*[2]", "d e"); }
-#[test] fn case8_2_20() { cell(T5N, "*[3]", "e"); }
-#[test] fn case8_2_21() { cell(T5N, "*[4]", ""); }
-#[test] fn case8_2_22() { cell(T5N, "[0]*", ""); }
-#[test] fn case8_2_23() { cell(T5N, "[1]*", "a"); }
-#[test] fn case8_2_24() { cell(T5N, "[2]*", "b a"); }
-#[test] fn case8_2_25() { cell(T5N, "[3]*", "c b a"); }
-#[test] fn case8_2_26() { cell(T5N, "[4]*", "d c b a"); }
+#[test] fn case8_2_17() { cell(T5N, "[0]*", "b c d e"); }
+#[test] fn case8_2_18() { cell(T5N, "[1]*", "c d e"); }
+#[test] fn case8_2_19() { cell(T5N, "[2]*", "d e"); }
+#[test] fn case8_2_20() { cell(T5N, "[3]*", "e"); }
+#[test] fn case8_2_21() { cell(T5N, "[4]*", ""); }
+#[test] fn case8_2_22() { cell(T5N, "*[0]", ""); }
+#[test] fn case8_2_23() { cell(T5N, "*[1]", "a"); }
+#[test] fn case8_2_24() { cell(T5N, "*[2]", "b a"); }
+#[test] fn case8_2_25() { cell(T5N, "*[3]", "c b a"); }
+#[test] fn case8_2_26() { cell(T5N, "*[4]", "d c b a"); }
 
 #[test]
 fn case8_2_27() {
@@ -291,13 +315,13 @@ fn case8_2_28() {
 #[test] fn case8_3_14() { cell(TQ, "[2]", "a"); }
 #[test] fn case8_3_15() { cell(TQ, "[3]", "r"); }
 #[test] fn case8_3_16() { cell(TQ, "[4]", "k"); }
-#[test] fn case8_3_17() { cell(TQ, "*[0]", "u a r k"); }
-#[test] fn case8_3_18() { cell(TQ, "*[1]", "a r k"); }
-#[test] fn case8_3_19() { cell(TQ, "*[2]", "r k"); }
-#[test] fn case8_3_20() { cell(TQ, "*[3]", "k"); }
-#[test] fn case8_3_21() { cell(TQ, "*[4]", ""); }
-#[test] fn case8_3_22() { cell(TQ, "[0]*", ""); }
-#[test] fn case8_3_23() { cell(TQ, "[1]*", "Q"); }
-#[test] fn case8_3_24() { cell(TQ, "[2]*", "u Q"); }
-#[test] fn case8_3_25() { cell(TQ, "[3]*", "a u Q"); }
-#[test] fn case8_3_26() { cell(TQ, "[4]*", "r a u Q"); }
+#[test] fn case8_3_17() { cell(TQ, "[0]*", "u a r k"); }
+#[test] fn case8_3_18() { cell(TQ, "[1]*", "a r k"); }
+#[test] fn case8_3_19() { cell(TQ, "[2]*", "r k"); }
+#[test] fn case8_3_20() { cell(TQ, "[3]*", "k"); }
+#[test] fn case8_3_21() { cell(TQ, "[4]*", ""); }
+#[test] fn case8_3_22() { cell(TQ, "*[0]", ""); }
+#[test] fn case8_3_23() { cell(TQ, "*[1]", "Q"); }
+#[test] fn case8_3_24() { cell(TQ, "*[2]", "u Q"); }
+#[test] fn case8_3_25() { cell(TQ, "*[3]", "a u Q"); }
+#[test] fn case8_3_26() { cell(TQ, "*[4]", "r a u Q"); }
