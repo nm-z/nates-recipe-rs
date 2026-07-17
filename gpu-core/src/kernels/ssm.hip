@@ -7,9 +7,12 @@
 // conv is per-channel over the time axis with an implicit (d_conv-1) left
 // zero-pad (the j>=0 guard), matching ggml_ssm_conv on a zeroed state prefix.
 // conv_w is [d_inner, d_conv] channel-major (tap-contiguous): w[c*d_conv + k].
+// apply_silu==0 leaves the raw conv output (lfm2 shortconv gates it downstream);
+// nonzero fuses SiLU (mamba family). Same channel-major tap-contiguous weight and
+// (d_conv-1) causal left zero-pad in both cases.
 extern "C" __global__ void ssm_conv_causal_silu_kernel(
     const double* x, const double* conv_w, const double* bias, double* out,
-    int T, int d_inner, int d_conv
+    int T, int d_inner, int d_conv, int apply_silu
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)T * d_inner;
@@ -22,18 +25,18 @@ extern "C" __global__ void ssm_conv_causal_silu_kernel(
         int j = t - (d_conv - 1) + k;
         if (j >= 0) acc += wc[k] * x[(long)j * d_inner + c];
     }
-    out[idx] = acc / (1.0 + exp(-acc));
+    out[idx] = apply_silu ? (acc / (1.0 + exp(-acc))) : acc;
 }
 
 extern "C" void launch_ssm_conv_causal_silu(
     const double* x, const double* conv_w, const double* bias, double* out,
-    int T, int d_inner, int d_conv, hipStream_t stream
+    int T, int d_inner, int d_conv, int apply_silu, hipStream_t stream
 ) {
     long total = (long)T * d_inner;
     dim3 block(256);
     dim3 grid((total + 255) / 256);
     hipLaunchKernelGGL(ssm_conv_causal_silu_kernel, grid, block, 0, stream,
-        x, conv_w, bias, out, T, d_inner, d_conv);
+        x, conv_w, bias, out, T, d_inner, d_conv, apply_silu);
 }
 
 // Fused Mamba-1 selective scan (ground truth ggml-cuda/ssm-scan.cu:83-113).

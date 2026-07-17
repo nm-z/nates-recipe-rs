@@ -9,15 +9,15 @@ use anyhow::{Result, anyhow};
 use core::ptr;
 use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_mla_attn, gpu_rmsnorm_f64,
-	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace,
+	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_rope_partial_factors, gpu_scale_f64_inplace,
 };
 use gpu_core::k_gapact::gpu_softplus;
 use gpu_core::kernels::{
 	gpu_add_into, gpu_bias_add, gpu_broadcast_mul, gpu_concat_into, gpu_copy_into,
 	gpu_gated_delta_scan, gpu_gelu_into, gpu_l2norm_rows, gpu_layernorm_opt_into, gpu_mul_inplace,
 	gpu_relu_into, gpu_row_scale, gpu_sigmoid_into, gpu_silu_into, gpu_slice_cols,
-	gpu_slice_lead_into, gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm, gpu_ssm_scan_mamba1,
-	gpu_ssm_scan_mamba2,
+	gpu_slice_lead_into, gpu_ssm_conv_causal, gpu_ssm_conv_causal_silu, gpu_ssm_group_rmsnorm,
+	gpu_ssm_scan_mamba1, gpu_ssm_scan_mamba2,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -71,6 +71,13 @@ pub(super) struct Spec {
 	pub alibi: bool,
 	pub emb_sqrt_ne: bool,
 	pub emb_scale_kv: bool,
+	/// A hardcoded input-embedding scale the arch's graph applies as a literal
+	/// constant (minicpm3 `scale_embd=12`); `1.0` means no constant scale.
+	pub emb_scale_const: f64,
+	/// talkie: a non-parametric RMS of the initial embedding is retained and added
+	/// (scaled by each layer's `layer_output_scale`) to every layer's output. Drives
+	/// the decode-loop embed prenorm + stash and the [`layer_talkie`] skip residual.
+	pub embd_skip: bool,
 	pub residual_scale: bool,
 	pub final_softcap: bool,
 	pub bidir: bool,
@@ -101,6 +108,8 @@ impl Spec {
 			alibi: false,
 			emb_sqrt_ne: false,
 			emb_scale_kv: false,
+			emb_scale_const: 1.0,
+			embd_skip: false,
 			residual_scale: false,
 			final_softcap: false,
 			bidir: false,
@@ -167,6 +176,14 @@ impl Spec {
 		self.emb_scale_kv = true;
 		self
 	}
+	pub(super) const fn emb_scale_const(mut self, v: f64) -> Spec {
+		self.emb_scale_const = v;
+		self
+	}
+	pub(super) const fn embd_skip(mut self) -> Spec {
+		self.embd_skip = true;
+		self
+	}
 	pub(super) const fn residual_scale(mut self) -> Spec {
 		self.residual_scale = true;
 		self
@@ -221,6 +238,10 @@ pub(super) enum Recur {
 	/// each with its own causal conv, a per-CHANNEL log-decay LoRA, the delta-rule
 	/// scan, and a sigmoid(`g_b(g_a(x))`)-gated RMSNorm output.
 	Kda,
+	/// lfm2 gated short-convolution mixer: operator-norm, `in_proj` split into
+	/// `B`/`C`/`x`, the `B*x` pre-conv gate, a causal depthwise conv, the `C*conv`
+	/// post-conv gate, and `out_proj`.
+	ShortConv,
 }
 
 /// How a hybrid arch lays out its per-layer blocks.
@@ -243,6 +264,11 @@ pub(super) enum HyMode {
 	/// output, adds the block residual, then a `pre_ff`-normed FFN sub-block (dense
 	/// SwiGLU or MoE + shared expert) with its own residual.
 	DeltaNet,
+	/// lfm2/lfm2moe: each layer runs one mixer (short-conv recurrent OR SWA
+	/// attention, chosen by shortconv-tensor presence) on the operator-normed input,
+	/// adds the block residual, then an `ffn_norm`-normed FFN sub-block (dense SwiGLU
+	/// or sigmoid-gated MoE) with its own residual.
+	ShortConv,
 }
 
 /// A per-layer attention/recurrent-interleaving composition. `sp` drives both the
@@ -367,7 +393,8 @@ fn attn_block(
 		ne,
 		&ar.v,
 	)?;
-	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2 regress with them), so attn_bias stays a no-op
+	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2/lfm2/talkie
+	// regress with them, finding 20), so attn_bias stays a no-op
 	let _ = sp.attn_bias;
 	if sp.qk_norm {
 		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
@@ -449,6 +476,83 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	return Ok(());
 }
 
+/// NeoX RoPE with optional LongRoPE per-pair frequency factors (minicpm3): the
+/// `factors` path divides each pair's angle by `factors[i]`, the `None` path is
+/// plain RoPE. Keeps [`layer_minicpm3`] agnostic to whether the arch ships factors.
+fn rope_maybe_factors(
+	theta: &GpuBuffer,
+	factors: Option<&GpuBuffer>,
+	rows: usize,
+	head_dim: usize,
+	rot: usize,
+	heads: usize,
+	buf: &GpuBuffer,
+) -> Result<()> {
+	match factors {
+		Some(f) => gpu_rope_partial_factors(theta, rows, head_dim, rot, heads, f, buf)?,
+		None => gpu_rope_partial(theta, rows, head_dim, rot, heads, buf)?,
+	}
+	return Ok(());
+}
+
+/// The minicpm3 decoder block (minicpm3.cpp:91-238): a naive (non-absorbed)
+/// Multi-head Latent Attention with per-head RoPE'd query and one shared RoPE'd
+/// key replicated across the query heads, LongRoPE per-pair frequency factors, and
+/// the minicpm depth-scaled residual (both the attn and FFN outputs scaled by
+/// `scale_depth/sqrt(n_layer)` via `m.res_scale`). The input embedding is pre-scaled
+/// by `scale_embd` in the decode loop. Requires the zero-nope head geometry
+/// (`n_embd_head_k == n_rot`, the fixture's shape); a nonzero nope split fails clean.
+pub(super) fn layer_minicpm3(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let nqh = hp.dims[l].nqh;
+	let (qlr, kvlr, rot) = (hp.q_lora_rank, hp.kv_lora_rank, hp.n_rot);
+	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
+	if hdk != rot {
+		return Err(anyhow!(
+			"{}: minicpm3 nonzero-nope MLA (head_k={hdk}, n_rot={rot}) not supported",
+			hp.arch
+		));
+	}
+	let theta = &m.theta_full;
+	let factors = m.rope_factors.as_ref();
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
+	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, "q_a_norm")?, &m.eps, t, qlr, &ar.mqa)?;
+	gpu_gemm_bt_f64(&ar.mqa, &m.stream(&layer_name(l, "self_attn.q_b_proj.weight"))?, t, nqh * hdk, qlr, &ar.mqb)?;
+	rope_maybe_factors(theta, factors, t * nqh, hdk, rot, nqh, &ar.mqb)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
+	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
+	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	rope_maybe_factors(theta, factors, t, rot, rot, 1, &ar.mkp)?;
+	gpu_gemm_bt_f64(&ar.mkc, &m.stream(&layer_name(l, "self_attn.kv_b_proj.weight"))?, t, nqh * hdv, kvlr, &ar.v)?;
+	gpu_copy_into(&ar.mkp, t * rot, &ar.k)?;
+	for h in 1..nqh {
+		gpu_concat_into(&ar.k, &ar.mkp, t, h * rot, rot, &ar.mkk)?;
+		gpu_copy_into(&ar.mkk, t * (h + 1) * rot, &ar.k)?;
+	}
+	gpu_scale_f64_inplace(attn_scale, t * nqh * hdk, &ar.mqb)?;
+	gpu_gqa_attn(&ar.mqb, &ar.k, &ar.v, t, nqh, nqh, hdk, t, 0.0, &ar.attn)?;
+	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, nqh * hdv, &ar.o)?;
+	gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
+	ffn(m, l, sp, t, ar, &ar.cms)?;
+	gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
+	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
+	return Ok(());
+}
+
 /// Parameterized dense-attention decoder block: attention, residual, FFN
 /// (gated SwiGLU/GeGLU or sequential GELU/ReLU^2), residual. Composes only the
 /// shared `gpu_*` kernels selected by `sp`.
@@ -481,6 +585,53 @@ pub(super) fn layer_spec(
 	}
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
+}
+
+/// The talkie decoder block (talkie.cpp:64-129). Every block norm is
+/// non-parametric RMS; the attention applies RoPE first, then an asymmetric
+/// post-rope qk-norm (Q: non-parametric RMS over head_dim then a per-head scalar
+/// gain; K: non-parametric RMS, no gain); the FFN is a non-parametric-normed
+/// SwiGLU; and the frozen non-parametric-normed initial embedding (`ar.embd_skip`,
+/// stashed once by the decode loop) is added to every layer output scaled by that
+/// layer's `layer_output_scale` scalar. Composed from the shared `gpu_*` kernels.
+pub(super) fn layer_talkie(
+	m: &Model,
+	l: usize,
+	sp: &Spec,
+	h_in: &GpuBuffer,
+	h_out: &GpuBuffer,
+	t: usize,
+	ar: &Arena,
+	attn_scale: &GpuBuffer,
+) -> Result<()> {
+	let hp = &m.hp;
+	let ne = hp.ne;
+	let d = &hp.dims[l];
+	let (nqh, hd, nkv) = (d.nqh, d.hd, d.nkv);
+	let (qd, kd) = (nqh * hd, nkv * hd);
+	gpu_rmsnorm_f64_nogamma(h_in, &m.eps, t, ne, &ar.x)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, ne, &ar.q)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
+	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, ne, &ar.v)?;
+	gpu_rope_partial(&m.theta_full, t * nqh, hd, hd, nqh, &ar.q)?;
+	gpu_rope_partial(&m.theta_full, t * nkv, hd, hd, nkv, &ar.k)?;
+	gpu_rmsnorm_f64_nogamma(&ar.q, &m.eps, t * nqh, hd, &ar.q)?;
+	let gain = m.q_headscale[l]
+		.as_ref()
+		.ok_or_else(|| anyhow!("{}: layer {l} missing per-head q gain", hp.arch))?;
+	gpu_broadcast_mul(&ar.q, gain, t * qd, qd, &ar.q)?;
+	gpu_rmsnorm_f64_nogamma(&ar.k, &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, t, 0.0, &ar.attn)?;
+	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, qd, &ar.o)?;
+	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+	gpu_rmsnorm_f64_nogamma(&ar.attn_out, &m.eps, t, ne, &ar.cms)?;
+	ffn(m, l, sp, t, ar, &ar.cms)?;
+	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, &ar.o)?;
+	gpu_copy_into(&ar.embd_skip, t * ne, &ar.cms)?;
+	gpu_scale_f64_inplace(&m.ls_dev[l], t * ne, &ar.cms)?;
+	gpu_add_into(&ar.cms, &ar.o, t * ne, h_out)?;
+	return Ok(());
 }
 
 /// Dense FFN composition selected by `sp.ffn`, `cms` (normed input) -> `ar.mlp0`.
@@ -1303,6 +1454,34 @@ fn hybrid_ffn(
 	return Ok(());
 }
 
+/// True if layer `l` is an lfm2 short-conv recurrent layer (its `shortconv_in_proj`
+/// is present) rather than an attention layer: the honest per-layer interleave
+/// signal, `n_head_kv(l)==0` in `llama.cpp`.
+fn layer_is_shortconv(m: &Model, l: usize) -> bool {
+	return m.big.contains_key(&layer_name(l, "self_attn.shortconv_in_proj.weight"));
+}
+
+/// The lfm2 gated short-convolution mixer (lfm2.cpp build_shortconv_block :157-226),
+/// writing the `out_proj`-projected output to `out` without the block residual.
+/// operator_norm, `in_proj` split into contiguous row-blocks `B|C|x`, the `B*x`
+/// pre-conv gate, a causal depthwise conv (`l_cache` taps, no activation), the
+/// `C*conv` post-conv gate, then `out_proj`. All scratch is arena-resident.
+fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
+	let ne = m.hp.ne;
+	let lc = m.hp.shortconv_l_cache;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	let w_in = m.stream(&layer_name(l, "self_attn.shortconv_in_proj.weight"))?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, ne * ne), t, ne, ne, &ar.q)?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(ne * ne, ne * ne), t, ne, ne, &ar.k)?;
+	gpu_gemm_bt_f64(&ar.x, &w_in.view(2 * ne * ne, ne * ne), t, ne, ne, &ar.v)?;
+	gpu_mul_inplace(&ar.v, t * ne, &ar.q)?;
+	let conv_w = m.stream(&layer_name(l, "self_attn.shortconv_conv.weight"))?;
+	gpu_ssm_conv_causal(&ar.q, &conv_w, None, t, ne, lc, &ar.v)?;
+	gpu_mul_inplace(&ar.k, t * ne, &ar.v)?;
+	gpu_gemm_bt_f64(&ar.v, &m.stream(&layer_name(l, "self_attn.shortconv_out_proj.weight"))?, t, ne, ne, out)?;
+	return Ok(());
+}
+
 /// Per-layer attention/recurrent-interleaving decoder block for the mamba
 /// hybrids. Routes each layer to its mixer by tensor presence and composes the
 /// block per `hy.mode`, reusing the verified [`attn_block`], [`mamba1_mix`],
@@ -1325,6 +1504,7 @@ pub(super) fn layer_hybrid(
 			Recur::Plamo2 => plamo2_mix(m, l, h_in, out, t, ar),
 			Recur::GatedDelta => gated_delta_mix(m, l, h_in, out, t, ar),
 			Recur::Kda => kda_mix(m, l, h_in, out, t, ar),
+			Recur::ShortConv => shortconv_mix(m, l, h_in, out, t, ar),
 		};
 	};
 	match hy.mode {
@@ -1379,6 +1559,15 @@ pub(super) fn layer_hybrid(
 				delta_full_attn(m, l, h_in, &ar.o, t, ar, attn_scale)?;
 			}
 			gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+			delta_ffn(m, l, &hy.sp, &ar.attn_out, h_out, t, ar)?;
+		}
+		HyMode::ShortConv => {
+			if layer_is_shortconv(m, l) {
+				recur_mix(&ar.o)?;
+				gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
+			} else {
+				attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
+			}
 			delta_ffn(m, l, &hy.sp, &ar.attn_out, h_out, t, ar)?;
 		}
 	}

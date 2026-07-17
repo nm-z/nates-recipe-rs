@@ -1589,6 +1589,7 @@ unsafe extern "C" {
 		t: i32,
 		d_inner: i32,
 		d_conv: i32,
+		apply_silu: i32,
 		stream: *mut c_void,
 	);
 	fn launch_ssm_scan_mamba1(
@@ -4990,6 +4991,42 @@ pub fn gpu_ssm_conv_causal_silu(
 			ci(t)?,
 			ci(d_inner)?,
 			ci(d_conv)?,
+			1,
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
+/// Causal depthwise conv1d with optional per-channel bias, NO activation (lfm2
+/// shortconv: the raw conv output is gated downstream by `C`, not SiLU'd). Same
+/// `[T, d_inner]` token-major layout and `(d_conv-1)` left zero-pad as
+/// [`gpu_ssm_conv_causal_silu`].
+///
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+pub fn gpu_ssm_conv_causal(
+	x: &GpuBuffer,
+	conv_w: &GpuBuffer,
+	bias: Option<&GpuBuffer>,
+	t: usize,
+	d_inner: usize,
+	d_conv: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	let bias_ptr = bias.map_or(ptr::null(), |b| b.ptr.cast_const());
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null bias is handled by the kernel (no per-channel add).
+	unsafe {
+		launch_ssm_conv_causal_silu(
+			x.ptr.cast_const(),
+			conv_w.ptr.cast_const(),
+			bias_ptr,
+			out.ptr,
+			ci(t)?,
+			ci(d_inner)?,
+			ci(d_conv)?,
+			0,
 			ptr::null_mut(),
 		);
 	}

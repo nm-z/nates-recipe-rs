@@ -72,6 +72,7 @@ unsafe extern "C" {
 		rotary_dim: i32,
 		heads_per_tok: i32,
 		theta: *const c_void,
+		factors: *const c_void,
 		stream: *mut c_void,
 	);
 	fn launch_gemm_bt_f64(
@@ -113,6 +114,38 @@ pub fn gpu_rope_partial(
 			ci(rotary_dim)?,
 			ci(heads_per_tok)?,
 			theta.ptr_raw().cast_const(),
+			ptr::null(),
+			ptr::null_mut(),
+		);
+	}
+	return cl();
+}
+
+/// LongRoPE NeoX RoPE with per-pair frequency factors (`factors` is `[rotary_dim/2]`,
+/// dividing the pair-i angle; minicpm3 `rope_ext` with `freq_factors`).
+///
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
+pub fn gpu_rope_partial_factors(
+	theta: &GpuBuffer,
+	rows: usize,
+	head_dim: usize,
+	rotary_dim: usize,
+	heads_per_tok: usize,
+	factors: &GpuBuffer,
+	buf: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: buf, theta and factors are live GpuBuffer allocations and the dims are range-checked i32; the launcher only reads them.
+	unsafe {
+		launch_rope_partial(
+			buf.ptr_raw(),
+			ci(rows)?,
+			ci(head_dim)?,
+			ci(rotary_dim)?,
+			ci(heads_per_tok)?,
+			theta.ptr_raw().cast_const(),
+			factors.ptr_raw().cast_const(),
 			ptr::null_mut(),
 		);
 	}

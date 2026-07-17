@@ -154,8 +154,12 @@ extern "C" void launch_mla_masked_attn(
         q, k, v, out, t, nqh, nkv, hdk, hdv, prefix);
 }
 
+// factors (nullable): LongRoPE per-pair frequency factors [rotary_dim/2]. When
+// present the pair-i angle is divided by factors[i] (ggml rope_ext freq_factors,
+// minicpm3); null reproduces plain NeoX RoPE.
 extern "C" __global__ void rope_partial(
-    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta_p
+    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok,
+    const double* theta_p, const double* factors
 ) {
     double theta = *theta_p;
     int half = rotary_dim / 2;
@@ -165,7 +169,8 @@ extern "C" __global__ void rope_partial(
     int row = idx / half;
     int i = idx % half;
     int pos = row / heads_per_tok;
-    double freq = (double)pos * pow(theta, -2.0 * (double)i / (double)rotary_dim);
+    double ff = factors ? factors[i] : 1.0;
+    double freq = (double)pos * pow(theta, -2.0 * (double)i / (double)rotary_dim) / ff;
     double c = cos(freq), s = sin(freq);
     double* b = buf + (long)row * head_dim;
     double a0 = b[i], a1 = b[i + half];
@@ -173,13 +178,14 @@ extern "C" __global__ void rope_partial(
     b[i + half] = a0 * s + a1 * c;
 }
 extern "C" void launch_rope_partial(
-    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok, const double* theta, hipStream_t s
+    double* buf, int rows, int head_dim, int rotary_dim, int heads_per_tok,
+    const double* theta, const double* factors, hipStream_t s
 ) {
     int t = 256;
     long total = (long)rows * (rotary_dim / 2);
     long blk = (total + t - 1) / t;
     hipLaunchKernelGGL(rope_partial, dim3((unsigned)blk), dim3(t), 0, s,
-        buf, rows, head_dim, rotary_dim, heads_per_tok, theta);
+        buf, rows, head_dim, rotary_dim, heads_per_tok, theta, factors);
 }
 
 __device__ __forceinline__ double fi_gelu_tanh(double x) {

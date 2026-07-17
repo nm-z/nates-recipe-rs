@@ -8,7 +8,7 @@ use super::{Arena, Model};
 use anyhow::{Result, bail};
 use common::{
 	Ffn, Hy, HyMode, NormK, Recur, Spec, apply_norm, layer_hybrid, layer_mamba, layer_mamba2,
-	layer_moe, layer_recurrent, layer_spec,
+	layer_minicpm3, layer_moe, layer_recurrent, layer_spec, layer_talkie,
 };
 use gpu_core::memory::GpuBuffer;
 
@@ -31,6 +31,15 @@ enum Comp {
 	/// (jamba, falcon-h1, granitehybrid, nemotron_h): each layer's mixer is
 	/// chosen by tensor presence, dispatched to [`layer_hybrid`].
 	Hybrid(Hy),
+	/// talkie: non-parametric-RMS dense-attention block with post-rope asymmetric
+	/// qk-norm and a frozen normed-embedding skip residual, dispatched to
+	/// [`layer_talkie`]. Carries a [`Spec`] for the shared scalar resolvers
+	/// (logit_scale, embd_skip, final norm).
+	Talkie(Spec),
+	/// minicpm3: naive (non-absorbed) MLA with LongRoPE per-pair frequency factors
+	/// and the minicpm depth-scaled residual, dispatched to [`layer_minicpm3`].
+	/// Carries a [`Spec`] for the FFN + the `scale_embd` constant.
+	Minicpm3(Spec),
 }
 
 /// GGUF architecture string -> decode composition. The single source of truth
@@ -59,7 +68,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("deepseek", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("deepseek2", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
 	("deepseek2-ocr", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
-	("deepseek32", Comp::Moe(Spec::dense(Ffn::SiluGate))),
+	("deepseek32", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
 	("deepseek4", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("dflash", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("dots1", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
@@ -119,8 +128,16 @@ const TABLE: &[(&str, Comp)] = &[
 		sp: Spec::dense(Ffn::SiluGate),
 		mode: HyMode::DeltaNet,
 	})),
-	("lfm2", Comp::Recurrent),
-	("lfm2moe", Comp::Recurrent),
+	("lfm2", Comp::Hybrid(Hy {
+		recur: Recur::ShortConv,
+		sp: Spec::dense(Ffn::SiluGate).qk(),
+		mode: HyMode::ShortConv,
+	})),
+	("lfm2moe", Comp::Hybrid(Hy {
+		recur: Recur::ShortConv,
+		sp: Spec::dense(Ffn::SiluGate).qk(),
+		mode: HyMode::ShortConv,
+	})),
 	("llada", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("llada-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("llama", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
@@ -132,7 +149,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("mellum", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mimo2", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("minicpm", Comp::Dense(Spec::dense(Ffn::SiluGate).emb_scale_kv().residual_scale())),
-	("minicpm3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("minicpm3", Comp::Minicpm3(Spec::dense(Ffn::SiluGate).emb_scale_const(12.0))),
 	("minimax-m2", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mistral3", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("mistral4", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
@@ -207,7 +224,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("step35", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("t5", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("t5encoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("talkie", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
+	("talkie", Comp::Talkie(Spec::dense(Ffn::SiluGate).logit_scale().embd_skip())),
 	("wavtokenizer-dec", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("xverse", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 ];
@@ -231,18 +248,18 @@ pub(super) const COMPOSABLE: &[&str] = &supported_names();
 /// parity test hard-fails if a listed arch regresses.
 pub(super) const VERIFIED: &[&str] = &[
 	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
-	"cogvlm", "command-r", "dbrx", "deepseek", "deepseek2", "dots1", "dream",
+	"cogvlm", "command-r", "dbrx", "deepseek", "deepseek2", "deepseek32", "dots1", "dream",
 	"ernie4_5", "ernie4_5-moe", "exaone", "falcon-h1", "gemma", "gemma2", "glm-dsa",
 	"glm4moe", "granitehybrid", "grok", "grovemoe", "hunyuan-dense", "hunyuan-moe",
-	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "kimi-linear", "llada",
-	"llada-moe", "llama4",
-	"maincoder", "mamba", "mamba2", "nemotron_h", "nemotron_h_moe",
+	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "kimi-linear", "lfm2", "lfm2moe",
+	"llada", "llada-moe", "llama4",
+	"maincoder", "mamba", "mamba2", "minicpm3", "nemotron_h", "nemotron_h_moe",
 	"minimax-m2",
 	"mistral4", "olmoe", "openelm", "paddleocr", "pangu-embedded", "phi2",
 	"phi3", "plamo", "plamo2", "qwen",
 	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen35", "qwen35moe", "qwen3moe",
 	"qwen3next", "qwen3vl",
-	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "xverse",
+	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "talkie", "xverse",
 ];
 
 /// True if every parity fixture config of `arch` is measured OK.
@@ -277,7 +294,9 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 	for &(name, comp) in TABLE {
 		if name == arch {
 			return match comp {
-				Comp::Dense(sp) | Comp::Moe(sp) => sp.norm == NormK::Layer,
+				Comp::Dense(sp) | Comp::Moe(sp) | Comp::Talkie(sp) | Comp::Minicpm3(sp) => {
+					sp.norm == NormK::Layer
+				}
 				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 | Comp::Hybrid(_) => false,
 			};
 		}
@@ -292,7 +311,7 @@ fn spec_of(m: &Model) -> Option<Spec> {
 	for &(name, comp) in TABLE {
 		if name == arch {
 			return match comp {
-				Comp::Dense(sp) | Comp::Moe(sp) => Some(sp),
+				Comp::Dense(sp) | Comp::Moe(sp) | Comp::Talkie(sp) | Comp::Minicpm3(sp) => Some(sp),
 				Comp::Recurrent | Comp::Mamba | Comp::Mamba2 | Comp::Hybrid(_) => None,
 			};
 		}
@@ -308,6 +327,7 @@ pub(super) fn embedding_scale(m: &Model) -> f64 {
 	match spec_of(m) {
 		Some(sp) if sp.emb_sqrt_ne => (m.hp.ne as f64).sqrt(),
 		Some(sp) if sp.emb_scale_kv && m.hp.embedding_scale > 0.0 => m.hp.embedding_scale,
+		Some(sp) if sp.emb_scale_const != 1.0 => sp.emb_scale_const,
 		_other => 1.0,
 	}
 }
@@ -327,6 +347,13 @@ pub(super) fn final_softcap(m: &Model) -> f64 {
 		Some(sp) if sp.final_softcap => m.hp.softcap,
 		_other => 0.0,
 	}
+}
+
+/// True if `m.hp.arch` retains a non-parametric-normed copy of the initial
+/// embedding as a per-layer skip residual (talkie): the decode loop RMS-norms the
+/// embedding in place and stashes it, and [`layer_talkie`] adds it back scaled.
+pub(super) fn embd_skip(m: &Model) -> bool {
+	return spec_of(m).is_some_and(|sp| sp.embd_skip);
 }
 
 /// Final-logit scale for `m.hp.arch`: `hp.logit_scale` for arches whose graph
@@ -386,6 +413,8 @@ pub(super) fn dispatch(
 				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar),
 				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar),
 				Comp::Hybrid(hy) => layer_hybrid(m, l, &hy, h_in, h_out, t, ar, attn_scale),
+				Comp::Talkie(sp) => layer_talkie(m, l, &sp, h_in, h_out, t, ar, attn_scale),
+				Comp::Minicpm3(sp) => layer_minicpm3(m, l, &sp, h_in, h_out, t, ar, attn_scale),
 			};
 		}
 	}

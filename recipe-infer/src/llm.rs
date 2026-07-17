@@ -4,7 +4,7 @@ use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
 };
-use gpu_core::kernels::{gpu_add_into, gpu_layernorm_into};
+use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
 use gpu_core::log::probe as probe_flag;
 use gpu_core::log::{Write, data, gpu};
 use gpu_core::memory::GpuBuffer;
@@ -126,6 +126,12 @@ impl Headless {
 		h0.load(&base)?;
 		if let Some((g, b)) = &m.embed_norm {
 			gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
+		}
+		// talkie: non-parametric RMS the embedding in place, then freeze it as the
+		// per-layer skip source (talkie.cpp:50-53).
+		if models::embd_skip(m) {
+			gpu_rmsnorm_f64_nogamma(&h0, &m.eps, t, ne, &h0)?;
+			gpu_copy_into(&h0, t * ne, &ar.embd_skip)?;
 		}
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
@@ -356,6 +362,9 @@ struct Hparams {
 	value_length: usize,
 	key_length_swa: usize,
 	value_length_swa: usize,
+	/// lfm2 short-conv cache width (`shortconv.l_cache`), the depthwise-conv kernel
+	/// width for shortconv recurrent layers; `0` for non-shortconv arches.
+	shortconv_l_cache: usize,
 	/// Multi-head Latent Attention ranks + head sub-dims (deepseek2 family). All
 	/// zero for non-MLA arches. `q_lora_rank`/`kv_lora_rank` are the latent
 	/// bottleneck widths; `head_k_mla`/`head_v_mla` the decompressed per-head key
@@ -440,8 +449,17 @@ impl Hparams {
 		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
 		let q_lora_rank = uint_kv_or(g, &k("attention.q_lora_rank"), 0)?;
 		let kv_lora_rank = uint_kv_or(g, &k("attention.kv_lora_rank"), 0)?;
-		let head_k_mla = uint_kv_or(g, &k("attention.key_length_mla"), 0)?;
-		let head_v_mla = uint_kv_or(g, &k("attention.value_length_mla"), 0)?;
+		// minicpm3 is a naive (non-absorbed) MLA: it ships q/kv-lora ranks but no
+		// key_length_mla/value_length_mla, so derive the per-head key/value dims from
+		// the standard key_length/value_length to size the MLA scratch + widen window.
+		let (head_k_mla, head_v_mla) = if arch == "minicpm3" {
+			(key_length, value_length)
+		} else {
+			(
+				uint_kv_or(g, &k("attention.key_length_mla"), 0)?,
+				uint_kv_or(g, &k("attention.value_length_mla"), 0)?,
+			)
+		};
 		let n_rot = uint_kv_or(g, &k("rope.dimension_count"), 0)?;
 		let head_count_kv = match g.kv.get(&k("attention.head_count_kv")) {
 			Some(Val::Arr(_items)) => uint_arr(g, &k("attention.head_count_kv"))?,
@@ -475,6 +493,7 @@ impl Hparams {
 		let embedding_scale = f32_kv_or(g, &k("embedding_scale"), 0.0)?;
 		let residual_scale = f32_kv_or(g, &k("residual_scale"), 0.0)?;
 		let alibi_bias = f32_kv_or(g, &k("attention.max_alibi_bias"), 0.0)?;
+		let shortconv_l_cache = uint_kv_or(g, &k("shortconv.l_cache"), 0)?;
 		let ssm_d_conv = uint_kv_or(g, &k("ssm.conv_kernel"), 0)?;
 		let ssm_d_inner = uint_kv_or(g, &k("ssm.inner_size"), 0)?;
 		let ssm_d_state = uint_kv_or(g, &k("ssm.state_size"), 0)?;
@@ -612,9 +631,12 @@ impl Hparams {
 		} else {
 			0
 		};
+		// lfm2 shortconv in_proj is [3*ne, ne], wider than any attention/FFN weight.
+		let shortconv_win = if shortconv_l_cache > 0 { 3 * ne * ne } else { 0 };
 		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne)
 			.max(mla_win)
 			.max(ssm_win)
+			.max(shortconv_win)
 			.max(2 * qd_max * ne);
 		let lm_chunk = win_elems / ne;
 		let stage_bytes = (win_elems * 2).max(slot_bytes);
@@ -641,6 +663,7 @@ impl Hparams {
 			value_length,
 			key_length_swa,
 			value_length_swa,
+			shortconv_l_cache,
 			q_lora_rank,
 			kv_lora_rank,
 			head_k_mla,
@@ -823,6 +846,10 @@ struct Arena {
 	comb: GpuBuffer,
 	ha: GpuBuffer,
 	hb: GpuBuffer,
+	/// The frozen non-parametric-normed initial embedding (talkie skip source),
+	/// stashed once by the decode loop and added to every layer. Sized `1` for
+	/// non-talkie arches.
+	embd_skip: GpuBuffer,
 	soft: GpuBuffer,
 	scn: GpuBuffer,
 	sg: GpuBuffer,
@@ -920,6 +947,7 @@ impl Arena {
 			comb: a(t * ne)?,
 			ha: a(t * ne)?,
 			hb: a(t * ne)?,
+			embd_skip: a(if hp.arch == "talkie" { t * ne } else { 1 })?,
 			soft: a(c * ne)?,
 			scn: a(c * ne)?,
 			sg: a(c * nff)?,
@@ -977,6 +1005,10 @@ struct Model {
 	norms: Vec<HashMap<&'static str, GpuBuffer>>,
 	norms_b: Vec<HashMap<&'static str, GpuBuffer>>,
 	o_bias: Vec<Option<GpuBuffer>>,
+	/// talkie per-head scalar Q gain, expanded to a full `[nqh*hd]` per-column
+	/// vector so [`gpu_broadcast_mul`] applies each head's scalar over its head_dim.
+	/// `None` outside talkie.
+	q_headscale: Vec<Option<GpuBuffer>>,
 	ffn_up_bias: Vec<Option<GpuBuffer>>,
 	ffn_down_bias: Vec<Option<GpuBuffer>>,
 	embed_norm: Option<(GpuBuffer, GpuBuffer)>,
@@ -1006,6 +1038,9 @@ struct Model {
 	attn_scale_mla: GpuBuffer,
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
+	/// LongRoPE per-pair frequency factors (`[n_rot/2]`, minicpm3 `rope_factors_*`);
+	/// `None` for arches without per-dim rope scaling.
+	rope_factors: Option<GpuBuffer>,
 	ls_dev: Vec<GpuBuffer>,
 	/// Per-layer selective-SSM parameters loaded as f64 device buffers (mamba
 	/// family): `ssm_conv_w` `[d_inner, d_conv]` channel-major, `ssm_conv_b`
@@ -1298,6 +1333,8 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 	("output.bias", "lm_head.bias"),
 	("output_norm.weight", "norm.weight"),
 	("output_norm.bias", "norm.bias"),
+	("rope_factors_short.weight", "rope_short.weight"),
+	("rope_factors_long.weight", "rope_long.weight"),
 	("self_cond_pre_norm.weight", "self_conditioning.pre_norm.weight"),
 	("self_cond_gate.weight", "self_conditioning.gate_proj.weight"),
 	("self_cond_up.weight", "self_conditioning.up_proj.weight"),
@@ -1328,6 +1365,9 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_q.weight", "self_attn.q_proj.weight"),
 	("attn_k.weight", "self_attn.k_proj.weight"),
 	("attn_v.weight", "self_attn.v_proj.weight"),
+	("shortconv.conv.weight", "self_attn.shortconv_conv.weight"),
+	("shortconv.in_proj.weight", "self_attn.shortconv_in_proj.weight"),
+	("shortconv.out_proj.weight", "self_attn.shortconv_out_proj.weight"),
 	("attn_q_a.weight", "self_attn.q_a_proj.weight"),
 	("attn_q_b.weight", "self_attn.q_b_proj.weight"),
 	("attn_kv_a_mqa.weight", "self_attn.kv_a_proj.weight"),
@@ -1450,6 +1490,13 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 			},
 		);
 	}
+	// lfm2/lfm2moe ship the FINAL pre-lm_head norm under the name token_embd_norm
+	// (LLM_TENSOR_OUTPUT_NORM_LFM2), applied as output_norm, not an embed norm.
+	if matches!(hp.arch.as_str(), "lfm2" | "lfm2moe")
+		&& let Some(t) = big.remove("model.decoder.embed_norm.weight")
+	{
+		big.insert("model.decoder.norm.weight".to_string(), t);
+	}
 	synth_qkv_slices(&mut big, &hp);
 	synth_ffn_slices(&mut big, &hp);
 	finish_load(vec![f], big, hp)
@@ -1553,7 +1600,15 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	};
 	let res_scale = {
 		let ub = GpuBuffer::alloc(1)?;
-		let s = if hp.residual_scale > 0.0 { hp.residual_scale } else { 1.0 };
+		// minicpm3 hardcodes scale_depth=1.4 (minicpm3.cpp:67), the per-layer residual
+		// scale is scale_depth/sqrt(n_layer), applied to both the attn and FFN outputs.
+		let s = if hp.arch == "minicpm3" {
+			1.4 / (hp.nl as f64).sqrt()
+		} else if hp.residual_scale > 0.0 {
+			hp.residual_scale
+		} else {
+			1.0
+		};
 		ub.load(&[s])?;
 		ub
 	};
@@ -1576,6 +1631,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		norms: Vec::new(),
 		norms_b: Vec::new(),
 		o_bias: Vec::new(),
+		q_headscale: Vec::new(),
 		ffn_up_bias: Vec::new(),
 		ffn_down_bias: Vec::new(),
 		embed_norm: None,
@@ -1597,6 +1653,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		attn_scale_mla,
 		theta_full,
 		theta_slide,
+		rope_factors: None,
 		ls_dev: Vec::new(),
 		ssm_conv_w: Vec::new(),
 		ssm_conv_b: Vec::new(),
@@ -1652,6 +1709,24 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			return Ok(None);
 		};
 		m.o_bias.push(opt_bias(&m, p("self_attn.o_proj.bias"))?);
+		// talkie's per-head scalar Q gain [n_head] expands to [nqh*hd] so a single
+		// broadcast-mul applies each head's scalar across its head_dim.
+		let qhs = if m.hp.arch == "talkie" && m.big.contains_key(&p("self_attn.q_norm.weight")) {
+			let per_head = m.small_f64(&p("self_attn.q_norm.weight"))?;
+			let (nqh, hd) = (m.hp.dims[l].nqh, m.hp.dims[l].hd);
+			let mut expanded = vec![0.0f64; nqh * hd];
+			for h in 0..nqh {
+				for x in 0..hd {
+					expanded[h * hd + x] = per_head[h % per_head.len()];
+				}
+			}
+			let ub = GpuBuffer::alloc(expanded.len())?;
+			ub.load(&expanded)?;
+			Some(ub)
+		} else {
+			None
+		};
+		m.q_headscale.push(qhs);
 		m.ffn_up_bias.push(opt_bias(&m, p("mlp.up_proj.bias"))?);
 		m.ffn_down_bias.push(opt_bias(&m, p("mlp.down_proj.bias"))?);
 		let opt_small = |m: &Model, name: String| -> Result<Vec<f64>> {
@@ -1701,6 +1776,15 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	}
 
 	Write::line(data, "globals + embedding table");
+	// LongRoPE per-pair frequency factors (minicpm3). For a context within the
+	// original training length the short factors apply (get_rope_factors); the
+	// fixtures ship identity factors, so this is exact and correct machinery.
+	if m.big.contains_key("model.decoder.rope_short.weight") {
+		let vals = m.small_f64("model.decoder.rope_short.weight")?;
+		let ub = GpuBuffer::alloc(vals.len())?;
+		ub.load(&vals)?;
+		m.rope_factors = Some(ub);
+	}
 	if m.big.contains_key("model.decoder.norm.weight") {
 		m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
 	}
