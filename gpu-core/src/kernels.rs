@@ -3231,6 +3231,43 @@ pub fn gpu_layernorm_into(
 	return Ok(());
 }
 
+/// LayerNorm with optional affine params, mirroring llama.cpp `build_norm(x,
+/// gamma_or_null, beta_or_null, LLM_NORM)`: `None` gamma runs a non-parametric
+/// LayerNorm (mean-center + unit scale), a present gamma with `None` beta runs a
+/// gamma-only affine (zero bias). The kernel branches on the null pointers, so the
+/// runtime composes every norm variant from one op with no per-arch code.
+///
+/// # Errors
+/// Returns [`HipError`] on size overflow or launch failure.
+#[inline]
+pub fn gpu_layernorm_opt_into(
+	x: &GpuBuffer,
+	gamma: Option<&GpuBuffer>,
+	beta: Option<&GpuBuffer>,
+	eps: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	let gp = gamma.map_or(ptr::null(), |g| g.ptr.cast_const());
+	let bp = beta.map_or(ptr::null(), |b| b.ptr.cast_const());
+	// SAFETY: x/out/eps are live allocations and gamma/beta are either live or null; the launcher touches only rows*cols and null-guards the affine reads.
+	unsafe {
+		launch_layernorm(
+			x.ptr.cast_const(),
+			out.ptr.cast::<c_void>(),
+			gp,
+			bp,
+			ci(rows)?,
+			ci(cols)?,
+			eps.ptr.cast::<f64>(),
+			ptr::null_mut(),
+		);
+	}
+	check_launch();
+	return Ok(());
+}
+
 /// # Errors
 /// Returns [`HipError`] on size overflow or launch failure.
 #[inline]

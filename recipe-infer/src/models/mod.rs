@@ -6,7 +6,7 @@ mod common;
 
 use super::{Arena, Model};
 use anyhow::{Result, bail};
-use common::{Ffn, Spec, layer_moe, layer_recurrent, layer_spec};
+use common::{Ffn, NormK, Spec, apply_norm, layer_moe, layer_recurrent, layer_spec};
 use gpu_core::memory::GpuBuffer;
 
 /// One architecture's decode composition: a dense [`Spec`] block, a
@@ -39,8 +39,8 @@ const TABLE: &[(&str, Comp)] = &[
 	("cogvlm", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("cohere2", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("cohere2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("command-r", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
-	("dbrx", Comp::Moe(Spec::dense(Ffn::SiluGate))),
+	("command-r", Comp::Dense(Spec::dense(Ffn::SiluGate).layer().parallel().logit_scale())),
+	("dbrx", Comp::Moe(Spec::dense(Ffn::SiluGate).layer())),
 	("deci", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
 	("deepseek", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("deepseek2", Comp::Moe(Spec::dense(Ffn::SiluGate))),
@@ -55,9 +55,9 @@ const TABLE: &[(&str, Comp)] = &[
 	("ernie4_5-moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("eurobert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
 	("exaone", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
-	("exaone4", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
+	("exaone4", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich().no_pre_norm())),
 	("exaone-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("falcon", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("falcon", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().parallel().attn_norm2())),
 	("falcon-h1", Comp::Recurrent),
 	("gemma", Comp::Dense(Spec::dense(Ffn::GeluGate).emb_sqrt_ne())),
 	("gemma2", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().emb_sqrt_ne().final_softcap())),
@@ -114,7 +114,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("neo-bert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
 	("nomic-bert", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("nomic-bert-moe", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("olmo", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("olmo", Comp::Dense(Spec::dense(Ffn::SiluGate).layer().nonparam())),
 	("olmo2", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("olmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("openelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
@@ -177,8 +177,8 @@ pub(super) const COMPOSABLE: &[&str] = &supported_names();
 /// parity test hard-fails if a listed arch regresses.
 pub(super) const VERIFIED: &[&str] = &[
 	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
-	"cogvlm", "deepseek", "dots1", "dream", "ernie4_5", "ernie4_5-moe",
-	"exaone", "gemma", "gemma2", "glm4moe", "grok", "grovemoe",
+	"cogvlm", "command-r", "dbrx", "deepseek", "dots1", "dream", "ernie4_5",
+	"ernie4_5-moe", "exaone", "gemma", "gemma2", "glm4moe", "grok", "grovemoe",
 	"hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3", "internlm2",
 	"llada", "llada-moe", "llama4", "maincoder", "minimax-m2", "olmoe",
 	"openelm", "paddleocr", "pangu-embedded", "phi2", "phi3", "plamo", "qwen",
@@ -194,6 +194,23 @@ pub(super) fn verified(arch: &str) -> bool {
 /// True if `arch` has a composition wired into [`dispatch`].
 pub(super) fn supported(arch: &str) -> bool {
 	COMPOSABLE.contains(&arch)
+}
+
+/// True if `arch`'s block norm is a true LayerNorm (mean-centered). Selects the
+/// norm-epsilon KV source at load: `attention.layer_norm_epsilon` for LayerNorm
+/// arches, `attention.layer_norm_rms_epsilon` for RMS arches, mirroring
+/// llama.cpp's `f_norm_eps` vs `f_norm_rms_eps` split. Fixtures ship the unused
+/// key as 0, so reading the wrong one silently zeroes eps.
+pub(super) fn norm_is_layer(arch: &str) -> bool {
+	for &(name, comp) in TABLE {
+		if name == arch {
+			return match comp {
+				Comp::Dense(sp) | Comp::Moe(sp) => sp.norm == NormK::Layer,
+				Comp::Recurrent => false,
+			};
+		}
+	}
+	return false;
 }
 
 /// The [`Spec`] for `m.hp.arch`, or `None` for recurrent / unlisted arches. Lets
@@ -238,6 +255,38 @@ pub(super) fn final_softcap(m: &Model) -> f64 {
 		Some(sp) if sp.final_softcap => m.hp.softcap,
 		_other => 0.0,
 	}
+}
+
+/// Final-logit scale for `m.hp.arch`: `hp.logit_scale` for arches whose graph
+/// scales the logits (command-r), else `1.0`. Spec-flag gated so an arch that
+/// ships the KV without using it never scales.
+pub(super) fn logit_scale(m: &Model) -> f64 {
+	match spec_of(m) {
+		Some(sp) if sp.logit_scale && m.hp.logit_scale != 0.0 => m.hp.logit_scale,
+		_other => 1.0,
+	}
+}
+
+/// The final pre-LM-head norm for `m.hp.arch`, composed from the arch's [`NormK`]
+/// with gamma/beta resolved by presence: absent gamma is the non-parametric case
+/// (olmo/talkie), a present gamma with absent beta the gamma-only case
+/// (command-r/dbrx). Mirrors llama.cpp's `build_norm(cur, output_norm_or_null,
+/// output_norm_b_or_null, kind, -1)`, so the runtime composes the head norm the
+/// same way it composes the block norms.
+pub(super) fn decoder_norm(
+	m: &Model,
+	x: &GpuBuffer,
+	rows: usize,
+	ne: usize,
+	out: &GpuBuffer,
+) -> Result<()> {
+	let kind = spec_of(m).map_or(NormK::Rms, |sp| sp.norm);
+	let gamma = if m.big.contains_key("model.decoder.norm.weight") {
+		Some(&m.decoder_norm)
+	} else {
+		None
+	};
+	return apply_norm(kind, gamma, m.decoder_norm_b.as_ref(), &m.eps, rows, ne, x, out);
 }
 
 /// Route one decode layer to the ported composition for `m.hp.arch` via a

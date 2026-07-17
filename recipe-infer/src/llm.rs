@@ -134,13 +134,15 @@ impl Headless {
 			mem::swap(&mut src, &mut dst);
 		}
 		let last_h = src.view((t - 1) * ne, ne);
-		if let Some(nb) = &m.decoder_norm_b {
-			gpu_layernorm_into(&last_h, &m.decoder_norm, nb, &m.eps, 1, ne, &ar.hfs)?;
-		} else {
-			gpu_rmsnorm_f64(&last_h, &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
-		}
+		models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
 		let mut logits = lm_head(m, &ar.hfs, 1, ar)?;
 		logits.truncate(m.hp.vocab);
+		let ls = models::logit_scale(m);
+		if ls != 1.0 {
+			for v in logits.iter_mut() {
+				*v *= ls;
+			}
+		}
 		let fc = models::final_softcap(m);
 		if fc > 0.0 {
 			for v in logits.iter_mut() {
@@ -357,6 +359,7 @@ struct Hparams {
 	freq_base: f64,
 	freq_base_swa: f64,
 	softcap: f64,
+	logit_scale: f64,
 	embedding_scale: f64,
 	residual_scale: f64,
 	alibi_bias: f64,
@@ -416,8 +419,13 @@ impl Hparams {
 		};
 		let freq_base = f32_kv_or(g, &k("rope.freq_base"), 10000.0)?;
 		let freq_base_swa = f32_kv_or(g, &k("rope.freq_base_swa"), freq_base)?;
-		let eps = f32_kv_or(g, &k("attention.layer_norm_rms_epsilon"), 1e-5)?;
+		let eps = if models::norm_is_layer(&arch) {
+			f32_kv_or(g, &k("attention.layer_norm_epsilon"), 1e-5)?
+		} else {
+			f32_kv_or(g, &k("attention.layer_norm_rms_epsilon"), 1e-5)?
+		};
 		let softcap = f32_kv_or(g, &k("final_logit_softcapping"), 0.0)?;
+		let logit_scale = f32_kv_or(g, &k("logit_scale"), 1.0)?;
 		let embedding_scale = f32_kv_or(g, &k("embedding_scale"), 0.0)?;
 		let residual_scale = f32_kv_or(g, &k("residual_scale"), 0.0)?;
 		let alibi_bias = f32_kv_or(g, &k("attention.max_alibi_bias"), 0.0)?;
@@ -513,6 +521,7 @@ impl Hparams {
 			freq_base,
 			freq_base_swa,
 			softcap,
+			logit_scale,
 			embedding_scale,
 			residual_scale,
 			alibi_bias,
@@ -774,8 +783,9 @@ struct Model {
 	hp: Hparams,
 }
 
-const LAYER_NORMS: [(&str, &str); 9] = [
+const LAYER_NORMS: [(&str, &str); 10] = [
 	("input", "input_layernorm.weight"),
+	("attn2", "self_attn.attn_norm_2.weight"),
 	("post_attn", "post_attention_layernorm.weight"),
 	("q_norm", "self_attn.q_norm.weight"),
 	("k_norm", "self_attn.k_norm.weight"),
@@ -1041,6 +1051,9 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_norm.weight", "input_layernorm.weight"),
 	("attn_norm.bias", "input_layernorm.bias"),
+	("attn_norm_2.weight", "self_attn.attn_norm_2.weight"),
+	("attn_norm_2.bias", "self_attn.attn_norm_2.bias"),
+	("attn_output_norm.weight", "pre_feedforward_layernorm.weight"),
 	("post_attention_norm.weight", "post_attention_layernorm.weight"),
 	("post_attention_norm.bias", "post_attention_layernorm.bias"),
 	("attn_q_norm.weight", "self_attn.q_norm.weight"),
@@ -1338,7 +1351,9 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	}
 
 	Write::line(data, "globals + embedding table");
-	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
+	if m.big.contains_key("model.decoder.norm.weight") {
+		m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
+	}
 	if m.big.contains_key("model.decoder.norm.bias") {
 		let vals = m.small_f64("model.decoder.norm.bias")?;
 		let ub = GpuBuffer::alloc(vals.len())?;
@@ -1860,19 +1875,17 @@ fn generate_causal(
 		}
 		let last = cur - 1;
 		let last_h = src.view(last * ne, ne);
-		if let Some(nb) = &m.decoder_norm_b {
-			gpu_layernorm_into(&last_h, &m.decoder_norm, nb, &m.eps, 1, ne, &ar.hfs)?;
-		} else {
-			gpu_rmsnorm_f64(&last_h, &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
-		}
+		models::decoder_norm(&m, &last_h, 1, ne, &ar.hfs)?;
 		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
+		let lsc = models::logit_scale(&m);
 		let mut best = 0usize;
 		let mut bv = f64::MIN;
 		for (i, &v) in logits.iter().take(vocab_size).enumerate() {
+			let vs = v * lsc;
 			let sv = if softcap > 0.0 {
-				softcap * (v / softcap).tanh()
+				softcap * (vs / softcap).tanh()
 			} else {
-				v
+				vs
 			};
 			if sv > bv {
 				bv = sv;

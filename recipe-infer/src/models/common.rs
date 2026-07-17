@@ -8,12 +8,12 @@ use super::super::{Arena, Model, layer_name, softmax};
 use anyhow::{Result, anyhow};
 use core::ptr;
 use gpu_core::infer_ops::{
-	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
-	gpu_scale_f64_inplace,
+	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rmsnorm_f64_nogamma,
+	gpu_rope_partial, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{
-	gpu_add_into, gpu_bias_add, gpu_gelu_into, gpu_layernorm_into, gpu_mul_inplace, gpu_relu_into,
-	gpu_silu_into,
+	gpu_add_into, gpu_bias_add, gpu_gelu_into, gpu_layernorm_opt_into, gpu_mul_inplace,
+	gpu_relu_into, gpu_silu_into,
 };
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
@@ -48,10 +48,22 @@ pub(super) struct Spec {
 	pub post_attn: bool,
 	pub post_ffn: bool,
 	pub parallel: bool,
+	/// False for post-norm archs (olmo2/exaone4): attention reads the raw block
+	/// input (no pre-attention norm) and the FFN reads the post-attn residual
+	/// directly (no pre-FFN norm); the norms live at the post positions instead.
+	pub pre_norm: bool,
+	/// Block norms carry no gamma/beta tensors (olmo): every boundary norm runs
+	/// non-parametric (mean-center + unit scale), never demanding a weight.
+	pub nonparam: bool,
+	/// A second block-input norm (`attn_norm_2`) feeds the attention branch while
+	/// the first (`input`) feeds the parallel FFN branch (falcon-40B).
+	pub second_attn_norm: bool,
 	pub attn_bias: bool,
 	pub o_bias: bool,
 	pub ffn_bias: bool,
 	pub out_bias: bool,
+	/// Scale the final logits by `{arch}.logit_scale` (command-r, cohere).
+	pub logit_scale: bool,
 	pub alibi: bool,
 	pub emb_sqrt_ne: bool,
 	pub emb_scale_kv: bool,
@@ -70,10 +82,14 @@ impl Spec {
 			post_attn: false,
 			post_ffn: false,
 			parallel: false,
+			pre_norm: true,
+			nonparam: false,
+			second_attn_norm: false,
 			attn_bias: false,
 			o_bias: false,
 			ffn_bias: false,
 			out_bias: false,
+			logit_scale: false,
 			alibi: false,
 			emb_sqrt_ne: false,
 			emb_scale_kv: false,
@@ -100,6 +116,22 @@ impl Spec {
 	}
 	pub(super) const fn parallel(mut self) -> Spec {
 		self.parallel = true;
+		self
+	}
+	pub(super) const fn nonparam(mut self) -> Spec {
+		self.nonparam = true;
+		self
+	}
+	pub(super) const fn no_pre_norm(mut self) -> Spec {
+		self.pre_norm = false;
+		self
+	}
+	pub(super) const fn attn_norm2(mut self) -> Spec {
+		self.second_attn_norm = true;
+		self
+	}
+	pub(super) const fn logit_scale(mut self) -> Spec {
+		self.logit_scale = true;
 		self
 	}
 	pub(super) const fn bias(mut self) -> Spec {
@@ -157,9 +189,35 @@ fn norm_of<'m>(m: &'m Model, l: usize, key: &str) -> Result<&'m GpuBuffer> {
 		.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} norm weight", m.hp.arch))
 }
 
-/// A block boundary norm dispatched by [`Spec::norm`]: RMSNorm (mean-free) or true
-/// LayerNorm (mean-centered, affine gamma+beta). The beta is looked up presence-wise
-/// from the parallel per-layer store, keeping the loader arch-agnostic.
+/// The one norm primitive every arch composes from, mirroring llama.cpp
+/// `build_norm(x, gamma_or_null, beta_or_null, kind)`: RMSNorm (mean-free) or true
+/// LayerNorm (mean-centered), each with `gamma`/`beta` present or absent. `None`
+/// gamma is the non-parametric case; a present gamma with `None` beta is the
+/// gamma-only affine. No per-arch code decides the shape, only these two `Option`s.
+pub(super) fn apply_norm(
+	kind: NormK,
+	gamma: Option<&GpuBuffer>,
+	beta: Option<&GpuBuffer>,
+	eps: &GpuBuffer,
+	rows: usize,
+	cols: usize,
+	x: &GpuBuffer,
+	out: &GpuBuffer,
+) -> Result<()> {
+	match kind {
+		NormK::Rms => match gamma {
+			Some(g) => gpu_rmsnorm_f64(x, g, eps, rows, cols, out)?,
+			None => gpu_rmsnorm_f64_nogamma(x, eps, rows, cols, out)?,
+		},
+		NormK::Layer => gpu_layernorm_opt_into(x, gamma, beta, eps, rows, cols, out)?,
+	}
+	return Ok(());
+}
+
+/// A block boundary norm dispatched by [`Spec::norm`]. Gamma is the per-layer norm
+/// weight, absent when [`Spec::nonparam`] (non-parametric norm, olmo); beta is
+/// looked up presence-wise from the parallel per-layer store (gamma-only when
+/// absent, command-r/dbrx), keeping the loader arch-agnostic.
 fn blk_norm(
 	m: &Model,
 	sp: &Spec,
@@ -170,16 +228,13 @@ fn blk_norm(
 	x: &GpuBuffer,
 	out: &GpuBuffer,
 ) -> Result<()> {
-	match sp.norm {
-		NormK::Rms => gpu_rmsnorm_f64(x, norm_of(m, l, key)?, &m.eps, rows, cols, out)?,
-		NormK::Layer => {
-			let beta = m.norms_b[l]
-				.get(key)
-				.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} layernorm beta", m.hp.arch))?;
-			gpu_layernorm_into(x, norm_of(m, l, key)?, beta, &m.eps, rows, cols, out)?;
-		}
-	}
-	return Ok(());
+	let gamma = if sp.nonparam {
+		None
+	} else {
+		Some(norm_of(m, l, key)?)
+	};
+	let beta = m.norms_b[l].get(key);
+	return apply_norm(sp.norm, gamma, beta, &m.eps, rows, cols, x, out);
 }
 
 /// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
@@ -204,9 +259,19 @@ fn attn_block(
 	} else {
 		&m.theta_full
 	};
-	blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
+	let attn_src: &GpuBuffer = if sp.pre_norm {
+		blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
+		if sp.second_attn_norm && m.norms[l].contains_key("attn2") {
+			blk_norm(m, sp, l, "attn2", t, ne, h_in, &ar.cms)?;
+			&ar.cms
+		} else {
+			&ar.x
+		}
+	} else {
+		h_in
+	};
 	gpu_gemm_bt_f64(
-		&ar.x,
+		attn_src,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
 		t,
 		qd,
@@ -214,9 +279,9 @@ fn attn_block(
 		&ar.q,
 	)?;
 	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
-	gpu_gemm_bt_f64(&ar.x, &wk, t, kd, ne, &ar.k)?;
+	gpu_gemm_bt_f64(attn_src, &wk, t, kd, ne, &ar.k)?;
 	gpu_gemm_bt_f64(
-		&ar.x,
+		attn_src,
 		&m.stream(&layer_name(l, "self_attn.v_proj.weight"))?,
 		t,
 		kd,
@@ -276,6 +341,8 @@ pub(super) fn layer_spec(
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
 	let ffn_in = if sp.parallel {
 		&ar.x
+	} else if !sp.pre_norm {
+		&ar.attn_out
 	} else {
 		blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
 		&ar.cms

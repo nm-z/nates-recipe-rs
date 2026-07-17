@@ -702,7 +702,7 @@ extern "C" __global__ void layernorm_kernel(const double* x, double* out,
     double inv_std = 1.0 / sqrt(smem[0] / cols + eps);
     for (int j = threadIdx.x; j < cols; j += blockDim.x) {
         double normed = (r[j] - mean) * inv_std;
-        o[j] = gamma ? normed * gamma[j] + beta[j] : normed;
+        o[j] = gamma ? normed * gamma[j] + (beta ? beta[j] : 0.0) : normed;
     }
 }
 
