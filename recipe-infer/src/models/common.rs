@@ -11,7 +11,10 @@ use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
 	gpu_scale_f64_inplace,
 };
-use gpu_core::kernels::{gpu_add_into, gpu_gelu_into, gpu_mul_inplace, gpu_relu_into, gpu_silu_into};
+use gpu_core::kernels::{
+	gpu_add_into, gpu_bias_add, gpu_gelu_into, gpu_layernorm_into, gpu_mul_inplace, gpu_relu_into,
+	gpu_silu_into,
+};
 use gpu_core::reductions::gpu_scan_linear_recurrence;
 use gpu_core::memory::GpuBuffer;
 use std::cmp;
@@ -44,7 +47,15 @@ pub(super) struct Spec {
 	pub qk_norm: bool,
 	pub post_attn: bool,
 	pub post_ffn: bool,
+	pub parallel: bool,
 	pub attn_bias: bool,
+	pub o_bias: bool,
+	pub out_bias: bool,
+	pub alibi: bool,
+	pub emb_sqrt_ne: bool,
+	pub emb_scale_kv: bool,
+	pub residual_scale: bool,
+	pub final_softcap: bool,
 	pub bidir: bool,
 	pub rope: bool,
 	pub ffn: Ffn,
@@ -57,7 +68,15 @@ impl Spec {
 			qk_norm: false,
 			post_attn: false,
 			post_ffn: false,
+			parallel: false,
 			attn_bias: false,
+			o_bias: false,
+			out_bias: false,
+			alibi: false,
+			emb_sqrt_ne: false,
+			emb_scale_kv: false,
+			residual_scale: false,
+			final_softcap: false,
 			bidir: false,
 			rope: true,
 			ffn,
@@ -77,12 +96,49 @@ impl Spec {
 		self.post_ffn = true;
 		self
 	}
+	pub(super) const fn parallel(mut self) -> Spec {
+		self.parallel = true;
+		self
+	}
 	pub(super) const fn bias(mut self) -> Spec {
 		self.attn_bias = true;
 		self
 	}
+	pub(super) const fn o_bias(mut self) -> Spec {
+		self.o_bias = true;
+		self
+	}
+	pub(super) const fn out_bias(mut self) -> Spec {
+		self.out_bias = true;
+		self
+	}
+	pub(super) const fn emb_sqrt_ne(mut self) -> Spec {
+		self.emb_sqrt_ne = true;
+		self
+	}
+	pub(super) const fn emb_scale_kv(mut self) -> Spec {
+		self.emb_scale_kv = true;
+		self
+	}
+	pub(super) const fn residual_scale(mut self) -> Spec {
+		self.residual_scale = true;
+		self
+	}
+	pub(super) const fn final_softcap(mut self) -> Spec {
+		self.final_softcap = true;
+		self
+	}
 	pub(super) const fn layer(mut self) -> Spec {
 		self.norm = NormK::Layer;
+		self
+	}
+	pub(super) const fn learned_pos(mut self) -> Spec {
+		self.rope = false;
+		self
+	}
+	pub(super) const fn alibi(mut self) -> Spec {
+		self.alibi = true;
+		self.rope = false;
 		self
 	}
 }
@@ -93,6 +149,31 @@ fn norm_of<'m>(m: &'m Model, l: usize, key: &str) -> Result<&'m GpuBuffer> {
 	m.norms[l]
 		.get(key)
 		.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} norm weight", m.hp.arch))
+}
+
+/// A block boundary norm dispatched by [`Spec::norm`]: RMSNorm (mean-free) or true
+/// LayerNorm (mean-centered, affine gamma+beta). The beta is looked up presence-wise
+/// from the parallel per-layer store, keeping the loader arch-agnostic.
+fn blk_norm(
+	m: &Model,
+	sp: &Spec,
+	l: usize,
+	key: &str,
+	rows: usize,
+	cols: usize,
+	x: &GpuBuffer,
+	out: &GpuBuffer,
+) -> Result<()> {
+	match sp.norm {
+		NormK::Rms => gpu_rmsnorm_f64(x, norm_of(m, l, key)?, &m.eps, rows, cols, out)?,
+		NormK::Layer => {
+			let beta = m.norms_b[l]
+				.get(key)
+				.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} layernorm beta", m.hp.arch))?;
+			gpu_layernorm_into(x, norm_of(m, l, key)?, beta, &m.eps, rows, cols, out)?;
+		}
+	}
+	return Ok(());
 }
 
 /// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
@@ -117,7 +198,7 @@ fn attn_block(
 	} else {
 		&m.theta_full
 	};
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
 	gpu_gemm_bt_f64(
 		&ar.x,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
@@ -146,7 +227,8 @@ fn attn_block(
 	}
 	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
 	let prefix = if sp.bidir { 0 } else { t };
-	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, &ar.attn)?;
+	let max_bias = if sp.alibi { m.hp.alibi_bias } else { 0.0 };
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, max_bias, &ar.attn)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -155,11 +237,18 @@ fn attn_block(
 		qd,
 		&ar.o,
 	)?;
+	if sp.o_bias {
+		if let Some(b) = &m.o_bias[l] {
+			gpu_bias_add(&ar.o, b, t, ne, &ar.o)?;
+		}
+	}
 	if sp.post_attn {
 		gpu_rmsnorm_f64(&ar.o, norm_of(m, l, "post_attn")?, &m.eps, t, ne, &ar.o)?;
 	}
+	if sp.residual_scale {
+		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.o)?;
+	}
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	let _ = sp.norm;
 	let _ = sp.attn_bias;
 	Ok(())
 }
@@ -179,25 +268,33 @@ pub(super) fn layer_spec(
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
-	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
-	ffn(m, l, sp, t, ar)?;
+	let ffn_in = if sp.parallel {
+		&ar.x
+	} else {
+		blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
+		&ar.cms
+	};
+	ffn(m, l, sp, t, ar, ffn_in)?;
 	if sp.post_ffn {
 		gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
+	}
+	if sp.residual_scale {
+		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
 	}
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
 }
 
-/// Dense FFN composition selected by `sp.ffn`, `ar.cms` (normed) -> `ar.mlp0`.
-fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena) -> Result<()> {
+/// Dense FFN composition selected by `sp.ffn`, `cms` (normed input) -> `ar.mlp0`.
+fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) -> Result<()> {
 	let hp = &m.hp;
 	let (ne, nff) = (hp.ne, hp.dims[l].nff);
 	let up = m.stream(&layer_name(l, "mlp.up_proj.weight"))?;
-	gpu_gemm_bt_f64(&ar.cms, &up, t, nff, ne, &ar.u)?;
+	gpu_gemm_bt_f64(cms, &up, t, nff, ne, &ar.u)?;
 	match sp.ffn {
 		Ffn::SiluGate => {
 			gpu_gemm_bt_f64(
-				&ar.cms,
+				cms,
 				&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
 				t,
 				nff,
@@ -209,7 +306,7 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena) -> Result<()> {
 		}
 		Ffn::GeluGate => {
 			gpu_gemm_bt_f64(
-				&ar.cms,
+				cms,
 				&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
 				t,
 				nff,
@@ -255,7 +352,7 @@ pub(super) fn layer_moe(
 	let hp = &m.hp;
 	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
-	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
+	blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
 	let gate_w = m.stream(&layer_name(l, "router.proj.weight"))?;
 	let logits = GpuBuffer::alloc(t * nexp)?;
 	gpu_gemm_bt_f64(&ar.cms, &gate_w, t, nexp, ne, &logits)?;
@@ -303,6 +400,9 @@ pub(super) fn layer_moe(
 		}
 	}
 	ar.mlp0.load(&mo)?;
+	if sp.residual_scale {
+		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
+	}
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
 }
@@ -366,7 +466,7 @@ pub(super) fn layer_recurrent(
 	)?;
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
 	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
-	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar)?;
+	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar, &ar.cms)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
 }

@@ -32,10 +32,10 @@ const TABLE: &[(&str, Comp)] = &[
 	("bailingmoe2", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("bert", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
 	("bitnet", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("bloom", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("bloom", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
 	("chameleon", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("chatglm", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
-	("codeshell", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("codeshell", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias())),
 	("cogvlm", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("cohere2", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("cohere2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
@@ -59,8 +59,8 @@ const TABLE: &[(&str, Comp)] = &[
 	("exaone-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("falcon", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
 	("falcon-h1", Comp::Recurrent),
-	("gemma", Comp::Dense(Spec::dense(Ffn::GeluGate))),
-	("gemma2", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich())),
+	("gemma", Comp::Dense(Spec::dense(Ffn::GeluGate).emb_sqrt_ne())),
+	("gemma2", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().emb_sqrt_ne().final_softcap())),
 	("gemma3", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
 	("gemma3n", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
 	("gemma4", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
@@ -69,22 +69,22 @@ const TABLE: &[(&str, Comp)] = &[
 	("glm4", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("glm4moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("glm-dsa", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("gpt2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("gpt2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().learned_pos())),
 	("gptj", Comp::Dense(Spec::dense(Ffn::GeluSeq))),
-	("gptneox", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("gptneox", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias())),
 	("gpt-oss", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("granite", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("granite", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("granitehybrid", Comp::Recurrent),
-	("granitemoe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("grok", Comp::Moe(Spec::dense(Ffn::SiluGate))),
+	("granitemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).o_bias())),
+	("grok", Comp::Moe(Spec::dense(Ffn::SiluGate).emb_scale_kv())),
 	("grovemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("hunyuan-dense", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("hunyuan-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("hunyuan_vl", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("hy_v3", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("internlm2", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("jais", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
-	("jais2", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
+	("jais", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
+	("jais2", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias())),
 	("jamba", Comp::Recurrent),
 	("jina-bert-v2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
 	("jina-bert-v3", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
@@ -93,7 +93,7 @@ const TABLE: &[(&str, Comp)] = &[
 	("lfm2moe", Comp::Recurrent),
 	("llada", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("llada-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("llama", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("llama", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("llama4", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("llama-embed", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
 	("maincoder", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
@@ -101,14 +101,14 @@ const TABLE: &[(&str, Comp)] = &[
 	("mamba2", Comp::Recurrent),
 	("mellum", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mimo2", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("minicpm", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("minicpm", Comp::Dense(Spec::dense(Ffn::SiluGate).emb_scale_kv().residual_scale())),
 	("minicpm3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("minimax-m2", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("mistral3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("mistral3", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("mistral4", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("modern-bert", Comp::Dense(Spec::dense(Ffn::GeluGate).encoder())),
-	("mpt", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
-	("nemotron", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
+	("mpt", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
+	("nemotron", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias())),
 	("nemotron_h", Comp::Recurrent),
 	("nemotron_h_moe", Comp::Recurrent),
 	("neo-bert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
@@ -119,17 +119,17 @@ const TABLE: &[(&str, Comp)] = &[
 	("olmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("openelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("orion", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
-	("paddleocr", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("pangu-embedded", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("phi2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
-	("phi3", Comp::Moe(Spec::dense(Ffn::SiluGate))),
+	("paddleocr", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
+	("pangu-embedded", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().out_bias())),
+	("phi2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().out_bias().parallel())),
+	("phi3", Comp::Moe(Spec::dense(Ffn::SiluGate).out_bias())),
 	("phimoe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("plamo", Comp::Dense(Spec::dense(Ffn::SiluGate))),
+	("plamo", Comp::Dense(Spec::dense(Ffn::SiluGate).parallel())),
 	("plamo2", Comp::Recurrent),
 	("plamo3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich())),
 	("plm", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
 	("qwen", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("qwen2", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
+	("qwen2", Comp::Dense(Spec::dense(Ffn::SiluGate).bias().out_bias())),
 	("qwen2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("qwen2vl", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
 	("qwen3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
@@ -139,17 +139,17 @@ const TABLE: &[(&str, Comp)] = &[
 	("qwen3next", Comp::Recurrent),
 	("qwen3vl", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("qwen3vlmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("refact", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("refact", Comp::Dense(Spec::dense(Ffn::GeluSeq).bias())),
 	("rnd1", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("rwkv6", Comp::Recurrent),
 	("rwkv6qwen2", Comp::Recurrent),
 	("rwkv7", Comp::Recurrent),
-	("seed_oss", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
+	("seed_oss", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("smallthinker", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("smollm3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("stablelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
-	("starcoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
-	("starcoder2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias())),
+	("stablelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().layer())),
+	("starcoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().learned_pos())),
+	("starcoder2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias())),
 	("step35", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("t5", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
 	("t5encoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
@@ -170,11 +170,74 @@ const fn supported_names() -> [&'static str; TABLE.len()] {
 }
 
 /// GGUF architecture strings with a decode composition wired into [`dispatch`].
-pub(super) const SUPPORTED: &[&str] = &supported_names();
+pub(super) const COMPOSABLE: &[&str] = &supported_names();
+
+/// Architectures whose EVERY parity fixture config matches llama.cpp to
+/// NMSE <= 1e-4 (archs_parity). Entry here is by measurement only; the
+/// parity test hard-fails if a listed arch regresses.
+pub(super) const VERIFIED: &[&str] = &[
+	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
+	"cogvlm", "deepseek", "dots1", "dream", "ernie4_5", "ernie4_5-moe",
+	"exaone", "gemma", "gemma2", "glm4moe", "grok", "grovemoe",
+	"hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3", "internlm2",
+	"llada", "llada-moe", "llama4", "maincoder", "minimax-m2", "olmoe",
+	"openelm", "paddleocr", "pangu-embedded", "phi3", "plamo", "qwen",
+	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen3moe", "qwen3vl",
+	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "xverse",
+];
+
+/// True if every parity fixture config of `arch` is measured OK.
+pub(super) fn verified(arch: &str) -> bool {
+	VERIFIED.contains(&arch)
+}
 
 /// True if `arch` has a composition wired into [`dispatch`].
 pub(super) fn supported(arch: &str) -> bool {
-	SUPPORTED.contains(&arch)
+	COMPOSABLE.contains(&arch)
+}
+
+/// The [`Spec`] for `m.hp.arch`, or `None` for recurrent / unlisted arches. Lets
+/// the neutral runtime resolve a Spec-flagged scalar without per-arch branching.
+fn spec_of(m: &Model) -> Option<Spec> {
+	let arch = m.hp.arch.as_str();
+	for &(name, comp) in TABLE {
+		if name == arch {
+			return match comp {
+				Comp::Dense(sp) | Comp::Moe(sp) => Some(sp),
+				Comp::Recurrent => None,
+			};
+		}
+	}
+	return None;
+}
+
+/// Input-embedding scale for `m.hp.arch`: `sqrt(n_embd)` for arches that hardcode
+/// it (gemma family), the `{arch}.embedding_scale` KV for arches that read it
+/// (grok, minicpm), else `1.0`. A structural [`Spec`] flag picks the source, so a
+/// KV value that every fixture ships never triggers on its own.
+pub(super) fn embedding_scale(m: &Model) -> f64 {
+	match spec_of(m) {
+		Some(sp) if sp.emb_sqrt_ne => (m.hp.ne as f64).sqrt(),
+		Some(sp) if sp.emb_scale_kv && m.hp.embedding_scale > 0.0 => m.hp.embedding_scale,
+		_other => 1.0,
+	}
+}
+
+/// True if `m.hp.arch` adds a learned LM-head output bias to the logits (qwen2,
+/// phi2/phi3, pangu). Spec-flag gated, never presence: dream/qwen2vl ship the
+/// tensor but their reference graph leaves it unused.
+pub(super) fn out_bias(m: &Model) -> bool {
+	spec_of(m).is_some_and(|sp| sp.out_bias)
+}
+
+/// Final-logit softcap for `m.hp.arch`: `hp.softcap` for arches whose graph applies
+/// it (gemma2/gemma3), else `0.0`. Spec-flag gated, never KV-triggered, because
+/// gemma1/minicpm ship `final_logit_softcapping` in KV yet must not apply it.
+pub(super) fn final_softcap(m: &Model) -> f64 {
+	match spec_of(m) {
+		Some(sp) if sp.final_softcap => m.hp.softcap,
+		_other => 0.0,
+	}
 }
 
 /// Route one decode layer to the ported composition for `m.hp.arch` via a

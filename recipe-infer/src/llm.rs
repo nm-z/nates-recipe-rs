@@ -4,7 +4,7 @@ use gpu_core::infer_ops::{
 	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
 };
-use gpu_core::kernels::gpu_add_into;
+use gpu_core::kernels::{gpu_add_into, gpu_layernorm_into};
 use gpu_core::log::probe as probe_flag;
 use gpu_core::log::{Write, data, gpu};
 use gpu_core::memory::GpuBuffer;
@@ -30,14 +30,27 @@ use std::time::Instant;
 #[path = "models/mod.rs"]
 mod models;
 
-/// GGUF architecture strings recipe-infer has a verified decode composition for.
+/// GGUF architecture strings whose parity fixtures ALL measure OK against
+/// llama.cpp (NMSE <= 1e-4 in archs_parity). Measured, never declared.
 pub fn supported_archs() -> &'static [&'static str] {
-	models::SUPPORTED
+	models::VERIFIED
 }
 
-/// True if `arch` (a GGUF `general.architecture` string) is verified-supported.
-pub fn arch_supported(arch: &str) -> bool {
+/// Every GGUF architecture string [`models::dispatch`] can compose a decode
+/// for, verified or not. Composable answers "can we attempt a forward";
+/// [`supported_archs`] answers "is the output measured correct".
+pub fn composable_archs() -> &'static [&'static str] {
+	models::COMPOSABLE
+}
+
+/// True if `arch` has a dispatchable decode composition.
+pub fn arch_composable(arch: &str) -> bool {
 	models::supported(arch)
+}
+
+/// True if every parity fixture config of `arch` is measured OK.
+pub fn arch_supported(arch: &str) -> bool {
+	models::verified(arch)
 }
 
 /// Defuses to a released device arena if `Headless::open` fails partway: the
@@ -98,26 +111,42 @@ impl Headless {
 		let (m, ar) = (&self.m, &self.ar);
 		let (ne, nl) = (m.hp.ne, m.hp.nl);
 		let t = seq.len();
-		// llama/qwen3/xverse do NOT scale input embeddings (gemma's sqrt(n_embd)
-		// scale is arch-specific and would swamp the residual stream here).
+		// Input-embedding scale is 1.0 except for arches whose graph scales it (gemma).
+		let scale = models::embedding_scale(m);
 		let mut base = vec![0.0f64; t * ne];
 		for (p, &tk) in seq.iter().enumerate() {
 			let b = tk as usize * ne * 2;
 			for x in 0..ne {
 				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
 			}
 		}
-		ar.ha.view(0, t * ne).load(&base)?;
+		add_pos_embd(m, &mut base, 0, t, ne);
+		let h0 = ar.ha.view(0, t * ne);
+		h0.load(&base)?;
+		if let Some((g, b)) = &m.embed_norm {
+			gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
+		}
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
 			models::dispatch(m, l, src, dst, t, ar, &self.attn_scale)?;
 			mem::swap(&mut src, &mut dst);
 		}
-		gpu_rmsnorm_f64(&src.view((t - 1) * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		let last_h = src.view((t - 1) * ne, ne);
+		if let Some(nb) = &m.decoder_norm_b {
+			gpu_layernorm_into(&last_h, &m.decoder_norm, nb, &m.eps, 1, ne, &ar.hfs)?;
+		} else {
+			gpu_rmsnorm_f64(&last_h, &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		}
 		let mut logits = lm_head(m, &ar.hfs, 1, ar)?;
 		logits.truncate(m.hp.vocab);
+		let fc = models::final_softcap(m);
+		if fc > 0.0 {
+			for v in logits.iter_mut() {
+				*v = fc * (*v / fc).tanh();
+			}
+		}
 		return Ok(logits);
 	}
 }
@@ -328,6 +357,9 @@ struct Hparams {
 	freq_base: f64,
 	freq_base_swa: f64,
 	softcap: f64,
+	embedding_scale: f64,
+	residual_scale: f64,
+	alibi_bias: f64,
 	dims: Vec<LayerDims>,
 	win_elems: usize,
 	stage_bytes: usize,
@@ -386,6 +418,9 @@ impl Hparams {
 		let freq_base_swa = f32_kv_or(g, &k("rope.freq_base_swa"), freq_base)?;
 		let eps = f32_kv_or(g, &k("attention.layer_norm_rms_epsilon"), 1e-5)?;
 		let softcap = f32_kv_or(g, &k("final_logit_softcapping"), 0.0)?;
+		let embedding_scale = f32_kv_or(g, &k("embedding_scale"), 0.0)?;
+		let residual_scale = f32_kv_or(g, &k("residual_scale"), 0.0)?;
+		let alibi_bias = f32_kv_or(g, &k("attention.max_alibi_bias"), 0.0)?;
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
 		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
@@ -478,6 +513,9 @@ impl Hparams {
 			freq_base,
 			freq_base_swa,
 			softcap,
+			embedding_scale,
+			residual_scale,
+			alibi_bias,
 			dims,
 			qd_max,
 			kd_max,
@@ -491,6 +529,22 @@ impl Hparams {
 
 fn bf16(h: u16) -> f64 {
 	f32::from_bits((h as u32) << 16) as f64
+}
+
+/// Adds the learned absolute position embedding to `t` rows of `base` starting at
+/// absolute position `pos0`. A no-op for RoPE arches (empty `pos_embd`), so the
+/// caller stays arch-agnostic.
+fn add_pos_embd(m: &Model, base: &mut [f64], pos0: usize, t: usize, ne: usize) {
+	if m.pos_embd.is_empty() {
+		return;
+	}
+	for p in 0..t {
+		let row = (pos0 + p) * ne * 2;
+		for x in 0..ne {
+			let b = row + x * 2;
+			base[p * ne + x] += bf16(u16::from_le_bytes([m.pos_embd[b], m.pos_embd[b + 1]]));
+		}
+	}
 }
 
 /// Expert feed-forward width taken from the expert weight tensor's own shape, for
@@ -688,7 +742,11 @@ struct Model {
 	store: Waterfall,
 	rbuf: RefCell<Vec<u8>>,
 	norms: Vec<HashMap<&'static str, GpuBuffer>>,
+	norms_b: Vec<HashMap<&'static str, GpuBuffer>>,
+	o_bias: Vec<Option<GpuBuffer>>,
+	embed_norm: Option<(GpuBuffer, GpuBuffer)>,
 	decoder_norm: GpuBuffer,
+	decoder_norm_b: Option<GpuBuffer>,
 	sc_pre: GpuBuffer,
 	sc_gate: GpuBuffer,
 	sc_up: GpuBuffer,
@@ -700,7 +758,14 @@ struct Model {
 	/// Untied output projection (bf16 bytes), when the model ships a separate
 	/// `output.weight`. Empty when the LM head is tied to `emb`.
 	out: Vec<u8>,
+	/// Learned LM-head output bias (`output.bias`, f64), added to the logits for
+	/// arches whose graph applies it. Empty otherwise.
+	out_b: Vec<f64>,
+	/// Learned absolute position embedding table (`position_embd.weight`, bf16
+	/// bytes), added to the input embeddings by position. Empty for RoPE arches.
+	pos_embd: Vec<u8>,
 	eps: GpuBuffer,
+	res_scale: GpuBuffer,
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
 	ls_dev: Vec<GpuBuffer>,
@@ -953,8 +1018,13 @@ fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 /// code decides where a tensor goes.
 const GLOBAL_MAP: &[(&str, &str)] = &[
 	("token_embd.weight", "embed_tokens.weight"),
+	("token_embd_norm.weight", "embed_norm.weight"),
+	("token_embd_norm.bias", "embed_norm.bias"),
+	("position_embd.weight", "pos_embd.weight"),
 	("output.weight", "lm_head.weight"),
+	("output.bias", "lm_head.bias"),
 	("output_norm.weight", "norm.weight"),
+	("output_norm.bias", "norm.bias"),
 	("self_cond_pre_norm.weight", "self_conditioning.pre_norm.weight"),
 	("self_cond_gate.weight", "self_conditioning.gate_proj.weight"),
 	("self_cond_up.weight", "self_conditioning.up_proj.weight"),
@@ -968,10 +1038,13 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 /// neutral fused role and [`SLICE_MAP`] then feeds q/k/v as row-subranges.
 const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_norm.weight", "input_layernorm.weight"),
+	("attn_norm.bias", "input_layernorm.bias"),
 	("post_attention_norm.weight", "post_attention_layernorm.weight"),
+	("post_attention_norm.bias", "post_attention_layernorm.bias"),
 	("attn_q_norm.weight", "self_attn.q_norm.weight"),
 	("attn_k_norm.weight", "self_attn.k_norm.weight"),
 	("ffn_norm.weight", "pre_feedforward_layernorm.weight"),
+	("ffn_norm.bias", "pre_feedforward_layernorm.bias"),
 	("post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"),
 	("pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
 	("post_ffw_norm_2.weight", "post_feedforward_layernorm_2.weight"),
@@ -980,6 +1053,7 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_k.weight", "self_attn.k_proj.weight"),
 	("attn_v.weight", "self_attn.v_proj.weight"),
 	("attn_output.weight", "self_attn.o_proj.weight"),
+	("attn_output.bias", "self_attn.o_proj.bias"),
 	("attn_qkv.weight", "self_attn.qkv_proj.weight"),
 	("ffn_gate.weight", "mlp.gate_proj.weight"),
 	("ffn_up.weight", "mlp.up_proj.weight"),
@@ -1155,6 +1229,12 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub.load(&[hp.freq_base_swa])?;
 		ub
 	};
+	let res_scale = {
+		let ub = GpuBuffer::alloc(1)?;
+		let s = if hp.residual_scale > 0.0 { hp.residual_scale } else { 1.0 };
+		ub.load(&[s])?;
+		ub
+	};
 	let nl = hp.nl;
 	let vocab = hp.vocab;
 	let ne = hp.ne;
@@ -1166,7 +1246,11 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		store: Waterfall::new(),
 		rbuf: RefCell::new(Vec::new()),
 		norms: Vec::new(),
+		norms_b: Vec::new(),
+		o_bias: Vec::new(),
+		embed_norm: None,
 		decoder_norm: GpuBuffer::alloc(1)?,
+		decoder_norm_b: None,
 		sc_pre: GpuBuffer::alloc(1)?,
 		sc_gate: GpuBuffer::alloc(1)?,
 		sc_up: GpuBuffer::alloc(1)?,
@@ -1176,7 +1260,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		pe: Vec::new(),
 		emb: Vec::new(),
 		out: Vec::new(),
+		out_b: Vec::new(),
+		pos_embd: Vec::new(),
 		eps,
+		res_scale,
 		theta_full,
 		theta_slide,
 		ls_dev: Vec::new(),
@@ -1191,12 +1278,35 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		beat();
 		let p = |n: &str| format!("model.decoder.layers.{l}.{n}");
 		let mut nm = HashMap::new();
+		let mut nmb = HashMap::new();
 		for (key, suffix) in LAYER_NORMS {
 			if m.big.contains_key(&p(suffix)) {
 				nm.insert(key, upload_gamma(&m.small_f64(&p(suffix))?, plus_one)?);
 			}
+			let bname = p(&suffix.replace(".weight", ".bias"));
+			if m.big.contains_key(&bname) {
+				let vals = m.small_f64(&bname)?;
+				let ub = GpuBuffer::alloc(vals.len())?;
+				ub.load(&vals)?;
+				nmb.insert(key, ub);
+			}
+		}
+		if !nm.contains_key("pre_ff") && m.big.contains_key(&p("post_attention_layernorm.weight")) {
+			let g = upload_gamma(&m.small_f64(&p("post_attention_layernorm.weight"))?, plus_one)?;
+			nm.insert("pre_ff", g);
 		}
 		m.norms.push(nm);
+		m.norms_b.push(nmb);
+		let opt_bias = |m: &Model, name: String| -> Result<Option<GpuBuffer>> {
+			if m.big.contains_key(&name) {
+				let vals = m.small_f64(&name)?;
+				let ub = GpuBuffer::alloc(vals.len())?;
+				ub.load(&vals)?;
+				return Ok(Some(ub));
+			}
+			return Ok(None);
+		};
+		m.o_bias.push(opt_bias(&m, p("self_attn.o_proj.bias"))?);
 		let opt_small = |m: &Model, name: String| -> Result<Vec<f64>> {
 			if m.big.contains_key(&name) {
 				m.small_f64(&name)
@@ -1221,6 +1331,29 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 
 	Write::line(data, "globals + embedding table");
 	m.decoder_norm = upload_gamma(&m.small_f64("model.decoder.norm.weight")?, plus_one)?;
+	if m.big.contains_key("model.decoder.norm.bias") {
+		let vals = m.small_f64("model.decoder.norm.bias")?;
+		let ub = GpuBuffer::alloc(vals.len())?;
+		ub.load(&vals)?;
+		m.decoder_norm_b = Some(ub);
+	}
+	if m.big.contains_key("model.decoder.embed_norm.weight")
+		&& m.big.contains_key("model.decoder.embed_norm.bias")
+	{
+		let g = {
+			let vals = m.small_f64("model.decoder.embed_norm.weight")?;
+			let ub = GpuBuffer::alloc(vals.len())?;
+			ub.load(&vals)?;
+			ub
+		};
+		let b = {
+			let vals = m.small_f64("model.decoder.embed_norm.bias")?;
+			let ub = GpuBuffer::alloc(vals.len())?;
+			ub.load(&vals)?;
+			ub
+		};
+		m.embed_norm = Some((g, b));
+	}
 	if m.big.contains_key("model.decoder.self_conditioning.pre_norm.weight") {
 		m.sc_pre = upload_gamma(
 			&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?,
@@ -1261,6 +1394,12 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		if ot.shape == vec![vocab, ne] {
 			m.out = m.read_bytes(&ot, 0, ot.nbytes)?;
 		}
+	}
+	if m.big.contains_key("model.decoder.lm_head.bias") {
+		m.out_b = m.small_f64("model.decoder.lm_head.bias")?;
+	}
+	if let Some(pt) = m.big.get("model.decoder.pos_embd.weight").cloned() {
+		m.pos_embd = m.read_bytes(&pt, 0, pt.nbytes)?;
 	}
 
 	Ok(m)
@@ -1480,7 +1619,7 @@ fn layer(
 	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
 	gpu_rope_partial(theta, t * nqh, hd, d.rotary, nqh, &ar.q)?;
 	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
-	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, &ar.attn)?;
+	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, 0.0, &ar.attn)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -1632,6 +1771,13 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 		}
 		c0 += cn;
 	}
+	if models::out_bias(m) && !m.out_b.is_empty() {
+		for p in 0..ncanvas {
+			for (j, lg) in logits[p * hp.vocab..(p + 1) * hp.vocab].iter_mut().enumerate() {
+				*lg += m.out_b[j];
+			}
+		}
+	}
 	acc(&LM_NS, _tl);
 	Ok(logits)
 }
@@ -1654,7 +1800,7 @@ fn generate_causal(
 	let nl = m.hp.nl;
 	let vocab_size = m.hp.vocab;
 	let eos = m.hp.eos;
-	let softcap = m.hp.softcap;
+	let softcap = models::final_softcap(&m);
 	let max_new = 256usize;
 	let t_max = prefix + max_new;
 
@@ -1683,15 +1829,21 @@ fn generate_causal(
 	let mut ttft: Option<Duration> = None;
 	for _new in 0..max_new {
 		let cur = toks.len();
+		let scale = models::embedding_scale(&m);
 		let mut base = vec![0.0f64; cur * ne];
 		for (p, &tk) in toks.iter().enumerate() {
 			let b = tk as usize * ne * 2;
 			for x in 0..ne {
 				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]));
+					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
 			}
 		}
-		ar.ha.view(0, cur * ne).load(&base)?;
+		add_pos_embd(&m, &mut base, 0, cur, ne);
+		let h0 = ar.ha.view(0, cur * ne);
+		h0.load(&base)?;
+		if let Some((g, b)) = &m.embed_norm {
+			gpu_layernorm_into(&h0, g, b, &m.eps, cur, ne, &h0)?;
+		}
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
@@ -1699,7 +1851,12 @@ fn generate_causal(
 			mem::swap(&mut src, &mut dst);
 		}
 		let last = cur - 1;
-		gpu_rmsnorm_f64(&src.view(last * ne, ne), &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		let last_h = src.view(last * ne, ne);
+		if let Some(nb) = &m.decoder_norm_b {
+			gpu_layernorm_into(&last_h, &m.decoder_norm, nb, &m.eps, 1, ne, &ar.hfs)?;
+		} else {
+			gpu_rmsnorm_f64(&last_h, &m.decoder_norm, &m.eps, 1, ne, &ar.hfs)?;
+		}
 		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
 		let mut best = 0usize;
 		let mut bv = f64::MIN;

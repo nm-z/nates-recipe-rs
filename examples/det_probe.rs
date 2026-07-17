@@ -281,7 +281,7 @@ fn main() -> anyhow::Result<()> {
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).context("rope q")?;
 		gpu_rope_partial(&theta_buf, T * nkv, hd, rotary, nkv, &k).context("rope k")?;
 		twice(label, T * 16 * hd, |o| {
-			gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, o).context("gqa")
+			gpu_gqa_attn(&q, &k, &v, T, 16, nkv, hd, 6, 0.0, o).context("gqa")
 		})?;
 
 		// rope itself: re-upload, rotate, download, twice.

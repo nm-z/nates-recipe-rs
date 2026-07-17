@@ -34,7 +34,7 @@ __device__ __forceinline__ double fi_block_sum(double v, double* smem) {
 
 extern "C" __global__ void gqa_masked_attn(
     const double* q, const double* k, const double* v, double* out,
-    int t, int nqh, int nkv, int hd, int prefix
+    int t, int nqh, int nkv, int hd, int prefix, double max_bias
 ) {
     int blk = blockIdx.x;
     int p = blk / nqh;
@@ -44,6 +44,14 @@ extern "C" __global__ void gqa_masked_attn(
     int qd = nqh * hd;
     int kd = nkv * hd;
     const double* qrow = q + (long)p * qd + (long)h * hd;
+
+    double slope = 0.0;
+    if (max_bias > 0.0) {
+        int nhl2 = 1 << (int)floor(log2((double)nqh));
+        double m0 = exp2(-max_bias / (double)nhl2);
+        double m1 = exp2(-(max_bias * 0.5) / (double)nhl2);
+        slope = (h < nhl2) ? pow(m0, (double)(h + 1)) : pow(m1, (double)(2 * (h - nhl2) + 1));
+    }
 
     __shared__ double red[64];
     extern __shared__ double sc[];
@@ -55,7 +63,7 @@ extern "C" __global__ void gqa_masked_attn(
         double dot = fi_block_sum(part, red);
         if (threadIdx.x == 0) {
             bool masked = (p < prefix) && (sp > p);
-            sc[sp] = masked ? -1e30 : dot;
+            sc[sp] = masked ? -1e30 : (dot - slope * (double)(p - sp));
         }
         __syncthreads();
     }
@@ -77,12 +85,12 @@ extern "C" __global__ void gqa_masked_attn(
 }
 extern "C" void launch_gqa_masked_attn(
     const double* q, const double* k, const double* v, double* out,
-    int t, int nqh, int nkv, int hd, int prefix, hipStream_t s
+    int t, int nqh, int nkv, int hd, int prefix, double max_bias, hipStream_t s
 ) {
     int threads = hd < 256 ? hd : 256;
     size_t shmem = (size_t)t * sizeof(double);
     hipLaunchKernelGGL(gqa_masked_attn, dim3((unsigned)(t * nqh)), dim3(threads), shmem, s,
-        q, k, v, out, t, nqh, nkv, hd, prefix);
+        q, k, v, out, t, nqh, nkv, hd, prefix, max_bias);
 }
 
 extern "C" __global__ void rope_partial(

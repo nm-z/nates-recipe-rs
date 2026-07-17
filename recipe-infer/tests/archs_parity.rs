@@ -24,7 +24,8 @@
 
 use anyhow::{Context, Result, bail};
 use recipe_infer::gguf::{Gguf, Val};
-use recipe_infer::llm::{arch_supported, last_logits};
+use recipe_infer::llm::{arch_composable, arch_supported, last_logits};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -93,6 +94,7 @@ fn archs_parity_vs_llama_cpp() {
 	assert!(!models.is_empty(), "no gguf fixtures in {}", dir.display());
 
 	let (mut ok, mut fail, mut unsup, mut err, mut noref) = (0u32, 0u32, 0u32, 0u32, 0u32);
+	let mut clean: HashMap<String, bool> = HashMap::new();
 	eprintln!("{:<20} {:<6} {}", "Model arch.", "Config", "recipe-infer vs llama.cpp");
 	for gguf in &models {
 		let stem = gguf.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
@@ -110,7 +112,7 @@ fn archs_parity_vs_llama_cpp() {
 					err += 1;
 					format!("\x1b[1;31mERROR\x1b[0m {e:#}")
 				}
-				Ok(arch) if !arch_supported(&arch) => {
+				Ok(arch) if !arch_composable(&arch) => {
 					unsup += 1;
 					"\x1b[1;33mUNSUPPORTED\x1b[0m".to_string()
 				}
@@ -141,11 +143,35 @@ fn archs_parity_vs_llama_cpp() {
 			}
 		};
 		eprintln!("{name:<20} {cfg:<6} {verdict}");
+		if refpath.exists()
+			&& let Ok(arch) = gguf_arch(gguf)
+		{
+			let all_ok = clean.entry(arch).or_insert(true);
+			*all_ok &= verdict.starts_with("\x1b[1;32mOK");
+		}
 	}
 	let referenced = ok + fail + unsup + err;
 	eprintln!(
 		"parity: {ok} OK, {fail} FAIL, {unsup} UNSUPPORTED, {err} ERROR of {referenced} referenced ({noref} NOREF)"
 	);
+	let regressions: Vec<&str> = recipe_infer::llm::supported_archs()
+		.iter()
+		.copied()
+		.filter(|a| clean.get(*a).is_some_and(|c| !c))
+		.collect();
+	assert!(
+		regressions.is_empty(),
+		"VERIFIED arch regressed from measured OK: {regressions:?}"
+	);
+	let mut promotable: Vec<&String> = clean
+		.iter()
+		.filter(|(a, c)| **c && !arch_supported(a))
+		.map(|(a, _c)| a)
+		.collect();
+	promotable.sort();
+	if !promotable.is_empty() {
+		eprintln!("promotable to VERIFIED (all configs OK): {promotable:?}");
+	}
 	assert_eq!(
 		(fail, unsup, err),
 		(0, 0, 0),

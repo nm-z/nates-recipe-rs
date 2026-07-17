@@ -1,29 +1,46 @@
-//! Verifies the architecture dispatch contract: only architectures whose graph
-//! is verified against llama.cpp and whose tensors resolve are reported
-//! supported, using the real GGUF `general.architecture` strings. Everything
-//! else is rejected (there is no silent fallback in `models::dispatch`).
+//! Verifies the architecture support contract with the verified/composable
+//! split: `arch_supported` reports only architectures whose parity fixtures
+//! ALL measure OK against llama.cpp (entry by measurement, enforced by
+//! archs_parity's regression gate); `arch_composable` reports what
+//! `models::dispatch` can attempt. Verified is a subset of composable, and
+//! unknown strings are rejected by both (no silent fallback).
 
-use recipe_infer::llm::{arch_supported, supported_archs};
+use recipe_infer::llm::{arch_composable, arch_supported, composable_archs, supported_archs};
 
 #[test]
-fn only_verified_archs_are_supported() {
-	for arch in ["llama", "xverse", "qwen3"] {
-		assert!(arch_supported(arch), "{arch} is verified and must be supported");
+fn verified_is_a_measured_subset_of_composable() {
+	assert!(!supported_archs().is_empty(), "VERIFIED went empty");
+	for arch in supported_archs() {
+		assert!(arch_supported(arch), "{arch} listed but not reported supported");
+		assert!(
+			arch_composable(arch),
+			"{arch} verified but not composable: roster and table diverged"
+		);
 	}
-	assert_eq!(supported_archs(), &["llama", "xverse", "qwen3"]);
+	for arch in ["qwen3", "xverse", "gemma2", "qwen2", "phi3"] {
+		assert!(arch_supported(arch), "{arch} is measured OK and must be supported");
+	}
 }
 
 #[test]
-fn unverified_archs_are_rejected() {
-	// Real GGUF arch strings that are NOT yet verified end-to-end. Reporting any
-	// of these as supported (or silently decoding them) is the bug this guards.
-	for arch in [
-		"gpt2", "bert", "qwen2", "qwen2moe", "gemma2", "mamba", "rwkv6", "t5",
-		"deepseek2", "falcon", "phi3", "starcoder2",
-	] {
+fn composable_but_unverified_is_not_supported() {
+	for arch in ["mamba", "rwkv6", "t5", "deepseek2", "falcon", "qwen35"] {
+		assert!(
+			arch_composable(arch),
+			"{arch} is in the dispatch table and must be composable"
+		);
 		assert!(
 			!arch_supported(arch),
-			"{arch} must not be reported supported until its graph and logits are verified"
+			"{arch} has no measured parity and must not be reported supported"
 		);
+	}
+	assert!(composable_archs().len() > supported_archs().len());
+}
+
+#[test]
+fn unknown_archs_are_rejected() {
+	for arch in ["gpt7", "clip", "(unknown)", ""] {
+		assert!(!arch_composable(arch), "{arch:?} must not be composable");
+		assert!(!arch_supported(arch), "{arch:?} must not be supported");
 	}
 }

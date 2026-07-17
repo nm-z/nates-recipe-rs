@@ -35,6 +35,7 @@ unsafe extern "C" {
 		nkv: i32,
 		hd: i32,
 		prefix: i32,
+		max_bias: f64,
 		stream: *mut c_void,
 	);
 	fn launch_gelu_mul(
@@ -184,6 +185,7 @@ pub fn gpu_gqa_attn(
 	nkv: usize,
 	hd: usize,
 	prefix: usize,
+	max_bias: f64,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
@@ -198,6 +200,7 @@ pub fn gpu_gqa_attn(
 			ci(nkv)?,
 			ci(hd)?,
 			ci(prefix)?,
+			max_bias,
 			ptr::null_mut(),
 		);
 	}
