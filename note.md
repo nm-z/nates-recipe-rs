@@ -206,6 +206,102 @@ philosophy
 
 
 
+Tokenizers (17)
+	bert-bge
+	command-r
+	deepseek-coder
+	deepseek-llm
+	falcon
+	gemma-4
+	gpt-2
+	llama-bpe
+	llama-spm
+	mpt
+	phi-3
+	qwen2
+	qwen35
+	refact
+	starcoder
+Inference (8)
+	test-download-model
+	test-eval-callback-download-model
+	test-llama-archs:
+		builds all 109 testable archs
+		GPU-vs-CPU NMSE
+		save/reload roundtrip
+		seeding/saving: -s <seed> -a <arch> -o <dir>
+	test-thread-safety:
+		4 parallel inferences on model
+	test-save-load-state:
+		generate
+		save KV
+		restore KV
+		verify identical
+	test-state-restore-fragmented:
+		fragmented KV cache
+	test-recurrent-state-rollback
+		state rollback recurrent (mamba-style) caches
+	test-eval-callback
+		runs llama-eval-callback on model
+		verifies hooks fire
+	test-model-load-cancel
+		abort a model load mid-way
+	test-autorelease
+		load/free lifecycle
+Kernels / GPU backend (6)
+	test-backend-ops
+		every op vs CPU reference
+		16595 cases
+	test-backend-sampler
+		GPU-side =? CPU sampling
+	test-rope
+	test-col2im-1d
+	test-alloc
+		graph allocator
+	test-barrier
+		threadpool barrier
+Quantization (2)
+	test-quantize-fns
+		quantize/dequantize error bounds
+	test-quantize-perf
+		throughput benchmark
+Grammar / structured output
+	gbnf parsing and constrained-decoding
+		test-grammar-parser
+		test-llama-grammar
+		test-grammar-integration
+	test-json-schema-to-grammar
+		JSON schema to GBNF conversion
+	test-peg-parser
+		their PEG parser implementation
+Chat plumbing (6)
+	chat template rendering and model output parsing
+		test-chat
+		test-chat-template
+		test-chat-peg-parser
+		test-chat-auto-parser
+	test-jinja
+		minja engine vs reference Jinja2 behavior
+Sampling + misc (9)
+	test-sampling
+		top-k/top-p/temp/mirostat correctness
+	test-reasoning-budget
+		thinking-token budget enforcement
+	test-batch-alloc
+		batch memory allocation
+	test-gguf
+		gguf read/write roundtrip
+	test-mtmd-c-api
+		multimodal C API surface
+	test-log
+		logging
+	test-arg-parser
+		CLI args
+	test-double-float
+		float conversion
+	test-c
+		C-linkage compilation
+
 
 
 

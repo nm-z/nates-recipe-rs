@@ -5,7 +5,7 @@
 //! `build_arch_graph`. Recurrent families spell out their own composition.
 
 use super::super::{Arena, Model, layer_name, softmax};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use core::ptr;
 use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_rmsnorm_f64, gpu_rope_partial,
@@ -87,6 +87,14 @@ impl Spec {
 	}
 }
 
+/// The named norm weight for layer `l`, or an error carrying the arch and the
+/// missing key (a mapping gap must fail that model's row, never panic a sweep).
+fn norm_of<'m>(m: &'m Model, l: usize, key: &str) -> Result<&'m GpuBuffer> {
+	m.norms[l]
+		.get(key)
+		.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} norm weight", m.hp.arch))
+}
+
 /// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
 /// projection (optional per-head Q/K RMSNorm), RoPE, scaled GQA, output
 /// projection (optional post-attn norm), residual into `ar.attn_out`.
@@ -102,7 +110,6 @@ fn attn_block(
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let nqh = hp.nqh;
-	let nm = &m.norms[l];
 	let d = &hp.dims[l];
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
 	let theta = if d.sliding {
@@ -110,7 +117,7 @@ fn attn_block(
 	} else {
 		&m.theta_full
 	};
-	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(
 		&ar.x,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
@@ -130,8 +137,8 @@ fn attn_block(
 		&ar.v,
 	)?;
 	if sp.qk_norm {
-		gpu_rmsnorm_f64(&ar.q, &nm["q_norm"], &m.eps, t * nqh, hd, &ar.q)?;
-		gpu_rmsnorm_f64(&ar.k, &nm["k_norm"], &m.eps, t * nkv, hd, &ar.k)?;
+		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
+		gpu_rmsnorm_f64(&ar.k, norm_of(m, l, "k_norm")?, &m.eps, t * nkv, hd, &ar.k)?;
 	}
 	if sp.rope {
 		gpu_rope_partial(theta, t * nqh, hd, hd, nqh, &ar.q)?;
@@ -149,7 +156,7 @@ fn attn_block(
 		&ar.o,
 	)?;
 	if sp.post_attn {
-		gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, ne, &ar.o)?;
+		gpu_rmsnorm_f64(&ar.o, norm_of(m, l, "post_attn")?, &m.eps, t, ne, &ar.o)?;
 	}
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
 	let _ = sp.norm;
@@ -171,12 +178,11 @@ pub(super) fn layer_spec(
 	attn_scale: &GpuBuffer,
 ) -> Result<()> {
 	let ne = m.hp.ne;
-	let nm = &m.norms[l];
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
-	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
 	ffn(m, l, sp, t, ar)?;
 	if sp.post_ffn {
-		gpu_rmsnorm_f64(&ar.mlp0, &nm["pfw"], &m.eps, t, ne, &ar.mlp0)?;
+		gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
 	}
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
@@ -248,9 +254,8 @@ pub(super) fn layer_moe(
 ) -> Result<()> {
 	let hp = &m.hp;
 	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
-	let nm = &m.norms[l];
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
-	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
 	let gate_w = m.stream(&layer_name(l, "mlp.gate.weight"))?;
 	let logits = GpuBuffer::alloc(t * nexp)?;
 	gpu_gemm_bt_f64(&ar.cms, &gate_w, t, nexp, ne, &logits)?;
@@ -321,11 +326,10 @@ pub(super) fn layer_recurrent(
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let nqh = hp.nqh;
-	let nm = &m.norms[l];
 	let d = &hp.dims[l];
 	let kd = d.nkv * d.hd;
 	let qd = nqh * d.hd;
-	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(
 		&ar.x,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
@@ -361,7 +365,7 @@ pub(super) fn layer_recurrent(
 		&ar.o,
 	)?;
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
 	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
