@@ -4,6 +4,7 @@ extern crate alloc;
 pub mod __macro_support;
 /// Houses the process-wide default graph behind a stable path.
 mod alias;
+mod glob;
 
 use alloc::fmt;
 use alloc::sync::Arc;
