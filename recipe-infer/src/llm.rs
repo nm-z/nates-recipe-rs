@@ -103,7 +103,7 @@ impl Headless {
 			bail!("headless: claim guard empty");
 		};
 		let mut h = Self { m, ar, attn_scale };
-		fill_store(&mut h.m, claim)?;
+		fill_store(&mut h.m, claim, &mut || false)?;
 		return Ok(h);
 	}
 
@@ -1939,12 +1939,14 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 /// Places every weight into `store`, then hands the store to `m` UNCONDITIONALLY
 /// (even on placement failure) so the arena slab inside it stays reachable for
 /// release; the canary readback then proves uploads are GPU-visible.
-fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
+fn fill_store(m: &mut Model, store: Waterfall, cancel: &mut dyn FnMut() -> bool) -> Result<bool> {
 	let mut store = store;
-	let placed = fill_into(m, &mut store);
+	let placed = fill_into(m, &mut store, cancel);
 	store.report();
 	m.store = store;
-	placed?;
+	if !placed? {
+		return Ok(false);
+	}
 	let nl = m.hp.nl;
 	let mut canary = vec!["model.decoder.embed_tokens.weight".to_string()];
 	if let Some(first) = fixed_names(m, 0).into_iter().next() {
@@ -1973,10 +1975,10 @@ fn fill_store(m: &mut Model, store: Waterfall) -> Result<()> {
 			}
 		}
 	}
-	return Ok(());
+	return Ok(true);
 }
 
-fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
+fn fill_into(m: &Model, store: &mut Waterfall, cancel: &mut dyn FnMut() -> bool) -> Result<bool> {
 	let nl = m.hp.nl;
 	let nexp = m.hp.nexp;
 	let slot_bytes = m.hp.slot_bytes;
@@ -1986,6 +1988,9 @@ fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 		Ok(())
 	})?;
 	beat();
+	if cancel() {
+		return Ok(false);
+	}
 	for l in 0..nl {
 		for name in fixed_names(m, l) {
 			let t = m.big.get(&name).ok_or_else(|| anyhow!("missing {name}"))?;
@@ -1993,6 +1998,9 @@ fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 				m.read_host(t, 0, dst).map_err(io::Error::other)
 			})?;
 			beat();
+			if cancel() {
+				return Ok(false);
+			}
 		}
 	}
 	for e in 0..nexp {
@@ -2004,9 +2012,12 @@ fn fill_into(m: &Model, store: &mut Waterfall) -> Result<()> {
 				m.fill_expert(l, e, dst).map_err(io::Error::other)
 			})?;
 			beat();
+			if cancel() {
+				return Ok(false);
+			}
 		}
 	}
-	return Ok(());
+	return Ok(true);
 }
 
 fn rnp(x: &[f64], eps: f64) -> Vec<f64> {
@@ -2281,7 +2292,9 @@ fn generate_causal(
 		ub.load(&[1.0 / (hd as f64).sqrt()])?;
 		ub
 	};
-	fill_store(&mut m, claim)?;
+	if !fill_store(&mut m, claim, &mut || !on_round(&[]))? {
+		return Ok(String::new());
+	}
 	watchdog.disarm();
 	Write::line(
 		gpu,
@@ -2410,6 +2423,7 @@ pub fn generate(
 			let status = {
 				let mut c = process::Command::new(env::current_exe()?);
 				c.env("VRAM_PROBE", want.to_string());
+				c.stdin(process::Stdio::null());
 				unsafe {
 					c.pre_exec(|| {
 						let z = libc::rlimit {
@@ -2514,7 +2528,9 @@ pub fn generate(
 	Write::line(data, "preflight gemms");
 	preflight(&m, &ar, t)?;
 	Write::line(data, "waterfall fill");
-	fill_store(&mut m, claim)?;
+	if !fill_store(&mut m, claim, &mut || !on_round(&[]))? {
+		return Ok(String::new());
+	}
 	watchdog.disarm();
 	Write::line(
 		gpu,

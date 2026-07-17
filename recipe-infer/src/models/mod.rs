@@ -2,6 +2,15 @@
 //! a [`Comp`] composition entry, and [`dispatch`] is a table lookup that composes
 //! the block via the shared `common` drivers. The runtime composes the arch from
 //! shared ops and transfers; it does not implement any arch imperatively.
+//!
+//! Contract vocabulary:
+//! - [`TABLE`] is the single source of truth: every arch fact ([`COMPOSABLE`],
+//!   [`VERIFIED`], per-arch scalar resolvers) is derived from it.
+//! - COMPOSABLE ([`supported`]) = a decode route exists in [`dispatch`].
+//! - VERIFIED ([`verified`]) = full parity was MEASURED against llama.cpp
+//!   (NMSE <= 1e-4, `archs_parity`); a strict subset of COMPOSABLE.
+//! - Spec flags (the [`Spec`] builder methods per row) are shared behavior
+//!   switches: the same neutral driver reads them, so no arch needs a branch.
 mod common;
 
 use super::{Arena, Model};
@@ -12,33 +21,23 @@ use common::{
 };
 use gpu_core::memory::GpuBuffer;
 
-/// One architecture's decode composition: a dense [`Spec`] block, a
-/// mixture-of-experts [`Spec`] block, or a recurrent (linear-attention / SSM)
-/// block (which takes no `Spec`).
+/// The driver a row routes to. Each variant names its `common` entry point; the
+/// composition graph itself lives in that driver, not here. Variants carrying a
+/// [`Spec`] pass its flags through to the shared scalar resolvers.
 #[derive(Clone, Copy)]
 enum Comp {
 	Dense(Spec),
 	Moe(Spec),
 	Recurrent,
-	/// Mamba-1 selective-SSM block (norm + selective scan + residual, no FFN):
-	/// the shared recurrent mixer for the mamba family, dispatched to
-	/// [`layer_mamba`].
+	/// mamba family -> [`layer_mamba`].
 	Mamba,
-	/// Mamba-2 grouped-SSM (SSD) block (norm + grouped selective scan + gated
-	/// grouped RMSNorm + residual, no FFN), dispatched to [`layer_mamba2`].
+	/// mamba-2 (SSD) family -> [`layer_mamba2`].
 	Mamba2,
-	/// Per-layer attention/recurrent-interleaving block for the mamba hybrids
-	/// (jamba, falcon-h1, granitehybrid, nemotron_h): each layer's mixer is
-	/// chosen by tensor presence, dispatched to [`layer_hybrid`].
+	/// attention/recurrent hybrids (per-layer mixer choice) -> [`layer_hybrid`].
 	Hybrid(Hy),
-	/// talkie: non-parametric-RMS dense-attention block with post-rope asymmetric
-	/// qk-norm and a frozen normed-embedding skip residual, dispatched to
-	/// [`layer_talkie`]. Carries a [`Spec`] for the shared scalar resolvers
-	/// (logit_scale, embd_skip, final norm).
+	/// talkie -> [`layer_talkie`].
 	Talkie(Spec),
-	/// minicpm3: naive (non-absorbed) MLA with LongRoPE per-pair frequency factors
-	/// and the minicpm depth-scaled residual, dispatched to [`layer_minicpm3`].
-	/// Carries a [`Spec`] for the FFN + the `scale_embd` constant.
+	/// minicpm3 -> [`layer_minicpm3`].
 	Minicpm3(Spec),
 }
 

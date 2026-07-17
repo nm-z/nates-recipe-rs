@@ -439,7 +439,7 @@ fn attn_block(
 /// (`kv_a`) split into the latent (RMSNorm'd -> Vcur, also Kcur's nope half) and the
 /// shared roped k_pe. MQA attention over `kv_lora+rope` keys and `kv_lora` values
 /// then decompresses through `v_b` and projects out through `o_proj`; residual into
-/// `ar.attn_out`. Composed 1:1 from the shared `gpu_*` kernels, nothing per-arch.
+/// `ar.attn_out`.
 fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
@@ -554,8 +554,7 @@ pub(super) fn layer_minicpm3(
 }
 
 /// Parameterized dense-attention decoder block: attention, residual, FFN
-/// (gated SwiGLU/GeGLU or sequential GELU/ReLU^2), residual. Composes only the
-/// shared `gpu_*` kernels selected by `sp`.
+/// (gated SwiGLU/GeGLU or sequential GELU/ReLU^2), residual.
 pub(super) fn layer_spec(
 	m: &Model,
 	l: usize,
@@ -593,7 +592,7 @@ pub(super) fn layer_spec(
 /// gain; K: non-parametric RMS, no gain); the FFN is a non-parametric-normed
 /// SwiGLU; and the frozen non-parametric-normed initial embedding (`ar.embd_skip`,
 /// stashed once by the decode loop) is added to every layer output scaled by that
-/// layer's `layer_output_scale` scalar. Composed from the shared `gpu_*` kernels.
+/// layer's `layer_output_scale` scalar.
 pub(super) fn layer_talkie(
 	m: &Model,
 	l: usize,
@@ -732,10 +731,10 @@ pub(super) fn layer_moe(
 /// Linear-attention / state-space decoder block for the recurrent families
 /// (Mamba, RWKV, gated delta-net hybrids). Composes the sequence mixer as a
 /// gated linear recurrence over the sequence via [`gpu_scan_linear_recurrence`]
-/// (the diagonal decay scan the SSM/WKV/delta families reduce to at decode),
-/// then the SiLU SwiGLU FFN. The K/V projections carry the state transition and
-/// input; Q gates the read-out. Structural composition of the `build_*` graph;
-/// per-family decay parameterization is refined per arch.
+/// (the diagonal decay scan the SSM/WKV/delta families reduce to at decode) over
+/// the SiLU-gated K and the V projection, then the SiLU SwiGLU FFN. Structural
+/// composition of the `build_*` graph; per-family decay parameterization is
+/// refined per arch. The Q projection is computed but not consumed by the scan.
 pub(super) fn layer_recurrent(
 	m: &Model,
 	l: usize,
