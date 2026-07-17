@@ -1,14 +1,14 @@
 {
-  "skillOverrides": {
-    "arduino-due": "off",
-    "csun-apporto-login": "off",
-    "grill-me": "off"
-  },
-  "outputStyle": "default",
   "permissions": {
     "allow": [
       "Bash(timeout 180 cargo test --manifest-path ogdl/Cargo.toml --no-run)",
       "Read(//tmp/claude-1000/**)"
     ]
-  }
+  },
+  "skillOverrides": {
+    "arduino-due": "off",
+    "csun-apporto-login": "off",
+    "grill-me": "off"
+  },
+  "outputStyle": "default"
 }

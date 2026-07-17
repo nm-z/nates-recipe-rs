@@ -3,6 +3,7 @@
 #![deny(clippy::match_wild_err_arm)]
 
 pub mod bridge;
+pub mod chat;
 pub mod dequant;
 pub mod enums;
 pub mod forward;

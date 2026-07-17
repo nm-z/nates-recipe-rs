@@ -58,6 +58,16 @@ DISK
 						GPR
 							ALU
 
+
+
+
+
+
+
+
+
+
+
 Vendor:
 	nvidia
 		tool		cuda

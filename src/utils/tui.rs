@@ -569,6 +569,12 @@ pub fn chat(gguf: &str) {
 		match ev {
 			Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
 				(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => break,
+				(KeyCode::Esc, _mods) => {
+					let Some(_clear) = Some(()).filter(|_probe| !textarea.lines().join("").trim().is_empty()) else {
+						break;
+					};
+					textarea = new_input();
+				}
 				(KeyCode::Enter, _mods) => {
 					let joined = textarea.lines().join(" ");
 					let prompt: String = joined
@@ -581,6 +587,21 @@ pub fn chat(gguf: &str) {
 					let Some(_run) = Some(()).filter(|_probe| !prompt.is_empty()) else {
 						continue;
 					};
+					let mut history: Vec<recipe_infer::chat::Msg> = Vec::new();
+					for (u, r) in &scrollback {
+						let keep = !u.is_empty() && !r.starts_with("error: ") && !r.starts_with("note: ");
+						let Some(_ok) = Some(()).filter(|_probe| keep) else {
+							continue;
+						};
+						history.push(recipe_infer::chat::Msg::new("user", u.clone()));
+						history.push(recipe_infer::chat::Msg::new("assistant", r.clone()));
+					}
+					history.push(recipe_infer::chat::Msg::new("user", prompt.clone()));
+					let templated = recipe_infer::chat::render_chat(Path::new(gguf), &history, true);
+					let (send, note): (String, Option<&str>) = match templated {
+						Ok(s) => (s, None),
+						Err(_e) => (prompt.clone(), Some("note: no chat template in gguf; multi-turn history disabled")),
+					};
 					let res;
 					{
 						let sb = &scrollback;
@@ -592,15 +613,16 @@ pub fn chat(gguf: &str) {
 							});
 							!cancel_requested()
 						};
-						let _first = on_round(&[]);
-						res = recipe_infer::llm::generate(
-							Path::new(gguf),
-							&prompt,
-							&mut on_round,
-						);
+						res = match on_round(&[]) {
+							true => recipe_infer::llm::generate(Path::new(gguf), &send, &mut on_round),
+							false => Ok(String::new()),
+						};
 					}
 					match res {
-						Ok(resp) => scrollback.push((prompt, resp)),
+						Ok(resp) => {
+							let shown = note.map(|n| format!("{n}\n{resp}")).unwrap_or(resp);
+							scrollback.push((prompt, shown));
+						}
 						Err(e) => scrollback.push((prompt, format!("error: {e:#}"))),
 					}
 				}
