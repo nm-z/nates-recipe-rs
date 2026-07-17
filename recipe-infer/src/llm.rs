@@ -1183,20 +1183,8 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		hp,
 	};
 
-	let probe = m.small_f64("model.decoder.layers.0.input_layernorm.weight")?;
-	let mean = probe.iter().sum::<f64>() / probe.len() as f64;
-	let plus_one = mean.abs() < 0.5;
-	Write::line(
-		data,
-		format!(
-			"norm probe mean={mean:.4} -> {}",
-			if plus_one {
-				"(1+w) HF convention"
-			} else {
-				"folded x*w"
-			}
-		),
-	);
+	let plus_one = false;
+	Write::line(data, "norm convention: folded x*w (gguf stores gammas as saved)");
 
 	for l in 0..nl {
 		Write::line(data, format!("norms layer {}/{}", l + 1, nl));

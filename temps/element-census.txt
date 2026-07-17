@@ -1,0 +1,641 @@
+Element census vs the composition vocabulary (2026-07-17, workflow wf_d62efe51)
+statuses: WIRED = reachable from dispatch; PRIMITIVE = exists, nothing routes to it; ABSENT = no implementation
+
+ABSENT	activation quantization
+	rg 'activation.*quant'/'quantize_activ' = 0 files across recipe-infer/src and gpu-core/src. All activations run f64 (common.rs ffn/attn_block use gpu_silu_into/gpu_gelu_into/gpu_gqa_attn in f64); design invariant is f64-only.
+	note: No per-tensor/per-token activation scaling or int quant of activations.
+ABSENT	ALiBi
+	gqa_masked_attn scores are raw q.k with only a causal mask, no positional slope/bias term (gpu-core/src/kernels/f64_infer.hip:51-59). No alibi/slope-per-head anywhere in recipe-infer or gpu-core (the params.rs 'slope' hits are PReLU init, params.rs:293/491/558).
+	note: No linear-bias attention.
+ABSENT	attention dropout
+	Neither attention path calls any dropout. A general dropout_kernel exists (gpu-core/src/kernels/elementwise.hip:716, launcher gpu_dropout_into at gpu-core/src/kernels.rs:3277) but rg for callers of gpu_dropout_into returns none — it is an unwired primitive, and no attention-specific dropout exists.
+	note: Inference-only engine; a dropout primitive is present but routed nowhere.
+ABSENT	attention gate
+	rg -ni 'sink|attn_gate|attn.*sigmoid|gate.*attn' over recipe-infer/src and gpu-core/src returns no attention-gate hits. attn_block (common.rs:101-165) goes qkv->rope->scale->gqa->o_proj->residual with no output gate. gpu-core/src/gate.rs is MoE/RNN gating, not attention.
+ABSENT	attention sinks
+	rg -ni 'sink' over recipe-infer/src and gpu-core/src returns zero hits. The softmax in gqa_masked_attn (gpu-core/src/kernels/f64_infer.hip:62-68) normalizes only over the t key positions with no extra sink logit.
+ABSENT	audio path
+	No audio/mel/whisper handling in recipe-infer/src (grep audio/whisper/mel empty). No audio encoder or feature-extraction composition.
+	note: No audio front-end of any kind.
+ABSENT	audio token generation
+	No talker/thinker/audio-code generation: grep talker|thinker|audio|codec returns nothing in recipe-infer/gpu-core Rust or hip (except unrelated 'smallthinker' arch name mod.rs:148).
+ABSENT	audio token path
+	wavtokenizer-dec (mod.rs:157) routes to Comp::Dense(GeluSeq).encoder() text-style dense; no audio-codec detokenization, no vocoder/codec-frame handling (grep codec/vocoder/wavtok empty beyond the arch string).
+	note: The audio-token decoder is treated as a generic encoder-dense block; the audio-codec output path is not implemented.
+ABSENT	BitLinear
+	grep 'bitlinear|ternary|1.58|two_bit' over recipe-infer/src and gpu-core/src returns nothing; the 'bitnet' arch (models/mod.rs:34) maps to an ordinary Spec::dense(Ffn::SiluGate) computed with the standard f64 gpu_gemm_bt_f64 - no ternary/packed BitLinear layer.
+	note: bitnet is present as a name but uses full-precision f64 GEMM.
+ABSENT	BitNet weights
+	The 'bitnet' arch row exists at recipe-infer/src/models/mod.rs:34 but maps to Comp::Dense(Spec::dense(Ffn::SiluGate)) — a standard SwiGLU dense block. No bitlinear / ternary / 1.58-bit dequant or kernel exists (rg bitnet = 1 file: only that TABLE row; ternary = 0).
+	note: The architecture string is dispatchable, but the BitNet weight FORMAT (ternary bitlinear) is unimplemented; such a GGUF would abort in dequant unless stored as a supported quant type.
+ABSENT	blank infilling
+	No blank/span-infill objective or GLM-style [MASK]-span reconstruction path in recipe-infer (no infill token routing; grep empty).
+	note: The diffusion canvas fills a fixed suffix of mask tokens, not arbitrary interior blanks/spans.
+ABSENT	cache-aware attention
+	No KV cache: generate_causal re-embeds and recomputes the entire growing sequence every token (cur=toks.len(); dispatch with t=cur over all nl layers), llm.rs:1696-1712. k_actx.rs is activation functions (relu6/hardsigmoid/...), not a KV cache (gpu-core/src/k_actx.rs:60-73).
+	note: Attention recomputes full prefix each step; no cached K/V reuse or block table.
+ABSENT	causal convolution
+	The only 1D conv kernel convx_conv1d (convx.hip:4-22) is a non-causal 'valid' cross-correlation (line 19: acc+=xp[t*S+k]*wp[k], no left padding) and is used only in the CNN training forward (forward.rs:332). No causal/left-padded conv exists.
+ABSENT	classification head
+	No cls/cls_out projection in the infer path: rg 'cls_out' = 0; 'classif' matches only enums.rs Loss::is_classification (recipe-infer/src/enums.rs:42-44), which classifies the tabular training loss (Ce/Bce/Focal), not an LLM sequence-classification head. rg '\bcls\b' hits are only n_classes in gpu-core/src/kernels/bayes.hip (Naive Bayes).
+	note: No sentence-classification / NSP head over pooled embeddings.
+ABSENT	codec reconstruction
+	No codec decode-to-waveform path: grep codec|vocoder|token2wav|reconstruct returns nothing. No output-conv / codebook reconstruction composition.
+ABSENT	codec token path
+	No codec-token or residual-vector-quantizer handling anywhere in recipe-infer/src (grep codec empty except arch-name context).
+	note: No codec/RVQ token stream composition.
+ABSENT	compressed attention
+	No KV-compression/low-rank latent KV path anywhere; same gap as latent MLA (llm.rs:1103-1119). attn_block always projects full-width K/V (kd=nkv*hd) with no down/up compression (common.rs:129-138).
+ABSENT	ConvNeXt block
+	No ConvNeXt (depthwise-conv + pointwise + learned-gamma residual) block; grep convnext returns nothing in recipe-infer/gpu-core. The dwconv1d primitive that would seed it (convx.hip:209) has no Rust binding.
+	note: Defined in the reference (llama-model.cpp:1091-1092) but no composition or binding here.
+ABSENT	convolution state
+	layer_recurrent (common.rs:317-372) composes no conv1d and holds no rolling conv-state buffer; the recurrent block is rmsnorm->q/k/v proj->silu(k)->scan->o_proj. gpu_conv1d_into exists but is wired only into the CNN training path (forward.rs:332, LayerKind::Conv).
+	note: Mamba/RWKV short-conv rolling state is not part of the mixer.
+ABSENT	cross-attention
+	No encoder-decoder cross-attention: no cross_attn tensors loaded, no second K/V source. attn_block/layer only ever project K/V from the current hidden state (common.rs:129-138). t5/t5encoder are mapped as encoder-only Dense blocks.
+ABSENT	draft head
+	No draft-model/draft-projection head. TokStatus::Draft (llm.rs:171-175, used llm.rs:188,2095) is only a TUI label for unaccepted diffusion-canvas tokens, not a decode head.
+ABSENT	early fusion
+	No early (pre-decoder) merge of image+text embeddings. Decoder input is purely text-embedding rows (llm.rs:1698-1706); no image embedding is ever produced or concatenated.
+ABSENT	embed-skip residual
+	No residual from the embedding output skipping to a later layer. The decode loops (llm.rs:114-117, :1709-1712, :2005-2016) carry only the running src/dst hidden state; the initial embedding buffer is overwritten, never re-added downstream.
+	note: No stored embed copy for a later skip-add.
+ABSENT	embedding head
+	No embedding-extraction/sentence-embedding head in recipe-infer; encoder archs (llama-embed, gemma-embedding, bert; mod.rs:68,98) fall through lm_head->logits with no CLS/mean pooling. generate paths only emit token logits.
+	note: embeddingx_bag (mean/sum embedding pooling) kernel exists in gpu-core (embeddingx.hip:22) as an input-side primitive but is not routed to produce an output embedding.
+ABSENT	embedding norm
+	No token_embd_norm weight is mapped or applied; the embed output feeds layer 0 unnormalized (llm.rs:104-111 logits_last, :1698-1706 generate_causal). Only a sqrt(n_embd) *scale* exists (diffusion path llm.rs:1947), explicitly skipped in logits_last (llm.rs:101-102). Tabular Embed layer (forward.rs:312-321) does gather+bias-subtract, not a norm.
+	note: Closest wired norm on an embedding representation is the diffusion self-conditioning pre_norm on soft-embeddings (llm.rs:1971, weight m.sc_pre), which is a distinct branch, not a token-embedding norm.
+ABSENT	embedding normalization
+	No token_embd_norm/emb_norm tensor in any mapping table (grep empty across recipe-infer/src). Norm primitive gpu_rmsnorm_f64 exists (gpu-core/src/infer_ops.rs:127) but is used for block norms, not an embedding-norm layer.
+	note: The diffusion path applies a gamma-less rmsnorm directly to the embedded canvas buffer (recipe-infer/src/llm.rs:1977-1985) as part of self-conditioning, but there is no general weighted embedding-normalization layer in the composition.
+ABSENT	embedding output
+	No code returns hidden-state embeddings instead of logits; generate()/logits_last/lm_head only emit vocab logits (llm.rs:1615-1648 lm_head). No embeddings-mode branch anywhere (0 matches).
+	note: The framework is generation-only for GGUF LLMs.
+ABSENT	encoder-decoder stack
+	T5/t5encoder route to encoder-only Comp::Dense(...).encoder() (recipe-infer/src/models/mod.rs:154-155). No cross-attention anywhere: grep for cross_attn/enc_attn across recipe-infer/src returns nothing; no cross-KV tensors in mapping tables.
+	note: Cross-attention between an encoder stack and a decoder stack is not composed; T5 is handled as an encoder-only dense block only.
+ABSENT	expert group scaling
+	No group-limited routing anywhere: grep for n_group/n_expert_group/topk_group/expert_group over recipe-infer + gpu-core returns nothing. Both routers rank a flat expert list (common.rs:270-273, llm.rs:1560-1562) with no group partition or per-group score gating.
+	note: DeepSeek group-limited routing / group score scaling not implemented.
+ABSENT	expert probability bias
+	Top-k selection sorts on raw softmax probs with no correction bias: common.rs:270-273 (idx.sort_by on probs, truncate(used)); llm.rs:1560-1562 (sort on rl, truncate). No `e_score_correction_bias`/`exp_probs_b` tensor is loaded (grep of recipe-infer/gpu-core returns nothing) and no sigmoid+bias selection path exists.
+	note: DeepSeek-V3-style score-correction bias for expert selection is not present.
+ABSENT	feature fusion
+	No fusion of modality feature streams. The only concat is the tabular x_cat concat_layer path (forward.rs:294-302), which merges dataset feature columns, not modality features.
+ABSENT	fill-in-the-middle
+	No FIM prefix/suffix/middle token handling; grep for 'fim'/'infill'/'middle'/'suffix'+'prefix' in recipe-infer returns nothing. Prompt is a single linear encode (llm.rs:1880-1888).
+ABSENT	hash-layer routing
+	No hash-based token->expert assignment: grep hash_layer/hash_rout over recipe-infer + gpu-core returns nothing. Both routers are learned softmax gates (common.rs:261-270, llm.rs:1557-1559).
+	note: Deterministic hash-layer routing not implemented.
+ABSENT	hybrid blocks
+	Hybrid archs (jamba mod.rs:88, falcon-h1:61, granitehybrid:77, nemotron_h:112, nemotron_h_moe:113, plamo2:128, lfm2:92) all map to a single whole-arch Comp::Recurrent. dispatch selects one Comp per architecture, not per layer (models/mod.rs:192-203); only layer_is_moe varies per layer.
+	note: True hybrids interleave attention and SSM/recurrent layers within one model; here every layer of a hybrid is forced fully-recurrent, so the interleaved-block mechanism is not implemented.
+ABSENT	hyper-connection path
+	Zero hits for hyper-connection in recipe-infer/src or gpu-core/src; no expansion-rate residual matrix, no depth/width connection tensor in the Model struct (llm.rs norms/decoder_norm/ls_dev only) or Arena.
+	note: Not declared, not primitive, not wired.
+ABSENT	image boundary tokens
+	grep img_break|image_token|boundary|<img> across recipe-infer/src and gpu-core returns nothing (only memory.rs:824 alignment-boundary, unrelated). No special image-delimiter token logic.
+ABSENT	image path
+	No image ingestion, patch embedding, or pixel-tensor handling in recipe-infer/src (grep image/pixel/patch empty apart from unrelated host-image weight-buffer terms in params.rs). No 2D conv/patchify.
+	note: No image input path exists.
+ABSENT	KV cache injection
+	Decode recomputes the entire sequence every step: Headless::logits_last takes the full seq and runs all layers over t positions (recipe-infer/src/llm.rs:97-122); greedy pushes each new token and re-calls logits_last on the whole seq (llm.rs:141-149). gqa_masked_attn recomputes attention over all t keys (f64_infer.hip:51-76). No k_cache/v_cache buffers or past-KV concat anywhere (rg 'k_cache|v_cache|past' empty).
+ABSENT	KV compression
+	No latent KV compression (MLA). The only compress hits are union-find uf_compress in gpu-core/src/cluster.rs / cluster.hip (clustering, unrelated). synth_qkv_slices explicitly declines to slice a latent-MLA fused tensor (llm.rs:1103-1104); no kv_a/kv_b compression tensors are loaded.
+ABSENT	KV latent path
+	attn_block streams only self_attn.q_proj/k_proj/v_proj weights (recipe-infer/src/models/common.rs:121-138); no kv_a_proj_with_mqa / kv_b_proj / compressed-latent projection. deepseek2/deepseek2-ocr/glm-dsa route to the standard dense/moe Spec (models/mod.rs:46-47,71). synth_qkv_slices explicitly leaves a latent-MLA fuse unhandled (llm.rs:1100-1105 comment 'latent MLA is left').
+	note: MLA compressed-KV is not composed; such models would fail on missing q/k/v_proj.
+ABSENT	KV LoRA path
+	No q_a_proj/q_b_proj or kv/q lora-rank handling in loader, alias map, or composition. grep across recipe-infer/src for q_a_proj|q_b_proj|kv_lora|q_lora returns nothing. attn_block uses plain full-rank q/k/v gemms (common.rs:121-138).
+	note: MLA low-rank Q/KV down-up projections absent.
+ABSENT	KV reuse
+	No persistent KV cache. Arena holds only transient q/k/v recomputed per call (recipe-infer/src/llm.rs:602-665, fields q/k/v alloc'd at 647-649). generate_causal rebuilds embeddings for ALL toks and reruns the full forward over `cur` tokens every decode step (llm.rs:1696-1712); gqa_masked_attn reads full K/V each time (gpu-core/src/kernels/f64_infer.hip:35-77). No cache/kcache/vcache field anywhere.
+	note: Decode is prefill-every-step (O(n^2) regrow), not cached incremental decode.
+ABSENT	KV sharing
+	No cross-layer KV sharing: each decode layer streams its own self_attn.k_proj/v_proj weights and recomputes K/V (common.rs:129-138 per l in dispatch loop llm.rs:114-117); no layer reuses another layer's KV. rg 'kv.*shar|shared.*kv|cross.*layer' finds nothing.
+	note: The only KV sharing present is within-attention head-group sharing (GQA/MQA), already covered by gqa_masked_attn kv=h/g2 (f64_infer.hip:42-44); cross-layer/persistent KV sharing is not implemented.
+ABSENT	latent attention
+	No MLA composition. synth_qkv_slices explicitly skips a fused tensor whose row count != qd+2*kd 'e.g. latent MLA' (llm.rs:1103,1117), leaving deepseek2/deepseek* to route through the standard GQA attn_block, which lacks kv_a/kv_b/q_a/q_b compression projections.
+	note: deepseek2 is in TABLE as Comp::Moe but its MLA attention is not actually built; it would error on missing q/k/v projections.
+ABSENT	LAUREL residual path
+	Zero hits for laurel; no low-rank learned-augmented residual weights loaded or applied. Spec (common.rs:41-51) has no LAUREL field; no laurel tensor in the norm/alias maps (llm.rs:710-994).
+	note: Not implemented in any form.
+ABSENT	learned absolute positions
+	No position-embedding table (wpe/pos_embd/position_embeddings) loaded or added; grep for pos_embd|position|wpe in llm.rs finds none. gpt2/bloom/mpt etc. map to RoPE-bearing dense specs (models/mod.rs:72,35,110). A sinusoidal gpu_positional_encoding kernel exists (gpu-core/src/attention.rs:289) but is fixed (not learned) and has no callers.
+	note: No additive learned position embeddings.
+ABSENT	load-balancing loss
+	recipe-infer is inference-only; the MoE routers compute no auxiliary loss (common.rs:245-308, llm.rs:1538-1602 emit only the mixed activation). gpu-core/moe.rs has a training forward+backward (moe.rs:123-206) but computes gate/expert grads only, no balance/z-loss term, and is not called by recipe-infer.
+	note: No aux load-balancing or router-z loss anywhere.
+ABSENT	logit scaling
+	No read of 'logit_scale'/f_logit_scale KV anywhere (grep of recipe-infer finds only 'final_logit_softcapping' llm.rs:388); lm_head() llm.rs:1615-1649 returns raw GEMM logits with no scalar multiply.
+	note: command-r/cohere2 multiply final logits by f_logit_scale (llama.cpp cohere2.cpp:153-154). The gpu_scale_f64_inplace primitive (infer_ops.rs:302) exists but is never routed to logits, and the KV is never parsed.
+ABSENT	LongRoPE
+	theta_full/theta_slide are single scalars loaded from rope.freq_base/freq_base_swa (recipe-infer/src/llm.rs:1148-1157); rope_partial uses one uniform theta pow (f64_infer.hip:99). No short/long per-dim factor arrays, no attn_factor / mscale, no YaRN/NTK ramp.
+	note: No context-extension frequency rescaling of any kind.
+ABSENT	LoRA adapters
+	rg -i lora = 0 files across recipe-infer/src and gpu-core/src. No lora_a/lora_b tensors, no build_lora_mm equivalent; GEMMs go straight through m.stream(weight) (common.rs:121-157).
+ABSENT	LoRA projection
+	rg -i lora = 0 files. No low-rank A/B projection applied to any weight matmul anywhere in the composition drivers (common.rs).
+ABSENT	low-rank projection
+	No MLA/LoRA-style latent projections: rg -ni 'kv_a|kv_b|q_a_proj|q_b_proj|lora|low.?rank|mla' finds only the comment at llm.rs:1103 stating a fused tensor whose rows != qd+2*kd ("e.g. latent MLA") is left alone so its absent-projection error stays truthful. deepseek2 etc. are in TABLE but route through standard q/k/v names, not latent proj.
+ABSENT	Matryoshka embeddings
+	rg -i matryoshka = 0 files. No nested/truncatable embedding-dimension logic; ne is fixed per model (Hparams.ne, llm.rs:347).
+ABSENT	mean pooling
+	rg 'mean.?pool' = 0 files. The only pooling kernels are f32 CNN spatial pools gpu_avg_n_2d_f32 / gpu_max_n_2d_f32 (gpu-core/src/nn_f32.rs; kernels/poolx.hip) — unrelated to sequence mean-pooling and not referenced by recipe-infer (PRIMITIVE to the infer path).
+	note: No mean-over-sequence reduction for embeddings.
+ABSENT	mixed token stream
+	No interleaving of text+non-text token streams anywhere. generate_causal embeds only u32 text tokens from m.emb (recipe-infer/src/llm.rs:1698-1706); models/mod.rs TABLE has no multimodal arch and no token-type/stream-merge composition.
+	note: Vision-named arches in TABLE (qwen3vl, hunyuan_vl, cogvlm, deepseek2-ocr) route to the plain text Dense/Moe block; the vision half is not present.
+ABSENT	mixed-stream prediction
+	No combined autoregressive+infilling mixed-objective decode; the two decode paths (causal generate_causal, diffusion generate) are disjoint and each single-objective (selected by ncanvas, llm.rs:1896).
+ABSENT	MLM head
+	No masked-LM projection tensors mapped (no cls.predictions/mlm entries in LAYER_MAP/GLOBAL_MAP llm.rs:954-995). Encoder archs (bert, modern-bert, nomic-bert) route through the same tied lm_head; no MLM decode head.
+	note: BERT-family archs are in TABLE (mod.rs:33,109,114-116) as Dense encoder Spec but no MLM head exists.
+ABSENT	MTP head
+	No multi-token-prediction head tensors mapped or allocated (no n_layer_nextn/mtp fields in Hparams llm.rs:308-340; no mtp entries in the tensor maps).
+ABSENT	multi-section RoPE
+	rope_partial derives one scalar position per token (pos=row/heads_per_tok, f64_infer.hip:98); no mrope_sections split of the rotary dim across t/h/w axes. qwen2vl/qwen3vl/qwen3vlmoe route to the plain dense/moe Spec using ordinary gpu_rope_partial (models/mod.rs:134,140-141). No rope_sections key read.
+	note: M-RoPE section partitioning not implemented.
+ABSENT	multi-token prediction
+	Decode emits one token per causal step (argmax over single last position, generate_causal llm.rs:1713-1729) or one token per canvas slot per diffusion step; no MTP head/objective producing multiple future tokens per position.
+ABSENT	multimodal blocks
+	No mmproj/projector/cross-modal fusion in recipe-infer/src (grep mmproj/clip/vision/patch_embd empty except arch-name strings in the TABLE). No modality-projection tensors in GLOBAL_MAP/LAYER_MAP.
+	note: No mechanism to fuse non-text embeddings into the token stream.
+ABSENT	NextN head
+	llama.cpp LLM_TENSOR_NEXTN_EH_PROJ/SHARED_HEAD (llama-model.cpp:1408-1477) have no counterpart in LAYER_MAP (llm.rs:969-995); grep for 'nextn'/'eh_proj'/'shared_head' in recipe-infer returns nothing.
+ABSENT	OCR path
+	deepseek2-ocr (mod.rs:47) and paddleocr (:122) route to text-only Dense/encoder decode. No image input, no OCR/vision encoder (grep ocr/image/pixel returns only the arch-name strings).
+	note: OCR archs are handled as plain text decoders; the OCR image pipeline is absent.
+ABSENT	output bias
+	Spec.attn_bias flag exists (common.rs:47, set by .bias() common.rs:80-83 for ~15 archs) but is explicitly discarded: 'let _ = sp.attn_bias;' common.rs:163. No '.bias' tensor in LAYER_MAP/GLOBAL_MAP (llm.rs:954-995); attn/ffn/lm_head GEMMs add no bias.
+	note: The transformer LLM path loads and adds no projection/output bias despite the flag. Separate subsystem: the tabular NN forward (forward.rs) fully wires biases via gpu_matvec_bias_into/gpu_linear_into with p.b (forward.rs:389-393, 465-467).
+ABSENT	parallel attention-FFN block
+	No path computes attention and FFN from a shared normed input in parallel; FFN input is re-normed from the post-attention residual (common.rs:182), enforcing sequential dependency. No arch entry routes to a parallel composer.
+	note: Same sequential-only structure as parallel residual path.
+ABSENT	parallel attention-MLP block
+	Synonym of parallel attention-FFN; identical evidence — common.rs:170-189 is sequential. The gemma dual-branch at llm.rs:1535-1606 runs a dense MLP branch parallel to a MoE branch (both off attn_out), but attention is NOT one of the parallel branches.
+	note: The only parallelism present is dense-FFN || MoE-FFN, not attention || MLP.
+ABSENT	parallel attention-SSM block
+	layer_recurrent (common.rs:317-372) runs the SSM/scan mixer alone in the sequence-mixing slot; there is no parallel self-attention branch. Hybrid archs (jamba, granitehybrid, nemotron_h, mod.rs:88,77,112) all map to Comp::Recurrent = pure scan, no attention branch.
+	note: No hybrid block that runs GQA attention and the linear-recurrence scan side-by-side and combines them.
+ABSENT	parallel residual path
+	layer_spec composes strictly sequentially: attn+residual (common.rs:181/161) THEN a fresh pre_ff norm off ar.attn_out (common.rs:182) THEN FFN+residual (:187). GPT-J/GPT-NeoX/Falcon (mod.rs:73,74,60) architecturally use parallel residual but are wired to this sequential driver.
+	note: Attention and FFN never share one normed input or one residual add.
+ABSENT	patch embedding
+	No patch-embed composition in recipe-infer. An f32 2D im2col primitive exists (gpu-core/src/kernels/attention.hip:345 attn_im2col_2d_ext_kernel) but has no Rust launcher/route; CLAUDE.md bans 2D conv. The only routed conv is 1D tabular (forward.rs:332 gpu_conv1d_into).
+	note: im2col_2d_ext is a dead f32 kernel, unreachable from any composition path.
+ABSENT	patch merger
+	No patch-merge/spatial-downsample-of-tokens function in either crate. attn_mha_merge (attention.hip:167) is an unrelated unrouted f32 head-merge, not a vision patch merger.
+ABSENT	pooled embedding output
+	No pooling head and no pooled-embedding return path. rg 'pooling' = 1 match, a false positive in gpu-core/src/kernels.rs doc comment (redacted display); no LLAMA_POOLING_TYPE equivalent in recipe-infer.
+ABSENT	position embeddings
+	No pos_embd/position tensor in GLOBAL_MAP or LAYER_MAP (grep for pos_embd/position_embd across recipe-infer/src returns nothing). Only rotary RoPE is applied: gpu_rope_partial (gpu-core/src/infer_ops.rs:85) called common.rs:143-146
+	note: Additive/learned absolute position embeddings (the gpt2/bert wpe element) are not composed. RoPE is a distinct rotary scheme, not additive position embeddings.
+ABSENT	PosNet
+	No PosNet block anywhere; grep posnet returns nothing in recipe-infer/gpu-core (only found in the vendored reference llama.cpp llama-model.cpp:1088-1089).
+ABSENT	post-mixer norm
+	layer_recurrent adds the mixer output straight into the residual with no post-mixer norm: common.rs:358-367 (scan -> o_proj gemm -> `gpu_add_into(&ar.o, h_in, ..., &ar.attn_out)` at 367) has no norm between the mixer output and the residual add. Only a pre-ff norm follows (368), which is the FFN's pre-norm, not a post-mixer norm.
+	note: A dedicated post-mixer norm (e.g. mamba2/some SSM hybrids) is not composed in the recurrent driver; contrast the attention path which does have post_attn.
+ABSENT	pre-cross-attention norm
+	No cross-attention anywhere in recipe-infer/src or gpu-core/src (grep for cross/xattn = 0 hits). attn_block (common.rs:101-165) and both forward.rs attn paths are self-attention only; the .encoder() spec (common.rs:66) only sets bidir+no-rope, still self-attn.
+	note: Encoder-decoder cross-attention is not modeled; no encoder-output K/V is ever consumed.
+ABSENT	relative position bias
+	t5/t5encoder route to Dense(GeluSeq).encoder() (models/mod.rs:154-155); no attn_rel_b / relative_attention_bias tensor is loaded or added, and gqa_masked_attn accepts no bias tensor (only q,k,v,out + causal mask; f64_infer.hip:35-59).
+	note: T5-style learned relative bias not composed.
+ABSENT	ReLU FFN
+	No sequential plain-ReLU Ffn variant: models/common.rs:29-38 enumerates only SiluGate/GeluGate/GeluSeq/ReluSqrSeq. gpu_relu_into (kernels.rs:2522) exists but is only reached in squared form (common.rs:225-227); no TABLE arch composes down(relu(up(x))).
+	note: ReLU kernel is present as a primitive but no ReLU-only FFN composition routes to it.
+ABSENT	residual mixing
+	No learned mixing of residual streams. The only multi-branch combine is the gemma dual-FFN add llm.rs:1604 (ar.mlp + ar.mop) which is a plain gpu_add_into, not a learned per-channel mix; no mixing weights/matrix over residual paths anywhere.
+	note: Distinct from residual scaling; no hyper-connection-style width-wise mixing exists.
+ABSENT	router bias
+	No bias added to router logits in either MoE path (common.rs:259-261 gemms cms->logits then softmax at 270; llm.rs:1554-1559 dots then softmax at 1559). Spec `.bias()` (mod.rs:37,44,57,132,134) is attention QKV bias, not router, and even that is discarded (`let _ = sp.attn_bias;` common.rs:163). No `router.bias`/`ffn_gate_inp.bias` tensor key anywhere.
+	note: Router bias (llama.cpp build_moe_ffn logit bias) has no tensor load and no add-before-softmax.
+ABSENT	secondary-arch-wiring-gaps
+	Distinct from the contradiction but surfaced by the same run: 30 ERROR rows are missing tensor/norm mappings, not value bugs. Fused-QKV archs error at `missing model.decoder.layers.0.self_attn.q_proj.weight` (qwen35, qwen35moe, qwen3next, deepseek2, deepseek32, glm-dsa, granitehybrid, jamba) and `...k_proj.weight` (kimi-linear) -- synth_qkv_slices (llm.rs) does not split their combined qkv tensor. Norm-name mapping gaps error at `layer 0 has no "pre_ff"/"post_attn" norm weight` (falcon, falcon-h1, dbrx, glm4moe, gpt-oss, seed_oss, command-r) and `missing ...input_layernorm.weight` / `missing model.decoder.norm.weight` (exaone4, talkie, lfm2, lfm2moe) -- the LAYER_NORMS map (llm.rs:710-720) and hf_name table lack those archs' tensor names. gemma FAIL 1.6e4 additionally reflects the missing input-embedding sqrt(n_embd) scale that logits_last explicitly omits (llm.rs:101-102), an arch-specific gap orthogonal to plus_one.
+	note: These are separate burn-down items (the test header calls itself the burn-down baseline), fixed by extending synth_qkv_slices to the fused-qkv layouts and adding the missing arch tensor-name mappings; they do not bear on the llama vs stories forward contradiction and should be triaged independently after the plus_one fix, which alone should flip the ~71 FAIL dense/moe rows.
+ABSENT	selective scan
+	scan_linear_recurrence is a non-selective linear recurrence with a and b fully precomputed before the scan (a=silu(K), b=V; common.rs:357-358) and constant per step in the kernel loop (gpu-core/src/kernels/scan.hip:317-320). No input-dependent discretization/selection (delta, A, per-step B/C) and no selective_scan kernel exists.
+	note: The scan primitive is wired but is plain, not selective.
+ABSENT	sequence embedding output
+	No embedding-extraction (pooling-NONE / per-token or per-sequence embedding return) mode exists. Both engine paths end in lm_head logits + token generation (llm.rs:119-121 logits_last, :1714-1729 causal, :2033-2094 diffusion). rg 'embd_out'/'sequence embed'/'res_embd'/'return hidden' = 0.
+	note: Encoder archs (bert/*-embed, common.rs encoder() sets bidir at :66-70) still run to lm_head; no hidden-state export.
+ABSENT	shared expert MLP
+	No shexp / shared-expert tensor names or branch anywhere in recipe-infer/src or gpu-core/src (grep 'shexp|shared_exp|inp_shexp' empty); layer_moe (common.rs:245-308) and gemma4 layer (llm.rs:1538-1601) compose only a router + routed experts, no always-on shared branch.
+	note: llama.cpp ffn_*_shexp path has no counterpart here.
+ABSENT	shared experts
+	No shared-expert tensors, hyperparameter, or always-added branch: layer_moe (common.rs:245-308) sums only the routed top-k experts; SLICE/LAYER maps (llm.rs:969-993) carry only experts.gate/up/down + router, no shexp entry.
+ABSENT	short convolution
+	No short causal conv in layer_recurrent (common.rs:317-372); no LAYER_MAP entry for any ssm_conv/short-conv tensor (llm.rs:969-995). Nearest primitives: generic convx_conv1d (CNN-only) and dwconv1d (unbound).
+	note: Mamba's width-~4 conv over the SSM input is not composed.
+ABSENT	SiLU FFN
+	No sequential (ungated) SiLU Ffn variant in models/common.rs:29-38; only gated SiluGate exists. gpu_silu_into (kernels.rs:2487) is a live primitive but is reached only inside SwiGLU (common.rs:207) and the recurrent K-gate (common.rs:357), never as down(silu(up(x))).
+	note: Distinct from SwiGLU; the ungated-SiLU MLP has no composition.
+ABSENT	skip parameter
+	No SSM D (ssm_d) tensor in LAYER_MAP and no y=scan+D*x term in layer_recurrent; the add at common.rs:367 (gpu_add_into ar.o + h_in) is the standard transformer block residual, not the SSM D skip.
+ABSENT	sliding-window attention
+	The gqa_masked_attn kernel has only a causal 'prefix' cutoff and no window lower-bound (f64_infer.hip:51-59), so SWA layers actually compute full attention. SWA hparams are parsed (llm.rs:370-386) and d.sliding only switches RoPE theta_slide + key_length_swa head_dim (llm.rs:1461-1465, 424-425).
+	note: Partial plumbing (per-layer flag + RoPE theta) is wired, but the defining window mask is implemented nowhere.
+ABSENT	speculative decoding head
+	No speculative-decode acceptance/verification head or draft-target loop in recipe-infer; decode loops are single greedy/sample (generate_causal llm.rs:1696-1748) or fixed 6-step diffusion (generate llm.rs:1940).
+ABSENT	SSM convolution
+	No ssm_conv1d tensor in LAYER_MAP (llm.rs:969-995) and no conv op in layer_recurrent (common.rs:317-372); the SSM-block causal depthwise conv is neither loaded nor composed.
+ABSENT	state matrix
+	No A/A_log state-transition tensor in LAYER_MAP (llm.rs:969-995); the scan's per-step coefficient a is improvised as silu(k) (common.rs:357), not a learned state matrix. Grep for a_log/ssm_a across both crates yields only comments/table strings.
+	note: The recurrence has a scalar decay coefficient but no learned A parameter.
+ABSENT	task adapters
+	rg -i adapter = 0 files across both crates. No task-specific adapter modules or routing.
+ABSENT	temporal RoPE
+	No temporal/time-axis position handling; single scalar pos per token (f64_infer.hip:98). grep temporal empty.
+	note: Part of the missing M-RoPE section machinery.
+ABSENT	ternary weights
+	recipe-infer/src/dequant.rs:2-17 block_layout handles only ggml types {0,1,6,8,12,14}; ternary types (TQ1_0/TQ2_0/I2_S) fall to the _other arm at dequant.rs:10-16 and :130-135 which calls process::abort(). rg TQ1/TQ2/i2_s/ternary = 0 files.
+	note: No ternary block layout, no 1.58-bit unpack kernel anywhere.
+ABSENT	text-image-video positions
+	No M-RoPE / rope_sections. ropex.hip defines only ropex_qk (line 3) and ropex_qk_heads (line 36); rope.rs binds only those two; common.rs:143-146 uses single-axis gpu_rope_partial. grep mrope|rope_sections|GGML_ROPE_TYPE_MROPE|position_ids returns nothing (the 'sections' hits are timing-report labels llm.rs:2139).
+	note: llama.cpp reference uses M-RoPE with text/image/video sections; here only 1D rope exists.
+ABSENT	text-timestamp alignment
+	No TMRoPE / timestamp alignment: grep timestamp|tmrope returns nothing in recipe-infer or gpu-core.
+ABSENT	time mixing
+	RWKV time-mix mechanism (token-shift interpolation feeding receptance/WKV with time_mix_*/time_first/time_decay) is not composed; none of those tensors are in LAYER_MAP (llm.rs:969-995). layer_recurrent substitutes the generic scan only.
+	note: The generic linear recurrence stands in structurally, but the RWKV time-mix op and its parameters are absent.
+ABSENT	time-step bias
+	No dt_bias tensor mapped (llm.rs:969-995) and no timestep-bias term anywhere; grep for dt_bias across both crates is empty.
+ABSENT	time-step projection
+	No dt_proj/x_proj tensor in LAYER_MAP (llm.rs:969-995) and no delta/timestep computation in layer_recurrent (common.rs:317-372). Grep for dt_proj across both crates is empty.
+ABSENT	token shift
+	No token-shift op (per-channel 1-timestep shift + interpolation) anywhere: no kernel, no LAYER_MAP token_shift entry, no call in layer_recurrent (common.rs:317-372). Grep for token_shift/time_maa across both crates hits only mod.rs table strings.
+ABSENT	token type embeddings
+	No token_types/type_embd/segment tensor mapped or referenced anywhere in recipe-infer/src (grep empty). BERT-family archs (bert models/mod.rs:33) route to encoder Dense with no type-embedding add.
+	note: Required by BERT segment embeddings; not implemented.
+ABSENT	V normalization
+	rg -ni 'v_norm|value_norm' over recipe-infer/src and gpu-core/src returns zero hits. attn_block normalizes only Q and K (common.rs:139-142); V is projected and fed straight to gqa (common.rs:131-138,149).
+ABSENT	value residual mix
+	No value-residual mixing (v' = v + mix*(v_first - v)) in layer_recurrent or elsewhere; grep for value_resid/v_resid across both crates is empty.
+ABSENT	vision feature fusion
+	No deepstack/merger/feature-merge path: grep deepstack|fusion|merger returns nothing. There is no image-feature branch to fuse.
+ABSENT	vision path
+	VL archs qwen2vl (mod.rs:134), qwen3vl (:140), qwen3vlmoe (:141), cogvlm (:39), hunyuan_vl (:83) all route to text-only Comp::Dense/Moe. No vision tower, patch embedding, or image-projection tensors anywhere (grep pixel/patch_embd/vision empty).
+	note: Only the text decoder half of vision-language models is composed; the image encoder and its projector are not implemented.
+ABSENT	vision position embeddings
+	No vision positional embedding tensor or kernel. Position handling in the LLM path is standard 1D RoPE only (common.rs:143-146 gpu_rope_partial; rope.rs gpu_rope_qk). No vision/2D pos-embed code in recipe-infer or gpu-core.
+ABSENT	vision projector
+	No mm_projector / vision->text projection. No such tensor names loaded in gguf.rs/safetensors.rs/params.rs; models/common.rs composes only self_attn.*/mlp.* weights.
+ABSENT	vision RoPE
+	No vision tower, patch embedding, or 2D/axial RoPE. grep for vision/2d rope empty across recipe-infer/gpu-core. VL archs decode as text-only dense/moe (models/mod.rs:83,134,140).
+	note: No spatial rotary encoding.
+ABSENT	vision tower
+	No clip/vit/mmproj/patch-embed loader or encoder anywhere: grep for vision|clip|mmproj|patch|siglip|vit across recipe-infer/src and gpu-core returns nothing in loaders (llm.rs, gguf.rs, params.rs, safetensors.rs all empty). Table entries qwen2vl(mod.rs:134), qwen3vl(:140), qwen3vlmoe(:141), hunyuan_vl(:83), deepseek2-ocr(:47), paddleocr(:122) map ONLY the text decoder Spec.
+	note: VL/OCR arch strings are present but each resolves to a pure language-decoder composition; the image encoder is not loaded or composed.
+ABSENT	vision-language projector
+	rg -i 'mmproj'/'projector'/'vision'/'visual'/'image_embed'/'clip' = 0 files (only 'clippy' lint-attr false positives). VLM arch rows exist as strings (qwen2vl/qwen3vl/hunyuan_vl models/mod.rs:83,134,140-141) but all map to plain text Dense/Moe Specs; no image->text projection.
+	note: VLM archs run text-only through the standard decoder; no mm-projector tensors are loaded or composed.
+ABSENT	vision-token integration
+	The engine consumes token ids only; no image-embedding injection into the hidden stream. common.rs attn/ffn drivers take h_in hidden buffers with no image-embed insertion, and no image_embed/n_embd_v handling exists in llm.rs.
+ABSENT	visual expert attention
+	attn_block (common.rs:101-165) is a single unconditional GQA attention over all tokens; no visual-token-specific Q/K/V/O expert weights or masks. rg visual = 0.
+ABSENT	visual expert FFN
+	ffn/layer_moe (common.rs:192-308) provide only the text FFN and softmax-router MoE; no image-token expert FFN. rg visual = 0.
+ABSENT	visual expert path
+	rg -i visual = 0 files. cogvlm arch row (models/mod.rs:39) maps to plain Comp::Dense(Spec::dense(Ffn::SiluGate)); dispatch (mod.rs:182-209) has no modality/token-type branching — layer_is_moe (llm.rs:860) is expert-MoE routing, not a visual/text expert split.
+	note: No dual-expert (visual vs language) structure of any kind.
+ABSENT	visual token insertion
+	No image-placeholder splicing or visual-token scatter. grep for patch/vision/image/mmproj across recipe-infer/src and gpu-core/src returns only false positives (clip_value grad-clip, cross_entropy).
+ABSENT	waveform token decoder
+	Arch string 'wavtokenizer-dec' is in TABLE (models/mod.rs:157) but maps to Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()) — a generic bidirectional transformer-encoder block via layer_spec. The actual wavtokenizer decoder stack (embd->conv1d->posnet->convnext->head, per llama.cpp llama-model.cpp:1088-1092) is not composed.
+	note: Present as a mislabeled alias to the generic encoder driver, not as the codec decoder it names.
+PRIMITIVE	attention bias
+	Spec.attn_bias field (common.rs:47) is set by .bias() (common.rs:80-83) for many TABLE arches (qwen2, chatglm, falcon, bloom, gpt2, phi2, etc.), but attn_block discards it: 'let _ = sp.attn_bias;' (common.rs:163). Q/K/V gemms add no bias (common.rs:121-138 gpu_gemm_bt_f64, no bias operand).
+	note: Declared and threaded through the Spec but consumed as a no-op; no additive attention/QKV bias is ever applied.
+PRIMITIVE	convolutional decoder
+	conv1d kernel exists and is wired only to the recipe builder Conv layer: gpu_conv1d_into kernels.rs:7196 (+backward 7233/7268/7319), convx.hip:4, called at forward.rs:332 for LayerKind::Conv. convx.hip also has conv2d(:142)/conv3d(:174)/convtranspose2d(:302)/dwconv(:209)/gconv(:268)/dilation2d(:337) but these have NO Rust FFI binding (kernels.rs binds only launch_convx_conv1d family 1535-1576).
+	note: conv1d building block is reachable from the generic NN builder, not from any LLM/vocoder decoder composition; conv2d/3d/transpose/dwconv are dead .hip primitives with no launcher binding.
+PRIMITIVE	depthwise convolution
+	convx_dwconv1d_kernel + launch_convx_dwconv1d exist (convx.hip:209-236) but have NO Rust FFI binding in kernels.rs (grep for dwconv/depthwise across gpu-core/src/*.rs is empty) and nothing routes to them.
+	note: Kernel source present; no launcher decl, no gpu_* wrapper, unreachable.
+PRIMITIVE	encoder output norm
+	gpu_layernorm_into exists at gpu-core/src/kernels.rs:3208 but nothing in the LLM composition routes to it: common.rs:162 `let _ = sp.norm` discards the NormK::Layer selection set by .layer() (common.rs:84-87), so bert/gpt2/t5/nomic-bert encoder archs still get gpu_rmsnorm_f64 everywhere and share the generic final norm (llm.rs:118).
+	note: No encoder-distinct output norm; LayerNorm kernel is unrouted in decode. Encoder archs collapse onto the rmsnorm decoder_norm final norm.
+PRIMITIVE	gated attention
+	gpu_scan_linear_recurrence takes a gate/decay operand a and input b (reductions.rs:769-774); layer_recurrent feeds silu(k) as that gate (common.rs:357-358). No gate exists on the softmax/GQA path (common.rs attn_block:120-161 has none).
+	note: Only gated-linear-recurrence gating is present, inside the recurrent path; no dedicated gated-softmax-attention output gate.
+PRIMITIVE	GroupNorm
+	Kernel normx_groupnorm_kernel + launcher launch_normx_groupnorm exist (normx.hip:22-57), but there is NO Rust extern declaration or wrapper for it (grep launch_normx_groupnorm/groupnorm over all *.rs returns nothing) and nothing routes to it.
+	note: Kernel-only; not even bound in Rust, so strictly below LayerNorm's status. Same for the neighboring normx_instancenorm_kernel (normx.hip:59).
+PRIMITIVE	LayerNorm
+	f64 kernel layernorm_kernel exists (elementwise.hip:660-707) with Rust binding gpu_layernorm_into (kernels.rs:3208-3232), but nothing in recipe-infer calls it (grep shows only the definition). The NormK::Layer spec variant is set for ~20 arches (common.rs:22-24; mod.rs:33,35,38,60,72,74,...) but is discarded at `let _ = sp.norm;` (common.rs:162) — attn_block/layer_spec unconditionally call gpu_rmsnorm_f64 instead.
+	note: So bert/gpt2/falcon/bloom/mpt etc. marked .layer() actually run RMSNorm on the wired path; the true LayerNorm kernel is never routed. (f32 training variant also exists: nn_f32.rs:329, gpu-only, banned for f64 infer.)
+PRIMITIVE	non-parametric LayerNorm
+	layernorm_kernel supports null gamma/beta -> mean-centered, unscaled output (elementwise.hip:705 `gamma ? normed*gamma[j]+beta[j] : normed`), but gpu_layernorm_into is never called by recipe-infer, so this branch is unreachable on the dispatch path. The only WIRED parameter-free norm is RMSNorm-no-gamma (gpu_rmsnorm_f64_nogamma, infer_ops.rs:153, used llm.rs:1492,1977,1979) — which is not mean-centered, so it is not LayerNorm.
+	note: Non-parametric LayerNorm (mean-centered, no affine) exists as a kernel branch but is not routed; the routed param-free norm is RMS-based instead.
+PRIMITIVE	pooling head
+	gpu-core/src/kernels/poolx.hip has global_avg_pool (poolx.hip:4), global_max_pool (poolx.hip:23), lp_pool (poolx.hip:45), adaptive_avg_pool (poolx.hip:67), but grep finds NO Rust binding for 'poolx' in any .rs and nothing in recipe-infer routes to them.
+	note: Kernels are CNN-shaped (pool over channels/span), not a sequence-pooling head, and have no FFI decl. No pooling occurs in any LLM decode path.
+WIRED	attention
+	gpu_gqa_attn -> launch_gqa_masked_attn -> gqa_masked_attn kernel (gpu-core/src/infer_ops.rs:178, gpu-core/src/kernels/f64_infer.hip:35) is called every decode layer via common.rs attn_block:149 and the gemma path llm.rs:1495. Tabular path uses flash_attn_f64 (forward.rs:478/509).
+	note: Two live attention implementations: f64 GQA (LLM decode) and f64 flash attention (tabular Attn layer).
+WIRED	attention output projection
+	LLM path: recipe-infer/src/models/common.rs:150-157 gpu_gemm_bt_f64(&ar.attn, self_attn.o_proj.weight, ...)->ar.o. NN path: recipe-infer/src/forward.rs:481 gpu_linear_into(&sc.a_ctx, &p.wo, &p.b, ...)->out.
+WIRED	attention scaling
+	recipe-infer/src/models/common.rs:147 gpu_scale_f64_inplace(attn_scale, t*qd, &ar.q) applied to Q before GQA; attn_scale buffer = 1.0/sqrt(hd) at recipe-infer/src/llm.rs:83-86 and 1677-1680, threaded through models::dispatch (llm.rs:115). infer_ops.rs:302 launch_scale_f64.
+	note: Scale is folded into Q pre-attention (standard 1/sqrt(head_dim)); the NN-builder attn path scales inside flash_attn_f64 instead.
+WIRED	autoregressive objective
+	generate_causal() llm.rs:1655-1760 is the causal (non-diffusion) autoregressive decode; entered when ncanvas==0 (llm.rs:1896-1898). Causal masking via prefix arg to gpu_gqa_attn (common.rs:148-149).
+WIRED	bidirectional attention
+	Spec::encoder() sets bidir=true (common.rs:66-70); attn_block sets prefix=0 (common.rs:148), so the kernel applies no mask (f64_infer.hip:57 masked=false for all sp), giving full bidirectional attention. Routed for bert/t5/jina/*-embed/modern-bert arches in mod.rs TABLE.
+WIRED	causal attention
+	For non-bidir specs prefix=t (common.rs:148), and the kernel masks sp>p when p<prefix (f64_infer.hip:57), i.e. lower-triangular causal. Default Spec::dense has bidir=false (common.rs:61). llm.rs:1655 generate_causal is the causal decode entry.
+WIRED	channel mixing
+	The channel-mixing slot of the recurrent block is filled by the SwiGLU FFN: layer_recurrent calls ffn(Spec::dense(Ffn::SiluGate)) at common.rs:369, which mixes across channels per token (down(silu(gate(x))*up(x)), common.rs:198-208).
+	note: Generic FFN fills the role; RWKV channel-mix specifics (token-shift + squared-ReLU + R gate) are absent.
+WIRED	channel-mixing MLP
+	recipe-infer/src/models/common.rs:192-239 ffn() consumes ar.cms (channel-mix state, declared llm.rs:610, alloc 653) and mixes across the feature dim; invoked by dense layer_spec (common.rs:183) and recurrent layer_recurrent (common.rs:369).
+	note: The FFN itself is the channel-mixer (vs token/time mixing in attention/scan).
+WIRED	decay path
+	The per-step multiplicative decay a in h=a*h+b (scan.hip:319) is fed by silu(k): gpu_silu_into(ar.k) at common.rs:357 then scan at common.rs:358.
+	note: Generic gate derived from the K projection; not a learned time_decay (RWKV) or exp(-dt*A) (Mamba) decay parameter.
+WIRED	decoder stack
+	Per-layer decode loop over nl layers dispatching through models::dispatch: recipe-infer/src/llm.rs:114-117 (Headless), 1709-1712 (causal), 2005-2016 (diffusion); dispatch table recipe-infer/src/models/mod.rs:182-209.
+	note: Causal (prefix mask) decoder stack is the primary wired path.
+WIRED	DeltaNet
+	Delta-net hybrids (qwen3next, qwen35/qwen35moe) map to Comp::Recurrent (models/mod.rs:139,136-137); layer_recurrent's doc names delta-net (common.rs:310-316) but composes gpu_scan_linear_recurrence (common.rs:358).
+	note: No delta-rule outer-product state update (S += beta*(v - S k) k^T); collapses to scalar diagonal recurrence. Mechanism absent.
+WIRED	dense blocks
+	Comp::Dense -> layer_spec (recipe-infer/src/models/mod.rs:198-199 dispatch; driver at models/common.rs:170-189); majority of TABLE entries are Comp::Dense.
+	note: Attention + residual + gated/sequential FFN (SwiGLU/GeGLU/GELU/ReLU^2) all composed from shared kernels.
+WIRED	dense FFN fallback
+	recipe-infer/src/models/mod.rs:195-200 dispatch routes a layer to layer_spec (dense ffn) when m.layer_is_moe(l) is false; layer_is_moe is presence-driven (llm.rs:856-863). Applies to every Comp::Dense arch and non-expert layers of Comp::Moe archs.
+WIRED	dense MLP
+	Dense (non-MoE) FFN path: layer_spec (common.rs:170-189) -> ffn() with up/gate/down GEMMs (gpu_gemm_bt_f64 common.rs:196,230); GeluSeq/ReluSqrSeq give the plain dense MLP form (common.rs:222-228).
+	note: Distinct from layer_moe's routed-expert FFN (common.rs:245-308).
+WIRED	dense-MoE hybrid stack
+	recipe-infer/src/models/mod.rs:194-201 dispatch selects layer_moe vs layer_spec per layer for the same arch; additionally gemma4 fn layer (llm.rs:1442) runs a dense GeGLU FFN (1510-1535) AND a routed MoE (1538-1601) combined into h_out per layer (gpu_add_into 1604).
+	note: Two hybrid forms: per-layer dense/MoE interleave, and per-layer dense+MoE fusion (gemma4).
+WIRED	diffusion blocks
+	Masked-canvas self-conditioning denoising decode loop (recipe-infer/src/llm.rs:1940-2118): canvas mask tokens :1886-1888, self-conditioning MLP sc_pre/sc_gate/sc_up/sc_down :1971-1976, per-step temperature sampling :2043-2089. Self-conditioning tensors mapped GLOBAL_MAP :958-961.
+	note: The composition is wired in recipe-infer. gpu-core's dedicated diffusion sampling kernels (gpu_diffusion_sample gpu-core/src/diffusion.rs:105, gpu_diffusion_commit:74, entropy_gated_step:39) are PRIMITIVE -- no recipe-infer caller (grep gpu_diffusion in recipe-infer empty); the infer path does its own host-side entropy/temperature sampling instead.
+WIRED	diffusion objective
+	recipe-infer/src/llm.rs:1874,1886-1898 (ncanvas from diffusion.canvas_length fills a masked canvas; generate() branches to the diffusion decode when ncanvas>0), loop at llm.rs:1940-2094 (6-step iterative masked denoising: embed canvas, run layers, lm_head logits, temperature schedule temp=1.0-0.7*step/6, top-50 sample, confidence remask into sck). Hparams field at llm.rs:319,389.
+	note: Discrete/masked-token diffusion (LLaDA/Dream style), run host-side. gpu-core has GPU-native diffusion primitives gpu_entropy_gated_step/gpu_diffusion_commit (gpu-core/src/diffusion.rs:44,74; kernels/diffusionx.hip) but recipe-infer does not route to them (0 refs) — those are PRIMITIVE.
+WIRED	dropless routing
+	Routing is dropless by construction: each expert's routed tokens are gathered into an unbounded list and processed with a dense GEMM, with no capacity factor or drop logic (common.rs:282-304 `for (&e, poslist) in &e2p` over Vec of all routed positions; llm.rs:1572-1599 identical). No `capacity`/drop path exists in the codebase.
+	note: Dropless as a PROPERTY (no token is dropped), not a dedicated block-sparse/grouped-GEMM dMoE kernel; the mechanism is a naive per-expert host-side gather + per-expert dense f64 GEMM.
+WIRED	embedding scaling
+	gemma sqrt(n_embd) scale: scl=(ne).sqrt() recipe-infer/src/llm.rs:1890, applied to token embeds :1947 and to soft embeds :1967. Causal path intentionally leaves embeddings unscaled, documented recipe-infer/src/llm.rs:101-102.
+	note: Scaling is wired only in the gemma diffusion decode; the generic causal decode deliberately skips it per the arch-specific comment.
+WIRED	embedding tying
+	lm_head reuses embed_tokens.weight when m.out is empty (recipe-infer/src/llm.rs:1623-1630); a separate untied output.weight (lm_head.weight) is loaded when present at recipe-infer/src/llm.rs:1272 and used at :1631-1633.
+	note: Both tied (shared token-embedding matrix) and untied (separate output projection) paths are handled.
+WIRED	encoder stack
+	Spec::encoder() sets bidir=true, rope=false (recipe-infer/src/models/common.rs:66-70); consumed in attn_block as prefix=0 non-causal attention (common.rs:148-149). Encoder archs bert/t5/eurobert/nomic-bert etc. in TABLE (models/mod.rs:33,154-155,56,115).
+	note: Bidirectional (non-causal) attention layers ARE composed and dispatch-reachable, but there is no encoder-only entry point producing pooled/sequence embeddings and no pooling head; the engine only exposes causal/diffusion generation, so a bert load would run the stack but through the LM-head generation driver.
+WIRED	expert gating
+	recipe-infer/src/models/common.rs:269-277 softmax over router logits, sum of top-k probs ws (274), gate weight probs[e]/ws applied at combine (299-303); gemma4 adds per_expert_scale pe[e] (llm.rs:1594).
+WIRED	expert logits
+	recipe-infer/src/models/common.rs:260-261 gpu_gemm_bt_f64(ar.cms, gate_w) -> logits[t*nexp] then downloaded (263); gemma4 computes router logits host-side as rw·rin dot products (llm.rs:1554-1558).
+	note: gate_w comes from ffn_gate_inp.weight -> router.proj.weight (llm.rs:991).
+WIRED	expert MLP
+	recipe-infer/src/models/common.rs:288-293 per-expert: widen gate+up slot -> gpu_gemm_bt_f64 (2*nffe) -> gpu_glu_silu -> down gemm; each routed expert is a SwiGLU MLP over packed expert_slot weights (llm.rs:894 expert_slot).
+WIRED	expert routing
+	recipe-infer/src/models/common.rs:259-278: router gemm ar.cms x router.proj.weight -> logits (259-261), download, per-token softmax + descending sort + truncate(used) building expert->positions map e2p; gemma4 host router llm.rs:1548-1567.
+	note: Routing logic runs on host; GPU kernel gpu_moe_route (moe.rs:128) is unused (PRIMITIVE).
+WIRED	expert weight normalization
+	Both live MoE paths renormalize the top-k gate weights to sum to 1: common.rs:274 `let ws: f64 = idx.iter().map(|&e| probs[e]).sum();` then :276 `probs[e] / ws`; llm.rs:1563 `let ws` then :1565 `rl[e] / ws`.
+	note: norm_topk_prob is implemented in both models::dispatch layer_moe and the gemma4 engine.
+WIRED	expert weight scaling
+	Gemma4 engine only: per-expert output scale `pe` (router.per_expert_scale, loaded llm.rs:1221 from key map 993) applied at llm.rs:1594 `let s = w * pe[e]`; router-input scale `gis` (router.scale, loaded 1220 from key 992) applied at llm.rs:1553 `rmn[xx] * inv_sqrt_ne * gis[xx]`.
+	note: Wired ONLY in the gemma4 `layer()` path (llm.rs:1442, called 2015). The generic common.rs::layer_moe has NO routed-output scaling — a single routed_scaling_factor scalar there is absent.
+WIRED	FFN
+	ffn() driver at common.rs:192-239 with four variants (SiluGate/GeluGate/GeluSeq/ReluSqrSeq); invoked by layer_spec (common.rs:183), layer_recurrent (common.rs:369), and per-expert in layer_moe (common.rs:290-293).
+WIRED	final norm
+	m.decoder_norm applied before lm_head via gpu_rmsnorm_f64: llm.rs:118 (logits_last), :1714 (generate_causal), :2033 (diffusion decode); loaded at llm.rs:1235 from model.decoder.norm.weight.
+	note: output_norm/norm.weight; single shared final rmsnorm across all decode paths.
+WIRED	fine-grained routing
+	The generic top-k router is granularity-agnostic: arbitrary nexp/used (common.rs:256 `(nexp, used)`, selection 270-273), and per-expert FF width is taken from the expert tensor shape rather than a fixed hparam (llm.rs:501 expert_ff_from_tensors, used 350-353). Fine-grained arches (qwen2moe/qwen3moe/deepseek) route through this.
+	note: The routing math scales to fine granularity, BUT shared-expert isolation (the defining half of DeepSeekMoE/Qwen2MoE fine-grained routing) is ABSENT: no shexp tensors are loaded or added (grep shared_expert/shexp returns nothing), so those models are numerically incomplete.
+WIRED	full attention
+	gqa_masked_attn loops sp over all t key positions with no windowing (f64_infer.hip:51,72-75); GQA grouping via nqh/nkv (kv=h/(nqh/nkv), line 42-44). Reached every layer through common.rs:149 / llm.rs:1495.
+WIRED	full-head RoPE
+	Shared attn_block calls gpu_rope_partial with rotary_dim == hd (recipe-infer/src/models/common.rs:144-145), rotating the entire head dimension for every dispatched dense/moe arch.
+	note: Default for the whole models/ table path.
+WIRED	gated DeltaNet
+	Same recurrent dispatch (qwen3next et al., models/mod.rs:139) -> layer_recurrent -> gpu_scan_linear_recurrence (common.rs:358).
+	note: No gated delta rule (per-token forget gate on a matrix state); only the shared scalar a*h+b recurrence. Mechanism absent.
+WIRED	gated MLP
+	recipe-infer/src/models/common.rs:197-221 ffn() SiluGate/GeluGate branches gemm a gate_proj, apply act, then gpu_mul_inplace with up -> down(act(gate(x))*up(x)); reached for gated archs (llama/gemma/qwen) via dispatch mod.rs:195-199.
+	note: The canonical gate*up MLP; two gate variants (silu, gelu).
+WIRED	GeGLU
+	recipe-infer/src/models/common.rs:32-33 Ffn::GeluGate; ffn() 210-220 gpu_gelu_into(gate)+gpu_mul_inplace; fused gpu_glu_gelu infer_ops.rs:232 -> f64_infer.hip:130, wired in gemma4 MoE experts llm.rs:1583; dense gemma via gpu_gelu_mul llm.rs:1526.
+	note: gemma/gemma2/gemma3/modern-bert map here (mod.rs:62-68,109).
+WIRED	GELU FFN
+	recipe-infer/src/models/common.rs:34-35 Ffn::GeluSeq; ffn() 222-224 down(gpu_gelu_into(up(x))) with no gate; kernel gpu_gelu_into kernels.rs:3237. Archs bert/gpt2/falcon/bloom map here (mod.rs:33,60,72).
+	note: Sequential (ungated) GELU MLP.
+WIRED	global attention
+	The non-sliding (full) layers of a hybrid model run the default full-causal path: d.sliding=false selects theta_full (llm.rs:1461-1464) and gqa attends over all t positions (f64_infer.hip:51-77). This is the standard wired attention.
+	note: 'Global' here is just the full-attention path; distinct only from the (unimplemented) sliding window.
+WIRED	grouped-query attention
+	gqa_masked_attn computes g2=nqh/nkv, kv=h/g2 to share KV heads across query groups (gpu-core/src/kernels/f64_infer.hip:42-44,52,74). nkv is per-layer head_count_kv (llm.rs:365-368, Dims.nkv:302,433); gpu_gqa_attn passes nqh,nkv (infer_ops.rs:178-205, common.rs:149).
+WIRED	head-dim RoPE
+	rope_partial indexes per head via heads_per_tok, computing pos = row / heads_per_tok so each head's head_dim slice is rotated (gpu-core/src/kernels/f64_infer.hip:96-104). Training path ropex_qk_heads rotates per-head with hd=d/heads (gpu-core/src/kernels/ropex.hip:42-60).
+	note: Per-head rotation over head_dim is the implemented form.
+WIRED	high-sparsity MoE
+	Top-`used` of arbitrary `nexp` via full sort + truncate handles any sparsity ratio: common.rs:271-273 (idx over 0..nexp, sort, truncate(used)); llm.rs:1560-1562. nexp/used come straight from GGUF expert_count/expert_used_count (llm.rs:351,355).
+	note: Large-expert-count / few-active configs are supported by the generic router with no cap or threshold.
+WIRED	input embedding scaling
+	Diffusion path scales embeddings by scl=sqrt(ne): recipe-infer/src/llm.rs:1890 (let scl = (ne as f64).sqrt()) applied at :1947 (base[...] *= scl) and :1967 (soft carry *= scl). Causal path explicitly does NOT scale (llm.rs:101-110 comment + :1698-1705 raw bf16 embeds, no multiply).
+	note: Reachable/executed only in the diffusion decode, with a hardcoded sqrt(n_embd); not driven by a per-arch KV (e.g. gemma's f_embedding_scale). Causal decode deliberately omits it.
+WIRED	K normalization
+	recipe-infer/src/models/common.rs:141 gpu_rmsnorm_f64(&ar.k, norm_of(m,l,"k_norm"), &m.eps, t*nkv, hd, &ar.k) under sp.qk_norm.
+WIRED	key projection
+	recipe-infer/src/models/common.rs:129-130 gpu_gemm_bt_f64(&ar.x, wk=self_attn.k_proj.weight, t, kd, ne, &ar.k). NN path forward.rs:466 gpu_linear_into(h,&p.wk,...,&sc.a_k).
+WIRED	Kimi Delta Attention
+	kimi-linear maps to Comp::Recurrent (models/mod.rs:91) -> layer_recurrent -> gpu_scan_linear_recurrence (common.rs:358).
+	note: No KDA-specific fine-grained gated delta mechanism; runs the shared generic recurrence. Mechanism absent.
+WIRED	language attention path
+	attn_block (common.rs:101-165): pre-RMSNorm, Q/K/V projections, optional per-head q/k RMSNorm, RoPE (gpu_rope_partial), scaled GQA (gpu_gqa_attn, common.rs:149), output projection, residual. Reached from both layer_spec and layer_moe and from every TABLE dispatch (mod.rs:195-201).
+	note: Standard grouped-query attention over text tokens; this is the language-side attention with no visual counterpart.
+WIRED	language expert path
+	The standard decode block IS the language-side compute and is fully reachable: layer_spec (common.rs:170-189) composes attention + FFN + residuals for every dense arch via dispatch (models/mod.rs:182-209); MoE variant layer_moe (common.rs:245-308).
+	note: Present only as the sole, non-modality-gated decode path — not as a paired 'language expert' branch of a visual-expert model (which is absent). All tokens go through it.
+WIRED	language FFN path
+	recipe-infer/src/models/common.rs:192-239 ffn() composes up/gate/down GEMMs with SiluGate/GeluGate/GeluSeq/ReluSqrSeq; MoE variant common.rs:245-308. Reached from models/mod.rs:182 dispatch -> layer_spec/layer_moe, called by llm.rs:115 and llm.rs:1710.
+	note: The one element fully on the composition path. Ffn enum common.rs:29-38 selects the four gate/seq forms; every TABLE arch drives it.
+WIRED	language path
+	Text generation is the entire engine: generate -> generate_causal (recipe-infer/src/llm.rs:1655) or the diffusion loop (:1940); tokenizer at recipe-infer/src/tokenizer.rs, embeds+decodes+lm_head.
+	note: The only fully wired end-to-end path.
+WIRED	layer output scaling
+	LAYER_MAP 'layer_output_scale.weight'->'layer_scalar' llm.rs:994; loaded per layer into m.ls_dev llm.rs:1222-1231; applied gpu_scale_f64_inplace(&m.ls_dev[l], t*ne, h_out) llm.rs:1607.
+	note: Applied only in the diffusion generate() layer() (llm.rs:1442-1609). The causal dispatch drivers (common.rs layer_spec/layer_moe/layer_recurrent) do NOT apply ls_dev, so causal decode ignores per-layer output scale.
+WIRED	layer output scaling (attention 1/sqrt(hd))
+	attn_scale = 1/sqrt(hd) built llm.rs:83-88 and 1677-1682; threaded through dispatch (mod.rs:189) and applied gpu_scale_f64_inplace(attn_scale, t*qd, ar.q) common.rs:147.
+	note: Standard attention logit scaling (softmax denominator) is wired for every arch; distinct from the per-layer/embedding-width scales above.
+WIRED	leading dense FFN
+	recipe-infer/src/llm.rs:856-863 layer_is_moe checks per-layer expert-tensor presence, so a dense-lead prefix (e.g. deepseek: dense first layers, MoE later) routes each leading layer to layer_spec and later layers to layer_moe with no per-arch code (mod.rs:195-199).
+	note: Doc comment at llm.rs:857-859 explicitly cites the deepseek dense-lead case.
+WIRED	linear attention
+	Comp::Recurrent (mod.rs:201) routes to layer_recurrent (common.rs:317), which computes the sequence mixer as gpu_scan_linear_recurrence (common.rs:358; gpu-core/src/reductions.rs:769). ~20 arches routed (mamba, mamba2, rwkv6/7, qwen3next, kimi-linear, lfm2, jamba, falcon-h1, etc.).
+	note: Generic diagonal-decay scan; comment (common.rs:310-316) states per-family decay parameterization is unrefined/structural.
+WIRED	linear-time mixing
+	gpu_scan_linear_recurrence (reductions.rs:769; kernel scan.hip:311 h=a*h+b) is called in layer_recurrent (common.rs:358), reachable from dispatch (models/mod.rs:201) for all Comp::Recurrent archs (mamba, rwkv*, jamba, etc.).
+	note: A single O(t) first-order diagonal recurrence is the entire sequence mixer for every recurrent arch; no per-family parameterization.
+WIRED	LM head
+	lm_head() llm.rs:1615-1649 (chunked GEMM hfs x weight -> logits); tied path uses embed_tokens, untied uses m.out from 'output.weight'->'lm_head.weight' GLOBAL_MAP llm.rs:956, loaded llm.rs:1272-1276; called from generate_causal llm.rs:1715, diffusion generate llm.rs:2041, Headless::logits_last llm.rs:119.
+	note: Supports both tied and untied output projection, selected by presence of output.weight.
+WIRED	logit softcapping
+	final_logit_softcapping read into hp.softcap llm.rs:388; applied host-side in generate_causal: sv = softcap*(v/softcap).tanh() llm.rs:1719-1720.
+	note: Final-logit softcap applied in the causal decode path only. Diffusion generate() (llm.rs:2044+), logits_last/last_logits/greedy do NOT apply it. Gemma2 attn-logit softcapping (f_attn_logit_softcapping) is not implemented. No dedicated softcap kernel in gpu-core; done host-side.
+WIRED	Mamba
+	mamba/mamba2/jamba/falcon-h1/plamo2/nemotron_h etc. map to Comp::Recurrent (models/mod.rs:100-101,88,61,128,112) -> layer_recurrent -> gpu_scan_linear_recurrence (common.rs:358).
+	note: Dispatch reachable but composed as the shared generic recurrence; Mamba's selective SSM (input-dependent dt/B/C, causal conv1d, exp(dt*A) discretization) is NOT implemented. Not the real Mamba mechanism.
+WIRED	masked diffusion objective
+	generate() ncanvas>0 path llm.rs:1896-2118: appends canvas of mask tokens (llm.rs:1886-1888), 6-step iterative refine (llm.rs:1940), self-conditioning MLP over soft-embeddings (sc_pre/gate/up/down, llm.rs:1955-1987), per-step temperature-annealed top-50 sampling (llm.rs:2043-2089). Archs llada/dream/rnd1/llada-moe (mod.rs:52,94,95,143).
+	note: Decode is driven host-side. The gpu-core entropy-gated accept/renoise diffusion kernel (diffusion.rs:44 gpu_entropy_gated_step, kernels/diffusionx.hip) is PRIMITIVE - present but not called by recipe-infer (grep finds no diffusion:: caller).
+WIRED	MLP
+	Sequential (non-gated) MLP variants in ffn(): Ffn::GeluSeq = down(gelu(up(x))) and Ffn::ReluSqrSeq = down(relu(up(x))^2) at common.rs:222-228; selected per-arch via the TABLE (e.g. gpt2/bert GeluSeq, nemotron ReluSqrSeq).
+WIRED	MoE
+	recipe-infer/src/models/common.rs:245-308 layer_moe full mixture-of-experts block; Comp::Moe TABLE entries (mod.rs:25-153, e.g. qwen2moe/deepseek2/mixtral-class) dispatched at mod.rs:195-197.
+	note: gpu-core/src/moe.rs gpu_moe_route/gpu_moe_weighted_accumulate exist but are PRIMITIVE (no caller in recipe-infer or gpu-core); the wired routing is host-side in layer_moe.
+WIRED	MoE blocks
+	Comp::Moe -> layer_moe (recipe-infer/src/models/mod.rs:195-197; driver models/common.rs:245-308); per-layer expert detection layer_is_moe (recipe-infer/src/llm.rs:860).
+	note: Softmax top-k router + per-expert SwiGLU + weighted combine. Router runs a host-side top-k with per-expert GEMM roundtrips (common.rs:262-304), not a fully-fused GPU MoE kernel.
+WIRED	multi-head attention
+	gqa_masked_attn dispatches grid t*nqh, head h=blk%nqh (gpu-core/src/kernels/f64_infer.hip:39-46,71-76); driven from common.rs:149 gpu_gqa_attn with nqh from per-layer Dims (llm.rs:300,431). NN path uses gpu_flash_attention_into with heads param (forward.rs:479,509).
+WIRED	multi-query attention
+	Same gqa_masked_attn kernel; MQA is the nkv==1 case of kv=h/g2 (f64_infer.hip:42-44). nkv is read per-layer from attention.head_count_kv (llm.rs:365-368) so nkv=1 models route through the identical grouped kernel.
+WIRED	next-token prediction
+	Autoregressive greedy next-token: generate_causal embeds running seq, runs dispatch layers, takes last-position logits, argmax, appends, repeats to EOS (llm.rs:1655-1748); public greedy() llm.rs:136-153 and last_logits() llm.rs:158-162.
+WIRED	non-causal attention
+	Same mechanism as bidirectional: prefix=0 => no mask (common.rs:148, f64_infer.hip:57). Encoder arches (bert, t5, neo-bert, nomic-bert, llama-embed, etc.) all use it.
+	note: Non-causal and bidirectional are the same prefix=0 code path here.
+WIRED	NoPE
+	Spec.rope is a bool gate; encoder() sets rope=false (common.rs:66-70) and attn_block skips RoPE when !sp.rope (common.rs:143). Bidirectional encoders (bert, t5, *-embed, etc.) run position-encoding-free through dispatch.
+	note: Only the encoder/bidirectional variants disable RoPE; no llama4-style per-decoder-layer NoPE interleave schedule exists.
+WIRED	normalization
+	Every decode block boundary applies a norm via gpu_rmsnorm_f64 (infer_ops.rs:127): input/pre-attn common.rs:120, pre-ff common.rs:182/258, plus final decoder_norm llm.rs:118. The general normalization slot is fully exercised on the dispatch path.
+	note: The concrete norm used everywhere on the wired path is RMSNorm.
+WIRED	output embeddings
+	Untied output projection loaded to m.out at recipe-infer/src/llm.rs:1272-1274 (reads model.decoder.lm_head.weight when present) and consumed as the unembedding in lm_head at llm.rs:1623-1635 (gpu_gemm_bt_f64 over m.out, else tied token_embd fallback :1624-1629). Tensor alias output.weight->lm_head.weight at llm.rs:956; field doc at :701.
+	note: Interpreted as the output/unembedding matrix; both untied output.weight and weight-tied embedding cases are handled.
+WIRED	partial RoPE
+	rope_partial kernel takes rotary_dim independent of head_dim, rotating only the first rotary_dim lanes (gpu-core/src/kernels/f64_infer.hip:88-104). llm.rs::layer passes d.rotary as rotary_dim distinct from hd (recipe-infer/src/llm.rs:1493-1494); rotary field set per-layer (llm.rs:303,424-428), e.g. 128 vs key_length. That layer fn is reachable via the diffusion/gemma forward (llm.rs:2015).
+	note: Capability present and routed in the llm.rs layer path; the general common.rs path passes rotary_dim=hd (full).
+WIRED	post-attention norm
+	post_attn norm after o_proj, gated by sp.post_attn: common.rs:158-160 `if sp.post_attn { gpu_rmsnorm_f64(&ar.o, norm_of(m,l,"post_attn")?, ...) }`; set by Spec::sandwich() (common.rs:75-79) for gemma2/olmo2/cohere2/glm4/... (mod.rs:26,40,42,58,63,...); gemma4 engine llm.rs:1504.
+	note: Active only for sandwich/post-norm arches; the flag is honored (unlike sp.norm).
+WIRED	post-block norm
+	recipe-infer/src/models/common.rs:158-160 `if sp.post_attn { gpu_rmsnorm_f64(&ar.o, norm_of(m,l,"post_attn")...) }` (post-attention, before residual add at :161) and common.rs:184-186 `if sp.post_ffn { gpu_rmsnorm_f64(&ar.mlp0, norm_of(m,l,"pfw")...) }`.
+	note: Gated by Spec.post_attn/post_ffn (set by .sandwich()); olmo2/gemma2/cohere2/command-r/glm4/etc. route here.
+WIRED	post-FFN norm
+	post_ffn norm after the FFN, gated by sp.post_ffn: common.rs:184-186 `if sp.post_ffn { gpu_rmsnorm_f64(&ar.mlp0, norm_of(m,l,"pfw")?, ...) }` (set by Spec::sandwich, common.rs:75-79); gemma4 engine applies post_feedforward_layernorm variants at llm.rs:1535(pf1),1601(pf2),1605(pfw).
+	note: pfw = post_feedforward_layernorm.weight (llm.rs:719); active for sandwich arches and the gemma4 dual-FFN engine.
+WIRED	pre-attention norm
+	Input norm applied before Q/K/V projection: common.rs:120 `gpu_rmsnorm_f64(h_in, norm_of(m,l,"input")?, ...&ar.x)` inside attn_block; gemma4 engine llm.rs:1467; recurrent llm/common.rs:332. `input` maps to input_layernorm.weight (llm.rs:711).
+	note: Reachable for every dense/moe/recurrent arch on the dispatch path.
+WIRED	pre-block norm
+	recipe-infer/src/models/common.rs:120 attn_block opens with gpu_rmsnorm_f64(h_in, norm_of(m,l,"input")...) before Q/K/V; reachable from models/mod.rs:182 dispatch -> layer_spec/layer_moe. Also the gemma imperative path llm.rs:1467 and recurrent llm layer_recurrent common.rs:332.
+	note: Pre-attention input_layernorm/attn_norm; always applied via gpu_rmsnorm_f64 for every dense/moe/recurrent arch in the table.
+WIRED	pre-channel-mix norm
+	recipe-infer/src/models/common.rs:368 layer_recurrent applies gpu_rmsnorm_f64(&ar.attn_out, norm_of(m,l,"pre_ff")...) before the FFN; reachable via mod.rs:201 dispatch Comp::Recurrent for rwkv6/rwkv7/mamba/etc.
+	note: This is the generic pre-FFN rmsnorm in the shared recurrent driver, not a true RWKV channel-mix (the FFN is a standard SwiGLU, no token-shift channel-mix operator exists).
+WIRED	pre-FFN norm
+	pre_ff norm before the FFN/MoE: common.rs:182 (dense) and common.rs:258 (moe) `gpu_rmsnorm_f64(&ar.attn_out, norm_of(m,l,"pre_ff")?, ...&ar.cms)`; recurrent common.rs:368; gemma4 engine llm.rs:1509. `pre_ff` maps to pre_feedforward_layernorm.weight (llm.rs:715).
+	note: Applied on every FFN/MoE block of the dispatch path.
+WIRED	pre-mixer norm
+	Recurrent (SSM/linear-attn) block applies input norm before the sequence mixer: common.rs:332 `gpu_rmsnorm_f64(h_in, norm_of(m,l,"input")?, ...&ar.x)` in layer_recurrent, before the q/k/v projections and gpu_scan_linear_recurrence (common.rs:333-358). Reached for mamba/rwkv/jamba/lfm2/qwen3next/... (mod.rs:29,61,88,91,100,...).
+	note: 'mixer' = the token/sequence mixer of the recurrent families; its pre-norm is the input norm.
+WIRED	pre-SSM norm
+	recipe-infer/src/models/common.rs:332 input rmsnorm precedes gpu_scan_linear_recurrence (common.rs:358, launcher gpu-core/src/reductions.rs:769) in layer_recurrent; mamba/mamba2/jamba/falcon-h1/nemotron_h route here via mod.rs:201.
+	note: Norm position is wired, but the 'SSM' is a generic linear-recurrence scan, not a selective Mamba SSM (no A/B/C/dt selective state); one pre-mixer norm, no separate SSM-internal norm.
+WIRED	pre-time-mix norm
+	recipe-infer/src/models/common.rs:332 layer_recurrent applies gpu_rmsnorm_f64(h_in, norm_of(m,l,"input")...) before the sequence mixer (Q/K/V + scan at :333-358).
+	note: Generic pre-mixer rmsnorm; the mixer is gpu_scan_linear_recurrence, a diagonal-decay linear recurrence stand-in, not the true RWKV time-mix (WKV/token-shift). Driver doc-comment itself calls the decay parameterization unrefined.
+WIRED	projection bias
+	NN-builder attn path applies bias: recipe-infer/src/forward.rs:465-467,481 pass &p.b to gpu_linear_into for Q/K/V and O; LayerParams.b/wk/wv/wo at params.rs:35-45. This path is reachable via forward_into (forward.rs:322-325).
+	note: LLM composition path does NOT apply bias: Spec.attn_bias is set on ~20 archs via .bias() (models/mod.rs) but discarded at common.rs:163 (let _ = sp.attn_bias), and no attn bias tensor is loaded (rg 'bias' in llm.rs is empty). gemm_bt_f64 has no bias operand. So bias is wired only for the NN attn layer, declared-but-unwired for GGUF LLMs.
+WIRED	Q normalization
+	recipe-infer/src/models/common.rs:140 gpu_rmsnorm_f64(&ar.q, norm_of(m,l,"q_norm"), &m.eps, t*nqh, hd, &ar.q) under sp.qk_norm.
+WIRED	QK normalization
+	Spec.qk_norm gate (common.rs:139) applies per-head RMSNorm to both Q and K (common.rs:140-141) using q_norm/k_norm weights; loaded via llm.rs:713-714,972-973 and used again at llm.rs:1490-1491. Enabled on ~25 archs (.qk() in models/mod.rs, e.g. qwen3:135, gemma3:64).
+WIRED	QKV projection
+	Separate Q/K/V GEMMs in common.rs:121-138. Fused attn_qkv.weight is transparently sliced into q/k/v: SLICE_MAP llm.rs:1011-1013 (Slice::QkvQ/K/V) and synth_qkv_slices llm.rs:1105-1136 split at [qd|kd|kd].
+WIRED	quantized weights
+	recipe-infer/src/dequant.rs:2-17 block_layout + :60-137 deqblock dequantize F16/Q8_0/Q5_1/Q4_K/Q6_K blocks; load path recipe-infer/src/llm.rs:744-753 (read_bytes dequants non-BF16 tensors to bf16) and :791-800 (small_f64). nbytes_for at gguf.rs:153.
+	note: Any non-BF16 GGUF tensor is dequantized at load then uploaded; widened to f64 on device.
+WIRED	query projection
+	recipe-infer/src/models/common.rs:121-128 gpu_gemm_bt_f64(&ar.x, self_attn.q_proj.weight, t, qd, ne, &ar.q). NN path forward.rs:465 gpu_linear_into(h,&p.w,...,&sc.a_q).
+WIRED	recurrent blocks
+	Comp::Recurrent -> layer_recurrent (recipe-infer/src/models/mod.rs:201; driver models/common.rs:317-372) using gpu_scan_linear_recurrence (gpu-core/src/reductions.rs:769) as the sequence mixer.
+	note: Composed as a generic gated linear/diagonal-decay recurrence; the driver doc (common.rs:315-316) states per-family decay parameterization (Mamba/RWKV/delta-net specifics) is not yet specialized -- structural composition only.
+WIRED	recurrent state
+	scan_linear_recurrence_kernel carries h step-to-step: scan.hip:316-320 (double h=0; h=a[idx]*h+b[idx]; states[idx]=h), output into ar.attn via common.rs:358.
+	note: Scalar hidden state per channel; genuinely carried across timesteps.
+WIRED	ReLU-squared FFN
+	recipe-infer/src/models/common.rs:36-37 Ffn::ReluSqrSeq; ffn() 225-227 gpu_relu_into(up) then gpu_mul_inplace(g,g) squares it. Archs arcee/nemotron/jais2/plm map here (mod.rs:27,87,111,130).
+WIRED	reordered norm path
+	recipe-infer/src/models/common.rs:75-79 Spec::sandwich() sets post_attn+post_ffn; applied common.rs:158-160 (post-attn norm on ar.o) and common.rs:184-186 (post-ffn norm on ar.mlp0); reachable via dispatch (mod.rs:198-199) for olmo2/gemma2/3/4/cohere2/command-r/apertus etc.
+	note: Implemented as sandwich post-sublayer norm placement (pre-norm kept + extra post-norm). It is the one norm-reordering knob wired; a pure post-norm-only reordering (no input norm) is not distinctly modeled.
+WIRED	residual connections
+	gpu_add_into skip-adds: common.rs:161 attn residual (ar.o + h_in), common.rs:187 FFN residual (ar.mlp0 + ar.attn_out); MoE common.rs:306; recurrent common.rs:367,370; gemma imperative llm.rs:1505,1604,1606.
+	note: Standard post-norm residual adds on every sublayer of every driver.
+WIRED	residual scaling
+	recipe-infer/src/llm.rs:1607 gpu_scale_f64_inplace(&m.ls_dev[l], t*ne, h_out) scales the block output/residual stream by the per-layer layer_output_scale (mapped llm.rs:994 layer_output_scale.weight->layer_scalar, loaded into ls_dev).
+	note: Wired only in the gemma4 imperative decode layer (llm.rs:1442-1609); the generic table driver (common.rs) applies no residual scaling.
+WIRED	RMSNorm
+	gpu_rmsnorm_f64 (infer_ops.rs:127-148) binds launch_normx_rmsnorm -> normx_rmsnorm_kernel (normx.hip:116-140, `r[j]*inv*gamma[j]`), called throughout both decode paths (common.rs:120,140,141,159,182,185,258,332,368; llm.rs:1467,1490,1491,1504,1509,...).
+	note: Primary and default norm; also a no-gamma variant gpu_rmsnorm_f64_nogamma (infer_ops.rs:153).
+WIRED	RoPE
+	gpu_rope_partial applied to Q and K in the shared attn_block (recipe-infer/src/models/common.rs:143-146), reachable from models::dispatch (models/mod.rs:182-204). Kernel rope_partial (gpu-core/src/kernels/f64_infer.hip:88-114) via wrapper gpu_rope_partial (gpu-core/src/infer_ops.rs:85-106). Also the training attn layer uses gpu_rope_qk_heads_inplace (recipe-infer/src/forward.rs:468, gpu-core/src/rope.rs:37, kernel ropex.hip:36-70).
+	note: Standard rotate-half NeoX-style RoPE with single theta scalar.
+WIRED	routed expert MLP
+	recipe-infer/src/models/common.rs:282-304 loops e2p routed experts, each a SwiGLU (gu gemm 290 / gpu_glu_silu 291 / dn gemm 293), combined by routing weight w at 299-303; gemma4 variant llm.rs:1572-1598 with gpu_glu_gelu.
+WIRED	routed experts
+	recipe-infer/src/models/common.rs:275-304 iterates the routed experts selected in e2p, computing each expert MLP and accumulating weighted by normalized routing prob (299-303).
+WIRED	RWKV
+	rwkv6/rwkv7/arwkv7/rwkv6qwen2 map to Comp::Recurrent (models/mod.rs:144-146,29) -> layer_recurrent (common.rs:317-372).
+	note: Runs the shared linear recurrence; no WKV time-mixing, token-shift, or per-channel decay/bonus. Not the real RWKV mechanism.
+WIRED	sandwich norm
+	recipe-infer/src/models/common.rs:75-79 Spec::sandwich() sets post_attn=true+post_ffn=true; combined with the pre-norms this brackets attn (pre common.rs:120 / post :158) and FFN (pre :182 / post :184). Table entries e.g. mod.rs:63 gemma2, :118 olmo2, :26 apertus, :42 command-r.
+	note: Full pre+post bracketing on both sublayers. The gemma4 imperative path (llm.rs:1467-1606) additionally does a dual pf1/pn2/pf2/pfw sandwich.
+WIRED	self-attention
+	Q/K/V all projected from the same normed hidden state ar.x via self_attn.{q,k,v}_proj.weight (common.rs:121-138) then gpu_gqa_attn (common.rs:149); identical in gemma path (llm.rs:1468-1495).
+WIRED	sequential residual path
+	recipe-infer/src/models/common.rs:170-189 layer_spec: attn_block (residual add :161) then FFN then gpu_add_into(&ar.mlp0, &ar.attn_out, h_out) :187 — two ordered sublayers each with its own pre-norm and residual.
+	note: The default/only block topology for all dense and MoE archs; recurrent driver (common.rs:317) is likewise sequential.
+WIRED	shared-KV attention
+	KV heads are shared across query heads inside gqa_masked_attn via kv=h/g2 indexing of the k/v rows (gpu-core/src/kernels/f64_infer.hip:42-44,52,74) — the single mechanism covering MHA/GQA/MQA. This is within-attention head-group KV sharing.
+WIRED	SSM
+	Recurrent archs dispatch to layer_recurrent (models/mod.rs:201) which composes gpu_scan_linear_recurrence (recipe-infer/src/models/common.rs:317-372, call at 358). Kernel scan_linear_recurrence is a plain diagonal first-order recurrence h = a*h + b (gpu-core/src/kernels/scan.hip:311-322; wrapper reductions.rs:769-786), with a=silu(K), b=V.
+	note: Generic gated linear recurrence stands in for ALL SSM/recurrent families; no state-space discretization (A/B/C, dt), no ssm_conv, no D skip. Degenerate placeholder, not a faithful SSM.
+WIRED	SSM projection
+	Input and output projections around the recurrence are real GEMMs: gpu_gemm_bt_f64 for q/k/v (common.rs:333-356) and o_proj (common.rs:359-366).
+	note: Reuses attention-named weights (self_attn.q/k/v/o_proj); no dedicated ssm_in/ssm_out/x_proj tensors are mapped in LAYER_MAP (llm.rs:969-995).
+WIRED	SSM scan
+	gpu_scan_linear_recurrence at common.rs:358 (kernel scan.hip:311). This is the scan on the recurrent dispatch path.
+	note: First-order diagonal recurrence (a=silu(k) fixed gate); not a selective/associative scan with input-dependent A/B/C and no chunked state passing.
+WIRED	SSM state
+	The diagonal decay scan (scan.hip:311-322) provides the reduced state the doc calls out in common.rs:313 ('the diagonal decay scan the SSM/WKV/delta families reduce to at decode'), wired at common.rs:358.
+	note: Only the diagonal, scalar-per-channel reduced state; no true (d_state x d_inner) selective state governed by input-dependent A/B/C.
+WIRED	SwiGLU
+	recipe-infer/src/models/common.rs:30-31 Ffn::SiluGate; ffn() 198-208 gpu_silu_into(gate)+gpu_mul_inplace(up); fused kernel gpu_glu_silu infer_ops.rs:254 -> f64_infer.hip:147 glu_silu, used in MoE experts common.rs:291.
+	note: Default FFN for llama/qwen/mistral and all MoE experts.
+WIRED	target feature norm
+	recipe-infer/src/forward.rs:200 zscore_fit_into and :222 zscore_apply_into (gpu_reduce_mean_cols/var + broadcast_sub/div) normalize input features on-device; target de-normalization via YScaler at forward.rs:558-577 (gpu_scale_inplace + add ymean on the last-layer output).
+	note: This is the tabular NN feature/target z-score path, on-device per the normalize-in-place invariant.
+WIRED	token embeddings
+	recipe-infer/src/llm.rs:104-110 (host bf16 lookup into base[]), 1699-1705, 1942-1948; tensor mapped GLOBAL_MAP recipe-infer/src/llm.rs:955 token_embd.weight->embed_tokens.weight
+	note: Lookup is done host-side on the CPU (widen bf16 per token). The GPU embedding kernel embeddingx_lookup_kernel (gpu-core/src/kernels/embeddingx.hip:4, launcher :14) has NO Rust caller anywhere -> PRIMITIVE, unused by the infer path.
+WIRED	token prediction
+	lm_head logits -> argmax (generate_causal llm.rs:1716-1729) and -> top-k softmax sampling (diffusion generate llm.rs:2044-2089); tokenizer.decode streams the picked ids (llm.rs:1738).
+WIRED	top-k routing
+	recipe-infer/src/models/common.rs:271-273 idx sorted by prob desc then idx.truncate(used) selects top-`used` experts per token (used = expert_used_count, llm.rs:355); gemma4 same at llm.rs:1560-1562.
+	note: Top-k done host-side via sort+truncate; GPU sortx_topk (kernels.rs:4781) exists but is not on this path.
+WIRED	value projection
+	recipe-infer/src/models/common.rs:131-138 gpu_gemm_bt_f64(&ar.x, self_attn.v_proj.weight, t, kd, ne, &ar.v). NN path forward.rs:467 gpu_linear_into(h,&p.wv,...,&sc.a_v).
+WIRED	width scaling
+	scl=(ne as f64).sqrt() llm.rs:1890, applied to input embeddings llm.rs:1947 and soft-embeddings llm.rs:1967; router width scale inv_sqrt_ne llm.rs:1549 used at llm.rs:1553.
+	note: Only the hardcoded sqrt(n_embd) embedding scale in the diffusion path. Causal path deliberately omits it (comment llm.rs:100-102, 'do NOT scale input embeddings'). The generic KV-driven f_embedding_scale/f_residual_scale/f_attention_scale (llama.cpp) are never read from GGUF.
+WIRED	zero-centered norm
+	Gemma-style (1+w) zero-centered norm weights applied at load: upload_gamma (llm.rs:938-940 `x + 1.0`), auto-detected via `plus_one = mean.abs() < 0.5` (llm.rs:1188), applied to every per-layer norm (1208), decoder_norm (1235), and self-conditioning pre-norm (1237).
+	note: Folded into gamma at load, then consumed by the standard RMSNorm kernel; correct for gemma/gemma2/gemma3/gemma4.
