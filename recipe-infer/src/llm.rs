@@ -2890,7 +2890,6 @@ fn decode_cached(
 			forward_rows(m, &[*tk], attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
 		}
 	}
-	let ttft = decode_start.elapsed();
 	let mut out_ids: Vec<u32> = Vec::new();
 	let mut next = pick_greedy(&logits, vocab_size, lsc, softcap);
 	loop {
@@ -2914,8 +2913,7 @@ fn decode_cached(
 	let elapsed = decode_start.elapsed();
 	let body = tokenizer.decode(&out_ids, true).unwrap_or_default();
 	let out = format!(
-		"{body}\n\nTTFT {:.2}s, {} tokens, {:.2} tok/s",
-		ttft.as_secs_f64(),
+		"{body}\n\n{} tokens, {:.2} tok/s",
 		out_ids.len(),
 		out_ids.len() as f64 / elapsed.as_secs_f64().max(1e-9)
 	);

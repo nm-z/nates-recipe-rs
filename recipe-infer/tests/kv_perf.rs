@@ -112,16 +112,18 @@ fn measure(model_key: &str, gen_tokens: usize, tag: &str) {
 		.session()
 		.expect("session cancelled");
 	let mut generated = 0usize;
+	let mut first: Option<f64> = None;
 	let wall = Instant::now();
 	let summary = session
 		.generate_in(&prompt, &mut |_toks: &[Tok]| {
+			let _stamp = first.get_or_insert_with(|| return wall.elapsed().as_secs_f64());
 			generated += 1;
 			return generated < gen_tokens;
 		})
 		.expect("generate_in returned Err");
 	let elapsed = wall.elapsed().as_secs_f64();
 	let last = summary.lines().last().unwrap_or_default();
-	eprintln!("{tag}: {last}");
+	eprintln!("{tag}: TTFT {:.2}s, {last}", first.unwrap_or(f64::NAN));
 	eprintln!(
 		"{tag}: {generated} tokens in {elapsed:.2}s wall, {:.2} tok/s (harness)",
 		generated as f64 / elapsed.max(1e-9)

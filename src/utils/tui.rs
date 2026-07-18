@@ -475,7 +475,9 @@ fn render_chat(
 		.add_modifier(Modifier::BOLD);
 	let mut lines: Vec<Line> = Vec::new();
 	for (p, r) in scrollback {
-		lines.push(Line::from(Span::styled(format!("> {p}"), head)));
+		if !p.is_empty() {
+			lines.push(Line::from(Span::styled(format!("> {p}"), head)));
+		}
 		for seg in r.split('\n') {
 			lines.push(Line::from(seg.to_string()));
 		}
@@ -826,13 +828,20 @@ fn run_message(
 	prompt: &str,
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
-) -> Option<std::result::Result<String, String>> {
+	sent: std::time::Instant,
+) -> Option<(std::result::Result<String, String>, Option<f64>)> {
 	let mut latest: Vec<Tok> = Vec::new();
+	let mut ttft: Option<f64> = None;
 	loop {
 		loop {
 			match ev_rx.try_recv() {
-				Ok(FromWorker::Snap(t)) => latest = t,
-				Ok(FromWorker::Reply(r)) => return Some(r),
+				Ok(FromWorker::Snap(t)) => {
+					if !t.is_empty() && ttft.is_none() {
+						ttft = Some(sent.elapsed().as_secs_f64());
+					}
+					latest = t;
+				}
+				Ok(FromWorker::Reply(r)) => return Some((r, ttft)),
 				Ok(_other) => {}
 				Err(std::sync::mpsc::TryRecvError::Empty) => break,
 				Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
@@ -862,7 +871,9 @@ pub fn chat(gguf: &str) {
 	let worker = std::thread::spawn(move || session_worker(&gguf_owned, prompt_rx, ev_tx, flag));
 
 	match wait_load(&mut term, &mut textarea, &scrollback, &ev_rx, &cancel) {
-		LoadOutcome::Loaded => {}
+		LoadOutcome::Loaded => {
+			scrollback.push((String::new(), format!("model: {gguf}")));
+		}
 		LoadOutcome::Cancelled => {
 			drop(prompt_tx);
 			let _joined = worker.join();
@@ -929,15 +940,20 @@ pub fn chat(gguf: &str) {
 						Ok(s) => (s, None),
 						Err(_e) => (prompt.clone(), Some("note: no chat template in gguf; multi-turn history disabled")),
 					};
+					let sent = std::time::Instant::now();
 					if prompt_tx.send(send).is_err() {
 						break;
 					}
-					match run_message(&mut term, &mut textarea, &scrollback, &prompt, &ev_rx, &cancel) {
-						Some(Ok(resp)) => {
+					match run_message(&mut term, &mut textarea, &scrollback, &prompt, &ev_rx, &cancel, sent) {
+						Some((Ok(resp), ttft)) => {
+							let resp = match ttft {
+								Some(t) => format!("{resp}, TTFT {t:.2}s"),
+								None => resp,
+							};
 							let shown = note.map(|n| format!("{n}\n{resp}")).unwrap_or(resp);
 							scrollback.push((prompt, shown));
 						}
-						Some(Err(e)) => scrollback.push((prompt, format!("error: {e}"))),
+						Some((Err(e), _ttft)) => scrollback.push((prompt, format!("error: {e}"))),
 						None => break,
 					}
 				}
