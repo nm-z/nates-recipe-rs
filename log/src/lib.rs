@@ -72,13 +72,37 @@ pub fn opt() -> Opt {
 	return *OPT.lock().unwrap_or_else(PoisonError::into_inner);
 }
 
-/// Appends `t` to this process's run log under `/tmp/recipe`, ignoring any I/O error.
+/// The run's log path: inherited from `RECIPE_LOG` when a parent already chose
+/// one (exec'd children and subprocesses land in the same file), otherwise
+/// minted once per process tree from the start timestamp and exported so every
+/// descendant inherits it. One run, one log, regardless of PIDs.
+fn log_path() -> &'static str {
+	static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+	return PATH.get_or_init(|| {
+		if let Ok(p) = std::env::var("RECIPE_LOG").map(Some).map(|o| o.filter(|p| !p.is_empty()))
+			&& let Some(p) = p
+		{
+			return p;
+		}
+		let secs = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let p = format!("/tmp/recipe/run-{secs}-{}.log", process::id());
+		// SAFETY: first log call happens before this process spawns threads that read the environment; the value is set exactly once.
+		unsafe {
+			std::env::set_var("RECIPE_LOG", &p);
+		}
+		return p;
+	});
+}
+
+/// Appends `t` to the run log (see [`log_path`]), ignoring any I/O error.
 fn log(t: &impl Display) {
 	if fs::create_dir_all("/tmp/recipe").is_err() {
 		return;
 	}
-	let path = format!("/tmp/recipe/run{:03x}.log", process::id() & 0xfff);
-	let Ok(mut f) = File::options().append(true).create(true).open(path) else {
+	let Ok(mut f) = File::options().append(true).create(true).open(log_path()) else {
 		return;
 	};
 	drop(writeln!(f, "{t}"));
