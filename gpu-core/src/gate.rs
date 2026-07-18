@@ -288,7 +288,7 @@ pub fn acquire() {
 		}
 		Err(e) => {
 			drop(Write::err(format!("gpu gate: {e}")));
-			process::abort();
+			return;
 		}
 	}
 }

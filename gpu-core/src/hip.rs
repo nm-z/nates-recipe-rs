@@ -12,7 +12,6 @@ use core::ptr;
 use core::time::Duration;
 use std::env;
 use std::fs;
-use std::process;
 use std::sync::Once;
 use std::thread;
 
@@ -73,9 +72,12 @@ pub fn cu_count() -> usize {
 				drop(Write::err(format!(
 					"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
 				)));
-				process::abort();
+				return 0;
 			}
-			let count = usize::try_from(n).unwrap_or_else(|_| process::abort());
+			let count = usize::try_from(n).unwrap_or_else(|_| {
+				drop(Write::err(format!("multiProcessorCount={n} does not fit in usize")));
+				return 0;
+			});
 			CU.store(count, Ordering::Relaxed);
 			return count;
 		},

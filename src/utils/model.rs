@@ -15,7 +15,6 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::mem;
 use std::path::Path;
-use std::process;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -379,7 +378,7 @@ impl Train {
 					.is_none()
 				{
 					drop(Write::err(format!("run: prepare data: {e:#}")));
-					process::abort();
+					return self;
 				}
 				drop(Write::err(
 					"skipped  scenario exceeds the VRAM+RAM+disk ceiling (size above)",
@@ -392,7 +391,7 @@ impl Train {
 			drop(Write::err(
 				"run: forward-only data — Train is fit-only; use recipe.infer().run(&model).eval(&data)",
 			));
-			process::abort();
+			return self;
 		}
 		let conns: Option<Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
@@ -514,7 +513,7 @@ impl Train {
 				let params = model.params.borrow();
 				if params.is_empty() {
 					drop(Write::err("save: model has no trained params"));
-					process::abort();
+					return;
 				}
 				let Ok(text) = recipe_infer::dump_ogdl(&params, filter, key, score) else {
 					return;
@@ -534,7 +533,7 @@ impl Train {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			process::abort();
+			return;
 		}
 		let full = fs::canonicalize(&path).unwrap_or_else(|_err| path.as_str().into());
 		Write::line(
@@ -608,7 +607,7 @@ impl Infer {
 					drop(Write::err(
 						"infer: VRAM_PROBE set — the binary's main must call recipe_infer::llm::vram_probe_ask() and exit with its code before run()",
 					));
-					process::abort();
+					return self;
 				}
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
@@ -658,7 +657,7 @@ impl Infer {
 			let last = self.last.borrow();
 			if last.model.is_null() {
 				drop(Write::err("infer: call run(&model) first"));
-				process::abort();
+				return self;
 			}
 			last.model
 		};
@@ -684,7 +683,7 @@ impl Infer {
 		let params = model.params.borrow();
 		if params.is_empty() {
 			drop(Write::err("eval: call train first"));
-			process::abort();
+			return self;
 		}
 		let k = params[params.len() - 1].out_dim;
 		let yscaler = *model.yscaler.borrow();
@@ -706,7 +705,7 @@ impl Infer {
 								.map(|e| format!("{e:#}"))
 								.unwrap_or_default()
 						)));
-						process::abort();
+						return self;
 					}
 					__ub
 				};
@@ -1164,7 +1163,7 @@ impl Model {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			process::abort();
+			return proto;
 		}
 		let params = plan.materialize(&staged, 0);
 		*inner.rebuild_backing.borrow_mut() = Some(staged);

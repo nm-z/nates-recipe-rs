@@ -7,7 +7,6 @@ use gpu_core::memory::GpuBuffer;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem;
-use std::process;
 use std::ptr;
 use std::sync::Mutex;
 
@@ -106,7 +105,7 @@ pub fn layer_ms_from(
 					"fwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
 				)));
-				process::abort();
+				return 0.0;
 			}
 			e.unwrap_or(0.0) as f64
 		})
@@ -119,7 +118,7 @@ pub fn layer_ms_from(
 					"bwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
 				)));
-				process::abort();
+				return 0.0;
 			}
 			e.unwrap_or(0.0) as f64
 		})
@@ -400,7 +399,7 @@ impl Scratch {
 					"record fwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
 				)));
-				process::abort();
+				return;
 			}
 		}
 	}
@@ -413,7 +412,7 @@ impl Scratch {
 					"record bwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
 				)));
-				process::abort();
+				return;
 			}
 		}
 	}
@@ -426,7 +425,10 @@ impl Scratch {
 				"sync bwd event: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			process::abort();
+			return LayerMs {
+				fwd: vec![0.0; layers],
+				bwd: vec![0.0; layers],
+			};
 		}
 		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
 	}
@@ -469,7 +471,7 @@ impl Scratch {
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			process::abort();
+			return unsafe { *self.pinned_scalar };
 		}
 		unsafe { *self.pinned_scalar }
 	}
@@ -486,7 +488,7 @@ impl Scratch {
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			process::abort();
+			return;
 		}
 	}
 
@@ -566,7 +568,7 @@ fn pinned_scalar_pair() -> *mut f64 {
 				"pinned scalars: {}",
 				hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
 			)));
-			process::abort();
+			return ptr::null_mut();
 		}
 		*g = hm.unwrap_or(ptr::null_mut()) as usize;
 	}
@@ -763,7 +765,7 @@ pub fn vram_estimate(
 						}
 						None => {
 							drop(Write::err("conv cin"));
-							process::abort();
+							return bytes;
 						}
 					}
 				} else {

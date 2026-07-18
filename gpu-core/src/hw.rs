@@ -9,7 +9,6 @@ use std::fs;
 use std::io::{Error, Read as _, Write as _};
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
-use std::process;
 use std::sync::Once;
 use std::thread;
 use std::time::Instant;
@@ -82,7 +81,7 @@ pub fn arm_saturation_crash() {
 			drop(Write::err(
 				"saturation watchdog: no gpu_busy_percent under /sys/class/drm",
 			));
-			process::abort();
+			return PathBuf::new();
 		};
 		let path = busy_path();
 		thread::spawn(move || {
@@ -97,13 +96,13 @@ pub fn arm_saturation_crash() {
 					let busy: u32 = fs::read_to_string(&path)
 						.unwrap_or_else(|e| {
 								drop(Write::err(format!("saturation watchdog: read {}: {e}", path.display())));
-								process::abort()
+								return String::new();
 							})
 						.trim()
 						.parse()
 						.unwrap_or_else(|e| {
 								drop(Write::err(format!("saturation watchdog: parse busy: {e}")));
-								process::abort()
+								return 0u32;
 							});
 					if busy >= 100 {
 						last_pinned = Instant::now();
@@ -114,7 +113,7 @@ pub fn arm_saturation_crash() {
 							"GPU NOT PINNED  no 100% gpu_busy_percent sample in {}s (latest {busy}%) during compute — aborting (saturation law)",
 							SAT_WINDOW.as_secs()
 						)));
-						process::abort();
+						return;
 					};
 				}
 				was_armed = armed;
@@ -238,7 +237,7 @@ pub fn spawn_thrash_watchdog() {
 								"gpu thrash  {}  — driver evicted our queues/mappings; aborting per fail-clean",
 								ev.trim()
 							)));
-							process::abort();
+							return;
 						}
 						GpuEvent::Restored => Write::line(
 							gpu,

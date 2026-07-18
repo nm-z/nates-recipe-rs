@@ -1,7 +1,6 @@
 use crate::log::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::process;
 use std::sync::Mutex;
 
 /// Declares each named counter as a private atomic tally cell initialised to zero.
@@ -383,7 +382,7 @@ fn index_of(c: &AtomicU64) -> usize {
 		.position(|x| return ptr::eq(*x, c))
 		.unwrap_or_else(|| {
 			drop(Write::err("callspy: counter not registered in ALL"));
-			process::abort()
+				return 0;
 		});
 }
 

@@ -572,7 +572,7 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 	}
 
 	let dir = tmp.to_str().context("temp dir path is not valid UTF-8")?;
-	let groups = load_groups(dir);
+	let groups = load_groups(dir)?;
 	drop(guard);
 	Ok(groups)
 }
@@ -612,7 +612,7 @@ fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 
 // ── file → columns: all source parsing (csv / arff / dir / zip / sqlite) ─────
 
-pub fn load_groups(path: &str) -> Vec<DirGroup> {
+pub fn load_groups(path: &str) -> Result<Vec<DirGroup>> {
 	let p = Path::new(path);
 	let ext = p
 		.extension()
@@ -620,37 +620,25 @@ pub fn load_groups(path: &str) -> Vec<DirGroup> {
 		.map(str::to_ascii_lowercase);
 	let ext_ref = ext.as_deref();
 	if ext_ref == Some("zip") {
-		return load_zip_groups(path).unwrap_or_else(|e| {
-			drop(Write::err(format!("load zip: {e}")));
-			process::abort();
-		});
+		return load_zip_groups(path).context("load zip");
 	}
 	if matches!(ext_ref, Some("db" | "sqlite")) {
-		return load_sqlite_groups(path).unwrap_or_else(|e| {
-			drop(Write::err(format!("load sqlite: {e}")));
-			process::abort();
-		});
+		return load_sqlite_groups(path).context("load sqlite");
 	}
 	if p.is_dir() {
-		return load_dir_groups(path).unwrap_or_else(|e| {
-			drop(Write::err(format!("load dir: {e}")));
-			process::abort();
-		});
+		return load_dir_groups(path).context("load dir");
 	}
 	let RawCsv {
 		headers,
 		rows: cells,
-	} = read_raw_csv(p).unwrap_or_else(|e| {
-		drop(Write::err(format!("read csv: {e}")));
-		process::abort();
-	});
+	} = read_raw_csv(p).context("read csv")?;
 	let hashes = vec![String::new(); cells.len()];
-	vec![DirGroup::Table {
+	return Ok(vec![DirGroup::Table {
 		name: String::new(),
 		headers,
 		hashes,
 		cells,
-	}]
+	}]);
 }
 
 pub fn split_fields(line: &str) -> Vec<String> {
@@ -693,26 +681,32 @@ struct NameSpec {
 fn parse_attribute(line: &str) -> Attr {
 	let rest = line["@attribute".len()..].trim();
 	let ns = match rest.strip_prefix('\'') {
-		Some(r) => {
-			let Some(end) = r.find('\'') else {
-				drop(Write::err("attribute: unterminated quoted name"));
-				process::abort();
-			};
-			NameSpec {
+		Some(r) => match r.find('\'') {
+			Some(end) => NameSpec {
 				name: r[..end].to_string(),
 				spec: r[end + 1..].trim().to_string(),
+			},
+			None => {
+				drop(Write::err("attribute: unterminated quoted name"));
+				NameSpec {
+					name: r.to_string(),
+					spec: String::new(),
+				}
 			}
-		}
-		None => {
-			let Some(end) = rest.find(char::is_whitespace) else {
-				drop(Write::err("attribute: missing type"));
-				process::abort();
-			};
-			NameSpec {
+		},
+		None => match rest.find(char::is_whitespace) {
+			Some(end) => NameSpec {
 				name: rest[..end].to_string(),
 				spec: rest[end..].trim().to_string(),
+			},
+			None => {
+				drop(Write::err("attribute: missing type"));
+				NameSpec {
+					name: rest.to_string(),
+					spec: String::new(),
+				}
 			}
-		}
+		},
 	};
 	let kind = match ns.spec.strip_prefix('{') {
 		Some(_body) => {
@@ -734,21 +728,27 @@ enum Section {
 }
 
 pub fn parse_arff(path: &str) -> ArffTable {
-	let text = fs::read_to_string(path).unwrap_or_else(|e| {
-		if e.kind() == io::ErrorKind::NotFound {
-			let cwd = env::current_dir()
-				.map(|p| p.display().to_string())
-				.unwrap_or_else(|_e| ".".to_string());
-			let name = Path::new(path)
-				.file_name()
-				.and_then(|s| s.to_str())
-				.unwrap_or(path);
-			drop(Write::err(format!("couldn't find '{name}' in {cwd}")));
-			process::abort();
+	let text = match fs::read_to_string(path) {
+		Ok(t) => t,
+		Err(e) => {
+			if e.kind() == io::ErrorKind::NotFound {
+				let cwd = env::current_dir()
+					.map(|p| p.display().to_string())
+					.unwrap_or_else(|_e| ".".to_string());
+				let name = Path::new(path)
+					.file_name()
+					.and_then(|s| s.to_str())
+					.unwrap_or(path);
+				drop(Write::err(format!("couldn't find '{name}' in {cwd}")));
+			} else {
+				drop(Write::err(format!("Data: cannot read {path}: {e}")));
+			}
+			return ArffTable {
+				attrs: Vec::new(),
+				rows: Vec::new(),
+			};
 		}
-		drop(Write::err(format!("Data: cannot read {path}: {e}")));
-		process::abort();
-	});
+	};
 	let mut attrs = Vec::new();
 	let mut rows = Vec::new();
 	let mut section = Section::Header;
@@ -779,13 +779,19 @@ pub fn parse_arff(path: &str) -> ArffTable {
 	}
 	if attrs.is_empty() {
 		drop(Write::err(format!("Data: no @attribute lines in {path}")));
-		process::abort();
+		return ArffTable {
+			attrs: Vec::new(),
+			rows: Vec::new(),
+		};
 	}
 	if rows.is_empty() {
 		drop(Write::err(format!("Data: no @data rows in {path}")));
-		process::abort();
+		return ArffTable {
+			attrs: Vec::new(),
+			rows: Vec::new(),
+		};
 	}
-	ArffTable { attrs, rows }
+	return ArffTable { attrs, rows };
 }
 
 pub struct ArffTable {
@@ -887,27 +893,26 @@ pub fn load_labeled_image_dir(dir: &str, width: u32, height: u32) -> Result<Labe
 	let names: Vec<String> = subdirs
 		.iter()
 		.map(|p| {
-			let Some(fname) = p.file_name() else {
-				drop(Write::err("subdir path has no filename component"));
-				process::abort();
-			};
-			fname.to_string_lossy().into_owned()
+			let fname = p
+				.file_name()
+				.ok_or_else(|| Errored::new("subdir path has no filename component"))?;
+			return Ok(fname.to_string_lossy().into_owned());
 		})
-		.collect();
+		.collect::<Result<Vec<String>>>()?;
 	let non_float = names.iter().find(|n| n.parse::<f64>().is_err());
 
 	let label_map: Vec<f64> = match non_float {
 		None => names
 			.iter()
 			.map(|n| {
-				n.parse().unwrap_or_else(|e| {
-					drop(Write::err(format!(
+				return n.parse::<f64>().map_err(|e| {
+					Errored::new(format!(
 						"subdir name failed f64 parse after all_float check: {e}"
-					)));
-					process::abort();
-				})
+					))
+					.into()
+				});
 			})
-			.collect(),
+			.collect::<Result<Vec<f64>>>()?,
 		Some(_nf) => (0..names.len()).map(|i| i as f64).collect(),
 	};
 

@@ -7,7 +7,6 @@ use crate::memory::{self, GpuBuffer};
 use core::ffi::c_void;
 use core::ops::Div;
 use core::{cmp, mem, ptr};
-use std::process;
 
 /// Aborts the process if the most recent HIP kernel launch recorded an error.
 pub(crate) fn check_launch() {
@@ -19,7 +18,7 @@ pub(crate) fn check_launch() {
 		drop(Write::err(format!(
 			"HIP kernel launch failed with error code {err}"
 		)));
-		process::abort();
+		return;
 	}
 }
 
@@ -29,7 +28,7 @@ pub(crate) fn safe_i32(v: usize) -> i32 {
 		return n;
 	}
 	drop(Write::err(format!("size {v} overflows i32")));
-	process::abort();
+	return i32::MAX;
 }
 
 /// Range-checks `v` and casts it to the `i32` an FFI launcher signature expects.
@@ -1731,7 +1730,7 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 					drop(Write::err(format!(
 						"hipblasCreate failed with status {status}"
 					)));
-					process::abort();
+					return handle;
 				}
 				// SAFETY: handle is the live hipBLAS handle from hipblasCreate; a null stream selects the default stream.
 				let stream_status = unsafe { hipblasSetStream(handle, ptr::null_mut()) };
@@ -1739,7 +1738,7 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 					drop(Write::err(format!(
 						"hipblasSetStream failed with status {stream_status}"
 					)));
-					process::abort();
+					return handle;
 				}
 				h.store(handle, Ordering::Relaxed);
 				return handle;
@@ -1757,7 +1756,7 @@ pub fn gpu_blas_workspace(buf: &GpuBuffer) {
 		drop(Write::err(format!(
 			"hipblasSetWorkspace failed with status {status}"
 		)));
-		process::abort();
+		return;
 	}
 }
 
@@ -1774,7 +1773,7 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 					drop(Write::err(format!(
 						"hipsolverCreate failed with status {status}"
 					)));
-					process::abort();
+					return handle;
 				}
 				h.store(handle, Ordering::Relaxed);
 				return handle;
@@ -1941,7 +1940,7 @@ pub fn gpu_cholesky_solve_workspace_bytes(n: usize) -> usize {
 		return bytes * 8;
 	}
 	drop(Write::err(format!("workspace size {lwork} is negative")));
-	process::abort();
+	return 8;
 }
 
 /// # Errors
@@ -5982,7 +5981,7 @@ pub fn gpu_slice_rows(
 			"slice_rows: start({start}) + count({count}) = {} exceeds rows({total_rows})",
 			start + count
 		)));
-		process::abort();
+		return Err(HipError(1));
 	}
 	let start_i32 = ci(start)?;
 	let count_i32 = ci(count)?;

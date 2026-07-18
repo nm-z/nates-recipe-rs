@@ -3,7 +3,6 @@
 #![deny(clippy::match_wild_err_arm)]
 
 use std::fmt;
-use std::process;
 
 #[doc(hidden)]
 pub type Mat = ndarray::Array2<f64>;
@@ -93,25 +92,21 @@ pub fn infer() -> Infer {
 }
 
 pub(crate) fn ok_or_die<T, E: fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
-	if !r.is_ok() {
-		drop(gpu_core::log::Write::err(format!(
-			"{ctx}: {}",
-			r.as_ref()
-				.err()
-				.map(|e| format!("{e:#}"))
-				.unwrap_or_default()
-		)));
-		process::abort();
+	match r {
+		Ok(v) => return v,
+		Err(e) => {
+			drop(gpu_core::log::Write::err(format!("{ctx}: {e:#}")));
+			panic!("{ctx}");
+		}
 	}
-	let Ok(v) = r else { process::abort() };
-	v
 }
 
 pub(crate) fn some_or_die<T>(o: Option<T>, msg: &str) -> T {
-	if !o.is_some() {
-		drop(gpu_core::log::Write::err(msg));
-		process::abort();
+	match o {
+		Some(v) => return v,
+		None => {
+			drop(gpu_core::log::Write::err(msg));
+			panic!("{msg}");
+		}
 	}
-	let Some(v) = o else { process::abort() };
-	v
 }

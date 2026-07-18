@@ -99,12 +99,12 @@ fn whitespace_matrix_headerless_keeps_rows() {
 }
 
 #[test]
-fn dir_groups_found_recursively() {
+fn dir_groups_found_recursively() -> anyhow::Result<()> {
 	let d = concat!(
 		env!("CARGO_MANIFEST_DIR"),
 		"/../datasets/uci-har-sensor/UCI HAR Dataset"
 	);
-	let names: Vec<String> = load_groups(d)
+	let names: Vec<String> = load_groups(d)?
 		.iter()
 		.map(|g| match g {
 			DirGroup::Table { name, .. } | DirGroup::Image { name, .. } => {
@@ -120,6 +120,7 @@ fn dir_groups_found_recursively() {
 		names.iter().any(|n| return n == "X_test"),
 		"X_test group from test/ subdir: {names:?}"
 	);
+	return Ok(());
 }
 
 #[test]
@@ -191,5 +192,19 @@ fn nested_zip_extracts_inner_tables() {
 			vec!["1".to_owned(), "2".to_owned()],
 			vec!["3".to_owned(), "4".to_owned()]
 		]
+	);
+}
+
+/// A `load_groups` call on an unreadable source path used to `process::abort()`
+/// inside its loader closures; it now returns `Err` up the parse graph. Reaching
+/// the assertion at all proves the old self-kill is gone: a path whose parent
+/// directory does not exist can neither be opened nor created, so `read_raw_csv`
+/// rejects it and the failure surfaces as `Err`, not SIGABRT.
+#[test]
+fn load_groups_missing_source_errs_not_aborts() {
+	let got = load_groups("/nonexistent-recipe-dir-9f2a/nope.csv");
+	assert!(
+		got.is_err(),
+		"load_groups on an unreadable path must surface as Err, not abort"
 	);
 }

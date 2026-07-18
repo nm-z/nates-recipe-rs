@@ -85,7 +85,7 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 				cols: kinds_for(&pref.headers, &non_empty)?,
 			}])
 		}
-		None => crate::data::load_groups(path)
+		None => crate::data::load_groups(path)?
 			.iter()
 			.filter_map(|g| match g {
 				crate::data::DirGroup::Table {

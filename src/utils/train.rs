@@ -11,7 +11,6 @@ use recipe_infer::{
 use std::ffi::c_void;
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -1013,14 +1012,14 @@ impl ModelInner {
 					"eval: feature count changed: {} vs {cols}",
 					sc.mean.len()
 				)));
-				process::abort();
+				panic!("eval: feature count changed");
 			}
 			if sc.std.len() != cols {
 				drop(Write::err(format!(
 					"eval: feature count changed: {} vs {cols}",
 					sc.std.len()
 				)));
-				process::abort();
+				panic!("eval: feature count changed");
 			}
 			let mut st = Stage::new();
 			let m_off = st.push(&sc.mean);

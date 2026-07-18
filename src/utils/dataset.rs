@@ -10,7 +10,6 @@ use std::fs;
 use std::mem;
 use std::ops::Deref;
 use std::path::Path;
-use std::process;
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
@@ -303,7 +302,7 @@ impl Data {
 			drop(Write::err(format!(
 				"split fraction must be in (0, 1), got {train_frac}"
 			)));
-			process::abort();
+			return self;
 		}
 		self.inner.split_frac = Some(train_frac);
 		self

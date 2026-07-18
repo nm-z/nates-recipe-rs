@@ -222,7 +222,7 @@ impl Paged {
 	fn win(&self, s0: usize, cnt: usize) -> usize {
 		if !(s0.is_multiple_of(self.chunk) && cnt <= self.chunk) {
 			drop(Write::err("ooc access not window-aligned"));
-			process::abort();
+			panic!("ooc access not window-aligned");
 		}
 		s0 / self.chunk
 	}
@@ -2530,7 +2530,7 @@ impl Drop for Ooc {
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
 			)));
-			process::abort();
+			return;
 		}
 		let Some(net) = self.net.clone() else {
 			return;

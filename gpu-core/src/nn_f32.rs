@@ -6,7 +6,6 @@ use crate::log::Write;
 use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
-use std::process;
 
 /// hipBLAS operation code selecting a non-transposed matrix.
 const HIPBLAS_OP_N: u32 = 111;
@@ -197,7 +196,7 @@ fn safe_i32(v: usize) -> i32 {
 		return n;
 	}
 	drop(Write::err(format!("size {v} overflows i32")));
-	process::abort();
+	return i32::MAX;
 }
 
 /// # Errors

@@ -35,7 +35,7 @@ fn main() -> Result<()> {
 			Write::line(data, "");
 			Write::line(data, format!("# {path}"));
 		}
-		for group in pantry::data::load_groups(path) {
+		for group in pantry::data::load_groups(path)? {
 			let pantry::data::DirGroup::Table {
 				name,
 				headers,

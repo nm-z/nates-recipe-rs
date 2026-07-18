@@ -1002,7 +1002,7 @@ pub fn shuffle_split(
 		Dataset {
 			x: Mat::from_shape_vec((sel.len(), cols), xd).unwrap_or_else(|e| {
 				drop(Write::err(format!("split: x reshape: {e}")));
-				process::abort();
+				return Mat::zeros((sel.len(), cols));
 			}),
 			y: Vec1::from(yd),
 			source: source.to_string(),
@@ -1081,9 +1081,8 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 				drop(Write::err(format!(
 					"NaN/inf in '{name}' — no missing values allowed here"
 				)));
-				process::abort();
 			}
-			(0..v.len()).collect()
+			return (0..v.len()).collect();
 		}
 		Nan::Drop => (0..v.len()).filter(|&i| v[i].is_finite()).collect(),
 	}
@@ -1229,11 +1228,17 @@ pub fn prepare_table_data(
 ) -> anyhow::Result<PreparedTable> {
 	let set_groups: Vec<DirGroup> = sources
 		.iter()
-		.flat_map(|s| crate::data::load_groups(s))
+		.map(|s| crate::data::load_groups(s))
+		.collect::<anyhow::Result<Vec<Vec<DirGroup>>>>()?
+		.into_iter()
+		.flatten()
 		.collect();
 	let set_tnames = table_names(&set_groups);
 
-	let test_groups = test_path.map(|tp| (crate::data::load_groups(tp), tp.to_string()));
+	let test_groups = match test_path {
+		Some(tp) => Some((crate::data::load_groups(tp)?, tp.to_string())),
+		None => None,
+	};
 	let test_tnames: Option<Vec<String>> = match (&test_groups, split_frac) {
 		(Some((g, _)), _) => Some(table_names(g)),
 		(None, Some(_)) => Some(set_tnames.clone()),
