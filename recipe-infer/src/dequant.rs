@@ -104,24 +104,21 @@ pub fn convert(src: DType, dst: DType, bytes: &[u8]) -> Result<Vec<u8>> {
       return Ok(out);
 }
 
-/// Block layout `(block_bytes, block_elems)` for a GGML type; aborts on an
-/// unsupported tag, matching the loader's fail-loud contract.
-pub fn block_layout(t: u32) -> (usize, usize) {
-      match DType::from_ggml(t) {
-            Ok(d) => {
-                  let c = d.codec();
-                  (c.block_bytes(), c.block_elems())
-            }
-            Err(e) => {
-                  drop(gpu_core::log::Write::err(format!("{e}")));
-                  std::process::abort()
-            }
-      }
+/// Block layout `(block_bytes, block_elems)` for a GGML type.
+///
+/// # Errors
+/// Returns an error naming the unsupported GGML type tag.
+pub fn block_layout(t: u32) -> Result<(usize, usize)> {
+      let d = DType::from_ggml(t)?;
+      let c = d.codec();
+      return Ok((c.block_bytes(), c.block_elems()));
 }
 
-pub fn nbytes_for(t: u32, elems: usize) -> usize {
-      let (block_bytes, block_elems) = block_layout(t);
-      return (elems / block_elems) * block_bytes;
+/// # Errors
+/// Returns an error naming the unsupported GGML type tag.
+pub fn nbytes_for(t: u32, elems: usize) -> Result<usize> {
+      let (block_bytes, block_elems) = block_layout(t)?;
+      return Ok((elems / block_elems) * block_bytes);
 }
 
 /// Decode `bytes` of GGML type `t` to f32 values via the one conversion surface.

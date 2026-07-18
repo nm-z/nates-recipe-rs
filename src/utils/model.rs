@@ -443,7 +443,9 @@ impl Train {
 							.map(|e| format!("{e:#}"))
 							.unwrap_or_default()
 					)));
-					process::abort();
+					model.fit_score.set(f64::NAN);
+					let nan_vals: Vec<f64> = vec![f64::NAN; self.metrics.len()];
+					Write::always(crate::train::metrics_line(&self.metrics, &nan_vals));
 				}
 				let post_fit = run_hip.map(|_snap| gpu_core::callspy::snapshot());
 				Some(())

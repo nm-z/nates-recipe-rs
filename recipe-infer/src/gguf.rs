@@ -150,7 +150,7 @@ impl Gguf {
 		let mut tensors = HashMap::new();
 		for (name, dims, gt, off) in raw {
 			let elems: usize = dims.iter().product();
-			let nbytes = crate::dequant::nbytes_for(gt, elems);
+			let nbytes = crate::dequant::nbytes_for(gt, elems)?;
 			tensors.insert(
 				name,
 				TensorInfo {

@@ -765,7 +765,6 @@ fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 		drop(Write::err(format!(
 			"bview: unaligned {off_bytes}/{len_bytes}"
 		)));
-		process::abort();
 	}
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
@@ -810,9 +809,9 @@ fn arm_watchdog() -> Watchdog {
 			let b = BEAT.load(Ordering::Relaxed);
 			if b == last {
 				drop(Write::err(
-					"LOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Aborting.",
+					"LOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Press Ctrl-C to stop.",
 				));
-				process::abort();
+				return;
 			}
 			last = b;
 		}
@@ -924,7 +923,10 @@ impl Arena {
 		let ne = hp.ne;
 		let nff = hp.nff;
 		let nffe = hp.nffe;
-		let a = GpuBuffer::alloc;
+		let a = |n: usize| -> Result<GpuBuffer> {
+			return GpuBuffer::alloc(n)
+				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * 8)));
+		};
 		Ok(Arena {
 			x: a(t * ne)?,
 			q: a(t * hp.qd_max)?,
@@ -1096,7 +1098,7 @@ const LAYER_NORMS: [(&str, &str); 12] = [
 
 impl Model {
 	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
-		let (bb, be) = crate::dequant::block_layout(t.gt);
+		let (bb, be) = crate::dequant::block_layout(t.gt)?;
 		anyhow::ensure!(
 			off.is_multiple_of(2) && len.is_multiple_of(2) && (off / 2).is_multiple_of(be),
 			"qrange: read {off}+{len} not block-aligned (be={be})"

@@ -119,13 +119,10 @@ pub struct Errored(pub String);
 impl Errored {
 	#[inline]
 	pub fn new(t: impl Display) -> Self {
-		if Err::log {
-			log(&t);
-		}
-		if Err::print {
-			print(&t);
-		}
-		return Self(t.to_string());
+		let msg = format!("ERROR: {t}");
+		log(&msg);
+		print(&msg);
+		return Self(msg);
 	}
 }
 
