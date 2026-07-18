@@ -21,7 +21,7 @@ tokenizers = "0.21"
 ndarray = "0.16"
 ogdl = { path = "../ogdl" }
 minijinja = "2"
-hf-chat-template = { version = "0.2", features = ["pycompat"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [dev-dependencies]
 serde_json = "1"

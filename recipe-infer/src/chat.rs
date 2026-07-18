@@ -6,8 +6,7 @@
 
 use crate::gguf::{Gguf, Val};
 use anyhow::{Result, anyhow, bail};
-use hf_chat_template::ChatTemplate;
-use minijinja::{Value, context};
+use minijinja::{Environment, Value, context};
 use std::path::Path;
 
 /// One conversation turn. `role` is the HF convention (`system`/`user`/`assistant`);
@@ -27,10 +26,11 @@ impl Msg {
 }
 
 /// Render `msgs` through a Jinja chat template string via `hf-chat-template`,
-/// which layers HF `transformers` compatibility (the `raise_exception` callable
-/// many templates use to reject malformed histories, Python string methods, etc.)
-/// over minijinja. Provides `messages`, `add_generation_prompt`, `bos_token` and
-/// `eos_token` in the render context.
+/// with `minijinja-contrib`'s pycompat callback supplying the Python string
+/// methods (`.strip()`, `.split()`, …) HF templates lean on, plus the
+/// `raise_exception` callable many use to reject malformed histories. Provides
+/// `messages`, `add_generation_prompt`, `bos_token` and `eos_token` in the
+/// render context.
 pub fn render_template(
       tmpl: &str,
       msgs: &[Msg],
@@ -38,13 +38,28 @@ pub fn render_template(
       bos_token: &str,
       eos_token: &str,
 ) -> Result<String> {
-      let template = ChatTemplate::from_str(tmpl).map_err(|e| anyhow!("chat template parse: {e}"))?;
+      let mut env = Environment::new();
+      env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+      minijinja_contrib::add_to_environment(&mut env);
+      env.add_function(
+            "raise_exception",
+            |msg: String| -> std::result::Result<Value, minijinja::Error> {
+                  return Err(minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        msg,
+                  ));
+            },
+      );
+      env.add_template("chat", tmpl)
+            .map_err(|e| anyhow!("chat template parse: {e}"))?;
       let messages: Vec<Value> = msgs
             .iter()
             .map(|m| context! { role => m.role.as_str(), content => m.content.as_str() })
             .collect();
-      let rendered = template
-            .render_value(context! {
+      let rendered = env
+            .get_template("chat")
+            .map_err(|e| anyhow!("chat template get: {e}"))?
+            .render(context! {
                   messages => messages,
                   add_generation_prompt => add_generation_prompt,
                   bos_token => bos_token,
