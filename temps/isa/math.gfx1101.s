@@ -3697,166 +3697,6 @@ isfinite_all_kernel:                    ; @isfinite_all_kernel
 ; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
 ; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
 	.text
-	.protected	tall_skinny_dgemm_kernel ; -- Begin function tall_skinny_dgemm_kernel
-	.globl	tall_skinny_dgemm_kernel
-	.p2align	8
-	.type	tall_skinny_dgemm_kernel,@function
-tall_skinny_dgemm_kernel:               ; @tall_skinny_dgemm_kernel
-; %bb.0:
-	s_clause 0x1
-	s_load_b32 s3, s[0:1], 0x34
-	s_load_b128 s[4:7], s[0:1], 0x18
-	v_bfe_u32 v3, v0, 10, 10
-	v_and_b32_e32 v0, 0x3ff, v0
-	s_waitcnt lgkmcnt(0)
-	s_lshr_b32 s3, s3, 16
-	s_delay_alu instid0(VALU_DEP_2) | instid1(SALU_CYCLE_1)
-	v_mad_u64_u32 v[1:2], null, s2, s3, v[3:4]
-	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_2)
-	v_cmp_gt_i32_e64 s2, s5, v0
-	v_cmp_gt_i32_e32 vcc_lo, s4, v1
-	s_and_b32 s2, s2, vcc_lo
-	s_delay_alu instid0(SALU_CYCLE_1)
-	s_and_saveexec_b32 s3, s2
-	s_cbranch_execz .LBB21_6
-; %bb.1:
-	s_load_b64 s[2:3], s[0:1], 0x10
-	s_cmp_lt_i32 s6, 1
-	s_cbranch_scc1 .LBB21_4
-; %bb.2:
-	s_load_b128 s[8:11], s[0:1], 0x0
-	v_mul_lo_u32 v4, v1, s6
-	v_lshlrev_b32_e32 v8, 3, v0
-	v_mov_b32_e32 v2, 0
-	v_mov_b32_e32 v3, 0
-	s_ashr_i32 s1, s5, 31
-	s_delay_alu instid0(VALU_DEP_4) | instskip(NEXT) | instid1(VALU_DEP_1)
-	v_ashrrev_i32_e32 v5, 31, v4
-	v_lshlrev_b64 v[6:7], 3, v[4:5]
-	s_waitcnt lgkmcnt(0)
-	v_add_co_u32 v4, s0, s10, v8
-	s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_4)
-	v_add_co_u32 v6, vcc_lo, s8, v6
-	v_add_co_ci_u32_e64 v5, null, s11, 0, s0
-	v_add_co_ci_u32_e64 v7, null, s9, v7, vcc_lo
-	s_mov_b32 s0, s5
-	s_delay_alu instid0(SALU_CYCLE_1)
-	s_lshl_b64 s[0:1], s[0:1], 3
-	.p2align	6
-.LBB21_3:                               ; =>This Inner Loop Header: Depth=1
-	global_load_b64 v[8:9], v[6:7], off
-	global_load_b64 v[10:11], v[4:5], off
-	v_add_co_u32 v4, vcc_lo, v4, s0
-	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
-	v_add_co_ci_u32_e64 v5, null, s1, v5, vcc_lo
-	v_add_co_u32 v6, vcc_lo, v6, 8
-	v_add_co_ci_u32_e64 v7, null, 0, v7, vcc_lo
-	s_add_i32 s6, s6, -1
-	s_delay_alu instid0(SALU_CYCLE_1)
-	s_cmp_eq_u32 s6, 0
-	s_waitcnt vmcnt(0)
-	v_fma_f64 v[2:3], v[8:9], v[10:11], v[2:3]
-	s_cbranch_scc0 .LBB21_3
-	s_branch .LBB21_5
-.LBB21_4:
-	v_mov_b32_e32 v2, 0
-	v_mov_b32_e32 v3, 0
-.LBB21_5:
-	v_mad_u64_u32 v[4:5], null, v1, s5, v[0:1]
-	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
-	v_ashrrev_i32_e32 v5, 31, v4
-	v_lshlrev_b64 v[0:1], 3, v[4:5]
-	s_waitcnt lgkmcnt(0)
-	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
-	v_add_co_u32 v0, vcc_lo, s2, v0
-	v_add_co_ci_u32_e64 v1, null, s3, v1, vcc_lo
-	global_load_b64 v[4:5], v[0:1], off
-	s_waitcnt vmcnt(0)
-	v_add_f64 v[2:3], v[2:3], v[4:5]
-	global_store_b64 v[0:1], v[2:3], off
-.LBB21_6:
-	s_endpgm
-	.section	.rodata,"a",@progbits
-	.p2align	6, 0x0
-	.amdhsa_kernel tall_skinny_dgemm_kernel
-		.amdhsa_group_segment_fixed_size 0
-		.amdhsa_private_segment_fixed_size 0
-		.amdhsa_kernarg_size 296
-		.amdhsa_user_sgpr_count 2
-		.amdhsa_user_sgpr_dispatch_ptr 0
-		.amdhsa_user_sgpr_queue_ptr 0
-		.amdhsa_user_sgpr_kernarg_segment_ptr 1
-		.amdhsa_user_sgpr_dispatch_id 0
-		.amdhsa_user_sgpr_private_segment_size 0
-		.amdhsa_wavefront_size32 1
-		.amdhsa_uses_dynamic_stack 0
-		.amdhsa_enable_private_segment 0
-		.amdhsa_system_sgpr_workgroup_id_x 1
-		.amdhsa_system_sgpr_workgroup_id_y 0
-		.amdhsa_system_sgpr_workgroup_id_z 0
-		.amdhsa_system_sgpr_workgroup_info 0
-		.amdhsa_system_vgpr_workitem_id 1
-		.amdhsa_next_free_vgpr 12
-		.amdhsa_next_free_sgpr 12
-		.amdhsa_reserve_vcc 1
-		.amdhsa_float_round_mode_32 0
-		.amdhsa_float_round_mode_16_64 0
-		.amdhsa_float_denorm_mode_32 3
-		.amdhsa_float_denorm_mode_16_64 3
-		.amdhsa_dx10_clamp 1
-		.amdhsa_ieee_mode 1
-		.amdhsa_fp16_overflow 0
-		.amdhsa_workgroup_processor_mode 1
-		.amdhsa_memory_ordered 1
-		.amdhsa_forward_progress 1
-		.amdhsa_shared_vgpr_count 0
-		.amdhsa_inst_pref_size 3
-		.amdhsa_exception_fp_ieee_invalid_op 0
-		.amdhsa_exception_fp_denorm_src 0
-		.amdhsa_exception_fp_ieee_div_zero 0
-		.amdhsa_exception_fp_ieee_overflow 0
-		.amdhsa_exception_fp_ieee_underflow 0
-		.amdhsa_exception_fp_ieee_inexact 0
-		.amdhsa_exception_int_div_zero 0
-	.end_amdhsa_kernel
-	.text
-.Lfunc_end21:
-	.size	tall_skinny_dgemm_kernel, .Lfunc_end21-tall_skinny_dgemm_kernel
-                                        ; -- End function
-	.set tall_skinny_dgemm_kernel.num_vgpr, 12
-	.set tall_skinny_dgemm_kernel.num_agpr, 0
-	.set tall_skinny_dgemm_kernel.numbered_sgpr, 12
-	.set tall_skinny_dgemm_kernel.num_named_barrier, 0
-	.set tall_skinny_dgemm_kernel.private_seg_size, 0
-	.set tall_skinny_dgemm_kernel.uses_vcc, 1
-	.set tall_skinny_dgemm_kernel.uses_flat_scratch, 0
-	.set tall_skinny_dgemm_kernel.has_dyn_sized_stack, 0
-	.set tall_skinny_dgemm_kernel.has_recursion, 0
-	.set tall_skinny_dgemm_kernel.has_indirect_call, 0
-	.section	.AMDGPU.csdata,"",@progbits
-; Kernel info:
-; codeLenInByte = 376
-; TotalNumSgprs: 14
-; NumVgprs: 12
-; ScratchSize: 0
-; MemoryBound: 0
-; FloatMode: 240
-; IeeeMode: 1
-; LDSByteSize: 0 bytes/workgroup (compile time only)
-; SGPRBlocks: 0
-; VGPRBlocks: 1
-; NumSGPRsForWavesPerEU: 14
-; NumVGPRsForWavesPerEU: 12
-; Occupancy: 16
-; WaveLimiterHint : 0
-; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
-; COMPUTE_PGM_RSRC2:USER_SGPR: 2
-; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
-; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
-; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
-; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
-; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 1
-	.text
 	.protected	_Z15splitk_dw_pass1PKdS0_Pdiiii ; -- Begin function _Z15splitk_dw_pass1PKdS0_Pdiiii
 	.globl	_Z15splitk_dw_pass1PKdS0_Pdiiii
 	.p2align	8
@@ -3956,13 +3796,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
                                         ; implicit-def: $sgpr12_sgpr13
 	s_and_b32 vcc_lo, exec_lo, s4
                                         ; implicit-def: $sgpr4
-	s_cbranch_vccnz .LBB22_2
+	s_cbranch_vccnz .LBB21_2
 ; %bb.1:
 	s_ashr_i32 s4, s6, 31
 	s_ashr_i32 s13, s5, 31
 	s_mov_b32 s12, s5
 	s_mov_b32 s9, 0
-.LBB22_2:
+.LBB21_2:
 	s_load_b64 s[14:15], s[0:1], 0x10
 	v_mov_b32_e32 v33, 0
 	v_mov_b32_e32 v31, 0
@@ -4000,7 +3840,7 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_lshl_b32 s20, s7, 6
 	s_and_not1_b32 vcc_lo, exec_lo, s9
 	s_lshl_b32 s7, s8, 6
-	s_cbranch_vccnz .LBB22_13
+	s_cbranch_vccnz .LBB21_13
 ; %bb.3:
 	s_clause 0x1
 	s_load_b32 s4, s[0:1], 0x34
@@ -4043,8 +3883,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_ashr_i32 s4, s6, 31
 	s_ashr_i32 s13, s5, 31
 	s_mov_b32 s12, s5
-	s_branch .LBB22_5
-.LBB22_4:                               ;   in Loop: Header=BB22_5 Depth=1
+	s_branch .LBB21_5
+.LBB21_4:                               ;   in Loop: Header=BB21_5 Depth=1
 	s_or_b32 exec_lo, exec_lo, s22
 	s_waitcnt lgkmcnt(0)
 	s_barrier
@@ -4422,16 +4262,16 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_fma_f64 v[5:6], v[51:52], v[43:44], v[59:60]
 	v_fma_f64 v[3:4], v[51:52], v[45:46], v[61:62]
 	v_fma_f64 v[1:2], v[51:52], v[47:48], v[63:64]
-	s_cbranch_vccnz .LBB22_13
-.LBB22_5:                               ; =>This Loop Header: Depth=1
-                                        ;     Child Loop BB22_7 Depth 2
-                                        ;     Child Loop BB22_11 Depth 2
+	s_cbranch_vccnz .LBB21_13
+.LBB21_5:                               ; =>This Loop Header: Depth=1
+                                        ;     Child Loop BB21_7 Depth 2
+                                        ;     Child Loop BB21_11 Depth 2
 	v_mov_b32_e32 v41, v0
 	s_sub_i32 s0, s18, s16
 	s_mov_b32 s22, 0
 	s_min_i32 s21, s0, 16
-	s_branch .LBB22_7
-.LBB22_6:                               ;   in Loop: Header=BB22_7 Depth=2
+	s_branch .LBB21_7
+.LBB21_6:                               ;   in Loop: Header=BB21_7 Depth=2
 	s_or_b32 exec_lo, exec_lo, s0
 	v_add_nc_u32_e32 v41, s1, v41
 	v_lshlrev_b32_e32 v29, 3, v43
@@ -4442,8 +4282,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_waitcnt vmcnt(0)
 	ds_store_b64 v29, v[35:36]
 	s_and_not1_b32 exec_lo, exec_lo, s22
-	s_cbranch_execz .LBB22_9
-.LBB22_7:                               ;   Parent Loop BB22_5 Depth=1
+	s_cbranch_execz .LBB21_9
+.LBB21_7:                               ;   Parent Loop BB21_5 Depth=1
                                         ; =>  This Inner Loop Header: Depth=2
 	v_and_b32_e32 v43, 63, v41
 	v_mov_b32_e32 v35, 0
@@ -4456,8 +4296,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_cmp_gt_i32_e64 s0, s6, v29
 	s_and_b32 s23, vcc_lo, s0
 	s_and_saveexec_b32 s0, s23
-	s_cbranch_execz .LBB22_6
-; %bb.8:                                ;   in Loop: Header=BB22_7 Depth=2
+	s_cbranch_execz .LBB21_6
+; %bb.8:                                ;   in Loop: Header=BB21_7 Depth=2
 	v_add_co_u32 v30, s23, s16, v42
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_2)
 	v_add_co_ci_u32_e64 v35, null, s17, 0, s23
@@ -4477,13 +4317,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_u32 v29, vcc_lo, v35, v29
 	v_add_co_ci_u32_e64 v30, null, v36, v30, vcc_lo
 	global_load_b64 v[35:36], v[29:30], off
-	s_branch .LBB22_6
-.LBB22_9:                               ;   in Loop: Header=BB22_5 Depth=1
+	s_branch .LBB21_6
+.LBB21_9:                               ;   in Loop: Header=BB21_5 Depth=1
 	s_or_b32 exec_lo, exec_lo, s22
 	v_mov_b32_e32 v41, v0
 	s_mov_b32 s22, 0
-	s_branch .LBB22_11
-.LBB22_10:                              ;   in Loop: Header=BB22_11 Depth=2
+	s_branch .LBB21_11
+.LBB21_10:                              ;   in Loop: Header=BB21_11 Depth=2
 	s_or_b32 exec_lo, exec_lo, s0
 	v_add_nc_u32_e32 v41, s1, v41
 	v_lshlrev_b32_e32 v29, 3, v43
@@ -4494,8 +4334,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_waitcnt vmcnt(0)
 	ds_store_b64 v29, v[35:36] offset:8192
 	s_and_not1_b32 exec_lo, exec_lo, s22
-	s_cbranch_execz .LBB22_4
-.LBB22_11:                              ;   Parent Loop BB22_5 Depth=1
+	s_cbranch_execz .LBB21_4
+.LBB21_11:                              ;   Parent Loop BB21_5 Depth=1
                                         ; =>  This Inner Loop Header: Depth=2
 	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_3) | instid1(VALU_DEP_4)
 	v_and_b32_e32 v43, 63, v41
@@ -4509,8 +4349,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_and_b32 s23, vcc_lo, s0
 	s_delay_alu instid0(SALU_CYCLE_1)
 	s_and_saveexec_b32 s0, s23
-	s_cbranch_execz .LBB22_10
-; %bb.12:                               ;   in Loop: Header=BB22_11 Depth=2
+	s_cbranch_execz .LBB21_10
+; %bb.12:                               ;   in Loop: Header=BB21_11 Depth=2
 	v_add_co_u32 v30, s23, s16, v42
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_2)
 	v_add_co_ci_u32_e64 v35, null, s17, 0, s23
@@ -4530,8 +4370,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_u32 v29, vcc_lo, v35, v29
 	v_add_co_ci_u32_e64 v30, null, v36, v30, vcc_lo
 	global_load_b64 v[35:36], v[29:30], off
-	s_branch .LBB22_10
-.LBB22_13:
+	s_branch .LBB21_10
+.LBB21_13:
 	s_mul_i32 s0, s12, s2
 	s_mul_hi_u32 s1, s12, s3
 	s_mul_i32 s2, s12, s3
@@ -4552,7 +4392,7 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_add_u32 s0, s14, s0
 	s_addc_u32 s1, s15, s1
 	v_cmpx_gt_i32_e64 s6, v0
-	s_cbranch_execz .LBB22_22
+	s_cbranch_execz .LBB21_22
 ; %bb.14:
 	v_ashrrev_i32_e32 v30, 31, v0
 	v_mul_lo_u32 v37, s13, v0
@@ -4566,7 +4406,7 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_u32 v35, vcc_lo, s0, v35
 	v_add_co_ci_u32_e64 v36, null, s1, v36, vcc_lo
 	v_cmpx_gt_i32_e64 s5, v29
-	s_cbranch_execz .LBB22_16
+	s_cbranch_execz .LBB21_16
 ; %bb.15:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4575,13 +4415,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v38, null, v36, v38, vcc_lo
 	global_store_b64 v[37:38], v[33:34], off
-.LBB22_16:
+.LBB21_16:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v30, 1, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v30
-	s_cbranch_execz .LBB22_18
+	s_cbranch_execz .LBB21_18
 ; %bb.17:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4590,13 +4430,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v34, null, v36, v34, vcc_lo
 	global_store_b64 v[33:34], v[31:32], off offset:8
-.LBB22_18:
+.LBB21_18:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v30, 2, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v30
-	s_cbranch_execz .LBB22_20
+	s_cbranch_execz .LBB21_20
 ; %bb.19:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4605,13 +4445,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v31, null, v36, v31, vcc_lo
 	global_store_b64 v[30:31], v[27:28], off offset:16
-.LBB22_20:
+.LBB21_20:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v27, 3, v29
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmp_gt_i32_e32 vcc_lo, s5, v27
 	s_and_b32 exec_lo, exec_lo, vcc_lo
-	s_cbranch_execz .LBB22_22
+	s_cbranch_execz .LBB21_22
 ; %bb.21:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4620,13 +4460,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v28, null, v36, v28, vcc_lo
 	global_store_b64 v[27:28], v[25:26], off offset:24
-.LBB22_22:
+.LBB21_22:
 	s_or_b32 exec_lo, exec_lo, s2
 	v_or_b32_e32 v25, 1, v0
 	s_mov_b32 s2, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s6, v25
-	s_cbranch_execz .LBB22_31
+	s_cbranch_execz .LBB21_31
 ; %bb.23:
 	v_ashrrev_i32_e32 v28, 31, v25
 	v_mul_lo_u32 v30, s13, v25
@@ -4640,7 +4480,7 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_u32 v25, vcc_lo, s0, v25
 	v_add_co_ci_u32_e64 v26, null, s1, v26, vcc_lo
 	v_cmpx_gt_i32_e64 s5, v29
-	s_cbranch_execz .LBB22_25
+	s_cbranch_execz .LBB21_25
 ; %bb.24:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4649,13 +4489,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v28, null, v26, v28, vcc_lo
 	global_store_b64 v[27:28], v[23:24], off
-.LBB22_25:
+.LBB21_25:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v23, 1, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v23
-	s_cbranch_execz .LBB22_27
+	s_cbranch_execz .LBB21_27
 ; %bb.26:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4664,13 +4504,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v24, null, v26, v24, vcc_lo
 	global_store_b64 v[23:24], v[21:22], off offset:8
-.LBB22_27:
+.LBB21_27:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v21, 2, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v21
-	s_cbranch_execz .LBB22_29
+	s_cbranch_execz .LBB21_29
 ; %bb.28:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4679,13 +4519,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v22, null, v26, v22, vcc_lo
 	global_store_b64 v[21:22], v[19:20], off offset:16
-.LBB22_29:
+.LBB21_29:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v19, 3, v29
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmp_gt_i32_e32 vcc_lo, s5, v19
 	s_and_b32 exec_lo, exec_lo, vcc_lo
-	s_cbranch_execz .LBB22_31
+	s_cbranch_execz .LBB21_31
 ; %bb.30:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4694,13 +4534,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v20, null, v26, v20, vcc_lo
 	global_store_b64 v[19:20], v[17:18], off offset:24
-.LBB22_31:
+.LBB21_31:
 	s_or_b32 exec_lo, exec_lo, s2
 	v_or_b32_e32 v17, 2, v0
 	s_mov_b32 s2, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s6, v17
-	s_cbranch_execz .LBB22_40
+	s_cbranch_execz .LBB21_40
 ; %bb.32:
 	v_ashrrev_i32_e32 v20, 31, v17
 	v_mul_lo_u32 v21, s13, v17
@@ -4714,7 +4554,7 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_u32 v17, vcc_lo, s0, v17
 	v_add_co_ci_u32_e64 v18, null, s1, v18, vcc_lo
 	v_cmpx_gt_i32_e64 s5, v29
-	s_cbranch_execz .LBB22_34
+	s_cbranch_execz .LBB21_34
 ; %bb.33:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4723,13 +4563,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v20, null, v18, v20, vcc_lo
 	global_store_b64 v[19:20], v[15:16], off
-.LBB22_34:
+.LBB21_34:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v15, 1, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v15
-	s_cbranch_execz .LBB22_36
+	s_cbranch_execz .LBB21_36
 ; %bb.35:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4738,13 +4578,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v16, null, v18, v16, vcc_lo
 	global_store_b64 v[15:16], v[13:14], off offset:8
-.LBB22_36:
+.LBB21_36:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v13, 2, v29
 	s_mov_b32 s3, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v13
-	s_cbranch_execz .LBB22_38
+	s_cbranch_execz .LBB21_38
 ; %bb.37:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4753,13 +4593,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v14, null, v18, v14, vcc_lo
 	global_store_b64 v[13:14], v[11:12], off offset:16
-.LBB22_38:
+.LBB21_38:
 	s_or_b32 exec_lo, exec_lo, s3
 	v_or_b32_e32 v11, 3, v29
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmp_gt_i32_e32 vcc_lo, s5, v11
 	s_and_b32 exec_lo, exec_lo, vcc_lo
-	s_cbranch_execz .LBB22_40
+	s_cbranch_execz .LBB21_40
 ; %bb.39:
 	v_ashrrev_i32_e32 v30, 31, v29
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
@@ -4768,13 +4608,13 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v12, null, v18, v12, vcc_lo
 	global_store_b64 v[11:12], v[9:10], off offset:24
-.LBB22_40:
+.LBB21_40:
 	s_or_b32 exec_lo, exec_lo, s2
 	v_or_b32_e32 v0, 3, v0
 	s_mov_b32 s2, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s6, v0
-	s_cbranch_execz .LBB22_49
+	s_cbranch_execz .LBB21_49
 ; %bb.41:
 	v_ashrrev_i32_e32 v11, 31, v0
 	v_mul_lo_u32 v12, s13, v0
@@ -4790,53 +4630,53 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 	v_add_co_ci_u32_e64 v9, null, s1, v10, s0
 	s_mov_b32 s0, exec_lo
 	v_cmpx_gt_i32_e64 s5, v29
-	s_cbranch_execz .LBB22_43
+	s_cbranch_execz .LBB21_43
 ; %bb.42:
 	v_lshlrev_b64 v[10:11], 3, v[29:30]
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
 	v_add_co_u32 v10, vcc_lo, v0, v10
 	v_add_co_ci_u32_e64 v11, null, v9, v11, vcc_lo
 	global_store_b64 v[10:11], v[7:8], off
-.LBB22_43:
+.LBB21_43:
 	s_or_b32 exec_lo, exec_lo, s0
 	v_or_b32_e32 v7, 1, v29
 	s_mov_b32 s0, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v7
-	s_cbranch_execz .LBB22_45
+	s_cbranch_execz .LBB21_45
 ; %bb.44:
 	v_lshlrev_b64 v[7:8], 3, v[29:30]
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
 	v_add_co_u32 v7, vcc_lo, v0, v7
 	v_add_co_ci_u32_e64 v8, null, v9, v8, vcc_lo
 	global_store_b64 v[7:8], v[5:6], off offset:8
-.LBB22_45:
+.LBB21_45:
 	s_or_b32 exec_lo, exec_lo, s0
 	v_or_b32_e32 v5, 2, v29
 	s_mov_b32 s0, exec_lo
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmpx_gt_i32_e64 s5, v5
-	s_cbranch_execz .LBB22_47
+	s_cbranch_execz .LBB21_47
 ; %bb.46:
 	v_lshlrev_b64 v[5:6], 3, v[29:30]
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
 	v_add_co_u32 v5, vcc_lo, v0, v5
 	v_add_co_ci_u32_e64 v6, null, v9, v6, vcc_lo
 	global_store_b64 v[5:6], v[3:4], off offset:16
-.LBB22_47:
+.LBB21_47:
 	s_or_b32 exec_lo, exec_lo, s0
 	v_or_b32_e32 v3, 3, v29
 	s_delay_alu instid0(VALU_DEP_1)
 	v_cmp_gt_i32_e32 vcc_lo, s5, v3
 	s_and_b32 exec_lo, exec_lo, vcc_lo
-	s_cbranch_execz .LBB22_49
+	s_cbranch_execz .LBB21_49
 ; %bb.48:
 	v_lshlrev_b64 v[3:4], 3, v[29:30]
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
 	v_add_co_u32 v3, vcc_lo, v0, v3
 	v_add_co_ci_u32_e64 v4, null, v9, v4, vcc_lo
 	global_store_b64 v[3:4], v[1:2], off offset:24
-.LBB22_49:
+.LBB21_49:
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
@@ -4882,8 +4722,8 @@ _Z15splitk_dw_pass1PKdS0_Pdiiii:        ; @_Z15splitk_dw_pass1PKdS0_Pdiiii
 		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
-.Lfunc_end22:
-	.size	_Z15splitk_dw_pass1PKdS0_Pdiiii, .Lfunc_end22-_Z15splitk_dw_pass1PKdS0_Pdiiii
+.Lfunc_end21:
+	.size	_Z15splitk_dw_pass1PKdS0_Pdiiii, .Lfunc_end21-_Z15splitk_dw_pass1PKdS0_Pdiiii
                                         ; -- End function
 	.set _Z15splitk_dw_pass1PKdS0_Pdiiii.num_vgpr, 65
 	.set _Z15splitk_dw_pass1PKdS0_Pdiiii.num_agpr, 0
@@ -4934,20 +4774,20 @@ _Z15splitk_dw_pass2PKdPdii:             ; @_Z15splitk_dw_pass2PKdPdii
 	v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]
 	s_mov_b32 s2, exec_lo
 	v_cmpx_gt_i32_e64 s4, v1
-	s_cbranch_execz .LBB23_7
+	s_cbranch_execz .LBB22_7
 ; %bb.1:
 	v_ashrrev_i32_e32 v2, 31, v1
 	s_cmp_gt_i32 s5, 0
 	s_mov_b32 s6, 0
-	s_cbranch_scc0 .LBB23_3
+	s_cbranch_scc0 .LBB22_3
 ; %bb.2:
 	s_mov_b32 s6, -1
-.LBB23_3:
+.LBB22_3:
 	s_load_b64 s[2:3], s[0:1], 0x8
 	v_mov_b32_e32 v3, 0
 	v_mov_b32_e32 v4, 0
 	s_and_not1_b32 vcc_lo, exec_lo, s6
-	s_cbranch_vccnz .LBB23_6
+	s_cbranch_vccnz .LBB22_6
 ; %bb.4:
 	s_load_b64 s[0:1], s[0:1], 0x0
 	v_lshlrev_b64 v[5:6], 3, v[1:2]
@@ -4960,7 +4800,7 @@ _Z15splitk_dw_pass2PKdPdii:             ; @_Z15splitk_dw_pass2PKdPdii
 	s_delay_alu instid0(VALU_DEP_1)
 	v_add_co_ci_u32_e64 v6, null, s1, v6, vcc_lo
 	s_lshl_b64 s[0:1], s[6:7], 3
-.LBB23_5:                               ; =>This Inner Loop Header: Depth=1
+.LBB22_5:                               ; =>This Inner Loop Header: Depth=1
 	global_load_b64 v[7:8], v[5:6], off
 	v_add_co_u32 v5, vcc_lo, v5, s0
 	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(SALU_CYCLE_1)
@@ -4969,15 +4809,15 @@ _Z15splitk_dw_pass2PKdPdii:             ; @_Z15splitk_dw_pass2PKdPdii
 	s_cmp_eq_u32 s5, 0
 	s_waitcnt vmcnt(0)
 	v_add_f64 v[3:4], v[3:4], v[7:8]
-	s_cbranch_scc0 .LBB23_5
-.LBB23_6:
+	s_cbranch_scc0 .LBB22_5
+.LBB22_6:
 	v_lshlrev_b64 v[0:1], 3, v[1:2]
 	s_waitcnt lgkmcnt(0)
 	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
 	v_add_co_u32 v0, vcc_lo, s2, v0
 	v_add_co_ci_u32_e64 v1, null, s3, v1, vcc_lo
 	global_store_b64 v[0:1], v[3:4], off
-.LBB23_7:
+.LBB22_7:
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
@@ -5023,8 +4863,8 @@ _Z15splitk_dw_pass2PKdPdii:             ; @_Z15splitk_dw_pass2PKdPdii
 		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
-.Lfunc_end23:
-	.size	_Z15splitk_dw_pass2PKdPdii, .Lfunc_end23-_Z15splitk_dw_pass2PKdPdii
+.Lfunc_end22:
+	.size	_Z15splitk_dw_pass2PKdPdii, .Lfunc_end22-_Z15splitk_dw_pass2PKdPdii
                                         ; -- End function
 	.set _Z15splitk_dw_pass2PKdPdii.num_vgpr, 9
 	.set _Z15splitk_dw_pass2PKdPdii.num_agpr, 0
@@ -5059,6 +4899,323 @@ _Z15splitk_dw_pass2PKdPdii:             ; @_Z15splitk_dw_pass2PKdPdii
 ; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
 ; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
 ; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
+	.section	.text._Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii,"axG",@progbits,_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii,comdat
+	.protected	_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii ; -- Begin function _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+	.globl	_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+	.p2align	8
+	.type	_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii,@function
+_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii: ; @_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+; %bb.0:
+	s_clause 0x1
+	s_load_b32 s3, s[0:1], 0x34
+	s_load_b128 s[4:7], s[0:1], 0x18
+	v_bfe_u32 v3, v0, 10, 10
+	v_and_b32_e32 v0, 0x3ff, v0
+	s_waitcnt lgkmcnt(0)
+	s_lshr_b32 s3, s3, 16
+	s_delay_alu instid0(VALU_DEP_2) | instid1(SALU_CYCLE_1)
+	v_mad_u64_u32 v[1:2], null, s2, s3, v[3:4]
+	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_2)
+	v_cmp_gt_i32_e64 s2, s5, v0
+	v_cmp_gt_i32_e32 vcc_lo, s4, v1
+	s_and_b32 s2, s2, vcc_lo
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_and_saveexec_b32 s3, s2
+	s_cbranch_execz .LBB23_6
+; %bb.1:
+	s_load_b64 s[2:3], s[0:1], 0x10
+	s_cmp_lt_i32 s6, 1
+	s_cbranch_scc1 .LBB23_4
+; %bb.2:
+	s_load_b128 s[8:11], s[0:1], 0x0
+	v_mul_lo_u32 v2, v1, s6
+	v_dual_mov_b32 v6, 0 :: v_dual_lshlrev_b32 v7, 2, v0
+	s_ashr_i32 s1, s5, 31
+	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshlrev_b64 v[4:5], 2, v[2:3]
+	s_waitcnt lgkmcnt(0)
+	v_add_co_u32 v2, s0, s10, v7
+	s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_4)
+	v_add_co_u32 v4, vcc_lo, s8, v4
+	v_add_co_ci_u32_e64 v3, null, s11, 0, s0
+	v_add_co_ci_u32_e64 v5, null, s9, v5, vcc_lo
+	s_mov_b32 s0, s5
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_lshl_b64 s[0:1], s[0:1], 2
+	.p2align	6
+.LBB23_3:                               ; =>This Inner Loop Header: Depth=1
+	global_load_b32 v7, v[4:5], off
+	global_load_b32 v8, v[2:3], off
+	v_add_co_u32 v2, vcc_lo, v2, s0
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v3, null, s1, v3, vcc_lo
+	v_add_co_u32 v4, vcc_lo, v4, 4
+	v_add_co_ci_u32_e64 v5, null, 0, v5, vcc_lo
+	s_add_i32 s6, s6, -1
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_cmp_eq_u32 s6, 0
+	s_waitcnt vmcnt(0)
+	v_fmac_f32_e32 v6, v7, v8
+	s_cbranch_scc0 .LBB23_3
+	s_branch .LBB23_5
+.LBB23_4:
+	v_mov_b32_e32 v6, 0
+.LBB23_5:
+	v_mad_u64_u32 v[2:3], null, v1, s5, v[0:1]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshlrev_b64 v[0:1], 2, v[2:3]
+	s_waitcnt lgkmcnt(0)
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v0, vcc_lo, s2, v0
+	v_add_co_ci_u32_e64 v1, null, s3, v1, vcc_lo
+	global_load_b32 v2, v[0:1], off
+	s_waitcnt vmcnt(0)
+	v_add_f32_e32 v2, v6, v2
+	global_store_b32 v[0:1], v2, off
+.LBB23_6:
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 296
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_wavefront_size32 1
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 1
+		.amdhsa_next_free_vgpr 9
+		.amdhsa_next_free_sgpr 12
+		.amdhsa_reserve_vcc 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_workgroup_processor_mode 1
+		.amdhsa_memory_ordered 1
+		.amdhsa_forward_progress 1
+		.amdhsa_shared_vgpr_count 0
+		.amdhsa_inst_pref_size 3
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.section	.text._Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii,"axG",@progbits,_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii,comdat
+.Lfunc_end23:
+	.size	_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii, .Lfunc_end23-_Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+                                        ; -- End function
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.num_vgpr, 9
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.num_agpr, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.numbered_sgpr, 12
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.num_named_barrier, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.private_seg_size, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.uses_vcc, 1
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.uses_flat_scratch, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.has_dyn_sized_stack, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.has_recursion, 0
+	.set _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 360
+; TotalNumSgprs: 14
+; NumVgprs: 9
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 0
+; VGPRBlocks: 1
+; NumSGPRsForWavesPerEU: 14
+; NumVGPRsForWavesPerEU: 9
+; Occupancy: 16
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 2
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 1
+	.section	.text._Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii,"axG",@progbits,_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii,comdat
+	.protected	_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii ; -- Begin function _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+	.globl	_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+	.p2align	8
+	.type	_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii,@function
+_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii: ; @_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+; %bb.0:
+	s_clause 0x1
+	s_load_b32 s3, s[0:1], 0x34
+	s_load_b128 s[4:7], s[0:1], 0x18
+	v_bfe_u32 v3, v0, 10, 10
+	v_and_b32_e32 v0, 0x3ff, v0
+	s_waitcnt lgkmcnt(0)
+	s_lshr_b32 s3, s3, 16
+	s_delay_alu instid0(VALU_DEP_2) | instid1(SALU_CYCLE_1)
+	v_mad_u64_u32 v[1:2], null, s2, s3, v[3:4]
+	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_2)
+	v_cmp_gt_i32_e64 s2, s5, v0
+	v_cmp_gt_i32_e32 vcc_lo, s4, v1
+	s_and_b32 s2, s2, vcc_lo
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_and_saveexec_b32 s3, s2
+	s_cbranch_execz .LBB24_6
+; %bb.1:
+	s_load_b64 s[2:3], s[0:1], 0x10
+	s_cmp_lt_i32 s6, 1
+	s_cbranch_scc1 .LBB24_4
+; %bb.2:
+	s_load_b128 s[8:11], s[0:1], 0x0
+	v_mul_lo_u32 v4, v1, s6
+	v_lshlrev_b32_e32 v8, 3, v0
+	v_mov_b32_e32 v2, 0
+	v_mov_b32_e32 v3, 0
+	s_ashr_i32 s1, s5, 31
+	s_delay_alu instid0(VALU_DEP_4) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_ashrrev_i32_e32 v5, 31, v4
+	v_lshlrev_b64 v[6:7], 3, v[4:5]
+	s_waitcnt lgkmcnt(0)
+	v_add_co_u32 v4, s0, s10, v8
+	s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_4)
+	v_add_co_u32 v6, vcc_lo, s8, v6
+	v_add_co_ci_u32_e64 v5, null, s11, 0, s0
+	v_add_co_ci_u32_e64 v7, null, s9, v7, vcc_lo
+	s_mov_b32 s0, s5
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_lshl_b64 s[0:1], s[0:1], 3
+	.p2align	6
+.LBB24_3:                               ; =>This Inner Loop Header: Depth=1
+	global_load_b64 v[8:9], v[6:7], off
+	global_load_b64 v[10:11], v[4:5], off
+	v_add_co_u32 v4, vcc_lo, v4, s0
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v5, null, s1, v5, vcc_lo
+	v_add_co_u32 v6, vcc_lo, v6, 8
+	v_add_co_ci_u32_e64 v7, null, 0, v7, vcc_lo
+	s_add_i32 s6, s6, -1
+	s_delay_alu instid0(SALU_CYCLE_1)
+	s_cmp_eq_u32 s6, 0
+	s_waitcnt vmcnt(0)
+	v_fma_f64 v[2:3], v[8:9], v[10:11], v[2:3]
+	s_cbranch_scc0 .LBB24_3
+	s_branch .LBB24_5
+.LBB24_4:
+	v_mov_b32_e32 v2, 0
+	v_mov_b32_e32 v3, 0
+.LBB24_5:
+	v_mad_u64_u32 v[4:5], null, v1, s5, v[0:1]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_ashrrev_i32_e32 v5, 31, v4
+	v_lshlrev_b64 v[0:1], 3, v[4:5]
+	s_waitcnt lgkmcnt(0)
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v0, vcc_lo, s2, v0
+	v_add_co_ci_u32_e64 v1, null, s3, v1, vcc_lo
+	global_load_b64 v[4:5], v[0:1], off
+	s_waitcnt vmcnt(0)
+	v_add_f64 v[2:3], v[2:3], v[4:5]
+	global_store_b64 v[0:1], v[2:3], off
+.LBB24_6:
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 296
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_wavefront_size32 1
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 1
+		.amdhsa_next_free_vgpr 12
+		.amdhsa_next_free_sgpr 12
+		.amdhsa_reserve_vcc 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_workgroup_processor_mode 1
+		.amdhsa_memory_ordered 1
+		.amdhsa_forward_progress 1
+		.amdhsa_shared_vgpr_count 0
+		.amdhsa_inst_pref_size 3
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.section	.text._Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii,"axG",@progbits,_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii,comdat
+.Lfunc_end24:
+	.size	_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii, .Lfunc_end24-_Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+                                        ; -- End function
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.num_vgpr, 12
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.num_agpr, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.numbered_sgpr, 12
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.num_named_barrier, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.private_seg_size, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.uses_vcc, 1
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.uses_flat_scratch, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.has_dyn_sized_stack, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.has_recursion, 0
+	.set _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 376
+; TotalNumSgprs: 14
+; NumVgprs: 12
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 0
+; VGPRBlocks: 1
+; NumSGPRsForWavesPerEU: 14
+; NumVGPRsForWavesPerEU: 12
+; Occupancy: 16
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 2
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 1
 	.text
 	.p2alignl 7, 3214868480
 	.fill 96, 4, 3214868480
@@ -6594,88 +6751,6 @@ amdhsa.kernels:
         .offset:         8
         .size:           8
         .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         16
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         24
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         28
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         32
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         40
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         44
-        .size:           4
-        .value_kind:     hidden_block_count_y
-      - .offset:         48
-        .size:           4
-        .value_kind:     hidden_block_count_z
-      - .offset:         52
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         54
-        .size:           2
-        .value_kind:     hidden_group_size_y
-      - .offset:         56
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         58
-        .size:           2
-        .value_kind:     hidden_remainder_x
-      - .offset:         60
-        .size:           2
-        .value_kind:     hidden_remainder_y
-      - .offset:         62
-        .size:           2
-        .value_kind:     hidden_remainder_z
-      - .offset:         80
-        .size:           8
-        .value_kind:     hidden_global_offset_x
-      - .offset:         88
-        .size:           8
-        .value_kind:     hidden_global_offset_y
-      - .offset:         96
-        .size:           8
-        .value_kind:     hidden_global_offset_z
-      - .offset:         104
-        .size:           2
-        .value_kind:     hidden_grid_dims
-    .group_segment_fixed_size: 0
-    .kernarg_segment_align: 8
-    .kernarg_segment_size: 296
-    .language:       OpenCL C
-    .language_version:
-      - 2
-      - 0
-    .max_flat_workgroup_size: 1024
-    .name:           tall_skinny_dgemm_kernel
-    .private_segment_fixed_size: 0
-    .sgpr_count:     14
-    .sgpr_spill_count: 0
-    .symbol:         tall_skinny_dgemm_kernel.kd
-    .uniform_work_group_size: 1
-    .uses_dynamic_stack: false
-    .vgpr_count:     12
-    .vgpr_spill_count: 0
-    .wavefront_size: 32
-    .workgroup_processor_mode: 1
-  - .args:
-      - .actual_access:  read_only
-        .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .actual_access:  read_only
-        .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
       - .actual_access:  write_only
         .address_space:  global
         .offset:         16
@@ -6823,6 +6898,170 @@ amdhsa.kernels:
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
     .vgpr_count:     9
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         28
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         32
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii
+    .private_segment_fixed_size: 0
+    .sgpr_count:     14
+    .sgpr_spill_count: 0
+    .symbol:         _Z24tall_skinny_dgemm_kernelIfEvPKT_S2_PS0_iii.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     9
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         28
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         32
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii
+    .private_segment_fixed_size: 0
+    .sgpr_count:     14
+    .sgpr_spill_count: 0
+    .symbol:         _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     12
     .vgpr_spill_count: 0
     .wavefront_size: 32
     .workgroup_processor_mode: 1
