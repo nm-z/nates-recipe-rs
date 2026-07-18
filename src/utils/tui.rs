@@ -452,8 +452,9 @@ fn render_chat(
 	input: &TextArea,
 	scrollback: &[(String, String)],
 	pending: Option<&str>,
+	pre: &[String],
 	live: &[Tok],
-	generating: bool,
+	activity: Option<&str>,
 	scroll_up: usize,
 	loaded: bool,
 ) {
@@ -484,12 +485,15 @@ fn render_chat(
 		lines.push(Line::from(String::new()));
 	}
 	let _pend = pending.map(|p| lines.push(Line::from(Span::styled(format!("> {p}"), head))));
+	for l in pre {
+		lines.push(Line::from(l.clone()));
+	}
 	for l in toks_to_lines(live) {
 		lines.push(l);
 	}
-	let _gen = Some(()).filter(|_probe| generating).map(|_probe| {
+	let _act = activity.map(|a| {
 		lines.push(Line::from(Span::styled(
-			"  generating (model load + rounds, this takes minutes)".to_string(),
+			a.to_string(),
 			Style::default()
 				.fg(Color::Yellow)
 				.add_modifier(Modifier::ITALIC),
@@ -700,7 +704,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	let res = {
 		let sb = &scrollback;
 		let mut on_round = |toks: &[Tok]| -> bool {
-			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true, 0, false));
+			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), &[], toks, Some("generating"), 0, false));
 			drain_input(&cancel, &mut input, 0);
 			!cancel.load(std::sync::atomic::Ordering::Relaxed)
 		};
@@ -715,7 +719,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 			return;
 		}
 	}
-	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false, 0, true));
+	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], &[], None, 0, true));
 	loop {
 		match event::read() {
 			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
@@ -795,6 +799,7 @@ fn wait_load(
 	scrollback: &[(String, String)],
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
+	start: std::time::Instant,
 ) -> LoadOutcome {
 	let mut latest: Vec<Tok> = Vec::new();
 	loop {
@@ -811,8 +816,9 @@ fn wait_load(
 				}
 			}
 		}
+		let act = format!("model load  {:.1}s", start.elapsed().as_secs_f64());
 		let _live = term
-			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true, 0, false));
+			.draw(|f| render_chat(f, textarea, scrollback, None, &[], &latest, Some(&act), 0, false));
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -821,6 +827,15 @@ fn wait_load(
 /// token snapshots and polls keys every 50ms so Esc/Ctrl-C cancels the
 /// generation (setting the flag) while leaving the session alive for the next
 /// message. Returns the worker's reply, or `None` if the worker channel closed.
+/// A finished message's frozen step lines: the pre-stream steps (prefill/TTFT),
+/// the reply, and the final token-rate line — exactly what the live view showed,
+/// stopped at their final values.
+struct RunDone {
+	r: std::result::Result<String, String>,
+	pre: Vec<String>,
+	gen_line: Option<String>,
+}
+
 fn run_message(
 	term: &mut ratatui::DefaultTerminal,
 	textarea: &mut TextArea,
@@ -829,26 +844,55 @@ fn run_message(
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
 	sent: std::time::Instant,
-) -> Option<(std::result::Result<String, String>, Option<f64>)> {
+) -> Option<RunDone> {
 	let mut latest: Vec<Tok> = Vec::new();
-	let mut ttft: Option<f64> = None;
+	let mut pre: Vec<String> = Vec::new();
+	let mut first: Option<std::time::Instant> = None;
+	let mut n_tok = 0usize;
 	loop {
 		loop {
 			match ev_rx.try_recv() {
 				Ok(FromWorker::Snap(t)) => {
-					if !t.is_empty() && ttft.is_none() {
-						ttft = Some(sent.elapsed().as_secs_f64());
+					if !t.is_empty() {
+						if first.is_none() {
+							first = Some(std::time::Instant::now());
+							pre.push(format!(
+								"prefill (TTFT)  {:.2}s",
+								sent.elapsed().as_secs_f64()
+							));
+						}
+						n_tok += 1;
 					}
 					latest = t;
 				}
-				Ok(FromWorker::Reply(r)) => return Some((r, ttft)),
+				Ok(FromWorker::Reply(r)) => {
+					let gen_line = first.map(|f| {
+						let rate = n_tok as f64 / f.elapsed().as_secs_f64().max(1e-9);
+						return format!(
+							"{n_tok} tok, {rate:.2} tok/s, {:.1}s",
+							sent.elapsed().as_secs_f64()
+						);
+					});
+					return Some(RunDone { r, pre, gen_line });
+				}
 				Ok(_other) => {}
 				Err(std::sync::mpsc::TryRecvError::Empty) => break,
 				Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
 			}
 		}
-		let _live =
-			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true, 0, true));
+		let act = match first {
+			None => format!("prefill (TTFT)  {:.1}s", sent.elapsed().as_secs_f64()),
+			Some(f) => {
+				let rate = n_tok as f64 / f.elapsed().as_secs_f64().max(1e-9);
+				format!(
+					"{n_tok} tok, {rate:.2} tok/s, {:.1}s",
+					sent.elapsed().as_secs_f64()
+				)
+			}
+		};
+		let _live = term.draw(|f| {
+			render_chat(f, textarea, scrollback, Some(prompt), &pre, &latest, Some(&act), 0, true)
+		});
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -868,11 +912,16 @@ pub fn chat(gguf: &str) {
 	let (ev_tx, ev_rx) = std::sync::mpsc::channel::<FromWorker>();
 	let gguf_owned = std::path::PathBuf::from(gguf);
 	let flag = std::sync::Arc::clone(&cancel);
+	let load_start = std::time::Instant::now();
 	let worker = std::thread::spawn(move || session_worker(&gguf_owned, prompt_rx, ev_tx, flag));
 
-	match wait_load(&mut term, &mut textarea, &scrollback, &ev_rx, &cancel) {
+	match wait_load(&mut term, &mut textarea, &scrollback, &ev_rx, &cancel, load_start) {
 		LoadOutcome::Loaded => {
 			scrollback.push((String::new(), format!("model: {gguf}")));
+			scrollback.push((
+				String::new(),
+				format!("model load  {:.1}s", load_start.elapsed().as_secs_f64()),
+			));
 		}
 		LoadOutcome::Cancelled => {
 			drop(prompt_tx);
@@ -892,7 +941,7 @@ pub fn chat(gguf: &str) {
 	let mut scroll_up: usize = 0;
 	loop {
 		let _idle =
-			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false, scroll_up, true));
+			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], &[], None, scroll_up, true));
 		let ev = match event::read() {
 			Ok(e) => e,
 			Err(_e) => break,
@@ -945,15 +994,27 @@ pub fn chat(gguf: &str) {
 						break;
 					}
 					match run_message(&mut term, &mut textarea, &scrollback, &prompt, &ev_rx, &cancel, sent) {
-						Some((Ok(resp), ttft)) => {
-							let resp = match ttft {
-								Some(t) => format!("{resp}, TTFT {t:.2}s"),
-								None => resp,
-							};
-							let shown = note.map(|n| format!("{n}\n{resp}")).unwrap_or(resp);
+						Some(RunDone { r: Ok(resp), pre, gen_line }) => {
+							let body = resp
+								.rsplit_once("\n\n")
+								.map(|(b, _stats)| b.to_string())
+								.unwrap_or(resp);
+							let mut shown = String::new();
+							for l in &pre {
+								shown.push_str(l);
+								shown.push('\n');
+							}
+							shown.push_str(&body);
+							if let Some(g) = gen_line {
+								shown.push('\n');
+								shown.push_str(&g);
+							}
+							let shown = note.map(|n| format!("{n}\n{shown}")).unwrap_or(shown);
 							scrollback.push((prompt, shown));
 						}
-						Some((Err(e), _ttft)) => scrollback.push((prompt, format!("error: {e}"))),
+						Some(RunDone { r: Err(e), pre: _pre, gen_line: _gen }) => {
+							scrollback.push((prompt, format!("error: {e}")));
+						}
 						None => break,
 					}
 				}
