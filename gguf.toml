@@ -27,6 +27,7 @@ bge-small-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge
 bge-small-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge-small/ggml-model-q8_0.gguf"
 rerank-tiny-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/rerank-tiny/ggml-model-f16.gguf"
 stories15m-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/tinyllamas/stories15M-q4_0.gguf"
+stories15m-q4_0-debug = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-debug/tinyllamas/stories15M-q4_0.gguf"
 stories-f32-fixture = "/home/nate/Desktop/nates-recipe-rs/recipe-infer/tests/fixtures/stories-f32.gguf"
 
 [misc]
