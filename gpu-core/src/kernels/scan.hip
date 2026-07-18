@@ -309,22 +309,26 @@ extern "C" void launch_segment_max(
       hipLaunchKernelGGL(segment_max_kernel, g, b, 0, stream, vals, seg_ids, out, n);
 }
 
+// state_g (nullable, [dim], thread d owns state_g[d]=h): loaded at entry, written
+// back at exit, so an incremental scan over only the NEW steps is bit-identical to
+// a full-sequence scan. Null keeps the h=0 init and no write-back.
 template<typename T> __global__ void scan_linear_recurrence_kernel(
-      const T* a, const T* b, T* states, int n_steps, int dim
+      const T* a, const T* b, T* states, int n_steps, int dim, T* state_g
 ) {
       int d = blockIdx.x * blockDim.x + threadIdx.x;
       if (d >= dim) return;
-      T h = 0.0;
+      T h = state_g ? state_g[d] : (T)0.0;
       for (int t = 0; t < n_steps; t++) {
             int idx = t * dim + d;
             h = a[idx] * h + b[idx];
             states[idx] = h;
       }
+      if (state_g) state_g[d] = h;
 }
 
 extern "C" void launch_scan_linear_recurrence(
-      const double* a, const double* b, double* states, int n_steps, int dim, hipStream_t stream, int dtype
+      const double* a, const double* b, double* states, int n_steps, int dim, double* state, hipStream_t stream, int dtype
 ) {
       dim3 b2(256), g((dim + 255) / 256);
-      DT_DISPATCH(dtype, scan_linear_recurrence_kernel<T><<<g, b2, 0, stream>>>((const T*)a, (const T*)b, (T*)states, n_steps, dim));
+      DT_DISPATCH(dtype, scan_linear_recurrence_kernel<T><<<g, b2, 0, stream>>>((const T*)a, (const T*)b, (T*)states, n_steps, dim, (T*)state));
 }

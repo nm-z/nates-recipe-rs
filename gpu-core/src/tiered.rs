@@ -52,6 +52,34 @@ impl fmt::Display for Full {
 	}
 }
 
+/// The machine's persistent data directory (`$XDG_CACHE_HOME` or `~/.cache`,
+/// plus `recipe/`), created if absent. This is THE spill-dir owner for every
+/// disk tier in the workspace: the training out-of-core spill, the KV-cache
+/// spill files, and the [`Budgets`] disk measurement all resolve through this
+/// one function, so the bytes always land on the filesystem whose free space
+/// was measured — never on a tmpfs the RAM tier already counts.
+///
+/// # Errors
+/// Returns an error when neither `XDG_CACHE_HOME` nor `HOME` is set, or the
+/// directory cannot be created.
+pub fn data_dir() -> std::io::Result<PathBuf> {
+	let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| return !v.is_empty()) {
+		Some(x) => PathBuf::from(x),
+		None => {
+			let Some(home) = std::env::var_os("HOME").filter(|v| return !v.is_empty()) else {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::NotFound,
+					"data_dir: neither XDG_CACHE_HOME nor HOME is set",
+				));
+			};
+			PathBuf::from(home).join(".cache")
+		}
+	};
+	let dir = base.join("recipe");
+	fs::create_dir_all(&dir)?;
+	return Ok(dir);
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Budgets {
 	pub vram_data: usize,
@@ -221,40 +249,8 @@ impl Tiered {
 		let n_disk = n_pg - gpu_pages - ram_pages;
 
 		let (va, handles): (*mut c_void, Vec<*mut c_void>) = NonZeroUsize::new(gpu_pages)
-			.map_or_else(
-				|| return (ptr::null_mut(), Vec::new()),
-				|_count| {
-					let mut va: *mut c_void = ptr::null_mut();
-					callspy::tick(&callspy::MEM_ADDRESS_RESERVE);
-					// SAFETY: va is a valid writable out-slot for the reserved base address.
-					hip::check(unsafe { hip::vmm_reserve(&raw mut va, gpu_pages * P) })
-						.unwrap_or_else(|e| {
-							Write::error(format!("vmm reserve: {e}"));
-						});
-					let mut handles = Vec::with_capacity(gpu_pages);
-					for s in 0..gpu_pages {
-						let mut h: *mut c_void = ptr::null_mut();
-						callspy::tick(&callspy::MEM_CREATE);
-						// SAFETY: h is a valid writable out-slot for the new physical handle.
-						hip::check(unsafe { hip::vmm_create(&raw mut h, P) })
-							.unwrap_or_else(|e| {
-								Write::error(format!("vmm create: {e}"));
-							});
-						// SAFETY: s < gpu_pages, so the offset stays within the reserved VA range.
-						let slot_va =
-							unsafe { va.cast::<u8>().add(s * P).cast::<c_void>() };
-						callspy::tick(&callspy::MEM_MAP);
-						callspy::tick(&callspy::MEM_SET_ACCESS);
-						// SAFETY: slot_va is a reserved in-range page and h its freshly created handle.
-						hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })
-							.unwrap_or_else(|e| {
-								Write::error(format!("vmm map: {e}"));
-							});
-						handles.push(h);
-					}
-					return (va, handles);
-				},
-			);
+			.and_then(|_count| return memory::vmm_map_span(gpu_pages * P))
+			.unwrap_or((ptr::null_mut(), Vec::new()));
 		tag_note_alloc("tiered-vram", handles.len() * P);
 		let slot_page: Vec<Option<usize>> = (0..gpu_pages).map(Some).collect();
 
@@ -619,28 +615,7 @@ impl Drop for Tiered {
 	#[inline]
 	fn drop(&mut self) {
 		memory::tag_note_free("tiered-vram", self.slots * P);
-		for s in 0..self.handles.len() {
-			let h = self.handles[s];
-			// SAFETY: s*P is within the reserved VA span for this Tiered mapping
-			let va = unsafe { self.va.cast::<u8>().add(s * P).cast::<c_void>() };
-			callspy::tick(&callspy::MEM_UNMAP);
-			// SAFETY: va is this slot's live mapped VA; unmap once before release
-			unsafe {
-				hip::vmm_unmap(va, P);
-			}
-			callspy::tick(&callspy::MEM_RELEASE);
-			// SAFETY: h backs this slot; released after its VA is unmapped
-			unsafe {
-				hip::vmm_release(h);
-			}
-		}
-		if ptr::NonNull::new(self.va).is_some_and(|_p| return self.slots > 0) {
-			callspy::tick(&callspy::MEM_ADDRESS_FREE);
-			// SAFETY: self.va is the reserved base of self.slots contiguous mapped pages.
-			unsafe {
-				hip::vmm_addr_free(self.va, self.slots * P);
-			}
-		}
+		memory::vmm_unmap_span(self.va, &self.handles);
 		if self.disk.is_some() {
 			fs::remove_file(&self.spill_path).ok().unwrap_or(());
 		}

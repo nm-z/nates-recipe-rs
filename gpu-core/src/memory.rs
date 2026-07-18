@@ -529,6 +529,13 @@ static ARENA_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// Bytes already carved from the active arena.
 static ARENA_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
+/// The VMM page handles backing the active [`Ownership::Vmm`] arena, keyed by its
+/// base address. One arena exists at a time, so this holds at most one entry; the
+/// arena slab's drop takes it and hands the handles to [`vmm_unmap_span`]. Stored
+/// as addresses (opaque VMM handles carry no memory provenance) so the mutex stays
+/// `Send`.
+static ARENA_VMM: Mutex<Option<(usize, Vec<usize>)>> = Mutex::new(None);
+
 /// Per-tag bytes carved from the arena since the last drain.
 static ARENA_CARVED: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
 /// Total aligned bytes carved from the arena since the last drain.
@@ -581,6 +588,74 @@ fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<()
 		}
 	}
 	return device_synchronize();
+}
+
+/// Page granularity for a VMM-backed reservation (2 MiB, the ROCm VMM minimum).
+const VMM_PAGE: usize = 2 << 20;
+
+/// THE single choke point for a VMM-backed contiguous span: reserves a
+/// `ceil(bytes/page)`-page VA range and creates + maps one physical handle per
+/// page, so the returned base is DETERMINISTICALLY backed — a first-write memset
+/// can never page-fault the way a cold `hipMallocAsync` pool suballocation does.
+/// Shared by the arena claim and [`crate::tiered`]; every VMM `hipMem*` call lives
+/// here and in [`vmm_unmap_span`], nowhere else. Returns `(base, page-handles)`.
+pub fn vmm_map_span(bytes: usize) -> Option<(*mut c_void, Vec<*mut c_void>)> {
+	let pages = bytes.div_ceil(VMM_PAGE);
+	if pages == 0 {
+		return None;
+	}
+	let mut va: *mut c_void = ptr::null_mut();
+	callspy::tick(&callspy::MEM_ADDRESS_RESERVE);
+	// SAFETY: &raw mut va is a valid out-slot for the reserved base address.
+	if check(unsafe { crate::hip::vmm_reserve(&raw mut va, pages * VMM_PAGE) }).is_err() {
+		return None;
+	}
+	let mut handles: Vec<*mut c_void> = Vec::with_capacity(pages);
+	for s in 0..pages {
+		let mut h: *mut c_void = ptr::null_mut();
+		callspy::tick(&callspy::MEM_CREATE);
+		// SAFETY: &raw mut h is a valid out-slot for the new physical handle.
+		if check(unsafe { crate::hip::vmm_create(&raw mut h, VMM_PAGE) }).is_err() {
+			vmm_unmap_span(va, &handles);
+			return None;
+		}
+		// SAFETY: s < pages, so va + s*page stays within the reserved range.
+		let slot = unsafe { va.cast::<u8>().add(s * VMM_PAGE).cast::<c_void>() };
+		callspy::tick(&callspy::MEM_MAP);
+		callspy::tick(&callspy::MEM_SET_ACCESS);
+		// SAFETY: slot is a reserved in-range page and h its freshly created handle.
+		if check(unsafe { crate::hip::vmm_map_at(slot, VMM_PAGE, h) }).is_err() {
+			// SAFETY: h was created just above and is released once here before bailing.
+			unsafe { crate::hip::vmm_release(h) };
+			vmm_unmap_span(va, &handles);
+			return None;
+		}
+		handles.push(h);
+	}
+	return Some((va, handles));
+}
+
+/// THE single choke point tearing down a [`vmm_map_span`] region: unmaps each
+/// page's slot, releases its handle, then frees the reserved VA span. Reserved-only
+/// tails (a mid-map failure) free correctly because the address range is freed by
+/// the mapped-page count, matching how the caller reserved and mapped.
+pub fn vmm_unmap_span(va: *mut c_void, handles: &[*mut c_void]) {
+	for (s, &h) in handles.iter().enumerate() {
+		// SAFETY: va + s*page is this slot's live mapped VA; unmap once before release.
+		let slot = unsafe { va.cast::<u8>().add(s * VMM_PAGE).cast::<c_void>() };
+		callspy::tick(&callspy::MEM_UNMAP);
+		// SAFETY: slot is mapped and h backs it; unmap then release, once each.
+		unsafe {
+			crate::hip::vmm_unmap(slot, VMM_PAGE);
+			callspy::tick(&callspy::MEM_RELEASE);
+			crate::hip::vmm_release(h);
+		}
+	}
+	if !va.is_null() {
+		callspy::tick(&callspy::MEM_ADDRESS_FREE);
+		// SAFETY: va is the reserved base of handles.len() contiguous mapped pages.
+		unsafe { crate::hip::vmm_addr_free(va, handles.len() * VMM_PAGE) };
+	}
 }
 
 #[inline]
@@ -1571,6 +1646,10 @@ pub enum Ownership {
 	Pool,
 	/// Borrows memory owned elsewhere; never freed.
 	Borrow,
+	/// Owns the VMM-backed device arena ([`vmm_map_span`]); its page handles live
+	/// in [`ARENA_VMM`] (one arena at a time) and are unmapped, released, and the
+	/// VA freed on drop.
+	Vmm,
 }
 
 pub struct GpuBuffer {
@@ -1757,13 +1836,16 @@ impl GpuBuffer {
 		if n_bytes > cap {
 			return None;
 		}
-		let ptr = Self::map_bytes(n_bytes).ok()?;
+		let (ptr, handles) = vmm_map_span(n_bytes)?;
+		if let Ok(mut g) = ARENA_VMM.lock() {
+			*g = Some((ptr.addr(), handles.iter().map(|h| return h.addr()).collect()));
+		}
 		tag_add(tag, n_bytes);
 		note_range(ptr.addr(), n_bytes, tag);
 		return Some(Self {
 			ptr,
 			len: n_bytes,
-			owned: Ownership::Pool,
+			owned: Ownership::Vmm,
 			tag,
 			dt: Dtype::F64,
 		});
@@ -2207,9 +2289,9 @@ impl GpuBuffer {
 impl Drop for GpuBuffer {
 	#[inline]
 	fn drop(&mut self) {
-		let Ownership::Pool = self.owned else {
+		if matches!(self.owned, Ownership::Borrow) {
 			return;
-		};
+		}
 		let Some(_nn) = ptr::NonNull::new(self.ptr) else {
 			return;
 		};
@@ -2218,16 +2300,30 @@ impl Drop for GpuBuffer {
 		};
 		tag_sub(self.tag, self.len);
 		FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
-		callspy::tick(&callspy::FREE_ASYNC);
-		// SAFETY: self.ptr is a live pool allocation freed exactly once here and nulled below.
-		let code = unsafe { hipFreeAsync(self.ptr, ptr::null_mut()) };
-		if let Some(_fail) = num::NonZeroI32::new(code) {
-			Write::error(format!(
-				"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:#x}",
-				self.len,
-				self.tag,
-				self.ptr.addr()
-			));
+		match mem::replace(&mut self.owned, Ownership::Borrow) {
+			Ownership::Vmm => {
+				let taken = ARENA_VMM.lock().ok().and_then(|mut g| return g.take());
+				if let Some((_va, addrs)) = taken {
+					let ptrs: Vec<*mut c_void> = addrs
+						.iter()
+						.map(|&a| return ptr::with_exposed_provenance_mut::<c_void>(a))
+						.collect();
+					vmm_unmap_span(self.ptr, &ptrs);
+				}
+			}
+			_pool => {
+				callspy::tick(&callspy::FREE_ASYNC);
+				// SAFETY: self.ptr is a live pool allocation freed exactly once here and nulled below.
+				let code = unsafe { hipFreeAsync(self.ptr, ptr::null_mut()) };
+				if let Some(_fail) = num::NonZeroI32::new(code) {
+					Write::error(format!(
+						"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:#x}",
+						self.len,
+						self.tag,
+						self.ptr.addr()
+					));
+				}
+			}
 		}
 		self.ptr = ptr::null_mut();
 	}

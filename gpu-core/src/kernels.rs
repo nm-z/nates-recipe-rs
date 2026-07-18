@@ -1609,6 +1609,8 @@ unsafe extern "C" {
 		d_inner: i32,
 		d_conv: i32,
 		apply_silu: i32,
+		state_in: *const c_void,
+		state_out: *mut c_void,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -1623,6 +1625,7 @@ unsafe extern "C" {
 		t: i32,
 		d_inner: i32,
 		d_state: i32,
+		state: *mut c_void,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -1638,6 +1641,7 @@ unsafe extern "C" {
 		n_head: i32,
 		n_group: i32,
 		conv_dim: i32,
+		state: *mut c_void,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -1674,6 +1678,7 @@ unsafe extern "C" {
 		d: i32,
 		per_channel: i32,
 		scale: f64,
+		state: *mut c_void,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -5031,9 +5036,13 @@ pub fn gpu_ssm_conv_causal_silu(
 	d_inner: usize,
 	d_conv: usize,
 	out: &GpuBuffer,
+	state_in: Option<&GpuBuffer>,
+	state_out: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
 	let bias_ptr = bias.map_or(ptr::null(), |b| b.ptr.cast_const());
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null bias is handled by the kernel (no per-channel add).
+	let sin = state_in.map_or(ptr::null(), |s| s.ptr.cast_const());
+	let sout = state_out.map_or(ptr::null_mut(), |s| s.ptr);
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. Null bias/state are handled by the kernel (zero-pad prefix, no state write-back).
 	unsafe {
 		launch_ssm_conv_causal_silu(
 			x.ptr.cast_const(),
@@ -5044,6 +5053,8 @@ pub fn gpu_ssm_conv_causal_silu(
 			ci(d_inner)?,
 			ci(d_conv)?,
 			1,
+			sin,
+			sout,
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);
@@ -5067,9 +5078,13 @@ pub fn gpu_ssm_conv_causal(
 	d_inner: usize,
 	d_conv: usize,
 	out: &GpuBuffer,
+	state_in: Option<&GpuBuffer>,
+	state_out: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
 	let bias_ptr = bias.map_or(ptr::null(), |b| b.ptr.cast_const());
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null bias is handled by the kernel (no per-channel add).
+	let sin = state_in.map_or(ptr::null(), |s| s.ptr.cast_const());
+	let sout = state_out.map_or(ptr::null_mut(), |s| s.ptr);
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. Null bias/state are handled by the kernel (zero-pad prefix, no state write-back).
 	unsafe {
 		launch_ssm_conv_causal_silu(
 			x.ptr.cast_const(),
@@ -5080,6 +5095,8 @@ pub fn gpu_ssm_conv_causal(
 			ci(d_inner)?,
 			ci(d_conv)?,
 			0,
+			sin,
+			sout,
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);
@@ -5110,8 +5127,10 @@ pub fn gpu_ssm_scan_mamba1(
 	d_inner: usize,
 	d_state: usize,
 	y: &GpuBuffer,
+	state: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	let sp = state.map_or(ptr::null_mut(), |s| s.ptr);
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null state zero-inits with no write-back.
 	unsafe {
 		launch_ssm_scan_mamba1(
 			xc.ptr.cast_const(),
@@ -5124,6 +5143,7 @@ pub fn gpu_ssm_scan_mamba1(
 			ci(t)?,
 			ci(d_inner)?,
 			ci(d_state)?,
+			sp,
 			ptr::null_mut(),
 			y.dtype().ffi(),
 		);
@@ -5156,8 +5176,10 @@ pub fn gpu_ssm_scan_mamba2(
 	n_group: usize,
 	conv_dim: usize,
 	y: &GpuBuffer,
+	state: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	let sp = state.map_or(ptr::null_mut(), |s| s.ptr);
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null state zero-inits with no write-back.
 	unsafe {
 		launch_ssm_scan_mamba2(
 			xbc.ptr.cast_const(),
@@ -5171,6 +5193,7 @@ pub fn gpu_ssm_scan_mamba2(
 			ci(n_head)?,
 			ci(n_group)?,
 			ci(conv_dim)?,
+			sp,
 			ptr::null_mut(),
 			y.dtype().ffi(),
 		);
@@ -5273,8 +5296,10 @@ pub fn gpu_gated_delta_scan(
 	d: usize,
 	per_channel: bool,
 	scale: f64,
+	state: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
-	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
+	let sp = state.map_or(ptr::null_mut(), |s| s.ptr);
+	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them. A null state zero-inits with no write-back.
 	unsafe {
 		launch_gated_delta_scan(
 			q.ptr.cast_const(),
@@ -5289,6 +5314,7 @@ pub fn gpu_gated_delta_scan(
 			ci(d)?,
 			i32::from(per_channel),
 			scale,
+			sp,
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);

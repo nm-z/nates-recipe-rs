@@ -27,31 +27,45 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_gqa_masked_attn(
+	fn launch_flash_gqa(
 		q: *const c_void,
-		k: *const c_void,
-		v: *const c_void,
+		kc: *const c_void,
+		vc: *const c_void,
 		out: *mut c_void,
-		t: i32,
+		t_q: i32,
+		t_kv: i32,
 		nqh: i32,
 		nkv: i32,
 		hd: i32,
-		prefix: i32,
 		max_bias: f64,
+		p_base: i32,
+		causal_below: i32,
+		m_io: *mut c_void,
+		l_io: *mut c_void,
+		acc_io: *mut c_void,
+		kv_off: i32,
+		finalize: i32,
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_mla_masked_attn(
+	fn launch_flash_mla(
 		q: *const c_void,
-		k: *const c_void,
-		v: *const c_void,
+		kc: *const c_void,
+		vc: *const c_void,
 		out: *mut c_void,
-		t: i32,
+		t_q: i32,
+		t_kv: i32,
 		nqh: i32,
 		nkv: i32,
 		hdk: i32,
 		hdv: i32,
-		prefix: i32,
+		p_base: i32,
+		causal_below: i32,
+		m_io: *mut c_void,
+		l_io: *mut c_void,
+		acc_io: *mut c_void,
+		kv_off: i32,
+		finalize: i32,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -79,6 +93,7 @@ unsafe extern "C" {
 		heads_per_tok: i32,
 		theta: *const c_void,
 		factors: *const c_void,
+		pos_base: i32,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -124,6 +139,41 @@ pub fn gpu_rope_partial(
 			ci(heads_per_tok)?,
 			theta.ptr_raw().cast_const(),
 			ptr::null(),
+			0,
+			ptr::null_mut(),
+			buf.dtype().ffi(),
+		);
+	}
+	return cl();
+}
+
+/// NeoX RoPE applying absolute positions offset by `pos_base` (KV-cache decode:
+/// the new rows sit at absolute positions `pos_base + row`). `pos_base == 0` is the
+/// prefill/full-forward case, identical to [`gpu_rope_partial`].
+///
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
+pub fn gpu_rope_partial_pos(
+	theta: &GpuBuffer,
+	rows: usize,
+	head_dim: usize,
+	rotary_dim: usize,
+	heads_per_tok: usize,
+	pos_base: usize,
+	buf: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: buf and theta are live GpuBuffer allocations and the dims are range-checked i32; the launcher only reads them.
+	unsafe {
+		launch_rope_partial(
+			buf.ptr_raw(),
+			ci(rows)?,
+			ci(head_dim)?,
+			ci(rotary_dim)?,
+			ci(heads_per_tok)?,
+			theta.ptr_raw().cast_const(),
+			ptr::null(),
+			ci(pos_base)?,
 			ptr::null_mut(),
 			buf.dtype().ffi(),
 		);
@@ -156,6 +206,42 @@ pub fn gpu_rope_partial_factors(
 			ci(heads_per_tok)?,
 			theta.ptr_raw().cast_const(),
 			factors.ptr_raw().cast_const(),
+			0,
+			ptr::null_mut(),
+			buf.dtype().ffi(),
+		);
+	}
+	return cl();
+}
+
+/// LongRoPE per-pair-factor NeoX RoPE at absolute positions offset by `pos_base`
+/// (KV-cache decode). `pos_base == 0` matches [`gpu_rope_partial_factors`].
+///
+/// # Errors
+/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_rope_partial_factors_pos(
+	theta: &GpuBuffer,
+	rows: usize,
+	head_dim: usize,
+	rotary_dim: usize,
+	heads_per_tok: usize,
+	factors: &GpuBuffer,
+	pos_base: usize,
+	buf: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: buf, theta and factors are live GpuBuffer allocations and the dims are range-checked i32; the launcher only reads them.
+	unsafe {
+		launch_rope_partial(
+			buf.ptr_raw(),
+			ci(rows)?,
+			ci(head_dim)?,
+			ci(rotary_dim)?,
+			ci(heads_per_tok)?,
+			theta.ptr_raw().cast_const(),
+			factors.ptr_raw().cast_const(),
+			ci(pos_base)?,
 			ptr::null_mut(),
 			buf.dtype().ffi(),
 		);
@@ -232,34 +318,63 @@ pub fn gpu_rmsnorm_f64_nogamma(
 	return cl();
 }
 
+
+/// Batched flash attention (GQA/MQA) — the sole attention path. `q` is `[t_q,nqh,hd]`
+/// (the NEW query rows, pre-scaled by `1/sqrt(hd)`), `kc`/`vc` are `[t_kv,nkv,hd]`
+/// (the K/V cache, or a per-forward K/V buffer), `out` is `[t_q,nqh,hd]`. Online
+/// softmax, never materializes the score matrix; `t_q == 1` and `t_q > 1` run the
+/// identical algorithm.
+///
+/// `causal_below` is a POSITION BOUND, never a flag: key `sp` is masked out for the
+/// query at absolute position `p = p_base+i` exactly when `p < causal_below && sp > p`.
+/// Pass `t_kv` for a fully causal pass (every query masks its future), `0` for a
+/// fully bidirectional pass (nothing masked), or the prompt length for the diffusion
+/// canvas (causal prompt, bidirectional canvas). Passing `1` here would make only
+/// position 0 causal — never pass a bool.
+///
 /// # Errors
 /// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
-pub fn gpu_gqa_attn(
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_flash_gqa(
 	q: &GpuBuffer,
-	k: &GpuBuffer,
-	v: &GpuBuffer,
-	t: usize,
+	kc: &GpuBuffer,
+	vc: &GpuBuffer,
+	t_q: usize,
+	t_kv: usize,
 	nqh: usize,
 	nkv: usize,
 	hd: usize,
-	prefix: usize,
 	max_bias: f64,
+	p_base: usize,
+	causal_below: usize,
 	out: &GpuBuffer,
+	m_io: Option<&GpuBuffer>,
+	l_io: Option<&GpuBuffer>,
+	acc_io: Option<&GpuBuffer>,
+	kv_off: usize,
+	finalize: bool,
 ) -> Result<(), HipError> {
-	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
+	// SAFETY: launcher reads valid device buffers with matching dims on the default stream; carry buffers are null or live.
 	unsafe {
-		launch_gqa_masked_attn(
+		launch_flash_gqa(
 			q.ptr_raw().cast_const(),
-			k.ptr_raw().cast_const(),
-			v.ptr_raw().cast_const(),
+			kc.ptr_raw().cast_const(),
+			vc.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			ci(t)?,
+			ci(t_q)?,
+			ci(t_kv)?,
 			ci(nqh)?,
 			ci(nkv)?,
 			ci(hd)?,
-			ci(prefix)?,
 			max_bias,
+			ci(p_base)?,
+			ci(causal_below)?,
+			m_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			l_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			acc_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			ci(kv_off)?,
+			i32::from(finalize),
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);
@@ -267,39 +382,53 @@ pub fn gpu_gqa_attn(
 	return cl();
 }
 
-/// Multi-head Latent Attention: causal MQA/GQA softmax where the query-key dot
-/// runs over `hdk` and the value gather over `hdv` (MLA's compressed K carries a
-/// shared RoPE key the V lacks). `q` is expected pre-scaled by `1/sqrt(n_embd_head_k)`.
+/// Batched flash MLA — distinct key/value head dims (`hdk` dot, `hdv` gather), MQA.
+/// `q` pre-scaled. See [`gpu_flash_gqa`]; `kc` is `[t_kv,nkv,hdk]`, `vc` is
+/// `[t_kv,nkv,hdv]`, `out` is `[t_q,nqh,hdv]`.
 ///
 /// # Errors
 /// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_mla_attn(
+pub fn gpu_flash_mla(
 	q: &GpuBuffer,
-	k: &GpuBuffer,
-	v: &GpuBuffer,
-	t: usize,
+	kc: &GpuBuffer,
+	vc: &GpuBuffer,
+	t_q: usize,
+	t_kv: usize,
 	nqh: usize,
 	nkv: usize,
 	hdk: usize,
 	hdv: usize,
-	prefix: usize,
+	p_base: usize,
+	causal_below: usize,
 	out: &GpuBuffer,
+	m_io: Option<&GpuBuffer>,
+	l_io: Option<&GpuBuffer>,
+	acc_io: Option<&GpuBuffer>,
+	kv_off: usize,
+	finalize: bool,
 ) -> Result<(), HipError> {
-	// SAFETY: launcher reads valid device buffers with matching dims on the default stream.
+	// SAFETY: launcher reads valid device buffers with matching dims on the default stream; carry buffers are null or live.
 	unsafe {
-		launch_mla_masked_attn(
+		launch_flash_mla(
 			q.ptr_raw().cast_const(),
-			k.ptr_raw().cast_const(),
-			v.ptr_raw().cast_const(),
+			kc.ptr_raw().cast_const(),
+			vc.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			ci(t)?,
+			ci(t_q)?,
+			ci(t_kv)?,
 			ci(nqh)?,
 			ci(nkv)?,
 			ci(hdk)?,
 			ci(hdv)?,
-			ci(prefix)?,
+			ci(p_base)?,
+			ci(causal_below)?,
+			m_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			l_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			acc_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			ci(kv_off)?,
+			i32::from(finalize),
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);

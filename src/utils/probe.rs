@@ -529,19 +529,11 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 	bytes as f64 / best / 1e9
 }
 
+/// Delegates to [`gpu_core::tiered::data_dir`], the one spill-dir owner shared
+/// by the training OOC spill, the KV-cache spill, and the disk-tier budget
+/// measurement.
 pub fn data_dir() -> anyhow::Result<PathBuf> {
-	let base = match env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-		Some(x) => PathBuf::from(x),
-		None => {
-			let home = env::var_os("HOME")
-				.filter(|v| !v.is_empty())
-				.ok_or_else(|| anyhow::anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
-			PathBuf::from(home).join(".cache")
-		}
-	};
-	let dir = base.join("recipe");
-	fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("data_dir {}: {e}", dir.display()))?;
-	Ok(dir)
+	return gpu_core::tiered::data_dir().map_err(|e| anyhow::anyhow!("data_dir: {e}"));
 }
 
 fn bench_cpu_flops() -> f64 {

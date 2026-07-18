@@ -154,6 +154,7 @@ unsafe extern "C" {
 		states: *mut c_void,
 		n_steps: i32,
 		dim: i32,
+		state: *mut c_void,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -762,7 +763,12 @@ pub fn gpu_segment_max(
 	return Ok(());
 }
 
-/// Runs the first-order linear recurrence scan `state = a * state + b` over `n_steps` steps of width `dim`, writing states into `states`.
+/// Runs the first-order linear recurrence scan `h = a * h + b` over `n_steps`
+/// steps of width `dim`, writing per-step states into `states`. `state` (nullable)
+/// carries the recurrence across calls: when present, `h` is loaded from it at
+/// entry and the final `h` written back, so a scan over only the NEW steps is
+/// bit-identical to a full-sequence scan; when `None`, `h` starts at zero with no
+/// write-back.
 ///
 /// # Errors
 /// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
@@ -773,8 +779,10 @@ pub fn gpu_scan_linear_recurrence(
 	n_steps: usize,
 	dim: usize,
 	states: &GpuBuffer,
+	state: Option<&GpuBuffer>,
 ) -> Result<(), HipError> {
-	// SAFETY: a, b, and states are live device buffers sized for n_steps*dim; the launcher signature matches these arguments.
+	let sp = state.map_or(ptr::null_mut(), |s| s.ptr_raw());
+	// SAFETY: a, b, and states are live device buffers sized for n_steps*dim; the launcher signature matches these arguments. A null state zero-inits with no write-back.
 	unsafe {
 		launch_scan_linear_recurrence(
 			a.ptr_raw().cast_const(),
@@ -782,6 +790,7 @@ pub fn gpu_scan_linear_recurrence(
 			states.ptr_raw(),
 			safe_i32(n_steps),
 			safe_i32(dim),
+			sp,
 			ptr::null_mut(),
 			states.dtype().ffi(),
 		);

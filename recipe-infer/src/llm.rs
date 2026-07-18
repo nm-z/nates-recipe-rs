@@ -1,7 +1,7 @@
 use crate::gguf::{Gguf, Val};
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_gqa_attn, gpu_rmsnorm_f64,
+	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
@@ -13,11 +13,11 @@ use std::cell::RefCell;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::mem;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +33,10 @@ mod models;
 /// compute type) and every activation, scalar, and scratch buffer is carved at
 /// this width, so the dtype-generic kernels dispatch to the f32 path throughout.
 pub(crate) const FWD_DT: Dtype = Dtype::F32;
+
+/// Process-unique suffix for KV spill file names, so concurrent caches in one
+/// process (tests) never collide on a path.
+static KV_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Carves `n` forward-width elements, reporting a carve-miss in the right units.
 fn falloc(n: usize) -> Result<GpuBuffer, gpu_core::HipError> {
@@ -146,7 +150,7 @@ impl Headless {
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
-			models::dispatch(m, l, src, dst, t, ar, &self.attn_scale)?;
+			models::dispatch(m, l, src, dst, t, ar, &self.attn_scale, None)?;
 			mem::swap(&mut src, &mut dst);
 		}
 		let last_h = src.view((t - 1) * ne, ne);
@@ -177,24 +181,44 @@ impl Drop for Headless {
 	}
 }
 
-/// Headless greedy generation: embeds the exact `toks` (bypassing the
-/// tokenizer) and greedily generates `n_new` tokens through the verified
-/// decode layers, returning the generated ids.
+/// Headless greedy generation: embeds the exact `toks` (bypassing the tokenizer)
+/// and greedily generates `n_new` tokens, returning the generated ids. EVERY arch
+/// runs THROUGH the incremental cache (prefill the prompt once, then one row per
+/// step: attention layers append their K/V and attend the full cache, recurrent
+/// layers carry their scan/conv state) — the one decode path, so the reference
+/// oracle validates exactly what generation runs.
 pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
+	return greedy_windowed(gguf, toks, n_new, toks.len() + n_new);
+}
+
+/// [`greedy`] constrained to a `win`-row VRAM window: rows evicted past the window
+/// spill to the host mirror and attention runs the segmented ascending carry, so
+/// `greedy_windowed(.., win < len)` agreeing with `greedy(..)` is the driver-level
+/// chunked==unchunked spill gate. `greedy` itself is the `win == len + n_new`
+/// (never-spilling) case of this function.
+pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> Result<Vec<u32>> {
 	anyhow::ensure!(!toks.is_empty(), "greedy: empty token sequence");
-	let h = Headless::open(gguf, toks.len() + n_new)?;
-	let mut seq = toks.to_vec();
+	anyhow::ensure!(win >= 1, "greedy: zero-row VRAM window");
+	let total = toks.len() + n_new;
+	let win = win.min(total);
+	let h = Headless::open(gguf, toks.len().min(win))?;
+	let softcap = models::final_softcap(&h.m);
+	let lsc = models::logit_scale(&h.m);
+	let vocab = h.m.hp.vocab;
+	let mut cache = KvCache::new(&h.m, win, total - win)?;
+	let mut logits = vec![0.0f64; vocab];
+	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
+	for c in toks.chunks(win) {
+		forward_rows(&h.m, c, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
+	}
 	let mut generated = Vec::with_capacity(n_new);
 	for _ in 0..n_new {
-		let logits = h.logits_last(&seq)?;
-		let next = logits
-			.iter()
-			.enumerate()
-			.max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(cmp::Ordering::Equal))
-			.map(|(i, _)| i as u32)
-			.unwrap_or(0);
-		seq.push(next);
+		let next = pick_greedy(&logits, vocab, lsc, softcap);
 		generated.push(next);
+		if generated.len() >= n_new {
+			break;
+		}
+		forward_rows(&h.m, &[next], &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
 	}
 	return Ok(generated);
 }
@@ -932,6 +956,13 @@ struct Arena {
 	d_g: GpuBuffer,
 	d_bt: GpuBuffer,
 	d_o: GpuBuffer,
+	/// Query-side online-softmax carry `(cm, cl, cacc)` threaded across the
+	/// ascending spill segment launches — per decode row, so it scales with this
+	/// arena's width. The K/V staging windows live on the [`KvCache`] (carved once
+	/// at cache-open, window-granular), never here.
+	cm: GpuBuffer,
+	cl: GpuBuffer,
+	cacc: GpuBuffer,
 }
 
 impl Arena {
@@ -944,6 +975,8 @@ impl Arena {
 			return falloc(n)
 				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * FWD_DT.elem_size())));
 		};
+		let nqh_max = hp.dims.iter().map(|d| return d.nqh).max().unwrap_or(1);
+		let sacc = hp.qd_max.max(hp.kv_lora_rank).max(nqh_max * hp.head_k_mla);
 		Ok(Arena {
 			x: a(t * ne)?,
 			q: a(t * hp.qd_max)?,
@@ -1012,6 +1045,9 @@ impl Arena {
 			d_g: a((t * hp.delta_win).max(1))?,
 			d_bt: a((t * hp.delta_win).max(1))?,
 			d_o: a((t * hp.delta_win).max(1))?,
+			cm: a((t * nqh_max).max(1))?,
+			cl: a((t * nqh_max).max(1))?,
+			cacc: a((t * sacc).max(1))?,
 		})
 	}
 }
@@ -2157,7 +2193,7 @@ fn layer(
 	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
 	gpu_rope_partial(theta, t * nqh, hd, d.rotary, nqh, &ar.q)?;
 	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
-	gpu_gqa_attn(&ar.q, &ar.k, &ar.v, t, nqh, nkv, hd, prefix, 0.0, &ar.attn)?;
+	gpu_flash_gqa(&ar.q, &ar.k, &ar.v, t, t, nqh, nkv, hd, 0.0, 0, prefix, &ar.attn, None, None, None, 0, true)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -2331,89 +2367,519 @@ fn lm_head_into(
 }
 
 
-/// Autoregressive causal decode for dense (non-diffusion) models against a
-/// resident, already-loaded model: embed the running sequence, run the causal
-/// layers, take the last position's logits, greedily pick the next token, stream
-/// it, and repeat until EOS. The weights stay put across calls; only the per-call
-/// scratch arena is carved and dropped here, so a chat session reuses the loaded
-/// model for every message with no reload.
-fn decode_causal(
+/// Per-layer KV cache carved once at [`ChatSession::open`] and kept resident for
+/// the session: `k[l]`/`v[l]` hold up to `t_max` positions of this layer's
+/// attention keys/values (GQA `nkv*hd`, or the compressed `kv_lora+rope` / `kv_lora`
+/// for MLA), `len` is how many are populated, `ids` mirrors the token id at each
+/// position so a later turn finds its common prefix. One-claim law: allocated at
+/// open, never freed or grown mid-run.
+struct KvCache {
+	/// Per-layer VRAM K/V window: the resident rows `[win_base, win_base+win)`. The
+	/// window is the first waterfall tier; rows evicted below `win_base` live in the
+	/// host tiers ([`hk`]/[`hv`], RAM then disk). Attention over a fully-resident
+	/// cache reads this buffer directly (one launch); a spilled cache stages evicted
+	/// segments back into the window and carries state across launches.
+	k: Vec<GpuBuffer>,
+	v: Vec<GpuBuffer>,
+	kw: Vec<usize>,
+	vw: Vec<usize>,
+	/// VRAM window capacity in rows, and the absolute row currently at window offset 0.
+	win: usize,
+	win_base: usize,
+	/// Host-tier backing for rows evicted from the VRAM window: per-layer
+	/// [`HostStore`]s that fill the measured RAM budget first, then append to a
+	/// session-scoped spill file (waterfall order). Empty until the cache first
+	/// exceeds `win` rows, so a within-window session pays nothing.
+	hk: Vec<HostStore>,
+	hv: Vec<HostStore>,
+	/// Double-buffered staging windows host K/V segments are read back into during
+	/// a spilled decode, each sized for one full window of the widest layer's rows.
+	/// Carved once at cache-open from the claim remainder after the weights and the
+	/// resident window (the capacity divisor reserves their per-token cost), so the
+	/// readback grain is the window — independent of any step's decode width.
+	/// `None` when the waterfall affords no host tier (`host_cap == 0`).
+	stage: Option<KvStage>,
+	/// Per-layer recurrent matrix/vector state (SSM / delta), `None` for attention
+	/// or FFN-only layers. Carried across decode steps by the stateful scan kernels.
+	rec: Vec<Option<GpuBuffer>>,
+	rec_sz: Vec<usize>,
+	/// Per-layer conv windows (the previous `d_conv-1` input rows per conv), and a
+	/// second set the current step writes into. After each incremental forward the
+	/// two swap, so the next step reads what this one wrote (ping-pong).
+	conv: Vec<Vec<GpuBuffer>>,
+	conv_nxt: Vec<Vec<GpuBuffer>>,
+	conv_sz: Vec<Vec<usize>>,
+	len: usize,
+	ids: Vec<u32>,
+	t_max: usize,
+}
+
+/// The cache's double-buffered spill staging: `sk[i]`/`sv[i]` each hold one full
+/// window of the widest layer's K/V rows, so a spilled attention walks the host
+/// mirror in window-sized read-ahead blocks.
+struct KvStage {
+	sk: [GpuBuffer; 2],
+	sv: [GpuBuffer; 2],
+}
+
+/// Append-only host store for one layer's evicted K/V rows: bytes `[0, ram.len())`
+/// live in RAM, everything after in a session-scoped spill file in the same
+/// directory [`gpu_core::tiered::Budgets`] measures, deleted on drop. `ram_budget`
+/// is this store's prorated share of the measured RAM tier — `ram_data * w / Σw`
+/// over every layer's K and V row widths, so all stores cross to disk at the same
+/// evicted-row count. The first append that would exceed the budget routes whole
+/// to the file, so the RAM/disk boundary always sits on an append (whole-row)
+/// edge and every staged block splits into at most one RAM and one file range.
+///
+/// The two io directions never share a path: eviction writes go through `wf`,
+/// staging reads through an independent `rf` descriptor, both positioned
+/// (`pwrite`/`pread` — no seek cursor) with no lock between them. NVMe is full
+/// duplex, so eviction write-behind and staging read-ahead can run concurrently;
+/// nothing in this structure serializes one direction against the other.
+pub(crate) struct HostStore {
+	ram: Vec<u8>,
+	ram_budget: usize,
+	wf: Option<fs::File>,
+	rf: RefCell<Option<fs::File>>,
+	path: PathBuf,
+	file_len: usize,
+}
+
+impl HostStore {
+	fn new(ram_budget: usize, path: PathBuf) -> HostStore {
+		return HostStore {
+			ram: Vec::new(),
+			ram_budget,
+			wf: None,
+			rf: RefCell::new(None),
+			path,
+			file_len: 0,
+		};
+	}
+
+	fn len(&self) -> usize {
+		return self.ram.len() + self.file_len;
+	}
+
+	fn append_f32(&mut self, vals: &[f32]) -> Result<()> {
+		let mut bytes = Vec::with_capacity(vals.len() * 4);
+		for v in vals {
+			bytes.extend_from_slice(&v.to_le_bytes());
+		}
+		if self.wf.is_none() && self.ram.len() + bytes.len() <= self.ram_budget {
+			self.ram.extend_from_slice(&bytes);
+			return Ok(());
+		}
+		if self.wf.is_none() {
+			let f = fs::OpenOptions::new()
+				.write(true)
+				.create(true)
+				.truncate(true)
+				.open(&self.path)
+				.with_context(|| format!("KV spill file {}", self.path.display()))?;
+			self.wf = Some(f);
+		}
+		let Some(f) = &self.wf else {
+			bail!("KV spill file {} closed mid-append", self.path.display());
+		};
+		f.write_all_at(&bytes, self.file_len as u64)
+			.with_context(|| format!("KV spill write at {} in {}", self.file_len, self.path.display()))?;
+		self.file_len += bytes.len();
+		return Ok(());
+	}
+
+	/// Uploads bytes `[off, off+len)` into `dst` from wherever they live: the RAM
+	/// range goes up directly, a file range is read into `scratch` first (through
+	/// the read-side descriptor, opened lazily). Both ranges are whole rows (the
+	/// RAM/disk boundary is append-aligned), so the element-offset view arithmetic
+	/// is exact.
+	pub(crate) fn stage_into(
+		&self,
+		off: usize,
+		len: usize,
+		dst: &GpuBuffer,
+		scratch: &mut Vec<u8>,
+	) -> Result<()> {
+		anyhow::ensure!(
+			off + len <= self.len(),
+			"KV host store: staging [{off}, {}) past the {} stored bytes",
+			off + len,
+			self.len()
+		);
+		let es = FWD_DT.elem_size();
+		let ram_n = self.ram.len().saturating_sub(off).min(len);
+		if ram_n > 0 {
+			dst.write_u8(&self.ram[off..off + ram_n])?;
+		}
+		let file_n = len - ram_n;
+		if file_n > 0 {
+			let mut rf = self.rf.borrow_mut();
+			if rf.is_none() {
+				*rf = Some(
+					File::open(&self.path)
+						.with_context(|| format!("KV spill read-open {}", self.path.display()))?,
+				);
+			}
+			let Some(f) = rf.as_ref() else {
+				bail!("KV host store: {} file bytes requested but no spill file", file_n);
+			};
+			let foff = (off + ram_n - self.ram.len()) as u64;
+			scratch.resize(file_n, 0);
+			f.read_exact_at(scratch, foff)
+				.with_context(|| format!("KV spill read [{foff}, +{file_n}) from {}", self.path.display()))?;
+			dst.view(ram_n / es, file_n / es).write_u8(&scratch[..])?;
+		}
+		return Ok(());
+	}
+
+	fn truncate(&mut self, len: usize) {
+		if len <= self.ram.len() {
+			self.ram.truncate(len);
+			*self.rf.borrow_mut() = None;
+			if self.wf.take().is_some() {
+				let _ = fs::remove_file(&self.path);
+			}
+			self.file_len = 0;
+		} else {
+			self.file_len = len - self.ram.len();
+		}
+	}
+}
+
+impl Drop for HostStore {
+	fn drop(&mut self) {
+		if self.wf.take().is_some() {
+			let _ = fs::remove_file(&self.path);
+		}
+	}
+}
+
+impl KvCache {
+	fn new(m: &Model, win: usize, host_cap: usize) -> Result<KvCache> {
+		let nl = m.hp.nl;
+		let es = FWD_DT.elem_size();
+		let mut k = Vec::with_capacity(nl);
+		let mut v = Vec::with_capacity(nl);
+		let mut kw = Vec::with_capacity(nl);
+		let mut vw = Vec::with_capacity(nl);
+		let mut rec = Vec::with_capacity(nl);
+		let mut rec_sz = Vec::with_capacity(nl);
+		let mut conv = Vec::with_capacity(nl);
+		let mut conv_nxt = Vec::with_capacity(nl);
+		let mut conv_sz = Vec::with_capacity(nl);
+		for l in 0..nl {
+			let s = models::layer_cache_shape(m, l);
+			k.push(falloc(win * s.kw.max(1))?);
+			v.push(falloc(win * s.vw.max(1))?);
+			kw.push(s.kw);
+			vw.push(s.vw);
+			if s.rec > 0 {
+				let b = falloc(s.rec)?;
+				b.memset_zero(s.rec * es)?;
+				rec.push(Some(b));
+			} else {
+				rec.push(None);
+			}
+			rec_sz.push(s.rec);
+			let mut cw = Vec::with_capacity(s.conv.len());
+			let mut cwn = Vec::with_capacity(s.conv.len());
+			for &w in &s.conv {
+				let a = falloc(w.max(1))?;
+				a.memset_zero(w.max(1) * es)?;
+				cw.push(a);
+				let b = falloc(w.max(1))?;
+				b.memset_zero(w.max(1) * es)?;
+				cwn.push(b);
+			}
+			conv.push(cw);
+			conv_nxt.push(cwn);
+			conv_sz.push(s.conv.clone());
+		}
+		let skw = kw.iter().copied().max().unwrap_or(0);
+		let svw = vw.iter().copied().max().unwrap_or(0);
+		let stage = if host_cap > 0 && skw > 0 {
+			Some(KvStage {
+				sk: [falloc(win * skw)?, falloc(win * skw)?],
+				sv: [falloc(win * svw.max(1))?, falloc(win * svw.max(1))?],
+			})
+		} else {
+			None
+		};
+		let total_w: usize = kw.iter().sum::<usize>() + vw.iter().sum::<usize>();
+		let (ram_budget, spill_dir) = if host_cap > 0 && total_w > 0 {
+			let dir = kv_spill_dir()?;
+			(gpu_core::tiered::Budgets::measure(0, 0, &dir).ram_data, dir)
+		} else {
+			(0, PathBuf::new())
+		};
+		let sid = KV_SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+		let store = |w: usize, name: &str, l: usize| -> HostStore {
+			let budget = if total_w > 0 { ram_budget / total_w * w } else { 0 };
+			let path = spill_dir
+				.join(format!("recipe-kv-{}-{sid}-l{l}-{name}.spill", process::id()));
+			return HostStore::new(budget, path);
+		};
+		let hk = (0..nl).map(|l| return store(kw[l], "k", l)).collect();
+		let hv = (0..nl).map(|l| return store(vw[l], "v", l)).collect();
+		return Ok(KvCache {
+			k,
+			v,
+			kw,
+			vw,
+			win,
+			win_base: 0,
+			hk,
+			hv,
+			stage,
+			rec,
+			rec_sz,
+			conv,
+			conv_nxt,
+			conv_sz,
+			len: 0,
+			ids: Vec::new(),
+			t_max: win + host_cap,
+		});
+	}
+
+	/// Drops cached positions past `keep` (cross-turn: rewind to the common prefix
+	/// with the newly templated sequence). Buffers keep their bytes; only `len`/`ids`
+	/// shrink, and stale rows are never read (attention bounds itself by `len + new`).
+	/// Rewinding below `win_base` truncates the host mirror to the kept rows and
+	/// restarts the window empty at `keep` — the kept prefix is then attended from
+	/// the host tier. Legal only when no layer carries recurrent state, or when
+	/// `keep == len` — a recurrence cannot be partially rewound; see
+	/// [`KvCache::clear_scan`].
+	fn rewind(&mut self, keep: usize) {
+		self.len = keep.min(self.len);
+		self.ids.truncate(self.len);
+		if self.len < self.win_base {
+			let es = FWD_DT.elem_size();
+			for l in 0..self.k.len() {
+				self.hk[l].truncate(self.len * self.kw[l] * es);
+				self.hv[l].truncate(self.len * self.vw[l] * es);
+			}
+			self.win_base = self.len;
+		}
+	}
+
+	/// Zeroes every recurrent/conv state and empties the cache, so a recurrent arch
+	/// whose new prompt diverges before the end of the cached prefix reprocesses from
+	/// row 0 through the same decode path (its scan state cannot be rewound to an
+	/// interior position — only the final state is kept).
+	fn clear_scan(&mut self) -> Result<()> {
+		let es = FWD_DT.elem_size();
+		for (rb, &sz) in self.rec.iter().zip(self.rec_sz.iter()) {
+			if let Some(b) = rb {
+				b.memset_zero(sz * es)?;
+			}
+		}
+		for (cv, szs) in self.conv.iter().zip(self.conv_sz.iter()) {
+			for (b, &w) in cv.iter().zip(szs.iter()) {
+				b.memset_zero(w.max(1) * es)?;
+			}
+		}
+		for (cv, szs) in self.conv_nxt.iter().zip(self.conv_sz.iter()) {
+			for (b, &w) in cv.iter().zip(szs.iter()) {
+				b.memset_zero(w.max(1) * es)?;
+			}
+		}
+		self.len = 0;
+		self.ids.clear();
+		for l in 0..self.k.len() {
+			self.hk[l].truncate(0);
+			self.hv[l].truncate(0);
+		}
+		self.win_base = 0;
+		return Ok(());
+	}
+
+	/// Ensures the VRAM window can hold `t` more rows. When appending them would
+	/// overflow, the resident rows `[win_base, len)` flush to the host byte mirror
+	/// (D2H through the ledger) and `win_base` advances to `len` — the window
+	/// restarts empty and the flushed rows are then attended from the host tier by
+	/// the segmented driver. A within-window session never flushes, so it stays on
+	/// the one-launch fits path. `true` iff a flush happened (the layer now spills).
+	fn ensure_room(&mut self, t: usize) -> Result<bool> {
+		if (self.len - self.win_base) + t <= self.win {
+			return Ok(false);
+		}
+		let resident = self.len - self.win_base;
+		for l in 0..self.k.len() {
+			if self.kw[l] == 0 {
+				continue;
+			}
+			let mut kf = vec![0.0f32; resident * self.kw[l]];
+			let mut vf = vec![0.0f32; resident * self.vw[l]];
+			self.k[l].download_f32(&mut kf)?;
+			self.v[l].download_f32(&mut vf)?;
+			self.hk[l].append_f32(&kf)?;
+			self.hv[l].append_f32(&vf)?;
+		}
+		self.win_base = self.len;
+		return Ok(true);
+	}
+}
+
+/// Greedy argmax over `vocab` logits with the arch's logit scale and final softcap
+/// applied (both monotone, so they only matter at the boundary), matching the
+/// reference pick so the cached decode stays token-exact.
+fn pick_greedy(logits: &[f64], vocab: usize, lsc: f64, softcap: f64) -> u32 {
+	let mut best = 0usize;
+	let mut bv = f64::MIN;
+	for (i, &v) in logits.iter().take(vocab).enumerate() {
+		let vs = v * lsc;
+		let sv = if softcap > 0.0 {
+			softcap * (vs / softcap).tanh()
+		} else {
+			vs
+		};
+		if sv > bv {
+			bv = sv;
+			best = i;
+		}
+	}
+	return best as u32;
+}
+
+/// Runs one incremental forward over `rows` NEW tokens sitting at absolute
+/// positions `cache.len ..`, appending their K/V into every layer's cache and
+/// leaving the last row's logits in `logits`. Embed/Q/FFN/norm see only these rows;
+/// attention reads the full cache (`len + rows`). A batch call (`rows.len() > 1`) is
+/// the turn-1 prefill (`cache.len == 0`); single-row calls are cross-turn suffix
+/// tokens and generation steps. Advances `cache.len`/`cache.ids` by `rows`.
+fn forward_rows(
 	m: &Model,
-	tokenizer: &crate::tokenizer::Tokenizer,
-	mut toks: Vec<u32>,
-	prefix: usize,
+	rows: &[u32],
 	attn_scale: &GpuBuffer,
-	on_round: &mut dyn FnMut(&[Tok]) -> bool,
-) -> Result<String> {
+	ar: &Arena,
+	cache: &mut KvCache,
+	logits: &mut [f64],
+	lm_scratch: &mut [f64],
+) -> Result<()> {
 	let ne = m.hp.ne;
 	let nl = m.hp.nl;
+	let t = rows.len();
+	let base_off = cache.len;
+	let scale = models::embedding_scale(m);
+	let mut base = vec![0.0f64; t * ne];
+	for (p, &tk) in rows.iter().enumerate() {
+		let b = tk as usize * ne * 2;
+		for x in 0..ne {
+			base[p * ne + x] =
+				bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
+		}
+	}
+	add_pos_embd(m, &mut base, base_off, t, ne);
+	let h0 = ar.ha.view(0, t * ne);
+	h0.load(&base)?;
+	if let Some((g, b)) = &m.embed_norm {
+		gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
+	}
+	if models::embd_skip(m) {
+		gpu_rmsnorm_f64_nogamma(&h0, &m.eps, t, ne, &h0)?;
+		gpu_copy_into(&h0, t * ne, &ar.embd_skip)?;
+	}
+	cache.ensure_room(t)?;
+	let stage = match (&cache.stage, cache.win_base > 0) {
+		(Some(s), true) => Some(s),
+		(None, true) => bail!("KV cache spilled {} rows without staging windows", cache.win_base),
+		_ => None,
+	};
+	let mut src: &GpuBuffer = &ar.ha;
+	let mut dst: &GpuBuffer = &ar.hb;
+	for l in 0..nl {
+		let spill = match stage {
+			Some(s) if cache.kw[l] > 0 => Some(models::SpillCtx {
+				win_base: cache.win_base,
+				hk: &cache.hk[l],
+				hv: &cache.hv[l],
+				sk: &s.sk,
+				sv: &s.sv,
+				rows: cache.win,
+			}),
+			_ => None,
+		};
+		let dec = models::DecCtx {
+			cached: cache.len,
+			kc: &cache.k[l],
+			vc: &cache.v[l],
+			rec: cache.rec[l].as_ref(),
+			conv_in: &cache.conv[l],
+			conv_out: &cache.conv_nxt[l],
+			spill,
+		};
+		models::dispatch(m, l, src, dst, t, ar, attn_scale, Some(dec))?;
+		mem::swap(&mut src, &mut dst);
+	}
+	for l in 0..nl {
+		mem::swap(&mut cache.conv[l], &mut cache.conv_nxt[l]);
+	}
+	let last_h = src.view((t - 1) * ne, ne);
+	models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
+	lm_head_into(m, &ar.hfs, 1, ar, logits, lm_scratch)?;
+	cache.len += t;
+	cache.ids.extend_from_slice(rows);
+	return Ok(());
+}
+
+/// Incremental autoregressive decode against the resident KV cache. Prefills the
+/// uncached suffix of `toks` (batched when the cache is empty, else one token at a
+/// time so the offset-causal attention runs through [`gpu_flash_decode_gqa`]), then
+/// generates greedily one token per step — each step embeds/GEMMs/norms ONLY the new
+/// token and attends it against the full cache. The cache and its token ids survive
+/// the call so the next turn reuses the common prefix.
+fn decode_cached(
+	m: &Model,
+	tokenizer: &crate::tokenizer::Tokenizer,
+	toks: &[u32],
+	attn_scale: &GpuBuffer,
+	cache: &mut KvCache,
+	on_round: &mut dyn FnMut(&[Tok]) -> bool,
+) -> Result<String> {
 	let vocab_size = m.hp.vocab;
 	let eos = m.hp.eos;
 	let softcap = models::final_softcap(m);
+	let lsc = models::logit_scale(m);
 	let max_new = 256usize;
-	let t_max = prefix + max_new;
-
+	let per_row = kv_row_elems(m) * FWD_DT.elem_size();
+	if toks.len() > cache.t_max {
+		bail!(
+			"KV cache: sequence of {} tokens ({}) exceeds the VRAM+RAM+disk waterfall ceiling of {} tokens ({}) — all tiers exhausted (arch {})",
+			toks.len(),
+			crate::human_bytes(toks.len() * per_row),
+			cache.t_max,
+			crate::human_bytes(cache.t_max * per_row),
+			m.hp.arch
+		);
+	}
+	let p_new = toks.len() - cache.len;
+	let chunk = cache.win.max(1);
+	let aw = if cache.len == 0 { p_new.min(chunk) } else { 1 };
 	let ar = {
 		let _t = gpu_core::memory::tag_scope("arena");
-		Arena::new(&m.hp, t_max)?
+		Arena::new(&m.hp, aw.max(1))?
 	};
-
-	let mut out_ids: Vec<u32> = Vec::new();
-	let decode_start = Instant::now();
-	let mut ttft: Option<Duration> = None;
-	let mut base_all = vec![0.0f64; t_max * ne];
 	let mut logits = vec![0.0f64; m.hp.vocab];
 	let mut lm_scratch = vec![0.0f64; m.hp.lm_chunk];
-	for _new in 0..max_new {
-		let cur = toks.len();
-		let scale = models::embedding_scale(m);
-		let base = &mut base_all[..cur * ne];
-		for (p, &tk) in toks.iter().enumerate() {
-			let b = tk as usize * ne * 2;
-			for x in 0..ne {
-				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
-			}
+	let decode_start = Instant::now();
+	if cache.len == 0 {
+		for c in toks.chunks(chunk) {
+			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
 		}
-		add_pos_embd(m, base, 0, cur, ne);
-		let h0 = ar.ha.view(0, cur * ne);
-		h0.load(base)?;
-		if let Some((g, b)) = &m.embed_norm {
-			gpu_layernorm_into(&h0, g, b, &m.eps, cur, ne, &h0)?;
+	} else {
+		let suffix = toks[cache.len..].to_vec();
+		for tk in &suffix {
+			forward_rows(m, &[*tk], attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
 		}
-		let mut src: &GpuBuffer = &ar.ha;
-		let mut dst: &GpuBuffer = &ar.hb;
-		for l in 0..nl {
-			models::dispatch(m, l, src, dst, cur, &ar, attn_scale)?;
-			mem::swap(&mut src, &mut dst);
-		}
-		let last = cur - 1;
-		let last_h = src.view(last * ne, ne);
-		models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
-		lm_head_into(m, &ar.hfs, 1, &ar, &mut logits, &mut lm_scratch)?;
-		let lsc = models::logit_scale(m);
-		let mut best = 0usize;
-		let mut bv = f64::MIN;
-		for (i, &v) in logits.iter().take(vocab_size).enumerate() {
-			let vs = v * lsc;
-			let sv = if softcap > 0.0 {
-				softcap * (vs / softcap).tanh()
-			} else {
-				vs
-			};
-			if sv > bv {
-				bv = sv;
-				best = i;
-			}
-		}
-		let next = best as u32;
-		if ttft.is_none() {
-			ttft = Some(decode_start.elapsed());
-		}
+	}
+	let ttft = decode_start.elapsed();
+	let mut out_ids: Vec<u32> = Vec::new();
+	let mut next = pick_greedy(&logits, vocab_size, lsc, softcap);
+	loop {
 		if next == eos || m.hp.eog.contains(&next) {
 			break;
 		}
-		toks.push(next);
 		out_ids.push(next);
 		let text = tokenizer.decode(&out_ids, true).unwrap_or_default();
 		let keep_going = on_round(&[Tok {
@@ -2422,20 +2888,22 @@ fn decode_causal(
 			age: 0,
 			heat: 1.0,
 		}]);
-		if !keep_going {
+		if !keep_going || out_ids.len() >= max_new || cache.len >= cache.t_max {
 			break;
 		}
+		forward_rows(m, &[next], attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
+		next = pick_greedy(&logits, vocab_size, lsc, softcap);
 	}
 	let elapsed = decode_start.elapsed();
 	let body = tokenizer.decode(&out_ids, true).unwrap_or_default();
 	let out = format!(
 		"{body}\n\nTTFT {:.2}s, {} tokens, {:.2} tok/s",
-		ttft.map_or(0.0, |d| d.as_secs_f64()),
+		ttft.as_secs_f64(),
 		out_ids.len(),
 		out_ids.len() as f64 / elapsed.as_secs_f64().max(1e-9)
 	);
 	drop(ar);
-	Ok(out)
+	return Ok(out);
 }
 
 pub fn vram_probe_ask() -> Option<i32> {
@@ -2529,6 +2997,103 @@ pub struct ChatSession {
 	tokenizer: crate::tokenizer::Tokenizer,
 	vocab: Vec<String>,
 	attn_scale: GpuBuffer,
+	/// Resident per-layer incremental cache for every token arch (`Some` whenever
+	/// `ncanvas == 0`): attention K/V plus recurrent scan/conv state, carried across
+	/// turns. `None` only for the diffusion-canvas arches, which decode a fixed canvas.
+	cache: Option<KvCache>,
+}
+
+/// The KV-cache capacity the remaining claim affords, in tokens: no fixed ceiling
+/// and no borrowed default — the session holds as many positions as the hardware
+/// has room for after the weights land. Measures the per-row cost of the scratch
+/// arena with two throwaway probe carves (cost(2 rows) - cost(1 row) is one row;
+/// the difference from cost(1) is the row-independent part), then divides the
+/// remaining arena by one token's total cost: scratch row + this model's per-layer
+/// K/V + the spill staging's two window-granular buffer pairs (widest layer's K
+/// and V per window row) — so after the window and worst-case scratch are carved,
+/// the remainder IS the staging, by construction. Returns 0 when a single token
+/// does not fit, so the caller refuses with sizes instead of silently truncating.
+fn kv_capacity_tokens(m: &Model) -> Result<usize> {
+	let es = FWD_DT.elem_size();
+	let cache_row = kv_row_elems(m) * es;
+	let fixed_cache = fixed_cache_elems(m) * es;
+	let stage_row = {
+		let mut skw = 0usize;
+		let mut svw = 0usize;
+		for l in 0..m.hp.nl {
+			let s = models::layer_cache_shape(m, l);
+			skw = skw.max(s.kw);
+			svw = svw.max(s.vw);
+		}
+		2 * (skw + svw) * es
+	};
+	let avail = gpu_core::memory::arena_remaining();
+	let cost1 = {
+		let _probe = Arena::new(&m.hp, 1)?;
+		avail.saturating_sub(gpu_core::memory::arena_remaining())
+	};
+	let cost2 = {
+		let _probe = Arena::new(&m.hp, 2)?;
+		avail.saturating_sub(gpu_core::memory::arena_remaining())
+	};
+	let arena_row = cost2.saturating_sub(cost1);
+	let arena_fixed = cost1.saturating_sub(arena_row);
+	let per_token = arena_row + cache_row + stage_row;
+	if per_token == 0 {
+		return Ok(0);
+	}
+	let free = gpu_core::memory::arena_remaining().saturating_sub(arena_fixed + fixed_cache);
+	return Ok(free / per_token);
+}
+
+/// Elements of K plus V one token occupies across every layer, from the per-layer
+/// cache shapes (GQA `nkv*hd`, MLA compressed `kv_lora+rope`/`kv_lora`, or `0` for a
+/// recurrent layer). Recurrent layers spend no per-token cache; their fixed state
+/// is counted by [`fixed_cache_elems`].
+fn kv_row_elems(m: &Model) -> usize {
+	let mut n = 0usize;
+	for l in 0..m.hp.nl {
+		let s = models::layer_cache_shape(m, l);
+		n += s.kw + s.vw;
+	}
+	return n;
+}
+
+/// The token-independent cache elements: per-layer recurrent state plus every conv
+/// window (allocated twice for the ping-pong). Counted once at capacity time so the
+/// per-token divisor sees only the K/V that actually grows with sequence length.
+fn fixed_cache_elems(m: &Model) -> usize {
+	let mut n = 0usize;
+	for l in 0..m.hp.nl {
+		let s = models::layer_cache_shape(m, l);
+		n += s.rec;
+		let conv: usize = s.conv.iter().map(|&w| w.max(1)).sum();
+		n += 2 * conv;
+	}
+	return n;
+}
+
+/// The KV spill directory: [`gpu_core::tiered::data_dir`], the ONE owner shared
+/// with the training OOC spill and — critically — the SAME call the disk-tier
+/// budget measurement uses, so the measured free space and the spill bytes are
+/// always the same real filesystem (never a tmpfs the RAM tier already counts).
+fn kv_spill_dir() -> Result<PathBuf> {
+	return gpu_core::tiered::data_dir().context("KV spill dir");
+}
+
+/// Rows the RAM + disk waterfall tiers afford PAST the VRAM window, so the cache
+/// ceiling is the whole VRAM->RAM->DISK waterfall rather than a fixed VRAM-only
+/// t_max. Uses the same [`gpu_core::tiered::Budgets`] measurement as the training
+/// out-of-core path (`MemAvailable` and disk free, each minus the `USER_GB`
+/// reserve), pointed at [`kv_spill_dir`]; the host K/V pays only the per-row K/V
+/// bytes since the scratch arena stays on device.
+fn kv_host_tokens(m: &Model) -> Result<usize> {
+	let per_row = kv_row_elems(m) * FWD_DT.elem_size();
+	if per_row == 0 {
+		return Ok(0);
+	}
+	let b = gpu_core::tiered::Budgets::measure(0, 0, &kv_spill_dir()?);
+	return Ok((b.ram_data + b.disk_data) / per_row);
 }
 
 impl ChatSession {
@@ -2567,10 +3132,26 @@ impl ChatSession {
 			return Ok(None);
 		}
 		watchdog.disarm();
+		let cache = if m.hp.ncanvas == 0 {
+			let win = kv_capacity_tokens(&m)?;
+			if win == 0 {
+				bail!(
+					"KV cache: not one token fits — {} bytes free in the claim, {} bytes per token ({} layers)",
+					gpu_core::memory::arena_remaining(),
+					kv_row_elems(&m) * FWD_DT.elem_size(),
+					m.hp.nl
+				);
+			}
+			let host = kv_host_tokens(&m)?;
+			let _t = gpu_core::memory::tag_scope("kvcache");
+			Some(KvCache::new(&m, win, host)?)
+		} else {
+			None
+		};
 		Write::line(
 			gpu,
 			format!(
-				"loaded in {:.1}s (arch={} nl={} ne={} experts={} canvas={} vocab={} softcap={})",
+				"loaded in {:.1}s (arch={} nl={} ne={} experts={} canvas={} vocab={} softcap={} kvcache={})",
 				t_load.elapsed().as_secs_f64(),
 				m.hp.arch,
 				m.hp.nl,
@@ -2579,6 +3160,7 @@ impl ChatSession {
 				m.hp.ncanvas,
 				m.hp.vocab,
 				m.hp.softcap,
+				cache.is_some(),
 			),
 		);
 		return Ok(Some(ChatSession {
@@ -2586,13 +3168,17 @@ impl ChatSession {
 			tokenizer,
 			vocab,
 			attn_scale,
+			cache,
 		}));
 	}
 
-	/// Generates a reply for `prompt` (already chat-templated by the caller)
-	/// against the resident weights. Re-tokenizes the full text each call — no
-	/// KV cache across messages — and picks the causal or diffusion decode by the
-	/// model's canvas length.
+	/// Generates a reply for `prompt` (already chat-templated by the caller) against
+	/// the resident weights. For attention arches the per-layer KV cache survives
+	/// across calls: the newly templated sequence's token-level common prefix with
+	/// the cached ids is detected, the cache is rewound to it, and only the new
+	/// suffix runs — so turn N+1 with a long history pays for the new message alone.
+	/// Recurrent arches (no cache) recompute the full sequence; diffusion picks the
+	/// canvas decode.
 	pub fn generate_in(
 		&mut self,
 		prompt: &str,
@@ -2616,16 +3202,35 @@ impl ChatSession {
 			format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
 		);
 		if ncanvas == 0 {
-			return decode_causal(
-				&self.m,
-				&self.tokenizer,
-				toks,
-				prefix,
-				&self.attn_scale,
-				on_round,
+			let cache = match self.cache.as_mut() {
+				Some(c) => c,
+				None => bail!("non-canvas arch {} opened without a KV cache", self.m.hp.arch),
+			};
+			let mut keep = 0usize;
+			while keep < cache.ids.len() && keep < toks.len() && cache.ids[keep] == toks[keep] {
+				keep += 1;
+			}
+			let keep = keep.min(toks.len().saturating_sub(1));
+			if models::arch_has_recurrence(&self.m.hp.arch) && keep < cache.len {
+				cache.clear_scan()?;
+			} else {
+				cache.rewind(keep);
+			}
+			Write::line(
+				data,
+				format!("kvcache reuse: cached_prefix={} new_suffix={}", cache.len, toks.len() - cache.len),
 			);
+			return decode_cached(&self.m, &self.tokenizer, &toks, &self.attn_scale, cache, on_round);
 		}
 		return decode_canvas(&self.m, &self.vocab, toks, prefix, on_round);
+	}
+}
+
+impl Drop for ChatSession {
+	fn drop(&mut self) {
+		if let Some(slab) = self.m.store.take_slab() {
+			gpu_core::memory::release_device_arena(slab);
+		}
 	}
 }
 
@@ -2916,4 +3521,71 @@ fn decode_canvas(
 
 	drop(ar);
 	Ok(out)
+}
+
+#[cfg(test)]
+mod host_store_tests {
+	use super::*;
+
+	/// The waterfall law at the RAM/disk boundary, byte-exact: appends fill the
+	/// RAM budget, the first over-budget append routes whole to the spill file,
+	/// and a staged read spanning both tiers uploads the exact stored bytes.
+	/// Boundary arithmetic: budget 96 B = 3 rows of 8 f32; two 2-row (64 B)
+	/// appends -> the second would end at 128 B > 96, so RAM freezes at 64 B
+	/// (2 rows) and rows 2..6 live in the file.
+	#[test]
+	fn ram_boundary_then_disk_roundtrip_and_stage() {
+		let es = FWD_DT.elem_size();
+		let w = 8usize;
+		let path = env::temp_dir().join(format!("recipe-kv-test-{}.spill", process::id()));
+		let mut st = HostStore::new(3 * w * es, path.clone());
+		let row = |r: usize| -> Vec<f32> {
+			return (0..2 * w).map(|i| return (r * 100 + i) as f32 * 0.5).collect();
+		};
+		st.append_f32(&row(0)).expect("append rows 0-1");
+		assert_eq!(st.ram.len(), 2 * w * es, "first append stays in RAM");
+		assert_eq!(st.file_len, 0);
+		st.append_f32(&row(2)).expect("append rows 2-3");
+		assert_eq!(st.ram.len(), 2 * w * es, "RAM frozen at the boundary append");
+		assert_eq!(st.file_len, 2 * w * es, "over-budget append went whole to disk");
+		assert!(fs::metadata(&path).is_ok(), "spill file exists on disk");
+		st.append_f32(&row(4)).expect("append rows 4-5");
+		assert_eq!(st.len(), 6 * w * es);
+		let mut expect: Vec<f32> = Vec::new();
+		for r in [0usize, 2, 4] {
+			expect.extend_from_slice(&row(r));
+		}
+		let dst = GpuBuffer::alloc_ty(6 * w, FWD_DT).expect("stage dst");
+		let mut scratch = Vec::new();
+		st.stage_into(0, 6 * w * es, &dst, &mut scratch).expect("stage all 6 rows");
+		let mut got = vec![0.0f32; 6 * w];
+		dst.download_f32(&mut got).expect("download");
+		assert_eq!(got, expect, "full-range stage must return the exact stored bytes");
+		let dst2 = GpuBuffer::alloc_ty(3 * w, FWD_DT).expect("straddle dst");
+		st.stage_into(w * es, 3 * w * es, &dst2, &mut scratch).expect("stage rows 1..4");
+		let mut got2 = vec![0.0f32; 3 * w];
+		dst2.download_f32(&mut got2).expect("download straddle");
+		assert_eq!(got2, expect[w..4 * w], "RAM/file straddling stage must be byte-exact");
+		st.append_f32(&row(6)).expect("append rows 6-7 after a read");
+		let dst3 = GpuBuffer::alloc_ty(2 * w, FWD_DT).expect("post-append dst");
+		st.stage_into(6 * w * es, 2 * w * es, &dst3, &mut scratch)
+			.expect("stage rows 6..8 through the cached read descriptor");
+		let mut got3 = vec![0.0f32; 2 * w];
+		dst3.download_f32(&mut got3).expect("download post-append");
+		assert_eq!(
+			got3,
+			row(6),
+			"bytes written through the write descriptor must be visible through the independent read descriptor"
+		);
+		st.truncate(3 * w * es);
+		assert_eq!(st.len(), 3 * w * es);
+		assert_eq!(st.file_len, w * es, "truncate above the watermark shrinks only the file");
+		st.truncate(w * es);
+		assert_eq!(st.file_len, 0, "truncate below the watermark drops the file");
+		assert!(fs::metadata(&path).is_err(), "spill file deleted on truncate below RAM");
+		st.append_f32(&row(9)).expect("append after truncate");
+		assert_eq!(st.ram.len(), 3 * w * es, "RAM regrows to its budget once the file is gone");
+		drop(st);
+		assert!(fs::metadata(&path).is_err(), "no spill file left after drop");
+	}
 }

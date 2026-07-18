@@ -434,7 +434,7 @@ fn test_scan_linear_recurrence() {
 		__ub
 	};
 	let out = GpuBuffer::alloc(6).unwrap();
-	gpu_scan_linear_recurrence(&a, &b, 3, 2, &out).unwrap();
+	gpu_scan_linear_recurrence(&a, &b, 3, 2, &out, None).unwrap();
 	let mut v = [0.0f64; 6];
 	unsafe { out.download_async(&mut v, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();

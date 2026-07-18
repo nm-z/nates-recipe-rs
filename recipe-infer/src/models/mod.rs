@@ -13,7 +13,7 @@
 //!   switches: the same neutral driver reads them, so no arch needs a branch.
 mod common;
 
-use super::{Arena, Model};
+use super::{Arena, HostStore, Model};
 use anyhow::{Result, bail};
 use common::{
 	Ffn, Hy, HyMode, NormK, Recur, Spec, apply_norm, layer_hybrid, layer_mamba, layer_mamba2,
@@ -304,6 +304,196 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 	return false;
 }
 
+/// Per-layer incremental-decode context threaded through [`dispatch`] into every
+/// mixer. `cached` rows already live in this layer's persistent cache buffers; the
+/// `t` rows flowing into the block are the NEW tokens. An attention layer appends
+/// their K/V into `kc`/`vc` and attends the full cache. A recurrent layer loads its
+/// carried state from `rec` (the SSM/delta matrix state) and `conv_in` (the
+/// previous conv-window rows), processes only the new rows, and writes the updated
+/// state back into `rec` and `conv_out`. `None` at a call site is the full-forward
+/// path (fresh prefill with `cached == 0`, or a forward-only parity pass): mixers
+/// then pass null state to the kernels, which zero-init with no write-back — a path
+/// bit-identical to the pre-cache behavior.
+#[derive(Clone, Copy)]
+pub(super) struct DecCtx<'a> {
+	pub(super) cached: usize,
+	pub(super) kc: &'a GpuBuffer,
+	pub(super) vc: &'a GpuBuffer,
+	pub(super) rec: Option<&'a GpuBuffer>,
+	pub(super) conv_in: &'a [GpuBuffer],
+	pub(super) conv_out: &'a [GpuBuffer],
+	/// Present only once this layer's K/V cache has spilled past the VRAM window
+	/// (`win_base > 0`): attention then walks the whole causal range in window-sized
+	/// segments, staging the host-tier rows back in and carrying softmax state across
+	/// launches. Absent = the cache still fits the window, so attention is one
+	/// null-carry launch over `kc`/`vc` (bit-identical to the pre-spill path).
+	pub(super) spill: Option<SpillCtx<'a>>,
+}
+
+/// What a spilled attention layer needs from the cache: `win` is the resident VRAM
+/// `win_base` is the absolute row now at window offset 0 and `hk`/`hv` the byte
+/// mirror of the evicted rows `[0, win_base)` (RAM pool then disk). `sk`/`sv` are
+/// the cache-owned double-buffered staging windows, carved at cache-open from the
+/// claim remainder after weights and the resident window, each holding `rows`
+/// (one full window) of the widest layer's K/V — so host readback is
+/// window-granular regardless of this step's decode width. Query-side carry
+/// buffers stay in the per-step [`Arena`].
+#[derive(Clone, Copy)]
+pub(super) struct SpillCtx<'a> {
+	pub(super) win_base: usize,
+	pub(super) hk: &'a HostStore,
+	pub(super) hv: &'a HostStore,
+	pub(super) sk: &'a [GpuBuffer; 2],
+	pub(super) sv: &'a [GpuBuffer; 2],
+	pub(super) rows: usize,
+}
+
+/// The [`Comp`] composition entry for `arch`, or `None` if unlisted.
+fn comp_of(arch: &str) -> Option<Comp> {
+	for &(name, comp) in TABLE {
+		if name == arch {
+			return Some(comp);
+		}
+	}
+	return None;
+}
+
+/// True if `arch` carries any recurrent (SSM / delta-net / short-conv / linear)
+/// mixer layer. This is NOT a decode fork — every arch decodes through the one
+/// [`crate::llm`] cached path. It is only the cross-turn rewind policy: a
+/// recurrence cannot be partially rewound (only its final state is kept), so a
+/// recurrent arch whose new prompt diverges before the end of the cached prefix
+/// clears the whole cache and reprocesses from row 0 through that same path, while
+/// a pure-attention arch rewinds to any common prefix.
+pub(super) fn arch_has_recurrence(arch: &str) -> bool {
+	return matches!(
+		comp_of(arch),
+		Some(Comp::Recurrent | Comp::Mamba | Comp::Mamba2 | Comp::Hybrid(_))
+	);
+}
+
+/// Everything the incremental decode cache allocates for layer `l`: the attention
+/// K/V cache widths (`kw`/`vw`, elements per cached row; `0` for a recurrent or
+/// FFN-only layer), the recurrent matrix/vector state element count (`rec`; `0` for
+/// an attention or FIR-only layer), and the conv-window element counts in the
+/// mixer's own call order (`conv`; empty for a non-conv layer). Every cache shape
+/// flows from this one resolver so the cache never second-guesses a mixer's
+/// geometry — the mixer and the allocation read the same source of truth.
+pub(super) struct LayerCacheShape {
+	pub(super) kw: usize,
+	pub(super) vw: usize,
+	pub(super) rec: usize,
+	pub(super) conv: Vec<usize>,
+}
+
+fn attn_shape(m: &Model, l: usize) -> LayerCacheShape {
+	let d = &m.hp.dims[l];
+	let w = d.nkv * d.hd;
+	return LayerCacheShape { kw: w, vw: w, rec: 0, conv: Vec::new() };
+}
+
+fn mla_shape(m: &Model) -> LayerCacheShape {
+	return LayerCacheShape {
+		kw: m.hp.kv_lora_rank + m.hp.n_rot,
+		vw: m.hp.kv_lora_rank,
+		rec: 0,
+		conv: Vec::new(),
+	};
+}
+
+pub(super) fn layer_cache_shape(m: &Model, l: usize) -> LayerCacheShape {
+	let hp = &m.hp;
+	let empty = LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: Vec::new() };
+	let dc = hp.ssm_d_conv;
+	match comp_of(hp.arch.as_str()) {
+		None => empty,
+		Some(Comp::Dense(sp)) | Some(Comp::Moe(sp)) => {
+			if sp.mla { mla_shape(m) } else { attn_shape(m, l) }
+		}
+		Some(Comp::Talkie(_)) => attn_shape(m, l),
+		Some(Comp::Minicpm3(_)) => {
+			let nqh = hp.dims[l].nqh;
+			LayerCacheShape {
+				kw: nqh * hp.head_k_mla,
+				vw: nqh * hp.head_v_mla,
+				rec: 0,
+				conv: Vec::new(),
+			}
+		}
+		Some(Comp::Recurrent) => {
+			let d = &hp.dims[l];
+			LayerCacheShape { kw: 0, vw: 0, rec: d.nkv * d.hd, conv: Vec::new() }
+		}
+		Some(Comp::Mamba) => {
+			let (di, ds) = (hp.ssm_d_inner, hp.ssm_d_state);
+			LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * di] }
+		}
+		Some(Comp::Mamba2) => {
+			let (di, ds, ng) = (hp.ssm_d_inner, hp.ssm_d_state, hp.ssm_n_group.max(1));
+			let cd = di + 2 * ng * ds;
+			LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * cd] }
+		}
+		Some(Comp::Hybrid(hy)) => hybrid_layer_shape(m, l, &hy),
+	}
+}
+
+fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
+	let hp = &m.hp;
+	let dc = hp.ssm_d_conv;
+	if hy.mode == HyMode::Parallel {
+		let d = &hp.dims[l];
+		let w = d.nkv * d.hd;
+		let (di, ds, ng) = (hp.ssm_d_inner, hp.ssm_d_state, hp.ssm_n_group.max(1));
+		let cd = di + 2 * ng * ds;
+		return LayerCacheShape { kw: w, vw: w, rec: di * ds, conv: vec![(dc - 1) * cd] };
+	}
+	if common::layer_is_shortconv(m, l) {
+		let lc = hp.shortconv_l_cache;
+		return LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: vec![(lc - 1) * hp.ne] };
+	}
+	if common::layer_is_delta(m, l) {
+		let (d, _hk, hv, _key, _val, conv_dim) = common::delta_dims(m);
+		return match hy.recur {
+			Recur::Kda => {
+				let di = d * hv;
+				LayerCacheShape {
+					kw: 0,
+					vw: 0,
+					rec: hv * d * d,
+					conv: vec![(dc - 1) * di, (dc - 1) * di, (dc - 1) * di],
+				}
+			}
+			_gda => LayerCacheShape { kw: 0, vw: 0, rec: hv * d * d, conv: vec![(dc - 1) * conv_dim] },
+		};
+	}
+	if common::layer_is_recur(m, l) {
+		let (di, ds, ng) = (hp.ssm_d_inner, hp.ssm_d_state, hp.ssm_n_group.max(1));
+		return match hy.recur {
+			Recur::Mamba2 => {
+				let cd = di + 2 * ng * ds;
+				LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * cd] }
+			}
+			_mamba1_or_plamo2 => {
+				LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * di] }
+			}
+		};
+	}
+	if common::layer_is_attn(m, l) {
+		if hy.recur == Recur::Kda {
+			return mla_shape(m);
+		}
+		return attn_shape(m, l);
+	}
+	return LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: Vec::new() };
+}
+
+/// True if `m.hp.arch` runs Multi-head Latent Attention (deepseek2 family): its
+/// cache stores the compressed `kv_lora+rope` key and `kv_lora` value, sized apart
+/// from the plain GQA `nkv*hd`.
+pub(super) fn arch_mla(m: &Model) -> bool {
+	return spec_of(m).is_some_and(|sp| sp.mla);
+}
+
 /// The [`Spec`] for `m.hp.arch`, or `None` for recurrent / unlisted arches. Lets
 /// the neutral runtime resolve a Spec-flagged scalar without per-arch branching.
 fn spec_of(m: &Model) -> Option<Spec> {
@@ -398,23 +588,24 @@ pub(super) fn dispatch(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
+	dec: Option<DecCtx>,
 ) -> Result<()> {
 	let arch = m.hp.arch.as_str();
 	for &(name, comp) in TABLE {
 		if name == arch {
 			return match comp {
 				Comp::Dense(sp) | Comp::Moe(sp) if m.layer_is_moe(l) => {
-					layer_moe(m, l, &sp, h_in, h_out, t, ar, attn_scale)
+					layer_moe(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec)
 				}
 				Comp::Dense(sp) | Comp::Moe(sp) => {
-					layer_spec(m, l, &sp, h_in, h_out, t, ar, attn_scale)
+					layer_spec(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec)
 				}
-				Comp::Recurrent => layer_recurrent(m, l, h_in, h_out, t, ar, attn_scale),
-				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar),
-				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar),
-				Comp::Hybrid(hy) => layer_hybrid(m, l, &hy, h_in, h_out, t, ar, attn_scale),
-				Comp::Talkie(sp) => layer_talkie(m, l, &sp, h_in, h_out, t, ar, attn_scale),
-				Comp::Minicpm3(sp) => layer_minicpm3(m, l, &sp, h_in, h_out, t, ar, attn_scale),
+				Comp::Recurrent => layer_recurrent(m, l, h_in, h_out, t, ar, attn_scale, dec),
+				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar, dec),
+				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar, dec),
+				Comp::Hybrid(hy) => layer_hybrid(m, l, &hy, h_in, h_out, t, ar, attn_scale, dec),
+				Comp::Talkie(sp) => layer_talkie(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec),
+				Comp::Minicpm3(sp) => layer_minicpm3(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec),
 			};
 		}
 	}
