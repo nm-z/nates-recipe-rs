@@ -516,8 +516,11 @@ impl Train {
 					drop(Write::err("save: model has no trained params"));
 					process::abort();
 				}
+				let Ok(text) = recipe_infer::dump_ogdl(&params, filter, key, score) else {
+					return;
+				};
 				Rendered {
-					text: recipe_infer::dump_ogdl(&params, filter, key, score),
+					text,
 					neurons: params.iter().map(|p| p.out_dim).sum::<usize>(),
 				}
 			}

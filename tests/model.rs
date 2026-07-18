@@ -643,7 +643,7 @@ fn gpu_metrics_match_cpu_reference() {
 	let sc = Scratch::new_full(&params, n, &consts).expect("scratch");
 	forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 	let last = params.len() - 1;
-	let p = download_vec(&sc.acts[last], n);
+	let p = download_vec(&sc.acts[last], n).expect("download");
 	let ybar = y.iter().sum::<f64>() / n as f64;
 	let ss_tot = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>();
 
@@ -684,7 +684,7 @@ fn gpu_metrics_match_cpu_reference() {
 		let LossScale { sign, div } =
 			metric_gpu_into(lossfn, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar)
 				.expect("metric");
-		let v = sign * download_scalar(&sc.metric_scalar) / div;
+		let v = sign * download_scalar(&sc.metric_scalar).expect("download") / div;
 		if m == Metric::R2 { 1.0 - v } else { v }
 	};
 	close(metric(Metric::R2, Loss::Mse), r2_ref, "R2");
@@ -801,14 +801,14 @@ fn fit_loop_memory_flat() {
 	let consts = consts_buf();
 	let sc_ref = Scratch::new_infer(&params, n, &consts).expect("scratch");
 	forward_into(&params, &xbuf, None, n, &sc_ref.acts, &sc_ref).expect("forward");
-	let out_ref = download_vec(&sc_ref.acts[last], n);
+	let out_ref = download_vec(&sc_ref.acts[last], n).expect("download");
 	drop(sc_ref);
 	let sc = {
 		let _t_scratch = gpu_core::memory::tag_scope("scratch");
 		Scratch::new_full(&params, n, &consts).expect("scratch")
 	};
 	forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
-	let out_into = download_vec(&sc.acts[last], n);
+	let out_into = download_vec(&sc.acts[last], n).expect("download");
 	let fwd_diff = out_ref
 		.iter()
 		.zip(&out_into)
@@ -835,7 +835,7 @@ fn fit_loop_memory_flat() {
 			backward_step(Loss::Mse, &params, &xbuf, &ybuf, n, &sc, &ss);
 			kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar)
 				.expect("ss_res");
-			r2s.push(1.0 - download_scalar(&sc.metric_scalar) / ss_tot);
+			r2s.push(1.0 - download_scalar(&sc.metric_scalar).expect("download") / ss_tot);
 		}
 	}
 
@@ -952,11 +952,11 @@ fn ping_pong_gradients_match_per_layer() {
 	let last = params.len() - 1;
 	let init_w: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim))
+		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim).expect("download"))
 		.collect();
 	let init_b: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.b, p.out_dim))
+		.map(|p| download_vec(&p.b, p.out_dim).expect("download"))
 		.collect();
 
 	let ss = step_scalars(rate, n);
@@ -966,11 +966,11 @@ fn ping_pong_gradients_match_per_layer() {
 	backward_step(Loss::Mse, &params, &xbuf, &ybuf, n, &sc, &ss);
 	let pp_w: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim))
+		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim).expect("download"))
 		.collect();
 	let pp_b: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.b, p.out_dim))
+		.map(|p| download_vec(&p.b, p.out_dim).expect("download"))
 		.collect();
 
 	for (l, p) in params.iter().enumerate() {
@@ -1077,11 +1077,11 @@ fn ping_pong_gradients_match_per_layer() {
 	}
 	let ref_w: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim))
+		.map(|p| download_vec(&p.w, p.in_dim * p.out_dim).expect("download"))
 		.collect();
 	let ref_b: Vec<Vec<f64>> = params
 		.iter()
-		.map(|p| download_vec(&p.b, p.out_dim))
+		.map(|p| download_vec(&p.b, p.out_dim).expect("download"))
 		.collect();
 
 	let mut max_w_diff = 0.0f64;
@@ -1160,7 +1160,7 @@ fn stacked_conv_checkpoint_roundtrip() {
 		LayerSpec::Dense(1, Activation::Linear),
 	];
 	let fresh = plan_layer_params(&specs, 784, 0, 0, &[], PlanMode::Fresh).expect("fresh plan");
-	let text = fresh.dump_ogdl_host(fresh.host(), "r2", 0.5);
+	let text = fresh.dump_ogdl_host(fresh.host(), "r2", 0.5).expect("dump_ogdl_host");
 	let saved = load_ogdl_str(&text).expect("parse roundtrip");
 	let convs = saved
 		.iter()

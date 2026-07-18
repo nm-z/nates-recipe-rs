@@ -75,7 +75,9 @@ fn dump_add_api_roundtrips() {
 		drop(g.add(0.01f64, "z1.b"));
 		drop(g.add(vec![-0.4f64, 0.5], "z2.w"));
 		drop(g.add(0.02f64, "z2.b"));
-	});
+		Ok(())
+	})
+	.expect("ogdl_text");
 	let saved = load_ogdl_str(&text).expect("load_ogdl_str");
 	assert_eq!(saved.len(), 2, "two dense neurons, metric header skipped");
 	assert_eq!(

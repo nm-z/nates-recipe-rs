@@ -6,7 +6,6 @@ use gpu_core::kernels;
 use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cmp::Ordering;
-use std::process;
 use std::ptr;
 
 #[derive(Clone, Copy)]
@@ -511,25 +510,16 @@ pub fn attn_forward_cached(
 	Ok(())
 }
 
-pub fn download_vec(buf: &GpuBuffer, len: usize) -> Vec<f64> {
+pub fn download_vec(buf: &GpuBuffer, len: usize) -> anyhow::Result<Vec<f64>> {
 	let mut v = vec![0.0f64; len];
 	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
-	if !dl.is_ok() {
-		drop(Write::err(format!(
-			"gpu download: {}",
-			dl.err().map(|e| e.to_string()).unwrap_or_default()
-		)));
-		process::abort();
+	if let Err(e) = dl {
+		Write::err(format!("gpu download: {e}"))?;
 	}
-	let sync = gpu_core::hip::device_synchronize();
-	if !sync.is_ok() {
-		drop(Write::err(format!(
-			"gpu download sync: {}",
-			sync.err().map(|e| e.to_string()).unwrap_or_default()
-		)));
-		process::abort();
+	if let Err(e) = gpu_core::hip::device_synchronize() {
+		Write::err(format!("gpu download sync: {e}"))?;
 	}
-	v
+	return Ok(v);
 }
 
 pub fn infer_scored(
@@ -594,7 +584,7 @@ pub fn infer_scored(
 							ss_tot,
 							&sc.metric_scalar,
 						)?;
-						let v = sign * download_scalar(&sc.metric_scalar) / div;
+						let v = sign * download_scalar(&sc.metric_scalar)? / div;
 						match m {
 							Metric::R2 => 1.0 - v,
 							Metric::Loss
@@ -612,7 +602,7 @@ pub fn infer_scored(
 		None => Vec::new(),
 	};
 	Ok(Scored {
-		preds: download_vec(out, n * k),
+		preds: download_vec(out, n * k)?,
 		vals,
 	})
 }
@@ -628,23 +618,14 @@ pub struct Scored {
 	pub vals: Vec<f64>,
 }
 
-pub fn download_scalar(buf: &GpuBuffer) -> f64 {
+pub fn download_scalar(buf: &GpuBuffer) -> anyhow::Result<f64> {
 	let mut v = [0.0f64];
 	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
-	if !dl.is_ok() {
-		drop(Write::err(format!(
-			"scalar download: {}",
-			dl.err().map(|e| e.to_string()).unwrap_or_default()
-		)));
-		process::abort();
+	if let Err(e) = dl {
+		Write::err(format!("scalar download: {e}"))?;
 	}
-	let sync = gpu_core::hip::device_synchronize();
-	if !sync.is_ok() {
-		drop(Write::err(format!(
-			"scalar download sync: {}",
-			sync.err().map(|e| e.to_string()).unwrap_or_default()
-		)));
-		process::abort();
+	if let Err(e) = gpu_core::hip::device_synchronize() {
+		Write::err(format!("scalar download sync: {e}"))?;
 	}
-	v[0]
+	return Ok(v[0]);
 }

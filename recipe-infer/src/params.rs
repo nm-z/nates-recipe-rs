@@ -240,9 +240,14 @@ impl LayerPlan {
 			.collect()
 	}
 
-	pub fn dump_ogdl_host(&self, image: &[f64], key: &str, score: f64) -> String {
+	pub fn dump_ogdl_host(
+		&self,
+		image: &[f64],
+		key: &str,
+		score: f64,
+	) -> anyhow::Result<String> {
 		let blk = |bp: &BlockPlan| image[bp.off..bp.off + bp.len].to_vec();
-		ogdl_text(|g| {
+		return ogdl_text(|g| {
 			drop(g.add(score, key));
 			let mut z = 1;
 			let mut at = 1;
@@ -306,25 +311,28 @@ impl LayerPlan {
 					}
 				}
 			}
-		})
+			Ok(())
+		});
 	}
 }
 
-pub fn ogdl_text(build: impl FnOnce(ogdl::Graph)) -> String {
+pub fn ogdl_text(
+	build: impl FnOnce(ogdl::Graph) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
 	static SEQ: AtomicU64 = AtomicU64::new(0);
 	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
 	let tmp = env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", process::id()));
 	let Some(tp) = tmp.to_str() else {
-		drop(Write::err("utf8 tmp"));
-		process::abort();
+		Write::err("dump temp path is not valid utf8")?;
+		return Err(anyhow::anyhow!("dump temp path is not valid utf8"));
 	};
 	let _ = fs::remove_file(tp);
 	let g = ogdl::file(tp);
-	build(g.clone());
+	build(g.clone())?;
 	drop(g.file(tp));
 	let text = fs::read_to_string(tp).unwrap_or_default();
 	let _ = fs::remove_file(tp);
-	text
+	return Ok(text);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -776,10 +784,10 @@ pub fn dump_ogdl(
 	filter: Option<&[Param]>,
 	key: &str,
 	score: f64,
-) -> String {
+) -> anyhow::Result<String> {
 	let want_w = filter.is_none_or(|f| f.contains(&Param::W));
 	let want_b = filter.is_none_or(|f| f.contains(&Param::B));
-	crate::params::ogdl_text(|g| {
+	return crate::params::ogdl_text(|g| {
 		drop(g.add(score, key));
 		let mut z = 1;
 		let mut at = 1;
@@ -788,7 +796,7 @@ pub fn dump_ogdl(
 			match p.kind {
 				LayerKind::Embed => {
 					if want_w {
-						let table = download_vec(&p.w, p.vocab * p.dim);
+						let table = download_vec(&p.w, p.vocab * p.dim)?;
 						for id in 0..p.vocab {
 							drop(g.add(
 								table[id * p.dim..(id + 1) * p.dim].to_vec(),
@@ -800,13 +808,13 @@ pub fn dump_ogdl(
 				LayerKind::Attn => {
 					let dd = p.dim * p.dim;
 					if want_w {
-						drop(g.add(download_vec(&p.w, dd), &format!("attn{at}.wq")));
-						drop(g.add(download_vec(&p.wk, dd), &format!("attn{at}.wk")));
-						drop(g.add(download_vec(&p.wv, dd), &format!("attn{at}.wv")));
-						drop(g.add(download_vec(&p.wo, dd), &format!("attn{at}.wo")));
+						drop(g.add(download_vec(&p.w, dd)?, &format!("attn{at}.wq")));
+						drop(g.add(download_vec(&p.wk, dd)?, &format!("attn{at}.wk")));
+						drop(g.add(download_vec(&p.wv, dd)?, &format!("attn{at}.wv")));
+						drop(g.add(download_vec(&p.wo, dd)?, &format!("attn{at}.wo")));
 					}
 					if want_b {
-						let bias = download_vec(&p.b, p.dim);
+						let bias = download_vec(&p.b, p.dim)?;
 						for nm in ["bq", "bk", "bv", "bo"] {
 							drop(g.add(bias.clone(), &format!("attn{at}.{nm}")));
 						}
@@ -829,20 +837,23 @@ pub fn dump_ogdl(
 					));
 					if want_w {
 						drop(g.add(
-							download_vec(&p.w, w_count),
+							download_vec(&p.w, w_count)?,
 							&format!("conv{cv}.w"),
 						));
 					}
 					if want_b {
-						drop(g.add(download_vec(&p.b, cout), &format!("conv{cv}.b")));
+						drop(g.add(download_vec(&p.b, cout)?, &format!("conv{cv}.b")));
 					}
 					cv += 1;
 				}
 				LayerKind::Dense => {
-					let w = download_vec(&p.w, p.in_dim * p.out_dim);
-					let b = download_vec(&p.b, p.out_dim);
-					let slope = (p.act == Activation::PRelu)
-						.then(|| download_scalar(&p.palpha));
+					let w = download_vec(&p.w, p.in_dim * p.out_dim)?;
+					let b = download_vec(&p.b, p.out_dim)?;
+					let slope = if p.act == Activation::PRelu {
+						Some(download_scalar(&p.palpha)?)
+					} else {
+						None
+					};
 					for j in 0..p.out_dim {
 						if want_w {
 							let row: Vec<f64> = (0..p.in_dim)
@@ -861,7 +872,8 @@ pub fn dump_ogdl(
 				}
 			}
 		}
-	})
+		Ok(())
+	});
 }
 
 pub fn write_ogdl(path: &str, out: &str) -> anyhow::Result<()> {

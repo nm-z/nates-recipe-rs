@@ -64,13 +64,13 @@ fn kv_cache_matches_full_attention() {
 	let sc_ref = Scratch::new_full(&params, n, &consts).expect("scratch");
 	assert!(!sc_ref.infer, "ref must use the full-batch path");
 	forward_into(&params, &h, None, n, &sc_ref.acts, &sc_ref).expect("forward");
-	let reference = download_vec(&sc_ref.acts[0], n * in_dim);
+	let reference = download_vec(&sc_ref.acts[0], n * in_dim).expect("download");
 	drop(sc_ref);
 
 	let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 	assert!(sc.infer, "inference must use the KV-cache path");
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
-	let cached = download_vec(&sc.acts[0], n * in_dim);
+	let cached = download_vec(&sc.acts[0], n * in_dim).expect("download");
 
 	let (mut maxdiff, mut maxabs) = (0.0_f64, 0.0_f64);
 	for i in 0..reference.len() {
@@ -112,10 +112,10 @@ fn kv_cache_bounded_memory_long_sequence() {
 	let consts = consts_buf();
 	let sc = Scratch::new_infer(&params, n, &consts).expect("scratch");
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
-	let _ = download_vec(&sc.acts[0], 1);
+	let _ = download_vec(&sc.acts[0], 1).expect("download");
 	let t0 = Instant::now();
 	forward_into(&params, &h, None, n, &sc.acts, &sc).expect("forward");
-	let out = download_vec(&sc.acts[0], n * in_dim);
+	let out = download_vec(&sc.acts[0], n * in_dim).expect("download");
 	let ms = t0.elapsed().as_secs_f64() * 1e3;
 	assert!(
 		out.iter().all(|v| return v.is_finite()),
@@ -150,8 +150,8 @@ fn splitk_dw_matches_rocblas() {
 		let dw = GpuBuffer::alloc(k * n).expect("dw");
 		gpu_core::kernels::gpu_splitk_dw_into(&input, &grad, &partials, m, n, k, &dw)
 			.expect("splitk dw");
-		let r = download_vec(&reference, k * n);
-		let g = download_vec(&dw, k * n);
+		let r = download_vec(&reference, k * n).expect("download");
+		let g = download_vec(&dw, k * n).expect("download");
 		let (mut maxdiff, mut maxabs) = (0.0_f64, 0.0_f64);
 		for i in 0..r.len() {
 			maxdiff = maxdiff.max((r[i] - g[i]).abs());

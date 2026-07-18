@@ -743,7 +743,7 @@ impl ModelInner {
 											.map(|_p| -> anyhow::Result<()> {
 												recipe_infer::write_ogdl(
 												path,
-												&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score),
+												&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score)?,
 											)?;
 												checkpointed = Some(());
 												Ok(())
@@ -829,7 +829,7 @@ impl ModelInner {
 			.for_each(|s| fit_score = s);
 		let neurons: usize = params.iter().map(|p| p.out_dim).sum();
 		*self.saved_ogdl.borrow_mut() = Some(crate::model::SavedWeights {
-			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, fit_score),
+			text: plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, fit_score)?,
 			neurons,
 			d,
 			c_cat,
