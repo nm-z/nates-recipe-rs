@@ -16,7 +16,6 @@ use std::error;
 use std::fmt;
 use std::mem;
 use std::path::Path;
-use std::process;
 
 /// The encoded numeric result handed to the trainer: feature matrix `x`, flat
 /// `n*n_targets` target vector `y`, and the column metadata the model needs.
@@ -493,7 +492,7 @@ fn admit_ceiling(
 	if let Some((base, seq)) = bases.into_iter().max_by_key(|(_, c)| *c) {
 		line.push(oom_pair("widest", &format!("{base}×{seq}")));
 	}
-	drop(Write::err(line.join(", ")));
+	Write::error(line.join(", "));
 	Err(CeilingExceeded {
 		label: label.to_string(),
 		rows: n,
@@ -1001,7 +1000,7 @@ pub fn shuffle_split(
 		}
 		Dataset {
 			x: Mat::from_shape_vec((sel.len(), cols), xd).unwrap_or_else(|e| {
-				drop(Write::err(format!("split: x reshape: {e}")));
+				Write::error(format!("split: x reshape: {e}"));
 				return Mat::zeros((sel.len(), cols));
 			}),
 			y: Vec1::from(yd),
@@ -1078,9 +1077,9 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 		}
 		Nan::Error => {
 			if !v.iter().all(|x| x.is_finite()) {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"NaN/inf in '{name}' — no missing values allowed here"
-				)));
+				));
 			}
 			return (0..v.len()).collect();
 		}
@@ -1092,23 +1091,23 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 /// enters the numeric pipeline. Targets use `Drop` (a missing label can't be
 /// invented); features use `ImputeMean`. Afterwards the matrix holds no NaN, so
 /// nothing downstream handles NaN again.
-pub fn clean_dataset(d: &mut Dataset) {
+pub fn clean_dataset(d: &mut Dataset) -> anyhow::Result<()> {
 	let k = d.n_targets;
 	let n = d.x.nrows();
 	let src = crate::data::short_path(&d.source);
 	if d.x.ncols() == 0 {
-		drop(Write::err(format!(
+		return Err(Errored::new(format!(
 			"no columns found, check delimiter  {src}  →  {n} row(s) × 0 column(s)"
-		)));
-		process::exit(1);
+		))
+		.into());
 	}
 	if d.y.len() < n * k {
-		drop(Write::err(format!(
+		return Err(Errored::new(format!(
 			"{k} target column(s) but {} target value(s)  {src}  →  {n} row(s) × {k} target(s) needs {} value(s)",
 			d.y.len(),
 			n * k
-		)));
-		process::exit(1);
+		))
+		.into());
 	}
 	let mut keep: Vec<usize> = (0..n).collect();
 	for j in 0..k {
@@ -1141,6 +1140,7 @@ pub fn clean_dataset(d: &mut Dataset) {
 			d.x[(i, j)] = col[i];
 		}
 	}
+	return Ok(());
 }
 
 /// ARFF / pre-parsed path: `attrs` + `rows` are already in hand (the loader ran

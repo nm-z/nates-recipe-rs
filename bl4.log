@@ -1,0 +1,108 @@
+warning: usage of an `unsafe` block
+  --> log/src/lib.rs:93:3
+   |
+93 | /         unsafe {
+94 | |             std::env::set_var("RECIPE_LOG", &p);
+95 | |         }
+   | |_________^
+   |
+   = note: requested on the command line with `-W unsafe-code`
+
+warning: `log` (lib) generated 1 warning
+warning: variant `Q2_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:16:7
+   |
+16 |       Q2_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q2K`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variant `Q3_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:17:7
+   |
+17 |       Q3_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q3K`
+
+warning: variant `Q4_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:18:7
+   |
+18 |       Q4_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q4K`
+
+warning: variant `Q5_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:19:7
+   |
+19 |       Q5_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q5K`
+
+warning: variant `Q6_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:20:7
+   |
+20 |       Q6_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q6K`
+
+warning: fields `value_length`, `key_length_swa`, and `value_length_swa` are never read
+   --> recipe-infer/src/llm.rs:374:2
+    |
+357 | struct Hparams {
+    |        ------- fields in this struct
+...
+374 |     value_length: usize,
+    |     ^^^^^^^^^^^^
+375 |     key_length_swa: usize,
+    |     ^^^^^^^^^^^^^^
+376 |     value_length_swa: usize,
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: static variable `Bf16C` should have an upper case name
+   --> recipe-infer/src/dequant.rs:251:8
+    |
+251 | static Bf16C: Bf16Codec = Bf16Codec;
+    |        ^^^^^
+    |
+    = note: `#[warn(non_upper_case_globals)]` (part of `#[warn(nonstandard_style)]`) on by default
+help: convert the identifier to upper case
+    |
+251 - static Bf16C: Bf16Codec = Bf16Codec;
+251 + static BF16_C: Bf16Codec = Bf16Codec;
+    |
+
+warning: `recipe-infer` (lib) generated 7 warnings (run `cargo fix --lib -p recipe-infer` to apply 1 suggestion)
+   Compiling pantry v0.1.0 (/home/nate/Desktop/nates-recipe-rs/pantry)
+   Compiling recipe v0.1.1 (/home/nate/Desktop/nates-recipe-rs)
+warning: unused import: `std::process`
+  --> pantry/src/encode.rs:19:5
+   |
+19 | use std::process;
+   |     ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+    --> pantry/src/encode.rs:1137:2
+     |
+1095 |   pub fn clean_dataset(d: &mut Dataset) -> anyhow::Result<()> {
+     |                                            ------------------ expected `Result<(), anyhow::Error>` because of return type
+...
+1137 | /     for j in 0..cols {
+1138 | |         let mut col: Vec<f64> = (0..rows).map(|i| d.x[(i, j)]).collect();
+1139 | |         nan_clean(&mut col, Nan::ImputeMean, "feature");
+1140 | |         for i in 0..rows {
+...    |
+1143 | |     }
+     | |_____^ expected `Result<(), Error>`, found `()`
+     |
+     = note:   expected enum `Result<(), anyhow::Error>`
+             found unit type `()`
+     = note: `for` loops evaluate to unit type `()`
+help: try adding an expression at the end of the block
+     |
+1143 ~     }
+1144 ~     Ok(())
+     |
+
+For more information about this error, try `rustc --explain E0308`.
+warning: `pantry` (lib) generated 1 warning
+error: could not compile `pantry` (lib) due to 1 previous error; 1 warning emitted

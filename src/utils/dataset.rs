@@ -536,9 +536,9 @@ impl DataInner {
 				}
 			}
 		};
-		pantry::encode::clean_dataset(&mut prepared.train);
+		pantry::encode::clean_dataset(&mut prepared.train)?;
 		for ds in prepared.test.as_mut().into_iter() {
-			pantry::encode::clean_dataset(ds);
+			pantry::encode::clean_dataset(ds)?;
 		}
 		anyhow::ensure!(
 			prepared.train.x.nrows() > 0,
