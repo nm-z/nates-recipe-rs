@@ -1485,6 +1485,7 @@ pub fn ram_probe_ask() -> Option<i32> {
 	let Ok(n) = sz.to_string_lossy().parse::<usize>() else {
 		return Some(2);
 	};
+	let _volunteered = std::fs::write("/proc/self/oom_score_adj", "1000");
 	let mut v = vec![0u8; n];
 	let mut i = 0usize;
 	while i < v.len() {
