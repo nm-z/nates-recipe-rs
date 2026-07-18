@@ -22,7 +22,7 @@ fn main() -> Result<(), Errored> {
 		.map_err(|e| return Errored::new(format!("probe: download sync: {e}")))?;
 	for (i, v) in back.iter().enumerate() {
 		if (v - 0.5f64).abs().partial_cmp(&1e-12f64) == Some(Ordering::Greater) {
-			drop(Write::err(format!("probe: mismatch at {i}: {v}")));
+			Write::error(format!("probe: mismatch at {i}: {v}"));
 			process::exit(1);
 		}
 	}

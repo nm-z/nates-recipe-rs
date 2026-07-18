@@ -141,10 +141,10 @@ fn resolve_next(name: &CStr) -> usize {
 	// SAFETY: dlsym with a valid NUL-terminated name; RTLD_NEXT is well-defined under LD_PRELOAD.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
 	let Some(nn) = NonNull::new(p) else {
-		drop(Write::err(format!(
+		Write::error(format!(
 			"vramspy: RTLD_NEXT resolution failed for {}",
 			name.to_string_lossy()
-		)));
+		));
 		// SAFETY: abort takes no arguments and never returns.
 		unsafe { libc::abort() }
 	};
@@ -352,9 +352,9 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 				pgi: resolve_next_or_default(c"hsa_amd_memory_pool_get_info")?,
 			});
 		})() else {
-			drop(Write::err(
+			Write::error(
 				"vramspy: agent/pool classification symbols unavailable \u{2014} all pools classify OTHER",
-			));
+			);
 			return pools;
 		};
 		// SAFETY: transmute to the exact documented C signature.

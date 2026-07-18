@@ -117,10 +117,10 @@ fn expired(t0: time::Instant) -> Option<()> {
 
 /// Warn that a prior holder overran the teardown deadline.
 fn overstayed(pid: u32, t0: time::Instant) {
-	drop(Write::err(format!(
+	Write::error(format!(
 		"gpu gate: pid {pid} still holds the device after {:.0}s — proceeding",
 		t0.elapsed().as_secs_f64()
-	)));
+	));
 }
 
 /// Adopt an inherited fd or open the lock file, flock it, stamp our pid, and
@@ -287,7 +287,7 @@ pub fn acquire() {
 			HOLDING.store(process::id(), Ordering::Release);
 		}
 		Err(e) => {
-			drop(Write::err(format!("gpu gate: {e}")));
+			Write::error(format!("gpu gate: {e}"));
 			return;
 		}
 	}
@@ -303,10 +303,10 @@ pub fn release() {
 		return;
 	};
 	if let Some(e) = stamp(f, CLEAN).err() {
-		drop(Write::err(format!("gpu gate: clean stamp: {e}")));
+		Write::error(format!("gpu gate: clean stamp: {e}"));
 	}
 	if let Some(e) = flock(f.as_raw_fd(), libc::LOCK_UN).err() {
-		drop(Write::err(format!("gpu gate: unlock: {e}")));
+		Write::error(format!("gpu gate: unlock: {e}"));
 	}
 	g.grip = Grip::Free;
 	drop(g);

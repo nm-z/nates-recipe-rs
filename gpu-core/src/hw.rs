@@ -78,9 +78,9 @@ pub fn arm_saturation_crash() {
 				};
 				return found;
 			}
-			drop(Write::err(
+			Write::error(
 				"saturation watchdog: no gpu_busy_percent under /sys/class/drm",
-			));
+			);
 			return PathBuf::new();
 		};
 		let path = busy_path();
@@ -95,13 +95,13 @@ pub fn arm_saturation_crash() {
 					}
 					let busy: u32 = fs::read_to_string(&path)
 						.unwrap_or_else(|e| {
-								drop(Write::err(format!("saturation watchdog: read {}: {e}", path.display())));
+								Write::error(format!("saturation watchdog: read {}: {e}", path.display()));
 								return String::new();
 							})
 						.trim()
 						.parse()
 						.unwrap_or_else(|e| {
-								drop(Write::err(format!("saturation watchdog: parse busy: {e}")));
+								Write::error(format!("saturation watchdog: parse busy: {e}"));
 								return 0u32;
 							});
 					if busy >= 100 {
@@ -109,10 +109,10 @@ pub fn arm_saturation_crash() {
 					}
 					let stalled = SAT_ARMED.load(Ordering::SeqCst) && last_pinned.elapsed() > SAT_WINDOW;
 					let None = stalled.then_some(()) else {
-						drop(Write::err(format!(
+						Write::error(format!(
 							"GPU NOT PINNED  no 100% gpu_busy_percent sample in {}s (latest {busy}%) during compute — aborting (saturation law)",
 							SAT_WINDOW.as_secs()
-						)));
+						));
 						return;
 					};
 				}
@@ -169,17 +169,17 @@ pub fn spawn_thrash_watchdog() {
 			return None;
 		};
 		let Some(gpu_idx) = gpu_id() else {
-			drop(Write::err("thrash watchdog: no kfd gpu_id"));
+			Write::error("thrash watchdog: no kfd gpu_id");
 			return;
 		};
 		// SAFETY: opening a static NUL-terminated device path with standard flags; no aliasing.
 		let raw = unsafe { libc::open(c"/dev/kfd".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 		let kfd = match raw.cmp(&0i32) {
 			cmp::Ordering::Less => {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"thrash watchdog: /dev/kfd: {}",
 					Error::last_os_error()
-				)));
+				));
 				return;
 			}
 			// SAFETY: this arm runs only when raw >= 0, a valid owned fd that File adopts.
@@ -194,10 +194,10 @@ pub fn spawn_thrash_watchdog() {
 		// SAFETY: kfd is an open fd and args is an initialized SmiArgs for this ioctl.
 		let rc = unsafe { libc::ioctl(kfd.as_raw_fd(), AMDKFD_IOC_SMI_EVENTS, &mut args) };
 		let cmp::Ordering::Equal = rc.cmp(&0i32) else {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"thrash watchdog: SMI ioctl: {}",
 				Error::last_os_error()
-			)));
+			));
 			return;
 		};
 		// SAFETY: anon_fd was just returned by the SMI ioctl and is owned by us.
@@ -210,7 +210,7 @@ pub fn spawn_thrash_watchdog() {
 			return u8::try_from((mask >> (i * 8)) & 0xff).unwrap_or(0);
 		});
 		if let Err(e) = (&smi).write_all(&smi_bytes) {
-			drop(Write::err(format!("thrash watchdog: mask write: {e}")));
+			Write::error(format!("thrash watchdog: mask write: {e}"));
 			return;
 		}
 		thread::spawn(move || {
@@ -233,10 +233,10 @@ pub fn spawn_thrash_watchdog() {
 					};
 					match kind {
 						GpuEvent::Thrash => {
-							drop(Write::err(format!(
+							Write::error(format!(
 								"gpu thrash  {}  — driver evicted our queues/mappings; aborting per fail-clean",
 								ev.trim()
-							)));
+							));
 							return;
 						}
 						GpuEvent::Restored => Write::line(

@@ -7,7 +7,7 @@ use gpu_core::infer_ops::{
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
 use gpu_core::log::probe as probe_flag;
 use gpu_core::log::{Write, data, gpu};
-use gpu_core::memory::GpuBuffer;
+use gpu_core::memory::{Dtype, GpuBuffer};
 use gpu_core::waterfall::{Home, Waterfall};
 use std::cell::RefCell;
 use std::cmp;
@@ -20,7 +20,6 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process;
-use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -29,6 +28,17 @@ use std::time::Instant;
 
 #[path = "models/mod.rs"]
 mod models;
+
+/// Compute width of the GGUF forward. A gguf runs at its native precision, not
+/// forced to f64: f16/bf16/quantized weights dequant to f32 (their canonical
+/// compute type) and every activation, scalar, and scratch buffer is carved at
+/// this width, so the dtype-generic kernels dispatch to the f32 path throughout.
+pub(crate) const FWD_DT: Dtype = Dtype::F32;
+
+/// Carves `n` forward-width elements, reporting a carve-miss in the right units.
+fn falloc(n: usize) -> Result<GpuBuffer, gpu_core::HipError> {
+	return GpuBuffer::alloc_ty(n, FWD_DT);
+}
 
 /// GGUF architecture strings whose parity fixtures ALL measure OK against
 /// llama.cpp (NMSE <= 1e-4 in archs_parity). Measured, never declared.
@@ -95,7 +105,7 @@ impl Headless {
 		let ar = Arena::new(&m.hp, cap)?;
 		let attn_scale = {
 			let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
-			let ub = GpuBuffer::alloc(1)?;
+			let ub = falloc(1)?;
 			ub.load(&[1.0 / (hd as f64).sqrt()])?;
 			ub
 		};
@@ -762,9 +772,9 @@ struct Tensor {
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 	if !(off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8)) {
-		drop(Write::err(format!(
+		Write::error(format!(
 			"bview: unaligned {off_bytes}/{len_bytes}"
-		)));
+		));
 	}
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
@@ -808,9 +818,9 @@ fn arm_watchdog() -> Watchdog {
 			}
 			let b = BEAT.load(Ordering::Relaxed);
 			if b == last {
-				drop(Write::err(
+				Write::error(
 					"LOAD WEDGED: no progress for 20s — hipMallocAsync/HSA spin (known driver race). Press Ctrl-C to stop.",
-				));
+				);
 				return;
 			}
 			last = b;
@@ -924,8 +934,8 @@ impl Arena {
 		let nff = hp.nff;
 		let nffe = hp.nffe;
 		let a = |n: usize| -> Result<GpuBuffer> {
-			return GpuBuffer::alloc(n)
-				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * 8)));
+			return falloc(n)
+				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * FWD_DT.elem_size())));
 		};
 		Ok(Arena {
 			x: a(t * ne)?,
@@ -1314,11 +1324,11 @@ impl Model {
 fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 	if plus_one {
 		let v: Vec<f64> = vals.iter().map(|x| x + 1.0).collect();
-		let ub = GpuBuffer::alloc(v.len())?;
+		let ub = falloc(v.len())?;
 		ub.load(&v)?;
 		Ok(ub)
 	} else {
-		let ub = GpuBuffer::alloc(vals.len())?;
+		let ub = falloc(vals.len())?;
 		ub.load(vals)?;
 		Ok(ub)
 	}
@@ -1587,22 +1597,22 @@ fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> Result<Model> {
 	Write::line(data, "allocating stage+win");
 	let eps = {
-		let ub = GpuBuffer::alloc(1)?;
+		let ub = falloc(1)?;
 		ub.load(&[hp.eps])?;
 		ub
 	};
 	let theta_full = {
-		let ub = GpuBuffer::alloc(1)?;
+		let ub = falloc(1)?;
 		ub.load(&[hp.freq_base])?;
 		ub
 	};
 	let theta_slide = {
-		let ub = GpuBuffer::alloc(1)?;
+		let ub = falloc(1)?;
 		ub.load(&[hp.freq_base_swa])?;
 		ub
 	};
 	let res_scale = {
-		let ub = GpuBuffer::alloc(1)?;
+		let ub = falloc(1)?;
 		// minicpm3 hardcodes scale_depth=1.4 (minicpm3.cpp:67), the per-layer residual
 		// scale is scale_depth/sqrt(n_layer), applied to both the attn and FFN outputs.
 		let s = if hp.arch == "minicpm3" {
@@ -1616,7 +1626,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub
 	};
 	let attn_scale_mla = {
-		let ub = GpuBuffer::alloc(1)?;
+		let ub = falloc(1)?;
 		let s = if hp.is_mla() { 1.0 / (hp.head_k_mla as f64).sqrt() } else { 1.0 };
 		ub.load(&[s])?;
 		ub
@@ -1628,7 +1638,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		shards,
 		big,
 		stage: GpuBuffer::alloc_bytes(hp.stage_bytes)?,
-		win: GpuBuffer::alloc(hp.win_elems)?,
+		win: falloc(hp.win_elems)?,
 		store: Waterfall::new(),
 		rbuf: RefCell::new(Vec::new()),
 		norms: Vec::new(),
@@ -1638,12 +1648,12 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ffn_up_bias: Vec::new(),
 		ffn_down_bias: Vec::new(),
 		embed_norm: None,
-		decoder_norm: GpuBuffer::alloc(1)?,
+		decoder_norm: falloc(1)?,
 		decoder_norm_b: None,
-		sc_pre: GpuBuffer::alloc(1)?,
-		sc_gate: GpuBuffer::alloc(1)?,
-		sc_up: GpuBuffer::alloc(1)?,
-		sc_down: GpuBuffer::alloc(1)?,
+		sc_pre: falloc(1)?,
+		sc_gate: falloc(1)?,
+		sc_up: falloc(1)?,
+		sc_down: falloc(1)?,
 		rw: Vec::new(),
 		gis: Vec::new(),
 		pe: Vec::new(),
@@ -1691,7 +1701,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			let bname = p(&suffix.replace(".weight", ".bias"));
 			if m.big.contains_key(&bname) {
 				let vals = m.small_f64(&bname)?;
-				let ub = GpuBuffer::alloc(vals.len())?;
+				let ub = falloc(vals.len())?;
 				ub.load(&vals)?;
 				nmb.insert(key, ub);
 			}
@@ -1705,7 +1715,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		let opt_bias = |m: &Model, name: String| -> Result<Option<GpuBuffer>> {
 			if m.big.contains_key(&name) {
 				let vals = m.small_f64(&name)?;
-				let ub = GpuBuffer::alloc(vals.len())?;
+				let ub = falloc(vals.len())?;
 				ub.load(&vals)?;
 				return Ok(Some(ub));
 			}
@@ -1723,7 +1733,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 					expanded[h * hd + x] = per_head[h % per_head.len()];
 				}
 			}
-			let ub = GpuBuffer::alloc(expanded.len())?;
+			let ub = falloc(expanded.len())?;
 			ub.load(&expanded)?;
 			Some(ub)
 		} else {
@@ -1748,7 +1758,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			1.0
 		};
 		m.ls_dev.push({
-			let ub = GpuBuffer::alloc(1)?;
+			let ub = falloc(1)?;
 			ub.load(&[lsv])?;
 			ub
 		});
@@ -1757,7 +1767,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		let conv_b = match opt_bias(&m, p("self_attn.ssm_conv1d.bias"))? {
 			Some(b) => Some(b),
 			None if m.big.contains_key(&p("self_attn.ssm_conv1d.weight")) => {
-				let zb = GpuBuffer::alloc(m.hp.ssm_d_inner.max(1))?;
+				let zb = falloc(m.hp.ssm_d_inner.max(1))?;
 				zb.load(&vec![0.0f64; m.hp.ssm_d_inner.max(1)])?;
 				Some(zb)
 			}
@@ -1784,7 +1794,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	// fixtures ship identity factors, so this is exact and correct machinery.
 	if m.big.contains_key("model.decoder.rope_short.weight") {
 		let vals = m.small_f64("model.decoder.rope_short.weight")?;
-		let ub = GpuBuffer::alloc(vals.len())?;
+		let ub = falloc(vals.len())?;
 		ub.load(&vals)?;
 		m.rope_factors = Some(ub);
 	}
@@ -1793,7 +1803,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	}
 	if m.big.contains_key("model.decoder.norm.bias") {
 		let vals = m.small_f64("model.decoder.norm.bias")?;
-		let ub = GpuBuffer::alloc(vals.len())?;
+		let ub = falloc(vals.len())?;
 		ub.load(&vals)?;
 		m.decoder_norm_b = Some(ub);
 	}
@@ -1802,13 +1812,13 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	{
 		let g = {
 			let vals = m.small_f64("model.decoder.embed_norm.weight")?;
-			let ub = GpuBuffer::alloc(vals.len())?;
+			let ub = falloc(vals.len())?;
 			ub.load(&vals)?;
 			ub
 		};
 		let b = {
 			let vals = m.small_f64("model.decoder.embed_norm.bias")?;
-			let ub = GpuBuffer::alloc(vals.len())?;
+			let ub = falloc(vals.len())?;
 			ub.load(&vals)?;
 			ub
 		};
@@ -1821,19 +1831,19 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		)?;
 		m.sc_gate = {
 			let vals = m.small_f64("model.decoder.self_conditioning.gate_proj.weight")?;
-			let ub = GpuBuffer::alloc(vals.len())?;
+			let ub = falloc(vals.len())?;
 			ub.load(&vals)?;
 			ub
 		};
 		m.sc_up = {
 			let vals = m.small_f64("model.decoder.self_conditioning.up_proj.weight")?;
-			let ub = GpuBuffer::alloc(vals.len())?;
+			let ub = falloc(vals.len())?;
 			ub.load(&vals)?;
 			ub
 		};
 		m.sc_down = {
 			let vals = m.small_f64("model.decoder.self_conditioning.down_proj.weight")?;
-			let ub = GpuBuffer::alloc(vals.len())?;
+			let ub = falloc(vals.len())?;
 			ub.load(&vals)?;
 			ub
 		};
@@ -2148,8 +2158,8 @@ fn layer(
 	let _rt = Instant::now();
 	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
 	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
-	unsafe { ar.attn_out.download_async(&mut ao_host, ptr::null_mut()) }?;
-	unsafe { ar.cmoes.download_async(&mut cmoes_host, ptr::null_mut()) }?;
+	ar.attn_out.download_host(&mut ao_host)?;
+	ar.cmoes.download_host(&mut cmoes_host)?;
 	gpu_core::hip::device_synchronize()?;
 	acc(&MOE_RT_NS, _rt);
 	let _tr = Instant::now();
@@ -2192,10 +2202,7 @@ fn layer(
 		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
 		let _rt = Instant::now();
-		unsafe {
-			ar.moe_dv
-				.download_async(&mut dv_host[..np * ne], ptr::null_mut())
-		}?;
+		ar.moe_dv.download_host(&mut dv_host[..np * ne])?;
 		gpu_core::hip::device_synchronize()?;
 		acc(&MOE_RT_NS, _rt);
 		for (i, &(p, w)) in poslist.iter().enumerate() {
@@ -2241,10 +2248,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 			m.widen_from(&m.stage, 0, cn * hp.ne)?
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
-		unsafe {
-			ar.lm_out
-				.download_async(&mut out_host[..ncanvas * cn], ptr::null_mut())
-		}?;
+		ar.lm_out.download_host(&mut out_host[..ncanvas * cn])?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
 			logits[p * hp.vocab + c0..p * hp.vocab + c0 + cn]
@@ -2479,9 +2483,9 @@ impl ChatSession {
 		gguf: &Path,
 		load_round: &mut dyn FnMut(&[Tok]) -> bool,
 	) -> Result<Option<ChatSession>> {
-		if env::var_os("VRAM_PROBE").is_some() {
+		if env::var_os("VRAM_PROBE").is_some() || env::var_os("RAM_PROBE").is_some() {
 			Write::err(
-				"ChatSession: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
+				"ChatSession: VRAM_PROBE/RAM_PROBE set: the binary's main must call llm::vram_probe_ask() and gpu_core::memory::ram_probe_ask() and exit with the code before any other work",
 			)?;
 		}
 		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
@@ -2499,7 +2503,7 @@ impl ChatSession {
 		};
 		let attn_scale = {
 			let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
-			let ub = GpuBuffer::alloc(1)?;
+			let ub = falloc(1)?;
 			ub.load(&[1.0 / (hd as f64).sqrt()])?;
 			ub
 		};
@@ -2667,11 +2671,11 @@ fn decode_canvas(
 				&ar.normed,
 			)?;
 		}
-		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * 8)?;
+		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * FWD_DT.elem_size())?;
 
 		let bithash = |b: &GpuBuffer, n: usize| -> Result<u64> {
 			let mut v = vec![0.0f64; n];
-			unsafe { b.view(0, n).download_async(&mut v, ptr::null_mut()) }?;
+			b.view(0, n).download_host(&mut v)?;
 			gpu_core::hip::device_synchronize()?;
 			Ok(v.iter().fold(0xcbf29ce484222325u64, |h, x| {
 				(h ^ x.to_bits()).wrapping_mul(0x100000001b3)
@@ -2706,7 +2710,7 @@ fn decode_canvas(
 		}
 		let hbuf = src;
 		let mut hbuf_host = vec![0.0f64; hbuf.n_floats()];
-		unsafe { hbuf.download_async(&mut hbuf_host, ptr::null_mut()) }?;
+		hbuf.download_host(&mut hbuf_host)?;
 		gpu_core::hip::device_synchronize()?;
 		let nan = hbuf_host.iter().filter(|v| !v.is_finite()).count();
 		if nan > 0 {

@@ -21,9 +21,9 @@ fn main() -> Result<()> {
 	});
 	let paths: Vec<String> = env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		drop(Write::err(
+		Write::error(
 			"usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)",
-		));
+		);
 		process::exit(1);
 	};
 

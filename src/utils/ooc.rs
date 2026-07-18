@@ -219,12 +219,12 @@ struct Paged {
 }
 
 impl Paged {
-	fn win(&self, s0: usize, cnt: usize) -> usize {
-		if !(s0.is_multiple_of(self.chunk) && cnt <= self.chunk) {
-			drop(Write::err("ooc access not window-aligned"));
-			panic!("ooc access not window-aligned");
-		}
-		s0 / self.chunk
+	fn win(&self, s0: usize, cnt: usize) -> anyhow::Result<usize> {
+		anyhow::ensure!(
+			s0.is_multiple_of(self.chunk) && cnt <= self.chunk,
+			"ooc access not window-aligned"
+		);
+		Ok(s0 / self.chunk)
 	}
 	fn fresh_disk_read(
 		&self,
@@ -356,7 +356,7 @@ impl Paged {
 		host: &HostPool,
 	) -> anyhow::Result<GpuBuffer> {
 		let len = cnt * self.spb * 8;
-		Ok(match &self.homes[self.win(s0, cnt)] {
+		Ok(match &self.homes[self.win(s0, cnt)?] {
 			Home::Vram(b) => view(b, 0, len),
 			Home::Ram(v) => {
 				win.write_u8(&v[..len]).context("ooc H2D")?;
@@ -415,12 +415,12 @@ impl Paged {
 			}
 		})
 	}
-	fn write_view(&self, s0: usize, cnt: usize, win: &GpuBuffer) -> GpuBuffer {
+	fn write_view(&self, s0: usize, cnt: usize, win: &GpuBuffer) -> anyhow::Result<GpuBuffer> {
 		let len = cnt * self.spb * 8;
-		match &self.homes[self.win(s0, cnt)] {
+		Ok(match &self.homes[self.win(s0, cnt)?] {
 			Home::Vram(b) => view(b, 0, len),
 			_spilled => view(win, 0, len),
-		}
+		})
 	}
 	fn commit(
 		&mut self,
@@ -431,7 +431,7 @@ impl Paged {
 		host: &HostPool,
 	) -> anyhow::Result<()> {
 		let len = cnt * self.spb * 8;
-		let w = self.win(s0, cnt);
+		let w = self.win(s0, cnt)?;
 		match &mut self.homes[w] {
 			Home::Vram(_buf) => Ok(()),
 			Home::Ram(dst) => v.download_u8(&mut dst[..len]).context("ooc D2H"),
@@ -606,7 +606,13 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let dir = crate::ok_or_die(crate::machine::data_dir(), "data_dir");
+	let dir = match crate::ok_or_err(crate::machine::data_dir(), "data_dir") {
+		Ok(v) => v,
+		Err(e) => {
+			Write::error(format!("{e:#}"));
+			return None;
+		}
+	};
 	let disk_avail = disk_free(&dir).saturating_sub(USER_GB);
 	let vram = need.min(vram_avail);
 	let ram = (need - vram).min(ram_avail);
@@ -1270,7 +1276,7 @@ impl Ooc {
 							return Ok(());
 						};
 						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
-						let out = self.acts[l].write_view(s0, cnt, &self.wins[0]);
+						let out = self.acts[l].write_view(s0, cnt, &self.wins[0])?;
 						kernels::gpu_gather_rows_into(
 							&p.w,
 							&ids,
@@ -1310,9 +1316,9 @@ impl Ooc {
 							&self.host,
 						)?;
 						let m = cnt * s;
-						let q = self.a_q.write_view(s0, cnt, &self.wins[1]);
-						let k = self.a_k.write_view(s0, cnt, &self.wins[2]);
-						let v = self.a_v.write_view(s0, cnt, &self.wins[3]);
+						let q = self.a_q.write_view(s0, cnt, &self.wins[1])?;
+						let k = self.a_k.write_view(s0, cnt, &self.wins[2])?;
+						let v = self.a_v.write_view(s0, cnt, &self.wins[3])?;
 						kernels::gpu_linear_into(&prev, &p.w, &p.b, m, d, d, &q)
 							.context("attn q")?;
 						kernels::gpu_linear_into(&prev, &p.wk, &p.b, m, d, d, &k)
@@ -1365,7 +1371,7 @@ impl Ooc {
 							self.n,
 							&self.host,
 						)?;
-						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3]);
+						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3])?;
 						let lse =
 							view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
 						kernels::gpu_flash_attention_train_into(
@@ -1389,7 +1395,7 @@ impl Ooc {
 							self.n,
 							&self.host,
 						)?;
-						let out = self.acts[l].write_view(s0, cnt, &self.wins[1]);
+						let out = self.acts[l].write_view(s0, cnt, &self.wins[1])?;
 						kernels::gpu_linear_into(
 							&ctx,
 							&p.wo,
@@ -1440,7 +1446,7 @@ impl Ooc {
 								cnt * p.out_dim * 8,
 							),
 							cmp::Ordering::Less | cmp::Ordering::Greater => {
-								self.acts[l].write_view(s0, cnt, &self.wins[1])
+								self.acts[l].write_view(s0, cnt, &self.wins[1])?
 							}
 						};
 						match p.kind {
@@ -1477,7 +1483,7 @@ impl Ooc {
 						let m = cnt * p.out_dim;
 						let saved = match self.preacts[l].as_mut() {
 							Some(pa) => {
-								let pre = pa.write_view(s0, cnt, &self.wins[2]);
+								let pre = pa.write_view(s0, cnt, &self.wins[2])?;
 								kernels::gpu_copy_into(&out, m, &pre)
 									.context("copy preact")?;
 								pa.commit(s0, cnt, &pre, &self.writer, &self.host)?;
@@ -1606,7 +1612,7 @@ impl Ooc {
 				s0 * c * 8,
 				cnt * c * 8,
 			);
-			let out = self.concat.write_view(s0, cnt, &self.wins[1]);
+			let out = self.concat.write_view(s0, cnt, &self.wins[1])?;
 			kernels::gpu_concat_into(&prev, &xc, cnt, a, c, &out).context("concat")?;
 			self.concat
 				.commit(s0, cnt, &out, &self.writer, &self.host)?;
@@ -1642,7 +1648,7 @@ impl Ooc {
 			let k = params[last].out_dim;
 			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
 			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
-			let da = self.da_a.write_view(s0, cnt, &self.wins[0]);
+			let da = self.da_a.write_view(s0, cnt, &self.wins[0])?;
 			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss)?;
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host)?;
 		}
@@ -1769,7 +1775,7 @@ impl Ooc {
 									Flip::A => &mut self.da_b,
 								};
 								let below =
-									below_pg.write_view(s0, cnt, &self.wins[7]);
+									below_pg.write_view(s0, cnt, &self.wins[7])?;
 								kernels::gpu_conv1d_backward_data_into(
 									grad, &p.w, cnt, cin, lin, cout, kk, stride,
 									&below,
@@ -1852,7 +1858,7 @@ impl Ooc {
 									Flip::A => &mut self.da_b,
 								};
 								let below =
-									below_pg.write_view(s0, cnt, &self.wins[7]);
+									below_pg.write_view(s0, cnt, &self.wins[7])?;
 								kernels::gpu_linear_backward_full_into(
 									grad,
 									&a_prev,
@@ -2326,7 +2332,7 @@ impl Ooc {
 				self.n,
 				&self.host,
 			)?;
-			let dctx = self.a_dctx.write_view(s0, cnt, &self.wins[2]);
+			let dctx = self.a_dctx.write_view(s0, cnt, &self.wins[2])?;
 			kernels::gpu_linear_backward_full_into(
 				&da,
 				&ctx,
@@ -2396,9 +2402,9 @@ impl Ooc {
 			)?;
 			let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
 			let dsum = view(&self.dsum, s0 * heads * s * 8, cnt * heads * s * 8);
-			let dq = self.a_dq.write_view(s0, cnt, &self.wins[5]);
-			let dk = self.a_dk.write_view(s0, cnt, &self.wins[6]);
-			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7]);
+			let dq = self.a_dq.write_view(s0, cnt, &self.wins[5])?;
+			let dk = self.a_dk.write_view(s0, cnt, &self.wins[6])?;
+			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7])?;
 			kernels::gpu_flash_attention_backward_into(
 				&q, &k, &v, &ctx, &dctx, &lse, cnt, s, d, heads, &dsum, &dq, &dk, &dv,
 			)
@@ -2445,7 +2451,7 @@ impl Ooc {
 				Flip::B => &mut self.da_a,
 				Flip::A => &mut self.da_b,
 			};
-			let below = below_pg.write_view(s0, cnt, &self.wins[1]);
+			let below = below_pg.write_view(s0, cnt, &self.wins[1])?;
 			let dh_tmp = view(&self.wins[2], 0, cnt * p.in_dim * 8);
 			let qkv = [
 				Qkv {
@@ -2523,13 +2529,13 @@ impl Drop for Ooc {
 		let Ooc { writer, spill, .. } = &mut *self;
 		let r = writer.barrier(spill.as_ref());
 		if !r.is_ok() {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"ooc drop barrier: {}",
 				r.as_ref()
 					.err()
 					.map(|e| format!("{e:#}"))
 					.unwrap_or_default()
-			)));
+			));
 			return;
 		}
 		let Some(net) = self.net.clone() else {

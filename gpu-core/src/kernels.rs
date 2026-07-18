@@ -15,9 +15,9 @@ pub(crate) fn check_launch() {
 	// SAFETY: hipGetLastError reads and clears the driver's per-thread last-error slot; always valid.
 	let err = unsafe { hip::hipGetLastError() };
 	if err != 0i32 {
-		drop(Write::err(format!(
+		Write::error(format!(
 			"HIP kernel launch failed with error code {err}"
-		)));
+		));
 		return;
 	}
 }
@@ -27,7 +27,7 @@ pub(crate) fn safe_i32(v: usize) -> i32 {
 	if let Ok(n) = i32::try_from(v) {
 		return n;
 	}
-	drop(Write::err(format!("size {v} overflows i32")));
+	Write::error(format!("size {v} overflows i32"));
 	return i32::MAX;
 }
 
@@ -40,7 +40,7 @@ pub(crate) fn ci(v: usize) -> Result<i32, HipError> {
 	if let Ok(n) = i32::try_from(v) {
 		return Ok(n);
 	}
-	drop(Write::err(format!("size {v} overflows i32")));
+	Write::error(format!("size {v} overflows i32"));
 	return Err(HipError(1));
 }
 
@@ -53,7 +53,7 @@ pub(crate) fn cu(v: usize) -> Result<u32, HipError> {
 	if let Ok(n) = u32::try_from(v) {
 		return Ok(n);
 	}
-	drop(Write::err(format!("value {v} overflows u32")));
+	Write::error(format!("value {v} overflows u32"));
 	return Err(HipError(1));
 }
 
@@ -1727,17 +1727,17 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 				// SAFETY: &raw mut handle is a valid out-pointer to a null-initialized handle that hipblasCreate fills.
 				let status = unsafe { hipblasCreate(&raw mut handle) };
 				if status != 0i32 {
-					drop(Write::err(format!(
+					Write::error(format!(
 						"hipblasCreate failed with status {status}"
-					)));
+					));
 					return handle;
 				}
 				// SAFETY: handle is the live hipBLAS handle from hipblasCreate; a null stream selects the default stream.
 				let stream_status = unsafe { hipblasSetStream(handle, ptr::null_mut()) };
 				if stream_status != 0i32 {
-					drop(Write::err(format!(
+					Write::error(format!(
 						"hipblasSetStream failed with status {stream_status}"
-					)));
+					));
 					return handle;
 				}
 				h.store(handle, Ordering::Relaxed);
@@ -1753,9 +1753,9 @@ pub fn gpu_blas_workspace(buf: &GpuBuffer) {
 	// SAFETY: hipblas_handle() returns the live handle; buf is a valid GPU buffer of buf.len() bytes.
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
 	if status != 0i32 {
-		drop(Write::err(format!(
+		Write::error(format!(
 			"hipblasSetWorkspace failed with status {status}"
-		)));
+		));
 		return;
 	}
 }
@@ -1770,9 +1770,9 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 				// SAFETY: &raw mut handle is a valid out-pointer to a null-initialized handle that hipsolverCreate fills.
 				let status = unsafe { hipsolverCreate(&raw mut handle) };
 				if status != 0i32 {
-					drop(Write::err(format!(
+					Write::error(format!(
 						"hipsolverCreate failed with status {status}"
-					)));
+					));
 					return handle;
 				}
 				h.store(handle, Ordering::Relaxed);
@@ -1939,7 +1939,7 @@ pub fn gpu_cholesky_solve_workspace_bytes(n: usize) -> usize {
 	if let Ok(bytes) = usize::try_from(lwork.max(1i32)) {
 		return bytes * 8;
 	}
-	drop(Write::err(format!("workspace size {lwork} is negative")));
+	Write::error(format!("workspace size {lwork} is negative"));
 	return 8;
 }
 
@@ -4133,47 +4133,47 @@ pub fn gpu_tree_build_into(
 	let hist_elems = max_level * p * n_bins;
 
 	let node_assign = GpuBuffer::alloc_bytes(n_train * isz).map_err(|e| {
-		drop(Write::err(format!("tb node_assign: {e}")));
+		Write::error(format!("tb node_assign: {e}"));
 		return e;
 	})?;
 	node_assign.memset_zero(n_train * isz).map_err(|e| {
-		drop(Write::err(format!("tb node_assign zero: {e}")));
+		Write::error(format!("tb node_assign zero: {e}"));
 		return e;
 	})?;
 	let sf = GpuBuffer::alloc_bytes(max_nodes * isz).map_err(|e| {
-		drop(Write::err(format!("tb split_feat: {e}")));
+		Write::error(format!("tb split_feat: {e}"));
 		return e;
 	})?;
 	let sb = GpuBuffer::alloc_bytes(max_nodes * isz).map_err(|e| {
-		drop(Write::err(format!("tb split_bin: {e}")));
+		Write::error(format!("tb split_bin: {e}"));
 		return e;
 	})?;
 	sf.fill_bytes(0xFF, max_nodes * isz).map_err(|e| {
-		drop(Write::err(format!("tb split_feat fill: {e}")));
+		Write::error(format!("tb split_feat fill: {e}"));
 		return e;
 	})?;
 	sb.fill_bytes(0xFF, max_nodes * isz).map_err(|e| {
-		drop(Write::err(format!("tb split_bin fill: {e}")));
+		Write::error(format!("tb split_bin fill: {e}"));
 		return e;
 	})?;
 	let gh = GpuBuffer::alloc(hist_elems).map_err(|e| {
-		drop(Write::err(format!("tb grad_hist: {e}")));
+		Write::error(format!("tb grad_hist: {e}"));
 		return e;
 	})?;
 	let hh = GpuBuffer::alloc(hist_elems).map_err(|e| {
-		drop(Write::err(format!("tb hess_hist: {e}")));
+		Write::error(format!("tb hess_hist: {e}"));
 		return e;
 	})?;
 	let sum_g = GpuBuffer::alloc(max_nodes).map_err(|e| {
-		drop(Write::err(format!("tb node_sum_g: {e}")));
+		Write::error(format!("tb node_sum_g: {e}"));
 		return e;
 	})?;
 	let sum_h = GpuBuffer::alloc(max_nodes).map_err(|e| {
-		drop(Write::err(format!("tb node_sum_h: {e}")));
+		Write::error(format!("tb node_sum_h: {e}"));
 		return e;
 	})?;
 	let lv = GpuBuffer::alloc(max_nodes).map_err(|e| {
-		drop(Write::err(format!("tb leaf_val: {e}")));
+		Write::error(format!("tb leaf_val: {e}"));
 		return e;
 	})?;
 
@@ -4182,11 +4182,11 @@ pub fn gpu_tree_build_into(
 		let n_level = 1usize << d;
 		let level_bytes = n_level * p * n_bins * fsz;
 		gh.memset_zero(level_bytes).map_err(|e| {
-			drop(Write::err(format!("tb grad_hist zero: {e}")));
+			Write::error(format!("tb grad_hist zero: {e}"));
 			return e;
 		})?;
 		hh.memset_zero(level_bytes).map_err(|e| {
-			drop(Write::err(format!("tb hess_hist zero: {e}")));
+			Write::error(format!("tb hess_hist zero: {e}"));
 			return e;
 		})?;
 		gpu_tb_histogram(
@@ -4208,15 +4208,15 @@ pub fn gpu_tree_build_into(
 	}
 
 	sum_g.memset_zero(max_nodes * fsz).map_err(|e| {
-		drop(Write::err(format!("tb node_sum_g zero: {e}")));
+		Write::error(format!("tb node_sum_g zero: {e}"));
 		return e;
 	})?;
 	sum_h.memset_zero(max_nodes * fsz).map_err(|e| {
-		drop(Write::err(format!("tb node_sum_h zero: {e}")));
+		Write::error(format!("tb node_sum_h zero: {e}"));
 		return e;
 	})?;
 	lv.memset_zero(max_nodes * fsz).map_err(|e| {
-		drop(Write::err(format!("tb leaf_val zero: {e}")));
+		Write::error(format!("tb leaf_val zero: {e}"));
 		return e;
 	})?;
 	gpu_tb_leaf_sum(grad, hess, &node_assign, n_train, &sum_g, &sum_h)?;
@@ -5977,10 +5977,10 @@ pub fn gpu_slice_rows(
 ) -> Result<(), HipError> {
 	let total_rows = x.n_floats().div_euclid(cols);
 	if start + count > total_rows {
-		drop(Write::err(format!(
+		Write::error(format!(
 			"slice_rows: start({start}) + count({count}) = {} exceeds rows({total_rows})",
 			start + count
-		)));
+		));
 		return Err(HipError(1));
 	}
 	let start_i32 = ci(start)?;

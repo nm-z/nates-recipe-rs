@@ -147,9 +147,10 @@ impl ModelInner {
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats =
 			embed_first && dat.text_cols.is_empty() && !dat.onehot_groups.is_empty();
-		let coll = Some(())
-			.filter(|_probe| embed_cats)
-			.map(|_probe| collapse_onehot(dat));
+		let coll = match Some(()).filter(|_probe| embed_cats) {
+			Some(_p) => Some(collapse_onehot(dat)?),
+			None => None,
+		};
 		let collapsed_vocab = coll.as_ref().map_or(0, |c| c.vocab);
 		let effective_x = coll.as_ref().map_or(&dat.x, |c| &c.x);
 		let effective_text = match &coll {
@@ -215,14 +216,14 @@ impl ModelInner {
 		};
 		let ask_overwrite = |what: &str| -> YesNo {
 			use std::io::Write as _;
-			drop(Write::err("resume"));
-			drop(Write::err("    data does not match"));
-			drop(Write::err(&format!("        {what}")));
-			drop(Write::err(&format!(
+			Write::error("resume");
+			Write::error("    data does not match");
+			Write::error(&format!("        {what}"));
+			Write::error(&format!(
 				"        file path={}",
 				resume.unwrap_or("")
-			)));
-			drop(Write::err(&format!("        data path={}", dat.source)));
+			));
+			Write::error(&format!("        data path={}", dat.source));
 			let Some(_tty) = Some(()).filter(|_probe| io::stdin().is_terminal()) else {
 				return YesNo::No;
 			};
@@ -714,9 +715,9 @@ impl ModelInner {
 						let lossv = val_of(Metric::Loss, e);
 						match Some(()).filter(|_probe| lossv.is_nan()) {
 							Some(_nan) => {
-								drop(Write::err(&format!(
+								Write::error(&format!(
 									"NaN loss at epoch {e} — stopping (weights diverged)"
-								)));
+								));
 								Halt::Stop
 							}
 							None => {
@@ -973,13 +974,14 @@ impl ModelInner {
 		gpu_core::memory::park_run_backing(slab);
 		Ok(host)
 	}
-	pub(crate) fn prep_eval_input(&self, ds: &Dataset) -> EvalInput {
+	pub(crate) fn prep_eval_input(&self, ds: &Dataset) -> anyhow::Result<EvalInput> {
 		let n = ds.x.nrows();
 		let embed_first = matches!(self.specs.first(), Some(LayerSpec::Embed(..)));
 		let embed_cats = embed_first && ds.text_cols.is_empty() && !ds.onehot_groups.is_empty();
-		let coll = Some(())
-			.filter(|_probe| embed_cats)
-			.map(|_probe| collapse_onehot(ds));
+		let coll = match Some(()).filter(|_probe| embed_cats) {
+			Some(_p) => Some(collapse_onehot(ds)?),
+			None => None,
+		};
 		let eff_x = coll.as_ref().map_or(&ds.x, |c| &c.x);
 		let eff_text = match &coll {
 			Some(c) => &c.embed_cols,
@@ -998,37 +1000,29 @@ impl ModelInner {
 		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
 		let scaler_ref =
-			crate::some_or_die(scaler.as_ref(), "eval: missing scaler; train first");
-		let up = |m: &ndarray::Array2<f64>| -> GpuBuffer {
+			crate::some_or_err(scaler.as_ref(), "eval: missing scaler; train first")?;
+		let up = |m: &ndarray::Array2<f64>| -> anyhow::Result<GpuBuffer> {
 			let s = m.as_standard_layout();
-			let sl = crate::some_or_die(s.as_slice(), "eval upload: non-contiguous");
-			let b = crate::ok_or_die(GpuBuffer::alloc(sl.len()), "eval upload");
-			crate::ok_or_die(b.load(sl), "eval upload");
-			b
+			let sl = crate::some_or_err(s.as_slice(), "eval upload: non-contiguous")?;
+			let b = crate::ok_or_err(GpuBuffer::alloc(sl.len()), "eval upload")?;
+			crate::ok_or_err(b.load(sl), "eval upload")?;
+			Ok(b)
 		};
-		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> GpuBuffer {
-			if sc.mean.len() != cols {
-				drop(Write::err(format!(
-					"eval: feature count changed: {} vs {cols}",
-					sc.mean.len()
-				)));
-				panic!("eval: feature count changed");
-			}
-			if sc.std.len() != cols {
-				drop(Write::err(format!(
-					"eval: feature count changed: {} vs {cols}",
-					sc.std.len()
-				)));
-				panic!("eval: feature count changed");
-			}
+		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> anyhow::Result<GpuBuffer> {
+			anyhow::ensure!(
+				sc.mean.len() == cols && sc.std.len() == cols,
+				"eval: feature count changed: mean {} std {} vs {cols}",
+				sc.mean.len(),
+				sc.std.len()
+			);
 			let mut st = Stage::new();
 			let m_off = st.push(&sc.mean);
 			let s_off = st.push(&sc.std);
 			let host = st.into_host();
 			let img =
-				crate::ok_or_die(GpuBuffer::alloc(host.len().max(1)), "eval scaler stage");
-			crate::ok_or_die(img.load(&host), "eval scaler stage");
-			crate::ok_or_die(
+				crate::ok_or_err(GpuBuffer::alloc(host.len().max(1)), "eval scaler stage")?;
+			crate::ok_or_err(img.load(&host), "eval scaler stage")?;
+			crate::ok_or_err(
 				zscore_apply_views(
 					xraw,
 					rows,
@@ -1041,32 +1035,32 @@ impl ModelInner {
 		};
 		match Some(()).filter(|_probe| embed_first) {
 			Some(_ef) => {
-				let xraw = up(&xinput);
+				let xraw = up(&xinput)?;
 				match Some(()).filter(|_probe| cat_cols.is_empty()) {
-					Some(_nocat) => EvalInput {
+					Some(_nocat) => Ok(EvalInput {
 						x: xraw,
 						x_cat: None,
 						n,
-					},
+					}),
 					None => {
 						let cat = eff_x.select(ndarray::Axis(1), &cat_cols);
-						let craw = up(&cat);
+						let craw = up(&cat)?;
 						let c = cat.ncols();
-						EvalInput {
+						Ok(EvalInput {
 							x: xraw,
-							x_cat: Some(apply(&craw, n, c, scaler_ref)),
+							x_cat: Some(apply(&craw, n, c, scaler_ref)?),
 							n,
-						}
+						})
 					}
 				}
 			}
 			None => {
-				let xraw = up(&xinput);
-				EvalInput {
-					x: apply(&xraw, n, d, scaler_ref),
+				let xraw = up(&xinput)?;
+				Ok(EvalInput {
+					x: apply(&xraw, n, d, scaler_ref)?,
 					x_cat: None,
 					n,
-				}
+				})
 			}
 		}
 	}

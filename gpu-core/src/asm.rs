@@ -48,8 +48,6 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
       return Err(AsmError(msg.into()));
 }
 
-// ---- HSA FFI ----------------------------------------------------------------
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Agent {
@@ -225,8 +223,6 @@ fn hsa_check(status: i32, what: &str) -> Result<()> {
       return err(format!("{what}: HSA status {status}"));
 }
 
-// ---- process-global HSA context ---------------------------------------------
-
 struct Ctx {
       gpu: Agent,
       queue: *mut Queue,
@@ -234,8 +230,7 @@ struct Ctx {
       vram_pool: Pool,
 }
 
-// SAFETY: the queue pointer and pool/agent handles are stable for process life;
-// every dispatch that touches them holds `gate::acquire`, serializing GPU entry.
+// SAFETY: queue pointer and pool/agent handles are stable for process life, and every dispatch holds `gate::acquire`, serializing GPU entry.
 unsafe impl Send for Ctx {}
 // SAFETY: see the Send note; access is funneled through the process GPU gate.
 unsafe impl Sync for Ctx {}
@@ -365,8 +360,7 @@ fn context() -> Result<&'static Ctx> {
             return err("hsa_queue_create returned a null queue");
       }
       let ctx = Ctx { gpu, queue, kernarg_pool, vram_pool };
-      // Only this thread holds INIT_LOCK and the double-check above saw None, so
-      // set cannot fail and no queue leaks.
+      // Only this thread holds INIT_LOCK and the double-check above saw None, so set cannot fail and no queue leaks.
       if CTX.set(ctx).is_err() {
             return err("asm context init raced despite lock");
       }
@@ -422,8 +416,6 @@ pub unsafe fn free_device(ptr: *mut c_void) -> Result<()> {
       // SAFETY: caller guarantees ptr came from alloc_device and is freed exactly once.
       return hsa_check(unsafe { hsa_amd_memory_pool_free(ptr) }, "hsa_amd_memory_pool_free(vram)");
 }
-
-// ---- kernel arguments -------------------------------------------------------
 
 /// A packed kernarg buffer, built left to right in declaration order. Each value
 /// is placed at its natural alignment, matching the AMDGPU kernarg ABI.
@@ -489,8 +481,6 @@ impl KernArgs {
             return &self.buf;
       }
 }
-
-// ---- assemble + load --------------------------------------------------------
 
 struct Kernel {
       kernel_object: u64,
@@ -738,8 +728,7 @@ impl Program {
                         },
                   );
             }
-            // SAFETY: publishes the packet header with release ordering so the packet
-            // processor observes a fully written packet before the type flips to dispatch.
+            // SAFETY: publishes the packet header with release ordering so the packet processor observes a fully written packet before the type flips to dispatch.
             unsafe {
                   let header_ptr = &raw mut (*packet).header;
                   core::sync::atomic::AtomicU16::from_ptr(header_ptr)

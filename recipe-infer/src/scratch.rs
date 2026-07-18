@@ -101,10 +101,10 @@ pub fn layer_ms_from(
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
 			if !e.is_ok() {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"fwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
-				)));
+				));
 				return 0.0;
 			}
 			e.unwrap_or(0.0) as f64
@@ -114,10 +114,10 @@ pub fn layer_ms_from(
 		.map(|l| {
 			let e = gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]);
 			if !e.is_ok() {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"bwd elapsed: {}",
 					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
-				)));
+				));
 				return 0.0;
 			}
 			e.unwrap_or(0.0) as f64
@@ -395,10 +395,10 @@ impl Scratch {
 		if self.timing.get() {
 			let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
 			if !r.is_ok() {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"record fwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
-				)));
+				));
 				return;
 			}
 		}
@@ -408,10 +408,10 @@ impl Scratch {
 		if self.timing.get() {
 			let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
 			if !r.is_ok() {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"record bwd event: {}",
 					r.err().map(|e| e.to_string()).unwrap_or_default()
-				)));
+				));
 				return;
 			}
 		}
@@ -421,10 +421,10 @@ impl Scratch {
 		let s = self.timing_slot.get();
 		let r = self.ev_bwd[s][0].synchronize();
 		if !r.is_ok() {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"sync bwd event: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
-			)));
+			));
 			return LayerMs {
 				fwd: vec![0.0; layers],
 				bwd: vec![0.0; layers],
@@ -467,10 +467,10 @@ impl Scratch {
 	pub fn sync_deferred_scalar(&self) -> f64 {
 		let r = self.copy_stream.synchronize();
 		if !r.is_ok() {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
-			)));
+			));
 			return unsafe { *self.pinned_scalar };
 		}
 		unsafe { *self.pinned_scalar }
@@ -484,10 +484,10 @@ impl Scratch {
 	pub fn sync_copy_stream(&self) {
 		let r = self.copy_stream.synchronize();
 		if !r.is_ok() {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
-			)));
+			));
 			return;
 		}
 	}
@@ -564,10 +564,10 @@ fn pinned_scalar_pair() -> *mut f64 {
 	if *g == 0 {
 		let hm = gpu_core::hip::host_malloc(16, 0);
 		if !hm.is_ok() {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"pinned scalars: {}",
 				hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
-			)));
+			));
 			return ptr::null_mut();
 		}
 		*g = hm.unwrap_or(ptr::null_mut()) as usize;
@@ -764,7 +764,7 @@ pub fn vram_estimate(
 								.max(1)
 						}
 						None => {
-							drop(Write::err("conv cin"));
+							Write::error("conv cin");
 							return bytes;
 						}
 					}

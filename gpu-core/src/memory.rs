@@ -169,13 +169,13 @@ pub fn oom_report(req: usize) {
 	line.push(oom_pair("over", &fmt_bytes(req.saturating_sub(free))));
 	line.push(oom_pair("slack", &fmt_bytes(pool_slack(0).unwrap_or(0))));
 	line.push(oom_pair("arena", &fmt_bytes(arena_remaining())));
-	drop(Write::err(line.join(", ")));
-	drop(Write::err(format!(
+	Write::error(line.join(", "));
+	Write::error(format!(
 		"{}, {}, {}",
 		oom_pair("H2D", &fmt_bytes(H2D_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2H", &fmt_bytes(D2H_BYTES.load(Ordering::Relaxed))),
 		oom_pair("D2D", &fmt_bytes(D2D_BYTES.load(Ordering::Relaxed))),
-	)));
+	));
 }
 
 /// Kernel-reported video and system memory usage for this process.
@@ -553,7 +553,7 @@ fn carve_image_front(image: &[f64]) {
 	};
 	let _t = tag_scope("weights");
 	if let Err(e) = GpuBuffer::alloc(image.len()) {
-		drop(Write::err(format!("arena image carve: {e}")));
+		Write::error(format!("arena image carve: {e}"));
 	}
 }
 
@@ -605,9 +605,9 @@ pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
 #[inline]
 pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Option<GpuBuffer> {
 	if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-		drop(Write::err(
+		Write::error(
 			"claim_device_arena: a device arena is already active",
-		));
+		);
 		return None;
 	}
 	let _t = tag_scope("unclaimed");
@@ -617,7 +617,7 @@ pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Op
 				set_device_arena(slab.ptr_raw(), want);
 				carve_image_front(image);
 				if let Err(e) = commit_with_image(slab.ptr_raw(), want, image) {
-					drop(Write::err(format!("claim commit: {e}")));
+					Write::error(format!("claim commit: {e}"));
 					return None;
 				}
 				return Some(slab);
@@ -631,13 +631,13 @@ pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Op
 #[inline]
 pub fn release_device_arena(slab: GpuBuffer) {
 	if ARENA_BASE.load(Ordering::Relaxed) != slab.ptr_addr() {
-		drop(Write::err(
+		Write::error(
 			"release_device_arena: slab is not the active claim",
-		));
+		);
 		return;
 	}
 	if let Err(e) = device_synchronize() {
-		drop(Write::err(format!("arena release sync: {e}")));
+		Write::error(format!("arena release sync: {e}"));
 	}
 	set_device_arena(ptr::null_mut(), 0);
 	drain_arena_carve();
@@ -678,9 +678,9 @@ pub fn park_run_backing(buf: GpuBuffer) {
 		Err(p) => p.into_inner(),
 	};
 	if !g.is_none() {
-		drop(Write::err(
+		Write::error(
 			"park_run_backing: a parked run backing already exists",
-		));
+		);
 		return;
 	}
 	*g = Some(buf);
@@ -737,7 +737,7 @@ pub fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
 	match decision {
 		Disposition::DropForeign => {
 			if let Err(e) = device_synchronize() {
-				drop(Write::err(format!("parked release sync: {e}")));
+				Write::error(format!("parked release sync: {e}"));
 			}
 			drop(parked);
 			pool_trim();
@@ -767,7 +767,7 @@ pub fn adopt_run_backing_with_image(need: usize, image: &[f64]) -> Option<GpuBuf
 	let slab = adopt_run_backing_inner(need)?;
 	carve_image_front(image);
 	if let Err(e) = commit_with_image(slab.ptr_raw(), slab.len(), image) {
-		drop(Write::err(format!("adopt commit: {e}")));
+		Write::error(format!("adopt commit: {e}"));
 		return None;
 	}
 	return Some(slab);
@@ -787,7 +787,7 @@ pub fn release_run_backing() {
 		cmp::Ordering::Equal => release_device_arena(b),
 		cmp::Ordering::Less | cmp::Ordering::Greater => {
 			if let Err(e) = device_synchronize() {
-				drop(Write::err(format!("parked release sync: {e}")));
+				Write::error(format!("parked release sync: {e}"));
 			}
 			drop(b);
 		}
@@ -1001,7 +1001,7 @@ fn pin_ensure(g: &mut PinBuf, bytes: usize) -> Result<*mut u8, HipError> {
 			drop(unsafe { host_free(ptr::with_exposed_provenance_mut::<c_void>(g.ptr)) });
 		}
 		let raw = host_malloc(bytes, 0).map_err(|e| {
-			drop(Write::err(format!("run_pin host_malloc: {e}")));
+			Write::error(format!("run_pin host_malloc: {e}"));
 			return e;
 		})?;
 		g.ptr = raw.expose_provenance();
@@ -1181,11 +1181,11 @@ impl ExitD2H {
 	#[inline]
 	pub fn finish(self, dst: &mut [f64]) {
 		if mem::size_of_val(dst) != self.bytes {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"ExitD2H::finish size mismatch: {} vs {}",
 				mem::size_of_val(dst),
 				self.bytes
-			)));
+			));
 			return;
 		}
 		par_copy(
@@ -1258,7 +1258,7 @@ pub(crate) fn device_init_once() {
 	DEVICE_INIT.call_once(|| {
 		disable_sdma_once();
 		if let Some(e) = set_pool_retain(0).err() {
-			drop(Write::err(format!("GPU pool retain failed: {e}")));
+			Write::error(format!("GPU pool retain failed: {e}"));
 		}
 		register_fault_autopsy_once();
 		hw::spawn_thrash_watchdog();
@@ -1268,10 +1268,10 @@ pub(crate) fn device_init_once() {
 #[inline]
 pub fn pool_trim() {
 	if let Err(e) = device_synchronize() {
-		drop(Write::err(format!("pool_trim sync: {e}")));
+		Write::error(format!("pool_trim sync: {e}"));
 	}
 	if let Err(e) = trim_mempool(0) {
-		drop(Write::err(format!("pool_trim: {e}")));
+		Write::error(format!("pool_trim: {e}"));
 	}
 }
 
@@ -1283,7 +1283,7 @@ pub fn vram_free_base() -> usize {
 	let hip_free = match mem_info() {
 		Ok(mi) => mi.free,
 		Err(e) => {
-			drop(Write::err(format!("hipMemGetInfo: {e}")));
+			Write::error(format!("hipMemGetInfo: {e}"));
 			sysfs_vram_free().unwrap_or(0)
 		}
 	};
@@ -1291,7 +1291,7 @@ pub fn vram_free_base() -> usize {
 	let slack = match pool_slack(0) {
 		Ok(s) => s,
 		Err(e) => {
-			drop(Write::err(format!("pool_slack: {e}")));
+			Write::error(format!("pool_slack: {e}"));
 			0
 		}
 	};
@@ -1377,6 +1377,79 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 		Write::line(
 			gpu,
 			format!("claim probe: {} unmappable, backing off", fmt_bytes(want)),
+		);
+		want -= want >> 4i32;
+	}
+	return None;
+}
+
+/// Child entry for the host-RAM headroom probe. When `RAM_PROBE` names a byte
+/// count, commits that many host bytes and touches every page so the commit
+/// becomes real resident memory, mirroring the VRAM probe's device allocation.
+/// Returns `Some(0)` if the process survived the commit, `Some(2)` on a parse
+/// failure, and `None` when the env var is unset (not a probe child). If the
+/// kernel OOM-kills the child mid-commit it dies with SIGKILL and the parent's
+/// [`probe_ram_ceiling`] loop reads the non-success status as "unmappable".
+#[inline]
+pub fn ram_probe_ask() -> Option<i32> {
+	let sz = std::env::var_os("RAM_PROBE")?;
+	let Ok(n) = sz.to_string_lossy().parse::<usize>() else {
+		return Some(2);
+	};
+	let mut v = vec![0u8; n];
+	let mut i = 0usize;
+	while i < v.len() {
+		v[i] = 1u8;
+		i += 4096;
+	}
+	core::hint::black_box(v.as_ptr());
+	drop(v);
+	return Some(0);
+}
+
+/// Spawns one RAM probe child that must commit and touch `want` bytes, returning
+/// whether it survived. Core dumps are disabled in the child so an OOM-kill is
+/// silent, exactly as the VRAM claim probe does.
+fn spawn_ram_probe(want: usize) -> bool {
+	use std::os::unix::process::CommandExt as _;
+	let Ok(exe) = std::env::current_exe() else {
+		return false;
+	};
+	let mut c = std::process::Command::new(exe);
+	c.stdin(std::process::Stdio::null());
+	c.env("RAM_PROBE", want.to_string());
+	// SAFETY: setrlimit and Ok are async-signal-safe; the child only disables core dumps before exec.
+	unsafe {
+		c.pre_exec(|| {
+			let z = libc::rlimit {
+				rlim_cur: 0,
+				rlim_max: 0,
+			};
+			libc::setrlimit(libc::RLIMIT_CORE, &z);
+			return Ok(());
+		});
+	}
+	return c.status().map(|s| return s.success()).unwrap_or(false);
+}
+
+/// Probe-verified host-RAM budget. Spawns a child per candidate size that must
+/// commit and touch that many bytes, backing off by 1/16 until one survives,
+/// exactly mirroring [`probe_ceiling`]'s VRAM claim probe. Returns the largest
+/// survivable size, or `None` when nothing above 1 GB survives the commit.
+#[inline]
+pub fn probe_ram_ceiling(guess: usize) -> Option<usize> {
+	let mut want = guess & !((1 << 21i32) - 1);
+	while want > (1 << 30i32) {
+		if spawn_ram_probe(want) {
+			Write::line(
+				gpu,
+				format!("ram probe: {} (probe-verified)", fmt_bytes(want)),
+			);
+			return Some(want);
+		}
+		Write::line(
+			gpu,
+			format!("ram probe: {} unmappable, backing off", fmt_bytes(want)),
 		);
 		want -= want >> 4i32;
 	}
@@ -1529,9 +1602,9 @@ impl GpuBuffer {
 	fn alloc_bytes_inner(n_bytes: usize) -> Result<Self, HipError> {
 		device_init_once();
 		if ALLOC_FROZEN.with(|f| return !matches!(f.get(), Frozen::No)) {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"GPU allocation inside frozen training loop (requested {n_bytes} bytes)"
-			)));
+			));
 			return Err(HipError(2));
 		}
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1587,15 +1660,15 @@ impl GpuBuffer {
 	pub fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
 		device_init_once();
 		if ALLOC_FROZEN.with(|f| return !matches!(f.get(), Frozen::No)) {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"GPU claim inside frozen training loop (requested {n_bytes} bytes)"
-			)));
+			));
 			return None;
 		}
 		if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-			drop(Write::err(
+			Write::error(
 				"claim_map_bytes: a device arena is already active",
-			));
+			);
 			return None;
 		}
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1622,11 +1695,11 @@ impl GpuBuffer {
 	#[inline]
 	pub fn write_u8(&self, data: &[u8]) -> Result<(), HipError> {
 		if data.len() > self.len {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"write_u8: {} bytes into a {}-byte buffer",
 				data.len(),
 				self.len
-			)));
+			));
 			return Err(HipError(1));
 		}
 		// SAFETY: the bounds check above guarantees data fits within self.len; self.ptr is a live device allocation.
@@ -1645,12 +1718,33 @@ impl GpuBuffer {
 	/// Returns an error if the host-to-device transfer fails.
 	#[inline]
 	pub fn load(&self, data: &[f64]) -> Result<(), HipError> {
+		if self.dt == Dtype::F32 {
+			let narrowed: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+			let bytes = narrowed.len() * Dtype::F32.elem_size();
+			if bytes > self.len {
+				Write::error(format!(
+					"load: {bytes} bytes into a {}-byte buffer",
+					self.len
+				));
+				return Err(HipError(1));
+			}
+			// SAFETY: the bounds check above guarantees the narrowed bytes fit within self.len; self.ptr is a live device allocation.
+			unsafe {
+				return xfer(
+					self.ptr,
+					narrowed.as_ptr().cast::<c_void>(),
+					bytes,
+					HIP_MEMCPY_H2D,
+					ptr::null_mut(),
+				);
+			}
+		}
 		let bytes = mem::size_of_val(data);
 		if bytes > self.len {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"load: {bytes} bytes into a {}-byte buffer",
 				self.len
-			)));
+			));
 			return Err(HipError(1));
 		}
 		// SAFETY: the bounds check above guarantees data fits within self.len; self.ptr is a live device allocation.
@@ -1663,6 +1757,37 @@ impl GpuBuffer {
 				ptr::null_mut(),
 			);
 		}
+	}
+
+	/// Downloads into an f64 host slice, widening from the buffer's storage
+	/// dtype: an F32 buffer is read back and promoted, an F64 buffer copied
+	/// directly. The inference forward parks activations at the model's native
+	/// width but composes its host-side routing and readout in f64.
+	///
+	/// # Errors
+	/// Errors if the device-to-host copy or the following synchronize fails.
+	#[inline]
+	pub fn download_host(&self, dst: &mut [f64]) -> Result<(), HipError> {
+		if self.dt == Dtype::F32 {
+			let mut tmp = vec![0f32; dst.len()];
+			self.download_f32(&mut tmp)?;
+			for (d, s) in dst.iter_mut().zip(tmp.iter()) {
+				*d = f64::from(*s);
+			}
+			return Ok(());
+		}
+		let bytes = dst.len() * 8;
+		// SAFETY: dst holds bytes of valid host memory and self.ptr is a live device buffer of at least that size.
+		unsafe {
+			xfer(
+				dst.as_mut_ptr().cast::<c_void>(),
+				self.ptr,
+				bytes,
+				HIP_MEMCPY_D2H,
+				ptr::null_mut(),
+			)
+		}?;
+		return device_synchronize();
 	}
 
 	/// # Errors
@@ -1807,10 +1932,10 @@ impl GpuBuffer {
 		let es = self.dt.elem_size();
 		let want = n_floats * es;
 		let off = if want > self.len {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"as_ptr_offset: offset {want} bytes exceeds buffer len {}",
 				self.len
-			)));
+			));
 			self.len
 		} else {
 			want
@@ -1988,12 +2113,12 @@ impl Drop for GpuBuffer {
 		// SAFETY: self.ptr is a live pool allocation freed exactly once here and nulled below.
 		let code = unsafe { hipFreeAsync(self.ptr, ptr::null_mut()) };
 		if let Some(_fail) = num::NonZeroI32::new(code) {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"hipFreeAsync FAILED (code {code}): leaked {} tag '{}' at {:#x}",
 				self.len,
 				self.tag,
 				self.ptr.addr()
-			)));
+			));
 		}
 		self.ptr = ptr::null_mut();
 	}

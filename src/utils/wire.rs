@@ -313,7 +313,7 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 	let sock = match UdpSocket::bind(bind) {
 		Ok(s) => s,
 		Err(e) => {
-			drop(Write::err(&format!("discovery listener bind failed: {e}")));
+			Write::error(&format!("discovery listener bind failed: {e}"));
 			return;
 		}
 	};
@@ -407,7 +407,7 @@ fn rewrite_config(reg: &Registry, own: &Option<Arc<Machine>>) {
 		.err()
 		.into_iter()
 	{
-		drop(Write::err(&format!("config write failed: {e}")));
+		Write::error(&format!("config write failed: {e}"));
 	}
 }
 
@@ -693,7 +693,7 @@ impl Server {
 				.err()
 				.into_iter()
 			{
-				drop(Write::err(&format!("config write failed: {e}")));
+				Write::error(&format!("config write failed: {e}"));
 			}
 		}
 		let bm = machine.clone();
@@ -723,7 +723,7 @@ impl Server {
 			let srv = self.clone();
 			thread::spawn(move || {
 				for e in srv.handle(stream).err().into_iter() {
-					drop(Write::err(&format!("connection ended: {e}")));
+					Write::error(&format!("connection ended: {e}"));
 				}
 			});
 		}

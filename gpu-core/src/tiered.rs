@@ -245,7 +245,7 @@ impl Tiered {
 					// SAFETY: va is a valid writable out-slot for the reserved base address.
 					hip::check(unsafe { hip::vmm_reserve(&raw mut va, gpu_pages * P) })
 						.unwrap_or_else(|e| {
-							drop(Write::err(format!("vmm reserve: {e}")));
+							Write::error(format!("vmm reserve: {e}"));
 						});
 					let mut handles = Vec::with_capacity(gpu_pages);
 					for s in 0..gpu_pages {
@@ -254,7 +254,7 @@ impl Tiered {
 						// SAFETY: h is a valid writable out-slot for the new physical handle.
 						hip::check(unsafe { hip::vmm_create(&raw mut h, P) })
 							.unwrap_or_else(|e| {
-								drop(Write::err(format!("vmm create: {e}")));
+								Write::error(format!("vmm create: {e}"));
 							});
 						// SAFETY: s < gpu_pages, so the offset stays within the reserved VA range.
 						let slot_va =
@@ -264,7 +264,7 @@ impl Tiered {
 						// SAFETY: slot_va is a reserved in-range page and h its freshly created handle.
 						hip::check(unsafe { hip::vmm_map_at(slot_va, P, h) })
 							.unwrap_or_else(|e| {
-								drop(Write::err(format!("vmm map: {e}")));
+								Write::error(format!("vmm map: {e}"));
 							});
 						handles.push(h);
 					}
@@ -282,19 +282,19 @@ impl Tiered {
 			cmp::Ordering::Greater => match open_spill(spill) {
 				Ok(f) => {
 					let disk_bytes = u64::try_from(n_disk * P).unwrap_or_else(|e| {
-						drop(Write::err(format!(
+						Write::error(format!(
 							"spill size {} overflows u64: {e}",
 							n_disk * P
-						)));
+						));
 						0
 					});
 					f.set_len(disk_bytes).unwrap_or_else(|e| {
-						drop(Write::err(format!("size spill file: {e}")));
+						Write::error(format!("size spill file: {e}"));
 					});
 					Some(f)
 				}
 				Err(e) => {
-					drop(Write::err(format!("open spill file: {e}")));
+					Write::error(format!("open spill file: {e}"));
 					None
 				}
 			},
@@ -304,22 +304,22 @@ impl Tiered {
 		let mut res = Vec::with_capacity(n_pg);
 		for s in 0..gpu_pages {
 			res.push(Residence::Vram(u32::try_from(s).unwrap_or_else(|e| {
-				drop(Write::err(format!("vram slot {s} overflows u32: {e}")));
+				Write::error(format!("vram slot {s} overflows u32: {e}"));
 				0
 			})));
 		}
 		for i in 0..ram_pages {
 			res.push(Residence::Ram(u32::try_from(i).unwrap_or_else(|e| {
-				drop(Write::err(format!("ram slot {i} overflows u32: {e}")));
+				Write::error(format!("ram slot {i} overflows u32: {e}"));
 				0
 			})));
 		}
 		for i in 0..n_disk {
 			res.push(Residence::Disk(u64::try_from(i * P).unwrap_or_else(|e| {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"disk offset {} overflows u64: {e}",
 					i * P
-				)));
+				));
 				0
 			})));
 		}
@@ -370,9 +370,9 @@ impl Tiered {
 	#[inline]
 	pub fn device_ptr(&self) -> *mut c_void {
 		if !self.is_contiguous_vram() {
-			drop(Write::err(
+			Write::error(
 				"device_ptr on a spilled buffer \u{2014} stage pages instead",
-			));
+			);
 			return ptr::null_mut();
 		}
 		return self.va;
@@ -381,7 +381,7 @@ impl Tiered {
 	#[inline]
 	pub fn fill(&mut self, src: &[u8]) {
 		if src.len() > self.b {
-			drop(Write::err("fill src longer than buffer"));
+			Write::error("fill src longer than buffer");
 			return;
 		}
 		for p in 0..self.n_pg {
@@ -403,7 +403,7 @@ impl Tiered {
 				let off = match usize::try_from(s) {
 					Ok(v) => v * P,
 					Err(_) => {
-						drop(Write::err("vram slot index overflows usize"));
+						Write::error("vram slot index overflows usize");
 						return;
 					}
 				};
@@ -421,14 +421,14 @@ impl Tiered {
 					)
 				}
 				.unwrap_or_else(|e| {
-					drop(Write::err(format!("H2D page fill: {e}")));
+					Write::error(format!("H2D page fill: {e}"));
 				});
 			}
 			Residence::Ram(i) => {
 				let ri = match usize::try_from(i) {
 					Ok(v) => v,
 					Err(_) => {
-						drop(Write::err("ram page index overflows usize"));
+						Write::error("ram page index overflows usize");
 						return;
 					}
 				};
@@ -436,11 +436,11 @@ impl Tiered {
 			}
 			Residence::Disk(off) => {
 				let Some(f) = self.disk.as_ref() else {
-					drop(Write::err("disk tier missing"));
+					Write::error("disk tier missing");
 					return;
 				};
 				f.write_all_at(bytes, off).unwrap_or_else(|e| {
-					drop(Write::err(format!("spill write: {e}")));
+					Write::error(format!("spill write: {e}"));
 				});
 			}
 		}
@@ -480,7 +480,7 @@ impl Tiered {
 						xfer(dst, src, chunk, hip::HIP_MEMCPY_D2D, ptr::null_mut())
 					}
 					.unwrap_or_else(|e| {
-						drop(Write::err(format!("stage_bytes D2D: {e}")));
+						Write::error(format!("stage_bytes D2D: {e}"));
 					});
 				}
 				Residence::Ram(i) => {
@@ -496,12 +496,12 @@ impl Tiered {
 						xfer(dst, src, chunk, hip::HIP_MEMCPY_H2D, ptr::null_mut())
 					}
 					.unwrap_or_else(|e| {
-						drop(Write::err(format!("stage_bytes H2D: {e}")));
+						Write::error(format!("stage_bytes H2D: {e}"));
 					});
 				}
 				Residence::Disk(diskoff) => {
 					let Some(f) = self.disk.as_ref() else {
-						drop(Write::err("disk tier missing"));
+						Write::error("disk tier missing");
 						return;
 					};
 					f.read_exact_at(
@@ -509,7 +509,7 @@ impl Tiered {
 						diskoff + u64::try_from(poff).unwrap_or(0),
 					)
 					.unwrap_or_else(|e| {
-						drop(Write::err(format!("stage_bytes read: {e}")));
+						Write::error(format!("stage_bytes read: {e}"));
 					});
 					// SAFETY: scratch holds chunk bytes just read from disk and dst is valid for chunk bytes.
 					unsafe {
@@ -521,7 +521,7 @@ impl Tiered {
 							ptr::null_mut(),
 						)
 						.unwrap_or_else(|e| {
-							drop(Write::err(format!("stage_bytes disk H2D: {e}")));
+							Write::error(format!("stage_bytes disk H2D: {e}"));
 						});
 					}
 				}
@@ -546,9 +546,9 @@ impl Tiered {
 							let slot = match usize::try_from(s) {
 								Ok(v) => v,
 								Err(_) => {
-									drop(Write::err(
+									Write::error(
 										"stage_into vram slot overflows usize",
-									));
+									);
 									return;
 								}
 							};
@@ -571,16 +571,16 @@ impl Tiered {
 								)
 							}
 							.unwrap_or_else(|e| {
-								drop(Write::err(format!("stage D2D: {e}")));
+								Write::error(format!("stage D2D: {e}"));
 							});
 						}
 						Residence::Ram(i) => {
 							let ri = match usize::try_from(i) {
 								Ok(v) => v,
 								Err(_) => {
-									drop(Write::err(
+									Write::error(
 										"stage_into ram index overflows usize",
-									));
+									);
 									return;
 								}
 							};
@@ -595,18 +595,18 @@ impl Tiered {
 									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
-									drop(Write::err(format!("stage H2D: {e}")));
+									Write::error(format!("stage H2D: {e}"));
 								});
 							}
 						}
 						Residence::Disk(off) => {
 							let Some(f) = self.disk.as_ref() else {
-								drop(Write::err("disk tier missing"));
+								Write::error("disk tier missing");
 								return;
 							};
 							f.read_exact_at(&mut disk_scratch[..bytes], off)
 								.unwrap_or_else(|e| {
-									drop(Write::err(format!("stage read: {e}")));
+									Write::error(format!("stage read: {e}"));
 								});
 							// SAFETY: disk_scratch holds the read bytes; dst is a valid device pointer
 							unsafe {
@@ -618,9 +618,9 @@ impl Tiered {
 									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
-									drop(Write::err(format!(
+									Write::error(format!(
 										"stage disk H2D: {e}"
-									)));
+									));
 								});
 							}
 						}

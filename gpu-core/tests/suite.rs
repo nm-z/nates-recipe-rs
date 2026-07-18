@@ -64,6 +64,8 @@ mod prove_shape;
 mod prove_sort;
 #[path = "suite/prove_special.rs"]
 mod prove_special;
+#[path = "suite/ram_probe.rs"]
+mod ram_probe;
 #[path = "suite/t_algos.rs"]
 mod t_algos;
 #[path = "suite/t_bmm.rs"]

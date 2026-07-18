@@ -195,7 +195,7 @@ fn safe_i32(v: usize) -> i32 {
 	if let Ok(n) = i32::try_from(v) {
 		return n;
 	}
-	drop(Write::err(format!("size {v} overflows i32")));
+	Write::error(format!("size {v} overflows i32"));
 	return i32::MAX;
 }
 

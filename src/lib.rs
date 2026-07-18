@@ -91,22 +91,10 @@ pub fn infer() -> Infer {
 	Infer::new()
 }
 
-pub(crate) fn ok_or_die<T, E: fmt::Display>(r: Result<T, E>, ctx: &str) -> T {
-	match r {
-		Ok(v) => return v,
-		Err(e) => {
-			drop(gpu_core::log::Write::err(format!("{ctx}: {e:#}")));
-			panic!("{ctx}");
-		}
-	}
+pub(crate) fn ok_or_err<T, E: fmt::Display>(r: Result<T, E>, ctx: &str) -> anyhow::Result<T> {
+	r.map_err(|e| anyhow::anyhow!("{ctx}: {e:#}"))
 }
 
-pub(crate) fn some_or_die<T>(o: Option<T>, msg: &str) -> T {
-	match o {
-		Some(v) => return v,
-		None => {
-			drop(gpu_core::log::Write::err(msg));
-			panic!("{msg}");
-		}
-	}
+pub(crate) fn some_or_err<T>(o: Option<T>, msg: &str) -> anyhow::Result<T> {
+	o.ok_or_else(|| anyhow::anyhow!("{msg}"))
 }

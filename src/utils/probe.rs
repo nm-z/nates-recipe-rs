@@ -67,12 +67,12 @@ pub fn gpu_child_ask() -> Option<i32> {
 		Ok(card) => match measure_gpu(card) {
 			Ok(_dev) => 0,
 			Err(e) => {
-				drop(Write::err(&format!("probe child gpu{card}: {e}")));
+				Write::error(&format!("probe child gpu{card}: {e}"));
 				2
 			}
 		},
 		Err(e) => {
-			drop(Write::err(&format!("RECIPE_PROBE_GPU parse: {e}")));
+			Write::error(&format!("RECIPE_PROBE_GPU parse: {e}"));
 			2
 		}
 	};

@@ -69,13 +69,13 @@ pub fn cu_count() -> usize {
 			// SAFETY: hip_multiprocessor_count takes no arguments and only reads the cached device multiprocessor count.
 			let n = unsafe { hip_multiprocessor_count() };
 			if n <= 0i32 {
-				drop(Write::err(format!(
+				Write::error(format!(
 					"hipGetDeviceProperties returned multiProcessorCount={n} — initialize the device (set_device) before sizing GPU launches"
-				)));
+				));
 				return 0;
 			}
 			let count = usize::try_from(n).unwrap_or_else(|_| {
-				drop(Write::err(format!("multiProcessorCount={n} does not fit in usize")));
+				Write::error(format!("multiProcessorCount={n} does not fit in usize"));
 				return 0;
 			});
 			CU.store(count, Ordering::Relaxed);
@@ -326,11 +326,11 @@ pub unsafe extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_
 			|| return format!("{placed}; va in NO recorded allocation"),
 			|hit| return format!("{placed}; {hit}"),
 		);
-		drop(Write::err(format!(
+		Write::error(format!(
 			"gpu fault autopsy  va=0x{:x}  reason={why}  {located}\n{}",
 			e.virtual_address,
 			memory::ledger_report(),
-		)));
+		));
 
 		thread::sleep(Duration::from_millis(150));
 	}

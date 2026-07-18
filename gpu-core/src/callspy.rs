@@ -381,7 +381,7 @@ fn index_of(c: &AtomicU64) -> usize {
 		.iter()
 		.position(|x| return ptr::eq(*x, c))
 		.unwrap_or_else(|| {
-			drop(Write::err("callspy: counter not registered in ALL"));
+			Write::error("callspy: counter not registered in ALL");
 				return 0;
 		});
 }

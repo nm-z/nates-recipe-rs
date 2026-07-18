@@ -69,9 +69,9 @@ fn run() -> Result<(), Errored> {
 	let Some(kernel) = argv.get(2) else {
 		let mut names = program.kernels();
 		names.sort_unstable();
-		drop(Write::err(format!("kernels in {path}:")));
+		Write::error(format!("kernels in {path}:"));
 		for name in names {
-			drop(Write::err(format!("  {name}")));
+			Write::error(format!("  {name}"));
 		}
 		return Ok(());
 	};
@@ -96,10 +96,10 @@ fn run() -> Result<(), Errored> {
 	program
 		.launch(kernel, [grid_x, 1, 1], [block_x, 1, 1], &args)
 		.map_err(|e| Errored::new(format!("launch {kernel}: {e}")))?;
-	drop(Write::err(format!(
+	Write::error(format!(
 		"DONE {kernel} grid={grid_x} block={block_x} kernargs={} bytes",
 		args.as_bytes().len()
-	)));
+	));
 
 	for p in bufs {
 		// SAFETY: each p was returned by asm::alloc_device above and is freed exactly once here.
@@ -112,7 +112,7 @@ fn run() -> Result<(), Errored> {
 
 fn main() {
 	if let Err(e) = run() {
-		drop(Write::err(format!("asmrun: {e}")));
+		Write::error(format!("asmrun: {e}"));
 		process::exit(1);
 	}
 }

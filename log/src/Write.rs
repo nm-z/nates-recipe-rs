@@ -75,3 +75,12 @@ pub fn unwait() {
 pub fn err(t: impl Display) -> Result<(), Errored> {
 	return Result::Err(Errored::new(t));
 }
+
+/// Fire-and-forget error report for scopes that cannot propagate (Drop impls,
+/// void callbacks, closures with frozen signatures): same `ERROR:` prefix, log,
+/// and stderr as [`err`], no `Result` to discard. `drop(Write::err(..))` is the
+/// wrong function for that job — this is the right one.
+#[inline]
+pub fn error(t: impl Display) {
+	let _reported = Errored::new(t);
+}

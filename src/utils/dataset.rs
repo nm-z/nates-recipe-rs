@@ -52,10 +52,12 @@ impl Drop for Data {
 
 pub(crate) fn parked_data() -> Data {
 	let inner = PARKED_DATA.with(|slot| slot.borrow_mut().take());
-	let inner = crate::some_or_die(
-		inner,
-		"run: no data configured — chain recipe.data(path) before run(data, …)",
-	);
+	let inner = inner.unwrap_or_else(|| {
+		Write::error(
+			"run: no data configured — chain recipe.data(path) before run(data, …)",
+		);
+		Box::new(DataInner::blank())
+	});
 	Data { inner }
 }
 
@@ -132,7 +134,21 @@ impl Deref for Data {
 		&self.inner
 	}
 }
-pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
+/// An empty encoded set used only as the non-dying fallback when a data
+/// preparation error is surfaced inline instead of aborting the process.
+fn empty_dataset() -> Dataset {
+	Dataset {
+		x: Mat::zeros([0, 0]),
+		y: crate::Vec1::zeros(0),
+		source: String::new(),
+		n_targets: 0,
+		has_target: false,
+		text_cols: Vec::new(),
+		onehot_groups: Vec::new(),
+	}
+}
+
+pub(crate) fn collapse_onehot(ds: &Dataset) -> anyhow::Result<CollapsedOnehot> {
 	let n = ds.x.nrows();
 	let ncols = ds.x.ncols();
 	let mut in_group: BTreeSet<usize> = BTreeSet::new();
@@ -166,12 +182,12 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> CollapsedOnehot {
 		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let x = crate::ok_or_die(Mat::from_shape_vec([n, new_ncols], dat), "collapse_onehot");
-	CollapsedOnehot {
+	let x = crate::ok_or_err(Mat::from_shape_vec([n, new_ncols], dat), "collapse_onehot")?;
+	Ok(CollapsedOnehot {
 		x,
 		embed_cols,
 		vocab: offset,
-	}
+	})
 }
 
 enum FileFormat {
@@ -299,9 +315,9 @@ impl Data {
 
 	pub fn split(mut self, train_frac: f64) -> Data {
 		if !(0.0..1.0).contains(&train_frac) {
-			drop(Write::err(format!(
+			Write::error(format!(
 				"split fraction must be in (0, 1), got {train_frac}"
-			)));
+			));
 			return self;
 		}
 		self.inner.split_frac = Some(train_frac);
@@ -319,7 +335,13 @@ impl DataInner {
 	}
 
 	pub fn datasets(&self) -> Datasets {
-		crate::ok_or_die(self.try_datasets(), "Data::datasets")
+		self.try_datasets().unwrap_or_else(|e| {
+			Write::error(format!("Data::datasets: {e:#}"));
+			Datasets {
+				train: empty_dataset(),
+				test: None,
+			}
+		})
 	}
 
 	pub(crate) fn try_datasets(&self) -> anyhow::Result<Datasets> {

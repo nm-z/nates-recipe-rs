@@ -6,7 +6,6 @@
 
 use super::super::{Arena, Model, layer_name, softmax};
 use anyhow::{Result, anyhow};
-use core::ptr;
 use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_mla_attn, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_rope_partial_factors, gpu_scale_f64_inplace,
@@ -1309,15 +1308,15 @@ fn moe_core(
 	let hp = &m.hp;
 	let (ne, nffe, nexp, used) = (hp.ne, hp.nffe, hp.nexp, hp.used);
 	let gate_w = m.stream(&layer_name(l, "router.proj.weight"))?;
-	let logits = GpuBuffer::alloc(t * nexp)?;
+	let logits = GpuBuffer::alloc_ty(t * nexp, super::super::FWD_DT)?;
 	gpu_gemm_bt_f64(cms, &gate_w, t, nexp, ne, &logits)?;
 	let mut lh = vec![0.0f64; t * nexp];
-	unsafe { logits.download_async(&mut lh, ptr::null_mut()) }?;
+	logits.download_host(&mut lh)?;
 	let mut cms_host = vec![0.0f64; t * ne];
-	unsafe { cms.download_async(&mut cms_host, ptr::null_mut()) }?;
+	cms.download_host(&mut cms_host)?;
 	let mut bias_h = vec![0.0f64; nexp];
 	if let Some(b) = bias {
-		unsafe { b.download_async(&mut bias_h, ptr::null_mut()) }?;
+		b.download_host(&mut bias_h)?;
 	}
 	gpu_core::hip::device_synchronize()?;
 	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
@@ -1357,9 +1356,7 @@ fn moe_core(
 		gpu_glu_silu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
 		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
-		unsafe {
-			ar.moe_dv.download_async(&mut dv[..np * ne], ptr::null_mut())
-		}?;
+		ar.moe_dv.download_host(&mut dv[..np * ne])?;
 		gpu_core::hip::device_synchronize()?;
 		for (i, &(p, w)) in poslist.iter().enumerate() {
 			for x in 0..ne {

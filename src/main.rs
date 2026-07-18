@@ -181,6 +181,9 @@ fn main() -> Result<()> {
 		};
 		process::exit(code);
 	}
+	if let Some(code) = gpu_core::memory::ram_probe_ask() {
+		process::exit(code);
+	}
 	if let Some(it) = env::var_os("SETUP_RACE") {
 		let iters: usize = it
 			.to_string_lossy()

@@ -533,7 +533,10 @@ fn render_models(frame: &mut Frame, names: &[String], cur: usize) {
 /// index, or `None` if the user quits without selecting. Mirrors the
 /// [`peers_picker`] ratatui style.
 pub fn model_picker(names: &[String]) -> Option<usize> {
-	crate::some_or_die(io::stdin().is_terminal().then_some(()), "run: needs a tty");
+	if !io::stdin().is_terminal() {
+		gpu_core::log::Write::error("run: needs a tty");
+		return None;
+	}
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut cur = 0usize;
@@ -593,7 +596,10 @@ fn drain_input(cancel: &std::sync::atomic::AtomicBool, textarea: &mut TextArea, 
 }
 
 pub fn render_once(gguf: &str, prompt: &str) {
-	crate::some_or_die(io::stdin().is_terminal().then_some(()), "render: needs a tty");
+	if !io::stdin().is_terminal() {
+		gpu_core::log::Write::error("render: needs a tty");
+		return;
+	}
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut input = new_input();
@@ -613,7 +619,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 		Ok(resp) => scrollback.push((prompt.to_string(), resp)),
 		Err(e) => {
 			drop(_guard);
-			drop(gpu_core::log::Write::err(format!("render: {e:#}")));
+			gpu_core::log::Write::error(format!("render: {e:#}"));
 			return;
 		}
 	}
@@ -749,7 +755,10 @@ fn run_message(
 }
 
 pub fn chat(gguf: &str) {
-	crate::some_or_die(io::stdin().is_terminal().then_some(()), "chat: needs a tty");
+	if !io::stdin().is_terminal() {
+		gpu_core::log::Write::error("chat: needs a tty");
+		return;
+	}
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut textarea = new_input();
@@ -774,7 +783,7 @@ pub fn chat(gguf: &str) {
 			drop(prompt_tx);
 			let _joined = worker.join();
 			drop(_guard);
-			drop(gpu_core::log::Write::err(format!("chat: load failed: {e}")));
+			gpu_core::log::Write::error(format!("chat: load failed: {e}"));
 			return;
 		}
 	}

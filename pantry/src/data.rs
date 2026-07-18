@@ -120,13 +120,13 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	if avail.checked_sub(proj).is_none() {
-		drop(Write::err("csv too large to parse into RAM"));
-		drop(Write::err(format!(
+		Write::error("csv too large to parse into RAM");
+		Write::error(format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		)));
+		));
 		Write::err(format!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
@@ -189,13 +189,13 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
 	let avail = crate::available_ram_bytes();
 	if avail.checked_sub(proj).is_none() {
-		drop(Write::err("csv too large to parse into RAM"));
-		drop(Write::err(format!(
+		Write::error("csv too large to parse into RAM");
+		Write::error(format!(
 			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
 			short_path(path.to_str().unwrap_or_default()),
 			human_bytes(proj),
 			human_bytes(avail)
-		)));
+		));
 		Write::err(format!(
 			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
 			path.display(),
@@ -410,10 +410,10 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					drop(Write::err(format!(
+					Write::error(format!(
 						"WARN: skipping {}: {e}",
 						hp.path.display()
-					)));
+					));
 					None
 				}
 			})
@@ -502,10 +502,10 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					drop(Write::err(format!(
+					Write::error(format!(
 						"WARN: skipping image {}: {e}",
 						p.display()
-					)));
+					));
 					vec![f64::NAN; dim]
 				}
 			};
@@ -687,7 +687,7 @@ fn parse_attribute(line: &str) -> Attr {
 				spec: r[end + 1..].trim().to_string(),
 			},
 			None => {
-				drop(Write::err("attribute: unterminated quoted name"));
+				Write::error("attribute: unterminated quoted name");
 				NameSpec {
 					name: r.to_string(),
 					spec: String::new(),
@@ -700,7 +700,7 @@ fn parse_attribute(line: &str) -> Attr {
 				spec: rest[end..].trim().to_string(),
 			},
 			None => {
-				drop(Write::err("attribute: missing type"));
+				Write::error("attribute: missing type");
 				NameSpec {
 					name: rest.to_string(),
 					spec: String::new(),
@@ -739,9 +739,9 @@ pub fn parse_arff(path: &str) -> ArffTable {
 					.file_name()
 					.and_then(|s| s.to_str())
 					.unwrap_or(path);
-				drop(Write::err(format!("couldn't find '{name}' in {cwd}")));
+				Write::error(format!("couldn't find '{name}' in {cwd}"));
 			} else {
-				drop(Write::err(format!("Data: cannot read {path}: {e}")));
+				Write::error(format!("Data: cannot read {path}: {e}"));
 			}
 			return ArffTable {
 				attrs: Vec::new(),
@@ -778,14 +778,14 @@ pub fn parse_arff(path: &str) -> ArffTable {
 		}
 	}
 	if attrs.is_empty() {
-		drop(Write::err(format!("Data: no @attribute lines in {path}")));
+		Write::error(format!("Data: no @attribute lines in {path}"));
 		return ArffTable {
 			attrs: Vec::new(),
 			rows: Vec::new(),
 		};
 	}
 	if rows.is_empty() {
-		drop(Write::err(format!("Data: no @data rows in {path}")));
+		Write::error(format!("Data: no @data rows in {path}"));
 		return ArffTable {
 			attrs: Vec::new(),
 			rows: Vec::new(),

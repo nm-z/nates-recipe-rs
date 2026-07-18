@@ -60,7 +60,18 @@ fn main() -> Result<(), String> {
 		.filter(|o| o.status.success())
 		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 		.ok_or("git rev-parse --short HEAD failed")?;
-	put(&format!("cargo:rustc-env=GIT_HASH={hash}"));
+	let dirty = process::Command::new("git")
+		.args(["status", "--porcelain"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.map(|o| !o.stdout.is_empty())
+		.ok_or("git status --porcelain failed")?;
+	let suffix = match dirty {
+		true => "-dirty",
+		false => "",
+	};
+	put(&format!("cargo:rustc-env=GIT_HASH={hash}{suffix}"));
 	put("cargo:rerun-if-changed=.git/HEAD");
 	let platform = match hipconfig("--platform")?.as_str() {
 		"amd" => Platform::Amd,
