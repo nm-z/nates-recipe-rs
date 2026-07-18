@@ -12,7 +12,11 @@ use std::slice;
 use std::time::UNIX_EPOCH;
 
 fn usage(code: i32) -> ! {
-	drop(Write::err(&format!("recipe {}", env!("CARGO_PKG_VERSION"))));
+	drop(Write::err(&format!(
+		"recipe {}.{}",
+		env!("CARGO_PKG_VERSION"),
+		env!("GIT_HASH")
+	)));
 	drop(Write::err(
 		"usage: recipe <file.rs> [args]  # compile + run",
 	));

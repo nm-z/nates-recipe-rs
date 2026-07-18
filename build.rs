@@ -53,6 +53,15 @@ fn rocm_path() -> Result<String, String> {
 }
 
 fn main() -> Result<(), String> {
+	let hash = process::Command::new("git")
+		.args(["rev-parse", "--short", "HEAD"])
+		.output()
+		.ok()
+		.filter(|o| o.status.success())
+		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+		.ok_or("git rev-parse --short HEAD failed")?;
+	put(&format!("cargo:rustc-env=GIT_HASH={hash}"));
+	put("cargo:rerun-if-changed=.git/HEAD");
 	let platform = match hipconfig("--platform")?.as_str() {
 		"amd" => Platform::Amd,
 		"nvidia" => Platform::Nvidia,
