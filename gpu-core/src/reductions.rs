@@ -779,9 +779,9 @@ pub fn gpu_scan_linear_recurrence(
 	n_steps: usize,
 	dim: usize,
 	states: &GpuBuffer,
-	state: Option<&GpuBuffer>,
+	state: &GpuBuffer,
 ) -> Result<(), HipError> {
-	let sp = state.map_or(ptr::null_mut(), |s| s.ptr_raw());
+	let sp = state.ptr_raw();
 	// SAFETY: a, b, and states are live device buffers sized for n_steps*dim; the launcher signature matches these arguments. A null state zero-inits with no write-back.
 	unsafe {
 		launch_scan_linear_recurrence(

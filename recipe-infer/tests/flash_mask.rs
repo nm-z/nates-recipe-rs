@@ -87,7 +87,10 @@ fn run_flash(
 	let kb = upload(k);
 	let vb = upload(v);
 	let ob = GpuBuffer::alloc(t_q * nqh * hd).expect("out");
-	gpu_flash_gqa(&qb, &kb, &vb, t_q, t_kv, nqh, nkv, hd, 0.0, p_base, t_kv, &ob, None, None, None, 0, true).expect("flash");
+	let cm = GpuBuffer::alloc(t_q * nqh).expect("cm");
+	let cl = GpuBuffer::alloc(t_q * nqh).expect("cl");
+	let cacc = GpuBuffer::alloc(t_q * nqh * hd).expect("cacc");
+	gpu_flash_gqa(&qb, &kb, &vb, t_q, t_kv, nqh, nkv, hd, 0.0, p_base, t_kv, &ob, &cm, &cl, &cacc, 0, true).expect("flash");
 	gpu_core::hip::device_synchronize().expect("sync");
 	let mut out = vec![0.0f64; t_q * nqh * hd];
 	ob.download_host(&mut out).expect("download");

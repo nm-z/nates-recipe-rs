@@ -126,6 +126,9 @@ fn gqa_future_kv_rows_never_touch_earlier_queries() {
 		upload(&q),
 		GpuBuffer::alloc(s.t_q * s.nqh * s.hdv).expect("out"),
 	);
+	let cm = GpuBuffer::alloc(s.t_q * s.nqh).expect("cm");
+	let cl = GpuBuffer::alloc(s.t_q * s.nqh).expect("cl");
+	let cacc = GpuBuffer::alloc(s.t_q * s.nqh * s.hdk.max(s.hdv)).expect("cacc");
 	let run = |kh: &[f64], vh: &[f64]| -> Vec<u64> {
 		let (gk, gv) = (upload(kh), upload(vh));
 		gpu_flash_gqa(
@@ -141,9 +144,9 @@ fn gqa_future_kv_rows_never_touch_earlier_queries() {
 			s.p_base,
 			s.causal_below,
 			&gout,
-			None,
-			None,
-			None,
+			&cm,
+			&cl,
+			&cacc,
 			0,
 			true,
 		)
@@ -218,6 +221,9 @@ fn gqa_matches_host_masked_softmax() {
 		let v = seeded(300 + n as u64, s.t_kv * s.nkv * s.hdv);
 		let (gq, gk, gv) = (upload(&q), upload(&k), upload(&v));
 		let gout = GpuBuffer::alloc(s.t_q * s.nqh * s.hdv).expect("out");
+		let cm = GpuBuffer::alloc(s.t_q * s.nqh).expect("cm");
+		let cl = GpuBuffer::alloc(s.t_q * s.nqh).expect("cl");
+		let cacc = GpuBuffer::alloc(s.t_q * s.nqh * s.hdk.max(s.hdv)).expect("cacc");
 		gpu_flash_gqa(
 			&gq,
 			&gk,
@@ -231,9 +237,9 @@ fn gqa_matches_host_masked_softmax() {
 			s.p_base,
 			s.causal_below,
 			&gout,
-			None,
-			None,
-			None,
+			&cm,
+			&cl,
+			&cacc,
 			0,
 			true,
 		)
@@ -269,6 +275,9 @@ fn mla_matches_host_masked_softmax() {
 		let v = seeded(600 + n as u64, s.t_kv * s.nkv * s.hdv);
 		let (gq, gk, gv) = (upload(&q), upload(&k), upload(&v));
 		let gout = GpuBuffer::alloc(s.t_q * s.nqh * s.hdv).expect("out");
+		let cm = GpuBuffer::alloc(s.t_q * s.nqh).expect("cm");
+		let cl = GpuBuffer::alloc(s.t_q * s.nqh).expect("cl");
+		let cacc = GpuBuffer::alloc(s.t_q * s.nqh * s.hdk.max(s.hdv)).expect("cacc");
 		gpu_flash_mla(
 			&gq,
 			&gk,
@@ -282,9 +291,9 @@ fn mla_matches_host_masked_softmax() {
 			s.p_base,
 			s.causal_below,
 			&gout,
-			None,
-			None,
-			None,
+			&cm,
+			&cl,
+			&cacc,
 			0,
 			true,
 		)

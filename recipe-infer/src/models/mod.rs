@@ -588,7 +588,7 @@ pub(super) fn dispatch(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let arch = m.hp.arch.as_str();
 	for &(name, comp) in TABLE {

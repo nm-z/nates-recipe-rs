@@ -71,12 +71,13 @@ template<typename T> __device__ __forceinline__ T fi_block_sum(T v, T* smem) {
 // untiled online softmax to T rounding: sp=0 is never causally masked, so the
 // running max is a real score before any masked (-1e30) row arrives.
 //
-// Optional cross-launch carry (m_io,l_io,acc_io indexed by query block = i*nqh+h;
-// [t_q*nqh] for m/l, [t_q*nqh*hd] for acc). NULL m_io => today's kernel exactly:
-// fresh (-inf,0,0), in-launch normalize to out, kv_off and finalize inert. Non-null
-// => resume the prior segment's (m,l,acc), fold this segment's keys at absolute
-// position kv_off+sp, then finalize=1 normalizes acc/l to out while finalize=0
-// stores (m,l,acc) back and writes no out. Segments in ascending kv_off make the
+// Cross-launch carry (m_io,l_io,acc_io indexed by query block = i*nqh+h;
+// [t_q*nqh] for m/l, [t_q*nqh*hd] for acc) — ALWAYS-VALID buffers, never null.
+// kv_off == 0 (the first, often only, segment) starts fresh (-inf,0,0) in
+// registers without reading them; kv_off > 0 resumes the prior segment's
+// (m,l,acc), folding this segment's keys at absolute position kv_off+sp.
+// finalize=1 normalizes acc/l to out; finalize=0 stores (m,l,acc) back and
+// writes no out. Segments in ascending kv_off make the
 // chunked output BIT-IDENTICAL to one launch (state crosses global as exact T bits,
 // accumulation order and absolute positions match). Carry lives per query block,
 // not in the K/V tile budget, so the L2 tile solve above is unchanged.
@@ -109,7 +110,7 @@ template<typename T> __global__ void flash_gqa(
     HIP_DYNAMIC_SHARED(char, smem_raw);
     T* acc = reinterpret_cast<T*>(smem_raw);
     T* qsh = acc + hd;
-    bool carry = m_io != nullptr;
+    bool carry = kv_off > 0;
     for (int x = threadIdx.x; x < hd; x += blockDim.x) { acc[x] = carry ? acc_io[(long)blk * hd + x] : (T)0.0; qsh[x] = qsrc[x]; }
     if (threadIdx.x == 0) { sh_m = carry ? m_io[blk] : (T)(-1e300); sh_s = carry ? l_io[blk] : (T)0.0; }
     __syncthreads();
@@ -138,7 +139,7 @@ template<typename T> __global__ void flash_gqa(
             __syncthreads();
         }
     }
-    if (finalize || !carry) {
+    if (finalize) {
         T* orow = out + (long)i * qd + (long)h * hd;
         for (int x = threadIdx.x; x < hd; x += blockDim.x) orow[x] = acc[x] / sh_s;
     } else {
@@ -191,7 +192,7 @@ template<typename T> __global__ void flash_mla(
     HIP_DYNAMIC_SHARED(char, smem_raw);
     T* acc = reinterpret_cast<T*>(smem_raw);
     T* qsh = acc + hdv;
-    bool carry = m_io != nullptr;
+    bool carry = kv_off > 0;
     for (int x = threadIdx.x; x < hdv; x += blockDim.x) acc[x] = carry ? acc_io[(long)blk * hdv + x] : (T)0.0;
     for (int x = threadIdx.x; x < hdk; x += blockDim.x) qsh[x] = qsrc[x];
     if (threadIdx.x == 0) { sh_m = carry ? m_io[blk] : (T)(-1e300); sh_s = carry ? l_io[blk] : (T)0.0; }
@@ -221,7 +222,7 @@ template<typename T> __global__ void flash_mla(
             __syncthreads();
         }
     }
-    if (finalize || !carry) {
+    if (finalize) {
         T* orow = out + (long)i * qdv + (long)h * hdv;
         for (int x = threadIdx.x; x < hdv; x += blockDim.x) orow[x] = acc[x] / sh_s;
     } else {

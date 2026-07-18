@@ -120,57 +120,6 @@ impl Headless {
 		return Ok(h);
 	}
 
-	/// Runs the forward for `seq` and returns the final-position logits. The
-	/// input-embedding scale is 1.0 except for arches whose graph scales it (gemma).
-	/// For talkie, the embedding is non-parametrically RMS'd in place and frozen as
-	/// the per-layer skip source (talkie.cpp:50-53).
-	fn logits_last(&self, seq: &[u32]) -> Result<Vec<f64>> {
-		let (m, ar) = (&self.m, &self.ar);
-		let (ne, nl) = (m.hp.ne, m.hp.nl);
-		let t = seq.len();
-		let scale = models::embedding_scale(m);
-		let mut base = vec![0.0f64; t * ne];
-		for (p, &tk) in seq.iter().enumerate() {
-			let b = tk as usize * ne * 2;
-			for x in 0..ne {
-				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
-			}
-		}
-		add_pos_embd(m, &mut base, 0, t, ne);
-		let h0 = ar.ha.view(0, t * ne);
-		h0.load(&base)?;
-		if let Some((g, b)) = &m.embed_norm {
-			gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
-		}
-		if models::embd_skip(m) {
-			gpu_rmsnorm_f64_nogamma(&h0, &m.eps, t, ne, &h0)?;
-			gpu_copy_into(&h0, t * ne, &ar.embd_skip)?;
-		}
-		let mut src: &GpuBuffer = &ar.ha;
-		let mut dst: &GpuBuffer = &ar.hb;
-		for l in 0..nl {
-			models::dispatch(m, l, src, dst, t, ar, &self.attn_scale, None)?;
-			mem::swap(&mut src, &mut dst);
-		}
-		let last_h = src.view((t - 1) * ne, ne);
-		models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
-		let mut logits = lm_head(m, &ar.hfs, 1, ar)?;
-		logits.truncate(m.hp.vocab);
-		let ls = models::logit_scale(m);
-		if ls != 1.0 {
-			for v in logits.iter_mut() {
-				*v *= ls;
-			}
-		}
-		let fc = models::final_softcap(m);
-		if fc > 0.0 {
-			for v in logits.iter_mut() {
-				*v = fc * (*v / fc).tanh();
-			}
-		}
-		return Ok(logits);
-	}
 }
 
 impl Drop for Headless {
@@ -225,11 +174,28 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 
 /// Headless single forward: the last-position logits (`vocab` long, f64) for
 /// the exact `toks`, for parity comparison against llama.cpp reference logits
-/// on the same GGUF file.
+/// on the same GGUF file. Runs THROUGH the cache prefill — the same one decode
+/// path as generation — then applies the arch's logit scale and final softcap.
 pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	anyhow::ensure!(!toks.is_empty(), "last_logits: empty token sequence");
 	let h = Headless::open(gguf, toks.len())?;
-	return h.logits_last(toks);
+	let mut cache = KvCache::new(&h.m, toks.len(), 0)?;
+	let mut logits = vec![0.0f64; h.m.hp.vocab];
+	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
+	forward_rows(&h.m, toks, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
+	let ls = models::logit_scale(&h.m);
+	if ls != 1.0 {
+		for v in logits.iter_mut() {
+			*v *= ls;
+		}
+	}
+	let fc = models::final_softcap(&h.m);
+	if fc > 0.0 {
+		for v in logits.iter_mut() {
+			*v = fc * (*v / fc).tanh();
+		}
+	}
+	return Ok(logits);
 }
 
 #[derive(Clone)]
@@ -2193,7 +2159,7 @@ fn layer(
 	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
 	gpu_rope_partial(theta, t * nqh, hd, d.rotary, nqh, &ar.q)?;
 	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
-	gpu_flash_gqa(&ar.q, &ar.k, &ar.v, t, t, nqh, nkv, hd, 0.0, 0, prefix, &ar.attn, None, None, None, 0, true)?;
+	gpu_flash_gqa(&ar.q, &ar.k, &ar.v, t, t, nqh, nkv, hd, 0.0, 0, prefix, &ar.attn, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -2809,7 +2775,7 @@ fn forward_rows(
 			conv_out: &cache.conv_nxt[l],
 			spill,
 		};
-		models::dispatch(m, l, src, dst, t, ar, attn_scale, Some(dec))?;
+		models::dispatch(m, l, src, dst, t, ar, attn_scale, &dec)?;
 		mem::swap(&mut src, &mut dst);
 	}
 	for l in 0..nl {
@@ -3010,7 +2976,7 @@ pub struct ChatSession {
 	/// Resident per-layer incremental cache for every token arch (`Some` whenever
 	/// `ncanvas == 0`): attention K/V plus recurrent scan/conv state, carried across
 	/// turns. `None` only for the diffusion-canvas arches, which decode a fixed canvas.
-	cache: Option<KvCache>,
+	cache: KvCache,
 }
 
 /// The KV-cache capacity the remaining claim affords, in tokens: no fixed ceiling
@@ -3154,14 +3120,16 @@ impl ChatSession {
 			}
 			let host = kv_host_tokens(&m)?;
 			let _t = gpu_core::memory::tag_scope("kvcache");
-			Some(KvCache::new(&m, win, host)?)
+			KvCache::new(&m, win, host)?
 		} else {
-			None
+			let win = kv_capacity_tokens(&m)?.max(1);
+			let _t = gpu_core::memory::tag_scope("kvcache");
+			KvCache::new(&m, win, 0)?
 		};
 		Write::line(
 			gpu,
 			format!(
-				"loaded in {:.1}s (arch={} nl={} ne={} experts={} canvas={} vocab={} softcap={} kvcache={})",
+				"loaded in {:.1}s (arch={} nl={} ne={} experts={} canvas={} vocab={} softcap={} kvcache_rows={})",
 				t_load.elapsed().as_secs_f64(),
 				m.hp.arch,
 				m.hp.nl,
@@ -3170,7 +3138,7 @@ impl ChatSession {
 				m.hp.ncanvas,
 				m.hp.vocab,
 				m.hp.softcap,
-				cache.is_some(),
+				cache.t_max,
 			),
 		);
 		return Ok(Some(ChatSession {
@@ -3212,10 +3180,7 @@ impl ChatSession {
 			format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
 		);
 		if ncanvas == 0 {
-			let cache = match self.cache.as_mut() {
-				Some(c) => c,
-				None => bail!("non-canvas arch {} opened without a KV cache", self.m.hp.arch),
-			};
+			let cache = &mut self.cache;
 			let mut keep = 0usize;
 			while keep < cache.ids.len() && keep < toks.len() && cache.ids[keep] == toks[keep] {
 				keep += 1;

@@ -3,7 +3,7 @@
 //! state threaded between them must produce output BIT-IDENTICAL to a single
 //! null-carry launch over the whole sequence.
 //!
-//! Contract (f64_infer.hip): `None` carry = today's kernel exactly (fresh
+//! Contract (f64_infer.hip): carry buffers are ALWAYS passed; kv_off == 0 starts fresh
 //! (-inf,0,0), in-launch normalize, kv_off/finalize inert). `Some` carry resumes
 //! the prior segment's (m,l,acc), folds this segment's keys at ABSOLUTE position
 //! `kv_off + sp`, and either normalizes to `out` (finalize=true) or stores
@@ -75,6 +75,7 @@ fn fresh_carry(blocks: usize, acc_len: usize) -> (GpuBuffer, GpuBuffer, GpuBuffe
 /// Single null-carry launch over the whole sequence — the reference.
 fn single(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> Vec<u64> {
 	let out = GpuBuffer::alloc(c.t_q * c.nqh * c.hdv).expect("out");
+	let (cm, cl, cacc) = fresh_carry(c.t_q * c.nqh, c.t_q * c.nqh * c.hdv);
 	if mla {
 		gpu_flash_mla(
 			q,
@@ -89,9 +90,9 @@ fn single(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> V
 			c.p_base,
 			c.causal_below,
 			&out,
-			None,
-			None,
-			None,
+			&cm,
+			&cl,
+			&cacc,
 			0,
 			true,
 		)
@@ -110,9 +111,9 @@ fn single(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> V
 			c.p_base,
 			c.causal_below,
 			&out,
-			None,
-			None,
-			None,
+			&cm,
+			&cl,
+			&cacc,
 			0,
 			true,
 		)
@@ -144,9 +145,9 @@ fn chunked(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> 
 				c.p_base,
 				c.causal_below,
 				&out,
-				Some(&m),
-				Some(&l),
-				Some(&acc),
+				&m,
+				&l,
+				&acc,
 				off,
 				last,
 			)
@@ -167,9 +168,9 @@ fn chunked(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> 
 				c.p_base,
 				c.causal_below,
 				&out,
-				Some(&m),
-				Some(&l),
-				Some(&acc),
+				&m,
+				&l,
+				&acc,
 				off,
 				last,
 			)

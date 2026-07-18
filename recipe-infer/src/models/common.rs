@@ -341,19 +341,21 @@ fn blk_norm(
 }
 
 /// The carried recurrent matrix/vector state for this decode step, or `None` on
-/// the forward-only / fresh-prefill path (kernels then zero-init with no
-/// write-back — bit-identical to the pre-cache behavior).
-fn rec_of<'a>(dec: Option<DecCtx<'a>>) -> Option<&'a GpuBuffer> {
-	return dec.and_then(|d| d.rec);
+/// This layer's recurrent state buffer. A scan mixer reaching here without one is
+/// a structural bug (the cache allocates state for every `layer_cache_shape` with
+/// `rec > 0`), surfaced as a loud error — never a silent recompute.
+fn rec_of<'a>(dec: &DecCtx<'a>) -> Result<&'a GpuBuffer> {
+	return dec.rec.ok_or_else(|| return anyhow!("scan mixer dispatched without its recurrent state buffer"));
 }
 
 /// The `(read, write)` conv-window buffers for conv `i` of this layer's mixer (in
-/// the mixer's own conv call order), or `(None, None)` on the forward-only path.
-fn conv_io<'a>(dec: Option<DecCtx<'a>>, i: usize) -> (Option<&'a GpuBuffer>, Option<&'a GpuBuffer>) {
-	return match dec {
-		Some(d) => (d.conv_in.get(i), d.conv_out.get(i)),
-		None => (None, None),
-	};
+/// the mixer's own conv call order). Out-of-range `i` means the mixer and
+/// [`models::layer_cache_shape`] disagree on this layer's conv count — loud error.
+fn conv_io<'a>(dec: &DecCtx<'a>, i: usize) -> Result<(&'a GpuBuffer, &'a GpuBuffer)> {
+	match (dec.conv_in.get(i), dec.conv_out.get(i)) {
+		(Some(r), Some(w)) => return Ok((r, w)),
+		_missing => return Err(anyhow!("conv {i} has no cache window (layer_cache_shape mismatch)")),
+	}
 }
 
 /// NeoX RoPE with optional LongRoPE factors AND a position base, so a cached decode
@@ -406,9 +408,6 @@ fn segmented_gqa(
 	let block = sc.rows;
 	gpu_copy_into(new_k, t * kd, &d.kc.view((d.cached - sc.win_base) * kd, t * kd))?;
 	gpu_copy_into(new_v, t * vd, &d.vc.view((d.cached - sc.win_base) * vd, t * vd))?;
-	ar.cm.load(&vec![-1e300f64; t * nqh])?;
-	ar.cl.memset_zero(t * nqh * es)?;
-	ar.cacc.memset_zero(t * nqh * hd * es)?;
 	let causal_below = if bidir { 0 } else { total };
 	let stage_k = [&sc.sk[0], &sc.sk[1]];
 	let stage_v = [&sc.sv[0], &sc.sv[1]];
@@ -421,7 +420,7 @@ fn segmented_gqa(
 		sc.hv.stage_into(seg * vd * es, n * vd * es, stage_v[buf], &mut scratch)?;
 		gpu_flash_gqa(
 			q, stage_k[buf], stage_v[buf], t, n, nqh, nkv, hd, max_bias, d.cached, causal_below, out,
-			Some(&ar.cm), Some(&ar.cl), Some(&ar.cacc), seg, false,
+			&ar.cm, &ar.cl, &ar.cacc, seg, false,
 		)?;
 		seg += n;
 		buf ^= 1;
@@ -429,7 +428,7 @@ fn segmented_gqa(
 	let res_n = total - sc.win_base;
 	gpu_flash_gqa(
 		q, d.kc, d.vc, t, res_n, nqh, nkv, hd, max_bias, d.cached, causal_below, out,
-		Some(&ar.cm), Some(&ar.cl), Some(&ar.cacc), sc.win_base, true,
+		&ar.cm, &ar.cl, &ar.cacc, sc.win_base, true,
 	)?;
 	return Ok(());
 }
@@ -455,9 +454,6 @@ fn segmented_mla(
 	let block = sc.rows;
 	gpu_copy_into(new_k, t * kw, &d.kc.view((d.cached - sc.win_base) * kw, t * kw))?;
 	gpu_copy_into(new_v, t * kvlr, &d.vc.view((d.cached - sc.win_base) * kvlr, t * kvlr))?;
-	ar.cm.load(&vec![-1e300f64; t * nqh])?;
-	ar.cl.memset_zero(t * nqh * es)?;
-	ar.cacc.memset_zero(t * nqh * kvlr * es)?;
 	let stage_k = [&sc.sk[0], &sc.sk[1]];
 	let stage_v = [&sc.sv[0], &sc.sv[1]];
 	let mut scratch = Vec::new();
@@ -469,7 +465,7 @@ fn segmented_mla(
 		sc.hv.stage_into(seg * kvlr * es, n * kvlr * es, stage_v[buf], &mut scratch)?;
 		gpu_flash_mla(
 			q, stage_k[buf], stage_v[buf], t, n, nqh, 1, kw, kvlr, d.cached, total, out,
-			Some(&ar.cm), Some(&ar.cl), Some(&ar.cacc), seg, false,
+			&ar.cm, &ar.cl, &ar.cacc, seg, false,
 		)?;
 		seg += n;
 		buf ^= 1;
@@ -477,7 +473,7 @@ fn segmented_mla(
 	let res_n = total - sc.win_base;
 	gpu_flash_mla(
 		q, d.kc, d.vc, t, res_n, nqh, 1, kw, kvlr, d.cached, total, out,
-		Some(&ar.cm), Some(&ar.cl), Some(&ar.cacc), sc.win_base, true,
+		&ar.cm, &ar.cl, &ar.cacc, sc.win_base, true,
 	)?;
 	return Ok(());
 }
@@ -488,7 +484,7 @@ fn segmented_mla(
 /// been evicted to the host tier. `kd`/`vd` are the cache's per-row K/V widths
 /// (equal everywhere except minicpm3's naive MLA).
 fn cached_gqa(
-	dec: &Option<DecCtx>,
+	dec: &DecCtx,
 	ar: &Arena,
 	q: &GpuBuffer,
 	new_k: &GpuBuffer,
@@ -503,25 +499,21 @@ fn cached_gqa(
 	bidir: bool,
 	out: &GpuBuffer,
 ) -> Result<()> {
-	if let Some(d) = dec {
-		if d.spill.is_some() {
-			return segmented_gqa(d, ar, q, new_k, new_v, t, nqh, nkv, hd, kd, vd, max_bias, bidir, out);
-		}
-		gpu_copy_into(new_k, t * kd, &d.kc.view(d.cached * kd, t * kd))?;
-		gpu_copy_into(new_v, t * vd, &d.vc.view(d.cached * vd, t * vd))?;
-		let t_kv = d.cached + t;
-		let causal_below = if bidir { 0 } else { t_kv };
-		gpu_flash_gqa(q, d.kc, d.vc, t, t_kv, nqh, nkv, hd, max_bias, d.cached, causal_below, out, None, None, None, 0, true)?;
-		return Ok(());
+	let d = dec;
+	if d.spill.is_some() {
+		return segmented_gqa(d, ar, q, new_k, new_v, t, nqh, nkv, hd, kd, vd, max_bias, bidir, out);
 	}
-	let causal_below = if bidir { 0 } else { t };
-	gpu_flash_gqa(q, new_k, new_v, t, t, nqh, nkv, hd, max_bias, 0, causal_below, out, None, None, None, 0, true)?;
+	gpu_copy_into(new_k, t * kd, &d.kc.view(d.cached * kd, t * kd))?;
+	gpu_copy_into(new_v, t * vd, &d.vc.view(d.cached * vd, t * vd))?;
+	let t_kv = d.cached + t;
+	let causal_below = if bidir { 0 } else { t_kv };
+	gpu_flash_gqa(q, d.kc, d.vc, t, t_kv, nqh, nkv, hd, max_bias, d.cached, causal_below, out, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
 	return Ok(());
 }
 
 /// [`cached_gqa`]'s MLA twin, shared by the absorbed deepseek2 and kimi blocks.
 fn cached_mla(
-	dec: &Option<DecCtx>,
+	dec: &DecCtx,
 	ar: &Arena,
 	q: &GpuBuffer,
 	new_k: &GpuBuffer,
@@ -532,17 +524,14 @@ fn cached_mla(
 	kvlr: usize,
 	out: &GpuBuffer,
 ) -> Result<()> {
-	if let Some(d) = dec {
-		if d.spill.is_some() {
-			return segmented_mla(d, ar, q, new_k, new_v, t, nqh, kw, kvlr, out);
-		}
-		gpu_copy_into(new_k, t * kw, &d.kc.view(d.cached * kw, t * kw))?;
-		gpu_copy_into(new_v, t * kvlr, &d.vc.view(d.cached * kvlr, t * kvlr))?;
-		let t_kv = d.cached + t;
-		gpu_flash_mla(q, d.kc, d.vc, t, t_kv, nqh, 1, kw, kvlr, d.cached, t_kv, out, None, None, None, 0, true)?;
-		return Ok(());
+	let d = dec;
+	if d.spill.is_some() {
+		return segmented_mla(d, ar, q, new_k, new_v, t, nqh, kw, kvlr, out);
 	}
-	gpu_flash_mla(q, new_k, new_v, t, t, nqh, 1, kw, kvlr, 0, t, out, None, None, None, 0, true)?;
+	gpu_copy_into(new_k, t * kw, &d.kc.view(d.cached * kw, t * kw))?;
+	gpu_copy_into(new_v, t * kvlr, &d.vc.view(d.cached * kvlr, t * kvlr))?;
+	let t_kv = d.cached + t;
+	gpu_flash_mla(q, d.kc, d.vc, t, t_kv, nqh, 1, kw, kvlr, d.cached, t_kv, out, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
 	return Ok(());
 }
 
@@ -557,7 +546,7 @@ fn attn_block(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	if sp.mla {
 		return mla_attn_block(m, l, sp, h_in, t, ar, dec);
@@ -607,7 +596,7 @@ fn attn_block(
 		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
 		gpu_rmsnorm_f64(&ar.k, norm_of(m, l, Nk::KNorm)?, &m.eps, t * nkv, hd, &ar.k)?;
 	}
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	if sp.rope {
 		gpu_rope_partial_pos(theta, t * nqh, hd, hd, nqh, pos_base, &ar.q)?;
 		gpu_rope_partial_pos(theta, t * nkv, hd, hd, nkv, pos_base, &ar.k)?;
@@ -647,7 +636,7 @@ fn attn_block(
 /// shared roped k_pe. MQA attention over `kv_lora+rope` keys and `kv_lora` values
 /// then decompresses through `v_b` and projects out through `o_proj`; residual into
 /// `ar.attn_out`.
-fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar: &Arena, dec: Option<DecCtx>) -> Result<()> {
+fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let nqh = hp.dims[l].nqh;
@@ -657,7 +646,7 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	let (qlr, kvlr, rot) = (hp.q_lora_rank, hp.kv_lora_rank, hp.n_rot);
 	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
 	let nope = hdk - rot;
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	let theta = &m.theta_full;
 	blk_norm(m, sp, l, Nk::Input, t, ne, h_in, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
@@ -720,7 +709,7 @@ pub(super) fn layer_minicpm3(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
@@ -733,7 +722,7 @@ pub(super) fn layer_minicpm3(
 			hp.arch
 		));
 	}
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	let (kwid, vwid) = (nqh * hdk, nqh * hdv);
 	let theta = &m.theta_full;
 	let factors = m.rope_factors.as_ref();
@@ -776,7 +765,7 @@ pub(super) fn layer_spec(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	attn_block(m, l, sp, h_in, t, ar, attn_scale, dec)?;
@@ -815,14 +804,14 @@ pub(super) fn layer_talkie(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let d = &hp.dims[l];
 	let (nqh, hd, nkv) = (d.nqh, d.hd, d.nkv);
 	let (qd, kd) = (nqh * hd, nkv * hd);
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	gpu_rmsnorm_f64_nogamma(h_in, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, ne, &ar.q)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
@@ -931,7 +920,7 @@ pub(super) fn layer_moe(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	attn_block(m, l, sp, h_in, t, ar, attn_scale, dec)?;
@@ -959,7 +948,7 @@ pub(super) fn layer_recurrent(
 	t: usize,
 	ar: &Arena,
 	_attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
@@ -993,7 +982,7 @@ pub(super) fn layer_recurrent(
 		&ar.v,
 	)?;
 	gpu_silu_into(&ar.k, t * kd, &ar.k)?;
-	gpu_scan_linear_recurrence(&ar.k, &ar.v, t, kd, &ar.attn, rec_of(dec))?;
+	gpu_scan_linear_recurrence(&ar.k, &ar.v, t, kd, &ar.attn, rec_of(dec)?)?;
 	gpu_gemm_bt_f64(
 		&ar.attn,
 		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
@@ -1036,7 +1025,7 @@ pub(super) fn layer_mamba(
 	h_out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	mamba1_mix(m, l, h_in, &ar.o, t, ar, dec)?;
 	gpu_add_into(&ar.o, h_in, t * m.hp.ne, h_out)?;
@@ -1056,7 +1045,7 @@ fn mamba1_mix(
 	out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
@@ -1066,7 +1055,7 @@ fn mamba1_mix(
 	let dr = hp.ssm_dt_rank;
 	let dc = hp.ssm_d_conv;
 	let dbw = dr + 2 * ds;
-	let (cin, cout) = conv_io(dec, 0);
+	let (cin, cout) = conv_io(dec, 0)?;
 	if hp.ssm_n_group != 1 {
 		return Err(anyhow!(
 			"{arch}: mamba-1 block expects a single selective group, got n_group={}",
@@ -1107,7 +1096,7 @@ fn mamba1_mix(
 
 	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
 	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
-	gpu_ssm_scan_mamba1(&ar.ss_xc, &ar.ss_dt, a, &ar.ss_bb, &ar.ss_cc, d, t, di, ds, &ar.ss_y, rec_of(dec))?;
+	gpu_ssm_scan_mamba1(&ar.ss_xc, &ar.ss_dt, a, &ar.ss_bb, &ar.ss_cc, d, t, di, ds, &ar.ss_y, rec_of(dec)?)?;
 
 	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
 	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
@@ -1132,7 +1121,7 @@ pub(super) fn layer_mamba2(
 	h_out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	mamba2_mix(m, l, h_in, &ar.o, t, ar, dec)?;
 	gpu_add_into(&ar.o, h_in, t * m.hp.ne, h_out)?;
@@ -1150,7 +1139,7 @@ fn mamba2_mix(
 	out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
@@ -1161,7 +1150,7 @@ fn mamba2_mix(
 	let dc = hp.ssm_d_conv;
 	let nh = hp.ssm_dt_rank;
 	let conv_dim = di + 2 * ng * ds;
-	let (cin, cout) = conv_io(dec, 0);
+	let (cin, cout) = conv_io(dec, 0)?;
 	if nh == 0 || di % nh != 0 {
 		return Err(anyhow!("{arch}: mamba-2 d_inner={di} not divisible by n_head={nh}"));
 	}
@@ -1185,7 +1174,7 @@ fn mamba2_mix(
 
 	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
 	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
-	gpu_ssm_scan_mamba2(&ar.ss_xbcc, &ar.ss_dtlr, a, d, t, di, ds, nh, ng, conv_dim, &ar.ss_y, rec_of(dec))?;
+	gpu_ssm_scan_mamba2(&ar.ss_xbcc, &ar.ss_dtlr, a, d, t, di, ds, nh, ng, conv_dim, &ar.ss_y, rec_of(dec)?)?;
 
 	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
 	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
@@ -1235,7 +1224,7 @@ fn plamo2_mix(
 	out: &GpuBuffer,
 	t: usize,
 	ar: &Arena,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
@@ -1245,7 +1234,7 @@ fn plamo2_mix(
 	let nh = hp.ssm_dt_rank;
 	let dc = hp.ssm_d_conv;
 	let dtd = hp.ssm_dt_dim;
-	let (cin, cout) = conv_io(dec, 0);
+	let (cin, cout) = conv_io(dec, 0)?;
 	if nh == 0 || di % nh != 0 {
 		return Err(anyhow!("{arch}: plamo2 d_inner={di} not divisible by n_head={nh}"));
 	}
@@ -1284,7 +1273,7 @@ fn plamo2_mix(
 
 	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
 	let d = ssm_of(&m.ssm_d, l, arch, "ssm_d")?;
-	gpu_ssm_scan_mamba2(&ar.ss_xbc, &dt, a, d, t, di, ds, nh, 1, conv_dim, &ar.ss_y, rec_of(dec))?;
+	gpu_ssm_scan_mamba2(&ar.ss_xbc, &dt, a, d, t, di, ds, nh, 1, conv_dim, &ar.ss_y, rec_of(dec)?)?;
 
 	gpu_silu_into(&ar.ss_z, t * di, &ar.ss_z)?;
 	gpu_mul_inplace(&ar.ss_z, t * di, &ar.ss_y)?;
@@ -1306,14 +1295,14 @@ fn plamo2_attn(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let d = &hp.dims[l];
 	let nqh = d.nqh;
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, ne, &ar.q)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
@@ -1368,13 +1357,13 @@ pub(super) fn delta_dims(m: &Model) -> (usize, usize, usize, usize, usize, usize
 /// + `wqkv_gate`), the fused-or-separate beta/alpha, causal short conv + SiLU,
 /// per-head L2-norm of q/k, the delta-rule scan (per-head scalar decay), and the
 /// SiLU(z)-gated `ssm_norm` output. All scratch is arena-resident.
-fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: Option<DecCtx>) -> Result<()> {
+fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
 	let ne = hp.ne;
 	let (d, hk, hv, key_dim, value_dim, conv_dim) = delta_dims(m);
 	let dc = hp.ssm_d_conv;
-	let (cin, cout) = conv_io(dec, 0);
+	let (cin, cout) = conv_io(dec, 0)?;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.qkv_proj.weight"))?, t, conv_dim, ne, &ar.d_qkv)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.z_gate.weight"))?, t, value_dim, ne, &ar.d_z)?;
@@ -1398,7 +1387,7 @@ fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: us
 	gpu_l2norm_rows(&ar.d_k, &m.eps, t * hk, d, &ar.d_k)?;
 	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
 	let scale = 1.0 / (d as f64).sqrt();
-	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, hv, d, false, scale, rec_of(dec))?;
+	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, hv, d, false, scale, rec_of(dec)?)?;
 	gpu_rmsnorm_f64(&ar.d_o, ssm_of(&m.ssm_norm, l, arch, "ssm_norm.weight")?, &m.eps, t * hv, d, &ar.d_o)?;
 	gpu_silu_into(&ar.d_z, t * value_dim, &ar.d_z)?;
 	gpu_mul_inplace(&ar.d_z, t * value_dim, &ar.d_o)?;
@@ -1411,16 +1400,16 @@ fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: us
 /// Separate q/k/v projections each with its own causal short conv + SiLU, per-head
 /// L2-norm of q/k, a per-CHANNEL log-decay LoRA (`f_b(f_a(x))`), the delta-rule
 /// scan (per-channel decay), and a sigmoid(`g_b(g_a(x))`)-gated `ssm_norm` output.
-fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: Option<DecCtx>) -> Result<()> {
+fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
 	let ne = hp.ne;
 	let (d, h) = (hp.kda_head_dim, hp.kda_n_head);
 	let di = d * h;
 	let dc = hp.ssm_d_conv;
-	let (qin, qout) = conv_io(dec, 0);
-	let (kin, kout) = conv_io(dec, 1);
-	let (vin, vout) = conv_io(dec, 2);
+	let (qin, qout) = conv_io(dec, 0)?;
+	let (kin, kout) = conv_io(dec, 1)?;
+	let (vin, vout) = conv_io(dec, 2)?;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	let qcw = ssm_of(&m.ssm_q_conv_w, l, arch, "q_conv.weight")?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, di, ne, &ar.d_qkv)?;
@@ -1441,7 +1430,7 @@ fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar:
 	gpu_sigmoid_into(&ar.d_bt, t * h, &ar.d_bt)?;
 	let a = ssm_of(&m.ssm_a, l, arch, "ssm_a")?;
 	let scale = 1.0 / (d as f64).sqrt();
-	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, h, d, true, scale, rec_of(dec))?;
+	gpu_gated_delta_scan(&ar.d_q, &ar.d_k, &ar.d_v, &ar.d_g, &ar.d_bt, a, &ar.d_o, t, h, d, true, scale, rec_of(dec)?)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.g_a.weight"))?, t, d, ne, &ar.d_z)?;
 	gpu_gemm_bt_f64(&ar.d_z, &m.stream(&layer_name(l, "self_attn.g_b.weight"))?, t, di, d, &ar.d_qkv)?;
 	gpu_sigmoid_into(&ar.d_qkv, t * di, &ar.d_qkv)?;
@@ -1464,14 +1453,14 @@ fn delta_full_attn(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let dd = &hp.dims[l];
 	let (nqh, hd, nkv) = (dd.nqh, dd.hd, dd.nkv);
 	let (qd, kd) = (nqh * hd, nkv * hd);
-	let pos_base = dec.as_ref().map_or(0, |d| d.cached);
+	let pos_base = dec.cached;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, 2 * qd, ne, &ar.d_qkv)?;
 	deinterleave_heads(&ar.d_qkv, t, hd, nqh, 0, &ar.q, &ar.d_q, &ar.d_k)?;
@@ -1496,7 +1485,7 @@ fn delta_full_attn(
 /// `k_b`) and a pe part carried unrotated; K/V ride the `kv_a` latent (RMSNorm'd)
 /// plus the unrotated k_pe. MQA over `kv_lora+pe` keys and `kv_lora` values, then
 /// `v_b` decompress and `o_proj`. Reuses the MLA arena scratch.
-fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: Option<DecCtx>) -> Result<()> {
+fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
 	let nqh = hp.dims[l].nqh;
@@ -1697,10 +1686,10 @@ pub(super) fn layer_is_shortconv(m: &Model, l: usize) -> bool {
 /// operator_norm, `in_proj` split into contiguous row-blocks `B|C|x`, the `B*x`
 /// pre-conv gate, a causal depthwise conv (`l_cache` taps, no activation), the
 /// `C*conv` post-conv gate, then `out_proj`. All scratch is arena-resident.
-fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: Option<DecCtx>) -> Result<()> {
+fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let ne = m.hp.ne;
 	let lc = m.hp.shortconv_l_cache;
-	let (cin, cout) = conv_io(dec, 0);
+	let (cin, cout) = conv_io(dec, 0)?;
 	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	let w_in = m.stream(&layer_name(l, "self_attn.shortconv_in_proj.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, ne * ne), t, ne, ne, &ar.q)?;
@@ -1727,7 +1716,7 @@ pub(super) fn layer_hybrid(
 	t: usize,
 	ar: &Arena,
 	attn_scale: &GpuBuffer,
-	dec: Option<DecCtx>,
+	dec: &DecCtx,
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	let recur_mix = |out: &GpuBuffer| -> Result<()> {

@@ -220,7 +220,6 @@ pub fn gpu_rope_partial_factors(
 /// # Errors
 /// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_rope_partial_factors_pos(
 	theta: &GpuBuffer,
 	rows: usize,
@@ -375,9 +374,9 @@ pub fn gpu_flash_gqa(
 	p_base: usize,
 	causal_below: usize,
 	out: &GpuBuffer,
-	m_io: Option<&GpuBuffer>,
-	l_io: Option<&GpuBuffer>,
-	acc_io: Option<&GpuBuffer>,
+	m_io: &GpuBuffer,
+	l_io: &GpuBuffer,
+	acc_io: &GpuBuffer,
 	kv_off: usize,
 	finalize: bool,
 ) -> Result<(), HipError> {
@@ -398,9 +397,9 @@ pub fn gpu_flash_gqa(
 			max_bias,
 			ci(p_base)?,
 			ci(causal_below)?,
-			m_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
-			l_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
-			acc_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			m_io.ptr_raw(),
+			l_io.ptr_raw(),
+			acc_io.ptr_raw(),
 			ci(kv_off)?,
 			i32::from(finalize),
 			ptr::null_mut(),
@@ -430,9 +429,9 @@ pub fn gpu_flash_mla(
 	p_base: usize,
 	causal_below: usize,
 	out: &GpuBuffer,
-	m_io: Option<&GpuBuffer>,
-	l_io: Option<&GpuBuffer>,
-	acc_io: Option<&GpuBuffer>,
+	m_io: &GpuBuffer,
+	l_io: &GpuBuffer,
+	acc_io: &GpuBuffer,
 	kv_off: usize,
 	finalize: bool,
 ) -> Result<(), HipError> {
@@ -453,9 +452,9 @@ pub fn gpu_flash_mla(
 			ci(hdv)?,
 			ci(p_base)?,
 			ci(causal_below)?,
-			m_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
-			l_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
-			acc_io.map_or(ptr::null_mut(), GpuBuffer::ptr_raw),
+			m_io.ptr_raw(),
+			l_io.ptr_raw(),
+			acc_io.ptr_raw(),
 			ci(kv_off)?,
 			i32::from(finalize),
 			ptr::null_mut(),

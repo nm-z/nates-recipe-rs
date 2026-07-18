@@ -280,8 +280,11 @@ fn main() -> anyhow::Result<()> {
 		};
 		gpu_rope_partial(&theta_buf, T * 16, hd, rotary, 16, &q).context("rope q")?;
 		gpu_rope_partial(&theta_buf, T * nkv, hd, rotary, nkv, &k).context("rope k")?;
+		let cm = GpuBuffer::alloc(T * 16).context("cm")?;
+		let cl = GpuBuffer::alloc(T * 16).context("cl")?;
+		let cacc = GpuBuffer::alloc(T * 16 * hd).context("cacc")?;
 		twice(label, T * 16 * hd, |o| {
-			gpu_flash_gqa(&q, &k, &v, T, T, 16, nkv, hd, 0.0, 0, 6, o, None, None, None, 0, true)
+			gpu_flash_gqa(&q, &k, &v, T, T, 16, nkv, hd, 0.0, 0, 6, o, &cm, &cl, &cacc, 0, true)
 				.context("flash gqa")
 		})?;
 
