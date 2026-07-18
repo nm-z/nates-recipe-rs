@@ -16,10 +16,12 @@ name = "recipe_infer"
 anyhow = "1"
 libc = "0.2"
 gpu-core = { path = "../gpu-core" }
+half = "2"
 tokenizers = "0.21"
 ndarray = "0.16"
 ogdl = { path = "../ogdl" }
 minijinja = "2"
+hf-chat-template = { version = "0.2", features = ["pycompat"] }
 
 [dev-dependencies]
 serde_json = "1"

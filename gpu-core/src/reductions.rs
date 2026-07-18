@@ -155,6 +155,7 @@ unsafe extern "C" {
 		n_steps: i32,
 		dim: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 }
 
@@ -782,6 +783,7 @@ pub fn gpu_scan_linear_recurrence(
 			safe_i32(n_steps),
 			safe_i32(dim),
 			ptr::null_mut(),
+			states.dtype().ffi(),
 		);
 	}
 	check_launch();

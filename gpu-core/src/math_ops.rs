@@ -84,6 +84,7 @@ unsafe extern "C" {
 		n: i32,
 		k: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	pub fn launch_splitk_dw(
 		input: *const c_void,

@@ -198,6 +198,7 @@ pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	return h.logits_last(toks);
 }
 
+#[derive(Clone)]
 pub struct Tok {
 	pub text: String,
 	pub status: TokStatus,
@@ -205,6 +206,7 @@ pub struct Tok {
 	pub heat: f32,
 }
 
+#[derive(Clone, Copy)]
 pub enum TokStatus {
 	Draft,
 	Accepted,
@@ -1121,7 +1123,7 @@ impl Model {
 			.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
 			.with_context(|| format!("read {qlen} quant bytes"))?;
 		acc(&DISK_NS, _d);
-		let mut out = crate::dequant::dequant_bf16(t.gt, &qbuf);
+		let mut out = crate::dequant::dequant_bf16(t.gt, &qbuf)?;
 		out.truncate(len);
 		Ok(out)
 	}
@@ -1167,8 +1169,7 @@ impl Model {
 			self.shards[t.shard]
 				.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
 				.with_context(|| format!("small {name}"))?;
-			let mut f = Vec::new();
-			crate::dequant::dequant_f32(t.gt, &qbuf, &mut f);
+			let mut f = crate::dequant::dequant_f32(t.gt, &qbuf)?;
 			f.truncate(t.nbytes / 2);
 			return Ok(f.iter().map(|&x| x as f64).collect());
 		}
@@ -2261,24 +2262,25 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 }
 
 
-/// Autoregressive causal decode for dense (non-diffusion) models: embed the
-/// running sequence, run the causal layers, take the last position's logits,
-/// greedily pick the next token, stream it, and repeat until EOS.
-fn generate_causal(
-	mut m: Model,
-	claim: Waterfall,
-	watchdog: Watchdog,
-	t_load: Instant,
+/// Autoregressive causal decode for dense (non-diffusion) models against a
+/// resident, already-loaded model: embed the running sequence, run the causal
+/// layers, take the last position's logits, greedily pick the next token, stream
+/// it, and repeat until EOS. The weights stay put across calls; only the per-call
+/// scratch arena is carved and dropped here, so a chat session reuses the loaded
+/// model for every message with no reload.
+fn decode_causal(
+	m: &Model,
 	tokenizer: &crate::tokenizer::Tokenizer,
 	mut toks: Vec<u32>,
 	prefix: usize,
+	attn_scale: &GpuBuffer,
 	on_round: &mut dyn FnMut(&[Tok]) -> bool,
 ) -> Result<String> {
 	let ne = m.hp.ne;
 	let nl = m.hp.nl;
 	let vocab_size = m.hp.vocab;
 	let eos = m.hp.eos;
-	let softcap = models::final_softcap(&m);
+	let softcap = models::final_softcap(m);
 	let max_new = 256usize;
 	let t_max = prefix + max_new;
 
@@ -2286,30 +2288,13 @@ fn generate_causal(
 		let _t = gpu_core::memory::tag_scope("arena");
 		Arena::new(&m.hp, t_max)?
 	};
-	let attn_scale = {
-		let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
-		let ub = GpuBuffer::alloc(1)?;
-		ub.load(&[1.0 / (hd as f64).sqrt()])?;
-		ub
-	};
-	if !fill_store(&mut m, claim, &mut || !on_round(&[]))? {
-		return Ok(String::new());
-	}
-	watchdog.disarm();
-	Write::line(
-		gpu,
-		format!(
-			"loaded in {:.1}s (causal decode, {nl} layers, softcap={softcap})",
-			t_load.elapsed().as_secs_f64()
-		),
-	);
 
 	let mut out_ids: Vec<u32> = Vec::new();
 	let decode_start = Instant::now();
 	let mut ttft: Option<Duration> = None;
 	for _new in 0..max_new {
 		let cur = toks.len();
-		let scale = models::embedding_scale(&m);
+		let scale = models::embedding_scale(m);
 		let mut base = vec![0.0f64; cur * ne];
 		for (p, &tk) in toks.iter().enumerate() {
 			let b = tk as usize * ne * 2;
@@ -2318,7 +2303,7 @@ fn generate_causal(
 					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
 			}
 		}
-		add_pos_embd(&m, &mut base, 0, cur, ne);
+		add_pos_embd(m, &mut base, 0, cur, ne);
 		let h0 = ar.ha.view(0, cur * ne);
 		h0.load(&base)?;
 		if let Some((g, b)) = &m.embed_norm {
@@ -2327,14 +2312,14 @@ fn generate_causal(
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
-			models::dispatch(&m, l, src, dst, cur, &ar, &attn_scale)?;
+			models::dispatch(m, l, src, dst, cur, &ar, attn_scale)?;
 			mem::swap(&mut src, &mut dst);
 		}
 		let last = cur - 1;
 		let last_h = src.view(last * ne, ne);
-		models::decoder_norm(&m, &last_h, 1, ne, &ar.hfs)?;
-		let logits = lm_head(&m, &ar.hfs, 1, &ar)?;
-		let lsc = models::logit_scale(&m);
+		models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
+		let logits = lm_head(m, &ar.hfs, 1, &ar)?;
+		let lsc = models::logit_scale(m);
 		let mut best = 0usize;
 		let mut bv = f64::MIN;
 		for (i, &v) in logits.iter().take(vocab_size).enumerate() {
@@ -2378,7 +2363,6 @@ fn generate_causal(
 		out_ids.len() as f64 / elapsed.as_secs_f64().max(1e-9)
 	);
 	drop(ar);
-	drop(m);
 	Ok(out)
 }
 
@@ -2396,103 +2380,218 @@ pub fn vram_probe_ask() -> Option<i32> {
 	})
 }
 
+/// Probe-verified device-arena claim: spawns a child that tries to map a
+/// candidate size, backing off until one succeeds, waits for the child's VRAM
+/// to be reclaimed, then claims the slab. Shared by one-shot [`generate`] and
+/// the persistent [`ChatSession`] so both take exactly one claim per open.
+fn probe_claim() -> Result<Waterfall> {
+	let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
+	Write::line(
+		gpu,
+		format!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64),
+	);
+	loop {
+		if want < (1 << 30) {
+			bail!("claim probe: nothing mappable above 1 GB");
+		}
+		let status = {
+			let mut c = process::Command::new(env::current_exe()?);
+			c.stdin(process::Stdio::null());
+			c.env("VRAM_PROBE", want.to_string());
+			c.stdin(process::Stdio::null());
+			unsafe {
+				c.pre_exec(|| {
+					let z = libc::rlimit {
+						rlim_cur: 0,
+						rlim_max: 0,
+					};
+					libc::setrlimit(libc::RLIMIT_CORE, &z);
+					Ok(())
+				});
+			}
+			c.status().context("spawn claim probe")?
+		};
+		beat();
+		if status.success() {
+			break;
+		}
+		Write::line(
+			gpu,
+			format!(
+				"claim probe: {:.2} GB unmappable, backing off",
+				want as f64 / (1u64 << 30) as f64
+			),
+		);
+		want -= want / 16;
+	}
+	Write::line(
+		gpu,
+		format!(
+			"claim: {:.2} GB (probe-verified)",
+			want as f64 / (1u64 << 30) as f64
+		),
+	);
+	let need = want + gpu_core::memory::USER_GB;
+	let reclaim_start = Instant::now();
+	while gpu_core::memory::vram_free_base() < need {
+		if reclaim_start.elapsed() > Duration::from_secs(10) {
+			Write::line(
+				gpu,
+				format!(
+					"claim: reclaim wait timed out, free={:.2} GB (probe child VRAM not returned)",
+					gpu_core::memory::vram_free_base() as f64 / (1u64 << 30) as f64
+				),
+			);
+			break;
+		}
+		thread::sleep(Duration::from_millis(50));
+		beat();
+	}
+	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
+	let w = Waterfall::from_arena(slab);
+	Write::line(
+		gpu,
+		format!("[right after claim] {}", gpu_core::memory::ledger_report()),
+	);
+	return Ok(w);
+}
+
+/// A chat model loaded once and kept resident: [`open`](ChatSession::open) does
+/// the single claim + weight load + waterfall fill, then every
+/// [`generate_in`](ChatSession::generate_in) call reuses those weights, carving
+/// and dropping only a per-message scratch arena. This is what lets a chat run
+/// many messages against one load — no re-claim, no re-fill between turns. The
+/// weights free once when the session drops.
+pub struct ChatSession {
+	m: Model,
+	tokenizer: crate::tokenizer::Tokenizer,
+	vocab: Vec<String>,
+	attn_scale: GpuBuffer,
+}
+
+impl ChatSession {
+	/// Loads `gguf` resident. `load_round` receives empty token snapshots during
+	/// the fill so the caller can keep a load UI drawn and cancel; a cancelled
+	/// load returns `Ok(None)` and frees the claim cleanly.
+	pub fn open(
+		gguf: &Path,
+		load_round: &mut dyn FnMut(&[Tok]) -> bool,
+	) -> Result<Option<ChatSession>> {
+		if env::var_os("VRAM_PROBE").is_some() {
+			Write::err(
+				"ChatSession: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
+			)?;
+		}
+		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
+		let t_load = Instant::now();
+		let watchdog = arm_watchdog();
+		let claim = probe_claim()?;
+		beat();
+		let mut m = load_model_gguf(gguf)?;
+		let (tokenizer, vocab) = {
+			let g = Gguf::open(gguf)?;
+			(
+				crate::tokenizer::from_gguf(&g)?,
+				crate::tokenizer::gguf_vocab(&g, m.hp.vocab)?,
+			)
+		};
+		let attn_scale = {
+			let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
+			let ub = GpuBuffer::alloc(1)?;
+			ub.load(&[1.0 / (hd as f64).sqrt()])?;
+			ub
+		};
+		if !fill_store(&mut m, claim, &mut || !load_round(&[]))? {
+			return Ok(None);
+		}
+		watchdog.disarm();
+		Write::line(
+			gpu,
+			format!(
+				"loaded in {:.1}s (arch={} nl={} ne={} experts={} canvas={} vocab={} softcap={})",
+				t_load.elapsed().as_secs_f64(),
+				m.hp.arch,
+				m.hp.nl,
+				m.hp.ne,
+				m.hp.nexp,
+				m.hp.ncanvas,
+				m.hp.vocab,
+				m.hp.softcap,
+			),
+		);
+		return Ok(Some(ChatSession {
+			m,
+			tokenizer,
+			vocab,
+			attn_scale,
+		}));
+	}
+
+	/// Generates a reply for `prompt` (already chat-templated by the caller)
+	/// against the resident weights. Re-tokenizes the full text each call — no
+	/// KV cache across messages — and picks the causal or diffusion decode by the
+	/// model's canvas length.
+	pub fn generate_in(
+		&mut self,
+		prompt: &str,
+		on_round: &mut dyn FnMut(&[Tok]) -> bool,
+	) -> Result<String> {
+		let ncanvas = self.m.hp.ncanvas;
+		let mask = self.m.hp.mask;
+		let enc = self
+			.tokenizer
+			.encode(prompt, false)
+			.map_err(|e| anyhow!("tokenize: {e}"))?;
+		let mut toks = vec![self.m.hp.bos];
+		toks.extend_from_slice(enc.get_ids());
+		let prefix = toks.len();
+		for _ in 0..ncanvas {
+			toks.push(mask as u32);
+		}
+		let t = toks.len();
+		Write::line(
+			data,
+			format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
+		);
+		if ncanvas == 0 {
+			return decode_causal(
+				&self.m,
+				&self.tokenizer,
+				toks,
+				prefix,
+				&self.attn_scale,
+				on_round,
+			);
+		}
+		return decode_canvas(&self.m, &self.vocab, toks, prefix, on_round);
+	}
+}
+
+/// One-shot generation kept for single-prompt callers (render_once, tests):
+/// opens a [`ChatSession`], runs a single message, and drops it. Multi-message
+/// callers hold the session and call [`ChatSession::generate_in`] directly.
 pub fn generate(
 	gguf: &Path,
 	prompt: &str,
 	on_round: &mut dyn FnMut(&[Tok]) -> bool,
 ) -> Result<String> {
-	if !env::var_os("VRAM_PROBE").is_none() {
-		Write::err(
-			"generate: VRAM_PROBE set — the binary's main must call llm::vram_probe_ask() and exit with its code before any other work",
-		)?;
-	}
-	crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
-
-	let t_load = Instant::now();
-	let watchdog = arm_watchdog();
-	let claim = {
-		let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
-		Write::line(
-			gpu,
-			format!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64),
-		);
-		loop {
-			if want < (1 << 30) {
-				bail!("claim probe: nothing mappable above 1 GB");
-			}
-			let status = {
-				let mut c = process::Command::new(env::current_exe()?);
-				c.env("VRAM_PROBE", want.to_string());
-				c.stdin(process::Stdio::null());
-				unsafe {
-					c.pre_exec(|| {
-						let z = libc::rlimit {
-							rlim_cur: 0,
-							rlim_max: 0,
-						};
-						libc::setrlimit(libc::RLIMIT_CORE, &z);
-						Ok(())
-					});
-				}
-				c.status().context("spawn claim probe")?
-			};
-			beat();
-			if status.success() {
-				break;
-			}
-			Write::line(
-				gpu,
-				format!(
-					"claim probe: {:.2} GB unmappable, backing off",
-					want as f64 / (1u64 << 30) as f64
-				),
-			);
-			want -= want / 16;
-		}
-		Write::line(
-			gpu,
-			format!(
-				"claim: {:.2} GB (probe-verified)",
-				want as f64 / (1u64 << 30) as f64
-			),
-		);
-		let need = want + gpu_core::memory::USER_GB;
-		let reclaim_start = Instant::now();
-		while gpu_core::memory::vram_free_base() < need {
-			if reclaim_start.elapsed() > Duration::from_secs(10) {
-				Write::line(
-					gpu,
-					format!(
-						"claim: reclaim wait timed out, free={:.2} GB (probe child VRAM not returned)",
-						gpu_core::memory::vram_free_base() as f64 / (1u64 << 30) as f64
-					),
-				);
-				break;
-			}
-			thread::sleep(Duration::from_millis(50));
-			beat();
-		}
-		let slab =
-			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
-		let w = Waterfall::from_arena(slab);
-		Write::line(
-			gpu,
-			format!("[right after claim] {}", gpu_core::memory::ledger_report()),
-		);
-		w
+	let mut session = match ChatSession::open(gguf, on_round)? {
+		Some(s) => s,
+		None => return Ok(String::new()),
 	};
+	return session.generate_in(prompt, on_round);
+}
 
-	beat();
-	let mut m = load_model_gguf(gguf)?;
-
-	let (tokenizer, vocab) = {
-		let g = Gguf::open(gguf)?;
-		(
-			crate::tokenizer::from_gguf(&g)?,
-			crate::tokenizer::gguf_vocab(&g, m.hp.vocab)?,
-		)
-	};
-
+/// Diffusion (canvas) decode against a resident model: iteratively refines the
+/// masked canvas region for a fixed number of steps, streaming per-step token
+/// snapshots. Carves and drops its own per-message scratch arena.
+fn decode_canvas(
+	m: &Model,
+	vocab: &[String],
+	toks: Vec<u32>,
+	prefix: usize,
+	on_round: &mut dyn FnMut(&[Tok]) -> bool,
+) -> Result<String> {
 	let ne = m.hp.ne;
 	let nff = m.hp.nff;
 	let ncanvas = m.hp.ncanvas;
@@ -2500,59 +2599,15 @@ pub fn generate(
 	let mask = m.hp.mask;
 	let vocab_size = m.hp.vocab;
 	let mask_signal = m.hp.mask_signal;
-
-	let enc = tokenizer
-		.encode(prompt, false)
-		.map_err(|e| anyhow!("tokenize: {e}"))?;
-	let mut toks = vec![m.hp.bos];
-	toks.extend_from_slice(enc.get_ids());
-	let prefix = toks.len();
-	for _ in 0..ncanvas {
-		toks.push(mask as u32);
-	}
 	let t = toks.len();
 	let scl = (ne as f64).sqrt();
-	Write::line(
-		data,
-		format!("prompt tokens={prefix} canvas={ncanvas} total={t}"),
-	);
-
-	if ncanvas == 0 {
-		return generate_causal(m, claim, watchdog, t_load, &tokenizer, toks, prefix, on_round);
-	}
 
 	let ar = {
 		let _t = gpu_core::memory::tag_scope("arena");
 		Arena::new(&m.hp, t)?
 	};
 	Write::line(data, "preflight gemms");
-	preflight(&m, &ar, t)?;
-	Write::line(data, "waterfall fill");
-	if !fill_store(&mut m, claim, &mut || !on_round(&[]))? {
-		return Ok(String::new());
-	}
-	watchdog.disarm();
-	Write::line(
-		gpu,
-		format!("loaded in {:.1}s", t_load.elapsed().as_secs_f64()),
-	);
-	Write::line(
-		gpu,
-		format!(
-			"hparams arch={} nl={} ne={} experts={} canvas={} vocab={} kd={}/{} vd={}/{} softcap={}",
-			m.hp.arch,
-			m.hp.nl,
-			m.hp.ne,
-			m.hp.nexp,
-			m.hp.ncanvas,
-			m.hp.vocab,
-			m.hp.key_length,
-			m.hp.key_length_swa,
-			m.hp.value_length,
-			m.hp.value_length_swa,
-			m.hp.softcap,
-		),
-	);
+	preflight(m, &ar, t)?;
 
 	let allocs_before = gpu_core::memory::device_alloc_count();
 	let t0 = Instant::now();
@@ -2638,7 +2693,7 @@ pub fn generate(
 					t0.elapsed().as_secs_f64()
 				),
 			);
-			layer(&m, l, src, dst, t, prefix, &ar)?;
+			layer(m, l, src, dst, t, prefix, &ar)?;
 			mem::swap(&mut src, &mut dst);
 			if step == 0 && gpu_core::log::opt().probe {
 				Write::line(
@@ -2664,7 +2719,7 @@ pub fn generate(
 			ne,
 			&ar.hfs,
 		)?;
-		let logits = lm_head(&m, &ar.hfs, ncanvas, &ar)?;
+		let logits = lm_head(m, &ar.hfs, ncanvas, &ar)?;
 
 		let temp = 1.0 - 0.7 * (step as f64 / 6.0);
 		for c in 0..ncanvas {
@@ -2716,8 +2771,16 @@ pub fn generate(
 
 		let toks_ui: Vec<Tok> = (0..ncanvas)
 			.map(|c| {
-				let tk = pred[c] as usize;
-				let status = if tk == mask || Some(tk) == mask_signal {
+				let mut tk = pred[c] as usize;
+				let undecided = tk == mask || Some(tk) == mask_signal;
+				if undecided
+					&& let Some(&(best, _p)) = sck[c]
+						.iter()
+						.find(|&&(id, _p)| id != mask && Some(id) != mask_signal)
+				{
+					tk = best;
+				}
+				let status = if undecided {
 					TokStatus::Draft
 				} else if pred[c] != prev[c] {
 					TokStatus::Recent
@@ -2784,17 +2847,11 @@ pub fn generate(
 
 	let out: String = pred
 		.iter()
-		.map(|&tk| vocab[tk as usize].replace('\u{2581}', " "))
+		.map(|&tk| tk as usize)
+		.filter(|&tk| tk != mask && Some(tk) != mask_signal)
+		.map(|tk| vocab[tk].replace('\u{2581}', " "))
 		.collect();
 
 	drop(ar);
-	drop(m);
-	Write::line(
-		gpu,
-		format!(
-			"exit: device frees {}",
-			gpu_core::memory::device_free_count()
-		),
-	);
 	Ok(out)
 }

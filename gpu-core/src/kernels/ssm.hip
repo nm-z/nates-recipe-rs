@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "dtype_dispatch.h"
 
 #define SSM_MAX_STATE 256
 
@@ -10,8 +11,8 @@
 // apply_silu==0 leaves the raw conv output (lfm2 shortconv gates it downstream);
 // nonzero fuses SiLU (mamba family). Same channel-major tap-contiguous weight and
 // (d_conv-1) causal left zero-pad in both cases.
-extern "C" __global__ void ssm_conv_causal_silu_kernel(
-    const double* x, const double* conv_w, const double* bias, double* out,
+template<typename DT> __global__ void ssm_conv_causal_silu_kernel(
+    const DT* x, const DT* conv_w, const DT* bias, DT* out,
     int T, int d_inner, int d_conv, int apply_silu
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -19,8 +20,8 @@ extern "C" __global__ void ssm_conv_causal_silu_kernel(
     if (idx >= total) return;
     int c = idx % d_inner;
     int t = idx / d_inner;
-    const double* wc = conv_w + (long)c * d_conv;
-    double acc = bias ? bias[c] : 0.0;
+    const DT* wc = conv_w + (long)c * d_conv;
+    DT acc = bias ? bias[c] : 0.0;
     for (int k = 0; k < d_conv; ++k) {
         int j = t - (d_conv - 1) + k;
         if (j >= 0) acc += wc[k] * x[(long)j * d_inner + c];
@@ -30,13 +31,14 @@ extern "C" __global__ void ssm_conv_causal_silu_kernel(
 
 extern "C" void launch_ssm_conv_causal_silu(
     const double* x, const double* conv_w, const double* bias, double* out,
-    int T, int d_inner, int d_conv, int apply_silu, hipStream_t stream
+    int T, int d_inner, int d_conv, int apply_silu, hipStream_t stream, int dtype
 ) {
     long total = (long)T * d_inner;
     dim3 block(256);
     dim3 grid((total + 255) / 256);
-    hipLaunchKernelGGL(ssm_conv_causal_silu_kernel, grid, block, 0, stream,
-        x, conv_w, bias, out, T, d_inner, d_conv, apply_silu);
+    int Tn = T;
+    DT_DISPATCH(dtype, ssm_conv_causal_silu_kernel<T><<<grid, block, 0, stream>>>(
+        (const T*)x, (const T*)conv_w, (const T*)bias, (T*)out, Tn, d_inner, d_conv, apply_silu));
 }
 
 // Fused Mamba-1 selective scan (ground truth ggml-cuda/ssm-scan.cu:83-113).
@@ -50,27 +52,27 @@ extern "C" void launch_ssm_conv_causal_silu(
 //   C   [T, d_state]  single-group readout   (token-major)
 //   D   [d_inner]     per-channel skip
 //   y   [T, d_inner]  output (token-major), y[t,c] = sum_n h*C + D[c]*xc[t,c]
-extern "C" __global__ void ssm_scan_mamba1_kernel(
-    const double* xc, const double* dt, const double* A,
-    const double* B, const double* C, const double* D,
-    double* y, int T, int d_inner, int d_state
+template<typename DT> __global__ void ssm_scan_mamba1_kernel(
+    const DT* xc, const DT* dt, const DT* A,
+    const DT* B, const DT* C, const DT* D,
+    DT* y, int T, int d_inner, int d_state
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d_inner) return;
-    double state[SSM_MAX_STATE];
+    DT state[SSM_MAX_STATE];
     for (int n = 0; n < d_state; ++n) state[n] = 0.0;
-    const double* Ac = A + (long)c * d_state;
-    double Dc = D[c];
+    const DT* Ac = A + (long)c * d_state;
+    DT Dc = D[c];
     for (int t = 0; t < T; ++t) {
-        double dtc = dt[(long)t * d_inner + c];
-        double dt_sp = (dtc <= 20.0) ? log1p(exp(dtc)) : dtc;
-        double xct = xc[(long)t * d_inner + c];
-        double x_dt = xct * dt_sp;
-        const double* Bt = B + (long)t * d_state;
-        const double* Ct = C + (long)t * d_state;
-        double yacc = 0.0;
+        DT dtc = dt[(long)t * d_inner + c];
+        DT dt_sp = (dtc <= 20.0) ? log1p(exp(dtc)) : dtc;
+        DT xct = xc[(long)t * d_inner + c];
+        DT x_dt = xct * dt_sp;
+        const DT* Bt = B + (long)t * d_state;
+        const DT* Ct = C + (long)t * d_state;
+        DT yacc = 0.0;
         for (int n = 0; n < d_state; ++n) {
-            double a = exp(dt_sp * Ac[n]);
+            DT a = exp(dt_sp * Ac[n]);
             state[n] = state[n] * a + Bt[n] * x_dt;
             yacc += state[n] * Ct[n];
         }
@@ -81,12 +83,14 @@ extern "C" __global__ void ssm_scan_mamba1_kernel(
 extern "C" void launch_ssm_scan_mamba1(
     const double* xc, const double* dt, const double* A,
     const double* B, const double* C, const double* D,
-    double* y, int T, int d_inner, int d_state, hipStream_t stream
+    double* y, int T, int d_inner, int d_state, hipStream_t stream, int dtype
 ) {
     dim3 block(256);
     dim3 grid((d_inner + 255) / 256);
-    hipLaunchKernelGGL(ssm_scan_mamba1_kernel, grid, block, 0, stream,
-        xc, dt, A, B, C, D, y, T, d_inner, d_state);
+    int Tn = T;
+    DT_DISPATCH(dtype, ssm_scan_mamba1_kernel<T><<<grid, block, 0, stream>>>(
+        (const T*)xc, (const T*)dt, (const T*)A, (const T*)B, (const T*)C, (const T*)D,
+        (T*)y, Tn, d_inner, d_state));
 }
 
 // Fused Mamba-2 grouped selective scan (ggml ssm-scan.cu mamba2 branch,
@@ -103,30 +107,30 @@ extern "C" void launch_ssm_scan_mamba1(
 //   A    [n_head]       per-head scalar decay, used directly (already -exp(A_log))
 //   D    [n_head]       per-head scalar skip
 //   y    [T, d_inner]   output, y[t,c] = sum_n h*C + D[h]*x[t,c]
-extern "C" __global__ void ssm_scan_mamba2_kernel(
-    const double* xbc, const double* dt, const double* A, const double* D,
-    double* y, int T, int d_inner, int d_state, int n_head, int n_group, int conv_dim
+template<typename DT> __global__ void ssm_scan_mamba2_kernel(
+    const DT* xbc, const DT* dt, const DT* A, const DT* D,
+    DT* y, int T, int d_inner, int d_state, int n_head, int n_group, int conv_dim
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d_inner) return;
     int head_dim = d_inner / n_head;
     int h = c / head_dim;
     int g = h / (n_head / n_group);
-    double state[SSM_MAX_STATE];
+    DT state[SSM_MAX_STATE];
     for (int n = 0; n < d_state; ++n) state[n] = 0.0;
-    double Ah = A[h];
-    double Dh = D[h];
+    DT Ah = A[h];
+    DT Dh = D[h];
     long b_off = (long)d_inner + (long)g * d_state;
     long c_off = (long)d_inner + (long)n_group * d_state + (long)g * d_state;
     for (int t = 0; t < T; ++t) {
-        double dth = dt[(long)t * n_head + h];
-        double dt_sp = (dth <= 20.0) ? log1p(exp(dth)) : dth;
-        double xct = xbc[(long)t * conv_dim + c];
-        double x_dt = xct * dt_sp;
-        double a = exp(dt_sp * Ah);
-        const double* Bt = xbc + (long)t * conv_dim + b_off;
-        const double* Ct = xbc + (long)t * conv_dim + c_off;
-        double yacc = 0.0;
+        DT dth = dt[(long)t * n_head + h];
+        DT dt_sp = (dth <= 20.0) ? log1p(exp(dth)) : dth;
+        DT xct = xbc[(long)t * conv_dim + c];
+        DT x_dt = xct * dt_sp;
+        DT a = exp(dt_sp * Ah);
+        const DT* Bt = xbc + (long)t * conv_dim + b_off;
+        const DT* Ct = xbc + (long)t * conv_dim + c_off;
+        DT yacc = 0.0;
         for (int n = 0; n < d_state; ++n) {
             state[n] = state[n] * a + Bt[n] * x_dt;
             yacc += state[n] * Ct[n];
@@ -138,15 +142,17 @@ extern "C" __global__ void ssm_scan_mamba2_kernel(
 extern "C" void launch_ssm_scan_mamba2(
     const double* xbc, const double* dt, const double* A, const double* D,
     double* y, int T, int d_inner, int d_state, int n_head, int n_group,
-    int conv_dim, hipStream_t stream
+    int conv_dim, hipStream_t stream, int dtype
 ) {
     dim3 block(256);
     dim3 grid((d_inner + 255) / 256);
-    hipLaunchKernelGGL(ssm_scan_mamba2_kernel, grid, block, 0, stream,
-        xbc, dt, A, D, y, T, d_inner, d_state, n_head, n_group, conv_dim);
+    int Tn = T;
+    DT_DISPATCH(dtype, ssm_scan_mamba2_kernel<T><<<grid, block, 0, stream>>>(
+        (const T*)xbc, (const T*)dt, (const T*)A, (const T*)D,
+        (T*)y, Tn, d_inner, d_state, n_head, n_group, conv_dim));
 }
 
-__device__ __forceinline__ double ssm_block_sum_bcast(double val, double* smem) {
+template<typename DT> __device__ __forceinline__ DT ssm_block_sum_bcast(DT val, DT* smem) {
     int lane = threadIdx.x % warpSize;
     int wid  = threadIdx.x / warpSize;
     for (int off = warpSize / 2; off > 0; off /= 2) val += __shfl_down(val, off);
@@ -154,12 +160,12 @@ __device__ __forceinline__ double ssm_block_sum_bcast(double val, double* smem) 
     __syncthreads();
     int nwarps = (blockDim.x + warpSize - 1) / warpSize;
     if (wid == 0) {
-        double v = (lane < nwarps) ? smem[lane] : 0.0;
+        DT v = (lane < nwarps) ? smem[lane] : 0.0;
         for (int off = warpSize / 2; off > 0; off /= 2) v += __shfl_down(v, off);
         if (lane == 0) smem[0] = v;
     }
     __syncthreads();
-    double total = smem[0];
+    DT total = smem[0];
     __syncthreads();
     return total;
 }
@@ -170,62 +176,62 @@ __device__ __forceinline__ double ssm_block_sum_bcast(double val, double* smem) 
 // (token,group) row RMS-normalizes over its dpg channels then scales by
 // gamma[g*dpg + j] (ssm_norm is [dpg, n_group], group g contiguous at g*dpg).
 // Flattened as rows = T*n_group so a row's group is row % n_group. In-place safe.
-extern "C" __global__ void ssm_group_rmsnorm_kernel(
-    const double* x, const double* gamma, const double* eps_p, double* out,
+template<typename DT> __global__ void ssm_group_rmsnorm_kernel(
+    const DT* x, const DT* gamma, const DT* eps_p, DT* out,
     int rows, int dpg, int n_group
 ) {
-    double eps = *eps_p;
+    DT eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
     int g = row % n_group;
-    const double* r = x + (long)row * dpg;
-    double* o = out + (long)row * dpg;
-    const double* gg = gamma + (long)g * dpg;
-    __shared__ double smem[32];
-    double ss = 0.0;
-    for (int j = threadIdx.x; j < dpg; j += blockDim.x) { double v = r[j]; ss += v * v; }
-    double ms = ssm_block_sum_bcast(ss, smem) / dpg;
-    double inv = 1.0 / sqrt(ms + eps);
+    const DT* r = x + (long)row * dpg;
+    DT* o = out + (long)row * dpg;
+    const DT* gg = gamma + (long)g * dpg;
+    __shared__ DT smem[32];
+    DT ss = 0.0;
+    for (int j = threadIdx.x; j < dpg; j += blockDim.x) { DT v = r[j]; ss += v * v; }
+    DT ms = ssm_block_sum_bcast(ss, smem) / dpg;
+    DT inv = 1.0 / sqrt(ms + eps);
     for (int j = threadIdx.x; j < dpg; j += blockDim.x)
         o[j] = r[j] * inv * gg[j];
 }
 
 extern "C" void launch_ssm_group_rmsnorm(
     const double* x, const double* gamma, const double* eps, double* out,
-    int rows, int dpg, int n_group, hipStream_t stream
+    int rows, int dpg, int n_group, hipStream_t stream, int dtype
 ) {
     int threads = min(256, max(32, dpg));
-    hipLaunchKernelGGL(ssm_group_rmsnorm_kernel, dim3(rows), dim3(threads), 0, stream,
-        x, gamma, eps, out, rows, dpg, n_group);
+    DT_DISPATCH(dtype, ssm_group_rmsnorm_kernel<T><<<dim3(rows), dim3(threads), 0, stream>>>(
+        (const T*)x, (const T*)gamma, (const T*)eps, (T*)out, rows, dpg, n_group));
 }
 
 // Per-row L2 normalize (ggml_l2_norm, ops.cpp:4174): out[row,j] = x[row,j] /
 // max(sqrt(sum_j x[row,j]^2), eps). Distinct from RMSNorm (no 1/cols factor, no
 // gamma; the divisor floors at eps, it is not added under the sqrt). rows = T*H,
 // cols = head_dim; one block per row. In-place safe.
-extern "C" __global__ void l2norm_rows_kernel(
-    const double* x, const double* eps_p, double* out, int rows, int cols
+template<typename DT> __global__ void l2norm_rows_kernel(
+    const DT* x, const DT* eps_p, DT* out, int rows, int cols
 ) {
-    double eps = *eps_p;
+    DT eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
-    const double* r = x + (long)row * cols;
-    double* o = out + (long)row * cols;
-    __shared__ double smem[32];
-    double ss = 0.0;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) { double v = r[j]; ss += v * v; }
-    double tot = ssm_block_sum_bcast(ss, smem);
-    double inv = 1.0 / fmax(sqrt(tot), eps);
+    const DT* r = x + (long)row * cols;
+    DT* o = out + (long)row * cols;
+    __shared__ DT smem[32];
+    DT ss = 0.0;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) { DT v = r[j]; ss += v * v; }
+    DT tot = ssm_block_sum_bcast(ss, smem);
+    DT inv = 1.0 / fmax(sqrt(tot), eps);
     for (int j = threadIdx.x; j < cols; j += blockDim.x)
         o[j] = r[j] * inv;
 }
 
 extern "C" void launch_l2norm_rows(
-    const double* x, const double* eps, double* out, int rows, int cols, hipStream_t stream
+    const double* x, const double* eps, double* out, int rows, int cols, hipStream_t stream, int dtype
 ) {
     int threads = min(256, max(32, cols));
-    hipLaunchKernelGGL(l2norm_rows_kernel, dim3(rows), dim3(threads), 0, stream,
-        x, eps, out, rows, cols);
+    DT_DISPATCH(dtype, l2norm_rows_kernel<T><<<dim3(rows), dim3(threads), 0, stream>>>(
+        (const T*)x, (const T*)eps, (T*)out, rows, cols));
 }
 
 #define GDS_MAX_D 256
@@ -246,19 +252,19 @@ extern "C" void launch_l2norm_rows(
 // (every thread reads all i). v[j]/g/beta are per-thread direct reads. f64, no
 // intra-loop allocation. q/k/v are [T, Hv*d] token-major head-major; g is [T,Hv]
 // (GDA) or [T,Hv*d] (KDA); beta is [T,Hv]; a is [Hv]; out is [T, Hv*d].
-extern "C" __global__ void gated_delta_scan_kernel(
-    const double* q, const double* k, const double* v,
-    const double* g, const double* beta, const double* a,
-    double* out, int T, int Hv, int d, int per_channel, double scale
+template<typename DT> __global__ void gated_delta_scan_kernel(
+    const DT* q, const DT* k, const DT* v,
+    const DT* g, const DT* beta, const DT* a,
+    DT* out, int T, int Hv, int d, int per_channel, DT scale
 ) {
     int h = blockIdx.x;
     int j = threadIdx.x;
     if (j >= d) return;
-    __shared__ double kl[GDS_MAX_D];
-    __shared__ double ql[GDS_MAX_D];
-    double state[GDS_MAX_D];
+    __shared__ DT kl[GDS_MAX_D];
+    __shared__ DT ql[GDS_MAX_D];
+    DT state[GDS_MAX_D];
     for (int i = 0; i < d; ++i) state[i] = 0.0;
-    double ah = a[h];
+    DT ah = a[h];
     long stride = (long)Hv * d;
     long hd = (long)h * d;
     for (int t = 0; t < T; ++t) {
@@ -266,12 +272,12 @@ extern "C" __global__ void gated_delta_scan_kernel(
         kl[j] = k[base + j];
         ql[j] = q[base + j] * scale;
         __syncthreads();
-        double gval = per_channel ? g[base + j] : g[(long)t * Hv + h];
-        double dec = exp(gval * ah);
-        double sk = 0.0;
+        DT gval = per_channel ? g[base + j] : g[(long)t * Hv + h];
+        DT dec = exp(gval * ah);
+        DT sk = 0.0;
         for (int i = 0; i < d; ++i) { state[i] *= dec; sk += state[i] * kl[i]; }
-        double dj = beta[(long)t * Hv + h] * (v[base + j] - sk);
-        double o = 0.0;
+        DT dj = beta[(long)t * Hv + h] * (v[base + j] - sk);
+        DT o = 0.0;
         for (int i = 0; i < d; ++i) { state[i] += kl[i] * dj; o += state[i] * ql[i]; }
         out[base + j] = o;
         __syncthreads();
@@ -281,17 +287,19 @@ extern "C" __global__ void gated_delta_scan_kernel(
 extern "C" void launch_gated_delta_scan(
     const double* q, const double* k, const double* v,
     const double* g, const double* beta, const double* a,
-    double* out, int T, int Hv, int d, int per_channel, double scale, hipStream_t stream
+    double* out, int T, int Hv, int d, int per_channel, double scale, hipStream_t stream, int dtype
 ) {
-    hipLaunchKernelGGL(gated_delta_scan_kernel, dim3(Hv), dim3(d), 0, stream,
-        q, k, v, g, beta, a, out, T, Hv, d, per_channel, scale);
+    int Tn = T;
+    DT_DISPATCH(dtype, gated_delta_scan_kernel<T><<<dim3(Hv), dim3(d), 0, stream>>>(
+        (const T*)q, (const T*)k, (const T*)v, (const T*)g, (const T*)beta, (const T*)a,
+        (T*)out, Tn, Hv, d, per_channel, (T)scale));
 }
 
 // Per-row scalar multiply: out[r*cols + c] = x[r*cols + c] * s[r]. s is one scalar
 // per row (rows entries). The qwen3.5/next shared-expert token gate multiplies the
 // [T, n_embd] expert output by a per-token sigmoid scalar. In-place safe.
-extern "C" __global__ void row_scale_kernel(
-    const double* x, const double* s, double* out, int rows, int cols
+template<typename DT> __global__ void row_scale_kernel(
+    const DT* x, const DT* s, DT* out, int rows, int cols
 ) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)rows * cols;
@@ -300,10 +308,11 @@ extern "C" __global__ void row_scale_kernel(
 }
 
 extern "C" void launch_row_scale(
-    const double* x, const double* s, double* out, int rows, int cols, hipStream_t stream
+    const double* x, const double* s, double* out, int rows, int cols, hipStream_t stream, int dtype
 ) {
     long total = (long)rows * cols;
     dim3 block(256);
     dim3 grid((total + 255) / 256);
-    hipLaunchKernelGGL(row_scale_kernel, grid, block, 0, stream, x, s, out, rows, cols);
+    DT_DISPATCH(dtype, row_scale_kernel<T><<<grid, block, 0, stream>>>(
+        (const T*)x, (const T*)s, (T*)out, rows, cols));
 }

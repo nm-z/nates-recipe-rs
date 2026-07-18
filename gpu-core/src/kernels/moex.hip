@@ -1,23 +1,25 @@
 #include <hip/hip_runtime.h>
+#include "dtype_dispatch.h"
 
 
-extern "C" __global__ void moex_weighted_accumulate_kernel(
-    const double* ye, const double* gate, double* out,
+template<typename T> __global__ void moex_weighted_accumulate_kernel(
+    const T* ye, const T* gate, T* out,
     int n, int d, int n_experts, int e
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n * d) return;
     int i = idx / d;
-    double g = gate[(long)i * n_experts + e];
+    T g = gate[(long)i * n_experts + e];
     out[idx] += g * ye[idx];
 }
 extern "C" void launch_moex_weighted_accumulate(
-    const double* ye, const double* gate, double* out,
-    int n, int d, int n_experts, int e, hipStream_t s
+    const void* ye, const void* gate, void* out,
+    int n, int d, int n_experts, int e, hipStream_t s, int dtype
 ) {
     int total = n * d;
     dim3 block(256); dim3 grid((total + 255) / 256);
-    hipLaunchKernelGGL(moex_weighted_accumulate_kernel, grid, block, 0, s, ye, gate, out, n, d, n_experts, e);
+    DT_DISPATCH(dtype, hipLaunchKernelGGL(moex_weighted_accumulate_kernel<T>, grid, block, 0, s,
+        (const T*)ye, (const T*)gate, (T*)out, n, d, n_experts, e));
 }
 
 extern "C" __global__ void moex_dye_kernel(

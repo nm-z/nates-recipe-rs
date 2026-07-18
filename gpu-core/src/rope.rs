@@ -26,6 +26,7 @@ unsafe extern "C" {
 		theta: *const c_void,
 		sgn: *const c_void,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 }
 
@@ -60,6 +61,7 @@ pub fn gpu_rope_qk_heads_inplace(
 			theta.ptr_raw().cast_const(),
 			sgn.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			q.dtype().ffi(),
 		);
 	}
 	check_launch();

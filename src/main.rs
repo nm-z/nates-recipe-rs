@@ -29,7 +29,91 @@ fn usage(code: i32) -> ! {
 	drop(Write::err(
 		"       recipe probe            # measure this machine",
 	));
+	drop(Write::err(
+		"       recipe run [name]       # pick a gguf.toml model and chat",
+	));
 	process::exit(code);
+}
+
+/// Locates `gguf.toml`: the current directory first, then
+/// `$XDG_CONFIG_HOME/recipe/gguf.toml` (falling back to `~/.config/recipe`).
+fn gguf_toml_path() -> Result<PathBuf> {
+	let cwd = PathBuf::from("gguf.toml");
+	if cwd.exists() {
+		return Ok(cwd);
+	}
+	let dir = match env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+		Some(xdg) => PathBuf::from(xdg).join("recipe"),
+		None => {
+			let home = env::var("HOME").map_err(|_e| anyhow::anyhow!("run: HOME not set"))?;
+			PathBuf::from(home).join(".config/recipe")
+		}
+	};
+	Ok(dir.join("gguf.toml"))
+}
+
+/// Parses the `[models]` table of a gguf.toml into `(name, path)` pairs in file
+/// order. A minimal section-aware line reader: no toml crate is a workspace
+/// dependency and the table is flat `name = "path"` entries.
+fn load_models(toml: &Path) -> Result<Vec<(String, String)>> {
+	let text = fs::read_to_string(toml)
+		.map_err(|e| anyhow::anyhow!("{}: {e}", toml.display()))?;
+	let mut models = Vec::new();
+	let mut in_models = false;
+	for raw in text.lines() {
+		let line = raw.split('#').next().unwrap_or("").trim();
+		if line.is_empty() {
+			continue;
+		}
+		if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+			in_models = section.trim() == "models";
+			continue;
+		}
+		let Some(_keep) = Some(()).filter(|_probe| in_models) else {
+			continue;
+		};
+		let Some((key, val)) = line.split_once('=') else {
+			continue;
+		};
+		let path = val.trim().trim_matches('"').to_string();
+		models.push((key.trim().to_string(), path));
+	}
+	Ok(models)
+}
+
+/// Resolves the model to chat with: `name` selects directly, otherwise the
+/// interactive picker chooses one. Returns the gguf path, or `None` when the
+/// user quit the picker.
+fn run_chat(name: Option<&str>) -> Result<()> {
+	let toml = gguf_toml_path()?;
+	let models = load_models(&toml)?;
+	anyhow::ensure!(
+		!models.is_empty(),
+		"run: no [models] entries in {}",
+		toml.display()
+	);
+	let chosen = match name {
+		Some(want) => {
+			let hit = models.iter().find(|(k, _v)| k == want);
+			let Some((_k, path)) = hit else {
+				anyhow::bail!("run: no model named {want:?} in {}", toml.display());
+			};
+			Some(path.clone())
+		}
+		None => {
+			let names: Vec<String> = models.iter().map(|(k, _v)| k.clone()).collect();
+			recipe::tui::model_picker(&names).map(|i| models[i].1.clone())
+		}
+	};
+	let Some(path) = chosen else {
+		return Ok(());
+	};
+	anyhow::ensure!(
+		Path::new(&path).exists(),
+		"run: model file not found: {path}"
+	);
+	recipe::tui::chat(&path);
+	Ok(())
 }
 
 fn run_rs(path: &str, extra: &[String]) -> Result<()> {
@@ -267,6 +351,15 @@ fn main() -> Result<()> {
 				}
 			}
 			Ok(())
+		}
+		"run" => {
+			set_opt(Opt {
+				prompt: true,
+				gpu: true,
+				data: true,
+				..Opt::default()
+			});
+			run_chat(args.get(2).map(String::as_str))
 		}
 		other => {
 			let probed = fs::metadata(other).ok();

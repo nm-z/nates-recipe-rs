@@ -24,6 +24,7 @@ unsafe extern "C" {
 		cols: i32,
 		eps: *const c_void,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gqa_masked_attn(
 		q: *const c_void,
@@ -37,6 +38,7 @@ unsafe extern "C" {
 		prefix: i32,
 		max_bias: f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_mla_masked_attn(
 		q: *const c_void,
@@ -50,6 +52,7 @@ unsafe extern "C" {
 		hdv: i32,
 		prefix: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gelu_mul(
 		a: *const c_void,
@@ -57,6 +60,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_glu_gelu(
 		input: *const c_void,
@@ -64,6 +68,7 @@ unsafe extern "C" {
 		rows: i32,
 		half: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_rope_partial(
 		buf: *mut c_void,
@@ -74,6 +79,7 @@ unsafe extern "C" {
 		theta: *const c_void,
 		factors: *const c_void,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gemm_bt_f64(
 		a: *const c_void,
@@ -83,14 +89,16 @@ unsafe extern "C" {
 		n: i32,
 		k: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
-	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void);
+	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void, dtype: i32);
 	fn launch_glu_silu(
 		input: *const c_void,
 		out: *mut c_void,
 		rows: i32,
 		half: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 }
 
@@ -116,6 +124,7 @@ pub fn gpu_rope_partial(
 			theta.ptr_raw().cast_const(),
 			ptr::null(),
 			ptr::null_mut(),
+			buf.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -147,6 +156,7 @@ pub fn gpu_rope_partial_factors(
 			theta.ptr_raw().cast_const(),
 			factors.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			buf.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -189,6 +199,7 @@ pub fn gpu_rmsnorm_f64(
 			ci(cols)?,
 			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -214,6 +225,7 @@ pub fn gpu_rmsnorm_f64_nogamma(
 			ci(cols)?,
 			eps.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -248,6 +260,7 @@ pub fn gpu_gqa_attn(
 			ci(prefix)?,
 			max_bias,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -287,6 +300,7 @@ pub fn gpu_mla_attn(
 			ci(hdv)?,
 			ci(prefix)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -309,6 +323,7 @@ pub fn gpu_gelu_mul(
 			out.ptr_raw(),
 			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -331,6 +346,7 @@ pub fn gpu_glu_gelu(
 			ci(rows)?,
 			ci(half)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -353,6 +369,7 @@ pub fn gpu_glu_silu(
 			ci(rows)?,
 			ci(half)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -379,6 +396,7 @@ pub fn gpu_gemm_bt_f64(
 			ci(n)?,
 			ci(k)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();
@@ -395,6 +413,7 @@ pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Res
 			scalar.ptr_raw().cast_const(),
 			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
+			x.dtype().ffi(),
 		);
 	}
 	return cl();

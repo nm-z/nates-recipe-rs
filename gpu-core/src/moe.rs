@@ -33,6 +33,7 @@ unsafe extern "C" {
 		n_experts: i32,
 		e: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_moex_weighted_accumulate_backward(
 		d_out: *const c_void,
@@ -77,6 +78,7 @@ pub fn gpu_moe_weighted_accumulate(
 			n_experts_i,
 			ei,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return cl();

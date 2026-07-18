@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "dtype_dispatch.h"
 
 extern "C" __global__ void ropex_qk_kernel(
     const double* q, const double* k, const double* pos,
@@ -33,11 +34,11 @@ extern "C" void launch_ropex_qk(
     hipLaunchKernelGGL(ropex_qk_kernel, grid, block, 0, s, q, k, pos, qo, ko, n_rows, d, theta);
 }
 
-extern "C" __global__ void ropex_qk_heads_kernel(
-    double* q, double* k, int m, int d, int heads, int seq, const double* theta_p, const double* sgn_p
+template<typename T> __global__ void ropex_qk_heads_kernel(
+    T* q, T* k, int m, int d, int heads, int seq, const T* theta_p, const T* sgn_p
 ) {
-    double theta = *theta_p;
-    double sgn = *sgn_p;
+    T theta = *theta_p;
+    T sgn = *sgn_p;
     int hd = d / heads;
     int half = hd / 2;
     int total = m * heads * half;
@@ -48,23 +49,24 @@ extern "C" __global__ void ropex_qk_heads_kernel(
     int h = t % heads;
     int row = t / heads;
     int pos = row % seq;
-    double angle = (double)pos / pow(theta, (2.0 * (double)j) / (double)hd);
-    double c = cos(angle);
-    double s = sgn * sin(angle);
+    T angle = (T)pos / pow(theta, (T)(2.0 * (double)j) / (T)hd);
+    T c = cos(angle);
+    T s = sgn * sin(angle);
     long base = (long)row * d + (long)h * hd;
-    double qa = q[base + j], qb = q[base + j + half];
+    T qa = q[base + j], qb = q[base + j + half];
     q[base + j]        = qa * c - qb * s;
     q[base + j + half] = qb * c + qa * s;
-    double ka = k[base + j], kb = k[base + j + half];
+    T ka = k[base + j], kb = k[base + j + half];
     k[base + j]        = ka * c - kb * s;
     k[base + j + half] = kb * c + ka * s;
 }
 extern "C" void launch_ropex_qk_heads(
-    double* q, double* k, int m, int d, int heads, int seq, const double* theta, const double* sgn, hipStream_t st
+    void* q, void* k, int m, int d, int heads, int seq, const void* theta, const void* sgn, hipStream_t st, int dtype
 ) {
     int half = (d / heads) / 2;
     if (half == 0) return;
     int total = m * heads * half;
     dim3 block(256); dim3 grid((total + 255) / 256);
-    hipLaunchKernelGGL(ropex_qk_heads_kernel, grid, block, 0, st, q, k, m, d, heads, seq, theta, sgn);
+    DT_DISPATCH(dtype, hipLaunchKernelGGL(ropex_qk_heads_kernel<T>, grid, block, 0, st,
+        (T*)q, (T*)k, m, d, heads, seq, (const T*)theta, (const T*)sgn));
 }

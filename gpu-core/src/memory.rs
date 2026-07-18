@@ -1349,6 +1349,34 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	return None;
 }
 
+/// Element type of a device buffer; every byte computation derives from it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Dtype {
+      F32,
+      #[default]
+      F64,
+}
+
+impl Dtype {
+      #[inline]
+      #[must_use]
+      pub const fn elem_size(self) -> usize {
+            return match self {
+                  Self::F32 => 4,
+                  Self::F64 => 8,
+            };
+      }
+
+      #[inline]
+      #[must_use]
+      pub const fn ffi(self) -> i32 {
+            return match self {
+                  Self::F32 => 1,
+                  Self::F64 => 0,
+            };
+      }
+}
+
 /// Whether a buffer owns its device allocation or merely borrows one.
 #[derive(Clone, Copy)]
 #[non_exhaustive]
@@ -1368,6 +1396,8 @@ pub struct GpuBuffer {
 	pub owned: Ownership,
 	/// Ledger tag the buffer's bytes are accounted under.
 	pub tag: &'static str,
+	/// Element type every byte computation on this buffer derives from.
+	pub dt: Dtype,
 }
 
 // SAFETY: GpuBuffer owns a raw device pointer with no thread-affine handles, so moving it across threads is sound.
@@ -1383,7 +1413,34 @@ impl GpuBuffer {
 			len,
 			owned: Ownership::Borrow,
 			tag: "borrow",
+			dt: Dtype::F64,
 		};
+	}
+
+	#[inline]
+	#[must_use]
+	pub const fn dtype(&self) -> Dtype {
+		return self.dt;
+	}
+
+	#[inline]
+	#[must_use]
+	pub const fn elem_size(&self) -> usize {
+		return self.dt.elem_size();
+	}
+
+	#[inline]
+	#[must_use]
+	pub const fn as_dtype(mut self, dt: Dtype) -> Self {
+		self.dt = dt;
+		return self;
+	}
+
+	/// # Errors
+	/// Errors when the underlying device allocation fails.
+	#[inline]
+	pub fn alloc_ty(n_elems: usize, dt: Dtype) -> Result<Self, HipError> {
+		return Ok(Self::alloc_bytes(n_elems * dt.elem_size())?.as_dtype(dt));
 	}
 
 	#[must_use]
@@ -1481,6 +1538,7 @@ impl GpuBuffer {
 							len: n_bytes,
 							owned: Ownership::Borrow,
 							tag,
+							dt: Dtype::F64,
 						});
 					}
 					Err(cur) => off = cur,
@@ -1531,6 +1589,7 @@ impl GpuBuffer {
 			len: n_bytes,
 			owned: Ownership::Pool,
 			tag,
+			dt: Dtype::F64,
 		});
 	}
 
@@ -1587,7 +1646,7 @@ impl GpuBuffer {
 	#[inline]
 	pub fn upload_f32(data: &[f32]) -> Result<Self, HipError> {
 		let bytes = data.len() * 4;
-		let buf = Self::alloc_bytes(bytes)?;
+		let buf = Self::alloc_bytes(bytes)?.as_dtype(Dtype::F32);
 		// SAFETY: buf holds bytes just allocated and data points to bytes of valid host memory.
 		unsafe {
 			xfer(
@@ -1624,7 +1683,7 @@ impl GpuBuffer {
 	/// Errors if the device allocation or the zeroing memset fails.
 	#[inline]
 	pub fn zeros_f32(n: usize) -> Result<Self, HipError> {
-		let buf = Self::alloc_bytes(n * 4)?;
+		let buf = Self::alloc_bytes(n * 4)?.as_dtype(Dtype::F32);
 		buf.memset_zero(n * 4)?;
 		return Ok(buf);
 	}
@@ -1699,7 +1758,7 @@ impl GpuBuffer {
 	#[inline]
 	#[must_use]
 	pub const fn n_floats(&self) -> usize {
-		return self.len.wrapping_div(mem::size_of::<f64>());
+		return self.len.wrapping_div(self.dt.elem_size());
 	}
 	#[inline]
 	#[must_use]
@@ -1721,22 +1780,27 @@ impl GpuBuffer {
 	#[inline]
 	#[must_use]
 	pub fn as_ptr_offset(&self, n_floats: usize) -> *mut c_void {
-		if n_floats * 8 > self.len {
+		let es = self.dt.elem_size();
+		if n_floats * es > self.len {
 			drop(Write::err(format!(
 				"as_ptr_offset: offset {} bytes exceeds buffer len {}",
-				n_floats * 8,
+				n_floats * es,
 				self.len
 			)));
 			process::abort();
 		}
-		// SAFETY: n_floats*8 is bounds-checked above, so the offset stays inside the allocation.
-		unsafe { return self.ptr.cast::<u8>().add(n_floats * 8).cast::<c_void>() }
+		// SAFETY: n_floats*elem_size is bounds-checked above, so the offset stays inside the allocation.
+		unsafe { return self.ptr.cast::<u8>().add(n_floats * es).cast::<c_void>() }
 	}
 
 	#[inline]
 	#[must_use]
 	pub fn view(&self, offset_floats: usize, len_floats: usize) -> Self {
-		return Self::borrow(self.as_ptr_offset(offset_floats), len_floats * 8);
+		return Self::borrow(
+			self.as_ptr_offset(offset_floats),
+			len_floats * self.dt.elem_size(),
+		)
+		.as_dtype(self.dt);
 	}
 
 	/// # Errors

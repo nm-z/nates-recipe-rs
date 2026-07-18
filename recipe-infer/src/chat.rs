@@ -6,7 +6,8 @@
 
 use crate::gguf::{Gguf, Val};
 use anyhow::{Result, anyhow, bail};
-use minijinja::{Environment, Value, context};
+use hf_chat_template::ChatTemplate;
+use minijinja::{Value, context};
 use std::path::Path;
 
 /// One conversation turn. `role` is the HF convention (`system`/`user`/`assistant`);
@@ -25,9 +26,11 @@ impl Msg {
       }
 }
 
-/// Render `msgs` through a Jinja chat template string. Provides `messages`,
-/// `add_generation_prompt`, `bos_token`, `eos_token` and a `raise_exception`
-/// callable (many HF templates call it to reject malformed histories).
+/// Render `msgs` through a Jinja chat template string via `hf-chat-template`,
+/// which layers HF `transformers` compatibility (the `raise_exception` callable
+/// many templates use to reject malformed histories, Python string methods, etc.)
+/// over minijinja. Provides `messages`, `add_generation_prompt`, `bos_token` and
+/// `eos_token` in the render context.
 pub fn render_template(
       tmpl: &str,
       msgs: &[Msg],
@@ -35,27 +38,13 @@ pub fn render_template(
       bos_token: &str,
       eos_token: &str,
 ) -> Result<String> {
-      let mut env = Environment::new();
-      env.add_function(
-            "raise_exception",
-            |msg: String| -> std::result::Result<Value, minijinja::Error> {
-                  return Err(minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        msg,
-                  ));
-            },
-      );
-      env.add_template("chat", tmpl)
-            .map_err(|e| anyhow!("chat template parse: {e}"))?;
-      let tpl = env
-            .get_template("chat")
-            .map_err(|e| anyhow!("chat template get: {e}"))?;
+      let template = ChatTemplate::from_str(tmpl).map_err(|e| anyhow!("chat template parse: {e}"))?;
       let messages: Vec<Value> = msgs
             .iter()
             .map(|m| context! { role => m.role.as_str(), content => m.content.as_str() })
             .collect();
-      let rendered = tpl
-            .render(context! {
+      let rendered = template
+            .render_value(context! {
                   messages => messages,
                   add_generation_prompt => add_generation_prompt,
                   bos_token => bos_token,

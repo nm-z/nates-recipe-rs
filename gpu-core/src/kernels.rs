@@ -220,7 +220,7 @@ unsafe extern "C" {
 		scale: *const f64,
 		stream: *mut c_void,
 	);
-	fn launch_sigmoid(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_sigmoid(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_sigmoid_backward(
 		grad: *const c_void,
 		act: *const c_void,
@@ -228,7 +228,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_tanh_act(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_tanh_act(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_tanh_backward(
 		grad: *const c_void,
 		act: *const c_void,
@@ -236,7 +236,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_relu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_relu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_relu_backward(
 		grad: *const c_void,
 		act: *const c_void,
@@ -250,6 +250,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_add_scalar(
 		x: *const c_void,
@@ -257,6 +258,7 @@ unsafe extern "C" {
 		n: i32,
 		s: *const f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_div(
 		a: *const c_void,
@@ -272,6 +274,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_reduce_sum_cols(
 		x: *const c_void,
@@ -281,6 +284,7 @@ unsafe extern "C" {
 		tmp: *mut c_void,
 		tmp_bytes: usize,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_reduce_sum_rows(
 		x: *const c_void,
@@ -314,6 +318,7 @@ unsafe extern "C" {
 		rows: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	) -> usize;
 	fn reduce_sum_rows_workspace_bytes(
 		x: *const c_void,
@@ -360,6 +365,7 @@ unsafe extern "C" {
 		rows: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_lstm_cell(
 		gates: *const c_void,
@@ -403,7 +409,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_mul_inplace(a: *mut c_void, b: *const c_void, n: i32, stream: *mut c_void);
+	fn launch_mul_inplace(a: *mut c_void, b: *const c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_add_col_scaled(
 		matrix: *mut c_void,
 		col: *const c_void,
@@ -441,6 +447,7 @@ unsafe extern "C" {
 		out: *mut c_void,
 		n: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_softmax_rows(
 		x: *const c_void,
@@ -448,6 +455,7 @@ unsafe extern "C" {
 		rows: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_flash_attention_f64(
 		q: *const c_void,
@@ -459,6 +467,7 @@ unsafe extern "C" {
 		d: i32,
 		heads: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_flash_attention_f64_train_fwd(
 		q: *const c_void,
@@ -518,6 +527,7 @@ unsafe extern "C" {
 		n: i32,
 		scale: *const f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_avg_pool_1d(
 		input: *const c_void,
@@ -566,6 +576,7 @@ unsafe extern "C" {
 		n: i32,
 		alpha: *const f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_leaky_relu_backward(
 		grad: *const c_void,
@@ -584,6 +595,7 @@ unsafe extern "C" {
 		cols: i32,
 		eps: *const f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_dropout(
 		x: *const c_void,
@@ -617,6 +629,7 @@ unsafe extern "C" {
 		d1: i32,
 		d2: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_slice_lead(
 		src: *const c_void,
@@ -625,6 +638,7 @@ unsafe extern "C" {
 		src_cols: i32,
 		take: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_im2col_2d(
 		x: *const c_void,
@@ -640,10 +654,10 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_exp(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_log(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_copy_f64(src: *const c_void, dst: *mut c_void, n: i64, stream: *mut c_void);
-	fn launch_sqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_abs(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_log(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
+	fn launch_copy_f64(src: *const c_void, dst: *mut c_void, n: i64, stream: *mut c_void, dtype: i32);
+	fn launch_sqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
+	fn launch_abs(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_neg(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_sign(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_pow(x: *const c_void, out: *mut c_void, n: i32, p: *const f64, stream: *mut c_void);
@@ -654,6 +668,7 @@ unsafe extern "C" {
 		lo: *const f64,
 		hi: *const f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_transpose(
 		x: *const c_void,
@@ -693,6 +708,7 @@ unsafe extern "C" {
 		n: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_broadcast_mul(
 		x: *const c_void,
@@ -701,6 +717,7 @@ unsafe extern "C" {
 		n: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_broadcast_div(
 		x: *const c_void,
@@ -709,6 +726,7 @@ unsafe extern "C" {
 		n: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 
 	fn launch_softmax_backward(
@@ -742,6 +760,7 @@ unsafe extern "C" {
 		n: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_scatter_add(
 		target: *mut c_void,
@@ -950,7 +969,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_gelu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_gelu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_gelu_backward(
 		grad: *const c_void,
 		x: *const c_void,
@@ -958,7 +977,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_silu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_silu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_silu_backward(
 		grad: *const c_void,
 		x: *const c_void,
@@ -1063,6 +1082,7 @@ unsafe extern "C" {
 		start: i32,
 		count: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_tril_mask(out: *mut c_void, n: i32, fill_val: *const f64, stream: *mut c_void);
 	fn launch_fill(out: *mut c_void, n: i32, val: *const f64, stream: *mut c_void);
@@ -1591,6 +1611,7 @@ unsafe extern "C" {
 		d_conv: i32,
 		apply_silu: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_ssm_scan_mamba1(
 		xc: *const c_void,
@@ -1604,6 +1625,7 @@ unsafe extern "C" {
 		d_inner: i32,
 		d_state: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_ssm_scan_mamba2(
 		xbc: *const c_void,
@@ -1618,6 +1640,7 @@ unsafe extern "C" {
 		n_group: i32,
 		conv_dim: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_ssm_group_rmsnorm(
 		x: *const c_void,
@@ -1628,6 +1651,7 @@ unsafe extern "C" {
 		dpg: i32,
 		n_group: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_l2norm_rows(
 		x: *const c_void,
@@ -1636,6 +1660,7 @@ unsafe extern "C" {
 		rows: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gated_delta_scan(
 		q: *const c_void,
@@ -1651,6 +1676,7 @@ unsafe extern "C" {
 		per_channel: i32,
 		scale: f64,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_row_scale(
 		x: *const c_void,
@@ -1659,6 +1685,7 @@ unsafe extern "C" {
 		rows: i32,
 		cols: i32,
 		stream: *mut c_void,
+		dtype: i32,
 	);
 }
 
@@ -2450,6 +2477,7 @@ pub fn gpu_sigmoid_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), 
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2485,7 +2513,7 @@ pub fn gpu_sigmoid_backward_into(
 pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_tanh_act with device pointers from live buffers and a checked length
 	unsafe {
-		launch_tanh_act(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut());
+		launch_tanh_act(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut(), out.dtype().ffi());
 	}
 	check_launch();
 	return Ok(());
@@ -2530,6 +2558,7 @@ pub fn gpu_leaky_relu_into(
 			ci(n)?,
 			alpha.ptr.cast::<f64>().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2566,7 +2595,7 @@ pub fn gpu_leaky_relu_backward_into(
 pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the launch reads only live GpuBuffer device allocations through valid FFI pointers.
 	unsafe {
-		launch_silu(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut());
+		launch_silu(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut(), out.dtype().ffi());
 	}
 	check_launch();
 	return Ok(());
@@ -2606,6 +2635,7 @@ pub fn gpu_relu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2654,6 +2684,7 @@ pub fn gpu_add_into(
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2677,6 +2708,7 @@ pub fn gpu_add_scalar(
 			ci(n)?,
 			s.ptr.cast::<f64>(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2732,6 +2764,7 @@ pub fn gpu_fma(
 			out.ptr,
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2790,6 +2823,7 @@ pub fn gpu_mul_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 			b.ptr.cast_const(),
 			ci(n)?,
 			ptr::null_mut(),
+			a.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2808,6 +2842,7 @@ pub fn gpu_add_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 			a.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			a.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2826,6 +2861,7 @@ pub fn gpu_sub_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 			a.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			a.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2844,6 +2880,7 @@ pub fn gpu_add_scalar_inplace(s: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<
 			ci(n)?,
 			s.ptr.cast::<f64>().cast_const(),
 			ptr::null_mut(),
+			a.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -2885,6 +2922,7 @@ pub fn gpu_linear_into(
 					ci(n)?,
 					ci(k)?,
 					ptr::null_mut(),
+					out.dtype().ffi(),
 				);
 			}
 			check_launch();
@@ -3068,6 +3106,7 @@ pub fn gpu_abs_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3085,6 +3124,7 @@ pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3102,6 +3142,7 @@ pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), H
 			out.ptr,
 			i64::try_from(n).map_err(|_e| return HipError(1))?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3120,7 +3161,7 @@ pub fn gpu_reduce_sum_cols_into(
 ) -> Result<(), HipError> {
 	// SAFETY: reduce_sum_cols_workspace_bytes computes the byte count from the dims; its pointer args are unused.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(ptr::null(), ci(rows)?, ci(cols)?, ptr::null_mut())
+		reduce_sum_cols_workspace_bytes(ptr::null(), ci(rows)?, ci(cols)?, ptr::null_mut(), x.dtype().ffi())
 	};
 	// SAFETY: launch_reduce_sum_cols reads x, writes out, and uses reduce_ws of ws bytes, all valid device buffers for the dims.
 	unsafe {
@@ -3132,6 +3173,7 @@ pub fn gpu_reduce_sum_cols_into(
 			reduce_ws.ptr,
 			ws,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3148,6 +3190,7 @@ pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 			safe_i32(rows),
 			safe_i32(cols),
 			ptr::null_mut(),
+			memory::Dtype::F64.ffi(),
 		);
 	}
 }
@@ -3304,6 +3347,7 @@ pub fn gpu_layernorm_into(
 			ci(cols)?,
 			eps.ptr.cast::<f64>(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3341,6 +3385,7 @@ pub fn gpu_layernorm_opt_into(
 			ci(cols)?,
 			eps.ptr.cast::<f64>(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3358,6 +3403,7 @@ pub fn gpu_gelu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 			out.ptr.cast::<c_void>(),
 			ci(n)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3513,7 +3559,7 @@ pub fn gpu_linear_backward_weights_only_into(
 ) -> Result<(), HipError> {
 	// SAFETY: `grad.ptr` is a valid device pointer; the call only queries the reduction workspace byte size and launches nothing.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut())
+		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut(), grad.dtype().ffi())
 	};
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
 	// SAFETY: `grad`/`grad_b` device pointers and the `reduce_ws` workspace are valid for this column-reduction launch on the default stream.
@@ -3526,6 +3572,7 @@ pub fn gpu_linear_backward_weights_only_into(
 			reduce_ws.ptr,
 			ws,
 			ptr::null_mut(),
+			grad_b.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3553,7 +3600,7 @@ pub fn gpu_linear_backward_full_into(
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
 	// SAFETY: `grad.ptr` is a valid device pointer; the call only queries the reduction workspace byte size and launches nothing.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut())
+		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut(), grad.dtype().ffi())
 	};
 	// SAFETY: `grad`/`grad_b` device pointers and the `reduce_ws` workspace are valid for this column-reduction launch on the default stream.
 	unsafe {
@@ -3565,6 +3612,7 @@ pub fn gpu_linear_backward_full_into(
 			reduce_ws.ptr,
 			ws,
 			ptr::null_mut(),
+			grad_b.dtype().ffi(),
 		);
 	}
 	// SAFETY: the device pointers are valid GPU allocations sized for the m/n/k dims; hipblas reads and writes within those bounds.
@@ -3640,6 +3688,7 @@ pub fn gpu_softmax_rows_into(
 			ci(rows)?,
 			ci(cols)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -3671,6 +3720,7 @@ pub fn gpu_flash_attention_into(
 			ci(d)?,
 			ci(heads)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -4733,6 +4783,7 @@ pub fn gpu_sub(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 			out.ptr.cast::<c_void>(),
 			n_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -4759,6 +4810,7 @@ pub fn gpu_sub_scale_into(
 			n_i32,
 			scale.ptr.cast::<f64>().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -4956,6 +5008,7 @@ pub fn gpu_bias_add(
 			ci(rows)?,
 			ci(cols)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -4993,6 +5046,7 @@ pub fn gpu_ssm_conv_causal_silu(
 			ci(d_conv)?,
 			1,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5028,6 +5082,7 @@ pub fn gpu_ssm_conv_causal(
 			ci(d_conv)?,
 			0,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5071,6 +5126,7 @@ pub fn gpu_ssm_scan_mamba1(
 			ci(d_inner)?,
 			ci(d_state)?,
 			ptr::null_mut(),
+			y.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5117,6 +5173,7 @@ pub fn gpu_ssm_scan_mamba2(
 			ci(n_group)?,
 			ci(conv_dim)?,
 			ptr::null_mut(),
+			y.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5152,6 +5209,7 @@ pub fn gpu_ssm_group_rmsnorm(
 			ci(dpg)?,
 			ci(n_group)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5182,6 +5240,7 @@ pub fn gpu_l2norm_rows(
 			ci(rows)?,
 			ci(cols)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5232,6 +5291,7 @@ pub fn gpu_gated_delta_scan(
 			i32::from(per_channel),
 			scale,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5261,6 +5321,7 @@ pub fn gpu_row_scale(
 			ci(rows)?,
 			ci(cols)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5643,6 +5704,7 @@ pub fn gpu_concat_into(
 			d1_i32,
 			d2_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5673,6 +5735,7 @@ pub fn gpu_slice_lead_into(
 			src_cols_i32,
 			take_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5733,7 +5796,7 @@ pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	let n_i32 = ci(n)?;
 	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
-		launch_sqrt(x.ptr.cast_const(), out.ptr, n_i32, ptr::null_mut());
+		launch_sqrt(x.ptr.cast_const(), out.ptr, n_i32, ptr::null_mut(), out.dtype().ffi());
 	}
 	check_launch();
 	return Ok(());
@@ -5809,6 +5872,7 @@ pub fn gpu_clamp_into(
 			lo.ptr.cast::<f64>().cast_const(),
 			hi.ptr.cast::<f64>().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5959,6 +6023,7 @@ pub fn gpu_broadcast_sub_into(
 			n_i32,
 			cols_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -5986,6 +6051,7 @@ pub fn gpu_broadcast_mul(
 			n_i32,
 			cols_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -6013,6 +6079,7 @@ pub fn gpu_broadcast_div(
 			n_i32,
 			cols_i32,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -6111,6 +6178,7 @@ pub fn gpu_gather_rows_into(
 			ci(n)?,
 			ci(cols)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();
@@ -6921,6 +6989,7 @@ pub fn gpu_slice_cols(
 			ci(start)?,
 			ci(count)?,
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	check_launch();

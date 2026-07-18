@@ -501,6 +501,59 @@ pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 	}
 }
 
+fn render_models(frame: &mut Frame, names: &[String], cur: usize) {
+	let mut lines: Vec<Line> = Vec::new();
+	lines.push(Line::from(Span::styled(
+		"models  (arrows move, enter load, q quit)",
+		Style::default()
+			.fg(Color::Rgb(120, 200, 255))
+			.add_modifier(Modifier::BOLD),
+	)));
+	lines.push(Line::from(""));
+	for (i, name) in names.iter().enumerate() {
+		let style = match i == cur {
+			true => Style::default().add_modifier(Modifier::REVERSED),
+			false => Style::default(),
+		};
+		lines.push(Line::from(Span::styled(format!(" {name}"), style)));
+	}
+	let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+	frame.render_widget(para, frame.area());
+}
+
+/// Single-select dropdown over the gguf.toml model names; returns the chosen
+/// index, or `None` if the user quits without selecting. Mirrors the
+/// [`peers_picker`] ratatui style.
+pub fn model_picker(names: &[String]) -> Option<usize> {
+	crate::some_or_die(io::stdin().is_terminal().then_some(()), "run: needs a tty");
+	let mut term = ratatui::init();
+	let _guard = TermRestore::new();
+	let mut cur = 0usize;
+	loop {
+		let _drawn = term.draw(|f| render_models(f, names, cur));
+		let ev = match event::read() {
+			Ok(e) => e,
+			Err(_e) => return None,
+		};
+		let Event::Key(k) = ev else { continue };
+		let KeyEventKind::Press = k.kind else {
+			continue;
+		};
+		match (k.code, k.modifiers) {
+			(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return None,
+			(KeyCode::Esc, _mods) | (KeyCode::Char('q'), _mods) => return None,
+			(KeyCode::Enter, _mods) => return Some(cur),
+			(KeyCode::Up, _mods) | (KeyCode::Char('k'), _mods) => {
+				cur = cur.saturating_sub(1);
+			}
+			(KeyCode::Down, _mods) | (KeyCode::Char('j'), _mods) => {
+				cur = (cur + 1).min(names.len().saturating_sub(1));
+			}
+			_other => {}
+		}
+	}
+}
+
 /// Non-blocking poll for a generation-cancel key (Ctrl-C or Esc). Drains any
 /// pending input events so a cancel during a long generation is seen promptly.
 fn cancel_requested() -> bool {
@@ -554,12 +607,176 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	}
 }
 
+/// Events streamed from the session worker to the chat UI thread: live token
+/// snapshots during load or decode, the load terminal signals, and the finished
+/// reply for a message (Ok body or a formatted error string).
+enum FromWorker {
+	Snap(Vec<Tok>),
+	Loaded,
+	LoadEnded(Option<String>),
+	Reply(std::result::Result<String, String>),
+}
+
+enum LoadOutcome {
+	Loaded,
+	Cancelled,
+	Failed(String),
+}
+
+/// Owns the resident [`ChatSession`] for the chat's lifetime on its own thread:
+/// loads the weights once (streaming snapshots + honoring the cancel flag), then
+/// serves each prompt from `prompts` by calling `generate_in` against those same
+/// weights — no reload between messages. Exits when `prompts` closes (chat quit),
+/// dropping the session so the weights free exactly once.
+fn session_worker(
+	gguf: &Path,
+	prompts: std::sync::mpsc::Receiver<String>,
+	ev: std::sync::mpsc::Sender<FromWorker>,
+	cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+	let opened = {
+		let mut load_round = |toks: &[Tok]| -> bool {
+			let _snap = ev.send(FromWorker::Snap(toks.to_vec()));
+			return !cancel.load(std::sync::atomic::Ordering::Relaxed);
+		};
+		recipe_infer::llm::ChatSession::open(gguf, &mut load_round)
+	};
+	let mut session = match opened {
+		Err(e) => {
+			let _sent = ev.send(FromWorker::LoadEnded(Some(format!("{e:#}"))));
+			return;
+		}
+		Ok(None) => {
+			let _sent = ev.send(FromWorker::LoadEnded(None));
+			return;
+		}
+		Ok(Some(s)) => s,
+	};
+	let _ready = ev.send(FromWorker::Loaded);
+	loop {
+		let prompt = match prompts.recv() {
+			Ok(p) => p,
+			Err(_closed) => return,
+		};
+		cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+		let mut on_round = |toks: &[Tok]| -> bool {
+			let _snap = ev.send(FromWorker::Snap(toks.to_vec()));
+			return !cancel.load(std::sync::atomic::Ordering::Relaxed);
+		};
+		let r = session.generate_in(&prompt, &mut on_round);
+		let _reply = ev.send(FromWorker::Reply(r.map_err(|e| format!("{e:#}"))));
+	}
+}
+
+/// Renders the load screen and polls keys until the worker reports the load
+/// finished, was cancelled (Esc/Ctrl-C), or failed. A cancel sets the shared
+/// flag so `ChatSession::open` returns cleanly.
+fn wait_load(
+	term: &mut ratatui::DefaultTerminal,
+	textarea: &TextArea,
+	scrollback: &[(String, String)],
+	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
+	cancel: &std::sync::atomic::AtomicBool,
+) -> LoadOutcome {
+	let mut latest: Vec<Tok> = Vec::new();
+	loop {
+		loop {
+			match ev_rx.try_recv() {
+				Ok(FromWorker::Snap(t)) => latest = t,
+				Ok(FromWorker::Loaded) => return LoadOutcome::Loaded,
+				Ok(FromWorker::LoadEnded(None)) => return LoadOutcome::Cancelled,
+				Ok(FromWorker::LoadEnded(Some(e))) => return LoadOutcome::Failed(e),
+				Ok(FromWorker::Reply(_r)) => {}
+				Err(std::sync::mpsc::TryRecvError::Empty) => break,
+				Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+					return LoadOutcome::Failed("worker thread ended during load".to_string());
+				}
+			}
+		}
+		let _live = term
+			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true));
+		if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false)
+			&& let Ok(Event::Key(k)) = event::read()
+			&& k.kind == KeyEventKind::Press
+		{
+			let ctrl_c =
+				k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+			if ctrl_c || k.code == KeyCode::Esc {
+				cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+	}
+}
+
+/// Sends one already-templated prompt's decode span through the UI: streams
+/// token snapshots and polls keys every 50ms so Esc/Ctrl-C cancels the
+/// generation (setting the flag) while leaving the session alive for the next
+/// message. Returns the worker's reply, or `None` if the worker channel closed.
+fn run_message(
+	term: &mut ratatui::DefaultTerminal,
+	textarea: &TextArea,
+	scrollback: &[(String, String)],
+	prompt: &str,
+	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
+	cancel: &std::sync::atomic::AtomicBool,
+) -> Option<std::result::Result<String, String>> {
+	let mut latest: Vec<Tok> = Vec::new();
+	loop {
+		loop {
+			match ev_rx.try_recv() {
+				Ok(FromWorker::Snap(t)) => latest = t,
+				Ok(FromWorker::Reply(r)) => return Some(r),
+				Ok(_other) => {}
+				Err(std::sync::mpsc::TryRecvError::Empty) => break,
+				Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+			}
+		}
+		let _live =
+			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true));
+		if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false)
+			&& let Ok(Event::Key(k)) = event::read()
+			&& k.kind == KeyEventKind::Press
+		{
+			let ctrl_c =
+				k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+			if ctrl_c || k.code == KeyCode::Esc {
+				cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+	}
+}
+
 pub fn chat(gguf: &str) {
 	crate::some_or_die(io::stdin().is_terminal().then_some(()), "chat: needs a tty");
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut textarea = new_input();
 	let mut scrollback: Vec<(String, String)> = Vec::new();
+
+	let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<String>();
+	let (ev_tx, ev_rx) = std::sync::mpsc::channel::<FromWorker>();
+	let gguf_owned = std::path::PathBuf::from(gguf);
+	let flag = std::sync::Arc::clone(&cancel);
+	let worker = std::thread::spawn(move || session_worker(&gguf_owned, prompt_rx, ev_tx, flag));
+
+	match wait_load(&mut term, &textarea, &scrollback, &ev_rx, &cancel) {
+		LoadOutcome::Loaded => {}
+		LoadOutcome::Cancelled => {
+			drop(prompt_tx);
+			let _joined = worker.join();
+			drop(_guard);
+			return;
+		}
+		LoadOutcome::Failed(e) => {
+			drop(prompt_tx);
+			let _joined = worker.join();
+			drop(_guard);
+			drop(gpu_core::log::Write::err(format!("chat: load failed: {e}")));
+			return;
+		}
+	}
+
 	loop {
 		let _idle = term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false));
 		let ev = match event::read() {
@@ -602,28 +819,16 @@ pub fn chat(gguf: &str) {
 						Ok(s) => (s, None),
 						Err(_e) => (prompt.clone(), Some("note: no chat template in gguf; multi-turn history disabled")),
 					};
-					let res;
-					{
-						let sb = &scrollback;
-						let ta = &textarea;
-						let pr = prompt.as_str();
-						let mut on_round = |toks: &[Tok]| -> bool {
-							let _round = term.draw(|f| {
-								render_chat(f, ta, sb, Some(pr), toks, true)
-							});
-							!cancel_requested()
-						};
-						res = match on_round(&[]) {
-							true => recipe_infer::llm::generate(Path::new(gguf), &send, &mut on_round),
-							false => Ok(String::new()),
-						};
+					if prompt_tx.send(send).is_err() {
+						break;
 					}
-					match res {
-						Ok(resp) => {
+					match run_message(&mut term, &textarea, &scrollback, &prompt, &ev_rx, &cancel) {
+						Some(Ok(resp)) => {
 							let shown = note.map(|n| format!("{n}\n{resp}")).unwrap_or(resp);
 							scrollback.push((prompt, shown));
 						}
-						Err(e) => scrollback.push((prompt, format!("error: {e:#}"))),
+						Some(Err(e)) => scrollback.push((prompt, format!("error: {e}"))),
+						None => break,
 					}
 				}
 				_other => {
@@ -636,5 +841,7 @@ pub fn chat(gguf: &str) {
 			}
 		}
 	}
+	drop(prompt_tx);
+	let _joined = worker.join();
 	drop(_guard);
 }

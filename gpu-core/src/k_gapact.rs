@@ -16,6 +16,7 @@ unsafe extern "C" {
 		n: i32,
 		alpha: *const c_void,
 		s: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gapact_elu_backward(
 		g: *const c_void,
@@ -32,6 +33,7 @@ unsafe extern "C" {
 		alpha: *const c_void,
 		lambda: *const c_void,
 		s: *mut c_void,
+		dtype: i32,
 	);
 	fn launch_gapact_selu_backward(
 		g: *const c_void,
@@ -50,7 +52,7 @@ unsafe extern "C" {
 		n: i32,
 		s: *mut c_void,
 	);
-	fn launch_gapact_softplus(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_gapact_softplus(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, dtype: i32);
 	fn launch_gapact_softplus_backward(
 		g: *const c_void,
 		x: *const c_void,
@@ -108,6 +110,7 @@ pub fn gpu_elu(
 			ni,
 			alpha.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return e();
@@ -156,6 +159,7 @@ pub fn gpu_selu(
 			alpha.ptr_raw().cast_const(),
 			lambda.ptr_raw().cast_const(),
 			ptr::null_mut(),
+			out.dtype().ffi(),
 		);
 	}
 	return e();
@@ -260,7 +264,23 @@ macro_rules! gate {
 
 u!(gpu_mish, launch_gapact_mish);
 ub!(gpu_mish_backward, launch_gapact_mish_backward);
-u!(gpu_softplus, launch_gapact_softplus);
+/// # Errors
+/// Returns `HipError` if the kernel launch fails or `n` exceeds `i32`.
+#[inline]
+pub fn gpu_softplus(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+	let ni = ci(n)?;
+	// SAFETY: x/out reference live GpuBuffers valid for n elements; the launcher only touches that range.
+	unsafe {
+		launch_gapact_softplus(
+			x.ptr_raw().cast_const(),
+			out.ptr_raw(),
+			ni,
+			ptr::null_mut(),
+			out.dtype().ffi(),
+		);
+	}
+	return e();
+}
 ub!(gpu_softplus_backward, launch_gapact_softplus_backward);
 u!(gpu_hardswish, launch_gapact_hardswish);
 ub!(gpu_hardswish_backward, launch_gapact_hardswish_backward);

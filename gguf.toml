@@ -1,0 +1,39 @@
+# Full paths of every gguf on this machine (scan 2026-07-17).
+# [models] are runnable weight files, keyed by a short usable name.
+# Fixture/vocab collections are listed as directories, not per file.
+
+[models]
+diffusiongemma-26b = "/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+deepseek-r1-qwen-32b = "/home/nate/models/DeepSeek-32B/models--bartowski--DeepSeek-R1-Distill-Qwen-32B-GGUF/snapshots/1dc8cf9ffa5dd333057ea1b09ccf4772d8726dec/DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf"
+llama2-7b = "/home/nate/models/llama-2-7b/llama-2-7b.Q4_K_M.gguf"
+rnj-1-instruct-q4 = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf"
+rnj-1-instruct-q8 = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q8_0.gguf"
+nomic-embed-text = "/home/nate/.lmstudio/.internal/bundled-models/nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf"
+qwen3-0.6b-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-f16.gguf"
+qwen3-0.6b-bf16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-bf16.gguf"
+qwen3-0.6b-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q8_0.gguf"
+qwen3-0.6b-q6_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q6_k.gguf"
+qwen3-0.6b-q5_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_k.gguf"
+qwen3-0.6b-q5_1 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_1.gguf"
+qwen3-0.6b-q5_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_0.gguf"
+qwen3-0.6b-q4_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_k.gguf"
+qwen3-0.6b-q4_1 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_1.gguf"
+qwen3-0.6b-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_0.gguf"
+qwen3-0.6b-q3_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q3_k.gguf"
+qwen3-0.6b-q2_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q2_k.gguf"
+qwen3-0.6b-q8-quantize = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/quantize/Qwen3-0.6B-Q8_0.gguf"
+qwen3-0.6b-q8-split = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/gguf-split/Qwen3-0.6B-Q8_0.gguf"
+bge-small-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge-small/ggml-model-f16.gguf"
+bge-small-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge-small/ggml-model-q8_0.gguf"
+rerank-tiny-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/rerank-tiny/ggml-model-f16.gguf"
+stories15m-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/tinyllamas/stories15M-q4_0.gguf"
+stories-f32-fixture = "/home/nate/Desktop/nates-recipe-rs/recipe-infer/tests/fixtures/stories-f32.gguf"
+
+[misc]
+imatrix = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/imatrix.gguf"
+
+[fixture_dirs]
+archs-parity = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-archs-seed42"          # 111 seeded arch ggufs + .logits references
+vocabs-parity = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-vocabs-tokenizer"     # tokenizer parity set
+vocab-ggufs-recipe = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/models"                  # ggml-vocab-*.gguf (no weights)
+vocab-ggufs-gemma4 = "/home/nate/Desktop/gemma4/llama.cpp/models"                           # ggml-vocab-*.gguf (no weights)

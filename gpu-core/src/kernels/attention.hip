@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "dtype_dispatch.h"
 
 
 __global__ void attn_sdp_kernel(
@@ -495,8 +496,8 @@ extern "C" void launch_bn_update_running(
 #define FA_BQ 64
 #define FA_BK 64
 
-__global__ void flash_attn_f64_kernel(
-      const double* q, const double* k, const double* v, double* out,
+template<typename T> __global__ void flash_attn_f64_kernel(
+      const T* q, const T* k, const T* v, T* out,
       int n, int seq, int d, int heads
 ) {
       int hd = d / heads;
@@ -506,19 +507,20 @@ __global__ void flash_attn_f64_kernel(
       int tx = threadIdx.x;
       int qpos = qtile * FA_BQ + tx;
 
-      double scale = 1.0 / sqrt((double)hd);
+      T scale = 1.0 / sqrt((double)hd);
 
-      extern __shared__ double sh[];
-      double* Qs = sh;
-      double* Ks = Qs + FA_BQ * hd;
-      double* Vs = Ks + FA_BK * hd;
-      double* As = Vs + FA_BK * hd;
+      HIP_DYNAMIC_SHARED(char, smem_raw);
+      T* sh = reinterpret_cast<T*>(smem_raw);
+      T* Qs = sh;
+      T* Ks = Qs + FA_BQ * hd;
+      T* Vs = Ks + FA_BK * hd;
+      T* As = Vs + FA_BK * hd;
 
-      double m = -1.0e308;
-      double l = 0.0;
+      T m = -1.0e308;
+      T l = 0.0;
 
       if (qpos < seq) {
-            const double* qrow = q + ((long)bi * seq + qpos) * d + hh * hd;
+            const T* qrow = q + ((long)bi * seq + qpos) * d + hh * hd;
             for (int c = 0; c < hd; c++) {
                   Qs[tx * hd + c] = qrow[c];
                   As[tx * hd + c] = 0.0;
@@ -541,13 +543,13 @@ __global__ void flash_attn_f64_kernel(
             if (qpos < seq) {
                   int tile = (seq - kt < FA_BK) ? (seq - kt) : FA_BK;
                   for (int kj = 0; kj < tile; kj++) {
-                        double dot = 0.0;
+                        T dot = 0.0;
                         for (int c = 0; c < hd; c++)
                               dot += Qs[tx * hd + c] * Ks[kj * hd + c];
-                        double s = dot * scale;
-                        double m_new = (s > m) ? s : m;
-                        double resc = exp(m - m_new);
-                        double e = exp(s - m_new);
+                        T s = dot * scale;
+                        T m_new = (s > m) ? s : m;
+                        T resc = exp(m - m_new);
+                        T e = exp(s - m_new);
                         for (int c = 0; c < hd; c++)
                               As[tx * hd + c] = As[tx * hd + c] * resc + Vs[kj * hd + c] * e;
                         l = l * resc + e;
@@ -558,24 +560,24 @@ __global__ void flash_attn_f64_kernel(
       }
 
       if (qpos < seq) {
-            double inv = (l > 0.0) ? 1.0 / l : 0.0;
-            double* orow = out + ((long)bi * seq + qpos) * d + hh * hd;
+            T inv = (l > 0.0) ? 1.0 / l : 0.0;
+            T* orow = out + ((long)bi * seq + qpos) * d + hh * hd;
             for (int c = 0; c < hd; c++)
                   orow[c] = As[tx * hd + c] * inv;
       }
 }
 
 extern "C" void launch_flash_attention_f64(
-      const double* q, const double* k, const double* v, double* out,
-      int n, int seq, int d, int heads, hipStream_t stream
+      const void* q, const void* k, const void* v, void* out,
+      int n, int seq, int d, int heads, hipStream_t stream, int dtype
 ) {
       int hd = d / heads;
       int qtiles = (seq + FA_BQ - 1) / FA_BQ;
       dim3 grid(qtiles, heads, n);
       dim3 block(FA_BQ);
-      size_t shared_bytes = (size_t)(2 * FA_BQ + 2 * FA_BK) * hd * sizeof(double);
-      hipLaunchKernelGGL(flash_attn_f64_kernel, grid, block, shared_bytes, stream,
-            q, k, v, out, n, seq, d, heads);
+      size_t shared_bytes = (size_t)(2 * FA_BQ + 2 * FA_BK) * hd * dt_elem_size(dtype);
+      DT_DISPATCH(dtype, hipLaunchKernelGGL(flash_attn_f64_kernel<T>, grid, block, shared_bytes, stream,
+            (const T*)q, (const T*)k, (const T*)v, (T*)out, n, seq, d, heads));
 }
 
 

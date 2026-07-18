@@ -1,7 +1,8 @@
 #include <hip/hip_runtime.h>
+#include "dtype_dispatch.h"
 
 
-__device__ __forceinline__ double block_sum_bcast(double val, double* smem) {
+template<typename T> __device__ __forceinline__ T block_sum_bcast(T val, T* smem) {
     int lane = threadIdx.x % warpSize;
     int wid  = threadIdx.x / warpSize;
     for (int off = warpSize / 2; off > 0; off /= 2) val += __shfl_down(val, off);
@@ -9,12 +10,12 @@ __device__ __forceinline__ double block_sum_bcast(double val, double* smem) {
     __syncthreads();
     int nwarps = (blockDim.x + warpSize - 1) / warpSize;
     if (wid == 0) {
-        double v = (lane < nwarps) ? smem[lane] : 0.0;
+        T v = (lane < nwarps) ? smem[lane] : 0.0;
         for (int off = warpSize / 2; off > 0; off /= 2) v += __shfl_down(v, off);
         if (lane == 0) smem[0] = v;
     }
     __syncthreads();
-    double total = smem[0];
+    T total = smem[0];
     __syncthreads();
     return total;
 }
@@ -113,28 +114,28 @@ extern "C" void launch_normx_l2_normalize(
         x, out, rows, cols, eps);
 }
 
-extern "C" __global__ void normx_rmsnorm_kernel(
-    const double* x, double* out, const double* gamma, int rows, int cols, const double* eps_p
+template<typename T> __global__ void normx_rmsnorm_kernel(
+    const T* x, T* out, const T* gamma, int rows, int cols, const T* eps_p
 ) {
-    double eps = *eps_p;
+    T eps = *eps_p;
     int row = blockIdx.x;
     if (row >= rows) return;
-    const double* r = x + (long)row * cols;
-    double* o = out + (long)row * cols;
+    const T* r = x + (long)row * cols;
+    T* o = out + (long)row * cols;
 
-    __shared__ double smem[32];
-    double ss = 0.0;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) { double v = r[j]; ss += v * v; }
-    double ms = block_sum_bcast(ss, smem) / cols;
-    double inv = 1.0 / sqrt(ms + eps);
+    __shared__ T smem[32];
+    T ss = 0.0;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) { T v = r[j]; ss += v * v; }
+    T ms = block_sum_bcast(ss, smem) / cols;
+    T inv = 1.0 / sqrt(ms + eps);
     for (int j = threadIdx.x; j < cols; j += blockDim.x)
         o[j] = gamma ? r[j] * inv * gamma[j] : r[j] * inv;
 }
 
 extern "C" void launch_normx_rmsnorm(
-    const double* x, double* out, const double* gamma, int rows, int cols, const double* eps, hipStream_t s
+    const void* x, void* out, const void* gamma, int rows, int cols, const void* eps, hipStream_t s, int dtype
 ) {
     int threads = min(256, max(32, cols));
-    hipLaunchKernelGGL(normx_rmsnorm_kernel, dim3(rows), dim3(threads), 0, s,
-        x, out, gamma, rows, cols, eps);
+    DT_DISPATCH(dtype, hipLaunchKernelGGL(normx_rmsnorm_kernel<T>, dim3(rows), dim3(threads), 0, s,
+        (const T*)x, (T*)out, (const T*)gamma, rows, cols, (const T*)eps));
 }

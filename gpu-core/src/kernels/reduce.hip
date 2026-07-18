@@ -1,12 +1,13 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include <rocprim/rocprim.hpp>
+#include "dtype_dispatch.h"
 
-struct ColTransposeOp {
-    const double* x;
+template<typename T> struct ColTransposeOp {
+    const T* x;
     int rows;
     int cols;
-    __host__ __device__ double operator()(int i) const {
+    __host__ __device__ T operator()(int i) const {
         return x[(i % rows) * cols + (i / rows)];
     }
 };
@@ -21,39 +22,40 @@ struct DivByRows {
     __host__ __device__ double operator()(double v) const { return v * inv_rows; }
 };
 
-extern "C" size_t reduce_sum_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
-    auto input_it = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
-    auto begin_offsets = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
-    auto end_offsets = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
-
+extern "C" size_t reduce_sum_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream, int dtype) {
     size_t tmp_bytes = 0;
-    rocprim::segmented_reduce(nullptr, tmp_bytes,
-        input_it, (double*)nullptr, (unsigned int)cols,
-        begin_offsets, end_offsets,
-        rocprim::plus<double>(), 0.0,
-        stream);
+    DT_DISPATCH(dtype, {
+        auto input_it = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(0),
+            ColTransposeOp<T>{(const T*)x, rows, cols});
+        auto begin_offsets = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+        auto end_offsets = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+        rocprim::segmented_reduce(nullptr, tmp_bytes,
+            input_it, (T*)nullptr, (unsigned int)cols,
+            begin_offsets, end_offsets,
+            rocprim::plus<T>(), (T)0.0,
+            stream);
+    });
     return tmp_bytes;
 }
 
-extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
-    auto input_it = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
-
-    auto begin_offsets = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
-    auto end_offsets = rocprim::make_transform_iterator(
-        rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
-
-    rocprim::segmented_reduce(tmp, tmp_bytes,
-        input_it, out, (unsigned int)cols,
-        begin_offsets, end_offsets,
-        rocprim::plus<double>(), 0.0,
-        stream);
+extern "C" void launch_reduce_sum_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream, int dtype) {
+    DT_DISPATCH(dtype, {
+        auto input_it = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(0),
+            ColTransposeOp<T>{(const T*)x, rows, cols});
+        auto begin_offsets = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
+        auto end_offsets = rocprim::make_transform_iterator(
+            rocprim::make_counting_iterator<int>(1), ScaleByRows{rows});
+        rocprim::segmented_reduce(tmp, tmp_bytes,
+            input_it, (T*)out, (unsigned int)cols,
+            begin_offsets, end_offsets,
+            rocprim::plus<T>(), (T)0.0,
+            stream);
+    });
 }
 
 extern "C" size_t reduce_sum_rows_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
@@ -85,11 +87,11 @@ extern "C" void launch_reduce_sum_rows(const double* x, double* out, int rows, i
 }
 
 extern "C" size_t reduce_mean_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
-    return reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    return reduce_sum_cols_workspace_bytes(x, rows, cols, stream, 0);
 }
 
 extern "C" void launch_reduce_mean_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
-    launch_reduce_sum_cols(x, out, rows, cols, tmp, tmp_bytes, stream);
+    launch_reduce_sum_cols(x, out, rows, cols, tmp, tmp_bytes, stream, 0);
     rocprim::transform(out, out, (size_t)cols, DivByRows{1.0 / rows}, stream);
 }
 
@@ -106,16 +108,16 @@ struct ColDevSqOp {
 };
 
 extern "C" size_t reduce_var_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
-    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream, 0);
     size_t off = (seg + 255) & ~((size_t)255);
     return off + (size_t)cols * sizeof(double);
 }
 
 extern "C" void launch_reduce_var_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
-    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream);
+    size_t seg = reduce_sum_cols_workspace_bytes(x, rows, cols, stream, 0);
     size_t off = (seg + 255) & ~((size_t)255);
     double* means = (double*)((char*)tmp + off);
-    launch_reduce_sum_cols(x, means, rows, cols, tmp, seg, stream);
+    launch_reduce_sum_cols(x, means, rows, cols, tmp, seg, stream, 0);
     rocprim::transform(means, means, (size_t)cols, DivByRows{1.0 / rows}, stream);
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
@@ -272,7 +274,7 @@ extern "C" void launch_reduce_max_rows(const double* x, double* out, int rows, i
 extern "C" size_t reduce_max_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
+        ColTransposeOp<double>{x, rows, cols});
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -289,7 +291,7 @@ extern "C" size_t reduce_max_cols_workspace_bytes(const double* x, int rows, int
 extern "C" void launch_reduce_max_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
+        ColTransposeOp<double>{x, rows, cols});
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -330,7 +332,7 @@ extern "C" void launch_reduce_min_rows(const double* x, double* out, int rows, i
 extern "C" size_t reduce_min_cols_workspace_bytes(const double* x, int rows, int cols, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
+        ColTransposeOp<double>{x, rows, cols});
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
     auto end_offsets = rocprim::make_transform_iterator(
@@ -347,7 +349,7 @@ extern "C" size_t reduce_min_cols_workspace_bytes(const double* x, int rows, int
 extern "C" void launch_reduce_min_cols(const double* x, double* out, int rows, int cols, void* tmp, size_t tmp_bytes, hipStream_t stream) {
     auto input_it = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0),
-        ColTransposeOp{x, rows, cols});
+        ColTransposeOp<double>{x, rows, cols});
     auto begin_offsets = rocprim::make_transform_iterator(
         rocprim::make_counting_iterator<int>(0), ScaleByRows{rows});
     auto end_offsets = rocprim::make_transform_iterator(
