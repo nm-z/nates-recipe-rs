@@ -9,6 +9,10 @@
 //! Each `arg` is `KIND:VALUE`: `ptr:<bytes>` allocates a zeroed device buffer of
 //! that many bytes and passes its pointer; `i32/u32/u64:<v>` and `f64:<v>` pass
 //! a scalar. Arguments are packed in declaration order.
+//!
+//! `lds:<bytes>` is a launch setting rather than a kernel argument: it reserves
+//! dynamic group segment for a kernel declaring `HIP_DYNAMIC_SHARED`, which
+//! reports a fixed group segment of zero and would otherwise run with no LDS.
 
 use core::ffi::c_void;
 use gpu_core::asm::{self, KernArgs};
@@ -69,9 +73,9 @@ fn run() -> Result<(), Errored> {
 	let Some(kernel) = argv.get(2) else {
 		let mut names = program.kernels();
 		names.sort_unstable();
-		Write::error(format!("kernels in {path}:"));
+		Write::always(format!("kernels in {path}:"));
 		for name in names {
-			Write::error(format!("  {name}"));
+			Write::always(format!("  {name}"));
 		}
 		return Ok(());
 	};
@@ -89,15 +93,22 @@ fn run() -> Result<(), Errored> {
 
 	let mut args = KernArgs::new();
 	let mut bufs: Vec<*mut c_void> = Vec::new();
+	let mut lds: u32 = 0;
 	for token in argv.iter().skip(5) {
+		if let Some(value) = token.strip_prefix("lds:") {
+			lds = value
+				.parse()
+				.map_err(|e| Errored::new(format!("lds '{value}': {e}")))?;
+			continue;
+		}
 		parse_arg(token, &mut args, &mut bufs)?;
 	}
 
 	program
-		.launch(kernel, [grid_x, 1, 1], [block_x, 1, 1], &args)
+		.launch_lds(kernel, [grid_x, 1, 1], [block_x, 1, 1], lds, &args)
 		.map_err(|e| Errored::new(format!("launch {kernel}: {e}")))?;
-	Write::error(format!(
-		"DONE {kernel} grid={grid_x} block={block_x} kernargs={} bytes",
+	Write::always(format!(
+		"DONE {kernel} grid={grid_x} block={block_x} lds={lds} kernargs={} bytes",
 		args.as_bytes().len()
 	));
 

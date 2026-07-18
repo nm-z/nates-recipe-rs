@@ -129,6 +129,7 @@ const HSA_POOL_INFO_GLOBAL_FLAGS: i32 = 1;
 const HSA_POOL_INFO_RUNTIME_ALLOC_ALLOWED: i32 = 5;
 const HSA_SEGMENT_GLOBAL: u32 = 0;
 const HSA_POOL_FLAG_KERNARG: u32 = 1;
+const HSA_POOL_FLAG_FINE: u32 = 2;
 const HSA_POOL_FLAG_COARSE: u32 = 4;
 const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 2;
 const HSA_FENCE_SCOPE_SYSTEM: u16 = 2;
@@ -227,6 +228,7 @@ struct Ctx {
       gpu: Agent,
       queue: *mut Queue,
       kernarg_pool: Pool,
+      host_pool: Pool,
       vram_pool: Pool,
 }
 
@@ -338,6 +340,7 @@ fn context() -> Result<&'static Ctx> {
       let gpu = find_agent(HSA_DEVICE_TYPE_GPU)?;
       let cpu = find_agent(HSA_DEVICE_TYPE_CPU)?;
       let kernarg_pool = find_pool(cpu, HSA_POOL_FLAG_KERNARG)?;
+      let host_pool = find_pool(cpu, HSA_POOL_FLAG_FINE)?;
       let vram_pool = find_pool(gpu, HSA_POOL_FLAG_COARSE)?;
       let mut queue: *mut Queue = ptr::null_mut();
       // SAFETY: a single-consumer dispatch queue of 1024 slots on the GPU agent; queue receives the runtime-owned pointer.
@@ -359,7 +362,7 @@ fn context() -> Result<&'static Ctx> {
       if queue.is_null() {
             return err("hsa_queue_create returned a null queue");
       }
-      let ctx = Ctx { gpu, queue, kernarg_pool, vram_pool };
+      let ctx = Ctx { gpu, queue, kernarg_pool, host_pool, vram_pool };
       // Only this thread holds INIT_LOCK and the double-check above saw None, so set cannot fail and no queue leaks.
       if CTX.set(ctx).is_err() {
             return err("asm context init raced despite lock");
@@ -378,17 +381,35 @@ fn context() -> Result<&'static Ctx> {
 /// Returns [`AsmError`] if the HSA pool allocation or access grant fails.
 pub fn alloc_device(bytes: usize) -> Result<*mut c_void> {
       let ctx = context()?;
+      return alloc_from(ctx, ctx.vram_pool, bytes, "vram");
+}
+
+/// Allocates `bytes` of fine-grained host memory the GPU agent can read and
+/// write directly, and which the host can dereference without any transfer.
+///
+/// This is the readback path for the raw-HSA dispatcher: kernel operands and
+/// results placed here are visible to both sides, so a caller can seed inputs
+/// and check outputs without the ledgered arena. Device-resident work belongs
+/// in [`alloc_device`]; this memory is reached across PCIe by the kernel. Free
+/// it with [`free_device`].
+///
+/// # Errors
+/// Returns [`AsmError`] if the HSA pool allocation or access grant fails.
+pub fn alloc_host(bytes: usize) -> Result<*mut c_void> {
+      let ctx = context()?;
+      return alloc_from(ctx, ctx.host_pool, bytes, "host");
+}
+
+fn alloc_from(ctx: &Ctx, pool: Pool, bytes: usize, what: &str) -> Result<*mut c_void> {
       gate::acquire();
       let mut ptr_out: *mut c_void = ptr::null_mut();
-      // SAFETY: allocates `bytes` from the device coarse pool; ptr_out receives the pointer.
+      // SAFETY: allocates `bytes` from the named pool; ptr_out receives the pointer.
       hsa_check(
-            unsafe {
-                  hsa_amd_memory_pool_allocate(ctx.vram_pool, bytes.max(1), 0, &raw mut ptr_out)
-            },
-            "hsa_amd_memory_pool_allocate(vram)",
+            unsafe { hsa_amd_memory_pool_allocate(pool, bytes.max(1), 0, &raw mut ptr_out) },
+            &format!("hsa_amd_memory_pool_allocate({what})"),
       )?;
       if ptr_out.is_null() {
-            return err("device allocation returned null");
+            return err(format!("{what} allocation returned null"));
       }
       // SAFETY: grants the GPU agent access to the buffer it will read and write.
       let allow =
@@ -398,19 +419,20 @@ pub fn alloc_device(bytes: usize) -> Result<*mut c_void> {
             unsafe {
                   hsa_amd_memory_pool_free(ptr_out);
             }
-            return err(format!("hsa_amd_agents_allow_access(vram): HSA status {allow}"));
+            return err(format!("hsa_amd_agents_allow_access({what}): HSA status {allow}"));
       }
       return Ok(ptr_out);
 }
 
-/// Frees a buffer returned by [`alloc_device`].
+/// Frees a buffer returned by [`alloc_device`] or [`alloc_host`]. The HSA pool
+/// free resolves the owning pool from the pointer, so one function covers both.
 ///
 /// # Errors
 /// Returns [`AsmError`] if the HSA free fails.
 ///
 /// # Safety
-/// `ptr` must be a pointer previously returned by [`alloc_device`] and not yet
-/// freed.
+/// `ptr` must be a pointer previously returned by [`alloc_device`] or
+/// [`alloc_host`] and not yet freed.
 pub unsafe fn free_device(ptr: *mut c_void) -> Result<()> {
       gate::acquire();
       // SAFETY: caller guarantees ptr came from alloc_device and is freed exactly once.
@@ -482,11 +504,20 @@ impl KernArgs {
       }
 }
 
+/// One implicit kernel argument: where it sits in the kernarg segment and what
+/// the dispatch is expected to put there.
+struct Hidden {
+      kind: String,
+      offset: usize,
+      size: usize,
+}
+
 struct Kernel {
       kernel_object: u64,
       kernarg_size: u32,
       group_size: u32,
       private_size: u32,
+      hidden: Vec<Hidden>,
 }
 
 /// A frozen HSA executable and its dispatchable kernels, keyed by name.
@@ -548,8 +579,8 @@ pub fn load(path: impl AsRef<Path>) -> Result<Program> {
       hsa_check(unsafe { hsa_executable_freeze(exe, ptr::null()) }, "hsa_executable_freeze")?;
 
       let mut kernels = HashMap::new();
-      for name in kernel_names(&object)? {
-            let kernel = resolve(exe, ctx.gpu, &name)?;
+      for (name, hidden) in kernel_meta(&object)? {
+            let kernel = resolve(exe, ctx.gpu, &name, hidden)?;
             kernels.insert(name, kernel);
       }
       if kernels.is_empty() {
@@ -558,7 +589,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Program> {
       return Ok(Program { kernels, source: path.to_path_buf() });
 }
 
-fn resolve(exe: Executable, gpu: Agent, name: &str) -> Result<Kernel> {
+fn resolve(exe: Executable, gpu: Agent, name: &str, hidden: Vec<Hidden>) -> Result<Kernel> {
       let symbol_name = CString::new(format!("{name}.kd"))
             .map_err(|_e| AsmError(format!("kernel name has interior NUL: {name}")))?;
       let mut symbol = Symbol { handle: 0 };
@@ -613,7 +644,7 @@ fn resolve(exe: Executable, gpu: Agent, name: &str) -> Result<Kernel> {
                   "symbol PRIVATE_SEGMENT_SIZE",
             )?;
       }
-      return Ok(Kernel { kernel_object, kernarg_size, group_size, private_size });
+      return Ok(Kernel { kernel_object, kernarg_size, group_size, private_size, hidden });
 }
 
 impl Program {
@@ -646,6 +677,30 @@ impl Program {
             block: [u16; 3],
             args: &KernArgs,
       ) -> Result<()> {
+            return self.launch_lds(name, grid, block, 0, args);
+      }
+
+      /// Dispatches `name` with `dynamic_lds` extra bytes of group segment per
+      /// work-group on top of the kernel's fixed allocation.
+      ///
+      /// A kernel declaring `HIP_DYNAMIC_SHARED` reports a fixed group segment
+      /// size of zero and takes its LDS size at dispatch, which is what the
+      /// shared-memory argument of `hipLaunchKernelGGL` supplies. Such a kernel
+      /// launched through [`Program::launch`] runs with no LDS at all and reads
+      /// and writes outside its group segment, so pass its byte count here.
+      ///
+      /// # Errors
+      /// Returns [`AsmError`] if the kernel is unknown, `args` overflows the
+      /// kernarg segment, the group segment total overflows `u32`, or an HSA
+      /// allocation/dispatch step fails.
+      pub fn launch_lds(
+            &self,
+            name: &str,
+            grid: [u32; 3],
+            block: [u16; 3],
+            dynamic_lds: u32,
+            args: &KernArgs,
+      ) -> Result<()> {
             let kernel = self
                   .kernels
                   .get(name)
@@ -662,7 +717,7 @@ impl Program {
             gate::acquire();
 
             let kernarg = alloc_kernarg(ctx, kernel.kernarg_size, bytes)?;
-            let result = self.dispatch(ctx, kernel, grid, block, kernarg);
+            let result = self.dispatch(ctx, kernel, grid, block, dynamic_lds, kernarg);
             // SAFETY: kernarg came from hsa_amd_memory_pool_allocate above; freed once, after the wait completes.
             unsafe {
                   hsa_amd_memory_pool_free(kernarg);
@@ -676,8 +731,15 @@ impl Program {
             kernel: &Kernel,
             grid: [u32; 3],
             block: [u16; 3],
+            dynamic_lds: u32,
             kernarg: *mut c_void,
       ) -> Result<()> {
+            let group_segment = kernel.group_size.checked_add(dynamic_lds).ok_or_else(|| {
+                  AsmError(format!(
+                        "group segment overflow: fixed {} + dynamic {dynamic_lds}",
+                        kernel.group_size
+                  ))
+            })?;
             let mut signal = Signal { handle: 0 };
             // SAFETY: creates a completion signal initialized to 1; signal receives the handle.
             hsa_check(
@@ -692,6 +754,15 @@ impl Program {
             } else {
                   1
             };
+            fill_hidden(
+                  kernarg,
+                  kernel.kernarg_size,
+                  &kernel.hidden,
+                  grid,
+                  block,
+                  dims,
+                  dynamic_lds,
+            )?;
             let header = HSA_PACKET_TYPE_KERNEL_DISPATCH
                   | (HSA_FENCE_SCOPE_SYSTEM << 9)
                   | (HSA_FENCE_SCOPE_SYSTEM << 11);
@@ -720,7 +791,7 @@ impl Program {
                               grid_size_y: grid[1],
                               grid_size_z: grid[2],
                               private_segment_size: kernel.private_size,
-                              group_segment_size: kernel.group_size,
+                              group_segment_size: group_segment,
                               kernel_object: kernel.kernel_object,
                               kernarg_address: kernarg,
                               reserved2: 0,
@@ -753,6 +824,65 @@ impl Program {
             }
             return Ok(());
       }
+}
+
+/// Fills the implicit arguments the dispatch owns.
+///
+/// On code object v5 and later a HIP kernel reads `blockDim` and `gridDim` from
+/// its kernarg segment, not from a hardware register, so a dispatch that leaves
+/// those slots zeroed gives the kernel a block size of zero. Loops written as
+/// `for (x = threadIdx.x; x < n; x += blockDim.x)` then never advance and the
+/// kernel hangs; simpler kernels merely index as if every block were block
+/// zero. Slots this dispatcher has no value for, such as the hostcall buffer
+/// and the device heap, stay zeroed.
+///
+/// # Errors
+/// Returns [`AsmError`] if a declared slot lies outside the kernarg segment.
+fn fill_hidden(
+      kernarg: *mut c_void,
+      kernarg_size: u32,
+      hidden: &[Hidden],
+      grid: [u32; 3],
+      block: [u16; 3],
+      dims: u16,
+      dynamic_lds: u32,
+) -> Result<()> {
+      let extent = |i: usize| -> u32 {
+            return u32::from(block[i]).max(1);
+      };
+      for h in hidden {
+            let value: u64 = match h.kind.as_str() {
+                  "hidden_block_count_x" => u64::from(grid[0].div_ceil(extent(0))),
+                  "hidden_block_count_y" => u64::from(grid[1].div_ceil(extent(1))),
+                  "hidden_block_count_z" => u64::from(grid[2].div_ceil(extent(2))),
+                  "hidden_group_size_x" => u64::from(block[0]),
+                  "hidden_group_size_y" => u64::from(block[1]),
+                  "hidden_group_size_z" => u64::from(block[2]),
+                  "hidden_remainder_x" => u64::from(grid[0] % extent(0)),
+                  "hidden_remainder_y" => u64::from(grid[1] % extent(1)),
+                  "hidden_remainder_z" => u64::from(grid[2] % extent(2)),
+                  "hidden_grid_dims" => u64::from(dims),
+                  "hidden_dynamic_lds_size" => u64::from(dynamic_lds),
+                  _unused => continue,
+            };
+            let end = h.offset.checked_add(h.size).unwrap_or(usize::MAX);
+            if h.size > 8 || end > kernarg_size as usize {
+                  return err(format!(
+                        "{} at offset {} size {} does not fit a {kernarg_size}-byte kernarg segment",
+                        h.kind, h.offset, h.size
+                  ));
+            }
+            let bytes = value.to_ne_bytes();
+            // SAFETY: the bounds check above keeps offset..offset+size inside the kernarg allocation, and size is at most 8.
+            unsafe {
+                  ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        kernarg.cast::<u8>().add(h.offset),
+                        h.size,
+                  );
+            }
+      }
+      return Ok(());
 }
 
 fn alloc_kernarg(ctx: &Ctx, size: u32, bytes: &[u8]) -> Result<*mut c_void> {
@@ -839,32 +969,58 @@ fn fresh(object: &Path, source: &Path) -> bool {
       return obj.mtime() >= src.mtime();
 }
 
-fn kernel_names(object: &Path) -> Result<Vec<String>> {
+/// Reads the `NT_AMDGPU_METADATA` note and returns each kernel with the
+/// implicit arguments its kernarg segment reserves.
+///
+/// The note is the authority on where those slots sit: their offsets shift with
+/// the explicit argument list, so they cannot be assumed from a fixed layout.
+/// Kernels appear as `.args` lists followed by the `.name` they belong to.
+fn kernel_meta(object: &Path) -> Result<Vec<(String, Vec<Hidden>)>> {
       let rocm = env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_owned());
       let readelf = format!("{rocm}/llvm/bin/llvm-readelf");
       let out = Command::new(&readelf)
-            .arg("-s")
+            .arg("--notes")
             .arg(object)
             .output()
             .map_err(|e| AsmError(format!("spawn {readelf}: {e}")))?;
       if !out.status.success() {
             return err(format!(
-                  "llvm-readelf {}: {}",
+                  "llvm-readelf --notes {}: {}",
                   object.display(),
                   String::from_utf8_lossy(&out.stderr)
             ));
       }
       let text = String::from_utf8_lossy(&out.stdout);
-      let mut names = Vec::new();
+      let mut kernels: Vec<(String, Vec<Hidden>)> = Vec::new();
+      let mut pending: Vec<Hidden> = Vec::new();
+      let mut offset: Option<usize> = None;
+      let mut size: Option<usize> = None;
       for line in text.lines() {
-            let Some(sym) = line.split_whitespace().last() else {
-                  continue;
-            };
-            if let Some(base) = sym.strip_suffix(".kd") {
-                  if !base.is_empty() && !names.iter().any(|n: &String| n == base) {
-                        names.push(base.to_owned());
+            let trimmed = line.trim_start().trim_start_matches("- ");
+            if let Some(v) = field(trimmed, ".offset:") {
+                  offset = v.parse().ok();
+            } else if let Some(v) = field(trimmed, ".size:") {
+                  size = v.parse().ok();
+            } else if let Some(v) = field(trimmed, ".value_kind:") {
+                  if v.starts_with("hidden_") {
+                        if let (Some(o), Some(s)) = (offset, size) {
+                              pending.push(Hidden { kind: v.to_owned(), offset: o, size: s });
+                        }
                   }
+                  offset = None;
+                  size = None;
+            } else if let Some(v) = field(trimmed, ".name:") {
+                  kernels.push((v.to_owned(), core::mem::take(&mut pending)));
+                  offset = None;
+                  size = None;
             }
       }
-      return Ok(names);
+      if kernels.is_empty() {
+            return err(format!("no kernel metadata in {}", object.display()));
+      }
+      return Ok(kernels);
+}
+
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+      return line.strip_prefix(key).map(str::trim);
 }
