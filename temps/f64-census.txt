@@ -1,100 +1,100 @@
 f64 instruction census, measured from compiler-emitted gfx1101 ISA
 produced by: hipcc -S --cuda-device-only --offload-arch=gfx1101 -O3 <kernel>.hip  (same -O3/gfx1101 as gpu-core/build.rs AMD_FLAGS)
-date: 2026-07-15   hipcc: HIP version: 7.2.53211-9999
+date: 2026-07-18   hipcc: HIP version: 7.2.53211-9999
 
 == totals ==
-kernel .hip files:                        57
-kernels:                                5599
-total instructions:                   605228
-unique instruction mnemonics:            399
-f64 vector ops:                        80583
-ops not f64:                          524645
-memory transfer instructions:          49063
-	64-bit wide:                     39150
-	other widths:                     9913
+kernel .hip files:                        58
+kernels:                                5673
+total instructions:                   621828
+unique instruction mnemonics:            403
+f64 vector ops:                        82579
+ops not f64:                          539249
+memory transfer instructions:          49840
+	64-bit wide:                     39298
+	other widths:                    10542
 f64 FLOP
-	FLOP-weighted: 59.6% fused, 40.4% single-FLOP
+	FLOP-weighted: 59.5% fused, 40.5% single-FLOP
 	op-count:      42.4% fused, 57.6% single-FLOP
 
-== functional distribution (all 605228 instructions, classified by mnemonic) ==
-calc       46.221%   279741   produces a new value
-transfer   19.379%   117287   moves or converts data
-hint       14.645%    88633   tells hardware how to schedule/cache/prefetch
-compare     9.092%    55026   produces a flag
-sync        5.497%    33271   burns time waiting
-branch      4.872%    29484   changes instruction pointer
-barrier     0.295%     1786   synchronizes threads
+== functional distribution (all 621828 instructions, classified by mnemonic) ==
+calc       46.441%   288784   produces a new value
+transfer   19.239%   119632   moves or converts data
+hint       14.724%    91558   tells hardware how to schedule/cache/prefetch
+compare     9.003%    55983   produces a flag
+sync        5.475%    34046   burns time waiting
+branch      4.823%    29989   changes instruction pointer
+barrier     0.295%     1836   synchronizes threads
 
-== aggregate (all 57 kernel files) ==
-  23311  28.928  28.928  v_add_f64
-  22307  27.682  56.610  v_fma_f64
-  11688  14.504  71.114  v_cmp_lt_f64_e32
-   6989   8.673  79.787  v_mul_f64
-   2938   3.646  83.433  v_cmp_neq_f64_e32
-   1734   2.152  85.585  v_cmp_gt_f64_e32
-   1705   2.116  87.701  v_ldexp_f64
-   1264   1.569  89.269  v_cvt_i32_f64_e32
-   1216   1.509  90.778  v_rndne_f64_e32
-   1179   1.463  92.242  v_cmp_ngt_f64_e64
-    874   1.085  93.326  v_cmp_neq_f64_e64
-    718   0.891  94.217  v_cmp_nlt_f64_e32
-    676   0.839  95.056  v_cmp_o_f64_e32
-    505   0.627  95.683  v_cmp_nlt_f64_e64
-    413   0.513  96.195  v_cmp_o_f64_e64
-    395   0.490  96.685  v_cmp_gt_f64_e64
-    374   0.464  97.150  v_div_scale_f64
-    339   0.421  97.570  v_rcp_f64_e32
-    233   0.289  97.859  v_cmp_class_f64_e64
-    193   0.240  98.099  v_cmp_lt_f64_e64
-    187   0.232  98.331  v_div_fmas_f64
-    187   0.232  98.563  v_div_fixup_f64
-    183   0.227  98.790  v_cvt_f64_i32_e32
-    108   0.134  98.924  v_frexp_exp_i32_f64_e32
-     77   0.096  99.020  v_cmp_ngt_f64_e32
-     67   0.083  99.103  v_trunc_f64_e32
-     62   0.077  99.180  v_frexp_mant_f64_e32
-     61   0.076  99.255  v_rsq_f64_e32
-     58   0.072  99.327  v_max_f64
-     57   0.071  99.398  v_cmp_eq_f64_e64
-     51   0.063  99.461  v_trig_preop_f64
-     45   0.056  99.517  v_cmp_nge_f64_e32
-     44   0.055  99.572  v_cmp_eq_f64_e32
-     42   0.052  99.624  v_frexp_mant_f64_e64
-     35   0.043  99.667  v_cmpx_ngt_f64_e32
-     32   0.040  99.707  v_cmp_le_f64_e32
-     28   0.035  99.742  v_fract_f64_e32
-     25   0.031  99.773  v_cvt_f64_u32_e32
-     23   0.029  99.801  v_cmpx_nlt_f64_e32
-     18   0.022  99.824  v_cmp_le_f64_e64
-     16   0.020  99.844  v_cmp_nge_f64_e64
-     15   0.019  99.862  v_cmp_ge_f64_e64
-     12   0.015  99.877  v_cmpx_nge_f64_e64
-     11   0.014  99.891  v_min_f64
+== aggregate (all 58 kernel files) ==
+  24047  29.120  29.120  v_add_f64
+  22944  27.784  56.904  v_fma_f64
+  11688  14.154  71.058  v_cmp_lt_f64_e32
+   7175   8.689  79.747  v_mul_f64
+   2944   3.565  83.312  v_cmp_neq_f64_e32
+   1760   2.131  85.443  v_ldexp_f64
+   1746   2.114  87.557  v_cmp_gt_f64_e32
+   1286   1.557  89.115  v_cvt_i32_f64_e32
+   1236   1.497  90.611  v_rndne_f64_e32
+   1197   1.450  92.061  v_cmp_ngt_f64_e64
+    888   1.075  93.136  v_cmp_neq_f64_e64
+    731   0.885  94.021  v_cmp_nlt_f64_e32
+    676   0.819  94.840  v_cmp_o_f64_e32
+    510   0.618  95.458  v_cmp_nlt_f64_e64
+    417   0.505  95.963  v_cmp_o_f64_e64
+    416   0.504  96.466  v_div_scale_f64
+    407   0.493  96.959  v_cmp_gt_f64_e64
+    372   0.450  97.410  v_rcp_f64_e32
+    248   0.300  97.710  v_cmp_class_f64_e64
+    208   0.252  97.962  v_div_fmas_f64
+    208   0.252  98.214  v_div_fixup_f64
+    203   0.246  98.460  v_cvt_f64_i32_e32
+    197   0.239  98.698  v_cmp_lt_f64_e64
+    121   0.147  98.845  v_frexp_exp_i32_f64_e32
+     81   0.098  98.943  v_cmp_ngt_f64_e32
+     75   0.091  99.034  v_trunc_f64_e32
+     66   0.080  99.114  v_frexp_mant_f64_e32
+     65   0.079  99.192  v_cmp_eq_f64_e64
+     64   0.078  99.270  v_rsq_f64_e32
+     61   0.074  99.344  v_max_f64
+     51   0.062  99.405  v_trig_preop_f64
+     47   0.057  99.462  v_cmp_nge_f64_e32
+     46   0.056  99.518  v_frexp_mant_f64_e64
+     44   0.053  99.571  v_cmp_eq_f64_e32
+     35   0.042  99.614  v_cmpx_ngt_f64_e32
+     32   0.039  99.652  v_cmp_le_f64_e32
+     29   0.035  99.688  v_cvt_f64_u32_e32
+     28   0.034  99.721  v_cvt_f64_f32_e32
+     28   0.034  99.755  v_fract_f64_e32
+     23   0.028  99.783  v_cmpx_nlt_f64_e32
+     18   0.022  99.805  v_cmp_le_f64_e64
+     17   0.021  99.826  v_cvt_f32_f64_e32
+     16   0.019  99.845  v_cmp_nge_f64_e64
+     15   0.018  99.863  v_cmp_ge_f64_e64
+     12   0.015  99.878  v_cmpx_nge_f64_e64
+     11   0.013  99.891  v_min_f64
      10   0.012  99.903  v_cmpx_gt_f64_e32
       8   0.010  99.913  v_cmpx_lt_f64_e32
-      8   0.010  99.923  v_cmpx_ngt_f64_e64
-      5   0.006  99.929  v_cmp_u_f64_e32
-      5   0.006  99.935  v_floor_f64_e32
-      5   0.006  99.942  v_cmpx_neq_f64_e32
-      5   0.006  99.948  v_cmpx_nge_f64_e32
-      4   0.005  99.953  v_cmpx_nlt_f64_e64
-      4   0.005  99.958  v_cmpx_ge_f64_e32
-      3   0.004  99.962  v_cvt_f64_f32_e32
-      3   0.004  99.965  v_cmp_ge_f64_e32
-      3   0.004  99.969  v_cmpx_le_f64_e32
-      3   0.004  99.973  v_cmp_nlg_f64_e32
-      3   0.004  99.976  v_cmp_nle_f64_e32
-      3   0.004  99.980  v_cmp_nlg_f64_e64
-      2   0.002  99.983  v_cmp_u_f64_e64
-      2   0.002  99.985  v_cmp_nle_f64_e64
-      2   0.002  99.988  v_ceil_f64_e32
-      2   0.002  99.990  v_cmpx_nle_f64_e32
-      2   0.002  99.993  v_rsq_f64_e64
-      1   0.001  99.994  v_cmpx_lt_f64_e64
-      1   0.001  99.995  v_cvt_f64_f32_e64
-      1   0.001  99.996  v_rndne_f64_e64
-      1   0.001  99.998  v_cmp_lg_f64_e64
-      1   0.001  99.999  v_cvt_f32_f64_e32
+      8   0.010  99.922  v_cmpx_ngt_f64_e64
+      7   0.008  99.931  v_floor_f64_e32
+      6   0.007  99.938  v_cmpx_ge_f64_e32
+      5   0.006  99.944  v_cmp_u_f64_e32
+      5   0.006  99.950  v_cmpx_neq_f64_e32
+      5   0.006  99.956  v_cmpx_nge_f64_e32
+      4   0.005  99.961  v_cmpx_nlt_f64_e64
+      3   0.004  99.965  v_cvt_f64_f32_e64
+      3   0.004  99.969  v_cmp_ge_f64_e32
+      3   0.004  99.972  v_cmpx_le_f64_e32
+      3   0.004  99.976  v_cmp_nlg_f64_e32
+      3   0.004  99.979  v_cmp_nle_f64_e32
+      3   0.004  99.983  v_cmp_nlg_f64_e64
+      2   0.002  99.985  v_cmp_u_f64_e64
+      2   0.002  99.988  v_cmp_nle_f64_e64
+      2   0.002  99.990  v_ceil_f64_e32
+      2   0.002  99.993  v_cmpx_nle_f64_e32
+      2   0.002  99.995  v_rsq_f64_e64
+      1   0.001  99.996  v_cmpx_lt_f64_e64
+      1   0.001  99.998  v_rndne_f64_e64
+      1   0.001  99.999  v_cmp_lg_f64_e64
       1   0.001 100.000  v_rcp_f64_e64
 
 == per file (files with zero f64 instructions omitted below, listed at end) ==
@@ -162,30 +162,31 @@ barrier     0.295%     1786   synchronizes threads
       2  66.667  66.667  v_cmpx_gt_f64_e32
       1  33.333 100.000  v_cmpx_lt_f64_e32
 -- attention
-    168  47.458  47.458  v_fma_f64
-     48  13.559  61.017  v_add_f64
-     37  10.452  71.469  v_mul_f64
-     17   4.802  76.271  v_ldexp_f64
-     12   3.390  79.661  v_div_scale_f64
-      7   1.977  81.638  v_cmp_gt_f64_e32
-      7   1.977  83.616  v_rcp_f64_e32
-      6   1.695  85.311  v_div_fmas_f64
-      6   1.695  87.006  v_div_fixup_f64
-      6   1.695  88.701  v_cmp_ngt_f64_e64
-      6   1.695  90.395  v_rndne_f64_e32
-      6   1.695  92.090  v_cvt_i32_f64_e32
-      5   1.412  93.503  v_cvt_f64_i32_e32
-      4   1.130  94.633  v_rsq_f64_e32
-      4   1.130  95.763  v_cmp_class_f64_e64
-      4   1.130  96.893  v_cmp_nlt_f64_e32
-      3   0.847  97.740  v_frexp_exp_i32_f64_e32
-      2   0.565  98.305  v_cmp_nlt_f64_e64
-      1   0.282  98.588  v_cvt_f64_f32_e64
-      1   0.282  98.870  v_cvt_f64_f32_e32
-      1   0.282  99.153  v_cmp_lt_f64_e32
-      1   0.282  99.435  v_cmp_lt_f64_e64
-      1   0.282  99.718  v_frexp_mant_f64_e32
-      1   0.282 100.000  v_cmp_neq_f64_e32
+    180  47.244  47.244  v_fma_f64
+     48  12.598  59.843  v_add_f64
+     40  10.499  70.341  v_mul_f64
+     19   4.987  75.328  v_ldexp_f64
+     14   3.675  79.003  v_div_scale_f64
+      8   2.100  81.102  v_cmp_gt_f64_e32
+      8   2.100  83.202  v_rcp_f64_e32
+      7   1.837  85.039  v_div_fmas_f64
+      7   1.837  86.877  v_div_fixup_f64
+      6   1.575  88.451  v_cvt_f64_i32_e32
+      6   1.575  90.026  v_cmp_ngt_f64_e64
+      6   1.575  91.601  v_rndne_f64_e32
+      6   1.575  93.176  v_cvt_i32_f64_e32
+      5   1.312  94.488  v_rsq_f64_e32
+      5   1.312  95.801  v_cmp_class_f64_e64
+      4   1.050  96.850  v_cmp_nlt_f64_e32
+      3   0.787  97.638  v_frexp_exp_i32_f64_e32
+      2   0.525  98.163  v_cmp_nlt_f64_e64
+      1   0.262  98.425  v_cvt_f64_f32_e64
+      1   0.262  98.688  v_cvt_f64_f32_e32
+      1   0.262  98.950  v_cmp_lt_f64_e64
+      1   0.262  99.213  v_frexp_mant_f64_e32
+      1   0.262  99.475  v_cmp_neq_f64_e32
+      1   0.262  99.738  v_cvt_f32_f64_e32
+      1   0.262 100.000  v_cmp_lt_f64_e32
 -- bayes
      93  57.407  57.407  v_add_f64
      30  18.519  75.926  v_fma_f64
@@ -358,47 +359,49 @@ barrier     0.295%     1786   synchronizes threads
       1   0.152  99.848  v_cmp_ge_f64_e32
       1   0.152 100.000  v_cmp_le_f64_e32
 -- elementwise
-   1446  41.889  41.889  v_add_f64
-   1001  28.998  70.886  v_fma_f64
-    330   9.560  80.446  v_mul_f64
-     95   2.752  83.198  v_ldexp_f64
-     68   1.970  85.168  v_div_scale_f64
-     57   1.651  86.819  v_rcp_f64_e32
-     38   1.101  87.920  v_cvt_i32_f64_e32
-     34   0.985  88.905  v_div_fmas_f64
-     34   0.985  89.890  v_div_fixup_f64
-     31   0.898  90.788  v_cmp_lt_f64_e64
-     31   0.898  91.686  v_rndne_f64_e32
-     30   0.869  92.555  v_cmp_class_f64_e64
-     27   0.782  93.337  v_cmp_gt_f64_e32
-     22   0.637  93.975  v_cmp_nlt_f64_e64
-     22   0.637  94.612  v_cvt_f64_i32_e32
-     20   0.579  95.191  v_cmp_ngt_f64_e64
-     20   0.579  95.771  v_cmp_neq_f64_e64
-     16   0.463  96.234  v_cmp_gt_f64_e64
-     11   0.319  96.553  v_frexp_exp_i32_f64_e32
-     10   0.290  96.842  v_cmp_nlt_f64_e32
-     10   0.290  97.132  v_cmp_neq_f64_e32
-     10   0.290  97.422  v_trunc_f64_e32
-      9   0.261  97.683  v_cmp_lt_f64_e32
-      9   0.261  97.943  v_cmp_ngt_f64_e32
-      9   0.261  98.204  v_rsq_f64_e32
-      9   0.261  98.465  v_cmp_eq_f64_e64
-      8   0.232  98.696  v_max_f64
-      8   0.232  98.928  v_cvt_f64_u32_e32
-      6   0.174  99.102  v_frexp_mant_f64_e32
-      5   0.145  99.247  v_frexp_mant_f64_e64
-      4   0.116  99.363  v_cmp_nge_f64_e32
-      4   0.116  99.479  v_cmp_o_f64_e64
-      3   0.087  99.565  v_cmp_eq_f64_e32
-      3   0.087  99.652  v_cmp_le_f64_e32
-      3   0.087  99.739  v_trig_preop_f64
-      2   0.058  99.797  v_min_f64
-      1   0.029  99.826  v_cmp_nle_f64_e64
-      1   0.029  99.855  v_cmp_o_f64_e32
-      1   0.029  99.884  v_cmpx_gt_f64_e32
-      1   0.029  99.913  v_cmp_ge_f64_e32
-      1   0.029  99.942  v_cmpx_ngt_f64_e32
+   1450  41.488  41.488  v_add_f64
+   1012  28.956  70.443  v_fma_f64
+    337   9.642  80.086  v_mul_f64
+     95   2.718  82.804  v_ldexp_f64
+     72   2.060  84.864  v_div_scale_f64
+     59   1.688  86.552  v_rcp_f64_e32
+     38   1.087  87.639  v_cvt_i32_f64_e32
+     36   1.030  88.670  v_div_fmas_f64
+     36   1.030  89.700  v_div_fixup_f64
+     31   0.887  90.587  v_rndne_f64_e32
+     31   0.887  91.474  v_cmp_lt_f64_e64
+     30   0.858  92.332  v_cmp_class_f64_e64
+     27   0.773  93.104  v_cmp_gt_f64_e32
+     22   0.629  93.734  v_cmp_nlt_f64_e64
+     22   0.629  94.363  v_cvt_f64_i32_e32
+     20   0.572  94.936  v_cmp_ngt_f64_e64
+     20   0.572  95.508  v_cmp_neq_f64_e64
+     16   0.458  95.966  v_cmp_gt_f64_e64
+     11   0.315  96.280  v_frexp_exp_i32_f64_e32
+     10   0.286  96.567  v_cmp_nlt_f64_e32
+     10   0.286  96.853  v_cmp_neq_f64_e32
+     10   0.286  97.139  v_trunc_f64_e32
+      9   0.258  97.396  v_cmp_lt_f64_e32
+      9   0.258  97.654  v_cmp_ngt_f64_e32
+      9   0.258  97.911  v_cmp_eq_f64_e64
+      9   0.258  98.169  v_rsq_f64_e32
+      8   0.229  98.398  v_max_f64
+      8   0.229  98.627  v_cvt_f64_u32_e32
+      6   0.172  98.798  v_frexp_mant_f64_e32
+      6   0.172  98.970  v_cvt_f64_f32_e32
+      5   0.143  99.113  v_frexp_mant_f64_e64
+      5   0.143  99.256  v_cvt_f32_f64_e32
+      4   0.114  99.371  v_cmp_nge_f64_e32
+      4   0.114  99.485  v_cmp_o_f64_e64
+      3   0.086  99.571  v_cmp_eq_f64_e32
+      3   0.086  99.657  v_cmp_le_f64_e32
+      3   0.086  99.742  v_trig_preop_f64
+      2   0.057  99.800  v_min_f64
+      1   0.029  99.828  v_cmp_nle_f64_e64
+      1   0.029  99.857  v_cmp_o_f64_e32
+      1   0.029  99.886  v_cmpx_gt_f64_e32
+      1   0.029  99.914  v_cmp_ge_f64_e32
+      1   0.029  99.943  v_cmpx_ngt_f64_e32
       1   0.029  99.971  v_fract_f64_e32
       1   0.029 100.000  v_cmp_lg_f64_e64
 -- elementwise_unaryx
@@ -459,38 +462,44 @@ barrier     0.295%     1786   synchronizes threads
       1   2.326  97.674  v_cvt_i32_f64_e32
       1   2.326 100.000  v_cmp_nle_f64_e32
 -- f64_infer
-    383  46.424  46.424  v_add_f64
-    225  27.273  73.697  v_fma_f64
-     82   9.939  83.636  v_mul_f64
-     17   2.061  85.697  v_ldexp_f64
-     12   1.455  87.152  v_div_scale_f64
-     11   1.333  88.485  v_cmp_gt_f64_e64
-     11   1.333  89.818  v_rcp_f64_e32
-     10   1.212  91.030  v_cvt_i32_f64_e32
-      8   0.970  92.000  v_rndne_f64_e32
-      7   0.848  92.848  v_cmp_neq_f64_e64
-      6   0.727  93.576  v_div_fmas_f64
-      6   0.727  94.303  v_div_fixup_f64
-      5   0.606  94.909  v_cmp_gt_f64_e32
-      5   0.606  95.515  v_cmp_ngt_f64_e64
-      5   0.606  96.121  v_cvt_f64_i32_e32
-      5   0.606  96.727  v_cmp_class_f64_e64
-      4   0.485  97.212  v_cmp_nlt_f64_e64
-      3   0.364  97.576  v_trig_preop_f64
-      2   0.242  97.818  v_cmp_nlt_f64_e32
-      2   0.242  98.061  v_cvt_f64_u32_e32
-      2   0.242  98.303  v_trunc_f64_e32
-      2   0.242  98.545  v_cmp_le_f64_e64
-      2   0.242  98.788  v_fract_f64_e32
-      2   0.242  99.030  v_cmp_le_f64_e32
-      1   0.121  99.152  v_cvt_f64_f32_e32
-      1   0.121  99.273  v_cmp_neq_f64_e32
-      1   0.121  99.394  v_frexp_mant_f64_e64
-      1   0.121  99.515  v_frexp_exp_i32_f64_e32
-      1   0.121  99.636  v_cmp_eq_f64_e32
-      1   0.121  99.758  v_cmp_lt_f64_e64
-      1   0.121  99.879  v_cmp_eq_f64_e64
-      1   0.121 100.000  v_cmp_o_f64_e32
+    936  42.353  42.353  v_add_f64
+    654  29.593  71.946  v_fma_f64
+    200   9.050  80.995  v_mul_f64
+     52   2.353  83.348  v_ldexp_f64
+     38   1.719  85.068  v_div_scale_f64
+     34   1.538  86.606  v_rcp_f64_e32
+     26   1.176  87.783  v_cvt_i32_f64_e32
+     23   1.041  88.824  v_cmp_gt_f64_e64
+     22   0.995  89.819  v_rndne_f64_e32
+     20   0.905  90.724  v_cvt_f64_i32_e32
+     19   0.860  91.584  v_div_fmas_f64
+     19   0.860  92.443  v_div_fixup_f64
+     19   0.860  93.303  v_cmp_neq_f64_e64
+     18   0.814  94.118  v_cmp_ngt_f64_e64
+     17   0.769  94.887  v_cmp_class_f64_e64
+     12   0.543  95.430  v_cmp_gt_f64_e32
+     12   0.543  95.973  v_cmp_nlt_f64_e32
+     10   0.452  96.425  v_trunc_f64_e32
+      9   0.407  96.833  v_cmp_eq_f64_e64
+      8   0.362  97.195  v_frexp_exp_i32_f64_e32
+      8   0.362  97.557  v_cmp_nlt_f64_e64
+      7   0.317  97.873  v_cvt_f64_f32_e32
+      6   0.271  98.145  v_cvt_f64_u32_e32
+      5   0.226  98.371  v_cmp_neq_f64_e32
+      5   0.226  98.597  v_frexp_mant_f64_e64
+      5   0.226  98.824  v_cmp_lt_f64_e64
+      5   0.226  99.050  v_cvt_f32_f64_e32
+      4   0.181  99.231  v_cmp_o_f64_e64
+      3   0.136  99.367  v_trig_preop_f64
+      2   0.090  99.457  v_frexp_mant_f64_e32
+      2   0.090  99.548  v_floor_f64_e32
+      2   0.090  99.638  v_cmp_le_f64_e64
+      2   0.090  99.729  v_fract_f64_e32
+      2   0.090  99.819  v_cmp_le_f64_e32
+      1   0.045  99.864  v_cvt_f64_f32_e64
+      1   0.045  99.910  v_cmp_eq_f64_e32
+      1   0.045  99.955  v_cmp_o_f64_e32
+      1   0.045 100.000  v_cmp_ngt_f64_e32
 -- foreachx
    1032  45.887  45.887  v_add_f64
     680  30.236  76.123  v_fma_f64
@@ -549,38 +558,40 @@ barrier     0.295%     1786   synchronizes threads
       1   5.882  94.118  v_cmp_gt_f64_e32
       1   5.882 100.000  v_fma_f64
 -- gapact
-    418  43.633  43.633  v_add_f64
-    310  32.359  75.992  v_fma_f64
-     87   9.081  85.073  v_mul_f64
-     27   2.818  87.891  v_ldexp_f64
-     13   1.357  89.248  v_rndne_f64_e32
-     13   1.357  90.605  v_cvt_i32_f64_e32
-     12   1.253  91.858  v_rcp_f64_e32
-     10   1.044  92.902  v_div_scale_f64
-      9   0.939  93.841  v_cmp_nlt_f64_e64
-      8   0.835  94.676  v_cmp_ngt_f64_e32
-      6   0.626  95.303  v_max_f64
-      5   0.522  95.825  v_div_fmas_f64
-      5   0.522  96.347  v_div_fixup_f64
-      4   0.418  96.764  v_cmpx_nlt_f64_e32
-      4   0.418  97.182  v_cmp_ngt_f64_e64
-      4   0.418  97.599  v_cmp_neq_f64_e32
-      3   0.313  97.912  v_frexp_mant_f64_e32
-      3   0.313  98.225  v_frexp_exp_i32_f64_e32
-      3   0.313  98.539  v_cmp_gt_f64_e32
-      3   0.313  98.852  v_cvt_f64_i32_e32
-      2   0.209  99.061  v_cmp_nge_f64_e32
-      2   0.209  99.269  v_cmp_neq_f64_e64
-      2   0.209  99.478  v_cmp_gt_f64_e64
-      1   0.104  99.582  v_cmp_nge_f64_e64
-      1   0.104  99.687  v_cmp_nlt_f64_e32
-      1   0.104  99.791  v_cmpx_nge_f64_e32
-      1   0.104  99.896  v_cmpx_nle_f64_e32
-      1   0.104 100.000  v_cmpx_nlt_f64_e64
+    421  43.047  43.047  v_add_f64
+    310  31.697  74.744  v_fma_f64
+     90   9.202  83.947  v_mul_f64
+     27   2.761  86.708  v_ldexp_f64
+     13   1.329  88.037  v_rndne_f64_e32
+     13   1.329  89.366  v_cvt_i32_f64_e32
+     12   1.227  90.593  v_rcp_f64_e32
+     10   1.022  91.616  v_div_scale_f64
+      9   0.920  92.536  v_cmp_nlt_f64_e64
+      9   0.920  93.456  v_cvt_f64_f32_e32
+      8   0.818  94.274  v_cmp_ngt_f64_e32
+      7   0.716  94.990  v_max_f64
+      5   0.511  95.501  v_div_fmas_f64
+      5   0.511  96.012  v_div_fixup_f64
+      4   0.409  96.421  v_cmpx_nlt_f64_e32
+      4   0.409  96.830  v_frexp_exp_i32_f64_e32
+      4   0.409  97.239  v_cmp_ngt_f64_e64
+      4   0.409  97.648  v_cmp_neq_f64_e32
+      3   0.307  97.955  v_frexp_mant_f64_e32
+      3   0.307  98.262  v_cmp_gt_f64_e32
+      3   0.307  98.569  v_cvt_f64_i32_e32
+      3   0.307  98.875  v_cvt_f32_f64_e32
+      2   0.204  99.080  v_cmp_nge_f64_e32
+      2   0.204  99.284  v_cmp_neq_f64_e64
+      2   0.204  99.489  v_cmp_gt_f64_e64
+      1   0.102  99.591  v_cmp_nlt_f64_e32
+      1   0.102  99.693  v_cmpx_nge_f64_e32
+      1   0.102  99.796  v_cmpx_nle_f64_e32
+      1   0.102  99.898  v_cmpx_nlt_f64_e64
+      1   0.102 100.000  v_cmp_nge_f64_e64
 -- gemm_f64
-      5  71.429  71.429  v_add_f64
-      1  14.286  85.714  v_fma_f64
-      1  14.286 100.000  v_mul_f64
+      6  75.000  75.000  v_add_f64
+      1  12.500  87.500  v_fma_f64
+      1  12.500 100.000  v_mul_f64
 -- graph
      19  44.186  44.186  v_fma_f64
       5  11.628  55.814  v_mul_f64
@@ -977,35 +988,37 @@ barrier     0.295%     1786   synchronizes threads
       1   0.699  99.301  v_div_fmas_f64
       1   0.699 100.000  v_div_fixup_f64
 -- ropex
-    366  45.865  45.865  v_add_f64
-    208  26.065  71.930  v_fma_f64
-     79   9.900  81.830  v_mul_f64
-     18   2.256  84.085  v_ldexp_f64
-     14   1.754  85.840  v_cmp_neq_f64_e64
-     12   1.504  87.343  v_cvt_f64_i32_e32
-     11   1.378  88.722  v_cvt_i32_f64_e32
-     10   1.253  89.975  v_cmp_class_f64_e64
-      8   1.003  90.977  v_div_scale_f64
-      8   1.003  91.980  v_cmp_gt_f64_e32
-      6   0.752  92.732  v_rcp_f64_e32
-      6   0.752  93.484  v_rndne_f64_e32
-      6   0.752  94.236  v_trig_preop_f64
-      4   0.501  94.737  v_div_fmas_f64
-      4   0.501  95.238  v_div_fixup_f64
-      4   0.501  95.739  v_trunc_f64_e32
-      4   0.501  96.241  v_cmp_ngt_f64_e64
-      4   0.501  96.742  v_cmp_le_f64_e64
-      4   0.501  97.243  v_fract_f64_e32
-      4   0.501  97.744  v_cmp_le_f64_e32
-      2   0.251  97.995  v_cmp_neq_f64_e32
-      2   0.251  98.246  v_frexp_mant_f64_e64
-      2   0.251  98.496  v_cmp_lt_f64_e64
-      2   0.251  98.747  v_frexp_exp_i32_f64_e32
-      2   0.251  98.997  v_cmp_eq_f64_e64
-      2   0.251  99.248  v_cmp_nlt_f64_e64
-      2   0.251  99.499  v_cmp_eq_f64_e32
-      2   0.251  99.749  v_cmp_gt_f64_e64
-      2   0.251 100.000  v_cmp_o_f64_e32
+    367  45.704  45.704  v_add_f64
+    208  25.903  71.606  v_fma_f64
+     79   9.838  81.445  v_mul_f64
+     18   2.242  83.686  v_ldexp_f64
+     14   1.743  85.430  v_cmp_neq_f64_e64
+     13   1.619  87.049  v_cvt_f64_i32_e32
+     11   1.370  88.418  v_cvt_i32_f64_e32
+     10   1.245  89.664  v_cmp_class_f64_e64
+      8   0.996  90.660  v_div_scale_f64
+      8   0.996  91.656  v_cmp_gt_f64_e32
+      6   0.747  92.403  v_rcp_f64_e32
+      6   0.747  93.151  v_rndne_f64_e32
+      6   0.747  93.898  v_trig_preop_f64
+      4   0.498  94.396  v_div_fmas_f64
+      4   0.498  94.894  v_div_fixup_f64
+      4   0.498  95.392  v_trunc_f64_e32
+      4   0.498  95.890  v_cmp_ngt_f64_e64
+      4   0.498  96.389  v_cmp_le_f64_e64
+      4   0.498  96.887  v_fract_f64_e32
+      4   0.498  97.385  v_cmp_le_f64_e32
+      3   0.374  97.758  v_frexp_exp_i32_f64_e32
+      2   0.249  98.007  v_cmp_neq_f64_e32
+      2   0.249  98.257  v_frexp_mant_f64_e64
+      2   0.249  98.506  v_cmp_lt_f64_e64
+      2   0.249  98.755  v_cmp_eq_f64_e64
+      2   0.249  99.004  v_cmp_nlt_f64_e64
+      2   0.249  99.253  v_cmp_eq_f64_e32
+      2   0.249  99.502  v_cmp_gt_f64_e64
+      2   0.249  99.751  v_cmp_o_f64_e32
+      1   0.125  99.875  v_cvt_f32_f64_e32
+      1   0.125 100.000  v_cvt_f64_f32_e64
 -- scan
    4610  59.027  59.027  v_cmp_lt_f64_e32
    2409  30.845  89.872  v_add_f64
@@ -1133,6 +1146,34 @@ barrier     0.295%     1786   synchronizes threads
       2   0.062  99.907  v_cmp_nlg_f64_e64
       2   0.062  99.969  v_cmp_nlg_f64_e32
       1   0.031 100.000  v_cmp_nle_f64_e32
+-- ssm
+    185  35.922  35.922  v_fma_f64
+    174  33.786  69.709  v_add_f64
+     55  10.680  80.388  v_mul_f64
+     18   3.495  83.883  v_ldexp_f64
+     10   1.942  85.825  v_div_scale_f64
+      7   1.359  87.184  v_rcp_f64_e32
+      6   1.165  88.350  v_rndne_f64_e32
+      6   1.165  89.515  v_cvt_i32_f64_e32
+      5   0.971  90.485  v_div_fmas_f64
+      5   0.971  91.456  v_div_fixup_f64
+      5   0.971  92.427  v_cmp_ngt_f64_e64
+      4   0.777  93.204  v_cvt_f64_f32_e32
+      4   0.777  93.981  v_frexp_exp_i32_f64_e32
+      4   0.777  94.757  v_cmp_gt_f64_e32
+      3   0.583  95.340  v_cmp_ngt_f64_e32
+      3   0.583  95.922  v_cvt_f64_i32_e32
+      3   0.583  96.505  v_cmp_nlt_f64_e32
+      2   0.388  96.893  v_cmpx_ge_f64_e32
+      2   0.388  97.282  v_cmp_neq_f64_e64
+      2   0.388  97.670  v_frexp_mant_f64_e32
+      2   0.388  98.058  v_cmp_nge_f64_e32
+      2   0.388  98.447  v_cmp_neq_f64_e32
+      2   0.388  98.835  v_rsq_f64_e32
+      2   0.388  99.223  v_cmp_class_f64_e64
+      2   0.388  99.612  v_max_f64
+      1   0.194  99.806  v_cvt_f32_f64_e32
+      1   0.194 100.000  v_cmp_nlt_f64_e64
 -- svm
     326  49.771  49.771  v_add_f64
     180  27.481  77.252  v_fma_f64
@@ -1179,10 +1220,10 @@ barrier     0.295%     1786   synchronizes threads
 
 == hardware-encoding cross-check (gemm_f64) ==
 hipcc --genco, then clang-offload-bundler --unbundle, then llvm-objdump -d on the gfx1101 device ELF
-mnemonic counts identical to compiler -S output (5 v_add_f64, 1 v_fma_f64, 1 v_mul_f64); encodings:
-	v_fma_f64 v[2:3], v[16:17], v[18:19], v[2:3]               // 000000002284: D6140002 040A2510
-	v_mul_f64 v[2:3], s[0:1], v[2:3]                           // 00000000247C: D7280002 00020400
-	v_add_f64 v[2:3], v[2:3], v[4:5]                           // 0000000022BC: D7270002 00020902
+mnemonic counts identical to compiler -S output (6 v_add_f64, 1 v_fma_f64, 1 v_mul_f64); encodings:
+	v_fma_f64 v[5:6], v[22:23], v[24:25], v[5:6]               // 000000003444: D6140005 04163116
+	v_mul_f64 v[2:3], s[0:1], v[2:3]                           // 00000000377C: D7280002 00020400
+	v_add_f64 v[5:6], v[5:6], v[7:8]                           // 00000000347C: D7270005 00020F05
 
-== gemm_bt_f64 inner K-loop, measured shape (isa/gemm_f64.gfx1101.s:173-187) ==
+== gemm_bt_f64 inner K-loop, measured shape (isa/gemm_f64.gfx1101.s:445-460) ==
 per iteration: 1 global_load_b64 + 1 ds_load_b64 + s_waitcnt vmcnt(0) lgkmcnt(0) + 1 v_fma_f64
