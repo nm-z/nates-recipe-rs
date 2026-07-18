@@ -383,6 +383,7 @@ fn render_chat(
 	pending: Option<&str>,
 	live: &[Tok],
 	generating: bool,
+	scroll_up: usize,
 ) {
 	let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(frame.area());
 	let head = Style::default()
@@ -409,8 +410,14 @@ fn render_chat(
 		)))
 	});
 	let text = Text::from(lines);
-	let total = text.lines.len();
-	let scroll = total.saturating_sub(outer[0].height as usize) as u16;
+	let width = outer[0].width.max(1) as usize;
+	let total: usize = text
+		.lines
+		.iter()
+		.map(|l| l.width().div_ceil(width).max(1))
+		.sum();
+	let pinned = total.saturating_sub(outer[0].height as usize);
+	let scroll = pinned.saturating_sub(scroll_up) as u16;
 	let para = Paragraph::new(text)
 		.wrap(Wrap { trim: false })
 		.scroll((scroll, 0));
@@ -593,7 +600,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	let res = {
 		let sb = &scrollback;
 		let mut on_round = |toks: &[Tok]| -> bool {
-			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true));
+			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true, 0));
 			drain_input(&cancel, &mut input, 0);
 			!cancel.load(std::sync::atomic::Ordering::Relaxed)
 		};
@@ -608,7 +615,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 			return;
 		}
 	}
-	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false));
+	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false, 0));
 	loop {
 		match event::read() {
 			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
@@ -705,7 +712,7 @@ fn wait_load(
 			}
 		}
 		let _live = term
-			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true));
+			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true, 0));
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -734,7 +741,7 @@ fn run_message(
 			}
 		}
 		let _live =
-			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true));
+			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true, 0));
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -773,8 +780,10 @@ pub fn chat(gguf: &str) {
 		}
 	}
 
+	let mut scroll_up: usize = 0;
 	loop {
-		let _idle = term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false));
+		let _idle =
+			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false, scroll_up));
 		let ev = match event::read() {
 			Ok(e) => e,
 			Err(_e) => break,
@@ -782,6 +791,12 @@ pub fn chat(gguf: &str) {
 		match ev {
 			Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
 				(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => break,
+				(KeyCode::PageUp, _mods) => {
+					scroll_up = scroll_up.saturating_add(10);
+				}
+				(KeyCode::PageDown, _mods) => {
+					scroll_up = scroll_up.saturating_sub(10);
+				}
 				(KeyCode::Esc, _mods) => {
 					let Some(_clear) = Some(()).filter(|_probe| !textarea.lines().join("").trim().is_empty()) else {
 						break;
@@ -789,6 +804,7 @@ pub fn chat(gguf: &str) {
 					textarea = new_input();
 				}
 				(KeyCode::Enter, _mods) => {
+					scroll_up = 0;
 					let joined = textarea.lines().join(" ");
 					let prompt: String = joined
 						.chars()

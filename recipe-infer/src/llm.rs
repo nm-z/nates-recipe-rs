@@ -369,6 +369,7 @@ struct Hparams {
 	mask: usize,
 	bos: u32,
 	eos: u32,
+	eog: Vec<u32>,
 	mask_signal: Option<usize>,
 	key_length: usize,
 	value_length: usize,
@@ -540,6 +541,21 @@ impl Hparams {
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
 		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
 		let mask = uint_kv_or(g, "tokenizer.ggml.mask_token_id", 0)?;
+		let eog = {
+			let mut set = vec![eos];
+			if let Ok(eot) = uint_kv(g, "tokenizer.ggml.eot_token_id") {
+				set.push(eot as u32);
+			}
+			let pieces = g.str_arr("tokenizer.ggml.tokens").unwrap_or_default();
+			for eog_piece in ["<|im_end|>", "<|end|>", "<end_of_turn>", "<|eot_id|>", "<|endoftext|>"] {
+				if let Some(id) = pieces.iter().position(|p| p == eog_piece) {
+					set.push(id as u32);
+				}
+			}
+			set.sort_unstable();
+			set.dedup();
+			set
+		};
 
 		let et = g
 			.tensors
@@ -658,6 +674,7 @@ impl Hparams {
 			mask,
 			bos,
 			eos,
+			eog,
 			win_elems,
 			stage_bytes,
 			mask_signal,
@@ -2393,7 +2410,7 @@ fn decode_causal(
 		if ttft.is_none() {
 			ttft = Some(decode_start.elapsed());
 		}
-		if next == eos {
+		if next == eos || m.hp.eog.contains(&next) {
 			break;
 		}
 		toks.push(next);
