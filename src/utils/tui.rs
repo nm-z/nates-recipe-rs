@@ -288,7 +288,7 @@ struct TermRestore {
 impl TermRestore {
 	fn new() -> Self {
 		let log_path = std::env::var("RECIPE_TUI_LOG")
-			.unwrap_or_else(|_e| "/tmp/recipe-tui.log".to_owned());
+			.unwrap_or_else(|_e| gpu_core::log::log_path().to_owned());
 		let saved_stderr = redirect_stderr(&log_path);
 		drop(ratatui::crossterm::execute!(
 			io::stdout(),
@@ -311,7 +311,7 @@ impl Drop for TermRestore {
 /// Redirects fd 2 to `path` (truncating it), returning a dup of the original fd 2
 /// to restore later, or `-1` if the redirect could not be set up.
 fn redirect_stderr(path: &str) -> i32 {
-	let Ok(file) = OpenOptions::new().create(true).write(true).truncate(true).open(path) else {
+	let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
 		return -1;
 	};
 	return gpu_core::sys::redirect_stderr(&file);

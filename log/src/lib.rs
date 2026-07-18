@@ -77,7 +77,7 @@ pub fn opt() -> Opt {
 /// one (exec'd children and subprocesses land in the same file), otherwise
 /// minted once per process tree from the start timestamp and exported so every
 /// descendant inherits it. One run, one log, regardless of PIDs.
-fn log_path() -> &'static str {
+pub fn log_path() -> &'static str {
 	static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 	return PATH.get_or_init(|| {
 		if let Ok(p) = std::env::var("RECIPE_LOG").map(Some).map(|o| o.filter(|p| !p.is_empty()))
