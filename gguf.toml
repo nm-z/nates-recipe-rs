@@ -16,10 +16,6 @@ mistral-7b-v0.3 = "/home/nate/.lmstudio/models/lmstudio-community/Mistral-7B-Ins
 nemotron3-nano-4b = "/home/nate/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
 phi4-mini-reasoning = "/home/nate/.lmstudio/models/lmstudio-community/Phi-4-mini-reasoning-GGUF/Phi-4-mini-reasoning-Q8_0.gguf"
 
-[mmproj]
-gemma4-e2b-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/gemma-4-E2B-it-GGUF/mmproj-gemma-4-E2B-it-BF16.gguf"
-glm-4.6v-flash-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/GLM-4.6V-Flash-GGUF/mmproj-GLM-4.6V-Flash-F16.gguf"
-ministral3-3b-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/Ministral-3-3B-Instruct-2512-GGUF/mmproj-Ministral-3-3B-Instruct-2512-F16.gguf"
 qwen3-0.6b-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-f16.gguf"
 qwen3-0.6b-bf16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-bf16.gguf"
 qwen3-0.6b-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q8_0.gguf"
@@ -40,6 +36,11 @@ rerank-tiny-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/r
 stories15m-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/tinyllamas/stories15M-q4_0.gguf"
 stories15m-q4_0-debug = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-debug/tinyllamas/stories15M-q4_0.gguf"
 stories-f32-fixture = "/home/nate/Desktop/nates-recipe-rs/recipe-infer/tests/fixtures/stories-f32.gguf"
+
+[mmproj]
+gemma4-e2b-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/gemma-4-E2B-it-GGUF/mmproj-gemma-4-E2B-it-BF16.gguf"
+glm-4.6v-flash-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/GLM-4.6V-Flash-GGUF/mmproj-GLM-4.6V-Flash-F16.gguf"
+ministral3-3b-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/Ministral-3-3B-Instruct-2512-GGUF/mmproj-Ministral-3-3B-Instruct-2512-F16.gguf"
 
 [misc]
 imatrix = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/imatrix.gguf"

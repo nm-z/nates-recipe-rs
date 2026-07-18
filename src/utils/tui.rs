@@ -562,37 +562,49 @@ pub fn model_picker(names: &[String]) -> Option<usize> {
 	}
 }
 
-/// Non-blocking poll for a generation-cancel key (Ctrl-C or Esc). Drains any
-/// pending input events so a cancel during a long generation is seen promptly.
-fn cancel_requested() -> bool {
-	while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-		let Ok(Event::Key(k)) = event::read() else {
-			continue;
-		};
-		if k.kind != KeyEventKind::Press {
-			continue;
+/// The one paste path: CRLF/CR normalized to LF, trailing newlines stripped so a
+/// paste never submits, interior newlines kept as textarea line breaks.
+fn insert_paste(textarea: &mut TextArea, s: &str) {
+	let text = s.replace("\r\n", "\n").replace('\r', "\n");
+	let _ins = textarea.insert_str(text.trim_end_matches('\n'));
+}
+
+/// Non-blocking input drain, waiting up to `wait_ms` for the first event (frame
+/// pacing): Esc or Ctrl-C sets `cancel`, a bracketed paste lands in `textarea`
+/// via [`insert_paste`] so text pasted mid-reply survives into the next message,
+/// and other keys are ignored while a reply streams.
+fn drain_input(cancel: &std::sync::atomic::AtomicBool, textarea: &mut TextArea, wait_ms: u64) {
+	let mut ready = event::poll(std::time::Duration::from_millis(wait_ms)).unwrap_or(false);
+	while ready {
+		match event::read() {
+			Ok(Event::Paste(s)) => insert_paste(textarea, &s),
+			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+				let ctrl_c =
+					k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+				if ctrl_c || k.code == KeyCode::Esc {
+					cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+				}
+			}
+			Ok(_e) => {}
+			Err(_e) => break,
 		}
-		let ctrl_c =
-			k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-		if ctrl_c || k.code == KeyCode::Esc {
-			return true;
-		}
+		ready = event::poll(std::time::Duration::from_millis(0)).unwrap_or(false);
 	}
-	false
 }
 
 pub fn render_once(gguf: &str, prompt: &str) {
 	crate::some_or_die(io::stdin().is_terminal().then_some(()), "render: needs a tty");
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
-	let input = new_input();
+	let mut input = new_input();
 	let mut scrollback: Vec<(String, String)> = Vec::new();
+	let cancel = std::sync::atomic::AtomicBool::new(false);
 	let res = {
 		let sb = &scrollback;
-		let ta = &input;
 		let mut on_round = |toks: &[Tok]| -> bool {
-			let _round = term.draw(|f| render_chat(f, ta, sb, Some(prompt), toks, true));
-			!cancel_requested()
+			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true));
+			drain_input(&cancel, &mut input, 0);
+			!cancel.load(std::sync::atomic::Ordering::Relaxed)
 		};
 		let _first = on_round(&[]);
 		recipe_infer::llm::generate(Path::new(gguf), prompt, &mut on_round)
@@ -681,7 +693,7 @@ fn session_worker(
 /// flag so `ChatSession::open` returns cleanly.
 fn wait_load(
 	term: &mut ratatui::DefaultTerminal,
-	textarea: &TextArea,
+	textarea: &mut TextArea,
 	scrollback: &[(String, String)],
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
@@ -703,16 +715,7 @@ fn wait_load(
 		}
 		let _live = term
 			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true));
-		if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false)
-			&& let Ok(Event::Key(k)) = event::read()
-			&& k.kind == KeyEventKind::Press
-		{
-			let ctrl_c =
-				k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-			if ctrl_c || k.code == KeyCode::Esc {
-				cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-			}
-		}
+		drain_input(cancel, textarea, 50);
 	}
 }
 
@@ -722,7 +725,7 @@ fn wait_load(
 /// message. Returns the worker's reply, or `None` if the worker channel closed.
 fn run_message(
 	term: &mut ratatui::DefaultTerminal,
-	textarea: &TextArea,
+	textarea: &mut TextArea,
 	scrollback: &[(String, String)],
 	prompt: &str,
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
@@ -741,16 +744,7 @@ fn run_message(
 		}
 		let _live =
 			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true));
-		if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false)
-			&& let Ok(Event::Key(k)) = event::read()
-			&& k.kind == KeyEventKind::Press
-		{
-			let ctrl_c =
-				k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-			if ctrl_c || k.code == KeyCode::Esc {
-				cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-			}
-		}
+		drain_input(cancel, textarea, 50);
 	}
 }
 
@@ -768,7 +762,7 @@ pub fn chat(gguf: &str) {
 	let flag = std::sync::Arc::clone(&cancel);
 	let worker = std::thread::spawn(move || session_worker(&gguf_owned, prompt_rx, ev_tx, flag));
 
-	match wait_load(&mut term, &textarea, &scrollback, &ev_rx, &cancel) {
+	match wait_load(&mut term, &mut textarea, &scrollback, &ev_rx, &cancel) {
 		LoadOutcome::Loaded => {}
 		LoadOutcome::Cancelled => {
 			drop(prompt_tx);
@@ -830,7 +824,7 @@ pub fn chat(gguf: &str) {
 					if prompt_tx.send(send).is_err() {
 						break;
 					}
-					match run_message(&mut term, &textarea, &scrollback, &prompt, &ev_rx, &cancel) {
+					match run_message(&mut term, &mut textarea, &scrollback, &prompt, &ev_rx, &cancel) {
 						Some(Ok(resp)) => {
 							let shown = note.map(|n| format!("{n}\n{resp}")).unwrap_or(resp);
 							scrollback.push((prompt, shown));
@@ -844,9 +838,7 @@ pub fn chat(gguf: &str) {
 				}
 			},
 			Event::Key(_k) => {}
-			Event::Paste(s) => {
-				textarea.insert_str(s.replace('\r', "\n"));
-			}
+			Event::Paste(s) => insert_paste(&mut textarea, &s),
 			other => {
 				let _typed = textarea.input(other);
 			}
