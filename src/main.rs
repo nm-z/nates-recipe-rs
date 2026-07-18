@@ -12,26 +12,16 @@ use std::slice;
 use std::time::UNIX_EPOCH;
 
 fn usage(code: i32) -> ! {
-	drop(Write::err(&format!(
+	Write::always(&format!(
 		"recipe {}.{}",
 		env!("CARGO_PKG_VERSION"),
 		env!("GIT_HASH")
-	)));
-	drop(Write::err(
-		"usage: recipe <file.rs> [args]  # compile + run",
 	));
-	drop(Write::err(
-		"       recipe serve            # daemon on 7845",
-	));
-	drop(Write::err(
-		"       recipe peers            # live network view",
-	));
-	drop(Write::err(
-		"       recipe probe            # measure this machine",
-	));
-	drop(Write::err(
-		"       recipe run [name]       # pick a gguf.toml model and chat",
-	));
+	Write::always("usage: recipe <file.rs> [args]  # compile + run");
+	Write::always("       recipe serve            # daemon on 7845");
+	Write::always("       recipe peers            # live network view");
+	Write::always("       recipe probe            # measure this machine");
+	Write::always("       recipe run [name]       # pick a gguf.toml model and chat");
 	process::exit(code);
 }
 
