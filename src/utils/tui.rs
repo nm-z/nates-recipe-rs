@@ -291,11 +291,19 @@ impl TermRestore {
 		let log_path = std::env::var("RECIPE_TUI_LOG")
 			.unwrap_or_else(|_e| "/tmp/recipe-tui.log".to_owned());
 		let saved_stderr = redirect_stderr(&log_path);
+		drop(ratatui::crossterm::execute!(
+			io::stdout(),
+			event::EnableBracketedPaste
+		));
 		Self { saved_stderr }
 	}
 }
 impl Drop for TermRestore {
 	fn drop(&mut self) {
+		drop(ratatui::crossterm::execute!(
+			io::stdout(),
+			event::DisableBracketedPaste
+		));
 		ratatui::restore();
 		if self.saved_stderr >= 0 {
 			// SAFETY: saved_stderr is a live dup of the original fd 2 from redirect_stderr; dup2 restores it and close releases the dup.
@@ -836,6 +844,9 @@ pub fn chat(gguf: &str) {
 				}
 			},
 			Event::Key(_k) => {}
+			Event::Paste(s) => {
+				textarea.insert_str(s.replace('\r', "\n"));
+			}
 			other => {
 				let _typed = textarea.input(other);
 			}
