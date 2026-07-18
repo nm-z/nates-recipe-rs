@@ -108,16 +108,20 @@ pub fn loss_grad_into(
 	Ok(())
 }
 pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
-	let mut parts: Vec<String> = Vec::new();
+	use std::fmt::Write as _;
+	let mut line = String::with_capacity(16 * metrics.len().max(1));
 	for mi in 0..metrics.len().min(vals.len()) {
 		let m = metrics[mi];
 		let Some(_w) = m.fmt().width.checked_sub(1) else {
 			continue;
 		};
 		let num = m.render(vals[mi]);
-		parts.push(format!("{} {num}", m.fmt().label));
+		if !line.is_empty() {
+			line.push_str("  ");
+		}
+		let _ = write!(line, "{} {num}", m.fmt().label);
 	}
-	parts.join("  ")
+	line
 }
 impl ModelInner {
 	pub(crate) fn fit(

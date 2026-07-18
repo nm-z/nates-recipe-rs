@@ -1006,8 +1006,8 @@ struct Model {
 	win: GpuBuffer,
 	store: Waterfall,
 	rbuf: RefCell<Vec<u8>>,
-	norms: Vec<HashMap<&'static str, GpuBuffer>>,
-	norms_b: Vec<HashMap<&'static str, GpuBuffer>>,
+	norms: Vec<[Option<GpuBuffer>; N_NORMS]>,
+	norms_b: Vec<[Option<GpuBuffer>; N_NORMS]>,
 	o_bias: Vec<Option<GpuBuffer>>,
 	/// talkie per-head scalar Q gain, expanded to a full `[nqh*hd]` per-column
 	/// vector so [`gpu_broadcast_mul`] applies each head's scalar over its head_dim.
@@ -1081,22 +1081,68 @@ struct Model {
 	hp: Hparams,
 }
 
-const LAYER_NORMS: [(&str, &str); 12] = [
-	("input", "input_layernorm.weight"),
-	("attn2", "self_attn.attn_norm_2.weight"),
-	("post_attn", "post_attention_layernorm.weight"),
-	("q_norm", "self_attn.q_norm.weight"),
-	("k_norm", "self_attn.k_norm.weight"),
-	("q_a_norm", "self_attn.q_a_norm.weight"),
-	("kv_a_norm", "self_attn.kv_a_norm.weight"),
-	("pre_ff", "pre_feedforward_layernorm.weight"),
-	("pf1", "post_feedforward_layernorm_1.weight"),
-	("pn2", "pre_feedforward_layernorm_2.weight"),
-	("pf2", "post_feedforward_layernorm_2.weight"),
-	("pfw", "post_feedforward_layernorm.weight"),
+/// The per-layer norm slot names, one enum variant per [`LAYER_NORMS`] row; each
+/// layer's norms live in a flat `[Option<GpuBuffer>; N_NORMS]` indexed by
+/// `Nk as usize` (no hashing in the decode loop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Nk {
+	Input,
+	Attn2,
+	PostAttn,
+	QNorm,
+	KNorm,
+	QANorm,
+	KvANorm,
+	PreFf,
+	Pf1,
+	Pn2,
+	Pf2,
+	Pfw,
+}
+
+pub(super) const N_NORMS: usize = 12;
+
+impl Nk {
+	fn name(self) -> &'static str {
+		return match self {
+			Nk::Input => "input",
+			Nk::Attn2 => "attn2",
+			Nk::PostAttn => "post_attn",
+			Nk::QNorm => "q_norm",
+			Nk::KNorm => "k_norm",
+			Nk::QANorm => "q_a_norm",
+			Nk::KvANorm => "kv_a_norm",
+			Nk::PreFf => "pre_ff",
+			Nk::Pf1 => "pf1",
+			Nk::Pn2 => "pn2",
+			Nk::Pf2 => "pf2",
+			Nk::Pfw => "pfw",
+		};
+	}
+}
+
+const LAYER_NORMS: [(Nk, &str); N_NORMS] = [
+	(Nk::Input, "input_layernorm.weight"),
+	(Nk::Attn2, "self_attn.attn_norm_2.weight"),
+	(Nk::PostAttn, "post_attention_layernorm.weight"),
+	(Nk::QNorm, "self_attn.q_norm.weight"),
+	(Nk::KNorm, "self_attn.k_norm.weight"),
+	(Nk::QANorm, "self_attn.q_a_norm.weight"),
+	(Nk::KvANorm, "self_attn.kv_a_norm.weight"),
+	(Nk::PreFf, "pre_feedforward_layernorm.weight"),
+	(Nk::Pf1, "post_feedforward_layernorm_1.weight"),
+	(Nk::Pn2, "pre_feedforward_layernorm_2.weight"),
+	(Nk::Pf2, "post_feedforward_layernorm_2.weight"),
+	(Nk::Pfw, "post_feedforward_layernorm.weight"),
 ];
 
 impl Model {
+	fn norm(&self, l: usize, k: Nk) -> Result<&GpuBuffer> {
+		return self.norms[l][k as usize]
+			.as_ref()
+			.ok_or_else(|| anyhow!("{}: layer {l} has no {:?} norm weight", self.hp.arch, k.name()));
+	}
+
 	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
 		let (bb, be) = crate::dequant::block_layout(t.gt)?;
 		anyhow::ensure!(
@@ -1686,23 +1732,23 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		Write::line(data, format!("norms layer {}/{}", l + 1, nl));
 		beat();
 		let p = |n: &str| format!("model.decoder.layers.{l}.{n}");
-		let mut nm = HashMap::new();
-		let mut nmb = HashMap::new();
+		let mut nm: [Option<GpuBuffer>; N_NORMS] = std::array::from_fn(|_| None);
+		let mut nmb: [Option<GpuBuffer>; N_NORMS] = std::array::from_fn(|_| None);
 		for (key, suffix) in LAYER_NORMS {
 			if m.big.contains_key(&p(suffix)) {
-				nm.insert(key, upload_gamma(&m.small_f64(&p(suffix))?, plus_one)?);
+				nm[key as usize] = Some(upload_gamma(&m.small_f64(&p(suffix))?, plus_one)?);
 			}
 			let bname = p(&suffix.replace(".weight", ".bias"));
 			if m.big.contains_key(&bname) {
 				let vals = m.small_f64(&bname)?;
 				let ub = falloc(vals.len())?;
 				ub.load(&vals)?;
-				nmb.insert(key, ub);
+				nmb[key as usize] = Some(ub);
 			}
 		}
-		if !nm.contains_key("pre_ff") && m.big.contains_key(&p("post_attention_layernorm.weight")) {
+		if nm[Nk::PreFf as usize].is_none() && m.big.contains_key(&p("post_attention_layernorm.weight")) {
 			let g = upload_gamma(&m.small_f64(&p("post_attention_layernorm.weight"))?, plus_one)?;
-			nm.insert("pre_ff", g);
+			nm[Nk::PreFf as usize] = Some(g);
 		}
 		m.norms.push(nm);
 		m.norms_b.push(nmb);
@@ -2058,7 +2104,6 @@ fn layer(
 	let nqh = hp.nqh;
 	let nexp = hp.nexp;
 	let used = hp.used;
-	let nm = &m.norms[l];
 	let d = &hp.dims[l];
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
 	let theta = if d.sliding {
@@ -2067,7 +2112,7 @@ fn layer(
 		&m.theta_full
 	};
 	let _ta = Instant::now();
-	gpu_rmsnorm_f64(h_in, &nm["input"], &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, m.norm(l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(
 		&ar.x,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
@@ -2090,8 +2135,8 @@ fn layer(
 	} else {
 		gpu_gemm_bt_f64(&ar.x, &wk, t, kd, ne, &ar.v)?;
 	}
-	gpu_rmsnorm_f64(&ar.q, &nm["q_norm"], &m.eps, t * nqh, hd, &ar.q)?;
-	gpu_rmsnorm_f64(&ar.k, &nm["k_norm"], &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_rmsnorm_f64(&ar.q, m.norm(l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
+	gpu_rmsnorm_f64(&ar.k, m.norm(l, Nk::KNorm)?, &m.eps, t * nkv, hd, &ar.k)?;
 	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
 	gpu_rope_partial(theta, t * nqh, hd, d.rotary, nqh, &ar.q)?;
 	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
@@ -2104,12 +2149,12 @@ fn layer(
 		qd,
 		&ar.o,
 	)?;
-	gpu_rmsnorm_f64(&ar.o, &nm["post_attn"], &m.eps, t, ne, &ar.o)?;
+	gpu_rmsnorm_f64(&ar.o, m.norm(l, Nk::PostAttn)?, &m.eps, t, ne, &ar.o)?;
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
 	acc(&ATTN_NS, _ta);
 
 	let _tm = Instant::now();
-	gpu_rmsnorm_f64(&ar.attn_out, &nm["pre_ff"], &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, m.norm(l, Nk::PreFf)?, &m.eps, t, ne, &ar.cms)?;
 	gpu_gemm_bt_f64(
 		&ar.cms,
 		&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
@@ -2135,11 +2180,11 @@ fn layer(
 		nff,
 		&ar.mlp0,
 	)?;
-	gpu_rmsnorm_f64(&ar.mlp0, &nm["pf1"], &m.eps, t, ne, &ar.mlp)?;
+	gpu_rmsnorm_f64(&ar.mlp0, m.norm(l, Nk::Pf1)?, &m.eps, t, ne, &ar.mlp)?;
 	acc(&MLP_NS, _tm);
 
 	let _tmoe = Instant::now();
-	gpu_rmsnorm_f64(&ar.attn_out, &nm["pn2"], &m.eps, t, ne, &ar.cmoes)?;
+	gpu_rmsnorm_f64(&ar.attn_out, m.norm(l, Nk::Pn2)?, &m.eps, t, ne, &ar.cmoes)?;
 	let _rt = Instant::now();
 	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
 	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
@@ -2198,11 +2243,11 @@ fn layer(
 		}
 	}
 	ar.mo.load(&mo_host)?;
-	gpu_rmsnorm_f64(&ar.mo, &nm["pf2"], &m.eps, t, ne, &ar.mop)?;
+	gpu_rmsnorm_f64(&ar.mo, m.norm(l, Nk::Pf2)?, &m.eps, t, ne, &ar.mop)?;
 	acc(&MOE_NS, _tmoe);
 
 	gpu_add_into(&ar.mlp, &ar.mop, t * ne, &ar.comb)?;
-	gpu_rmsnorm_f64(&ar.comb, &nm["pfw"], &m.eps, t, ne, &ar.comb)?;
+	gpu_rmsnorm_f64(&ar.comb, m.norm(l, Nk::Pfw)?, &m.eps, t, ne, &ar.comb)?;
 	gpu_add_into(&ar.attn_out, &ar.comb, t * ne, h_out)?;
 	gpu_scale_f64_inplace(&m.ls_dev[l], t * ne, h_out)?;
 	Ok(())
@@ -2214,9 +2259,25 @@ fn layer_name(l: usize, suffix: &str) -> String {
 
 fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec<f64>> {
 	let hp = &m.hp;
-	let _tl = Instant::now();
 	let mut logits = vec![0.0f64; ncanvas * hp.vocab];
 	let mut out_host = vec![0.0f64; ncanvas * hp.lm_chunk];
+	lm_head_into(m, hfs, ncanvas, ar, &mut logits, &mut out_host)?;
+	Ok(logits)
+}
+
+/// Allocation-free LM head: chunked vocab GEMM writing into caller-owned
+/// `logits`/`out_host` scratch, so the per-token decode loop reuses one pair of
+/// host buffers for the whole generation (AllocGuard spirit).
+fn lm_head_into(
+	m: &Model,
+	hfs: &GpuBuffer,
+	ncanvas: usize,
+	ar: &Arena,
+	logits: &mut [f64],
+	out_host: &mut [f64],
+) -> Result<()> {
+	let hp = &m.hp;
+	let _tl = Instant::now();
 	let mut c0 = 0;
 	while c0 < hp.vocab {
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
@@ -2249,7 +2310,7 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 		}
 	}
 	acc(&LM_NS, _tl);
-	Ok(logits)
+	Ok(())
 }
 
 
@@ -2283,10 +2344,13 @@ fn decode_causal(
 	let mut out_ids: Vec<u32> = Vec::new();
 	let decode_start = Instant::now();
 	let mut ttft: Option<Duration> = None;
+	let mut base_all = vec![0.0f64; t_max * ne];
+	let mut logits = vec![0.0f64; m.hp.vocab];
+	let mut lm_scratch = vec![0.0f64; m.hp.lm_chunk];
 	for _new in 0..max_new {
 		let cur = toks.len();
 		let scale = models::embedding_scale(m);
-		let mut base = vec![0.0f64; cur * ne];
+		let base = &mut base_all[..cur * ne];
 		for (p, &tk) in toks.iter().enumerate() {
 			let b = tk as usize * ne * 2;
 			for x in 0..ne {
@@ -2294,9 +2358,9 @@ fn decode_causal(
 					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
 			}
 		}
-		add_pos_embd(m, &mut base, 0, cur, ne);
+		add_pos_embd(m, base, 0, cur, ne);
 		let h0 = ar.ha.view(0, cur * ne);
-		h0.load(&base)?;
+		h0.load(base)?;
 		if let Some((g, b)) = &m.embed_norm {
 			gpu_layernorm_into(&h0, g, b, &m.eps, cur, ne, &h0)?;
 		}
@@ -2309,7 +2373,7 @@ fn decode_causal(
 		let last = cur - 1;
 		let last_h = src.view(last * ne, ne);
 		models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
-		let logits = lm_head(m, &ar.hfs, 1, &ar)?;
+		lm_head_into(m, &ar.hfs, 1, &ar, &mut logits, &mut lm_scratch)?;
 		let lsc = models::logit_scale(m);
 		let mut best = 0usize;
 		let mut bv = f64::MIN;

@@ -111,7 +111,7 @@ impl Machine {
 		let job = gpu_core::gate::Lease::new();
 		let ngpu = gpu_core::hip::device_count().unwrap_or(0).max(0) as usize;
 		let mut gpus = Vec::with_capacity(ngpu);
-		for d in 0..ngpu as i32 {
+		for d in 0..i32::try_from(ngpu)? {
 			let base = format!("measuring.{host}.GPU{d}");
 			drop(g.add("", &base));
 			Write::block(probe, &g.section(&base));

@@ -4,7 +4,7 @@
 //! which compose the shared `gpu_*` kernels 1:1 with the arch's `llama.cpp`
 //! `build_arch_graph`. Recurrent families spell out their own composition.
 
-use super::super::{Arena, Model, layer_name, softmax};
+use super::super::{Arena, Model, Nk, layer_name, softmax};
 use anyhow::{Result, anyhow};
 use gpu_core::infer_ops::{
 	gpu_gemm_bt_f64, gpu_glu_silu, gpu_gqa_attn, gpu_mla_attn, gpu_rmsnorm_f64,
@@ -284,10 +284,10 @@ pub(super) struct Hy {
 
 /// The named norm weight for layer `l`, or an error carrying the arch and the
 /// missing key (a mapping gap must fail that model's row, never panic a sweep).
-fn norm_of<'m>(m: &'m Model, l: usize, key: &str) -> Result<&'m GpuBuffer> {
-	m.norms[l]
-		.get(key)
-		.ok_or_else(|| anyhow!("{}: layer {l} has no {key:?} norm weight", m.hp.arch))
+fn norm_of<'m>(m: &'m Model, l: usize, key: Nk) -> Result<&'m GpuBuffer> {
+	m.norms[l][key as usize]
+		.as_ref()
+		.ok_or_else(|| anyhow!("{}: layer {l} has no {:?} norm weight", m.hp.arch, key.name()))
 }
 
 /// The one norm primitive every arch composes from, mirroring llama.cpp
@@ -323,7 +323,7 @@ fn blk_norm(
 	m: &Model,
 	sp: &Spec,
 	l: usize,
-	key: &str,
+	key: Nk,
 	rows: usize,
 	cols: usize,
 	x: &GpuBuffer,
@@ -334,7 +334,7 @@ fn blk_norm(
 	} else {
 		Some(norm_of(m, l, key)?)
 	};
-	let beta = m.norms_b[l].get(key);
+	let beta = m.norms_b[l][key as usize].as_ref();
 	return apply_norm(sp.norm, gamma, beta, &m.eps, rows, cols, x, out);
 }
 
@@ -364,9 +364,9 @@ fn attn_block(
 		&m.theta_full
 	};
 	let attn_src: &GpuBuffer = if sp.pre_norm {
-		blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
-		if sp.second_attn_norm && m.norms[l].contains_key("attn2") {
-			blk_norm(m, sp, l, "attn2", t, ne, h_in, &ar.cms)?;
+		blk_norm(m, sp, l, Nk::Input, t, ne, h_in, &ar.x)?;
+		if sp.second_attn_norm && m.norms[l][Nk::Attn2 as usize].is_some() {
+			blk_norm(m, sp, l, Nk::Attn2, t, ne, h_in, &ar.cms)?;
 			&ar.cms
 		} else {
 			&ar.x
@@ -395,8 +395,8 @@ fn attn_block(
 	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2/lfm2/talkie regress with them, finding 20), so attn_bias stays a no-op
 	let _ = sp.attn_bias;
 	if sp.qk_norm {
-		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
-		gpu_rmsnorm_f64(&ar.k, norm_of(m, l, "k_norm")?, &m.eps, t * nkv, hd, &ar.k)?;
+		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
+		gpu_rmsnorm_f64(&ar.k, norm_of(m, l, Nk::KNorm)?, &m.eps, t * nkv, hd, &ar.k)?;
 	}
 	if sp.rope {
 		gpu_rope_partial(theta, t * nqh, hd, hd, nqh, &ar.q)?;
@@ -420,7 +420,7 @@ fn attn_block(
 		}
 	}
 	if sp.post_attn {
-		gpu_rmsnorm_f64(&ar.o, norm_of(m, l, "post_attn")?, &m.eps, t, ne, &ar.o)?;
+		gpu_rmsnorm_f64(&ar.o, norm_of(m, l, Nk::PostAttn)?, &m.eps, t, ne, &ar.o)?;
 	}
 	if sp.residual_scale {
 		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.o)?;
@@ -449,9 +449,9 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
 	let nope = hdk - rot;
 	let theta = &m.theta_full;
-	blk_norm(m, sp, l, "input", t, ne, h_in, &ar.x)?;
+	blk_norm(m, sp, l, Nk::Input, t, ne, h_in, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
-	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, "q_a_norm")?, &m.eps, t, qlr, &ar.mqa)?;
+	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, Nk::QANorm)?, &m.eps, t, qlr, &ar.mqa)?;
 	gpu_gemm_bt_f64(&ar.mqa, &m.stream(&layer_name(l, "self_attn.q_b_proj.weight"))?, t, nqh * hdk, qlr, &ar.mqb)?;
 	// RoPE the tail rope sub-dim of every head in place (view at the nope offset).
 	let qpe_view = ar.mqb.view(nope, t * nqh * hdk - nope);
@@ -463,7 +463,7 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
 	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
 	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
-	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, Nk::KvANorm)?, &m.eps, t, kvlr, &ar.mkc)?;
 	gpu_rope_partial(theta, t, rot, rot, 1, &ar.mkp)?;
 	gpu_concat_into(&ar.mkc, &ar.mkp, t, kvlr, rot, &ar.mkk)?;
 	gpu_scale_f64_inplace(&m.attn_scale_mla, t * (kvlr + rot), &ar.mqc)?;
@@ -523,15 +523,15 @@ pub(super) fn layer_minicpm3(
 	}
 	let theta = &m.theta_full;
 	let factors = m.rope_factors.as_ref();
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
-	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, "q_a_norm")?, &m.eps, t, qlr, &ar.mqa)?;
+	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, Nk::QANorm)?, &m.eps, t, qlr, &ar.mqa)?;
 	gpu_gemm_bt_f64(&ar.mqa, &m.stream(&layer_name(l, "self_attn.q_b_proj.weight"))?, t, nqh * hdk, qlr, &ar.mqb)?;
 	rope_maybe_factors(theta, factors, t * nqh, hdk, rot, nqh, &ar.mqb)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
 	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
 	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
-	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, Nk::KvANorm)?, &m.eps, t, kvlr, &ar.mkc)?;
 	rope_maybe_factors(theta, factors, t, rot, rot, 1, &ar.mkp)?;
 	gpu_gemm_bt_f64(&ar.mkc, &m.stream(&layer_name(l, "self_attn.kv_b_proj.weight"))?, t, nqh * hdv, kvlr, &ar.v)?;
 	gpu_copy_into(&ar.mkp, t * rot, &ar.k)?;
@@ -544,7 +544,7 @@ pub(super) fn layer_minicpm3(
 	gpu_gemm_bt_f64(&ar.attn, &m.stream(&layer_name(l, "self_attn.o_proj.weight"))?, t, ne, nqh * hdv, &ar.o)?;
 	gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.o)?;
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, Nk::PreFf)?, &m.eps, t, ne, &ar.cms)?;
 	ffn(m, l, sp, t, ar, &ar.cms)?;
 	gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
@@ -570,12 +570,12 @@ pub(super) fn layer_spec(
 	} else if !sp.pre_norm {
 		&ar.attn_out
 	} else {
-		blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
+		blk_norm(m, sp, l, Nk::PreFf, t, ne, &ar.attn_out, &ar.cms)?;
 		&ar.cms
 	};
 	ffn(m, l, sp, t, ar, ffn_in)?;
 	if sp.post_ffn {
-		gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
+		gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, Nk::Pfw)?, &m.eps, t, ne, &ar.mlp0)?;
 	}
 	if sp.residual_scale {
 		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
@@ -717,7 +717,7 @@ pub(super) fn layer_moe(
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	attn_block(m, l, sp, h_in, t, ar, attn_scale)?;
-	blk_norm(m, sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
+	blk_norm(m, sp, l, Nk::PreFf, t, ne, &ar.attn_out, &ar.cms)?;
 	moe_core(m, l, &ar.cms, t, ar, false, None)?;
 	if sp.residual_scale {
 		gpu_scale_f64_inplace(&m.res_scale, t * ne, &ar.mlp0)?;
@@ -748,7 +748,7 @@ pub(super) fn layer_recurrent(
 	let nqh = d.nqh;
 	let kd = d.nkv * d.hd;
 	let qd = nqh * d.hd;
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(
 		&ar.x,
 		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
@@ -784,7 +784,7 @@ pub(super) fn layer_recurrent(
 		&ar.o,
 	)?;
 	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, "pre_ff")?, &m.eps, t, ne, &ar.cms)?;
+	gpu_rmsnorm_f64(&ar.attn_out, norm_of(m, l, Nk::PreFf)?, &m.eps, t, ne, &ar.cms)?;
 	ffn(m, l, &Spec::dense(Ffn::SiluGate), t, ar, &ar.cms)?;
 	gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 	Ok(())
@@ -852,7 +852,7 @@ fn mamba1_mix(
 		));
 	}
 
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 
 	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, di * ne), t, di, ne, &ar.ss_x)?;
@@ -944,7 +944,7 @@ fn mamba2_mix(
 		return Err(anyhow!("{arch}: mamba-2 d_inner={di} not divisible by n_group={ng}"));
 	}
 
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 
 	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, di * ne), t, di, ne, &ar.ss_z)?;
@@ -1026,7 +1026,7 @@ fn plamo2_mix(
 	let bcd = dtd + 2 * ds;
 	let conv_dim = di + 2 * ds;
 
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 
 	let w_in = m.stream(&layer_name(l, "self_attn.ssm_in.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &w_in, t, 2 * di, ne, &ar.ss_zx)?;
@@ -1085,14 +1085,14 @@ fn plamo2_attn(
 	let d = &hp.dims[l];
 	let nqh = d.nqh;
 	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, qd, ne, &ar.q)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, ne, &ar.v)?;
 	gpu_rmsnorm_f64_nogamma(&ar.q, &m.eps, t * nqh, hd, &ar.q)?;
-	gpu_broadcast_mul(&ar.q, norm_of(m, l, "q_norm")?, t * qd, qd, &ar.q)?;
+	gpu_broadcast_mul(&ar.q, norm_of(m, l, Nk::QNorm)?, t * qd, qd, &ar.q)?;
 	gpu_rmsnorm_f64_nogamma(&ar.k, &m.eps, t * nkv, hd, &ar.k)?;
-	gpu_broadcast_mul(&ar.k, norm_of(m, l, "k_norm")?, t * kd, kd, &ar.k)?;
+	gpu_broadcast_mul(&ar.k, norm_of(m, l, Nk::KNorm)?, t * kd, kd, &ar.k)?;
 	gpu_rope_partial(&m.theta_full, t * nqh, hd, hd, nqh, &ar.q)?;
 	gpu_rope_partial(&m.theta_full, t * nkv, hd, hd, nkv, &ar.k)?;
 	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
@@ -1145,7 +1145,7 @@ fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: us
 	let ne = hp.ne;
 	let (d, hk, hv, key_dim, value_dim, conv_dim) = delta_dims(m);
 	let dc = hp.ssm_d_conv;
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.qkv_proj.weight"))?, t, conv_dim, ne, &ar.d_qkv)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.z_gate.weight"))?, t, value_dim, ne, &ar.d_z)?;
 	if m.big.contains_key(&layer_name(l, "self_attn.ssm_ba.weight")) {
@@ -1188,7 +1188,7 @@ fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar:
 	let (d, h) = (hp.kda_head_dim, hp.kda_n_head);
 	let di = d * h;
 	let dc = hp.ssm_d_conv;
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	let qcw = ssm_of(&m.ssm_q_conv_w, l, arch, "q_conv.weight")?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, di, ne, &ar.d_qkv)?;
 	gpu_ssm_conv_causal_silu(&ar.d_qkv, qcw, None, t, di, dc, &ar.d_q)?;
@@ -1237,14 +1237,14 @@ fn delta_full_attn(
 	let dd = &hp.dims[l];
 	let (nqh, hd, nkv) = (dd.nqh, dd.hd, dd.nkv);
 	let (qd, kd) = (nqh * hd, nkv * hd);
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, 2 * qd, ne, &ar.d_qkv)?;
 	deinterleave_heads(&ar.d_qkv, t, hd, nqh, 0, &ar.q, &ar.d_q, &ar.d_k)?;
 	deinterleave_heads(&ar.d_qkv, t, hd, nqh, hd, &ar.d_z, &ar.d_q, &ar.d_k)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.k_proj.weight"))?, t, kd, ne, &ar.k)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.v_proj.weight"))?, t, kd, ne, &ar.v)?;
-	gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;
-	gpu_rmsnorm_f64(&ar.k, norm_of(m, l, "k_norm")?, &m.eps, t * nkv, hd, &ar.k)?;
+	gpu_rmsnorm_f64(&ar.q, norm_of(m, l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
+	gpu_rmsnorm_f64(&ar.k, norm_of(m, l, Nk::KNorm)?, &m.eps, t * nkv, hd, &ar.k)?;
 	gpu_rope_partial(&m.theta_full, t * nqh, hd, hd, nqh, &ar.q)?;
 	gpu_rope_partial(&m.theta_full, t * nkv, hd, hd, nkv, &ar.k)?;
 	gpu_scale_f64_inplace(attn_scale, t * qd, &ar.q)?;
@@ -1271,7 +1271,7 @@ fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usiz
 	let (kvlr, rot) = (hp.kv_lora_rank, hp.n_rot);
 	let (hdk, hdv) = (hp.head_k_mla, hp.head_v_mla);
 	let nope = hdk - rot;
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_proj.weight"))?, t, nqh * hdk, ne, &ar.mqb)?;
 	gpu_slice_lead_into(&ar.mqb, t * nqh, hdk, nope, &ar.mqn)?;
 	gpu_slice_cols(&ar.mqb, t * nqh, hdk, nope, rot, &ar.mqp)?;
@@ -1280,7 +1280,7 @@ fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usiz
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.kv_a_proj.weight"))?, t, kvlr + rot, ne, &ar.mkv)?;
 	gpu_slice_lead_into(&ar.mkv, t, kvlr + rot, kvlr, &ar.mkc)?;
 	gpu_slice_cols(&ar.mkv, t, kvlr + rot, kvlr, rot, &ar.mkp)?;
-	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, "kv_a_norm")?, &m.eps, t, kvlr, &ar.mkc)?;
+	gpu_rmsnorm_f64(&ar.mkc, norm_of(m, l, Nk::KvANorm)?, &m.eps, t, kvlr, &ar.mkc)?;
 	gpu_concat_into(&ar.mkc, &ar.mkp, t, kvlr, rot, &ar.mkk)?;
 	gpu_scale_f64_inplace(&m.attn_scale_mla, t * (kvlr + rot), &ar.mqc)?;
 	gpu_mla_attn(&ar.mqc, &ar.mkk, &ar.mkc, t, nqh, 1, kvlr + rot, kvlr, t, &ar.mrw)?;
@@ -1400,7 +1400,7 @@ fn delta_ffn(
 	ar: &Arena,
 ) -> Result<()> {
 	let ne = m.hp.ne;
-	blk_norm(m, sp, l, "pre_ff", t, ne, resid, &ar.cms)?;
+	blk_norm(m, sp, l, Nk::PreFf, t, ne, resid, &ar.cms)?;
 	if m.layer_is_moe(l) {
 		let sigmoid = m.exp_probs_b[l].is_some();
 		moe_core(m, l, &ar.cms, t, ar, sigmoid, m.exp_probs_b[l].as_ref())?;
@@ -1429,7 +1429,7 @@ fn hybrid_ffn(
 	m: &Model,
 	l: usize,
 	sp: &Spec,
-	norm_key: &str,
+	norm_key: Nk,
 	src: &GpuBuffer,
 	resid: &GpuBuffer,
 	h_out: &GpuBuffer,
@@ -1464,7 +1464,7 @@ fn layer_is_shortconv(m: &Model, l: usize) -> bool {
 fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
 	let ne = m.hp.ne;
 	let lc = m.hp.shortconv_l_cache;
-	gpu_rmsnorm_f64(h_in, norm_of(m, l, "input")?, &m.eps, t, ne, &ar.x)?;
+	gpu_rmsnorm_f64(h_in, norm_of(m, l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
 	let w_in = m.stream(&layer_name(l, "self_attn.shortconv_in_proj.weight"))?;
 	gpu_gemm_bt_f64(&ar.x, &w_in.view(0, ne * ne), t, ne, ne, &ar.q)?;
 	gpu_gemm_bt_f64(&ar.x, &w_in.view(ne * ne, ne * ne), t, ne, ne, &ar.k)?;
@@ -1507,7 +1507,7 @@ pub(super) fn layer_hybrid(
 			attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
 			mamba2_mix(m, l, h_in, &ar.o, t, ar)?;
 			gpu_add_into(&ar.attn_out, &ar.o, t * ne, &ar.mlp)?;
-			hybrid_ffn(m, l, &hy.sp, "pre_ff", &ar.mlp, &ar.mlp, h_out, t, ar)?;
+			hybrid_ffn(m, l, &hy.sp, Nk::PreFf, &ar.mlp, &ar.mlp, h_out, t, ar)?;
 		}
 		HyMode::MixerFfn => {
 			if layer_is_recur(m, l) {
@@ -1516,7 +1516,7 @@ pub(super) fn layer_hybrid(
 			} else {
 				attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
 			}
-			hybrid_ffn(m, l, &hy.sp, "pre_ff", &ar.attn_out, &ar.attn_out, h_out, t, ar)?;
+			hybrid_ffn(m, l, &hy.sp, Nk::PreFf, &ar.attn_out, &ar.attn_out, h_out, t, ar)?;
 		}
 		HyMode::Triage => {
 			if layer_is_recur(m, l) {
@@ -1526,7 +1526,7 @@ pub(super) fn layer_hybrid(
 				attn_block(m, l, &hy.sp, h_in, t, ar, attn_scale)?;
 				gpu_copy_into(&ar.attn_out, t * ne, h_out)?;
 			} else {
-				hybrid_ffn(m, l, &hy.sp, "input", h_in, h_in, h_out, t, ar)?;
+				hybrid_ffn(m, l, &hy.sp, Nk::Input, h_in, h_in, h_out, t, ar)?;
 			}
 		}
 		HyMode::Sandwich => {
@@ -1535,11 +1535,11 @@ pub(super) fn layer_hybrid(
 			} else {
 				plamo2_attn(m, l, h_in, &ar.o, t, ar, attn_scale)?;
 			}
-			gpu_rmsnorm_f64(&ar.o, norm_of(m, l, "post_attn")?, &m.eps, t, ne, &ar.o)?;
+			gpu_rmsnorm_f64(&ar.o, norm_of(m, l, Nk::PostAttn)?, &m.eps, t, ne, &ar.o)?;
 			gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-			blk_norm(m, &hy.sp, l, "pre_ff", t, ne, &ar.attn_out, &ar.cms)?;
+			blk_norm(m, &hy.sp, l, Nk::PreFf, t, ne, &ar.attn_out, &ar.cms)?;
 			ffn(m, l, &hy.sp, t, ar, &ar.cms)?;
-			gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, "pfw")?, &m.eps, t, ne, &ar.mlp0)?;
+			gpu_rmsnorm_f64(&ar.mlp0, norm_of(m, l, Nk::Pfw)?, &m.eps, t, ne, &ar.mlp0)?;
 			gpu_add_into(&ar.mlp0, &ar.attn_out, t * ne, h_out)?;
 		}
 		HyMode::DeltaNet => {

@@ -46,6 +46,9 @@ pub struct Waterfall {
 	ram_bytes: usize,
 	/// Running total of bytes spilled to disk.
 	disk_bytes: usize,
+	/// Reusable host bounce buffer for VRAM placements, grown to the largest
+	/// blob seen so load-time settle stops mallocing a fresh vec per blob.
+	stage: Vec<u8>,
 }
 
 /// Reads `MemAvailable` from `/proc/meminfo` in bytes, or `usize::MAX` if unreadable.
@@ -90,6 +93,7 @@ impl Waterfall {
 			vram_bytes: 0,
 			ram_bytes: 0,
 			disk_bytes: 0,
+			stage: Vec::new(),
 		};
 	}
 
@@ -145,9 +149,13 @@ impl Waterfall {
 				let _t = tag_scope("waterfall");
 				let view = GpuBuffer::alloc_bytes(len)
 					.map_err(|e| return Error::other(format!("carve: {e}")))?;
-				let mut host = vec![0u8; len];
-				fill(&mut host)?;
-				view.write_u8(&host)
+				if self.stage.len() < len {
+					self.stage.resize(len, 0);
+				}
+				let host = &mut self.stage[..len];
+				host.fill(0);
+				fill(host)?;
+				view.write_u8(host)
 					.map_err(|e| return Error::other(format!("waterfall H2D: {e}")))?;
 				return Ok(Home::Vram(view));
 			}
