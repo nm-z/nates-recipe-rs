@@ -109,7 +109,8 @@ fn measure(model_key: &str, gen_tokens: usize, tag: &str) {
 	let prompt = long_prompt(&gguf).expect("build >=2k-token prompt");
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
-		.expect("session open cancelled");
+		.session()
+		.expect("session cancelled");
 	let mut generated = 0usize;
 	let wall = Instant::now();
 	let summary = session

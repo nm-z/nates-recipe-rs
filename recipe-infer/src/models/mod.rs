@@ -316,36 +316,20 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 /// bit-identical to the pre-cache behavior.
 #[derive(Clone, Copy)]
 pub(super) struct DecCtx<'a> {
+	/// Rows already cached; the new rows sit at absolute positions `cached..`.
 	pub(super) cached: usize,
-	pub(super) kc: &'a GpuBuffer,
-	pub(super) vc: &'a GpuBuffer,
-	pub(super) rec: Option<&'a GpuBuffer>,
-	pub(super) conv_in: &'a [GpuBuffer],
-	pub(super) conv_out: &'a [GpuBuffer],
-	/// Present only once this layer's K/V cache has spilled past the VRAM window
-	/// (`win_base > 0`): attention then walks the whole causal range in window-sized
-	/// segments, staging the host-tier rows back in and carrying softmax state across
-	/// launches. Absent = the cache still fits the window, so attention is one
-	/// null-carry launch over `kc`/`vc` (bit-identical to the pre-spill path).
-	pub(super) spill: Option<SpillCtx<'a>>,
-}
-
-/// What a spilled attention layer needs from the cache: `win` is the resident VRAM
-/// `win_base` is the absolute row now at window offset 0 and `hk`/`hv` the byte
-/// mirror of the evicted rows `[0, win_base)` (RAM pool then disk). `sk`/`sv` are
-/// the cache-owned double-buffered staging windows, carved at cache-open from the
-/// claim remainder after weights and the resident window, each holding `rows`
-/// (one full window) of the widest layer's K/V — so host readback is
-/// window-granular regardless of this step's decode width. Query-side carry
-/// buffers stay in the per-step [`Arena`].
-#[derive(Clone, Copy)]
-pub(super) struct SpillCtx<'a> {
+	/// The absolute row at window offset 0 (`> 0` iff rows have been evicted to
+	/// the host tier), and the window capacity in rows. Attention ALWAYS walks
+	/// host segments `[0, win_base)` then the resident window — a fully-resident
+	/// cache is the `win_base == 0` case of the same walk (the loop body never
+	/// runs), not a second path.
 	pub(super) win_base: usize,
-	pub(super) hk: &'a HostStore,
-	pub(super) hv: &'a HostStore,
-	pub(super) sk: &'a [GpuBuffer; 2],
-	pub(super) sv: &'a [GpuBuffer; 2],
-	pub(super) rows: usize,
+	pub(super) win: usize,
+	/// This layer's cached state — the variant carries exactly what the layer's
+	/// mixer needs (K/V rows + host stores, scan state, conv windows).
+	pub(super) state: &'a crate::llm::LayerCache,
+	/// The cache's double-buffered host-readback staging windows.
+	pub(super) stage: &'a crate::llm::KvStage,
 }
 
 /// The [`Comp`] composition entry for `arch`, or `None` if unlisted.

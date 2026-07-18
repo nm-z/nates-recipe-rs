@@ -66,21 +66,6 @@ pub fn arch_supported(arch: &str) -> bool {
 	models::verified(arch)
 }
 
-/// Defuses to a released device arena if `Headless::open` fails partway: the
-/// claim must never leak, or the next open in the same process aborts.
-struct ArenaClaim(Option<Waterfall>);
-
-impl Drop for ArenaClaim {
-	fn drop(&mut self) {
-		let Some(mut w) = self.0.take() else {
-			return;
-		};
-		if let Some(slab) = w.take_slab() {
-			gpu_core::memory::release_device_arena(slab);
-		}
-	}
-}
-
 /// A loaded headless model for reference validation: claims a fixed 2 GB
 /// device arena at open (no VRAM-probe re-exec; intended for small models) and
 /// releases it on drop, so sequential opens in one process are valid. One
@@ -98,22 +83,31 @@ impl Headless {
 		let want = (2usize << 30) & !((1 << 21) - 1);
 		let slab =
 			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
-		let mut guard = ArenaClaim(Some(Waterfall::from_arena(slab)));
-		let m = load_model_gguf(gguf)?;
-		anyhow::ensure!(
-			models::supported(&m.hp.arch),
-			"headless: unsupported architecture {:?}",
-			m.hp.arch
-		);
-		let ar = Arena::new(&m.hp, cap)?;
-		let attn_scale = {
-			let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
-			let ub = falloc(1)?;
-			ub.load(&[1.0 / (hd as f64).sqrt()])?;
-			ub
-		};
-		let Some(claim) = guard.0.take() else {
-			bail!("headless: claim guard empty");
+		let mut claim = Waterfall::from_arena(slab);
+		let prep = (|| -> Result<(Model, Arena, GpuBuffer)> {
+			let m = load_model_gguf(gguf)?;
+			anyhow::ensure!(
+				models::supported(&m.hp.arch),
+				"headless: unsupported architecture {:?}",
+				m.hp.arch
+			);
+			let ar = Arena::new(&m.hp, cap)?;
+			let attn_scale = {
+				let hd = m.hp.dims.first().map_or(m.hp.key_length, |d| d.hd);
+				let ub = falloc(1)?;
+				ub.load(&[1.0 / (hd as f64).sqrt()])?;
+				ub
+			};
+			return Ok((m, ar, attn_scale));
+		})();
+		let (m, ar, attn_scale) = match prep {
+			Ok(v) => v,
+			Err(e) => {
+				if let Some(slab) = claim.take_slab() {
+					gpu_core::memory::release_device_arena(slab);
+				}
+				return Err(e);
+			}
 		};
 		let mut h = Self { m, ar, attn_scale };
 		fill_store(&mut h.m, claim, &mut || false)?;
@@ -2339,42 +2333,94 @@ fn lm_head_into(
 /// for MLA), `len` is how many are populated, `ids` mirrors the token id at each
 /// position so a later turn finds its common prefix. One-claim law: allocated at
 /// open, never freed or grown mid-run.
+/// One layer's cached decode state: the VARIANT is what the layer's mixer
+/// actually carries per [`models::layer_cache_shape`] — attention layers hold
+/// K/V rows plus their host-tier stores, recurrent mixers hold scan state and
+/// conv ping-pong windows, hybrids hold both, pure-conv mixers (shortconv)
+/// hold only windows. A scan mixer dispatched onto a `Kv` layer is
+/// unrepresentable, not an error path.
+pub(crate) enum LayerCache {
+	Kv(KvSlot),
+	Scan(ScanSlot),
+	Conv(ConvSlot),
+	KvScan(KvSlot, ScanSlot),
+}
+
+/// Attention rows: the VRAM window `[win_base, win_base+win)` in `k`/`v`, and
+/// the host-tier stores (`hk`/`hv`, RAM then spill file) for evicted rows.
+pub(crate) struct KvSlot {
+	pub(crate) k: GpuBuffer,
+	pub(crate) v: GpuBuffer,
+	pub(crate) hk: HostStore,
+	pub(crate) hv: HostStore,
+}
+
+/// Recurrent mixer state: the SSM/delta matrix state carried across steps, plus
+/// the conv ping-pong windows (read `conv[i]`, write `nxt[i]`, swapped after
+/// every forward so the next step reads what this one wrote).
+pub(crate) struct ScanSlot {
+	pub(crate) rec: GpuBuffer,
+	pub(crate) conv: Vec<GpuBuffer>,
+	pub(crate) nxt: Vec<GpuBuffer>,
+}
+
+/// Conv-only mixer state (shortconv): ping-pong windows, no matrix recurrence.
+pub(crate) struct ConvSlot {
+	pub(crate) conv: Vec<GpuBuffer>,
+	pub(crate) nxt: Vec<GpuBuffer>,
+}
+
+impl LayerCache {
+	/// The attention rows of this layer — loud error on a non-attention layer
+	/// (a mixer/shape disagreement, never a silent recompute).
+	pub(crate) fn kv(&self) -> Result<&KvSlot> {
+		match self {
+			LayerCache::Kv(s) | LayerCache::KvScan(s, _) => return Ok(s),
+			_other => return Err(anyhow!("attention on a layer without K/V cache rows")),
+		}
+	}
+
+	/// This layer's recurrent state — loud error on a layer without one.
+	pub(crate) fn rec(&self) -> Result<&GpuBuffer> {
+		match self {
+			LayerCache::Scan(s) | LayerCache::KvScan(_, s) => return Ok(&s.rec),
+			_other => return Err(anyhow!("scan mixer on a layer without recurrent state")),
+		}
+	}
+
+	/// The `(read, write)` conv windows for conv `i` of this layer's mixer.
+	pub(crate) fn conv_io(&self, i: usize) -> Result<(&GpuBuffer, &GpuBuffer)> {
+		let (c, n) = match self {
+			LayerCache::Scan(s) | LayerCache::KvScan(_, s) => (&s.conv, &s.nxt),
+			LayerCache::Conv(s) => (&s.conv, &s.nxt),
+			LayerCache::Kv(_) => {
+				return Err(anyhow!("conv mixer on a layer without conv windows"));
+			}
+		};
+		match (c.get(i), n.get(i)) {
+			(Some(r), Some(w)) => return Ok((r, w)),
+			_missing => return Err(anyhow!("conv {i} has no cache window (layer_cache_shape mismatch)")),
+		}
+	}
+}
+
 struct KvCache {
-	/// Per-layer VRAM K/V window: the resident rows `[win_base, win_base+win)`. The
-	/// window is the first waterfall tier; rows evicted below `win_base` live in the
-	/// host tiers ([`hk`]/[`hv`], RAM then disk). Attention over a fully-resident
-	/// cache reads this buffer directly (one launch); a spilled cache stages evicted
-	/// segments back into the window and carries state across launches.
-	k: Vec<GpuBuffer>,
-	v: Vec<GpuBuffer>,
+	/// Per-layer cached state — see [`LayerCache`].
+	layers: Vec<LayerCache>,
 	kw: Vec<usize>,
 	vw: Vec<usize>,
+	conv_sz: Vec<Vec<usize>>,
+	rec_sz: Vec<usize>,
 	/// VRAM window capacity in rows, and the absolute row currently at window offset 0.
 	win: usize,
 	win_base: usize,
-	/// Host-tier backing for rows evicted from the VRAM window: per-layer
-	/// [`HostStore`]s that fill the measured RAM budget first, then append to a
-	/// session-scoped spill file (waterfall order). Empty until the cache first
-	/// exceeds `win` rows, so a within-window session pays nothing.
-	hk: Vec<HostStore>,
-	hv: Vec<HostStore>,
 	/// Double-buffered staging windows host K/V segments are read back into during
 	/// a spilled decode, each sized for one full window of the widest layer's rows.
 	/// Carved once at cache-open from the claim remainder after the weights and the
-	/// resident window (the capacity divisor reserves their per-token cost), so the
-	/// readback grain is the window — independent of any step's decode width.
-	/// `None` when the waterfall affords no host tier (`host_cap == 0`).
-	stage: Option<KvStage>,
-	/// Per-layer recurrent matrix/vector state (SSM / delta), `None` for attention
-	/// or FFN-only layers. Carried across decode steps by the stateful scan kernels.
-	rec: Vec<Option<GpuBuffer>>,
-	rec_sz: Vec<usize>,
-	/// Per-layer conv windows (the previous `d_conv-1` input rows per conv), and a
-	/// second set the current step writes into. After each incremental forward the
-	/// two swap, so the next step reads what this one wrote (ping-pong).
-	conv: Vec<Vec<GpuBuffer>>,
-	conv_nxt: Vec<Vec<GpuBuffer>>,
-	conv_sz: Vec<Vec<usize>>,
+	/// resident window (the capacity divisor reserves their per-token cost ALWAYS,
+	/// so the stage exists unconditionally), so the readback grain is the window —
+	/// independent of any step's decode width.
+	stage: KvStage,
 	len: usize,
 	ids: Vec<u32>,
 	t_max: usize,
@@ -2383,9 +2429,9 @@ struct KvCache {
 /// The cache's double-buffered spill staging: `sk[i]`/`sv[i]` each hold one full
 /// window of the widest layer's K/V rows, so a spilled attention walks the host
 /// mirror in window-sized read-ahead blocks.
-struct KvStage {
-	sk: [GpuBuffer; 2],
-	sv: [GpuBuffer; 2],
+pub(crate) struct KvStage {
+	pub(crate) sk: [GpuBuffer; 2],
+	pub(crate) sv: [GpuBuffer; 2],
 }
 
 /// Append-only host store for one layer's evicted K/V rows: bytes `[0, ram.len())`
@@ -2524,53 +2570,12 @@ impl KvCache {
 	fn new(m: &Model, win: usize, host_cap: usize) -> Result<KvCache> {
 		let nl = m.hp.nl;
 		let es = FWD_DT.elem_size();
-		let mut k = Vec::with_capacity(nl);
-		let mut v = Vec::with_capacity(nl);
-		let mut kw = Vec::with_capacity(nl);
-		let mut vw = Vec::with_capacity(nl);
-		let mut rec = Vec::with_capacity(nl);
-		let mut rec_sz = Vec::with_capacity(nl);
-		let mut conv = Vec::with_capacity(nl);
-		let mut conv_nxt = Vec::with_capacity(nl);
-		let mut conv_sz = Vec::with_capacity(nl);
-		for l in 0..nl {
-			let s = models::layer_cache_shape(m, l);
-			k.push(falloc(win * s.kw.max(1))?);
-			v.push(falloc(win * s.vw.max(1))?);
-			kw.push(s.kw);
-			vw.push(s.vw);
-			if s.rec > 0 {
-				let b = falloc(s.rec)?;
-				b.memset_zero(s.rec * es)?;
-				rec.push(Some(b));
-			} else {
-				rec.push(None);
-			}
-			rec_sz.push(s.rec);
-			let mut cw = Vec::with_capacity(s.conv.len());
-			let mut cwn = Vec::with_capacity(s.conv.len());
-			for &w in &s.conv {
-				let a = falloc(w.max(1))?;
-				a.memset_zero(w.max(1) * es)?;
-				cw.push(a);
-				let b = falloc(w.max(1))?;
-				b.memset_zero(w.max(1) * es)?;
-				cwn.push(b);
-			}
-			conv.push(cw);
-			conv_nxt.push(cwn);
-			conv_sz.push(s.conv.clone());
-		}
-		let skw = kw.iter().copied().max().unwrap_or(0);
-		let svw = vw.iter().copied().max().unwrap_or(0);
-		let stage = if host_cap > 0 && skw > 0 {
-			Some(KvStage {
-				sk: [falloc(win * skw)?, falloc(win * skw)?],
-				sv: [falloc(win * svw.max(1))?, falloc(win * svw.max(1))?],
-			})
-		} else {
-			None
-		};
+		let shapes: Vec<models::LayerCacheShape> =
+			(0..nl).map(|l| return models::layer_cache_shape(m, l)).collect();
+		let kw: Vec<usize> = shapes.iter().map(|s| return s.kw).collect();
+		let vw: Vec<usize> = shapes.iter().map(|s| return s.vw).collect();
+		let rec_sz: Vec<usize> = shapes.iter().map(|s| return s.rec).collect();
+		let conv_sz: Vec<Vec<usize>> = shapes.iter().map(|s| return s.conv.clone()).collect();
 		let total_w: usize = kw.iter().sum::<usize>() + vw.iter().sum::<usize>();
 		let (ram_budget, spill_dir) = if host_cap > 0 && total_w > 0 {
 			let dir = kv_spill_dir()?;
@@ -2585,23 +2590,58 @@ impl KvCache {
 				.join(format!("recipe-kv-{}-{sid}-l{l}-{name}.spill", process::id()));
 			return HostStore::new(budget, path);
 		};
-		let hk = (0..nl).map(|l| return store(kw[l], "k", l)).collect();
-		let hv = (0..nl).map(|l| return store(vw[l], "v", l)).collect();
+		let scan_slot = |s: &models::LayerCacheShape| -> Result<ScanSlot> {
+			let rec = falloc(s.rec.max(1))?;
+			rec.memset_zero(s.rec.max(1) * es)?;
+			let mut conv = Vec::with_capacity(s.conv.len());
+			let mut nxt = Vec::with_capacity(s.conv.len());
+			for &w in &s.conv {
+				let a = falloc(w.max(1))?;
+				a.memset_zero(w.max(1) * es)?;
+				conv.push(a);
+				let b = falloc(w.max(1))?;
+				b.memset_zero(w.max(1) * es)?;
+				nxt.push(b);
+			}
+			return Ok(ScanSlot { rec, conv, nxt });
+		};
+		let mut layers = Vec::with_capacity(nl);
+		for (l, s) in shapes.iter().enumerate() {
+			let kv_slot = |_probe: ()| -> Result<KvSlot> {
+				return Ok(KvSlot {
+					k: falloc(win * s.kw.max(1))?,
+					v: falloc(win * s.vw.max(1))?,
+					hk: store(s.kw, "k", l),
+					hv: store(s.vw, "v", l),
+				});
+			};
+			let layer = match (s.kw > 0, s.rec > 0, !s.conv.is_empty()) {
+				(true, false, false) => LayerCache::Kv(kv_slot(())?),
+				(true, _rec, _conv) => LayerCache::KvScan(kv_slot(())?, scan_slot(s)?),
+				(false, true, _conv) => LayerCache::Scan(scan_slot(s)?),
+				(false, false, true) => {
+					let sc = scan_slot(s)?;
+					LayerCache::Conv(ConvSlot { conv: sc.conv, nxt: sc.nxt })
+				}
+				(false, false, false) => LayerCache::Kv(kv_slot(())?),
+			};
+			layers.push(layer);
+		}
+		let skw = kw.iter().copied().max().unwrap_or(0);
+		let svw = vw.iter().copied().max().unwrap_or(0);
+		let stage = KvStage {
+			sk: [falloc(win * skw.max(1))?, falloc(win * skw.max(1))?],
+			sv: [falloc(win * svw.max(1))?, falloc(win * svw.max(1))?],
+		};
 		return Ok(KvCache {
-			k,
-			v,
+			layers,
 			kw,
 			vw,
+			conv_sz,
+			rec_sz,
 			win,
 			win_base: 0,
-			hk,
-			hv,
 			stage,
-			rec,
-			rec_sz,
-			conv,
-			conv_nxt,
-			conv_sz,
 			len: 0,
 			ids: Vec::new(),
 			t_max: win + host_cap,
@@ -2621,9 +2661,13 @@ impl KvCache {
 		self.ids.truncate(self.len);
 		if self.len < self.win_base {
 			let es = FWD_DT.elem_size();
-			for l in 0..self.k.len() {
-				self.hk[l].truncate(self.len * self.kw[l] * es);
-				self.hv[l].truncate(self.len * self.vw[l] * es);
+			let (len, kw, vw) = (self.len, &self.kw, &self.vw);
+			for (l, layer) in self.layers.iter_mut().enumerate() {
+				let (LayerCache::Kv(s) | LayerCache::KvScan(s, _)) = layer else {
+					continue;
+				};
+				s.hk.truncate(len * kw[l] * es);
+				s.hv.truncate(len * vw[l] * es);
 			}
 			self.win_base = self.len;
 		}
@@ -2635,27 +2679,34 @@ impl KvCache {
 	/// interior position — only the final state is kept).
 	fn clear_scan(&mut self) -> Result<()> {
 		let es = FWD_DT.elem_size();
-		for (rb, &sz) in self.rec.iter().zip(self.rec_sz.iter()) {
-			if let Some(b) = rb {
-				b.memset_zero(sz * es)?;
-			}
-		}
-		for (cv, szs) in self.conv.iter().zip(self.conv_sz.iter()) {
-			for (b, &w) in cv.iter().zip(szs.iter()) {
+		let zero_scan = |s: &ScanSlot, sz: usize, szs: &[usize]| -> Result<()> {
+			s.rec.memset_zero(sz.max(1) * es)?;
+			for (b, &w) in s.conv.iter().chain(s.nxt.iter()).zip(szs.iter().chain(szs.iter())) {
 				b.memset_zero(w.max(1) * es)?;
 			}
-		}
-		for (cv, szs) in self.conv_nxt.iter().zip(self.conv_sz.iter()) {
-			for (b, &w) in cv.iter().zip(szs.iter()) {
-				b.memset_zero(w.max(1) * es)?;
+			return Ok(());
+		};
+		for (l, layer) in self.layers.iter_mut().enumerate() {
+			match layer {
+				LayerCache::Scan(s) => zero_scan(s, self.rec_sz[l], &self.conv_sz[l])?,
+				LayerCache::KvScan(kv, s) => {
+					zero_scan(s, self.rec_sz[l], &self.conv_sz[l])?;
+					kv.hk.truncate(0);
+					kv.hv.truncate(0);
+				}
+				LayerCache::Conv(s) => {
+					for (b, &w) in s.conv.iter().chain(s.nxt.iter()).zip(self.conv_sz[l].iter().chain(self.conv_sz[l].iter())) {
+						b.memset_zero(w.max(1) * es)?;
+					}
+				}
+				LayerCache::Kv(s) => {
+					s.hk.truncate(0);
+					s.hv.truncate(0);
+				}
 			}
 		}
 		self.len = 0;
 		self.ids.clear();
-		for l in 0..self.k.len() {
-			self.hk[l].truncate(0);
-			self.hv[l].truncate(0);
-		}
 		self.win_base = 0;
 		return Ok(());
 	}
@@ -2671,16 +2722,20 @@ impl KvCache {
 			return Ok(false);
 		}
 		let resident = self.len - self.win_base;
-		for l in 0..self.k.len() {
-			if self.kw[l] == 0 {
+		let (kw, vw) = (&self.kw, &self.vw);
+		for (l, layer) in self.layers.iter_mut().enumerate() {
+			let (LayerCache::Kv(s) | LayerCache::KvScan(s, _)) = layer else {
+				continue;
+			};
+			if kw[l] == 0 {
 				continue;
 			}
-			let mut kf = vec![0.0f32; resident * self.kw[l]];
-			let mut vf = vec![0.0f32; resident * self.vw[l]];
-			self.k[l].download_f32(&mut kf)?;
-			self.v[l].download_f32(&mut vf)?;
-			self.hk[l].append_f32(&kf)?;
-			self.hv[l].append_f32(&vf)?;
+			let mut kf = vec![0.0f32; resident * kw[l]];
+			let mut vf = vec![0.0f32; resident * vw[l]];
+			s.k.download_f32(&mut kf)?;
+			s.v.download_f32(&mut vf)?;
+			s.hk.append_f32(&kf)?;
+			s.hv.append_f32(&vf)?;
 		}
 		self.win_base = self.len;
 		return Ok(true);
@@ -2747,39 +2802,25 @@ fn forward_rows(
 		gpu_copy_into(&h0, t * ne, &ar.embd_skip)?;
 	}
 	cache.ensure_room(t)?;
-	let stage = match (&cache.stage, cache.win_base > 0) {
-		(Some(s), true) => Some(s),
-		(None, true) => bail!("KV cache spilled {} rows without staging windows", cache.win_base),
-		_ => None,
-	};
 	let mut src: &GpuBuffer = &ar.ha;
 	let mut dst: &GpuBuffer = &ar.hb;
 	for l in 0..nl {
-		let spill = match stage {
-			Some(s) if cache.kw[l] > 0 => Some(models::SpillCtx {
-				win_base: cache.win_base,
-				hk: &cache.hk[l],
-				hv: &cache.hv[l],
-				sk: &s.sk,
-				sv: &s.sv,
-				rows: cache.win,
-			}),
-			_ => None,
-		};
 		let dec = models::DecCtx {
 			cached: cache.len,
-			kc: &cache.k[l],
-			vc: &cache.v[l],
-			rec: cache.rec[l].as_ref(),
-			conv_in: &cache.conv[l],
-			conv_out: &cache.conv_nxt[l],
-			spill,
+			win_base: cache.win_base,
+			win: cache.win,
+			state: &cache.layers[l],
+			stage: &cache.stage,
 		};
 		models::dispatch(m, l, src, dst, t, ar, attn_scale, &dec)?;
 		mem::swap(&mut src, &mut dst);
 	}
-	for l in 0..nl {
-		mem::swap(&mut cache.conv[l], &mut cache.conv_nxt[l]);
+	for layer in cache.layers.iter_mut() {
+		match layer {
+			LayerCache::Scan(s) | LayerCache::KvScan(_, s) => mem::swap(&mut s.conv, &mut s.nxt),
+			LayerCache::Conv(s) => mem::swap(&mut s.conv, &mut s.nxt),
+			LayerCache::Kv(_) => {}
+		}
 	}
 	let last_h = src.view((t - 1) * ne, ne);
 	models::decoder_norm(m, &last_h, 1, ne, &ar.hfs)?;
@@ -3072,14 +3113,36 @@ fn kv_host_tokens(m: &Model) -> Result<usize> {
 	return Ok((b.ram_data + b.disk_data) / per_row);
 }
 
+/// What [`ChatSession::open`] yields: the resident session, or the named fact
+/// that the user cancelled the load — never an Option whose `None` needs a
+/// comment to explain.
+pub enum Opened {
+	Session(Box<ChatSession>),
+	Cancelled,
+}
+
+impl Opened {
+	/// The session, treating a cancel as an error — for callers (tests, one-shot
+	/// drivers) that never cancel. Interactive callers match the variants.
+	///
+	/// # Errors
+	/// Returns an error if the load was cancelled.
+	pub fn session(self) -> Result<ChatSession> {
+		match self {
+			Opened::Session(s) => return Ok(*s),
+			Opened::Cancelled => return Err(anyhow!("model load cancelled")),
+		}
+	}
+}
+
 impl ChatSession {
 	/// Loads `gguf` resident. `load_round` receives empty token snapshots during
 	/// the fill so the caller can keep a load UI drawn and cancel; a cancelled
-	/// load returns `Ok(None)` and frees the claim cleanly.
+	/// load returns [`Opened::Cancelled`] and frees the claim cleanly.
 	pub fn open(
 		gguf: &Path,
 		load_round: &mut dyn FnMut(&[Tok]) -> bool,
-	) -> Result<Option<ChatSession>> {
+	) -> Result<Opened> {
 		if env::var_os("VRAM_PROBE").is_some() || env::var_os("RAM_PROBE").is_some() {
 			Write::err(
 				"ChatSession: VRAM_PROBE/RAM_PROBE set: the binary's main must call llm::vram_probe_ask() and gpu_core::memory::ram_probe_ask() and exit with the code before any other work",
@@ -3105,7 +3168,7 @@ impl ChatSession {
 			ub
 		};
 		if !fill_store(&mut m, claim, &mut || !load_round(&[]))? {
-			return Ok(None);
+			return Ok(Opened::Cancelled);
 		}
 		watchdog.disarm();
 		let cache = if m.hp.ncanvas == 0 {
@@ -3141,13 +3204,13 @@ impl ChatSession {
 				cache.t_max,
 			),
 		);
-		return Ok(Some(ChatSession {
+		return Ok(Opened::Session(Box::new(ChatSession {
 			m,
 			tokenizer,
 			vocab,
 			attn_scale,
 			cache,
-		}));
+		})));
 	}
 
 	/// Generates a reply for `prompt` (already chat-templated by the caller) against
@@ -3218,8 +3281,8 @@ pub fn generate(
 	on_round: &mut dyn FnMut(&[Tok]) -> bool,
 ) -> Result<String> {
 	let mut session = match ChatSession::open(gguf, on_round)? {
-		Some(s) => s,
-		None => return Ok(String::new()),
+		Opened::Session(s) => *s,
+		Opened::Cancelled => return Ok(String::new()),
 	};
 	return session.generate_in(prompt, on_round);
 }

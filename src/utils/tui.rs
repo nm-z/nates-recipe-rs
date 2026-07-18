@@ -762,11 +762,11 @@ fn session_worker(
 			let _sent = ev.send(FromWorker::LoadEnded(Some(format!("{e:#}"))));
 			return;
 		}
-		Ok(None) => {
+		Ok(recipe_infer::llm::Opened::Cancelled) => {
 			let _sent = ev.send(FromWorker::LoadEnded(None));
 			return;
 		}
-		Ok(Some(s)) => s,
+		Ok(recipe_infer::llm::Opened::Session(s)) => *s,
 	};
 	let _ready = ev.send(FromWorker::Loaded);
 	loop {

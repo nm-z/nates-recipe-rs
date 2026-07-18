@@ -88,6 +88,7 @@ fn turn2_h2d_scales_with_suffix_not_total() {
 	let gguf = stories_fixture();
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
+		.session()
 		.expect("session cancelled");
 	let prompt = "Once upon a time there was a little girl. ".repeat(60);
 	let budget = 1usize;

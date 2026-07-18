@@ -168,7 +168,8 @@ fn do_smoke(name: &str) -> (f64, f64, usize) {
 	let t_load = Instant::now();
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.unwrap_or_else(|e| panic!("{name}: session open failed: {e:#}"))
-		.unwrap_or_else(|| panic!("{name}: session open cancelled"));
+		.session()
+		.unwrap_or_else(|e| panic!("{name}: {e:#}"));
 	let load = t_load.elapsed().as_secs_f64();
 	let mut n = 0usize;
 	let t_gen = Instant::now();

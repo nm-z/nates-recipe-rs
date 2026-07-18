@@ -340,22 +340,15 @@ fn blk_norm(
 	return apply_norm(sp.norm, gamma, beta, &m.eps, rows, cols, x, out);
 }
 
-/// The carried recurrent matrix/vector state for this decode step, or `None` on
-/// This layer's recurrent state buffer. A scan mixer reaching here without one is
-/// a structural bug (the cache allocates state for every `layer_cache_shape` with
-/// `rec > 0`), surfaced as a loud error — never a silent recompute.
+/// This layer's recurrent state buffer — variant-checked by [`crate::llm::LayerCache`],
+/// so a scan mixer on a non-scan layer is a loud structural error, never a recompute.
 fn rec_of<'a>(dec: &DecCtx<'a>) -> Result<&'a GpuBuffer> {
-	return dec.rec.ok_or_else(|| return anyhow!("scan mixer dispatched without its recurrent state buffer"));
+	return dec.state.rec();
 }
 
-/// The `(read, write)` conv-window buffers for conv `i` of this layer's mixer (in
-/// the mixer's own conv call order). Out-of-range `i` means the mixer and
-/// [`models::layer_cache_shape`] disagree on this layer's conv count — loud error.
+/// The `(read, write)` conv-window buffers for conv `i` of this layer's mixer.
 fn conv_io<'a>(dec: &DecCtx<'a>, i: usize) -> Result<(&'a GpuBuffer, &'a GpuBuffer)> {
-	match (dec.conv_in.get(i), dec.conv_out.get(i)) {
-		(Some(r), Some(w)) => return Ok((r, w)),
-		_missing => return Err(anyhow!("conv {i} has no cache window (layer_cache_shape mismatch)")),
-	}
+	return dec.state.conv_io(i);
 }
 
 /// NeoX RoPE with optional LongRoPE factors AND a position base, so a cached decode
@@ -377,16 +370,17 @@ fn rope_maybe_factors_pos(
 	return Ok(());
 }
 
-/// Segmented ascending-carry GQA attention for a K/V cache spilled past the VRAM
-/// window. Appends the new K/V into the resident window, then walks the whole causal
-/// range in window-sized segments in ASCENDING absolute-key order — host-tier rows
-/// staged back into the window first, then the resident segment — carrying the
-/// online-softmax `(m, l, acc)` across launches and normalizing only on the last.
-/// By the flash carry contract this is BIT-IDENTICAL to one launch over the full
-/// contiguous cache, so a spilled decode matches an in-VRAM one. `q`/`new_k`/`new_v`
-/// are this step's projections; `d.kc`/`d.vc` the window; `d.spill` the host mirror,
-/// staging window, and carry buffers.
-fn segmented_gqa(
+/// The ONE attention walk every GQA site resolves through: append the new K/V
+/// into the resident window, then walk the whole causal range in ASCENDING
+/// absolute-key order — host-tier segments `[0, win_base)` staged back in
+/// first, then the resident window — carrying the online-softmax `(m, l, acc)`
+/// across launches and normalizing only on the last. A fully-resident cache is
+/// the `win_base == 0` case: the host loop never runs and the resident launch
+/// covers everything — the SAME code path, not a branch. By the flash carry
+/// contract the walk is BIT-IDENTICAL to one launch over the full contiguous
+/// cache. `kd`/`vd` are the cache's per-row K/V widths (equal everywhere
+/// except minicpm3's naive MLA).
+fn cached_gqa(
 	d: &DecCtx,
 	ar: &Arena,
 	q: &GpuBuffer,
@@ -402,22 +396,21 @@ fn segmented_gqa(
 	bidir: bool,
 	out: &GpuBuffer,
 ) -> Result<()> {
-	let sc = d.spill.ok_or_else(|| anyhow!("segmented_gqa without spill context"))?;
+	let s = d.state.kv()?;
 	let es = super::super::FWD_DT.elem_size();
 	let total = d.cached + t;
-	let block = sc.rows;
-	gpu_copy_into(new_k, t * kd, &d.kc.view((d.cached - sc.win_base) * kd, t * kd))?;
-	gpu_copy_into(new_v, t * vd, &d.vc.view((d.cached - sc.win_base) * vd, t * vd))?;
+	gpu_copy_into(new_k, t * kd, &s.k.view((d.cached - d.win_base) * kd, t * kd))?;
+	gpu_copy_into(new_v, t * vd, &s.v.view((d.cached - d.win_base) * vd, t * vd))?;
 	let causal_below = if bidir { 0 } else { total };
-	let stage_k = [&sc.sk[0], &sc.sk[1]];
-	let stage_v = [&sc.sv[0], &sc.sv[1]];
+	let stage_k = [&d.stage.sk[0], &d.stage.sk[1]];
+	let stage_v = [&d.stage.sv[0], &d.stage.sv[1]];
 	let mut scratch = Vec::new();
 	let mut seg = 0usize;
 	let mut buf = 0usize;
-	while seg < sc.win_base {
-		let n = block.min(sc.win_base - seg);
-		sc.hk.stage_into(seg * kd * es, n * kd * es, stage_k[buf], &mut scratch)?;
-		sc.hv.stage_into(seg * vd * es, n * vd * es, stage_v[buf], &mut scratch)?;
+	while seg < d.win_base {
+		let n = d.win.min(d.win_base - seg);
+		s.hk.stage_into(seg * kd * es, n * kd * es, stage_k[buf], &mut scratch)?;
+		s.hv.stage_into(seg * vd * es, n * vd * es, stage_v[buf], &mut scratch)?;
 		gpu_flash_gqa(
 			q, stage_k[buf], stage_v[buf], t, n, nqh, nkv, hd, max_bias, d.cached, causal_below, out,
 			&ar.cm, &ar.cl, &ar.cacc, seg, false,
@@ -425,18 +418,17 @@ fn segmented_gqa(
 		seg += n;
 		buf ^= 1;
 	}
-	let res_n = total - sc.win_base;
+	let res_n = total - d.win_base;
 	gpu_flash_gqa(
-		q, d.kc, d.vc, t, res_n, nqh, nkv, hd, max_bias, d.cached, causal_below, out,
-		&ar.cm, &ar.cl, &ar.cacc, sc.win_base, true,
+		q, &s.k, &s.v, t, res_n, nqh, nkv, hd, max_bias, d.cached, causal_below, out,
+		&ar.cm, &ar.cl, &ar.cacc, d.win_base, true,
 	)?;
 	return Ok(());
 }
 
-/// [`segmented_gqa`]'s MLA twin: the same ascending host-then-resident carry walk
-/// through [`gpu_flash_mla`], with the MLA's asymmetric row widths (`kw` latent+pe
-/// keys, `kvlr` latent values) and always-causal masking.
-fn segmented_mla(
+/// [`cached_gqa`]'s MLA twin (asymmetric widths: `kw` latent+pe keys, `kvlr`
+/// latent values; always causal), shared by the absorbed deepseek2 and kimi blocks.
+fn cached_mla(
 	d: &DecCtx,
 	ar: &Arena,
 	q: &GpuBuffer,
@@ -448,21 +440,20 @@ fn segmented_mla(
 	kvlr: usize,
 	out: &GpuBuffer,
 ) -> Result<()> {
-	let sc = d.spill.ok_or_else(|| anyhow!("segmented_mla without spill context"))?;
+	let s = d.state.kv()?;
 	let es = super::super::FWD_DT.elem_size();
 	let total = d.cached + t;
-	let block = sc.rows;
-	gpu_copy_into(new_k, t * kw, &d.kc.view((d.cached - sc.win_base) * kw, t * kw))?;
-	gpu_copy_into(new_v, t * kvlr, &d.vc.view((d.cached - sc.win_base) * kvlr, t * kvlr))?;
-	let stage_k = [&sc.sk[0], &sc.sk[1]];
-	let stage_v = [&sc.sv[0], &sc.sv[1]];
+	gpu_copy_into(new_k, t * kw, &s.k.view((d.cached - d.win_base) * kw, t * kw))?;
+	gpu_copy_into(new_v, t * kvlr, &s.v.view((d.cached - d.win_base) * kvlr, t * kvlr))?;
+	let stage_k = [&d.stage.sk[0], &d.stage.sk[1]];
+	let stage_v = [&d.stage.sv[0], &d.stage.sv[1]];
 	let mut scratch = Vec::new();
 	let mut seg = 0usize;
 	let mut buf = 0usize;
-	while seg < sc.win_base {
-		let n = block.min(sc.win_base - seg);
-		sc.hk.stage_into(seg * kw * es, n * kw * es, stage_k[buf], &mut scratch)?;
-		sc.hv.stage_into(seg * kvlr * es, n * kvlr * es, stage_v[buf], &mut scratch)?;
+	while seg < d.win_base {
+		let n = d.win.min(d.win_base - seg);
+		s.hk.stage_into(seg * kw * es, n * kw * es, stage_k[buf], &mut scratch)?;
+		s.hv.stage_into(seg * kvlr * es, n * kvlr * es, stage_v[buf], &mut scratch)?;
 		gpu_flash_mla(
 			q, stage_k[buf], stage_v[buf], t, n, nqh, 1, kw, kvlr, d.cached, total, out,
 			&ar.cm, &ar.cl, &ar.cacc, seg, false,
@@ -470,71 +461,13 @@ fn segmented_mla(
 		seg += n;
 		buf ^= 1;
 	}
-	let res_n = total - sc.win_base;
+	let res_n = total - d.win_base;
 	gpu_flash_mla(
-		q, d.kc, d.vc, t, res_n, nqh, 1, kw, kvlr, d.cached, total, out,
-		&ar.cm, &ar.cl, &ar.cacc, sc.win_base, true,
+		q, &s.k, &s.v, t, res_n, nqh, 1, kw, kvlr, d.cached, total, out,
+		&ar.cm, &ar.cl, &ar.cacc, d.win_base, true,
 	)?;
 	return Ok(());
 }
-
-/// The ONE cached-GQA funnel every attention site resolves through: scratch
-/// attention when there is no cache, append + single offset-causal launch while
-/// the cache fits the VRAM window, and the segmented spill walk once rows have
-/// been evicted to the host tier. `kd`/`vd` are the cache's per-row K/V widths
-/// (equal everywhere except minicpm3's naive MLA).
-fn cached_gqa(
-	dec: &DecCtx,
-	ar: &Arena,
-	q: &GpuBuffer,
-	new_k: &GpuBuffer,
-	new_v: &GpuBuffer,
-	t: usize,
-	nqh: usize,
-	nkv: usize,
-	hd: usize,
-	kd: usize,
-	vd: usize,
-	max_bias: f64,
-	bidir: bool,
-	out: &GpuBuffer,
-) -> Result<()> {
-	let d = dec;
-	if d.spill.is_some() {
-		return segmented_gqa(d, ar, q, new_k, new_v, t, nqh, nkv, hd, kd, vd, max_bias, bidir, out);
-	}
-	gpu_copy_into(new_k, t * kd, &d.kc.view(d.cached * kd, t * kd))?;
-	gpu_copy_into(new_v, t * vd, &d.vc.view(d.cached * vd, t * vd))?;
-	let t_kv = d.cached + t;
-	let causal_below = if bidir { 0 } else { t_kv };
-	gpu_flash_gqa(q, d.kc, d.vc, t, t_kv, nqh, nkv, hd, max_bias, d.cached, causal_below, out, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
-	return Ok(());
-}
-
-/// [`cached_gqa`]'s MLA twin, shared by the absorbed deepseek2 and kimi blocks.
-fn cached_mla(
-	dec: &DecCtx,
-	ar: &Arena,
-	q: &GpuBuffer,
-	new_k: &GpuBuffer,
-	new_v: &GpuBuffer,
-	t: usize,
-	nqh: usize,
-	kw: usize,
-	kvlr: usize,
-	out: &GpuBuffer,
-) -> Result<()> {
-	let d = dec;
-	if d.spill.is_some() {
-		return segmented_mla(d, ar, q, new_k, new_v, t, nqh, kw, kvlr, out);
-	}
-	gpu_copy_into(new_k, t * kw, &d.kc.view(d.cached * kw, t * kw))?;
-	gpu_copy_into(new_v, t * kvlr, &d.vc.view(d.cached * kvlr, t * kvlr))?;
-	let t_kv = d.cached + t;
-	gpu_flash_mla(q, d.kc, d.vc, t, t_kv, nqh, 1, kw, kvlr, d.cached, t_kv, out, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
-	return Ok(());
-}
-
 /// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
 /// projection (optional per-head Q/K RMSNorm), RoPE, scaled GQA, output
 /// projection (optional post-attn norm), residual into `ar.attn_out`.
