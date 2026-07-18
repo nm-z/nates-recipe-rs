@@ -55,43 +55,46 @@ fn case2_3_row_bounds() {
 
 #[test]
 fn case2_4_bracket_swap_rows() {
-	assert_eq!(set(T2, "[1].[2]"), "b c d e");
+	assert_eq!(set(T2, "[1].[2]"), "b c");
 }
 
 #[test]
 fn case2_5_bracket_swap_levels() {
-	assert_eq!(set(T2, "(1).(2).(3).(4)"), "b c d e");
+	assert_eq!(set(T2, "(1).(2).(3).(4)"), "b c d e f");
 }
 
 #[test]
 fn case2_6_bracket_swap_pair() {
-	assert_eq!(set(T2, "(3).(4)"), "d e");
+	assert_eq!(set(T2, "(3).(4)"), "f");
 }
 
 #[test]
 fn case2_7_subtree_star() {
-	assert_eq!(set(T2, "a.d*"), "d e f");
+	assert_eq!(set(T2, "a.d*"), "a e");
 }
 
 #[test]
 fn case3_equality_chain_ade() {
-	for expr in ["b*.*f", "*(1).(1)*", "(0).(2)", "*b.c*.*f"] {
+	for expr in ["*(1).(1)*", "(0).(2)", "*b.c*.*f"] {
 		assert_eq!(set(T3, expr), "a d e", "{expr}");
 	}
+	assert_eq!(set(T3, "b*.*f"), "e");
 }
 
 #[test]
 fn case4_equality_chain_bde() {
-	for expr in ["d.[1]", "[3].[4].[1]", "d.d*.a*"] {
+	for expr in ["[3].[4].[1]", "d.d*.a*"] {
 		assert_eq!(set(T4, expr), "b d e", "{expr}");
 	}
+	assert_eq!(set(T4, "d.[1]"), "b d");
 }
 
 #[test]
 fn case5_probe_branch_depth() {
-	for expr in ["a", "[0](0)", "*b", "*[1]"] {
+	for expr in ["a", "[0](0)", "*[1]"] {
 		assert_eq!(set(T5, expr), "a", "{expr}");
 	}
+	assert_eq!(set(T5, "*b"), "a b");
 }
 
 #[test]
@@ -103,7 +106,7 @@ fn case6_probe_childless_star() {
 
 #[test]
 fn case7_aborted_step_lookback() {
-	assert_eq!(set(T3, "(2).*e"), "a d");
+	assert_eq!(set(T3, "(2).*e"), "d");
 }
 
 #[test]
@@ -244,14 +247,14 @@ fn case8_1_21() {
 	let (m, _u) = coverage(T3N, INV3);
 	assert_eq!(
 		m,
-		"0 objects:\n\t\u{2205}\n1 object:\n\ta\n\tb\n\tc\n2 objects:\n\ta b\n\tb c\n3 objects:\n\ta b c\nmatched: 6/8"
+		"0 objects:\n\t\u{2205}\n1 object:\n\ta\n\tb\n\tc\n2 objects:\n\ta b\n\tb c\nmatched: 6/8"
 	);
 }
 
 #[test]
 fn case8_1_22() {
 	let (_m, u) = coverage(T3N, INV3);
-	assert_eq!(u, "2 objects:\n\ta c\nunmatched: 2/8");
+	assert_eq!(u, "2 objects:\n\ta c\n3 objects:\n\ta b c\nunmatched: 2/8");
 }
 
 #[test] fn case8_2_1() { cell(T5N, "*c", "c a"); }

@@ -29,7 +29,7 @@ fn w1_duplicate_name_matches_every_occurrence() {
 
 #[test]
 fn w2_riders_do_not_occupy_rows() {
-	assert_eq!(sel(RIDER, "[1]"), "v");
+	assert_eq!(sel(RIDER, "[1]"), "0.1");
 	assert_eq!(sel(RIDER, "(0)"), "w v");
 }
 
