@@ -9,6 +9,17 @@ extern "C" int hip_multiprocessor_count() {
       return prop.multiProcessorCount;
 }
 
+extern "C" int hip_gcn_arch(char* buf, int cap) {
+      int dev = 0;
+      if (hipGetDevice(&dev) != hipSuccess) return 0;
+      hipDeviceProp_t prop;
+      if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return 0;
+      int i = 0;
+      for (; i + 1 < cap && prop.gcnArchName[i]; i++) buf[i] = prop.gcnArchName[i];
+      buf[i] = 0;
+      return i;
+}
+
 
 extern "C" __global__ void rsqrt_kernel(const double* x, double* out, int n) {
       int i = blockIdx.x * blockDim.x + threadIdx.x;

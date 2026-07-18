@@ -85,11 +85,42 @@ pub fn cu_count() -> usize {
 	);
 }
 
+/// The device's `gcnArchName` (e.g. `"gfx1101:sramecc-:xnack-"`), queried once
+/// through the [`hip_gcn_arch`] shim after the first successful call. Returns
+/// `""` while the device is uninitialized — this is a display-only probe (the
+/// capability line), so an early caller gets "unknown", never an error storm.
+pub fn gcn_arch() -> &'static str {
+	use std::sync::OnceLock;
+	static ARCH: OnceLock<String> = OnceLock::new();
+	if let Some(a) = ARCH.get() {
+		return a;
+	}
+	let mut buf = [0u8; 64];
+	callspy::tick(&callspy::GET_DEVICE_PROPERTIES);
+	// SAFETY: buf is a writable 64-byte out-slot; the shim NUL-terminates within cap.
+	let n = unsafe { hip_gcn_arch(buf.as_mut_ptr().cast::<i8>(), 64) };
+	if n <= 0i32 {
+		return "";
+	}
+	let s = String::from_utf8_lossy(&buf[..n.unsigned_abs() as usize]).into_owned();
+	return ARCH.get_or_init(|| return s);
+}
+
+/// Whether the device carries an Infinity Cache (MALL): the leading decimal of
+/// `gcnArchName` is 1030 or higher (RDNA2 gfx103x, RDNA3 gfx11xx, RDNA4 gfx12xx).
+/// `false` when the arch is unknown — presence is only ever claimed, never assumed.
+pub fn mall_present() -> bool {
+	let a = gcn_arch().strip_prefix("gfx").unwrap_or("");
+	let digits: String = a.chars().take_while(char::is_ascii_digit).collect();
+	return digits.parse::<u32>().is_ok_and(|n| return n >= 1030);
+}
+
 pub const HIP_MEMCPY_H2D: i32 = 1;
 pub const HIP_MEMCPY_D2H: i32 = 2;
 pub const HIP_MEMCPY_D2D: i32 = 3;
 
 unsafe extern "C" {
+	pub fn hip_gcn_arch(buf: *mut i8, cap: i32) -> i32;
 	pub fn hipGetLastError() -> i32;
 	pub fn hipDeviceSynchronize() -> i32;
 	pub fn hipEventCreate(event: *mut *mut c_void) -> i32;

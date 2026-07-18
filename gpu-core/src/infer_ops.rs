@@ -332,10 +332,36 @@ pub fn gpu_rmsnorm_f64_nogamma(
 /// canvas (causal prompt, bidirectional canvas). Passing `1` here would make only
 /// position 0 causal — never pass a bool.
 ///
+/// Set the first time a flash kernel actually launched / a launch's host-side
+/// tile solve actually segmented its K/V sweep (`t_kv > tile`). Read by the
+/// chat capability line — proven-ran flags, never build-time claims.
+static FLASH_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static L2_TILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[must_use]
+pub fn flash_ran() -> bool {
+	return FLASH_RAN.load(core::sync::atomic::Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn l2_tiled() -> bool {
+	return L2_TILED.load(core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Host mirror of the kernel's L2 tile solve: rows per tile such that the K+V
+/// working set at one sequence offset fits the 4 MiB L2 (same inequality the
+/// kernel doc states), clamped to at least 1.
+fn note_flash(t_kv: usize, kv_row_bytes: usize, resident_bytes: usize) {
+	FLASH_RAN.store(true, core::sync::atomic::Ordering::Relaxed);
+	let tile = (4_194_304usize.saturating_sub(resident_bytes) / kv_row_bytes.max(1)).max(1);
+	if t_kv > tile {
+		L2_TILED.store(true, core::sync::atomic::Ordering::Relaxed);
+	}
+}
+
 /// # Errors
 /// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_flash_gqa(
 	q: &GpuBuffer,
 	kc: &GpuBuffer,
@@ -355,6 +381,8 @@ pub fn gpu_flash_gqa(
 	kv_off: usize,
 	finalize: bool,
 ) -> Result<(), HipError> {
+	let es = out.dtype().elem_size();
+	note_flash(t_kv, 2 * nkv * hd * es, 2 * hd * es);
 	// SAFETY: launcher reads valid device buffers with matching dims on the default stream; carry buffers are null or live.
 	unsafe {
 		launch_flash_gqa(
@@ -389,7 +417,6 @@ pub fn gpu_flash_gqa(
 /// # Errors
 /// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_flash_mla(
 	q: &GpuBuffer,
 	kc: &GpuBuffer,
@@ -409,6 +436,8 @@ pub fn gpu_flash_mla(
 	kv_off: usize,
 	finalize: bool,
 ) -> Result<(), HipError> {
+	let es = out.dtype().elem_size();
+	note_flash(t_kv, nkv * (hdk + hdv) * es, (hdk + hdv) * es);
 	// SAFETY: launcher reads valid device buffers with matching dims on the default stream; carry buffers are null or live.
 	unsafe {
 		launch_flash_mla(

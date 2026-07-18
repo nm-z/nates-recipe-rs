@@ -376,6 +376,77 @@ fn toks_to_lines(toks: &[Tok]) -> Vec<Line<'static>> {
 	lines
 }
 
+/// Char-level display-width wrap of one logical line into rows of at most `w`
+/// cells (always at least one row) — the input box renders these pre-wrapped
+/// rows so its height and cursor math are exact by construction (ratatui's
+/// `Wrap` is word-based and would drift from the height calculation).
+fn wrap_rows(s: &str, w: usize) -> Vec<String> {
+	use unicode_width::UnicodeWidthChar;
+	let mut rows = Vec::new();
+	let mut cur = String::new();
+	let mut cw = 0usize;
+	for c in s.chars() {
+		let d = c.width().unwrap_or(0);
+		if cw + d > w && !cur.is_empty() {
+			rows.push(mem::take(&mut cur));
+			cw = 0;
+		}
+		cur.push(c);
+		cw += d;
+	}
+	rows.push(cur);
+	return rows;
+}
+
+/// The wrapped cursor position for `input` at `w` cells per row: visual rows of
+/// every logical line above, plus the display width of the cursor line's prefix
+/// divided by the row width. A prefix filling its rows exactly lands the cursor
+/// at column 0 of a fresh row, which is what grows the box one line on wrap.
+fn input_cursor(input: &TextArea, w: usize) -> (usize, usize) {
+	use unicode_width::UnicodeWidthChar;
+	let (row, col) = input.cursor();
+	let mut y = 0usize;
+	for l in input.lines().iter().take(row) {
+		y += wrap_rows(l, w).len();
+	}
+	let pw: usize = input.lines()[row]
+		.chars()
+		.take(col)
+		.map(|c| return c.width().unwrap_or(0))
+		.sum();
+	return (y + pw / w, pw % w);
+}
+
+/// The capability sanity line under the input box: each entry appears only after
+/// the mechanism PROVABLY happened this process (flash kernel launched, KV rows
+/// appended, a launch's K/V sweep actually tiled) or provably exists (Infinity
+/// Cache by device arch). Nothing here is a build-time claim.
+fn caps_line(loaded: bool) -> Line<'static> {
+	if !loaded {
+		return Line::from(String::new());
+	}
+	let mut caps: Vec<&str> = Vec::new();
+	if gpu_core::infer_ops::flash_ran() {
+		caps.push("FA");
+	}
+	if recipe_infer::llm::kv_cache_ran() {
+		caps.push("KV cache");
+	}
+	if gpu_core::infer_ops::l2_tiled() {
+		caps.push("L2 tiling");
+	}
+	if gpu_core::hip::mall_present() {
+		caps.push("IC");
+	}
+	if caps.is_empty() {
+		return Line::from(String::new());
+	}
+	return Line::from(Span::styled(
+		format!("Enabled: {}", caps.join(", ")),
+		Style::default().fg(Color::DarkGray),
+	));
+}
+
 fn render_chat(
 	frame: &mut Frame,
 	input: &TextArea,
@@ -384,8 +455,21 @@ fn render_chat(
 	live: &[Tok],
 	generating: bool,
 	scroll_up: usize,
+	loaded: bool,
 ) {
-	let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(frame.area());
+	let area = frame.area();
+	let inner_w = area.width.saturating_sub(2).max(1) as usize;
+	let wrapped: Vec<String> = input.lines().iter().flat_map(|l| return wrap_rows(l, inner_w)).collect();
+	let (cy, cx) = input_cursor(input, inner_w);
+	let rows = wrapped.len().max(cy + 1);
+	let max_h = (area.height / 2).max(3);
+	let input_h = u16::try_from(rows + 2).unwrap_or(u16::MAX).clamp(3, max_h);
+	let outer = Layout::vertical([
+		Constraint::Min(1),
+		Constraint::Length(input_h),
+		Constraint::Length(1),
+	])
+	.split(area);
 	let head = Style::default()
 		.fg(Color::Rgb(120, 200, 255))
 		.add_modifier(Modifier::BOLD);
@@ -422,7 +506,21 @@ fn render_chat(
 		.wrap(Wrap { trim: false })
 		.scroll((scroll, 0));
 	frame.render_widget(para, outer[0]);
-	frame.render_widget(input, outer[1]);
+	let inner_h = outer[1].height.saturating_sub(2).max(1) as usize;
+	let in_scroll = (cy + 1).saturating_sub(inner_h);
+	let in_para = Paragraph::new(wrapped.join("\n"))
+		.scroll((u16::try_from(in_scroll).unwrap_or(u16::MAX), 0))
+		.block(
+			Block::default()
+				.borders(Borders::ALL)
+				.title("message  (Enter send, Esc quit)"),
+		);
+	frame.render_widget(in_para, outer[1]);
+	frame.set_cursor_position(ratatui::layout::Position {
+		x: outer[1].x + 1 + u16::try_from(cx).unwrap_or(0),
+		y: outer[1].y + 1 + u16::try_from(cy - in_scroll).unwrap_or(0),
+	});
+	frame.render_widget(Paragraph::new(caps_line(loaded)), outer[2]);
 }
 
 pub struct PeerRow {
@@ -600,7 +698,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	let res = {
 		let sb = &scrollback;
 		let mut on_round = |toks: &[Tok]| -> bool {
-			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true, 0));
+			let _round = term.draw(|f| render_chat(f, &input, sb, Some(prompt), toks, true, 0, false));
 			drain_input(&cancel, &mut input, 0);
 			!cancel.load(std::sync::atomic::Ordering::Relaxed)
 		};
@@ -615,7 +713,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 			return;
 		}
 	}
-	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false, 0));
+	let _final = term.draw(|f| render_chat(f, &input, &scrollback, None, &[], false, 0, true));
 	loop {
 		match event::read() {
 			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
@@ -712,7 +810,7 @@ fn wait_load(
 			}
 		}
 		let _live = term
-			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true, 0));
+			.draw(|f| render_chat(f, textarea, scrollback, Some("(loading model…)"), &latest, true, 0, false));
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -741,7 +839,7 @@ fn run_message(
 			}
 		}
 		let _live =
-			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true, 0));
+			term.draw(|f| render_chat(f, textarea, scrollback, Some(prompt), &latest, true, 0, true));
 		drain_input(cancel, textarea, 50);
 	}
 }
@@ -783,7 +881,7 @@ pub fn chat(gguf: &str) {
 	let mut scroll_up: usize = 0;
 	loop {
 		let _idle =
-			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false, scroll_up));
+			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], false, scroll_up, true));
 		let ev = match event::read() {
 			Ok(e) => e,
 			Err(_e) => break,

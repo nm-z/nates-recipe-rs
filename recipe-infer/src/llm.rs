@@ -2820,7 +2820,17 @@ fn forward_rows(
 	lm_head_into(m, &ar.hfs, 1, ar, logits, lm_scratch)?;
 	cache.len += t;
 	cache.ids.extend_from_slice(rows);
+	KV_RAN.store(true, Ordering::Relaxed);
 	return Ok(());
+}
+
+/// Set the first time [`forward_rows`] actually appended rows into a resident
+/// [`KvCache`]. Read by the chat capability line — a proven-ran flag.
+static KV_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[must_use]
+pub fn kv_cache_ran() -> bool {
+	return KV_RAN.load(Ordering::Relaxed);
 }
 
 /// Incremental autoregressive decode against the resident KV cache. Prefills the
