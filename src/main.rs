@@ -11,7 +11,13 @@ use std::process;
 use std::slice;
 use std::time::UNIX_EPOCH;
 
-fn usage(code: i32) -> ! {
+/// Maps a legacy `i32` status into an `ExitCode`, preserving the child-probe
+/// protocol's exact 0/2 semantics; unrepresentable codes collapse to 1.
+fn exit_code(code: i32) -> process::ExitCode {
+	return process::ExitCode::from(u8::try_from(code).unwrap_or(1));
+}
+
+fn usage(code: i32) -> process::ExitCode {
 	Write::always(&format!(
 		"recipe {}.{}",
 		env!("CARGO_PKG_VERSION"),
@@ -22,7 +28,7 @@ fn usage(code: i32) -> ! {
 	Write::always("       recipe peers            # live network view");
 	Write::always("       recipe probe            # measure this machine");
 	Write::always("       recipe run [name]       # pick a gguf.toml model and chat");
-	process::exit(code);
+	return exit_code(code);
 }
 
 /// Locates `gguf.toml`: the current directory first, then
@@ -163,9 +169,9 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	Err(process::Command::new(&bin).args(extra).exec().into())
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<process::ExitCode> {
 	if let Some(code) = recipe::machine::gpu_child_ask() {
-		process::exit(code);
+		return Ok(exit_code(code));
 	}
 	if let Some(sz) = env::var_os("VRAM_PROBE") {
 		let n: usize = sz
@@ -179,10 +185,10 @@ fn main() -> Result<()> {
 			}
 			None => 2,
 		};
-		process::exit(code);
+		return Ok(exit_code(code));
 	}
 	if let Some(code) = gpu_core::memory::ram_probe_ask() {
-		process::exit(code);
+		return Ok(exit_code(code));
 	}
 	if let Some(it) = env::var_os("SETUP_RACE") {
 		let iters: usize = it
@@ -249,15 +255,15 @@ fn main() -> Result<()> {
 			Write::line(gpu, &format!("setup-race iter {i}: clean"));
 		}
 		gpu_core::kernels::gpu_shutdown();
-		process::exit(0);
+		return Ok(exit_code(0));
 	}
 	let args: Vec<String> = env::args().collect();
 	let cmd = match args.get(1) {
 		Some(first) => first.as_str(),
-		None => usage(1),
+		None => return Ok(usage(1)),
 	};
-	match cmd {
-		"-h" | "--help" => usage(0),
+	let outcome: Result<()> = match cmd {
+		"-h" | "--help" => return Ok(usage(0)),
 		"probe" => {
 			set_opt(Opt {
 				probe: true,
@@ -358,8 +364,9 @@ fn main() -> Result<()> {
 			let probed = fs::metadata(other).ok();
 			match other.strip_suffix(".rs").and(probed) {
 				Some(_meta) => run_rs(other, &args[2..]),
-				None => usage(1),
+				None => return Ok(usage(1)),
 			}
 		}
-	}
+	};
+	return outcome.map(|()| process::ExitCode::SUCCESS);
 }

@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "raw-HSA dispatch of loaded assembly")]
+#![allow(unsafe_code)]
 //! Load a `.s`/`.hsaco` and dispatch one of its kernels from the command line.
 //!
 //! ```text
@@ -13,7 +13,7 @@
 use core::ffi::c_void;
 use gpu_core::asm::{self, KernArgs};
 use gpu_core::log::{Errored, Write};
-use std::process;
+use std::process::ExitCode;
 
 fn parse_arg(token: &str, args: &mut KernArgs, bufs: &mut Vec<*mut c_void>) -> Result<(), Errored> {
 	let (kind, value) = token
@@ -110,9 +110,10 @@ fn run() -> Result<(), Errored> {
 	return Ok(());
 }
 
-fn main() {
+fn main() -> ExitCode {
 	if let Err(e) = run() {
 		Write::error(format!("asmrun: {e}"));
-		process::exit(1);
+		return ExitCode::from(1);
 	}
+	return ExitCode::SUCCESS;
 }

@@ -116,13 +116,13 @@ fn main() -> Result<(), Errored> {
 					probs[i * n_classes + a]
 						.partial_cmp(&probs[i * n_classes + b])
 						.unwrap_or_else(|| {
-							drop(Write::err(format!("NaN in probs at row {i}")));
-							std::process::abort();
+							Write::error(format!("NaN in probs at row {i}"));
+							return std::cmp::Ordering::Equal;
 						})
 				})
 				.unwrap_or_else(|| {
-					drop(Write::err(format!("empty class range at row {i}")));
-					std::process::abort();
+					Write::error(format!("empty class range at row {i}"));
+					return usize::MAX;
 				}) == y_te[i]
 		})
 		.count();

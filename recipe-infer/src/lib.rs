@@ -1,7 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::match_wild_err_arm)]
-
+#![allow(unsafe_code)]
 pub mod bridge;
 pub mod chat;
 pub mod dequant;
@@ -23,7 +20,8 @@ pub use gpu_core::log;
 pub use gpu_core::memory::{
 	ExitD2H, GpuBuffer, Stage, adopt_run_backing_with_image, claim_device_arena_bytes,
 	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes,
-	device_arena_active, exit_d2h_enqueue, park_run_backing, release_device_arena,
+	device_arena_active, exit_d2h_enqueue, exit_d2h_enqueue_buf, park_run_backing,
+	release_device_arena,
 };
 pub use gpu_core::tiered;
 pub use params::*;
@@ -36,7 +34,7 @@ pub fn init() -> Result<(), gpu_core::HipError> {
 }
 
 pub fn shutdown() {
-	scratch::free_pinned_pair();
+	gpu_core::memory::free_pinned_pair();
 	gpu_core::kernels::gpu_shutdown();
 }
 

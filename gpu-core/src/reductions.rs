@@ -491,7 +491,7 @@ pub fn gpu_bitonic_step_dd(
 pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
 	let mut work = GpuBuffer::alloc(pn)?;
-	work.copy_from(x, n * 8)?;
+	work.copy_from(x, n * size_of::<f64>())?;
 	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
@@ -507,7 +507,7 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 		k <<= 1usize;
 	}
 	let mut dst = GpuBuffer::borrow(out.ptr_raw(), out.len());
-	dst.copy_from(&work, n * 8)?;
+	dst.copy_from(&work, n * size_of::<f64>())?;
 	return Ok(());
 }
 
@@ -520,7 +520,7 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	let pn = next_pow2(n);
 	let mut keys = GpuBuffer::alloc(pn)?;
 	let vals = GpuBuffer::alloc_bytes(pn * 4)?;
-	keys.copy_from(x, n * 8)?;
+	keys.copy_from(x, n * size_of::<f64>())?;
 	gpu_init_idx(pn, &vals)?;
 	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
@@ -556,8 +556,8 @@ pub fn gpu_sort_by_key(
 	let pn = next_pow2(n);
 	let mut wk = GpuBuffer::alloc(pn)?;
 	let mut wv = GpuBuffer::alloc(pn)?;
-	wk.copy_from(keys, n * 8)?;
-	wv.copy_from(vals, n * 8)?;
+	wk.copy_from(keys, n * size_of::<f64>())?;
+	wv.copy_from(vals, n * size_of::<f64>())?;
 	if let Some(_pad) = Some(pn).filter(|p| return *p > n) {
 		let sentinel = GpuBuffer::alloc(1)?;
 		sentinel.load(&[f64::MAX])?;
@@ -573,9 +573,9 @@ pub fn gpu_sort_by_key(
 		k <<= 1usize;
 	}
 	let mut dk = GpuBuffer::borrow(out_keys.ptr_raw(), out_keys.len());
-	dk.copy_from(&wk, n * 8)?;
+	dk.copy_from(&wk, n * size_of::<f64>())?;
 	let mut dv = GpuBuffer::borrow(out_vals.ptr_raw(), out_vals.len());
-	dv.copy_from(&wv, n * 8)?;
+	dv.copy_from(&wv, n * size_of::<f64>())?;
 	return Ok(());
 }
 

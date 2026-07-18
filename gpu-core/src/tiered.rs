@@ -6,12 +6,10 @@ use crate::hip;
 use crate::log::Write;
 use crate::memory;
 use crate::memory::tag_note_alloc;
-use alloc::ffi::CString;
 use core::cmp;
 use core::ffi::c_void;
 use core::fmt;
 use core::iter;
-use core::mem;
 use core::num::NonZeroUsize;
 use core::ptr;
 use std::fs;
@@ -68,7 +66,6 @@ impl Budgets {
 	#[must_use]
 	#[inline]
 	pub fn measure(weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Self {
-		use std::os::unix::ffi::OsStrExt as _;
 		let mut free = 0usize;
 		let mut total = 0usize;
 		callspy::tick(&callspy::MEM_GET_INFO);
@@ -106,20 +103,7 @@ impl Budgets {
 			.parent()
 			.filter(|p| return !p.as_os_str().is_empty())
 			.unwrap_or_else(|| return Path::new("."));
-		let disk_avail = CString::new(dir.as_os_str().as_bytes()).map_or(0, |c| {
-			// SAFETY: libc::statvfs is plain data with no invalid bit patterns; zeroed is valid.
-			let mut st: libc::statvfs = unsafe { mem::zeroed() };
-			// SAFETY: c is a valid NUL-terminated path and st is a valid writable statvfs slot.
-			let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
-			match rc.cmp(&0i32) {
-				cmp::Ordering::Equal => {
-					return usize::try_from(st.f_bavail)
-						.unwrap_or(0)
-						.saturating_mul(usize::try_from(st.f_frsize).unwrap_or(0));
-				}
-				cmp::Ordering::Less | cmp::Ordering::Greater => return 0,
-			}
-		});
+		let disk_avail = crate::sys::disk_free_bytes(dir);
 		let disk_data = disk_avail.saturating_sub(RESERVE_D);
 		return Self {
 			vram_data,

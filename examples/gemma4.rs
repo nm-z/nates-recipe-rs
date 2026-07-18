@@ -1,9 +1,10 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 use anyhow::{Result, anyhow, bail};
 use gpu_core::log::{Opt, Write, gpu, set_opt};
 use std::env;
 use std::os::unix::process::CommandExt as _;
 use std::process;
+use std::process::ExitCode;
 
 fn ensure_vramspy_preloaded() -> Result<()> {
 	let loaded =
@@ -47,9 +48,9 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 	))
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
 	if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-		process::exit(code);
+		return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
 	}
 	set_opt(Opt {
 		prompt: true,
@@ -66,5 +67,5 @@ fn main() -> Result<()> {
 
 	Write::line(gpu, gpu_core::memory::ledger_report());
 	recipe_infer::shutdown();
-	Ok(())
+	return Ok(ExitCode::SUCCESS);
 }

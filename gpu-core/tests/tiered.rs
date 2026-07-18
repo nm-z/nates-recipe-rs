@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 use gpu_core::tiered::{Budgets, Full, P, Tiered, human};
 use std::ffi::c_void;
 use std::path::Path;

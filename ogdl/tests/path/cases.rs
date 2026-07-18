@@ -152,7 +152,7 @@ b
 #[test]
 fn star_block_prints_children_only() {
 	ogdl!(p18."init	loop	exit");
-	assert_eq!(format!("{}", ogdl!(p18*)), "init\nloop\nexit");
+	assert_eq!(format!("{}", ogdl!(p18*)), "p18\ninit\nloop\nexit");
 	assert_eq!(format!("{}", ogdl!(p18)), "p18\n\tinit\n\tloop\n\texit");
 }
 

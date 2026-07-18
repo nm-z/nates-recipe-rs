@@ -6,14 +6,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
-use std::ffi::CStr;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::io::{Read, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process;
-use std::ptr;
 use std::slice;
 use std::str::from_utf8;
 use std::sync::mpsc::{Receiver, Sender};
@@ -216,44 +214,18 @@ struct Iface {
 
 fn ifaces() -> Vec<Iface> {
 	let mut out = Vec::new();
-	unsafe {
-		let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
-		let Ordering::Equal = libc::getifaddrs(&mut ifap).cmp(&0) else {
-			return out;
+	for nic in gpu_core::sys::ipv4_interfaces() {
+		let link = match fs::metadata(format!("/sys/class/net/{}/wireless", nic.name)).ok() {
+			Some(_meta) => Link::Wireless,
+			None => Link::Wired,
 		};
-		let mut p = ifap;
-		while !p.is_null() {
-			let a = &*p;
-			let up = a.ifa_flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32
-				== (libc::IFF_UP | libc::IFF_RUNNING) as u32;
-			let lo = a.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
-			let want = up
-				&& !lo && !a.ifa_addr.is_null()
-				&& (*a.ifa_addr).sa_family as i32 == libc::AF_INET;
-			for _present in Some(()).filter(|_unit| want).into_iter() {
-				let sin = &*(a.ifa_addr as *const libc::sockaddr_in);
-				let ip = u32::from_be(sin.sin_addr.s_addr);
-				let mask = match a.ifa_netmask.cast::<libc::sockaddr_in>().as_ref() {
-					Some(nm) => u32::from_be(nm.sin_addr.s_addr),
-					None => 0,
-				};
-				let name = CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
-				let link =
-					match fs::metadata(format!("/sys/class/net/{name}/wireless")).ok() {
-						Some(_meta) => Link::Wireless,
-						None => Link::Wired,
-					};
-				out.push(Iface {
-					ip: Ipv4Addr::from(ip),
-					bcast: Ipv4Addr::from(ip | !mask),
-					link,
-				});
-			}
-			p = a.ifa_next;
-		}
-		libc::freeifaddrs(ifap);
+		out.push(Iface {
+			ip: Ipv4Addr::from(nic.ip),
+			bcast: Ipv4Addr::from(nic.ip | !nic.mask),
+			link,
+		});
 	}
-	out
+	return out;
 }
 
 #[derive(Clone)]

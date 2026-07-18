@@ -6,7 +6,6 @@ use gpu_core::kernels;
 use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cmp::Ordering;
-use std::ptr;
 
 #[derive(Clone, Copy)]
 pub struct LossScale {
@@ -206,7 +205,7 @@ pub fn zscore_fit_into(
 	out: &GpuBuffer,
 ) -> anyhow::Result<()> {
 	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
-	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * 8).context("zscore ws")?;
+	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * size_of::<f64>()).context("zscore ws")?;
 	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean)?;
 	let var = GpuBuffer::alloc(d).context("var")?;
 	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var)?;
@@ -512,7 +511,7 @@ pub fn attn_forward_cached(
 
 pub fn download_vec(buf: &GpuBuffer, len: usize) -> anyhow::Result<Vec<f64>> {
 	let mut v = vec![0.0f64; len];
-	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
+	let dl = buf.download(&mut v);
 	if let Err(e) = dl {
 		Write::err(format!("gpu download: {e}"))?;
 	}
@@ -620,7 +619,7 @@ pub struct Scored {
 
 pub fn download_scalar(buf: &GpuBuffer) -> anyhow::Result<f64> {
 	let mut v = [0.0f64];
-	let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
+	let dl = buf.download(&mut v);
 	if let Err(e) = dl {
 		Write::err(format!("scalar download: {e}"))?;
 	}

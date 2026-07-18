@@ -182,7 +182,8 @@ pub(crate) fn collapse_onehot(ds: &Dataset) -> anyhow::Result<CollapsedOnehot> {
 		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let x = crate::ok_or_err(Mat::from_shape_vec([n, new_ncols], dat), "collapse_onehot")?;
+	let x = Mat::from_shape_vec([n, new_ncols], dat)
+		.map_err(|e| anyhow::anyhow!("collapse_onehot: {e:#}"))?;
 	Ok(CollapsedOnehot {
 		x,
 		embed_cols,

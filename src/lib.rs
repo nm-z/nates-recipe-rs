@@ -1,7 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::match_wild_err_arm)]
-
+#![allow(unsafe_code)]
 use std::fmt;
 
 #[doc(hidden)]
@@ -89,12 +86,4 @@ pub fn train() -> Train {
 }
 pub fn infer() -> Infer {
 	Infer::new()
-}
-
-pub(crate) fn ok_or_err<T, E: fmt::Display>(r: Result<T, E>, ctx: &str) -> anyhow::Result<T> {
-	r.map_err(|e| anyhow::anyhow!("{ctx}: {e:#}"))
-}
-
-pub(crate) fn some_or_err<T>(o: Option<T>, msg: &str) -> anyhow::Result<T> {
-	o.ok_or_else(|| anyhow::anyhow!("{msg}"))
 }

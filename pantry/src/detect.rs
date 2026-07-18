@@ -157,7 +157,7 @@ enum FirstRow {
 /// returned prefix is exactly what `tokenize_column` would consume from the full
 /// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
 fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
-	// One token per byte, plus one newline separator between consecutive cells.
+	/// One token per byte, plus one newline separator between consecutive cells.
 	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize]) {
 		let Ordering::Less = tok[j].cmp(&CONTEXT) else {
 			return;
@@ -190,8 +190,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 		.map(|s| String::from_utf8_lossy(s).into_owned())
 		.collect();
 	let w = first_cells.len();
-	// Header row iff any first-row cell is a non-number (a header names columns);
-	// an all-numeric first row is data, and columns are synthesized col_0..col_{w-1}.
+	// Header row iff any first-row cell is a non-number (a header names columns); an all-numeric first row is data, and columns are synthesized col_0..col_{w-1}.
 	let headerless = !first_cells.is_empty()
 		&& first_cells.iter().all(|c| {
 			let t = c.trim();
@@ -250,10 +249,10 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 	Ok(PrefixCols { headers, cols })
 }
 
-// Parks the detector's backing slab on every exit — normal return or a panic
-// during the forward — so the arena is never left registered-and-live and the
-// next call adopts it instead of reclaiming. No HIP calls in park, so drop
-// drains nothing. `None` once the slab has already been parked/handed off.
+/// Parks the detector's backing slab on every exit — normal return or a panic
+/// during the forward — so the arena is never left registered-and-live and the
+/// next call adopts it instead of reclaiming. No HIP calls in park, so drop
+/// drains nothing. `None` once the slab has already been parked/handed off.
 struct ArenaGuard {
 	slab: Option<recipe_infer::GpuBuffer>,
 }
@@ -271,6 +270,19 @@ impl Drop for ArenaGuard {
 /// `recipe_infer::LayerSpec` values, loads the inline checkpoint into it, and runs
 /// a single forward pass. The byte-id stream is the embed input, so no feature
 /// scaling and no categorical side-input (`x_cat = None`).
+///
+/// Arena lifecycle: weights (resume-composed host image), the 12 scratch constants,
+/// and the tokenized input compose ONE init image; build/upload/scratch all
+/// bump-carve from one memset-committed slab — no per-buffer pool growth (the
+/// fresh-page commit that faults ~30-50% of fresh-process loads). The claim is ONE
+/// drain: re-arm a parked training backing when present, else claim a fresh arena;
+/// the composed image rides the adopt/claim H2D with no standalone upload, and both
+/// refusing means nothing is parked and the card cannot hold the footprint — fail
+/// clean with the numbers, no pool fallback. An `ArenaGuard` parks the slab on drop,
+/// so a normal return or an unwind through the forward parks (never frees) it for the
+/// next call to adopt. Release is ONE drain: enqueue the logits D2H (async, no wait),
+/// then the single `device_synchronize` completes it and `finish` fans the pin into
+/// preds; `Scratch` drops after this drain, so its `Drop` drains nothing.
 pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	let Some(_head) = columns.first() else {
 		return Ok(Vec::new());
@@ -288,11 +300,6 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 		recipe_infer::LayerSpec::Dense(64, recipe_infer::Activation::LeakyRelu),
 		recipe_infer::LayerSpec::Dense(N_CLASS, recipe_infer::Activation::Linear),
 	];
-	// Uniform adopt→forward→park backing for the detector's forward. Weights
-	// (resume-composed host image), the 12 scratch constants, and the tokenized
-	// input compose ONE init image; build/upload/scratch all bump-carve from
-	// one memset-committed slab — no per-buffer pool growth (the fresh-page
-	// commit that faults ~30-50% of fresh-process loads).
 	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL)?;
 	let plan = recipe_infer::plan_layer_params(
 		&specs,
@@ -311,10 +318,6 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 		.ok_or_else(|| recipe_infer::log::Errored::new("detect: x contiguous"))?);
 	let image = stage.into_host();
 	let image_floats = image.len();
-	// Detector claim (ONE drain): re-arm a parked training backing when present,
-	// else claim a fresh arena — the composed image rides the adopt/claim H2D, no
-	// standalone upload. Both refusing means nothing is parked and the card cannot
-	// hold the footprint: fail clean with the numbers, no pool fallback.
 	let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, 0 < 1);
 	let need = est + est / 2 + (1 << 20);
 	let slab = recipe_infer::adopt_run_backing_with_image(need, &image)
@@ -327,8 +330,6 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 			)
 		})?;
 	let base = slab.view(0, image_floats);
-	// Park-on-drop: on normal return the slab is parked for the next call to
-	// adopt; on an unwind through the forward it is parked (not freed) too.
 	let _arena = ArenaGuard { slab: Some(slab) };
 	let params = plan.materialize(&base, w_off);
 	let xbuf = base.view(x_off, n * CONTEXT);
@@ -336,13 +337,9 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view)?;
 	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc)?;
 	let last = params.len() - 1;
-	// Detector release (ONE drain): enqueue the logits D2H (async, no wait), then
-	// the single device_synchronize completes it; finish fans the pin into preds.
-	// Scratch (all carves) drops after this drain, so its Drop drains nothing.
 	let mut preds = vec![0.0f64; n * N_CLASS];
-	let exit =
-		unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
-			.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
+	let exit = recipe_infer::exit_d2h_enqueue_buf(&sc.acts[last], n * N_CLASS * 8)
+		.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
 	recipe_infer::device_synchronize()
 		.map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
 	exit.finish(&mut preds);

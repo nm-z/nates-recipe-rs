@@ -1,0 +1,361 @@
+warning: usage of an `unsafe` block
+  --> log/src/lib.rs:93:3
+   |
+93 | /         unsafe {
+94 | |             std::env::set_var("RECIPE_LOG", &p);
+95 | |         }
+   | |_________^
+   |
+   = note: requested on the command line with `-W unsafe-code`
+
+warning: `log` (lib) generated 1 warning
+warning: variant `Q2_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:16:7
+   |
+16 |       Q2_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q2K`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variant `Q3_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:17:7
+   |
+17 |       Q3_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q3K`
+
+warning: variant `Q4_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:18:7
+   |
+18 |       Q4_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q4K`
+
+warning: variant `Q5_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:19:7
+   |
+19 |       Q5_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q5K`
+
+warning: variant `Q6_K` should have an upper camel case name
+  --> recipe-infer/src/dequant.rs:20:7
+   |
+20 |       Q6_K,
+   |       ^^^^ help: convert the identifier to upper camel case: `Q6K`
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/forward.rs:515:11
+    |
+515 |     let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-W unsafe-code`
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/forward.rs:623:11
+    |
+623 |     let dl = unsafe { buf.download_async(&mut v, ptr::null_mut()) };
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+    --> recipe-infer/src/llm.rs:2394:4
+     |
+2394 | /             unsafe {
+2395 | |                 c.pre_exec(|| {
+2396 | |                     let z = libc::rlimit {
+2397 | |                         rlim_cur: 0,
+...    |
+2402 | |                 });
+2403 | |             }
+     | |_____________^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:296:4
+    |
+296 |             unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:378:21
+    |
+378 |             pinned_scalar_b: unsafe { pinned_pair.add(1) },
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:396:12
+    |
+396 |             let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:409:12
+    |
+409 |             let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:444:3
+    |
+444 | /         unsafe {
+445 | |             let _ = gpu_core::memory::xfer(
+446 | |                 self.pinned_scalar as *mut c_void,
+447 | |                 self.metric_scalar.ptr_raw() as *const c_void,
+...   |
+451 | |             );
+452 | |         }
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:456:3
+    |
+456 | /         unsafe {
+457 | |             let _ = gpu_core::memory::xfer(
+458 | |                 self.pinned_scalar_b as *mut c_void,
+459 | |                 self.metric_scalar_b.ptr_raw() as *const c_void,
+...   |
+463 | |             );
+464 | |         }
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:474:11
+    |
+474 |             return unsafe { *self.pinned_scalar };
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:476:3
+    |
+476 |         unsafe { *self.pinned_scalar }
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:496:3
+    |
+496 |         unsafe { *self.pinned_scalar }
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:499:3
+    |
+499 |         unsafe { *self.pinned_scalar_b }
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> recipe-infer/src/scratch.rs:582:11
+    |
+582 |         let _ = unsafe { gpu_core::hip::host_free(*g as *mut c_void) };
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `value_length`, `key_length_swa`, and `value_length_swa` are never read
+   --> recipe-infer/src/llm.rs:375:2
+    |
+358 | struct Hparams {
+    |        ------- fields in this struct
+...
+375 |     value_length: usize,
+    |     ^^^^^^^^^^^^
+376 |     key_length_swa: usize,
+    |     ^^^^^^^^^^^^^^
+377 |     value_length_swa: usize,
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: static variable `Bf16C` should have an upper case name
+   --> recipe-infer/src/dequant.rs:251:8
+    |
+251 | static Bf16C: Bf16Codec = Bf16Codec;
+    |        ^^^^^
+    |
+    = note: `#[warn(non_upper_case_globals)]` (part of `#[warn(nonstandard_style)]`) on by default
+help: convert the identifier to upper case
+    |
+251 - static Bf16C: Bf16Codec = Bf16Codec;
+251 + static BF16_C: Bf16Codec = Bf16Codec;
+    |
+
+warning: `recipe-infer` (lib) generated 21 warnings (run `cargo fix --lib -p recipe-infer` to apply 1 suggestion)
+warning: usage of an `unsafe` block
+   --> pantry/src/detect.rs:342:3
+    |
+342 |         unsafe { recipe_infer::exit_d2h_enqueue(sc.acts[last].ptr_raw(), n * N_CLASS * 8) }
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-W unsafe-code`
+
+warning: `pantry` (lib) generated 1 warning
+warning: usage of an `unsafe` block
+   --> src/utils/probe.rs:294:30
+    |
+294 |     let mut st: libc::statvfs = unsafe { mem::zeroed() };
+    |                                 ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-W unsafe-code`
+
+warning: usage of an `unsafe` block
+   --> src/utils/probe.rs:296:3
+    |
+296 |         unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> src/utils/probe.rs:529:32
+    |
+529 |   ...                   acc = acc.wrapping_add(unsafe {
+    |  ______________________________________________^
+530 | | ...                       ptr::read_volatile((base + i) as *const u8)
+531 | | ...                   } as u64);
+    | |_______________________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/probe.rs:614:2
+    |
+614 | /     unsafe {
+615 | |         libc::sync_file_range(
+616 | |             f.as_raw_fd(),
+617 | |             off as i64,
+...   |
+628 | |         );
+629 | |     }
+    | |_____^
+
+warning: usage of an `unsafe` block
+  --> src/utils/ooc.rs:95:30
+   |
+95 |     let mut st: libc::statvfs = unsafe { mem::zeroed() };
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+  --> src/utils/ooc.rs:96:22
+   |
+96 |     let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) }.cmp(&0) {
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> src/utils/ooc.rs:107:3
+    |
+107 |         unsafe { (b.ptr_raw() as *mut u8).add(byte_off) as *mut c_void },
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> src/utils/ooc.rs:114:2
+    |
+114 | /     unsafe {
+115 | |         libc::sync_file_range(
+116 | |             f.as_raw_fd(),
+117 | |             off as i64,
+...   |
+128 | |         );
+129 | |     }
+    | |_____^
+
+warning: usage of an `unsafe` block
+   --> src/utils/ooc.rs:241:3
+    |
+241 | /         unsafe {
+242 | |             use std::os::unix::io::AsRawFd;
+243 | |             libc::posix_fadvise(
+244 | |                 f.as_raw_fd(),
+...   |
+248 | |             );
+249 | |         }
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/ooc.rs:298:7
+    |
+298 | /                         unsafe {
+299 | |                             use std::os::unix::io::AsRawFd;
+300 | |                             libc::posix_fadvise(
+301 | |                                 f.as_raw_fd(),
+...   |
+305 | |                             );
+306 | |                         }
+    | |_________________________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/tui.rs:310:4
+    |
+310 | /             unsafe {
+311 | |                 libc::dup2(self.saved_stderr, 2);
+312 | |                 libc::close(self.saved_stderr);
+313 | |             }
+    | |_____________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/tui.rs:325:14
+    |
+325 |       let saved = unsafe {
+    |  _________________^
+326 | |         let saved = libc::dup(2);
+327 | |         if saved >= 0 {
+328 | |             libc::dup2(file.as_raw_fd(), 2);
+329 | |         }
+330 | |         saved
+331 | |     };
+    | |_____^
+
+warning: usage of an `unsafe` block
+   --> src/utils/wire.rs:219:2
+    |
+219 | /     unsafe {
+220 | |         let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
+221 | |         let Ordering::Equal = libc::getifaddrs(&mut ifap).cmp(&0) else {
+222 | |             return out;
+...   |
+254 | |         libc::freeifaddrs(ifap);
+255 | |     }
+    | |_____^
+
+warning: usage of an `unsafe` block
+  --> src/utils/train.rs:23:2
+   |
+23 |     unsafe { libc::_exit(130) };
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> src/utils/train.rs:577:3
+    |
+577 | /         unsafe {
+578 | |             libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+579 | |         }
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/train.rs:671:3
+    |
+671 | /         unsafe {
+672 | |             libc::signal(libc::SIGINT, libc::SIG_DFL);
+673 | |         }
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/train.rs:967:18
+    |
+967 |           let inflight = unsafe {
+    |  ________________________^
+968 | |             gpu_core::memory::exit_d2h_enqueue(src, prefix_bytes)
+969 | |                 .context("exit prefix d2h enqueue")?
+970 | |         };
+    | |_________^
+
+warning: usage of an `unsafe` block
+   --> src/utils/model.rs:503:15
+    |
+503 |         let model = unsafe { &*last.model };
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+   --> src/utils/model.rs:673:28
+    |
+673 |         let model: &ModelInner = unsafe { &*last_model };
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: usage of an `unsafe` block
+    --> src/utils/model.rs:1119:2
+     |
+1119 |     unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `recipe` (lib) generated 20 warnings
+   Compiling recipe v0.1.1 (/home/nate/Desktop/nates-recipe-rs)
+    Finished `release` profile [optimized] target(s) in 53.50s

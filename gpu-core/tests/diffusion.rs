@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 use core::ptr;
 use gpu_core::HipError;
 use gpu_core::diffusion::{Sample, gpu_diffusion_sample};

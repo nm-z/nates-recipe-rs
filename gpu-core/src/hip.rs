@@ -615,6 +615,16 @@ impl Event {
 		return check(unsafe { hipEventRecord(self.raw, stream) });
 	}
 
+	/// Record this event on the default (null) stream.
+	///
+	/// # Errors
+	/// Returns [`HipError`] if recording the HIP event fails.
+	#[inline]
+	pub fn record_default(&self) -> Result<(), HipError> {
+		// SAFETY: the null (default) stream is always a valid stream argument.
+		return unsafe { self.record(ptr::null_mut()) };
+	}
+
 	/// # Errors
 	/// Returns [`HipError`] if the HIP event synchronization fails.
 	#[inline]

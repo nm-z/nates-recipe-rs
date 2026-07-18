@@ -1229,6 +1229,95 @@ pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD
 	});
 }
 
+/// Safe wrapper over [`exit_d2h_enqueue`] taking the source as a buffer plus a
+/// byte count. Bounds-checks against the buffer so callers need no unsafe.
+///
+/// # Errors
+/// Returns [`HipError`] if the enqueue fails.
+pub fn exit_d2h_enqueue_buf(src: &GpuBuffer, bytes: usize) -> Result<ExitD2H, HipError> {
+	assert!(
+		bytes <= src.len,
+		"exit_d2h_enqueue_buf: {bytes} bytes exceeds buffer len {}",
+		src.len
+	);
+	// SAFETY: the assert proves src covers `bytes`; ptr_raw is a valid device pointer.
+	return unsafe { exit_d2h_enqueue(src.ptr_raw().cast_const(), bytes) };
+}
+
+/// Process-global two-slot pinned host buffer used for the deferred 8-byte
+/// metric-scalar downloads. Stored as an address so it stays `Send`.
+static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
+
+/// Address of the pinned two-`f64` pair, allocating it on first use. Returns 0
+/// if the pinned allocation fails.
+fn pinned_pair_addr() -> usize {
+	let mut g = match PINNED_PAIR.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if *g == 0 {
+		match crate::hip::host_malloc(16, 0) {
+			Ok(p) => *g = p.addr(),
+			Err(e) => {
+				Write::error(format!("pinned scalars: {e}"));
+				return 0;
+			}
+		}
+	}
+	return *g;
+}
+
+/// Download 8 bytes from `src` into pinned scalar `slot` (0 or 1) on `stream`,
+/// deferred (no sync). Safe: `slot` is masked to the two-slot pair and the copy
+/// size is fixed at one `f64`.
+pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream) {
+	let base = pinned_pair_addr();
+	if base == 0 {
+		return;
+	}
+	let dst = (base + (slot & 1) * size_of::<f64>()) as *mut c_void;
+	// SAFETY: dst is one f64 slot inside the 16-byte pinned pair; src covers 8
+	// bytes (a scalar buffer); stream is a valid HIP stream handle.
+	let r = unsafe {
+		xfer(
+			dst,
+			src.ptr_raw().cast_const(),
+			size_of::<f64>(),
+			HIP_MEMCPY_D2H,
+			stream.raw(),
+		)
+	};
+	if let Err(e) = r {
+		Write::error(format!("pinned download: {e}"));
+	}
+}
+
+/// Read pinned scalar `slot` (0 or 1). Returns 0.0 if the pinned pair could not
+/// be allocated. The caller must have synchronized the download stream first.
+#[must_use]
+pub fn pinned_read(slot: usize) -> f64 {
+	let base = pinned_pair_addr();
+	if base == 0 {
+		return 0.0;
+	}
+	// SAFETY: base points at a live 16-byte pinned allocation; slot&1 stays in it.
+	return unsafe { *((base + (slot & 1) * size_of::<f64>()) as *const f64) };
+}
+
+/// Free the pinned scalar pair after a device sync. Called during teardown.
+pub fn free_pinned_pair() {
+	let mut g = match PINNED_PAIR.lock() {
+		Ok(g) => g,
+		Err(p) => p.into_inner(),
+	};
+	if *g != 0 {
+		let _ = device_synchronize();
+		// SAFETY: the address came from host_malloc and is freed exactly once here.
+		let _ = unsafe { crate::hip::host_free(*g as *mut c_void) };
+		*g = 0;
+	}
+}
+
 /// Ledgered async device memset on the given stream.
 pub(crate) unsafe fn memset_dev(
 	dst: *mut c_void,
@@ -1411,24 +1500,13 @@ pub fn ram_probe_ask() -> Option<i32> {
 /// whether it survived. Core dumps are disabled in the child so an OOM-kill is
 /// silent, exactly as the VRAM claim probe does.
 fn spawn_ram_probe(want: usize) -> bool {
-	use std::os::unix::process::CommandExt as _;
 	let Ok(exe) = std::env::current_exe() else {
 		return false;
 	};
 	let mut c = std::process::Command::new(exe);
 	c.stdin(std::process::Stdio::null());
 	c.env("RAM_PROBE", want.to_string());
-	// SAFETY: setrlimit and Ok are async-signal-safe; the child only disables core dumps before exec.
-	unsafe {
-		c.pre_exec(|| {
-			let z = libc::rlimit {
-				rlim_cur: 0,
-				rlim_max: 0,
-			};
-			libc::setrlimit(libc::RLIMIT_CORE, &z);
-			return Ok(());
-		});
-	}
+	crate::sys::disable_core_dumps(&mut c);
 	return c.status().map(|s| return s.success()).unwrap_or(false);
 }
 
@@ -1776,7 +1854,7 @@ impl GpuBuffer {
 			}
 			return Ok(());
 		}
-		let bytes = dst.len() * 8;
+		let bytes = dst.len() * size_of::<f64>();
 		// SAFETY: dst holds bytes of valid host memory and self.ptr is a live device buffer of at least that size.
 		unsafe {
 			xfer(
@@ -1926,6 +2004,23 @@ impl GpuBuffer {
 		return self.len == 0;
 	}
 
+	/// Borrowed sub-window `[byte_off, byte_off+byte_len)` of this buffer.
+	/// The returned buffer does not own the memory; it stays valid only while
+	/// `self` does. Panics if the window runs past the end of the buffer.
+	#[inline]
+	#[must_use]
+	pub fn sub_view(&self, byte_off: usize, byte_len: usize) -> Self {
+		assert!(
+			byte_off.saturating_add(byte_len) <= self.len,
+			"sub_view [{byte_off}, {byte_off}+{byte_len}) exceeds buffer len {}",
+			self.len
+		);
+		// SAFETY: the assert above proves byte_off is within the allocation, so
+		// the offset pointer stays inside self's device buffer.
+		let p = unsafe { self.ptr.cast::<u8>().add(byte_off) }.cast::<c_void>();
+		return Self::borrow(p, byte_len);
+	}
+
 	#[inline]
 	#[must_use]
 	pub fn as_ptr_offset(&self, n_floats: usize) -> *mut c_void {
@@ -2018,6 +2113,19 @@ impl GpuBuffer {
 				stream,
 			);
 		}
+	}
+
+	/// Download `self` into `dst` on the default stream, then the caller
+	/// synchronizes. Safe wrapper over [`Self::download_async`]: the only
+	/// invariant the async form needs from a caller is a valid stream, and the
+	/// default stream is always valid, so this form carries none.
+	///
+	/// # Errors
+	/// Returns [`HipError`] if the download fails.
+	#[inline]
+	pub fn download(&self, dst: &mut [f64]) -> Result<(), HipError> {
+		// SAFETY: the null (default) stream is always valid; bounds come from dst.
+		return unsafe { self.download_async(dst, ptr::null_mut()) };
 	}
 
 	/// # Errors

@@ -5,10 +5,8 @@ use gpu_core::kernels;
 use gpu_core::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cell::Cell;
-use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::sync::Mutex;
 
 pub const SCRATCH_CONSTS: [f64; 12] = [
 	1.0,
@@ -74,8 +72,6 @@ pub struct Scratch {
 	pub conv_wg: usize,
 	pub infer: bool,
 	pub copy_stream: gpu_core::hip::Stream,
-	pub pinned_scalar: *mut f64,
-	pub pinned_scalar_b: *mut f64,
 	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
 	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
 	timing: Cell<bool>,
@@ -166,7 +162,7 @@ impl Scratch {
 			GpuBuffer::alloc(sz).map_err(|e| {
 				anyhow::anyhow!(
 					"{label}: GPU alloc of {} ({sz} × f64) failed — {e:?}",
-					crate::human_bytes(sz * 8)
+					crate::human_bytes(sz * size_of::<f64>())
 				)
 			})
 		};
@@ -292,10 +288,9 @@ impl Scratch {
 			}
 		}
 		let (conv_temp_buf, conv_wg_count) = if !forward_only && !light && max_conv_fsz > 0 {
-			let (mut free, mut total) = (0usize, 0usize);
-			unsafe { gpu_core::hip::hipMemGetInfo(&mut free, &mut total) };
+			let free = gpu_core::hip::mem_info().map(|m| m.free).unwrap_or(0);
 			let usable = free / 2;
-			let chunks = (usable / (max_conv_fsz * 8)).min(n).max(1);
+			let chunks = (usable / (max_conv_fsz * size_of::<f64>())).min(n).max(1);
 			let buf = alloc(max_conv_fsz * chunks, "conv_temp")?;
 			let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunks, max_conv_fsz);
 			if ws > max_ws {
@@ -306,7 +301,6 @@ impl Scratch {
 			(alloc(1, "conv_temp")?, 0)
 		};
 		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
-		let pinned_pair = pinned_scalar_pair();
 		let copy_stream = gpu_core::hip::Stream::new().context("copy stream")?;
 		let mut ev_fwd = Vec::with_capacity(n_timed);
 		let mut ev_bwd = Vec::with_capacity(n_timed);
@@ -374,8 +368,6 @@ impl Scratch {
 			conv_wg: conv_wg_count,
 			infer: forward_only,
 			copy_stream,
-			pinned_scalar: pinned_pair,
-			pinned_scalar_b: unsafe { pinned_pair.add(1) },
 			ev_fwd,
 			ev_bwd,
 			timing: Cell::new(false),
@@ -393,7 +385,7 @@ impl Scratch {
 
 	pub fn mark_fwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe { self.ev_fwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
+			let r = self.ev_fwd[self.timing_slot.get()][i].record_default();
 			if !r.is_ok() {
 				Write::error(format!(
 					"record fwd event: {}",
@@ -406,7 +398,7 @@ impl Scratch {
 
 	pub fn mark_bwd(&self, i: usize) {
 		if self.timing.get() {
-			let r = unsafe { self.ev_bwd[self.timing_slot.get()][i].record(ptr::null_mut()) };
+			let r = self.ev_bwd[self.timing_slot.get()][i].record_default();
 			if !r.is_ok() {
 				Write::error(format!(
 					"record bwd event: {}",
@@ -441,27 +433,11 @@ impl Scratch {
 	}
 
 	pub fn download_scalar_deferred(&self) {
-		unsafe {
-			let _ = gpu_core::memory::xfer(
-				self.pinned_scalar as *mut c_void,
-				self.metric_scalar.ptr_raw() as *const c_void,
-				8,
-				gpu_core::hip::HIP_MEMCPY_D2H,
-				self.copy_stream.raw(),
-			);
-		}
+		gpu_core::memory::pinned_download(0, &self.metric_scalar, &self.copy_stream);
 	}
 
 	pub fn download_scalar_b_deferred(&self) {
-		unsafe {
-			let _ = gpu_core::memory::xfer(
-				self.pinned_scalar_b as *mut c_void,
-				self.metric_scalar_b.ptr_raw() as *const c_void,
-				8,
-				gpu_core::hip::HIP_MEMCPY_D2H,
-				self.copy_stream.raw(),
-			);
-		}
+		gpu_core::memory::pinned_download(1, &self.metric_scalar_b, &self.copy_stream);
 	}
 
 	pub fn sync_deferred_scalar(&self) -> f64 {
@@ -471,14 +447,13 @@ impl Scratch {
 				"sync copy stream: {}",
 				r.err().map(|e| e.to_string()).unwrap_or_default()
 			));
-			return unsafe { *self.pinned_scalar };
 		}
-		unsafe { *self.pinned_scalar }
+		return gpu_core::memory::pinned_read(0);
 	}
 
 	pub fn read_metric_scalar(&self) -> f64 {
 		self.download_scalar_deferred();
-		self.sync_deferred_scalar()
+		return self.sync_deferred_scalar();
 	}
 
 	pub fn sync_copy_stream(&self) {
@@ -493,10 +468,10 @@ impl Scratch {
 	}
 
 	pub fn deferred_scalar(&self) -> f64 {
-		unsafe { *self.pinned_scalar }
+		return gpu_core::memory::pinned_read(0);
 	}
 	pub fn deferred_scalar_b(&self) -> f64 {
-		unsafe { *self.pinned_scalar_b }
+		return gpu_core::memory::pinned_read(1);
 	}
 }
 
@@ -552,35 +527,10 @@ impl Drop for Scratch {
 			.iter()
 			.any(|b| b.is_pool_owned());
 		if owned_any {
-			let _ = gpu_core::hip::device_synchronize();
+			if let Err(e) = gpu_core::hip::device_synchronize() {
+				Write::error(format!("Scratch::drop device sync: {e}"));
+			}
 		}
-	}
-}
-
-static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
-
-fn pinned_scalar_pair() -> *mut f64 {
-	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
-	if *g == 0 {
-		let hm = gpu_core::hip::host_malloc(16, 0);
-		if !hm.is_ok() {
-			Write::error(format!(
-				"pinned scalars: {}",
-				hm.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
-			));
-			return ptr::null_mut();
-		}
-		*g = hm.unwrap_or(ptr::null_mut()) as usize;
-	}
-	*g as *mut f64
-}
-
-pub fn free_pinned_pair() {
-	let mut g = PINNED_PAIR.lock().unwrap_or_else(|p| p.into_inner());
-	if *g != 0 {
-		let _ = gpu_core::hip::device_synchronize();
-		let _ = unsafe { gpu_core::hip::host_free(*g as *mut c_void) };
-		*g = 0;
 	}
 }
 

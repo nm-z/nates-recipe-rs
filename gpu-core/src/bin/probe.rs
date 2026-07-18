@@ -1,12 +1,12 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 use core::cmp::Ordering;
 use core::ptr;
 use gpu_core::log::{Errored, Opt, Write, gpu, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, math_ops};
-use std::process;
+use std::process::ExitCode;
 
-fn main() -> Result<(), Errored> {
+fn main() -> Result<ExitCode, Errored> {
 	let n = 8usize << 20i32;
 	let host = vec![4.0f64; n];
 	let x = GpuBuffer::alloc(n).map_err(|e| return Errored::new(format!("probe: alloc: {e}")))?;
@@ -23,7 +23,7 @@ fn main() -> Result<(), Errored> {
 	for (i, v) in back.iter().enumerate() {
 		if (v - 0.5f64).abs().partial_cmp(&1e-12f64) == Some(Ordering::Greater) {
 			Write::error(format!("probe: mismatch at {i}: {v}"));
-			process::exit(1);
+			return Ok(ExitCode::from(1));
 		}
 	}
 	hip::device_synchronize()
@@ -33,5 +33,5 @@ fn main() -> Result<(), Errored> {
 		..Opt::default()
 	});
 	Write::line(gpu, "probe: ok");
-	return Ok(());
+	return Ok(ExitCode::SUCCESS);
 }

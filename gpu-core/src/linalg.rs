@@ -410,7 +410,7 @@ pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
 /// # Errors
@@ -474,7 +474,7 @@ pub fn gpu_lu_solve_workspace_bytes(n: usize, nrhs: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
 /// # Errors
@@ -548,7 +548,7 @@ pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or_default() * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or_default() * size_of::<f64>();
 }
 
 /// # Errors
@@ -629,7 +629,7 @@ pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 			&raw mut lwork_q,
 		);
 	}
-	return usize::try_from(lwork.max(lwork_q).max(1)).unwrap_or(1) * 8;
+	return usize::try_from(lwork.max(lwork_q).max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
 /// # Errors
@@ -728,7 +728,7 @@ pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or(1) * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
 /// Symmetric eigendecomposition via hipsolver.
@@ -793,7 +793,7 @@ pub fn gpu_svd_workspace_bytes(m: usize, n: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return (usize::try_from(lwork.max(1)).unwrap_or(1) + m * n + n * n) * 8;
+	return (usize::try_from(lwork.max(1)).unwrap_or(1) + m * n + n * n) * size_of::<f64>();
 }
 
 /// # Errors

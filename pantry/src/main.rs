@@ -5,7 +5,7 @@
 use anyhow::Result;
 use recipe_infer::log::{Opt, Write, data, set_opt};
 use std::env;
-use std::process;
+use std::process::ExitCode;
 
 fn kind_name(k: usize) -> &'static str {
 	["Numeric", "Temporal", "Categorical", "Ordinal", "Text"]
@@ -14,7 +14,7 @@ fn kind_name(k: usize) -> &'static str {
 		.unwrap_or("Image")
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
 	set_opt(Opt {
 		data: true,
 		..Opt::default()
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
 		Write::error(
 			"usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)",
 		);
-		process::exit(1);
+		return Ok(ExitCode::from(1));
 	};
 
 	recipe_infer::init()?;
@@ -67,5 +67,5 @@ fn main() -> Result<()> {
 	}
 
 	recipe_infer::shutdown();
-	Ok(())
+	return Ok(ExitCode::SUCCESS);
 }

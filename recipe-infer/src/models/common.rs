@@ -392,8 +392,7 @@ fn attn_block(
 		ne,
 		&ar.v,
 	)?;
-	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2/lfm2/talkie
-	// regress with them, finding 20), so attn_bias stays a no-op
+	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2/lfm2/talkie regress with them, finding 20), so attn_bias stays a no-op
 	let _ = sp.attn_bias;
 	if sp.qk_norm {
 		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, "q_norm")?, &m.eps, t * nqh, hd, &ar.q)?;

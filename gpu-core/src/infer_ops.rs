@@ -2,7 +2,7 @@ use crate::HipError;
 use crate::callspy;
 use crate::hip::{check, hipGetLastError};
 use crate::kernels::ci;
-use crate::memory::GpuBuffer;
+use crate::memory::{Dtype, GpuBuffer};
 use core::ffi::c_void;
 use core::ptr;
 
@@ -16,6 +16,7 @@ fn cl() -> Result<(), HipError> {
 
 unsafe extern "C" {
 	fn launch_widen_bf16_f64(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
+	fn launch_widen_bf16_f32(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
 	fn launch_normx_rmsnorm(
 		x: *const c_void,
 		out: *mut c_void,
@@ -166,14 +167,14 @@ pub fn gpu_rope_partial_factors(
 /// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
 #[inline]
 pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
-	// SAFETY: raw and out are live GpuBuffer allocations sized for n f64 elements; the launcher only reads/writes within them.
+	let n64 = i64::try_from(n).map_err(|_e| return HipError(1))?;
+	// SAFETY: raw and out are live GpuBuffer allocations sized for n elements at out's dtype; the launcher only reads/writes within them.
 	unsafe {
-		launch_widen_bf16_f64(
-			raw.ptr_raw().cast_const(),
-			out.ptr_raw(),
-			i64::try_from(n).map_err(|_e| return HipError(1))?,
-			ptr::null_mut(),
-		);
+		if out.dtype() == Dtype::F32 {
+			launch_widen_bf16_f32(raw.ptr_raw().cast_const(), out.ptr_raw(), n64, ptr::null_mut());
+		} else {
+			launch_widen_bf16_f64(raw.ptr_raw().cast_const(), out.ptr_raw(), n64, ptr::null_mut());
+		}
 	}
 	return cl();
 }

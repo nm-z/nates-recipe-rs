@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 use gpu_core::HipError;
 use gpu_core::kernels::*;
 use gpu_core::log::{Write, epoch};

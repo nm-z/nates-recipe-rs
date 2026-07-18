@@ -8,7 +8,6 @@ use recipe_infer::{
 	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
 	load_ogdl_str, metric_gpu_into, pinned_vocab, plan_layer_params, zscore_apply_views,
 };
-use std::ffi::c_void;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
@@ -20,7 +19,7 @@ extern "C" fn on_sigint(_sig: i32) {
 	else {
 		return;
 	};
-	unsafe { libc::_exit(130) };
+	gpu_core::sys::exit_now(130);
 }
 #[derive(Clone, Copy)]
 enum Logged {
@@ -434,7 +433,7 @@ impl ModelInner {
 		let image_floats = image.len();
 		let ac_pre = recipe_infer::concat_layer_dims(&plan.dims())
 			.map(|d| crate::ooc::ConcatAc { a: d.a, c: d.c });
-		let need = image_floats * 8 + crate::ooc::Ooc::min_bytes(&plan.dims(), n, ac_pre);
+		let need = image_floats * size_of::<f64>() + crate::ooc::Ooc::min_bytes(&plan.dims(), n, ac_pre);
 		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
 			.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
 			.ok_or_else(|| {
@@ -574,9 +573,7 @@ impl ModelInner {
 		let _guard = gpu_core::memory::AllocGuard::freeze();
 		gpu_core::hw::arm_saturation_crash();
 		INTERRUPTED.store(0, Ordering::SeqCst);
-		unsafe {
-			libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
-		}
+		gpu_core::sys::on_sigint(on_sigint);
 		gpu_core::callspy::mark_loop_start();
 		let hip_init = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
@@ -668,12 +665,9 @@ impl ModelInner {
 		let hip_loop = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
 		let led_loop = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
 		drop(_guard);
-		unsafe {
-			libc::signal(libc::SIGINT, libc::SIG_DFL);
-		}
+		gpu_core::sys::reset_sigint();
 		drop(ooc);
-		let src = base.as_ptr_offset(0);
-		let host = self.park(slab, src, prefix_len, sc)?;
+		let host = self.park(slab, &base, prefix_len, sc)?;
 		Some(())
 			.filter(|_probe| d_sc > 0 && !rerun)
 			.map(|_probe| {
@@ -958,16 +952,14 @@ impl ModelInner {
 	fn park(
 		&self,
 		slab: GpuBuffer,
-		src: *mut c_void,
+		src: &GpuBuffer,
 		prefix_len: usize,
 		sc: Scratch,
 	) -> anyhow::Result<Vec<f64>> {
 		let mut host = vec![0.0f64; prefix_len];
-		let prefix_bytes = prefix_len * 8;
-		let inflight = unsafe {
-			gpu_core::memory::exit_d2h_enqueue(src, prefix_bytes)
-				.context("exit prefix d2h enqueue")?
-		};
+		let prefix_bytes = prefix_len * size_of::<f64>();
+		let inflight = gpu_core::memory::exit_d2h_enqueue_buf(src, prefix_bytes)
+			.context("exit prefix d2h enqueue")?;
 		gpu_core::hip::device_synchronize().context("exit drain")?;
 		drop(sc);
 		inflight.finish(&mut host);
@@ -999,13 +991,16 @@ impl ModelInner {
 			.unwrap_or_else(|| eff_x.clone());
 		let d = xinput.ncols();
 		let scaler = self.scaler.borrow();
-		let scaler_ref =
-			crate::some_or_err(scaler.as_ref(), "eval: missing scaler; train first")?;
+		let scaler_ref = scaler
+			.as_ref()
+			.ok_or_else(|| anyhow::anyhow!("eval: missing scaler; train first"))?;
 		let up = |m: &ndarray::Array2<f64>| -> anyhow::Result<GpuBuffer> {
 			let s = m.as_standard_layout();
-			let sl = crate::some_or_err(s.as_slice(), "eval upload: non-contiguous")?;
-			let b = crate::ok_or_err(GpuBuffer::alloc(sl.len()), "eval upload")?;
-			crate::ok_or_err(b.load(sl), "eval upload")?;
+			let sl = s
+				.as_slice()
+				.ok_or_else(|| anyhow::anyhow!("eval upload: non-contiguous"))?;
+			let b = GpuBuffer::alloc(sl.len()).context("eval upload")?;
+			b.load(sl).context("eval upload")?;
 			Ok(b)
 		};
 		let apply = |xraw: &GpuBuffer, rows: usize, cols: usize, sc: &Scaler| -> anyhow::Result<GpuBuffer> {
@@ -1019,19 +1014,16 @@ impl ModelInner {
 			let m_off = st.push(&sc.mean);
 			let s_off = st.push(&sc.std);
 			let host = st.into_host();
-			let img =
-				crate::ok_or_err(GpuBuffer::alloc(host.len().max(1)), "eval scaler stage")?;
-			crate::ok_or_err(img.load(&host), "eval scaler stage")?;
-			crate::ok_or_err(
-				zscore_apply_views(
-					xraw,
-					rows,
-					cols,
-					&img.view(m_off, cols),
-					&img.view(s_off, cols),
-				),
-				"eval zscore",
+			let img = GpuBuffer::alloc(host.len().max(1)).context("eval scaler stage")?;
+			img.load(&host).context("eval scaler stage")?;
+			zscore_apply_views(
+				xraw,
+				rows,
+				cols,
+				&img.view(m_off, cols),
+				&img.view(s_off, cols),
 			)
+			.context("eval zscore")
 		};
 		match Some(()).filter(|_probe| embed_first) {
 			Some(_ef) => {

@@ -9,7 +9,6 @@ use recipe_infer::{Metric, Pt, pt};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal};
 use std::mem;
-use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 
 #[derive(Clone, Copy)]
@@ -305,13 +304,7 @@ impl Drop for TermRestore {
 			event::DisableBracketedPaste
 		));
 		ratatui::restore();
-		if self.saved_stderr >= 0 {
-			// SAFETY: saved_stderr is a live dup of the original fd 2 from redirect_stderr; dup2 restores it and close releases the dup.
-			unsafe {
-				libc::dup2(self.saved_stderr, 2);
-				libc::close(self.saved_stderr);
-			}
-		}
+		gpu_core::sys::restore_stderr(self.saved_stderr);
 	}
 }
 
@@ -321,15 +314,7 @@ fn redirect_stderr(path: &str) -> i32 {
 	let Ok(file) = OpenOptions::new().create(true).write(true).truncate(true).open(path) else {
 		return -1;
 	};
-	// SAFETY: dup/dup2 on fd 2 and the open file's fd; on success fd 2 aliases the file and `saved` keeps the original open.
-	let saved = unsafe {
-		let saved = libc::dup(2);
-		if saved >= 0 {
-			libc::dup2(file.as_raw_fd(), 2);
-		}
-		saved
-	};
-	return saved;
+	return gpu_core::sys::redirect_stderr(&file);
 }
 
 fn new_input() -> TextArea<'static> {

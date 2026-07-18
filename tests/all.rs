@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
+#![allow(unsafe_code)]
 use std::any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;

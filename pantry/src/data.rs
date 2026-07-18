@@ -63,14 +63,18 @@ enum FirstRow {
 	Data,
 }
 
+/// Reads a CSV, treating EVERY line as a record (no implicit header) so the first
+/// row can be inspected before deciding its role — a CSV carries no header flag.
+/// Header detection is a CSV-format question, not a content heuristic: a header row
+/// names columns, so at least one cell is a non-number. If EVERY cell parses as f64
+/// (ints, decimals, signs, scientific notation), the first row is data, not names —
+/// synthesize col_0..col_{w-1} and keep the row. Binary structural test, no thresholds.
 pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let delim = sniff_delimiter(path);
 	let Some(()) = Some(()).filter(|_u| delim != b' ') else {
 		return read_raw_whitespace(path);
 	};
 	let disk = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
-	// Read EVERY line as a record (no implicit header) so the first row can be
-	// inspected before deciding its role — a CSV carries no header flag.
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
@@ -91,11 +95,6 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		.collect();
 	let w = first_cells.len();
 
-	// Header detection is a CSV-format question, not a content heuristic: a header
-	// row names columns, so at least one cell is a non-number. If EVERY cell parses
-	// as f64 (ints, decimals, signs, scientific notation), the first row is dat,
-	// not names — synthesize col_0..col_{w-1} and keep the row. Binary structural
-	// test, no thresholds.
 	let first_row = match first_cells.first() {
 		None => FirstRow::Header,
 		Some(_c0) => match first_cells.iter().find(|c| {
@@ -476,16 +475,13 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		.and_then(|s| s.to_str())
 		.unwrap_or(dir);
 	pb.set_message(format!("decoding images in /{leaf}"));
-	// A directory of image files is ONE vector, indexed by filename (stem) — the
-	// join key a CSV column of filenames matches against. (Previously each unique
-	// stem became its own single-image group, so nothing could join.)
+	// A directory of image files is ONE vector, indexed by filename (stem) — the join key a CSV column of filenames matches against. (Previously each unique stem became its own single-image group, so nothing could join.)
 	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())
 		.unwrap_or("images")
 		.to_string();
 	let all: Vec<PathBuf> = images.into_values().flatten().map(|hp| hp.path).collect();
-	// The images' own native resolution sets the matrix width — no picked resize target.
 	let first_img = image::open(&all[0])
 		.with_context(|| format!("failed to read image dimensions: {}", all[0].display()))?;
 	let iw = first_img.width();
@@ -609,8 +605,6 @@ fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 	}
 	Ok(())
 }
-
-// ── file → columns: all source parsing (csv / arff / dir / zip / sqlite) ─────
 
 pub fn load_groups(path: &str) -> Result<Vec<DirGroup>> {
 	let p = Path::new(path);

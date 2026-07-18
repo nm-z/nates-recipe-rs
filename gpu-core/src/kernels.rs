@@ -1937,10 +1937,10 @@ pub fn gpu_cholesky_solve_workspace_bytes(n: usize) -> usize {
 		);
 	}
 	if let Ok(bytes) = usize::try_from(lwork.max(1i32)) {
-		return bytes * 8;
+		return bytes * size_of::<f64>();
 	}
 	Write::error(format!("workspace size {lwork} is negative"));
-	return 8;
+	return size_of::<f64>();
 }
 
 /// # Errors
@@ -2128,7 +2128,7 @@ pub fn gpu_solve_getrf_workspace_bytes(n: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or(0) * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or(0) * size_of::<f64>();
 }
 
 #[must_use]
@@ -2150,7 +2150,7 @@ pub fn gpu_solve_getrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 			&raw mut lwork_s,
 		);
 	}
-	return usize::try_from(lwork_s.max(1)).unwrap_or(0) * 8;
+	return usize::try_from(lwork_s.max(1)).unwrap_or(0) * size_of::<f64>();
 }
 
 /// Solves the dense linear system `A x = b` on the GPU by LU factorization.
@@ -2252,7 +2252,7 @@ pub fn gpu_cholesky_workspace_bytes(n: usize) -> usize {
 			&raw mut lwork,
 		);
 	}
-	return usize::try_from(lwork.max(1)).unwrap_or(0) * 8;
+	return usize::try_from(lwork.max(1)).unwrap_or(0) * size_of::<f64>();
 }
 
 /// # Errors
@@ -6222,7 +6222,7 @@ pub fn gpu_col2im_1d(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
-	out.memset_zero(n * p * 8)?;
+	out.memset_zero(n * p * size_of::<f64>())?;
 	let n_i32 = ci(n)?;
 	let p_i32 = ci(p)?;
 	let ks_i32 = ci(ks)?;
@@ -6258,7 +6258,7 @@ pub fn gpu_col2im_2d(
 ) -> Result<(), HipError> {
 	let out_h = h - kh + 1;
 	let out_w = w - kw + 1;
-	out.memset_zero(n * c * h * w * 8)?;
+	out.memset_zero(n * c * h * w * size_of::<f64>())?;
 	// SAFETY: buffer pointers are live device allocations and the launcher arg types match the extern decl.
 	unsafe {
 		launch_col2im_2d(
@@ -6317,7 +6317,7 @@ pub fn gpu_max_pool_1d_backward(
 	n_filters: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	out.memset_zero(n * out_len * n_filters * 8)?;
+	out.memset_zero(n * out_len * n_filters * size_of::<f64>())?;
 	// SAFETY: grad, indices, and out are valid device buffers and the launch args match the kernel ABI.
 	unsafe {
 		launch_max_pool_1d_backward(
@@ -6390,7 +6390,7 @@ pub fn gpu_avg_pool_2d_backward(
 ) -> Result<(), HipError> {
 	let out_h = (h - kh).div_euclid(sh) + 1;
 	let out_w = (w - kw).div_euclid(sw) + 1;
-	out.memset_zero(n * c * h * w * 8)?;
+	out.memset_zero(n * c * h * w * size_of::<f64>())?;
 	// SAFETY: FFI kernel launch; buffer pointers are valid and dims are checked to i32.
 	unsafe {
 		launch_avg_pool_2d_backward(
@@ -6468,7 +6468,7 @@ pub fn gpu_max_pool_2d_backward(
 	out_w: usize,
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
-	out.memset_zero(n * c * h * w * 8)?;
+	out.memset_zero(n * c * h * w * size_of::<f64>())?;
 	// SAFETY: grad, indices, and out are live device allocations outliving the launch; sizes are range-checked casts.
 	unsafe {
 		launch_max_pool_2d_backward(

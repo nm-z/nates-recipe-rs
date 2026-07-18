@@ -17,7 +17,6 @@ use std::fs::File;
 use std::io;
 use std::mem;
 use std::os::unix::fs::FileExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,11 +116,14 @@ impl Headless {
 		return Ok(h);
 	}
 
+	/// Runs the forward for `seq` and returns the final-position logits. The
+	/// input-embedding scale is 1.0 except for arches whose graph scales it (gemma).
+	/// For talkie, the embedding is non-parametrically RMS'd in place and frozen as
+	/// the per-layer skip source (talkie.cpp:50-53).
 	fn logits_last(&self, seq: &[u32]) -> Result<Vec<f64>> {
 		let (m, ar) = (&self.m, &self.ar);
 		let (ne, nl) = (m.hp.ne, m.hp.nl);
 		let t = seq.len();
-		// Input-embedding scale is 1.0 except for arches whose graph scales it (gemma).
 		let scale = models::embedding_scale(m);
 		let mut base = vec![0.0f64; t * ne];
 		for (p, &tk) in seq.iter().enumerate() {
@@ -137,8 +139,6 @@ impl Headless {
 		if let Some((g, b)) = &m.embed_norm {
 			gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
 		}
-		// talkie: non-parametric RMS the embedding in place, then freeze it as the
-		// per-layer skip source (talkie.cpp:50-53).
 		if models::embd_skip(m) {
 			gpu_rmsnorm_f64_nogamma(&h0, &m.eps, t, ne, &h0)?;
 			gpu_copy_into(&h0, t * ne, &ar.embd_skip)?;
@@ -437,6 +437,17 @@ impl Hparams {
 		return self.head_k_mla > 0 && self.head_v_mla > 0;
 	}
 
+	/// Parses arch-specific hyperparameters, with several derivations that mirror
+	/// llama.cpp defaults for minimal GGUFs:
+	/// - head dim = embedding_length / head_count when explicit key_length/value_length are absent.
+	/// - minicpm3 is a naive (non-absorbed) MLA: it ships q/kv-lora ranks but no key_length_mla/value_length_mla, so per-head key/value dims derive from the standard key_length/value_length to size the MLA scratch and widen window.
+	/// - plamo2 derives its low-rank dt width from n_embd (plamo2.cpp:43).
+	/// - recurrent-layer interleave for the delta hybrids comes from the declared recurrent_layers array, else n_head_kv[l]==0 (kimi, mamba-hybrid style); KDA head count = recurrent-layer ssm_dt.bias width / kda.head_dim.
+	/// Widen-window sizing (win_elems = widest widened-f64 matrix live at once; stage_bytes = widest raw bf16 region staged at once):
+	/// - MLA latent projections (wq_b is q_lora_rank x n_head*head_k_mla) can exceed any standard projection, so the window must cover them.
+	/// - SSM projections can exceed any attention/FFN weight (mamba-1 ssm_in = 2*d_inner*ne; mamba-2 = d_in_proj*ne where d_in_proj = 2*d_inner + 2*n_group*d_state + n_head, n_head=dt_rank), so the window covers the widest single-tensor stream.
+	/// - gated-delta activation scratch width covers conv_dim, d_inner, the fused Q+gate projection, and the per-head state dim (zero for non-delta arches).
+	/// - lfm2 shortconv in_proj is [3*ne, ne], wider than any attention/FFN weight.
 	fn from_gguf(g: &Gguf) -> Result<Hparams> {
 		let arch = str_kv(g, "general.architecture")?;
 		let k = |s: &str| format!("{arch}.{s}");
@@ -452,8 +463,6 @@ impl Hparams {
 		let used = uint_kv_or(g, &k("expert_used_count"), 0)?;
 		let n_head_arr = uint_or_arr(g, &k("attention.head_count"), nl, 0)?;
 		let nqh = n_head_arr.iter().copied().max().unwrap_or(0);
-		// llama.cpp default: head dim = embedding_length / head_count when the
-		// explicit key_length/value_length keys are absent (minimal GGUFs).
 		let head_dim_default = if nqh > 0 { ne / nqh } else { 0 };
 		let key_length = uint_kv_or(g, &k("attention.key_length"), head_dim_default)?;
 		let value_length = uint_kv_or(g, &k("attention.value_length"), head_dim_default)?;
@@ -461,9 +470,6 @@ impl Hparams {
 		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
 		let q_lora_rank = uint_kv_or(g, &k("attention.q_lora_rank"), 0)?;
 		let kv_lora_rank = uint_kv_or(g, &k("attention.kv_lora_rank"), 0)?;
-		// minicpm3 is a naive (non-absorbed) MLA: it ships q/kv-lora ranks but no
-		// key_length_mla/value_length_mla, so derive the per-head key/value dims from
-		// the standard key_length/value_length to size the MLA scratch + widen window.
 		let (head_k_mla, head_v_mla) = if arch == "minicpm3" {
 			(key_length, value_length)
 		} else {
@@ -512,18 +518,14 @@ impl Hparams {
 		let ssm_dt_rank = uint_kv_or(g, &k("ssm.time_step_rank"), 0)?;
 		let ssm_n_group_raw = uint_kv_or(g, &k("ssm.group_count"), 0)?;
 		let ssm_n_group = if ssm_n_group_raw == 0 { 1 } else { ssm_n_group_raw };
-		// plamo2 derives its low-rank dt width from n_embd (plamo2.cpp:43)
 		let ssm_dt_dim = if arch == "plamo2" { (ne / 16).max(64) } else { 0 };
 		let kda_head_dim = uint_kv_or(g, &k("kda.head_dim"), 0)?;
-		// Per-layer recurrent interleave for the delta hybrids: the declared
-		// recurrent_layers array, else n_head_kv[l]==0 (kimi, mamba-hybrid style).
 		let is_recr: Vec<bool> = match g.kv.get(&k("attention.recurrent_layers")) {
 			Some(Val::Arr(_items)) => {
 				uint_arr(g, &k("attention.recurrent_layers"))?.iter().map(|&x| x != 0).collect()
 			}
 			_other => head_count_kv.iter().map(|&kv| kv == 0).collect(),
 		};
-		// KDA head count = recurrent-layer ssm_dt.bias width / kda.head_dim.
 		let kda_n_head = if kda_head_dim > 0 {
 			is_recr
 				.iter()
@@ -594,11 +596,6 @@ impl Hparams {
 		let gu_bytes = 2 * nffe * ne * 2;
 		let dn_bytes = nffe * ne * 2;
 		let slot_bytes = gu_bytes + dn_bytes;
-		// win_elems: widest widened-f64 matrix live at once (q/k/v/o proj, dense FFN,
-		// or a widened gate_up expert). stage_bytes: widest raw bf16 region staged at
-		// once (biggest single weight, or a full combined expert slot).
-		// MLA latent projections (wq_b is q_lora_rank x n_head*head_k_mla) can be
-		// wider than any standard projection, so the widen window must cover them.
 		let mla_win = if head_k_mla > 0 && head_v_mla > 0 {
 			let nope = head_k_mla.saturating_sub(n_rot);
 			[
@@ -614,10 +611,6 @@ impl Hparams {
 		} else {
 			0
 		};
-		// SSM projections can be wider than any attention/FFN weight (mamba-1's
-		// ssm_in is 2*d_inner*ne; mamba-2's is d_in_proj*ne where d_in_proj =
-		// 2*d_inner + 2*n_group*d_state + n_head, with n_head=dt_rank), so the
-		// widen window must cover the widest single-tensor stream.
 		let ssm_win = if ssm_d_inner > 0 {
 			[
 				2 * ssm_d_inner * ne,
@@ -633,8 +626,6 @@ impl Hparams {
 		} else {
 			0
 		};
-		// Gated-delta activation scratch width (conv_dim, d_inner, the fused Q+gate
-		// projection, the per-head state dim). Zero for non-delta arches.
 		let delta_win = if models::is_delta_arch(&arch) {
 			let d = ssm_d_state.max(kda_head_dim);
 			let di = ssm_d_inner.max(kda_head_dim * kda_n_head);
@@ -643,7 +634,6 @@ impl Hparams {
 		} else {
 			0
 		};
-		// lfm2 shortconv in_proj is [3*ne, ne], wider than any attention/FFN weight.
 		let shortconv_win = if shortconv_l_cache > 0 { 3 * ne * ne } else { 0 };
 		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne)
 			.max(mla_win)
@@ -1503,8 +1493,7 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 			},
 		);
 	}
-	// lfm2/lfm2moe ship the FINAL pre-lm_head norm under the name token_embd_norm
-	// (LLM_TENSOR_OUTPUT_NORM_LFM2), applied as output_norm, not an embed norm.
+	// lfm2/lfm2moe ship the FINAL pre-lm_head norm under the name token_embd_norm (LLM_TENSOR_OUTPUT_NORM_LFM2), applied as output_norm, not an embed norm.
 	if matches!(hp.arch.as_str(), "lfm2" | "lfm2moe")
 		&& let Some(t) = big.remove("model.decoder.embed_norm.weight")
 	{
@@ -1594,6 +1583,13 @@ fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 	}
 }
 
+/// Materializes the loaded tensors into a `Model`, applying several arch-specific
+/// fixups:
+/// - minicpm3 hardcodes scale_depth=1.4 (minicpm3.cpp:67); the per-layer residual scale is scale_depth/sqrt(n_layer), applied to both the attn and FFN outputs.
+/// - talkie's per-head scalar Q gain [n_head] expands to [nqh*hd] so a single broadcast-mul applies each head's scalar across its head_dim.
+/// - plamo2's causal conv ships no bias, so a zero one is synthesized for the shared launcher.
+/// - LongRoPE per-pair frequency factors (minicpm3): for a context within the original training length the short factors apply (get_rope_factors); the fixtures ship identity factors, so this is exact machinery.
+/// - untied LM head: some models (e.g. llama with a separate output.weight) project the final hidden state through their own matrix rather than the tied token embedding, loaded when present so lm_head uses the right one.
 fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> Result<Model> {
 	Write::line(data, "allocating stage+win");
 	let eps = {
@@ -1613,8 +1609,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	};
 	let res_scale = {
 		let ub = falloc(1)?;
-		// minicpm3 hardcodes scale_depth=1.4 (minicpm3.cpp:67), the per-layer residual
-		// scale is scale_depth/sqrt(n_layer), applied to both the attn and FFN outputs.
 		let s = if hp.arch == "minicpm3" {
 			1.4 / (hp.nl as f64).sqrt()
 		} else if hp.residual_scale > 0.0 {
@@ -1722,8 +1716,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			return Ok(None);
 		};
 		m.o_bias.push(opt_bias(&m, p("self_attn.o_proj.bias"))?);
-		// talkie's per-head scalar Q gain [n_head] expands to [nqh*hd] so a single
-		// broadcast-mul applies each head's scalar across its head_dim.
 		let qhs = if m.hp.arch == "talkie" && m.big.contains_key(&p("self_attn.q_norm.weight")) {
 			let per_head = m.small_f64(&p("self_attn.q_norm.weight"))?;
 			let (nqh, hd) = (m.hp.dims[l].nqh, m.hp.dims[l].hd);
@@ -1763,7 +1755,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			ub
 		});
 		m.ssm_conv_w.push(opt_bias(&m, p("self_attn.ssm_conv1d.weight"))?);
-		// plamo2's causal conv ships no bias; synthesize a zero one for the shared launcher
 		let conv_b = match opt_bias(&m, p("self_attn.ssm_conv1d.bias"))? {
 			Some(b) => Some(b),
 			None if m.big.contains_key(&p("self_attn.ssm_conv1d.weight")) => {
@@ -1789,9 +1780,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	}
 
 	Write::line(data, "globals + embedding table");
-	// LongRoPE per-pair frequency factors (minicpm3). For a context within the
-	// original training length the short factors apply (get_rope_factors); the
-	// fixtures ship identity factors, so this is exact and correct machinery.
 	if m.big.contains_key("model.decoder.rope_short.weight") {
 		let vals = m.small_f64("model.decoder.rope_short.weight")?;
 		let ub = falloc(vals.len())?;
@@ -1857,9 +1845,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	}
 	m.emb = m.read_bytes(et, 0, et.nbytes)?;
 
-	// Untied LM head: some models (e.g. llama with a separate output.weight)
-	// project the final hidden state through their own matrix rather than the
-	// tied token embedding. Load it when present so lm_head uses the right one.
 	if let Some(ot) = m.big.get("model.decoder.lm_head.weight").cloned() {
 		if ot.shape == vec![vocab, ne] {
 			m.out = m.read_bytes(&ot, 0, ot.nbytes)?;
@@ -2404,17 +2389,7 @@ fn probe_claim() -> Result<Waterfall> {
 			let mut c = process::Command::new(env::current_exe()?);
 			c.stdin(process::Stdio::null());
 			c.env("VRAM_PROBE", want.to_string());
-			c.stdin(process::Stdio::null());
-			unsafe {
-				c.pre_exec(|| {
-					let z = libc::rlimit {
-						rlim_cur: 0,
-						rlim_max: 0,
-					};
-					libc::setrlimit(libc::RLIMIT_CORE, &z);
-					Ok(())
-				});
-			}
+			gpu_core::sys::disable_core_dumps(&mut c);
 			c.status().context("spawn claim probe")?
 		};
 		beat();

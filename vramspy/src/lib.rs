@@ -1,4 +1,5 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
+#![allow(non_snake_case, reason = "interposed HSA symbols carry C ABI names")]
 //! `LD_PRELOAD` interposer for exactly four HSA allocation entry points:
 //! `hsa_amd_memory_pool_{allocate,free}` and `hsa_memory_{allocate,free}`.
 //! Every allocation is classified by which AGENT owns its pool (device vs.
@@ -9,8 +10,6 @@
 //! libhsa-runtime64.so and reaches these symbols through the dynamic symbol
 //! table — `LD_PRELOAD` makes this library resolve first.
 
-#![deny(clippy::unwrap_used)]
-#![allow(non_snake_case, reason = "interposed HSA symbols carry C ABI names")]
 
 use core::ffi::{CStr, c_void};
 use core::mem;
@@ -136,7 +135,7 @@ struct Real {
 // SAFETY: plain C function pointers into a shared library, safe to share across threads.
 unsafe impl Sync for Real {}
 
-/// Resolves `name` via `RTLD_NEXT`, aborting on miss.
+/// Resolves `name` via `RTLD_NEXT`, returning 0 on miss (never aborts the host).
 fn resolve_next(name: &CStr) -> usize {
 	// SAFETY: dlsym with a valid NUL-terminated name; RTLD_NEXT is well-defined under LD_PRELOAD.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
@@ -145,8 +144,7 @@ fn resolve_next(name: &CStr) -> usize {
 			"vramspy: RTLD_NEXT resolution failed for {}",
 			name.to_string_lossy()
 		));
-		// SAFETY: abort takes no arguments and never returns.
-		unsafe { libc::abort() }
+		return 0;
 	};
 	return nn.as_ptr().addr();
 }

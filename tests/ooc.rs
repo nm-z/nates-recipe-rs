@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime and libc")]
+#![allow(unsafe_code)]
 use core::ptr;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;

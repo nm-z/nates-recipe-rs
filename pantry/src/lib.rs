@@ -1,6 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::match_wild_err_arm)]
+#![allow(unsafe_code)]
 //! Owns all parsing: loaders (csv/arff/zip/dir) + column-type detection. Parse
 //! any format, detect column types via the char-level detector, export OGDL.
 //! Depends on `recipe-infer` (the forward engine) plus leaf utility crates only —
@@ -29,7 +27,6 @@ pub use detect::*;
 /// (one-hot / index / token-id / day-count); here it is just the taxonomy the
 /// loaders and the char-level detector speak in.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub enum Kind {
 	Numeric,
 	Temporal,

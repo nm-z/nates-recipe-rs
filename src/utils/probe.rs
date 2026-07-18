@@ -19,16 +19,13 @@ use gpu_core::log::{Opt, Write, probe, set_opt};
 use gpu_core::memory::{GpuBuffer, USER_GB, par_copy, par_touch};
 use std::cmp::Ordering;
 use std::env;
-use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::hint;
 use std::io::BufReader;
-use std::mem;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::ptr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -290,14 +287,8 @@ fn bench_bytes(buffers: usize) -> Result<usize> {
 }
 
 fn disk_total(path: &Path) -> Result<u64> {
-	let c = CString::new(path.as_os_str().as_encoded_bytes())?;
-	let mut st: libc::statvfs = unsafe { mem::zeroed() };
-	ensure!(
-		unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0,
-		"probe: statvfs failed for {}",
-		path.display()
-	);
-	Ok((st.f_blocks as u64).saturating_mul(st.f_frsize as u64))
+	return gpu_core::sys::disk_total_bytes(path)
+		.ok_or_else(|| anyhow!("probe: statvfs failed for {}", path.display()));
 }
 
 fn link_speed_gbs() -> f64 {
@@ -459,9 +450,9 @@ fn bench_gemm() -> Result<f64> {
 	let w = GpuBuffer::alloc(k * n)?;
 	let bias = GpuBuffer::alloc(n)?;
 	let out = GpuBuffer::alloc(m * n)?;
-	x.memset_zero(m * k * 8)?;
-	w.memset_zero(k * n * 8)?;
-	bias.memset_zero(n * 8)?;
+	x.memset_zero(m * k * size_of::<f64>())?;
+	w.memset_zero(k * n * size_of::<f64>())?;
+	bias.memset_zero(n * size_of::<f64>())?;
 	let flop = 2.0 * m as f64 * n as f64 * k as f64;
 	let mut best = f64::INFINITY;
 	for _rep in 0..5 {
@@ -478,8 +469,8 @@ fn bench_transfer() -> Result<f64> {
 	let n = 32usize << 20;
 	let src = GpuBuffer::alloc(n)?;
 	let dst = GpuBuffer::alloc(n)?;
-	src.memset_zero(n * 8)?;
-	let bytes = n * 8;
+	src.memset_zero(n * size_of::<f64>())?;
+	let bytes = n * size_of::<f64>();
 	let mut best = f64::INFINITY;
 	for _rep in 0..5 {
 		gpu_core::hip::device_synchronize()?;
@@ -512,7 +503,7 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 		.map(|n| n.get())
 		.unwrap_or(1);
 	let per = bytes.div_ceil(threads);
-	let base = buf.as_ptr() as usize;
+	let buf = &buf;
 	let mut best = f64::INFINITY;
 	for _rep in 0..5 {
 		let t = Instant::now();
@@ -524,13 +515,7 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 					match off.cmp(&bytes) {
 						Ordering::Less => {
 							let len = per.min(bytes - off);
-							let mut acc = 0u64;
-							for i in (off..off + len).step_by(64) {
-								acc = acc.wrapping_add(unsafe {
-									ptr::read_volatile((base + i) as *const u8)
-								} as u64);
-							}
-							acc
+							gpu_core::sys::volatile_read_sum(&buf[off..off + len], 64)
 						}
 						Ordering::Greater | Ordering::Equal => 0u64,
 					}
@@ -610,23 +595,7 @@ fn bench_disk(dir: &Path, bytes: usize) -> Result<f64> {
 }
 
 fn drop_cache(f: &File, off: u64, len: usize) {
-	use std::os::unix::io::AsRawFd;
-	unsafe {
-		libc::sync_file_range(
-			f.as_raw_fd(),
-			off as i64,
-			len as i64,
-			libc::SYNC_FILE_RANGE_WAIT_BEFORE
-				| libc::SYNC_FILE_RANGE_WRITE
-				| libc::SYNC_FILE_RANGE_WAIT_AFTER,
-		);
-		libc::posix_fadvise(
-			f.as_raw_fd(),
-			off as i64,
-			len as i64,
-			libc::POSIX_FADV_DONTNEED,
-		);
-	}
+	gpu_core::sys::evict_range(f, off, len);
 }
 
 pub fn write_config(machines: &[Machine]) -> String {

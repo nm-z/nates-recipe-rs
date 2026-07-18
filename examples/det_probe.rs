@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 // Determinism probe: every GPU op the diffusion forward composes, run twice on
 // identical inputs, bit-compared. A DIVERGED op is the source of the observed
 // run-to-run output variance (atomic f64 accumulation or a stream race).
@@ -171,7 +171,7 @@ fn bench_shape(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> 
 	gpu_core::hip::device_synchronize().context("sync2")?;
 	let cus_ms = t1.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
 
-	let b_bytes = (n * k * 8) as f64;
+	let b_bytes = (n * k * size_of::<f64>()) as f64;
 	let floor_ms = b_bytes / 432e9 * 1000.0;
 	let roc_gbs = b_bytes / (roc_ms / 1000.0) / 1e9;
 	let cus_gbs = b_bytes / (cus_ms / 1000.0) / 1e9;

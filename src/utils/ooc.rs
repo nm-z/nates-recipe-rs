@@ -8,11 +8,8 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::VecDeque;
-use std::ffi::CString;
-use std::ffi::c_void;
 use std::fs;
 use std::fs::File;
-use std::mem;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process;
@@ -89,44 +86,15 @@ fn mem_available() -> usize {
 }
 
 fn disk_free(path: &Path) -> usize {
-	let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else {
-		return 0;
-	};
-	let mut st: libc::statvfs = unsafe { mem::zeroed() };
-	let Ok(()) = (match unsafe { libc::statvfs(c.as_ptr(), &mut st) }.cmp(&0) {
-		cmp::Ordering::Equal => Ok(()),
-		cmp::Ordering::Less | cmp::Ordering::Greater => Err(()),
-	}) else {
-		return 0;
-	};
-	(st.f_bavail as usize).saturating_mul(st.f_frsize as usize)
+	return gpu_core::sys::disk_free_bytes(path);
 }
 
 pub fn view(b: &GpuBuffer, byte_off: usize, byte_len: usize) -> GpuBuffer {
-	GpuBuffer::borrow(
-		unsafe { (b.ptr_raw() as *mut u8).add(byte_off) as *mut c_void },
-		byte_len,
-	)
+	return b.sub_view(byte_off, byte_len);
 }
 
 fn drop_cache(f: &File, off: u64, len: usize) {
-	use std::os::unix::io::AsRawFd;
-	unsafe {
-		libc::sync_file_range(
-			f.as_raw_fd(),
-			off as i64,
-			len as i64,
-			libc::SYNC_FILE_RANGE_WAIT_BEFORE
-				| libc::SYNC_FILE_RANGE_WRITE
-				| libc::SYNC_FILE_RANGE_WAIT_AFTER,
-		);
-		libc::posix_fadvise(
-			f.as_raw_fd(),
-			off as i64,
-			len as i64,
-			libc::POSIX_FADV_DONTNEED,
-		);
-	}
+	gpu_core::sys::evict_range(f, off, len);
 }
 
 enum Interrupt {
@@ -238,15 +206,7 @@ impl Paged {
 		f.read_exact_at(&mut buf[..len], off)
 			.context("ooc spill read")?;
 		DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
-		unsafe {
-			use std::os::unix::io::AsRawFd;
-			libc::posix_fadvise(
-				f.as_raw_fd(),
-				off as i64,
-				len as i64,
-				libc::POSIX_FADV_DONTNEED,
-			);
-		}
+		gpu_core::sys::advise_dontneed(f, off, len);
 		Ok(buf)
 	}
 	fn fresh_net_read(
@@ -279,7 +239,7 @@ impl Paged {
 		let mut next0 = q.back().map_or(s0 + cnt, |a| a.s0 + a.cnt);
 		while q.len() < AHEAD && next0 < n {
 			let next_cnt = cnt.min(n - next0);
-			let len = next_cnt * self.spb * 8;
+			let len = next_cnt * self.spb * size_of::<f64>();
 			let h = match &self.homes[next0 / self.chunk] {
 				Home::Disk(off) => {
 					let off = *off;
@@ -295,15 +255,7 @@ impl Paged {
 						f.read_exact_at(&mut buf[..len], off)
 							.context("ooc spill read-ahead")?;
 						DISK_R_BYTES.fetch_add(len, Ordering::Relaxed);
-						unsafe {
-							use std::os::unix::io::AsRawFd;
-							libc::posix_fadvise(
-								f.as_raw_fd(),
-								off as i64,
-								len as i64,
-								libc::POSIX_FADV_DONTNEED,
-							);
-						}
+						gpu_core::sys::advise_dontneed(&f, off, len);
 						Ok(buf)
 					})
 				}
@@ -355,7 +307,7 @@ impl Paged {
 		n: usize,
 		host: &HostPool,
 	) -> anyhow::Result<GpuBuffer> {
-		let len = cnt * self.spb * 8;
+		let len = cnt * self.spb * size_of::<f64>();
 		Ok(match &self.homes[self.win(s0, cnt)?] {
 			Home::Vram(b) => view(b, 0, len),
 			Home::Ram(v) => {
@@ -416,7 +368,7 @@ impl Paged {
 		})
 	}
 	fn write_view(&self, s0: usize, cnt: usize, win: &GpuBuffer) -> anyhow::Result<GpuBuffer> {
-		let len = cnt * self.spb * 8;
+		let len = cnt * self.spb * size_of::<f64>();
 		Ok(match &self.homes[self.win(s0, cnt)?] {
 			Home::Vram(b) => view(b, 0, len),
 			_spilled => view(win, 0, len),
@@ -430,7 +382,7 @@ impl Paged {
 		writer: &Writer,
 		host: &HostPool,
 	) -> anyhow::Result<()> {
-		let len = cnt * self.spb * 8;
+		let len = cnt * self.spb * size_of::<f64>();
 		let w = self.win(s0, cnt)?;
 		match &mut self.homes[w] {
 			Home::Vram(_buf) => Ok(()),
@@ -606,10 +558,10 @@ pub use gpu_core::memory::USER_GB;
 pub fn plan(need: usize, net_ram: usize) -> Option<Plan> {
 	let vram_avail = gpu_core::memory::claimable_bytes();
 	let ram_avail = mem_available().saturating_sub(USER_GB);
-	let dir = match crate::ok_or_err(crate::machine::data_dir(), "data_dir") {
+	let dir = match crate::machine::data_dir() {
 		Ok(v) => v,
 		Err(e) => {
-			Write::error(format!("{e:#}"));
+			Write::error(format!("data_dir: {e:#}"));
 			return None;
 		}
 	};
@@ -784,13 +736,13 @@ impl Ooc {
 			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
 		});
 		let align256 = |b: usize| (b + 255) & !255;
-		WINS * align256(chunk * max_spb * 8)
-			+ 2 * align256(n * hs * 8)
-			+ 5 * align256(max_wt * 8)
-			+ 2 * align256(max_bias * 8)
+		WINS * align256(chunk * max_spb * size_of::<f64>())
+			+ 2 * align256(n * hs * size_of::<f64>())
+			+ 5 * align256(max_wt * size_of::<f64>())
+			+ 2 * align256(max_bias * size_of::<f64>())
 			+ 2 * align256(8)
-			+ align256(dwp * 8)
-			+ align256(ws) + align256(((conv_wg * max_conv_fsz).max(1)) * 8)
+			+ align256(dwp * size_of::<f64>())
+			+ align256(ws) + align256(((conv_wg * max_conv_fsz).max(1)) * size_of::<f64>())
 			+ (1 << 20)
 	}
 
@@ -839,10 +791,10 @@ impl Ooc {
 			.max()
 			.unwrap_or(0);
 		const WINS: usize = 10;
-		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * 8;
+		let fixed_res = (2 * n * hs + 6 * max_wt + 2 * max_bias + 2) * size_of::<f64>();
 		let win_budget = gpu_core::memory::arena_remaining().saturating_sub(fixed_res) / 2;
-		let chunk = (win_budget / (((WINS + 2) * max_spb + max_conv_fsz) * 8)).clamp(1, n);
-		let wbytes = chunk * max_spb * 8;
+		let chunk = (win_budget / (((WINS + 2) * max_spb + max_conv_fsz) * size_of::<f64>())).clamp(1, n);
+		let wbytes = chunk * max_spb * size_of::<f64>();
 		let conv_wg = match max_conv_fsz.cmp(&0) {
 			cmp::Ordering::Greater => chunk,
 			cmp::Ordering::Less | cmp::Ordering::Equal => 0,
@@ -935,7 +887,7 @@ impl Ooc {
 			let mut homes = Vec::with_capacity(n_wins);
 			for w in 0..n_wins {
 				let cnt = chunk.min(n - w * chunk);
-				let bytes = cnt * spb * 8;
+				let bytes = cnt * spb * size_of::<f64>();
 				let aligned = (bytes + 4095) & !4095;
 				let vram_room = match vram_gate {
 					Gate::Open => slab_bytes.checked_sub(slab_off + aligned),
@@ -1173,10 +1125,10 @@ impl Ooc {
 				let h = &p.homes[w];
 				let cnt = p.chunk.min(self.n - w * p.chunk);
 				match h {
-					Home::Vram(_buf) => v += cnt * p.spb * 8,
+					Home::Vram(_buf) => v += cnt * p.spb * size_of::<f64>(),
 					Home::Ram(x) => r += x.len(),
-					Home::Disk(_off) => d += cnt * p.spb * 8,
-					Home::Remote { .. } => nt += cnt * p.spb * 8,
+					Home::Disk(_off) => d += cnt * p.spb * size_of::<f64>(),
+					Home::Remote { .. } => nt += cnt * p.spb * size_of::<f64>(),
 				}
 			}
 		};
@@ -1275,7 +1227,7 @@ impl Ooc {
 						let Flow::Go = self.bail()? else {
 							return Ok(());
 						};
-						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
+						let ids = view(x, s0 * p.in_dim * size_of::<f64>(), cnt * p.in_dim * size_of::<f64>());
 						let out = self.acts[l].write_view(s0, cnt, &self.wins[0])?;
 						kernels::gpu_gather_rows_into(
 							&p.w,
@@ -1373,7 +1325,7 @@ impl Ooc {
 						)?;
 						let ctx = self.a_ctx.write_view(s0, cnt, &self.wins[3])?;
 						let lse =
-							view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
+							view(&self.lse, s0 * heads * s * size_of::<f64>(), cnt * heads * s * size_of::<f64>());
 						kernels::gpu_flash_attention_train_into(
 							&q, &k, &v, cnt, s, d, heads, &ctx, &lse,
 						)
@@ -1419,7 +1371,7 @@ impl Ooc {
 						};
 						let concat_here = concat_at.filter(|cf| cf.pf == l);
 						let prev = match l {
-							0 => view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8),
+							0 => view(x, s0 * p.in_dim * size_of::<f64>(), cnt * p.in_dim * size_of::<f64>()),
 							_nonzero => match concat_here {
 								Some(_cf) => self.concat.read(
 									s0,
@@ -1442,8 +1394,8 @@ impl Ooc {
 						let out = match l.cmp(&last) {
 							cmp::Ordering::Equal => view(
 								&sc.acts[last],
-								s0 * p.out_dim * 8,
-								cnt * p.out_dim * 8,
+								s0 * p.out_dim * size_of::<f64>(),
+								cnt * p.out_dim * size_of::<f64>(),
 							),
 							cmp::Ordering::Less | cmp::Ordering::Greater => {
 								self.acts[l].write_view(s0, cnt, &self.wins[1])?
@@ -1609,8 +1561,8 @@ impl Ooc {
 			)?;
 			let xc = view(
 				x_cat.ok_or_else(|| anyhow::anyhow!("x_cat"))?,
-				s0 * c * 8,
-				cnt * c * 8,
+				s0 * c * size_of::<f64>(),
+				cnt * c * size_of::<f64>(),
 			);
 			let out = self.concat.write_view(s0, cnt, &self.wins[1])?;
 			kernels::gpu_concat_into(&prev, &xc, cnt, a, c, &out).context("concat")?;
@@ -1646,8 +1598,8 @@ impl Ooc {
 				return Ok(());
 			};
 			let k = params[last].out_dim;
-			let out = view(&sc.acts[last], s0 * k * 8, cnt * k * 8);
-			let y = view(ybuf, s0 * k * 8, cnt * k * 8);
+			let out = view(&sc.acts[last], s0 * k * size_of::<f64>(), cnt * k * size_of::<f64>());
+			let y = view(ybuf, s0 * k * size_of::<f64>(), cnt * k * size_of::<f64>());
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0])?;
 			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss)?;
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host)?;
@@ -1677,7 +1629,7 @@ impl Ooc {
 							self.n,
 							&self.host,
 						)?;
-						let ids = view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8);
+						let ids = view(x, s0 * p.in_dim * size_of::<f64>(), cnt * p.in_dim * size_of::<f64>());
 						kernels::gpu_scatter_add(
 							&ids,
 							&da,
@@ -1729,7 +1681,7 @@ impl Ooc {
 							p, l, &w.da, &w.act_l, &w.dz, w.m, s0, cnt, sc,
 						)?;
 						let a_prev = match l {
-							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
+							0 => view(x, s0 * in_dim * size_of::<f64>(), cnt * in_dim * size_of::<f64>()),
 							_positive => self.acts[l - 1].read(
 								s0,
 								cnt,
@@ -1817,7 +1769,7 @@ impl Ooc {
 							p, l, &w.da, &w.act_l, &w.dz, w.m, s0, cnt, sc,
 						)?;
 						let a_prev = match l {
-							0 => view(x, s0 * in_dim * 8, cnt * in_dim * 8),
+							0 => view(x, s0 * in_dim * size_of::<f64>(), cnt * in_dim * size_of::<f64>()),
 							_positive => match concat_at.filter(|cf| cf.pf == l) {
 								Some(_cf) => self.concat.read(
 									s0,
@@ -1880,7 +1832,7 @@ impl Ooc {
 										let compact = view(
 											&self.wins[8],
 											0,
-											cnt * a * 8,
+											cnt * a * size_of::<f64>(),
 										);
 										kernels::gpu_slice_lead_into(
 											&below,
@@ -2143,7 +2095,7 @@ impl Ooc {
 			&self.host,
 		)?;
 		let act_l = match l.cmp(&last) {
-			cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * 8, cnt * out_dim * 8),
+			cmp::Ordering::Equal => view(&sc.acts[last], s0 * out_dim * size_of::<f64>(), cnt * out_dim * size_of::<f64>()),
 			cmp::Ordering::Less | cmp::Ordering::Greater => self.acts[l].read(
 				s0,
 				cnt,
@@ -2153,7 +2105,7 @@ impl Ooc {
 				&self.host,
 			)?,
 		};
-		let dz = view(&self.wins[2], 0, m * 8);
+		let dz = view(&self.wins[2], 0, m * size_of::<f64>());
 		Ok(BwdWin { da, act_l, dz, m })
 	}
 
@@ -2198,8 +2150,8 @@ impl Ooc {
 						self.n,
 						&self.host,
 					)?;
-				let t0 = view(&self.wins[4], 0, m * 8);
-				let t1 = view(&self.wins[5], 0, m * 8);
+				let t0 = view(&self.wins[4], 0, m * size_of::<f64>());
+				let t1 = view(&self.wins[5], 0, m * size_of::<f64>());
 				kernels::gpu_relu_into(&pre, m, &t0).context("prelu relu")?;
 				kernels::gpu_copy_into(&pre, m, &t1).context("prelu copy")?;
 				kernels::gpu_sub_inplace(&t0, m, &t1).context("prelu sub")?;
@@ -2400,8 +2352,8 @@ impl Ooc {
 				self.n,
 				&self.host,
 			)?;
-			let lse = view(&self.lse, s0 * heads * s * 8, cnt * heads * s * 8);
-			let dsum = view(&self.dsum, s0 * heads * s * 8, cnt * heads * s * 8);
+			let lse = view(&self.lse, s0 * heads * s * size_of::<f64>(), cnt * heads * s * size_of::<f64>());
+			let dsum = view(&self.dsum, s0 * heads * s * size_of::<f64>(), cnt * heads * s * size_of::<f64>());
 			let dq = self.a_dq.write_view(s0, cnt, &self.wins[5])?;
 			let dk = self.a_dk.write_view(s0, cnt, &self.wins[6])?;
 			let dv = self.a_dv.write_view(s0, cnt, &self.wins[7])?;
@@ -2437,7 +2389,7 @@ impl Ooc {
 			};
 			let m = cnt * s;
 			let h = match l {
-				0 => view(x, s0 * p.in_dim * 8, cnt * p.in_dim * 8),
+				0 => view(x, s0 * p.in_dim * size_of::<f64>(), cnt * p.in_dim * size_of::<f64>()),
 				_positive => self.acts[l - 1].read(
 					s0,
 					cnt,
@@ -2452,7 +2404,7 @@ impl Ooc {
 				Flip::A => &mut self.da_b,
 			};
 			let below = below_pg.write_view(s0, cnt, &self.wins[1])?;
-			let dh_tmp = view(&self.wins[2], 0, cnt * p.in_dim * 8);
+			let dh_tmp = view(&self.wins[2], 0, cnt * p.in_dim * size_of::<f64>());
 			let qkv = [
 				Qkv {
 					w: &p.w,

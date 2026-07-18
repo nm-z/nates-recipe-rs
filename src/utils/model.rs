@@ -1,5 +1,6 @@
 use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
+use anyhow::Context;
 use gpu_core::log::{
 	Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2,
 	save, set_opt, time,
@@ -395,10 +396,10 @@ impl Train {
 		}
 		let conns: Option<Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
-				let cs = match crate::ok_or_err(wnet.connect(), "net: connect") {
+				let cs = match wnet.connect() {
 					Ok(v) => v,
 					Err(e) => {
-						Write::error(format!("{e:#}"));
+						Write::error(format!("net: connect: {e:#}"));
 						return self;
 					}
 				};
@@ -500,6 +501,8 @@ impl Train {
 		let Some(_stale) = Some(()).filter(|_probe| !last.model.is_null()) else {
 			return;
 		};
+		// SAFETY: last.model was set from a &ModelInner in run/infer and the caller
+		// keeps that model alive across the chained .run().save() call it borrows.
 		let model = unsafe { &*last.model };
 		let key = model.loss.score_key();
 		let score = last.score;
@@ -624,23 +627,20 @@ impl Infer {
 						let prompt_text = env::args().nth(1).unwrap_or_else(|| {
 							"The capital of France is".to_string()
 						});
-						let out = crate::ok_or_err(
-							recipe_infer::llm::generate(
-								Path::new(path),
-								&prompt_text,
-								&mut |toks| {
-									Write::line(
-										prompt,
-										recipe_infer::llm::render_toks(toks),
-									);
-									true
-								},
-							),
-							"infer: generate",
+						let out = recipe_infer::llm::generate(
+							Path::new(path),
+							&prompt_text,
+							&mut |toks| {
+								Write::line(
+									prompt,
+									recipe_infer::llm::render_toks(toks),
+								);
+								true
+							},
 						);
 						match out {
 							Ok(text) => Write::line(prompt, text),
-							Err(e) => Write::error(format!("{e:#}")),
+							Err(e) => Write::error(format!("infer: generate: {e:#}")),
 						}
 						recipe_infer::shutdown();
 					}
@@ -670,6 +670,8 @@ impl Infer {
 			}
 			last.model
 		};
+		// SAFETY: last_model was set from a &ModelInner in run/infer and the caller
+		// keeps that model alive across the chained .run().eval() call it borrows.
 		let model: &ModelInner = unsafe { &*last_model };
 		let metrics: Vec<Metric> = self
 			.flags
@@ -685,10 +687,10 @@ impl Infer {
 				_other => None,
 			})
 			.collect();
-		let prepared = match crate::ok_or_err(dat.prepared(), "eval: prepare data") {
+		let prepared = match dat.prepared() {
 			Ok(v) => v,
 			Err(e) => {
-				Write::error(format!("{e:#}"));
+				Write::error(format!("eval: prepare data: {e:#}"));
 				return self;
 			}
 		};
@@ -718,24 +720,15 @@ impl Infer {
 		let sp = match Some(()).filter(|_probe| ds.has_target && !metrics.is_empty()) {
 			Some(_scored) => {
 				let ybuf = {
-					let __up = match crate::some_or_err(
-						ds.y.as_slice(),
-						"eval: metrics: y contig",
-					) {
-						Ok(v) => v,
-						Err(e) => {
-							Write::error(format!("{e:#}"));
-							model.end_forward(arena);
-							return self;
-						}
+					let Some(__up) = ds.y.as_slice() else {
+						Write::error("eval: metrics: y contig");
+						model.end_forward(arena);
+						return self;
 					};
-					let __ub = match crate::ok_or_err(
-						GpuBuffer::alloc(__up.len()),
-						"eval: metrics: ybuf",
-					) {
+					let __ub = match GpuBuffer::alloc(__up.len()) {
 						Ok(v) => v,
 						Err(e) => {
-							Write::error(format!("{e:#}"));
+							Write::error(format!("eval: metrics: ybuf: {e:#}"));
 							model.end_forward(arena);
 							return self;
 						}
@@ -769,10 +762,10 @@ impl Infer {
 					&metrics,
 					ss_tot,
 				);
-				let sc = match crate::ok_or_err(__sc, "eval: metrics") {
+				let sc = match __sc {
 					Ok(v) => v,
 					Err(e) => {
-						Write::error(format!("{e:#}"));
+						Write::error(format!("eval: metrics: {e:#}"));
 						model.end_forward(arena);
 						return self;
 					}
@@ -819,10 +812,10 @@ impl Infer {
 					&[],
 					0.0,
 				);
-				let sc = match crate::ok_or_err(__sc, "eval: predictions") {
+				let sc = match __sc {
 					Ok(v) => v,
 					Err(e) => {
-						Write::error(format!("{e:#}"));
+						Write::error(format!("eval: predictions: {e:#}"));
 						model.end_forward(arena);
 						return self;
 					}
@@ -1022,30 +1015,18 @@ impl ModelInner {
 		}
 		let params = {
 			let mirror = self.saved_ogdl.borrow();
-			let m = crate::some_or_err(
-				mirror.as_ref(),
-				"eval: this model's device weights were freed by a later training run and \
-				 there is no host mirror to restore them (pooled out-of-core arena run)",
-			)?;
-			let saved =
-				crate::ok_or_err(load_ogdl_str(&m.text), "eval: parse host weight mirror")?;
-			let plan = crate::ok_or_err(
-				plan_layer_params(
-					&self.specs,
-					m.d,
-					m.c_cat,
-					m.vocab,
-					&saved,
-					PlanMode::Warm,
-				),
-				"eval: rebuild weights from mirror",
-			)?;
+			let m = mirror.as_ref().ok_or_else(|| {
+				anyhow::anyhow!(
+					"eval: this model's device weights were freed by a later training run and \
+					 there is no host mirror to restore them (pooled out-of-core arena run)"
+				)
+			})?;
+			let saved = load_ogdl_str(&m.text).context("eval: parse host weight mirror")?;
+			let plan = plan_layer_params(&self.specs, m.d, m.c_cat, m.vocab, &saved, PlanMode::Warm)
+				.map_err(|e| anyhow::anyhow!("eval: rebuild weights from mirror: {e}"))?;
 			let host = plan.host();
-			let staged = crate::ok_or_err(
-				GpuBuffer::alloc(host.len().max(1)),
-				"rebuild staged alloc",
-			)?;
-			crate::ok_or_err(staged.load(host), "rebuild staged load")?;
+			let staged = GpuBuffer::alloc(host.len().max(1)).context("rebuild staged alloc")?;
+			staged.load(host).context("rebuild staged load")?;
 			let params = plan.materialize(&staged, 0);
 			*self.rebuild_backing.borrow_mut() = Some(staged);
 			params
@@ -1114,9 +1095,9 @@ fn preflight(model: &ModelInner, ds: &Dataset, net_ram: usize) -> Vec<Issue> {
 	let n_layers = model.specs.len();
 	issues.extend(output_check(model.loss, last_out, n_layers, k));
 
-	let mut free_vram = 0usize;
-	let mut total_vram = 0usize;
-	unsafe { gpu_core::hip::hipMemGetInfo(&mut free_vram, &mut total_vram) };
+	let (free_vram, total_vram) = gpu_core::hip::mem_info()
+		.map(|m| (m.free, m.total))
+		.unwrap_or((0, 0));
 	let need = plan_footprint(model, ds);
 	Some(())
 		.filter(|_probe| need > free_vram)
@@ -1204,42 +1185,32 @@ impl Model {
 			proto.inner.gguf = Some(weights.to_string());
 			return proto;
 		}
-		let saved = match crate::ok_or_err(load_ogdl_str(weights), "Model::load: parse weights") {
+		let saved = match load_ogdl_str(weights) {
 			Ok(v) => v,
 			Err(e) => {
-				Write::error(format!("{e:#}"));
+				Write::error(format!("Model::load: parse weights: {e:#}"));
 				return proto;
 			}
 		};
 		let inner = &proto.inner;
-		let vocab = match crate::some_or_err(
-			pinned_vocab(&inner.specs),
-			"Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))",
-		) {
-			Ok(v) => v,
-			Err(e) => {
-				Write::error(format!("{e:#}"));
-				return proto;
-			}
+		let Some(vocab) = pinned_vocab(&inner.specs) else {
+			Write::error(
+				"Model::load: first embed layer must pin a fixed vocab (embed(dim).vocab(v))",
+			);
+			return proto;
 		};
-		let plan = match crate::ok_or_err(
-			plan_layer_params(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm),
-			"Model::load: plan layer params",
-		) {
+		let plan = match plan_layer_params(&inner.specs, d, 0, vocab, &saved, PlanMode::Warm) {
 			Ok(v) => v,
 			Err(e) => {
-				Write::error(format!("{e:#}"));
+				Write::error(format!("Model::load: plan layer params: {e:#}"));
 				return proto;
 			}
 		};
 		let host = plan.host();
-		let staged = match crate::ok_or_err(
-			GpuBuffer::alloc(host.len().max(1)),
-			"Model::load staged alloc",
-		) {
+		let staged = match GpuBuffer::alloc(host.len().max(1)) {
 			Ok(v) => v,
 			Err(e) => {
-				Write::error(format!("{e:#}"));
+				Write::error(format!("Model::load staged alloc: {e:#}"));
 				return proto;
 			}
 		};

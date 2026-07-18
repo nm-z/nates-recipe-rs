@@ -1,4 +1,4 @@
-#![allow(unsafe_code, reason = "FFI to HIP runtime")]
+#![allow(unsafe_code)]
 #![allow(
 	clippy::too_many_arguments,
 	clippy::unnecessary_cast,
@@ -39,6 +39,7 @@ pub mod rl;
 pub mod rope;
 pub mod sequence;
 pub mod svm;
+pub mod sys;
 pub mod tiered;
 pub mod waterfall;
 
