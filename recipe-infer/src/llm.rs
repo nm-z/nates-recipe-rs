@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
 	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
+	gpu_widen_bf16_scaled,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
 use gpu_core::log::probe as probe_flag;
@@ -151,8 +152,9 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 	let mut cache = KvCache::new(&h.m, win, total - win)?;
 	let mut logits = vec![0.0f64; vocab];
 	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
+	let mut emb_scratch: Vec<u8> = Vec::new();
 	for c in toks.chunks(win) {
-		forward_rows(&h.m, c, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
+		forward_rows(&h.m, c, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 	}
 	let mut generated = Vec::with_capacity(n_new);
 	for _ in 0..n_new {
@@ -161,7 +163,7 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 		if generated.len() >= n_new {
 			break;
 		}
-		forward_rows(&h.m, &[next], &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
+		forward_rows(&h.m, &[next], &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 	}
 	return Ok(generated);
 }
@@ -176,7 +178,8 @@ pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	let mut cache = KvCache::new(&h.m, toks.len(), 0)?;
 	let mut logits = vec![0.0f64; h.m.hp.vocab];
 	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
-	forward_rows(&h.m, toks, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch)?;
+	let mut emb_scratch: Vec<u8> = Vec::new();
+	forward_rows(&h.m, toks, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 	let ls = models::logit_scale(&h.m);
 	if ls != 1.0 {
 		for v in logits.iter_mut() {
@@ -356,9 +359,6 @@ struct Hparams {
 	eog: Vec<u32>,
 	mask_signal: Option<usize>,
 	key_length: usize,
-	value_length: usize,
-	key_length_swa: usize,
-	value_length_swa: usize,
 	/// lfm2 short-conv cache width (`shortconv.l_cache`), the depthwise-conv kernel
 	/// width for shortconv recurrent layers; `0` for non-shortconv arches.
 	shortconv_l_cache: usize,
@@ -452,7 +452,6 @@ impl Hparams {
 		let key_length = uint_kv_or(g, &k("attention.key_length"), head_dim_default)?;
 		let value_length = uint_kv_or(g, &k("attention.value_length"), head_dim_default)?;
 		let key_length_swa = uint_kv_or(g, &k("attention.key_length_swa"), key_length)?;
-		let value_length_swa = uint_kv_or(g, &k("attention.value_length_swa"), value_length)?;
 		let q_lora_rank = uint_kv_or(g, &k("attention.q_lora_rank"), 0)?;
 		let kv_lora_rank = uint_kv_or(g, &k("attention.kv_lora_rank"), 0)?;
 		let (head_k_mla, head_v_mla) = if arch == "minicpm3" {
@@ -663,9 +662,6 @@ impl Hparams {
 			stage_bytes,
 			mask_signal,
 			key_length,
-			value_length,
-			key_length_swa,
-			value_length_swa,
 			shortconv_l_cache,
 			q_lora_rank,
 			kv_lora_rank,
@@ -701,22 +697,6 @@ impl Hparams {
 
 fn bf16(h: u16) -> f64 {
 	f32::from_bits((h as u32) << 16) as f64
-}
-
-/// Adds the learned absolute position embedding to `t` rows of `base` starting at
-/// absolute position `pos0`. A no-op for RoPE arches (empty `pos_embd`), so the
-/// caller stays arch-agnostic.
-fn add_pos_embd(m: &Model, base: &mut [f64], pos0: usize, t: usize, ne: usize) {
-	if m.pos_embd.is_empty() {
-		return;
-	}
-	for p in 0..t {
-		let row = (pos0 + p) * ne * 2;
-		for x in 0..ne {
-			let b = row + x * 2;
-			base[p * ne + x] += bf16(u16::from_le_bytes([m.pos_embd[b], m.pos_embd[b + 1]]));
-		}
-	}
 }
 
 /// Expert feed-forward width taken from the expert weight tensor's own shape, for
@@ -2643,7 +2623,7 @@ impl KvCache {
 			win_base: 0,
 			stage,
 			len: 0,
-			ids: Vec::new(),
+			ids: Vec::with_capacity(win + host_cap),
 			t_max: win + host_cap,
 		});
 	}
@@ -2777,23 +2757,30 @@ fn forward_rows(
 	cache: &mut KvCache,
 	logits: &mut [f64],
 	lm_scratch: &mut [f64],
+	emb_scratch: &mut Vec<u8>,
 ) -> Result<()> {
 	let ne = m.hp.ne;
 	let nl = m.hp.nl;
 	let t = rows.len();
 	let base_off = cache.len;
 	let scale = models::embedding_scale(m);
-	let mut base = vec![0.0f64; t * ne];
-	for (p, &tk) in rows.iter().enumerate() {
-		let b = tk as usize * ne * 2;
-		for x in 0..ne {
-			base[p * ne + x] =
-				bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]])) * scale;
-		}
+	let rb = ne * 2;
+	emb_scratch.clear();
+	for &tk in rows {
+		let b = tk as usize * rb;
+		emb_scratch.extend_from_slice(&m.emb[b..b + rb]);
 	}
-	add_pos_embd(m, &mut base, base_off, t, ne);
 	let h0 = ar.ha.view(0, t * ne);
-	h0.load(&base)?;
+	let stage = ar.x.view(0, t * ne);
+	stage.write_u8(emb_scratch)?;
+	gpu_widen_bf16_scaled(&stage, t * ne, scale, &h0)?;
+	if !m.pos_embd.is_empty() {
+		let row = base_off * rb;
+		stage.write_u8(&m.pos_embd[row..row + t * rb])?;
+		let pe = ar.attn_out.view(0, t * ne);
+		gpu_widen_bf16_scaled(&stage, t * ne, 1.0, &pe)?;
+		gpu_add_into(&pe, &h0, t * ne, &h0)?;
+	}
 	if let Some((g, b)) = &m.embed_norm {
 		gpu_layernorm_into(&h0, g, b, &m.eps, t, ne, &h0)?;
 	}
@@ -2872,22 +2859,23 @@ fn decode_cached(
 	}
 	let p_new = toks.len() - cache.len;
 	let chunk = cache.win.max(1);
-	let aw = if cache.len == 0 { p_new.min(chunk) } else { 1 };
+	let aw = p_new.min(chunk).max(1);
 	let ar = {
 		let _t = gpu_core::memory::tag_scope("arena");
 		Arena::new(&m.hp, aw.max(1))?
 	};
 	let mut logits = vec![0.0f64; m.hp.vocab];
 	let mut lm_scratch = vec![0.0f64; m.hp.lm_chunk];
+	let mut emb_scratch: Vec<u8> = Vec::new();
 	let decode_start = Instant::now();
 	if cache.len == 0 {
 		for c in toks.chunks(chunk) {
-			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
+			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 		}
 	} else {
 		let suffix = toks[cache.len..].to_vec();
-		for tk in &suffix {
-			forward_rows(m, &[*tk], attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
+		for c in suffix.chunks(chunk) {
+			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 		}
 	}
 	let mut out_ids: Vec<u32> = Vec::new();
@@ -2907,7 +2895,7 @@ fn decode_cached(
 		if !keep_going || out_ids.len() >= max_new || cache.len >= cache.t_max {
 			break;
 		}
-		forward_rows(m, &[next], attn_scale, &ar, cache, &mut logits, &mut lm_scratch)?;
+		forward_rows(m, &[next], attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
 		next = pick_greedy(&logits, vocab_size, lsc, softcap);
 	}
 	let elapsed = decode_start.elapsed();

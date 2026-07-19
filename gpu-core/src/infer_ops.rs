@@ -17,6 +17,14 @@ fn cl() -> Result<(), HipError> {
 unsafe extern "C" {
 	fn launch_widen_bf16_f64(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
 	fn launch_widen_bf16_f32(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
+	fn launch_widen_bf16_scaled(
+		input: *const c_void,
+		out: *mut c_void,
+		n: i64,
+		scale: f64,
+		stream: *mut c_void,
+		f32_out: i32,
+	);
 	fn launch_normx_rmsnorm(
 		x: *const c_void,
 		out: *mut c_void,
@@ -243,6 +251,37 @@ pub fn gpu_rope_partial_factors_pos(
 			ci(pos_base)?,
 			ptr::null_mut(),
 			buf.dtype().ffi(),
+		);
+	}
+	return cl();
+}
+
+/// Widens `n` bf16 values in `raw` into `out` (f32 or f64 by `out`'s dtype),
+/// multiplying each by `scale` in f64 before any narrowing — bit-identical to
+/// the host `(f64)bf16 * scale` path it replaces. The GPU-side embedding
+/// gather: token rows upload as raw bf16 bytes and widen on device, no
+/// per-element host loop.
+///
+/// # Errors
+/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
+#[inline]
+pub fn gpu_widen_bf16_scaled(
+	raw: &GpuBuffer,
+	n: usize,
+	scale: f64,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	let n64 = i64::try_from(n).map_err(|_e| return HipError(1))?;
+	let f32_out = i32::from(out.dtype() == Dtype::F32);
+	// SAFETY: raw holds at least n bf16 values and out n elements at its dtype; the launcher only reads/writes within them.
+	unsafe {
+		launch_widen_bf16_scaled(
+			raw.ptr_raw().cast_const(),
+			out.ptr_raw(),
+			n64,
+			scale,
+			ptr::null_mut(),
+			f32_out,
 		);
 	}
 	return cl();

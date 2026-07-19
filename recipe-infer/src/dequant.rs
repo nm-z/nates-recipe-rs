@@ -232,7 +232,7 @@ impl DType {
             return match self {
                   DType::F32 => Cx::S(&F32C),
                   DType::F16 => Cx::S(&F16C),
-                  DType::Bf16 => Cx::S(&Bf16C),
+                  DType::Bf16 => Cx::S(&BF16_C),
                   DType::Q4_0 => Cx::S(&Q40C),
                   DType::Q4_1 => Cx::S(&Q41C),
                   DType::Q5_0 => Cx::S(&Q50C),
@@ -518,7 +518,7 @@ impl Codec for F16Codec {
 }
 
 struct Bf16Codec;
-static Bf16C: Bf16Codec = Bf16Codec;
+static BF16_C: Bf16Codec = Bf16Codec;
 impl Codec for Bf16Codec {
       fn name(&self) -> &'static str {
             return "Bf16";

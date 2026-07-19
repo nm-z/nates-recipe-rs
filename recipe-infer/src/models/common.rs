@@ -9,7 +9,7 @@ use super::DecCtx;
 use anyhow::{Result, anyhow};
 use gpu_core::infer_ops::{
 	gpu_flash_gqa, gpu_flash_mla, gpu_gemm_bt_f64, gpu_glu_silu, gpu_rmsnorm_f64,
-	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_rope_partial_factors,
+	gpu_rmsnorm_f64_nogamma,
 	gpu_rope_partial_factors_pos, gpu_rope_partial_pos, gpu_scale_f64_inplace,
 };
 use gpu_core::k_gapact::gpu_softplus;
@@ -607,24 +607,6 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	return Ok(());
 }
 
-/// NeoX RoPE with optional LongRoPE per-pair frequency factors (minicpm3): the
-/// `factors` path divides each pair's angle by `factors[i]`, the `None` path is
-/// plain RoPE. Keeps [`layer_minicpm3`] agnostic to whether the arch ships factors.
-fn rope_maybe_factors(
-	theta: &GpuBuffer,
-	factors: Option<&GpuBuffer>,
-	rows: usize,
-	head_dim: usize,
-	rot: usize,
-	heads: usize,
-	buf: &GpuBuffer,
-) -> Result<()> {
-	match factors {
-		Some(f) => gpu_rope_partial_factors(theta, rows, head_dim, rot, heads, f, buf)?,
-		None => gpu_rope_partial(theta, rows, head_dim, rot, heads, buf)?,
-	}
-	return Ok(());
-}
 
 /// The minicpm3 decoder block (minicpm3.cpp:91-238): a naive (non-absorbed)
 /// Multi-head Latent Attention with per-head RoPE'd query and one shared RoPE'd

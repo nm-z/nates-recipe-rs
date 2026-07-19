@@ -65,16 +65,23 @@ fn second_turn_uploads_scale_with_suffix_not_total_length() {
 	let n2 = run_turn(&mut session, &prompt, budget);
 	let turn2 = xfer_bytes().h2d - h2d_mid;
 	assert!(n2 >= 1, "turn 2 produced no tokens");
+	let h2d_mid2 = xfer_bytes().h2d;
+	let n3 = run_turn(&mut session, &prompt, budget);
+	let turn3 = xfer_bytes().h2d - h2d_mid2;
+	assert!(n3 >= 1, "turn 3 produced no tokens");
 	eprintln!(
-		"H2D bytes: turn1 (cold prefill of the full ~660-row prompt) = {turn1}, turn2 (same prompt fully cached, 1 suffix row) = {turn2}"
+		"H2D bytes: turn1 (cold prefill of the full ~660-row prompt) = {turn1}, turn2 (same prompt fully cached, 1 suffix row) = {turn2}, turn3 (same again, longer cached total) = {turn3}"
 	);
 	assert!(
 		turn1 > 0,
 		"turn 1 moved no H2D bytes — the ledger is not seeing the forward"
 	);
 	assert!(
-		turn2 * 3 < turn1,
-		"turn 2 with a fully shared prefix moved {turn2} H2D bytes vs {turn1} for the cold prefill: \
-		 turn-2 work is scaling with total length, not the suffix (prefix K/V not reused)"
+		turn2 < turn1,
+		"turn 2 with a fully shared prefix moved {turn2} H2D bytes, not less than the {turn1}-byte cold prefill: prefix K/V not reused"
+	);
+	assert_eq!(
+		turn3, turn2,
+		"two 1-suffix-row turns at different cached totals moved different H2D byte counts — turn work scales with the total, not the suffix"
 	);
 }

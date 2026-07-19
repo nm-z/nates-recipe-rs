@@ -13,7 +13,7 @@
 //!   switches: the same neutral driver reads them, so no arch needs a branch.
 mod common;
 
-use super::{Arena, HostStore, Model};
+use super::{Arena, Model};
 use anyhow::{Result, bail};
 use common::{
 	Ffn, Hy, HyMode, NormK, Recur, Spec, apply_norm, layer_hybrid, layer_mamba, layer_mamba2,
@@ -471,12 +471,6 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 	return LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: Vec::new() };
 }
 
-/// True if `m.hp.arch` runs Multi-head Latent Attention (deepseek2 family): its
-/// cache stores the compressed `kv_lora+rope` key and `kv_lora` value, sized apart
-/// from the plain GQA `nkv*hd`.
-pub(super) fn arch_mla(m: &Model) -> bool {
-	return spec_of(m).is_some_and(|sp| sp.mla);
-}
 
 /// The [`Spec`] for `m.hp.arch`, or `None` for recurrent / unlisted arches. Lets
 /// the neutral runtime resolve a Spec-flagged scalar without per-arch branching.

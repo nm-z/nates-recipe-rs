@@ -28,6 +28,32 @@ extern "C" void launch_widen_bf16_f32(const unsigned short* in, float* out, long
     hipLaunchKernelGGL(widen_bf16_f32, dim3((unsigned int)blocks), dim3(t), 0, s, in, out, n);
 }
 
+extern "C" __global__ void widen_bf16_f64_scaled(const unsigned short* in, double* out, long n, double scale) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned int bits = ((unsigned int)in[i]) << 16;
+        out[i] = (double)__uint_as_float(bits) * scale;
+    }
+}
+extern "C" __global__ void widen_bf16_f32_scaled(const unsigned short* in, float* out, long n, double scale) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned int bits = ((unsigned int)in[i]) << 16;
+        out[i] = (float)((double)__uint_as_float(bits) * scale);
+    }
+}
+extern "C" void launch_widen_bf16_scaled(const void* in, void* out, long n, double scale, hipStream_t s, int f32) {
+    int t = 256;
+    long blocks = (n + t - 1) / t;
+    if (f32) {
+        hipLaunchKernelGGL(widen_bf16_f32_scaled, dim3((unsigned int)blocks), dim3(t), 0, s,
+            (const unsigned short*)in, (float*)out, n, scale);
+    } else {
+        hipLaunchKernelGGL(widen_bf16_f64_scaled, dim3((unsigned int)blocks), dim3(t), 0, s,
+            (const unsigned short*)in, (double*)out, n, scale);
+    }
+}
+
 template<typename T> __device__ __forceinline__ T fi_block_sum(T v, T* smem) {
     int lane = threadIdx.x % warpSize;
     int wid  = threadIdx.x / warpSize;

@@ -447,10 +447,21 @@ fn caps_line(loaded: bool) -> Line<'static> {
 	));
 }
 
+/// One finished scrollback entry. `body` is the PURE assistant reply — the only
+/// text that may re-enter the chat template as history. `shown` is what the
+/// screen renders: body plus frozen timer/stat lines, notes, error text. The
+/// two are separate on purpose: stats fed back into the template as assistant
+/// content garble every later turn.
+struct Entry {
+	user: String,
+	body: String,
+	shown: String,
+}
+
 fn render_chat(
 	frame: &mut Frame,
 	input: &TextArea,
-	scrollback: &[(String, String)],
+	scrollback: &[Entry],
 	pending: Option<&str>,
 	pre: &[String],
 	live: &[Tok],
@@ -475,11 +486,11 @@ fn render_chat(
 		.fg(Color::Rgb(120, 200, 255))
 		.add_modifier(Modifier::BOLD);
 	let mut lines: Vec<Line> = Vec::new();
-	for (p, r) in scrollback {
-		if !p.is_empty() {
-			lines.push(Line::from(Span::styled(format!("> {p}"), head)));
+	for e in scrollback {
+		if !e.user.is_empty() {
+			lines.push(Line::from(Span::styled(format!("> {}", e.user), head)));
 		}
-		for seg in r.split('\n') {
+		for seg in e.shown.split('\n') {
 			lines.push(Line::from(seg.to_string()));
 		}
 		lines.push(Line::from(String::new()));
@@ -699,7 +710,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut input = new_input();
-	let mut scrollback: Vec<(String, String)> = Vec::new();
+	let mut scrollback: Vec<Entry> = Vec::new();
 	let cancel = std::sync::atomic::AtomicBool::new(false);
 	let res = {
 		let sb = &scrollback;
@@ -712,7 +723,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 		recipe_infer::llm::generate(Path::new(gguf), prompt, &mut on_round)
 	};
 	match res {
-		Ok(resp) => scrollback.push((prompt.to_string(), resp)),
+		Ok(resp) => scrollback.push(Entry { user: prompt.to_string(), body: resp.clone(), shown: resp }),
 		Err(e) => {
 			drop(_guard);
 			gpu_core::log::Write::error(format!("render: {e:#}"));
@@ -796,7 +807,7 @@ fn session_worker(
 fn wait_load(
 	term: &mut ratatui::DefaultTerminal,
 	textarea: &mut TextArea,
-	scrollback: &[(String, String)],
+	scrollback: &[Entry],
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
 	start: std::time::Instant,
@@ -839,7 +850,7 @@ struct RunDone {
 fn run_message(
 	term: &mut ratatui::DefaultTerminal,
 	textarea: &mut TextArea,
-	scrollback: &[(String, String)],
+	scrollback: &[Entry],
 	prompt: &str,
 	ev_rx: &std::sync::mpsc::Receiver<FromWorker>,
 	cancel: &std::sync::atomic::AtomicBool,
@@ -905,7 +916,7 @@ pub fn chat(gguf: &str) {
 	let mut term = ratatui::init();
 	let _guard = TermRestore::new();
 	let mut textarea = new_input();
-	let mut scrollback: Vec<(String, String)> = Vec::new();
+	let mut scrollback: Vec<Entry> = Vec::new();
 
 	let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 	let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<String>();
@@ -917,11 +928,12 @@ pub fn chat(gguf: &str) {
 
 	match wait_load(&mut term, &mut textarea, &scrollback, &ev_rx, &cancel, load_start) {
 		LoadOutcome::Loaded => {
-			scrollback.push((String::new(), format!("model: {gguf}")));
-			scrollback.push((
-				String::new(),
-				format!("model load  {:.1}s", load_start.elapsed().as_secs_f64()),
-			));
+			scrollback.push(Entry { user: String::new(), body: String::new(), shown: format!("model: {gguf}") });
+			scrollback.push(Entry {
+				user: String::new(),
+				body: String::new(),
+				shown: format!("model load  {:.1}s", load_start.elapsed().as_secs_f64()),
+			});
 		}
 		LoadOutcome::Cancelled => {
 			drop(prompt_tx);
@@ -975,13 +987,13 @@ pub fn chat(gguf: &str) {
 						continue;
 					};
 					let mut history: Vec<recipe_infer::chat::Msg> = Vec::new();
-					for (u, r) in &scrollback {
-						let keep = !u.is_empty() && !r.starts_with("error: ") && !r.starts_with("note: ");
+					for e in &scrollback {
+						let keep = !e.user.is_empty() && !e.body.is_empty();
 						let Some(_ok) = Some(()).filter(|_probe| keep) else {
 							continue;
 						};
-						history.push(recipe_infer::chat::Msg::new("user", u.clone()));
-						history.push(recipe_infer::chat::Msg::new("assistant", r.clone()));
+						history.push(recipe_infer::chat::Msg::new("user", e.user.clone()));
+						history.push(recipe_infer::chat::Msg::new("assistant", e.body.clone()));
 					}
 					history.push(recipe_infer::chat::Msg::new("user", prompt.clone()));
 					let templated = recipe_infer::chat::render_chat(Path::new(gguf), &history, true);
@@ -1010,10 +1022,10 @@ pub fn chat(gguf: &str) {
 								shown.push_str(&g);
 							}
 							let shown = note.map(|n| format!("{n}\n{shown}")).unwrap_or(shown);
-							scrollback.push((prompt, shown));
+							scrollback.push(Entry { user: prompt, body, shown });
 						}
 						Some(RunDone { r: Err(e), pre: _pre, gen_line: _gen }) => {
-							scrollback.push((prompt, format!("error: {e}")));
+							scrollback.push(Entry { user: prompt, body: String::new(), shown: format!("error: {e}") });
 						}
 						None => break,
 					}
