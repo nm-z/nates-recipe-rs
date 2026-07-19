@@ -1,3 +1,4 @@
+use gpu_core::log::Write;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Layout, Position};
@@ -568,7 +569,10 @@ pub fn peers_picker(rows: &mut [PeerRow]) -> bool {
 		let _drawn = term.draw(|f| render_peers(f, rows, cur));
 		let ev = match event::read() {
 			Ok(e) => e,
-			Err(_e) => return false,
+			Err(e) => {
+				drop(Write::err(format!("{e}")));
+				return false;
+			}
 		};
 		let Event::Key(k) = ev else { continue };
 		let KeyEventKind::Press = k.kind else {
@@ -626,7 +630,10 @@ pub fn model_picker(names: &[String]) -> Option<usize> {
 		let _drawn = term.draw(|f| render_models(f, names, cur));
 		let ev = match event::read() {
 			Ok(e) => e,
-			Err(_e) => return None,
+			Err(e) => {
+				drop(Write::err(format!("{e}")));
+				return None;
+			}
 		};
 		let Event::Key(k) = ev else { continue };
 		let KeyEventKind::Press = k.kind else {
@@ -665,7 +672,10 @@ fn drain_input(cancel: &std::sync::atomic::AtomicBool, textarea: &mut TextArea, 
 				}
 			}
 			Ok(_e) => {}
-			Err(_e) => break,
+			Err(e) => {
+				drop(Write::err(format!("{e}")));
+				break;
+			}
 		}
 		ready = event::poll(std::time::Duration::from_millis(0)).unwrap_or(false);
 	}
@@ -704,7 +714,10 @@ pub fn render_once(gguf: &str, prompt: &str) {
 		match event::read() {
 			Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => break,
 			Ok(_e) => {}
-			Err(_e) => break,
+			Err(e) => {
+				drop(Write::err(format!("{e}")));
+				break;
+			}
 		}
 	}
 }
@@ -907,7 +920,10 @@ pub fn chat(gguf: &str) {
 			term.draw(|f| render_chat(f, &textarea, &scrollback, None, &[], &[], None, scroll_up, true));
 		let ev = match event::read() {
 			Ok(e) => e,
-			Err(_e) => break,
+			Err(e) => {
+				drop(Write::err(format!("{e}")));
+				break;
+			}
 		};
 		match ev {
 			Event::Key(k) if k.kind == KeyEventKind::Press => match (k.code, k.modifiers) {
@@ -950,7 +966,10 @@ pub fn chat(gguf: &str) {
 					let templated = recipe_infer::chat::render_chat(Path::new(gguf), &history, true);
 					let (send, note): (String, Option<&str>) = match templated {
 						Ok(s) => (s, None),
-						Err(_e) => (prompt.clone(), Some("note: no chat template in gguf; multi-turn history disabled")),
+						Err(e) => {
+							drop(Write::err(format!("{e}")));
+							(prompt.clone(), None)
+						}
 					};
 					let sent = std::time::Instant::now();
 					if prompt_tx.send(send).is_err() {
