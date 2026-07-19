@@ -1104,21 +1104,28 @@ impl Model {
 
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
 		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
-		if t.gt != GT_BF16 {
+		let n = store_elems(t.nbytes);
+		let (dt, raw) = if t.gt == GT_BF16 {
+			(STORE_DT, self.read_raw(t, 0, t.nbytes)?)
+		} else {
 			let (qoff, qlen) = Self::qrange(t, 0, t.nbytes)?;
 			let mut qbuf = vec![0u8; qlen];
 			self.shards[t.shard]
 				.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
 				.with_context(|| format!("small {name}"))?;
-			let mut f = crate::dequant::dequant_f32(t.gt, &qbuf)?;
-			f.truncate(store_elems(t.nbytes));
-			return Ok(f.iter().map(|&x| return f64::from(x)).collect());
-		}
-		let raw = self.read_bytes(t, 0, t.nbytes)?;
-		return Ok(raw
-			.chunks_exact(STORE_DT.elem_size())
-			.map(|c| return f64::from(f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)))
-			.collect());
+			(crate::dequant::from_ggml(t.gt)?, qbuf)
+		};
+		let whole = raw.len() / dt.block_bytes() * dt.block_elems();
+		anyhow::ensure!(whole >= n, "small {name}: {whole} decoded < {n} needed");
+		self.to_stage(&raw)?;
+		let src = GpuBuffer::borrow(self.stage.ptr, raw.len()).as_dtype(dt);
+		let dst = self.win.view(0, whole);
+		gpu_convert(&src, &dst, whole, 1.0)
+			.map_err(|e| return anyhow!("small {name} convert: {e:?}"))?;
+		let mut out = vec![0f64; whole];
+		dst.download_host(&mut out)?;
+		out.truncate(n);
+		return Ok(out);
 	}
 
 
