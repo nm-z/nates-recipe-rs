@@ -221,10 +221,6 @@ pub fn dequant_f32(t: u32, bytes: &[u8]) -> Result<Vec<f32>> {
       return Ok(out);
 }
 
-pub fn dequant_bf16(t: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-      return convert(from_ggml(t)?, Dtype::BF16, bytes);
-}
-
 fn f16_to_f32(b: u16) -> f32 {
       let s = (b >> 15) & 1;
       let e = ((b >> 10) & 0x1f) as i32;

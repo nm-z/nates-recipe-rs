@@ -142,7 +142,7 @@ recipe::eval(&model, &data);
 
 ## Conventions
 
-Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. **Budgeted comments** (2026-07-15 law): `///`/`//!` doc comments allowed, no limit. `// SAFETY:` allowed, max 1 per unsafe block. Any other `//` comment: max 1 per function — not 1 per file, not unlimited. No `/* */`, no section dividers. Enforced by `h03_comment_budget` in `tests/hygiene.rs` (lexer-based; doc comments exempt, regular comments counted per fn). Naming and structure still carry the meaning; a constraint the code cannot express goes in the commit message.
+Edition 2024, stable. 6-space indentation. `anyhow::Result`; `#![deny(clippy::unwrap_used)]`. Lowercase const aliases (`mse`, `w`, `b`). Activations as chained methods. Progress/diagnostics to stderr, never stdout. **Comment ban** (2026-07-18 law, supersedes budgeted comments): the ONLY comments allowed are `// SAFETY:` on unsafe blocks (required there, max 1) and `// ─` separator lines. Everything else is banned: `///` and `//!` doc comments, `/* */`, every other `//`. Attributes (`#![...]`, `#[...]`) are not comments and stay. Enforced by `h03_comment_ban` in `tests/hygiene/cases.rs` (lexer-based). Naming and structure carry ALL the meaning. **Commit messages are banned too** (2026-07-18): every commit is made with `--allow-empty-message -m ''`; the diff is the record.
 
 ## Active State (2026-07)
 

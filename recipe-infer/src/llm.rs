@@ -30,14 +30,8 @@ mod models;
 
 pub(crate) const FWD_DT: Dtype = Dtype::F32;
 
-pub(crate) const STORE_DT: Dtype = Dtype::BF16;
-
-const fn store_elems(nbytes: usize) -> usize {
-	return nbytes / STORE_DT.elem_size();
-}
-
-const fn store_bytes(n: usize) -> usize {
-	return n * STORE_DT.elem_size();
+const fn bytes_for(elems: usize, dt: Dtype) -> usize {
+	return elems.div_ceil(dt.block_elems()) * dt.block_bytes();
 }
 
 static KV_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -58,9 +52,8 @@ fn embed_blend_into(
 	wts: &mut Vec<f64>,
 ) -> Result<()> {
 	let ne = m.hp.ne;
-	let (src, dt) =
-		if m.emb_src.is_empty() { (&m.emb, Dtype::BF16) } else { (&m.emb_src, m.emb_dt) };
-	let rb = ne * dt.elem_size();
+	let (src, dt) = (&m.emb_src, m.emb_dt);
+	let rb = bytes_for(ne, dt);
 	scratch.clear();
 	wts.clear();
 	for &(id, w) in picks {
@@ -75,10 +68,6 @@ fn embed_blend_into(
 	gpu_embed_blend(&stage, &wdev, out, rows, k, ne, scale)
 		.map_err(|e| return anyhow!("embed_blend launch: {e:?}"))?;
 	return Ok(());
-}
-
-const fn raw_bytes(nbytes_bf16: usize, dt: Dtype) -> usize {
-	return store_elems(nbytes_bf16) * dt.elem_size();
 }
 
 pub fn supported_archs() -> &'static [&'static str] {
@@ -390,6 +379,8 @@ struct Hparams {
 	gu_bytes: usize,
 	dn_bytes: usize,
 	slot_bytes: usize,
+	moe_gu_dt: Dtype,
+	moe_dn_dt: Dtype,
 }
 
 impl Hparams {
@@ -549,8 +540,32 @@ impl Hparams {
 			.map(|d| d.nqh * d.hd)
 			.max()
 			.unwrap_or(nqh * key_length);
-		let gu_bytes = store_bytes(2 * nffe * ne);
-		let dn_bytes = store_bytes(nffe * ne);
+		let moe_dt = |suffix: &str| -> Result<Option<Dtype>> {
+			for l in 0..nl {
+				if let Some(ti) = g.tensors.get(&format!("blk.{l}.{suffix}")) {
+					return Ok(Some(crate::dequant::from_ggml(ti.ggml_type)?));
+				}
+			}
+			return Ok(None);
+		};
+		let moe_gu_dt = moe_dt("ffn_gate_up_exps.weight")?
+			.or(moe_dt("ffn_gate_exps.weight")?)
+			.unwrap_or(FWD_DT);
+		let moe_dn_dt = moe_dt("ffn_down_exps.weight")?.unwrap_or(FWD_DT);
+		if nexp > 0 {
+			anyhow::ensure!(
+				(2 * nffe * ne).is_multiple_of(moe_gu_dt.block_elems())
+					&& (nffe * ne).is_multiple_of(moe_gu_dt.block_elems()),
+				"expert gate/up {}x{ne} not on {moe_gu_dt:?} block boundary",
+				2 * nffe
+			);
+			anyhow::ensure!(
+				(nffe * ne).is_multiple_of(moe_dn_dt.block_elems()),
+				"expert down {nffe}x{ne} not on {moe_dn_dt:?} block boundary"
+			);
+		}
+		let gu_bytes = bytes_for(2 * nffe * ne, moe_gu_dt);
+		let dn_bytes = bytes_for(nffe * ne, moe_dn_dt);
 		let slot_bytes = gu_bytes + dn_bytes;
 		let mla_win = if head_k_mla > 0 && head_v_mla > 0 {
 			let nope = head_k_mla.saturating_sub(n_rot);
@@ -597,7 +612,13 @@ impl Hparams {
 			.max(shortconv_win)
 			.max(2 * qd_max * ne);
 		let lm_chunk = win_elems / ne;
-		let stage_bytes = (win_elems * 2).max(slot_bytes);
+		let mut stage_bytes = slot_bytes;
+		for (name, info) in &g.tensors {
+			if hf_name(name).is_some() {
+				let dt = crate::dequant::from_ggml(info.ggml_type)?;
+				stage_bytes = stage_bytes.max(bytes_for(win_elems, dt));
+			}
+		}
 
 		Ok(Hparams {
 			arch,
@@ -648,6 +669,8 @@ impl Hparams {
 			gu_bytes,
 			dn_bytes,
 			slot_bytes,
+			moe_gu_dt,
+			moe_dn_dt,
 		})
 	}
 }
@@ -678,15 +701,19 @@ fn acc(a: &AtomicU64, t: Instant) {
 	a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
-const GT_BF16: u32 = u32::MAX;
-
 #[derive(Clone)]
 struct Tensor {
 	shard: usize,
 	off: usize,
 	nbytes: usize,
 	shape: Vec<usize>,
-	gt: u32,
+	dt: Dtype,
+}
+
+impl Tensor {
+	fn elems(&self) -> usize {
+		return self.shape.iter().product();
+	}
 }
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
@@ -942,11 +969,11 @@ struct Model {
 	rw: Vec<Vec<f64>>,
 	gis: Vec<Vec<f64>>,
 	pe: Vec<Vec<f64>>,
-	emb: Vec<u8>,
 	emb_src: Vec<u8>,
 	emb_dt: Dtype,
 	pos_dt: Dtype,
 	out: Vec<u8>,
+	out_dt: Dtype,
 	out_b: Vec<f64>,
 	pos_embd: Vec<u8>,
 	eps: GpuBuffer,
@@ -1026,18 +1053,14 @@ const LAYER_NORMS: [(Nk, &str); N_NORMS] = [
 ];
 
 impl Model {
-	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
-		let (bb, be) = crate::dequant::block_layout(t.gt)?;
-		let es = STORE_DT.elem_size();
+	fn qrange(t: &Tensor, elem_off: usize, elems: usize) -> Result<(usize, usize)> {
+		let be = t.dt.block_elems();
 		anyhow::ensure!(
-			off.is_multiple_of(es)
-				&& len.is_multiple_of(es)
-				&& store_elems(off).is_multiple_of(be),
-			"qrange: read {off}+{len} not block-aligned (be={be})"
+			elem_off.is_multiple_of(be) && elems.is_multiple_of(be),
+			"block-align: element range {elem_off}+{elems} off {:?} block boundary (be={be})",
+			t.dt
 		);
-		let qoff = store_elems(off) / be * bb;
-		let qlen = store_elems(len).div_ceil(be) * bb;
-		Ok((qoff, qlen))
+		return Ok((bytes_for(elem_off, t.dt), bytes_for(elems, t.dt)));
 	}
 
 	fn read_raw(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
@@ -1050,28 +1073,6 @@ impl Model {
 		return Ok(buf);
 	}
 
-	fn read_bytes(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
-		if t.gt == GT_BF16 {
-			let mut buf = vec![0u8; len];
-			let _d = Instant::now();
-			self.shards[t.shard]
-				.read_exact_at(&mut buf, (t.off + off) as u64)
-				.with_context(|| format!("read {len} bytes at shard {}", t.shard))?;
-			acc(&DISK_NS, _d);
-			return Ok(buf);
-		}
-		let (qoff, qlen) = Self::qrange(t, off, len)?;
-		let mut qbuf = vec![0u8; qlen];
-		let _d = Instant::now();
-		self.shards[t.shard]
-			.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
-			.with_context(|| format!("read {qlen} quant bytes"))?;
-		acc(&DISK_NS, _d);
-		let mut out = crate::dequant::dequant_bf16(t.gt, &qbuf)?;
-		out.truncate(len);
-		Ok(out)
-	}
-
 	fn read_into(
 		&self,
 		t: &Tensor,
@@ -1080,13 +1081,6 @@ impl Model {
 		dst: &GpuBuffer,
 		dst_off: usize,
 	) -> Result<()> {
-		if t.gt != GT_BF16 {
-			let bytes = self.read_bytes(t, off, len)?;
-			let _h = Instant::now();
-			bview(dst, dst_off, len).write_u8(&bytes)?;
-			acc(&H2D_NS, _h);
-			return Ok(());
-		}
 		let mut rb = self.rbuf.borrow_mut();
 		if rb.len() < len {
 			rb.resize(len, 0);
@@ -1099,22 +1093,14 @@ impl Model {
 		let _h = Instant::now();
 		bview(dst, dst_off, len).write_u8(&rb[..len])?;
 		acc(&H2D_NS, _h);
-		Ok(())
+		return Ok(());
 	}
 
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
 		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
-		let n = store_elems(t.nbytes);
-		let (dt, raw) = if t.gt == GT_BF16 {
-			(STORE_DT, self.read_raw(t, 0, t.nbytes)?)
-		} else {
-			let (qoff, qlen) = Self::qrange(t, 0, t.nbytes)?;
-			let mut qbuf = vec![0u8; qlen];
-			self.shards[t.shard]
-				.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
-				.with_context(|| format!("small {name}"))?;
-			(crate::dequant::from_ggml(t.gt)?, qbuf)
-		};
+		let n = t.elems();
+		let dt = t.dt;
+		let raw = self.read_raw(t, 0, t.nbytes)?;
 		let whole = raw.len() / dt.block_bytes() * dt.block_elems();
 		anyhow::ensure!(whole >= n, "small {name}: {whole} decoded < {n} needed");
 		self.to_stage(&raw)?;
@@ -1130,25 +1116,21 @@ impl Model {
 
 
 	fn read_host(&self, t: &Tensor, off: usize, dst: &mut [u8]) -> Result<()> {
-		if t.gt == GT_BF16 {
-			let _d = Instant::now();
-			self.shards[t.shard]
-				.read_exact_at(dst, (t.off + off) as u64)
-				.with_context(|| format!("read_host {} bytes", dst.len()))?;
-			acc(&DISK_NS, _d);
-			return Ok(());
-		}
-		let bytes = self.read_bytes(t, off, dst.len())?;
-		dst.copy_from_slice(&bytes);
-		Ok(())
+		let _d = Instant::now();
+		self.shards[t.shard]
+			.read_exact_at(dst, (t.off + off) as u64)
+			.with_context(|| format!("read_host {} bytes", dst.len()))?;
+		acc(&DISK_NS, _d);
+		return Ok(());
 	}
 
-	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> Result<GpuBuffer> {
+	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize, dt: Dtype) -> Result<GpuBuffer> {
 		let _w = Instant::now();
-		gpu_convert(&bview(src, off_bytes, n * 2).as_dtype(Dtype::BF16), &self.win, n, 1.0)
-			.map_err(|e| anyhow!("convert launch: {e:?}"))?;
+		let raw_len = bytes_for(n, dt);
+		gpu_convert(&bview(src, off_bytes, raw_len).as_dtype(dt), &self.win, n, 1.0)
+			.map_err(|e| return anyhow!("convert launch: {e:?}"))?;
 		acc(&WIDEN_NS, _w);
-		Ok(self.win.view(0, n))
+		return Ok(self.win.view(0, n));
 	}
 
 	fn to_stage(&self, bytes: &[u8]) -> Result<()> {
@@ -1163,16 +1145,17 @@ impl Model {
 			.big
 			.get(name)
 			.ok_or_else(|| anyhow!("missing {name}"))?;
-		let n = store_elems(t.nbytes);
+		let n = t.elems();
+		let dt = t.dt;
 		match self.store.home(name) {
-			Some(Home::Vram(dev)) => self.widen_from(dev, 0, n),
+			Some(Home::Vram(dev)) => self.widen_from(dev, 0, n, dt),
 			Some(Home::Ram(bytes)) => {
 				self.to_stage(bytes)?;
-				self.widen_from(&self.stage, 0, n)
+				self.widen_from(&self.stage, 0, n, dt)
 			}
 			_other => {
 				self.read_into(t, 0, t.nbytes, &self.stage, 0)?;
-				self.widen_from(&self.stage, 0, n)
+				self.widen_from(&self.stage, 0, n, dt)
 			}
 		}
 	}
@@ -1184,7 +1167,7 @@ impl Model {
 
 	fn fill_expert(&self, l: usize, e: usize, dst: &mut [u8]) -> Result<()> {
 		let (gu_bytes, dn_bytes, half) =
-			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.dn_bytes);
+			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.gu_bytes / 2);
 		if let Some(gu) = self.big.get(&layer_name(l, "experts.gate_up_proj")) {
 			self.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])?;
 		} else {
@@ -1211,7 +1194,7 @@ impl Model {
 		let (gu_bytes, dn_bytes, half, slot_bytes) = (
 			self.hp.gu_bytes,
 			self.hp.dn_bytes,
-			self.hp.dn_bytes,
+			self.hp.gu_bytes / 2,
 			self.hp.slot_bytes,
 		);
 		match self.store.home(&ekey(l, e)) {
@@ -1405,7 +1388,6 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 		let Some(hf) = hf_name(name) else {
 			continue;
 		};
-		let elems: usize = info.dims.iter().product();
 		let mut shape: Vec<usize> = info.dims.clone();
 		shape.reverse();
 		big.insert(
@@ -1413,9 +1395,9 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 			Tensor {
 				shard: 0,
 				off: info.offset as usize,
-				nbytes: elems * 2,
+				nbytes: info.nbytes,
 				shape,
-				gt: info.ggml_type,
+				dt: crate::dequant::from_ggml(info.ggml_type)?,
 			},
 		);
 	}
@@ -1443,19 +1425,19 @@ fn synth_ffn_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 			continue;
 		}
 		let ne = up.shape[1];
-		let (src_shard, src_off, src_gt) = (up.shard, up.off, up.gt);
-		let (Ok((q0, _)), Ok((q1, _))) = (
-			Model::qrange(up, 0, store_bytes(nff * ne)),
-			Model::qrange(up, store_bytes(nff * ne), store_bytes(nff * ne)),
+		let (src_shard, src_off, src_dt) = (up.shard, up.off, up.dt);
+		let (Ok((q0, part_bytes)), Ok((q1, _))) = (
+			Model::qrange(up, 0, nff * ne),
+			Model::qrange(up, nff * ne, nff * ne),
 		) else {
 			continue;
 		};
 		let part = |qoff: usize| Tensor {
 			shard: src_shard,
 			off: src_off + qoff,
-			nbytes: store_bytes(nff * ne),
+			nbytes: part_bytes,
 			shape: vec![nff, ne],
-			gt: src_gt,
+			dt: src_dt,
 		};
 		big.insert(layer_name(l, "mlp.gate_proj.weight"), part(q0));
 		big.insert(up_k, part(q1));
@@ -1483,15 +1465,15 @@ fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 				Slice::QkvK => (qd, kd),
 				Slice::QkvV => (qd + kd, kd),
 			};
-			let Ok((qoff, _qlen)) = Model::qrange(src_t, store_bytes(row0 * ne), store_bytes(rows * ne)) else {
+			let Ok((qoff, sub_bytes)) = Model::qrange(src_t, row0 * ne, rows * ne) else {
 				continue;
 			};
 			let sub = Tensor {
 				shard: src_t.shard,
 				off: src_t.off + qoff,
-				nbytes: store_bytes(rows * ne),
+				nbytes: sub_bytes,
 				shape: vec![rows, ne],
-				gt: src_t.gt,
+				dt: src_t.dt,
 			};
 			big.insert(nk, sub);
 		}
@@ -1559,11 +1541,11 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		rw: Vec::new(),
 		gis: Vec::new(),
 		pe: Vec::new(),
-		emb: Vec::new(),
 		emb_src: Vec::new(),
 		emb_dt: Dtype::BF16,
 		pos_dt: Dtype::BF16,
 		out: Vec::new(),
+		out_dt: Dtype::BF16,
 		out_b: Vec::new(),
 		pos_embd: Vec::new(),
 		eps,
@@ -1748,33 +1730,29 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		};
 	}
 
-	let et =
-		m.big.get("model.decoder.embed_tokens.weight")
-			.ok_or_else(|| anyhow!("no embed_tokens"))?;
+	let et = m
+		.big
+		.get("model.decoder.embed_tokens.weight")
+		.cloned()
+		.ok_or_else(|| anyhow!("no embed_tokens"))?;
 	if et.shape != vec![vocab, ne] {
 		bail!("embed_tokens shape {:?}", et.shape);
 	}
-	m.emb = m.read_bytes(et, 0, et.nbytes)?;
-	if et.gt == 0 {
-		m.emb_dt = Dtype::F32;
-		m.emb_src = m.read_raw(et, 0, raw_bytes(et.nbytes, m.emb_dt))?;
-	}
+	m.emb_dt = et.dt;
+	m.emb_src = m.read_raw(&et, 0, et.nbytes)?;
 
 	if let Some(ot) = m.big.get("model.decoder.lm_head.weight").cloned() {
 		if ot.shape == vec![vocab, ne] {
-			m.out = m.read_bytes(&ot, 0, ot.nbytes)?;
+			m.out_dt = ot.dt;
+			m.out = m.read_raw(&ot, 0, ot.nbytes)?;
 		}
 	}
 	if m.big.contains_key("model.decoder.lm_head.bias") {
 		m.out_b = m.small_f64("model.decoder.lm_head.bias")?;
 	}
 	if let Some(pt) = m.big.get("model.decoder.pos_embd.weight").cloned() {
-		m.pos_embd = if pt.gt == 0 {
-			m.pos_dt = Dtype::F32;
-			m.read_raw(&pt, 0, raw_bytes(pt.nbytes, m.pos_dt))?
-		} else {
-			m.read_bytes(&pt, 0, pt.nbytes)?
-		};
+		m.pos_dt = pt.dt;
+		m.pos_embd = m.read_raw(&pt, 0, pt.nbytes)?;
 	}
 
 	Ok(m)
@@ -1871,9 +1849,9 @@ fn fill_store(m: &mut Model, store: Waterfall, cancel: &mut dyn FnMut() -> bool)
 			let n = 4096.min(t.nbytes);
 			for off in [0, t.nbytes - n] {
 				let want = if name.ends_with("embed_tokens.weight") {
-					m.emb[off..off + n].to_vec()
+					m.emb_src[off..off + n].to_vec()
 				} else {
-					m.read_bytes(t, off, n)?
+					m.read_raw(t, off, n)?
 				};
 				let mut got = vec![0u8; n];
 				bview(dev, off, n).download_u8(&mut got)?;
@@ -1893,8 +1871,8 @@ fn fill_into(m: &Model, store: &mut Waterfall, cancel: &mut dyn FnMut() -> bool)
 	let nexp = m.hp.nexp;
 	let slot_bytes = m.hp.slot_bytes;
 	beat();
-	store.place("model.decoder.embed_tokens.weight", m.emb.len(), |dst| {
-		dst.copy_from_slice(&m.emb);
+	store.place("model.decoder.embed_tokens.weight", m.emb_src.len(), |dst| {
+		dst.copy_from_slice(&m.emb_src);
 		Ok(())
 	})?;
 	beat();
@@ -1976,16 +1954,20 @@ fn lm_head_into(
 	while c0 < hp.vocab {
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
 		let w = if m.out.is_empty() {
+			let dt = m.emb_dt;
 			match m.store.home("model.decoder.embed_tokens.weight") {
-				Some(Home::Vram(dev)) => m.widen_from(dev, store_bytes(c0 * hp.ne), cn * hp.ne)?,
+				Some(Home::Vram(dev)) => {
+					m.widen_from(dev, bytes_for(c0 * hp.ne, dt), cn * hp.ne, dt)?
+				}
 				_other => {
-					m.to_stage(&m.emb[store_bytes(c0 * hp.ne)..store_bytes((c0 + cn) * hp.ne)])?;
-					m.widen_from(&m.stage, 0, cn * hp.ne)?
+					m.to_stage(&m.emb_src[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)])?;
+					m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
 				}
 			}
 		} else {
-			m.to_stage(&m.out[store_bytes(c0 * hp.ne)..store_bytes((c0 + cn) * hp.ne)])?;
-			m.widen_from(&m.stage, 0, cn * hp.ne)?
+			let dt = m.out_dt;
+			m.to_stage(&m.out[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)])?;
+			m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
 		ar.lm_out.download_host(&mut out_host[..ncanvas * cn])?;
@@ -2386,9 +2368,8 @@ fn forward_rows(
 	let t = rows.len();
 	let base_off = cache.len;
 	let scale = models::embedding_scale(m);
-	let (src, dt) =
-		if m.emb_src.is_empty() { (&m.emb, Dtype::BF16) } else { (&m.emb_src, m.emb_dt) };
-	let rb = ne * dt.elem_size();
+	let (src, dt) = (&m.emb_src, m.emb_dt);
+	let rb = bytes_for(ne, dt);
 	emb_scratch.clear();
 	for &tk in rows {
 		let b = tk as usize * rb;
@@ -2399,7 +2380,7 @@ fn forward_rows(
 	stage.write_u8(emb_scratch)?;
 	gpu_convert(&stage, &h0, t * ne, scale)?;
 	if !m.pos_embd.is_empty() {
-		let rbp = ne * m.pos_dt.elem_size();
+		let rbp = bytes_for(ne, m.pos_dt);
 		let row = base_off * rbp;
 		let pstage = ar.x.view(0, t * ne).as_dtype(m.pos_dt);
 		pstage.write_u8(&m.pos_embd[row..row + t * rbp])?;

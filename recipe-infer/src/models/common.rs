@@ -1275,10 +1275,10 @@ fn moe_core(
 		}
 		ar.moe_xg.load(&xg[..np * ne])?;
 		let es = m.expert_slot(l, e)?;
-		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
+		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne, hp.moe_gu_dt)?;
 		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
 		gpu_glu_silu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
-		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
+		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe, hp.moe_dn_dt)?;
 		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
 		ar.moe_dv.download_host(&mut dv[..np * ne])?;
 		gpu_core::hip::device_synchronize()?;

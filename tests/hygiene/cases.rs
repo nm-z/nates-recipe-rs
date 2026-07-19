@@ -22,16 +22,15 @@ enum Ev {
 	Fun,
 	Unsafe,
 	Code,
-	Doc,
+	Doc(usize),
+	Sep,
 	Block(usize),
 	Line(usize),
 	Safety(usize),
 }
 
 struct Scope {
-	is_fn: bool,
 	is_unsafe: bool,
-	other: usize,
 	safety: usize,
 }
 
@@ -62,13 +61,17 @@ fn word_ev(w: &str) -> Ev {
 fn classify(c: &[char], line: usize) -> Ev {
 	let tail: String = c.iter().copied().skip(2).collect();
 	if tail.starts_with('!') {
-		return Ev::Doc;
+		return Ev::Doc(line);
 	}
 	if tail.starts_with('/') && !tail.starts_with("//") {
-		return Ev::Doc;
+		return Ev::Doc(line);
 	}
 	if tail.trim_start().starts_with("SAFETY:") {
 		return Ev::Safety(line);
+	}
+	let t = tail.trim();
+	if t.starts_with('─') && t.ends_with('─') {
+		return Ev::Sep;
 	}
 	return Ev::Line(line);
 }
@@ -198,12 +201,10 @@ fn scan(name: &str, src: &str) -> Vec<String> {
 	let mut out = Vec::new();
 	let mut stack: Vec<Scope> = Vec::new();
 	let mut pending: Vec<(usize, usize)> = Vec::new();
-	let mut next_is_fn = false;
 	let mut cand_unsafe = false;
 	for ev in mark(src) {
 		match ev {
 			Ev::Fun => {
-				next_is_fn = true;
 				cand_unsafe = false;
 			}
 			Ev::Unsafe => {
@@ -226,15 +227,10 @@ fn scan(name: &str, src: &str) -> Vec<String> {
 				}
 			}
 			Ev::Open => {
-				let is_unsafe = cand_unsafe;
-				let is_fn = next_is_fn && !cand_unsafe;
 				stack.push(Scope {
-					is_fn,
-					is_unsafe,
-					other: 0,
+					is_unsafe: cand_unsafe,
 					safety: 0,
 				});
-				next_is_fn = false;
 				cand_unsafe = false;
 			}
 			Ev::Close => {
@@ -259,11 +255,12 @@ fn scan(name: &str, src: &str) -> Vec<String> {
 			Ev::Code => {
 				cand_unsafe = false;
 			}
-			Ev::Doc => {}
+			Ev::Doc(ln) => {
+				out.push(format!("{name}:{ln}: doc comment (banned)"));
+			}
+			Ev::Sep => {}
 			Ev::Block(ln) => {
-				out.push(format!(
-					"{name}:{ln}: block comment (banned; use /// or //!)"
-				));
+				out.push(format!("{name}:{ln}: block comment (banned)"));
 			}
 			Ev::Safety(ln) => {
 				let d = stack.len();
@@ -279,27 +276,9 @@ fn scan(name: &str, src: &str) -> Vec<String> {
 				}
 			}
 			Ev::Line(ln) => {
-				let mut idx = usize::MAX;
-				let mut k = stack.len();
-				while k > 0 {
-					k -= 1;
-					if stack[k].is_fn {
-						idx = k;
-						break;
-					}
-				}
-				if idx == usize::MAX {
-					out.push(format!(
-						"{name}:{ln}: // comment outside a function (use /// or //!)"
-					));
-				} else {
-					stack[idx].other += 1;
-					if stack[idx].other > 1 {
-						out.push(format!(
-							"{name}:{ln}: more than one // comment in a function (budget 1)"
-						));
-					}
-				}
+				out.push(format!(
+					"{name}:{ln}: // comment (banned; only // SAFETY: and // ─ separators)"
+				));
 			}
 		}
 	}
@@ -332,7 +311,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn h03_budgeted_comments() {
+fn h03_comment_ban() {
 	let clean = "fn f() {\n\tlet s = \"// not a comment /* nope */\";\n\treturn;\n}\n";
 	assert!(
 		scan("self/clean.rs", clean).is_empty(),
@@ -343,14 +322,24 @@ fn h03_budgeted_comments() {
 		!scan("self/dirty.rs", dirty).is_empty(),
 		"dirty sample was not flagged"
 	);
+	let doc = "/// yap\nfn f() {\n\treturn;\n}\n";
 	assert!(
-		matches!(classify(&['/', '/', '/', ' ', 'x'], 1), Ev::Doc),
+		!scan("self/doc.rs", doc).is_empty(),
+		"doc comment was not flagged"
+	);
+	let sep = "fn f() {\n\t// ── stage ──\n\t// ─\n\treturn;\n}\n";
+	assert!(
+		scan("self/sep.rs", sep).is_empty(),
+		"separator lines were flagged"
+	);
+	assert!(
+		matches!(classify(&['/', '/', '/', ' ', 'x'], 1), Ev::Doc(1)),
 		"/// must classify as a doc comment"
 	);
 	let mut leaked = 0usize;
 	for e in mark("let s = \"// x /* y */\";") {
 		match e {
-			Ev::Line(_) | Ev::Block(_) | Ev::Safety(_) => {
+			Ev::Doc(_) | Ev::Line(_) | Ev::Block(_) | Ev::Safety(_) => {
 				leaked += 1;
 			}
 			_ => {}
