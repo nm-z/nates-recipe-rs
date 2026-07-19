@@ -1,9 +1,8 @@
 use crate::gguf::{Gguf, Val};
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_rmsnorm_f64,
-	gpu_rmsnorm_f64_nogamma, gpu_rope_partial, gpu_scale_f64_inplace, gpu_widen_bf16,
-	gpu_widen_bf16_scaled,
+	gpu_convert, gpu_embed_blend, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_rmsnorm_f64,
+	gpu_rmsnorm_f64_nogamma,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
 use gpu_core::log::probe as probe_flag;
@@ -12,7 +11,7 @@ use gpu_core::memory::{Dtype, GpuBuffer};
 use gpu_core::waterfall::{Home, Waterfall};
 use std::cell::RefCell;
 use std::cmp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io;
@@ -42,6 +41,51 @@ static KV_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Carves `n` forward-width elements, reporting a carve-miss in the right units.
 fn falloc(n: usize) -> Result<GpuBuffer, gpu_core::HipError> {
 	return GpuBuffer::alloc_ty(n, FWD_DT);
+}
+
+/// THE embedding read. Stages `rows * k` embedding rows as raw file bytes and
+/// hands them to [`gpu_embed_blend`], which converts and weight-sums them into
+/// `out`. A plain token embedding is `k == 1` with unit weights; a diffusion
+/// canvas blend is the same call with the sampler's top-[`BLEND_K`] ids and
+/// their probabilities. The host copies bytes and reads indices — never a
+/// float — and no path decodes an element on the CPU.
+fn embed_blend_into(
+	m: &Model,
+	ar: &Arena,
+	picks: &[(usize, f64)],
+	rows: usize,
+	k: usize,
+	scale: f64,
+	out: &GpuBuffer,
+	scratch: &mut Vec<u8>,
+	wts: &mut Vec<f64>,
+) -> Result<()> {
+	let ne = m.hp.ne;
+	let (src, dt) =
+		if m.emb_src.is_empty() { (&m.emb, Dtype::BF16) } else { (&m.emb_src, m.emb_dt) };
+	let rb = ne * dt.elem_size();
+	scratch.clear();
+	wts.clear();
+	for &(id, w) in picks {
+		let b = id * rb;
+		scratch.extend_from_slice(&src[b..b + rb]);
+		wts.push(w);
+	}
+	let stage = ar.blend_src.view(0, rows * k * ne).as_dtype(dt);
+	stage.write_u8(scratch)?;
+	let wdev = ar.blend_w.view(0, rows * k);
+	wdev.load(wts)?;
+	gpu_embed_blend(&stage, &wdev, out, rows, k, ne, scale)
+		.map_err(|e| return anyhow!("embed_blend launch: {e:?}"))?;
+	return Ok(());
+}
+
+/// File byte count for a tensor whose [`Tensor::nbytes`] is the bf16
+/// interchange size (`elems * 2`). Reading raw source bytes needs the width the
+/// FILE uses, not the width the interchange uses, or the read silently returns
+/// a prefix of the tensor.
+const fn raw_bytes(nbytes_bf16: usize, dt: Dtype) -> usize {
+	return (nbytes_bf16 / 2) * dt.elem_size();
 }
 
 /// GGUF architecture strings whose parity fixtures ALL measure OK against
@@ -336,8 +380,6 @@ struct LayerDims {
 	nqh: usize,
 	nff: usize,
 	nkv: usize,
-	rotary: usize,
-	has_v: bool,
 	sliding: bool,
 }
 
@@ -569,19 +611,12 @@ impl Hparams {
 		let mut dims = Vec::with_capacity(nl);
 		for l in 0..nl {
 			let sliding = pattern[l];
-			let has_v = g.tensors.contains_key(&format!("blk.{l}.attn_v.weight"));
-			let (hd, rotary) = if sliding {
-				(key_length_swa, key_length_swa)
-			} else {
-				(key_length, 128)
-			};
+			let hd = if sliding { key_length_swa } else { key_length };
 			dims.push(LayerDims {
 				hd,
 				nqh: n_head_arr[l],
 				nff: n_ff_arr[l],
 				nkv: head_count_kv[l],
-				rotary,
-				has_v,
 				sliding,
 			});
 		}
@@ -818,14 +853,11 @@ struct Arena {
 	act: GpuBuffer,
 	mlp0: GpuBuffer,
 	mlp: GpuBuffer,
-	cmoes: GpuBuffer,
 	moe_xg: GpuBuffer,
 	moe_gu: GpuBuffer,
 	moe_ea: GpuBuffer,
 	moe_dv: GpuBuffer,
 	mo: GpuBuffer,
-	mop: GpuBuffer,
-	comb: GpuBuffer,
 	ha: GpuBuffer,
 	hb: GpuBuffer,
 	/// The frozen non-parametric-normed initial embedding (talkie skip source),
@@ -903,7 +935,23 @@ struct Arena {
 	cm: GpuBuffer,
 	cl: GpuBuffer,
 	cacc: GpuBuffer,
+	/// Staging for [`embed_blend_into`]: the raw embedding rows the host copies
+	/// in, byte-granular, carved wide enough for the widest source dtype. Sized
+	/// for whichever is larger, one row per token or [`BLEND_K`] rows per canvas
+	/// cell.
+	blend_src: GpuBuffer,
+	/// One f64 weight per staged row, uploaded beside [`Arena::blend_src`].
+	blend_w: GpuBuffer,
+	/// Device flag for the per-step finiteness check: 4 bytes carved at the
+	/// arena's width and read as an `i32`, so the check costs one scalar
+	/// download instead of pulling the whole activation back to RAM.
+	finite: GpuBuffer,
 }
+
+/// Candidates blended into each canvas cell's input embedding — the sampler's
+/// top-`k` list length. One const so the sampler and the arena carve cannot
+/// disagree about how many rows get staged.
+const BLEND_K: usize = 8;
 
 impl Arena {
 	fn new(hp: &Hparams, t: usize) -> Result<Arena> {
@@ -915,6 +963,11 @@ impl Arena {
 			return falloc(n)
 				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * FWD_DT.elem_size())));
 		};
+		let a64 = |n: usize| -> Result<GpuBuffer> {
+			return GpuBuffer::alloc_ty(n, Dtype::F64)
+				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * 8)));
+		};
+		let blend_rows = t.max(c * BLEND_K);
 		let nqh_max = hp.dims.iter().map(|d| return d.nqh).max().unwrap_or(1);
 		let sacc = hp.qd_max.max(hp.kv_lora_rank).max(nqh_max * hp.head_k_mla);
 		Ok(Arena {
@@ -931,17 +984,17 @@ impl Arena {
 			act: a(t * nff)?,
 			mlp0: a(t * ne)?,
 			mlp: a(t * ne)?,
-			cmoes: a(t * ne)?,
 			moe_xg: a(t * ne)?,
 			moe_gu: a(t * 2 * nffe)?,
 			moe_ea: a(t * nffe)?,
 			moe_dv: a(t * ne)?,
 			mo: a(t * ne)?,
-			mop: a(t * ne)?,
-			comb: a(t * ne)?,
 			ha: a(t * ne)?,
 			hb: a(t * ne)?,
 			embd_skip: a(if hp.arch == "talkie" { t * ne } else { 1 })?,
+			blend_src: a(blend_rows * ne)?,
+			blend_w: a64(blend_rows)?,
+			finite: a(1)?,
 			soft: a(c * ne)?,
 			scn: a(c * ne)?,
 			sg: a(c * nff)?,
@@ -1019,6 +1072,17 @@ struct Model {
 	gis: Vec<Vec<f64>>,
 	pe: Vec<Vec<f64>>,
 	emb: Vec<u8>,
+	/// The embedding table in its FILE dtype, for the forward gather only —
+	/// populated when the source is wider than the bf16 interchange (f32), so
+	/// the rows the model actually attends carry full source precision instead
+	/// of a bf16 round-trip. Empty = gather from [`emb`] as bf16. The store,
+	/// tied LM head, and streaming paths keep reading the bf16 [`emb`].
+	emb_src: Vec<u8>,
+	/// Element type of [`emb_src`] and of [`pos_embd`], derived from the tensor
+	/// metadata at load. The gather uploads those bytes untouched and hands the
+	/// dtype to the flipper, so the host never decodes an element.
+	emb_dt: Dtype,
+	pos_dt: Dtype,
 	/// Untied output projection (bf16 bytes), when the model ships a separate
 	/// `output.weight`. Empty when the LM head is tied to `emb`.
 	out: Vec<u8>,
@@ -1130,12 +1194,6 @@ const LAYER_NORMS: [(Nk, &str); N_NORMS] = [
 ];
 
 impl Model {
-	fn norm(&self, l: usize, k: Nk) -> Result<&GpuBuffer> {
-		return self.norms[l][k as usize]
-			.as_ref()
-			.ok_or_else(|| anyhow!("{}: layer {l} has no {:?} norm weight", self.hp.arch, k.name()));
-	}
-
 	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
 		let (bb, be) = crate::dequant::block_layout(t.gt)?;
 		anyhow::ensure!(
@@ -1145,6 +1203,18 @@ impl Model {
 		let qoff = off / 2 / be * bb;
 		let qlen = (len / 2).div_ceil(be) * bb;
 		Ok((qoff, qlen))
+	}
+
+	/// Reads `len` bytes of `t` verbatim in its FILE dtype — no dequant, no
+	/// bf16 interchange. For source-precision consumers (the embedding gather).
+	fn read_raw(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
+		let mut buf = vec![0u8; len];
+		let _d = Instant::now();
+		self.shards[t.shard]
+			.read_exact_at(&mut buf, (t.off + off) as u64)
+			.with_context(|| format!("raw read {len} bytes at shard {}", t.shard))?;
+		acc(&DISK_NS, _d);
+		return Ok(buf);
 	}
 
 	fn read_bytes(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
@@ -1236,8 +1306,8 @@ impl Model {
 
 	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize) -> Result<GpuBuffer> {
 		let _w = Instant::now();
-		gpu_widen_bf16(&bview(src, off_bytes, n * 2), n, &self.win)
-			.map_err(|e| anyhow!("widen_bf16 launch: {e:?}"))?;
+		gpu_convert(&bview(src, off_bytes, n * 2).as_dtype(Dtype::BF16), &self.win, n, 1.0)
+			.map_err(|e| anyhow!("convert launch: {e:?}"))?;
 		acc(&WIDEN_NS, _w);
 		Ok(self.win.view(0, n))
 	}
@@ -1691,6 +1761,9 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		gis: Vec::new(),
 		pe: Vec::new(),
 		emb: Vec::new(),
+		emb_src: Vec::new(),
+		emb_dt: Dtype::BF16,
+		pos_dt: Dtype::BF16,
 		out: Vec::new(),
 		out_b: Vec::new(),
 		pos_embd: Vec::new(),
@@ -1883,6 +1956,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		bail!("embed_tokens shape {:?}", et.shape);
 	}
 	m.emb = m.read_bytes(et, 0, et.nbytes)?;
+	if et.gt == 0 {
+		m.emb_dt = Dtype::F32;
+		m.emb_src = m.read_raw(et, 0, raw_bytes(et.nbytes, m.emb_dt))?;
+	}
 
 	if let Some(ot) = m.big.get("model.decoder.lm_head.weight").cloned() {
 		if ot.shape == vec![vocab, ne] {
@@ -1893,7 +1970,12 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		m.out_b = m.small_f64("model.decoder.lm_head.bias")?;
 	}
 	if let Some(pt) = m.big.get("model.decoder.pos_embd.weight").cloned() {
-		m.pos_embd = m.read_bytes(&pt, 0, pt.nbytes)?;
+		m.pos_embd = if pt.gt == 0 {
+			m.pos_dt = Dtype::F32;
+			m.read_raw(&pt, 0, raw_bytes(pt.nbytes, m.pos_dt))?
+		} else {
+			m.read_bytes(&pt, 0, pt.nbytes)?
+		};
 	}
 
 	Ok(m)
@@ -2057,11 +2139,6 @@ fn fill_into(m: &Model, store: &mut Waterfall, cancel: &mut dyn FnMut() -> bool)
 	return Ok(true);
 }
 
-fn rnp(x: &[f64], eps: f64) -> Vec<f64> {
-	let inv = 1.0 / ((x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64) + eps).sqrt();
-	x.iter().map(|v| v * inv).collect()
-}
-
 fn softmax(v: &mut [f64]) {
 	let m = v.iter().cloned().fold(f64::MIN, f64::max);
 	let mut s = 0.0;
@@ -2081,170 +2158,6 @@ fn xs(st: &mut u64) -> f64 {
 	(*st >> 11) as f64 / (1u64 << 53) as f64
 }
 
-fn layer(
-	m: &Model,
-	l: usize,
-	h_in: &GpuBuffer,
-	h_out: &GpuBuffer,
-	t: usize,
-	prefix: usize,
-	ar: &Arena,
-) -> Result<()> {
-	let hp = &m.hp;
-	let ne = hp.ne;
-	let nff = hp.nff;
-	let nffe = hp.nffe;
-	let nqh = hp.nqh;
-	let nexp = hp.nexp;
-	let used = hp.used;
-	let d = &hp.dims[l];
-	let (hd, nkv, qd, kd) = (d.hd, d.nkv, nqh * d.hd, d.nkv * d.hd);
-	let theta = if d.sliding {
-		&m.theta_slide
-	} else {
-		&m.theta_full
-	};
-	let _ta = Instant::now();
-	gpu_rmsnorm_f64(h_in, m.norm(l, Nk::Input)?, &m.eps, t, ne, &ar.x)?;
-	gpu_gemm_bt_f64(
-		&ar.x,
-		&m.stream(&layer_name(l, "self_attn.q_proj.weight"))?,
-		t,
-		qd,
-		ne,
-		&ar.q,
-	)?;
-	let wk = m.stream(&layer_name(l, "self_attn.k_proj.weight"))?;
-	gpu_gemm_bt_f64(&ar.x, &wk, t, kd, ne, &ar.k)?;
-	if d.has_v {
-		gpu_gemm_bt_f64(
-			&ar.x,
-			&m.stream(&layer_name(l, "self_attn.v_proj.weight"))?,
-			t,
-			kd,
-			ne,
-			&ar.v,
-		)?;
-	} else {
-		gpu_gemm_bt_f64(&ar.x, &wk, t, kd, ne, &ar.v)?;
-	}
-	gpu_rmsnorm_f64(&ar.q, m.norm(l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
-	gpu_rmsnorm_f64(&ar.k, m.norm(l, Nk::KNorm)?, &m.eps, t * nkv, hd, &ar.k)?;
-	gpu_rmsnorm_f64_nogamma(&ar.v, &m.eps, t * nkv, hd, &ar.v)?;
-	gpu_rope_partial(theta, t * nqh, hd, d.rotary, nqh, &ar.q)?;
-	gpu_rope_partial(theta, t * nkv, hd, d.rotary, nkv, &ar.k)?;
-	gpu_flash_gqa(&ar.q, &ar.k, &ar.v, t, t, nqh, nkv, hd, 0.0, 0, prefix, &ar.attn, &ar.cm, &ar.cl, &ar.cacc, 0, true)?;
-	gpu_gemm_bt_f64(
-		&ar.attn,
-		&m.stream(&layer_name(l, "self_attn.o_proj.weight"))?,
-		t,
-		ne,
-		qd,
-		&ar.o,
-	)?;
-	gpu_rmsnorm_f64(&ar.o, m.norm(l, Nk::PostAttn)?, &m.eps, t, ne, &ar.o)?;
-	gpu_add_into(&ar.o, h_in, t * ne, &ar.attn_out)?;
-	acc(&ATTN_NS, _ta);
-
-	let _tm = Instant::now();
-	gpu_rmsnorm_f64(&ar.attn_out, m.norm(l, Nk::PreFf)?, &m.eps, t, ne, &ar.cms)?;
-	gpu_gemm_bt_f64(
-		&ar.cms,
-		&m.stream(&layer_name(l, "mlp.gate_proj.weight"))?,
-		t,
-		nff,
-		ne,
-		&ar.g,
-	)?;
-	gpu_gemm_bt_f64(
-		&ar.cms,
-		&m.stream(&layer_name(l, "mlp.up_proj.weight"))?,
-		t,
-		nff,
-		ne,
-		&ar.u,
-	)?;
-	gpu_gelu_mul(&ar.g, &ar.u, t * nff, &ar.act)?;
-	gpu_gemm_bt_f64(
-		&ar.act,
-		&m.stream(&layer_name(l, "mlp.down_proj.weight"))?,
-		t,
-		ne,
-		nff,
-		&ar.mlp0,
-	)?;
-	gpu_rmsnorm_f64(&ar.mlp0, m.norm(l, Nk::Pf1)?, &m.eps, t, ne, &ar.mlp)?;
-	acc(&MLP_NS, _tm);
-
-	let _tmoe = Instant::now();
-	gpu_rmsnorm_f64(&ar.attn_out, m.norm(l, Nk::Pn2)?, &m.eps, t, ne, &ar.cmoes)?;
-	let _rt = Instant::now();
-	let mut ao_host = vec![0.0f64; ar.attn_out.n_floats()];
-	let mut cmoes_host = vec![0.0f64; ar.cmoes.n_floats()];
-	ar.attn_out.download_host(&mut ao_host)?;
-	ar.cmoes.download_host(&mut cmoes_host)?;
-	gpu_core::hip::device_synchronize()?;
-	acc(&MOE_RT_NS, _rt);
-	let _tr = Instant::now();
-	let (rw, gis, pe) = (&m.rw[l], &m.gis[l], &m.pe[l]);
-	let inv_sqrt_ne = 1.0 / (ne as f64).sqrt();
-	let mut e2p: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
-	for p in 0..t {
-		let rmn = rnp(&ao_host[p * ne..(p + 1) * ne], hp.eps);
-		let rin: Vec<f64> = (0..ne).map(|xx| rmn[xx] * inv_sqrt_ne * gis[xx]).collect();
-		let mut rl = vec![0.0f64; nexp];
-		for (e, rle) in rl.iter_mut().enumerate() {
-			let b = e * ne;
-			*rle = (0..ne).map(|i| rw[b + i] * rin[i]).sum();
-		}
-		softmax(&mut rl);
-		let mut idx: Vec<usize> = (0..nexp).collect();
-		idx.sort_by(|a, b| rl[*b].partial_cmp(&rl[*a]).unwrap_or(cmp::Ordering::Equal));
-		idx.truncate(used);
-		let ws: f64 = idx.iter().map(|&e| rl[e]).sum();
-		for &e in &idx {
-			e2p.entry(e).or_default().push((p, rl[e] / ws));
-		}
-	}
-	acc(&ROUTE_NS, _tr);
-	let mut mo_host = vec![0.0f64; t * ne];
-	let mut xg = vec![0.0f64; t * ne];
-	let mut dv_host = vec![0.0f64; t * ne];
-	for (&e, poslist) in &e2p {
-		let np = poslist.len();
-		for (i, &(p, _)) in poslist.iter().enumerate() {
-			xg[i * ne..(i + 1) * ne].copy_from_slice(&cmoes_host[p * ne..(p + 1) * ne]);
-		}
-		let _rt = Instant::now();
-		ar.moe_xg.load(&xg[..np * ne])?;
-		acc(&MOE_RT_NS, _rt);
-		let es = m.expert_slot(l, e)?;
-		let gu_w = m.widen_from(&es, 0, 2 * nffe * ne)?;
-		gpu_gemm_bt_f64(&ar.moe_xg, &gu_w, np, 2 * nffe, ne, &ar.moe_gu)?;
-		gpu_glu_gelu(&ar.moe_gu, np, nffe, &ar.moe_ea)?;
-		let dn_w = m.widen_from(&es, hp.gu_bytes, ne * nffe)?;
-		gpu_gemm_bt_f64(&ar.moe_ea, &dn_w, np, ne, nffe, &ar.moe_dv)?;
-		let _rt = Instant::now();
-		ar.moe_dv.download_host(&mut dv_host[..np * ne])?;
-		gpu_core::hip::device_synchronize()?;
-		acc(&MOE_RT_NS, _rt);
-		for (i, &(p, w)) in poslist.iter().enumerate() {
-			let s = w * pe[e];
-			for xx in 0..ne {
-				mo_host[p * ne + xx] += s * dv_host[i * ne + xx];
-			}
-		}
-	}
-	ar.mo.load(&mo_host)?;
-	gpu_rmsnorm_f64(&ar.mo, m.norm(l, Nk::Pf2)?, &m.eps, t, ne, &ar.mop)?;
-	acc(&MOE_NS, _tmoe);
-
-	gpu_add_into(&ar.mlp, &ar.mop, t * ne, &ar.comb)?;
-	gpu_rmsnorm_f64(&ar.comb, m.norm(l, Nk::Pfw)?, &m.eps, t, ne, &ar.comb)?;
-	gpu_add_into(&ar.attn_out, &ar.comb, t * ne, h_out)?;
-	gpu_scale_f64_inplace(&m.ls_dev[l], t * ne, h_out)?;
-	Ok(())
-}
 
 fn layer_name(l: usize, suffix: &str) -> String {
 	format!("model.decoder.layers.{l}.{suffix}")
@@ -2764,21 +2677,25 @@ fn forward_rows(
 	let t = rows.len();
 	let base_off = cache.len;
 	let scale = models::embedding_scale(m);
-	let rb = ne * 2;
+	let (src, dt) =
+		if m.emb_src.is_empty() { (&m.emb, Dtype::BF16) } else { (&m.emb_src, m.emb_dt) };
+	let rb = ne * dt.elem_size();
 	emb_scratch.clear();
 	for &tk in rows {
 		let b = tk as usize * rb;
-		emb_scratch.extend_from_slice(&m.emb[b..b + rb]);
+		emb_scratch.extend_from_slice(&src[b..b + rb]);
 	}
 	let h0 = ar.ha.view(0, t * ne);
-	let stage = ar.x.view(0, t * ne);
+	let stage = ar.x.view(0, t * ne).as_dtype(dt);
 	stage.write_u8(emb_scratch)?;
-	gpu_widen_bf16_scaled(&stage, t * ne, scale, &h0)?;
+	gpu_convert(&stage, &h0, t * ne, scale)?;
 	if !m.pos_embd.is_empty() {
-		let row = base_off * rb;
-		stage.write_u8(&m.pos_embd[row..row + t * rb])?;
+		let rbp = ne * m.pos_dt.elem_size();
+		let row = base_off * rbp;
+		let pstage = ar.x.view(0, t * ne).as_dtype(m.pos_dt);
+		pstage.write_u8(&m.pos_embd[row..row + t * rbp])?;
 		let pe = ar.attn_out.view(0, t * ne);
-		gpu_widen_bf16_scaled(&stage, t * ne, 1.0, &pe)?;
+		gpu_convert(&pstage, &pe, t * ne, 1.0)?;
 		gpu_add_into(&pe, &h0, t * ne, &h0)?;
 	}
 	if let Some((g, b)) = &m.embed_norm {
@@ -3246,7 +3163,8 @@ impl ChatSession {
 			);
 			return decode_cached(&self.m, &self.tokenizer, &toks, &self.attn_scale, cache, on_round);
 		}
-		return decode_canvas(&self.m, &self.vocab, toks, prefix, on_round);
+		let cache = &mut self.cache;
+		return refine_canvas(&self.m, &self.vocab, toks, prefix, &self.attn_scale, cache, on_round);
 	}
 }
 
@@ -3276,11 +3194,13 @@ pub fn generate(
 /// Diffusion (canvas) decode against a resident model: iteratively refines the
 /// masked canvas region for a fixed number of steps, streaming per-step token
 /// snapshots. Carves and drops its own per-message scratch arena.
-fn decode_canvas(
+fn refine_canvas(
 	m: &Model,
 	vocab: &[String],
 	toks: Vec<u32>,
 	prefix: usize,
+	attn_scale: &GpuBuffer,
+	cache: &mut KvCache,
 	on_round: &mut dyn FnMut(&[Tok]) -> bool,
 ) -> Result<String> {
 	let ne = m.hp.ne;
@@ -3309,37 +3229,36 @@ fn decode_canvas(
 	let mut ages = vec![0u8; ncanvas];
 	let mut heats = vec![0f32; ncanvas];
 
+	let mut picks: Vec<(usize, f64)> = Vec::with_capacity(t.max(ncanvas * BLEND_K));
+	let mut emb_scratch: Vec<u8> = Vec::new();
+	let mut emb_wts: Vec<f64> = Vec::new();
+
 	for step in 0..6 {
-		let mut base = vec![0.0f64; t * ne];
-		for (p, &tk) in toks.iter().enumerate() {
-			let b = tk as usize * ne * 2;
-			for x in 0..ne {
-				base[p * ne + x] =
-					bf16(u16::from_le_bytes([m.emb[b + x * 2], m.emb[b + x * 2 + 1]]))
-						* scl;
-			}
-		}
-		ar.ha.load(&base)?;
+		picks.clear();
+		picks.extend(toks.iter().map(|&tk| return (tk as usize, 1.0)));
+		embed_blend_into(m, &ar, &picks, t, 1, scl, &ar.ha, &mut emb_scratch, &mut emb_wts)?;
 
 		let coff = prefix * ne;
 		let clen = ncanvas * ne;
 		if step > 0 {
-			let mut soft = vec![0.0f64; ncanvas * ne];
-			for (c, top) in sck.iter().enumerate() {
-				for &(id, pr) in top {
-					let b = id * ne * 2;
-					for x in 0..ne {
-						soft[c * ne + x] += pr * bf16(u16::from_le_bytes([
-							m.emb[b + x * 2],
-							m.emb[b + x * 2 + 1],
-						]));
-					}
-				}
-				for x in 0..ne {
-					soft[c * ne + x] *= scl;
+			picks.clear();
+			for top in &sck {
+				let last = top.last().copied().unwrap_or((mask, 0.0));
+				for j in 0..BLEND_K {
+					picks.push(top.get(j).copied().unwrap_or((last.0, 0.0)));
 				}
 			}
-			ar.soft.load(&soft)?;
+			embed_blend_into(
+				m,
+				&ar,
+				&picks,
+				ncanvas,
+				BLEND_K,
+				scl,
+				&ar.soft,
+				&mut emb_scratch,
+				&mut emb_wts,
+			)?;
 			gpu_rmsnorm_f64(&ar.soft, &m.sc_pre, &m.eps, ncanvas, ne, &ar.scn)?;
 			gpu_gemm_bt_f64(&ar.scn, &m.sc_gate, ncanvas, nff, ne, &ar.sg)?;
 			gpu_gemm_bt_f64(&ar.scn, &m.sc_up, ncanvas, nff, ne, &ar.su)?;
@@ -3372,6 +3291,8 @@ fn decode_canvas(
 				format!("[hash] step0 input {:016x}", bithash(&ar.ha, t * ne)?),
 			);
 		}
+		cache.rewind(0);
+		cache.ensure_room(t)?;
 		let mut src: &GpuBuffer = &ar.ha;
 		let mut dst: &GpuBuffer = &ar.hb;
 		for l in 0..nl {
@@ -3384,7 +3305,14 @@ fn decode_canvas(
 					t0.elapsed().as_secs_f64()
 				),
 			);
-			layer(m, l, src, dst, t, prefix, &ar)?;
+			let dec = models::DecCtx {
+				cached: cache.len,
+				win_base: cache.win_base,
+				win: cache.win,
+				state: &cache.layers[l],
+				stage: &cache.stage,
+			};
+			models::dispatch(m, l, src, dst, t, &ar, attn_scale, &dec)?;
 			mem::swap(&mut src, &mut dst);
 			if step == 0 && gpu_core::log::opt().probe {
 				Write::line(
@@ -3394,12 +3322,12 @@ fn decode_canvas(
 			}
 		}
 		let hbuf = src;
-		let mut hbuf_host = vec![0.0f64; hbuf.n_floats()];
-		hbuf.download_host(&mut hbuf_host)?;
-		gpu_core::hip::device_synchronize()?;
-		let nan = hbuf_host.iter().filter(|v| !v.is_finite()).count();
-		if nan > 0 {
-			Write::err(format!("step {step}: {nan} non-finite in h after layers"))?;
+		gpu_core::math_ops::gpu_isfinite_all(hbuf, t * ne, &ar.finite)
+			.map_err(|e| return anyhow!("isfinite_all: {e:?}"))?;
+		let mut flag = [0u8; 4];
+		ar.finite.download_u8(&mut flag)?;
+		if i32::from_le_bytes(flag) == 0 {
+			Write::err(format!("step {step}: non-finite in h after layers"))?;
 		}
 
 		gpu_rmsnorm_f64(

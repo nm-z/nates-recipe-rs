@@ -2,6 +2,7 @@ use crate::HipError;
 use crate::callspy;
 use crate::hip::{check, hipGetLastError};
 use crate::kernels::ci;
+use crate::log::Write;
 use crate::memory::{Dtype, GpuBuffer};
 use core::ffi::c_void;
 use core::ptr;
@@ -15,15 +16,26 @@ fn cl() -> Result<(), HipError> {
 }
 
 unsafe extern "C" {
-	fn launch_widen_bf16_f64(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
-	fn launch_widen_bf16_f32(input: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void);
-	fn launch_widen_bf16_scaled(
-		input: *const c_void,
-		out: *mut c_void,
+	fn launch_convert(
+		src: *const c_void,
+		dst: *mut c_void,
 		n: i64,
 		scale: f64,
+		sdt: i32,
+		ddt: i32,
 		stream: *mut c_void,
-		f32_out: i32,
+	);
+	fn launch_embed_blend(
+		rowsrc: *const c_void,
+		w: *const c_void,
+		out: *mut c_void,
+		rows: i64,
+		k: i32,
+		ne: i32,
+		scale: f64,
+		sdt: i32,
+		ddt: i32,
+		stream: *mut c_void,
 	);
 	fn launch_normx_rmsnorm(
 		x: *const c_void,
@@ -256,49 +268,96 @@ pub fn gpu_rope_partial_factors_pos(
 	return cl();
 }
 
-/// Widens `n` bf16 values in `raw` into `out` (f32 or f64 by `out`'s dtype),
-/// multiplying each by `scale` in f64 before any narrowing — bit-identical to
-/// the host `(f64)bf16 * scale` path it replaces. The GPU-side embedding
-/// gather: token rows upload as raw bf16 bytes and widen on device, no
-/// per-element host loop.
+/// THE embedding read: writes `rows` rows of `ne` elements into `out`, each the
+/// `scale`-weighted sum of `k` consecutive staged rows in `rowsrc`, converted
+/// from `rowsrc`'s dtype on the way in. A plain token embedding is `k == 1`
+/// with weight `1.0`; a diffusion canvas blend is the same call with `k`
+/// candidates and their probabilities. The host stages raw bytes and integer
+/// indices; every float operation happens here.
 ///
 /// # Errors
-/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
+/// Returns [`HipError`] if a dimension overflows its ABI width, either dtype
+/// has no convert kernel, or the launch fails.
 #[inline]
-pub fn gpu_widen_bf16_scaled(
-	raw: &GpuBuffer,
-	n: usize,
-	scale: f64,
+pub fn gpu_embed_blend(
+	rowsrc: &GpuBuffer,
+	w: &GpuBuffer,
 	out: &GpuBuffer,
+	rows: usize,
+	k: usize,
+	ne: usize,
+	scale: f64,
 ) -> Result<(), HipError> {
-	let n64 = i64::try_from(n).map_err(|_e| return HipError(1))?;
-	let f32_out = i32::from(out.dtype() == Dtype::F32);
-	// SAFETY: raw holds at least n bf16 values and out n elements at its dtype; the launcher only reads/writes within them.
+	let (s, d) = (rowsrc.dtype(), out.dtype());
+	if s.conv() < 0 || d.conv() < 0 || d.block_elems() > 1 {
+		Write::error(format!("gpu_embed_blend: no kernel for {s:?} -> {d:?}"));
+		return Err(HipError(1));
+	}
+	let rows64 = i64::try_from(rows).map_err(|_e| return HipError(1))?;
+	// SAFETY: rowsrc holds rows*k rows of ne elements at its dtype, w holds rows*k weights, and out holds rows*ne elements at its dtype.
 	unsafe {
-		launch_widen_bf16_scaled(
-			raw.ptr_raw().cast_const(),
+		launch_embed_blend(
+			rowsrc.ptr_raw().cast_const(),
+			w.ptr_raw().cast_const(),
 			out.ptr_raw(),
-			n64,
+			rows64,
+			ci(k)?,
+			ci(ne)?,
 			scale,
+			s.conv(),
+			d.conv(),
 			ptr::null_mut(),
-			f32_out,
 		);
 	}
 	return cl();
 }
 
+/// THE dtype flipper: converts `n` elements of `src` into `dst`. One function
+/// for every dtype and every direction — widen, narrow, dequant, requant are
+/// the same call, and the caller names none of them. `src.dtype()` says what
+/// the bytes are, `dst.dtype()` says what they become, and the pair picks the
+/// kernel; adding dtype N+1 costs one variant and one case. Every value is
+/// scaled in f64 before any narrowing, bit-identical to the host
+/// `(f64)x * scale` path it replaces (`scale == 1.0` converts exactly).
+///
+/// Quant sources decode block-resident on device: the raw file bytes stay in
+/// VRAM and the host does no element math. A pair with no kernel, or a length
+/// that does not fill whole blocks, fails by name — never a silent reinterpret.
+///
 /// # Errors
-/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
+/// Returns [`HipError`] if `n` overflows `i64`, either dtype has no convert
+/// kernel, `n` is not a whole number of blocks, or the launch fails.
 #[inline]
-pub fn gpu_widen_bf16(raw: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
+pub fn gpu_convert(src: &GpuBuffer, dst: &GpuBuffer, n: usize, scale: f64) -> Result<(), HipError> {
 	let n64 = i64::try_from(n).map_err(|_e| return HipError(1))?;
-	// SAFETY: raw and out are live GpuBuffer allocations sized for n elements at out's dtype; the launcher only reads/writes within them.
+	let (s, d) = (src.dtype(), dst.dtype());
+	if s.conv() < 0 || d.conv() < 0 {
+		Write::error(format!("gpu_convert: no kernel for {s:?} -> {d:?}"));
+		return Err(HipError(1));
+	}
+	if d.block_elems() > 1 && d != Dtype::Q8_0 {
+		Write::error(format!("gpu_convert: no encoder for {d:?}"));
+		return Err(HipError(1));
+	}
+	if !n.is_multiple_of(s.block_elems()) || !n.is_multiple_of(d.block_elems()) {
+		Write::error(format!(
+			"gpu_convert: {n} elements is not whole blocks of {s:?} ({}) -> {d:?} ({})",
+			s.block_elems(),
+			d.block_elems()
+		));
+		return Err(HipError(1));
+	}
+	// SAFETY: src holds at least n elements at its dtype and dst n elements at its dtype; the launcher only reads/writes within them.
 	unsafe {
-		if out.dtype() == Dtype::F32 {
-			launch_widen_bf16_f32(raw.ptr_raw().cast_const(), out.ptr_raw(), n64, ptr::null_mut());
-		} else {
-			launch_widen_bf16_f64(raw.ptr_raw().cast_const(), out.ptr_raw(), n64, ptr::null_mut());
-		}
+		launch_convert(
+			src.ptr_raw().cast_const(),
+			dst.ptr_raw(),
+			n64,
+			scale,
+			s.conv(),
+			d.conv(),
+			ptr::null_mut(),
+		);
 	}
 	return cl();
 }

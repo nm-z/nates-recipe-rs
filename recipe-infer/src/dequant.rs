@@ -1,192 +1,33 @@
 use anyhow::{Result, bail, ensure};
 
-/// Numeric interpretation applied to an image/typed-buffer channel of a given
-/// bit width. This is a format axis on the image codecs, not a standalone
-/// width: the same channel bits mean different values under each.
-///
-/// - `Unorm`   raw / (2^w - 1)                       -> [0, 1]
-/// - `Snorm`   max(signext / (2^(w-1) - 1), -1)      -> [-1, 1]
-/// - `Uscaled` raw as f32 (unsigned integer value)
-/// - `Sscaled` signext as f32 (signed integer value)
-/// - `Uint`    raw as f32
-/// - `Sint`    signext as f32
-/// - `Float`   IEEE/mini float of the channel width (10/11/16/32)
-/// - `Srgb`    `Unorm` then the sRGB EOTF on colour channels (alpha stays linear)
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ImgFmt {
-      Unorm,
-      Snorm,
-      Uscaled,
-      Sscaled,
-      Uint,
-      Sint,
-      Float,
-      Srgb,
-}
+/// The one dtype enum, re-exported. `gpu-core` owns it at the bottom of the
+/// DAG because device buffers are typed by it and its kernels convert between
+/// its variants; this codec surface decodes the same variants on the host.
+/// There is no second dtype enum to keep in sync — adding type N+1 is one
+/// variant there, one kernel case, and one codec arm here.
+pub use gpu_core::memory::{Dtype, ImgFmt, ImgLayout};
 
-/// Image packed channel layout: the per-channel bit widths, listed low-order
-/// channel first. Channels pack little-endian within the block, the first
-/// listed channel occupying the least-significant bits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ImgLayout {
-      L8,
-      L8_8,
-      L8_8_8_8,
-      L16,
-      L16_16,
-      L16_16_16_16,
-      L32,
-      L32_32,
-      L32_32_32,
-      L32_32_32_32,
-      L5_6_5,
-      L1_5_5_5,
-      L5_5_5_1,
-      L10_10_10_2,
-      L2_10_10_10,
-      L10_11_11,
-      L11_11_10,
-}
-
-impl ImgLayout {
-      /// Per-channel bit widths, low-order channel first.
-      pub fn channels(self) -> &'static [u32] {
-            return match self {
-                  ImgLayout::L8 => &[8],
-                  ImgLayout::L8_8 => &[8, 8],
-                  ImgLayout::L8_8_8_8 => &[8, 8, 8, 8],
-                  ImgLayout::L16 => &[16],
-                  ImgLayout::L16_16 => &[16, 16],
-                  ImgLayout::L16_16_16_16 => &[16, 16, 16, 16],
-                  ImgLayout::L32 => &[32],
-                  ImgLayout::L32_32 => &[32, 32],
-                  ImgLayout::L32_32_32 => &[32, 32, 32],
-                  ImgLayout::L32_32_32_32 => &[32, 32, 32, 32],
-                  ImgLayout::L5_6_5 => &[5, 6, 5],
-                  ImgLayout::L1_5_5_5 => &[1, 5, 5, 5],
-                  ImgLayout::L5_5_5_1 => &[5, 5, 5, 1],
-                  ImgLayout::L10_10_10_2 => &[10, 10, 10, 2],
-                  ImgLayout::L2_10_10_10 => &[2, 10, 10, 10],
-                  ImgLayout::L10_11_11 => &[10, 11, 11],
-                  ImgLayout::L11_11_10 => &[11, 11, 10],
-            };
-      }
-
-      fn nm(self) -> &'static str {
-            return match self {
-                  ImgLayout::L8 => "img8",
-                  ImgLayout::L8_8 => "img8_8",
-                  ImgLayout::L8_8_8_8 => "img8_8_8_8",
-                  ImgLayout::L16 => "img16",
-                  ImgLayout::L16_16 => "img16_16",
-                  ImgLayout::L16_16_16_16 => "img16_16_16_16",
-                  ImgLayout::L32 => "img32",
-                  ImgLayout::L32_32 => "img32_32",
-                  ImgLayout::L32_32_32 => "img32_32_32",
-                  ImgLayout::L32_32_32_32 => "img32_32_32_32",
-                  ImgLayout::L5_6_5 => "img5_6_5",
-                  ImgLayout::L1_5_5_5 => "img1_5_5_5",
-                  ImgLayout::L5_5_5_1 => "img5_5_5_1",
-                  ImgLayout::L10_10_10_2 => "img10_10_10_2",
-                  ImgLayout::L2_10_10_10 => "img2_10_10_10",
-                  ImgLayout::L10_11_11 => "img10_11_11",
-                  ImgLayout::L11_11_10 => "img11_11_10",
-            };
-      }
-}
-
-/// The dtypes this one codec surface understands. The GGUF quant grid, the
-/// full-width floats, the typeless bit widths, signed/unsigned/packed integers,
-/// the OCP-MX / AMD mini-floats, and the image channel layouts are ALL siblings
-/// in this single enum, converted through the one f32 pivot by `convert`. Quant
-/// variants decode only; every other variant decodes, and encodes where the
-/// encode is meaningful (else it bails, exactly like the quants).
-///
-/// Lossy through the f32 pivot (documented per codec): `F64`/`F64x2`,
-/// `I32`/`U32`/`I64`/`U64` above 2^24, `Tf32`/`Xf32` (10-bit mantissa
-/// truncation), and any 32-bit image channel under `Uint`/`Sint`/`Float`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DType {
-      F32,
-      F16,
-      Bf16,
-      Q4_0,
-      Q4_1,
-      Q5_0,
-      Q5_1,
-      Q8_0,
-      Q2_K,
-      Q3_K,
-      Q4_K,
-      Q5_K,
-      Q6_K,
-      B8,
-      B16,
-      B32,
-      B64,
-      B96,
-      B128,
-      B256,
-      B512,
-      B16x2,
-      B16x3,
-      B16x4,
-      I4,
-      I8,
-      I16,
-      I24,
-      I32,
-      I64,
-      U4,
-      U8,
-      U16,
-      U24,
-      U32,
-      U64,
-      I4x8,
-      U4x8,
-      I8x4,
-      U8x4,
-      I16x2,
-      U16x2,
-      F4e2m1,
-      F6e2m3,
-      F6e3m2,
-      F8e4m3,
-      F8e5m2,
-      F8e4m3fnuz,
-      F8e5m2fnuz,
-      Bf8,
-      Tf32,
-      Xf32,
-      F64,
-      F4x2e2m1,
-      F4x4e2m1,
-      F6x2e2m3,
-      F6x4e2m3,
-      F6x2e3m2,
-      F6x4e3m2,
-      F8x2e4m3,
-      F8x4e4m3,
-      F8x2e5m2,
-      F8x4e5m2,
-      F8x2e4m3fnuz,
-      F8x4e4m3fnuz,
-      F8x2e5m2fnuz,
-      F8x4e5m2fnuz,
-      F16x2,
-      Bf16x2,
-      F32x2,
-      F64x2,
-      Byte,
-      Short,
-      Dword,
-      Dwordx2,
-      Dwordx3,
-      Dwordx4,
-      Dwordx8,
-      Dwordx16,
-      Img(ImgLayout, ImgFmt),
+/// Short name for an image layout, used to label its codec.
+fn img_nm(l: ImgLayout) -> &'static str {
+      return match l {
+            ImgLayout::L8 => "img8",
+            ImgLayout::L8_8 => "img8_8",
+            ImgLayout::L8_8_8_8 => "img8_8_8_8",
+            ImgLayout::L16 => "img16",
+            ImgLayout::L16_16 => "img16_16",
+            ImgLayout::L16_16_16_16 => "img16_16_16_16",
+            ImgLayout::L32 => "img32",
+            ImgLayout::L32_32 => "img32_32",
+            ImgLayout::L32_32_32 => "img32_32_32",
+            ImgLayout::L32_32_32_32 => "img32_32_32_32",
+            ImgLayout::L5_6_5 => "img5_6_5",
+            ImgLayout::L1_5_5_5 => "img1_5_5_5",
+            ImgLayout::L5_5_5_1 => "img5_5_5_1",
+            ImgLayout::L10_10_10_2 => "img10_10_10_2",
+            ImgLayout::L2_10_10_10 => "img2_10_10_10",
+            ImgLayout::L10_11_11 => "img10_11_11",
+            ImgLayout::L11_11_10 => "img11_11_10",
+      };
 }
 
 /// Either a borrowed static codec (the fixed quant/float grid) or an owned,
@@ -206,126 +47,130 @@ impl Cx {
       }
 }
 
-impl DType {
-      /// Map a GGML type tag to a `DType`; unknown tags bail rather than guess.
-      pub fn from_ggml(t: u32) -> Result<DType> {
-            let d = match t {
-                  0 => DType::F32,
-                  1 => DType::F16,
-                  2 => DType::Q4_0,
-                  3 => DType::Q4_1,
-                  6 => DType::Q5_0,
-                  7 => DType::Q5_1,
-                  8 => DType::Q8_0,
-                  10 => DType::Q2_K,
-                  11 => DType::Q3_K,
-                  12 => DType::Q4_K,
-                  13 => DType::Q5_K,
-                  14 => DType::Q6_K,
-                  30 => DType::Bf16,
-                  other => bail!("gguf: unsupported ggml type {other}"),
-            };
-            return Ok(d);
-      }
+/// Map a GGML type tag to a `Dtype`; unknown tags bail rather than guess.
+pub fn from_ggml(t: u32) -> Result<Dtype> {
+      let d = match t {
+            0 => Dtype::F32,
+            1 => Dtype::F16,
+            2 => Dtype::Q4_0,
+            3 => Dtype::Q4_1,
+            6 => Dtype::Q5_0,
+            7 => Dtype::Q5_1,
+            8 => Dtype::Q8_0,
+            10 => Dtype::Q2K,
+            11 => Dtype::Q3K,
+            12 => Dtype::Q4K,
+            13 => Dtype::Q5K,
+            14 => Dtype::Q6K,
+            30 => Dtype::BF16,
+            other => bail!("gguf: unsupported ggml type {other}"),
+      };
+      return Ok(d);
+}
 
-      fn codec(self) -> Cx {
-            return match self {
-                  DType::F32 => Cx::S(&F32C),
-                  DType::F16 => Cx::S(&F16C),
-                  DType::Bf16 => Cx::S(&BF16_C),
-                  DType::Q4_0 => Cx::S(&Q40C),
-                  DType::Q4_1 => Cx::S(&Q41C),
-                  DType::Q5_0 => Cx::S(&Q50C),
-                  DType::Q5_1 => Cx::S(&Q51C),
-                  DType::Q8_0 => Cx::S(&Q80C),
-                  DType::Q2_K => Cx::S(&Q2KC),
-                  DType::Q3_K => Cx::S(&Q3KC),
-                  DType::Q4_K => Cx::S(&Q4KC),
-                  DType::Q5_K => Cx::S(&Q5KC),
-                  DType::Q6_K => Cx::S(&Q6KC),
-                  DType::B8 => Cx::Own(Box::new(IntCodec::new("b8", 8, false, 1))),
-                  DType::B16 => Cx::Own(Box::new(IntCodec::new("b16", 16, false, 1))),
-                  DType::B32 => Cx::Own(Box::new(BitcastCodec::new("b32", 1))),
-                  DType::B64 => Cx::Own(Box::new(BitcastCodec::new("b64", 2))),
-                  DType::B96 => Cx::Own(Box::new(BitcastCodec::new("b96", 3))),
-                  DType::B128 => Cx::Own(Box::new(BitcastCodec::new("b128", 4))),
-                  DType::B256 => Cx::Own(Box::new(BitcastCodec::new("b256", 8))),
-                  DType::B512 => Cx::Own(Box::new(BitcastCodec::new("b512", 16))),
-                  DType::B16x2 => Cx::Own(Box::new(IntCodec::new("b16x2", 16, false, 2))),
-                  DType::B16x3 => Cx::Own(Box::new(IntCodec::new("b16x3", 16, false, 3))),
-                  DType::B16x4 => Cx::Own(Box::new(IntCodec::new("b16x4", 16, false, 4))),
-                  DType::I4 => Cx::Own(Box::new(IntCodec::new("i4", 4, true, 2))),
-                  DType::I8 => Cx::Own(Box::new(IntCodec::new("i8", 8, true, 1))),
-                  DType::I16 => Cx::Own(Box::new(IntCodec::new("i16", 16, true, 1))),
-                  DType::I24 => Cx::Own(Box::new(IntCodec::new("i24", 24, true, 1))),
-                  DType::I32 => Cx::Own(Box::new(IntCodec::new("i32", 32, true, 1))),
-                  DType::I64 => Cx::Own(Box::new(IntCodec::new("i64", 64, true, 1))),
-                  DType::U4 => Cx::Own(Box::new(IntCodec::new("u4", 4, false, 2))),
-                  DType::U8 => Cx::Own(Box::new(IntCodec::new("u8", 8, false, 1))),
-                  DType::U16 => Cx::Own(Box::new(IntCodec::new("u16", 16, false, 1))),
-                  DType::U24 => Cx::Own(Box::new(IntCodec::new("u24", 24, false, 1))),
-                  DType::U32 => Cx::Own(Box::new(IntCodec::new("u32", 32, false, 1))),
-                  DType::U64 => Cx::Own(Box::new(IntCodec::new("u64", 64, false, 1))),
-                  DType::I4x8 => Cx::Own(Box::new(IntCodec::new("i4x8", 4, true, 8))),
-                  DType::U4x8 => Cx::Own(Box::new(IntCodec::new("u4x8", 4, false, 8))),
-                  DType::I8x4 => Cx::Own(Box::new(IntCodec::new("i8x4", 8, true, 4))),
-                  DType::U8x4 => Cx::Own(Box::new(IntCodec::new("u8x4", 8, false, 4))),
-                  DType::I16x2 => Cx::Own(Box::new(IntCodec::new("i16x2", 16, true, 2))),
-                  DType::U16x2 => Cx::Own(Box::new(IntCodec::new("u16x2", 16, false, 2))),
-                  DType::F4e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4_e2m1", 2))),
-                  DType::F6e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6_e2m3", 4))),
-                  DType::F6e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6_e3m2", 4))),
-                  DType::F8e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8_e4m3", 1, false))),
-                  DType::F8e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8_e5m2", 1, false))),
-                  DType::F8e4m3fnuz => {
-                        Cx::Own(Box::new(FpCodec::e4m3("f8_e4m3_fnuz", 1, true)))
-                  }
-                  DType::F8e5m2fnuz => {
-                        Cx::Own(Box::new(FpCodec::e5m2("f8_e5m2_fnuz", 1, true)))
-                  }
-                  DType::Bf8 => Cx::Own(Box::new(FpCodec::e5m2("bf8", 1, false))),
-                  DType::Tf32 => Cx::Own(Box::new(WideCodec::new("tf32", WideKind::Tf32, 1))),
-                  DType::Xf32 => Cx::Own(Box::new(WideCodec::new("xf32", WideKind::Tf32, 1))),
-                  DType::F64 => Cx::Own(Box::new(WideCodec::new("f64", WideKind::F64, 1))),
-                  DType::F4x2e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4x2_e2m1", 2))),
-                  DType::F4x4e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4x4_e2m1", 4))),
-                  DType::F6x2e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6x2_e2m3", 4))),
-                  DType::F6x4e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6x4_e2m3", 4))),
-                  DType::F6x2e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6x2_e3m2", 4))),
-                  DType::F6x4e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6x4_e3m2", 4))),
-                  DType::F8x2e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8x2_e4m3", 2, false))),
-                  DType::F8x4e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8x4_e4m3", 4, false))),
-                  DType::F8x2e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8x2_e5m2", 2, false))),
-                  DType::F8x4e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8x4_e5m2", 4, false))),
-                  DType::F8x2e4m3fnuz => {
-                        Cx::Own(Box::new(FpCodec::e4m3("f8x2_e4m3_fnuz", 2, true)))
-                  }
-                  DType::F8x4e4m3fnuz => {
-                        Cx::Own(Box::new(FpCodec::e4m3("f8x4_e4m3_fnuz", 4, true)))
-                  }
-                  DType::F8x2e5m2fnuz => {
-                        Cx::Own(Box::new(FpCodec::e5m2("f8x2_e5m2_fnuz", 2, true)))
-                  }
-                  DType::F8x4e5m2fnuz => {
-                        Cx::Own(Box::new(FpCodec::e5m2("f8x4_e5m2_fnuz", 4, true)))
-                  }
-                  DType::F16x2 => Cx::Own(Box::new(WideCodec::new("f16x2", WideKind::F16, 2))),
-                  DType::Bf16x2 => {
-                        Cx::Own(Box::new(WideCodec::new("bf16x2", WideKind::Bf16, 2)))
-                  }
-                  DType::F32x2 => Cx::Own(Box::new(WideCodec::new("f32x2", WideKind::F32, 2))),
-                  DType::F64x2 => Cx::Own(Box::new(WideCodec::new("f64x2", WideKind::F64, 2))),
-                  DType::Byte => Cx::Own(Box::new(IntCodec::new("byte", 8, false, 1))),
-                  DType::Short => Cx::Own(Box::new(IntCodec::new("short", 16, false, 1))),
-                  DType::Dword => Cx::Own(Box::new(BitcastCodec::new("dword", 1))),
-                  DType::Dwordx2 => Cx::Own(Box::new(BitcastCodec::new("dwordx2", 2))),
-                  DType::Dwordx3 => Cx::Own(Box::new(BitcastCodec::new("dwordx3", 3))),
-                  DType::Dwordx4 => Cx::Own(Box::new(BitcastCodec::new("dwordx4", 4))),
-                  DType::Dwordx8 => Cx::Own(Box::new(BitcastCodec::new("dwordx8", 8))),
-                  DType::Dwordx16 => Cx::Own(Box::new(BitcastCodec::new("dwordx16", 16))),
-                  DType::Img(l, f) => Cx::Own(Box::new(ImageCodec { layout: l, fmt: f })),
-            };
-      }
+/// The codec for this dtype. Every variant of the one enum is answered
+/// here or named in the error — the IQ family is declared in `Dtype` (the
+/// gguf grid includes it) but has no codec on either side yet, so asking
+/// for one fails by name instead of decoding as something else.
+fn codec(d: Dtype) -> Result<Cx> {
+      let cx = match d {
+            Dtype::F32 => Cx::S(&F32C),
+            Dtype::F16 => Cx::S(&F16C),
+            Dtype::BF16 => Cx::S(&BF16_C),
+            Dtype::Q4_0 => Cx::S(&Q40C),
+            Dtype::Q4_1 => Cx::S(&Q41C),
+            Dtype::Q5_0 => Cx::S(&Q50C),
+            Dtype::Q5_1 => Cx::S(&Q51C),
+            Dtype::Q8_0 => Cx::S(&Q80C),
+            Dtype::Q2K => Cx::S(&Q2KC),
+            Dtype::Q3K => Cx::S(&Q3KC),
+            Dtype::Q4K => Cx::S(&Q4KC),
+            Dtype::Q5K => Cx::S(&Q5KC),
+            Dtype::Q6K => Cx::S(&Q6KC),
+            Dtype::B8 => Cx::Own(Box::new(IntCodec::new("b8", 8, false, 1))),
+            Dtype::B16 => Cx::Own(Box::new(IntCodec::new("b16", 16, false, 1))),
+            Dtype::B32 => Cx::Own(Box::new(BitcastCodec::new("b32", 1))),
+            Dtype::B64 => Cx::Own(Box::new(BitcastCodec::new("b64", 2))),
+            Dtype::B96 => Cx::Own(Box::new(BitcastCodec::new("b96", 3))),
+            Dtype::B128 => Cx::Own(Box::new(BitcastCodec::new("b128", 4))),
+            Dtype::B256 => Cx::Own(Box::new(BitcastCodec::new("b256", 8))),
+            Dtype::B512 => Cx::Own(Box::new(BitcastCodec::new("b512", 16))),
+            Dtype::B16x2 => Cx::Own(Box::new(IntCodec::new("b16x2", 16, false, 2))),
+            Dtype::B16x3 => Cx::Own(Box::new(IntCodec::new("b16x3", 16, false, 3))),
+            Dtype::B16x4 => Cx::Own(Box::new(IntCodec::new("b16x4", 16, false, 4))),
+            Dtype::I4 => Cx::Own(Box::new(IntCodec::new("i4", 4, true, 2))),
+            Dtype::I8 => Cx::Own(Box::new(IntCodec::new("i8", 8, true, 1))),
+            Dtype::I16 => Cx::Own(Box::new(IntCodec::new("i16", 16, true, 1))),
+            Dtype::I24 => Cx::Own(Box::new(IntCodec::new("i24", 24, true, 1))),
+            Dtype::I32 => Cx::Own(Box::new(IntCodec::new("i32", 32, true, 1))),
+            Dtype::I64 => Cx::Own(Box::new(IntCodec::new("i64", 64, true, 1))),
+            Dtype::U4 => Cx::Own(Box::new(IntCodec::new("u4", 4, false, 2))),
+            Dtype::U8 => Cx::Own(Box::new(IntCodec::new("u8", 8, false, 1))),
+            Dtype::U16 => Cx::Own(Box::new(IntCodec::new("u16", 16, false, 1))),
+            Dtype::U24 => Cx::Own(Box::new(IntCodec::new("u24", 24, false, 1))),
+            Dtype::U32 => Cx::Own(Box::new(IntCodec::new("u32", 32, false, 1))),
+            Dtype::U64 => Cx::Own(Box::new(IntCodec::new("u64", 64, false, 1))),
+            Dtype::I4x8 => Cx::Own(Box::new(IntCodec::new("i4x8", 4, true, 8))),
+            Dtype::U4x8 => Cx::Own(Box::new(IntCodec::new("u4x8", 4, false, 8))),
+            Dtype::I8x4 => Cx::Own(Box::new(IntCodec::new("i8x4", 8, true, 4))),
+            Dtype::U8x4 => Cx::Own(Box::new(IntCodec::new("u8x4", 8, false, 4))),
+            Dtype::I16x2 => Cx::Own(Box::new(IntCodec::new("i16x2", 16, true, 2))),
+            Dtype::U16x2 => Cx::Own(Box::new(IntCodec::new("u16x2", 16, false, 2))),
+            Dtype::F4e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4_e2m1", 2))),
+            Dtype::F6e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6_e2m3", 4))),
+            Dtype::F6e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6_e3m2", 4))),
+            Dtype::F8e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8_e4m3", 1, false))),
+            Dtype::F8e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8_e5m2", 1, false))),
+            Dtype::F8e4m3fnuz => {
+                  Cx::Own(Box::new(FpCodec::e4m3("f8_e4m3_fnuz", 1, true)))
+            }
+            Dtype::F8e5m2fnuz => {
+                  Cx::Own(Box::new(FpCodec::e5m2("f8_e5m2_fnuz", 1, true)))
+            }
+            Dtype::BF8 => Cx::Own(Box::new(FpCodec::e5m2("bf8", 1, false))),
+            Dtype::Tf32 => Cx::Own(Box::new(WideCodec::new("tf32", WideKind::Tf32, 1))),
+            Dtype::Xf32 => Cx::Own(Box::new(WideCodec::new("xf32", WideKind::Tf32, 1))),
+            Dtype::F64 => Cx::Own(Box::new(WideCodec::new("f64", WideKind::F64, 1))),
+            Dtype::F4x2e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4x2_e2m1", 2))),
+            Dtype::F4x4e2m1 => Cx::Own(Box::new(FpCodec::e2m1("f4x4_e2m1", 4))),
+            Dtype::F6x2e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6x2_e2m3", 4))),
+            Dtype::F6x4e2m3 => Cx::Own(Box::new(FpCodec::e2m3("f6x4_e2m3", 4))),
+            Dtype::F6x2e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6x2_e3m2", 4))),
+            Dtype::F6x4e3m2 => Cx::Own(Box::new(FpCodec::e3m2("f6x4_e3m2", 4))),
+            Dtype::F8x2e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8x2_e4m3", 2, false))),
+            Dtype::F8x4e4m3 => Cx::Own(Box::new(FpCodec::e4m3("f8x4_e4m3", 4, false))),
+            Dtype::F8x2e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8x2_e5m2", 2, false))),
+            Dtype::F8x4e5m2 => Cx::Own(Box::new(FpCodec::e5m2("f8x4_e5m2", 4, false))),
+            Dtype::F8x2e4m3fnuz => {
+                  Cx::Own(Box::new(FpCodec::e4m3("f8x2_e4m3_fnuz", 2, true)))
+            }
+            Dtype::F8x4e4m3fnuz => {
+                  Cx::Own(Box::new(FpCodec::e4m3("f8x4_e4m3_fnuz", 4, true)))
+            }
+            Dtype::F8x2e5m2fnuz => {
+                  Cx::Own(Box::new(FpCodec::e5m2("f8x2_e5m2_fnuz", 2, true)))
+            }
+            Dtype::F8x4e5m2fnuz => {
+                  Cx::Own(Box::new(FpCodec::e5m2("f8x4_e5m2_fnuz", 4, true)))
+            }
+            Dtype::F16x2 => Cx::Own(Box::new(WideCodec::new("f16x2", WideKind::F16, 2))),
+            Dtype::BF16x2 => {
+                  Cx::Own(Box::new(WideCodec::new("bf16x2", WideKind::Bf16, 2)))
+            }
+            Dtype::F32x2 => Cx::Own(Box::new(WideCodec::new("f32x2", WideKind::F32, 2))),
+            Dtype::F64x2 => Cx::Own(Box::new(WideCodec::new("f64x2", WideKind::F64, 2))),
+            Dtype::Byte => Cx::Own(Box::new(IntCodec::new("byte", 8, false, 1))),
+            Dtype::Short => Cx::Own(Box::new(IntCodec::new("short", 16, false, 1))),
+            Dtype::Dword => Cx::Own(Box::new(BitcastCodec::new("dword", 1))),
+            Dtype::Dwordx2 => Cx::Own(Box::new(BitcastCodec::new("dwordx2", 2))),
+            Dtype::Dwordx3 => Cx::Own(Box::new(BitcastCodec::new("dwordx3", 3))),
+            Dtype::Dwordx4 => Cx::Own(Box::new(BitcastCodec::new("dwordx4", 4))),
+            Dtype::Dwordx8 => Cx::Own(Box::new(BitcastCodec::new("dwordx8", 8))),
+            Dtype::Dwordx16 => Cx::Own(Box::new(BitcastCodec::new("dwordx16", 16))),
+            Dtype::Img(l, f) => Cx::Own(Box::new(ImageCodec { layout: l, fmt: f })),
+            other => bail!("{other:?}: no codec on this surface yet"),
+      };
+      return Ok(cx);
 }
 
 /// One block layout + codec per dtype. `decode_block` consumes exactly
@@ -340,9 +185,9 @@ trait Codec: Sync {
 }
 
 /// THE conversion surface: decode every `src` block to f32, re-encode as `dst`.
-pub fn convert(src: DType, dst: DType, bytes: &[u8]) -> Result<Vec<u8>> {
-      let scx = src.codec();
-      let dcx = dst.codec();
+pub fn convert(src: Dtype, dst: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
+      let scx = codec(src)?;
+      let dcx = codec(dst)?;
       let sc = scx.get();
       let dc = dcx.get();
       let sbb = sc.block_bytes();
@@ -378,8 +223,8 @@ pub fn convert(src: DType, dst: DType, bytes: &[u8]) -> Result<Vec<u8>> {
 /// # Errors
 /// Returns an error naming the unsupported GGML type tag.
 pub fn block_layout(t: u32) -> Result<(usize, usize)> {
-      let d = DType::from_ggml(t)?;
-      let cx = d.codec();
+      let d = from_ggml(t)?;
+      let cx = codec(d)?;
       let c = cx.get();
       return Ok((c.block_bytes(), c.block_elems()));
 }
@@ -393,7 +238,7 @@ pub fn nbytes_for(t: u32, elems: usize) -> Result<usize> {
 
 /// Decode `bytes` of GGML type `t` to f32 values via the one conversion surface.
 pub fn dequant_f32(t: u32, bytes: &[u8]) -> Result<Vec<f32>> {
-      let raw = convert(DType::from_ggml(t)?, DType::F32, bytes)?;
+      let raw = convert(from_ggml(t)?, Dtype::F32, bytes)?;
       let out = raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -403,7 +248,7 @@ pub fn dequant_f32(t: u32, bytes: &[u8]) -> Result<Vec<f32>> {
 
 /// Decode `bytes` of GGML type `t` to little-endian bf16 bytes.
 pub fn dequant_bf16(t: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-      return convert(DType::from_ggml(t)?, DType::Bf16, bytes);
+      return convert(from_ggml(t)?, Dtype::BF16, bytes);
 }
 
 fn f16_to_f32(b: u16) -> f32 {
@@ -692,8 +537,19 @@ impl Codec for Q80Codec {
             }
             return Ok(());
       }
-      fn encode_block(&self, _vals: &[f32], _out: &mut Vec<u8>) -> Result<()> {
-            bail!("Q8_0 encode not implemented");
+      /// `quantize_row_q8_0_ref` (ggml/src/ggml-quants.c): 127 levels against
+      /// the block's own max. `d` is stored f16 but the quantization divides by
+      /// the unrounded f32 `d`, so the round trip can exceed half a step by the
+      /// f16 error of the scale — the reference behaviour, matched exactly.
+      fn encode_block(&self, vals: &[f32], out: &mut Vec<u8>) -> Result<()> {
+            let amax = vals.iter().fold(0f32, |a, &v| return a.max(v.abs()));
+            let d = amax / 127.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+            for &v in vals {
+                  out.push((v * id).round() as i8 as u8);
+            }
+            return Ok(());
       }
 }
 
@@ -1525,7 +1381,7 @@ struct ImageCodec {
 
 impl Codec for ImageCodec {
       fn name(&self) -> &'static str {
-            return self.layout.nm();
+            return img_nm(self.layout);
       }
       fn block_bytes(&self) -> usize {
             let total: u32 = self.layout.channels().iter().sum();

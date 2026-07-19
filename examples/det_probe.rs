@@ -8,11 +8,11 @@
 use anyhow::Context;
 use gpu_core::infer_ops::{
 	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_rmsnorm_f64, gpu_rope_partial,
-	gpu_scale_f64_inplace, gpu_widen_bf16,
+	gpu_convert, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
 use gpu_core::log::{Opt, Write, opt, probe, set_opt};
-use gpu_core::memory::GpuBuffer;
+use gpu_core::memory::{Dtype, GpuBuffer};
 use ogdl::ogdl;
 use std::fmt;
 use std::ptr;
@@ -335,10 +335,10 @@ fn main() -> anyhow::Result<()> {
 		.map(|v| ((*v as f32).to_bits() >> 16) as u16)
 		.flat_map(|h| h.to_le_bytes())
 		.collect();
-	let stage = GpuBuffer::alloc_bytes(bf.len()).context("stage")?;
+	let stage = GpuBuffer::alloc_bytes(bf.len()).context("stage")?.as_dtype(Dtype::BF16);
 	stage.write_u8(&bf).context("write")?;
-	twice("widen_bf16", T * NE, |o| {
-		gpu_widen_bf16(&stage, T * NE, o).context("widen")
+	twice("convert_bf16", T * NE, |o| {
+		gpu_convert(&stage, o, T * NE, 1.0).context("convert")
 	})?;
 
 	// scale_inplace: in-place, so reload between runs.

@@ -1610,30 +1610,264 @@ pub fn probe_ram_ceiling(guess: usize) -> Option<usize> {
 	return None;
 }
 
-/// Element type of a device buffer; every byte computation derives from it.
+/// Image packed channel sample format, applied per channel after unpacking.
+/// - `Unorm`   raw / (2^bits - 1)
+/// - `Snorm`   signext then / (2^(bits-1) - 1), clamped to -1
+/// - `Uscaled` raw as f32 (unsigned integer value)
+/// - `Sscaled` signext as f32 (signed integer value)
+/// - `Uint`    raw as f32
+/// - `Sint`    signext as f32
+/// - `Float`   IEEE/mini float of the channel width (10/11/16/32)
+/// - `Srgb`    `Unorm` then the sRGB EOTF on colour channels (alpha stays linear)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImgFmt {
+	Unorm,
+	Snorm,
+	Uscaled,
+	Sscaled,
+	Uint,
+	Sint,
+	Float,
+	Srgb,
+}
+
+/// Image packed channel layout: the per-channel bit widths, listed low-order
+/// channel first. Channels pack little-endian within the block, the first
+/// listed channel occupying the least-significant bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImgLayout {
+	L8,
+	L8_8,
+	L8_8_8_8,
+	L16,
+	L16_16,
+	L16_16_16_16,
+	L32,
+	L32_32,
+	L32_32_32,
+	L32_32_32_32,
+	L5_6_5,
+	L1_5_5_5,
+	L5_5_5_1,
+	L10_10_10_2,
+	L2_10_10_10,
+	L10_11_11,
+	L11_11_10,
+}
+
+impl ImgLayout {
+	/// Per-channel bit widths, low-order channel first.
+	pub fn channels(self) -> &'static [u32] {
+		return match self {
+			ImgLayout::L8 => &[8],
+			ImgLayout::L8_8 => &[8, 8],
+			ImgLayout::L8_8_8_8 => &[8, 8, 8, 8],
+			ImgLayout::L16 => &[16],
+			ImgLayout::L16_16 => &[16, 16],
+			ImgLayout::L16_16_16_16 => &[16, 16, 16, 16],
+			ImgLayout::L32 => &[32],
+			ImgLayout::L32_32 => &[32, 32],
+			ImgLayout::L32_32_32 => &[32, 32, 32],
+			ImgLayout::L32_32_32_32 => &[32, 32, 32, 32],
+			ImgLayout::L5_6_5 => &[5, 6, 5],
+			ImgLayout::L1_5_5_5 => &[1, 5, 5, 5],
+			ImgLayout::L5_5_5_1 => &[5, 5, 5, 1],
+			ImgLayout::L10_10_10_2 => &[10, 10, 10, 2],
+			ImgLayout::L2_10_10_10 => &[2, 10, 10, 10],
+			ImgLayout::L10_11_11 => &[10, 11, 11],
+			ImgLayout::L11_11_10 => &[11, 11, 10],
+		};
+	}
+
+}
+
+/// THE dtype: every element type any part of the system names — device buffer
+/// elements, gguf tensor storage, quant blocks, packed ints, mini-floats,
+/// image layouts — is a variant here, in gpu-core, the bottom of the DAG.
+/// Adding dtype N+1 costs one variant and one match arm. Kernel dispatch
+/// ([`Dtype::ffi`]) covers the compute dtypes; codecs in `recipe-infer`'s
+/// dequant map the rest onto them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Dtype {
-      F32,
-      #[default]
-      F64,
+	F32,
+	#[default]
+	F64,
+	F16,
+	BF16,
+	Q4_0,
+	Q4_1,
+	Q5_0,
+	Q5_1,
+	Q8_0,
+	Q2K,
+	Q3K,
+	Q4K,
+	Q5K,
+	Q6K,
+	Iq1S,
+	Iq1M,
+	Iq2Xxs,
+	Iq2Xs,
+	Iq2S,
+	Iq3Xxs,
+	Iq3S,
+	Iq4Nl,
+	Iq4Xs,
+	B8,
+	B16,
+	B32,
+	B64,
+	B96,
+	B128,
+	B256,
+	B512,
+	B16x2,
+	B16x3,
+	B16x4,
+	I4,
+	I8,
+	I16,
+	I24,
+	I32,
+	I64,
+	U4,
+	U8,
+	U16,
+	U24,
+	U32,
+	U64,
+	I4x8,
+	U4x8,
+	I8x4,
+	U8x4,
+	I16x2,
+	U16x2,
+	F4e2m1,
+	F6e2m3,
+	F6e3m2,
+	F8e4m3,
+	F8e5m2,
+	F8e4m3fnuz,
+	F8e5m2fnuz,
+	BF8,
+	Tf32,
+	Xf32,
+	F4x2e2m1,
+	F4x4e2m1,
+	F6x2e2m3,
+	F6x4e2m3,
+	F6x2e3m2,
+	F6x4e3m2,
+	F8x2e4m3,
+	F8x4e4m3,
+	F8x2e5m2,
+	F8x4e5m2,
+	F8x2e4m3fnuz,
+	F8x4e4m3fnuz,
+	F8x2e5m2fnuz,
+	F8x4e5m2fnuz,
+	F16x2,
+	BF16x2,
+	F32x2,
+	F64x2,
+	Byte,
+	Short,
+	Dword,
+	Dwordx2,
+	Dwordx3,
+	Dwordx4,
+	Dwordx8,
+	Dwordx16,
+	Img(ImgLayout, ImgFmt),
 }
+
 
 impl Dtype {
       #[inline]
       #[must_use]
+      /// Bytes per element for the scalar compute dtypes. Block-quantized, packed,
+      /// and image dtypes are byte-granular here (1): their real geometry lives in
+      /// the codec (`block_bytes`/`block_elems`), never in flat element math.
       pub const fn elem_size(self) -> usize {
             return match self {
-                  Self::F32 => 4,
-                  Self::F64 => 8,
+                  Self::F64 | Self::F64x2 => 8,
+                  Self::F32 | Self::Tf32 | Self::Xf32 => 4,
+                  Self::F16 | Self::BF16 => 2,
+                  _other => 1,
             };
       }
 
       #[inline]
       #[must_use]
+      /// Kernel-ABI dispatch code (dtype_dispatch.h): 0 = f64, 1 = f32. Every
+      /// other dtype is NOT kernel-dispatchable — codecs convert it to a compute
+      /// dtype first — and returns -1 so a stray launch fails loudly in review,
+      /// never silently as f64.
       pub const fn ffi(self) -> i32 {
             return match self {
                   Self::F32 => 1,
                   Self::F64 => 0,
+                  _other => -1,
+            };
+      }
+
+      #[inline]
+      #[must_use]
+      /// Convert-kernel ABI code (`convert.h`), the dtype half of the
+      /// [`crate::infer_ops::gpu_convert`] flipper. Shares 0 = f64 / 1 = f32
+      /// with [`Self::ffi`] so a buffer's compute code and convert code never
+      /// disagree. `-1` = no kernel reads or writes this dtype yet, which
+      /// `gpu_convert` reports by name rather than reinterpreting bytes.
+      pub const fn conv(self) -> i32 {
+            return match self {
+                  Self::F64 => 0,
+                  Self::F32 => 1,
+                  Self::F16 => 2,
+                  Self::BF16 => 3,
+                  Self::Q4_0 => 10,
+                  Self::Q4_1 => 11,
+                  Self::Q5_0 => 12,
+                  Self::Q5_1 => 13,
+                  Self::Q8_0 => 14,
+                  Self::Q2K => 20,
+                  Self::Q3K => 21,
+                  Self::Q4K => 22,
+                  Self::Q5K => 23,
+                  Self::Q6K => 24,
+                  _other => -1,
+            };
+      }
+
+      #[inline]
+      #[must_use]
+      /// Elements per storage block: 1 for the element-granular dtypes, 32 for
+      /// the legacy quants, 256 for the K-quant superblocks. The count a
+      /// conversion length must divide evenly.
+      pub const fn block_elems(self) -> usize {
+            return match self {
+                  Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
+                  Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+                  _other => 1,
+            };
+      }
+
+      #[inline]
+      #[must_use]
+      /// Bytes per storage block, matching the ggml on-disk layouts byte for
+      /// byte. For element-granular dtypes this is [`Self::elem_size`].
+      pub const fn block_bytes(self) -> usize {
+            return match self {
+                  Self::Q4_0 => 18,
+                  Self::Q4_1 => 20,
+                  Self::Q5_0 => 22,
+                  Self::Q5_1 => 24,
+                  Self::Q8_0 => 34,
+                  Self::Q2K => 84,
+                  Self::Q3K => 110,
+                  Self::Q4K => 144,
+                  Self::Q5K => 176,
+                  Self::Q6K => 210,
+                  _other => self.elem_size(),
             };
       }
 }
