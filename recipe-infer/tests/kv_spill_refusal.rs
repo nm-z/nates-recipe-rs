@@ -1,32 +1,3 @@
-//! Refusal-contract gate for the infinity KV cache. The contract: the cache
-//! refuses ONLY when every tier (VRAM claim, RAM pool, disk) is genuinely
-//! exhausted, and the refusal is a clean sized message in GB that names the
-//! tier, returned as an `Err` — never a page fault, panic, or abort.
-//!
-//! Genuine all-tier exhaustion is NOT forceable in <=60s honestly: it needs the
-//! disk tier full, and the only lever that would fake it in-budget — shrinking a
-//! tier via an env var or a magic constant — is banned. So, exactly as the task
-//! authorizes, the refusal is proven at its boundary: the sized-message
-//! primitives the refusal is built from are pinned here, and the end-to-end
-//! all-tier-exhaustion string is left to a `dev`-metered manual run on a machine
-//! driven to true exhaustion.
-//!
-//! What is pinned:
-//!   * `human_bytes` renders a claim-scale magnitude in GB with two decimals —
-//!     the refusal must report sizes, not raw byte counts.
-//!   * `USER_GB` is exactly 1 GiB — the single headroom constant the sized
-//!     shortfall is computed against, so "X GB short" is never a magic number.
-//!   * `carve_miss_message` (the over-claim / arena-exhaustion refusal the
-//!     implementation agent is making fault-free) returns a sized String that
-//!     names the VRAM tier and its free/total/short accounting — proving the
-//!     refusal path is an error VALUE, not a fault. This is the RAM/disk
-//!     refusal's sibling; the waterfall emits the analogous "... GB ... spilling
-//!     to DISK" tier line for the host tiers.
-//!
-//! Needed hook (reported, not added here): a pub tier-named exhaustion formatter
-//! — e.g. `kv_exhaustion_message(tier, need, tiers) -> String` — would let the
-//! RAM/disk refusal string be asserted at its boundary as a fails-first gate,
-//! instead of only the VRAM `carve_miss_message` sibling.
 
 use gpu_core::memory::{USER_GB, carve_miss_message};
 use recipe_infer::human_bytes;

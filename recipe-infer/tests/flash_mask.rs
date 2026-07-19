@@ -1,15 +1,3 @@
-//! Settles the reviewer's allegation that the flash mask leaks future positions,
-//! and pins the kernel to a reference masked-softmax attention.
-//!
-//! `causal_below` is a position bound: for the query at absolute position
-//! `p = p_base + i`, key `sp` is masked exactly when `p < causal_below && sp > p`.
-//! With `causal_below == t_kv` (fully causal) every new query masks every key past
-//! its own absolute position, so:
-//!   1. perturbing a K/V row at a FUTURE position must leave every earlier query's
-//!      output BIT-IDENTICAL (the masked key contributes a hard -inf score, hence
-//!      an exact 0.0 weight — no dependence on its value), and
-//!   2. the kernel's online-softmax output matches a straightforward host f64
-//!      masked softmax attention, including GQA head sharing.
 
 use gpu_core::infer_ops::gpu_flash_gqa;
 use gpu_core::memory::GpuBuffer;

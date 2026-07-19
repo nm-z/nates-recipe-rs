@@ -1,18 +1,3 @@
-//! Proof that the single decode path is correct for EVERY family. There is one
-//! function that turns tokens into next-token logits during generation
-//! (`llm::greedy`, backed by the resident incremental cache). This test compares
-//! its output, token for token, against a full-recompute reference that re-runs a
-//! fresh whole-sequence forward (`llm::last_logits`, the `dec == None` path) at
-//! every step. Equality means the cache carries state exactly:
-//!   - attention layers: appending only the new K/V and attending the full cache
-//!     equals re-attending the whole sequence;
-//!   - recurrent layers (SSM / mamba-2 / delta-net / KDA / short-conv / linear):
-//!     carrying the scan/conv state and processing only the new rows equals
-//!     reprocessing from row 0.
-//! The recurrences are exact under state carry, so any divergence is a bug, not
-//! rounding. Fixtures are the committed seeded arch set (real graphs, random
-//! weights); greedy output is deterministic gibberish, which is all self-consistency
-//! needs. Run serially (`--test-threads=1`) — one GPU arena claim at a time.
 
 use anyhow::{Context, Result};
 use recipe_infer::llm::{greedy, greedy_windowed, last_logits};

@@ -1,15 +1,3 @@
-//! The GPU flipper against the CPU codec surface, on real quantized weights.
-//!
-//! [`gpu_core::infer_ops::gpu_convert`] decodes every ggml block quant on
-//! device so the raw file bytes never leave VRAM and the host does no element
-//! math. That device decode has to agree with `dequant`'s reference-exact CPU
-//! codecs BIT FOR BIT, not approximately: both compute in f32 and `scale = 1.0`
-//! is exact, so any difference is a wrong index, a wrong shift, or a wrong
-//! scale unpack, never rounding.
-//!
-//! One `#[test]` per quant, each on the smallest real tensor of that type in
-//! the machine's `qwen3-0.6b-<quant>` gguf (from the committed `gguf.toml`) —
-//! every block of that tensor, every element of every block.
 
 use anyhow::{Context, Result, bail};
 use gpu_core::infer_ops::gpu_convert;

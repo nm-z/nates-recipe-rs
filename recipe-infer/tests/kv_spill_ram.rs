@@ -1,32 +1,3 @@
-//! Spill-contract gate for the infinity KV cache: capacity grows from the VRAM
-//! claim and, when the claim is exhausted, new K/V rows settle in the RAM pool
-//! then disk (waterfall law) — never a fresh device allocation, and never a
-//! silent refusal while a lower tier still has room. Cache content is exact
-//! regardless of which tier a row lives in.
-//!
-//! Two invariants are asserted, both of which a naive "grow the cache by
-//! allocating more device memory" implementation FAILS:
-//!
-//! 1. Unbounded growth moves BYTES, not allocations. Across many growing turns
-//!    the gpu-core ledger's device allocation count stays pinned at its
-//!    post-open value (the one-claim law holds under growth) while transfer
-//!    CALLS accumulate — the cache is streamed through the choke points, not
-//!    re-allocated. A grow-by-alloc cache trips the alloc assertion; a cache
-//!    that stops decoding when VRAM fills trips the liveness assertion.
-//! 2. Tier-independence of content: the incremental cached path's first token
-//!    equals a cold full recompute's first token for the same ids. A row's
-//!    logits must not depend on whether it was read from VRAM, RAM, or disk.
-//!
-//! Honesty caveat (why there is no "crossed into RAM" assertion): the only
-//! committed fixtures are tiny (stories-f32 and the archs-parity set), their
-//! per-token K/V is kilobytes, and the probe-verified claim cannot drop below
-//! ~1 GB — so a genuine VRAM->RAM crossing needs far more than 60s of decode, or
-//! a model no committed fixture provides. Forcing the crossing by shrinking a
-//! tier through an env var or a magic constant is banned. This test therefore
-//! pins the spill MECHANISM's invariants (alloc-free growth, byte movement,
-//! tier-independent content), which hold and are checkable on the tiny models;
-//! the observed VRAM->RAM->DISK crossing itself is a `dev`-metered measurement
-//! on a large model, not a suite assertion.
 
 use gpu_core::memory::{device_alloc_count, xfer_calls};
 use recipe_infer::llm::{ChatSession, Tok, greedy, last_logits};

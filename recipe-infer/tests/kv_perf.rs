@@ -1,18 +1,3 @@
-//! Permanent perf harness for the resident decode path. Loads a real chat gguf
-//! (smallest chat-capable model in the repo's `gguf.toml`: qwen3-0.6B Q8_0),
-//! prefills a prompt of at least 2k tokens through the one decode path, greedily
-//! generates a fixed token count, and prints TTFT and tok/s to stderr. This is
-//! the target the nontemporal A/B and before/after measurements run with
-//! `--nocapture`; it is a harness, not a benchmark gate, so it asserts only that
-//! generation completed — but it is still a real test that fails on breakage
-//! (load error, empty generation, or a decode that returns `Err`), and it stays
-//! inside the 60s per-test budget.
-//!
-//! The prompt is a long deterministic passage tokenized to >= 2000 tokens; the
-//! generated text is greedy gibberish continuation, which is all a speed probe
-//! needs. Model path comes from the committed `gguf.toml`; the test fails loudly
-//! if that model is not present on the machine (a perf harness with no model is a
-//! broken harness, not a skip).
 
 use std::time::Instant;
 use std::path::PathBuf;

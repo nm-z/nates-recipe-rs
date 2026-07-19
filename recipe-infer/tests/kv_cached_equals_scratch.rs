@@ -1,23 +1,3 @@
-//! Cached-decode exactness at the token level: the incremental cached path must
-//! generate token-for-token what a from-scratch full recompute produces.
-//!
-//! [`recipe_infer::llm::greedy`] IS the cached path — one batched prefill of the
-//! prompt, then one row per step appending K/V (attention layers) and carrying
-//! scan/conv state (recurrent layers) through the resident cache. The scratch
-//! oracle re-forwards the ENTIRE sequence every step through
-//! [`recipe_infer::llm::last_logits`] (fresh model open, no cache) and greedily
-//! extends it. Both apply the same monotone logit-scale/softcap before argmax,
-//! so identical logits give identical picks — any divergence is the cache
-//! state-carry disagreeing with a clean recompute. Equality is required, not
-//! approximate.
-//!
-//! Fed raw token ids (bypassing the tokenizer, exactly as archs_parity /
-//! logit_ref do) so this validates the decode math, not tokenization — which
-//! also lets it run on the committed archs-parity fixtures whose seeded minimal
-//! tokenizers don't build. Covered: a dense arch (llama, committed stories-f32),
-//! a pure-scan arch (mamba2) and an attention/SSM hybrid (falcon-h1), both from
-//! the committed archs-parity set. Each opens/frees its own claim; runs are
-//! serial, one GPU process at a time under the suite orchestrator.
 
 use recipe_infer::llm::{greedy, last_logits};
 use std::cmp::Ordering;

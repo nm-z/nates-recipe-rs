@@ -1,17 +1,3 @@
-//! Capacity behavior of the resident cache: growth must keep decoding, never
-//! silently refuse mid-conversation, and must ride the one claim — zero fresh
-//! device allocations after the session opens (the one-claim law; spill tiers,
-//! not allocs, absorb growth under the infinity-cache contract).
-//!
-//! Scope honesty: true VRAM exhaustion is NOT forceable in <=60s with the
-//! committed fixtures. The only committed runnable models are tiny (stories-f32
-//! ~= 2.5 KB of K/V per token across its layers), the probe-verified claim
-//! cannot go below ~1 GB, and single-row suffix decode runs low-thousands of
-//! rows per minute — so crossing a >=1 GB cache in one test is out of reach by
-//! orders of magnitude. This test therefore proves the sustained-growth half of
-//! the contract (a multi-thousand-row cache built across turns keeps decoding,
-//! alloc-free); the spill crossing and the GB-sized genuine-exhaustion refusal
-//! remain a post-implementation measured claim, not a suite assertion.
 
 use gpu_core::memory::device_alloc_count;
 use recipe_infer::llm::{ChatSession, Tok};

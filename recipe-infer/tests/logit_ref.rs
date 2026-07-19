@@ -1,15 +1,3 @@
-//! Reference parity test for the causal-dense (LLaMA) family: recipe-infer's
-//! verified decode must greedily generate the SAME token sequence as llama.cpp
-//! for the same model and the same input tokens. Bypasses recipe-infer's
-//! tokenizer (token ids fed directly) so this validates the forward model, not
-//! tokenization.
-//!
-//! Model: `stories260K` (llama arch), f32, committed under tests/fixtures/.
-//! Reference obtained on the same file with `/usr/bin/llama-cli` /
-//! `llama-completion` / `llama-tokenize` (greedy, --temp 0, -ngl 0):
-//!   prompt "Once upon a time" -> tokens [1, 403, 407, 261, 378]
-//!   greedy continuation "Once upon a time, there was a little girl"
-//!   full ids [1,403,407,261,378, 432,383,286,261,376,298,315,421]
 
 use recipe_infer::llm::greedy;
 use std::path::Path;

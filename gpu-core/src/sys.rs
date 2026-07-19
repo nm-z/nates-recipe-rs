@@ -1,6 +1,3 @@
-//! OS-level unsafe boundary: the single named home for libc/process/signal
-//! calls that the rest of the workspace would otherwise reach for inline.
-//! Every function here is SAFE to call; the unsafe is contained.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;

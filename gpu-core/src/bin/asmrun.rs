@@ -1,18 +1,4 @@
 #![allow(unsafe_code)]
-//! Load a `.s`/`.hsaco` and dispatch one of its kernels from the command line.
-//!
-//! ```text
-//! asmrun <path.s>                                  # list the kernels
-//! asmrun <path.s> <kernel> <gridX> <blockX> [arg..] # dispatch
-//! ```
-//!
-//! Each `arg` is `KIND:VALUE`: `ptr:<bytes>` allocates a zeroed device buffer of
-//! that many bytes and passes its pointer; `i32/u32/u64:<v>` and `f64:<v>` pass
-//! a scalar. Arguments are packed in declaration order.
-//!
-//! `lds:<bytes>` is a launch setting rather than a kernel argument: it reserves
-//! dynamic group segment for a kernel declaring `HIP_DYNAMIC_SHARED`, which
-//! reports a fixed group segment of zero and would otherwise run with no LDS.
 
 use core::ffi::c_void;
 use gpu_core::asm::{self, KernArgs};

@@ -1,18 +1,3 @@
-//! Apples-to-apples tokenizer parity against llama.cpp, one row per vocab.
-//!
-//! Fixtures in `datasets/llamacpp-vocabs-tokenizer/` are llama.cpp's own
-//! committed tokenizer test set (`models/ggml-vocab-*.gguf` plus `.inp` test
-//! strings separated by `__ggml_vocab_test__` and `.out` reference ids per
-//! case), copied verbatim. recipe-infer must tokenize every case of every
-//! vocab to exactly llama.cpp's ids.
-//!
-//! Verdict per vocab on stderr:
-//!   OK     every case matches
-//!   FAIL   tokenizer built, some cases mismatch (matched/total shown)
-//!   ERROR  vocab gguf did not open or no tokenizer could be built from it
-//!   NOREF  gguf present without .inp/.out reference pair
-//!
-//! Passes only at full parity; red rows are the burn-down baseline.
 
 use anyhow::{Context, Result};
 use recipe_infer::gguf::Gguf;

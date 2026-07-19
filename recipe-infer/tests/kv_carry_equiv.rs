@@ -1,26 +1,3 @@
-//! Cross-launch carry equivalence: splitting the KV sequence across several
-//! `gpu_flash_gqa`/`gpu_flash_mla` launches with the (m,l,acc) online-softmax
-//! state threaded between them must produce output BIT-IDENTICAL to a single
-//! null-carry launch over the whole sequence.
-//!
-//! Contract (f64_infer.hip): carry buffers are ALWAYS passed; kv_off == 0 starts fresh
-//! (-inf,0,0), in-launch normalize, kv_off/finalize inert). `Some` carry resumes
-//! the prior segment's (m,l,acc), folds this segment's keys at ABSOLUTE position
-//! `kv_off + sp`, and either normalizes to `out` (finalize=true) or stores
-//! (m,l,acc) back writing no out (finalize=false). Carry is indexed by query
-//! block `i*nqh+h`: m_io/l_io are `[t_q*nqh]`, acc_io is `[t_q*nqh*hd]` (GQA) /
-//! `[t_q*nqh*hdv]` (MLA). Ascending kv_off keeps the accumulation order and the
-//! absolute key positions identical to one launch, so the state round-trips
-//! through global as exact T bits and the finalized output matches to the bit.
-//!
-//! The assertion is exact `to_bits()` equality, not epsilon: the segmented path
-//! is designed to be the SAME float operations in the SAME order as the single
-//! launch. Any bit difference means the kernel mishandles kv_off, the carry
-//! indexing, the state round-trip, or the segment-boundary normalize — all real
-//! bugs. Coverage: GQA head ratios nqh/nkv = 1, 2, 4 and an MLA shape; causal
-//! (causal_below=t_kv with p_base>0) and bidirectional (causal_below=0); uneven
-//! 3-segment splits including a boundary that lands mid-way through the causal
-//! frontier (where some queries mask the crossed keys and others do not).
 
 use gpu_core::infer_ops::{gpu_flash_gqa, gpu_flash_mla};
 use gpu_core::memory::GpuBuffer;

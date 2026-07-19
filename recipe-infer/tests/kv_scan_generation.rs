@@ -1,14 +1,3 @@
-//! Smoke proof that scan/recurrent and hybrid architectures generate through
-//! the ONE decode path. Under the finished contract every attention site is
-//! cached and scan/conv ops carry per-layer state through the cache, so a
-//! hybrid arch must take the exact same incremental path as a dense one — a
-//! rejection, hang, or error here means hybrids fell off the unified route.
-//!
-//! [`recipe_infer::llm::greedy`] IS that path (prefill + one cached row per
-//! step). Driven by raw token ids so the seeded archs-parity fixtures (whose
-//! minimal tokenizers don't build) can be used: mamba2 = pure scan, falcon-h1 =
-//! attention/SSM hybrid, both committed. Random seeded weights are fine for a
-//! liveness proof; token-level exactness is covered by kv_cached_equals_scratch.
 
 use recipe_infer::llm::greedy;
 use std::path::{Path, PathBuf};

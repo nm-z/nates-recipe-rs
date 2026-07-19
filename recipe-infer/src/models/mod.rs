@@ -1,16 +1,3 @@
-//! Flat declarative arch table: each GGUF `general.architecture` string maps to
-//! a [`Comp`] composition entry, and [`dispatch`] is a table lookup that composes
-//! the block via the shared `common` drivers. The runtime composes the arch from
-//! shared ops and transfers; it does not implement any arch imperatively.
-//!
-//! Contract vocabulary:
-//! - [`TABLE`] is the single source of truth: every arch fact ([`COMPOSABLE`],
-//!   [`VERIFIED`], per-arch scalar resolvers) is derived from it.
-//! - COMPOSABLE ([`supported`]) = a decode route exists in [`dispatch`].
-//! - VERIFIED ([`verified`]) = full parity was MEASURED against llama.cpp
-//!   (NMSE <= 1e-4, `archs_parity`); a strict subset of COMPOSABLE.
-//! - Spec flags (the [`Spec`] builder methods per row) are shared behavior
-//!   switches: the same neutral driver reads them, so no arch needs a branch.
 mod common;
 
 use super::{Arena, Model};

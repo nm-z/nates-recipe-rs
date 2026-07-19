@@ -1,8 +1,3 @@
-//! Proves the RAM headroom probe child entry: an unset env means "not a probe
-//! child" (`None`), and a set budget is committed and touched, so surviving the
-//! commit reports `Some(0)`. This is the CPU-only child half of the VRAM-shaped
-//! host-RAM probe; the parent loop is never spawned from a test (its
-//! `current_exe` would re-enter the suite binary).
 use gpu_core::memory::ram_probe_ask;
 use std::env;
 

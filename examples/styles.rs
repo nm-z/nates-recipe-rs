@@ -1,10 +1,4 @@
 #!/usr/bin/env -S cargo run --release --example styles --
-//! The three import styles, one crate, one dataset. Each block builds the same
-//! model on the same data and trains it — only the door differs. Chaining,
-//! `let` bindings, `train().run(data, model)` and `infer().run(model).eval(data)`
-//! are identical past the constructor.
-//!
-//!   cargo run --release --example styles
 
 use gpu_core::log::{loss, r2};
 use recipe::{Data, Infer, Loss, Model, R2, Train, mse, recipe};

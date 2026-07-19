@@ -1,9 +1,3 @@
-//! Verifies the architecture support contract with the verified/composable
-//! split: `arch_supported` reports only architectures whose parity fixtures
-//! ALL measure OK against llama.cpp (entry by measurement, enforced by
-//! archs_parity's regression gate); `arch_composable` reports what
-//! `models::dispatch` can attempt. Verified is a subset of composable, and
-//! unknown strings are rejected by both (no silent fallback).
 
 use recipe_infer::llm::{arch_composable, arch_supported, composable_archs, supported_archs};
 

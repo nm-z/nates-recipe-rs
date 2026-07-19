@@ -1,6 +1,3 @@
-//! The glob grammar through its real door: the `ogdl!` macro, including the
-//! loop-through forms with runtime coordinates. One test fn: the macro works
-//! on the process-global graph, so this file owns its process.
 
 use ogdl::ogdl;
 use std::fmt::Display;

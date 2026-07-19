@@ -1,6 +1,3 @@
-//! The glob grammar's adjudicated corpus: every worksheet cell and elicited
-//! example that survived the final law, as executable truth. Worksheet cells
-//! assert walk order; route examples assert viewpoint exclusion.
 
 use ogdl::Node;
 

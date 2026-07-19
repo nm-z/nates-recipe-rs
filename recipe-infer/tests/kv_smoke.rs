@@ -1,26 +1,3 @@
-//! Per-gguf smoke coverage: every chat-capable model in the committed
-//! `gguf.toml` opens a session through the one decode path and greedily
-//! generates 3 tokens. Each in-suite model is its own `#[test]` fn (its own
-//! process under the suite's 60s), so one model hanging or faulting cannot mask
-//! another. This is the "will it still work tomorrow" sweep — run LAST, against
-//! the final tree.
-//!
-//! Capacity honesty (not a cap): big models (gemma-26B class, multi-GB weights)
-//! cannot load + decode inside 60s. Rather than #[ignore] them (banned) or
-//! silently drop them (banned), the roster is partitioned by MEASURED fit:
-//!   * IN_SUITE models get a per-model smoke fn that runs in the suite.
-//!   * the rest are listed in [`kv_smoke_inventory`], which every run prints the
-//!     full accounting (N in gguf.toml chat-capable, M in-suite, K manual with
-//!     measured times) and ASSERTS M + K == N against the committed gguf.toml —
-//!     so a model appearing in or vanishing from gguf.toml without being
-//!     classified here reds the suite. The oversized ones stay runnable through
-//!     THIS binary by name for manual sweeps via [`oversized_manual_sweep`]
-//!     (`KV_SMOKE=<name-substring>`, a run-mode selector like the existing
-//!     VRAM_PROBE flag — the path still comes from committed gguf.toml).
-//!
-//! A model that fits in time but fails to load or decode is an in-suite RED
-//! finding, exactly as intended — the table of pass/fail/times is the
-//! deliverable, and some failures (unwired arch, unsupported quant) are expected.
 
 use std::time::Instant;
 use std::path::PathBuf;

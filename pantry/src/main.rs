@@ -1,7 +1,3 @@
-//! Standalone GPU-only column-type detector. Point it at any dataset
-//! (CSV / ARFF / dir / zip) and it prints each column → datatype.
-//! Links only `pantry` + `recipe-infer` + the embedded detector weights —
-//! no training framework.
 use anyhow::Result;
 use recipe_infer::log::{Opt, Write, data, set_opt};
 use std::env;

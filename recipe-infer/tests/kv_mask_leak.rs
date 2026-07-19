@@ -1,16 +1,3 @@
-//! Flash-attention mask proofs for the KV-cache contract (f64 kernel path).
-//!
-//! `causal_below` is a position bound: key `sp` is masked for the query at
-//! absolute position `p = p_base + i` exactly when `p < causal_below && sp > p`.
-//! Two properties are proven here against `gpu_flash_gqa` / `gpu_flash_mla`:
-//!
-//! 1. Leak-freedom, bitwise: perturbing a K or V cache row at a FUTURE absolute
-//!    position must leave every earlier query row's output BIT-identical — the
-//!    online softmax may not let a masked key move an accumulator by even one ulp.
-//! 2. Reference parity: the flash output matches a straightforward host f64
-//!    masked-softmax attention to 1e-12 on seeded shapes covering MHA, GQA
-//!    (nqh != nkv), MQA, offset decode (p_base > 0), fully causal
-//!    (causal_below = t_kv) and fully bidirectional (causal_below = 0).
 
 use gpu_core::infer_ops::{gpu_flash_gqa, gpu_flash_mla};
 use gpu_core::memory::GpuBuffer;

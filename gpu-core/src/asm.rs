@@ -1,18 +1,3 @@
-//! Runtime dispatch of hand-written gfx assembly.
-//!
-//! Loads a `.s` (or pre-assembled `.hsaco`) AMDGPU code object, freezes it into
-//! an HSA executable, and dispatches its kernels by hand-writing the AQL packet
-//! and ringing the queue doorbell. This is the raw-HSA path: no HIP module API,
-//! no vendor launcher. A `.s` is assembled to a `.hsaco` once (cached beside the
-//! source by mtime) via the ROCm LLVM `clang`, then loaded through the runtime.
-//!
-//! ```no_run
-//! let prog = gpu_core::asm::load("/path/diffusion_step.gfx1101.entropy_fast.s")?;
-//! let mut args = gpu_core::asm::KernArgs::new();
-//! args.ptr(d_logits).ptr(d_entropy).i32(n).i32(classes);
-//! prog.launch("diffusionx_entropy_gated_step_kernel", [n as u32, 1, 1], [256, 1, 1], &args)?;
-//! # Ok::<(), gpu_core::asm::AsmError>(())
-//! ```
 
 use crate::gate;
 use core::error::Error;

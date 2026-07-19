@@ -1,8 +1,4 @@
 #![allow(unsafe_code)]
-//! Owns all parsing: loaders (csv/arff/zip/dir) + column-type detection. Parse
-//! any format, detect column types via the char-level detector, export OGDL.
-//! Depends on `recipe-infer` (the forward engine) plus leaf utility crates only —
-//! it knows nothing of the trainer, builders, or encoded datasets above it.
 
 use std::fs;
 

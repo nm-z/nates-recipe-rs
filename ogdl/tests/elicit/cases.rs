@@ -1,6 +1,3 @@
-//! Nate's raw elicitation record, verbatim: eight cases of (graph, expression,
-//! equivalent spellings, stated result). Encoded exactly as given, slips and
-//! all — a red case here is an unresolved cell of the grammar, not noise.
 
 use ogdl::Node;
 

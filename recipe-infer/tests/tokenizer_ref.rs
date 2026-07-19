@@ -1,9 +1,3 @@
-//! Reference-parity test for the LLaMA (SentencePiece) tokenizer: recipe-infer
-//! must tokenize each of llama.cpp's own fixture strings to exactly the token
-//! ids llama.cpp records. Fixtures are llama.cpp's committed
-//! `ggml-vocab-llama-spm.gguf` vocab plus its `.inp` (test strings separated by
-//! `__ggml_vocab_test__`) and `.out` (space-separated reference ids per test),
-//! copied into tests/fixtures/ so this test reads only committed files.
 
 use recipe_infer::gguf::Gguf;
 use recipe_infer::tokenizer;

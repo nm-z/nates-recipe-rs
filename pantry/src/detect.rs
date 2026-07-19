@@ -1,8 +1,3 @@
-//! Column-type detector — inference half. Char-level model over a column's raw
-//! byte stream → one of six `Kind`s. The architecture is fixed (embed→attn→dense
-//! →dense) and its trained weights ship inline as `detector.ogdl`. Runs forward
-//! through `recipe_infer` directly; the trainer that produced the weights lives
-//! up in the framework crate.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;

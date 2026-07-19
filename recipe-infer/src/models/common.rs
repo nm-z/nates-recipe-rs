@@ -1,8 +1,3 @@
-//! Shared composition vocabulary for the per-architecture decode ports. Every
-//! `models/<arch>.rs` is one architecture: it declares that arch's [`Spec`] and
-//! delegates to [`layer_spec`] (dense) or [`layer_moe`] (mixture-of-experts),
-//! which compose the shared `gpu_*` kernels 1:1 with the arch's `llama.cpp`
-//! `build_arch_graph`. Recurrent families spell out their own composition.
 
 use super::super::{Arena, Model, Nk, layer_name, softmax};
 use super::DecCtx;

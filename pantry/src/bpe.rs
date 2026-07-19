@@ -1,8 +1,3 @@
-//! Byte-Pair Encoding — host-side encoder, no GPU. UTF-8 bytes in, token ids
-//! out. The merge table is an ordered list of adjacent-pair merges (list order
-//! = rank, lowest merges first); encode repeatedly collapses the lowest-ranked
-//! applicable pair until no adjacent pair remains in the table. Pure CPU work,
-//! knows nothing of models — the byte-id companion to `detect`'s token stream.
 
 use anyhow::{Result, bail};
 use std::collections::HashMap;

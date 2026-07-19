@@ -1,12 +1,7 @@
-//! Chat-template rendering: turn a conversation history into the single prompt
-//! string a model expects, using the Jinja `tokenizer.chat_template` baked into
-//! the gguf metadata (the standard llama.cpp key). `render_template` is the pure
-//! renderer over an explicit template string; `render_chat` is the gguf wrapper
-//! that reads the template plus the bos/eos token strings for a model on disk.
-
 use crate::gguf::{Gguf, Val};
 use anyhow::{Result, anyhow, bail};
-use minijinja::{Environment, Value, context};
+use hf_chat_template::ChatTemplate;
+use minijinja::{Value, context};
 use std::path::Path;
 
 pub struct Msg {
@@ -30,35 +25,19 @@ pub fn render_template(
       bos_token: &str,
       eos_token: &str,
 ) -> Result<String> {
-      let mut env = Environment::new();
-      env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-      minijinja_contrib::add_to_environment(&mut env);
-      env.add_function(
-            "raise_exception",
-            |msg: String| -> std::result::Result<Value, minijinja::Error> {
-                  return Err(minijinja::Error::new(
-                        minijinja::ErrorKind::InvalidOperation,
-                        msg,
-                  ));
-            },
-      );
-      env.add_template("chat", tmpl)
-            .map_err(|e| anyhow!("chat template parse: {e}"))?;
       let messages: Vec<Value> = msgs
             .iter()
             .map(|m| context! { role => m.role.as_str(), content => m.content.as_str() })
             .collect();
-      let rendered = env
-            .get_template("chat")
-            .map_err(|e| anyhow!("chat template get: {e}"))?
-            .render(context! {
+      return ChatTemplate::from_str(tmpl)
+            .map_err(|e| anyhow!("chat template compile: {e}"))?
+            .render_value(context! {
                   messages => messages,
                   add_generation_prompt => add_generation_prompt,
                   bos_token => bos_token,
                   eos_token => eos_token,
             })
-            .map_err(|e| anyhow!("chat template render: {e}"))?;
-      return Ok(rendered);
+            .map_err(|e| anyhow!("chat template render: {e}"));
 }
 
 pub fn render_chat(gguf: &Path, msgs: &[Msg], add_generation_prompt: bool) -> Result<String> {

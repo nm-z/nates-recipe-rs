@@ -1,18 +1,3 @@
-//! Prefix-reuse proof: turn 2 of a resident [`ChatSession`] with a shared
-//! prefix must append only the suffix K/V, never re-prefill the whole sequence.
-//! The cache length is not visible from outside the crate, so the assertion
-//! rides the gpu-core memory ledger (the single choke point every HIP transfer
-//! goes through, per the CLAUDE.md ledger law): each forward uploads its new
-//! embedding rows H2D, so H2D BYTES scale with the rows actually forwarded.
-//!
-//! Generation is capped at ONE accepted token so each turn is exactly one
-//! forward call — this isolates the prefill from the per-step lm-head weight
-//! streaming, which is a fixed per-call H2D cost that would otherwise swamp the
-//! signal. Turn 1 (cold) forwards the whole N-row prompt; turn 2, with the same
-//! prompt fully cached, forwards a single suffix row. With a long prompt the
-//! N-row base upload dominates the shared fixed cost, so turn 2's H2D collapses
-//! to a small fraction of turn 1's iff the prefix K/V was reused. A re-prefill
-//! would forward all N rows again and make the two turns comparable.
 
 use gpu_core::memory::xfer_bytes;
 use recipe_infer::llm::{ChatSession, Tok};

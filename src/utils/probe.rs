@@ -1,18 +1,3 @@
-//! inventory reads:
-//!     /proc/meminfo
-//!     /proc/sys/kernel/hostname
-//!     /sys/class/net/*/speed
-//!     /sys/devices/system/cpu/.../cache
-//!     statvfs
-//!
-//! active measurements:
-//!     GPU H2D copy
-//!     GPU GEMM
-//!     GPU VRAM copy
-//!     CPU RAM copy
-//!     CPU cacheline read
-//!     CPU FLOP loop
-//!     disk write/read
 
 use anyhow::{Result, anyhow, bail, ensure};
 use gpu_core::log::{Opt, Write, probe, set_opt};

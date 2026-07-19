@@ -1,31 +1,3 @@
-//! Glob selection over a [`Node`] tree: two spatial axes plus one-step
-//! lineage, composed left to right.
-//!
-//! The grid is 0-indexed everywhere: rows run top to bottom in document
-//! order (`[n]`, one node per row), levels run parents to children
-//! (`(m)`, a set per level). Atoms:
-//!
-//! Star-before looks toward an axis's minus side, star-after toward plus,
-//! uniformly: left|right for `()`, up|down for `[]`, upstm|dnstm for names.
-//!
-//! - `name`            every node with that name
-//! - `[n]`             the node at row n
-//! - `(m)`             every node at level m
-//! - `*[n]` / `[n]*`   rows above / rows below n, exclusive
-//! - `*(m)` / `(m)*`   levels left / levels right of m, exclusive
-//! - `*x` / `x*`       x with its parents / x with its children; inside a
-//!   route the anchor is the viewpoint and drops out, leaving one step
-//!
-//! Juxtaposition inside a segment intersects; a single star between two
-//! coordinates serves both sides (`[0]*(1)` is `[0]*` and `*(1)`), and an
-//! empty operand drops out as identity instead of annihilating. Across
-//! dots, a plus-view segment followed by a minus-view segment on the same
-//! axis is a bounds pair selecting the strictly-between interval
-//! (`(0)*.*(3)`, `[0]*.*[5]`); every other segment collects (union).
-//! Matches come back in walk order away from the anchor ([`Node::glob`]);
-//! [`Node::glob_show`] prints matched lines at native indent in document
-//! order. Empty positions select nothing: a leaf's `x*`, `*[0]` above the
-//! first row, an out-of-range coordinate are the empty set, never an error.
 
 use crate::Node;
 use std::collections::BTreeSet;

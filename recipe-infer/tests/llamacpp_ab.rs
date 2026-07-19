@@ -1,17 +1,3 @@
-//! Live A/B against llama.cpp on the SAME gguf: greedy continuation must be
-//! IDENTICAL (not approximate), and recipe must not be slower. The reference
-//! engine is `/usr/bin/llama-completion` (raw completion; this build's
-//! `llama-cli` is a chat REPL that wraps the prompt and spins on closed
-//! stdin), run at `--temp 0` on the same file recipe loads, so tokenizer and
-//! weights are shared and only the engines differ.
-//!
-//! Token identity runs on the committed `stories-f32.gguf` fixture. The perf
-//! gates run on the machine's qwen3-0.6b-q8_0 (via `gguf.toml`): on the 260K
-//! stories toy a perf ratio only measures kernel-launch overhead against a
-//! trivial CPU sprint, not engine speed.
-//!
-//! Run serially (`--test-threads=1`): each test opens its own resident session
-//! and two concurrent device-arena claims collide by design (one GPU process).
 
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};

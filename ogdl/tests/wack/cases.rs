@@ -1,6 +1,3 @@
-//! Adversarial probes: expressions the elicited law underdetermines, each
-//! encoded with my best-guess expectation. A red here is a question for Nate,
-//! answered by telling me what actually happens and why.
 
 use ogdl::Node;
 

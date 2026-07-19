@@ -1,9 +1,3 @@
-//! Deletion gate for the KV-cache unification, as a test: the legacy decode
-//! surface must be GONE from the sources. Scans every committed source file
-//! under `recipe-infer/src` and `gpu-core/src` (all extensions, .hip included)
-//! and fails on any occurrence of the deleted symbols, or on any `attn_block(`
-//! call that still passes a literal `None` decode context — the finished
-//! contract has ONE decode method and every attention site cached.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,14 +1,5 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case, reason = "interposed HSA symbols carry C ABI names")]
-//! `LD_PRELOAD` interposer for exactly four HSA allocation entry points:
-//! `hsa_amd_memory_pool_{allocate,free}` and `hsa_memory_{allocate,free}`.
-//! Every allocation is classified by which AGENT owns its pool (device vs.
-//! host), not by guessing from `SEGMENT/GLOBAL_FLAGS` alone — both device and
-//! pinned-host pools report segment GLOBAL, so ownership is the only
-//! reliable discriminator. Interposition works because the calling code
-//! (libamdhip64.so, the vendor BLAS lib) is a separate DSO from
-//! libhsa-runtime64.so and reaches these symbols through the dynamic symbol
-//! table — `LD_PRELOAD` makes this library resolve first.
 
 
 use core::ffi::{CStr, c_void};

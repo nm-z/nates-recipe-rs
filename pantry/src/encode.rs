@@ -1,8 +1,3 @@
-//! All predictor/target encoding: detected column `Kind`s → numeric matrices,
-//! the multi-file assemble/join, RAM guards, NaN handling, and the train/test
-//! split. Pure dat work — turns parsed rows (from `dat`) into a `Dataset`. The
-//! trainer crate above interprets what that `Dataset` means for a model; this
-//! module knows nothing of models, GPUs, or the forward pass.
 use recipe_infer::log::{Errored, Write, data};
 
 use crate::data::DirGroup;
