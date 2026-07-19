@@ -2,8 +2,9 @@
 use recipe::*;
 
 fn main() {
-	const GGUF: &str = "gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf";
+    const HP: &str = "datasets/house-prices/train.csv";
 
-	recipe.model().load(&GGUF);
-	recipe.infer().log([chat]).run(&model);
+    let d = Data::load(HP).split(0.8).exclude("Id").target("SalePrice");
+    let m = Model::new().layer(64).relu().layer(1).loss(mse).lr(0.05);
+    Train::new().epochs(20).log([Loss, R2]).run(&d, &m);
 }

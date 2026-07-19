@@ -659,7 +659,10 @@ fn probe_ok(probe: &Path) -> bool {
 	}
 	let mut child = match cmd.spawn() {
 		Ok(c) => c,
-		Err(_) => return false,
+		Err(e) => {
+			errline(&format!("spawn test binary: {e}"));
+			return false;
+		}
 	};
 	let pid = child.id();
 	CHILD_PGID.store(pid as i32, Ordering::SeqCst);
@@ -677,7 +680,10 @@ fn probe_ok(probe: &Path) -> bool {
 				}
 				thread::sleep(Duration::from_millis(3));
 			}
-			Err(_) => break false,
+			Err(e) => {
+				errline(&format!("wait on test child: {e}"));
+				break false;
+			}
 		}
 	};
 	CHILD_PGID.store(0, Ordering::SeqCst);
@@ -692,7 +698,10 @@ fn kfd_holders() -> Vec<i32> {
 		.output()
 	{
 		Ok(o) => o,
-		Err(_) => return Vec::new(),
+		Err(e) => {
+			errline(&format!("fuser /dev/kfd: {e}"));
+			return Vec::new();
+		}
 	};
 	let me = process::id() as i32;
 	String::from_utf8_lossy(&out.stdout)

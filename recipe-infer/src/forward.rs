@@ -256,7 +256,11 @@ pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> ZFit {
 		}
 	}
 	for s in std.iter_mut() {
-		*s = (*s / nf + ZSCORE_EPS).sqrt();
+		let var = *s / nf;
+		*s = match var == 0.0 {
+			true => 1.0,
+			false => (var + ZSCORE_EPS).sqrt(),
+		};
 	}
 	let mut scaled = vec![0.0f64; n * d];
 	for i in 0..n {

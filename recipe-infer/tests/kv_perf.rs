@@ -67,7 +67,8 @@ fn measure(model_key: &str, gen_tokens: usize, tag: &str) {
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
 		.session()
-		.expect("session cancelled");
+		.expect("session cancelled")
+		.temp(0.0);
 	let mut generated = 0usize;
 	let mut first: Option<f64> = None;
 	let wall = Instant::now();

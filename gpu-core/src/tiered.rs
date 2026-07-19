@@ -4,6 +4,7 @@ use crate::bridge::open_spill;
 use crate::callspy;
 use crate::hip;
 use crate::log::Write;
+use crate::log::data;
 use crate::memory;
 use crate::memory::tag_note_alloc;
 use core::cmp;
@@ -106,7 +107,7 @@ impl Budgets {
 		let ram_data = ram_avail
 			.saturating_sub(RESERVE_R)
 			.saturating_sub(host_mirror);
-		Write::always(format!(
+		Write::line(data, format!(
 			"RAM headroom: MemAvailable {:.2} GB, reserve {:.2} GB, host-mirror {:.2} GB, RAM budget {:.2} GB",
 			ram_avail as f64 / 1e9,
 			RESERVE_R as f64 / 1e9,
@@ -353,7 +354,7 @@ impl Tiered {
 				let off = match usize::try_from(s) {
 					Ok(v) => v * P,
 					Err(_) => {
-						Write::error("vram slot index overflows usize");
+						Write::error(format!("vram slot index {s} overflows usize"));
 						return;
 					}
 				};
@@ -378,7 +379,7 @@ impl Tiered {
 				let ri = match usize::try_from(i) {
 					Ok(v) => v,
 					Err(_) => {
-						Write::error("ram page index overflows usize");
+						Write::error(format!("ram page index {i} overflows usize"));
 						return;
 					}
 				};
@@ -494,9 +495,9 @@ impl Tiered {
 							let slot = match usize::try_from(s) {
 								Ok(v) => v,
 								Err(_) => {
-									Write::error(
-										"stage_into vram slot overflows usize",
-									);
+									Write::error(format!(
+										"stage_into vram slot {s} overflows usize"
+									));
 									return;
 								}
 							};
@@ -526,9 +527,9 @@ impl Tiered {
 							let ri = match usize::try_from(i) {
 								Ok(v) => v,
 								Err(_) => {
-									Write::error(
-										"stage_into ram index overflows usize",
-									);
+									Write::error(format!(
+										"stage_into ram index {i} overflows usize"
+									));
 									return;
 								}
 							};

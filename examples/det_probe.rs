@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 use gpu_core::infer_ops::{
-	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_glu_gelu, gpu_rmsnorm_f64, gpu_rope_partial,
+	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt, gpu_glu_gelu, gpu_rmsnorm_f64, gpu_rope_partial,
 	gpu_convert, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
@@ -97,7 +97,7 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	let cpu = cpu_gemm_bt(&av, &bv, m, n, k);
 
 	let out_c = GpuBuffer::alloc(m * n).context("out_c")?;
-	gpu_gemm_bt_f64(&a, &b, m, n, k, &out_c).context("gemm_bt_f64")?;
+	gpu_gemm_bt(&a, &b, m, n, k, &out_c).context("gemm_bt_f64")?;
 	let mut gc = vec![0.0f64; m * n];
 	unsafe { out_c.download_async(&mut gc, ptr::null_mut()) }.context("dl gc")?;
 	gpu_core::hip::device_synchronize().context("dl gc")?;
@@ -124,7 +124,7 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	));
 
 	twice(&format!("gemm_bt_f64 {label}"), m * n, |o| {
-		gpu_gemm_bt_f64(&a, &b, m, n, k, o).context("gemm_bt_f64")
+		gpu_gemm_bt(&a, &b, m, n, k, o).context("gemm_bt_f64")
 	})?;
 	Ok(())
 }
@@ -155,7 +155,7 @@ fn bench_shape(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> 
 
 	let t1 = Instant::now();
 	for _ in 0..ITERS {
-		gpu_gemm_bt_f64(&a, &b, m, n, k, &out).context("gemm_bt_f64")?;
+		gpu_gemm_bt(&a, &b, m, n, k, &out).context("gemm_bt_f64")?;
 	}
 	gpu_core::hip::device_synchronize().context("sync2")?;
 	let cus_ms = t1.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;

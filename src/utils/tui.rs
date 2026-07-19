@@ -13,10 +13,10 @@ use std::mem;
 use std::path::Path;
 
 #[derive(Clone, Copy)]
-struct Rgb {
-	r: u8,
-	g: u8,
-	b: u8,
+pub(crate) struct Rgb {
+	pub(crate) r: u8,
+	pub(crate) g: u8,
+	pub(crate) b: u8,
 }
 enum CellFix {
 	Fill,
@@ -89,7 +89,11 @@ const PALETTE: [Rgb; 12] = [
 		b: 20,
 	},
 ];
-fn palette(i: usize) -> Rgb {
+pub fn paint(i: usize, t: impl std::fmt::Display) -> String {
+	let c = palette(i);
+	return format!("\x1b[38;2;{};{};{}m{t}\x1b[0m", c.r, c.g, c.b);
+}
+pub(crate) fn palette(i: usize) -> Rgb {
 	PALETTE[i % PALETTE.len()]
 }
 fn symlog(y: f64) -> f64 {
@@ -262,7 +266,10 @@ pub fn show(summary: &str, rows: &[Vec<f64>], ys: &[Metric]) {
 		.map(|_probe| {
 			loop {
 				match event::read() {
-					Err(_err) => break,
+					Err(e) => {
+						drop(Write::err(format!("{e}")));
+						break;
+					}
 					Ok(ev) => match ev {
 						Event::Key(_key) => break,
 						_other => continue,

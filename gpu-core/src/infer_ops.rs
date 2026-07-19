@@ -116,13 +116,26 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_gemm_bt_f64(
+	fn launch_gemm_bt(
 		a: *const c_void,
 		b: *const c_void,
 		c: *mut c_void,
 		m: i32,
 		n: i32,
 		k: i32,
+		stream: *mut c_void,
+		dtype: i32,
+	);
+	fn launch_gemm_bt_tiles(
+		a: *const c_void,
+		b: *const c_void,
+		c: *mut c_void,
+		m: i32,
+		n: i32,
+		k: i32,
+		tile_m: i32,
+		tile_n: i32,
+		tile_k: i32,
 		stream: *mut c_void,
 		dtype: i32,
 	);
@@ -551,7 +564,7 @@ pub fn gpu_glu_silu(
 }
 
 #[inline]
-pub fn gpu_gemm_bt_f64(
+pub fn gpu_gemm_bt(
 	lhs: &GpuBuffer,
 	rhs: &GpuBuffer,
 	m: usize,
@@ -561,13 +574,44 @@ pub fn gpu_gemm_bt_f64(
 ) -> Result<(), HipError> {
 	// SAFETY: lhs, rhs, and out outlive this synchronous launch and m, n, k match their shapes.
 	unsafe {
-		launch_gemm_bt_f64(
+		launch_gemm_bt(
 			lhs.ptr_raw().cast_const(),
 			rhs.ptr_raw().cast_const(),
 			out.ptr_raw(),
 			ci(m)?,
 			ci(n)?,
 			ci(k)?,
+			ptr::null_mut(),
+			out.dtype().ffi(),
+		);
+	}
+	return cl();
+}
+
+#[inline]
+pub fn gpu_gemm_bt_tiles(
+	lhs: &GpuBuffer,
+	rhs: &GpuBuffer,
+	m: usize,
+	n: usize,
+	k: usize,
+	tile_m: usize,
+	tile_n: usize,
+	tile_k: usize,
+	out: &GpuBuffer,
+) -> Result<(), HipError> {
+	// SAFETY: lhs, rhs, and out outlive this synchronous launch and m, n, k match their shapes.
+	unsafe {
+		launch_gemm_bt_tiles(
+			lhs.ptr_raw().cast_const(),
+			rhs.ptr_raw().cast_const(),
+			out.ptr_raw(),
+			ci(m)?,
+			ci(n)?,
+			ci(k)?,
+			ci(tile_m)?,
+			ci(tile_n)?,
+			ci(tile_k)?,
 			ptr::null_mut(),
 			out.dtype().ffi(),
 		);

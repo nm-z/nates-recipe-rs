@@ -1911,6 +1911,7 @@ dependencies = [
  "csv",
  "data-encoding",
  "gpu-core",
+ "half",
  "image",
  "indicatif",
  "libc",
@@ -1940,9 +1941,9 @@ dependencies = [
  "half",
  "hf-chat-template",
  "libc",
- "minijinja",
  "ndarray",
  "ogdl",
+ "rand 0.9.2",
  "serde_json",
  "tokenizers",
 ]

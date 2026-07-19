@@ -37,7 +37,8 @@ fn spill_growth_moves_bytes_without_fresh_device_allocs() {
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
 		.session()
-		.expect("session cancelled");
+		.expect("session cancelled")
+		.temp(0.0);
 	let sentence = "Once upon a time there was a little girl who lived in a big house. ";
 	let mut prompt = sentence.repeat(60);
 	run_turn(&mut session, &prompt, 2);

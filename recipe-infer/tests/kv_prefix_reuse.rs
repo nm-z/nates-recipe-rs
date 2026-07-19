@@ -24,7 +24,8 @@ fn second_turn_uploads_scale_with_suffix_not_total_length() {
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
 		.session()
-		.expect("session cancelled");
+		.expect("session cancelled")
+		.temp(0.0);
 	let prompt = "Once upon a time there was a little girl. ".repeat(60);
 	let budget = 1usize;
 	let h2d_before = xfer_bytes().h2d;

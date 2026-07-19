@@ -1,7 +1,7 @@
 use crate::gguf::{Gguf, Val};
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_convert, gpu_embed_blend, gpu_gelu_mul, gpu_gemm_bt_f64, gpu_rmsnorm_f64,
+	gpu_convert, gpu_embed_blend, gpu_gelu_mul, gpu_gemm_bt, gpu_rmsnorm_f64,
 	gpu_rmsnorm_f64_nogamma,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
@@ -9,6 +9,8 @@ use gpu_core::log::probe as probe_flag;
 use gpu_core::log::{Write, data, gpu};
 use gpu_core::memory::{Dtype, GpuBuffer};
 use gpu_core::waterfall::{Home, Waterfall};
+use rand::rngs::StdRng;
+use rand::{Rng as _, SeedableRng as _};
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::HashMap;
@@ -52,7 +54,7 @@ fn embed_blend_into(
 	wts: &mut Vec<f64>,
 ) -> Result<()> {
 	let ne = m.hp.ne;
-	let (src, dt) = (&m.emb_src, m.emb_dt);
+	let (src, dt) = (&m.emb.bytes, m.emb.dt);
 	let rb = bytes_for(ne, dt);
 	scratch.clear();
 	wts.clear();
@@ -477,16 +479,12 @@ impl Hparams {
 		};
 		let ncanvas = uint_kv_or(g, "diffusion.canvas_length", 0)?;
 		let bos = uint_kv(g, "tokenizer.ggml.bos_token_id")? as u32;
-		let eos = uint_kv_or(g, "tokenizer.ggml.eos_token_id", 1)? as u32;
+		let eos = uint_kv(g, "tokenizer.ggml.eos_token_id")? as u32;
 		let mask = uint_kv_or(g, "tokenizer.ggml.mask_token_id", 0)?;
 		let eog = {
 			let mut set = vec![eos];
-			if let Ok(eot) = uint_kv(g, "tokenizer.ggml.eot_token_id") {
-				set.push(eot as u32);
-			}
-			let pieces = g.str_arr("tokenizer.ggml.tokens").unwrap_or_default();
-			for eog_piece in ["<|im_end|>", "<|end|>", "<end_of_turn>", "<|eot_id|>", "<|endoftext|>"] {
-				if let Some(id) = pieces.iter().position(|p| p == eog_piece) {
+			for id_key in ["tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+				if let Ok(id) = uint_kv(g, id_key) {
 					set.push(id as u32);
 				}
 			}
@@ -548,10 +546,16 @@ impl Hparams {
 			}
 			return Ok(None);
 		};
-		let moe_gu_dt = moe_dt("ffn_gate_up_exps.weight")?
-			.or(moe_dt("ffn_gate_exps.weight")?)
-			.unwrap_or(FWD_DT);
-		let moe_dn_dt = moe_dt("ffn_down_exps.weight")?.unwrap_or(FWD_DT);
+		let moe_gu_dt = match moe_dt("ffn_gate_up_exps.weight")?.or(moe_dt("ffn_gate_exps.weight")?) {
+			Some(dt) => dt,
+			None if nexp == 0 => FWD_DT,
+			None => bail!("gguf: {nexp} experts but no ffn_gate_up_exps/ffn_gate_exps weight in any layer"),
+		};
+		let moe_dn_dt = match moe_dt("ffn_down_exps.weight")? {
+			Some(dt) => dt,
+			None if nexp == 0 => FWD_DT,
+			None => bail!("gguf: {nexp} experts but no ffn_down_exps weight in any layer"),
+		};
 		if nexp > 0 {
 			anyhow::ensure!(
 				(2 * nffe * ne).is_multiple_of(moe_gu_dt.block_elems())
@@ -714,6 +718,28 @@ impl Tensor {
 	fn elems(&self) -> usize {
 		return self.shape.iter().product();
 	}
+}
+
+struct Raw {
+	bytes: Vec<u8>,
+	dt: Dtype,
+}
+
+fn read_raw_at(shards: &[File], t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
+	let mut buf = vec![0u8; len];
+	let _d = Instant::now();
+	shards[t.shard]
+		.read_exact_at(&mut buf, (t.off + off) as u64)
+		.with_context(|| format!("raw read {len} bytes at shard {}", t.shard))?;
+	acc(&DISK_NS, _d);
+	return Ok(buf);
+}
+
+fn read_whole(shards: &[File], t: &Tensor) -> Result<Raw> {
+	return Ok(Raw {
+		bytes: read_raw_at(shards, t, 0, t.nbytes)?,
+		dt: t.dt,
+	});
 }
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
@@ -969,13 +995,10 @@ struct Model {
 	rw: Vec<Vec<f64>>,
 	gis: Vec<Vec<f64>>,
 	pe: Vec<Vec<f64>>,
-	emb_src: Vec<u8>,
-	emb_dt: Dtype,
-	pos_dt: Dtype,
-	out: Vec<u8>,
-	out_dt: Dtype,
+	emb: Raw,
+	pos: Option<Raw>,
+	out: Option<Raw>,
 	out_b: Vec<f64>,
-	pos_embd: Vec<u8>,
 	eps: GpuBuffer,
 	res_scale: GpuBuffer,
 	attn_scale_mla: GpuBuffer,
@@ -1064,13 +1087,7 @@ impl Model {
 	}
 
 	fn read_raw(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
-		let mut buf = vec![0u8; len];
-		let _d = Instant::now();
-		self.shards[t.shard]
-			.read_exact_at(&mut buf, (t.off + off) as u64)
-			.with_context(|| format!("raw read {len} bytes at shard {}", t.shard))?;
-		acc(&DISK_NS, _d);
-		return Ok(buf);
+		return read_raw_at(&self.shards, t, off, len);
 	}
 
 	fn read_into(
@@ -1518,6 +1535,21 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	let nl = hp.nl;
 	let vocab = hp.vocab;
 	let ne = hp.ne;
+	let et = big
+		.get("model.decoder.embed_tokens.weight")
+		.ok_or_else(|| return anyhow!("no embed_tokens"))?;
+	if et.shape != vec![vocab, ne] {
+		bail!("embed_tokens shape {:?}", et.shape);
+	}
+	let emb = read_whole(&shards, et)?;
+	let out = match big.get("model.decoder.lm_head.weight") {
+		Some(ot) if ot.shape == vec![vocab, ne] => Some(read_whole(&shards, ot)?),
+		_other => None,
+	};
+	let pos = match big.get("model.decoder.pos_embd.weight") {
+		Some(pt) => Some(read_whole(&shards, pt)?),
+		None => None,
+	};
 	let mut m = Model {
 		shards,
 		big,
@@ -1541,13 +1573,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		rw: Vec::new(),
 		gis: Vec::new(),
 		pe: Vec::new(),
-		emb_src: Vec::new(),
-		emb_dt: Dtype::BF16,
-		pos_dt: Dtype::BF16,
-		out: Vec::new(),
-		out_dt: Dtype::BF16,
+		emb,
+		pos,
+		out,
 		out_b: Vec::new(),
-		pos_embd: Vec::new(),
 		eps,
 		res_scale,
 		attn_scale_mla,
@@ -1730,29 +1759,8 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		};
 	}
 
-	let et = m
-		.big
-		.get("model.decoder.embed_tokens.weight")
-		.cloned()
-		.ok_or_else(|| anyhow!("no embed_tokens"))?;
-	if et.shape != vec![vocab, ne] {
-		bail!("embed_tokens shape {:?}", et.shape);
-	}
-	m.emb_dt = et.dt;
-	m.emb_src = m.read_raw(&et, 0, et.nbytes)?;
-
-	if let Some(ot) = m.big.get("model.decoder.lm_head.weight").cloned() {
-		if ot.shape == vec![vocab, ne] {
-			m.out_dt = ot.dt;
-			m.out = m.read_raw(&ot, 0, ot.nbytes)?;
-		}
-	}
 	if m.big.contains_key("model.decoder.lm_head.bias") {
 		m.out_b = m.small_f64("model.decoder.lm_head.bias")?;
-	}
-	if let Some(pt) = m.big.get("model.decoder.pos_embd.weight").cloned() {
-		m.pos_dt = pt.dt;
-		m.pos_embd = m.read_raw(&pt, 0, pt.nbytes)?;
 	}
 
 	Ok(m)
@@ -1787,7 +1795,7 @@ fn fixed_names(m: &Model, l: usize) -> Vec<String> {
 
 fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 	let hp = &m.hp;
-	gpu_gemm_bt_f64(
+	gpu_gemm_bt(
 		&ar.x,
 		&m.win.view(0, hp.qd_max * hp.ne),
 		t,
@@ -1796,7 +1804,7 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 		&ar.q,
 	)?;
 	beat();
-	gpu_gemm_bt_f64(
+	gpu_gemm_bt(
 		&ar.cms,
 		&m.win.view(0, hp.nff * hp.ne),
 		t,
@@ -1805,7 +1813,7 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 		&ar.g,
 	)?;
 	beat();
-	gpu_gemm_bt_f64(
+	gpu_gemm_bt(
 		&ar.act,
 		&m.win.view(0, hp.ne * hp.nff),
 		t,
@@ -1814,7 +1822,7 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 		&ar.mlp0,
 	)?;
 	beat();
-	gpu_gemm_bt_f64(
+	gpu_gemm_bt(
 		&ar.moe_xg,
 		&m.win.view(0, 2 * hp.nffe * hp.ne),
 		t,
@@ -1849,7 +1857,7 @@ fn fill_store(m: &mut Model, store: Waterfall, cancel: &mut dyn FnMut() -> bool)
 			let n = 4096.min(t.nbytes);
 			for off in [0, t.nbytes - n] {
 				let want = if name.ends_with("embed_tokens.weight") {
-					m.emb_src[off..off + n].to_vec()
+					m.emb.bytes[off..off + n].to_vec()
 				} else {
 					m.read_raw(t, off, n)?
 				};
@@ -1871,8 +1879,8 @@ fn fill_into(m: &Model, store: &mut Waterfall, cancel: &mut dyn FnMut() -> bool)
 	let nexp = m.hp.nexp;
 	let slot_bytes = m.hp.slot_bytes;
 	beat();
-	store.place("model.decoder.embed_tokens.weight", m.emb_src.len(), |dst| {
-		dst.copy_from_slice(&m.emb_src);
+	store.place("model.decoder.embed_tokens.weight", m.emb.bytes.len(), |dst| {
+		dst.copy_from_slice(&m.emb.bytes);
 		Ok(())
 	})?;
 	beat();
@@ -1953,23 +1961,31 @@ fn lm_head_into(
 	let mut c0 = 0;
 	while c0 < hp.vocab {
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
-		let w = if m.out.is_empty() {
-			let dt = m.emb_dt;
-			match m.store.home("model.decoder.embed_tokens.weight") {
-				Some(Home::Vram(dev)) => {
-					m.widen_from(dev, bytes_for(c0 * hp.ne, dt), cn * hp.ne, dt)?
-				}
-				_other => {
-					m.to_stage(&m.emb_src[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)])?;
-					m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
+		let w = match &m.out {
+			Some(out) => {
+				let dt = out.dt;
+				m.to_stage(
+					&out.bytes[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)],
+				)?;
+				m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
+			}
+			None => {
+				let dt = m.emb.dt;
+				match m.store.home("model.decoder.embed_tokens.weight") {
+					Some(Home::Vram(dev)) => {
+						m.widen_from(dev, bytes_for(c0 * hp.ne, dt), cn * hp.ne, dt)?
+					}
+					_other => {
+						m.to_stage(
+							&m.emb.bytes[bytes_for(c0 * hp.ne, dt)
+								..bytes_for((c0 + cn) * hp.ne, dt)],
+						)?;
+						m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
+					}
 				}
 			}
-		} else {
-			let dt = m.out_dt;
-			m.to_stage(&m.out[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)])?;
-			m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
 		};
-		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
+		gpu_gemm_bt(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
 		ar.lm_out.download_host(&mut out_host[..ncanvas * cn])?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
@@ -2353,6 +2369,92 @@ fn pick_greedy(logits: &[f64], vocab: usize, lsc: f64, softcap: f64) -> u32 {
 	return best as u32;
 }
 
+pub struct Sampler {
+	temp: f64,
+	top_k: usize,
+	top_p: f64,
+	rng: StdRng,
+	shaped: Vec<f64>,
+	order: Vec<u32>,
+}
+
+impl Sampler {
+	fn fresh() -> Sampler {
+		let seed = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |d| return d.as_nanos() as u64);
+		return Sampler {
+			temp: 0.8,
+			top_k: 40,
+			top_p: 0.95,
+			rng: StdRng::seed_from_u64(seed),
+			shaped: Vec::new(),
+			order: Vec::new(),
+		};
+	}
+
+	fn pick(&mut self, logits: &[f64], vocab: usize, lsc: f64, softcap: f64) -> u32 {
+		if self.temp <= 0.0 {
+			return pick_greedy(logits, vocab, lsc, softcap);
+		}
+		let n = vocab.min(logits.len());
+		self.shaped.clear();
+		self.shaped.extend(logits.iter().take(n).map(|&v| {
+			let vs = v * lsc;
+			let sv = if softcap > 0.0 {
+				softcap * (vs / softcap).tanh()
+			} else {
+				vs
+			};
+			return sv / self.temp;
+		}));
+		self.order.clear();
+		self.order.extend(0..n as u32);
+		let k = match self.top_k {
+			0 => n,
+			k => k.min(n),
+		};
+		let shaped = &self.shaped;
+		self.order
+			.select_nth_unstable_by(k - 1, |&a, &b| {
+				return shaped[b as usize].total_cmp(&shaped[a as usize]);
+			});
+		self.order.truncate(k);
+		self.order.sort_unstable_by(|&a, &b| {
+			return shaped[b as usize].total_cmp(&shaped[a as usize]);
+		});
+		let top = shaped[self.order[0] as usize];
+		let z: f64 = self
+			.order
+			.iter()
+			.map(|&i| return (shaped[i as usize] - top).exp())
+			.sum();
+		let mut kept = self.order.len();
+		let mut cum = 0.0;
+		for (j, &i) in self.order.iter().enumerate() {
+			cum += (shaped[i as usize] - top).exp() / z;
+			if cum >= self.top_p {
+				kept = j + 1;
+				break;
+			}
+		}
+		self.order.truncate(kept);
+		let zk: f64 = self
+			.order
+			.iter()
+			.map(|&i| return (shaped[i as usize] - top).exp())
+			.sum();
+		let mut draw = self.rng.random::<f64>() * zk;
+		for &i in &self.order {
+			draw -= (shaped[i as usize] - top).exp();
+			if draw <= 0.0 {
+				return i;
+			}
+		}
+		return self.order[kept - 1];
+	}
+}
+
 fn forward_rows(
 	m: &Model,
 	rows: &[u32],
@@ -2368,7 +2470,7 @@ fn forward_rows(
 	let t = rows.len();
 	let base_off = cache.len;
 	let scale = models::embedding_scale(m);
-	let (src, dt) = (&m.emb_src, m.emb_dt);
+	let (src, dt) = (&m.emb.bytes, m.emb.dt);
 	let rb = bytes_for(ne, dt);
 	emb_scratch.clear();
 	for &tk in rows {
@@ -2379,11 +2481,11 @@ fn forward_rows(
 	let stage = ar.x.view(0, t * ne).as_dtype(dt);
 	stage.write_u8(emb_scratch)?;
 	gpu_convert(&stage, &h0, t * ne, scale)?;
-	if !m.pos_embd.is_empty() {
-		let rbp = bytes_for(ne, m.pos_dt);
+	if let Some(pos) = &m.pos {
+		let rbp = bytes_for(ne, pos.dt);
 		let row = base_off * rbp;
-		let pstage = ar.x.view(0, t * ne).as_dtype(m.pos_dt);
-		pstage.write_u8(&m.pos_embd[row..row + t * rbp])?;
+		let pstage = ar.x.view(0, t * ne).as_dtype(pos.dt);
+		pstage.write_u8(&pos.bytes[row..row + t * rbp])?;
 		let pe = ar.attn_out.view(0, t * ne);
 		gpu_convert(&pstage, &pe, t * ne, 1.0)?;
 		gpu_add_into(&pe, &h0, t * ne, &h0)?;
@@ -2432,12 +2534,19 @@ pub fn kv_cache_ran() -> bool {
 	return KV_RAN.load(Ordering::Relaxed);
 }
 
+fn decode_tokens(tokenizer: &crate::tokenizer::Tokenizer, ids: &[u32]) -> Result<String> {
+	return tokenizer
+		.decode(ids, true)
+		.map_err(|e| return anyhow!("decode {} tokens: {e}", ids.len()));
+}
+
 fn decode_cached(
 	m: &Model,
 	tokenizer: &crate::tokenizer::Tokenizer,
 	toks: &[u32],
 	attn_scale: &GpuBuffer,
 	cache: &mut KvCache,
+	smp: &mut Sampler,
 	on_round: &mut dyn FnMut(&[Tok]) -> bool,
 ) -> Result<String> {
 	let vocab_size = m.hp.vocab;
@@ -2478,13 +2587,13 @@ fn decode_cached(
 		}
 	}
 	let mut out_ids: Vec<u32> = Vec::new();
-	let mut next = pick_greedy(&logits, vocab_size, lsc, softcap);
+	let mut next = smp.pick(&logits, vocab_size, lsc, softcap);
 	loop {
 		if next == eos || m.hp.eog.contains(&next) {
 			break;
 		}
 		out_ids.push(next);
-		let text = tokenizer.decode(&out_ids, true).unwrap_or_default();
+		let text = decode_tokens(tokenizer, &out_ids)?;
 		let keep_going = on_round(&[Tok {
 			text,
 			status: TokStatus::Accepted,
@@ -2495,10 +2604,10 @@ fn decode_cached(
 			break;
 		}
 		forward_rows(m, &[next], attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
-		next = pick_greedy(&logits, vocab_size, lsc, softcap);
+		next = smp.pick(&logits, vocab_size, lsc, softcap);
 	}
 	let elapsed = decode_start.elapsed();
-	let body = tokenizer.decode(&out_ids, true).unwrap_or_default();
+	let body = decode_tokens(tokenizer, &out_ids)?;
 	let out = format!(
 		"{body}\n\n{} tokens, {:.2} tok/s",
 		out_ids.len(),
@@ -2590,6 +2699,27 @@ pub struct ChatSession {
 	vocab: Vec<String>,
 	attn_scale: GpuBuffer,
 	cache: KvCache,
+	sampler: Sampler,
+}
+
+impl ChatSession {
+	#[must_use]
+	pub fn temp(mut self, t: f64) -> ChatSession {
+		self.sampler.temp = t;
+		return self;
+	}
+
+	#[must_use]
+	pub fn top_k(mut self, k: usize) -> ChatSession {
+		self.sampler.top_k = k;
+		return self;
+	}
+
+	#[must_use]
+	pub fn top_p(mut self, p: f64) -> ChatSession {
+		self.sampler.top_p = p;
+		return self;
+	}
 }
 
 fn kv_capacity_tokens(m: &Model) -> Result<usize> {
@@ -2744,6 +2874,7 @@ impl ChatSession {
 			vocab,
 			attn_scale,
 			cache,
+			sampler: Sampler::fresh(),
 		})));
 	}
 
@@ -2785,7 +2916,7 @@ impl ChatSession {
 				data,
 				format!("kvcache reuse: cached_prefix={} new_suffix={}", cache.len, toks.len() - cache.len),
 			);
-			return decode_cached(&self.m, &self.tokenizer, &toks, &self.attn_scale, cache, on_round);
+			return decode_cached(&self.m, &self.tokenizer, &toks, &self.attn_scale, cache, &mut self.sampler, on_round);
 		}
 		let cache = &mut self.cache;
 		return refine_canvas(&self.m, &self.vocab, toks, prefix, &self.attn_scale, cache, on_round);
@@ -2878,10 +3009,10 @@ fn refine_canvas(
 				&mut emb_wts,
 			)?;
 			gpu_rmsnorm_f64(&ar.soft, &m.sc_pre, &m.eps, ncanvas, ne, &ar.scn)?;
-			gpu_gemm_bt_f64(&ar.scn, &m.sc_gate, ncanvas, nff, ne, &ar.sg)?;
-			gpu_gemm_bt_f64(&ar.scn, &m.sc_up, ncanvas, nff, ne, &ar.su)?;
+			gpu_gemm_bt(&ar.scn, &m.sc_gate, ncanvas, nff, ne, &ar.sg)?;
+			gpu_gemm_bt(&ar.scn, &m.sc_up, ncanvas, nff, ne, &ar.su)?;
 			gpu_gelu_mul(&ar.sg, &ar.su, ncanvas * nff, &ar.sa)?;
-			gpu_gemm_bt_f64(&ar.sa, &m.sc_down, ncanvas, ne, nff, &ar.sc_add)?;
+			gpu_gemm_bt(&ar.sa, &m.sc_down, ncanvas, ne, nff, &ar.sc_add)?;
 			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, clen, &ar.cur)?;
 			gpu_rmsnorm_f64_nogamma(&ar.cur, &m.eps, ncanvas, ne, &ar.normed)?;
 		} else {
@@ -3094,62 +3225,4 @@ fn refine_canvas(
 }
 
 #[cfg(test)]
-mod host_store_tests {
-	use super::*;
-
-	#[test]
-	fn ram_boundary_then_disk_roundtrip_and_stage() {
-		let es = FWD_DT.elem_size();
-		let w = 8usize;
-		let path = env::temp_dir().join(format!("recipe-kv-test-{}.spill", process::id()));
-		let mut st = HostStore::new(3 * w * es, path.clone());
-		let row = |r: usize| -> Vec<f32> {
-			return (0..2 * w).map(|i| return (r * 100 + i) as f32 * 0.5).collect();
-		};
-		st.append_f32(&row(0)).expect("append rows 0-1");
-		assert_eq!(st.ram.len(), 2 * w * es, "first append stays in RAM");
-		assert_eq!(st.file_len, 0);
-		st.append_f32(&row(2)).expect("append rows 2-3");
-		assert_eq!(st.ram.len(), 2 * w * es, "RAM frozen at the boundary append");
-		assert_eq!(st.file_len, 2 * w * es, "over-budget append went whole to disk");
-		assert!(fs::metadata(&path).is_ok(), "spill file exists on disk");
-		st.append_f32(&row(4)).expect("append rows 4-5");
-		assert_eq!(st.len(), 6 * w * es);
-		let mut expect: Vec<f32> = Vec::new();
-		for r in [0usize, 2, 4] {
-			expect.extend_from_slice(&row(r));
-		}
-		let dst = GpuBuffer::alloc_ty(6 * w, FWD_DT).expect("stage dst");
-		let mut scratch = Vec::new();
-		st.stage_into(0, 6 * w * es, &dst, &mut scratch).expect("stage all 6 rows");
-		let mut got = vec![0.0f32; 6 * w];
-		dst.download_f32(&mut got).expect("download");
-		assert_eq!(got, expect, "full-range stage must return the exact stored bytes");
-		let dst2 = GpuBuffer::alloc_ty(3 * w, FWD_DT).expect("straddle dst");
-		st.stage_into(w * es, 3 * w * es, &dst2, &mut scratch).expect("stage rows 1..4");
-		let mut got2 = vec![0.0f32; 3 * w];
-		dst2.download_f32(&mut got2).expect("download straddle");
-		assert_eq!(got2, expect[w..4 * w], "RAM/file straddling stage must be byte-exact");
-		st.append_f32(&row(6)).expect("append rows 6-7 after a read");
-		let dst3 = GpuBuffer::alloc_ty(2 * w, FWD_DT).expect("post-append dst");
-		st.stage_into(6 * w * es, 2 * w * es, &dst3, &mut scratch)
-			.expect("stage rows 6..8 through the cached read descriptor");
-		let mut got3 = vec![0.0f32; 2 * w];
-		dst3.download_f32(&mut got3).expect("download post-append");
-		assert_eq!(
-			got3,
-			row(6),
-			"bytes written through the write descriptor must be visible through the independent read descriptor"
-		);
-		st.truncate(3 * w * es);
-		assert_eq!(st.len(), 3 * w * es);
-		assert_eq!(st.file_len, w * es, "truncate above the watermark shrinks only the file");
-		st.truncate(w * es);
-		assert_eq!(st.file_len, 0, "truncate below the watermark drops the file");
-		assert!(fs::metadata(&path).is_err(), "spill file deleted on truncate below RAM");
-		st.append_f32(&row(9)).expect("append after truncate");
-		assert_eq!(st.ram.len(), 3 * w * es, "RAM regrows to its budget once the file is gone");
-		drop(st);
-		assert!(fs::metadata(&path).is_err(), "no spill file left after drop");
-	}
-}
+mod host_store_tests;

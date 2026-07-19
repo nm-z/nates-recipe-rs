@@ -110,6 +110,7 @@ pub fn loss_grad_into(
 pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 	use std::fmt::Write as _;
 	let mut line = String::with_capacity(16 * metrics.len().max(1));
+	let mut shown = 0usize;
 	for mi in 0..metrics.len().min(vals.len()) {
 		let m = metrics[mi];
 		let Some(_w) = m.fmt().width.checked_sub(1) else {
@@ -119,9 +120,56 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 		if !line.is_empty() {
 			line.push_str("  ");
 		}
-		let _ = write!(line, "{} {num}", m.fmt().label);
+		let c = crate::tui::palette(shown);
+		shown += 1;
+		let _ = write!(
+			line,
+			"{} \x1b[38;2;{};{};{}m{num}\x1b[0m",
+			m.fmt().label,
+			c.r,
+			c.g,
+			c.b
+		);
 	}
 	line
+}
+pub(crate) fn metric_flag(m: Metric) -> gpu_core::log::Flag {
+	return match m {
+		Metric::Loss => loss,
+		Metric::Accuracy => acc,
+		Metric::Epoch => epoch,
+		Metric::Lr => lr,
+		Metric::Time => time,
+		Metric::R2 => r2,
+		Metric::Hip => device,
+	};
+}
+pub(crate) fn metrics_emit(prefix: &str, metrics: &[Metric], vals: &[f64]) {
+	let o = gpu_core::log::opt();
+	let shown: Vec<(Metric, f64)> = metrics
+		.iter()
+		.zip(vals.iter())
+		.filter(|(m, _v)| **m != Metric::Hip)
+		.filter(|(m, _v)| match m {
+			Metric::Loss => o.loss,
+			Metric::Accuracy => o.acc,
+			Metric::Epoch => o.epoch,
+			Metric::Lr => o.lr,
+			Metric::Time => o.time,
+			Metric::R2 => o.r2,
+			Metric::Hip => o.device,
+		})
+		.map(|(m, v)| (*m, *v))
+		.collect();
+	let Some((first, _v)) = shown.first() else {
+		return;
+	};
+	let ms: Vec<Metric> = shown.iter().map(|(m, _v)| *m).collect();
+	let vs: Vec<f64> = shown.iter().map(|(_m, v)| *v).collect();
+	Write::line(
+		metric_flag(*first),
+		&format!("{prefix}{}", metrics_line(&ms, &vs)),
+	);
 }
 impl ModelInner {
 	pub(crate) fn fit(
@@ -582,6 +630,7 @@ impl ModelInner {
 		let hip_init = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
 		let mut fit_score = f64::NAN;
+		let mut fit_loss = f64::NAN;
 		let mut epoch_meta: Vec<EpochMeta> = Vec::new();
 		let ring_every = checkpointing || plotting;
 		let mut ring_scale: Vec<recipe_infer::LossScale> = vec![
@@ -706,6 +755,10 @@ impl ModelInner {
 				.filter(|_probe| score.is_finite())
 				.map(|_probe| score)
 				.unwrap_or(fit_score);
+			fit_loss = Some(())
+				.filter(|_probe| val_of(Metric::Loss, e).is_finite())
+				.map(|_probe| val_of(Metric::Loss, e))
+				.unwrap_or(fit_loss);
 			let mut checkpointed: Option<()> = None;
 			let nan_stop =
 				match Some(()).filter(|_probe| checkpointing) {
@@ -769,24 +822,17 @@ impl ModelInner {
 			else {
 				continue;
 			};
-			for m in cfg.metrics.iter().filter(|m| **m != Metric::Hip) {
-				let v = match m {
-					Metric::Epoch => e as f64,
-					Metric::Lr => self.lr,
-					Metric::Time => meta.elapsed,
-					_other => val_of(*m, e),
-				};
-				let flag = match m {
-					Metric::Loss => loss,
-					Metric::Accuracy => acc,
-					Metric::Epoch => epoch,
-					Metric::Lr => lr,
-					Metric::Time => time,
-					Metric::R2 => r2,
-					Metric::Hip => device,
-				};
-				Write::line(flag, &metrics_line(&[*m], &[v]));
-			}
+				let vals: Vec<f64> = cfg
+					.metrics
+					.iter()
+					.map(|m| match m {
+						Metric::Epoch => e as f64,
+						Metric::Lr => self.lr,
+						Metric::Time => meta.elapsed,
+						_other => val_of(*m, e),
+					})
+					.collect();
+				metrics_emit("", &cfg.metrics, &vals);
 			for _ck in checkpointed.iter() {
 				Write::line(save, "<- checkpoint");
 			}
@@ -896,6 +942,7 @@ impl ModelInner {
 			.transpose()?;
 		*self.params.borrow_mut() = params;
 		self.fit_score.set(fit_score);
+		self.fit_loss.set(fit_loss);
 		let hip_dump = || -> Option<()> {
 			let b0 = hip_snap?;
 			let init = hip_init?;

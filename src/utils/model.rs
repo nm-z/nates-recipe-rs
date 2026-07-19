@@ -243,6 +243,7 @@ impl<F: Fn() -> Model> ModelArg for F {
 struct LastRun {
 	model: *const ModelInner,
 	score: f64,
+	loss: f64,
 	preds: Option<Vec<f64>>,
 	n: usize,
 	k: usize,
@@ -256,6 +257,7 @@ impl Default for LastRun {
 		LastRun {
 			model: ptr::null(),
 			score: f64::NAN,
+			loss: f64::NAN,
 			preds: None,
 			n: 0,
 			k: 0,
@@ -473,6 +475,7 @@ impl Train {
 				let mut last = self.last.borrow_mut();
 				last.model = model as *const ModelInner;
 				last.score = score;
+				last.loss = model.fit_loss.get();
 				last.preds = None;
 				last.n = ds.x.nrows();
 				last.k = ds.n_targets.max(1);
@@ -483,12 +486,20 @@ impl Train {
 				if let Some((tree, errs)) = gpu_core::callspy::state_report(&run_state) {
 					Write::block(device, &tree.serialize());
 					for e in errs {
-						Write::error(&e);
+						Write::line(device, &e);
 					}
 				}
 			}
 		}
 		self
+	}
+
+	pub fn score(&self) -> f64 {
+		return self.last.borrow().score;
+	}
+
+	pub fn loss(&self) -> f64 {
+		return self.last.borrow().loss;
 	}
 
 	pub fn save(&self, path: impl SavePath) -> &Train {
@@ -768,24 +779,7 @@ impl Infer {
 						return self;
 					}
 				};
-				for (mi, m) in metrics.iter().enumerate() {
-					let flag = match m {
-						Metric::Loss => loss,
-						Metric::Accuracy => acc,
-						Metric::Epoch => epoch,
-						Metric::Lr => lr,
-						Metric::Time => time,
-						Metric::R2 => r2,
-						Metric::Hip => device,
-					};
-					Write::line(
-						flag,
-						&format!(
-							"eval  {}",
-							crate::train::metrics_line(&[*m], &[sc.vals[mi]])
-						),
-					);
-				}
+					crate::train::metrics_emit("eval  ", &metrics, &sc.vals);
 				let stop = Some(Metric::Accuracy)
 					.filter(|_m| model.loss.is_classification())
 					.unwrap_or(Metric::R2);
@@ -891,6 +885,7 @@ pub(crate) struct ModelInner {
 	pub(crate) scaler: RefCell<Option<Scaler>>,
 	pub(crate) yscaler: RefCell<Option<recipe_infer::YScaler>>,
 	pub(crate) fit_score: Cell<f64>,
+	pub(crate) fit_loss: Cell<f64>,
 	pub(crate) saved_ogdl: RefCell<Option<SavedWeights>>,
 	pub(crate) arena_gen: Cell<Option<usize>>,
 	pub(crate) rebuild_backing: RefCell<Option<GpuBuffer>>,
@@ -997,6 +992,7 @@ impl ModelInner {
 			scaler: RefCell::new(None),
 			yscaler: RefCell::new(None),
 			fit_score: Cell::new(f64::NAN),
+			fit_loss: Cell::new(f64::NAN),
 			saved_ogdl: RefCell::new(None),
 			arena_gen: Cell::new(None),
 			rebuild_backing: RefCell::new(None),

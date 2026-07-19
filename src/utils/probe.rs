@@ -26,6 +26,10 @@ pub struct GpuDev {
 	pub transfer_gbs: f64,
 }
 
+pub fn max_cube_mnk(vram: u64) -> u64 {
+	return vram.saturating_sub(USER_GB as u64);
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
 	pub host: String,

@@ -1,7 +1,7 @@
 use crate::gguf::{Gguf, Val};
 use anyhow::{Result, anyhow, bail};
 use hf_chat_template::ChatTemplate;
-use minijinja::{Value, context};
+use hf_chat_template::minijinja::{Value, context};
 use std::path::Path;
 
 pub struct Msg {

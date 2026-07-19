@@ -688,9 +688,9 @@ impl Saved {
 pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
 	let text = match fs::read_to_string(path) {
 		Ok(t) => t,
-		Err(_) => {
+		Err(e) => {
 			Write::error(&format!(
-				"no data in {path}, initialized random weights and biases"
+				"no data in {path} ({e}), initialized random weights and biases"
 			));
 			return Ok(Vec::new());
 		}

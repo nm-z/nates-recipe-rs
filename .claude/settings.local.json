@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(timeout 180 cargo test --manifest-path ogdl/Cargo.toml --no-run)",
-      "Read(//tmp/claude-1000/**)"
+      "Read(//tmp/claude-1000/**)",
+      "Bash(timeout 30 rg -n '^FAIL' /home/nate/Desktop/nates-recipe-rs/suite.log)",
+      "Bash(timeout 30 rg -n 'exit\\\\\\(' /home/nate/Desktop/nates-recipe-rs/recipe-infer/src/)",
+      "Bash(timeout 30 rg -n '#\\\\[cfg\\\\\\(test\\\\\\)\\\\]|mod host_store_tests|#\\\\[test\\\\]' /home/nate/Desktop/nates-recipe-rs/recipe-infer/src/llm.rs)",
+      "Bash(rg -n 'process::exit')",
+      "Bash(rg -n)"
     ]
   },
   "skillOverrides": {

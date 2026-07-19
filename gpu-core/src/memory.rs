@@ -60,24 +60,44 @@ impl Drop for TagScope {
 	}
 }
 
-fn tag_add(tag: &'static str, n: usize) {
-	let live = match TAG_BYTES.lock() {
-		Ok(mut m) => {
-			let e = m.entry(tag).or_insert(0);
-			*e += n;
-			*e
+fn lock_or_log<'m, T>(mutex: &'m Mutex<T>, name: &str) -> Option<MutexGuard<'m, T>> {
+	match mutex.lock() {
+		Ok(g) => return Some(g),
+		Err(p) => {
+			Write::error(format!("{name} poisoned: {p}"));
+			return None;
 		}
-		Err(_p) => return,
+	}
+}
+
+fn lock_recover<'m, T>(mutex: &'m Mutex<T>, name: &str) -> MutexGuard<'m, T> {
+	match mutex.lock() {
+		Ok(g) => return g,
+		Err(p) => {
+			Write::error(format!("{name} poisoned, recovering guard: {p}"));
+			return p.into_inner();
+		}
+	}
+}
+
+fn tag_add(tag: &'static str, n: usize) {
+	let live = {
+		let Some(mut m) = lock_or_log(&TAG_BYTES, "TAG_BYTES") else {
+			return;
+		};
+		let e = m.entry(tag).or_insert(0);
+		*e += n;
+		*e
 	};
-	let Ok(mut p) = TAG_PEAK.lock() else {
+	let Some(mut peak) = lock_or_log(&TAG_PEAK, "TAG_PEAK") else {
 		return;
 	};
-	let e = p.entry(tag).or_insert(0);
+	let e = peak.entry(tag).or_insert(0);
 	*e = (*e).max(live);
 }
 
 fn tag_sub(tag: &'static str, n: usize) {
-	let Ok(mut m) = TAG_BYTES.lock() else {
+	let Some(mut m) = lock_or_log(&TAG_BYTES, "TAG_BYTES") else {
 		return;
 	};
 	let e = m.entry(tag).or_insert(0);
@@ -126,15 +146,15 @@ pub fn oom_report(req: usize) {
 	let mi = mem_info().unwrap_or(MemInfo { free: 0, total: 0 });
 	let free = mi.free;
 	let total = mi.total;
-	let mut autopsy: Vec<TagBytes> = match TAG_BYTES.lock() {
-		Ok(m) => m
+	let mut autopsy: Vec<TagBytes> = match lock_or_log(&TAG_BYTES, "TAG_BYTES") {
+		Some(m) => m
 			.keys()
 			.filter_map(|k| {
 				let bytes = m.get(k).copied().unwrap_or(0);
 				return Some(TagBytes { tag: k, bytes }).filter(|tb| return tb.bytes > 0);
 			})
 			.collect(),
-		Err(_p) => Vec::new(),
+		None => Vec::new(),
 	};
 	autopsy.sort_by_key(|b| return cmp::Reverse(b.bytes));
 	let mut line: Vec<String> = autopsy
@@ -318,8 +338,7 @@ pub fn ledger_vramspy_section(total_live: usize) -> String {
 
 #[inline]
 pub fn ledger_report() -> String {
-	let mut live: Vec<TagBytes> = TAG_BYTES
-		.lock()
+	let mut live: Vec<TagBytes> = lock_or_log(&TAG_BYTES, "TAG_BYTES")
 		.map(|m| {
 			return m
 				.keys()
@@ -333,8 +352,7 @@ pub fn ledger_report() -> String {
 		})
 		.unwrap_or_default();
 	live.sort_by_key(|b| return cmp::Reverse(b.bytes));
-	let peak = TAG_PEAK
-		.lock()
+	let peak = lock_or_log(&TAG_PEAK, "TAG_PEAK")
 		.map(|m| return m.clone())
 		.unwrap_or_default();
 	let mut s = String::from(
@@ -492,7 +510,7 @@ static ARENA_CARVED_ALIGNED: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 pub fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
-	let Ok(mut m) = ARENA_CARVED.lock() else {
+	let Some(mut m) = lock_or_log(&ARENA_CARVED, "ARENA_CARVED") else {
 		ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
 		return;
 	};
@@ -661,7 +679,7 @@ fn drain_arena_carve() {
 
 #[inline]
 pub fn drain_arena_carve_map() {
-	let Ok(mut m) = ARENA_CARVED.lock() else {
+	let Some(mut m) = lock_or_log(&ARENA_CARVED, "ARENA_CARVED") else {
 		return;
 	};
 	for tag in m.keys() {
@@ -678,10 +696,7 @@ static PARKED_GEN: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 pub fn park_run_backing(buf: GpuBuffer) {
-	let mut g = match PARKED.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut g = lock_recover(&PARKED, "PARKED");
 	if !g.is_none() {
 		Write::error(
 			"park_run_backing: a parked run backing already exists",
@@ -715,10 +730,7 @@ enum Disposition {
 
 #[inline]
 pub fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
-	let parked = match PARKED.lock() {
-		Ok(mut g) => g.take(),
-		Err(p) => p.into_inner().take(),
-	}?;
+	let parked = lock_recover(&PARKED, "PARKED").take()?;
 	PARKED_GEN.store(0, Ordering::Relaxed);
 	let kind = match ARENA_BASE.load(Ordering::Relaxed).cmp(&parked.ptr_addr()) {
 		cmp::Ordering::Equal => ParkKind::Registered,
@@ -772,10 +784,7 @@ pub fn adopt_run_backing_with_image(need: usize, image: &[f64]) -> Option<GpuBuf
 
 #[inline]
 pub fn release_run_backing() {
-	let parked = match PARKED.lock() {
-		Ok(mut g) => g.take(),
-		Err(p) => p.into_inner().take(),
-	};
+	let parked = lock_recover(&PARKED, "PARKED").take();
 	PARKED_GEN.store(0, Ordering::Relaxed);
 	let Some(b) = parked else {
 		return;
@@ -990,10 +999,7 @@ fn pin_ensure(g: &mut PinBuf, bytes: usize) -> Result<*mut u8, HipError> {
 
 #[inline]
 pub fn run_pin(bytes: usize) -> Result<*mut u8, HipError> {
-	let mut g = match RUN_PIN.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut g = lock_recover(&RUN_PIN, "RUN_PIN");
 	return pin_ensure(&mut g, bytes);
 }
 
@@ -1004,7 +1010,7 @@ pub struct BounceRange {
 
 #[inline]
 pub fn bounce_range() -> Option<BounceRange> {
-	let base = BOUNCE.lock().ok()?.addr;
+	let base = lock_or_log(&BOUNCE, "BOUNCE")?.addr;
 	return num::NonZeroUsize::new(base).map(|nz| {
 		return BounceRange {
 			base: nz.get(),
@@ -1022,7 +1028,7 @@ struct Range {
 static RECENT_RANGES: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 
 pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
-	let Ok(mut r) = RECENT_RANGES.lock() else {
+	let Some(mut r) = lock_or_log(&RECENT_RANGES, "RECENT_RANGES") else {
 		return;
 	};
 	if let Some(_full) = (r.len() >= 256).then_some(()) {
@@ -1033,7 +1039,7 @@ pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
 
 #[inline]
 pub fn locate_va(va: usize) -> Option<String> {
-	let r = RECENT_RANGES.lock().ok()?;
+	let r = lock_or_log(&RECENT_RANGES, "RECENT_RANGES")?;
 	return r
 		.iter()
 		.rev()
@@ -1051,10 +1057,7 @@ pub fn locate_va(va: usize) -> Option<String> {
 
 #[inline]
 pub fn free_bounce() {
-	let mut guard = match BOUNCE.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut guard = lock_recover(&BOUNCE, "BOUNCE");
 	if let Some(_live) = num::NonZeroUsize::new(guard.addr) {
 		// SAFETY: guard holds a live pinned allocation from host_malloc, freed once here.
 		drop(unsafe { host_free(ptr::with_exposed_provenance_mut::<c_void>(guard.addr)) });
@@ -1064,10 +1067,7 @@ pub fn free_bounce() {
 
 #[inline]
 pub fn free_run_pin() {
-	let mut guard = match RUN_PIN.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut guard = lock_recover(&RUN_PIN, "RUN_PIN");
 	if let Some(_live) = num::NonZeroUsize::new(guard.ptr) {
 		drop(device_synchronize());
 		// SAFETY: guard.ptr holds a live pinned allocation from host_malloc, freed once here.
@@ -1084,10 +1084,7 @@ pub unsafe fn h2d_pinned(
 	bytes: usize,
 	stream: *mut c_void,
 ) -> Result<(), HipError> {
-	let mut guard = match BOUNCE.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut guard = lock_recover(&BOUNCE, "BOUNCE");
 	let base = if let Some(nz) = num::NonZeroUsize::new(guard.addr) {
 		nz.get()
 	} else {
@@ -1156,10 +1153,7 @@ impl ExitD2H {
 	reason = "the RUN_PIN guard must outlive the enqueued D2H copy; it rides in the returned ExitD2H, so it cannot drop earlier"
 )]
 pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD2H, HipError> {
-	let mut guard = match RUN_PIN.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut guard = lock_recover(&RUN_PIN, "RUN_PIN");
 	let pin = pin_ensure(&mut guard, bytes)?;
 	let pin_addr = guard.ptr;
 	D2H_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -1194,10 +1188,7 @@ pub fn exit_d2h_enqueue_buf(src: &GpuBuffer, bytes: usize) -> Result<ExitD2H, Hi
 static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
 
 fn pinned_pair_addr() -> usize {
-	let mut g = match PINNED_PAIR.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut g = lock_recover(&PINNED_PAIR, "PINNED_PAIR");
 	if *g == 0 {
 		match crate::hip::host_malloc(16, 0) {
 			Ok(p) => *g = p.addr(),
@@ -1242,10 +1233,7 @@ pub fn pinned_read(slot: usize) -> f64 {
 }
 
 pub fn free_pinned_pair() {
-	let mut g = match PINNED_PAIR.lock() {
-		Ok(g) => g,
-		Err(p) => p.into_inner(),
-	};
+	let mut g = lock_recover(&PINNED_PAIR, "PINNED_PAIR");
 	if *g != 0 {
 		let _ = device_synchronize();
 		// SAFETY: the address came from host_malloc and is freed exactly once here.
@@ -1618,6 +1606,8 @@ impl Dtype {
             return match self {
                   Self::F32 => 1,
                   Self::F64 => 0,
+                  Self::F16 => 2,
+                  Self::BF16 => 3,
                   _other => -1,
             };
       }
@@ -1849,7 +1839,7 @@ impl GpuBuffer {
 			return None;
 		}
 		let (ptr, handles) = vmm_map_span(n_bytes)?;
-		if let Ok(mut g) = ARENA_VMM.lock() {
+		if let Some(mut g) = lock_or_log(&ARENA_VMM, "ARENA_VMM") {
 			*g = Some((ptr.addr(), handles.iter().map(|h| return h.addr()).collect()));
 		}
 		tag_add(tag, n_bytes);
@@ -2262,7 +2252,8 @@ impl Drop for GpuBuffer {
 		FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
 		match mem::replace(&mut self.owned, Ownership::Borrow) {
 			Ownership::Vmm => {
-				let taken = ARENA_VMM.lock().ok().and_then(|mut g| return g.take());
+				let taken =
+					lock_or_log(&ARENA_VMM, "ARENA_VMM").and_then(|mut g| return g.take());
 				if let Some((_va, addrs)) = taken {
 					let ptrs: Vec<*mut c_void> = addrs
 						.iter()

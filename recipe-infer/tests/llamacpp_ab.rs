@@ -99,7 +99,8 @@ fn recipe_run(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 	let mut session = ChatSession::open(model, &mut |_toks: &[Tok]| true)
 		.expect("session open")
 		.session()
-		.expect("session cancelled");
+		.expect("session cancelled")
+		.temp(0.0);
 	let mut n = 0usize;
 	let mut first: Option<Instant> = None;
 	let sent = Instant::now();

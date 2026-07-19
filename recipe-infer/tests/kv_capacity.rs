@@ -24,7 +24,8 @@ fn cache_growth_keeps_decoding_without_fresh_device_memory() {
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
 		.session()
-		.expect("session cancelled");
+		.expect("session cancelled")
+		.temp(0.0);
 	let sentence = "Once upon a time there was a little girl who lived in a big house. ";
 	let mut prompt = sentence.repeat(250);
 	let budget = 2usize;

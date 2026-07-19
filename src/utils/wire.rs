@@ -118,6 +118,15 @@ fn write_frame(s: &mut TcpStream, f: &Frame) -> Result<()> {
 	write_frame_raw(s, f.op, f.flags, f.tag, f.seq, f.id, &f.data)
 }
 
+fn note_frame_end(e: &anyhow::Error, what: &str) {
+	if e.downcast_ref::<std::io::Error>()
+		.is_some_and(|io_err| return io_err.kind() == std::io::ErrorKind::UnexpectedEof)
+	{
+		return;
+	}
+	Write::error(format!("{what}: {e}"));
+}
+
 fn read_frame(s: &mut TcpStream) -> Result<Frame> {
 	let mut h = [0u8; HDR];
 	s.read_exact(&mut h)?;
@@ -352,13 +361,19 @@ fn listen_loop(reg: Registry, own: Option<Arc<Machine>>) {
 							None => None,
 						}
 					}
-					Err(_poison) => None,
+					Err(p) => {
+						Write::error(format!("peer registry poisoned: {p}"));
+						None
+					}
 				};
 				for _rw in changed.into_iter() {
 					rewrite_config(&reg, &own);
 				}
 			}
-			Err(_recv_err) => continue,
+			Err(e) => {
+				Write::error(format!("beacon recv: {e}"));
+				continue;
+			}
 		}
 	}
 }
@@ -522,7 +537,10 @@ impl Conn {
 							None => continue,
 						}
 					}
-					Err(_read_err) => break,
+					Err(e) => {
+						note_frame_end(&e, "client frame read");
+						break;
+					}
 				}
 			}
 		});
@@ -707,7 +725,10 @@ impl Server {
 		loop {
 			let f = match read_frame(&mut s) {
 				Ok(f) => f,
-				Err(_frame_err) => return Ok(()),
+				Err(e) => {
+					note_frame_end(&e, "serve frame read");
+					return Ok(());
+				}
 			};
 			let reply = self.dispatch(&f);
 			let out = match reply {

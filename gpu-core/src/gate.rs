@@ -109,7 +109,11 @@ pub fn acquire() {
 	let engaged: io::Result<()> = 'engage: {
 		if matches!(g.lock, Lock::Closed) {
 			let adopted: Option<RawFd> = match env::var(INHERIT_VAR) {
-				Err(_no_var) => None,
+				Err(env::VarError::NotPresent) => None,
+				Err(e) => {
+					Write::error(format!("{INHERIT_VAR}: {e}"));
+					None
+				}
 				Ok(raw) => {
 					let Ok(fd) = raw.parse::<RawFd>() else {
 						break 'engage Err(io::Error::other(format!(
