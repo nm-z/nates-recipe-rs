@@ -1,12 +1,7 @@
-// Runtime parity for the hipSOLVER/hipFFT-backed ops (gpu_solve, gpu_cholesky_solve,
-// gpu_eigh_sym, gpu_fft_c2c_1d). Layout-free checks: linear-solve residuals,
-// eigenvalue-sum == trace, FFT round-trip. Same test runs on AMD (rocSOLVER/rocFFT)
-// and NVIDIA (cuSOLVER/cuFFT) → cross-backend parity. f64, tol generous for solvers.
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
 use std::ptr;
 
-// deterministic SPD matrix A = MᵀM + n·I (row-major == col-major since symmetric)
 fn spd(n: usize, seed: u64) -> Vec<f64> {
 	let mut s = seed;
 	let mut rnd = || {
@@ -139,7 +134,6 @@ fn eigh_eigenvalue_sum_equals_trace() {
 			__dv
 		};
 		let sum: f64 = ev.iter().sum();
-		// SPD → all eigenvalues strictly positive; sum == trace (invariant)
 		assert!(
 			(sum - trace).abs() < 1e-6,
 			"eigh n={n}: sum {sum} vs trace {trace}"
@@ -155,7 +149,6 @@ fn eigh_eigenvalue_sum_equals_trace() {
 fn fft_roundtrip() {
 	hip::set_device(0).unwrap();
 	for &n in &[8usize, 16, 64] {
-		// interleaved re/im, n complex elements
 		let inp: Vec<f64> = (0..2 * n).map(|i| (i as f64 * 0.13).sin()).collect();
 		let din = {
 			let __up = &inp;
@@ -173,16 +166,12 @@ fn fft_roundtrip() {
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
-		// hipFFT is unnormalized: inverse(forward(x)) = n·x
 		let recovered: Vec<f64> = inv.iter().map(|v| v / n as f64).collect();
 		let d = max_abs_diff(&recovered, &inp);
 		assert!(d < 1e-9, "fft roundtrip n={n}: max diff {d:e}");
 	}
 }
 
-// gpu_cholesky_inv must return the true inverse: A·A⁻¹ = I. (A⁻¹ is symmetric for
-// SPD A, so the row/col-major layout is unambiguous.) Guards the potrf/dtrsm fill
-// mode agreeing inside that function.
 #[test]
 fn cholesky_inv_times_a_is_identity() {
 	hip::set_device(0).unwrap();
@@ -225,9 +214,6 @@ fn cholesky_inv_times_a_is_identity() {
 	}
 }
 
-// gpu_cholesky (factor) feeding gpu_tri_solve must reconstruct the linear solve:
-// A=L·Lᵀ stored col-major as U=Lᵀ, so A·x=b is forward Uᵀz=b (trans=true) then
-// backward Ux=z (trans=false). Guards gpu_tri_solve's fill mode matching gpu_cholesky.
 #[test]
 fn cholesky_factor_then_tri_solve() {
 	hip::set_device(0).unwrap();

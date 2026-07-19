@@ -1,21 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "optimizer" inventory category.
-//
-// For every optimizer-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run ONE in-place weight-update
-// step on the LIVE gfx1101 GPU from a KNOWN nonzero (w, g, state, t>=2) and assert
-// it matches an AUTHORITATIVE CPU oracle written independently from the math
-// definition (std f64 / textbook update rule). tol 1e-6.
-//
-// EXISTING ops (proven via their public Rust fns):
-//   sgd, momentum, rmsprop, adagrad, lion, lamb, adam, adamw, nadam.
-// NEW optimizerx_ kernels (proven via FFI launchers): nesterov, adadelta, radam, lars.
-//
-// A proven op counts ALL its inventory variants collapsed by canon (dtype/fused/
-// precision/multi_tensor/capturable/paged wrappers of the SAME math). Algorithmically
-// different names (proximal/DA/centered/adamax/ftrl/novograd/addsign/yogi/...) are
-// NOT mapped to a base op — that would be faked green — they remain backlog like the
-// host-only schedule/state items. The test FAILS on any registered-op mismatch.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -91,7 +74,6 @@ fn close(a: &[f64], b: &[f64]) -> bool {
 			.all(|(x, y)| (x - y).abs() <= TOL * (1.0 + y.abs()))
 }
 
-// Deterministic, distinct-per-element test vectors of length n.
 fn wv(n: usize) -> Vec<f64> {
 	(0..n).map(|i| 0.30 - 0.11 * i as f64 + 0.017 * (i * i) as f64)
 		.collect()
@@ -108,7 +90,6 @@ const N: usize = 37;
 
 // ── EXISTING-op proofs (call public Rust fns) ───────────────────────────────
 
-// sgd: w -= lr*g  (gpu_sgd_update: Y = Y - lr*X)
 fn prove_sgd() -> bool {
 	let (lr, n) = (0.05, N);
 	let w = wv(n);
@@ -139,7 +120,6 @@ fn prove_sgd() -> bool {
 	close(&got, &want)
 }
 
-// momentum (Sutskever form, as coded): v = mu*v - lr*g; w += v
 fn prove_momentum() -> bool {
 	let (lr, mu, n) = (0.05, 0.9, N);
 	let w = wv(n);
@@ -187,7 +167,6 @@ fn prove_momentum() -> bool {
 	close(&gw, &want_w) && close(&gvb, &want_v)
 }
 
-// rmsprop: cache = decay*cache + (1-decay)*g^2; w -= lr*g/(sqrt(cache)+eps)
 fn prove_rmsprop() -> bool {
 	let (lr, decay, eps, n) = (0.05, 0.9, 1e-8, N);
 	let w = wv(n);
@@ -245,7 +224,6 @@ fn prove_rmsprop() -> bool {
 	close(&gw, &want_w) && close(&gc, &want_c)
 }
 
-// adagrad: accum += g^2; w -= lr*g/(sqrt(accum)+eps)
 fn prove_adagrad() -> bool {
 	let (lr, eps, n) = (0.05, 1e-10, N);
 	let w = wv(n);
@@ -295,7 +273,6 @@ fn prove_adagrad() -> bool {
 	close(&gw, &want_w) && close(&ga, &want_a)
 }
 
-// lion: upd = sign(b1*m + (1-b1)*g); w -= lr*(upd + wd*w); m = b2*m + (1-b2)*g
 fn prove_lion() -> bool {
 	let (lr, b1, b2, wd, n) = (0.01, 0.9, 0.99, 0.01, N);
 	let w = wv(n);
@@ -369,7 +346,6 @@ fn prove_lion() -> bool {
 	close(&gw, &want_w) && close(&gm, &want_m)
 }
 
-// adam (t>=2): m=b1*m+(1-b1)g; v=b2*v+(1-b2)g^2; mh=m/(1-b1^t); vh=v/(1-b2^t); w-=lr*mh/(sqrt(vh)+eps)
 fn prove_adam() -> bool {
 	let (lr, b1, b2, eps, t, n) = (0.01, 0.9, 0.999, 1e-8, 5usize, N);
 	let w = wv(n);
@@ -441,7 +417,6 @@ fn prove_adam() -> bool {
 	close(&gw, &want)
 }
 
-// adamw (decoupled wd): like adam but w = w*(1-lr*wd) - lr*mh/(sqrt(vh)+eps)
 fn prove_adamw() -> bool {
 	let (lr, b1, b2, eps, wd, t, n) = (0.01, 0.9, 0.999, 1e-8, 0.05, 5usize, N);
 	let w = wv(n);
@@ -519,8 +494,6 @@ fn prove_adamw() -> bool {
 	close(&gw, &want)
 }
 
-// nadam (Nesterov-accelerated Adam, Keras/Dozat form):
-// m_hat = b1*m/(1-b1^(t+1)) + (1-b1)*g/(1-b1^t); v_hat = v/(1-b2^t); w -= lr*m_hat/(sqrt(v_hat)+eps)
 fn prove_nadam() -> bool {
 	let (lr, b1, b2, eps, t, n) = (0.01, 0.9, 0.999, 1e-8, 5usize, N);
 	let w = wv(n);
@@ -594,7 +567,6 @@ fn prove_nadam() -> bool {
 	close(&gw, &want)
 }
 
-// lamb: Adam moments + trust ratio ||w||/||update|| (whole-vector), upd includes wd*w.
 fn prove_lamb() -> bool {
 	let (lr, b1, b2, eps, wd, t, n) = (0.01, 0.9, 0.999, 1e-6, 0.02, 5i32, N);
 	let w = wv(n);
@@ -625,7 +597,6 @@ fn prove_lamb() -> bool {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	// LAMB = phase1 (Adam moments + trust-ratio norms, device-side) then phase2 (scaled update).
 	let tmp_upd = GpuBuffer::alloc(n).unwrap();
 	let w_norm_sq = GpuBuffer::alloc(1).unwrap();
 	let u_norm_sq = GpuBuffer::alloc(1).unwrap();
@@ -687,7 +658,6 @@ fn prove_lamb() -> bool {
 
 // ── NEW optimizerx_ kernel proofs ───────────────────────────────────────────
 
-// nesterov (PyTorch NAG): buf = mu*buf + g; d = g + mu*buf; w -= lr*d
 fn prove_nesterov() -> bool {
 	let (lr, mu, n) = (0.05, 0.9, N);
 	let w = wv(n);
@@ -736,7 +706,6 @@ fn prove_nesterov() -> bool {
 	close(&gw, &want_w) && close(&gb, &want_b)
 }
 
-// adadelta (Zeiler): Eg=rho*Eg+(1-rho)g^2; dx=-sqrt(Edx+eps)/sqrt(Eg+eps)*g; Edx=rho*Edx+(1-rho)dx^2; w+=lr*dx
 fn prove_adadelta() -> bool {
 	let (lr, rho, eps, n) = (1.0, 0.95, 1e-6, N);
 	let w = wv(n);
@@ -803,7 +772,6 @@ fn prove_adadelta() -> bool {
 	close(&gw, &want_w) && close(&geg, &want_eg) && close(&gedx, &want_edx)
 }
 
-// radam: rectified Adam. Run at two t values to hit BOTH branches (unrectified small t, rectified large t).
 fn radam_step(t: usize) -> (Vec<f64>, Vec<f64>) {
 	let (lr, b1, b2, eps, n) = (0.01, 0.9, 0.999, 1e-8, N);
 	let w = wv(n);
@@ -876,8 +844,6 @@ fn radam_step(t: usize) -> (Vec<f64>, Vec<f64>) {
 	(gw, want)
 }
 fn prove_radam() -> bool {
-	// rho_inf = 2/0.001 - 1 = 1999. rho_t>4 requires t large enough.
-	// t=3 -> rho_t ~ -? (unrectified); t=10 -> rectified. Verify both branches actually fire.
 	let rho_inf = 2.0 / (1.0 - 0.999_f64) - 1.0;
 	let rho_at = |t: usize| {
 		let b2t = 0.999_f64.powi(t as i32);
@@ -900,7 +866,6 @@ fn prove_radam() -> bool {
 	close(&g1, &w1) && close(&g2, &w2)
 }
 
-// lars: trust = lambda*||w||/(||g||+wd*||w||+eps); buf = mu*buf + trust*(g+wd*w); w -= lr*buf
 fn prove_lars() -> bool {
 	let (lr, mu, wd, lambda, eps, n) = (0.05, 0.9, 0.01, 1.0, 1e-8, N);
 	let w = wv(n);
@@ -969,10 +934,8 @@ fn prove_lars() -> bool {
 	let mut gb = vec![0.0; n];
 	unsafe { bb.download_async(&mut gb, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	// independent oracle
 	let w_norm = w.iter().map(|x| x * x).sum::<f64>().sqrt();
 	let g_norm = g.iter().map(|x| x * x).sum::<f64>().sqrt();
-	// sanity: the GPU norm accumulators must match (proves phase1 reduction)
 	if (wn[0] - w.iter().map(|x| x * x).sum::<f64>()).abs() > 1e-9 * (1.0 + wn[0].abs()) {
 		return false;
 	}
@@ -1010,24 +973,15 @@ fn registry() -> HashMap<&'static str, fn() -> bool> {
 	m
 }
 
-// Canonicalize an optimizer JSON name to a registry key.
-// Strip lib paths, framework prefixes (apply/sparse/resource/keras/fused/multi_tensor/
-// paged/scale_by/deepspeedcpu/mb/dp/noisy/polyak/optimistic), and dtype/precision/
-// capturable/distributed/master suffixes. Map TRUE synonyms only. Algorithmically
-// different ops (proximal/da/centered/adamax/ftrl/novograd/yogi/...) keep their own
-// key and stay backlog — never folded into a base op (that would fake green).
 fn canon(name: &str) -> String {
-	// last path segment
 	let mut s = name
 		.rsplit(['.', ':'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
-	// leading underscores from torch._fused_*
 	while let Some(r) = s.strip_prefix('_') {
 		s = r.to_string();
 	}
-	// strip framework method/op prefixes (longest first; repeat to peel stacks)
 	let prefixes = [
 		"resourcesparseapply",
 		"resourceapply",
@@ -1060,11 +1014,9 @@ fn canon(name: &str) -> String {
 			break;
 		}
 	}
-	// strip trailing underscores (torch._fused_adam_)
 	while let Some(r) = s.strip_suffix('_') {
 		s = r.to_string();
 	}
-	// strip dtype / variant suffixes
 	let suffixes = [
 		"_capturable_master",
 		"_capturable",
@@ -1095,7 +1047,6 @@ fn canon(name: &str) -> String {
 			break;
 		}
 	}
-	// explicit synonym table (same math, different name)
 	let alias: &[(&str, &str)] = &[
 		("sgd", "sgd"),
 		("gradientdescent", "sgd"),
@@ -1166,7 +1117,6 @@ fn prove_optimizer() {
 	assert!(!items.is_empty(), "no optimizer items in inventory");
 	let reg = registry();
 
-	// Prove each registered op ONCE on the live GPU; fail loud on any mismatch.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	let mut failures: Vec<String> = Vec::new();
 	for (k, f) in reg.iter() {
@@ -1177,7 +1127,6 @@ fn prove_optimizer() {
 		}
 	}
 
-	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();
@@ -1208,7 +1157,6 @@ fn prove_optimizer() {
 		failures
 	);
 	assert!(proven > 0, "zero optimizer items proven");
-	// newly implemented optimizerx_ kernels (genuinely missing before this work)
 	let implemented = "nesterov,lars,adamw,nadam,radam,adadelta";
 	eprintln!(
 		"RESULT optimizer: proven={} total={} green=true implemented={}",

@@ -1,4 +1,3 @@
-// Lead smoke test: trivially-verifiable functions across domains, executed on the GPU.
 use gpu_core::encoding::gpu_one_hot;
 use gpu_core::math_ops::{gpu_max, gpu_reciprocal, gpu_rsqrt};
 use gpu_core::memory::GpuBuffer;

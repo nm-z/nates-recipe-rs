@@ -3,16 +3,11 @@ use std::fs;
 use std::io;
 use std::process;
 
-/// The HIP backend platform, decided solely by `hipconfig --platform`.
 enum Platform {
-	/// AMD `ROCm`: hipBLAS/hipSOLVER/hipFFT forward to rocBLAS/rocSOLVER/rocFFT.
 	Amd,
-	/// NVIDIA CUDA: hipBLAS/hipSOLVER/hipFFT wrap cuBLAS/cuSOLVER/cuFFT.
 	Nvidia,
 }
 
-/// Writes one cargo build directive to stdout, newline-terminated.
-/// Write errors are discarded — cargo reads this line-by-line and a dropped byte is not worth failing the build.
 fn put(s: &str) {
 	use std::io::Write as _;
 	let mut o = io::stdout();
@@ -20,8 +15,6 @@ fn put(s: &str) {
 	drop(o.write_all(b"\n"));
 }
 
-/// Runs `hipconfig <flag>` and returns its trimmed stdout — the sole backend-truth source.
-/// Errs (naming the packages to install) if hipconfig is missing, fails to run, or returns nonzero.
 fn hipconfig(flag: &str) -> Result<String, String> {
 	let out = match process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
@@ -42,8 +35,6 @@ fn hipconfig(flag: &str) -> Result<String, String> {
 	return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
 }
 
-/// Returns the `ROCm` install tree path queried from `hipconfig --rocmpath`.
-/// Errs if hipconfig fails or yields empty output.
 fn rocm_path() -> Result<String, String> {
 	let p = hipconfig("--rocmpath")?;
 	if p.is_empty() {
@@ -144,8 +135,6 @@ fn main() -> Result<(), String> {
 	return Ok(());
 }
 
-/// Recursively collects every `.rs` path under `dir`, emitting a cargo:rerun-if-changed for each.
-/// An unreadable directory yields no entries rather than failing.
 fn walkdir(dir: &str) -> Vec<String> {
 	let mut out = Vec::new();
 	let Ok(rd) = fs::read_dir(dir) else {

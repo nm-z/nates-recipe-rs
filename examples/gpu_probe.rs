@@ -1,5 +1,3 @@
-// Proof-of-life: Rust drives the attached AMD GPU through gpu-core's hipblasSgemm.
-// Small case verifies correctness vs a CPU reference; large case measures f32 TFLOP/s.
 use anyhow::Context;
 use gpu_core::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
@@ -67,7 +65,6 @@ fn main() -> anyhow::Result<()> {
 	let d = 4096usize;
 	let xl: Vec<f32> = (0..d * d).map(|i| ((i % 17) as f32) * 0.01).collect();
 	let wl: Vec<f32> = (0..d * d).map(|i| ((i % 13) as f32) * 0.01).collect();
-	// warm up (allocs, hipblas handle, kernel load)
 	let _ = gpu_linear(&xl, &wl, d, d, d)?;
 	let t = Instant::now();
 	let reps = 5;

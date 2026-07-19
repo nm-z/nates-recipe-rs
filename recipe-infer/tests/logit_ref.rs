@@ -14,17 +14,10 @@
 use recipe_infer::llm::greedy;
 use std::path::Path;
 
-// llama.cpp tokenization of the prompt "Once upon a time".
 const PROMPT_TOKS: &[u32] = &[1, 403, 407, 261, 378];
 
-// llama.cpp greedy continuation (", there was a little girl"), the exact next
-// tokens after the prompt at --temp 0.
 const LLAMA_GREEDY: &[u32] = &[432, 383, 286, 261, 376, 298, 315, 421];
 
-// recipe-infer decodes in f64 and llama.cpp in f32, so deep into greedy decoding
-// accumulated rounding eventually flips a near-tie (here at position 6: this
-// 260K-param model scores several tokens within ~1e-2). Parity is asserted over
-// the stable prefix; a real forward bug diverges at token 0, not token 6.
 const STABLE: usize = 6;
 
 #[test]

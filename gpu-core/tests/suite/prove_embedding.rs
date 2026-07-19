@@ -1,14 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "embedding" inventory category.
-//
-// For every embedding-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core kernel on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE oracle (Rust gather /
-// scatter / textbook rotation / finite-difference). tol 1e-6.
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). Backward/grad names never
-// map to a forward op. Host-only / sparse / structural items stay as backlog.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -227,7 +217,6 @@ fn gpu_rope_bwd(dy: &[f64], cosb: &[f64], sinb: &[f64], n: usize, d: usize) -> V
 }
 
 // ── RoPE cos/sin cache (positions × inv_freq, base^(-2k/D)) ─────────────────
-// Shared by GPU and the independent Rust oracle so the rotation factors match.
 fn rope_cache(n: usize, d: usize, base: f64) -> (Vec<f64>, Vec<f64>) {
 	let half = d / 2;
 	let mut cosb = vec![0.0; n * half];
@@ -263,7 +252,6 @@ fn prove_lookup() -> bool {
 			want[i * d + j] = table[row as usize * d + j];
 		}
 	}
-	// value copy -> demand bit-exact equality
 	got == want
 }
 
@@ -313,7 +301,6 @@ fn prove_rope() -> bool {
 	let x: Vec<f64> = (0..n * d).map(|i| (i as f64) * 0.13 - 0.7).collect();
 	let (cosb, sinb) = rope_cache(n, d, base);
 	let got = gpu_rope(&x, &cosb, &sinb, n, d);
-	// Independent textbook NeoX rotation in Rust (NOT a second kernel call).
 	let mut want = vec![0.0; n * d];
 	for p in 0..n {
 		for k in 0..half {
@@ -328,10 +315,6 @@ fn prove_rope() -> bool {
 	close(&got, &want)
 }
 
-// Embedding lookup backward: grad_table[indices[i], :] += grad_out[i, :].
-// Uses the already-public gpu_core::attention::gpu_embedding_backward (f32
-// atomicAdd scatter). Oracle = independent Rust scatter-add. f32 accumulation,
-// so small N + modest magnitudes keep error well under 1e-5.
 fn prove_embedding_lookup_bwd() -> bool {
 	let (vocab, cols) = (5usize, 4usize);
 	let indices: [i32; 6] = [0, 2, 4, 2, 1, 0];
@@ -343,7 +326,6 @@ fn prove_embedding_lookup_bwd() -> bool {
 	gpu_core::attention::gpu_embedding_backward(&bg, &bi, n, cols, vocab, &gt).unwrap();
 	let mut got = vec![0.0f32; vocab * cols];
 	gt.download_f32(&mut got).unwrap();
-	// Rust scatter-add oracle
 	let mut want = vec![0.0f32; vocab * cols];
 	for (i, &row) in indices.iter().enumerate() {
 		for j in 0..cols {
@@ -355,18 +337,13 @@ fn prove_embedding_lookup_bwd() -> bool {
 		.all(|(a, b)| (a - b).abs() <= 1e-5 * (1.0 + b.abs()))
 }
 
-// RoPE backward proven by FINITE-DIFFERENCE of the GPU forward (not by asserting
-// the analytic transpose, which would be circular). For linear y=R(x), the VJP
-// dx = J^T dy where J = R; column j of J^T is obtained from a forward difference.
 fn prove_rope_bwd() -> bool {
 	let (n, d) = (3usize, 4usize);
 	let base = 10000.0;
 	let x: Vec<f64> = (0..n * d).map(|i| (i as f64) * 0.21 - 0.4).collect();
 	let (cosb, sinb) = rope_cache(n, d, base);
-	// pick an arbitrary upstream gradient dy
 	let dy: Vec<f64> = (0..n * d).map(|i| ((i as f64) * 0.17).cos()).collect();
 	let dx = gpu_rope_bwd(&dy, &cosb, &sinb, n, d);
-	// FD Jacobian-transpose-vector product:  dx_k = sum_m dy_m * dY_m/dx_k.
 	let h = 1e-6;
 	let y0 = gpu_rope(&x, &cosb, &sinb, n, d);
 	let mut dx_fd = vec![0.0; n * d];
@@ -380,15 +357,12 @@ fn prove_rope_bwd() -> bool {
 		}
 		dx_fd[k] = acc;
 	}
-	// FD carries O(h) error; loosen tolerance for this op only.
 	dx.iter()
 		.zip(&dx_fd)
 		.all(|(a, b)| (a - b).abs() <= 1e-4 * (1.0 + b.abs()))
 }
 
 // ── canonicalization: embedding-category JSON name -> registry key ──────────
-// strip lib/scope prefix, lowercase, last segment; map TRUE synonyms only.
-// *_backward / *_bwd / *_grad never collapse onto a forward op.
 fn canon(name: &str) -> String {
 	let lname = name.to_lowercase();
 	let is_bwd = lname.contains("backward")
@@ -396,7 +370,6 @@ fn canon(name: &str) -> String {
 		|| lname.ends_with("_grad")
 		|| lname.contains("grad");
 
-	// RoPE / rotary family
 	let is_rope = lname.contains("rope") || lname.contains("rotary");
 	if is_rope {
 		return if is_bwd {
@@ -406,7 +379,6 @@ fn canon(name: &str) -> String {
 		};
 	}
 
-	// embedding_bag family (pooled). torch._embedding_bag*, F.embedding_bag
 	if lname.contains("embedding_bag") || lname.contains("_bag") {
 		return if is_bwd {
 			"embedding_bag_bwd".to_string()
@@ -415,13 +387,10 @@ fn canon(name: &str) -> String {
 		};
 	}
 
-	// one_hot
 	if lname.contains("one_hot") {
 		return "one_hot".to_string();
 	}
 
-	// generic (dense) embedding-lookup backward: dense scatter-add of grad rows.
-	// sparse variant has a different (sparse) gradient layout -> stays backlog.
 	if (lname.contains("embedding_backward") || lname.contains("embedding_dense_backward"))
 		&& !lname.contains("sparse")
 		&& !lname.contains("_bag")
@@ -429,10 +398,6 @@ fn canon(name: &str) -> String {
 		return "embedding_lookup_bwd".to_string();
 	}
 
-	// plain embedding lookup family (token embedding gather)
-	// covers: torch.embedding/_embedding, F.embedding, tf.nn.embedding_lookup,
-	// faster_transformer.embedding_lookup, liger LigerEmbedding, keras Embedding,
-	// pltpu...lookup, __tpu$embedding_lookup, tfrs ...embedding_lookup, etc.
 	let is_lookupish = lname.contains("embedding_lookup")
 		|| lname.ends_with("embedding")
 		|| lname.contains("_embedding")
@@ -447,8 +412,6 @@ fn canon(name: &str) -> String {
 		return "embedding_lookup_bwd".to_string();
 	}
 
-	// backlog (unmapped): sparse/safe lookups, embedding_update, EmbLayerNorm,
-	// per_sample_weights_backward, learned/relative/sinusoidal positional, etc.
 	lname.rsplit(['.', ':', '$'])
 		.next()
 		.unwrap_or(&lname)
@@ -496,7 +459,6 @@ fn prove_embedding() {
 	let items = load_embedding();
 	assert!(!items.is_empty(), "no embedding items in inventory");
 
-	// Prove each registered op ONCE against its authoritative oracle.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	op_ok.insert("embedding_lookup", prove_lookup());
 	op_ok.insert("embedding_bag", prove_bag());
@@ -511,7 +473,6 @@ fn prove_embedding() {
 		.map(|(k, _)| *k)
 		.collect();
 
-	// Walk the inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

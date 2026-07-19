@@ -34,8 +34,6 @@ fn prompt_tokens() -> Result<Vec<u32>> {
 	return Ok(toks);
 }
 
-/// Greedy generation via full whole-sequence recompute at every step (the
-/// `dec == None` forward), the authoritative reference for the cached path.
 fn full_recompute_greedy(gguf: &Path, toks: &[u32], n: usize) -> Result<Vec<u32>> {
 	let mut seq = toks.to_vec();
 	let mut generated = Vec::with_capacity(n);
@@ -132,8 +130,6 @@ fn cached_matches_full_talkie() {
 
 #[test]
 fn cached_matches_full_falcon_h1_parallel() {
-	// Parallel hybrid: attention AND mamba-2 run in the SAME layer, so that layer
-	// carries both K/V and recurrent state — the strictest cache-shape case.
 	assert_cached_matches_full("falcon-h1-dense.gguf");
 }
 
@@ -147,13 +143,6 @@ fn cached_matches_full_nemotron_h_triage() {
 	assert_cached_matches_full("nemotron_h-dense.gguf");
 }
 
-/// Spill gate at the driver level: constraining the VRAM window below the sequence
-/// forces rows through the host mirror and the segmented ascending-carry attention
-/// walk, and the tokens must STILL equal the never-spilling resident decode. Two
-/// real crossings per arch: a prompt longer than the window (chunked prefill spills
-/// during prefill — brand-new path) and a window crossed mid-generation. The carry
-/// contract is bit-identical (kv_carry_equiv), so token equality is the expectation,
-/// not a tolerance.
 fn assert_spill_matches_resident(fixture: &str) {
 	let gguf = fixtures_dir().join(fixture);
 	if !gguf.exists() {
@@ -223,8 +212,6 @@ fn spill_matches_resident_talkie() {
 
 #[test]
 fn spill_matches_resident_falcon_h1_parallel() {
-	// Attention and mamba-2 in the SAME layer: K/V rows spill to the host mirror
-	// while the recurrent state must stay resident and exact.
 	assert_spill_matches_resident("falcon-h1-dense.gguf");
 }
 
@@ -238,9 +225,6 @@ fn spill_matches_resident_nemotron_h() {
 	assert_spill_matches_resident("nemotron_h-dense.gguf");
 }
 
-/// The unification is structural, not just behavioral: there is exactly one decode
-/// entry point and no full-recompute fallback method left in the tree. Reads the
-/// two committed decode source files and asserts the deleted symbols are gone.
 #[test]
 fn one_decode_method_no_fallback() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));

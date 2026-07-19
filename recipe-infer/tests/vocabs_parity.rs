@@ -25,8 +25,6 @@ fn cases(dir: &Path, stem: &str) -> Result<(Vec<String>, Vec<Vec<u32>>)> {
 	let out = fs::read_to_string(dir.join(format!("{stem}.gguf.out"))).context(".out")?;
 	let mut texts: Vec<String> =
 		inp.split("\n__ggml_vocab_test__\n").map(str::to_string).collect();
-	// The .inp ends with a trailing separator, so split yields a final empty
-	// element that is not a test case; drop it (interior empty tests are kept).
 	if texts.last().is_some_and(String::is_empty) {
 		texts.pop();
 	}

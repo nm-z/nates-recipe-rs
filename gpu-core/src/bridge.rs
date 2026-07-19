@@ -15,8 +15,6 @@ pub fn sync_chan<T>(depth: usize) -> Chan<T> {
 	return Chan { tx, rx };
 }
 
-/// # Errors
-/// Returns an error if the spill file at `path` cannot be opened for read/write.
 #[inline]
 pub fn open_spill(path: &Path) -> io::Result<File> {
 	return OpenOptions::new()

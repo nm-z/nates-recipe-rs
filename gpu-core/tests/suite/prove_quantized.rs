@@ -1,23 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "quantized" inventory category.
-//
-// Affine per-tensor quantization primitives proven on the gfx1101 GPU:
-//   quantize_per_tensor : q = clamp(round(x/scale)+zp, qmin, qmax)   (int exact)
-//   dequantize          : x = (q - zp) * scale                       (1e-6)
-//   fake_quant          : dequant(quant(x))                          (1e-6)
-// Each op is run on-device and checked against an authoritative std-f64 oracle
-// running the SAME textbook formula. quantize is asserted INTEGER-EXACT; dequant
-// and fake_quant at tol 1e-6. The round-trip bound |fake_quant(x)-x| <= scale/2
-// is asserted as the convention sanity check. int8 ([-128,127]) and int4 ([-8,7])
-// are both exercised; i8 storage rides through u8 buffers via two's-complement
-// bit reinterpretation (no upload_i8 in the API).
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). Float/
-// codebook formats (FP8/FP4/NF4), block/group formats (gptq/hqq/llama_cpp q*_K/
-// awq/ggml), quantized COMPUTE (QuantizedMatMul/Conv/lstm/embedding_bag), and
-// host-only param accessors (q_scale/q_zero_point/choose_qparams/int_repr) use a
-// different convention or are not the quant primitive — they stay backlog, never
-// counted, never faked green.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeSet;
@@ -80,7 +61,6 @@ const TOL: f64 = 1e-6;
 
 // ── GPU wrappers ─────────────────────────────────────────────────────────────
 
-// quantize: f64 x -> i8 codes (carried as u8 via two's complement reinterpret).
 fn gpu_quantize(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) -> Vec<i32> {
 	let bx = {
 		let __up = x;
@@ -112,7 +92,6 @@ fn gpu_quantize(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) 
 	codes_u8.iter().map(|&b| b as i8 as i32).collect()
 }
 
-// dequantize: i8 codes -> f64.
 fn gpu_dequantize(codes: &[i32], scale: f64, zp: i32) -> Vec<f64> {
 	let codes_u8: Vec<u8> = codes.iter().map(|&c| c as i8 as u8).collect();
 	let bq = {
@@ -139,7 +118,6 @@ fn gpu_dequantize(codes: &[i32], scale: f64, zp: i32) -> Vec<f64> {
 	out
 }
 
-// fake_quant: f64 x -> f64 (dequant of quant), stays on f64 buffer.
 fn gpu_fake_quant(x: &[f64], scale: f64, zp: i32, qmin: i32, qmax: i32, i4: bool) -> Vec<f64> {
 	let bx = {
 		let __up = x;
@@ -184,17 +162,12 @@ fn oracle_fake_quant(x: f64, scale: f64, zp: i32, qmin: i32, qmax: i32) -> f64 {
 	oracle_dequantize(oracle_quantize(x, scale, zp, qmin, qmax), scale, zp)
 }
 
-// Probes deliberately avoid x/scale landing on *.5 so the integer-exact assert
-// is not hostage to rounding-mode ties.
 fn probes(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 	(0..n).map(|i| lo + (hi - lo) * (i as f64 + 0.317) / n as f64)
 		.collect()
 }
 
 // ── inventory canonicalization ───────────────────────────────────────────────
-// Map a quantized-category JSON name to one of {quantize, dequantize, fake_quant}
-// when (and ONLY when) our affine int per-tensor kernels genuinely implement it.
-// Everything else returns None and stays backlog.
 fn canon(name: &str) -> Option<&'static str> {
 	let full = name.to_lowercase();
 	let b = name
@@ -204,40 +177,30 @@ fn canon(name: &str) -> Option<&'static str> {
 		.to_lowercase();
 
 	// ── library-prefix excludes (must test the FULL name, since the last
-	//    segment can collide with a legitimate op, e.g. exllamav2.dequantize
-	//    has segment "dequantize" identical to torch.dequantize) ──
-	// block/group/codebook-format libraries — per-block scales, not affine per-tensor:
 	if full.contains("awq") || full.contains("aqlm") || full.contains("ggml")
             || full.contains("gptq") || full.contains("hqq") || full.contains("llama_cpp")
             || full.contains("exllamav2") || full.contains("bitsandbytes") || full.contains("unsloth")
             || full.contains("marlin") || full.contains("flashinfer")
-            // deepspeed/te groupwise + fp quantizers:
             || full.contains("deepspeed") || full.contains("transformer_engine") || full.contains("__te$")
             || full.contains("cudnn") || full.contains("cutlass")
 	{
 		return None;
 	}
 
-	// Exclusions on the last segment — different convention or not the quant primitive.
-	// float / codebook formats (FP8/FP4/NF4):
 	if b.contains("fp8") || b.contains("fp4") || b.contains("nf4") {
 		return None;
 	}
-	// block/group-scale formats:
 	if b.contains("blockwise") || b.contains("block_scale") || b.contains("_2bit")
             || b.contains("_3bit") || b.contains("_4bit") || b.contains("to_4bit")
             || b.contains("_k") || b.starts_with("dequantize_q") || b.starts_with("dequantize_iq")
             || b.contains("gemm") || b.contains("packbits")
-            // per-channel needs a scale VECTOR through the kernel; per-tensor doesn't prove it:
             || b.contains("per_channel") || b.contains("perchannel")
 	{
 		return None;
 	}
-	// gradients / STE backward passes are a different function from the forward op:
 	if b.contains("grad") || b.contains("backward") {
 		return None;
 	}
-	// quantized compute (matmul/conv/relu/lstm/embedding/etc.) — has extra qualifiers:
 	if b.contains("matmul")
 		|| b.contains("conv")
 		|| b.contains("relu")
@@ -266,7 +229,6 @@ fn canon(name: &str) -> Option<&'static str> {
 	{
 		return None;
 	}
-	// host-only param accessors / qparam choosers / repr:
 	if b.contains("q_scale")
 		|| b.contains("q_zero_point")
 		|| b.contains("qparams")
@@ -277,12 +239,10 @@ fn canon(name: &str) -> Option<&'static str> {
 	{
 		return None;
 	}
-	// requantize (down-and-shrink / uniform requant) — combined rescale, not primitive:
 	if b.contains("requantize") || b.contains("shrinkrange") {
 		return None;
 	}
 
-	// fake_quant family (clamp+round then dequant) — check before quantize/dequant:
 	if b.contains("fake_quant")
 		|| b.contains("fakequant")
 		|| b.contains("quantizeanddequantize")
@@ -290,7 +250,6 @@ fn canon(name: &str) -> Option<&'static str> {
 	{
 		return Some("fake_quant");
 	}
-	// dequantize family:
 	if b.starts_with("dequantize")
 		|| b == "dequantize"
 		|| b.contains("uniformdequantize")
@@ -298,7 +257,6 @@ fn canon(name: &str) -> Option<&'static str> {
 	{
 		return Some("dequantize");
 	}
-	// quantize family (per-tensor affine):
 	if b.starts_with("quantize")
 		|| b == "quantize"
 		|| b.contains("uniformquantize")
@@ -356,15 +314,12 @@ fn prove_quantized() {
 
 	let mut failures: Vec<String> = Vec::new();
 
-	// Parameter sets exercised for each op. Mix of positive/negative zero_point,
-	// non-unit scale, asymmetric ranges.
 	let cfgs: &[(f64, i32)] = &[(0.05, 0), (0.1, -10), (0.02, 7), (0.25, 3)];
 
 	// ── int8 ([-128,127]) ───────────────────────────────────────────────────
 	let (qmin8, qmax8) = (-128, 127);
 	let xs8 = probes(-7.0, 7.0, 64);
 	for &(scale, zp) in cfgs {
-		// quantize: integer-EXACT vs oracle.
 		let gq = gpu_quantize(&xs8, scale, zp, qmin8, qmax8, false);
 		for (i, x) in xs8.iter().enumerate() {
 			let want = oracle_quantize(*x, scale, zp, qmin8, qmax8);
@@ -375,7 +330,6 @@ fn prove_quantized() {
 				));
 			}
 		}
-		// dequantize: 1e-6 vs oracle over full code range.
 		let codes: Vec<i32> = (qmin8..=qmax8).collect();
 		let gd = gpu_dequantize(&codes, scale, zp);
 		for (i, q) in codes.iter().enumerate() {
@@ -387,7 +341,6 @@ fn prove_quantized() {
 				));
 			}
 		}
-		// fake_quant: 1e-6 vs oracle + round-trip <= scale/2 sanity.
 		let gf = gpu_fake_quant(&xs8, scale, zp, qmin8, qmax8, false);
 		for (i, x) in xs8.iter().enumerate() {
 			let want = oracle_fake_quant(*x, scale, zp, qmin8, qmax8);
@@ -397,7 +350,6 @@ fn prove_quantized() {
 					x, scale, zp, gf[i], want
 				));
 			}
-			// round-trip bound only where x is inside the representable range.
 			let qv = oracle_quantize(*x, scale, zp, qmin8, qmax8);
 			if qv > qmin8 && qv < qmax8 && (gf[i] - x).abs() > scale / 2.0 + 1e-9 {
 				failures.push(format!(
@@ -434,7 +386,6 @@ fn prove_quantized() {
 				));
 			}
 		}
-		// int4 dequant reuses the same i8 dequant kernel (codes fit in i8).
 		let codes: Vec<i32> = (qmin4..=qmax4).collect();
 		let gd = gpu_dequantize(&codes, scale, zp);
 		for (i, q) in codes.iter().enumerate() {
@@ -467,12 +418,10 @@ fn prove_quantized() {
 		}
 	}
 
-	// Which canonical ops did we actually prove on-device (all green)?
 	let proven_ops: BTreeSet<&'static str> = ["quantize", "dequantize", "fake_quant"]
 		.into_iter()
 		.collect();
 
-	// Walk the inventory: count every item whose canon maps to a proven op.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<&'static str> = BTreeSet::new();
@@ -511,7 +460,6 @@ fn prove_quantized() {
 		failures
 	);
 	assert!(proven > 0, "zero quantized items proven");
-	// All three primitives must be genuinely proven on-device.
 	assert!(
 		proven_keys.contains("quantize")
 			&& proven_keys.contains("dequantize")

@@ -134,8 +134,6 @@ impl Deref for Data {
 		&self.inner
 	}
 }
-/// An empty encoded set used only as the non-dying fallback when a data
-/// preparation error is surfaced inline instead of aborting the process.
 fn empty_dataset() -> Dataset {
 	Dataset {
 		x: Mat::zeros([0, 0]),

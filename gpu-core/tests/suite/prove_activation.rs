@@ -1,17 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "activation" inventory category.
-//
-// For every activation-category item in kernel_inventory/*.json, canonicalize
-// its name; if that canonical op is registered here, run the gpu-core op on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE oracle (textbook
-// formula / std f64 / libm). tol 1e-6.
-//
-// New ops live in activationx.hip (this task). Existing public activation ops
-// (kernels.rs, k_actx, k_gapact) are ALSO registered so canon collapses the big
-// inventory clusters (relu/sigmoid/gelu/softmax/... across every framework) onto
-// their proven on-device implementation. Stochastic items (dropout family),
-// derivatives (*_backward/*Grad/*_bwd) and structural items (keras.layers.*,
-// stax.*, cutlass epilogues, generic Activation) stay backlog — not failures.
 
 use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
@@ -99,7 +86,6 @@ fn run_u(f: LaunchU, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-// existing k_* unary ops: (x, n, out) -> ()
 type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let b = {
@@ -342,7 +328,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 }
 
 // ── special-cased proofs for the multi-arg activationx ops ──────────────────
-// squareplus(x; b) = (x + sqrt(x^2 + b)) / 2 ; b chosen != 0.
 fn check_squareplus() -> Option<String> {
 	let b = 4.0;
 	let xs = probes(-3.0, 3.0, 32);
@@ -374,7 +359,6 @@ fn check_squareplus() -> Option<String> {
 	}
 	None
 }
-// star_relu(x; s, b) = s * relu(x)^2 + b ; s != 1 && b != 0 so test is non-vacuous.
 fn check_star_relu() -> Option<String> {
 	let (sc, b) = (0.8, -0.5);
 	let xs = probes(-3.0, 3.0, 32);
@@ -410,7 +394,6 @@ fn check_star_relu() -> Option<String> {
 	}
 	None
 }
-// prelu(x, alpha[]) = max(0,x) + alpha*min(0,x) ; per-element alpha array.
 fn check_prelu() -> Option<String> {
 	let xs = probes(-3.0, 3.0, 32);
 	let alpha: Vec<f64> = (0..xs.len())
@@ -450,7 +433,6 @@ fn check_prelu() -> Option<String> {
 	}
 	None
 }
-// glu(x): contiguous split; out[i] = a[i] * sigmoid(b[i]).
 fn check_glu() -> Option<String> {
 	let half = 24usize;
 	let mut x: Vec<f64> = probes(-3.0, 3.0, half);
@@ -483,7 +465,6 @@ fn check_glu() -> Option<String> {
 	}
 	None
 }
-// reglu(x): contiguous split; out[i] = a[i] * relu(b[i]).
 fn check_reglu() -> Option<String> {
 	let half = 24usize;
 	let mut x: Vec<f64> = probes(-3.0, 3.0, half);
@@ -516,7 +497,6 @@ fn check_reglu() -> Option<String> {
 	}
 	None
 }
-// crelu(x) = concat(relu(x), relu(-x)), out length 2n.
 fn check_crelu() -> Option<String> {
 	let xs = probes(-3.0, 3.0, 32);
 	let n = xs.len();
@@ -554,7 +534,6 @@ fn check_crelu() -> Option<String> {
 	}
 	None
 }
-// softmin(x) = softmax(-x) row-wise. Oracle = CPU stable softmax of -x.
 fn check_softmin() -> Option<String> {
 	let (rows, cols) = (5usize, 7usize);
 	let mut x = vec![0.0f64; rows * cols];
@@ -604,13 +583,11 @@ fn check_softmin() -> Option<String> {
 
 // ── canon: activation JSON name -> registry key (true synonyms only) ─────────
 fn canon(name: &str) -> String {
-	// last path/namespace segment, lowercased
 	let mut base = name
 		.rsplit(['.', ':', '$', '/'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
-	// strip framework-specific prefixes baked into the leaf
 	for p in [
 		"miopenactivationforward_",
 		"cudnnactivation_",
@@ -624,48 +601,38 @@ fn canon(name: &str) -> String {
 	}
 	base = base.trim_start_matches('_').to_string();
 	let alias: &[(&str, &str)] = &[
-		// relu family (true relu only; relu6 / leaky distinct)
 		("relu", "relu"),
 		("reluop", "relu"),
 		("cudnn_relu", "relu"),
 		("relu6", "relu6"),
-		// sigmoid
 		("sigmoid", "sigmoid"),
-		// tanh
 		("tanh", "tanh"),
-		// silu / swish are the same function
 		("silu", "silu"),
 		("swish", "silu"),
 		("siluop", "silu"),
 		("fused_silu", "silu"),
-		// gelu EXACT only (erf). tanh/new/fast/quick/approx variants -> backlog.
 		("gelu", "gelu"),
 		("geluop", "gelu"),
-		// elu / selu / celu
 		("elu", "elu"),
 		("selu", "selu"),
 		("celu", "celu"),
-		// mish / softplus / softsign
 		("mish", "mish"),
 		("softplus", "softplus"),
 		("softrelu", "softplus"),
 		("softsign", "softsign"),
 		("soft_sign", "softsign"),
-		// hard variants (distinct from smooth)
 		("hardswish", "hardswish"),
 		("hard_swish", "hardswish"),
 		("hardsigmoid", "hardsigmoid"),
 		("hard_sigmoid", "hardsigmoid"),
 		("hardtanh", "hardtanh"),
 		("hard_tanh", "hardtanh"),
-		// shrink / logsigmoid / thresholded
 		("tanhshrink", "tanhshrink"),
 		("softshrink", "softshrink"),
 		("hardshrink", "hardshrink"),
 		("logsigmoid", "logsigmoid"),
 		("log_sigmoid", "logsigmoid"),
 		("thresholdedrelu", "thresholdedrelu"),
-		// softmax (accurate/forward) and log_softmax
 		("softmax", "softmax"),
 		("softmaxop", "softmax"),
 		("soft_max", "softmax"),
@@ -674,10 +641,8 @@ fn canon(name: &str) -> String {
 		("logsoftmax", "log_softmax"),
 		("log_softmax", "log_softmax"),
 		("softmax_log", "log_softmax"),
-		// gated
 		("swiglu", "swiglu"),
 		("geglu", "geglu"),
-		// new activationx ops
 		("prelu", "prelu"),
 		("glu", "glu"),
 		("reglu", "reglu"),

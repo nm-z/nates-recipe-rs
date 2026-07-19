@@ -3,10 +3,6 @@ use gpu_core::memory::{
 	release_device_arena,
 };
 
-/// A per-message arena carve that exceeds the remaining claim must return an
-/// error, never abort the process. Reaching the assertions at all proves the
-/// old `process::abort()` path is gone; the message asserts the human-unit
-/// needs/has/short accounting the inference path surfaces inline.
 #[test]
 fn carve_miss_returns_error_with_human_message() {
 	let remain_bytes = 9_090_304usize;

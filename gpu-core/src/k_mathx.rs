@@ -4,13 +4,10 @@ use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
 
-/// Generates elementwise unary math launcher wrappers over the `launch_mx_*` HIP kernels.
 macro_rules! mx {
     ($($name:ident => $launch:ident),* $(,)?) => {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void); )* }
         $(
-            /// # Errors
-            /// Returns `HipError` if the length overflows `i32` or the kernel launch fails.
             #[inline]
             pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
                 let n = crate::kernels::ci(n)?;

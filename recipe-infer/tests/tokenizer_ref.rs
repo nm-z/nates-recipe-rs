@@ -20,8 +20,6 @@ fn spm_tokenization_matches_llama_cpp() {
 	let out = fs::read_to_string(dir.join("ggml-vocab-llama-spm.gguf.out")).expect("read .out");
 
 	let mut texts: Vec<&str> = inp.split("\n__ggml_vocab_test__\n").collect();
-	// The .inp ends with a trailing separator, so split yields a final empty
-	// element that is not a test case; drop it (interior empty tests are kept).
 	if texts.last() == Some(&"") {
 		texts.pop();
 	}
@@ -44,12 +42,6 @@ fn spm_tokenization_matches_llama_cpp() {
 		.filter(|(i, t)| encode(t) == expected[*i])
 		.count();
 
-	// KNOWN GAP (validated against llama.cpp, not hidden): recipe-infer builds an
-	// HF Unigram tokenizer, which diverges from llama.cpp's SPM bigram-merge on
-	// real multi-word text -- e.g. "Hello world" byte-fragments instead of the
-	// SPM tokens [15043, 3186]. Only ~26/46 fixtures match today. This is a real
-	// defect that makes standard llama models tokenize wrong end-to-end; it is
-	// pinned here so any fix or regression is visible rather than silent.
 	assert!(
 		matched >= 26,
 		"SPM/llama.cpp tokenizer parity regressed below the documented baseline: {matched}/46 match"

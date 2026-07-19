@@ -17,7 +17,6 @@ use std::process;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
-/// Declares the flag [`Opt`] struct, the [`Flag`] enum, and the global option state.
 macro_rules! flags {
 	($($f:ident),+) => {
 		#[derive(Clone, Copy, Default)]
@@ -73,10 +72,6 @@ pub fn opt() -> Opt {
 	return *OPT.lock().unwrap_or_else(PoisonError::into_inner);
 }
 
-/// The run's log path: inherited from `RECIPE_LOG` when a parent already chose
-/// one (exec'd children and subprocesses land in the same file), otherwise
-/// minted once per process tree from the start timestamp and exported so every
-/// descendant inherits it. One run, one log, regardless of PIDs.
 pub fn log_path() -> &'static str {
 	static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 	return PATH.get_or_init(|| {
@@ -98,7 +93,6 @@ pub fn log_path() -> &'static str {
 	});
 }
 
-/// Appends `t` to the run log (see [`log_path`]), ignoring any I/O error.
 fn log(t: &impl Display) {
 	if fs::create_dir_all("/tmp/recipe").is_err() {
 		return;
@@ -109,7 +103,6 @@ fn log(t: &impl Display) {
 	drop(writeln!(f, "{t}"));
 }
 
-/// Writes `t` to stderr, ignoring any I/O error.
 fn print(t: &impl Display) {
 	drop(writeln!(io::stderr(), "{t}"));
 }

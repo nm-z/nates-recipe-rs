@@ -8,7 +8,6 @@ use core::ffi::c_void;
 use core::ops::Div;
 use core::{cmp, mem, ptr};
 
-/// Aborts the process if the most recent HIP kernel launch recorded an error.
 pub(crate) fn check_launch() {
 	callspy::tick(&callspy::LAUNCH);
 	callspy::tick(&callspy::GET_LAST_ERROR);
@@ -22,7 +21,6 @@ pub(crate) fn check_launch() {
 	}
 }
 
-/// Casts `v` to [`i32`], aborting the process if it exceeds [`i32::MAX`].
 pub(crate) fn safe_i32(v: usize) -> i32 {
 	if let Ok(n) = i32::try_from(v) {
 		return n;
@@ -31,11 +29,6 @@ pub(crate) fn safe_i32(v: usize) -> i32 {
 	return i32::MAX;
 }
 
-/// Range-checks `v` and casts it to the `i32` an FFI launcher signature expects.
-///
-/// # Errors
-/// Returns [`HipError`] if `v` does not fit in [`i32`]; the offending value is
-/// named on stderr before the error bubbles.
 pub(crate) fn ci(v: usize) -> Result<i32, HipError> {
 	if let Ok(n) = i32::try_from(v) {
 		return Ok(n);
@@ -44,11 +37,6 @@ pub(crate) fn ci(v: usize) -> Result<i32, HipError> {
 	return Err(HipError(1));
 }
 
-/// Range-checks `v` and casts it to the `u32` an FFI launcher signature expects.
-///
-/// # Errors
-/// Returns [`HipError`] if `v` does not fit in [`u32`]; the offending value is
-/// named on stderr before the error bubbles.
 pub(crate) fn cu(v: usize) -> Result<u32, HipError> {
 	if let Ok(n) = u32::try_from(v) {
 		return Ok(n);
@@ -57,19 +45,15 @@ pub(crate) fn cu(v: usize) -> Result<u32, HipError> {
 	return Err(HipError(1));
 }
 
-/// Exact `a + b`, routed through `mul_add` so no bare float operator remains.
 const fn fadd(a: f64, b: f64) -> f64 {
 	return a.mul_add(1.0f64, b);
 }
 
-/// Exact `a / b`, dispatched through the `Div` trait so no bare float operator remains.
 fn fdiv(a: f64, b: f64) -> f64 {
 	return Div::div(a, b);
 }
 
-/// hipBLAS operation selector for a non-transposed matrix.
 const HIPBLAS_OP_N: u32 = 111;
-/// hipBLAS operation selector for a transposed matrix.
 const HIPBLAS_OP_T: u32 = 112;
 
 unsafe extern "C" {
@@ -1700,10 +1684,8 @@ thread_local! {
     static HIPSOLVER_HANDLE: AtomicPtr<c_void> = const { AtomicPtr::new(ptr::null_mut()) };
 }
 
-/// One-time guard flag for registering the process-exit GPU shutdown hook.
 static ATEXIT_REGISTERED: AtomicUsize = AtomicUsize::new(0);
 
-/// Process-exit hook: synchronizes the device, then runs GPU shutdown.
 #[inline]
 pub unsafe extern "C" fn atexit_gpu_shutdown() {
 	callspy::tick(&callspy::DEVICE_SYNCHRONIZE);
@@ -1713,7 +1695,6 @@ pub unsafe extern "C" fn atexit_gpu_shutdown() {
 	gpu_shutdown();
 }
 
-/// Returns the thread-local hipBLAS handle, lazily creating it on first use.
 pub(crate) fn hipblas_handle() -> *mut c_void {
 	callspy::tick(&callspy::HIPBLAS);
 	return HIPBLAS_HANDLE.with(|h| {
@@ -1765,7 +1746,6 @@ pub fn gpu_blas_workspace(buf: &GpuBuffer) {
 	}
 }
 
-/// Returns the thread-local hipSOLVER handle, creating it on first use.
 pub(crate) fn hipsolver_handle() -> *mut c_void {
 	return HIPSOLVER_HANDLE.with(|h| {
 		let ptr = h.load(Ordering::Relaxed);
@@ -1819,8 +1799,6 @@ pub fn gpu_shutdown() {
 	Write::block(device, callspy::report().serialize());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the hipBLAS call fails.
 #[inline]
 pub fn gpu_gemm(
 	mat_a: &GpuBuffer,
@@ -1854,8 +1832,6 @@ pub fn gpu_gemm(
 	return check(status);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the hipBLAS call fails.
 #[inline]
 pub fn gpu_gemm_at(
 	mat_a: &GpuBuffer,
@@ -1889,10 +1865,6 @@ pub fn gpu_gemm_at(
 	return check(status);
 }
 
-/// Multiplies `mat_a` by the transpose of `mat_b`, writing the result into `mat_c`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`], or the launch fails.
 #[inline]
 pub fn gpu_gemm_bt_into(
 	mat_a: &GpuBuffer,
@@ -1948,8 +1920,6 @@ pub fn gpu_cholesky_solve_workspace_bytes(n: usize) -> usize {
 	return size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a hipSOLVER/hipBLAS call fails or `n` exceeds [`i32`].
 #[inline]
 pub fn gpu_cholesky_solve(
 	a: &GpuBuffer,
@@ -2036,10 +2006,6 @@ pub fn gpu_cholesky_inv_workspace_bytes(n: usize) -> usize {
 	return gpu_cholesky_solve_workspace_bytes(n);
 }
 
-/// Inverts the SPD matrix `a` of order `n` into `out` using its Cholesky factor.
-///
-/// # Errors
-/// Returns [`HipError`] if a HIP solver/blas call fails or `n` overflows [`i32`].
 #[inline]
 pub fn gpu_cholesky_inv(
 	a: &GpuBuffer,
@@ -2158,10 +2124,6 @@ pub fn gpu_solve_getrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	return usize::try_from(lwork_s.max(1)).unwrap_or(0) * size_of::<f64>();
 }
 
-/// Solves the dense linear system `A x = b` on the GPU by LU factorization.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`] or a hipSOLVER call fails.
 #[inline]
 pub fn gpu_solve(
 	a: &GpuBuffer,
@@ -2260,8 +2222,6 @@ pub fn gpu_cholesky_workspace_bytes(n: usize) -> usize {
 	return usize::try_from(lwork.max(1)).unwrap_or(0) * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] when a dimension exceeds [`i32`] range or the hipSOLVER factorization fails.
 #[inline]
 pub fn gpu_cholesky(
 	a: &GpuBuffer,
@@ -2299,8 +2259,6 @@ pub fn gpu_cholesky(
 	return check(status);
 }
 
-/// # Errors
-/// Returns [`HipError`] when a dimension exceeds [`i32`] range or the hipBLAS solve fails.
 #[inline]
 pub fn gpu_tri_solve(
 	l: &GpuBuffer,
@@ -2336,8 +2294,6 @@ pub fn gpu_tri_solve(
 	return check(status);
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_add_diag(val: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: a and val are valid device buffers of length n and launch_add_diag touches only those n elements.
@@ -2353,8 +2309,6 @@ pub fn gpu_add_diag(val: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipE
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_reparameterize(
 	mu: &GpuBuffer,
@@ -2378,8 +2332,6 @@ pub fn gpu_reparameterize(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_kl_div(
 	mu: &GpuBuffer,
@@ -2401,8 +2353,6 @@ pub fn gpu_kl_div(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_vae_backward_latent(
 	grad_z: &GpuBuffer,
@@ -2433,8 +2383,6 @@ pub fn gpu_vae_backward_latent(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_log_det_cholesky(l: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -2446,8 +2394,6 @@ pub fn gpu_log_det_cholesky(l: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_scaled_exp(
 	x: &GpuBuffer,
@@ -2470,8 +2416,6 @@ pub fn gpu_scaled_exp(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sigmoid_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_sigmoid with device pointers from live buffers and a checked length
@@ -2488,8 +2432,6 @@ pub fn gpu_sigmoid_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), 
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if `n` overflows `i32`.
 #[inline]
 pub fn gpu_sigmoid_backward_into(
 	grad: &GpuBuffer,
@@ -2511,8 +2453,6 @@ pub fn gpu_sigmoid_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if `n` overflows `i32`.
 #[inline]
 pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_tanh_act with device pointers from live buffers and a checked length
@@ -2522,8 +2462,6 @@ pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns `HipError` if `n` overflows `i32`.
 #[inline]
 pub fn gpu_tanh_backward_into(
 	grad: &GpuBuffer,
@@ -2545,8 +2483,6 @@ pub fn gpu_tanh_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the element count overflows `i32`.
 #[inline]
 pub fn gpu_leaky_relu_into(
 	x: &GpuBuffer,
@@ -2568,8 +2504,6 @@ pub fn gpu_leaky_relu_into(
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if the element count overflows `i32`.
 #[inline]
 pub fn gpu_leaky_relu_backward_into(
 	grad: &GpuBuffer,
@@ -2593,8 +2527,6 @@ pub fn gpu_leaky_relu_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the element count overflows `i32`.
 #[inline]
 pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the launch reads only live GpuBuffer device allocations through valid FFI pointers.
@@ -2604,8 +2536,6 @@ pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if the element count overflows `i32`.
 #[inline]
 pub fn gpu_silu_backward_into(
 	grad: &GpuBuffer,
@@ -2627,9 +2557,6 @@ pub fn gpu_silu_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns a `HipError` if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_relu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the device pointers are live, ledgered allocations valid for `n` elements.
@@ -2646,9 +2573,6 @@ pub fn gpu_relu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns a `HipError` if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_relu_backward_into(
 	grad: &GpuBuffer,
@@ -2670,9 +2594,6 @@ pub fn gpu_relu_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns a `HipError` if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_add_into(
 	a: &GpuBuffer,
@@ -2695,8 +2616,6 @@ pub fn gpu_add_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_add_scalar(
 	x: &GpuBuffer,
@@ -2719,8 +2638,6 @@ pub fn gpu_add_scalar(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_div_into(
 	a: &GpuBuffer,
@@ -2742,15 +2659,11 @@ pub fn gpu_div_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Propagates any [`HipError`] from the underlying scale kernel launch.
 #[inline]
 pub fn gpu_scale_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	return gpu_scale_f64_inplace(scalar, n, x);
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_fma(
 	x: &GpuBuffer,
@@ -2775,8 +2688,6 @@ pub fn gpu_fma(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sgd_update(
 	grad: &GpuBuffer,
@@ -2798,8 +2709,6 @@ pub fn gpu_sgd_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `a`, `b`, and `out` are live device buffers of `n` f64 that outlive the launch.
@@ -2816,8 +2725,6 @@ pub fn gpu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_mul_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `a` and `b` are live device buffers of `n` f64 that outlive the launch.
@@ -2834,8 +2741,6 @@ pub fn gpu_mul_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_add_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `a` and `b` are live device buffers of `n` f64 that outlive the launch.
@@ -2853,8 +2758,6 @@ pub fn gpu_add_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if `n` overflows `i32`.
 #[inline]
 pub fn gpu_sub_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: a and b are live device buffers of at least n f64 elements; launch_sub only touches memory within those bounds.
@@ -2872,8 +2775,6 @@ pub fn gpu_sub_inplace(b: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if `n` overflows `i32`.
 #[inline]
 pub fn gpu_add_scalar_inplace(s: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: a is a live device buffer of at least n f64 elements and s a device scalar; launch_add_scalar stays within those bounds.
@@ -2891,8 +2792,6 @@ pub fn gpu_add_scalar_inplace(s: &GpuBuffer, n: usize, a: &GpuBuffer) -> Result<
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_linear_into(
 	xin: &GpuBuffer,
@@ -2959,8 +2858,6 @@ pub fn gpu_linear_into(
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_ss_res_into(
 	pred: &GpuBuffer,
@@ -2987,8 +2884,6 @@ pub fn gpu_ss_res_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_mse_into(
 	pred: &GpuBuffer,
@@ -3015,8 +2910,6 @@ pub fn gpu_mse_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_accuracy_into(
 	pred: &GpuBuffer,
@@ -3043,8 +2936,6 @@ pub fn gpu_accuracy_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_bce_grad_into(
 	pred: &GpuBuffer,
@@ -3068,8 +2959,6 @@ pub fn gpu_bce_grad_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `k` overflows [`i32`].
 #[inline]
 pub fn gpu_argmax_accuracy_into(
 	pred: &GpuBuffer,
@@ -3099,8 +2988,6 @@ pub fn gpu_argmax_accuracy_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_abs_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x is a live device buffer of length n and out holds n f64 slots; launch_abs reads x and writes out within bounds.
@@ -3117,8 +3004,6 @@ pub fn gpu_abs_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_log reads x and writes out, both valid device buffers of n f64 elements.
@@ -3135,8 +3020,6 @@ pub fn gpu_log_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i64`].
 #[inline]
 pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_copy_f64 copies n f64 elements from src to out, both valid device buffers.
@@ -3153,8 +3036,6 @@ pub fn gpu_copy_into(src: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), H
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` overflows [`i32`].
 #[inline]
 pub fn gpu_reduce_sum_cols_into(
 	x: &GpuBuffer,
@@ -3199,10 +3080,6 @@ pub fn gpu_reduce_sum_cols_workspace_bytes(rows: usize, cols: usize) -> usize {
 	}
 }
 
-/// Computes `out = w*x + b` on device (bias broadcast then GEMV).
-///
-/// # Errors
-/// Returns [`HipError`] if `n` or `in_dim` overflow [`i32`], or the GEMV call fails.
 #[inline]
 pub fn gpu_matvec_bias_into(
 	x: &GpuBuffer,
@@ -3246,8 +3123,6 @@ pub fn gpu_matvec_bias_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the hipBLAS gemv call fails.
 #[inline]
 pub fn gpu_dgemv_into(
 	a: &GpuBuffer,
@@ -3286,8 +3161,6 @@ pub fn gpu_dgemv_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the hipBLAS dger call fails.
 #[inline]
 pub fn gpu_dger_into(
 	grad: &GpuBuffer,
@@ -3328,8 +3201,6 @@ pub fn gpu_dger_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] on size overflow or launch failure.
 #[inline]
 pub fn gpu_layernorm_into(
 	x: &GpuBuffer,
@@ -3358,14 +3229,6 @@ pub fn gpu_layernorm_into(
 	return Ok(());
 }
 
-/// LayerNorm with optional affine params, mirroring llama.cpp `build_norm(x,
-/// gamma_or_null, beta_or_null, LLM_NORM)`: `None` gamma runs a non-parametric
-/// LayerNorm (mean-center + unit scale), a present gamma with `None` beta runs a
-/// gamma-only affine (zero bias). The kernel branches on the null pointers, so the
-/// runtime composes every norm variant from one op with no per-arch code.
-///
-/// # Errors
-/// Returns [`HipError`] on size overflow or launch failure.
 #[inline]
 pub fn gpu_layernorm_opt_into(
 	x: &GpuBuffer,
@@ -3396,8 +3259,6 @@ pub fn gpu_layernorm_opt_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] on size overflow or launch failure.
 #[inline]
 pub fn gpu_gelu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: pointers are live GpuBuffer allocations and the launcher reads/writes only the first n elements.
@@ -3414,8 +3275,6 @@ pub fn gpu_gelu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] on size overflow or launch failure.
 #[inline]
 pub fn gpu_gelu_backward_into(
 	grad: &GpuBuffer,
@@ -3437,8 +3296,6 @@ pub fn gpu_gelu_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_dropout_into(
 	x: &GpuBuffer,
@@ -3464,8 +3321,6 @@ pub fn gpu_dropout_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `seed` overflow the launcher integer type.
 #[inline]
 pub fn gpu_rand_uniform_into(seed: usize, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffer pointers are live GPU device allocations and the launch dimensions stay within their extents.
@@ -3476,8 +3331,6 @@ pub fn gpu_rand_uniform_into(seed: usize, n: usize, out: &GpuBuffer) -> Result<(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a launch dimension overflows `i32`.
 #[inline]
 pub fn gpu_softmax_ce_grad_into(
 	logits: &GpuBuffer,
@@ -3512,10 +3365,6 @@ pub fn gpu_splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
 	return splitk_dw_partials_elems(m, k, n);
 }
 
-/// Launches the split-K `dW` accumulation for the given shape into `grad_w`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`].
 #[inline]
 pub fn gpu_splitk_dw_into(
 	input: &GpuBuffer,
@@ -3547,8 +3396,6 @@ pub fn gpu_splitk_dw_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_linear_backward_weights_only_into(
 	grad: &GpuBuffer,
@@ -3583,8 +3430,6 @@ pub fn gpu_linear_backward_weights_only_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the backward GEMM launch fails.
 #[inline]
 pub fn gpu_linear_backward_full_into(
 	grad: &GpuBuffer,
@@ -3642,8 +3487,6 @@ pub fn gpu_linear_backward_full_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_layernorm_backward_full_into(
 	grad_y: &GpuBuffer,
@@ -3675,8 +3518,6 @@ pub fn gpu_layernorm_backward_full_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if `rows` or `cols` overflow `i32`.
 #[inline]
 pub fn gpu_softmax_rows_into(
 	x: &GpuBuffer,
@@ -3699,8 +3540,6 @@ pub fn gpu_softmax_rows_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if any dimension overflows `i32`.
 #[inline]
 pub fn gpu_flash_attention_into(
 	query: &GpuBuffer,
@@ -3731,8 +3570,6 @@ pub fn gpu_flash_attention_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_flash_attention_train_into(
 	query: &GpuBuffer,
@@ -3768,8 +3605,6 @@ pub fn gpu_flash_attention_train_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a launch dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_flash_attention_backward_into(
 	query: &GpuBuffer,
@@ -3841,8 +3676,6 @@ pub fn gpu_flash_attention_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `n` or `seed` overflows the launcher integer width.
 #[inline]
 pub fn gpu_bernoulli_into(
 	p: &GpuBuffer,
@@ -3866,8 +3699,6 @@ pub fn gpu_bernoulli_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size or dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_grad_hess_into(
 	probs: &GpuBuffer,
@@ -3902,8 +3733,6 @@ pub fn gpu_grad_hess_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size or dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_tb_histogram(
 	tr_bins: &GpuBuffer,
@@ -3937,8 +3766,6 @@ pub fn gpu_tb_histogram(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a launch dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_tb_split_eval(
 	grad_hist: &GpuBuffer,
@@ -3972,8 +3799,6 @@ pub fn gpu_tb_split_eval(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n_tr` or `p` overflows its target width.
 #[inline]
 pub fn gpu_tb_repartition(
 	tr_bins: &GpuBuffer,
@@ -4001,8 +3826,6 @@ pub fn gpu_tb_repartition(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n_tr` overflows its target width.
 #[inline]
 pub fn gpu_tb_leaf_sum(
 	grad: &GpuBuffer,
@@ -4029,8 +3852,6 @@ pub fn gpu_tb_leaf_sum(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n_leaves` overflows its target width.
 #[inline]
 pub fn gpu_tb_leaf_val(
 	node_sum_g: &GpuBuffer,
@@ -4056,8 +3877,6 @@ pub fn gpu_tb_leaf_val(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_tr` overflows `i32`.
 #[inline]
 pub fn gpu_tb_scatter(
 	node_assign: &GpuBuffer,
@@ -4079,8 +3898,6 @@ pub fn gpu_tb_scatter(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_tb_apply_tree(
 	te_bins: &GpuBuffer,
@@ -4110,8 +3927,6 @@ pub fn gpu_tb_apply_tree(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if allocation, memset, or a kernel launch fails.
 #[inline]
 pub fn gpu_tree_build_into(
 	train_bins: &GpuBuffer,
@@ -4231,8 +4046,6 @@ pub fn gpu_tree_build_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if the kernel launch fails.
 #[inline]
 pub fn gpu_mse_grad_into(
 	pred: &GpuBuffer,
@@ -4254,8 +4067,6 @@ pub fn gpu_mse_grad_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_softmax_ce_class_grad_f32(
 	class_ptr_buf: &GpuBuffer,
@@ -4286,8 +4097,6 @@ pub fn gpu_softmax_ce_class_grad_f32(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_logloss_grad_f32(
 	pred: &GpuBuffer,
@@ -4312,8 +4121,6 @@ pub fn gpu_logloss_grad_f32(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if `n` overflows `i32`.
 #[inline]
 pub fn gpu_argmax_f32(data: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: HIP kernel launch over live GpuBuffer device pointers; the size arg is range-checked.
@@ -4329,8 +4136,6 @@ pub fn gpu_argmax_f32(data: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(),
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if `n` overflows `i32`.
 #[inline]
 pub fn gpu_fill_f32(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: HIP kernel launch over live GpuBuffer device pointers; the size arg is range-checked.
@@ -4346,8 +4151,6 @@ pub fn gpu_fill_f32(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hi
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_argmax_write_split(
 	gain: &GpuBuffer,
@@ -4375,8 +4178,6 @@ pub fn gpu_argmax_write_split(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size argument overflows the launcher's integer type.
 #[inline]
 pub fn gpu_write_split(
 	feat: usize,
@@ -4400,8 +4201,6 @@ pub fn gpu_write_split(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size argument overflows the launcher's integer type.
 #[inline]
 pub fn gpu_oblivious_histogram(
 	bins_fm: &GpuBuffer,
@@ -4435,8 +4234,6 @@ pub fn gpu_oblivious_histogram(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if an integer argument overflows the launch integer type.
 #[inline]
 pub fn gpu_oblivious_route_step(
 	bins_rm: &GpuBuffer,
@@ -4466,8 +4263,6 @@ pub fn gpu_oblivious_route_step(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if an integer argument overflows the launch integer type.
 #[inline]
 pub fn gpu_oblivious_route_step_dev(
 	bins_rm: &GpuBuffer,
@@ -4497,8 +4292,6 @@ pub fn gpu_oblivious_route_step_dev(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_oblivious_route_full(
 	bins_rm: &GpuBuffer,
@@ -4526,8 +4319,6 @@ pub fn gpu_oblivious_route_full(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_scatter_add_by_leaf(
 	leaf_idx: &GpuBuffer,
@@ -4551,8 +4342,6 @@ pub fn gpu_scatter_add_by_leaf(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `n_rows` overflows `i32`.
 #[inline]
 pub fn gpu_leaf_reduce(
 	leaf_idx: &GpuBuffer,
@@ -4579,8 +4368,6 @@ pub fn gpu_leaf_reduce(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `n_leaves` overflows `i32`.
 #[inline]
 pub fn gpu_leaf_finalize(
 	leaf_grad: &GpuBuffer,
@@ -4605,8 +4392,6 @@ pub fn gpu_leaf_finalize(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_nodes`, `n_features`, or `n_bins` does not fit in [`i32`].
 #[inline]
 pub fn gpu_oblivious_split_eval(
 	grad_hist: &GpuBuffer,
@@ -4639,8 +4424,6 @@ pub fn gpu_oblivious_split_eval(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows` or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_softmax_inplace(n_rows: usize, n_classes: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	let n_rows_i32 = ci(n_rows)?;
@@ -4658,8 +4441,6 @@ pub fn gpu_softmax_inplace(n_rows: usize, n_classes: usize, x: &GpuBuffer) -> Re
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows` or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_logloss_grad_mc(
 	pred: &GpuBuffer,
@@ -4687,8 +4468,6 @@ pub fn gpu_logloss_grad_mc(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows` or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_accuracy(
 	pred: &GpuBuffer,
@@ -4714,8 +4493,6 @@ pub fn gpu_accuracy(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows`, `n_classes`, or `col` does not fit in [`i32`].
 #[inline]
 pub fn gpu_scatter_add_by_leaf_col(
 	leaf_idx: &GpuBuffer,
@@ -4744,8 +4521,6 @@ pub fn gpu_scatter_add_by_leaf_col(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds [`i32`].
 #[inline]
 pub fn gpu_add_col_scaled_inplace(
 	col: &GpuBuffer,
@@ -4774,8 +4549,6 @@ pub fn gpu_add_col_scaled_inplace(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds [`i32`].
 #[inline]
 pub fn gpu_sub(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -4794,8 +4567,6 @@ pub fn gpu_sub(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds [`i32`].
 #[inline]
 pub fn gpu_sub_scale_into(
 	a: &GpuBuffer,
@@ -4821,8 +4592,6 @@ pub fn gpu_sub_scale_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_avg_pool_1d(
 	input: &GpuBuffer,
@@ -4849,8 +4618,6 @@ pub fn gpu_avg_pool_1d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_pool_grad_expand(
 	grad: &GpuBuffer,
@@ -4875,8 +4642,6 @@ pub fn gpu_pool_grad_expand(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_argmin_rows(
 	dists: &GpuBuffer,
@@ -4898,8 +4663,6 @@ pub fn gpu_argmin_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the device transfer or synchronize fails.
 #[inline]
 pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; n];
@@ -4918,8 +4681,6 @@ pub fn download_assignments(buf: &GpuBuffer, n: usize) -> Result<Vec<i32>, HipEr
 	return Ok(result);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_centroid_update(
 	x: &GpuBuffer,
@@ -4947,8 +4708,6 @@ pub fn gpu_centroid_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when a dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_topk_per_row(
 	dists: &GpuBuffer,
@@ -4972,8 +4731,6 @@ pub fn gpu_topk_per_row(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` if the device-to-host copy or synchronization fails.
 #[inline]
 pub fn download_topk_indices(buf: &GpuBuffer, rows: usize, k: usize) -> Result<Vec<i32>, HipError> {
 	let n = rows * k;
@@ -4993,8 +4750,6 @@ pub fn download_topk_indices(buf: &GpuBuffer, rows: usize, k: usize) -> Result<V
 	return Ok(result);
 }
 
-/// # Errors
-/// Returns `HipError` when a dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_bias_add(
 	x: &GpuBuffer,
@@ -5019,14 +4774,6 @@ pub fn gpu_bias_add(
 	return Ok(());
 }
 
-/// Causal depthwise conv1d + per-channel bias + SiLU, token-major in/out.
-/// `x`/`out` are `[t, d_inner]` token-major; `conv_w` is `[d_inner, d_conv]`
-/// channel-major (tap-contiguous). The conv is per-channel over time with an
-/// implicit `(d_conv-1)` left zero-pad, matching ggml_ssm_conv on a zeroed
-/// state prefix. Fused, so the SSM conv step costs one launch and no allocation.
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_ssm_conv_causal_silu(
 	x: &GpuBuffer,
@@ -5063,13 +4810,6 @@ pub fn gpu_ssm_conv_causal_silu(
 	return Ok(());
 }
 
-/// Causal depthwise conv1d with optional per-channel bias, NO activation (lfm2
-/// shortconv: the raw conv output is gated downstream by `C`, not SiLU'd). Same
-/// `[T, d_inner]` token-major layout and `(d_conv-1)` left zero-pad as
-/// [`gpu_ssm_conv_causal_silu`].
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 pub fn gpu_ssm_conv_causal(
 	x: &GpuBuffer,
 	conv_w: &GpuBuffer,
@@ -5105,15 +4845,6 @@ pub fn gpu_ssm_conv_causal(
 	return Ok(());
 }
 
-/// Fused Mamba-1 selective scan (ggml-cuda/ssm-scan.cu:83-113). One thread per
-/// inner channel holds an `N=d_state` private state across the whole `t` loop,
-/// folding softplus(dt), exp(dt*A), the B/x accumulate, the C readout and the D
-/// skip. `xc`/`dt`/`y` are `[t, d_inner]` token-major; `a` is `[d_inner, d_state]`
-/// channel-major used directly (already `-exp(A_log)`); `b`/`c` are `[t, d_state]`
-/// single-group; `d` is `[d_inner]`.
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_ssm_scan_mamba1(
@@ -5152,16 +4883,6 @@ pub fn gpu_ssm_scan_mamba1(
 	return Ok(());
 }
 
-/// Fused Mamba-2 grouped selective scan (ggml ssm-scan.cu mamba2 branch). One
-/// thread per inner channel holds an `N=d_state` private state across the whole
-/// `t` loop. `a`/`d` are per-head scalars `[n_head]` (used directly); `dt` is
-/// `[t, n_head]` per-head; `xbc` is the conv+SiLU output `[t, conv_dim]` whose
-/// first `d_inner` columns are `x` and whose grouped `B`/`C` blocks (offset
-/// `d_inner`) the kernel indexes by group `g = h/(n_head/n_group)`. `y` is
-/// `[t, d_inner]` token-major with the `D` skip folded in.
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_ssm_scan_mamba2(
@@ -5202,14 +4923,6 @@ pub fn gpu_ssm_scan_mamba2(
 	return Ok(());
 }
 
-/// Grouped RMSNorm with per-group gamma (Mamba-2 gated norm). The gated `[t,
-/// d_inner]` buffer is flattened to `rows = t*n_group` rows of `dpg =
-/// d_inner/n_group`; each row RMS-normalizes over `dpg` then scales by
-/// `gamma[(row % n_group)*dpg + j]`. `gamma` is `ssm_norm [dpg, n_group]`.
-/// In-place safe (`out` may alias `x`).
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_ssm_group_rmsnorm(
 	x: &GpuBuffer,
@@ -5238,13 +4951,6 @@ pub fn gpu_ssm_group_rmsnorm(
 	return Ok(());
 }
 
-/// Per-row L2 normalize (ggml_l2_norm): `out[row,j] = x[row,j] /
-/// max(sqrt(sum_j x^2), eps)`. Distinct from RMSNorm (no `1/cols`, no gamma; eps
-/// floors the divisor rather than adding under the root). `rows = t*n_head`,
-/// `cols = head_dim`, one block per row. In-place safe.
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_l2norm_rows(
 	x: &GpuBuffer,
@@ -5269,18 +4975,6 @@ pub fn gpu_l2norm_rows(
 	return Ok(());
 }
 
-/// Fused gated delta-rule scan (delta-net-base.cpp `build_delta_net_autoregressive`,
-/// applied sequentially over the `t` prompt tokens; state starts at zero, no
-/// cross-call cache). Per head, per token: decay `S[i,j] *= exp(g*a[h])`, `sk[j]
-/// = sum_i S[i,j]k[i]`, `d[j] = beta*(v[j]-sk[j])`, `S[i,j] += k[i]d[j]`, `o[j] =
-/// sum_i S[i,j]q[i]` with `q` pre-scaled by `scale`. One workgroup per head, `d`
-/// threads; thread `j` holds state column `S[:,j]` privately across the whole `t`
-/// loop. `q`/`k`/`v`/`out` are `[t, hv*d]` token-major head-major; `g` is `[t,hv]`
-/// for GDA (`per_channel=false`) or `[t,hv*d]` for KDA (`per_channel=true`);
-/// `beta` is `[t,hv]`; `a` is `[hv]` (the per-head `-exp(A_log)` decay coefficient).
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_gated_delta_scan(
@@ -5323,12 +5017,6 @@ pub fn gpu_gated_delta_scan(
 	return Ok(());
 }
 
-/// Per-row scalar multiply: `out[r, c] = x[r, c] * s[r]`, one scalar per row.
-/// The gated shared-expert token gate (qwen3.5/next) scales each token's expert
-/// output by a per-token sigmoid scalar. In-place safe.
-///
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_row_scale(
 	x: &GpuBuffer,
@@ -5353,8 +5041,6 @@ pub fn gpu_row_scale(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_lstm_cell(
 	gates: &GpuBuffer,
@@ -5378,8 +5064,6 @@ pub fn gpu_lstm_cell(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_gaussian_ll(
 	x: &GpuBuffer,
@@ -5409,9 +5093,6 @@ pub fn gpu_gaussian_ll(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns [`HipError`] if a dimension argument overflows `i32`.
 #[inline]
 pub fn gpu_im2col_1d(
 	x: &GpuBuffer,
@@ -5437,9 +5118,6 @@ pub fn gpu_im2col_1d(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns [`HipError`] if a dimension argument overflows `i32`.
 #[inline]
 pub fn gpu_argmax_rows(
 	x: &GpuBuffer,
@@ -5461,8 +5139,6 @@ pub fn gpu_argmax_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_reduce_sum_rows(
 	x: &GpuBuffer,
@@ -5496,8 +5172,6 @@ pub fn gpu_reduce_sum_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_reduce_mean_cols(
 	x: &GpuBuffer,
@@ -5531,8 +5205,6 @@ pub fn gpu_reduce_mean_cols(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `rows` or `cols` overflows `i32`.
 #[inline]
 pub fn gpu_reduce_var_cols(
 	x: &GpuBuffer,
@@ -5563,8 +5235,6 @@ pub fn gpu_reduce_var_cols(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `nq`, `nt`, or `dim` overflows `i32`.
 #[inline]
 pub fn gpu_pairwise_l2(
 	query: &GpuBuffer,
@@ -5593,10 +5263,6 @@ pub fn gpu_pairwise_l2(
 	return Ok(());
 }
 
-/// Partially argsorts `data` (`n` elements), writing the sorted indices to `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_partial_argsort(
 	data: &GpuBuffer,
@@ -5626,10 +5292,6 @@ pub fn gpu_partial_argsort(
 	return Ok(());
 }
 
-/// Downloads `k` [`i32`] indices from device buffer `buf` into a host [`Vec`].
-///
-/// # Errors
-/// Returns [`HipError`] if the device-to-host copy or synchronize fails.
 #[inline]
 pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError> {
 	let mut result = vec![0i32; k];
@@ -5648,10 +5310,6 @@ pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError>
 	return Ok(result);
 }
 
-/// Fills `mask` with a Bernoulli draw of probability `p` over `n` elements.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`] or `seed` in [`u32`].
 #[inline]
 pub fn gpu_bernoulli_u8(
 	p: &GpuBuffer,
@@ -5675,10 +5333,6 @@ pub fn gpu_bernoulli_u8(
 	return Ok(());
 }
 
-/// Applies the precomputed dropout `mask` and `scale` to `x`, writing to `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_dropout_u8_into(
 	x: &GpuBuffer,
@@ -5703,10 +5357,6 @@ pub fn gpu_dropout_u8_into(
 	return Ok(());
 }
 
-/// Concatenates `a` and `b` column-wise into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_concat_into(
 	a: &GpuBuffer,
@@ -5736,10 +5386,6 @@ pub fn gpu_concat_into(
 	return Ok(());
 }
 
-/// Copies the leading `take` columns of each row of `src` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_slice_lead_into(
 	src: &GpuBuffer,
@@ -5767,8 +5413,6 @@ pub fn gpu_slice_lead_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_im2col_2d(
 	xin: &GpuBuffer,
@@ -5802,8 +5446,6 @@ pub fn gpu_im2col_2d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if `n` overflows `i32`.
 #[inline]
 pub fn gpu_exp(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_exp reads x and writes out only for the n elements passed.
@@ -5814,8 +5456,6 @@ pub fn gpu_exp(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -5827,8 +5467,6 @@ pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_neg(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -5840,8 +5478,6 @@ pub fn gpu_neg(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sign_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -5858,8 +5494,6 @@ pub fn gpu_sign_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_pow(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -5877,8 +5511,6 @@ pub fn gpu_pow(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_clamp_into(
 	x: &GpuBuffer,
@@ -5904,8 +5536,6 @@ pub fn gpu_clamp_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_transpose(
 	x: &GpuBuffer,
@@ -5929,8 +5559,6 @@ pub fn gpu_transpose(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_pack_upper_tri(
 	factor: &GpuBuffer,
@@ -5952,8 +5580,6 @@ pub fn gpu_pack_upper_tri(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_eye(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -5965,8 +5591,6 @@ pub fn gpu_eye(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_where_mask(
 	cond: &GpuBuffer,
@@ -5991,8 +5615,6 @@ pub fn gpu_where_mask(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_slice_rows(
 	x: &GpuBuffer,
@@ -6027,8 +5649,6 @@ pub fn gpu_slice_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size argument overflows [`i32`].
 #[inline]
 pub fn gpu_broadcast_sub_into(
 	x: &GpuBuffer,
@@ -6055,8 +5675,6 @@ pub fn gpu_broadcast_sub_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_broadcast_mul(
 	x: &GpuBuffer,
@@ -6083,8 +5701,6 @@ pub fn gpu_broadcast_mul(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_broadcast_div(
 	x: &GpuBuffer,
@@ -6111,8 +5727,6 @@ pub fn gpu_broadcast_div(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_softmax_backward_into(
 	grad: &GpuBuffer,
@@ -6136,8 +5750,6 @@ pub fn gpu_softmax_backward_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_log_softmax_rows(
 	x: &GpuBuffer,
@@ -6159,8 +5771,6 @@ pub fn gpu_log_softmax_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_cross_entropy(
 	logits: &GpuBuffer,
@@ -6184,8 +5794,6 @@ pub fn gpu_cross_entropy(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_gather_rows_into(
 	table: &GpuBuffer,
@@ -6210,8 +5818,6 @@ pub fn gpu_gather_rows_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `cols` overflows `i32`, or the kernel launch fails.
 #[inline]
 pub fn gpu_scatter_add(
 	indices: &GpuBuffer,
@@ -6237,8 +5843,6 @@ pub fn gpu_scatter_add(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n`, `p`, `ks`, or `out_len` overflows `i32`, or the kernel launch fails.
 #[inline]
 pub fn gpu_col2im_1d(
 	patches: &GpuBuffer,
@@ -6269,8 +5873,6 @@ pub fn gpu_col2im_1d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_col2im_2d(
 	patches: &GpuBuffer,
@@ -6305,8 +5907,6 @@ pub fn gpu_col2im_2d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_max_pool_1d(
 	input: &GpuBuffer,
@@ -6332,8 +5932,6 @@ pub fn gpu_max_pool_1d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds `i32` or a device operation fails.
 #[inline]
 pub fn gpu_max_pool_1d_backward(
 	grad: &GpuBuffer,
@@ -6360,8 +5958,6 @@ pub fn gpu_max_pool_1d_backward(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_avg_pool_2d(
 	input: &GpuBuffer,
@@ -6399,8 +5995,6 @@ pub fn gpu_avg_pool_2d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds [`i32`] or the kernel launch fails.
 #[inline]
 pub fn gpu_avg_pool_2d_backward(
 	grad: &GpuBuffer,
@@ -6439,8 +6033,6 @@ pub fn gpu_avg_pool_2d_backward(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when a pooling dimension overflows `i32`.
 #[inline]
 pub fn gpu_max_pool_2d(
 	input: &GpuBuffer,
@@ -6480,8 +6072,6 @@ pub fn gpu_max_pool_2d(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the zeroing memset fails or a dimension exceeds [`i32`].
 #[inline]
 pub fn gpu_max_pool_2d_backward(
 	grad: &GpuBuffer,
@@ -6514,8 +6104,6 @@ pub fn gpu_max_pool_2d_backward(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows`/`cols` exceed `i32` range or the kernel launch fails.
 #[inline]
 pub fn gpu_reduce_max_rows(
 	x: &GpuBuffer,
@@ -6549,8 +6137,6 @@ pub fn gpu_reduce_max_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows`/`cols` exceed `i32` range or the kernel launch fails.
 #[inline]
 pub fn gpu_reduce_max_cols(
 	x: &GpuBuffer,
@@ -6584,8 +6170,6 @@ pub fn gpu_reduce_max_cols(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` does not fit in [`i32`].
 #[inline]
 pub fn gpu_reduce_min_rows(
 	x: &GpuBuffer,
@@ -6616,8 +6200,6 @@ pub fn gpu_reduce_min_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` does not fit in [`i32`].
 #[inline]
 pub fn gpu_reduce_min_cols(
 	x: &GpuBuffer,
@@ -6648,8 +6230,6 @@ pub fn gpu_reduce_min_cols(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_gt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_gt is an FFI launcher over live GpuBuffer pointers with a range-checked length and a valid null stream.
@@ -6665,8 +6245,6 @@ pub fn gpu_gt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_lt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_lt is an FFI launcher over live GpuBuffer pointers with a range-checked length and a valid null stream.
@@ -6682,8 +6260,6 @@ pub fn gpu_lt(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_eq(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_eq is an FFI launcher over live GpuBuffer pointers with a range-checked length and a valid null stream.
@@ -6699,8 +6275,6 @@ pub fn gpu_eq(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_gt_scalar(
 	x: &GpuBuffer,
@@ -6722,8 +6296,6 @@ pub fn gpu_gt_scalar(
 	check_launch();
 	return Ok(());
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_lt_scalar(
 	x: &GpuBuffer,
@@ -6746,8 +6318,6 @@ pub fn gpu_lt_scalar(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `c` overflows `i32`.
 #[inline]
 pub fn gpu_batchnorm_forward(
 	x: &GpuBuffer,
@@ -6781,8 +6351,6 @@ pub fn gpu_batchnorm_forward(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `c` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_batchnorm_inference(
 	x: &GpuBuffer,
@@ -6816,8 +6384,6 @@ pub fn gpu_batchnorm_inference(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `c` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_batchnorm_backward(
 	grad_y: &GpuBuffer,
@@ -6851,9 +6417,6 @@ pub fn gpu_batchnorm_backward(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns `HipError` if `t` or `n` overflows `i32`.
 #[inline]
 pub fn gpu_adam_update(
 	grad: &GpuBuffer,
@@ -6887,9 +6450,6 @@ pub fn gpu_adam_update(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns `HipError` if `t` or `n` overflows `i32`.
 #[inline]
 pub fn gpu_adamw_update(
 	grad: &GpuBuffer,
@@ -6925,9 +6485,6 @@ pub fn gpu_adamw_update(
 	return Ok(());
 }
 
-/// # Errors
-///
-/// Returns `HipError` if `n` or `hs` overflows `i32`.
 #[inline]
 pub fn gpu_gru_cell(
 	gates: &GpuBuffer,
@@ -6953,8 +6510,6 @@ pub fn gpu_gru_cell(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a device-to-device copy or the device synchronize fails.
 #[inline]
 pub fn gpu_vconcat(
 	a: &GpuBuffer,
@@ -6991,8 +6546,6 @@ pub fn gpu_vconcat(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a slice dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_slice_cols(
 	x: &GpuBuffer,
@@ -7021,8 +6574,6 @@ pub fn gpu_slice_cols(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_tril_mask(fill_val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launcher reads valid device buffers for the passed extent.
@@ -7033,8 +6584,6 @@ pub fn gpu_tril_mask(fill_val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_fill(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launcher writes a valid device buffer for the passed length.
@@ -7045,8 +6594,6 @@ pub fn gpu_fill(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErr
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a row count does not fit in [`i32`].
 #[inline]
 pub fn gpu_repeat_rows(
 	src: &GpuBuffer,
@@ -7069,8 +6616,6 @@ pub fn gpu_repeat_rows(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_upsample_nearest_2d(
 	input: &GpuBuffer,
@@ -7100,10 +6645,6 @@ pub fn gpu_upsample_nearest_2d(
 	return Ok(());
 }
 
-/// Computes the log-sum-exp of each row of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `rows` or `cols` does not fit in [`i32`].
 #[inline]
 pub fn gpu_log_sum_exp_rows(
 	x: &GpuBuffer,
@@ -7125,10 +6666,6 @@ pub fn gpu_log_sum_exp_rows(
 	return Ok(());
 }
 
-/// Clips `x` in place so its global L2 norm does not exceed `max_norm`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_grad_clip_norm(
 	max_norm: &GpuBuffer,
@@ -7150,8 +6687,6 @@ pub fn gpu_grad_clip_norm(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `n` overflows `i32`.
 #[inline]
 pub fn gpu_prefix_sum_inclusive(
 	x: &GpuBuffer,
@@ -7179,8 +6714,6 @@ pub fn gpu_prefix_sum_inclusive(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when `n` overflows `i32`.
 #[inline]
 pub fn gpu_prefix_sum_exclusive(
 	x: &GpuBuffer,
@@ -7208,8 +6741,6 @@ pub fn gpu_prefix_sum_exclusive(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a dimension overflows `i32`.
 #[inline]
 pub fn gpu_histogram_build(
 	bins: &GpuBuffer,
@@ -7243,8 +6774,6 @@ pub fn gpu_histogram_build(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size or dimension overflows `i32`.
 #[inline]
 pub fn gpu_split_eval(
 	gh: &GpuBuffer,
@@ -7276,8 +6805,6 @@ pub fn gpu_split_eval(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size or dimension overflows `i32`.
 #[inline]
 pub fn gpu_data_partition(
 	bins: &GpuBuffer,
@@ -7308,8 +6835,6 @@ pub fn gpu_data_partition(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a GPU allocation or kernel launch fails.
 #[inline]
 pub fn gpu_add_col(
 	matrix: &GpuBuffer,
@@ -7355,8 +6880,6 @@ pub fn gpu_add_col(
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if a GPU op, download, or a class index is out of range.
 #[inline]
 pub fn gpu_report(
 	logits: &GpuBuffer,
@@ -7394,8 +6917,6 @@ pub fn gpu_report(
 	return Ok(ba);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a kernel launch or synchronization fails.
 #[inline]
 pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(), HipError> {
 	let dp_size = ci((m + 1) * (n + 1))?;
@@ -7424,8 +6945,6 @@ pub fn gpu_dtw(cost: &GpuBuffer, m: usize, n: usize, dp: &GpuBuffer) -> Result<(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_itemset_support(
 	trans: &GpuBuffer,
@@ -7457,8 +6976,6 @@ pub fn gpu_itemset_support(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_candidate_generate(
 	freq: &GpuBuffer,
@@ -7485,8 +7002,6 @@ pub fn gpu_candidate_generate(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a launch argument exceeds the integer range.
 #[inline]
 pub fn gpu_randn(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i = ci(n)?;
@@ -7499,8 +7014,6 @@ pub fn gpu_randn(n: usize, seed: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a launch argument exceeds the integer range.
 #[inline]
 pub fn gpu_lgbm_histogram(
 	bins_fm: &GpuBuffer,
@@ -7536,8 +7049,6 @@ pub fn gpu_lgbm_histogram(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a launch argument exceeds the integer range.
 #[inline]
 pub fn gpu_lgbm_hist_subtract(
 	dst_slot: usize,
@@ -7565,10 +7076,6 @@ pub fn gpu_lgbm_hist_subtract(
 	return Ok(());
 }
 
-/// Picks the best-gain split across evaluated features from the `LightGBM` bin histograms.
-///
-/// # Errors
-/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_lgbm_best_split(
 	grad_hist: &GpuBuffer,
@@ -7608,10 +7115,6 @@ pub fn gpu_lgbm_best_split(
 	return Ok(());
 }
 
-/// Reduces per-row gradients and hessians into per-leaf sums.
-///
-/// # Errors
-/// Returns [`HipError`] if `n_rows` does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_lgbm_leaf_reduce(
 	node_idx: &GpuBuffer,
@@ -7637,8 +7140,6 @@ pub fn gpu_lgbm_leaf_reduce(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_goss_sample(
 	sorted_idx: &GpuBuffer,
@@ -7668,8 +7169,6 @@ pub fn gpu_goss_sample(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_leaf_split_apply(
 	bins_fm: &GpuBuffer,
@@ -7705,8 +7204,6 @@ pub fn gpu_leaf_split_apply(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if any conv dimension overflows `i32`.
 #[inline]
 pub fn gpu_conv1d_into(
 	xin: &GpuBuffer,
@@ -7742,8 +7239,6 @@ pub fn gpu_conv1d_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size or stride argument exceeds [`i32`].
 #[inline]
 pub fn gpu_conv1d_backward_data_into(
 	dy: &GpuBuffer,
@@ -7777,8 +7272,6 @@ pub fn gpu_conv1d_backward_data_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] when a size or stride argument exceeds [`i32`].
 #[inline]
 pub fn gpu_conv1d_backward_filter_into(
 	dy: &GpuBuffer,
@@ -7826,10 +7319,6 @@ pub fn gpu_conv1d_backward_filter_into(
 	return Ok(());
 }
 
-/// Accumulates the conv1d bias gradient into `db` from the upstream gradient `dy`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit the launcher's `i32` params.
 #[inline]
 pub fn gpu_conv1d_backward_bias_into(
 	dy: &GpuBuffer,

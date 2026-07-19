@@ -1,10 +1,3 @@
-// Data-driven proof for the elementwise_unary category on a LIVE gfx1101 GPU.
-// For every canonical op we register a GPU fn + an AUTHORITATIVE CPU oracle
-// (std f64 / libm / scipy-textbook formula) and assert byte-for-byte agreement
-// within tol over a per-op input domain. Predicate ops (isnan/isinf/isfinite/
-// signbit) are fed pathological inputs (+/-inf, NaN, -0.0) so the assertion is
-// not vacuously true. New ops live in src/kernels/elementwise_unaryx.hip and are
-// reached through the auto-wired launch_elementwise_unaryx_* C symbols.
 
 use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
@@ -148,7 +141,6 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		gpu_rsqrt, gpu_sin, gpu_tan, gpu_trunc,
 	};
 
-	// selu carries two scalar params (alpha, lambda); wrap to the standard unary form.
 	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 		let a = {
 			let __up = &[1.6732632423543772f64];
@@ -170,7 +162,6 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	let dom1 = probes(-0.95, 0.95, 64); // (-1,1) for asin/acos/atanh
 	let gt1 = probes(1.01, 5.0, 64); // (1,inf) for acosh
 	let prob01 = probes(0.02, 0.98, 64); // (0,1) for logit
-	// pathological inputs for predicate ops — without these the assert is vacuous
 	let patho: Vec<f64> = vec![
 		f64::NEG_INFINITY,
 		-3.5,
@@ -324,7 +315,6 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	e!("tanh", gpu_tanh_into, |x| x.tanh(), std_probe);
 	e!("trunc", gpu_trunc, |x| x.trunc(), std_probe);
 	{
-		// elu/leaky_relu take a param; wrap to the standard unary form
 		fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			let a = {
 				let __up = &[1.0f64];
@@ -413,7 +403,6 @@ fn registry() -> BTreeMap<&'static str, Op> {
 		|x| 10f64.powf(x),
 		std_probe
 	);
-	// predicate ops: pathological inputs make the assertion non-vacuous
 	nw!(
 		"isnan",
 		launch_elementwise_unaryx_isnan,

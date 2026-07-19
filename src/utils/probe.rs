@@ -529,9 +529,6 @@ fn bench_cpu_read(bytes: usize) -> f64 {
 	bytes as f64 / best / 1e9
 }
 
-/// Delegates to [`gpu_core::tiered::data_dir`], the one spill-dir owner shared
-/// by the training OOC spill, the KV-cache spill, and the disk-tier budget
-/// measurement.
 pub fn data_dir() -> anyhow::Result<PathBuf> {
 	return gpu_core::tiered::data_dir().map_err(|e| anyhow::anyhow!("data_dir: {e}"));
 }

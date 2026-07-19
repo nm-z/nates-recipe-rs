@@ -17,8 +17,6 @@ use std::fmt;
 use std::mem;
 use std::path::Path;
 
-/// The encoded numeric result handed to the trainer: feature matrix `x`, flat
-/// `n*n_targets` target vector `y`, and the column metadata the model needs.
 pub struct Dataset {
 	pub x: Mat,
 	pub y: Vec1,
@@ -41,8 +39,6 @@ fn tokenize(s: &str) -> impl Iterator<Item = String> + '_ {
 		.map(|t| t.to_ascii_lowercase())
 }
 
-/// Filename → stem (drop directory + extension) so a CSV cell like
-/// `train/train_0001.png` matches an image vector keyed by `train_0001`.
 fn file_stem(s: &str) -> &str {
 	Path::new(s)
 		.file_stem()
@@ -108,10 +104,6 @@ fn distinct_sorted(rows: &[Vec<String>], j: usize) -> Vec<String> {
 	cats
 }
 
-/// Column kinds come precomputed from `Data::set()` (`pre`); a mismatch is a
-/// wiring bug. Detection happens at load, never here: a column with neither a
-/// known attr nor a precomputed kind is a wiring bug, not a cue to run the
-/// detector mid-run.
 fn infer_attrs(
 	headers: &[String],
 	rows: &[Vec<String>],
@@ -194,11 +186,6 @@ fn infer_attrs(
 		.collect())
 }
 
-/// Encode one column purely by its `Kind` — identical whether the column is a
-/// feature or a target. Role only decides where the produced columns are routed
-/// (X vs Y), never how they're encoded. An image column holds filenames — it is
-/// the JOIN KEY into an image vector (handled in `assemble`), not a feature
-/// itself, so it emits no columns.
 fn encode_kind(
 	attr: &Attr,
 	rows: &[Vec<String>],
@@ -274,17 +261,6 @@ fn encode_kind(
 	}
 }
 
-/// Attention is O(seq²) per row in both memory and compute; an unbounded text
-/// column (e.g. a 9641-token LLM response) makes a single row's score matrix
-/// tens of GB, so token sequences are bounded to a context window — a no-op for
-/// ordinary short text, a truncation only for long-form outliers. Image columns
-/// are join keys, not features (zero feature width). Each encoded feature
-/// column is scattered straight into the row-major output and dropped, instead
-/// of accumulating every column and copying afterwards — holding both was a
-/// full second copy of the ~n×proj_w matrix (the measured 2× peak). A
-/// categorical TARGET encodes to ONE class-index column (0..N-1), not a
-/// one-hot — the trainer expands it to the model's output width for CE;
-/// features keep their one-hot encoding.
 fn encode(
 	attrs: &[Attr],
 	rows: &[Vec<String>],
@@ -395,9 +371,6 @@ fn oom_pair(name: &str, val: &str) -> String {
 	format!("{name}: {val}")
 }
 
-/// The one typed over-ceiling error: raised here where the budgets are measured,
-/// matched by type (never by message text) in the training crate's preflight to
-/// skip the scenario.
 #[derive(Debug)]
 pub struct CeilingExceeded {
 	pub label: String,
@@ -423,16 +396,6 @@ impl fmt::Display for CeilingExceeded {
 
 impl error::Error for CeilingExceeded {}
 
-/// Admit check for both the per-group encode and the cross-group selection. The
-/// run stops for two reasons, decided from live budgets (`tiered::admit`) before
-/// the matrix is built: the encoded matrix `n × w × 8B` exceeds the combined
-/// VRAM+RAM+disk ceiling, or it exceeds the host-RAM budget alone — encode
-/// materializes the full matrix in RAM before the fit can stream it, so the disk
-/// tier is unreachable during this phase and admitting against it produced 64 GB
-/// allocator aborts instead of diagnostics. On rejection it prints a one-line
-/// autopsy (largest bucket first) then returns the typed `CeilingExceeded`.
-/// Overflow pages spill to a file beside the cwd (NVMe), so the disk tier is
-/// sized against that filesystem's free space.
 fn admit_ceiling(
 	n: usize,
 	w: usize,
@@ -503,9 +466,6 @@ fn admit_ceiling(
 	.into())
 }
 
-/// Fallible host allocation for a row-major `n × w` matrix. `admit_ceiling`
-/// bounds the steady state; this catches allocator refusal under concurrent
-/// memory pressure so the failure stays a diagnostic instead of an abort.
 fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 	let cells = n.saturating_mul(w);
 	let mut dat: Vec<f64> = Vec::new();
@@ -529,24 +489,17 @@ fn alloc_matrix(n: usize, w: usize, label: &str) -> anyhow::Result<Vec<f64>> {
 
 type Schema = BTreeMap<String, Vec<Attr>>;
 
-/// One table group's kinds, detected at `Data::set` time: the group name and its
-/// per-column kinds (positional to the group's headers).
 pub struct GroupKinds {
 	pub name: String,
 	pub cols: Vec<ColKind>,
 }
 
-/// One column's detected kind: its header name and the kind integer.
 pub struct ColKind {
 	pub header: String,
 	pub kind: usize,
 }
-/// Detected kinds for every table group of a `Data` source set. Threads from the
-/// builder into `infer_attrs` so the detector's GPU classification runs at load
-/// time, not inside the training run's measured init window.
 pub type PreKinds = Vec<GroupKinds>;
 
-/// Precomputed kinds for one group, matched by group name.
 fn group_pre<'a>(pre: Option<&'a [GroupKinds]>, name: &str) -> Option<&'a [ColKind]> {
 	pre.and_then(|p| p.iter().find(|g| g.name == name).map(|g| g.cols.as_slice()))
 }
@@ -565,14 +518,6 @@ struct Assembled {
 }
 
 impl Assembled {
-	/// Left-compaction fast path: when every kept column comes from a single
-	/// source matrix whose row-gather is the identity and whose column indices
-	/// stay ascending, the selection is that matrix's own columns in place —
-	/// reusing its buffer instead of allocating a second full n×w matrix
-	/// (holding both doubled peak RAM). In place is safe because each read
-	/// index `i*big_w + col` ≥ its write index `i*w + jc`, so no cell is
-	/// overwritten before it is read. Otherwise the general path gathers across
-	/// sources / non-identity joins into a fresh matrix.
 	fn select(&mut self, keep: &[String]) -> anyhow::Result<Mat> {
 		let n = self.samples;
 		let w = keep.len();
@@ -709,11 +654,6 @@ fn group_hashes(g: &DirGroup) -> &[String] {
 	}
 }
 
-/// Joins sample tables with image vectors: a dir of files is a vector indexed
-/// by filename, and a sample column of filenames is a vector of those keys
-/// (the "column of filenames" in the user's abstraction). For each image
-/// vector, picks the sample column whose cell stems best match its filenames,
-/// then gathers each row's image by that key (index = filename, dat = image).
 fn assemble(
 	groups: &[DirGroup],
 	targets: &[String],
@@ -1046,17 +986,12 @@ fn onehot_group_indices(feats: &[String]) -> Vec<GroupSpan> {
 	groups
 }
 
-/// The single NaN strategy: `Drop` reports the finite rows (caller removes them
-/// from every column), `ImputeMean` fills NaN with the column's finite mean in
-/// place, `Error` panics on any NaN.
 pub enum Nan {
 	Drop,
 	ImputeMean,
 	Error,
 }
 
-/// THE one NaN-handling function — applied to a single column-vector. Returns the
-/// row indices to keep (every row except for `Drop`, which keeps only finite ones).
 pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 	match strategy {
 		Nan::ImputeMean => {
@@ -1087,10 +1022,6 @@ pub fn nan_clean(v: &mut [f64], strategy: Nan, name: &str) -> Vec<usize> {
 	}
 }
 
-/// The ONE call site: apply the NaN policy once per column-vector as a dataset
-/// enters the numeric pipeline. Targets use `Drop` (a missing label can't be
-/// invented); features use `ImputeMean`. Afterwards the matrix holds no NaN, so
-/// nothing downstream handles NaN again.
 pub fn clean_dataset(d: &mut Dataset) -> anyhow::Result<()> {
 	let k = d.n_targets;
 	let n = d.x.nrows();
@@ -1143,9 +1074,6 @@ pub fn clean_dataset(d: &mut Dataset) -> anyhow::Result<()> {
 	return Ok(());
 }
 
-/// ARFF / pre-parsed path: `attrs` + `rows` are already in hand (the loader ran
-/// up in the builder), so encode directly, optionally splitting or encoding a
-/// separate test file the same way.
 pub fn prepare_arff_data(
 	attrs: &[Attr],
 	rows: &[Vec<String>],
@@ -1211,12 +1139,6 @@ pub struct PreparedArff {
 	pub test: Option<Dataset>,
 }
 
-/// Table path (CSV/dir/zip): load groups, resolve targets (via the caller's
-/// `resolve` closure, which lives up in the builder), assemble + join, select
-/// the kept feature columns, and optionally split or align a separate test set.
-/// Test reuses the train schema as `known` — no precomputed kinds needed; a
-/// test-only column absent from the train schema panics in `infer_attrs`,
-/// because detection runs at load, never mid-run.
 pub fn prepare_table_data(
 	sources: &[String],
 	test_path: Option<&str>,

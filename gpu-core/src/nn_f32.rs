@@ -7,7 +7,6 @@ use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
 
-/// hipBLAS operation code selecting a non-transposed matrix.
 const HIPBLAS_OP_N: u32 = 111;
 
 unsafe extern "C" {
@@ -181,7 +180,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Polls the last HIP launch error and maps it to a [`HipError`].
 fn check_launch() -> Result<(), HipError> {
 	tick(&LAUNCH);
 	tick(&GET_LAST_ERROR);
@@ -190,7 +188,6 @@ fn check_launch() -> Result<(), HipError> {
 	return check(err);
 }
 
-/// Converts `v` to `i32`, aborting the process when it exceeds `i32::MAX`.
 fn safe_i32(v: usize) -> i32 {
 	if let Ok(n) = i32::try_from(v) {
 		return n;
@@ -199,8 +196,6 @@ fn safe_i32(v: usize) -> i32 {
 	return i32::MAX;
 }
 
-/// # Errors
-/// Returns [`HipError`] if a HIP launch or GEMM call fails.
 #[inline]
 pub fn gpu_linear_f32(
 	input: &GpuBuffer,
@@ -246,8 +241,6 @@ pub fn gpu_linear_f32(
 	return check(status);
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x and out outlive the launch; ptr_raw yields valid device pointers and n is range-checked.
@@ -262,8 +255,6 @@ pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return check_launch();
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_relu_backward_f32(
 	grad: &GpuBuffer,
@@ -284,8 +275,6 @@ pub fn gpu_relu_backward_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `Err` if the kernel launch reports failure.
 #[inline]
 pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
@@ -300,8 +289,6 @@ pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `Err` if the kernel launch reports failure.
 #[inline]
 pub fn gpu_gelu_backward_f32(
 	grad: &GpuBuffer,
@@ -322,8 +309,6 @@ pub fn gpu_gelu_backward_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `Err` if the kernel launch reports failure.
 #[inline]
 pub fn gpu_layernorm_f32(
 	x: &GpuBuffer,
@@ -350,8 +335,6 @@ pub fn gpu_layernorm_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `Err` if the kernel launch reports failure.
 #[inline]
 pub fn gpu_layernorm_backward_f32(
 	grad_y: &GpuBuffer,
@@ -382,8 +365,6 @@ pub fn gpu_layernorm_backward_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns a [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_bias_add_f32(
 	x: &GpuBuffer,
@@ -406,8 +387,6 @@ pub fn gpu_bias_add_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns a [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_avg_pool_2d_f32(
 	input: &GpuBuffer,
@@ -444,8 +423,6 @@ pub fn gpu_avg_pool_2d_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns a [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_avg_pool_2d_backward_f32(
 	grad_out: &GpuBuffer,
@@ -482,8 +459,6 @@ pub fn gpu_avg_pool_2d_backward_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns a [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_max_pool_2d_f32(
 	input: &GpuBuffer,
@@ -522,8 +497,6 @@ pub fn gpu_max_pool_2d_f32(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns a [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_max_pool_2d_backward_f32(
 	grad_out: &GpuBuffer,
@@ -554,10 +527,6 @@ pub fn gpu_max_pool_2d_backward_f32(
 	return check_launch();
 }
 
-/// Launches the fused LSTM cell kernel.
-///
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_lstm_cell_f32(
 	gates: &GpuBuffer,
@@ -580,10 +549,6 @@ pub fn gpu_lstm_cell_f32(
 	return check_launch();
 }
 
-/// Launches the fused GRU cell kernel.
-///
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_gru_cell_f32(
 	gates: &GpuBuffer,
@@ -606,10 +571,6 @@ pub fn gpu_gru_cell_f32(
 	return check_launch();
 }
 
-/// Launches the half-precision `ReLU` kernel.
-///
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
@@ -624,10 +585,6 @@ pub fn gpu_relu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return check_launch();
 }
 
-/// Launches the half-precision GELU kernel.
-///
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
@@ -642,10 +599,6 @@ pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 	return check_launch();
 }
 
-/// Launches the half-precision elementwise add kernel.
-///
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_add_f16(
 	a: &GpuBuffer,
@@ -666,8 +619,6 @@ pub fn gpu_add_f16(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if the kernel launch fails.
 #[inline]
 pub fn gpu_mul_f16(
 	a: &GpuBuffer,
@@ -688,8 +639,6 @@ pub fn gpu_mul_f16(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if the kernel launch fails.
 #[inline]
 pub fn gpu_sgd_update_f32(
 	grad: &GpuBuffer,

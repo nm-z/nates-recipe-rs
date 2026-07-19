@@ -1,17 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "foreach" inventory category.
-//
-// torch._foreach_<op> applies <op> elementwise across a LIST of tensors. The
-// per-element math is identical to the ordinary op; flattening the tensorlist to
-// one contiguous buffer makes foreach a single elementwise launch over the whole
-// batch. So each foreachx_ kernel is proven by running it on the LIVE gfx1101 GPU
-// over a flattened multi-tensor batch and comparing against an AUTHORITATIVE CPU
-// oracle (std f64 / libm) elementwise, tol 1e-6.
-//
-// canon() maps every foreach inventory name (in-place `_`, _scalar/_tensor/_list
-// overloads, alias suffixes) to one registry key, so one proven op honestly
-// covers all its variants. Pure host-only items (apex.*, transformer_engine.*,
-// multi_tensor_*, foreach_map) stay backlog — never faked.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -20,7 +7,6 @@ use std::fs;
 use std::ptr;
 
 unsafe extern "C" {
-	// unary x -> out
 	fn launch_foreachx_neg(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_abs(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_sqrt(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
@@ -50,7 +36,6 @@ unsafe extern "C" {
 	fn launch_foreachx_erf(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_erfc(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_lgamma(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
-	// binary a,b -> out
 	fn launch_foreachx_add(
 		a: *const c_void,
 		b: *const c_void,
@@ -157,8 +142,6 @@ fn run_b(f: LaunchB, a: &[f64], b: &[f64]) -> Vec<f64> {
 	out
 }
 
-// A flattened multi-tensor batch: emulates a foreach over a tensorlist of 3
-// tensors of unequal length (5+3+7=15 elems), mapped linearly onto [lo,hi].
 fn batch(lo: f64, hi: f64) -> Vec<f64> {
 	let n = 15usize;
 	(0..n).map(|i| lo + (hi - lo) * (i as f64 + 0.5) / n as f64)
@@ -402,15 +385,11 @@ fn check(op: &Op) -> bool {
 	})
 }
 
-// Canonicalize a foreach inventory name to a registry key.
 fn canon(name: &str) -> String {
-	// last dotted segment, lowercase
 	let mut s = name.rsplit('.').next().unwrap_or(name).to_lowercase();
-	// strip leading _foreach_ (and any leading underscores)
 	if let Some(p) = s.find("_foreach_") {
 		s = s[p + "_foreach_".len()..].to_string();
 	}
-	// strip overload suffixes (longest first), repeatedly
 	let suffixes = [
 		"_scalarlist",
 		"_tensorlist",
@@ -432,11 +411,9 @@ fn canon(name: &str) -> String {
 			break;
 		}
 	}
-	// strip trailing in-place underscore
 	if s.ends_with('_') {
 		s.pop();
 	}
-	// norm/norm_2 alias to norm (host-only, stays backlog regardless)
 	s
 }
 
@@ -511,7 +488,6 @@ fn prove_foreach() {
 		proven_keys.iter().cloned().collect::<Vec<_>>().join(", ")
 	);
 
-	// explicit per-op asserts for the mandated core 9
 	for k in [
 		"add", "sub", "mul", "div", "neg", "abs", "sqrt", "exp", "sigmoid",
 	] {

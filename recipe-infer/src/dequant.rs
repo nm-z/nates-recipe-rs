@@ -1,13 +1,7 @@
 use anyhow::{Result, bail, ensure};
 
-/// The one dtype enum, re-exported. `gpu-core` owns it at the bottom of the
-/// DAG because device buffers are typed by it and its kernels convert between
-/// its variants; this codec surface decodes the same variants on the host.
-/// There is no second dtype enum to keep in sync — adding type N+1 is one
-/// variant there, one kernel case, and one codec arm here.
 pub use gpu_core::memory::{Dtype, ImgFmt, ImgLayout};
 
-/// Short name for an image layout, used to label its codec.
 fn img_nm(l: ImgLayout) -> &'static str {
       return match l {
             ImgLayout::L8 => "img8",
@@ -30,9 +24,6 @@ fn img_nm(l: ImgLayout) -> &'static str {
       };
 }
 
-/// Either a borrowed static codec (the fixed quant/float grid) or an owned,
-/// parameterised codec (ints, mini-floats, typeless widths, images). `get`
-/// hands back the trait object either way, so `convert` sees one surface.
 enum Cx {
       S(&'static dyn Codec),
       Own(Box<dyn Codec>),
@@ -47,7 +38,6 @@ impl Cx {
       }
 }
 
-/// Map a GGML type tag to a `Dtype`; unknown tags bail rather than guess.
 pub fn from_ggml(t: u32) -> Result<Dtype> {
       let d = match t {
             0 => Dtype::F32,
@@ -68,10 +58,6 @@ pub fn from_ggml(t: u32) -> Result<Dtype> {
       return Ok(d);
 }
 
-/// The codec for this dtype. Every variant of the one enum is answered
-/// here or named in the error — the IQ family is declared in `Dtype` (the
-/// gguf grid includes it) but has no codec on either side yet, so asking
-/// for one fails by name instead of decoding as something else.
 fn codec(d: Dtype) -> Result<Cx> {
       let cx = match d {
             Dtype::F32 => Cx::S(&F32C),
@@ -173,9 +159,6 @@ fn codec(d: Dtype) -> Result<Cx> {
       return Ok(cx);
 }
 
-/// One block layout + codec per dtype. `decode_block` consumes exactly
-/// `block_bytes` and appends `block_elems` f32 values; `encode_block` is the
-/// inverse. Quant codecs implement decode only.
 trait Codec: Sync {
       fn name(&self) -> &'static str;
       fn block_bytes(&self) -> usize;
@@ -184,7 +167,6 @@ trait Codec: Sync {
       fn encode_block(&self, vals: &[f32], out: &mut Vec<u8>) -> Result<()>;
 }
 
-/// THE conversion surface: decode every `src` block to f32, re-encode as `dst`.
 pub fn convert(src: Dtype, dst: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
       let scx = codec(src)?;
       let dcx = codec(dst)?;
@@ -218,10 +200,6 @@ pub fn convert(src: Dtype, dst: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
       return Ok(out);
 }
 
-/// Block layout `(block_bytes, block_elems)` for a GGML type.
-///
-/// # Errors
-/// Returns an error naming the unsupported GGML type tag.
 pub fn block_layout(t: u32) -> Result<(usize, usize)> {
       let d = from_ggml(t)?;
       let cx = codec(d)?;
@@ -229,14 +207,11 @@ pub fn block_layout(t: u32) -> Result<(usize, usize)> {
       return Ok((c.block_bytes(), c.block_elems()));
 }
 
-/// # Errors
-/// Returns an error naming the unsupported GGML type tag.
 pub fn nbytes_for(t: u32, elems: usize) -> Result<usize> {
       let (block_bytes, block_elems) = block_layout(t)?;
       return Ok((elems / block_elems) * block_bytes);
 }
 
-/// Decode `bytes` of GGML type `t` to f32 values via the one conversion surface.
 pub fn dequant_f32(t: u32, bytes: &[u8]) -> Result<Vec<f32>> {
       let raw = convert(from_ggml(t)?, Dtype::F32, bytes)?;
       let out = raw
@@ -246,7 +221,6 @@ pub fn dequant_f32(t: u32, bytes: &[u8]) -> Result<Vec<f32>> {
       return Ok(out);
 }
 
-/// Decode `bytes` of GGML type `t` to little-endian bf16 bytes.
 pub fn dequant_bf16(t: u32, bytes: &[u8]) -> Result<Vec<u8>> {
       return convert(from_ggml(t)?, Dtype::BF16, bytes);
 }
@@ -385,8 +359,6 @@ impl Codec for Bf16Codec {
       }
 }
 
-/// Q4_0: `dequantize_row_q4_0` (ggml/src/ggml-quants.c). 18B/32: `d`(f16) then
-/// 16 packed nibbles; each nibble minus 8, scaled by `d`.
 struct Q40Codec;
 static Q40C: Q40Codec = Q40Codec;
 impl Codec for Q40Codec {
@@ -417,8 +389,6 @@ impl Codec for Q40Codec {
       }
 }
 
-/// Q4_1: `dequantize_row_q4_1` (ggml/src/ggml-quants.c). 20B/32: `d`,`m`(f16)
-/// then 16 packed nibbles; `nibble*d + m`.
 struct Q41Codec;
 static Q41C: Q41Codec = Q41Codec;
 impl Codec for Q41Codec {
@@ -448,8 +418,6 @@ impl Codec for Q41Codec {
       }
 }
 
-/// Q5_0: `dequantize_row_q5_0` (ggml/src/ggml-quants.c). 22B/32: `d`(f16),
-/// 32-bit high-bit field, then 16 low nibbles; `(q - 16)*d`.
 struct Q50Codec;
 static Q50C: Q50Codec = Q50Codec;
 impl Codec for Q50Codec {
@@ -482,8 +450,6 @@ impl Codec for Q50Codec {
       }
 }
 
-/// Q5_1: `dequantize_row_q5_1` (ggml/src/ggml-quants.c). 24B/32: `d`,`m`(f16),
-/// 32-bit high-bit field, then 16 low nibbles; `q*d + m`.
 struct Q51Codec;
 static Q51C: Q51Codec = Q51Codec;
 impl Codec for Q51Codec {
@@ -537,10 +503,6 @@ impl Codec for Q80Codec {
             }
             return Ok(());
       }
-      /// `quantize_row_q8_0_ref` (ggml/src/ggml-quants.c): 127 levels against
-      /// the block's own max. `d` is stored f16 but the quantization divides by
-      /// the unrounded f32 `d`, so the round trip can exceed half a step by the
-      /// f16 error of the scale — the reference behaviour, matched exactly.
       fn encode_block(&self, vals: &[f32], out: &mut Vec<u8>) -> Result<()> {
             let amax = vals.iter().fold(0f32, |a, &v| return a.max(v.abs()));
             let d = amax / 127.0;
@@ -553,8 +515,6 @@ impl Codec for Q80Codec {
       }
 }
 
-/// Q2_K: `dequantize_row_q2_K` (ggml/src/ggml-quants.c). 84B/256: `scales`[16],
-/// `qs`[64], then `d`,`dmin`(f16). 2-bit quants with per-16 4-bit scale+min.
 struct Q2KCodec;
 static Q2KC: Q2KCodec = Q2KCodec;
 impl Codec for Q2KCodec {
@@ -599,9 +559,6 @@ impl Codec for Q2KCodec {
       }
 }
 
-/// Q3_K: `dequantize_row_q3_K` (ggml/src/ggml-quants.c). 110B/256: `hmask`[32],
-/// `qs`[64], `scales`[12], then `d`(f16). 3-bit quants; the 16 6-bit scales are
-/// unpacked from the 12 scale bytes exactly as the reference `aux` shuffle.
 struct Q3KCodec;
 static Q3KC: Q3KCodec = Q3KCodec;
 impl Codec for Q3KCodec {
@@ -710,9 +667,6 @@ impl Codec for Q4KCodec {
       }
 }
 
-/// Q5_K: `dequantize_row_q5_K` (ggml/src/ggml-quants.c). 176B/256: `d`,`dmin`
-/// (f16), `scales`[12], `qh`[32], `qs`[128]. 5-bit quants; low nibble plus the
-/// per-element high bit, per-32 6-bit scale+min via `get_scale_min`.
 struct Q5KCodec;
 static Q5KC: Q5KCodec = Q5KCodec;
 impl Codec for Q5KCodec {
@@ -801,8 +755,6 @@ impl Codec for Q6KCodec {
       }
 }
 
-/// Read `width` bits (LSB-first, little-endian within the block) starting at
-/// bit offset `start` from `raw`.
 fn read_bits_le(raw: &[u8], start: usize, width: u32) -> u64 {
       let mut v = 0u64;
       for i in 0..width as usize {
@@ -813,8 +765,6 @@ fn read_bits_le(raw: &[u8], start: usize, width: u32) -> u64 {
       return v;
 }
 
-/// Write the low `width` bits of `val` (LSB-first, little-endian within the
-/// block) into `raw` starting at bit offset `start`. `raw` must be pre-zeroed.
 fn write_bits_le(raw: &mut [u8], start: usize, width: u32, val: u64) {
       for i in 0..width as usize {
             let bit = ((val >> i) & 1) as u8;
@@ -823,19 +773,11 @@ fn write_bits_le(raw: &mut [u8], start: usize, width: u32, val: u64) {
       }
 }
 
-/// Sign-extend the low `width` bits of `u` to a full `i64`.
 fn sign_extend(u: u64, width: u32) -> i64 {
       let shift = 64 - width;
       return ((u << shift) as i64) >> shift;
 }
 
-/// Signed/unsigned integer lanes packed little-endian within a block. Covers
-/// the `iN`/`uN` scalars, the packed `iNxM`/`uNxM` vectors, and the typeless
-/// `b8`/`b16`/`b16xM` widths (unsigned). Each lane maps to one f32.
-///
-/// # Lossy through f32
-/// `bits > 24` (`i32`/`u32`/`i64`/`u64`) cannot round-trip integer values above
-/// 2^24; the f32 pivot rounds to the nearest representable magnitude.
 struct IntCodec {
       nm: &'static str,
       bits: u32,
@@ -898,10 +840,6 @@ impl Codec for IntCodec {
       }
 }
 
-/// Typeless bit widths that are a multiple of 32 bits: `b32`/`b64`/`b96`/…/`b512`
-/// and the `dword*` aliases. Each 32-bit lane is a raw f32 bitcast (no numeric
-/// conversion), so any typeless width converts to any other by reinterpreting
-/// the same bits, and to/from `F32` losslessly.
 struct BitcastCodec {
       nm: &'static str,
       lanes: usize,
@@ -943,22 +881,14 @@ impl Codec for BitcastCodec {
       }
 }
 
-/// Special-value discipline of a mini-float format.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FpSpecial {
-      /// No infinities and no NaN; every bit pattern is a finite number.
       Finite,
-      /// OCP e4m3: no infinities; the single all-ones-exponent, all-ones-mantissa
-      /// pattern is NaN, every other max-exponent pattern is a normal number.
       NanMaxMant,
-      /// IEEE-like: max exponent with zero mantissa is infinity, otherwise NaN.
       Ieee,
-      /// AMD `fnuz`: no infinities; the sign-set, zero-exponent, zero-mantissa
-      /// pattern is the sole NaN (there is no negative zero).
       Fnuz,
 }
 
-/// Decode a mini-float bit pattern (OCP-MX / AMD conventions) to f32.
 fn minifloat_to_f32(
       bits: u32,
       ebits: u32,
@@ -998,7 +928,6 @@ fn minifloat_to_f32(
       return sgn * val;
 }
 
-/// Encode an f32 to the nearest mini-float bit pattern (round half to even).
 fn f32_to_minifloat(
       x: f32,
       ebits: u32,
@@ -1075,16 +1004,6 @@ fn f32_to_minifloat(
       return sfield | m as u32;
 }
 
-/// A signed mini-float: `ebits`+`mbits`+sign, `lanes` of them packed
-/// little-endian per block. Covers f4/f6/f8 and all their `fnuz` and packed
-/// (`xN`) variants. `bf8` is `f8_e5m2` (OCP), per the OCP FP8 spec.
-///
-/// Bit layouts implemented (OCP "OCP Microscaling Formats (MX) v1.0" and AMD
-/// CDNA fnuz): e2m1 bias 1 (finite), e2m3 bias 1 (finite), e3m2 bias 3
-/// (finite), e4m3 bias 7 (no inf, NaN=S.1111.111), e5m2 bias 15 (IEEE inf/NaN),
-/// e4m3_fnuz bias 8 (no inf, NaN=1.0000.000), e5m2_fnuz bias 16 (no inf,
-/// NaN=1.00000.00). f6x2 is 12 bits (not byte-aligned) so shares the byte-exact
-/// 3-byte / 4-lane block with f6x4.
 struct FpCodec {
       nm: &'static str,
       ebits: u32,
@@ -1204,7 +1123,6 @@ impl Codec for FpCodec {
       }
 }
 
-/// Wide native-float lane kind.
 #[derive(Clone, Copy)]
 enum WideKind {
       F16,
@@ -1214,14 +1132,6 @@ enum WideKind {
       Tf32,
 }
 
-/// `lanes` native floats packed contiguously per block: `f16x2`, `bf16x2`,
-/// `f32x2`, `f64`/`f64x2`, and `tf32`/`xf32`.
-///
-/// # Lossy through f32
-/// `F64` above 2^24-magnitude precision and `Tf32`/`Xf32` (mantissa truncated
-/// to 10 bits) do not carry full source precision across the f32 pivot. `Xf32`
-/// is modelled as TF32 (e8m10, 32-bit storage) per the absence of a distinct
-/// public XF32 bit spec.
 struct WideCodec {
       nm: &'static str,
       kind: WideKind,
@@ -1291,7 +1201,6 @@ impl Codec for WideCodec {
       }
 }
 
-/// The sRGB electro-optical transfer function (encoded sRGB -> linear).
 fn srgb_to_linear(c: f32) -> f32 {
       if c <= 0.04045 {
             return c / 12.92;
@@ -1299,7 +1208,6 @@ fn srgb_to_linear(c: f32) -> f32 {
       return ((c + 0.055) / 1.055).powf(2.4);
 }
 
-/// The inverse sRGB transfer function (linear -> encoded sRGB).
 fn linear_to_srgb(l: f32) -> f32 {
       if l <= 0.0031308 {
             return 12.92 * l;
@@ -1307,9 +1215,6 @@ fn linear_to_srgb(l: f32) -> f32 {
       return 1.055 * l.powf(1.0 / 2.4) - 0.055;
 }
 
-/// Decode one image channel of `width` raw bits under `fmt`. `idx`/`count`
-/// identify the channel so `Srgb` can leave the alpha channel (last of four)
-/// linear, matching Vulkan `_SRGB` semantics.
 fn img_channel_decode(u: u64, width: u32, fmt: ImgFmt, idx: usize, count: usize) -> Result<f32> {
       let maxu = ((1u128 << width) - 1) as f64;
       let smax = ((1u64 << (width - 1)) - 1) as f64;
@@ -1337,7 +1242,6 @@ fn img_channel_decode(u: u64, width: u32, fmt: ImgFmt, idx: usize, count: usize)
       return Ok(v);
 }
 
-/// Encode one image channel value `x` to `width` raw bits under `fmt`.
 fn img_channel_encode(x: f32, width: u32, fmt: ImgFmt, idx: usize, count: usize) -> Result<u64> {
       let maxu = ((1u128 << width) - 1) as f64;
       let smax = ((1u64 << (width - 1)) - 1) as f64;
@@ -1371,9 +1275,6 @@ fn img_channel_encode(x: f32, width: u32, fmt: ImgFmt, idx: usize, count: usize)
       return Ok(v);
 }
 
-/// An image/typed-buffer codec: a channel bit layout crossed with a numeric
-/// format. Channels unpack to one f32 lane each, low-order channel first, the
-/// whole block read as a little-endian word.
 struct ImageCodec {
       layout: ImgLayout,
       fmt: ImgFmt,

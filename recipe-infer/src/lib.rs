@@ -72,11 +72,6 @@ pub fn human_bytes(b: usize) -> String {
 	format!("{:.prec$} {}", f / pick.div, pick.label, prec = pick.prec)
 }
 
-/// Probe children answer BEFORE main: a session open re-execs this binary with
-/// `VRAM_PROBE`/`RAM_PROBE` set to measure ceilings in a fresh process, and this
-/// constructor exits the child with the probe's code before libtest (or any
-/// main) prints a banner or runs a line of test code. Normal startup pays two
-/// getenv calls.
 #[ctor::ctor]
 fn probe_child_answer() {
 	if std::env::var_os("VRAM_PROBE").is_some() || std::env::var_os("RAM_PROBE").is_some() {

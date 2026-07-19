@@ -27,10 +27,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};
 
-/// Chat-capable `[models]` keys expected in `gguf.toml` — the full roster this
-/// file certifies. Embedding/rerank models (which do not generate) are excluded
-/// via [`NON_CHAT`]; [`kv_smoke_inventory`] proves this list plus NON_CHAT covers
-/// gguf.toml exactly.
 const CHAT_MODELS: &[&str] = &[
 	"qwen3-0.6b-f16",
 	"qwen3-0.6b-bf16",
@@ -62,9 +58,6 @@ const CHAT_MODELS: &[&str] = &[
 	"phi4-mini-reasoning",
 ];
 
-/// `[models]` keys that are embeddings/rerankers, not chat models — no decode
-/// path, so out of this sweep's scope. Kept explicit so the inventory can prove
-/// CHAT_MODELS + NON_CHAT == gguf.toml's model set.
 const NON_CHAT: &[&str] = &[
 	"nomic-embed-text",
 	"bge-small-f16",
@@ -72,9 +65,6 @@ const NON_CHAT: &[&str] = &[
 	"rerank-tiny-f16",
 ];
 
-/// Models whose load + 3-token decode MEASURABLY fits the 60s budget, each with
-/// its own smoke fn below. Finalized from the sweep's measured times; anything
-/// not here is manual (see the inventory).
 const IN_SUITE: &[&str] = &[
 	"qwen3-0.6b-f16",
 	"qwen3-0.6b-bf16",
@@ -100,7 +90,6 @@ fn gguf_toml() -> PathBuf {
 	return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
 }
 
-/// Every `key = "path"` under `[models]` in the committed gguf.toml.
 fn parse_models() -> Result<Vec<(String, String)>> {
 	let text = std::fs::read_to_string(gguf_toml()).with_context(|| "read gguf.toml")?;
 	let mut out = Vec::new();
@@ -137,10 +126,6 @@ fn model_path(name: &str) -> Result<PathBuf> {
 	bail!("model {name} not in gguf.toml [models]");
 }
 
-/// Opens `name` through the resident decode path and greedily generates
-/// `GEN_TOKENS` tokens from a neutral prompt; returns (load_secs, gen_secs,
-/// tokens). Panics (test failure) on a missing file, load error, decode error,
-/// or zero tokens produced.
 fn do_smoke(name: &str) -> (f64, f64, usize) {
 	const GEN_TOKENS: usize = 3;
 	let gguf = model_path(name).expect("gguf.toml lookup");
@@ -197,9 +182,6 @@ smoke_test!(smoke_stories15m_q4_0_debug, "stories15m-q4_0-debug");
 smoke_test!(smoke_stories_f32_fixture, "stories-f32-fixture");
 smoke_test!(smoke_lfm2_5_1_2b, "lfm2.5-1.2b");
 
-/// Coverage + accounting gate. Proves CHAT_MODELS + NON_CHAT is exactly the
-/// committed gguf.toml model set (so a model appearing or vanishing reds this),
-/// then prints N/M/K and asserts M + K == N.
 #[test]
 fn kv_smoke_inventory() {
 	let parsed: Vec<String> = parse_models()
@@ -257,10 +239,6 @@ fn kv_smoke_inventory() {
 	);
 }
 
-/// Manual entry point for the oversized models the 60s suite cannot hold. With
-/// `KV_SMOKE=<substring>` set, smokes every manual model whose name matches
-/// (long timeout expected). Unset, it prints the manual roster and passes — the
-/// in-suite coverage guarantee lives in [`kv_smoke_inventory`], not here.
 #[test]
 fn oversized_manual_sweep() {
 	let filter = std::env::var("KV_SMOKE").unwrap_or_default();

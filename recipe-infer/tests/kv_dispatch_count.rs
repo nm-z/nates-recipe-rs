@@ -56,7 +56,6 @@ fn stories_fixture() -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stories-f32.gguf");
 }
 
-/// Runs one turn to `budget` accepted tokens; returns the accepted count.
 fn run_turn(session: &mut ChatSession, prompt: &str, budget: usize) -> usize {
 	let mut n = 0usize;
 	session

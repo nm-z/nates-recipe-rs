@@ -24,8 +24,6 @@ fn line_of(text: &str, byte: usize) -> usize {
 	return text[..byte].bytes().filter(|&b| b == b'\n').count() + 1;
 }
 
-/// True when the byte range holds `None` as a standalone token (not part of a
-/// longer identifier), anywhere inside `span`.
 fn has_none_token(span: &str) -> bool {
 	let bytes = span.as_bytes();
 	let ident = |b: u8| return b == b'_' || b.is_ascii_alphanumeric();
@@ -43,7 +41,6 @@ fn has_none_token(span: &str) -> bool {
 	return false;
 }
 
-/// Byte range of the balanced-paren argument list starting at `open` (the `(`).
 fn paren_span(text: &str, open: usize) -> Option<(usize, usize)> {
 	let mut depth = 0usize;
 	for (off, ch) in text[open..].char_indices() {

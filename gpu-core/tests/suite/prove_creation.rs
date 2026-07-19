@@ -1,21 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "creation" inventory category.
-//
-// For every creation-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical generator is registered here, run the gpu-core op on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle (the defining
-// sequence). tol 1e-6 relative. Generators are output-only: no input buffer is
-// read, the kernel synthesizes out[i] from i and the scalar params.
-//
-// Reuses existing kernels where they already cover the op (gpu_fill for
-// full/zeros/ones/constant, gpu_eye for square identity, gpu_iota for int
-// sequences) and adds new creationx_ kernels only for genuine gaps (arange,
-// linspace, logspace, geomspace, tri, rectangular eye).
-//
-// HONESTY: empty/empty_like return uninitialized memory — no oracle exists, so
-// they are NOT mapped to any op (left as backlog, never faked as zeros). full is
-// proven with a NONTRIVIAL value so we prove a kernel wrote it, not that alloc
-// returned zeros. The test FAILS on any registered-op mismatch (a real bug).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -143,7 +126,6 @@ fn run_arange_i32(start: i32, step: i32, n: usize) -> Vec<i32> {
 }
 
 // ── proofs (run each registered generator ONCE vs oracle + defining edges) ──────
-// Returns (map op_name -> pass/fail, failure messages).
 fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let mut ok: HashMap<&'static str, bool> = HashMap::new();
 	let mut fails: Vec<String> = Vec::new();
@@ -157,8 +139,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		}};
 	}
 
-	// fill / full / constant / zeros / ones — reuse gpu_fill(n, val).
-	// Prove with a NONTRIVIAL value (3.14159) so we prove a kernel WROTE it.
 	{
 		use gpu_core::kernels::gpu_fill;
 		let n = 37usize;
@@ -180,7 +160,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		gpu_core::hip::device_synchronize().unwrap();
 		let want = vec![val; n];
 		prove!("full", close(&got, &want));
-		// zeros & ones ride the same proven fill kernel, but assert distinctly.
 		let z = GpuBuffer::alloc(n).unwrap();
 		gpu_fill(
 			&{
@@ -215,7 +194,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		prove!("ones", go.iter().all(|v| *v == 1.0));
 	}
 
-	// eye / identity — square via gpu_eye; rectangular+offset via creationx_eye_rect.
 	{
 		use gpu_core::kernels::gpu_eye;
 		let n = 5usize;
@@ -224,7 +202,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let mut got = vec![0.0; n * n];
 		unsafe { g.download_async(&mut got, ptr::null_mut()) }.unwrap();
 		gpu_core::hip::device_synchronize().unwrap();
-		// diagonal == 1, off-diagonal == 0 (assert BOTH).
 		let mut diag_ok = true;
 		let mut off_ok = true;
 		for r in 0..n {
@@ -239,7 +216,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				}
 			}
 		}
-		// rectangular eye with k offset vs CPU oracle.
 		let (rr, cc, k) = (4usize, 6usize, 1i32);
 		let re = run_eye_rect(rr, cc, k);
 		let mut want = vec![0.0; rr * cc];
@@ -253,18 +229,15 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		prove!("eye", diag_ok && off_ok && close(&re, &want));
 	}
 
-	// arange: out[i] = start + i*step. Test negative + fractional step.
 	{
 		let (start, step, n) = (-2.0_f64, 0.25_f64, 30usize);
 		let got = run_arange(start, step, n);
 		let want: Vec<f64> = (0..n).map(|i| start + i as f64 * step).collect();
-		// also a negative step run.
 		let got2 = run_arange(5.0, -0.5, 20);
 		let want2: Vec<f64> = (0..20).map(|i| 5.0 - 0.5 * i as f64).collect();
 		prove!("arange", close(&got, &want) && close(&got2, &want2));
 	}
 
-	// linspace: endpoint-INCLUSIVE. assert out[n-1]==stop and out[0]==start; n==1 edge.
 	{
 		let (start, stop, n) = (-1.5_f64, 4.5_f64, 16usize);
 		let got = run_linspace(start, stop, n);
@@ -281,7 +254,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		);
 	}
 
-	// logspace: out[i] = base^linspace(start,stop,n)[i].
 	{
 		let (start, stop, base, n) = (-1.0_f64, 3.0_f64, 10.0_f64, 12usize);
 		let got = run_logspace(start, stop, base, n);
@@ -291,13 +263,11 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				base.powf(e)
 			})
 			.collect();
-		// base-2 variant
 		let got2 = run_logspace(0.0, 5.0, 2.0, 6);
 		let want2: Vec<f64> = (0..6).map(|i| 2.0_f64.powf(5.0 * i as f64 / 5.0)).collect();
 		prove!("logspace", close(&got, &want) && close(&got2, &want2));
 	}
 
-	// geomspace: out[i] = start*(stop/start)^(i/(n-1)). assert endpoints exact.
 	{
 		let (start, stop, n) = (2.0_f64, 256.0_f64, 9usize);
 		let got = run_geomspace(start, stop, n);
@@ -308,7 +278,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		prove!("geomspace", close(&got, &want) && edge);
 	}
 
-	// tri: lower-triangular ones with diagonal offset k.
 	{
 		let (rr, cc, k) = (5usize, 5usize, 0i32);
 		let got = run_tri(rr, cc, k);
@@ -320,7 +289,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 				}
 			}
 		}
-		// offset variant (k=1)
 		let got2 = run_tri(4, 6, 1);
 		let mut want2 = vec![0.0; 24];
 		for r in 0..4 {
@@ -333,8 +301,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		prove!("tri", close(&got, &want) && close(&got2, &want2));
 	}
 
-	// iota (int dtype): reuse gpu_iota -> [0..n-1] (download i32).
-	// creationx_arange_i32 proves the general integer sequence start+i*step.
 	{
 		use gpu_core::catboost::gpu_iota;
 		let n = 41usize;
@@ -344,7 +310,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		g.download_i32(&mut got).unwrap();
 		let want: Vec<i32> = (0..n as i32).collect();
 		let iota_ok = got == want;
-		// general int arange: start=3, step=2
 		let ga = run_arange_i32(3, 2, 20);
 		let wa: Vec<i32> = (0..20).map(|i| 3 + 2 * i).collect();
 		prove!("iota", iota_ok && ga == wa);
@@ -354,11 +319,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 }
 
 // ── canonicalize a creation JSON name to a registry generator key ───────────────
-// Mirrors inventory_proof.rs: strip lib/namespace prefix to last segment, lowercase.
-// Map TRUE synonyms only. *_like variants of fill-style ops share the value-fill
-// semantics (zeros_like fills 0, ones_like fills 1, full_like fills val) so they
-// map to the same proven kernel. empty/empty_like are DELIBERATELY left unmapped
-// (uninitialized memory has no oracle — never faked as zeros).
 fn canon(name: &str) -> String {
 	let base = name
 		.rsplit(['.', ':', '$'])
@@ -366,7 +326,6 @@ fn canon(name: &str) -> String {
 		.unwrap_or(name)
 		.to_lowercase();
 	let alias: &[(&str, &str)] = &[
-		// value-fill family -> gpu_fill
 		("fill", "full"),
 		("fill_n", "full"),
 		("full", "full"),
@@ -382,10 +341,8 @@ fn canon(name: &str) -> String {
 		("zero_", "zeros"),
 		("ones", "ones"),
 		("ones_like", "ones"),
-		// identity matrices
 		("eye", "eye"),
 		("identity", "eye"),
-		// ranges / sequences (f64)
 		("arange", "arange"),
 		("range", "arange"),
 		("sequence", "arange"),
@@ -393,9 +350,7 @@ fn canon(name: &str) -> String {
 		("linspace", "linspace"),
 		("logspace", "logspace"),
 		("geomspace", "geomspace"),
-		// triangular ones generator
 		("tri", "tri"),
-		// integer sequences -> gpu_iota / creationx_arange_i32
 		("iota", "iota"),
 		("vector_iota", "iota"),
 		("broadcasted_iota", "iota"),
@@ -452,7 +407,6 @@ fn prove_creation() {
 
 	let (op_ok, failures) = run_proofs();
 
-	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

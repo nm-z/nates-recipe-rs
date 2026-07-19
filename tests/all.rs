@@ -251,19 +251,12 @@ fn run() -> i32 {
 		return finish(&mut log, &tally, t0, 0.0);
 	}
 
-	// One lease over the whole suite. Every test process links gpu-core and
-	// would take this lock at its first device touch; instead they inherit
-	// ours through RECIPE_GPU_LOCK_FD and no daemon job can slip between two
-	// tests. A daemon that wants the GPU queues in the kernel until we exit,
-	// so the suite no longer stops anyone's service to get the card.
 	let waited = Instant::now();
 	gpu_core::gate::acquire();
 	log.status(&format!(
 		"[S] GPU-LOCK acquired wait={:.1}s",
 		waited.elapsed().as_secs_f64()
 	));
-	// Processes already holding /dev/kfd open cannot use it while we hold the
-	// lease; only a NEW holder means a test leaked a GPU child.
 	let known = kfd_holders();
 	let mut done = vec![false; tests.len()];
 	let mut test_secs = 0.0f64;
@@ -491,8 +484,6 @@ fn test_tail(id: &str, secs: f64) -> String {
 	format!("{id} {secs:.1}s")
 }
 
-/// Drop libtest harness ceremony from a child's captured output so FAIL
-/// details show only what the test itself printed plus the panic message.
 fn scrub(capture: &[String], name: &str) -> Vec<String> {
 	let bare = name.rsplit("::").next().unwrap_or(name);
 	let mut lines: Vec<String> = Vec::new();

@@ -1,16 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "norm" inventory category.
-//
-// For every norm-category item in kernel_inventory/*.json, canonicalize its name;
-// if that canonical op is registered here, run the gpu-core op on the LIVE
-// gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle (std f64 textbook
-// standardize: (x-mean)/sqrt(var+eps), rms = x/sqrt(mean(x^2)+eps), l2 =
-// x/sqrt(max(sumsq,eps)), softmax = exp(x-max)/sum). tol 1e-7.
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). Backward/grad/quant/fp8/
-// dropout/scaler/imputer/LRN/whitening items are different functions and stay as
-// backlog — never claimed by a forward op (mirrors prove_special.rs convention).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -18,7 +6,6 @@ use std::ffi::c_void;
 use std::fs;
 use std::ptr;
 
-// New normx_ launchers (see src/kernels/normx.hip).
 unsafe extern "C" {
 	fn launch_normx_groupnorm(
 		x: *const c_void,
@@ -98,7 +85,6 @@ fn cpu_layernorm(
 	o
 }
 
-// batchnorm forward: normalize each channel c over the N samples. x: (N, C).
 fn cpu_batchnorm(x: &[f64], n: usize, c: usize, gamma: &[f64], beta: &[f64], eps: f64) -> Vec<f64> {
 	let mut o = vec![0.0; n * c];
 	for ch in 0..c {
@@ -113,7 +99,6 @@ fn cpu_batchnorm(x: &[f64], n: usize, c: usize, gamma: &[f64], beta: &[f64], eps
 	o
 }
 
-// groupnorm: x (N, C, L), G groups over C. normalize over (C/G)*L per (n,g).
 fn cpu_groupnorm(
 	x: &[f64],
 	n: usize,
@@ -142,7 +127,6 @@ fn cpu_groupnorm(
 	o
 }
 
-// instancenorm: x (N, C, L). normalize over L per (n,c). == groupnorm G=C.
 fn cpu_instancenorm(
 	x: &[f64],
 	n: usize,
@@ -263,7 +247,6 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let got = dl(&g, rows * cols);
 		let want = cpu_layernorm(&x, rows, cols, &gamma, &beta, 1e-5);
 		put("layernorm", close(&got, &want), &mut fails);
-		// jax.nn.standardize == layernorm without affine (gamma=1,beta=0)
 		let one = vec![1.0; cols];
 		let zero = vec![0.0; cols];
 		let bone = {
@@ -573,14 +556,12 @@ fn run_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 // ── canonicalize a norm JSON name to a registry key (forward ops only) ────────
 fn canon(name: &str) -> String {
-	// last segment after . : $ , lowercase
 	let mut base = name
 		.rsplit(['.', ':', '$'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
 	base.retain(|ch| ch != '_');
-	// never claim backward/grad/bwd/quant/fp8 variants from a forward op
 	if base.contains("backward")
 		|| base.contains("grad")
 		|| base.ends_with("bwd")
@@ -590,7 +571,6 @@ fn canon(name: &str) -> String {
 		return base;
 	}
 
-	// l2 / unit normalization
 	if base.contains("l2normalization")
 		|| base == "l2normalize"
 		|| base == "unitnormalization"
@@ -598,7 +578,6 @@ fn canon(name: &str) -> String {
 	{
 		return "l2_normalize".to_string();
 	}
-	// rms before layer (rmsnorm contains neither "layer" nor "batch")
 	if base.contains("rmsnorm") || base.contains("rmsnormalization") {
 		return "rmsnorm".to_string();
 	}

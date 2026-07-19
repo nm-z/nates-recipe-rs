@@ -19,11 +19,8 @@ use std::path::{Path, PathBuf};
 
 pub const P: usize = 2 << 20;
 
-/// User reserve withheld from the VRAM tier (1 GiB).
 const RESERVE_V: usize = 1 << 30;
-/// User reserve withheld from the RAM tier (1 GiB).
 const RESERVE_R: usize = 1 << 30;
-/// User reserve withheld from the disk tier (1 GiB).
 const RESERVE_D: usize = 1 << 30;
 
 #[derive(Clone, Copy, Debug)]
@@ -52,16 +49,6 @@ impl fmt::Display for Full {
 	}
 }
 
-/// The machine's persistent data directory (`$XDG_CACHE_HOME` or `~/.cache`,
-/// plus `recipe/`), created if absent. This is THE spill-dir owner for every
-/// disk tier in the workspace: the training out-of-core spill, the KV-cache
-/// spill files, and the [`Budgets`] disk measurement all resolve through this
-/// one function, so the bytes always land on the filesystem whose free space
-/// was measured — never on a tmpfs the RAM tier already counts.
-///
-/// # Errors
-/// Returns an error when neither `XDG_CACHE_HOME` nor `HOME` is set, or the
-/// directory cannot be created.
 pub fn data_dir() -> std::io::Result<PathBuf> {
 	let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| return !v.is_empty()) {
 		Some(x) => PathBuf::from(x),
@@ -144,8 +131,6 @@ impl Budgets {
 	}
 }
 
-/// # Errors
-/// Returns [`Full`] when the requested buffer exceeds the combined VRAM+RAM+disk ceiling.
 #[inline]
 pub fn admit(
 	b: usize,
@@ -166,34 +151,23 @@ pub fn admit(
 }
 
 pub struct Tiered {
-	/// Logical byte length of the buffer.
 	b: usize,
-	/// Total page count, `ceil(b / P)`.
 	n_pg: usize,
-	/// Residence tier of each page in order.
 	res: Vec<Residence>,
-	/// Tier budgets captured when the buffer was allocated.
 	budgets: Budgets,
 
-	/// Base device virtual address of the mapped VRAM slots, null when none.
 	va: *mut c_void,
-	/// Physical VMM handles, one per mapped VRAM slot.
 	handles: Vec<*mut c_void>,
-	/// Reverse slot-to-page map reserved for future eviction.
 	#[expect(
 		dead_code,
 		reason = "reserved slot-to-page reverse map for future eviction"
 	)]
 	slot_page: Vec<Option<usize>>,
-	/// Count of VRAM slots currently mapped.
 	slots: usize,
 
-	/// Host RAM tier pages, one boxed slab each.
 	ram: Vec<Box<[u8]>>,
 
-	/// Disk spill file backing the overflow tier, absent when unused.
 	disk: Option<File>,
-	/// Path of the spill file, removed on drop.
 	spill_path: PathBuf,
 }
 
@@ -201,8 +175,6 @@ pub struct Tiered {
 unsafe impl Send for Tiered {}
 
 impl Tiered {
-	/// # Errors
-	/// Returns [`Full`] when `b` exceeds the combined VRAM+RAM+disk ceiling.
 	#[inline]
 	pub fn alloc(
 		b: usize,
@@ -237,7 +209,6 @@ impl Tiered {
 		return Self::build(b, n_pg, gpu_pages, ram_pages, budgets, spill);
 	}
 
-	/// Builds a [`Tiered`] from the computed VRAM/RAM/disk page split.
 	fn build(
 		b: usize,
 		n_pg: usize,
@@ -376,7 +347,6 @@ impl Tiered {
 		}
 	}
 
-	/// Writes `bytes` into logical page `p`, dispatching to its resident tier.
 	fn write_page(&mut self, p: usize, bytes: &[u8]) {
 		match self.res[p] {
 			Residence::Vram(s) => {
@@ -426,8 +396,6 @@ impl Tiered {
 		}
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] when the device synchronize fails.
 	#[inline]
 	pub fn sync(&self) -> Result<(), HipError> {
 		return hip::device_synchronize();

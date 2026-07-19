@@ -84,7 +84,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Checks and returns the last HIP launch error.
 fn e() -> Result<(), HipError> {
 	callspy::tick(&callspy::LAUNCH);
 	callspy::tick(&callspy::GET_LAST_ERROR);
@@ -92,8 +91,6 @@ fn e() -> Result<(), HipError> {
 	return check(unsafe { hipGetLastError() });
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_elu(
 	x: &GpuBuffer,
@@ -115,8 +112,6 @@ pub fn gpu_elu(
 	}
 	return e();
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_elu_backward(
 	g: &GpuBuffer,
@@ -139,8 +134,6 @@ pub fn gpu_elu_backward(
 	}
 	return e();
 }
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_selu(
 	x: &GpuBuffer,
@@ -164,8 +157,6 @@ pub fn gpu_selu(
 	}
 	return e();
 }
-/// # Errors
-/// Returns `HipError` if the kernel launch fails or `n` exceeds `i32`.
 #[inline]
 pub fn gpu_selu_backward(
 	g: &GpuBuffer,
@@ -191,11 +182,8 @@ pub fn gpu_selu_backward(
 	return e();
 }
 
-/// Generates a unary activation launcher.
 macro_rules! u {
 	($name:ident, $launch:ident) => {
-		/// # Errors
-		/// Returns `HipError` if the kernel launch fails or `n` exceeds `i32`.
 		#[inline]
 		pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			let ni = ci(n)?;
@@ -207,11 +195,8 @@ macro_rules! u {
 		}
 	};
 }
-/// Generates a unary-activation backward launcher.
 macro_rules! ub {
 	($name:ident, $launch:ident) => {
-		/// # Errors
-		/// Returns `HipError` if the kernel launch fails or `n` exceeds `i32`.
 		#[inline]
 		pub fn $name(
 			g: &GpuBuffer,
@@ -234,11 +219,8 @@ macro_rules! ub {
 		}
 	};
 }
-/// Generates a gated-activation launcher.
 macro_rules! gate {
 	($name:ident, $launch:ident) => {
-		/// # Errors
-		/// Errors if `n` overflows `i32` or the launch fails.
 		#[inline]
 		pub fn $name(
 			a: &GpuBuffer,
@@ -264,8 +246,6 @@ macro_rules! gate {
 
 u!(gpu_mish, launch_gapact_mish);
 ub!(gpu_mish_backward, launch_gapact_mish_backward);
-/// # Errors
-/// Returns `HipError` if the kernel launch fails or `n` exceeds `i32`.
 #[inline]
 pub fn gpu_softplus(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let ni = ci(n)?;

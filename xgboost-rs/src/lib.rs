@@ -320,7 +320,6 @@ pub fn train(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Resul
 			hess[i] = 1.0;
 		}
 
-		// GPU path not integrated: gpu_tree_build_into emits only per-sample tr_pred/te_pred, never the split_feat/split_bin/leaf_val tree the Model stores for predict() — true GPU integration requires gpu-core to return that tree structure.
 		let (cpu_tree, node_assign) = build_cpu_tree(
 			&bins,
 			n,
@@ -441,7 +440,6 @@ pub fn train_multiclass(
 				hess[i] = (pk * (1.0 - pk)).max(1e-6);
 			}
 
-			// GPU path not integrated: gpu_tree_build_into emits only per-sample tr_pred/te_pred, never the split_feat/split_bin/leaf_val tree the Model stores for predict() — true GPU integration requires gpu-core to return that tree structure.
 			let (cpu_tree, node_assign) = build_cpu_tree(
 				&bins,
 				n,

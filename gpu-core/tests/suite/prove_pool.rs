@@ -1,10 +1,3 @@
-// Live-GPU proof harness for the "pool" kernel category (gfx1101).
-// Every registered canonical op runs on-device and is asserted against an
-// authoritative CPU oracle derived from the op's real definition (PyTorch /
-// textbook pooling formulas) — never invented numbers. tol 1e-7.
-//
-// Existing ops proven directly from gpu_core::kernels; new ops (poolx.hip)
-// proven via raw launcher FFI. A proven canonical op covers all its variants.
 
 use gpu_core::memory::GpuBuffer;
 use std::ffi::c_void;
@@ -82,7 +75,6 @@ fn assert_close(name: &str, got: &[f64], want: &[f64]) {
 
 // ── Existing op proofs (gpu_core::kernels) ──────────────────────────────────
 
-// avg_pool_1d: input (n*out_len, n_filters) → (n, n_filters); mean over out_len.
 fn prove_avg_pool_1d() {
 	use gpu_core::kernels::gpu_avg_pool_1d;
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
@@ -111,7 +103,6 @@ fn prove_avg_pool_1d() {
 	assert_close("avg_pool_1d", &got, &want);
 }
 
-// avg_pool_2d: NCHW mean over kH×kW window at stride sH,sW; divide by count.
 fn prove_avg_pool_2d() {
 	use gpu_core::kernels::gpu_avg_pool_2d;
 	let (n, c, h, w, kh, kw, sh, sw) = (2usize, 2, 4, 4, 2, 2, 2, 2);
@@ -152,11 +143,9 @@ fn prove_avg_pool_2d() {
 	assert_close("avg_pool_2d", &got, &want);
 }
 
-// max_pool_1d: max over out_len window; also returns argmax idx (first-occurrence).
 fn prove_max_pool_1d_and_argmax() {
 	use gpu_core::kernels::gpu_max_pool_1d;
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
-	// Distinct values (non-repeating ramp scrambled) so argmax is unambiguous.
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| ((i * 37 + 11) % 97) as f64)
 		.collect();
@@ -192,7 +181,6 @@ fn prove_max_pool_1d_and_argmax() {
 	assert_close("max_pool_with_argmax", &gi, &wi);
 }
 
-// max_pool_2d: NCHW max; idx = flat ih*W+iw within the channel plane.
 fn prove_max_pool_2d() {
 	use gpu_core::kernels::gpu_max_pool_2d;
 	let (n, c, h, w, kh, kw, sh, sw) = (2usize, 2, 4, 4, 2, 2, 2, 2);
@@ -238,11 +226,8 @@ fn prove_max_pool_2d() {
 	assert_close("max_pool_2d", &gv, &wv);
 }
 
-// avg_pool_grad: pool_grad_expand replicates (n,nf) → (n*out_len,nf) / out_len;
-// also avg_pool_2d_backward spreads grad/count to each window cell.
 fn prove_avg_pool_grad() {
 	use gpu_core::kernels::{gpu_avg_pool_2d_backward, gpu_pool_grad_expand};
-	// 1d expand
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
 	let g: Vec<f64> = (0..n * nf).map(|i| (i as f64) + 1.0).collect();
 	let gb = {
@@ -262,7 +247,6 @@ fn prove_avg_pool_grad() {
 	}
 	assert_close("avg_pool_grad", &got, &want);
 
-	// 2d backward: each output grad / count, atomic-added to its window cells.
 	let (n2, c, h, w, kh, kw, sh, sw) = (1usize, 1, 4, 4, 2, 2, 2, 2);
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
@@ -308,12 +292,10 @@ fn prove_avg_pool_grad() {
 	assert_close("avg_pool_grad_2d", &gi, &wi);
 }
 
-// max_pool_grad: scatter grad to the recorded argmax positions (1d and 2d).
 fn prove_max_pool_grad() {
 	use gpu_core::kernels::{
 		gpu_max_pool_1d, gpu_max_pool_1d_backward, gpu_max_pool_2d, gpu_max_pool_2d_backward,
 	};
-	// 1d
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| ((i * 37 + 11) % 97) as f64)
@@ -347,7 +329,6 @@ fn prove_max_pool_grad() {
 	}
 	assert_close("max_pool_grad_1d", &got, &want);
 
-	// 2d
 	let (n2, c, h, w, kh, kw, sh, sw) = (1usize, 2, 4, 4, 2, 2, 2, 2);
 	let oh = (h - kh) / sh + 1;
 	let ow = (w - kw) / sw + 1;
@@ -521,7 +502,6 @@ fn run_poolx_adaptive(
 	dl(&o, rows * out_len)
 }
 
-// PyTorch adaptive bin: start=floor(o*I/O), end=ceil((o+1)*I/O).
 fn adaptive_bin(o: usize, i: usize, out: usize) -> (usize, usize) {
 	let start = (o * i) / out;
 	let end = ((o + 1) * i).div_ceil(out);
@@ -568,7 +548,6 @@ fn prove_adaptive_max_pool() {
 
 #[test]
 fn prove_pool() {
-	// Each entry is one canonical pool op proven on the live GPU vs its oracle.
 	let ops: Vec<(&str, fn())> = vec![
 		("avg_pool", prove_avg_pool_1d),
 		("avg_pool_2d", prove_avg_pool_2d),
@@ -589,13 +568,6 @@ fn prove_pool() {
 		proven += 1;
 		eprintln!("  ok pool::{name}");
 	}
-	// Canonical ops covered (1d/2d/3d & dtype variants collapse into these):
-	//   avg_pool, max_pool (+ with_argmax), avg_pool_grad, max_pool_grad,
-	//   global_avg_pool, global_max_pool, lp_pool/l2_pool, adaptive_avg_pool,
-	//   adaptive_max_pool.
-	// Backlog (dropped — need external state, not faked):
-	//   fractional_max_pool / fractional_avg_pool (random region sampling),
-	//   max_unpool (requires externally-supplied argmax indices + output shape).
 	eprintln!("PROVE pool: {proven} / {total}");
 	assert_eq!(proven, total, "not all registered pool ops proved");
 }

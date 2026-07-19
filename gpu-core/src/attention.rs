@@ -6,7 +6,6 @@ use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
 
-/// Ticks the launch counters and returns any deferred HIP launch error.
 fn check_launch() -> Result<(), HipError> {
 	tick(&LAUNCH);
 	tick(&GET_LAST_ERROR);
@@ -156,8 +155,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_scaled_dot_product_attn(
 	q: &GpuBuffer,
@@ -190,8 +187,6 @@ pub fn gpu_scaled_dot_product_attn(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	let rows_i = ci(rows)?;
@@ -203,8 +198,6 @@ pub fn gpu_causal_softmax_rows(rows: usize, cols: usize, x: &GpuBuffer) -> Resul
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_mha_split(
 	x: &GpuBuffer,
@@ -230,8 +223,6 @@ pub fn gpu_mha_split(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_mha_merge(
 	x: &GpuBuffer,
@@ -257,8 +248,6 @@ pub fn gpu_mha_merge(
 	return check_launch();
 }
 
-/// # Errors
-/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rope(
 	x: &GpuBuffer,
@@ -283,8 +272,6 @@ pub fn gpu_rope(
 	return check_launch();
 }
 
-/// # Errors
-/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let seq_i = ci(seq)?;
@@ -296,8 +283,6 @@ pub fn gpu_positional_encoding(seq: usize, dim: usize, out: &GpuBuffer) -> Resul
 	return check_launch();
 }
 
-/// # Errors
-/// [`HipError`] if a size overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rmsnorm(
 	x: &GpuBuffer,
@@ -324,8 +309,6 @@ pub fn gpu_rmsnorm(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns [`HipError`] on launch failure or size overflow.
 #[inline]
 pub fn gpu_rmsnorm_backward(
 	grad_out: &GpuBuffer,
@@ -354,8 +337,6 @@ pub fn gpu_rmsnorm_backward(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns [`HipError`] on launch failure or size overflow.
 #[inline]
 pub fn gpu_im2col_2d_ext(
 	img: &GpuBuffer,
@@ -399,8 +380,6 @@ pub fn gpu_im2col_2d_ext(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_col2im_2d_ext(
 	patches: &GpuBuffer,
@@ -444,8 +423,6 @@ pub fn gpu_col2im_2d_ext(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_embedding_backward(
 	grad_out: &GpuBuffer,
@@ -473,8 +450,6 @@ pub fn gpu_embedding_backward(
 	return check_launch();
 }
 
-/// # Errors
-/// Returns `HipError` if the kernel launch fails.
 #[inline]
 pub fn gpu_bn_update_running(
 	save_mean: &GpuBuffer,

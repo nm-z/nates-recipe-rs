@@ -6,10 +6,6 @@ use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
 
-/// Ticks the launch counters and returns the pending HIP error, if any.
-///
-/// # Errors
-/// Returns [`HipError`] when the preceding kernel launch reported a failure.
 fn e() -> Result<(), HipError> {
 	tick(&LAUNCH);
 	tick(&GET_LAST_ERROR);
@@ -17,15 +13,10 @@ fn e() -> Result<(), HipError> {
 	return check(unsafe { hipGetLastError() });
 }
 
-/// Defines parameterless activation launchers over `(x, n) -> out`.
 macro_rules! a0 {
     ($($name:ident => $launch:ident),* $(,)?) => {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void); )* }
         $(
-            /// Launches the activation kernel over `n` elements.
-            ///
-            /// # Errors
-            /// Returns [`HipError`] if `n` overflows [`i32`] or the launch fails.
             #[inline]
             pub fn $name(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
                 let n = ci(n)?;
@@ -36,15 +27,10 @@ macro_rules! a0 {
         )*
     };
 }
-/// Defines one-parameter activation launchers over `(x, p, n) -> out`.
 macro_rules! a1 {
     ($($name:ident => $launch:ident),* $(,)?) => {
         unsafe extern "C" { $( fn $launch(x: *const c_void, out: *mut c_void, n: i32, p: *const c_void, s: *mut c_void); )* }
         $(
-            /// Launches the parameterized activation kernel over `n` elements.
-            ///
-            /// # Errors
-            /// Returns [`HipError`] if `n` overflows [`i32`] or the launch fails.
             #[inline]
             pub fn $name(x: &GpuBuffer, p: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
                 let n = ci(n)?;

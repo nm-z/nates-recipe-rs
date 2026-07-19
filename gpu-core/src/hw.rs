@@ -13,14 +13,10 @@ use std::sync::Once;
 use std::thread;
 use std::time::Instant;
 
-/// True while a compute phase is armed for the saturation-crash watchdog.
 static SAT_ARMED: AtomicBool = AtomicBool::new(0i32 == 1i32);
-/// Longest gap without a 100%-busy sample before the watchdog aborts.
 const SAT_WINDOW: Duration = Duration::from_secs(5);
-/// When `Some(())`, the saturation-crash watchdog is enabled.
 const SAT_ENFORCE: Option<()> = None;
 
-/// Signal handler: disable core dumps, then re-raise with the default disposition.
 #[inline]
 pub extern "C" fn fast_death(sig: libc::c_int) {
 	// SAFETY: async-signal-safe; disables core dumps before re-raising.
@@ -128,25 +124,17 @@ pub fn disarm_saturation_crash() {
 	SAT_ARMED.store(0i32 == 1i32, Ordering::SeqCst);
 }
 
-/// KFD ioctl selector for subscribing to SMI (thermal/thrash) events.
 const AMDKFD_IOC_SMI_EVENTS: libc::c_ulong = 0xC008_4B1F;
 
 #[repr(C)]
-/// Argument block for the AMDKFD SMI-events ioctl.
 struct SmiArgs {
-	/// KFD topology `gpu_id` to subscribe to.
 	gpuid: u32,
-	/// Anonymous fd the kernel returns for reading events.
 	anon_fd: u32,
 }
 
-/// Classification of a decoded KFD SMI event.
 enum GpuEvent {
-	/// Driver evicted our queues or mappings.
 	Thrash,
-	/// Queues restored after an eviction.
 	Restored,
-	/// Any other event, logged but not acted on.
 	Other,
 }
 

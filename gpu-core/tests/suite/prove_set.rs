@@ -1,24 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "set" inventory category.
-//
-// For every set-category item in kernel_inventory/*.json, canonicalize its name;
-// if that canonical op is registered here, run the gpu-core setx_ kernel on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE CPU set oracle.
-//
-//   unique             — sorted distinct (radix sort + adjacent dedup, hipcub)
-//   unique_consecutive — collapse ADJACENT duplicates only, original order
-//   unique_counts      — sorted distinct values + multiplicities (RunLengthEncode)
-//   isin               — membership mask a[i] in b (sort b + binary search)
-//
-// Variable-length outputs: the launcher writes into a capacity-n buffer and
-// reports the produced length via a device int* out_count; the test slices to
-// that length. tol 1e-6 on values (all probes are exactly-representable f64, so
-// dedup equality is bit-exact and the value tolerance is trivially met).
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). The remaining set algebra
-// (intersect1d/union1d/setdiff1d/setxor1d, thrust::set_*, *_by_key, have_overlap,
-// merge, unique_inverse/all) stays backlog — reported, never faked green.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -80,10 +60,6 @@ fn lasterr() {
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 }
 
-// Probe vector with BOTH adjacent dups (the 2.0,2.0 pair and 5.5,5.5 pair) AND
-// non-adjacent dups (-1.0 appears at idx 1 & 8; 7.25 at idx 2 & 5). This makes
-// unique (sorted-distinct) and unique_consecutive produce DIFFERENT outputs, so
-// the two ops are genuinely distinguished. All values exactly representable.
 fn data() -> Vec<f64> {
 	vec![
 		3.5, -1.0, 7.25, 2.0, 2.0, 7.25, -8.0, 5.5, 5.5, -1.0, 4.0, 0.0, 4.0, 9.0,
@@ -92,8 +68,6 @@ fn data() -> Vec<f64> {
 
 // ── GPU runners ──
 
-// unique: radix sort then adjacent dedup -> needs an extra keys_sorted f64[n]
-// scratch the launcher sorts into, plus the hipcub temp workspace.
 fn run_unique(x: &[f64]) -> Vec<f64> {
 	let n = x.len();
 	let b = {
@@ -130,8 +104,6 @@ fn run_unique(x: &[f64]) -> Vec<f64> {
 	buf
 }
 
-// unique_consecutive: adjacent dedup only, no sort -> no keys_sorted scratch,
-// just the hipcub DeviceSelect::Unique temp workspace.
 fn run_unique_consecutive(x: &[f64]) -> Vec<f64> {
 	let n = x.len();
 	let b = {
@@ -221,7 +193,6 @@ fn run_isin(a: &[f64], b: &[f64]) -> Vec<f64> {
 		__ub
 	};
 	let mask = GpuBuffer::alloc(a.len()).unwrap();
-	// hipcub DeviceRadixSort sorts b internally: needs a b_sorted output + temp storage.
 	let b_sorted = GpuBuffer::alloc(b.len()).unwrap();
 	let tmp_bytes = unsafe { launch_setx_isin_workspace_bytes(b.len() as i32) };
 	let tmp = GpuBuffer::alloc_bytes(tmp_bytes.max(1)).unwrap();
@@ -292,7 +263,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		}};
 	}
 
-	// unique: sorted distinct == CPU sort+dedup
 	{
 		let g = run_unique(&x);
 		let w = cpu_unique(&x);
@@ -300,14 +270,11 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		mark!("unique", pass, format!("unique {:?} != {:?}", g, w));
 	}
 
-	// unique_consecutive: adjacent-only dedup, original order == CPU dedup
-	// MUST differ from unique here (probe has non-adjacent dups), else vacuous.
 	{
 		let g = run_unique_consecutive(&x);
 		let w = cpu_unique_consecutive(&x);
 		let mut pass =
 			g.len() == w.len() && g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= TOL);
-		// distinctness guard: the two ops must genuinely disagree on this probe
 		let u = cpu_unique(&x);
 		if w.len() == u.len() && w.iter().zip(&u).all(|(a, b)| (a - b).abs() <= TOL) {
 			pass = false; // probe failed to distinguish the ops -> treat as failure
@@ -320,7 +287,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		);
 	}
 
-	// unique_counts: sorted distinct values + multiplicities
 	{
 		let (gv, gc) = run_unique_counts(&x);
 		let (wv, wc) = cpu_unique_counts(&x);
@@ -334,7 +300,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		);
 	}
 
-	// isin: membership mask a[i] in b ; oracle = exact b.contains
 	{
 		let a = [3.5, -1.0, 100.0, 2.0, 0.0, -8.0, 42.0, 9.0];
 		let b = [3.5, 2.0, 0.0, 9.0, 7.25, -8.0];
@@ -356,18 +321,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	(ok, fail)
 }
 
-// Canonicalize a set-category JSON name to a registry key. Routing is by the
-// item's documented semantics (the inventory `description` field), NOT by string
-// shape: the discriminator is "full distinct set" -> unique vs "collapse
-// consecutive runs only" -> unique_consecutive.
-//
-// Full-name overrides come FIRST because last-segment matching physically cannot
-// separate thrust::unique / cudf::unique / jax.numpy.unique (all -> "unique"):
-//   thrust::unique  = "Remove consecutive duplicates"  -> unique_consecutive
-//   cudf::unique    = "Distinct values preserving order" (consecutive dedup;
-//                     cudf::distinct is the global-dedup op) -> unique_consecutive
-// V2 ops (UniqueV2/UniqueWithCountsV2) carry an axis parameter our flat op does
-// not implement, so they are NOT stripped to v1 — they stay backlog (honest).
 fn canon(name: &str) -> String {
 	match name {
 		"thrust::unique" | "cudf::unique" => return "unique_consecutive".to_string(),
@@ -383,21 +336,14 @@ fn canon(name: &str) -> String {
 		.map(|s| s.to_string())
 		.unwrap_or(base);
 	let alias: &[(&str, &str)] = &[
-		// sorted-distinct / global-distinct family -> unique (set-invariant,
-		// order-agnostic: GPU op and oracle both sort, so the proven claim is
-		// the distinct SET, not first-occurrence ordering).
 		("unique", "unique"),
 		("unique_values", "unique"),
 		("distinct", "unique"),
-		// unique-with-counts / count-distinct family -> unique_counts
-		// (the (value,count) multiset is order-independent).
 		("unique_counts", "unique_counts"),
 		("uniquewithcounts", "unique_counts"),
 		("count_distinct", "unique_counts"),
-		// adjacent run-dedup family -> unique_consecutive
 		("unique_consecutive", "unique_consecutive"),
 		("unique_copy", "unique_consecutive"),
-		// membership -> isin
 		("isin", "isin"),
 		("in1d", "isin"),
 	];

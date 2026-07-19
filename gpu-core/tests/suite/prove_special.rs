@@ -1,15 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "special" inventory category.
-//
-// For every special-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core op (existing
-// k_mathx fn or a new specialx_ kernel) on the LIVE gfx1101 GPU and assert it
-// matches an AUTHORITATIVE oracle (std f64 / libm / textbook definition from the
-// JSON description / inverse round-trip / finite difference). tol 1e-7.
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). Host-only / structural items
-// (tfp.sts.*, accumulators, integrators, interpolators, ...) stay as backlog.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -18,7 +7,6 @@ use std::ffi::c_void;
 use std::fs;
 use std::ptr;
 
-// New specialx_ kernels (unary: x->out ; xlogy: x,y->out).
 unsafe extern "C" {
 	fn launch_specialx_digamma(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_specialx_expit(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
@@ -72,7 +60,6 @@ fn run_specialx(f: Launch, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-// Existing k_mathx unary ops carry signature (x, n, out) -> ().
 type Km = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::HipError>;
 fn run_km(f: Km, x: &[f64]) -> Vec<f64> {
 	let b = {
@@ -176,7 +163,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		0.05,
 		3.0
 	);
-	// erfinv via inverse round-trip: erf(erfinv(x)) == x
 	sx!("erfinv", launch_specialx_erfinv, |x| x, -0.99, 0.99); // oracle handled specially below
 	sx!(
 		"erfcx",
@@ -185,7 +171,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		-3.0,
 		3.0
 	);
-	// i0/i1 textbook power series
 	sx!("i0", launch_specialx_i0, bessel_i0_series, -5.0, 5.0);
 	sx!("i1", launch_specialx_i1, bessel_i1_series, -5.0, 5.0);
 	sx!(
@@ -206,7 +191,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	sx!("j1", launch_specialx_j1, libm::j1, -8.0, 8.0);
 	sx!("y0", launch_specialx_y0, libm::y0, 0.5, 8.0);
 	sx!("y1", launch_specialx_y1, libm::y1, 0.5, 8.0);
-	// ndtr = standard normal CDF = 0.5*erfc(-x/sqrt2) ; ndtri = inverse (round-trip)
 	sx!(
 		"ndtr",
 		launch_specialx_ndtr,
@@ -222,7 +206,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		-2.0,
 		2.0
 	);
-	// digamma oracle = central finite-diff of lgamma (digamma == d/dx ln Gamma)
 	sx!(
 		"digamma",
 		launch_specialx_digamma,
@@ -236,7 +219,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	m
 }
 
-// Modified Bessel I0/I1 power series (textbook). |x|<=5, ~25 terms => <1e-12.
 fn bessel_i0_series(x: f64) -> f64 {
 	let y = (x / 2.0).powi(2);
 	let mut term = 1.0;
@@ -264,7 +246,6 @@ fn bessel_i1_series(x: f64) -> f64 {
 	sum
 }
 
-// xlogy is binary: x*log(y), x==0 -> 0.
 fn run_xlogy(x: &[f64], y: &[f64]) -> Vec<f64> {
 	let bx = {
 		let __up = x;
@@ -295,16 +276,12 @@ fn run_xlogy(x: &[f64], y: &[f64]) -> Vec<f64> {
 	out
 }
 
-// Canonicalize a special-category JSON name to a registry key. Mirrors the
-// inventory_proof.rs convention (strip lib prefix, lowercase, last segment),
-// then maps TRUE synonyms only — never *_backward / *_grad (different functions).
 fn canon(name: &str) -> String {
 	let base = name
 		.rsplit(['.', ':', '$'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
-	// drop trailing "_2"/"_alias"/"_aten" disambiguators (same forward function)
 	let base = base
 		.strip_suffix("_2")
 		.map(|s| s.to_string())
@@ -312,30 +289,24 @@ fn canon(name: &str) -> String {
 		.or_else(|| base.strip_suffix("_aten").map(|s| s.to_string()))
 		.unwrap_or(base);
 	let alias: &[(&str, &str)] = &[
-		// sigmoid family
 		("expit", "expit"),
 		("sigmoid", "expit"),
-		// digamma / psi
 		("digamma", "digamma"),
 		("psi", "digamma"),
 		("hpsi", "digamma"),
-		// gamma family
 		("gamma", "tgamma"),
 		("gammaln", "lgamma"),
 		("lngamma", "lgamma"),
-		// error functions
 		("erf", "erf"),
 		("erfc", "erfc"),
 		("erfcx", "erfcx"),
 		("erfinv", "erfinv"),
-		// modified bessel I
 		("i0", "i0"),
 		("i1", "i1"),
 		("i0e", "i0e"),
 		("i1e", "i1e"),
 		("modified_bessel_i0", "i0"),
 		("modified_bessel_i1", "i1"),
-		// bessel J / Y
 		("bessel_j0", "j0"),
 		("bessel_j1", "j1"),
 		("bessel_y0", "y0"),
@@ -344,10 +315,8 @@ fn canon(name: &str) -> String {
 		("j1", "j1"),
 		("y0", "y0"),
 		("y1", "y1"),
-		// normal CDF / inverse
 		("ndtr", "ndtr"),
 		("ndtri", "ndtri"),
-		// others
 		("logit", "logit"),
 		("sinc", "sinc"),
 		("entr", "entr"),
@@ -400,10 +369,8 @@ fn load_special() -> Vec<String> {
 
 const TOL: f64 = 1e-7;
 
-// Special-cased proofs that need a different assertion than direct oracle compare.
 fn check_special_op(key: &str, reg: &UnaryOp) -> bool {
 	match key {
-		// erf(erfinv(x)) == x
 		"erfinv" => {
 			let xs = probes(reg.lo, reg.hi, 24);
 			let got = (reg.run)(&xs);
@@ -411,7 +378,6 @@ fn check_special_op(key: &str, reg: &UnaryOp) -> bool {
 				.zip(&got)
 				.all(|(x, g)| (libm::erf(*g) - x).abs() <= TOL * (1.0 + x.abs()))
 		}
-		// ndtr(ndtri(x)) == x  (ndtr oracle proven independently)
 		"ndtri" => {
 			let xs = probes(reg.lo, reg.hi, 24);
 			let got = (reg.run)(&xs);
@@ -437,7 +403,6 @@ fn prove_special() {
 	assert!(!items.is_empty(), "no special items in inventory");
 	let reg = unary_registry();
 
-	// Prove each registered op ONCE (and its defining-edge probes), cache pass/fail.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	let mut failures: Vec<String> = Vec::new();
 	for (k, op) in reg.iter() {
@@ -448,8 +413,6 @@ fn prove_special() {
 		}
 	}
 
-	// Defining-edge probes (the conventions are the whole point of these ops):
-	// entr(0)=0, sinc(0)=1, xlogy(0,y)=0.
 	{
 		let e = run_specialx(launch_specialx_entr, &[0.0]);
 		if e[0] != 0.0 {
@@ -470,7 +433,6 @@ fn prove_special() {
 		op_ok.insert("xlogy", !failures.iter().any(|f| f.starts_with("xlogy")));
 	}
 
-	// Walk the inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

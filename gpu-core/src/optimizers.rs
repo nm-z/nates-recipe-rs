@@ -91,8 +91,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns [`HipError`] if the size exceeds `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_momentum_update(
 	g: &GpuBuffer,
@@ -119,8 +117,6 @@ pub fn gpu_momentum_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the size exceeds `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rmsprop_update(
 	g: &GpuBuffer,
@@ -149,8 +145,6 @@ pub fn gpu_rmsprop_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_adagrad_update(
 	g: &GpuBuffer,
@@ -176,8 +170,6 @@ pub fn gpu_adagrad_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a checked cast overflows or a device call fails.
 #[inline]
 pub fn gpu_lamb_phase1(
 	grad: &GpuBuffer,
@@ -221,8 +213,6 @@ pub fn gpu_lamb_phase1(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a checked cast overflows or a device call fails.
 #[inline]
 pub fn gpu_lamb_phase2(
 	tmp_upd: &GpuBuffer,
@@ -249,8 +239,6 @@ pub fn gpu_lamb_phase2(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a checked cast overflows or a device call fails.
 #[inline]
 pub fn gpu_lion_update(
 	g: &GpuBuffer,
@@ -281,8 +269,6 @@ pub fn gpu_lion_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if the kernel launch fails.
 #[inline]
 pub fn gpu_nadam_update(
 	grad: &GpuBuffer,
@@ -318,8 +304,6 @@ pub fn gpu_nadam_update(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if the kernel launch fails.
 #[inline]
 pub fn gpu_clip_value(
 	lo: &GpuBuffer,

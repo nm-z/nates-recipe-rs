@@ -9,8 +9,6 @@ use anyhow::{Result, anyhow, bail};
 use minijinja::{Environment, Value, context};
 use std::path::Path;
 
-/// One conversation turn. `role` is the HF convention (`system`/`user`/`assistant`);
-/// `content` is the raw text for that turn.
 pub struct Msg {
       pub role: String,
       pub content: String,
@@ -25,12 +23,6 @@ impl Msg {
       }
 }
 
-/// Render `msgs` through a Jinja chat template string via `hf-chat-template`,
-/// with `minijinja-contrib`'s pycompat callback supplying the Python string
-/// methods (`.strip()`, `.split()`, …) HF templates lean on, plus the
-/// `raise_exception` callable many use to reject malformed histories. Provides
-/// `messages`, `add_generation_prompt`, `bos_token` and `eos_token` in the
-/// render context.
 pub fn render_template(
       tmpl: &str,
       msgs: &[Msg],
@@ -69,11 +61,6 @@ pub fn render_template(
       return Ok(rendered);
 }
 
-/// Render the conversation for a gguf model on disk. Reads `tokenizer.chat_template`;
-/// per the no-fallback-defaults invariant, a missing key is a clean Err, never a
-/// synthesized default. A leading bos-token string is stripped from the result
-/// because `generate()` prepends the bos id itself before tokenizing (deterministic
-/// single-bos: strip the text here, let generate add exactly one back).
 pub fn render_chat(gguf: &Path, msgs: &[Msg], add_generation_prompt: bool) -> Result<String> {
       let g = Gguf::open(gguf)?;
       let tmpl = match g.kv.get("tokenizer.chat_template") {

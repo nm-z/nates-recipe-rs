@@ -15,8 +15,6 @@
 use gpu_core::infer_ops::{gpu_flash_gqa, gpu_flash_mla};
 use gpu_core::memory::GpuBuffer;
 
-/// One attention problem: kernel-layout dims plus the mask bound. `hdk` is the
-/// dot head width, `hdv` the gather width (equal for GQA, distinct for MLA).
 struct Shape {
 	t_q: usize,
 	t_kv: usize,
@@ -52,9 +50,6 @@ fn download(b: &GpuBuffer, n: usize) -> Vec<f64> {
 	return v;
 }
 
-/// Host f64 reference: two-pass masked-softmax attention with the kernel's
-/// exact layouts (q `[t_q,nqh,hdk]`, kc `[t_kv,nkv,hdk]`, vc `[t_kv,nkv,hdv]`,
-/// out `[t_q,nqh,hdv]`, kv head = `h / (nqh/nkv)`, q pre-scaled by the caller).
 fn host_attn(q: &[f64], kc: &[f64], vc: &[f64], s: &Shape) -> Vec<f64> {
 	let mut out = vec![0.0f64; s.t_q * s.nqh * s.hdv];
 	for i in 0..s.t_q {

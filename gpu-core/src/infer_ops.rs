@@ -7,7 +7,6 @@ use crate::memory::{Dtype, GpuBuffer};
 use core::ffi::c_void;
 use core::ptr;
 
-/// Checks the last HIP launch for an error, ticking the launch callspy counters.
 fn cl() -> Result<(), HipError> {
 	callspy::tick(&callspy::LAUNCH);
 	callspy::tick(&callspy::GET_LAST_ERROR);
@@ -138,8 +137,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rope_partial(
 	theta: &GpuBuffer,
@@ -167,12 +164,6 @@ pub fn gpu_rope_partial(
 	return cl();
 }
 
-/// NeoX RoPE applying absolute positions offset by `pos_base` (KV-cache decode:
-/// the new rows sit at absolute positions `pos_base + row`). `pos_base == 0` is the
-/// prefill/full-forward case, identical to [`gpu_rope_partial`].
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rope_partial_pos(
 	theta: &GpuBuffer,
@@ -201,11 +192,6 @@ pub fn gpu_rope_partial_pos(
 	return cl();
 }
 
-/// LongRoPE NeoX RoPE with per-pair frequency factors (`factors` is `[rotary_dim/2]`,
-/// dividing the pair-i angle; minicpm3 `rope_ext` with `freq_factors`).
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rope_partial_factors(
 	theta: &GpuBuffer,
@@ -234,11 +220,6 @@ pub fn gpu_rope_partial_factors(
 	return cl();
 }
 
-/// LongRoPE per-pair-factor NeoX RoPE at absolute positions offset by `pos_base`
-/// (KV-cache decode). `pos_base == 0` matches [`gpu_rope_partial_factors`].
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rope_partial_factors_pos(
 	theta: &GpuBuffer,
@@ -268,16 +249,6 @@ pub fn gpu_rope_partial_factors_pos(
 	return cl();
 }
 
-/// THE embedding read: writes `rows` rows of `ne` elements into `out`, each the
-/// `scale`-weighted sum of `k` consecutive staged rows in `rowsrc`, converted
-/// from `rowsrc`'s dtype on the way in. A plain token embedding is `k == 1`
-/// with weight `1.0`; a diffusion canvas blend is the same call with `k`
-/// candidates and their probabilities. The host stages raw bytes and integer
-/// indices; every float operation happens here.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows its ABI width, either dtype
-/// has no convert kernel, or the launch fails.
 #[inline]
 pub fn gpu_embed_blend(
 	rowsrc: &GpuBuffer,
@@ -312,21 +283,6 @@ pub fn gpu_embed_blend(
 	return cl();
 }
 
-/// THE dtype flipper: converts `n` elements of `src` into `dst`. One function
-/// for every dtype and every direction — widen, narrow, dequant, requant are
-/// the same call, and the caller names none of them. `src.dtype()` says what
-/// the bytes are, `dst.dtype()` says what they become, and the pair picks the
-/// kernel; adding dtype N+1 costs one variant and one case. Every value is
-/// scaled in f64 before any narrowing, bit-identical to the host
-/// `(f64)x * scale` path it replaces (`scale == 1.0` converts exactly).
-///
-/// Quant sources decode block-resident on device: the raw file bytes stay in
-/// VRAM and the host does no element math. A pair with no kernel, or a length
-/// that does not fill whole blocks, fails by name — never a silent reinterpret.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i64`, either dtype has no convert
-/// kernel, `n` is not a whole number of blocks, or the launch fails.
 #[inline]
 pub fn gpu_convert(src: &GpuBuffer, dst: &GpuBuffer, n: usize, scale: f64) -> Result<(), HipError> {
 	let n64 = i64::try_from(n).map_err(|_e| return HipError(1))?;
@@ -362,8 +318,6 @@ pub fn gpu_convert(src: &GpuBuffer, dst: &GpuBuffer, n: usize, scale: f64) -> Re
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_rmsnorm_f64(
 	x: &GpuBuffer,
@@ -389,8 +343,6 @@ pub fn gpu_rmsnorm_f64(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_rmsnorm_f64_nogamma(
 	x: &GpuBuffer,
@@ -416,22 +368,6 @@ pub fn gpu_rmsnorm_f64_nogamma(
 }
 
 
-/// Batched flash attention (GQA/MQA) — the sole attention path. `q` is `[t_q,nqh,hd]`
-/// (the NEW query rows, pre-scaled by `1/sqrt(hd)`), `kc`/`vc` are `[t_kv,nkv,hd]`
-/// (the K/V cache, or a per-forward K/V buffer), `out` is `[t_q,nqh,hd]`. Online
-/// softmax, never materializes the score matrix; `t_q == 1` and `t_q > 1` run the
-/// identical algorithm.
-///
-/// `causal_below` is a POSITION BOUND, never a flag: key `sp` is masked out for the
-/// query at absolute position `p = p_base+i` exactly when `p < causal_below && sp > p`.
-/// Pass `t_kv` for a fully causal pass (every query masks its future), `0` for a
-/// fully bidirectional pass (nothing masked), or the prompt length for the diffusion
-/// canvas (causal prompt, bidirectional canvas). Passing `1` here would make only
-/// position 0 causal — never pass a bool.
-///
-/// Set the first time a flash kernel actually launched / a launch's host-side
-/// tile solve actually segmented its K/V sweep (`t_kv > tile`). Read by the
-/// chat capability line — proven-ran flags, never build-time claims.
 static FLASH_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static L2_TILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -445,9 +381,6 @@ pub fn l2_tiled() -> bool {
 	return L2_TILED.load(core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Host mirror of the kernel's L2 tile solve: rows per tile such that the K+V
-/// working set at one sequence offset fits the 4 MiB L2 (same inequality the
-/// kernel doc states), clamped to at least 1.
 fn note_flash(t_kv: usize, kv_row_bytes: usize, resident_bytes: usize) {
 	FLASH_RAN.store(true, core::sync::atomic::Ordering::Relaxed);
 	let tile = (4_194_304usize.saturating_sub(resident_bytes) / kv_row_bytes.max(1)).max(1);
@@ -456,8 +389,6 @@ fn note_flash(t_kv: usize, kv_row_bytes: usize, resident_bytes: usize) {
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_flash_gqa(
 	q: &GpuBuffer,
@@ -507,12 +438,6 @@ pub fn gpu_flash_gqa(
 	return cl();
 }
 
-/// Batched flash MLA — distinct key/value head dims (`hdk` dot, `hdv` gather), MQA.
-/// `q` pre-scaled. See [`gpu_flash_gqa`]; `kc` is `[t_kv,nkv,hdk]`, `vc` is
-/// `[t_kv,nkv,hdv]`, `out` is `[t_q,nqh,hdv]`.
-///
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_flash_mla(
 	q: &GpuBuffer,
@@ -562,8 +487,6 @@ pub fn gpu_flash_mla(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i64` or the kernel launch fails.
 #[inline]
 pub fn gpu_gelu_mul(
 	a: &GpuBuffer,
@@ -585,8 +508,6 @@ pub fn gpu_gelu_mul(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `half` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_glu_gelu(
 	input: &GpuBuffer,
@@ -608,8 +529,6 @@ pub fn gpu_glu_gelu(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if `rows` or `half` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_glu_silu(
 	input: &GpuBuffer,
@@ -631,8 +550,6 @@ pub fn gpu_glu_silu(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if `m`, `n`, or `k` overflows `i32` or the launch fails.
 #[inline]
 pub fn gpu_gemm_bt_f64(
 	lhs: &GpuBuffer,
@@ -658,8 +575,6 @@ pub fn gpu_gemm_bt_f64(
 	return cl();
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn gpu_scale_f64_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: all pointers reference live GpuBuffers valid for the kernel launch.

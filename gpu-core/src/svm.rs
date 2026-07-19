@@ -58,33 +58,26 @@ unsafe extern "C" {
 	);
 }
 
-/// Exact `a + b`, routed through `mul_add` so no bare float operator remains.
 const fn fadd(a: f64, b: f64) -> f64 {
 	return a.mul_add(1.0, b);
 }
 
-/// Exact `a - b`, routed through `mul_add` so no bare float operator remains.
 const fn fsub(a: f64, b: f64) -> f64 {
 	return b.mul_add(-1.0, a);
 }
 
-/// Exact `a * b`, routed through `mul_add` so no bare float operator remains.
 const fn fmul(a: f64, b: f64) -> f64 {
 	return a.mul_add(b, 0.0);
 }
 
-/// Exact `a / b`, dispatched through the `Div` trait so no bare float operator remains.
 fn fdiv(a: f64, b: f64) -> f64 {
 	return Div::div(a, b);
 }
 
-/// Negation of `a`, routed through `mul_add` so no bare float operator remains.
 const fn fneg(a: f64) -> f64 {
 	return a.mul_add(-1.0, 0.0);
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension overflows `i32`.
 #[inline]
 pub fn gpu_kernel_matrix(
 	x: &GpuBuffer,
@@ -117,8 +110,6 @@ pub fn gpu_kernel_matrix(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_smo_kkt_score(
 	grad: &GpuBuffer,
@@ -147,8 +138,6 @@ pub fn gpu_smo_kkt_score(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_smo_kernel_row(
 	x: &GpuBuffer,
@@ -184,8 +173,6 @@ pub fn gpu_smo_kernel_row(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_smo_argmax(s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i = ci(n)?;
@@ -202,8 +189,6 @@ pub fn gpu_smo_argmax(s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hi
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32`.
 #[inline]
 pub fn gpu_smo_update_gradient_rows(
 	ki: &GpuBuffer,
@@ -229,7 +214,6 @@ pub fn gpu_smo_update_gradient_rows(
 	return Ok(());
 }
 
-/// Downloads a single f64 element from device buffer `buf` at index `idx`.
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
 	// SAFETY: idx * size_of::<f64>() keeps the byte offset inside buf's allocation.
@@ -249,7 +233,6 @@ fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	return Ok(v[0]);
 }
 
-/// Uploads a single f64 `val` into the first slot of device buffer `buf`.
 fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 	let v = [val];
 	// SAFETY: v (host) holds one f64 copied H2D into buf (device).
@@ -265,10 +248,6 @@ fn write1(buf: &GpuBuffer, val: f64) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// Runs the argmax kernel over `score` and returns the winning `(value, index)` pair.
-///
-/// # Errors
-/// Returns [`HipError`] if the launch, download, or synchronize fails.
 fn argmax_pick(score: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(f64, usize), HipError> {
 	let mut am = [0.0f64; 2];
 	gpu_smo_argmax(score, n, out)?;
@@ -280,10 +259,6 @@ fn argmax_pick(score: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(f64, usi
 	return Ok((am[0], idx));
 }
 
-/// Bias contribution from the support vector at `idx` when multiplier `a` sits strictly inside `(0, c)`.
-///
-/// # Errors
-/// Returns [`HipError`] if the gradient read fails.
 fn bias_contrib(
 	grad_buf: &GpuBuffer,
 	idx: usize,
@@ -302,62 +277,34 @@ pub struct SmoModel {
 	pub b: f64,
 }
 
-/// Clamp interval `[lo, hi]` for the low multiplier in an SMO update step.
 struct Bounds {
-	/// Lower clamp bound.
 	lo: f64,
-	/// Upper clamp bound.
 	hi: f64,
 }
 
-/// Device buffers and scalar hyper-parameters shared across every SMO iteration.
 struct SmoCtx<'a> {
-	/// Training feature matrix (device), borrowed from the caller.
 	x_buf: &'a GpuBuffer,
-	/// Labels in `{-1, +1}` (device).
 	y_buf: GpuBuffer,
-	/// Multiplier mirror handed to the KKT-score kernel (device).
 	alpha_buf: GpuBuffer,
-	/// Gradient vector (device), updated in place each step.
 	grad_buf: GpuBuffer,
-	/// Per-sample up-side KKT score scratch (device).
 	up_score_buf: GpuBuffer,
-	/// Per-sample low-side KKT score scratch (device).
 	low_score_buf: GpuBuffer,
-	/// Kernel row for the up index (device).
 	krow_i: GpuBuffer,
-	/// Kernel row for the low index (device).
 	krow_j: GpuBuffer,
-	/// Two-element argmax result `[value, index]` (device).
 	argmax_out: GpuBuffer,
-	/// Kernel gamma coefficient (device scalar).
 	gamma_buf: GpuBuffer,
-	/// Kernel coef0 term (device scalar).
 	coef0_buf: GpuBuffer,
-	/// Kernel polynomial degree (device scalar).
 	degree_buf: GpuBuffer,
-	/// Box constraint `C` (device scalar).
 	c_buf: GpuBuffer,
-	/// Up-side gradient delta staging (device scalar).
 	up_delta_buf: GpuBuffer,
-	/// Low-side gradient delta staging (device scalar).
 	low_delta_buf: GpuBuffer,
-	/// Number of training samples.
 	n: usize,
-	/// Feature dimensionality.
 	dim: usize,
-	/// Kernel selector.
 	kind_u: usize,
-	/// KKT convergence tolerance.
 	tol: f64,
-	/// Box constraint `C` (host copy).
 	c: f64,
 }
 
-/// Computes the kernel row for sample `row` into `krow` using `ctx`'s hyper-parameters.
-///
-/// # Errors
-/// Returns [`HipError`] if the launch fails or a size overflows `i32`.
 fn smo_kernel_row(ctx: &SmoCtx<'_>, row: usize, krow: &GpuBuffer) -> Result<(), HipError> {
 	return gpu_smo_kernel_row(
 		ctx.x_buf,
@@ -372,8 +319,6 @@ fn smo_kernel_row(ctx: &SmoCtx<'_>, row: usize, krow: &GpuBuffer) -> Result<(), 
 	);
 }
 
-/// # Errors
-/// Returns an error if a kernel launch, device transfer, or synchronize fails.
 #[inline]
 pub fn gpu_smo_train(
 	x_buf: &GpuBuffer,

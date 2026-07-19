@@ -279,9 +279,6 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Borders, Wrap};
 use tui_textarea::TextArea;
 
-/// Owns the terminal for a TUI session: while alive, fd 2 is redirected to a log
-/// file so `Write::*` diagnostics from generation cannot corrupt the ratatui
-/// screen. Dropping restores the terminal and fd 2, then reports the log path.
 struct TermRestore {
 	saved_stderr: i32,
 }
@@ -308,8 +305,6 @@ impl Drop for TermRestore {
 	}
 }
 
-/// Redirects fd 2 to `path` (truncating it), returning a dup of the original fd 2
-/// to restore later, or `-1` if the redirect could not be set up.
 fn redirect_stderr(path: &str) -> i32 {
 	let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
 		return -1;
@@ -376,10 +371,6 @@ fn toks_to_lines(toks: &[Tok]) -> Vec<Line<'static>> {
 	lines
 }
 
-/// Char-level display-width wrap of one logical line into rows of at most `w`
-/// cells (always at least one row) — the input box renders these pre-wrapped
-/// rows so its height and cursor math are exact by construction (ratatui's
-/// `Wrap` is word-based and would drift from the height calculation).
 fn wrap_rows(s: &str, w: usize) -> Vec<String> {
 	use unicode_width::UnicodeWidthChar;
 	let mut rows = Vec::new();
@@ -398,10 +389,6 @@ fn wrap_rows(s: &str, w: usize) -> Vec<String> {
 	return rows;
 }
 
-/// The wrapped cursor position for `input` at `w` cells per row: visual rows of
-/// every logical line above, plus the display width of the cursor line's prefix
-/// divided by the row width. A prefix filling its rows exactly lands the cursor
-/// at column 0 of a fresh row, which is what grows the box one line on wrap.
 fn input_cursor(input: &TextArea, w: usize) -> (usize, usize) {
 	use unicode_width::UnicodeWidthChar;
 	let (row, col) = input.cursor();
@@ -417,10 +404,6 @@ fn input_cursor(input: &TextArea, w: usize) -> (usize, usize) {
 	return (y + pw / w, pw % w);
 }
 
-/// The capability sanity line under the input box: each entry appears only after
-/// the mechanism PROVABLY happened this process (flash kernel launched, KV rows
-/// appended, a launch's K/V sweep actually tiled) or provably exists (Infinity
-/// Cache by device arch). Nothing here is a build-time claim.
 fn caps_line(loaded: bool) -> Line<'static> {
 	if !loaded {
 		return Line::from(String::new());
@@ -447,11 +430,6 @@ fn caps_line(loaded: bool) -> Line<'static> {
 	));
 }
 
-/// One finished scrollback entry. `body` is the PURE assistant reply — the only
-/// text that may re-enter the chat template as history. `shown` is what the
-/// screen renders: body plus frozen timer/stat lines, notes, error text. The
-/// two are separate on purpose: stats fed back into the template as assistant
-/// content garble every later turn.
 struct Entry {
 	user: String,
 	body: String,
@@ -636,9 +614,6 @@ fn render_models(frame: &mut Frame, names: &[String], cur: usize) {
 	frame.render_widget(para, frame.area());
 }
 
-/// Single-select dropdown over the gguf.toml model names; returns the chosen
-/// index, or `None` if the user quits without selecting. Mirrors the
-/// [`peers_picker`] ratatui style.
 pub fn model_picker(names: &[String]) -> Option<usize> {
 	if !io::stdin().is_terminal() {
 		gpu_core::log::Write::error("run: needs a tty");
@@ -672,17 +647,11 @@ pub fn model_picker(names: &[String]) -> Option<usize> {
 	}
 }
 
-/// The one paste path: CRLF/CR normalized to LF, trailing newlines stripped so a
-/// paste never submits, interior newlines kept as textarea line breaks.
 fn insert_paste(textarea: &mut TextArea, s: &str) {
 	let text = s.replace("\r\n", "\n").replace('\r', "\n");
 	let _ins = textarea.insert_str(text.trim_end_matches('\n'));
 }
 
-/// Non-blocking input drain, waiting up to `wait_ms` for the first event (frame
-/// pacing): Esc or Ctrl-C sets `cancel`, a bracketed paste lands in `textarea`
-/// via [`insert_paste`] so text pasted mid-reply survives into the next message,
-/// and other keys are ignored while a reply streams.
 fn drain_input(cancel: &std::sync::atomic::AtomicBool, textarea: &mut TextArea, wait_ms: u64) {
 	let mut ready = event::poll(std::time::Duration::from_millis(wait_ms)).unwrap_or(false);
 	while ready {
@@ -740,9 +709,6 @@ pub fn render_once(gguf: &str, prompt: &str) {
 	}
 }
 
-/// Events streamed from the session worker to the chat UI thread: live token
-/// snapshots during load or decode, the load terminal signals, and the finished
-/// reply for a message (Ok body or a formatted error string).
 enum FromWorker {
 	Snap(Vec<Tok>),
 	Loaded,
@@ -756,11 +722,6 @@ enum LoadOutcome {
 	Failed(String),
 }
 
-/// Owns the resident [`ChatSession`] for the chat's lifetime on its own thread:
-/// loads the weights once (streaming snapshots + honoring the cancel flag), then
-/// serves each prompt from `prompts` by calling `generate_in` against those same
-/// weights — no reload between messages. Exits when `prompts` closes (chat quit),
-/// dropping the session so the weights free exactly once.
 fn session_worker(
 	gguf: &Path,
 	prompts: std::sync::mpsc::Receiver<String>,
@@ -801,9 +762,6 @@ fn session_worker(
 	}
 }
 
-/// Renders the load screen and polls keys until the worker reports the load
-/// finished, was cancelled (Esc/Ctrl-C), or failed. A cancel sets the shared
-/// flag so `ChatSession::open` returns cleanly.
 fn wait_load(
 	term: &mut ratatui::DefaultTerminal,
 	textarea: &mut TextArea,
@@ -834,13 +792,6 @@ fn wait_load(
 	}
 }
 
-/// Sends one already-templated prompt's decode span through the UI: streams
-/// token snapshots and polls keys every 50ms so Esc/Ctrl-C cancels the
-/// generation (setting the flag) while leaving the session alive for the next
-/// message. Returns the worker's reply, or `None` if the worker channel closed.
-/// A finished message's frozen step lines: the pre-stream steps (prefill/TTFT),
-/// the reply, and the final token-rate line — exactly what the live view showed,
-/// stopped at their final values.
 struct RunDone {
 	r: std::result::Result<String, String>,
 	pre: Vec<String>,

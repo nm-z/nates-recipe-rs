@@ -28,8 +28,6 @@ fn upload(v: &[f64]) -> GpuBuffer {
 	return b;
 }
 
-/// Host f64 causal masked-softmax attention: query `i` (abs pos `p_base+i`), head
-/// `h` (kv head `h / (nqh/nkv)`) attends keys `0..=p_base+i`.
 fn reference(
 	q: &[f64],
 	k: &[f64],
@@ -110,8 +108,6 @@ fn flash_mask_does_not_leak_future_positions() {
 
 	let base = run_flash(&q, &k, &v, t_q, t_kv, nqh, nkv, hd, p_base);
 
-	// Perturb the LAST cache row (abs position p_base + t_q - 1): a FUTURE position
-	// for queries 0..t_q-1, its own position only for the last query.
 	let pf = p_base + t_q - 1;
 	let mut k2 = k.clone();
 	let mut v2 = v.clone();
@@ -134,7 +130,6 @@ fn flash_mask_does_not_leak_future_positions() {
 			}
 		}
 	}
-	// The last query is AT pf, so it legitimately attends the perturbed row.
 	let last = (t_q - 1) * nqh * hd;
 	assert!(
 		(base[last] - perturbed[last]).abs() > 1e-9,
@@ -145,7 +140,6 @@ fn flash_mask_does_not_leak_future_positions() {
 #[test]
 fn flash_matches_reference_masked_softmax() {
 	let _g = GPU.lock().unwrap_or_else(|p| p.into_inner());
-	// Several shapes including GQA head ratios (nqh/nkv = 1, 2, 4) and MQA.
 	let shapes = [
 		(5usize, 2usize, 2usize, 8usize, 0usize),
 		(6, 4, 2, 16, 2),

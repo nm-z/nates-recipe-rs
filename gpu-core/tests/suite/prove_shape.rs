@@ -1,18 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "shape" inventory category.
-//
-// Shape ops are pure index remaps: out[i] = x[src(i)]. No arithmetic happens,
-// so GPU and a direct Rust reimplementation of the same index map must agree
-// bit-exact (we assert within tol 1e-7 anyway). Inputs are distinct values
-// (x[i] = i+1, non-square shapes) so any index error becomes a visible mismatch.
-//
-// Each op declares its true FFI signature (heterogeneous arities) and a
-// self-contained closure that sets up input/dims, runs the GPU op, computes the
-// oracle, and compares. We then walk kernel_inventory/*.json: every shape item
-// whose canonical name maps to a passing registered op is proven. The test
-// FAILS on any registered-op mismatch (a real bug). Unmapped items (reshape,
-// squeeze, slice, stack, broadcast, ... — view/no-op or out of scope) stay as
-// honest backlog, never faked.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -113,7 +99,6 @@ fn check_last() {
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 }
 
-// distinct, non-degenerate input: x[i] = i+1
 fn seq(n: usize) -> Vec<f64> {
 	(0..n).map(|i| (i + 1) as f64).collect()
 }
@@ -127,11 +112,9 @@ fn veq(a: &[f64], b: &[f64]) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-op GPU runners + CPU oracles. Each returns true iff GPU == oracle.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn prove_transpose() -> bool {
-	// non-square 3x4 so a rows/cols swap cannot hide
 	let (r, c) = (3usize, 4usize);
 	let x = seq(r * c);
 	let gx = upload(&x);
@@ -225,17 +208,13 @@ fn prove_flip() -> bool {
 }
 
 fn prove_rot90() -> bool {
-	// numpy rot90 (k=1) = transpose then flipud == fliplr then transpose.
-	// Compose proven primitives as oracle: out = transpose(fliplr(x)).
 	let (r, c) = (3usize, 4usize);
 	let x = seq(r * c);
-	// GPU: fliplr then transpose
 	let f = run_flip(&x, r, c, 1); // r x c
 	let gf = upload(&f);
 	let g = GpuBuffer::alloc(r * c).unwrap();
 	gpu_core::kernels::gpu_transpose(&gf, r, c, &g).unwrap(); // c x r
 	let got = download(&g, r * c);
-	// oracle: numpy.rot90 -> out[c-1-j][i] = x[i][j], shape c x r
 	let mut want = vec![0.0; r * c];
 	for i in 0..r {
 		for j in 0..c {
@@ -371,7 +350,6 @@ fn prove_tile() -> bool {
 }
 
 fn prove_repeat() -> bool {
-	// numpy.repeat along axis 0 (interleave): rows duplicated in place.
 	let (r, c) = (3usize, 2usize);
 	let reps = 3usize;
 	let x = seq(r * c);
@@ -440,7 +418,6 @@ fn prove_diagonal() -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Registry + canonicalization
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn registry() -> HashMap<&'static str, fn() -> bool> {
@@ -460,11 +437,6 @@ fn registry() -> HashMap<&'static str, fn() -> bool> {
 	m
 }
 
-// Canonicalize a shape JSON name to a registry key. Strip lib prefix (last
-// segment after . : $), lowercase, strip leading underscores, then map TRUE
-// synonyms only. Names whose semantics differ from the registered op (masked
-// reverse_sequence, attention transpose, list reverse, diag construction,
-// un/pad_input) are intentionally left unmapped (honest backlog).
 fn canon(name: &str) -> String {
 	let mut base = name
 		.rsplit(['.', ':', '$'])
@@ -474,14 +446,12 @@ fn canon(name: &str) -> String {
 	while base.starts_with('_') {
 		base.remove(0);
 	}
-	// strip a trailing dtype/alias disambiguator on the same forward op
 	for suf in ["_copy", "_8u_c1r", "_2", "_forward", "_kernel", "_op"] {
 		if let Some(s) = base.strip_suffix(suf) {
 			base = s.to_string();
 		}
 	}
 	let alias: &[(&str, &str)] = &[
-		// transpose (plain 2D matrix transpose only)
 		("transpose", "transpose"),
 		("matrix_transpose", "transpose"),
 		("devicetranspose", "transpose"),
@@ -489,30 +459,23 @@ fn canon(name: &str) -> String {
 		("nppitranspose", "transpose"),
 		("fp8_transpose", "transpose"),
 		("stablehlo_transpose", "transpose"),
-		// pad (constant pad)
 		("pad", "pad"),
 		("dynamic_pad", "pad"),
 		("zeropadding1d", "pad"),
 		("zeropadding2d", "pad"),
 		("zeropadding3d", "pad"),
-		// flip family
 		("flip", "flip"),
 		("rev", "flip"),
 		("reverse", "flip"),
 		("reverse_v2", "flip"),
 		("fliplr", "fliplr"),
 		("flipud", "flipud"),
-		// rotate
 		("rot90", "rot90"),
-		// roll
 		("roll", "roll"),
-		// tile
 		("tile", "tile"),
-		// repeat (interleave). torch.repeat = tile semantics -> tile.
 		("repeat_interleave", "repeat"),
 		("repeat", "repeat"),
 		("repeatvector", "tile"),
-		// diagonal extraction
 		("diagonal", "diagonal"),
 	];
 	for (a, c) in alias {
@@ -560,7 +523,6 @@ fn prove_shape() {
 	assert!(!items.is_empty(), "no shape items in inventory");
 	let reg = registry();
 
-	// Prove each registered op once.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	let mut failures: Vec<String> = Vec::new();
 	for (k, f) in reg.iter() {
@@ -571,7 +533,6 @@ fn prove_shape() {
 		}
 	}
 
-	// Walk inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

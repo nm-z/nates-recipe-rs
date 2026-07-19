@@ -15,11 +15,6 @@ fn close(a: f64, b: f64) -> bool {
 
 #[test]
 fn test_csr_spmv() {
-	// 3x3 sparse A:
-	//   row 0: (0,1.0),(1,2.0)
-	//   row 1: (1,3.0),(2,4.0)
-	//   row 2: (0,5.0)
-	// x=[1,2,3] → y=[5,18,5]
 	let values_h: [f64; 5] = [1.0, 2.0, 3.0, 4.0, 5.0];
 	let col_idx_h: [i32; 5] = [0, 1, 1, 2, 0];
 	let row_ptr_h: [i32; 4] = [0, 2, 4, 5];
@@ -58,8 +53,6 @@ fn test_csr_spmv() {
 
 #[test]
 fn test_csr_spmm() {
-	// Same A, B = [[1,2],[3,4],[5,6]] (3x2 row-major)
-	// C[0] = [7,10], C[1] = [29,36], C[2] = [5,10]
 	let values_h: [f64; 5] = [1.0, 2.0, 3.0, 4.0, 5.0];
 	let col_idx_h: [i32; 5] = [0, 1, 1, 2, 0];
 	let row_ptr_h: [i32; 4] = [0, 2, 4, 5];
@@ -105,9 +98,6 @@ fn test_csr_spmm() {
 
 #[test]
 fn test_neighbor_aggregate_sum() {
-	// 4 nodes, edges: 0->1, 2->1, 2->3 (node 1 has in-degree 2)
-	// features: node0=[1,2], node1=[3,4], node2=[5,6], node3=[7,8]
-	// agg[0]=[0,0], agg[1]=[6,8], agg[2]=[0,0], agg[3]=[5,6]
 	let features_h: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 	let edge_src_h: [i32; 3] = [0, 2, 2];
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
@@ -153,9 +143,6 @@ fn test_neighbor_aggregate_sum() {
 
 #[test]
 fn test_neighbor_aggregate_mean() {
-	// Same graph: 0->1, 2->1, 2->3
-	// agg[1] = [6/2, 8/2] = [3, 4] (in-degree 2)
-	// agg[3] = [5/1, 6/1] = [5, 6]
 	let features_h: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 	let edge_src_h: [i32; 3] = [0, 2, 2];
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
@@ -201,8 +188,6 @@ fn test_neighbor_aggregate_mean() {
 
 #[test]
 fn test_gpu_degree() {
-	// Edges 0->1, 2->1, 2->3 → dst=[1,1,3]
-	// deg[0]=0, deg[1]=2, deg[2]=0, deg[3]=1
 	let edge_dst_h: [i32; 3] = [1, 1, 3];
 
 	let edge_dst = GpuBuffer::upload_i32(&edge_dst_h).unwrap();
@@ -231,9 +216,6 @@ fn test_gpu_degree() {
 
 #[test]
 fn test_gpu_gcn_norm() {
-	// features = [[1,0],[2,0],[3,0],[4,0]], deg = [1,4,9,16]
-	// scale[i] = 1/sqrt(deg[i])
-	// result: [[1,0],[1,0],[1,0],[1,0]]
 	let mut features_h: [f64; 8] = [1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0];
 	let deg_h: [f64; 4] = [1.0, 4.0, 9.0, 16.0];
 
@@ -260,8 +242,6 @@ fn test_gpu_gcn_norm() {
 		features_h.iter().all(|v| v.is_finite()),
 		"NaN/Inf in gcn_norm"
 	);
-	// every row's first column should be 1.0 (n*1/sqrt(n^2) = 1)
-	// col 0: 1*1=1, 2*0.5=1, 3*(1/3)=1, 4*0.25=1
 	for i in 0..4 {
 		assert!(
 			close(features_h[i * 2], 1.0),
@@ -282,10 +262,6 @@ fn test_gpu_gcn_norm() {
 
 #[test]
 fn test_forward_backward() {
-	// 2-state HMM, T=3
-	// log_trans[s*2+s2]: 0->0=log(0.7), 0->1=log(0.3), 1->0=log(0.4), 1->1=log(0.6)
-	// log_emit[t*2+s]: t=0 obs=0, t=1 obs=1, t=2 obs=0
-	//   s=0: emit(0)=0.9, emit(1)=0.1; s=1: emit(0)=0.2, emit(1)=0.8
 	let log_trans_h: [f64; 4] = [0.7f64.ln(), 0.3f64.ln(), 0.4f64.ln(), 0.6f64.ln()];
 	let log_emit_h: [f64; 6] = [
 		0.9f64.ln(),
@@ -345,7 +321,6 @@ fn test_forward_backward() {
 		"NaN/Inf in log_gamma"
 	);
 
-	// CPU reference (computed with Python logsumexp):
 	let ref_alpha: [f64; 6] = [
 		-0.798508,
 		-consts::LN_10,
@@ -377,7 +352,6 @@ fn test_forward_backward() {
 			log_beta[i]
 		);
 	}
-	// gamma: check that each timestep's probabilities sum to 1
 	for t in 0..3 {
 		let p0 = log_gamma[t * 2].exp();
 		let p1 = log_gamma[t * 2 + 1].exp();
@@ -388,7 +362,6 @@ fn test_forward_backward() {
 			p0 + p1
 		);
 	}
-	// check actual gamma values against reference
 	for i in 0..6 {
 		assert!(
 			close(log_gamma[i], ref_gamma[i]),
@@ -404,7 +377,6 @@ fn test_forward_backward() {
 
 #[test]
 fn test_viterbi() {
-	// Same HMM. Best path brute-forced over all 2^3=8 paths: [0, 1, 0]
 	let log_trans_h: [f64; 4] = [0.7f64.ln(), 0.3f64.ln(), 0.4f64.ln(), 0.6f64.ln()];
 	let log_emit_h: [f64; 6] = [
 		0.9f64.ln(),
@@ -437,7 +409,6 @@ fn test_viterbi() {
 	path_gpu.download_i32(&mut path).unwrap();
 
 	println!("Viterbi best_path = {:?}", path);
-	// Brute-force best path is [0, 1, 0]
 	assert_eq!(path[0], 0, "Viterbi path[0]: expected 0, got {}", path[0]);
 	assert_eq!(path[1], 1, "Viterbi path[1]: expected 1, got {}", path[1]);
 	assert_eq!(path[2], 0, "Viterbi path[2]: expected 0, got {}", path[2]);
@@ -447,9 +418,6 @@ fn test_viterbi() {
 
 #[test]
 fn test_union_find_cc() {
-	// 5 nodes, 2 components:
-	//   Component A: 0,1,2 (edges 0-1, 1-2)
-	//   Component B: 3,4   (edge  3-4)
 	let edge_src_h: [i32; 3] = [0, 1, 3];
 	let edge_dst_h: [i32; 3] = [1, 2, 4];
 
@@ -463,8 +431,6 @@ fn test_union_find_cc() {
 
 	println!("UF parent = {:?}", parent);
 
-	// After path compression: all nodes in same component share the same root.
-	// Don't hard-code which root wins — just check partition structure.
 	assert_eq!(
 		parent[0], parent[1],
 		"UF: nodes 0 and 1 should be in same component, got roots {} and {}",
@@ -486,7 +452,6 @@ fn test_union_find_cc() {
 		parent[0]
 	);
 
-	// Exactly 2 distinct component labels
 	let mut roots: HashSet<i32> = HashSet::new();
 	for &p in &parent {
 		roots.insert(p);
@@ -504,14 +469,6 @@ fn test_union_find_cc() {
 
 #[test]
 fn test_boruvka_mst() {
-	// 4 nodes, 4 undirected edges (each stored once as directed):
-	//   edge 0: 0->1 w=1.0
-	//   edge 1: 1->2 w=5.0
-	//   edge 2: 2->3 w=2.0
-	//   edge 3: 0->3 w=10.0
-	// Kruskal MST: pick (0,1,1), (2,3,2), (1,2,5) = total 8.0
-	// The boruvka kernel runs UF on ALL edges (not just MST edges) between rounds,
-	// which may over-merge. Report the actual weight as a finding if != 8.0.
 	let edge_src_h: [i32; 4] = [0, 1, 2, 0];
 	let edge_dst_h: [i32; 4] = [1, 2, 3, 3];
 	let edge_w_h: [f64; 4] = [1.0, 5.0, 2.0, 10.0];
@@ -538,7 +495,6 @@ fn test_boruvka_mst() {
 		"NaN/Inf in Boruvka total_weight"
 	);
 
-	// Expected MST weight = 8.0 (Kruskal reference)
 	assert!(
 		close(result.total_weight, 8.0),
 		"FINDING: Boruvka total_weight: expected 8.0, got {}. Likely over-merging bug \
@@ -546,7 +502,6 @@ fn test_boruvka_mst() {
 		result.total_weight
 	);
 
-	// MST should have exactly n_nodes-1 = 3 edges
 	let mst_count = in_mst.iter().filter(|&&b| b != 0).count();
 	assert_eq!(
 		mst_count, 3,
@@ -559,12 +514,6 @@ fn test_boruvka_mst() {
 
 #[test]
 fn test_core_distance() {
-	// 4 points in 1D: [0.0, 1.0, 2.0, 10.0], min_pts=2
-	// Core dist = 2nd smallest distance to other points (excluding self)
-	// point 0: dists=[1,2,10] → 2nd = 2.0
-	// point 1: dists=[1,1,9]  → 2nd = 1.0
-	// point 2: dists=[1,2,8]  → 2nd = 2.0
-	// point 3: dists=[8,9,10] → 2nd = 9.0
 	let points_h: [f64; 4] = [0.0, 1.0, 2.0, 10.0];
 
 	let points = {

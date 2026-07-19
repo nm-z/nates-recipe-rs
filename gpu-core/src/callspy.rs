@@ -3,7 +3,6 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Declares each named counter as a private atomic tally cell initialised to zero.
 macro_rules! counters {
 	($($name:ident),* $(,)?) => {
 		$(pub(crate) static $name: AtomicU64 = AtomicU64::new(0);)*
@@ -60,7 +59,6 @@ counters!(
 	HOST_GET_DEVICE_POINTER,
 );
 
-/// Increments a counter cell by one with relaxed ordering.
 #[inline]
 pub(crate) fn tick(c: &AtomicU64) {
 	c.fetch_add(1, Ordering::Relaxed);
@@ -68,7 +66,6 @@ pub(crate) fn tick(c: &AtomicU64) {
 
 pub const N: usize = 47;
 
-/// Registry of every counter cell in the same order as [`snapshot`] reads them.
 static ALL: [&AtomicU64; N] = [
 	&HOST_MALLOC,
 	&HOST_FREE,
@@ -140,28 +137,20 @@ pub fn report_since(base: &[u64; N]) -> ogdl::Node {
 	return report_between(base, &snapshot());
 }
 
-/// Builds a single `name -> value` OGDL leaf node.
 fn kv(name: &str, val: String) -> ogdl::Node {
 	return ogdl::Node::new(name.to_owned(), vec![ogdl::Node::new(val, Vec::new())]);
 }
 
-/// One counter and the human-readable label it appears under in the report.
 struct CounterEntry {
-	/// The atomic cell whose delta is reported.
 	counter: &'static AtomicU64,
-	/// Label shown for this counter in the report tree.
 	name: &'static str,
 }
 
-/// A named group of counters rendered as one subtree of the report.
 struct CounterGroup {
-	/// Group heading shown in the report tree.
 	group: &'static str,
-	/// Counters that belong to this group.
 	entries: &'static [CounterEntry],
 }
 
-/// Static grouping of every counter into the report's section layout.
 static GROUPS: &[CounterGroup] = &[
 	CounterGroup {
 		group: "sync",
@@ -375,7 +364,6 @@ static GROUPS: &[CounterGroup] = &[
 	},
 ];
 
-/// Returns the index of counter `c` within [`ALL`], aborting if it is unregistered.
 fn index_of(c: &AtomicU64) -> usize {
 	return ALL
 		.iter()
@@ -409,9 +397,7 @@ pub fn report_between(base: &[u64; N], end: &[u64; N]) -> ogdl::Node {
 	return root;
 }
 
-/// Counter snapshot taken when the training loop begins.
 static LOOP_START: Mutex<Option<[u64; N]>> = Mutex::new(None);
-/// Counter snapshot taken when the training loop ends.
 static LOOP_END: Mutex<Option<[u64; N]>> = Mutex::new(None);
 
 #[inline]
@@ -424,41 +410,27 @@ pub fn mark_loop_end() {
 	*LOOP_END.lock().unwrap_or_else(|p| return p.into_inner()) = Some(snapshot());
 }
 
-/// One of the three run phases and the snapshot bounds that delimit it.
 struct Phase<'a> {
-	/// Phase heading shown in the state tree.
 	name: &'a str,
-	/// Counter snapshot at the phase start.
 	a: &'a [u64; N],
-	/// Counter snapshot at the phase end.
 	b: &'a [u64; N],
 }
 
-/// A counter total that has no assigned spec cell, tracked per phase.
 struct Tail<'a> {
-	/// Label for the untracked total.
 	what: &'a str,
-	/// Per-phase counts (init, loop, exit).
 	v: [u64; 3],
 }
 
-/// A labelled value summed from several counters within one phase.
 struct Sub {
-	/// Label shown for this summed value.
 	label: &'static str,
-	/// Counters summed to produce the value.
 	counters: &'static [&'static AtomicU64],
 }
 
-/// A category grouping several summed values under one heading per phase.
 struct Cat {
-	/// Category heading shown in the state tree.
 	label: &'static str,
-	/// Summed values shown under the heading.
 	subs: &'static [Sub],
 }
 
-/// Per-phase state-tree layout: which counters roll up into which value.
 static CATS: &[Cat] = &[
 	Cat {
 		label: "calcs",

@@ -45,9 +45,6 @@ fn argmax(logits: &[f64], vocab: usize) -> u32 {
 	return best as u32;
 }
 
-/// From-scratch oracle: full-sequence recompute per step. `last_logits` returns
-/// scaled/softcapped final-position logits, so argmax reproduces the cached
-/// path's greedy pick without needing the cache.
 fn scratch_generate(gguf: &Path, prompt: &[u32], n_new: usize) -> Vec<u32> {
 	let vocab = last_logits(gguf, prompt)
 		.expect("scratch prime logits")

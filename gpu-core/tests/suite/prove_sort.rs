@@ -1,17 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "sort" inventory category.
-//
-// For every sort-category item in kernel_inventory/*.json, canonicalize its name;
-// if that canonical op is registered here, run the gpu-core sortx_ kernel on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE oracle (std/CPU sort).
-// All full sorts use hipcub::DeviceRadixSort on device; the oracle is a CPU sort
-// of the same data, which is the definition of a correct sort. tol 1e-7.
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). Items with no kernel op here
-// (joins, candidate samplers, ranking metrics, lexsort, unique, structural cub::
-// Block*/Warp* building blocks, approximate top-k) stay backlog, reported but
-// never faked green.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -121,7 +108,6 @@ fn lasterr() {
 	gpu_core::hip::check(unsafe { gpu_core::hip::hipGetLastError() }).unwrap();
 }
 
-// A deterministic but unsorted, duplicate-bearing probe vector.
 fn data() -> Vec<f64> {
 	let raw = [
 		3.5, -1.0, 7.25, 0.0, 7.25, -8.0, 2.0, 5.5, -1.0, 9.0, 4.0, -3.5, 6.0, 1.5, -2.0, 8.0,
@@ -376,7 +362,6 @@ fn cpu_sorted_asc(x: &[f64]) -> Vec<f64> {
 	v
 }
 
-// Prove each registered op against its CPU oracle. Returns (op_ok map, failures).
 fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	let x = data();
 	let n = x.len();
@@ -393,14 +378,12 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		}};
 	}
 
-	// sort ascending == CPU sort
 	{
 		let g = run_keys(launch_sortx_sort_asc, sortx_sort_asc_workspace_bytes, &x);
 		let pass =
 			g.len() == asc.len() && g.iter().zip(&asc).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!("sort", pass, format!("sort_asc {:?} != {:?}", g, asc));
 	}
-	// sort descending == reversed CPU sort
 	{
 		let mut desc = asc.clone();
 		desc.reverse();
@@ -412,8 +395,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 			format!("sort_desc {:?} != {:?}", g, desc)
 		);
 	}
-	// argsort: indices must (a) be a permutation and (b) order the data ascending,
-	// matching the stable CPU argsort exactly (radix SortPairs is stable).
 	{
 		let g = run_argsort(&x);
 		let mut cpu: Vec<usize> = (0..n).collect();
@@ -434,7 +415,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let pass = monotone && perm && matches_cpu;
 		mark!("argsort", pass, format!("argsort {:?} (cpu {:?})", g, cpu));
 	}
-	// topk: the k largest values, descending (torch.topk convention)
 	{
 		let k = 5usize;
 		let mut desc = asc.clone();
@@ -444,7 +424,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		let pass = g.iter().zip(want).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!("topk", pass, format!("topk {:?} != {:?}", g, want));
 	}
-	// kthvalue: k-th smallest (1-based)
 	{
 		let mut all = true;
 		for k in [1usize, 7, n] {
@@ -462,7 +441,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 		}
 		ok.insert("kthvalue", all);
 	}
-	// median: even-n => mean of two central; verify odd-n branch too
 	{
 		let g = run_median(&x);
 		let want = 0.5 * (asc[n / 2 - 1] + asc[n / 2]);
@@ -481,7 +459,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 			)
 		);
 	}
-	// argmax / argmin (ties: radix pair sort returns the lowest original index)
 	{
 		let g = run_argextreme(launch_sortx_argmax, sortx_argmax_workspace_bytes, &x);
 		let want = (0..n)
@@ -494,7 +471,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 			.unwrap() as i32;
 		mark!("argmin", g2 == want2, format!("argmin {} != {}", g2, want2));
 	}
-	// searchsorted (left): out[j] == count of sorted[i] < q[j]
 	{
 		let q = [-9.0, -1.0, 0.0, 2.0, 7.25, 10.0, 11.0];
 		let g = run_searchsorted(&asc, &q);
@@ -513,9 +489,6 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	(ok, fail)
 }
 
-// Canonicalize a sort-category JSON name to a registry key. Strip lib prefix
-// (last path segment), lowercase, drop dtype/alias disambiguators, then map TRUE
-// synonyms only.
 fn canon(name: &str) -> String {
 	let base = name
 		.rsplit(['.', ':', '$'])
@@ -529,7 +502,6 @@ fn canon(name: &str) -> String {
 		.or_else(|| base.strip_suffix("v2").map(|s| s.to_string()))
 		.unwrap_or(base);
 	let alias: &[(&str, &str)] = &[
-		// plain ascending sort + all stable/merge/radix keys-only variants
 		("sort", "sort"),
 		("sortkeys", "sort"),
 		("stablesortkeys", "sort"),
@@ -541,15 +513,12 @@ fn canon(name: &str) -> String {
 		("sort_complex", "sort"),
 		("sorted", "sort"),
 		("merge_sorted", "sort"),
-		// descending keys
 		("sortkeysdescending", "sort_desc"),
 		("radix_sort_keys_descending", "sort_desc"),
-		// argsort / sorted_order / stable argsort
 		("argsort", "argsort"),
 		("argsort_stable", "argsort"),
 		("sorted_order", "argsort"),
 		("stable_sorted_order", "argsort"),
-		// pairs / by-key sorts have the SAME key ordering as plain sort (proven via sort/argsort)
 		("sortpairs", "sort"),
 		("sortkeyscopy", "sort"),
 		("sortpairsdescending", "sort_desc"),
@@ -560,20 +529,16 @@ fn canon(name: &str) -> String {
 		("stablesortpairs", "sort"),
 		("sort_key_val", "sort"),
 		("stable_sort_by_key", "sort"),
-		// top-k
 		("topk", "topk"),
 		("top_k", "topk"),
 		("moe_top_k", "topk"),
 		("itoplayer", "topk"),
 		("itopklayer", "topk"),
-		// k-th value / nth element
 		("kthvalue", "kthvalue"),
 		("nthelement", "kthvalue"),
 		("nth_element", "kthvalue"),
-		// argmax / argmin
 		("argmax", "argmax"),
 		("argmin", "argmin"),
-		// searchsorted
 		("searchsorted", "searchsorted"),
 	];
 	for (a, c) in alias {

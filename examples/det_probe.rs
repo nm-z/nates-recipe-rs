@@ -1,9 +1,4 @@
 #![allow(unsafe_code)]
-// Determinism probe: every GPU op the diffusion forward composes, run twice on
-// identical inputs, bit-compared. A DIVERGED op is the source of the observed
-// run-to-run output variance (atomic f64 accumulation or a stream race).
-//
-//   cargo run --release --example det_probe
 
 use anyhow::Context;
 use gpu_core::infer_ops::{
@@ -72,7 +67,6 @@ fn cmp(name: &str, a: &[f64], b: &[f64]) {
 	}
 }
 
-// Plain-Rust CPU oracle for out(m,n) = a(m,k) . b(n,k)^T, row-major.
 fn cpu_gemm_bt(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
 	let mut out = vec![0.0f64; m * n];
 	for i in 0..m {
@@ -85,8 +79,6 @@ fn cpu_gemm_bt(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
 	out
 }
 
-// Custom gemm_bt_f64 vs CPU oracle (accuracy) and vs rocBLAS gpu_gemm_bt_into
-// (cross-check), plus bit-identity across two runs.
 fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	let av = host(m * k, 1000 + m as u64);
 	let bv = host(n * k, 2000 + n as u64 + k as u64);
@@ -137,9 +129,6 @@ fn check_gemm(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	Ok(())
 }
 
-// Time ITERS iterations of rocBLAS gpu_gemm_bt_into vs the custom kernel for
-// one (m,n,k) shape, report ms + effective GB/s (B read once, the dominant
-// bandwidth term) against the 432GB/s gfx1101 floor.
 fn bench_shape(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> {
 	let a = {
 		let __up = &host(m * k, 3000);
@@ -246,7 +235,6 @@ fn main() -> anyhow::Result<()> {
 		})?;
 	}
 
-	// GQA attention, both gemma4 geometries (q/k/v shaped like the real layer).
 	for (hd, nkv, rotary, theta, label) in [
 		(256usize, 8usize, 256usize, 1e4, "gqa sliding hd256"),
 		(512, 2, 128, 1e6, "gqa full hd512"),
@@ -288,7 +276,6 @@ fn main() -> anyhow::Result<()> {
 				.context("flash gqa")
 		})?;
 
-		// rope itself: re-upload, rotate, download, twice.
 		let mut a = vec![0.0f64; T * 16 * hd];
 		let mut b = vec![0.0f64; T * 16 * hd];
 		q.load(&q0).context("reload q")?;
@@ -341,7 +328,6 @@ fn main() -> anyhow::Result<()> {
 		gpu_convert(&stage, o, T * NE, 1.0).context("convert")
 	})?;
 
-	// scale_inplace: in-place, so reload between runs.
 	let mut s1 = vec![0.0f64; T * NE];
 	let mut s2 = vec![0.0f64; T * NE];
 	let x0 = host(T * NE, 43);
@@ -355,7 +341,6 @@ fn main() -> anyhow::Result<()> {
 	gpu_core::hip::device_synchronize().context("dl")?;
 	cmp("scale_inplace", &s1, &s2);
 
-	// scale_f64: in-place, so reload between runs.
 	let mut sf1 = vec![0.0f64; T * NE];
 	let mut sf2 = vec![0.0f64; T * NE];
 	x.load(&x0).context("reload")?;
@@ -374,9 +359,6 @@ fn main() -> anyhow::Result<()> {
 		.fold(0.0f64, f64::max);
 	say(format!("scale_f64 vs hipblasDscal   max_err={err_scale:e}"));
 
-	// Custom f64 GEMM-BT: correctness (CPU oracle + rocBLAS cross-check + bit
-	// identity) across every real gemma4 shape, m spanning the full MoE (1..10)
-	// through full-canvas (48/54) range.
 	say("\n-- gemm_bt_f64 correctness --");
 	check_gemm("q_proj/lm_head", 54, 8192, 2816)?;
 	check_gemm("k_proj", 48, 2048, 2816)?;

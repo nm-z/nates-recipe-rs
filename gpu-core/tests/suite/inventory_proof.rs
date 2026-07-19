@@ -1,12 +1,4 @@
 use crate::common;
-// Data-driven proof harness: for every item in kernel_inventory/*.json, if its
-// canonical op name is registered here, run the gpu-core op on the LIVE GPU and
-// assert it matches a CPU oracle. Prints proven/total coverage per category.
-//
-// "Proving an item operates the same" == its semantics (per the JSON description)
-// reproduced on-device within tolerance. Coverage grows as ops are registered and
-// gaps implemented. The test FAILS only on a registered-op mismatch (a real bug);
-// unmapped items are reported as the remaining backlog, not failures.
 
 use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
@@ -17,8 +9,6 @@ use std::fs;
 use std::mem;
 use std::ptr;
 
-// Ops now write into a caller-provided `out` and return Result<(), _>. The proof
-// harness allocates the out buffer, invokes the op, then downloads to assert.
 type UnaryGpu = fn(&GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 type BinaryGpu = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), HipError>;
 
@@ -140,7 +130,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	u!("sin", gpu_sin, |x| x.sin(), -3.0, 3.0);
 	u!("cos", gpu_cos, |x| x.cos(), -3.0, 3.0);
 	u!("tan", gpu_tan, |x| x.tan(), -1.2, 1.2);
-	// mathx gaps
 	use gpu_core::k_mathx::*;
 	u!("square", gpu_square, |x| x * x, -3.0, 3.0);
 	u!("exp2", gpu_exp2, |x| x.exp2(), -3.0, 3.0);
@@ -161,9 +150,7 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	u!("lgamma", gpu_lgamma, |x| libm::lgamma(x), 0.2, 5.0);
 	u!("deg2rad", gpu_deg2rad, |x| x.to_radians(), -180.0, 180.0);
 	u!("rad2deg", gpu_rad2deg, |x| x.to_degrees(), -3.0, 3.0);
-	// gap activations
 	use gpu_core::k_gapact::{gpu_hardswish, gpu_mish, gpu_selu, gpu_softplus};
-	// device-scalar params (alpha/lambda) upload once inside each wrapper.
 	fn elu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 		let a = {
 			let __up = &[1.0];
@@ -226,7 +213,6 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 		-4.0,
 		4.0
 	);
-	// actx gap activations
 	use gpu_core::k_actx::*;
 	fn celu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 		let p = {
@@ -383,9 +369,6 @@ fn binary_registry() -> HashMap<&'static str, BinaryOp> {
 	m
 }
 
-// Reduce ops write a device scalar into a 1-elem `out`; the harness downloads it.
-// Wrappers allocate any workspace (sized via the paired *_workspace_bytes helper)
-// and the out scalar, then read the value back — download-and-assert is test-side.
 type ReduceGpu = fn(&GpuBuffer, usize) -> Result<f64, HipError>;
 struct ReduceOp {
 	gpu: ReduceGpu,
@@ -490,7 +473,6 @@ fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 	m
 }
 
-// Complex proofs (matmul/dot/scal/softmax): run ONCE, map all alias keys to the pass/fail bool.
 fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 	use gpu_core::kernels::{
 		gpu_gemm, gpu_log_softmax_rows, gpu_scale_inplace, gpu_softmax_rows_into,
@@ -504,7 +486,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 			.all(|(x, y)| (x - y).abs() <= 1e-7 * (1.0 + y.abs()))
 	};
 
-	// gemm: C(m,n) = A(m,k)·B(k,n)
 	let (mm, kk, nn) = (3usize, 4usize, 2usize);
 	let a: Vec<f64> = (0..mm * kk).map(|i| i as f64 * 0.1 - 0.5).collect();
 	let b: Vec<f64> = (0..kk * nn).map(|i| i as f64 * 0.2 - 0.3).collect();
@@ -528,9 +509,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		gpu_core::hip::device_synchronize().unwrap();
 		o
 	};
-	// Fault probe: the first Dgemm of a process intermittently returns garbage
-	// when another GPU process ran moments before. Run it twice — a transient
-	// (clock/init) glitch passes on retry; persistent corruption repeats.
 	let c = run_gemm();
 	let c2 = run_gemm();
 	let mut want = vec![0.0; mm * nn];
@@ -557,7 +535,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("gemm".into());
 	}
 
-	// dot
 	let av: Vec<f64> = (0..16).map(|i| i as f64 * 0.1 - 0.5).collect();
 	let bv: Vec<f64> = (0..16).map(|i| i as f64 * 0.05 + 0.2).collect();
 	let d = {
@@ -589,7 +566,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("dot".into());
 	}
 
-	// scal: y = alpha·x  (alpha uploaded once as a 1-elem device scalar)
 	let xs: Vec<f64> = (0..16).map(|i| i as f64 * 0.1 - 0.5).collect();
 	let y = {
 		let gx = {
@@ -604,7 +580,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 			__ub.load(__up).unwrap();
 			__ub
 		};
-		// in-place scale: gx *= 2.5, then read gx back
 		gpu_scale_inplace(&scalar, 16, &gx).unwrap();
 		let mut o = vec![0.0; 16];
 		unsafe { gx.download_async(&mut o, ptr::null_mut()) }.unwrap();
@@ -618,7 +593,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("scal".into());
 	}
 
-	// softmax + log_softmax (1 row)
 	let sx = vec![0.5, -1.0, 2.0, 0.3, 1.1];
 	let mx = sx.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 	let ex: Vec<f64> = sx.iter().map(|v| (v - mx).exp()).collect();
@@ -663,7 +637,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("log_softmax".into());
 	}
 
-	// gemv: y(m) = A(m,n)·x(n)
 	use gpu_core::kernels::{gpu_cholesky, gpu_cholesky_workspace_bytes};
 	use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
 	use gpu_core::linalg::gpu_dsyrk;
@@ -699,7 +672,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("gemv".into());
 	}
 
-	// ger: A(m,n) = x(m)·y(n)ᵀ  (dger accumulates → out pre-zeroed)
 	let xo: Vec<f64> = (0..gm).map(|i| i as f64 * 0.2 - 0.1).collect();
 	let yo: Vec<f64> = (0..gn).map(|i| i as f64 * 0.15 + 0.3).collect();
 	let ao = {
@@ -740,7 +712,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 	let _ = gpu_dsyrk; // syrk convention deferred (ambiguous lda/shape) — task #3
 
-	// potrf (cholesky): A SPD, L lower s.t. L·Lᵀ = A
 	let cn = 3usize;
 	let bm: Vec<f64> = (0..cn * cn)
 		.map(|i| ((i * 7 + 1) % 5) as f64 * 0.3 + 0.1)
@@ -787,7 +758,6 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 		fails.push("potrf".into());
 	}
 
-	// transpose: B(n,m) = A(m,n)ᵀ
 	use gpu_core::kernels::gpu_transpose;
 	let (tm, tn) = (3usize, 4usize);
 	let ta: Vec<f64> = (0..tm * tn).map(|i| i as f64 * 0.25 - 1.0).collect();
@@ -905,14 +875,12 @@ fn scan_registry() -> HashMap<&'static str, ScanOp> {
 	m
 }
 
-// JSON name -> canonical registry key.
 fn canon(name: &str) -> String {
 	let mut base = name
 		.rsplit(['.', ':', '$'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
-	// strip vendor library prefixes (longest first)
 	for p in [
 		"rocsolver_",
 		"cusolver_",
@@ -934,8 +902,6 @@ fn canon(name: &str) -> String {
 			break;
 		}
 	}
-	// BLAS/LAPACK ops carry a dtype letter (s/d/c/z/h). Strip it for an EXACT op match
-	// (so fused variants like gemm_bias / gemm_ex stay distinct and aren't over-claimed).
 	let blas_ops = [
 		"gemm", "gemv", "gbmv", "symv", "syrk", "syr2k", "trsm", "trmm", "trsv", "potrf",
 		"potrs", "getrf", "getrs", "gesvd", "gesdd", "gesv", "geqrf", "syev", "syevd", "heevd",
@@ -990,7 +956,6 @@ fn canon(name: &str) -> String {
 		("exp_2", "exp2"),
 		("log_2", "log2"),
 		("log_10", "log10"),
-		// reductions
 		("sum", "redsum"),
 		("reduce_sum", "redsum"),
 		("nansum", "redsum"),
@@ -1006,11 +971,9 @@ fn canon(name: &str) -> String {
 		("norm", "rednorm"),
 		("l2_norm", "rednorm"),
 		("frobenius_norm", "rednorm"),
-		// scans
 		("cumulative_sum", "cumsum"),
 		("cumulative_prod", "cumprod"),
 		("cumulative_max", "cummax"),
-		// more activations
 		("hard_sigmoid", "hardsigmoid"),
 		("hard_tanh", "hardtanh"),
 		("log_sigmoid", "logsigmoid"),
@@ -1022,7 +985,6 @@ fn canon(name: &str) -> String {
 		("relu_6", "relu6"),
 		("thresholded_relu", "thresholdedrelu"),
 		("thresholdedrelu", "thresholdedrelu"),
-		// linalg
 		("matmul", "gemm"),
 		("mm", "gemm"),
 		("bmm", "gemm"),
@@ -1181,7 +1143,6 @@ fn prove_inventory() {
 	}
 	failures.extend(complex_fails);
 
-	// Report
 	let total = items.len();
 	let mut cats: Vec<_> = per_cat.iter().collect();
 	cats.sort_by_key(|(_, (p, _))| cmp::Reverse(*p));

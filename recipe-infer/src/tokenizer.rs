@@ -9,9 +9,6 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
 	Tokenizer::from_file(path).map_err(|e| anyhow!("tokenizer {}: {e}", path.display()))
 }
 
-/// Builds a tokenizer from gguf metadata, inferring the model from what's present:
-/// SentencePiece (score-ranked BPE) when `scores` exist, otherwise byte-level BPE
-/// from `merges`.
 pub fn from_gguf(g: &Gguf) -> Result<Tokenizer> {
 	if g.f32_arr("tokenizer.ggml.scores").is_ok() {
 		from_gguf_spm(g)
@@ -20,14 +17,6 @@ pub fn from_gguf(g: &Gguf) -> Result<Tokenizer> {
 	}
 }
 
-/// llama.cpp's SPM tokenizer (`llm_tokenizer_spm`) is greedy bigram-BPE ranked by
-/// piece SCORE — adjacent pieces merge when their concatenation is in the vocab,
-/// best score first — NOT Unigram Viterbi, which segments the same text
-/// differently. Reconstructed as a BPE merge table the same way HF's
-/// slow-tokenizer converter does: every vocab piece that splits into two vocab
-/// pieces contributes a merge, ranked by the merged piece's score (descending,
-/// stable). Metaspace pre-tokenizer/decoder carries the `▁ = space` convention
-/// and the leading dummy prefix; unmapped bytes fall back to `<0xXX>` pieces.
 fn from_gguf_spm(g: &Gguf) -> Result<Tokenizer> {
 	let pieces = g.str_arr("tokenizer.ggml.tokens")?;
 	let scores = g.f32_arr("tokenizer.ggml.scores")?;

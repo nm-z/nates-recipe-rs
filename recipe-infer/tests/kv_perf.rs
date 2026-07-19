@@ -23,18 +23,11 @@ use recipe_infer::tokenizer::from_gguf;
 
 const MODEL_KEY: &str = "qwen3-0.6b-q8_0";
 const MIN_PROMPT_TOKENS: usize = 2000;
-// 3 decode steps is enough steady-state tok/s; qwen never stops on its own so any
-// count is arbitrary, and each extra token is the most expensive kind on the
-// no-cache baseline. TTFT (prefill) is measured separately, excluded from tok/s.
 const GEN_TOKENS: usize = 3;
 
-// Scan/recurrent-hybrid contrast: smallest chat-capable scan arch in gguf.toml
-// (lfm2 = short-conv + attention hybrid, 1.2B). Same 3-step protocol as dense.
 const SCAN_MODEL_KEY: &str = "lfm2.5-1.2b";
 const SCAN_GEN_TOKENS: usize = 3;
 
-/// Path for `key` out of the committed `gguf.toml` at the repo root, parsed
-/// without a toml dependency: the `key = "value"` line under `[models]`.
 fn model_path(key: &str) -> Result<PathBuf> {
 	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
 	let text = std::fs::read_to_string(&toml).with_context(|| format!("read {}", toml.display()))?;
@@ -54,8 +47,6 @@ fn model_path(key: &str) -> Result<PathBuf> {
 	bail!("key {key} not found in {}", toml.display());
 }
 
-/// A deterministic passage repeated until it tokenizes to at least
-/// `MIN_PROMPT_TOKENS` under the model's own tokenizer.
 fn long_prompt(gguf: &std::path::Path) -> Result<String> {
 	let g = Gguf::open(gguf)?;
 	let tk = from_gguf(&g)?;
@@ -80,9 +71,6 @@ fn long_prompt(gguf: &std::path::Path) -> Result<String> {
 	return Ok(prompt);
 }
 
-/// Shared probe: prefill a >=2k-token prompt for `model_key`, greedily generate
-/// `gen_tokens`, print TTFT/tok/s to stderr under `tag`. Asserts only that
-/// generation ran (a perf harness, not a numeric gate).
 fn measure(model_key: &str, gen_tokens: usize, tag: &str) {
 	let gguf = model_path(model_key).expect("model path from gguf.toml");
 	assert!(

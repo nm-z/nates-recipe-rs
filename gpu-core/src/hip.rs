@@ -46,10 +46,6 @@ impl fmt::Display for HipError {
 }
 impl Error for HipError {}
 
-/// Converts a raw HIP status `code` into a `Result`.
-///
-/// # Errors
-/// Returns `HipError` for any nonzero `code`.
 #[inline]
 pub const fn check(code: i32) -> Result<(), HipError> {
 	match code {
@@ -85,10 +81,6 @@ pub fn cu_count() -> usize {
 	);
 }
 
-/// The device's `gcnArchName` (e.g. `"gfx1101:sramecc-:xnack-"`), queried once
-/// through the [`hip_gcn_arch`] shim after the first successful call. Returns
-/// `""` while the device is uninitialized — this is a display-only probe (the
-/// capability line), so an early caller gets "unknown", never an error storm.
 pub fn gcn_arch() -> &'static str {
 	use std::sync::OnceLock;
 	static ARCH: OnceLock<String> = OnceLock::new();
@@ -106,9 +98,6 @@ pub fn gcn_arch() -> &'static str {
 	return ARCH.get_or_init(|| return s);
 }
 
-/// Whether the device carries an Infinity Cache (MALL): the leading decimal of
-/// `gcnArchName` is 1030 or higher (RDNA2 gfx103x, RDNA3 gfx11xx, RDNA4 gfx12xx).
-/// `false` when the arch is unknown — presence is only ever claimed, never assumed.
 pub fn mall_present() -> bool {
 	let a = gcn_arch().strip_prefix("gfx").unwrap_or("");
 	let digits: String = a.chars().take_while(char::is_ascii_digit).collect();
@@ -211,8 +200,6 @@ pub struct MemInfo {
 	pub total: usize,
 }
 
-/// # Errors
-/// Returns [`HipError`] if the HIP memory-info query fails.
 #[inline]
 pub fn mem_info() -> Result<MemInfo, HipError> {
 	gate::acquire();
@@ -224,8 +211,6 @@ pub fn mem_info() -> Result<MemInfo, HipError> {
 	return Ok(MemInfo { free, total });
 }
 
-/// # Errors
-/// Returns [`HipError`] if the device synchronize call fails.
 #[inline]
 pub fn device_synchronize() -> Result<(), HipError> {
 	gate::acquire();
@@ -234,7 +219,6 @@ pub fn device_synchronize() -> Result<(), HipError> {
 	return check(unsafe { hipDeviceSynchronize() });
 }
 
-/// Disables SDMA copy engines once by setting `HSA_ENABLE_SDMA=0` when the env var is unset.
 pub(crate) fn disable_sdma_once() {
 	static ONCE: Once = Once::new();
 	ONCE.call_once(|| {
@@ -247,8 +231,6 @@ pub(crate) fn disable_sdma_once() {
 	});
 }
 
-/// # Errors
-/// Returns [`HipError`] if selecting the device fails.
 #[inline]
 pub fn set_device(device: i32) -> Result<(), HipError> {
 	gate::acquire();
@@ -261,27 +243,18 @@ pub fn set_device(device: i32) -> Result<(), HipError> {
 }
 
 #[repr(C)]
-/// HSA AMD system-event payload delivered to the fault-autopsy callback.
 pub struct HsaAmdEvent {
-	/// Event discriminator; 0 marks a memory-fault event.
 	event_type: u32,
-	/// Opaque HSA agent handle that raised the event.
 	agent: u64,
-	/// Faulting device virtual address.
 	virtual_address: u64,
-	/// Bitmask of fault reasons decoded via `FaultReason`.
 	fault_reason_mask: u32,
 }
 
-/// One decodable bit of a fault-reason mask paired with its label.
 struct FaultReason {
-	/// Single-bit mask this reason occupies.
 	bit: u32,
-	/// Human-readable reason label.
 	name: &'static str,
 }
 
-/// HSA event callback that decodes a GPU memory fault, logs the autopsy, and returns 1.
 #[inline]
 pub unsafe extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_void) -> i32 {
 	use crate::memory;
@@ -368,7 +341,6 @@ pub unsafe extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_
 	return 1;
 }
 
-/// Registers the HSA fault-autopsy event handler exactly once.
 pub(crate) fn register_fault_autopsy_once() {
 	use core::sync::atomic::{AtomicUsize, Ordering};
 	static REGISTERED: AtomicUsize = AtomicUsize::new(0);
@@ -394,8 +366,6 @@ pub(crate) fn register_fault_autopsy_once() {
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if the default mempool or its attributes cannot be queried.
 #[inline]
 pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	use crate::{callspy, gate};
@@ -443,10 +413,6 @@ pub fn sysfs_vram_free() -> Option<usize> {
 	return None;
 }
 
-/// Retain freed blocks in the device mempool by raising its release threshold to `u64::MAX`.
-///
-/// # Errors
-/// Returns [`HipError`] if the default mempool query or attribute set fails.
 #[inline]
 pub fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
@@ -466,8 +432,6 @@ pub fn set_pool_retain(device: i32) -> Result<(), HipError> {
 	});
 }
 
-/// # Errors
-/// Never errors; always returns `Ok(())`.
 #[inline]
 pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
 	use crate::memory;
@@ -475,7 +439,6 @@ pub fn retain_mempool(_device: i32) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// Release reserved bytes to the driver by trimming the device mempool to zero.
 pub(crate) fn trim_mempool(device: i32) -> Result<(), HipError> {
 	let mut pool: *mut c_void = ptr::null_mut();
 	callspy::tick(&callspy::GET_DEFAULT_MEMPOOL);
@@ -494,8 +457,6 @@ pub fn peek_last_error() -> i32 {
 	unsafe { return hipPeekAtLastError() }
 }
 
-/// # Errors
-/// Returns an error if the device-count query fails.
 #[inline]
 pub fn device_count() -> Result<i32, HipError> {
 	gate::acquire();
@@ -506,8 +467,6 @@ pub fn device_count() -> Result<i32, HipError> {
 	return Ok(count);
 }
 
-/// # Errors
-/// Returns an error if the attribute query fails.
 #[inline]
 pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 	gate::acquire();
@@ -518,8 +477,6 @@ pub fn device_attribute(attr: i32, device: i32) -> Result<i32, HipError> {
 	return Ok(val);
 }
 
-/// # Errors
-/// Returns an error if the pinned-host allocation fails.
 #[inline]
 pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 	use crate::{callspy, gate, memory};
@@ -532,8 +489,6 @@ pub fn host_malloc(size: usize, flags: u32) -> Result<*mut c_void, HipError> {
 	return Ok(ptr);
 }
 
-/// # Errors
-/// Returns [`HipError`] if the HIP host-free call fails.
 #[inline]
 pub unsafe fn host_free(ptr: *mut c_void) -> Result<(), HipError> {
 	use crate::callspy;
@@ -542,8 +497,6 @@ pub unsafe fn host_free(ptr: *mut c_void) -> Result<(), HipError> {
 	return check(unsafe { hipHostFree(ptr) });
 }
 
-/// # Errors
-/// Returns [`HipError`] if the HIP peer-access query fails.
 #[inline]
 pub fn can_access_peer(device: i32, peer: i32) -> Result<bool, HipError> {
 	let mut val: i32 = 0;
@@ -553,8 +506,6 @@ pub fn can_access_peer(device: i32, peer: i32) -> Result<bool, HipError> {
 	return Ok(val != 0);
 }
 
-/// # Errors
-/// Returns [`HipError`] if enabling peer access fails.
 #[inline]
 pub fn enable_peer_access(peer: i32, flags: u32) -> Result<(), HipError> {
 	use crate::callspy;
@@ -564,7 +515,6 @@ pub fn enable_peer_access(peer: i32, flags: u32) -> Result<(), HipError> {
 }
 
 pub struct Stream {
-	/// Underlying HIP stream handle.
 	raw: *mut c_void,
 }
 
@@ -574,8 +524,6 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
 impl Stream {
-	/// # Errors
-	/// Returns [`HipError`] if stream creation fails.
 	#[inline]
 	pub fn new() -> Result<Self, HipError> {
 		use crate::{callspy, gate};
@@ -593,8 +541,6 @@ impl Stream {
 		return self.raw;
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the HIP stream synchronization fails.
 	#[inline]
 	pub fn synchronize(&self) -> Result<(), HipError> {
 		callspy::tick(&callspy::STREAM_SYNCHRONIZE);
@@ -615,7 +561,6 @@ impl Drop for Stream {
 }
 
 pub struct Event {
-	/// Underlying HIP event handle.
 	raw: *mut c_void,
 }
 
@@ -625,8 +570,6 @@ unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 
 impl Event {
-	/// # Errors
-	/// Returns [`HipError`] if HIP event creation fails.
 	#[inline]
 	pub fn new() -> Result<Self, HipError> {
 		gate::acquire();
@@ -637,8 +580,6 @@ impl Event {
 		return Ok(Self { raw });
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if recording the HIP event fails.
 	#[inline]
 	pub unsafe fn record(&self, stream: *mut c_void) -> Result<(), HipError> {
 		callspy::tick(&callspy::EVENT_RECORD);
@@ -646,18 +587,12 @@ impl Event {
 		return check(unsafe { hipEventRecord(self.raw, stream) });
 	}
 
-	/// Record this event on the default (null) stream.
-	///
-	/// # Errors
-	/// Returns [`HipError`] if recording the HIP event fails.
 	#[inline]
 	pub fn record_default(&self) -> Result<(), HipError> {
 		// SAFETY: the null (default) stream is always a valid stream argument.
 		return unsafe { self.record(ptr::null_mut()) };
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the HIP event synchronization fails.
 	#[inline]
 	pub fn synchronize(&self) -> Result<(), HipError> {
 		callspy::tick(&callspy::EVENT_SYNCHRONIZE);
@@ -677,8 +612,6 @@ impl Drop for Event {
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if querying the HIP event elapsed time fails.
 #[inline]
 pub fn elapsed_ms(start: &Event, stop: &Event) -> Result<f32, HipError> {
 	let mut ms: f32 = 0.0;

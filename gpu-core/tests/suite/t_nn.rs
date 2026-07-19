@@ -56,7 +56,6 @@ fn assert_close(got: &[f32], expected: &[f32], label: &str) {
 
 #[test]
 fn test_linear_f32() {
-	// X(2,3) @ W(3,2) + bias(2) = out(2,2)
 	let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 	let w_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 	let bias_data: Vec<f32> = vec![0.1, 0.2];
@@ -95,7 +94,6 @@ fn test_relu_f32() {
 
 #[test]
 fn test_relu_backward_f32() {
-	// grad passes through where act > 0
 	let grad_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0, 1.0];
 	let act_data: Vec<f32> = vec![-1.0, 0.0, 0.5, 1.0, 2.0];
 	let expected: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 1.0];
@@ -114,9 +112,7 @@ fn test_relu_backward_f32() {
 
 #[test]
 fn test_gelu_f32() {
-	// GELU(0)=0, GELU(large positive) ~ x, GELU(large negative) ~ 0
 	let x_data: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0, -2.0];
-	// reference: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
 	let expected: Vec<f32> = {
 		fn gelu(x: f32) -> f32 {
 			const C: f32 = 0.797_884_6;
@@ -139,7 +135,6 @@ fn test_gelu_f32() {
 
 #[test]
 fn test_gelu_backward_f32() {
-	// Just check it runs and produces finite values
 	let x_data: Vec<f32> = vec![0.0, 1.0, -1.0];
 	let grad_data: Vec<f32> = vec![1.0, 1.0, 1.0];
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
@@ -157,7 +152,6 @@ fn test_gelu_backward_f32() {
 
 #[test]
 fn test_layernorm_f32() {
-	// 2 rows of 4 cols; gamma=1, beta=0 → output is (x-mean)/std per row
 	let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0];
 	let gamma_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
 	let beta_data: Vec<f32> = vec![0.0, 0.0, 0.0, 0.0];
@@ -229,7 +223,6 @@ fn test_layernorm_backward_f32() {
 	eprintln!("layernorm_backward grad_gamma: {:?}", gg);
 	eprintln!("layernorm_backward grad_beta: {:?}", gb);
 
-	// When grad_y = all-ones, grad_x should sum to ~0 per row (layernorm symmetry)
 	for row in 0..rows {
 		let sum: f32 = gx[row * cols..(row + 1) * cols].iter().sum();
 		assert!(
@@ -239,11 +232,9 @@ fn test_layernorm_backward_f32() {
 			sum
 		);
 	}
-	// grad_beta = sum of grad_y over rows = [2,2,2,2]
 	for &v in &gb {
 		assert!(v.is_finite(), "grad_beta non-finite");
 	}
-	// grad_gamma should be finite
 	for &v in &gg {
 		assert!(v.is_finite(), "grad_gamma non-finite");
 	}
@@ -269,11 +260,7 @@ fn test_bias_add_f32() {
 
 #[test]
 fn test_avg_pool_2d_f32() {
-	// NCHW: n=1, c=1, h=4, w=4; kernel=2x2, stride=2
 	let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
-	// out_h = (4-2)/2+1 = 2, out_w = 2
-	// pool[0,0] = avg(1,2,5,6)=3.5, pool[0,1]=avg(3,4,7,8)=5.5
-	// pool[1,0] = avg(9,10,13,14)=11.5, pool[1,1]=avg(11,12,15,16)=13.5
 	let expected: Vec<f32> = vec![3.5, 5.5, 11.5, 13.5];
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
@@ -289,10 +276,7 @@ fn test_avg_pool_2d_f32() {
 
 #[test]
 fn test_max_pool_2d_f32() {
-	// NCHW: n=1, c=1, h=4, w=4; kernel=2x2, stride=2
 	let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
-	// max[0,0]=max(1,2,5,6)=6, max[0,1]=max(3,4,7,8)=8
-	// max[1,0]=max(9,10,13,14)=14, max[1,1]=max(11,12,15,16)=16
 	let expected: Vec<f32> = vec![6.0, 8.0, 14.0, 16.0];
 
 	let x = GpuBuffer::upload_f32(&input).unwrap();
@@ -309,8 +293,6 @@ fn test_max_pool_2d_f32() {
 
 #[test]
 fn test_lstm_cell_f32() {
-	// n=1, hs=2
-	// gates layout: [f_pre(hs=2), i_pre(hs=2), g_pre(hs=2), o_pre(hs=2)]
 	let gates_data: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 0.5, -0.5, 0.0, 0.0];
 	let c_data: Vec<f32> = vec![0.0, 0.0];
 	let h_data: Vec<f32> = vec![0.0, 0.0];
@@ -330,7 +312,6 @@ fn test_lstm_cell_f32() {
 	eprintln!("lstm c_got: {:?}", c_got);
 	eprintln!("lstm h_got: {:?}", h_got);
 
-	// expected from python: c=[0.33783475, -0.33783475], h=[0.1627715, -0.1627715]
 	let expected_c: Vec<f32> = vec![0.33783475, -0.33783475];
 	let expected_h: Vec<f32> = vec![0.1627715, -0.1627715];
 	assert_close(&c_got, &expected_c, "lstm_cell c");
@@ -339,8 +320,6 @@ fn test_lstm_cell_f32() {
 
 #[test]
 fn test_gru_cell_f32() {
-	// n=1, hs=2
-	// gates: [z_pre(2), r_pre(2), n_x(2), n_h(2)]
 	let gates_data: Vec<f32> = vec![0.0, 0.0, 0.5, 0.5, 1.0, -1.0, 0.2, -0.2];
 	let h_data: Vec<f32> = vec![1.0, -1.0];
 
@@ -395,7 +374,6 @@ fn test_gelu_f16() {
 	out.download_f16(&mut got_f16).unwrap();
 	let got: Vec<f32> = got_f16.iter().map(|h| h.to_f32()).collect();
 	eprintln!("gelu_f16 got: {:?}", got);
-	// f16 has ~1e-3 precision, use looser tolerance
 	for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
 		assert!(g.is_finite(), "gelu_f16 got[{}] not finite", i);
 		assert!(
@@ -469,7 +447,6 @@ fn test_sgd_update_f32() {
 	let w_data: Vec<f32> = vec![1.0, 2.0, 3.0];
 	let grad_data: Vec<f32> = vec![0.1, 0.2, 0.3];
 	let lr = 0.1_f32;
-	// expected: w - lr * grad = [0.99, 1.98, 2.97]
 	let expected: Vec<f32> = vec![0.99, 1.98, 2.97];
 
 	let w = GpuBuffer::upload_f32(&w_data).unwrap();
@@ -488,8 +465,6 @@ fn test_sgd_update_f32() {
 
 #[test]
 fn test_sdpa_noncausal() {
-	// n_rows=1, seq=2, dim=2
-	// Q=[[1,0],[0,1]], K=[[1,0],[0,1]], V=[[1,2],[3,4]]
 	let q_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
 	let k_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
 	let v_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -506,14 +481,12 @@ fn test_sdpa_noncausal() {
 	out.download_f32(&mut got).unwrap();
 	eprintln!("sdpa non-causal got: {:?}", got);
 
-	// from python: [1.6604769, 2.6604769, 2.3395231, 3.3395231]
 	let expected: Vec<f32> = vec![1.6604769, 2.660_477, 2.339_523, 3.339_523];
 	assert_close(&got, &expected, "sdpa_noncausal");
 }
 
 #[test]
 fn test_sdpa_causal() {
-	// same as above but causal=true
 	let q_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
 	let k_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
 	let v_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -530,14 +503,12 @@ fn test_sdpa_causal() {
 	out.download_f32(&mut got).unwrap();
 	eprintln!("sdpa causal got: {:?}", got);
 
-	// from python: row0 attends only key0 → V[0]=[1,2]; row1 same as non-causal
 	let expected: Vec<f32> = vec![1.0, 2.0, 2.339_523, 3.339_523];
 	assert_close(&got, &expected, "sdpa_causal");
 }
 
 #[test]
 fn test_causal_softmax_rows() {
-	// 3x3 matrix of all ones; row i should have uniform probs over [0..i]
 	let x_data: Vec<f32> = vec![1.0; 9];
 
 	let x = GpuBuffer::upload_f32(&x_data).unwrap();
@@ -548,7 +519,6 @@ fn test_causal_softmax_rows() {
 	x.download_f32(&mut got).unwrap();
 	eprintln!("causal_softmax got: {:?}", got);
 
-	// Row 0: only j=0 unmasked → prob=[1,0,0]
 	assert!(
 		(got[0] - 1.0).abs() < 1e-4,
 		"row0[0] should be 1.0 got {}",
@@ -564,7 +534,6 @@ fn test_causal_softmax_rows() {
 		"row0[2] should be 0.0 got {}",
 		got[2]
 	);
-	// Row 1: j=0,1 → prob=[0.5, 0.5, 0]
 	assert!(
 		(got[3] - 0.5).abs() < 1e-4,
 		"row1[0] should be 0.5 got {}",
@@ -580,7 +549,6 @@ fn test_causal_softmax_rows() {
 		"row1[2] should be 0.0 got {}",
 		got[5]
 	);
-	// Row 2: all three → prob=[1/3, 1/3, 1/3]
 	for j in 6..9 {
 		assert!(
 			(got[j] - 1.0 / 3.0).abs() < 1e-4,
@@ -593,7 +561,6 @@ fn test_causal_softmax_rows() {
 
 #[test]
 fn test_mha_split_merge_roundtrip() {
-	// x: (seq=4, n_heads*head_dim = 2*3=6)
 	let n_heads = 2usize;
 	let head_dim = 3usize;
 	let seq = 4usize;
@@ -616,14 +583,6 @@ fn test_mha_split_merge_roundtrip() {
 
 #[test]
 fn test_mha_split_layout() {
-	// x: (seq=2, 2*2=4): [[0,1,2,3],[4,5,6,7]]
-	// head 0 dim 0,1: x[:,0:2]
-	// head 1 dim 0,1: x[:,2:4]
-	// split → (n_heads=2, seq=2, head_dim=2)
-	// out[0,0,*] = x[0, 0:2] = [0,1]
-	// out[0,1,*] = x[1, 0:2] = [4,5]
-	// out[1,0,*] = x[0, 2:4] = [2,3]
-	// out[1,1,*] = x[1, 2:4] = [6,7]
 	let data: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
 	let expected: Vec<f32> = vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0];
 
@@ -640,7 +599,6 @@ fn test_mha_split_layout() {
 
 #[test]
 fn test_rope_norm_preserved() {
-	// RoPE should preserve L2 norm per (d, d+dim/2) pair
 	let seq = 3usize;
 	let dim = 4usize;
 	let data: Vec<f32> = vec![
@@ -659,7 +617,6 @@ fn test_rope_norm_preserved() {
 	out.download_f32(&mut got).unwrap();
 	eprintln!("rope got: {:?}", got);
 
-	// Check that for each row, norm of (got[d], got[d+dim/2]) == norm of (x[d], x[d+dim/2])
 	let half = dim / 2;
 	for s in 0..seq {
 		for d in 0..half {
@@ -694,13 +651,11 @@ fn test_positional_encoding() {
 	out.download_f32(&mut got).unwrap();
 	eprintln!("pos_enc (4,8): {:?}", got);
 
-	// All values should be finite and in [-1, 1]
 	for (i, &v) in got.iter().enumerate() {
 		assert!(v.is_finite(), "pos_enc[{}] not finite", i);
 		assert!(v.abs() <= 1.0 + 1e-5, "pos_enc[{}]={} out of [-1,1]", i, v);
 	}
 
-	// pe[0, even] = sin(0 / ...) = 0
 	for d in (0..dim).step_by(2) {
 		assert!(
 			(got[d]).abs() < 1e-5,
@@ -709,7 +664,6 @@ fn test_positional_encoding() {
 			got[d]
 		);
 	}
-	// pe[0, odd] = cos(0 / ...) = 1
 	for d in (1..dim).step_by(2) {
 		assert!(
 			(got[d] - 1.0).abs() < 1e-5,
@@ -722,7 +676,6 @@ fn test_positional_encoding() {
 
 #[test]
 fn test_rmsnorm() {
-	// 1 row of 4 cols; gamma=ones; expected = x / rms(x)
 	let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
 	let gamma_data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
 	let eps_buf = GpuBuffer::upload_f32(&[1e-5_f32]).unwrap();
@@ -737,7 +690,6 @@ fn test_rmsnorm() {
 	out.download_f32(&mut got).unwrap();
 	eprintln!("rmsnorm got: {:?}", got);
 
-	// from python: [0.36514813, 0.73029625, 1.0954444, 1.4605925]
 	let expected: Vec<f32> = vec![0.36514813, 0.73029625, 1.0954444, 1.4605925];
 	assert_close(&got, &expected, "gpu_rmsnorm");
 }
@@ -785,20 +737,13 @@ fn test_rmsnorm_backward() {
 		assert!(v.is_finite(), "rmsnorm grad_gamma non-finite");
 	}
 
-	// RMSNorm backward: grad_x should sum to near 0 per row when grad_out is uniform
-	// (similar to LayerNorm — the scaling factor removes one degree of freedom)
-	// Actually RMSNorm doesn't center, so this doesn't hold exactly.
-	// Just verify finite and non-zero
 	let gx_sum: f32 = gx.iter().sum();
 	assert!(gx_sum.is_finite(), "rmsnorm grad_x sum non-finite");
 }
 
 #[test]
 fn test_im2col_2d_ext() {
-	// n=1, c=1, h=4, w=4, kh=2, kw=2, sh=2, sw=2, pad=1, dil=1
 	let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
-	// out_h = (4+2*1 - 1*(2-1) - 1)/2 + 1 = (4+2-1-1)/2+1 = 4/2+1 = 3
-	// out_w = 3
 	let n = 1usize;
 	let c = 1usize;
 	let h = 4usize;
@@ -834,7 +779,6 @@ fn test_im2col_2d_ext() {
 		eprintln!("  patch[{}]: {:?}", r, &got[r * 4..(r + 1) * 4]);
 	}
 
-	// from python: patches[0]=[0,0,0,1], patches[4]=[6,7,10,11], patches[8]=[16,0,0,0]
 	let expected_patch0: Vec<f32> = vec![0.0, 0.0, 0.0, 1.0];
 	let expected_patch4: Vec<f32> = vec![6.0, 7.0, 10.0, 11.0];
 	let expected_patch8: Vec<f32> = vec![16.0, 0.0, 0.0, 0.0];
@@ -842,15 +786,11 @@ fn test_im2col_2d_ext() {
 	assert_close(&got[16..20], &expected_patch4, "im2col patch[4]");
 	assert_close(&got[32..36], &expected_patch8, "im2col patch[8]");
 
-	// check output dimensions by verifying length
 	assert_eq!(got.len(), 9 * 4, "im2col output size wrong");
 }
 
 #[test]
 fn test_embedding_backward() {
-	// grad_out: (n=3, cols=2), indices: [0, 1, 0] (i32), vocab=2
-	// grad_table[0] = grad_out[0] + grad_out[2] = [1,2] + [5,6] = [6,8]
-	// grad_table[1] = grad_out[1] = [3,4]
 	let grad_out_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 	let indices_i32: Vec<i32> = vec![0, 1, 0];
 	let n = 3usize;
@@ -874,7 +814,6 @@ fn test_embedding_backward() {
 
 #[test]
 fn test_bn_update_running() {
-	// run = (1-momentum)*run + momentum*save
 	let run_mean_data: Vec<f32> = vec![0.0, 0.0];
 	let run_var_data: Vec<f32> = vec![1.0, 1.0];
 	let save_mean_data: Vec<f32> = vec![2.0, -2.0];
@@ -896,8 +835,6 @@ fn test_bn_update_running() {
 	eprintln!("bn_update_running mean: {:?}", got_mean);
 	eprintln!("bn_update_running var: {:?}", got_var);
 
-	// expected: mean = 0.9*0 + 0.1*2 = 0.2; mean[1] = 0.9*0 + 0.1*(-2) = -0.2
-	// var = 0.9*1 + 0.1*0.5 = 0.95
 	let expected_mean: Vec<f32> = vec![0.2, -0.2];
 	let expected_var: Vec<f32> = vec![0.95, 0.95];
 	assert_close(&got_mean, &expected_mean, "bn_update_running mean");

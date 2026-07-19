@@ -40,7 +40,6 @@ fn model() -> Model {
 
 // ── training corpus: real columns from datasets/, labelled by known schema ───
 
-// Every column across datasets/, hand-labelled by type.
 const HP: &str = "datasets/house-prices/train.csv";
 const CH: &str = "datasets/playground-series-s6e3/train.csv";
 const LLM: &str = "datasets/llm-classification-finetuning/train.csv";
@@ -408,7 +407,6 @@ const SOURCES: &[(&str, &[&str], usize)] = &[
 	),
 ];
 
-// march tables — paths built at runtime from MDIR.
 const MARCH: &[(&str, &[&str], usize)] = &[
 	("Cities.csv", &["CityID"], KIND_NUMERIC),
 	("Cities.csv", &["City"], KIND_TEXT),
@@ -469,10 +467,6 @@ fn column_cells(path: &str, col: &str) -> anyhow::Result<Vec<String>> {
 }
 
 // ── extra corpus: VNA + UCI dumps in varied delimiters / headerless layouts ──
-// The shipped parser only auto-detects all-numeric headerless files; here the
-// trainer KNOWS each file's delimiter and whether it has a header, so it passes
-// that truth in directly (a headerless file with a categorical column would fool
-// any content test). One delimited reader covers comma/semicolon/tab/space.
 
 enum Delim {
 	Comma,
@@ -515,8 +509,6 @@ fn columns_of(path: &str, d: &Delim, headerless: bool) -> anyhow::Result<Vec<Vec
 		.collect())
 }
 
-/// Expand one column's cells into prefix variants + the full stream, same shape
-/// as the in-line corpus builder, so fixture-scale and full-length both appear.
 fn push_instances(out: &mut Vec<(Vec<String>, usize)>, cells: Vec<String>, kind: usize) {
 	if cells.is_empty() {
 		return;
@@ -529,7 +521,6 @@ fn push_instances(out: &mut Vec<(Vec<String>, usize)>, cells: Vec<String>, kind:
 	out.push((cells, kind));
 }
 
-/// Per-column kinds for a `w`-wide file: Numeric by default, with named overrides.
 fn kinds(width: usize, overrides: &[(usize, usize)]) -> Vec<(usize, usize)> {
 	let mut v: Vec<(usize, usize)> = (0..width).map(|j| (j, KIND_NUMERIC)).collect();
 	for &(j, k) in overrides {
@@ -556,9 +547,6 @@ fn add_indexed(
 	Ok(())
 }
 
-/// Wide all-numeric matrices (VNA predictors, HAR sensor): sample ~k evenly-spaced
-/// columns as Numeric. Sampling, not every column, so a 3204-wide file can't swamp
-/// the corpus and collapse class balance — logged, never silent.
 fn add_sampled_numeric(
 	out: &mut Vec<(Vec<String>, usize)>,
 	path: &str,
@@ -583,7 +571,6 @@ fn add_sampled_numeric(
 
 fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 	use Delim::{Comma, Semicolon, Space, Tab};
-	// VNA — the headerless numeric dumps that motivated this. Targets: one column.
 	add_indexed(
 		out,
 		"datasets/VNA/9_10_24_Hold_02_targets.csv",
@@ -607,9 +594,6 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 		64,
 	)?;
 
-	// UCI comma headerless — numeric attributes + a trailing class/label column.
-	// Full columns (not sampled): more data generalized better than a balanced-but-
-	// smaller corpus here — the v1 (1722 rows) > v2 (1180 rows) held-out result.
 	add_indexed(
 		out,
 		"datasets/uci-wine/wine.data",
@@ -708,7 +692,6 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 		),
 	)?;
 
-	// UCI space/tab headerless numeric matrices (+ trailing class).
 	add_indexed(
 		out,
 		"datasets/uci-german-numeric/german.data-numeric",
@@ -766,7 +749,6 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 		64,
 	)?;
 
-	// SMS spam: tab-delimited headerless — label + free text.
 	add_indexed(
 		out,
 		"datasets/uci-sms-tab/SMSSpamCollection",
@@ -775,7 +757,6 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 		&[(0, KIND_CATEGORICAL), (1, KIND_TEXT)],
 	)?;
 
-	// Semicolon-delimited WITH headers (quoted fields in bank).
 	add_indexed(
 		out,
 		"datasets/uci-winequality-semicolon/winequality-red.csv",
@@ -814,7 +795,6 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 	Ok(())
 }
 
-/// Every labelled column across datasets/, as `(byte-stream cells, kind)`.
 fn instances() -> anyhow::Result<Vec<(Vec<String>, usize)>> {
 	let mut out: Vec<(Vec<String>, usize)> = Vec::new();
 	let mut add = |path: &str, cols: &[&str], kind: usize| -> anyhow::Result<()> {
@@ -823,10 +803,6 @@ fn instances() -> anyhow::Result<Vec<(Vec<String>, usize)>> {
 			if cells.is_empty() {
 				continue;
 			}
-			// Short prefixes so the detector generalizes to tiny columns whose token
-			// stream is mostly PAD — fixtures are ~8-10 cells, but every corpus column
-			// is full-length. Each prefix keeps the kind's structure (repeats, decimals,
-			// date/path shape, cardinality) intact at fixture scale.
 			for take in [4usize, 8, 16] {
 				if cells.len() > take {
 					out.push((cells[..take].to_vec(), kind));
@@ -842,11 +818,9 @@ fn instances() -> anyhow::Result<Vec<(Vec<String>, usize)>> {
 	for (file, cols, kind) in MARCH {
 		add(&format!("{MDIR}{file}"), cols, *kind)?;
 	}
-	// newchic: same five image-URL columns across every category file.
 	for file in NEWCHIC_FILES {
 		add(&format!("{NCDIR}{file}.csv"), NEWCHIC_IMG, KIND_IMAGE)?;
 	}
-	// s&p500: ISO date column from the first STOCK_N per-ticker files.
 	let mut stocks: Vec<PathBuf> = fs::read_dir(STOCK_DIR)
 		.context("stock dir")?
 		.filter_map(|e| e.ok())
@@ -884,8 +858,6 @@ fn build_dataset(insts: &[(Vec<String>, usize)]) -> anyhow::Result<Dataset> {
 	})
 }
 
-/// Shuffle all labelled columns (seeded) and split into (train, test) by fraction.
-/// `test_frac = 0.6` → 40% train / 60% test.
 fn corpus_split(seed: u64, test_frac: f64) -> anyhow::Result<(Dataset, Dataset)> {
 	use rand::SeedableRng as _;
 	use rand::seq::SliceRandom as _;
@@ -897,8 +869,6 @@ fn corpus_split(seed: u64, test_frac: f64) -> anyhow::Result<(Dataset, Dataset)>
 	Ok((build_dataset(tr)?, build_dataset(te)?))
 }
 
-/// Per-class instance counts (argmax the one-hot targets) — proves the held-out
-/// accuracy isn't a degenerate all-Numeric pass.
 fn class_balance(tag: &str, ds: &Dataset) -> anyhow::Result<()> {
 	let y = ds.y.as_slice().context("y contiguous")?;
 	let n = y.len() / N_CLASS;
@@ -926,7 +896,6 @@ fn class_balance(tag: &str, ds: &Dataset) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-	// 40% train / 60% test over all hand-labelled real columns.
 	let (train, test) = corpus_split(0xC0FFEE, 0.6)?;
 	say(format!(
 		"split: {} train / {} test columns",
@@ -936,11 +905,6 @@ fn main() -> anyhow::Result<()> {
 	class_balance("train", &train)?;
 	class_balance("test", &test)?;
 
-	// Retrain from scratch on the EXPANDED corpus. The prior detector.ogdl (0.987)
-	// was a different corpus, so resuming + the best-only save guard would compare
-	// against a stale, incomparable score and silently refuse to save the retrained
-	// model. Remove it first; resume_from still sets the checkpoint path so the best
-	// weights are written during training (it just starts from random, file absent).
 	let _ = fs::remove_file("pantry/detector.ogdl");
 	let model = model();
 	let trainer = Train::new()

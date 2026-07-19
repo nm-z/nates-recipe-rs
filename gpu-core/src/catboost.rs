@@ -37,10 +37,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Fills `out` with the sequence `0, 1, …, n-1`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -52,7 +48,6 @@ pub fn gpu_iota(n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// Scratch size in bytes required to permute `n` keys via radix sort.
 #[must_use]
 #[inline]
 pub fn gpu_random_permutation_workspace_bytes(n: usize) -> usize {
@@ -61,10 +56,6 @@ pub fn gpu_random_permutation_workspace_bytes(n: usize) -> usize {
 	unsafe { return radix_perm_workspace_bytes(n_i32, ptr::null_mut()) }
 }
 
-/// Builds a random permutation of `0..n` into `out` by sorting random keys.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` or `seed` does not fit the launcher width.
 #[inline]
 pub fn gpu_random_permutation(
 	keys: &GpuBuffer,
@@ -105,10 +96,6 @@ pub fn gpu_random_permutation(
 	return Ok(());
 }
 
-/// Computes ordered (CatBoost-style) target statistics into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` or `n_categories` does not fit in [`i32`].
 #[inline]
 pub fn gpu_ordered_target_stats(
 	cat_col_i32: &GpuBuffer,

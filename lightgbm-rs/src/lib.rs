@@ -384,9 +384,6 @@ fn apply_goss(
 	Ok(())
 }
 
-// Evaluate the best split for a set of leaf slots on the GPU and download the
-// packed results. Outputs are indexed by eval position (0..slots.len()), NOT by
-// slot id — the caller scatters them into per-slot host caches.
 fn eval_best_split(
 	grad_hist: &GpuBuffer,
 	hess_hist: &GpuBuffer,
@@ -431,12 +428,6 @@ fn eval_best_split(
 	Ok((hg, hf, hb, hc))
 }
 
-// Leaf-wise (best-first) tree with LightGBM's histogram trick: the root histogram
-// is built once; each split builds the histogram for only the SMALLER child and
-// derives the larger child by subtraction (parent − sibling). Split selection is
-// argmaxed on the GPU per leaf; only the two leaves changed by a split are
-// re-evaluated (leaf-wise caching). Returns the tree plus the per-row training
-// predictions (the final leaf assignment is reused — no CPU tree-walk).
 fn build_leaf_wise_tree(
 	bins_eff: &[Vec<u8>],
 	grad_h: &[f32],
@@ -498,13 +489,11 @@ fn build_leaf_wise_tree(
 	slot_count[0] = n;
 	let mut next_tree_node = 1usize;
 
-	// host caches of each live slot's best split (scattered from GPU evals)
 	let mut bg = vec![f32::NEG_INFINITY; num_leaves];
 	let mut bf = vec![-1i32; num_leaves];
 	let mut bb = vec![-1i32; num_leaves];
 	let mut blc = vec![0i32; num_leaves];
 
-	// root: one full histogram pass, then evaluate its split
 	gpu_lgbm_histogram(
 		&bins_fm,
 		&node_idx,
@@ -538,7 +527,6 @@ fn build_leaf_wise_tree(
 	blc[0] = hc[0];
 
 	for _ in 0..num_leaves - 1 {
-		// pick the globally best splittable live leaf from the host cache
 		let mut s_sel: i32 = -1;
 		let mut s_gain = f32::NEG_INFINITY;
 		for slot in 0..num_leaves {
@@ -586,9 +574,6 @@ fn build_leaf_wise_tree(
 		nodes[parent_tree].right_child = right_tree;
 		nodes[parent_tree].is_leaf = false;
 
-		// Smaller child -> fresh slot r (built directly); larger child reuses
-		// parent slot s (derived by subtraction). The apply kernel routes
-		// bin<=split_bin -> left_arg, else -> right_arg.
 		let (left_arg, right_arg) = if cl <= cr { (r, s) } else { (s, r) };
 		slot_tree[left_arg] = left_tree as i32;
 		slot_tree[right_arg] = right_tree as i32;
@@ -607,8 +592,6 @@ fn build_leaf_wise_tree(
 			&node_idx,
 		)?;
 
-		// parent histogram still sits in slot s: build smaller child fresh into
-		// r, then slot s -= slot r yields the larger child. Order is mandatory.
 		gpu_lgbm_histogram(
 			&bins_fm,
 			&node_idx,
@@ -667,7 +650,6 @@ fn build_leaf_wise_tree(
 		}
 	}
 
-	// reuse the training-pass leaf assignment for self-predictions (no CPU walk)
 	let mut node_assign = vec![0i32; n];
 	node_idx.download_i32(&mut node_assign)?;
 	let train_preds: Vec<f32> = node_assign
@@ -678,9 +660,6 @@ fn build_leaf_wise_tree(
 	Ok((Tree { nodes }, train_preds))
 }
 
-// Flatten a class's forest into the contiguous node arrays the GPU ensemble
-// predict kernel consumes. Each tree's local child indices are offset by the
-// tree's base into the concatenated pool to become global indices.
 fn flatten_forest(
 	trees: &[Tree],
 ) -> (

@@ -307,8 +307,6 @@ pub fn del(p: &mut P, name: &str) {
 	hold(p);
 }
 
-/// Evaluates a lowered glob expression against the global graph and returns
-/// the matched names as leaf lines, in the engine's walk order.
 #[inline]
 #[must_use]
 pub fn glob_block(expr: &str) -> super::Block {

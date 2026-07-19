@@ -99,16 +99,11 @@ unsafe extern "C" {
 	);
 }
 
-/// Split-K output-tile row height, in `k` elements.
 const SK_BM: usize = 64;
-/// Split-K output-tile column width, in `n` elements.
 const SK_BN: usize = 64;
-/// Target number of concurrent waves per compute unit for split-K.
 const SK_WAVES: usize = 8;
-/// Minimum contraction-axis rows assigned to one split-K slice.
 const SK_MIN_SLICE: usize = 256;
 
-/// Number of split-K partitions for a `dW` accumulation of the given shape.
 #[must_use]
 #[inline]
 pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
@@ -119,17 +114,12 @@ pub fn splitk_dw_p(m: usize, k: usize, n: usize) -> usize {
 	return target.min(max_by_rows).min(m.max(1));
 }
 
-/// Element count of the split-K partials buffer for a `dW` of the given shape.
 #[must_use]
 #[inline]
 pub fn splitk_dw_partials_elems(m: usize, k: usize, n: usize) -> usize {
 	return splitk_dw_p(m, k, n) * k * n;
 }
 
-/// Computes the elementwise reciprocal square root of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_rsqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -146,10 +136,6 @@ pub fn gpu_rsqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise reciprocal of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_reciprocal(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -166,10 +152,6 @@ pub fn gpu_reciprocal(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hi
 	return Ok(());
 }
 
-/// Computes the elementwise maximum of `a` and `b` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -187,10 +169,6 @@ pub fn gpu_max(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	return Ok(());
 }
 
-/// Computes the elementwise minimum of `a` and `b` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -208,10 +186,6 @@ pub fn gpu_min(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resul
 	return Ok(());
 }
 
-/// Computes the elementwise sine of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sin(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -228,10 +202,6 @@ pub fn gpu_sin(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// Computes the elementwise cosine of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_cos(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -248,10 +218,6 @@ pub fn gpu_cos(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// Computes the elementwise tangent of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_tan(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -268,10 +234,6 @@ pub fn gpu_tan(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError>
 	return Ok(());
 }
 
-/// Computes the elementwise two-argument arctangent of `a` and `b` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -289,10 +251,6 @@ pub fn gpu_atan2(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Res
 	return Ok(());
 }
 
-/// Computes the elementwise `ln(1 + x)` of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_log1p(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -309,10 +267,6 @@ pub fn gpu_log1p(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise `exp(x) - 1` of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_expm1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -329,10 +283,6 @@ pub fn gpu_expm1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise floor of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_floor(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -349,10 +299,6 @@ pub fn gpu_floor(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise ceiling of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_ceil(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -369,10 +315,6 @@ pub fn gpu_ceil(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	return Ok(());
 }
 
-/// Computes the elementwise round-to-nearest of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_round(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -389,10 +331,6 @@ pub fn gpu_round(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise truncation of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_trunc(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -409,10 +347,6 @@ pub fn gpu_trunc(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// Computes the elementwise floating-point remainder of `a` over `b` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -430,10 +364,6 @@ pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resu
 	return Ok(());
 }
 
-/// Subtracts the device scalar `s` from each element of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_sub_scalar(
 	x: &GpuBuffer,
@@ -456,10 +386,6 @@ pub fn gpu_sub_scalar(
 	return Ok(());
 }
 
-/// Divides each element of `x` by the device scalar `s` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_div_scalar(
 	x: &GpuBuffer,
@@ -482,10 +408,6 @@ pub fn gpu_div_scalar(
 	return Ok(());
 }
 
-/// Subtracts each element of `x` from the device scalar `s` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_rsub_scalar(
 	x: &GpuBuffer,
@@ -508,10 +430,6 @@ pub fn gpu_rsub_scalar(
 	return Ok(());
 }
 
-/// Divides the device scalar `s` by each element of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_rdiv_scalar(
 	x: &GpuBuffer,
@@ -534,10 +452,6 @@ pub fn gpu_rdiv_scalar(
 	return Ok(());
 }
 
-/// Sets `flag` to nonzero when any element of `x` is NaN.
-///
-/// # Errors
-/// Returns [`HipError`] if the device memset fails or `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_has_nan(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
@@ -558,10 +472,6 @@ pub fn gpu_has_nan(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipE
 	return Ok(());
 }
 
-/// Sets `flag` to nonzero only when every element of `x` is finite.
-///
-/// # Errors
-/// Returns [`HipError`] if the device memset fails or `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_isfinite_all(x: &GpuBuffer, n: usize, flag: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;

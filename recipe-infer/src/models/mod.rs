@@ -21,28 +21,18 @@ use common::{
 };
 use gpu_core::memory::GpuBuffer;
 
-/// The driver a row routes to. Each variant names its `common` entry point; the
-/// composition graph itself lives in that driver, not here. Variants carrying a
-/// [`Spec`] pass its flags through to the shared scalar resolvers.
 #[derive(Clone, Copy)]
 enum Comp {
 	Dense(Spec),
 	Moe(Spec),
 	Recurrent,
-	/// mamba family -> [`layer_mamba`].
 	Mamba,
-	/// mamba-2 (SSD) family -> [`layer_mamba2`].
 	Mamba2,
-	/// attention/recurrent hybrids (per-layer mixer choice) -> [`layer_hybrid`].
 	Hybrid(Hy),
-	/// talkie -> [`layer_talkie`].
 	Talkie(Spec),
-	/// minicpm3 -> [`layer_minicpm3`].
 	Minicpm3(Spec),
 }
 
-/// GGUF architecture string -> decode composition. The single source of truth
-/// for both [`SUPPORTED`] and [`dispatch`].
 const TABLE: &[(&str, Comp)] = &[
 	("afmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("apertus", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
@@ -228,7 +218,6 @@ const TABLE: &[(&str, Comp)] = &[
 	("xverse", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 ];
 
-/// The architecture strings of [`TABLE`], derived at compile time.
 const fn supported_names() -> [&'static str; TABLE.len()] {
 	let mut names = [""; TABLE.len()];
 	let mut i = 0;
@@ -239,12 +228,8 @@ const fn supported_names() -> [&'static str; TABLE.len()] {
 	names
 }
 
-/// GGUF architecture strings with a decode composition wired into [`dispatch`].
 pub(super) const COMPOSABLE: &[&str] = &supported_names();
 
-/// Architectures whose EVERY parity fixture config matches llama.cpp to
-/// NMSE <= 1e-4 (archs_parity). Entry here is by measurement only; the
-/// parity test hard-fails if a listed arch regresses.
 pub(super) const VERIFIED: &[&str] = &[
 	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
 	"cogvlm", "command-r", "dbrx", "deci", "deepseek", "deepseek2", "deepseek32", "dots1", "dream",
@@ -262,20 +247,14 @@ pub(super) const VERIFIED: &[&str] = &[
 	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "talkie", "xverse",
 ];
 
-/// True if every parity fixture config of `arch` is measured OK.
 pub(super) fn verified(arch: &str) -> bool {
 	VERIFIED.contains(&arch)
 }
 
-/// True if `arch` has a composition wired into [`dispatch`].
 pub(super) fn supported(arch: &str) -> bool {
 	COMPOSABLE.contains(&arch)
 }
 
-/// True if `arch` is a gated-delta-net hybrid (qwen3.5/next/moe, kimi-linear):
-/// its recurrent layers run the delta-rule scan and its dispatch is per-layer
-/// [`HyMode::DeltaNet`]. Gates the delta-scratch arena sizing so a non-delta
-/// arch pays nothing.
 pub(super) fn is_delta_arch(arch: &str) -> bool {
 	for &(name, comp) in TABLE {
 		if name == arch {
@@ -285,11 +264,6 @@ pub(super) fn is_delta_arch(arch: &str) -> bool {
 	return false;
 }
 
-/// True if `arch`'s block norm is a true LayerNorm (mean-centered). Selects the
-/// norm-epsilon KV source at load: `attention.layer_norm_epsilon` for LayerNorm
-/// arches, `attention.layer_norm_rms_epsilon` for RMS arches, mirroring
-/// llama.cpp's `f_norm_eps` vs `f_norm_rms_eps` split. Fixtures ship the unused
-/// key as 0, so reading the wrong one silently zeroes eps.
 pub(super) fn norm_is_layer(arch: &str) -> bool {
 	for &(name, comp) in TABLE {
 		if name == arch {
@@ -304,35 +278,15 @@ pub(super) fn norm_is_layer(arch: &str) -> bool {
 	return false;
 }
 
-/// Per-layer incremental-decode context threaded through [`dispatch`] into every
-/// mixer. `cached` rows already live in this layer's persistent cache buffers; the
-/// `t` rows flowing into the block are the NEW tokens. An attention layer appends
-/// their K/V into `kc`/`vc` and attends the full cache. A recurrent layer loads its
-/// carried state from `rec` (the SSM/delta matrix state) and `conv_in` (the
-/// previous conv-window rows), processes only the new rows, and writes the updated
-/// state back into `rec` and `conv_out`. `None` at a call site is the full-forward
-/// path (fresh prefill with `cached == 0`, or a forward-only parity pass): mixers
-/// then pass null state to the kernels, which zero-init with no write-back — a path
-/// bit-identical to the pre-cache behavior.
 #[derive(Clone, Copy)]
 pub(super) struct DecCtx<'a> {
-	/// Rows already cached; the new rows sit at absolute positions `cached..`.
 	pub(super) cached: usize,
-	/// The absolute row at window offset 0 (`> 0` iff rows have been evicted to
-	/// the host tier), and the window capacity in rows. Attention ALWAYS walks
-	/// host segments `[0, win_base)` then the resident window — a fully-resident
-	/// cache is the `win_base == 0` case of the same walk (the loop body never
-	/// runs), not a second path.
 	pub(super) win_base: usize,
 	pub(super) win: usize,
-	/// This layer's cached state — the variant carries exactly what the layer's
-	/// mixer needs (K/V rows + host stores, scan state, conv windows).
 	pub(super) state: &'a crate::llm::LayerCache,
-	/// The cache's double-buffered host-readback staging windows.
 	pub(super) stage: &'a crate::llm::KvStage,
 }
 
-/// The [`Comp`] composition entry for `arch`, or `None` if unlisted.
 fn comp_of(arch: &str) -> Option<Comp> {
 	for &(name, comp) in TABLE {
 		if name == arch {
@@ -342,13 +296,6 @@ fn comp_of(arch: &str) -> Option<Comp> {
 	return None;
 }
 
-/// True if `arch` carries any recurrent (SSM / delta-net / short-conv / linear)
-/// mixer layer. This is NOT a decode fork — every arch decodes through the one
-/// [`crate::llm`] cached path. It is only the cross-turn rewind policy: a
-/// recurrence cannot be partially rewound (only its final state is kept), so a
-/// recurrent arch whose new prompt diverges before the end of the cached prefix
-/// clears the whole cache and reprocesses from row 0 through that same path, while
-/// a pure-attention arch rewinds to any common prefix.
 pub(super) fn arch_has_recurrence(arch: &str) -> bool {
 	return matches!(
 		comp_of(arch),
@@ -356,13 +303,6 @@ pub(super) fn arch_has_recurrence(arch: &str) -> bool {
 	);
 }
 
-/// Everything the incremental decode cache allocates for layer `l`: the attention
-/// K/V cache widths (`kw`/`vw`, elements per cached row; `0` for a recurrent or
-/// FFN-only layer), the recurrent matrix/vector state element count (`rec`; `0` for
-/// an attention or FIR-only layer), and the conv-window element counts in the
-/// mixer's own call order (`conv`; empty for a non-conv layer). Every cache shape
-/// flows from this one resolver so the cache never second-guesses a mixer's
-/// geometry — the mixer and the allocation read the same source of truth.
 pub(super) struct LayerCacheShape {
 	pub(super) kw: usize,
 	pub(super) vw: usize,
@@ -472,8 +412,6 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 }
 
 
-/// The [`Spec`] for `m.hp.arch`, or `None` for recurrent / unlisted arches. Lets
-/// the neutral runtime resolve a Spec-flagged scalar without per-arch branching.
 fn spec_of(m: &Model) -> Option<Spec> {
 	let arch = m.hp.arch.as_str();
 	for &(name, comp) in TABLE {
@@ -487,10 +425,6 @@ fn spec_of(m: &Model) -> Option<Spec> {
 	return None;
 }
 
-/// Input-embedding scale for `m.hp.arch`: `sqrt(n_embd)` for arches that hardcode
-/// it (gemma family), the `{arch}.embedding_scale` KV for arches that read it
-/// (grok, minicpm), else `1.0`. A structural [`Spec`] flag picks the source, so a
-/// KV value that every fixture ships never triggers on its own.
 pub(super) fn embedding_scale(m: &Model) -> f64 {
 	match spec_of(m) {
 		Some(sp) if sp.emb_sqrt_ne => (m.hp.ne as f64).sqrt(),
@@ -500,16 +434,10 @@ pub(super) fn embedding_scale(m: &Model) -> f64 {
 	}
 }
 
-/// True if `m.hp.arch` adds a learned LM-head output bias to the logits (qwen2,
-/// phi2/phi3, pangu). Spec-flag gated, never presence: dream/qwen2vl ship the
-/// tensor but their reference graph leaves it unused.
 pub(super) fn out_bias(m: &Model) -> bool {
 	spec_of(m).is_some_and(|sp| sp.out_bias)
 }
 
-/// Final-logit softcap for `m.hp.arch`: `hp.softcap` for arches whose graph applies
-/// it (gemma2/gemma3), else `0.0`. Spec-flag gated, never KV-triggered, because
-/// gemma1/minicpm ship `final_logit_softcapping` in KV yet must not apply it.
 pub(super) fn final_softcap(m: &Model) -> f64 {
 	match spec_of(m) {
 		Some(sp) if sp.final_softcap => m.hp.softcap,
@@ -517,16 +445,10 @@ pub(super) fn final_softcap(m: &Model) -> f64 {
 	}
 }
 
-/// True if `m.hp.arch` retains a non-parametric-normed copy of the initial
-/// embedding as a per-layer skip residual (talkie): the decode loop RMS-norms the
-/// embedding in place and stashes it, and [`layer_talkie`] adds it back scaled.
 pub(super) fn embd_skip(m: &Model) -> bool {
 	return spec_of(m).is_some_and(|sp| sp.embd_skip);
 }
 
-/// Final-logit scale for `m.hp.arch`: `hp.logit_scale` for arches whose graph
-/// scales the logits (command-r), else `1.0`. Spec-flag gated so an arch that
-/// ships the KV without using it never scales.
 pub(super) fn logit_scale(m: &Model) -> f64 {
 	match spec_of(m) {
 		Some(sp) if sp.logit_scale && m.hp.logit_scale != 0.0 => m.hp.logit_scale,
@@ -534,12 +456,6 @@ pub(super) fn logit_scale(m: &Model) -> f64 {
 	}
 }
 
-/// The final pre-LM-head norm for `m.hp.arch`, composed from the arch's [`NormK`]
-/// with gamma/beta resolved by presence: absent gamma is the non-parametric case
-/// (olmo/talkie), a present gamma with absent beta the gamma-only case
-/// (command-r/dbrx). Mirrors llama.cpp's `build_norm(cur, output_norm_or_null,
-/// output_norm_b_or_null, kind, -1)`, so the runtime composes the head norm the
-/// same way it composes the block norms.
 pub(super) fn decoder_norm(
 	m: &Model,
 	x: &GpuBuffer,
@@ -556,8 +472,6 @@ pub(super) fn decoder_norm(
 	return apply_norm(kind, gamma, m.decoder_norm_b.as_ref(), &m.eps, rows, ne, x, out);
 }
 
-/// Route one decode layer to the ported composition for `m.hp.arch` via a
-/// [`TABLE`] lookup, composing through the shared `common` drivers.
 pub(super) fn dispatch(
 	m: &Model,
 	l: usize,

@@ -1,17 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "scan" inventory category.
-//
-// For every scan-category item in kernel_inventory/*.json, canonicalize its name;
-// if that canonical op is registered here, run the gpu-core op on the LIVE gfx1101
-// GPU and assert it matches an AUTHORITATIVE oracle (a CPU running accumulate / std
-// f64 / textbook scan convention). tol 1e-7. A proven op counts ALL its inventory
-// variants (collapsed by canon). The test FAILS on any registered-op mismatch.
-//
-// Scans are inherently sequential: out[i] depends on the whole prefix x[0..=i].
-// The authoritative reference for every op below is a CPU running accumulate with
-// the documented identity element and combine op — exactly what the device kernel
-// streams. Windowed / groupby / rank / interpolate / generic-carry items that are
-// not pure prefix scans stay backlog (reported, never faked green).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -38,7 +25,6 @@ unsafe extern "C" {
 
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
-// Run a launcher x -> out (full-length vector), on the LIVE GPU.
 fn run_scanx(f: Launch, x: &[f64]) -> Vec<f64> {
 	let b = {
 		let __up = x;
@@ -62,9 +48,7 @@ fn run_scanx(f: Launch, x: &[f64]) -> Vec<f64> {
 	out
 }
 
-// Existing gpu-core scan ops carry their own signatures; wrap each to x -> Vec<f64>.
 fn g_cumsum(x: &[f64]) -> Vec<f64> {
-	// gpu_cumsum_rows: 1 row × n cols => inclusive prefix sum over the row.
 	let b = {
 		let __up = x;
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -173,8 +157,6 @@ fn o_excl_prod(x: &[f64]) -> Vec<f64> {
 		.collect()
 }
 fn o_logcumsumexp(x: &[f64]) -> Vec<f64> {
-	// out[i] = log(Σ_{k<=i} exp(x[k])), computed unstably in extended precision
-	// as an independent reference (kernel uses the stable streaming form).
 	let mut acc = 0.0f64;
 	x.iter()
 		.map(|&v| {
@@ -193,7 +175,6 @@ fn close(g: &[f64], w: &[f64]) -> bool {
 			.all(|(a, b)| (a - b).abs() <= TOL * (1.0 + b.abs()))
 }
 
-// A registered scan op: GPU runner + CPU oracle, both x -> full vector.
 struct ScanOp {
 	run: Box<dyn Fn(&[f64]) -> Vec<f64>>,
 	oracle: Box<dyn Fn(&[f64]) -> Vec<f64>>,
@@ -212,11 +193,9 @@ fn registry() -> HashMap<&'static str, ScanOp> {
 			);
 		};
 	}
-	// existing gpu-core ops (prove they still hold)
 	reg!("cumsum", g_cumsum, o_cumsum);
 	reg!("cumprod", g_cumprod, o_cumprod);
 	reg!("cummax", g_cummax, o_cummax);
-	// new scanx_ ops
 	reg!("cummin", |x| run_scanx(launch_scanx_cummin, x), |x| {
 		o_cummin(x)
 	});
@@ -248,9 +227,6 @@ fn registry() -> HashMap<&'static str, ScanOp> {
 	m
 }
 
-// Canonicalize a scan-category JSON name to a registry key.  Strip lib prefix
-// (last '.'/':'/'$' segment), lowercase, drop dtype/alias disambiguators, then map
-// TRUE synonyms only.  Anything that is not a pure prefix scan is left unmapped.
 fn canon(name: &str) -> String {
 	let base = name
 		.rsplit(['.', ':', '$'])
@@ -265,11 +241,7 @@ fn canon(name: &str) -> String {
 		.or_else(|| base.strip_suffix("_along_dim").map(|s| s.to_string()))
 		.or_else(|| base.strip_suffix("_fwd").map(|s| s.to_string()))
 		.unwrap_or(base);
-	// by-key / segmented / transform / block / warp / thread variants are the SAME
-	// associative prefix-scan primitive: with one key/segment and identity transform
-	// they reduce exactly to the plain inclusive/exclusive sum proven here.
 	let alias: &[(&str, &str)] = &[
-		// inclusive sum / cumsum family
 		("cumsum", "cumsum"),
 		("cumulative_sum", "cumsum"),
 		("_cumsum", "cumsum"),
@@ -288,7 +260,6 @@ fn canon(name: &str) -> String {
 		("blockscan", "inclusive_sum"),
 		("warpscan", "inclusive_sum"),
 		("threadscan", "inclusive_sum"),
-		// exclusive scan family (identity element)
 		("exclusivesum", "exclusive_sum"),
 		("exclusive_sum", "exclusive_sum"),
 		("exclusive_scan", "exclusive_sum"),
@@ -300,20 +271,16 @@ fn canon(name: &str) -> String {
 		("transform_exclusive_scan", "exclusive_sum"),
 		("block_scan_exclusive", "exclusive_sum"),
 		("warp_scan_exclusive", "exclusive_sum"),
-		// cumprod
 		("cumprod", "cumprod"),
 		("cumulative_product", "cumprod"),
-		// cummax / cummin
 		("cummax", "cummax"),
 		("cumulative_max", "cummax"),
 		("_cummax", "cummax"),
 		("cummin", "cummin"),
 		("cumulative_min", "cummin"),
 		("_cummin", "cummin"),
-		// log-cumsum-exp
 		("logcumsumexp", "logcumsumexp"),
 		("cumlogsumexp", "logcumsumexp"),
-		// associative / generic forward scan primitives
 		("associative_scan", "associative_scan"),
 		("scan", "associative_scan"),
 		("scan_pack", "associative_scan"),
@@ -368,14 +335,11 @@ fn prove_scan() {
 	assert!(!items.is_empty(), "no scan items in inventory");
 	let reg = registry();
 
-	// Probe arrays exercise sign changes, zeros, growth, decay. logcumsumexp gets
-	// its own range (kept moderate so exp() stays finite for both kernel & oracle).
 	let xs: Vec<f64> = {
 		let n = 33usize;
 		(0..n).map(|i| -4.0 + 8.0 * (i as f64 + 0.5) / n as f64)
 			.collect()
 	};
-	// cumprod/excl_prod need values near 1 to avoid over/underflow blowup.
 	let xs_prod: Vec<f64> = (0..20).map(|i| 0.5 + 0.05 * i as f64).collect();
 
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
@@ -401,7 +365,6 @@ fn prove_scan() {
 	}
 
 	// ── defining-convention edge probes ──
-	// exclusive scan identities: out[0] must equal the identity element.
 	{
 		let e = run_scanx(launch_scanx_excl_sum, &xs);
 		if e[0] != 0.0 {
@@ -412,8 +375,6 @@ fn prove_scan() {
 			failures.push(format!("excl_prod[0]={} != 1 (identity)", p[0]));
 		}
 	}
-	// associative-scan associativity: combining as a balanced tree must equal the
-	// left-fold (the whole point of associative_scan). Check final element vs sum.
 	{
 		let a = run_scanx(launch_scanx_assoc_add, &xs);
 		let total: f64 = xs.iter().sum();
@@ -421,8 +382,6 @@ fn prove_scan() {
 			failures.push(format!("assoc_add last={} != Σx={}", a[a.len() - 1], total));
 		}
 	}
-	// linear-recurrence associative scan: h_t = a_t h_{t-1} + b_t (Mamba/S4 SSM).
-	// Prove against an independent CPU recurrence.
 	{
 		let a: Vec<f64> = (0..16).map(|i| 0.9 - 0.01 * i as f64).collect();
 		let b: Vec<f64> = (0..16).map(|i| 0.1 * (i as f64 - 7.0)).collect();
@@ -466,7 +425,6 @@ fn prove_scan() {
 		}
 	}
 
-	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

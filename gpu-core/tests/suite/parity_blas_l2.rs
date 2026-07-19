@@ -1,6 +1,3 @@
-// Parity test for hipBLAS-backed L2 (level-2) BLAS ops.
-// GPU result (cuBLAS via shim on NVIDIA, rocBLAS on AMD) must match a plain-Rust
-// CPU oracle within 1e-9 absolute. Matching on both backends == parity.
 
 use gpu_core::hip;
 use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
@@ -29,7 +26,6 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> (f64, usize) {
 	(worst, idx)
 }
 
-// CPU oracle: y = A @ x, A row-major m×n, x len n, y len m.
 fn cpu_gemv_notrans(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 	let mut y = vec![0.0; m];
 	for i in 0..m {
@@ -42,7 +38,6 @@ fn cpu_gemv_notrans(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 	y
 }
 
-// CPU oracle: y = A^T @ x, A row-major m×n, x len m, y len n.
 fn cpu_gemv_trans(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 	let mut y = vec![0.0; n];
 	for j in 0..n {
@@ -55,7 +50,6 @@ fn cpu_gemv_trans(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 	y
 }
 
-// CPU oracle: A[i*n+j] = x[i]*y[j], A row-major m×n.
 fn cpu_ger(x: &[f64], y: &[f64], m: usize, n: usize) -> Vec<f64> {
 	let mut a = vec![0.0; m * n];
 	for i in 0..m {
@@ -66,7 +60,6 @@ fn cpu_ger(x: &[f64], y: &[f64], m: usize, n: usize) -> Vec<f64> {
 	a
 }
 
-// Deterministic pseudo-random fill in [-1, 1).
 fn fill(len: usize, seed: u64) -> Vec<f64> {
 	let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
 	let mut v = Vec::with_capacity(len);
@@ -80,7 +73,6 @@ fn fill(len: usize, seed: u64) -> Vec<f64> {
 	v
 }
 
-// Sizes: square, non-square, and one not a multiple of 32 (warp-path stress).
 const SIZES: &[(usize, usize)] = &[(32, 32), (64, 48), (37, 53), (1, 17), (29, 1)];
 
 #[test]

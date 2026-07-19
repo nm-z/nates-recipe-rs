@@ -26,8 +26,6 @@ fn fixture() -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stories-f32.gguf");
 }
 
-/// Path for `key` out of the committed `gguf.toml` at the repo root, parsed
-/// without a toml dependency: the `key = "value"` line under `[models]`.
 fn model_path(key: &str) -> Result<PathBuf> {
 	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
 	let text = std::fs::read_to_string(&toml).with_context(|| format!("read {}", toml.display()))?;
@@ -53,8 +51,6 @@ struct EngineRun {
 	tok_s: f64,
 }
 
-/// Runs llama-completion greedy on `model` and parses the continuation text
-/// plus the `common_perf_print` prompt-eval (TTFT) and eval (tok/s) figures.
 fn llama_completion(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 	let out = Command::new("/usr/bin/llama-completion")
 		.args([
@@ -113,8 +109,6 @@ fn llama_completion(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 	return EngineRun { text, ttft_s, tok_s };
 }
 
-/// Runs recipe's resident-session greedy decode on `model`: TTFT is
-/// send-to-first-token, tok/s counts rounds after the first token.
 fn recipe_run(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 	let mut session = ChatSession::open(model, &mut |_toks: &[Tok]| true)
 		.expect("session open")
@@ -143,8 +137,6 @@ fn recipe_run(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 	};
 }
 
-/// Reports the first divergence position with context, so a failure names the
-/// token neighborhood instead of dumping two blobs.
 fn assert_same_text(recipe: &str, llama: &str) {
 	if recipe == llama {
 		return;

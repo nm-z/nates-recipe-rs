@@ -15,60 +15,39 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time;
 
-/// Basename of the per-user GPU lock file under the runtime dir.
 const LOCK_NAME: &str = "recipe-gpu.lock";
-/// Env var carrying the inherited lock fd across process re-exec.
 const INHERIT_VAR: &str = "RECIPE_GPU_LOCK_FD";
-/// KFD per-process sysfs dir; a live entry means the pid still holds the device.
 const KFD_PROC: &str = "/sys/class/kfd/kfd/proc";
-/// Seconds to wait for a prior holder's GPU teardown before proceeding.
 const TEARDOWN_DEADLINE_SECS: f64 = 30.0;
-/// Poll interval while waiting for a departing holder's VRAM to drain.
 const RECLAIM_STEP: time::Duration = time::Duration::from_millis(25);
-/// Fixed byte width of the pid stamp written into the lock file.
 const STAMP_WIDTH: usize = 20;
-/// Sentinel pid meaning the lock is unheld.
 const CLEAN: u32 = 0;
 
-/// State of this process's handle on the lock file.
 enum Lock {
-	/// No lock file has been opened yet.
 	Closed,
-	/// We opened the lock file ourselves.
 	Own,
-	/// Inherited an already-open lock fd from a parent process.
 	Adopted,
 }
 
 #[derive(Clone, Copy)]
-/// Whether this process currently holds the GPU.
 enum Grip {
-	/// The device is not held by this process.
 	Free,
-	/// The device is held by this process.
 	Taken,
 }
 
-/// Per-process gate state guarding GPU acquisition.
 struct Gate {
-	/// Handle on the on-disk lock file.
 	lock: Lock,
-	/// The lock file, opened only when this process owns the lock.
 	file: Option<fs::File>,
-	/// Whether this process holds the device.
 	grip: Grip,
 }
 
-/// Single global gate serializing GPU access within this process.
 static GATE: Mutex<Gate> = Mutex::new(Gate {
 	lock: Lock::Closed,
 	file: None,
 	grip: Grip::Free,
 });
-/// Fast-path holder pid, or CLEAN when the device is free.
 static HOLDING: AtomicU32 = AtomicU32::new(CLEAN);
 
-/// Lock the global gate, recovering from a poisoned mutex.
 fn locked() -> MutexGuard<'static, Gate> {
 	match GATE.lock() {
 		Ok(g) => return g,
@@ -76,7 +55,6 @@ fn locked() -> MutexGuard<'static, Gate> {
 	}
 }
 
-/// Apply a flock operation to the fd, retrying on interruption.
 fn flock(fd: RawFd, op: i32) -> io::Result<()> {
 	loop {
 		// SAFETY: flock operates on an owned fd and integer op; no pointers are dereferenced.
@@ -92,21 +70,18 @@ fn flock(fd: RawFd, op: i32) -> io::Result<()> {
 	}
 }
 
-/// Read the pid currently stamped in the lock file.
 fn holder_pid(f: &mut fs::File) -> Option<u32> {
 	f.rewind().ok()?;
 	let s = io::read_to_string(&mut *f).ok()?;
 	return s.trim().parse().ok();
 }
 
-/// Write a fixed-width pid stamp at the start of the lock file.
 fn stamp(f: &mut fs::File, pid: u32) -> io::Result<()> {
 	f.rewind()?;
 	write!(f, "{pid:<STAMP_WIDTH$}")?;
 	return f.flush();
 }
 
-/// Whether the teardown deadline has elapsed since the given instant.
 fn expired(t0: time::Instant) -> Option<()> {
 	let waited = t0.elapsed().as_secs_f64();
 	match waited.partial_cmp(&TEARDOWN_DEADLINE_SECS) {
@@ -115,7 +90,6 @@ fn expired(t0: time::Instant) -> Option<()> {
 	}
 }
 
-/// Warn that a prior holder overran the teardown deadline.
 fn overstayed(pid: u32, t0: time::Instant) {
 	Write::error(format!(
 		"gpu gate: pid {pid} still holds the device after {:.0}s — proceeding",
@@ -123,8 +97,6 @@ fn overstayed(pid: u32, t0: time::Instant) {
 	));
 }
 
-/// Adopt an inherited fd or open the lock file, flock it, stamp our pid, and
-/// wait out any prior holder's KFD teardown and VRAM drain before returning.
 #[inline]
 pub fn acquire() {
 	let None = num::NonZeroU32::new(HOLDING.load(Ordering::Acquire)) else {
@@ -314,7 +286,6 @@ pub fn release() {
 }
 
 pub struct Lease {
-	/// Marker preventing external construction of a lease.
 	_p: PhantomData<()>,
 }
 

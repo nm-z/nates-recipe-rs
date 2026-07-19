@@ -53,8 +53,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns `HipError` when `t_len` overflows `i32`.
 #[inline]
 pub fn gpu_discounted_returns(
 	rewards: &GpuBuffer,
@@ -77,8 +75,6 @@ pub fn gpu_discounted_returns(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `t_len` overflows `i32`.
 #[inline]
 pub fn gpu_gae(
 	rewards: &GpuBuffer,
@@ -105,8 +101,6 @@ pub fn gpu_gae(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n` overflows `i32`.
 #[inline]
 pub fn gpu_td_targets(
 	rewards: &GpuBuffer,
@@ -133,8 +127,6 @@ pub fn gpu_td_targets(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n` or `n_actions` overflows `i32`.
 #[inline]
 pub fn gpu_categorical_logprob(
 	logits: &GpuBuffer,
@@ -160,8 +152,6 @@ pub fn gpu_categorical_logprob(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n` or `dim` overflows `i32`.
 #[inline]
 pub fn gpu_gaussian_logprob(
 	mu: &GpuBuffer,

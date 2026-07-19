@@ -1,17 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "conv" inventory category.
-//
-// For every conv-category item in kernel_inventory/*.json, canonicalize its name;
-// if that canonical op is registered here, run the gpu-core conv kernel on the LIVE
-// gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle (textbook direct
-// convolution, cross-correlation convention — the convention every DL framework
-// here uses: PyTorch / TF / Keras / cuDNN / MIOpen do NOT flip the kernel). tol 1e-6.
-//
-// A proven op counts ALL its inventory variants (collapsed by canon). The test
-// FAILS on any registered-op mismatch (a real bug). Distinct functions —
-// backprop/grad, fused conv+bias+act, quantized/int8, space<->batch reshapes,
-// convLSTM, locally-connected, causal_conv1d, host-only algorithm finders/enums —
-// are NOT mapped into the forward-conv buckets and remain honest backlog.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -158,7 +145,6 @@ fn close(a: &[f64], b: &[f64]) -> bool {
 			.all(|(x, y)| (x - y).abs() <= TOL * (1.0 + y.abs()))
 }
 
-// Deterministic filler in [-1,1).
 fn fill(n: usize, seed: u64) -> Vec<f64> {
 	let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
 	(0..n).map(|_| {
@@ -617,8 +603,6 @@ fn prove_convtranspose2d() -> bool {
 			ptr::null_mut(),
 		);
 	});
-	// Oracle: transposed convolution = adjoint of forward cross-correlation.
-	// Scatter form: y[n,co, oh+kh, ow+kw] += x[n,ci,oh,ow] * w[ci,co,kh,kw].
 	let mut want = vec![0.0; n * cout * hout * wout];
 	for co in 0..cout {
 		for nn in 0..n {
@@ -729,7 +713,6 @@ fn prove_im2col_2d() -> bool {
 	gpu_im2col_2d(&bx, n, c, h, w, kh, kw, &bout).unwrap();
 	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	// Oracle: patches[(n*oh*ow), (c*kh*kw)], patch[(...,p),(c,ph,pw)] = x[n,c,oh+ph,ow+pw]
 	let ps = c * kh * kw;
 	let mut want = vec![0.0; n * oh * ow * ps];
 	for nn in 0..n {
@@ -780,8 +763,6 @@ fn prove_im2col_1d() -> bool {
 
 fn prove_col2im_2d() -> bool {
 	use gpu_core::kernels::{gpu_col2im_2d, gpu_im2col_2d};
-	// col2im / fold = scatter-add (overlapping patch positions SUM). Verify against
-	// the true fold convention: fold(unfold(x)) accumulates overlap counts per cell.
 	let (n, c, h, w) = (1, 2, 5, 4);
 	let (kh, kw) = (2, 3);
 	let x = fill(n * c * h * w, 101);
@@ -799,8 +780,6 @@ fn prove_col2im_2d() -> bool {
 	gpu_col2im_2d(&patches, n, c, h, w, kh, kw, &bout).unwrap();
 	unsafe { bout.download_async(&mut got, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
-	// Oracle: scatter-add the same patch values back; equals x scaled by per-cell
-	// overlap multiplicity (number of (oh,ow) windows covering that cell).
 	let (oh, ow) = (h - kh + 1, w - kw + 1);
 	let mut want = vec![0.0; n * c * h * w];
 	for nn in 0..n {
@@ -852,8 +831,6 @@ fn prove_col2im_1d() -> bool {
 }
 
 // ── Canonicalization: conv JSON name → registry key (forward-conv buckets only). ─
-// Distinct functions (backprop/grad, fused, quantized, reshapes, lstm, locally-
-// connected, causal, host-only finders/enums) are NOT mapped — honest backlog.
 fn canon(name: &str) -> Option<&'static str> {
 	let mut base = name
 		.rsplit(['.', ':', '$'])
@@ -864,7 +841,6 @@ fn canon(name: &str) -> Option<&'static str> {
 		base = s.to_string();
 	}
 
-	// EXCLUSIONS first (these are genuinely different ops / non-kernel) ──────
 	let excl_sub = [
 		"backprop",
 		"bwd",
@@ -920,12 +896,10 @@ fn canon(name: &str) -> Option<&'static str> {
 		return None;
 	}
 
-	// TRANSPOSE / DECONV family (check before generic conv) ──────────────────
 	if base.contains("transpose") || base.contains("deconv") {
 		return Some("convtranspose2d");
 	}
 
-	// DEPTHWISE (non-bwd already filtered) ───────────────────────────────────
 	if base == "depthwiseconv1d" {
 		return Some("depthwise_conv1d");
 	}
@@ -933,12 +907,10 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("depthwise_conv2d");
 	}
 
-	// GROUPED ────────────────────────────────────────────────────────────────
 	if base == "group_conv" || base.starts_with("grouped") || base == "devicegroupedconvfwd" {
 		return Some("grouped_conv2d");
 	}
 
-	// MORPHOLOGICAL dilation / erosion ───────────────────────────────────────
 	if base == "dilation2d"
 		|| base == "dilation2d_native"
 		|| base == "erosion2d"
@@ -947,7 +919,6 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("dilation2d");
 	}
 
-	// im2col / col2im (unfold / fold) ────────────────────────────────────────
 	if base == "im2col" || base == "unfold" || base == "conv_general_dilated_patches" {
 		return Some("im2col");
 	}
@@ -955,7 +926,6 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("col2im");
 	}
 
-	// conv1d forward ─────────────────────────────────────────────────────────
 	if base == "conv1d"
 		|| base == "conv_general_dilated"
 		|| base == "conv_with_general_padding"
@@ -965,7 +935,6 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("conv1d");
 	}
 
-	// conv3d forward ─────────────────────────────────────────────────────────
 	if base == "conv3d"
 		|| base == "conv_3d"
 		|| base == "convolution3d"
@@ -976,8 +945,6 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("conv3d");
 	}
 
-	// conv2d / generic forward convolution → conv2d ──────────────────────────
-	// (a plain forward conv with 2-spatial dims; dim-generic names land here too.)
 	if base.contains("forward") || base.contains("convfwd") || base == "convforward" {
 		return Some("conv2d");
 	}
@@ -1049,7 +1016,6 @@ fn prove_conv() {
 	let items = load_conv();
 	assert!(!items.is_empty(), "no conv items in inventory");
 
-	// Run every registered op ONCE on the live GPU; cache pass/fail.
 	let mut op_ok: HashMap<&'static str, bool> = HashMap::new();
 	op_ok.insert("conv1d", prove_conv1d());
 	op_ok.insert("conv2d", prove_conv2d());
@@ -1071,7 +1037,6 @@ fn prove_conv() {
 		.map(|(k, _)| *k)
 		.collect();
 
-	// Walk inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<&str> = Default::default();

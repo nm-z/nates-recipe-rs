@@ -19,17 +19,11 @@ pub struct Merge {
 	pub merged_id: u32,
 }
 
-/// An ordered BPE merge table. Maps each adjacent symbol pair to its `rank`
-/// (training order — lower merges first) and the `merged_id` it collapses to.
-/// Base byte symbols hold ids `0..=255`; the `i`-th merge yields id `256 + i`.
 pub struct MergeTable {
 	ranks: HashMap<Pair, Merge>,
 }
 
 impl MergeTable {
-	/// Build from an ordered list of `(left_id, right_id)` merges. List index is
-	/// the rank (0 merges first); merge `i` produces id `256 + i`. Fails if a
-	/// pair is listed twice — its collapse target would be ambiguous.
 	pub fn from_merges(merges: Vec<Pair>) -> Result<Self> {
 		let mut ranks = HashMap::with_capacity(merges.len());
 		let mut rank: u32 = 0;
@@ -47,12 +41,10 @@ impl MergeTable {
 		Ok(Self { ranks })
 	}
 
-	/// `(rank, merged_id)` for an adjacent pair, or `None` if it is not a merge.
 	pub fn lookup(&self, a: u32, b: u32) -> Option<Merge> {
 		self.ranks.get(&Pair { left: a, right: b }).copied()
 	}
 
-	/// Number of merges in the table.
 	pub fn len(&self) -> usize {
 		self.ranks.len()
 	}
@@ -69,10 +61,6 @@ struct Best {
 	merged_id: u32,
 }
 
-/// Encode raw UTF-8 bytes to BPE token ids. Symbols start as the bytes
-/// themselves (`0..=255`); the adjacent pair with the lowest rank present in
-/// `table` is collapsed into its merged id, repeatedly, until no adjacent pair
-/// is in the table. Ties go to the leftmost occurrence. Empty input → empty.
 pub fn encode(bytes: &[u8], table: &MergeTable) -> Vec<u32> {
 	let mut ids: Vec<u32> = bytes.iter().map(|&b| u32::from(b)).collect();
 	loop {

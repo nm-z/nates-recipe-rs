@@ -28,8 +28,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns `HipError` when `n_states` or `t_len` overflows `i32`.
 #[inline]
 pub fn gpu_forward_backward(
 	log_trans: &GpuBuffer,
@@ -59,8 +57,6 @@ pub fn gpu_forward_backward(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n_states` or `t_len` overflows `i32`.
 #[inline]
 pub fn gpu_viterbi(
 	log_trans: &GpuBuffer,

@@ -45,10 +45,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Accumulates per-class feature count totals from `x_counts` and labels `y` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n`, `n_features`, or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_nb_count_table(
 	x_counts: &GpuBuffer,
@@ -77,10 +73,6 @@ pub fn gpu_nb_count_table(
 	return Ok(());
 }
 
-/// Computes smoothed per-class feature log-probabilities from `count_table` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n_classes` or `n_features` does not fit in [`i32`].
 #[inline]
 pub fn gpu_nb_feature_log_prob(
 	count_table: &GpuBuffer,
@@ -106,10 +98,6 @@ pub fn gpu_nb_feature_log_prob(
 	return Ok(());
 }
 
-/// Computes multinomial naive-Bayes class log-probabilities for each row of `x` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n`, `n_features`, or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_multinomial_nb_logprob(
 	log_class_prior: &GpuBuffer,
@@ -140,10 +128,6 @@ pub fn gpu_multinomial_nb_logprob(
 	return Ok(());
 }
 
-/// Computes Bernoulli naive-Bayes class log-probabilities for each row of `x_binary` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n`, `n_features`, or `n_classes` does not fit in [`i32`].
 #[inline]
 pub fn gpu_bernoulli_nb_logprob(
 	log_class_prior: &GpuBuffer,

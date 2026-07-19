@@ -1,21 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "indexing" inventory category.
-//
-// For every indexing-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core op on the LIVE
-// gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle (pure data
-// movement => bit-exact; tol 1e-7 is slack). A proven op counts ALL inventory
-// variants that canonicalize to it. The test FAILS on any registered-op mismatch
-// (a real bug). Ambiguous / different-semantics names stay in the backlog
-// (counted in total, never proven) — never canon-inflate to fake green.
-//
-// Registered ops:
-//   existing gpu-core: where/select (gpu_where_mask), index_select/take
-//                      (gpu_gather_rows_into, cols=1 for 1-D take), index_add as the
-//                      row scatter-add (gpu_scatter_add).
-//   new indexingx_ kernels: masked_select (hipcub DeviceSelect::Flagged),
-//                      diagonal (extract), take_along_axis (gather along last
-//                      dim), tril, triu.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -79,7 +62,6 @@ fn last_err() {
 
 // ── op runners (GPU) ─────────────────────────────────────────────────────────
 
-// index_select / take: gather rows of [rows,cols] by i32 idx -> [n,cols].
 fn gpu_index_select(src: &[f64], idx: &[i32], cols: usize) -> Vec<f64> {
 	let n = idx.len();
 	let bs = {
@@ -145,7 +127,6 @@ fn gpu_where(cond: &[f64], a: &[f64], b: &[f64]) -> Vec<f64> {
 	out
 }
 
-// index_add: base [rows,cols] copied to out; out[idx[i],:] += src[i,:].
 fn gpu_index_add(base: &[f64], idx: &[i32], src: &[f64], cols: usize) -> Vec<f64> {
 	let rows = base.len() / cols;
 	let n = idx.len();
@@ -202,7 +183,6 @@ fn gpu_diagonal(m: &[f64], n: usize) -> Vec<f64> {
 	out
 }
 
-// take_along_axis: src [rows,cols], idx [rows,k] -> out[i,j] = src[i, idx[i,j]].
 fn gpu_take_along(src: &[f64], idx: &[i32], rows: usize, cols: usize, k: usize) -> Vec<f64> {
 	let bs = {
 		let __up = src;
@@ -262,7 +242,6 @@ fn gpu_tri(m: &[f64], n: usize, upper: bool) -> Vec<f64> {
 	out
 }
 
-// masked_select: in [n], flags u8 -> (num_out, out[0..num_out]).
 fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	let n = input.len();
 	let bi = {
@@ -279,7 +258,6 @@ fn gpu_masked_select(input: &[f64], flags: &[u8]) -> (usize, Vec<f64>) {
 	};
 	let o = GpuBuffer::alloc(n).unwrap();
 	let bn = GpuBuffer::alloc_bytes(4).unwrap();
-	// hipcub DeviceSelect::Flagged is two-phase: query temp size, allocate, then run.
 	let temp_bytes = unsafe { indexingx_masked_select_workspace_bytes(n as i32) };
 	let d_temp = GpuBuffer::alloc_bytes(temp_bytes.max(1)).unwrap();
 	unsafe {
@@ -315,7 +293,6 @@ fn close(a: &[f64], b: &[f64]) -> bool {
 // ── per-op proofs against authoritative CPU oracle ───────────────────────────
 
 fn prove_index_select() -> bool {
-	// [4,3] table, gather rows [2,0,3,1,0]
 	let cols = 3usize;
 	let src: Vec<f64> = (0..12).map(|v| v as f64 * 0.5 - 1.3).collect();
 	let idx = [2i32, 0, 3, 1, 0];
@@ -327,7 +304,6 @@ fn prove_index_select() -> bool {
 		}
 	}
 	let row_ok = close(&got, &want);
-	// 1-D take (cols=1): linear-index gather
 	let v: Vec<f64> = (0..8).map(|i| (i as f64).sin()).collect();
 	let ti = [7i32, 0, 3, 3, 5];
 	let g2 = gpu_index_select(&v, &ti, 1);
@@ -347,8 +323,6 @@ fn prove_where() -> bool {
 }
 
 fn prove_index_add() -> bool {
-	// [4,2] base; add src rows at idx with a DUPLICATE index (0 appears twice)
-	// to prove atomicAdd accumulation.
 	let cols = 2usize;
 	let base: Vec<f64> = (0..8).map(|v| v as f64).collect();
 	let idx = [0i32, 2, 0, 3];
@@ -372,7 +346,6 @@ fn prove_diagonal() -> bool {
 }
 
 fn prove_take_along() -> bool {
-	// src [3,4], idx [3,2] gather along last dim
 	let (rows, cols, k) = (3usize, 4usize, 2usize);
 	let src: Vec<f64> = (0..rows * cols).map(|v| (v as f64).cos()).collect();
 	let idx = [3i32, 0, 1, 2, 0, 3]; // row-major [3,2]
@@ -421,19 +394,13 @@ fn prove_masked_select() -> bool {
 }
 
 // ── canonicalization: inventory name -> registered op key (or backlog) ───────
-// Conservative: match specific compounds before bare substrings; backlog any
-// name whose true semantics differ from a registered kernel (scatter-variants,
-// construct-diag, coordinate-lists, *_scatter inverses, n-d gather).
 fn canon(name: &str) -> Option<&'static str> {
 	let n = name.to_lowercase();
 	let seg = n.rsplit(['.', ':', '$']).next().unwrap_or(&n).to_string();
 
-	// --- explicit backlog: different semantics that contain our keywords ---
-	// n-d coordinate gather (not gather-along-one-axis, not row gather)
 	if seg.contains("gathernd") || seg.contains("gather_nd") {
 		return None;
 	}
-	// *_scatter inverses / coordinate-list / construct-diag families
 	if seg.contains("scatter_") || seg.ends_with("_scatter") || seg.contains("scatternd")
             || seg.contains("indices")                       // tril_indices/triu_indices
             || seg.contains("diag_embed") || seg.contains("diagflat")
@@ -442,12 +409,10 @@ fn canon(name: &str) -> Option<&'static str> {
 		return None;
 	}
 
-	// --- masked_select / boolean-mask filter (select where mask true) ---
 	if seg.contains("masked_select") || seg.contains("apply_boolean_mask") {
 		return Some("masked_select");
 	}
 
-	// --- take_along_axis: element gather along one axis (torch.gather etc.) ---
 	if seg.contains("take_along")
 		|| seg == "torch.gather"
 		|| n == "torch.gather"
@@ -456,40 +421,32 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("take_along_axis");
 	}
 
-	// --- index_select / take (row gather by index) ---
-	// specific compounds first
 	if seg.contains("index_select") || seg.contains("torch_index_select") {
 		return Some("index_select");
 	}
-	// bare gather (row gather) across frameworks, and linear-index take
 	if (seg == "gather" || seg == "gatherv2" || seg.ends_with("gather"))
 		&& !seg.contains("along")
 		&& !seg.contains("allgather")
 		&& !seg.contains("nd")
 	{
-		// allgather is a collective, not an index gather
 		return Some("index_select");
 	}
 	if seg == "take" || seg == "resourcegather" {
 		return Some("index_select");
 	}
 
-	// --- index_add: ROW scatter-add only ---
 	if seg == "index_add" || seg == "scatteradd" || seg == "resourcescatteradd" {
 		return Some("index_add");
 	}
 
-	// --- diagonal extract ONLY (torch.diagonal: "Extract diagonal") ---
 	if seg == "diagonal" {
 		return Some("diagonal");
 	}
 
-	// --- tril / triu (mask form) ---
 	if seg == "tril" || seg == "triu" {
 		return Some("tril");
 	} // both prove same kernel pair
 
-	// --- where / select (conditional) ---
 	if seg.starts_with("where") {
 		return Some("where");
 	}
@@ -541,7 +498,6 @@ fn prove_indexing() {
 	let items = load_indexing();
 	assert!(!items.is_empty(), "no indexing items in inventory");
 
-	// Prove each registered op once against its oracle.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	op_ok.insert("index_select", prove_index_select());
 	op_ok.insert("where", prove_where());
@@ -557,7 +513,6 @@ fn prove_indexing() {
 		.map(|(k, _)| *k)
 		.collect();
 
-	// Walk the inventory: each item whose canon maps to a passing op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<&str> = Default::default();

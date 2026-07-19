@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-/// A failure anywhere in the assemble/load/dispatch path.
 #[derive(Debug)]
 pub struct AsmError(pub String);
 
@@ -79,8 +78,6 @@ struct Symbol {
       handle: u64,
 }
 
-/// AMD queue header, 64-bit (`HSA_LARGE_MODEL`) layout. Only the fields the
-/// doorbell path reads are named; the runtime owns the rest.
 #[repr(C)]
 struct Queue {
       queue_type: u32,
@@ -92,7 +89,6 @@ struct Queue {
       id: u64,
 }
 
-/// The 64-byte kernel-dispatch AQL packet (`HSA_LARGE_MODEL`).
 #[repr(C)]
 struct DispatchPacket {
       header: u16,
@@ -363,38 +359,17 @@ fn context() -> Result<&'static Ctx> {
             return err("hsa_queue_create returned a null queue");
       }
       let ctx = Ctx { gpu, queue, kernarg_pool, host_pool, vram_pool };
-      // Only this thread holds INIT_LOCK and the double-check above saw None, so set cannot fail and no queue leaks.
       if CTX.set(ctx).is_err() {
             return err("asm context init raced despite lock");
       }
       return CTX.get().ok_or_else(|| AsmError("asm context vanished after set".to_owned()));
 }
 
-/// Allocates `bytes` of coarse-grained device VRAM for use as a kernel argument
-/// buffer, granting the GPU agent access. Free it with [`free_device`].
-///
-/// This is the raw-HSA analogue of the arena; tensors that already live in the
-/// ledgered arena should pass their own device pointers to [`KernArgs::ptr`]
-/// instead of allocating here.
-///
-/// # Errors
-/// Returns [`AsmError`] if the HSA pool allocation or access grant fails.
 pub fn alloc_device(bytes: usize) -> Result<*mut c_void> {
       let ctx = context()?;
       return alloc_from(ctx, ctx.vram_pool, bytes, "vram");
 }
 
-/// Allocates `bytes` of fine-grained host memory the GPU agent can read and
-/// write directly, and which the host can dereference without any transfer.
-///
-/// This is the readback path for the raw-HSA dispatcher: kernel operands and
-/// results placed here are visible to both sides, so a caller can seed inputs
-/// and check outputs without the ledgered arena. Device-resident work belongs
-/// in [`alloc_device`]; this memory is reached across PCIe by the kernel. Free
-/// it with [`free_device`].
-///
-/// # Errors
-/// Returns [`AsmError`] if the HSA pool allocation or access grant fails.
 pub fn alloc_host(bytes: usize) -> Result<*mut c_void> {
       let ctx = context()?;
       return alloc_from(ctx, ctx.host_pool, bytes, "host");
@@ -424,23 +399,12 @@ fn alloc_from(ctx: &Ctx, pool: Pool, bytes: usize, what: &str) -> Result<*mut c_
       return Ok(ptr_out);
 }
 
-/// Frees a buffer returned by [`alloc_device`] or [`alloc_host`]. The HSA pool
-/// free resolves the owning pool from the pointer, so one function covers both.
-///
-/// # Errors
-/// Returns [`AsmError`] if the HSA free fails.
-///
-/// # Safety
-/// `ptr` must be a pointer previously returned by [`alloc_device`] or
-/// [`alloc_host`] and not yet freed.
 pub unsafe fn free_device(ptr: *mut c_void) -> Result<()> {
       gate::acquire();
       // SAFETY: caller guarantees ptr came from alloc_device and is freed exactly once.
       return hsa_check(unsafe { hsa_amd_memory_pool_free(ptr) }, "hsa_amd_memory_pool_free(vram)");
 }
 
-/// A packed kernarg buffer, built left to right in declaration order. Each value
-/// is placed at its natural alignment, matching the AMDGPU kernarg ABI.
 #[derive(Default)]
 pub struct KernArgs {
       buf: Vec<u8>,
@@ -459,13 +423,11 @@ impl KernArgs {
             }
       }
 
-      /// Appends a device pointer argument (8 bytes, 8-aligned).
       #[inline]
       pub fn ptr(&mut self, p: *const c_void) -> &mut Self {
             return self.u64(p as u64);
       }
 
-      /// Appends a `u64` argument (8 bytes, 8-aligned).
       #[inline]
       pub fn u64(&mut self, v: u64) -> &mut Self {
             self.align_to(8);
@@ -473,7 +435,6 @@ impl KernArgs {
             return self;
       }
 
-      /// Appends an `i32` argument (4 bytes, 4-aligned).
       #[inline]
       pub fn i32(&mut self, v: i32) -> &mut Self {
             self.align_to(4);
@@ -481,7 +442,6 @@ impl KernArgs {
             return self;
       }
 
-      /// Appends a `u32` argument (4 bytes, 4-aligned).
       #[inline]
       pub fn u32(&mut self, v: u32) -> &mut Self {
             self.align_to(4);
@@ -489,7 +449,6 @@ impl KernArgs {
             return self;
       }
 
-      /// Appends an `f64` argument (8 bytes, 8-aligned).
       #[inline]
       pub fn f64(&mut self, v: f64) -> &mut Self {
             self.align_to(8);
@@ -504,8 +463,6 @@ impl KernArgs {
       }
 }
 
-/// One implicit kernel argument: where it sits in the kernarg segment and what
-/// the dispatch is expected to put there.
 struct Hidden {
       kind: String,
       offset: usize,
@@ -520,20 +477,11 @@ struct Kernel {
       hidden: Vec<Hidden>,
 }
 
-/// A frozen HSA executable and its dispatchable kernels, keyed by name.
 pub struct Program {
       kernels: HashMap<String, Kernel>,
       source: PathBuf,
 }
 
-/// Assembles `path` if it is a `.s` file, loads the code object, and freezes it.
-///
-/// A `.s` source is compiled to `<stem>.hsaco` beside it, reusing the cached
-/// object when it is newer than the source. A `.hsaco`/`.co` path is loaded
-/// directly.
-///
-/// # Errors
-/// Returns [`AsmError`] if assembly, HSA load, or symbol resolution fails.
 pub fn load(path: impl AsRef<Path>) -> Result<Program> {
       let path = path.as_ref();
       let object = assemble(path)?;
@@ -648,28 +596,16 @@ fn resolve(exe: Executable, gpu: Agent, name: &str, hidden: Vec<Hidden>) -> Resu
 }
 
 impl Program {
-      /// The kernel names this program exposes.
       #[must_use]
       pub fn kernels(&self) -> Vec<&str> {
             return self.kernels.keys().map(String::as_str).collect();
       }
 
-      /// The source path this program was loaded from.
       #[must_use]
       pub fn source(&self) -> &Path {
             return &self.source;
       }
 
-      /// Dispatches `name` over `grid` work-items in `block`-sized work-groups,
-      /// with `args` copied into the kernarg segment. Blocks until the kernel
-      /// signals completion.
-      ///
-      /// `grid` and `block` are `[x, y, z]`; the packet dimension count is the
-      /// number of dimensions whose grid extent is greater than 1.
-      ///
-      /// # Errors
-      /// Returns [`AsmError`] if the kernel is unknown, `args` overflows the
-      /// kernarg segment, or an HSA allocation/dispatch step fails.
       pub fn launch(
             &self,
             name: &str,
@@ -680,19 +616,6 @@ impl Program {
             return self.launch_lds(name, grid, block, 0, args);
       }
 
-      /// Dispatches `name` with `dynamic_lds` extra bytes of group segment per
-      /// work-group on top of the kernel's fixed allocation.
-      ///
-      /// A kernel declaring `HIP_DYNAMIC_SHARED` reports a fixed group segment
-      /// size of zero and takes its LDS size at dispatch, which is what the
-      /// shared-memory argument of `hipLaunchKernelGGL` supplies. Such a kernel
-      /// launched through [`Program::launch`] runs with no LDS at all and reads
-      /// and writes outside its group segment, so pass its byte count here.
-      ///
-      /// # Errors
-      /// Returns [`AsmError`] if the kernel is unknown, `args` overflows the
-      /// kernarg segment, the group segment total overflows `u32`, or an HSA
-      /// allocation/dispatch step fails.
       pub fn launch_lds(
             &self,
             name: &str,
@@ -826,18 +749,6 @@ impl Program {
       }
 }
 
-/// Fills the implicit arguments the dispatch owns.
-///
-/// On code object v5 and later a HIP kernel reads `blockDim` and `gridDim` from
-/// its kernarg segment, not from a hardware register, so a dispatch that leaves
-/// those slots zeroed gives the kernel a block size of zero. Loops written as
-/// `for (x = threadIdx.x; x < n; x += blockDim.x)` then never advance and the
-/// kernel hangs; simpler kernels merely index as if every block were block
-/// zero. Slots this dispatcher has no value for, such as the hostcall buffer
-/// and the device heap, stay zeroed.
-///
-/// # Errors
-/// Returns [`AsmError`] if a declared slot lies outside the kernarg segment.
 fn fill_hidden(
       kernarg: *mut c_void,
       kernarg_size: u32,
@@ -969,12 +880,6 @@ fn fresh(object: &Path, source: &Path) -> bool {
       return obj.mtime() >= src.mtime();
 }
 
-/// Reads the `NT_AMDGPU_METADATA` note and returns each kernel with the
-/// implicit arguments its kernarg segment reserves.
-///
-/// The note is the authority on where those slots sit: their offsets shift with
-/// the explicit argument list, so they cannot be assumed from a fixed layout.
-/// Kernels appear as `.args` lists followed by the `.name` they belong to.
 fn kernel_meta(object: &Path) -> Result<Vec<(String, Vec<Hidden>)>> {
       let rocm = env::var("ROCM_PATH").unwrap_or_else(|_e| "/opt/rocm".to_owned());
       let readelf = format!("{rocm}/llvm/bin/llvm-readelf");

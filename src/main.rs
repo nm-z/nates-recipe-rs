@@ -11,8 +11,6 @@ use std::process;
 use std::slice;
 use std::time::UNIX_EPOCH;
 
-/// Maps a legacy `i32` status into an `ExitCode`, preserving the child-probe
-/// protocol's exact 0/2 semantics; unrepresentable codes collapse to 1.
 fn exit_code(code: i32) -> process::ExitCode {
 	return process::ExitCode::from(u8::try_from(code).unwrap_or(1));
 }
@@ -31,8 +29,6 @@ fn usage(code: i32) -> process::ExitCode {
 	return exit_code(code);
 }
 
-/// Locates `gguf.toml`: the current directory first, then
-/// `$XDG_CONFIG_HOME/recipe/gguf.toml` (falling back to `~/.config/recipe`).
 fn gguf_toml_path() -> Result<PathBuf> {
 	let cwd = PathBuf::from("gguf.toml");
 	if cwd.exists() {
@@ -48,9 +44,6 @@ fn gguf_toml_path() -> Result<PathBuf> {
 	Ok(dir.join("gguf.toml"))
 }
 
-/// Parses the `[models]` table of a gguf.toml into `(name, path)` pairs in file
-/// order. A minimal section-aware line reader: no toml crate is a workspace
-/// dependency and the table is flat `name = "path"` entries.
 fn load_models(toml: &Path) -> Result<Vec<(String, String)>> {
 	let text = fs::read_to_string(toml)
 		.map_err(|e| anyhow::anyhow!("{}: {e}", toml.display()))?;
@@ -77,9 +70,6 @@ fn load_models(toml: &Path) -> Result<Vec<(String, String)>> {
 	Ok(models)
 }
 
-/// Resolves the model to chat with: `name` selects directly, otherwise the
-/// interactive picker chooses one. Returns the gguf path, or `None` when the
-/// user quit the picker.
 fn run_chat(name: Option<&str>) -> Result<()> {
 	let toml = gguf_toml_path()?;
 	let models = load_models(&toml)?;

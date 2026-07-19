@@ -28,7 +28,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Records the launch counters and returns any pending HIP launch error.
 fn e() -> Result<(), HipError> {
 	tick(&LAUNCH);
 	tick(&GET_LAST_ERROR);
@@ -36,10 +35,6 @@ fn e() -> Result<(), HipError> {
 	return check(unsafe { hipGetLastError() });
 }
 
-/// Runs one entropy-gated diffusion step, writing the accept and renoise masks.
-///
-/// # Errors
-/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_entropy_gated_step(
 	logits: &GpuBuffer,
@@ -66,10 +61,6 @@ pub fn gpu_entropy_gated_step(
 	return e();
 }
 
-/// Commits accepted tokens into `canvas` and folds renoise into `committed`.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_diffusion_commit(
 	accepted: &GpuBuffer,
@@ -97,10 +88,6 @@ pub struct Sample {
 	pub steps: usize,
 }
 
-/// Iteratively denoises `initial_canvas` until every position has committed.
-///
-/// # Errors
-/// Returns [`HipError`] if an allocation, a launch, or a device transfer fails.
 #[inline]
 pub fn gpu_diffusion_sample(
 	mut logits_fn: impl FnMut(&GpuBuffer) -> Result<GpuBuffer, HipError>,

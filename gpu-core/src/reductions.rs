@@ -160,7 +160,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Rounds `n` up to the next power of two, returning `1` when `n <= 1`.
 const fn next_pow2(n: usize) -> usize {
 	let mut p = 1usize;
 	while p < n {
@@ -169,56 +168,48 @@ const fn next_pow2(n: usize) -> usize {
 	return p;
 }
 
-/// Queries the device workspace size in bytes required by the sum-all reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_sum_all_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_sum_all_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the max-all reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_max_all_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_max_all_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the min-all reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_min_all_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_min_all_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the mean-all reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_mean_all_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_mean_all_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the L2-norm reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_l2_norm_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_l2_norm_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the dot-product reduction over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_dot_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_dot_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the cumulative-product scan over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_cumprod_workspace_bytes(n: usize) -> usize {
 	// SAFETY: FFI size query taking a plain i32 and returning a usize; no pointers are dereferenced.
 	unsafe { return launch_cumprod_workspace_bytes(safe_i32(n)) }
 }
-/// Queries the device workspace size in bytes required by the cumulative-max scan over `n` elements.
 #[must_use]
 #[inline]
 pub fn gpu_cummax_workspace_bytes(n: usize) -> usize {
@@ -226,7 +217,6 @@ pub fn gpu_cummax_workspace_bytes(n: usize) -> usize {
 	unsafe { return launch_cummax_workspace_bytes(safe_i32(n)) }
 }
 
-/// Dispatches scalar reduction launcher `f` over `x`, writing the single-element result into `out`.
 fn scalar_reduce(
 	f: unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, usize, i32, *mut c_void),
 	x: &GpuBuffer,
@@ -248,10 +238,6 @@ fn scalar_reduce(
 	check_launch();
 }
 
-/// Reduces `x` to its sum, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_sum_all(
 	x: &GpuBuffer,
@@ -263,10 +249,6 @@ pub fn gpu_sum_all(
 	return Ok(());
 }
 
-/// Reduces `x` to its maximum, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_max_all(
 	x: &GpuBuffer,
@@ -278,10 +260,6 @@ pub fn gpu_max_all(
 	return Ok(());
 }
 
-/// Reduces `x` to its minimum, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_min_all(
 	x: &GpuBuffer,
@@ -293,10 +271,6 @@ pub fn gpu_min_all(
 	return Ok(());
 }
 
-/// Reduces `x` to its mean, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_mean_all(
 	x: &GpuBuffer,
@@ -308,10 +282,6 @@ pub fn gpu_mean_all(
 	return Ok(());
 }
 
-/// Reduces `x` to its L2 norm using `sq` as squared-element scratch, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_l2_norm(
 	x: &GpuBuffer,
@@ -336,10 +306,6 @@ pub fn gpu_l2_norm(
 	return Ok(());
 }
 
-/// Reduces the dot product of `a` and `b` using `prod` as elementwise-product scratch, writing the scalar into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_dot(
 	a: &GpuBuffer,
@@ -366,10 +332,6 @@ pub fn gpu_dot(
 	return Ok(());
 }
 
-/// Fills the padding region of `data` between `real_n` and `padded_n` with the `sentinel` value.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_fill_sentinel(
 	data: &GpuBuffer,
@@ -391,10 +353,6 @@ pub fn gpu_fill_sentinel(
 	return Ok(());
 }
 
-/// Initializes `idx` with the identity permutation `0..n`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: idx is a live device buffer sized for n; the launcher signature matches these arguments.
@@ -405,10 +363,6 @@ pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// Runs one bitonic compare-exchange step over `data` for stride `j` and subsequence length `k`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_bitonic_step(
 	j: usize,
@@ -430,10 +384,6 @@ pub fn gpu_bitonic_step(
 	return Ok(());
 }
 
-/// Runs one key/index bitonic compare-exchange step over `keys` and `vals` for stride `j` and subsequence length `k`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_bitonic_step_idx(
 	j: usize,
@@ -457,10 +407,6 @@ pub fn gpu_bitonic_step_idx(
 	return Ok(());
 }
 
-/// Runs one key/value (both `f64`) bitonic compare-exchange step over `keys` and `vals` for stride `j` and subsequence length `k`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_bitonic_step_dd(
 	j: usize,
@@ -484,10 +430,6 @@ pub fn gpu_bitonic_step_dd(
 	return Ok(());
 }
 
-/// Sorts the first `n` elements of `x` ascending via bitonic sort, writing the result into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
@@ -512,10 +454,6 @@ pub fn gpu_sort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	return Ok(());
 }
 
-/// Argsorts the first `n` elements of `x` ascending via bitonic sort, writing the permutation indices into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let pn = next_pow2(n);
@@ -542,10 +480,6 @@ pub fn gpu_argsort(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipEr
 	return Ok(());
 }
 
-/// Sorts `keys` ascending while permuting `vals` in lockstep, writing results into `out_keys` and `out_vals`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_sort_by_key(
 	keys: &GpuBuffer,
@@ -580,10 +514,6 @@ pub fn gpu_sort_by_key(
 	return Ok(());
 }
 
-/// Sorts each segment of `data` delimited by `seg_offsets` independently, writing results into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_segment_sort(
 	data: &GpuBuffer,
@@ -607,10 +537,6 @@ pub fn gpu_segment_sort(
 	return Ok(());
 }
 
-/// Computes the row-wise prefix sum of the `rows`-by-`cols` matrix `x`, writing the result into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_cumsum_rows(
 	x: &GpuBuffer,
@@ -632,10 +558,6 @@ pub fn gpu_cumsum_rows(
 	return Ok(());
 }
 
-/// Computes the column-wise prefix sum of the `rows`-by-`cols` matrix `x`, writing the result into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_cumsum_cols(
 	x: &GpuBuffer,
@@ -657,10 +579,6 @@ pub fn gpu_cumsum_cols(
 	return Ok(());
 }
 
-/// Computes the inclusive cumulative product of the first `n` elements of `x`, writing the result into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_cumprod(
 	x: &GpuBuffer,
@@ -683,10 +601,6 @@ pub fn gpu_cumprod(
 	return Ok(());
 }
 
-/// Computes the inclusive cumulative maximum of the first `n` elements of `x`, writing the result into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_cummax(
 	x: &GpuBuffer,
@@ -709,10 +623,6 @@ pub fn gpu_cummax(
 	return Ok(());
 }
 
-/// Sums `vals` within each segment identified by `seg_ids`, writing per-segment totals into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_segment_sum(
 	vals: &GpuBuffer,
@@ -736,10 +646,6 @@ pub fn gpu_segment_sum(
 	return Ok(());
 }
 
-/// Reduces `vals` to the maximum within each segment identified by `seg_ids`, writing per-segment maxima into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_segment_max(
 	vals: &GpuBuffer,
@@ -763,15 +669,6 @@ pub fn gpu_segment_max(
 	return Ok(());
 }
 
-/// Runs the first-order linear recurrence scan `h = a * h + b` over `n_steps`
-/// steps of width `dim`, writing per-step states into `states`. `state` (nullable)
-/// carries the recurrence across calls: when present, `h` is loaded from it at
-/// entry and the final `h` written back, so a scan over only the NEW steps is
-/// bit-identical to a full-sequence scan; when `None`, `h` starts at zero with no
-/// write-back.
-///
-/// # Errors
-/// Returns [`HipError`] if a GPU buffer operation or kernel launch fails.
 #[inline]
 pub fn gpu_scan_linear_recurrence(
 	a: &GpuBuffer,

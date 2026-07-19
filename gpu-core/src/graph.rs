@@ -52,8 +52,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows` overflows `i32`.
 #[inline]
 pub fn gpu_csr_spmv(
 	values: &GpuBuffer,
@@ -80,8 +78,6 @@ pub fn gpu_csr_spmv(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n_rows` or `feat` overflows `i32`.
 #[inline]
 pub fn gpu_csr_spmm(
 	values: &GpuBuffer,
@@ -111,8 +107,6 @@ pub fn gpu_csr_spmm(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a device memset fails or a size overflows `i32`.
 #[inline]
 pub fn gpu_neighbor_aggregate(
 	features: &GpuBuffer,
@@ -160,8 +154,6 @@ pub fn gpu_neighbor_aggregate(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] on a device failure or a size that overflows `i32`.
 #[inline]
 pub fn gpu_degree(
 	edge_dst: &GpuBuffer,
@@ -184,8 +176,6 @@ pub fn gpu_degree(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when a size overflows `i32` or the kernel launch reports failure.
 #[inline]
 pub fn gpu_gcn_norm(
 	deg: &GpuBuffer,

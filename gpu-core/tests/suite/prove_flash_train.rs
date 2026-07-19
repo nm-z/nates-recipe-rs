@@ -2,7 +2,6 @@ use gpu_core::kernels::{gpu_flash_attention_backward_into, gpu_flash_attention_t
 use gpu_core::memory::GpuBuffer;
 use std::ptr;
 
-// Deterministic pseudo-random fill (no rand dep in this crate's tests).
 fn lcg_fill(v: &mut [f64], mut state: u64) {
 	for x in v.iter_mut() {
 		state = state
@@ -12,9 +11,6 @@ fn lcg_fill(v: &mut [f64], mut state: u64) {
 	}
 }
 
-// CPU oracle for one (sample, head): full softmax attention forward + backward.
-// Layouts match the kernels: q/k/v/ctx are [n, s, d] with head slice hh*hd,
-// lse is [n][heads][s].
 #[allow(clippy::too_many_arguments)]
 fn cpu_attention(
 	q: &[f64],
@@ -63,8 +59,6 @@ fn cpu_attention(
 					}
 				}
 			}
-			// dP = dctx·Vᵀ; dS = P∘(dP − rowsum(dP∘P))·scale; dQ = dS·K;
-			// dK = dSᵀ·Q; dV = Pᵀ·dctx.
 			for i in 0..s {
 				let mut dp = vec![0.0; s];
 				let mut rowsum = 0.0;
@@ -95,9 +89,6 @@ fn maxdiff(a: &[f64], b: &[f64]) -> f64 {
 		.fold(0.0, f64::max)
 }
 
-// Flash training forward (context + logsumexp) and the three backward kernels
-// must reproduce full-softmax attention math to f64 tolerance. s=100 crosses a
-// partial FA_BK=64 key tile and multiple FA_TQ=32 query tiles.
 #[test]
 fn flash_train_matches_cpu_oracle() {
 	gpu_core::hip::set_device(0).expect("set_device");

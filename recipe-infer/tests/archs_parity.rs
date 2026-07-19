@@ -45,7 +45,6 @@ fn read_tokens(dir: &Path) -> Result<Vec<u32>> {
 	return Ok(toks);
 }
 
-/// Last-position row of an LGT0 reference dump, widened to f64.
 fn read_ref_last(path: &Path) -> Result<Vec<f64>> {
 	let raw = fs::read(path)?;
 	anyhow::ensure!(raw.len() >= 12 && &raw[..4] == b"LGT0", "bad LGT0 header");

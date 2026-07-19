@@ -2,7 +2,6 @@ extern crate alloc;
 
 #[doc(hidden)]
 pub mod __macro_support;
-/// Houses the process-wide default graph behind a stable path.
 mod alias;
 mod glob;
 
@@ -15,7 +14,6 @@ use std::sync::{LazyLock, Mutex};
 
 pub use alias::OGDL as ogdl;
 
-/// Generates [`Value`] implementations that flatten a type into leaf nodes.
 macro_rules! value {
       (scalar: $($t:ty),*) => {$( impl Value for $t {
             #[inline]
@@ -182,10 +180,8 @@ macro_rules! del {
 	($g:expr, $a:ident . $b:ident {}) => {{ $crate::__macro_support::del_all(&$g, stringify!($a), stringify!($b)) }};
 }
 
-/// When true, the first content line's tab-separated fields become sibling roots rather than a nested chain.
 const FIRST_LINE_SIBLINGS: bool = true;
 
-/// Newline character used as the OGDL line separator.
 const NL: char = '\u{a}';
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -196,7 +192,6 @@ pub struct Node {
 }
 
 impl Node {
-	/// Descends `path` of child indices from `n`, returning the mutable node reached.
 	fn at_mut<'a>(mut n: &'a mut Self, path: &[usize]) -> &'a mut Self {
 		for &i in path {
 			n = &mut n.children[i];
@@ -204,7 +199,6 @@ impl Node {
 		return n;
 	}
 
-	/// Builds a childless node holding `name`.
 	#[inline]
 	#[must_use]
 	pub fn leaf(name: &str) -> Self {
@@ -261,7 +255,6 @@ impl Node {
 		return Some(cur);
 	}
 
-	/// Like [`select`](Self::select) but walks and returns a mutable reference along the path.
 	pub(crate) fn select_mut(&mut self, path: &str) -> Option<&mut Self> {
 		let mut cur = self;
 		for seg in path.split('.').filter(|s| return !s.is_empty()) {
@@ -279,7 +272,6 @@ impl Node {
 		return s;
 	}
 
-	/// Resolves one dotted-path segment against direct children, honoring `[n]` index and `{name}` selector syntax.
 	fn step(&self, seg: &str) -> Option<&Self> {
 		match seg.strip_prefix('[') {
 			Some(rest) => {
@@ -308,7 +300,6 @@ impl Node {
 		}
 	}
 
-	/// Returns the child index a single segment resolves to, or `None`.
 	fn step_index(&self, seg: &str) -> Option<usize> {
 		match seg.strip_prefix('[') {
 			Some(rest) => {
@@ -335,7 +326,6 @@ impl Node {
 		}
 	}
 
-	/// Appends this node's subtree as tab-indented lines to `out`, starting at `depth`.
 	fn write_to(&self, out: &mut String, depth: usize) {
 		let mut lines = Vec::new();
 		walk_lines(self, &mut Vec::new(), depth, &mut lines);
@@ -438,9 +428,6 @@ impl Graph {
 		return a.apply(self.clone());
 	}
 
-	/// Mutates the tree while erasing any already-printed terminal lines the mutation invalidates.
-	/// Captures the serialization before and after `f`, then reconciles the shown cursor so deletions
-	/// clear stale terminal output on a TTY and clamp the append-only cursor on a pipe.
 	#[inline]
 	pub(crate) fn mutate_shown<R>(&self, f: impl FnOnce(&mut Node) -> R) -> R {
 		let mut n = self.root.lock().unwrap_or_else(|p| return p.into_inner());
@@ -460,7 +447,6 @@ impl Graph {
 		return r;
 	}
 
-	/// Loads a graph from the OGDL file at `path`, empty when the read fails.
 	fn read(path: &str) -> Self {
 		let g = Self::empty();
 		let text = fs::read_to_string(path).unwrap_or_default();
@@ -693,8 +679,6 @@ pub fn text(src: &str) -> Graph {
 	return g;
 }
 
-/// Flattens a node subtree into tab-indented text lines paired with their child-index path and a rider flag.
-/// Rider children collapse onto one tab-separated line and are not descended into; all others recurse one depth deeper.
 fn walk_lines(
 	n: &Node,
 	path: &mut Vec<usize>,
@@ -728,16 +712,12 @@ fn walk_lines(
 	}
 }
 
-/// Flattens the tree under `root` into rendered rows in document order, each carrying its tab-indented text, child-index path, and whether it is a value-rider line.
-/// Rider children collapse onto the parent's line and are not recursed into; the path/rider fields drive Display, `show` selection, and the shown-cursor delta.
 fn lines_of(root: &Node) -> Vec<(String, Vec<usize>, bool)> {
 	let mut out = Vec::new();
 	walk_lines(root, &mut Vec::new(), 0, &mut out);
 	return out;
 }
 
-/// Returns the first line index at which the pre-mutation lines `before` and post-mutation lines `after` differ.
-/// Equal when one is a prefix of the other, in which case the shorter length is returned.
 #[doc(hidden)]
 #[inline]
 #[must_use]
@@ -749,10 +729,6 @@ pub fn divergence(before: &[String], after: &[String]) -> usize {
 	return i;
 }
 
-/// Reconciles already-printed terminal lines against a mutation that changed the tree.
-/// On a TTY, moves the cursor up over the invalidated shown lines, clears to end of screen, reprints the
-/// survivors from the divergence point, and sets `shown` to the reprinted count. On a pipe, printed history
-/// is append-only, so it only clamps `shown` to the new tree length to keep later `Write::block` deltas valid.
 #[doc(hidden)]
 #[inline]
 pub fn reconcile(before: &[String], after: &[String], shown: &mut usize) {

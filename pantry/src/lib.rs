@@ -9,10 +9,6 @@ use std::fs;
 pub type Mat = ndarray::Array2<f64>;
 pub type Vec1 = ndarray::Array1<f64>;
 
-/// Token-sequence context window for Text columns. Attention is O(seq²) per row,
-/// so a single unbounded long-form cell (e.g. a multi-thousand-token LLM response)
-/// would blow up the score matrix; the encoder caps each Text column's sequence
-/// length to this. A no-op for ordinary short text, a truncation only for outliers.
 pub const TEXT_CONTEXT: usize = 256;
 
 pub mod bpe;
@@ -23,9 +19,6 @@ pub mod encode;
 pub use data::*;
 pub use detect::*;
 
-/// A detected column type. The encoder above turns these into numeric columns
-/// (one-hot / index / token-id / day-count); here it is just the taxonomy the
-/// loaders and the char-level detector speak in.
 #[derive(Clone)]
 pub enum Kind {
 	Numeric,
@@ -36,15 +29,12 @@ pub enum Kind {
 	Image,
 }
 
-/// One named column with its detected (or declared, for ARFF) `Kind`.
 #[derive(Clone)]
 pub struct Attr {
 	pub name: String,
 	pub kind: Kind,
 }
 
-/// MemAvailable from /proc/meminfo, in bytes. `usize::MAX` if it can't be read
-/// (no guard rather than a false positive). Used by the CSV/parse RAM guards.
 pub fn available_ram_bytes() -> usize {
 	fs::read_to_string("/proc/meminfo")
 		.ok()

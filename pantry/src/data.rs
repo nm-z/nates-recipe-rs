@@ -63,12 +63,6 @@ enum FirstRow {
 	Data,
 }
 
-/// Reads a CSV, treating EVERY line as a record (no implicit header) so the first
-/// row can be inspected before deciding its role — a CSV carries no header flag.
-/// Header detection is a CSV-format question, not a content heuristic: a header row
-/// names columns, so at least one cell is a non-number. If EVERY cell parses as f64
-/// (ints, decimals, signs, scientific notation), the first row is data, not names —
-/// synthesize col_0..col_{w-1} and keep the row. Binary structural test, no thresholds.
 pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	let delim = sniff_delimiter(path);
 	let Some(()) = Some(()).filter(|_u| delim != b' ') else {
@@ -475,7 +469,6 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		.and_then(|s| s.to_str())
 		.unwrap_or(dir);
 	pb.set_message(format!("decoding images in /{leaf}"));
-	// A directory of image files is ONE vector, indexed by filename (stem) — the join key a CSV column of filenames matches against. (Previously each unique stem became its own single-image group, so nothing could join.)
 	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())

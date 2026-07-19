@@ -95,8 +95,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_mae_grad(
 	pred: &GpuBuffer,
@@ -119,8 +117,6 @@ pub fn gpu_mae_grad(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_huber_grad(
 	pred: &GpuBuffer,
@@ -145,8 +141,6 @@ pub fn gpu_huber_grad(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_bce_with_logits(
 	logits: &GpuBuffer,
@@ -171,8 +165,6 @@ pub fn gpu_bce_with_logits(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_focal_into(
 	prob: &GpuBuffer,
@@ -201,8 +193,6 @@ pub fn gpu_focal_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_focal_grad_into(
 	prob: &GpuBuffer,
@@ -231,8 +221,6 @@ pub fn gpu_focal_grad_into(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_kl_div_loss(
 	log_p: &GpuBuffer,
@@ -254,8 +242,6 @@ pub fn gpu_kl_div_loss(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` overflows `i32`.
 #[inline]
 pub fn gpu_hinge_loss(
 	scores: &GpuBuffer,
@@ -280,8 +266,6 @@ pub fn gpu_hinge_loss(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `dim` overflows `i32`.
 #[inline]
 pub fn gpu_cosine_embedding_loss(
 	a: &GpuBuffer,
@@ -311,8 +295,6 @@ pub fn gpu_cosine_embedding_loss(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `dim` overflows `i32`.
 #[inline]
 pub fn gpu_triplet_loss(
 	anchor: &GpuBuffer,
@@ -342,8 +324,6 @@ pub fn gpu_triplet_loss(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` or `dim` overflows `i32`.
 #[inline]
 pub fn gpu_contrastive_loss(
 	a: &GpuBuffer,

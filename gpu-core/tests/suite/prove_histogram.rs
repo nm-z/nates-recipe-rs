@@ -1,28 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "histogram" inventory category.
-//
-// Two real kernels are bridged here and proven on the live gfx1101 GPU against
-// an AUTHORITATIVE CPU oracle (a plain Rust histogram / bincount loop):
-//
-//   histc(x, lo, hi, B)  -> count f64 values into B equal-width bins over [lo,hi]
-//   bincount(labels, L)  -> count non-negative int labels into out[0..L)
-//
-// Proof strategy follows prove_special.rs: drive coverage with BIN-INTERIOR
-// probes (midpoints lo + (hi-lo)*(i+0.5)/n) so no probe sits on lo, hi, or an
-// internal bin edge. Interior values fall strictly inside exactly one bin, so
-// the count is identical under every histogram convention in the inventory
-// (cub/rocprim half-open [lower,upper) AND numpy/torch last-edge-closed), which
-// is why ONE histc op honestly covers histogram/histogram_even/histogram_range/
-// HistogramEven/HistogramRange/calcHist/histEven/histRange/HistogramFixedWidth.
-//
-// Counts are integer-exact, so the GPU-vs-oracle compare is an exact match
-// (tol 1e-6 is a formality). Defining-edge pins (count conservation: sum of
-// histc bins == #in-range, sum of bincount == N) mirror prove_special's
-// entr(0)/sinc(0) checks. The test FAILS on any registered-op mismatch.
-//
-// Host-only / different-function items (digitize, histogram2d/dd, MultiHistogram,
-// histogram_bin_edges, HistogramEq/EqualizeHist, confusion_matrix, *Summary*)
-// stay as backlog: not mapped, not proven, not failed.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -136,7 +112,6 @@ fn cpu_bincount(labels: &[i32], out_len: usize) -> Vec<i32> {
 }
 
 fn interior_probes(lo: f64, hi: f64, bins: usize, per_bin: usize) -> Vec<f64> {
-	// midpoints inside each bin: strictly interior, never on an edge.
 	let w = (hi - lo) / bins as f64;
 	let mut v = Vec::with_capacity(bins * per_bin);
 	for b in 0..bins {
@@ -159,7 +134,6 @@ fn canon(name: &str) -> String {
 		.map(|s| s.to_string())
 		.or_else(|| base.strip_suffix("_8u_c1r").map(|s| s.to_string()))
 		.unwrap_or(base);
-	// TRUE synonyms only. histc = 1-D even/range count over a value interval.
 	let alias: &[(&str, &str)] = &[
 		("histc", "histc"),
 		("histogram", "histc"),
@@ -171,7 +145,6 @@ fn canon(name: &str) -> String {
 		("histrange", "histc"),
 		("calchist", "histc"),
 		("histogramfixedwidth", "histc"),
-		// bincount family
 		("bincount", "bincount"),
 		("densebincount", "bincount"),
 	];
@@ -220,10 +193,8 @@ fn load_histogram() -> Vec<String> {
 }
 
 fn prove_histc() -> bool {
-	// Interior probes across [lo,hi] => deterministic, edge-free counts.
 	let (lo, hi, bins) = (-2.0_f64, 6.0_f64, 8usize);
 	let x = interior_probes(lo, hi, bins, 5);
-	// add out-of-range values that the oracle drops too
 	let mut xs = x.clone();
 	xs.extend_from_slice(&[lo - 1.0, hi + 1.0, lo - 100.0, hi + 50.0]);
 	let got = gpu_histc(&xs, lo, hi, bins);
@@ -232,10 +203,8 @@ fn prove_histc() -> bool {
 		.iter()
 		.zip(&want)
 		.all(|(g, w)| ((*g as f64) - (*w as f64)).abs() <= TOL);
-	// defining edge: sum of bins == number of in-range probes (the 20 interior, OOB dropped)
 	let in_range = xs.iter().filter(|&&v| v >= lo && v <= hi).count() as i32;
 	let conserved = got.iter().sum::<i32>() == in_range;
-	// second config: different lo/hi/bins to avoid a lucky single case
 	let (lo2, hi2, bins2) = (0.0_f64, 1.0_f64, 13usize);
 	let x2 = interior_probes(lo2, hi2, bins2, 3);
 	let g2 = gpu_histc(&x2, lo2, hi2, bins2);

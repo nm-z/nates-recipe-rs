@@ -2,12 +2,6 @@ use gpu_core::memory::GpuBuffer;
 use std::env;
 use std::process::{self, Command};
 
-// Repro of the cookbook "continue anyway? y" crash: allocations fill VRAM and
-// the first ask past the mappable ceiling dies in the uncatchable
-// VmHeap::MapPhysMemory assert (SIGABRT) instead of returning a clean OOM.
-// The child fills VRAM in 512 MB steps holding every buffer; the only
-// acceptable outcome is try_alloc_bytes -> None (exit 0). A signal 6 exit is
-// the bug.
 #[test]
 fn oversize_request_is_clean_oom_not_abort() {
 	if env::var("OVERSIZE_OOM_CHILD").is_ok() {
@@ -29,10 +23,7 @@ fn oversize_request_is_clean_oom_not_abort() {
 		"--test-threads=1",
 	])
 	.env("OVERSIZE_OOM_CHILD", "1")
-	// The fill child needs the committed-page warm regardless of how the
-	// parent was launched (no-warm children fault instead of clean-OOM).
 	.env_remove("RECIPE_SKIP_POOL_WARM");
-	// No core dump from the expected-abort child.
 	unsafe {
 		use std::os::unix::process::CommandExt;
 		cmd.pre_exec(|| {

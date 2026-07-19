@@ -2,7 +2,6 @@ use gpu_core::linalg::gpu_bmm_into;
 use gpu_core::memory::GpuBuffer;
 use std::ptr;
 
-// CPU reference: per batch, C(m×n) = opA(A)·opB(B), all row-major contiguous.
 fn cpu_bmm(
 	a: &[f64],
 	b: &[f64],
@@ -107,13 +106,11 @@ fn bmm_every_transpose_mode() {
 	run_case(3, 5, 7, 4, true, true);
 }
 
-// Per-head view: Q packed [S, heads*hd], one head = hd columns with lda = heads*hd.
 #[test]
 fn bmm_per_head_offset() {
 	gpu_core::hip::set_device(0).expect("dev");
 	let (n, s, heads, hd) = (2usize, 4usize, 3usize, 2usize);
 	let d = heads * hd;
-	// Q,K packed [n, S, d]; compute scores_h[i] = Q_i,h(S×hd) · K_i,hᵀ(hd×S) per head.
 	let q: Vec<f64> = (0..n * s * d).map(|i| (i as f64 * 0.3).sin()).collect();
 	let kk: Vec<f64> = (0..n * s * d).map(|i| (i as f64 * 0.5).cos()).collect();
 	let qg = {
@@ -130,7 +127,6 @@ fn bmm_per_head_offset() {
 	};
 	let scores = GpuBuffer::alloc(heads * n * s * s).expect("sc");
 	for h in 0..heads {
-		// batch over n: A=Q head block, B=K head block, C=scores_h, opB=trans
 		gpu_bmm_into(
 			&qg,
 			&kg,
@@ -156,7 +152,6 @@ fn bmm_per_head_offset() {
 	let mut got = vec![0.0f64; heads * n * s * s];
 	unsafe { scores.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl");
-	// CPU ref
 	for h in 0..heads {
 		for i in 0..n {
 			for a in 0..s {

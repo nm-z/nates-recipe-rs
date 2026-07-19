@@ -12,46 +12,29 @@ pub enum Home {
 	Disk,
 }
 
-/// Whether a memory tier still has room to accept a blob.
 #[derive(Clone, Copy)]
 enum Fill {
-	/// Tier can still accept blobs.
 	Open,
-	/// Tier is exhausted; skip it.
 	Full,
 }
 
-/// Decision for one tier: place the blob here or fall through.
 enum Tier {
-	/// Place the blob in this tier.
 	Use,
-	/// Fall through to the next tier.
 	Skip,
 }
 
 pub struct Waterfall {
-	/// Device arena backing VRAM carves, if this waterfall owns one.
 	slab: Option<GpuBuffer>,
-	/// Named blobs and the tier each landed in.
 	homes: HashMap<String, Home>,
-	/// Whether VRAM can still accept blobs.
 	vram_full: Fill,
-	/// Whether RAM can still accept blobs.
 	ram_full: Fill,
-	/// Probe-verified RAM budget in bytes, computed once on first host placement.
 	ram_ceiling: Option<usize>,
-	/// Running total of bytes placed in VRAM.
 	vram_bytes: usize,
-	/// Running total of bytes placed in RAM.
 	ram_bytes: usize,
-	/// Running total of bytes spilled to disk.
 	disk_bytes: usize,
-	/// Reusable host bounce buffer for VRAM placements, grown to the largest
-	/// blob seen so load-time settle stops mallocing a fresh vec per blob.
 	stage: Vec<u8>,
 }
 
-/// Reads `MemAvailable` from `/proc/meminfo` in bytes, or `usize::MAX` if unreadable.
 fn mem_available() -> usize {
 	return fs::read_to_string("/proc/meminfo")
 		.ok()
@@ -65,7 +48,6 @@ fn mem_available() -> usize {
 		.map_or(usize::MAX, |kb| return kb.saturating_mul(1024));
 }
 
-/// Formats `b` bytes as a two-decimal GB magnitude (no unit suffix).
 fn gb(b: usize) -> String {
 	let gib: usize = 0x4000_0000;
 	let whole = b.div_euclid(gib);
@@ -106,16 +88,11 @@ impl Waterfall {
 		return w;
 	}
 
-	/// Hands back the claim-mapped slab (if this store owns one) so the caller
-	/// can pass it to `release_device_arena` and end the run's claim. After this
-	/// the store must not place anything further.
 	#[inline]
 	pub fn take_slab(&mut self) -> Option<GpuBuffer> {
 		return self.slab.take();
 	}
 
-	/// # Errors
-	/// Returns an error if the fill closure fails or a VRAM carve/H2D transfer fails.
 	#[inline]
 	pub fn place(
 		&mut self,
@@ -132,7 +109,6 @@ impl Waterfall {
 		return Ok(self.homes.entry(name.to_owned()).or_insert(home));
 	}
 
-	/// Places `len` bytes in VRAM if the arena has room, else falls through to host tiers.
 	fn settle(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
 		let vram = match self.vram_full {
 			Fill::Full => Tier::Skip,
@@ -163,10 +139,6 @@ impl Waterfall {
 		}
 	}
 
-	/// Probe-verified RAM budget for this waterfall, computed once and cached. The
-	/// guess is `MemAvailable - USER_GB` exactly as the VRAM claim bakes the 1 GB
-	/// reserve into `vram_free_base - USER_GB`; a child process then commits and
-	/// touches that budget to prove the kernel will actually back it.
 	fn ram_ceiling(&mut self) -> usize {
 		if let Some(c) = self.ram_ceiling {
 			return c;
@@ -177,8 +149,6 @@ impl Waterfall {
 		return verified;
 	}
 
-	/// Places `len` bytes in RAM if the running total stays within the probe-verified
-	/// ceiling, else marks the blob disk-resident.
 	fn settle_host(
 		&mut self,
 		len: usize,

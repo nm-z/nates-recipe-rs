@@ -25,8 +25,6 @@
 use gpu_core::infer_ops::{gpu_flash_gqa, gpu_flash_mla};
 use gpu_core::memory::GpuBuffer;
 
-/// One attention problem plus how the KV sequence is chopped. `hdk` is the dot
-/// head width, `hdv` the value-gather width (equal for GQA, distinct for MLA).
 struct Case {
 	t_q: usize,
 	t_kv: usize,
@@ -63,8 +61,6 @@ fn bits(b: &GpuBuffer, n: usize) -> Vec<u64> {
 	return v.iter().map(|x| x.to_bits()).collect();
 }
 
-/// Fresh carry buffers at the (-1e300, 0, 0) start the kernel uses for a cold
-/// launch, so segment 0 with carry reproduces a fresh launch exactly.
 fn fresh_carry(blocks: usize, acc_len: usize) -> (GpuBuffer, GpuBuffer, GpuBuffer) {
 	let m = upload(&vec![-1e300f64; blocks]);
 	let l = upload(&vec![0.0f64; blocks]);
@@ -72,7 +68,6 @@ fn fresh_carry(blocks: usize, acc_len: usize) -> (GpuBuffer, GpuBuffer, GpuBuffe
 	return (m, l, acc);
 }
 
-/// Single null-carry launch over the whole sequence — the reference.
 fn single(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> Vec<u64> {
 	let out = GpuBuffer::alloc(c.t_q * c.nqh * c.hdv).expect("out");
 	let (cm, cl, cacc) = fresh_carry(c.t_q * c.nqh, c.t_q * c.nqh * c.hdv);
@@ -122,7 +117,6 @@ fn single(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> V
 	return bits(&out, c.t_q * c.nqh * c.hdv);
 }
 
-/// Segmented launches over `c.segs`, carry threaded, finalize only on the last.
 fn chunked(c: &Case, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, mla: bool) -> Vec<u64> {
 	let out = GpuBuffer::alloc(c.t_q * c.nqh * c.hdv).expect("out");
 	let (m, l, acc) = fresh_carry(c.t_q * c.nqh, c.t_q * c.nqh * c.hdv);

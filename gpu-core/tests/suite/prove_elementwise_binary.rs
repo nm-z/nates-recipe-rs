@@ -1,12 +1,4 @@
 use crate::common;
-// Live-GPU proof for the elementwise_binary inventory category.
-//
-// For every elementwise_binary item in kernel_inventory/*.json, canonicalize its
-// name; if it maps to a registered binary op, run that op on the gfx1101 GPU and
-// assert it matches an AUTHORITATIVE CPU oracle (std f64 / libm / textbook formula
-// from the JSON description). One op proves all its library variants. Unmapped
-// items are reported as remaining backlog, not failures. The test FAILS only if a
-// registered op mismatches its oracle (a real bug).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -14,7 +6,6 @@ use std::ffi::c_void;
 use std::fs;
 use std::ptr;
 
-// New tail kernels implemented in src/kernels/elementwise_binaryx.hip.
 unsafe extern "C" {
 	fn launch_elementwise_binaryx_pow(
 		a: *const c_void,
@@ -146,20 +137,16 @@ unsafe extern "C" {
 
 type Launch = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, *mut c_void);
 
-// gpu_* public wrappers (existing ops) share the (a,b,n,out) signature.
 type GpuBin = fn(&GpuBuffer, &GpuBuffer, usize, &GpuBuffer) -> Result<(), gpu_core::HipError>;
 
 enum Op {
-	// raw launcher from the new .hip
 	Raw(Launch),
-	// existing public gpu_* wrapper
 	Wrap(GpuBin),
 }
 
 struct BinOp {
 	op: Op,
 	oracle: fn(f64, f64) -> f64,
-	// per-operand domains chosen so the oracle stays finite (a hard-fail otherwise)
 	alo: f64,
 	ahi: f64,
 	blo: f64,
@@ -229,7 +216,6 @@ fn registry() -> HashMap<&'static str, BinOp> {
 	};
 	use gpu_core::math_ops::{gpu_atan2, gpu_fmod, gpu_max, gpu_min};
 	let mut m: HashMap<&'static str, BinOp> = HashMap::new();
-	// existing wrappers
 	macro_rules! w {
 		($k:literal, $g:expr, $o:expr, $alo:expr,$ahi:expr,$blo:expr,$bhi:expr) => {
 			m.insert(
@@ -246,7 +232,6 @@ fn registry() -> HashMap<&'static str, BinOp> {
 			);
 		};
 	}
-	// new raw launchers
 	macro_rules! r {
 		($k:literal, $g:expr, $o:expr, $alo:expr,$ahi:expr,$blo:expr,$bhi:expr) => {
 			m.insert(
@@ -264,7 +249,6 @@ fn registry() -> HashMap<&'static str, BinOp> {
 		};
 	}
 
-	// --- existing ops (proved directly) ---
 	w!("add", gpu_add_into, |a, b| a + b, -3.0, 3.0, -2.3, 3.7);
 	w!("sub", gpu_sub, |a, b| a - b, -3.0, 3.0, -2.3, 3.7);
 	w!("mul", gpu_mul, |a, b| a * b, -3.0, 3.0, -2.3, 3.7);
@@ -301,7 +285,6 @@ fn registry() -> HashMap<&'static str, BinOp> {
 		3.7
 	);
 
-	// --- new tail ops (raw launchers) ---
 	r!(
 		"pow",
 		launch_elementwise_binaryx_pow,
@@ -473,10 +456,6 @@ fn registry() -> HashMap<&'static str, BinOp> {
 	m
 }
 
-// JSON name -> canonical registry key. Conservative: only alias when semantics
-// are truly identical. Ops with distinct semantics (pmod, divnonan, truncatemod,
-// xdivy, cdiv, bitwise/shift/int-domain, special functions) are intentionally
-// left unmapped (backlog), never bent onto a registered op to fake coverage.
 fn canon(name: &str) -> String {
 	let base = name
 		.rsplit(['.', ':', '$'])
@@ -484,7 +463,6 @@ fn canon(name: &str) -> String {
 		.unwrap_or(name)
 		.to_lowercase();
 	let alias: &[(&str, &str)] = &[
-		// add / addv2 / accumulate variants
 		("add", "add"),
 		("add_", "add"),
 		("addv2", "add"),
@@ -497,7 +475,6 @@ fn canon(name: &str) -> String {
 		("cudnnaddtensor", "add"),
 		("vxadd", "add"),
 		("miopenaddnforward", "add"),
-		// sub
 		("subtract", "sub"),
 		("sub_", "sub"),
 		("broadcast_subtract", "sub"),
@@ -505,7 +482,6 @@ fn canon(name: &str) -> String {
 		("cudnnpointwise_sub", "sub"),
 		("stablehlo_subtract", "sub"),
 		("vxsubtract", "sub"),
-		// mul
 		("multiply", "mul"),
 		("mul_", "mul"),
 		("broadcast_multiply", "mul"),
@@ -515,7 +491,6 @@ fn canon(name: &str) -> String {
 		("cudnnpointwise_mul", "mul"),
 		("stablehlo_multiply", "mul"),
 		("vxmultiply", "mul"),
-		// div (true division)
 		("divide", "div"),
 		("div_", "div"),
 		("true_divide", "div"),
@@ -528,12 +503,9 @@ fn canon(name: &str) -> String {
 		("broadcast_divide", "div"),
 		("cudnnpointwise_div", "div"),
 		("stablehlo_divide", "div"),
-		// atan2
 		("arctan2", "atan2"),
 		("broadcast_atan2", "atan2"),
-		// fmod (C truncated mod, sign of dividend)
 		("truncatemod", "fmod"),
-		// max / min (numpy maximum/minimum == propagate-NaN; our fmax/fmin separate)
 		("max", "maximum"),
 		("broadcast_maximum", "maximum"),
 		("vector_max", "maximum"),
@@ -548,7 +520,6 @@ fn canon(name: &str) -> String {
 		("cutensorop_min", "minimum"),
 		("cudnnpointwise_min", "minimum"),
 		("stablehlo_minimum", "minimum"),
-		// comparisons
 		("greater", "gt"),
 		("cudnnpointwise_cmp_gt", "gt"),
 		("less", "lt"),
@@ -564,26 +535,20 @@ fn canon(name: &str) -> String {
 		("not_equal", "ne"),
 		("notequal", "ne"),
 		("cudnnpointwise_cmp_neq", "ne"),
-		// pow
 		("power", "pow"),
 		("broadcast_power", "pow"),
 		("cudnnpointwise_pow", "pow"),
 		("stablehlo_power", "pow"),
 		("float_power", "pow"),
 		("float_power_aten", "pow"),
-		// remainder (numpy/torch: sign of divisor)
 		("rem", "remainder"),
 		("mod", "remainder"),
 		("floor_mod", "remainder"),
 		("floormod", "remainder"),
 		("broadcast_remainder", "remainder"),
 		("stablehlo_remainder", "remainder"),
-		// floor_divide
 		("floordiv", "floor_divide"),
-		// squared_difference
 		("squareddifference", "squared_difference"),
-		// logaddexp
-		// copysign / hypot / fmax / fmin / nextafter / heaviside / ldexp / xlogy / xlog1py / next_after
 		("next_after", "nextafter"),
 		("broadcast_next_after", "nextafter"),
 	];
@@ -641,7 +606,6 @@ fn prove_elementwise_binary() {
 	);
 	let reg = registry();
 
-	// Validate every registered op against its oracle ONCE (real bug if any fail).
 	let n = 32usize;
 	let mut failures: Vec<String> = Vec::new();
 	let mut proven_ops: Vec<&'static str> = Vec::new();
@@ -659,7 +623,6 @@ fn prove_elementwise_binary() {
 		if ok {
 			proven_ops.push(k);
 		} else {
-			// find first mismatch for diagnostics
 			let mut msg = format!("op {k}");
 			for ((x, y), g) in a.iter().zip(&b).zip(&got) {
 				let want = (op.oracle)(*x, *y);
@@ -672,7 +635,6 @@ fn prove_elementwise_binary() {
 		}
 	}
 
-	// Map inventory rows to proven ops -> coverage count.
 	let proven_keys: HashSet<&str> = proven_ops.iter().cloned().collect();
 	let total = items.len();
 	let mut proven = 0usize;

@@ -11,29 +11,18 @@ use core::ptr;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-/// hipBLAS operation: no transpose.
 const OP_NONE: u32 = 111;
-/// hipBLAS operation: transpose.
 const OP_TRANS: u32 = 112;
-/// hipBLAS fill mode: lower triangle.
 const FILL_LOWER: u32 = 121;
 
-/// hipSOLVER fill mode: lower triangle.
 const SOLVER_FILL_LOWER: u32 = 122;
-/// hipSOLVER fill mode: upper triangle.
 const SOLVER_FILL_UPPER: u32 = 121;
-/// hipSOLVER eigensolver job: compute eigenvectors.
 const SOLVER_EIG_VECTOR: u32 = 202;
-/// hipSOLVER SVD job: compute all singular vectors.
 const SOLVER_JOB_ALL: i8 = 65;
 
-/// hipFFT transform type: complex-to-complex, double precision.
 const HIPFFT_Z2Z: i32 = 0x69;
-/// hipFFT transform type: real-to-complex, double precision.
 const HIPFFT_D2Z: i32 = 0x6a;
-/// hipFFT direction: forward transform.
 const HIPFFT_FORWARD: i32 = -1;
-/// hipFFT direction: inverse transform.
 const HIPFFT_BACKWARD: i32 = 1;
 
 unsafe extern "C" {
@@ -263,8 +252,6 @@ unsafe extern "C" {
 	fn hipfftExecD2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void) -> i32;
 }
 
-/// # Errors
-/// Returns [`HipError`] if the hipBLAS reduction fails.
 #[inline]
 pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result = 0.0f64;
@@ -282,8 +269,6 @@ pub fn gpu_dasum(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErro
 	return out.load(&[result]);
 }
 
-/// # Errors
-/// Returns [`HipError`] if the hipBLAS call fails.
 #[inline]
 pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let mut result: i32 = 0;
@@ -301,8 +286,6 @@ pub fn gpu_idamax(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErr
 	return out.load(&[f64::from((result - 1).max(0))]);
 }
 
-/// # Errors
-/// Returns [`HipError`] if the hipBLAS rank-k update fails.
 #[inline]
 pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let alpha = 1.0f64;
@@ -332,8 +315,6 @@ pub fn gpu_dsyrk(a: &GpuBuffer, n: usize, k: usize, out: &GpuBuffer) -> Result<(
 	clippy::too_many_arguments,
 	reason = "strided-batched GEMM exposes every leading dimension, stride, offset, and transpose flag as a distinct parameter"
 )]
-/// # Errors
-/// Returns [`HipError`] if the batched GEMM fails.
 #[inline]
 pub fn gpu_bmm_into(
 	a_mat: &GpuBuffer,
@@ -413,8 +394,6 @@ pub fn gpu_lu_factor_workspace_bytes(n: usize) -> usize {
 	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] if the hipSOLVER LU factorization fails.
 #[inline]
 pub fn gpu_lu_factor(
 	a: &GpuBuffer,
@@ -477,8 +456,6 @@ pub fn gpu_lu_solve_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension exceeds `i32` range or the hipSOLVER triangular solve fails.
 #[inline]
 pub fn gpu_lu_solve(
 	lu: &GpuBuffer,
@@ -551,8 +528,6 @@ pub fn gpu_potrs_workspace_bytes(n: usize, nrhs: usize) -> usize {
 	return usize::try_from(lwork.max(1)).unwrap_or_default() * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns `HipError` if the hipsolver Cholesky solve fails.
 #[inline]
 pub fn gpu_potrs(
 	l: &GpuBuffer,
@@ -632,8 +607,6 @@ pub fn gpu_qr_workspace_bytes(m: usize, n: usize) -> usize {
 	return usize::try_from(lwork.max(lwork_q).max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] if a hipSOLVER QR routine fails or a dimension exceeds `i32`.
 #[inline]
 pub fn gpu_qr(
 	a: &GpuBuffer,
@@ -731,10 +704,6 @@ pub fn gpu_eigh_sym_workspace_bytes(n: usize) -> usize {
 	return usize::try_from(lwork.max(1)).unwrap_or(1) * size_of::<f64>();
 }
 
-/// Symmetric eigendecomposition via hipsolver.
-///
-/// # Errors
-/// Returns `HipError` if a hipsolver call or size cast fails.
 #[inline]
 pub fn gpu_eigh_sym(
 	a: &GpuBuffer,
@@ -796,8 +765,6 @@ pub fn gpu_svd_workspace_bytes(m: usize, n: usize) -> usize {
 	return (usize::try_from(lwork.max(1)).unwrap_or(1) + m * n + n * n) * size_of::<f64>();
 }
 
-/// # Errors
-/// Returns [`HipError`] if the hipSOLVER SVD workspace query or factorization fails.
 #[inline]
 pub fn gpu_svd(
 	a: &GpuBuffer,
@@ -856,27 +823,20 @@ pub fn gpu_svd(
 	return gpu_transpose(&v, n, n, vt_out);
 }
 
-/// Cached hipFFT plan handle keyed by transform type and length.
 struct CachedFftPlan {
-	/// Raw hipFFT plan pointer stored as an integer address so the struct is `Send`.
 	plan: usize,
 }
 // SAFETY: the wrapped plan is an opaque driver handle only ever touched under the cache mutex, so moving it across threads is sound.
 unsafe impl Send for CachedFftPlan {}
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-/// Cache key: transform type plus length uniquely identify a plan.
 struct FftKey {
-	/// hipFFT transform-type constant (Z2Z or D2Z).
 	fft_type: i32,
-	/// Transform length in elements.
 	n: usize,
 }
 
-/// Process-wide cache of hipFFT plans, one per `(fft_type, n)` key.
 static FFT_CACHE: OnceLock<Mutex<HashMap<FftKey, CachedFftPlan>>> = OnceLock::new();
 
-/// Returns a cached hipFFT plan for `(fft_type, n)`, creating one on first use.
 fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	let mut cache = FFT_CACHE
 		.get_or_init(|| return Mutex::new(HashMap::new()))
@@ -903,10 +863,6 @@ fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 	return Ok(plan);
 }
 
-/// Executes an in-place complex-to-complex 1-D FFT of length `n` on `input` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if plan creation or the hipFFT execution fails.
 #[inline]
 pub fn gpu_fft_c2c_1d(
 	input: &GpuBuffer,
@@ -924,10 +880,6 @@ pub fn gpu_fft_c2c_1d(
 	return check(status);
 }
 
-/// Executes a real-to-complex 1-D FFT of length `n` on `input_real` into `out`.
-///
-/// # Errors
-/// Returns [`HipError`] if plan creation or the hipFFT execution fails.
 #[inline]
 pub fn gpu_rfft_1d(input_real: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let plan = fft_plan(HIPFFT_D2Z, n)?;

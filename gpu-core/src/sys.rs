@@ -9,8 +9,6 @@ use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::process::Command;
 
-/// Bytes free (available to an unprivileged writer) on the filesystem holding
-/// `path`. Returns 0 when the path cannot be encoded or the query fails.
 #[inline]
 #[must_use]
 pub fn disk_free_bytes(path: &Path) -> usize {
@@ -28,8 +26,6 @@ pub fn disk_free_bytes(path: &Path) -> usize {
 		.saturating_mul(usize::try_from(st.f_frsize).unwrap_or(0));
 }
 
-/// Total bytes of the filesystem holding `path`, or `None` if the path cannot
-/// be encoded or the `statvfs` call fails.
 #[inline]
 #[must_use]
 pub fn disk_total_bytes(path: &Path) -> Option<u64> {
@@ -43,13 +39,9 @@ pub fn disk_total_bytes(path: &Path) -> Option<u64> {
 	return Some((st.f_blocks as u64).saturating_mul(st.f_frsize as u64));
 }
 
-/// Arrange for `cmd`'s child to disable core dumps between fork and exec.
-/// Used by the size-probe spawns so a deliberate OOM/commit failure leaves no
-/// multi-GB core behind.
 pub fn disable_core_dumps(cmd: &mut Command) {
 	use std::os::unix::process::CommandExt as _;
 	// SAFETY: setrlimit and Ok are async-signal-safe; the child only lowers its
-	// own RLIMIT_CORE before exec and touches no shared state.
 	unsafe {
 		cmd.pre_exec(|| {
 			let z = libc::rlimit {
@@ -62,8 +54,6 @@ pub fn disable_core_dumps(cmd: &mut Command) {
 	}
 }
 
-/// Advise the kernel to drop the `[off, off+len)` byte range of `f` from the
-/// page cache. Best-effort; failures are ignored (cache advice is a hint).
 pub fn advise_dontneed(f: &File, off: u64, len: usize) {
 	// SAFETY: f owns a live fd; posix_fadvise reads no memory and cannot corrupt state.
 	unsafe {
@@ -71,8 +61,6 @@ pub fn advise_dontneed(f: &File, off: u64, len: usize) {
 	}
 }
 
-/// Flush the `[off, off+len)` range of `f` to disk and then drop it from the
-/// page cache (write-behind eviction). Best-effort.
 pub fn evict_range(f: &File, off: u64, len: usize) {
 	// SAFETY: f owns a live fd; both calls only reference kernel-side state for that fd.
 	unsafe {
@@ -88,9 +76,6 @@ pub fn evict_range(f: &File, off: u64, len: usize) {
 	advise_dontneed(f, off, len);
 }
 
-/// Sum every `stride`-th byte of `buf` with volatile reads, so the compiler
-/// cannot elide the loads. The single primitive for RAM read-bandwidth probes;
-/// takes a slice so the bounds are the caller's borrow, not a raw address.
 #[must_use]
 pub fn volatile_read_sum(buf: &[u8], stride: usize) -> u64 {
 	let step = stride.max(1);
@@ -98,24 +83,18 @@ pub fn volatile_read_sum(buf: &[u8], stride: usize) -> u64 {
 	let mut i = 0usize;
 	while i < buf.len() {
 		// SAFETY: i < buf.len() holds each iteration, so the offset pointer is
-		// in-bounds for buf; volatile only forbids the optimizer eliding the load.
 		acc = acc.wrapping_add(u64::from(unsafe { core::ptr::read_volatile(buf.as_ptr().add(i)) }));
 		i += step;
 	}
 	return acc;
 }
 
-/// Terminate the process immediately with `code`, skipping atexit handlers and
-/// buffer flushes. Async-signal-safe: the only call permitted from a signal
-/// handler that must not run Rust destructors.
 #[inline]
 pub fn exit_now(code: i32) -> ! {
 	// SAFETY: _exit is async-signal-safe and simply terminates the process.
 	unsafe { libc::_exit(code) };
 }
 
-/// Install `handler` as the SIGINT disposition. `handler` must be an
-/// `extern "C"` function that only calls async-signal-safe routines.
 pub fn on_sigint(handler: extern "C" fn(i32)) {
 	// SAFETY: handler is a valid extern "C" fn pointer; signal() just records the disposition.
 	unsafe {
@@ -123,7 +102,6 @@ pub fn on_sigint(handler: extern "C" fn(i32)) {
 	}
 }
 
-/// Restore SIGINT to the default disposition.
 pub fn reset_sigint() {
 	// SAFETY: SIG_DFL is the well-defined default disposition sentinel.
 	unsafe {
@@ -131,11 +109,8 @@ pub fn reset_sigint() {
 	}
 }
 
-/// Redirect fd 2 (stderr) to `file`, returning a dup of the original fd 2 to
-/// pass back to [`restore_stderr`], or `-1` if the redirect could not be set up.
 pub fn redirect_stderr(file: &File) -> i32 {
 	// SAFETY: dup(2) then dup2 onto fd 2; on success fd 2 aliases file and the
-	// returned fd keeps the original stderr open for later restore.
 	unsafe {
 		let saved = libc::dup(2);
 		if saved >= 0 {
@@ -145,8 +120,6 @@ pub fn redirect_stderr(file: &File) -> i32 {
 	}
 }
 
-/// Restore fd 2 from a `saved` dup produced by [`redirect_stderr`], closing the
-/// dup. A negative `saved` is a no-op.
 pub fn restore_stderr(saved: i32) {
 	if saved < 0 {
 		return;
@@ -158,21 +131,16 @@ pub fn restore_stderr(saved: i32) {
 	}
 }
 
-/// One up, non-loopback, IPv4 interface: its name and address/netmask as host
-/// order `u32`s. The single `getifaddrs` boundary.
 pub struct Ipv4Iface {
 	pub name: String,
 	pub ip: u32,
 	pub mask: u32,
 }
 
-/// Enumerate up, non-loopback IPv4 interfaces. Returns an empty vec if the
-/// `getifaddrs` query fails.
 #[must_use]
 pub fn ipv4_interfaces() -> Vec<Ipv4Iface> {
 	let mut out = Vec::new();
 	// SAFETY: getifaddrs yields a NULL-terminated list we only read, and every
-	// pointer is null-checked before deref; freeifaddrs releases it on exit.
 	unsafe {
 		let mut ifap: *mut libc::ifaddrs = core::ptr::null_mut();
 		if libc::getifaddrs(&raw mut ifap) != 0i32 {

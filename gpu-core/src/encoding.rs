@@ -92,8 +92,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Errors if a dimension argument exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_bin_edges_uniform(
 	x: &GpuBuffer,
@@ -117,8 +115,6 @@ pub fn gpu_bin_edges_uniform(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if a dimension argument exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_bin_edges_quantile(
 	x: &GpuBuffer,
@@ -144,8 +140,6 @@ pub fn gpu_bin_edges_quantile(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if a dimension argument exceeds `i32::MAX`.
 #[inline]
 pub fn gpu_quantize_features(
 	x: &GpuBuffer,
@@ -171,10 +165,6 @@ pub fn gpu_quantize_features(
 	return Ok(());
 }
 
-/// One-hot encodes the integer `labels_i32` into `out` on the device.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` or `n_classes` overflows [`i32`].
 #[inline]
 pub fn gpu_one_hot(
 	labels_i32: &GpuBuffer,
@@ -209,10 +199,6 @@ pub fn gpu_count_distinct_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	}
 }
 
-/// Counts distinct values in `x` on the device, writing uniques and run counts to the output buffers.
-///
-/// # Errors
-/// Returns [`HipError`] if `n` overflows [`i32`].
 #[inline]
 pub fn gpu_count_distinct(
 	x: &GpuBuffer,
@@ -252,8 +238,6 @@ pub fn gpu_run_length_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	}
 }
 
-/// # Errors
-/// Returns [`HipError`] if `n` does not fit in [`i32`].
 #[inline]
 pub fn gpu_run_length(
 	x: &GpuBuffer,
@@ -281,8 +265,6 @@ pub fn gpu_run_length(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_pairwise_cosine(
 	query: &GpuBuffer,
@@ -308,8 +290,6 @@ pub fn gpu_pairwise_cosine(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a dimension does not fit in [`i32`].
 #[inline]
 pub fn gpu_pairwise_l1(
 	query: &GpuBuffer,
@@ -335,8 +315,6 @@ pub fn gpu_pairwise_l1(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns an error if `nq`, `nt`, or `dim` overflows `i32`, or the launch fails.
 #[inline]
 pub fn gpu_pairwise_hamming(
 	query_u8: &GpuBuffer,

@@ -11,10 +11,6 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
-/// Ticks the launch counters and reports any pending HIP launch error.
-///
-/// # Errors
-/// Returns [`HipError`] if the preceding kernel launch reported a failure.
 fn cl() -> Result<(), HipError> {
 	tick(&LAUNCH);
 	tick(&GET_LAST_ERROR);
@@ -49,10 +45,6 @@ unsafe extern "C" {
 	);
 }
 
-/// Accumulates expert `e`'s weighted output into `out` on device.
-///
-/// # Errors
-/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_moe_weighted_accumulate(
 	ye: &GpuBuffer,
@@ -84,10 +76,6 @@ pub fn gpu_moe_weighted_accumulate(
 	return cl();
 }
 
-/// Backpropagates expert `e` through the weighted accumulate on device.
-///
-/// # Errors
-/// Returns [`HipError`] if a size does not fit in [`i32`] or the launch fails.
 #[inline]
 pub fn gpu_moe_weighted_accumulate_backward(
 	d_out: &GpuBuffer,
@@ -122,10 +110,6 @@ pub fn gpu_moe_weighted_accumulate_backward(
 	return cl();
 }
 
-/// Routes tokens through the softmax gate and mixes every expert on device.
-///
-/// # Errors
-/// Returns [`HipError`] if an allocation, a GEMM, or an accumulate launch fails.
 #[inline]
 pub fn gpu_moe_route(
 	hidden: &GpuBuffer,
@@ -152,10 +136,6 @@ pub fn gpu_moe_route(
 	return Ok(out);
 }
 
-/// Backpropagates the routed mixture into hidden, gate, and expert gradients.
-///
-/// # Errors
-/// Returns [`HipError`] if an allocation, a GEMM, or a launch fails.
 #[inline]
 pub fn gpu_moe_backward(
 	hidden: &GpuBuffer,

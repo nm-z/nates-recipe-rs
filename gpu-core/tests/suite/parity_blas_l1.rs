@@ -1,7 +1,3 @@
-// Parity tests for L1 reductions (gpu_dot / gpu_l2_norm / gpu_dasum /
-// gpu_idamax). The GPU result must match a plain-Rust CPU oracle within 1e-9.
-// The same test runs on AMD (native hipBLAS) and NVIDIA (cuBLAS shim); matching
-// the CPU oracle on both backends == parity.
 
 use gpu_core::memory::GpuBuffer;
 use gpu_core::reductions::{
@@ -12,12 +8,8 @@ use std::ptr;
 
 const TOL: f64 = 1e-9;
 
-// A spread of element counts: square-ish, non-power-of-two, prime, and a value
-// that is NOT a multiple of 32 to stress the warp/reduction tail paths.
 const SIZES: &[usize] = &[1, 7, 31, 32, 33, 64, 100, 127, 256, 1000];
 
-// Deterministic pseudo-random sequence with both signs and a zero, so |x| and
-// argmax behavior are exercised. Plain LCG — no external crates.
 fn make_seq(n: usize, seed: u64) -> Vec<f64> {
 	let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
 	let mut v = Vec::with_capacity(n);
@@ -25,7 +17,6 @@ fn make_seq(n: usize, seed: u64) -> Vec<f64> {
 		state = state
 			.wrapping_mul(6364136223846793005)
 			.wrapping_add(1442695040888963407);
-		// map top bits to [-1, 1)
 		let u = ((state >> 11) as f64) / ((1u64 << 53) as f64); // [0,1)
 		v.push(2.0 * u - 1.0);
 	}
@@ -44,8 +35,6 @@ fn cpu_dasum(x: &[f64]) -> f64 {
 	x.iter().map(|v| v.abs()).sum()
 }
 
-// 0-based index of the first element with the largest absolute value, matching
-// the gpu_idamax wrapper (which converts BLAS's 1-based result to 0-based).
 fn cpu_idamax(x: &[f64]) -> usize {
 	let mut best = 0usize;
 	let mut best_abs = x[0].abs();
@@ -195,8 +184,6 @@ fn idamax_parity() {
 		);
 	}
 
-	// Explicit case where the max-|x| element is negative and sits off any
-	// 32-aligned boundary, to pin down 0-based indexing + sign handling.
 	let mut x = make_seq(50, 6);
 	x[37] = -99.0;
 	let gx = {

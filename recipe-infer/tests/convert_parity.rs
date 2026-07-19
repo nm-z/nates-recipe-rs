@@ -18,8 +18,6 @@ use recipe_infer::dequant::{convert, dequant_f32};
 use recipe_infer::gguf::Gguf;
 use std::path::PathBuf;
 
-/// Path for `key` out of the committed `gguf.toml` at the repo root, parsed
-/// without a toml dependency: the `key = "value"` line under `[models]`.
 fn model_path(key: &str) -> Result<PathBuf> {
 	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
 	let text = std::fs::read_to_string(&toml).with_context(|| format!("read {}", toml.display()))?;
@@ -39,8 +37,6 @@ fn model_path(key: &str) -> Result<PathBuf> {
 	bail!("key {key} not found in {}", toml.display());
 }
 
-/// Decodes the smallest tensor of ggml type `ggml` in `model_key`'s gguf both
-/// ways and asserts every element is bit-identical.
 fn parity(model_key: &str, ggml: u32, dt: Dtype) -> Result<()> {
 	let path = model_path(model_key)?;
 	let g = Gguf::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -146,10 +142,6 @@ fn convert_bf16_matches_cpu_codec() -> Result<()> {
 	return parity("qwen3-0.6b-bf16", 30, Dtype::BF16);
 }
 
-/// Requant runs the flipper the other way: f32 elements in, Q8_0 blocks out.
-/// The block scale needs the whole block before a byte lands, so this is the
-/// one path where a thread owns a block instead of an element — and the bytes
-/// it writes must equal the CPU codec's encode of the same values, exactly.
 #[test]
 fn requant_q8_0_matches_cpu_codec() -> Result<()> {
 	let path = model_path("qwen3-0.6b-f16")?;

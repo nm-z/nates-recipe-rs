@@ -502,7 +502,6 @@ impl Train {
 			return;
 		};
 		// SAFETY: last.model was set from a &ModelInner in run/infer and the caller
-		// keeps that model alive across the chained .run().save() call it borrows.
 		let model = unsafe { &*last.model };
 		let key = model.loss.score_key();
 		let score = last.score;
@@ -671,7 +670,6 @@ impl Infer {
 			last.model
 		};
 		// SAFETY: last_model was set from a &ModelInner in run/infer and the caller
-		// keeps that model alive across the chained .run().eval() call it borrows.
 		let model: &ModelInner = unsafe { &*last_model };
 		let metrics: Vec<Metric> = self
 			.flags

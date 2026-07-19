@@ -28,27 +28,24 @@ use std::time::Instant;
 #[path = "models/mod.rs"]
 mod models;
 
-/// Compute width of the GGUF forward. A gguf runs at its native precision, not
-/// forced to f64: f16/bf16/quantized weights dequant to f32 (their canonical
-/// compute type) and every activation, scalar, and scratch buffer is carved at
-/// this width, so the dtype-generic kernels dispatch to the f32 path throughout.
 pub(crate) const FWD_DT: Dtype = Dtype::F32;
 
-/// Process-unique suffix for KV spill file names, so concurrent caches in one
-/// process (tests) never collide on a path.
+pub(crate) const STORE_DT: Dtype = Dtype::BF16;
+
+const fn store_elems(nbytes: usize) -> usize {
+	return nbytes / STORE_DT.elem_size();
+}
+
+const fn store_bytes(n: usize) -> usize {
+	return n * STORE_DT.elem_size();
+}
+
 static KV_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Carves `n` forward-width elements, reporting a carve-miss in the right units.
 fn falloc(n: usize) -> Result<GpuBuffer, gpu_core::HipError> {
 	return GpuBuffer::alloc_ty(n, FWD_DT);
 }
 
-/// THE embedding read. Stages `rows * k` embedding rows as raw file bytes and
-/// hands them to [`gpu_embed_blend`], which converts and weight-sums them into
-/// `out`. A plain token embedding is `k == 1` with unit weights; a diffusion
-/// canvas blend is the same call with the sampler's top-[`BLEND_K`] ids and
-/// their probabilities. The host copies bytes and reads indices — never a
-/// float — and no path decodes an element on the CPU.
 fn embed_blend_into(
 	m: &Model,
 	ar: &Arena,
@@ -80,42 +77,26 @@ fn embed_blend_into(
 	return Ok(());
 }
 
-/// File byte count for a tensor whose [`Tensor::nbytes`] is the bf16
-/// interchange size (`elems * 2`). Reading raw source bytes needs the width the
-/// FILE uses, not the width the interchange uses, or the read silently returns
-/// a prefix of the tensor.
 const fn raw_bytes(nbytes_bf16: usize, dt: Dtype) -> usize {
-	return (nbytes_bf16 / 2) * dt.elem_size();
+	return store_elems(nbytes_bf16) * dt.elem_size();
 }
 
-/// GGUF architecture strings whose parity fixtures ALL measure OK against
-/// llama.cpp (NMSE <= 1e-4 in archs_parity). Measured, never declared.
 pub fn supported_archs() -> &'static [&'static str] {
 	models::VERIFIED
 }
 
-/// Every GGUF architecture string [`models::dispatch`] can compose a decode
-/// for, verified or not. Composable answers "can we attempt a forward";
-/// [`supported_archs`] answers "is the output measured correct".
 pub fn composable_archs() -> &'static [&'static str] {
 	models::COMPOSABLE
 }
 
-/// True if `arch` has a dispatchable decode composition.
 pub fn arch_composable(arch: &str) -> bool {
 	models::supported(arch)
 }
 
-/// True if every parity fixture config of `arch` is measured OK.
 pub fn arch_supported(arch: &str) -> bool {
 	models::verified(arch)
 }
 
-/// A loaded headless model for reference validation: claims a fixed 2 GB
-/// device arena at open (no VRAM-probe re-exec; intended for small models) and
-/// releases it on drop, so sequential opens in one process are valid. One
-/// claim + one free per open stays inside the blocking-op budget. Errors if
-/// the architecture is unsupported.
 struct Headless {
 	m: Model,
 	ar: Arena,
@@ -169,21 +150,10 @@ impl Drop for Headless {
 	}
 }
 
-/// Headless greedy generation: embeds the exact `toks` (bypassing the tokenizer)
-/// and greedily generates `n_new` tokens, returning the generated ids. EVERY arch
-/// runs THROUGH the incremental cache (prefill the prompt once, then one row per
-/// step: attention layers append their K/V and attend the full cache, recurrent
-/// layers carry their scan/conv state) — the one decode path, so the reference
-/// oracle validates exactly what generation runs.
 pub fn greedy(gguf: &Path, toks: &[u32], n_new: usize) -> Result<Vec<u32>> {
 	return greedy_windowed(gguf, toks, n_new, toks.len() + n_new);
 }
 
-/// [`greedy`] constrained to a `win`-row VRAM window: rows evicted past the window
-/// spill to the host mirror and attention runs the segmented ascending carry, so
-/// `greedy_windowed(.., win < len)` agreeing with `greedy(..)` is the driver-level
-/// chunked==unchunked spill gate. `greedy` itself is the `win == len + n_new`
-/// (never-spilling) case of this function.
 pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> Result<Vec<u32>> {
 	anyhow::ensure!(!toks.is_empty(), "greedy: empty token sequence");
 	anyhow::ensure!(win >= 1, "greedy: zero-row VRAM window");
@@ -212,10 +182,6 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 	return Ok(generated);
 }
 
-/// Headless single forward: the last-position logits (`vocab` long, f64) for
-/// the exact `toks`, for parity comparison against llama.cpp reference logits
-/// on the same GGUF file. Runs THROUGH the cache prefill — the same one decode
-/// path as generation — then applies the arch's logit scale and final softcap.
 pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	anyhow::ensure!(!toks.is_empty(), "last_logits: empty token sequence");
 	let h = Headless::open(gguf, toks.len())?;
@@ -297,8 +263,6 @@ fn uint_kv(g: &Gguf, key: &str) -> Result<usize> {
 		.ok_or_else(|| anyhow!("gguf: kv {key} is not an unsigned integer"))
 }
 
-/// Reads an optional unsigned-integer kv, returning `default` when the key is absent.
-/// Absence is legal (e.g. expert params on a dense model); a present-but-wrong type still errors.
 fn uint_kv_or(g: &Gguf, key: &str, default: usize) -> Result<usize> {
 	match g.kv.get(key) {
 		None => Ok(default),
@@ -308,7 +272,6 @@ fn uint_kv_or(g: &Gguf, key: &str, default: usize) -> Result<usize> {
 	}
 }
 
-/// Reads an optional f32 kv as f64, returning `default` when the key is absent.
 fn f32_kv_or(g: &Gguf, key: &str, default: f64) -> Result<f64> {
 	match g.kv.get(key) {
 		None => Ok(default),
@@ -332,11 +295,6 @@ fn uint_arr(g: &Gguf, key: &str) -> Result<Vec<usize>> {
 	}
 }
 
-/// Per-layer unsigned hparam: a scalar broadcasts to all `nl` layers; an array
-/// must have exactly `nl` elements. Mirrors llama.cpp `get_key_or_arr` (the
-/// `n_head_arr`/`n_ff_arr` reads), so hybrid archs that store `head_count` /
-/// `feed_forward_length` per layer parse through the same shared vocabulary a
-/// scalar arch broadcasts unchanged. `default` is used only when the key is absent.
 fn uint_or_arr(g: &Gguf, key: &str, nl: usize, default: usize) -> Result<Vec<usize>> {
 	match g.kv.get(key) {
 		None => Ok(vec![default; nl]),
@@ -401,14 +359,7 @@ struct Hparams {
 	eog: Vec<u32>,
 	mask_signal: Option<usize>,
 	key_length: usize,
-	/// lfm2 short-conv cache width (`shortconv.l_cache`), the depthwise-conv kernel
-	/// width for shortconv recurrent layers; `0` for non-shortconv arches.
 	shortconv_l_cache: usize,
-	/// Multi-head Latent Attention ranks + head sub-dims (deepseek2 family). All
-	/// zero for non-MLA arches. `q_lora_rank`/`kv_lora_rank` are the latent
-	/// bottleneck widths; `head_k_mla`/`head_v_mla` the decompressed per-head key
-	/// and value dims (`attention.key_length_mla`/`value_length_mla`); `n_rot` the
-	/// RoPE sub-dim (`rope.dimension_count`), so `head_k_mla - n_rot` is the nope part.
 	q_lora_rank: usize,
 	kv_lora_rank: usize,
 	head_k_mla: usize,
@@ -421,30 +372,14 @@ struct Hparams {
 	embedding_scale: f64,
 	residual_scale: f64,
 	alibi_bias: f64,
-	/// Selective-SSM dims (mamba family), all zero for non-SSM arches:
-	/// `ssm_d_conv` conv kernel width, `ssm_d_inner` inner width (=2*ne for
-	/// mamba-1), `ssm_d_state` state size N, `ssm_dt_rank` low-rank dt width,
-	/// `ssm_n_group` selective B/C groups (0 read as 1); the dt/B/C RMSNorm
-	/// is gated by tensor presence, not a flag.
 	ssm_d_conv: usize,
 	ssm_d_inner: usize,
 	ssm_d_state: usize,
 	ssm_dt_rank: usize,
 	ssm_n_group: usize,
-	/// plamo2 low-rank dt width `max(64, ne/16)` (DERIVED, not a KV): plamo2's
-	/// `ssm_x` projects the conv output to `[dt_dim | B | C]` with this dt width,
-	/// then `ssm_dt` up-projects it to `n_head`. Zero for the other SSM arches.
 	ssm_dt_dim: usize,
-	/// Kimi Delta Attention per-head dim (`{arch}.kda.head_dim`), the `d` of the
-	/// KDA delta-rule state; `0` for the GDA delta arches (which use `ssm_d_state`)
-	/// and non-delta arches.
 	kda_head_dim: usize,
-	/// KDA head count, derived from the recurrent-layer `ssm_dt.bias` width /
-	/// `kda_head_dim`. `0` outside kimi-linear.
 	kda_n_head: usize,
-	/// Widest gated-delta scratch element count per token (conv_dim, value_dim, the
-	/// fused Q+gate projection, the KDA g vector). `0` for non-delta arches, sizing
-	/// their delta arena buffers to 1.
 	delta_win: usize,
 	dims: Vec<LayerDims>,
 	win_elems: usize,
@@ -458,23 +393,10 @@ struct Hparams {
 }
 
 impl Hparams {
-	/// True when the arch uses Multi-head Latent Attention (deepseek2 family):
-	/// both decompressed head dims are declared, mirroring llama.cpp `is_mla()`.
 	fn is_mla(&self) -> bool {
 		return self.head_k_mla > 0 && self.head_v_mla > 0;
 	}
 
-	/// Parses arch-specific hyperparameters, with several derivations that mirror
-	/// llama.cpp defaults for minimal GGUFs:
-	/// - head dim = embedding_length / head_count when explicit key_length/value_length are absent.
-	/// - minicpm3 is a naive (non-absorbed) MLA: it ships q/kv-lora ranks but no key_length_mla/value_length_mla, so per-head key/value dims derive from the standard key_length/value_length to size the MLA scratch and widen window.
-	/// - plamo2 derives its low-rank dt width from n_embd (plamo2.cpp:43).
-	/// - recurrent-layer interleave for the delta hybrids comes from the declared recurrent_layers array, else n_head_kv[l]==0 (kimi, mamba-hybrid style); KDA head count = recurrent-layer ssm_dt.bias width / kda.head_dim.
-	/// Widen-window sizing (win_elems = widest widened-f64 matrix live at once; stage_bytes = widest raw bf16 region staged at once):
-	/// - MLA latent projections (wq_b is q_lora_rank x n_head*head_k_mla) can exceed any standard projection, so the window must cover them.
-	/// - SSM projections can exceed any attention/FFN weight (mamba-1 ssm_in = 2*d_inner*ne; mamba-2 = d_in_proj*ne where d_in_proj = 2*d_inner + 2*n_group*d_state + n_head, n_head=dt_rank), so the window covers the widest single-tensor stream.
-	/// - gated-delta activation scratch width covers conv_dim, d_inner, the fused Q+gate projection, and the per-head state dim (zero for non-delta arches).
-	/// - lfm2 shortconv in_proj is [3*ne, ne], wider than any attention/FFN weight.
 	fn from_gguf(g: &Gguf) -> Result<Hparams> {
 		let arch = str_kv(g, "general.architecture")?;
 		let k = |s: &str| format!("{arch}.{s}");
@@ -627,8 +549,8 @@ impl Hparams {
 			.map(|d| d.nqh * d.hd)
 			.max()
 			.unwrap_or(nqh * key_length);
-		let gu_bytes = 2 * nffe * ne * 2;
-		let dn_bytes = nffe * ne * 2;
+		let gu_bytes = store_bytes(2 * nffe * ne);
+		let dn_bytes = store_bytes(nffe * ne);
 		let slot_bytes = gu_bytes + dn_bytes;
 		let mla_win = if head_k_mla > 0 && head_v_mla > 0 {
 			let nope = head_k_mla.saturating_sub(n_rot);
@@ -730,15 +652,6 @@ impl Hparams {
 	}
 }
 
-fn bf16(h: u16) -> f64 {
-	f32::from_bits((h as u32) << 16) as f64
-}
-
-/// Expert feed-forward width taken from the expert weight tensor's own shape, for
-/// models that omit or zero `expert_feed_forward_length` in metadata. Gate experts
-/// are `[n_embd, n_ff_exp, n_expert]`, a fused gate+up tensor `[n_embd, 2*n_ff_exp,
-/// n_expert]`; the first block carrying experts wins (dense-lead layers have none).
-/// Ground truth from the tensor, never a guessed constant.
 fn expert_ff_from_tensors(g: &Gguf, nl: usize) -> usize {
 	for l in 0..nl {
 		if let Some(ti) = g.tensors.get(&format!("blk.{l}.ffn_gate_exps.weight")) {
@@ -860,9 +773,6 @@ struct Arena {
 	mo: GpuBuffer,
 	ha: GpuBuffer,
 	hb: GpuBuffer,
-	/// The frozen non-parametric-normed initial embedding (talkie skip source),
-	/// stashed once by the decode loop and added to every layer. Sized `1` for
-	/// non-talkie arches.
 	embd_skip: GpuBuffer,
 	soft: GpuBuffer,
 	scn: GpuBuffer,
@@ -874,11 +784,6 @@ struct Arena {
 	normed: GpuBuffer,
 	hfs: GpuBuffer,
 	lm_out: GpuBuffer,
-	/// MLA attention scratch (deepseek2 family). Sized `1` for non-MLA arches.
-	/// `mqa` q latent, `mqb` q per head, `mqn`/`mqp` q nope/rope split, `mqx`
-	/// q_nope absorbed via wk_b, `mqc` Qcur; `mkv` kv+rope compressed, `mkc`
-	/// kv latent (Vcur), `mkp` k rope, `mkk` Kcur; `mrw` raw attn out, `mav`
-	/// value-decompressed via wv_b.
 	mqa: GpuBuffer,
 	mqb: GpuBuffer,
 	mqn: GpuBuffer,
@@ -891,13 +796,6 @@ struct Arena {
 	mkk: GpuBuffer,
 	mrw: GpuBuffer,
 	mav: GpuBuffer,
-	/// Selective-SSM scratch (mamba family). Sized `1` for non-SSM arches.
-	/// `ss_x`/`ss_z` the in_proj split, `ss_xc` conv+SiLU output, `ss_db` the
-	/// ssm_x projection [dt_lr|B|C], `ss_dtlr`/`ss_bb`/`ss_cc` its column slices,
-	/// `ss_dt` the projected time-step, `ss_y` the scan readout. Mamba-2 adds
-	/// `ss_xbc` (in_proj xBC split, `[t, conv_dim]`) and `ss_xbcc` (its conv+SiLU
-	/// output, from which the scan reads `x`/`B`/`C` by offset); it reuses `ss_z`
-	/// for `z`, `ss_dtlr` for the `[t, n_head]` dt, and `ss_y` for the readout.
 	ss_x: GpuBuffer,
 	ss_z: GpuBuffer,
 	ss_xc: GpuBuffer,
@@ -909,16 +807,7 @@ struct Arena {
 	ss_y: GpuBuffer,
 	ss_xbc: GpuBuffer,
 	ss_xbcc: GpuBuffer,
-	/// plamo2 in_proj output `[t, 2*d_inner]` before the per-head z/x
-	/// de-interleave; sized `1` for the other SSM arches which split `in_proj`
-	/// by contiguous weight views instead.
 	ss_zx: GpuBuffer,
-	/// Gated-delta-net scratch (qwen3.5/next/moe, kimi-linear); sized `1` for the
-	/// other arches. `d_qkv` the mixed q|k|v projection, `d_cv` its conv+SiLU
-	/// output, `d_q`/`d_k`/`d_v` the per-head split + L2-normed q/k/v (and, on
-	/// full-attention layers, the fused Q+gate and its slices), `d_z` the SiLU
-	/// output gate, `d_g` the per-head (GDA) or per-channel (KDA) log-decay,
-	/// `d_bt` beta, `d_o` the delta-scan readout.
 	d_qkv: GpuBuffer,
 	d_cv: GpuBuffer,
 	d_q: GpuBuffer,
@@ -928,29 +817,14 @@ struct Arena {
 	d_g: GpuBuffer,
 	d_bt: GpuBuffer,
 	d_o: GpuBuffer,
-	/// Query-side online-softmax carry `(cm, cl, cacc)` threaded across the
-	/// ascending spill segment launches — per decode row, so it scales with this
-	/// arena's width. The K/V staging windows live on the [`KvCache`] (carved once
-	/// at cache-open, window-granular), never here.
 	cm: GpuBuffer,
 	cl: GpuBuffer,
 	cacc: GpuBuffer,
-	/// Staging for [`embed_blend_into`]: the raw embedding rows the host copies
-	/// in, byte-granular, carved wide enough for the widest source dtype. Sized
-	/// for whichever is larger, one row per token or [`BLEND_K`] rows per canvas
-	/// cell.
 	blend_src: GpuBuffer,
-	/// One f64 weight per staged row, uploaded beside [`Arena::blend_src`].
 	blend_w: GpuBuffer,
-	/// Device flag for the per-step finiteness check: 4 bytes carved at the
-	/// arena's width and read as an `i32`, so the check costs one scalar
-	/// download instead of pulling the whole activation back to RAM.
 	finite: GpuBuffer,
 }
 
-/// Candidates blended into each canvas cell's input embedding — the sampler's
-/// top-`k` list length. One const so the sampler and the arena carve cannot
-/// disagree about how many rows get staged.
 const BLEND_K: usize = 8;
 
 impl Arena {
@@ -1055,9 +929,6 @@ struct Model {
 	norms: Vec<[Option<GpuBuffer>; N_NORMS]>,
 	norms_b: Vec<[Option<GpuBuffer>; N_NORMS]>,
 	o_bias: Vec<Option<GpuBuffer>>,
-	/// talkie per-head scalar Q gain, expanded to a full `[nqh*hd]` per-column
-	/// vector so [`gpu_broadcast_mul`] applies each head's scalar over its head_dim.
-	/// `None` outside talkie.
 	q_headscale: Vec<Option<GpuBuffer>>,
 	ffn_up_bias: Vec<Option<GpuBuffer>>,
 	ffn_down_bias: Vec<Option<GpuBuffer>>,
@@ -1072,75 +943,36 @@ struct Model {
 	gis: Vec<Vec<f64>>,
 	pe: Vec<Vec<f64>>,
 	emb: Vec<u8>,
-	/// The embedding table in its FILE dtype, for the forward gather only —
-	/// populated when the source is wider than the bf16 interchange (f32), so
-	/// the rows the model actually attends carry full source precision instead
-	/// of a bf16 round-trip. Empty = gather from [`emb`] as bf16. The store,
-	/// tied LM head, and streaming paths keep reading the bf16 [`emb`].
 	emb_src: Vec<u8>,
-	/// Element type of [`emb_src`] and of [`pos_embd`], derived from the tensor
-	/// metadata at load. The gather uploads those bytes untouched and hands the
-	/// dtype to the flipper, so the host never decodes an element.
 	emb_dt: Dtype,
 	pos_dt: Dtype,
-	/// Untied output projection (bf16 bytes), when the model ships a separate
-	/// `output.weight`. Empty when the LM head is tied to `emb`.
 	out: Vec<u8>,
-	/// Learned LM-head output bias (`output.bias`, f64), added to the logits for
-	/// arches whose graph applies it. Empty otherwise.
 	out_b: Vec<f64>,
-	/// Learned absolute position embedding table (`position_embd.weight`, bf16
-	/// bytes), added to the input embeddings by position. Empty for RoPE arches.
 	pos_embd: Vec<u8>,
 	eps: GpuBuffer,
 	res_scale: GpuBuffer,
-	/// `1/sqrt(n_embd_head_k_mla)` device scalar for MLA attention pre-scaling;
-	/// `1.0` for non-MLA arches (unused there).
 	attn_scale_mla: GpuBuffer,
 	theta_full: GpuBuffer,
 	theta_slide: GpuBuffer,
-	/// LongRoPE per-pair frequency factors (`[n_rot/2]`, minicpm3 `rope_factors_*`);
-	/// `None` for arches without per-dim rope scaling.
 	rope_factors: Option<GpuBuffer>,
 	ls_dev: Vec<GpuBuffer>,
-	/// Per-layer selective-SSM parameters loaded as f64 device buffers (mamba
-	/// family): `ssm_conv_w` `[d_inner, d_conv]` channel-major, `ssm_conv_b`
-	/// `[d_inner]`, `ssm_a` `[d_inner, d_state]` (mamba-1) or `[n_head]` (mamba-2)
-	/// channel-major (used directly), `ssm_d` `[d_inner]`/`[n_head]`, `ssm_dt_b`
-	/// `[d_inner]`/`[n_head]`, `ssm_norm` the mamba-2 grouped-gated-norm gamma
-	/// `[d_inner/n_group, n_group]`. Empty for non-SSM layers.
 	ssm_conv_w: Vec<Option<GpuBuffer>>,
 	ssm_conv_b: Vec<Option<GpuBuffer>>,
 	ssm_a: Vec<Option<GpuBuffer>>,
 	ssm_d: Vec<Option<GpuBuffer>>,
 	ssm_dt_b: Vec<Option<GpuBuffer>>,
 	ssm_norm: Vec<Option<GpuBuffer>>,
-	/// Per-layer FFN gate-projection bias (falcon-h1, granitehybrid SwiGLU
-	/// biases). `None` when absent.
 	ffn_gate_bias: Vec<Option<GpuBuffer>>,
-	/// Per-layer mamba-1 dt/B/C RMSNorm gammas (jamba, plamo2), applied to the
-	/// low-rank `dt`/`B`/`C` before the `ssm_dt` up-projection. `None` for the
-	/// plain mamba variant that omits them.
 	ssm_dt_norm: Vec<Option<GpuBuffer>>,
 	ssm_b_norm: Vec<Option<GpuBuffer>>,
 	ssm_c_norm: Vec<Option<GpuBuffer>>,
-	/// Per-layer KDA causal-conv weights (kimi-linear), one `[d_inner, d_conv]`
-	/// channel-major buffer per q/k/v projection (kimi convolves q/k/v with three
-	/// separate depthwise kernels). `None` for the GDA arches (single mixed conv,
-	/// carried in `ssm_conv_w`) and non-recurrent layers.
 	ssm_q_conv_w: Vec<Option<GpuBuffer>>,
 	ssm_k_conv_w: Vec<Option<GpuBuffer>>,
 	ssm_v_conv_w: Vec<Option<GpuBuffer>>,
-	/// Per-layer MoE router selection bias (`exp_probs_b`, kimi-linear sigmoid
-	/// gating): added to the gating probs for top-k selection only, the weights
-	/// themselves stay unbiased. `None` for softmax-router arches.
 	exp_probs_b: Vec<Option<GpuBuffer>>,
 	hp: Hparams,
 }
 
-/// The per-layer norm slot names, one enum variant per [`LAYER_NORMS`] row; each
-/// layer's norms live in a flat `[Option<GpuBuffer>; N_NORMS]` indexed by
-/// `Nk as usize` (no hashing in the decode loop).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Nk {
 	Input,
@@ -1196,17 +1028,18 @@ const LAYER_NORMS: [(Nk, &str); N_NORMS] = [
 impl Model {
 	fn qrange(t: &Tensor, off: usize, len: usize) -> Result<(usize, usize)> {
 		let (bb, be) = crate::dequant::block_layout(t.gt)?;
+		let es = STORE_DT.elem_size();
 		anyhow::ensure!(
-			off.is_multiple_of(2) && len.is_multiple_of(2) && (off / 2).is_multiple_of(be),
+			off.is_multiple_of(es)
+				&& len.is_multiple_of(es)
+				&& store_elems(off).is_multiple_of(be),
 			"qrange: read {off}+{len} not block-aligned (be={be})"
 		);
-		let qoff = off / 2 / be * bb;
-		let qlen = (len / 2).div_ceil(be) * bb;
+		let qoff = store_elems(off) / be * bb;
+		let qlen = store_elems(len).div_ceil(be) * bb;
 		Ok((qoff, qlen))
 	}
 
-	/// Reads `len` bytes of `t` verbatim in its FILE dtype — no dequant, no
-	/// bf16 interchange. For source-precision consumers (the embedding gather).
 	fn read_raw(&self, t: &Tensor, off: usize, len: usize) -> Result<Vec<u8>> {
 		let mut buf = vec![0u8; len];
 		let _d = Instant::now();
@@ -1270,10 +1103,7 @@ impl Model {
 	}
 
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
-		let t = self
-			.big
-			.get(name)
-			.ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
 		if t.gt != GT_BF16 {
 			let (qoff, qlen) = Self::qrange(t, 0, t.nbytes)?;
 			let mut qbuf = vec![0u8; qlen];
@@ -1281,14 +1111,16 @@ impl Model {
 				.read_exact_at(&mut qbuf, (t.off + qoff) as u64)
 				.with_context(|| format!("small {name}"))?;
 			let mut f = crate::dequant::dequant_f32(t.gt, &qbuf)?;
-			f.truncate(t.nbytes / 2);
-			return Ok(f.iter().map(|&x| x as f64).collect());
+			f.truncate(store_elems(t.nbytes));
+			return Ok(f.iter().map(|&x| return f64::from(x)).collect());
 		}
 		let raw = self.read_bytes(t, 0, t.nbytes)?;
-		Ok(raw.chunks_exact(2)
-			.map(|c| bf16(u16::from_le_bytes([c[0], c[1]])))
-			.collect())
+		return Ok(raw
+			.chunks_exact(STORE_DT.elem_size())
+			.map(|c| return f64::from(f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)))
+			.collect());
 	}
+
 
 	fn read_host(&self, t: &Tensor, off: usize, dst: &mut [u8]) -> Result<()> {
 		if t.gt == GT_BF16 {
@@ -1324,7 +1156,7 @@ impl Model {
 			.big
 			.get(name)
 			.ok_or_else(|| anyhow!("missing {name}"))?;
-		let n = t.nbytes / 2;
+		let n = store_elems(t.nbytes);
 		match self.store.home(name) {
 			Some(Home::Vram(dev)) => self.widen_from(dev, 0, n),
 			Some(Home::Ram(bytes)) => {
@@ -1338,19 +1170,11 @@ impl Model {
 		}
 	}
 
-	/// True if layer `l` carries expert tensors (fused or separate gate/up). The
-	/// dense-vs-MoE choice is per layer and presence-driven, so a model with a
-	/// dense-lead prefix (e.g. deepseek) routes each layer correctly with no
-	/// per-arch code.
 	fn layer_is_moe(&self, l: usize) -> bool {
 		self.big.contains_key(&layer_name(l, "experts.gate_proj"))
 			|| self.big.contains_key(&layer_name(l, "experts.gate_up_proj"))
 	}
 
-	/// Composes expert `e` of layer `l` into `dst` as the packed slot
-	/// `[gate | up | down]`, sourcing gate+up from either one fused
-	/// `experts.gate_up_proj` tensor or the separate `experts.gate_proj` and
-	/// `experts.up_proj` tensors (llama.cpp's two expert storage layouts).
 	fn fill_expert(&self, l: usize, e: usize, dst: &mut [u8]) -> Result<()> {
 		let (gu_bytes, dn_bytes, half) =
 			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.dn_bytes);
@@ -1433,9 +1257,6 @@ fn upload_gamma(vals: &[f64], plus_one: bool) -> Result<GpuBuffer> {
 	}
 }
 
-/// Flat gguf -> neutral tensor map for whole-model (non-per-block) tensors. The
-/// runtime composes the arch purely by resolving these transfers; no per-arch
-/// code decides where a tensor goes.
 const GLOBAL_MAP: &[(&str, &str)] = &[
 	("token_embd.weight", "embed_tokens.weight"),
 	("token_embd_norm.weight", "embed_norm.weight"),
@@ -1453,11 +1274,6 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 	("self_cond_down.weight", "self_conditioning.down_proj.weight"),
 ];
 
-/// Flat gguf `blk.N.<suffix>` -> neutral `layers.N.<suffix>` map. Norm-name
-/// variants (attn_norm vs input_layernorm, ffn_norm vs pre_feedforward, ...) and
-/// fused sources (attn_qkv, separate expert gate/up) are all vocabulary here;
-/// the loader adds nothing per arch. Fused `attn_qkv.weight` lands under one
-/// neutral fused role and [`SLICE_MAP`] then feeds q/k/v as row-subranges.
 const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_norm.weight", "input_layernorm.weight"),
 	("attn_norm.bias", "input_layernorm.bias"),
@@ -1542,9 +1358,6 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("exp_probs_b.bias", "router.bias"),
 ];
 
-/// How a neutral tensor sources from a fused gguf tensor: a named row-subrange
-/// whose split point is set by the layer's attention dims (`qd`, `kd`). This is
-/// the transfer description that lets one fused gguf tensor feed several roles.
 #[derive(Clone, Copy)]
 enum Slice {
 	QkvQ,
@@ -1552,9 +1365,6 @@ enum Slice {
 	QkvV,
 }
 
-/// Derived neutral tensor <- fused source neutral tensor, sliced by [`Slice`].
-/// Resolved per layer in [`load_model_gguf`] once the dims are known, so a model
-/// shipping a fused `attn_qkv` transparently yields separate q/k/v projections.
 const SLICE_MAP: &[(&str, &str, Slice)] = &[
 	("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvQ),
 	("self_attn.k_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvK),
@@ -1602,7 +1412,6 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 			},
 		);
 	}
-	// lfm2/lfm2moe ship the FINAL pre-lm_head norm under the name token_embd_norm (LLM_TENSOR_OUTPUT_NORM_LFM2), applied as output_norm, not an embed norm.
 	if matches!(hp.arch.as_str(), "lfm2" | "lfm2moe")
 		&& let Some(t) = big.remove("model.decoder.embed_norm.weight")
 	{
@@ -1613,11 +1422,6 @@ fn load_model_gguf(path: &Path) -> Result<Model> {
 	finish_load(vec![f], big, hp)
 }
 
-/// Splits a fused gate+up FFN projection into separate `mlp.gate_proj` and
-/// `mlp.up_proj` when a gated model ships them stacked in one `ffn_up` tensor
-/// (phi3, glm4, chatglm): a `[2*nff]`-row up tensor with no gate becomes gate =
-/// rows `[0, nff)`, up = rows `[nff, 2*nff)`. Shape-driven, so nothing per-arch
-/// decides the split.
 fn synth_ffn_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 	let nff = hp.nff;
 	for l in 0..hp.nl {
@@ -1634,15 +1438,15 @@ fn synth_ffn_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 		let ne = up.shape[1];
 		let (src_shard, src_off, src_gt) = (up.shard, up.off, up.gt);
 		let (Ok((q0, _)), Ok((q1, _))) = (
-			Model::qrange(up, 0, nff * ne * 2),
-			Model::qrange(up, nff * ne * 2, nff * ne * 2),
+			Model::qrange(up, 0, store_bytes(nff * ne)),
+			Model::qrange(up, store_bytes(nff * ne), store_bytes(nff * ne)),
 		) else {
 			continue;
 		};
 		let part = |qoff: usize| Tensor {
 			shard: src_shard,
 			off: src_off + qoff,
-			nbytes: nff * ne * 2,
+			nbytes: store_bytes(nff * ne),
 			shape: vec![nff, ne],
 			gt: src_gt,
 		};
@@ -1651,11 +1455,6 @@ fn synth_ffn_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 	}
 }
 
-/// Feeds q/k/v neutral projections from a fused `attn_qkv` source per [`SLICE_MAP`]
-/// when the model ships no separate q/k/v tensors. Each slice is a row-subrange
-/// of the fused tensor's data, split at `[qd | kd | kd]` from the layer's dims;
-/// a fuse whose row count does not match `qd + 2*kd` (e.g. latent MLA) is left
-/// alone, so its absent-projection error stays truthful.
 fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 	for l in 0..hp.nl {
 		let d = &hp.dims[l];
@@ -1677,13 +1476,13 @@ fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 				Slice::QkvK => (qd, kd),
 				Slice::QkvV => (qd + kd, kd),
 			};
-			let Ok((qoff, _qlen)) = Model::qrange(src_t, row0 * ne * 2, rows * ne * 2) else {
+			let Ok((qoff, _qlen)) = Model::qrange(src_t, store_bytes(row0 * ne), store_bytes(rows * ne)) else {
 				continue;
 			};
 			let sub = Tensor {
 				shard: src_t.shard,
 				off: src_t.off + qoff,
-				nbytes: rows * ne * 2,
+				nbytes: store_bytes(rows * ne),
 				shape: vec![rows, ne],
 				gt: src_t.gt,
 			};
@@ -1692,13 +1491,6 @@ fn synth_qkv_slices(big: &mut HashMap<String, Tensor>, hp: &Hparams) {
 	}
 }
 
-/// Materializes the loaded tensors into a `Model`, applying several arch-specific
-/// fixups:
-/// - minicpm3 hardcodes scale_depth=1.4 (minicpm3.cpp:67); the per-layer residual scale is scale_depth/sqrt(n_layer), applied to both the attn and FFN outputs.
-/// - talkie's per-head scalar Q gain [n_head] expands to [nqh*hd] so a single broadcast-mul applies each head's scalar across its head_dim.
-/// - plamo2's causal conv ships no bias, so a zero one is synthesized for the shared launcher.
-/// - LongRoPE per-pair frequency factors (minicpm3): for a context within the original training length the short factors apply (get_rope_factors); the fixtures ship identity factors, so this is exact machinery.
-/// - untied LM head: some models (e.g. llama with a separate output.weight) project the final hidden state through their own matrix rather than the tied token embedding, loaded when present so lm_head uses the right one.
 fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> Result<Model> {
 	Write::line(data, "allocating stage+win");
 	let eps = {
@@ -1981,11 +1773,6 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	Ok(m)
 }
 
-/// The dense-projection weights actually present for layer `l`, from the fixed
-/// role vocabulary. Presence-driven, so a non-gated FFN never demands a gate, a
-/// pure-MoE layer contributes no dense FFN weights (its experts load separately),
-/// and a fused-qkv model contributes the synthesized q/k/v — the required set
-/// derives from the composition, never a fixed per-arch list.
 fn fixed_names(m: &Model, l: usize) -> Vec<String> {
 	const ROLES: [&str; 17] = [
 		"self_attn.q_proj.weight",
@@ -2055,9 +1842,6 @@ fn preflight(m: &Model, ar: &Arena, t: usize) -> Result<()> {
 	Ok(())
 }
 
-/// Places every weight into `store`, then hands the store to `m` UNCONDITIONALLY
-/// (even on placement failure) so the arena slab inside it stays reachable for
-/// release; the canary readback then proves uploads are GPU-visible.
 fn fill_store(m: &mut Model, store: Waterfall, cancel: &mut dyn FnMut() -> bool) -> Result<bool> {
 	let mut store = store;
 	let placed = fill_into(m, &mut store, cancel);
@@ -2171,9 +1955,6 @@ fn lm_head(m: &Model, hfs: &GpuBuffer, ncanvas: usize, ar: &Arena) -> Result<Vec
 	Ok(logits)
 }
 
-/// Allocation-free LM head: chunked vocab GEMM writing into caller-owned
-/// `logits`/`out_host` scratch, so the per-token decode loop reuses one pair of
-/// host buffers for the whole generation (AllocGuard spirit).
 fn lm_head_into(
 	m: &Model,
 	hfs: &GpuBuffer,
@@ -2189,14 +1970,14 @@ fn lm_head_into(
 		let cn = hp.lm_chunk.min(hp.vocab - c0);
 		let w = if m.out.is_empty() {
 			match m.store.home("model.decoder.embed_tokens.weight") {
-				Some(Home::Vram(dev)) => m.widen_from(dev, c0 * hp.ne * 2, cn * hp.ne)?,
+				Some(Home::Vram(dev)) => m.widen_from(dev, store_bytes(c0 * hp.ne), cn * hp.ne)?,
 				_other => {
-					m.to_stage(&m.emb[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
+					m.to_stage(&m.emb[store_bytes(c0 * hp.ne)..store_bytes((c0 + cn) * hp.ne)])?;
 					m.widen_from(&m.stage, 0, cn * hp.ne)?
 				}
 			}
 		} else {
-			m.to_stage(&m.out[c0 * hp.ne * 2..(c0 + cn) * hp.ne * 2])?;
+			m.to_stage(&m.out[store_bytes(c0 * hp.ne)..store_bytes((c0 + cn) * hp.ne)])?;
 			m.widen_from(&m.stage, 0, cn * hp.ne)?
 		};
 		gpu_gemm_bt_f64(hfs, &w, ncanvas, cn, hp.ne, &ar.lm_out)?;
@@ -2220,18 +2001,6 @@ fn lm_head_into(
 }
 
 
-/// Per-layer KV cache carved once at [`ChatSession::open`] and kept resident for
-/// the session: `k[l]`/`v[l]` hold up to `t_max` positions of this layer's
-/// attention keys/values (GQA `nkv*hd`, or the compressed `kv_lora+rope` / `kv_lora`
-/// for MLA), `len` is how many are populated, `ids` mirrors the token id at each
-/// position so a later turn finds its common prefix. One-claim law: allocated at
-/// open, never freed or grown mid-run.
-/// One layer's cached decode state: the VARIANT is what the layer's mixer
-/// actually carries per [`models::layer_cache_shape`] — attention layers hold
-/// K/V rows plus their host-tier stores, recurrent mixers hold scan state and
-/// conv ping-pong windows, hybrids hold both, pure-conv mixers (shortconv)
-/// hold only windows. A scan mixer dispatched onto a `Kv` layer is
-/// unrepresentable, not an error path.
 pub(crate) enum LayerCache {
 	Kv(KvSlot),
 	Scan(ScanSlot),
@@ -2239,8 +2008,6 @@ pub(crate) enum LayerCache {
 	KvScan(KvSlot, ScanSlot),
 }
 
-/// Attention rows: the VRAM window `[win_base, win_base+win)` in `k`/`v`, and
-/// the host-tier stores (`hk`/`hv`, RAM then spill file) for evicted rows.
 pub(crate) struct KvSlot {
 	pub(crate) k: GpuBuffer,
 	pub(crate) v: GpuBuffer,
@@ -2248,24 +2015,18 @@ pub(crate) struct KvSlot {
 	pub(crate) hv: HostStore,
 }
 
-/// Recurrent mixer state: the SSM/delta matrix state carried across steps, plus
-/// the conv ping-pong windows (read `conv[i]`, write `nxt[i]`, swapped after
-/// every forward so the next step reads what this one wrote).
 pub(crate) struct ScanSlot {
 	pub(crate) rec: GpuBuffer,
 	pub(crate) conv: Vec<GpuBuffer>,
 	pub(crate) nxt: Vec<GpuBuffer>,
 }
 
-/// Conv-only mixer state (shortconv): ping-pong windows, no matrix recurrence.
 pub(crate) struct ConvSlot {
 	pub(crate) conv: Vec<GpuBuffer>,
 	pub(crate) nxt: Vec<GpuBuffer>,
 }
 
 impl LayerCache {
-	/// The attention rows of this layer — loud error on a non-attention layer
-	/// (a mixer/shape disagreement, never a silent recompute).
 	pub(crate) fn kv(&self) -> Result<&KvSlot> {
 		match self {
 			LayerCache::Kv(s) | LayerCache::KvScan(s, _) => return Ok(s),
@@ -2273,7 +2034,6 @@ impl LayerCache {
 		}
 	}
 
-	/// This layer's recurrent state — loud error on a layer without one.
 	pub(crate) fn rec(&self) -> Result<&GpuBuffer> {
 		match self {
 			LayerCache::Scan(s) | LayerCache::KvScan(_, s) => return Ok(&s.rec),
@@ -2281,7 +2041,6 @@ impl LayerCache {
 		}
 	}
 
-	/// The `(read, write)` conv windows for conv `i` of this layer's mixer.
 	pub(crate) fn conv_io(&self, i: usize) -> Result<(&GpuBuffer, &GpuBuffer)> {
 		let (c, n) = match self {
 			LayerCache::Scan(s) | LayerCache::KvScan(_, s) => (&s.conv, &s.nxt),
@@ -2298,49 +2057,24 @@ impl LayerCache {
 }
 
 struct KvCache {
-	/// Per-layer cached state — see [`LayerCache`].
 	layers: Vec<LayerCache>,
 	kw: Vec<usize>,
 	vw: Vec<usize>,
 	conv_sz: Vec<Vec<usize>>,
 	rec_sz: Vec<usize>,
-	/// VRAM window capacity in rows, and the absolute row currently at window offset 0.
 	win: usize,
 	win_base: usize,
-	/// Double-buffered staging windows host K/V segments are read back into during
-	/// a spilled decode, each sized for one full window of the widest layer's rows.
-	/// Carved once at cache-open from the claim remainder after the weights and the
-	/// resident window (the capacity divisor reserves their per-token cost ALWAYS,
-	/// so the stage exists unconditionally), so the readback grain is the window —
-	/// independent of any step's decode width.
 	stage: KvStage,
 	len: usize,
 	ids: Vec<u32>,
 	t_max: usize,
 }
 
-/// The cache's double-buffered spill staging: `sk[i]`/`sv[i]` each hold one full
-/// window of the widest layer's K/V rows, so a spilled attention walks the host
-/// mirror in window-sized read-ahead blocks.
 pub(crate) struct KvStage {
 	pub(crate) sk: [GpuBuffer; 2],
 	pub(crate) sv: [GpuBuffer; 2],
 }
 
-/// Append-only host store for one layer's evicted K/V rows: bytes `[0, ram.len())`
-/// live in RAM, everything after in a session-scoped spill file in the same
-/// directory [`gpu_core::tiered::Budgets`] measures, deleted on drop. `ram_budget`
-/// is this store's prorated share of the measured RAM tier — `ram_data * w / Σw`
-/// over every layer's K and V row widths, so all stores cross to disk at the same
-/// evicted-row count. The first append that would exceed the budget routes whole
-/// to the file, so the RAM/disk boundary always sits on an append (whole-row)
-/// edge and every staged block splits into at most one RAM and one file range.
-///
-/// The two io directions never share a path: eviction writes go through `wf`,
-/// staging reads through an independent `rf` descriptor, both positioned
-/// (`pwrite`/`pread` — no seek cursor) with no lock between them. NVMe is full
-/// duplex, so eviction write-behind and staging read-ahead can run concurrently;
-/// nothing in this structure serializes one direction against the other.
 pub(crate) struct HostStore {
 	ram: Vec<u8>,
 	ram_budget: usize,
@@ -2393,11 +2127,6 @@ impl HostStore {
 		return Ok(());
 	}
 
-	/// Uploads bytes `[off, off+len)` into `dst` from wherever they live: the RAM
-	/// range goes up directly, a file range is read into `scratch` first (through
-	/// the read-side descriptor, opened lazily). Both ranges are whole rows (the
-	/// RAM/disk boundary is append-aligned), so the element-offset view arithmetic
-	/// is exact.
 	pub(crate) fn stage_into(
 		&self,
 		off: usize,
@@ -2541,14 +2270,6 @@ impl KvCache {
 		});
 	}
 
-	/// Drops cached positions past `keep` (cross-turn: rewind to the common prefix
-	/// with the newly templated sequence). Buffers keep their bytes; only `len`/`ids`
-	/// shrink, and stale rows are never read (attention bounds itself by `len + new`).
-	/// Rewinding below `win_base` truncates the host mirror to the kept rows and
-	/// restarts the window empty at `keep` — the kept prefix is then attended from
-	/// the host tier. Legal only when no layer carries recurrent state, or when
-	/// `keep == len` — a recurrence cannot be partially rewound; see
-	/// [`KvCache::clear_scan`].
 	fn rewind(&mut self, keep: usize) {
 		self.len = keep.min(self.len);
 		self.ids.truncate(self.len);
@@ -2566,10 +2287,6 @@ impl KvCache {
 		}
 	}
 
-	/// Zeroes every recurrent/conv state and empties the cache, so a recurrent arch
-	/// whose new prompt diverges before the end of the cached prefix reprocesses from
-	/// row 0 through the same decode path (its scan state cannot be rewound to an
-	/// interior position — only the final state is kept).
 	fn clear_scan(&mut self) -> Result<()> {
 		let es = FWD_DT.elem_size();
 		let zero_scan = |s: &ScanSlot, sz: usize, szs: &[usize]| -> Result<()> {
@@ -2604,12 +2321,6 @@ impl KvCache {
 		return Ok(());
 	}
 
-	/// Ensures the VRAM window can hold `t` more rows. When appending them would
-	/// overflow, the resident rows `[win_base, len)` flush to the host byte mirror
-	/// (D2H through the ledger) and `win_base` advances to `len` — the window
-	/// restarts empty and the flushed rows are then attended from the host tier by
-	/// the segmented driver. A within-window session never flushes, so it stays on
-	/// the one-launch fits path. `true` iff a flush happened (the layer now spills).
 	fn ensure_room(&mut self, t: usize) -> Result<bool> {
 		if (self.len - self.win_base) + t <= self.win {
 			return Ok(false);
@@ -2635,9 +2346,6 @@ impl KvCache {
 	}
 }
 
-/// Greedy argmax over `vocab` logits with the arch's logit scale and final softcap
-/// applied (both monotone, so they only matter at the boundary), matching the
-/// reference pick so the cached decode stays token-exact.
 fn pick_greedy(logits: &[f64], vocab: usize, lsc: f64, softcap: f64) -> u32 {
 	let mut best = 0usize;
 	let mut bv = f64::MIN;
@@ -2656,12 +2364,6 @@ fn pick_greedy(logits: &[f64], vocab: usize, lsc: f64, softcap: f64) -> u32 {
 	return best as u32;
 }
 
-/// Runs one incremental forward over `rows` NEW tokens sitting at absolute
-/// positions `cache.len ..`, appending their K/V into every layer's cache and
-/// leaving the last row's logits in `logits`. Embed/Q/FFN/norm see only these rows;
-/// attention reads the full cache (`len + rows`). A batch call (`rows.len() > 1`) is
-/// the turn-1 prefill (`cache.len == 0`); single-row calls are cross-turn suffix
-/// tokens and generation steps. Advances `cache.len`/`cache.ids` by `rows`.
 fn forward_rows(
 	m: &Model,
 	rows: &[u32],
@@ -2735,8 +2437,6 @@ fn forward_rows(
 	return Ok(());
 }
 
-/// Set the first time [`forward_rows`] actually appended rows into a resident
-/// [`KvCache`]. Read by the chat capability line — a proven-ran flag.
 static KV_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[must_use]
@@ -2744,12 +2444,6 @@ pub fn kv_cache_ran() -> bool {
 	return KV_RAN.load(Ordering::Relaxed);
 }
 
-/// Incremental autoregressive decode against the resident KV cache. Prefills the
-/// uncached suffix of `toks` (batched when the cache is empty, else one token at a
-/// time so the offset-causal attention runs through [`gpu_flash_decode_gqa`]), then
-/// generates greedily one token per step — each step embeds/GEMMs/norms ONLY the new
-/// token and attends it against the full cache. The cache and its token ids survive
-/// the call so the next turn reuses the common prefix.
 fn decode_cached(
 	m: &Model,
 	tokenizer: &crate::tokenizer::Tokenizer,
@@ -2840,10 +2534,6 @@ pub fn vram_probe_ask() -> Option<i32> {
 	})
 }
 
-/// Probe-verified device-arena claim: spawns a child that tries to map a
-/// candidate size, backing off until one succeeds, waits for the child's VRAM
-/// to be reclaimed, then claims the slab. Shared by one-shot [`generate`] and
-/// the persistent [`ChatSession`] so both take exactly one claim per open.
 fn probe_claim() -> Result<Waterfall> {
 	let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
 	Write::line(
@@ -2906,33 +2596,14 @@ fn probe_claim() -> Result<Waterfall> {
 	return Ok(w);
 }
 
-/// A chat model loaded once and kept resident: [`open`](ChatSession::open) does
-/// the single claim + weight load + waterfall fill, then every
-/// [`generate_in`](ChatSession::generate_in) call reuses those weights, carving
-/// and dropping only a per-message scratch arena. This is what lets a chat run
-/// many messages against one load — no re-claim, no re-fill between turns. The
-/// weights free once when the session drops.
 pub struct ChatSession {
 	m: Model,
 	tokenizer: crate::tokenizer::Tokenizer,
 	vocab: Vec<String>,
 	attn_scale: GpuBuffer,
-	/// Resident per-layer incremental cache for every token arch (`Some` whenever
-	/// `ncanvas == 0`): attention K/V plus recurrent scan/conv state, carried across
-	/// turns. `None` only for the diffusion-canvas arches, which decode a fixed canvas.
 	cache: KvCache,
 }
 
-/// The KV-cache capacity the remaining claim affords, in tokens: no fixed ceiling
-/// and no borrowed default — the session holds as many positions as the hardware
-/// has room for after the weights land. Measures the per-row cost of the scratch
-/// arena with two throwaway probe carves (cost(2 rows) - cost(1 row) is one row;
-/// the difference from cost(1) is the row-independent part), then divides the
-/// remaining arena by one token's total cost: scratch row + this model's per-layer
-/// K/V + the spill staging's two window-granular buffer pairs (widest layer's K
-/// and V per window row) — so after the window and worst-case scratch are carved,
-/// the remainder IS the staging, by construction. Returns 0 when a single token
-/// does not fit, so the caller refuses with sizes instead of silently truncating.
 fn kv_capacity_tokens(m: &Model) -> Result<usize> {
 	let es = FWD_DT.elem_size();
 	let cache_row = kv_row_elems(m) * es;
@@ -2966,10 +2637,6 @@ fn kv_capacity_tokens(m: &Model) -> Result<usize> {
 	return Ok(free / per_token);
 }
 
-/// Elements of K plus V one token occupies across every layer, from the per-layer
-/// cache shapes (GQA `nkv*hd`, MLA compressed `kv_lora+rope`/`kv_lora`, or `0` for a
-/// recurrent layer). Recurrent layers spend no per-token cache; their fixed state
-/// is counted by [`fixed_cache_elems`].
 fn kv_row_elems(m: &Model) -> usize {
 	let mut n = 0usize;
 	for l in 0..m.hp.nl {
@@ -2979,9 +2646,6 @@ fn kv_row_elems(m: &Model) -> usize {
 	return n;
 }
 
-/// The token-independent cache elements: per-layer recurrent state plus every conv
-/// window (allocated twice for the ping-pong). Counted once at capacity time so the
-/// per-token divisor sees only the K/V that actually grows with sequence length.
 fn fixed_cache_elems(m: &Model) -> usize {
 	let mut n = 0usize;
 	for l in 0..m.hp.nl {
@@ -2993,20 +2657,10 @@ fn fixed_cache_elems(m: &Model) -> usize {
 	return n;
 }
 
-/// The KV spill directory: [`gpu_core::tiered::data_dir`], the ONE owner shared
-/// with the training OOC spill and — critically — the SAME call the disk-tier
-/// budget measurement uses, so the measured free space and the spill bytes are
-/// always the same real filesystem (never a tmpfs the RAM tier already counts).
 fn kv_spill_dir() -> Result<PathBuf> {
 	return gpu_core::tiered::data_dir().context("KV spill dir");
 }
 
-/// Rows the RAM + disk waterfall tiers afford PAST the VRAM window, so the cache
-/// ceiling is the whole VRAM->RAM->DISK waterfall rather than a fixed VRAM-only
-/// t_max. Uses the same [`gpu_core::tiered::Budgets`] measurement as the training
-/// out-of-core path (`MemAvailable` and disk free, each minus the `USER_GB`
-/// reserve), pointed at [`kv_spill_dir`]; the host K/V pays only the per-row K/V
-/// bytes since the scratch arena stays on device.
 fn kv_host_tokens(m: &Model) -> Result<usize> {
 	let per_row = kv_row_elems(m) * FWD_DT.elem_size();
 	if per_row == 0 {
@@ -3016,20 +2670,12 @@ fn kv_host_tokens(m: &Model) -> Result<usize> {
 	return Ok((b.ram_data + b.disk_data) / per_row);
 }
 
-/// What [`ChatSession::open`] yields: the resident session, or the named fact
-/// that the user cancelled the load — never an Option whose `None` needs a
-/// comment to explain.
 pub enum Opened {
 	Session(Box<ChatSession>),
 	Cancelled,
 }
 
 impl Opened {
-	/// The session, treating a cancel as an error — for callers (tests, one-shot
-	/// drivers) that never cancel. Interactive callers match the variants.
-	///
-	/// # Errors
-	/// Returns an error if the load was cancelled.
 	pub fn session(self) -> Result<ChatSession> {
 		match self {
 			Opened::Session(s) => return Ok(*s),
@@ -3039,9 +2685,6 @@ impl Opened {
 }
 
 impl ChatSession {
-	/// Loads `gguf` resident. `load_round` receives empty token snapshots during
-	/// the fill so the caller can keep a load UI drawn and cancel; a cancelled
-	/// load returns [`Opened::Cancelled`] and frees the claim cleanly.
 	pub fn open(
 		gguf: &Path,
 		load_round: &mut dyn FnMut(&[Tok]) -> bool,
@@ -3116,13 +2759,6 @@ impl ChatSession {
 		})));
 	}
 
-	/// Generates a reply for `prompt` (already chat-templated by the caller) against
-	/// the resident weights. For attention arches the per-layer KV cache survives
-	/// across calls: the newly templated sequence's token-level common prefix with
-	/// the cached ids is detected, the cache is rewound to it, and only the new
-	/// suffix runs — so turn N+1 with a long history pays for the new message alone.
-	/// Recurrent arches (no cache) recompute the full sequence; diffusion picks the
-	/// canvas decode.
 	pub fn generate_in(
 		&mut self,
 		prompt: &str,
@@ -3176,9 +2812,6 @@ impl Drop for ChatSession {
 	}
 }
 
-/// One-shot generation kept for single-prompt callers (render_once, tests):
-/// opens a [`ChatSession`], runs a single message, and drops it. Multi-message
-/// callers hold the session and call [`ChatSession::generate_in`] directly.
 pub fn generate(
 	gguf: &Path,
 	prompt: &str,
@@ -3191,9 +2824,6 @@ pub fn generate(
 	return session.generate_in(prompt, on_round);
 }
 
-/// Diffusion (canvas) decode against a resident model: iteratively refines the
-/// masked canvas region for a fixed number of steps, streaming per-step token
-/// snapshots. Carves and drops its own per-message scratch arena.
 fn refine_canvas(
 	m: &Model,
 	vocab: &[String],
@@ -3479,12 +3109,6 @@ fn refine_canvas(
 mod host_store_tests {
 	use super::*;
 
-	/// The waterfall law at the RAM/disk boundary, byte-exact: appends fill the
-	/// RAM budget, the first over-budget append routes whole to the spill file,
-	/// and a staged read spanning both tiers uploads the exact stored bytes.
-	/// Boundary arithmetic: budget 96 B = 3 rows of 8 f32; two 2-row (64 B)
-	/// appends -> the second would end at 128 B > 96, so RAM freezes at 64 B
-	/// (2 rows) and rows 2..6 live in the file.
 	#[test]
 	fn ram_boundary_then_disk_roundtrip_and_stage() {
 		let es = FWD_DT.elem_size();

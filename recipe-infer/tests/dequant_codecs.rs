@@ -26,7 +26,6 @@ fn encode(dt: Dtype, vals: &[f32]) -> Vec<u8> {
       return convert(Dtype::F32, dt, &f32_bytes(vals)).expect("encode from f32");
 }
 
-/// decode(encode(v)) must reproduce every grid value exactly.
 fn roundtrip_grid(dt: Dtype, vals: &[f32]) {
       let enc = encode(dt, vals);
       let dec = decode(dt, &enc);

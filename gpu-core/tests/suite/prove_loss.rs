@@ -1,11 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "loss" kernel category.
-//
-// For every loss-category item in kernel_inventory/*.json, if its canonical op
-// name is registered here, run the gpu-core op on the LIVE gfx1101 GPU and assert
-// the per-element output matches an AUTHORITATIVE CPU oracle (the exact textbook /
-// framework definition). tol 1e-7. A registered-op mismatch FAILS the test (real
-// bug). Unmapped items are reported as remaining backlog, not failures.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{HashMap, HashSet};
@@ -160,11 +153,9 @@ fn run2_param(
 	out
 }
 
-// A registered loss op: produce GPU output and an element-wise CPU oracle over (pred,target).
 struct LossOp {
 	gpu: Box<dyn Fn(&[f64], &[f64]) -> Vec<f64>>,
 	oracle: Box<dyn Fn(f64, f64) -> f64>,
-	// probe ranges for pred (a) and target (b)
 	a_lo: f64,
 	a_hi: f64,
 	b_lo: f64,
@@ -195,7 +186,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	}
 
 	// ── New per-element kernels (lossx.hip) ───────────────────────────────────
-	// MSE: (a-b)^2   covers mse_loss / l2_loss / l2_distance / l2
 	op!(
 		"mse",
 		|a, b| run2(launch_lossx_mse, a, b),
@@ -205,7 +195,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		-3.0,
 		3.0
 	);
-	// MAE / L1: |a-b|
 	op!(
 		"mae",
 		|a, b| run2(launch_lossx_mae, a, b),
@@ -215,7 +204,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		-3.0,
 		3.0
 	);
-	// log-cosh: log(cosh(a-b))
 	op!(
 		"log_cosh",
 		|a, b| run2(launch_lossx_log_cosh, a, b),
@@ -225,7 +213,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		-3.0,
 		3.0
 	);
-	// BCE (from probabilities): -(y log p + (1-y) log(1-p)), p clamped to (eps,1-eps)
 	op!(
 		"bce",
 		|a, b| run2(launch_lossx_bce, a, b),
@@ -239,7 +226,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		0.0,
 		1.0
 	);
-	// Poisson NLL (torch default log_input=True): exp(input) - target*input
 	op!(
 		"poisson_nll",
 		|a, b| run2(launch_lossx_poisson_nll, a, b),
@@ -249,7 +235,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		0.0,
 		4.0
 	);
-	// KL div (target probs, pred=log-probs): t*(log t - logp), guard t<=0 -> 0
 	op!(
 		"kl_div",
 		|a, b| run2(launch_lossx_kl_div, a, b),
@@ -260,7 +245,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		0.98
 	);
 
-	// Smooth L1 (beta=1.0): |d|<beta ? 0.5 d^2/beta : |d|-0.5 beta
 	let beta = 1.0_f64;
 	op!(
 		"smooth_l1",
@@ -283,7 +267,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		-3.0,
 		3.0
 	);
-	// Huber (delta=1.0): |d|<=delta ? 0.5 d^2 : delta(|d|-0.5 delta)
 	let delta = 1.0_f64;
 	op!(
 		"huber",
@@ -306,7 +289,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		-3.0,
 		3.0
 	);
-	// Tweedie deviance (power=1.5), pred>0: -y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p)
 	let power = 1.5_f64;
 	op!(
 		"tweedie",
@@ -322,7 +304,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		0.0,
 		4.0
 	);
-	// Quantile / pinball (q=0.7): d=t-pred; max(q d,(q-1)d)
 	let q = 0.7_f64;
 	op!(
 		"quantile",
@@ -342,8 +323,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	);
 
 	// ── Existing kernels (src/kernels/loss.hip via gpu_core::losses) ──────────
-	// Focal loss (sigmoid_focal_loss / kornia.focal): -alpha*(1-p_t)^gamma*log(p_t)
-	// pred=probability in (0,1), target in {0,1}.
 	let (gamma, alpha) = (2.0_f64, 0.25_f64);
 	op!(
 		"focal",
@@ -400,7 +379,6 @@ fn registry() -> HashMap<&'static str, LossOp> {
 		0.0,
 		1.0
 	);
-	// Hinge loss (hinge_embedding-style with labels in {-1,+1}): max(0, 1 - y*s)
 	op!(
 		"hinge",
 		|a, b| {
@@ -434,16 +412,13 @@ fn registry() -> HashMap<&'static str, LossOp> {
 	m
 }
 
-// JSON loss name -> canonical registry key. Returns "" for items we don't claim.
 fn canon(name: &str) -> &'static str {
 	let base = name
 		.rsplit(['.', ':', '$'])
 		.next()
 		.unwrap_or(name)
 		.to_lowercase();
-	// longest-match table of textbook per-element loss ops we prove on-device.
 	let table: &[(&str, &str)] = &[
-		// MSE / L2 family
 		("mse_loss_aten", "mse"),
 		("mse_loss", "mse"),
 		("miopenmselossforward", "mse"),
@@ -451,41 +426,32 @@ fn canon(name: &str) -> &'static str {
 		("l2_loss", "mse"),
 		("l2_distance", "mse"),
 		("l2", "mse"),
-		// MAE / L1 family
 		("l1_loss_aten", "mae"),
 		("l1_loss", "mae"),
 		("miopenl1lossforward", "mae"),
 		("miopenl1lossbackward", "mae"),
-		// smooth L1 (beta) — torch default beta=1
 		("smooth_l1_loss_aten", "smooth_l1"),
 		("smooth_l1_loss", "smooth_l1"),
 		("miopensmoothl1lossforward", "smooth_l1"),
 		("miopensmoothl1lossbackward", "smooth_l1"),
-		// huber (delta) — torch default delta=1
 		("huber_loss_aten", "huber"),
 		("huber_loss", "huber"),
-		// log-cosh
 		("log_cosh_loss", "log_cosh"),
-		// KL divergence
 		("kl_div_loss", "kl_div"),
 		("kl_div", "kl_div"),
 		("kl_divergence", "kl_div"),
 		("miopenkldivlossforward", "kl_div"),
 		("miopenkldivlossbackward", "kl_div"),
 		("ligerkldiv", "kl_div"),
-		// BCE from probabilities
 		("binary_cross_entropy_loss", "bce"),
 		("binary_cross_entropy", "bce"),
-		// Poisson NLL (log_input form)
 		("poisson_nll_loss_aten", "poisson_nll"),
 		("poisson_nll_loss", "poisson_nll"),
 		("log_poisson_loss", "poisson_nll"),
-		// Focal (sigmoid-focal / kornia focal)
 		("sigmoid_focal_loss", "focal"),
 		("focal", "focal"),
 		("miopensigmoidfocallossforward", "focal"),
 		("miopensigmoidfocallossbackward", "focal"),
-		// Hinge embedding
 		("hinge_embedding_loss", "hinge"),
 	];
 	for (a, c) in table {
@@ -534,8 +500,6 @@ fn prove_loss() {
 	let items = load_loss_inventory();
 	assert!(!items.is_empty(), "loss inventory empty");
 
-	// Self-prove EVERY registered op once (independent of inventory mapping), so a
-	// bad oracle/kernel is caught even if no JSON name maps to it.
 	let n = 32usize;
 	let mut implemented: Vec<&str> = Vec::new();
 	let mut failures: Vec<String> = Vec::new();
@@ -544,7 +508,6 @@ fn prove_loss() {
 	for &k in &keys {
 		let op = &reg[k];
 		let a = probes(op.a_lo, op.a_hi, n);
-		// target: for hinge use alternating ±1; else probe its own range.
 		let b: Vec<f64> = if *k == "hinge" {
 			(0..n).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
 				.collect()
@@ -569,7 +532,6 @@ fn prove_loss() {
 		}
 	}
 
-	// Map inventory -> proven count. A proven op covers ALL its variants.
 	let mut proven_items = 0usize;
 	let total = items.len();
 	let proven_ops: HashSet<&str> = implemented.iter().copied().collect();

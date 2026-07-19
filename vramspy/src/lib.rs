@@ -19,75 +19,53 @@ use log::Write;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Device-owned VRAM.
 pub const KIND_DEVICE: u8 = 0;
-/// Pinned host memory.
 pub const KIND_HOST_PINNED: u8 = 1;
-/// Kernarg memory.
 pub const KIND_KERNARG: u8 = 2;
-/// Unclassified memory.
 pub const KIND_OTHER: u8 = 3;
-/// Number of allocation kinds tracked.
 const N_KINDS: usize = 4;
 
-/// `HSA_STATUS_SUCCESS`.
 const HSA_STATUS_SUCCESS: i32 = 0;
-/// `HSA_AGENT_INFO_DEVICE`; value type is `hsa_device_type_t`.
 const HSA_AGENT_INFO_DEVICE: i32 = 17;
-/// `HSA_DEVICE_TYPE_GPU`; CPU is 0.
 const HSA_DEVICE_TYPE_GPU: u32 = 1;
-/// `HSA_AMD_SEGMENT_GLOBAL`; the only segment holding real allocations.
 const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
-/// `HSA_AMD_MEMORY_POOL_INFO_SEGMENT`.
 const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: i32 = 0;
-/// `HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS`.
 const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: i32 = 1;
-/// `HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT` bit.
 const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
 
-/// Live bytes per kind.
 static LIVE: [AtomicU64; N_KINDS] = [
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 ];
-/// Peak bytes per kind.
 static PEAK: [AtomicU64; N_KINDS] = [
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 ];
-/// Allocation count per kind.
 static ALLOCS: [AtomicU64; N_KINDS] = [
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 ];
-/// Free count per kind.
 static FREES: [AtomicU64; N_KINDS] = [
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 	AtomicU64::new(0),
 ];
-/// Frees of pointers never recorded.
 static UNKNOWN_FREES: AtomicU64 = AtomicU64::new(0);
 
-/// A recorded allocation.
 struct Alloc {
-	/// Byte size.
 	size: u64,
-	/// Kind index.
 	kind: u8,
 }
 
-/// Pointer-to-record map.
 static MAP: OnceLock<Mutex<HashMap<usize, Alloc>>> = OnceLock::new();
 
-/// Locks the allocation map, recovering from poisoning.
 fn lock_map() -> MutexGuard<'static, HashMap<usize, Alloc>> {
 	let guard = match MAP.get_or_init(|| return Mutex::new(HashMap::new())).lock() {
 		Ok(g) => g,
@@ -96,7 +74,6 @@ fn lock_map() -> MutexGuard<'static, HashMap<usize, Alloc>> {
 	return guard;
 }
 
-/// Records an allocation of `size` bytes at `ptr` classified as `kind`.
 fn record_alloc(ptr: usize, size: usize, kind: u8) {
 	let k = usize::from(kind);
 	let bytes = u64::try_from(size).unwrap_or(u64::MAX);
@@ -106,7 +83,6 @@ fn record_alloc(ptr: usize, size: usize, kind: u8) {
 	PEAK[k].fetch_max(live, Ordering::Relaxed);
 }
 
-/// Records the free of `ptr`.
 fn record_free(ptr: usize) {
 	let removed = lock_map().remove(&ptr);
 	match removed {
@@ -121,21 +97,15 @@ fn record_free(ptr: usize) {
 	}
 }
 
-/// Resolved real HSA allocation entry points.
 struct Real {
-	/// Real `hsa_amd_memory_pool_allocate`.
 	pool_allocate: unsafe extern "C" fn(u64, usize, u32, *mut *mut c_void) -> i32,
-	/// Real `hsa_amd_memory_pool_free`.
 	pool_free: unsafe extern "C" fn(*mut c_void) -> i32,
-	/// Real `hsa_memory_allocate`.
 	mem_allocate: unsafe extern "C" fn(u64, usize, *mut *mut c_void) -> i32,
-	/// Real `hsa_memory_free`.
 	mem_free: unsafe extern "C" fn(*mut c_void) -> i32,
 }
 // SAFETY: plain C function pointers into a shared library, safe to share across threads.
 unsafe impl Sync for Real {}
 
-/// Resolves `name` via `RTLD_NEXT`, returning 0 on miss (never aborts the host).
 fn resolve_next(name: &CStr) -> usize {
 	// SAFETY: dlsym with a valid NUL-terminated name; RTLD_NEXT is well-defined under LD_PRELOAD.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
@@ -149,7 +119,6 @@ fn resolve_next(name: &CStr) -> usize {
 	return nn.as_ptr().addr();
 }
 
-/// Real entry points, resolved once.
 fn real() -> &'static Real {
 	static REAL: OnceLock<Real> = OnceLock::new();
 	return REAL.get_or_init(|| {
@@ -187,7 +156,6 @@ fn real() -> &'static Real {
 	});
 }
 
-/// Resolves `name` via `RTLD_NEXT` then `RTLD_DEFAULT`.
 fn resolve_next_or_default(name: &CStr) -> Option<usize> {
 	// SAFETY: dlsym with a valid NUL-terminated name.
 	let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
@@ -201,50 +169,32 @@ fn resolve_next_or_default(name: &CStr) -> Option<usize> {
 	return NonNull::new(q).map(|nn| return nn.as_ptr().addr());
 }
 
-/// Owning-agent class of a pool.
 enum DevKind {
-	/// GPU agent.
 	Gpu,
-	/// Any non-GPU agent.
 	Other,
 }
 
-/// Agent-iteration context.
 struct BuildCtx<'ctx> {
-	/// Accumulated pool classifications.
 	pools: &'ctx mut HashMap<u64, u8>,
-	/// Real `hsa_agent_get_info`.
 	agent_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
-	/// Real `hsa_amd_agent_iterate_memory_pools`.
 	iterate_pools:
 		unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
-	/// Real `hsa_amd_memory_pool_get_info`.
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 }
 
-/// Pool-iteration context for one agent.
 struct PoolCtx<'ctx> {
-	/// Accumulated pool classifications.
 	pools: &'ctx mut HashMap<u64, u8>,
-	/// Owning-agent class.
 	dev: DevKind,
-	/// Real `hsa_amd_memory_pool_get_info`.
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 }
 
-/// Resolved classification symbol addresses.
 struct Syms {
-	/// `hsa_iterate_agents`.
 	ia: usize,
-	/// `hsa_agent_get_info`.
 	agi: usize,
-	/// `hsa_amd_agent_iterate_memory_pools`.
 	ip: usize,
-	/// `hsa_amd_memory_pool_get_info`.
 	pgi: usize,
 }
 
-/// Classifies one pool into its iteration context.
 #[inline]
 pub extern "C" fn pool_cb(pool: u64, data: *mut c_void) -> i32 {
 	// SAFETY: data is a live &mut PoolCtx for the duration of the enclosing iterate call.
@@ -285,7 +235,6 @@ pub extern "C" fn pool_cb(pool: u64, data: *mut c_void) -> i32 {
 	return HSA_STATUS_SUCCESS;
 }
 
-/// Iterates one agent's pools, classifying each.
 #[inline]
 pub extern "C" fn agent_cb(agent: u64, data: *mut c_void) -> i32 {
 	// SAFETY: data is a live &mut BuildCtx for the duration of the enclosing iterate call.
@@ -319,9 +268,6 @@ pub extern "C" fn agent_cb(agent: u64, data: *mut c_void) -> i32 {
 	return HSA_STATUS_SUCCESS;
 }
 
-/// # Safety
-///
-/// `ptr` must satisfy the real `hsa_amd_memory_pool_allocate` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 	pool: u64,
@@ -405,9 +351,6 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 	return status;
 }
 
-/// # Safety
-///
-/// `ptr` must satisfy the real `hsa_amd_memory_pool_free` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's pointer unchanged to the real HSA runtime.
@@ -419,9 +362,6 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 	return status;
 }
 
-/// # Safety
-///
-/// `ptr` must satisfy the real `hsa_memory_allocate` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hsa_memory_allocate(
 	region: u64,
@@ -442,9 +382,6 @@ pub unsafe extern "C" fn hsa_memory_allocate(
 	return status;
 }
 
-/// # Safety
-///
-/// `ptr` must satisfy the real `hsa_memory_free` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hsa_memory_free(ptr: *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's pointer unchanged to the real HSA runtime.
@@ -456,13 +393,11 @@ pub unsafe extern "C" fn hsa_memory_free(ptr: *mut c_void) -> i32 {
 	return status;
 }
 
-/// Whether the interposer is loaded.
 #[unsafe(no_mangle)]
 pub const extern "C" fn vramspy_loaded() -> u32 {
 	return 1;
 }
 
-/// Loads an atomic counter for `kind`.
 fn load_kind(arr: &[AtomicU64; N_KINDS], kind: u32) -> u64 {
 	let Ok(i) = usize::try_from(kind) else {
 		return 0;
@@ -470,31 +405,26 @@ fn load_kind(arr: &[AtomicU64; N_KINDS], kind: u32) -> u64 {
 	return arr.get(i).map_or(0, |a| return a.load(Ordering::Relaxed));
 }
 
-/// Live bytes for `kind`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_live(kind: u32) -> u64 {
 	return load_kind(&LIVE, kind);
 }
 
-/// Peak bytes for `kind`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_peak(kind: u32) -> u64 {
 	return load_kind(&PEAK, kind);
 }
 
-/// Allocation count for `kind`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_allocs(kind: u32) -> u64 {
 	return load_kind(&ALLOCS, kind);
 }
 
-/// Free count for `kind`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_frees(kind: u32) -> u64 {
 	return load_kind(&FREES, kind);
 }
 
-/// Count of frees of unrecorded pointers.
 #[unsafe(no_mangle)]
 pub extern "C" fn vramspy_unknown_frees() -> u64 {
 	return UNKNOWN_FREES.load(Ordering::Relaxed);

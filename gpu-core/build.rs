@@ -10,13 +10,10 @@ use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-/// Count of HIP memory-API choke points tracked by the ledger scan.
 const NAPI: usize = 8;
 
-/// GPU BLAS libraries banned from direct use — `hipBLAS` is the only sanctioned entry.
 const BANNED: [&str; 2] = ["rocblas", "cublas"];
 
-/// HIP memory-API choke points; each may appear at most twice (decl + single ledgered call site).
 const APIS: [&str; NAPI] = [
 	"hipMemcpyAsync(",
 	"hipHostMalloc(",
@@ -28,10 +25,8 @@ const APIS: [&str; NAPI] = [
 	"hipMemPoolTrimTo(",
 ];
 
-/// Static hipcc flags for the AMD kernel archive; dynamic paths ride the `dynamics` slice.
 const AMD_FLAGS: [&str; 4] = ["-x", "hip", "-fPIC", "-O3"];
 
-/// Static nvcc flags for the NVIDIA device-library (rocPRIM/hipCUB) kernel archive.
 const NV_DEVLIB_FLAGS: [&str; 9] = [
 	"-x",
 	"cu",
@@ -44,23 +39,16 @@ const NV_DEVLIB_FLAGS: [&str; 9] = [
 	"-fPIC",
 ];
 
-/// Static hipcc flags for the NVIDIA plain-kernel archive compiled under `HIP_PLATFORM=nvidia`.
 const NV_PLAIN_FLAGS: [&str; 4] = ["-fPIC", "-O3", "-diag-suppress", "2810"];
 
-/// Static nvcc flags for the NVIDIA hip→cu memory shim.
 const NV_SHIM_FLAGS: [&str; 3] = ["-O3", "-Xcompiler", "-fPIC"];
 
-/// The HIP backend platform, decided solely by `hipconfig --platform`.
 #[derive(Clone, Copy)]
 enum Platform {
-	/// AMD `ROCm`: hipBLAS/hipSOLVER/hipFFT forward to rocBLAS/rocSOLVER/rocFFT.
 	Amd,
-	/// NVIDIA CUDA: hipBLAS/hipSOLVER/hipFFT wrap cuBLAS/cuSOLVER/cuFFT.
 	Nvidia,
 }
 
-/// Prints one `cargo:` build directive to stdout with a trailing newline.
-/// Write errors are dropped, never propagated.
 fn put(s: &str) {
 	use std::io::Write as _;
 	let mut o = io::stdout();
@@ -68,33 +56,26 @@ fn put(s: &str) {
 	drop(o.write_all(b"\n"));
 }
 
-/// Emits a `cargo:rustc-link-search=native=<path>` directive.
 fn link_search(path: &str) {
 	put(&format!("cargo:rustc-link-search=native={path}"));
 }
 
-/// Emits a `cargo:rustc-link-lib=dylib=<name>` directive.
 fn link_lib(name: &str) {
 	put(&format!("cargo:rustc-link-lib=dylib={name}"));
 }
 
-/// Unwraps `v`, or errors the build with `what` as the message.
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
 	return v.ok_or_else(|| return what.to_owned());
 }
 
-/// Returns `key`'s environment value, or `default` when unset.
 fn env_or(key: &str, default: String) -> String {
 	return env::var(key).unwrap_or(default);
 }
 
-/// Prefixes `env_or(key, default)` with `prefix`, yielding a compiler flag string.
 fn envflag(prefix: &str, key: &str, default: String) -> String {
 	return format!("{prefix}{}", env_or(key, default));
 }
 
-/// Runs `hipconfig <flag>`, returning its trimmed stdout.
-/// Errs (naming the hip-runtime package to install) if the binary is missing or the call fails.
 fn hipconfig(flag: &str) -> Result<String, String> {
 	let out = match process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
@@ -115,8 +96,6 @@ fn hipconfig(flag: &str) -> Result<String, String> {
 	return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
 }
 
-/// Recursively scans every `.rs` under `dir`: errors on a banned BLAS symbol, else records each HIP
-/// memory-API choke-point occurrence into `sites` keyed by API index. Recurses into subdirectories.
 fn scan_sources(dir: &Path, sites: &mut [Vec<String>]) -> Result<(), String> {
 	let Ok(rd) = fs::read_dir(dir) else {
 		return Ok(());
@@ -152,8 +131,6 @@ fn scan_sources(dir: &Path, sites: &mut [Vec<String>]) -> Result<(), String> {
 	return Ok(());
 }
 
-/// Errors if any API choke point in `sites` exceeds two occurrences (decl + single call site);
-/// walks the parallel `sites`/`apis` tails by recursion.
 fn check_counts(sites: &[Vec<String>], apis: &[&str]) -> Result<(), String> {
 	let Some((s, srest)) = sites.split_first() else {
 		return Ok(());
@@ -171,8 +148,6 @@ fn check_counts(sites: &[Vec<String>], apis: &[&str]) -> Result<(), String> {
 	return check_counts(srest, arest);
 }
 
-/// Recursively appends every `.hip` file under `dir` to `out` in filesystem order.
-/// An unreadable directory is silently skipped, not an error.
 fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	let Ok(entries) = fs::read_dir(dir) else {
 		return;
@@ -189,8 +164,6 @@ fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	}
 }
 
-/// Copies each `.hip` in `files` to a flat `.cu` under `cudir`, bucketing device-library sources
-/// (rocPRIM/hipCUB) into `dev` and the rest into `plain`; recurses down the slice tail.
 fn stage_cus(
 	files: &[PathBuf],
 	cudir: &str,
@@ -216,8 +189,6 @@ fn stage_cus(
 	return stage_cus(rest, cudir, dev, plain);
 }
 
-/// Recursively removes every stale `.o` and `libhip*.a` under `dir` so the full kernel set recompiles fresh.
-/// Unreadable dirs and failed removals are silently skipped; never fails the build.
 fn sweep(dir: &Path) {
 	let Ok(rd) = fs::read_dir(dir) else {
 		return;
@@ -240,21 +211,17 @@ fn sweep(dir: &Path) {
 	}
 }
 
-/// Recreates `path` empty, erroring on a failed create.
 fn fresh_dir(path: &str) -> Result<(), String> {
 	drop(fs::remove_dir_all(path));
 	return fs::create_dir_all(path).map_err(|e| return format!("mkdir {path}: {e}"));
 }
 
-/// Emits the three hipBLAS/hipSOLVER/hipFFT link directives shared by both platforms.
 fn link_hip() {
 	link_lib("hipblas");
 	link_lib("hipsolver");
 	link_lib("hipfft");
 }
 
-/// Compiles `files` with `compiler` into the static archive `name`, applying `statics` then
-/// `dynamics` flags followed by one `-isystem <dir>` pair per `includes` entry.
 fn compile_kernels<P: AsRef<Path>>(
 	compiler: &str,
 	statics: &[&str],
@@ -274,7 +241,6 @@ fn compile_kernels<P: AsRef<Path>>(
 	b.files(files).compile(name);
 }
 
-/// Compiles the kernel set when non-empty, optionally toggling the nvidia platform env around the call.
 fn compile_if(
 	compiler: &str,
 	statics: &[&str],

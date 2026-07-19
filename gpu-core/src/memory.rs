@@ -23,30 +23,19 @@ use std::num;
 use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 
-/// Total device allocations requested this process (diagnostic counter).
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Nonzero once shutdown begins; suppresses frees racing HIP's atexit dtor.
 static SHUTTING_DOWN: AtomicU8 = AtomicU8::new(0);
 
-/// Cumulative count of device frees.
 static FREE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
-/// Cumulative host-to-device transfer bytes.
 static H2D_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Cumulative device-to-host transfer bytes.
 static D2H_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Cumulative device-to-device transfer bytes.
 static D2D_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Cumulative host-to-device transfer call count.
 static H2D_CALLS: AtomicUsize = AtomicUsize::new(0);
-/// Cumulative device-to-host transfer call count.
 static D2H_CALLS: AtomicUsize = AtomicUsize::new(0);
-/// Cumulative device-to-device transfer call count.
 static D2D_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Live bytes per allocation tag.
 static TAG_BYTES: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
-/// Peak live bytes per allocation tag.
 static TAG_PEAK: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
 
 thread_local! {
@@ -54,7 +43,6 @@ thread_local! {
 }
 
 pub struct TagScope {
-	/// Tag active before this scope, restored on drop.
 	prev: &'static str,
 }
 
@@ -72,7 +60,6 @@ impl Drop for TagScope {
 	}
 }
 
-/// Add `n` bytes to `tag`'s live total and update its peak.
 fn tag_add(tag: &'static str, n: usize) {
 	let live = match TAG_BYTES.lock() {
 		Ok(mut m) => {
@@ -89,7 +76,6 @@ fn tag_add(tag: &'static str, n: usize) {
 	*e = (*e).max(live);
 }
 
-/// Subtract `n` bytes from `tag`'s live total (saturating).
 fn tag_sub(tag: &'static str, n: usize) {
 	let Ok(mut m) = TAG_BYTES.lock() else {
 		return;
@@ -98,19 +84,16 @@ fn tag_sub(tag: &'static str, n: usize) {
 	*e = e.saturating_sub(n);
 }
 
-/// Record an allocation of `n` bytes under `tag`.
 #[inline]
 pub fn tag_note_alloc(tag: &'static str, n: usize) {
 	tag_add(tag, n);
 }
 
-/// Record a free of `n` bytes under `tag`.
 #[inline]
 pub fn tag_note_free(tag: &'static str, n: usize) {
 	tag_sub(tag, n);
 }
 
-/// Format a byte count as a human-readable GB/MB/KB/B string.
 fn fmt_bytes(b: usize) -> String {
 	const K: usize = 1024;
 	const M: usize = K * K;
@@ -129,20 +112,15 @@ fn fmt_bytes(b: usize) -> String {
 	return format!("{whole}.{frac:02} {unit}");
 }
 
-/// Format a `name: value` diagnostic pair.
 fn oom_pair(name: &str, val: &str) -> String {
 	return format!("{name}: {val}");
 }
 
-/// A tag paired with its live byte count, for ledger rows.
 struct TagBytes {
-	/// The allocation tag.
 	tag: &'static str,
-	/// Live bytes attributed to this tag.
 	bytes: usize,
 }
 
-/// Writes an out-of-memory autopsy to stderr with per-tag live bytes and transfer totals.
 #[inline]
 pub fn oom_report(req: usize) {
 	let mi = mem_info().unwrap_or(MemInfo { free: 0, total: 0 });
@@ -178,15 +156,11 @@ pub fn oom_report(req: usize) {
 	));
 }
 
-/// Kernel-reported video and system memory usage for this process.
 pub struct FdinfoMem {
-	/// Video memory in use, in kibibytes.
 	vram_kib: u64,
-	/// System memory in use, in kibibytes.
 	gtt_kib: u64,
 }
 
-/// Sums per-client video and system memory from kernel fdinfo, or None if unreadable.
 #[must_use]
 #[inline]
 pub fn kernel_fdinfo() -> Option<FdinfoMem> {
@@ -239,29 +213,19 @@ pub fn kernel_fdinfo() -> Option<FdinfoMem> {
 	});
 }
 
-/// Pairs a vramspy allocation-kind code with its display label.
 struct KindLabel {
-	/// Numeric allocation-kind code.
 	kind: u32,
-	/// Human-readable name for the kind.
 	label: &'static str,
 }
 
-/// One per-kind vramspy row: live and peak bytes with alloc and free counts.
 struct VramspyRow {
-	/// Allocation-kind label.
 	label: &'static str,
-	/// Currently live bytes for this kind.
 	live: u64,
-	/// Peak live bytes observed for this kind.
 	peak: u64,
-	/// Cumulative allocation count.
 	al: u64,
-	/// Cumulative free count for this VRAM kind.
 	fr: u64,
 }
 
-/// Formats the vramspy global-memory section, or a not-loaded notice when the library is absent.
 #[inline]
 pub fn ledger_vramspy_section(total_live: usize) -> String {
 	let mut s = String::new();
@@ -436,11 +400,8 @@ pub fn mark_shutting_down() {
 }
 
 #[derive(Clone, Copy)]
-/// Whether device allocation is frozen inside the training loop.
 enum Frozen {
-	/// Allocation permitted.
 	No,
-	/// Allocation forbidden; attempts abort.
 	Yes,
 }
 
@@ -498,7 +459,6 @@ pub fn alloc_unfreeze() {
 }
 
 pub struct AllocGuard {
-	/// Keeps the guard neither Send nor Sync.
 	_marker: PhantomData<*const ()>,
 }
 
@@ -520,28 +480,16 @@ impl Drop for AllocGuard {
 	}
 }
 
-/// Byte alignment for every arena carve.
 const ARENA_ALIGN: usize = 256;
-/// Base address of the active device arena, or 0 when none.
 static ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
-/// Total byte size of the active device arena.
 static ARENA_SIZE: AtomicUsize = AtomicUsize::new(0);
-/// Bytes already carved from the active arena.
 static ARENA_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
-/// The VMM page handles backing the active [`Ownership::Vmm`] arena, keyed by its
-/// base address. One arena exists at a time, so this holds at most one entry; the
-/// arena slab's drop takes it and hands the handles to [`vmm_unmap_span`]. Stored
-/// as addresses (opaque VMM handles carry no memory provenance) so the mutex stays
-/// `Send`.
 static ARENA_VMM: Mutex<Option<(usize, Vec<usize>)>> = Mutex::new(None);
 
-/// Per-tag bytes carved from the arena since the last drain.
 static ARENA_CARVED: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
-/// Total aligned bytes carved from the arena since the last drain.
 static ARENA_CARVED_ALIGNED: AtomicUsize = AtomicUsize::new(0);
 
-/// Record a carve of `n_bytes` (aligned rounded up) under tag.
 #[inline]
 pub fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
 	let Ok(mut m) = ARENA_CARVED.lock() else {
@@ -553,7 +501,6 @@ pub fn arena_note_carve(tag: &'static str, n_bytes: usize, aligned: usize) {
 	ARENA_CARVED_ALIGNED.fetch_add(aligned, Ordering::Relaxed);
 }
 
-/// Carves the weights image buffer at the arena front so it precedes all later allocations.
 fn carve_image_front(image: &[f64]) {
 	let Some(_first) = image.first() else {
 		return;
@@ -564,7 +511,6 @@ fn carve_image_front(image: &[f64]) {
 	}
 }
 
-/// Zeroes the claimed arena then uploads the weights image into its front.
 fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<(), HipError> {
 	// SAFETY: base points to the just-claimed device arena of size bytes, a valid target for an async memset.
 	unsafe {
@@ -590,15 +536,8 @@ fn commit_with_image(base: *mut c_void, size: usize, image: &[f64]) -> Result<()
 	return device_synchronize();
 }
 
-/// Page granularity for a VMM-backed reservation (2 MiB, the ROCm VMM minimum).
 const VMM_PAGE: usize = 2 << 20;
 
-/// THE single choke point for a VMM-backed contiguous span: reserves a
-/// `ceil(bytes/page)`-page VA range and creates + maps one physical handle per
-/// page, so the returned base is DETERMINISTICALLY backed — a first-write memset
-/// can never page-fault the way a cold `hipMallocAsync` pool suballocation does.
-/// Shared by the arena claim and [`crate::tiered`]; every VMM `hipMem*` call lives
-/// here and in [`vmm_unmap_span`], nowhere else. Returns `(base, page-handles)`.
 pub fn vmm_map_span(bytes: usize) -> Option<(*mut c_void, Vec<*mut c_void>)> {
 	let pages = bytes.div_ceil(VMM_PAGE);
 	if pages == 0 {
@@ -635,10 +574,6 @@ pub fn vmm_map_span(bytes: usize) -> Option<(*mut c_void, Vec<*mut c_void>)> {
 	return Some((va, handles));
 }
 
-/// THE single choke point tearing down a [`vmm_map_span`] region: unmaps each
-/// page's slot, releases its handle, then frees the reserved VA span. Reserved-only
-/// tails (a mid-map failure) free correctly because the address range is freed by
-/// the mapped-page count, matching how the caller reserved and mapped.
 pub fn vmm_unmap_span(va: *mut c_void, handles: &[*mut c_void]) {
 	for (s, &h) in handles.iter().enumerate() {
 		// SAFETY: va + s*page is this slot's live mapped VA; unmap once before release.
@@ -719,13 +654,11 @@ pub fn release_device_arena(slab: GpuBuffer) {
 	drop(slab);
 }
 
-/// Folds all arena carve tallies back into the unclaimed tag and clears the per-tag map.
 fn drain_arena_carve() {
 	drain_arena_carve_map();
 	tag_add("unclaimed", ARENA_CARVED_ALIGNED.swap(0, Ordering::Relaxed));
 }
 
-/// Subtracts every recorded arena carve from its tag ledger and empties the carve map.
 #[inline]
 pub fn drain_arena_carve_map() {
 	let Ok(mut m) = ARENA_CARVED.lock() else {
@@ -738,12 +671,9 @@ pub fn drain_arena_carve_map() {
 	m.clear();
 }
 
-/// The single parked run backing awaiting adoption or release across runs.
 static PARKED: Mutex<Option<GpuBuffer>> = Mutex::new(None);
 
-/// Monotonic generation counter, bumped each time a run backing is parked.
 static PARK_GEN: AtomicUsize = AtomicUsize::new(0);
-/// Generation of the currently parked backing; 0 when nothing is parked.
 static PARKED_GEN: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
@@ -772,25 +702,17 @@ pub fn live_parked_gen() -> Option<usize> {
 		.map(num::NonZeroUsize::get);
 }
 
-/// Classification of a taken parked buffer relative to the active arena.
 enum ParkKind {
-	/// The parked buffer is the registered device arena.
 	Registered,
-	/// The parked buffer is a foreign pool allocation, not the arena.
 	Foreign,
 }
 
-/// Decided action for a parked backing during adoption.
 enum Disposition {
-	/// Reuse the parked arena in place for this run.
 	Adopt,
-	/// Release the arena because the parked backing is too small.
 	ReleaseArena,
-	/// Drop the foreign parked buffer and trim the pool.
 	DropForeign,
 }
 
-/// Take the parked backing and decide whether to adopt, release, or drop it.
 #[inline]
 pub fn adopt_run_backing_inner(need: usize) -> Option<GpuBuffer> {
 	let parked = match PARKED.lock() {
@@ -870,11 +792,9 @@ pub fn release_run_backing() {
 }
 
 pub struct Stage {
-	/// Host-side f64 staging buffer, alignment-padded per push.
 	host: Vec<f64>,
 }
 
-/// Arena alignment expressed in f64 elements.
 const STAGE_ALIGN_F64: usize = ARENA_ALIGN >> 3;
 
 impl Default for Stage {
@@ -891,7 +811,6 @@ impl Stage {
 		return Self { host: Vec::new() };
 	}
 
-	/// Pads the host buffer up to the next f64 alignment boundary.
 	fn pad(&mut self) {
 		let rem = self.host.len() & (STAGE_ALIGN_F64 - 1);
 		let add = (STAGE_ALIGN_F64 - rem) & (STAGE_ALIGN_F64 - 1);
@@ -933,18 +852,12 @@ impl Stage {
 	}
 }
 
-/// Direction of a ledgered device transfer.
 enum Dir {
-	/// Host to device.
 	H2D,
-	/// Device to host.
 	D2H,
-	/// Device to device.
 	D2D,
 }
 
-/// # Errors
-/// Returns [`HipError`] if the underlying HIP memcpy fails.
 #[inline]
 pub unsafe fn xfer(
 	dst: *mut c_void,
@@ -986,7 +899,6 @@ pub unsafe fn xfer(
 	}
 }
 
-/// Records and issues one ledgered async `hipMemcpyAsync`.
 unsafe fn dev_copy(
 	dst: *mut c_void,
 	src: *const c_void,
@@ -1047,28 +959,19 @@ pub fn par_copy(dst: *mut u8, src: *const u8, bytes: usize) {
 	});
 }
 
-/// Fixed size of the pinned H2D bounce staging buffer.
 const BOUNCE_BYTES: usize = 64 << 20;
-/// Address of the lazily allocated pinned bounce buffer, 0 when unset.
 struct BounceAddr {
-	/// Address of the pinned bounce allocation, 0 when unset.
 	addr: usize,
 }
-/// Serializes access to the single shared pinned H2D bounce buffer.
 static BOUNCE: Mutex<BounceAddr> = Mutex::new(BounceAddr { addr: 0 });
 
-/// Reusable pinned host buffer backing out-of-core run transfers.
 struct PinBuf {
-	/// Address of the pinned allocation, 0 when none.
 	ptr: usize,
-	/// Capacity of the pinned allocation in bytes.
 	cap: usize,
 }
 
-/// Process-wide reusable run pin buffer.
 static RUN_PIN: Mutex<PinBuf> = Mutex::new(PinBuf { ptr: 0, cap: 0 });
 
-/// Grows the pin buffer to hold `bytes` when it is smaller and returns its pointer.
 fn pin_ensure(g: &mut PinBuf, bytes: usize) -> Result<*mut u8, HipError> {
 	if g.cap < bytes {
 		if let Some(_old) = num::NonZeroUsize::new(g.ptr) {
@@ -1085,7 +988,6 @@ fn pin_ensure(g: &mut PinBuf, bytes: usize) -> Result<*mut u8, HipError> {
 	return Ok(ptr::with_exposed_provenance_mut::<u8>(g.ptr));
 }
 
-/// Return the shared run-pin host buffer, grown to at least the requested bytes.
 #[inline]
 pub fn run_pin(bytes: usize) -> Result<*mut u8, HipError> {
 	let mut g = match RUN_PIN.lock() {
@@ -1095,15 +997,11 @@ pub fn run_pin(bytes: usize) -> Result<*mut u8, HipError> {
 	return pin_ensure(&mut g, bytes);
 }
 
-/// Base address and length of the live bounce buffer.
 pub struct BounceRange {
-	/// Start address of the bounce buffer.
 	pub base: usize,
-	/// Length of the bounce buffer in bytes.
 	pub len: usize,
 }
 
-/// Return the live bounce buffer range, or None when unallocated.
 #[inline]
 pub fn bounce_range() -> Option<BounceRange> {
 	let base = BOUNCE.lock().ok()?.addr;
@@ -1115,20 +1013,14 @@ pub fn bounce_range() -> Option<BounceRange> {
 	});
 }
 
-/// A recently noted device VA range, for fault-autopsy lookup.
 struct Range {
-	/// Start address of the range.
 	base: usize,
-	/// Length of the range in bytes.
 	len: usize,
-	/// Human-readable label for the range.
 	what: &'static str,
 }
 
-/// Ring of recently noted device VA ranges for fault autopsy.
 static RECENT_RANGES: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 
-/// Record a device VA range so `locate_va` can later name it.
 pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
 	let Ok(mut r) = RECENT_RANGES.lock() else {
 		return;
@@ -1139,7 +1031,6 @@ pub(crate) fn note_range(base: usize, len: usize, what: &'static str) {
 	r.push(Range { base, len, what });
 }
 
-/// Describe which noted range contains the given address, if any.
 #[inline]
 pub fn locate_va(va: usize) -> Option<String> {
 	let r = RECENT_RANGES.lock().ok()?;
@@ -1158,7 +1049,6 @@ pub fn locate_va(va: usize) -> Option<String> {
 		});
 }
 
-/// Releases the pinned H2D bounce buffer if one was allocated.
 #[inline]
 pub fn free_bounce() {
 	let mut guard = match BOUNCE.lock() {
@@ -1172,7 +1062,6 @@ pub fn free_bounce() {
 	}
 }
 
-/// Releases the pinned run staging buffer after a device sync.
 #[inline]
 pub fn free_run_pin() {
 	let mut guard = match RUN_PIN.lock() {
@@ -1188,13 +1077,6 @@ pub fn free_run_pin() {
 	}
 }
 
-/// Streams host bytes to device through the pinned bounce buffer in synced chunks.
-///
-/// # Errors
-/// Returns [`HipError`] if a chunk copy or stream sync fails.
-///
-/// # Safety
-/// `dst` and `src` must be valid for `bytes` and `stream` must be a live HIP stream.
 #[inline]
 pub unsafe fn h2d_pinned(
 	dst: *mut c_void,
@@ -1244,11 +1126,8 @@ pub unsafe fn h2d_pinned(
 pub const BOUNCE_LIMIT: usize = BOUNCE_BYTES;
 
 pub struct ExitD2H {
-	/// Held pin-buffer lock keeping the staging region alive until finish.
 	_guard: MutexGuard<'static, PinBuf>,
-	/// Address of the pinned staging buffer holding the download.
 	pin: usize,
-	/// Byte length of the pending download.
 	bytes: usize,
 }
 
@@ -1271,8 +1150,6 @@ impl ExitD2H {
 	}
 }
 
-/// # Errors
-/// Errors when the device-to-host copy fails to enqueue.
 #[inline]
 #[expect(
 	clippy::significant_drop_tightening,
@@ -1304,11 +1181,6 @@ pub unsafe fn exit_d2h_enqueue(src: *const c_void, bytes: usize) -> Result<ExitD
 	});
 }
 
-/// Safe wrapper over [`exit_d2h_enqueue`] taking the source as a buffer plus a
-/// byte count. Bounds-checks against the buffer so callers need no unsafe.
-///
-/// # Errors
-/// Returns [`HipError`] if the enqueue fails.
 pub fn exit_d2h_enqueue_buf(src: &GpuBuffer, bytes: usize) -> Result<ExitD2H, HipError> {
 	assert!(
 		bytes <= src.len,
@@ -1319,12 +1191,8 @@ pub fn exit_d2h_enqueue_buf(src: &GpuBuffer, bytes: usize) -> Result<ExitD2H, Hi
 	return unsafe { exit_d2h_enqueue(src.ptr_raw().cast_const(), bytes) };
 }
 
-/// Process-global two-slot pinned host buffer used for the deferred 8-byte
-/// metric-scalar downloads. Stored as an address so it stays `Send`.
 static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
 
-/// Address of the pinned two-`f64` pair, allocating it on first use. Returns 0
-/// if the pinned allocation fails.
 fn pinned_pair_addr() -> usize {
 	let mut g = match PINNED_PAIR.lock() {
 		Ok(g) => g,
@@ -1342,9 +1210,6 @@ fn pinned_pair_addr() -> usize {
 	return *g;
 }
 
-/// Download 8 bytes from `src` into pinned scalar `slot` (0 or 1) on `stream`,
-/// deferred (no sync). Safe: `slot` is masked to the two-slot pair and the copy
-/// size is fixed at one `f64`.
 pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream) {
 	let base = pinned_pair_addr();
 	if base == 0 {
@@ -1352,7 +1217,6 @@ pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream
 	}
 	let dst = (base + (slot & 1) * size_of::<f64>()) as *mut c_void;
 	// SAFETY: dst is one f64 slot inside the 16-byte pinned pair; src covers 8
-	// bytes (a scalar buffer); stream is a valid HIP stream handle.
 	let r = unsafe {
 		xfer(
 			dst,
@@ -1367,8 +1231,6 @@ pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream
 	}
 }
 
-/// Read pinned scalar `slot` (0 or 1). Returns 0.0 if the pinned pair could not
-/// be allocated. The caller must have synchronized the download stream first.
 #[must_use]
 pub fn pinned_read(slot: usize) -> f64 {
 	let base = pinned_pair_addr();
@@ -1379,7 +1241,6 @@ pub fn pinned_read(slot: usize) -> f64 {
 	return unsafe { *((base + (slot & 1) * size_of::<f64>()) as *const f64) };
 }
 
-/// Free the pinned scalar pair after a device sync. Called during teardown.
 pub fn free_pinned_pair() {
 	let mut g = match PINNED_PAIR.lock() {
 		Ok(g) => g,
@@ -1393,7 +1254,6 @@ pub fn free_pinned_pair() {
 	}
 }
 
-/// Ledgered async device memset on the given stream.
 pub(crate) unsafe fn memset_dev(
 	dst: *mut c_void,
 	value: i32,
@@ -1405,16 +1265,13 @@ pub(crate) unsafe fn memset_dev(
 	return check(unsafe { hipMemsetAsync(dst, value, bytes, stream) });
 }
 
-/// One-shot guard for process-wide device initialization.
 static DEVICE_INIT: Once = Once::new();
 
-/// atexit hook releasing the parked birth arena claim at process exit.
 #[inline]
 pub extern "C" fn release_birth_claim_at_exit() {
 	release_run_backing();
 }
 
-/// Performs process-wide GPU device initialization exactly once.
 pub(crate) fn device_init_once() {
 	use crate::gate;
 	use crate::hw;
@@ -1475,10 +1332,6 @@ pub fn set_device_arena(base: *mut c_void, size: usize) {
 	ARENA_BASE.store(base.addr(), Ordering::Relaxed);
 }
 
-/// Human-readable arena carve-miss diagnostic: a GPU-busy and VRAM free/total
-/// context line followed by the needs/has/short accounting, all in MB/GB to two
-/// decimals. Composed where the exact asked size and remaining claim are known
-/// so the inference path can propagate it instead of aborting.
 #[must_use]
 pub fn carve_miss_message(asked_bytes: usize) -> String {
 	let mb = |b: usize| return b as f64 / (1u64 << 20i32) as f64;
@@ -1497,8 +1350,6 @@ pub fn carve_miss_message(asked_bytes: usize) -> String {
 	);
 }
 
-/// Reads the first `gpu_busy_percent` under `/sys/class/drm`, or `None` when the
-/// counter is unavailable; used only to annotate diagnostics, never for a fit.
 #[must_use]
 fn gpu_busy_percent() -> Option<u32> {
 	for card in fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
@@ -1547,13 +1398,6 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	return None;
 }
 
-/// Child entry for the host-RAM headroom probe. When `RAM_PROBE` names a byte
-/// count, commits that many host bytes and touches every page so the commit
-/// becomes real resident memory, mirroring the VRAM probe's device allocation.
-/// Returns `Some(0)` if the process survived the commit, `Some(2)` on a parse
-/// failure, and `None` when the env var is unset (not a probe child). If the
-/// kernel OOM-kills the child mid-commit it dies with SIGKILL and the parent's
-/// [`probe_ram_ceiling`] loop reads the non-success status as "unmappable".
 #[inline]
 pub fn ram_probe_ask() -> Option<i32> {
 	let sz = std::env::var_os("RAM_PROBE")?;
@@ -1572,9 +1416,6 @@ pub fn ram_probe_ask() -> Option<i32> {
 	return Some(0);
 }
 
-/// Spawns one RAM probe child that must commit and touch `want` bytes, returning
-/// whether it survived. Core dumps are disabled in the child so an OOM-kill is
-/// silent, exactly as the VRAM claim probe does.
 fn spawn_ram_probe(want: usize) -> bool {
 	let Ok(exe) = std::env::current_exe() else {
 		return false;
@@ -1586,10 +1427,6 @@ fn spawn_ram_probe(want: usize) -> bool {
 	return c.status().map(|s| return s.success()).unwrap_or(false);
 }
 
-/// Probe-verified host-RAM budget. Spawns a child per candidate size that must
-/// commit and touch that many bytes, backing off by 1/16 until one survives,
-/// exactly mirroring [`probe_ceiling`]'s VRAM claim probe. Returns the largest
-/// survivable size, or `None` when nothing above 1 GB survives the commit.
 #[inline]
 pub fn probe_ram_ceiling(guess: usize) -> Option<usize> {
 	let mut want = guess & !((1 << 21i32) - 1);
@@ -1610,15 +1447,6 @@ pub fn probe_ram_ceiling(guess: usize) -> Option<usize> {
 	return None;
 }
 
-/// Image packed channel sample format, applied per channel after unpacking.
-/// - `Unorm`   raw / (2^bits - 1)
-/// - `Snorm`   signext then / (2^(bits-1) - 1), clamped to -1
-/// - `Uscaled` raw as f32 (unsigned integer value)
-/// - `Sscaled` signext as f32 (signed integer value)
-/// - `Uint`    raw as f32
-/// - `Sint`    signext as f32
-/// - `Float`   IEEE/mini float of the channel width (10/11/16/32)
-/// - `Srgb`    `Unorm` then the sRGB EOTF on colour channels (alpha stays linear)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImgFmt {
 	Unorm,
@@ -1631,9 +1459,6 @@ pub enum ImgFmt {
 	Srgb,
 }
 
-/// Image packed channel layout: the per-channel bit widths, listed low-order
-/// channel first. Channels pack little-endian within the block, the first
-/// listed channel occupying the least-significant bits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImgLayout {
 	L8,
@@ -1656,7 +1481,6 @@ pub enum ImgLayout {
 }
 
 impl ImgLayout {
-	/// Per-channel bit widths, low-order channel first.
 	pub fn channels(self) -> &'static [u32] {
 		return match self {
 			ImgLayout::L8 => &[8],
@@ -1681,12 +1505,6 @@ impl ImgLayout {
 
 }
 
-/// THE dtype: every element type any part of the system names — device buffer
-/// elements, gguf tensor storage, quant blocks, packed ints, mini-floats,
-/// image layouts — is a variant here, in gpu-core, the bottom of the DAG.
-/// Adding dtype N+1 costs one variant and one match arm. Kernel dispatch
-/// ([`Dtype::ffi`]) covers the compute dtypes; codecs in `recipe-infer`'s
-/// dequant map the rest onto them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Dtype {
 	F32,
@@ -1785,9 +1603,6 @@ pub enum Dtype {
 impl Dtype {
       #[inline]
       #[must_use]
-      /// Bytes per element for the scalar compute dtypes. Block-quantized, packed,
-      /// and image dtypes are byte-granular here (1): their real geometry lives in
-      /// the codec (`block_bytes`/`block_elems`), never in flat element math.
       pub const fn elem_size(self) -> usize {
             return match self {
                   Self::F64 | Self::F64x2 => 8,
@@ -1799,10 +1614,6 @@ impl Dtype {
 
       #[inline]
       #[must_use]
-      /// Kernel-ABI dispatch code (dtype_dispatch.h): 0 = f64, 1 = f32. Every
-      /// other dtype is NOT kernel-dispatchable — codecs convert it to a compute
-      /// dtype first — and returns -1 so a stray launch fails loudly in review,
-      /// never silently as f64.
       pub const fn ffi(self) -> i32 {
             return match self {
                   Self::F32 => 1,
@@ -1813,11 +1624,6 @@ impl Dtype {
 
       #[inline]
       #[must_use]
-      /// Convert-kernel ABI code (`convert.h`), the dtype half of the
-      /// [`crate::infer_ops::gpu_convert`] flipper. Shares 0 = f64 / 1 = f32
-      /// with [`Self::ffi`] so a buffer's compute code and convert code never
-      /// disagree. `-1` = no kernel reads or writes this dtype yet, which
-      /// `gpu_convert` reports by name rather than reinterpreting bytes.
       pub const fn conv(self) -> i32 {
             return match self {
                   Self::F64 => 0,
@@ -1840,9 +1646,6 @@ impl Dtype {
 
       #[inline]
       #[must_use]
-      /// Elements per storage block: 1 for the element-granular dtypes, 32 for
-      /// the legacy quants, 256 for the K-quant superblocks. The count a
-      /// conversion length must divide evenly.
       pub const fn block_elems(self) -> usize {
             return match self {
                   Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
@@ -1853,8 +1656,6 @@ impl Dtype {
 
       #[inline]
       #[must_use]
-      /// Bytes per storage block, matching the ggml on-disk layouts byte for
-      /// byte. For element-granular dtypes this is [`Self::elem_size`].
       pub const fn block_bytes(self) -> usize {
             return match self {
                   Self::Q4_0 => 18,
@@ -1872,30 +1673,19 @@ impl Dtype {
       }
 }
 
-/// Whether a buffer owns its device allocation or merely borrows one.
 #[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum Ownership {
-	/// Owns a pool allocation; freed on drop.
 	Pool,
-	/// Borrows memory owned elsewhere; never freed.
 	Borrow,
-	/// Owns the VMM-backed device arena ([`vmm_map_span`]); its page handles live
-	/// in [`ARENA_VMM`] (one arena at a time) and are unmapped, released, and the
-	/// VA freed on drop.
 	Vmm,
 }
 
 pub struct GpuBuffer {
-	/// Raw device allocation pointer, null once dropped.
 	pub ptr: *mut c_void,
-	/// Length of the allocation in bytes.
 	pub len: usize,
-	/// Ownership mode governing whether drop frees the pointer.
 	pub owned: Ownership,
-	/// Ledger tag the buffer's bytes are accounted under.
 	pub tag: &'static str,
-	/// Element type every byte computation on this buffer derives from.
 	pub dt: Dtype,
 }
 
@@ -1935,8 +1725,6 @@ impl GpuBuffer {
 		return self;
 	}
 
-	/// # Errors
-	/// Errors when the underlying device allocation fails.
 	#[inline]
 	pub fn alloc_ty(n_elems: usize, dt: Dtype) -> Result<Self, HipError> {
 		return Ok(Self::alloc_bytes(n_elems * dt.elem_size())?.as_dtype(dt));
@@ -1948,8 +1736,6 @@ impl GpuBuffer {
 		return matches!(self.owned, Ownership::Pool);
 	}
 
-	/// # Errors
-	/// Errors when the underlying device allocation fails.
 	#[inline]
 	pub fn alloc(n_floats: usize) -> Result<Self, HipError> {
 		return Self::alloc_bytes(n_floats * mem::size_of::<f64>());
@@ -1961,8 +1747,6 @@ impl GpuBuffer {
 		return Self::alloc_bytes_inner(n_bytes).ok();
 	}
 
-	/// # Errors
-	/// Errors when the device allocation fails and no arena carve remains.
 	#[inline]
 	pub fn alloc_bytes(n_bytes: usize) -> Result<Self, HipError> {
 		match Self::alloc_bytes_inner(n_bytes) {
@@ -1977,10 +1761,6 @@ impl GpuBuffer {
 		}
 	}
 
-	/// Maps `n_bytes` of pool memory and returns the raw device pointer.
-	///
-	/// # Errors
-	/// Returns [`HipError`] if the pool allocation fails.
 	#[inline]
 	pub fn map_bytes(n_bytes: usize) -> Result<*mut c_void, HipError> {
 		let mut ptr: *mut c_void = ptr::null_mut();
@@ -1990,7 +1770,6 @@ impl GpuBuffer {
 		return Ok(ptr);
 	}
 
-	/// Carves `n_bytes` from the active arena, claiming the arena first when none is active.
 	fn alloc_bytes_inner(n_bytes: usize) -> Result<Self, HipError> {
 		device_init_once();
 		if ALLOC_FROZEN.with(|f| return !matches!(f.get(), Frozen::No)) {
@@ -2047,7 +1826,6 @@ impl GpuBuffer {
 		});
 	}
 
-	/// Maps a fresh pool-owned slab of `n_bytes` to back the device arena claim.
 	#[inline]
 	pub fn claim_map_bytes(n_bytes: usize) -> Option<Self> {
 		device_init_once();
@@ -2085,8 +1863,6 @@ impl GpuBuffer {
 		});
 	}
 
-	/// # Errors
-	/// Returns an error if the host-to-device transfer fails.
 	#[inline]
 	pub fn write_u8(&self, data: &[u8]) -> Result<(), HipError> {
 		if data.len() > self.len {
@@ -2109,8 +1885,6 @@ impl GpuBuffer {
 		}
 	}
 
-	/// # Errors
-	/// Returns an error if the host-to-device transfer fails.
 	#[inline]
 	pub fn load(&self, data: &[f64]) -> Result<(), HipError> {
 		if self.dt == Dtype::F32 {
@@ -2154,13 +1928,6 @@ impl GpuBuffer {
 		}
 	}
 
-	/// Downloads into an f64 host slice, widening from the buffer's storage
-	/// dtype: an F32 buffer is read back and promoted, an F64 buffer copied
-	/// directly. The inference forward parks activations at the model's native
-	/// width but composes its host-side routing and readout in f64.
-	///
-	/// # Errors
-	/// Errors if the device-to-host copy or the following synchronize fails.
 	#[inline]
 	pub fn download_host(&self, dst: &mut [f64]) -> Result<(), HipError> {
 		if self.dt == Dtype::F32 {
@@ -2185,8 +1952,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Returns an error if allocation or the host-to-device transfer fails.
 	#[inline]
 	pub fn upload_f32(data: &[f32]) -> Result<Self, HipError> {
 		let bytes = data.len() * 4;
@@ -2204,8 +1969,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Errors if the device allocation or the host-to-device upload fails.
 	#[inline]
 	pub fn upload_i32(data: &[i32]) -> Result<Self, HipError> {
 		let bytes = data.len() * 4;
@@ -2223,8 +1986,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Errors if the device allocation or the zeroing memset fails.
 	#[inline]
 	pub fn zeros_f32(n: usize) -> Result<Self, HipError> {
 		let buf = Self::alloc_bytes(n * 4)?.as_dtype(Dtype::F32);
@@ -2232,8 +1993,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Errors if the memset or the device synchronize fails.
 	#[inline]
 	pub fn memset_zero(&self, n_bytes: usize) -> Result<(), HipError> {
 		// SAFETY: self.ptr is a valid device buffer of at least n_bytes.
@@ -2241,8 +2000,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Errors if the device-to-host copy or the synchronize fails.
 	#[inline]
 	pub fn download_f32(&self, dst: &mut [f32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
@@ -2259,8 +2016,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Errors if the device-to-host copy or the synchronize fails.
 	#[inline]
 	pub fn download_u8(&self, dst: &mut [u8]) -> Result<(), HipError> {
 		// SAFETY: dst holds dst.len() bytes of valid host memory and self.ptr is a valid device buffer.
@@ -2276,8 +2031,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Errors if the device-to-host copy or the synchronize fails.
 	#[inline]
 	pub fn download_i32(&self, dst: &mut [i32]) -> Result<(), HipError> {
 		let bytes = dst.len() * 4;
@@ -2321,9 +2074,6 @@ impl GpuBuffer {
 		return self.len == 0;
 	}
 
-	/// Borrowed sub-window `[byte_off, byte_off+byte_len)` of this buffer.
-	/// The returned buffer does not own the memory; it stays valid only while
-	/// `self` does. Panics if the window runs past the end of the buffer.
 	#[inline]
 	#[must_use]
 	pub fn sub_view(&self, byte_off: usize, byte_len: usize) -> Self {
@@ -2333,7 +2083,6 @@ impl GpuBuffer {
 			self.len
 		);
 		// SAFETY: the assert above proves byte_off is within the allocation, so
-		// the offset pointer stays inside self's device buffer.
 		let p = unsafe { self.ptr.cast::<u8>().add(byte_off) }.cast::<c_void>();
 		return Self::borrow(p, byte_len);
 	}
@@ -2366,8 +2115,6 @@ impl GpuBuffer {
 		.as_dtype(self.dt);
 	}
 
-	/// # Errors
-	/// Returns `HipError` if the device-to-device copy or the following device sync fails.
 	#[inline]
 	pub fn copy_from(&mut self, src: &Self, n_bytes: usize) -> Result<(), HipError> {
 		// SAFETY: self.ptr and src.ptr are valid device pointers spanning n_bytes.
@@ -2383,8 +2130,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the device memset fails.
 	#[inline]
 	pub fn fill_bytes(&self, value: u8, n_bytes: usize) -> Result<(), HipError> {
 		// SAFETY: self.ptr is a valid device pointer spanning n_bytes.
@@ -2392,8 +2137,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the allocation or upload fails.
 	#[inline]
 	pub unsafe fn upload_async(data: &[f64], stream: *mut c_void) -> Result<Self, HipError> {
 		let bytes = mem::size_of_val(data);
@@ -2411,8 +2154,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the download fails.
 	#[inline]
 	pub unsafe fn download_async(
 		&self,
@@ -2432,21 +2173,12 @@ impl GpuBuffer {
 		}
 	}
 
-	/// Download `self` into `dst` on the default stream, then the caller
-	/// synchronizes. Safe wrapper over [`Self::download_async`]: the only
-	/// invariant the async form needs from a caller is a valid stream, and the
-	/// default stream is always valid, so this form carries none.
-	///
-	/// # Errors
-	/// Returns [`HipError`] if the download fails.
 	#[inline]
 	pub fn download(&self, dst: &mut [f64]) -> Result<(), HipError> {
 		// SAFETY: the null (default) stream is always valid; bounds come from dst.
 		return unsafe { self.download_async(dst, ptr::null_mut()) };
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the allocation or upload fails.
 	#[inline]
 	pub fn upload_f16(data: &[half::f16]) -> Result<Self, HipError> {
 		let bytes = data.len() * 2;
@@ -2464,8 +2196,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the download fails.
 	#[inline]
 	pub fn download_f16(&self, dst: &mut [half::f16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;
@@ -2482,8 +2212,6 @@ impl GpuBuffer {
 		return device_synchronize();
 	}
 
-	/// # Errors
-	/// Returns [`HipError`] if the allocation or upload fails.
 	#[inline]
 	pub fn upload_bf16(data: &[half::bf16]) -> Result<Self, HipError> {
 		let bytes = data.len() * 2;
@@ -2501,8 +2229,6 @@ impl GpuBuffer {
 		return Ok(buf);
 	}
 
-	/// # Errors
-	/// Errors if the device-to-host transfer or the synchronize fails.
 	#[inline]
 	pub fn download_bf16(&self, dst: &mut [half::bf16]) -> Result<(), HipError> {
 		let bytes = dst.len() * 2;

@@ -195,11 +195,6 @@ fn nested_zip_extracts_inner_tables() {
 	);
 }
 
-/// A `load_groups` call on an unreadable source path used to `process::abort()`
-/// inside its loader closures; it now returns `Err` up the parse graph. Reaching
-/// the assertion at all proves the old self-kill is gone: a path whose parent
-/// directory does not exist can neither be opened nor created, so `read_raw_csv`
-/// rejects it and the failure surfaces as `Err`, not SIGABRT.
 #[test]
 fn load_groups_missing_source_errs_not_aborts() {
 	let got = load_groups("/nonexistent-recipe-dir-9f2a/nope.csv");

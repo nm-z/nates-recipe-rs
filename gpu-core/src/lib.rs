@@ -43,6 +43,5 @@ pub mod sys;
 pub mod tiered;
 pub mod waterfall;
 
-/// A HIP runtime status code wrapped as an error; the field is the raw status.
 #[derive(Debug)]
 pub struct HipError(pub i32);

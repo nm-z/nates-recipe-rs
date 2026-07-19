@@ -25,9 +25,6 @@ pub const HEADS: usize = 4;
 const DETECTOR_OGDL: &str = include_str!("../detector.ogdl");
 const NLB: u8 = 10;
 
-/// One column → one variable-length byte stream (every cell, newline-delimited),
-/// read up to the context window, `id = byte + 1`, PAD(0) to `CONTEXT`.
-/// No sampling, no per-cell windowing — the whole stream as far as the context reads.
 pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	let mut ids = Vec::with_capacity(CONTEXT);
 	let sep = NLB as f64 + 1.0;
@@ -49,20 +46,6 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	ids
 }
 
-/// Load-time column-type detection for the table path (CSV / dir / zip). Runs the
-/// GPU char-level detector at `Data::set` time so the classification stays out of
-/// the training run's measured init window; the encoder consumes the result instead
-/// of calling `predict_kinds` mid-materialize. Returns, per table group, its name
-/// and per-column `(header, kind int)` positional to the group's headers. Image
-/// groups carry no feature columns and are omitted.
-///
-/// The detector sees byte-identical input to the in-encode path: per column, the
-/// newline-joined stream of non-missing cells, `tokenize_column`-truncated to
-/// `CONTEXT`. A plain CSV takes a streaming PREFIX read that stops as soon as every
-/// column has ≥ `CONTEXT` bytes of that stream (or at EOF) — a column with fewer
-/// forces reading to EOF, exactly what `tokenize_column` consumes from the full
-/// parse. Dir/zip/db reuse the full `load_groups` loader (the same parser), taking
-/// correctness over a second, prefix-only dialect.
 pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 	let p = Path::new(path);
 	let ext = p
@@ -115,10 +98,6 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 	}
 }
 
-/// Non-empty columns → detector kinds; every empty column gets `KIND_NUMERIC` (the
-/// branch the encoder takes for it regardless of any prediction). One `(header,
-/// kind)` per column, in header order, so the encoder matches positionally and can
-/// catch a count/name drift against its full parse.
 fn kinds_for(
 	headers: &[String],
 	non_empty: &[Vec<&str>],
@@ -151,13 +130,7 @@ enum FirstRow {
 	Data,
 }
 
-/// Streaming prefix read of a plain CSV: replicates `read_raw_csv`'s header
-/// detection and missing-cell filtering, collecting each column's non-missing cells
-/// only until it holds ≥ `CONTEXT` bytes of `tokenize_column` stream (or EOF). The
-/// returned prefix is exactly what `tokenize_column` would consume from the full
-/// column, so the `CONTEXT`-token vector — and thus the detection — is identical.
 fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
-	/// One token per byte, plus one newline separator between consecutive cells.
 	fn take(j: usize, cell: &str, cols: &mut [Vec<String>], tok: &mut [usize]) {
 		let Ordering::Less = tok[j].cmp(&CONTEXT) else {
 			return;
@@ -190,7 +163,6 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 		.map(|s| String::from_utf8_lossy(s).into_owned())
 		.collect();
 	let w = first_cells.len();
-	// Header row iff any first-row cell is a non-number (a header names columns); an all-numeric first row is data, and columns are synthesized col_0..col_{w-1}.
 	let headerless = !first_cells.is_empty()
 		&& first_cells.iter().all(|c| {
 			let t = c.trim();
@@ -249,10 +221,6 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 	Ok(PrefixCols { headers, cols })
 }
 
-/// Parks the detector's backing slab on every exit — normal return or a panic
-/// during the forward — so the arena is never left registered-and-live and the
-/// next call adopts it instead of reclaiming. No HIP calls in park, so drop
-/// drains nothing. `None` once the slab has already been parked/handed off.
 struct ArenaGuard {
 	slab: Option<recipe_infer::GpuBuffer>,
 }
@@ -265,24 +233,6 @@ impl Drop for ArenaGuard {
 	}
 }
 
-/// Each column's byte stream → argmax over the six kind logits. Builds the fixed
-/// `embed(32,vocab=257) → attn(4) → dense(64,leaky) → dense(6,linear)` stack as
-/// `recipe_infer::LayerSpec` values, loads the inline checkpoint into it, and runs
-/// a single forward pass. The byte-id stream is the embed input, so no feature
-/// scaling and no categorical side-input (`x_cat = None`).
-///
-/// Arena lifecycle: weights (resume-composed host image), the 12 scratch constants,
-/// and the tokenized input compose ONE init image; build/upload/scratch all
-/// bump-carve from one memset-committed slab — no per-buffer pool growth (the
-/// fresh-page commit that faults ~30-50% of fresh-process loads). The claim is ONE
-/// drain: re-arm a parked training backing when present, else claim a fresh arena;
-/// the composed image rides the adopt/claim H2D with no standalone upload, and both
-/// refusing means nothing is parked and the card cannot hold the footprint — fail
-/// clean with the numbers, no pool fallback. An `ArenaGuard` parks the slab on drop,
-/// so a normal return or an unwind through the forward parks (never frees) it for the
-/// next call to adopt. Release is ONE drain: enqueue the logits D2H (async, no wait),
-/// then the single `device_synchronize` completes it and `finish` fans the pin into
-/// preds; `Scratch` drops after this drain, so its `Drop` drains nothing.
 pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	let Some(_head) = columns.first() else {
 		return Ok(Vec::new());

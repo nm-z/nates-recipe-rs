@@ -1,20 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "search" inventory category.
-//
-// For every search-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core searchx_ kernel
-// on the LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle.
-//
-// Index-valued ops (searchsorted, bucketize, nonzero, argmax, idamax, find,
-// partition_point, ...) return i32 and are checked with EXACT equality — a float
-// tolerance would hide the off-by-one errors these ops are prone to. The few
-// genuinely host-only / structural items (ANN index build/search, LLM sampling,
-// retrieval, scipy peak prominence/width) stay in `total` as backlog, never faked
-// into `proven`.
-//
-// digitize, bucketize and searchsorted share ONE binary-search kernel but each has
-// its OWN oracle here: numpy.digitize and torch.bucketize use opposite `right`
-// senses, so collapsing them would prove the wrong convention.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeSet;
@@ -308,7 +292,6 @@ fn argrel_gpu(x: &[f64], mode: i32) -> Vec<i32> {
 // ── CPU oracles (authoritative numpy/torch/thrust/BLAS conventions) ──────────
 
 fn ora_searchsorted(a: &[f64], v: &[f64], right: bool) -> Vec<i32> {
-	// numpy: side='left' -> first i with a[i] >= key ; side='right' -> first i with a[i] > key
 	v.iter()
 		.map(|&key| {
 			let mut c = 0i32;
@@ -324,15 +307,9 @@ fn ora_searchsorted(a: &[f64], v: &[f64], right: bool) -> Vec<i32> {
 		.collect()
 }
 fn ora_digitize(x: &[f64], bins: &[f64], right: bool) -> Vec<i32> {
-	// numpy.digitize, increasing bins:
-	//   right=false -> bins[i-1] <= x < bins[i]  == searchsorted(side='right')
-	//   right=true  -> bins[i-1] <  x <= bins[i] == searchsorted(side='left')
 	ora_searchsorted(bins, x, !right)
 }
 fn ora_bucketize(x: &[f64], bnd: &[f64], right: bool) -> Vec<i32> {
-	// torch.bucketize:
-	//   right=false (default) -> lower_bound == searchsorted(side='left')
-	//   right=true            -> upper_bound == searchsorted(side='right')
 	ora_searchsorted(bnd, x, right)
 }
 fn ora_isin(a: &[f64], x: &[f64]) -> Vec<i32> {
@@ -397,7 +374,6 @@ fn ora_argmin(x: &[f64]) -> i32 {
 		.unwrap() as i32
 }
 fn ora_idamax(x: &[f64]) -> i32 {
-	// BLAS Idamax: index of first element with max |x| (0-based here).
 	let mut best = 0usize;
 	let mut bv = x[0].abs();
 	for i in 1..x.len() {
@@ -422,7 +398,6 @@ fn ora_idamin(x: &[f64]) -> i32 {
 	best as i32
 }
 fn ora_argrel(x: &[f64], mode: i32) -> Vec<i32> {
-	// scipy argrelmax/min/extrema, order=1, no boundary wrap. Returns 0/1 mask.
 	(0..x.len())
 		.map(|i| {
 			if i == 0 || i + 1 >= x.len() {
@@ -470,10 +445,6 @@ fn registered() -> BTreeSet<&'static str> {
 	.collect()
 }
 
-// Run every registered op against its oracle; return the set that PASSES and a
-// list of human-readable failures. Probes deliberately put values EXACTLY on
-// array entries so left/right tie-breaks are exercised — without ties, the whole
-// searchsorted/bucketize convention is untested.
 fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 	let mut ok: BTreeSet<&'static str> = BTreeSet::new();
 	macro_rules! pass {
@@ -486,11 +457,9 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		};
 	}
 
-	// sorted array with DUPLICATES + needles that hit boundaries exactly.
 	let a = [1.0, 3.0, 3.0, 5.0, 7.0, 9.0];
 	let v = [0.0, 1.0, 3.0, 4.0, 9.0, 10.0];
 
-	// searchsorted left (default): tie -> leftmost. e.g. v=3 -> index 1.
 	let g = searchsorted_gpu(&a, &v, 0);
 	pass!(
 		"searchsorted",
@@ -501,20 +470,17 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 			ora_searchsorted(&a, &v, false)
 		)
 	);
-	// lower_bound == searchsorted left.
 	pass!(
 		"lower_bound",
 		searchsorted_gpu(&a, &v, 0) == ora_searchsorted(&a, &v, false),
 		"lower_bound != side=left"
 	);
-	// upper_bound == searchsorted right: tie -> past the run. v=3 -> index 3.
 	let gr = searchsorted_gpu(&a, &v, 1);
 	pass!(
 		"upper_bound",
 		gr == ora_searchsorted(&a, &v, true),
 		format!("got {:?} want {:?}", gr, ora_searchsorted(&a, &v, true))
 	);
-	// The tie MUST differ between left and right at v=3 (index 2 in `v`).
 	if g[2] == gr[2] {
 		failures.push(format!(
 			"searchsorted tie not distinguished: left={} right={}",
@@ -523,10 +489,8 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		ok.remove("searchsorted");
 	}
 
-	// digitize: numpy convention, OWN oracle (right flag reversed vs side).
 	let bins = [1.0, 3.0, 5.0, 7.0, 9.0];
 	let dx = [0.5, 1.0, 3.0, 4.0, 9.0, 9.5];
-	// right=false -> searchsorted(side='right')
 	let gdf = searchsorted_gpu(&bins, &dx, 1);
 	pass!(
 		"digitize",
@@ -537,7 +501,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 			ora_digitize(&dx, &bins, false)
 		)
 	);
-	// right=true  -> searchsorted(side='left'); must differ at exact-bin ties.
 	let gdt = searchsorted_gpu(&bins, &dx, 0);
 	if gdt != ora_digitize(&dx, &bins, true) {
 		failures.push(format!(
@@ -548,10 +511,8 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		ok.remove("digitize");
 	}
 
-	// bucketize: torch convention, OWN oracle (right flag opposite sense to digitize).
 	let bnd = [1.0, 3.0, 5.0, 7.0, 9.0];
 	let bx = [0.5, 1.0, 3.0, 6.0, 9.0, 9.5];
-	// right=false (default) -> lower_bound == side='left'
 	let gbf = searchsorted_gpu(&bnd, &bx, 0);
 	pass!(
 		"bucketize",
@@ -562,7 +523,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 			ora_bucketize(&bx, &bnd, false)
 		)
 	);
-	// right=true -> upper_bound == side='right'
 	let gbt = searchsorted_gpu(&bnd, &bx, 1);
 	if gbt != ora_bucketize(&bx, &bnd, true) {
 		failures.push(format!(
@@ -572,13 +532,11 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		));
 		ok.remove("bucketize");
 	}
-	// bucketize default tie (v=3 == bnd[1]) must land at 1 (lower), not 2.
 	if gbf[2] != 1 {
 		failures.push(format!("bucketize tie v=3 got {} want 1", gbf[2]));
 		ok.remove("bucketize");
 	}
 
-	// isin / contains.
 	let hay = [2.0, 4.0, 6.0, 8.0];
 	let needles = [1.0, 2.0, 5.0, 8.0, 9.0];
 	let gi = isin_gpu(&hay, &needles);
@@ -588,7 +546,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		format!("got {:?} want {:?}", gi, ora_isin(&hay, &needles))
 	);
 
-	// nonzero / argwhere / where: compacted indices, EXACT incl. length.
 	let nz = [0.0, 5.0, 0.0, -2.0, 0.0, 0.0, 7.0];
 	let gn = nonzero_gpu(&nz);
 	pass!(
@@ -596,13 +553,11 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		gn == ora_nonzero(&nz),
 		format!("got {:?} want {:?}", gn, ora_nonzero(&nz))
 	);
-	// edge: all-zero -> empty.
 	if !nonzero_gpu(&[0.0, 0.0, 0.0]).is_empty() {
 		failures.push("nonzero all-zero not empty".into());
 		ok.remove("nonzero");
 	}
 
-	// find / find_if: first occurrence; absent -> n.
 	let fx = [4.0, 1.0, 3.0, 1.0, 2.0];
 	pass!(
 		"find",
@@ -616,7 +571,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// find_n: first run of k consecutive matches.
 	let fn_x = [1.0, 2.0, 2.0, 2.0, 1.0, 2.0, 2.0];
 	pass!(
 		"find_n",
@@ -631,14 +585,12 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// is_sorted.
 	pass!(
 		"is_sorted",
 		is_sorted_gpu(&[1.0, 2.0, 2.0, 5.0]) == 1 && is_sorted_gpu(&[1.0, 3.0, 2.0]) == 0,
 		"is_sorted wrong"
 	);
 
-	// is_sorted_until: first index breaking order; n if sorted.
 	let su = [1.0, 2.0, 5.0, 4.0, 9.0];
 	pass!(
 		"is_sorted_until",
@@ -651,7 +603,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// partition_point: first index where pred(x<pivot) is false, on partitioned data.
 	let pp = [0.0, 1.0, 2.0, 3.0, 10.0, 11.0];
 	pass!(
 		"partition_point",
@@ -663,7 +614,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// mismatch: first differing index.
 	let ma = [1.0, 2.0, 3.0, 4.0];
 	let mb = [1.0, 2.0, 9.0, 4.0];
 	pass!(
@@ -676,7 +626,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// argmax / max_element ; argmin / min_element : first-occurrence ties.
 	let ax = [2.0, 5.0, 5.0, 1.0, 1.0, 4.0];
 	pass!(
 		"argmax",
@@ -689,7 +638,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		format!("got {} want {}", argextreme_gpu(&ax, 1), ora_argmin(&ax))
 	);
 
-	// minmax_element: (argmin, argmax) in one pass.
 	let (gmn, gmx) = minmax_element_gpu(&ax);
 	pass!(
 		"minmax_element",
@@ -703,7 +651,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		)
 	);
 
-	// idamax / idamin: index of max/min ABSOLUTE value (BLAS) — distinct from argmax.
 	let dx2 = [1.0, -7.0, 3.0, -2.0, 7.0, 0.5];
 	pass!(
 		"idamax",
@@ -715,12 +662,10 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 		argextreme_gpu(&dx2, 3) == ora_idamin(&dx2),
 		format!("got {} want {}", argextreme_gpu(&dx2, 3), ora_idamin(&dx2))
 	);
-	// Proof that idamax != argmax here (|-7| ties |7| -> first; argmax picks the +7).
 	if ora_idamax(&dx2) == ora_argmax(&dx2) {
 		failures.push("idamax probe failed to distinguish from argmax".into());
 	}
 
-	// argrelmax / argrelmin / argrelextrema: strict local extrema mask, order=1.
 	let rx = [0.0, 2.0, 1.0, 3.0, 0.0, -1.0, 2.0];
 	pass!(
 		"argrelmax",
@@ -741,10 +686,6 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 	ok
 }
 
-// Canonicalize a search-category JSON name to a registry key. Strip lib prefix,
-// lowercase, take last segment; map TRUE synonyms only (e.g. max_element==argmax,
-// find_if==find, rocblas_*amax==idamax). Host-only/structural items fall through
-// to a non-registered key and remain backlog.
 fn canon(name: &str) -> String {
 	let mut base = name
 		.rsplit(['.', ':', '$'])
@@ -763,7 +704,6 @@ fn canon(name: &str) -> String {
 			base = s.to_string();
 		}
 	}
-	// BLAS index-of-max/min-abs: i{d,s,c,z}amax / amin under rocblas_/hipblas prefixes.
 	for pre in ["rocblas_", "hipblas"] {
 		if let Some(s) = base.strip_prefix(pre) {
 			base = s.to_string();
@@ -779,8 +719,6 @@ fn canon(name: &str) -> String {
 		("searchsorted", "searchsorted"),
 		("lower_bound", "lower_bound"),
 		("upper_bound", "upper_bound"),
-		// thrust/rocprim binary_search return a found-FLAG per needle (membership),
-		// not an insertion index -> that contract is isin, not lower_bound.
 		("binary_search", "isin"),
 		("digitize", "digitize"),
 		("bucketize", "bucketize"),
@@ -802,8 +740,6 @@ fn canon(name: &str) -> String {
 		("argmin", "argmin"),
 		("min_element", "argmin"),
 		("minmax_element", "minmax_element"),
-		// (idamax/idamin BLAS family handled by the prefix/suffix rules above.)
-		// signal extrema.
 		("argrelmax", "argrelmax"),
 		("argrelmin", "argrelmin"),
 		("argrelextrema", "argrelextrema"),
@@ -857,7 +793,6 @@ fn prove_search() {
 	let ok = prove_ops(&mut failures);
 	let reg = registered();
 
-	// Walk the inventory: an item is proven iff its canon maps to a passing op.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = BTreeSet::new();
@@ -898,7 +833,6 @@ fn prove_search() {
 	);
 	assert!(proven > 0, "zero search items proven");
 
-	// Every registered op must have proven at least one inventory item (no dead registrations).
 	for r in &reg {
 		assert!(
 			proven_keys.contains(*r),

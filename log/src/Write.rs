@@ -68,18 +68,11 @@ pub fn unwait() {
 		drop(write!(io::stderr(), "\u{1b}[1A\u{1b}[2K\r"));
 	}
 }
-/// # Errors
-///
-/// Always returns the [`Errored`] value built from `t`.
 #[inline]
 pub fn err(t: impl Display) -> Result<(), Errored> {
 	return Result::Err(Errored::new(t));
 }
 
-/// Fire-and-forget error report for scopes that cannot propagate (Drop impls,
-/// void callbacks, closures with frozen signatures): same `ERROR:` prefix, log,
-/// and stderr as [`err`], no `Result` to discard. `drop(Write::err(..))` is the
-/// wrong function for that job — this is the right one.
 #[inline]
 pub fn error(t: impl Display) {
 	let _reported = Errored::new(t);

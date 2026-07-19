@@ -32,8 +32,6 @@ unsafe extern "C" {
 
 pub const ROPE_THETA: f64 = 10000.0;
 
-/// # Errors
-/// Returns `HipError` when a dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_rope_qk_heads_inplace(
 	sgn: &GpuBuffer,
@@ -68,8 +66,6 @@ pub fn gpu_rope_qk_heads_inplace(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when a dimension exceeds `i32` range.
 #[inline]
 pub fn gpu_rope_qk(
 	q: &GpuBuffer,

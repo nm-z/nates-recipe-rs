@@ -1,25 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "padding" inventory category.
-//
-// For every padding-category item in kernel_inventory/*.json, canonicalize its
-// name to one of the registered pad ops; run the gpu-core paddingx_ kernel on the
-// LIVE gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle implementing
-// the textbook PyTorch/NumPy pad convention. tol 1e-7.
-//
-//   constant : OOB -> cval                 (NumPy 'constant', torch constant_pad_nd,
-//                                            tflite PAD/PADV2, StableHLO low/high pad,
-//                                            copyMakeBorder BORDER_CONSTANT; zero_pad = cval 0)
-//   reflect  : mirror WITHOUT repeating edge (NumPy 'reflect', torch reflection_pad,
-//                                            tflite MIRROR_PAD mode REFLECT)
-//   replicate: clamp to edge                (NumPy 'edge', torch replication_pad,
-//                                            BORDER_REPLICATE)
-//   circular : wrap modulo length           (NumPy 'wrap', torch circular_pad)
-//
-// One op covers all its dimensionality (1d/2d/3d) and dtype/alias variants: the
-// per-axis index convention is identical, proven on the 1D and 2D kernels here.
-// Gradient/backward items (MirrorPadGrad, *_backward) are DIFFERENT functions and
-// are dropped (noted). tflite DILATE is interior dilation, not boundary fill —
-// dropped (noted).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -316,14 +295,11 @@ fn close(a: &[f64], b: &[f64]) -> bool {
 			.all(|(g, w)| (g - w).abs() <= TOL * (1.0 + w.abs()))
 }
 
-// Prove one pad mode end-to-end on both 1D and 2D with asymmetric pads.
 fn prove_mode(mode: &str) -> bool {
-	// deterministic pseudo-random input
 	let x1: Vec<f64> = (0..7)
 		.map(|i| ((i * 31 + 5) % 17) as f64 * 0.5 - 3.0)
 		.collect();
 	let cval = 2.5;
-	// 1D: asymmetric, and a pad >= L for reflect/circular robustness
 	for &(lp, rp) in &[(3i32, 2i32), (6, 5), (0, 4)] {
 		let g = gpu_1d(mode, &x1, lp, rp, cval);
 		let o = oracle_1d(mode, &x1, lp as i64, rp as i64, cval);
@@ -332,7 +308,6 @@ fn prove_mode(mode: &str) -> bool {
 			return false;
 		}
 	}
-	// 2D: 4x5 input, asymmetric pads on all four sides
 	let (h, w) = (4i32, 5i32);
 	let x2: Vec<f64> = (0..(h * w))
 		.map(|i| ((i * 13 + 7) % 23) as f64 * 0.25 - 2.0)
@@ -350,7 +325,6 @@ fn prove_mode(mode: &str) -> bool {
 	true
 }
 
-// Canonicalize a padding-category JSON name to a registered op key, or "" to drop.
 fn canon(name: &str) -> &'static str {
 	let base = name
 		.rsplit(['.', ':', '$'])
@@ -358,33 +332,24 @@ fn canon(name: &str) -> &'static str {
 		.unwrap_or(name)
 		.to_lowercase();
 	let base = base.trim_start_matches('_');
-	// backward/grad are different functions -> drop
 	if base.contains("grad") || base.contains("backward") {
 		return "DROP_grad";
 	}
-	// tflite DILATE = interior dilation, not boundary fill -> drop
 	if base == "dilate" {
 		return "DROP_dilate";
 	}
-	// reflect / mirror family
 	if base.contains("reflection") || base.contains("mirror") {
 		return "reflect";
 	}
-	// replicate / edge family
 	if base.contains("replication") {
 		return "replicate";
 	}
-	// circular / wrap family
 	if base.contains("circular") {
 		return "circular";
 	}
-	// zero_pad = constant with 0
 	if base.contains("zero_pad") {
 		return "constant";
 	}
-	// everything else is a generic / constant pad op:
-	//   pad, padv2, constant_pad_nd, stablehlo_pad, copymakeborder,
-	//   padandstack, ipaddinglayer
 	if base.contains("pad") || base.contains("copymakeborder") {
 		return "constant";
 	}
@@ -438,7 +403,6 @@ fn prove_padding() {
 		}
 	}
 
-	// Walk inventory: each item whose canon maps to a passing registered op is proven.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

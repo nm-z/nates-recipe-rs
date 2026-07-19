@@ -54,8 +54,6 @@ unsafe extern "C" {
 	);
 }
 
-/// # Errors
-/// Returns `HipError` when `n` or `n_samples` overflows `i32`.
 #[inline]
 pub fn gpu_bootstrap_sample(
 	uniform_ws: &GpuBuffer,
@@ -80,8 +78,6 @@ pub fn gpu_bootstrap_sample(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n_features`, `k`, or `seed` overflows its target width.
 #[inline]
 pub fn gpu_feature_subset(
 	keys_ws: &GpuBuffer,
@@ -108,8 +104,6 @@ pub fn gpu_feature_subset(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n` or `seed` overflows its target width.
 #[inline]
 pub fn gpu_random_threshold_split(
 	feature_col: &GpuBuffer,
@@ -137,8 +131,6 @@ pub fn gpu_random_threshold_split(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when `n` or `n_trees` overflows `i32`.
 #[inline]
 pub fn gpu_tree_ensemble_predict(
 	bins: &GpuBuffer,
@@ -178,8 +170,6 @@ pub fn gpu_tree_ensemble_predict(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns `HipError` when the zero-fill fails or `n_samples` or `n` overflows `i32`.
 #[inline]
 pub fn gpu_oob_mask(
 	bootstrap_idx: &GpuBuffer,

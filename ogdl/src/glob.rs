@@ -215,7 +215,6 @@ fn eval_atom(a: &Atom, g: &Grid, route: bool) -> Vec<usize> {
 	};
 }
 
-/// A directional half-space view: which axis and which sign it looks toward.
 #[derive(Clone, Copy, PartialEq)]
 enum Axis {
 	Row,
@@ -300,7 +299,6 @@ fn eval_rows(g: &Grid, expr: &str) -> Result<Vec<usize>, String> {
 }
 
 impl Node {
-	/// Every node matched by `expr`, in walk order away from each anchor.
 	pub fn glob(&self, expr: &str) -> Result<Vec<&Self>, String> {
 		let g = flatten(self);
 		let rows = eval_rows(&g, expr)?;
@@ -316,7 +314,6 @@ impl Node {
 			.collect());
 	}
 
-	/// The matched lines at their native indent, document order, one per row.
 	pub fn glob_show(&self, expr: &str) -> Result<String, String> {
 		let g = flatten(self);
 		let mut rows = eval_rows(&g, expr)?;

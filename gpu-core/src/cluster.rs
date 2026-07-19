@@ -108,8 +108,6 @@ pub struct NeighborCsr {
 	pub nnz: usize,
 }
 
-/// # Errors
-/// Errors if `n` or `dim` overflows `i32`.
 #[inline]
 pub fn fixed_radius_count(
 	points: &GpuBuffer,
@@ -133,8 +131,6 @@ pub fn fixed_radius_count(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if `n` overflows `i32`.
 #[inline]
 pub fn exclusive_scan_i32(
 	count_in: &GpuBuffer,
@@ -154,8 +150,6 @@ pub fn exclusive_scan_i32(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if `n` or `dim` overflows `i32`.
 #[inline]
 pub fn fixed_radius_fill_csr(
 	points: &GpuBuffer,
@@ -181,8 +175,6 @@ pub fn fixed_radius_fill_csr(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if allocation, transfer, or a kernel launch fails.
 #[inline]
 pub fn gpu_fixed_radius_neighbors(
 	points: &GpuBuffer,
@@ -212,8 +204,6 @@ pub fn gpu_fixed_radius_neighbors(
 	});
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: parent_out is a live GpuBuffer and the node count is a checked i32.
@@ -224,8 +214,6 @@ pub fn uf_init(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn uf_hook(
 	edge_src: &GpuBuffer,
@@ -249,8 +237,6 @@ pub fn uf_hook(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: parent_out is a live GpuBuffer and the node count is a checked i32.
@@ -261,8 +247,6 @@ pub fn uf_compress(n_nodes: usize, parent_out: &GpuBuffer) -> Result<(), HipErro
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if allocation, transfer, or a kernel launch fails.
 #[inline]
 pub fn gpu_union_find_cc(
 	edge_src: &GpuBuffer,
@@ -294,8 +278,6 @@ pub struct BoruvkaResult {
 	pub total_weight: f64,
 }
 
-/// # Errors
-/// Returns [`HipError`] if the kernel launch fails.
 #[inline]
 pub fn boruvka_init(
 	n_nodes: usize,
@@ -315,8 +297,6 @@ pub fn boruvka_init(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn boruvka_min_w(
 	edge_src: &GpuBuffer,
@@ -342,8 +322,6 @@ pub fn boruvka_min_w(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn boruvka_min_e(
 	edge_src: &GpuBuffer,
@@ -371,8 +349,6 @@ pub fn boruvka_min_e(
 	return Ok(());
 }
 
-/// # Errors
-/// Returns [`HipError`] if a size argument overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn boruvka_mark(
 	best_edge: &GpuBuffer,
@@ -394,8 +370,6 @@ pub fn boruvka_mark(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if `n_edges` overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn masked_weight_sum(
 	edge_w: &GpuBuffer,
@@ -417,8 +391,6 @@ pub fn masked_weight_sum(
 	return Ok(());
 }
 
-/// # Errors
-/// Errors if a size overflows `i32`, an allocation fails, or a launch fails.
 #[inline]
 pub fn gpu_boruvka_mst(
 	edge_src: &GpuBuffer,
@@ -500,8 +472,6 @@ pub fn gpu_boruvka_mst(
 	});
 }
 
-/// # Errors
-/// Errors if `n` or `dim` overflows `i32` or the kernel launch fails.
 #[inline]
 pub fn gpu_core_distance(
 	points: &GpuBuffer,

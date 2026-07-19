@@ -1,15 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "reduction" inventory category.
-//
-// For every reduction-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core op on the LIVE
-// gfx1101 GPU and assert it matches an AUTHORITATIVE oracle (std f64 / textbook
-// definition). tol 1e-7. A proven op counts ALL its inventory variants (collapsed
-// by canon). The test FAILS on any registered-op mismatch (a real bug).
-//
-// Generic / windowed / distributed / order-statistic / segment / metric / scan /
-// warp-intrinsic items stay backlog (reported, not faked green) — see canon()'s
-// note list. Mapping any of those to a scalar op would be a false identity.
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -18,10 +7,6 @@ use std::fs;
 use std::ptr;
 
 // ── New reductionx_ launchers (scalar/2-slot out) ─────────────────────────────
-// rocprim-backed launchers follow the crate convention: the caller queries temp
-// storage with `_workspace_bytes`, allocates it, and passes (workspace, bytes).
-// argmax/argmin are self-contained (a file-scope device scalar), so they keep the
-// bare 4-arg (x, out, n, stream) shape. sumsqdev also needs a `mu` device scalar.
 unsafe extern "C" {
 	fn launch_reductionx_prod_workspace_bytes(
 		x: *const c_void,
@@ -154,7 +139,6 @@ type LaunchWs =
 	unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void, *mut c_void, usize);
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
 
-// rocprim-backed launcher: query temp size, allocate, run, return `slots` doubles.
 fn run_ws(query: Query, f: LaunchWs, x: &[f64], slots: usize) -> Vec<f64> {
 	let b = {
 		let __up = x;
@@ -185,7 +169,6 @@ fn scalar_ws(query: Query, f: LaunchWs, x: &[f64]) -> f64 {
 	run_ws(query, f, x, 1)[0]
 }
 
-// sumsqdev: Σ(x-μ)² — also needs a `mu` device scalar alongside the temp storage.
 fn sumsqdev(x: &[f64]) -> f64 {
 	let b = {
 		let __up = x;
@@ -221,7 +204,6 @@ fn sumsqdev(x: &[f64]) -> f64 {
 	out[0]
 }
 
-// Self-contained launcher (argmax/argmin): no workspace.
 fn run_slots(f: Launch, x: &[f64], slots: usize) -> Vec<f64> {
 	let b = {
 		let __up = x;
@@ -249,7 +231,6 @@ fn scalar(f: Launch, x: &[f64]) -> f64 {
 }
 
 // ── GPU op wrappers producing a single f64 result on the LIVE GPU ─────────────
-// Each closure uploads x, runs the device op, returns the finished scalar.
 fn download1(o: &GpuBuffer) -> f64 {
 	let mut out = [0.0; 1];
 	unsafe { o.download_async(&mut out, ptr::null_mut()) }.unwrap();
@@ -443,7 +424,6 @@ fn g_argmax(x: &[f64]) -> f64 {
 fn g_argmin(x: &[f64]) -> f64 {
 	scalar(launch_reductionx_argmin, x)
 }
-// iamax: index of element with largest |x| (BLAS Idamax/Isamax family). 0-based.
 fn g_iamax(x: &[f64]) -> f64 {
 	let b = {
 		let __up = x;
@@ -476,7 +456,6 @@ fn registry() -> HashMap<&'static str, Op> {
 		};
 	}
 
-	// existing ops (oracle = std f64)
 	op!("sum", g_sum, |x: &[f64]| x.iter().sum());
 	op!("mean", g_mean, |x: &[f64]| x.iter().sum::<f64>()
 		/ x.len() as f64);
@@ -496,7 +475,6 @@ fn registry() -> HashMap<&'static str, Op> {
 	op!("asum", g_asum, |x: &[f64]| x.iter().map(|v| v.abs()).sum());
 	op!("dot", g_dot, |x: &[f64]| x.iter().map(|v| v * v).sum()); // dot(x,x)
 
-	// new reductionx ops
 	op!("prod", g_prod, |x: &[f64]| x.iter().product());
 	op!("nansum", g_nansum, |x: &[f64]| x
 		.iter()
@@ -548,7 +526,6 @@ fn registry() -> HashMap<&'static str, Op> {
 		let mu = x.iter().sum::<f64>() / x.len() as f64;
 		(x.iter().map(|v| (v - mu).powi(2)).sum::<f64>() / (x.len() as f64 - 1.0)).sqrt()
 	});
-	// argmax/argmin: first-occurrence index of the global extremum, as f64
 	op!("argmax", g_argmax, |x: &[f64]| {
 		let mut bi = 0;
 		for i in 1..x.len() {
@@ -567,7 +544,6 @@ fn registry() -> HashMap<&'static str, Op> {
 		}
 		bi as f64
 	});
-	// iamax = index of max |x| (BLAS i*amax). Distinct from plain argmax.
 	op!("iamax", g_iamax, |x: &[f64]| {
 		let mut bi = 0;
 		for i in 1..x.len() {
@@ -581,10 +557,6 @@ fn registry() -> HashMap<&'static str, Op> {
 }
 
 // ── Canonicalize a reduction-category JSON name to a registry key ─────────────
-// Strips library/vendor prefixes + a BLAS dtype letter, lowercases the last
-// dotted/colon/$ segment, then maps TRUE synonyms only. Anything generic,
-// windowed, distributed, order-statistic, segmented, metric, scan, or a warp
-// intrinsic is left unmapped (backlog) — never aliased to a scalar op.
 fn canon(name: &str) -> String {
 	let mut base = name
 		.rsplit(['.', ':', '$'])
@@ -592,7 +564,6 @@ fn canon(name: &str) -> String {
 		.unwrap_or(name)
 		.to_lowercase();
 	base = base.trim_start_matches('_').to_string();
-	// vendor BLAS prefixes (longest first)
 	for p in [
 		"rocblas_",
 		"hipblaslt_",
@@ -608,7 +579,6 @@ fn canon(name: &str) -> String {
 			break;
 		}
 	}
-	// suffixed batched/strided/ex variants are a different SHAPE -> leave unmapped (backlog)
 	if base.ends_with("_batched")
 		|| base.ends_with("_strided_batched")
 		|| base.ends_with("_ex")
@@ -616,8 +586,6 @@ fn canon(name: &str) -> String {
 	{
 		return base;
 	}
-	// BLAS reduction ops carry a dtype letter (s/d/c/z/h). Strip it for an exact match.
-	// conjugate/complex dot (cdotc/zdotu/...) and i-prefixed iamax are handled BELOW (kept separate).
 	let blas_ops = ["dot", "nrm2", "asum"];
 	if base.len() >= 4 {
 		let (f, rest) = base.split_at(1);
@@ -630,7 +598,6 @@ fn canon(name: &str) -> String {
 			.to_string();
 		}
 	}
-	// bare BLAS op names
 	match base.as_str() {
 		"dot" => return "dot".into(),
 		"nrm2" => return "l2".into(),
@@ -647,7 +614,6 @@ fn canon(name: &str) -> String {
 		("miopensumforward", "sum"),
 		("cudnnreduce_add", "sum"),
 		("vector_reduce_sum", "sum"),
-		// named npp sums
 		("nppisum_8u_c1r", "sum"),
 		("nppisum_32f_c1r", "sum"),
 		// ── mean / average family ──
@@ -741,7 +707,6 @@ fn canon(name: &str) -> String {
 		("variance", "var_pop"),
 		("reduce_variance", "var_pop"),
 		// ── var family (sample: torch/cudf/pandas default ddof=1) ──
-		// torch.var / cudf::reduce::var collapse to "var" -> sample default
 		("var", "var_samp"),
 		// ── std family (population) ──
 		("std_dev", "std_pop"),
@@ -758,7 +723,6 @@ fn canon(name: &str) -> String {
 		// ── ptp ──
 		("ptp", "ptp"),
 		// ── iamax: index of max|x| (real dtypes only: d=f64, s=f32). complex i*amax/i*amin and
-		//    i*amin (no idamin fn) stay backlog. ──
 		("idamax", "iamax"),
 		("isamax", "iamax"),
 	];
@@ -806,8 +770,6 @@ fn close(a: f64, b: f64) -> bool {
 	(a - b).abs() <= TOL * (1.0 + b.abs())
 }
 
-// Per-op probe data. Several ops need shaped inputs (NaN for nansum, zeros for
-// any/all/count, unique extremum for argmax/argmin). General default otherwise.
 fn probe_for(key: &str) -> Vec<f64> {
 	match key {
 		"nansum" => vec![1.0, f64::NAN, 3.0, f64::NAN, 5.5, -2.0],
@@ -828,7 +790,6 @@ fn prove_reduction() {
 	assert!(!items.is_empty(), "no reduction items in inventory");
 	let reg = registry();
 
-	// Prove each registered op against its oracle on the LIVE GPU.
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
 	let mut failures: Vec<String> = Vec::new();
 	for (k, op) in reg.iter() {
@@ -842,7 +803,6 @@ fn prove_reduction() {
 		op_ok.insert(*k, ok);
 	}
 
-	// Extra defining-edge checks: any/all must exercise BOTH outcomes.
 	{
 		let all_zero = g_any(&[0.0, 0.0, 0.0]);
 		if all_zero != 0.0 {
@@ -854,7 +814,6 @@ fn prove_reduction() {
 		}
 	}
 
-	// Walk inventory: item proven iff its canon maps to a passing registered op.
 	let total = items.len();
 	let mut proven = 0usize;
 	let mut proven_keys: BTreeSet<String> = Default::default();

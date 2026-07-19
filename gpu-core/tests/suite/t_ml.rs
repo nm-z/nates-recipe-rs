@@ -44,9 +44,6 @@ fn test_rl_discounted_returns() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// G[2] = 1.0
-	// G[1] = 1.0 + 0.5 * 1.0 = 1.5
-	// G[0] = 1.0 + 0.5 * 1.5 = 1.75
 	assert!(
 		(result[0] - 1.75).abs() < EPS,
 		"G[0]={} expected 1.75",
@@ -67,7 +64,6 @@ fn test_rl_discounted_returns() {
 
 #[test]
 fn test_rl_gae() {
-	// Simple 3-step case: r=[1,1,1], v=[1,1,1], gamma=0.9, lam=0.95
 	let rewards = {
 		let __up = &[1.0_f64, 1.0, 1.0];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -100,15 +96,6 @@ fn test_rl_gae() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// Hand compute:
-	// delta[t] = r[t] + gamma * v[t+1] - v[t]   (v[3]=0)
-	// delta[2] = 1 + 0.9*0 - 1 = 0
-	// delta[1] = 1 + 0.9*1 - 1 = 0.9
-	// delta[0] = 1 + 0.9*1 - 1 = 0.9
-	// A[t] = delta[t] + gamma*lam*A[t+1]
-	// A[2] = 0
-	// A[1] = 0.9 + 0.9*0.95*0 = 0.9
-	// A[0] = 0.9 + 0.9*0.95*0.9 = 0.9 + 0.7695 = 1.6695
 	let exp_a2 = 0.0_f64;
 	let exp_a1 = 0.9_f64;
 	let exp_a0 = 0.9 + gamma * lam * exp_a1;
@@ -125,7 +112,6 @@ fn test_rl_gae() {
 
 #[test]
 fn test_rl_td_targets() {
-	// r=[1,2,3], v_next=[4,5,6], done=[0,1,0], gamma=0.99
 	let rewards = {
 		let __up = &[1.0_f64, 2.0, 3.0];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -156,9 +142,6 @@ fn test_rl_td_targets() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// t[0] = 1 + 0.99*4*(1-0) = 1 + 3.96 = 4.96
-	// t[1] = 2 + 0.99*5*(1-1) = 2
-	// t[2] = 3 + 0.99*6*(1-0) = 3 + 5.94 = 8.94
 	let exp = [4.96_f64, 2.0, 8.94];
 	for i in 0..3 {
 		assert!(
@@ -174,9 +157,6 @@ fn test_rl_td_targets() {
 
 #[test]
 fn test_rl_categorical_logprob() {
-	// n=1, n_actions=3, logits=[0,1,2], action=2
-	// softmax: exp([0,1,2])/sum = [1, e, e^2] / (1+e+e^2)
-	// log_softmax[2] = 2 - log(1 + e + e^2)
 	let logits = {
 		let __up = &[0.0_f64, 1.0, 2.0];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -211,8 +191,6 @@ fn test_rl_categorical_logprob() {
 
 #[test]
 fn test_rl_gaussian_logprob() {
-	// n=1, dim=1, mu=0, log_std=0 (sigma=1), action=1.0
-	// logp = -0.5*(1)^2 - 0 - 0.5*log(2*pi)
 	let mu = {
 		let __up = &[0.0_f64];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -257,9 +235,6 @@ fn test_rl_gaussian_logprob() {
 
 #[test]
 fn test_bayes_nb_feature_log_prob() {
-	// 2 classes, 3 features. counts:
-	// class 0: [1, 2, 3]  sum=6, alpha=1 -> smoothed: [2,3,4]/9
-	// class 1: [4, 5, 6]  sum=15, alpha=1 -> smoothed: [5,6,7]/18
 	let counts = {
 		let __up = &[
 			1.0_f64, 2.0, 3.0, // class 0
@@ -281,14 +256,12 @@ fn test_bayes_nb_feature_log_prob() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// class 0: log([2,3,4]) - log(9)
 	let log9 = 9.0_f64.ln();
 	let exp_c0 = [
 		2.0_f64.ln() - log9,
 		3.0_f64.ln() - log9,
 		4.0_f64.ln() - log9,
 	];
-	// class 1: log([5,6,7]) - log(18)
 	let log18 = 18.0_f64.ln();
 	let exp_c1 = [
 		5.0_f64.ln() - log18,
@@ -321,9 +294,6 @@ fn test_bayes_nb_feature_log_prob() {
 
 #[test]
 fn test_bayes_nb_count_table() {
-	// n=3, n_features=2, n_classes=2
-	// x_counts: [[1,0],[0,1],[1,1]], y=[0,1,0]
-	// expected count_table: class0=[2,1], class1=[0,1]
 	let x = {
 		let __up = &[1.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -341,7 +311,6 @@ fn test_bayes_nb_count_table() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// row-major: class0=[result[0],result[1]], class1=[result[2],result[3]]
 	assert!((result[0] - 2.0).abs() < 1e-9, "c0f0={}", result[0]);
 	assert!((result[1] - 1.0).abs() < 1e-9, "c0f1={}", result[1]);
 	assert!((result[2] - 0.0).abs() < 1e-9, "c1f0={}", result[2]);
@@ -351,12 +320,6 @@ fn test_bayes_nb_count_table() {
 
 #[test]
 fn test_bayes_multinomial_nb_logprob() {
-	// 1 sample, 2 features, 2 classes
-	// log_prior=[log(0.5),log(0.5)]
-	// feature_log_prob: class0=[log(0.3),log(0.7)], class1=[log(0.6),log(0.4)]
-	// x=[1,1]
-	// out[0] = log(0.5) + 1*log(0.3) + 1*log(0.7)
-	// out[1] = log(0.5) + 1*log(0.6) + 1*log(0.4)
 	let log_prior = {
 		let __up = &[0.5_f64.ln(), 0.5_f64.ln()];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -407,14 +370,6 @@ fn test_bayes_multinomial_nb_logprob() {
 
 #[test]
 fn test_bayes_bernoulli_nb_logprob() {
-	// 1 sample, 2 features, 2 classes
-	// log_p: class0=[log(0.3),log(0.7)], class1=[log(0.6),log(0.4)]
-	// log_neg: class0=[log(0.7),log(0.3)], class1=[log(0.4),log(0.6)]
-	// x=[1,0] (binary)
-	// out[0] = log_prior[0] + 1*log(0.3) + 0*log(0.7) + 0*log(0.7) + 1*log(0.3)
-	//        = log_prior[0] + log(0.3) + log(0.3)
-	// out[1] = log_prior[1] + 1*log(0.6) + 0*log(0.4) + 0*log(0.4) + 1*log(0.6)
-	//        = log_prior[1] + log(0.6) + log(0.6)
 	let log_prior = {
 		let __up = &[0.5_f64.ln(), 0.5_f64.ln()];
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -445,7 +400,6 @@ fn test_bayes_bernoulli_nb_logprob() {
 	unsafe { out.download_async(&mut result, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
 
-	// x=[1,0]: feat0 present (use log_p[c,0]), feat1 absent (use log_neg[c,1])
 	let exp0 = 0.5_f64.ln() + 0.3_f64.ln() + 0.3_f64.ln();
 	let exp1 = 0.5_f64.ln() + 0.6_f64.ln() + 0.6_f64.ln();
 	assert!(result[0].is_finite(), "bernoulli logprob[0] not finite");
@@ -475,7 +429,6 @@ fn test_forest_bootstrap_sample() {
 	gpu_rand_uniform_into(42, n_samples, &uniform_ws).unwrap();
 	let buf = GpuBuffer::alloc_bytes(n_samples * mem::size_of::<i32>()).unwrap();
 	gpu_bootstrap_sample(&uniform_ws, n, n_samples, 42, &buf).unwrap();
-	// buf.len() is bytes = n_samples * 4
 	assert_eq!(buf.len(), n_samples * 4, "wrong byte length");
 	let mut idx = vec![0_i32; n_samples];
 	buf.download_i32(&mut idx).unwrap();
@@ -492,11 +445,8 @@ fn test_forest_feature_subset() {
 	let keys_ws = GpuBuffer::alloc(n_features).unwrap();
 	let buf = GpuBuffer::alloc_bytes(n_features * mem::size_of::<i32>()).unwrap();
 	gpu_feature_subset(&keys_ws, n_features, k, 7, &buf).unwrap();
-	// buf is alloc_bytes(n_features * 4) — always returns n_features indices sorted by key
-	// the first k are the selected subset
 	let mut all_idx = vec![0_i32; n_features];
 	buf.download_i32(&mut all_idx).unwrap();
-	// First k indices must be in [0, n_features)
 	for i in 0..k {
 		assert!(
 			all_idx[i] >= 0 && all_idx[i] < n_features as i32,
@@ -505,7 +455,6 @@ fn test_forest_feature_subset() {
 			all_idx[i]
 		);
 	}
-	// Check first k are distinct
 	let subset: HashSet<i32> = all_idx[..k].iter().cloned().collect();
 	assert_eq!(
 		subset.len(),
@@ -549,19 +498,15 @@ fn test_forest_random_threshold_split() {
 
 #[test]
 fn test_forest_oob_mask() {
-	// n=6, bootstrap picks indices [0,1,2,3] (4 samples)
-	// OOB should be indices 4 and 5 (never sampled)
 	let bootstrap = [0_i32, 1, 2, 3];
 	let n = 6_usize;
 	let bs_buf = GpuBuffer::upload_i32(&bootstrap).unwrap();
 	let used_ws = GpuBuffer::alloc_bytes(n).unwrap();
 	let mask_buf = GpuBuffer::alloc_bytes(n).unwrap();
 	gpu_oob_mask(&bs_buf, &used_ws, bootstrap.len(), n, &mask_buf).unwrap();
-	// mask_buf is zeros_bytes(n) -> u8 array of length n bytes
 	let mut mask = vec![0_u8; n];
 	mask_buf.download_u8(&mut mask).unwrap();
 
-	// Indices 0..3 are in bootstrap -> oob=0; indices 4,5 not in bootstrap -> oob=1
 	for i in 0..4 {
 		assert_eq!(mask[i], 0, "oob[{}] should be 0 (was sampled)", i);
 	}
@@ -609,7 +554,6 @@ fn test_catboost_random_permutation() {
 	let mut perm = vec![0_i32; n];
 	buf.download_i32(&mut perm).unwrap();
 
-	// Valid permutation: sort and check 0..n
 	let mut sorted = perm.clone();
 	sorted.sort();
 	for (i, &v) in sorted.iter().enumerate() {
@@ -624,17 +568,6 @@ fn test_catboost_random_permutation() {
 
 #[test]
 fn test_catboost_ordered_target_stats() {
-	// Simple 4-row case, 2 categories (0,1), prior=0, smoothing=1
-	// cat_col:  [0, 1, 0, 1]
-	// target:   [10, 20, 30, 40]
-	// perm:     [0, 1, 2, 3]   (identity permutation)
-	//
-	// Walk:
-	//   p=0, row=0, cat=0: sum=0,cnt=0 -> TS=(0+0*1)/(0+1)=0.  after: sum[0]=10,cnt[0]=1
-	//   p=1, row=1, cat=1: sum=0,cnt=0 -> TS=(0+0*1)/(0+1)=0.  after: sum[1]=20,cnt[1]=1
-	//   p=2, row=2, cat=0: sum=10,cnt=1-> TS=(10+0)/(1+1)=5.   after: sum[0]=40,cnt[0]=2
-	//   p=3, row=3, cat=1: sum=20,cnt=1-> TS=(20+0)/(1+1)=10.  after: sum[1]=60,cnt[1]=2
-	// encoded_out = [0, 0, 5, 10] (indexed by original row)
 	let cat_col = GpuBuffer::upload_i32(&[0_i32, 1, 0, 1]).unwrap();
 	let target = {
 		let __up = &[10.0_f64, 20.0, 30.0, 40.0];

@@ -25,27 +25,20 @@ use gpu_core::memory::GpuBuffer;
 use std::cmp;
 use std::collections::BTreeMap;
 
-/// Norm applied at block boundaries.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum NormK {
 	Rms,
 	Layer,
 }
 
-/// Feed-forward composition.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Ffn {
-	/// SwiGLU: `down(silu(gate(x)) * up(x))`.
 	SiluGate,
-	/// GeGLU: `down(gelu(gate(x)) * up(x))`.
 	GeluGate,
-	/// Sequential GELU MLP: `down(gelu(up(x)))`, no gate.
 	GeluSeq,
-	/// Sequential ReLU^2 MLP: `down(relu(up(x))^2)`, no gate.
 	ReluSqrSeq,
 }
 
-/// The 1:1 composition recipe for one architecture's decoder block.
 #[derive(Clone, Copy)]
 pub(super) struct Spec {
 	pub norm: NormK,
@@ -53,39 +46,23 @@ pub(super) struct Spec {
 	pub post_attn: bool,
 	pub post_ffn: bool,
 	pub parallel: bool,
-	/// False for post-norm archs (olmo2/exaone4): attention reads the raw block
-	/// input (no pre-attention norm) and the FFN reads the post-attn residual
-	/// directly (no pre-FFN norm); the norms live at the post positions instead.
 	pub pre_norm: bool,
-	/// Block norms carry no gamma/beta tensors (olmo): every boundary norm runs
-	/// non-parametric (mean-center + unit scale), never demanding a weight.
 	pub nonparam: bool,
-	/// A second block-input norm (`attn_norm_2`) feeds the attention branch while
-	/// the first (`input`) feeds the parallel FFN branch (falcon-40B).
 	pub second_attn_norm: bool,
 	pub attn_bias: bool,
 	pub o_bias: bool,
 	pub ffn_bias: bool,
 	pub out_bias: bool,
-	/// Scale the final logits by `{arch}.logit_scale` (command-r, cohere).
 	pub logit_scale: bool,
 	pub alibi: bool,
 	pub emb_sqrt_ne: bool,
 	pub emb_scale_kv: bool,
-	/// A hardcoded input-embedding scale the arch's graph applies as a literal
-	/// constant (minicpm3 `scale_embd=12`); `1.0` means no constant scale.
 	pub emb_scale_const: f64,
-	/// talkie: a non-parametric RMS of the initial embedding is retained and added
-	/// (scaled by each layer's `layer_output_scale`) to every layer's output. Drives
-	/// the decode-loop embed prenorm + stash and the [`layer_talkie`] skip residual.
 	pub embd_skip: bool,
 	pub residual_scale: bool,
 	pub final_softcap: bool,
 	pub bidir: bool,
 	pub rope: bool,
-	/// Multi-head Latent Attention (deepseek2 family): the attention branch reads
-	/// latent q/kv projections instead of plain q/k/v, so [`attn_block`] delegates
-	/// to [`mla_attn_block`]. The FFN branch is unaffected.
 	pub mla: bool,
 	pub ffn: Ffn,
 }
@@ -216,67 +193,26 @@ impl Spec {
 	}
 }
 
-/// Which selective-SSM mixer a hybrid arch's recurrent layers use.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Recur {
-	/// Mamba-1 body (`ssm_x` low-rank split, `ssm_dt` up-projection, optional
-	/// dt/B/C RMSNorm), shared with jamba.
 	Mamba1,
-	/// Mamba-2 grouped-SSD body (fused `in_proj`, conv-carried B/C, per-head
-	/// scalar A/D, grouped gated RMSNorm), shared with falcon-h1, granitehybrid,
-	/// nemotron_h.
 	Mamba2,
-	/// plamo2 mixer: mamba-2 head structure (per-head scalar A/D) with mamba-1
-	/// projections (`ssm_x` -> B/C/dt, `ssm_dt` up-projection), always-on dt/B/C
-	/// RMSNorm, no grouped gated norm, no conv bias, and a per-head-interleaved
-	/// z/x split of `in_proj`.
 	Plamo2,
-	/// Gated Delta-Net (GDA) linear-attention mixer (qwen3.5/next/moe): q/k/v/z
-	/// projections, causal short conv + SiLU, per-head L2-normed q/k, a per-head
-	/// scalar log-decay, the delta-rule scan, and a SiLU(z)-gated RMSNorm output.
 	GatedDelta,
-	/// Kimi Delta-Attention (KDA) mixer (kimi-linear): separate q/k/v projections
-	/// each with its own causal conv, a per-CHANNEL log-decay LoRA, the delta-rule
-	/// scan, and a sigmoid(`g_b(g_a(x))`)-gated RMSNorm output.
 	Kda,
-	/// lfm2 gated short-convolution mixer: operator-norm, `in_proj` split into
-	/// `B`/`C`/`x`, the `B*x` pre-conv gate, a causal depthwise conv, the `C*conv`
-	/// post-conv gate, and `out_proj`.
 	ShortConv,
 }
 
-/// How a hybrid arch lays out its per-layer blocks.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum HyMode {
-	/// jamba, granitehybrid: each layer is a mixer sub-block (recurrent OR
-	/// attention, chosen per layer) followed by an FFN sub-block, two residuals.
 	MixerFfn,
-	/// falcon-h1: every layer runs the attention AND mamba-2 branches on the same
-	/// normed input, sums them, adds the residual, then an FFN sub-block.
 	Parallel,
-	/// nemotron_h: each layer is EXACTLY ONE body (mamba-2, attention, or FFN),
-	/// one residual; the triage is by tensor presence.
 	Triage,
-	/// plamo2: sandwich norms wrap both halves. Pre-norm, mixer, post-norm, then a
-	/// residual; then pre-ff-norm, SwiGLU FFN, post-ff-norm, then a residual.
 	Sandwich,
-	/// qwen3.5/next/moe, kimi-linear: each layer runs one mixer (delta recurrent
-	/// OR full attention, chosen by conv-tensor presence) writing its projected
-	/// output, adds the block residual, then a `pre_ff`-normed FFN sub-block (dense
-	/// SwiGLU or MoE + shared expert) with its own residual.
 	DeltaNet,
-	/// lfm2/lfm2moe: each layer runs one mixer (short-conv recurrent OR SWA
-	/// attention, chosen by shortconv-tensor presence) on the operator-normed input,
-	/// adds the block residual, then an `ffn_norm`-normed FFN sub-block (dense SwiGLU
-	/// or sigmoid-gated MoE) with its own residual.
 	ShortConv,
 }
 
-/// A per-layer attention/recurrent-interleaving composition. `sp` drives both the
-/// attention branch (rope/bias/qk-norm/o-bias) and the FFN branch (activation +
-/// bias); `recur` picks the SSM mixer for recurrent layers; `mode` the block
-/// layout. Per-layer routing is by tensor presence (`ssm_in` vs `q_proj`), the
-/// honest signal for which mixer a block carries.
 #[derive(Clone, Copy)]
 pub(super) struct Hy {
 	pub recur: Recur,
@@ -284,19 +220,12 @@ pub(super) struct Hy {
 	pub mode: HyMode,
 }
 
-/// The named norm weight for layer `l`, or an error carrying the arch and the
-/// missing key (a mapping gap must fail that model's row, never panic a sweep).
 fn norm_of<'m>(m: &'m Model, l: usize, key: Nk) -> Result<&'m GpuBuffer> {
 	m.norms[l][key as usize]
 		.as_ref()
 		.ok_or_else(|| anyhow!("{}: layer {l} has no {:?} norm weight", m.hp.arch, key.name()))
 }
 
-/// The one norm primitive every arch composes from, mirroring llama.cpp
-/// `build_norm(x, gamma_or_null, beta_or_null, kind)`: RMSNorm (mean-free) or true
-/// LayerNorm (mean-centered), each with `gamma`/`beta` present or absent. `None`
-/// gamma is the non-parametric case; a present gamma with `None` beta is the
-/// gamma-only affine. No per-arch code decides the shape, only these two `Option`s.
 pub(super) fn apply_norm(
 	kind: NormK,
 	gamma: Option<&GpuBuffer>,
@@ -317,10 +246,6 @@ pub(super) fn apply_norm(
 	return Ok(());
 }
 
-/// A block boundary norm dispatched by [`Spec::norm`]. Gamma is the per-layer norm
-/// weight, absent when [`Spec::nonparam`] (non-parametric norm, olmo); beta is
-/// looked up presence-wise from the parallel per-layer store (gamma-only when
-/// absent, command-r/dbrx), keeping the loader arch-agnostic.
 fn blk_norm(
 	m: &Model,
 	sp: &Spec,
@@ -340,19 +265,14 @@ fn blk_norm(
 	return apply_norm(sp.norm, gamma, beta, &m.eps, rows, cols, x, out);
 }
 
-/// This layer's recurrent state buffer — variant-checked by [`crate::llm::LayerCache`],
-/// so a scan mixer on a non-scan layer is a loud structural error, never a recompute.
 fn rec_of<'a>(dec: &DecCtx<'a>) -> Result<&'a GpuBuffer> {
 	return dec.state.rec();
 }
 
-/// The `(read, write)` conv-window buffers for conv `i` of this layer's mixer.
 fn conv_io<'a>(dec: &DecCtx<'a>, i: usize) -> Result<(&'a GpuBuffer, &'a GpuBuffer)> {
 	return dec.state.conv_io(i);
 }
 
-/// NeoX RoPE with optional LongRoPE factors AND a position base, so a cached decode
-/// rotates the NEW rows at their true absolute positions (`pos_base = cached`).
 fn rope_maybe_factors_pos(
 	theta: &GpuBuffer,
 	factors: Option<&GpuBuffer>,
@@ -370,16 +290,6 @@ fn rope_maybe_factors_pos(
 	return Ok(());
 }
 
-/// The ONE attention walk every GQA site resolves through: append the new K/V
-/// into the resident window, then walk the whole causal range in ASCENDING
-/// absolute-key order — host-tier segments `[0, win_base)` staged back in
-/// first, then the resident window — carrying the online-softmax `(m, l, acc)`
-/// across launches and normalizing only on the last. A fully-resident cache is
-/// the `win_base == 0` case: the host loop never runs and the resident launch
-/// covers everything — the SAME code path, not a branch. By the flash carry
-/// contract the walk is BIT-IDENTICAL to one launch over the full contiguous
-/// cache. `kd`/`vd` are the cache's per-row K/V widths (equal everywhere
-/// except minicpm3's naive MLA).
 fn cached_gqa(
 	d: &DecCtx,
 	ar: &Arena,
@@ -426,8 +336,6 @@ fn cached_gqa(
 	return Ok(());
 }
 
-/// [`cached_gqa`]'s MLA twin (asymmetric widths: `kw` latent+pe keys, `kvlr`
-/// latent values; always causal), shared by the absorbed deepseek2 and kimi blocks.
 fn cached_mla(
 	d: &DecCtx,
 	ar: &Arena,
@@ -468,9 +376,6 @@ fn cached_mla(
 	)?;
 	return Ok(());
 }
-/// Attention sub-block shared by the dense and MoE drivers: pre-norm, Q/K/V
-/// projection (optional per-head Q/K RMSNorm), RoPE, scaled GQA, output
-/// projection (optional post-attn norm), residual into `ar.attn_out`.
 fn attn_block(
 	m: &Model,
 	l: usize,
@@ -523,7 +428,6 @@ fn attn_block(
 		ne,
 		&ar.v,
 	)?;
-	// the F32 reference applies o_proj/ffn biases but not q/k/v (qwen2/phi2/lfm2/talkie regress with them, finding 20), so attn_bias stays a no-op
 	let _ = sp.attn_bias;
 	if sp.qk_norm {
 		gpu_rmsnorm_f64(&ar.q, norm_of(m, l, Nk::QNorm)?, &m.eps, t * nqh, hd, &ar.q)?;
@@ -560,15 +464,6 @@ fn attn_block(
 	Ok(())
 }
 
-/// Multi-head Latent Attention block (deepseek2 family), the absorbed MLA graph
-/// of `llama.cpp` `build_deepseek2` for `n_head == 1`. Q rides the q_lora
-/// bottleneck (`q_a` -> RMSNorm -> `q_b`) then splits per head into a nope part and
-/// a RoPE part; the nope part is absorbed into the kv latent by `k_b` and
-/// concatenated with the roped q_pe to form Qcur. K/V ride the kv_lora bottleneck
-/// (`kv_a`) split into the latent (RMSNorm'd -> Vcur, also Kcur's nope half) and the
-/// shared roped k_pe. MQA attention over `kv_lora+rope` keys and `kv_lora` values
-/// then decompresses through `v_b` and projects out through `o_proj`; residual into
-/// `ar.attn_out`.
 fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
@@ -585,7 +480,6 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 	gpu_gemm_bt_f64(&ar.x, &m.stream(&layer_name(l, "self_attn.q_a_proj.weight"))?, t, qlr, ne, &ar.mqa)?;
 	gpu_rmsnorm_f64(&ar.mqa, norm_of(m, l, Nk::QANorm)?, &m.eps, t, qlr, &ar.mqa)?;
 	gpu_gemm_bt_f64(&ar.mqa, &m.stream(&layer_name(l, "self_attn.q_b_proj.weight"))?, t, nqh * hdk, qlr, &ar.mqb)?;
-	// RoPE the tail rope sub-dim of every head in place (view at the nope offset).
 	let qpe_view = ar.mqb.view(nope, t * nqh * hdk - nope);
 	gpu_rope_partial_pos(theta, t * nqh, hdk, rot, nqh, pos_base, &qpe_view)?;
 	gpu_slice_lead_into(&ar.mqb, t * nqh, hdk, nope, &ar.mqn)?;
@@ -608,13 +502,6 @@ fn mla_attn_block(m: &Model, l: usize, sp: &Spec, h_in: &GpuBuffer, t: usize, ar
 }
 
 
-/// The minicpm3 decoder block (minicpm3.cpp:91-238): a naive (non-absorbed)
-/// Multi-head Latent Attention with per-head RoPE'd query and one shared RoPE'd
-/// key replicated across the query heads, LongRoPE per-pair frequency factors, and
-/// the minicpm depth-scaled residual (both the attn and FFN outputs scaled by
-/// `scale_depth/sqrt(n_layer)` via `m.res_scale`). The input embedding is pre-scaled
-/// by `scale_embd` in the decode loop. Requires the zero-nope head geometry
-/// (`n_embd_head_k == n_rot`, the fixture's shape); a nonzero nope split fails clean.
 pub(super) fn layer_minicpm3(
 	m: &Model,
 	l: usize,
@@ -669,8 +556,6 @@ pub(super) fn layer_minicpm3(
 	return Ok(());
 }
 
-/// Parameterized dense-attention decoder block: attention, residual, FFN
-/// (gated SwiGLU/GeGLU or sequential GELU/ReLU^2), residual.
 pub(super) fn layer_spec(
 	m: &Model,
 	l: usize,
@@ -703,13 +588,6 @@ pub(super) fn layer_spec(
 	Ok(())
 }
 
-/// The talkie decoder block (talkie.cpp:64-129). Every block norm is
-/// non-parametric RMS; the attention applies RoPE first, then an asymmetric
-/// post-rope qk-norm (Q: non-parametric RMS over head_dim then a per-head scalar
-/// gain; K: non-parametric RMS, no gain); the FFN is a non-parametric-normed
-/// SwiGLU; and the frozen non-parametric-normed initial embedding (`ar.embd_skip`,
-/// stashed once by the decode loop) is added to every layer output scaled by that
-/// layer's `layer_output_scale` scalar.
 pub(super) fn layer_talkie(
 	m: &Model,
 	l: usize,
@@ -752,7 +630,6 @@ pub(super) fn layer_talkie(
 	return Ok(());
 }
 
-/// Dense FFN composition selected by `sp.ffn`, `cms` (normed input) -> `ar.mlp0`.
 fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) -> Result<()> {
 	let hp = &m.hp;
 	let (ne, nff) = (hp.ne, hp.dims[l].nff);
@@ -822,10 +699,6 @@ fn ffn(m: &Model, l: usize, sp: &Spec, t: usize, ar: &Arena, cms: &GpuBuffer) ->
 	Ok(())
 }
 
-/// Mixture-of-experts decoder block: shared attention, then a softmax router
-/// selecting the top-`used` of `nexp` experts per token, each a SiLU SwiGLU on
-/// the packed `expert_slot` weights, combined by routing weight. Composes the
-/// shared kernels 1:1 with `build_moe_ffn` (LLM_FFN_SILU).
 pub(super) fn layer_moe(
 	m: &Model,
 	l: usize,
@@ -848,13 +721,6 @@ pub(super) fn layer_moe(
 	Ok(())
 }
 
-/// Linear-attention / state-space decoder block for the recurrent families
-/// (Mamba, RWKV, gated delta-net hybrids). Composes the sequence mixer as a
-/// gated linear recurrence over the sequence via [`gpu_scan_linear_recurrence`]
-/// (the diagonal decay scan the SSM/WKV/delta families reduce to at decode) over
-/// the SiLU-gated K and the V projection, then the SiLU SwiGLU FFN. Structural
-/// composition of the `build_*` graph; per-family decay parameterization is
-/// refined per arch. The Q projection is computed but not consumed by the scan.
 pub(super) fn layer_recurrent(
 	m: &Model,
 	l: usize,
@@ -913,8 +779,6 @@ pub(super) fn layer_recurrent(
 	Ok(())
 }
 
-/// The named per-layer SSM parameter buffer for layer `l`, or an error naming
-/// the missing tensor (a load gap fails that model's row, never panics a sweep).
 fn ssm_of<'m>(
 	buf: &'m [Option<GpuBuffer>],
 	l: usize,
@@ -926,13 +790,6 @@ fn ssm_of<'m>(
 		.ok_or_else(|| anyhow!("{arch}: layer {l} has no {name} SSM tensor"))
 }
 
-/// Mamba-1 selective-SSM decoder block (llama.cpp mamba-base.cpp:7-147): block
-/// pre-norm, `in_proj` split into `x`/`z`, causal depthwise conv + SiLU on `x`,
-/// the `ssm_x` low-rank projection split into `dt`/`B`/`C`, the `ssm_dt`
-/// up-projection with bias, the fused selective scan (softplus/exp/B/C/D folded
-/// in [`gpu_ssm_scan_mamba1`]), the `SiLU(z)` gate, `out_proj`, and the residual.
-/// No FFN and no attention: the block IS the mixer. All scratch is arena-resident,
-/// so the decode loop allocates nothing.
 pub(super) fn layer_mamba(
 	m: &Model,
 	l: usize,
@@ -947,12 +804,6 @@ pub(super) fn layer_mamba(
 	return Ok(());
 }
 
-/// The mamba-1 mixer body: block pre-norm through `out_proj`, writing the
-/// projected output to `out` WITHOUT the block residual (the caller adds it).
-/// The optional dt/B/C RMSNorm (jamba, plamo2) applies to the low-rank
-/// `dt`/`B`/`C` by presence, before the `ssm_dt` up-projection, matching
-/// `llama.cpp` mamba-base.cpp:97-101; a plain mamba layer ships none and runs
-/// the identical numeric path it did before.
 fn mamba1_mix(
 	m: &Model,
 	l: usize,
@@ -1021,14 +872,6 @@ fn mamba1_mix(
 	return Ok(());
 }
 
-/// Mamba-2 grouped-SSM (SSD) decoder block (llama.cpp mamba-base.cpp:149-288):
-/// block pre-norm, one `in_proj` split into `z`/`xBC`/`dt`, a causal depthwise
-/// conv + SiLU over the WHOLE `xBC` (conv_dim = d_inner + 2*n_group*d_state), the
-/// per-head dt bias, the fused grouped selective scan (per-head scalar `A`/`D`,
-/// per-group `B`/`C` read out of the conv output by offset, D skip folded in),
-/// the `SiLU(z)` gate, the grouped gated RMSNorm (gate THEN norm), `out_proj`,
-/// and the residual. No dt/x projections (dt rides `in_proj`, B/C ride the conv);
-/// no FFN and no attention. All scratch is arena-resident.
 pub(super) fn layer_mamba2(
 	m: &Model,
 	l: usize,
@@ -1043,10 +886,6 @@ pub(super) fn layer_mamba2(
 	return Ok(());
 }
 
-/// The mamba-2 mixer body: block pre-norm through `out_proj`, writing the
-/// projected output to `out` WITHOUT the block residual (the caller adds it).
-/// Shared verbatim by the mamba-2 hybrids (falcon-h1, granitehybrid,
-/// nemotron_h) and the pure `mamba2` arch.
 fn mamba2_mix(
 	m: &Model,
 	l: usize,
@@ -1101,11 +940,6 @@ fn mamba2_mix(
 	return Ok(());
 }
 
-/// De-interleaves one of the two per-head sub-vectors from a `[t, 2*head_dim*
-/// n_head]` tensor whose per-head layout is `[first_half | second_half]`, into a
-/// contiguous `[t, head_dim*n_head]` `out`. `within_off` selects the half (`0`
-/// for the first, `head_dim` for the second). `sa`/`sb` are `[t, d_inner]`
-/// scratch. plamo2's `in_proj` output splits `z`/`x` this way (plamo2.cpp:293-310).
 fn deinterleave_heads(
 	zx: &GpuBuffer,
 	t: usize,
@@ -1126,12 +960,6 @@ fn deinterleave_heads(
 	return Ok(());
 }
 
-/// The plamo2 mixer body (plamo2.cpp:258-426), writing `out_proj` to `out`
-/// without the block residual. mamba-2 head scan (per-head scalar A/D, single
-/// shared B/C) fed by mamba-1 front-end projections: per-head z/x de-interleave
-/// of `in_proj`, causal conv + SiLU (no bias), `ssm_x` -> `[B|C|dt]`, always-on
-/// dt/B/C RMSNorm, `ssm_dt` up-projection, then the packed grouped scan reused
-/// from mamba-2 (`n_group == 1`). No grouped gated RMSNorm.
 fn plamo2_mix(
 	m: &Model,
 	l: usize,
@@ -1198,10 +1026,6 @@ fn plamo2_mix(
 	return Ok(());
 }
 
-/// The plamo2 attention body (plamo2.cpp:203-256): pre-norm, fused-QKV split
-/// (via [`synth_qkv_slices`]), per-head Q/K RMSNorm (per-`(head,dim)` gamma),
-/// RoPE, GQA, `o_proj`. Writes the projection to `out` without the block
-/// residual (the sandwich wrapper adds it). No output bias.
 fn plamo2_attn(
 	m: &Model,
 	l: usize,
@@ -1234,26 +1058,15 @@ fn plamo2_attn(
 	return Ok(());
 }
 
-/// True if layer `l` carries a recurrent SSM mixer (its `ssm_in` projection is
-/// present) rather than attention: the honest per-layer interleave signal, the
-/// same discriminator `llama.cpp` derives from `n_head_kv(l)==0`.
 pub(super) fn layer_is_recur(m: &Model, l: usize) -> bool {
 	return m.big.contains_key(&layer_name(l, "self_attn.ssm_in.weight"));
 }
 
-/// True if layer `l` is a gated-delta / KDA recurrent layer, keyed on the presence
-/// of its causal-conv signature tensor (the mixed `ssm_conv1d` for GDA, the `q`
-/// short-conv for KDA) — the honest per-layer interleave discriminator, absent on
-/// the arch's full-attention layers.
 pub(super) fn layer_is_delta(m: &Model, l: usize) -> bool {
 	return m.big.contains_key(&layer_name(l, "self_attn.ssm_conv1d.weight"))
 		|| m.big.contains_key(&layer_name(l, "self_attn.q_conv.weight"));
 }
 
-/// The gated-delta head geometry `(d, hk, hv, key_dim, value_dim, conv_dim)`. For
-/// GDA arches `d = ssm.state_size`, `hk = ssm.group_count`, `hv =
-/// ssm.time_step_rank`; for KDA (kimi) `d = kda.head_dim` and both head counts are
-/// `kda_n_head` (separate per-projection convs, so `conv_dim = d_inner`).
 pub(super) fn delta_dims(m: &Model) -> (usize, usize, usize, usize, usize, usize) {
 	let hp = &m.hp;
 	if hp.kda_head_dim > 0 {
@@ -1266,12 +1079,6 @@ pub(super) fn delta_dims(m: &Model) -> (usize, usize, usize, usize, usize, usize
 	return (d, hk, hv, key_dim, value_dim, 2 * key_dim + value_dim);
 }
 
-/// The gated delta-net (GDA) recurrent mixer (qwen3.5/next/moe
-/// `build_layer_attn_linear`), writing the `ssm_out`-projected mixer output to
-/// `out` without the block residual. Pre-norm, q|k|v|z projections (fused `wqkv`
-/// + `wqkv_gate`), the fused-or-separate beta/alpha, causal short conv + SiLU,
-/// per-head L2-norm of q/k, the delta-rule scan (per-head scalar decay), and the
-/// SiLU(z)-gated `ssm_norm` output. All scratch is arena-resident.
 fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
@@ -1310,11 +1117,6 @@ fn gated_delta_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: us
 	return Ok(());
 }
 
-/// The Kimi Delta-Attention (KDA) recurrent mixer (kimi-linear graph :288-372),
-/// writing the `o_proj`-projected output to `out` without the block residual.
-/// Separate q/k/v projections each with its own causal short conv + SiLU, per-head
-/// L2-norm of q/k, a per-CHANNEL log-decay LoRA (`f_b(f_a(x))`), the delta-rule
-/// scan (per-channel decay), and a sigmoid(`g_b(g_a(x))`)-gated `ssm_norm` output.
 fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let arch = hp.arch.as_str();
@@ -1355,11 +1157,6 @@ fn kda_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar:
 	return Ok(());
 }
 
-/// The gated delta-net full-attention companion (qwen3.5/next `build_layer_attn`),
-/// writing the `o_proj`-projected output to `out` without the block residual. A
-/// fused Q+gate projection (per-head `[Q | gate]`), per-head Q/K RMSNorm, NEOX
-/// RoPE (qwen3.5's MRoPE reduces to this for text positions), scaled GQA, then a
-/// sigmoid(gate) elementwise gate before `o_proj`.
 fn delta_full_attn(
 	m: &Model,
 	l: usize,
@@ -1394,12 +1191,6 @@ fn delta_full_attn(
 	return Ok(());
 }
 
-/// The kimi-linear full-attention companion: absorbed MLA (deepseek2-style) with
-/// NO RoPE and NO q_a compression (kimi-linear.cpp:374-472, `wk_b`/`wv_b` present).
-/// Q rides `wq` directly, splits into a nope part (absorbed into the kv latent by
-/// `k_b`) and a pe part carried unrotated; K/V ride the `kv_a` latent (RMSNorm'd)
-/// plus the unrotated k_pe. MQA over `kv_lora+pe` keys and `kv_lora` values, then
-/// `v_b` decompress and `o_proj`. Reuses the MLA arena scratch.
 fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let hp = &m.hp;
 	let ne = hp.ne;
@@ -1429,12 +1220,6 @@ fn kimi_mla_attn(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usiz
 	return Ok(());
 }
 
-/// The routed mixture-of-experts core shared by [`layer_moe`] and the delta-net
-/// FFN: gate logits, `softmax` or `sigmoid` gating, an optional selection bias
-/// (`exp_probs_b`, added for top-k selection only), renormalized top-`used`
-/// weights, and the per-expert SwiGLU compose. Writes the routed output to
-/// `ar.mlp0`. The router/expert loop is host-driven (one D2H per expert), matching
-/// the existing MoE serialization.
 fn moe_core(
 	m: &Model,
 	l: usize,
@@ -1507,10 +1292,6 @@ fn moe_core(
 	return Ok(());
 }
 
-/// The gated shared-expert branch (qwen3.5/next, kimi-linear): an unconditional
-/// SiLU-SwiGLU over the normed input `cms`, written to `out`. qwen adds a
-/// per-token sigmoid gate (`shexp.gate_inp`) scaling each row; kimi ships no gate
-/// (added straight into the MoE output).
 fn shared_expert(m: &Model, l: usize, cms: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena) -> Result<()> {
 	let (ne, nffs) = (m.hp.ne, m.hp.nffe);
 	gpu_gemm_bt_f64(cms, &m.stream(&layer_name(l, "shexp.gate.weight"))?, t, nffs, ne, &ar.g)?;
@@ -1526,10 +1307,6 @@ fn shared_expert(m: &Model, l: usize, cms: &GpuBuffer, out: &GpuBuffer, t: usize
 	return Ok(());
 }
 
-/// The delta-net FFN sub-block: `pre_ff`-normed input, then a dense SwiGLU (qwen3.5)
-/// or a MoE (+ shared expert) FFN (qwen3.5-moe/next softmax + gated shexp,
-/// kimi-linear sigmoid + `exp_probs_b` bias + plain shexp), residual `resid` into
-/// `h_out`. MoE vs dense is per-layer by expert-tensor presence.
 fn delta_ffn(
 	m: &Model,
 	l: usize,
@@ -1555,16 +1332,10 @@ fn delta_ffn(
 	return Ok(());
 }
 
-/// True if layer `l` carries an attention mixer (its `q_proj` is present, fused
-/// or separate). A nemotron FFN-only layer has neither this nor `ssm_in`.
 pub(super) fn layer_is_attn(m: &Model, l: usize) -> bool {
 	return m.big.contains_key(&layer_name(l, "self_attn.q_proj.weight"));
 }
 
-/// The FFN half of a hybrid block: pre-`norm_key` norm of `src` into `ar.cms`,
-/// the dense FFN into `ar.mlp0`, residual `resid` into `h_out`. Per-layer MoE
-/// FFN (real jamba/granite/nemotron-MoE checkpoints) is not wired; the parity
-/// fixtures are all dense (`expert_count == 0`), so a MoE layer fails clean here.
 fn hybrid_ffn(
 	m: &Model,
 	l: usize,
@@ -1589,18 +1360,10 @@ fn hybrid_ffn(
 	return Ok(());
 }
 
-/// True if layer `l` is an lfm2 short-conv recurrent layer (its `shortconv_in_proj`
-/// is present) rather than an attention layer: the honest per-layer interleave
-/// signal, `n_head_kv(l)==0` in `llama.cpp`.
 pub(super) fn layer_is_shortconv(m: &Model, l: usize) -> bool {
 	return m.big.contains_key(&layer_name(l, "self_attn.shortconv_in_proj.weight"));
 }
 
-/// The lfm2 gated short-convolution mixer (lfm2.cpp build_shortconv_block :157-226),
-/// writing the `out_proj`-projected output to `out` without the block residual.
-/// operator_norm, `in_proj` split into contiguous row-blocks `B|C|x`, the `B*x`
-/// pre-conv gate, a causal depthwise conv (`l_cache` taps, no activation), the
-/// `C*conv` post-conv gate, then `out_proj`. All scratch is arena-resident.
 fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usize, ar: &Arena, dec: &DecCtx) -> Result<()> {
 	let ne = m.hp.ne;
 	let lc = m.hp.shortconv_l_cache;
@@ -1618,10 +1381,6 @@ fn shortconv_mix(m: &Model, l: usize, h_in: &GpuBuffer, out: &GpuBuffer, t: usiz
 	return Ok(());
 }
 
-/// Per-layer attention/recurrent-interleaving decoder block for the mamba
-/// hybrids. Routes each layer to its mixer by tensor presence and composes the
-/// block per `hy.mode`, reusing the verified [`attn_block`], [`mamba1_mix`],
-/// [`mamba2_mix`], and [`ffn`] drivers 1:1 with the arch's `llama.cpp` graph.
 pub(super) fn layer_hybrid(
 	m: &Model,
 	l: usize,

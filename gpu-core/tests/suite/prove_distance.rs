@@ -1,26 +1,4 @@
 use crate::common;
-// Live-GPU proof harness for the "distance" inventory category.
-//
-// For every distance-category item in kernel_inventory/*.json, canonicalize its
-// name; if that canonical op is registered here, run the gpu-core op on the LIVE
-// gfx1101 GPU and assert it matches an AUTHORITATIVE CPU oracle (std f64 textbook
-// pairwise definitions). tol 1e-7.
-//
-// Conventions are matched to the kernels, NOT to the inventory name:
-//   - pairwise_l2 (existing)      → SQUARED L2, no sqrt    : Σ diff²
-//   - pairwise_cosine (existing)  → cosine SIMILARITY      : dot/(‖q‖‖t‖), 0/0→0
-//   - pairwise_l1 (existing)      → L1                     : Σ |diff|
-//   - pairwise_hamming (existing) → u8 mismatch fraction   : #(q≠t)/dim
-//   - distancex_manhattan (new)   → L1
-//   - distancex_chebyshev (new)   → Linf  : max|diff|
-//   - distancex_minkowski (new)   → Lp    : (Σ|diff|^p)^(1/p)
-//   - distancex_braycurtis (new)  → Σ|diff| / Σ|q+t|, 0/0→0
-//   - distancex_canberra (new)    → Σ |diff|/(|q|+|t|), per-term 0/0→0
-//
-// Canonicalization honesty: generic-euclidean inventory names (cdist/pdist/
-// pairwise_distance/...) route to minkowski(p=2) = TRUE euclidean (sqrt), never to
-// the squared-L2 kernel. Only the explicitly-"squared L2" names map to l2.
-// Backward / structural / different-function items stay backlog (never faked green).
 
 use gpu_core::memory::GpuBuffer;
 use std::collections::{BTreeSet, HashMap};
@@ -80,7 +58,6 @@ unsafe extern "C" {
 const TOL: f64 = 1e-7;
 
 // ── test data: strictly positive [0.5,5] so diffs take both signs and
-//    braycurtis / canberra denominators stay nonzero (off the 0/0 edge). ──
 fn make_data() -> (Vec<f64>, Vec<f64>, usize, usize, usize) {
 	let (nq, nt, dim) = (5usize, 7usize, 4usize);
 	let mut q = vec![0.0; nq * dim];
@@ -129,7 +106,6 @@ fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: 
 	out
 }
 
-// CPU oracle: apply a per-pair reducer over the (nq x nt) grid.
 fn oracle_grid<F: Fn(&[f64], &[f64]) -> f64>(
 	q: &[f64],
 	t: &[f64],
@@ -169,14 +145,10 @@ fn canon(name: &str) -> Option<&'static str> {
 		.strip_suffix("_aten")
 		.map(|s| s.to_string())
 		.unwrap_or(base);
-	// explicitly squared-L2 → l2 kernel (squared, no sqrt)
 	match base.as_str() {
 		"l2unexpanded" | "l2expanded" => return Some("l2_squared"),
-		// cosine SIMILARITY family → cosine kernel
 		"cosine_similarity" | "cosineexpanded" | "cosine" => return Some("cosine"),
-		// hamming (u8) → hamming kernel
 		"hamming" => return Some("hamming"),
-		// generic euclidean cross/pairwise distance → minkowski(p=2) = true euclidean
 		"cdist"
 		| "_cdist_forward"
 		| "cdist_forward"
@@ -193,7 +165,6 @@ fn canon(name: &str) -> Option<&'static str> {
 	None
 }
 
-// distance items in the inventory (deduped).
 fn load_distance() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
@@ -240,7 +211,6 @@ fn prove_distance() {
 		};
 
 	// ── existing kernels (proven against their TRUE convention) ──
-	// pairwise_l2 → SQUARED L2
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::kernels::gpu_pairwise_l2(
@@ -273,7 +243,6 @@ fn prove_distance() {
 		});
 		assert_op("l2_squared", got, want, &mut failures);
 	}
-	// pairwise_cosine → cosine SIMILARITY
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::encoding::gpu_pairwise_cosine(
@@ -310,7 +279,6 @@ fn prove_distance() {
 		});
 		assert_op("cosine", got, want, &mut failures);
 	}
-	// pairwise_l1 → L1
 	{
 		let out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::encoding::gpu_pairwise_l1(
@@ -343,7 +311,6 @@ fn prove_distance() {
 		});
 		assert_op("manhattan", got.clone(), want.clone(), &mut failures);
 	}
-	// pairwise_hamming → u8 mismatch fraction (separate u8 runner + integer oracle)
 	{
 		let qd = dim;
 		let nqh = 5usize;
@@ -398,7 +365,6 @@ fn prove_distance() {
 	}
 
 	// ── new distancex_ kernels ──
-	// manhattan (new, independent of pairwise_l1): L1
 	{
 		let got = run_flat_f64(launch_distancex_manhattan, &q, &t, nq, nt, dim);
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
@@ -406,7 +372,6 @@ fn prove_distance() {
 		});
 		assert_op("manhattan", got, want, &mut failures);
 	}
-	// chebyshev: Linf
 	{
 		let got = run_flat_f64(launch_distancex_chebyshev, &q, &t, nq, nt, dim);
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
@@ -417,7 +382,6 @@ fn prove_distance() {
 		});
 		assert_op("chebyshev", got, want, &mut failures);
 	}
-	// minkowski(p=3): (Σ|diff|^p)^(1/p)
 	{
 		let p = 3.0_f64;
 		let bq = {
@@ -458,7 +422,6 @@ fn prove_distance() {
 		});
 		assert_op("minkowski", got, want, &mut failures);
 	}
-	// minkowski(p=2) cross-check == sqrt(l2-squared kernel output)
 	{
 		let p = 2.0_f64;
 		let bq = {
@@ -493,7 +456,6 @@ fn prove_distance() {
 			gpu_core::hip::device_synchronize().unwrap();
 			__dv
 		};
-		// CPU oracle: true euclidean = sqrt(Σ diff²)
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
 			a.iter()
 				.zip(b)
@@ -502,7 +464,6 @@ fn prove_distance() {
 				.sqrt()
 		});
 		assert_op("euclidean", mink2.clone(), want, &mut failures);
-		// bonus cross-check: GPU minkowski(p=2) == sqrt(GPU squared-L2 kernel)
 		let l2out = GpuBuffer::alloc(nq * nt).unwrap();
 		gpu_core::kernels::gpu_pairwise_l2(
 			&{
@@ -534,7 +495,6 @@ fn prove_distance() {
 			failures.push("minkowski(p=2) != sqrt(l2_squared)".into());
 		}
 	}
-	// bray-curtis: Σ|diff| / Σ|q+t|
 	{
 		let got = run_flat_f64(launch_distancex_braycurtis, &q, &t, nq, nt, dim);
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
@@ -544,7 +504,6 @@ fn prove_distance() {
 		});
 		assert_op("braycurtis", got, want, &mut failures);
 	}
-	// canberra: Σ |diff|/(|q|+|t|), per-term 0/0→0
 	{
 		let got = run_flat_f64(launch_distancex_canberra, &q, &t, nq, nt, dim);
 		let want = oracle_grid(&q, &t, nq, nt, dim, |a, b| {
@@ -559,7 +518,6 @@ fn prove_distance() {
 		assert_op("canberra", got, want, &mut failures);
 	}
 
-	// defining-edge probes: canberra(0,0)-term → 0 ; braycurtis all-zero pair → 0.
 	{
 		let zq = vec![0.0; dim];
 		let zt = vec![0.0; dim];
@@ -573,7 +531,6 @@ fn prove_distance() {
 		}
 	}
 
-	// walk inventory → proven count
 	let items = load_distance();
 	assert!(!items.is_empty(), "no distance items in inventory");
 	let total = items.len();
