@@ -17,20 +17,6 @@
 use gpu_core::memory::xfer_bytes;
 use recipe_infer::llm::{ChatSession, Tok};
 use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::Once;
-
-fn probe_gate() {
-	static GATE: Once = Once::new();
-	GATE.call_once(|| {
-		if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-			process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			process::exit(code);
-		}
-	});
-}
 
 fn stories_fixture() -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stories-f32.gguf");
@@ -49,7 +35,6 @@ fn run_turn(session: &mut ChatSession, prompt: &str, budget: usize) -> usize {
 
 #[test]
 fn second_turn_uploads_scale_with_suffix_not_total_length() {
-	probe_gate();
 	let gguf = stories_fixture();
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")

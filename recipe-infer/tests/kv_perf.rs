@@ -14,11 +14,8 @@
 //! if that model is not present on the machine (a perf harness with no model is a
 //! broken harness, not a skip).
 
-use std::path::PathBuf;
-use std::process;
-use std::sync::Once;
 use std::time::Instant;
-
+use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use recipe_infer::gguf::Gguf;
 use recipe_infer::llm::{ChatSession, Tok};
@@ -35,18 +32,6 @@ const GEN_TOKENS: usize = 3;
 // (lfm2 = short-conv + attention hybrid, 1.2B). Same 3-step protocol as dense.
 const SCAN_MODEL_KEY: &str = "lfm2.5-1.2b";
 const SCAN_GEN_TOKENS: usize = 3;
-
-fn probe_gate() {
-	static GATE: Once = Once::new();
-	GATE.call_once(|| {
-		if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-			process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			process::exit(code);
-		}
-	});
-}
 
 /// Path for `key` out of the committed `gguf.toml` at the repo root, parsed
 /// without a toml dependency: the `key = "value"` line under `[models]`.
@@ -99,7 +84,6 @@ fn long_prompt(gguf: &std::path::Path) -> Result<String> {
 /// `gen_tokens`, print TTFT/tok/s to stderr under `tag`. Asserts only that
 /// generation ran (a perf harness, not a numeric gate).
 fn measure(model_key: &str, gen_tokens: usize, tag: &str) {
-	probe_gate();
 	let gguf = model_path(model_key).expect("model path from gguf.toml");
 	assert!(
 		gguf.exists(),

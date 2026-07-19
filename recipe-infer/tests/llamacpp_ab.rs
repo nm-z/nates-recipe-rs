@@ -15,25 +15,12 @@
 
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};
-use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
-use std::sync::Once;
 use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const PROMPT: &str = "Once upon a time";
 const N_NEW: usize = 64;
-
-fn probe_gate() {
-	static GATE: Once = Once::new();
-	GATE.call_once(|| {
-		if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-			process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			process::exit(code);
-		}
-	});
-}
 
 fn fixture() -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stories-f32.gguf");
@@ -182,7 +169,6 @@ fn assert_same_text(recipe: &str, llama: &str) {
 
 #[test]
 fn greedy_tokens_match_llamacpp() {
-	probe_gate();
 	let model = fixture();
 	let llama = llama_completion(&model, PROMPT, N_NEW);
 	let recipe = recipe_run(&model, PROMPT, N_NEW);
@@ -195,7 +181,6 @@ fn greedy_tokens_match_llamacpp() {
 
 #[test]
 fn recipe_not_slower_than_llamacpp() {
-	probe_gate();
 	let model = model_path("qwen3-0.6b-q8_0").expect("qwen3-0.6b-q8_0 in gguf.toml");
 	assert!(
 		model.exists(),

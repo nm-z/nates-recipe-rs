@@ -32,20 +32,6 @@ use gpu_core::memory::{device_alloc_count, xfer_calls};
 use recipe_infer::llm::{ChatSession, Tok, greedy, last_logits};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::Once;
-
-fn probe_gate() {
-	static GATE: Once = Once::new();
-	GATE.call_once(|| {
-		if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-			process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			process::exit(code);
-		}
-	});
-}
 
 fn stories_fixture() -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stories-f32.gguf");
@@ -76,7 +62,6 @@ fn argmax(logits: &[f64]) -> u32 {
 
 #[test]
 fn spill_growth_moves_bytes_without_fresh_device_allocs() {
-	probe_gate();
 	let gguf = stories_fixture();
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")
@@ -119,7 +104,6 @@ fn spill_growth_moves_bytes_without_fresh_device_allocs() {
 
 #[test]
 fn resident_cache_content_matches_cold_recompute() {
-	probe_gate();
 	let gguf = stories_fixture();
 	let prompt: &[u32] = &[1, 403, 407, 261, 378];
 	let cached = greedy(&gguf, prompt, 1).expect("cached first token");

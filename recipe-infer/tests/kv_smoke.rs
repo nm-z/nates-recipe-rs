@@ -22,11 +22,8 @@
 //! finding, exactly as intended — the table of pass/fail/times is the
 //! deliverable, and some failures (unwired arch, unsupported quant) are expected.
 
-use std::path::PathBuf;
-use std::process;
-use std::sync::Once;
 use std::time::Instant;
-
+use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};
 
@@ -99,18 +96,6 @@ const IN_SUITE: &[&str] = &[
 	"lfm2.5-1.2b",
 ];
 
-fn probe_gate() {
-	static GATE: Once = Once::new();
-	GATE.call_once(|| {
-		if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-			process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			process::exit(code);
-		}
-	});
-}
-
 fn gguf_toml() -> PathBuf {
 	return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
 }
@@ -158,7 +143,6 @@ fn model_path(name: &str) -> Result<PathBuf> {
 /// or zero tokens produced.
 fn do_smoke(name: &str) -> (f64, f64, usize) {
 	const GEN_TOKENS: usize = 3;
-	probe_gate();
 	let gguf = model_path(name).expect("gguf.toml lookup");
 	assert!(
 		gguf.exists(),
