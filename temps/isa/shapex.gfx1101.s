@@ -1636,17 +1636,17 @@ shapex_pack_upper_tri_kernel:           ; @shapex_pack_upper_tri_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_f11e43ae679cf96e,@object ; @__hip_cuid_f11e43ae679cf96e
+	.type	__hip_cuid_a426c315bbad5feb,@object ; @__hip_cuid_a426c315bbad5feb
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_f11e43ae679cf96e
-__hip_cuid_f11e43ae679cf96e:
+	.globl	__hip_cuid_a426c315bbad5feb
+__hip_cuid_a426c315bbad5feb:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_f11e43ae679cf96e, 1
+	.size	__hip_cuid_a426c315bbad5feb, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_f11e43ae679cf96e
+	.addrsig_sym __hip_cuid_a426c315bbad5feb
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

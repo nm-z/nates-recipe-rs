@@ -653,17 +653,17 @@ _Z31moex_weighted_accumulate_kernelIdEvPKT_S2_PS0_iiii: ; @_Z31moex_weighted_acc
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_74e8ddf8a1a7e140,@object ; @__hip_cuid_74e8ddf8a1a7e140
+	.type	__hip_cuid_a55106f6064ae370,@object ; @__hip_cuid_a55106f6064ae370
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_74e8ddf8a1a7e140
-__hip_cuid_74e8ddf8a1a7e140:
+	.globl	__hip_cuid_a55106f6064ae370
+__hip_cuid_a55106f6064ae370:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_74e8ddf8a1a7e140, 1
+	.size	__hip_cuid_a55106f6064ae370, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_74e8ddf8a1a7e140
+	.addrsig_sym __hip_cuid_a55106f6064ae370
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

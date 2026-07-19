@@ -1760,17 +1760,17 @@ searchx_argrel_kernel:                  ; @searchx_argrel_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_bc05ba168cc271ec,@object ; @__hip_cuid_bc05ba168cc271ec
+	.type	__hip_cuid_55d4661872b462c1,@object ; @__hip_cuid_55d4661872b462c1
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_bc05ba168cc271ec
-__hip_cuid_bc05ba168cc271ec:
+	.globl	__hip_cuid_55d4661872b462c1
+__hip_cuid_55d4661872b462c1:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_bc05ba168cc271ec, 1
+	.size	__hip_cuid_55d4661872b462c1, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_bc05ba168cc271ec
+	.addrsig_sym __hip_cuid_55d4661872b462c1
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

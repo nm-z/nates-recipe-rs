@@ -3446,17 +3446,17 @@ elementwise_binaryx_ne_kernel:          ; @elementwise_binaryx_ne_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_4b7c0bba232b0ba4,@object ; @__hip_cuid_4b7c0bba232b0ba4
+	.type	__hip_cuid_2772f1aca2e9b55a,@object ; @__hip_cuid_2772f1aca2e9b55a
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_4b7c0bba232b0ba4
-__hip_cuid_4b7c0bba232b0ba4:
+	.globl	__hip_cuid_2772f1aca2e9b55a
+__hip_cuid_2772f1aca2e9b55a:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_4b7c0bba232b0ba4, 1
+	.size	__hip_cuid_2772f1aca2e9b55a, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_4b7c0bba232b0ba4
+	.addrsig_sym __hip_cuid_2772f1aca2e9b55a
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

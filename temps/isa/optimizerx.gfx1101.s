@@ -1683,17 +1683,17 @@ optimizerx_lars_phase2_kernel:          ; @optimizerx_lars_phase2_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_23837c7046a965f4,@object ; @__hip_cuid_23837c7046a965f4
+	.type	__hip_cuid_7d59ec952e2a2d26,@object ; @__hip_cuid_7d59ec952e2a2d26
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_23837c7046a965f4
-__hip_cuid_23837c7046a965f4:
+	.globl	__hip_cuid_7d59ec952e2a2d26
+__hip_cuid_7d59ec952e2a2d26:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_23837c7046a965f4, 1
+	.size	__hip_cuid_7d59ec952e2a2d26, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_23837c7046a965f4
+	.addrsig_sym __hip_cuid_7d59ec952e2a2d26
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

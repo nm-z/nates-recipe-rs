@@ -1020,17 +1020,17 @@ _Z23gaussian_logprob_kernelPKdS0_S0_Pdii: ; @_Z23gaussian_logprob_kernelPKdS0_S0
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_e0d81515a70b4672,@object ; @__hip_cuid_e0d81515a70b4672
+	.type	__hip_cuid_f64053017307a319,@object ; @__hip_cuid_f64053017307a319
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_e0d81515a70b4672
-__hip_cuid_e0d81515a70b4672:
+	.globl	__hip_cuid_f64053017307a319
+__hip_cuid_f64053017307a319:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_e0d81515a70b4672, 1
+	.size	__hip_cuid_f64053017307a319, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_e0d81515a70b4672
+	.addrsig_sym __hip_cuid_f64053017307a319
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

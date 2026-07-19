@@ -10808,12 +10808,12 @@ specialx_xlogy_kernel:                  ; @specialx_xlogy_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_daad206124ef2e23,@object ; @__hip_cuid_daad206124ef2e23
+	.type	__hip_cuid_84e5117a328f749b,@object ; @__hip_cuid_84e5117a328f749b
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_daad206124ef2e23
-__hip_cuid_daad206124ef2e23:
+	.globl	__hip_cuid_84e5117a328f749b
+__hip_cuid_84e5117a328f749b:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_daad206124ef2e23, 1
+	.size	__hip_cuid_84e5117a328f749b, 1
 
 	.type	__ocmltbl_M64_J0,@object        ; @__ocmltbl_M64_J0
 	.section	.rodata,"a",@progbits
@@ -11619,7 +11619,7 @@ __ocmltbl_M64_Y1:
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_daad206124ef2e23
+	.addrsig_sym __hip_cuid_84e5117a328f749b
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

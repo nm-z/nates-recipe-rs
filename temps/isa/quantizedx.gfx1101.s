@@ -719,17 +719,17 @@ quantizedx_fake_quant_i4_kernel:        ; @quantizedx_fake_quant_i4_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_7ec3fc861be0bc21,@object ; @__hip_cuid_7ec3fc861be0bc21
+	.type	__hip_cuid_e9d6033b56986c6c,@object ; @__hip_cuid_e9d6033b56986c6c
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_7ec3fc861be0bc21
-__hip_cuid_7ec3fc861be0bc21:
+	.globl	__hip_cuid_e9d6033b56986c6c
+__hip_cuid_e9d6033b56986c6c:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_7ec3fc861be0bc21, 1
+	.size	__hip_cuid_e9d6033b56986c6c, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_7ec3fc861be0bc21
+	.addrsig_sym __hip_cuid_e9d6033b56986c6c
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

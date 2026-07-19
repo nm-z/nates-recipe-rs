@@ -289,17 +289,17 @@ _Z15dtw_init_kernelPdi:                 ; @_Z15dtw_init_kernelPdi
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_dc9beb25bb7d514,@object ; @__hip_cuid_dc9beb25bb7d514
+	.type	__hip_cuid_467b4bab44192997,@object ; @__hip_cuid_467b4bab44192997
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_dc9beb25bb7d514
-__hip_cuid_dc9beb25bb7d514:
+	.globl	__hip_cuid_467b4bab44192997
+__hip_cuid_467b4bab44192997:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_dc9beb25bb7d514, 1
+	.size	__hip_cuid_467b4bab44192997, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_dc9beb25bb7d514
+	.addrsig_sym __hip_cuid_467b4bab44192997
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

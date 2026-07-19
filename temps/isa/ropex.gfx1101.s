@@ -2845,17 +2845,17 @@ _Z21ropex_qk_heads_kernelIdEvPT_S1_iiiiPKS0_S3_: ; @_Z21ropex_qk_heads_kernelIdE
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_efd4eefeef10034b,@object ; @__hip_cuid_efd4eefeef10034b
+	.type	__hip_cuid_1f774c56ef913817,@object ; @__hip_cuid_1f774c56ef913817
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_efd4eefeef10034b
-__hip_cuid_efd4eefeef10034b:
+	.globl	__hip_cuid_1f774c56ef913817
+__hip_cuid_1f774c56ef913817:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_efd4eefeef10034b, 1
+	.size	__hip_cuid_1f774c56ef913817, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_efd4eefeef10034b
+	.addrsig_sym __hip_cuid_1f774c56ef913817
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

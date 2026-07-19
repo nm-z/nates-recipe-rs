@@ -815,17 +815,17 @@ _Z9scale_f64IdEvPT_PKS0_l:              ; @_Z9scale_f64IdEvPT_PKS0_l
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.section	.AMDGPU.csdata,"",@progbits
-	.type	__hip_cuid_78a634b71272fcb7,@object ; @__hip_cuid_78a634b71272fcb7
+	.type	__hip_cuid_cac7378cc9b996ca,@object ; @__hip_cuid_cac7378cc9b996ca
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_78a634b71272fcb7
-__hip_cuid_78a634b71272fcb7:
+	.globl	__hip_cuid_cac7378cc9b996ca
+__hip_cuid_cac7378cc9b996ca:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_78a634b71272fcb7, 1
+	.size	__hip_cuid_cac7378cc9b996ca, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_78a634b71272fcb7
+	.addrsig_sym __hip_cuid_cac7378cc9b996ca
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

@@ -2340,17 +2340,17 @@ _Z31smo_update_gradient_rows_kernelPdPKdS1_iS1_S1_: ; @_Z31smo_update_gradient_r
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_2f0281dc8ae90cfe,@object ; @__hip_cuid_2f0281dc8ae90cfe
+	.type	__hip_cuid_133a0f54e4534380,@object ; @__hip_cuid_133a0f54e4534380
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_2f0281dc8ae90cfe
-__hip_cuid_2f0281dc8ae90cfe:
+	.globl	__hip_cuid_133a0f54e4534380
+__hip_cuid_133a0f54e4534380:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_2f0281dc8ae90cfe, 1
+	.size	__hip_cuid_133a0f54e4534380, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_2f0281dc8ae90cfe
+	.addrsig_sym __hip_cuid_133a0f54e4534380
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

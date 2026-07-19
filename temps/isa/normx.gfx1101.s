@@ -2113,17 +2113,17 @@ _Z20normx_rmsnorm_kernelIdEvPKT_PS0_S2_iiS2_: ; @_Z20normx_rmsnorm_kernelIdEvPKT
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_6fa80066720f170a,@object ; @__hip_cuid_6fa80066720f170a
+	.type	__hip_cuid_ee853abf7dfa3674,@object ; @__hip_cuid_ee853abf7dfa3674
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_6fa80066720f170a
-__hip_cuid_6fa80066720f170a:
+	.globl	__hip_cuid_ee853abf7dfa3674
+__hip_cuid_ee853abf7dfa3674:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_6fa80066720f170a, 1
+	.size	__hip_cuid_ee853abf7dfa3674, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_6fa80066720f170a
+	.addrsig_sym __hip_cuid_ee853abf7dfa3674
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

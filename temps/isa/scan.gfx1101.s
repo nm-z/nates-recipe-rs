@@ -191198,63 +191198,95 @@ _ZN7rocprim17ROCPRIM_400200_NS6detail17trampoline_kernelINS1_19wrapped_scan_conf
 ; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
 ; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
 ; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
-	.section	.text._Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii,"axG",@progbits,_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii,comdat
-	.protected	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii ; -- Begin function _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
-	.globl	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
+	.section	.text._Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_,"axG",@progbits,_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_,comdat
+	.protected	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_ ; -- Begin function _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
+	.globl	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
 	.p2align	8
-	.type	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii,@function
-_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
+	.type	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_,@function
+_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_: ; @_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
 ; %bb.0:
 	s_clause 0x1
-	s_load_b32 s3, s[0:1], 0x2c
+	s_load_b32 s3, s[0:1], 0x34
 	s_load_b64 s[8:9], s[0:1], 0x18
 	s_waitcnt lgkmcnt(0)
 	s_and_b32 s3, s3, 0xffff
-	s_cmp_gt_i32 s8, 0
-	v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]
-	s_cselect_b32 s2, -1, 0
-	v_cmp_gt_i32_e32 vcc_lo, s9, v1
-	s_and_b32 s2, vcc_lo, s2
 	s_delay_alu instid0(SALU_CYCLE_1)
-	s_and_saveexec_b32 s3, s2
-	s_cbranch_execz .LBB1020_3
+	v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]
+	s_mov_b32 s2, exec_lo
+	v_cmpx_gt_i32_e64 s9, v1
+	s_cbranch_execz .LBB1020_8
 ; %bb.1:
+	s_load_b64 s[2:3], s[0:1], 0x20
+	v_ashrrev_i32_e32 v2, 31, v1
+	s_waitcnt lgkmcnt(0)
+	s_cmp_lg_u64 s[2:3], 0
+	s_cselect_b32 s10, -1, 0
+	s_cmp_eq_u64 s[2:3], 0
+	s_cbranch_scc1 .LBB1020_3
+; %bb.2:
+	v_lshlrev_b64 v[3:4], 2, v[1:2]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v3, vcc_lo, s2, v3
+	v_add_co_ci_u32_e64 v4, null, s3, v4, vcc_lo
+	global_load_b32 v0, v[3:4], off
+	s_cmp_lt_i32 s8, 1
+	s_cbranch_scc0 .LBB1020_4
+	s_branch .LBB1020_6
+.LBB1020_3:
+	v_mov_b32_e32 v0, 0
+	s_cmp_lt_i32 s8, 1
+	s_cbranch_scc1 .LBB1020_6
+.LBB1020_4:
 	s_clause 0x1
 	s_load_b128 s[4:7], s[0:1], 0x0
 	s_load_b64 s[0:1], s[0:1], 0x10
-	v_mov_b32_e32 v0, 0
+	v_mov_b32_e32 v3, v1
 	.p2align	6
-.LBB1020_2:                             ; =>This Inner Loop Header: Depth=1
-	v_ashrrev_i32_e32 v2, 31, v1
+.LBB1020_5:                             ; =>This Inner Loop Header: Depth=1
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(SALU_CYCLE_1)
+	v_ashrrev_i32_e32 v4, 31, v3
 	s_add_i32 s8, s8, -1
-	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(VALU_DEP_1)
-	s_cmp_lg_u32 s8, 0
-	v_lshlrev_b64 v[2:3], 2, v[1:2]
+	s_cmp_eq_u32 s8, 0
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_2) | instid1(VALU_DEP_2)
+	v_lshlrev_b64 v[4:5], 2, v[3:4]
+	v_add_nc_u32_e32 v3, s9, v3
 	s_waitcnt lgkmcnt(0)
-	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
-	v_add_co_u32 v4, vcc_lo, s4, v2
-	v_add_co_ci_u32_e64 v5, null, s5, v3, vcc_lo
-	v_add_co_u32 v6, vcc_lo, s6, v2
+	v_add_co_u32 v6, vcc_lo, s6, v4
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v7, null, s7, v5, vcc_lo
+	v_add_co_u32 v8, vcc_lo, s4, v4
+	v_add_co_ci_u32_e64 v9, null, s5, v5, vcc_lo
+	global_load_b32 v6, v[6:7], off
+	global_load_b32 v7, v[8:9], off
+	s_waitcnt vmcnt(2)
+	v_mov_b32_e32 v8, v0
+	v_add_co_u32 v4, vcc_lo, s0, v4
 	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_3) | instid1(VALU_DEP_1)
-	v_add_co_ci_u32_e64 v7, null, s7, v3, vcc_lo
-	global_load_b32 v4, v[4:5], off
-	global_load_b32 v5, v[6:7], off
-	v_add_co_u32 v2, vcc_lo, s0, v2
-	v_add_co_ci_u32_e64 v3, null, s1, v3, vcc_lo
+	v_add_co_ci_u32_e64 v5, null, s1, v5, vcc_lo
+	s_waitcnt vmcnt(1)
+	v_mov_b32_e32 v0, v6
 	s_waitcnt vmcnt(0)
-	v_fmac_f32_e32 v5, v0, v4
-	s_delay_alu instid0(VALU_DEP_1)
-	v_dual_mov_b32 v0, v5 :: v_dual_add_nc_u32 v1, s9, v1
-	global_store_b32 v[2:3], v5, off
-	s_cbranch_scc1 .LBB1020_2
-.LBB1020_3:
+	v_fmac_f32_e32 v0, v8, v7
+	global_store_b32 v[4:5], v0, off
+	s_cbranch_scc0 .LBB1020_5
+.LBB1020_6:
+	s_and_b32 vcc_lo, exec_lo, s10
+	s_cbranch_vccz .LBB1020_8
+; %bb.7:
+	v_lshlrev_b64 v[1:2], 2, v[1:2]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v1, vcc_lo, s2, v1
+	v_add_co_ci_u32_e64 v2, null, s3, v2, vcc_lo
+	s_waitcnt vmcnt(0)
+	global_store_b32 v[1:2], v0, off
+.LBB1020_8:
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
-	.amdhsa_kernel _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
+	.amdhsa_kernel _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
-		.amdhsa_kernarg_size 288
+		.amdhsa_kernarg_size 296
 		.amdhsa_user_sgpr_count 2
 		.amdhsa_user_sgpr_dispatch_ptr 0
 		.amdhsa_user_sgpr_queue_ptr 0
@@ -191269,8 +191301,8 @@ _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_system_sgpr_workgroup_id_z 0
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
-		.amdhsa_next_free_vgpr 8
-		.amdhsa_next_free_sgpr 10
+		.amdhsa_next_free_vgpr 10
+		.amdhsa_next_free_sgpr 11
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -191283,7 +191315,7 @@ _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_memory_ordered 1
 		.amdhsa_forward_progress 1
 		.amdhsa_shared_vgpr_count 0
-		.amdhsa_inst_pref_size 2
+		.amdhsa_inst_pref_size 3
 		.amdhsa_exception_fp_ieee_invalid_op 0
 		.amdhsa_exception_fp_denorm_src 0
 		.amdhsa_exception_fp_ieee_div_zero 0
@@ -191292,34 +191324,34 @@ _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_exception_fp_ieee_inexact 0
 		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
-	.section	.text._Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii,"axG",@progbits,_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii,comdat
+	.section	.text._Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_,"axG",@progbits,_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_,comdat
 .Lfunc_end1020:
-	.size	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii, .Lfunc_end1020-_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
+	.size	_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_, .Lfunc_end1020-_Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
                                         ; -- End function
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.num_vgpr, 8
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.num_agpr, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.numbered_sgpr, 10
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.num_named_barrier, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.private_seg_size, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.uses_vcc, 1
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.uses_flat_scratch, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.has_dyn_sized_stack, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.has_recursion, 0
-	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.has_indirect_call, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.num_vgpr, 10
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.num_agpr, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.numbered_sgpr, 11
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.num_named_barrier, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.private_seg_size, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.uses_vcc, 1
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.uses_flat_scratch, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.has_dyn_sized_stack, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.has_recursion, 0
+	.set _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.has_indirect_call, 0
 	.section	.AMDGPU.csdata,"",@progbits
 ; Kernel info:
-; codeLenInByte = 228
-; TotalNumSgprs: 12
-; NumVgprs: 8
+; codeLenInByte = 372
+; TotalNumSgprs: 13
+; NumVgprs: 10
 ; ScratchSize: 0
 ; MemoryBound: 0
 ; FloatMode: 240
 ; IeeeMode: 1
 ; LDSByteSize: 0 bytes/workgroup (compile time only)
 ; SGPRBlocks: 0
-; VGPRBlocks: 0
-; NumSGPRsForWavesPerEU: 12
-; NumVGPRsForWavesPerEU: 8
+; VGPRBlocks: 1
+; NumSGPRsForWavesPerEU: 13
+; NumVGPRsForWavesPerEU: 10
 ; Occupancy: 16
 ; WaveLimiterHint : 0
 ; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
@@ -191329,63 +191361,92 @@ _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 ; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
 ; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
 ; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
-	.section	.text._Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii,"axG",@progbits,_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii,comdat
-	.protected	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii ; -- Begin function _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
-	.globl	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
+	.section	.text._Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_,"axG",@progbits,_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_,comdat
+	.protected	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_ ; -- Begin function _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
+	.globl	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
 	.p2align	8
-	.type	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii,@function
-_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
+	.type	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_,@function
+_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_: ; @_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
 ; %bb.0:
 	s_clause 0x1
-	s_load_b32 s3, s[0:1], 0x2c
+	s_load_b32 s3, s[0:1], 0x34
 	s_load_b64 s[8:9], s[0:1], 0x18
 	s_waitcnt lgkmcnt(0)
 	s_and_b32 s3, s3, 0xffff
-	s_cmp_gt_i32 s8, 0
-	v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]
-	s_cselect_b32 s2, -1, 0
-	v_cmp_gt_i32_e32 vcc_lo, s9, v1
-	s_and_b32 s2, vcc_lo, s2
 	s_delay_alu instid0(SALU_CYCLE_1)
-	s_and_saveexec_b32 s3, s2
-	s_cbranch_execz .LBB1021_3
+	v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]
+	s_mov_b32 s2, exec_lo
+	v_cmpx_gt_i32_e64 s9, v1
+	s_cbranch_execz .LBB1021_8
 ; %bb.1:
+	s_load_b64 s[2:3], s[0:1], 0x20
+	v_ashrrev_i32_e32 v2, 31, v1
+	s_waitcnt lgkmcnt(0)
+	s_cmp_lg_u64 s[2:3], 0
+	s_cselect_b32 s10, -1, 0
+	s_cmp_eq_u64 s[2:3], 0
+	s_cbranch_scc1 .LBB1021_3
+; %bb.2:
+	v_lshlrev_b64 v[3:4], 3, v[1:2]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v3, vcc_lo, s2, v3
+	v_add_co_ci_u32_e64 v4, null, s3, v4, vcc_lo
+	global_load_b64 v[3:4], v[3:4], off
+	s_cmp_lt_i32 s8, 1
+	s_cbranch_scc0 .LBB1021_4
+	s_branch .LBB1021_6
+.LBB1021_3:
+	v_mov_b32_e32 v3, 0
+	v_mov_b32_e32 v4, 0
+	s_cmp_lt_i32 s8, 1
+	s_cbranch_scc1 .LBB1021_6
+.LBB1021_4:
 	s_clause 0x1
 	s_load_b128 s[4:7], s[0:1], 0x0
 	s_load_b64 s[0:1], s[0:1], 0x10
-	v_mov_b32_e32 v3, 0
-	v_mov_b32_e32 v4, 0
+	v_mov_b32_e32 v5, v1
 	.p2align	6
-.LBB1021_2:                             ; =>This Inner Loop Header: Depth=1
-	v_ashrrev_i32_e32 v2, 31, v1
+.LBB1021_5:                             ; =>This Inner Loop Header: Depth=1
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(SALU_CYCLE_1)
+	v_ashrrev_i32_e32 v6, 31, v5
 	s_add_i32 s8, s8, -1
-	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(VALU_DEP_1)
-	s_cmp_lg_u32 s8, 0
-	v_lshlrev_b64 v[5:6], 3, v[1:2]
-	v_add_nc_u32_e32 v1, s9, v1
+	s_cmp_eq_u32 s8, 0
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_2) | instid1(VALU_DEP_2)
+	v_lshlrev_b64 v[6:7], 3, v[5:6]
+	v_add_nc_u32_e32 v5, s9, v5
 	s_waitcnt lgkmcnt(0)
-	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_1)
-	v_add_co_u32 v7, vcc_lo, s4, v5
-	v_add_co_ci_u32_e64 v8, null, s5, v6, vcc_lo
-	v_add_co_u32 v9, vcc_lo, s6, v5
-	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_3) | instid1(VALU_DEP_1)
-	v_add_co_ci_u32_e64 v10, null, s7, v6, vcc_lo
-	global_load_b64 v[7:8], v[7:8], off
-	global_load_b64 v[9:10], v[9:10], off
-	v_add_co_u32 v5, vcc_lo, s0, v5
-	v_add_co_ci_u32_e64 v6, null, s1, v6, vcc_lo
+	v_add_co_u32 v8, vcc_lo, s4, v6
+	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v9, null, s5, v7, vcc_lo
+	v_add_co_u32 v10, vcc_lo, s6, v6
+	v_add_co_ci_u32_e64 v11, null, s7, v7, vcc_lo
+	global_load_b64 v[8:9], v[8:9], off
+	global_load_b64 v[10:11], v[10:11], off
+	v_add_co_u32 v6, vcc_lo, s0, v6
+	s_delay_alu instid0(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v7, null, s1, v7, vcc_lo
 	s_waitcnt vmcnt(0)
-	v_fma_f64 v[3:4], v[3:4], v[7:8], v[9:10]
-	global_store_b64 v[5:6], v[3:4], off
-	s_cbranch_scc1 .LBB1021_2
-.LBB1021_3:
+	v_fma_f64 v[3:4], v[3:4], v[8:9], v[10:11]
+	global_store_b64 v[6:7], v[3:4], off
+	s_cbranch_scc0 .LBB1021_5
+.LBB1021_6:
+	s_and_b32 vcc_lo, exec_lo, s10
+	s_cbranch_vccz .LBB1021_8
+; %bb.7:
+	v_lshlrev_b64 v[0:1], 3, v[1:2]
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v0, vcc_lo, s2, v0
+	v_add_co_ci_u32_e64 v1, null, s3, v1, vcc_lo
+	s_waitcnt vmcnt(0)
+	global_store_b64 v[0:1], v[3:4], off
+.LBB1021_8:
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
-	.amdhsa_kernel _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
+	.amdhsa_kernel _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
-		.amdhsa_kernarg_size 288
+		.amdhsa_kernarg_size 296
 		.amdhsa_user_sgpr_count 2
 		.amdhsa_user_sgpr_dispatch_ptr 0
 		.amdhsa_user_sgpr_queue_ptr 0
@@ -191400,8 +191461,8 @@ _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_system_sgpr_workgroup_id_z 0
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
-		.amdhsa_next_free_vgpr 11
-		.amdhsa_next_free_sgpr 10
+		.amdhsa_next_free_vgpr 12
+		.amdhsa_next_free_sgpr 11
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -191414,7 +191475,7 @@ _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_memory_ordered 1
 		.amdhsa_forward_progress 1
 		.amdhsa_shared_vgpr_count 0
-		.amdhsa_inst_pref_size 2
+		.amdhsa_inst_pref_size 3
 		.amdhsa_exception_fp_ieee_invalid_op 0
 		.amdhsa_exception_fp_denorm_src 0
 		.amdhsa_exception_fp_ieee_div_zero 0
@@ -191423,25 +191484,25 @@ _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 		.amdhsa_exception_fp_ieee_inexact 0
 		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
-	.section	.text._Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii,"axG",@progbits,_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii,comdat
+	.section	.text._Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_,"axG",@progbits,_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_,comdat
 .Lfunc_end1021:
-	.size	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii, .Lfunc_end1021-_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
+	.size	_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_, .Lfunc_end1021-_Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
                                         ; -- End function
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.num_vgpr, 11
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.num_agpr, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.numbered_sgpr, 10
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.num_named_barrier, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.private_seg_size, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.uses_vcc, 1
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.uses_flat_scratch, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.has_dyn_sized_stack, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.has_recursion, 0
-	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.has_indirect_call, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.num_vgpr, 12
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.num_agpr, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.numbered_sgpr, 11
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.num_named_barrier, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.private_seg_size, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.uses_vcc, 1
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.uses_flat_scratch, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.has_dyn_sized_stack, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.has_recursion, 0
+	.set _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.has_indirect_call, 0
 	.section	.AMDGPU.csdata,"",@progbits
 ; Kernel info:
-; codeLenInByte = 228
-; TotalNumSgprs: 12
-; NumVgprs: 11
+; codeLenInByte = 364
+; TotalNumSgprs: 13
+; NumVgprs: 12
 ; ScratchSize: 0
 ; MemoryBound: 0
 ; FloatMode: 240
@@ -191449,8 +191510,8 @@ _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 ; LDSByteSize: 0 bytes/workgroup (compile time only)
 ; SGPRBlocks: 0
 ; VGPRBlocks: 1
-; NumSGPRsForWavesPerEU: 12
-; NumVGPRsForWavesPerEU: 11
+; NumSGPRsForWavesPerEU: 13
+; NumVGPRsForWavesPerEU: 12
 ; Occupancy: 16
 ; WaveLimiterHint : 0
 ; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
@@ -191468,17 +191529,17 @@ _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii: ; @_Z29scan_linear_recurrenc
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_5602d1904aeb7a5,@object ; @__hip_cuid_5602d1904aeb7a5
+	.type	__hip_cuid_e12b347a27093a5a,@object ; @__hip_cuid_e12b347a27093a5a
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_5602d1904aeb7a5
-__hip_cuid_5602d1904aeb7a5:
+	.globl	__hip_cuid_e12b347a27093a5a
+__hip_cuid_e12b347a27093a5a:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_5602d1904aeb7a5, 1
+	.size	__hip_cuid_e12b347a27093a5a, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_5602d1904aeb7a5
+	.addrsig_sym __hip_cuid_e12b347a27093a5a
 	.amdgpu_metadata
 ---
 amdhsa.kernels:
@@ -215825,61 +215886,65 @@ amdhsa.kernels:
       - .offset:         28
         .size:           4
         .value_kind:     by_value
-      - .offset:         32
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         36
-        .size:           4
-        .value_kind:     hidden_block_count_y
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
       - .offset:         40
         .size:           4
-        .value_kind:     hidden_block_count_z
+        .value_kind:     hidden_block_count_x
       - .offset:         44
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         46
-        .size:           2
-        .value_kind:     hidden_group_size_y
+        .size:           4
+        .value_kind:     hidden_block_count_y
       - .offset:         48
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         50
-        .size:           2
-        .value_kind:     hidden_remainder_x
+        .size:           4
+        .value_kind:     hidden_block_count_z
       - .offset:         52
         .size:           2
-        .value_kind:     hidden_remainder_y
+        .value_kind:     hidden_group_size_x
       - .offset:         54
         .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
         .value_kind:     hidden_remainder_z
-      - .offset:         72
-        .size:           8
-        .value_kind:     hidden_global_offset_x
       - .offset:         80
         .size:           8
-        .value_kind:     hidden_global_offset_y
+        .value_kind:     hidden_global_offset_x
       - .offset:         88
         .size:           8
-        .value_kind:     hidden_global_offset_z
+        .value_kind:     hidden_global_offset_y
       - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
         .size:           2
         .value_kind:     hidden_grid_dims
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
-    .kernarg_segment_size: 288
+    .kernarg_segment_size: 296
     .language:       OpenCL C
     .language_version:
       - 2
       - 0
     .max_flat_workgroup_size: 1024
-    .name:           _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii
+    .name:           _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_
     .private_segment_fixed_size: 0
-    .sgpr_count:     12
+    .sgpr_count:     13
     .sgpr_spill_count: 0
-    .symbol:         _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_ii.kd
+    .symbol:         _Z29scan_linear_recurrence_kernelIfEvPKT_S2_PS0_iiS3_.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
-    .vgpr_count:     8
+    .vgpr_count:     10
     .vgpr_spill_count: 0
     .wavefront_size: 32
     .workgroup_processor_mode: 1
@@ -215902,61 +215967,65 @@ amdhsa.kernels:
       - .offset:         28
         .size:           4
         .value_kind:     by_value
-      - .offset:         32
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         36
-        .size:           4
-        .value_kind:     hidden_block_count_y
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
       - .offset:         40
         .size:           4
-        .value_kind:     hidden_block_count_z
+        .value_kind:     hidden_block_count_x
       - .offset:         44
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         46
-        .size:           2
-        .value_kind:     hidden_group_size_y
+        .size:           4
+        .value_kind:     hidden_block_count_y
       - .offset:         48
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         50
-        .size:           2
-        .value_kind:     hidden_remainder_x
+        .size:           4
+        .value_kind:     hidden_block_count_z
       - .offset:         52
         .size:           2
-        .value_kind:     hidden_remainder_y
+        .value_kind:     hidden_group_size_x
       - .offset:         54
         .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
         .value_kind:     hidden_remainder_z
-      - .offset:         72
-        .size:           8
-        .value_kind:     hidden_global_offset_x
       - .offset:         80
         .size:           8
-        .value_kind:     hidden_global_offset_y
+        .value_kind:     hidden_global_offset_x
       - .offset:         88
         .size:           8
-        .value_kind:     hidden_global_offset_z
+        .value_kind:     hidden_global_offset_y
       - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
         .size:           2
         .value_kind:     hidden_grid_dims
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
-    .kernarg_segment_size: 288
+    .kernarg_segment_size: 296
     .language:       OpenCL C
     .language_version:
       - 2
       - 0
     .max_flat_workgroup_size: 1024
-    .name:           _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii
+    .name:           _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_
     .private_segment_fixed_size: 0
-    .sgpr_count:     12
+    .sgpr_count:     13
     .sgpr_spill_count: 0
-    .symbol:         _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_ii.kd
+    .symbol:         _Z29scan_linear_recurrence_kernelIdEvPKT_S2_PS0_iiS3_.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
-    .vgpr_count:     11
+    .vgpr_count:     12
     .vgpr_spill_count: 0
     .wavefront_size: 32
     .workgroup_processor_mode: 1

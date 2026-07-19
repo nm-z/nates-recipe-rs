@@ -8886,17 +8886,17 @@ foreachx_pow_kernel:                    ; @foreachx_pow_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_ca059ac8e52be8ef,@object ; @__hip_cuid_ca059ac8e52be8ef
+	.type	__hip_cuid_9ed884a44759fdd9,@object ; @__hip_cuid_9ed884a44759fdd9
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_ca059ac8e52be8ef
-__hip_cuid_ca059ac8e52be8ef:
+	.globl	__hip_cuid_9ed884a44759fdd9
+__hip_cuid_9ed884a44759fdd9:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_ca059ac8e52be8ef, 1
+	.size	__hip_cuid_9ed884a44759fdd9, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_ca059ac8e52be8ef
+	.addrsig_sym __hip_cuid_9ed884a44759fdd9
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

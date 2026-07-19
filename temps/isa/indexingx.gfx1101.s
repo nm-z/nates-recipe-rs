@@ -10657,17 +10657,17 @@ s_waitcnt vmcnt(0)
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_2e306abddfeb77af,@object ; @__hip_cuid_2e306abddfeb77af
+	.type	__hip_cuid_81cc7768dbb71a8b,@object ; @__hip_cuid_81cc7768dbb71a8b
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_2e306abddfeb77af
-__hip_cuid_2e306abddfeb77af:
+	.globl	__hip_cuid_81cc7768dbb71a8b
+__hip_cuid_81cc7768dbb71a8b:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_2e306abddfeb77af, 1
+	.size	__hip_cuid_81cc7768dbb71a8b, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_2e306abddfeb77af
+	.addrsig_sym __hip_cuid_81cc7768dbb71a8b
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

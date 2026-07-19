@@ -112250,17 +112250,17 @@ _ZN7rocprim17ROCPRIM_400200_NS16block_radix_sortIdLj256ELj4EiLj1ELj1ELj0ELNS0_26
 	.long	8                               ; 0x8
 	.size	_ZN7rocprim17ROCPRIM_400200_NS16block_radix_sortIdLj256ELj4EiLj1ELj1ELj0ELNS0_26block_radix_rank_algorithmE1ELNS0_18block_padding_hintE2ELNS0_4arch9wavefront6targetE0EE19radix_bits_per_passE, 4
 
-	.type	__hip_cuid_8df50aaa972784a0,@object ; @__hip_cuid_8df50aaa972784a0
+	.type	__hip_cuid_f93af0f5a3157433,@object ; @__hip_cuid_f93af0f5a3157433
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_8df50aaa972784a0
-__hip_cuid_8df50aaa972784a0:
+	.globl	__hip_cuid_f93af0f5a3157433
+__hip_cuid_f93af0f5a3157433:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_8df50aaa972784a0, 1
+	.size	__hip_cuid_f93af0f5a3157433, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_8df50aaa972784a0
+	.addrsig_sym __hip_cuid_f93af0f5a3157433
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

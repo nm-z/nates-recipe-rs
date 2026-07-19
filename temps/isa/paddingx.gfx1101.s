@@ -1419,17 +1419,17 @@ paddingx_circular2d_kernel:             ; @paddingx_circular2d_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_986494e33675af0b,@object ; @__hip_cuid_986494e33675af0b
+	.type	__hip_cuid_28a7eb9888b52032,@object ; @__hip_cuid_28a7eb9888b52032
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_986494e33675af0b
-__hip_cuid_986494e33675af0b:
+	.globl	__hip_cuid_28a7eb9888b52032
+__hip_cuid_28a7eb9888b52032:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_986494e33675af0b, 1
+	.size	__hip_cuid_28a7eb9888b52032, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_986494e33675af0b
+	.addrsig_sym __hip_cuid_28a7eb9888b52032
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

@@ -2291,17 +2291,17 @@ poolx_adaptive_max_pool_kernel:         ; @poolx_adaptive_max_pool_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_1534af8ea322cf28,@object ; @__hip_cuid_1534af8ea322cf28
+	.type	__hip_cuid_fa92a8b54bae5a6c,@object ; @__hip_cuid_fa92a8b54bae5a6c
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_1534af8ea322cf28
-__hip_cuid_1534af8ea322cf28:
+	.globl	__hip_cuid_fa92a8b54bae5a6c
+__hip_cuid_fa92a8b54bae5a6c:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_1534af8ea322cf28, 1
+	.size	__hip_cuid_fa92a8b54bae5a6c, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_1534af8ea322cf28
+	.addrsig_sym __hip_cuid_fa92a8b54bae5a6c
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

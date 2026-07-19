@@ -4355,17 +4355,17 @@ sgd_update_f32_kernel:                  ; @sgd_update_f32_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_78f7236bb5fcf443,@object ; @__hip_cuid_78f7236bb5fcf443
+	.type	__hip_cuid_b219763d6904f5d6,@object ; @__hip_cuid_b219763d6904f5d6
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_78f7236bb5fcf443
-__hip_cuid_78f7236bb5fcf443:
+	.globl	__hip_cuid_b219763d6904f5d6
+__hip_cuid_b219763d6904f5d6:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_78f7236bb5fcf443, 1
+	.size	__hip_cuid_b219763d6904f5d6, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_78f7236bb5fcf443
+	.addrsig_sym __hip_cuid_b219763d6904f5d6
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

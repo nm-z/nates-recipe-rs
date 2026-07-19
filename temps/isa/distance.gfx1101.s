@@ -216,17 +216,17 @@ pairwise_l2_kernel:                     ; @pairwise_l2_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_296a8a67de2c80d,@object ; @__hip_cuid_296a8a67de2c80d
+	.type	__hip_cuid_17a5d4dcc061b649,@object ; @__hip_cuid_17a5d4dcc061b649
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_296a8a67de2c80d
-__hip_cuid_296a8a67de2c80d:
+	.globl	__hip_cuid_17a5d4dcc061b649
+__hip_cuid_17a5d4dcc061b649:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_296a8a67de2c80d, 1
+	.size	__hip_cuid_17a5d4dcc061b649, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_296a8a67de2c80d
+	.addrsig_sym __hip_cuid_17a5d4dcc061b649
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

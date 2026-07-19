@@ -50082,17 +50082,17 @@ _ZN7rocprim17ROCPRIM_400200_NS6detail17trampoline_kernelINS1_19wrapped_scan_conf
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_e661bca0c42c97a4,@object ; @__hip_cuid_e661bca0c42c97a4
+	.type	__hip_cuid_2ad509d2f57ce021,@object ; @__hip_cuid_2ad509d2f57ce021
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_e661bca0c42c97a4
-__hip_cuid_e661bca0c42c97a4:
+	.globl	__hip_cuid_2ad509d2f57ce021
+__hip_cuid_2ad509d2f57ce021:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_e661bca0c42c97a4, 1
+	.size	__hip_cuid_2ad509d2f57ce021, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_e661bca0c42c97a4
+	.addrsig_sym __hip_cuid_2ad509d2f57ce021
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

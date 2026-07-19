@@ -6705,17 +6705,17 @@ mx_rad2deg_kernel:                      ; @mx_rad2deg_kernel
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_69ec6756b4b8e0e1,@object ; @__hip_cuid_69ec6756b4b8e0e1
+	.type	__hip_cuid_92810c59e977c741,@object ; @__hip_cuid_92810c59e977c741
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_69ec6756b4b8e0e1
-__hip_cuid_69ec6756b4b8e0e1:
+	.globl	__hip_cuid_92810c59e977c741
+__hip_cuid_92810c59e977c741:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_69ec6756b4b8e0e1, 1
+	.size	__hip_cuid_92810c59e977c741, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_69ec6756b4b8e0e1
+	.addrsig_sym __hip_cuid_92810c59e977c741
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

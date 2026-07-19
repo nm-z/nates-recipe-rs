@@ -5224,17 +5224,17 @@ _Z24tall_skinny_dgemm_kernelIdEvPKT_S2_PS0_iii: ; @_Z24tall_skinny_dgemm_kernelI
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_4af7afefaa68c975,@object ; @__hip_cuid_4af7afefaa68c975
+	.type	__hip_cuid_4b6c6c44af1fe877,@object ; @__hip_cuid_4b6c6c44af1fe877
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_4af7afefaa68c975
-__hip_cuid_4af7afefaa68c975:
+	.globl	__hip_cuid_4b6c6c44af1fe877
+__hip_cuid_4b6c6c44af1fe877:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_4af7afefaa68c975, 1
+	.size	__hip_cuid_4b6c6c44af1fe877, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_4af7afefaa68c975
+	.addrsig_sym __hip_cuid_4b6c6c44af1fe877
 	.amdgpu_metadata
 ---
 amdhsa.kernels:

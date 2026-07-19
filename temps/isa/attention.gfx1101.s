@@ -8102,17 +8102,17 @@ _Z21flash_attn_f64_kernelIdEvPKT_S2_S2_PS0_iiii: ; @_Z21flash_attn_f64_kernelIdE
 	.set amdgpu.max_num_agpr, 0
 	.set amdgpu.max_num_sgpr, 0
 	.text
-	.type	__hip_cuid_8a297e594e6283d5,@object ; @__hip_cuid_8a297e594e6283d5
+	.type	__hip_cuid_a91fbdd93d1ec8c8,@object ; @__hip_cuid_a91fbdd93d1ec8c8
 	.section	.bss,"aw",@nobits
-	.globl	__hip_cuid_8a297e594e6283d5
-__hip_cuid_8a297e594e6283d5:
+	.globl	__hip_cuid_a91fbdd93d1ec8c8
+__hip_cuid_a91fbdd93d1ec8c8:
 	.byte	0                               ; 0x0
-	.size	__hip_cuid_8a297e594e6283d5, 1
+	.size	__hip_cuid_a91fbdd93d1ec8c8, 1
 
 	.ident	"AMD clang version 22.0.0git (/srcdest/rocm-llvm f58b06dce1f9c15707c5f808fd002e18c2accf7e)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
-	.addrsig_sym __hip_cuid_8a297e594e6283d5
+	.addrsig_sym __hip_cuid_a91fbdd93d1ec8c8
 	.amdgpu_metadata
 ---
 amdhsa.kernels:
