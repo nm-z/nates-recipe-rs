@@ -10,32 +10,72 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
 }
 
 /// Builds a tokenizer from gguf metadata, inferring the model from what's present:
-/// SentencePiece/Unigram when `scores` exist, otherwise byte-level BPE from `merges`.
+/// SentencePiece (score-ranked BPE) when `scores` exist, otherwise byte-level BPE
+/// from `merges`.
 pub fn from_gguf(g: &Gguf) -> Result<Tokenizer> {
 	if g.f32_arr("tokenizer.ggml.scores").is_ok() {
-		from_gguf_unigram(g)
+		from_gguf_spm(g)
 	} else {
 		from_gguf_bpe(g)
 	}
 }
 
-fn from_gguf_unigram(g: &Gguf) -> Result<Tokenizer> {
+/// llama.cpp's SPM tokenizer (`llm_tokenizer_spm`) is greedy bigram-BPE ranked by
+/// piece SCORE — adjacent pieces merge when their concatenation is in the vocab,
+/// best score first — NOT Unigram Viterbi, which segments the same text
+/// differently. Reconstructed as a BPE merge table the same way HF's
+/// slow-tokenizer converter does: every vocab piece that splits into two vocab
+/// pieces contributes a merge, ranked by the merged piece's score (descending,
+/// stable). Metaspace pre-tokenizer/decoder carries the `▁ = space` convention
+/// and the leading dummy prefix; unmapped bytes fall back to `<0xXX>` pieces.
+fn from_gguf_spm(g: &Gguf) -> Result<Tokenizer> {
 	let pieces = g.str_arr("tokenizer.ggml.tokens")?;
 	let scores = g.f32_arr("tokenizer.ggml.scores")?;
-	let unk = g.u32_kv("tokenizer.ggml.unknown_token_id").unwrap_or(3) as usize;
-	let pairs: Vec<(String, f64)> = pieces
-		.into_iter()
-		.zip(scores.iter().map(|&s| s as f64))
+	let vocab: Vocab = pieces
+		.iter()
+		.enumerate()
+		.map(|(i, t)| (t.clone(), i as u32))
 		.collect();
-	let uni = tokenizers::models::unigram::Unigram::from(pairs, Some(unk), true)
-		.map_err(|e| anyhow!("unigram: {e}"))?;
-	let mut tk = Tokenizer::new(uni);
-	tk.with_normalizer(Some(tokenizers::normalizers::Sequence::new(vec![
-		tokenizers::normalizers::Prepend::new("\u{2581}".to_string()).into(),
-		tokenizers::normalizers::Replace::new(" ", "\u{2581}")
+	let mut merges: Vec<(f32, String, String)> = Vec::new();
+	for (p, &sc) in pieces.iter().zip(scores.iter()) {
+		for (b, _c) in p.char_indices().skip(1) {
+			let (l, r) = p.split_at(b);
+			if vocab.contains_key(l) && vocab.contains_key(r) {
+				merges.push((sc, l.to_owned(), r.to_owned()));
+			}
+		}
+	}
+	merges.sort_by(|a, b| return b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+	let merge_pairs: Vec<(String, String)> =
+		merges.into_iter().map(|(_sc, l, r)| return (l, r)).collect();
+	let unk = g.u32_kv("tokenizer.ggml.unknown_token_id").unwrap_or(0);
+	let unk_piece = pieces
+		.get(unk as usize)
+		.cloned()
+		.unwrap_or_else(|| return "<unk>".to_owned());
+	let bpe = BPE::builder()
+		.vocab_and_merges(vocab, merge_pairs)
+		.unk_token(unk_piece)
+		.byte_fallback(true)
+		.fuse_unk(true)
+		.build()
+		.map_err(|e| anyhow!("spm bpe: {e}"))?;
+	let mut tk = Tokenizer::new(bpe);
+	let ms = tokenizers::pre_tokenizers::metaspace::Metaspace::new(
+		'\u{2581}',
+		tokenizers::pre_tokenizers::metaspace::PrependScheme::First,
+		false,
+	);
+	tk.with_pre_tokenizer(Some(ms));
+	let decode_chain: Vec<tokenizers::DecoderWrapper> = vec![
+		tokenizers::normalizers::Replace::new("\u{2581}", " ")
 			.map_err(|e| anyhow!("replace: {e}"))?
 			.into(),
-	])));
+		tokenizers::decoders::byte_fallback::ByteFallback::new().into(),
+		tokenizers::decoders::fuse::Fuse::new().into(),
+		tokenizers::decoders::strip::Strip::new(' ', 1, 0).into(),
+	];
+	tk.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(decode_chain)));
 	Ok(tk)
 }
 
