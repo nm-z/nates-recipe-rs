@@ -145,6 +145,11 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 			.filter(|v| !v.is_empty())
 			.map(PathBuf::from)
 			.unwrap_or_else(|| PathBuf::from("/opt/rocm"));
+		use std::io::IsTerminal as _;
+		let color = match io::stderr().is_terminal() {
+			true => "always",
+			false => "never",
+		};
 		let mut cmd = process::Command::new("rustc");
 		cmd.arg(path)
 			.arg("-L")
@@ -153,6 +158,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 			.arg(root.join("deps"))
 			.arg("-L")
 			.arg(rocm.join("lib"))
+			.args(["--color", color])
 			.args(["--edition", "2024"])
 			.args([
 				"-l",
