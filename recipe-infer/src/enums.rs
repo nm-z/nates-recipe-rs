@@ -110,6 +110,15 @@ impl Metric {
 		}
 	}
 
+	pub fn pinned_slot(self) -> Option<usize> {
+		return match self {
+			Metric::Loss => Some(0),
+			Metric::Accuracy => Some(1),
+			Metric::R2 => Some(2),
+			Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => None,
+		};
+	}
+
 	pub fn render(self, v: f64) -> String {
 		let w = self.fmt().width;
 		v.partial_cmp(&v)

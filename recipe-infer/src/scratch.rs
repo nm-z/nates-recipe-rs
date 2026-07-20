@@ -432,28 +432,12 @@ impl Scratch {
 		}
 	}
 
-	pub fn download_scalar_deferred(&self) {
-		gpu_core::memory::pinned_download(0, &self.metric_scalar, &self.copy_stream);
-	}
-
-	pub fn download_scalar_b_deferred(&self) {
-		gpu_core::memory::pinned_download(1, &self.metric_scalar_b, &self.copy_stream);
-	}
-
-	pub fn sync_deferred_scalar(&self) -> f64 {
-		let r = self.copy_stream.synchronize();
-		if !r.is_ok() {
-			Write::error(format!(
-				"sync copy stream: {}",
-				r.err().map(|e| e.to_string()).unwrap_or_default()
-			));
-		}
-		return gpu_core::memory::pinned_read(0);
-	}
-
-	pub fn read_metric_scalar(&self) -> f64 {
-		self.download_scalar_deferred();
-		return self.sync_deferred_scalar();
+	pub fn defer_scalar(
+		&self,
+		slot: usize,
+		src: &gpu_core::memory::GpuBuffer,
+	) -> Result<(), gpu_core::HipError> {
+		return gpu_core::memory::pinned_download(slot, src, &self.copy_stream);
 	}
 
 	pub fn sync_copy_stream(&self) {
@@ -467,11 +451,8 @@ impl Scratch {
 		}
 	}
 
-	pub fn deferred_scalar(&self) -> f64 {
-		return gpu_core::memory::pinned_read(0);
-	}
-	pub fn deferred_scalar_b(&self) -> f64 {
-		return gpu_core::memory::pinned_read(1);
+	pub fn deferred_scalar(&self, slot: usize) -> Result<f64, gpu_core::HipError> {
+		return gpu_core::memory::pinned_read(slot);
 	}
 }
 

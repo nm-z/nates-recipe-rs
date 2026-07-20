@@ -34,7 +34,7 @@ pub fn init() -> Result<(), gpu_core::HipError> {
 }
 
 pub fn shutdown() {
-	gpu_core::memory::free_pinned_pair();
+	gpu_core::memory::free_pinned_slots();
 	gpu_core::kernels::gpu_shutdown();
 }
 

@@ -133,6 +133,49 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 	}
 	line
 }
+pub(crate) struct Pending {
+	pub epoch: usize,
+	pub elapsed: f64,
+}
+
+pub(crate) fn live_vals(
+	metrics: &[Metric],
+	live: &[(Metric, usize, usize)],
+	ring_scale: &[recipe_infer::LossScale],
+	ss_tot: f64,
+	rate: f64,
+	pend: &Pending,
+) -> anyhow::Result<Vec<f64>> {
+	let mut vals = Vec::with_capacity(metrics.len());
+	for m in metrics {
+		let v = match m {
+			Metric::Epoch => pend.epoch as f64,
+			Metric::Lr => rate,
+			Metric::Time => pend.elapsed,
+			Metric::Hip => f64::NAN,
+			Metric::Loss | Metric::Accuracy | Metric::R2 => {
+				match live.iter().find(|&&(lm, _slot, _ri)| lm == *m) {
+					None => f64::NAN,
+					Some(&(_lm, slot, ri)) => {
+						let raw = gpu_core::memory::pinned_read(slot)
+							.context("read metric scalar")?;
+						match m {
+							Metric::R2 => 1.0 - raw / ss_tot,
+							Metric::Accuracy => raw,
+							_loss => {
+								let s = ring_scale[ri];
+								s.sign * raw / s.div
+							}
+						}
+					}
+				}
+			}
+		};
+		vals.push(v);
+	}
+	return Ok(vals);
+}
+
 pub(crate) fn metric_flag(m: Metric) -> gpu_core::log::Flag {
 	return match m {
 		Metric::Loss => loss,
@@ -407,6 +450,25 @@ impl ModelInner {
 			ring_row.extend(Some(m).filter(|_probe| keep));
 		}
 		let n_rows = ring_row.len();
+		let live: Vec<(Metric, usize, usize)> = cfg
+			.metrics
+			.iter()
+			.copied()
+			.filter_map(|m| {
+				let slot = m.pinned_slot()?;
+				let ri = ring_row.iter().position(|&d| d == m)?;
+				Some((m, slot, ri))
+			})
+			.collect();
+		let streaming = !plotting && !live.is_empty();
+		if streaming {
+			let slots = live
+				.iter()
+				.map(|&(_m, slot, _ri)| slot + 1)
+				.max()
+				.unwrap_or(0);
+			gpu_core::memory::pinned_claim(slots).context("pinned metric slots")?;
+		}
 		let n_timed = 0usize;
 		let zf: recipe_infer::ZFit = match Some(()).filter(|_probe| d_sc == 0) {
 			Some(_empty) => recipe_infer::ZFit {
@@ -640,6 +702,7 @@ impl ModelInner {
 			};
 			n_rows
 		];
+		let mut pending: Option<Pending> = None;
 		for e in 0..cfg.epochs {
 			let Some(_go) = Some(()).filter(|_probe| INTERRUPTED.load(Ordering::SeqCst) == 0)
 			else {
@@ -663,11 +726,26 @@ impl ModelInner {
 				break;
 			};
 			let out = &sc.acts[last];
+			for pend in pending.take().iter() {
+				sc.sync_copy_stream();
+				let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr, pend)?;
+				metrics_emit("", &cfg.metrics, &vals);
+			}
 			for mi in 0..ring_row.len() {
 				let m = ring_row[mi];
 				let slot = base.view(ring_off + mi * epochs + e, 1);
 				ring_scale[mi] =
 					metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot)?;
+			}
+			if streaming && log_now {
+				for &(_m, slot, ri) in &live {
+					sc.defer_scalar(slot, &base.view(ring_off + ri * epochs + e, 1))
+						.context("defer metric scalar")?;
+				}
+				pending = Some(Pending {
+					epoch: e,
+					elapsed: start.elapsed().as_secs_f64(),
+				});
 			}
 			epoch_meta.push(EpochMeta {
 				epoch: e,
@@ -677,6 +755,11 @@ impl ModelInner {
 					.map(|_probe| Logged::Yes)
 					.unwrap_or(Logged::No),
 			});
+		}
+		for pend in pending.take().iter() {
+			sc.sync_copy_stream();
+			let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr, pend)?;
+			metrics_emit("", &cfg.metrics, &vals);
 		}
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst) != 0;
 		Some(())
@@ -816,7 +899,7 @@ impl ModelInner {
 			let Halt::Continue = nan_stop else {
 				break;
 			};
-			let logged_flag = matches!(meta.logged, Logged::Yes);
+			let logged_flag = matches!(meta.logged, Logged::Yes) && !streaming;
 			let Some(_go) = Some(())
 				.filter(|_probe| (logged_flag || checkpointed.is_some()) && !plotting)
 			else {

@@ -1185,60 +1185,74 @@ pub fn exit_d2h_enqueue_buf(src: &GpuBuffer, bytes: usize) -> Result<ExitD2H, Hi
 	return unsafe { exit_d2h_enqueue(src.ptr_raw().cast_const(), bytes) };
 }
 
-static PINNED_PAIR: Mutex<usize> = Mutex::new(0);
+static PINNED_SLOTS: Mutex<(usize, usize)> = Mutex::new((0, 0));
 
-fn pinned_pair_addr() -> usize {
-	let mut g = lock_recover(&PINNED_PAIR, "PINNED_PAIR");
-	if *g == 0 {
-		match crate::hip::host_malloc(16, 0) {
-			Ok(p) => *g = p.addr(),
-			Err(e) => {
-				Write::error(format!("pinned scalars: {e}"));
-				return 0;
-			}
+pub fn pinned_claim(slots: usize) -> Result<(), HipError> {
+	let mut g = lock_recover(&PINNED_SLOTS, "PINNED_SLOTS");
+	if g.0 != 0 {
+		if slots > g.1 {
+			Write::error(format!(
+				"pinned scalars: claimed {} slots, {slots} requested; the pinned region is one claim per run",
+				g.1
+			));
+			return Err(HipError(1));
 		}
+		return Ok(());
 	}
-	return *g;
+	let p = crate::hip::host_malloc(slots * size_of::<f64>(), 0)?;
+	*g = (p.addr(), slots);
+	return Ok(());
 }
 
-pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream) {
-	let base = pinned_pair_addr();
-	if base == 0 {
-		return;
+fn pinned_at(slot: usize) -> Result<usize, HipError> {
+	let g = lock_recover(&PINNED_SLOTS, "PINNED_SLOTS");
+	if g.0 == 0 {
+		Write::error("pinned scalars: read before pinned_claim");
+		return Err(HipError(1));
 	}
-	let dst = (base + (slot & 1) * size_of::<f64>()) as *mut c_void;
-	// SAFETY: dst is one f64 slot inside the 16-byte pinned pair; src covers 8
-	let r = unsafe {
-		xfer(
+	if slot >= g.1 {
+		Write::error(format!(
+			"pinned scalars: slot {slot} outside the {} claimed",
+			g.1
+		));
+		return Err(HipError(1));
+	}
+	return Ok(g.0 + slot * size_of::<f64>());
+}
+
+pub fn pinned_download(
+	slot: usize,
+	src: &GpuBuffer,
+	stream: &crate::hip::Stream,
+) -> Result<(), HipError> {
+	let dst = pinned_at(slot)? as *mut c_void;
+	// SAFETY: dst is one f64 slot inside the claimed pinned region; src covers 8 bytes.
+	unsafe {
+		return xfer(
 			dst,
 			src.ptr_raw().cast_const(),
 			size_of::<f64>(),
 			HIP_MEMCPY_D2H,
 			stream.raw(),
-		)
-	};
-	if let Err(e) = r {
-		Write::error(format!("pinned download: {e}"));
+		);
 	}
 }
 
-#[must_use]
-pub fn pinned_read(slot: usize) -> f64 {
-	let base = pinned_pair_addr();
-	if base == 0 {
-		return 0.0;
+pub fn pinned_read(slot: usize) -> Result<f64, HipError> {
+	let at = pinned_at(slot)?;
+	// SAFETY: pinned_at bounds-checked the slot against the live claimed region.
+	unsafe {
+		return Ok(*(at as *const f64));
 	}
-	// SAFETY: base points at a live 16-byte pinned allocation; slot&1 stays in it.
-	return unsafe { *((base + (slot & 1) * size_of::<f64>()) as *const f64) };
 }
 
-pub fn free_pinned_pair() {
-	let mut g = lock_recover(&PINNED_PAIR, "PINNED_PAIR");
-	if *g != 0 {
+pub fn free_pinned_slots() {
+	let mut g = lock_recover(&PINNED_SLOTS, "PINNED_SLOTS");
+	if g.0 != 0 {
 		let _ = device_synchronize();
 		// SAFETY: the address came from host_malloc and is freed exactly once here.
-		let _ = unsafe { crate::hip::host_free(*g as *mut c_void) };
-		*g = 0;
+		let _ = unsafe { crate::hip::host_free(g.0 as *mut c_void) };
+		*g = (0, 0);
 	}
 }
 
