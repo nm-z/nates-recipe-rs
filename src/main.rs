@@ -102,6 +102,25 @@ fn run_chat(name: Option<&str>) -> Result<()> {
 	Ok(())
 }
 
+fn unresolved_names(stderr: &str) -> Vec<String> {
+	let mut names: Vec<String> = Vec::new();
+	for lead in ["cannot find value `", "cannot find function `"] {
+		let mut rest = stderr;
+		while let Some(at) = rest.find(lead) {
+			rest = &rest[at + lead.len()..];
+			let Some(end) = rest.find('`') else {
+				break;
+			};
+			let name = rest[..end].to_owned();
+			if !names.contains(&name) {
+				names.push(name);
+			}
+			rest = &rest[end..];
+		}
+	}
+	return names;
+}
+
 fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	use std::hash::Hasher;
 	use std::os::unix::process::CommandExt;
@@ -153,8 +172,19 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 				root.join(format!("lib{name}.rlib")).display()
 			));
 		}
-		let status = cmd.status().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
-		anyhow::ensure!(status.success(), "rustc failed on {path}: {status}");
+		let out = cmd.output().map_err(|e| anyhow::anyhow!("rustc: {e}"))?;
+		use io::Write as _;
+		drop(io::stdout().write_all(&out.stdout));
+		drop(io::stderr().write_all(&out.stderr));
+		if !out.status.success() {
+			let text = String::from_utf8_lossy(&out.stderr);
+			for name in unresolved_names(&text) {
+				if let Some(hint) = recipe_infer::name_hint(&name) {
+					Write::always(&hint);
+				}
+			}
+			anyhow::bail!("rustc failed on {path}: {}", out.status);
+		}
 	}
 	Err(process::Command::new(&bin).args(extra).exec().into())
 }
