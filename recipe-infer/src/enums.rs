@@ -186,59 +186,12 @@ pub use alias::{
 	ACCURACY as accuracy, EPOCH as epoch, HIP as Hip, LOSS as loss, LR as lr, R_TWO as r2,
 	TIME as time,
 };
+pub use alias::ACCURACY as Acc;
 pub use alias::{
 	BCE as bce, CE as ce, ELU as elu, FOCAL as focal, GELU as gelu, HUBER as huber, LEAK as leak,
 	LINEAR as linear, MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu,
 	SIG as sig, SILU as silu, SWISH as swish, TANH as tanh,
 };
-
-pub const METRIC_NAMES: [&str; 7] = ["Loss", "Accuracy", "R2", "Lr", "Epoch", "Time", "hip"];
-pub const LOSS_NAMES: [&str; 6] = ["mse", "mae", "huber", "ce", "bce", "focal"];
-pub const ACTIVATION_NAMES: [&str; 12] = [
-	"relu", "leak", "gelu", "silu", "swish", "tanh", "sig", "elu", "selu", "prelu", "linear",
-	"softmax",
-];
-
-fn nearest(unknown: &str, names: &[&str]) -> Option<&'static str> {
-	let low = unknown.to_ascii_lowercase();
-	return names
-		.iter()
-		.find(|cand| {
-			let c = cand.to_ascii_lowercase();
-			return c.starts_with(&low) || low.starts_with(&c);
-		})
-		.map(|cand| -> &'static str {
-			for known in METRIC_NAMES.iter().chain(&LOSS_NAMES).chain(&ACTIVATION_NAMES) {
-				if known == cand {
-					return known;
-				}
-			}
-			return "";
-		})
-		.filter(|cand| !cand.is_empty());
-}
-
-pub fn name_hint(unknown: &str) -> Option<String> {
-	for (names, surface) in [
-		(&METRIC_NAMES[..], ".log()"),
-		(&LOSS_NAMES[..], ".loss()"),
-		(&ACTIVATION_NAMES[..], "the activation"),
-	] {
-		let Some(cand) = nearest(unknown, names) else {
-			continue;
-		};
-		return Some(format!(
-			"`{unknown}` is not a name recipe knows. did you mean `{cand}`?\n{surface} takes: {}\ntry: {}",
-			names.join(", "),
-			match surface {
-				".log()" => format!(".log([{cand}])"),
-				".loss()" => format!(".loss({cand})"),
-				_other => format!(".{cand}()"),
-			}
-		));
-	}
-	return None;
-}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Param {

@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub use recipe_infer::{
-	Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu, focal,
-	gelu, hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
+	Acc, Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu,
+	focal, gelu, hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
 };
 
 pub trait IntoLayer {
