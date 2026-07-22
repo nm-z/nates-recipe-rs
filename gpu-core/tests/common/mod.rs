@@ -10,7 +10,7 @@ pub fn inventory_dir() -> String {
 }
 
 fn hydrate() -> String {
-	let db_path = format!("{}/../kernel_inventory.db", env!("CARGO_MANIFEST_DIR"));
+	let db_path = format!("{}/../recipe.db", env!("CARGO_MANIFEST_DIR"));
 	let out = env::temp_dir().join(format!("ki_inv_{}", process::id()));
 	fs::create_dir_all(&out).expect("create temp inventory dir");
 	let conn =

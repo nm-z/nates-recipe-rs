@@ -1016,7 +1016,7 @@ fn load_inventory() -> Vec<(String, String)> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
 	let Ok(rd) = fs::read_dir(&dir) else {
-		panic!("no kernel_inventory at {dir}");
+		panic!("no recipe.db at {dir}");
 	};
 	for e in rd.flatten() {
 		let p = e.path();

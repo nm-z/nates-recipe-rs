@@ -74,7 +74,7 @@ One GPU process at a time; concurrent runs OOM at weight init.
 
 f64 `.hip` kernels, HIP/ROCm bindings, tagged memory ledger. Everything GPU sits on this.
 
-Kernel proof suite; the test target is named `suite`, not `all`, and it needs the committed `kernel_inventory.db`:
+Kernel proof suite; the test target is named `suite`, not `all`, and it needs the committed `recipe.db`:
 
 ```bash
 cargo test -p gpu-core --release --test suite

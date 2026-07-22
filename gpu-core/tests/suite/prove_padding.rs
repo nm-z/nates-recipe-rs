@@ -359,7 +359,7 @@ fn canon(name: &str) -> &'static str {
 fn load_padding() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	for e in fs::read_dir(&dir).expect("no kernel_inventory").flatten() {
+	for e in fs::read_dir(&dir).expect("no recipe.db").flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
 			let Ok(txt) = fs::read_to_string(&p) else {

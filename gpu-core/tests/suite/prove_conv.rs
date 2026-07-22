@@ -978,7 +978,7 @@ fn canon(name: &str) -> Option<&'static str> {
 fn load_conv() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = fs::read_dir(&dir).expect("no kernel_inventory");
+	let rd = fs::read_dir(&dir).expect("no recipe.db");
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {

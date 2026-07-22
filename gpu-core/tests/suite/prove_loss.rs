@@ -465,7 +465,7 @@ fn canon(name: &str) -> &'static str {
 fn load_loss_inventory() -> Vec<String> {
 	let dir = common::inventory_dir();
 	let mut items = Vec::new();
-	let rd = fs::read_dir(&dir).unwrap_or_else(|_| panic!("no kernel_inventory at {dir}"));
+	let rd = fs::read_dir(&dir).unwrap_or_else(|_| panic!("no recipe.db at {dir}"));
 	for e in rd.flatten() {
 		let p = e.path();
 		if p.extension().is_some_and(|x| x == "json") {
