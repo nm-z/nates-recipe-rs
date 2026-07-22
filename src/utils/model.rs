@@ -630,7 +630,7 @@ impl Infer {
 				}
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
-						crate::tui::chat(path);
+						crate::cli::tui::chat(path);
 						recipe_infer::shutdown();
 					}
 					None => {

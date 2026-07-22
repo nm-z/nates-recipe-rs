@@ -63,7 +63,7 @@ fn main() -> Result<ExitCode> {
 	let gguf_str = env::var("GGUF").unwrap_or_else(|_e| {
 		"/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf".to_owned()
 	});
-	recipe::tui::chat(&gguf_str);
+	recipe::cli::tui::chat(&gguf_str);
 
 	Write::line(gpu, gpu_core::memory::ledger_report());
 	recipe_infer::shutdown();

@@ -60,7 +60,7 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 		if !line.is_empty() {
 			line.push_str("  ");
 		}
-		let c = crate::tui::palette(shown);
+		let c = crate::cli::tui::palette(shown);
 		shown += 1;
 		let _ = write!(
 			line,
@@ -881,7 +881,7 @@ impl ModelInner {
 					.as_ref()
 					.map(|g| g.serialize())
 					.unwrap_or_default();
-				crate::tui::show(&summary_text, &plot_rows, &plot_ys);
+				crate::cli::tui::show(&summary_text, &plot_rows, &plot_ys);
 			})
 			.unwrap_or(());
 		let end_val = Some(()).filter(|_probe| !was_interrupted).map(|_probe| {
