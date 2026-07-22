@@ -7,25 +7,37 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal};
 
+#[derive(Clone)]
+pub struct ModelState {
+	pub specs: Vec<LayerSpec>,
+	pub objective: recipe_ir::ObjectiveIntent,
+	pub lr_intent: Option<f64>,
+}
+
 thread_local! {
-	static MODEL_REGISTRY: RefCell<HashMap<u32, (Vec<LayerSpec>, Loss, recipe_ir::ObjectiveIntent)>> =
+	static MODEL_REGISTRY: RefCell<HashMap<u32, ModelState>> =
 		RefCell::new(HashMap::new());
 }
 
-pub fn register_model(
+pub fn upsert_model(
 	id: recipe_ir::ObjectId,
 	specs: Vec<LayerSpec>,
-	loss: Loss,
 	objective: recipe_ir::ObjectiveIntent,
+	lr_intent: Option<f64>,
 ) {
 	MODEL_REGISTRY.with(|reg| {
-		reg.borrow_mut().insert(id.0, (specs, loss, objective));
+		reg.borrow_mut().insert(
+			id.0,
+			ModelState {
+				specs,
+				objective,
+				lr_intent,
+			},
+		);
 	});
 }
 
-pub fn registered(
-	id: recipe_ir::ObjectId,
-) -> Option<(Vec<LayerSpec>, Loss, recipe_ir::ObjectiveIntent)> {
+pub fn registered(id: recipe_ir::ObjectId) -> Option<ModelState> {
 	return MODEL_REGISTRY.with(|reg| reg.borrow().get(&id.0).cloned());
 }
 
@@ -103,7 +115,7 @@ pub fn preflight(model: &ModelInner, ds: &Dataset, net_ram: usize) -> Vec<Issue>
 		_other => 0,
 	};
 	let n_layers = model.specs.len();
-	issues.extend(output_check(model.loss.get(), last_out, n_layers, k));
+	issues.extend(output_check(model.resolved_loss(), last_out, n_layers, k));
 
 	let (free_vram, total_vram) = gpu_core::hip::mem_info()
 		.map(|m| (m.free, m.total))
@@ -190,6 +202,7 @@ pub enum TargetKind {
 	Categorical,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct DataFacts {
 	pub n: usize,
 	pub d: usize,
@@ -275,18 +288,55 @@ pub fn resolve_model(
 	specs: &[LayerSpec],
 	facts: &DataFacts,
 ) -> Result<Resolved, ResolveError> {
+	return resolve_core(objective, lr_intent, specs, Some(facts));
+}
+
+fn context_pick(facts: Option<&DataFacts>) -> Option<(Loss, &'static str, &'static str)> {
+	let Some(f) = facts else {
+		return None;
+	};
+	return match f.target_kind {
+		TargetKind::Continuous => Some((Loss::Mse, "mse", "target is continuous")),
+		TargetKind::Binary => Some((Loss::Bce, "bce", "target is binary in {0, 1}")),
+		TargetKind::Categorical => Some((Loss::Ce, "ce", "target is integer-coded categorical")),
+		TargetKind::None => None,
+	};
+}
+
+fn ambiguity_error(ref_id: recipe_ir::ObjectId, facts: &DataFacts) -> ResolveError {
+	let ctx = context_pick(Some(facts)).map_or("a context", |picked| picked.1);
+	return ResolveError::Ambiguous(vec![
+		format!(
+			"train on the dataset target with {ctx} loss (the dataset has a real target producer)"
+		),
+		format!(
+			"train through referenced model #{} as a surrogate loss",
+			ref_id.0
+		),
+	]);
+}
+
+fn resolve_core(
+	objective: &recipe_ir::ObjectiveIntent,
+	lr_intent: Option<f64>,
+	specs: &[LayerSpec],
+	facts: Option<&DataFacts>,
+) -> Result<Resolved, ResolveError> {
 	use recipe_ir::ObjectiveIntent as Obj;
 	let mut notes = Vec::new();
 	let (loss, graph) = match objective {
 		Obj::Builtin(l) => (*l, None),
-		Obj::Unspecified => {
-			let picked = match facts.target_kind {
-				TargetKind::Continuous => (Loss::Mse, "mse", "target is continuous"),
-				TargetKind::Binary => (Loss::Bce, "bce", "target is binary in {0, 1}"),
-				TargetKind::Categorical => {
-					(Loss::Ce, "ce", "target is integer-coded categorical")
-				}
-				TargetKind::None => {
+		Obj::Unspecified => match context_pick(facts) {
+			Some((l, chose, because)) => {
+				notes.push(Note {
+					subject: "loss".to_string(),
+					chose: chose.to_string(),
+					because: because.to_string(),
+				});
+				(l, None)
+			}
+			None => match facts {
+				Some(_known) => {
 					return Err(ResolveError::NoCoherentProgram(
 						"no loss can be chosen: the dataset has no target producer \
 						 (no target column and no .target()) so nothing produces y to \
@@ -294,16 +344,17 @@ pub fn resolve_model(
 							.to_string(),
 					));
 				}
-			};
-			notes.push(Note {
-				subject: "loss".to_string(),
-				chose: picked.1.to_string(),
-				because: picked.2.to_string(),
-			});
-			(picked.0, None)
-		}
+				None => (Loss::Mse, None),
+			},
+		},
 		Obj::Reference(recipe_ir::ObjectRef::Object(ref_id)) => {
-			resolve_reference(*ref_id, specs, facts, &mut notes)?
+			if let Some(f) = facts {
+				if f.target_kind != TargetKind::None {
+					return Err(ambiguity_error(*ref_id, f));
+				}
+			}
+			let mut visited = std::collections::HashSet::new();
+			resolve_reference(*ref_id, specs, facts, &mut notes, &mut visited)?
 		}
 		Obj::Expression(_) => {
 			return Err(ResolveError::NoCoherentProgram(
@@ -314,7 +365,7 @@ pub fn resolve_model(
 		}
 	};
 	let lr = lr_intent.unwrap_or(0.01);
-	let lr_note = lr_intent.is_none() && !matches!(objective, Obj::Builtin(_));
+	let lr_note = lr_intent.is_none();
 	Some(())
 		.filter(|_probe| lr_note)
 		.map(|_probe| {
@@ -336,19 +387,31 @@ pub fn resolve_model(
 fn resolve_reference(
 	ref_id: recipe_ir::ObjectId,
 	referrer_specs: &[LayerSpec],
-	facts: &DataFacts,
+	facts: Option<&DataFacts>,
 	notes: &mut Vec<Note>,
+	visited: &mut std::collections::HashSet<u32>,
 ) -> Result<(Loss, Option<recipe_ir::SemanticGraph>), ResolveError> {
-	let Some((ref_specs, ref_loss, ref_obj)) = registered(ref_id) else {
+	if !visited.insert(ref_id.0) {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate reference cycle: model #{} is revisited while resolving its own loss \
+			 chain — a reference that loops back on itself has no ground scalar",
+			ref_id.0
+		)));
+	}
+
+	let Some(state) = registered(ref_id) else {
 		return Err(ResolveError::NoCoherentProgram(format!(
 			"objective references model #{} as its loss, but that model was never registered \
-			 as a surrogate source — only a model passed to .loss(&other) is registered, and \
-			 this id was not; nothing produces a scalar for the referrer to reduce",
+			 as a surrogate source — only a model reached by a Model builder step is registered, \
+			 and this id was not; nothing produces a scalar for the referrer to reduce",
 			ref_id.0
 		)));
 	};
+	let ref_specs = state.specs;
+	let ref_obj = state.objective;
 
-	let referrer_dims = crate::graph::logical_dims(referrer_specs, facts.d);
+	let in_dim = facts.map_or(1, |f| f.d);
+	let referrer_dims = crate::graph::logical_dims(referrer_specs, in_dim);
 	let Some(referrer_last) = referrer_dims.last().copied() else {
 		return Err(ResolveError::NoCoherentProgram(
 			"surrogate reference: the referrer model has no layers, so it has no output to \
@@ -374,9 +437,40 @@ fn resolve_reference(
 		)));
 	}
 
-	let referrer_g =
-		crate::graph::build_forward_graph(recipe_ir::ObjectId(u32::MAX), &referrer_dims, ref_loss);
-	let referenced_g = crate::graph::build_forward_graph(ref_id, &referenced_dims, ref_loss);
+	let ground_loss = match ref_obj {
+		recipe_ir::ObjectiveIntent::Builtin(l) => l,
+		recipe_ir::ObjectiveIntent::Unspecified => match context_pick(facts) {
+			Some((l, _chose, _because)) => l,
+			None => match facts {
+				Some(_known) => {
+					return Err(ResolveError::NoCoherentProgram(format!(
+						"surrogate ground guard: referenced model #{}'s loss is omitted and the \
+						 dataset has no target producer, so no context loss can ground the chain",
+						ref_id.0
+					)));
+				}
+				None => Loss::Mse,
+			},
+		},
+		recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(inner)) => {
+			let (gl, _inner) = resolve_reference(inner, &ref_specs, facts, notes, visited)?;
+			gl
+		}
+		recipe_ir::ObjectiveIntent::Expression(_) => {
+			return Err(ResolveError::NoCoherentProgram(format!(
+				"surrogate ground guard: referenced model #{}'s loss is an expression, which has \
+				 no producer to ground the chain",
+				ref_id.0
+			)));
+		}
+	};
+
+	let referrer_g = crate::graph::build_forward_graph(
+		recipe_ir::ObjectId(u32::MAX),
+		&referrer_dims,
+		ground_loss,
+	);
+	let referenced_g = crate::graph::build_forward_graph(ref_id, &referenced_dims, ground_loss);
 
 	let scalar_empty = referenced_g
 		.objectives
@@ -412,25 +506,16 @@ fn resolve_reference(
 		)));
 	}
 
-	if matches!(ref_obj, recipe_ir::ObjectiveIntent::Reference(_)) {
-		return Err(ResolveError::NoCoherentProgram(format!(
-			"surrogate contradiction guard: referenced model #{} itself defines its loss by \
-			 reference to another model — a chain of surrogates has no ground scalar; give the \
-			 referenced model a concrete loss first",
-			ref_id.0
-		)));
-	}
-
 	notes.push(Note {
 		subject: "referrer objective".to_string(),
 		chose: format!("surrogate loss through referenced model #{}", ref_id.0),
 		because: format!(
 			"reference is coherent: referrer's {referrer_out}-wide output feeds the referenced \
 			 input, the referenced objective reduces to a 0-dim scalar, the reverse path reaches \
-			 all {np_referrer} referrer params, and the referenced loss is concrete ({})",
-			ref_loss.name()
+			 all {np_referrer} referrer params, and the chain grounds in {}",
+			ground_loss.name()
 		),
 	});
 
-	return Ok((ref_loss, Some(merged)));
+	return Ok((ground_loss, Some(merged)));
 }

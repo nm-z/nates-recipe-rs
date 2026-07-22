@@ -104,8 +104,18 @@ impl Model {
 		proto
 	}
 
+	fn sync_registry(&self) {
+		recipe_runtime::resolve::upsert_model(
+			self.inner.id,
+			self.inner.specs.clone(),
+			self.inner.objective,
+			self.inner.lr_intent,
+		);
+	}
+
 	pub fn layer(mut self, spec: impl IntoLayer) -> Model {
 		self.inner.specs.push(spec.into_layer());
+		self.sync_registry();
 		self
 	}
 
@@ -124,6 +134,7 @@ impl Model {
 				"activation method called but last layer is not dense or conv",
 			),
 		}
+		self.sync_registry();
 		self
 	}
 
@@ -159,16 +170,19 @@ impl Model {
 		self.inner
 			.specs
 			.push(LayerSpec::Conv(filters, kernel, stride, Activation::Linear));
+		self.sync_registry();
 		self
 	}
 
 	pub fn loss(self, obj: impl IntoObjective) -> Model {
-		return obj.record(self);
+		let m = obj.record(self);
+		m.sync_registry();
+		return m;
 	}
 
 	pub fn lr(mut self, rate: f64) -> Model {
-		self.inner.lr.set(rate);
 		self.inner.lr_intent = Some(rate);
+		self.sync_registry();
 		return self;
 	}
 
@@ -192,19 +206,12 @@ pub trait IntoObjective {
 impl IntoObjective for recipe_ir::Loss {
 	fn record(self, mut m: Model) -> Model {
 		m.inner.objective = recipe_ir::ObjectiveIntent::Builtin(self);
-		m.inner.loss.set(self);
 		return m;
 	}
 }
 
 impl IntoObjective for &Model {
 	fn record(self, mut m: Model) -> Model {
-		recipe_runtime::resolve::register_model(
-			self.inner.id,
-			self.inner.specs.clone(),
-			self.inner.loss.get(),
-			self.inner.objective,
-		);
 		m.inner.objective =
 			recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(self.inner.id));
 		return m;

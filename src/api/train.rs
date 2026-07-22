@@ -1,6 +1,6 @@
 use crate::api::{InferOnly, ModelArg, RunArg, SavePath};
 use ogdl::log::Write;
-use recipe_ir::LogItem;
+use recipe_ir::{LogItem, Slot};
 use recipe_runtime::execute::{LastRun, ModelInner, RunMeta, TrainCfg};
 use std::cell::RefCell;
 
@@ -12,8 +12,8 @@ impl Train {
 	pub fn new() -> Train {
 		Train {
 			cfg: TrainCfg {
-				epochs: 1,
-				log_every: 1,
+				epochs: Slot::Unspecified,
+				log_every: Slot::Unspecified,
 				metrics: Vec::new(),
 				device: false,
 				plot: Vec::new(),
@@ -26,12 +26,12 @@ impl Train {
 	}
 
 	pub fn epochs(mut self, n: usize) -> Train {
-		self.cfg.epochs = n;
+		self.cfg.epochs = Slot::Given(n);
 		self
 	}
 
 	pub fn log_every(mut self, every: usize) -> Train {
-		self.cfg.log_every = every;
+		self.cfg.log_every = Slot::Given(every);
 		self
 	}
 
@@ -96,8 +96,9 @@ impl Train {
 			}
 		};
 		let ds = prepared.get();
-		let fit_ok =
-			matches!(d.infer_only(), InferOnly::Fit) && self.cfg.epochs >= 1 && ds.has_target;
+		let fit_ok = matches!(d.infer_only(), InferOnly::Fit)
+			&& self.cfg.resolved_epochs() >= 1
+			&& ds.has_target;
 		let meta = RunMeta {
 			target_names: d.target_names(),
 			raw_test_rows: d.raw_rows(),
