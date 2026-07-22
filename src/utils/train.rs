@@ -5,23 +5,16 @@ use gpu_core::kernels;
 use ogdl::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
 use gpu_core::memory::{GpuBuffer, Stage};
 use recipe_infer::{
-	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
+	LayerSpec, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
 	load_ogdl_str, metric_fmt, metric_gpu_into, metric_pinned_slot, metric_render, pinned_vocab,
 	plan_layer_params, zscore_apply_views,
 };
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-pub(crate) static INTERRUPTED: AtomicUsize = AtomicUsize::new(0);
-extern "C" fn on_sigint(_sig: i32) {
-	let Some(_second) = Some(()).filter(|_probe| INTERRUPTED.swap(1, Ordering::SeqCst) != 0)
-	else {
-		return;
-	};
-	gpu_core::sys::exit_now(130);
-}
+use recipe_runtime::execute::{INTERRUPTED, StepScalars};
 #[derive(Clone, Copy)]
 enum Logged {
 	Yes,
@@ -53,60 +46,6 @@ pub(crate) struct EvalInput {
 	pub x: GpuBuffer,
 	pub x_cat: Option<GpuBuffer>,
 	pub n: usize,
-}
-pub struct StepScalars {
-	pub neg_lr: GpuBuffer,
-	pub inv_n: GpuBuffer,
-	pub two_inv_n: GpuBuffer,
-	pub zero: GpuBuffer,
-}
-pub fn loss_grad_into(
-	lossfn: Loss,
-	out: &GpuBuffer,
-	y: &GpuBuffer,
-	da: &GpuBuffer,
-	n: usize,
-	total: usize,
-	sc: &Scratch,
-	ss: &StepScalars,
-) -> anyhow::Result<()> {
-	match lossfn {
-		Loss::Mse => {
-			kernels::gpu_sub_scale_into(out, y, &ss.two_inv_n, total, da).context("mse")?;
-		}
-		Loss::Mae => {
-			kernels::gpu_sub_scale_into(out, y, &sc.c_one, total, da).context("mae sub")?;
-			kernels::gpu_sign_into(da, total, da).context("mae sign")?;
-			kernels::gpu_scale_inplace(&ss.inv_n, total, da).context("mae scale")?;
-		}
-		Loss::Huber => {
-			kernels::gpu_sub_scale_into(out, y, &sc.c_one, total, da).context("huber sub")?;
-			kernels::gpu_clamp_into(da, &sc.c_neg_one, &sc.c_one, total, da)
-				.context("huber clamp")?;
-			kernels::gpu_scale_inplace(&ss.inv_n, total, da).context("huber scale")?;
-		}
-		Loss::Ce => {
-			let k = total / n;
-			kernels::gpu_softmax_rows_into(out, n, k, da).context("ce softmax")?;
-			kernels::gpu_sub_scale_into(da, y, &ss.inv_n, total, da).context("ce grad")?;
-		}
-		Loss::Bce => {
-			kernels::gpu_bce_grad_into(out, y, &ss.inv_n, total, da).context("bce")?;
-		}
-		Loss::Focal => {
-			gpu_core::losses::gpu_focal_grad_into(
-				out,
-				y,
-				&sc.c_focal_gamma,
-				&sc.c_focal_alpha,
-				&ss.inv_n,
-				total,
-				da,
-			)
-			.context("focal")?;
-		}
-	}
-	Ok(())
 }
 pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 	use std::fmt::Write as _;
@@ -221,7 +160,7 @@ impl ModelInner {
 		dat: &Dataset,
 		cfg: &Train,
 		resume: Option<&str>,
-		net: Option<Arc<Vec<crate::wire::Conn>>>,
+		net: Option<Arc<Vec<recipe_runtime::transport::Conn>>>,
 	) -> anyhow::Result<()> {
 		let hip_snap = Some(())
 			.filter(|_probe| cfg.metrics.contains(&Metric::Hip))
@@ -547,8 +486,8 @@ impl ModelInner {
 		let image = stage.into_host();
 		let image_floats = image.len();
 		let ac_pre = recipe_infer::concat_layer_dims(&plan.dims())
-			.map(|d| crate::ooc::ConcatAc { a: d.a, c: d.c });
-		let need = image_floats * size_of::<f64>() + crate::ooc::Ooc::min_bytes(&plan.dims(), n, ac_pre);
+			.map(|d| recipe_runtime::memory::ConcatAc { a: d.a, c: d.c });
+		let need = image_floats * size_of::<f64>() + recipe_runtime::memory::Ooc::min_bytes(&plan.dims(), n, ac_pre);
 		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
 			.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
 			.ok_or_else(|| {
@@ -565,8 +504,8 @@ impl ModelInner {
 		let concat_fit_raw = concat_layer(&params);
 		let ac_fit = concat_fit_raw
 			.as_ref()
-			.map(|d| crate::ooc::ConcatAc { a: d.a, c: d.c });
-		let concat_fit = concat_fit_raw.as_ref().map(|d| crate::ooc::ConcatFit {
+			.map(|d| recipe_runtime::memory::ConcatAc { a: d.a, c: d.c });
+		let concat_fit = concat_fit_raw.as_ref().map(|d| recipe_runtime::memory::ConcatFit {
 			pf: d.pf,
 			a: d.a,
 			c: d.c,
@@ -681,14 +620,14 @@ impl ModelInner {
 			.unwrap_or(());
 		let mut ooc = {
 			let _t = gpu_core::memory::tag_scope("waterfall");
-			let o = crate::ooc::Ooc::build(&params, n, ac_fit, net.clone())?;
+			let o = recipe_runtime::memory::Ooc::build(&params, n, ac_fit, net.clone())?;
 			o.report();
 			o
 		};
 		let _guard = gpu_core::memory::AllocGuard::freeze();
 		gpu_core::hw::arm_saturation_crash();
 		INTERRUPTED.store(0, Ordering::SeqCst);
-		gpu_core::sys::on_sigint(on_sigint);
+		gpu_core::sys::on_sigint(recipe_runtime::execute::on_sigint);
 		gpu_core::callspy::mark_loop_start();
 		let hip_init = hip_snap.map(|_snap| gpu_core::callspy::snapshot());
 		let led_init = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());

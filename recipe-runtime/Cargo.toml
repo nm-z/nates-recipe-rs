@@ -1,0 +1,22 @@
+[package]
+name = "recipe-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "GPU training/eval runtime: step execution, machine probe, out-of-core memory, wire transport"
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "../README.md"
+keywords = ["training", "gpu", "hip", "runtime", "tensor"]
+categories = ["science::ml"]
+
+[lib]
+name = "recipe_runtime"
+
+[dependencies]
+anyhow = "1"
+gpu-core = { path = "../gpu-core" }
+recipe-infer = { path = "../recipe-infer" }
+ogdl = { path = "../ogdl" }
+
+[lints]
+workspace = true

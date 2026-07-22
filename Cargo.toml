@@ -29,6 +29,7 @@ members = [
 	".",
 	"recipe-infer",
 	"recipe-ir",
+	"recipe-runtime",
 	"pantry",
 	"gpu-core/vramspy",
 	"gpu-core",
@@ -44,6 +45,7 @@ recipe-infer = { path = "recipe-infer" }
 recipe-ir = { path = "recipe-ir" }
 pantry = { path = "pantry" }
 ogdl = { path = "ogdl" }
+recipe-runtime = { path = "recipe-runtime" }
 anyhow = "1"
 csv = "1"
 ndarray = { version = "0.16", features = ["rayon"] }

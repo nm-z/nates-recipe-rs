@@ -1,5 +1,5 @@
 use anyhow::Result;
-use recipe::wire::{Conn, FN_MOE_FFN, NodeInfo, Op, Server};
+use recipe_runtime::transport::{Conn, FN_MOE_FFN, NodeInfo, Op, Server};
 use std::collections;
 use std::net;
 use std::thread;

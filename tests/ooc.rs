@@ -2,7 +2,7 @@
 use core::ptr;
 use gpu_core::kernels;
 use gpu_core::memory::GpuBuffer;
-use recipe::ooc::{Window, chunks, view};
+use recipe_runtime::memory::{Window, chunks, view};
 
 fn cpu_bce_grad(p: &[f64], y: &[f64], n_total: usize) -> Vec<f64> {
 	let eps = 1e-7;

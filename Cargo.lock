@@ -1921,6 +1921,7 @@ dependencies = [
  "rayon",
  "recipe-infer",
  "recipe-ir",
+ "recipe-runtime",
  "rusqlite",
  "serde_json",
  "tui-textarea",
@@ -1949,6 +1950,16 @@ dependencies = [
 [[package]]
 name = "recipe-ir"
 version = "0.1.0"
+
+[[package]]
+name = "recipe-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpu-core",
+ "ogdl",
+ "recipe-infer",
+]
 
 [[package]]
 name = "redox_syscall"

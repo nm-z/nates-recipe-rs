@@ -1,4 +1,4 @@
-use recipe::machine::{GpuDev, Machine, parse_config, write_config};
+use recipe_runtime::machine::{GpuDev, Machine, parse_config, write_config};
 
 fn sample(gpus: Vec<GpuDev>) -> Machine {
 	return Machine {

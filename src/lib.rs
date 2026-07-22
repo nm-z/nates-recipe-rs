@@ -15,14 +15,8 @@ pub use pantry::data;
 #[doc(hidden)]
 #[path = "utils/dataset.rs"]
 pub mod dataset;
-#[path = "utils/probe.rs"]
-pub mod machine;
-#[path = "utils/ooc.rs"]
-pub mod ooc;
 #[path = "utils/tui.rs"]
 pub mod tui;
-#[path = "utils/wire.rs"]
-pub mod wire;
 
 #[doc(hidden)]
 #[path = "utils/train.rs"]

@@ -1,4 +1,4 @@
-use crate::train::StepScalars;
+use crate::execute::StepScalars;
 use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::{Write, gpu};
@@ -136,7 +136,7 @@ fn prelu_gate(act: &Activation) -> Option<()> {
 }
 
 fn interrupted() -> Interrupt {
-	match crate::train::INTERRUPTED.load(Ordering::SeqCst).cmp(&0) {
+	match crate::execute::INTERRUPTED.load(Ordering::SeqCst).cmp(&0) {
 		cmp::Ordering::Equal => Interrupt::No,
 		cmp::Ordering::Less | cmp::Ordering::Greater => Interrupt::Yes,
 	}
@@ -183,7 +183,7 @@ struct Paged {
 	spb: usize,
 	chunk: usize,
 	ahead: RefCell<VecDeque<Ahead>>,
-	net: Option<Arc<Vec<crate::wire::Conn>>>,
+	net: Option<Arc<Vec<crate::transport::Conn>>>,
 }
 
 impl Paged {
@@ -433,7 +433,7 @@ struct Writer {
 	lanes: Vec<Lane>,
 	next: Cell<usize>,
 	host: HostPool,
-	net: Option<Arc<Vec<crate::wire::Conn>>>,
+	net: Option<Arc<Vec<crate::transport::Conn>>>,
 	pending: Arc<AtomicUsize>,
 	drained: Cell<f64>,
 }
@@ -447,7 +447,7 @@ const POOL_BUFS: usize = MAX_READERS * AHEAD + 1 + W_LANES * (WQ_DEPTH + 1) + 1;
 fn spawn_lane(
 	spill: Option<&File>,
 	host: &HostPool,
-	net: &Option<Arc<Vec<crate::wire::Conn>>>,
+	net: &Option<Arc<Vec<crate::transport::Conn>>>,
 	pending: &Arc<AtomicUsize>,
 ) -> anyhow::Result<Lane> {
 	let f: Option<File> = match spill {
@@ -496,7 +496,7 @@ impl Writer {
 	fn new(
 		spill: Option<&File>,
 		host: HostPool,
-		net: Option<Arc<Vec<crate::wire::Conn>>>,
+		net: Option<Arc<Vec<crate::transport::Conn>>>,
 	) -> anyhow::Result<Writer> {
 		let pending = Arc::new(AtomicUsize::new(0));
 		Ok(Writer {
@@ -620,7 +620,7 @@ pub struct Ooc {
 	rate_disk_w: f64,
 	rate_net_r: f64,
 	rate_net_w: f64,
-	net: Option<Arc<Vec<crate::wire::Conn>>>,
+	net: Option<Arc<Vec<crate::transport::Conn>>>,
 }
 
 struct SweepStart {
@@ -750,7 +750,7 @@ impl Ooc {
 		params: &[LayerParams],
 		n: usize,
 		concat_ac: Option<ConcatAc>,
-		net: Option<Arc<Vec<crate::wire::Conn>>>,
+		net: Option<Arc<Vec<crate::transport::Conn>>>,
 	) -> anyhow::Result<Ooc> {
 		let attn = params.iter().find(|p| p.kind == LayerKind::Attn);
 		let seq_spb = attn.map_or(1, |p| p.in_dim);
@@ -1577,7 +1577,7 @@ impl Ooc {
 		Ok(Flow::Go)
 	}
 
-	pub(crate) fn backward(
+	pub fn backward(
 		&mut self,
 		params: &[LayerParams],
 		x: &GpuBuffer,
@@ -1601,7 +1601,7 @@ impl Ooc {
 			let out = view(&sc.acts[last], s0 * k * size_of::<f64>(), cnt * k * size_of::<f64>());
 			let y = view(ybuf, s0 * k * size_of::<f64>(), cnt * k * size_of::<f64>());
 			let da = self.da_a.write_view(s0, cnt, &self.wins[0])?;
-			crate::train::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss)?;
+			crate::execute::loss_grad_into(loss, &out, &y, &da, cnt, cnt * k, sc, ss)?;
 			self.da_a.commit(s0, cnt, &da, &self.writer, &self.host)?;
 		}
 		let mut flip = Flip::A;

@@ -1,5 +1,5 @@
 use gpu_core::kernels;
-use recipe::train::StepScalars;
+use recipe_runtime::execute::StepScalars;
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
 use std::env;
@@ -213,7 +213,7 @@ fn backward_step(
 	let last = params.len() - 1;
 	let cc = concat_layer(params);
 	let (da_cur, da_next) = (&sc.da_a, &sc.da_b);
-	recipe::train::loss_grad_into(
+	recipe_runtime::execute::loss_grad_into(
 		lossfn,
 		&sc.acts[last],
 		ybuf,
@@ -1005,7 +1005,7 @@ fn ping_pong_gradients_match_per_layer() {
 		ref_dw.push(GpuBuffer::alloc(p.in_dim * p.out_dim).expect("ref dw"));
 		ref_db.push(GpuBuffer::alloc(p.out_dim).expect("ref db"));
 	}
-	recipe::train::loss_grad_into(
+	recipe_runtime::execute::loss_grad_into(
 		Loss::Mse,
 		&sc.acts[last],
 		&ybuf,

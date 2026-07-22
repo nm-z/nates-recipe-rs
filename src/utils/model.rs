@@ -1,5 +1,5 @@
 use crate::dataset::Dataset;
-use crate::train::INTERRUPTED;
+use recipe_runtime::execute::INTERRUPTED;
 use anyhow::Context;
 use ogdl::log::{
 	Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2,
@@ -284,7 +284,7 @@ pub struct Train {
 	pub(crate) metrics: Vec<Metric>,
 	pub(crate) plot: Vec<Metric>,
 	pub(crate) resume: Option<String>,
-	pub(crate) net: Option<crate::wire::Net>,
+	pub(crate) net: Option<recipe_runtime::transport::Net>,
 	last: RefCell<LastRun>,
 }
 
@@ -340,7 +340,7 @@ impl Train {
 	}
 
 	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Train {
-		let mut wnet = crate::wire::Net::new();
+		let mut wnet = recipe_runtime::transport::Net::new();
 		for alias in nodes {
 			wnet = wnet.node(alias);
 		}
@@ -396,7 +396,7 @@ impl Train {
 			);
 			return self;
 		}
-		let conns: Option<Arc<Vec<crate::wire::Conn>>> = match self.net.as_ref() {
+		let conns: Option<Arc<Vec<recipe_runtime::transport::Conn>>> = match self.net.as_ref() {
 			Some(wnet) => {
 				let cs = match wnet.connect() {
 					Ok(v) => v,
@@ -421,7 +421,7 @@ impl Train {
 		};
 		let net_ram: usize = conns.as_ref().map_or(0, |cs| {
 			cs.iter()
-				.map(|c| (c.info.ram as usize).saturating_sub(crate::ooc::USER_GB))
+				.map(|c| (c.info.ram as usize).saturating_sub(recipe_runtime::memory::USER_GB))
 				.sum()
 		});
 		let issues = preflight(model, ds, net_ram);
@@ -1096,7 +1096,7 @@ fn preflight(model: &ModelInner, ds: &Dataset, net_ram: usize) -> Vec<Issue> {
 	Some(())
 		.filter(|_probe| need > free_vram)
 		.map(|_probe| {
-			let planned = crate::ooc::plan(need, net_ram);
+			let planned = recipe_runtime::memory::plan(need, net_ram);
 			match planned {
 				Some(p) => {
 					let net_part = Some(())

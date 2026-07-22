@@ -120,7 +120,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 	let mut h = DefaultHasher::new();
 	h.write(&src);
 	h.write_u128(mtime.duration_since(UNIX_EPOCH)?.as_nanos());
-	let bin = recipe::machine::data_dir()?.join(format!("{:016x}", h.finish()));
+	let bin = recipe_runtime::machine::data_dir()?.join(format!("{:016x}", h.finish()));
 	for _absent in fs::metadata(&bin).err().into_iter() {
 		let rocm = env::var_os("ROCM_PATH")
 			.filter(|v| !v.is_empty())
@@ -160,7 +160,7 @@ fn run_rs(path: &str, extra: &[String]) -> Result<()> {
 }
 
 fn main() -> Result<process::ExitCode> {
-	if let Some(code) = recipe::machine::gpu_child_ask() {
+	if let Some(code) = recipe_runtime::machine::gpu_child_ask() {
 		return Ok(exit_code(code));
 	}
 	if let Some(sz) = env::var_os("VRAM_PROBE") {
@@ -259,10 +259,10 @@ fn main() -> Result<process::ExitCode> {
 				probe: true,
 				..Opt::default()
 			});
-			let machine = recipe::machine::Machine::probe()?;
+			let machine = recipe_runtime::machine::Machine::probe()?;
 			Write::block(
 				probe,
-				&recipe::machine::write_config(slice::from_ref(&machine)),
+				&recipe_runtime::machine::write_config(slice::from_ref(&machine)),
 			);
 			Ok(())
 		}
@@ -271,12 +271,12 @@ fn main() -> Result<process::ExitCode> {
 				probe: true,
 				..Opt::default()
 			});
-			let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), recipe::wire::PORT);
-			let listener = recipe::wire::Server::bind(bind)?;
-			let machine = recipe::machine::Machine::probe()?;
-			let info = recipe::wire::NodeInfo::probe();
+			let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), recipe_runtime::transport::PORT);
+			let listener = recipe_runtime::transport::Server::bind(bind)?;
+			let machine = recipe_runtime::machine::Machine::probe()?;
+			let info = recipe_runtime::transport::NodeInfo::probe();
 			let runners = HashMap::new();
-			recipe::wire::Server::new(info, runners)
+			recipe_runtime::transport::Server::new(info, runners)
 				.machine(machine)
 				.serve_bound(listener)?;
 			Ok(())
@@ -287,9 +287,9 @@ fn main() -> Result<process::ExitCode> {
 				net: true,
 				..Opt::default()
 			});
-			let off = recipe::wire::pool_deselected();
-			let me = recipe::wire::self_host();
-			let mine = recipe::wire::NodeInfo::probe();
+			let off = recipe_runtime::transport::pool_deselected();
+			let me = recipe_runtime::transport::self_host();
+			let mine = recipe_runtime::transport::NodeInfo::probe();
 			let mut rows = vec![recipe::tui::PeerRow {
 				detail: format!(
 					"{}  {} gpu  {} MiB vram  {} MiB ram",
@@ -302,7 +302,7 @@ fn main() -> Result<process::ExitCode> {
 				host: me,
 				local: true,
 			}];
-			for p in recipe::wire::local_peers()? {
+			for p in recipe_runtime::transport::local_peers()? {
 				rows.push(recipe::tui::PeerRow {
 					detail: format!(
 						"{}  {}  {} gpu  {} MiB vram  {} MiB ram",
@@ -326,7 +326,7 @@ fn main() -> Result<process::ExitCode> {
 							.filter(|r| !r.selected)
 							.map(|r| r.host.clone())
 							.collect();
-						recipe::wire::pool_write(&deselected)?;
+						recipe_runtime::transport::pool_write(&deselected)?;
 					}
 				}
 				false => {
