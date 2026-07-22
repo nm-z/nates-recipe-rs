@@ -173,7 +173,7 @@ impl Data {
 				}
 				Err(e) => self.inner.defer(e),
 			},
-			FileFormat::Table => match pantry::detect_kinds(path) {
+			FileFormat::Table => match pantry::detect_kinds(path, recipe_runtime::execute::detector_forward) {
 				Ok(kinds) => self.inner.pre_kinds.extend(kinds),
 				Err(e) => self.inner.defer(e),
 			},

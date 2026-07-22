@@ -365,6 +365,72 @@ pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64
 	scaled
 }
 
+struct ArenaGuard {
+	slab: Option<GpuBuffer>,
+}
+
+impl Drop for ArenaGuard {
+	fn drop(&mut self) {
+		for slab in self.slab.take().into_iter() {
+			gpu_core::memory::park_run_backing(slab);
+		}
+	}
+}
+
+pub fn detector_forward(input: &[f64], specs: &[LayerSpec]) -> anyhow::Result<Vec<f64>> {
+	let n = input.len() / pantry::CONTEXT;
+	let saved = load_ogdl_str(pantry::DETECTOR_OGDL)?;
+	let plan = plan_layer_params(
+		specs,
+		pantry::CONTEXT,
+		0,
+		pantry::VOCAB,
+		&saved,
+		PlanMode::Warm,
+	)
+	.map_err(|e| anyhow::anyhow!("detect plan_layer_params: {e}"))?;
+	let mut stage = Stage::new();
+	let w_off = stage.push(plan.host());
+	let consts_off = stage.push(&SCRATCH_CONSTS);
+	let x_off = stage.push(input);
+	let image = stage.into_host();
+	let image_floats = image.len();
+	let est = recipe_infer::vram_estimate(
+		specs,
+		n,
+		pantry::CONTEXT,
+		pantry::N_CLASS,
+		pantry::VOCAB,
+		0,
+		true,
+	);
+	let need = est + est / 2 + (1 << 20);
+	let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
+		.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"detect: no device backing — footprint {}, claimable {}",
+				pantry::data::human_bytes(need),
+				pantry::data::human_bytes(gpu_core::memory::claimable_bytes()),
+			)
+		})?;
+	let base = slab.view(0, image_floats);
+	let _arena = ArenaGuard { slab: Some(slab) };
+	let params = plan.materialize(&base, w_off);
+	let xbuf = base.view(x_off, input.len());
+	let consts_view = base.view(consts_off, 12);
+	let sc = Scratch::new_infer(&params, n, &consts_view)?;
+	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc)?;
+	let last = params.len() - 1;
+	let mut preds = vec![0.0f64; n * pantry::N_CLASS];
+	let exit = gpu_core::memory::exit_d2h_enqueue_buf(&sc.acts[last], n * pantry::N_CLASS * 8)
+		.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
+	gpu_core::hip::device_synchronize()
+		.map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
+	exit.finish(&mut preds);
+	return Ok(preds);
+}
+
 pub fn infer_scored(
 	params: &[LayerParams],
 	xbuf: &GpuBuffer,

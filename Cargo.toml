@@ -19,6 +19,11 @@ name = "recipe"
 path = "src/main.rs"
 test = false
 
+[[bin]]
+name = "detect"
+path = "src/bin/detect.rs"
+test = false
+
 [[test]]
 name = "all"
 harness = false

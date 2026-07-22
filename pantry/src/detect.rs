@@ -17,8 +17,10 @@ pub const KIND_IMAGE: usize = 5;
 pub const EMBED_DIM: usize = 32;
 pub const HEADS: usize = 4;
 
-const DETECTOR_OGDL: &str = include_str!("../detector.ogdl");
+pub const DETECTOR_OGDL: &str = include_str!("../detector.ogdl");
 const NLB: u8 = 10;
+
+pub type ForwardFn = fn(&[f64], &[recipe_ir::LayerSpec]) -> anyhow::Result<Vec<f64>>;
 
 pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	let mut ids = Vec::with_capacity(CONTEXT);
@@ -41,7 +43,7 @@ pub fn tokenize_column(cells: &[&str]) -> Vec<f64> {
 	ids
 }
 
-pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
+pub fn detect_kinds(path: &str, forward: ForwardFn) -> anyhow::Result<crate::encode::PreKinds> {
 	let p = Path::new(path);
 	let ext = p
 		.extension()
@@ -60,7 +62,7 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 				.collect();
 			Ok(vec![crate::encode::GroupKinds {
 				name: String::new(),
-				cols: kinds_for(&pref.headers, &non_empty)?,
+				cols: kinds_for(&pref.headers, &non_empty, forward)?,
 			}])
 		}
 		None => crate::data::load_groups(path)?
@@ -80,7 +82,7 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 								.collect()
 						})
 						.collect();
-					Some(kinds_for(headers, &non_empty).map(|k| {
+					Some(kinds_for(headers, &non_empty, forward).map(|k| {
 						crate::encode::GroupKinds {
 							name: name.clone(),
 							cols: k,
@@ -96,12 +98,13 @@ pub fn detect_kinds(path: &str) -> anyhow::Result<crate::encode::PreKinds> {
 fn kinds_for(
 	headers: &[String],
 	non_empty: &[Vec<&str>],
+	forward: ForwardFn,
 ) -> anyhow::Result<Vec<crate::encode::ColKind>> {
 	let to_predict: Vec<usize> = (0..headers.len())
 		.filter(|&j| !non_empty[j].is_empty())
 		.collect();
 	let cols: Vec<Vec<&str>> = to_predict.iter().map(|&j| non_empty[j].clone()).collect();
-	let preds = predict_kinds(&cols)?;
+	let preds = predict_kinds(&cols, forward)?;
 	let mut pred: HashMap<usize, usize> = HashMap::new();
 	for i in 0..to_predict.len() {
 		pred.insert(to_predict[i], preds[i]);
@@ -216,19 +219,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 	Ok(PrefixCols { headers, cols })
 }
 
-struct ArenaGuard {
-	slab: Option<recipe_infer::GpuBuffer>,
-}
-
-impl Drop for ArenaGuard {
-	fn drop(&mut self) {
-		for slab in self.slab.take().into_iter() {
-			recipe_infer::park_run_backing(slab);
-		}
-	}
-}
-
-pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
+pub fn predict_kinds(columns: &[Vec<&str>], forward: ForwardFn) -> anyhow::Result<Vec<usize>> {
 	let Some(_head) = columns.first() else {
 		return Ok(Vec::new());
 	};
@@ -237,58 +228,14 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 	for col in columns {
 		data.extend(tokenize_column(col));
 	}
-	let x = ndarray::Array2::from_shape_vec(ndarray::Ix2(n, CONTEXT), data)
-		.map_err(|e| ogdl::log::Errored::new(format!("detect: shape: {e}")))?;
 	let specs = vec![
 		recipe_ir::LayerSpec::Embed(EMBED_DIM, Some(VOCAB)),
 		recipe_ir::LayerSpec::Attn(HEADS),
 		recipe_ir::LayerSpec::Dense(64, recipe_ir::Activation::LeakyRelu),
 		recipe_ir::LayerSpec::Dense(N_CLASS, recipe_ir::Activation::Linear),
 	];
-	let saved = recipe_infer::load_ogdl_str(DETECTOR_OGDL)?;
-	let plan = recipe_infer::plan_layer_params(
-		&specs,
-		CONTEXT,
-		0,
-		VOCAB,
-		&saved,
-		recipe_infer::PlanMode::Warm,
-	)
-	.map_err(|e| anyhow::anyhow!("detect plan_layer_params: {e}"))?;
-	let mut stage = recipe_infer::Stage::new();
-	let w_off = stage.push(plan.host());
-	let consts_off = stage.push(&recipe_infer::SCRATCH_CONSTS);
-	let x_off = stage.push(x
-		.as_slice()
-		.ok_or_else(|| ogdl::log::Errored::new("detect: x contiguous"))?);
-	let image = stage.into_host();
-	let image_floats = image.len();
-	let est = recipe_infer::vram_estimate(&specs, n, CONTEXT, N_CLASS, VOCAB, 0, 0 < 1);
-	let need = est + est / 2 + (1 << 20);
-	let slab = recipe_infer::adopt_run_backing_with_image(need, &image)
-		.or_else(|| recipe_infer::claim_device_arena_with_image(&image))
-		.ok_or_else(|| {
-			anyhow::anyhow!(
-				"detect: no device backing — footprint {}, claimable {}",
-				recipe_infer::human_bytes(need),
-				recipe_infer::human_bytes(recipe_infer::claimable_bytes()),
-			)
-		})?;
-	let base = slab.view(0, image_floats);
-	let _arena = ArenaGuard { slab: Some(slab) };
-	let params = plan.materialize(&base, w_off);
-	let xbuf = base.view(x_off, n * CONTEXT);
-	let consts_view = base.view(consts_off, 12);
-	let sc = recipe_infer::Scratch::new_infer(&params, n, &consts_view)?;
-	recipe_infer::forward_into(&params, &xbuf, None, n, &sc.acts, &sc)?;
-	let last = params.len() - 1;
-	let mut preds = vec![0.0f64; n * N_CLASS];
-	let exit = recipe_infer::exit_d2h_enqueue_buf(&sc.acts[last], n * N_CLASS * 8)
-		.map_err(|e| anyhow::anyhow!("detect exit d2h enqueue: {e:?}"))?;
-	recipe_infer::device_synchronize()
-		.map_err(|e| anyhow::anyhow!("detect release sync: {e:?}"))?;
-	exit.finish(&mut preds);
-	Ok((0..n)
+	let preds = forward(&data, &specs)?;
+	return Ok((0..n)
 		.map(|r| {
 			let lg = &preds[r * N_CLASS..r * N_CLASS + N_CLASS];
 			let mut best = 0;
@@ -300,5 +247,5 @@ pub fn predict_kinds(columns: &[Vec<&str>]) -> anyhow::Result<Vec<usize>> {
 			}
 			best
 		})
-		.collect())
+		.collect());
 }

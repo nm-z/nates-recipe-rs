@@ -49,7 +49,7 @@ fn main() -> Result<ExitCode> {
 						.collect()
 				})
 				.collect();
-			let kinds = pantry::predict_kinds(&columns)?;
+			let kinds = pantry::predict_kinds(&columns, recipe_runtime::execute::detector_forward)?;
 			let prefix = match name.chars().next() {
 				Some(_first) => format!("{name}:"),
 				None => String::new(),

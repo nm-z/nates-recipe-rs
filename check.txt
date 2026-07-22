@@ -1,0 +1,4 @@
+    Checking pantry v0.1.0 (/home/nate/Desktop/nates-recipe-rs/pantry)
+   Compiling recipe v0.1.1 (/home/nate/Desktop/nates-recipe-rs)
+    Checking recipe-runtime v0.1.0 (/home/nate/Desktop/nates-recipe-rs/recipe-runtime)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.08s
