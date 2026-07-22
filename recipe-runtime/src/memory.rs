@@ -1184,8 +1184,8 @@ impl Ooc {
 		);
 		let mut roof = format!(
 			"waterfall  measured rooflines: gemm {} GF/s  vram {} GB/s",
-			recipe_infer::GEMM_GFLOPS,
-			recipe_infer::VRAM_GBS,
+			crate::plan::GEMM_GFLOPS,
+			crate::plan::VRAM_GBS,
 		);
 		for rt in [
 			Rate {
@@ -1587,7 +1587,7 @@ impl Ooc {
 			self.concat
 				.commit(s0, cnt, &out, &self.writer, &self.host)?;
 		}
-		let cw = recipe_infer::Work {
+		let cw = recipe_ir::Work {
 			flop: 0.0,
 			bytes: 16.0 * (self.n * (a + c)) as f64,
 		};
@@ -1915,8 +1915,8 @@ impl Ooc {
 			LayerKind::Dense => "dense",
 		};
 		let w = match phase {
-			"fwd" => recipe_infer::layer_fwd(p, self.n),
-			_other => recipe_infer::layer_bwd(p, self.n, l == 0),
+			"fwd" => crate::plan::layer_fwd(p, self.n),
+			_other => crate::plan::layer_bwd(p, self.n, l == 0),
 		};
 		self.sweep_line_work(
 			phase,
@@ -1934,7 +1934,7 @@ impl Ooc {
 		l: usize,
 		kind: &str,
 		dims: &str,
-		w: recipe_infer::Work,
+		w: recipe_ir::Work,
 		s: SweepStart,
 	) -> anyhow::Result<()> {
 		let x = xfer();
@@ -1960,9 +1960,9 @@ impl Ooc {
 			"ooc {phase} L{l} {kind} {dims}  {} windows  {sec:.1}s  {:.2} GFLOP {gfs:.1} GF/s {:.0}% gemm  {:.2} GB {gbs:.1} GB/s {:.0}% vram",
 			self.n.div_ceil(self.chunk),
 			w.flop / 1e9,
-			100.0 * gfs / recipe_infer::GEMM_GFLOPS,
+			100.0 * gfs / crate::plan::GEMM_GFLOPS,
 			w.bytes / 1e9,
-			100.0 * gbs / recipe_infer::VRAM_GBS,
+			100.0 * gbs / crate::plan::VRAM_GBS,
 		);
 		for st in [
 			Stream {

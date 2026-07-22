@@ -10,7 +10,6 @@ pub mod params;
 pub mod safetensors;
 pub mod scratch;
 pub mod tokenizer;
-pub mod work;
 
 pub use bridge::*;
 pub use enums::*;
@@ -26,7 +25,6 @@ pub use gpu_core::memory::{
 pub use gpu_core::tiered;
 pub use params::*;
 pub use scratch::*;
-pub use work::{GEMM_GFLOPS, VRAM_GBS, Work, layer_bwd, layer_fwd};
 
 pub fn init() -> Result<(), gpu_core::HipError> {
 	gpu_core::hip::set_device(0)?;

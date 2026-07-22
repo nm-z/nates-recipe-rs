@@ -1334,8 +1334,8 @@ impl ModelInner {
 							gpu,
 							&format!(
 								"roofline  gemm {} GF/s  vram {} GB/s",
-								recipe_infer::GEMM_GFLOPS,
-								recipe_infer::VRAM_GBS
+								crate::plan::GEMM_GFLOPS,
+								crate::plan::VRAM_GBS
 							),
 						);
 					})
