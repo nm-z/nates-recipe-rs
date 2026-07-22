@@ -1,31 +1,30 @@
 use crate::execute::{StepScalars, download_scalar, download_vec};
 use anyhow::Context;
 use gpu_core::kernels;
-use ogdl::log::{Write, gpu};
+use ogdl::log::{Errored, Write, gpu};
 use gpu_core::memory::GpuBuffer;
-use recipe_infer::Scratch;
-use recipe_ir::{Activation, LayerKind, Loss, Param};
+use recipe_ir::{
+	Activation, ConcatDims, LayerDims, LayerKind, LayerSpec, Loss, Param, concat_layer_dims,
+};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::VecDeque;
+use std::env;
+use std::f64::consts;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::mem;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
-
-// ─────────────────────────────────────────────────────────────────────────────
-pub use recipe_infer::{
-	ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerParams, LayerPlan, PRELU_INIT,
-	PlanMode, Saved, concat_layer, load_ogdl_str, ogdl_text, plan_layer_params, sinusoidal_pe,
-};
 
 static DISK_R_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -2691,4 +2690,1471 @@ pub fn saved_score(path: &str, key: &str) -> Option<f64> {
 		}
 	}
 	None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+pub const SCRATCH_CONSTS: [f64; 12] = [
+	1.0,
+	-1.0,
+	0.5,
+	1e-7,
+	1.0 - 1e-7,
+	LEAKY_ALPHA,
+	ELU_ALPHA,
+	gpu_core::k_gapact::SELU_ALPHA,
+	gpu_core::k_gapact::SELU_LAMBDA,
+	FOCAL_GAMMA,
+	FOCAL_ALPHA,
+	gpu_core::rope::ROPE_THETA,
+];
+
+pub struct Scratch {
+	pub acts: Vec<GpuBuffer>,
+	pub preact: Vec<GpuBuffer>,
+	pub da_a: GpuBuffer,
+	pub da_b: GpuBuffer,
+	pub dz: GpuBuffer,
+	pub dw: GpuBuffer,
+	pub dw_partials: GpuBuffer,
+	pub db: GpuBuffer,
+	pub metric_t0: GpuBuffer,
+	pub metric_t1: GpuBuffer,
+	pub metric_t2: GpuBuffer,
+	pub metric_scalar: GpuBuffer,
+	pub metric_scalar_b: GpuBuffer,
+	pub c_one: GpuBuffer,
+	pub c_neg_one: GpuBuffer,
+	pub c_half: GpuBuffer,
+	pub c_eps: GpuBuffer,
+	pub c_one_minus_eps: GpuBuffer,
+	pub c_leaky_alpha: GpuBuffer,
+	pub c_elu_alpha: GpuBuffer,
+	pub c_selu_alpha: GpuBuffer,
+	pub c_selu_lambda: GpuBuffer,
+	pub c_focal_gamma: GpuBuffer,
+	pub c_focal_alpha: GpuBuffer,
+	pub c_rope_theta: GpuBuffer,
+	pub reduce_ws: GpuBuffer,
+	pub embed_grad: GpuBuffer,
+	pub a_q: GpuBuffer,
+	pub a_k: GpuBuffer,
+	pub a_v: GpuBuffer,
+	pub a_ctx: GpuBuffer,
+	pub a_lse: GpuBuffer,
+	pub a_dctx: GpuBuffer,
+	pub a_dq: GpuBuffer,
+	pub a_dk: GpuBuffer,
+	pub a_dv: GpuBuffer,
+	pub a_dsum: GpuBuffer,
+	pub a_gw: GpuBuffer,
+	pub a_dbias: GpuBuffer,
+	pub prelu_t0: GpuBuffer,
+	pub prelu_t1: GpuBuffer,
+	pub prelu_scalar: GpuBuffer,
+	pub concat: GpuBuffer,
+	pub concat_dgrad: GpuBuffer,
+	pub conv_temp: GpuBuffer,
+	pub conv_wg: usize,
+	pub infer: bool,
+	pub copy_stream: gpu_core::hip::Stream,
+	ev_fwd: Vec<Vec<gpu_core::hip::Event>>,
+	ev_bwd: Vec<Vec<gpu_core::hip::Event>>,
+	timing: Cell<bool>,
+	timing_slot: Cell<usize>,
+}
+
+pub struct LayerMs {
+	pub fwd: Vec<f64>,
+	pub bwd: Vec<f64>,
+}
+
+pub struct LayerEvents {
+	pub fwd: Vec<Vec<gpu_core::hip::Event>>,
+	pub bwd: Vec<Vec<gpu_core::hip::Event>>,
+}
+
+pub fn layer_ms_from(
+	ev_fwd: &[gpu_core::hip::Event],
+	ev_bwd: &[gpu_core::hip::Event],
+	layers: usize,
+) -> LayerMs {
+	let f = (0..layers)
+		.map(|l| {
+			let e = gpu_core::hip::elapsed_ms(&ev_fwd[l], &ev_fwd[l + 1]);
+			if !e.is_ok() {
+				Write::error(format!(
+					"fwd elapsed: {}",
+					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+				));
+				return 0.0;
+			}
+			e.unwrap_or(0.0) as f64
+		})
+		.collect();
+	let b = (0..layers)
+		.map(|l| {
+			let e = gpu_core::hip::elapsed_ms(&ev_bwd[l + 1], &ev_bwd[l]);
+			if !e.is_ok() {
+				Write::error(format!(
+					"bwd elapsed: {}",
+					e.as_ref().err().map(|x| x.to_string()).unwrap_or_default()
+				));
+				return 0.0;
+			}
+			e.unwrap_or(0.0) as f64
+		})
+		.collect();
+	LayerMs { fwd: f, bwd: b }
+}
+
+impl Scratch {
+	pub fn new_full(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+	) -> anyhow::Result<Scratch> {
+		Self::new_inner(params, n, false, false, consts, 1)
+	}
+
+	pub fn carve(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+		n_timed: usize,
+	) -> anyhow::Result<Scratch> {
+		Self::new_inner(params, n, false, true, consts, n_timed)
+	}
+
+	pub fn new_infer(
+		params: &[LayerParams],
+		n: usize,
+		consts: &GpuBuffer,
+	) -> anyhow::Result<Scratch> {
+		Self::new_inner(params, n, true, false, consts, 0)
+	}
+
+	fn new_inner(
+		params: &[LayerParams],
+		n: usize,
+		forward_only: bool,
+		light: bool,
+		consts: &GpuBuffer,
+		n_timed: usize,
+	) -> anyhow::Result<Scratch> {
+		let bw = move |sz: usize| if forward_only { 1 } else { sz };
+		let lt = move |sz: usize| if light { 1 } else { sz };
+		let alloc = |sz: usize, label: &str| -> anyhow::Result<GpuBuffer> {
+			GpuBuffer::alloc(sz).map_err(|e| {
+				anyhow::anyhow!(
+					"{label}: GPU alloc of {} ({sz} × f64) failed — {e:?}",
+					recipe_infer::human_bytes(sz * size_of::<f64>())
+				)
+			})
+		};
+		let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
+		let mut max_act = 0usize;
+		let mut max_wt = 0usize;
+		let mut max_bias = 0usize;
+		let mut max_embed_grad = 1usize;
+		let mut max_seqd = 1usize;
+		let mut max_lse = 1usize;
+		let mut max_dd = 1usize;
+		let mut max_dw_partials = 1usize;
+		let mut has_prelu = false;
+		for p in params {
+			let dw_dp = match p.kind {
+				LayerKind::Dense => {
+					kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim)
+				}
+				LayerKind::Attn => {
+					let s = p.in_dim / p.dim;
+					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
+				}
+				_ => 0,
+			};
+			if dw_dp > max_dw_partials {
+				max_dw_partials = dw_dp;
+			}
+			if p.act == Activation::PRelu {
+				has_prelu = true;
+				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * p.out_dim, 1);
+				if ws > max_ws {
+					max_ws = ws;
+				}
+			}
+			let w = kernels::gpu_reduce_sum_cols_workspace_bytes(n, p.out_dim);
+			if w > max_ws {
+				max_ws = w;
+			}
+			let a = n * p.out_dim.max(p.in_dim);
+			if a > max_act {
+				max_act = a;
+			}
+			let wt = match p.kind {
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					cout * p.conv_cin * p.conv_k
+				}
+				LayerKind::Dense => p.in_dim * p.out_dim,
+				_ => 0,
+			};
+			if wt > max_wt {
+				max_wt = wt;
+			}
+			let bias_sz = if p.kind == LayerKind::Conv {
+				let lin = p.in_dim / p.conv_cin;
+				let lout = (lin - p.conv_k) / p.conv_stride + 1;
+				p.out_dim / lout
+			} else {
+				p.out_dim
+			};
+			if bias_sz > max_bias {
+				max_bias = bias_sz;
+			}
+			if p.kind == LayerKind::Embed && p.vocab * p.dim > max_embed_grad {
+				max_embed_grad = p.vocab * p.dim;
+			}
+			if p.kind == LayerKind::Attn {
+				let s = p.in_dim / p.dim;
+				if n * p.in_dim > max_seqd {
+					max_seqd = n * p.in_dim;
+				}
+				if n * p.heads * s > max_lse {
+					max_lse = n * p.heads * s;
+				}
+				if p.dim * p.dim > max_dd {
+					max_dd = p.dim * p.dim;
+				}
+				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * s, p.dim);
+				if ws > max_ws {
+					max_ws = ws;
+				}
+			}
+		}
+		let mut acts = Vec::with_capacity(params.len());
+		let mut preact = Vec::with_capacity(params.len());
+		for p in params {
+			acts.push(alloc(
+				if light && acts.len() + 1 != params.len() {
+					1
+				} else {
+					n * p.out_dim
+				},
+				"scratch acts",
+			)?);
+			let needs_pre = matches!(
+				p.act,
+				Activation::Silu
+					| Activation::Gelu | Activation::Elu
+					| Activation::Selu | Activation::PRelu
+			);
+			preact.push(alloc(
+				if needs_pre { lt(n * p.out_dim) } else { 1 },
+				"scratch preact",
+			)?);
+		}
+		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
+		let (concat_sz, concat_grad_sz) = match concat_layer(params) {
+			Some(ConcatDims { a, c, .. }) => (n * (a + c), n * a),
+			None => (1, 1),
+		};
+		let mut max_conv_fsz = 0usize;
+		for p in params {
+			if p.kind == LayerKind::Conv {
+				let lin = p.in_dim / p.conv_cin;
+				let lout = (lin - p.conv_k) / p.conv_stride + 1;
+				let cout = p.out_dim / lout;
+				let fsz = cout * p.conv_cin * p.conv_k;
+				if fsz > max_conv_fsz {
+					max_conv_fsz = fsz;
+				}
+			}
+		}
+		let (conv_temp_buf, conv_wg_count) = if !forward_only && !light && max_conv_fsz > 0 {
+			let free = gpu_core::hip::mem_info().map(|m| m.free).unwrap_or(0);
+			let usable = free / 2;
+			let chunks = (usable / (max_conv_fsz * size_of::<f64>())).min(n).max(1);
+			let buf = alloc(max_conv_fsz * chunks, "conv_temp")?;
+			let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(chunks, max_conv_fsz);
+			if ws > max_ws {
+				max_ws = ws;
+			}
+			(buf, chunks)
+		} else {
+			(alloc(1, "conv_temp")?, 0)
+		};
+		let cbuf = |i: usize| -> GpuBuffer { consts.view(i, 1) };
+		let copy_stream = gpu_core::hip::Stream::new().context("copy stream")?;
+		let mut ev_fwd = Vec::with_capacity(n_timed);
+		let mut ev_bwd = Vec::with_capacity(n_timed);
+		for _ in 0..n_timed {
+			let mut f = Vec::with_capacity(params.len() + 1);
+			let mut b = Vec::with_capacity(params.len() + 1);
+			for _ in 0..=params.len() {
+				f.push(gpu_core::hip::Event::new().context("layer timing event")?);
+				b.push(gpu_core::hip::Event::new().context("layer timing event")?);
+			}
+			ev_fwd.push(f);
+			ev_bwd.push(b);
+		}
+		Ok(Scratch {
+			acts,
+			preact,
+			da_a: alloc(lt(bw(max_act)), "da_a")?,
+			da_b: alloc(lt(bw(max_act)), "da_b")?,
+			dz: alloc(lt(bw(max_act)), "dz")?,
+			dw: alloc(lt(bw(max_wt)), "dw")?,
+			dw_partials: alloc(lt(bw(max_dw_partials)), "dw_partials")?,
+			db: alloc(lt(bw(max_bias)), "db")?,
+			metric_t0: alloc(out_elems, "metric_t0")?,
+			metric_t1: alloc(out_elems, "metric_t1")?,
+			metric_t2: alloc(out_elems, "metric_t2")?,
+			metric_scalar: alloc(1, "metric_scalar")?,
+			metric_scalar_b: alloc(1, "metric_scalar_b")?,
+			c_one: cbuf(0),
+			c_neg_one: cbuf(1),
+			c_half: cbuf(2),
+			c_eps: cbuf(3),
+			c_one_minus_eps: cbuf(4),
+			c_leaky_alpha: cbuf(5),
+			c_elu_alpha: cbuf(6),
+			c_selu_alpha: cbuf(7),
+			c_selu_lambda: cbuf(8),
+			c_focal_gamma: cbuf(9),
+			c_focal_alpha: cbuf(10),
+			c_rope_theta: cbuf(11),
+			reduce_ws: GpuBuffer::alloc_bytes(max_ws).map_err(|e| {
+				anyhow::anyhow!(
+					"reduce_ws: GPU alloc of {} failed — {e:?}",
+					recipe_infer::human_bytes(max_ws)
+				)
+			})?,
+			embed_grad: alloc(bw(max_embed_grad), "embed_grad")?,
+			a_q: alloc(lt(max_seqd), "a_q")?,
+			a_k: alloc(lt(max_seqd), "a_k")?,
+			a_v: alloc(lt(max_seqd), "a_v")?,
+			a_ctx: alloc(lt(max_seqd), "a_ctx")?,
+			a_lse: alloc(if forward_only || light { 1 } else { max_lse }, "a_lse")?,
+			a_dctx: alloc(lt(bw(max_seqd)), "a_dctx")?,
+			a_dq: alloc(lt(bw(max_seqd)), "a_dq")?,
+			a_dk: alloc(lt(bw(max_seqd)), "a_dk")?,
+			a_dv: alloc(lt(bw(max_seqd)), "a_dv")?,
+			a_dsum: alloc(lt(bw(max_lse)), "a_dsum")?,
+			a_gw: alloc(bw(max_dd), "a_gw")?,
+			a_dbias: alloc(bw(max_dd), "a_dbias")?,
+			prelu_t0: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t0")?,
+			prelu_t1: alloc(lt(bw(if has_prelu { max_act } else { 1 })), "prelu_t1")?,
+			prelu_scalar: alloc(1, "prelu_scalar")?,
+			concat: alloc(lt(concat_sz), "concat")?,
+			concat_dgrad: alloc(lt(bw(concat_grad_sz)), "concat_dgrad")?,
+			conv_temp: conv_temp_buf,
+			conv_wg: conv_wg_count,
+			infer: forward_only,
+			copy_stream,
+			ev_fwd,
+			ev_bwd,
+			timing: Cell::new(false),
+			timing_slot: Cell::new(0),
+		})
+	}
+
+	pub fn set_timing(&self, on: bool) {
+		self.timing.set(on);
+	}
+
+	pub fn set_timing_slot(&self, slot: usize) {
+		self.timing_slot.set(slot);
+	}
+
+	pub fn mark_fwd(&self, i: usize) {
+		if self.timing.get() {
+			let r = self.ev_fwd[self.timing_slot.get()][i].record_default();
+			if !r.is_ok() {
+				Write::error(format!(
+					"record fwd event: {}",
+					r.err().map(|e| e.to_string()).unwrap_or_default()
+				));
+				return;
+			}
+		}
+	}
+
+	pub fn mark_bwd(&self, i: usize) {
+		if self.timing.get() {
+			let r = self.ev_bwd[self.timing_slot.get()][i].record_default();
+			if !r.is_ok() {
+				Write::error(format!(
+					"record bwd event: {}",
+					r.err().map(|e| e.to_string()).unwrap_or_default()
+				));
+				return;
+			}
+		}
+	}
+
+	pub fn layer_ms(&self, layers: usize) -> LayerMs {
+		let s = self.timing_slot.get();
+		let r = self.ev_bwd[s][0].synchronize();
+		if !r.is_ok() {
+			Write::error(format!(
+				"sync bwd event: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			));
+			return LayerMs {
+				fwd: vec![0.0; layers],
+				bwd: vec![0.0; layers],
+			};
+		}
+		layer_ms_from(&self.ev_fwd[s], &self.ev_bwd[s], layers)
+	}
+
+	pub fn take_events(&mut self) -> LayerEvents {
+		LayerEvents {
+			fwd: mem::take(&mut self.ev_fwd),
+			bwd: mem::take(&mut self.ev_bwd),
+		}
+	}
+
+	pub fn defer_scalar(
+		&self,
+		slot: usize,
+		src: &gpu_core::memory::GpuBuffer,
+	) -> Result<(), gpu_core::HipError> {
+		return gpu_core::memory::pinned_download(slot, src, &self.copy_stream);
+	}
+
+	pub fn sync_copy_stream(&self) {
+		let r = self.copy_stream.synchronize();
+		if !r.is_ok() {
+			Write::error(format!(
+				"sync copy stream: {}",
+				r.err().map(|e| e.to_string()).unwrap_or_default()
+			));
+			return;
+		}
+	}
+
+	pub fn deferred_scalar(&self, slot: usize) -> Result<f64, gpu_core::HipError> {
+		return gpu_core::memory::pinned_read(slot);
+	}
+}
+
+impl Drop for Scratch {
+	fn drop(&mut self) {
+		let owned_any = self.acts.iter().any(GpuBuffer::is_pool_owned)
+			|| self.preact.iter().any(GpuBuffer::is_pool_owned)
+			|| [
+				&self.da_a,
+				&self.da_b,
+				&self.dz,
+				&self.dw,
+				&self.dw_partials,
+				&self.db,
+				&self.metric_t0,
+				&self.metric_t1,
+				&self.metric_t2,
+				&self.metric_scalar,
+				&self.metric_scalar_b,
+				&self.c_one,
+				&self.c_neg_one,
+				&self.c_half,
+				&self.c_eps,
+				&self.c_one_minus_eps,
+				&self.c_leaky_alpha,
+				&self.c_elu_alpha,
+				&self.c_selu_alpha,
+				&self.c_selu_lambda,
+				&self.c_focal_gamma,
+				&self.c_focal_alpha,
+				&self.c_rope_theta,
+				&self.reduce_ws,
+				&self.embed_grad,
+				&self.a_q,
+				&self.a_k,
+				&self.a_v,
+				&self.a_ctx,
+				&self.a_lse,
+				&self.a_dctx,
+				&self.a_dq,
+				&self.a_dk,
+				&self.a_dv,
+				&self.a_dsum,
+				&self.a_gw,
+				&self.a_dbias,
+				&self.prelu_t0,
+				&self.prelu_t1,
+				&self.prelu_scalar,
+				&self.concat,
+				&self.concat_dgrad,
+				&self.conv_temp,
+			]
+			.iter()
+			.any(|b| b.is_pool_owned());
+		if owned_any {
+			if let Err(e) = gpu_core::hip::device_synchronize() {
+				Write::error(format!("Scratch::drop device sync: {e}"));
+			}
+		}
+	}
+}
+
+impl Scratch {
+	pub fn vram_bytes(params: &[LayerParams], n: usize, forward_only: bool) -> usize {
+		let dims: Vec<LayerDims> = params.iter().map(LayerDims::from).collect();
+		Self::vram_bytes_dims(&dims, n, forward_only)
+	}
+
+	pub fn vram_bytes_dims(params: &[LayerDims], n: usize, forward_only: bool) -> usize {
+		let bw = |sz: usize| if forward_only { 1 } else { sz };
+		let mut max_ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1);
+		let (mut max_act, mut max_wt, mut max_bias) = (0usize, 0usize, 0usize);
+		let (mut max_embed_grad, mut max_seqd, mut max_lse, mut max_dd) =
+			(1usize, 1usize, 1usize, 1usize);
+		let mut max_dw_partials = 1usize;
+		let mut has_prelu = false;
+		let mut floats = 0usize;
+		for p in params {
+			floats += n * p.out_dim;
+			let dw_dp = match p.kind {
+				LayerKind::Dense => {
+					kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim)
+				}
+				LayerKind::Attn => {
+					let s = p.in_dim / p.dim;
+					kernels::gpu_splitk_dw_partials_elems(n * s, p.dim, p.dim)
+				}
+				_ => 0,
+			};
+			if dw_dp > max_dw_partials {
+				max_dw_partials = dw_dp;
+			}
+			let needs_pre = matches!(
+				p.act,
+				Activation::Silu
+					| Activation::Gelu | Activation::Elu
+					| Activation::Selu | Activation::PRelu
+			);
+			floats += if needs_pre { n * p.out_dim } else { 1 };
+			if p.act == Activation::PRelu {
+				has_prelu = true;
+				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * p.out_dim, 1);
+				if ws > max_ws {
+					max_ws = ws;
+				}
+			}
+			let w = kernels::gpu_reduce_sum_cols_workspace_bytes(n, p.out_dim);
+			if w > max_ws {
+				max_ws = w;
+			}
+			if n * p.out_dim.max(p.in_dim) > max_act {
+				max_act = n * p.out_dim.max(p.in_dim);
+			}
+			let wt = match p.kind {
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					cout * p.conv_cin * p.conv_k
+				}
+				LayerKind::Dense => p.in_dim * p.out_dim,
+				_ => 0,
+			};
+			if wt > max_wt {
+				max_wt = wt;
+			}
+			if p.out_dim > max_bias {
+				max_bias = p.out_dim;
+			}
+			if p.kind == LayerKind::Embed && p.vocab * p.dim > max_embed_grad {
+				max_embed_grad = p.vocab * p.dim;
+			}
+			if p.kind == LayerKind::Attn {
+				let s = p.in_dim / p.dim;
+				if n * p.in_dim > max_seqd {
+					max_seqd = n * p.in_dim;
+				}
+				if n * p.heads * s > max_lse {
+					max_lse = n * p.heads * s;
+				}
+				if p.dim * p.dim > max_dd {
+					max_dd = p.dim * p.dim;
+				}
+				let ws = kernels::gpu_reduce_sum_cols_workspace_bytes(n * s, p.dim);
+				if ws > max_ws {
+					max_ws = ws;
+				}
+			}
+		}
+		let out_elems = n * params.last().map_or(1, |p| p.out_dim);
+		floats += 3 * bw(max_act);
+		floats += bw(max_wt) + bw(max_dw_partials) + bw(max_bias);
+		floats += 3 * out_elems + 2;
+		floats += 12;
+		floats += bw(max_embed_grad);
+		floats += 4 * max_seqd;
+		floats += 4 * bw(max_seqd);
+		if forward_only {
+			floats += 2;
+		} else {
+			floats += 2 * max_lse;
+		}
+		floats += 2 * bw(max_dd);
+		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1;
+		match recipe_ir::concat_layer_dims(params) {
+			Some(ConcatDims { a, c, .. }) => {
+				floats += n * (a + c) + bw(n * a);
+			}
+			None => {
+				floats += 1 + bw(1);
+			}
+		}
+		floats * mem::size_of::<f64>() + max_ws
+	}
+}
+
+pub fn vram_estimate(
+	specs: &[LayerSpec],
+	n: usize,
+	d: usize,
+	k: usize,
+	vocab: usize,
+	c_cat: usize,
+	forward_only: bool,
+) -> usize {
+	let f8 = mem::size_of::<f64>();
+	let mut bytes = 0usize;
+	bytes += 2 * n * d * f8;
+	if c_cat > 0 {
+		bytes += 2 * n * c_cat * f8;
+	}
+	bytes += 3 * d * f8;
+	bytes += n * k * f8;
+	let mut in_dim = d;
+	let mut embed_dim = 0usize;
+	let mut fake_params: Vec<(usize, usize, LayerKind, usize, usize, Activation, usize)> =
+		Vec::new();
+	for spec in specs {
+		match *spec {
+			LayerSpec::Embed(dim, _) => {
+				let seq = in_dim;
+				bytes += vocab * dim * f8;
+				bytes += seq * dim * f8;
+				let out = seq * dim;
+				embed_dim = dim;
+				fake_params.push((
+					in_dim,
+					out,
+					LayerKind::Embed,
+					dim,
+					vocab,
+					Activation::Linear,
+					0,
+				));
+				in_dim = out;
+			}
+			LayerSpec::Attn(heads) => {
+				let d_tok = if embed_dim > 0 { embed_dim } else { in_dim };
+				bytes += 4 * d_tok * d_tok * f8;
+				bytes += 4 * d_tok * f8;
+				fake_params.push((
+					in_dim,
+					in_dim,
+					LayerKind::Attn,
+					d_tok,
+					0,
+					Activation::Linear,
+					heads,
+				));
+			}
+			LayerSpec::Conv(filters, kernel, stride, act) => {
+				let cin = fake_params.last().map_or(1, |(_, _, kind, ..)| {
+					if *kind == LayerKind::Conv { 0 } else { 1 }
+				});
+				let cin = if cin == 0 {
+					match fake_params.last() {
+						Some(prev) => {
+							prev.1 / ((prev.0 / prev.3.max(1) - prev.4)
+								/ prev.6.max(1) + 1)
+								.max(1)
+						}
+						None => {
+							Write::error("conv cin");
+							return bytes;
+						}
+					}
+				} else {
+					cin
+				};
+				let lin = in_dim / cin;
+				let lout = (lin - kernel) / stride + 1;
+				bytes += filters * cin * kernel * f8;
+				bytes += filters * f8;
+				if act == Activation::PRelu {
+					bytes += f8;
+				}
+				let out = filters * lout;
+				fake_params.push((in_dim, out, LayerKind::Conv, cin, kernel, act, stride));
+				in_dim = out;
+			}
+			LayerSpec::Dense(units, act) => {
+				let actual_in = if c_cat > 0
+					&& !fake_params.is_empty()
+					&& matches!(
+						fake_params.last(),
+						Some((_, _, LayerKind::Embed | LayerKind::Attn, ..))
+					) {
+					in_dim + c_cat
+				} else {
+					in_dim
+				};
+				bytes += actual_in * units * f8;
+				bytes += units * f8;
+				if act == Activation::PRelu {
+					bytes += f8;
+				}
+				fake_params.push((actual_in, units, LayerKind::Dense, 0, 0, act, 0));
+				in_dim = units;
+			}
+		}
+	}
+	let dummy_params: Vec<LayerParams> = fake_params
+		.iter()
+		.map(|&(i, o, kind, dim, vocab, act, heads)| {
+			let dummy = || GpuBuffer::borrow(ptr::null_mut(), 0);
+			let (cc, ck, cs) = if kind == LayerKind::Conv {
+				(dim, vocab, heads)
+			} else {
+				(0, 0, 0)
+			};
+			LayerParams {
+				kind,
+				w: dummy(),
+				b: dummy(),
+				in_dim: i,
+				out_dim: o,
+				act,
+				dim: dim.max(1),
+				vocab,
+				wk: dummy(),
+				wv: dummy(),
+				wo: dummy(),
+				heads,
+				palpha: dummy(),
+				conv_cin: cc,
+				conv_k: ck,
+				conv_stride: cs,
+			}
+		})
+		.collect();
+	if !dummy_params.is_empty() {
+		bytes += Scratch::vram_bytes(&dummy_params, n, forward_only);
+	}
+	bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+pub const LEAKY_ALPHA: f64 = 0.01;
+pub const PRELU_INIT: f64 = 0.25;
+pub const ELU_ALPHA: f64 = 1.0;
+pub const FOCAL_GAMMA: f64 = 2.0;
+pub const FOCAL_ALPHA: f64 = 0.25;
+
+pub fn sinusoidal_pe(seq: usize, dim: usize, negate: bool) -> Vec<f64> {
+	let sign = if negate { -1.0 } else { 1.0 };
+	let mut pe = vec![0.0f64; seq * dim];
+	for s in 0..seq {
+		for j in 0..dim {
+			let i2 = (j / 2) * 2;
+			let freq = 1.0 / 10000f64.powf(i2 as f64 / dim as f64);
+			let ang = s as f64 * freq;
+			pe[s * dim + j] = sign * if j % 2 == 0 { ang.sin() } else { ang.cos() };
+		}
+	}
+	pe
+}
+
+pub struct LayerParams {
+	pub kind: LayerKind,
+	pub w: GpuBuffer,
+	pub b: GpuBuffer,
+	pub in_dim: usize,
+	pub out_dim: usize,
+	pub act: Activation,
+	pub dim: usize,
+	pub vocab: usize,
+	pub wk: GpuBuffer,
+	pub wv: GpuBuffer,
+	pub wo: GpuBuffer,
+	pub heads: usize,
+	pub palpha: GpuBuffer,
+	pub conv_cin: usize,
+	pub conv_k: usize,
+	pub conv_stride: usize,
+}
+
+pub fn concat_layer(params: &[LayerParams]) -> Option<ConcatDims> {
+	let dims: Vec<LayerDims> = params.iter().map(LayerDims::from).collect();
+	concat_layer_dims(&dims)
+}
+
+impl From<&LayerParams> for LayerDims {
+	fn from(p: &LayerParams) -> Self {
+		LayerDims {
+			kind: p.kind,
+			in_dim: p.in_dim,
+			out_dim: p.out_dim,
+			act: p.act,
+			dim: p.dim,
+			vocab: p.vocab,
+			heads: p.heads,
+			conv_cin: p.conv_cin,
+			conv_k: p.conv_k,
+			conv_stride: p.conv_stride,
+		}
+	}
+}
+
+fn philox2x32(counter: u32, key: u32) -> u32 {
+	let (mut x, mut y) = (counter, key);
+	for i in 0..10u32 {
+		let lo = x.wrapping_mul(0xD2511F53);
+		let hi = ((x as u64 * 0xD2511F53u64) >> 32) as u32;
+		x = hi ^ y ^ key.wrapping_mul(i + 1);
+		y = lo;
+	}
+	x
+}
+
+fn philox_uniform(idx: u32, seed: u32) -> f64 {
+	philox2x32(idx, seed) as f64 / 4294967296.0
+}
+
+fn host_randn(seed: u32, scale: f64, out: &mut [f64]) {
+	for (i, o) in out.iter_mut().enumerate() {
+		let u1 = philox_uniform((2 * i) as u32, seed).max(1e-30);
+		let u2 = philox_uniform((2 * i + 1) as u32, seed);
+		*o = (-2.0 * u1.ln()).sqrt() * (2.0 * consts::PI * u2).cos() * scale;
+	}
+}
+
+struct BlockPlan {
+	off: usize,
+	len: usize,
+}
+
+struct PlanEntry {
+	dims: LayerDims,
+	w: BlockPlan,
+	b: BlockPlan,
+	wk: BlockPlan,
+	wv: BlockPlan,
+	wo: BlockPlan,
+	palpha: BlockPlan,
+}
+
+pub struct LayerPlan {
+	entries: Vec<PlanEntry>,
+	host: Vec<f64>,
+}
+
+const PLAN_ALIGN_F64: usize = 32;
+
+impl LayerPlan {
+	fn pad(&mut self) {
+		let rem = self.host.len() % PLAN_ALIGN_F64;
+		if rem != 0 {
+			self.host
+				.resize(self.host.len() + PLAN_ALIGN_F64 - rem, 0.0);
+		}
+	}
+
+	fn push(&mut self, data: &[f64]) -> BlockPlan {
+		self.pad();
+		let off = self.host.len();
+		self.host.extend_from_slice(data);
+		BlockPlan {
+			off,
+			len: data.len(),
+		}
+	}
+
+	fn zeros(&mut self, len: usize) -> BlockPlan {
+		self.pad();
+		let off = self.host.len();
+		self.host.resize(off + len, 0.0);
+		BlockPlan { off, len }
+	}
+
+	fn randn(&mut self, len: usize, seed: usize, scale: f64) -> BlockPlan {
+		self.pad();
+		let off = self.host.len();
+		self.host.resize(off + len, 0.0);
+		host_randn(seed as u32, scale, &mut self.host[off..off + len]);
+		BlockPlan { off, len }
+	}
+
+	pub fn host(&self) -> &[f64] {
+		&self.host
+	}
+
+	pub fn dims(&self) -> Vec<LayerDims> {
+		self.entries.iter().map(|e| e.dims).collect()
+	}
+
+	pub fn out_dim_last(&self) -> usize {
+		self.entries.last().map_or(0, |e| e.dims.out_dim)
+	}
+
+	pub fn materialize(&self, staged: &GpuBuffer, base_off: usize) -> Vec<LayerParams> {
+		let view =
+			|bp: &BlockPlan| -> GpuBuffer { staged.view(base_off + bp.off, bp.len.max(1)) };
+		self.entries
+			.iter()
+			.map(|e| LayerParams {
+				kind: e.dims.kind,
+				w: view(&e.w),
+				b: view(&e.b),
+				in_dim: e.dims.in_dim,
+				out_dim: e.dims.out_dim,
+				act: e.dims.act,
+				dim: e.dims.dim,
+				vocab: e.dims.vocab,
+				wk: view(&e.wk),
+				wv: view(&e.wv),
+				wo: view(&e.wo),
+				heads: e.dims.heads,
+				palpha: view(&e.palpha),
+				conv_cin: e.dims.conv_cin,
+				conv_k: e.dims.conv_k,
+				conv_stride: e.dims.conv_stride,
+			})
+			.collect()
+	}
+
+	pub fn dump_ogdl_host(
+		&self,
+		image: &[f64],
+		key: &str,
+		score: f64,
+	) -> anyhow::Result<String> {
+		let blk = |bp: &BlockPlan| image[bp.off..bp.off + bp.len].to_vec();
+		return ogdl_text(|g| {
+			drop(g.add(score, key));
+			let mut z = 1;
+			let mut at = 1;
+			let mut cv = 1;
+			for e in &self.entries {
+				let d = &e.dims;
+				match d.kind {
+					LayerKind::Embed => {
+						let table = blk(&e.w);
+						for id in 0..d.vocab {
+							drop(g.add(
+								table[id * d.dim..(id + 1) * d.dim].to_vec(),
+								&format!("embed.{id}"),
+							));
+						}
+					}
+					LayerKind::Attn => {
+						drop(g.add(blk(&e.w), &format!("attn{at}.wq")));
+						drop(g.add(blk(&e.wk), &format!("attn{at}.wk")));
+						drop(g.add(blk(&e.wv), &format!("attn{at}.wv")));
+						drop(g.add(blk(&e.wo), &format!("attn{at}.wo")));
+						let bias = blk(&e.b);
+						for nm in ["bq", "bk", "bv", "bo"] {
+							drop(g.add(bias.clone(), &format!("attn{at}.{nm}")));
+						}
+						at += 1;
+					}
+					LayerKind::Conv => {
+						let lin = d.in_dim / d.conv_cin;
+						let lout = (lin - d.conv_k) / d.conv_stride + 1;
+						let cout = d.out_dim / lout;
+						drop(g.add(
+							vec![
+								cout as f64,
+								d.conv_cin as f64,
+								d.conv_k as f64,
+								d.conv_stride as f64,
+							],
+							&format!("conv{cv}"),
+						));
+						drop(g.add(blk(&e.w), &format!("conv{cv}.w")));
+						drop(g.add(blk(&e.b), &format!("conv{cv}.b")));
+						cv += 1;
+					}
+					LayerKind::Dense => {
+						let w = blk(&e.w);
+						let b = blk(&e.b);
+						let slope =
+							(d.act == Activation::PRelu).then(|| image[e.palpha.off]);
+						for j in 0..d.out_dim {
+							let row: Vec<f64> = (0..d.in_dim)
+								.map(|i| w[i * d.out_dim + j])
+								.collect();
+							drop(g.add(row, &format!("z{z}.w")));
+							if let Some(a) = slope {
+								drop(g.add(a, &format!("z{z}.a")));
+							}
+							drop(g.add(b[j], &format!("z{z}.b")));
+							z += 1;
+						}
+					}
+				}
+			}
+			Ok(())
+		});
+	}
+}
+
+pub fn ogdl_text(
+	build: impl FnOnce(ogdl::Graph) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+	static SEQ: AtomicU64 = AtomicU64::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let tmp = env::temp_dir().join(format!("nrs_dump_{}_{seq}.ogdl", process::id()));
+	let Some(tp) = tmp.to_str() else {
+		Write::err("dump temp path is not valid utf8")?;
+		return Err(anyhow::anyhow!("dump temp path is not valid utf8"));
+	};
+	let _ = fs::remove_file(tp);
+	let g = ogdl::file(tp);
+	build(g.clone())?;
+	drop(g.file(tp));
+	let text = fs::read_to_string(tp).unwrap_or_default();
+	let _ = fs::remove_file(tp);
+	return Ok(text);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlanMode {
+	Fresh,
+	Warm,
+}
+
+pub fn plan_layer_params(
+	specs: &[LayerSpec],
+	d: usize,
+	c_cat: usize,
+	vocab: usize,
+	resumed: &[Saved],
+	mode: PlanMode,
+) -> Result<LayerPlan, String> {
+	let try_resume = mode == PlanMode::Warm;
+	let mut plan = LayerPlan {
+		entries: Vec::new(),
+		host: Vec::new(),
+	};
+	let dummy_off = plan.zeros(1).off;
+	let dummy = || BlockPlan {
+		off: dummy_off,
+		len: 1,
+	};
+	let mut si = 0usize;
+	let mut in_dim = d;
+	for (li, spec) in specs.iter().enumerate() {
+		if let LayerSpec::Embed(dim, _) = *spec {
+			let w = if try_resume {
+				let t = match resumed.get(si) {
+					Some(Saved::Embed(t)) => t,
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no embed block here"
+						));
+					}
+				};
+				if t.len() != vocab * dim {
+					return Err(format!(
+						"layer {li} embed: checkpoint table has {} values, model needs {} (vocab {vocab} × dim {dim})",
+						t.len(),
+						vocab * dim
+					));
+				}
+				si += 1;
+				plan.push(t)
+			} else {
+				plan.randn(vocab * dim, 4242 + li * 7919, 0.1)
+			};
+			let b = plan.push(&sinusoidal_pe(in_dim, dim, true));
+			plan.entries.push(PlanEntry {
+				dims: LayerDims {
+					kind: LayerKind::Embed,
+					in_dim,
+					out_dim: in_dim * dim,
+					act: Activation::Linear,
+					dim,
+					vocab,
+					heads: 0,
+					conv_cin: 0,
+					conv_k: 0,
+					conv_stride: 0,
+				},
+				w,
+				b,
+				wk: dummy(),
+				wv: dummy(),
+				wo: dummy(),
+				palpha: dummy(),
+			});
+			in_dim *= dim;
+			continue;
+		}
+		if let LayerSpec::Attn(heads) = *spec {
+			let d_tok = plan.entries.last().map_or(in_dim, |e| {
+				if e.dims.kind == LayerKind::Embed {
+					e.dims.dim
+				} else {
+					e.dims.out_dim
+				}
+			});
+			if !in_dim.is_multiple_of(d_tok) {
+				return Err(Errored::new(format!(
+					"attn: input {in_dim} not a multiple of token dim {d_tok}"
+				))
+				.to_string());
+			}
+			if !d_tok.is_multiple_of(heads) {
+				return Err(Errored::new(format!(
+					"attn: token dim {d_tok} not divisible by {heads} heads"
+				))
+				.to_string());
+			}
+			let need = d_tok * d_tok;
+			let (w, wk, wv, wo) = if try_resume {
+				let (sq, sk, sv, so) = match resumed.get(si) {
+					Some(Saved::Attn { wq, wk, wv, wo, .. }) => (wq, wk, wv, wo),
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no attn block here"
+						));
+					}
+				};
+				for (nm, v) in [("wq", sq), ("wk", sk), ("wv", sv), ("wo", so)] {
+					if v.len() != need {
+						return Err(format!(
+							"layer {li} attn {nm}: checkpoint has {} values, model needs {need} (token dim {d_tok}²)",
+							v.len()
+						));
+					}
+				}
+				si += 1;
+				(plan.push(sq), plan.push(sk), plan.push(sv), plan.push(so))
+			} else {
+				let scale = (1.0 / d_tok as f64).sqrt();
+				(
+					plan.randn(need, 7001 + li * 13, scale),
+					plan.randn(need, 7002 + li * 13, scale),
+					plan.randn(need, 7003 + li * 13, scale),
+					plan.randn(need, 7004 + li * 13, scale),
+				)
+			};
+			let b = plan.zeros(d_tok);
+			plan.entries.push(PlanEntry {
+				dims: LayerDims {
+					kind: LayerKind::Attn,
+					in_dim,
+					out_dim: in_dim,
+					act: Activation::Linear,
+					dim: d_tok,
+					vocab: 0,
+					heads,
+					conv_cin: 0,
+					conv_k: 0,
+					conv_stride: 0,
+				},
+				w,
+				b,
+				wk,
+				wv,
+				wo,
+				palpha: dummy(),
+			});
+			continue;
+		}
+		if let LayerSpec::Conv(filters, kernel, stride, act) = *spec {
+			let cin = if let Some(prev) = plan.entries.last() {
+				if prev.dims.kind == LayerKind::Conv {
+					let prev_lout = (prev.dims.in_dim / prev.dims.conv_cin
+						- prev.dims.conv_k) / prev.dims.conv_stride
+						+ 1;
+					prev.dims.out_dim / prev_lout
+				} else {
+					1
+				}
+			} else {
+				1
+			};
+			let lin = in_dim / cin;
+			let lout = (lin - kernel) / stride + 1;
+			let w_count = filters * cin * kernel;
+			let (w, b, slope) = if !try_resume {
+				let scale = (2.0 / (cin * kernel) as f64).sqrt();
+				(plan.randn(w_count, li, scale), plan.zeros(filters), None)
+			} else {
+				let (ws, bs) = match resumed.get(si) {
+					Some(Saved::Conv { w, b }) => (w, b),
+					_ => {
+						return Err(format!(
+							"layer {li}: checkpoint has no conv block here"
+						));
+					}
+				};
+				if ws.len() != w_count {
+					return Err(format!(
+						"layer {li} conv: checkpoint has {} weights, model needs {w_count} ({filters}×{cin}×{kernel})",
+						ws.len()
+					));
+				}
+				if bs.len() != filters {
+					return Err(format!(
+						"layer {li} conv: checkpoint has {} biases, model needs {filters}",
+						bs.len()
+					));
+				}
+				si += 1;
+				(plan.push(ws), plan.push(bs), None)
+			};
+			let palpha = if act == Activation::PRelu {
+				plan.push(&[slope.unwrap_or(PRELU_INIT)])
+			} else {
+				dummy()
+			};
+			plan.entries.push(PlanEntry {
+				dims: LayerDims {
+					kind: LayerKind::Conv,
+					in_dim,
+					out_dim: filters * lout,
+					act,
+					dim: 0,
+					vocab: 0,
+					heads: 0,
+					conv_cin: cin,
+					conv_k: kernel,
+					conv_stride: stride,
+				},
+				w,
+				b,
+				wk: dummy(),
+				wv: dummy(),
+				wo: dummy(),
+				palpha,
+			});
+			in_dim = filters * lout;
+			continue;
+		}
+		let LayerSpec::Dense(units, act) = *spec else {
+			return Err(
+				"plan_layer_params: layer spec not handled by an earlier arm".to_owned(),
+			);
+		};
+		if c_cat > 0
+			&& matches!(
+				plan.entries.last().map(|e| e.dims.kind),
+				Some(LayerKind::Embed | LayerKind::Attn)
+			) {
+			in_dim += c_cat;
+		}
+		let (w, b, slope) = if !try_resume {
+			let scale = (2.0 / in_dim as f64).sqrt();
+			(
+				plan.randn(in_dim * units, li, scale),
+				plan.zeros(units),
+				None,
+			)
+		} else {
+			let mut wh = vec![0.0f64; in_dim * units];
+			let mut bh = vec![0.0f64; units];
+			let mut slope = None;
+			for j in 0..units {
+				let (ws, bias, a) = match resumed.get(si) {
+					Some(Saved::Dense { w, b, a }) => (w, *b, *a),
+					_ => {
+						return Err(format!(
+							"layer {li} neuron {j}: checkpoint has no dense (z) block here"
+						));
+					}
+				};
+				if ws.len() != in_dim {
+					return Err(format!(
+						"layer {li} neuron {j}: checkpoint has {} weights, model needs {in_dim} (data feature count differs?)",
+						ws.len()
+					));
+				}
+				for i in 0..in_dim {
+					wh[i * units + j] = ws[i];
+				}
+				bh[j] = bias;
+				if j == 0 {
+					slope = a;
+				}
+				si += 1;
+			}
+			(plan.push(&wh), plan.push(&bh), slope)
+		};
+		let palpha = if act == Activation::PRelu {
+			plan.push(&[slope.unwrap_or(PRELU_INIT)])
+		} else {
+			dummy()
+		};
+		plan.entries.push(PlanEntry {
+			dims: LayerDims {
+				kind: LayerKind::Dense,
+				in_dim,
+				out_dim: units,
+				act,
+				dim: 0,
+				vocab: 0,
+				heads: 0,
+				conv_cin: 0,
+				conv_k: 0,
+				conv_stride: 0,
+			},
+			w,
+			b,
+			wk: dummy(),
+			wv: dummy(),
+			wo: dummy(),
+			palpha,
+		});
+		in_dim = units;
+	}
+	if try_resume && si != resumed.len() {
+		return Err(format!(
+			"checkpoint has {} saved blocks, this architecture consumed {si}",
+			resumed.len()
+		));
+	}
+	Ok(plan)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Saved {
+	Embed(Vec<f64>),
+	Attn {
+		wq: Vec<f64>,
+		wk: Vec<f64>,
+		wv: Vec<f64>,
+		wo: Vec<f64>,
+		bq: Vec<f64>,
+		bk: Vec<f64>,
+		bv: Vec<f64>,
+		bo: Vec<f64>,
+	},
+	Dense {
+		w: Vec<f64>,
+		b: f64,
+		a: Option<f64>,
+	},
+	Conv {
+		w: Vec<f64>,
+		b: Vec<f64>,
+	},
+}
+
+impl Saved {
+	pub fn len(&self) -> usize {
+		match self {
+			Saved::Embed(t) => t.len(),
+			Saved::Attn {
+				wq,
+				wk,
+				wv,
+				wo,
+				bq,
+				bk,
+				bv,
+				bo,
+			} => {
+				wq.len()
+					+ wk.len() + wv.len() + wo.len()
+					+ bq.len() + bk.len() + bv.len()
+					+ bo.len()
+			}
+			Saved::Dense { w, .. } => w.len() + 1,
+			Saved::Conv { w, b } => w.len() + b.len(),
+		}
+	}
+}
+
+pub fn load_ogdl_str(text: &str) -> anyhow::Result<Vec<Saved>> {
+	let root = ogdl::text(text).itnl("");
+	let vals = |n: &ogdl::Node| -> Vec<f64> {
+		n.children
+			.iter()
+			.filter_map(|g| g.name.parse::<f64>().ok())
+			.collect()
+	};
+	let mut out: Vec<Saved> = Vec::new();
+	for block in &root.children {
+		if !block.children.is_empty() && block.children.iter().all(|c| c.children.is_empty()) {
+			continue;
+		}
+		let field = |name: &str| -> Vec<f64> {
+			block.children
+				.iter()
+				.find(|c| c.name == name)
+				.map_or_else(Vec::new, &vals)
+		};
+		match block.name.as_str() {
+			"embed" => {
+				let mut rows: Vec<(usize, Vec<f64>)> =
+					Vec::with_capacity(block.children.len());
+				for c in &block.children {
+					let id = c.name.parse().context("resume: embed row id")?;
+					rows.push((id, vals(c)));
+				}
+				rows.sort_by_key(|(id, _)| *id);
+				out.push(Saved::Embed(
+					rows.into_iter().flat_map(|(_, v)| v).collect(),
+				));
+			}
+			name if name.starts_with("attn") => out.push(Saved::Attn {
+				wq: field("wq"),
+				wk: field("wk"),
+				wv: field("wv"),
+				wo: field("wo"),
+				bq: field("bq"),
+				bk: field("bk"),
+				bv: field("bv"),
+				bo: field("bo"),
+			}),
+			name if name.starts_with("conv") => out.push(Saved::Conv {
+				w: field("w"),
+				b: field("b"),
+			}),
+			_ => {
+				let mut w = Vec::new();
+				let mut b = 0.0;
+				let mut a = None;
+				for c in &block.children {
+					match c.name.as_str() {
+						"w" => w = vals(c),
+						"b" => {
+							b = vals(c)
+								.first()
+								.copied()
+								.ok_or_else(|| anyhow::anyhow!("resume: dense b"))?
+						}
+						"a" => a = vals(c).first().copied(),
+						key if key.starts_with('w')
+							&& key.len() > 1 && key[1..]
+							.chars()
+							.all(|ch| ch.is_ascii_digit()) =>
+						{
+							w.push(vals(c).first().copied().ok_or_else(|| {
+								anyhow::anyhow!("resume: dense w{{n}}")
+							})?);
+						}
+						key => anyhow::bail!(
+							"resume: unrecognized key '{key}' — incompatible checkpoint; rm the .ogdl to start fresh"
+						),
+					}
+				}
+				out.push(Saved::Dense { w, b, a });
+			}
+		}
+	}
+	Ok(out)
 }

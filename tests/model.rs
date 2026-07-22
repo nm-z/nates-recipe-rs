@@ -4,6 +4,10 @@ use recipe_runtime::execute::{
 };
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
+use recipe_runtime::{
+	LayerParams, PlanMode, SCRATCH_CONSTS, Saved, Scratch, concat_layer, forward_into,
+	load_ogdl_str, plan_layer_params,
+};
 use recipe_ir::{Activation, ConcatDims, LayerKind, LayerSpec};
 use std::env;
 use std::fs;

@@ -1,5 +1,4 @@
-use recipe_infer::{Saved, load_ogdl_str};
-use recipe_runtime::load_ogdl;
+use recipe_runtime::{Saved, load_ogdl, load_ogdl_str};
 use std::env;
 use std::fs;
 
@@ -69,7 +68,7 @@ z2
 
 #[test]
 fn dump_add_api_roundtrips() {
-	let text = recipe_infer::params::ogdl_text(|g| {
+	let text = recipe_runtime::ogdl_text(|g| {
 		drop(g.add(0.42f64, "r2"));
 		drop(g.add(vec![0.1f64, 0.2, 0.3], "z1.w"));
 		drop(g.add(0.05f64, "z1.a"));

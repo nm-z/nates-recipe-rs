@@ -1,6 +1,6 @@
 use crate::execute::ModelInner;
 use pantry::encode::Dataset;
-use recipe_infer::vram_estimate;
+use crate::memory::vram_estimate;
 use recipe_ir::graph::{OpKind, ValueId};
 use recipe_ir::{Activation, LayerDims, LayerKind, LayerSpec, SemanticGraph, pinned_vocab};
 pub use recipe_ir::Work;

@@ -1,7 +1,6 @@
-use recipe_infer::{
-	GpuBuffer, LayerParams, SCRATCH_CONSTS, Scratch, forward_into, human_bytes,
-};
+use recipe_infer::{GpuBuffer, human_bytes};
 use recipe_runtime::execute::download_vec;
+use recipe_runtime::{LayerParams, SCRATCH_CONSTS, Scratch, forward_into};
 use recipe_ir::{Activation, LayerKind};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
