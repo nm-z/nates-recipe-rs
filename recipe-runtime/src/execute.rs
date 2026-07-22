@@ -192,6 +192,7 @@ pub struct ModelInner {
 	pub saved_ogdl: RefCell<Option<SavedWeights>>,
 	pub arena_gen: Cell<Option<usize>>,
 	pub rebuild_backing: RefCell<Option<GpuBuffer>>,
+	pub forward_graph: RefCell<Option<recipe_ir::SemanticGraph>>,
 	pub gguf: Option<String>,
 }
 
@@ -212,6 +213,7 @@ impl ModelInner {
 			saved_ogdl: RefCell::new(None),
 			arena_gen: Cell::new(None),
 			rebuild_backing: RefCell::new(None),
+			forward_graph: RefCell::new(None),
 			gguf: None,
 		}
 	}
@@ -360,7 +362,8 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 					&format!("{}  {} ({})", note.subject, note.chose, note.because),
 				);
 			}
-			if res.graph.is_some() {
+			if let Some(g) = res.graph {
+				model.forward_graph.borrow_mut().replace(g);
 				Write::error("surrogate training awaits whole-program compilation");
 				return;
 			}
@@ -547,8 +550,14 @@ pub fn eval_run(cfg: &InferCfg, ds: &Dataset, model: &ModelInner) {
 	let params = model.params.borrow();
 	if params.is_empty() {
 		Write::error("eval: call train first");
+		model.end_forward(arena);
 		return;
 	}
+	let eval_dims: Vec<recipe_ir::LayerDims> =
+		params.iter().map(recipe_ir::LayerDims::from).collect();
+	model.forward_graph.borrow_mut().replace(
+		crate::graph::build_forward_graph(model.id, &eval_dims, eval_loss),
+	);
 	let k = params[params.len() - 1].out_dim;
 	let yscaler = *model.yscaler.borrow();
 	let sp = match Some(()).filter(|_probe| ds.has_target && !metrics.is_empty()) {
@@ -1116,7 +1125,18 @@ impl ModelInner {
 				.all(|p| graph.ops.iter().any(|o| o.id == p.owner)),
 			"every ParamNode owner op id must be valid"
 		);
-		let _graph = graph;
+		debug_assert!(
+			{
+				let (gwf, gwb) = crate::plan::work_from_graph(&graph, n);
+				graph_dims.iter().take(3).enumerate().all(|(l, ld)| {
+					gwf[l].flop == crate::plan::layer_fwd(ld, n).flop
+						&& gwb[l].flop
+							== crate::plan::layer_bwd(ld, n, l == 0).flop
+				})
+			},
+			"work_from_graph must reproduce the per-layer work table"
+		);
+		self.forward_graph.borrow_mut().replace(graph);
 		let out_dim = plan.out_dim_last();
 		let n_targets = dat.n_targets.max(1);
 		let expand_ce = classify && n_targets == 1 && out_dim > 1;

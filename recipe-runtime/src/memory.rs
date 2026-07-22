@@ -1937,9 +1937,10 @@ impl Ooc {
 			LayerKind::Conv => "conv",
 			LayerKind::Dense => "dense",
 		};
+		let ld = recipe_ir::LayerDims::from(p);
 		let w = match phase {
-			"fwd" => crate::plan::layer_fwd(p, self.n),
-			_other => crate::plan::layer_bwd(p, self.n, l == 0),
+			"fwd" => crate::plan::layer_fwd(&ld, self.n),
+			_other => crate::plan::layer_bwd(&ld, self.n, l == 0),
 		};
 		self.sweep_line_work(
 			phase,

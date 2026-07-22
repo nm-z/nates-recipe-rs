@@ -1,7 +1,8 @@
 use crate::execute::ModelInner;
 use pantry::encode::Dataset;
-use recipe_infer::{LayerParams, vram_estimate};
-use recipe_ir::{Activation, LayerKind, LayerSpec, pinned_vocab};
+use recipe_infer::vram_estimate;
+use recipe_ir::graph::{OpKind, ValueId};
+use recipe_ir::{Activation, LayerDims, LayerKind, LayerSpec, SemanticGraph, pinned_vocab};
 pub use recipe_ir::Work;
 
 pub struct CatShape {
@@ -114,7 +115,7 @@ fn sgd(e: f64) -> Work {
 	}
 }
 
-pub fn layer_fwd(p: &LayerParams, n: usize) -> Work {
+pub fn layer_fwd(p: &LayerDims, n: usize) -> Work {
 	let nf = n as f64;
 	let i = p.in_dim as f64;
 	let o = p.out_dim as f64;
@@ -162,7 +163,7 @@ pub fn layer_fwd(p: &LayerParams, n: usize) -> Work {
 	w
 }
 
-pub fn layer_bwd(p: &LayerParams, n: usize, first: bool) -> Work {
+pub fn layer_bwd(p: &LayerDims, n: usize, first: bool) -> Work {
 	let nf = n as f64;
 	let i = p.in_dim as f64;
 	let o = p.out_dim as f64;
@@ -224,4 +225,83 @@ pub fn layer_bwd(p: &LayerParams, n: usize, first: bool) -> Work {
 		}
 	}
 	w
+}
+
+pub fn work_from_graph(g: &SemanticGraph, n: usize) -> (Vec<Work>, Vec<Work>) {
+	let width = |vid: ValueId| -> usize {
+		return g
+			.values
+			.iter()
+			.find(|v| v.id == vid)
+			.map_or(0, |v| v.shape.dims.iter().map(|d| d.0).product());
+	};
+	let base = LayerDims {
+		kind: LayerKind::Dense,
+		in_dim: 0,
+		out_dim: 0,
+		act: Activation::Linear,
+		dim: 0,
+		vocab: 0,
+		heads: 0,
+		conv_cin: 0,
+		conv_k: 0,
+		conv_stride: 0,
+	};
+	let mut dims: Vec<LayerDims> = Vec::new();
+	for (i, op) in g.ops.iter().enumerate() {
+		let mut ld = match op.kind {
+			OpKind::Dense(act) => LayerDims {
+				kind: LayerKind::Dense,
+				act,
+				..base
+			},
+			OpKind::Embed { dim, vocab } => LayerDims {
+				kind: LayerKind::Embed,
+				dim,
+				vocab,
+				..base
+			},
+			OpKind::Attn { dim, heads } => LayerDims {
+				kind: LayerKind::Attn,
+				dim,
+				heads,
+				..base
+			},
+			OpKind::Conv {
+				cin,
+				k,
+				stride,
+				act,
+			} => LayerDims {
+				kind: LayerKind::Conv,
+				conv_cin: cin,
+				conv_k: k,
+				conv_stride: stride,
+				act,
+				..base
+			},
+			OpKind::Activation(_) | OpKind::LossReduce(_) => continue,
+		};
+		ld.in_dim = op.inputs.iter().map(|v| width(*v)).sum();
+		ld.out_dim = op.outputs.first().map_or(0, |v| width(*v));
+		if let Some(next) = g.ops.get(i + 1) {
+			if let OpKind::Activation(a) = next.kind {
+				if next.inputs.first() == op.outputs.first() {
+					ld.act = a;
+					ld.out_dim = next
+						.outputs
+						.first()
+						.map_or(ld.out_dim, |v| width(*v));
+				}
+			}
+		}
+		dims.push(ld);
+	}
+	let fwd: Vec<Work> = dims.iter().map(|d| layer_fwd(d, n)).collect();
+	let bwd: Vec<Work> = dims
+		.iter()
+		.enumerate()
+		.map(|(l, d)| layer_bwd(d, n, l == 0))
+		.collect();
+	return (fwd, bwd);
 }

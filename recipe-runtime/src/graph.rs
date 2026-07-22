@@ -25,13 +25,31 @@ pub fn build_forward_graph(model_id: ObjectId, dims: &[LayerDims], loss: Loss) -
 	let l_count = dims.len();
 	let mut layer_out: Vec<ValueId> = Vec::with_capacity(l_count);
 	let mut prev = v_in;
+	let mut prev_width = in_dim;
 
 	for d in dims.iter() {
+		let saves =
+			d.act != Activation::Linear && crate::plan::saves_preact(d.act).is_some();
+		let fused = match saves {
+			true => Activation::Linear,
+			false => d.act,
+		};
 		let kind = match d.kind {
-			LayerKind::Dense => OpKind::Dense,
-			LayerKind::Embed => OpKind::Embed,
-			LayerKind::Attn => OpKind::Attn,
-			LayerKind::Conv => OpKind::Conv,
+			LayerKind::Dense => OpKind::Dense(fused),
+			LayerKind::Embed => OpKind::Embed {
+				dim: d.dim,
+				vocab: d.vocab,
+			},
+			LayerKind::Attn => OpKind::Attn {
+				dim: d.dim,
+				heads: d.heads,
+			},
+			LayerKind::Conv => OpKind::Conv {
+				cin: d.conv_cin,
+				k: d.conv_k,
+				stride: d.conv_stride,
+				act: fused,
+			},
 		};
 		let op_id = OpId(no);
 		no += 1;
@@ -51,8 +69,22 @@ pub fn build_forward_graph(model_id: ObjectId, dims: &[LayerDims], loss: Loss) -
 			role: Param::B,
 		});
 
-		let saves =
-			d.act != Activation::Linear && crate::plan::saves_preact(d.act).is_some();
+		let side = d.in_dim.saturating_sub(prev_width);
+		let inputs = match side {
+			0 => vec![prev],
+			c => {
+				let v_side = ValueId(nv);
+				nv += 1;
+				g.values.push(ValueNode {
+					id: v_side,
+					shape: Shape {
+						dims: vec![Dim(c)],
+					},
+					produced_by: None,
+				});
+				vec![prev, v_side]
+			}
+		};
 
 		let out_val = match saves {
 			true => {
@@ -68,7 +100,7 @@ pub fn build_forward_graph(model_id: ObjectId, dims: &[LayerDims], loss: Loss) -
 				g.ops.push(OpNode {
 					id: op_id,
 					kind,
-					inputs: vec![prev],
+					inputs,
 					outputs: vec![preact],
 				});
 				let act_op = OpId(no);
@@ -103,7 +135,7 @@ pub fn build_forward_graph(model_id: ObjectId, dims: &[LayerDims], loss: Loss) -
 				g.ops.push(OpNode {
 					id: op_id,
 					kind,
-					inputs: vec![prev],
+					inputs,
 					outputs: vec![out],
 				});
 				out
@@ -120,6 +152,7 @@ pub fn build_forward_graph(model_id: ObjectId, dims: &[LayerDims], loss: Loss) -
 		});
 		layer_out.push(out_val);
 		prev = out_val;
+		prev_width = d.out_dim;
 	}
 
 	let v_last = prev;

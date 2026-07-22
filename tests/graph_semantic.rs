@@ -51,8 +51,8 @@ fn dense_leak_dense_chain() {
 
 	let kinds: Vec<OpKind> = g.ops.iter().map(|o| o.kind).collect();
 	assert_eq!(kinds.len(), 3, "two structural ops + one loss op");
-	assert!(kinds[0] == OpKind::Dense);
-	assert!(kinds[1] == OpKind::Dense);
+	assert!(kinds[0] == OpKind::Dense(Activation::LeakyRelu));
+	assert!(kinds[1] == OpKind::Dense(Activation::Linear));
 	assert!(kinds[2] == OpKind::LossReduce(Loss::Mse));
 
 	assert_eq!(
@@ -92,9 +92,9 @@ fn embed_attn_dense_chain() {
 
 	let kinds: Vec<OpKind> = g.ops.iter().map(|o| o.kind).collect();
 	assert_eq!(kinds.len(), 4, "three structural ops + one loss op");
-	assert!(kinds[0] == OpKind::Embed);
-	assert!(kinds[1] == OpKind::Attn);
-	assert!(kinds[2] == OpKind::Dense);
+	assert!(kinds[0] == OpKind::Embed { dim: 0, vocab: 0 });
+	assert!(kinds[1] == OpKind::Attn { dim: 0, heads: 0 });
+	assert!(kinds[2] == OpKind::Dense(Activation::Linear));
 	assert!(kinds[3] == OpKind::LossReduce(Loss::Ce));
 
 	assert_eq!(
@@ -137,9 +137,9 @@ fn gelu_dense_preact_node() {
 
 	let kinds: Vec<OpKind> = g.ops.iter().map(|o| o.kind).collect();
 	assert_eq!(kinds.len(), 4, "Dense + Activation(Gelu) + Dense + loss");
-	assert!(kinds[0] == OpKind::Dense);
+	assert!(kinds[0] == OpKind::Dense(Activation::Linear));
 	assert!(kinds[1] == OpKind::Activation(Activation::Gelu));
-	assert!(kinds[2] == OpKind::Dense);
+	assert!(kinds[2] == OpKind::Dense(Activation::Linear));
 	assert!(kinds[3] == OpKind::LossReduce(Loss::Mse));
 
 	assert_eq!(
@@ -171,7 +171,7 @@ fn gelu_dense_preact_node() {
 		.map(|o| o.kind)
 		.expect("structural op present");
 	assert!(
-		structural_kind == OpKind::Dense,
+		matches!(structural_kind, OpKind::Dense(_)),
 		"preact must be produced by the structural Dense op"
 	);
 
