@@ -149,11 +149,11 @@ cargo build --release -p vramspy
 LD_PRELOAD=target/release/libvramspy.so <bin>
 ```
 
-## catboost-rs, xgboost-rs, lightgbm-rs
+## catboost-rs, xgboost-rs-broken, lightgbm-rs
 
 Standalone GBDT trainers on `gpu-core` (ordered boosting; level-wise histogram trees; leaf-wise GOSS/EFB).
 
-Build; same form for `xgboost-rs`, `lightgbm-rs`:
+Build; same form for `xgboost-rs-broken`, `lightgbm-rs`:
 
 ```bash
 cargo build --release -p catboost-rs

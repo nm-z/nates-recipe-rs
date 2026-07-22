@@ -17,7 +17,7 @@ vramspy                        LD_PRELOAD cdylib interposing HSA alloc entry poi
                                counts library-side VRAM beneath the ledger choke points
 ```
 
-`catboost-rs` / `lightgbm-rs` / `xgboost-rs` are workspace-excluded, standalone, untouched.
+`catboost-rs` / `lightgbm-rs` / `xgboost-rs-broken` are workspace-excluded, standalone, untouched.
 
 ## Build & Run
 

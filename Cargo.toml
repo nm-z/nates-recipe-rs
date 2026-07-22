@@ -34,7 +34,7 @@ members = [
 	"log",
 	"ogdl",
 	"catboost-rs",
-	"xgboost-rs",
+	"xgboost-rs-broken",
 	"lightgbm-rs",
 ]
 

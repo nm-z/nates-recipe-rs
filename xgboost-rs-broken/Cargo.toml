@@ -1,5 +1,5 @@
 [package]
-name = "xgboost-rs"
+name = "xgboost-rs-broken"
 version = "0.1.0"
 edition = "2024"
 description = "XGBoost-equivalent gradient boosting — level-wise trees, histogram splits, HIP GPU"

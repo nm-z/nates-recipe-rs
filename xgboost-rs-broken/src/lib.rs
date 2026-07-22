@@ -10,7 +10,7 @@ pub enum Error {
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Error::InvalidInput(s) => write!(f, "xgboost-rs: {s}"),
+			Error::InvalidInput(s) => write!(f, "xgboost-rs-broken: {s}"),
 		}
 	}
 }

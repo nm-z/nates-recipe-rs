@@ -1,6 +1,6 @@
 use gpu_core::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use std::time::Instant;
-use xgboost_rs::{Params, predict_proba, train_multiclass};
+use xgboost_rs_broken::{Params, predict_proba, train_multiclass};
 
 fn load_csv(path: &str) -> Result<(Vec<f64>, Vec<usize>, usize, usize), Errored> {
 	let text = std::fs::read_to_string(path)
@@ -108,7 +108,7 @@ fn main() -> Result<(), Errored> {
 
 	Write::line(
 		acc,
-		"\n# ── xgboost-rs results ──────────────────────────────────────",
+		"\n# ── xgboost-rs-broken results ───────────────────────────────",
 	);
 	Write::line(
 		data,
