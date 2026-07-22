@@ -27,7 +27,7 @@ pub mod k_gapact;
 pub mod k_mathx;
 pub mod kernels;
 pub mod linalg;
-pub use log;
+pub use ogdl::log;
 pub mod losses;
 pub mod math_ops;
 pub mod memory;

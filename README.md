@@ -165,9 +165,9 @@ Each crate ships its own `bench` bin, a train+predict bench on a csv:
 cargo run --release -p catboost-rs --bin bench
 ```
 
-## ogdl, log
+## ogdl
 
-Leaf utility crates: OGDL tree graphs (weights/config format); flag-gated stderr and run-file logging.
+Leaf utility crate: OGDL tree graphs (weights/config format); flag-gated stderr and run-file logging as `ogdl::log`.
 
 ogdl test targets; same form for `doc`, `fill`, `full_probe`, `graph`, `host`, `path`, `reconcile`, `styles`:
 
@@ -175,4 +175,4 @@ ogdl test targets; same form for `doc`, `fill`, `full_probe`, `graph`, `host`, `
 cargo test -p ogdl --release --test corpus
 ```
 
-`log` has no targets of its own; everything above is also a member of `cargo test all`.
+Everything above is also a member of `cargo test all`.

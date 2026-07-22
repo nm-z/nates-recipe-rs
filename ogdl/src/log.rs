@@ -4,7 +4,7 @@
 	non_camel_case_types,
 	non_snake_case,
 	dead_code,
-	reason = "log crate deliberately uses lowercase type/const/flag identifiers as its frozen public API"
+	reason = "log module deliberately uses lowercase type/const/flag identifiers as its frozen public API"
 )]
 use core::fmt;
 use core::fmt::Display;

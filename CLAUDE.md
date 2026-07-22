@@ -2,7 +2,7 @@
 
 ## What This Is
 
-GPU-native neural-network training framework in Rust: builder API for models, data loading (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, evaluation. All compute runs on GPU through `gpu-core`; no CPU ML crates. 10-member workspace (every crate in the repo); core DAG:
+GPU-native neural-network training framework in Rust: builder API for models, data loading (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, evaluation. All compute runs on GPU through `gpu-core`; no CPU ML crates. 9-member workspace (every crate in the repo); core DAG:
 
 ```
 gpu-core                       HIP kernels, links ROCm, depends on nothing

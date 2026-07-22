@@ -8,9 +8,8 @@ const SRC_ROOTS: &[&str] = &[
 	"src",
 	"recipe-infer/src",
 	"pantry/src",
-	"vramspy/src",
+	"gpu-core/vramspy/src",
 	"gpu-core/src",
-	"log/src",
 	"ogdl/src",
 ];
 

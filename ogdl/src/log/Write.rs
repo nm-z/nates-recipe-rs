@@ -31,7 +31,7 @@ impl Show for &String {
 	}
 }
 
-impl Show for ogdl::Block {
+impl Show for crate::Block {
 	#[inline]
 	fn take(self) -> String {
 		return self.show();

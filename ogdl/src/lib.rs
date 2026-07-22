@@ -4,6 +4,7 @@ extern crate alloc;
 pub mod __macro_support;
 mod alias;
 mod glob;
+pub mod log;
 
 use alloc::fmt;
 use alloc::sync::Arc;

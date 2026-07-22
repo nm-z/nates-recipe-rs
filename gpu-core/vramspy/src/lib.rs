@@ -6,7 +6,7 @@ use core::ffi::{CStr, c_void};
 use core::mem;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
-use log::Write;
+use ogdl::log::Write;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
