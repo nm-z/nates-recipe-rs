@@ -2,7 +2,7 @@ use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
 pub use recipe_ir::{ConcatDims, LayerDims, concat_layer_dims, pinned_vocab};
 use anyhow::Context;
-use gpu_core::log::{Errored, Write};
+use ogdl::log::{Errored, Write};
 use gpu_core::memory::GpuBuffer;
 use std::env;
 use std::f64::consts;

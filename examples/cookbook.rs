@@ -1,5 +1,5 @@
 #!/usr/bin/env -S cargo run --release --example cookbook --
-use gpu_core::log::{acc, r2};
+use ogdl::log::{acc, r2};
 use recipe::{Accuracy, Data, Infer, Loss, Model, R2, Train, attn, bce, ce, embed, mse};
 
 #[expect(dead_code)]

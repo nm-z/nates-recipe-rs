@@ -2,7 +2,7 @@ use crate::HipError;
 use crate::callspy;
 use crate::hip::{self, check};
 use crate::infer_ops::gpu_scale_f64_inplace;
-use crate::log::{Write, device, gpu};
+use ogdl::log::{Write, device, gpu};
 use crate::memory::{self, GpuBuffer};
 use core::ffi::c_void;
 use core::ops::Div;

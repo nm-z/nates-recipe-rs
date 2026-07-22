@@ -1,4 +1,4 @@
-use gpu_core::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
+use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use std::time::Instant;
 use xgboost_rs_broken::{Params, predict_proba, train_multiclass};
 

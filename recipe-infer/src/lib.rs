@@ -16,7 +16,7 @@ pub use bridge::*;
 pub use enums::*;
 pub use forward::*;
 pub use gpu_core::hip::device_synchronize;
-pub use gpu_core::log;
+pub use ogdl::log;
 pub use gpu_core::memory::{
 	ExitD2H, GpuBuffer, Stage, adopt_run_backing_with_image, claim_device_arena_bytes,
 	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes,

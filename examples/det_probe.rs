@@ -6,7 +6,7 @@ use gpu_core::infer_ops::{
 	gpu_convert, gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
-use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::{Dtype, GpuBuffer};
 use ogdl::ogdl;
 use std::fmt;

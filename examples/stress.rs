@@ -1,5 +1,5 @@
 use anyhow::Context;
-use gpu_core::log::{Opt, Write, opt, probe, r2, set_opt};
+use ogdl::log::{Opt, Write, opt, probe, r2, set_opt};
 use recipe::*;
 use std::fmt;
 use std::path::Path;

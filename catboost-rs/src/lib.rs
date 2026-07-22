@@ -3,7 +3,7 @@ use gpu_core::kernels::{
 	gpu_leaf_finalize, gpu_leaf_reduce, gpu_oblivious_histogram, gpu_oblivious_route_full,
 	gpu_oblivious_route_step, gpu_oblivious_split_eval,
 };
-use gpu_core::log::{Errored, Write, epoch};
+use ogdl::log::{Errored, Write, epoch};
 use gpu_core::memory::GpuBuffer;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;

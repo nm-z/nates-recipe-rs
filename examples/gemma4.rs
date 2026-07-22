@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 use anyhow::{Result, anyhow, bail};
-use gpu_core::log::{Opt, Write, gpu, set_opt};
+use ogdl::log::{Opt, Write, gpu, set_opt};
 use std::env;
 use std::os::unix::process::CommandExt as _;
 use std::process;

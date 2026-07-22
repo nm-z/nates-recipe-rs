@@ -2,7 +2,7 @@ use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
 use anyhow::Context;
 use gpu_core::kernels;
-use gpu_core::log::Write;
+use ogdl::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cell::Cell;
 use std::mem;

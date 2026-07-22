@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 use core::cmp::Ordering;
 use core::ptr;
-use gpu_core::log::{Errored, Opt, Write, gpu, set_opt};
+use ogdl::log::{Errored, Opt, Write, gpu, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, math_ops};
 use std::process::ExitCode;

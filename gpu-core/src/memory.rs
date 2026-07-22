@@ -8,7 +8,7 @@ use crate::hip::{
 	hipStreamSynchronize, host_free, host_malloc, mem_info, pool_slack,
 	register_fault_autopsy_once, set_pool_retain, sysfs_vram_free, trim_mempool,
 };
-use crate::log::{Write, gpu};
+use ogdl::log::{Write, gpu};
 use alloc::collections::BTreeMap;
 use core::cell::Cell;
 use core::cmp;

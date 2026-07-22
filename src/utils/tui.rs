@@ -1,4 +1,4 @@
-use gpu_core::log::Write;
+use ogdl::log::Write;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Layout, Position};
@@ -293,7 +293,7 @@ struct TermRestore {
 impl TermRestore {
 	fn new() -> Self {
 		let log_path = std::env::var("RECIPE_TUI_LOG")
-			.unwrap_or_else(|_e| gpu_core::log::log_path().to_owned());
+			.unwrap_or_else(|_e| ogdl::log::log_path().to_owned());
 		let saved_stderr = redirect_stderr(&log_path);
 		drop(ratatui::crossterm::execute!(
 			io::stdout(),
@@ -627,7 +627,7 @@ fn render_models(frame: &mut Frame, names: &[String], cur: usize) {
 
 pub fn model_picker(names: &[String]) -> Option<usize> {
 	if !io::stdin().is_terminal() {
-		gpu_core::log::Write::error("run: needs a tty");
+		ogdl::log::Write::error("run: needs a tty");
 		return None;
 	}
 	let mut term = ratatui::init();
@@ -690,7 +690,7 @@ fn drain_input(cancel: &std::sync::atomic::AtomicBool, textarea: &mut TextArea, 
 
 pub fn render_once(gguf: &str, prompt: &str) {
 	if !io::stdin().is_terminal() {
-		gpu_core::log::Write::error("render: needs a tty");
+		ogdl::log::Write::error("render: needs a tty");
 		return;
 	}
 	let mut term = ratatui::init();
@@ -712,7 +712,7 @@ pub fn render_once(gguf: &str, prompt: &str) {
 		Ok(resp) => scrollback.push(Entry { user: prompt.to_string(), body: resp.clone(), shown: resp }),
 		Err(e) => {
 			drop(_guard);
-			gpu_core::log::Write::error(format!("render: {e:#}"));
+			ogdl::log::Write::error(format!("render: {e:#}"));
 			return;
 		}
 	}
@@ -881,7 +881,7 @@ fn run_message(
 
 pub fn chat(gguf: &str) {
 	if !io::stdin().is_terminal() {
-		gpu_core::log::Write::error("chat: needs a tty");
+		ogdl::log::Write::error("chat: needs a tty");
 		return;
 	}
 	let mut term = ratatui::init();
@@ -916,7 +916,7 @@ pub fn chat(gguf: &str) {
 			drop(prompt_tx);
 			let _joined = worker.join();
 			drop(_guard);
-			gpu_core::log::Write::error(format!("chat: load failed: {e}"));
+			ogdl::log::Write::error(format!("chat: load failed: {e}"));
 			return;
 		}
 	}

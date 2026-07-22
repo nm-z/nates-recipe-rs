@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpu_core::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
+use ogdl::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
 use std::collections::HashMap;
 use std::env;
 use std::fs;

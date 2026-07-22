@@ -2,7 +2,7 @@ use crate::HipError;
 use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
 use crate::hip::{check, hipGetLastError};
 use crate::kernels::hipblas_handle;
-use crate::log::Write;
+use ogdl::log::Write;
 use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;

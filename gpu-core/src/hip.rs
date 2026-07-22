@@ -1,7 +1,7 @@
 use crate::callspy;
 use crate::gate;
 use crate::hw;
-use crate::log::Write;
+use ogdl::log::Write;
 use core::cmp;
 use core::error::Error;
 use core::ffi::{CStr, c_void};

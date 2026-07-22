@@ -1,5 +1,5 @@
 use crate::hip::sysfs_vram_free;
-use crate::log::Write;
+use ogdl::log::Write;
 use core::cmp;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};

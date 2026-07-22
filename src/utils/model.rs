@@ -1,7 +1,7 @@
 use crate::dataset::Dataset;
 use crate::train::INTERRUPTED;
 use anyhow::Context;
-use gpu_core::log::{
+use ogdl::log::{
 	Flag, Opt, Write, acc, chat, data, device, epoch, gpu, loss, lr, net, probe, prompt, r2,
 	save, set_opt, time,
 };

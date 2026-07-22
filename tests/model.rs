@@ -1129,25 +1129,25 @@ fn metric_consts_both_casings() {
 	]);
 	drop(t);
 	let i = Infer::new().log([
-		gpu_core::log::loss,
-		gpu_core::log::acc,
-		gpu_core::log::epoch,
-		gpu_core::log::lr,
-		gpu_core::log::time,
-		gpu_core::log::r2,
-		gpu_core::log::chat,
+		ogdl::log::loss,
+		ogdl::log::acc,
+		ogdl::log::epoch,
+		ogdl::log::lr,
+		ogdl::log::time,
+		ogdl::log::r2,
+		ogdl::log::chat,
 	]);
 	drop(i);
 	assert!(
-		gpu_core::log::loss == gpu_core::log::loss,
+		ogdl::log::loss == ogdl::log::loss,
 		"flag self-equality"
 	);
 	assert!(
-		gpu_core::log::loss != gpu_core::log::acc,
+		ogdl::log::loss != ogdl::log::acc,
 		"distinct flags compare unequal"
 	);
 	assert!(
-		gpu_core::log::chat != gpu_core::log::r2,
+		ogdl::log::chat != ogdl::log::r2,
 		"chat is its own flag"
 	);
 }

@@ -53,7 +53,7 @@ pub use ogdl::ogdl;
 pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
 
 pub fn block(content: impl fmt::Display) {
-	gpu_core::log::Write::always(content);
+	ogdl::log::Write::always(content);
 }
 
 pub struct Recipe;

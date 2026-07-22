@@ -1,4 +1,4 @@
-use gpu_core::log::{Write, epoch};
+use ogdl::log::{Write, epoch};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use std::fmt;

@@ -2,7 +2,7 @@
 
 use core::ffi::c_void;
 use gpu_core::asm::{self, KernArgs};
-use gpu_core::log::{Errored, Write};
+use ogdl::log::{Errored, Write};
 use std::process::ExitCode;
 
 fn parse_arg(token: &str, args: &mut KernArgs, bufs: &mut Vec<*mut c_void>) -> Result<(), Errored> {

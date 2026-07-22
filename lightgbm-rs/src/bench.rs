@@ -1,4 +1,4 @@
-use gpu_core::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
+use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use lightgbm_rs::{Params, predict_proba, train_multiclass};
 use std::time::Instant;
 

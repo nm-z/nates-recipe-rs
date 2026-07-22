@@ -3,7 +3,7 @@ use crate::params::{ConcatDims, LayerParams, concat_layer};
 use crate::scratch::Scratch;
 use anyhow::Context;
 use gpu_core::kernels;
-use gpu_core::log::Write;
+use ogdl::log::Write;
 use gpu_core::memory::GpuBuffer;
 use std::cmp::Ordering;
 

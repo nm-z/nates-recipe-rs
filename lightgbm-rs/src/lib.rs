@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 use gpu_core::HipError;
 use gpu_core::kernels::*;
-use gpu_core::log::{Write, epoch};
+use ogdl::log::{Write, epoch};
 use gpu_core::memory::GpuBuffer;
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;

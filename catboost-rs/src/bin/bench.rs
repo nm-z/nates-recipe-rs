@@ -1,5 +1,5 @@
 use catboost_rs::{Params, predict, train};
-use gpu_core::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
+use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use std::time::Instant;
 
 fn load_csv(path: &str) -> Result<(Vec<f64>, Vec<usize>, usize, usize), Errored> {

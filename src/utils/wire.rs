@@ -1,6 +1,6 @@
 use crate::machine::Machine;
 use anyhow::{Result, bail, ensure};
-use gpu_core::log::{Write, net};
+use ogdl::log::{Write, net};
 use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
 use std::collections::HashMap;

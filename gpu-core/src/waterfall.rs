@@ -1,4 +1,4 @@
-use crate::log::{Write, gpu};
+use ogdl::log::{Write, gpu};
 use crate::memory::{GpuBuffer, USER_GB, arena_remaining, probe_ram_ceiling, tag_scope};
 use core::cmp::Ordering;
 use std::collections::HashMap;

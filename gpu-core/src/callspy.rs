@@ -1,4 +1,4 @@
-use crate::log::Write;
+use ogdl::log::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

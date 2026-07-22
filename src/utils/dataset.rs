@@ -1,5 +1,5 @@
 use crate::Mat;
-use gpu_core::log::{Write, data};
+use ogdl::log::{Write, data};
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
 use std::cell::RefCell;

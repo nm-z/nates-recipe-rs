@@ -2,7 +2,7 @@ use crate::dataset::{Dataset, collapse_onehot};
 use crate::model::{ModelInner, Train};
 use anyhow::Context;
 use gpu_core::kernels;
-use gpu_core::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
+use ogdl::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, save, time};
 use gpu_core::memory::{GpuBuffer, Stage};
 use recipe_infer::{
 	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
@@ -177,7 +177,7 @@ pub(crate) fn live_vals(
 	return Ok(vals);
 }
 
-pub(crate) fn metric_flag(m: Metric) -> gpu_core::log::Flag {
+pub(crate) fn metric_flag(m: Metric) -> ogdl::log::Flag {
 	return match m {
 		Metric::Loss => loss,
 		Metric::Accuracy => acc,
@@ -189,7 +189,7 @@ pub(crate) fn metric_flag(m: Metric) -> gpu_core::log::Flag {
 	};
 }
 pub(crate) fn metrics_emit(prefix: &str, metrics: &[Metric], vals: &[f64]) {
-	let o = gpu_core::log::opt();
+	let o = ogdl::log::opt();
 	let shown: Vec<(Metric, f64)> = metrics
 		.iter()
 		.zip(vals.iter())

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S cargo run --release --example styles --
 
-use gpu_core::log::{loss, r2};
+use ogdl::log::{loss, r2};
 use recipe::{Data, Infer, Loss, Model, R2, Train, mse, recipe};
 
 const CSV: &str = "examples/datasets/house-prices/train.csv";

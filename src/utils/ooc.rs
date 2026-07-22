@@ -1,7 +1,7 @@
 use crate::train::StepScalars;
 use anyhow::Context;
 use gpu_core::kernels;
-use gpu_core::log::{Write, gpu};
+use ogdl::log::{Write, gpu};
 use gpu_core::memory::GpuBuffer;
 use recipe_infer::{Activation, LayerKind, LayerParams, Loss, Scratch};
 use std::cell::Cell;

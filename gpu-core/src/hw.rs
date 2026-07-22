@@ -1,4 +1,4 @@
-use crate::log::{Write, gpu};
+use ogdl::log::{Write, gpu};
 use core::array::from_fn;
 use core::cmp;
 use core::mem::transmute_copy;

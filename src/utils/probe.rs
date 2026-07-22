@@ -1,6 +1,6 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
-use gpu_core::log::{Opt, Write, probe, set_opt};
+use ogdl::log::{Opt, Write, probe, set_opt};
 use gpu_core::memory::{GpuBuffer, USER_GB, par_copy, par_touch};
 use std::cmp::Ordering;
 use std::env;

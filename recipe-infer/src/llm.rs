@@ -5,8 +5,8 @@ use gpu_core::infer_ops::{
 	gpu_rmsnorm_f64_nogamma,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
-use gpu_core::log::probe as probe_flag;
-use gpu_core::log::{Write, data, gpu};
+use ogdl::log::probe as probe_flag;
+use ogdl::log::{Write, data, gpu};
 use gpu_core::memory::{Dtype, GpuBuffer};
 use gpu_core::waterfall::{Home, Waterfall};
 use rand::rngs::StdRng;
@@ -3034,7 +3034,7 @@ fn refine_canvas(
 				(h ^ x.to_bits()).wrapping_mul(0x100000001b3)
 			}))
 		};
-		if step == 0 && gpu_core::log::opt().probe {
+		if step == 0 && ogdl::log::opt().probe {
 			Write::line(
 				probe_flag,
 				format!("[hash] step0 input {:016x}", bithash(&ar.ha, t * ne)?),
@@ -3063,7 +3063,7 @@ fn refine_canvas(
 			};
 			models::dispatch(m, l, src, dst, t, &ar, attn_scale, &dec)?;
 			mem::swap(&mut src, &mut dst);
-			if step == 0 && gpu_core::log::opt().probe {
+			if step == 0 && ogdl::log::opt().probe {
 				Write::line(
 					probe_flag,
 					format!("[hash] step0 layer {l:2} {:016x}", bithash(src, t * ne)?),

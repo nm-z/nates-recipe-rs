@@ -1,7 +1,7 @@
 #!/usr/bin/env -S cargo run --release --example train_detector --
 
 use anyhow::Context;
-use gpu_core::log::{Opt, Write, opt, probe, set_opt};
+use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use pantry::{
 	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
