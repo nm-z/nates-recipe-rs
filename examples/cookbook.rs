@@ -38,7 +38,6 @@ fn main() {
 		.target("Churn");
 	let nn_train = Train::new()
 		.epochs(20)
-		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 	let nn_infer = Infer::new().log([acc]);
 
@@ -58,7 +57,6 @@ fn main() {
 		.target("label");
 	let cnn_train = Train::new()
 		.epochs(20)
-		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 	let cnn_infer = Infer::new().log([acc]);
 
@@ -76,7 +74,6 @@ fn main() {
 		.target("SalePrice");
 	let mlp_train = Train::new()
 		.epochs(20)
-		.net(["archy", "sentry"])
 		.log([Loss, R2, hip]);
 	let mlp_infer = Infer::new().log([r2]);
 
@@ -95,7 +92,6 @@ fn main() {
 	]);
 	let llm_train = Train::new()
 		.epochs(1)
-		.net(["archy", "sentry"])
 		.log([Loss, Accuracy, hip]);
 	let llm_infer = Infer::new().log([acc]);
 
