@@ -39,15 +39,18 @@ pub use dataset::Dataset;
 
 #[doc(inline)]
 pub use model::{
-	Acc, Accuracy, Epoch, Infer, Loss, Lr, Metric, Model, R2, Time, Train, attn, bce, ce,
+	Acc, Accuracy, Epoch, Infer, Lr, Model, R2, Time, Train, attn, bce, ce,
 	embed, focal, hip, huber, mae, mse,
 };
+#[doc(inline)]
+pub use recipe_infer::loss as Loss;
 #[doc(hidden)]
 pub use model::{
-	Activation, DataHandle, IntoLayer, LayerSpec, ModelArg, ModelHandle, Prepared, RunArg,
+	DataHandle, IntoLayer, ModelArg, ModelHandle, Prepared, RunArg,
 	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 pub use ogdl::ogdl;
+pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
 
 pub fn block(content: impl fmt::Display) {
 	gpu_core::log::Write::always(content);

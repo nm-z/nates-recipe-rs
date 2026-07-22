@@ -1,136 +1,63 @@
-#[derive(Clone, Copy, PartialEq)]
-pub enum Activation {
-	Relu,
-	Sigmoid,
-	Linear,
-	LeakyRelu,
-	PRelu,
-	Elu,
-	Selu,
-	Tanh,
-	Silu,
-	Gelu,
-}
-
-#[derive(Clone, Copy)]
-pub enum LayerSpec {
-	Dense(usize, Activation),
-	Embed(usize, Option<usize>),
-	Attn(usize),
-	Conv(usize, usize, usize, Activation),
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum LayerKind {
-	Dense,
-	Embed,
-	Attn,
-	Conv,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Loss {
-	Mse,
-	Mae,
-	Ce,
-	Bce,
-	Huber,
-	Focal,
-}
-
-impl Loss {
-	pub fn is_classification(self) -> bool {
-		matches!(self, Loss::Ce | Loss::Bce | Loss::Focal)
-	}
-	pub fn score_key(self) -> &'static str {
-		match self {
-			Loss::Ce | Loss::Bce | Loss::Focal => "acc",
-			Loss::Mse | Loss::Mae | Loss::Huber => "r2",
-		}
-	}
-	pub fn name(self) -> &'static str {
-		match self {
-			Loss::Mse => "mse",
-			Loss::Mae => "mae",
-			Loss::Ce => "ce",
-			Loss::Bce => "bce",
-			Loss::Huber => "huber",
-			Loss::Focal => "focal",
-		}
-	}
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Metric {
-	Loss,
-	Accuracy,
-	Epoch,
-	Lr,
-	Time,
-	R2,
-	Hip,
-}
+pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
 
 pub struct MetricFmt {
 	pub label: &'static str,
 	pub width: usize,
 }
 
-impl Metric {
-	pub fn fmt(self) -> MetricFmt {
-		match self {
-			Metric::Epoch => MetricFmt {
-				label: "epoch",
-				width: 5,
-			},
-			Metric::Lr => MetricFmt {
-				label: "lr",
-				width: 7,
-			},
-			Metric::Time => MetricFmt {
-				label: "time",
-				width: 9,
-			},
-			Metric::Loss => MetricFmt {
-				label: "loss",
-				width: 7,
-			},
-			Metric::Accuracy => MetricFmt {
-				label: "acc",
-				width: 6,
-			},
-			Metric::R2 => MetricFmt {
-				label: "r2",
-				width: 8,
-			},
-			Metric::Hip => MetricFmt {
-				label: "hip",
-				width: 0,
-			},
-		}
+pub fn metric_fmt(m: Metric) -> MetricFmt {
+	match m {
+		Metric::Epoch => MetricFmt {
+			label: "epoch",
+			width: 5,
+		},
+		Metric::Lr => MetricFmt {
+			label: "lr",
+			width: 7,
+		},
+		Metric::Time => MetricFmt {
+			label: "time",
+			width: 9,
+		},
+		Metric::Loss => MetricFmt {
+			label: "loss",
+			width: 7,
+		},
+		Metric::Accuracy => MetricFmt {
+			label: "acc",
+			width: 6,
+		},
+		Metric::R2 => MetricFmt {
+			label: "r2",
+			width: 8,
+		},
+		Metric::Hip => MetricFmt {
+			label: "hip",
+			width: 0,
+		},
 	}
+}
 
-	pub fn pinned_slot(self) -> Option<usize> {
-		return match self {
-			Metric::Loss => Some(0),
-			Metric::Accuracy => Some(1),
-			Metric::R2 => Some(2),
-			Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => None,
-		};
-	}
+pub fn metric_pinned_slot(m: Metric) -> Option<usize> {
+	return match m {
+		Metric::Loss => Some(0),
+		Metric::Accuracy => Some(1),
+		Metric::R2 => Some(2),
+		Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => None,
+	};
+}
 
-	pub fn render(self, v: f64) -> String {
-		let w = self.fmt().width;
-		v.partial_cmp(&v)
-			.map_or(format!("{:>w$}", "N/A"), |_finite| match self {
-				Metric::Epoch => format!("{:>w$}", v as usize),
-				Metric::Time => format!("{:>w$}", fmt_time(v)),
-				Metric::Hip => String::new(),
-				Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => {
-					format!("{v:>w$.4}")
-				}
-			})
-	}
+pub fn metric_render(m: Metric, v: f64) -> String {
+	let w = metric_fmt(m).width;
+	v.partial_cmp(&v)
+		.map_or(format!("{:>w$}", "N/A"), |_finite| match m {
+			Metric::Epoch => format!("{:>w$}", v as usize),
+			Metric::Time => format!("{:>w$}", fmt_time(v)),
+			Metric::Hip => String::new(),
+			Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => {
+				format!("{v:>w$.4}")
+			}
+		})
 }
 
 pub fn fmt_time(secs: f64) -> String {
@@ -192,9 +119,3 @@ pub use alias::{
 	LINEAR as linear, MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu,
 	SIG as sig, SILU as silu, SWISH as swish, TANH as tanh,
 };
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Param {
-	W,
-	B,
-}

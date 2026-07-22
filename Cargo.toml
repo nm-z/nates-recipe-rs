@@ -28,6 +28,7 @@ resolver = "3"
 members = [
 	".",
 	"recipe-infer",
+	"recipe-ir",
 	"pantry",
 	"gpu-core/vramspy",
 	"gpu-core",
@@ -40,6 +41,7 @@ members = [
 [dependencies]
 gpu-core = { path = "gpu-core" }
 recipe-infer = { path = "recipe-infer" }
+recipe-ir = { path = "recipe-ir" }
 pantry = { path = "pantry" }
 ogdl = { path = "ogdl" }
 anyhow = "1"

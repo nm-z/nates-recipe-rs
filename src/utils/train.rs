@@ -6,7 +6,8 @@ use gpu_core::log::{Write, acc, data, device, epoch, gpu, loss, lr, prompt, r2, 
 use gpu_core::memory::{GpuBuffer, Stage};
 use recipe_infer::{
 	LayerSpec, Loss, Metric, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, load_ogdl,
-	load_ogdl_str, metric_gpu_into, pinned_vocab, plan_layer_params, zscore_apply_views,
+	load_ogdl_str, metric_fmt, metric_gpu_into, metric_pinned_slot, metric_render, pinned_vocab,
+	plan_layer_params, zscore_apply_views,
 };
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -113,10 +114,10 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 	let mut shown = 0usize;
 	for mi in 0..metrics.len().min(vals.len()) {
 		let m = metrics[mi];
-		let Some(_w) = m.fmt().width.checked_sub(1) else {
+		let Some(_w) = metric_fmt(m).width.checked_sub(1) else {
 			continue;
 		};
-		let num = m.render(vals[mi]);
+		let num = metric_render(m, vals[mi]);
 		if !line.is_empty() {
 			line.push_str("  ");
 		}
@@ -125,7 +126,7 @@ pub(crate) fn metrics_line(metrics: &[Metric], vals: &[f64]) -> String {
 		let _ = write!(
 			line,
 			"{} \x1b[38;2;{};{};{}m{num}\x1b[0m",
-			m.fmt().label,
+			metric_fmt(m).label,
 			c.r,
 			c.g,
 			c.b
@@ -455,7 +456,7 @@ impl ModelInner {
 			.iter()
 			.copied()
 			.filter_map(|m| {
-				let slot = m.pinned_slot()?;
+				let slot = metric_pinned_slot(m)?;
 				let ri = ring_row.iter().position(|&d| d == m)?;
 				Some((m, slot, ri))
 			})

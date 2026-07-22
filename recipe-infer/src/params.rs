@@ -1,5 +1,6 @@
 use crate::enums::{Activation, LayerKind, LayerSpec};
 use crate::{Param, download_scalar, download_vec};
+pub use recipe_ir::{ConcatDims, LayerDims, concat_layer_dims, pinned_vocab};
 use anyhow::Context;
 use gpu_core::log::{Errored, Write};
 use gpu_core::memory::GpuBuffer;
@@ -49,61 +50,14 @@ pub struct LayerParams {
 	pub conv_stride: usize,
 }
 
-#[derive(Clone, Copy)]
-pub struct ConcatDims {
-	pub pf: usize,
-	pub a: usize,
-	pub c: usize,
-}
-
 pub fn concat_layer(params: &[LayerParams]) -> Option<ConcatDims> {
-	concat_layer_dims_iter(params.iter().map(|p| (p.kind, p.in_dim, p.out_dim)))
-}
-
-pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<ConcatDims> {
-	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
-}
-
-fn concat_layer_dims_iter(
-	it: impl Iterator<Item = (LayerKind, usize, usize)>,
-) -> Option<ConcatDims> {
-	let layers: Vec<(LayerKind, usize, usize)> = it.collect();
-	for l in 1..layers.len() {
-		let (prev_kind, _, prev_out) = layers[l - 1];
-		let (kind, in_dim, _) = layers[l];
-		if kind == LayerKind::Dense && matches!(prev_kind, LayerKind::Embed | LayerKind::Attn) {
-			let a = prev_out;
-			let c = in_dim.saturating_sub(a);
-			return (c > 0).then_some(ConcatDims { pf: l, a, c });
-		}
-	}
-	None
+	let dims: Vec<LayerDims> = params.iter().map(LayerDims::from).collect();
+	concat_layer_dims(&dims)
 }
 
 pub struct Scaler {
 	pub mean: Vec<f64>,
 	pub std: Vec<f64>,
-}
-
-pub fn pinned_vocab(specs: &[LayerSpec]) -> Option<usize> {
-	specs.iter().find_map(|s| match s {
-		LayerSpec::Embed(_, v) => *v,
-		_ => None,
-	})
-}
-
-#[derive(Clone, Copy)]
-pub struct LayerDims {
-	pub kind: LayerKind,
-	pub in_dim: usize,
-	pub out_dim: usize,
-	pub act: Activation,
-	pub dim: usize,
-	pub vocab: usize,
-	pub heads: usize,
-	pub conv_cin: usize,
-	pub conv_k: usize,
-	pub conv_stride: usize,
 }
 
 impl From<&LayerParams> for LayerDims {

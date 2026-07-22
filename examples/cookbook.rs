@@ -1,6 +1,6 @@
 #!/usr/bin/env -S cargo run --release --example cookbook --
 use gpu_core::log::{acc, r2};
-use recipe::{Accuracy, Data, Infer, Loss, Model, R2, Train, attn, bce, ce, embed, hip, mse};
+use recipe::{Accuracy, Data, Infer, Loss, Model, R2, Train, attn, bce, ce, embed, mse};
 
 #[expect(dead_code)]
 struct Sets {
@@ -38,7 +38,7 @@ fn main() {
 		.target("Churn");
 	let nn_train = Train::new()
 		.epochs(20)
-		.log([Loss, Accuracy, hip]);
+		.log([Loss, Accuracy]);
 	let nn_infer = Infer::new().log([acc]);
 
 	let cnn = Model::new() // CNN
@@ -57,7 +57,7 @@ fn main() {
 		.target("label");
 	let cnn_train = Train::new()
 		.epochs(20)
-		.log([Loss, Accuracy, hip]);
+		.log([Loss, Accuracy]);
 	let cnn_infer = Infer::new().log([acc]);
 
 	let mlp = Model::new() // MLP
@@ -74,7 +74,7 @@ fn main() {
 		.target("SalePrice");
 	let mlp_train = Train::new()
 		.epochs(20)
-		.log([Loss, R2, hip]);
+		.log([Loss, R2]);
 	let mlp_infer = Infer::new().log([r2]);
 
 	let llm = Model::new() // LLM
@@ -92,7 +92,7 @@ fn main() {
 	]);
 	let llm_train = Train::new()
 		.epochs(1)
-		.log([Loss, Accuracy, hip]);
+		.log([Loss, Accuracy]);
 	let llm_infer = Infer::new().log([acc]);
 
 	for (model, data, train, infer) in [

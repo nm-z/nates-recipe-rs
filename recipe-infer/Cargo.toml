@@ -13,6 +13,7 @@ categories = ["science::ml"]
 name = "recipe_infer"
 
 [dependencies]
+recipe-ir = { path = "../recipe-ir" }
 ctor = "0.2"
 anyhow = "1"
 libc = "0.2"

@@ -186,7 +186,7 @@ pub fn dashboard(frame: &mut Frame, summary: &str, rows: &[Vec<f64>], ys: &[Metr
 			.data(&pts);
 		let cur = rows.last().map_or(f64::NAN, |r| r[1 + j]);
 		let title = Span::styled(
-			format!("{} = {}", m.fmt().label, fmt_axis(cur)),
+			format!("{} = {}", recipe_infer::metric_fmt(m).label, fmt_axis(cur)),
 			Style::default().fg(color),
 		);
 		let chart = Chart::new(vec![ds])
