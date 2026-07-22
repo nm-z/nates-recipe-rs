@@ -16,25 +16,25 @@ mistral-7b-v0.3 = "/home/nate/.lmstudio/models/lmstudio-community/Mistral-7B-Ins
 nemotron3-nano-4b = "/home/nate/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf"
 phi4-mini-reasoning = "/home/nate/.lmstudio/models/lmstudio-community/Phi-4-mini-reasoning-GGUF/Phi-4-mini-reasoning-Q8_0.gguf"
 
-qwen3-0.6b-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-f16.gguf"
-qwen3-0.6b-bf16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-bf16.gguf"
-qwen3-0.6b-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q8_0.gguf"
-qwen3-0.6b-q6_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q6_k.gguf"
-qwen3-0.6b-q5_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_k.gguf"
-qwen3-0.6b-q5_1 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_1.gguf"
-qwen3-0.6b-q5_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q5_0.gguf"
-qwen3-0.6b-q4_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_k.gguf"
-qwen3-0.6b-q4_1 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_1.gguf"
-qwen3-0.6b-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q4_0.gguf"
-qwen3-0.6b-q3_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q3_k.gguf"
-qwen3-0.6b-q2_k = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/qwen3/0.6B/ggml-model-q2_k.gguf"
-qwen3-0.6b-q8-quantize = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/quantize/Qwen3-0.6B-Q8_0.gguf"
-qwen3-0.6b-q8-split = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/gguf-split/Qwen3-0.6B-Q8_0.gguf"
-bge-small-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge-small/ggml-model-f16.gguf"
-bge-small-q8_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/bge-small/ggml-model-q8_0.gguf"
-rerank-tiny-f16 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/tmp/mnt/models/rerank-tiny/ggml-model-f16.gguf"
-stories15m-q4_0 = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/tinyllamas/stories15M-q4_0.gguf"
-stories15m-q4_0-debug = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-debug/tinyllamas/stories15M-q4_0.gguf"
+qwen3-0.6b-f16 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-f16.gguf"
+qwen3-0.6b-bf16 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-bf16.gguf"
+qwen3-0.6b-q8_0 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q8_0.gguf"
+qwen3-0.6b-q6_k = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q6_k.gguf"
+qwen3-0.6b-q5_k = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q5_k.gguf"
+qwen3-0.6b-q5_1 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q5_1.gguf"
+qwen3-0.6b-q5_0 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q5_0.gguf"
+qwen3-0.6b-q4_k = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q4_k.gguf"
+qwen3-0.6b-q4_1 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q4_1.gguf"
+qwen3-0.6b-q4_0 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q4_0.gguf"
+qwen3-0.6b-q3_k = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q3_k.gguf"
+qwen3-0.6b-q2_k = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/qwen3/0.6B/ggml-model-q2_k.gguf"
+qwen3-0.6b-q8-quantize = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/quantize/Qwen3-0.6B-Q8_0.gguf"
+qwen3-0.6b-q8-split = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/gguf-split/Qwen3-0.6B-Q8_0.gguf"
+bge-small-f16 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/bge-small/ggml-model-f16.gguf"
+bge-small-q8_0 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/bge-small/ggml-model-q8_0.gguf"
+rerank-tiny-f16 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/rerank-tiny/ggml-model-f16.gguf"
+stories15m-q4_0 = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/tinyllamas/stories15M-q4_0.gguf"
+stories15m-q4_0-debug = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/tinyllamas/stories15M-q4_0.gguf"
 stories-f32-fixture = "/home/nate/Desktop/nates-recipe-rs/recipe-infer/tests/fixtures/stories-f32.gguf"
 
 [mmproj]
@@ -43,10 +43,9 @@ glm-4.6v-flash-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/GLM-4.6V
 ministral3-3b-mmproj = "/home/nate/.lmstudio/models/lmstudio-community/Ministral-3-3B-Instruct-2512-GGUF/mmproj-Ministral-3-3B-Instruct-2512-F16.gguf"
 
 [misc]
-imatrix = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/build-ci-release/imatrix.gguf"
+imatrix = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-ci-models/imatrix.gguf"
 
 [fixture_dirs]
 archs-parity = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-archs-seed42"          # 111 seeded arch ggufs + .logits references
 vocabs-parity = "/home/nate/Desktop/nates-recipe-rs/datasets/llamacpp-vocabs-tokenizer"     # tokenizer parity set
-vocab-ggufs-recipe = "/home/nate/Desktop/nates-recipe-rs/llama.cpp/models"                  # ggml-vocab-*.gguf (no weights)
 vocab-ggufs-gemma4 = "/home/nate/Desktop/gemma4/llama.cpp/models"                           # ggml-vocab-*.gguf (no weights)

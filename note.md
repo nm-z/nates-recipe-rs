@@ -1,34 +1,8 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 inference:
 	parallelism: PP
 	dtype:
 		engi.GPU0 fp16
 		sentry.GPU1 bf16
-
-
-
-
-
-
-
-
 
 ---
 1 VGPR	= 1 value / thread
@@ -100,7 +74,7 @@ DISK
 
 
 
-
+---
 Vendor:
 	nvidia
 		tool		cuda

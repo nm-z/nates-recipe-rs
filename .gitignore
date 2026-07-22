@@ -55,15 +55,7 @@ examples/*/test_images/
 /*.patch
 /deleted-copilot-branches-*.txt
 .recipe_spill
-/suite.log
-/warn.log
-/check.log
-/clippy.log
-/census.log
-/gc.log
-/suite.stderr.log
-/push.log
-/log-clippy.log
+*.log
 
 # Vendored llama.cpp clone (reference for arch ports; clone separately)
 llama.cpp/
