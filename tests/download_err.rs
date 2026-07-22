@@ -1,4 +1,5 @@
-use recipe_infer::{GpuBuffer, download_vec};
+use recipe_infer::GpuBuffer;
+use recipe_runtime::execute::download_vec;
 
 #[test]
 fn download_from_null_buffer_errs_not_aborts() {

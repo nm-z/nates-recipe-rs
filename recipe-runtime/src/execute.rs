@@ -8,8 +8,8 @@ use ogdl::log::{
 use pantry::encode::Dataset;
 use crate::memory::{Scaler, load_ogdl};
 use recipe_infer::{
-	LayerParams, PlanMode, SCRATCH_CONSTS, Scratch, concat_layer, infer_scored,
-	load_ogdl_str, metric_gpu_into, plan_layer_params, zscore_apply_views,
+	LayerParams, PlanMode, SCRATCH_CONSTS, Scratch, concat_layer, load_ogdl_str,
+	plan_layer_params,
 };
 use recipe_ir::{LayerSpec, Loss, Metric, Param, Slot, pinned_vocab};
 use std::cell::{Cell, RefCell};
@@ -89,6 +89,399 @@ pub fn fmt_time(secs: f64) -> String {
 			None => format!("{secs:.1}s"),
 		},
 	}
+}
+
+#[derive(Clone, Copy)]
+pub struct LossScale {
+	pub sign: f64,
+	pub div: f64,
+}
+
+pub fn metric_gpu_into(
+	lossfn: Loss,
+	m: Metric,
+	out: &GpuBuffer,
+	ybuf: &GpuBuffer,
+	sc: &Scratch,
+	n: usize,
+	k: usize,
+	ss_tot: f64,
+	dst: &GpuBuffer,
+) -> anyhow::Result<LossScale> {
+	let nk = n * k;
+	Ok(match m {
+		Metric::Loss => match lossfn {
+			Loss::Mse => {
+				kernels::gpu_mse_into(out, ybuf, nk, dst)?;
+				LossScale {
+					sign: 1.0,
+					div: 1.0,
+				}
+			}
+			Loss::Mae => {
+				kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
+				kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+				kernels::gpu_reduce_sum_cols_into(
+					&sc.metric_t0,
+					&sc.reduce_ws,
+					nk,
+					1,
+					dst,
+				)?;
+				LossScale {
+					sign: 1.0,
+					div: nk as f64,
+				}
+			}
+			Loss::Huber => {
+				kernels::gpu_sub_scale_into(out, ybuf, &sc.c_one, nk, &sc.metric_t0)?;
+				kernels::gpu_clamp_into(
+					&sc.metric_t0,
+					&sc.c_neg_one,
+					&sc.c_one,
+					nk,
+					&sc.metric_t1,
+				)?;
+				kernels::gpu_copy_into(&sc.metric_t1, nk, &sc.metric_t2)?;
+				kernels::gpu_mul_inplace(&sc.metric_t1, nk, &sc.metric_t2)?;
+				kernels::gpu_scale_inplace(&sc.c_half, nk, &sc.metric_t2)?;
+				kernels::gpu_abs_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+				kernels::gpu_add_inplace(&sc.metric_t0, nk, &sc.metric_t2)?;
+				kernels::gpu_abs_into(&sc.metric_t1, nk, &sc.metric_t1)?;
+				kernels::gpu_sub_inplace(&sc.metric_t1, nk, &sc.metric_t2)?;
+				kernels::gpu_reduce_sum_cols_into(
+					&sc.metric_t2,
+					&sc.reduce_ws,
+					nk,
+					1,
+					dst,
+				)?;
+				LossScale {
+					sign: 1.0,
+					div: nk as f64,
+				}
+			}
+			Loss::Ce => {
+				kernels::gpu_softmax_rows_into(out, n, k, &sc.metric_t0)?;
+				kernels::gpu_clamp_into(
+					&sc.metric_t0,
+					&sc.c_eps,
+					&sc.c_one,
+					nk,
+					&sc.metric_t0,
+				)?;
+				kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+				kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t0)?;
+				kernels::gpu_reduce_sum_cols_into(
+					&sc.metric_t0,
+					&sc.reduce_ws,
+					nk,
+					1,
+					dst,
+				)?;
+				LossScale {
+					sign: -1.0,
+					div: n as f64,
+				}
+			}
+			Loss::Bce => {
+				kernels::gpu_clamp_into(
+					out,
+					&sc.c_eps,
+					&sc.c_one_minus_eps,
+					nk,
+					&sc.metric_t0,
+				)?;
+				kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t1)?;
+				kernels::gpu_mul_inplace(ybuf, nk, &sc.metric_t1)?;
+				kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t0)?;
+				kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t0)?;
+				kernels::gpu_log_into(&sc.metric_t0, nk, &sc.metric_t0)?;
+				kernels::gpu_copy_into(ybuf, nk, &sc.metric_t2)?;
+				kernels::gpu_scale_inplace(&sc.c_neg_one, nk, &sc.metric_t2)?;
+				kernels::gpu_add_scalar_inplace(&sc.c_one, nk, &sc.metric_t2)?;
+				kernels::gpu_mul_inplace(&sc.metric_t0, nk, &sc.metric_t2)?;
+				kernels::gpu_add_inplace(&sc.metric_t2, nk, &sc.metric_t1)?;
+				kernels::gpu_reduce_sum_cols_into(
+					&sc.metric_t1,
+					&sc.reduce_ws,
+					nk,
+					1,
+					dst,
+				)?;
+				LossScale {
+					sign: -1.0,
+					div: nk as f64,
+				}
+			}
+			Loss::Focal => {
+				gpu_core::losses::gpu_focal_into(
+					out,
+					ybuf,
+					&sc.c_focal_gamma,
+					&sc.c_focal_alpha,
+					nk,
+					&sc.metric_t0,
+					&sc.metric_t1,
+				)?;
+				kernels::gpu_reduce_sum_cols_into(
+					&sc.metric_t0,
+					&sc.reduce_ws,
+					nk,
+					1,
+					dst,
+				)?;
+				LossScale {
+					sign: 1.0,
+					div: nk as f64,
+				}
+			}
+		},
+		Metric::R2 => {
+			kernels::gpu_ss_res_into(out, ybuf, nk, dst)?;
+			LossScale {
+				sign: 1.0,
+				div: ss_tot,
+			}
+		}
+		Metric::Accuracy => {
+			match k.cmp(&1) {
+				std::cmp::Ordering::Equal => kernels::gpu_accuracy_into(out, ybuf, n, dst)?,
+				std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+					kernels::gpu_argmax_accuracy_into(out, ybuf, n, k, dst)?
+				}
+			}
+			LossScale {
+				sign: 1.0,
+				div: 1.0,
+			}
+		}
+		Metric::Epoch | Metric::Lr | Metric::Time => LossScale {
+			sign: 1.0,
+			div: 1.0,
+		},
+	})
+}
+
+pub const ZSCORE_EPS: f64 = 1e-8;
+
+pub fn zscore_apply_views(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+) -> anyhow::Result<GpuBuffer> {
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	let xbuf = GpuBuffer::alloc(n * d).context("scale")?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, &xbuf)?;
+	Ok(xbuf)
+}
+
+pub fn zscore_fit_into(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	eps: &GpuBuffer,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+	out: &GpuBuffer,
+) -> anyhow::Result<()> {
+	let seg = kernels::gpu_reduce_sum_cols_workspace_bytes(n, d);
+	let ws = GpuBuffer::alloc_bytes(((seg + 255) & !255usize) + d * size_of::<f64>()).context("zscore ws")?;
+	kernels::gpu_reduce_mean_cols(xraw, n, d, &ws, mean)?;
+	let var = GpuBuffer::alloc(d).context("var")?;
+	kernels::gpu_reduce_var_cols(xraw, n, d, &ws, &var)?;
+	kernels::gpu_add_scalar_inplace(eps, d, &var)?;
+	kernels::gpu_sqrt(&var, d, std)?;
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out)?;
+	Ok(())
+}
+
+pub fn zscore_apply_into(
+	xraw: &GpuBuffer,
+	n: usize,
+	d: usize,
+	mean: &GpuBuffer,
+	std: &GpuBuffer,
+	out: &GpuBuffer,
+) -> anyhow::Result<()> {
+	let xc = GpuBuffer::alloc(n * d).context("center")?;
+	kernels::gpu_broadcast_sub_into(xraw, mean, n * d, d, &xc)?;
+	kernels::gpu_broadcast_div(&xc, std, n * d, d, out)?;
+	Ok(())
+}
+
+pub struct ZFit {
+	pub mean: Vec<f64>,
+	pub std: Vec<f64>,
+	pub scaled: Vec<f64>,
+}
+
+pub fn zscore_fit_host(x: &[f64], n: usize, d: usize) -> ZFit {
+	let nf = n as f64;
+	let mut mean = vec![0.0f64; d];
+	for i in 0..n {
+		for j in 0..d {
+			mean[j] += x[i * d + j];
+		}
+	}
+	for m in mean.iter_mut() {
+		*m /= nf;
+	}
+	let mut std = vec![0.0f64; d];
+	for i in 0..n {
+		for j in 0..d {
+			let dv = x[i * d + j] - mean[j];
+			std[j] += dv * dv;
+		}
+	}
+	for s in std.iter_mut() {
+		let var = *s / nf;
+		*s = match var == 0.0 {
+			true => 1.0,
+			false => (var + ZSCORE_EPS).sqrt(),
+		};
+	}
+	let mut scaled = vec![0.0f64; n * d];
+	for i in 0..n {
+		for j in 0..d {
+			scaled[i * d + j] = (x[i * d + j] - mean[j]) / std[j];
+		}
+	}
+	ZFit { mean, std, scaled }
+}
+
+pub fn zscore_apply_host(x: &[f64], n: usize, d: usize, mean: &[f64], std: &[f64]) -> Vec<f64> {
+	let mut scaled = vec![0.0f64; n * d];
+	for i in 0..n {
+		for j in 0..d {
+			scaled[i * d + j] = (x[i * d + j] - mean[j]) / std[j];
+		}
+	}
+	scaled
+}
+
+pub fn infer_scored(
+	params: &[LayerParams],
+	xbuf: &GpuBuffer,
+	x_cat: Option<&GpuBuffer>,
+	n: usize,
+	yscaler: Option<YScaler>,
+	ybuf: Option<&GpuBuffer>,
+	lossfn: Loss,
+	_lr: f64,
+	metrics: &[Metric],
+	ss_tot: f64,
+) -> anyhow::Result<Scored> {
+	let last = params.len() - 1;
+	let k = params[last].out_dim;
+	let consts = {
+		let b = GpuBuffer::alloc(SCRATCH_CONSTS.len())
+			.context("scratch consts")?;
+		b.load(&SCRATCH_CONSTS)
+			.context("scratch consts")?;
+		b
+	};
+	let sc = Scratch::new_infer(params, n, &consts)?;
+	recipe_infer::forward_into(params, xbuf, x_cat, n, &sc.acts, &sc)?;
+	for YScaler {
+		mean: ymean,
+		std: ystd,
+	} in yscaler.into_iter()
+	{
+		let ystd_b = {
+			let __up = &[ystd];
+			let __ub = GpuBuffer::alloc(__up.len()).context("ystd")?;
+			__ub.load(__up).context("ystd")?;
+			__ub
+		};
+		let ymean_b = {
+			let __up = &[ymean];
+			let __ub = GpuBuffer::alloc(__up.len()).context("ymean")?;
+			__ub.load(__up).context("ymean")?;
+			__ub
+		};
+		kernels::gpu_scale_inplace(&ystd_b, n * k, &sc.acts[last])?;
+		kernels::gpu_add_scalar_inplace(&ymean_b, n * k, &sc.acts[last])?;
+	}
+	let out = &sc.acts[last];
+	let vals: Vec<f64> = match ybuf {
+		Some(yb) => {
+			let mut mvals = Vec::with_capacity(metrics.len());
+			for &m in metrics {
+				mvals.push(match m {
+					Metric::Lr | Metric::Epoch | Metric::Time => f64::NAN,
+					Metric::Loss | Metric::Accuracy | Metric::R2 => {
+						let LossScale { sign, div } = metric_gpu_into(
+							lossfn,
+							m,
+							out,
+							yb,
+							&sc,
+							n,
+							k,
+							ss_tot,
+							&sc.metric_scalar,
+						)?;
+						let v = sign * download_scalar(&sc.metric_scalar)? / div;
+						match m {
+							Metric::R2 => 1.0 - v,
+							Metric::Loss
+							| Metric::Accuracy
+							| Metric::Lr
+							| Metric::Epoch
+							| Metric::Time => v,
+						}
+					}
+				});
+			}
+			mvals
+		}
+		None => Vec::new(),
+	};
+	Ok(Scored {
+		preds: download_vec(out, n * k)?,
+		vals,
+	})
+}
+
+#[derive(Clone, Copy)]
+pub struct YScaler {
+	pub mean: f64,
+	pub std: f64,
+}
+
+pub struct Scored {
+	pub preds: Vec<f64>,
+	pub vals: Vec<f64>,
+}
+
+pub fn download_vec(buf: &GpuBuffer, len: usize) -> anyhow::Result<Vec<f64>> {
+	let mut v = vec![0.0f64; len];
+	let dl = buf.download(&mut v);
+	if let Err(e) = dl {
+		Write::err(format!("gpu download: {e}"))?;
+	}
+	if let Err(e) = gpu_core::hip::device_synchronize() {
+		Write::err(format!("gpu download sync: {e}"))?;
+	}
+	return Ok(v);
+}
+
+pub fn download_scalar(buf: &GpuBuffer) -> anyhow::Result<f64> {
+	let mut v = [0.0f64];
+	let dl = buf.download(&mut v);
+	if let Err(e) = dl {
+		Write::err(format!("scalar download: {e}"))?;
+	}
+	if let Err(e) = gpu_core::hip::device_synchronize() {
+		Write::err(format!("scalar download sync: {e}"))?;
+	}
+	return Ok(v[0]);
 }
 
 pub static INTERRUPTED: AtomicUsize = AtomicUsize::new(0);
@@ -255,7 +648,7 @@ pub struct ModelInner {
 	pub lr_intent: Option<f64>,
 	pub params: RefCell<Vec<LayerParams>>,
 	pub scaler: RefCell<Option<Scaler>>,
-	pub yscaler: RefCell<Option<recipe_infer::YScaler>>,
+	pub yscaler: RefCell<Option<YScaler>>,
 	pub fit_score: Cell<f64>,
 	pub fit_loss: Cell<f64>,
 	pub saved_ogdl: RefCell<Option<SavedWeights>>,
@@ -771,7 +1164,7 @@ pub fn setup_race_ask() -> anyhow::Result<Option<i32>> {
 		let eps = {
 			let e = gpu_core::memory::GpuBuffer::alloc(1)
 				.map_err(|e| Errored::new(format!("eps: {e}")))?;
-			e.load(&[recipe_infer::ZSCORE_EPS])
+			e.load(&[ZSCORE_EPS])
 				.map_err(|e| Errored::new(format!("eps load: {e}")))?;
 			e
 		};
@@ -781,7 +1174,7 @@ pub fn setup_race_ask() -> anyhow::Result<Option<i32>> {
 			.map_err(|e| Errored::new(format!("std: {e}")))?;
 		let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc)
 			.map_err(|e| Errored::new(format!("zscored: {e}")))?;
-		recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
+		zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
 		let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
 			.map_err(|e| Errored::new(format!("lse: {e}")))?;
 		let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
@@ -948,7 +1341,7 @@ pub struct Pending {
 pub fn live_vals(
 	metrics: &[Metric],
 	live: &[(Metric, usize, usize)],
-	ring_scale: &[recipe_infer::LossScale],
+	ring_scale: &[LossScale],
 	ss_tot: f64,
 	rate: f64,
 	pend: &Pending,
@@ -1232,7 +1625,7 @@ impl ModelInner {
 					for v in yd.iter_mut() {
 						*v = (*v - ymean) / ystd;
 					}
-					*self.yscaler.borrow_mut() = Some(recipe_infer::YScaler {
+					*self.yscaler.borrow_mut() = Some(YScaler {
 						mean: ymean,
 						std: ystd,
 					});
@@ -1314,8 +1707,8 @@ impl ModelInner {
 			gpu_core::memory::pinned_claim(slots).context("pinned metric slots")?;
 		}
 		let n_timed = 0usize;
-		let zf: recipe_infer::ZFit = match Some(()).filter(|_probe| d_sc == 0) {
-			Some(_empty) => recipe_infer::ZFit {
+		let zf: ZFit = match Some(()).filter(|_probe| d_sc == 0) {
+			Some(_empty) => ZFit {
 				mean: Vec::new(),
 				std: Vec::new(),
 				scaled: Vec::new(),
@@ -1343,16 +1736,16 @@ impl ModelInner {
 								s.mean.len()
 							))?;
 						}
-						let scaled = recipe_infer::zscore_apply_host(
+						let scaled = zscore_apply_host(
 							sl, n, d_sc, &s.mean, &s.std,
 						);
-						recipe_infer::ZFit {
+						ZFit {
 							mean: s.mean.clone(),
 							std: s.std.clone(),
 							scaled,
 						}
 					}
-					None => recipe_infer::zscore_fit_host(sl, n, d_sc),
+					None => zscore_fit_host(sl, n, d_sc),
 				}
 			}
 		};
@@ -1539,8 +1932,8 @@ impl ModelInner {
 		let mut fit_loss = f64::NAN;
 		let mut epoch_meta: Vec<EpochMeta> = Vec::new();
 		let ring_every = checkpointing || plotting;
-		let mut ring_scale: Vec<recipe_infer::LossScale> = vec![
-			recipe_infer::LossScale {
+		let mut ring_scale: Vec<LossScale> = vec![
+			LossScale {
 				sign: 1.0,
 				div: 1.0
 			};

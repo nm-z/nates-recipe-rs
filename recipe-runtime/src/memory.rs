@@ -1,9 +1,9 @@
-use crate::execute::StepScalars;
+use crate::execute::{StepScalars, download_scalar, download_vec};
 use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::{Write, gpu};
 use gpu_core::memory::GpuBuffer;
-use recipe_infer::{Scratch, download_scalar, download_vec};
+use recipe_infer::Scratch;
 use recipe_ir::{Activation, LayerKind, Loss, Param};
 use std::cell::Cell;
 use std::cell::RefCell;

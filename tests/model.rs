@@ -1,5 +1,7 @@
 use gpu_core::kernels;
-use recipe_runtime::execute::StepScalars;
+use recipe_runtime::execute::{
+	LossScale, StepScalars, download_scalar, download_vec, metric_gpu_into,
+};
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
 use recipe_ir::{Activation, ConcatDims, LayerKind, LayerSpec};
