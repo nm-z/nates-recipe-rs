@@ -60,7 +60,7 @@ pub const VRAM_GBS: f64 = 432.0;
 
 const F8: f64 = 8.0;
 
-fn saves_preact(a: Activation) -> Option<()> {
+pub(crate) fn saves_preact(a: Activation) -> Option<()> {
 	Some(()).filter(|_u| {
 		matches!(
 			a,

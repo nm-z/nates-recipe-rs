@@ -1026,6 +1026,36 @@ impl ModelInner {
 				}
 			}
 		};
+		let graph_dims = plan.dims();
+		let graph = crate::graph::build_forward_graph(
+			self.id,
+			&graph_dims,
+			self.loss.get(),
+		);
+		debug_assert!(
+			graph
+				.fwd_edges
+				.windows(2)
+				.all(|w| w[0].to == w[1].from),
+			"fwd_edges must form a single chain"
+		);
+		debug_assert!(
+			graph.fwd_edges.last().map(|e| e.to) == Some(graph.objectives[0].scalar),
+			"fwd chain must end at the loss scalar"
+		);
+		debug_assert_eq!(
+			graph.rev_edges.len(),
+			graph_dims.len(),
+			"rev_edges count must equal layer count"
+		);
+		debug_assert!(
+			graph
+				.params
+				.iter()
+				.all(|p| graph.ops.iter().any(|o| o.id == p.owner)),
+			"every ParamNode owner op id must be valid"
+		);
+		let _graph = graph;
 		let out_dim = plan.out_dim_last();
 		let n_targets = dat.n_targets.max(1);
 		let expand_ce = classify && n_targets == 1 && out_dim > 1;
