@@ -1,6 +1,6 @@
 use crate::api::{InferOnly, ModelArg, RunArg, SavePath};
 use ogdl::log::Write;
-use recipe_infer::Metric;
+use recipe_infer::LogItem;
 use recipe_runtime::execute::{LastRun, ModelInner, RunMeta, TrainCfg};
 use std::cell::RefCell;
 
@@ -15,6 +15,7 @@ impl Train {
 				epochs: 1,
 				log_every: 1,
 				metrics: Vec::new(),
+				device: false,
 				plot: Vec::new(),
 				resume: None,
 				net: None,
@@ -34,13 +35,24 @@ impl Train {
 		self
 	}
 
-	pub fn log(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
-		self.cfg.metrics = metrics.into_iter().collect();
+	pub fn log(mut self, items: impl IntoIterator<Item = LogItem>) -> Train {
+		for item in items {
+			match item {
+				LogItem::Metric(m) => self.cfg.metrics.push(m),
+				LogItem::Device => self.cfg.device = true,
+			}
+		}
 		self
 	}
 
-	pub fn plot(mut self, metrics: impl IntoIterator<Item = Metric>) -> Train {
-		self.cfg.plot = metrics.into_iter().collect();
+	pub fn plot(mut self, items: impl IntoIterator<Item = LogItem>) -> Train {
+		self.cfg.plot = items
+			.into_iter()
+			.filter_map(|item| match item {
+				LogItem::Metric(m) => Some(m),
+				LogItem::Device => None,
+			})
+			.collect();
 		self.cfg.plot_render = None;
 		if !self.cfg.plot.is_empty() {
 			self.cfg.plot_render = Some(crate::cli::tui::show);

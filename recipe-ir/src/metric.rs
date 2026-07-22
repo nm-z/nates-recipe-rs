@@ -6,5 +6,10 @@ pub enum Metric {
 	Lr,
 	Time,
 	R2,
-	Hip,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum LogItem {
+	Metric(Metric),
+	Device,
 }

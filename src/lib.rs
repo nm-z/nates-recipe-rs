@@ -41,7 +41,7 @@ pub use api::model::{
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 pub use ogdl::ogdl;
-pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
+pub use recipe_ir::{Activation, LayerKind, LayerSpec, LogItem, Loss, Metric, Param};
 
 pub fn block(content: impl fmt::Display) {
 	ogdl::log::Write::always(content);

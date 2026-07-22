@@ -1,4 +1,4 @@
-pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
+pub use recipe_ir::{Activation, LayerKind, LayerSpec, LogItem, Loss, Metric, Param};
 
 pub struct MetricFmt {
 	pub label: &'static str,
@@ -31,10 +31,6 @@ pub fn metric_fmt(m: Metric) -> MetricFmt {
 			label: "r2",
 			width: 8,
 		},
-		Metric::Hip => MetricFmt {
-			label: "hip",
-			width: 0,
-		},
 	}
 }
 
@@ -43,7 +39,7 @@ pub fn metric_pinned_slot(m: Metric) -> Option<usize> {
 		Metric::Loss => Some(0),
 		Metric::Accuracy => Some(1),
 		Metric::R2 => Some(2),
-		Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => None,
+		Metric::Epoch | Metric::Lr | Metric::Time => None,
 	};
 }
 
@@ -53,7 +49,6 @@ pub fn metric_render(m: Metric, v: f64) -> String {
 		.map_or(format!("{:>w$}", "N/A"), |_finite| match m {
 			Metric::Epoch => format!("{:>w$}", v as usize),
 			Metric::Time => format!("{:>w$}", fmt_time(v)),
-			Metric::Hip => String::new(),
 			Metric::Loss | Metric::Accuracy | Metric::Lr | Metric::R2 => {
 				format!("{v:>w$.4}")
 			}
@@ -75,7 +70,7 @@ pub fn fmt_time(secs: f64) -> String {
 }
 
 mod alias {
-	use super::{Activation, Loss, Metric};
+	use super::{Activation, LogItem, Loss, Metric};
 
 	pub const RELU: Activation = Activation::Relu;
 	pub const SIG: Activation = Activation::Sigmoid;
@@ -96,13 +91,13 @@ mod alias {
 	pub const HUBER: Loss = Loss::Huber;
 	pub const FOCAL: Loss = Loss::Focal;
 
-	pub const LOSS: Metric = Metric::Loss;
-	pub const ACCURACY: Metric = Metric::Accuracy;
-	pub const EPOCH: Metric = Metric::Epoch;
-	pub const LR: Metric = Metric::Lr;
-	pub const TIME: Metric = Metric::Time;
-	pub const R_TWO: Metric = Metric::R2;
-	pub const HIP: Metric = Metric::Hip;
+	pub const LOSS: LogItem = LogItem::Metric(Metric::Loss);
+	pub const ACCURACY: LogItem = LogItem::Metric(Metric::Accuracy);
+	pub const EPOCH: LogItem = LogItem::Metric(Metric::Epoch);
+	pub const LR: LogItem = LogItem::Metric(Metric::Lr);
+	pub const TIME: LogItem = LogItem::Metric(Metric::Time);
+	pub const R_TWO: LogItem = LogItem::Metric(Metric::R2);
+	pub const HIP: LogItem = LogItem::Device;
 }
 
 pub use alias::{

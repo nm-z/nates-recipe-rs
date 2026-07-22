@@ -91,6 +91,7 @@ pub struct TrainCfg {
 	pub epochs: usize,
 	pub log_every: usize,
 	pub metrics: Vec<Metric>,
+	pub device: bool,
 	pub plot: Vec<Metric>,
 	pub resume: Option<String>,
 	pub net: Option<crate::transport::Net>,
@@ -247,10 +248,8 @@ pub struct RunProbe {
 }
 
 pub fn run_begin(cfg: &TrainCfg) -> RunProbe {
-	let run_hip = cfg
-		.metrics
-		.iter()
-		.find(|m| **m == Metric::Hip)
+	let run_hip = Some(())
+		.filter(|_probe| cfg.device)
 		.map(|_hip| gpu_core::callspy::snapshot());
 	let run_state = gpu_core::callspy::snapshot();
 	RunProbe { run_hip, run_state }
@@ -435,7 +434,7 @@ pub fn eval_run(cfg: &InferCfg, ds: &Dataset, model: &ModelInner) {
 			Flag::lr => Some(Metric::Lr),
 			Flag::time => Some(Metric::Time),
 			Flag::r2 => Some(Metric::R2),
-			Flag::device => Some(Metric::Hip),
+			Flag::device => None,
 			_other => None,
 		})
 		.collect();
@@ -791,7 +790,6 @@ pub fn live_vals(
 			Metric::Epoch => pend.epoch as f64,
 			Metric::Lr => rate,
 			Metric::Time => pend.elapsed,
-			Metric::Hip => f64::NAN,
 			Metric::Loss | Metric::Accuracy | Metric::R2 => {
 				match live.iter().find(|&&(lm, _slot, _ri)| lm == *m) {
 					None => f64::NAN,
@@ -823,7 +821,6 @@ pub fn metric_flag(m: Metric) -> ogdl::log::Flag {
 		Metric::Lr => lr,
 		Metric::Time => time,
 		Metric::R2 => r2,
-		Metric::Hip => device,
 	};
 }
 pub fn metrics_emit(prefix: &str, metrics: &[Metric], vals: &[f64]) {
@@ -831,7 +828,6 @@ pub fn metrics_emit(prefix: &str, metrics: &[Metric], vals: &[f64]) {
 	let shown: Vec<(Metric, f64)> = metrics
 		.iter()
 		.zip(vals.iter())
-		.filter(|(m, _v)| **m != Metric::Hip)
 		.filter(|(m, _v)| match m {
 			Metric::Loss => o.loss,
 			Metric::Accuracy => o.acc,
@@ -839,7 +835,6 @@ pub fn metrics_emit(prefix: &str, metrics: &[Metric], vals: &[f64]) {
 			Metric::Lr => o.lr,
 			Metric::Time => o.time,
 			Metric::R2 => o.r2,
-			Metric::Hip => o.device,
 		})
 		.map(|(m, v)| (*m, *v))
 		.collect();
@@ -862,7 +857,7 @@ impl ModelInner {
 		conns: Option<Arc<Vec<crate::transport::Conn>>>,
 	) -> anyhow::Result<()> {
 		let hip_snap = Some(())
-			.filter(|_probe| cfg.metrics.contains(&Metric::Hip))
+			.filter(|_probe| cfg.device)
 			.map(|_probe| gpu_core::callspy::snapshot());
 		let led_snap = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
 		let start = Instant::now();
@@ -1569,7 +1564,6 @@ impl ModelInner {
 						for &m in &plot_ys {
 							row.push(match m {
 								Metric::Lr => self.lr,
-								Metric::Hip => f64::NAN,
 								_other => val_of(m, meta.epoch),
 							});
 						}

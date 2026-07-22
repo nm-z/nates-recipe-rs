@@ -172,7 +172,7 @@ pub fn metric_gpu_into(
 				div: 1.0,
 			}
 		}
-		Metric::Epoch | Metric::Lr | Metric::Time | Metric::Hip => LossScale {
+		Metric::Epoch | Metric::Lr | Metric::Time => LossScale {
 			sign: 1.0,
 			div: 1.0,
 		},
@@ -574,7 +574,7 @@ pub fn infer_scored(
 			let mut acc = Vec::with_capacity(metrics.len());
 			for &m in metrics {
 				acc.push(match m {
-					Metric::Lr | Metric::Epoch | Metric::Time | Metric::Hip => f64::NAN,
+					Metric::Lr | Metric::Epoch | Metric::Time => f64::NAN,
 					Metric::Loss | Metric::Accuracy | Metric::R2 => {
 						let LossScale { sign, div } = metric_gpu_into(
 							loss,
@@ -594,8 +594,7 @@ pub fn infer_scored(
 							| Metric::Accuracy
 							| Metric::Lr
 							| Metric::Epoch
-							| Metric::Time
-							| Metric::Hip => v,
+							| Metric::Time => v,
 						}
 					}
 				});
