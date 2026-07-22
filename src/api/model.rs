@@ -169,6 +169,18 @@ impl Model {
 		self.inner.lr_intent = Some(rate);
 		return self;
 	}
+
+	pub fn objective(&self) -> recipe_ir::ObjectiveIntent {
+		return self.inner.objective;
+	}
+
+	pub fn specs(&self) -> &[LayerSpec] {
+		return &self.inner.specs;
+	}
+
+	pub fn lr_intent(&self) -> Option<f64> {
+		return self.inner.lr_intent;
+	}
 }
 
 pub trait IntoObjective {
@@ -185,6 +197,12 @@ impl IntoObjective for recipe_ir::Loss {
 
 impl IntoObjective for &Model {
 	fn record(self, mut m: Model) -> Model {
+		recipe_runtime::resolve::register_model(
+			self.inner.id,
+			self.inner.specs.clone(),
+			self.inner.loss.get(),
+			self.inner.objective,
+		);
 		m.inner.objective =
 			recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(self.inner.id));
 		return m;

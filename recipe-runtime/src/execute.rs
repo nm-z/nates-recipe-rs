@@ -312,7 +312,12 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 			.sum()
 	});
 	let facts = crate::resolve::derive_facts(ds);
-	match crate::resolve::resolve_model(&model.objective, model.lr_intent, &facts) {
+	match crate::resolve::resolve_model(
+		&model.objective,
+		model.lr_intent,
+		&model.specs,
+		&facts,
+	) {
 		Ok(res) => {
 			if !matches!(model.objective, recipe_ir::ObjectiveIntent::Builtin(_)) {
 				model.loss.set(res.loss);
@@ -325,6 +330,12 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 							note.subject, note.chose, note.because
 						),
 					);
+				}
+				if res.graph.is_some() {
+					Write::error(
+						"surrogate training awaits whole-program compilation",
+					);
+					return;
 				}
 			}
 		}

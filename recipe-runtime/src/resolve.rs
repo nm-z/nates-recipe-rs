@@ -2,8 +2,32 @@ use crate::execute::ModelInner;
 use ogdl::log::{Write, gpu, prompt};
 use pantry::encode::Dataset;
 use recipe_infer::{LayerSpec, Loss};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal};
+
+thread_local! {
+	static MODEL_REGISTRY: RefCell<HashMap<u32, (Vec<LayerSpec>, Loss, recipe_ir::ObjectiveIntent)>> =
+		RefCell::new(HashMap::new());
+}
+
+pub fn register_model(
+	id: recipe_ir::ObjectId,
+	specs: Vec<LayerSpec>,
+	loss: Loss,
+	objective: recipe_ir::ObjectiveIntent,
+) {
+	MODEL_REGISTRY.with(|reg| {
+		reg.borrow_mut().insert(id.0, (specs, loss, objective));
+	});
+}
+
+pub fn registered(
+	id: recipe_ir::ObjectId,
+) -> Option<(Vec<LayerSpec>, Loss, recipe_ir::ObjectiveIntent)> {
+	return MODEL_REGISTRY.with(|reg| reg.borrow().get(&id.0).cloned());
+}
 
 pub fn resolve_path(path: &str) -> String {
 	let raw = match path {
@@ -242,17 +266,19 @@ pub struct Resolved {
 	pub loss: Loss,
 	pub lr: f64,
 	pub notes: Vec<Note>,
+	pub graph: Option<recipe_ir::SemanticGraph>,
 }
 
 pub fn resolve_model(
 	objective: &recipe_ir::ObjectiveIntent,
 	lr_intent: Option<f64>,
+	specs: &[LayerSpec],
 	facts: &DataFacts,
 ) -> Result<Resolved, ResolveError> {
 	use recipe_ir::ObjectiveIntent as Obj;
 	let mut notes = Vec::new();
-	let loss = match objective {
-		Obj::Builtin(l) => *l,
+	let (loss, graph) = match objective {
+		Obj::Builtin(l) => (*l, None),
 		Obj::Unspecified => {
 			let picked = match facts.target_kind {
 				TargetKind::Continuous => (Loss::Mse, "mse", "target is continuous"),
@@ -274,16 +300,10 @@ pub fn resolve_model(
 				chose: picked.1.to_string(),
 				because: picked.2.to_string(),
 			});
-			picked.0
+			(picked.0, None)
 		}
-		Obj::Reference(_) => {
-			return Err(ResolveError::NoCoherentProgram(
-				"objective references another object: the reference is recorded, but \
-				 surrogate-loss resolution requires the semantic graph — the \
-				 target-producer-absence guard passes only with the graph's shape and \
-				 differentiability proofs, which are not built"
-					.to_string(),
-			));
+		Obj::Reference(recipe_ir::ObjectRef::Object(ref_id)) => {
+			resolve_reference(*ref_id, specs, facts, &mut notes)?
 		}
 		Obj::Expression(_) => {
 			return Err(ResolveError::NoCoherentProgram(
@@ -305,5 +325,112 @@ pub fn resolve_model(
 			});
 		})
 		.unwrap_or(());
-	return Ok(Resolved { loss, lr, notes });
+	return Ok(Resolved {
+		loss,
+		lr,
+		notes,
+		graph,
+	});
+}
+
+fn resolve_reference(
+	ref_id: recipe_ir::ObjectId,
+	referrer_specs: &[LayerSpec],
+	facts: &DataFacts,
+	notes: &mut Vec<Note>,
+) -> Result<(Loss, Option<recipe_ir::SemanticGraph>), ResolveError> {
+	let Some((ref_specs, ref_loss, ref_obj)) = registered(ref_id) else {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"objective references model #{} as its loss, but that model was never registered \
+			 as a surrogate source — only a model passed to .loss(&other) is registered, and \
+			 this id was not; nothing produces a scalar for the referrer to reduce",
+			ref_id.0
+		)));
+	};
+
+	let referrer_dims = crate::graph::logical_dims(referrer_specs, facts.d);
+	let Some(referrer_last) = referrer_dims.last().copied() else {
+		return Err(ResolveError::NoCoherentProgram(
+			"surrogate reference: the referrer model has no layers, so it has no output to \
+			 feed the referenced model"
+				.to_string(),
+		));
+	};
+	let referrer_out = referrer_last.out_dim;
+	let referenced_dims = crate::graph::logical_dims(&ref_specs, referrer_out);
+
+	let Some(referenced_first) = referenced_dims.first().copied() else {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate dimensional guard: referenced model #{} has no layers, so its first \
+			 input dimension cannot match the referrer's {referrer_out}-wide output",
+			ref_id.0
+		)));
+	};
+	if referenced_first.in_dim != referrer_out {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate dimensional guard: referrer emits {referrer_out} features but \
+			 referenced model #{} takes {} — the surrogate cannot consume the referrer's output",
+			ref_id.0, referenced_first.in_dim
+		)));
+	}
+
+	let referrer_g =
+		crate::graph::build_forward_graph(recipe_ir::ObjectId(u32::MAX), &referrer_dims, ref_loss);
+	let referenced_g = crate::graph::build_forward_graph(ref_id, &referenced_dims, ref_loss);
+
+	let scalar_empty = referenced_g
+		.objectives
+		.first()
+		.and_then(|o| referenced_g.values.iter().find(|v| v.id == o.scalar))
+		.is_some_and(|v| v.shape.dims.is_empty());
+	if !scalar_empty {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate scalar guard: referenced model #{}'s objective does not reduce to a \
+			 0-dimensional scalar, so it cannot serve as a loss",
+			ref_id.0
+		)));
+	}
+
+	let merged = crate::graph::compose_surrogate(&referrer_g, &referenced_g);
+
+	let reached = crate::graph::rev_reached_ops(&merged);
+	let np_referrer = referrer_g.params.len() as u32;
+	let mut missing: Vec<u32> = merged
+		.params
+		.iter()
+		.filter(|p| p.id.0 < np_referrer && !reached.contains(&p.owner.0))
+		.map(|p| p.owner.0)
+		.collect();
+	missing.sort_unstable();
+	missing.dedup();
+	if !missing.is_empty() {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate reverse-path guard: the gradient path from referenced model #{}'s \
+			 scalar does not reach referrer ops {missing:?}, which own referrer weights — the \
+			 surrogate cannot train those parameters",
+			ref_id.0
+		)));
+	}
+
+	if matches!(ref_obj, recipe_ir::ObjectiveIntent::Reference(_)) {
+		return Err(ResolveError::NoCoherentProgram(format!(
+			"surrogate contradiction guard: referenced model #{} itself defines its loss by \
+			 reference to another model — a chain of surrogates has no ground scalar; give the \
+			 referenced model a concrete loss first",
+			ref_id.0
+		)));
+	}
+
+	notes.push(Note {
+		subject: "referrer objective".to_string(),
+		chose: format!("surrogate loss through referenced model #{}", ref_id.0),
+		because: format!(
+			"reference is coherent: referrer's {referrer_out}-wide output feeds the referenced \
+			 input, the referenced objective reduces to a 0-dim scalar, the reverse path reaches \
+			 all {np_referrer} referrer params, and the referenced loss is concrete ({})",
+			ref_loss.name()
+		),
+	});
+
+	return Ok((ref_loss, Some(merged)));
 }
