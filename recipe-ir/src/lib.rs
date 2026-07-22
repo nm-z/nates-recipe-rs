@@ -1,3 +1,6 @@
+pub mod compose;
+pub mod graph;
+pub mod intent;
 pub mod metric;
 pub mod model;
 pub mod work;
@@ -8,3 +11,9 @@ pub use model::{
 	pinned_vocab,
 };
 pub use work::Work;
+
+pub use intent::{ObjectId, ObjectRef, ObjectiveIntent, RecipeIntent, Slot};
+pub use compose::{
+	Architecture, Block, IntoLayerCandidate, IntoObjectiveCandidate, IntoTargetCandidate,
+};
+pub use graph::SemanticGraph;
