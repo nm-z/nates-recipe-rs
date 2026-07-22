@@ -1,7 +1,6 @@
 #![allow(unsafe_code)]
 pub mod chat;
 pub mod dequant;
-pub mod enums;
 pub mod forward;
 pub mod gguf;
 pub mod llm;
@@ -10,7 +9,6 @@ pub mod safetensors;
 pub mod scratch;
 pub mod tokenizer;
 
-pub use enums::*;
 pub use forward::*;
 pub use gpu_core::hip::device_synchronize;
 pub use gpu_core::memory::{

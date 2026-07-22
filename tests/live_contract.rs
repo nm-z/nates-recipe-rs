@@ -1,7 +1,6 @@
-use recipe_infer::{fmt_time, metric_fmt, metric_render};
 use recipe_ir::metric as li;
 use recipe_ir::{LogItem, Metric};
-use recipe_runtime::execute::metrics_line;
+use recipe_runtime::execute::{fmt_time, metric_fmt, metric_render, metrics_line};
 
 #[test]
 fn loss_acc_line_bytes() {
