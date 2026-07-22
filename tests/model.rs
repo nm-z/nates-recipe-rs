@@ -1178,3 +1178,39 @@ fn stacked_conv_checkpoint_roundtrip() {
 		"rehydrated image size"
 	);
 }
+
+#[test]
+fn resolver_defaults_binary_target_to_bce() {
+	const TRAIN: &str = "examples/datasets/playground-series-s6e3/train.csv";
+	assert!(
+		Path::new(TRAIN).exists(),
+		"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",
+	);
+	let out = env::temp_dir().join(format!("recipe_resolver_bce_{}.ogdl", process::id()));
+	let _ = fs::remove_file(&out);
+	let out_str = out.to_str().expect("temp path utf8");
+
+	let data = recipe::Data::load(TRAIN).target("Churn");
+	let model = Model::new().layer(8).leak().layer(1).sigmoid().lr(0.001);
+	Train::new().epochs(1).run(&data, &model).save(out_str);
+
+	let text = fs::read_to_string(&out).expect(
+		"saved ogdl unreadable — omitted-loss resolver failed to fit and save a Bce checkpoint",
+	);
+	let score_line = text
+		.lines()
+		.next()
+		.expect("saved ogdl has no score line")
+		.to_string();
+	let _ = fs::remove_file(&out);
+
+	assert!(
+		score_line.contains("acc"),
+		"score line lacks classification key 'acc' — resolver did not pick Bce from the binary target: {score_line}"
+	);
+	assert!(
+		!score_line.contains("r2"),
+		"score line carries regression key 'r2' — resolver fell back to Mse instead of Bce: {score_line}"
+	);
+	eprintln!("resolver score line: {score_line}");
+}

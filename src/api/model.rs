@@ -165,7 +165,7 @@ impl Model {
 	}
 
 	pub fn lr(mut self, rate: f64) -> Model {
-		self.inner.lr = rate;
+		self.inner.lr.set(rate);
 		self.inner.lr_intent = Some(rate);
 		return self;
 	}
@@ -178,7 +178,7 @@ pub trait IntoObjective {
 impl IntoObjective for recipe_ir::Loss {
 	fn record(self, mut m: Model) -> Model {
 		m.inner.objective = recipe_ir::ObjectiveIntent::Builtin(self);
-		m.inner.loss = self;
+		m.inner.loss.set(self);
 		return m;
 	}
 }

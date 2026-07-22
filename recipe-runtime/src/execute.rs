@@ -162,8 +162,8 @@ pub struct SavedWeights {
 
 pub struct ModelInner {
 	pub specs: Vec<LayerSpec>,
-	pub loss: Loss,
-	pub lr: f64,
+	pub loss: Cell<Loss>,
+	pub lr: Cell<f64>,
 	pub id: recipe_ir::ObjectId,
 	pub objective: recipe_ir::ObjectiveIntent,
 	pub lr_intent: Option<f64>,
@@ -182,8 +182,8 @@ impl ModelInner {
 	pub fn blank() -> ModelInner {
 		ModelInner {
 			specs: Vec::new(),
-			loss: Loss::Mse,
-			lr: 0.01,
+			loss: Cell::new(Loss::Mse),
+			lr: Cell::new(0.01),
 			id: recipe_ir::ObjectId(NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed)),
 			objective: recipe_ir::ObjectiveIntent::Unspecified,
 			lr_intent: None,
@@ -311,6 +311,28 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 			.map(|c| (c.info.ram as usize).saturating_sub(crate::memory::USER_GB))
 			.sum()
 	});
+	let facts = crate::resolve::derive_facts(ds);
+	match crate::resolve::resolve_model(&model.objective, model.lr_intent, &facts) {
+		Ok(res) => {
+			if !matches!(model.objective, recipe_ir::ObjectiveIntent::Builtin(_)) {
+				model.loss.set(res.loss);
+				model.lr.set(res.lr);
+				for note in &res.notes {
+					Write::line(
+						data,
+						&format!(
+							"{}  {} ({})",
+							note.subject, note.chose, note.because
+						),
+					);
+				}
+			}
+		}
+		Err(e) => {
+			Write::error(e.message());
+			return;
+		}
+	}
 	let issues = crate::resolve::preflight(model, ds, net_ram);
 	let crate::resolve::Gate::Proceed = crate::resolve::confirm_issues(&issues) else {
 		Write::error("aborted");
@@ -381,7 +403,7 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 }
 
 pub fn save_ogdl(model: &ModelInner, score: f64, filter: Option<&[Param]>, path: &str) {
-	let key = model.loss.score_key();
+	let key = model.loss.get().score_key();
 	let path = crate::resolve::resolve_path(path);
 	let allow = score.is_finite()
 		&& !recipe_infer::saved_score(&path, key).is_some_and(|best| score <= best);
@@ -508,8 +530,8 @@ pub fn eval_run(cfg: &InferCfg, ds: &Dataset, model: &ModelInner) {
 				ei.n,
 				yscaler,
 				Some(&ybuf),
-				model.loss,
-				model.lr,
+				model.loss.get(),
+				model.lr.get(),
 				&metrics,
 				ss_tot,
 			);
@@ -523,7 +545,7 @@ pub fn eval_run(cfg: &InferCfg, ds: &Dataset, model: &ModelInner) {
 			};
 				metrics_emit("eval  ", &metrics, &sc.vals);
 			let stop = Some(Metric::Accuracy)
-				.filter(|_m| model.loss.is_classification())
+				.filter(|_m| model.loss.get().is_classification())
 				.unwrap_or(Metric::R2);
 			let score = (0..metrics.len())
 				.find(|mi| metrics[*mi] == stop)
@@ -541,8 +563,8 @@ pub fn eval_run(cfg: &InferCfg, ds: &Dataset, model: &ModelInner) {
 				ei.n,
 				yscaler,
 				None,
-				model.loss,
-				model.lr,
+				model.loss.get(),
+				model.lr.get(),
 				&[],
 				0.0,
 			);
@@ -869,7 +891,7 @@ impl ModelInner {
 			.map(|_probe| gpu_core::callspy::snapshot());
 		let led_snap = hip_snap.map(|_snap| gpu_core::memory::xfer_calls());
 		let start = Instant::now();
-		let classify = self.loss.is_classification();
+		let classify = self.loss.get().is_classification();
 		let rerun = !self.params.borrow().is_empty();
 		let checkpoint_path = cfg.resume.as_deref().map(crate::resolve::resolve_path);
 		let checkpointing = checkpoint_path.is_some();
@@ -1170,7 +1192,7 @@ impl ModelInner {
 		let w_len = plan.host().len();
 		let prefix_len = stage.len_floats();
 		let consts_off = stage.push(&SCRATCH_CONSTS);
-		let sc_off = stage.push(&[-self.lr, 1.0 / n as f64, 2.0 / n as f64, 0.0]);
+		let sc_off = stage.push(&[-self.lr.get(), 1.0 / n as f64, 2.0 / n as f64, 0.0]);
 		let scaled_off = Some(())
 			.filter(|_probe| d_sc > 0)
 			.map(|_probe| stage.push(&zf.scaled))
@@ -1358,7 +1380,7 @@ impl ModelInner {
 			else {
 				break;
 			};
-			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss, concat_fit)?;
+			ooc.backward(&params, &xbuf, &ybuf, &sc, &ss, self.loss.get(), concat_fit)?;
 			let Some(_do) = Some(()).filter(|_probe| log_now || ring_every) else {
 				continue;
 			};
@@ -1370,14 +1392,14 @@ impl ModelInner {
 			let out = &sc.acts[last];
 			for pend in pending.take().iter() {
 				sc.sync_copy_stream();
-				let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr, pend)?;
+				let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr.get(), pend)?;
 				metrics_emit("", &cfg.metrics, &vals);
 			}
 			for mi in 0..ring_row.len() {
 				let m = ring_row[mi];
 				let slot = base.view(ring_off + mi * epochs + e, 1);
 				ring_scale[mi] =
-					metric_gpu_into(self.loss, m, out, &ybuf, &sc, n, k, ss_tot, &slot)?;
+					metric_gpu_into(self.loss.get(), m, out, &ybuf, &sc, n, k, ss_tot, &slot)?;
 			}
 			if streaming && log_now {
 				for &(_m, slot, ri) in &live {
@@ -1400,7 +1422,7 @@ impl ModelInner {
 		}
 		for pend in pending.take().iter() {
 			sc.sync_copy_stream();
-			let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr, pend)?;
+			let vals = live_vals(&cfg.metrics, &live, &ring_scale, ss_tot, self.lr.get(), pend)?;
 			metrics_emit("", &cfg.metrics, &vals);
 		}
 		let was_interrupted = INTERRUPTED.load(Ordering::SeqCst) != 0;
@@ -1470,7 +1492,7 @@ impl ModelInner {
 				_other => f64::NAN,
 			}
 		};
-		let key = self.loss.score_key();
+		let key = self.loss.get().score_key();
 		let mut loss_prev = f64::INFINITY;
 		let mut ckpt_saved: Option<()> = None;
 		for meta in &epoch_meta {
@@ -1552,7 +1574,7 @@ impl ModelInner {
 					.iter()
 					.map(|m| match m {
 						Metric::Epoch => e as f64,
-						Metric::Lr => self.lr,
+						Metric::Lr => self.lr.get(),
 						Metric::Time => meta.elapsed,
 						_other => val_of(*m, e),
 					})
@@ -1571,7 +1593,7 @@ impl ModelInner {
 						let mut row = vec![meta.elapsed];
 						for &m in &plot_ys {
 							row.push(match m {
-								Metric::Lr => self.lr,
+								Metric::Lr => self.lr.get(),
 								_other => val_of(m, meta.epoch),
 							});
 						}
