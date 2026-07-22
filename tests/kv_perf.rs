@@ -14,7 +14,7 @@ const SCAN_MODEL_KEY: &str = "lfm2.5-1.2b";
 const SCAN_GEN_TOKENS: usize = 3;
 
 fn model_path(key: &str) -> Result<PathBuf> {
-	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
+	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gguf.toml");
 	let text = std::fs::read_to_string(&toml).with_context(|| format!("read {}", toml.display()))?;
 	for line in text.lines() {
 		let trimmed = line.trim_start();

@@ -1,7 +1,7 @@
 use recipe_infer::chat::{Msg, render_template};
 
 const QWEN_TOKENIZER_CONFIG: &str =
-      include_str!("../../datasets/tokenizers/qwen2.5-0.5b/tokenizer_config.json");
+      include_str!("../examples/datasets/tokenizers/qwen2.5-0.5b/tokenizer_config.json");
 
 fn qwen_template() -> String {
       let cfg: serde_json::Value =

@@ -32,32 +32,32 @@ fn model() -> Model {
 		.lr(0.002)
 }
 
-// ── training corpus: real columns from datasets/, labelled by known schema ───
+// ── training corpus: real columns from examples/datasets/, labelled by known schema ───
 
-const HP: &str = "datasets/house-prices/train.csv";
-const CH: &str = "datasets/playground-series-s6e3/train.csv";
-const LLM: &str = "datasets/llm-classification-finetuning/train.csv";
-const WINE: &str = "datasets/wine-quality/winequality-red.csv";
-const NOSHOW: &str = "datasets/no-show-appointments/KaggleV2-May-2016.csv";
-const AMZ: &str = "datasets/amazon-fashion/products.csv";
-const FURN: &str = "datasets/furniture/competitors_raw_data.csv";
-const COS: &str = "datasets/cosmetics/output.csv";
-const HW: &str = "datasets/predict-the-handwriting-images/train.csv";
-const MDIR: &str = "datasets/march-machine-learning-mania-2026/";
-const OL_ORD: &str = "datasets/olist/olist_orders_dataset.csv";
-const OL_REV: &str = "datasets/olist/olist_order_reviews_dataset.csv";
-const OL_ITM: &str = "datasets/olist/olist_order_items_dataset.csv";
-const OL_CUS: &str = "datasets/olist/olist_customers_dataset.csv";
-const LC: &str = "datasets/lendingclub-2007-2011/loan.csv";
-const HMP: &str = "datasets/hm-products/handm.csv";
-const ADI_G: &str = "datasets/adidas-2026/Adidas_Global.csv";
-const ADI_U: &str = "datasets/adidas-2026/US_Adidas.csv";
-const NC_W: &str = "datasets/newchic/women.csv";
-const NC_M: &str = "datasets/newchic/men.csv";
-const NC_S: &str = "datasets/newchic/shoes.csv";
-const SV18: &str = "datasets/kaggle-survey-2018/multipleChoiceResponses.csv";
-const SV17: &str = "datasets/survey-2017/multipleChoiceResponses.csv";
-const NCDIR: &str = "datasets/newchic/";
+const HP: &str = "examples/datasets/house-prices/train.csv";
+const CH: &str = "examples/datasets/playground-series-s6e3/train.csv";
+const LLM: &str = "examples/datasets/llm-classification-finetuning/train.csv";
+const WINE: &str = "examples/datasets/wine-quality/winequality-red.csv";
+const NOSHOW: &str = "examples/datasets/no-show-appointments/KaggleV2-May-2016.csv";
+const AMZ: &str = "examples/datasets/amazon-fashion/products.csv";
+const FURN: &str = "examples/datasets/furniture/competitors_raw_data.csv";
+const COS: &str = "examples/datasets/cosmetics/output.csv";
+const HW: &str = "examples/datasets/predict-the-handwriting-images/train.csv";
+const MDIR: &str = "examples/datasets/march-machine-learning-mania-2026/";
+const OL_ORD: &str = "examples/datasets/olist/olist_orders_dataset.csv";
+const OL_REV: &str = "examples/datasets/olist/olist_order_reviews_dataset.csv";
+const OL_ITM: &str = "examples/datasets/olist/olist_order_items_dataset.csv";
+const OL_CUS: &str = "examples/datasets/olist/olist_customers_dataset.csv";
+const LC: &str = "examples/datasets/lendingclub-2007-2011/loan.csv";
+const HMP: &str = "examples/datasets/hm-products/handm.csv";
+const ADI_G: &str = "examples/datasets/adidas-2026/Adidas_Global.csv";
+const ADI_U: &str = "examples/datasets/adidas-2026/US_Adidas.csv";
+const NC_W: &str = "examples/datasets/newchic/women.csv";
+const NC_M: &str = "examples/datasets/newchic/men.csv";
+const NC_S: &str = "examples/datasets/newchic/shoes.csv";
+const SV18: &str = "examples/datasets/kaggle-survey-2018/multipleChoiceResponses.csv";
+const SV17: &str = "examples/datasets/survey-2017/multipleChoiceResponses.csv";
+const NCDIR: &str = "examples/datasets/newchic/";
 const NEWCHIC_FILES: &[&str] = &[
 	"women",
 	"men",
@@ -76,7 +76,7 @@ const NEWCHIC_IMG: &[&str] = &[
 	"variation_1_image",
 	"image_url",
 ];
-const STOCK_DIR: &str = "datasets/sandp500/individual_stocks_5yr/individual_stocks_5yr";
+const STOCK_DIR: &str = "examples/datasets/sandp500/individual_stocks_5yr/individual_stocks_5yr";
 const STOCK_N: usize = 40;
 
 const SOURCES: &[(&str, &[&str], usize)] = &[
@@ -301,7 +301,7 @@ const SOURCES: &[(&str, &[&str], usize)] = &[
 	(HW, &["label"], KIND_CATEGORICAL),
 	(HW, &["image_id"], KIND_IMAGE),
 	(
-		"datasets/predict-the-handwriting-images/test.csv",
+		"examples/datasets/predict-the-handwriting-images/test.csv",
 		&["image_id"],
 		KIND_IMAGE,
 	),
@@ -567,22 +567,22 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 	use Delim::{Comma, Semicolon, Space, Tab};
 	add_indexed(
 		out,
-		"datasets/VNA/9_10_24_Hold_02_targets.csv",
+		"examples/datasets/VNA/9_10_24_Hold_02_targets.csv",
 		&Comma,
 		true,
 		&[(0, KIND_NUMERIC)],
 	)?;
 	add_indexed(
 		out,
-		"datasets/VNA/sample_targets.csv",
+		"examples/datasets/VNA/sample_targets.csv",
 		&Comma,
 		true,
 		&[(0, KIND_NUMERIC)],
 	)?;
-	add_sampled_numeric(out, "datasets/VNA/sample_predictors.csv", &Comma, true, 64)?;
+	add_sampled_numeric(out, "examples/datasets/VNA/sample_predictors.csv", &Comma, true, 64)?;
 	add_sampled_numeric(
 		out,
-		"datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv",
+		"examples/datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv",
 		&Comma,
 		true,
 		64,
@@ -590,84 +590,84 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 
 	add_indexed(
 		out,
-		"datasets/uci-wine/wine.data",
+		"examples/datasets/uci-wine/wine.data",
 		&Comma,
 		true,
 		&kinds(14, &[(0, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-glass/glass.data",
+		"examples/datasets/uci-glass/glass.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-ionosphere/ionosphere.data",
+		"examples/datasets/uci-ionosphere/ionosphere.data",
 		&Comma,
 		true,
 		&kinds(35, &[(34, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-sonar/sonar.all-data",
+		"examples/datasets/uci-sonar/sonar.all-data",
 		&Comma,
 		true,
 		&kinds(61, &[(60, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-abalone/abalone.data",
+		"examples/datasets/uci-abalone/abalone.data",
 		&Comma,
 		true,
 		&kinds(9, &[(0, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-bcw/breast-cancer-wisconsin.data",
+		"examples/datasets/uci-bcw/breast-cancer-wisconsin.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-wdbc/wdbc.data",
+		"examples/datasets/uci-wdbc/wdbc.data",
 		&Comma,
 		true,
 		&kinds(32, &[(1, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-letter/letter-recognition.data",
+		"examples/datasets/uci-letter/letter-recognition.data",
 		&Comma,
 		true,
 		&kinds(17, &[(0, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-magic/magic04.data",
+		"examples/datasets/uci-magic/magic04.data",
 		&Comma,
 		true,
 		&kinds(11, &[(10, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-optdigits/optdigits.tra",
+		"examples/datasets/uci-optdigits/optdigits.tra",
 		&Comma,
 		true,
 		&kinds(65, &[(64, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-spambase/spambase.data",
+		"examples/datasets/uci-spambase/spambase.data",
 		&Comma,
 		true,
 		&kinds(58, &[(57, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-adult/adult.data",
+		"examples/datasets/uci-adult/adult.data",
 		&Comma,
 		true,
 		&kinds(
@@ -688,56 +688,56 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 
 	add_indexed(
 		out,
-		"datasets/uci-german-numeric/german.data-numeric",
+		"examples/datasets/uci-german-numeric/german.data-numeric",
 		&Space,
 		true,
 		&kinds(25, &[]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-satimage/sat.trn",
+		"examples/datasets/uci-satimage/sat.trn",
 		&Space,
 		true,
 		&kinds(37, &[(36, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-shuttle/shuttle.trn",
+		"examples/datasets/uci-shuttle/shuttle.trn",
 		&Space,
 		true,
 		&kinds(10, &[(9, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-ecoli/ecoli.data",
+		"examples/datasets/uci-ecoli/ecoli.data",
 		&Space,
 		true,
 		&kinds(9, &[(0, KIND_TEXT), (8, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-yeast/yeast.data",
+		"examples/datasets/uci-yeast/yeast.data",
 		&Space,
 		true,
 		&kinds(10, &[(0, KIND_TEXT), (9, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-seeds/seeds_dataset.txt",
+		"examples/datasets/uci-seeds/seeds_dataset.txt",
 		&Tab,
 		true,
 		&kinds(8, &[(7, KIND_CATEGORICAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-airfoil/airfoil_self_noise.dat",
+		"examples/datasets/uci-airfoil/airfoil_self_noise.dat",
 		&Tab,
 		true,
 		&kinds(6, &[]),
 	)?;
 	add_sampled_numeric(
 		out,
-		"datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt",
+		"examples/datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt",
 		&Space,
 		true,
 		64,
@@ -745,7 +745,7 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 
 	add_indexed(
 		out,
-		"datasets/uci-sms-tab/SMSSpamCollection",
+		"examples/datasets/uci-sms-tab/SMSSpamCollection",
 		&Tab,
 		true,
 		&[(0, KIND_CATEGORICAL), (1, KIND_TEXT)],
@@ -753,21 +753,21 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 
 	add_indexed(
 		out,
-		"datasets/uci-winequality-semicolon/winequality-red.csv",
+		"examples/datasets/uci-winequality-semicolon/winequality-red.csv",
 		&Semicolon,
 		false,
 		&kinds(12, &[(11, KIND_ORDINAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-winequality-semicolon/winequality-white.csv",
+		"examples/datasets/uci-winequality-semicolon/winequality-white.csv",
 		&Semicolon,
 		false,
 		&kinds(12, &[(11, KIND_ORDINAL)]),
 	)?;
 	add_indexed(
 		out,
-		"datasets/uci-bank-semicolon/bank-full.csv",
+		"examples/datasets/uci-bank-semicolon/bank-full.csv",
 		&Semicolon,
 		false,
 		&kinds(

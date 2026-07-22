@@ -7,7 +7,7 @@ use recipe_infer::gguf::Gguf;
 use std::path::PathBuf;
 
 fn model_path(key: &str) -> Result<PathBuf> {
-	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
+	let toml = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gguf.toml");
 	let text = std::fs::read_to_string(&toml).with_context(|| format!("read {}", toml.display()))?;
 	for line in text.lines() {
 		let trimmed = line.trim_start();

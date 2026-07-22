@@ -95,7 +95,7 @@ fn data_load_materializes_safetensors_shard() {
 
 #[test]
 fn no_target_datasets_is_features_only() {
-	let d = Data::load("datasets/uci-wine/wine.data");
+	let d = Data::load("examples/datasets/uci-wine/wine.data");
 	let Datasets { train: set, test } = d.datasets();
 	assert_eq!(set.n_targets, 0, "no .target() yields zero targets");
 	assert!(set.y.is_empty(), "zero targets carry no y");

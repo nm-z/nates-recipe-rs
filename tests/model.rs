@@ -69,7 +69,7 @@ fn consts_buf() -> GpuBuffer {
 }
 
 static CHURN: LazyLock<recipe::dataset::Dataset> = LazyLock::new(|| {
-	const TRAIN: &str = "datasets/playground-series-s6e3/train.csv";
+	const TRAIN: &str = "examples/datasets/playground-series-s6e3/train.csv";
 	assert!(
 		Path::new(TRAIN).exists(),
 		"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",

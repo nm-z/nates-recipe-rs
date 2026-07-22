@@ -27,7 +27,7 @@ cargo test all                           # THE suite: every test in every crate,
                                          #   test, 60s SIGKILL deadline each (kill = that test's FAIL,
                                          #   suite continues), single log at suite.log, verdict:
                                          #   rg '^FAIL' suite.log   (SUITE SPEC v3; tests/all.rs)
-cargo test -p recipe-infer --release     # forward/KV-cache/ogdl behavioral tests (GPU)
+cargo test --release --test forward      # infer/pantry behavioral tests live in ./tests (root package)
 cargo test -p gpu-core --release --test suite   # kernel proof suite alone (target renamed from `all`;
                                          #   no test id may contain substring "all" — cargo filter)
 cargo run --release -- train.csv --target Price
@@ -37,7 +37,7 @@ cargo run --release --example train_detector   # retrains → pantry/detector.og
 cargo run --release --example gemma4 -- "prompt"  # gemma-26B f64 inference
 ```
 
-ROCm default `/opt/rocm` (symlink to ~/.rocm-install/rocm); overrides: `ROCM_PATH`, `GPU_ARCH` (default gfx1101), `HIPCC`. Datasets live in `datasets/` — tracked via **Git LFS** (`.gitattributes`: `datasets/** filter=lfs`), not gitignored. A fresh `git clone` smudges ~3.3 GiB of dataset blobs; a compute/serve node that only needs source can skip them with `GIT_LFS_SKIP_SMUDGE=1 git clone/pull` (leaves LFS pointer files, ~110 MB tree). Edit examples and `/home/nate/Desktop/train.rs` in place — every new crate target or new -Zscript file triggers a full ~15-min rebuild.
+ROCm default `/opt/rocm` (symlink to ~/.rocm-install/rocm); overrides: `ROCM_PATH`, `GPU_ARCH` (default gfx1101), `HIPCC`. Datasets live in `examples/datasets/` — tracked via **Git LFS** (`.gitattributes`: `examples/datasets/** filter=lfs`), not gitignored. A fresh `git clone` smudges ~3.3 GiB of dataset blobs; a compute/serve node that only needs source can skip them with `GIT_LFS_SKIP_SMUDGE=1 git clone/pull` (leaves LFS pointer files, ~110 MB tree). Edit examples and `/home/nate/Desktop/train.rs` in place — every new crate target or new -Zscript file triggers a full ~15-min rebuild.
 
 ## User API
 

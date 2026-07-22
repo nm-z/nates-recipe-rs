@@ -42,7 +42,7 @@ fn single_numeric_column_headerless() {
 fn semicolon_delimiter_is_sniffed() {
 	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-bank-semicolon/bank.csv"
+		"/examples/datasets/uci-bank-semicolon/bank.csv"
 	));
 	assert_eq!(sniff_delimiter(p), b';');
 }
@@ -51,7 +51,7 @@ fn semicolon_delimiter_is_sniffed() {
 fn tab_delimiter_is_sniffed() {
 	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-seeds/seeds_dataset.txt"
+		"/examples/datasets/uci-seeds/seeds_dataset.txt"
 	));
 	assert_eq!(sniff_delimiter(p), b'\t');
 }
@@ -60,7 +60,7 @@ fn tab_delimiter_is_sniffed() {
 fn comma_delimiter_is_sniffed() {
 	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/wine-quality/winequality-red.csv"
+		"/examples/datasets/wine-quality/winequality-red.csv"
 	));
 	assert_eq!(sniff_delimiter(p), b',');
 }
@@ -69,7 +69,7 @@ fn comma_delimiter_is_sniffed() {
 fn space_delimiter_is_sniffed() {
 	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
+		"/examples/datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
 	));
 	assert_eq!(sniff_delimiter(p), b' ');
 }
@@ -87,7 +87,7 @@ fn prose_line_is_not_space_delimited() {
 fn whitespace_matrix_headerless_keeps_rows() {
 	let p = Path::new(concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
+		"/examples/datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
 	));
 	let RawCsv { headers, rows } = read_raw_csv(p).unwrap();
 	assert_eq!(headers.len(), 561);
@@ -102,7 +102,7 @@ fn whitespace_matrix_headerless_keeps_rows() {
 fn dir_groups_found_recursively() -> anyhow::Result<()> {
 	let d = concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-har-sensor/UCI HAR Dataset"
+		"/examples/datasets/uci-har-sensor/UCI HAR Dataset"
 	);
 	let names: Vec<String> = load_groups(d)?
 		.iter()
@@ -127,7 +127,7 @@ fn dir_groups_found_recursively() -> anyhow::Result<()> {
 fn har_zip_extracts_wrapped_tables() {
 	let p = concat!(
 		env!("CARGO_MANIFEST_DIR"),
-		"/../datasets/uci-har-sensor/har.zip"
+		"/examples/datasets/uci-har-sensor/har.zip"
 	);
 	let groups = load_zip_groups(p).unwrap();
 	let mut x_train_cols = 0_usize;

@@ -9,7 +9,7 @@ fn stories_fixture() -> PathBuf {
 
 fn arch_fixture(name: &str) -> PathBuf {
 	return Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("../datasets/llamacpp-archs-seed42")
+		.join("examples/datasets/llamacpp-archs-seed42")
 		.join(name);
 }
 

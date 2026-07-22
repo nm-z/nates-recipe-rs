@@ -13,14 +13,14 @@ struct Sets {
 }
 
 const SET: Sets = Sets {
-	numeric: "datasets/house-prices/train.csv",
-	temporal: "datasets/web-traffic-time-series-forecasting/train_1.csv",
-	categoric: "datasets/playground-series-s6e3/train.csv",
-	ordinal: "datasets/wine-quality/winequality-red.csv",
-	text: "datasets/llm-classification-finetuning/train.csv",
+	numeric: "examples/datasets/house-prices/train.csv",
+	temporal: "examples/datasets/web-traffic-time-series-forecasting/train_1.csv",
+	categoric: "examples/datasets/playground-series-s6e3/train.csv",
+	ordinal: "examples/datasets/wine-quality/winequality-red.csv",
+	text: "examples/datasets/llm-classification-finetuning/train.csv",
 	image: [
-		"datasets/predict-the-handwriting-images/train.csv",
-		"datasets/predict-the-handwriting-images/train_images/",
+		"examples/datasets/predict-the-handwriting-images/train.csv",
+		"examples/datasets/predict-the-handwriting-images/train_images/",
 	],
 };
 

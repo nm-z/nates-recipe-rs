@@ -64,7 +64,7 @@ const IN_SUITE: &[&str] = &[
 ];
 
 fn gguf_toml() -> PathBuf {
-	return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gguf.toml");
+	return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gguf.toml");
 }
 
 fn parse_models() -> Result<Vec<(String, String)>> {

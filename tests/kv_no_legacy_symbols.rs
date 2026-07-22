@@ -53,7 +53,7 @@ fn paren_span(text: &str, open: usize) -> Option<(usize, usize)> {
 #[test]
 fn no_legacy_decode_symbols_in_sources() {
 	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-	let roots = [manifest.join("src"), manifest.join("../gpu-core/src")];
+	let roots = [manifest.join("recipe-infer/src"), manifest.join("gpu-core/src")];
 	let banned = ["decode_scan", "has_scan_op", "gpu_gqa_attn", "gpu_mla_attn"];
 	let mut files = Vec::new();
 	for root in &roots {

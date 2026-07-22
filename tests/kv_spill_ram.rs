@@ -32,7 +32,7 @@ fn argmax(logits: &[f64]) -> u32 {
 }
 
 #[test]
-fn spill_growth_moves_bytes_without_fresh_device_allocs() {
+fn spill_growth_moves_bytes_without_new_device_memory() {
 	let gguf = stories_fixture();
 	let mut session = ChatSession::open(&gguf, &mut |_toks: &[Tok]| true)
 		.expect("session open")

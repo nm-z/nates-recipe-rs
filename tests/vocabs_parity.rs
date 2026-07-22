@@ -42,7 +42,7 @@ fn matched_cases(dir: &Path, stem: &str) -> Result<(usize, usize)> {
 
 #[test]
 fn vocabs_parity_vs_llama_cpp() {
-	let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../datasets/llamacpp-vocabs-tokenizer");
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/datasets/llamacpp-vocabs-tokenizer");
 	let mut vocabs: Vec<PathBuf> = fs::read_dir(&dir)
 		.expect("fixtures dir")
 		.filter_map(|e| e.ok().map(|e| e.path()))

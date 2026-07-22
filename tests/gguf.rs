@@ -5,7 +5,7 @@ use std::path::Path;
 #[test]
 fn open_gemma_vocab_and_validate_layout() {
 	let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("..")
+		.join("examples")
 		.join("datasets")
 		.join("gguf-test")
 		.join("ggml-vocab-gemma-4.gguf");

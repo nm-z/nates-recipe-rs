@@ -1,1 +1,1 @@
-datasets/** filter=lfs diff=lfs merge=lfs -text
+examples/datasets/** filter=lfs diff=lfs merge=lfs -text

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 const NMSE_BAR: f64 = 1e-4;
 
 fn fixtures_dir() -> PathBuf {
-	Path::new(env!("CARGO_MANIFEST_DIR")).join("../datasets/llamacpp-archs-seed42")
+	Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/datasets/llamacpp-archs-seed42")
 }
 
 fn read_tokens(dir: &Path) -> Result<Vec<u32>> {

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn fixtures_dir() -> PathBuf {
-	Path::new(env!("CARGO_MANIFEST_DIR")).join("../datasets/llamacpp-archs-seed42")
+	Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/datasets/llamacpp-archs-seed42")
 }
 
 fn prompt_tokens() -> Result<Vec<u32>> {
@@ -114,7 +114,7 @@ fn cached_matches_full_talkie() {
 }
 
 #[test]
-fn cached_matches_full_falcon_h1_parallel() {
+fn cached_matches_full_for_falcon_h1() {
 	assert_cached_matches_full("falcon-h1-dense.gguf");
 }
 
@@ -196,7 +196,7 @@ fn spill_matches_resident_talkie() {
 }
 
 #[test]
-fn spill_matches_resident_falcon_h1_parallel() {
+fn spill_matches_resident_for_falcon_h1() {
 	assert_spill_matches_resident("falcon-h1-dense.gguf");
 }
 
@@ -211,9 +211,9 @@ fn spill_matches_resident_nemotron_h() {
 }
 
 #[test]
-fn one_decode_method_no_fallback() {
+fn one_decode_method_no_second_path() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-	let llm = fs::read_to_string(root.join("src/llm.rs")).expect("llm.rs");
+	let llm = fs::read_to_string(root.join("recipe-infer/src/llm.rs")).expect("llm.rs");
 	assert!(!llm.contains("fn decode_scan"), "decode_scan fallback still present");
 	assert!(!llm.contains("has_scan_op"), "has_scan_op decode fork still present");
 	assert_eq!(

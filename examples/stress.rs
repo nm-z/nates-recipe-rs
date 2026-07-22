@@ -4,9 +4,9 @@ use recipe::*;
 use std::fmt;
 use std::path::Path;
 
-const BANK: &str = "datasets/uci-bank-semicolon/bank-full.csv";
-const SEEDS: &str = "datasets/uci-seeds/seeds_dataset.txt";
-const WINE: &str = "datasets/uci-wine/wine.data";
+const BANK: &str = "examples/datasets/uci-bank-semicolon/bank-full.csv";
+const SEEDS: &str = "examples/datasets/uci-seeds/seeds_dataset.txt";
+const WINE: &str = "examples/datasets/uci-wine/wine.data";
 
 fn say(t: impl fmt::Display) {
 	set_opt(Opt {
