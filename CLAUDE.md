@@ -2,7 +2,7 @@
 
 ## What This Is
 
-GPU-native neural-network training framework in Rust: builder API for models, data loading (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, evaluation. All compute runs on GPU through `gpu-core`; no CPU ML crates. 5-member workspace, strict one-way DAG:
+GPU-native neural-network training framework in Rust: builder API for models, data loading (CSV/ARFF/zip/image dirs), training on AMD GPUs via HIP/ROCm, evaluation. All compute runs on GPU through `gpu-core`; no CPU ML crates. 10-member workspace (every crate in the repo); core DAG:
 
 ```
 gpu-core                       HIP kernels, links ROCm, depends on nothing
@@ -17,7 +17,7 @@ vramspy                        LD_PRELOAD cdylib interposing HSA alloc entry poi
                                counts library-side VRAM beneath the ledger choke points
 ```
 
-`catboost-rs` / `lightgbm-rs` / `xgboost-rs-broken` are workspace-excluded, standalone, untouched.
+`catboost-rs` / `lightgbm-rs` / `xgboost-rs-broken` are workspace members; every crate in the repo is.
 
 ## Build & Run
 
