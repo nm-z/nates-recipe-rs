@@ -6,9 +6,10 @@ use ogdl::log::{
 	set_opt, time,
 };
 use pantry::encode::Dataset;
+use crate::memory::{Scaler, load_ogdl};
 use recipe_infer::{
-	LayerParams, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, infer_scored,
-	load_ogdl, load_ogdl_str, metric_fmt, metric_gpu_into, metric_pinned_slot, metric_render,
+	LayerParams, PlanMode, SCRATCH_CONSTS, Scratch, concat_layer, infer_scored,
+	load_ogdl_str, metric_fmt, metric_gpu_into, metric_pinned_slot, metric_render,
 	plan_layer_params, zscore_apply_views,
 };
 use recipe_ir::{LayerSpec, Loss, Metric, Param, Slot, pinned_vocab};
@@ -446,7 +447,7 @@ pub fn save_ogdl(model: &ModelInner, score: f64, filter: Option<&[Param]>, path:
 	let key = model.resolved_loss().score_key();
 	let path = crate::resolve::resolve_path(path);
 	let allow = score.is_finite()
-		&& !recipe_infer::saved_score(&path, key).is_some_and(|best| score <= best);
+		&& !crate::memory::saved_score(&path, key).is_some_and(|best| score <= best);
 	let Some(_ok) = Some(()).filter(|_probe| allow) else {
 		return;
 	};
@@ -462,7 +463,7 @@ pub fn save_ogdl(model: &ModelInner, score: f64, filter: Option<&[Param]>, path:
 				Write::error("save: model has no trained params");
 				return;
 			}
-			let Ok(text) = recipe_infer::dump_ogdl(&params, filter, key, score) else {
+			let Ok(text) = crate::memory::dump_ogdl(&params, filter, key, score) else {
 				return;
 			};
 			Rendered {
@@ -471,7 +472,7 @@ pub fn save_ogdl(model: &ModelInner, score: f64, filter: Option<&[Param]>, path:
 			}
 		}
 	};
-	let __wr = recipe_infer::write_ogdl(&path, &rendered.text);
+	let __wr = crate::memory::write_ogdl(&path, &rendered.text);
 	if !__wr.is_ok() {
 		Write::error(format!(
 			"write model file: {}",
@@ -1643,14 +1644,14 @@ impl ModelInner {
 													"checkpoint path"
 												)
 											})?;
-										let better = recipe_infer::saved_score(
+										let better = crate::memory::saved_score(
 											path, key,
 										)
 										.is_none_or(|best| score > best);
 										Some(())
 											.filter(|_p| better)
 											.map(|_p| -> anyhow::Result<()> {
-												recipe_infer::write_ogdl(
+												crate::memory::write_ogdl(
 												path,
 												&plan.dump_ogdl_host(&host[w_off..w_off + w_len], key, score)?,
 											)?;
@@ -1748,7 +1749,7 @@ impl ModelInner {
 					.text;
 				match Some(()).filter(|_probe| was_interrupted) {
 					Some(_intr) => {
-						let better_on_disk = recipe_infer::saved_score(path, key)
+						let better_on_disk = crate::memory::saved_score(path, key)
 							.is_some_and(|best| {
 								!(fit_score.is_finite() && fit_score > best)
 							});
@@ -1760,7 +1761,7 @@ impl ModelInner {
 								),
 							),
 							None => {
-								recipe_infer::write_ogdl(path, text)?;
+								crate::memory::write_ogdl(path, text)?;
 								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
 								Write::line(
@@ -1777,11 +1778,11 @@ impl ModelInner {
 						end_val
 							.filter(|s| s.is_finite())
 							.filter(|&s| {
-								recipe_infer::saved_score(path, key)
+								crate::memory::saved_score(path, key)
 									.is_none_or(|best| s > best)
 							})
 							.map(|s| -> anyhow::Result<()> {
-								recipe_infer::write_ogdl(path, text)?;
+								crate::memory::write_ogdl(path, text)?;
 								let full = fs::canonicalize(path)
 									.unwrap_or_else(|_err| path.into());
 								Write::line(

@@ -1,4 +1,5 @@
-use recipe_infer::{Saved, load_ogdl, load_ogdl_str};
+use recipe_infer::{Saved, load_ogdl_str};
+use recipe_runtime::load_ogdl;
 use std::env;
 use std::fs;
 

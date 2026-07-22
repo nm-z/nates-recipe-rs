@@ -3,8 +3,8 @@ use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::{Write, gpu};
 use gpu_core::memory::GpuBuffer;
-use recipe_infer::{LayerParams, Scratch};
-use recipe_ir::{Activation, LayerKind, Loss};
+use recipe_infer::{Scratch, download_scalar, download_vec};
+use recipe_ir::{Activation, LayerKind, Loss, Param};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
@@ -20,6 +20,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+
+// ─────────────────────────────────────────────────────────────────────────────
+pub use recipe_infer::{
+	ELU_ALPHA, FOCAL_ALPHA, FOCAL_GAMMA, LEAKY_ALPHA, LayerParams, LayerPlan, PRELU_INIT,
+	PlanMode, Saved, concat_layer, load_ogdl_str, ogdl_text, plan_layer_params, sinusoidal_pe,
+};
 
 static DISK_R_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -2544,4 +2550,145 @@ impl Drop for Ooc {
 			}
 		}
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+pub struct Scaler {
+	pub mean: Vec<f64>,
+	pub std: Vec<f64>,
+}
+
+pub fn load_ogdl(path: &str) -> anyhow::Result<Vec<Saved>> {
+	let text = match fs::read_to_string(path) {
+		Ok(t) => t,
+		Err(e) => {
+			Write::error(&format!(
+				"no data in {path} ({e}), initialized random weights and biases"
+			));
+			return Ok(Vec::new());
+		}
+	};
+	load_ogdl_str(&text)
+}
+
+pub fn dump_ogdl(
+	params: &[LayerParams],
+	filter: Option<&[Param]>,
+	key: &str,
+	score: f64,
+) -> anyhow::Result<String> {
+	let want_w = filter.is_none_or(|f| f.contains(&Param::W));
+	let want_b = filter.is_none_or(|f| f.contains(&Param::B));
+	return ogdl_text(|g| {
+		drop(g.add(score, key));
+		let mut z = 1;
+		let mut at = 1;
+		let mut cv = 1;
+		for p in params.iter() {
+			match p.kind {
+				LayerKind::Embed => {
+					if want_w {
+						let table = download_vec(&p.w, p.vocab * p.dim)?;
+						for id in 0..p.vocab {
+							drop(g.add(
+								table[id * p.dim..(id + 1) * p.dim].to_vec(),
+								&format!("embed.{id}"),
+							));
+						}
+					}
+				}
+				LayerKind::Attn => {
+					let dd = p.dim * p.dim;
+					if want_w {
+						drop(g.add(download_vec(&p.w, dd)?, &format!("attn{at}.wq")));
+						drop(g.add(download_vec(&p.wk, dd)?, &format!("attn{at}.wk")));
+						drop(g.add(download_vec(&p.wv, dd)?, &format!("attn{at}.wv")));
+						drop(g.add(download_vec(&p.wo, dd)?, &format!("attn{at}.wo")));
+					}
+					if want_b {
+						let bias = download_vec(&p.b, p.dim)?;
+						for nm in ["bq", "bk", "bv", "bo"] {
+							drop(g.add(bias.clone(), &format!("attn{at}.{nm}")));
+						}
+					}
+					at += 1;
+				}
+				LayerKind::Conv => {
+					let lin = p.in_dim / p.conv_cin;
+					let lout = (lin - p.conv_k) / p.conv_stride + 1;
+					let cout = p.out_dim / lout;
+					let w_count = cout * p.conv_cin * p.conv_k;
+					drop(g.add(
+						vec![
+							cout as f64,
+							p.conv_cin as f64,
+							p.conv_k as f64,
+							p.conv_stride as f64,
+						],
+						&format!("conv{cv}"),
+					));
+					if want_w {
+						drop(g.add(
+							download_vec(&p.w, w_count)?,
+							&format!("conv{cv}.w"),
+						));
+					}
+					if want_b {
+						drop(g.add(download_vec(&p.b, cout)?, &format!("conv{cv}.b")));
+					}
+					cv += 1;
+				}
+				LayerKind::Dense => {
+					let w = download_vec(&p.w, p.in_dim * p.out_dim)?;
+					let b = download_vec(&p.b, p.out_dim)?;
+					let slope = if p.act == Activation::PRelu {
+						Some(download_scalar(&p.palpha)?)
+					} else {
+						None
+					};
+					for j in 0..p.out_dim {
+						if want_w {
+							let row: Vec<f64> = (0..p.in_dim)
+								.map(|i| w[i * p.out_dim + j])
+								.collect();
+							drop(g.add(row, &format!("z{z}.w")));
+							if let Some(a) = slope {
+								drop(g.add(a, &format!("z{z}.a")));
+							}
+						}
+						if want_b {
+							drop(g.add(b[j], &format!("z{z}.b")));
+						}
+						z += 1;
+					}
+				}
+			}
+		}
+		Ok(())
+	});
+}
+
+pub fn write_ogdl(path: &str, out: &str) -> anyhow::Result<()> {
+	if let Some(parent) = Path::new(path).parent()
+		&& !parent.as_os_str().is_empty()
+	{
+		fs::create_dir_all(parent)
+			.map_err(|e| anyhow::anyhow!("save: mkdir {}: {e}", parent.display()))?;
+	}
+	fs::write(path, out).map_err(|e| anyhow::anyhow!("save: write {path}: {e}"))
+}
+
+pub fn saved_score(path: &str, key: &str) -> Option<f64> {
+	let text = fs::read_to_string(path).ok()?;
+	for line in text.lines() {
+		let line = line.trim();
+		if let Some((k, v)) = line
+			.split_once('=')
+			.or_else(|| line.split_once(char::is_whitespace))
+			&& k.trim() == key
+		{
+			return v.trim().parse().ok();
+		}
+	}
+	None
 }
