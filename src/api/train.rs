@@ -63,6 +63,7 @@ impl Train {
 	}
 
 	pub fn run(&self, dat: impl RunArg, model: impl ModelArg) -> &Train {
+		let probe = recipe_runtime::execute::run_begin(&self.cfg);
 		let dh = dat.resolve();
 		let mh = model.resolve();
 		let d = dh.get();
@@ -92,7 +93,7 @@ impl Train {
 			fit_ok,
 		};
 		let inner: &ModelInner = &m.inner;
-		recipe_runtime::execute::run_train(&self.cfg, ds, inner, meta);
+		recipe_runtime::execute::run_train(&self.cfg, ds, inner, meta, probe);
 		self
 	}
 

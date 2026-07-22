@@ -241,13 +241,23 @@ impl ModelInner {
 	}
 }
 
-pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta) {
+pub struct RunProbe {
+	pub run_hip: Option<[u64; gpu_core::callspy::N]>,
+	pub run_state: [u64; gpu_core::callspy::N],
+}
+
+pub fn run_begin(cfg: &TrainCfg) -> RunProbe {
 	let run_hip = cfg
 		.metrics
 		.iter()
 		.find(|m| **m == Metric::Hip)
 		.map(|_hip| gpu_core::callspy::snapshot());
 	let run_state = gpu_core::callspy::snapshot();
+	RunProbe { run_hip, run_state }
+}
+
+pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta, probe: RunProbe) {
+	let RunProbe { run_hip, run_state } = probe;
 	set_opt(Opt {
 		loss: cfg.metrics.contains(&Metric::Loss),
 		acc: cfg.metrics.contains(&Metric::Accuracy),
