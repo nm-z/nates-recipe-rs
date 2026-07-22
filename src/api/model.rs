@@ -160,14 +160,34 @@ impl Model {
 		self
 	}
 
-	pub fn loss(mut self, lossfn: Loss) -> Model {
-		self.inner.loss = lossfn;
-		self
+	pub fn loss(self, obj: impl IntoObjective) -> Model {
+		return obj.record(self);
 	}
 
 	pub fn lr(mut self, rate: f64) -> Model {
 		self.inner.lr = rate;
-		self
+		self.inner.lr_intent = Some(rate);
+		return self;
+	}
+}
+
+pub trait IntoObjective {
+	fn record(self, m: Model) -> Model;
+}
+
+impl IntoObjective for recipe_ir::Loss {
+	fn record(self, mut m: Model) -> Model {
+		m.inner.objective = recipe_ir::ObjectiveIntent::Builtin(self);
+		m.inner.loss = self;
+		return m;
+	}
+}
+
+impl IntoObjective for &Model {
+	fn record(self, mut m: Model) -> Model {
+		m.inner.objective =
+			recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(self.inner.id));
+		return m;
 	}
 }
 

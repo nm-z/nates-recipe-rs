@@ -37,6 +37,8 @@ pub use api::{
 	DataHandle, IntoLayer, ModelArg, ModelHandle, Prepared, RunArg, RunData, SavePath,
 };
 #[doc(hidden)]
+pub use api::model::IntoObjective;
+#[doc(hidden)]
 pub use api::model::{
 	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };

@@ -18,10 +18,12 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub static INTERRUPTED: AtomicUsize = AtomicUsize::new(0);
+
+static NEXT_MODEL_ID: AtomicU32 = AtomicU32::new(0);
 
 pub extern "C" fn on_sigint(_sig: i32) {
 	let Some(_second) = Some(()).filter(|_probe| INTERRUPTED.swap(1, Ordering::SeqCst) != 0)
@@ -162,6 +164,9 @@ pub struct ModelInner {
 	pub specs: Vec<LayerSpec>,
 	pub loss: Loss,
 	pub lr: f64,
+	pub id: recipe_ir::ObjectId,
+	pub objective: recipe_ir::ObjectiveIntent,
+	pub lr_intent: Option<f64>,
 	pub params: RefCell<Vec<LayerParams>>,
 	pub scaler: RefCell<Option<Scaler>>,
 	pub yscaler: RefCell<Option<recipe_infer::YScaler>>,
@@ -179,6 +184,9 @@ impl ModelInner {
 			specs: Vec::new(),
 			loss: Loss::Mse,
 			lr: 0.01,
+			id: recipe_ir::ObjectId(NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed)),
+			objective: recipe_ir::ObjectiveIntent::Unspecified,
+			lr_intent: None,
 			params: RefCell::new(Vec::new()),
 			scaler: RefCell::new(None),
 			yscaler: RefCell::new(None),
