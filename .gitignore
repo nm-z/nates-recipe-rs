@@ -61,3 +61,4 @@ examples/*/test_images/
 
 # Vendored llama.cpp clone (reference for arch ports; clone separately)
 llama.cpp/
+*.err
