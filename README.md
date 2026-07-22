@@ -77,7 +77,7 @@ f64 `.hip` kernels, HIP/ROCm bindings, tagged memory ledger. Everything GPU sits
 Kernel proof suite; the test target is named `suite`, not `all`, and it needs the committed `recipe.db`:
 
 ```bash
-cargo test -p gpu-core --release --test suite
+cargo test --release --test suite
 ```
 
 Other test targets; same form for `moe`, `rope`, `tiered`:

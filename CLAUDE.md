@@ -28,7 +28,7 @@ cargo test all                           # THE suite: every test in every crate,
                                          #   suite continues), single log at suite.log, verdict:
                                          #   rg '^FAIL' suite.log   (SUITE SPEC v3; tests/all.rs)
 cargo test --release --test forward      # infer/pantry behavioral tests live in ./tests (root package)
-cargo test -p gpu-core --release --test suite   # kernel proof suite alone (target renamed from `all`;
+cargo test --release --test suite        # kernel proof suite alone (target renamed from `all`;
                                          #   no test id may contain substring "all" — cargo filter)
 cargo run --release -- train.csv --target Price
 cargo run --release -- detect <path>     # or ./target/release/detect <path> (standalone bin)

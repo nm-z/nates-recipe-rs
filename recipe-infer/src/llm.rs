@@ -30,7 +30,7 @@ use std::time::Instant;
 #[path = "models/mod.rs"]
 mod models;
 
-pub(crate) const FWD_DT: Dtype = Dtype::F32;
+pub const FWD_DT: Dtype = Dtype::F32;
 
 const fn bytes_for(elems: usize, dt: Dtype) -> usize {
 	return elems.div_ceil(dt.block_elems()) * dt.block_bytes();
@@ -2080,17 +2080,17 @@ pub(crate) struct KvStage {
 	pub(crate) sv: [GpuBuffer; 2],
 }
 
-pub(crate) struct HostStore {
-	ram: Vec<u8>,
+pub struct HostStore {
+	pub ram: Vec<u8>,
 	ram_budget: usize,
 	wf: Option<fs::File>,
 	rf: RefCell<Option<fs::File>>,
 	path: PathBuf,
-	file_len: usize,
+	pub file_len: usize,
 }
 
 impl HostStore {
-	fn new(ram_budget: usize, path: PathBuf) -> HostStore {
+	pub fn new(ram_budget: usize, path: PathBuf) -> HostStore {
 		return HostStore {
 			ram: Vec::new(),
 			ram_budget,
@@ -2101,11 +2101,11 @@ impl HostStore {
 		};
 	}
 
-	fn len(&self) -> usize {
+	pub fn len(&self) -> usize {
 		return self.ram.len() + self.file_len;
 	}
 
-	fn append_f32(&mut self, vals: &[f32]) -> Result<()> {
+	pub fn append_f32(&mut self, vals: &[f32]) -> Result<()> {
 		let mut bytes = Vec::with_capacity(vals.len() * 4);
 		for v in vals {
 			bytes.extend_from_slice(&v.to_le_bytes());
@@ -2132,7 +2132,7 @@ impl HostStore {
 		return Ok(());
 	}
 
-	pub(crate) fn stage_into(
+	pub fn stage_into(
 		&self,
 		off: usize,
 		len: usize,
@@ -2171,7 +2171,7 @@ impl HostStore {
 		return Ok(());
 	}
 
-	fn truncate(&mut self, len: usize) {
+	pub fn truncate(&mut self, len: usize) {
 		if len <= self.ram.len() {
 			self.ram.truncate(len);
 			*self.rf.borrow_mut() = None;
@@ -3223,6 +3223,3 @@ fn refine_canvas(
 	drop(ar);
 	Ok(out)
 }
-
-#[cfg(test)]
-mod host_store_tests;
