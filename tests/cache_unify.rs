@@ -221,7 +221,7 @@ fn one_decode_method_no_second_path() {
 		1,
 		"expected exactly one cached decode function"
 	);
-	let common = fs::read_to_string(root.join("src/models/common.rs")).expect("common.rs");
+	let common = fs::read_to_string(root.join("recipe-infer/src/models/common.rs")).expect("common.rs");
 	assert!(!common.contains("gpu_gqa_attn"), "obsolete gpu_gqa_attn symbol present");
 	assert!(!common.contains("gpu_mla_attn"), "obsolete gpu_mla_attn symbol present");
 }

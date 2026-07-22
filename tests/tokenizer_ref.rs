@@ -36,14 +36,14 @@ fn spm_tokenization_matches_llama_cpp() {
 		.filter(|(i, t)| encode(t) == expected[*i])
 		.count();
 
+	eprintln!("spm parity: {matched}/{}", texts.len());
 	assert!(
-		matched >= 26,
+		matched >= 31,
 		"SPM/llama.cpp tokenizer parity regressed below the documented baseline: {matched}/46 match"
 	);
-	assert_ne!(
+	assert_eq!(
 		encode("Hello world"),
 		vec![15043u32, 3186],
-		"recipe-infer now matches llama.cpp SPM for 'Hello world' -- the tokenizer was fixed; \
-		 raise the parity floor above and update the KNOWN GAP note"
+		"'Hello world' must encode to llama.cpp's SPM ids; this probe was fixed and is locked"
 	);
 }
