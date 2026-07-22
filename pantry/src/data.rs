@@ -1,9 +1,8 @@
 use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
-use recipe_infer::log::{Errored, Write, data};
+use ogdl::log::{Errored, Write, data};
 use std::borrow::Cow;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -14,7 +13,6 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 const NLB: u8 = 10;
 
@@ -457,18 +455,11 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 	};
 	let total: usize = images.values().map(|v| v.len()).sum();
 	Write::line(data, &format!("found images in {}", short_path(dir)));
-	let pb = ProgressBar::new(total as u64);
-	pb.set_style(
-		ProgressStyle::with_template("    {msg} {per_sec} {elapsed} [{bar:30}] {pos}/{len}")
-			.map_err(|e| Errored::new(format!("progress template: {e}")))?
-			.progress_chars("=>-"),
-	);
-	pb.enable_steady_tick(Duration::from_millis(120));
 	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())
 		.unwrap_or(dir);
-	pb.set_message(format!("decoding images in /{leaf}"));
+	let pb = Write::progress(format!("decoding images in /{leaf}"), total as u64);
 	let leaf = Path::new(dir)
 		.file_name()
 		.and_then(|s| s.to_str())
@@ -498,7 +489,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 					vec![f64::NAN; dim]
 				}
 			};
-			pb.inc(1);
+			pb.tick();
 			StemPixels { stem, pixels: px }
 		})
 		.collect();

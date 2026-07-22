@@ -1,6 +1,7 @@
-use crate::enums::{Activation, LayerKind, LayerSpec};
-use crate::{Param, download_scalar, download_vec};
-pub use recipe_ir::{ConcatDims, LayerDims, concat_layer_dims, pinned_vocab};
+use crate::{download_scalar, download_vec};
+use recipe_ir::{
+	Activation, ConcatDims, LayerDims, LayerKind, LayerSpec, Param, concat_layer_dims,
+};
 use anyhow::Context;
 use ogdl::log::{Errored, Write};
 use gpu_core::memory::GpuBuffer;

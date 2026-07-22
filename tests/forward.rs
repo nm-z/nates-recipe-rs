@@ -1,7 +1,7 @@
 use recipe_infer::{
-	Activation, GpuBuffer, LayerKind, LayerParams, SCRATCH_CONSTS, Scratch, download_vec,
-	forward_into, human_bytes,
+	GpuBuffer, LayerParams, SCRATCH_CONSTS, Scratch, download_vec, forward_into, human_bytes,
 };
+use recipe_ir::{Activation, LayerKind};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 

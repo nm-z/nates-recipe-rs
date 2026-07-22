@@ -4,12 +4,14 @@ use recipe_runtime::execute::ModelInner;
 use std::cell::RefCell;
 use std::mem;
 
-pub use recipe_infer::{
-	Acc, Accuracy, Activation, Epoch, LayerSpec, Loss, Lr, Metric, R2, Time, bce, ce, elu,
-	focal, gelu, hip, huber, leak, linear, mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
+pub use recipe_ir::metric::{
+	Acc, Accuracy, Epoch, Lr, R2, Time, bce, ce, elu, focal, gelu, hip, huber, leak, linear,
+	mae, mse, prelu, relu, selu, sig, silu, swish, tanh,
 };
+pub use recipe_ir::metric::Loss;
+pub use recipe_ir::{Activation, LayerSpec, Loss, Metric};
 
-pub use recipe_infer::Param;
+pub use recipe_ir::Param;
 
 impl IntoLayer for usize {
 	fn into_layer(self) -> LayerSpec {

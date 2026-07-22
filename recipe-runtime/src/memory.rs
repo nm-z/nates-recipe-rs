@@ -3,13 +3,15 @@ use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::{Write, gpu};
 use gpu_core::memory::GpuBuffer;
-use recipe_infer::{Activation, LayerKind, LayerParams, Loss, Scratch};
+use recipe_infer::{LayerParams, Scratch};
+use recipe_ir::{Activation, LayerKind, Loss};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process;
@@ -174,11 +176,20 @@ pub fn chunks(n: usize, c: usize) -> impl Iterator<Item = Window> {
 	})
 }
 
+pub fn open_rw(path: &Path) -> io::Result<File> {
+	fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.open(path)
+}
+
 fn open_spill() -> anyhow::Result<File> {
 	let path = crate::machine::data_dir()
 		.context("spill dir")?
 		.join(".recipe_spill");
-	let f = recipe_infer::bridge::open_rw(&path).context("open spill file")?;
+	let f = open_rw(&path).context("open spill file")?;
 	drop(fs::remove_file(&path));
 	Ok(f)
 }
@@ -443,8 +454,20 @@ struct Lane {
 	worker: Option<thread::JoinHandle<anyhow::Result<()>>>,
 }
 
-fn make_chan(depth: usize) -> gpu_core::bridge::Chan<WriteMsg> {
-	gpu_core::bridge::sync_chan::<WriteMsg>(depth)
+struct Chan<T> {
+	tx: mpsc::SyncSender<T>,
+	rx: mpsc::Receiver<T>,
+}
+
+#[must_use]
+#[inline]
+fn sync_chan<T>(depth: usize) -> Chan<T> {
+	let (tx, rx) = mpsc::sync_channel::<T>(depth);
+	return Chan { tx, rx };
+}
+
+fn make_chan(depth: usize) -> Chan<WriteMsg> {
+	sync_chan::<WriteMsg>(depth)
 }
 
 struct Writer {
@@ -677,7 +700,7 @@ fn sweep_start() -> SweepStart {
 
 impl Ooc {
 	pub fn min_bytes(
-		dims: &[recipe_infer::LayerDims],
+		dims: &[recipe_ir::LayerDims],
 		n: usize,
 		concat_ac: Option<ConcatAc>,
 	) -> usize {

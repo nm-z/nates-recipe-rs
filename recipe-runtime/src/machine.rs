@@ -30,6 +30,25 @@ pub fn max_cube_mnk(vram: u64) -> u64 {
 	return vram.saturating_sub(USER_GB as u64);
 }
 
+#[inline]
+pub fn ram_probe_ask() -> Option<i32> {
+	return gpu_core::memory::ram_probe_ask();
+}
+
+#[must_use]
+pub fn flash_ran() -> bool {
+	return gpu_core::infer_ops::flash_ran();
+}
+
+#[must_use]
+pub fn l2_tiled() -> bool {
+	return gpu_core::infer_ops::l2_tiled();
+}
+
+pub fn mall_present() -> bool {
+	return gpu_core::hip::mall_present();
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
 	pub host: String,
@@ -557,7 +576,7 @@ fn bench_disk(dir: &Path, bytes: usize) -> Result<f64> {
 	let mut buf = vec![0u8; bytes];
 	par_touch(&mut buf);
 	let path = dir.join(".recipe_probe");
-	let f = recipe_infer::bridge::open_rw(&path)?;
+	let f = crate::memory::open_rw(&path)?;
 	let tw = Instant::now();
 	f.write_all_at(&buf, 0)?;
 	f.sync_all()?;

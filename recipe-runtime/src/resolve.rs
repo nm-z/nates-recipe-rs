@@ -1,7 +1,7 @@
 use crate::execute::ModelInner;
 use ogdl::log::{Write, gpu, prompt};
 use pantry::encode::Dataset;
-use recipe_infer::{LayerSpec, Loss};
+use recipe_ir::{LayerSpec, Loss};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;

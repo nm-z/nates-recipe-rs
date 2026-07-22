@@ -11,5 +11,7 @@ categories = ["parser-implementations", "encoding"]
 
 [lib]
 name = "ogdl"
+[dependencies]
+libc = "0.2"
 [lints]
 workspace = true

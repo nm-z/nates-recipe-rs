@@ -1,6 +1,6 @@
 use crate::api::{InferOnly, ModelArg, RunArg, SavePath};
 use ogdl::log::Write;
-use recipe_infer::LogItem;
+use recipe_ir::LogItem;
 use recipe_runtime::execute::{LastRun, ModelInner, RunMeta, TrainCfg};
 use std::cell::RefCell;
 

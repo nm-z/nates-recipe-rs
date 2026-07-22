@@ -1,4 +1,4 @@
-use recipe_infer::log::{Errored, Write, data};
+use ogdl::log::{Errored, Write, data};
 
 use crate::data::DirGroup;
 use crate::{Attr, Kind, Mat, Vec1};

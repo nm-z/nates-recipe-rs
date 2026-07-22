@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 recipe-infer = { path = "../recipe-infer" }
+recipe-ir = { path = "../recipe-ir" }
+ogdl = { path = "../ogdl" }
 anyhow = "1"
 csv = "1"
 ndarray = "0.16"
@@ -27,6 +29,5 @@ zip = "2"
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1"
-indicatif = { version = "0.17", features = ["rayon"] }
 [lints]
 workspace = true

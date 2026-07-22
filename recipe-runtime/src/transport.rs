@@ -1,7 +1,6 @@
 use crate::machine::Machine;
 use anyhow::{Result, bail, ensure};
 use ogdl::log::{Write, net};
-use recipe_infer::bridge::{Chan, chan, recv_from};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -14,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::process;
 use std::slice;
 use std::str::from_utf8;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +29,34 @@ const BEACON_MAGIC: u32 = 0x5243_5042;
 const BEACON_SECS: u64 = 2;
 const STALE_MS: u128 = 3 * BEACON_SECS as u128 * 1000;
 const CONNECT_TIMEOUT_SECS: u64 = 2;
+
+struct Chan<T> {
+	tx: Sender<T>,
+	rx: Receiver<T>,
+}
+
+fn chan<T>() -> Chan<T> {
+	let (tx, rx) = mpsc::channel();
+	Chan { tx, rx }
+}
+
+struct Recv {
+	n: usize,
+	from: SocketAddr,
+}
+
+fn recv_from(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<Recv> {
+	let (n, from) = sock.recv_from(buf)?;
+	Ok(Recv { n, from })
+}
+
+fn broadcast_on(s: &UdpSocket) -> io::Result<()> {
+	s.set_broadcast(true)
+}
+
+fn nodelay_on(s: &TcpStream) -> io::Result<()> {
+	s.set_nodelay(true)
+}
 
 pub const FN_MOE_FFN: u16 = 1;
 
@@ -267,7 +294,7 @@ fn beacon_loop(machine: Option<Arc<Machine>>) {
 			let Ok(s) = UdpSocket::bind(bind) else {
 				continue;
 			};
-			drop(recipe_infer::bridge::broadcast_on(&s));
+			drop(broadcast_on(&s));
 			let kind = match i.link {
 				Link::Wireless => "wlan",
 				Link::Wired => "eth",
@@ -518,7 +545,7 @@ impl Conn {
 			.ok_or_else(|| anyhow::anyhow!("wire: {addr} resolves to nothing"))?;
 		let stream =
 			TcpStream::connect_timeout(&sa, Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
-		recipe_infer::bridge::nodelay_on(&stream)?;
+		nodelay_on(&stream)?;
 		let reader = stream.try_clone()?;
 		let pending: Arc<Mutex<HashMap<u32, Sender<Frame>>>> =
 			Arc::new(Mutex::new(HashMap::new()));
@@ -721,7 +748,7 @@ impl Server {
 	}
 
 	fn handle(&self, mut s: TcpStream) -> Result<()> {
-		recipe_infer::bridge::nodelay_on(&s)?;
+		nodelay_on(&s)?;
 		loop {
 			let f = match read_frame(&mut s) {
 				Ok(f) => f,

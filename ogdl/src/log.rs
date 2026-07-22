@@ -13,6 +13,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write as _;
+use std::os::unix::io::AsRawFd as _;
 use std::process;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -207,5 +208,27 @@ impl fmt::Debug for Errored {
 }
 
 impl error::Error for Errored {}
+
+pub fn redirect_stderr(file: &File) -> i32 {
+	// SAFETY: dup(2) then dup2 onto fd 2; on success fd 2 aliases file and the
+	unsafe {
+		let saved = libc::dup(2);
+		if saved >= 0 {
+			libc::dup2(file.as_raw_fd(), 2);
+		}
+		return saved;
+	}
+}
+
+pub fn restore_stderr(saved: i32) {
+	if saved < 0 {
+		return;
+	}
+	// SAFETY: saved is a live dup of the original fd 2; dup2 reinstates it and close releases the dup.
+	unsafe {
+		libc::dup2(saved, 2);
+		libc::close(saved);
+	}
+}
 
 pub mod Write;

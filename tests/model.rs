@@ -2,6 +2,7 @@ use gpu_core::kernels;
 use recipe_runtime::execute::StepScalars;
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
+use recipe_ir::{Activation, ConcatDims, LayerKind, LayerSpec};
 use std::env;
 use std::fs;
 use std::path::Path;

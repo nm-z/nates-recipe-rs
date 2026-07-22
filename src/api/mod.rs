@@ -6,7 +6,7 @@ pub mod infer;
 use crate::api::data::{Data, parked_data};
 use crate::api::model::{Model, parked_model};
 use pantry::encode::Dataset;
-use recipe_infer::LayerSpec;
+use recipe_ir::LayerSpec;
 
 pub trait IntoLayer {
 	fn into_layer(self) -> LayerSpec;

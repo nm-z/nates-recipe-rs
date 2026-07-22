@@ -7,10 +7,11 @@ use ogdl::log::{
 };
 use pantry::encode::Dataset;
 use recipe_infer::{
-	LayerParams, LayerSpec, Loss, Metric, Param, PlanMode, SCRATCH_CONSTS, Scaler, Scratch,
-	concat_layer, infer_scored, load_ogdl, load_ogdl_str, metric_fmt, metric_gpu_into,
-	metric_pinned_slot, metric_render, pinned_vocab, plan_layer_params, zscore_apply_views,
+	LayerParams, PlanMode, SCRATCH_CONSTS, Scaler, Scratch, concat_layer, infer_scored,
+	load_ogdl, load_ogdl_str, metric_fmt, metric_gpu_into, metric_pinned_slot, metric_render,
+	plan_layer_params, zscore_apply_views,
 };
+use recipe_ir::{LayerSpec, Loss, Metric, Param, pinned_vocab};
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
@@ -1250,7 +1251,7 @@ impl ModelInner {
 		let y_off = stage.push(&yp.y_flat);
 		let image = stage.into_host();
 		let image_floats = image.len();
-		let ac_pre = recipe_infer::concat_layer_dims(&plan.dims())
+		let ac_pre = recipe_ir::concat_layer_dims(&plan.dims())
 			.map(|d| crate::memory::ConcatAc { a: d.a, c: d.c });
 		let need = image_floats * size_of::<f64>() + crate::memory::Ooc::min_bytes(&plan.dims(), n, ac_pre);
 		let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)

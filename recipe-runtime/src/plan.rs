@@ -1,7 +1,7 @@
 use crate::execute::ModelInner;
 use pantry::encode::Dataset;
-use recipe_infer::{LayerParams, LayerSpec, pinned_vocab, vram_estimate};
-use recipe_ir::{Activation, LayerKind};
+use recipe_infer::{LayerParams, vram_estimate};
+use recipe_ir::{Activation, LayerKind, LayerSpec, pinned_vocab};
 pub use recipe_ir::Work;
 
 pub struct CatShape {

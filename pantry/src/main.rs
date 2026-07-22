@@ -1,5 +1,5 @@
 use anyhow::Result;
-use recipe_infer::log::{Opt, Write, data, set_opt};
+use ogdl::log::{Opt, Write, data, set_opt};
 use std::env;
 use std::process::ExitCode;
 

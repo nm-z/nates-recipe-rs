@@ -1,6 +1,6 @@
-use crate::enums::{Activation, LayerKind, Loss, Metric};
-use crate::params::{ConcatDims, LayerParams, concat_layer};
+use crate::params::{LayerParams, concat_layer};
 use crate::scratch::Scratch;
+use recipe_ir::{Activation, ConcatDims, LayerKind, Loss, Metric};
 use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::Write;

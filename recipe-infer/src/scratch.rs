@@ -1,5 +1,5 @@
-use crate::enums::{Activation, LayerKind, LayerSpec};
-use crate::params::{ConcatDims, LayerDims, LayerParams, concat_layer};
+use crate::params::{LayerParams, concat_layer};
+use recipe_ir::{Activation, ConcatDims, LayerDims, LayerKind, LayerSpec};
 use anyhow::Context;
 use gpu_core::kernels;
 use ogdl::log::Write;
@@ -617,7 +617,7 @@ impl Scratch {
 		}
 		floats += 2 * bw(max_dd);
 		floats += 2 * bw(if has_prelu { max_act } else { 1 }) + 1;
-		match crate::params::concat_layer_dims(params) {
+		match recipe_ir::concat_layer_dims(params) {
 			Some(ConcatDims { a, c, .. }) => {
 				floats += n * (a + c) + bw(n * a);
 			}

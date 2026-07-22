@@ -6,13 +6,17 @@ use ratatui::style::{Color, Style};
 use ratatui::symbols::{self, Marker};
 use ratatui::text::Span;
 use ratatui::widgets::{Axis, Block, Chart, Dataset as ChartDataset, GraphType, Paragraph};
-use recipe_infer::{Metric, Pt, pt};
+use recipe_ir::Metric;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal};
 use std::mem;
 use std::path::Path;
 
 pub(crate) use ogdl::log::palette;
+type Pt = (f64, f64);
+fn pt(x: f64, y: f64) -> Pt {
+	(x, y)
+}
 enum CellFix {
 	Fill,
 	Corner,
@@ -239,7 +243,7 @@ impl Drop for TermRestore {
 			event::DisableBracketedPaste
 		));
 		ratatui::restore();
-		gpu_core::sys::restore_stderr(self.saved_stderr);
+		ogdl::log::restore_stderr(self.saved_stderr);
 	}
 }
 
@@ -247,7 +251,7 @@ fn redirect_stderr(path: &str) -> i32 {
 	let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
 		return -1;
 	};
-	return gpu_core::sys::redirect_stderr(&file);
+	return ogdl::log::redirect_stderr(&file);
 }
 
 fn new_input() -> TextArea<'static> {
@@ -347,16 +351,16 @@ fn caps_line(loaded: bool) -> Line<'static> {
 		return Line::from(String::new());
 	}
 	let mut caps: Vec<&str> = Vec::new();
-	if gpu_core::infer_ops::flash_ran() {
+	if recipe_runtime::machine::flash_ran() {
 		caps.push("FA");
 	}
 	if recipe_infer::llm::kv_cache_ran() {
 		caps.push("KV cache");
 	}
-	if gpu_core::infer_ops::l2_tiled() {
+	if recipe_runtime::machine::l2_tiled() {
 		caps.push("L2 tiling");
 	}
-	if gpu_core::hip::mall_present() {
+	if recipe_runtime::machine::mall_present() {
 		caps.push("IC");
 	}
 	if caps.is_empty() {

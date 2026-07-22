@@ -7,9 +7,6 @@ pub type Mat = ndarray::Array2<f64>;
 pub type Vec1 = ndarray::Array1<f64>;
 
 #[doc(hidden)]
-pub use gpu_core as gpu;
-
-#[doc(hidden)]
 pub use pantry::data;
 
 pub mod api;
@@ -31,7 +28,7 @@ pub use api::model::{
 #[doc(inline)]
 pub use api::train::Train;
 #[doc(inline)]
-pub use recipe_infer::loss as Loss;
+pub use recipe_ir::metric::loss as Loss;
 #[doc(hidden)]
 pub use api::{
 	DataHandle, IntoLayer, ModelArg, ModelHandle, Prepared, RunArg, RunData, SavePath,
