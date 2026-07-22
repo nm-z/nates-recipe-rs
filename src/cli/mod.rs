@@ -1,7 +1,7 @@
 pub mod tui;
 
 use anyhow::Result;
-use ogdl::log::{Errored, Opt, Write, gpu, net, probe, set_opt};
+use ogdl::log::{Opt, Write, net, probe, set_opt};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -165,89 +165,14 @@ pub fn main() -> anyhow::Result<std::process::ExitCode> {
 	if let Some(code) = recipe_runtime::machine::gpu_child_ask() {
 		return Ok(exit_code(code));
 	}
-	if let Some(sz) = env::var_os("VRAM_PROBE") {
-		let n: usize = sz
-			.to_string_lossy()
-			.parse()
-			.map_err(|e| Errored::new(format!("VRAM_PROBE parse: {e}")))?;
-		let code = match gpu_core::memory::GpuBuffer::try_alloc_bytes(n) {
-			Some(held) => {
-				drop(held);
-				0
-			}
-			None => 2,
-		};
+	if let Some(code) = recipe_runtime::memory::vram_probe_ask()? {
 		return Ok(exit_code(code));
 	}
 	if let Some(code) = gpu_core::memory::ram_probe_ask() {
 		return Ok(exit_code(code));
 	}
-	if let Some(it) = env::var_os("SETUP_RACE") {
-		let iters: usize = it
-			.to_string_lossy()
-			.parse()
-			.map_err(|e| Errored::new(format!("SETUP_RACE parse: {e}")))?;
-		gpu_core::hip::set_device(0)?;
-		for i in 0..iters {
-			let x = ndarray::Array2::<f64>::from_elem(ndarray::Ix2(45982, 768), 1.0);
-			let cat = ndarray::Array2::<f64>::from_elem(ndarray::Ix2(45982, 128), 1.0);
-			let mut stage = gpu_core::memory::Stage::new();
-			let x_std = x.as_standard_layout();
-			let x_off =
-				stage.push(x_std.as_slice().ok_or_else(|| Errored::new("x contig"))?);
-			let cat_std = cat.as_standard_layout();
-			let cat_off = stage.push(cat_std
-				.as_slice()
-				.ok_or_else(|| Errored::new("cat contig"))?);
-			let host = stage.into_host();
-			let staged = gpu_core::memory::GpuBuffer::alloc(host.len().max(1))
-				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
-			staged.load(&host)
-				.map_err(|e| Errored::new(format!("setup-race stage: {e}")))?;
-			let xraw = staged.view(x_off, x.len());
-			let craw = staged.view(cat_off, cat.len());
-			let nn = cat.nrows();
-			let cc = cat.ncols();
-			let eps = {
-				let e = gpu_core::memory::GpuBuffer::alloc(1)
-					.map_err(|e| Errored::new(format!("eps: {e}")))?;
-				e.load(&[recipe_infer::ZSCORE_EPS])
-					.map_err(|e| Errored::new(format!("eps load: {e}")))?;
-				e
-			};
-			let mean = gpu_core::memory::GpuBuffer::alloc(cc)
-				.map_err(|e| Errored::new(format!("mean: {e}")))?;
-			let std = gpu_core::memory::GpuBuffer::alloc(cc)
-				.map_err(|e| Errored::new(format!("std: {e}")))?;
-			let xb = gpu_core::memory::GpuBuffer::alloc(nn * cc)
-				.map_err(|e| Errored::new(format!("zscored: {e}")))?;
-			recipe_infer::zscore_fit_into(&craw, nn, cc, &eps, &mean, &std, &xb)?;
-			let lse = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
-				.map_err(|e| Errored::new(format!("lse: {e}")))?;
-			let dsum = gpu_core::memory::GpuBuffer::alloc(45982 * 3072)
-				.map_err(|e| Errored::new(format!("dsum: {e}")))?;
-			let mut fills = Vec::new();
-			while let Some(b) = gpu_core::memory::GpuBuffer::try_alloc_bytes(256 << 20) {
-				fills.push(b);
-			}
-			let mut probe1k = vec![0u8; 1024];
-			lse.download_u8(&mut probe1k)
-				.map_err(|e| Errored::new(format!("d2h under pressure: {e}")))?;
-			drop(xraw);
-			drop(craw);
-			drop(xb);
-			drop(lse);
-			drop(dsum);
-			drop(fills);
-			drop(staged);
-			drop(eps);
-			drop(mean);
-			drop(std);
-			gpu_core::memory::pool_trim();
-			Write::line(gpu, &format!("setup-race iter {i}: clean"));
-		}
-		gpu_core::kernels::gpu_shutdown();
-		return Ok(exit_code(0));
+	if let Some(code) = recipe_runtime::execute::setup_race_ask()? {
+		return Ok(exit_code(code));
 	}
 	let args: Vec<String> = env::args().collect();
 	let cmd = match args.get(1) {

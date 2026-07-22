@@ -24,6 +24,24 @@ static DISK_W_BYTES: AtomicUsize = AtomicUsize::new(0);
 static NET_R_BYTES: AtomicUsize = AtomicUsize::new(0);
 static NET_W_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+pub fn vram_probe_ask() -> anyhow::Result<Option<i32>> {
+	let Some(sz) = std::env::var_os("VRAM_PROBE") else {
+		return Ok(None);
+	};
+	let n: usize = sz
+		.to_string_lossy()
+		.parse()
+		.map_err(|e| ogdl::log::Errored::new(format!("VRAM_PROBE parse: {e}")))?;
+	let code = match GpuBuffer::try_alloc_bytes(n) {
+		Some(held) => {
+			drop(held);
+			0
+		}
+		None => 2,
+	};
+	Ok(Some(code))
+}
+
 type HostPool = Arc<Mutex<Vec<Vec<u8>>>>;
 
 pub struct Window {

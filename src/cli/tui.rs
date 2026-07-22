@@ -12,12 +12,7 @@ use std::io::{self, IsTerminal};
 use std::mem;
 use std::path::Path;
 
-#[derive(Clone, Copy)]
-pub(crate) struct Rgb {
-	pub(crate) r: u8,
-	pub(crate) g: u8,
-	pub(crate) b: u8,
-}
+pub(crate) use ogdl::log::palette;
 enum CellFix {
 	Fill,
 	Corner,
@@ -27,74 +22,9 @@ struct Found {
 	cx: u16,
 	style: Style,
 }
-const PALETTE: [Rgb; 12] = [
-	Rgb {
-		r: 242,
-		g: 40,
-		b: 60,
-	},
-	Rgb {
-		r: 39,
-		g: 125,
-		b: 255,
-	},
-	Rgb {
-		r: 0,
-		g: 174,
-		b: 107,
-	},
-	Rgb {
-		r: 255,
-		g: 194,
-		b: 0,
-	},
-	Rgb {
-		r: 215,
-		g: 46,
-		b: 130,
-	},
-	Rgb {
-		r: 135,
-		g: 90,
-		b: 251,
-	},
-	Rgb {
-		r: 255,
-		g: 122,
-		b: 0,
-	},
-	Rgb {
-		r: 91,
-		g: 192,
-		b: 235,
-	},
-	Rgb {
-		r: 157,
-		g: 121,
-		b: 188,
-	},
-	Rgb {
-		r: 46,
-		g: 83,
-		b: 57,
-	},
-	Rgb {
-		r: 3,
-		g: 252,
-		b: 186,
-	},
-	Rgb {
-		r: 194,
-		g: 1,
-		b: 20,
-	},
-];
 pub fn paint(i: usize, t: impl std::fmt::Display) -> String {
 	let c = palette(i);
 	return format!("\x1b[38;2;{};{};{}m{t}\x1b[0m", c.r, c.g, c.b);
-}
-pub(crate) fn palette(i: usize) -> Rgb {
-	PALETTE[i % PALETTE.len()]
 }
 fn symlog(y: f64) -> f64 {
 	Some(())

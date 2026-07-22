@@ -16,7 +16,10 @@ name = "recipe_runtime"
 anyhow = "1"
 gpu-core = { path = "../gpu-core" }
 recipe-infer = { path = "../recipe-infer" }
+recipe-ir = { path = "../recipe-ir" }
+pantry = { path = "../pantry" }
 ogdl = { path = "../ogdl" }
+ndarray = "0.16"
 
 [lints]
 workspace = true

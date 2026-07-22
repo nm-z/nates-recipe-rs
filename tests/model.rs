@@ -32,7 +32,7 @@ fn builders_are_owned_not_leaked() {
 	let cycle = |p: &str| {
 		let _m = Model::new().layer(64).relu().layer(1).loss(mse).lr(0.01);
 		let _t = Train::new().epochs(10).log_every(2);
-		let _d = recipe::dataset::Data::load(p)
+		let _d = recipe::Data::load(p)
 			.split(0.5)
 			.exclude("none")
 			.target("y");
@@ -68,13 +68,13 @@ fn consts_buf() -> GpuBuffer {
 	b
 }
 
-static CHURN: LazyLock<recipe::dataset::Dataset> = LazyLock::new(|| {
+static CHURN: LazyLock<recipe::Dataset> = LazyLock::new(|| {
 	const TRAIN: &str = "examples/datasets/playground-series-s6e3/train.csv";
 	assert!(
 		Path::new(TRAIN).exists(),
 		"{TRAIN} missing — it is committed via Git LFS; run `git lfs pull`",
 	);
-	let data = recipe::dataset::Data::load(TRAIN).target("Churn");
+	let data = recipe::Data::load(TRAIN).target("Churn");
 	data.datasets().train
 });
 
@@ -528,7 +528,7 @@ fn backward_step(
 
 #[test]
 fn gpu_metrics_match_cpu_reference() {
-	let train: &recipe::dataset::Dataset = &CHURN;
+	let train: &recipe::Dataset = &CHURN;
 	gpu_core::hip::set_device(0).expect("set_device");
 	let x = &train.x;
 	let y = &train.y;
@@ -701,7 +701,7 @@ fn gpu_metrics_match_cpu_reference() {
 
 #[test]
 fn fit_loop_memory_flat() {
-	let train: &recipe::dataset::Dataset = &CHURN;
+	let train: &recipe::Dataset = &CHURN;
 	gpu_core::hip::set_device(0).expect("set_device");
 	let x = &train.x;
 	let y = &train.y;
@@ -852,7 +852,7 @@ fn fit_loop_memory_flat() {
 
 #[test]
 fn ping_pong_gradients_match_per_layer() {
-	let train: &recipe::dataset::Dataset = &CHURN;
+	let train: &recipe::Dataset = &CHURN;
 	gpu_core::hip::set_device(0).expect("set_device");
 	let x = &train.x;
 	let y = &train.y;

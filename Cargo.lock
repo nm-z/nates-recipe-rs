@@ -1957,8 +1957,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpu-core",
+ "ndarray",
  "ogdl",
+ "pantry",
  "recipe-infer",
+ "recipe-ir",
 ]
 
 [[package]]

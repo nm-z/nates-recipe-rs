@@ -1,5 +1,6 @@
 use pantry::Kind;
-use recipe::dataset::{Data, Datasets, SafeTable, safetensors_to_table};
+use pantry::encode::{SafeTable, safetensors_to_table};
+use recipe::{Data, Datasets};
 use std::env;
 use std::fs;
 use std::process;

@@ -6,9 +6,11 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error;
 use std::fmt;
+use std::fs;
 use std::mem;
 use std::path::Path;
 
@@ -1243,4 +1245,102 @@ pub struct PreparedTable {
 	pub train: Dataset,
 	pub test: Option<Dataset>,
 	pub attrs: Vec<Attr>,
+}
+
+pub struct CollapsedOnehot {
+	pub x: Mat,
+	pub embed_cols: Vec<usize>,
+	pub vocab: usize,
+}
+
+pub struct SafeTable {
+	pub attrs: Vec<Attr>,
+	pub rows: Vec<Vec<String>>,
+}
+
+pub fn collapse_onehot(ds: &Dataset) -> anyhow::Result<CollapsedOnehot> {
+	let n = ds.x.nrows();
+	let ncols = ds.x.ncols();
+	let mut in_group: BTreeSet<usize> = BTreeSet::new();
+	for grp in &ds.onehot_groups {
+		for c in grp.start..grp.start + grp.len {
+			in_group.insert(c);
+		}
+	}
+	let passthrough: Vec<usize> = (0..ncols).filter(|c| !in_group.contains(c)).collect();
+	let n_cat = ds.onehot_groups.len();
+	let new_ncols = passthrough.len() + n_cat;
+	let mut dat = vec![0.0f64; n * new_ncols];
+	for new_j in 0..passthrough.len() {
+		let orig_j = passthrough[new_j];
+		for i in 0..n {
+			dat[i * new_ncols + new_j] = ds.x[[i, orig_j]];
+		}
+	}
+	let embed_start = passthrough.len();
+	let mut offset = 0usize;
+	let spans = &ds.onehot_groups;
+	for g in 0..spans.len() {
+		let grp = &spans[g];
+		let new_j = embed_start + g;
+		for i in 0..n {
+			let Some(c) = (0..grp.len).find(|&c| ds.x[[i, grp.start + c]] > 0.5) else {
+				continue;
+			};
+			dat[i * new_ncols + new_j] = (offset + c) as f64;
+		}
+		offset += grp.len;
+	}
+	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
+	let x = Mat::from_shape_vec([n, new_ncols], dat)
+		.map_err(|e| anyhow::anyhow!("collapse_onehot: {e:#}"))?;
+	Ok(CollapsedOnehot {
+		x,
+		embed_cols,
+		vocab: offset,
+	})
+}
+
+pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
+	let bytes = fs::read(path).map_err(|e| anyhow::anyhow!("safetensors: read {path}: {e}"))?;
+	let tensors = recipe_infer::safetensors::parse_safetensors_shaped(&bytes)
+		.map_err(|e| anyhow::anyhow!("safetensors: {path}: {e}"))?;
+	anyhow::ensure!(!tensors.is_empty(), "safetensors: {path} has no tensors");
+	let n = {
+		let head = &tensors[0];
+		let hname = &head.name;
+		head.shape.first().copied().ok_or_else(|| {
+			anyhow::anyhow!("safetensors: tensor '{hname}' has no leading row dim")
+		})?
+	};
+	let mut attrs = Vec::new();
+	let mut cols: Vec<Vec<f64>> = Vec::new();
+	for t in &tensors {
+		let name = &t.name;
+		let shape = &t.shape;
+		let vals = &t.values;
+		let leading = shape.first().copied().unwrap_or(0);
+		anyhow::ensure!(
+			leading == n,
+			"safetensors: tensor '{name}' leading dim {leading} != {n}"
+		);
+		let width = shape.iter().skip(1).product::<usize>().max(1);
+		for c in 0..width {
+			let aname = match width.cmp(&1) {
+				Ordering::Equal => name.clone(),
+				Ordering::Less | Ordering::Greater => {
+					format!("{name}:{c}")
+				}
+			};
+			attrs.push(Attr {
+				name: aname,
+				kind: Kind::Numeric,
+			});
+			cols.push((0..n).map(|i| vals[i * width + c]).collect());
+		}
+	}
+	let rows = (0..n)
+		.map(|i| cols.iter().map(|col| format!("{}", col[i])).collect())
+		.collect();
+	Ok(SafeTable { attrs, rows })
 }

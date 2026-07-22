@@ -12,36 +12,33 @@ pub use gpu_core as gpu;
 #[doc(hidden)]
 pub use pantry::data;
 
-#[doc(hidden)]
-#[path = "utils/dataset.rs"]
-pub mod dataset;
+pub mod api;
 
 pub mod cli;
 
+#[doc(inline)]
+pub use api::data::Data;
 #[doc(hidden)]
-#[path = "utils/train.rs"]
-pub mod train;
-
-#[doc(hidden)]
-#[path = "utils/model.rs"]
-pub mod model;
+pub use api::data::{Dataset, Datasets};
 
 #[doc(inline)]
-pub use dataset::Data;
-#[doc(hidden)]
-pub use dataset::Dataset;
-
+pub use api::infer::Infer;
 #[doc(inline)]
-pub use model::{
-	Acc, Accuracy, Epoch, Infer, Lr, Model, R2, Time, Train, attn, bce, ce,
-	embed, focal, hip, huber, mae, mse,
+pub use api::model::{
+	Acc, Accuracy, Epoch, Lr, Model, R2, Time, attn, bce, ce, embed, focal, hip, huber, mae,
+	mse,
 };
+#[doc(inline)]
+pub use api::train::Train;
 #[doc(inline)]
 pub use recipe_infer::loss as Loss;
 #[doc(hidden)]
-pub use model::{
-	DataHandle, IntoLayer, ModelArg, ModelHandle, Prepared, RunArg,
-	RunData, SavePath, elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
+pub use api::{
+	DataHandle, IntoLayer, ModelArg, ModelHandle, Prepared, RunArg, RunData, SavePath,
+};
+#[doc(hidden)]
+pub use api::model::{
+	elu, gelu, leak, linear, prelu, relu, selu, sig, silu, swish, tanh,
 };
 pub use ogdl::ogdl;
 pub use recipe_ir::{Activation, LayerKind, LayerSpec, Loss, Metric, Param};
