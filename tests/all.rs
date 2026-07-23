@@ -186,14 +186,21 @@ fn run() -> i32 {
 		None => return fatal("another suite run already holds target/.suite.lock"),
 	};
 
+	errline(&paint(CYAN, "[S] building test binaries (release)", tty(2)));
 	let binaries = match discover_binaries() {
 		Ok(b) => b,
 		Err(e) => return fatal(&format!("discovery failed: {e}")),
 	};
+	errline(&paint(CYAN, "[S] building probe", tty(2)));
 	let probe = match build_probe() {
 		Ok(p) => p,
 		Err(e) => return fatal(&format!("probe build failed: {e}")),
 	};
+	errline(&paint(
+		CYAN,
+		&format!("[S] enumerating {} binaries", binaries.len()),
+		tty(2),
+	));
 	let mut tests: Vec<Test> = Vec::new();
 	for (pkg, target, exe, cwd) in &binaries {
 		let (names, ignored) = match list_tests(exe, cwd) {
