@@ -138,16 +138,83 @@ fn empty_dataset() -> Dataset {
 enum FileFormat {
 	Arff,
 	Safetensors,
+	Structured,
 	Table,
 }
 
+const STRUCTURED_EXTS: &[&str] = &[
+	"json", "jsonl", "ndjson", "parquet", "arrow", "feather",
+	"npy", "npz", "h5", "hdf5", "xlsx", "xls", "xlsb", "ods",
+	"mat", "tfrecord", "avro",
+];
+
 fn file_format(path: &str) -> FileFormat {
-	let ext = Path::new(path).extension().and_then(|e| e.to_str());
-	let arff = ext.filter(|e| *e == "arff").and(Some(FileFormat::Arff));
-	let safet = ext
-		.filter(|e| *e == "safetensors")
-		.and(Some(FileFormat::Safetensors));
-	arff.or(safet).unwrap_or(FileFormat::Table)
+	let ext = Path::new(path)
+		.extension()
+		.and_then(|e| e.to_str())
+		.map(|e| e.to_ascii_lowercase());
+	let ext_ref = ext.as_deref().unwrap_or("");
+	if ext_ref == "arff" {
+		return FileFormat::Arff;
+	}
+	if ext_ref == "safetensors" {
+		return FileFormat::Safetensors;
+	}
+	if STRUCTURED_EXTS.contains(&ext_ref) {
+		return FileFormat::Structured;
+	}
+	return FileFormat::Table;
+}
+
+fn datavecs_to_table(vecs: Vec<pantry::formats::DataVec>) -> (Vec<Attr>, Vec<Vec<String>>) {
+	use pantry::formats::DataType;
+	let nrows = vecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
+	let attrs: Vec<Attr> = vecs.iter().map(|v| {
+		let kind = match v.kind {
+			DataType::Numeric => Kind::Numeric,
+			DataType::Temporal => Kind::Temporal,
+			DataType::Image => Kind::Image,
+			DataType::Categoric => {
+				let mut cats: Vec<String> = v.values.iter()
+					.filter(|s| !s.is_empty())
+					.cloned()
+					.collect::<std::collections::BTreeSet<_>>()
+					.into_iter()
+					.collect();
+				cats.sort();
+				Kind::Categorical(cats)
+			}
+			DataType::Ordinal => {
+				let mut vals: Vec<String> = v.values.iter()
+					.filter(|s| !s.is_empty())
+					.cloned()
+					.collect::<std::collections::BTreeSet<_>>()
+					.into_iter()
+					.collect();
+				vals.sort();
+				Kind::Ordinal(vals)
+			}
+			DataType::Text => {
+				let vocab: Vec<String> = v.values.iter()
+					.flat_map(|s| s.split(|c: char| !c.is_alphanumeric()))
+					.filter(|t| !t.is_empty())
+					.map(String::from)
+					.collect::<std::collections::BTreeSet<_>>()
+					.into_iter()
+					.collect();
+				Kind::Text(vocab)
+			}
+		};
+		Attr { name: v.name.clone(), kind }
+	}).collect();
+	let mut rows: Vec<Vec<String>> = Vec::with_capacity(nrows);
+	for r in 0..nrows {
+		let row: Vec<String> = vecs.iter()
+			.map(|v| v.values.get(r).cloned().unwrap_or_default())
+			.collect();
+		rows.push(row);
+	}
+	return (attrs, rows);
 }
 
 impl Data {
@@ -173,6 +240,18 @@ impl Data {
 				}
 				Err(e) => self.inner.defer(e),
 			},
+			FileFormat::Structured => {
+				use pantry::formats::UsrData;
+				let file = pantry::formats::File { path: Path::new(path).to_path_buf() };
+				match file.parse() {
+					Ok(vecs) => {
+						let (attrs, rows) = datavecs_to_table(vecs);
+						self.inner.attrs = attrs;
+						self.inner.rows = rows;
+					}
+					Err(e) => self.inner.defer(e),
+				}
+			}
 			FileFormat::Table => match pantry::detect_kinds(path, recipe_runtime::execute::detector_forward) {
 				Ok(kinds) => self.inner.pre_kinds.extend(kinds),
 				Err(e) => self.inner.defer(e),
