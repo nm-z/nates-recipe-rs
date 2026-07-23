@@ -2,7 +2,7 @@ use crate::Mat;
 use ogdl::log::{Write, data};
 use pantry::encode::exclude_match;
 use pantry::{Attr, Kind};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::env;
@@ -71,6 +71,11 @@ struct PreparedSets {
 	attrs: Vec<Attr>,
 }
 
+struct RawTest {
+	headers: Vec<String>,
+	rows: Vec<Vec<String>>,
+}
+
 struct TypeCount {
 	label: &'static str,
 	count: usize,
@@ -85,14 +90,12 @@ struct CardCount {
 pub struct DataInner {
 	pub target: String,
 	target_names: Vec<String>,
-	pub(crate) attrs: Vec<Attr>,
-	rows: Vec<Vec<String>>,
+	pub(crate) parsed: Vec<pantry::formats::ParsedData>,
 	sources: Vec<String>,
 	test_path: Option<String>,
 	split_frac: Option<f64>,
 	exclude: Vec<String>,
-	raw_test_rows: Option<Vec<Vec<String>>>,
-	raw_test_headers: Option<Vec<String>>,
+	test_raw: OnceCell<Option<RawTest>>,
 	pre_kinds: pantry::encode::PreKinds,
 	deferred: Option<anyhow::Error>,
 }
@@ -102,14 +105,12 @@ impl DataInner {
 		DataInner {
 			target: String::new(),
 			target_names: Vec::new(),
-			attrs: Vec::new(),
-			rows: Vec::new(),
+			parsed: Vec::new(),
 			sources: Vec::new(),
 			test_path: None,
 			split_frac: None,
 			exclude: Vec::new(),
-			raw_test_rows: None,
-			raw_test_headers: None,
+			test_raw: OnceCell::new(),
 			pre_kinds: Vec::new(),
 			deferred: None,
 		}
@@ -134,11 +135,32 @@ fn empty_dataset() -> Dataset {
 	}
 }
 
-fn datavecs_to_table(parsed: pantry::formats::ParsedData) -> (Vec<Attr>, Vec<Vec<String>>) {
-	use pantry::formats::DataType;
-	let vecs = parsed.into_columns();
-	let nrows = vecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
-	let attrs: Vec<Attr> = vecs.iter().map(|v| {
+fn table_from_parsed(sets: &[pantry::formats::ParsedData]) -> (Vec<Attr>, Vec<Vec<String>>) {
+	use pantry::formats::{DataType, DataVec};
+	let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+	for set in sets {
+		for group in &set.groups {
+			for column in &group.columns {
+				*counts.entry(column.name.as_str()).or_default() += 1;
+			}
+		}
+	}
+	let mut named: Vec<(String, &DataVec)> = Vec::new();
+	for set in sets {
+		for group in &set.groups {
+			for column in &group.columns {
+				let collides = counts.get(column.name.as_str()).copied().unwrap_or(0) > 1;
+				let name = if collides && !group.member.is_empty() {
+					format!("{}:{}", group.member, column.name)
+				} else {
+					column.name.clone()
+				};
+				named.push((name, column));
+			}
+		}
+	}
+	let nrows = named.iter().map(|(_n, v)| v.values.len()).max().unwrap_or(0);
+	let attrs: Vec<Attr> = named.iter().map(|(name, v)| {
 		let kind = match v.kind {
 			DataType::Numeric => Kind::Numeric,
 			DataType::Temporal => Kind::Temporal,
@@ -177,12 +199,12 @@ fn datavecs_to_table(parsed: pantry::formats::ParsedData) -> (Vec<Attr>, Vec<Vec
 				Kind::Text(vocab)
 			}
 		};
-		Attr { name: v.name.clone(), kind }
+		Attr { name: name.clone(), kind }
 	}).collect();
 	let mut rows: Vec<Vec<String>> = Vec::with_capacity(nrows);
 	for r in 0..nrows {
-		let row: Vec<String> = vecs.iter()
-			.map(|v| v.values.get(r).cloned().unwrap_or_default())
+		let row: Vec<String> = named.iter()
+			.map(|(_n, v)| v.values.get(r).cloned().unwrap_or_default())
 			.collect();
 		rows.push(row);
 	}
@@ -200,11 +222,7 @@ impl Data {
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
 		match pantry::formats::load(path) {
-			Ok(parsed) => {
-				let (attrs, rows) = datavecs_to_table(parsed);
-				self.inner.attrs = attrs;
-				self.inner.rows = rows;
-			}
+			Ok(parsed) => self.inner.parsed.push(parsed),
 			Err(e) => self.inner.defer(e),
 		}
 		self
@@ -213,21 +231,6 @@ impl Data {
 	pub fn target(mut self, t: impl IntoTargets) -> Data {
 		self.inner.target_names = t.into_targets();
 		self.inner.target = self.inner.target_names.first().cloned().unwrap_or_default();
-		let Some(tp) = self.inner.test_path.clone() else {
-			return self;
-		};
-		let Ok(parsed) = pantry::formats::load(&tp) else {
-			return self;
-		};
-		let (attrs, rows) = datavecs_to_table(parsed);
-		if attrs.is_empty() {
-			return self;
-		}
-		self.inner.raw_test_headers = Some(attrs
-			.into_iter()
-			.map(|a| a.name.trim().to_string())
-			.collect());
-		self.inner.raw_test_rows = Some(rows);
 		self
 	}
 
@@ -260,6 +263,26 @@ impl DataInner {
 
 	fn defer(&mut self, e: anyhow::Error) {
 		self.deferred.get_or_insert(e);
+	}
+
+	fn raw_test(&self) -> Option<&RawTest> {
+		return self.test_raw
+			.get_or_init(|| {
+				let tp = self.test_path.as_ref()?;
+				let parsed = pantry::formats::load(tp).ok()?;
+				let (attrs, rows) = table_from_parsed(std::slice::from_ref(&parsed));
+				if attrs.is_empty() {
+					return None;
+				}
+				return Some(RawTest {
+					headers: attrs
+						.into_iter()
+						.map(|a| a.name.trim().to_string())
+						.collect(),
+					rows,
+				});
+			})
+			.as_ref();
 	}
 
 	pub fn datasets(&self) -> Datasets {
@@ -408,11 +431,10 @@ impl DataInner {
 			match &self.test_path {
 				Some(tp) => {
 					let test_raw_cols =
-						self.raw_test_headers.as_ref().map_or(raw_cols, |h| h.len());
+						self.raw_test().map_or(raw_cols, |t| t.headers.len());
 					let test_raw_rows = self
-						.raw_test_rows
-						.as_ref()
-						.map_or(test.x.nrows(), |r| r.len());
+						.raw_test()
+						.map_or(test.x.nrows(), |t| t.rows.len());
 					Write::line(data, &format!("test  {}", short(tp)));
 					Write::line(
 						data,
@@ -453,15 +475,15 @@ impl DataInner {
 			.as_ref()
 			.map(|e| anyhow::anyhow!("{e:#}"))
 			.map_or(Ok(()), Err)?;
-		let mut prepared = match self.attrs.first() {
-			None => self.prepare_table()?,
-			Some(_first) => {
-				let arff = self.prepare_arff()?;
-				PreparedSets {
-					train: arff.train,
-					test: arff.test,
-					attrs: self.attrs.clone(),
-				}
+		let (attrs, rows) = table_from_parsed(&self.parsed);
+		let mut prepared = if attrs.is_empty() {
+			self.prepare_table()?
+		} else {
+			let sets = self.prepare_encoded(&attrs, &rows)?;
+			PreparedSets {
+				train: sets.train,
+				test: sets.test,
+				attrs,
 			}
 		};
 		pantry::encode::clean_dataset(&mut prepared.train)?;
@@ -486,8 +508,8 @@ impl DataInner {
 		Ok(prepared)
 	}
 
-	fn prepare_arff(&self) -> anyhow::Result<Datasets> {
-		let names: Vec<String> = self.attrs.iter().map(|a| a.name.clone()).collect();
+	fn prepare_encoded(&self, attrs: &[Attr], rows: &[Vec<String>]) -> anyhow::Result<Datasets> {
+		let names: Vec<String> = attrs.iter().map(|a| a.name.clone()).collect();
 		let resolved = self.resolve_targets(&names, None)?;
 		let targets: Vec<usize> = resolved
 			.iter()
@@ -498,8 +520,8 @@ impl DataInner {
 			})
 			.collect::<anyhow::Result<Vec<usize>>>()?;
 		let prepared = pantry::encode::prepare_arff_data(
-			&self.attrs,
-			&self.rows,
+			attrs,
+			rows,
 			&targets,
 			&self.exclude,
 			self.split_frac,
@@ -605,10 +627,10 @@ impl crate::api::RunData for DataInner {
 		self.target_names.clone()
 	}
 	fn raw_rows(&self) -> Option<Vec<Vec<String>>> {
-		self.raw_test_rows.clone()
+		self.raw_test().map(|t| t.rows.clone())
 	}
 	fn raw_headers(&self) -> Option<Vec<String>> {
-		self.raw_test_headers.clone()
+		self.raw_test().map(|t| t.headers.clone())
 	}
 	fn infer_only(&self) -> InferOnly {
 		InferOnly::Fit
