@@ -3707,6 +3707,46 @@ impl LayerPlan {
 			Ok(())
 		});
 	}
+
+	pub fn compiled_weight_prefix(&self) -> Vec<f64> {
+		let mut out: Vec<f64> = Vec::new();
+		for e in &self.entries {
+			let we = e.dims.in_dim * e.dims.out_dim;
+			let be = e.dims.out_dim;
+			let mut wbuf = vec![0.0f64; we];
+			let wsrc = &self.host[e.w.off..e.w.off + e.w.len.min(we)];
+			wbuf[..wsrc.len()].copy_from_slice(wsrc);
+			out.extend_from_slice(&wbuf);
+			let mut bbuf = vec![0.0f64; be];
+			let bsrc = &self.host[e.b.off..e.b.off + e.b.len.min(be)];
+			bbuf[..bsrc.len()].copy_from_slice(bsrc);
+			out.extend_from_slice(&bbuf);
+		}
+		return out;
+	}
+
+	pub fn compiled_dump_ogdl(
+		&self,
+		tight: &[f64],
+		key: &str,
+		score: f64,
+	) -> anyhow::Result<String> {
+		let mut host = self.host.clone();
+		let mut off = 0usize;
+		for e in &self.entries {
+			let we = e.dims.in_dim * e.dims.out_dim;
+			let be = e.dims.out_dim;
+			if matches!(e.dims.kind, LayerKind::Dense) {
+				let wl = e.w.len.min(we);
+				host[e.w.off..e.w.off + wl].copy_from_slice(&tight[off..off + wl]);
+				let bl = e.b.len.min(be);
+				host[e.b.off..e.b.off + bl]
+					.copy_from_slice(&tight[off + we..off + we + bl]);
+			}
+			off += we + be;
+		}
+		return self.dump_ogdl_host(&host, key, score);
+	}
 }
 
 pub fn ogdl_text(

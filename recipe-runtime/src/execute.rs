@@ -891,8 +891,6 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 			}
 			if let Some(g) = res.graph {
 				model.forward_graph.borrow_mut().replace(g);
-				Write::error("surrogate training awaits whole-program compilation");
-				return;
 			}
 		}
 		Err(e) => {
@@ -907,7 +905,6 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 	};
 	{
 		{
-			let resume = cfg.resume.as_deref().map(crate::resolve::resolve_path);
 			run_hip
 				.as_ref()
 				.map(|a| {
@@ -918,7 +915,7 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 					)
 				})
 				.unwrap_or(());
-			let __fit = model.fit(ds, cfg, resume.as_deref(), conns);
+			let __fit = run_compiled_train(cfg, ds, model);
 			if !__fit.is_ok() {
 				Write::error(format!(
 					"run: fit: {}",
@@ -967,6 +964,239 @@ pub fn run_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner, meta: RunMeta
 			}
 		}
 	}
+}
+
+unsafe extern "C" {
+	fn hipModuleLoadData(module: *mut *mut std::ffi::c_void, image: *const u8) -> i32;
+	fn hipModuleGetFunction(
+		func: *mut *mut std::ffi::c_void,
+		module: *mut std::ffi::c_void,
+		name: *const i8,
+	) -> i32;
+	fn hipModuleLaunchKernel(
+		func: *mut std::ffi::c_void,
+		grid_x: u32,
+		grid_y: u32,
+		grid_z: u32,
+		block_x: u32,
+		block_y: u32,
+		block_z: u32,
+		shared: u32,
+		stream: *mut std::ffi::c_void,
+		params: *mut *mut std::ffi::c_void,
+		extra: *mut *mut std::ffi::c_void,
+	) -> i32;
+	fn hipModuleUnload(module: *mut std::ffi::c_void) -> i32;
+}
+
+pub fn run_compiled_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner) -> anyhow::Result<()> {
+	let n = ds.x.nrows();
+	let d = ds.x.ncols();
+	let fit_loss = model.resolved_loss();
+	let fit_lr = model.resolved_lr();
+	let classify = fit_loss.is_classification();
+	let vocab = pinned_vocab(&model.specs).unwrap_or(0);
+	let plan = plan_layer_params(&model.specs, d, 0, vocab, &[], PlanMode::Fresh)
+		.map_err(|e| anyhow::anyhow!("compiled: plan_layer_params: {e}"))?;
+	let dims = plan.dims();
+	if dims.is_empty() {
+		anyhow::bail!("compiled: model resolves to zero layers");
+	}
+	let k = plan.out_dim_last().max(1);
+	if model.forward_graph.borrow().is_none() {
+		let g = crate::graph::build_forward_graph(model.id, &dims, fit_loss);
+		model.forward_graph.borrow_mut().replace(g);
+	}
+	let unit = {
+		let gref = model.forward_graph.borrow();
+		let graph = gref
+			.as_ref()
+			.ok_or_else(|| anyhow::anyhow!("compiled: forward graph missing"))?;
+		crate::compile::generate_train_source(graph, &dims, fit_loss, n, k, fit_lr)
+	};
+	let target = crate::compile::detect_target()?;
+	let artifact = crate::compile::compile(&unit, &target)
+		.context("compiled: device program compilation")?;
+	Write::line(
+		device,
+		&format!(
+			"compiled  {:?}  {}  {} bytes",
+			artifact.route,
+			target.arch,
+			artifact.code_object.len()
+		),
+	);
+
+	let wprefix = plan.compiled_weight_prefix();
+	let wp = wprefix.len();
+	let max_out = dims.iter().map(|ld| ld.out_dim).max().unwrap_or(1);
+	let acts_off = wp;
+	let metric_off = acts_off + n * max_out;
+	let x_off = metric_off + 1;
+	let y_off = x_off + n * d;
+	let pad_off = y_off + n * k;
+	let total = pad_off + plan.host().len();
+
+	let x_std = ds.x.as_standard_layout();
+	let xsrc = x_std
+		.as_slice()
+		.ok_or_else(|| anyhow::anyhow!("compiled: x not contiguous"))?;
+	let ysrc = ds
+		.y
+		.as_slice()
+		.ok_or_else(|| anyhow::anyhow!("compiled: y not contiguous"))?;
+
+	let mut image = vec![0.0f64; total];
+	image[..wp].copy_from_slice(&wprefix);
+	let xm = xsrc.len().min(n * d);
+	image[x_off..x_off + xm].copy_from_slice(&xsrc[..xm]);
+	if classify && k > 1 && ysrc.len() == n {
+		for i in 0..n {
+			let c = ysrc[i];
+			if c.is_finite() && (c as usize) < k {
+				image[y_off + i * k + c as usize] = 1.0;
+			}
+		}
+	} else {
+		let ym = ysrc.len().min(n * k);
+		image[y_off..y_off + ym].copy_from_slice(&ysrc[..ym]);
+	}
+	image[pad_off..pad_off + plan.host().len()].copy_from_slice(plan.host());
+
+	let need = total * size_of::<f64>();
+	let slab = gpu_core::memory::adopt_run_backing_with_image(need, &image)
+		.or_else(|| gpu_core::memory::claim_device_arena_with_image(&image))
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"compiled: arena claim failed — need {} claimable {}",
+				pantry::data::human_bytes(need),
+				pantry::data::human_bytes(gpu_core::memory::claimable_bytes()),
+			)
+		})?;
+	let base = slab.view(0, total);
+
+	let entry = std::ffi::CString::new(unit.entry_symbol.as_str())
+		.context("compiled: entry symbol nul")?;
+	let mut module: *mut std::ffi::c_void = ptr::null_mut();
+	let mut func: *mut std::ffi::c_void = ptr::null_mut();
+	// SAFETY: code_object is a valid device image and module is a live out-pointer for this call.
+	let load_rc = unsafe { hipModuleLoadData(&raw mut module, artifact.code_object.as_ptr()) };
+	if load_rc != 0 {
+		gpu_core::memory::park_run_backing(slab);
+		anyhow::bail!("compiled: hipModuleLoadData rc={load_rc}");
+	}
+	// SAFETY: module is a loaded module and entry is a valid nul-terminated symbol name.
+	let fn_rc = unsafe { hipModuleGetFunction(&raw mut func, module, entry.as_ptr()) };
+	if fn_rc != 0 {
+		// SAFETY: module is a live loaded module being released after a failed symbol lookup.
+		unsafe { hipModuleUnload(module) };
+		gpu_core::memory::park_run_backing(slab);
+		anyhow::bail!("compiled: hipModuleGetFunction({}) rc={fn_rc}", unit.entry_symbol);
+	}
+
+	let ss_tot = {
+		let yreg = &image[y_off..y_off + n * k];
+		let cnt = yreg.len().max(1) as f64;
+		let ybar = yreg.iter().sum::<f64>() / cnt;
+		yreg.iter().map(|v| (v - ybar).powi(2)).sum::<f64>()
+	};
+	let arena_ptr = base.ptr_raw();
+	let x_ptr = base.as_ptr_offset(x_off);
+	let y_ptr = base.as_ptr_offset(y_off);
+	let metric_ptr = base.as_ptr_offset(metric_off);
+	let total_epochs = cfg.resolved_epochs().max(1);
+	let start = Instant::now();
+	let mut done = 0usize;
+	let mut last_metric = f64::NAN;
+	while done < total_epochs {
+		let chunk = (total_epochs - done).min(64);
+		let mut a_ptr = arena_ptr;
+		let mut xp = x_ptr;
+		let mut yp = y_ptr;
+		let mut mp = metric_ptr;
+		let mut epochs_i = chunk as i32;
+		let mut bound_i = chunk as i32;
+		let mut kargs: [*mut std::ffi::c_void; 6] = [
+			(&raw mut a_ptr).cast(),
+			(&raw mut xp).cast(),
+			(&raw mut yp).cast(),
+			(&raw mut mp).cast(),
+			(&raw mut epochs_i).cast(),
+			(&raw mut bound_i).cast(),
+		];
+		// SAFETY: func is a valid kernel; kargs holds one pointer per kernel parameter for a 1x1 launch.
+		let rc = unsafe {
+			hipModuleLaunchKernel(
+				func,
+				1,
+				1,
+				1,
+				1,
+				1,
+				1,
+				0,
+				ptr::null_mut(),
+				kargs.as_mut_ptr(),
+				ptr::null_mut(),
+			)
+		};
+		if rc != 0 {
+			// SAFETY: module is a live loaded module being released after a failed launch.
+			unsafe { hipModuleUnload(module) };
+			gpu_core::memory::park_run_backing(slab);
+			anyhow::bail!("compiled: hipModuleLaunchKernel rc={rc}");
+		}
+		gpu_core::hip::device_synchronize().context("compiled: launch sync")?;
+		let mut mo = [0.0f64; 1];
+		base.view(metric_off, 1)
+			.download_host(&mut mo)
+			.context("compiled: metric readback")?;
+		last_metric = mo[0];
+		done += chunk;
+		let r2_val = match ss_tot > 0.0 {
+			true => 1.0 - last_metric * n as f64 / ss_tot,
+			false => f64::NAN,
+		};
+		let elapsed = start.elapsed().as_secs_f64();
+		let vals: Vec<f64> = cfg
+			.metrics
+			.iter()
+			.map(|m| match m {
+				Metric::Epoch => done as f64,
+				Metric::Lr => fit_lr,
+				Metric::Time => elapsed,
+				Metric::Loss => last_metric,
+				Metric::R2 => r2_val,
+				Metric::Accuracy => r2_val,
+			})
+			.collect();
+		metrics_emit("", &cfg.metrics, &vals);
+	}
+
+	let final_score = match ss_tot > 0.0 {
+		true => 1.0 - last_metric * n as f64 / ss_tot,
+		false => f64::NAN,
+	};
+	let key = fit_loss.score_key();
+	let mut wout = vec![0.0f64; wp];
+	base.view(0, wp)
+		.download_host(&mut wout)
+		.context("compiled: weight readback")?;
+	let neurons: usize = dims.iter().map(|ld| ld.out_dim).sum();
+	*model.saved_ogdl.borrow_mut() = Some(SavedWeights {
+		text: plan.compiled_dump_ogdl(&wout, key, final_score)?,
+		neurons,
+		d,
+		c_cat: 0,
+		vocab,
+	});
+	*model.params.borrow_mut() = plan.materialize(&base, pad_off);
+	model.fit_score.set(final_score);
+	model.fit_loss.set(last_metric);
+	// SAFETY: module is a live loaded module being released after all launches completed.
+	unsafe { hipModuleUnload(module) };
+	gpu_core::memory::park_run_backing(slab);
+	return Ok(());
 }
 
 pub fn save_ogdl(model: &ModelInner, score: f64, filter: Option<&[Param]>, path: &str) {
