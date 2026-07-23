@@ -272,7 +272,11 @@ impl File {
 			.with_context(|| format!("failed to parse JSON: {}", self.path.display()))?;
 		return match val {
 			serde_json::Value::Array(arr) => json_values_to_columns(arr),
-			serde_json::Value::Object(_) => json_values_to_columns(vec![val]),
+			serde_json::Value::Object(_) => {
+				let mut rows = Vec::new();
+				collect_json_rows(val, &mut rows);
+				json_values_to_columns(rows)
+			}
 			_ => bail!("JSON root must be object or array: {}", self.path.display()),
 		};
 	}
@@ -309,6 +313,34 @@ fn json_values_to_columns(values: Vec<serde_json::Value>) -> Result<Vec<DataVec>
 				kind: DataType::default(),
 			}]);
 		}
+	};
+}
+
+fn collect_json_rows(val: serde_json::Value, rows: &mut Vec<serde_json::Value>) {
+	match val {
+		serde_json::Value::Object(map) if !map.is_empty() && map.values().all(serde_json::Value::is_object) => {
+			for (_, inner) in map {
+				collect_json_rows(inner, rows);
+			}
+		}
+		serde_json::Value::Object(map) if !map.is_empty() && map.values().all(is_object_array) => {
+			for (_, field) in map {
+				if let serde_json::Value::Array(items) = field {
+					for item in items {
+						collect_json_rows(item, rows);
+					}
+				}
+			}
+		}
+		other => rows.push(other),
+	}
+	return;
+}
+
+fn is_object_array(val: &serde_json::Value) -> bool {
+	return match val {
+		serde_json::Value::Array(arr) => arr.iter().all(serde_json::Value::is_object),
+		_ => false,
 	};
 }
 
@@ -362,8 +394,29 @@ fn json_cell(val: &serde_json::Value) -> String {
 		serde_json::Value::Bool(b) => b.to_string(),
 		serde_json::Value::Number(n) => n.to_string(),
 		serde_json::Value::String(s) => s.clone(),
+		serde_json::Value::Array(_) => {
+			let mut leaves = Vec::new();
+			json_flatten(val, &mut leaves);
+			leaves.join(" ")
+		}
 		other => other.to_string(),
 	};
+}
+
+fn json_flatten(val: &serde_json::Value, leaves: &mut Vec<String>) {
+	match val {
+		serde_json::Value::Null => {}
+		serde_json::Value::Bool(b) => leaves.push(b.to_string()),
+		serde_json::Value::Number(n) => leaves.push(n.to_string()),
+		serde_json::Value::String(s) => leaves.push(s.clone()),
+		serde_json::Value::Array(arr) => {
+			for item in arr {
+				json_flatten(item, leaves);
+			}
+		}
+		other => leaves.push(other.to_string()),
+	}
+	return;
 }
 
 // ─ Parquet + Arrow IPC
