@@ -20,10 +20,6 @@ use std::path::{Path, PathBuf};
 
 pub const P: usize = 2 << 20;
 
-const RESERVE_V: usize = 1 << 30;
-const RESERVE_R: usize = 1 << 30;
-const RESERVE_D: usize = 1 << 30;
-
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum Residence {
@@ -92,7 +88,7 @@ impl Budgets {
 		let vram_data = total
 			.saturating_sub(weights_bytes)
 			.saturating_sub(grad_bytes)
-			.saturating_sub(RESERVE_V);
+			.saturating_sub(crate::memory::USER_GB);
 
 		let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
 		let ram_avail = meminfo
@@ -105,12 +101,12 @@ impl Budgets {
 			.unwrap_or(0);
 		let host_mirror = weights_bytes.saturating_add(grad_bytes);
 		let ram_data = ram_avail
-			.saturating_sub(RESERVE_R)
+			.saturating_sub(crate::memory::USER_GB)
 			.saturating_sub(host_mirror);
 		Write::line(data, format!(
 			"RAM headroom: MemAvailable {:.2} GB, reserve {:.2} GB, host-mirror {:.2} GB, RAM budget {:.2} GB",
 			ram_avail as f64 / 1e9,
-			RESERVE_R as f64 / 1e9,
+			crate::memory::USER_GB as f64 / 1e9,
 			host_mirror as f64 / 1e9,
 			ram_data as f64 / 1e9
 		));
@@ -120,7 +116,7 @@ impl Budgets {
 			.filter(|p| return !p.as_os_str().is_empty())
 			.unwrap_or_else(|| return Path::new("."));
 		let disk_avail = crate::sys::disk_free_bytes(dir);
-		let disk_data = disk_avail.saturating_sub(RESERVE_D);
+		let disk_data = disk_avail.saturating_sub(crate::memory::USER_GB);
 		return Self {
 			vram_data,
 			ram_data,
