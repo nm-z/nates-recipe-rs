@@ -7,7 +7,17 @@ use std::path::{Path, PathBuf};
 // ─
 
 pub trait UsrData {
-	fn parse(&self) -> Result<Vec<DataVec>>;
+	fn parse(&self) -> Result<Vec<DataGroup>>;
+}
+
+pub struct ParsedData {
+	pub source: String,
+	pub groups: Vec<DataGroup>,
+}
+
+pub struct DataGroup {
+	pub member: String,
+	pub columns: Vec<DataVec>,
 }
 
 pub struct DataVec {
@@ -43,75 +53,54 @@ pub struct Zip {
 	pub path: PathBuf,
 }
 
-pub fn load(path: &str) -> Result<Vec<DataVec>> {
+pub fn load(path: &str) -> Result<ParsedData> {
 	let p = PathBuf::from(path);
-	if p.is_dir() {
-		return (Dir { path: p }).parse();
-	}
-	let extension = p.extension()
+	let groups = if p.is_dir() {
+		(Dir { path: p }).parse()?
+	} else if is_zip(&p) {
+		(Zip { path: p }).parse()?
+	} else {
+		(File { path: p }).parse()?
+	};
+	return Ok(ParsedData {
+		source: path.to_string(),
+		groups,
+	});
+}
+
+fn is_zip(p: &Path) -> bool {
+	return p.extension()
 		.and_then(|e| e.to_str())
-		.unwrap_or("")
-		.to_ascii_lowercase();
-	if extension == "zip" {
-		return (Zip { path: p }).parse();
-	}
-	return (File { path: p }).parse();
+		.is_some_and(|e| e.eq_ignore_ascii_case("zip"));
 }
 
-// ─
-
-const USER_GB: usize = 1 << 30;
-
-fn ensure_fits_in_ram(bytes: u64, source: &Path) -> Result<()> {
-	let available = crate::available_ram_bytes();
-	let budget = available.saturating_sub(USER_GB) as u64;
-	if bytes > budget {
-		bail!(
-			"refusing to load {}: {bytes} bytes exceeds loadable RAM ({available} bytes available minus {USER_GB} bytes reserved)",
-			source.display()
-		);
+impl ParsedData {
+	pub fn into_columns(self) -> Vec<DataVec> {
+		let mut counts: HashMap<String, usize> = HashMap::new();
+		for group in &self.groups {
+			for column in &group.columns {
+				*counts.entry(column.name.clone()).or_default() += 1;
+			}
+		}
+		let mut columns = Vec::new();
+		for group in self.groups {
+			let member = group.member;
+			for mut column in group.columns {
+				if counts.get(&column.name).copied().unwrap_or(0) > 1 && !member.is_empty() {
+					column.name = format!("{member}:{}", column.name);
+				}
+				columns.push(column);
+			}
+		}
+		return columns;
 	}
-	return Ok(());
 }
 
-fn dir_total_bytes(path: &Path) -> Result<u64> {
-	let mut total = 0u64;
-	let entries = fs::read_dir(path)
-		.with_context(|| format!("failed to read directory: {}", path.display()))?;
-	for entry in entries.filter_map(|e| e.ok()) {
-		let p = entry.path();
-		let name = p.file_name()
-			.and_then(|n| n.to_str())
-			.unwrap_or("");
-		if name.starts_with('.') || name == "__MACOSX" {
-			continue;
-		}
-		if p.is_dir() {
-			total = total.saturating_add(dir_total_bytes(&p)?);
-		} else {
-			let meta = fs::metadata(&p)
-				.with_context(|| format!("failed to stat {}", p.display()))?;
-			total = total.saturating_add(meta.len());
-		}
-	}
-	return Ok(total);
-}
-
-fn zip_total_bytes(path: &Path) -> Result<u64> {
-	let file = fs::File::open(path)
-		.with_context(|| format!("failed to open zip {}", path.display()))?;
-	let mut archive = zip::ZipArchive::new(file)
-		.with_context(|| format!("failed to read zip {}", path.display()))?;
-	let mut total = 0u64;
-	for i in 0..archive.len() {
-		let entry = archive.by_index_raw(i)
-			.with_context(|| format!("failed to read zip entry {i}"))?;
-		if entry.is_dir() {
-			continue;
-		}
-		total = total.saturating_add(entry.size());
-	}
-	return Ok(total);
+fn single_group(columns: Vec<DataVec>) -> Vec<DataGroup> {
+	return vec![DataGroup {
+		member: String::new(),
+		columns,
+	}];
 }
 
 // ─
@@ -122,53 +111,52 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 
 impl UsrData for File {
-	fn parse(&self) -> Result<Vec<DataVec>> {
-		let size = fs::metadata(&self.path)
-			.with_context(|| format!("failed to stat {}", self.path.display()))?
-			.len();
-		ensure_fits_in_ram(size, &self.path)?;
+	fn parse(&self) -> Result<Vec<DataGroup>> {
+		if is_zip(&self.path) {
+			return (Zip { path: self.path.clone() }).parse();
+		}
 		let extension = self.path.extension()
 			.and_then(|e| e.to_str())
 			.unwrap_or("")
 			.to_ascii_lowercase();
 
-		let mut vectors = match extension.as_str() {
-			"csv" | "tsv" | "txt" | "dat" | "data" => self.parse_csv()?,
-			"arff" => self.parse_arff()?,
-			"safetensors" => self.parse_safetensors()?,
+		let mut groups = match extension.as_str() {
+			"csv" | "tsv" | "txt" | "dat" | "data" => single_group(self.parse_csv()?),
+			"arff" => single_group(self.parse_arff()?),
+			"safetensors" => single_group(self.parse_safetensors()?),
 			"json" => self.parse_json()?,
-			"jsonl" | "ndjson" => self.parse_jsonl()?,
-			"parquet" => self.parse_parquet()?,
-			"arrow" | "feather" => self.parse_arrow()?,
-			"npy" => self.parse_npy()?,
+			"jsonl" | "ndjson" => single_group(self.parse_jsonl()?),
+			"parquet" => single_group(self.parse_parquet()?),
+			"arrow" | "feather" => single_group(self.parse_arrow()?),
+			"npy" => single_group(self.parse_npy()?),
 			"npz" => self.parse_npz()?,
 			"h5" | "hdf5" => self.parse_hdf5()?,
 			"xlsx" | "xls" | "xlsb" | "ods" => self.parse_excel()?,
-			"pptx" => self.parse_pptx()?,
+			"pptx" => single_group(self.parse_pptx()?),
 			"mat" => self.parse_mat()?,
-			"tfrecord" => self.parse_tfrecord()?,
-			"avro" => self.parse_avro()?,
+			"tfrecord" => single_group(self.parse_tfrecord()?),
+			"avro" => single_group(self.parse_avro()?),
 			"db" | "sqlite" => self.parse_sqlite()?,
-			"zip" => (Zip { path: self.path.clone() }).parse()?,
-			ext if IMAGE_EXTENSIONS.contains(&ext) => self.parse_image()?,
+			ext if IMAGE_EXTENSIONS.contains(&ext) => single_group(self.parse_image()?),
 			_ => bail!("unsupported file type: {}", self.path.display()),
 		};
 
-		assign_data_types(&mut vectors)?;
 		let source = self.path.display().to_string();
-		for vector in vectors.iter_mut() {
-			if vector.source.is_empty() {
-				vector.source = source.clone();
+		for group in groups.iter_mut() {
+			assign_data_types(&mut group.columns)?;
+			for vector in group.columns.iter_mut() {
+				if vector.source.is_empty() {
+					vector.source = source.clone();
+				}
 			}
 		}
-		return Ok(vectors);
+		return Ok(groups);
 	}
 }
 
 impl UsrData for Dir {
-	fn parse(&self) -> Result<Vec<DataVec>> {
-		ensure_fits_in_ram(dir_total_bytes(&self.path)?, &self.path)?;
-		let mut vectors = Vec::new();
+	fn parse(&self) -> Result<Vec<DataGroup>> {
+		let mut groups = Vec::new();
 		let mut entries: Vec<PathBuf> = fs::read_dir(&self.path)
 			.with_context(|| format!("failed to read directory: {}", self.path.display()))?
 			.filter_map(|e| e.ok())
@@ -178,40 +166,51 @@ impl UsrData for Dir {
 		for path in entries {
 			let name = path.file_name()
 				.and_then(|n| n.to_str())
-				.unwrap_or("");
+				.unwrap_or("")
+				.to_string();
 			if name.starts_with('.') || name == "__MACOSX" {
 				continue;
 			}
-			let mut parsed = if path.is_dir() {
+			let sub = if path.is_dir() {
 				(Dir { path }).parse()?
+			} else if is_zip(&path) {
+				(Zip { path }).parse()?
 			} else {
 				(File { path }).parse()?
 			};
-			vectors.append(&mut parsed);
+			for mut group in sub {
+				group.member = if group.member.is_empty() {
+					name.clone()
+				} else {
+					format!("{name}/{}", group.member)
+				};
+				groups.push(group);
+			}
 		}
-		return Ok(vectors);
+		return Ok(groups);
 	}
 }
 
 impl UsrData for Zip {
-	fn parse(&self) -> Result<Vec<DataVec>> {
-		ensure_fits_in_ram(zip_total_bytes(&self.path)?, &self.path)?;
+	fn parse(&self) -> Result<Vec<DataGroup>> {
 		let extracted = extract_zip(&self.path)?;
 		struct Guard(PathBuf);
 		impl Drop for Guard {
 			fn drop(&mut self) { fs::remove_dir_all(&self.0).ok(); }
 		}
 		let _cleanup = Guard(extracted.clone());
-		let mut vectors = (Dir { path: extracted.clone() }).parse()?;
+		let mut groups = (Dir { path: extracted.clone() }).parse()?;
 		let zip_path = self.path.display().to_string();
-		for vector in vectors.iter_mut() {
-			let member = match Path::new(&vector.source).strip_prefix(&extracted) {
-				Ok(m) => m.display().to_string(),
-				Err(_e) => continue,
-			};
-			vector.source = format!("{zip_path}/{member}");
+		for group in groups.iter_mut() {
+			for vector in group.columns.iter_mut() {
+				let member = match Path::new(&vector.source).strip_prefix(&extracted) {
+					Ok(m) => m.display().to_string(),
+					Err(_e) => continue,
+				};
+				vector.source = format!("{zip_path}/{member}");
+			}
 		}
-		return Ok(vectors);
+		return Ok(groups);
 	}
 }
 
@@ -237,6 +236,10 @@ pub fn detect_data_type(values: &[String]) -> DataType {
 		return DataType::Text;
 	}
 
+	if looks_ordinal(&non_empty) {
+		return DataType::Ordinal;
+	}
+
 	if non_empty.iter().all(|s| s.parse::<f64>().is_ok()) {
 		return DataType::Numeric;
 	}
@@ -251,6 +254,28 @@ pub fn detect_data_type(values: &[String]) -> DataType {
 	}
 
 	return DataType::Categoric;
+}
+
+fn looks_ordinal(non_empty: &[&str]) -> bool {
+	let mut ints = Vec::with_capacity(non_empty.len());
+	for s in non_empty {
+		let Ok(v) = s.trim().parse::<i64>() else {
+			return false;
+		};
+		ints.push(v);
+	}
+	let distinct: HashSet<i64> = ints.iter().copied().collect();
+	let d = distinct.len();
+	if d < 2 || d == ints.len() {
+		return false;
+	}
+	if d.saturating_mul(d) > ints.len() {
+		return false;
+	}
+	let min = ints.iter().copied().min().unwrap_or(0);
+	let max = ints.iter().copied().max().unwrap_or(0);
+	let span = (max as i128) - (min as i128) + 1;
+	return span < (d as i128) * 2;
 }
 
 fn looks_temporal(s: &str) -> bool {
@@ -362,27 +387,90 @@ impl File {
 			source: String::new(),
 		}]);
 	}
+}
 
-	fn parse_sqlite(&self) -> Result<Vec<DataVec>> {
-		bail!("SQLite loader not yet implemented: {}", self.path.display())
+// ─ SQLite
+
+impl File {
+	fn parse_sqlite(&self) -> Result<Vec<DataGroup>> {
+		let conn = rusqlite::Connection::open_with_flags(
+			&self.path,
+			rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+		)
+		.with_context(|| format!("failed to open sqlite db: {}", self.path.display()))?;
+		let mut tables: Vec<String> = Vec::new();
+		{
+			let mut stmt = conn.prepare(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+			)?;
+			let mut rows = stmt.query([])?;
+			while let Some(row) = rows.next()? {
+				tables.push(row.get(0)?);
+			}
+		}
+		ensure!(!tables.is_empty(), "no tables in sqlite db: {}", self.path.display());
+		let mut groups = Vec::new();
+		for table in tables {
+			let quoted = table.replace('"', "\"\"");
+			let mut headers: Vec<String> = Vec::new();
+			{
+				let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{quoted}\")"))?;
+				let mut rows = stmt.query([])?;
+				while let Some(row) = rows.next()? {
+					headers.push(row.get(1)?);
+				}
+			}
+			ensure!(!headers.is_empty(), "no columns in sqlite table '{table}'");
+			let mut columns: Vec<Vec<String>> = headers.iter().map(|_| Vec::new()).collect();
+			{
+				let mut stmt = conn.prepare(&format!("SELECT * FROM \"{quoted}\""))?;
+				let ncols = stmt.column_count().min(columns.len());
+				let mut rows = stmt.query([])?;
+				while let Some(row) = rows.next()? {
+					for (j, column) in columns.iter_mut().enumerate().take(ncols) {
+						column.push(sqlite_cell(row, j)?);
+					}
+				}
+			}
+			groups.push(DataGroup {
+				member: table,
+				columns: headers.into_iter().zip(columns)
+					.map(|(name, values)| DataVec {
+						name,
+						values,
+						kind: DataType::default(),
+						source: String::new(),
+					})
+					.collect(),
+			});
+		}
+		return Ok(groups);
 	}
+}
+
+fn sqlite_cell(row: &rusqlite::Row<'_>, j: usize) -> Result<String> {
+	use rusqlite::types::ValueRef;
+	let cell = match row.get_ref(j)? {
+		ValueRef::Null => String::new(),
+		ValueRef::Integer(i) => i.to_string(),
+		ValueRef::Real(f) => f.to_string(),
+		ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+		ValueRef::Blob(b) => data_encoding::BASE64.encode(b),
+	};
+	return Ok(cell);
 }
 
 // ─ JSON
 
 impl File {
-	fn parse_json(&self) -> Result<Vec<DataVec>> {
+	fn parse_json(&self) -> Result<Vec<DataGroup>> {
 		let text = fs::read_to_string(&self.path)
 			.with_context(|| format!("failed to read {}", self.path.display()))?;
 		let val: serde_json::Value = serde_json::from_str(&text)
 			.with_context(|| format!("failed to parse JSON: {}", self.path.display()))?;
 		return match val {
-			serde_json::Value::Array(arr) => json_values_to_columns(arr),
-			serde_json::Value::Object(_) => {
-				let mut rows = Vec::new();
-				collect_json_rows(val, &mut rows);
-				json_values_to_columns(rows)
-			}
+			serde_json::Value::Array(arr) => Ok(single_group(json_values_to_columns(arr)?)),
+			serde_json::Value::Object(map) => json_object_to_groups(map),
 			_ => bail!("JSON root must be object or array: {}", self.path.display()),
 		};
 	}
@@ -404,6 +492,88 @@ impl File {
 	}
 }
 
+fn json_object_to_groups(map: serde_json::Map<String, serde_json::Value>) -> Result<Vec<DataGroup>> {
+	if map.is_empty() {
+		return Ok(Vec::new());
+	}
+	if map.values().all(serde_json::Value::is_object) {
+		return json_keyed_objects_to_groups(map);
+	}
+	if map.values().all(is_object_array) {
+		let mut groups = Vec::new();
+		for (member, field) in map {
+			let serde_json::Value::Array(items) = field else { continue };
+			groups.push(DataGroup {
+				member,
+				columns: json_values_to_columns(items)?,
+			});
+		}
+		return Ok(groups);
+	}
+	return Ok(single_group(json_values_to_columns(vec![serde_json::Value::Object(map)])?));
+}
+
+fn json_keyed_objects_to_groups(map: serde_json::Map<String, serde_json::Value>) -> Result<Vec<DataGroup>> {
+	let splits_shape = map.values().all(|v| match v {
+		serde_json::Value::Object(inner) => {
+			!inner.is_empty() && inner.values().all(is_object_array)
+		}
+		_ => false,
+	});
+	if !splits_shape {
+		let mut keys = Vec::with_capacity(map.len());
+		let mut rows = Vec::with_capacity(map.len());
+		for (key, val) in map {
+			keys.push(key);
+			rows.push(val);
+		}
+		let mut columns = vec![key_column(keys)];
+		columns.extend(json_values_to_columns(rows)?);
+		return Ok(single_group(columns));
+	}
+	let mut split_order: Vec<String> = Vec::new();
+	let mut seen: HashSet<String> = HashSet::new();
+	for val in map.values() {
+		if let serde_json::Value::Object(inner) = val {
+			for field in inner.keys() {
+				if seen.insert(field.clone()) {
+					split_order.push(field.clone());
+				}
+			}
+		}
+	}
+	let mut groups = Vec::new();
+	for split in split_order {
+		let mut keys: Vec<String> = Vec::new();
+		let mut rows: Vec<serde_json::Value> = Vec::new();
+		for (key, val) in &map {
+			let Some(serde_json::Value::Array(items)) = val.get(&split) else {
+				continue;
+			};
+			for item in items {
+				keys.push(key.clone());
+				rows.push(item.clone());
+			}
+		}
+		let mut columns = vec![key_column(keys)];
+		columns.extend(json_values_to_columns(rows)?);
+		groups.push(DataGroup {
+			member: split,
+			columns,
+		});
+	}
+	return Ok(groups);
+}
+
+fn key_column(keys: Vec<String>) -> DataVec {
+	return DataVec {
+		name: "key".to_string(),
+		values: keys,
+		kind: DataType::default(),
+		source: String::new(),
+	};
+}
+
 fn json_values_to_columns(values: Vec<serde_json::Value>) -> Result<Vec<DataVec>> {
 	if values.is_empty() {
 		return Ok(Vec::new());
@@ -421,27 +591,6 @@ fn json_values_to_columns(values: Vec<serde_json::Value>) -> Result<Vec<DataVec>
 			}]);
 		}
 	};
-}
-
-fn collect_json_rows(val: serde_json::Value, rows: &mut Vec<serde_json::Value>) {
-	match val {
-		serde_json::Value::Object(map) if !map.is_empty() && map.values().all(serde_json::Value::is_object) => {
-			for (_, inner) in map {
-				collect_json_rows(inner, rows);
-			}
-		}
-		serde_json::Value::Object(map) if !map.is_empty() && map.values().all(is_object_array) => {
-			for (_, field) in map {
-				if let serde_json::Value::Array(items) = field {
-					for item in items {
-						collect_json_rows(item, rows);
-					}
-				}
-			}
-		}
-		other => rows.push(other),
-	}
-	return;
 }
 
 fn is_object_array(val: &serde_json::Value) -> bool {
@@ -479,7 +628,7 @@ fn json_objects_to_columns(values: &[serde_json::Value]) -> Result<Vec<DataVec>>
 }
 
 fn json_arrays_to_columns(values: &[serde_json::Value], width: usize) -> Result<Vec<DataVec>> {
-	let headers: Vec<String> = (0..width).map(|j| format!("col_{j}")).collect();
+	let headers: Vec<String> = (0..width).map(|j| format!("col{}", j + 1)).collect();
 	let mut columns: Vec<Vec<String>> = vec![Vec::with_capacity(values.len()); width];
 	for val in values {
 		let arr = val.as_array();
@@ -501,29 +650,8 @@ fn json_cell(val: &serde_json::Value) -> String {
 		serde_json::Value::Bool(b) => b.to_string(),
 		serde_json::Value::Number(n) => n.to_string(),
 		serde_json::Value::String(s) => s.clone(),
-		serde_json::Value::Array(_) => {
-			let mut leaves = Vec::new();
-			json_flatten(val, &mut leaves);
-			leaves.join(" ")
-		}
 		other => other.to_string(),
 	};
-}
-
-fn json_flatten(val: &serde_json::Value, leaves: &mut Vec<String>) {
-	match val {
-		serde_json::Value::Null => {}
-		serde_json::Value::Bool(b) => leaves.push(b.to_string()),
-		serde_json::Value::Number(n) => leaves.push(n.to_string()),
-		serde_json::Value::String(s) => leaves.push(s.clone()),
-		serde_json::Value::Array(arr) => {
-			for item in arr {
-				json_flatten(item, leaves);
-			}
-		}
-		other => leaves.push(other.to_string()),
-	}
-	return;
 }
 
 // ─ Parquet + Arrow IPC
@@ -637,7 +765,7 @@ impl File {
 		let values = npy_to_f64_strings(payload, &info.descr, total)?;
 		let nrows = info.shape.first().copied().unwrap_or(total);
 		let ncols = if info.shape.len() >= 2 { info.shape[1] } else { 1 };
-		let headers: Vec<String> = (0..ncols).map(|j| format!("col_{j}")).collect();
+		let headers: Vec<String> = (0..ncols).map(|j| format!("col{}", j + 1)).collect();
 		let mut columns: Vec<Vec<String>> = (0..ncols)
 			.map(|_| Vec::with_capacity(nrows))
 			.collect();
@@ -656,12 +784,12 @@ impl File {
 			.collect());
 	}
 
-	fn parse_npz(&self) -> Result<Vec<DataVec>> {
+	fn parse_npz(&self) -> Result<Vec<DataGroup>> {
 		let file = fs::File::open(&self.path)
 			.with_context(|| format!("failed to open {}", self.path.display()))?;
 		let mut archive = zip::ZipArchive::new(file)
 			.with_context(|| format!("failed to read npz: {}", self.path.display()))?;
-		let mut vectors = Vec::new();
+		let mut groups = Vec::new();
 		for i in 0..archive.len() {
 			let mut entry = archive.by_index(i)
 				.with_context(|| format!("failed to read npz entry {i}"))?;
@@ -669,7 +797,7 @@ impl File {
 			if !entry_name.ends_with(".npy") {
 				continue;
 			}
-			let array_name = entry_name.trim_end_matches(".npy");
+			let array_name = entry_name.trim_end_matches(".npy").to_string();
 			let mut buf = Vec::new();
 			io::Read::read_to_end(&mut entry, &mut buf)?;
 			let (info, payload) = parse_npy_bytes(&buf)
@@ -678,11 +806,12 @@ impl File {
 			let values = npy_to_f64_strings(payload, &info.descr, total)?;
 			let nrows = info.shape.first().copied().unwrap_or(total);
 			let ncols = if info.shape.len() >= 2 { info.shape[1] } else { 1 };
+			let mut columns = Vec::with_capacity(ncols);
 			for col in 0..ncols {
 				let col_name = if ncols > 1 {
-					format!("{array_name}_{col}")
+					format!("col{}", col + 1)
 				} else {
-					array_name.to_string()
+					array_name.clone()
 				};
 				let mut col_vals = Vec::with_capacity(nrows);
 				for row in 0..nrows {
@@ -693,15 +822,19 @@ impl File {
 					};
 					col_vals.push(values.get(idx).cloned().unwrap_or_default());
 				}
-				vectors.push(DataVec {
+				columns.push(DataVec {
 					name: col_name,
 					values: col_vals,
 					kind: DataType::default(),
 					source: String::new(),
 				});
 			}
+			groups.push(DataGroup {
+				member: array_name,
+				columns,
+			});
 		}
-		return Ok(vectors);
+		return Ok(groups);
 	}
 }
 
@@ -836,18 +969,19 @@ fn npy_to_f64_strings(raw: &[u8], descr: &str, count: usize) -> Result<Vec<Strin
 // ─ HDF5
 
 impl File {
-	fn parse_hdf5(&self) -> Result<Vec<DataVec>> {
+	fn parse_hdf5(&self) -> Result<Vec<DataGroup>> {
 		let file = hdf5::File::open(&self.path)
 			.with_context(|| format!("failed to open HDF5: {}", self.path.display()))?;
-		let mut vectors = Vec::new();
-		hdf5_collect(&file, "", &mut vectors)?;
-		return Ok(vectors);
+		let mut groups = Vec::new();
+		hdf5_collect(&file, "", &mut groups)?;
+		return Ok(groups);
 	}
 }
 
-fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -> Result<()> {
+fn hdf5_collect(group: &hdf5::Group, prefix: &str, groups: &mut Vec<DataGroup>) -> Result<()> {
 	let names = group.member_names()
 		.with_context(|| format!("failed to list HDF5 group members at '{prefix}'"))?;
+	let mut columns: Vec<DataVec> = Vec::new();
 	for name in &names {
 		let full = if prefix.is_empty() {
 			name.clone()
@@ -857,21 +991,11 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 		if let Ok(ds) = group.dataset(name) {
 			let shape = ds.shape();
 			match shape.len() {
-				0 => {
+				0 | 1 => {
 					let data: Vec<f64> = ds.read_raw()
 						.with_context(|| format!("failed to read HDF5 dataset '{full}'"))?;
-					vectors.push(DataVec {
-						name: full,
-						values: data.iter().map(|v| v.to_string()).collect(),
-						kind: DataType::default(),
-						source: String::new(),
-					});
-				}
-				1 => {
-					let data: Vec<f64> = ds.read_raw()
-						.with_context(|| format!("failed to read HDF5 dataset '{full}'"))?;
-					vectors.push(DataVec {
-						name: full,
+					columns.push(DataVec {
+						name: name.clone(),
 						values: data.iter().map(|v| v.to_string()).collect(),
 						kind: DataType::default(),
 						source: String::new(),
@@ -883,14 +1007,14 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 					let data: Vec<f64> = ds.read_raw()
 						.with_context(|| format!("failed to read HDF5 dataset '{full}'"))?;
 					for col in 0..ncols {
-						let col_name = format!("{full}_{col}");
+						let col_name = format!("{name}_{col}");
 						let values: Vec<String> = (0..nrows)
 							.map(|row| {
 								data.get(row * ncols + col)
 									.map_or(String::new(), |v| v.to_string())
 							})
 							.collect();
-						vectors.push(DataVec {
+						columns.push(DataVec {
 							name: col_name,
 							values,
 							kind: DataType::default(),
@@ -902,8 +1026,14 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 			continue;
 		}
 		if let Ok(sub) = group.group(name) {
-			hdf5_collect(&sub, &full, vectors)?;
+			hdf5_collect(&sub, &full, groups)?;
 		}
+	}
+	if !columns.is_empty() {
+		groups.push(DataGroup {
+			member: prefix.to_string(),
+			columns,
+		});
 	}
 	return Ok(());
 }
@@ -911,37 +1041,44 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 // ─ Excel
 
 impl File {
-	fn parse_excel(&self) -> Result<Vec<DataVec>> {
+	fn parse_excel(&self) -> Result<Vec<DataGroup>> {
 		use calamine::Reader;
 
 		let mut wb = calamine::open_workbook_auto(&self.path)
 			.with_context(|| format!("failed to open workbook: {}", self.path.display()))?;
 		let sheets = wb.sheet_names().to_vec();
 		ensure!(!sheets.is_empty(), "no sheets in workbook: {}", self.path.display());
-		let range = wb.worksheet_range(&sheets[0])
-			.with_context(|| format!("failed to read sheet '{}'", sheets[0]))?;
-		let mut row_iter = range.rows();
-		let Some(first) = row_iter.next() else {
-			return Ok(Vec::new());
-		};
-		let all_numeric = first.iter().all(|c| matches!(c, calamine::Data::Float(_) | calamine::Data::Int(_)));
-		let headers: Vec<String>;
-		let mut rows: Vec<Vec<String>> = Vec::new();
-		if all_numeric {
-			headers = (0..first.len()).map(|j| format!("col_{j}")).collect();
-			rows.push(first.iter().map(excel_cell).collect());
-		} else {
-			headers = first.iter().enumerate()
-				.map(|(i, c)| {
-					let s = excel_cell(c);
-					if s.is_empty() { format!("col_{i}") } else { s }
-				})
-				.collect();
+		let mut groups = Vec::new();
+		for sheet in sheets {
+			let range = wb.worksheet_range(&sheet)
+				.with_context(|| format!("failed to read sheet '{sheet}'"))?;
+			let mut row_iter = range.rows();
+			let Some(first) = row_iter.next() else {
+				continue;
+			};
+			let all_numeric = first.iter().all(|c| matches!(c, calamine::Data::Float(_) | calamine::Data::Int(_)));
+			let headers: Vec<String>;
+			let mut rows: Vec<Vec<String>> = Vec::new();
+			if all_numeric {
+				headers = (0..first.len()).map(|j| format!("col{}", j + 1)).collect();
+				rows.push(first.iter().map(excel_cell).collect());
+			} else {
+				headers = first.iter().enumerate()
+					.map(|(i, c)| {
+						let s = excel_cell(c);
+						if s.is_empty() { format!("col{}", i + 1) } else { s }
+					})
+					.collect();
+			}
+			for row in row_iter {
+				rows.push(row.iter().map(excel_cell).collect());
+			}
+			groups.push(DataGroup {
+				member: sheet,
+				columns: rows_to_columns(headers, &rows),
+			});
 		}
-		for row in row_iter {
-			rows.push(row.iter().map(excel_cell).collect());
-		}
-		return Ok(rows_to_columns(headers, &rows));
+		return Ok(groups);
 	}
 }
 
@@ -1084,7 +1221,7 @@ fn pptx_entity(r: &quick_xml::events::BytesRef) -> Result<char> {
 // ─ MATLAB
 
 impl File {
-	fn parse_mat(&self) -> Result<Vec<DataVec>> {
+	fn parse_mat(&self) -> Result<Vec<DataGroup>> {
 		let raw = fs::read(&self.path)
 			.with_context(|| format!("failed to read {}", self.path.display()))?;
 		if raw.starts_with(&[0x89, b'H', b'D', b'F', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -1093,16 +1230,17 @@ impl File {
 		let cursor = io::Cursor::new(&raw);
 		let mat = matfile::MatFile::parse(cursor)
 			.with_context(|| format!("failed to parse MAT file: {}", self.path.display()))?;
-		let mut vectors = Vec::new();
+		let mut groups = Vec::new();
 		for array in mat.arrays() {
 			let name = array.name().to_string();
 			let dims = array.size();
 			let nrows = dims.first().copied().unwrap_or(0);
 			let ncols = dims.get(1).copied().unwrap_or(1);
 			let f64_vals = mat_array_to_f64s(array);
+			let mut columns = Vec::with_capacity(ncols);
 			for col in 0..ncols {
 				let col_name = if ncols > 1 {
-					format!("{name}_{col}")
+					format!("col{}", col + 1)
 				} else {
 					name.clone()
 				};
@@ -1112,15 +1250,19 @@ impl File {
 						f64_vals.get(idx).map_or(String::new(), |v| v.to_string())
 					})
 					.collect();
-				vectors.push(DataVec {
+				columns.push(DataVec {
 					name: col_name,
 					values,
 					kind: DataType::default(),
 					source: String::new(),
 				});
 			}
+			groups.push(DataGroup {
+				member: name,
+				columns,
+			});
 		}
-		return Ok(vectors);
+		return Ok(groups);
 	}
 }
 
@@ -1453,7 +1595,7 @@ impl File {
 			}
 		}
 		let hdrs = if headers.is_empty() && !rows.is_empty() {
-			(0..rows[0].len()).map(|j| format!("col_{j}")).collect()
+			(0..rows[0].len()).map(|j| format!("col{}", j + 1)).collect()
 		} else {
 			headers
 		};
