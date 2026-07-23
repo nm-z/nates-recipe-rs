@@ -524,11 +524,9 @@ impl DataInner {
 						})
 						.cloned()
 						.ok_or_else(|| {
-							let avail: Vec<&str> =
-								set_names.iter().map(|s| s.as_str()).collect();
 							anyhow::anyhow!(
-								"target '{want}' not found — available columns: {}",
-								avail.join(", ")
+								"target '{want}' not found; available columns: {}",
+								column_list(set_names)
 							)
 						})
 				})
@@ -545,6 +543,30 @@ impl DataInner {
 			},
 		}
 	}
+}
+
+fn column_list(names: &[String]) -> String {
+	let show = 20usize;
+	let width = 48usize;
+	let mut shown: Vec<String> = names
+		.iter()
+		.take(show)
+		.map(|n| {
+			let clean: String = n
+				.chars()
+				.map(|c| if c.is_control() { ' ' } else { c })
+				.take(width)
+				.collect();
+			if n.chars().count() > width {
+				return format!("{clean}...");
+			}
+			return clean;
+		})
+		.collect();
+	if names.len() > show {
+		shown.push(format!("... and {} more", names.len() - show));
+	}
+	return shown.join(", ");
 }
 
 impl crate::api::RunData for DataInner {
