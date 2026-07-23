@@ -3344,6 +3344,17 @@ mod tests {
 				false => Err(FakeError("prepared bridge validation failed")),
 			}
 		}
+
+		fn recycle_candidate_pending(
+			&mut self,
+			resource: &mut Self::Resource,
+			pending: Self::Pending,
+		) -> Result<(), Self::Error> {
+			match resource.tasks.contains(&pending.task) && pending.polls > 0 {
+				true => Ok(()),
+				false => Err(FakeError("candidate bridge token is not terminal or owned")),
+			}
+		}
 	}
 
 	fn location(device: DeviceId) -> ResolvedValueLocation {

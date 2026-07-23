@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use recipe_core::{ByteCount, BytesPerSecond, Property, PropertyProvenance};
 use recipe_probe::{
 	BoundedBenchmarkPlan, DirectionalBenchmarkEvidence, LinkDuplex, PEER_BENCHMARK_PROTOCOL_SCHEMA,
-	PeerBenchmarkEvidence, PeerDescriptor, PeerDuplexExecution, PeerEndpointEvidence, PeerMeasurement, PeerSession,
-	ProbeError, ProbeResult,
+	PeerBenchmarkAttempt, PeerBenchmarkControl, PeerBenchmarkEvidence, PeerBenchmarkFailure,
+	PeerBenchmarkFailureKind, PeerBenchmarkPhase, PeerDescriptor, PeerDuplexExecution, PeerEndpointEvidence,
+	PeerMeasurement, PeerSession, ProbeResult,
 };
 
 use crate::error::{TransportError, TransportResult};
@@ -85,64 +86,113 @@ impl TcpPeerSession {
 		})
 	}
 
-	fn run_benchmark(&self, plan: BoundedBenchmarkPlan) -> TransportResult<PeerMeasurement> {
-		validate_plan(plan)?;
-		let mut connection = self
-			.connection
-			.lock()
-			.map_err(|_| TransportError::Poisoned)?;
+	fn run_benchmark(
+		&self,
+		plan: BoundedBenchmarkPlan,
+		control: &PeerBenchmarkControl,
+	) -> Result<PeerMeasurement, PeerBenchmarkFailure> {
+		check_control(control, PeerBenchmarkPhase::Validation)?;
+		validate_plan(plan).map_err(|error| benchmark_failure(PeerBenchmarkPhase::Validation, error))?;
+		let attempt_deadline = Instant::now()
+			.checked_add(plan.maximum_duration)
+			.unwrap_or(control.absolute_deadline())
+			.min(control.absolute_deadline());
+		let bounded_control = PeerBenchmarkControl::new(attempt_deadline, control.cancellation().clone());
+		let control = &bounded_control;
+		let mut connection = lock_connection(&self.connection, control)?;
 		if plan.buffer_bytes.get() > connection.limits.max_payload() as u64 {
-			return Err(TransportError::FrameTooLarge {
-				declared: usize::try_from(plan.buffer_bytes.get()).unwrap_or(usize::MAX),
-				limit: connection.limits.max_payload(),
-			});
+			return Err(benchmark_failure(
+				PeerBenchmarkPhase::Validation,
+				TransportError::FrameTooLarge {
+					declared: usize::try_from(plan.buffer_bytes.get()).unwrap_or(usize::MAX),
+					limit: connection.limits.max_payload(),
+				},
+			));
 		}
 		let round = connection.next_round;
 		connection.next_round = round
 			.checked_add(1)
-			.ok_or(TransportError::ProtocolState("probe round exhausted"))?;
+			.ok_or(TransportError::ProtocolState("probe round exhausted"))
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::Validation, error))?;
 
-		let local_begin = encode_begin(plan, self.descriptor.duplex, self.local_memory)?;
-		let hello_deadline = connection.limits.deadline();
-		let begin_token = token(round, 1, 0)?;
+		check_control(control, PeerBenchmarkPhase::BeginExchange)?;
+		let local_begin = encode_begin(plan, self.descriptor.duplex, self.local_memory)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::BeginExchange, error))?;
+		let begin_token =
+			token(round, 1, 0).map_err(|error| benchmark_failure(PeerBenchmarkPhase::BeginExchange, error))?;
+		let begin_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::BeginExchange,
+		)?;
 		send_exact(
 			&mut connection.sender,
 			FrameKind::ProbeBegin,
 			begin_token,
 			&local_begin,
-			hello_deadline,
-		)?;
+			begin_deadline,
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::BeginExchange, error))?;
+		check_control(control, PeerBenchmarkPhase::BeginExchange)?;
 		let mut begin_buffer = [0_u8; BEGIN_BYTES];
+		let begin_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::BeginExchange,
+		)?;
 		let remote_begin = receive_exact(
 			&mut connection.receiver,
 			FrameKind::ProbeBegin,
 			begin_token,
 			&mut begin_buffer,
-			hello_deadline,
-		)?;
-		let remote_memory = decode_and_validate_begin(remote_begin, plan, self.descriptor.duplex)?;
+			begin_deadline,
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::BeginExchange, error))?;
+		let remote_memory = decode_and_validate_begin(remote_begin, plan, self.descriptor.duplex)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::BeginExchange, error))?;
 
-		let ready_token = token(round, 2, 0)?;
+		check_control(control, PeerBenchmarkPhase::ReadyExchange)?;
+		let ready_token =
+			token(round, 2, 0).map_err(|error| benchmark_failure(PeerBenchmarkPhase::ReadyExchange, error))?;
+		let ready_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::ReadyExchange,
+		)?;
 		send_exact(
 			&mut connection.sender,
 			FrameKind::ProbeReady,
 			ready_token,
 			&[],
-			hello_deadline,
-		)?;
+			ready_deadline,
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::ReadyExchange, error))?;
+		check_control(control, PeerBenchmarkPhase::ReadyExchange)?;
 		let mut empty = [];
+		let ready_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::ReadyExchange,
+		)?;
 		receive_exact(
 			&mut connection.receiver,
 			FrameKind::ProbeReady,
 			ready_token,
 			&mut empty,
-			hello_deadline,
-		)?;
+			ready_deadline,
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::ReadyExchange, error))?;
 
+		check_control(control, PeerBenchmarkPhase::DirectionalTransfer)?;
 		let payload_len = usize::try_from(plan.buffer_bytes.get())
-			.map_err(|_| TransportError::InvalidConfiguration("probe buffer does not fit address space"))?;
+			.map_err(|_| TransportError::InvalidConfiguration("probe buffer does not fit address space"))
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
 		let payload = vec![probe_pattern(round); payload_len];
-		let measurement_deadline = Instant::now() + plan.maximum_duration;
+		let measurement_deadline = Instant::now()
+			.checked_add(plan.maximum_duration)
+			.unwrap_or(control.absolute_deadline())
+			.min(control.absolute_deadline());
+		let operation_timeout = connection.limits.operation_timeout();
 		let identity = connection.identity;
 		let ProbeConnection {
 			sender, receiver, ..
@@ -155,7 +205,9 @@ impl TcpPeerSession {
 				plan.iterations,
 				&payload,
 				measurement_deadline,
-			)?,
+				operation_timeout,
+				control,
+			),
 			LinkDuplex::Half => measure_half_duplex(
 				sender,
 				receiver,
@@ -164,33 +216,60 @@ impl TcpPeerSession {
 				plan.iterations,
 				&payload,
 				measurement_deadline,
-			)?,
-		};
-		let total_bytes = total_bytes(plan)?;
-		let outbound_evidence = outbound_evidence.finish(total_bytes)?;
-		let inbound_evidence = inbound_evidence.finish(total_bytes)?;
-		let outbound_rate = measured_rate(total_bytes, outbound_evidence.elapsed_nanoseconds)?;
-		let inbound_rate = measured_rate(total_bytes, inbound_evidence.elapsed_nanoseconds)?;
+				operation_timeout,
+				control,
+			),
+		}
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
+		check_control(control, PeerBenchmarkPhase::DirectionalTransfer)?;
+		let total_bytes = total_bytes(plan)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
+		let outbound_evidence = outbound_evidence
+			.finish(total_bytes)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
+		let inbound_evidence = inbound_evidence
+			.finish(total_bytes)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
+		let outbound_rate = measured_rate(total_bytes, outbound_evidence.elapsed_nanoseconds)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
+		let inbound_rate = measured_rate(total_bytes, inbound_evidence.elapsed_nanoseconds)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::DirectionalTransfer, error))?;
 
+		check_control(control, PeerBenchmarkPhase::CompletionExchange)?;
 		let complete = encode_complete(outbound_rate, inbound_rate);
-		let complete_token = token(round, 4, 0)?;
-		let completion_deadline = connection.limits.deadline();
+		let complete_token = token(round, 4, 0)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::CompletionExchange, error))?;
+		let completion_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::CompletionExchange,
+		)?;
 		send_exact(
 			&mut connection.sender,
 			FrameKind::ProbeComplete,
 			complete_token,
 			&complete,
 			completion_deadline,
-		)?;
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::CompletionExchange, error))?;
+		check_control(control, PeerBenchmarkPhase::CompletionExchange)?;
 		let mut complete_buffer = [0_u8; COMPLETE_BYTES];
+		let completion_deadline = operation_deadline(
+			connection.limits,
+			control,
+			PeerBenchmarkPhase::CompletionExchange,
+		)?;
 		let remote_complete = receive_exact(
 			&mut connection.receiver,
 			FrameKind::ProbeComplete,
 			complete_token,
 			&mut complete_buffer,
 			completion_deadline,
-		)?;
-		validate_complete(remote_complete)?;
+		)
+		.map_err(|error| benchmark_failure(PeerBenchmarkPhase::CompletionExchange, error))?;
+		validate_complete(remote_complete)
+			.map_err(|error| benchmark_failure(PeerBenchmarkPhase::CompletionExchange, error))?;
+		check_control(control, PeerBenchmarkPhase::CompletionExchange)?;
 
 		Ok(PeerMeasurement {
 			remote_memory_capacity: measured(remote_memory.capacity),
@@ -225,9 +304,86 @@ impl PeerSession for TcpPeerSession {
 	}
 
 	fn benchmark(&self, plan: BoundedBenchmarkPlan) -> ProbeResult<PeerMeasurement> {
-		self.run_benchmark(plan)
-			.map_err(|error| ProbeError::Benchmark(error.to_string()))
+		let control = match PeerBenchmarkControl::for_plan(plan) {
+			Ok(control) => control,
+			Err(error) => return Err(error),
+		};
+		self.benchmark_controlled(plan, &control).into_measurement()
 	}
+
+	fn benchmark_controlled(
+		&self,
+		plan: BoundedBenchmarkPlan,
+		control: &PeerBenchmarkControl,
+	) -> PeerBenchmarkAttempt {
+		match self.run_benchmark(plan, control) {
+			Ok(measurement) => PeerBenchmarkAttempt::Measured(measurement),
+			Err(failure) => PeerBenchmarkAttempt::Failed(failure),
+		}
+	}
+}
+
+fn lock_connection<'a>(
+	connection: &'a Mutex<ProbeConnection>,
+	control: &PeerBenchmarkControl,
+) -> Result<std::sync::MutexGuard<'a, ProbeConnection>, PeerBenchmarkFailure> {
+	loop {
+		check_control(control, PeerBenchmarkPhase::Validation)?;
+		match connection.try_lock() {
+			Ok(connection) => return Ok(connection),
+			Err(std::sync::TryLockError::WouldBlock) => thread::yield_now(),
+			Err(std::sync::TryLockError::Poisoned(_)) => {
+				return Err(benchmark_failure(
+					PeerBenchmarkPhase::Validation,
+					TransportError::Poisoned,
+				));
+			}
+		}
+	}
+}
+
+fn check_control(control: &PeerBenchmarkControl, phase: PeerBenchmarkPhase) -> Result<(), PeerBenchmarkFailure> {
+	match control.failure(phase) {
+		Some(failure) => Err(failure),
+		None => Ok(()),
+	}
+}
+
+fn operation_deadline(
+	limits: ProtocolLimits,
+	control: &PeerBenchmarkControl,
+	phase: PeerBenchmarkPhase,
+) -> Result<Instant, PeerBenchmarkFailure> {
+	check_control(control, phase)?;
+	Ok(Instant::now()
+		.checked_add(limits.operation_timeout())
+		.unwrap_or(control.absolute_deadline())
+		.min(control.absolute_deadline()))
+}
+
+fn benchmark_failure(phase: PeerBenchmarkPhase, error: TransportError) -> PeerBenchmarkFailure {
+	let kind = match error {
+		TransportError::Cancelled => PeerBenchmarkFailureKind::Cancelled,
+		TransportError::DeadlineExceeded => PeerBenchmarkFailureKind::Deadline,
+		TransportError::InvalidIdentity(_) | TransportError::UnexpectedIdentity => {
+			PeerBenchmarkFailureKind::Identity
+		}
+		TransportError::IntegrityFailure => PeerBenchmarkFailureKind::Integrity,
+		TransportError::UnsupportedVersion(_)
+		| TransportError::InvalidFrame(_)
+		| TransportError::UnexpectedSequence { .. }
+		| TransportError::ProtocolState(_)
+		| TransportError::UnknownCompletion(_) => PeerBenchmarkFailureKind::Protocol,
+		TransportError::InvalidConfiguration(_)
+		| TransportError::FrameTooLarge { .. }
+		| TransportError::BufferTooSmall { .. }
+		| TransportError::ConnectionClosed
+		| TransportError::Io(_)
+		| TransportError::CapacityExhausted(_)
+		| TransportError::Probe(_)
+		| TransportError::Poisoned => PeerBenchmarkFailureKind::Transport,
+	};
+	PeerBenchmarkFailure::new(phase, kind, error.to_string())
 }
 
 fn validate_plan(plan: BoundedBenchmarkPlan) -> TransportResult<()> {
@@ -302,8 +458,8 @@ fn decode_and_validate_begin(
 		_ => return Err(TransportError::InvalidFrame("invalid probe duplex value")),
 	};
 	if duplex != expected_duplex {
-		return Err(TransportError::Probe(
-			"peer duplex declaration disagrees".to_owned(),
+		return Err(TransportError::InvalidFrame(
+			"peer duplex declaration disagrees",
 		));
 	}
 	let remote_plan = BoundedBenchmarkPlan {
@@ -312,8 +468,8 @@ fn decode_and_validate_begin(
 		maximum_duration: Duration::from_nanos(read_u64(payload, 16)?),
 	};
 	if remote_plan != expected_plan {
-		return Err(TransportError::Probe(
-			"peer benchmark plan disagrees".to_owned(),
+		return Err(TransportError::InvalidFrame(
+			"peer benchmark plan disagrees",
 		));
 	}
 	let capacity = ByteCount::new(read_u64(payload, 24)?);
@@ -399,17 +555,35 @@ fn measure_full_duplex(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	deadline: Instant,
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+	control: &PeerBenchmarkControl,
 ) -> TransportResult<(DirectionAccumulator, DirectionAccumulator)> {
 	let barrier = Arc::new(Barrier::new(2));
 	thread::scope(|scope| {
 		let receive_barrier = Arc::clone(&barrier);
 		let receiver_task = scope.spawn(move || {
 			receive_barrier.wait();
-			measure_receive(receiver, round, iterations, payload.len(), deadline)
+			measure_receive(
+				receiver,
+				round,
+				iterations,
+				payload.len(),
+				phase_deadline,
+				operation_timeout,
+				control,
+			)
 		});
 		barrier.wait();
-		let outbound = measure_send(sender, round, iterations, payload, deadline);
+		let outbound = measure_send(
+			sender,
+			round,
+			iterations,
+			payload,
+			phase_deadline,
+			operation_timeout,
+			control,
+		);
 		let inbound = receiver_task
 			.join()
 			.map_err(|_| TransportError::Probe("receive benchmark thread panicked".to_owned()))?;
@@ -427,16 +601,50 @@ fn measure_half_duplex(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	deadline: Instant,
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+	control: &PeerBenchmarkControl,
 ) -> TransportResult<(DirectionAccumulator, DirectionAccumulator)> {
 	let local_is_first = identity.local().machine().bytes() < identity.remote().machine().bytes();
 	if local_is_first {
-		let outbound = measure_send(sender, round, iterations, payload, deadline)?;
-		let inbound = measure_receive(receiver, round, iterations, payload.len(), deadline)?;
+		let outbound = measure_send(
+			sender,
+			round,
+			iterations,
+			payload,
+			phase_deadline,
+			operation_timeout,
+			control,
+		)?;
+		let inbound = measure_receive(
+			receiver,
+			round,
+			iterations,
+			payload.len(),
+			phase_deadline,
+			operation_timeout,
+			control,
+		)?;
 		Ok((outbound, inbound))
 	} else {
-		let inbound = measure_receive(receiver, round, iterations, payload.len(), deadline)?;
-		let outbound = measure_send(sender, round, iterations, payload, deadline)?;
+		let inbound = measure_receive(
+			receiver,
+			round,
+			iterations,
+			payload.len(),
+			phase_deadline,
+			operation_timeout,
+			control,
+		)?;
+		let outbound = measure_send(
+			sender,
+			round,
+			iterations,
+			payload,
+			phase_deadline,
+			operation_timeout,
+			control,
+		)?;
 		Ok((outbound, inbound))
 	}
 }
@@ -446,10 +654,13 @@ fn measure_send(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	deadline: Instant,
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+	control: &PeerBenchmarkControl,
 ) -> TransportResult<DirectionAccumulator> {
 	let mut measurements = DirectionAccumulator::new();
 	for iteration in 0..iterations {
+		let deadline = transfer_operation_deadline(control, phase_deadline, operation_timeout)?;
 		let sample_started = Instant::now();
 		send_exact(
 			sender,
@@ -460,9 +671,7 @@ fn measure_send(
 		)?;
 		measurements.record(sample_started.elapsed())?;
 	}
-	if Instant::now() > deadline {
-		return Err(TransportError::DeadlineExceeded);
-	}
+	transfer_control_check(control, phase_deadline)?;
 	Ok(measurements)
 }
 
@@ -471,11 +680,14 @@ fn measure_receive(
 	round: u32,
 	iterations: u32,
 	payload_len: usize,
-	deadline: Instant,
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+	control: &PeerBenchmarkControl,
 ) -> TransportResult<DirectionAccumulator> {
 	let mut payload = vec![0_u8; payload_len];
 	let mut measurements = DirectionAccumulator::new();
 	for iteration in 0..iterations {
+		let deadline = transfer_operation_deadline(control, phase_deadline, operation_timeout)?;
 		let sample_started = Instant::now();
 		let received = receive_exact(
 			receiver,
@@ -489,10 +701,31 @@ fn measure_receive(
 		}
 		measurements.record(sample_started.elapsed())?;
 	}
-	if Instant::now() > deadline {
-		return Err(TransportError::DeadlineExceeded);
-	}
+	transfer_control_check(control, phase_deadline)?;
 	Ok(measurements)
+}
+
+fn transfer_operation_deadline(
+	control: &PeerBenchmarkControl,
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+) -> TransportResult<Instant> {
+	transfer_control_check(control, phase_deadline)?;
+	let hard_deadline = phase_deadline.min(control.absolute_deadline());
+	Ok(Instant::now()
+		.checked_add(operation_timeout)
+		.unwrap_or(hard_deadline)
+		.min(hard_deadline))
+}
+
+fn transfer_control_check(control: &PeerBenchmarkControl, phase_deadline: Instant) -> TransportResult<()> {
+	if control.cancellation().is_cancelled() {
+		Err(TransportError::Cancelled)
+	} else if Instant::now() >= phase_deadline.min(control.absolute_deadline()) {
+		Err(TransportError::DeadlineExceeded)
+	} else {
+		Ok(())
+	}
 }
 
 fn send_exact(
@@ -601,10 +834,12 @@ fn read_u64(payload: &[u8], offset: usize) -> TransportResult<u64> {
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	use recipe_core::{ByteCount, BytesPerSecond, Label, PropertyProvenance, TransferLaneCount, TransportKind};
-	use recipe_probe::{BoundedBenchmarkPlan, MachineFingerprint, PeerDescriptor, PeerSession};
+	use recipe_probe::{
+		BoundedBenchmarkPlan, MachineFingerprint, PeerBenchmarkCancellation, PeerDescriptor, PeerSession,
+	};
 
 	use super::*;
 	use crate::protocol::tests::{identities, tcp_pair};
@@ -688,6 +923,28 @@ mod tests {
 			let right_task = scope.spawn(|| right.benchmark(right_plan));
 			(left_task.join().unwrap(), right_task.join().unwrap())
 		})
+	}
+
+	fn run_controlled_pair(
+		left: &TcpPeerSession,
+		right: &TcpPeerSession,
+		left_plan: BoundedBenchmarkPlan,
+		right_plan: BoundedBenchmarkPlan,
+		left_control: &PeerBenchmarkControl,
+		right_control: &PeerBenchmarkControl,
+	) -> (PeerBenchmarkAttempt, PeerBenchmarkAttempt) {
+		thread::scope(|scope| {
+			let left_task = scope.spawn(|| left.benchmark_controlled(left_plan, left_control));
+			let right_task = scope.spawn(|| right.benchmark_controlled(right_plan, right_control));
+			(left_task.join().unwrap(), right_task.join().unwrap())
+		})
+	}
+
+	fn failed(attempt: PeerBenchmarkAttempt) -> PeerBenchmarkFailure {
+		match attempt {
+			PeerBenchmarkAttempt::Measured(_) => panic!("benchmark unexpectedly measured"),
+			PeerBenchmarkAttempt::Failed(failure) => failure,
+		}
 	}
 
 	fn assert_measured(
@@ -795,5 +1052,97 @@ mod tests {
 		)
 		.unwrap();
 		assert!(left.benchmark(plan(4096)).is_err());
+	}
+
+	#[test]
+	fn controlled_benchmark_reports_cancellation_before_io() {
+		let (left, _right) = sessions(LinkDuplex::Full);
+		let cancellation = PeerBenchmarkCancellation::default();
+		cancellation.cancel();
+		let control = PeerBenchmarkControl::new(Instant::now() + Duration::from_secs(1), cancellation);
+		let failure = failed(left.benchmark_controlled(plan(4096), &control));
+		assert_eq!(failure.phase, PeerBenchmarkPhase::Validation);
+		assert_eq!(failure.kind, PeerBenchmarkFailureKind::Cancelled);
+		assert_eq!(failure.protocol_schema, PROBE_PAYLOAD_SCHEMA);
+	}
+
+	#[test]
+	fn controlled_benchmark_reports_expired_absolute_deadline_before_io() {
+		let (left, _right) = sessions(LinkDuplex::Full);
+		let control = PeerBenchmarkControl::new(Instant::now(), PeerBenchmarkCancellation::default());
+		let failure = failed(left.benchmark_controlled(plan(4096), &control));
+		assert_eq!(failure.phase, PeerBenchmarkPhase::Validation);
+		assert_eq!(failure.kind, PeerBenchmarkFailureKind::Deadline);
+	}
+
+	#[test]
+	fn controlled_benchmark_reports_protocol_disagreement_in_begin_exchange() {
+		let (left, right) = sessions(LinkDuplex::Full);
+		let left_control = PeerBenchmarkControl::for_plan(plan(4096)).unwrap();
+		let right_control = PeerBenchmarkControl::for_plan(plan(2048)).unwrap();
+		let (left_attempt, right_attempt) = run_controlled_pair(
+			&left,
+			&right,
+			plan(4096),
+			plan(2048),
+			&left_control,
+			&right_control,
+		);
+		for failure in [failed(left_attempt), failed(right_attempt)] {
+			assert_eq!(failure.phase, PeerBenchmarkPhase::BeginExchange);
+			assert_eq!(failure.kind, PeerBenchmarkFailureKind::Protocol);
+		}
+	}
+
+	#[test]
+	fn bounded_plan_deadline_bounds_a_stalled_begin_exchange() {
+		let (left_stream, _idle_peer) = tcp_pair();
+		let (left_identity, _) = identities();
+		let limits = ProtocolLimits::new(8192, Duration::from_secs(3)).unwrap();
+		let left = TcpPeerSession::new(
+			left_stream,
+			left_identity,
+			limits,
+			descriptor("idle", LinkDuplex::Full),
+			memory(16_000_000_000, 70_000_000_000),
+		)
+		.unwrap();
+		let bounded_plan = BoundedBenchmarkPlan {
+			maximum_duration: Duration::from_millis(40),
+			..plan(4096)
+		};
+		let control = PeerBenchmarkControl::new(
+			Instant::now() + Duration::from_secs(3),
+			PeerBenchmarkCancellation::default(),
+		);
+		let started = Instant::now();
+		let failure = failed(left.benchmark_controlled(bounded_plan, &control));
+		assert_eq!(failure.phase, PeerBenchmarkPhase::BeginExchange);
+		assert_eq!(failure.kind, PeerBenchmarkFailureKind::Deadline);
+		assert!(started.elapsed() < Duration::from_millis(500));
+	}
+
+	#[test]
+	fn caller_absolute_deadline_bounds_a_stalled_begin_exchange() {
+		let (left_stream, _idle_peer) = tcp_pair();
+		let (left_identity, _) = identities();
+		let limits = ProtocolLimits::new(8192, Duration::from_secs(3)).unwrap();
+		let left = TcpPeerSession::new(
+			left_stream,
+			left_identity,
+			limits,
+			descriptor("idle", LinkDuplex::Full),
+			memory(16_000_000_000, 70_000_000_000),
+		)
+		.unwrap();
+		let control = PeerBenchmarkControl::new(
+			Instant::now() + Duration::from_millis(40),
+			PeerBenchmarkCancellation::default(),
+		);
+		let started = Instant::now();
+		let failure = failed(left.benchmark_controlled(plan(4096), &control));
+		assert_eq!(failure.phase, PeerBenchmarkPhase::BeginExchange);
+		assert_eq!(failure.kind, PeerBenchmarkFailureKind::Deadline);
+		assert!(started.elapsed() < Duration::from_millis(500));
 	}
 }

@@ -1,11 +1,12 @@
 use recipe::*;
 
-const ARC: &str = "/home/nate/Desktop/nates-recipe-rs/examples/datasets/rogii-wellbore-geology-prediction";
+const DATASET: &str = "examples/datasets/rogii-wellbore-geology-prediction";
 
-fn main() {
-	recipe.data(ARC).split(0.8).target("TVT");
+fn main() -> DeclarationResult<()> {
+	let data = recipe.data(DATASET).split(0.8).target("TVT");
 
-	recipe.model()
+	let model = recipe
+		.model()
 		.loss(mse)
 		.layer(1024)
 		.gelu()
@@ -14,5 +15,14 @@ fn main() {
 		.layer(900)
 		.lr(0.0001);
 
-	recipe.train().epochs(100).log([Loss]).run(&data, &model);
+	let declaration = recipe
+		.train()
+		.epochs(100)
+		.log([Loss])
+		.declare(&data, &model)?;
+
+	// Declaration is side-effect free. End-to-end lowering and execution will
+	// replace this boundary once the public integration is complete.
+	assert_eq!(declaration.policy().epoch_bound(), Some(100));
+	Ok(())
 }

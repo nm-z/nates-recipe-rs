@@ -14,8 +14,8 @@ use crate::model::{
 	BenchmarkMetadata, BoundedBenchmarkPlan, CacheIdentity, GpuBenchmarkIo, GpuDescriptor, GpuDiscovery,
 	GpuMeasurement, HostBenchmarkIo, HostDiscovery, HostInventory, LinkDuplex, MeasuredGpuOrigin,
 	MeasuredMachineOrigin, MeasuredOrigins, MeasuredPeerBenchmark, MeasuredProfile, MeasuredRamOrigin,
-	MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_SCHEMA, PeerDescriptor, PeerDuplexExecution,
-	PeerMeasurement, PeerSession, RamMeasurement, StorageMeasurement,
+	MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_SCHEMA, PeerBenchmarkControl, PeerDescriptor,
+	PeerDuplexExecution, PeerMeasurement, PeerSession, RamMeasurement, StorageMeasurement,
 };
 use crate::seed::{IdentityFacet, SeedContract, SeedDuplex};
 
@@ -87,7 +87,10 @@ impl<'a> ProbeEngine<'a> {
 		}
 		let mut peer_measurements = Vec::new();
 		for (session, descriptor) in peers {
-			let measurement = session.benchmark(plans.network)?;
+			let control = PeerBenchmarkControl::for_plan(plans.network)?;
+			let measurement = session
+				.benchmark_controlled(plans.network, &control)
+				.into_measurement()?;
 			validate_peer_measurement(&descriptor, measurement, plans.network)?;
 			peer_measurements.push((descriptor, measurement));
 		}
@@ -1471,6 +1474,45 @@ mod tests {
 		}
 	}
 
+	#[derive(Debug)]
+	struct ControlledOnlyPeer {
+		inner: FakePeer,
+		controlled_calls: AtomicU64,
+	}
+
+	impl PeerSession for ControlledOnlyPeer {
+		fn descriptor(&self) -> ProbeResult<PeerDescriptor> {
+			self.inner.descriptor()
+		}
+
+		fn benchmark(&self, _plan: BoundedBenchmarkPlan) -> ProbeResult<PeerMeasurement> {
+			Err(ProbeError::Benchmark(
+				"probe engine bypassed controlled peer benchmark path".to_owned(),
+			))
+		}
+
+		fn benchmark_controlled(
+			&self,
+			plan: BoundedBenchmarkPlan,
+			control: &PeerBenchmarkControl,
+		) -> crate::model::PeerBenchmarkAttempt {
+			self.controlled_calls.fetch_add(1, Ordering::Relaxed);
+			if let Some(failure) = control.failure(crate::model::PeerBenchmarkPhase::Validation) {
+				return crate::model::PeerBenchmarkAttempt::Failed(failure);
+			}
+			match self.inner.benchmark(plan) {
+				Ok(measurement) => crate::model::PeerBenchmarkAttempt::Measured(measurement),
+				Err(error) => {
+					crate::model::PeerBenchmarkAttempt::Failed(crate::model::PeerBenchmarkFailure::new(
+						crate::model::PeerBenchmarkPhase::DirectionalTransfer,
+						crate::model::PeerBenchmarkFailureKind::Transport,
+						error.to_string(),
+					))
+				}
+			}
+		}
+	}
+
 	fn fake_peer_direction(
 		plan: BoundedBenchmarkPlan,
 		elapsed_nanoseconds: u64,
@@ -1803,6 +1845,24 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn probe_engine_uses_the_controlled_peer_attempt_path() {
+		let gpu = FakeGpuDiscovery {
+			driver: "driver-1",
+			exhaustive: true,
+		};
+		let benchmarks = FakeHostBenchmarks {
+			provenance: PropertyProvenance::Measured,
+		};
+		let peer = ControlledOnlyPeer {
+			inner: FakePeer { complete: true },
+			controlled_calls: AtomicU64::new(0),
+		};
+		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[&peer]).unwrap();
+		assert_eq!(profile.peer_benchmarks.len(), 1);
+		assert_eq!(peer.controlled_calls.load(Ordering::Relaxed), 1);
 	}
 
 	#[test]
