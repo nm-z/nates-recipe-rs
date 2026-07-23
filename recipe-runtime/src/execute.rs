@@ -1029,9 +1029,8 @@ pub fn run_compiled_train(cfg: &TrainCfg, ds: &Dataset, model: &ModelInner) -> a
 
 	let wprefix = plan.compiled_weight_prefix();
 	let wp = wprefix.len();
-	let max_out = dims.iter().map(|ld| ld.out_dim).max().unwrap_or(1);
-	let acts_off = wp;
-	let metric_off = acts_off + n * max_out;
+	let arena_end = crate::compile::arena_workspace(&dims, n);
+	let metric_off = arena_end;
 	let x_off = metric_off + 1;
 	let y_off = x_off + n * d;
 	let pad_off = y_off + n * k;
