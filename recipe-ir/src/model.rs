@@ -28,7 +28,7 @@ pub enum LayerKind {
 	Conv,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Loss {
 	Mse,
 	Mae,

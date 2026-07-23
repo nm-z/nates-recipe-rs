@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+pub mod compile;
 pub mod execute;
 pub mod graph;
 pub mod machine;
