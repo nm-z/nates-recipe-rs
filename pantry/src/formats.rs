@@ -60,6 +60,62 @@ pub fn load(path: &str) -> Result<Vec<DataVec>> {
 
 // ─
 
+const USER_GB: usize = 1 << 30;
+
+fn ensure_fits_in_ram(bytes: u64, source: &Path) -> Result<()> {
+	let available = crate::available_ram_bytes();
+	let budget = available.saturating_sub(USER_GB) as u64;
+	if bytes > budget {
+		bail!(
+			"refusing to load {}: {bytes} bytes exceeds loadable RAM ({available} bytes available minus {USER_GB} bytes reserved)",
+			source.display()
+		);
+	}
+	return Ok(());
+}
+
+fn dir_total_bytes(path: &Path) -> Result<u64> {
+	let mut total = 0u64;
+	let entries = fs::read_dir(path)
+		.with_context(|| format!("failed to read directory: {}", path.display()))?;
+	for entry in entries.filter_map(|e| e.ok()) {
+		let p = entry.path();
+		let name = p.file_name()
+			.and_then(|n| n.to_str())
+			.unwrap_or("");
+		if name.starts_with('.') || name == "__MACOSX" {
+			continue;
+		}
+		if p.is_dir() {
+			total = total.saturating_add(dir_total_bytes(&p)?);
+		} else {
+			let meta = fs::metadata(&p)
+				.with_context(|| format!("failed to stat {}", p.display()))?;
+			total = total.saturating_add(meta.len());
+		}
+	}
+	return Ok(total);
+}
+
+fn zip_total_bytes(path: &Path) -> Result<u64> {
+	let file = fs::File::open(path)
+		.with_context(|| format!("failed to open zip {}", path.display()))?;
+	let mut archive = zip::ZipArchive::new(file)
+		.with_context(|| format!("failed to read zip {}", path.display()))?;
+	let mut total = 0u64;
+	for i in 0..archive.len() {
+		let entry = archive.by_index_raw(i)
+			.with_context(|| format!("failed to read zip entry {i}"))?;
+		if entry.is_dir() {
+			continue;
+		}
+		total = total.saturating_add(entry.size());
+	}
+	return Ok(total);
+}
+
+// ─
+
 const IMAGE_EXTENSIONS: &[&str] = &[
 	"jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif",
 	"ico", "pnm", "pbm", "pgm", "ppm", "qoi", "dds", "hdr", "exr", "ff",
@@ -67,6 +123,10 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 
 impl UsrData for File {
 	fn parse(&self) -> Result<Vec<DataVec>> {
+		let size = fs::metadata(&self.path)
+			.with_context(|| format!("failed to stat {}", self.path.display()))?
+			.len();
+		ensure_fits_in_ram(size, &self.path)?;
 		let extension = self.path.extension()
 			.and_then(|e| e.to_str())
 			.unwrap_or("")
@@ -107,6 +167,7 @@ impl UsrData for File {
 
 impl UsrData for Dir {
 	fn parse(&self) -> Result<Vec<DataVec>> {
+		ensure_fits_in_ram(dir_total_bytes(&self.path)?, &self.path)?;
 		let mut vectors = Vec::new();
 		let mut entries: Vec<PathBuf> = fs::read_dir(&self.path)
 			.with_context(|| format!("failed to read directory: {}", self.path.display()))?
@@ -134,6 +195,7 @@ impl UsrData for Dir {
 
 impl UsrData for Zip {
 	fn parse(&self) -> Result<Vec<DataVec>> {
+		ensure_fits_in_ram(zip_total_bytes(&self.path)?, &self.path)?;
 		let extracted = extract_zip(&self.path)?;
 		struct Guard(PathBuf);
 		impl Drop for Guard {
