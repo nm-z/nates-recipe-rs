@@ -3,8 +3,7 @@ use std::time::Instant;
 use xgboost_rs_broken::{Params, predict_proba, train_multiclass};
 
 fn load_csv(path: &str) -> Result<(Vec<f64>, Vec<usize>, usize, usize), Errored> {
-	let text = std::fs::read_to_string(path)
-		.map_err(|e| Errored::new(format!("read_to_string {path}: {e}")))?;
+	let text = std::fs::read_to_string(path).map_err(|e| Errored::new(format!("read_to_string {path}: {e}")))?;
 	let mut x = Vec::new();
 	let mut y = Vec::new();
 	let mut p = 0;
@@ -85,8 +84,7 @@ fn main() -> Result<(), Errored> {
 	);
 
 	let t1 = Instant::now();
-	let probs = predict_proba(&model, &x_te, n_te)
-		.map_err(|e| Errored::new(format!("predict_proba: {e}")))?;
+	let probs = predict_proba(&model, &x_te, n_te).map_err(|e| Errored::new(format!("predict_proba: {e}")))?;
 	let predict_time = t1.elapsed();
 
 	let correct = (0..n_te)

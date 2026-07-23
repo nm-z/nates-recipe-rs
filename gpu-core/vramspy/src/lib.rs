@@ -1,7 +1,6 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case, reason = "interposed HSA symbols carry C ABI names")]
 
-
 use core::ffi::{CStr, c_void};
 use core::mem;
 use core::ptr::NonNull;
@@ -115,10 +114,9 @@ fn real() -> &'static Real {
 	return REAL.get_or_init(|| {
 		// SAFETY: transmute to the exact documented C signature; resolve_next is non-null.
 		let pool_allocate = unsafe {
-			mem::transmute::<
-				usize,
-				unsafe extern "C" fn(u64, usize, u32, *mut *mut c_void) -> i32,
-			>(resolve_next(c"hsa_amd_memory_pool_allocate"))
+			mem::transmute::<usize, unsafe extern "C" fn(u64, usize, u32, *mut *mut c_void) -> i32>(resolve_next(
+				c"hsa_amd_memory_pool_allocate",
+			))
 		};
 		// SAFETY: transmute to the exact documented C signature; resolve_next is non-null.
 		let pool_free = unsafe {
@@ -128,15 +126,13 @@ fn real() -> &'static Real {
 		};
 		// SAFETY: transmute to the exact documented C signature; resolve_next is non-null.
 		let mem_allocate = unsafe {
-			mem::transmute::<usize, unsafe extern "C" fn(u64, usize, *mut *mut c_void) -> i32>(
-				resolve_next(c"hsa_memory_allocate"),
-			)
+			mem::transmute::<usize, unsafe extern "C" fn(u64, usize, *mut *mut c_void) -> i32>(resolve_next(
+				c"hsa_memory_allocate",
+			))
 		};
 		// SAFETY: transmute to the exact documented C signature; resolve_next is non-null.
 		let mem_free = unsafe {
-			mem::transmute::<usize, unsafe extern "C" fn(*mut c_void) -> i32>(resolve_next(
-				c"hsa_memory_free",
-			))
+			mem::transmute::<usize, unsafe extern "C" fn(*mut c_void) -> i32>(resolve_next(c"hsa_memory_free"))
 		};
 		return Real {
 			pool_allocate,
@@ -168,8 +164,7 @@ enum DevKind {
 struct BuildCtx<'ctx> {
 	pools: &'ctx mut HashMap<u64, u8>,
 	agent_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
-	iterate_pools:
-		unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
+	iterate_pools: unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
 	pool_get_info: unsafe extern "C" fn(u64, i32, *mut c_void) -> i32,
 }
 
@@ -209,9 +204,7 @@ pub extern "C" fn pool_cb(pool: u64, data: *mut c_void) -> i32 {
 				(&raw mut flags).cast::<c_void>(),
 			)
 		};
-		if r2 == HSA_STATUS_SUCCESS
-			&& (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) != 0
-		{
+		if r2 == HSA_STATUS_SUCCESS && (flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT) != 0 {
 			KIND_KERNARG
 		} else {
 			match ctx.dev {
@@ -296,35 +289,22 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_allocate(
 		let iterate_agents = unsafe {
 			mem::transmute::<
 				usize,
-				unsafe extern "C" fn(
-					extern "C" fn(u64, *mut c_void) -> i32,
-					*mut c_void,
-				) -> i32,
+				unsafe extern "C" fn(extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
 			>(syms.ia)
 		};
 		// SAFETY: transmute to the exact documented C signature.
-		let agent_get_info = unsafe {
-			mem::transmute::<usize, unsafe extern "C" fn(u64, i32, *mut c_void) -> i32>(
-				syms.agi,
-			)
-		};
+		let agent_get_info =
+			unsafe { mem::transmute::<usize, unsafe extern "C" fn(u64, i32, *mut c_void) -> i32>(syms.agi) };
 		// SAFETY: transmute to the exact documented C signature.
 		let iterate_pools = unsafe {
 			mem::transmute::<
 				usize,
-				unsafe extern "C" fn(
-					u64,
-					extern "C" fn(u64, *mut c_void) -> i32,
-					*mut c_void,
-				) -> i32,
+				unsafe extern "C" fn(u64, extern "C" fn(u64, *mut c_void) -> i32, *mut c_void) -> i32,
 			>(syms.ip)
 		};
 		// SAFETY: transmute to the exact documented C signature.
-		let pool_get_info = unsafe {
-			mem::transmute::<usize, unsafe extern "C" fn(u64, i32, *mut c_void) -> i32>(
-				syms.pgi,
-			)
-		};
+		let pool_get_info =
+			unsafe { mem::transmute::<usize, unsafe extern "C" fn(u64, i32, *mut c_void) -> i32>(syms.pgi) };
 		let mut ctx = BuildCtx {
 			pools: &mut pools,
 			agent_get_info,
@@ -354,11 +334,7 @@ pub unsafe extern "C" fn hsa_amd_memory_pool_free(ptr: *mut c_void) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hsa_memory_allocate(
-	region: u64,
-	size: usize,
-	ptr: *mut *mut c_void,
-) -> i32 {
+pub unsafe extern "C" fn hsa_memory_allocate(region: u64, size: usize, ptr: *mut *mut c_void) -> i32 {
 	// SAFETY: forwarding the caller's arguments unchanged to the real HSA runtime.
 	let status = unsafe { (real().mem_allocate)(region, size, ptr) };
 	if status != HSA_STATUS_SUCCESS {

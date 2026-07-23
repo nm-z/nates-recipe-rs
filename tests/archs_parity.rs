@@ -1,4 +1,3 @@
-
 use anyhow::{Context, Result, bail};
 use recipe_infer::gguf::{Gguf, Val};
 use recipe_infer::llm::{arch_composable, arch_supported, last_logits};
@@ -16,7 +15,10 @@ fn read_tokens(dir: &Path) -> Result<Vec<u32>> {
 	let text = fs::read_to_string(dir.join("tokens.txt")).context("tokens.txt")?;
 	let mut toks = Vec::new();
 	for line in text.lines().filter(|l| !l.trim().is_empty()) {
-		toks.push(line.trim().parse::<u32>().with_context(|| format!("token line {line:?}"))?);
+		toks.push(line
+			.trim()
+			.parse::<u32>()
+			.with_context(|| format!("token line {line:?}"))?);
 	}
 	anyhow::ensure!(!toks.is_empty(), "tokens.txt empty");
 	return Ok(toks);
@@ -71,7 +73,10 @@ fn archs_parity_vs_llama_cpp() {
 
 	let (mut ok, mut fail, mut unsup, mut err, mut noref) = (0u32, 0u32, 0u32, 0u32, 0u32);
 	let mut clean: HashMap<String, bool> = HashMap::new();
-	eprintln!("{:<20} {:<6} {}", "Model arch.", "Config", "recipe-infer vs llama.cpp");
+	eprintln!(
+		"{:<20} {:<6} {}",
+		"Model arch.", "Config", "recipe-infer vs llama.cpp"
+	);
 	for gguf in &models {
 		let stem = gguf.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
 		let (name, cfg) = match stem.rsplit_once('-') {

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "id": "next 0.1.0 (path+file:///fake/next)",
+      "name": "next",
+      "manifest_path": "/fake/next/Cargo.toml"
+    },
+    {
+      "id": "relationship 1.0.0 (registry+fake)",
+      "name": "relationship",
+      "manifest_path": "/fake/registry/relationship/Cargo.toml"
+    },
+    {
+      "id": "nccl-sys 1.0.0 (registry+fake)",
+      "name": "nccl-sys",
+      "manifest_path": "/fake/registry/nccl-sys/Cargo.toml"
+    }
+  ],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "next 0.1.0 (path+file:///fake/next)",
+        "dependencies": [
+          "relationship 1.0.0 (registry+fake)",
+          "nccl-sys 1.0.0 (registry+fake)"
+        ]
+      },
+      {
+        "id": "relationship 1.0.0 (registry+fake)",
+        "dependencies": []
+      },
+      {
+        "id": "nccl-sys 1.0.0 (registry+fake)",
+        "dependencies": []
+      }
+    ]
+  }
+}

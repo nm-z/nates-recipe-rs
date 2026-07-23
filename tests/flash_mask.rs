@@ -1,4 +1,3 @@
-
 use gpu_core::infer_ops::gpu_flash_gqa;
 use gpu_core::memory::GpuBuffer;
 use std::sync::Mutex;
@@ -6,7 +5,9 @@ use std::sync::Mutex;
 static GPU: Mutex<()> = Mutex::new(());
 
 fn lcg(seed: &mut u64) -> f64 {
-	*seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+	*seed = seed
+		.wrapping_mul(6364136223846793005)
+		.wrapping_add(1442695040888963407);
 	return ((*seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
 }
 
@@ -76,7 +77,10 @@ fn run_flash(
 	let cm = GpuBuffer::alloc(t_q * nqh).expect("cm");
 	let cl = GpuBuffer::alloc(t_q * nqh).expect("cl");
 	let cacc = GpuBuffer::alloc(t_q * nqh * hd).expect("cacc");
-	gpu_flash_gqa(&qb, &kb, &vb, t_q, t_kv, nqh, nkv, hd, 0.0, p_base, t_kv, &ob, &cm, &cl, &cacc, 0, true).expect("flash");
+	gpu_flash_gqa(
+		&qb, &kb, &vb, t_q, t_kv, nqh, nkv, hd, 0.0, p_base, t_kv, &ob, &cm, &cl, &cacc, 0, true,
+	)
+	.expect("flash");
 	gpu_core::hip::device_synchronize().expect("sync");
 	let mut out = vec![0.0f64; t_q * nqh * hd];
 	ob.download_host(&mut out).expect("download");

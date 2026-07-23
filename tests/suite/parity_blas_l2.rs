@@ -1,4 +1,3 @@
-
 use gpu_core::hip;
 use gpu_core::kernels::{gpu_dgemv_into, gpu_dger_into};
 use gpu_core::memory::GpuBuffer;

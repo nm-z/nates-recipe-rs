@@ -1,6 +1,6 @@
-use ogdl::log::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
+use ogdl::log::Write;
 use std::sync::Mutex;
 
 macro_rules! counters {
@@ -370,7 +370,7 @@ fn index_of(c: &AtomicU64) -> usize {
 		.position(|x| return ptr::eq(*x, c))
 		.unwrap_or_else(|| {
 			Write::error("callspy: counter not registered in ALL");
-				return 0;
+			return 0;
 		});
 }
 

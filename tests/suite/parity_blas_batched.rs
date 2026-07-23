@@ -1,20 +1,10 @@
-
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
 use std::ptr;
 
 // ── CPU oracles (plain Rust, row-major contiguous) ────────────────────────
 
-fn cpu_bmm(
-	a: &[f64],
-	b: &[f64],
-	batch: usize,
-	m: usize,
-	n: usize,
-	k: usize,
-	ta: bool,
-	tb: bool,
-) -> Vec<f64> {
+fn cpu_bmm(a: &[f64], b: &[f64], batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) -> Vec<f64> {
 	let mut c = vec![0.0f64; batch * m * n];
 	for bi in 0..batch {
 		let ao = bi * m * k;

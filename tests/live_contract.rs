@@ -7,8 +7,7 @@ fn loss_acc_line_bytes() {
 	let line = metrics_line(&[Metric::Loss, Metric::Accuracy], &[0.7451, 0.5528]);
 	assert_eq!(
 		line.as_bytes(),
-		"loss \u{1b}[38;2;242;40;60m 0.7451\u{1b}[0m  acc \u{1b}[38;2;39;125;255m0.5528\u{1b}[0m"
-			.as_bytes()
+		"loss \u{1b}[38;2;242;40;60m 0.7451\u{1b}[0m  acc \u{1b}[38;2;39;125;255m0.5528\u{1b}[0m".as_bytes()
 	);
 	return;
 }
@@ -47,8 +46,7 @@ fn nan_line_bytes() {
 	let line = metrics_line(&[Metric::Loss, Metric::Accuracy], &[f64::NAN, f64::NAN]);
 	assert_eq!(
 		line.as_bytes(),
-		"loss \u{1b}[38;2;242;40;60m    N/A\u{1b}[0m  acc \u{1b}[38;2;39;125;255m   N/A\u{1b}[0m"
-			.as_bytes()
+		"loss \u{1b}[38;2;242;40;60m    N/A\u{1b}[0m  acc \u{1b}[38;2;39;125;255m   N/A\u{1b}[0m".as_bytes()
 	);
 	return;
 }

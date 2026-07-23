@@ -80,10 +80,7 @@ fn hipconfig(flag: &str) -> Result<String, String> {
 	let out = match process::Command::new("hipconfig").arg(flag).output() {
 		Ok(out) => out,
 		Err(e) if e.kind() == io::ErrorKind::NotFound => {
-			return Err(
-				"hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia"
-					.to_owned(),
-			);
+			return Err("hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia".to_owned());
 		}
 		Err(e) => return Err(format!("hipconfig {flag}: cannot run: {e}")),
 	};
@@ -164,12 +161,7 @@ fn collect_hip_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	}
 }
 
-fn stage_cus(
-	files: &[PathBuf],
-	cudir: &str,
-	dev: &mut Vec<String>,
-	plain: &mut Vec<String>,
-) -> Result<(), String> {
+fn stage_cus(files: &[PathBuf], cudir: &str, dev: &mut Vec<String>, plain: &mut Vec<String>) -> Result<(), String> {
 	let Some((src_path, rest)) = files.split_first() else {
 		return Ok(());
 	};
@@ -202,8 +194,7 @@ fn sweep(dir: &Path) {
 			let is_a = Path::new(name)
 				.extension()
 				.is_some_and(|x| return x.eq_ignore_ascii_case("a"));
-			let stale = p.extension().is_some_and(|x| return x == "o")
-				|| (name.starts_with("libhip") && is_a);
+			let stale = p.extension().is_some_and(|x| return x == "o") || (name.starts_with("libhip") && is_a);
 			if stale {
 				drop(fs::remove_file(&p));
 			}
@@ -331,8 +322,7 @@ fn main() -> Result<(), String> {
 			));
 			let cudir = format!("{out_dir}/cu");
 			fresh_dir(&cudir)?;
-			let (mut device_lib_cus, mut plain_cus): (Vec<String>, Vec<String>) =
-				(Vec::new(), Vec::new());
+			let (mut device_lib_cus, mut plain_cus): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
 			stage_cus(&hip_files, &cudir, &mut device_lib_cus, &mut plain_cus)?;
 			compile_if(
 				&nvcc,

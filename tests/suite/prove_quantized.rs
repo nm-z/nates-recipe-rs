@@ -17,14 +17,7 @@ unsafe extern "C" {
 		n: i32,
 		s: *mut c_void,
 	);
-	fn launch_quantizedx_dequantize_i8(
-		q: *const c_void,
-		x: *mut c_void,
-		scale: f64,
-		zp: i32,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_quantizedx_dequantize_i8(q: *const c_void, x: *mut c_void, scale: f64, zp: i32, n: i32, s: *mut c_void);
 	fn launch_quantizedx_fake_quant_i8(
 		x: *const c_void,
 		o: *mut c_void,
@@ -177,12 +170,22 @@ fn canon(name: &str) -> Option<&'static str> {
 		.to_lowercase();
 
 	// ── library-prefix excludes (must test the FULL name, since the last
-	if full.contains("awq") || full.contains("aqlm") || full.contains("ggml")
-            || full.contains("gptq") || full.contains("hqq") || full.contains("llama_cpp")
-            || full.contains("exllamav2") || full.contains("bitsandbytes") || full.contains("unsloth")
-            || full.contains("marlin") || full.contains("flashinfer")
-            || full.contains("deepspeed") || full.contains("transformer_engine") || full.contains("__te$")
-            || full.contains("cudnn") || full.contains("cutlass")
+	if full.contains("awq")
+		|| full.contains("aqlm")
+		|| full.contains("ggml")
+		|| full.contains("gptq")
+		|| full.contains("hqq")
+		|| full.contains("llama_cpp")
+		|| full.contains("exllamav2")
+		|| full.contains("bitsandbytes")
+		|| full.contains("unsloth")
+		|| full.contains("marlin")
+		|| full.contains("flashinfer")
+		|| full.contains("deepspeed")
+		|| full.contains("transformer_engine")
+		|| full.contains("__te$")
+		|| full.contains("cudnn")
+		|| full.contains("cutlass")
 	{
 		return None;
 	}
@@ -190,11 +193,19 @@ fn canon(name: &str) -> Option<&'static str> {
 	if b.contains("fp8") || b.contains("fp4") || b.contains("nf4") {
 		return None;
 	}
-	if b.contains("blockwise") || b.contains("block_scale") || b.contains("_2bit")
-            || b.contains("_3bit") || b.contains("_4bit") || b.contains("to_4bit")
-            || b.contains("_k") || b.starts_with("dequantize_q") || b.starts_with("dequantize_iq")
-            || b.contains("gemm") || b.contains("packbits")
-            || b.contains("per_channel") || b.contains("perchannel")
+	if b.contains("blockwise")
+		|| b.contains("block_scale")
+		|| b.contains("_2bit")
+		|| b.contains("_3bit")
+		|| b.contains("_4bit")
+		|| b.contains("to_4bit")
+		|| b.contains("_k")
+		|| b.starts_with("dequantize_q")
+		|| b.starts_with("dequantize_iq")
+		|| b.contains("gemm")
+		|| b.contains("packbits")
+		|| b.contains("per_channel")
+		|| b.contains("perchannel")
 	{
 		return None;
 	}
@@ -243,18 +254,11 @@ fn canon(name: &str) -> Option<&'static str> {
 		return None;
 	}
 
-	if b.contains("fake_quant")
-		|| b.contains("fakequant")
-		|| b.contains("quantizeanddequantize")
-		|| b == "fake_quant"
+	if b.contains("fake_quant") || b.contains("fakequant") || b.contains("quantizeanddequantize") || b == "fake_quant"
 	{
 		return Some("fake_quant");
 	}
-	if b.starts_with("dequantize")
-		|| b == "dequantize"
-		|| b.contains("uniformdequantize")
-		|| b == "dequant"
-	{
+	if b.starts_with("dequantize") || b == "dequantize" || b.contains("uniformdequantize") || b == "dequant" {
 		return Some("dequantize");
 	}
 	if b.starts_with("quantize")

@@ -9,71 +9,23 @@ use core::ptr;
 unsafe extern "C" {
 	fn launch_rsqrt(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_reciprocal(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_emax(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_emin(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_emax(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_emin(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_sin(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_cos(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_tan(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_atan2(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_atan2(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_log1p(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_expm1(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_floor(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_ceil(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_round(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_trunc(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_fmod(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_sub_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *const c_void,
-		stream: *mut c_void,
-	);
-	fn launch_div_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *const c_void,
-		stream: *mut c_void,
-	);
-	fn launch_rsub_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *const c_void,
-		stream: *mut c_void,
-	);
-	fn launch_rdiv_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *const c_void,
-		stream: *mut c_void,
-	);
+	fn launch_fmod(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_sub_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const c_void, stream: *mut c_void);
+	fn launch_div_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const c_void, stream: *mut c_void);
+	fn launch_rsub_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const c_void, stream: *mut c_void);
+	fn launch_rdiv_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const c_void, stream: *mut c_void);
 	fn launch_has_nan(x: *const c_void, flag: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_isfinite_all(x: *const c_void, flag: *mut c_void, n: i32, stream: *mut c_void);
 	pub fn launch_tall_skinny_dgemm(
@@ -365,12 +317,7 @@ pub fn gpu_fmod(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Resu
 }
 
 #[inline]
-pub fn gpu_sub_scalar(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_sub_scalar(x: &GpuBuffer, s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
@@ -387,12 +334,7 @@ pub fn gpu_sub_scalar(
 }
 
 #[inline]
-pub fn gpu_div_scalar(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_div_scalar(x: &GpuBuffer, s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
@@ -409,12 +351,7 @@ pub fn gpu_div_scalar(
 }
 
 #[inline]
-pub fn gpu_rsub_scalar(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_rsub_scalar(x: &GpuBuffer, s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {
@@ -431,12 +368,7 @@ pub fn gpu_rsub_scalar(
 }
 
 #[inline]
-pub fn gpu_rdiv_scalar(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_rdiv_scalar(x: &GpuBuffer, s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x`, `s`, and `out` are valid device buffers; `s` holds one scalar.
 	unsafe {

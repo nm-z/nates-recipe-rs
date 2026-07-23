@@ -1,4 +1,3 @@
-
 use anyhow::{Context, Result};
 use recipe_infer::gguf::Gguf;
 use recipe_infer::tokenizer;
@@ -8,14 +7,20 @@ use std::path::{Path, PathBuf};
 fn cases(dir: &Path, stem: &str) -> Result<(Vec<String>, Vec<Vec<u32>>)> {
 	let inp = fs::read_to_string(dir.join(format!("{stem}.gguf.inp"))).context(".inp")?;
 	let out = fs::read_to_string(dir.join(format!("{stem}.gguf.out"))).context(".out")?;
-	let mut texts: Vec<String> =
-		inp.split("\n__ggml_vocab_test__\n").map(str::to_string).collect();
+	let mut texts: Vec<String> = inp
+		.split("\n__ggml_vocab_test__\n")
+		.map(str::to_string)
+		.collect();
 	if texts.last().is_some_and(String::is_empty) {
 		texts.pop();
 	}
 	let expected: Vec<Vec<u32>> = out
 		.lines()
-		.map(|l| l.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+		.map(|l| {
+			l.split_whitespace()
+				.filter_map(|x| x.parse().ok())
+				.collect()
+		})
 		.collect();
 	anyhow::ensure!(
 		texts.len() == expected.len(),
@@ -32,7 +37,9 @@ fn matched_cases(dir: &Path, stem: &str) -> Result<(usize, usize)> {
 	let (texts, expected) = cases(dir, stem)?;
 	let mut matched = 0;
 	for (text, want) in texts.iter().zip(expected.iter()) {
-		let got = tk.encode(text.as_str(), false).map(|e| e.get_ids().to_vec());
+		let got = tk
+			.encode(text.as_str(), false)
+			.map(|e| e.get_ids().to_vec());
 		if got.is_ok_and(|ids| &ids == want) {
 			matched += 1;
 		}
@@ -56,8 +63,8 @@ fn vocabs_parity_vs_llama_cpp() {
 	for gguf in &vocabs {
 		let stem = gguf.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
 		let name = stem.strip_prefix("ggml-vocab-").unwrap_or(stem);
-		let has_ref = dir.join(format!("{stem}.gguf.inp")).exists()
-			&& dir.join(format!("{stem}.gguf.out")).exists();
+		let has_ref =
+			dir.join(format!("{stem}.gguf.inp")).exists() && dir.join(format!("{stem}.gguf.out")).exists();
 		let verdict = if !has_ref {
 			noref += 1;
 			"\x1b[1;33mNOREF\x1b[0m".to_string()

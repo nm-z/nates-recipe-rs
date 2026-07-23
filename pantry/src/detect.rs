@@ -1,4 +1,3 @@
-
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -82,12 +81,12 @@ pub fn detect_kinds(path: &str, forward: ForwardFn) -> anyhow::Result<crate::enc
 								.collect()
 						})
 						.collect();
-					Some(kinds_for(headers, &non_empty, forward).map(|k| {
-						crate::encode::GroupKinds {
+					Some(
+						kinds_for(headers, &non_empty, forward).map(|k| crate::encode::GroupKinds {
 							name: name.clone(),
 							cols: k,
-						}
-					}))
+						}),
+					)
 				}
 				crate::data::DirGroup::Image { .. } => None,
 			})
@@ -95,7 +94,7 @@ pub fn detect_kinds(path: &str, forward: ForwardFn) -> anyhow::Result<crate::enc
 	}
 }
 
-fn kinds_for(
+pub(crate) fn kinds_for(
 	headers: &[String],
 	non_empty: &[Vec<&str>],
 	forward: ForwardFn,
@@ -153,9 +152,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 			cols: Vec::new(),
 		});
 	};
-	let first = first.map_err(|e| {
-		anyhow::anyhow!("detect_kinds: first record of {}: {e}", path.display())
-	})?;
+	let first = first.map_err(|e| anyhow::anyhow!("detect_kinds: first record of {}: {e}", path.display()))?;
 	let first_cells: Vec<String> = first
 		.iter()
 		.map(|s| String::from_utf8_lossy(s).into_owned())
@@ -194,9 +191,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 			break 'records;
 		};
 		for rec in records {
-			let rec = rec.map_err(|e| {
-				anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display())
-			})?;
+			let rec = rec.map_err(|e| anyhow::anyhow!("detect_kinds: record of {}: {e}", path.display()))?;
 			for j in 0..w {
 				let Ordering::Less = tok[j].cmp(&CONTEXT) else {
 					continue;
@@ -204,9 +199,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 				let cell = rec
 					.get(j)
 					.map_or(Cow::Borrowed(""), String::from_utf8_lossy);
-				let Some(()) =
-					Some(()).filter(|_u| !crate::encode::is_missing(cell.as_ref()))
-				else {
+				let Some(()) = Some(()).filter(|_u| !crate::encode::is_missing(cell.as_ref())) else {
 					continue;
 				};
 				take(j, cell.as_ref(), &mut cols, &mut tok);

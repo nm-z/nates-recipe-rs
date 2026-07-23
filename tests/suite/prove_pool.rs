@@ -1,4 +1,3 @@
-
 use gpu_core::memory::GpuBuffer;
 use std::ffi::c_void;
 use std::ptr;
@@ -293,9 +292,7 @@ fn prove_avg_pool_grad() {
 }
 
 fn prove_max_pool_grad() {
-	use gpu_core::kernels::{
-		gpu_max_pool_1d, gpu_max_pool_1d_backward, gpu_max_pool_2d, gpu_max_pool_2d_backward,
-	};
+	use gpu_core::kernels::{gpu_max_pool_1d, gpu_max_pool_1d_backward, gpu_max_pool_2d, gpu_max_pool_2d_backward};
 	let (n, out_len, nf) = (3usize, 4usize, 2usize);
 	let x: Vec<f64> = (0..n * out_len * nf)
 		.map(|i| ((i * 37 + 11) % 97) as f64)

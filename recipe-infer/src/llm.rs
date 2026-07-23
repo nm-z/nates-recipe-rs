@@ -1,14 +1,13 @@
 use crate::gguf::{Gguf, Val};
 use anyhow::{Context, Result, anyhow, bail};
 use gpu_core::infer_ops::{
-	gpu_convert, gpu_embed_blend, gpu_gelu_mul, gpu_gemm_bt, gpu_rmsnorm_f64,
-	gpu_rmsnorm_f64_nogamma,
+	gpu_convert, gpu_embed_blend, gpu_gelu_mul, gpu_gemm_bt, gpu_rmsnorm_f64, gpu_rmsnorm_f64_nogamma,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_copy_into, gpu_layernorm_into};
-use ogdl::log::probe as probe_flag;
-use ogdl::log::{Write, data, gpu};
 use gpu_core::memory::{Dtype, GpuBuffer};
 use gpu_core::waterfall::{Home, Waterfall};
+use ogdl::log::probe as probe_flag;
+use ogdl::log::{Write, data, gpu};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 use std::cell::RefCell;
@@ -97,8 +96,7 @@ impl Headless {
 	fn open(gguf: &Path, cap: usize) -> Result<Self> {
 		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 		let want = (2usize << 30) & !((1 << 21) - 1);
-		let slab =
-			gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
+		let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 		let mut claim = Waterfall::from_arena(slab);
 		let prep = (|| -> Result<(Model, Arena, GpuBuffer)> {
 			let m = load_model_gguf(gguf)?;
@@ -129,7 +127,6 @@ impl Headless {
 		fill_store(&mut h.m, claim, &mut || false)?;
 		return Ok(h);
 	}
-
 }
 
 impl Drop for Headless {
@@ -158,7 +155,16 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
 	let mut emb_scratch: Vec<u8> = Vec::new();
 	for c in toks.chunks(win) {
-		forward_rows(&h.m, c, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+		forward_rows(
+			&h.m,
+			c,
+			&h.attn_scale,
+			&h.ar,
+			&mut cache,
+			&mut logits,
+			&mut lm_scratch,
+			&mut emb_scratch,
+		)?;
 	}
 	let mut generated = Vec::with_capacity(n_new);
 	for _ in 0..n_new {
@@ -167,7 +173,16 @@ pub fn greedy_windowed(gguf: &Path, toks: &[u32], n_new: usize, win: usize) -> R
 		if generated.len() >= n_new {
 			break;
 		}
-		forward_rows(&h.m, &[next], &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+		forward_rows(
+			&h.m,
+			&[next],
+			&h.attn_scale,
+			&h.ar,
+			&mut cache,
+			&mut logits,
+			&mut lm_scratch,
+			&mut emb_scratch,
+		)?;
 	}
 	return Ok(generated);
 }
@@ -179,7 +194,16 @@ pub fn last_logits(gguf: &Path, toks: &[u32]) -> Result<Vec<f64>> {
 	let mut logits = vec![0.0f64; h.m.hp.vocab];
 	let mut lm_scratch = vec![0.0f64; h.m.hp.lm_chunk];
 	let mut emb_scratch: Vec<u8> = Vec::new();
-	forward_rows(&h.m, toks, &h.attn_scale, &h.ar, &mut cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+	forward_rows(
+		&h.m,
+		toks,
+		&h.attn_scale,
+		&h.ar,
+		&mut cache,
+		&mut logits,
+		&mut lm_scratch,
+		&mut emb_scratch,
+	)?;
 	let ls = models::logit_scale(&h.m);
 	if ls != 1.0 {
 		for v in logits.iter_mut() {
@@ -221,8 +245,7 @@ pub fn render_toks(toks: &[Tok]) -> String {
 pub fn toks_line(toks: &[Tok]) -> String {
 	let mut out = String::new();
 	for t in toks {
-		let Some(_keep) = Some(()).filter(|_probe| !matches!(t.status, TokStatus::Draft))
-		else {
+		let Some(_keep) = Some(()).filter(|_probe| !matches!(t.status, TokStatus::Draft)) else {
 			continue;
 		};
 		out.push_str(&t.text);
@@ -275,9 +298,9 @@ fn uint_arr(g: &Gguf, key: &str) -> Result<Vec<usize>> {
 		Some(Val::Arr(items)) => items
 			.iter()
 			.map(|v| {
-				as_uint(v).map(|x| x as usize).ok_or_else(|| {
-					anyhow!("gguf: kv {key} array holds a non-uint element")
-				})
+				as_uint(v)
+					.map(|x| x as usize)
+					.ok_or_else(|| anyhow!("gguf: kv {key} array holds a non-uint element"))
 			})
 			.collect(),
 		Some(_other) => bail!("gguf: kv {key} is not an array"),
@@ -457,13 +480,22 @@ impl Hparams {
 		let ssm_d_state = uint_kv_or(g, &k("ssm.state_size"), 0)?;
 		let ssm_dt_rank = uint_kv_or(g, &k("ssm.time_step_rank"), 0)?;
 		let ssm_n_group_raw = uint_kv_or(g, &k("ssm.group_count"), 0)?;
-		let ssm_n_group = if ssm_n_group_raw == 0 { 1 } else { ssm_n_group_raw };
-		let ssm_dt_dim = if arch == "plamo2" { (ne / 16).max(64) } else { 0 };
+		let ssm_n_group = if ssm_n_group_raw == 0 {
+			1
+		} else {
+			ssm_n_group_raw
+		};
+		let ssm_dt_dim = if arch == "plamo2" {
+			(ne / 16).max(64)
+		} else {
+			0
+		};
 		let kda_head_dim = uint_kv_or(g, &k("kda.head_dim"), 0)?;
 		let is_recr: Vec<bool> = match g.kv.get(&k("attention.recurrent_layers")) {
-			Some(Val::Arr(_items)) => {
-				uint_arr(g, &k("attention.recurrent_layers"))?.iter().map(|&x| x != 0).collect()
-			}
+			Some(Val::Arr(_items)) => uint_arr(g, &k("attention.recurrent_layers"))?
+				.iter()
+				.map(|&x| x != 0)
+				.collect(),
 			_other => head_count_kv.iter().map(|&kv| kv == 0).collect(),
 		};
 		let kda_n_head = if kda_head_dim > 0 {
@@ -608,7 +640,11 @@ impl Hparams {
 		} else {
 			0
 		};
-		let shortconv_win = if shortconv_l_cache > 0 { 3 * ne * ne } else { 0 };
+		let shortconv_win = if shortconv_l_cache > 0 {
+			3 * ne * ne
+		} else {
+			0
+		};
 		let win_elems = (qd_max.max(kd_max).max(nff).max(2 * nffe) * ne)
 			.max(mla_win)
 			.max(ssm_win)
@@ -743,9 +779,7 @@ fn read_whole(shards: &[File], t: &Tensor) -> Result<Raw> {
 
 fn bview(buf: &GpuBuffer, off_bytes: usize, len_bytes: usize) -> GpuBuffer {
 	if !(off_bytes.is_multiple_of(8) && len_bytes.is_multiple_of(8)) {
-		Write::error(format!(
-			"bview: unaligned {off_bytes}/{len_bytes}"
-		));
+		Write::error(format!("bview: unaligned {off_bytes}/{len_bytes}"));
 	}
 	buf.view(off_bytes / 8, len_bytes / 8)
 }
@@ -886,8 +920,12 @@ impl Arena {
 		let nff = hp.nff;
 		let nffe = hp.nffe;
 		let a = |n: usize| -> Result<GpuBuffer> {
-			return falloc(n)
-				.map_err(|_e| anyhow!("{}", gpu_core::memory::carve_miss_message(n * FWD_DT.elem_size())));
+			return falloc(n).map_err(|_e| {
+				anyhow!(
+					"{}",
+					gpu_core::memory::carve_miss_message(n * FWD_DT.elem_size())
+				)
+			});
 		};
 		let a64 = |n: usize| -> Result<GpuBuffer> {
 			return GpuBuffer::alloc_ty(n, Dtype::F64)
@@ -1089,14 +1127,7 @@ impl Model {
 		return read_raw_at(&self.shards, t, off, len);
 	}
 
-	fn read_into(
-		&self,
-		t: &Tensor,
-		off: usize,
-		len: usize,
-		dst: &GpuBuffer,
-		dst_off: usize,
-	) -> Result<()> {
+	fn read_into(&self, t: &Tensor, off: usize, len: usize, dst: &GpuBuffer, dst_off: usize) -> Result<()> {
 		let mut rb = self.rbuf.borrow_mut();
 		if rb.len() < len {
 			rb.resize(len, 0);
@@ -1113,7 +1144,10 @@ impl Model {
 	}
 
 	fn small_f64(&self, name: &str) -> Result<Vec<f64>> {
-		let t = self.big.get(name).ok_or_else(|| anyhow!("missing {name}"))?;
+		let t = self
+			.big
+			.get(name)
+			.ok_or_else(|| anyhow!("missing {name}"))?;
 		let n = t.elems();
 		let dt = t.dt;
 		let raw = self.read_raw(t, 0, t.nbytes)?;
@@ -1122,14 +1156,12 @@ impl Model {
 		self.to_stage(&raw)?;
 		let src = GpuBuffer::borrow(self.stage.ptr, raw.len()).as_dtype(dt);
 		let dst = self.win.view(0, whole);
-		gpu_convert(&src, &dst, whole, 1.0)
-			.map_err(|e| return anyhow!("small {name} convert: {e:?}"))?;
+		gpu_convert(&src, &dst, whole, 1.0).map_err(|e| return anyhow!("small {name} convert: {e:?}"))?;
 		let mut out = vec![0f64; whole];
 		dst.download_host(&mut out)?;
 		out.truncate(n);
 		return Ok(out);
 	}
-
 
 	fn read_host(&self, t: &Tensor, off: usize, dst: &mut [u8]) -> Result<()> {
 		let _d = Instant::now();
@@ -1143,8 +1175,13 @@ impl Model {
 	fn widen_from(&self, src: &GpuBuffer, off_bytes: usize, n: usize, dt: Dtype) -> Result<GpuBuffer> {
 		let _w = Instant::now();
 		let raw_len = bytes_for(n, dt);
-		gpu_convert(&bview(src, off_bytes, raw_len).as_dtype(dt), &self.win, n, 1.0)
-			.map_err(|e| return anyhow!("convert launch: {e:?}"))?;
+		gpu_convert(
+			&bview(src, off_bytes, raw_len).as_dtype(dt),
+			&self.win,
+			n,
+			1.0,
+		)
+		.map_err(|e| return anyhow!("convert launch: {e:?}"))?;
 		acc(&WIDEN_NS, _w);
 		return Ok(self.win.view(0, n));
 	}
@@ -1178,12 +1215,13 @@ impl Model {
 
 	fn layer_is_moe(&self, l: usize) -> bool {
 		self.big.contains_key(&layer_name(l, "experts.gate_proj"))
-			|| self.big.contains_key(&layer_name(l, "experts.gate_up_proj"))
+			|| self
+				.big
+				.contains_key(&layer_name(l, "experts.gate_up_proj"))
 	}
 
 	fn fill_expert(&self, l: usize, e: usize, dst: &mut [u8]) -> Result<()> {
-		let (gu_bytes, dn_bytes, half) =
-			(self.hp.gu_bytes, self.hp.dn_bytes, self.hp.gu_bytes / 2);
+		let (gu_bytes, dn_bytes, half) = (self.hp.gu_bytes, self.hp.dn_bytes, self.hp.gu_bytes / 2);
 		if let Some(gu) = self.big.get(&layer_name(l, "experts.gate_up_proj")) {
 			self.read_host(gu, e * gu_bytes, &mut dst[..gu_bytes])?;
 		} else {
@@ -1274,10 +1312,19 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 	("output_norm.bias", "norm.bias"),
 	("rope_factors_short.weight", "rope_short.weight"),
 	("rope_factors_long.weight", "rope_long.weight"),
-	("self_cond_pre_norm.weight", "self_conditioning.pre_norm.weight"),
-	("self_cond_gate.weight", "self_conditioning.gate_proj.weight"),
+	(
+		"self_cond_pre_norm.weight",
+		"self_conditioning.pre_norm.weight",
+	),
+	(
+		"self_cond_gate.weight",
+		"self_conditioning.gate_proj.weight",
+	),
 	("self_cond_up.weight", "self_conditioning.up_proj.weight"),
-	("self_cond_down.weight", "self_conditioning.down_proj.weight"),
+	(
+		"self_cond_down.weight",
+		"self_conditioning.down_proj.weight",
+	),
 ];
 
 const LAYER_MAP: &[(&str, &str)] = &[
@@ -1285,23 +1332,44 @@ const LAYER_MAP: &[(&str, &str)] = &[
 	("attn_norm.bias", "input_layernorm.bias"),
 	("attn_norm_2.weight", "self_attn.attn_norm_2.weight"),
 	("attn_norm_2.bias", "self_attn.attn_norm_2.bias"),
-	("attn_output_norm.weight", "pre_feedforward_layernorm.weight"),
-	("post_attention_norm.weight", "post_attention_layernorm.weight"),
+	(
+		"attn_output_norm.weight",
+		"pre_feedforward_layernorm.weight",
+	),
+	(
+		"post_attention_norm.weight",
+		"post_attention_layernorm.weight",
+	),
 	("post_attention_norm.bias", "post_attention_layernorm.bias"),
 	("attn_q_norm.weight", "self_attn.q_norm.weight"),
 	("attn_k_norm.weight", "self_attn.k_norm.weight"),
 	("ffn_norm.weight", "pre_feedforward_layernorm.weight"),
 	("ffn_norm.bias", "pre_feedforward_layernorm.bias"),
-	("post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"),
-	("pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
-	("post_ffw_norm_2.weight", "post_feedforward_layernorm_2.weight"),
+	(
+		"post_ffw_norm_1.weight",
+		"post_feedforward_layernorm_1.weight",
+	),
+	(
+		"pre_ffw_norm_2.weight",
+		"pre_feedforward_layernorm_2.weight",
+	),
+	(
+		"post_ffw_norm_2.weight",
+		"post_feedforward_layernorm_2.weight",
+	),
 	("post_ffw_norm.weight", "post_feedforward_layernorm.weight"),
 	("attn_q.weight", "self_attn.q_proj.weight"),
 	("attn_k.weight", "self_attn.k_proj.weight"),
 	("attn_v.weight", "self_attn.v_proj.weight"),
 	("shortconv.conv.weight", "self_attn.shortconv_conv.weight"),
-	("shortconv.in_proj.weight", "self_attn.shortconv_in_proj.weight"),
-	("shortconv.out_proj.weight", "self_attn.shortconv_out_proj.weight"),
+	(
+		"shortconv.in_proj.weight",
+		"self_attn.shortconv_in_proj.weight",
+	),
+	(
+		"shortconv.out_proj.weight",
+		"self_attn.shortconv_out_proj.weight",
+	),
 	("attn_q_a.weight", "self_attn.q_a_proj.weight"),
 	("attn_q_b.weight", "self_attn.q_b_proj.weight"),
 	("attn_kv_a_mqa.weight", "self_attn.kv_a_proj.weight"),
@@ -1372,9 +1440,21 @@ enum Slice {
 }
 
 const SLICE_MAP: &[(&str, &str, Slice)] = &[
-	("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvQ),
-	("self_attn.k_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvK),
-	("self_attn.v_proj.weight", "self_attn.qkv_proj.weight", Slice::QkvV),
+	(
+		"self_attn.q_proj.weight",
+		"self_attn.qkv_proj.weight",
+		Slice::QkvQ,
+	),
+	(
+		"self_attn.k_proj.weight",
+		"self_attn.qkv_proj.weight",
+		Slice::QkvK,
+	),
+	(
+		"self_attn.v_proj.weight",
+		"self_attn.qkv_proj.weight",
+		Slice::QkvV,
+	),
 ];
 
 fn hf_name(gg: &str) -> Option<String> {
@@ -1527,7 +1607,11 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	};
 	let attn_scale_mla = {
 		let ub = falloc(1)?;
-		let s = if hp.is_mla() { 1.0 / (hp.head_k_mla as f64).sqrt() } else { 1.0 };
+		let s = if hp.is_mla() {
+			1.0 / (hp.head_k_mla as f64).sqrt()
+		} else {
+			1.0
+		};
 		ub.load(&[s])?;
 		ub
 	};
@@ -1601,7 +1685,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 	};
 
 	let plus_one = false;
-	Write::line(data, "norm convention: folded x*w (gguf stores gammas as saved)");
+	Write::line(
+		data,
+		"norm convention: folded x*w (gguf stores gammas as saved)",
+	);
 
 	for l in 0..nl {
 		Write::line(data, format!("norms layer {}/{}", l + 1, nl));
@@ -1622,7 +1709,10 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			}
 		}
 		if nm[Nk::PreFf as usize].is_none() && m.big.contains_key(&p("post_attention_layernorm.weight")) {
-			let g = upload_gamma(&m.small_f64(&p("post_attention_layernorm.weight"))?, plus_one)?;
+			let g = upload_gamma(
+				&m.small_f64(&p("post_attention_layernorm.weight"))?,
+				plus_one,
+			)?;
 			nm[Nk::PreFf as usize] = Some(g);
 		}
 		m.norms.push(nm);
@@ -1675,7 +1765,8 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 			ub.load(&[lsv])?;
 			ub
 		});
-		m.ssm_conv_w.push(opt_bias(&m, p("self_attn.ssm_conv1d.weight"))?);
+		m.ssm_conv_w
+			.push(opt_bias(&m, p("self_attn.ssm_conv1d.weight"))?);
 		let conv_b = match opt_bias(&m, p("self_attn.ssm_conv1d.bias"))? {
 			Some(b) => Some(b),
 			None if m.big.contains_key(&p("self_attn.ssm_conv1d.weight")) => {
@@ -1689,14 +1780,21 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		m.ssm_a.push(opt_bias(&m, p("self_attn.ssm_a"))?);
 		m.ssm_d.push(opt_bias(&m, p("self_attn.ssm_d"))?);
 		m.ssm_dt_b.push(opt_bias(&m, p("self_attn.ssm_dt.bias"))?);
-		m.ssm_norm.push(opt_bias(&m, p("self_attn.ssm_norm.weight"))?);
+		m.ssm_norm
+			.push(opt_bias(&m, p("self_attn.ssm_norm.weight"))?);
 		m.ffn_gate_bias.push(opt_bias(&m, p("mlp.gate_proj.bias"))?);
-		m.ssm_dt_norm.push(opt_bias(&m, p("self_attn.ssm_dt_norm.weight"))?);
-		m.ssm_b_norm.push(opt_bias(&m, p("self_attn.ssm_b_norm.weight"))?);
-		m.ssm_c_norm.push(opt_bias(&m, p("self_attn.ssm_c_norm.weight"))?);
-		m.ssm_q_conv_w.push(opt_bias(&m, p("self_attn.q_conv.weight"))?);
-		m.ssm_k_conv_w.push(opt_bias(&m, p("self_attn.k_conv.weight"))?);
-		m.ssm_v_conv_w.push(opt_bias(&m, p("self_attn.v_conv.weight"))?);
+		m.ssm_dt_norm
+			.push(opt_bias(&m, p("self_attn.ssm_dt_norm.weight"))?);
+		m.ssm_b_norm
+			.push(opt_bias(&m, p("self_attn.ssm_b_norm.weight"))?);
+		m.ssm_c_norm
+			.push(opt_bias(&m, p("self_attn.ssm_c_norm.weight"))?);
+		m.ssm_q_conv_w
+			.push(opt_bias(&m, p("self_attn.q_conv.weight"))?);
+		m.ssm_k_conv_w
+			.push(opt_bias(&m, p("self_attn.k_conv.weight"))?);
+		m.ssm_v_conv_w
+			.push(opt_bias(&m, p("self_attn.v_conv.weight"))?);
 		m.exp_probs_b.push(opt_bias(&m, p("router.bias"))?);
 	}
 
@@ -1716,9 +1814,7 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		ub.load(&vals)?;
 		m.decoder_norm_b = Some(ub);
 	}
-	if m.big.contains_key("model.decoder.embed_norm.weight")
-		&& m.big.contains_key("model.decoder.embed_norm.bias")
-	{
+	if m.big.contains_key("model.decoder.embed_norm.weight") && m.big.contains_key("model.decoder.embed_norm.bias") {
 		let g = {
 			let vals = m.small_f64("model.decoder.embed_norm.weight")?;
 			let ub = falloc(vals.len())?;
@@ -1733,7 +1829,9 @@ fn finish_load(shards: Vec<File>, big: HashMap<String, Tensor>, hp: Hparams) -> 
 		};
 		m.embed_norm = Some((g, b));
 	}
-	if m.big.contains_key("model.decoder.self_conditioning.pre_norm.weight") {
+	if m.big
+		.contains_key("model.decoder.self_conditioning.pre_norm.weight")
+	{
 		m.sc_pre = upload_gamma(
 			&m.small_f64("model.decoder.self_conditioning.pre_norm.weight")?,
 			plus_one,
@@ -1785,8 +1883,7 @@ fn fixed_names(m: &Model, l: usize) -> Vec<String> {
 		"self_attn.ssm_dt.weight",
 		"self_attn.ssm_out.weight",
 	];
-	ROLES
-		.iter()
+	ROLES.iter()
 		.map(|r| layer_name(l, r))
 		.filter(|n| m.big.contains_key(n))
 		.collect()
@@ -1863,9 +1960,7 @@ fn fill_store(m: &mut Model, store: Waterfall, cancel: &mut dyn FnMut() -> bool)
 				let mut got = vec![0u8; n];
 				bview(dev, off, n).download_u8(&mut got)?;
 				if got != want {
-					bail!(
-						"waterfall {name} stale at byte {off}: upload not visible to GPU reads"
-					);
+					bail!("waterfall {name} stale at byte {off}: upload not visible to GPU reads");
 				}
 			}
 		}
@@ -1878,10 +1973,14 @@ fn fill_into(m: &Model, store: &mut Waterfall, cancel: &mut dyn FnMut() -> bool)
 	let nexp = m.hp.nexp;
 	let slot_bytes = m.hp.slot_bytes;
 	beat();
-	store.place("model.decoder.embed_tokens.weight", m.emb.bytes.len(), |dst| {
-		dst.copy_from_slice(&m.emb.bytes);
-		Ok(())
-	})?;
+	store.place(
+		"model.decoder.embed_tokens.weight",
+		m.emb.bytes.len(),
+		|dst| {
+			dst.copy_from_slice(&m.emb.bytes);
+			Ok(())
+		},
+	)?;
 	beat();
 	if cancel() {
 		return Ok(false);
@@ -1934,7 +2033,6 @@ fn xs(st: &mut u64) -> f64 {
 	(*st >> 11) as f64 / (1u64 << 53) as f64
 }
 
-
 fn layer_name(l: usize, suffix: &str) -> String {
 	format!("model.decoder.layers.{l}.{suffix}")
 }
@@ -1963,21 +2061,16 @@ fn lm_head_into(
 		let w = match &m.out {
 			Some(out) => {
 				let dt = out.dt;
-				m.to_stage(
-					&out.bytes[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)],
-				)?;
+				m.to_stage(&out.bytes[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)])?;
 				m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
 			}
 			None => {
 				let dt = m.emb.dt;
 				match m.store.home("model.decoder.embed_tokens.weight") {
-					Some(Home::Vram(dev)) => {
-						m.widen_from(dev, bytes_for(c0 * hp.ne, dt), cn * hp.ne, dt)?
-					}
+					Some(Home::Vram(dev)) => m.widen_from(dev, bytes_for(c0 * hp.ne, dt), cn * hp.ne, dt)?,
 					_other => {
 						m.to_stage(
-							&m.emb.bytes[bytes_for(c0 * hp.ne, dt)
-								..bytes_for((c0 + cn) * hp.ne, dt)],
+							&m.emb.bytes[bytes_for(c0 * hp.ne, dt)..bytes_for((c0 + cn) * hp.ne, dt)],
 						)?;
 						m.widen_from(&m.stage, 0, cn * hp.ne, dt)?
 					}
@@ -1988,14 +2081,16 @@ fn lm_head_into(
 		ar.lm_out.download_host(&mut out_host[..ncanvas * cn])?;
 		gpu_core::hip::device_synchronize()?;
 		for p in 0..ncanvas {
-			logits[p * hp.vocab + c0..p * hp.vocab + c0 + cn]
-				.copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
+			logits[p * hp.vocab + c0..p * hp.vocab + c0 + cn].copy_from_slice(&out_host[p * cn..(p + 1) * cn]);
 		}
 		c0 += cn;
 	}
 	if models::out_bias(m) && !m.out_b.is_empty() {
 		for p in 0..ncanvas {
-			for (j, lg) in logits[p * hp.vocab..(p + 1) * hp.vocab].iter_mut().enumerate() {
+			for (j, lg) in logits[p * hp.vocab..(p + 1) * hp.vocab]
+				.iter_mut()
+				.enumerate()
+			{
 				*lg += m.out_b[j];
 			}
 		}
@@ -2003,7 +2098,6 @@ fn lm_head_into(
 	acc(&LM_NS, _tl);
 	Ok(())
 }
-
 
 pub(crate) enum LayerCache {
 	Kv(KvSlot),
@@ -2055,7 +2149,11 @@ impl LayerCache {
 		};
 		match (c.get(i), n.get(i)) {
 			(Some(r), Some(w)) => return Ok((r, w)),
-			_missing => return Err(anyhow!("conv {i} has no cache window (layer_cache_shape mismatch)")),
+			_missing => {
+				return Err(anyhow!(
+					"conv {i} has no cache window (layer_cache_shape mismatch)"
+				));
+			}
 		}
 	}
 }
@@ -2126,18 +2224,18 @@ impl HostStore {
 			bail!("KV spill file {} closed mid-append", self.path.display());
 		};
 		f.write_all_at(&bytes, self.file_len as u64)
-			.with_context(|| format!("KV spill write at {} in {}", self.file_len, self.path.display()))?;
+			.with_context(|| {
+				format!(
+					"KV spill write at {} in {}",
+					self.file_len,
+					self.path.display()
+				)
+			})?;
 		self.file_len += bytes.len();
 		return Ok(());
 	}
 
-	pub fn stage_into(
-		&self,
-		off: usize,
-		len: usize,
-		dst: &GpuBuffer,
-		scratch: &mut Vec<u8>,
-	) -> Result<()> {
+	pub fn stage_into(&self, off: usize, len: usize, dst: &GpuBuffer, scratch: &mut Vec<u8>) -> Result<()> {
 		anyhow::ensure!(
 			off + len <= self.len(),
 			"KV host store: staging [{off}, {}) past the {} stored bytes",
@@ -2153,18 +2251,23 @@ impl HostStore {
 		if file_n > 0 {
 			let mut rf = self.rf.borrow_mut();
 			if rf.is_none() {
-				*rf = Some(
-					File::open(&self.path)
-						.with_context(|| format!("KV spill read-open {}", self.path.display()))?,
-				);
+				*rf = Some(File::open(&self.path)
+					.with_context(|| format!("KV spill read-open {}", self.path.display()))?);
 			}
 			let Some(f) = rf.as_ref() else {
-				bail!("KV host store: {} file bytes requested but no spill file", file_n);
+				bail!(
+					"KV host store: {} file bytes requested but no spill file",
+					file_n
+				);
 			};
 			let foff = (off + ram_n - self.ram.len()) as u64;
 			scratch.resize(file_n, 0);
-			f.read_exact_at(scratch, foff)
-				.with_context(|| format!("KV spill read [{foff}, +{file_n}) from {}", self.path.display()))?;
+			f.read_exact_at(scratch, foff).with_context(|| {
+				format!(
+					"KV spill read [{foff}, +{file_n}) from {}",
+					self.path.display()
+				)
+			})?;
 			dst.view(ram_n / es, file_n / es).write_u8(&scratch[..])?;
 		}
 		return Ok(());
@@ -2196,8 +2299,9 @@ impl KvCache {
 	fn new(m: &Model, win: usize, host_cap: usize) -> Result<KvCache> {
 		let nl = m.hp.nl;
 		let es = FWD_DT.elem_size();
-		let shapes: Vec<models::LayerCacheShape> =
-			(0..nl).map(|l| return models::layer_cache_shape(m, l)).collect();
+		let shapes: Vec<models::LayerCacheShape> = (0..nl)
+			.map(|l| return models::layer_cache_shape(m, l))
+			.collect();
 		let kw: Vec<usize> = shapes.iter().map(|s| return s.kw).collect();
 		let vw: Vec<usize> = shapes.iter().map(|s| return s.vw).collect();
 		let rec_sz: Vec<usize> = shapes.iter().map(|s| return s.rec).collect();
@@ -2211,9 +2315,15 @@ impl KvCache {
 		};
 		let sid = KV_SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
 		let store = |w: usize, name: &str, l: usize| -> HostStore {
-			let budget = if total_w > 0 { ram_budget / total_w * w } else { 0 };
-			let path = spill_dir
-				.join(format!("recipe-kv-{}-{sid}-l{l}-{name}.spill", process::id()));
+			let budget = if total_w > 0 {
+				ram_budget / total_w * w
+			} else {
+				0
+			};
+			let path = spill_dir.join(format!(
+				"recipe-kv-{}-{sid}-l{l}-{name}.spill",
+				process::id()
+			));
 			return HostStore::new(budget, path);
 		};
 		let scan_slot = |s: &models::LayerCacheShape| -> Result<ScanSlot> {
@@ -2247,7 +2357,10 @@ impl KvCache {
 				(false, true, _conv) => LayerCache::Scan(scan_slot(s)?),
 				(false, false, true) => {
 					let sc = scan_slot(s)?;
-					LayerCache::Conv(ConvSlot { conv: sc.conv, nxt: sc.nxt })
+					LayerCache::Conv(ConvSlot {
+						conv: sc.conv,
+						nxt: sc.nxt,
+					})
 				}
 				(false, false, false) => LayerCache::Kv(kv_slot(())?),
 			};
@@ -2295,7 +2408,11 @@ impl KvCache {
 		let es = FWD_DT.elem_size();
 		let zero_scan = |s: &ScanSlot, sz: usize, szs: &[usize]| -> Result<()> {
 			s.rec.memset_zero(sz.max(1) * es)?;
-			for (b, &w) in s.conv.iter().chain(s.nxt.iter()).zip(szs.iter().chain(szs.iter())) {
+			for (b, &w) in
+				s.conv.iter()
+					.chain(s.nxt.iter())
+					.zip(szs.iter().chain(szs.iter()))
+			{
 				b.memset_zero(w.max(1) * es)?;
 			}
 			return Ok(());
@@ -2309,7 +2426,11 @@ impl KvCache {
 					kv.hv.truncate(0);
 				}
 				LayerCache::Conv(s) => {
-					for (b, &w) in s.conv.iter().chain(s.nxt.iter()).zip(self.conv_sz[l].iter().chain(self.conv_sz[l].iter())) {
+					for (b, &w) in
+						s.conv.iter()
+							.chain(s.nxt.iter())
+							.zip(self.conv_sz[l].iter().chain(self.conv_sz[l].iter()))
+					{
 						b.memset_zero(w.max(1) * es)?;
 					}
 				}
@@ -2414,10 +2535,9 @@ impl Sampler {
 			k => k.min(n),
 		};
 		let shaped = &self.shaped;
-		self.order
-			.select_nth_unstable_by(k - 1, |&a, &b| {
-				return shaped[b as usize].total_cmp(&shaped[a as usize]);
-			});
+		self.order.select_nth_unstable_by(k - 1, |&a, &b| {
+			return shaped[b as usize].total_cmp(&shaped[a as usize]);
+		});
 		self.order.truncate(k);
 		self.order.sort_unstable_by(|&a, &b| {
 			return shaped[b as usize].total_cmp(&shaped[a as usize]);
@@ -2577,12 +2697,30 @@ fn decode_cached(
 	let decode_start = Instant::now();
 	if cache.len == 0 {
 		for c in toks.chunks(chunk) {
-			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+			forward_rows(
+				m,
+				c,
+				attn_scale,
+				&ar,
+				cache,
+				&mut logits,
+				&mut lm_scratch,
+				&mut emb_scratch,
+			)?;
 		}
 	} else {
 		let suffix = toks[cache.len..].to_vec();
 		for c in suffix.chunks(chunk) {
-			forward_rows(m, c, attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+			forward_rows(
+				m,
+				c,
+				attn_scale,
+				&ar,
+				cache,
+				&mut logits,
+				&mut lm_scratch,
+				&mut emb_scratch,
+			)?;
 		}
 	}
 	let mut out_ids: Vec<u32> = Vec::new();
@@ -2602,7 +2740,16 @@ fn decode_cached(
 		if !keep_going || out_ids.len() >= max_new || cache.len >= cache.t_max {
 			break;
 		}
-		forward_rows(m, &[next], attn_scale, &ar, cache, &mut logits, &mut lm_scratch, &mut emb_scratch)?;
+		forward_rows(
+			m,
+			&[next],
+			attn_scale,
+			&ar,
+			cache,
+			&mut logits,
+			&mut lm_scratch,
+			&mut emb_scratch,
+		)?;
 		next = smp.pick(&logits, vocab_size, lsc, softcap);
 	}
 	let elapsed = decode_start.elapsed();
@@ -2622,14 +2769,16 @@ pub fn vram_probe_ask() -> Result<usize> {
 }
 
 fn probe_claim() -> Result<Waterfall> {
-	let want = gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB)
-		& !((1 << 21) - 1);
+	let want = gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB) & !((1 << 21) - 1);
 	if want < (1 << 30) {
 		bail!("claim probe: nothing mappable above 1 GB");
 	}
 	Write::line(
 		gpu,
-		format!("claim: {:.2} GB (measured)", want as f64 / (1u64 << 30) as f64),
+		format!(
+			"claim: {:.2} GB (measured)",
+			want as f64 / (1u64 << 30) as f64
+		),
 	);
 	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 	let w = Waterfall::from_arena(slab);
@@ -2750,10 +2899,7 @@ impl Opened {
 }
 
 impl ChatSession {
-	pub fn open(
-		gguf: &Path,
-		load_round: &mut dyn FnMut(&[Tok]) -> bool,
-	) -> Result<Opened> {
+	pub fn open(gguf: &Path, load_round: &mut dyn FnMut(&[Tok]) -> bool) -> Result<Opened> {
 		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 		let t_load = Instant::now();
 		let watchdog = arm_watchdog();
@@ -2820,11 +2966,7 @@ impl ChatSession {
 		})));
 	}
 
-	pub fn generate_in(
-		&mut self,
-		prompt: &str,
-		on_round: &mut dyn FnMut(&[Tok]) -> bool,
-	) -> Result<String> {
+	pub fn generate_in(&mut self, prompt: &str, on_round: &mut dyn FnMut(&[Tok]) -> bool) -> Result<String> {
 		let ncanvas = self.m.hp.ncanvas;
 		let mask = self.m.hp.mask;
 		let enc = self
@@ -2856,12 +2998,32 @@ impl ChatSession {
 			}
 			Write::line(
 				data,
-				format!("kvcache reuse: cached_prefix={} new_suffix={}", cache.len, toks.len() - cache.len),
+				format!(
+					"kvcache reuse: cached_prefix={} new_suffix={}",
+					cache.len,
+					toks.len() - cache.len
+				),
 			);
-			return decode_cached(&self.m, &self.tokenizer, &toks, &self.attn_scale, cache, &mut self.sampler, on_round);
+			return decode_cached(
+				&self.m,
+				&self.tokenizer,
+				&toks,
+				&self.attn_scale,
+				cache,
+				&mut self.sampler,
+				on_round,
+			);
 		}
 		let cache = &mut self.cache;
-		return refine_canvas(&self.m, &self.vocab, toks, prefix, &self.attn_scale, cache, on_round);
+		return refine_canvas(
+			&self.m,
+			&self.vocab,
+			toks,
+			prefix,
+			&self.attn_scale,
+			cache,
+			on_round,
+		);
 	}
 }
 
@@ -2873,11 +3035,7 @@ impl Drop for ChatSession {
 	}
 }
 
-pub fn generate(
-	gguf: &Path,
-	prompt: &str,
-	on_round: &mut dyn FnMut(&[Tok]) -> bool,
-) -> Result<String> {
+pub fn generate(gguf: &Path, prompt: &str, on_round: &mut dyn FnMut(&[Tok]) -> bool) -> Result<String> {
 	let mut session = match ChatSession::open(gguf, on_round)? {
 		Opened::Session(s) => *s,
 		Opened::Cancelled => return Ok(String::new()),
@@ -2927,7 +3085,17 @@ fn refine_canvas(
 	for step in 0..6 {
 		picks.clear();
 		picks.extend(toks.iter().map(|&tk| return (tk as usize, 1.0)));
-		embed_blend_into(m, &ar, &picks, t, 1, scl, &ar.ha, &mut emb_scratch, &mut emb_wts)?;
+		embed_blend_into(
+			m,
+			&ar,
+			&picks,
+			t,
+			1,
+			scl,
+			&ar.ha,
+			&mut emb_scratch,
+			&mut emb_wts,
+		)?;
 
 		let coff = prefix * ne;
 		let clen = ncanvas * ne;
@@ -2958,15 +3126,10 @@ fn refine_canvas(
 			gpu_add_into(&ar.ha.view(coff, clen), &ar.sc_add, clen, &ar.cur)?;
 			gpu_rmsnorm_f64_nogamma(&ar.cur, &m.eps, ncanvas, ne, &ar.normed)?;
 		} else {
-			gpu_rmsnorm_f64_nogamma(
-				&ar.ha.view(coff, clen),
-				&m.eps,
-				ncanvas,
-				ne,
-				&ar.normed,
-			)?;
+			gpu_rmsnorm_f64_nogamma(&ar.ha.view(coff, clen), &m.eps, ncanvas, ne, &ar.normed)?;
 		}
-		ar.ha.view(coff, clen).copy_from(&ar.normed, clen * FWD_DT.elem_size())?;
+		ar.ha.view(coff, clen)
+			.copy_from(&ar.normed, clen * FWD_DT.elem_size())?;
 
 		let bithash = |b: &GpuBuffer, n: usize| -> Result<u64> {
 			let mut v = vec![0.0f64; n];
@@ -3035,16 +3198,13 @@ fn refine_canvas(
 		for c in 0..ncanvas {
 			let row = &logits[c * vocab_size..(c + 1) * vocab_size];
 			let mut cand: Vec<(usize, f64)> = (0..vocab_size)
-				.filter(|&tk| {
-					tk >= 6 && Some(tk) != mask_signal && !vocab[tk].starts_with('<')
-				})
+				.filter(|&tk| tk >= 6 && Some(tk) != mask_signal && !vocab[tk].starts_with('<'))
 				.map(|tk| (tk, row[tk]))
 				.collect();
 			cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmp::Ordering::Equal));
 			cand.truncate(50);
 			let ml = cand[0].1;
-			let mut probs: Vec<f64> =
-				cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
+			let mut probs: Vec<f64> = cand.iter().map(|&(_, l)| ((l - ml) / temp).exp()).collect();
 			let sum: f64 = probs.iter().sum();
 			for x in probs.iter_mut() {
 				*x /= sum;

@@ -3,8 +3,7 @@ use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
 use crate::hip::{check, hipGetLastError};
 use crate::infer_ops::gpu_gemm_bt;
 use crate::kernels::{
-	ci, gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_softmax_backward_into,
-	gpu_softmax_rows_into,
+	ci, gpu_add_inplace, gpu_copy_into, gpu_gemm, gpu_gemm_at, gpu_softmax_backward_into, gpu_softmax_rows_into,
 };
 use crate::memory::GpuBuffer;
 use core::ffi::c_void;

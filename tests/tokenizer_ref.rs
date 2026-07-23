@@ -1,4 +1,3 @@
-
 use recipe_infer::gguf::Gguf;
 use recipe_infer::tokenizer;
 use std::fs;
@@ -19,7 +18,11 @@ fn spm_tokenization_matches_llama_cpp() {
 	}
 	let expected: Vec<Vec<u32>> = out
 		.lines()
-		.map(|l| l.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+		.map(|l| {
+			l.split_whitespace()
+				.filter_map(|x| x.parse().ok())
+				.collect()
+		})
 		.collect();
 	assert_eq!(
 		texts.len(),

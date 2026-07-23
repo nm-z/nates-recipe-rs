@@ -1,8 +1,7 @@
 use crate::HipError;
 use crate::hip::check;
 use crate::kernels::{
-	ci, gpu_copy_into, gpu_pack_upper_tri, gpu_transpose, hipblas_handle, hipsolver_handle,
-	safe_i32,
+	ci, gpu_copy_into, gpu_pack_upper_tri, gpu_transpose, hipblas_handle, hipsolver_handle, safe_i32,
 };
 use crate::memory::GpuBuffer;
 use core::cmp::Ordering;
@@ -26,21 +25,9 @@ const HIPFFT_FORWARD: i32 = -1;
 const HIPFFT_BACKWARD: i32 = 1;
 
 unsafe extern "C" {
-	fn hipblasDasum(
-		handle: *mut c_void,
-		n: i32,
-		x: *const f64,
-		incx: i32,
-		result: *mut f64,
-	) -> i32;
+	fn hipblasDasum(handle: *mut c_void, n: i32, x: *const f64, incx: i32, result: *mut f64) -> i32;
 
-	fn hipblasIdamax(
-		handle: *mut c_void,
-		n: i32,
-		x: *const f64,
-		incx: i32,
-		result: *mut i32,
-	) -> i32;
+	fn hipblasIdamax(handle: *mut c_void, n: i32, x: *const f64, incx: i32, result: *mut i32) -> i32;
 
 	fn hipblasDsyrk(
 		handle: *mut c_void,
@@ -77,14 +64,7 @@ unsafe extern "C" {
 		batch_count: i32,
 	) -> i32;
 
-	fn hipsolverDgetrf_bufferSize(
-		h: *mut c_void,
-		m: i32,
-		n: i32,
-		A: *mut f64,
-		lda: i32,
-		lwork: *mut i32,
-	) -> i32;
+	fn hipsolverDgetrf_bufferSize(h: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32) -> i32;
 	fn hipsolverDgetrf(
 		h: *mut c_void,
 		m: i32,
@@ -149,14 +129,7 @@ unsafe extern "C" {
 		info: *mut i32,
 	) -> i32;
 
-	fn hipsolverDgeqrf_bufferSize(
-		h: *mut c_void,
-		m: i32,
-		n: i32,
-		A: *mut f64,
-		lda: i32,
-		lwork: *mut i32,
-	) -> i32;
+	fn hipsolverDgeqrf_bufferSize(h: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32) -> i32;
 	fn hipsolverDgeqrf(
 		h: *mut c_void,
 		m: i32,
@@ -215,14 +188,7 @@ unsafe extern "C" {
 		info: *mut i32,
 	) -> i32;
 
-	fn hipsolverDgesvd_bufferSize(
-		h: *mut c_void,
-		jobu: i8,
-		jobv: i8,
-		m: i32,
-		n: i32,
-		lwork: *mut i32,
-	) -> i32;
+	fn hipsolverDgesvd_bufferSize(h: *mut c_void, jobu: i8, jobv: i8, m: i32, n: i32, lwork: *mut i32) -> i32;
 	fn hipsolverDgesvd(
 		h: *mut c_void,
 		jobu: i8,
@@ -243,12 +209,7 @@ unsafe extern "C" {
 	) -> i32;
 
 	fn hipfftPlan1d(plan: *mut *mut c_void, nx: i32, fft_type: i32, batch: i32) -> i32;
-	fn hipfftExecZ2Z(
-		plan: *mut c_void,
-		idata: *mut c_void,
-		odata: *mut c_void,
-		direction: i32,
-	) -> i32;
+	fn hipfftExecZ2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void, direction: i32) -> i32;
 	fn hipfftExecD2Z(plan: *mut c_void, idata: *mut c_void, odata: *mut c_void) -> i32;
 }
 
@@ -864,12 +825,7 @@ fn fft_plan(fft_type: i32, n: usize) -> Result<*mut c_void, HipError> {
 }
 
 #[inline]
-pub fn gpu_fft_c2c_1d(
-	input: &GpuBuffer,
-	n: usize,
-	forward: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_fft_c2c_1d(input: &GpuBuffer, n: usize, forward: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let plan = fft_plan(HIPFFT_Z2Z, n)?;
 	let direction = match forward.cmp(&0) {
 		Ordering::Equal => HIPFFT_BACKWARD,

@@ -1,0 +1,73 @@
+schema = 1
+kind = "probe-seed-estimates"
+
+# These are theoretical starting values from the human specification. They
+# size the first bounded benchmark pass; they are not a deployment inventory
+# and are not used as measured production performance.
+[estimates]
+ethernet_bytes_per_second = 125_000_000
+disk_bytes = 1_000_000_000_000
+sata_bytes_per_second = 600_000_000
+gpu_vram_bytes = 12_000_000_000
+pcie_bytes_per_second = 16_000_000_000
+gpu_flops_per_second = 380_000_000_000
+gpu_transfer_bytes_per_second = 432_000_000_000
+ram_bytes = 48_000_000_000
+ddr_bytes_per_second = 90_000_000_000
+cpu_reference_flops_per_second = 150_000_000_000
+ram_transfer_bytes_per_second = 90_000_000_000
+
+[reservation]
+bytes_per_storage_device = 1_000_000_000
+
+[probe]
+command = "recipe probe"
+environment = "bare-metal"
+discover_machines = true
+discover_devices = true
+discover_links = true
+benchmark_capacity = true
+benchmark_calculation = true
+benchmark_transfer = true
+require_measured_profile_for_prepare = true
+
+# A cached profile is valid only for the exact identities that produced it.
+invalidate_on = [
+	"machine",
+	"device",
+	"driver",
+	"runtime-abi",
+	"firmware",
+	"link",
+	"artifact-toolchain",
+]
+
+[transport.pcie]
+directions = "both"
+duplex = "full"
+issue = "async"
+
+[transport.nvme]
+directions = "both"
+duplex = "full"
+issue = "async"
+
+[transport.sas]
+directions = "both"
+duplex = "full"
+issue = "async"
+
+[transport.ethernet]
+directions = "both"
+duplex = "full"
+issue = "async"
+
+[transport.sata]
+directions = "both"
+duplex = "half"
+issue = "async"
+
+[transport.wlan]
+directions = "both"
+duplex = "half"
+issue = "async"

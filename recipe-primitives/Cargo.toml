@@ -1,0 +1,16 @@
+[package]
+name = "recipe-primitives"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Deterministic AOT lowering of Recipe tensor primitives into GPU stage programs"
+
+[dependencies]
+recipe-core = { path = "../recipe-core" }
+recipe-language = { path = "../recipe-language" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

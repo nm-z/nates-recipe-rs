@@ -2,10 +2,10 @@ use crate::HipError;
 use crate::callspy;
 use crate::hip::{check, hipGetLastError};
 use crate::kernels::ci;
-use ogdl::log::Write;
 use crate::memory::{Dtype, GpuBuffer};
 use core::ffi::c_void;
 use core::ptr;
+use ogdl::log::Write;
 
 fn cl() -> Result<(), HipError> {
 	callspy::tick(&callspy::LAUNCH);
@@ -88,22 +88,8 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_gelu_mul(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i64,
-		stream: *mut c_void,
-		dtype: i32,
-	);
-	fn launch_glu_gelu(
-		input: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		half: i32,
-		stream: *mut c_void,
-		dtype: i32,
-	);
+	fn launch_gelu_mul(a: *const c_void, b: *const c_void, out: *mut c_void, n: i64, stream: *mut c_void, dtype: i32);
+	fn launch_glu_gelu(input: *const c_void, out: *mut c_void, rows: i32, half: i32, stream: *mut c_void, dtype: i32);
 	fn launch_rope_partial(
 		buf: *mut c_void,
 		rows: i32,
@@ -140,14 +126,7 @@ unsafe extern "C" {
 		dtype: i32,
 	);
 	fn launch_scale_f64(x: *mut c_void, scalar: *const c_void, n: i64, stream: *mut c_void, dtype: i32);
-	fn launch_glu_silu(
-		input: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		half: i32,
-		stream: *mut c_void,
-		dtype: i32,
-	);
+	fn launch_glu_silu(input: *const c_void, out: *mut c_void, rows: i32, half: i32, stream: *mut c_void, dtype: i32);
 }
 
 #[inline]
@@ -380,7 +359,6 @@ pub fn gpu_rmsnorm_f64_nogamma(
 	return cl();
 }
 
-
 static FLASH_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static L2_TILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -501,12 +479,7 @@ pub fn gpu_flash_mla(
 }
 
 #[inline]
-pub fn gpu_gelu_mul(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gelu_mul(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: a, b, and out outlive this synchronous launch and n matches their element counts.
 	unsafe {
 		launch_gelu_mul(
@@ -522,12 +495,7 @@ pub fn gpu_gelu_mul(
 }
 
 #[inline]
-pub fn gpu_glu_gelu(
-	input: &GpuBuffer,
-	rows: usize,
-	half: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_glu_gelu(input: &GpuBuffer, rows: usize, half: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: input and out outlive this synchronous launch and rows and half match their sizes.
 	unsafe {
 		launch_glu_gelu(
@@ -543,12 +511,7 @@ pub fn gpu_glu_gelu(
 }
 
 #[inline]
-pub fn gpu_glu_silu(
-	input: &GpuBuffer,
-	rows: usize,
-	half: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_glu_silu(input: &GpuBuffer, rows: usize, half: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: input and out outlive this synchronous launch and rows and half match their sizes.
 	unsafe {
 		launch_glu_silu(

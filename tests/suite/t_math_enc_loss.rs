@@ -464,8 +464,7 @@ fn test_count_distinct() {
 	let n = 6;
 	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
 	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
-	let temp =
-		GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
 	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
 	let mut c = [0i32; 1];
@@ -481,8 +480,7 @@ fn test_count_distinct_uniform() {
 	let n = 3;
 	let unique_vals = GpuBuffer::alloc_bytes(n * 4).unwrap();
 	let run_counts = GpuBuffer::alloc_bytes(n * 4).unwrap();
-	let temp =
-		GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
+	let temp = GpuBuffer::alloc_bytes(gpu_count_distinct_workspace_bytes(&buf, n).max(8)).unwrap();
 	let count_out = GpuBuffer::alloc_bytes(4).unwrap();
 	gpu_count_distinct(&buf, n, &unique_vals, &run_counts, &temp, &count_out).unwrap();
 	let mut c = [0i32; 1];

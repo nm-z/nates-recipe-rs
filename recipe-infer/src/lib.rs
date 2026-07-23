@@ -9,9 +9,8 @@ pub mod tokenizer;
 pub use gpu_core::hip::device_synchronize;
 pub use gpu_core::memory::{
 	ExitD2H, GpuBuffer, Stage, adopt_run_backing_with_image, claim_device_arena_bytes,
-	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes,
-	device_arena_active, exit_d2h_enqueue, exit_d2h_enqueue_buf, park_run_backing,
-	release_device_arena,
+	claim_device_arena_bytes_with_image, claim_device_arena_with_image, claimable_bytes, device_arena_active,
+	exit_d2h_enqueue, exit_d2h_enqueue_buf, park_run_backing, release_device_arena,
 };
 pub use gpu_core::tiered;
 

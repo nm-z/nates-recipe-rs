@@ -31,13 +31,7 @@ unsafe extern "C" {
 		n_bins: i32,
 		stream: *mut c_void,
 	);
-	fn launch_one_hot(
-		labels: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		n_classes: i32,
-		stream: *mut c_void,
-	);
+	fn launch_one_hot(labels: *const c_void, out: *mut c_void, n: i32, n_classes: i32, stream: *mut c_void);
 	fn count_distinct_workspace_bytes(x: *const c_void, n: i32, stream: *mut c_void) -> usize;
 	fn launch_count_distinct(
 		x: *const c_void,
@@ -166,12 +160,7 @@ pub fn gpu_quantize_features(
 }
 
 #[inline]
-pub fn gpu_one_hot(
-	labels_i32: &GpuBuffer,
-	n: usize,
-	n_classes: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_one_hot(labels_i32: &GpuBuffer, n: usize, n_classes: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: labels_i32 and out are live GpuBuffers and the range-checked sizes bound the launcher's reads and writes.
 	unsafe {
 		launch_one_hot(
@@ -191,11 +180,7 @@ pub fn gpu_one_hot(
 pub fn gpu_count_distinct_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	// SAFETY: x is a live GpuBuffer and safe_i32 bounds n; the query only reads within it.
 	unsafe {
-		return count_distinct_workspace_bytes(
-			x.ptr_raw().cast_const(),
-			safe_i32(n),
-			ptr::null_mut(),
-		);
+		return count_distinct_workspace_bytes(x.ptr_raw().cast_const(), safe_i32(n), ptr::null_mut());
 	}
 }
 
@@ -230,11 +215,7 @@ pub fn gpu_count_distinct(
 pub fn gpu_run_length_workspace_bytes(x: &GpuBuffer, n: usize) -> usize {
 	// SAFETY: FFI workspace-size query over device buffer `x`, returning a usize byte count.
 	unsafe {
-		return run_length_workspace_bytes(
-			x.ptr_raw().cast_const(),
-			safe_i32(n),
-			ptr::null_mut(),
-		);
+		return run_length_workspace_bytes(x.ptr_raw().cast_const(), safe_i32(n), ptr::null_mut());
 	}
 }
 

@@ -497,15 +497,13 @@ fn scrub(capture: &[String], name: &str) -> Vec<String> {
 	for raw in capture {
 		let l = raw.trim_end();
 		let t = l.trim_start();
-		let ceremony = (t.starts_with("running ")
-			&& (t.ends_with(" test") || t.ends_with(" tests")))
+		let ceremony = (t.starts_with("running ") && (t.ends_with(" test") || t.ends_with(" tests")))
 			|| t == "failures:"
 			|| t.starts_with("test result: ")
 			|| t.starts_with("note: run with `RUST_BACKTRACE=1`")
 			|| (t.starts_with("test ")
 				&& (t.ends_with("... FAILED") || t.ends_with("... ok") || t.ends_with("... ignored")))
-			|| t == bare
-			|| t == name;
+			|| t == bare || t == name;
 		if ceremony {
 			continue;
 		}
@@ -543,13 +541,13 @@ fn finish(log: &mut Log, tally: &Tally, t0: Instant, test_secs: f64) -> i32 {
 	let wall = t0.elapsed().as_secs_f64();
 	let code = if tally.green() { 0 } else { 1 };
 	log.file(&format!(
-            "[S] passed={} failed={} unattempted={} discovered={} wall={wall:.1}s overhead={:.1}s exit={code}",
-            tally.passed,
-            tally.failed,
-            tally.unattempted,
-            tally.discovered,
-            wall - test_secs
-      ));
+		"[S] passed={} failed={} unattempted={} discovered={} wall={wall:.1}s overhead={:.1}s exit={code}",
+		tally.passed,
+		tally.failed,
+		tally.unattempted,
+		tally.discovered,
+		wall - test_secs
+	));
 	let mut summary = format!("{}/{} passed.", tally.passed, tally.discovered);
 	if tally.failed_total() > 0 {
 		summary.push_str(&format!(" {} FAILED.", tally.failed_total()));
@@ -608,7 +606,11 @@ fn run_test(t: &Test) -> Attempt {
 			None => {
 				let el = start.elapsed().as_secs_f64();
 				if el >= next_tick as f64 {
-					errline(&paint(CYAN, &format!("[RUN] {} {}s", t.id, next_tick), tty(2)));
+					errline(&paint(
+						CYAN,
+						&format!("[RUN] {} {}s", t.id, next_tick),
+						tty(2),
+					));
 					next_tick += 10;
 				}
 				if el >= TEST_DEADLINE_SECS {
@@ -894,10 +896,7 @@ fn collect_rs(dir: &Path, files: &mut Vec<PathBuf>) {
 		let p = e.path();
 		let name = e.file_name().to_string_lossy().into_owned();
 		if p.is_dir() {
-			if name.starts_with('.')
-				|| name == "target" || name == "datasets"
-				|| p.join("Cargo.toml").exists()
-			{
+			if name.starts_with('.') || name == "target" || name == "datasets" || p.join("Cargo.toml").exists() {
 				continue;
 			}
 			collect_rs(&p, files);

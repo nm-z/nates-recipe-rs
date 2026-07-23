@@ -1,4 +1,3 @@
-
 use anyhow::{Context, Result, bail};
 use gpu_core::infer_ops::gpu_convert;
 use gpu_core::memory::{Dtype, GpuBuffer};
@@ -43,12 +42,13 @@ fn parity(model_key: &str, ggml: u32, dt: Dtype) -> Result<()> {
 	let src = GpuBuffer::alloc_bytes(bytes.len())
 		.map_err(|e| return anyhow::anyhow!("alloc src: {e}"))?
 		.as_dtype(dt);
-	src.write_u8(&bytes).map_err(|e| return anyhow::anyhow!("upload: {e}"))?;
-	let dst = GpuBuffer::alloc_ty(elems, Dtype::F32)
-		.map_err(|e| return anyhow::anyhow!("alloc dst: {e}"))?;
+	src.write_u8(&bytes)
+		.map_err(|e| return anyhow::anyhow!("upload: {e}"))?;
+	let dst = GpuBuffer::alloc_ty(elems, Dtype::F32).map_err(|e| return anyhow::anyhow!("alloc dst: {e}"))?;
 	gpu_convert(&src, &dst, elems, 1.0).map_err(|e| return anyhow::anyhow!("convert: {e}"))?;
 	let mut gpu = vec![0f64; elems];
-	dst.download_host(&mut gpu).map_err(|e| return anyhow::anyhow!("download: {e}"))?;
+	dst.download_host(&mut gpu)
+		.map_err(|e| return anyhow::anyhow!("download: {e}"))?;
 
 	assert_eq!(cpu.len(), elems, "{dt:?}: cpu decode length");
 	let mut bad = 0usize;
@@ -64,9 +64,16 @@ fn parity(model_key: &str, ggml: u32, dt: Dtype) -> Result<()> {
 	eprintln!(
 		"{dt:?}: {name} {elems} elems ({} blocks) {}",
 		elems / dt.block_elems(),
-		if bad == 0 { "IDENTICAL".to_owned() } else { format!("{bad} DIFFER, first {first}") }
+		if bad == 0 {
+			"IDENTICAL".to_owned()
+		} else {
+			format!("{bad} DIFFER, first {first}")
+		}
 	);
-	assert_eq!(bad, 0, "{dt:?}: {bad}/{elems} elements differ, first {first}");
+	assert_eq!(
+		bad, 0,
+		"{dt:?}: {bad}/{elems} elements differ, first {first}"
+	);
 	return Ok(());
 }
 
@@ -154,25 +161,43 @@ fn requant_q8_0_matches_cpu_codec() -> Result<()> {
 	let src = GpuBuffer::alloc_bytes(raw.len())
 		.map_err(|e| return anyhow::anyhow!("alloc src: {e}"))?
 		.as_dtype(Dtype::F32);
-	src.write_u8(&raw).map_err(|e| return anyhow::anyhow!("upload: {e}"))?;
+	src.write_u8(&raw)
+		.map_err(|e| return anyhow::anyhow!("upload: {e}"))?;
 	let q = GpuBuffer::alloc_bytes(cpu.len())
 		.map_err(|e| return anyhow::anyhow!("alloc q: {e}"))?
 		.as_dtype(Dtype::Q8_0);
 	gpu_convert(&src, &q, elems, 1.0).map_err(|e| return anyhow::anyhow!("requant: {e}"))?;
 	let mut gpu = vec![0u8; cpu.len()];
-	q.download_u8(&mut gpu).map_err(|e| return anyhow::anyhow!("download: {e}"))?;
+	q.download_u8(&mut gpu)
+		.map_err(|e| return anyhow::anyhow!("download: {e}"))?;
 
-	let bad = cpu.iter().zip(gpu.iter()).filter(|(c, g)| return c != g).count();
+	let bad = cpu
+		.iter()
+		.zip(gpu.iter())
+		.filter(|(c, g)| return c != g)
+		.count();
 	let first = cpu
 		.iter()
 		.zip(gpu.iter())
 		.position(|(c, g)| return c != g)
-		.map_or_else(|| return "none".to_owned(), |i| return format!("[{i}] cpu {} gpu {}", cpu[i], gpu[i]));
+		.map_or_else(
+			|| return "none".to_owned(),
+			|i| return format!("[{i}] cpu {} gpu {}", cpu[i], gpu[i]),
+		);
 	eprintln!(
 		"Q8_0 requant: {name} {elems} elems ({} blocks) {}",
 		elems / 32,
-		if bad == 0 { "IDENTICAL".to_owned() } else { format!("{bad} bytes DIFFER, first {first}") }
+		if bad == 0 {
+			"IDENTICAL".to_owned()
+		} else {
+			format!("{bad} bytes DIFFER, first {first}")
+		}
 	);
-	assert_eq!(bad, 0, "Q8_0 requant: {bad}/{} bytes differ, first {first}", cpu.len());
+	assert_eq!(
+		bad,
+		0,
+		"Q8_0 requant: {bad}/{} bytes differ, first {first}",
+		cpu.len()
+	);
 	return Ok(());
 }

@@ -41,8 +41,7 @@ fn rope_heads_backward_is_inverse_rotation() {
 		q.load(x).expect("q load");
 		let k = GpuBuffer::alloc(xk.len()).expect("k");
 		k.load(&xk).expect("k load");
-		gpu_rope_qk_heads_inplace(&sgn_fwd, &theta, m, d, heads, seq, &q, &k)
-			.expect("rope fwd");
+		gpu_rope_qk_heads_inplace(&sgn_fwd, &theta, m, d, heads, seq, &q, &k).expect("rope fwd");
 		let mut o = vec![0.0f64; m * d];
 		unsafe { q.download_async(&mut o, ptr::null_mut()) }.expect("o");
 		gpu_core::hip::device_synchronize().expect("o sync");

@@ -3,8 +3,8 @@ mod common;
 use super::{Arena, Model};
 use anyhow::{Result, bail};
 use common::{
-	apply_norm, layer_hybrid, layer_mamba, layer_mamba2, layer_minicpm3, layer_moe,
-	layer_recurrent, layer_spec, layer_talkie,
+	apply_norm, layer_hybrid, layer_mamba, layer_mamba2, layer_minicpm3, layer_moe, layer_recurrent, layer_spec,
+	layer_talkie,
 };
 use gpu_core::memory::GpuBuffer;
 use recipe_ir::arch::{Comp, Hy, HyMode, NormK, Recur, Spec, TABLE};
@@ -60,7 +60,12 @@ pub(super) struct LayerCacheShape {
 fn attn_shape(m: &Model, l: usize) -> LayerCacheShape {
 	let d = &m.hp.dims[l];
 	let w = d.nkv * d.hd;
-	return LayerCacheShape { kw: w, vw: w, rec: 0, conv: Vec::new() };
+	return LayerCacheShape {
+		kw: w,
+		vw: w,
+		rec: 0,
+		conv: Vec::new(),
+	};
 }
 
 fn mla_shape(m: &Model) -> LayerCacheShape {
@@ -74,12 +79,21 @@ fn mla_shape(m: &Model) -> LayerCacheShape {
 
 pub(super) fn layer_cache_shape(m: &Model, l: usize) -> LayerCacheShape {
 	let hp = &m.hp;
-	let empty = LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: Vec::new() };
+	let empty = LayerCacheShape {
+		kw: 0,
+		vw: 0,
+		rec: 0,
+		conv: Vec::new(),
+	};
 	let dc = hp.ssm_d_conv;
 	match comp_of(hp.arch.as_str()) {
 		None => empty,
 		Some(Comp::Dense(sp)) | Some(Comp::Moe(sp)) => {
-			if sp.mla { mla_shape(m) } else { attn_shape(m, l) }
+			if sp.mla {
+				mla_shape(m)
+			} else {
+				attn_shape(m, l)
+			}
 		}
 		Some(Comp::Talkie(_)) => attn_shape(m, l),
 		Some(Comp::Minicpm3(_)) => {
@@ -93,16 +107,31 @@ pub(super) fn layer_cache_shape(m: &Model, l: usize) -> LayerCacheShape {
 		}
 		Some(Comp::Recurrent) => {
 			let d = &hp.dims[l];
-			LayerCacheShape { kw: 0, vw: 0, rec: d.nkv * d.hd, conv: Vec::new() }
+			LayerCacheShape {
+				kw: 0,
+				vw: 0,
+				rec: d.nkv * d.hd,
+				conv: Vec::new(),
+			}
 		}
 		Some(Comp::Mamba) => {
 			let (di, ds) = (hp.ssm_d_inner, hp.ssm_d_state);
-			LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * di] }
+			LayerCacheShape {
+				kw: 0,
+				vw: 0,
+				rec: di * ds,
+				conv: vec![(dc - 1) * di],
+			}
 		}
 		Some(Comp::Mamba2) => {
 			let (di, ds, ng) = (hp.ssm_d_inner, hp.ssm_d_state, hp.ssm_n_group.max(1));
 			let cd = di + 2 * ng * ds;
-			LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * cd] }
+			LayerCacheShape {
+				kw: 0,
+				vw: 0,
+				rec: di * ds,
+				conv: vec![(dc - 1) * cd],
+			}
 		}
 		Some(Comp::Hybrid(hy)) => hybrid_layer_shape(m, l, &hy),
 	}
@@ -116,11 +145,21 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 		let w = d.nkv * d.hd;
 		let (di, ds, ng) = (hp.ssm_d_inner, hp.ssm_d_state, hp.ssm_n_group.max(1));
 		let cd = di + 2 * ng * ds;
-		return LayerCacheShape { kw: w, vw: w, rec: di * ds, conv: vec![(dc - 1) * cd] };
+		return LayerCacheShape {
+			kw: w,
+			vw: w,
+			rec: di * ds,
+			conv: vec![(dc - 1) * cd],
+		};
 	}
 	if common::layer_is_shortconv(m, l) {
 		let lc = hp.shortconv_l_cache;
-		return LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: vec![(lc - 1) * hp.ne] };
+		return LayerCacheShape {
+			kw: 0,
+			vw: 0,
+			rec: 0,
+			conv: vec![(lc - 1) * hp.ne],
+		};
 	}
 	if common::layer_is_delta(m, l) {
 		let (d, _hk, hv, _key, _val, conv_dim) = common::delta_dims(m);
@@ -134,7 +173,12 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 					conv: vec![(dc - 1) * di, (dc - 1) * di, (dc - 1) * di],
 				}
 			}
-			_gda => LayerCacheShape { kw: 0, vw: 0, rec: hv * d * d, conv: vec![(dc - 1) * conv_dim] },
+			_gda => LayerCacheShape {
+				kw: 0,
+				vw: 0,
+				rec: hv * d * d,
+				conv: vec![(dc - 1) * conv_dim],
+			},
 		};
 	}
 	if common::layer_is_recur(m, l) {
@@ -142,11 +186,19 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 		return match hy.recur {
 			Recur::Mamba2 => {
 				let cd = di + 2 * ng * ds;
-				LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * cd] }
+				LayerCacheShape {
+					kw: 0,
+					vw: 0,
+					rec: di * ds,
+					conv: vec![(dc - 1) * cd],
+				}
 			}
-			_mamba1_or_plamo2 => {
-				LayerCacheShape { kw: 0, vw: 0, rec: di * ds, conv: vec![(dc - 1) * di] }
-			}
+			_mamba1_or_plamo2 => LayerCacheShape {
+				kw: 0,
+				vw: 0,
+				rec: di * ds,
+				conv: vec![(dc - 1) * di],
+			},
 		};
 	}
 	if common::layer_is_attn(m, l) {
@@ -155,9 +207,13 @@ fn hybrid_layer_shape(m: &Model, l: usize, hy: &Hy) -> LayerCacheShape {
 		}
 		return attn_shape(m, l);
 	}
-	return LayerCacheShape { kw: 0, vw: 0, rec: 0, conv: Vec::new() };
+	return LayerCacheShape {
+		kw: 0,
+		vw: 0,
+		rec: 0,
+		conv: Vec::new(),
+	};
 }
-
 
 fn spec_of(m: &Model) -> Option<Spec> {
 	let arch = m.hp.arch.as_str();
@@ -203,20 +259,23 @@ pub(super) fn logit_scale(m: &Model) -> f64 {
 	}
 }
 
-pub(super) fn decoder_norm(
-	m: &Model,
-	x: &GpuBuffer,
-	rows: usize,
-	ne: usize,
-	out: &GpuBuffer,
-) -> Result<()> {
+pub(super) fn decoder_norm(m: &Model, x: &GpuBuffer, rows: usize, ne: usize, out: &GpuBuffer) -> Result<()> {
 	let kind = spec_of(m).map_or(NormK::Rms, |sp| sp.norm);
 	let gamma = if m.big.contains_key("model.decoder.norm.weight") {
 		Some(&m.decoder_norm)
 	} else {
 		None
 	};
-	return apply_norm(kind, gamma, m.decoder_norm_b.as_ref(), &m.eps, rows, ne, x, out);
+	return apply_norm(
+		kind,
+		gamma,
+		m.decoder_norm_b.as_ref(),
+		&m.eps,
+		rows,
+		ne,
+		x,
+		out,
+	);
 }
 
 pub(super) fn dispatch(
@@ -236,9 +295,7 @@ pub(super) fn dispatch(
 				Comp::Dense(sp) | Comp::Moe(sp) if m.layer_is_moe(l) => {
 					layer_moe(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec)
 				}
-				Comp::Dense(sp) | Comp::Moe(sp) => {
-					layer_spec(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec)
-				}
+				Comp::Dense(sp) | Comp::Moe(sp) => layer_spec(m, l, &sp, h_in, h_out, t, ar, attn_scale, dec),
 				Comp::Recurrent => layer_recurrent(m, l, h_in, h_out, t, ar, attn_scale, dec),
 				Comp::Mamba => layer_mamba(m, l, h_in, h_out, t, ar, dec),
 				Comp::Mamba2 => layer_mamba2(m, l, h_in, h_out, t, ar, dec),

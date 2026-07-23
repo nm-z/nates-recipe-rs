@@ -1,7 +1,6 @@
 use crate::callspy;
 use crate::gate;
 use crate::hw;
-use ogdl::log::Write;
 use core::cmp;
 use core::error::Error;
 use core::ffi::{CStr, c_void};
@@ -10,6 +9,7 @@ use core::mem;
 use core::num::NonZeroUsize;
 use core::ptr;
 use core::time::Duration;
+use ogdl::log::Write;
 use std::env;
 use std::fs;
 use std::sync::Once;
@@ -31,11 +31,9 @@ impl fmt::Display for HipError {
 			Some(name_nn) => match ptr::NonNull::new(str_ptr.cast_mut()) {
 				Some(str_nn) => {
 					// SAFETY: name_nn is non-null and points to a NUL-terminated C string.
-					let name =
-						unsafe { CStr::from_ptr(name_nn.as_ptr()) }.to_string_lossy();
+					let name = unsafe { CStr::from_ptr(name_nn.as_ptr()) }.to_string_lossy();
 					// SAFETY: str_nn is non-null and points to a NUL-terminated C string.
-					let msg =
-						unsafe { CStr::from_ptr(str_nn.as_ptr()) }.to_string_lossy();
+					let msg = unsafe { CStr::from_ptr(str_nn.as_ptr()) }.to_string_lossy();
 					return write!(f, "{name}: {msg} (code {code})");
 				}
 				None => return write!(f, "HIP error code {code}"),
@@ -132,32 +130,18 @@ unsafe extern "C" {
 		kind: i32,
 		stream: *mut c_void,
 	) -> i32;
-	pub(crate) fn hipMemsetAsync(
-		dst: *mut c_void,
-		value: i32,
-		size: usize,
-		stream: *mut c_void,
-	) -> i32;
+	pub(crate) fn hipMemsetAsync(dst: *mut c_void, value: i32, size: usize, stream: *mut c_void) -> i32;
 	pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> i32;
 	pub(crate) fn hipHostFree(ptr: *mut c_void) -> i32;
 	pub fn hipGetDeviceCount(count: *mut i32) -> i32;
 	pub fn hipDeviceGetAttribute(pi: *mut i32, attr: i32, device_id: i32) -> i32;
 	pub fn hip_multiprocessor_count() -> i32;
-	pub fn hipDeviceCanAccessPeer(
-		can_access_peer: *mut i32,
-		device_id: i32,
-		peer_device_id: i32,
-	) -> i32;
+	pub fn hipDeviceCanAccessPeer(can_access_peer: *mut i32, device_id: i32, peer_device_id: i32) -> i32;
 	pub fn hipDeviceEnablePeerAccess(peer_device_id: i32, flags: u32) -> i32;
-	pub(crate) fn hipMallocAsync(
-		dev_ptr: *mut *mut c_void,
-		size: usize,
-		stream: *mut c_void,
-	) -> i32;
+	pub(crate) fn hipMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
 	pub(crate) fn hipFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
 	pub fn hipDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
-	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void)
-	-> i32;
+	pub(crate) fn hipMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub fn hipMemPoolGetAttribute(pool: *mut c_void, attr: i32, value: *mut c_void) -> i32;
 	pub(crate) fn hipMemPoolTrimTo(pool: *mut c_void, min_bytes_to_hold: usize) -> i32;
 	pub fn vmm_granularity(out: *mut usize) -> i32;
@@ -311,14 +295,9 @@ pub unsafe extern "C" fn fault_autopsy(event: *const HsaAmdEvent, _data: *mut c_
 				cmp::Ordering::Less => {
 					return format!("outside bounce (bounce base 0x{:x})", r.base);
 				}
-				cmp::Ordering::Equal | cmp::Ordering::Greater => match va
-					.cmp(&(r.base + r.len))
-				{
+				cmp::Ordering::Equal | cmp::Ordering::Greater => match va.cmp(&(r.base + r.len)) {
 					cmp::Ordering::Less => {
-						return format!(
-							"INSIDE pinned h2d bounce (+0x{:x})",
-							va - r.base
-						);
+						return format!("INSIDE pinned h2d bounce (+0x{:x})", va - r.base);
 					}
 					cmp::Ordering::Equal | cmp::Ordering::Greater => {
 						return format!("outside bounce (bounce base 0x{:x})", r.base);
@@ -353,10 +332,8 @@ pub(crate) fn register_fault_autopsy_once() {
 			)
 		};
 		if let Some(found) = ptr::NonNull::new(sym) {
-			type Register = extern "C" fn(
-				unsafe extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32,
-				*mut c_void,
-			) -> i32;
+			type Register =
+				extern "C" fn(unsafe extern "C" fn(*const HsaAmdEvent, *mut c_void) -> i32, *mut c_void) -> i32;
 			// SAFETY: the resolved symbol is hsa_amd_register_system_event_handler, whose C ABI matches the Register fn-pointer type.
 			let register = unsafe { mem::transmute::<*mut c_void, Register>(found.as_ptr()) };
 			if register(fault_autopsy, ptr::null_mut()) == 0i32 {
@@ -390,9 +367,7 @@ pub fn pool_slack(device: i32) -> Result<usize, HipError> {
 	})?;
 	callspy::tick(&callspy::MEMPOOL_GET_ATTRIBUTE);
 	// SAFETY: pool is the live default mempool and the out arg points at an owned u64 sized for the attribute.
-	check(unsafe {
-		hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, (&raw mut used).cast::<c_void>())
-	})?;
+	check(unsafe { hipMemPoolGetAttribute(pool, USED_MEM_CURRENT, (&raw mut used).cast::<c_void>()) })?;
 	return usize::try_from(reserved.saturating_sub(used)).map_err(|_err| return HipError(1));
 }
 

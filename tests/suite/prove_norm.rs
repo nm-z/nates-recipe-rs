@@ -30,14 +30,7 @@ unsafe extern "C" {
 		eps: f64,
 		s: *mut c_void,
 	);
-	fn launch_normx_l2_normalize(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		eps: f64,
-		s: *mut c_void,
-	);
+	fn launch_normx_l2_normalize(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, eps: f64, s: *mut c_void);
 	fn launch_normx_rmsnorm(
 		x: *const c_void,
 		out: *mut c_void,
@@ -64,14 +57,7 @@ fn ramp(n: usize, scale: f64, off: f64) -> Vec<f64> {
 }
 
 // ── CPU oracles (authoritative textbook standardize, biased variance) ─────────
-fn cpu_layernorm(
-	x: &[f64],
-	rows: usize,
-	cols: usize,
-	gamma: &[f64],
-	beta: &[f64],
-	eps: f64,
-) -> Vec<f64> {
+fn cpu_layernorm(x: &[f64], rows: usize, cols: usize, gamma: &[f64], beta: &[f64], eps: f64) -> Vec<f64> {
 	let mut o = vec![0.0; rows * cols];
 	for r in 0..rows {
 		let row = &x[r * cols..(r + 1) * cols];
@@ -99,16 +85,7 @@ fn cpu_batchnorm(x: &[f64], n: usize, c: usize, gamma: &[f64], beta: &[f64], eps
 	o
 }
 
-fn cpu_groupnorm(
-	x: &[f64],
-	n: usize,
-	c: usize,
-	l: usize,
-	g: usize,
-	gamma: &[f64],
-	beta: &[f64],
-	eps: f64,
-) -> Vec<f64> {
+fn cpu_groupnorm(x: &[f64], n: usize, c: usize, l: usize, g: usize, gamma: &[f64], beta: &[f64], eps: f64) -> Vec<f64> {
 	let cpg = c / g;
 	let mut o = vec![0.0; n * c * l];
 	for ni in 0..n {
@@ -127,15 +104,7 @@ fn cpu_groupnorm(
 	o
 }
 
-fn cpu_instancenorm(
-	x: &[f64],
-	n: usize,
-	c: usize,
-	l: usize,
-	gamma: &[f64],
-	beta: &[f64],
-	eps: f64,
-) -> Vec<f64> {
+fn cpu_instancenorm(x: &[f64], n: usize, c: usize, l: usize, gamma: &[f64], beta: &[f64], eps: f64) -> Vec<f64> {
 	cpu_groupnorm(x, n, c, l, c, gamma, beta, eps)
 }
 
@@ -571,10 +540,7 @@ fn canon(name: &str) -> String {
 		return base;
 	}
 
-	if base.contains("l2normalization")
-		|| base == "l2normalize"
-		|| base == "unitnormalization"
-		|| base == "normalize"
+	if base.contains("l2normalization") || base == "l2normalize" || base == "unitnormalization" || base == "normalize"
 	{
 		return "l2_normalize".to_string();
 	}

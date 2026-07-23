@@ -29,8 +29,7 @@ fn diffusion_block_ar_progressive_commit() {
 		return Ok(lb);
 	};
 
-	let Sample { canvas, steps } =
-		gpu_diffusion_sample(logits_fn, &initial, bound, 100, n, vocab).expect("sample");
+	let Sample { canvas, steps } = gpu_diffusion_sample(logits_fn, &initial, bound, 100, n, vocab).expect("sample");
 	let mut out = vec![0.0_f64; n];
 	unsafe { canvas.download_async(&mut out, ptr::null_mut()) }.expect("dl");
 	hip::device_synchronize().expect("dl sync");

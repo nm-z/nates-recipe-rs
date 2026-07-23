@@ -373,9 +373,7 @@ impl Graph {
 		self.with(|root| {
 			let mut cur = root;
 			for seg in path.split('.').filter(|s| return !s.is_empty()) {
-				let idx = if let Some(hit) =
-					cur.children.iter().position(|c| return c.name == seg)
-				{
+				let idx = if let Some(hit) = cur.children.iter().position(|c| return c.name == seg) {
 					hit
 				} else {
 					cur.children.push(Node::leaf(seg));
@@ -632,16 +630,15 @@ impl Block {
 		};
 		return ogdl.with(|root| {
 			let ls = lines_of(root);
-			let hit = ls.iter().position(|row| return row.1 == sel).or_else(|| {
-				match sel.split_last() {
+			let hit = ls
+				.iter()
+				.position(|row| return row.1 == sel)
+				.or_else(|| match sel.split_last() {
 					Some((_i, par)) => {
-						return ls
-							.iter()
-							.position(|row| return row.1.as_slice() == par);
+						return ls.iter().position(|row| return row.1.as_slice() == par);
 					}
 					None => return None,
-				}
-			});
+				});
 			let Some(mut end) = hit else {
 				return String::new();
 			};
@@ -680,12 +677,7 @@ pub fn text(src: &str) -> Graph {
 	return g;
 }
 
-fn walk_lines(
-	n: &Node,
-	path: &mut Vec<usize>,
-	depth: usize,
-	out: &mut Vec<(String, Vec<usize>, bool)>,
-) {
+fn walk_lines(n: &Node, path: &mut Vec<usize>, depth: usize, out: &mut Vec<(String, Vec<usize>, bool)>) {
 	for (i, c) in n.children.iter().enumerate() {
 		path.push(i);
 		let mut line = String::new();

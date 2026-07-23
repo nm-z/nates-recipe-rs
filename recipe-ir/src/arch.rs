@@ -207,28 +207,59 @@ pub enum Comp {
 
 pub const TABLE: &[(&str, Comp)] = &[
 	("afmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("apertus", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
+	(
+		"apertus",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich()),
+	),
 	("arcee", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
 	("arctic", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("arwkv7", Comp::Recurrent),
 	("baichuan", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("bailingmoe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("bailingmoe2", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("bert", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
+	(
+		"bert",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder()),
+	),
 	("bitnet", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("bloom", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi().ffn_bias())),
+	(
+		"bloom",
+		Comp::Dense(
+			Spec::dense(Ffn::GeluSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.alibi()
+				.ffn_bias(),
+		),
+	),
 	("chameleon", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("chatglm", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
-	("codeshell", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias())),
+	(
+		"codeshell",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias()),
+	),
 	("cogvlm", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("cohere2", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
+	(
+		"cohere2",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich()),
+	),
 	("cohere2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("command-r", Comp::Dense(Spec::dense(Ffn::SiluGate).layer().parallel().logit_scale())),
+	(
+		"command-r",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).layer().parallel().logit_scale()),
+	),
 	("dbrx", Comp::Moe(Spec::dense(Ffn::SiluGate).layer())),
-	("deci", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias())),
+	(
+		"deci",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias()),
+	),
 	("deepseek", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("deepseek2", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
-	("deepseek2-ocr", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
+	(
+		"deepseek2-ocr",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).encoder()),
+	),
 	("deepseek32", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
 	("deepseek4", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("dflash", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
@@ -237,37 +268,97 @@ pub const TABLE: &[(&str, Comp)] = &[
 	("eagle3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("ernie4_5", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("ernie4_5-moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("eurobert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
+	(
+		"eurobert",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).encoder()),
+	),
 	("exaone", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
-	("exaone4", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich().no_pre_norm())),
+	(
+		"exaone4",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich().no_pre_norm()),
+	),
 	("exaone-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("falcon", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().parallel().attn_norm2())),
-	("falcon-h1", Comp::Hybrid(Hy {
-		recur: Recur::Mamba2,
-		sp: Spec::dense(Ffn::SiluGate).ffn_bias(),
-		mode: HyMode::Parallel,
-	})),
-	("gemma", Comp::Dense(Spec::dense(Ffn::GeluGate).emb_sqrt_ne())),
-	("gemma2", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().emb_sqrt_ne().final_softcap())),
-	("gemma3", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
-	("gemma3n", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
-	("gemma4", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
-	("gemma4-assistant", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
-	("gemma-embedding", Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk())),
+	(
+		"falcon",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().parallel().attn_norm2()),
+	),
+	(
+		"falcon-h1",
+		Comp::Hybrid(Hy {
+			recur: Recur::Mamba2,
+			sp: Spec::dense(Ffn::SiluGate).ffn_bias(),
+			mode: HyMode::Parallel,
+		}),
+	),
+	(
+		"gemma",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).emb_sqrt_ne()),
+	),
+	(
+		"gemma2",
+		Comp::Dense(
+			Spec::dense(Ffn::GeluGate)
+				.sandwich()
+				.emb_sqrt_ne()
+				.final_softcap(),
+		),
+	),
+	(
+		"gemma3",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk()),
+	),
+	(
+		"gemma3n",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk()),
+	),
+	(
+		"gemma4",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk()),
+	),
+	(
+		"gemma4-assistant",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk()),
+	),
+	(
+		"gemma-embedding",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).sandwich().qk()),
+	),
 	("glm4", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("glm4moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("glm-dsa", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
-	("gpt2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().learned_pos().ffn_bias())),
+	(
+		"gpt2",
+		Comp::Dense(
+			Spec::dense(Ffn::GeluSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.learned_pos()
+				.ffn_bias(),
+		),
+	),
 	("gptj", Comp::Dense(Spec::dense(Ffn::GeluSeq))),
-	("gptneox", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias())),
+	(
+		"gptneox",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias()),
+	),
 	("gpt-oss", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("granite", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias())),
-	("granitehybrid", Comp::Hybrid(Hy {
-		recur: Recur::Mamba2,
-		sp: Spec::dense(Ffn::SiluGate).o_bias().ffn_bias(),
-		mode: HyMode::MixerFfn,
-	})),
-	("granitemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias())),
+	(
+		"granite",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias()),
+	),
+	(
+		"granitehybrid",
+		Comp::Hybrid(Hy {
+			recur: Recur::Mamba2,
+			sp: Spec::dense(Ffn::SiluGate).o_bias().ffn_bias(),
+			mode: HyMode::MixerFfn,
+		}),
+	),
+	(
+		"granitemoe",
+		Comp::Moe(Spec::dense(Ffn::SiluGate).o_bias().ffn_bias()),
+	),
 	("grok", Comp::Moe(Spec::dense(Ffn::SiluGate).emb_scale_kv())),
 	("grovemoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("hunyuan-dense", Comp::Dense(Spec::dense(Ffn::SiluGate))),
@@ -275,100 +366,216 @@ pub const TABLE: &[(&str, Comp)] = &[
 	("hunyuan_vl", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("hy_v3", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("internlm2", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("jais", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
-	("jais2", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias().ffn_bias())),
-	("jamba", Comp::Hybrid(Hy {
-		recur: Recur::Mamba1,
-		sp: Spec::dense(Ffn::SiluGate).no_rope(),
-		mode: HyMode::MixerFfn,
-	})),
-	("jina-bert-v2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder())),
-	("jina-bert-v3", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("kimi-linear", Comp::Hybrid(Hy {
-		recur: Recur::Kda,
-		sp: Spec::dense(Ffn::SiluGate),
-		mode: HyMode::DeltaNet,
-	})),
-	("lfm2", Comp::Hybrid(Hy {
-		recur: Recur::ShortConv,
-		sp: Spec::dense(Ffn::SiluGate).qk(),
-		mode: HyMode::ShortConv,
-	})),
-	("lfm2moe", Comp::Hybrid(Hy {
-		recur: Recur::ShortConv,
-		sp: Spec::dense(Ffn::SiluGate).qk(),
-		mode: HyMode::ShortConv,
-	})),
+	(
+		"jais",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi()),
+	),
+	(
+		"jais2",
+		Comp::Dense(
+			Spec::dense(Ffn::ReluSqrSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.ffn_bias(),
+		),
+	),
+	(
+		"jamba",
+		Comp::Hybrid(Hy {
+			recur: Recur::Mamba1,
+			sp: Spec::dense(Ffn::SiluGate).no_rope(),
+			mode: HyMode::MixerFfn,
+		}),
+	),
+	(
+		"jina-bert-v2",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().encoder()),
+	),
+	(
+		"jina-bert-v3",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()),
+	),
+	(
+		"kimi-linear",
+		Comp::Hybrid(Hy {
+			recur: Recur::Kda,
+			sp: Spec::dense(Ffn::SiluGate),
+			mode: HyMode::DeltaNet,
+		}),
+	),
+	(
+		"lfm2",
+		Comp::Hybrid(Hy {
+			recur: Recur::ShortConv,
+			sp: Spec::dense(Ffn::SiluGate).qk(),
+			mode: HyMode::ShortConv,
+		}),
+	),
+	(
+		"lfm2moe",
+		Comp::Hybrid(Hy {
+			recur: Recur::ShortConv,
+			sp: Spec::dense(Ffn::SiluGate).qk(),
+			mode: HyMode::ShortConv,
+		}),
+	),
 	("llada", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("llada-moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("llama", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("llama4", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("llama-embed", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
+	(
+		"llama-embed",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).encoder()),
+	),
 	("maincoder", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("mamba", Comp::Mamba),
 	("mamba2", Comp::Mamba2),
 	("mellum", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mimo2", Comp::Moe(Spec::dense(Ffn::SiluGate))),
-	("minicpm", Comp::Dense(Spec::dense(Ffn::SiluGate).emb_scale_kv().residual_scale().o_bias().ffn_bias())),
-	("minicpm3", Comp::Minicpm3(Spec::dense(Ffn::SiluGate).emb_scale_const(12.0))),
+	(
+		"minicpm",
+		Comp::Dense(
+			Spec::dense(Ffn::SiluGate)
+				.emb_scale_kv()
+				.residual_scale()
+				.o_bias()
+				.ffn_bias(),
+		),
+	),
+	(
+		"minicpm3",
+		Comp::Minicpm3(Spec::dense(Ffn::SiluGate).emb_scale_const(12.0)),
+	),
 	("minimax-m2", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("mistral3", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
 	("mistral4", Comp::Moe(Spec::dense(Ffn::SiluGate).mla())),
-	("modern-bert", Comp::Dense(Spec::dense(Ffn::GeluGate).encoder())),
-	("mpt", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi())),
-	("nemotron", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).layer().bias().o_bias().ffn_bias())),
-	("nemotron_h", Comp::Hybrid(Hy {
-		recur: Recur::Mamba2,
-		sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
-		mode: HyMode::Triage,
-	})),
-	("nemotron_h_moe", Comp::Hybrid(Hy {
-		recur: Recur::Mamba2,
-		sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
-		mode: HyMode::Triage,
-	})),
-	("neo-bert", Comp::Dense(Spec::dense(Ffn::SiluGate).encoder())),
-	("nomic-bert", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("nomic-bert-moe", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("olmo", Comp::Dense(Spec::dense(Ffn::SiluGate).layer().nonparam())),
+	(
+		"modern-bert",
+		Comp::Dense(Spec::dense(Ffn::GeluGate).encoder()),
+	),
+	(
+		"mpt",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().alibi()),
+	),
+	(
+		"nemotron",
+		Comp::Dense(
+			Spec::dense(Ffn::ReluSqrSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.ffn_bias(),
+		),
+	),
+	(
+		"nemotron_h",
+		Comp::Hybrid(Hy {
+			recur: Recur::Mamba2,
+			sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
+			mode: HyMode::Triage,
+		}),
+	),
+	(
+		"nemotron_h_moe",
+		Comp::Hybrid(Hy {
+			recur: Recur::Mamba2,
+			sp: Spec::dense(Ffn::ReluSqrSeq).o_bias().no_rope(),
+			mode: HyMode::Triage,
+		}),
+	),
+	(
+		"neo-bert",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).encoder()),
+	),
+	(
+		"nomic-bert",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()),
+	),
+	(
+		"nomic-bert-moe",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()),
+	),
+	(
+		"olmo",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).layer().nonparam()),
+	),
 	("olmo2", Comp::Dense(Spec::dense(Ffn::SiluGate).sandwich())),
 	("olmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("openelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
-	("orion", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().ffn_bias())),
-	("paddleocr", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias())),
-	("pangu-embedded", Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().out_bias())),
-	("phi2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().out_bias().parallel().ffn_bias())),
+	(
+		"orion",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().ffn_bias()),
+	),
+	(
+		"paddleocr",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias()),
+	),
+	(
+		"pangu-embedded",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).o_bias().out_bias()),
+	),
+	(
+		"phi2",
+		Comp::Dense(
+			Spec::dense(Ffn::GeluSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.out_bias()
+				.parallel()
+				.ffn_bias(),
+		),
+	),
 	("phi3", Comp::Moe(Spec::dense(Ffn::SiluGate).out_bias())),
 	("phimoe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("plamo", Comp::Dense(Spec::dense(Ffn::SiluGate).parallel())),
-	("plamo2", Comp::Hybrid(Hy {
-		recur: Recur::Plamo2,
-		sp: Spec::dense(Ffn::SiluGate),
-		mode: HyMode::Sandwich,
-	})),
-	("plamo3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich())),
+	(
+		"plamo2",
+		Comp::Hybrid(Hy {
+			recur: Recur::Plamo2,
+			sp: Spec::dense(Ffn::SiluGate),
+			mode: HyMode::Sandwich,
+		}),
+	),
+	(
+		"plamo3",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).qk().sandwich()),
+	),
 	("plm", Comp::Dense(Spec::dense(Ffn::ReluSqrSeq).bias())),
 	("qwen", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("qwen2", Comp::Dense(Spec::dense(Ffn::SiluGate).bias().out_bias())),
+	(
+		"qwen2",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).bias().out_bias()),
+	),
 	("qwen2moe", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("qwen2vl", Comp::Dense(Spec::dense(Ffn::SiluGate).bias())),
 	("qwen3", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
-	("qwen35", Comp::Hybrid(Hy {
-		recur: Recur::GatedDelta,
-		sp: Spec::dense(Ffn::SiluGate),
-		mode: HyMode::DeltaNet,
-	})),
-	("qwen35moe", Comp::Hybrid(Hy {
-		recur: Recur::GatedDelta,
-		sp: Spec::dense(Ffn::SiluGate),
-		mode: HyMode::DeltaNet,
-	})),
+	(
+		"qwen35",
+		Comp::Hybrid(Hy {
+			recur: Recur::GatedDelta,
+			sp: Spec::dense(Ffn::SiluGate),
+			mode: HyMode::DeltaNet,
+		}),
+	),
+	(
+		"qwen35moe",
+		Comp::Hybrid(Hy {
+			recur: Recur::GatedDelta,
+			sp: Spec::dense(Ffn::SiluGate),
+			mode: HyMode::DeltaNet,
+		}),
+	),
 	("qwen3moe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
-	("qwen3next", Comp::Hybrid(Hy {
-		recur: Recur::GatedDelta,
-		sp: Spec::dense(Ffn::SiluGate),
-		mode: HyMode::DeltaNet,
-	})),
+	(
+		"qwen3next",
+		Comp::Hybrid(Hy {
+			recur: Recur::GatedDelta,
+			sp: Spec::dense(Ffn::SiluGate),
+			mode: HyMode::DeltaNet,
+		}),
+	),
 	("qwen3vl", Comp::Dense(Spec::dense(Ffn::SiluGate).qk())),
 	("qwen3vlmoe", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("refact", Comp::Dense(Spec::dense(Ffn::SiluGate))),
@@ -379,14 +586,39 @@ pub const TABLE: &[(&str, Comp)] = &[
 	("seed_oss", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 	("smallthinker", Comp::Moe(Spec::dense(Ffn::SiluGate))),
 	("smollm3", Comp::Dense(Spec::dense(Ffn::SiluGate))),
-	("stablelm", Comp::Dense(Spec::dense(Ffn::SiluGate).qk().layer())),
-	("starcoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().learned_pos().ffn_bias())),
-	("starcoder2", Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias())),
+	(
+		"stablelm",
+		Comp::Dense(Spec::dense(Ffn::SiluGate).qk().layer()),
+	),
+	(
+		"starcoder",
+		Comp::Dense(
+			Spec::dense(Ffn::GeluSeq)
+				.layer()
+				.bias()
+				.o_bias()
+				.learned_pos()
+				.ffn_bias(),
+		),
+	),
+	(
+		"starcoder2",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).layer().bias().o_bias().ffn_bias()),
+	),
 	("step35", Comp::Moe(Spec::dense(Ffn::SiluGate).qk())),
 	("t5", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("t5encoder", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
-	("talkie", Comp::Talkie(Spec::dense(Ffn::SiluGate).logit_scale().embd_skip())),
-	("wavtokenizer-dec", Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder())),
+	(
+		"t5encoder",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()),
+	),
+	(
+		"talkie",
+		Comp::Talkie(Spec::dense(Ffn::SiluGate).logit_scale().embd_skip()),
+	),
+	(
+		"wavtokenizer-dec",
+		Comp::Dense(Spec::dense(Ffn::GeluSeq).encoder()),
+	),
 	("xverse", Comp::Dense(Spec::dense(Ffn::SiluGate))),
 ];
 
@@ -403,20 +635,80 @@ pub const fn supported_names() -> [&'static str; TABLE.len()] {
 pub const COMPOSABLE: &[&str] = &supported_names();
 
 pub const VERIFIED: &[&str] = &[
-	"arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe2", "chatglm",
-	"cogvlm", "command-r", "dbrx", "deci", "deepseek", "deepseek2", "deepseek32", "dots1", "dream",
-	"ernie4_5", "ernie4_5-moe", "exaone", "falcon-h1", "gemma", "gemma2", "glm-dsa",
-	"glm4moe", "granite", "granitemoe", "granitehybrid", "grok", "grovemoe", "hunyuan-dense", "hunyuan-moe",
+	"arcee",
+	"arctic",
+	"baichuan",
+	"bailingmoe",
+	"bailingmoe2",
+	"chatglm",
+	"cogvlm",
+	"command-r",
+	"dbrx",
+	"deci",
+	"deepseek",
+	"deepseek2",
+	"deepseek32",
+	"dots1",
+	"dream",
+	"ernie4_5",
+	"ernie4_5-moe",
+	"exaone",
+	"falcon-h1",
+	"gemma",
+	"gemma2",
+	"glm-dsa",
+	"glm4moe",
+	"granite",
+	"granitemoe",
+	"granitehybrid",
+	"grok",
+	"grovemoe",
+	"hunyuan-dense",
+	"hunyuan-moe",
 	"minicpm",
-	"hunyuan_vl", "hy_v3", "internlm2", "jamba", "kimi-linear", "lfm2", "lfm2moe",
-	"llada", "llada-moe", "llama4",
-	"maincoder", "mamba", "mamba2", "minicpm3", "nemotron_h", "nemotron_h_moe",
+	"hunyuan_vl",
+	"hy_v3",
+	"internlm2",
+	"jamba",
+	"kimi-linear",
+	"lfm2",
+	"lfm2moe",
+	"llada",
+	"llada-moe",
+	"llama4",
+	"maincoder",
+	"mamba",
+	"mamba2",
+	"minicpm3",
+	"nemotron_h",
+	"nemotron_h_moe",
 	"minimax-m2",
-	"mistral4", "olmoe", "openelm", "paddleocr", "pangu-embedded", "phi2",
-	"phi3", "plamo", "plamo2", "qwen",
-	"qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen35", "qwen35moe", "qwen3moe",
-	"qwen3next", "qwen3vl",
-	"qwen3vlmoe", "rnd1", "seed_oss", "smallthinker", "smollm3", "talkie", "xverse",
+	"mistral4",
+	"olmoe",
+	"openelm",
+	"paddleocr",
+	"pangu-embedded",
+	"phi2",
+	"phi3",
+	"plamo",
+	"plamo2",
+	"qwen",
+	"qwen2",
+	"qwen2moe",
+	"qwen2vl",
+	"qwen3",
+	"qwen35",
+	"qwen35moe",
+	"qwen3moe",
+	"qwen3next",
+	"qwen3vl",
+	"qwen3vlmoe",
+	"rnd1",
+	"seed_oss",
+	"smallthinker",
+	"smollm3",
+	"talkie",
+	"xverse",
 ];
 
 pub fn verified(arch: &str) -> bool {

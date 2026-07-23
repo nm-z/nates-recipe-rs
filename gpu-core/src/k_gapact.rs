@@ -45,43 +45,13 @@ unsafe extern "C" {
 		s: *mut c_void,
 	);
 	fn launch_gapact_mish(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_gapact_mish_backward(
-		g: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_gapact_mish_backward(g: *const c_void, x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_gapact_softplus(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void, dtype: i32);
-	fn launch_gapact_softplus_backward(
-		g: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_gapact_softplus_backward(g: *const c_void, x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_gapact_hardswish(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_gapact_hardswish_backward(
-		g: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_gapact_swiglu(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_gapact_geglu(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_gapact_hardswish_backward(g: *const c_void, x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_gapact_swiglu(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_gapact_geglu(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 }
 
 fn e() -> Result<(), HipError> {
@@ -92,12 +62,7 @@ fn e() -> Result<(), HipError> {
 }
 
 #[inline]
-pub fn gpu_elu(
-	x: &GpuBuffer,
-	alpha: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_elu(x: &GpuBuffer, alpha: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let ni = ci(n)?;
 	// SAFETY: buffer pointers come from live GpuBuffers valid for n elements; the launch reads and writes only within them.
 	unsafe {
@@ -198,12 +163,7 @@ macro_rules! u {
 macro_rules! ub {
 	($name:ident, $launch:ident) => {
 		#[inline]
-		pub fn $name(
-			g: &GpuBuffer,
-			x: &GpuBuffer,
-			n: usize,
-			out: &GpuBuffer,
-		) -> Result<(), HipError> {
+		pub fn $name(g: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			let ni = ci(n)?;
 			// SAFETY: g/x/out reference live GpuBuffers valid for n elements; the launcher only touches that range.
 			unsafe {
@@ -222,12 +182,7 @@ macro_rules! ub {
 macro_rules! gate {
 	($name:ident, $launch:ident) => {
 		#[inline]
-		pub fn $name(
-			a: &GpuBuffer,
-			b: &GpuBuffer,
-			n: usize,
-			out: &GpuBuffer,
-		) -> Result<(), HipError> {
+		pub fn $name(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 			let ni = ci(n)?;
 			// SAFETY: the buffers outlive the launch and `n` is the checked length.
 			unsafe {

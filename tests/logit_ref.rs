@@ -1,4 +1,3 @@
-
 use recipe_infer::llm::greedy;
 use std::path::Path;
 

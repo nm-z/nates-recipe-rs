@@ -1,4 +1,3 @@
-
 use ogdl::Node;
 
 fn sel(tree: &str, expr: &str) -> String {
@@ -156,7 +155,11 @@ fn every_subset_of_five_is_selectable() {
 			.filter(|i| return mask & (1 << i) != 0)
 			.map(|i| return node_names[i as usize])
 			.collect();
-		assert_eq!(sel(FIVE, &expr.join(".")), want.join(" "), "mask {mask:#07b}");
+		assert_eq!(
+			sel(FIVE, &expr.join(".")),
+			want.join(" "),
+			"mask {mask:#07b}"
+		);
 	}
 }
 

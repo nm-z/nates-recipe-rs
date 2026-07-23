@@ -14,13 +14,7 @@ unsafe extern "C" {
 	fn launch_scanx_excl_prod(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_scanx_logcumsumexp(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_scanx_assoc_add(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_scanx_recur(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_scanx_recur(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
@@ -69,10 +63,7 @@ fn g_cumprod(x: &[f64]) -> Vec<f64> {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	let ws = GpuBuffer::alloc_bytes(
-		gpu_core::reductions::gpu_cumprod_workspace_bytes(x.len()).max(1),
-	)
-	.unwrap();
+	let ws = GpuBuffer::alloc_bytes(gpu_core::reductions::gpu_cumprod_workspace_bytes(x.len()).max(1)).unwrap();
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	gpu_core::reductions::gpu_cumprod(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];
@@ -87,10 +78,7 @@ fn g_cummax(x: &[f64]) -> Vec<f64> {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	let ws = GpuBuffer::alloc_bytes(
-		gpu_core::reductions::gpu_cummax_workspace_bytes(x.len()).max(1),
-	)
-	.unwrap();
+	let ws = GpuBuffer::alloc_bytes(gpu_core::reductions::gpu_cummax_workspace_bytes(x.len()).max(1)).unwrap();
 	let o = GpuBuffer::alloc(x.len()).unwrap();
 	gpu_core::reductions::gpu_cummax(&b, &ws, x.len(), &o).unwrap();
 	let mut out = vec![0.0; x.len()];

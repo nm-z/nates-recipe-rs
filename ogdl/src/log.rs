@@ -148,7 +148,9 @@ pub fn opt() -> Opt {
 pub fn log_path() -> &'static str {
 	static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 	return PATH.get_or_init(|| {
-		if let Ok(p) = std::env::var("RECIPE_LOG").map(Some).map(|o| o.filter(|p| !p.is_empty()))
+		if let Ok(p) = std::env::var("RECIPE_LOG")
+			.map(Some)
+			.map(|o| o.filter(|p| !p.is_empty()))
 			&& let Some(p) = p
 		{
 			return p;

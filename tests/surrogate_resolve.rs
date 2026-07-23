@@ -15,17 +15,29 @@ fn facts() -> DataFacts {
 #[test]
 fn surrogate_reference_resolves_through_referenced_loss() {
 	let bench = Model::new().layer(24).leak().layer(1).loss(mse).lr(0.001);
-	let tile = Model::new().layer(32).leak().layer(3).loss(&bench).lr(0.001);
+	let tile = Model::new()
+		.layer(32)
+		.leak()
+		.layer(3)
+		.loss(&bench)
+		.lr(0.001);
 
-	let Ok(res) = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &facts())
-	else {
+	let Ok(res) = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &facts()) else {
 		panic!("surrogate reference must resolve");
 	};
 
-	assert!(res.loss == recipe_ir::Loss::Mse, "resolved loss is bench's mse");
-	assert!(!res.notes.is_empty(), "resolution records at least one note");
+	assert!(
+		res.loss == recipe_ir::Loss::Mse,
+		"resolved loss is bench's mse"
+	);
+	assert!(
+		!res.notes.is_empty(),
+		"resolution records at least one note"
+	);
 
-	let g = res.graph.expect("surrogate resolution carries a composed graph");
+	let g = res
+		.graph
+		.expect("surrogate resolution carries a composed graph");
 	assert_eq!(g.objectives.len(), 1, "exactly one merged ObjectiveNode");
 
 	let referrer_params: u32 = 4;
@@ -59,10 +71,12 @@ fn surrogate_reference_resolves_through_referenced_loss() {
 
 #[test]
 fn surrogate_reference_to_unregistered_model_errors() {
-	let objective = recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(
-		recipe_ir::ObjectId(4_000_000),
-	));
-	let specs = [recipe_ir::LayerSpec::Dense(3, recipe_ir::Activation::Linear)];
+	let objective =
+		recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(recipe_ir::ObjectId(4_000_000)));
+	let specs = [recipe_ir::LayerSpec::Dense(
+		3,
+		recipe_ir::Activation::Linear,
+	)];
 
 	let err = resolve_model(&objective, Some(0.001), &specs, &facts())
 		.err()
@@ -80,8 +94,7 @@ fn surrogate_reference_chain_to_ground_resolves() {
 	let mid = Model::new().layer(16).leak().layer(5).loss(&base).lr(0.001);
 	let top = Model::new().layer(32).leak().layer(5).loss(&mid).lr(0.001);
 
-	let Ok(res) = resolve_model(&top.objective(), top.lr_intent(), top.specs(), &facts())
-	else {
+	let Ok(res) = resolve_model(&top.objective(), top.lr_intent(), top.specs(), &facts()) else {
 		panic!("a reference chain that grounds in a concrete loss must resolve");
 	};
 	assert!(
@@ -116,7 +129,10 @@ fn surrogate_reference_genuine_cycle_errors() {
 	);
 
 	let objective = recipe_ir::ObjectiveIntent::Reference(recipe_ir::ObjectRef::Object(a));
-	let referrer_specs = [recipe_ir::LayerSpec::Dense(4, recipe_ir::Activation::Linear)];
+	let referrer_specs = [recipe_ir::LayerSpec::Dense(
+		4,
+		recipe_ir::Activation::Linear,
+	)];
 	let err = resolve_model(&objective, Some(0.001), &referrer_specs, &facts())
 		.err()
 		.expect("a reference that loops back on itself must error");
@@ -130,7 +146,12 @@ fn surrogate_reference_genuine_cycle_errors() {
 #[test]
 fn surrogate_reference_to_layerless_model_errors_on_dims() {
 	let empty = Model::new().loss(mse);
-	let tile = Model::new().layer(32).leak().layer(3).loss(&empty).lr(0.001);
+	let tile = Model::new()
+		.layer(32)
+		.leak()
+		.layer(3)
+		.loss(&empty)
+		.lr(0.001);
 
 	let err = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &facts())
 		.err()
@@ -145,13 +166,17 @@ fn surrogate_reference_to_layerless_model_errors_on_dims() {
 #[test]
 fn mutation_after_reference_is_visible() {
 	let bench = Model::new().layer(24).leak().layer(1).loss(mse).lr(0.001);
-	let tile = Model::new().layer(32).leak().layer(1).loss(&bench).lr(0.001);
+	let tile = Model::new()
+		.layer(32)
+		.leak()
+		.layer(1)
+		.loss(&bench)
+		.lr(0.001);
 
 	let bench = bench.loss(bce);
 	let _held = &bench;
 
-	let Ok(res) = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &facts())
-	else {
+	let Ok(res) = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &facts()) else {
 		panic!("a reference to a mutated model must still resolve");
 	};
 	assert!(
@@ -163,7 +188,12 @@ fn mutation_after_reference_is_visible() {
 #[test]
 fn ambiguity_when_real_target_and_reference_coexist() {
 	let bench = Model::new().layer(24).leak().layer(1).loss(mse).lr(0.001);
-	let tile = Model::new().layer(32).leak().layer(1).loss(&bench).lr(0.001);
+	let tile = Model::new()
+		.layer(32)
+		.leak()
+		.layer(1)
+		.loss(&bench)
+		.lr(0.001);
 
 	let with_target = DataFacts {
 		n: 100,
@@ -171,9 +201,14 @@ fn ambiguity_when_real_target_and_reference_coexist() {
 		k: 1,
 		target_kind: TargetKind::Continuous,
 	};
-	let err = resolve_model(&tile.objective(), tile.lr_intent(), tile.specs(), &with_target)
-		.err()
-		.expect("a real dataset target plus a reference objective is ambiguous");
+	let err = resolve_model(
+		&tile.objective(),
+		tile.lr_intent(),
+		tile.specs(),
+		&with_target,
+	)
+	.err()
+	.expect("a real dataset target plus a reference objective is ambiguous");
 	let msg = err.message();
 	assert!(msg.contains("ambiguous"), "names the ambiguity: {msg}");
 	assert!(
@@ -189,11 +224,21 @@ fn ambiguity_when_real_target_and_reference_coexist() {
 #[test]
 fn referenced_omitted_loss_never_defaults_to_mse() {
 	let critic = Model::new().layer(24).leak().layer(1);
-	let student = Model::new().layer(32).leak().layer(1).loss(&critic).lr(0.001);
+	let student = Model::new()
+		.layer(32)
+		.leak()
+		.layer(1)
+		.loss(&critic)
+		.lr(0.001);
 
-	let err = resolve_model(&student.objective(), student.lr_intent(), student.specs(), &facts())
-		.err()
-		.expect("a referenced model with an omitted loss and no context cannot silently become mse");
+	let err = resolve_model(
+		&student.objective(),
+		student.lr_intent(),
+		student.specs(),
+		&facts(),
+	)
+	.err()
+	.expect("a referenced model with an omitted loss and no context cannot silently become mse");
 	let msg = err.message();
 	assert!(
 		msg.contains("omitted") && msg.contains("no context loss"),

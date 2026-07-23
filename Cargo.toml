@@ -2,6 +2,7 @@
 name = "recipe"
 version = "0.1.1"
 edition = "2024"
+autotests = false
 description = "ML training + inference for AMD/NVIDIA GPUs"
 license = "MIT"
 repository = "https://github.com/nm-z/nates-recipe-rs"
@@ -23,18 +24,374 @@ test = false
 name = "detect"
 path = "src/bin/detect.rs"
 test = false
+required-features = ["legacy"]
 
 [[test]]
 name = "all"
 harness = false
+required-features = ["legacy"]
+
+[[test]]
+name = "next-boundary"
+path = "tests/next_boundary.rs"
+required-features = ["next"]
+
+[[test]]
+name = "arch_dispatch"
+path = "tests/arch_dispatch.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "archs_parity"
+path = "tests/archs_parity.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "cache_unify"
+path = "tests/cache_unify.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "carve_miss"
+path = "tests/carve_miss.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "chat_template"
+path = "tests/chat_template.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "convert_parity"
+path = "tests/convert_parity.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "corpus"
+path = "tests/corpus.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "data"
+path = "tests/data.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "dataset"
+path = "tests/dataset.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "dequant_codecs"
+path = "tests/dequant_codecs.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "diffusion"
+path = "tests/diffusion.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "doc"
+path = "tests/doc.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "download_err"
+path = "tests/download_err.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "elicit"
+path = "tests/elicit.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "encode"
+path = "tests/encode.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "fill"
+path = "tests/fill.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "flash_mask"
+path = "tests/flash_mask.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "forward"
+path = "tests/forward.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "full_probe"
+path = "tests/full_probe.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "gguf"
+path = "tests/gguf.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "glob"
+path = "tests/glob.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "globmac"
+path = "tests/globmac.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "graph"
+path = "tests/graph.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "graph_semantic"
+path = "tests/graph_semantic.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "host"
+path = "tests/host.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "host_store"
+path = "tests/host_store.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "hygiene"
+path = "tests/hygiene.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_cached_equals_scratch"
+path = "tests/kv_cached_equals_scratch.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_capacity"
+path = "tests/kv_capacity.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_carry_equiv"
+path = "tests/kv_carry_equiv.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_dispatch_count"
+path = "tests/kv_dispatch_count.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_mask_leak"
+path = "tests/kv_mask_leak.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_no_legacy_symbols"
+path = "tests/kv_no_legacy_symbols.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_perf"
+path = "tests/kv_perf.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_prefix_reuse"
+path = "tests/kv_prefix_reuse.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_scan_generation"
+path = "tests/kv_scan_generation.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_smoke"
+path = "tests/kv_smoke.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_spill_ram"
+path = "tests/kv_spill_ram.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "kv_spill_refusal"
+path = "tests/kv_spill_refusal.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "live_contract"
+path = "tests/live_contract.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "llamacpp_ab"
+path = "tests/llamacpp_ab.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "logit_ref"
+path = "tests/logit_ref.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "model"
+path = "tests/model.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "moe"
+path = "tests/moe.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "ooc"
+path = "tests/ooc.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "params"
+path = "tests/params.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "path"
+path = "tests/path.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "probe"
+path = "tests/probe.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "reconcile"
+path = "tests/reconcile.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "rope"
+path = "tests/rope.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "safetensors"
+path = "tests/safetensors.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "styles"
+path = "tests/styles.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "surrogate_resolve"
+path = "tests/surrogate_resolve.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "tiered"
+path = "tests/tiered.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "tokenizer_ref"
+path = "tests/tokenizer_ref.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "vocabs_parity"
+path = "tests/vocabs_parity.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "wack"
+path = "tests/wack.rs"
+required-features = ["legacy"]
+
+[[test]]
+name = "wire"
+path = "tests/wire.rs"
+required-features = ["legacy"]
+
+[[example]]
+name = "cookbook"
+required-features = ["legacy"]
+
+[[example]]
+name = "det_probe"
+required-features = ["legacy"]
+
+[[example]]
+name = "gemma4"
+required-features = ["legacy"]
+
+[[example]]
+name = "gpu_probe"
+required-features = ["legacy"]
+
+[[example]]
+name = "stress"
+required-features = ["legacy"]
+
+[[example]]
+name = "styles"
+required-features = ["legacy"]
+
+[[example]]
+name = "train"
+required-features = ["legacy"]
+
+[[example]]
+name = "train_detector"
+required-features = ["legacy"]
 
 [workspace]
 resolver = "3"
 members = [
 	".",
+	"recipe-audit",
+	"recipe-cluster",
 	"recipe-infer",
 	"recipe-ir",
 	"recipe-runtime",
+	"recipe-core",
+	"recipe-cuda",
+	"recipe-executor",
+	"recipe-hsa",
+	"recipe-host",
+	"recipe-ingest",
+	"recipe-kernel",
+	"recipe-language",
+	"recipe-math",
+	"recipe-native-executor",
+	"recipe-native-probe",
+	"recipe-ops",
+	"recipe-planner",
+	"recipe-prepare",
+	"recipe-primitives",
+	"recipe-probe",
+	"recipe-remote",
+	"recipe-scheduler",
+	"recipe-text",
+	"recipe-transport",
 	"pantry",
 	"gpu-core/vramspy",
 	"gpu-core",
@@ -44,30 +401,102 @@ members = [
 	"lightgbm-rs",
 ]
 
+[features]
+default = ["legacy"]
+legacy = [
+	"dep:anyhow",
+	"dep:crossterm",
+	"dep:csv",
+	"dep:data-encoding",
+	"dep:gpu-core",
+	"dep:half",
+	"dep:image",
+	"dep:libc",
+	"dep:ndarray",
+	"dep:ndarray-stats",
+	"dep:ogdl",
+	"dep:pantry",
+	"dep:rand",
+	"dep:rand_chacha",
+	"dep:rand_distr",
+	"dep:ratatui",
+	"dep:rayon",
+	"dep:recipe-infer",
+	"dep:recipe-ir",
+	"dep:recipe-runtime",
+	"dep:tui-textarea",
+	"dep:unicode-width",
+	"dep:zip",
+]
+next = [
+	"dep:recipe-core",
+	"dep:recipe-cluster",
+	"dep:recipe-cuda",
+	"dep:recipe-executor",
+	"dep:recipe-hsa",
+	"dep:recipe-host",
+	"dep:recipe-ingest",
+	"dep:recipe-kernel",
+	"dep:recipe-language",
+	"dep:recipe-math",
+	"dep:recipe-native-executor",
+	"dep:recipe-native-probe",
+	"dep:recipe-ops",
+	"dep:recipe-planner",
+	"dep:recipe-prepare",
+	"dep:recipe-primitives",
+	"dep:recipe-probe",
+	"dep:recipe-remote",
+	"dep:recipe-scheduler",
+	"dep:recipe-text",
+	"dep:recipe-transport",
+]
+
 [dependencies]
-gpu-core = { path = "gpu-core" }
-recipe-infer = { path = "recipe-infer" }
-recipe-ir = { path = "recipe-ir" }
-pantry = { path = "pantry" }
-ogdl = { path = "ogdl" }
-recipe-runtime = { path = "recipe-runtime" }
-anyhow = "1"
-csv = "1"
-ndarray = { version = "0.16", features = ["rayon"] }
-ndarray-stats = "0.6"
-rayon = "1"
-rand = "0.9"
-rand_chacha = "0.9"
-rand_distr = "0.5"
-half = "2"
-image = "0.25"
-ratatui = "0.29"
-crossterm = "0.28"
-tui-textarea = "0.7"
-unicode-width = "0.2"
-libc = "0.2"
-data-encoding = "2.11.0"
-zip = "2"
+recipe-core = { path = "recipe-core", optional = true }
+recipe-cluster = { path = "recipe-cluster", optional = true }
+recipe-cuda = { path = "recipe-cuda", optional = true }
+recipe-executor = { path = "recipe-executor", optional = true }
+recipe-hsa = { path = "recipe-hsa", optional = true }
+recipe-host = { path = "recipe-host", optional = true }
+recipe-ingest = { path = "recipe-ingest", optional = true }
+recipe-kernel = { path = "recipe-kernel", optional = true }
+recipe-language = { path = "recipe-language", optional = true }
+recipe-math = { path = "recipe-math", optional = true }
+recipe-native-executor = { path = "recipe-native-executor", optional = true }
+recipe-native-probe = { path = "recipe-native-probe", optional = true }
+recipe-ops = { path = "recipe-ops", optional = true }
+recipe-planner = { path = "recipe-planner", optional = true }
+recipe-prepare = { path = "recipe-prepare", optional = true }
+recipe-primitives = { path = "recipe-primitives", optional = true }
+recipe-probe = { path = "recipe-probe", optional = true }
+recipe-remote = { path = "recipe-remote", optional = true }
+recipe-scheduler = { path = "recipe-scheduler", optional = true }
+recipe-text = { path = "recipe-text", optional = true }
+recipe-transport = { path = "recipe-transport", optional = true }
+gpu-core = { path = "gpu-core", optional = true }
+recipe-infer = { path = "recipe-infer", optional = true }
+recipe-ir = { path = "recipe-ir", optional = true }
+pantry = { path = "pantry", optional = true }
+ogdl = { path = "ogdl", optional = true }
+recipe-runtime = { path = "recipe-runtime", optional = true }
+anyhow = { version = "1", optional = true }
+csv = { version = "1", optional = true }
+ndarray = { version = "0.16", features = ["rayon"], optional = true }
+ndarray-stats = { version = "0.6", optional = true }
+rayon = { version = "1", optional = true }
+rand = { version = "0.9", optional = true }
+rand_chacha = { version = "0.9", optional = true }
+rand_distr = { version = "0.5", optional = true }
+half = { version = "2", optional = true }
+image = { version = "0.25", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+tui-textarea = { version = "0.7", optional = true }
+unicode-width = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true }
+data-encoding = { version = "2.11.0", optional = true }
+zip = { version = "2", optional = true }
 
 
 [lints]
@@ -152,6 +581,3 @@ missing_trait_methods = "allow"
 integer_division_remainder_used = "allow"
 pub_without_shorthand = "allow"
 pub_with_shorthand = "allow"
-
-
-

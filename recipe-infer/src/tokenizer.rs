@@ -1,9 +1,9 @@
 use crate::gguf::Gguf;
 use anyhow::{Result, anyhow};
 use std::path::Path;
+pub use tokenizers::Tokenizer;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-pub use tokenizers::Tokenizer;
 
 pub fn from_file(path: &Path) -> Result<Tokenizer> {
 	Tokenizer::from_file(path).map_err(|e| anyhow!("tokenizer {}: {e}", path.display()))
@@ -35,8 +35,10 @@ fn from_gguf_spm(g: &Gguf) -> Result<Tokenizer> {
 		}
 	}
 	merges.sort_by(|a, b| return b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-	let merge_pairs: Vec<(String, String)> =
-		merges.into_iter().map(|(_sc, l, r)| return (l, r)).collect();
+	let merge_pairs: Vec<(String, String)> = merges
+		.into_iter()
+		.map(|(_sc, l, r)| return (l, r))
+		.collect();
 	let unk = g.u32_kv("tokenizer.ggml.unknown_token_id").unwrap_or(0);
 	let unk_piece = pieces
 		.get(unk as usize)
@@ -64,7 +66,9 @@ fn from_gguf_spm(g: &Gguf) -> Result<Tokenizer> {
 		tokenizers::decoders::fuse::Fuse::new().into(),
 		tokenizers::decoders::strip::Strip::new(' ', 1, 0).into(),
 	];
-	tk.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(decode_chain)));
+	tk.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(
+		decode_chain,
+	)));
 	Ok(tk)
 }
 

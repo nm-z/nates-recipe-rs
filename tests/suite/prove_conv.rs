@@ -215,8 +215,7 @@ fn prove_conv1d() -> bool {
 				let mut acc = b[co];
 				for ci in 0..cin {
 					for kk in 0..k {
-						acc += x[(nn * cin + ci) * l + t + kk]
-							* w[(co * cin + ci) * k + kk];
+						acc += x[(nn * cin + ci) * l + t + kk] * w[(co * cin + ci) * k + kk];
 					}
 				}
 				want[(nn * cout + co) * lout + t] = acc;
@@ -277,9 +276,8 @@ fn prove_conv2d() -> bool {
 					for ci in 0..cin {
 						for ph in 0..kh {
 							for pw in 0..kw {
-								acc += x[((nn * cin + ci) * h + oh + ph) * w_
-									+ ow + pw] * w
-									[((co * cin + ci) * kh + ph) * kw + pw];
+								acc += x[((nn * cin + ci) * h + oh + ph) * w_ + ow + pw]
+									* w[((co * cin + ci) * kh + ph) * kw + pw];
 							}
 						}
 					}
@@ -347,19 +345,14 @@ fn prove_conv3d() -> bool {
 							for pd in 0..kd {
 								for ph in 0..kh {
 									for pw in 0..kw {
-										acc +=
-											x[(((nn * cin + ci) * d
-												+ od + pd) * h + oh + ph) * w_
-												+ ow + pw] * w[(((co * cin
-												+ ci) * kd
-												+ pd) * kh + ph)
-												* kw + pw];
+										acc += x[(((nn * cin + ci) * d + od + pd) * h + oh + ph)
+											* w_ + ow + pw] * w
+											[(((co * cin + ci) * kd + pd) * kh + ph) * kw + pw];
 									}
 								}
 							}
 						}
-						want[(((nn * cout + co) * dout + od) * hout + oh) * wout
-							+ ow] = acc;
+						want[(((nn * cout + co) * dout + od) * hout + oh) * wout + ow] = acc;
 					}
 				}
 			}
@@ -547,9 +540,8 @@ fn prove_grouped_conv2d() -> bool {
 						let ci = ci_base + ciw;
 						for ph in 0..kh {
 							for pw in 0..kw {
-								acc += x[((nn * cin + ci) * h + oh + ph) * w_
-									+ ow + pw] * w
-									[((co * cin_g + ciw) * kh + ph) * kw + pw];
+								acc += x[((nn * cin + ci) * h + oh + ph) * w_ + ow + pw]
+									* w[((co * cin_g + ciw) * kh + ph) * kw + pw];
 							}
 						}
 					}
@@ -723,8 +715,7 @@ fn prove_im2col_2d() -> bool {
 					for ph in 0..kh {
 						for pw in 0..kw {
 							let within = (cc * kh + ph) * kw + pw;
-							want[pidx * ps + within] =
-								x[((nn * c + cc) * h + ohh + ph) * w + oww + pw];
+							want[pidx * ps + within] = x[((nn * c + cc) * h + ohh + ph) * w + oww + pw];
 						}
 					}
 				}
@@ -911,11 +902,7 @@ fn canon(name: &str) -> Option<&'static str> {
 		return Some("grouped_conv2d");
 	}
 
-	if base == "dilation2d"
-		|| base == "dilation2d_native"
-		|| base == "erosion2d"
-		|| base == "erosion2d_native"
-	{
+	if base == "dilation2d" || base == "dilation2d_native" || base == "erosion2d" || base == "erosion2d_native" {
 		return Some("dilation2d");
 	}
 

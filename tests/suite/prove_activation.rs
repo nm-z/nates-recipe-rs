@@ -11,44 +11,14 @@ use std::ptr;
 // ── new activationx_ launchers ──────────────────────────────────────────────
 unsafe extern "C" {
 	fn launch_activationx_relu_squared(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_activationx_shifted_softplus(
-		x: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_activationx_squareplus(
-		x: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		b: f64,
-		s: *mut c_void,
-	);
-	fn launch_activationx_star_relu(
-		x: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		sc: f64,
-		b: f64,
-		s: *mut c_void,
-	);
-	fn launch_activationx_prelu(
-		x: *const c_void,
-		a: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_activationx_shifted_softplus(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_activationx_squareplus(x: *const c_void, o: *mut c_void, n: i32, b: f64, s: *mut c_void);
+	fn launch_activationx_star_relu(x: *const c_void, o: *mut c_void, n: i32, sc: f64, b: f64, s: *mut c_void);
+	fn launch_activationx_prelu(x: *const c_void, a: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_activationx_glu(x: *const c_void, o: *mut c_void, half: i32, s: *mut c_void);
 	fn launch_activationx_reglu(x: *const c_void, o: *mut c_void, half: i32, s: *mut c_void);
 	fn launch_activationx_crelu(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_activationx_softmin(
-		x: *const c_void,
-		o: *mut c_void,
-		rows: i32,
-		cols: i32,
-		s: *mut c_void,
-	);
+	fn launch_activationx_softmin(x: *const c_void, o: *mut c_void, rows: i32, cols: i32, s: *mut c_void);
 }
 
 const TOL: f64 = 1e-6;
@@ -216,8 +186,8 @@ fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	);
 
 	use gpu_core::k_actx::{
-		gpu_gelu_exact, gpu_hardsigmoid, gpu_hardtanh, gpu_logsigmoid, gpu_relu6,
-		gpu_softshrink, gpu_softsign, gpu_tanhshrink,
+		gpu_gelu_exact, gpu_hardsigmoid, gpu_hardtanh, gpu_logsigmoid, gpu_relu6, gpu_softshrink, gpu_softsign,
+		gpu_tanhshrink,
 	};
 	fn celu1(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 		let p = {

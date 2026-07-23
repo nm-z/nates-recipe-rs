@@ -1,20 +1,16 @@
-use gpu_core::kernels::{
-	gpu_cholesky, gpu_cholesky_workspace_bytes, gpu_dgemv_into, gpu_dger_into,
-};
+use gpu_core::kernels::{gpu_cholesky, gpu_cholesky_workspace_bytes, gpu_dgemv_into, gpu_dger_into};
 use gpu_core::linalg::{
-	gpu_bmm_into, gpu_dasum, gpu_dsyrk, gpu_eigh_sym, gpu_eigh_sym_workspace_bytes,
-	gpu_fft_c2c_1d, gpu_idamax, gpu_lu_factor, gpu_lu_factor_workspace_bytes, gpu_lu_solve,
-	gpu_lu_solve_workspace_bytes, gpu_potrs, gpu_potrs_workspace_bytes, gpu_qr,
-	gpu_qr_workspace_bytes, gpu_rfft_1d, gpu_svd, gpu_svd_workspace_bytes,
+	gpu_bmm_into, gpu_dasum, gpu_dsyrk, gpu_eigh_sym, gpu_eigh_sym_workspace_bytes, gpu_fft_c2c_1d, gpu_idamax,
+	gpu_lu_factor, gpu_lu_factor_workspace_bytes, gpu_lu_solve, gpu_lu_solve_workspace_bytes, gpu_potrs,
+	gpu_potrs_workspace_bytes, gpu_qr, gpu_qr_workspace_bytes, gpu_rfft_1d, gpu_svd, gpu_svd_workspace_bytes,
 };
 use gpu_core::memory::GpuBuffer;
 use gpu_core::reductions::{
-	gpu_argsort, gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod,
-	gpu_cumprod_workspace_bytes, gpu_cumsum_cols, gpu_cumsum_rows, gpu_dot,
-	gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes, gpu_max_all,
+	gpu_argsort, gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod, gpu_cumprod_workspace_bytes, gpu_cumsum_cols,
+	gpu_cumsum_rows, gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes, gpu_max_all,
 	gpu_max_all_workspace_bytes, gpu_mean_all, gpu_mean_all_workspace_bytes, gpu_min_all,
-	gpu_min_all_workspace_bytes, gpu_scan_linear_recurrence, gpu_segment_max, gpu_segment_sort,
-	gpu_segment_sum, gpu_sort, gpu_sort_by_key, gpu_sum_all, gpu_sum_all_workspace_bytes,
+	gpu_min_all_workspace_bytes, gpu_scan_linear_recurrence, gpu_segment_max, gpu_segment_sort, gpu_segment_sum,
+	gpu_sort, gpu_sort_by_key, gpu_sum_all, gpu_sum_all_workspace_bytes,
 };
 use std::ptr;
 

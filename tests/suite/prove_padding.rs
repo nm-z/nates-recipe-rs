@@ -16,30 +16,9 @@ unsafe extern "C" {
 		cval: f64,
 		s: *mut c_void,
 	);
-	fn launch_paddingx_reflect1d(
-		x: *const c_void,
-		o: *mut c_void,
-		l: i32,
-		lpad: i32,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_paddingx_replicate1d(
-		x: *const c_void,
-		o: *mut c_void,
-		l: i32,
-		lpad: i32,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_paddingx_circular1d(
-		x: *const c_void,
-		o: *mut c_void,
-		l: i32,
-		lpad: i32,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_paddingx_reflect1d(x: *const c_void, o: *mut c_void, l: i32, lpad: i32, n: i32, s: *mut c_void);
+	fn launch_paddingx_replicate1d(x: *const c_void, o: *mut c_void, l: i32, lpad: i32, n: i32, s: *mut c_void);
+	fn launch_paddingx_circular1d(x: *const c_void, o: *mut c_void, l: i32, lpad: i32, n: i32, s: *mut c_void);
 	fn launch_paddingx_constant2d(
 		x: *const c_void,
 		o: *mut c_void,
@@ -138,17 +117,7 @@ fn oracle_1d(mode: &str, x: &[f64], lpad: i64, rpad: i64, cval: f64) -> Vec<f64>
 	.collect()
 }
 
-fn oracle_2d(
-	mode: &str,
-	x: &[f64],
-	h: i64,
-	w: i64,
-	tpad: i64,
-	bpad: i64,
-	lpad: i64,
-	rpad: i64,
-	cval: f64,
-) -> Vec<f64> {
+fn oracle_2d(mode: &str, x: &[f64], h: i64, w: i64, tpad: i64, bpad: i64, lpad: i64, rpad: i64, cval: f64) -> Vec<f64> {
 	let oh = h + tpad + bpad;
 	let ow = w + lpad + rpad;
 	let mut out = vec![0.0; (oh * ow) as usize];
@@ -189,9 +158,7 @@ fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	let (xp, op) = (b.ptr_raw() as *const c_void, o.ptr_raw());
 	unsafe {
 		match mode {
-			"constant" => {
-				launch_paddingx_constant1d(xp, op, l, lpad, n, cval, ptr::null_mut())
-			}
+			"constant" => launch_paddingx_constant1d(xp, op, l, lpad, n, cval, ptr::null_mut()),
 			"reflect" => launch_paddingx_reflect1d(xp, op, l, lpad, n, ptr::null_mut()),
 			"replicate" => launch_paddingx_replicate1d(xp, op, l, lpad, n, ptr::null_mut()),
 			"circular" => launch_paddingx_circular1d(xp, op, l, lpad, n, ptr::null_mut()),
@@ -205,17 +172,7 @@ fn gpu_1d(mode: &str, x: &[f64], lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	out
 }
 
-fn gpu_2d(
-	mode: &str,
-	x: &[f64],
-	h: i32,
-	w: i32,
-	tpad: i32,
-	bpad: i32,
-	lpad: i32,
-	rpad: i32,
-	cval: f64,
-) -> Vec<f64> {
+fn gpu_2d(mode: &str, x: &[f64], h: i32, w: i32, tpad: i32, bpad: i32, lpad: i32, rpad: i32, cval: f64) -> Vec<f64> {
 	let oh = h + tpad + bpad;
 	let ow = w + lpad + rpad;
 	let n = oh * ow;
@@ -229,55 +186,10 @@ fn gpu_2d(
 	let (xp, op) = (b.ptr_raw() as *const c_void, o.ptr_raw());
 	unsafe {
 		match mode {
-			"constant" => launch_paddingx_constant2d(
-				xp,
-				op,
-				h,
-				w,
-				tpad,
-				lpad,
-				oh,
-				ow,
-				n,
-				cval,
-				ptr::null_mut(),
-			),
-			"reflect" => launch_paddingx_reflect2d(
-				xp,
-				op,
-				h,
-				w,
-				tpad,
-				lpad,
-				oh,
-				ow,
-				n,
-				ptr::null_mut(),
-			),
-			"replicate" => launch_paddingx_replicate2d(
-				xp,
-				op,
-				h,
-				w,
-				tpad,
-				lpad,
-				oh,
-				ow,
-				n,
-				ptr::null_mut(),
-			),
-			"circular" => launch_paddingx_circular2d(
-				xp,
-				op,
-				h,
-				w,
-				tpad,
-				lpad,
-				oh,
-				ow,
-				n,
-				ptr::null_mut(),
-			),
+			"constant" => launch_paddingx_constant2d(xp, op, h, w, tpad, lpad, oh, ow, n, cval, ptr::null_mut()),
+			"reflect" => launch_paddingx_reflect2d(xp, op, h, w, tpad, lpad, oh, ow, n, ptr::null_mut()),
+			"replicate" => launch_paddingx_replicate2d(xp, op, h, w, tpad, lpad, oh, ow, n, ptr::null_mut()),
+			"circular" => launch_paddingx_circular2d(xp, op, h, w, tpad, lpad, oh, ow, n, ptr::null_mut()),
 			_ => unreachable!(),
 		}
 	}

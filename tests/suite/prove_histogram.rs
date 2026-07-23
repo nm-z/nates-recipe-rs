@@ -17,13 +17,7 @@ unsafe extern "C" {
 		bins: i32,
 		s: *mut c_void,
 	);
-	fn launch_histogramx_bincount(
-		labels: *const c_void,
-		counts: *mut c_void,
-		n: i32,
-		out_len: i32,
-		s: *mut c_void,
-	);
+	fn launch_histogramx_bincount(labels: *const c_void, counts: *mut c_void, n: i32, out_len: i32, s: *mut c_void);
 }
 
 const TOL: f64 = 1e-6;

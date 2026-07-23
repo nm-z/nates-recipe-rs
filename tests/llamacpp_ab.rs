@@ -1,9 +1,8 @@
-
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};
-use std::time::Instant;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 const PROMPT: &str = "Once upon a time";
 const N_NEW: usize = 64;
@@ -92,7 +91,11 @@ fn llama_completion(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 		ttft_s.is_finite() && tok_s.is_finite(),
 		"could not parse common_perf timings from llama-completion stderr:\n{stderr}"
 	);
-	return EngineRun { text, ttft_s, tok_s };
+	return EngineRun {
+		text,
+		ttft_s,
+		tok_s,
+	};
 }
 
 fn recipe_run(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
@@ -112,7 +115,9 @@ fn recipe_run(model: &Path, prompt: &str, n_new: usize) -> EngineRun {
 		})
 		.expect("generate_in");
 	let ttft_s = first.map_or(f64::NAN, |f| return f.duration_since(sent).as_secs_f64());
-	let tok_s = first.map_or(f64::NAN, |f| return n as f64 / f.elapsed().as_secs_f64().max(1e-9));
+	let tok_s = first.map_or(f64::NAN, |f| {
+		return n as f64 / f.elapsed().as_secs_f64().max(1e-9);
+	});
 	let body = reply
 		.rsplit_once("\n\n")
 		.map(|(b, _stats)| return b.to_string())

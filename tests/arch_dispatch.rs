@@ -1,18 +1,23 @@
-
 use recipe_infer::llm::{arch_composable, arch_supported, composable_archs, supported_archs};
 
 #[test]
 fn verified_is_a_measured_subset_of_composable() {
 	assert!(!supported_archs().is_empty(), "VERIFIED went empty");
 	for arch in supported_archs() {
-		assert!(arch_supported(arch), "{arch} listed but not reported supported");
+		assert!(
+			arch_supported(arch),
+			"{arch} listed but not reported supported"
+		);
 		assert!(
 			arch_composable(arch),
 			"{arch} verified but not composable: roster and table diverged"
 		);
 	}
 	for arch in ["qwen3", "xverse", "gemma2", "qwen2", "phi3"] {
-		assert!(arch_supported(arch), "{arch} is measured OK and must be supported");
+		assert!(
+			arch_supported(arch),
+			"{arch} is measured OK and must be supported"
+		);
 	}
 }
 

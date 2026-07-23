@@ -1,7 +1,7 @@
 use anyhow::Context;
-use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::nn_f32::gpu_linear_f32;
+use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use std::fmt;
 use std::time::Instant;

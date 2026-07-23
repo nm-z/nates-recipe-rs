@@ -1,0 +1,19 @@
+[package]
+name = "recipe-ingest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Dependency-clean external representation and framing for Recipe"
+
+[dependencies]
+csv = "1"
+recipe-core = { path = "../recipe-core" }
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

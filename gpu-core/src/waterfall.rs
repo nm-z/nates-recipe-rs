@@ -1,6 +1,6 @@
-use ogdl::log::{Write, gpu};
 use crate::memory::{GpuBuffer, USER_GB, arena_remaining, probe_ram_ceiling, tag_scope};
 use core::cmp::Ordering;
+use ogdl::log::{Write, gpu};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Error, Result};
@@ -94,12 +94,7 @@ impl Waterfall {
 	}
 
 	#[inline]
-	pub fn place(
-		&mut self,
-		name: &str,
-		len: usize,
-		fill: impl FnOnce(&mut [u8]) -> Result<()>,
-	) -> Result<&Home> {
+	pub fn place(&mut self, name: &str, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<&Home> {
 		let home = self.settle(len, fill)?;
 		match home {
 			Home::Vram(..) => self.vram_bytes += len,
@@ -123,8 +118,8 @@ impl Waterfall {
 		match vram {
 			Tier::Use => {
 				let _t = tag_scope("waterfall");
-				let view = GpuBuffer::alloc_bytes(len)
-					.map_err(|e| return Error::other(format!("carve: {e}")))?;
+				let view =
+					GpuBuffer::alloc_bytes(len).map_err(|e| return Error::other(format!("carve: {e}")))?;
 				if self.stage.len() < len {
 					self.stage.resize(len, 0);
 				}
@@ -149,11 +144,7 @@ impl Waterfall {
 		return verified;
 	}
 
-	fn settle_host(
-		&mut self,
-		len: usize,
-		fill: impl FnOnce(&mut [u8]) -> Result<()>,
-	) -> Result<Home> {
+	fn settle_host(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Home> {
 		let ceiling = self.ram_ceiling();
 		let ram = match self.ram_full {
 			Fill::Full => Tier::Skip,

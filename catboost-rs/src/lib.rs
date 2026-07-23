@@ -1,10 +1,10 @@
 use gpu_core::HipError;
 use gpu_core::kernels::{
-	gpu_leaf_finalize, gpu_leaf_reduce, gpu_oblivious_histogram, gpu_oblivious_route_full,
-	gpu_oblivious_route_step, gpu_oblivious_split_eval,
+	gpu_leaf_finalize, gpu_leaf_reduce, gpu_oblivious_histogram, gpu_oblivious_route_full, gpu_oblivious_route_step,
+	gpu_oblivious_split_eval,
 };
-use ogdl::log::{Errored, Write, epoch};
 use gpu_core::memory::GpuBuffer;
+use ogdl::log::{Errored, Write, epoch};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::Exp1;
@@ -98,14 +98,7 @@ pub struct Model {
 	ts_infos: Vec<TsInfo>,
 }
 
-fn validate_train(
-	x: &[f64],
-	y: &[usize],
-	n: usize,
-	p: usize,
-	nc: usize,
-	params: &Params,
-) -> Result<(), Error> {
+fn validate_train(x: &[f64], y: &[usize], n: usize, p: usize, nc: usize, params: &Params) -> Result<(), Error> {
 	if n == 0 {
 		return Err(Error::InvalidInput("n must be > 0".into()));
 	}
@@ -426,15 +419,11 @@ fn build_oblivious_tree_gpu(
 	n_bins: usize,
 ) -> Result<(Vec<usize>, Vec<usize>, Vec<Vec<f64>>, Vec<u8>), Error> {
 	let n_leaves = 1usize << depth;
-	let lambda_gpu = GpuBuffer::upload_f32(&[l2 as f32])
-		.map_err(|e| Errored::new(format!("upload lambda: {e}")))?;
-	let min_cw_gpu = GpuBuffer::upload_f32(&[0.0f32])
-		.map_err(|e| Errored::new(format!("upload min_cw: {e}")))?;
+	let lambda_gpu = GpuBuffer::upload_f32(&[l2 as f32]).map_err(|e| Errored::new(format!("upload lambda: {e}")))?;
+	let min_cw_gpu = GpuBuffer::upload_f32(&[0.0f32]).map_err(|e| Errored::new(format!("upload min_cw: {e}")))?;
 
-	let mut node_a =
-		zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_a ({n} bytes): {e}")))?;
-	let mut node_b =
-		zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_b ({n} bytes): {e}")))?;
+	let mut node_a = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_a ({n} bytes): {e}")))?;
+	let mut node_b = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc node_b ({n} bytes): {e}")))?;
 
 	let mut split_features = Vec::with_capacity(depth);
 	let mut split_bins_vec = Vec::with_capacity(depth);
@@ -454,12 +443,10 @@ fn build_oblivious_tree_gpu(
 			let h_gpu = GpuBuffer::upload_f32(&hess_k)
 				.map_err(|e| Errored::new(format!("upload hess class {k}: {e}")))?;
 
-			let grad_hist = zeros_bytes(hist_bytes).map_err(|e| {
-				Errored::new(format!("alloc grad_hist ({hist_bytes} bytes): {e}"))
-			})?;
-			let hess_hist = zeros_bytes(hist_bytes).map_err(|e| {
-				Errored::new(format!("alloc hess_hist ({hist_bytes} bytes): {e}"))
-			})?;
+			let grad_hist = zeros_bytes(hist_bytes)
+				.map_err(|e| Errored::new(format!("alloc grad_hist ({hist_bytes} bytes): {e}")))?;
+			let hess_hist = zeros_bytes(hist_bytes)
+				.map_err(|e| Errored::new(format!("alloc hess_hist ({hist_bytes} bytes): {e}")))?;
 
 			gpu_oblivious_histogram(
 				bins_fm_gpu,
@@ -474,9 +461,8 @@ fn build_oblivious_tree_gpu(
 				&hess_hist,
 			)?;
 
-			let gain_k = zeros_bytes(gain_elems * 4).map_err(|e| {
-				Errored::new(format!("alloc gain_k ({} bytes): {e}", gain_elems * 4))
-			})?;
+			let gain_k = zeros_bytes(gain_elems * 4)
+				.map_err(|e| Errored::new(format!("alloc gain_k ({} bytes): {e}", gain_elems * 4)))?;
 			gpu_oblivious_split_eval(
 				&grad_hist,
 				&hess_hist,
@@ -530,15 +516,12 @@ fn build_oblivious_tree_gpu(
 		let h_gpu = GpuBuffer::upload_f32(&hess_k)
 			.map_err(|e| Errored::new(format!("upload leaf hess class {k}: {e}")))?;
 
-		let leaf_grad = zeros_bytes(n_leaves * 4).map_err(|e| {
-			Errored::new(format!("alloc leaf_grad ({} bytes): {e}", n_leaves * 4))
-		})?;
-		let leaf_hess = zeros_bytes(n_leaves * 4).map_err(|e| {
-			Errored::new(format!("alloc leaf_hess ({} bytes): {e}", n_leaves * 4))
-		})?;
-		let leaf_val = zeros_bytes(n_leaves * 4).map_err(|e| {
-			Errored::new(format!("alloc leaf_val ({} bytes): {e}", n_leaves * 4))
-		})?;
+		let leaf_grad = zeros_bytes(n_leaves * 4)
+			.map_err(|e| Errored::new(format!("alloc leaf_grad ({} bytes): {e}", n_leaves * 4)))?;
+		let leaf_hess = zeros_bytes(n_leaves * 4)
+			.map_err(|e| Errored::new(format!("alloc leaf_hess ({} bytes): {e}", n_leaves * 4)))?;
+		let leaf_val = zeros_bytes(n_leaves * 4)
+			.map_err(|e| Errored::new(format!("alloc leaf_val ({} bytes): {e}", n_leaves * 4)))?;
 
 		gpu_leaf_reduce(&node_a, &g_gpu, &h_gpu, n, &leaf_grad, &leaf_hess)?;
 		gpu_leaf_finalize(&leaf_grad, &leaf_hess, &lambda_gpu, n_leaves, &leaf_val)?;
@@ -567,12 +550,9 @@ fn route_full_gpu(
 	let depth = split_features.len();
 	let sf_i32: Vec<i32> = split_features.iter().map(|&f| f as i32).collect();
 	let sb_u8: Vec<u8> = split_bins.iter().map(|&b| b.min(255) as u8).collect();
-	let sf_gpu = GpuBuffer::upload_i32(&sf_i32)
-		.map_err(|e| Errored::new(format!("upload split features: {e}")))?;
-	let sb_gpu =
-		upload_u8(&sb_u8).map_err(|e| Errored::new(format!("upload split bins: {e}")))?;
-	let leaf_gpu = zeros_bytes(n)
-		.map_err(|e| Errored::new(format!("alloc leaf routing buffer ({n} bytes): {e}")))?;
+	let sf_gpu = GpuBuffer::upload_i32(&sf_i32).map_err(|e| Errored::new(format!("upload split features: {e}")))?;
+	let sb_gpu = upload_u8(&sb_u8).map_err(|e| Errored::new(format!("upload split bins: {e}")))?;
+	let leaf_gpu = zeros_bytes(n).map_err(|e| Errored::new(format!("alloc leaf routing buffer ({n} bytes): {e}")))?;
 
 	gpu_oblivious_route_full(
 		bins_rm_gpu,
@@ -591,18 +571,10 @@ fn route_full_gpu(
 	Ok(out)
 }
 
-pub fn train(
-	x: &[f64],
-	y: &[usize],
-	n: usize,
-	p: usize,
-	n_classes: usize,
-	params: &Params,
-) -> Result<Model, Error> {
+pub fn train(x: &[f64], y: &[usize], n: usize, p: usize, n_classes: usize, params: &Params) -> Result<Model, Error> {
 	validate_train(x, y, n, p, n_classes, params)?;
 	let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
-	let (bins, borders, cat_mappings) =
-		quantize(x, n, p, params.border_count, &params.cat_features);
+	let (bins, borders, cat_mappings) = quantize(x, n, p, params.border_count, &params.cat_features);
 	let perms = gen_permutations(n, params.n_permutations, &mut rng);
 	let class_priors: Vec<f64> = (0..n_classes)
 		.map(|k| y.iter().filter(|&&c| c == k).count() as f64 / n as f64)
@@ -650,10 +622,8 @@ pub fn train(
 		for i in 0..n {
 			for k in 0..n_classes {
 				let pk = probs[i * n_classes + k];
-				grads_f32[i * n_classes + k] =
-					((pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i]) as f32;
-				hesses_f32[i * n_classes + k] =
-					((pk * (1.0 - pk)).max(1e-6) * bb[i]) as f32;
+				grads_f32[i * n_classes + k] = ((pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i]) as f32;
+				hesses_f32[i * n_classes + k] = ((pk * (1.0 - pk)).max(1e-6) * bb[i]) as f32;
 			}
 		}
 
@@ -685,8 +655,7 @@ pub fn train(
 			let mut lh = vec![0.0f64; n_leaves];
 			for i in 0..n {
 				let pk = avg_probs[i * n_classes + k];
-				lg[leaf_indices[i] as usize] +=
-					(pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
+				lg[leaf_indices[i] as usize] += (pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
 				lh[leaf_indices[i] as usize] += (pk * (1.0 - pk)).max(1e-6) * bb[i];
 			}
 			new_lv.push((0..n_leaves)
@@ -704,8 +673,7 @@ pub fn train(
 		for i in 0..n {
 			let leaf = leaf_indices[i] as usize;
 			for k in 0..n_classes {
-				avg_logits[i * n_classes + k] +=
-					params.learning_rate * tree.leaf_values[k][leaf];
+				avg_logits[i * n_classes + k] += params.learning_rate * tree.leaf_values[k][leaf];
 			}
 		}
 
@@ -729,8 +697,7 @@ pub fn train(
 			}
 
 			let r_rm = bins_row_major_u8(&r_all_refs, n_total, n);
-			let r_bins_rm_gpu = upload_u8(&r_rm)
-				.map_err(|e| Errored::new(format!("upload r_rm bins: {e}")))?;
+			let r_bins_rm_gpu = upload_u8(&r_rm).map_err(|e| Errored::new(format!("upload r_rm bins: {e}")))?;
 
 			let r_leaf_u8 = route_full_gpu(&r_bins_rm_gpu, &sf, &sb, n, n_total)?;
 			let r_leaf_indices: Vec<u32> = r_leaf_u8.iter().map(|&v| v as u32).collect();
@@ -741,8 +708,7 @@ pub fn train(
 			for i in 0..n {
 				for k in 0..n_classes {
 					let pk = r_probs[i * n_classes + k];
-					r_grads[i * n_classes + k] =
-						(pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
+					r_grads[i * n_classes + k] = (pk - if y[i] == k { 1.0 } else { 0.0 }) * bb[i];
 					r_hesses[i * n_classes + k] = (pk * (1.0 - pk)).max(1e-6) * bb[i];
 				}
 			}
@@ -753,11 +719,7 @@ pub fn train(
 				let leaf = r_leaf_indices[idx] as usize;
 				for k in 0..n_classes {
 					let w = if prefix_lh[k][leaf] > 1e-10 {
-						leaf_weight(
-							prefix_lg[k][leaf],
-							prefix_lh[k][leaf],
-							params.l2_reg,
-						)
+						leaf_weight(prefix_lg[k][leaf], prefix_lh[k][leaf], params.l2_reg)
 					} else {
 						0.0
 					};
@@ -780,14 +742,7 @@ pub fn train(
 	for &cat_j in &params.cat_features {
 		let n_cats = *bins[cat_j].iter().max().unwrap_or(&0) as usize + 1;
 		for k in 0..n_classes {
-			let greedy = greedy_target_stats(
-				y,
-				&bins[cat_j],
-				n_cats,
-				k,
-				params.ts_prior,
-				class_priors[k],
-			);
+			let greedy = greedy_target_stats(y, &bins[cat_j], n_cats, k, params.ts_prior, class_priors[k]);
 			ts_infos.push(TsInfo {
 				cat_feature: cat_j,
 				greedy_ts: greedy,
@@ -915,8 +870,8 @@ mod tests {
 	#[test]
 	fn test_overfit_binary() {
 		let x = vec![
-			0.1, 0.2, 0.2, 0.3, 0.15, 0.25, 0.3, 0.1, 0.8, 0.9, 0.9, 0.7, 0.85, 0.8, 0.7,
-			0.95, 0.25, 0.15, 0.35, 0.2, 0.75, 0.85, 0.65, 0.9,
+			0.1, 0.2, 0.2, 0.3, 0.15, 0.25, 0.3, 0.1, 0.8, 0.9, 0.9, 0.7, 0.85, 0.8, 0.7, 0.95, 0.25, 0.15, 0.35,
+			0.2, 0.75, 0.85, 0.65, 0.9,
 		];
 		let y = vec![0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1];
 		let params = Params {
@@ -961,10 +916,8 @@ mod tests {
 		let probs = predict(&model, &x, 120).unwrap();
 		let correct = (0..120)
 			.filter(|&i| {
-				(0..3).max_by(|&a, &b| {
-					probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap()
-				})
-				.unwrap() == y[i]
+				(0..3).max_by(|&a, &b| probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap())
+					.unwrap() == y[i]
 			})
 			.count();
 		assert!(correct >= 50, "only {correct}/120 correct");
@@ -973,8 +926,7 @@ mod tests {
 	#[test]
 	fn test_categorical_roundtrip() {
 		let x = vec![
-			10.0, 0.1, 10.0, 0.2, 20.0, 0.3, 20.0, 0.4, 30.0, 0.5, 30.0, 0.6, 10.0, 0.7,
-			20.0, 0.8,
+			10.0, 0.1, 10.0, 0.2, 20.0, 0.3, 20.0, 0.4, 30.0, 0.5, 30.0, 0.6, 10.0, 0.7, 20.0, 0.8,
 		];
 		let y = vec![0, 0, 1, 1, 0, 0, 0, 1];
 		let params = Params {

@@ -2,8 +2,7 @@ use gpu_core::encoding::gpu_one_hot;
 use gpu_core::math_ops::{gpu_max, gpu_reciprocal, gpu_rsqrt};
 use gpu_core::memory::GpuBuffer;
 use gpu_core::reductions::{
-	gpu_cumsum_rows, gpu_dot, gpu_dot_workspace_bytes, gpu_sort, gpu_sum_all,
-	gpu_sum_all_workspace_bytes,
+	gpu_cumsum_rows, gpu_dot, gpu_dot_workspace_bytes, gpu_sort, gpu_sum_all, gpu_sum_all_workspace_bytes,
 };
 use gpu_core::rl::gpu_discounted_returns;
 use std::ptr;

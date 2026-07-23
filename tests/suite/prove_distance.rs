@@ -71,8 +71,7 @@ fn make_data() -> (Vec<f64>, Vec<f64>, usize, usize, usize) {
 	(q, t, nq, nt, dim)
 }
 
-type FlatLaunch =
-	unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, i32, *mut c_void);
+type FlatLaunch = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, i32, *mut c_void);
 
 fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: usize) -> Vec<f64> {
 	let bq = {
@@ -106,14 +105,7 @@ fn run_flat_f64(f: FlatLaunch, q: &[f64], t: &[f64], nq: usize, nt: usize, dim: 
 	out
 }
 
-fn oracle_grid<F: Fn(&[f64], &[f64]) -> f64>(
-	q: &[f64],
-	t: &[f64],
-	nq: usize,
-	nt: usize,
-	dim: usize,
-	f: F,
-) -> Vec<f64> {
+fn oracle_grid<F: Fn(&[f64], &[f64]) -> f64>(q: &[f64], t: &[f64], nq: usize, nt: usize, dim: usize, f: F) -> Vec<f64> {
 	let mut out = vec![0.0; nq * nt];
 	for qi in 0..nq {
 		for ti in 0..nt {
@@ -201,14 +193,13 @@ fn prove_distance() {
 	let (q, t, nq, nt, dim) = make_data();
 	let mut failures: Vec<String> = Vec::new();
 	let mut op_ok: HashMap<&str, bool> = HashMap::new();
-	let mut assert_op =
-		|key: &'static str, got: Vec<f64>, want: Vec<f64>, failures: &mut Vec<String>| {
-			let ok = close(&got, &want).is_none();
-			if let Some((i, g, w)) = close(&got, &want) {
-				failures.push(format!("{}: idx {} gpu={} cpu={}", key, i, g, w));
-			}
-			op_ok.insert(key, ok);
-		};
+	let mut assert_op = |key: &'static str, got: Vec<f64>, want: Vec<f64>, failures: &mut Vec<String>| {
+		let ok = close(&got, &want).is_none();
+		if let Some((i, g, w)) = close(&got, &want) {
+			failures.push(format!("{}: idx {} gpu={} cpu={}", key, i, g, w));
+		}
+		op_ok.insert(key, ok);
+	};
 
 	// ── existing kernels (proven against their TRUE convention) ──
 	{

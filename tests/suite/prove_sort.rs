@@ -110,8 +110,8 @@ fn lasterr() {
 
 fn data() -> Vec<f64> {
 	let raw = [
-		3.5, -1.0, 7.25, 0.0, 7.25, -8.0, 2.0, 5.5, -1.0, 9.0, 4.0, -3.5, 6.0, 1.5, -2.0, 8.0,
-		0.5, -6.0, 2.75, 10.0,
+		3.5, -1.0, 7.25, 0.0, 7.25, -8.0, 2.0, 5.5, -1.0, 9.0, 4.0, -3.5, 6.0, 1.5, -2.0, 8.0, 0.5, -6.0, 2.75,
+		10.0,
 	];
 	raw.to_vec()
 }
@@ -254,16 +254,7 @@ fn run_topk(x: &[f64], k: usize) -> Vec<f64> {
 }
 
 fn run_scalar(
-	f: unsafe extern "C" fn(
-		*const c_void,
-		*mut c_void,
-		i32,
-		i32,
-		*mut c_void,
-		*mut c_void,
-		usize,
-		*mut c_void,
-	),
+	f: unsafe extern "C" fn(*const c_void, *mut c_void, i32, i32, *mut c_void, *mut c_void, usize, *mut c_void),
 	wb: unsafe extern "C" fn(i32) -> usize,
 	x: &[f64],
 	k: i32,
@@ -380,8 +371,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 	{
 		let g = run_keys(launch_sortx_sort_asc, sortx_sort_asc_workspace_bytes, &x);
-		let pass =
-			g.len() == asc.len() && g.iter().zip(&asc).all(|(a, b)| (a - b).abs() <= TOL);
+		let pass = g.len() == asc.len() && g.iter().zip(&asc).all(|(a, b)| (a - b).abs() <= TOL);
 		mark!("sort", pass, format!("sort_asc {:?} != {:?}", g, asc));
 	}
 	{

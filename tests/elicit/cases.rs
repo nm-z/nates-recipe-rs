@@ -1,4 +1,3 @@
-
 use ogdl::Node;
 
 fn sel(tree: &str, expr: &str) -> String {
@@ -156,10 +155,7 @@ fn coverage(tree: &str, inv: &[&str]) -> (String, String) {
 	let reach: BTreeSet<BTreeSet<String>> = inv
 		.iter()
 		.map(|e| {
-			return sel(tree, e)
-				.split_whitespace()
-				.map(str::to_owned)
-				.collect();
+			return sel(tree, e).split_whitespace().map(str::to_owned).collect();
 		})
 		.collect();
 	let n = names.len();
@@ -209,35 +205,94 @@ fn coverage(tree: &str, inv: &[&str]) -> (String, String) {
 }
 
 const INV3: &[&str] = &[
-	"*b", "b*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*",
-	"[0]", "[1]", "[2]", "[0]*", "[1]*", "[2]*", "*[0]", "*[1]", "*[2]",
+	"*b", "b*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*", "[0]", "[1]", "[2]", "[0]*",
+	"[1]*", "[2]*", "*[0]", "*[1]", "*[2]",
 ];
 const INV5: &[&str] = &[
-	"*c", "c*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*",
-	"[0]", "[1]", "[2]", "[3]", "[4]", "[0]*", "[1]*", "[2]*", "[3]*", "[4]*",
-	"*[0]", "*[1]", "*[2]", "*[3]", "*[4]",
+	"*c", "c*", "(0)", "(1)", "(2)", "*(0)", "*(1)", "*(2)", "(0)*", "(1)*", "(2)*", "[0]", "[1]", "[2]", "[3]",
+	"[4]", "[0]*", "[1]*", "[2]*", "[3]*", "[4]*", "*[0]", "*[1]", "*[2]", "*[3]", "*[4]",
 ];
 
-#[test] fn case8_1_1() { cell(T3N, "*b", "b a"); }
-#[test] fn case8_1_2() { cell(T3N, "b*", "b c"); }
-#[test] fn case8_1_3() { cell(T3N, "(0)", "a"); }
-#[test] fn case8_1_4() { cell(T3N, "(1)", "b"); }
-#[test] fn case8_1_5() { cell(T3N, "(2)", "c"); }
-#[test] fn case8_1_6() { cell(T3N, "*(0)", ""); }
-#[test] fn case8_1_7() { cell(T3N, "*(1)", "a"); }
-#[test] fn case8_1_8() { cell(T3N, "*(2)", "b a"); }
-#[test] fn case8_1_9() { cell(T3N, "(0)*", "b c"); }
-#[test] fn case8_1_10() { cell(T3N, "(1)*", "c"); }
-#[test] fn case8_1_11() { cell(T3N, "(2)*", ""); }
-#[test] fn case8_1_12() { cell(T3N, "[0]", "a"); }
-#[test] fn case8_1_13() { cell(T3N, "[1]", "b"); }
-#[test] fn case8_1_14() { cell(T3N, "[2]", "c"); }
-#[test] fn case8_1_15() { cell(T3N, "[0]*", "b c"); }
-#[test] fn case8_1_16() { cell(T3N, "[1]*", "c"); }
-#[test] fn case8_1_17() { cell(T3N, "[2]*", ""); }
-#[test] fn case8_1_18() { cell(T3N, "*[0]", ""); }
-#[test] fn case8_1_19() { cell(T3N, "*[1]", "a"); }
-#[test] fn case8_1_20() { cell(T3N, "*[2]", "b a"); }
+#[test]
+fn case8_1_1() {
+	cell(T3N, "*b", "b a");
+}
+#[test]
+fn case8_1_2() {
+	cell(T3N, "b*", "b c");
+}
+#[test]
+fn case8_1_3() {
+	cell(T3N, "(0)", "a");
+}
+#[test]
+fn case8_1_4() {
+	cell(T3N, "(1)", "b");
+}
+#[test]
+fn case8_1_5() {
+	cell(T3N, "(2)", "c");
+}
+#[test]
+fn case8_1_6() {
+	cell(T3N, "*(0)", "");
+}
+#[test]
+fn case8_1_7() {
+	cell(T3N, "*(1)", "a");
+}
+#[test]
+fn case8_1_8() {
+	cell(T3N, "*(2)", "b a");
+}
+#[test]
+fn case8_1_9() {
+	cell(T3N, "(0)*", "b c");
+}
+#[test]
+fn case8_1_10() {
+	cell(T3N, "(1)*", "c");
+}
+#[test]
+fn case8_1_11() {
+	cell(T3N, "(2)*", "");
+}
+#[test]
+fn case8_1_12() {
+	cell(T3N, "[0]", "a");
+}
+#[test]
+fn case8_1_13() {
+	cell(T3N, "[1]", "b");
+}
+#[test]
+fn case8_1_14() {
+	cell(T3N, "[2]", "c");
+}
+#[test]
+fn case8_1_15() {
+	cell(T3N, "[0]*", "b c");
+}
+#[test]
+fn case8_1_16() {
+	cell(T3N, "[1]*", "c");
+}
+#[test]
+fn case8_1_17() {
+	cell(T3N, "[2]*", "");
+}
+#[test]
+fn case8_1_18() {
+	cell(T3N, "*[0]", "");
+}
+#[test]
+fn case8_1_19() {
+	cell(T3N, "*[1]", "a");
+}
+#[test]
+fn case8_1_20() {
+	cell(T3N, "*[2]", "b a");
+}
 
 #[test]
 fn case8_1_21() {
@@ -254,32 +309,110 @@ fn case8_1_22() {
 	assert_eq!(u, "2 objects:\n\ta c\n3 objects:\n\ta b c\nunmatched: 2/8");
 }
 
-#[test] fn case8_2_1() { cell(T5N, "*c", "c a"); }
-#[test] fn case8_2_2() { cell(T5N, "c*", "c d"); }
-#[test] fn case8_2_3() { cell(T5N, "(0)", "a e"); }
-#[test] fn case8_2_4() { cell(T5N, "(1)", "b c"); }
-#[test] fn case8_2_5() { cell(T5N, "(2)", "d"); }
-#[test] fn case8_2_6() { cell(T5N, "*(0)", ""); }
-#[test] fn case8_2_7() { cell(T5N, "*(1)", "a e"); }
-#[test] fn case8_2_8() { cell(T5N, "*(2)", "b c a e"); }
-#[test] fn case8_2_9() { cell(T5N, "(0)*", "b c d"); }
-#[test] fn case8_2_10() { cell(T5N, "(1)*", "d"); }
-#[test] fn case8_2_11() { cell(T5N, "(2)*", ""); }
-#[test] fn case8_2_12() { cell(T5N, "[0]", "a"); }
-#[test] fn case8_2_13() { cell(T5N, "[1]", "b"); }
-#[test] fn case8_2_14() { cell(T5N, "[2]", "c"); }
-#[test] fn case8_2_15() { cell(T5N, "[3]", "d"); }
-#[test] fn case8_2_16() { cell(T5N, "[4]", "e"); }
-#[test] fn case8_2_17() { cell(T5N, "[0]*", "b c d e"); }
-#[test] fn case8_2_18() { cell(T5N, "[1]*", "c d e"); }
-#[test] fn case8_2_19() { cell(T5N, "[2]*", "d e"); }
-#[test] fn case8_2_20() { cell(T5N, "[3]*", "e"); }
-#[test] fn case8_2_21() { cell(T5N, "[4]*", ""); }
-#[test] fn case8_2_22() { cell(T5N, "*[0]", ""); }
-#[test] fn case8_2_23() { cell(T5N, "*[1]", "a"); }
-#[test] fn case8_2_24() { cell(T5N, "*[2]", "b a"); }
-#[test] fn case8_2_25() { cell(T5N, "*[3]", "c b a"); }
-#[test] fn case8_2_26() { cell(T5N, "*[4]", "d c b a"); }
+#[test]
+fn case8_2_1() {
+	cell(T5N, "*c", "c a");
+}
+#[test]
+fn case8_2_2() {
+	cell(T5N, "c*", "c d");
+}
+#[test]
+fn case8_2_3() {
+	cell(T5N, "(0)", "a e");
+}
+#[test]
+fn case8_2_4() {
+	cell(T5N, "(1)", "b c");
+}
+#[test]
+fn case8_2_5() {
+	cell(T5N, "(2)", "d");
+}
+#[test]
+fn case8_2_6() {
+	cell(T5N, "*(0)", "");
+}
+#[test]
+fn case8_2_7() {
+	cell(T5N, "*(1)", "a e");
+}
+#[test]
+fn case8_2_8() {
+	cell(T5N, "*(2)", "b c a e");
+}
+#[test]
+fn case8_2_9() {
+	cell(T5N, "(0)*", "b c d");
+}
+#[test]
+fn case8_2_10() {
+	cell(T5N, "(1)*", "d");
+}
+#[test]
+fn case8_2_11() {
+	cell(T5N, "(2)*", "");
+}
+#[test]
+fn case8_2_12() {
+	cell(T5N, "[0]", "a");
+}
+#[test]
+fn case8_2_13() {
+	cell(T5N, "[1]", "b");
+}
+#[test]
+fn case8_2_14() {
+	cell(T5N, "[2]", "c");
+}
+#[test]
+fn case8_2_15() {
+	cell(T5N, "[3]", "d");
+}
+#[test]
+fn case8_2_16() {
+	cell(T5N, "[4]", "e");
+}
+#[test]
+fn case8_2_17() {
+	cell(T5N, "[0]*", "b c d e");
+}
+#[test]
+fn case8_2_18() {
+	cell(T5N, "[1]*", "c d e");
+}
+#[test]
+fn case8_2_19() {
+	cell(T5N, "[2]*", "d e");
+}
+#[test]
+fn case8_2_20() {
+	cell(T5N, "[3]*", "e");
+}
+#[test]
+fn case8_2_21() {
+	cell(T5N, "[4]*", "");
+}
+#[test]
+fn case8_2_22() {
+	cell(T5N, "*[0]", "");
+}
+#[test]
+fn case8_2_23() {
+	cell(T5N, "*[1]", "a");
+}
+#[test]
+fn case8_2_24() {
+	cell(T5N, "*[2]", "b a");
+}
+#[test]
+fn case8_2_25() {
+	cell(T5N, "*[3]", "c b a");
+}
+#[test]
+fn case8_2_26() {
+	cell(T5N, "*[4]", "d c b a");
+}
 
 #[test]
 fn case8_2_27() {
@@ -299,29 +432,107 @@ fn case8_2_28() {
 	);
 }
 
-#[test] fn case8_3_1() { cell(TQ, "*a", "a Q"); }
-#[test] fn case8_3_2() { cell(TQ, "a*", "a r"); }
-#[test] fn case8_3_3() { cell(TQ, "(0)", "Q k"); }
-#[test] fn case8_3_4() { cell(TQ, "(1)", "u a"); }
-#[test] fn case8_3_5() { cell(TQ, "(2)", "r"); }
-#[test] fn case8_3_6() { cell(TQ, "*(0)", ""); }
-#[test] fn case8_3_7() { cell(TQ, "*(1)", "Q k"); }
-#[test] fn case8_3_8() { cell(TQ, "*(2)", "u a Q k"); }
-#[test] fn case8_3_9() { cell(TQ, "(0)*", "u a r"); }
-#[test] fn case8_3_10() { cell(TQ, "(1)*", "r"); }
-#[test] fn case8_3_11() { cell(TQ, "(2)*", ""); }
-#[test] fn case8_3_12() { cell(TQ, "[0]", "Q"); }
-#[test] fn case8_3_13() { cell(TQ, "[1]", "u"); }
-#[test] fn case8_3_14() { cell(TQ, "[2]", "a"); }
-#[test] fn case8_3_15() { cell(TQ, "[3]", "r"); }
-#[test] fn case8_3_16() { cell(TQ, "[4]", "k"); }
-#[test] fn case8_3_17() { cell(TQ, "[0]*", "u a r k"); }
-#[test] fn case8_3_18() { cell(TQ, "[1]*", "a r k"); }
-#[test] fn case8_3_19() { cell(TQ, "[2]*", "r k"); }
-#[test] fn case8_3_20() { cell(TQ, "[3]*", "k"); }
-#[test] fn case8_3_21() { cell(TQ, "[4]*", ""); }
-#[test] fn case8_3_22() { cell(TQ, "*[0]", ""); }
-#[test] fn case8_3_23() { cell(TQ, "*[1]", "Q"); }
-#[test] fn case8_3_24() { cell(TQ, "*[2]", "u Q"); }
-#[test] fn case8_3_25() { cell(TQ, "*[3]", "a u Q"); }
-#[test] fn case8_3_26() { cell(TQ, "*[4]", "r a u Q"); }
+#[test]
+fn case8_3_1() {
+	cell(TQ, "*a", "a Q");
+}
+#[test]
+fn case8_3_2() {
+	cell(TQ, "a*", "a r");
+}
+#[test]
+fn case8_3_3() {
+	cell(TQ, "(0)", "Q k");
+}
+#[test]
+fn case8_3_4() {
+	cell(TQ, "(1)", "u a");
+}
+#[test]
+fn case8_3_5() {
+	cell(TQ, "(2)", "r");
+}
+#[test]
+fn case8_3_6() {
+	cell(TQ, "*(0)", "");
+}
+#[test]
+fn case8_3_7() {
+	cell(TQ, "*(1)", "Q k");
+}
+#[test]
+fn case8_3_8() {
+	cell(TQ, "*(2)", "u a Q k");
+}
+#[test]
+fn case8_3_9() {
+	cell(TQ, "(0)*", "u a r");
+}
+#[test]
+fn case8_3_10() {
+	cell(TQ, "(1)*", "r");
+}
+#[test]
+fn case8_3_11() {
+	cell(TQ, "(2)*", "");
+}
+#[test]
+fn case8_3_12() {
+	cell(TQ, "[0]", "Q");
+}
+#[test]
+fn case8_3_13() {
+	cell(TQ, "[1]", "u");
+}
+#[test]
+fn case8_3_14() {
+	cell(TQ, "[2]", "a");
+}
+#[test]
+fn case8_3_15() {
+	cell(TQ, "[3]", "r");
+}
+#[test]
+fn case8_3_16() {
+	cell(TQ, "[4]", "k");
+}
+#[test]
+fn case8_3_17() {
+	cell(TQ, "[0]*", "u a r k");
+}
+#[test]
+fn case8_3_18() {
+	cell(TQ, "[1]*", "a r k");
+}
+#[test]
+fn case8_3_19() {
+	cell(TQ, "[2]*", "r k");
+}
+#[test]
+fn case8_3_20() {
+	cell(TQ, "[3]*", "k");
+}
+#[test]
+fn case8_3_21() {
+	cell(TQ, "[4]*", "");
+}
+#[test]
+fn case8_3_22() {
+	cell(TQ, "*[0]", "");
+}
+#[test]
+fn case8_3_23() {
+	cell(TQ, "*[1]", "Q");
+}
+#[test]
+fn case8_3_24() {
+	cell(TQ, "*[2]", "u Q");
+}
+#[test]
+fn case8_3_25() {
+	cell(TQ, "*[3]", "a u Q");
+}
+#[test]
+fn case8_3_26() {
+	cell(TQ, "*[4]", "r a u Q");
+}

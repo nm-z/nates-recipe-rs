@@ -2,12 +2,12 @@
 
 use anyhow::Context;
 use gpu_core::infer_ops::{
-	gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt, gpu_glu_gelu, gpu_rmsnorm_f64, gpu_rope_partial,
-	gpu_convert, gpu_scale_f64_inplace,
+	gpu_convert, gpu_flash_gqa, gpu_gelu_mul, gpu_gemm_bt, gpu_glu_gelu, gpu_rmsnorm_f64, gpu_rope_partial,
+	gpu_scale_f64_inplace,
 };
 use gpu_core::kernels::{gpu_add_into, gpu_gemm_bt_into, gpu_scale_inplace};
-use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use gpu_core::memory::{Dtype, GpuBuffer};
+use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use std::fmt;
 use std::ptr;
@@ -171,11 +171,7 @@ fn bench_shape(label: &str, m: usize, n: usize, k: usize) -> anyhow::Result<()> 
 	Ok(())
 }
 
-fn twice(
-	name: &str,
-	n_out: usize,
-	mut f: impl FnMut(&GpuBuffer) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+fn twice(name: &str, n_out: usize, mut f: impl FnMut(&GpuBuffer) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	let out = GpuBuffer::alloc(n_out).context("alloc out")?;
 	let mut r1 = vec![0.0f64; n_out];
 	let mut r2 = vec![0.0f64; n_out];
@@ -272,8 +268,10 @@ fn main() -> anyhow::Result<()> {
 		let cl = GpuBuffer::alloc(T * 16).context("cl")?;
 		let cacc = GpuBuffer::alloc(T * 16 * hd).context("cacc")?;
 		twice(label, T * 16 * hd, |o| {
-			gpu_flash_gqa(&q, &k, &v, T, T, 16, nkv, hd, 0.0, 0, 6, o, &cm, &cl, &cacc, 0, true)
-				.context("flash gqa")
+			gpu_flash_gqa(
+				&q, &k, &v, T, T, 16, nkv, hd, 0.0, 0, 6, o, &cm, &cl, &cacc, 0, true,
+			)
+			.context("flash gqa")
 		})?;
 
 		let mut a = vec![0.0f64; T * 16 * hd];
@@ -322,7 +320,9 @@ fn main() -> anyhow::Result<()> {
 		.map(|v| ((*v as f32).to_bits() >> 16) as u16)
 		.flat_map(|h| h.to_le_bytes())
 		.collect();
-	let stage = GpuBuffer::alloc_bytes(bf.len()).context("stage")?.as_dtype(Dtype::BF16);
+	let stage = GpuBuffer::alloc_bytes(bf.len())
+		.context("stage")?
+		.as_dtype(Dtype::BF16);
 	stage.write_u8(&bf).context("write")?;
 	twice("convert_bf16", T * NE, |o| {
 		gpu_convert(&stage, o, T * NE, 1.0).context("convert")

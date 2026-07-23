@@ -1,6 +1,4 @@
-use recipe_infer::safetensors::{
-	Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors,
-};
+use recipe_infer::safetensors::{Json, Member, decode, field_arr, field_str, parse_json, parse_safetensors};
 use std::env;
 use std::fs;
 use std::process;

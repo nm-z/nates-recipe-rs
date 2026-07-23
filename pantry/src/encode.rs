@@ -64,10 +64,7 @@ pub(crate) fn is_missing(c: &str) -> bool {
 	c.is_empty()
 		|| matches!(
 			c,
-			"NA" | "NaN"
-				| "nan" | "N/A" | "NULL"
-				| "null" | "None" | "none"
-				| "?" | "." | "-"
+			"NA" | "NaN" | "nan" | "N/A" | "NULL" | "null" | "None" | "none" | "?" | "." | "-"
 		)
 }
 
@@ -120,9 +117,7 @@ fn infer_attrs(
 		.collect();
 	let preds: Vec<usize> = match pre {
 		Some(pre) => {
-			if pre.len() != headers.len()
-				|| pre.iter().zip(headers).any(|(c, name)| &c.header != name)
-			{
+			if pre.len() != headers.len() || pre.iter().zip(headers).any(|(c, name)| &c.header != name) {
 				Write::err(format!(
 					"detect_kinds drift: precomputed [{}] != parsed [{}]",
 					pre.iter()
@@ -167,9 +162,7 @@ fn infer_attrs(
 				match pred[&j] {
 					crate::KIND_NUMERIC => Kind::Numeric,
 					crate::KIND_TEMPORAL => Kind::Temporal,
-					crate::KIND_CATEGORICAL => {
-						Kind::Categorical(distinct_sorted(rows, j))
-					}
+					crate::KIND_CATEGORICAL => Kind::Categorical(distinct_sorted(rows, j)),
 					crate::KIND_ORDINAL => Kind::Ordinal(distinct_sorted(rows, j)),
 					crate::KIND_TEXT => Kind::Text(col_vocab(rows, j)),
 					_ => Kind::Image,
@@ -183,12 +176,7 @@ fn infer_attrs(
 		.collect())
 }
 
-fn encode_kind(
-	attr: &Attr,
-	rows: &[Vec<String>],
-	ai: usize,
-	seq_len: usize,
-) -> (Vec<String>, Vec<Vec<f64>>) {
+fn encode_kind(attr: &Attr, rows: &[Vec<String>], ai: usize, seq_len: usize) -> (Vec<String>, Vec<Vec<f64>>) {
 	let n = rows.len();
 	match &attr.kind {
 		Kind::Numeric => {
@@ -240,8 +228,7 @@ fn encode_kind(
 				.map(|row| {
 					let mut ids = vec![0.0f64; seq_len];
 					for (s, tok) in tokenize(cell(row, ai)).take(seq_len).enumerate() {
-						ids[s] =
-							vocab.binary_search(&tok).map_or(0.0, |p| (p + 1) as f64);
+						ids[s] = vocab.binary_search(&tok).map_or(0.0, |p| (p + 1) as f64);
 					}
 					ids
 				})
@@ -357,8 +344,7 @@ fn encode(
 	}
 	Ok((
 		names,
-		Mat::from_shape_vec((n, w), dat)
-			.map_err(|e| Errored::new(format!("encode: reshape: {e}")))?,
+		Mat::from_shape_vec((n, w), dat).map_err(|e| Errored::new(format!("encode: reshape: {e}")))?,
 		Vec1::from(ydata),
 		k,
 	))
@@ -393,12 +379,7 @@ impl fmt::Display for CeilingExceeded {
 
 impl error::Error for CeilingExceeded {}
 
-fn admit_ceiling(
-	n: usize,
-	w: usize,
-	label: &str,
-	top_cols: &[(&str, usize)],
-) -> anyhow::Result<()> {
+fn admit_ceiling(n: usize, w: usize, label: &str, top_cols: &[(&str, usize)]) -> anyhow::Result<()> {
 	let bytes = n.saturating_mul(w).saturating_mul(mem::size_of::<f64>());
 	let spill = Path::new(".recipe_spill");
 	let full = match recipe_infer::tiered::admit(bytes, 0, 0, spill) {
@@ -572,8 +553,7 @@ impl Assembled {
 				dat[i * w + jc] = g[i].map_or(f64::NAN, |r| m[[r, col]]);
 			}
 		}
-		Ok(Mat::from_shape_vec((n, w), dat)
-			.map_err(|e| Errored::new(format!("select reshape: {e}")))?)
+		Ok(Mat::from_shape_vec((n, w), dat).map_err(|e| Errored::new(format!("select reshape: {e}")))?)
 	}
 }
 
@@ -638,8 +618,8 @@ fn encode_group(
 			let names = (0..*dim)
 				.map(|i| namespaced(name, &format!("px{i}")))
 				.collect();
-			let x = Mat::from_shape_vec((n, *dim), dat)
-				.map_err(|e| Errored::new(format!("image reshape: {e}")))?;
+			let x =
+				Mat::from_shape_vec((n, *dim), dat).map_err(|e| Errored::new(format!("image reshape: {e}")))?;
 			(names, x, Vec1::zeros(n), 0)
 		}
 	})
@@ -668,9 +648,7 @@ fn assemble(
 			if let DirGroup::Table { name, headers, .. } = g {
 				let cols: Vec<usize> = targets
 					.iter()
-					.filter_map(|t| {
-						headers.iter().position(|h| namespaced(name, h) == *t)
-					})
+					.filter_map(|t| headers.iter().position(|h| namespaced(name, h) == *t))
 					.collect();
 				if !cols.is_empty() {
 					sample_idx = gi;
@@ -762,9 +740,7 @@ fn assemble(
 			for c in 0..ncols {
 				let hits = cells
 					.iter()
-					.filter(|r| {
-						key_set.contains(file_stem(r.get(c).map_or("", String::as_str)))
-					})
+					.filter(|r| key_set.contains(file_stem(r.get(c).map_or("", String::as_str))))
 					.count();
 				if hits > best {
 					best = hits;
@@ -787,10 +763,8 @@ fn assemble(
 				)?;
 				let src: Vec<Option<usize>> = (0..n)
 					.map(|i| {
-						by_key.get(file_stem(
-							cells[i].get(best_col).map_or("", String::as_str),
-						))
-						.copied()
+						by_key.get(file_stem(cells[i].get(best_col).map_or("", String::as_str)))
+							.copied()
 					})
 					.collect();
 				let mi = mats.len();
@@ -813,9 +787,9 @@ fn assemble(
 		let shares = by_hash.keys().any(|h| s_count.contains_key(*h));
 		if !shares {
 			skipped.push(format!(
-                        "{}: shares no join key with the sample group — separate table, use .exclude() or join manually",
-                        group_name(g)
-                  ));
+				"{}: shares no join key with the sample group — separate table, use .exclude() or join manually",
+				group_name(g)
+			));
 			continue;
 		}
 		let all_one = by_hash.values().all(|v| v.len() == 1);
@@ -1092,15 +1066,10 @@ pub fn prepare_arff_data(
 		} = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
-		let tvecs = crate::formats::load(tp)?.into_columns();
-		let tn = tvecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
-		let trows: Vec<Vec<String>> = (0..tn)
-			.map(|r| {
-				tvecs.iter()
-					.map(|v| v.values.get(r).cloned().unwrap_or_default())
-					.collect()
-			})
-			.collect();
+		let tusr = crate::formats::load(tp)?;
+		let names: Vec<String> = attrs.iter().map(|a| a.name.clone()).collect();
+		let tgroup = tusr.related_group(&names)?;
+		let trows = tgroup.text_rows()?;
 		let (_, tx, ty, _) = encode(attrs, &trows, targets, &skip)?;
 		(
 			Dataset {
@@ -1160,12 +1129,31 @@ pub fn prepare_table_data(
 		.into_iter()
 		.flatten()
 		.collect();
-	let set_tnames = table_names(&set_groups);
-
 	let test_groups = match test_path {
 		Some(tp) => Some((crate::data::load_groups(tp)?, tp.to_string())),
 		None => None,
 	};
+	return prepare_groups_data(
+		set_groups,
+		test_groups,
+		split_frac,
+		exclude,
+		source_label,
+		pre,
+		resolve,
+	);
+}
+
+pub fn prepare_groups_data(
+	set_groups: Vec<DirGroup>,
+	test_groups: Option<(Vec<DirGroup>, String)>,
+	split_frac: Option<f64>,
+	exclude: &[String],
+	source_label: &str,
+	pre: Option<&[GroupKinds]>,
+	resolve: impl Fn(&[String], Option<&[String]>) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<PreparedTable> {
+	let set_tnames = table_names(&set_groups);
 	let test_tnames: Option<Vec<String>> = match (&test_groups, split_frac) {
 		(Some((g, _)), _) => Some(table_names(g)),
 		(None, Some(_)) => Some(set_tnames.clone()),
@@ -1187,8 +1175,7 @@ pub fn prepare_table_data(
 			exclude,
 			None,
 		)?;
-		let test_has_target =
-			!t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
+		let test_has_target = !t.is_empty() && t.iter().all(|tgt| test.names.iter().any(|n| n == tgt));
 		let feats: Vec<String> = set.names.iter().filter(|n| keep(n)).cloned().collect();
 		let tc = text_col_indices(&feats);
 		let oh = onehot_group_indices(&feats);
@@ -1300,8 +1287,7 @@ pub fn collapse_onehot(ds: &Dataset) -> anyhow::Result<CollapsedOnehot> {
 		offset += grp.len;
 	}
 	let embed_cols: Vec<usize> = (embed_start..embed_start + n_cat).collect();
-	let x = Mat::from_shape_vec([n, new_ncols], dat)
-		.map_err(|e| anyhow::anyhow!("collapse_onehot: {e:#}"))?;
+	let x = Mat::from_shape_vec([n, new_ncols], dat).map_err(|e| anyhow::anyhow!("collapse_onehot: {e:#}"))?;
 	Ok(CollapsedOnehot {
 		x,
 		embed_cols,
@@ -1317,9 +1303,10 @@ pub fn safetensors_to_table(path: &str) -> anyhow::Result<SafeTable> {
 	let n = {
 		let head = &tensors[0];
 		let hname = &head.name;
-		head.shape.first().copied().ok_or_else(|| {
-			anyhow::anyhow!("safetensors: tensor '{hname}' has no leading row dim")
-		})?
+		head.shape
+			.first()
+			.copied()
+			.ok_or_else(|| anyhow::anyhow!("safetensors: tensor '{hname}' has no leading row dim"))?
 	};
 	let mut attrs = Vec::new();
 	let mut cols: Vec<Vec<f64>> = Vec::new();

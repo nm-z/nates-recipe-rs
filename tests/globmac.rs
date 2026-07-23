@@ -1,4 +1,3 @@
-
 use ogdl::ogdl;
 use std::fmt::Display;
 
@@ -36,8 +35,8 @@ fn macro_speaks_glob() {
 
 	assert_eq!(s(ogdl!([0](0))), "a");
 	assert_eq!(s(ogdl!((1)[1])), "b");
-	assert_eq!(s(ogdl!([0]*(1))), "e");
-	assert_eq!(s(ogdl!([0]**[4])), "b c d");
+	assert_eq!(s(ogdl!([0] * (1))), "e");
+	assert_eq!(s(ogdl!([0] * *[4])), "b c d");
 	let j = 4;
-	assert_eq!(s(ogdl!([0]**[j])), "b c d");
+	assert_eq!(s(ogdl!([0] * *[j])), "b c d");
 }

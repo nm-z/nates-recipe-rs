@@ -69,12 +69,12 @@ fn run_binary(f: BinaryGpu, a: &[f64], b: &[f64]) -> Vec<f64> {
 
 fn unary_registry() -> HashMap<&'static str, UnaryOp> {
 	use gpu_core::kernels::{
-		gpu_abs_into, gpu_exp, gpu_log_into, gpu_neg, gpu_relu_into, gpu_sigmoid_into,
-		gpu_sign_into, gpu_silu_into, gpu_sqrt, gpu_tanh_into,
+		gpu_abs_into, gpu_exp, gpu_log_into, gpu_neg, gpu_relu_into, gpu_sigmoid_into, gpu_sign_into,
+		gpu_silu_into, gpu_sqrt, gpu_tanh_into,
 	};
 	use gpu_core::math_ops::{
-		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round,
-		gpu_rsqrt, gpu_sin, gpu_tan, gpu_trunc,
+		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round, gpu_rsqrt, gpu_sin, gpu_tan,
+		gpu_trunc,
 	};
 	let mut m: HashMap<&'static str, UnaryOp> = HashMap::new();
 	macro_rules! u {
@@ -389,9 +389,9 @@ struct ScanOp {
 fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 	use gpu_core::linalg::gpu_dasum;
 	use gpu_core::reductions::{
-		gpu_l2_norm, gpu_l2_norm_workspace_bytes, gpu_max_all, gpu_max_all_workspace_bytes,
-		gpu_mean_all, gpu_mean_all_workspace_bytes, gpu_min_all, gpu_min_all_workspace_bytes,
-		gpu_sum_all, gpu_sum_all_workspace_bytes,
+		gpu_l2_norm, gpu_l2_norm_workspace_bytes, gpu_max_all, gpu_max_all_workspace_bytes, gpu_mean_all,
+		gpu_mean_all_workspace_bytes, gpu_min_all, gpu_min_all_workspace_bytes, gpu_sum_all,
+		gpu_sum_all_workspace_bytes,
 	};
 	fn red_scalar(x: &GpuBuffer) -> Result<f64, HipError> {
 		let mut o = [0.0];
@@ -474,9 +474,7 @@ fn reduce_registry() -> HashMap<&'static str, ReduceOp> {
 }
 
 fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
-	use gpu_core::kernels::{
-		gpu_gemm, gpu_log_softmax_rows, gpu_scale_inplace, gpu_softmax_rows_into,
-	};
+	use gpu_core::kernels::{gpu_gemm, gpu_log_softmax_rows, gpu_scale_inplace, gpu_softmax_rows_into};
 	use gpu_core::reductions::{gpu_dot, gpu_dot_workspace_bytes};
 	let mut m: HashMap<&'static str, bool> = HashMap::new();
 	let mut fails: Vec<String> = Vec::new();
@@ -792,8 +790,7 @@ fn complex_proofs() -> (HashMap<&'static str, bool>, Vec<String>) {
 
 fn scan_registry() -> HashMap<&'static str, ScanOp> {
 	use gpu_core::reductions::{
-		gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod, gpu_cumprod_workspace_bytes,
-		gpu_cumsum_rows,
+		gpu_cummax, gpu_cummax_workspace_bytes, gpu_cumprod, gpu_cumprod_workspace_bytes, gpu_cumsum_rows,
 	};
 	fn scan_cumsum(x: &GpuBuffer, n: usize) -> Result<GpuBuffer, HipError> {
 		let out = GpuBuffer::alloc(n)?;
@@ -903,9 +900,9 @@ fn canon(name: &str) -> String {
 		}
 	}
 	let blas_ops = [
-		"gemm", "gemv", "gbmv", "symv", "syrk", "syr2k", "trsm", "trmm", "trsv", "potrf",
-		"potrs", "getrf", "getrs", "gesvd", "gesdd", "gesv", "geqrf", "syev", "syevd", "heevd",
-		"axpy", "scal", "dotu", "dotc", "dot", "nrm2", "asum", "iamax", "ger", "gerc", "geru",
+		"gemm", "gemv", "gbmv", "symv", "syrk", "syr2k", "trsm", "trmm", "trsv", "potrf", "potrs", "getrf",
+		"getrs", "gesvd", "gesdd", "gesv", "geqrf", "syev", "syevd", "heevd", "axpy", "scal", "dotu", "dotc",
+		"dot", "nrm2", "asum", "iamax", "ger", "gerc", "geru",
 	];
 	let remap = |op: &str| -> String {
 		match op {

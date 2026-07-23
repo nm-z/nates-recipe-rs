@@ -3,8 +3,7 @@ use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use std::time::Instant;
 
 fn load_csv(path: &str) -> Result<(Vec<f64>, Vec<usize>, usize, usize), Errored> {
-	let text =
-		std::fs::read_to_string(path).map_err(|e| Errored::new(format!("read {path}: {e}")))?;
+	let text = std::fs::read_to_string(path).map_err(|e| Errored::new(format!("read {path}: {e}")))?;
 	let mut x = Vec::new();
 	let mut y = Vec::new();
 	let mut p = 0;
@@ -74,8 +73,8 @@ fn main() -> Result<(), Errored> {
 	);
 
 	let t0 = Instant::now();
-	let model = train(&x_tr, &y_tr, n_tr, p, n_classes, &params)
-		.map_err(|e| Errored::new(format!("train failed: {e}")))?;
+	let model =
+		train(&x_tr, &y_tr, n_tr, p, n_classes, &params).map_err(|e| Errored::new(format!("train failed: {e}")))?;
 	let train_time = t0.elapsed();
 	Write::line(
 		time,
@@ -87,8 +86,7 @@ fn main() -> Result<(), Errored> {
 	);
 
 	let t1 = Instant::now();
-	let probs = predict(&model, &x_te, n_te)
-		.map_err(|e| Errored::new(format!("predict failed: {e}")))?;
+	let probs = predict(&model, &x_te, n_te).map_err(|e| Errored::new(format!("predict failed: {e}")))?;
 	let predict_time = t1.elapsed();
 
 	let correct = (0..n_te)

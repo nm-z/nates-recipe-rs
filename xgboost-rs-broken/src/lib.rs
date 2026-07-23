@@ -517,8 +517,7 @@ pub fn predict_proba(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Err
 		for (k, tree) in round_trees.iter().enumerate() {
 			let leaves = route_tree(tree, &bins, n, p);
 			for i in 0..n {
-				logits[i * nc + k] +=
-					model.learning_rate * tree.leaf_val[leaves[i] as usize];
+				logits[i * nc + k] += model.learning_rate * tree.leaf_val[leaves[i] as usize];
 			}
 		}
 	}
@@ -623,10 +622,8 @@ mod tests {
 		let probs = predict_proba(&model, &x, 120).unwrap();
 		let correct = (0..120)
 			.filter(|&i| {
-				(0..3).max_by(|&a, &b| {
-					probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap()
-				})
-				.unwrap() == y[i]
+				(0..3).max_by(|&a, &b| probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap())
+					.unwrap() == y[i]
 			})
 			.count();
 		let acc = correct as f64 / 120.0;

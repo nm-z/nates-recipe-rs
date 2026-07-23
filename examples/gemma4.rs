@@ -7,8 +7,7 @@ use std::process;
 use std::process::ExitCode;
 
 fn ensure_vramspy_preloaded() -> Result<()> {
-	let loaded =
-		!unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_loaded".as_ptr()) }.is_null();
+	let loaded = !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"vramspy_loaded".as_ptr()) }.is_null();
 	if loaded {
 		return Ok(());
 	}
@@ -57,9 +56,8 @@ fn main() -> Result<ExitCode> {
 	});
 	ensure_vramspy_preloaded()?;
 
-	let gguf_str = env::var("GGUF").unwrap_or_else(|_e| {
-		"/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf".to_owned()
-	});
+	let gguf_str = env::var("GGUF")
+		.unwrap_or_else(|_e| "/home/nate/Desktop/gemma4/gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf".to_owned());
 	recipe::cli::tui::chat(&gguf_str);
 
 	Write::line(gpu, gpu_core::memory::ledger_report());

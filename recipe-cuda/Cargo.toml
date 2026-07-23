@@ -1,0 +1,11 @@
+[package]
+name = "recipe-cuda"
+version = "0.1.0"
+edition = "2024"
+description = "Dependency-clean CUDA Driver API backend scaffolding for Recipe"
+license = "MIT"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+
+[dependencies]
+libc = "0.2"
+sha2 = "0.10"

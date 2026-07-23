@@ -91,9 +91,7 @@ pub fn concat_layer_dims(dims: &[LayerDims]) -> Option<ConcatDims> {
 	concat_layer_dims_iter(dims.iter().map(|d| (d.kind, d.in_dim, d.out_dim)))
 }
 
-fn concat_layer_dims_iter(
-	it: impl Iterator<Item = (LayerKind, usize, usize)>,
-) -> Option<ConcatDims> {
+fn concat_layer_dims_iter(it: impl Iterator<Item = (LayerKind, usize, usize)>) -> Option<ConcatDims> {
 	let layers: Vec<(LayerKind, usize, usize)> = it.collect();
 	for l in 1..layers.len() {
 		let (prev_kind, _, prev_out) = layers[l - 1];

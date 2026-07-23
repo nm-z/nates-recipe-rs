@@ -12,30 +12,11 @@ use std::ptr;
 unsafe extern "C" {
 	fn launch_creationx_arange(out: *mut c_void, start: f64, step: f64, n: i32, s: *mut c_void);
 	fn launch_creationx_linspace(out: *mut c_void, start: f64, stop: f64, n: i32, s: *mut c_void);
-	fn launch_creationx_logspace(
-		out: *mut c_void,
-		start: f64,
-		stop: f64,
-		base: f64,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_creationx_geomspace(
-		out: *mut c_void,
-		start: f64,
-		stop: f64,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_creationx_logspace(out: *mut c_void, start: f64, stop: f64, base: f64, n: i32, s: *mut c_void);
+	fn launch_creationx_geomspace(out: *mut c_void, start: f64, stop: f64, n: i32, s: *mut c_void);
 	fn launch_creationx_tri(out: *mut c_void, rows: i32, cols: i32, k: i32, s: *mut c_void);
 	fn launch_creationx_eye_rect(out: *mut c_void, rows: i32, cols: i32, k: i32, s: *mut c_void);
-	fn launch_creationx_arange_i32(
-		out: *mut c_void,
-		start: i32,
-		step: i32,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_creationx_arange_i32(out: *mut c_void, start: i32, step: i32, n: i32, s: *mut c_void);
 }
 
 const TOL: f64 = 1e-6;

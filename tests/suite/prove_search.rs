@@ -16,67 +16,17 @@ unsafe extern "C" {
 		side: i32,
 		s: *mut c_void,
 	);
-	fn launch_searchx_isin(
-		a: *const c_void,
-		na: i32,
-		x: *const c_void,
-		out: *mut c_void,
-		nx: i32,
-		s: *mut c_void,
-	);
-	fn launch_searchx_nonzero(
-		x: *const c_void,
-		n: i32,
-		out: *mut c_void,
-		cnt: *mut c_void,
-		s: *mut c_void,
-	);
-	fn launch_searchx_find(
-		x: *const c_void,
-		n: i32,
-		target: f64,
-		out: *mut c_void,
-		s: *mut c_void,
-	);
-	fn launch_searchx_find_n(
-		x: *const c_void,
-		n: i32,
-		target: f64,
-		k: i32,
-		out: *mut c_void,
-		s: *mut c_void,
-	);
+	fn launch_searchx_isin(a: *const c_void, na: i32, x: *const c_void, out: *mut c_void, nx: i32, s: *mut c_void);
+	fn launch_searchx_nonzero(x: *const c_void, n: i32, out: *mut c_void, cnt: *mut c_void, s: *mut c_void);
+	fn launch_searchx_find(x: *const c_void, n: i32, target: f64, out: *mut c_void, s: *mut c_void);
+	fn launch_searchx_find_n(x: *const c_void, n: i32, target: f64, k: i32, out: *mut c_void, s: *mut c_void);
 	fn launch_searchx_is_sorted(x: *const c_void, n: i32, out: *mut c_void, s: *mut c_void);
 	fn launch_searchx_is_sorted_until(x: *const c_void, n: i32, out: *mut c_void, s: *mut c_void);
-	fn launch_searchx_partition_point(
-		x: *const c_void,
-		n: i32,
-		pivot: f64,
-		out: *mut c_void,
-		s: *mut c_void,
-	);
-	fn launch_searchx_mismatch(
-		a: *const c_void,
-		b: *const c_void,
-		n: i32,
-		out: *mut c_void,
-		s: *mut c_void,
-	);
-	fn launch_searchx_argextreme(
-		x: *const c_void,
-		n: i32,
-		mode: i32,
-		out: *mut c_void,
-		s: *mut c_void,
-	);
+	fn launch_searchx_partition_point(x: *const c_void, n: i32, pivot: f64, out: *mut c_void, s: *mut c_void);
+	fn launch_searchx_mismatch(a: *const c_void, b: *const c_void, n: i32, out: *mut c_void, s: *mut c_void);
+	fn launch_searchx_argextreme(x: *const c_void, n: i32, mode: i32, out: *mut c_void, s: *mut c_void);
 	fn launch_searchx_minmax_element(x: *const c_void, n: i32, out: *mut c_void, s: *mut c_void);
-	fn launch_searchx_argrel(
-		x: *const c_void,
-		n: i32,
-		mode: i32,
-		mask: *mut c_void,
-		s: *mut c_void,
-	);
+	fn launch_searchx_argrel(x: *const c_void, n: i32, mode: i32, mask: *mut c_void, s: *mut c_void);
 }
 
 // ── GPU runners (upload f64, download i32) ───────────────────────────────────
@@ -594,8 +544,7 @@ fn prove_ops(failures: &mut Vec<String>) -> BTreeSet<&'static str> {
 	let su = [1.0, 2.0, 5.0, 4.0, 9.0];
 	pass!(
 		"is_sorted_until",
-		is_sorted_until_gpu(&su) == ora_is_sorted_until(&su)
-			&& is_sorted_until_gpu(&[1.0, 2.0, 3.0]) == 3,
+		is_sorted_until_gpu(&su) == ora_is_sorted_until(&su) && is_sorted_until_gpu(&[1.0, 2.0, 3.0]) == 3,
 		format!(
 			"got {} want {}",
 			is_sorted_until_gpu(&su),

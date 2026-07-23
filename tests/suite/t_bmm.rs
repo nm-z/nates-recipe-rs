@@ -2,16 +2,7 @@ use gpu_core::linalg::gpu_bmm_into;
 use gpu_core::memory::GpuBuffer;
 use std::ptr;
 
-fn cpu_bmm(
-	a: &[f64],
-	b: &[f64],
-	batch: usize,
-	m: usize,
-	n: usize,
-	k: usize,
-	ta: bool,
-	tb: bool,
-) -> Vec<f64> {
+fn cpu_bmm(a: &[f64], b: &[f64], batch: usize, m: usize, n: usize, k: usize, ta: bool, tb: bool) -> Vec<f64> {
 	let mut c = vec![0.0f64; batch * m * n];
 	for bi in 0..batch {
 		let ao = bi * m * k;
@@ -158,8 +149,7 @@ fn bmm_per_head_offset() {
 				for b2 in 0..s {
 					let mut acc = 0.0;
 					for p in 0..hd {
-						acc += q[i * s * d + a * d + h * hd + p]
-							* kk[i * s * d + b2 * d + h * hd + p];
+						acc += q[i * s * d + a * d + h * hd + p] * kk[i * s * d + b2 * d + h * hd + p];
 					}
 					let g = got[h * n * s * s + i * s * s + a * s + b2];
 					assert!(

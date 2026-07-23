@@ -8,48 +8,12 @@ use std::ptr;
 
 // ── New per-element loss launchers (src/kernels/lossx.hip) ────────────────────
 unsafe extern "C" {
-	fn launch_lossx_mse(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_lossx_mae(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_lossx_log_cosh(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_lossx_bce(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_lossx_poisson_nll(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_lossx_kl_div(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_lossx_mse(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_lossx_mae(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_lossx_log_cosh(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_lossx_bce(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_lossx_poisson_nll(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_lossx_kl_div(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_lossx_smooth_l1(
 		pred: *const c_void,
 		target: *const c_void,
@@ -122,11 +86,7 @@ fn run2(f: Launch2, a: &[f64], b: &[f64]) -> Vec<f64> {
 	out
 }
 
-fn run2_param(
-	launch: impl Fn(*const c_void, *const c_void, *mut c_void, i32),
-	a: &[f64],
-	b: &[f64],
-) -> Vec<f64> {
+fn run2_param(launch: impl Fn(*const c_void, *const c_void, *mut c_void, i32), a: &[f64], b: &[f64]) -> Vec<f64> {
 	let ba = {
 		let __up = a;
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -297,8 +257,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 			a,
 			b
 		),
-		move |mu, y| -y * mu.powf(1.0 - power) / (1.0 - power)
-			+ mu.powf(2.0 - power) / (2.0 - power),
+		move |mu, y| -y * mu.powf(1.0 - power) / (1.0 - power) + mu.powf(2.0 - power) / (2.0 - power),
 		0.2,
 		4.0,
 		0.0,
@@ -353,16 +312,7 @@ fn registry() -> HashMap<&'static str, LossOp> {
 			};
 			let loss = GpuBuffer::alloc(a.len()).unwrap();
 			let grad = GpuBuffer::alloc(a.len()).unwrap();
-			gpu_core::losses::gpu_focal_into(
-				&ba,
-				&bb,
-				&bgamma,
-				&balpha,
-				a.len(),
-				&loss,
-				&grad,
-			)
-			.unwrap();
+			gpu_core::losses::gpu_focal_into(&ba, &bb, &bgamma, &balpha, a.len(), &loss, &grad).unwrap();
 			let mut out = vec![0.0; a.len()];
 			unsafe { loss.download_async(&mut out, ptr::null_mut()) }.unwrap();
 			gpu_core::hip::device_synchronize().unwrap();

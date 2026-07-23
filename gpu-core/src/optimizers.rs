@@ -82,13 +82,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_clip_value(
-		x: *mut c_void,
-		lo: *const c_void,
-		hi: *const c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_clip_value(x: *mut c_void, lo: *const c_void, hi: *const c_void, n: i32, stream: *mut c_void);
 }
 
 #[inline]
@@ -305,12 +299,7 @@ pub fn gpu_nadam_update(
 }
 
 #[inline]
-pub fn gpu_clip_value(
-	lo: &GpuBuffer,
-	hi: &GpuBuffer,
-	n: usize,
-	x: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_clip_value(lo: &GpuBuffer, hi: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<(), HipError> {
 	let n_i = ci(n)?;
 	// SAFETY: every pointer is a live GpuBuffer device allocation sized for n elements.
 	unsafe {

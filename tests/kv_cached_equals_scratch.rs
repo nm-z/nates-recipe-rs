@@ -1,4 +1,3 @@
-
 use recipe_infer::llm::{greedy, last_logits};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};

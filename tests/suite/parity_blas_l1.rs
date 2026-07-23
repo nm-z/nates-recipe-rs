@@ -1,8 +1,5 @@
-
 use gpu_core::memory::GpuBuffer;
-use gpu_core::reductions::{
-	gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes,
-};
+use gpu_core::reductions::{gpu_dot, gpu_dot_workspace_bytes, gpu_l2_norm, gpu_l2_norm_workspace_bytes};
 use gpu_core::{hip, linalg};
 use std::ptr;
 

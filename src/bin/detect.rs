@@ -17,9 +17,7 @@ fn main() -> Result<ExitCode> {
 	});
 	let paths: Vec<String> = env::args().skip(1).collect();
 	let Some(_probe) = paths.first() else {
-		Write::error(
-			"usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)",
-		);
+		Write::error("usage: detect <path>...   (csv / arff / dir / zip; globs expand to many)");
 		return Ok(ExitCode::from(1));
 	};
 

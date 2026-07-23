@@ -54,8 +54,7 @@ fn cholesky_solve_residual() {
 			__ub.load(__up).unwrap();
 			__ub
 		};
-		let work =
-			GpuBuffer::alloc_bytes(kernels::gpu_cholesky_solve_workspace_bytes(n)).unwrap();
+		let work = GpuBuffer::alloc_bytes(kernels::gpu_cholesky_solve_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n).unwrap();
@@ -91,14 +90,12 @@ fn lu_solve_residual() {
 			__ub
 		};
 		let work = GpuBuffer::alloc_bytes(kernels::gpu_solve_getrf_workspace_bytes(n)).unwrap();
-		let work_s =
-			GpuBuffer::alloc_bytes(kernels::gpu_solve_getrs_workspace_bytes(n, 1)).unwrap();
+		let work_s = GpuBuffer::alloc_bytes(kernels::gpu_solve_getrs_workspace_bytes(n, 1)).unwrap();
 		let ipiv = GpuBuffer::alloc(n).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n).unwrap();
-		kernels::gpu_solve(&da, &db, n, 1, &work, &work_s, &ipiv, &info, &a_copy, &out)
-			.unwrap();
+		kernels::gpu_solve(&da, &db, n, 1, &work, &work_s, &ipiv, &info, &a_copy, &out).unwrap();
 		let xg = {
 			let mut __dv = vec![0.0f64; out.n_floats()];
 			unsafe { out.download_async(&mut __dv, ptr::null_mut()) }.unwrap();
@@ -183,8 +180,7 @@ fn cholesky_inv_times_a_is_identity() {
 			__ub.load(__up).unwrap();
 			__ub
 		};
-		let work =
-			GpuBuffer::alloc_bytes(kernels::gpu_cholesky_inv_workspace_bytes(n)).unwrap();
+		let work = GpuBuffer::alloc_bytes(kernels::gpu_cholesky_inv_workspace_bytes(n)).unwrap();
 		let info = GpuBuffer::alloc(1).unwrap();
 		let a_copy = GpuBuffer::alloc(n * n).unwrap();
 		let out = GpuBuffer::alloc(n * n).unwrap();

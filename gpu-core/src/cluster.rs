@@ -18,12 +18,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_exclusive_scan_i32(
-		count_in: *const c_void,
-		row_ptr_out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_exclusive_scan_i32(count_in: *const c_void, row_ptr_out: *mut c_void, n: i32, stream: *mut c_void);
 
 	fn launch_fixed_radius_fill_csr(
 		points: *const c_void,
@@ -48,12 +43,7 @@ unsafe extern "C" {
 
 	fn launch_uf_compress(parent: *mut c_void, n_nodes: i32, stream: *mut c_void);
 
-	fn launch_boruvka_init(
-		best_edge: *mut c_void,
-		best_wkey: *mut c_void,
-		n_nodes: i32,
-		stream: *mut c_void,
-	);
+	fn launch_boruvka_init(best_edge: *mut c_void, best_wkey: *mut c_void, n_nodes: i32, stream: *mut c_void);
 
 	fn launch_boruvka_min_w(
 		edge_src: *const c_void,
@@ -132,11 +122,7 @@ pub fn fixed_radius_count(
 }
 
 #[inline]
-pub fn exclusive_scan_i32(
-	count_in: &GpuBuffer,
-	n: usize,
-	row_ptr_out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn exclusive_scan_i32(count_in: &GpuBuffer, n: usize, row_ptr_out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: pointers come from live GpuBuffers valid for this launch; n is range-checked.
 	unsafe {
 		launch_exclusive_scan_i32(
@@ -176,12 +162,7 @@ pub fn fixed_radius_fill_csr(
 }
 
 #[inline]
-pub fn gpu_fixed_radius_neighbors(
-	points: &GpuBuffer,
-	n: usize,
-	dim: usize,
-	eps: f64,
-) -> Result<NeighborCsr, HipError> {
+pub fn gpu_fixed_radius_neighbors(points: &GpuBuffer, n: usize, dim: usize, eps: f64) -> Result<NeighborCsr, HipError> {
 	let eps_buf = GpuBuffer::alloc(1)?;
 	eps_buf.load(&[eps])?;
 	let count = GpuBuffer::alloc_bytes(n * mem::size_of::<i32>())?;
@@ -279,11 +260,7 @@ pub struct BoruvkaResult {
 }
 
 #[inline]
-pub fn boruvka_init(
-	n_nodes: usize,
-	best_edge_out: &GpuBuffer,
-	best_wkey_out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn boruvka_init(n_nodes: usize, best_edge_out: &GpuBuffer, best_wkey_out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffers outlive the call and n_nodes is range-checked into i32.
 	unsafe {
 		launch_boruvka_init(

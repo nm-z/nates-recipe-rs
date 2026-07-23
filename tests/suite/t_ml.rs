@@ -1,20 +1,13 @@
 use gpu_core::bayes::{
-	gpu_bernoulli_nb_logprob, gpu_multinomial_nb_logprob, gpu_nb_count_table,
-	gpu_nb_feature_log_prob,
+	gpu_bernoulli_nb_logprob, gpu_multinomial_nb_logprob, gpu_nb_count_table, gpu_nb_feature_log_prob,
 };
 use gpu_core::catboost::{
-	gpu_iota, gpu_ordered_target_stats, gpu_random_permutation,
-	gpu_random_permutation_workspace_bytes,
+	gpu_iota, gpu_ordered_target_stats, gpu_random_permutation, gpu_random_permutation_workspace_bytes,
 };
-use gpu_core::forest::{
-	gpu_bootstrap_sample, gpu_feature_subset, gpu_oob_mask, gpu_random_threshold_split,
-};
+use gpu_core::forest::{gpu_bootstrap_sample, gpu_feature_subset, gpu_oob_mask, gpu_random_threshold_split};
 use gpu_core::kernels::gpu_rand_uniform_into;
 use gpu_core::memory::GpuBuffer;
-use gpu_core::rl::{
-	gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob,
-	gpu_td_targets,
-};
+use gpu_core::rl::{gpu_categorical_logprob, gpu_discounted_returns, gpu_gae, gpu_gaussian_logprob, gpu_td_targets};
 use std::collections::HashSet;
 use std::f64::consts;
 use std::mem;

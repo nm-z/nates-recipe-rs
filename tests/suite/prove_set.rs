@@ -273,8 +273,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		let g = run_unique_consecutive(&x);
 		let w = cpu_unique_consecutive(&x);
-		let mut pass =
-			g.len() == w.len() && g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= TOL);
+		let mut pass = g.len() == w.len() && g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= TOL);
 		let u = cpu_unique(&x);
 		if w.len() == u.len() && w.iter().zip(&u).all(|(a, b)| (a - b).abs() <= TOL) {
 			pass = false; // probe failed to distinguish the ops -> treat as failure
@@ -290,9 +289,7 @@ fn prove_ops() -> (HashMap<&'static str, bool>, Vec<String>) {
 	{
 		let (gv, gc) = run_unique_counts(&x);
 		let (wv, wc) = cpu_unique_counts(&x);
-		let pass = gv.len() == wv.len()
-			&& gv.iter().zip(&wv).all(|(a, b)| (a - b).abs() <= TOL)
-			&& gc == wc;
+		let pass = gv.len() == wv.len() && gv.iter().zip(&wv).all(|(a, b)| (a - b).abs() <= TOL) && gc == wc;
 		mark!(
 			"unique_counts",
 			pass,

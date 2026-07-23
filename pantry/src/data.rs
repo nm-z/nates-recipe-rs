@@ -1,15 +1,14 @@
 use crate::{Attr, Kind, Mat, Vec1};
 use anyhow::{Context, Result};
 use ndarray::{Array1, Array2};
-use rayon::prelude::*;
 use ogdl::log::{Errored, Write, data};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,10 +39,7 @@ pub fn sniff_delimiter(path: &Path) -> u8 {
 		let tabs = text.matches('\t').count();
 		let total_sep = commas + semis + tabs;
 		let tokens: Vec<&str> = text.split_whitespace().collect();
-		if total_sep == 0
-			&& tokens.len() >= 2
-			&& tokens.iter().all(|t| t.parse::<f64>().is_ok())
-		{
+		if total_sep == 0 && tokens.len() >= 2 && tokens.iter().all(|t| t.parse::<f64>().is_ok()) {
 			return b' ';
 		}
 		return match semis.cmp(&commas) {
@@ -61,12 +57,11 @@ enum FirstRow {
 	Data,
 }
 
-pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
+pub fn read_raw_csv(path: &Path, account: &crate::formats::MemAccount) -> Result<RawCsv> {
 	let delim = sniff_delimiter(path);
 	let Some(()) = Some(()).filter(|_u| delim != b' ') else {
-		return read_raw_whitespace(path);
+		return read_raw_whitespace(path, account);
 	};
-	let disk = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
 	let mut rdr = csv::ReaderBuilder::new()
 		.has_headers(false)
 		.flexible(true)
@@ -102,29 +97,6 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		FirstRow::Header => first_cells.clone(),
 	};
 
-	let overhead = mem::size_of::<String>();
-	let physical = count_lines(path)?;
-	let est_rows = match first_row {
-		FirstRow::Data => physical,
-		FirstRow::Header => physical.saturating_sub(1),
-	};
-	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
-	let avail = crate::available_ram_bytes();
-	if avail.checked_sub(proj).is_none() {
-		Write::error("csv too large to parse into RAM");
-		Write::error(format!(
-			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
-			short_path(path.to_str().unwrap_or_default()),
-			human_bytes(proj),
-			human_bytes(avail)
-		));
-		Write::err(format!(
-			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
-			path.display(),
-			human_bytes(proj),
-			human_bytes(avail)
-		))?;
-	}
 	let na = |cell: &str| match cell {
 		"NA" | "NaN" | "nan" => String::new(),
 		s => s.to_string(),
@@ -135,6 +107,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 	};
 	for result in records {
 		let record = result.with_context(|| "failed to read CSV record")?;
+		account.admit(path)?;
 		let mut row = Vec::with_capacity(w);
 		for j in 0..w {
 			let cell = record
@@ -152,9 +125,8 @@ pub struct RawCsv {
 	pub rows: Vec<Vec<String>>,
 }
 
-fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
+fn read_raw_whitespace(path: &Path, account: &crate::formats::MemAccount) -> Result<RawCsv> {
 	use std::io::BufRead;
-	let disk = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
 	let f = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	let rdr = io::BufReader::with_capacity(1 << 20, f);
 	let mut lines = rdr.lines();
@@ -175,25 +147,6 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	let w = first_cells.len();
 	let headers: Vec<String> = (0..w).map(|j| format!("col{}", j + 1)).collect();
 
-	let overhead = mem::size_of::<String>();
-	let est_rows = count_lines(path)?;
-	let proj = disk.saturating_add(est_rows.saturating_mul(w).saturating_mul(overhead));
-	let avail = crate::available_ram_bytes();
-	if avail.checked_sub(proj).is_none() {
-		Write::error("csv too large to parse into RAM");
-		Write::error(format!(
-			"    {}  →  {est_rows} rows × {w} cols = {} (available {})",
-			short_path(path.to_str().unwrap_or_default()),
-			human_bytes(proj),
-			human_bytes(avail)
-		));
-		Write::err(format!(
-			"csv too large to parse into RAM: {} — {est_rows} rows × {w} cols = {} (available {})",
-			path.display(),
-			human_bytes(proj),
-			human_bytes(avail)
-		))?;
-	}
 	let na = |cell: &str| match cell {
 		"NA" | "NaN" | "nan" => String::new(),
 		s => s.to_string(),
@@ -205,6 +158,7 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 		let Some(_c0) = line.trim().chars().next() else {
 			continue;
 		};
+		account.admit(path)?;
 		let mut row = vec![String::new(); w];
 		let mut j = 0usize;
 		for tok in line.split_whitespace().take(w) {
@@ -234,30 +188,12 @@ pub fn human_bytes(b: usize) -> String {
 	}
 }
 
-fn count_lines(path: &Path) -> Result<usize> {
-	use std::io::Read;
-	let f = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-	let mut rdr = io::BufReader::with_capacity(1 << 20, f);
-	let mut buf = [0u8; 1 << 16];
-	let mut lines = 0usize;
-	loop {
-		let n = rdr
-			.read(&mut buf)
-			.with_context(|| format!("failed to read {}", path.display()))?;
-		let Some(_more) = n.checked_sub(1) else {
-			break;
-		};
-		lines += buf[..n].iter().filter(|&&c| c == NLB).count();
-	}
-	Ok(lines)
+pub(crate) struct GroupHash {
+	pub(crate) group: String,
+	pub(crate) hash: String,
 }
 
-struct GroupHash {
-	group: String,
-	hash: String,
-}
-
-fn group_and_hash(p: &Path, prefixes: &HashSet<String>) -> GroupHash {
+pub(crate) fn group_and_hash(p: &Path, prefixes: &HashSet<String>) -> GroupHash {
 	let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
 	if let Some(idx) = name.find("__") {
 		let h = &name[..idx];
@@ -330,11 +266,8 @@ fn is_junk_name(name: &str) -> Option<()> {
 }
 
 fn walk_data_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-	for entry in fs::read_dir(dir)
-		.with_context(|| format!("failed to read directory: {}", dir.display()))?
-	{
-		let entry =
-			entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+	for entry in fs::read_dir(dir).with_context(|| format!("failed to read directory: {}", dir.display()))? {
+		let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
 		let None = is_junk_name(&entry.file_name().to_string_lossy()) else {
 			continue;
 		};
@@ -357,6 +290,8 @@ fn walk_data_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
+	let account = crate::formats::MemAccount::start();
+	let account = &account;
 	let mut files: Vec<PathBuf> = Vec::new();
 	walk_data_files(Path::new(dir), &mut files)?;
 	files.sort();
@@ -394,17 +329,14 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 
 		let parsed: Vec<ParsedTable> = paths
 			.par_iter()
-			.filter_map(|hp| match read_raw_csv(&hp.path) {
+			.filter_map(|hp| match read_raw_csv(&hp.path, account) {
 				Ok(raw) => Some(ParsedTable {
 					hash: hp.hash.clone(),
 					headers: raw.headers,
 					rows: raw.rows,
 				}),
 				Err(e) => {
-					Write::error(format!(
-						"WARN: skipping {}: {e}",
-						hp.path.display()
-					));
+					Write::error(format!("WARN: skipping {}: {e}", hp.path.display()));
 					None
 				}
 			})
@@ -466,8 +398,8 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 		.unwrap_or("images")
 		.to_string();
 	let all: Vec<PathBuf> = images.into_values().flatten().map(|hp| hp.path).collect();
-	let first_img = image::open(&all[0])
-		.with_context(|| format!("failed to read image dimensions: {}", all[0].display()))?;
+	let first_img =
+		image::open(&all[0]).with_context(|| format!("failed to read image dimensions: {}", all[0].display()))?;
 	let iw = first_img.width();
 	let ih = first_img.height();
 	let dim = (iw * ih * 3) as usize;
@@ -482,10 +414,7 @@ pub fn load_dir_groups(dir: &str) -> Result<Vec<DirGroup>> {
 			let px = match image_to_row(p.to_str().unwrap_or_default(), iw, ih) {
 				Ok(r) => r.to_vec(),
 				Err(e) => {
-					Write::error(format!(
-						"WARN: skipping image {}: {e}",
-						p.display()
-					));
+					Write::error(format!("WARN: skipping image {}: {e}", p.display()));
 					vec![f64::NAN; dim]
 				}
 			};
@@ -515,8 +444,7 @@ static ZIP_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 	let n = ZIP_COUNT.fetch_add(1, Ordering::Relaxed);
 	let tmp = env::temp_dir().join(format!("nrecipe_zip_{}_{}", process::id(), n));
-	fs::create_dir_all(&tmp)
-		.with_context(|| format!("failed to create temp dir {}", tmp.display()))?;
+	fs::create_dir_all(&tmp).with_context(|| format!("failed to create temp dir {}", tmp.display()))?;
 
 	struct TempDir {
 		path: PathBuf,
@@ -546,8 +474,7 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 		for z in inner {
 			let dest = z.with_extension("");
 			extract_zip_file(&z, &dest)?;
-			fs::remove_file(&z)
-				.with_context(|| format!("failed to remove inner zip {}", z.display()))?;
+			fs::remove_file(&z).with_context(|| format!("failed to remove inner zip {}", z.display()))?;
 		}
 	}
 
@@ -559,10 +486,9 @@ pub fn load_zip_groups(path: &str) -> Result<Vec<DirGroup>> {
 
 fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 	fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
-	let file = fs::File::open(zip_path)
-		.with_context(|| format!("failed to open zip {}", zip_path.display()))?;
-	let mut archive = zip::ZipArchive::new(file)
-		.with_context(|| format!("failed to read zip {}", zip_path.display()))?;
+	let file = fs::File::open(zip_path).with_context(|| format!("failed to open zip {}", zip_path.display()))?;
+	let mut archive =
+		zip::ZipArchive::new(file).with_context(|| format!("failed to read zip {}", zip_path.display()))?;
 	for i in 0..archive.len() {
 		let mut entry = archive.by_index(i)?;
 		let Some(rel) = entry.enclosed_name() else {
@@ -579,13 +505,10 @@ fn extract_zip_file(zip_path: &Path, dest: &Path) -> Result<()> {
 			continue;
 		};
 		for parent in out.parent().into_iter() {
-			fs::create_dir_all(parent)
-				.with_context(|| format!("failed to create {}", parent.display()))?;
+			fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 		}
-		let mut w = fs::File::create(&out)
-			.with_context(|| format!("failed to create {}", out.display()))?;
-		io::copy(&mut entry, &mut w)
-			.with_context(|| format!("failed to extract {}", out.display()))?;
+		let mut w = fs::File::create(&out).with_context(|| format!("failed to create {}", out.display()))?;
+		io::copy(&mut entry, &mut w).with_context(|| format!("failed to extract {}", out.display()))?;
 	}
 	Ok(())
 }
@@ -609,7 +532,7 @@ pub fn load_groups(path: &str) -> Result<Vec<DirGroup>> {
 	let RawCsv {
 		headers,
 		rows: cells,
-	} = read_raw_csv(p).context("read csv")?;
+	} = read_raw_csv(p, &crate::formats::MemAccount::start()).context("read csv")?;
 	let hashes = vec![String::new(); cells.len()];
 	return Ok(vec![DirGroup::Table {
 		name: String::new(),
@@ -745,8 +668,7 @@ pub fn parse_arff(path: &str) -> ArffTable {
 				match lower.strip_prefix("@attribute") {
 					Some(_rest) => attrs.push(parse_attribute(line)),
 					None => {
-						let Some(()) = Some(()).filter(|_u| lower.starts_with("@data"))
-						else {
+						let Some(()) = Some(()).filter(|_u| lower.starts_with("@data")) else {
 							continue;
 						};
 						section = Section::Data;
@@ -778,20 +700,11 @@ pub struct ArffTable {
 }
 
 pub fn load_sqlite_groups(path: &str) -> Result<Vec<DirGroup>> {
-	let parsed = crate::formats::load(path)?;
+	let usr = crate::formats::load(path)?;
 	let mut groups = Vec::new();
-	for g in parsed.groups {
-		let headers: Vec<String> = g.columns.iter().map(|c| c.name.clone()).collect();
-		let nrows = g.columns.iter().map(|c| c.values.len()).max().unwrap_or(0);
-		let mut cells: Vec<Vec<String>> = Vec::with_capacity(nrows);
-		for r in 0..nrows {
-			cells.push(
-				g.columns
-					.iter()
-					.map(|c| c.values.get(r).cloned().unwrap_or_default())
-					.collect(),
-			);
-		}
+	for g in usr.groups {
+		let headers = g.header_names();
+		let cells = g.text_rows()?;
 		groups.push(DirGroup::Table {
 			name: g.member,
 			headers,
@@ -817,8 +730,8 @@ pub(crate) fn short_path(p: &str) -> String {
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &[
-	"jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif", "ico", "pnm", "pbm", "pgm", "ppm",
-	"qoi", "dds", "hdr", "exr", "ff",
+	"jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif", "ico", "pnm", "pbm", "pgm", "ppm", "qoi", "dds",
+	"hdr", "exr", "ff",
 ];
 
 fn classify_file(path: &Path) -> FileClass {

@@ -1,0 +1,17 @@
+[package]
+name = "recipe-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Preallocated asynchronous RAM and disk transfer resources for Recipe"
+
+[dependencies]
+recipe-core = { path = "../recipe-core" }
+recipe-executor = { path = "../recipe-executor" }
+rustix = { version = "0.38.44", features = ["fs"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

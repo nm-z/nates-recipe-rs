@@ -36,55 +36,13 @@ unsafe extern "C" {
 	fn launch_foreachx_erf(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_erfc(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_foreachx_lgamma(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_foreachx_add(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_sub(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_mul(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_div(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_maximum(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_minimum(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_foreachx_pow(
-		a: *const c_void,
-		b: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_foreachx_add(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_sub(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_mul(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_div(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_maximum(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_minimum(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_foreachx_pow(a: *const c_void, b: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type LaunchU = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);

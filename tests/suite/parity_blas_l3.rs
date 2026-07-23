@@ -1,4 +1,3 @@
-
 use gpu_core::memory::GpuBuffer;
 use gpu_core::{hip, kernels, linalg};
 use std::ptr;

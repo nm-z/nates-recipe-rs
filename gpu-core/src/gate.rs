@@ -1,8 +1,8 @@
 use crate::hip::sysfs_vram_free;
-use ogdl::log::Write;
 use core::cmp;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
+use ogdl::log::Write;
 use std::env;
 use std::fs;
 use std::io;
@@ -116,9 +116,7 @@ pub fn acquire() {
 				}
 				Ok(raw) => {
 					let Ok(fd) = raw.parse::<RawFd>() else {
-						break 'engage Err(io::Error::other(format!(
-							"{INHERIT_VAR}={raw}"
-						)));
+						break 'engage Err(io::Error::other(format!("{INHERIT_VAR}={raw}")));
 					};
 					// SAFETY: fcntl(F_GETFD) only reads the fd's flags and dereferences no pointers.
 					match unsafe { libc::fcntl(fd, libc::F_GETFD) }.cmp(&0i32) {
@@ -145,10 +143,7 @@ pub fn acquire() {
 						PathBuf::from,
 					);
 				if let Err(e) = fs::create_dir_all(&dir) {
-					break 'engage Err(io::Error::other(format!(
-						"create {}: {e}",
-						dir.display()
-					)));
+					break 'engage Err(io::Error::other(format!("create {}: {e}", dir.display())));
 				}
 				let path = dir.join(LOCK_NAME);
 				let opened = fs::OpenOptions::new()
@@ -160,17 +155,12 @@ pub fn acquire() {
 				let file = match opened {
 					Ok(f) => f,
 					Err(e) => {
-						break 'engage Err(io::Error::other(format!(
-							"open {}: {e}",
-							path.display()
-						)));
+						break 'engage Err(io::Error::other(format!("open {}: {e}", path.display())));
 					}
 				};
 				let fd = file.as_raw_fd();
 				// SAFETY: fcntl(F_SETFD, 0) clears close-on-exec on an owned fd and dereferences no pointers.
-				let None =
-					num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })
-				else {
+				let None = num::NonZeroI32::new(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }) else {
 					break 'engage Err(io::Error::last_os_error());
 				};
 				// SAFETY: env is mutated under the GATE mutex during single-threaded lock setup, with no concurrent readers.

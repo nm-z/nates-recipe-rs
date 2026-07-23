@@ -1,0 +1,16 @@
+[package]
+name = "recipe-planner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Deterministic measured-topology Draft candidate planner for Recipe"
+
+[dependencies]
+recipe-core = { path = "../recipe-core" }
+recipe-language = { path = "../recipe-language" }
+recipe-primitives = { path = "../recipe-primitives" }
+recipe-scheduler = { path = "../recipe-scheduler" }
+sha2 = "0.10.9"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -36,9 +36,7 @@ fn main() {
 		.split(0.8)
 		.exclude("id")
 		.target("Churn");
-	let nn_train = Train::new()
-		.epochs(20)
-		.log([Loss, Accuracy]);
+	let nn_train = Train::new().epochs(1).log([Loss, Accuracy]);
 	let nn_infer = Infer::new().log([acc]);
 
 	let cnn = Model::new() // CNN
@@ -55,9 +53,7 @@ fn main() {
 		.set(SET.image[1])
 		.split(0.8)
 		.target("label");
-	let cnn_train = Train::new()
-		.epochs(20)
-		.log([Loss, Accuracy]);
+	let cnn_train = Train::new().epochs(1).log([Loss, Accuracy]);
 	let cnn_infer = Infer::new().log([acc]);
 
 	let mlp = Model::new() // MLP
@@ -72,9 +68,7 @@ fn main() {
 		.split(0.8)
 		.exclude("Id")
 		.target("SalePrice");
-	let mlp_train = Train::new()
-		.epochs(20)
-		.log([Loss, R2]);
+	let mlp_train = Train::new().epochs(1).log([Loss, R2]);
 	let mlp_infer = Infer::new().log([r2]);
 
 	let llm = Model::new() // LLM
@@ -85,14 +79,12 @@ fn main() {
 		.leak()
 		.layer(3)
 		.lr(0.001);
-	let llm_data = Data::load(SET.text).split(0.8).exclude("id").target([
-		"winner_model_a",
-		"winner_model_b",
-		"winner_tie",
-	]);
-	let llm_train = Train::new()
-		.epochs(1)
-		.log([Loss, Accuracy]);
+	let llm_data =
+		Data::load(SET.text)
+			.split(0.8)
+			.exclude("id")
+			.target(["winner_model_a", "winner_model_b", "winner_tie"]);
+	let llm_train = Train::new().epochs(1).log([Loss, Accuracy]);
 	let llm_infer = Infer::new().log([acc]);
 
 	for (model, data, train, infer) in [

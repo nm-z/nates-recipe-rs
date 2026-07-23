@@ -2,10 +2,10 @@ use crate::HipError;
 use crate::callspy::{GET_LAST_ERROR, LAUNCH, tick};
 use crate::hip::{check, hipGetLastError};
 use crate::kernels::hipblas_handle;
-use ogdl::log::Write;
 use crate::memory::GpuBuffer;
 use core::ffi::c_void;
 use core::ptr;
+use ogdl::log::Write;
 
 const HIPBLAS_OP_N: u32 = 111;
 
@@ -36,13 +36,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_gelu_f32(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_gelu_backward_f32(
-		grad: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_gelu_backward_f32(grad: *const c_void, x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_bias_add_f32(
 		x: *const c_void,
 		bias: *const c_void,
@@ -51,13 +45,7 @@ unsafe extern "C" {
 		cols: i32,
 		stream: *mut c_void,
 	);
-	fn launch_repeat_rows_f32(
-		src: *const c_void,
-		dst: *mut c_void,
-		cols: i32,
-		total: i32,
-		stream: *mut c_void,
-	);
+	fn launch_repeat_rows_f32(src: *const c_void, dst: *mut c_void, cols: i32, total: i32, stream: *mut c_void);
 	fn launch_layernorm_f32(
 		x: *const c_void,
 		out: *mut c_void,
@@ -157,20 +145,8 @@ unsafe extern "C" {
 
 	fn launch_relu_f16(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_gelu_f16(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_add_f16(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_mul_f16(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_add_f16(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_mul_f16(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_sgd_update_f32(
 		grad: *const c_void,
 		lr: *const c_void,
@@ -256,12 +232,7 @@ pub fn gpu_relu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 }
 
 #[inline]
-pub fn gpu_relu_backward_f32(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_relu_backward_f32(grad: &GpuBuffer, act: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_relu_backward_f32(
@@ -290,12 +261,7 @@ pub fn gpu_gelu_f32(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 }
 
 #[inline]
-pub fn gpu_gelu_backward_f32(
-	grad: &GpuBuffer,
-	x: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gelu_backward_f32(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: buffer pointers are valid for the launch and match the extern launcher signature.
 	unsafe {
 		launch_gelu_backward_f32(
@@ -528,13 +494,7 @@ pub fn gpu_max_pool_2d_backward_f32(
 }
 
 #[inline]
-pub fn gpu_lstm_cell_f32(
-	gates: &GpuBuffer,
-	n: usize,
-	hs: usize,
-	c: &GpuBuffer,
-	h: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_lstm_cell_f32(gates: &GpuBuffer, n: usize, hs: usize, c: &GpuBuffer, h: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_lstm_cell_f32(
@@ -600,12 +560,7 @@ pub fn gpu_gelu_f16(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipE
 }
 
 #[inline]
-pub fn gpu_add_f16(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_add_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the buffer pointers are valid for this launch and the sizes fit i32.
 	unsafe {
 		launch_add_f16(
@@ -620,12 +575,7 @@ pub fn gpu_add_f16(
 }
 
 #[inline]
-pub fn gpu_mul_f16(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_mul_f16(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI kernel launch; all pointers come from live GpuBuffers and n is range-checked.
 	unsafe {
 		launch_mul_f16(
@@ -640,12 +590,7 @@ pub fn gpu_mul_f16(
 }
 
 #[inline]
-pub fn gpu_sgd_update_f32(
-	grad: &GpuBuffer,
-	lr: &GpuBuffer,
-	n: usize,
-	weights: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_sgd_update_f32(grad: &GpuBuffer, lr: &GpuBuffer, n: usize, weights: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI kernel launch; all pointers come from live GpuBuffers and n is range-checked.
 	unsafe {
 		launch_sgd_update_f32(

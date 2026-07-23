@@ -125,12 +125,16 @@ fn try_route(
 
 // ─
 
+pub const BLOCK_THREADS: usize = 256;
+
+pub const MAX_GRID_BLOCKS: usize = 2048;
+
 pub fn arena_workspace(dims: &[recipe_ir::LayerDims], n: usize) -> usize {
       let wp: usize = dims.iter().map(|ld| ld.in_dim * ld.out_dim + ld.out_dim).sum();
       let fwd: usize = dims.iter().map(|ld| 2 * n * ld.out_dim).sum();
       let max_out = dims.iter().map(|ld| ld.out_dim).max().unwrap_or(1);
       let grad = 2 * n * max_out;
-      return wp + fwd + grad;
+      return wp + fwd + grad + MAX_GRID_BLOCKS;
 }
 
 pub fn generate_train_source(
@@ -143,7 +147,15 @@ pub fn generate_train_source(
 ) -> SourceUnit {
       let mut src = String::with_capacity(16384);
       src.push_str("#include <hip/hip_runtime.h>\n");
+      src.push_str("#include <hip/hip_cooperative_groups.h>\n");
       src.push_str("#include <math.h>\n\n");
+      src.push_str(&format!("#define RECIPE_BLOCK {BLOCK_THREADS}\n\n"));
+      src.push_str(
+            "__device__ __forceinline__ void recipe_sync(cooperative_groups::grid_group& g) {\n",
+      );
+      src.push_str("      if (gridDim.x == 1) { __syncthreads(); return; }\n");
+      src.push_str("      g.sync();\n");
+      src.push_str("}\n\n");
 
       emit_train_kernel(&mut src, graph, dims, loss, n, k, lr);
 
@@ -172,6 +184,12 @@ fn emit_train_kernel(
       src.push_str("      int epochs,\n");
       src.push_str("      int epoch_bound\n");
       src.push_str(") {\n");
+      src.push_str(
+            "      cooperative_groups::grid_group grid = cooperative_groups::this_grid();\n",
+      );
+      src.push_str("      const int gtid = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n");
+      src.push_str("      const int gstride = (int)(gridDim.x * blockDim.x);\n");
+      src.push_str("      __shared__ double red[RECIPE_BLOCK];\n");
 
       let mut offset: usize = 0;
       for (i, ld) in dims.iter().enumerate() {
@@ -194,17 +212,22 @@ fn emit_train_kernel(
       src.push_str(&format!("      double* delta = arena + {offset};\n"));
       offset += grad_sz;
       src.push_str(&format!("      double* delta2 = arena + {offset};\n"));
+      offset += grad_sz;
+      src.push_str(&format!("      double* part = arena + {offset};\n"));
+      src.push_str(&format!("      const double inv_n = 1.0 / {n}.0;\n"));
 
       src.push_str("\n      for (int e = 0; e < epoch_bound && e < epochs; e++) {\n");
 
       for (i, ld) in dims.iter().enumerate() {
             let input = if i == 0 { "x".to_string() } else { format!("a{}", i - 1) };
             emit_dense_fwd(src, i, &input, ld.in_dim, ld.out_dim, n, ld.act);
+            emit_sync(src);
       }
 
       let last = dims.len() - 1;
       let last_out = dims[last].out_dim;
       emit_loss_grad(src, loss, last, n, last_out);
+      emit_sync(src);
 
       for ri in 0..dims.len() {
             let i = dims.len() - 1 - ri;
@@ -221,6 +244,29 @@ fn emit_train_kernel(
       src.push_str("}\n");
 }
 
+fn emit_sync(src: &mut String) {
+      src.push_str("            recipe_sync(grid);\n");
+}
+
+fn act_expr(act: recipe_ir::Activation) -> Option<&'static str> {
+      return match act {
+            recipe_ir::Activation::Relu => Some("sum > 0.0 ? sum : 0.0"),
+            recipe_ir::Activation::LeakyRelu => Some("sum > 0.0 ? sum : 0.01 * sum"),
+            recipe_ir::Activation::PRelu => Some("sum > 0.0 ? sum : 0.25 * sum"),
+            recipe_ir::Activation::Elu => Some("sum > 0.0 ? sum : exp(sum) - 1.0"),
+            recipe_ir::Activation::Selu => Some(
+                  "sum > 0.0 ? 1.0507009873554805 * sum : 1.0507009873554805 * 1.6732632423543772 * (exp(sum) - 1.0)",
+            ),
+            recipe_ir::Activation::Sigmoid => Some("1.0 / (1.0 + exp(-sum))"),
+            recipe_ir::Activation::Tanh => Some("tanh(sum)"),
+            recipe_ir::Activation::Gelu => Some(
+                  "0.5 * sum * (1.0 + tanh(0.7978845608 * (sum + 0.044715 * sum * sum * sum)))",
+            ),
+            recipe_ir::Activation::Silu => Some("sum / (1.0 + exp(-sum))"),
+            recipe_ir::Activation::Linear => None,
+      };
+}
+
 fn emit_dense_fwd(
       src: &mut String,
       idx: usize,
@@ -230,39 +276,21 @@ fn emit_dense_fwd(
       n: usize,
       act: recipe_ir::Activation,
 ) {
-      src.push_str(&format!("            for (int r = 0; r < {n}; r++) {{\n"));
-      src.push_str(&format!("                  for (int c = 0; c < {out_dim}; c++) {{\n"));
-      src.push_str(&format!("                        double sum = b{idx}[c];\n"));
-      src.push_str(&format!("                        for (int j = 0; j < {in_dim}; j++) {{\n"));
-      src.push_str(&format!("                              sum += {input}[r * {in_dim} + j] * w{idx}[j * {out_dim} + c];\n"));
-      src.push_str("                        }\n");
-      src.push_str(&format!("                        z{idx}[r * {out_dim} + c] = sum;\n"));
+      let total = n * out_dim;
+      src.push_str(&format!("            for (int t = gtid; t < {total}; t += gstride) {{\n"));
+      src.push_str(&format!("                  int r = t / {out_dim};\n"));
+      src.push_str(&format!("                  int c = t - r * {out_dim};\n"));
+      src.push_str(&format!("                  double sum = b{idx}[c];\n"));
+      src.push_str(&format!("                  for (int j = 0; j < {in_dim}; j++) {{\n"));
+      src.push_str(&format!("                        sum += {input}[r * {in_dim} + j] * w{idx}[j * {out_dim} + c];\n"));
+      src.push_str("                  }\n");
+      src.push_str(&format!("                  z{idx}[t] = sum;\n"));
 
-      match act {
-            recipe_ir::Activation::Relu =>
-                  src.push_str("                        sum = sum > 0.0 ? sum : 0.0;\n"),
-            recipe_ir::Activation::LeakyRelu =>
-                  src.push_str("                        sum = sum > 0.0 ? sum : 0.01 * sum;\n"),
-            recipe_ir::Activation::PRelu =>
-                  src.push_str("                        sum = sum > 0.0 ? sum : 0.25 * sum;\n"),
-            recipe_ir::Activation::Elu =>
-                  src.push_str("                        sum = sum > 0.0 ? sum : exp(sum) - 1.0;\n"),
-            recipe_ir::Activation::Selu => {
-                  src.push_str("                        sum = sum > 0.0 ? 1.0507009873554805 * sum : 1.0507009873554805 * 1.6732632423543772 * (exp(sum) - 1.0);\n");
-            }
-            recipe_ir::Activation::Sigmoid =>
-                  src.push_str("                        sum = 1.0 / (1.0 + exp(-sum));\n"),
-            recipe_ir::Activation::Tanh =>
-                  src.push_str("                        sum = tanh(sum);\n"),
-            recipe_ir::Activation::Gelu =>
-                  src.push_str("                        sum = 0.5 * sum * (1.0 + tanh(0.7978845608 * (sum + 0.044715 * sum * sum * sum)));\n"),
-            recipe_ir::Activation::Silu =>
-                  src.push_str("                        sum = sum / (1.0 + exp(-sum));\n"),
-            recipe_ir::Activation::Linear => {}
+      for expr in act_expr(act).into_iter() {
+            src.push_str(&format!("                  sum = {expr};\n"));
       }
 
-      src.push_str(&format!("                        a{idx}[r * {out_dim} + c] = sum;\n"));
-      src.push_str("                  }\n");
+      src.push_str(&format!("                  a{idx}[t] = sum;\n"));
       src.push_str("            }\n");
 }
 

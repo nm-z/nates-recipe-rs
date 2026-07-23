@@ -1,8 +1,7 @@
-
-use std::time::Instant;
-use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use recipe_infer::llm::{ChatSession, Tok};
+use std::path::PathBuf;
+use std::time::Instant;
 
 const CHAT_MODELS: &[&str] = &[
 	"qwen3-0.6b-f16",

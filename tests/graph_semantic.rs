@@ -148,11 +148,10 @@ fn gelu_dense_preact_node() {
 		"Gelu is in saves_preact — exactly one Activation op"
 	);
 
-	let act = g
-		.ops
-		.iter()
-		.find(|o| matches!(o.kind, OpKind::Activation(_)))
-		.expect("activation op present");
+	let act =
+		g.ops.iter()
+			.find(|o| matches!(o.kind, OpKind::Activation(_)))
+			.expect("activation op present");
 	assert_eq!(act.inputs.len(), 1, "activation consumes one value");
 	assert_eq!(act.outputs.len(), 1, "activation produces one value");
 	let preact_id = act.inputs[0];
@@ -164,12 +163,11 @@ fn gelu_dense_preact_node() {
 	let structural = preact
 		.produced_by
 		.expect("preact produced by the structural op");
-	let structural_kind = g
-		.ops
-		.iter()
-		.find(|o| o.id == structural)
-		.map(|o| o.kind)
-		.expect("structural op present");
+	let structural_kind =
+		g.ops.iter()
+			.find(|o| o.id == structural)
+			.map(|o| o.kind)
+			.expect("structural op present");
 	assert!(
 		matches!(structural_kind, OpKind::Dense(_)),
 		"preact must be produced by the structural Dense op"

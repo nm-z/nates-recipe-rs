@@ -20,56 +20,12 @@ unsafe extern "C" {
 		cval: f64,
 		s: *mut c_void,
 	);
-	fn launch_shapex_flip(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		axis: i32,
-		s: *mut c_void,
-	);
-	fn launch_shapex_roll(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		sr: i32,
-		sc: i32,
-		s: *mut c_void,
-	);
-	fn launch_shapex_triu(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		k: i32,
-		s: *mut c_void,
-	);
-	fn launch_shapex_tril(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		k: i32,
-		s: *mut c_void,
-	);
-	fn launch_shapex_tile(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		rr: i32,
-		rc: i32,
-		s: *mut c_void,
-	);
-	fn launch_shapex_repeat(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		reps: i32,
-		s: *mut c_void,
-	);
+	fn launch_shapex_flip(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, axis: i32, s: *mut c_void);
+	fn launch_shapex_roll(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, sr: i32, sc: i32, s: *mut c_void);
+	fn launch_shapex_triu(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, k: i32, s: *mut c_void);
+	fn launch_shapex_tril(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, k: i32, s: *mut c_void);
+	fn launch_shapex_tile(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, rr: i32, rc: i32, s: *mut c_void);
+	fn launch_shapex_repeat(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, reps: i32, s: *mut c_void);
 	fn launch_shapex_diagonal(
 		x: *const c_void,
 		out: *mut c_void,

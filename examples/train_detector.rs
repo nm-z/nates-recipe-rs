@@ -4,8 +4,8 @@ use anyhow::Context;
 use ogdl::log::{Opt, Write, opt, probe, set_opt};
 use ogdl::ogdl;
 use pantry::{
-	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL,
-	KIND_TEMPORAL, KIND_TEXT, N_CLASS, VOCAB, tokenize_column,
+	CONTEXT, EMBED_DIM, HEADS, KIND_CATEGORICAL, KIND_IMAGE, KIND_NUMERIC, KIND_ORDINAL, KIND_TEMPORAL, KIND_TEXT,
+	N_CLASS, VOCAB, tokenize_column,
 };
 use recipe::data::{RawCsv, read_raw_csv};
 use recipe::{Accuracy, Dataset, Epoch, Loss, Mat, Model, Train, Vec1, attn, ce, embed};
@@ -423,10 +423,9 @@ const MARCH: &[(&str, &[&str], usize)] = &[
 	(
 		"MNCAATourneyDetailedResults.csv",
 		&[
-			"Season", "DayNum", "WScore", "LScore", "NumOT", "WFGM", "WFGA", "WFGM3",
-			"WFGA3", "WFTM", "WFTA", "WOR", "WDR", "WAst", "WTO", "WStl", "WBlk", "WPF",
-			"LFGM", "LFGA", "LFGM3", "LFGA3", "LFTM", "LFTA", "LOR", "LDR", "LAst", "LTO",
-			"LStl", "LBlk", "LPF",
+			"Season", "DayNum", "WScore", "LScore", "NumOT", "WFGM", "WFGA", "WFGM3", "WFGA3", "WFTM", "WFTA",
+			"WOR", "WDR", "WAst", "WTO", "WStl", "WBlk", "WPF", "LFGM", "LFGA", "LFGM3", "LFGA3", "LFTM", "LFTA",
+			"LOR", "LDR", "LAst", "LTO", "LStl", "LBlk", "LPF",
 		],
 		KIND_NUMERIC,
 	),
@@ -579,7 +578,13 @@ fn add_new_corpus(out: &mut Vec<(Vec<String>, usize)>) -> anyhow::Result<()> {
 		true,
 		&[(0, KIND_NUMERIC)],
 	)?;
-	add_sampled_numeric(out, "examples/datasets/VNA/sample_predictors.csv", &Comma, true, 64)?;
+	add_sampled_numeric(
+		out,
+		"examples/datasets/VNA/sample_predictors.csv",
+		&Comma,
+		true,
+		64,
+	)?;
 	add_sampled_numeric(
 		out,
 		"examples/datasets/VNA/Predictors_2025-04-15_10-43_Hold-2.csv",
@@ -879,12 +884,7 @@ fn class_balance(tag: &str, ds: &Dataset) -> anyhow::Result<()> {
 	}
 	say(format!(
 		"  {tag}: NUM {} TEMP {} CAT {} ORD {} TEXT {} IMG {}",
-		c[KIND_NUMERIC],
-		c[KIND_TEMPORAL],
-		c[KIND_CATEGORICAL],
-		c[KIND_ORDINAL],
-		c[KIND_TEXT],
-		c[KIND_IMAGE]
+		c[KIND_NUMERIC], c[KIND_TEMPORAL], c[KIND_CATEGORICAL], c[KIND_ORDINAL], c[KIND_TEXT], c[KIND_IMAGE]
 	));
 	Ok(())
 }

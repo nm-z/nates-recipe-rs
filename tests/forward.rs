@@ -1,7 +1,7 @@
 use recipe_infer::{GpuBuffer, human_bytes};
+use recipe_ir::{Activation, LayerKind};
 use recipe_runtime::execute::download_vec;
 use recipe_runtime::{LayerParams, SCRATCH_CONSTS, Scratch, forward_into};
-use recipe_ir::{Activation, LayerKind};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
@@ -77,9 +77,7 @@ fn kv_cache_matches_full_attention() {
 		maxdiff = maxdiff.max((reference[i] - cached[i]).abs());
 		maxabs = maxabs.max(reference[i].abs());
 	}
-	eprintln!(
-		"flash-attn equivalence: n={n} heads={heads} d={d} s={s}  maxdiff={maxdiff:e}  maxabs={maxabs:e}"
-	);
+	eprintln!("flash-attn equivalence: n={n} heads={heads} d={d} s={s}  maxdiff={maxdiff:e}  maxabs={maxabs:e}");
 	assert!(
 		maxdiff <= 1e-9 * maxabs.max(1.0),
 		"flash-attn output diverged from full attention: maxdiff={maxdiff:e}"
@@ -145,11 +143,9 @@ fn splitk_dw_matches_rocblas() {
 		let reference = GpuBuffer::alloc(k * n).expect("ref dw");
 		gpu_core::kernels::gpu_gemm_at(&input, &grad, k, n, m, &reference).expect("ref dw");
 		let partials =
-			GpuBuffer::alloc(gpu_core::kernels::gpu_splitk_dw_partials_elems(m, k, n))
-				.expect("partials");
+			GpuBuffer::alloc(gpu_core::kernels::gpu_splitk_dw_partials_elems(m, k, n)).expect("partials");
 		let dw = GpuBuffer::alloc(k * n).expect("dw");
-		gpu_core::kernels::gpu_splitk_dw_into(&input, &grad, &partials, m, n, k, &dw)
-			.expect("splitk dw");
+		gpu_core::kernels::gpu_splitk_dw_into(&input, &grad, &partials, m, n, k, &dw).expect("splitk dw");
 		let r = download_vec(&reference, k * n).expect("download");
 		let g = download_vec(&dw, k * n).expect("download");
 		let (mut maxdiff, mut maxabs) = (0.0_f64, 0.0_f64);

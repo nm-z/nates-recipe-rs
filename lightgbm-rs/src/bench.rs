@@ -1,10 +1,9 @@
-use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use lightgbm_rs::{Params, predict_proba, train_multiclass};
+use ogdl::log::{Errored, Opt, Write, acc, data, epoch, set_opt, time};
 use std::time::Instant;
 
 fn load_csv(path: &str) -> Result<(Vec<f64>, Vec<usize>, usize, usize), Errored> {
-	let text = std::fs::read_to_string(path)
-		.map_err(|e| Errored::new(format!("read_to_string {path}: {e}")))?;
+	let text = std::fs::read_to_string(path).map_err(|e| Errored::new(format!("read_to_string {path}: {e}")))?;
 	let mut x = Vec::new();
 	let mut y = Vec::new();
 	let mut p = 0;
@@ -83,11 +82,7 @@ fn main() -> Result<(), Errored> {
 		epoch,
 		format!(
 			"Config: iters={} leaves={} lr={} goss_a={} goss_b={}",
-			params.n_estimators,
-			params.num_leaves,
-			params.learning_rate,
-			params.goss_a,
-			params.goss_b
+			params.n_estimators, params.num_leaves, params.learning_rate, params.goss_a, params.goss_b
 		),
 	);
 
@@ -105,8 +100,7 @@ fn main() -> Result<(), Errored> {
 	);
 
 	let t1 = Instant::now();
-	let probs = predict_proba(&model, &x_te, n_te)
-		.map_err(|e| Errored::new(format!("predict_proba: {e}")))?;
+	let probs = predict_proba(&model, &x_te, n_te).map_err(|e| Errored::new(format!("predict_proba: {e}")))?;
 	let predict_time = t1.elapsed();
 
 	let correct = (0..n_te)

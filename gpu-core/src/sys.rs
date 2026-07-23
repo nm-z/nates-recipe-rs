@@ -1,4 +1,3 @@
-
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt as _;
@@ -54,7 +53,12 @@ pub fn disable_core_dumps(cmd: &mut Command) {
 pub fn advise_dontneed(f: &File, off: u64, len: usize) {
 	// SAFETY: f owns a live fd; posix_fadvise reads no memory and cannot corrupt state.
 	unsafe {
-		libc::posix_fadvise(f.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_DONTNEED);
+		libc::posix_fadvise(
+			f.as_raw_fd(),
+			off as i64,
+			len as i64,
+			libc::POSIX_FADV_DONTNEED,
+		);
 	}
 }
 
@@ -65,9 +69,7 @@ pub fn evict_range(f: &File, off: u64, len: usize) {
 			f.as_raw_fd(),
 			off as i64,
 			len as i64,
-			libc::SYNC_FILE_RANGE_WAIT_BEFORE
-				| libc::SYNC_FILE_RANGE_WRITE
-				| libc::SYNC_FILE_RANGE_WAIT_AFTER,
+			libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER,
 		);
 	}
 	advise_dontneed(f, off, len);
@@ -80,7 +82,9 @@ pub fn volatile_read_sum(buf: &[u8], stride: usize) -> u64 {
 	let mut i = 0usize;
 	while i < buf.len() {
 		// SAFETY: i < buf.len() holds each iteration, so the offset pointer is
-		acc = acc.wrapping_add(u64::from(unsafe { core::ptr::read_volatile(buf.as_ptr().add(i)) }));
+		acc = acc.wrapping_add(u64::from(unsafe {
+			core::ptr::read_volatile(buf.as_ptr().add(i))
+		}));
 		i += step;
 	}
 	return acc;
@@ -125,12 +129,10 @@ pub fn ipv4_interfaces() -> Vec<Ipv4Iface> {
 		while !p.is_null() {
 			let a = &*p;
 			let flags = a.ifa_flags;
-			let up = flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32
-				== (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+			let up =
+				flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32 == (libc::IFF_UP | libc::IFF_RUNNING) as u32;
 			let lo = flags & libc::IFF_LOOPBACK as u32 != 0;
-			let want = up
-				&& !lo && !a.ifa_addr.is_null()
-				&& (*a.ifa_addr).sa_family as i32 == libc::AF_INET;
+			let want = up && !lo && !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET;
 			if want {
 				let sin = &*a.ifa_addr.cast::<libc::sockaddr_in>();
 				let ip = u32::from_be(sin.sin_addr.s_addr);

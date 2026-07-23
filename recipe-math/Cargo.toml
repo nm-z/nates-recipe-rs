@@ -1,0 +1,13 @@
+[package]
+name = "recipe-math"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Recipe-owned deterministic scalar math programs"
+
+[dependencies]
+recipe-core = { path = "../recipe-core" }
+recipe-language = { path = "../recipe-language" }
+
+[lints.rust]
+unsafe_code = "forbid"

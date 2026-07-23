@@ -5,13 +5,7 @@ use core::ffi::c_void;
 use core::ptr;
 
 unsafe extern "C" {
-	fn launch_mae_grad(
-		pred: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_mae_grad(pred: *const c_void, target: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_huber_grad(
 		pred: *const c_void,
 		target: *const c_void,
@@ -48,13 +42,7 @@ unsafe extern "C" {
 		inv_n: *const c_void,
 		stream: *mut c_void,
 	);
-	fn launch_kl_div_loss(
-		log_p: *const c_void,
-		target: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_kl_div_loss(log_p: *const c_void, target: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_hinge(
 		scores: *const c_void,
 		labels: *const c_void,
@@ -96,12 +84,7 @@ unsafe extern "C" {
 }
 
 #[inline]
-pub fn gpu_mae_grad(
-	pred: &GpuBuffer,
-	target: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_mae_grad(pred: &GpuBuffer, target: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let ni = ci(n)?;
 	// SAFETY: buffers outlive the synchronous launch and n fits i32.
 	unsafe {
@@ -222,12 +205,7 @@ pub fn gpu_focal_grad_into(
 }
 
 #[inline]
-pub fn gpu_kl_div_loss(
-	log_p: &GpuBuffer,
-	target: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_kl_div_loss(log_p: &GpuBuffer, target: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: pointers reference live `GpuBuffer` allocations valid for the launch.
 	unsafe {
 		launch_kl_div_loss(

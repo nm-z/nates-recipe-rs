@@ -12,7 +12,12 @@ fn ram_probe_measures_mem_free() {
 		.lines()
 		.find_map(|l| return l.strip_prefix("MemTotal:"))
 		.and_then(|rest| {
-			return rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok();
+			return rest
+				.trim()
+				.trim_end_matches("kB")
+				.trim()
+				.parse::<usize>()
+				.ok();
 		})
 		.map(|kb| return kb.saturating_mul(1024))
 	else {

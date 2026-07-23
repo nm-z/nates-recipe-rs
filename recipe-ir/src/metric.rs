@@ -46,17 +46,11 @@ mod alias {
 	pub const HIP: LogItem = LogItem::Device;
 }
 
-pub use alias::{
-	ACCURACY as Accuracy, EPOCH as Epoch, HIP as hip, LOSS as Loss, LR as Lr, R_TWO as R2,
-	TIME as Time,
-};
-pub use alias::{
-	ACCURACY as accuracy, EPOCH as epoch, HIP as Hip, LOSS as loss, LR as lr, R_TWO as r2,
-	TIME as time,
-};
 pub use alias::ACCURACY as Acc;
+pub use alias::{ACCURACY as Accuracy, EPOCH as Epoch, HIP as hip, LOSS as Loss, LR as Lr, R_TWO as R2, TIME as Time};
+pub use alias::{ACCURACY as accuracy, EPOCH as epoch, HIP as Hip, LOSS as loss, LR as lr, R_TWO as r2, TIME as time};
 pub use alias::{
-	BCE as bce, CE as ce, ELU as elu, FOCAL as focal, GELU as gelu, HUBER as huber, LEAK as leak,
-	LINEAR as linear, MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu,
-	SIG as sig, SILU as silu, SWISH as swish, TANH as tanh,
+	BCE as bce, CE as ce, ELU as elu, FOCAL as focal, GELU as gelu, HUBER as huber, LEAK as leak, LINEAR as linear,
+	MAE as mae, MSE as mse, PRELU as prelu, RELU as relu, SELU as selu, SIG as sig, SILU as silu, SWISH as swish,
+	TANH as tanh,
 };

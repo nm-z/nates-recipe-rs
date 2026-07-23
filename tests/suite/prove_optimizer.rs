@@ -400,8 +400,7 @@ fn prove_adam() -> bool {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	gpu_core::kernels::gpu_adam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
-		.unwrap();
+	gpu_core::kernels::gpu_adam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv).unwrap();
 	let mut gw = vec![0.0; n];
 	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
@@ -477,8 +476,7 @@ fn prove_adamw() -> bool {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	gpu_core::kernels::gpu_adamw_update(&bg, &blr, &bb1, &bb2, &beps, &bwd, t, n, &bw, &bm, &bv)
-		.unwrap();
+	gpu_core::kernels::gpu_adamw_update(&bg, &blr, &bb1, &bb2, &beps, &bwd, t, n, &bw, &bm, &bv).unwrap();
 	let mut gw = vec![0.0; n];
 	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
@@ -548,8 +546,7 @@ fn prove_nadam() -> bool {
 		__ub.load(__up).unwrap();
 		__ub
 	};
-	gpu_core::optimizers::gpu_nadam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv)
-		.unwrap();
+	gpu_core::optimizers::gpu_nadam_update(&bg, &blr, &bb1, &bb2, &beps, t, n, &bw, &bm, &bv).unwrap();
 	let mut gw = vec![0.0; n];
 	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();
@@ -631,12 +628,10 @@ fn prove_lamb() -> bool {
 		__ub
 	};
 	gpu_core::optimizers::gpu_lamb_phase1(
-		&bg, &b1_b, &b2_b, &eps_b, &wd_b, t as usize, n, &bw, &bm, &bv, &tmp_upd, &w_norm_sq,
-		&u_norm_sq,
+		&bg, &b1_b, &b2_b, &eps_b, &wd_b, t as usize, n, &bw, &bm, &bv, &tmp_upd, &w_norm_sq, &u_norm_sq,
 	)
 	.unwrap();
-	gpu_core::optimizers::gpu_lamb_phase2(&tmp_upd, &lr_b, &w_norm_sq, &u_norm_sq, n, &bw)
-		.unwrap();
+	gpu_core::optimizers::gpu_lamb_phase2(&tmp_upd, &lr_b, &w_norm_sq, &u_norm_sq, n, &bw).unwrap();
 	let mut gw = vec![0.0; n];
 	unsafe { bw.download_async(&mut gw, ptr::null_mut()) }.unwrap();
 	gpu_core::hip::device_synchronize().unwrap();

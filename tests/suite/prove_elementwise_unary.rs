@@ -1,4 +1,3 @@
-
 use gpu_core::HipError;
 use gpu_core::memory::GpuBuffer;
 use std::collections::BTreeMap;
@@ -10,60 +9,15 @@ use std::ptr;
 unsafe extern "C" {
 	fn launch_elementwise_unaryx_sinc(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_elementwise_unaryx_frac(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_elementwise_unaryx_heaviside(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_signbit(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_isnan(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_isinf(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_isfinite(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_logit(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_expit(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_positive(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_unaryx_exp10(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_elementwise_unaryx_heaviside(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_signbit(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_isnan(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_isinf(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_isfinite(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_logit(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_expit(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_positive(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_unaryx_exp10(x: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);
@@ -128,17 +82,16 @@ fn registry() -> BTreeMap<&'static str, Op> {
 	use gpu_core::k_actx::{gpu_hardsigmoid, gpu_relu6, gpu_softsign};
 	use gpu_core::k_gapact::{gpu_hardswish, gpu_mish, gpu_selu, gpu_softplus};
 	use gpu_core::k_mathx::{
-		gpu_acos, gpu_acosh, gpu_asin, gpu_asinh, gpu_atan, gpu_atanh, gpu_cbrt, gpu_cosh,
-		gpu_deg2rad, gpu_erf, gpu_erfc, gpu_exp2, gpu_lgamma, gpu_log2, gpu_log10, gpu_rad2deg,
-		gpu_sinh, gpu_square,
+		gpu_acos, gpu_acosh, gpu_asin, gpu_asinh, gpu_atan, gpu_atanh, gpu_cbrt, gpu_cosh, gpu_deg2rad, gpu_erf,
+		gpu_erfc, gpu_exp2, gpu_lgamma, gpu_log2, gpu_log10, gpu_rad2deg, gpu_sinh, gpu_square,
 	};
 	use gpu_core::kernels::{
-		gpu_abs_into, gpu_exp, gpu_leaky_relu_into, gpu_log_into, gpu_neg, gpu_relu_into,
-		gpu_sigmoid_into, gpu_sign_into, gpu_silu_into, gpu_sqrt, gpu_tanh_into,
+		gpu_abs_into, gpu_exp, gpu_leaky_relu_into, gpu_log_into, gpu_neg, gpu_relu_into, gpu_sigmoid_into,
+		gpu_sign_into, gpu_silu_into, gpu_sqrt, gpu_tanh_into,
 	};
 	use gpu_core::math_ops::{
-		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round,
-		gpu_rsqrt, gpu_sin, gpu_tan, gpu_trunc,
+		gpu_ceil, gpu_cos, gpu_expm1, gpu_floor, gpu_log1p, gpu_reciprocal, gpu_round, gpu_rsqrt, gpu_sin, gpu_tan,
+		gpu_trunc,
 	};
 
 	fn selu_w(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
@@ -474,8 +427,7 @@ fn prove_elementwise_unary() {
 		}
 	}
 
-	let implemented =
-		"sinc,frac,heaviside,signbit,isnan,isinf,isfinite,logit,expit,positive,exp10";
+	let implemented = "sinc,frac,heaviside,signbit,isnan,isinf,isfinite,logit,expit,positive,exp10";
 	eprintln!("PROVE elementwise_unary: {proven} / {total}");
 	for f in &failures {
 		eprintln!("  FAIL {f}");
@@ -487,7 +439,5 @@ fn prove_elementwise_unary() {
 		failures
 	);
 	assert_eq!(proven, total, "every registered op must match its oracle");
-	eprintln!(
-		"RESULT elementwise_unary: proven={proven} total={total} green=true implemented={implemented}"
-	);
+	eprintln!("RESULT elementwise_unary: proven={proven} total={total} green=true implemented={implemented}");
 }

@@ -7,34 +7,10 @@ use std::fs;
 use std::ptr;
 
 unsafe extern "C" {
-	fn launch_elementwise_binaryx_pow(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_hypot(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_fmax(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_fmin(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_elementwise_binaryx_pow(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_hypot(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_fmax(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_fmin(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_elementwise_binaryx_copysign(
 		a: *const c_void,
 		b: *const c_void,
@@ -84,20 +60,8 @@ unsafe extern "C" {
 		n: i32,
 		s: *mut c_void,
 	);
-	fn launch_elementwise_binaryx_ldexp(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_xlogy(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_elementwise_binaryx_ldexp(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_xlogy(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_elementwise_binaryx_xlog1py(
 		a: *const c_void,
 		b: *const c_void,
@@ -112,27 +76,9 @@ unsafe extern "C" {
 		n: i32,
 		s: *mut c_void,
 	);
-	fn launch_elementwise_binaryx_ge(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_le(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
-	fn launch_elementwise_binaryx_ne(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_elementwise_binaryx_ge(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_le(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
+	fn launch_elementwise_binaryx_ne(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type Launch = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, *mut c_void);
@@ -211,9 +157,7 @@ fn run_wrap(f: GpuBin, a: &[f64], b: &[f64]) -> Vec<f64> {
 }
 
 fn registry() -> HashMap<&'static str, BinOp> {
-	use gpu_core::kernels::{
-		gpu_add_into, gpu_div_into, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub,
-	};
+	use gpu_core::kernels::{gpu_add_into, gpu_div_into, gpu_eq, gpu_gt, gpu_lt, gpu_mul, gpu_sub};
 	use gpu_core::math_ops::{gpu_atan2, gpu_fmod, gpu_max, gpu_min};
 	let mut m: HashMap<&'static str, BinOp> = HashMap::new();
 	macro_rules! w {

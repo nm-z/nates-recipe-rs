@@ -52,9 +52,7 @@ impl Drop for Data {
 pub(crate) fn parked_data() -> Data {
 	let inner = PARKED_DATA.with(|slot| slot.borrow_mut().take());
 	let inner = inner.unwrap_or_else(|| {
-		Write::error(
-			"run: no data configured — chain recipe.data(path) before run(data, …)",
-		);
+		Write::error("run: no data configured — chain recipe.data(path) before run(data, …)");
 		Box::new(DataInner::blank())
 	});
 	Data { inner }
@@ -90,7 +88,7 @@ struct CardCount {
 pub struct DataInner {
 	pub target: String,
 	target_names: Vec<String>,
-	pub(crate) parsed: Vec<pantry::formats::ParsedData>,
+	pub(crate) parsed: Vec<pantry::formats::UsrData>,
 	sources: Vec<String>,
 	test_path: Option<String>,
 	split_frac: Option<f64>,
@@ -135,80 +133,60 @@ fn empty_dataset() -> Dataset {
 	}
 }
 
-fn table_from_parsed(sets: &[pantry::formats::ParsedData]) -> (Vec<Attr>, Vec<Vec<String>>) {
-	use pantry::formats::{DataType, DataVec};
-	let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-	for set in sets {
-		for group in &set.groups {
-			for column in &group.columns {
-				*counts.entry(column.name.as_str()).or_default() += 1;
+fn attrs_from_group(group: &pantry::formats::DataGroup) -> Vec<Attr> {
+	use pantry::formats::DataType;
+	return group
+		.columns
+		.iter()
+		.map(|v| {
+			let vals: &[String] = v.values.text().unwrap_or(&[]);
+			let kind = match v.kind {
+				DataType::Numeric => Kind::Numeric,
+				DataType::Temporal => Kind::Temporal,
+				DataType::Image => Kind::Image,
+				DataType::Categoric => {
+					let mut cats: Vec<String> = vals
+						.iter()
+						.filter(|s| !s.is_empty())
+						.cloned()
+						.collect::<std::collections::BTreeSet<_>>()
+						.into_iter()
+						.collect();
+					cats.sort();
+					Kind::Categorical(cats)
+				}
+				DataType::Ordinal => {
+					let mut ord: Vec<String> = vals
+						.iter()
+						.filter(|s| !s.is_empty())
+						.cloned()
+						.collect::<std::collections::BTreeSet<_>>()
+						.into_iter()
+						.collect();
+					ord.sort_by(|a, b| match (a.parse::<i64>(), b.parse::<i64>()) {
+						(Ok(x), Ok(y)) => x.cmp(&y),
+						_ => a.cmp(b),
+					});
+					Kind::Ordinal(ord)
+				}
+				DataType::Text => {
+					let vocab: Vec<String> = vals
+						.iter()
+						.flat_map(|s| s.split(|c: char| !c.is_alphanumeric()))
+						.filter(|t| !t.is_empty())
+						.map(String::from)
+						.collect::<std::collections::BTreeSet<_>>()
+						.into_iter()
+						.collect();
+					Kind::Text(vocab)
+				}
+			};
+			Attr {
+				name: v.name.clone(),
+				kind,
 			}
-		}
-	}
-	let mut named: Vec<(String, &DataVec)> = Vec::new();
-	for set in sets {
-		for group in &set.groups {
-			for column in &group.columns {
-				let collides = counts.get(column.name.as_str()).copied().unwrap_or(0) > 1;
-				let name = if collides && !group.member.is_empty() {
-					format!("{}:{}", group.member, column.name)
-				} else {
-					column.name.clone()
-				};
-				named.push((name, column));
-			}
-		}
-	}
-	let nrows = named.iter().map(|(_n, v)| v.values.len()).max().unwrap_or(0);
-	let attrs: Vec<Attr> = named.iter().map(|(name, v)| {
-		let kind = match v.kind {
-			DataType::Numeric => Kind::Numeric,
-			DataType::Temporal => Kind::Temporal,
-			DataType::Image => Kind::Image,
-			DataType::Categoric => {
-				let mut cats: Vec<String> = v.values.iter()
-					.filter(|s| !s.is_empty())
-					.cloned()
-					.collect::<std::collections::BTreeSet<_>>()
-					.into_iter()
-					.collect();
-				cats.sort();
-				Kind::Categorical(cats)
-			}
-			DataType::Ordinal => {
-				let mut vals: Vec<String> = v.values.iter()
-					.filter(|s| !s.is_empty())
-					.cloned()
-					.collect::<std::collections::BTreeSet<_>>()
-					.into_iter()
-					.collect();
-				vals.sort_by(|a, b| match (a.parse::<i64>(), b.parse::<i64>()) {
-					(Ok(x), Ok(y)) => x.cmp(&y),
-					_ => a.cmp(b),
-				});
-				Kind::Ordinal(vals)
-			}
-			DataType::Text => {
-				let vocab: Vec<String> = v.values.iter()
-					.flat_map(|s| s.split(|c: char| !c.is_alphanumeric()))
-					.filter(|t| !t.is_empty())
-					.map(String::from)
-					.collect::<std::collections::BTreeSet<_>>()
-					.into_iter()
-					.collect();
-				Kind::Text(vocab)
-			}
-		};
-		Attr { name: name.clone(), kind }
-	}).collect();
-	let mut rows: Vec<Vec<String>> = Vec::with_capacity(nrows);
-	for r in 0..nrows {
-		let row: Vec<String> = named.iter()
-			.map(|(_n, v)| v.values.get(r).cloned().unwrap_or_default())
-			.collect();
-		rows.push(row);
-	}
-	return (attrs, rows);
+		})
+		.collect();
 }
 
 impl Data {
@@ -222,7 +200,13 @@ impl Data {
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
 		match pantry::formats::load(path) {
-			Ok(parsed) => self.inner.parsed.push(parsed),
+			Ok(mut usr) => {
+				let typed = pantry::formats::assign_kinds(&mut usr, recipe_runtime::execute::detector_forward);
+				match typed {
+					Ok(()) => self.inner.parsed.push(usr),
+					Err(e) => self.inner.defer(e),
+				}
+			}
 			Err(e) => self.inner.defer(e),
 		}
 		self
@@ -266,21 +250,29 @@ impl DataInner {
 	}
 
 	fn raw_test(&self) -> Option<&RawTest> {
-		return self.test_raw
+		return self
+			.test_raw
 			.get_or_init(|| {
 				let tp = self.test_path.as_ref()?;
-				let parsed = pantry::formats::load(tp).ok()?;
-				let (attrs, rows) = table_from_parsed(std::slice::from_ref(&parsed));
-				if attrs.is_empty() {
+				let usr = pantry::formats::load(tp).ok()?;
+				let names: Vec<String> = self
+					.parsed
+					.iter()
+					.flat_map(|u| u.groups.iter())
+					.flat_map(|g| g.columns.iter())
+					.map(|c| c.name.clone())
+					.collect();
+				let group = usr.related_group(&names).ok()?;
+				let rows = group.text_rows().ok()?;
+				let headers: Vec<String> = group
+					.header_names()
+					.iter()
+					.map(|h| h.trim().to_string())
+					.collect();
+				if headers.is_empty() {
 					return None;
 				}
-				return Some(RawTest {
-					headers: attrs
-						.into_iter()
-						.map(|a| a.name.trim().to_string())
-						.collect(),
-					rows,
-				});
+				return Some(RawTest { headers, rows });
 			})
 			.as_ref();
 	}
@@ -430,11 +422,8 @@ impl DataInner {
 		for test in test.into_iter() {
 			match &self.test_path {
 				Some(tp) => {
-					let test_raw_cols =
-						self.raw_test().map_or(raw_cols, |t| t.headers.len());
-					let test_raw_rows = self
-						.raw_test()
-						.map_or(test.x.nrows(), |t| t.rows.len());
+					let test_raw_cols = self.raw_test().map_or(raw_cols, |t| t.headers.len());
+					let test_raw_rows = self.raw_test().map_or(test.x.nrows(), |t| t.rows.len());
 					Write::line(data, &format!("test  {}", short(tp)));
 					Write::line(
 						data,
@@ -446,20 +435,13 @@ impl DataInner {
 						),
 					);
 					print_types("        ");
-					Write::line(
-						data,
-						&format!("    {} features -> model", test.x.ncols()),
-					);
+					Write::line(data, &format!("    {} features -> model", test.x.ncols()));
 				}
 				None => {
 					for _frac in self.split_frac.iter() {
 						Write::line(
 							data,
-							&format!(
-								"split  {} train / {} test",
-								train.x.nrows(),
-								test.x.nrows(),
-							),
+							&format!("split  {} train / {} test", train.x.nrows(), test.x.nrows(),),
 						);
 					}
 				}
@@ -475,15 +457,45 @@ impl DataInner {
 			.as_ref()
 			.map(|e| anyhow::anyhow!("{e:#}"))
 			.map_or(Ok(()), Err)?;
-		let (attrs, rows) = table_from_parsed(&self.parsed);
-		let mut prepared = if attrs.is_empty() {
-			self.prepare_table()?
-		} else {
-			let sets = self.prepare_encoded(&attrs, &rows)?;
-			PreparedSets {
-				train: sets.train,
-				test: sets.test,
-				attrs,
+		let mut groups_iter = self.parsed.iter().flat_map(|u| u.groups.iter());
+		let first = groups_iter.next();
+		let second = groups_iter.next();
+		let mut prepared = match (first, second) {
+			(None, _) => self.prepare_table()?,
+			(Some(group), None) if group.columns.iter().all(|c| c.values.text().is_some()) => {
+				let attrs = attrs_from_group(group);
+				let rows = group.text_rows()?;
+				let sets = self.prepare_encoded(&attrs, &rows)?;
+				PreparedSets {
+					train: sets.train,
+					test: sets.test,
+					attrs,
+				}
+			}
+			_ => {
+				let (set_groups, pre) = pantry::formats::to_dir_groups(&self.parsed)?;
+				let test_groups = match self.test_path.as_deref() {
+					Some(tp) => {
+						let tusr = pantry::formats::load(tp)?;
+						let (tg, _tpre) = pantry::formats::to_dir_groups(std::slice::from_ref(&tusr))?;
+						Some((tg, tp.to_string()))
+					}
+					None => None,
+				};
+				let table = pantry::encode::prepare_groups_data(
+					set_groups,
+					test_groups,
+					self.split_frac,
+					&self.exclude,
+					&self.source_label(),
+					Some(pre.as_slice()),
+					|s, t| self.resolve_targets(s, t),
+				)?;
+				PreparedSets {
+					train: table.train,
+					test: table.test,
+					attrs: table.attrs,
+				}
 			}
 		};
 		pantry::encode::clean_dataset(&mut prepared.train)?;
@@ -551,11 +563,7 @@ impl DataInner {
 		})
 	}
 
-	fn resolve_targets(
-		&self,
-		set_names: &[String],
-		test_names: Option<&[String]>,
-	) -> anyhow::Result<Vec<String>> {
+	fn resolve_targets(&self, set_names: &[String], test_names: Option<&[String]>) -> anyhow::Result<Vec<String>> {
 		match self.target_names.first() {
 			Some(_first) => self
 				.target_names
@@ -565,11 +573,8 @@ impl DataInner {
 						.iter()
 						.find(|n| {
 							n.as_str() == want
-								|| n.ends_with(&format!(":{want}")) || n
-								.rsplit(':')
-								.next() == Some(
-								want.as_str(),
-							)
+								|| n.ends_with(&format!(":{want}")) || n.rsplit(':').next()
+								== Some(want.as_str())
 						})
 						.cloned()
 						.ok_or_else(|| {

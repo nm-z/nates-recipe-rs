@@ -68,14 +68,7 @@ unsafe extern "C" {
 		head_dim: i32,
 		stream: *mut c_void,
 	);
-	fn launch_rope(
-		x: *const c_void,
-		out: *mut c_void,
-		seq: i32,
-		dim: i32,
-		base: *const c_void,
-		stream: *mut c_void,
-	);
+	fn launch_rope(x: *const c_void, out: *mut c_void, seq: i32, dim: i32, base: *const c_void, stream: *mut c_void);
 	fn launch_positional_encoding(out: *mut c_void, seq: i32, dim: i32, stream: *mut c_void);
 	fn launch_rmsnorm(
 		x: *const c_void,
@@ -249,13 +242,7 @@ pub fn gpu_mha_merge(
 }
 
 #[inline]
-pub fn gpu_rope(
-	x: &GpuBuffer,
-	seq: usize,
-	dim: usize,
-	base: &GpuBuffer,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_rope(x: &GpuBuffer, seq: usize, dim: usize, base: &GpuBuffer, out: &GpuBuffer) -> Result<(), HipError> {
 	let seq_i = ci(seq)?;
 	let dim_i = ci(dim)?;
 	// SAFETY: launch args are valid device pointers and checked i32 extents.

@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
 use gpu_core::HipError;
 use gpu_core::kernels::*;
-use ogdl::log::{Write, epoch};
 use gpu_core::memory::GpuBuffer;
+use ogdl::log::{Write, epoch};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use std::fmt;
@@ -99,13 +99,7 @@ pub struct Model {
 	pub n_eff_features: usize,
 }
 
-fn validate_regression(
-	x: &[f64],
-	y: &[f64],
-	n: usize,
-	p: usize,
-	params: &Params,
-) -> Result<(), Error> {
+fn validate_regression(x: &[f64], y: &[f64], n: usize, p: usize, params: &Params) -> Result<(), Error> {
 	if n == 0 {
 		return Err(Error::InvalidInput("n must be > 0".into()));
 	}
@@ -240,12 +234,7 @@ fn quantize(x: &[f64], n: usize, p: usize, borders: &[Vec<f32>]) -> Vec<Vec<u8>>
 	.collect()
 }
 
-fn efb_bundle(
-	bins: &[Vec<u8>],
-	n: usize,
-	p: usize,
-	max_conflict: f64,
-) -> (Vec<(usize, u8)>, Vec<Vec<u8>>, usize) {
+fn efb_bundle(bins: &[Vec<u8>], n: usize, p: usize, max_conflict: f64) -> (Vec<(usize, u8)>, Vec<Vec<u8>>, usize) {
 	let nonzero_counts: Vec<usize> = (0..p)
 		.map(|j| bins[j].iter().filter(|&&b| b > 0).count())
 		.collect();
@@ -957,8 +946,7 @@ pub fn predict_proba(model: &Model, x: &[f64], n: usize) -> Result<Vec<f64>, Err
 
 	let mut logits = vec![0.0f64; n * nc];
 	for k in 0..nc {
-		let (feature, thresh, left, right, is_leaf, value, roots) =
-			flatten_forest(&model.trees[k]);
+		let (feature, thresh, left, right, is_leaf, value, roots) = flatten_forest(&model.trees[k]);
 		let n_trees = roots.len();
 		let feature_gpu = GpuBuffer::upload_i32(&feature)?;
 		let thresh_gpu = GpuBuffer::upload_i32(&thresh)?;
@@ -1085,10 +1073,8 @@ mod tests {
 		let probs = predict_proba(&model, &xdata, n).unwrap();
 		let correct = (0..n)
 			.filter(|&i| {
-				(0..3).max_by(|&a, &b| {
-					probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap()
-				})
-				.unwrap() == y[i]
+				(0..3).max_by(|&a, &b| probs[i * 3 + a].partial_cmp(&probs[i * 3 + b]).unwrap())
+					.unwrap() == y[i]
 			})
 			.count();
 		let acc = correct as f64 / n as f64;

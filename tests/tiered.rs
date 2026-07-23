@@ -107,18 +107,8 @@ fn tiled_full_batch_runs_and_matches_whole() {
 	for _ in 0..epochs {
 		kernels::gpu_linear_into(&x_dev, &w_ref, &b_ref, n, o, d, &yhat).expect("enq");
 		kernels::gpu_sub_inplace(&y_dev, n * o, &yhat).expect("enq");
-		kernels::gpu_linear_backward_weights_only_into(
-			&yhat,
-			&x_dev,
-			&reduce_ws,
-			&dw_partials,
-			n,
-			o,
-			d,
-			&dw,
-			&db,
-		)
-		.expect("enq");
+		kernels::gpu_linear_backward_weights_only_into(&yhat, &x_dev, &reduce_ws, &dw_partials, n, o, d, &dw, &db)
+			.expect("enq");
 		kernels::gpu_sgd_update(&dw, &neg_scale, d * o, &w_ref).expect("enq");
 		kernels::gpu_sgd_update(&db, &neg_scale, o, &b_ref).expect("enq");
 	}

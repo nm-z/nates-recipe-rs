@@ -26,13 +26,7 @@ unsafe extern "C" {
 	fn launch_specialx_ndtr(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_specialx_ndtri(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 	fn launch_specialx_sinpi(x: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
-	fn launch_specialx_xlogy(
-		x: *const c_void,
-		y: *const c_void,
-		o: *mut c_void,
-		n: i32,
-		s: *mut c_void,
-	);
+	fn launch_specialx_xlogy(x: *const c_void, y: *const c_void, o: *mut c_void, n: i32, s: *mut c_void);
 }
 
 type Launch = unsafe extern "C" fn(*const c_void, *mut c_void, i32, *mut c_void);

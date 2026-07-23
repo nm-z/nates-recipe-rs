@@ -3,8 +3,6 @@ use crate::HipError;
 use crate::bridge::open_spill;
 use crate::callspy;
 use crate::hip;
-use ogdl::log::Write;
-use ogdl::log::data;
 use crate::memory;
 use crate::memory::tag_note_alloc;
 use core::cmp;
@@ -13,6 +11,8 @@ use core::fmt;
 use core::iter;
 use core::num::NonZeroUsize;
 use core::ptr;
+use ogdl::log::Write;
+use ogdl::log::data;
 use std::fs;
 use std::fs::File;
 use std::os::unix::fs::FileExt as _;
@@ -103,13 +103,16 @@ impl Budgets {
 		let ram_data = ram_avail
 			.saturating_sub(crate::memory::USER_GB)
 			.saturating_sub(host_mirror);
-		Write::line(data, format!(
-			"RAM headroom: MemAvailable {:.2} GB, reserve {:.2} GB, host-mirror {:.2} GB, RAM budget {:.2} GB",
-			ram_avail as f64 / 1e9,
-			crate::memory::USER_GB as f64 / 1e9,
-			host_mirror as f64 / 1e9,
-			ram_data as f64 / 1e9
-		));
+		Write::line(
+			data,
+			format!(
+				"RAM headroom: MemAvailable {:.2} GB, reserve {:.2} GB, host-mirror {:.2} GB, RAM budget {:.2} GB",
+				ram_avail as f64 / 1e9,
+				crate::memory::USER_GB as f64 / 1e9,
+				host_mirror as f64 / 1e9,
+				ram_data as f64 / 1e9
+			),
+		);
 
 		let dir = spill
 			.parent()
@@ -129,12 +132,7 @@ impl Budgets {
 }
 
 #[inline]
-pub fn admit(
-	b: usize,
-	weights_bytes: usize,
-	grad_bytes: usize,
-	spill: &Path,
-) -> Result<Budgets, Full> {
+pub fn admit(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Result<Budgets, Full> {
 	let bud = Budgets::measure(weights_bytes, grad_bytes, spill);
 	match b.cmp(&bud.cap) {
 		cmp::Ordering::Greater => {
@@ -173,12 +171,7 @@ unsafe impl Send for Tiered {}
 
 impl Tiered {
 	#[inline]
-	pub fn alloc(
-		b: usize,
-		weights_bytes: usize,
-		grad_bytes: usize,
-		spill: &Path,
-	) -> Result<Self, Full> {
+	pub fn alloc(b: usize, weights_bytes: usize, grad_bytes: usize, spill: &Path) -> Result<Self, Full> {
 		let budgets = Budgets::measure(weights_bytes, grad_bytes, spill);
 		match b.cmp(&budgets.cap) {
 			cmp::Ordering::Greater => {
@@ -206,14 +199,7 @@ impl Tiered {
 		return Self::build(b, n_pg, gpu_pages, ram_pages, budgets, spill);
 	}
 
-	fn build(
-		b: usize,
-		n_pg: usize,
-		gpu_pages: usize,
-		ram_pages: usize,
-		budgets: Budgets,
-		spill: &Path,
-	) -> Self {
+	fn build(b: usize, n_pg: usize, gpu_pages: usize, ram_pages: usize, budgets: Budgets, spill: &Path) -> Self {
 		let n_disk = n_pg - gpu_pages - ram_pages;
 
 		let (va, handles): (*mut c_void, Vec<*mut c_void>) = NonZeroUsize::new(gpu_pages)
@@ -230,10 +216,7 @@ impl Tiered {
 			cmp::Ordering::Greater => match open_spill(spill) {
 				Ok(f) => {
 					let disk_bytes = u64::try_from(n_disk * P).unwrap_or_else(|e| {
-						Write::error(format!(
-							"spill size {} overflows u64: {e}",
-							n_disk * P
-						));
+						Write::error(format!("spill size {} overflows u64: {e}", n_disk * P));
 						0
 					});
 					f.set_len(disk_bytes).unwrap_or_else(|e| {
@@ -264,10 +247,7 @@ impl Tiered {
 		}
 		for i in 0..n_disk {
 			res.push(Residence::Disk(u64::try_from(i * P).unwrap_or_else(|e| {
-				Write::error(format!(
-					"disk offset {} overflows u64: {e}",
-					i * P
-				));
+				Write::error(format!("disk offset {} overflows u64: {e}", i * P));
 				0
 			})));
 		}
@@ -318,9 +298,7 @@ impl Tiered {
 	#[inline]
 	pub fn device_ptr(&self) -> *mut c_void {
 		if !self.is_contiguous_vram() {
-			Write::error(
-				"device_ptr on a spilled buffer \u{2014} stage pages instead",
-			);
+			Write::error("device_ptr on a spilled buffer \u{2014} stage pages instead");
 			return ptr::null_mut();
 		}
 		return self.va;
@@ -421,12 +399,11 @@ impl Tiered {
 							.cast_const()
 					};
 					// SAFETY: src and dst are valid for chunk bytes and both live on the device.
-					unsafe {
-						xfer(dst, src, chunk, hip::HIP_MEMCPY_D2D, ptr::null_mut())
-					}
-					.unwrap_or_else(|e| {
-						Write::error(format!("stage_bytes D2D: {e}"));
-					});
+					unsafe { xfer(dst, src, chunk, hip::HIP_MEMCPY_D2D, ptr::null_mut()) }.unwrap_or_else(
+						|e| {
+							Write::error(format!("stage_bytes D2D: {e}"));
+						},
+					);
 				}
 				Residence::Ram(i) => {
 					// SAFETY: poff < P keeps the read within the resident RAM page.
@@ -437,12 +414,11 @@ impl Tiered {
 							.cast::<c_void>()
 					};
 					// SAFETY: src and dst are valid for chunk bytes; H2D from host RAM into the window.
-					unsafe {
-						xfer(dst, src, chunk, hip::HIP_MEMCPY_H2D, ptr::null_mut())
-					}
-					.unwrap_or_else(|e| {
-						Write::error(format!("stage_bytes H2D: {e}"));
-					});
+					unsafe { xfer(dst, src, chunk, hip::HIP_MEMCPY_H2D, ptr::null_mut()) }.unwrap_or_else(
+						|e| {
+							Write::error(format!("stage_bytes H2D: {e}"));
+						},
+					);
 				}
 				Residence::Disk(diskoff) => {
 					let Some(f) = self.disk.as_ref() else {
@@ -491,9 +467,7 @@ impl Tiered {
 							let slot = match usize::try_from(s) {
 								Ok(v) => v,
 								Err(_) => {
-									Write::error(format!(
-										"stage_into vram slot {s} overflows usize"
-									));
+									Write::error(format!("stage_into vram slot {s} overflows usize"));
 									return;
 								}
 							};
@@ -507,13 +481,7 @@ impl Tiered {
 							};
 							// SAFETY: src and dst are valid device pointers for the copy length
 							unsafe {
-								memory::xfer(
-									dst,
-									src,
-									bytes,
-									hip::HIP_MEMCPY_D2D,
-									ptr::null_mut(),
-								)
+								memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_D2D, ptr::null_mut())
 							}
 							.unwrap_or_else(|e| {
 								Write::error(format!("stage D2D: {e}"));
@@ -523,25 +491,17 @@ impl Tiered {
 							let ri = match usize::try_from(i) {
 								Ok(v) => v,
 								Err(_) => {
-									Write::error(format!(
-										"stage_into ram index {i} overflows usize"
-									));
+									Write::error(format!("stage_into ram index {i} overflows usize"));
 									return;
 								}
 							};
 							// SAFETY: src points into a live RAM page; dst is a valid device pointer
 							unsafe {
 								let src = self.ram[ri].as_ptr().cast::<c_void>();
-								memory::xfer(
-									dst,
-									src,
-									bytes,
-									hip::HIP_MEMCPY_H2D,
-									ptr::null_mut(),
-								)
-								.unwrap_or_else(|e| {
-									Write::error(format!("stage H2D: {e}"));
-								});
+								memory::xfer(dst, src, bytes, hip::HIP_MEMCPY_H2D, ptr::null_mut())
+									.unwrap_or_else(|e| {
+										Write::error(format!("stage H2D: {e}"));
+									});
 							}
 						}
 						Residence::Disk(off) => {
@@ -563,9 +523,7 @@ impl Tiered {
 									ptr::null_mut(),
 								)
 								.unwrap_or_else(|e| {
-									Write::error(format!(
-										"stage disk H2D: {e}"
-									));
+									Write::error(format!("stage disk H2D: {e}"));
 								});
 							}
 						}

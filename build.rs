@@ -1,83 +1,138 @@
 use std::env;
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::process;
 
-enum Platform {
+#[derive(Clone, Copy, Debug)]
+enum Facade {
+	Legacy,
+	Next,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyPlatform {
 	Amd,
 	Nvidia,
 }
 
-fn put(s: &str) {
-	use std::io::Write as _;
-	let mut o = io::stdout();
-	drop(o.write_all(s.as_bytes()));
-	drop(o.write_all(b"\n"));
+#[derive(Debug)]
+enum BuildError {
+	FacadeMissing,
+	FacadeConflict,
+	Legacy(String),
 }
 
-fn hipconfig(flag: &str) -> Result<String, String> {
-	let out = match process::Command::new("hipconfig").arg(flag).output() {
-		Ok(out) => out,
-		Err(e) if e.kind() == io::ErrorKind::NotFound => {
-			return Err(
-				"hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia"
-					.to_owned(),
-			);
+impl fmt::Display for BuildError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::FacadeMissing => f.write_str("select exactly one Recipe facade: `legacy` or `next`"),
+			Self::FacadeConflict => f.write_str(
+				"`legacy` and `next` are mutually exclusive; use \
+				 `--no-default-features --features next` for the clean build",
+			),
+			Self::Legacy(message) => message.fmt(f),
 		}
-		Err(e) => return Err(format!("hipconfig {flag}: cannot run: {e}")),
+	}
+}
+
+impl Error for BuildError {}
+
+fn selected_facade() -> Result<Facade, BuildError> {
+	let legacy = env::var_os("CARGO_FEATURE_LEGACY").is_some();
+	let next = env::var_os("CARGO_FEATURE_NEXT").is_some();
+	match (legacy, next) {
+		(true, false) => Ok(Facade::Legacy),
+		(false, true) => Ok(Facade::Next),
+		(false, false) => Err(BuildError::FacadeMissing),
+		(true, true) => Err(BuildError::FacadeConflict),
+	}
+}
+
+fn source_revision() -> String {
+	match env::var_os("RECIPE_GIT_HASH") {
+		Some(revision) => revision.to_string_lossy().into_owned(),
+		None => "unrecorded".to_owned(),
+	}
+}
+
+fn put(value: &str) {
+	use std::io::Write as _;
+
+	let mut output = io::stdout();
+	drop(output.write_all(value.as_bytes()));
+	drop(output.write_all(b"\n"));
+}
+
+fn legacy_command(flag: &str) -> Result<String, BuildError> {
+	let output = match process::Command::new("hipconfig").arg(flag).output() {
+		Ok(output) => output,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			return Err(BuildError::Legacy(
+				"hipconfig not found; install hip-runtime-amd or hip-runtime-nvidia".to_owned(),
+			));
+		}
+		Err(error) => {
+			return Err(BuildError::Legacy(format!(
+				"hipconfig {flag}: cannot run: {error}"
+			)));
+		}
 	};
-	if !out.status.success() {
-		return Err(format!(
+	if !output.status.success() {
+		return Err(BuildError::Legacy(format!(
 			"hipconfig {flag}: {}",
-			String::from_utf8_lossy(&out.stderr)
-		));
+			String::from_utf8_lossy(&output.stderr)
+		)));
 	}
-	return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
+	Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn rocm_path() -> Result<String, String> {
-	let p = hipconfig("--rocmpath")?;
-	if p.is_empty() {
-		return Err("hipconfig --rocmpath: empty output".to_owned());
+fn legacy_rocm_path() -> Result<String, BuildError> {
+	let path = legacy_command("--rocmpath")?;
+	if path.is_empty() {
+		Err(BuildError::Legacy(
+			"hipconfig --rocmpath: empty output".to_owned(),
+		))
+	} else {
+		Ok(path)
 	}
-	return Ok(p);
 }
 
-fn main() -> Result<(), String> {
+fn legacy_revision() -> Result<String, BuildError> {
 	let hash = process::Command::new("git")
 		.args(["rev-parse", "--short", "HEAD"])
 		.output()
 		.ok()
-		.filter(|o| o.status.success())
-		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-		.ok_or("git rev-parse --short HEAD failed")?;
+		.filter(|output| output.status.success())
+		.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+		.ok_or_else(|| BuildError::Legacy("git rev-parse --short HEAD failed".to_owned()))?;
 	let dirty = process::Command::new("git")
 		.args(["status", "--porcelain"])
 		.output()
 		.ok()
-		.filter(|o| o.status.success())
-		.map(|o| !o.stdout.is_empty())
-		.ok_or("git status --porcelain failed")?;
-	let suffix = match dirty {
-		true => "-dirty",
-		false => "",
-	};
-	put(&format!("cargo:rustc-env=GIT_HASH={hash}{suffix}"));
+		.filter(|output| output.status.success())
+		.map(|output| !output.stdout.is_empty())
+		.ok_or_else(|| BuildError::Legacy("git status --porcelain failed".to_owned()))?;
+	Ok(format!("{hash}{}", if dirty { "-dirty" } else { "" }))
+}
+
+fn legacy_build() -> Result<(), BuildError> {
+	put(&format!("cargo:rustc-env=GIT_HASH={}", legacy_revision()?));
 	put("cargo:rerun-if-changed=.git/HEAD");
-	let platform = match hipconfig("--platform")?.as_str() {
-		"amd" => Platform::Amd,
-		"nvidia" => Platform::Nvidia,
+	let platform = match legacy_command("--platform")?.as_str() {
+		"amd" => LegacyPlatform::Amd,
+		"nvidia" => LegacyPlatform::Nvidia,
 		other => {
-			return Err(format!(
+			return Err(BuildError::Legacy(format!(
 				"hipconfig --platform returned {other:?}; install hip-runtime-amd or hip-runtime-nvidia"
-			));
+			)));
 		}
 	};
 	match platform {
-		Platform::Nvidia => {
-			let rocm = rocm_path()?;
-			let cuda =
-				env::var("CUDA_PATH").unwrap_or_else(|_e| return "/opt/cuda".to_owned());
+		LegacyPlatform::Nvidia => {
+			let rocm = legacy_rocm_path()?;
+			let cuda = env::var("CUDA_PATH").unwrap_or_else(|_| "/opt/cuda".to_owned());
 			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
 			put("cargo:rustc-link-lib=dylib=hipblas");
 			put("cargo:rustc-link-lib=dylib=hipsolver");
@@ -89,10 +144,9 @@ fn main() -> Result<(), String> {
 			put("cargo:rustc-link-lib=dylib=cufft");
 			put("cargo:rustc-link-lib=dylib=stdc++");
 		}
-		Platform::Amd => {
-			let rocm = rocm_path()?;
-			let rocm_extra =
-				env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_e| format!("{rocm}/lib"));
+		LegacyPlatform::Amd => {
+			let rocm = legacy_rocm_path()?;
+			let rocm_extra = env::var("ROCM_EXTRA_LIB").unwrap_or_else(|_| format!("{rocm}/lib"));
 			put(&format!("cargo:rustc-link-search=native={rocm}/lib"));
 			put("cargo:rustc-link-lib=dylib=amdhip64");
 			put(&format!("cargo:rustc-link-search=native={rocm_extra}"));
@@ -102,6 +156,10 @@ fn main() -> Result<(), String> {
 			put("cargo:rustc-link-lib=dylib=stdc++");
 		}
 	}
+	legacy_source_audit("src")
+}
+
+fn legacy_source_audit(directory: &str) -> Result<(), BuildError> {
 	let banned = ["hipMalloc(", "hipFree("];
 	let allowed = [
 		"hipMallocAsync",
@@ -110,46 +168,54 @@ fn main() -> Result<(), String> {
 		"fn hipMalloc",
 		"fn hipFree",
 	];
-	for entry in walkdir("src") {
+	for entry in walkdir(directory) {
 		let text = fs::read_to_string(&entry).unwrap_or_default();
-		let mut lineno = 0usize;
-		for line in text.lines() {
-			lineno = lineno.saturating_add(1);
+		for (index, line) in text.lines().enumerate() {
 			let code = !line.trim().starts_with("//");
-			for pat in &banned {
-				let hit =
-					code && line.contains(pat)
-						&& !allowed.iter().any(|a| return line.contains(a));
-				if !hit {
-					continue;
+			for pattern in &banned {
+				let permitted = allowed.iter().any(|allowed| line.contains(allowed));
+				if code && line.contains(pattern) && !permitted {
+					return Err(BuildError::Legacy(format!(
+						"{}:{}: synchronous {} banned in training crate - use hipMallocAsync/hipFreeAsync",
+						entry,
+						index + 1,
+						pattern.trim_end_matches('('),
+					)));
 				}
-				return Err(format!(
-					"{}:{}: synchronous {} banned in training crate — use hipMallocAsync/hipFreeAsync",
-					entry,
-					lineno,
-					pat.trim_end_matches('('),
-				));
 			}
 		}
 	}
-	return Ok(());
+	Ok(())
 }
 
-fn walkdir(dir: &str) -> Vec<String> {
-	let mut out = Vec::new();
-	let Ok(rd) = fs::read_dir(dir) else {
-		return out;
+fn walkdir(directory: &str) -> Vec<String> {
+	let mut entries = Vec::new();
+	let Ok(read_dir) = fs::read_dir(directory) else {
+		return entries;
 	};
-	for e in rd.flatten() {
-		let p = e.path();
-		if p.is_dir() {
-			out.extend(walkdir(p.to_str().unwrap_or_default()));
-			continue;
-		}
-		if p.extension().is_some_and(|ext| return ext == "rs") {
-			out.push(p.to_string_lossy().into_owned());
-			put(&format!("cargo:rerun-if-changed={}", p.display()));
+	for entry in read_dir.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			entries.extend(walkdir(path.to_str().unwrap_or_default()));
+		} else if path.extension().is_some_and(|extension| extension == "rs") {
+			entries.push(path.to_string_lossy().into_owned());
+			put(&format!("cargo:rerun-if-changed={}", path.display()));
 		}
 	}
-	return out;
+	entries
+}
+
+fn main() -> Result<(), BuildError> {
+	let facade = selected_facade()?;
+	match facade {
+		Facade::Legacy => {
+			println!("cargo:rustc-cfg=recipe_facade_legacy");
+			legacy_build()?;
+		}
+		Facade::Next => {
+			println!("cargo:rustc-cfg=recipe_facade_next");
+			println!("cargo:rustc-env=GIT_HASH={}", source_revision());
+		}
+	}
+	Ok(())
 }

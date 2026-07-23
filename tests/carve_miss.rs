@@ -1,6 +1,5 @@
 use gpu_core::memory::{
-	GpuBuffer, arena_remaining, carve_miss_message, claim_device_arena_bytes,
-	release_device_arena,
+	GpuBuffer, arena_remaining, carve_miss_message, claim_device_arena_bytes, release_device_arena,
 };
 
 #[test]
@@ -18,9 +17,21 @@ fn carve_miss_returns_error_with_human_message() {
 	);
 	let msg = carve_miss_message(asked_bytes);
 	eprintln!("{msg}");
-	assert!(msg.contains("11.19 MB"), "needs magnitude in message: {msg}");
-	assert!(msg.contains("8.67 MB"), "remaining magnitude in message: {msg}");
-	assert!(msg.contains("2.52 MB short"), "short magnitude in message: {msg}");
-	assert!(msg.contains("GB free /"), "VRAM context line in message: {msg}");
+	assert!(
+		msg.contains("11.19 MB"),
+		"needs magnitude in message: {msg}"
+	);
+	assert!(
+		msg.contains("8.67 MB"),
+		"remaining magnitude in message: {msg}"
+	);
+	assert!(
+		msg.contains("2.52 MB short"),
+		"short magnitude in message: {msg}"
+	);
+	assert!(
+		msg.contains("GB free /"),
+		"VRAM context line in message: {msg}"
+	);
 	release_device_arena(slab);
 }

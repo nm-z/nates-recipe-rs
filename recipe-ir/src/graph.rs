@@ -20,9 +20,20 @@ pub struct Shape {
 #[derive(Clone, Copy, PartialEq)]
 pub enum OpKind {
 	Dense(Activation),
-	Embed { dim: usize, vocab: usize },
-	Attn { dim: usize, heads: usize },
-	Conv { cin: usize, k: usize, stride: usize, act: Activation },
+	Embed {
+		dim: usize,
+		vocab: usize,
+	},
+	Attn {
+		dim: usize,
+		heads: usize,
+	},
+	Conv {
+		cin: usize,
+		k: usize,
+		stride: usize,
+		act: Activation,
+	},
 	Activation(Activation),
 	LossReduce(Loss),
 }

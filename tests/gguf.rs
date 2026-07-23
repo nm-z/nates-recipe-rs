@@ -20,8 +20,7 @@ fn open_gemma_vocab_and_validate_layout() {
 		.expect("tokenizer.ggml.tokens string array");
 	assert!(!toks.is_empty(), "tokenizer has at least one token");
 	for (name, info) in &g.tensors {
-		let (block_bytes, block_elems) =
-			block_layout(info.ggml_type).expect("block_layout for tensor type");
+		let (block_bytes, block_elems) = block_layout(info.ggml_type).expect("block_layout for tensor type");
 		let elems: usize = info.dims.iter().product();
 		assert_eq!(
 			elems % block_elems,

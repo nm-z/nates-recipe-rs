@@ -98,20 +98,8 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_cumsum_rows(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
-	fn launch_cumsum_cols(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
+	fn launch_cumsum_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+	fn launch_cumsum_cols(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
 	fn launch_cumprod_workspace_bytes(n: i32) -> usize;
 	fn launch_cumprod(
 		x: *const c_void,
@@ -239,45 +227,25 @@ fn scalar_reduce(
 }
 
 #[inline]
-pub fn gpu_sum_all(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_sum_all(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	scalar_reduce(launch_sum_all, x, workspace, n, out);
 	return Ok(());
 }
 
 #[inline]
-pub fn gpu_max_all(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_max_all(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	scalar_reduce(launch_max_all, x, workspace, n, out);
 	return Ok(());
 }
 
 #[inline]
-pub fn gpu_min_all(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_min_all(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	scalar_reduce(launch_min_all, x, workspace, n, out);
 	return Ok(());
 }
 
 #[inline]
-pub fn gpu_mean_all(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_mean_all(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	scalar_reduce(launch_mean_all, x, workspace, n, out);
 	return Ok(());
 }
@@ -364,12 +332,7 @@ pub fn gpu_init_idx(n: usize, idx: &GpuBuffer) -> Result<(), HipError> {
 }
 
 #[inline]
-pub fn gpu_bitonic_step(
-	j: usize,
-	k: usize,
-	padded_n: usize,
-	data: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_bitonic_step(j: usize, k: usize, padded_n: usize, data: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: data is a live device buffer sized for padded_n; the launcher signature matches these arguments.
 	unsafe {
 		launch_bitonic_step(
@@ -538,12 +501,7 @@ pub fn gpu_segment_sort(
 }
 
 #[inline]
-pub fn gpu_cumsum_rows(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_cumsum_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x and out are live device buffers sized for rows*cols; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumsum_rows(
@@ -559,12 +517,7 @@ pub fn gpu_cumsum_rows(
 }
 
 #[inline]
-pub fn gpu_cumsum_cols(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_cumsum_cols(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x and out are live device buffers sized for rows*cols; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumsum_cols(
@@ -580,12 +533,7 @@ pub fn gpu_cumsum_cols(
 }
 
 #[inline]
-pub fn gpu_cumprod(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_cumprod(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_cumprod(
@@ -602,12 +550,7 @@ pub fn gpu_cumprod(
 }
 
 #[inline]
-pub fn gpu_cummax(
-	x: &GpuBuffer,
-	workspace: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_cummax(x: &GpuBuffer, workspace: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x, out, and workspace are live device buffers sized for n; the launcher signature matches these arguments.
 	unsafe {
 		launch_cummax(

@@ -14,8 +14,7 @@ fn parse_arg(token: &str, args: &mut KernArgs, bufs: &mut Vec<*mut c_void>) -> R
 			let bytes: usize = value
 				.parse()
 				.map_err(|e| Errored::new(format!("ptr size '{value}': {e}")))?;
-			let p = asm::alloc_device(bytes)
-				.map_err(|e| Errored::new(format!("alloc_device({bytes}): {e}")))?;
+			let p = asm::alloc_device(bytes).map_err(|e| Errored::new(format!("alloc_device({bytes}): {e}")))?;
 			bufs.push(p);
 			args.ptr(p);
 		}
@@ -53,8 +52,7 @@ fn run() -> Result<(), Errored> {
 	let path = argv
 		.get(1)
 		.ok_or_else(|| Errored::new("usage: asmrun <path.s> [kernel gridX blockX arg..]"))?;
-	let program =
-		asm::load(path).map_err(|e| Errored::new(format!("load {path}: {e}")))?;
+	let program = asm::load(path).map_err(|e| Errored::new(format!("load {path}: {e}")))?;
 
 	let Some(kernel) = argv.get(2) else {
 		let mut names = program.kernels();

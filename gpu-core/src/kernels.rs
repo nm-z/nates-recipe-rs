@@ -2,11 +2,11 @@ use crate::HipError;
 use crate::callspy;
 use crate::hip::{self, check};
 use crate::infer_ops::gpu_scale_f64_inplace;
-use ogdl::log::{Write, device, gpu};
 use crate::memory::{self, GpuBuffer};
 use core::ffi::c_void;
 use core::ops::Div;
 use core::{cmp, mem, ptr};
+use ogdl::log::{Write, device, gpu};
 
 pub(crate) fn check_launch() {
 	callspy::tick(&callspy::LAUNCH);
@@ -14,9 +14,7 @@ pub(crate) fn check_launch() {
 	// SAFETY: hipGetLastError reads and clears the driver's per-thread last-error slot; always valid.
 	let err = unsafe { hip::hipGetLastError() };
 	if err != 0i32 {
-		Write::error(format!(
-			"HIP kernel launch failed with error code {err}"
-		));
+		Write::error(format!("HIP kernel launch failed with error code {err}"));
 		return;
 	}
 }
@@ -79,13 +77,7 @@ unsafe extern "C" {
 		ldc: i32,
 	) -> i32;
 
-	fn launch_sgd_update_f64(
-		w: *mut f64,
-		g: *const f64,
-		neg_lr: *const f64,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_sgd_update_f64(w: *mut f64, g: *const f64, neg_lr: *const f64, n: i32, stream: *mut c_void);
 
 	fn hipsolverCreate(handle: *mut *mut c_void) -> i32;
 	fn hipsolverDestroy(handle: *mut c_void) -> i32;
@@ -107,14 +99,8 @@ unsafe extern "C" {
 		lwork: i32,
 		info: *mut i32,
 	) -> i32;
-	fn hipsolverDgetrf_bufferSize(
-		handle: *mut c_void,
-		m: i32,
-		n: i32,
-		A: *mut f64,
-		lda: i32,
-		lwork: *mut i32,
-	) -> i32;
+	fn hipsolverDgetrf_bufferSize(handle: *mut c_void, m: i32, n: i32, A: *mut f64, lda: i32, lwork: *mut i32)
+	-> i32;
 	fn hipsolverDgetrf(
 		handle: *mut c_void,
 		m: i32,
@@ -177,13 +163,7 @@ unsafe extern "C" {
 		n: i32,
 		stream: *mut c_void,
 	);
-	fn launch_kl_div(
-		mu: *const c_void,
-		log_var: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_kl_div(mu: *const c_void, log_var: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_vae_backward_latent(
 		grad_z: *const c_void,
 		mu: *const c_void,
@@ -196,13 +176,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_log_det_cholesky(L: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
-	fn launch_scaled_exp(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		scale: *const f64,
-		stream: *mut c_void,
-	);
+	fn launch_scaled_exp(x: *const c_void, out: *mut c_void, n: i32, scale: *const f64, stream: *mut c_void);
 	fn launch_sigmoid(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_sigmoid_backward(
 		grad: *const c_void,
@@ -212,44 +186,12 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 	fn launch_tanh_act(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
-	fn launch_tanh_backward(
-		grad: *const c_void,
-		act: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_tanh_backward(grad: *const c_void, act: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_relu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
-	fn launch_relu_backward(
-		grad: *const c_void,
-		act: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_add(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-		dtype: i32,
-	);
-	fn launch_add_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		s: *const f64,
-		stream: *mut c_void,
-		dtype: i32,
-	);
-	fn launch_div(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_relu_backward(grad: *const c_void, act: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_add(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
+	fn launch_add_scalar(x: *const c_void, out: *mut c_void, n: i32, s: *const f64, stream: *mut c_void, dtype: i32);
+	fn launch_div(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_fma(
 		x: *const c_void,
 		a: *const c_void,
@@ -303,24 +245,9 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	) -> usize;
-	fn reduce_sum_rows_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn reduce_mean_cols_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn reduce_var_cols_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
+	fn reduce_sum_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+	fn reduce_mean_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+	fn reduce_var_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
 	fn launch_pairwise_l2(
 		query: *const c_void,
 		train: *const c_void,
@@ -350,14 +277,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_lstm_cell(
-		gates: *const c_void,
-		c: *mut c_void,
-		h: *mut c_void,
-		n: i32,
-		hs: i32,
-		stream: *mut c_void,
-	);
+	fn launch_lstm_cell(gates: *const c_void, c: *mut c_void, h: *mut c_void, n: i32, hs: i32, stream: *mut c_void);
 	fn launch_gaussian_ll(
 		x: *const c_void,
 		means: *const c_void,
@@ -378,20 +298,8 @@ unsafe extern "C" {
 		out_len: i32,
 		stream: *mut c_void,
 	);
-	fn launch_argmax_rows(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
-	fn launch_mul(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_argmax_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+	fn launch_mul(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_mul_inplace(a: *mut c_void, b: *const c_void, n: i32, stream: *mut c_void, dtype: i32);
 	fn launch_add_col_scaled(
 		matrix: *mut c_void,
@@ -424,22 +332,8 @@ unsafe extern "C" {
 		scale: *const f64,
 		stream: *mut c_void,
 	);
-	fn launch_sub(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-		dtype: i32,
-	);
-	fn launch_softmax_rows(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-		dtype: i32,
-	);
+	fn launch_sub(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
+	fn launch_softmax_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void, dtype: i32);
 	fn launch_flash_attention_f64(
 		q: *const c_void,
 		k: *const c_void,
@@ -528,13 +422,7 @@ unsafe extern "C" {
 		n_filters: i32,
 		stream: *mut c_void,
 	);
-	fn launch_argmin_rows(
-		dists: *const c_void,
-		assignments: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
+	fn launch_argmin_rows(dists: *const c_void, assignments: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
 	fn launch_centroid_update(
 		x: *const c_void,
 		assignments: *const c_void,
@@ -589,13 +477,7 @@ unsafe extern "C" {
 		scale: *const f64,
 		stream: *mut c_void,
 	);
-	fn launch_bernoulli_u8(
-		mask: *mut c_void,
-		n: i32,
-		seed: u32,
-		p: *const f64,
-		stream: *mut c_void,
-	);
+	fn launch_bernoulli_u8(mask: *mut c_void, n: i32, seed: u32, p: *const f64, stream: *mut c_void);
 	fn launch_dropout_u8(
 		x: *const c_void,
 		mask: *const c_void,
@@ -653,20 +535,8 @@ unsafe extern "C" {
 		stream: *mut c_void,
 		dtype: i32,
 	);
-	fn launch_transpose(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
-	fn launch_shapex_pack_upper_tri(
-		factor: *const c_void,
-		r: *mut c_void,
-		m: i32,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_transpose(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+	fn launch_shapex_pack_upper_tri(factor: *const c_void, r: *mut c_void, m: i32, n: i32, stream: *mut c_void);
 	fn launch_eye(out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_where_mask(
 		cond: *const c_void,
@@ -720,13 +590,7 @@ unsafe extern "C" {
 		cols: i32,
 		stream: *mut c_void,
 	);
-	fn launch_log_softmax_rows(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
+	fn launch_log_softmax_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
 	fn launch_cross_entropy(
 		logits: *const c_void,
 		targets: *const c_void,
@@ -891,83 +755,21 @@ unsafe extern "C" {
 		tmp_bytes: usize,
 		stream: *mut c_void,
 	);
-	fn reduce_max_rows_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn reduce_max_cols_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn reduce_min_rows_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn reduce_min_cols_workspace_bytes(
-		x: *const c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	) -> usize;
+	fn reduce_max_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+	fn reduce_max_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+	fn reduce_min_rows_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
+	fn reduce_min_cols_workspace_bytes(x: *const c_void, rows: i32, cols: i32, stream: *mut c_void) -> usize;
 
-	fn launch_gt(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_lt(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_eq(
-		a: *const c_void,
-		b: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_gt_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		val: *const f64,
-		stream: *mut c_void,
-	);
-	fn launch_lt_scalar(
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		val: *const f64,
-		stream: *mut c_void,
-	);
+	fn launch_gt(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_lt(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_eq(a: *const c_void, b: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_gt_scalar(x: *const c_void, out: *mut c_void, n: i32, val: *const f64, stream: *mut c_void);
+	fn launch_lt_scalar(x: *const c_void, out: *mut c_void, n: i32, val: *const f64, stream: *mut c_void);
 
 	fn launch_gelu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
-	fn launch_gelu_backward(
-		grad: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_gelu_backward(grad: *const c_void, x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_silu(x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void, dtype: i32);
-	fn launch_silu_backward(
-		grad: *const c_void,
-		x: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_silu_backward(grad: *const c_void, x: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 
 	fn launch_batchnorm_forward(
 		x: *const c_void,
@@ -1069,13 +871,7 @@ unsafe extern "C" {
 	);
 	fn launch_tril_mask(out: *mut c_void, n: i32, fill_val: *const f64, stream: *mut c_void);
 	fn launch_fill(out: *mut c_void, n: i32, val: *const f64, stream: *mut c_void);
-	fn launch_repeat_rows(
-		src: *const c_void,
-		dst: *mut c_void,
-		src_n: i32,
-		total: i32,
-		stream: *mut c_void,
-	);
+	fn launch_repeat_rows(src: *const c_void, dst: *mut c_void, src_n: i32, total: i32, stream: *mut c_void);
 	fn launch_upsample_nearest_2d(
 		input: *const c_void,
 		output: *mut c_void,
@@ -1088,20 +884,8 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_log_sum_exp_rows(
-		x: *const c_void,
-		out: *mut c_void,
-		rows: i32,
-		cols: i32,
-		stream: *mut c_void,
-	);
-	fn launch_grad_clip_norm(
-		x: *mut c_void,
-		tmp: *mut c_void,
-		n: i32,
-		max_norm: *const f64,
-		stream: *mut c_void,
-	);
+	fn launch_log_sum_exp_rows(x: *const c_void, out: *mut c_void, rows: i32, cols: i32, stream: *mut c_void);
+	fn launch_grad_clip_norm(x: *mut c_void, tmp: *mut c_void, n: i32, max_norm: *const f64, stream: *mut c_void);
 
 	fn launch_prefix_sum_inclusive(
 		x: *const c_void,
@@ -1119,16 +903,8 @@ unsafe extern "C" {
 		tmp_bytes: usize,
 		stream: *mut c_void,
 	);
-	fn prefix_sum_inclusive_workspace_bytes(
-		x: *const c_void,
-		n: i32,
-		stream: *mut c_void,
-	) -> usize;
-	fn prefix_sum_exclusive_workspace_bytes(
-		x: *const c_void,
-		n: i32,
-		stream: *mut c_void,
-	) -> usize;
+	fn prefix_sum_inclusive_workspace_bytes(x: *const c_void, n: i32, stream: *mut c_void) -> usize;
+	fn prefix_sum_exclusive_workspace_bytes(x: *const c_void, n: i32, stream: *mut c_void) -> usize;
 
 	fn launch_histogram_build(
 		bins: *const c_void,
@@ -1237,13 +1013,7 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_mse_grad(
-		pred: *const c_void,
-		target: *const c_void,
-		grad: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_mse_grad(pred: *const c_void, target: *const c_void, grad: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_argmax_f32(data: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_fill_f32(out: *mut c_void, val: *const f32, n: i32, stream: *mut c_void);
 	fn launch_write_split(
@@ -1392,28 +1162,10 @@ unsafe extern "C" {
 		stream: *mut c_void,
 	);
 
-	fn launch_ss_res(
-		pred: *const c_void,
-		y: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
-	fn launch_mse(
-		pred: *const c_void,
-		y: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_ss_res(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
+	fn launch_mse(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	#[link_name = "launch_acc_metric"]
-	fn launch_accuracy_metric(
-		pred: *const c_void,
-		y: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		stream: *mut c_void,
-	);
+	fn launch_accuracy_metric(pred: *const c_void, y: *const c_void, out: *mut c_void, n: i32, stream: *mut c_void);
 	fn launch_bce_grad(
 		pred: *const c_void,
 		y: *const c_void,
@@ -1432,14 +1184,7 @@ unsafe extern "C" {
 	);
 
 	fn launch_dtw_init(dp: *mut c_void, dp_size: i32, stream: *mut c_void);
-	fn launch_dtw_antidiag(
-		cost: *const c_void,
-		dp: *mut c_void,
-		m: i32,
-		n: i32,
-		d: i32,
-		stream: *mut c_void,
-	);
+	fn launch_dtw_antidiag(cost: *const c_void, dp: *mut c_void, m: i32, n: i32, d: i32, stream: *mut c_void);
 
 	fn launch_itemset_support(
 		trans: *const c_void,
@@ -1713,9 +1458,7 @@ pub(crate) fn hipblas_handle() -> *mut c_void {
 				// SAFETY: &raw mut handle is a valid out-pointer to a null-initialized handle that hipblasCreate fills.
 				let status = unsafe { hipblasCreate(&raw mut handle) };
 				if status != 0i32 {
-					Write::error(format!(
-						"hipblasCreate failed with status {status}"
-					));
+					Write::error(format!("hipblasCreate failed with status {status}"));
 					return handle;
 				}
 				// SAFETY: handle is the live hipBLAS handle from hipblasCreate; a null stream selects the default stream.
@@ -1739,9 +1482,7 @@ pub fn gpu_blas_workspace(buf: &GpuBuffer) {
 	// SAFETY: hipblas_handle() returns the live handle; buf is a valid GPU buffer of buf.len() bytes.
 	let status = unsafe { hipblasSetWorkspace(hipblas_handle(), buf.ptr_raw(), buf.len()) };
 	if status != 0i32 {
-		Write::error(format!(
-			"hipblasSetWorkspace failed with status {status}"
-		));
+		Write::error(format!("hipblasSetWorkspace failed with status {status}"));
 		return;
 	}
 }
@@ -1755,9 +1496,7 @@ pub(crate) fn hipsolver_handle() -> *mut c_void {
 				// SAFETY: &raw mut handle is a valid out-pointer to a null-initialized handle that hipsolverCreate fills.
 				let status = unsafe { hipsolverCreate(&raw mut handle) };
 				if status != 0i32 {
-					Write::error(format!(
-						"hipsolverCreate failed with status {status}"
-					));
+					Write::error(format!("hipsolverCreate failed with status {status}"));
 					return handle;
 				}
 				h.store(handle, Ordering::Relaxed);
@@ -2333,12 +2072,7 @@ pub fn gpu_reparameterize(
 }
 
 #[inline]
-pub fn gpu_kl_div(
-	mu: &GpuBuffer,
-	log_var: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_kl_div(mu: &GpuBuffer, log_var: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: mu, log_var and out are valid device buffers of length n and launch_kl_div touches only those n elements.
 	unsafe {
 		launch_kl_div(
@@ -2395,12 +2129,7 @@ pub fn gpu_log_det_cholesky(l: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<
 }
 
 #[inline]
-pub fn gpu_scaled_exp(
-	x: &GpuBuffer,
-	scale: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_scaled_exp(x: &GpuBuffer, scale: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x`, `scale`, and `out` are valid device buffers of at least `n` elements; the null stream is the default stream.
 	unsafe {
@@ -2433,12 +2162,7 @@ pub fn gpu_sigmoid_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), 
 }
 
 #[inline]
-pub fn gpu_sigmoid_backward_into(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_sigmoid_backward_into(grad: &GpuBuffer, act: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_sigmoid_backward with device pointers from live buffers and a checked length
 	unsafe {
 		launch_sigmoid_backward(
@@ -2457,18 +2181,19 @@ pub fn gpu_sigmoid_backward_into(
 pub fn gpu_tanh_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_tanh_act with device pointers from live buffers and a checked length
 	unsafe {
-		launch_tanh_act(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut(), out.dtype().ffi());
+		launch_tanh_act(
+			x.ptr.cast_const(),
+			out.ptr,
+			ci(n)?,
+			ptr::null_mut(),
+			out.dtype().ffi(),
+		);
 	}
 	check_launch();
 	return Ok(());
 }
 #[inline]
-pub fn gpu_tanh_backward_into(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_tanh_backward_into(grad: &GpuBuffer, act: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: FFI call into launch_tanh_backward with device pointers from live buffers and a checked length
 	unsafe {
 		launch_tanh_backward(
@@ -2484,12 +2209,7 @@ pub fn gpu_tanh_backward_into(
 }
 
 #[inline]
-pub fn gpu_leaky_relu_into(
-	x: &GpuBuffer,
-	alpha: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_leaky_relu_into(x: &GpuBuffer, alpha: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the launch reads only live GpuBuffer device allocations through valid FFI pointers.
 	unsafe {
 		launch_leaky_relu(
@@ -2531,18 +2251,19 @@ pub fn gpu_leaky_relu_backward_into(
 pub fn gpu_silu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the launch reads only live GpuBuffer device allocations through valid FFI pointers.
 	unsafe {
-		launch_silu(x.ptr.cast_const(), out.ptr, ci(n)?, ptr::null_mut(), out.dtype().ffi());
+		launch_silu(
+			x.ptr.cast_const(),
+			out.ptr,
+			ci(n)?,
+			ptr::null_mut(),
+			out.dtype().ffi(),
+		);
 	}
 	check_launch();
 	return Ok(());
 }
 #[inline]
-pub fn gpu_silu_backward_into(
-	grad: &GpuBuffer,
-	x: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_silu_backward_into(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the launch reads only live GpuBuffer device allocations through valid FFI pointers.
 	unsafe {
 		launch_silu_backward(
@@ -2574,12 +2295,7 @@ pub fn gpu_relu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 }
 
 #[inline]
-pub fn gpu_relu_backward_into(
-	grad: &GpuBuffer,
-	act: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_relu_backward_into(grad: &GpuBuffer, act: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the device pointers are live, ledgered allocations valid for `n` elements.
 	unsafe {
 		launch_relu_backward(
@@ -2595,12 +2311,7 @@ pub fn gpu_relu_backward_into(
 }
 
 #[inline]
-pub fn gpu_add_into(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_add_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the device pointers are live, ledgered allocations valid for `n` elements.
 	unsafe {
 		launch_add(
@@ -2617,12 +2328,7 @@ pub fn gpu_add_into(
 }
 
 #[inline]
-pub fn gpu_add_scalar(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_add_scalar(x: &GpuBuffer, s: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x, s, out are live device buffers of n f64 elements and launch_add_scalar only enqueues a kernel over them.
 	unsafe {
 		launch_add_scalar(
@@ -2639,12 +2345,7 @@ pub fn gpu_add_scalar(
 }
 
 #[inline]
-pub fn gpu_div_into(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_div_into(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: a, b, out are live device buffers of n f64 elements and launch_div only enqueues a kernel over them.
 	unsafe {
 		launch_div(
@@ -2665,13 +2366,7 @@ pub fn gpu_scale_inplace(scalar: &GpuBuffer, n: usize, x: &GpuBuffer) -> Result<
 }
 
 #[inline]
-pub fn gpu_fma(
-	x: &GpuBuffer,
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_fma(x: &GpuBuffer, a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: x, a, b, out are live device buffers of n f64 elements and launch_fma only enqueues a kernel over them.
 	unsafe {
 		launch_fma(
@@ -2689,12 +2384,7 @@ pub fn gpu_fma(
 }
 
 #[inline]
-pub fn gpu_sgd_update(
-	grad: &GpuBuffer,
-	neg_lr: &GpuBuffer,
-	n: usize,
-	weights: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_sgd_update(grad: &GpuBuffer, neg_lr: &GpuBuffer, n: usize, weights: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `weights`, `grad`, and `neg_lr` are live device buffers of `n` f64 that outlive the launch.
 	unsafe {
 		launch_sgd_update_f64(
@@ -2859,12 +2549,7 @@ pub fn gpu_linear_into(
 }
 
 #[inline]
-pub fn gpu_ss_res_into(
-	pred: &GpuBuffer,
-	y: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_ss_res_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	use crate::memory::memset_dev;
 	// SAFETY: out.ptr is a live device allocation of at least one f64; memset_dev writes size_of::<f64>() zero bytes there.
 	unsafe {
@@ -2885,12 +2570,7 @@ pub fn gpu_ss_res_into(
 }
 
 #[inline]
-pub fn gpu_mse_into(
-	pred: &GpuBuffer,
-	y: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_mse_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	use crate::memory::memset_dev;
 	// SAFETY: out.ptr is a live device allocation of at least one f64; memset_dev writes size_of::<f64>() zero bytes there.
 	unsafe {
@@ -2911,12 +2591,7 @@ pub fn gpu_mse_into(
 }
 
 #[inline]
-pub fn gpu_accuracy_into(
-	pred: &GpuBuffer,
-	y: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_accuracy_into(pred: &GpuBuffer, y: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	use crate::memory::memset_dev;
 	// SAFETY: out.ptr is a live device allocation of at least one f64; memset_dev writes size_of::<f64>() zero bytes there.
 	unsafe {
@@ -3046,7 +2721,13 @@ pub fn gpu_reduce_sum_cols_into(
 ) -> Result<(), HipError> {
 	// SAFETY: reduce_sum_cols_workspace_bytes computes the byte count from the dims; its pointer args are unused.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(ptr::null(), ci(rows)?, ci(cols)?, ptr::null_mut(), x.dtype().ffi())
+		reduce_sum_cols_workspace_bytes(
+			ptr::null(),
+			ci(rows)?,
+			ci(cols)?,
+			ptr::null_mut(),
+			x.dtype().ffi(),
+		)
 	};
 	// SAFETY: launch_reduce_sum_cols reads x, writes out, and uses reduce_ws of ws bytes, all valid device buffers for the dims.
 	unsafe {
@@ -3276,12 +2957,7 @@ pub fn gpu_gelu_into(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), Hip
 }
 
 #[inline]
-pub fn gpu_gelu_backward_into(
-	grad: &GpuBuffer,
-	x: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gelu_backward_into(grad: &GpuBuffer, x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: pointers are live GpuBuffer allocations and the launcher reads/writes only the first n elements.
 	unsafe {
 		launch_gelu_backward(
@@ -3410,7 +3086,13 @@ pub fn gpu_linear_backward_weights_only_into(
 ) -> Result<(), HipError> {
 	// SAFETY: `grad.ptr` is a valid device pointer; the call only queries the reduction workspace byte size and launches nothing.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut(), grad.dtype().ffi())
+		reduce_sum_cols_workspace_bytes(
+			grad.ptr.cast_const(),
+			ci(m)?,
+			ci(n)?,
+			ptr::null_mut(),
+			grad.dtype().ffi(),
+		)
 	};
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
 	// SAFETY: `grad`/`grad_b` device pointers and the `reduce_ws` workspace are valid for this column-reduction launch on the default stream.
@@ -3449,7 +3131,13 @@ pub fn gpu_linear_backward_full_into(
 	gpu_splitk_dw_into(input, grad, partials, m, n, k, grad_w)?;
 	// SAFETY: `grad.ptr` is a valid device pointer; the call only queries the reduction workspace byte size and launches nothing.
 	let ws = unsafe {
-		reduce_sum_cols_workspace_bytes(grad.ptr.cast_const(), ci(m)?, ci(n)?, ptr::null_mut(), grad.dtype().ffi())
+		reduce_sum_cols_workspace_bytes(
+			grad.ptr.cast_const(),
+			ci(m)?,
+			ci(n)?,
+			ptr::null_mut(),
+			grad.dtype().ffi(),
+		)
 	};
 	// SAFETY: `grad`/`grad_b` device pointers and the `reduce_ws` workspace are valid for this column-reduction launch on the default stream.
 	unsafe {
@@ -3519,12 +3207,7 @@ pub fn gpu_layernorm_backward_full_into(
 }
 
 #[inline]
-pub fn gpu_softmax_rows_into(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_softmax_rows_into(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the device buffer pointers are valid allocations owned by the caller for this launch.
 	unsafe {
 		launch_softmax_rows(
@@ -3677,12 +3360,7 @@ pub fn gpu_flash_attention_backward_into(
 }
 
 #[inline]
-pub fn gpu_bernoulli_into(
-	p: &GpuBuffer,
-	seed: usize,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_bernoulli_into(p: &GpuBuffer, seed: usize, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n32 = ci(n)?;
 	let seed32 = cu(seed)?;
 	// SAFETY: p and out are valid device buffers of n f64 elements; launch_bernoulli reads p and writes out within bounds.
@@ -4047,12 +3725,7 @@ pub fn gpu_tree_build_into(
 }
 
 #[inline]
-pub fn gpu_mse_grad_into(
-	pred: &GpuBuffer,
-	target: &GpuBuffer,
-	n: usize,
-	grad: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_mse_grad_into(pred: &GpuBuffer, target: &GpuBuffer, n: usize, grad: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: pred, target, and grad are valid live device allocations owned by the caller for the duration of this launch.
 	unsafe {
 		launch_mse_grad(
@@ -4643,12 +4316,7 @@ pub fn gpu_pool_grad_expand(
 }
 
 #[inline]
-pub fn gpu_argmin_rows(
-	dists: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_argmin_rows(dists: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: dists and out wrap live device allocations valid for the duration of the launch.
 	unsafe {
 		launch_argmin_rows(
@@ -5018,13 +4686,7 @@ pub fn gpu_gated_delta_scan(
 }
 
 #[inline]
-pub fn gpu_row_scale(
-	x: &GpuBuffer,
-	s: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_row_scale(x: &GpuBuffer, s: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: all buffers are live device allocations sized for the passed dims; the launcher only reads/writes within them.
 	unsafe {
 		launch_row_scale(
@@ -5042,13 +4704,7 @@ pub fn gpu_row_scale(
 }
 
 #[inline]
-pub fn gpu_lstm_cell(
-	gates: &GpuBuffer,
-	n: usize,
-	hs: usize,
-	c: &GpuBuffer,
-	h: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_lstm_cell(gates: &GpuBuffer, n: usize, hs: usize, c: &GpuBuffer, h: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: every pointer is a live device allocation owned by a caller `GpuBuffer` that outlives this launch, and the checked casts bound the dimensions.
 	unsafe {
 		launch_lstm_cell(
@@ -5094,13 +4750,7 @@ pub fn gpu_gaussian_ll(
 }
 
 #[inline]
-pub fn gpu_im2col_1d(
-	x: &GpuBuffer,
-	n: usize,
-	p: usize,
-	ks: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_im2col_1d(x: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
 	// SAFETY: all pointers reference live device allocations from the passed GpuBuffers and every FFI slot type matches the launcher declaration.
 	unsafe {
@@ -5119,12 +4769,7 @@ pub fn gpu_im2col_1d(
 }
 
 #[inline]
-pub fn gpu_argmax_rows(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_argmax_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: all pointers reference live device allocations from the passed GpuBuffers and every FFI slot type matches the launcher declaration.
 	unsafe {
 		launch_argmax_rows(
@@ -5148,14 +4793,7 @@ pub fn gpu_reduce_sum_rows(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	// SAFETY: FFI workspace-size query; x.ptr is a live device allocation.
-	let ws = unsafe {
-		reduce_sum_rows_workspace_bytes(
-			x.ptr.cast_const(),
-			ci(rows)?,
-			ci(cols)?,
-			ptr::null_mut(),
-		)
-	};
+	let ws = unsafe { reduce_sum_rows_workspace_bytes(x.ptr.cast_const(), ci(rows)?, ci(cols)?, ptr::null_mut()) };
 	// SAFETY: FFI launch; x/out/workspace are live device allocations for the call.
 	unsafe {
 		launch_reduce_sum_rows(
@@ -5181,14 +4819,7 @@ pub fn gpu_reduce_mean_cols(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	// SAFETY: FFI workspace-size query; x.ptr is a live device allocation.
-	let ws = unsafe {
-		reduce_mean_cols_workspace_bytes(
-			x.ptr.cast_const(),
-			ci(rows)?,
-			ci(cols)?,
-			ptr::null_mut(),
-		)
-	};
+	let ws = unsafe { reduce_mean_cols_workspace_bytes(x.ptr.cast_const(), ci(rows)?, ci(cols)?, ptr::null_mut()) };
 	// SAFETY: FFI launch; x/out/workspace are live device allocations for the call.
 	unsafe {
 		launch_reduce_mean_cols(
@@ -5216,9 +4847,7 @@ pub fn gpu_reduce_var_cols(
 	let rows_i32 = ci(rows)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: x is a live GpuBuffer; the query reads only its pointer and sizes.
-	let ws = unsafe {
-		reduce_var_cols_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut())
-	};
+	let ws = unsafe { reduce_var_cols_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut()) };
 	// SAFETY: all buffers are live and sized for rows*cols; ws matches the query.
 	unsafe {
 		launch_reduce_var_cols(
@@ -5311,12 +4940,7 @@ pub fn download_indices(buf: &GpuBuffer, k: usize) -> Result<Vec<i32>, HipError>
 }
 
 #[inline]
-pub fn gpu_bernoulli_u8(
-	p: &GpuBuffer,
-	n: usize,
-	seed: usize,
-	mask: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_bernoulli_u8(p: &GpuBuffer, n: usize, seed: usize, mask: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	let seed_u32 = cu(seed)?;
 	// SAFETY: `mask` and `p` are valid device buffers of at least `n` elements.
@@ -5461,7 +5085,13 @@ pub fn gpu_sqrt(x: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError
 	let n_i32 = ci(n)?;
 	// SAFETY: `x` and `out` are valid device buffers of at least `n` elements.
 	unsafe {
-		launch_sqrt(x.ptr.cast_const(), out.ptr, n_i32, ptr::null_mut(), out.dtype().ffi());
+		launch_sqrt(
+			x.ptr.cast_const(),
+			out.ptr,
+			n_i32,
+			ptr::null_mut(),
+			out.dtype().ffi(),
+		);
 	}
 	check_launch();
 	return Ok(());
@@ -5537,12 +5167,7 @@ pub fn gpu_clamp_into(
 }
 
 #[inline]
-pub fn gpu_transpose(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_transpose(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let rows_i32 = ci(rows)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: the GpuBuffer pointers are valid device allocations that outlive this launch
@@ -5560,12 +5185,7 @@ pub fn gpu_transpose(
 }
 
 #[inline]
-pub fn gpu_pack_upper_tri(
-	factor: &GpuBuffer,
-	m: usize,
-	n: usize,
-	r: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_pack_upper_tri(factor: &GpuBuffer, m: usize, n: usize, r: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: the GpuBuffer pointers are valid device allocations that outlive this launch
 	unsafe {
 		launch_shapex_pack_upper_tri(
@@ -5616,13 +5236,7 @@ pub fn gpu_where_mask(
 }
 
 #[inline]
-pub fn gpu_slice_rows(
-	x: &GpuBuffer,
-	start: usize,
-	count: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_slice_rows(x: &GpuBuffer, start: usize, count: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let total_rows = x.n_floats().div_euclid(cols);
 	if start + count > total_rows {
 		Write::error(format!(
@@ -5676,13 +5290,7 @@ pub fn gpu_broadcast_sub_into(
 }
 
 #[inline]
-pub fn gpu_broadcast_mul(
-	x: &GpuBuffer,
-	v: &GpuBuffer,
-	n: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_broadcast_mul(x: &GpuBuffer, v: &GpuBuffer, n: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: `x`, `v`, and `out` are valid device buffers sized for the broadcast.
@@ -5702,13 +5310,7 @@ pub fn gpu_broadcast_mul(
 }
 
 #[inline]
-pub fn gpu_broadcast_div(
-	x: &GpuBuffer,
-	v: &GpuBuffer,
-	n: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_broadcast_div(x: &GpuBuffer, v: &GpuBuffer, n: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: `x`, `v`, and `out` are valid device buffers sized for the broadcast.
@@ -5751,12 +5353,7 @@ pub fn gpu_softmax_backward_into(
 }
 
 #[inline]
-pub fn gpu_log_softmax_rows(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_log_softmax_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: launch_log_softmax_rows reads x and writes out only within the passed dims.
 	unsafe {
 		launch_log_softmax_rows(
@@ -5844,13 +5441,7 @@ pub fn gpu_scatter_add(
 }
 
 #[inline]
-pub fn gpu_col2im_1d(
-	patches: &GpuBuffer,
-	n: usize,
-	p: usize,
-	ks: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_col2im_1d(patches: &GpuBuffer, n: usize, p: usize, ks: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let out_len = p - ks + 1;
 	out.memset_zero(n * p * size_of::<f64>())?;
 	let n_i32 = ci(n)?;
@@ -6113,14 +5704,7 @@ pub fn gpu_reduce_max_rows(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	// SAFETY: FFI workspace query; `x` is a live device allocation and the dims are valid.
-	let ws = unsafe {
-		reduce_max_rows_workspace_bytes(
-			x.ptr.cast_const(),
-			ci(rows)?,
-			ci(cols)?,
-			ptr::null_mut(),
-		)
-	};
+	let ws = unsafe { reduce_max_rows_workspace_bytes(x.ptr.cast_const(), ci(rows)?, ci(cols)?, ptr::null_mut()) };
 	// SAFETY: FFI kernel launch; `x`/`out`/`workspace` are live device allocations sized for the dims.
 	unsafe {
 		launch_reduce_max_rows(
@@ -6146,14 +5730,7 @@ pub fn gpu_reduce_max_cols(
 	out: &GpuBuffer,
 ) -> Result<(), HipError> {
 	// SAFETY: FFI workspace query; `x` is a live device allocation and the dims are valid.
-	let ws = unsafe {
-		reduce_max_cols_workspace_bytes(
-			x.ptr.cast_const(),
-			ci(rows)?,
-			ci(cols)?,
-			ptr::null_mut(),
-		)
-	};
+	let ws = unsafe { reduce_max_cols_workspace_bytes(x.ptr.cast_const(), ci(rows)?, ci(cols)?, ptr::null_mut()) };
 	// SAFETY: launch_reduce_max_cols is an FFI launcher over live GpuBuffer pointers with range-checked dims and a valid null stream.
 	unsafe {
 		launch_reduce_max_cols(
@@ -6181,9 +5758,7 @@ pub fn gpu_reduce_min_rows(
 	let rows_i32 = ci(rows)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: `x.ptr` is a live device buffer; the query only sizes the workspace.
-	let ws = unsafe {
-		reduce_min_rows_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut())
-	};
+	let ws = unsafe { reduce_min_rows_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut()) };
 	// SAFETY: all pointers are live device buffers; dims are range-checked i32.
 	unsafe {
 		launch_reduce_min_rows(
@@ -6211,9 +5786,7 @@ pub fn gpu_reduce_min_cols(
 	let rows_i32 = ci(rows)?;
 	let cols_i32 = ci(cols)?;
 	// SAFETY: `x.ptr` is a live device buffer; the query only sizes the workspace.
-	let ws = unsafe {
-		reduce_min_cols_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut())
-	};
+	let ws = unsafe { reduce_min_cols_workspace_bytes(x.ptr.cast_const(), rows_i32, cols_i32, ptr::null_mut()) };
 	// SAFETY: all pointers are live device buffers; dims are range-checked i32.
 	unsafe {
 		launch_reduce_min_cols(
@@ -6276,12 +5849,7 @@ pub fn gpu_eq(a: &GpuBuffer, b: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result
 	return Ok(());
 }
 #[inline]
-pub fn gpu_gt_scalar(
-	x: &GpuBuffer,
-	val: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: the buffer pointers are valid for this launch and the argument types match the kernel's C ABI.
 	unsafe {
@@ -6297,12 +5865,7 @@ pub fn gpu_gt_scalar(
 	return Ok(());
 }
 #[inline]
-pub fn gpu_lt_scalar(
-	x: &GpuBuffer,
-	val: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_lt_scalar(x: &GpuBuffer, val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: the buffer pointers are valid for this launch and the argument types match the kernel's C ABI.
 	unsafe {
@@ -6486,13 +6049,7 @@ pub fn gpu_adamw_update(
 }
 
 #[inline]
-pub fn gpu_gru_cell(
-	gates: &GpuBuffer,
-	h: &GpuBuffer,
-	n: usize,
-	hs: usize,
-	h_new: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gru_cell(gates: &GpuBuffer, h: &GpuBuffer, n: usize, hs: usize, h_new: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	let hs_i32 = ci(hs)?;
 	// SAFETY: launch_gru_cell reads gates and h and writes h_new, each a valid device buffer for the given dims; the null stream is the default stream.
@@ -6511,13 +6068,7 @@ pub fn gpu_gru_cell(
 }
 
 #[inline]
-pub fn gpu_vconcat(
-	a: &GpuBuffer,
-	b: &GpuBuffer,
-	a_n: usize,
-	b_n: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_vconcat(a: &GpuBuffer, b: &GpuBuffer, a_n: usize, b_n: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let a_bytes = a_n * mem::size_of::<f64>();
 	let b_bytes = b_n * mem::size_of::<f64>();
 	// SAFETY: memory::xfer copies a_bytes device-to-device from a into out; both are valid device buffers and the null stream is the default stream.
@@ -6595,12 +6146,7 @@ pub fn gpu_fill(val: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(), HipErr
 }
 
 #[inline]
-pub fn gpu_repeat_rows(
-	src: &GpuBuffer,
-	src_n: usize,
-	repeats: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_repeat_rows(src: &GpuBuffer, src_n: usize, repeats: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	let total = src_n * repeats;
 	// SAFETY: launcher reads and writes valid device buffers for the passed extents.
 	unsafe {
@@ -6646,12 +6192,7 @@ pub fn gpu_upsample_nearest_2d(
 }
 
 #[inline]
-pub fn gpu_log_sum_exp_rows(
-	x: &GpuBuffer,
-	rows: usize,
-	cols: usize,
-	out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_log_sum_exp_rows(x: &GpuBuffer, rows: usize, cols: usize, out: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `x` and `out` are valid device buffers sized `rows` by `cols`; the null stream is the default stream.
 	unsafe {
 		launch_log_sum_exp_rows(
@@ -6667,12 +6208,7 @@ pub fn gpu_log_sum_exp_rows(
 }
 
 #[inline]
-pub fn gpu_grad_clip_norm(
-	max_norm: &GpuBuffer,
-	n: usize,
-	x: &GpuBuffer,
-	tmp: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_grad_clip_norm(max_norm: &GpuBuffer, n: usize, x: &GpuBuffer, tmp: &GpuBuffer) -> Result<(), HipError> {
 	// SAFETY: `x`, `tmp`, and `max_norm` are valid device buffers for `n` elements; the null stream is the default stream.
 	unsafe {
 		launch_grad_clip_norm(
@@ -6688,17 +6224,10 @@ pub fn gpu_grad_clip_norm(
 }
 
 #[inline]
-pub fn gpu_prefix_sum_inclusive(
-	x: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-	tmp: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_prefix_sum_inclusive(x: &GpuBuffer, n: usize, out: &GpuBuffer, tmp: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x.ptr` is a live device buffer; the null workspace pointer only queries the byte count
-	let ws = unsafe {
-		prefix_sum_inclusive_workspace_bytes(x.ptr.cast_const(), n_i32, ptr::null_mut())
-	};
+	let ws = unsafe { prefix_sum_inclusive_workspace_bytes(x.ptr.cast_const(), n_i32, ptr::null_mut()) };
 	// SAFETY: all buffers are live device allocations sized for `n` elements
 	unsafe {
 		launch_prefix_sum_inclusive(
@@ -6715,17 +6244,10 @@ pub fn gpu_prefix_sum_inclusive(
 }
 
 #[inline]
-pub fn gpu_prefix_sum_exclusive(
-	x: &GpuBuffer,
-	n: usize,
-	out: &GpuBuffer,
-	tmp: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_prefix_sum_exclusive(x: &GpuBuffer, n: usize, out: &GpuBuffer, tmp: &GpuBuffer) -> Result<(), HipError> {
 	let n_i32 = ci(n)?;
 	// SAFETY: `x.ptr` is a live device buffer; the null workspace pointer only queries the byte count
-	let ws = unsafe {
-		prefix_sum_exclusive_workspace_bytes(x.ptr.cast_const(), n_i32, ptr::null_mut())
-	};
+	let ws = unsafe { prefix_sum_exclusive_workspace_bytes(x.ptr.cast_const(), n_i32, ptr::null_mut()) };
 	// SAFETY: all buffers are live device allocations sized for `n` elements
 	unsafe {
 		launch_prefix_sum_exclusive(
@@ -6881,13 +6403,7 @@ pub fn gpu_add_col(
 }
 
 #[inline]
-pub fn gpu_report(
-	logits: &GpuBuffer,
-	val_targets: &[i32],
-	n: usize,
-	nc: usize,
-	round: usize,
-) -> Result<f64, HipError> {
+pub fn gpu_report(logits: &GpuBuffer, val_targets: &[i32], n: usize, nc: usize, round: usize) -> Result<f64, HipError> {
 	let preds = GpuBuffer::alloc(n)?;
 	gpu_argmax_rows(logits, n, nc, &preds)?;
 	let mut preds_cpu = vec![0.0f64; n];

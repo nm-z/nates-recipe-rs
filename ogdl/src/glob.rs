@@ -1,4 +1,3 @@
-
 use crate::Node;
 use std::collections::BTreeSet;
 
@@ -66,7 +65,9 @@ fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
 		let core: Core = match bytes[i] {
 			b'*' => {
 				if suffixable {
-					let last = atoms.pop().ok_or_else(|| format!("glob: dangling * in {seg:?}"))?;
+					let last = atoms
+						.pop()
+						.ok_or_else(|| format!("glob: dangling * in {seg:?}"))?;
 					atoms.push(match last {
 						Atom::Name(n) => Atom::NameDown(n),
 						Atom::Row(n) => Atom::RowBelow(n),
@@ -108,7 +109,10 @@ fn parse_segment(seg: &str) -> Result<Vec<Atom>, String> {
 					i = i.saturating_add(1);
 				}
 				if start == i {
-					return Err(format!("glob: unexpected {:?} in {seg:?}", bytes[i] as char));
+					return Err(format!(
+						"glob: unexpected {:?} in {seg:?}",
+						bytes[i] as char
+					));
 				}
 				Core::Name(seg[start..i].to_owned())
 			}
@@ -166,8 +170,7 @@ fn eval_atom(a: &Atom, g: &Grid, route: bool) -> Vec<usize> {
 		Atom::NameDown(n) => all()
 			.filter(|&r| return g.name[r] == n)
 			.flat_map(|r| {
-				let kids: Vec<usize> =
-					all().filter(|&c| return g.parent[c] == Some(r)).collect();
+				let kids: Vec<usize> = all().filter(|&c| return g.parent[c] == Some(r)).collect();
 				let mut v = Vec::new();
 				if !kids.is_empty() {
 					if !route {
@@ -253,8 +256,10 @@ fn eval_rows(g: &Grid, expr: &str) -> Result<Vec<usize>, String> {
 		if bounds {
 			let (prows, _pv) = pending.take().unwrap_or_default();
 			let inside: BTreeSet<usize> = rows.into_iter().collect();
-			let mut mid: Vec<usize> =
-				prows.into_iter().filter(|r| return inside.contains(r)).collect();
+			let mut mid: Vec<usize> = prows
+				.into_iter()
+				.filter(|r| return inside.contains(r))
+				.collect();
 			mid.sort_unstable();
 			flush(mid, &mut out, &mut seen);
 		} else {

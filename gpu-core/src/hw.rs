@@ -1,9 +1,9 @@
-use ogdl::log::{Write, gpu};
 use core::array::from_fn;
 use core::cmp;
 use core::mem::transmute_copy;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use ogdl::log::{Write, gpu};
 use std::env;
 use std::fs;
 use std::io::{Error, Read as _, Write as _};
@@ -42,9 +42,8 @@ pub fn install_fast_death() {
 		};
 		let handler_fn: extern "C" fn(libc::c_int) = fast_death;
 		// SAFETY: a C fn pointer and sighandler_t (size_t) are both pointer-width; reinterpret its address bits.
-		let handler: libc::sighandler_t = unsafe {
-			transmute_copy::<extern "C" fn(libc::c_int), libc::sighandler_t>(&handler_fn)
-		};
+		let handler: libc::sighandler_t =
+			unsafe { transmute_copy::<extern "C" fn(libc::c_int), libc::sighandler_t>(&handler_fn) };
 		// SAFETY: registers our async-signal-safe handler for SIGABRT.
 		unsafe {
 			libc::signal(libc::SIGABRT, handler);
@@ -171,9 +170,7 @@ pub fn spawn_thrash_watchdog() {
 				return;
 			}
 			// SAFETY: this arm runs only when raw >= 0, a valid owned fd that File adopts.
-			cmp::Ordering::Equal | cmp::Ordering::Greater => unsafe {
-				fs::File::from_raw_fd(raw)
-			},
+			cmp::Ordering::Equal | cmp::Ordering::Greater => unsafe { fs::File::from_raw_fd(raw) },
 		};
 		let mut args = SmiArgs {
 			gpuid: gpu_idx,
@@ -227,10 +224,9 @@ pub fn spawn_thrash_watchdog() {
 							));
 							return;
 						}
-						GpuEvent::Restored => Write::line(
-							gpu,
-							format!("gpu event  queue restored  {}", ev.trim()),
-						),
+						GpuEvent::Restored => {
+							Write::line(gpu, format!("gpu event  queue restored  {}", ev.trim()))
+						}
 						GpuEvent::Other => {
 							Write::line(gpu, format!("gpu event  {}", ev.trim()));
 						}

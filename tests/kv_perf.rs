@@ -1,10 +1,9 @@
-
-use std::time::Instant;
-use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use recipe_infer::gguf::Gguf;
 use recipe_infer::llm::{ChatSession, Tok};
 use recipe_infer::tokenizer::from_gguf;
+use std::path::PathBuf;
+use std::time::Instant;
 
 const MODEL_KEY: &str = "qwen3-0.6b-q8_0";
 const MIN_PROMPT_TOKENS: usize = 2000;

@@ -1,14 +1,12 @@
 use gpu_core::kernels;
-use recipe_runtime::execute::{
-	LossScale, StepScalars, download_scalar, download_vec, metric_gpu_into,
-};
 use recipe::{Infer, Loss, Metric, Model, Train, mse};
 use recipe_infer::*;
-use recipe_runtime::{
-	LayerParams, PlanMode, SCRATCH_CONSTS, Saved, Scratch, concat_layer, forward_into,
-	load_ogdl_str, plan_layer_params,
-};
 use recipe_ir::{Activation, ConcatDims, LayerKind, LayerSpec};
+use recipe_runtime::execute::{LossScale, StepScalars, download_scalar, download_vec, metric_gpu_into};
+use recipe_runtime::{
+	LayerParams, PlanMode, SCRATCH_CONSTS, Saved, Scratch, concat_layer, forward_into, load_ogdl_str,
+	plan_layer_params,
+};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -39,10 +37,7 @@ fn builders_are_owned_not_leaked() {
 	let cycle = |p: &str| {
 		let _m = Model::new().layer(64).relu().layer(1).loss(mse).lr(0.01);
 		let _t = Train::new().epochs(10).log_every(2);
-		let _d = recipe::Data::load(p)
-			.split(0.5)
-			.exclude("none")
-			.target("y");
+		let _d = recipe::Data::load(p).split(0.5).exclude("none").target("y");
 	};
 	const WARM: usize = 5_000;
 	const N: usize = 50_000;
@@ -144,8 +139,8 @@ fn attn_backward(
 	.expect("attn wo backward");
 	kernels::gpu_sgd_update(&sc.a_gw, &ss.neg_lr, d * d, &p.wo).expect("sgd wo");
 	kernels::gpu_flash_attention_backward_into(
-		&sc.a_q, &sc.a_k, &sc.a_v, &sc.a_ctx, &sc.a_dctx, &sc.a_lse, n, s, d, heads,
-		&sc.a_dsum, &sc.a_dq, &sc.a_dk, &sc.a_dv,
+		&sc.a_q, &sc.a_k, &sc.a_v, &sc.a_ctx, &sc.a_dctx, &sc.a_lse, n, s, d, heads, &sc.a_dsum, &sc.a_dq,
+		&sc.a_dk, &sc.a_dv,
 	)
 	.expect("flash attn backward");
 	gpu_core::rope::gpu_rope_qk_heads_inplace(
@@ -240,12 +235,9 @@ fn backward_step(
 		let da_below = if flip { da_cur } else { da_next };
 		if params[l].kind == LayerKind::Embed {
 			let p = &params[l];
-			kernels::gpu_scale_inplace(&ss.zero, p.vocab * p.dim, &sc.embed_grad)
-				.expect("embed zero");
-			kernels::gpu_scatter_add(x, da, n * p.in_dim, p.dim, &sc.embed_grad)
-				.expect("embed scatter");
-			kernels::gpu_sgd_update(&sc.embed_grad, &ss.neg_lr, p.vocab * p.dim, &p.w)
-				.expect("sgd embed");
+			kernels::gpu_scale_inplace(&ss.zero, p.vocab * p.dim, &sc.embed_grad).expect("embed zero");
+			kernels::gpu_scatter_add(x, da, n * p.in_dim, p.dim, &sc.embed_grad).expect("embed scatter");
+			kernels::gpu_sgd_update(&sc.embed_grad, &ss.neg_lr, p.vocab * p.dim, &p.w).expect("sgd embed");
 			sc.mark_bwd(l);
 			flip = !flip;
 			continue;
@@ -265,68 +257,37 @@ fn backward_step(
 			let lout = (lin - k) / stride + 1;
 			let grad = match p.act {
 				Activation::Relu => {
-					kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz)
-						.expect("relu bwd");
+					kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz).expect("relu bwd");
 					&sc.dz
 				}
 				Activation::Sigmoid => {
-					kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz)
-						.expect("sigmoid bwd");
+					kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz).expect("sigmoid bwd");
 					&sc.dz
 				}
 				Activation::LeakyRelu => {
-					kernels::gpu_leaky_relu_backward_into(
-						da,
-						&sc.acts[l],
-						&sc.c_leaky_alpha,
-						m,
-						&sc.dz,
-					)
-					.expect("leaky bwd");
+					kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.c_leaky_alpha, m, &sc.dz)
+						.expect("leaky bwd");
 					&sc.dz
 				}
 				Activation::PRelu => {
-					kernels::gpu_leaky_relu_backward_into(
-						da,
-						&sc.acts[l],
-						&p.palpha,
-						m,
-						&sc.dz,
-					)
-					.expect("prelu bwd");
-					kernels::gpu_relu_into(&sc.preact[l], m, &sc.prelu_t0)
-						.expect("prelu relu");
-					kernels::gpu_copy_into(&sc.preact[l], m, &sc.prelu_t1)
-						.expect("prelu copy");
-					kernels::gpu_sub_inplace(&sc.prelu_t0, m, &sc.prelu_t1)
-						.expect("prelu sub");
+					kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &p.palpha, m, &sc.dz)
+						.expect("prelu bwd");
+					kernels::gpu_relu_into(&sc.preact[l], m, &sc.prelu_t0).expect("prelu relu");
+					kernels::gpu_copy_into(&sc.preact[l], m, &sc.prelu_t1).expect("prelu copy");
+					kernels::gpu_sub_inplace(&sc.prelu_t0, m, &sc.prelu_t1).expect("prelu sub");
 					kernels::gpu_mul_inplace(da, m, &sc.prelu_t1).expect("prelu mul");
-					kernels::gpu_reduce_sum_cols_into(
-						&sc.prelu_t1,
-						&sc.reduce_ws,
-						m,
-						1,
-						&sc.prelu_scalar,
-					)
-					.expect("prelu reduce");
-					kernels::gpu_sgd_update(&sc.prelu_scalar, &ss.neg_lr, 1, &p.palpha)
-						.expect("sgd prelu");
+					kernels::gpu_reduce_sum_cols_into(&sc.prelu_t1, &sc.reduce_ws, m, 1, &sc.prelu_scalar)
+						.expect("prelu reduce");
+					kernels::gpu_sgd_update(&sc.prelu_scalar, &ss.neg_lr, 1, &p.palpha).expect("sgd prelu");
 					&sc.dz
 				}
 				Activation::Tanh => {
-					kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz)
-						.expect("tanh bwd");
+					kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz).expect("tanh bwd");
 					&sc.dz
 				}
 				Activation::Elu => {
-					gpu_core::k_gapact::gpu_elu_backward(
-						da,
-						&sc.preact[l],
-						&sc.c_elu_alpha,
-						m,
-						&sc.dz,
-					)
-					.expect("elu bwd");
+					gpu_core::k_gapact::gpu_elu_backward(da, &sc.preact[l], &sc.c_elu_alpha, m, &sc.dz)
+						.expect("elu bwd");
 					&sc.dz
 				}
 				Activation::Selu => {
@@ -342,13 +303,11 @@ fn backward_step(
 					&sc.dz
 				}
 				Activation::Silu => {
-					kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz)
-						.expect("silu bwd");
+					kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("silu bwd");
 					&sc.dz
 				}
 				Activation::Gelu => {
-					kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz)
-						.expect("gelu bwd");
+					kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("gelu bwd");
 					&sc.dz
 				}
 				Activation::Linear => da,
@@ -370,16 +329,12 @@ fn backward_step(
 			)
 			.expect("conv filter bwd");
 			kernels::gpu_scale_inplace(&ss.zero, cout, &sc.db).expect("conv db zero");
-			kernels::gpu_conv1d_backward_bias_into(grad, n, cout, lout, &sc.db)
-				.expect("conv bias bwd");
+			kernels::gpu_conv1d_backward_bias_into(grad, n, cout, lout, &sc.db).expect("conv bias bwd");
 			if l > 0 {
-				kernels::gpu_conv1d_backward_data_into(
-					grad, &p.w, n, cin, lin, cout, k, stride, da_below,
-				)
-				.expect("conv data bwd");
+				kernels::gpu_conv1d_backward_data_into(grad, &p.w, n, cin, lin, cout, k, stride, da_below)
+					.expect("conv data bwd");
 			}
-			kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, cout * cin * k, &p.w)
-				.expect("sgd conv w");
+			kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, cout * cin * k, &p.w).expect("sgd conv w");
 			kernels::gpu_sgd_update(&sc.db, &ss.neg_lr, cout, &p.b).expect("sgd conv b");
 			sc.mark_bwd(l);
 			flip = !flip;
@@ -387,65 +342,37 @@ fn backward_step(
 		}
 		let grad = match params[l].act {
 			Activation::Relu => {
-				kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz)
-					.expect("relu bwd");
+				kernels::gpu_relu_backward_into(da, &sc.acts[l], m, &sc.dz).expect("relu bwd");
 				&sc.dz
 			}
 			Activation::Sigmoid => {
-				kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz)
-					.expect("sigmoid bwd");
+				kernels::gpu_sigmoid_backward_into(da, &sc.acts[l], m, &sc.dz).expect("sigmoid bwd");
 				&sc.dz
 			}
 			Activation::LeakyRelu => {
-				kernels::gpu_leaky_relu_backward_into(
-					da,
-					&sc.acts[l],
-					&sc.c_leaky_alpha,
-					m,
-					&sc.dz,
-				)
-				.expect("leaky bwd");
+				kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &sc.c_leaky_alpha, m, &sc.dz)
+					.expect("leaky bwd");
 				&sc.dz
 			}
 			Activation::PRelu => {
-				kernels::gpu_leaky_relu_backward_into(
-					da,
-					&sc.acts[l],
-					&params[l].palpha,
-					m,
-					&sc.dz,
-				)
-				.expect("prelu bwd");
+				kernels::gpu_leaky_relu_backward_into(da, &sc.acts[l], &params[l].palpha, m, &sc.dz)
+					.expect("prelu bwd");
 				kernels::gpu_relu_into(&sc.preact[l], m, &sc.prelu_t0).expect("prelu relu");
 				kernels::gpu_copy_into(&sc.preact[l], m, &sc.prelu_t1).expect("prelu copy");
 				kernels::gpu_sub_inplace(&sc.prelu_t0, m, &sc.prelu_t1).expect("prelu sub");
 				kernels::gpu_mul_inplace(da, m, &sc.prelu_t1).expect("prelu mul");
-				kernels::gpu_reduce_sum_cols_into(
-					&sc.prelu_t1,
-					&sc.reduce_ws,
-					m,
-					1,
-					&sc.prelu_scalar,
-				)
-				.expect("prelu reduce");
-				kernels::gpu_sgd_update(&sc.prelu_scalar, &ss.neg_lr, 1, &params[l].palpha)
-					.expect("sgd prelu");
+				kernels::gpu_reduce_sum_cols_into(&sc.prelu_t1, &sc.reduce_ws, m, 1, &sc.prelu_scalar)
+					.expect("prelu reduce");
+				kernels::gpu_sgd_update(&sc.prelu_scalar, &ss.neg_lr, 1, &params[l].palpha).expect("sgd prelu");
 				&sc.dz
 			}
 			Activation::Tanh => {
-				kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz)
-					.expect("tanh bwd");
+				kernels::gpu_tanh_backward_into(da, &sc.acts[l], m, &sc.dz).expect("tanh bwd");
 				&sc.dz
 			}
 			Activation::Elu => {
-				gpu_core::k_gapact::gpu_elu_backward(
-					da,
-					&sc.preact[l],
-					&sc.c_elu_alpha,
-					m,
-					&sc.dz,
-				)
-				.expect("elu bwd");
+				gpu_core::k_gapact::gpu_elu_backward(da, &sc.preact[l], &sc.c_elu_alpha, m, &sc.dz)
+					.expect("elu bwd");
 				&sc.dz
 			}
 			Activation::Selu => {
@@ -461,13 +388,11 @@ fn backward_step(
 				&sc.dz
 			}
 			Activation::Silu => {
-				kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz)
-					.expect("silu bwd");
+				kernels::gpu_silu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("silu bwd");
 				&sc.dz
 			}
 			Activation::Gelu => {
-				kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz)
-					.expect("gelu bwd");
+				kernels::gpu_gelu_backward_into(da, &sc.preact[l], m, &sc.dz).expect("gelu bwd");
 				&sc.dz
 			}
 			Activation::Linear => da,
@@ -481,13 +406,10 @@ fn backward_step(
 			&sc.acts[l - 1]
 		};
 		if out_dim == 1 {
-			kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, n, 1, in_dim, &sc.dw)
-				.expect("splitk dw");
-			kernels::gpu_reduce_sum_cols_into(grad, &sc.reduce_ws, n, 1, &sc.db)
-				.expect("db reduce");
+			kernels::gpu_splitk_dw_into(a_prev, grad, &sc.dw_partials, n, 1, in_dim, &sc.dw).expect("splitk dw");
+			kernels::gpu_reduce_sum_cols_into(grad, &sc.reduce_ws, n, 1, &sc.db).expect("db reduce");
 			if l > 0 {
-				kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, da_below)
-					.expect("dger");
+				kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, da_below).expect("dger");
 			}
 		} else if l > 0 {
 			kernels::gpu_linear_backward_full_into(
@@ -518,14 +440,12 @@ fn backward_step(
 			)
 			.expect("linear weights bwd");
 		}
-		kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, in_dim * out_dim, &params[l].w)
-			.expect("sgd w");
+		kernels::gpu_sgd_update(&sc.dw, &ss.neg_lr, in_dim * out_dim, &params[l].w).expect("sgd w");
 		kernels::gpu_sgd_update(&sc.db, &ss.neg_lr, out_dim, &params[l].b).expect("sgd b");
 		if let Some(ConcatDims { pf, a, c }) = cc
 			&& l == pf
 		{
-			kernels::gpu_slice_lead_into(da_below, n, a + c, a, &sc.concat_dgrad)
-				.expect("concat slice");
+			kernels::gpu_slice_lead_into(da_below, n, a + c, a, &sc.concat_dgrad).expect("concat slice");
 			kernels::gpu_copy_into(&sc.concat_dgrad, n * a, da_below).expect("concat copy");
 		}
 		sc.mark_bwd(l);
@@ -689,8 +609,7 @@ fn gpu_metrics_match_cpu_reference() {
 	let out = &sc.acts[last];
 	let metric = |m: Metric, lossfn: Loss| -> f64 {
 		let LossScale { sign, div } =
-			metric_gpu_into(lossfn, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar)
-				.expect("metric");
+			metric_gpu_into(lossfn, m, out, &ybuf, &sc, n, 1, ss_tot, &sc.metric_scalar).expect("metric");
 		let v = sign * download_scalar(&sc.metric_scalar).expect("download") / div;
 		if m == Metric::R2 { 1.0 - v } else { v }
 	};
@@ -840,8 +759,7 @@ fn fit_loop_memory_flat() {
 		for _ in 0..EPOCHS {
 			forward_into(&params, &xbuf, None, n, &sc.acts, &sc).expect("forward");
 			backward_step(Loss::Mse, &params, &xbuf, &ybuf, n, &sc, &ss);
-			kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar)
-				.expect("ss_res");
+			kernels::gpu_ss_res_into(&sc.acts[last], &ybuf, n, &sc.metric_scalar).expect("ss_res");
 			r2s.push(1.0 - download_scalar(&sc.metric_scalar).expect("download") / ss_tot);
 		}
 	}
@@ -996,8 +914,7 @@ fn ping_pong_gradients_match_per_layer() {
 		.max()
 		.unwrap_or(0);
 	let ref_ws =
-		GpuBuffer::alloc_bytes(max_ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1)))
-			.expect("ref ws");
+		GpuBuffer::alloc_bytes(max_ws.max(kernels::gpu_reduce_sum_cols_workspace_bytes(n, 1))).expect("ref ws");
 	let ref_partials = GpuBuffer::alloc(
 		params.iter()
 			.map(|p| kernels::gpu_splitk_dw_partials_elems(n, p.in_dim, p.out_dim))
@@ -1028,8 +945,7 @@ fn ping_pong_gradients_match_per_layer() {
 		let m = n * out_dim;
 		let grad = match params[l].act {
 			Activation::Relu => {
-				kernels::gpu_relu_backward_into(&ref_da[l], &sc.acts[l], m, &ref_dz[l])
-					.expect("relu bwd");
+				kernels::gpu_relu_backward_into(&ref_da[l], &sc.acts[l], m, &ref_dz[l]).expect("relu bwd");
 				&ref_dz[l]
 			}
 			Activation::Sigmoid => {
@@ -1043,11 +959,9 @@ fn ping_pong_gradients_match_per_layer() {
 		let a_prev = if l == 0 { &xbuf } else { &sc.acts[l - 1] };
 		if out_dim == 1 {
 			kernels::gpu_dgemv_into(a_prev, grad, n, in_dim, 1, &ref_dw[l]).expect("dgemv");
-			kernels::gpu_reduce_sum_cols_into(grad, &ref_ws, n, 1, &ref_db[l])
-				.expect("db reduce");
+			kernels::gpu_reduce_sum_cols_into(grad, &ref_ws, n, 1, &ref_db[l]).expect("db reduce");
 			if l > 0 {
-				kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, &ref_da[l - 1])
-					.expect("dger");
+				kernels::gpu_dger_into(grad, &params[l].w, n, in_dim, &ref_da[l - 1]).expect("dger");
 			}
 		} else if l > 0 {
 			kernels::gpu_linear_backward_full_into(
@@ -1078,8 +992,7 @@ fn ping_pong_gradients_match_per_layer() {
 			)
 			.expect("linear weights bwd");
 		}
-		kernels::gpu_sgd_update(&ref_dw[l], &ss.neg_lr, in_dim * out_dim, &params[l].w)
-			.expect("sgd w");
+		kernels::gpu_sgd_update(&ref_dw[l], &ss.neg_lr, in_dim * out_dim, &params[l].w).expect("sgd w");
 		kernels::gpu_sgd_update(&ref_db[l], &ss.neg_lr, out_dim, &params[l].b).expect("sgd b");
 	}
 	let ref_w: Vec<Vec<f64>> = params
@@ -1145,18 +1058,12 @@ fn metric_consts_both_casings() {
 		ogdl::log::chat,
 	]);
 	drop(i);
-	assert!(
-		ogdl::log::loss == ogdl::log::loss,
-		"flag self-equality"
-	);
+	assert!(ogdl::log::loss == ogdl::log::loss, "flag self-equality");
 	assert!(
 		ogdl::log::loss != ogdl::log::acc,
 		"distinct flags compare unequal"
 	);
-	assert!(
-		ogdl::log::chat != ogdl::log::r2,
-		"chat is its own flag"
-	);
+	assert!(ogdl::log::chat != ogdl::log::r2, "chat is its own flag");
 }
 
 #[test]
@@ -1167,7 +1074,9 @@ fn stacked_conv_checkpoint_roundtrip() {
 		LayerSpec::Dense(1, Activation::Linear),
 	];
 	let fresh = plan_layer_params(&specs, 784, 0, 0, &[], PlanMode::Fresh).expect("fresh plan");
-	let text = fresh.dump_ogdl_host(fresh.host(), "r2", 0.5).expect("dump_ogdl_host");
+	let text = fresh
+		.dump_ogdl_host(fresh.host(), "r2", 0.5)
+		.expect("dump_ogdl_host");
 	let saved = load_ogdl_str(&text).expect("parse roundtrip");
 	let convs = saved
 		.iter()
@@ -1177,8 +1086,7 @@ fn stacked_conv_checkpoint_roundtrip() {
 		convs, 2,
 		"two conv layers must save as two blocks, got {convs}"
 	);
-	let warm =
-		plan_layer_params(&specs, 784, 0, 0, &saved, PlanMode::Warm).expect("warm rehydrate");
+	let warm = plan_layer_params(&specs, 784, 0, 0, &saved, PlanMode::Warm).expect("warm rehydrate");
 	assert_eq!(
 		warm.host().len(),
 		fresh.host().len(),
@@ -1201,9 +1109,8 @@ fn resolver_defaults_binary_target_to_bce() {
 	let model = Model::new().layer(8).leak().layer(1).sigmoid().lr(0.001);
 	Train::new().epochs(1).run(&data, &model).save(out_str);
 
-	let text = fs::read_to_string(&out).expect(
-		"saved ogdl unreadable — omitted-loss resolver failed to fit and save a Bce checkpoint",
-	);
+	let text = fs::read_to_string(&out)
+		.expect("saved ogdl unreadable — omitted-loss resolver failed to fit and save a Bce checkpoint");
 	let score_line = text
 		.lines()
 		.next()

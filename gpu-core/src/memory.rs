@@ -3,12 +3,10 @@ extern crate alloc;
 use crate::HipError;
 use crate::callspy;
 use crate::hip::{
-	HIP_MEMCPY_D2D, HIP_MEMCPY_D2H, HIP_MEMCPY_H2D, MemInfo, check, device_synchronize,
-	disable_sdma_once, hipFreeAsync, hipMallocAsync, hipMemcpyAsync, hipMemsetAsync,
-	hipStreamSynchronize, host_free, host_malloc, mem_info, pool_slack,
-	register_fault_autopsy_once, set_pool_retain, sysfs_vram_free, trim_mempool,
+	HIP_MEMCPY_D2D, HIP_MEMCPY_D2H, HIP_MEMCPY_H2D, MemInfo, check, device_synchronize, disable_sdma_once,
+	hipFreeAsync, hipMallocAsync, hipMemcpyAsync, hipMemsetAsync, hipStreamSynchronize, host_free, host_malloc,
+	mem_info, pool_slack, register_fault_autopsy_once, set_pool_retain, sysfs_vram_free, trim_mempool,
 };
-use ogdl::log::{Write, gpu};
 use alloc::collections::BTreeMap;
 use core::cell::Cell;
 use core::cmp;
@@ -18,6 +16,7 @@ use core::marker::PhantomData;
 use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use ogdl::log::{Write, gpu};
 use std::fs;
 use std::num;
 use std::sync::{Mutex, MutexGuard, Once};
@@ -198,21 +197,11 @@ pub fn kernel_fdinfo() -> Option<FdinfoMem> {
 				Some(v) => client_id = Some(v.trim().to_owned()),
 				None => match line.strip_prefix("drm-memory-vram:") {
 					Some(v) => {
-						vram_kib = v
-							.trim()
-							.trim_end_matches("KiB")
-							.trim()
-							.parse()
-							.unwrap_or(0);
+						vram_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
 					}
 					None => {
 						if let Some(v) = line.strip_prefix("drm-memory-gtt:") {
-							gtt_kib = v
-								.trim()
-								.trim_end_matches("KiB")
-								.trim()
-								.parse()
-								.unwrap_or(0);
+							gtt_kib = v.trim().trim_end_matches("KiB").trim().parse().unwrap_or(0);
 						}
 					}
 				},
@@ -271,11 +260,8 @@ pub fn ledger_vramspy_section(total_live: usize) -> String {
 			let allocs_fn = to_u32_u64(sym(c"vramspy_allocs"));
 			let frees_fn = to_u32_u64(sym(c"vramspy_frees"));
 			// SAFETY: sym returns the dlsym address for vramspy_unknown_frees with exactly this ABI.
-			let unknown_frees_fn = unsafe {
-				mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(
-					c"vramspy_unknown_frees",
-				))
-			};
+			let unknown_frees_fn =
+				unsafe { mem::transmute::<*mut c_void, extern "C" fn() -> u64>(sym(c"vramspy_unknown_frees")) };
 
 			s += "  global (vramspy, every byte incl. runtime+libs)\n";
 			let kinds = [
@@ -633,9 +619,7 @@ pub fn claim_device_arena_with_image(image: &[f64]) -> Option<GpuBuffer> {
 #[inline]
 pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Option<GpuBuffer> {
 	if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-		Write::error(
-			"claim_device_arena: a device arena is already active",
-		);
+		Write::error("claim_device_arena: a device arena is already active");
 		return None;
 	}
 	let _t = tag_scope("unclaimed");
@@ -659,9 +643,7 @@ pub fn claim_device_arena_bytes_with_image(mut want: usize, image: &[f64]) -> Op
 #[inline]
 pub fn release_device_arena(slab: GpuBuffer) {
 	if ARENA_BASE.load(Ordering::Relaxed) != slab.ptr_addr() {
-		Write::error(
-			"release_device_arena: slab is not the active claim",
-		);
+		Write::error("release_device_arena: slab is not the active claim");
 		return;
 	}
 	if let Err(e) = device_synchronize() {
@@ -698,9 +680,7 @@ static PARKED_GEN: AtomicUsize = AtomicUsize::new(0);
 pub fn park_run_backing(buf: GpuBuffer) {
 	let mut g = lock_recover(&PARKED, "PARKED");
 	if !g.is_none() {
-		Write::error(
-			"park_run_backing: a parked run backing already exists",
-		);
+		Write::error("park_run_backing: a parked run backing already exists");
 		return;
 	}
 	*g = Some(buf);
@@ -713,8 +693,7 @@ pub fn park_run_backing(buf: GpuBuffer) {
 
 #[inline]
 pub fn live_parked_gen() -> Option<usize> {
-	return num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed))
-		.map(num::NonZeroUsize::get);
+	return num::NonZeroUsize::new(PARKED_GEN.load(Ordering::Relaxed)).map(num::NonZeroUsize::get);
 }
 
 enum ParkKind {
@@ -1220,11 +1199,7 @@ fn pinned_at(slot: usize) -> Result<usize, HipError> {
 	return Ok(g.0 + slot * size_of::<f64>());
 }
 
-pub fn pinned_download(
-	slot: usize,
-	src: &GpuBuffer,
-	stream: &crate::hip::Stream,
-) -> Result<(), HipError> {
+pub fn pinned_download(slot: usize, src: &GpuBuffer, stream: &crate::hip::Stream) -> Result<(), HipError> {
 	let dst = pinned_at(slot)? as *mut c_void;
 	// SAFETY: dst is one f64 slot inside the claimed pinned region; src covers 8 bytes.
 	unsafe {
@@ -1354,7 +1329,11 @@ pub fn carve_miss_message(asked_bytes: usize) -> String {
 
 #[must_use]
 fn gpu_busy_percent() -> Option<u32> {
-	for card in fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+	for card in fs::read_dir("/sys/class/drm")
+		.into_iter()
+		.flatten()
+		.flatten()
+	{
 		let p = card.path().join("device/gpu_busy_percent");
 		let Ok(text) = fs::read_to_string(&p) else {
 			continue;
@@ -1411,7 +1390,12 @@ pub fn ram_probe_ask() -> usize {
 		.lines()
 		.find_map(|l| return l.strip_prefix("MemAvailable:"))
 		.and_then(|rest| {
-			return rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok();
+			return rest
+				.trim()
+				.trim_end_matches("kB")
+				.trim()
+				.parse::<usize>()
+				.ok();
 		})
 	else {
 		panic!("MemAvailable missing from /proc/meminfo");
@@ -1487,7 +1471,6 @@ impl ImgLayout {
 			ImgLayout::L11_11_10 => &[11, 11, 10],
 		};
 	}
-
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1584,80 +1567,79 @@ pub enum Dtype {
 	Img(ImgLayout, ImgFmt),
 }
 
-
 impl Dtype {
-      #[inline]
-      #[must_use]
-      pub const fn elem_size(self) -> usize {
-            return match self {
-                  Self::F64 | Self::F64x2 => 8,
-                  Self::F32 | Self::Tf32 | Self::Xf32 => 4,
-                  Self::F16 | Self::BF16 => 2,
-                  _other => 1,
-            };
-      }
+	#[inline]
+	#[must_use]
+	pub const fn elem_size(self) -> usize {
+		return match self {
+			Self::F64 | Self::F64x2 => 8,
+			Self::F32 | Self::Tf32 | Self::Xf32 => 4,
+			Self::F16 | Self::BF16 => 2,
+			_other => 1,
+		};
+	}
 
-      #[inline]
-      #[must_use]
-      pub const fn ffi(self) -> i32 {
-            return match self {
-                  Self::F32 => 1,
-                  Self::F64 => 0,
-                  Self::F16 => 2,
-                  Self::BF16 => 3,
-                  _other => -1,
-            };
-      }
+	#[inline]
+	#[must_use]
+	pub const fn ffi(self) -> i32 {
+		return match self {
+			Self::F32 => 1,
+			Self::F64 => 0,
+			Self::F16 => 2,
+			Self::BF16 => 3,
+			_other => -1,
+		};
+	}
 
-      #[inline]
-      #[must_use]
-      pub const fn conv(self) -> i32 {
-            return match self {
-                  Self::F64 => 0,
-                  Self::F32 => 1,
-                  Self::F16 => 2,
-                  Self::BF16 => 3,
-                  Self::Q4_0 => 10,
-                  Self::Q4_1 => 11,
-                  Self::Q5_0 => 12,
-                  Self::Q5_1 => 13,
-                  Self::Q8_0 => 14,
-                  Self::Q2K => 20,
-                  Self::Q3K => 21,
-                  Self::Q4K => 22,
-                  Self::Q5K => 23,
-                  Self::Q6K => 24,
-                  _other => -1,
-            };
-      }
+	#[inline]
+	#[must_use]
+	pub const fn conv(self) -> i32 {
+		return match self {
+			Self::F64 => 0,
+			Self::F32 => 1,
+			Self::F16 => 2,
+			Self::BF16 => 3,
+			Self::Q4_0 => 10,
+			Self::Q4_1 => 11,
+			Self::Q5_0 => 12,
+			Self::Q5_1 => 13,
+			Self::Q8_0 => 14,
+			Self::Q2K => 20,
+			Self::Q3K => 21,
+			Self::Q4K => 22,
+			Self::Q5K => 23,
+			Self::Q6K => 24,
+			_other => -1,
+		};
+	}
 
-      #[inline]
-      #[must_use]
-      pub const fn block_elems(self) -> usize {
-            return match self {
-                  Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
-                  Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
-                  _other => 1,
-            };
-      }
+	#[inline]
+	#[must_use]
+	pub const fn block_elems(self) -> usize {
+		return match self {
+			Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
+			Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
+			_other => 1,
+		};
+	}
 
-      #[inline]
-      #[must_use]
-      pub const fn block_bytes(self) -> usize {
-            return match self {
-                  Self::Q4_0 => 18,
-                  Self::Q4_1 => 20,
-                  Self::Q5_0 => 22,
-                  Self::Q5_1 => 24,
-                  Self::Q8_0 => 34,
-                  Self::Q2K => 84,
-                  Self::Q3K => 110,
-                  Self::Q4K => 144,
-                  Self::Q5K => 176,
-                  Self::Q6K => 210,
-                  _other => self.elem_size(),
-            };
-      }
+	#[inline]
+	#[must_use]
+	pub const fn block_bytes(self) -> usize {
+		return match self {
+			Self::Q4_0 => 18,
+			Self::Q4_1 => 20,
+			Self::Q5_0 => 22,
+			Self::Q5_1 => 24,
+			Self::Q8_0 => 34,
+			Self::Q2K => 84,
+			Self::Q3K => 110,
+			Self::Q4K => 144,
+			Self::Q5K => 176,
+			Self::Q6K => 210,
+			_other => self.elem_size(),
+		};
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -1823,9 +1805,7 @@ impl GpuBuffer {
 			return None;
 		}
 		if ARENA_BASE.load(Ordering::Relaxed) != 0 {
-			Write::error(
-				"claim_map_bytes: a device arena is already active",
-			);
+			Write::error("claim_map_bytes: a device arena is already active");
 			return None;
 		}
 		ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1837,7 +1817,10 @@ impl GpuBuffer {
 		}
 		let (ptr, handles) = vmm_map_span(n_bytes)?;
 		if let Some(mut g) = lock_or_log(&ARENA_VMM, "ARENA_VMM") {
-			*g = Some((ptr.addr(), handles.iter().map(|h| return h.addr()).collect()));
+			*g = Some((
+				ptr.addr(),
+				handles.iter().map(|h| return h.addr()).collect(),
+			));
 		}
 		tag_add(tag, n_bytes);
 		note_range(ptr.addr(), n_bytes, tag);
@@ -2142,11 +2125,7 @@ impl GpuBuffer {
 	}
 
 	#[inline]
-	pub unsafe fn download_async(
-		&self,
-		dst: &mut [f64],
-		stream: *mut c_void,
-	) -> Result<(), HipError> {
+	pub unsafe fn download_async(&self, dst: &mut [f64], stream: *mut c_void) -> Result<(), HipError> {
 		let bytes = mem::size_of_val(dst);
 		// SAFETY: self.ptr is a valid device pointer for `bytes`; dst is valid for `bytes`.
 		unsafe {
@@ -2249,8 +2228,7 @@ impl Drop for GpuBuffer {
 		FREE_TOTAL.fetch_add(1, Ordering::Relaxed);
 		match mem::replace(&mut self.owned, Ownership::Borrow) {
 			Ownership::Vmm => {
-				let taken =
-					lock_or_log(&ARENA_VMM, "ARENA_VMM").and_then(|mut g| return g.take());
+				let taken = lock_or_log(&ARENA_VMM, "ARENA_VMM").and_then(|mut g| return g.take());
 				if let Some((_va, addrs)) = taken {
 					let ptrs: Vec<*mut c_void> = addrs
 						.iter()

@@ -1,4 +1,5 @@
 use pantry::data::{DirGroup, RawCsv, load_groups, load_zip_groups, read_raw_csv, sniff_delimiter};
+use pantry::formats::MemAccount;
 use std::env;
 use std::fs;
 use std::io::Write as _;
@@ -15,7 +16,7 @@ fn tmp(name: &str, body: &str) -> PathBuf {
 #[test]
 fn headerless_numeric_first_row_is_data() {
 	let p = tmp("numeric.csv", "1.0,2,3.29662E-05\n4,5,6\n-7,8.5,9\n");
-	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
+	let RawCsv { headers, rows } = read_raw_csv(&p, &MemAccount::start()).unwrap();
 	assert_eq!(headers, vec!["col1", "col2", "col3"]);
 	assert_eq!(rows.len(), 3, "first numeric row must be kept, not eaten");
 	assert_eq!(rows[0], vec!["1.0", "2", "3.29662E-05"]);
@@ -24,7 +25,7 @@ fn headerless_numeric_first_row_is_data() {
 #[test]
 fn named_first_row_is_header() {
 	let p = tmp("named.csv", "age,city,score\n31,nyc,9.5\n");
-	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
+	let RawCsv { headers, rows } = read_raw_csv(&p, &MemAccount::start()).unwrap();
 	assert_eq!(headers, vec!["age", "city", "score"]);
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0], vec!["31", "nyc", "9.5"]);
@@ -33,7 +34,7 @@ fn named_first_row_is_header() {
 #[test]
 fn single_numeric_column_headerless() {
 	let p = tmp("single.csv", "3.29662E-05\n1.1\n2.2\n3.3\n");
-	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
+	let RawCsv { headers, rows } = read_raw_csv(&p, &MemAccount::start()).unwrap();
 	assert_eq!(headers, vec!["col1"]);
 	assert_eq!(rows.len(), 4);
 }
@@ -78,7 +79,7 @@ fn space_delimiter_is_sniffed() {
 fn prose_line_is_not_space_delimited() {
 	let p = tmp("prose.txt", "the quick brown fox\njumps over 3 dogs\n");
 	assert_eq!(sniff_delimiter(&p), b',');
-	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
+	let RawCsv { headers, rows } = read_raw_csv(&p, &MemAccount::start()).unwrap();
 	assert_eq!(headers, vec!["the quick brown fox"]);
 	assert_eq!(rows, vec![vec!["jumps over 3 dogs"]]);
 }
@@ -89,7 +90,7 @@ fn whitespace_matrix_headerless_keeps_rows() {
 		env!("CARGO_MANIFEST_DIR"),
 		"/examples/datasets/uci-har-sensor/UCI HAR Dataset/train/X_train.txt"
 	));
-	let RawCsv { headers, rows } = read_raw_csv(p).unwrap();
+	let RawCsv { headers, rows } = read_raw_csv(p, &MemAccount::start()).unwrap();
 	assert_eq!(headers.len(), 561);
 	assert_eq!(headers[0], "col1");
 	assert_eq!(headers[560], "col561");

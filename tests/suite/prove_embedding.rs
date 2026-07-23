@@ -25,13 +25,7 @@ unsafe extern "C" {
 		mode: i32,
 		s: *mut c_void,
 	);
-	fn launch_embeddingx_one_hot(
-		indices: *const c_void,
-		out: *mut c_void,
-		n: i32,
-		c: i32,
-		s: *mut c_void,
-	);
+	fn launch_embeddingx_one_hot(indices: *const c_void, out: *mut c_void, n: i32, c: i32, s: *mut c_void);
 	fn launch_embeddingx_rope(
 		x: *const c_void,
 		cosb: *const c_void,
@@ -85,14 +79,7 @@ fn gpu_lookup(table: &[f64], indices: &[i32], n: usize, d: usize) -> Vec<f64> {
 	out
 }
 
-fn gpu_bag(
-	table: &[f64],
-	indices: &[i32],
-	offsets: &[i32],
-	n_bags: usize,
-	d: usize,
-	mode: i32,
-) -> Vec<f64> {
+fn gpu_bag(table: &[f64], indices: &[i32], offsets: &[i32], n_bags: usize, d: usize, mode: i32) -> Vec<f64> {
 	let bt = {
 		let __up = table;
 		let __ub = GpuBuffer::alloc(__up.len()).unwrap();
@@ -365,10 +352,8 @@ fn prove_rope_bwd() -> bool {
 // ── canonicalization: embedding-category JSON name -> registry key ──────────
 fn canon(name: &str) -> String {
 	let lname = name.to_lowercase();
-	let is_bwd = lname.contains("backward")
-		|| lname.contains("_bwd")
-		|| lname.ends_with("_grad")
-		|| lname.contains("grad");
+	let is_bwd =
+		lname.contains("backward") || lname.contains("_bwd") || lname.ends_with("_grad") || lname.contains("grad");
 
 	let is_rope = lname.contains("rope") || lname.contains("rotary");
 	if is_rope {

@@ -37,19 +37,8 @@ unsafe extern "C" {
 		mean_flag: i32,
 		stream: *mut c_void,
 	);
-	fn launch_degree(
-		edge_dst: *const c_void,
-		deg: *mut c_void,
-		n_edges: i32,
-		stream: *mut c_void,
-	);
-	fn launch_gcn_norm(
-		features: *mut c_void,
-		deg: *const c_void,
-		n_nodes: i32,
-		feat: i32,
-		stream: *mut c_void,
-	);
+	fn launch_degree(edge_dst: *const c_void, deg: *mut c_void, n_edges: i32, stream: *mut c_void);
+	fn launch_gcn_norm(features: *mut c_void, deg: *const c_void, n_nodes: i32, feat: i32, stream: *mut c_void);
 }
 
 #[inline]
@@ -155,12 +144,7 @@ pub fn gpu_neighbor_aggregate(
 }
 
 #[inline]
-pub fn gpu_degree(
-	edge_dst: &GpuBuffer,
-	n_nodes: usize,
-	n_edges: usize,
-	deg_out: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_degree(edge_dst: &GpuBuffer, n_nodes: usize, n_edges: usize, deg_out: &GpuBuffer) -> Result<(), HipError> {
 	use crate::kernels::ci;
 	deg_out.memset_zero(n_nodes * mem::size_of::<f64>())?;
 	// SAFETY: edge_dst is a live device buffer for the launch duration.
@@ -177,12 +161,7 @@ pub fn gpu_degree(
 }
 
 #[inline]
-pub fn gpu_gcn_norm(
-	deg: &GpuBuffer,
-	n_nodes: usize,
-	feat: usize,
-	features: &GpuBuffer,
-) -> Result<(), HipError> {
+pub fn gpu_gcn_norm(deg: &GpuBuffer, n_nodes: usize, feat: usize, features: &GpuBuffer) -> Result<(), HipError> {
 	let nodes = ci(n_nodes)?;
 	let cols = ci(feat)?;
 	// SAFETY: device pointers are live GpuBuffer allocations that outlive the launch.

@@ -25,8 +25,7 @@ fn cpu_focal_grad(p: &[f64], y: &[f64], gamma: f64, alpha: f64, n_total: usize) 
 			let wt = 1.0 - p_t;
 			let sign_pt = if t > 0.5 { 1.0 } else { -1.0 };
 			let g = -alpha
-				* (gamma * wt.powf(gamma - 1.0) * (-sign_pt))
-					.mul_add(p_t.ln(), wt.powf(gamma) * sign_pt / p_t);
+				* (gamma * wt.powf(gamma - 1.0) * (-sign_pt)).mul_add(p_t.ln(), wt.powf(gamma) * sign_pt / p_t);
 			g / n_total as f64
 		})
 		.collect()
@@ -131,8 +130,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 
 	let want_f = cpu_focal_grad(&p, &y, gamma, alpha, n);
 	let da_f = GpuBuffer::alloc(n).expect("da_f");
-	gpu_core::losses::gpu_focal_grad_into(&bp, &by, &bgamma, &balpha, &inv_n, n, &da_f)
-		.expect("focal full");
+	gpu_core::losses::gpu_focal_grad_into(&bp, &by, &bgamma, &balpha, &inv_n, n, &da_f).expect("focal full");
 	unsafe { da_f.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");
 	for i in 0..n {
@@ -148,8 +146,7 @@ fn ragged_window_bce_focal_grad_matches_full_batch() {
 		let pw = view(&bp, s0 * 8, cnt * 8);
 		let yw = view(&by, s0 * 8, cnt * 8);
 		let dw = view(&da_fw, s0 * 8, cnt * 8);
-		gpu_core::losses::gpu_focal_grad_into(&pw, &yw, &bgamma, &balpha, &inv_n, cnt, &dw)
-			.expect("focal win");
+		gpu_core::losses::gpu_focal_grad_into(&pw, &yw, &bgamma, &balpha, &inv_n, cnt, &dw).expect("focal win");
 	}
 	unsafe { da_fw.download_async(&mut got, ptr::null_mut()) }.expect("dl");
 	gpu_core::hip::device_synchronize().expect("dl sync");

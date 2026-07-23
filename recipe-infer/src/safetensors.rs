@@ -17,8 +17,7 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 			bytes.len()
 		)
 	})?;
-	let header =
-		str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
+	let header = str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let data = &bytes[data_start..];
 	let Json::Obj(entries) = parse_json(header)? else {
 		bail!("safetensors: header is not a JSON object");
@@ -50,9 +49,8 @@ pub fn parse_safetensors_shaped(bytes: &[u8]) -> Result<Vec<ShapedTensor>> {
 				data.len()
 			)
 		})?;
-		let elem = elem_size(&dtype).ok_or_else(|| {
-			anyhow!("safetensors: tensor '{name}' unsupported dtype '{dtype}'")
-		})?;
+		let elem = elem_size(&dtype)
+			.ok_or_else(|| anyhow!("safetensors: tensor '{name}' unsupported dtype '{dtype}'"))?;
 		let count: usize = shape.iter().map(|&d| d as usize).product();
 		Some(raw.len())
 			.filter(|&len| len == count * elem)
@@ -105,8 +103,7 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader> {
 			bytes.len()
 		)
 	})?;
-	let header =
-		str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
+	let header = str::from_utf8(body).map_err(|e| anyhow!("safetensors: header is not utf8: {e}"))?;
 	let Json::Obj(entries) = parse_json(header)? else {
 		bail!("safetensors: header is not a JSON object");
 	};
@@ -370,8 +367,7 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 			None => bail!("safetensors: unterminated string"),
 			Some(b'"') => {
 				*p += 1;
-				return String::from_utf8(buf)
-					.map_err(|e| anyhow!("safetensors: string is not utf8: {e}"));
+				return String::from_utf8(buf).map_err(|e| anyhow!("safetensors: string is not utf8: {e}"));
 			}
 			Some(b'\\') => {
 				*p += 1;
@@ -386,17 +382,14 @@ fn parse_str(b: &[u8], p: &mut usize) -> Result<String> {
 					Some(b'b') => '\u{8}',
 					Some(b'f') => '\u{c}',
 					Some(b'u') => {
-						let hex = b.get(*p + 1..*p + 5).ok_or_else(|| {
-							anyhow!("safetensors: truncated \\u escape")
-						})?;
+						let hex = b
+							.get(*p + 1..*p + 5)
+							.ok_or_else(|| anyhow!("safetensors: truncated \\u escape"))?;
 						let code = u32::from_str_radix(str::from_utf8(hex)?, 16)
-							.map_err(|e| {
-								anyhow!("safetensors: bad \\u escape: {e}")
-							})?;
+							.map_err(|e| anyhow!("safetensors: bad \\u escape: {e}"))?;
 						*p += 4;
-						char::from_u32(code).ok_or_else(|| {
-							anyhow!("safetensors: invalid unicode {code}")
-						})?
+						char::from_u32(code)
+							.ok_or_else(|| anyhow!("safetensors: invalid unicode {code}"))?
 					}
 					_other => bail!("safetensors: bad escape at offset {}", *p),
 				};
@@ -416,8 +409,7 @@ fn parse_num(b: &[u8], p: &mut usize) -> Result<Json> {
 	while *p < b.len() && matches!(b[*p], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E') {
 		*p += 1;
 	}
-	let s = str::from_utf8(&b[start..*p])
-		.map_err(|e| anyhow!("safetensors: number is not utf8: {e}"))?;
+	let s = str::from_utf8(&b[start..*p]).map_err(|e| anyhow!("safetensors: number is not utf8: {e}"))?;
 	let v: f64 = s
 		.parse()
 		.map_err(|_e| anyhow!("safetensors: bad number '{s}'"))?;

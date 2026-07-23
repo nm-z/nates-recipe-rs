@@ -217,8 +217,7 @@ pub fn gpu_smo_update_gradient_rows(
 fn read_at(buf: &GpuBuffer, idx: usize) -> Result<f64, HipError> {
 	let mut v = [0.0f64];
 	// SAFETY: idx * size_of::<f64>() keeps the byte offset inside buf's allocation.
-	let src =
-		unsafe { buf.ptr_raw().cast::<u8>().add(idx * mem::size_of::<f64>()) }.cast::<c_void>();
+	let src = unsafe { buf.ptr_raw().cast::<u8>().add(idx * mem::size_of::<f64>()) }.cast::<c_void>();
 	// SAFETY: src (device) and v (host) span exactly one f64 for this D2H copy.
 	unsafe {
 		xfer(
@@ -259,13 +258,7 @@ fn argmax_pick(score: &GpuBuffer, n: usize, out: &GpuBuffer) -> Result<(f64, usi
 	return Ok((am[0], idx));
 }
 
-fn bias_contrib(
-	grad_buf: &GpuBuffer,
-	idx: usize,
-	y: f64,
-	a: f64,
-	c: f64,
-) -> Result<Option<f64>, HipError> {
+fn bias_contrib(grad_buf: &GpuBuffer, idx: usize, y: f64, a: f64, c: f64) -> Result<Option<f64>, HipError> {
 	if a > 0.0f64 && a < c {
 		return Ok(Some(fdiv(fneg(read_at(grad_buf, idx)?), y)));
 	}

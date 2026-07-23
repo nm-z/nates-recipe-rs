@@ -1,4 +1,3 @@
-
 use anyhow::{Context, Result};
 use recipe_infer::llm::{greedy, greedy_windowed, last_logits};
 use std::fs;
@@ -12,7 +11,10 @@ fn prompt_tokens() -> Result<Vec<u32>> {
 	let text = fs::read_to_string(fixtures_dir().join("tokens.txt")).context("tokens.txt")?;
 	let mut toks = Vec::new();
 	for line in text.lines().filter(|l| !l.trim().is_empty()) {
-		toks.push(line.trim().parse::<u32>().with_context(|| format!("token {line:?}"))?);
+		toks.push(line
+			.trim()
+			.parse::<u32>()
+			.with_context(|| format!("token {line:?}"))?);
 	}
 	anyhow::ensure!(!toks.is_empty(), "tokens.txt empty");
 	toks.truncate(6);
@@ -136,14 +138,12 @@ fn assert_spill_matches_resident(fixture: &str) {
 	let toks = prompt_tokens().expect("prompt tokens");
 	let n = 6;
 	let resident = greedy(&gguf, &toks, n).expect("resident greedy");
-	let prompt_cross =
-		greedy_windowed(&gguf, &toks, n, toks.len() - 2).expect("prompt-crossing greedy");
+	let prompt_cross = greedy_windowed(&gguf, &toks, n, toks.len() - 2).expect("prompt-crossing greedy");
 	assert_eq!(
 		prompt_cross, resident,
 		"{fixture}: prompt longer than the VRAM window diverges from resident decode\n  spill:    {prompt_cross:?}\n  resident: {resident:?}"
 	);
-	let gen_cross =
-		greedy_windowed(&gguf, &toks, n, toks.len() + 2).expect("generation-crossing greedy");
+	let gen_cross = greedy_windowed(&gguf, &toks, n, toks.len() + 2).expect("generation-crossing greedy");
 	assert_eq!(
 		gen_cross, resident,
 		"{fixture}: generation crossing the VRAM window diverges from resident decode\n  spill:    {gen_cross:?}\n  resident: {resident:?}"
@@ -214,14 +214,26 @@ fn spill_matches_resident_nemotron_h() {
 fn one_decode_method_no_second_path() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let llm = fs::read_to_string(root.join("recipe-infer/src/llm.rs")).expect("llm.rs");
-	assert!(!llm.contains("fn decode_scan"), "decode_scan fallback still present");
-	assert!(!llm.contains("has_scan_op"), "has_scan_op decode fork still present");
+	assert!(
+		!llm.contains("fn decode_scan"),
+		"decode_scan fallback still present"
+	);
+	assert!(
+		!llm.contains("has_scan_op"),
+		"has_scan_op decode fork still present"
+	);
 	assert_eq!(
 		llm.matches("fn decode_cached").count(),
 		1,
 		"expected exactly one cached decode function"
 	);
 	let common = fs::read_to_string(root.join("recipe-infer/src/models/common.rs")).expect("common.rs");
-	assert!(!common.contains("gpu_gqa_attn"), "obsolete gpu_gqa_attn symbol present");
-	assert!(!common.contains("gpu_mla_attn"), "obsolete gpu_mla_attn symbol present");
+	assert!(
+		!common.contains("gpu_gqa_attn"),
+		"obsolete gpu_gqa_attn symbol present"
+	);
+	assert!(
+		!common.contains("gpu_mla_attn"),
+		"obsolete gpu_mla_attn symbol present"
+	);
 }
