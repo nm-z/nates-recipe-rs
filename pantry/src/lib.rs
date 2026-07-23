@@ -11,6 +11,7 @@ pub mod bpe;
 pub mod data;
 pub mod detect;
 pub mod encode;
+pub mod formats;
 
 pub use data::*;
 pub use detect::*;

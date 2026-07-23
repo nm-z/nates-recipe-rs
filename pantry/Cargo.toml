@@ -25,5 +25,12 @@ zip = "2"
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1"
+serde_json = "1"
+parquet = { version = "59", features = ["arrow"] }
+arrow = "59"
+calamine = "0.36"
+apache-avro = "0.21"
+hdf5 = { package = "hdf5-metno", version = "0.13" }
+matfile = "0.5"
 [lints]
 workspace = true
