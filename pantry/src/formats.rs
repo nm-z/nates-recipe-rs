@@ -105,6 +105,195 @@ fn single_group(columns: Vec<DataVec>) -> Vec<DataGroup> {
 
 // ─
 
+fn ram_admit(need: u64, source: &Path) -> Result<()> {
+	let available = crate::available_ram_bytes() as u64;
+	if need > available {
+		bail!(
+			"refusing to load {}: decoding needs up to {need} bytes, {available} bytes of RAM available",
+			source.display()
+		);
+	}
+	return Ok(());
+}
+
+struct RamGauge {
+	source: String,
+	available: u64,
+	since: u64,
+}
+
+impl RamGauge {
+	fn new(source: &Path) -> Self {
+		return Self {
+			source: source.display().to_string(),
+			available: crate::available_ram_bytes() as u64,
+			since: 0,
+		};
+	}
+
+	fn admit(&mut self, chunk: u64) -> Result<()> {
+		if self.since.saturating_add(chunk) > self.available {
+			self.available = crate::available_ram_bytes() as u64;
+			self.since = 0;
+			if chunk > self.available {
+				bail!(
+					"RAM exhausted while decoding {}: next {chunk} bytes exceed {} bytes available",
+					self.source,
+					self.available
+				);
+			}
+		}
+		self.since = self.since.saturating_add(chunk);
+		return Ok(());
+	}
+}
+
+fn cell_bytes(payload: u64, cells: u64) -> u64 {
+	return payload.saturating_add(cells.saturating_mul(size_of::<String>() as u64));
+}
+
+fn row_bytes(row: &[String]) -> u64 {
+	let payload: u64 = row.iter().map(|s| s.len() as u64).sum();
+	return cell_bytes(payload, row.len() as u64);
+}
+
+fn f64_text_max() -> u64 {
+	let neg_min_normal = (-f64::MIN_POSITIVE).to_string().len();
+	let neg_max = f64::MIN.to_string().len();
+	return neg_min_normal.max(neg_max) as u64;
+}
+
+fn u8_text_max() -> u64 {
+	return f64::from(u8::MAX).to_string().len() as u64;
+}
+
+fn scan_counts(path: &Path, hit: fn(u8) -> bool) -> Result<(u64, u64)> {
+	let file = fs::File::open(path)
+		.with_context(|| format!("failed to open {}", path.display()))?;
+	let mut reader = io::BufReader::new(file);
+	let mut raw = 0u64;
+	let mut hits = 0u64;
+	loop {
+		let buf = io::BufRead::fill_buf(&mut reader)
+			.with_context(|| format!("failed to read {}", path.display()))?;
+		if buf.is_empty() {
+			break;
+		}
+		raw = raw.saturating_add(buf.len() as u64);
+		hits = hits.saturating_add(buf.iter().filter(|&&b| hit(b)).count() as u64);
+		let n = buf.len();
+		io::BufRead::consume(&mut reader, n);
+	}
+	return Ok((raw, hits));
+}
+
+fn delimited_need(path: &Path) -> Result<u64> {
+	let (raw, seps) = scan_counts(path, |b| b == b'\n' || b == b',' || b == b'\t' || b == b';')?;
+	let cells = seps.saturating_add(1);
+	return Ok(raw.saturating_add(cell_bytes(raw, cells).saturating_mul(2)));
+}
+
+fn json_need(path: &Path) -> Result<u64> {
+	let (raw, seps) = scan_counts(path, |b| b == b',' || b == b':' || b == b'[' || b == b'{')?;
+	let nodes = seps.saturating_add(1);
+	let per_node = (size_of::<serde_json::Value>() + size_of::<String>()) as u64;
+	return Ok(raw.saturating_mul(3).saturating_add(nodes.saturating_mul(per_node)));
+}
+
+fn image_need(path: &Path) -> Result<u64> {
+	let (w, h) = image::image_dimensions(path)
+		.with_context(|| format!("failed to read image dimensions: {}", path.display()))?;
+	let cells = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(3);
+	return Ok(cells.saturating_add(cell_bytes(cells.saturating_mul(u8_text_max()), cells)));
+}
+
+fn npy_decode_need(reader: &mut dyn io::Read, raw_len: u64, what: &str) -> Result<u64> {
+	let mut head = vec![0u8; 12];
+	io::Read::read_exact(reader, &mut head)
+		.with_context(|| format!("npy too short: {what}"))?;
+	let (header_start, header_len) = if head[6] <= 1 {
+		(10usize, u16::from_le_bytes([head[8], head[9]]) as usize)
+	} else {
+		(12usize, u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize)
+	};
+	let want = header_start.saturating_add(header_len);
+	if want > head.len() {
+		let mut rest = vec![0u8; want - head.len()];
+		io::Read::read_exact(reader, &mut rest)
+			.with_context(|| format!("npy header truncated: {what}"))?;
+		head.extend_from_slice(&rest);
+	}
+	let (info, _payload) = parse_npy_bytes(&head[..want])?;
+	let n = info.shape.iter().product::<usize>() as u64;
+	let per_cell = (size_of::<String>() as u64).saturating_add(f64_text_max());
+	return Ok(raw_len.saturating_add(n.saturating_mul(per_cell).saturating_mul(2)));
+}
+
+fn npy_need(path: &Path) -> Result<u64> {
+	let raw_len = fs::metadata(path)
+		.with_context(|| format!("failed to stat {}", path.display()))?
+		.len();
+	let mut file = fs::File::open(path)
+		.with_context(|| format!("failed to open {}", path.display()))?;
+	return npy_decode_need(&mut file, raw_len, &path.display().to_string());
+}
+
+fn npz_need(path: &Path) -> Result<u64> {
+	let file = fs::File::open(path)
+		.with_context(|| format!("failed to open {}", path.display()))?;
+	let mut archive = zip::ZipArchive::new(file)
+		.with_context(|| format!("failed to read npz: {}", path.display()))?;
+	let mut need = 0u64;
+	for i in 0..archive.len() {
+		let mut entry = archive.by_index(i)
+			.with_context(|| format!("failed to read npz entry {i}"))?;
+		if !entry.name().ends_with(".npy") {
+			continue;
+		}
+		let raw_len = entry.size();
+		let what = entry.name().to_string();
+		need = need.saturating_add(npy_decode_need(&mut entry, raw_len, &what)?);
+	}
+	return Ok(need);
+}
+
+fn zip_need(path: &Path) -> Result<u64> {
+	let file = fs::File::open(path)
+		.with_context(|| format!("failed to open zip {}", path.display()))?;
+	let mut archive = zip::ZipArchive::new(file)
+		.with_context(|| format!("failed to read zip {}", path.display()))?;
+	let mut need = 0u64;
+	for i in 0..archive.len() {
+		let entry = archive.by_index_raw(i)
+			.with_context(|| format!("failed to read zip entry {i}"))?;
+		if entry.is_dir() {
+			continue;
+		}
+		need = need.saturating_add(entry.size());
+	}
+	return Ok(need);
+}
+
+fn hdf5_need(group: &hdf5::Group) -> Result<u64> {
+	let names = group.member_names()
+		.context("failed to list HDF5 group members")?;
+	let per_cell = ((size_of::<f64>() + size_of::<String>()) as u64).saturating_add(f64_text_max());
+	let mut need = 0u64;
+	for name in &names {
+		if let Ok(ds) = group.dataset(name) {
+			let n = ds.shape().iter().product::<usize>() as u64;
+			need = need.saturating_add(n.saturating_mul(per_cell));
+			continue;
+		}
+		if let Ok(sub) = group.group(name) {
+			need = need.saturating_add(hdf5_need(&sub)?);
+		}
+	}
+	return Ok(need);
+}
+
+// ─
+
 const IMAGE_EXTENSIONS: &[&str] = &[
 	"jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif",
 	"ico", "pnm", "pbm", "pgm", "ppm", "qoi", "dds", "hdr", "exr", "ff",
@@ -119,6 +308,11 @@ impl UsrData for File {
 			.and_then(|e| e.to_str())
 			.unwrap_or("")
 			.to_ascii_lowercase();
+
+		let raw_len = fs::metadata(&self.path)
+			.with_context(|| format!("failed to stat {}", self.path.display()))?
+			.len();
+		ram_admit(raw_len, &self.path)?;
 
 		let mut groups = match extension.as_str() {
 			"csv" | "tsv" | "txt" | "dat" | "data" => single_group(self.parse_csv()?),
@@ -193,6 +387,7 @@ impl UsrData for Dir {
 
 impl UsrData for Zip {
 	fn parse(&self) -> Result<Vec<DataGroup>> {
+		ram_admit(zip_need(&self.path)?, &self.path)?;
 		let extracted = extract_zip(&self.path)?;
 		struct Guard(PathBuf);
 		impl Drop for Guard {
@@ -298,24 +493,26 @@ fn looks_temporal(s: &str) -> bool {
 
 // ─
 
-fn rows_to_columns(headers: Vec<String>, rows: &[Vec<String>]) -> Vec<DataVec> {
+fn rows_to_columns(headers: Vec<String>, rows: &[Vec<String>], source: &Path) -> Result<Vec<DataVec>> {
 	let ncols = headers.len();
+	let mut gauge = RamGauge::new(source);
 	let mut columns: Vec<Vec<String>> = (0..ncols)
 		.map(|_| Vec::with_capacity(rows.len()))
 		.collect();
 	for row in rows {
+		gauge.admit(row_bytes(row))?;
 		for j in 0..ncols {
 			columns[j].push(row.get(j).cloned().unwrap_or_default());
 		}
 	}
-	return headers.into_iter().zip(columns)
+	return Ok(headers.into_iter().zip(columns)
 		.map(|(name, values)| DataVec {
 			name,
 			values,
 			kind: DataType::default(),
 			source: String::new(),
 		})
-		.collect();
+		.collect());
 }
 
 fn extract_zip(path: &Path) -> Result<PathBuf> {
@@ -351,16 +548,18 @@ fn extract_zip(path: &Path) -> Result<PathBuf> {
 
 impl File {
 	fn parse_csv(&self) -> Result<Vec<DataVec>> {
+		ram_admit(delimited_need(&self.path)?, &self.path)?;
 		let raw = crate::data::read_raw_csv(&self.path)?;
-		return Ok(rows_to_columns(raw.headers, &raw.rows));
+		return rows_to_columns(raw.headers, &raw.rows, &self.path);
 	}
 
 	fn parse_arff(&self) -> Result<Vec<DataVec>> {
+		ram_admit(delimited_need(&self.path)?, &self.path)?;
 		let path_str = self.path.to_str()
 			.context("path is not valid UTF-8")?;
 		let table = crate::data::parse_arff(path_str);
 		let headers: Vec<String> = table.attrs.iter().map(|a| a.name.clone()).collect();
-		return Ok(rows_to_columns(headers, &table.rows));
+		return rows_to_columns(headers, &table.rows, &self.path);
 	}
 
 	fn parse_safetensors(&self) -> Result<Vec<DataVec>> {
@@ -368,10 +567,11 @@ impl File {
 			.context("path is not valid UTF-8")?;
 		let table = crate::encode::safetensors_to_table(path_str)?;
 		let headers: Vec<String> = table.attrs.iter().map(|a| a.name.clone()).collect();
-		return Ok(rows_to_columns(headers, &table.rows));
+		return rows_to_columns(headers, &table.rows, &self.path);
 	}
 
 	fn parse_image(&self) -> Result<Vec<DataVec>> {
+		ram_admit(image_need(&self.path)?, &self.path)?;
 		let img = image::open(&self.path)
 			.with_context(|| format!("failed to open image: {}", self.path.display()))?;
 		let rgb = img.to_rgb8();
@@ -409,6 +609,7 @@ impl File {
 			}
 		}
 		ensure!(!tables.is_empty(), "no tables in sqlite db: {}", self.path.display());
+		let mut gauge = RamGauge::new(&self.path);
 		let mut groups = Vec::new();
 		for table in tables {
 			let quoted = table.replace('"', "\"\"");
@@ -427,9 +628,13 @@ impl File {
 				let ncols = stmt.column_count().min(columns.len());
 				let mut rows = stmt.query([])?;
 				while let Some(row) = rows.next()? {
+					let mut chunk = 0u64;
 					for (j, column) in columns.iter_mut().enumerate().take(ncols) {
-						column.push(sqlite_cell(row, j)?);
+						let cell = sqlite_cell(row, j)?;
+						chunk = chunk.saturating_add(cell_bytes(cell.len() as u64, 1));
+						column.push(cell);
 					}
+					gauge.admit(chunk)?;
 				}
 			}
 			groups.push(DataGroup {
@@ -464,6 +669,7 @@ fn sqlite_cell(row: &rusqlite::Row<'_>, j: usize) -> Result<String> {
 
 impl File {
 	fn parse_json(&self) -> Result<Vec<DataGroup>> {
+		ram_admit(json_need(&self.path)?, &self.path)?;
 		let text = fs::read_to_string(&self.path)
 			.with_context(|| format!("failed to read {}", self.path.display()))?;
 		let val: serde_json::Value = serde_json::from_str(&text)
@@ -476,6 +682,7 @@ impl File {
 	}
 
 	fn parse_jsonl(&self) -> Result<Vec<DataVec>> {
+		ram_admit(json_need(&self.path)?, &self.path)?;
 		let text = fs::read_to_string(&self.path)
 			.with_context(|| format!("failed to read {}", self.path.display()))?;
 		let mut values = Vec::new();
@@ -665,13 +872,26 @@ impl File {
 		let builder = ParquetRecordBatchReaderBuilder::try_new(file)
 			.with_context(|| format!("failed to read parquet: {}", self.path.display()))?;
 		let schema = builder.schema().clone();
+		let meta_rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
+		let uncompressed: u64 = builder.metadata().row_groups().iter()
+			.map(|rg| rg.total_byte_size().max(0) as u64)
+			.sum();
+		let cells = meta_rows.saturating_mul(schema.fields().len() as u64);
+		let per_cell = (size_of::<String>() as u64).saturating_add(f64_text_max());
+		ram_admit(
+			uncompressed.saturating_mul(2).saturating_add(cells.saturating_mul(per_cell)),
+			&self.path,
+		)?;
 		let reader = builder.build()
 			.with_context(|| format!("failed to build parquet reader: {}", self.path.display()))?;
+		let mut gauge = RamGauge::new(&self.path);
 		let mut batches = Vec::new();
 		for batch in reader {
-			batches.push(batch.with_context(|| "failed to read parquet batch")?);
+			let batch = batch.with_context(|| "failed to read parquet batch")?;
+			gauge.admit(batch.get_array_memory_size() as u64)?;
+			batches.push(batch);
 		}
-		return arrow_batches_to_columns(&schema, &batches);
+		return arrow_batches_to_columns(&schema, &batches, &self.path);
 	}
 
 	fn parse_arrow(&self) -> Result<Vec<DataVec>> {
@@ -682,17 +902,21 @@ impl File {
 		let reader = FileReader::try_new(file, None)
 			.with_context(|| format!("failed to read arrow IPC: {}", self.path.display()))?;
 		let schema = reader.schema();
+		let mut gauge = RamGauge::new(&self.path);
 		let mut batches = Vec::new();
 		for batch in reader {
-			batches.push(batch.with_context(|| "failed to read arrow batch")?);
+			let batch = batch.with_context(|| "failed to read arrow batch")?;
+			gauge.admit(batch.get_array_memory_size() as u64)?;
+			batches.push(batch);
 		}
-		return arrow_batches_to_columns(&schema, &batches);
+		return arrow_batches_to_columns(&schema, &batches, &self.path);
 	}
 }
 
 fn arrow_batches_to_columns(
 	schema: &arrow::datatypes::Schema,
 	batches: &[arrow::record_batch::RecordBatch],
+	source: &Path,
 ) -> Result<Vec<DataVec>> {
 	let headers: Vec<String> = schema.fields().iter()
 		.map(|f| f.name().clone())
@@ -702,8 +926,12 @@ fn arrow_batches_to_columns(
 	let mut columns: Vec<Vec<String>> = (0..ncols)
 		.map(|_| Vec::with_capacity(total_rows))
 		.collect();
+	let mut gauge = RamGauge::new(source);
+	let per_cell = (size_of::<String>() as u64).saturating_add(f64_text_max());
 	for batch in batches {
 		let nrows = batch.num_rows();
+		let cells = (nrows as u64).saturating_mul(ncols as u64);
+		gauge.admit(cells.saturating_mul(per_cell))?;
 		for col in 0..ncols {
 			let array = batch.column(col);
 			for row in 0..nrows {
@@ -757,6 +985,7 @@ fn arrow_cell(array: &dyn arrow::array::Array, row: usize) -> String {
 
 impl File {
 	fn parse_npy(&self) -> Result<Vec<DataVec>> {
+		ram_admit(npy_need(&self.path)?, &self.path)?;
 		let data = fs::read(&self.path)
 			.with_context(|| format!("failed to read {}", self.path.display()))?;
 		let (info, payload) = parse_npy_bytes(&data)
@@ -785,6 +1014,7 @@ impl File {
 	}
 
 	fn parse_npz(&self) -> Result<Vec<DataGroup>> {
+		ram_admit(npz_need(&self.path)?, &self.path)?;
 		let file = fs::File::open(&self.path)
 			.with_context(|| format!("failed to open {}", self.path.display()))?;
 		let mut archive = zip::ZipArchive::new(file)
@@ -972,6 +1202,7 @@ impl File {
 	fn parse_hdf5(&self) -> Result<Vec<DataGroup>> {
 		let file = hdf5::File::open(&self.path)
 			.with_context(|| format!("failed to open HDF5: {}", self.path.display()))?;
+		ram_admit(hdf5_need(&file)?, &self.path)?;
 		let mut groups = Vec::new();
 		hdf5_collect(&file, "", &mut groups)?;
 		return Ok(groups);
@@ -1048,6 +1279,7 @@ impl File {
 			.with_context(|| format!("failed to open workbook: {}", self.path.display()))?;
 		let sheets = wb.sheet_names().to_vec();
 		ensure!(!sheets.is_empty(), "no sheets in workbook: {}", self.path.display());
+		let mut gauge = RamGauge::new(&self.path);
 		let mut groups = Vec::new();
 		for sheet in sheets {
 			let range = wb.worksheet_range(&sheet)
@@ -1061,7 +1293,9 @@ impl File {
 			let mut rows: Vec<Vec<String>> = Vec::new();
 			if all_numeric {
 				headers = (0..first.len()).map(|j| format!("col{}", j + 1)).collect();
-				rows.push(first.iter().map(excel_cell).collect());
+				let row: Vec<String> = first.iter().map(excel_cell).collect();
+				gauge.admit(row_bytes(&row))?;
+				rows.push(row);
 			} else {
 				headers = first.iter().enumerate()
 					.map(|(i, c)| {
@@ -1071,11 +1305,13 @@ impl File {
 					.collect();
 			}
 			for row in row_iter {
-				rows.push(row.iter().map(excel_cell).collect());
+				let row: Vec<String> = row.iter().map(excel_cell).collect();
+				gauge.admit(row_bytes(&row))?;
+				rows.push(row);
 			}
 			groups.push(DataGroup {
 				member: sheet,
-				columns: rows_to_columns(headers, &rows),
+				columns: rows_to_columns(headers, &rows, &self.path)?,
 			});
 		}
 		return Ok(groups);
@@ -1102,6 +1338,7 @@ impl File {
 			.with_context(|| format!("failed to open {}", self.path.display()))?;
 		let mut archive = zip::ZipArchive::new(file)
 			.with_context(|| format!("failed to read pptx: {}", self.path.display()))?;
+		let mut gauge = RamGauge::new(&self.path);
 		let mut slides: Vec<(usize, String)> = Vec::new();
 		for i in 0..archive.len() {
 			let mut entry = archive.by_index(i)
@@ -1112,6 +1349,7 @@ impl File {
 			let mut xml = String::new();
 			io::Read::read_to_string(&mut entry, &mut xml)
 				.with_context(|| format!("failed to read pptx slide {number}"))?;
+			gauge.admit((xml.len() as u64).saturating_mul(2))?;
 			slides.push((number, xml));
 		}
 		ensure!(!slides.is_empty(), "no slides in pptx: {}", self.path.display());
@@ -1230,12 +1468,16 @@ impl File {
 		let cursor = io::Cursor::new(&raw);
 		let mat = matfile::MatFile::parse(cursor)
 			.with_context(|| format!("failed to parse MAT file: {}", self.path.display()))?;
+		let mut gauge = RamGauge::new(&self.path);
 		let mut groups = Vec::new();
 		for array in mat.arrays() {
 			let name = array.name().to_string();
 			let dims = array.size();
 			let nrows = dims.first().copied().unwrap_or(0);
 			let ncols = dims.get(1).copied().unwrap_or(1);
+			let n = (nrows as u64).saturating_mul(ncols as u64);
+			let per_cell = ((size_of::<f64>() + size_of::<String>()) as u64).saturating_add(f64_text_max());
+			gauge.admit(n.saturating_mul(per_cell))?;
 			let f64_vals = mat_array_to_f64s(array);
 			let mut columns = Vec::with_capacity(ncols);
 			for col in 0..ncols {
@@ -1293,8 +1535,10 @@ impl File {
 		let mut seen: HashSet<String> = HashSet::new();
 		let mut records: Vec<Vec<(String, TfFeature)>> = Vec::new();
 
+		let mut gauge = RamGauge::new(&self.path);
 		while pos < data.len() {
 			let (frame, next) = tfrecord_frame(&data, pos)?;
+			gauge.admit(frame.len() as u64)?;
 			let features = tf_parse_example(frame)?;
 			for (key, _) in &features {
 				if seen.insert(key.clone()) {
@@ -1319,6 +1563,7 @@ impl File {
 					row[idx] = tf_feature_to_string(feature);
 				}
 			}
+			gauge.admit(row_bytes(&row))?;
 			for (j, val) in row.into_iter().enumerate() {
 				columns[j].push(val);
 			}
@@ -1568,38 +1813,37 @@ impl File {
 			}
 			_ => Vec::new(),
 		};
+		let mut gauge = RamGauge::new(&self.path);
 		let mut rows: Vec<Vec<String>> = Vec::new();
 		for val_result in reader {
 			let val = val_result
 				.with_context(|| format!("failed to read avro record: {}", self.path.display()))?;
-			match val {
+			let row: Vec<String> = match val {
 				apache_avro::types::Value::Record(fields) => {
 					if headers.is_empty() {
-						let row: Vec<String> = fields.iter()
+						fields.iter()
 							.map(|(_, v)| avro_cell(v))
-							.collect();
-						rows.push(row);
+							.collect()
 					} else {
 						let field_map: HashMap<&str, &apache_avro::types::Value> = fields.iter()
 							.map(|(k, v)| (k.as_str(), v))
 							.collect();
-						let row: Vec<String> = headers.iter()
+						headers.iter()
 							.map(|h| field_map.get(h.as_str()).map_or(String::new(), |v| avro_cell(v)))
-							.collect();
-						rows.push(row);
+							.collect()
 					}
 				}
-				other => {
-					rows.push(vec![avro_cell(&other)]);
-				}
-			}
+				other => vec![avro_cell(&other)],
+			};
+			gauge.admit(row_bytes(&row))?;
+			rows.push(row);
 		}
 		let hdrs = if headers.is_empty() && !rows.is_empty() {
 			(0..rows[0].len()).map(|j| format!("col{}", j + 1)).collect()
 		} else {
 			headers
 		};
-		return Ok(rows_to_columns(hdrs, &rows));
+		return rows_to_columns(hdrs, &rows, &self.path);
 	}
 }
 
