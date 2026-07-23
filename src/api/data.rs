@@ -227,6 +227,19 @@ impl Data {
 
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
+		let p = Path::new(path);
+		if p.is_dir() {
+			use pantry::formats::UsrData;
+			match (pantry::formats::Dir { path: p.to_path_buf() }).parse() {
+				Ok(vecs) => {
+					let (attrs, rows) = datavecs_to_table(vecs);
+					self.inner.attrs = attrs;
+					self.inner.rows = rows;
+				}
+				Err(e) => self.inner.defer(e),
+			}
+			return self;
+		}
 		match file_format(path) {
 			FileFormat::Arff => {
 				let table = crate::data::parse_arff(path);
@@ -242,7 +255,7 @@ impl Data {
 			},
 			FileFormat::Structured => {
 				use pantry::formats::UsrData;
-				let file = pantry::formats::File { path: Path::new(path).to_path_buf() };
+				let file = pantry::formats::File { path: p.to_path_buf() };
 				match file.parse() {
 					Ok(vecs) => {
 						let (attrs, rows) = datavecs_to_table(vecs);
