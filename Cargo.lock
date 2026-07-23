@@ -2212,6 +2212,7 @@ dependencies = [
  "rayon",
  "recipe-infer",
  "recipe-ir",
+ "rusqlite",
  "serde_json",
  "zip 2.4.2",
 ]

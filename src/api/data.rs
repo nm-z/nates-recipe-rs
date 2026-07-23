@@ -134,8 +134,9 @@ fn empty_dataset() -> Dataset {
 	}
 }
 
-fn datavecs_to_table(vecs: Vec<pantry::formats::DataVec>) -> (Vec<Attr>, Vec<Vec<String>>) {
+fn datavecs_to_table(parsed: pantry::formats::ParsedData) -> (Vec<Attr>, Vec<Vec<String>>) {
 	use pantry::formats::DataType;
+	let vecs = parsed.into_columns();
 	let nrows = vecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
 	let attrs: Vec<Attr> = vecs.iter().map(|v| {
 		let kind = match v.kind {
@@ -159,7 +160,10 @@ fn datavecs_to_table(vecs: Vec<pantry::formats::DataVec>) -> (Vec<Attr>, Vec<Vec
 					.collect::<std::collections::BTreeSet<_>>()
 					.into_iter()
 					.collect();
-				vals.sort();
+				vals.sort_by(|a, b| match (a.parse::<i64>(), b.parse::<i64>()) {
+					(Ok(x), Ok(y)) => x.cmp(&y),
+					_ => a.cmp(b),
+				});
 				Kind::Ordinal(vals)
 			}
 			DataType::Text => {
@@ -196,8 +200,8 @@ impl Data {
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
 		match pantry::formats::load(path) {
-			Ok(vecs) => {
-				let (attrs, rows) = datavecs_to_table(vecs);
+			Ok(parsed) => {
+				let (attrs, rows) = datavecs_to_table(parsed);
 				self.inner.attrs = attrs;
 				self.inner.rows = rows;
 			}
@@ -212,13 +216,13 @@ impl Data {
 		let Some(tp) = self.inner.test_path.clone() else {
 			return self;
 		};
-		let Ok(vecs) = pantry::formats::load(&tp) else {
+		let Ok(parsed) = pantry::formats::load(&tp) else {
 			return self;
 		};
-		if vecs.is_empty() {
+		let (attrs, rows) = datavecs_to_table(parsed);
+		if attrs.is_empty() {
 			return self;
 		}
-		let (attrs, rows) = datavecs_to_table(vecs);
 		self.inner.raw_test_headers = Some(attrs
 			.into_iter()
 			.map(|a| a.name.trim().to_string())

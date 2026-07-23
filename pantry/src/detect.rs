@@ -171,7 +171,7 @@ fn prefix_columns(path: &Path) -> anyhow::Result<PrefixCols> {
 		None => FirstRow::Header,
 	};
 	let headers: Vec<String> = match first_row {
-		FirstRow::Data => (0..w).map(|j| format!("col_{j}")).collect(),
+		FirstRow::Data => (0..w).map(|j| format!("col{}", j + 1)).collect(),
 		FirstRow::Header => first_cells.clone(),
 	};
 

@@ -33,5 +33,6 @@ quick-xml = "0.41"
 apache-avro = "0.21"
 hdf5 = { package = "hdf5-metno", version = "0.13" }
 matfile = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
 [lints]
 workspace = true

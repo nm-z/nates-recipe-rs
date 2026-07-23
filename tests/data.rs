@@ -16,7 +16,7 @@ fn tmp(name: &str, body: &str) -> PathBuf {
 fn headerless_numeric_first_row_is_data() {
 	let p = tmp("numeric.csv", "1.0,2,3.29662E-05\n4,5,6\n-7,8.5,9\n");
 	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
-	assert_eq!(headers, vec!["col_0", "col_1", "col_2"]);
+	assert_eq!(headers, vec!["col1", "col2", "col3"]);
 	assert_eq!(rows.len(), 3, "first numeric row must be kept, not eaten");
 	assert_eq!(rows[0], vec!["1.0", "2", "3.29662E-05"]);
 }
@@ -34,7 +34,7 @@ fn named_first_row_is_header() {
 fn single_numeric_column_headerless() {
 	let p = tmp("single.csv", "3.29662E-05\n1.1\n2.2\n3.3\n");
 	let RawCsv { headers, rows } = read_raw_csv(&p).unwrap();
-	assert_eq!(headers, vec!["col_0"]);
+	assert_eq!(headers, vec!["col1"]);
 	assert_eq!(rows.len(), 4);
 }
 
@@ -91,8 +91,8 @@ fn whitespace_matrix_headerless_keeps_rows() {
 	));
 	let RawCsv { headers, rows } = read_raw_csv(p).unwrap();
 	assert_eq!(headers.len(), 561);
-	assert_eq!(headers[0], "col_0");
-	assert_eq!(headers[560], "col_560");
+	assert_eq!(headers[0], "col1");
+	assert_eq!(headers[560], "col561");
 	assert_eq!(rows.len(), 7352);
 	assert!(rows.iter().all(|r| return r.len() == 561));
 	assert_eq!(rows[0][0].parse::<f64>().unwrap(), 2.8858451e-001);

@@ -98,7 +98,7 @@ pub fn read_raw_csv(path: &Path) -> Result<RawCsv> {
 		},
 	};
 	let headers: Vec<String> = match first_row {
-		FirstRow::Data => (0..w).map(|j| format!("col_{j}")).collect(),
+		FirstRow::Data => (0..w).map(|j| format!("col{}", j + 1)).collect(),
 		FirstRow::Header => first_cells.clone(),
 	};
 
@@ -173,7 +173,7 @@ fn read_raw_whitespace(path: &Path) -> Result<RawCsv> {
 	};
 	let first_cells: Vec<String> = first.split_whitespace().map(str::to_string).collect();
 	let w = first_cells.len();
-	let headers: Vec<String> = (0..w).map(|j| format!("col_{j}")).collect();
+	let headers: Vec<String> = (0..w).map(|j| format!("col{}", j + 1)).collect();
 
 	let overhead = mem::size_of::<String>();
 	let est_rows = count_lines(path)?;
@@ -778,7 +778,28 @@ pub struct ArffTable {
 }
 
 pub fn load_sqlite_groups(path: &str) -> Result<Vec<DirGroup>> {
-	anyhow::bail!("SQLite loader not yet implemented (.db/.sqlite): {path}")
+	let parsed = crate::formats::load(path)?;
+	let mut groups = Vec::new();
+	for g in parsed.groups {
+		let headers: Vec<String> = g.columns.iter().map(|c| c.name.clone()).collect();
+		let nrows = g.columns.iter().map(|c| c.values.len()).max().unwrap_or(0);
+		let mut cells: Vec<Vec<String>> = Vec::with_capacity(nrows);
+		for r in 0..nrows {
+			cells.push(
+				g.columns
+					.iter()
+					.map(|c| c.values.get(r).cloned().unwrap_or_default())
+					.collect(),
+			);
+		}
+		groups.push(DirGroup::Table {
+			name: g.member,
+			headers,
+			hashes: vec![String::new(); cells.len()],
+			cells,
+		});
+	}
+	return Ok(groups);
 }
 
 pub(crate) fn short_path(p: &str) -> String {

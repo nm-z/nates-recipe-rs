@@ -1092,7 +1092,7 @@ pub fn prepare_arff_data(
 		} = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
-		let tvecs = crate::formats::load(tp)?;
+		let tvecs = crate::formats::load(tp)?.into_columns();
 		let tn = tvecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
 		let trows: Vec<Vec<String>> = (0..tn)
 			.map(|r| {
