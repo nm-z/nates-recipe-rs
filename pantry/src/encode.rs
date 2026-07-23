@@ -1092,7 +1092,15 @@ pub fn prepare_arff_data(
 		} = shuffle_split(&x, &y, k, frac, source_label, &tc, &oh);
 		(tr, Some(te))
 	} else if let Some(tp) = test_path {
-		let trows = crate::data::parse_arff(tp).rows;
+		let tvecs = crate::formats::load(tp)?;
+		let tn = tvecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
+		let trows: Vec<Vec<String>> = (0..tn)
+			.map(|r| {
+				tvecs.iter()
+					.map(|v| v.values.get(r).cloned().unwrap_or_default())
+					.collect()
+			})
+			.collect();
 		let (_, tx, ty, _) = encode(attrs, &trows, targets, &skip)?;
 		(
 			Dataset {

@@ -9,7 +9,6 @@ use std::env;
 use std::fs;
 use std::mem;
 use std::ops::Deref;
-use std::path::Path;
 
 pub use pantry::encode::{Dataset, shuffle_split};
 
@@ -135,37 +134,6 @@ fn empty_dataset() -> Dataset {
 	}
 }
 
-enum FileFormat {
-	Arff,
-	Safetensors,
-	Structured,
-	Table,
-}
-
-const STRUCTURED_EXTS: &[&str] = &[
-	"json", "jsonl", "ndjson", "parquet", "arrow", "feather",
-	"npy", "npz", "h5", "hdf5", "xlsx", "xls", "xlsb", "ods",
-	"mat", "tfrecord", "avro",
-];
-
-fn file_format(path: &str) -> FileFormat {
-	let ext = Path::new(path)
-		.extension()
-		.and_then(|e| e.to_str())
-		.map(|e| e.to_ascii_lowercase());
-	let ext_ref = ext.as_deref().unwrap_or("");
-	if ext_ref == "arff" {
-		return FileFormat::Arff;
-	}
-	if ext_ref == "safetensors" {
-		return FileFormat::Safetensors;
-	}
-	if STRUCTURED_EXTS.contains(&ext_ref) {
-		return FileFormat::Structured;
-	}
-	return FileFormat::Table;
-}
-
 fn datavecs_to_table(vecs: Vec<pantry::formats::DataVec>) -> (Vec<Attr>, Vec<Vec<String>>) {
 	use pantry::formats::DataType;
 	let nrows = vecs.iter().map(|v| v.values.len()).max().unwrap_or(0);
@@ -227,48 +195,13 @@ impl Data {
 
 	pub fn set(mut self, path: &str) -> Data {
 		self.inner.sources.push(path.to_string());
-		let p = Path::new(path);
-		if p.is_dir() {
-			use pantry::formats::UsrData;
-			match (pantry::formats::Dir { path: p.to_path_buf() }).parse() {
-				Ok(vecs) => {
-					let (attrs, rows) = datavecs_to_table(vecs);
-					self.inner.attrs = attrs;
-					self.inner.rows = rows;
-				}
-				Err(e) => self.inner.defer(e),
+		match pantry::formats::load(path) {
+			Ok(vecs) => {
+				let (attrs, rows) = datavecs_to_table(vecs);
+				self.inner.attrs = attrs;
+				self.inner.rows = rows;
 			}
-			return self;
-		}
-		match file_format(path) {
-			FileFormat::Arff => {
-				let table = crate::data::parse_arff(path);
-				self.inner.attrs = table.attrs;
-				self.inner.rows = table.rows;
-			}
-			FileFormat::Safetensors => match pantry::encode::safetensors_to_table(path) {
-				Ok(table) => {
-					self.inner.attrs = table.attrs;
-					self.inner.rows = table.rows;
-				}
-				Err(e) => self.inner.defer(e),
-			},
-			FileFormat::Structured => {
-				use pantry::formats::UsrData;
-				let file = pantry::formats::File { path: p.to_path_buf() };
-				match file.parse() {
-					Ok(vecs) => {
-						let (attrs, rows) = datavecs_to_table(vecs);
-						self.inner.attrs = attrs;
-						self.inner.rows = rows;
-					}
-					Err(e) => self.inner.defer(e),
-				}
-			}
-			FileFormat::Table => match pantry::detect_kinds(path, recipe_runtime::execute::detector_forward) {
-				Ok(kinds) => self.inner.pre_kinds.extend(kinds),
-				Err(e) => self.inner.defer(e),
-			},
+			Err(e) => self.inner.defer(e),
 		}
 		self
 	}
@@ -279,20 +212,18 @@ impl Data {
 		let Some(tp) = self.inner.test_path.clone() else {
 			return self;
 		};
-		let Ok(raw) = crate::data::read_raw_csv(Path::new(&tp)) else {
+		let Ok(vecs) = pantry::formats::load(&tp) else {
 			return self;
 		};
-		match raw.headers.len().checked_sub(1) {
-			None => return self,
-			Some(_last) => {
-				self.inner.raw_test_headers = Some(raw
-					.headers
-					.into_iter()
-					.map(|h| h.trim().to_string())
-					.collect());
-				self.inner.raw_test_rows = Some(raw.rows);
-			}
+		if vecs.is_empty() {
+			return self;
 		}
+		let (attrs, rows) = datavecs_to_table(vecs);
+		self.inner.raw_test_headers = Some(attrs
+			.into_iter()
+			.map(|a| a.name.trim().to_string())
+			.collect());
+		self.inner.raw_test_rows = Some(rows);
 		self
 	}
 

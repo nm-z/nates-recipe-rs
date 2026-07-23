@@ -14,6 +14,7 @@ pub struct DataVec {
 	pub name: String,
 	pub values: Vec<String>,
 	pub kind: DataType,
+	pub source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,21 @@ pub struct Zip {
 	pub path: PathBuf,
 }
 
+pub fn load(path: &str) -> Result<Vec<DataVec>> {
+	let p = PathBuf::from(path);
+	if p.is_dir() {
+		return (Dir { path: p }).parse();
+	}
+	let extension = p.extension()
+		.and_then(|e| e.to_str())
+		.unwrap_or("")
+		.to_ascii_lowercase();
+	if extension == "zip" {
+		return (Zip { path: p }).parse();
+	}
+	return (File { path: p }).parse();
+}
+
 // ─
 
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -59,6 +75,7 @@ impl UsrData for File {
 		let mut vectors = match extension.as_str() {
 			"csv" | "tsv" | "txt" | "dat" | "data" => self.parse_csv()?,
 			"arff" => self.parse_arff()?,
+			"safetensors" => self.parse_safetensors()?,
 			"json" => self.parse_json()?,
 			"jsonl" | "ndjson" => self.parse_jsonl()?,
 			"parquet" => self.parse_parquet()?,
@@ -67,15 +84,23 @@ impl UsrData for File {
 			"npz" => self.parse_npz()?,
 			"h5" | "hdf5" => self.parse_hdf5()?,
 			"xlsx" | "xls" | "xlsb" | "ods" => self.parse_excel()?,
+			"pptx" => self.parse_pptx()?,
 			"mat" => self.parse_mat()?,
 			"tfrecord" => self.parse_tfrecord()?,
 			"avro" => self.parse_avro()?,
 			"db" | "sqlite" => self.parse_sqlite()?,
+			"zip" => (Zip { path: self.path.clone() }).parse()?,
 			ext if IMAGE_EXTENSIONS.contains(&ext) => self.parse_image()?,
 			_ => bail!("unsupported file type: {}", self.path.display()),
 		};
 
 		assign_data_types(&mut vectors)?;
+		let source = self.path.display().to_string();
+		for vector in vectors.iter_mut() {
+			if vector.source.is_empty() {
+				vector.source = source.clone();
+			}
+		}
 		return Ok(vectors);
 	}
 }
@@ -115,7 +140,16 @@ impl UsrData for Zip {
 			fn drop(&mut self) { fs::remove_dir_all(&self.0).ok(); }
 		}
 		let _cleanup = Guard(extracted.clone());
-		return (Dir { path: extracted }).parse();
+		let mut vectors = (Dir { path: extracted.clone() }).parse()?;
+		let zip_path = self.path.display().to_string();
+		for vector in vectors.iter_mut() {
+			let member = match Path::new(&vector.source).strip_prefix(&extracted) {
+				Ok(m) => m.display().to_string(),
+				Err(_e) => continue,
+			};
+			vector.source = format!("{zip_path}/{member}");
+		}
+		return Ok(vectors);
 	}
 }
 
@@ -192,6 +226,7 @@ fn rows_to_columns(headers: Vec<String>, rows: &[Vec<String>]) -> Vec<DataVec> {
 			name,
 			values,
 			kind: DataType::default(),
+			source: String::new(),
 		})
 		.collect();
 }
@@ -241,6 +276,14 @@ impl File {
 		return Ok(rows_to_columns(headers, &table.rows));
 	}
 
+	fn parse_safetensors(&self) -> Result<Vec<DataVec>> {
+		let path_str = self.path.to_str()
+			.context("path is not valid UTF-8")?;
+		let table = crate::encode::safetensors_to_table(path_str)?;
+		let headers: Vec<String> = table.attrs.iter().map(|a| a.name.clone()).collect();
+		return Ok(rows_to_columns(headers, &table.rows));
+	}
+
 	fn parse_image(&self) -> Result<Vec<DataVec>> {
 		let img = image::open(&self.path)
 			.with_context(|| format!("failed to open image: {}", self.path.display()))?;
@@ -254,6 +297,7 @@ impl File {
 			name: stem.to_string(),
 			values,
 			kind: DataType::Image,
+			source: String::new(),
 		}]);
 	}
 
@@ -311,6 +355,7 @@ fn json_values_to_columns(values: Vec<serde_json::Value>) -> Result<Vec<DataVec>
 				name: "value".to_string(),
 				values: col,
 				kind: DataType::default(),
+				source: String::new(),
 			}]);
 		}
 	};
@@ -367,7 +412,7 @@ fn json_objects_to_columns(values: &[serde_json::Value]) -> Result<Vec<DataVec>>
 		}
 	}
 	return Ok(key_order.into_iter().zip(columns)
-		.map(|(name, values)| DataVec { name, values, kind: DataType::default() })
+		.map(|(name, values)| DataVec { name, values, kind: DataType::default(), source: String::new() })
 		.collect());
 }
 
@@ -384,7 +429,7 @@ fn json_arrays_to_columns(values: &[serde_json::Value], width: usize) -> Result<
 		}
 	}
 	return Ok(headers.into_iter().zip(columns)
-		.map(|(name, values)| DataVec { name, values, kind: DataType::default() })
+		.map(|(name, values)| DataVec { name, values, kind: DataType::default(), source: String::new() })
 		.collect());
 }
 
@@ -477,7 +522,7 @@ fn arrow_batches_to_columns(
 		}
 	}
 	return Ok(headers.into_iter().zip(columns)
-		.map(|(name, values)| DataVec { name, values, kind: DataType::default() })
+		.map(|(name, values)| DataVec { name, values, kind: DataType::default(), source: String::new() })
 		.collect());
 }
 
@@ -545,7 +590,7 @@ impl File {
 			}
 		}
 		return Ok(headers.into_iter().zip(columns)
-			.map(|(name, values)| DataVec { name, values, kind: DataType::default() })
+			.map(|(name, values)| DataVec { name, values, kind: DataType::default(), source: String::new() })
 			.collect());
 	}
 
@@ -590,6 +635,7 @@ impl File {
 					name: col_name,
 					values: col_vals,
 					kind: DataType::default(),
+					source: String::new(),
 				});
 			}
 		}
@@ -756,6 +802,7 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 						name: full,
 						values: data.iter().map(|v| v.to_string()).collect(),
 						kind: DataType::default(),
+						source: String::new(),
 					});
 				}
 				1 => {
@@ -765,6 +812,7 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 						name: full,
 						values: data.iter().map(|v| v.to_string()).collect(),
 						kind: DataType::default(),
+						source: String::new(),
 					});
 				}
 				_ => {
@@ -784,6 +832,7 @@ fn hdf5_collect(group: &hdf5::Group, prefix: &str, vectors: &mut Vec<DataVec>) -
 							name: col_name,
 							values,
 							kind: DataType::default(),
+							source: String::new(),
 						});
 					}
 				}
@@ -846,6 +895,130 @@ fn excel_cell(cell: &calamine::Data) -> String {
 	};
 }
 
+// ─ PowerPoint
+
+impl File {
+	fn parse_pptx(&self) -> Result<Vec<DataVec>> {
+		let file = fs::File::open(&self.path)
+			.with_context(|| format!("failed to open {}", self.path.display()))?;
+		let mut archive = zip::ZipArchive::new(file)
+			.with_context(|| format!("failed to read pptx: {}", self.path.display()))?;
+		let mut slides: Vec<(usize, String)> = Vec::new();
+		for i in 0..archive.len() {
+			let mut entry = archive.by_index(i)
+				.with_context(|| format!("failed to read pptx entry {i}"))?;
+			let Some(number) = pptx_slide_number(entry.name()) else {
+				continue;
+			};
+			let mut xml = String::new();
+			io::Read::read_to_string(&mut entry, &mut xml)
+				.with_context(|| format!("failed to read pptx slide {number}"))?;
+			slides.push((number, xml));
+		}
+		ensure!(!slides.is_empty(), "no slides in pptx: {}", self.path.display());
+		slides.sort_by_key(|(number, _xml)| *number);
+		let mut slide_col = Vec::new();
+		let mut text_col = Vec::new();
+		for (number, xml) in &slides {
+			let paragraphs = pptx_paragraphs(xml)
+				.with_context(|| format!("failed to parse slide {number}: {}", self.path.display()))?;
+			for paragraph in paragraphs {
+				slide_col.push(number.to_string());
+				text_col.push(paragraph);
+			}
+		}
+		return Ok(vec![
+			DataVec {
+				name: "slide".to_string(),
+				values: slide_col,
+				kind: DataType::default(),
+				source: String::new(),
+			},
+			DataVec {
+				name: "text".to_string(),
+				values: text_col,
+				kind: DataType::default(),
+				source: String::new(),
+			},
+		]);
+	}
+}
+
+fn pptx_slide_number(entry_name: &str) -> Option<usize> {
+	let stem = entry_name.strip_prefix("ppt/slides/slide")?;
+	let digits = stem.strip_suffix(".xml")?;
+	return digits.parse::<usize>().ok();
+}
+
+fn pptx_paragraphs(xml: &str) -> Result<Vec<String>> {
+	use quick_xml::Reader;
+	use quick_xml::events::Event;
+
+	let mut reader = Reader::from_str(xml);
+	let mut paragraphs = Vec::new();
+	let mut paragraph = String::new();
+	let mut in_paragraph = false;
+	let mut in_text = false;
+	loop {
+		match reader.read_event().context("malformed slide XML")? {
+			Event::Start(e) => match e.local_name().as_ref() {
+				b"p" => in_paragraph = true,
+				b"t" => in_text = in_paragraph,
+				b"br" => paragraph.push(' '),
+				_ => {}
+			},
+			Event::Empty(e) => {
+				if e.local_name().as_ref() == b"br" {
+					paragraph.push(' ');
+				}
+			}
+			Event::End(e) => match e.local_name().as_ref() {
+				b"p" => {
+					in_paragraph = false;
+					let text = paragraph.trim().to_string();
+					paragraph.clear();
+					if !text.is_empty() {
+						paragraphs.push(text);
+					}
+				}
+				b"t" => in_text = false,
+				_ => {}
+			},
+			Event::Text(t) => {
+				if in_text {
+					let piece = t.xml10_content().context("undecodable slide text")?;
+					paragraph.push_str(&piece);
+				}
+			}
+			Event::GeneralRef(r) => {
+				if in_text {
+					paragraph.push(pptx_entity(&r)?);
+				}
+			}
+			Event::Eof => break,
+			_ => {}
+		}
+	}
+	return Ok(paragraphs);
+}
+
+fn pptx_entity(r: &quick_xml::events::BytesRef) -> Result<char> {
+	let resolved = r.resolve_char_ref()
+		.context("invalid character reference in slide text")?;
+	if let Some(ch) = resolved {
+		return Ok(ch);
+	}
+	let name = r.decode().context("undecodable entity in slide text")?;
+	return match name.as_ref() {
+		"amp" => Ok('&'),
+		"lt" => Ok('<'),
+		"gt" => Ok('>'),
+		"apos" => Ok('\''),
+		"quot" => Ok('"'),
+		other => bail!("unknown entity in slide text: &{other};"),
+	};
+}
+
 // ─ MATLAB
 
 impl File {
@@ -881,6 +1054,7 @@ impl File {
 					name: col_name,
 					values,
 					kind: DataType::default(),
+					source: String::new(),
 				});
 			}
 		}
@@ -946,7 +1120,7 @@ impl File {
 			}
 		}
 		return Ok(all_keys.into_iter().zip(columns)
-			.map(|(name, values)| DataVec { name, values, kind: DataType::default() })
+			.map(|(name, values)| DataVec { name, values, kind: DataType::default(), source: String::new() })
 			.collect());
 	}
 }
