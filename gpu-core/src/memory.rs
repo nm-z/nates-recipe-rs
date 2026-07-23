@@ -1400,51 +1400,34 @@ pub fn probe_ceiling(mut probe_survives: impl FnMut(usize) -> bool) -> Option<us
 	return None;
 }
 
+#[must_use]
 #[inline]
-pub fn ram_probe_ask() -> Option<i32> {
-	let sz = std::env::var_os("RAM_PROBE")?;
-	let Ok(n) = sz.to_string_lossy().parse::<usize>() else {
-		return Some(2);
+pub fn ram_probe_ask() -> usize {
+	let text = match std::fs::read_to_string("/proc/meminfo") {
+		Ok(t) => t,
+		Err(e) => panic!("/proc/meminfo: {e}"),
 	};
-	let _volunteered = std::fs::write("/proc/self/oom_score_adj", "1000");
-	let mut v = vec![0u8; n];
-	let mut i = 0usize;
-	while i < v.len() {
-		v[i] = 1u8;
-		i += 4096;
-	}
-	core::hint::black_box(v.as_ptr());
-	drop(v);
-	return Some(0);
-}
-
-fn spawn_ram_probe(want: usize) -> bool {
-	let Ok(exe) = std::env::current_exe() else {
-		return false;
+	let Some(kb) = text
+		.lines()
+		.find_map(|l| return l.strip_prefix("MemAvailable:"))
+		.and_then(|rest| {
+			return rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok();
+		})
+	else {
+		panic!("MemAvailable missing from /proc/meminfo");
 	};
-	let mut c = std::process::Command::new(exe);
-	c.stdin(std::process::Stdio::null());
-	c.env("RAM_PROBE", want.to_string());
-	crate::sys::disable_core_dumps(&mut c);
-	return c.status().map(|s| return s.success()).unwrap_or(false);
+	return kb.saturating_mul(1024);
 }
 
 #[inline]
 pub fn probe_ram_ceiling(guess: usize) -> Option<usize> {
-	let mut want = guess & !((1 << 21i32) - 1);
-	while want > (1 << 30i32) {
-		if spawn_ram_probe(want) {
-			Write::line(
-				gpu,
-				format!("ram probe: {} (probe-verified)", fmt_bytes(want)),
-			);
-			return Some(want);
-		}
+	let want = guess.min(ram_probe_ask()) & !((1 << 21i32) - 1);
+	if want > (1 << 30i32) {
 		Write::line(
 			gpu,
-			format!("ram probe: {} unmappable, backing off", fmt_bytes(want)),
+			format!("ram probe: {} (MemAvailable)", fmt_bytes(want)),
 		);
-		want -= want >> 4i32;
+		return Some(want);
 	}
 	return None;
 }

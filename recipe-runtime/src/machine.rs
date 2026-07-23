@@ -30,11 +30,6 @@ pub fn max_cube_mnk(vram: u64) -> u64 {
 	return vram.saturating_sub(USER_GB as u64);
 }
 
-#[inline]
-pub fn ram_probe_ask() -> Option<i32> {
-	return gpu_core::memory::ram_probe_ask();
-}
-
 #[must_use]
 pub fn flash_ran() -> bool {
 	return gpu_core::infer_ops::flash_ran();

@@ -9,6 +9,14 @@ readme = "../README.md"
 keywords = ["gpu", "hip", "rocm", "kernels", "cuda"]
 categories = ["science", "hardware-support"]
 
+[[bin]]
+name = "ramprobe"
+path = "src/bin/ramprobe.rs"
+
+[[bin]]
+name = "vramprobe"
+path = "src/bin/vramprobe.rs"
+
 [dependencies]
 half = "2"
 libc = "0.2"

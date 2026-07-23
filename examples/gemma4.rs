@@ -49,9 +49,6 @@ fn ensure_vramspy_preloaded() -> Result<()> {
 }
 
 fn main() -> Result<ExitCode> {
-	if let Some(code) = recipe_infer::llm::vram_probe_ask() {
-		return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
-	}
 	set_opt(Opt {
 		prompt: true,
 		gpu: true,

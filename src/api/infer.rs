@@ -6,7 +6,6 @@ use ogdl::log::{
 };
 use recipe_runtime::execute::{InferCfg, LastRun, ModelInner};
 use std::cell::RefCell;
-use std::env;
 use std::mem;
 
 pub struct Infer {
@@ -60,12 +59,6 @@ impl Infer {
 		});
 		match &model.inner.gguf {
 			Some(path) => {
-				if env::var_os("VRAM_PROBE").is_some() || env::var_os("RAM_PROBE").is_some() {
-					Write::error(
-						"infer: VRAM_PROBE/RAM_PROBE set: the binary's main must call recipe_infer::llm::vram_probe_ask() and gpu_core::memory::ram_probe_ask() and exit with the code before run()",
-					);
-					return self;
-				}
 				match Some(()).filter(|_probe| has(chat)) {
 					Some(_chat) => {
 						crate::cli::tui::chat(path);

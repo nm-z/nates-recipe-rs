@@ -14,7 +14,6 @@ use rand::{Rng as _, SeedableRng as _};
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::HashMap;
-use std::env;
 use std::fs::{self, File};
 use std::io;
 use std::mem;
@@ -2617,73 +2616,21 @@ fn decode_cached(
 	return Ok(out);
 }
 
-pub fn vram_probe_ask() -> Option<i32> {
-	let sz = env::var_os("VRAM_PROBE")?;
-	if crate::init().is_err() {
-		return Some(2);
-	}
-	let Ok(n) = sz.to_string_lossy().parse::<usize>() else {
-		return Some(2);
-	};
-	Some(match GpuBuffer::try_alloc_bytes(n) {
-		Some(_kept) => 0,
-		None => 2,
-	})
+pub fn vram_probe_ask() -> Result<usize> {
+	crate::init().map_err(|e| return anyhow!("gpu init: {e:?}"))?;
+	return Ok(gpu_core::memory::vram_free_base());
 }
 
 fn probe_claim() -> Result<Waterfall> {
-	let mut want = gpu_core::memory::vram_free_base() & !((1 << 21) - 1);
-	Write::line(
-		gpu,
-		format!("claim guess: {:.2} GB", want as f64 / (1u64 << 30) as f64),
-	);
-	loop {
-		if want < (1 << 30) {
-			bail!("claim probe: nothing mappable above 1 GB");
-		}
-		let status = {
-			let mut c = process::Command::new(env::current_exe()?);
-			c.stdin(process::Stdio::null());
-			c.env("VRAM_PROBE", want.to_string());
-			gpu_core::sys::disable_core_dumps(&mut c);
-			c.status().context("spawn claim probe")?
-		};
-		beat();
-		if status.success() {
-			break;
-		}
-		Write::line(
-			gpu,
-			format!(
-				"claim probe: {:.2} GB unmappable, backing off",
-				want as f64 / (1u64 << 30) as f64
-			),
-		);
-		want -= want / 16;
+	let want = gpu_core::memory::vram_free_base().saturating_sub(gpu_core::memory::USER_GB)
+		& !((1 << 21) - 1);
+	if want < (1 << 30) {
+		bail!("claim probe: nothing mappable above 1 GB");
 	}
 	Write::line(
 		gpu,
-		format!(
-			"claim: {:.2} GB (probe-verified)",
-			want as f64 / (1u64 << 30) as f64
-		),
+		format!("claim: {:.2} GB (measured)", want as f64 / (1u64 << 30) as f64),
 	);
-	let need = want + gpu_core::memory::USER_GB;
-	let reclaim_start = Instant::now();
-	while gpu_core::memory::vram_free_base() < need {
-		if reclaim_start.elapsed() > Duration::from_secs(10) {
-			Write::line(
-				gpu,
-				format!(
-					"claim: reclaim wait timed out, free={:.2} GB (probe child VRAM not returned)",
-					gpu_core::memory::vram_free_base() as f64 / (1u64 << 30) as f64
-				),
-			);
-			break;
-		}
-		thread::sleep(Duration::from_millis(50));
-		beat();
-	}
 	let slab = gpu_core::memory::claim_device_arena_bytes(want).context("claim device arena")?;
 	let w = Waterfall::from_arena(slab);
 	Write::line(
@@ -2807,11 +2754,6 @@ impl ChatSession {
 		gguf: &Path,
 		load_round: &mut dyn FnMut(&[Tok]) -> bool,
 	) -> Result<Opened> {
-		if env::var_os("VRAM_PROBE").is_some() || env::var_os("RAM_PROBE").is_some() {
-			Write::err(
-				"ChatSession: VRAM_PROBE/RAM_PROBE set: the binary's main must call llm::vram_probe_ask() and gpu_core::memory::ram_probe_ask() and exit with the code before any other work",
-			)?;
-		}
 		crate::init().map_err(|e| anyhow!("gpu init: {e:?}"))?;
 		let t_load = Instant::now();
 		let watchdog = arm_watchdog();

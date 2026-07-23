@@ -58,15 +58,3 @@ pub fn human_bytes(b: usize) -> String {
 	let pick = units.iter().find(|u| f >= u.floor).unwrap_or(&units[2]);
 	format!("{:.prec$} {}", f / pick.div, pick.label, prec = pick.prec)
 }
-
-#[ctor::ctor]
-fn probe_child_answer() {
-	if std::env::var_os("VRAM_PROBE").is_some() || std::env::var_os("RAM_PROBE").is_some() {
-		if let Some(code) = llm::vram_probe_ask() {
-			std::process::exit(code);
-		}
-		if let Some(code) = gpu_core::memory::ram_probe_ask() {
-			std::process::exit(code);
-		}
-	}
-}

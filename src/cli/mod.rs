@@ -165,12 +165,6 @@ pub fn main() -> anyhow::Result<std::process::ExitCode> {
 	if let Some(code) = recipe_runtime::machine::gpu_child_ask() {
 		return Ok(exit_code(code));
 	}
-	if let Some(code) = recipe_runtime::memory::vram_probe_ask()? {
-		return Ok(exit_code(code));
-	}
-	if let Some(code) = recipe_runtime::machine::ram_probe_ask() {
-		return Ok(exit_code(code));
-	}
 	if let Some(code) = recipe_runtime::execute::setup_race_ask()? {
 		return Ok(exit_code(code));
 	}
