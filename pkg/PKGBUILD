@@ -1,10 +1,12 @@
-pkgname=recipe
+pkgname=recipe-git
 pkgdesc="Capability-driven AOT scheduling and execution for AMD/NVIDIA GPUs"
-pkgver=0.1.1.r0.0000000
+pkgver=0.1.1.r443.720916ef
 pkgrel=1
 url=https://github.com/nm-z/nates-recipe-rs
 arch=(x86_64)
 license=(MIT)
+provides=("recipe=$pkgver")
+conflicts=(recipe)
 depends=(
     gcc-libs
     glibc
