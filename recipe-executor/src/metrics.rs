@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use recipe_core::{MetricId, MetricPurpose, MetricSlot, MetricSlotId, Task, TaskId, TaskKind};
+use recipe_core::{LoopIteration, MetricId, MetricPurpose, MetricSlot, MetricSlotId, Task, TaskId, TaskKind};
 
 use crate::error::{ExecutorError, Result};
 
@@ -15,6 +15,7 @@ pub enum MetricValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricSample {
 	pub sequence: u64,
+	pub iteration: LoopIteration,
 	pub task: TaskId,
 	pub slot: MetricSlotId,
 	pub metric: MetricId,
@@ -67,6 +68,7 @@ impl MetricMailbox {
 
 	pub(crate) fn publish(
 		&mut self,
+		iteration: LoopIteration,
 		task: TaskId,
 		slot: MetricSlotId,
 		metric: MetricId,
@@ -94,6 +96,7 @@ impl MetricMailbox {
 			.sample
 			.replace(MetricSample {
 				sequence,
+				iteration,
 				task,
 				slot,
 				metric,

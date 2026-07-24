@@ -9,9 +9,10 @@ use crate::identity::{
 use crate::ids::{ArenaObjectId, ArtifactId, DeviceId, TaskId, ValueId};
 use crate::scalar::{AliasPermission, DType, KernelTemplate};
 use crate::schedule::{
-	ArenaLayout, ArenaObject, ArenaRelease, InitDataImage, MetricPurpose, ResolvedTransferEndpoint,
-	ResolvedTransferEndpoints, ResolvedValueLocation, ResourceManifest, RunPhase, Task, TaskKind, TransferEndpoint,
-	TransferLaneClaim, ValueAliasContract, ValueBinding, ValueSpec,
+	ArenaLayout, ArenaObject, ArenaRelease, InitDataImage, IterationDomain, LoopIterations, LoopSchedule,
+	LoopTaskDomain, MetricPurpose, ResolvedTransferEndpoint, ResolvedTransferEndpoints, ResolvedValueLocation,
+	ResourceManifest, RunPhase, Task, TaskKind, TransferEndpoint, TransferLaneClaim, ValueAliasContract,
+	ValueBinding, ValueSpec,
 };
 use crate::topology::{DeviceKind, Property, Topology};
 use crate::units::{ByteCount, Nanoseconds};
@@ -24,12 +25,34 @@ pub enum ReservationMechanism {
 	EnforcedQuota,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationEvidence {
+	NonGpu,
+	GpuDisplay { enabled_connectors: u32 },
+}
+
+impl ReservationEvidence {
+	#[must_use]
+	pub const fn required_bytes(self) -> ByteCount {
+		match self {
+			Self::NonGpu
+			| Self::GpuDisplay {
+				enabled_connectors: 1..=u32::MAX,
+			} => EXACT_USER_RESERVATION,
+			Self::GpuDisplay {
+				enabled_connectors: 0,
+			} => ByteCount::ZERO,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReservationEntry {
 	pub device: DeviceId,
 	pub name: Label,
 	pub bytes: ByteCount,
 	pub mechanism: ReservationMechanism,
+	pub evidence: ReservationEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,8 +65,9 @@ impl ReservationLedger {
 		let mut validator = Validator::default();
 		let mut seen = BTreeSet::new();
 		for (index, entry) in self.entries.iter().enumerate() {
+			let device = topology.device(entry.device);
 			validator.require(
-				topology.device(entry.device).is_some(),
+				device.is_some(),
 				ValidationCode::UnknownReference,
 				format!("entries[{index}].device"),
 				format!("unknown device {}", entry.device),
@@ -54,13 +78,35 @@ impl ReservationLedger {
 				format!("entries[{index}].device"),
 				format!("device {} has more than one user reservation", entry.device),
 			);
+			if let Some(device) = device {
+				let evidence_matches = matches!(
+					(device.kind, entry.evidence),
+					(
+						DeviceKind::Ram | DeviceKind::Disk,
+						ReservationEvidence::NonGpu
+					) | (
+						DeviceKind::GpuMemory,
+						ReservationEvidence::GpuDisplay { .. }
+					)
+				);
+				validator.require(
+					evidence_matches,
+					ValidationCode::WrongKind,
+					format!("entries[{index}].evidence"),
+					format!(
+						"reservation evidence {:?} does not match device kind {:?}",
+						entry.evidence, device.kind
+					),
+				);
+			}
+			let required_bytes = entry.evidence.required_bytes();
 			validator.require(
-				entry.bytes == EXACT_USER_RESERVATION,
+				entry.bytes == required_bytes,
 				ValidationCode::WrongReservationSize,
 				format!("entries[{index}].bytes"),
 				format!(
-					"reservation must be exactly {} bytes, got {}",
-					EXACT_USER_RESERVATION.get(),
+					"reservation evidence requires exactly {} bytes, got {}",
+					required_bytes.get(),
 					entry.bytes.get()
 				),
 			);
@@ -728,6 +774,15 @@ fn validate_tasks(
 					format!("{path}.value"),
 					format!("unknown value {}", metric.value),
 				);
+				if let Some(value) = indexes.values.get(&metric.value) {
+					validate_submission(
+						validator,
+						&path,
+						value.device,
+						metric.submission,
+						&draft.resources,
+					);
+				}
 				validator.require(
 					draft.resources
 						.metric(metric.slot)
@@ -1336,7 +1391,7 @@ fn submission_slots(kind: &TaskKind) -> Option<crate::schedule::SubmissionSlots>
 	match kind {
 		TaskKind::Calculation(task) => Some(task.submission),
 		TaskKind::Transfer(task) => Some(task.submission),
-		TaskKind::Metric(_) => None,
+		TaskKind::Metric(task) => Some(task.submission),
 	}
 }
 
@@ -2203,10 +2258,144 @@ fn validate_realized_artifacts(
 	}
 }
 
+fn validate_loop_domains(
+	validator: &mut Validator,
+	tasks: &[Task],
+	loop_iterations: LoopIterations,
+	loop_domains: &[LoopTaskDomain],
+) {
+	let tasks_by_id = tasks
+		.iter()
+		.map(|task| (task.id, task))
+		.collect::<BTreeMap<_, _>>();
+	let mut domains = BTreeMap::new();
+	for (index, assignment) in loop_domains.iter().enumerate() {
+		let path = format!("loop_domains[{index}]");
+		validator.require(
+			domains.insert(assignment.task, assignment.domain).is_none(),
+			ValidationCode::DuplicateId,
+			format!("{path}.task"),
+			format!(
+				"task {} has more than one iteration domain",
+				assignment.task
+			),
+		);
+		let task = tasks_by_id.get(&assignment.task).copied();
+		validator.require(
+			task.is_some(),
+			ValidationCode::UnknownReference,
+			format!("{path}.task"),
+			format!(
+				"iteration domain references unknown task {}",
+				assignment.task
+			),
+		);
+		validator.require(
+			task.is_some_and(|task| task.phase == RunPhase::Loop),
+			ValidationCode::InvalidPhase,
+			format!("{path}.task"),
+			"only loop tasks may have an iteration domain",
+		);
+		validator.require(
+			assignment.domain.is_within(loop_iterations),
+			ValidationCode::InvalidIterationDomain,
+			format!("{path}.domain"),
+			format!(
+				"iteration domain [{}, {}) stride {} exceeds bounded loop [0, {})",
+				assignment.domain.first_iteration(),
+				assignment.domain.end_exclusive(),
+				assignment.domain.stride(),
+				loop_iterations.get()
+			),
+		);
+	}
+	for (index, task) in tasks.iter().enumerate() {
+		validator.require(
+			(task.phase == RunPhase::Loop) == domains.contains_key(&task.id),
+			ValidationCode::InvalidIterationDomain,
+			format!("tasks[{index}].iteration_domain"),
+			match task.phase {
+				RunPhase::Loop => "loop task has no iteration domain",
+				RunPhase::Init | RunPhase::Exit => "non-loop task has an iteration domain",
+			},
+		);
+	}
+
+	for (index, task) in tasks.iter().enumerate() {
+		let Some(task_domain) = domains.get(&task.id).copied() else {
+			continue;
+		};
+		if let TaskKind::Metric(metric) = &task.kind
+			&& let MetricPurpose::FaultReadback { calculation } = metric.purpose
+			&& let Some(calculation_domain) = domains.get(&calculation).copied()
+		{
+			validator.require(
+				task_domain == calculation_domain,
+				ValidationCode::InvalidIterationDomain,
+				format!("tasks[{index}].iteration_domain"),
+				format!(
+					"fault readback {} must share calculation {calculation}'s iteration domain",
+					task.id
+				),
+			);
+		}
+
+		let TaskKind::Transfer(transfer) = &task.kind else {
+			continue;
+		};
+		let (
+			TransferEndpoint::Device {
+				value: destination, ..
+			},
+			TransferEndpoint::Device { .. },
+		) = (transfer.destination, transfer.source)
+		else {
+			continue;
+		};
+		for (consumer_index, consumer) in tasks.iter().enumerate() {
+			if consumer.id == task.id
+				|| consumer.phase != RunPhase::Loop
+				|| !task_reads_value(consumer, destination)
+			{
+				continue;
+			}
+			if let Some(consumer_domain) = domains.get(&consumer.id).copied() {
+				validator.require(
+					task_domain == consumer_domain,
+					ValidationCode::InvalidIterationDomain,
+					format!("tasks[{consumer_index}].iteration_domain"),
+					format!(
+						"consumer {} must share internal transfer {}'s iteration domain for value {destination}",
+						consumer.id, task.id
+					),
+				);
+			}
+		}
+	}
+}
+
+fn task_reads_value(task: &Task, value: ValueId) -> bool {
+	match &task.kind {
+		TaskKind::Calculation(calculation) => calculation.inputs.contains(&value),
+		TaskKind::Transfer(transfer) => {
+			matches!(
+				transfer.source,
+				TransferEndpoint::Device {
+					value: source,
+					..
+				} if source == value
+			)
+		}
+		TaskKind::Metric(metric) => metric.value == value,
+	}
+}
+
 /// Immutable product of Finalize. Fields can only be populated by validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedBundle {
 	identity: BundleIdentity,
+	loop_iterations: LoopIterations,
+	loop_domains: Vec<LoopTaskDomain>,
 	topology: TopologyIdentity,
 	discovery: DiscoveryIdentity,
 	draft: DraftIdentity,
@@ -2233,6 +2422,63 @@ impl FinalizedBundle {
 		realization: RealizationProfile,
 		arena_layouts: Vec<ArenaLayout>,
 	) -> ValidationResult<Self> {
+		Self::finalize_with_loop_iterations(
+			identity,
+			topology,
+			discovery,
+			draft,
+			realization,
+			arena_layouts,
+			LoopIterations::ONE,
+		)
+	}
+
+	/// Finalizes one immutable bundle with an explicit bounded loop count.
+	///
+	/// The loop graph, artifacts, arenas, and pending-token slots remain
+	/// singular; only execution of the already-finalized loop is repeated.
+	pub fn finalize_with_loop_iterations(
+		identity: BundleIdentity,
+		topology: &Topology,
+		discovery: &DiscoveryProfile,
+		draft: DraftPlan,
+		realization: RealizationProfile,
+		arena_layouts: Vec<ArenaLayout>,
+		loop_iterations: LoopIterations,
+	) -> ValidationResult<Self> {
+		let loop_domains = draft
+			.tasks
+			.iter()
+			.filter(|task| task.phase == RunPhase::Loop)
+			.map(|task| LoopTaskDomain {
+				task: task.id,
+				domain: IterationDomain::every(loop_iterations),
+			})
+			.collect();
+		Self::finalize_with_loop_schedule(
+			identity,
+			topology,
+			discovery,
+			draft,
+			realization,
+			arena_layouts,
+			LoopSchedule::new(loop_iterations, loop_domains),
+		)
+	}
+
+	/// Finalizes one immutable bundle with an exact activation domain for every
+	/// loop task.
+	pub fn finalize_with_loop_schedule(
+		identity: BundleIdentity,
+		topology: &Topology,
+		discovery: &DiscoveryProfile,
+		draft: DraftPlan,
+		realization: RealizationProfile,
+		arena_layouts: Vec<ArenaLayout>,
+		loop_schedule: LoopSchedule,
+	) -> ValidationResult<Self> {
+		let (loop_iterations, mut loop_domains) = loop_schedule.into_parts();
+		loop_domains.sort_by_key(|entry| entry.task);
 		let mut validator = Validator::default();
 		validator.require(
 			!identity.is_zero(),
@@ -2246,6 +2492,7 @@ impl FinalizedBundle {
 		if let Err(errors) = realization.validate(topology, discovery, &draft) {
 			validator.append("realization", errors);
 		}
+		validate_loop_domains(&mut validator, &draft.tasks, loop_iterations, &loop_domains);
 		validate_layouts(
 			&mut validator,
 			topology,
@@ -2265,6 +2512,8 @@ impl FinalizedBundle {
 		}
 		Ok(Self {
 			identity,
+			loop_iterations,
+			loop_domains,
 			topology: topology.identity,
 			discovery: discovery.identity,
 			draft: draft.identity,
@@ -2286,6 +2535,24 @@ impl FinalizedBundle {
 	#[must_use]
 	pub const fn identity(&self) -> BundleIdentity {
 		self.identity
+	}
+
+	#[must_use]
+	pub const fn loop_iterations(&self) -> LoopIterations {
+		self.loop_iterations
+	}
+
+	#[must_use]
+	pub fn loop_domains(&self) -> &[LoopTaskDomain] {
+		&self.loop_domains
+	}
+
+	#[must_use]
+	pub fn iteration_domain(&self, task: TaskId) -> Option<IterationDomain> {
+		self.loop_domains
+			.binary_search_by_key(&task, |entry| entry.task)
+			.ok()
+			.map(|index| self.loop_domains[index].domain)
 	}
 
 	#[must_use]
@@ -2761,6 +3028,7 @@ mod tests {
 				DiscoveredDevice {
 					device: gpu,
 					available: true,
+					maximum_submission_queues: 2,
 					total_capacity: property(ByteCount::new(12_000_000_000)),
 					transfer: TransferCapability {
 						rate: property(BytesPerSecond::new(432_000_000_000).unwrap()),
@@ -2778,6 +3046,7 @@ mod tests {
 				DiscoveredDevice {
 					device: ram,
 					available: true,
+					maximum_submission_queues: 1,
 					total_capacity: property(ByteCount::new(48_000_000_000)),
 					transfer: TransferCapability {
 						rate: property(BytesPerSecond::new(90_000_000_000).unwrap()),
@@ -3070,12 +3339,16 @@ mod tests {
 					name: label("user-gpu"),
 					bytes: EXACT_USER_RESERVATION,
 					mechanism: ReservationMechanism::HeldAllocation,
+					evidence: ReservationEvidence::GpuDisplay {
+						enabled_connectors: 1,
+					},
 				},
 				ReservationEntry {
 					device: ram,
 					name: label("user-ram"),
 					bytes: EXACT_USER_RESERVATION,
 					mechanism: ReservationMechanism::EnforcedQuota,
+					evidence: ReservationEvidence::NonGpu,
 				},
 			],
 		};
@@ -3192,6 +3465,7 @@ mod tests {
 			panic!("fixture task 3 must be a calculation");
 		};
 		task.fault_flag = Some(fault_flag);
+		let submission = task.submission;
 		draft.values.push(ValueSpec {
 			id: fault_flag,
 			dtype: DType::I32,
@@ -3222,6 +3496,7 @@ mod tests {
 				metric: MetricId::new(1),
 				value: fault_flag,
 				slot: MetricSlotId::new(1),
+				submission,
 			}),
 		});
 		readback
@@ -3241,6 +3516,22 @@ mod tests {
 			}) if *calculation == TaskId::new(3) && *value == ValueId::new(3)
 		));
 		assert_eq!(draft.tasks[3].id, readback);
+	}
+
+	#[test]
+	fn rejects_metric_submission_slots_on_the_wrong_device() {
+		let (topology, discovery, mut draft, _, _) = fixture();
+		add_fault_contract(&mut draft);
+		let TaskKind::Metric(metric) = &mut draft.tasks[3].kind else {
+			panic!("fault helper must append a metric readback");
+		};
+		metric.submission = SubmissionSlots {
+			queue: QueueSlotId::new(2),
+			completion: CompletionSlotId::new(2),
+		};
+
+		let errors = draft.validate(&topology, &discovery).unwrap_err();
+		assert!(errors.contains(ValidationCode::ResourceMismatch));
 	}
 
 	#[test]
@@ -3356,6 +3647,64 @@ mod tests {
 				}),
 			})
 		);
+	}
+
+	#[test]
+	fn finalized_sparse_domains_are_complete_and_bounded() {
+		let iterations = LoopIterations::new(4).unwrap();
+		let domain = IterationDomain::new(1, 4, 2).unwrap();
+		let (topology, discovery, draft, realization, layouts) = fixture();
+		let bundle = FinalizedBundle::finalize_with_loop_schedule(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+			LoopSchedule::new(
+				iterations,
+				vec![LoopTaskDomain {
+					task: TaskId::new(3),
+					domain,
+				}],
+			),
+		)
+		.unwrap();
+		assert_eq!(bundle.loop_iterations(), iterations);
+		assert_eq!(bundle.iteration_domain(TaskId::new(3)), Some(domain));
+		assert_eq!(bundle.iteration_domain(TaskId::new(1)), None);
+
+		let (topology, discovery, draft, realization, layouts) = fixture();
+		let missing = FinalizedBundle::finalize_with_loop_schedule(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+			LoopSchedule::new(iterations, Vec::new()),
+		)
+		.unwrap_err();
+		assert!(missing.contains(ValidationCode::InvalidIterationDomain));
+
+		let (topology, discovery, draft, realization, layouts) = fixture();
+		let out_of_bounds = FinalizedBundle::finalize_with_loop_schedule(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+			LoopSchedule::new(
+				iterations,
+				vec![LoopTaskDomain {
+					task: TaskId::new(3),
+					domain: IterationDomain::new(0, 5, 1).unwrap(),
+				}],
+			),
+		)
+		.unwrap_err();
+		assert!(out_of_bounds.contains(ValidationCode::InvalidIterationDomain));
 	}
 
 	#[test]
@@ -3689,6 +4038,64 @@ mod tests {
 	fn rejects_binary_gib_reservation_on_every_storage_kind() {
 		let (topology, discovery, draft, mut realization, layouts) = fixture();
 		realization.reservations.entries[0].bytes = ByteCount::new(1 << 30);
+		let errors = FinalizedBundle::finalize(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+		)
+		.unwrap_err();
+		assert!(errors.contains(ValidationCode::WrongReservationSize));
+	}
+
+	#[test]
+	fn accepts_explicit_zero_headroom_for_a_headless_gpu() {
+		let (topology, discovery, draft, mut realization, layouts) = fixture();
+		realization.reservations.entries[0].bytes = ByteCount::ZERO;
+		realization.reservations.entries[0].evidence = ReservationEvidence::GpuDisplay {
+			enabled_connectors: 0,
+		};
+		realization.capacity.entries[0].recipe_usable = property(ByteCount::new(12_000_000_000));
+		let bundle = FinalizedBundle::finalize(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+		)
+		.unwrap();
+		assert_eq!(bundle.reservations().entries[0].bytes, ByteCount::ZERO);
+		assert_eq!(
+			bundle.reservations().entries[0].evidence,
+			ReservationEvidence::GpuDisplay {
+				enabled_connectors: 0,
+			}
+		);
+	}
+
+	#[test]
+	fn reservation_evidence_must_match_device_kind() {
+		let (topology, discovery, draft, mut realization, layouts) = fixture();
+		realization.reservations.entries[0].evidence = ReservationEvidence::NonGpu;
+		let errors = FinalizedBundle::finalize(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+		)
+		.unwrap_err();
+		assert!(errors.contains(ValidationCode::WrongKind));
+	}
+
+	#[test]
+	fn enabled_gpu_display_evidence_requires_exact_headroom() {
+		let (topology, discovery, draft, mut realization, layouts) = fixture();
+		realization.reservations.entries[0].bytes = ByteCount::ZERO;
 		let errors = FinalizedBundle::finalize(
 			BundleIdentity::new(digest(8)),
 			&topology,

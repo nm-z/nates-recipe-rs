@@ -14,13 +14,19 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use recipe_core::{
-	ArtifactIdentity, BundleIdentity, ByteCount, CandidateIdentity, CapacityLedger, CapacityLedgerEntry,
-	DiscoveryProfile, DraftPlan, EXACT_USER_RESERVATION, FinalizedBundle, Property, PropertyProvenance,
-	RealizationIdentity, RealizationProfile, ReservationLedger, ResourceManifest, Topology,
+	ArtifactIdentity, BundleIdentity, ByteCount, CandidateIdentity, CapacityLedger, CapacityLedgerEntry, DeviceId,
+	DiscoveryProfile, DraftPlan, EXACT_USER_RESERVATION, FinalizedBundle, LoopIterations, LoopTaskDomain, Property,
+	PropertyProvenance, RealizationIdentity, RealizationProfile, ReservationLedger, ResourceManifest, TaskId,
+	Topology, ValueId,
 };
 use recipe_language::CalculationGraph;
-use recipe_planner::{PlannedCandidate, PlannerSearch, plan_candidates};
+#[cfg(test)]
+use recipe_planner::plan_candidates;
+use recipe_planner::{
+	PlannedCandidate, PlannedExternalOutput, PlannedProgramCandidate, ProgramPlannerSearch, plan_program_candidates,
+};
 use recipe_probe::{MeasuredProfile, validate_profile};
+use recipe_program::StaticCalculationProgram;
 use recipe_scheduler::pack_arenas;
 use sha2::{Digest as _, Sha256};
 
@@ -198,9 +204,20 @@ impl fmt::Display for PrepareError {
 		if !self.rejections.is_empty() {
 			write!(
 				formatter,
-				" ({} candidate rejection(s))",
+				" ({} candidate rejection(s): ",
 				self.rejections.len()
 			)?;
+			for (index, rejection) in self.rejections.iter().enumerate() {
+				if index != 0 {
+					write!(formatter, "; ")?;
+				}
+				write!(
+					formatter,
+					"{:?} at {:?}: {}",
+					rejection.candidate, rejection.stage, rejection.detail
+				)?;
+			}
+			write!(formatter, ")")?;
 		}
 		Ok(())
 	}
@@ -216,6 +233,7 @@ pub struct PreparedSystem<C, S> {
 	realization: RealizationProfile,
 	catalog: C,
 	session: S,
+	external_outputs: Vec<PlannedExternalOutput>,
 	attempted_candidates: usize,
 	rejections: Vec<CandidateRejection>,
 }
@@ -239,6 +257,18 @@ impl<C, S> PreparedSystem<C, S> {
 	#[must_use]
 	pub const fn session(&self) -> &S {
 		&self.session
+	}
+
+	/// Exact logical-to-physical egress identities retained from the candidate
+	/// that produced this immutable bundle.
+	///
+	/// Finalized exit tasks address physical arena values. This evidence
+	/// preserves the one logical tensor deliberately selected for each task
+	/// without reverse-matching against unrelated resident copies.
+	pub fn external_outputs(&self) -> impl ExactSizeIterator<Item = (TaskId, ValueId, DeviceId, ValueId)> + '_ {
+		self.external_outputs
+			.iter()
+			.map(|output| (output.task, output.logical, output.device, output.physical))
 	}
 
 	#[must_use]
@@ -311,15 +341,39 @@ where
 		graph: &CalculationGraph,
 		profile: &MeasuredProfile,
 	) -> Result<PreparedSystem<A::Catalog, R::Session>, PrepareError> {
+		let program = StaticCalculationProgram::every_iteration(graph.clone(), LoopIterations::ONE)
+			.map_err(|error| PrepareError::new(PrepareErrorKind::Planning, error.to_string()))?;
+		self.prepare_program(&program, profile)
+	}
+
+	/// Prepares a bounded calculation program decoded from Recipe OGDL or
+	/// constructed directly.
+	pub fn prepare_program(
+		&mut self,
+		program: &StaticCalculationProgram,
+		profile: &MeasuredProfile,
+	) -> Result<PreparedSystem<A::Catalog, R::Session>, PrepareError> {
 		self.policy.validate()?;
 		validate_profile(profile)
 			.map_err(|error| PrepareError::new(PrepareErrorKind::InvalidMeasuredProfile, error.to_string()))?;
-		self.prepare_validated(graph, &profile.topology, &profile.discovery)
+		self.prepare_program_validated(program, &profile.topology, &profile.discovery)
 	}
 
+	#[cfg(test)]
 	fn prepare_validated(
 		&mut self,
 		graph: &CalculationGraph,
+		topology: &Topology,
+		discovery: &DiscoveryProfile,
+	) -> Result<PreparedSystem<A::Catalog, R::Session>, PrepareError> {
+		let program = StaticCalculationProgram::every_iteration(graph.clone(), LoopIterations::ONE)
+			.map_err(|error| PrepareError::new(PrepareErrorKind::Planning, error.to_string()))?;
+		self.prepare_program_validated(&program, topology, discovery)
+	}
+
+	fn prepare_program_validated(
+		&mut self,
+		program: &StaticCalculationProgram,
 		topology: &Topology,
 		discovery: &DiscoveryProfile,
 	) -> Result<PreparedSystem<A::Catalog, R::Session>, PrepareError> {
@@ -339,15 +393,15 @@ where
 		let planning_capacity = optimistic_planning_capacity(topology, discovery, &reservations)?;
 		let catalog = self
 			.artifact_provider
-			.resolve(graph, topology, discovery)
+			.resolve(program.graph(), topology, discovery)
 			.map_err(|error| {
 				PrepareError::new(
 					PrepareErrorKind::ArtifactCatalog,
 					format!("artifact resolution failed: {error}"),
 				)
 			})?;
-		let mut search = plan_candidates(
-			graph,
+		let mut search = plan_program_candidates(
+			program,
 			topology,
 			discovery,
 			self.artifact_provider.identities(&catalog),
@@ -358,7 +412,12 @@ where
 
 		let mut attempts = 0usize;
 		let mut rejections = Vec::new();
-		while let Some(candidate) = next_owned_candidate(&mut search) {
+		while let Some(program_candidate) = next_owned_program_candidate(&mut search) {
+			let PlannedProgramCandidate {
+				planned: candidate,
+				loop_iterations,
+				loop_domains,
+			} = program_candidate;
 			attempts = attempts.checked_add(1).ok_or_else(|| {
 				PrepareError::new(
 					PrepareErrorKind::ArithmeticOverflow,
@@ -438,20 +497,24 @@ where
 				reservations: realized.observation.reservations,
 				capacity,
 			};
-			let bundle_identity = hash_bundle(
+			let bundle_identity = hash_bundle_with_loop_domains(
 				topology,
 				discovery,
 				&candidate.draft,
 				&realization,
 				&layouts,
+				loop_iterations,
+				&loop_domains,
 			);
-			let bundle = match FinalizedBundle::finalize(
+			let external_outputs = candidate.external_outputs.clone();
+			let bundle = match FinalizedBundle::finalize_with_loop_schedule(
 				bundle_identity,
 				topology,
 				discovery,
 				candidate.draft,
 				realization.clone(),
 				layouts,
+				recipe_core::LoopSchedule::new(loop_iterations, loop_domains),
 			) {
 				Ok(bundle) => bundle,
 				Err(errors) => {
@@ -468,6 +531,7 @@ where
 				realization,
 				catalog,
 				session: realized.session,
+				external_outputs,
 				attempted_candidates: attempts,
 				rejections,
 			});
@@ -495,12 +559,12 @@ where
 	}
 }
 
-fn next_owned_candidate(search: &mut PlannerSearch) -> Option<PlannedCandidate> {
+fn next_owned_program_candidate(search: &mut ProgramPlannerSearch) -> Option<PlannedProgramCandidate> {
 	search.next_candidate().cloned()
 }
 
 fn reject_candidate(
-	search: &mut PlannerSearch,
+	search: &mut ProgramPlannerSearch,
 	rejections: &mut Vec<CandidateRejection>,
 	candidate: CandidateIdentity,
 	stage: CandidateRejectionStage,
@@ -611,8 +675,15 @@ fn validate_observation(
 		.iter()
 		.any(|snapshot| snapshot != &final_snapshot)
 	{
+		let deltas = capacity_stability_deltas(
+			topology,
+			&observation.capacity_snapshots,
+			stable_start,
+			&final_snapshot,
+		);
 		return Err(format!(
-			"the final {stable_tail} post-warm capacity snapshots did not stabilize"
+			"the final {stable_tail} post-warm capacity snapshots did not stabilize: {}",
+			deltas.join("; ")
 		));
 	}
 
@@ -633,12 +704,96 @@ fn validate_observation(
 	Ok(final_snapshot)
 }
 
+fn capacity_stability_deltas(
+	topology: &Topology,
+	snapshots: &[CapacityLedger],
+	stable_start: usize,
+	final_snapshot: &CapacityLedger,
+) -> Vec<String> {
+	let final_pass = snapshots.len();
+	let mut deltas = Vec::new();
+	for (index, snapshot) in snapshots
+		.iter()
+		.enumerate()
+		.skip(stable_start)
+		.take(final_pass.saturating_sub(stable_start + 1))
+	{
+		if snapshot == final_snapshot {
+			continue;
+		}
+		for device in &topology.devices {
+			let Some(observed) = snapshot.entry(device.id) else {
+				deltas.push(format!(
+					"pass {} device {} is absent but present in final pass {final_pass}",
+					index + 1,
+					device.id
+				));
+				continue;
+			};
+			let Some(final_entry) = final_snapshot.entry(device.id) else {
+				deltas.push(format!(
+					"pass {} device {} is present but absent from final pass {final_pass}",
+					index + 1,
+					device.id
+				));
+				continue;
+			};
+			for (field, observed, final_value) in [
+				("total", observed.total.value, final_entry.total.value),
+				(
+					"runtime_overhead",
+					observed.runtime_overhead.value,
+					final_entry.runtime_overhead.value,
+				),
+				(
+					"fragmentation",
+					observed.fragmentation.value,
+					final_entry.fragmentation.value,
+				),
+				(
+					"safety_headroom",
+					observed.safety_headroom.value,
+					final_entry.safety_headroom.value,
+				),
+				(
+					"recipe_usable",
+					observed.recipe_usable.value,
+					final_entry.recipe_usable.value,
+				),
+			] {
+				if observed != final_value {
+					deltas.push(format!(
+						"pass {} device {} {field}={} vs final pass {final_pass}={} ({})",
+						index + 1,
+						device.id,
+						observed.get(),
+						final_value.get(),
+						byte_delta(observed, final_value)
+					));
+				}
+			}
+		}
+	}
+	if deltas.is_empty() {
+		deltas.push("snapshot ordering or metadata differed without a byte-field delta".to_owned());
+	}
+	deltas
+}
+
+fn byte_delta(observed: ByteCount, final_value: ByteCount) -> String {
+	match final_value.get().cmp(&observed.get()) {
+		std::cmp::Ordering::Greater => format!("final increased by {}", final_value.get() - observed.get()),
+		std::cmp::Ordering::Less => format!("final decreased by {}", observed.get() - final_value.get()),
+		std::cmp::Ordering::Equal => "no byte delta".to_owned(),
+	}
+}
+
 fn hash_realization(
 	draft: &DraftPlan,
 	observation: &RealizationObservation,
 	policy: PreparationPolicy,
 ) -> RealizationIdentity {
-	let mut hash = CanonicalHash::new("recipe-realization-v2");
+	let mut hash = CanonicalHash::new("recipe-realization-v3");
 	hash.digest(draft.identity.digest());
 	hash.digest(draft.candidate.digest());
 	hash.digest(draft.discovery.digest());
@@ -658,6 +813,7 @@ fn hash_realization(
 	RealizationIdentity::new(hash.finish())
 }
 
+#[cfg(test)]
 fn hash_bundle(
 	topology: &Topology,
 	discovery: &DiscoveryProfile,
@@ -665,7 +821,36 @@ fn hash_bundle(
 	realization: &RealizationProfile,
 	layouts: &[recipe_core::ArenaLayout],
 ) -> BundleIdentity {
-	let mut hash = CanonicalHash::new("recipe-finalized-bundle-v2");
+	let loop_domains = draft
+		.tasks
+		.iter()
+		.filter(|task| task.phase == recipe_core::RunPhase::Loop)
+		.map(|task| LoopTaskDomain {
+			task: task.id,
+			domain: recipe_core::IterationDomain::every(LoopIterations::ONE),
+		})
+		.collect::<Vec<_>>();
+	hash_bundle_with_loop_domains(
+		topology,
+		discovery,
+		draft,
+		realization,
+		layouts,
+		LoopIterations::ONE,
+		&loop_domains,
+	)
+}
+
+fn hash_bundle_with_loop_domains(
+	topology: &Topology,
+	discovery: &DiscoveryProfile,
+	draft: &DraftPlan,
+	realization: &RealizationProfile,
+	layouts: &[recipe_core::ArenaLayout],
+	loop_iterations: LoopIterations,
+	loop_domains: &[LoopTaskDomain],
+) -> BundleIdentity {
+	let mut hash = CanonicalHash::new("recipe-finalized-bundle-v4");
 	hash.digest(topology.identity.digest());
 	hash.digest(discovery.identity.digest());
 	hash.digest(draft.identity.digest());
@@ -675,6 +860,14 @@ fn hash_bundle(
 	hash.artifact_builds(&draft.artifact_builds);
 	hash.value_aliases(&draft.value_aliases);
 	hash.tasks(&draft.tasks);
+	hash.u64(loop_iterations.get());
+	hash.u64(loop_domains.len() as u64);
+	for assignment in loop_domains {
+		hash.u64(assignment.task.get());
+		hash.u64(assignment.domain.first_iteration());
+		hash.u64(assignment.domain.end_exclusive());
+		hash.u64(assignment.domain.stride().get());
+	}
 	hash.resources(&realization.resources);
 	hash.reservations(&realization.reservations);
 	hash.capacity(&realization.capacity);
@@ -903,6 +1096,8 @@ impl CanonicalHash {
 					self.u64(metric.metric.get());
 					self.u64(metric.value.get());
 					self.u64(metric.slot.get());
+					self.u64(metric.submission.queue.get());
+					self.u64(metric.submission.completion.get());
 				}
 			}
 		}
@@ -969,6 +1164,13 @@ impl CanonicalHash {
 				recipe_core::ReservationMechanism::HeldAllocation => 0,
 				recipe_core::ReservationMechanism::EnforcedQuota => 1,
 			});
+			match entry.evidence {
+				recipe_core::ReservationEvidence::NonGpu => self.u64(0),
+				recipe_core::ReservationEvidence::GpuDisplay { enabled_connectors } => {
+					self.u64(1);
+					self.u64(u64::from(enabled_connectors));
+				}
+			}
 		}
 	}
 

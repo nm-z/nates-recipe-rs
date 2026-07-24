@@ -144,6 +144,7 @@ pub(crate) fn candidate_fixture(bytes: &[u8]) -> CandidateFixture {
 		devices: vec![DiscoveredDevice {
 			device: GPU,
 			available: true,
+			maximum_submission_queues: 1,
 			total_capacity: property(ByteCount::new(12_000_000_000)),
 			transfer: TransferCapability {
 				rate: property(success(BytesPerSecond::new(432_000_000_000))),
@@ -319,6 +320,10 @@ pub(crate) fn candidate_fixture(bytes: &[u8]) -> CandidateFixture {
 					metric: metric_id,
 					value,
 					slot: metric_slot,
+					submission: SubmissionSlots {
+						queue: QUEUE,
+						completion: COMPLETION,
+					},
 				}),
 			},
 		],
@@ -355,7 +360,10 @@ pub(crate) fn candidate_fixture(bytes: &[u8]) -> CandidateFixture {
 			device: GPU,
 			name: label("user"),
 			bytes: EXACT_USER_RESERVATION,
-			mechanism: ReservationMechanism::HeldAllocation,
+			mechanism: ReservationMechanism::EnforcedQuota,
+			evidence: ReservationEvidence::GpuDisplay {
+				enabled_connectors: 1,
+			},
 		}],
 	};
 	let capacity = CapacityLedger {
@@ -398,6 +406,7 @@ pub(crate) fn candidate_fixture(bytes: &[u8]) -> CandidateFixture {
 		stage_placements: Vec::new(),
 		lowered_programs: Vec::new(),
 		value_copies: Vec::new(),
+		external_outputs: Vec::new(),
 	};
 	let runtime_bytes: Arc<[u8]> = Arc::from(bytes);
 	let artifacts = vec![CandidateArtifact::new(
@@ -427,8 +436,105 @@ pub(crate) fn fixture(bytes: &[u8]) -> FinalizedBundle {
 	candidate_fixture(bytes).bundle
 }
 
+fn deferred_build_fixture(bytes: &[u8]) -> FinalizedBundle {
+	let fixture = candidate_fixture(bytes);
+	let mut draft = fixture.candidate.draft.clone();
+	let kernel_template = match &draft.tasks[1].kind {
+		TaskKind::Calculation(calculation) => calculation.kernel_template,
+		TaskKind::Transfer(_) | TaskKind::Metric(_) => panic!("fixture task 1 is not a calculation"),
+	};
+	let build = ArtifactBuildRecipe {
+		artifact: ARTIFACT,
+		kernel_template,
+		source_kernel: kernel_template,
+		provenance: ArtifactBuildProvenance {
+			program_digest: digest(9),
+			stage_ordinal: 0,
+			contract_digest: digest(10),
+		},
+		bindings: vec![ArtifactBuildBinding {
+			value: ValueId::new(1),
+			dtype: DType::F32,
+			access: ArtifactBuildAccess::ReadWrite,
+			view: ArtifactBuildView {
+				logical_extents: vec![4],
+				offset_elements: 0,
+				strides: vec![1],
+				storage_bytes: ByteCount::new(16),
+			},
+		}],
+		dispatch: ArtifactDispatchGeometry {
+			logical_lanes: 4,
+			workgroup_lanes: 64,
+			workgroups: 1,
+		},
+		work: ArtifactWorkBounds {
+			flops: FlopCount::new(4),
+			integer_operations: 0,
+			atomic_operations: 0,
+		},
+		fault_flag: None,
+		resources: KernelResourceBounds {
+			private_bytes_per_lane: ByteCount::ZERO,
+			shared_bytes_per_workgroup: ByteCount::ZERO,
+			scratch_bytes_per_dispatch: ByteCount::ZERO,
+			maximum_workgroup_lanes: 64,
+		},
+	};
+	draft.kernels.clear();
+	draft.artifacts.clear();
+	draft.artifact_builds = vec![build.clone()];
+
+	let mut artifact = fixture.bundle.artifacts()[0].clone();
+	artifact.build = Some(build.provenance);
+	artifact.resources = build.resources;
+	let realization = RealizationProfile {
+		identity: RealizationIdentity::new(digest(11)),
+		draft: draft.identity,
+		candidate: draft.candidate,
+		discovery: draft.discovery,
+		topology: draft.topology,
+		artifacts: vec![artifact],
+		resources: draft.resources.clone(),
+		reservations: fixture.reservations,
+		capacity: fixture.capacity,
+	};
+	success(FinalizedBundle::finalize(
+		BundleIdentity::new(digest(12)),
+		&fixture.topology,
+		&fixture.discovery,
+		draft,
+		realization,
+		fixture.candidate.arena_layouts,
+	))
+}
+
 #[test]
-fn immutable_plan_assigns_metric_to_preexisting_nonoverlapping_slots() {
+fn native_plan_uses_deferred_build_contract_without_a_scalar_template() {
+	let bytes: Arc<[u8]> = Arc::from(&b"runtime-image"[..]);
+	let bundle = deferred_build_fixture(&bytes);
+	assert!(bundle.kernels().is_empty());
+	assert!(bundle.artifact_build(ARTIFACT).is_some());
+	success(ExecutionPlan::validate(
+		&bundle,
+		vec![runtime_artifact(Arc::clone(&bytes), kernel_abi())],
+	));
+
+	let mut wrong_access = kernel_abi();
+	wrong_access.arguments[0] = KernelArgument::Buffer {
+		access: BufferAccess::Write,
+		dtype: DType::F32,
+		alignment: 4,
+	};
+	let error = match ExecutionPlan::validate(&bundle, vec![runtime_artifact(bytes, wrong_access)]) {
+		Ok(plan) => panic!("wrong deferred-stage ABI produced a plan: {plan:?}"),
+		Err(error) => error,
+	};
+	assert!(matches!(error, Error::ArtifactMismatch { .. }));
+}
+
+#[test]
+fn immutable_plan_uses_the_metric_submission_slots_persisted_by_the_planner() {
 	let bytes: Arc<[u8]> = Arc::from(&b"runtime-image"[..]);
 	let bundle = fixture(&bytes);
 	let plan = success(ExecutionPlan::validate(
@@ -497,9 +603,46 @@ fn dynamic_run_id_has_one_canonical_native_abi_position() {
 }
 
 #[test]
+fn loop_iteration_has_one_canonical_native_abi_position() {
+	let bytes: Arc<[u8]> = Arc::from(&b"runtime-image"[..]);
+	let bundle = fixture(&bytes);
+
+	let mut dynamic = kernel_abi();
+	dynamic.arguments.insert(2, KernelArgument::LoopIteration);
+	dynamic.argument_bytes = 32;
+	success(ExecutionPlan::validate(
+		&bundle,
+		vec![runtime_artifact(Arc::clone(&bytes), dynamic.clone())],
+	));
+
+	let mut misplaced = dynamic.clone();
+	misplaced.arguments.swap(0, 2);
+	let misplaced_error = match ExecutionPlan::validate(
+		&bundle,
+		vec![runtime_artifact(Arc::clone(&bytes), misplaced)],
+	) {
+		Ok(plan) => panic!("misplaced loop iteration produced a plan: {plan:?}"),
+		Err(error) => error,
+	};
+	assert!(matches!(misplaced_error, Error::ArtifactMismatch { .. }));
+
+	let mut repeated = dynamic;
+	repeated.arguments.insert(3, KernelArgument::LoopIteration);
+	repeated.argument_bytes = 40;
+	let repeated_error = match ExecutionPlan::validate(&bundle, vec![runtime_artifact(bytes, repeated)]) {
+		Ok(plan) => panic!("repeated loop iteration produced a plan: {plan:?}"),
+		Err(error) => error,
+	};
+	assert!(matches!(repeated_error, Error::ArtifactMismatch { .. }));
+}
+
+#[test]
 fn accounting_keeps_one_submit_and_one_poll_per_logical_action() {
 	let work = recipe_executor::BackendWork::Metric(recipe_executor::MetricWork {
 		task: METRIC,
+		iteration: LoopIterations::ONE
+			.iteration(0)
+			.expect("one loop iteration has index zero"),
 		metric: MetricId::new(1),
 		slot: MetricSlotId::new(1),
 		purpose: MetricPurpose::User,
@@ -511,6 +654,10 @@ fn accounting_keeps_one_submit_and_one_poll_per_logical_action() {
 			object: ArenaObjectId::new(1),
 			object_offset: ByteOffset::new(0),
 			arena_offset: ByteOffset::new(0),
+		},
+		submission: SubmissionSlots {
+			queue: QUEUE,
+			completion: COMPLETION,
 		},
 	});
 	assert!(matches!(

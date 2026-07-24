@@ -25,7 +25,7 @@ pub use backend::{
 pub use error::{BACKEND_MESSAGE_CAPACITY, BackendMessage, BackendOperation, ExecutorError, JournalStream, Result};
 pub use executor::{
 	DeviceImage, ExitImage, ExitedLoop, ExitedRun, InitializedRun, JournalCapacity, LogicalEvent, LoopStatus,
-	PreparedRun, RunJournal, RunningRun, RuntimeCapacities, Watchdog,
+	PendingPollCount, PreparedRun, RunJournal, RunningRun, RuntimeCapacities, Watchdog,
 };
 pub use metrics::{MetricMailbox, MetricSample, MetricValue};
 pub use worker::{

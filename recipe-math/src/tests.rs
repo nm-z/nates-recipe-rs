@@ -477,7 +477,10 @@ fn every_function_builds_a_valid_versioned_program() {
 		assert_eq!(first, second);
 		assert_eq!(first.function, function);
 		assert_eq!(first.algorithm, function.algorithm());
-		assert_eq!(first.algorithm.version, 1);
+		assert_eq!(
+			first.algorithm.version,
+			if function == MathFunction::Pow { 2 } else { 1 }
+		);
 		assert!(identities.insert(first.algorithm.name));
 		assert_eq!(first.program.inputs.len(), function.arity());
 		assert_eq!(function.contract().domain.inputs.len(), function.arity());
@@ -708,6 +711,41 @@ fn dense_finite_sweeps_respect_the_error_contracts() {
 			let base = logarithm.exp();
 			let exponent = (f32::from(exponent_step) - 32.0) / 3.2;
 			assert_program_conforms(&pow, &[base, exponent], base.powf(exponent));
+		}
+	}
+}
+
+#[test]
+fn positive_base_pow_crosses_adam_beta_one_underflow_without_faulting() {
+	let math = match build(MathFunction::Pow) {
+		Ok(math) => math,
+		Err(error) => panic!("failed to build Pow: {error}"),
+	};
+	for step in [759.0_f32, 760.0, 900.0, 1_000.0, 4_400.0] {
+		let expected = 0.9_f32.powf(step);
+		assert_program_conforms(&math, &[0.9, step], expected);
+		let evaluation = evaluate(&math.program, &[0.9, step]);
+		assert!(
+			!evaluation.faulted,
+			"Adam beta-one power faulted at step {step}"
+		);
+		match step as u32 {
+			759 | 760 => assert!(
+				evaluation.output.is_normal(),
+				"beta-one power should remain normal at step {step}, got {}",
+				evaluation.output
+			),
+			900 => assert!(
+				evaluation.output.is_subnormal(),
+				"beta-one power should be subnormal at step 900, got {}",
+				evaluation.output
+			),
+			1_000 | 4_400 => assert_eq!(
+				evaluation.output.to_bits(),
+				0.0_f32.to_bits(),
+				"true binary32 underflow must round to positive zero at step {step}"
+			),
+			_ => unreachable!("the test enumerates exact Adam steps"),
 		}
 	}
 }

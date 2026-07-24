@@ -201,6 +201,7 @@ fn single_machine_profile(index: u8, name: &str) -> MeasuredProfile {
 			DiscoveredDevice {
 				device: ram,
 				available: true,
+				maximum_submission_queues: 4,
 				total_capacity: measured(ram_capacity),
 				transfer: TransferCapability {
 					rate: measured(ram_rate),
@@ -213,6 +214,7 @@ fn single_machine_profile(index: u8, name: &str) -> MeasuredProfile {
 			DiscoveredDevice {
 				device: disk,
 				available: true,
+				maximum_submission_queues: 1,
 				total_capacity: measured(disk_capacity),
 				transfer: TransferCapability {
 					rate: measured(disk_rate),
@@ -225,6 +227,7 @@ fn single_machine_profile(index: u8, name: &str) -> MeasuredProfile {
 			DiscoveredDevice {
 				device: gpu,
 				available: true,
+				maximum_submission_queues: 2,
 				total_capacity: measured(gpu_capacity),
 				transfer: TransferCapability {
 					rate: measured(gpu_rate),

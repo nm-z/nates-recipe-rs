@@ -699,14 +699,17 @@ dependencies = [
  "recipe-math",
  "recipe-native-executor",
  "recipe-native-probe",
+ "recipe-ogdl",
  "recipe-ops",
  "recipe-planner",
  "recipe-prepare",
  "recipe-primitives",
  "recipe-probe",
+ "recipe-program",
  "recipe-remote",
  "recipe-scheduler",
  "recipe-text",
+ "recipe-training",
  "recipe-transport",
 ]
 
@@ -791,6 +794,7 @@ name = "recipe-language"
 version = "0.1.0"
 dependencies = [
  "recipe-core",
+ "recipe-ogdl",
 ]
 
 [[package]]
@@ -829,6 +833,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "recipe-ogdl"
+version = "0.1.0"
+
+[[package]]
 name = "recipe-ops"
 version = "0.1.0"
 dependencies = [
@@ -845,6 +853,7 @@ dependencies = [
  "recipe-core",
  "recipe-language",
  "recipe-primitives",
+ "recipe-program",
  "recipe-scheduler",
  "sha2",
 ]
@@ -860,6 +869,7 @@ dependencies = [
  "recipe-native-executor",
  "recipe-planner",
  "recipe-probe",
+ "recipe-program",
  "recipe-scheduler",
  "sha2",
 ]
@@ -879,6 +889,15 @@ dependencies = [
  "recipe-core",
  "rustix",
  "sha2",
+]
+
+[[package]]
+name = "recipe-program"
+version = "0.1.0"
+dependencies = [
+ "recipe-core",
+ "recipe-language",
+ "recipe-ogdl",
 ]
 
 [[package]]
@@ -905,6 +924,23 @@ dependencies = [
  "hf-chat-template",
  "recipe-ingest",
  "tokenizers",
+]
+
+[[package]]
+name = "recipe-training"
+version = "0.1.0"
+dependencies = [
+ "recipe-core",
+ "recipe-executor",
+ "recipe-ingest",
+ "recipe-language",
+ "recipe-native-executor",
+ "recipe-ogdl",
+ "recipe-ops",
+ "recipe-prepare",
+ "recipe-probe",
+ "recipe-program",
+ "rustix",
 ]
 
 [[package]]

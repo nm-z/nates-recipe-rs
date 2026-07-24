@@ -11,8 +11,8 @@ use recipe_core::{
 
 use crate::error::ProbeResult;
 
-pub const PROFILE_SCHEMA: u32 = 5;
-pub const PROFILE_CODEC_SCHEMA: u32 = 5;
+pub const PROFILE_SCHEMA: u32 = 6;
+pub const PROFILE_CODEC_SCHEMA: u32 = 6;
 pub const PEER_BENCHMARK_PROTOCOL_SCHEMA: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +98,7 @@ pub struct GpuDescriptor {
 	pub host_to_device_maximum_inflight: TransferLaneCount,
 	pub device_to_host_maximum_inflight: TransferLaneCount,
 	pub asynchronous_submission: bool,
+	pub maximum_submission_queues: u32,
 	pub maximum_concurrent_tasks: u32,
 	pub transfer_overlaps_calculation: bool,
 }
@@ -304,11 +305,7 @@ pub struct PeerBenchmarkFailure {
 
 impl PeerBenchmarkFailure {
 	#[must_use]
-	pub fn new(
-		phase: PeerBenchmarkPhase,
-		kind: PeerBenchmarkFailureKind,
-		detail: impl Into<String>,
-	) -> Self {
+	pub fn new(phase: PeerBenchmarkPhase, kind: PeerBenchmarkFailureKind, detail: impl Into<String>) -> Self {
 		Self {
 			protocol_schema: PEER_BENCHMARK_PROTOCOL_SCHEMA,
 			phase,

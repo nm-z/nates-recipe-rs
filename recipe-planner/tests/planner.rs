@@ -4,10 +4,11 @@ use recipe_core::{
 	AliasPermission, ArtifactIdentity, ByteCount, BytesPerSecond, CalculationCapability, CapacityLedger,
 	CapacityLedgerEntry, DType, Device, DeviceId, DeviceKind, Digest, DirectedLink, DiscoveredDevice, DiscoveredLink,
 	DiscoveryIdentity, DiscoveryProfile, DuplexMode, DuplexResourceId, EXACT_USER_RESERVATION, FlopsPerSecond,
-	KernelResourceBounds, KernelTemplateId, Label, LinkId, Machine, MachineId, Node, NodeId, NodeRole, Property,
-	PropertyProvenance, ReservationEntry, ReservationLedger, ReservationMechanism, ScalarInput, ScalarInstruction,
-	ScalarOpcode, ScalarProgram, ScalarValueId, TargetIdentity, ToolchainIdentity, Topology, TopologyIdentity,
-	TransferCapability, TransferLaneClaim, TransferLaneCount, TransportId, TransportKind, ValueId,
+	IterationDomain, KernelResourceBounds, KernelTemplateId, Label, LinkId, LoopIterations, Machine, MachineId,
+	MetricId, Node, NodeId, NodeRole, Property, PropertyProvenance, ReservationEntry, ReservationEvidence,
+	ReservationLedger, ReservationMechanism, ScalarInput, ScalarInstruction, ScalarOpcode, ScalarProgram,
+	ScalarValueId, TargetIdentity, ToolchainIdentity, Topology, TopologyIdentity, TransferCapability,
+	TransferLaneClaim, TransferLaneCount, TransportId, TransportKind, ValueId,
 };
 use recipe_language::{
 	AtomicOperation, AtomicOrdering, AxisSet, CalculationGraph, CalculationNode, Contraction, Elementwise, Gather,
@@ -15,7 +16,8 @@ use recipe_language::{
 	RandomMap, Reduce, ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Shape, Sort,
 	SortDirection, Tensor,
 };
-use recipe_planner::{PlannerErrorKind, plan_candidates};
+use recipe_planner::{PlannerErrorKind, plan_candidates, plan_program_candidates};
+use recipe_program::{KernelIterationDomain, MetricEmission, StaticCalculationProgram};
 
 fn label(value: &str) -> Label {
 	Label::new(value).unwrap()
@@ -117,6 +119,7 @@ fn fixture() -> Fixture {
 	let discovered_device = |id, calculation: Option<(TargetIdentity, u32)>| DiscoveredDevice {
 		device: id,
 		available: true,
+		maximum_submission_queues: 64,
 		total_capacity: measured(ByteCount::new(10_000_000_000)),
 		transfer: TransferCapability {
 			rate: measured(BytesPerSecond::new(1_000_000_000).unwrap()),
@@ -161,6 +164,12 @@ fn fixture() -> Fixture {
 				name: label(&format!("user-{}", device.id.get())),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::HeldAllocation,
+				evidence: match device.kind {
+					DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
+						enabled_connectors: 1,
+					},
+					DeviceKind::Ram | DeviceKind::Disk => ReservationEvidence::NonGpu,
+				},
 			})
 			.collect(),
 	};
@@ -227,6 +236,7 @@ fn three_gpu_fixture() -> (Fixture, TargetIdentity) {
 	fixture.discovery.devices.push(DiscoveredDevice {
 		device: gpu_c,
 		available: true,
+		maximum_submission_queues: 64,
 		total_capacity: measured(ByteCount::new(10_000_000_000)),
 		transfer: TransferCapability {
 			rate: measured(BytesPerSecond::new(1_000_000_000).unwrap()),
@@ -258,6 +268,9 @@ fn three_gpu_fixture() -> (Fixture, TargetIdentity) {
 		name: label("user-5"),
 		bytes: EXACT_USER_RESERVATION,
 		mechanism: ReservationMechanism::HeldAllocation,
+		evidence: ReservationEvidence::GpuDisplay {
+			enabled_connectors: 1,
+		},
 	});
 	fixture.capacity.entries.push(CapacityLedgerEntry {
 		device: gpu_c,
@@ -414,6 +427,16 @@ fn chain_graph() -> CalculationGraph {
 fn one_node_graph() -> CalculationGraph {
 	CalculationGraph {
 		tensors: vec![tensor(1, true, false), tensor(2, false, true)],
+		nodes: vec![unary(1, 1, 2)],
+	}
+}
+
+fn scalar_one_node_graph() -> CalculationGraph {
+	CalculationGraph {
+		tensors: vec![
+			typed_tensor(1, DType::F32, &[1], true, false),
+			typed_tensor(2, DType::F32, &[1], false, false),
+		],
 		nodes: vec![unary(1, 1, 2)],
 	}
 }
@@ -658,6 +681,31 @@ fn inserts_cross_machine_route_and_complete_lifecycle_contract() {
 		panic!("final hop must have a resident destination");
 	};
 	assert_eq!(final_copy.physical, final_destination);
+	let [egress] = planned.external_outputs.as_slice() else {
+		panic!("the one external tensor must produce one explicit egress identity");
+	};
+	assert_eq!(egress.logical, ValueId::new(3));
+	assert_ne!(egress.physical, egress.logical);
+	let egress_task = planned
+		.draft
+		.tasks
+		.iter()
+		.find(|task| task.id == egress.task)
+		.expect("recorded egress task exists");
+	let recipe_core::TaskKind::Transfer(egress_transfer) = &egress_task.kind else {
+		panic!("recorded egress task is a transfer");
+	};
+	assert_eq!(
+		egress_transfer.source,
+		recipe_core::TransferEndpoint::Device {
+			device: egress.device,
+			value: egress.physical,
+		}
+	);
+	assert_eq!(
+		egress_transfer.destination,
+		recipe_core::TransferEndpoint::External
+	);
 	for (_, transfer) in &transfers[..2] {
 		let recipe_core::TransferEndpoint::Device { value, .. } = transfer.destination else {
 			panic!("intermediate hop must have a resident destination");
@@ -793,6 +841,309 @@ fn checked_programs_receive_a_preallocated_device_fault_flag() {
 			1
 		);
 	}
+}
+
+#[test]
+fn ogdl_program_domains_reach_every_lowered_stage_and_fault_readback() {
+	let fixture = fixture();
+	let iterations = LoopIterations::new(5).unwrap();
+	let domain = IterationDomain::new(1, 5, 2).unwrap();
+	let program = StaticCalculationProgram::new(
+		faulting_graph(),
+		iterations,
+		vec![KernelIterationDomain {
+			kernel: KernelTemplateId::new(1),
+			domain,
+		}],
+	)
+	.unwrap();
+	let decoded = StaticCalculationProgram::from_ogdl(&program.to_ogdl().unwrap()).unwrap();
+	let artifacts = [
+		artifact(1, 1, fixture.target_a.clone()),
+		artifact(2, 1, fixture.target_b.clone()),
+	];
+	let search = plan_program_candidates(
+		&decoded,
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+
+	for candidate in search.ranked_candidates() {
+		assert_eq!(candidate.loop_iterations, iterations);
+		let loop_tasks = candidate
+			.planned
+			.draft
+			.tasks
+			.iter()
+			.filter(|task| task.phase == recipe_core::RunPhase::Loop)
+			.count();
+		assert_eq!(candidate.loop_domains.len(), loop_tasks);
+		assert!(
+			candidate
+				.loop_domains
+				.iter()
+				.all(|assignment| assignment.domain == domain)
+		);
+		let readback = candidate
+			.planned
+			.draft
+			.tasks
+			.iter()
+			.find(|task| matches!(task.kind, recipe_core::TaskKind::Metric(_)))
+			.unwrap();
+		assert_eq!(
+			candidate
+				.loop_domains
+				.iter()
+				.find(|assignment| assignment.task == readback.id)
+				.unwrap()
+				.domain,
+			domain
+		);
+	}
+}
+
+#[test]
+fn user_metric_uses_preallocated_slot_on_producer_resident_copy_and_exact_domain() {
+	let fixture = fixture();
+	let iterations = LoopIterations::new(6).unwrap();
+	let producer_domain = IterationDomain::every(iterations);
+	let metric_domain = IterationDomain::new(1, 6, 2).unwrap();
+	let program = StaticCalculationProgram::new_with_metrics(
+		scalar_one_node_graph(),
+		iterations,
+		vec![KernelIterationDomain {
+			kernel: KernelTemplateId::new(1),
+			domain: producer_domain,
+		}],
+		vec![MetricEmission {
+			metric: MetricId::new(41),
+			value: ValueId::new(2),
+			domain: metric_domain,
+		}],
+	)
+	.unwrap();
+	let artifacts = [
+		artifact(1, 1, fixture.target_a.clone()),
+		artifact(2, 1, fixture.target_b.clone()),
+	];
+	let search = plan_program_candidates(
+		&program,
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+
+	for candidate in search.ranked_candidates() {
+		let producer_device = candidate
+			.planned
+			.placements
+			.iter()
+			.find(|placement| placement.kernel == KernelTemplateId::new(1))
+			.unwrap()
+			.device;
+		let resident = candidate
+			.planned
+			.value_copies
+			.iter()
+			.find(|copy| copy.logical == ValueId::new(2) && copy.device == producer_device)
+			.unwrap();
+		let (metric_task, metric) = candidate
+			.planned
+			.draft
+			.tasks
+			.iter()
+			.find_map(|task| match &task.kind {
+				recipe_core::TaskKind::Metric(metric) if metric.purpose == recipe_core::MetricPurpose::User => {
+					Some((task, metric))
+				}
+				_ => None,
+			})
+			.unwrap();
+		assert_eq!(metric.metric, MetricId::new(41));
+		assert_eq!(metric.value, resident.physical);
+		assert_eq!(
+			candidate
+				.loop_domains
+				.iter()
+				.find(|assignment| assignment.task == metric_task.id)
+				.unwrap()
+				.domain,
+			metric_domain
+		);
+		assert_eq!(
+			candidate
+				.planned
+				.draft
+				.resources
+				.metrics
+				.iter()
+				.find(|slot| slot.id == metric.slot)
+				.map(|slot| slot.metric),
+			Some(MetricId::new(41))
+		);
+		let producer = candidate
+			.planned
+			.draft
+			.values
+			.iter()
+			.find(|value| value.id == resident.physical)
+			.and_then(|value| value.producer)
+			.unwrap();
+		assert!(metric_task.dependencies.contains(&producer));
+		assert!(!candidate.planned.draft.tasks.iter().any(|task| {
+			matches!(
+				task.kind,
+				recipe_core::TaskKind::Transfer(recipe_core::TransferTask {
+					source: recipe_core::TransferEndpoint::Device {
+						value,
+						..
+					},
+					destination: recipe_core::TransferEndpoint::External,
+					..
+				}) if value == metric.value
+			)
+		}));
+	}
+
+	let rerun = plan_program_candidates(
+		&StaticCalculationProgram::from_ogdl(&program.to_ogdl().unwrap()).unwrap(),
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+	assert_eq!(
+		search.ranked_candidates()
+			.iter()
+			.map(|candidate| (
+				candidate.planned.draft.candidate,
+				candidate.planned.draft.identity,
+			))
+			.collect::<Vec<_>>(),
+		rerun.ranked_candidates()
+			.iter()
+			.map(|candidate| (
+				candidate.planned.draft.candidate,
+				candidate.planned.draft.identity,
+			))
+			.collect::<Vec<_>>()
+	);
+	let changed_program = program
+		.clone()
+		.with_metrics(vec![MetricEmission {
+			metric: MetricId::new(42),
+			value: ValueId::new(2),
+			domain: metric_domain,
+		}])
+		.unwrap();
+	let changed = plan_program_candidates(
+		&changed_program,
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+	assert!(
+		search.ranked_candidates()
+			.iter()
+			.map(|candidate| candidate.planned.draft.candidate)
+			.zip(changed
+				.ranked_candidates()
+				.iter()
+				.map(|candidate| candidate.planned.draft.candidate))
+			.all(|(original, changed)| original != changed)
+	);
+}
+
+#[test]
+fn internal_transfer_uses_its_consuming_kernel_domain() {
+	let fixture = fixture();
+	let iterations = LoopIterations::new(6).unwrap();
+	let producer_domain = IterationDomain::new(0, 6, 2).unwrap();
+	let consumer_domain = IterationDomain::new(1, 6, 2).unwrap();
+	let program = StaticCalculationProgram::new(
+		chain_graph(),
+		iterations,
+		vec![
+			KernelIterationDomain {
+				kernel: KernelTemplateId::new(1),
+				domain: producer_domain,
+			},
+			KernelIterationDomain {
+				kernel: KernelTemplateId::new(2),
+				domain: consumer_domain,
+			},
+		],
+	)
+	.unwrap();
+	let artifacts = [
+		artifact(1, 1, fixture.target_a.clone()),
+		artifact(2, 2, fixture.target_b.clone()),
+	];
+	let search = plan_program_candidates(
+		&program,
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+	let candidate = search
+		.ranked_candidates()
+		.iter()
+		.find(|candidate| {
+			candidate
+				.planned
+				.placements
+				.iter()
+				.map(|placement| (placement.kernel, placement.device))
+				.collect::<BTreeMap<_, _>>()
+				== BTreeMap::from([
+					(KernelTemplateId::new(1), DeviceId::new(1)),
+					(KernelTemplateId::new(2), DeviceId::new(3)),
+				])
+		})
+		.unwrap();
+	let domains = candidate
+		.loop_domains
+		.iter()
+		.map(|assignment| (assignment.task, assignment.domain))
+		.collect::<BTreeMap<_, _>>();
+	let internal_transfers = candidate
+		.planned
+		.draft
+		.tasks
+		.iter()
+		.filter(|task| {
+			matches!(
+				task.kind,
+				recipe_core::TaskKind::Transfer(recipe_core::TransferTask {
+					source: recipe_core::TransferEndpoint::Device { .. },
+					destination: recipe_core::TransferEndpoint::Device { .. },
+					..
+				})
+			)
+		})
+		.collect::<Vec<_>>();
+	assert!(!internal_transfers.is_empty());
+	assert!(
+		internal_transfers
+			.iter()
+			.all(|task| domains[&task.id] == consumer_domain)
+	);
 }
 
 #[test]

@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 
 use recipe_core::{
-	ArtifactBuildRecipe, ArtifactId, ArtifactIdentity, CapacityLedger, DiscoveryIdentity, DiscoveryProfile,
-	ReservationLedger, Topology, TopologyIdentity, ValidationErrors,
+	ArtifactBuildRecipe, ArtifactId, ArtifactIdentity, CapacityLedger, DeviceId, DiscoveryIdentity, DiscoveryProfile,
+	ReservationEvidence, ReservationLedger, Topology, TopologyIdentity, ValidationErrors,
 };
 use recipe_planner::PlannedCandidate;
 
@@ -261,6 +261,8 @@ pub trait CandidateSessionFactory {
 	type Session: fmt::Debug;
 	type Error: StdError + Send + Sync + 'static;
 
+	fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error>;
+
 	fn realize_candidate(
 		&mut self,
 		request: CandidateRealizationRequest<'_>,
@@ -346,6 +348,10 @@ where
 {
 	type Error = F::Error;
 	type Session = ValidatedCandidateSession<F::Session>;
+
+	fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error> {
+		self.inner.reservation_evidence(device)
+	}
 
 	fn realize_candidate(
 		&mut self,
@@ -444,6 +450,11 @@ fn unavailable_candidate<T>(context: T) -> CandidateFailure<UnavailableCandidate
 impl CandidateSessionFactory for UnavailableCandidateFactory {
 	type Error = UnavailableCandidateError;
 	type Session = ();
+
+	fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error> {
+		let _ = device;
+		Err(UnavailableCandidateError)
+	}
 
 	fn realize_candidate(
 		&mut self,
@@ -637,6 +648,11 @@ mod tests {
 	impl CandidateSessionFactory for FakeFactory {
 		type Error = FakeError;
 		type Session = FakeSession;
+
+		fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error> {
+			let _ = device;
+			Ok(ReservationEvidence::NonGpu)
+		}
 
 		fn realize_candidate(
 			&mut self,

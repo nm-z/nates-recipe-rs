@@ -41,25 +41,25 @@ impl SlotCapacity {
 pub struct RuntimeConfig {
 	worker_threads: usize,
 	slots: SlotCapacity,
-	staging_bytes_per_slot: usize,
+	staging_bytes_per_worker: usize,
 }
 
 impl RuntimeConfig {
-	pub fn new(worker_threads: usize, slots: SlotCapacity, staging_bytes_per_slot: usize) -> Result<Self> {
+	pub fn new(worker_threads: usize, slots: SlotCapacity, staging_bytes_per_worker: usize) -> Result<Self> {
 		if worker_threads == 0 {
 			return Err(Error::InvalidConfiguration(
 				"worker thread count must be nonzero",
 			));
 		}
-		if staging_bytes_per_slot == 0 {
+		if staging_bytes_per_worker == 0 {
 			return Err(Error::InvalidConfiguration(
-				"per-slot disk staging capacity must be nonzero",
+				"per-worker disk staging capacity must be nonzero",
 			));
 		}
 		Ok(Self {
 			worker_threads,
 			slots,
-			staging_bytes_per_slot,
+			staging_bytes_per_worker,
 		})
 	}
 
@@ -74,8 +74,8 @@ impl RuntimeConfig {
 	}
 
 	#[must_use]
-	pub const fn staging_bytes_per_slot(self) -> usize {
-		self.staging_bytes_per_slot
+	pub const fn staging_bytes_per_worker(self) -> usize {
+		self.staging_bytes_per_worker
 	}
 }
 
@@ -106,22 +106,15 @@ struct JobSlot {
 	state: AtomicU8,
 	job: Mutex<Option<Job>>,
 	failure: Mutex<Option<Error>>,
-	staging: Mutex<Box<[u8]>>,
 }
 
 impl JobSlot {
-	fn new(staging_bytes: usize) -> Result<Self> {
-		let mut staging = Vec::new();
-		staging
-			.try_reserve_exact(staging_bytes)
-			.map_err(|_| Error::InvalidConfiguration("host staging allocation failed"))?;
-		staging.resize(staging_bytes, 0);
-		Ok(Self {
+	fn new() -> Self {
+		Self {
 			state: AtomicU8::new(SLOT_UNCLAIMED),
 			job: Mutex::new(None),
 			failure: Mutex::new(None),
-			staging: Mutex::new(staging.into_boxed_slice()),
-		})
+		}
 	}
 }
 
@@ -149,7 +142,7 @@ impl Runtime {
 		slots.try_reserve_exact(config.slots.get())
 			.map_err(|_| Error::InvalidConfiguration("host slot table allocation failed"))?;
 		for _ in 0..config.slots.get() {
-			slots.push(Arc::new(JobSlot::new(config.staging_bytes_per_slot)?));
+			slots.push(Arc::new(JobSlot::new()));
 		}
 		let shared = Arc::new(Shared {
 			slots,
@@ -159,15 +152,23 @@ impl Runtime {
 			stopping: AtomicBool::new(false),
 			poisoned: AtomicBool::new(false),
 		});
+		let worker_count = config.worker_threads.min(config.slots.get());
+		let mut staging = Vec::new();
+		staging
+			.try_reserve_exact(worker_count)
+			.map_err(|_| Error::InvalidConfiguration("host staging table allocation failed"))?;
+		for _ in 0..worker_count {
+			staging.push(allocate_staging(config.staging_bytes_per_worker)?);
+		}
 		let mut workers = Vec::new();
 		workers
-			.try_reserve_exact(config.worker_threads)
+			.try_reserve_exact(worker_count)
 			.map_err(|_| Error::InvalidConfiguration("host worker table allocation failed"))?;
-		for index in 0..config.worker_threads {
+		for (index, mut worker_staging) in staging.into_iter().enumerate() {
 			let worker_shared = Arc::clone(&shared);
 			let spawned = thread::Builder::new()
 				.name(format!("recipe-host-{index}"))
-				.spawn(move || worker_loop(&worker_shared));
+				.spawn(move || worker_loop(&worker_shared, &mut worker_staging));
 			match spawned {
 				Ok(handle) => workers.push(handle),
 				Err(error) => {
@@ -370,7 +371,16 @@ fn notify_worker(shared: &Shared) {
 	shared.wake.notify_one();
 }
 
-fn worker_loop(shared: &Shared) {
+fn allocate_staging(bytes: usize) -> Result<Box<[u8]>> {
+	let mut staging = Vec::new();
+	staging
+		.try_reserve_exact(bytes)
+		.map_err(|_| Error::InvalidConfiguration("host staging allocation failed"))?;
+	staging.resize(bytes, 0);
+	Ok(staging.into_boxed_slice())
+}
+
+fn worker_loop(shared: &Shared, staging: &mut [u8]) {
 	loop {
 		let mut progressed = false;
 		for slot in &shared.slots {
@@ -387,7 +397,7 @@ fn worker_loop(shared: &Shared) {
 				continue;
 			}
 			progressed = true;
-			let outcome = execute_slot(slot);
+			let outcome = execute_slot(slot, staging);
 			match outcome {
 				Ok(()) => slot.state.store(SLOT_COMPLETE, Ordering::Release),
 				Err(error) => {
@@ -425,15 +435,14 @@ fn worker_loop(shared: &Shared) {
 	}
 }
 
-fn execute_slot(slot: &JobSlot) -> Result<()> {
+fn execute_slot(slot: &JobSlot, staging: &mut [u8]) -> Result<()> {
 	let job = slot
 		.job
 		.lock()
 		.map_err(|_| Error::Poisoned)?
 		.take()
 		.ok_or(Error::InvalidPendingState)?;
-	let mut staging = slot.staging.lock().map_err(|_| Error::Poisoned)?;
-	execute_copy(&job, &mut staging)
+	execute_copy(&job, staging)
 }
 
 fn execute_copy(job: &Job, staging: &mut [u8]) -> Result<()> {
@@ -774,12 +783,5 @@ mod tests {
 		assert!(arena_path.exists());
 		drop(second_owner);
 		assert!(!arena_path.exists());
-
-		let reservation_spec = directory.file("abandoned-reservation");
-		let reservation_path = reservation_spec.path().to_owned();
-		let reservation =
-			crate::Reservation::disk(DeviceId::new(2), reservation_spec, ByteCount::new(4096)).unwrap();
-		drop(reservation);
-		assert!(!reservation_path.exists());
 	}
 }

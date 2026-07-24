@@ -41,14 +41,17 @@ members = [
 	"recipe-math",
 	"recipe-native-executor",
 	"recipe-native-probe",
+	"recipe-ogdl",
 	"recipe-ops",
 	"recipe-planner",
 	"recipe-prepare",
 	"recipe-primitives",
+	"recipe-program",
 	"recipe-probe",
 	"recipe-remote",
 	"recipe-scheduler",
 	"recipe-text",
+	"recipe-training",
 	"recipe-transport",
 ]
 
@@ -65,14 +68,17 @@ recipe-language = { path = "recipe-language" }
 recipe-math = { path = "recipe-math" }
 recipe-native-executor = { path = "recipe-native-executor" }
 recipe-native-probe = { path = "recipe-native-probe" }
+recipe-ogdl = { path = "recipe-ogdl" }
 recipe-ops = { path = "recipe-ops" }
 recipe-planner = { path = "recipe-planner" }
 recipe-prepare = { path = "recipe-prepare" }
 recipe-primitives = { path = "recipe-primitives" }
+recipe-program = { path = "recipe-program" }
 recipe-probe = { path = "recipe-probe" }
 recipe-remote = { path = "recipe-remote" }
 recipe-scheduler = { path = "recipe-scheduler" }
 recipe-text = { path = "recipe-text" }
+recipe-training = { path = "recipe-training" }
 recipe-transport = { path = "recipe-transport" }
 
 [lints]

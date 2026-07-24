@@ -21,6 +21,7 @@ mod inference_quantization_diffusion;
 mod loss_metrics;
 mod optimizer_normalization;
 mod solver_fft;
+mod training;
 mod tree_boosting;
 
 const MAX_EXPANDED_STEPS: usize = 1_000_000;
@@ -549,6 +550,7 @@ fn dispatch_concrete(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 	dispatch_family!(tree_boosting);
 	dispatch_family!(inference_quantization_diffusion);
 	dispatch_family!(creation_shape_misc);
+	dispatch_family!(training);
 	Err(operation_error(
 		request.descriptor.id,
 		OperationErrorKind::GraphMaterializationFailed,
@@ -4665,6 +4667,7 @@ const fn primitive_family(kind: &PrimitiveKind) -> PrimitiveFamily {
 		PrimitiveKind::Scatter(_) => PrimitiveFamily::Scatter,
 		PrimitiveKind::Histogram(_) => PrimitiveFamily::Histogram,
 		PrimitiveKind::Sort(_) => PrimitiveFamily::Sort,
+		PrimitiveKind::IndexMap(_) => PrimitiveFamily::IndexMap,
 		PrimitiveKind::Random(_) => PrimitiveFamily::Random,
 	}
 }
@@ -4733,4 +4736,5 @@ fn has_concrete_materializer(descriptor: OperationDescriptor) -> bool {
 		|| tree_boosting::supports(descriptor)
 		|| inference_quantization_diffusion::supports(descriptor)
 		|| creation_shape_misc::supports(descriptor)
+		|| training::supports(descriptor)
 }

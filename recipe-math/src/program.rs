@@ -6,6 +6,10 @@ use crate::MathFunction;
 const LOG_TWO_HIGH: f32 = 0.693_145_75;
 const LOG_TWO_LOW: f32 = 1.428_606_8e-6;
 const LOG_TWO_RECIPROCAL: f32 = core::f32::consts::LOG2_E;
+// ln(2^-150): binary32 exp results at or below this half-min-subnormal
+// tie round to positive zero under round-to-nearest-even.
+const EXP_HALF_MIN_SUBNORMAL_LOG: f32 = -103.972_08;
+const EXP_SPLIT_SCALE_BITS: i32 = 64;
 const PI_OVER_TWO_HIGH: f32 = f32::from_bits(0x3fc9_0fda);
 const PI_OVER_TWO_LOW: f32 = 7.549_789_4e-8;
 const TWO_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
@@ -98,11 +102,10 @@ fn emit_function(
 			require_positive(builder, x)?;
 			let logarithm = emit_log_core(builder, x)?;
 			let power = builder.binary(ScalarOpcode::Multiply, exponent, logarithm)?;
-			let absolute_power = builder.unary(ScalarOpcode::Absolute, power)?;
 			let limit = builder.f32(80.0)?;
-			let in_range = builder.binary(ScalarOpcode::LessThanOrEqual, absolute_power, limit)?;
+			let in_range = builder.binary(ScalarOpcode::LessThanOrEqual, power, limit)?;
 			require_condition(builder, in_range)?;
-			emit_exp_core(builder, power)
+			emit_exp_with_underflow(builder, power)
 		}
 		MathFunction::Sign => emit_sign(builder, x),
 		MathFunction::Sigmoid => {
@@ -331,6 +334,30 @@ fn emit_atan2_core(
 }
 
 fn emit_exp_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> LanguageResult<ScalarExpression> {
+	emit_exp_reconstruction(builder, x, false)
+}
+
+/// Reconstruct exp across the binary32 subnormal range and round values at or
+/// below half of the minimum subnormal to positive zero.
+fn emit_exp_with_underflow(
+	builder: &mut ScalarProgramBuilder,
+	x: ScalarExpression,
+) -> LanguageResult<ScalarExpression> {
+	let cutoff = builder.f32(EXP_HALF_MIN_SUBNORMAL_LOG)?;
+	let underflows = builder.binary(ScalarOpcode::LessThanOrEqual, x, cutoff)?;
+	// Clamp before f32-to-i32 range reduction so a finite multiplication that
+	// overflowed toward negative infinity cannot enter numeric conversion.
+	let bounded = builder.binary(ScalarOpcode::Maximum, x, cutoff)?;
+	let reconstructed = emit_exp_reconstruction(builder, bounded, true)?;
+	let zero = builder.f32(0.0)?;
+	builder.ternary(ScalarOpcode::Select, underflows, zero, reconstructed)
+}
+
+fn emit_exp_reconstruction(
+	builder: &mut ScalarProgramBuilder,
+	x: ScalarExpression,
+	support_subnormals: bool,
+) -> LanguageResult<ScalarExpression> {
 	let log_two_reciprocal = builder.f32(LOG_TWO_RECIPROCAL)?;
 	let scaled = builder.binary(ScalarOpcode::Multiply, x, log_two_reciprocal)?;
 	let nearest = builder.unary(ScalarOpcode::RoundNearestEven, scaled)?;
@@ -355,11 +382,36 @@ fn emit_exp_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> Lan
 
 	let exponent = builder.unary(ScalarOpcode::ConvertF32ToI32, nearest)?;
 	let bias = builder.i32(127)?;
-	let biased = builder.binary(ScalarOpcode::Add, exponent, bias)?;
 	let shift = builder.i32(23)?;
+	if !support_subnormals {
+		let biased = builder.binary(ScalarOpcode::Add, exponent, bias)?;
+		let exponent_bits = builder.binary(ScalarOpcode::ShiftLeft, biased, shift)?;
+		let power_of_two = builder.unary(ScalarOpcode::BitcastI32ToF32, exponent_bits)?;
+		return builder.binary(ScalarOpcode::Multiply, polynomial, power_of_two);
+	}
+
+	// A direct 2^k bit construction is valid only for normal k in
+	// [-126, 127]. Split lower exponents into 2^(k+64) * 2^-64 so the first
+	// product stays normal and only the final IEEE multiplication rounds into
+	// subnormal storage.
+	let minimum_normal_exponent = builder.i32(-126)?;
+	let needs_lower_split = builder.binary(ScalarOpcode::LessThan, exponent, minimum_normal_exponent)?;
+	let split = builder.i32(EXP_SPLIT_SCALE_BITS)?;
+	let adjusted_lower = builder.binary(ScalarOpcode::Add, exponent, split)?;
+	let reconstructed_exponent = builder.ternary(
+		ScalarOpcode::Select,
+		needs_lower_split,
+		adjusted_lower,
+		exponent,
+	)?;
+	let biased = builder.binary(ScalarOpcode::Add, reconstructed_exponent, bias)?;
 	let exponent_bits = builder.binary(ScalarOpcode::ShiftLeft, biased, shift)?;
 	let power_of_two = builder.unary(ScalarOpcode::BitcastI32ToF32, exponent_bits)?;
-	builder.binary(ScalarOpcode::Multiply, polynomial, power_of_two)
+	let normal_result = builder.binary(ScalarOpcode::Multiply, polynomial, power_of_two)?;
+	let lower_scale = builder.f32(f32::from_bits((127 - EXP_SPLIT_SCALE_BITS as u32) << 23))?;
+	let one = builder.f32(1.0)?;
+	let tail_scale = builder.ternary(ScalarOpcode::Select, needs_lower_split, lower_scale, one)?;
+	builder.binary(ScalarOpcode::Multiply, normal_result, tail_scale)
 }
 
 fn emit_expm1_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> LanguageResult<ScalarExpression> {

@@ -30,7 +30,7 @@ pub use candidate::{
 	CandidateArtifact, CandidateFailure, CandidateRealizationRequest, CandidateRequestError, CandidateSessionFactory,
 	UnavailableCandidateError, UnavailableCandidateFactory, ValidatedCandidateFactory, ValidatedCandidateSession,
 };
-pub use cuda::{CudaBackend, CudaBinding};
+pub use cuda::{CUDA_MAXIMUM_SUBMISSION_QUEUES, CudaBackend, CudaBinding};
 pub use error::{Error, Result};
 pub use hsa::{HsaBackend, HsaBinding};
 pub use local::{

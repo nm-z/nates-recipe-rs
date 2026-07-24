@@ -38,8 +38,11 @@ factory without weakening its fixed-point state machine.
 
 `LocalCandidateFactory` now realizes the candidate's host runtime and pending
 pool, CUDA/HSA modules and functions, queues, completion objects, metric and
-egress buffers, pinned staging, scratch, and exact held one-GB reservations
-before Finalize. `LocalPreparedSession::into_backend` validates the unchanged
+egress buffers, pinned staging, and scratch before Finalize. It captures live
+availability once at init and enforces one-GB RAM/disk headroom plus one-GB
+headroom only on GPUs with an enabled display connector; headless GPUs carry an
+explicit zero-byte exemption. These are scheduler quotas, not dummy
+allocations. `LocalPreparedSession::into_backend` validates the unchanged
 finalized bundle and every child/bridge contract before moving those same
 objects into one-shot prepared backend states. Bind attaches finalized
 addresses and allocates the final packed arenas; it does not load or realize a
@@ -54,17 +57,10 @@ set flag without adding an unscheduled loop transfer or host branch.
 
 The remaining integration work is:
 
-1. Implement the production `LocalCandidateStabilizer`: execute the real
-   maximum-concurrency candidate trace and query capacity after each complete
-   warm pass. The shipped `UnavailableLocalStabilizer` returns a typed
-   pre-final-realization failure, so no fabricated capacity evidence can reach
-   Finalize. CUDA contexts and HSA sessions are currently supplied as stable
-   measured bindings; an owned bootstrap layer still has to create and retain
-   them from probe-selected physical devices.
-2. Make poisoned-run teardown ordered and total. Native resources currently
+1. Make poisoned-run teardown ordered and total. Native resources currently
    refuse destruction while unhealthy; cancellation, terminal observation, and
    release must remain possible after a device or transport failure.
-3. Execute the live-hardware matrix (NVIDIA K80/M60 and AMD V340L), including
+2. Execute the live-hardware matrix (NVIDIA K80/M60 and AMD V340L), including
    init, concurrent loop work, scheduled metrics, exit readback, and ordered
    release. Mock tests prove contract validation but do not substitute for the
    driver and ISA acceptance runs.

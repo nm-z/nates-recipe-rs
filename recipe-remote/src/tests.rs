@@ -180,6 +180,7 @@ fn finalized_fixture(bundle_digest: u8, mode: DuplexMode, payload_bytes: u64) ->
 			DiscoveredDevice {
 				device: MASTER_RAM,
 				available: true,
+				maximum_submission_queues: 64,
 				total_capacity: measured(ByteCount::new(2_000_000_000)),
 				transfer: transfer_capability(90_000_000_000),
 				calculation: None,
@@ -187,6 +188,7 @@ fn finalized_fixture(bundle_digest: u8, mode: DuplexMode, payload_bytes: u64) ->
 			DiscoveredDevice {
 				device: WORKER_GPU,
 				available: true,
+				maximum_submission_queues: 64,
 				total_capacity: measured(ByteCount::new(2_000_000_000)),
 				transfer: transfer_capability(432_000_000_000),
 				calculation: Some(CalculationCapability {
@@ -385,6 +387,10 @@ fn finalized_fixture(bundle_digest: u8, mode: DuplexMode, payload_bytes: u64) ->
 					metric,
 					value: worker_value,
 					slot: metric_slot,
+					submission: SubmissionSlots {
+						queue: worker_queue,
+						completion: worker_completion,
+					},
 				}),
 			},
 			Task {
@@ -397,6 +403,10 @@ fn finalized_fixture(bundle_digest: u8, mode: DuplexMode, payload_bytes: u64) ->
 					metric,
 					value: worker_value,
 					slot: metric_slot,
+					submission: SubmissionSlots {
+						queue: worker_queue,
+						completion: worker_completion,
+					},
 				}),
 			},
 		],
@@ -468,12 +478,16 @@ fn finalized_fixture(bundle_digest: u8, mode: DuplexMode, payload_bytes: u64) ->
 				name: label("master-user-reservation"),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::EnforcedQuota,
+				evidence: ReservationEvidence::NonGpu,
 			},
 			ReservationEntry {
 				device: WORKER_GPU,
 				name: label("worker-user-reservation"),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::HeldAllocation,
+				evidence: ReservationEvidence::GpuDisplay {
+					enabled_connectors: 1,
+				},
 			},
 		],
 	};
@@ -914,12 +928,8 @@ impl fmt::Display for ExecutorFakeError {
 
 impl std::error::Error for ExecutorFakeError {}
 
-fn executor_record(
-	calls: &mut ExecutorPhysicalCallBatch,
-	call: ExecutorPhysicalCall,
-) -> Result<(), ExecutorFakeError> {
-	calls
-		.try_push(call)
+fn executor_record(calls: &mut ExecutorPhysicalCallBatch, call: ExecutorPhysicalCall) -> Result<(), ExecutorFakeError> {
+	calls.try_push(call)
 		.map_err(|ExecutorPhysicalCallBatchOverflow| ExecutorFakeError::CallOverflow)
 }
 
@@ -1017,7 +1027,8 @@ impl ExecutorBackend for ExecutorFakeBackend {
 					.ok_or(ExecutorFakeError::Contract("init arena is absent"))?;
 				let mut arena_bytes = arena.bytes.borrow_mut();
 				let range = arena_range(work.destination, arena_bytes.len())?;
-				if work.image.len() != range.len() || work.bytes.get() != u64::try_from(work.image.len()).unwrap_or(0)
+				if work.image.len() != range.len()
+					|| work.bytes.get() != u64::try_from(work.image.len()).unwrap_or(0)
 				{
 					return Err(ExecutorFakeError::Contract("init image length differs"));
 				}
@@ -1133,7 +1144,9 @@ impl ExecutorBackend for ExecutorFakeBackend {
 		let arena_bytes = arena.bytes.borrow();
 		let range = arena_range(source, arena_bytes.len())?;
 		if destination.len() != range.len() {
-			return Err(ExecutorFakeError::Contract("exit destination length differs"));
+			return Err(ExecutorFakeError::Contract(
+				"exit destination length differs",
+			));
 		}
 		destination.copy_from_slice(&arena_bytes[range]);
 		executor_record(
@@ -1158,7 +1171,10 @@ impl ExecutorBackend for ExecutorFakeBackend {
 			));
 		}
 		self.observer.releases.fetch_add(1, Ordering::SeqCst);
-		executor_record(physical_calls, ExecutorPhysicalCall::ReleaseArena { device })
+		executor_record(
+			physical_calls,
+			ExecutorPhysicalCall::ReleaseArena { device },
+		)
 	}
 
 	fn destroy_resources(
@@ -1307,7 +1323,9 @@ impl WorkerBackend for ExecutorFakeBackend {
 		physical_calls: &mut ExecutorPhysicalCallBatch,
 	) -> Result<ExecutorTransferPoll, Self::Error> {
 		if !pending.active {
-			return Err(ExecutorFakeError::Contract("external pending token is idle"));
+			return Err(ExecutorFakeError::Contract(
+				"external pending token is idle",
+			));
 		}
 		if !pending.polled {
 			pending.polled = true;
@@ -1596,7 +1614,10 @@ fn drive_exit(mut master: MasterExit) -> RemoteResult<MasterComplete> {
 fn executor_driver(
 	backend: ExecutorFakeBackend,
 	bundle_digest: u8,
-) -> (ProvisionedProgram, ExecutorWorkerDriver<ExecutorFakeBackend>) {
+) -> (
+	ProvisionedProgram,
+	ExecutorWorkerDriver<ExecutorFakeBackend>,
+) {
 	let (topology, bundle) = finalized_fixture(bundle_digest, DuplexMode::Full, 16);
 	let program = success(ProvisionedProgram::from_bundle(
 		&bundle,
@@ -1678,20 +1699,12 @@ fn wait_executor_task(
 	panic!("executor-backed remote task did not complete");
 }
 
-fn complete_executor_master(
-	channel: RuntimeChannel,
-	program: ProvisionedProgram,
-) -> RemoteResult<MasterComplete> {
+fn complete_executor_master(channel: RuntimeChannel, program: ProvisionedProgram) -> RemoteResult<MasterComplete> {
 	let mut master = master_run(channel, program)?;
 	master.send_user_data(MASTER_TO_WORKER, &MASTER_DATA)?;
 	wait_executor_task(&mut master, MASTER_TO_WORKER, None, None)?;
 	master.request_user_data(WORKER_TO_MASTER)?;
-	wait_executor_task(
-		&mut master,
-		WORKER_TO_MASTER,
-		Some(&MASTER_DATA),
-		None,
-	)?;
+	wait_executor_task(&mut master, WORKER_TO_MASTER, Some(&MASTER_DATA), None)?;
 	master.submit_task(METRIC_ONE)?;
 	wait_executor_task(
 		&mut master,
@@ -2044,8 +2057,10 @@ fn executor_driver_construction_proves_assignment_and_program_identity() {
 #[test]
 fn executor_driver_fault_quiesces_releases_and_destroys_before_reporting() {
 	let observer = Arc::new(ExecutorObserver::default());
-	let (provisioned, driver) =
-		executor_driver(ExecutorFakeBackend::failing_ingress(Arc::clone(&observer)), 8);
+	let (provisioned, driver) = executor_driver(
+		ExecutorFakeBackend::failing_ingress(Arc::clone(&observer)),
+		8,
+	);
 	let (master_channel, worker_channel) = channels(4);
 	let worker_program = provisioned.clone();
 	let worker = thread::spawn(move || complete_worker(worker_channel, worker_program, RUN, driver));

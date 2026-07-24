@@ -2,14 +2,16 @@ use std::convert::Infallible;
 
 use recipe_core::{
 	AliasPermission, ArtifactId, ByteCount, BytesPerSecond, CalculationCapability, Device, DeviceId, DeviceKind,
-	Digest, DiscoveredDevice, DiscoveryIdentity, FlopsPerSecond, KernelResourceBounds, KernelTemplateId, Label,
-	Machine, MachineId, Node, NodeId, NodeRole, Property, ReservationEntry, ReservationMechanism, ScalarInput,
-	ScalarInstruction, ScalarOpcode, ScalarProgram, ScalarValueId, TargetIdentity, ToolchainIdentity,
-	TopologyIdentity, TransferCapability, TransferLaneCount, ValueId,
+	Digest, DiscoveredDevice, DiscoveryIdentity, FlopsPerSecond, IterationDomain, KernelResourceBounds,
+	KernelTemplateId, Label, Machine, MachineId, Node, NodeId, NodeRole, Property, ReservationEntry,
+	ReservationEvidence, ReservationMechanism, ScalarInput, ScalarInstruction, ScalarOpcode, ScalarProgram,
+	ScalarValueId, TargetIdentity, ToolchainIdentity, TopologyIdentity, TransferCapability, TransferLaneCount,
+	ValueId,
 };
 use recipe_language::{
 	CalculationNode, Elementwise, PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, Shape, Tensor,
 };
+use recipe_program::KernelIterationDomain;
 
 use super::*;
 
@@ -69,6 +71,7 @@ fn fixture() -> (
 			.map(|device| DiscoveredDevice {
 				device,
 				available: true,
+				maximum_submission_queues: 64,
 				total_capacity: measured(ByteCount::new(3_000_000_000)),
 				transfer: TransferCapability {
 					rate: measured(BytesPerSecond::new(1_000_000_000).unwrap()),
@@ -218,6 +221,12 @@ impl CandidateRealizer<Vec<ArtifactIdentity>> for TestRealizer {
 					name: label(&format!("recipe-user-{}", device.id.get())),
 					bytes: EXACT_USER_RESERVATION,
 					mechanism: ReservationMechanism::HeldAllocation,
+					evidence: match device.kind {
+						DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
+							enabled_connectors: 1,
+						},
+						DeviceKind::Ram | DeviceKind::Disk => ReservationEvidence::NonGpu,
+					},
 				})
 				.collect(),
 		})
@@ -323,6 +332,12 @@ fn planned_fixture() -> (
 				name: label(&format!("recipe-user-{}", device.id.get())),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::HeldAllocation,
+				evidence: match device.kind {
+					DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
+						enabled_connectors: 1,
+					},
+					DeviceKind::Ram | DeviceKind::Disk => ReservationEvidence::NonGpu,
+				},
 			})
 			.collect(),
 	};
@@ -387,6 +402,41 @@ fn rejects_post_warm_capacity_then_finalizes_the_next_candidate() {
 }
 
 #[test]
+fn program_preparation_finalizes_its_repeat_bound_and_sparse_domain() {
+	let (topology, discovery, graph, artifacts) = fixture();
+	let iterations = LoopIterations::new(5).unwrap();
+	let domain = IterationDomain::new(1, 5, 2).unwrap();
+	let program = StaticCalculationProgram::new(
+		graph,
+		iterations,
+		vec![KernelIterationDomain {
+			kernel: KernelTemplateId::new(1),
+			domain,
+		}],
+	)
+	.unwrap();
+	let mut preparer = Preparer::new(
+		TestArtifacts { artifacts },
+		TestRealizer {
+			mode: TestMode::FirstCapacityRejected,
+			realized: 0,
+			destroyed: 0,
+		},
+	);
+	let result = preparer
+		.prepare_program_validated(&program, &topology, &discovery)
+		.unwrap();
+	assert_eq!(result.bundle().loop_iterations(), iterations);
+	assert!(!result.bundle().loop_domains().is_empty());
+	assert!(
+		result.bundle()
+			.loop_domains()
+			.iter()
+			.all(|assignment| assignment.domain == domain)
+	);
+}
+
+#[test]
 fn unstable_realizations_are_destroyed_until_finite_exhaustion() {
 	let (topology, discovery, graph, artifacts) = fixture();
 	let mut preparer = Preparer::new(
@@ -407,8 +457,31 @@ fn unstable_realizations_are_destroyed_until_finite_exhaustion() {
 			.iter()
 			.all(|rejection| rejection.stage == CandidateRejectionStage::Stabilize)
 	);
+	assert!(error.rejections.iter().all(|rejection| {
+		rejection.detail.contains("device 1")
+			&& rejection.detail.contains("recipe_usable")
+			&& rejection.detail.contains("final decreased by 1")
+	}));
 	assert_eq!(preparer.realizer().realized, 2);
 	assert_eq!(preparer.realizer().destroyed, 2);
+}
+
+#[test]
+fn candidate_exhaustion_display_retains_actionable_rejection_details() {
+	let candidate = CandidateIdentity::new(Digest::new([9; 32]));
+	let error = PrepareError::new(
+		PrepareErrorKind::CandidateExhaustion,
+		"all 1 finite candidates were rejected",
+	)
+	.with_rejections(vec![CandidateRejection {
+		candidate,
+		stage: CandidateRejectionStage::Realize,
+		detail: "artifact 17 failed to load".to_owned(),
+	}]);
+	let display = error.to_string();
+	assert!(display.contains("CandidateIdentity"));
+	assert!(display.contains("Realize"));
+	assert!(display.contains("artifact 17 failed to load"));
 }
 
 #[test]

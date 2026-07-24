@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 
 use recipe_core::{AliasPermission, DType, KernelTemplateId, ScalarLiteral, ValueId};
 use recipe_language::{
-	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Gather, IndexBounds, PrimitiveAliasRule, PrimitiveKernel,
-	PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter, ScatterConflict, Shape,
-	Sort, Tensor,
+	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Gather, IndexBounds, IndexMap, PrimitiveAliasRule,
+	PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter,
+	ScatterConflict, Shape, Sort, Tensor,
 };
+use recipe_primitives::{INDEX_MAP_INTEGER_OPERATIONS_PER_LANE, StageKind};
 
 use super::*;
 
@@ -260,6 +261,114 @@ fn every_primitive_recipe_performs_real_deterministic_lowering() {
 		assert_eq!(first, second, "{} was nondeterministic", descriptor.symbol);
 		first.validate().unwrap();
 	}
+}
+
+#[test]
+fn index_map_lowers_zero_inputs_into_the_exact_int32_output_shape_and_contract() {
+	let case = primitive_case(PrimitiveRecipe::IndexMap, 10_000);
+	let tensors = case
+		.tensors
+		.iter()
+		.map(|tensor| (tensor.id, tensor))
+		.collect::<BTreeMap<_, _>>();
+	let request = PrimitiveRequest {
+		kernel: &case.kernel,
+		tensors: &tensors,
+	};
+
+	assert_eq!(
+		PrimitiveRecipe::IndexMap.family(),
+		PrimitiveFamily::IndexMap
+	);
+	assert_eq!(
+		PrimitiveRecipe::IndexMap.dtype_contract(),
+		CanonicalDTypeContract::Exact {
+			inputs: &[],
+			outputs: &[DType::I32],
+		}
+	);
+	let first = lower_index_map(request).unwrap();
+	let second = lower_index_map(request).unwrap();
+	assert_eq!(first, second);
+	first.validate().unwrap();
+	assert_eq!(first.source_input_count, 0);
+	assert_eq!(first.source_output_count, 1);
+	assert!(first.source_aliases.is_empty());
+
+	let output = first
+		.buffers
+		.iter()
+		.find(|buffer| {
+			matches!(
+				buffer.origin,
+				recipe_primitives::BufferOrigin::Tensor(value) if value == ValueId::new(1)
+			)
+		})
+		.unwrap();
+	assert_eq!(output.dtype, DType::I32);
+	assert_eq!(output.shape, [2, 3]);
+	assert_eq!(output.access.logical_extents, [2, 3]);
+
+	assert_eq!(first.stages.len(), 1);
+	let stage = &first.stages[0];
+	assert_eq!(stage.geometry.logical_lanes, 6);
+	assert_eq!(
+		stage.kind,
+		StageKind::IndexMap(IndexMap {
+			start: -3,
+			element_step: 2,
+			iteration_step: 64,
+			modulus: Some(101),
+		})
+	);
+	assert_eq!(
+		stage.resources.integer_operations,
+		6 * INDEX_MAP_INTEGER_OPERATIONS_PER_LANE
+	);
+	assert_eq!(first.resources.total_flops.get(), 0);
+	assert_eq!(
+		first.resources.total_integer_operations,
+		6 * INDEX_MAP_INTEGER_OPERATIONS_PER_LANE
+	);
+	let fault = stage
+		.fault
+		.expect("checked affine arithmetic requires a fault path");
+	assert_eq!(
+		fault.reason,
+		recipe_primitives::FaultReason::ArithmeticDomain
+	);
+	assert!(fault.guard_before_address);
+}
+
+#[test]
+fn index_map_surface_rejects_inputs_non_int32_outputs_and_nonpositive_moduli() {
+	let mut input_case = primitive_case(PrimitiveRecipe::IndexMap, 10_010);
+	input_case
+		.tensors
+		.push(tensor(2, DType::I32, &[1], true, false));
+	input_case.kernel.inputs.push(ValueId::new(2));
+	input_case.kernel.alias_rules = forbidden_aliases(1, 1);
+	assert_eq!(
+		lower_index_map_case(&input_case).unwrap_err().kind,
+		OperationErrorKind::PrimitiveLoweringFailed
+	);
+
+	let mut dtype_case = primitive_case(PrimitiveRecipe::IndexMap, 10_011);
+	dtype_case.tensors[0] = tensor(1, DType::F32, &[2, 3], false, true);
+	assert_eq!(
+		lower_index_map_case(&dtype_case).unwrap_err().kind,
+		OperationErrorKind::PrimitiveLoweringFailed
+	);
+
+	let mut modulus_case = primitive_case(PrimitiveRecipe::IndexMap, 10_012);
+	let PrimitiveKind::IndexMap(spec) = &mut modulus_case.kernel.kind else {
+		unreachable!();
+	};
+	spec.modulus = Some(0);
+	assert_eq!(
+		lower_index_map_case(&modulus_case).unwrap_err().kind,
+		OperationErrorKind::PrimitiveLoweringFailed
+	);
 }
 
 #[test]
@@ -672,11 +781,7 @@ fn composition_primitive_families(steps: &[CompositionStep]) -> Vec<PrimitiveFam
 }
 
 fn assert_primitive_mismatch(symbol: &str, case: &PrimitiveCase) {
-	let tensors = case
-		.tensors
-		.iter()
-		.map(|tensor| (tensor.id, tensor))
-		.collect::<BTreeMap<_, _>>();
+	let tensors = tensor_index(case);
 	let request = PrimitiveRequest {
 		kernel: &case.kernel,
 		tensors: &tensors,
@@ -691,6 +796,21 @@ fn assert_primitive_mismatch(symbol: &str, case: &PrimitiveCase) {
 		OperationErrorKind::PrimitiveRecipeMismatch,
 		"{symbol} accepted a primitive with different semantics"
 	);
+}
+
+fn tensor_index(case: &PrimitiveCase) -> BTreeMap<ValueId, &Tensor> {
+	case.tensors
+		.iter()
+		.map(|tensor| (tensor.id, tensor))
+		.collect()
+}
+
+fn lower_index_map_case(case: &PrimitiveCase) -> OperationResult<LoweredProgram> {
+	let tensors = tensor_index(case);
+	lower_index_map(PrimitiveRequest {
+		kernel: &case.kernel,
+		tensors: &tensors,
+	})
 }
 
 #[derive(Debug)]
@@ -818,6 +938,21 @@ fn primitive_case(recipe: PrimitiveRecipe, ordinal: usize) -> PrimitiveCase {
 				],
 			}
 		}
+		PrimitiveRecipe::IndexMap => PrimitiveCase {
+			kernel: PrimitiveKernel {
+				id: kernel_id,
+				inputs: Vec::new(),
+				outputs: vec![ValueId::new(1)],
+				alias_rules: Vec::new(),
+				kind: PrimitiveKind::IndexMap(IndexMap {
+					start: -3,
+					element_step: 2,
+					iteration_step: 64,
+					modulus: Some(101),
+				}),
+			},
+			tensors: vec![tensor(1, DType::I32, &[2, 3], false, true)],
+		},
 		PrimitiveRecipe::Random(distribution) => {
 			let distribution = match distribution {
 				RandomRecipe::UniformF32 => RandomDistribution::UniformF32,

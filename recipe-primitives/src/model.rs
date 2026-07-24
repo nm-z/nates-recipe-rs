@@ -4,13 +4,14 @@ use recipe_core::{
 	AliasPermission, ByteCount, DType, FlopCount, KernelTemplate, KernelTemplateId, ScalarLiteral, ValueId,
 };
 use recipe_language::{
-	AtomicOperation, AtomicOrdering, Contraction, IndexBounds, RandomDistribution, RandomKey, ReduceOperator,
-	ReduceResult, ScatterConflict, SortDirection,
+	AtomicOperation, AtomicOrdering, Contraction, IndexBounds, IndexMap, RandomDistribution, RandomKey,
+	ReduceOperator, ReduceResult, ScatterConflict, SortDirection,
 };
 
 use crate::error::ProgramValidationError;
 
 pub const LOWERED_PROGRAM_SCHEMA_VERSION: u32 = 1;
+pub const INDEX_MAP_INTEGER_OPERATIONS_PER_LANE: u64 = 9;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProgramDigest([u8; 32]);
@@ -380,8 +381,8 @@ pub struct SortCompareStage {
 pub enum PhiloxCounterWord {
 	ElementLow,
 	ElementHigh,
-	RunXorStreamLow,
-	RunXorStreamHigh,
+	IterationXorStreamLow,
+	IterationXorStreamHigh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,6 +406,7 @@ pub struct Philox10Contract {
 	pub weyl_1: u32,
 	pub counter: [PhiloxCounterWord; 4],
 	pub fold_kernel_id_into_key: bool,
+	pub fold_run_id_into_key: bool,
 	pub uniform_i32: UniformI32Mapping,
 	pub normal_f32: NormalF32Mapping,
 }
@@ -448,6 +450,7 @@ pub enum StageKind {
 		network: SortNetwork,
 		emit_indices: bool,
 	},
+	IndexMap(IndexMap),
 	Philox4x32_10(Philox10Contract),
 }
 

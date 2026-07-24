@@ -9,6 +9,7 @@ description = "Deterministic measured-topology Draft candidate planner for Recip
 recipe-core = { path = "../recipe-core" }
 recipe-language = { path = "../recipe-language" }
 recipe-primitives = { path = "../recipe-primitives" }
+recipe-program = { path = "../recipe-program" }
 recipe-scheduler = { path = "../recipe-scheduler" }
 sha2 = "0.10.9"
 

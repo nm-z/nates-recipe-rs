@@ -1,4 +1,6 @@
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use recipe_probe::{
 	BoundedBenchmarkPlan, GpuBenchmarkIo, GpuDescriptor, GpuDiscovery, GpuInventory, GpuMeasurement, ProbeError,
@@ -14,6 +16,25 @@ pub(crate) trait Backend: fmt::Debug {
 	fn benchmark(&self, device: &GpuDescriptor, plan: BoundedBenchmarkPlan) -> ProbeResult<GpuMeasurement>;
 }
 
+#[derive(Debug)]
+enum NativeBackend {
+	Cuda(CudaBackend),
+	Hsa(HsaBackend),
+	#[cfg(test)]
+	Test(Box<dyn Backend>),
+}
+
+impl NativeBackend {
+	fn backend(&self) -> &dyn Backend {
+		match self {
+			Self::Cuda(backend) => backend,
+			Self::Hsa(backend) => backend,
+			#[cfg(test)]
+			Self::Test(backend) => backend.as_ref(),
+		}
+	}
+}
+
 /// Production GPU half of `ProbeEngine`.
 ///
 /// Each call revalidates exact backend-library and hardware identities.
@@ -22,20 +43,22 @@ pub(crate) trait Backend: fmt::Debug {
 /// existing backend that fails to load or enumerate, is not silently treated
 /// as absent.
 pub struct NativeGpuProbe {
-	backends: Vec<Box<dyn Backend>>,
+	backends: Vec<NativeBackend>,
 	exhaustive: bool,
+	pci_sysfs_root: PathBuf,
 }
 
 impl NativeGpuProbe {
 	pub fn new(config: NativeProbeConfig) -> ProbeResult<Self> {
 		validate_config(&config)?;
-		let backends: Vec<Box<dyn Backend>> = vec![
-			Box::new(CudaBackend::new(&config)?),
-			Box::new(HsaBackend::new(&config)?),
+		let backends = vec![
+			NativeBackend::Cuda(CudaBackend::new(&config)?),
+			NativeBackend::Hsa(HsaBackend::new(&config)?),
 		];
 		Ok(Self {
 			backends,
 			exhaustive: true,
+			pci_sysfs_root: config.pci_sysfs_root,
 		})
 	}
 
@@ -48,8 +71,9 @@ impl NativeGpuProbe {
 	pub fn cuda_diagnostic(config: NativeProbeConfig) -> ProbeResult<Self> {
 		validate_config(&config)?;
 		Ok(Self {
-			backends: vec![Box::new(CudaBackend::new(&config)?)],
+			backends: vec![NativeBackend::Cuda(CudaBackend::new(&config)?)],
 			exhaustive: false,
+			pci_sysfs_root: config.pci_sysfs_root,
 		})
 	}
 
@@ -60,18 +84,152 @@ impl NativeGpuProbe {
 	pub fn hsa_diagnostic(config: NativeProbeConfig) -> ProbeResult<Self> {
 		validate_config(&config)?;
 		Ok(Self {
-			backends: vec![Box::new(HsaBackend::new(&config)?)],
+			backends: vec![NativeBackend::Hsa(HsaBackend::new(&config)?)],
 			exhaustive: false,
+			pci_sysfs_root: config.pci_sysfs_root,
 		})
 	}
 
 	#[cfg(test)]
 	pub(crate) fn from_backends(backends: Vec<Box<dyn Backend>>) -> Self {
 		Self {
-			backends,
+			backends: backends.into_iter().map(NativeBackend::Test).collect(),
 			exhaustive: true,
+			pci_sysfs_root: PathBuf::from("/sys/bus/pci/devices"),
 		}
 	}
+
+	pub(crate) fn cuda_backend(&self) -> Option<&CudaBackend> {
+		self.backends.iter().find_map(|backend| match backend {
+			NativeBackend::Cuda(backend) => Some(backend),
+			NativeBackend::Hsa(_) => None,
+			#[cfg(test)]
+			NativeBackend::Test(_) => None,
+		})
+	}
+
+	pub(crate) fn hsa_backend(&self) -> Option<&HsaBackend> {
+		self.backends.iter().find_map(|backend| match backend {
+			NativeBackend::Hsa(backend) => Some(backend),
+			NativeBackend::Cuda(_) => None,
+			#[cfg(test)]
+			NativeBackend::Test(_) => None,
+		})
+	}
+
+	pub(crate) fn enabled_display_connectors(&self, origin: &str) -> ProbeResult<u32> {
+		let bdf = origin
+			.rsplit_once('@')
+			.map(|(_, bdf)| bdf)
+			.filter(|bdf| valid_pci_bdf(bdf))
+			.ok_or_else(|| {
+				ProbeError::Discovery(format!(
+					"GPU origin {origin:?} has no canonical PCI BDF suffix"
+				))
+			})?;
+		enabled_display_connectors(&self.pci_sysfs_root, bdf)
+	}
+}
+
+fn valid_pci_bdf(value: &str) -> bool {
+	let bytes = value.as_bytes();
+	bytes.len() == 12
+		&& bytes[0..4].iter().all(u8::is_ascii_hexdigit)
+		&& bytes[4] == b':'
+		&& bytes[5..7].iter().all(u8::is_ascii_hexdigit)
+		&& bytes[7] == b':'
+		&& bytes[8..10].iter().all(u8::is_ascii_hexdigit)
+		&& bytes[10] == b'.'
+		&& matches!(bytes[11], b'0'..=b'7')
+}
+
+fn enabled_display_connectors(pci_sysfs_root: &Path, bdf: &str) -> ProbeResult<u32> {
+	let device_root = pci_sysfs_root.join(bdf);
+	let metadata = fs::metadata(&device_root)
+		.map_err(|error| ProbeError::io("inspect GPU PCI device", &device_root, error))?;
+	if !metadata.is_dir() {
+		return Err(ProbeError::Discovery(format!(
+			"GPU PCI root {} is not a directory",
+			device_root.display()
+		)));
+	}
+	let drm_root = device_root.join("drm");
+	let cards = match fs::read_dir(&drm_root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+		Err(error) => {
+			return Err(ProbeError::io(
+				"enumerate GPU DRM devices",
+				&drm_root,
+				error,
+			));
+		}
+	};
+	let mut card_paths = Vec::new();
+	for entry in cards {
+		let entry = entry.map_err(|error| ProbeError::io("enumerate GPU DRM device", &drm_root, error))?;
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else {
+			return Err(ProbeError::Discovery(format!(
+				"GPU DRM entry under {} is not valid UTF-8",
+				drm_root.display()
+			)));
+		};
+		let Some(index) = name.strip_prefix("card") else {
+			continue;
+		};
+		if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+			continue;
+		}
+		let path = entry.path();
+		if path.is_dir() {
+			card_paths.push((name.to_owned(), path));
+		}
+	}
+	card_paths.sort_by(|left, right| left.0.cmp(&right.0));
+	let mut enabled = 0_u32;
+	for (card, path) in card_paths {
+		let connectors =
+			fs::read_dir(&path).map_err(|error| ProbeError::io("enumerate GPU DRM connectors", &path, error))?;
+		let prefix = format!("{card}-");
+		let mut connector_paths = Vec::new();
+		for entry in connectors {
+			let entry = entry.map_err(|error| ProbeError::io("enumerate GPU DRM connector", &path, error))?;
+			let name = entry.file_name();
+			let Some(name) = name.to_str() else {
+				return Err(ProbeError::Discovery(format!(
+					"GPU DRM connector under {} is not valid UTF-8",
+					path.display()
+				)));
+			};
+			if name.starts_with(&prefix) && entry.path().is_dir() {
+				connector_paths.push(entry.path());
+			}
+		}
+		connector_paths.sort();
+		for connector in connector_paths {
+			let enabled_path = connector.join("enabled");
+			let state = fs::read_to_string(&enabled_path)
+				.map_err(|error| ProbeError::io("read GPU DRM connector state", &enabled_path, error))?;
+			match state.trim() {
+				"enabled" => {
+					enabled = enabled.checked_add(1).ok_or_else(|| {
+						ProbeError::Discovery(
+							"enabled GPU display connector count overflowed u32".to_owned(),
+						)
+					})?;
+				}
+				"disabled" => {}
+				state => {
+					return Err(ProbeError::Discovery(format!(
+						"GPU DRM connector {} reported invalid enabled state {state:?}",
+						connector.display()
+					)));
+				}
+			}
+		}
+	}
+	Ok(enabled)
 }
 
 fn validate_config(config: &NativeProbeConfig) -> ProbeResult<()> {
@@ -102,7 +260,7 @@ impl GpuDiscovery for NativeGpuProbe {
 	fn discover_all(&self) -> ProbeResult<GpuInventory> {
 		let mut devices = Vec::new();
 		for backend in &self.backends {
-			devices.extend(backend.discover()?);
+			devices.extend(backend.backend().discover()?);
 		}
 		devices.sort_by(|left, right| left.key.cmp(&right.key));
 		for pair in devices.windows(2) {
@@ -129,6 +287,7 @@ impl GpuBenchmarkIo for NativeGpuProbe {
 		}
 		let mut owner = None;
 		for backend in &self.backends {
+			let backend = backend.backend();
 			let exact = backend
 				.discover()?
 				.into_iter()
@@ -157,6 +316,7 @@ impl GpuBenchmarkIo for NativeGpuProbe {
 mod tests {
 	use std::collections::VecDeque;
 	use std::sync::Mutex;
+	use std::sync::atomic::{AtomicU64, Ordering};
 
 	use recipe_core::{
 		ByteCount, BytesPerSecond, Digest, FlopsPerSecond, Label, Property, PropertyProvenance, TargetIdentity,
@@ -165,6 +325,8 @@ mod tests {
 	use recipe_probe::{GpuInventory, LinkDuplex};
 
 	use super::*;
+
+	static DISPLAY_NONCE: AtomicU64 = AtomicU64::new(0);
 
 	#[derive(Debug)]
 	struct FakeBackend {
@@ -216,6 +378,7 @@ mod tests {
 			host_to_device_maximum_inflight: TransferLaneCount::new(1).expect("test lanes"),
 			device_to_host_maximum_inflight: TransferLaneCount::new(1).expect("test lanes"),
 			asynchronous_submission: true,
+			maximum_submission_queues: 1,
 			maximum_concurrent_tasks: 1,
 			transfer_overlaps_calculation: true,
 		}
@@ -287,5 +450,52 @@ mod tests {
 			.benchmark_gpu(&original, plan)
 			.expect_err("identity drift must not benchmark a different GPU");
 		assert!(error.to_string().contains("identity changed"));
+	}
+
+	#[test]
+	fn display_probe_counts_only_enabled_connectors_on_the_exact_bdf() {
+		let root = std::env::temp_dir().join(format!(
+			"recipe-display-probe-{}-{}",
+			std::process::id(),
+			DISPLAY_NONCE.fetch_add(1, Ordering::Relaxed)
+		));
+		let card = root.join("0000:03:00.0").join("drm").join("card1");
+		let enabled = card.join("card1-DP-1");
+		let disabled = card.join("card1-HDMI-A-1");
+		fs::create_dir_all(&enabled).expect("create enabled connector");
+		fs::create_dir_all(&disabled).expect("create disabled connector");
+		fs::write(enabled.join("enabled"), b"enabled\n").expect("write enabled connector");
+		fs::write(disabled.join("enabled"), b"disabled\n").expect("write disabled connector");
+
+		assert_eq!(
+			enabled_display_connectors(&root, "0000:03:00.0").expect("probe display connectors"),
+			1
+		);
+		fs::remove_dir_all(root).expect("remove display fixture");
+	}
+
+	#[test]
+	fn display_probe_treats_an_absent_drm_surface_as_headless() {
+		let root = std::env::temp_dir().join(format!(
+			"recipe-headless-probe-{}-{}",
+			std::process::id(),
+			DISPLAY_NONCE.fetch_add(1, Ordering::Relaxed)
+		));
+		fs::create_dir_all(root.join("0000:03:00.0")).expect("create headless PCI device");
+		assert_eq!(
+			enabled_display_connectors(&root, "0000:03:00.0").expect("probe headless GPU"),
+			0
+		);
+		fs::remove_dir_all(root).expect("remove headless fixture");
+	}
+
+	#[test]
+	fn display_probe_rejects_malformed_gpu_origins() {
+		let mut probe = NativeGpuProbe::from_backends(Vec::new());
+		probe.pci_sysfs_root = PathBuf::from("/does/not/matter");
+		let error = probe
+			.enabled_display_connectors("hsa:gpu@../../device")
+			.expect_err("malformed BDF must fail closed");
+		assert!(error.to_string().contains("canonical PCI BDF"));
 	}
 }

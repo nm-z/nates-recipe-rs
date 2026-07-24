@@ -4,7 +4,9 @@ use recipe_core::{
 	ArtifactBuildAccess, ArtifactBuildRecipe, ByteCount, DType, Digest, ElementCount, KernelResourceBounds,
 	ScalarLiteral,
 };
-use recipe_language::{IndexBounds, RandomDistribution, ReduceOperator, ReduceResult, ScatterConflict, SortDirection};
+use recipe_language::{
+	IndexBounds, IndexMap, RandomDistribution, ReduceOperator, ReduceResult, ScatterConflict, SortDirection,
+};
 use recipe_primitives::{
 	AccessMode, AtomicAddressDomain, ContractionStage, FaultContract, FixedTree, FloatSortOrder, HistogramBinMapping,
 	LoweredProgram, MemorySemantics, NormalF32Mapping, OwnedAtomicOperation, OwnedAtomicOrdering, Philox10Contract,
@@ -352,10 +354,16 @@ struct StageSignature {
 	arguments: Vec<KernelArgument>,
 	parameters: Vec<String>,
 	has_run_id: bool,
+	has_loop_iteration: bool,
 }
 
 impl StageSignature {
-	fn new(stage: &ProgramStage, build: &ArtifactBuildRecipe, has_run_id: bool) -> Result<Self, LoweringError> {
+	fn new(
+		stage: &ProgramStage,
+		build: &ArtifactBuildRecipe,
+		has_run_id: bool,
+		has_loop_iteration: bool,
+	) -> Result<Self, LoweringError> {
 		let fault_buffer = stage.fault.map(|fault| fault.flag);
 		let mut pointers = build
 			.bindings
@@ -418,6 +426,14 @@ impl StageSignature {
 			KernelArgument::RunId,
 			usize::from(has_run_id),
 		));
+		parameters.extend(std::iter::repeat_n(
+			"i64 %loop_iteration".to_owned(),
+			usize::from(has_loop_iteration),
+		));
+		arguments.extend(std::iter::repeat_n(
+			KernelArgument::LoopIteration,
+			usize::from(has_loop_iteration),
+		));
 		parameters.push("i64 %element_count".to_owned());
 		arguments.push(KernelArgument::ElementCount);
 		Ok(Self {
@@ -425,6 +441,7 @@ impl StageSignature {
 			arguments,
 			parameters,
 			has_run_id,
+			has_loop_iteration,
 		})
 	}
 
@@ -699,6 +716,12 @@ fn llvm_type(dtype: DType) -> &'static str {
 	}
 }
 
+const fn private_address_space(target: &KernelTarget) -> u32 {
+	match target {
+		KernelTarget::Amd(_) | KernelTarget::Nvidia(_) => 5,
+	}
+}
+
 fn lower_owned_stage(
 	program: &LoweredProgram,
 	stage: &ProgramStage,
@@ -708,7 +731,9 @@ fn lower_owned_stage(
 	options: &LoweringOptions,
 ) -> Result<LoweredKernel, LoweringError> {
 	let has_run_id = matches!(kind, StageKind::Philox4x32_10(_));
-	let signature = StageSignature::new(stage, build, has_run_id)?;
+	let has_loop_iteration = matches!(kind, StageKind::Philox4x32_10(_))
+		|| matches!(kind, StageKind::IndexMap(spec) if spec.iteration_step != 0);
+	let signature = StageSignature::new(stage, build, has_run_id, has_loop_iteration)?;
 	let mut ir = Ir::new();
 	ir.emit_global_index(target, stage.geometry.workgroup_lanes);
 	match kind {
@@ -763,7 +788,8 @@ fn lower_owned_stage(
 			network,
 			emit_indices,
 		} => emit_sort_finalize(&mut ir, &signature, *network, *emit_indices)?,
-		StageKind::Philox4x32_10(contract) => emit_philox(&mut ir, &signature, build, contract)?,
+		StageKind::IndexMap(spec) => emit_index_map(&mut ir, &signature, stage, *spec)?,
+		StageKind::Philox4x32_10(contract) => emit_philox(&mut ir, &signature, build, contract, target)?,
 		StageKind::ScalarMap { .. } => {
 			return Err(stage_error(
 				"scalar-map stage reached the owned-stage emitter",
@@ -926,6 +952,184 @@ fn emit_copy(ir: &mut Ir, signature: &StageSignature) -> Result<(), LoweringErro
 	Ok(())
 }
 
+fn emit_index_map(
+	ir: &mut Ir,
+	signature: &StageSignature,
+	stage: &ProgramStage,
+	spec: IndexMap,
+) -> Result<(), LoweringError> {
+	let output = signature.pointer(0)?;
+	let fault = stage
+		.fault
+		.ok_or_else(|| stage_error("index-map stage omitted its checked fault contract"))?;
+	ensure_stage(
+		output.dtype == DType::I32
+			&& !signature.has_run_id
+			&& signature.has_loop_iteration == (spec.iteration_step != 0)
+			&& fault.reason == recipe_primitives::FaultReason::ArithmeticDomain
+			&& fault.code == 4,
+		"index-map type, dynamic ABI, or arithmetic-fault contract is invalid",
+	)?;
+	ensure_stage(
+		spec.modulus.is_none_or(|modulus| modulus > 0),
+		"index-map modulus is not strictly positive",
+	)?;
+
+	begin_lane(ir);
+	let mut rejected = Vec::new();
+	let element = checked_unsigned_scale(
+		ir,
+		"%global_id",
+		spec.element_step,
+		"index_map_element",
+		&mut rejected,
+	);
+	let iteration = match spec.iteration_step {
+		0 => "0".to_owned(),
+		step => checked_unsigned_scale(
+			ir,
+			"%loop_iteration",
+			step,
+			"index_map_iteration",
+			&mut rejected,
+		),
+	};
+	let with_element = checked_signed_add(
+		ir,
+		&spec.start.to_string(),
+		&element,
+		"index_map_start_element",
+		&mut rejected,
+	);
+	let affine = checked_signed_add(
+		ir,
+		&with_element,
+		&iteration,
+		"index_map_affine",
+		&mut rejected,
+	);
+	let result = match spec.modulus {
+		Some(modulus) => {
+			let remainder = ir.temporary("index_map_remainder");
+			ir.line(format_args!("  {remainder} = srem i64 {affine}, {modulus}"));
+			let negative = ir.temporary("index_map_remainder_negative");
+			ir.line(format_args!("  {negative} = icmp slt i64 {remainder}, 0"));
+			let corrected = ir.temporary("index_map_remainder_corrected");
+			ir.line(format_args!(
+				"  {corrected} = add i64 {remainder}, {modulus}"
+			));
+			let euclidean = ir.temporary("index_map_euclidean");
+			ir.line(format_args!(
+				"  {euclidean} = select i1 {negative}, i64 {corrected}, i64 {remainder}"
+			));
+			let narrowed = ir.temporary("index_map_result");
+			ir.line(format_args!("  {narrowed} = trunc i64 {euclidean} to i32"));
+			narrowed
+		}
+		None => {
+			let below = ir.temporary("index_map_below_i32");
+			ir.line(format_args!(
+				"  {below} = icmp slt i64 {affine}, {}",
+				i32::MIN
+			));
+			rejected.push(below);
+			let above = ir.temporary("index_map_above_i32");
+			ir.line(format_args!(
+				"  {above} = icmp sgt i64 {affine}, {}",
+				i32::MAX
+			));
+			rejected.push(above);
+			let narrowed = ir.temporary("index_map_result");
+			ir.line(format_args!("  {narrowed} = trunc i64 {affine} to i32"));
+			narrowed
+		}
+	};
+
+	let rejected = rejected
+		.into_iter()
+		.fold("false".to_owned(), |left, right| {
+			let combined = ir.temporary("index_map_rejected");
+			ir.line(format_args!("  {combined} = or i1 {left}, {right}"));
+			combined
+		});
+	let publish = ir.label("index_map_publish_fault");
+	let write = ir.label("index_map_write");
+	ir.line(format_args!(
+		"  br i1 {rejected}, label %{publish}, label %{write}"
+	));
+	ir.line(format_args!("{publish}:"));
+	let previous = ir.temporary("index_map_fault_previous");
+	ir.line(format_args!(
+		"  {previous} = atomicrmw xchg ptr addrspace(1) %fault_flag, i32 {} release, align 4",
+		fault.code
+	));
+	ir.line(format_args!("  br label %exit"));
+	ir.line(format_args!("{write}:"));
+	let output_index = ir.affine_index(output, "%global_id", "index_map_output");
+	ir.store(output, &output_index, &result, "index_map_output")?;
+	ir.line(format_args!("  br label %exit"));
+	ir.line(format_args!("exit:"));
+	ir.line(format_args!("  ret void"));
+	Ok(())
+}
+
+fn checked_unsigned_scale(
+	ir: &mut Ir,
+	unsigned: &str,
+	scale: i32,
+	purpose: &str,
+	rejected: &mut Vec<String>,
+) -> String {
+	if scale == 0 {
+		return "0".to_owned();
+	}
+	ir.declare(
+		"llvm.smul.with.overflow.i64",
+		"declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)",
+	);
+	let outside_signed = ir.temporary(&format!("{purpose}_outside_signed"));
+	ir.line(format_args!(
+		"  {outside_signed} = icmp ugt i64 {unsigned}, {}",
+		i64::MAX
+	));
+	rejected.push(outside_signed);
+	let pair = ir.temporary(&format!("{purpose}_pair"));
+	ir.line(format_args!(
+		"  {pair} = call {{ i64, i1 }} @llvm.smul.with.overflow.i64(i64 {unsigned}, i64 {scale})"
+	));
+	let value = ir.temporary(&format!("{purpose}_value"));
+	ir.line(format_args!(
+		"  {value} = extractvalue {{ i64, i1 }} {pair}, 0"
+	));
+	let overflow = ir.temporary(&format!("{purpose}_overflow"));
+	ir.line(format_args!(
+		"  {overflow} = extractvalue {{ i64, i1 }} {pair}, 1"
+	));
+	rejected.push(overflow);
+	value
+}
+
+fn checked_signed_add(ir: &mut Ir, left: &str, right: &str, purpose: &str, rejected: &mut Vec<String>) -> String {
+	ir.declare(
+		"llvm.sadd.with.overflow.i64",
+		"declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)",
+	);
+	let pair = ir.temporary(&format!("{purpose}_pair"));
+	ir.line(format_args!(
+		"  {pair} = call {{ i64, i1 }} @llvm.sadd.with.overflow.i64(i64 {left}, i64 {right})"
+	));
+	let value = ir.temporary(&format!("{purpose}_value"));
+	ir.line(format_args!(
+		"  {value} = extractvalue {{ i64, i1 }} {pair}, 0"
+	));
+	let overflow = ir.temporary(&format!("{purpose}_overflow"));
+	ir.line(format_args!(
+		"  {overflow} = extractvalue {{ i64, i1 }} {pair}, 1"
+	));
+	rejected.push(overflow);
+	value
+}
+
 fn literal_operand(ir: &mut Ir, literal: ScalarLiteral, purpose: &str) -> String {
 	match literal {
 		ScalarLiteral::I32(value) => value.to_string(),
@@ -973,6 +1177,7 @@ fn scan_local_axis(kind: &StageKind, level: u32) -> Option<usize> {
 		| StageKind::StableSortInitialize { .. }
 		| StageKind::StableSortCompareExchange(_)
 		| StageKind::StableSortFinalize { .. }
+		| StageKind::IndexMap(_)
 		| StageKind::Philox4x32_10(_) => None,
 	}
 }
@@ -1658,10 +1863,6 @@ fn constrained_binary(ir: &mut Ir, operation: &'static str, left: &str, right: &
 			"llvm.experimental.constrained.fsub.f32",
 			"declare float @llvm.experimental.constrained.fsub.f32(float, float, metadata, metadata)",
 		),
-		"fdiv" => ir.declare(
-			"llvm.experimental.constrained.fdiv.f32",
-			"declare float @llvm.experimental.constrained.fdiv.f32(float, float, metadata, metadata)",
-		),
 		operation => unreachable!("Recipe constrained binary opcode {operation}"),
 	}
 	let raw = ir.temporary(purpose);
@@ -1671,14 +1872,17 @@ fn constrained_binary(ir: &mut Ir, operation: &'static str, left: &str, right: &
 	canonicalize_nan(ir, &raw, &format!("{purpose}_canonical"))
 }
 
-fn constrained_sqrt(ir: &mut Ir, value: &str, purpose: &str) -> String {
-	ir.declare(
-		"llvm.experimental.constrained.sqrt.f32",
-		"declare float @llvm.experimental.constrained.sqrt.f32(float, metadata, metadata)",
-	);
+fn plain_fdiv(ir: &mut Ir, left: &str, right: &str, purpose: &str) -> String {
+	let raw = ir.temporary(purpose);
+	ir.line(format_args!("  {raw} = fdiv float {left}, {right}"));
+	canonicalize_nan(ir, &raw, &format!("{purpose}_canonical"))
+}
+
+fn square_root(ir: &mut Ir, value: &str, purpose: &str) -> String {
+	ir.declare("llvm.sqrt.f32", "declare float @llvm.sqrt.f32(float)");
 	let raw = ir.temporary(purpose);
 	ir.line(format_args!(
-		"  {raw} = call float @llvm.experimental.constrained.sqrt.f32(float {value}, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")"
+		"  {raw} = call float @llvm.sqrt.f32(float {value})"
 	));
 	canonicalize_nan(ir, &raw, &format!("{purpose}_canonical"))
 }
@@ -2247,6 +2451,7 @@ fn emit_contraction(
 	contraction: &ContractionStage,
 	target: &KernelTarget,
 ) -> Result<(), LoweringError> {
+	let private_address_space = private_address_space(target);
 	let left = signature.pointer(0)?;
 	let right = signature.pointer(1)?;
 	let output = signature.pointer(2)?;
@@ -2325,22 +2530,28 @@ fn emit_contraction(
 
 	let accumulator = ir.temporary("contraction_accumulator_slot");
 	ir.line(format_args!(
-		"  {accumulator} = alloca {}, align 4",
-		llvm_type(contraction.dtype)
+		"  {accumulator} = alloca {}, align 4, addrspace({private_address_space})",
+		llvm_type(contraction.dtype),
 	));
 	let zero = match contraction.dtype {
 		DType::F32 => "0.000000e+00",
 		DType::I32 => "0",
 	};
 	ir.line(format_args!(
-		"  store {} {zero}, ptr {accumulator}, align 4",
+		"  store {} {zero}, ptr addrspace({private_address_space}) {accumulator}, align 4",
 		llvm_type(contraction.dtype)
 	));
 	let tile_slot = ir.temporary("contraction_tile_slot");
 	let inner_slot = ir.temporary("contraction_inner_slot");
-	ir.line(format_args!("  {tile_slot} = alloca i64, align 8"));
-	ir.line(format_args!("  {inner_slot} = alloca i64, align 8"));
-	ir.line(format_args!("  store i64 0, ptr {tile_slot}, align 8"));
+	ir.line(format_args!(
+		"  {tile_slot} = alloca i64, align 8, addrspace({private_address_space})"
+	));
+	ir.line(format_args!(
+		"  {inner_slot} = alloca i64, align 8, addrspace({private_address_space})"
+	));
+	ir.line(format_args!(
+		"  store i64 0, ptr addrspace({private_address_space}) {tile_slot}, align 8"
+	));
 	let tile_check = ir.label("contraction_tile_check");
 	let tile_body = ir.label("contraction_tile_body");
 	let inner_check = ir.label("contraction_inner_check");
@@ -2353,7 +2564,7 @@ fn emit_contraction(
 	ir.line(format_args!("{tile_check}:"));
 	let tile_base = ir.temporary("contraction_tile_base");
 	ir.line(format_args!(
-		"  {tile_base} = load i64, ptr {tile_slot}, align 8"
+		"  {tile_base} = load i64, ptr addrspace({private_address_space}) {tile_slot}, align 8"
 	));
 	let has_tile = ir.temporary("contraction_has_tile");
 	ir.line(format_args!(
@@ -2364,13 +2575,15 @@ fn emit_contraction(
 		"  br i1 {has_tile}, label %{tile_body}, label %{tile_done}"
 	));
 	ir.line(format_args!("{tile_body}:"));
-	ir.line(format_args!("  store i64 0, ptr {inner_slot}, align 8"));
+	ir.line(format_args!(
+		"  store i64 0, ptr addrspace({private_address_space}) {inner_slot}, align 8"
+	));
 	ir.barrier(target);
 	ir.line(format_args!("  br label %{inner_check}"));
 	ir.line(format_args!("{inner_check}:"));
 	let inner = ir.temporary("contraction_inner");
 	ir.line(format_args!(
-		"  {inner} = load i64, ptr {inner_slot}, align 8"
+		"  {inner} = load i64, ptr addrspace({private_address_space}) {inner_slot}, align 8"
 	));
 	let inside_tile = ir.temporary("contraction_inside_tile");
 	ir.line(format_args!(
@@ -2428,7 +2641,7 @@ fn emit_contraction(
 	};
 	let accumulated = ir.temporary("contraction_accumulated");
 	ir.line(format_args!(
-		"  {accumulated} = load {}, ptr {accumulator}, align 4",
+		"  {accumulated} = load {}, ptr addrspace({private_address_space}) {accumulator}, align 4",
 		llvm_type(contraction.dtype)
 	));
 	let sum = match contraction.dtype {
@@ -2440,13 +2653,13 @@ fn emit_contraction(
 		}
 	};
 	ir.line(format_args!(
-		"  store {} {sum}, ptr {accumulator}, align 4",
+		"  store {} {sum}, ptr addrspace({private_address_space}) {accumulator}, align 4",
 		llvm_type(contraction.dtype)
 	));
 	let next_inner = ir.temporary("contraction_next_inner");
 	ir.line(format_args!("  {next_inner} = add i64 {inner}, 1"));
 	ir.line(format_args!(
-		"  store i64 {next_inner}, ptr {inner_slot}, align 8"
+		"  store i64 {next_inner}, ptr addrspace({private_address_space}) {inner_slot}, align 8"
 	));
 	ir.line(format_args!("  br label %{inner_check}"));
 	ir.line(format_args!("{inner_done}:"));
@@ -2457,7 +2670,7 @@ fn emit_contraction(
 		contraction.tile.reduction
 	));
 	ir.line(format_args!(
-		"  store i64 {next_tile}, ptr {tile_slot}, align 8"
+		"  store i64 {next_tile}, ptr addrspace({private_address_space}) {tile_slot}, align 8"
 	));
 	ir.line(format_args!("  br label %{tile_check}"));
 	ir.line(format_args!("{tile_done}:"));
@@ -2467,7 +2680,7 @@ fn emit_contraction(
 	ir.line(format_args!("{publish}:"));
 	let result = ir.temporary("contraction_result");
 	ir.line(format_args!(
-		"  {result} = load {}, ptr {accumulator}, align 4",
+		"  {result} = load {}, ptr addrspace({private_address_space}) {accumulator}, align 4",
 		llvm_type(contraction.dtype)
 	));
 	let output_index = ir.index_from_coordinates(output, &output_coordinates, "contraction_output");
@@ -3462,9 +3675,11 @@ fn emit_philox(
 	signature: &StageSignature,
 	build: &ArtifactBuildRecipe,
 	contract: &Philox10Contract,
+	target: &KernelTarget,
 ) -> Result<(), LoweringError> {
 	ensure_stage(
 		signature.has_run_id
+			&& signature.has_loop_iteration
 			&& contract.rounds == 10
 			&& contract.multiplier_0 == 0xd251_1f53
 			&& contract.multiplier_1 == 0xcd9e_8d57
@@ -3474,9 +3689,10 @@ fn emit_philox(
 				== [
 					PhiloxCounterWord::ElementLow,
 					PhiloxCounterWord::ElementHigh,
-					PhiloxCounterWord::RunXorStreamLow,
-					PhiloxCounterWord::RunXorStreamHigh,
+					PhiloxCounterWord::IterationXorStreamLow,
+					PhiloxCounterWord::IterationXorStreamHigh,
 				] && contract.fold_kernel_id_into_key
+			&& contract.fold_run_id_into_key
 			&& contract.uniform_i32 == UniformI32Mapping::UnbiasedMultiplyHighWithCounterRejection
 			&& contract.normal_f32 == NormalF32Mapping::OwnedBoxMullerV1,
 		"Philox stage is not the Recipe Philox4x32-10 v1 contract",
@@ -3504,9 +3720,9 @@ fn emit_philox(
 	ir.line(format_args!(
 		"  {element_high} = trunc i64 {element_high_wide} to i32"
 	));
-	let stream_xor = ir.temporary("philox_run_stream");
+	let stream_xor = ir.temporary("philox_iteration_stream");
 	ir.line(format_args!(
-		"  {stream_xor} = xor i64 %run_id, {}",
+		"  {stream_xor} = xor i64 %loop_iteration, {}",
 		contract.key.stream
 	));
 	let stream_low = ir.temporary("philox_stream_low");
@@ -3525,8 +3741,20 @@ fn emit_philox(
 	let seed_low = split_u64(contract.key.seed_low);
 	let seed_high = split_u64(contract.key.seed_high);
 	let kernel_words = split_u64(kernel);
-	let key_0 = seed_low[0] ^ seed_high[1] ^ kernel_words[0];
-	let key_1 = seed_low[1] ^ seed_high[0] ^ kernel_words[1];
+	let key_base_0 = seed_low[0] ^ seed_high[1] ^ kernel_words[0];
+	let key_base_1 = seed_low[1] ^ seed_high[0] ^ kernel_words[1];
+	let run_low = ir.temporary("philox_run_low");
+	let run_high_wide = ir.temporary("philox_run_high_wide");
+	let run_high = ir.temporary("philox_run_high");
+	ir.line(format_args!("  {run_low} = trunc i64 %run_id to i32"));
+	ir.line(format_args!("  {run_high_wide} = lshr i64 %run_id, 32"));
+	ir.line(format_args!(
+		"  {run_high} = trunc i64 {run_high_wide} to i32"
+	));
+	let key_0 = ir.temporary("philox_key_0");
+	let key_1 = ir.temporary("philox_key_1");
+	ir.line(format_args!("  {key_0} = xor i32 {run_low}, {key_base_0}"));
+	ir.line(format_args!("  {key_1} = xor i32 {run_high}, {key_base_1}"));
 
 	let result = match contract.distribution {
 		RandomDistribution::UniformF32 => {
@@ -3535,7 +3763,7 @@ fn emit_philox(
 				PhiloxCall {
 					helper: &helper,
 					counter: [&element_low, &element_high, &stream_low, &stream_high],
-					key: [key_0, key_1],
+					key: [&key_0, &key_1],
 					purpose: "philox_uniform",
 				},
 			);
@@ -3547,7 +3775,7 @@ fn emit_philox(
 				PhiloxCall {
 					helper: &helper,
 					counter: [&element_low, &element_high, &stream_low, &stream_high],
-					key: [key_0, key_1],
+					key: [&key_0, &key_1],
 					purpose: "philox_bernoulli",
 				},
 			);
@@ -3579,10 +3807,11 @@ fn emit_philox(
 				element_high: &element_high,
 				stream_low: &stream_low,
 				stream_high: &stream_high,
-				key: [key_0, key_1],
+				key: [&key_0, &key_1],
 			},
 			low,
 			high_exclusive,
+			target,
 		)?,
 		RandomDistribution::NormalF32 => {
 			let words = emit_philox_call(
@@ -3590,7 +3819,7 @@ fn emit_philox(
 				PhiloxCall {
 					helper: &helper,
 					counter: [&element_low, &element_high, &stream_low, &stream_high],
-					key: [key_0, key_1],
+					key: [&key_0, &key_1],
 					purpose: "philox_normal",
 				},
 			);
@@ -3761,7 +3990,7 @@ fn push_text_line(text: &mut String, arguments: std::fmt::Arguments<'_>) {
 struct PhiloxCall<'a> {
 	helper: &'a str,
 	counter: [&'a str; 4],
-	key: [u32; 2],
+	key: [&'a str; 2],
 	purpose: &'a str,
 }
 
@@ -3802,7 +4031,7 @@ struct PhiloxInputs<'a> {
 	element_high: &'a str,
 	stream_low: &'a str,
 	stream_high: &'a str,
-	key: [u32; 2],
+	key: [&'a str; 2],
 }
 
 fn emit_uniform_i32(
@@ -3810,7 +4039,9 @@ fn emit_uniform_i32(
 	inputs: PhiloxInputs<'_>,
 	low: i32,
 	high_exclusive: i32,
+	target: &KernelTarget,
 ) -> Result<String, LoweringError> {
+	let private_address_space = private_address_space(target);
 	let range_i64 = i64::from(high_exclusive) - i64::from(low);
 	let range = match u32::try_from(range_i64) {
 		Ok(range) => range,
@@ -3819,9 +4050,15 @@ fn emit_uniform_i32(
 	let threshold = range.wrapping_neg() % range;
 	let attempt_slot = ir.temporary("uniform_i32_attempt_slot");
 	let result_slot = ir.temporary("uniform_i32_result_slot");
-	ir.line(format_args!("  {attempt_slot} = alloca i32, align 4"));
-	ir.line(format_args!("  {result_slot} = alloca i32, align 4"));
-	ir.line(format_args!("  store i32 0, ptr {attempt_slot}, align 4"));
+	ir.line(format_args!(
+		"  {attempt_slot} = alloca i32, align 4, addrspace({private_address_space})"
+	));
+	ir.line(format_args!(
+		"  {result_slot} = alloca i32, align 4, addrspace({private_address_space})"
+	));
+	ir.line(format_args!(
+		"  store i32 0, ptr addrspace({private_address_space}) {attempt_slot}, align 4"
+	));
 	let retry = ir.label("uniform_i32_retry");
 	let accepted = ir.label("uniform_i32_accepted");
 	let rejected = ir.label("uniform_i32_rejected");
@@ -3830,7 +4067,7 @@ fn emit_uniform_i32(
 	ir.line(format_args!("{retry}:"));
 	let attempt = ir.temporary("uniform_i32_attempt");
 	ir.line(format_args!(
-		"  {attempt} = load i32, ptr {attempt_slot}, align 4"
+		"  {attempt} = load i32, ptr addrspace({private_address_space}) {attempt_slot}, align 4"
 	));
 	let retry_counter = ir.temporary("uniform_i32_retry_counter");
 	ir.line(format_args!(
@@ -3868,7 +4105,7 @@ fn emit_uniform_i32(
 	let next_attempt = ir.temporary("uniform_i32_next_attempt");
 	ir.line(format_args!("  {next_attempt} = add i32 {attempt}, 1"));
 	ir.line(format_args!(
-		"  store i32 {next_attempt}, ptr {attempt_slot}, align 4"
+		"  store i32 {next_attempt}, ptr addrspace({private_address_space}) {attempt_slot}, align 4"
 	));
 	ir.line(format_args!("  br label %{retry}"));
 	ir.line(format_args!("{accepted}:"));
@@ -3879,13 +4116,13 @@ fn emit_uniform_i32(
 	ir.line(format_args!("  {mapped} = trunc i64 {high_product} to i32"));
 	ir.line(format_args!("  {result} = add i32 {mapped}, {low}"));
 	ir.line(format_args!(
-		"  store i32 {result}, ptr {result_slot}, align 4"
+		"  store i32 {result}, ptr addrspace({private_address_space}) {result_slot}, align 4"
 	));
 	ir.line(format_args!("  br label %{joined}"));
 	ir.line(format_args!("{joined}:"));
 	let loaded = ir.temporary("uniform_i32_output");
 	ir.line(format_args!(
-		"  {loaded} = load i32, ptr {result_slot}, align 4"
+		"  {loaded} = load i32, ptr addrspace({private_address_space}) {result_slot}, align 4"
 	));
 	Ok(loaded)
 }
@@ -3900,7 +4137,7 @@ fn owned_box_muller_v1(ir: &mut Ir, first: &str, second: &str) -> String {
 		"normal_negative_two",
 	);
 	let radial_squared = constrained_binary(ir, "fmul", &negative_two, &log_u1, "normal_radial_squared");
-	let radial = constrained_sqrt(ir, &radial_squared, "normal_radial");
+	let radial = square_root(ir, &radial_squared, "normal_radial");
 	let two_pi = literal_operand(
 		ir,
 		ScalarLiteral::F32Bits(std::f32::consts::TAU.to_bits()),
@@ -3958,7 +4195,7 @@ fn owned_log_v1(ir: &mut Ir, value: &str) -> String {
 	);
 	let numerator = constrained_binary(ir, "fsub", &mantissa, &one, "owned_log_numerator");
 	let denominator = constrained_binary(ir, "fadd", &mantissa, &one, "owned_log_denominator");
-	let y = constrained_binary(ir, "fdiv", &numerator, &denominator, "owned_log_y");
+	let y = plain_fdiv(ir, &numerator, &denominator, "owned_log_y");
 	let y2 = constrained_binary(ir, "fmul", &y, &y, "owned_log_y2");
 	let mut power = y.clone();
 	let mut sum = y;
@@ -4097,10 +4334,13 @@ mod tests {
 		ScalarOpcode, ScalarProgram, ScalarValueId, ValueId,
 	};
 	use recipe_language::{
-		AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, PrimitiveAliasRule,
-		PrimitiveKernel, PrimitiveKind, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter, Shape, Sort, Tensor,
+		AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, IndexMap,
+		PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter,
+		Shape, Sort, Tensor,
 	};
 	use std::collections::{BTreeMap, HashSet};
+	use std::io::Write as _;
+	use std::process::{Command, Stdio};
 
 	use super::*;
 	use crate::{AmdTarget, NvidiaTarget};
@@ -4423,6 +4663,21 @@ mod tests {
 			),
 			&sort_tensors,
 		);
+		let index_map_tensors = [tensor(89, DType::I32, &[64])];
+		let index_map = lower_program(
+			primitive(
+				89,
+				&[],
+				&[89],
+				PrimitiveKind::IndexMap(IndexMap {
+					start: -3,
+					element_step: 1,
+					iteration_step: 64,
+					modulus: Some(101),
+				}),
+			),
+			&index_map_tensors,
+		);
 		let mut result = vec![
 			scalar,
 			reduction,
@@ -4433,6 +4688,7 @@ mod tests {
 			scatter,
 			histogram,
 			sort,
+			index_map,
 		];
 		for (ordinal, (distribution, dtype)) in [
 			(RandomDistribution::UniformF32, DType::F32),
@@ -4508,7 +4764,112 @@ mod tests {
 				}
 			}
 		}
-		assert_eq!(kinds.len(), 15);
+		assert_eq!(kinds.len(), 16);
+	}
+
+	#[test]
+	fn stack_slots_use_the_explicit_private_address_space_on_both_backends() {
+		let programs = programs();
+		let stages = [
+			must_some(
+				programs
+					.iter()
+					.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+					.find(|(_, stage)| matches!(stage.kind, StageKind::TiledContraction(_))),
+				"contraction stage",
+			),
+			must_some(
+				programs
+					.iter()
+					.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+					.find(|(_, stage)| {
+						matches!(
+							stage.kind,
+							StageKind::Philox4x32_10(contract)
+								if matches!(contract.distribution, RandomDistribution::UniformI32 { .. })
+						)
+					}),
+				"uniform int32 stage",
+			),
+		];
+		for (program, stage) in stages {
+			for target in targets() {
+				let lowered = must(
+					lower_stage(
+						program,
+						&build(program, stage),
+						&target,
+						&LoweringOptions {
+							entry_symbol: "recipe_private_stack".to_owned(),
+							workgroup_lanes: stage.geometry.workgroup_lanes,
+						},
+					),
+					"private-stack lowering",
+				);
+				let allocas = lowered
+					.llvm_ir
+					.lines()
+					.filter(|line| line.contains(" = alloca "))
+					.collect::<Vec<_>>();
+				assert!(!allocas.is_empty());
+				assert!(
+					allocas.iter().all(|line| line.contains("addrspace(5)")),
+					"target {target:?} emitted a non-private stack slot:\n{}",
+					allocas.join("\n")
+				);
+				assert!(!lowered.llvm_ir.contains(", ptr %contraction_"));
+				assert!(!lowered.llvm_ir.contains(", ptr %uniform_i32_"));
+			}
+		}
+	}
+
+	#[test]
+	#[ignore = "requires the host LLVM AMDGPU backend"]
+	fn host_llc_accepts_amd_contraction_private_stack_slots() {
+		let programs = programs();
+		let contraction = must_some(
+			programs
+				.iter()
+				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+				.find(|(_, stage)| matches!(stage.kind, StageKind::TiledContraction(_))),
+			"contraction stage",
+		);
+		let lowered = must(
+			lower_stage(
+				contraction.0,
+				&build(contraction.0, contraction.1),
+				&targets()[0],
+				&LoweringOptions {
+					entry_symbol: "recipe_contraction_private_stack".to_owned(),
+					workgroup_lanes: contraction.1.geometry.workgroup_lanes,
+				},
+			),
+			"contraction lowering",
+		);
+		let mut child = Command::new("/usr/bin/llc")
+			.args([
+				"-filetype=null",
+				"-march=amdgcn",
+				"-mcpu=gfx1101",
+				"--amdhsa-code-object-version=6",
+				"-",
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn host llc");
+		{
+			let mut stdin = child.stdin.take().expect("host llc stdin");
+			stdin.write_all(lowered.llvm_ir.as_bytes())
+				.expect("write LLVM IR");
+		}
+		let output = child.wait_with_output().expect("wait for host llc");
+		assert!(
+			output.status.success(),
+			"host llc rejected AMD contraction:\n{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
 	}
 
 	#[test]
@@ -4582,7 +4943,229 @@ mod tests {
 			"random lowering",
 		);
 		assert!(lowered.abi.arguments.contains(&KernelArgument::RunId));
+		assert!(
+			lowered
+				.abi
+				.arguments
+				.contains(&KernelArgument::LoopIteration)
+		);
 		assert!(lowered.llvm_ir.contains("recipe_philox4x32_10_v1"));
+		assert!(lowered.llvm_ir.contains("xor i64 %loop_iteration"));
+		assert!(lowered.llvm_ir.contains("xor i32 %philox_run_low"));
 		assert!(!lowered.llvm_ir.contains("curand"));
+	}
+
+	#[test]
+	fn emits_backend_safe_plain_fdiv_for_amd_normal_initialization() {
+		let programs = programs();
+		let normal = must_some(
+			programs
+				.iter()
+				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+				.find(|(_, stage)| {
+					matches!(
+						stage.kind,
+						StageKind::Philox4x32_10(contract)
+							if contract.distribution == RandomDistribution::NormalF32
+					)
+				}),
+			"normal random stage",
+		);
+		let lowered = must(
+			lower_stage(
+				normal.0,
+				&build(normal.0, normal.1),
+				&targets()[0],
+				&LoweringOptions {
+					entry_symbol: "recipe_normal_f32".to_owned(),
+					workgroup_lanes: normal.1.geometry.workgroup_lanes,
+				},
+			),
+			"normal random lowering",
+		);
+		assert!(lowered.llvm_ir.contains(" = fdiv float "));
+		assert!(!lowered.llvm_ir.contains("constrained.fdiv"));
+		assert!(lowered.llvm_ir.contains("owned_log_y_canonical"));
+		assert!(lowered.llvm_ir.contains("constrained.fmul"));
+		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
+	}
+
+	#[test]
+	fn emits_backend_safe_sqrt_intrinsic_for_amd_normal_initialization() {
+		let programs = programs();
+		let normal = must_some(
+			programs
+				.iter()
+				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+				.find(|(_, stage)| {
+					matches!(
+						stage.kind,
+						StageKind::Philox4x32_10(contract)
+							if contract.distribution == RandomDistribution::NormalF32
+					)
+				}),
+			"normal random stage",
+		);
+		let lowered = must(
+			lower_stage(
+				normal.0,
+				&build(normal.0, normal.1),
+				&targets()[0],
+				&LoweringOptions {
+					entry_symbol: "recipe_normal_f32".to_owned(),
+					workgroup_lanes: normal.1.geometry.workgroup_lanes,
+				},
+			),
+			"normal random lowering",
+		);
+		assert!(
+			lowered
+				.llvm_ir
+				.contains("declare float @llvm.sqrt.f32(float)")
+		);
+		assert!(lowered.llvm_ir.contains("call float @llvm.sqrt.f32(float "));
+		assert!(!lowered.llvm_ir.contains("constrained.sqrt"));
+		assert!(lowered.llvm_ir.contains("normal_radial_canonical"));
+		assert!(lowered.llvm_ir.contains("constrained.fmul"));
+		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
+	}
+
+	#[test]
+	#[ignore = "requires the host LLVM AMDGPU backend"]
+	fn host_llc_compiles_amd_normal_initialization_with_backend_safe_divide_and_sqrt() {
+		let programs = programs();
+		let normal = must_some(
+			programs
+				.iter()
+				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
+				.find(|(_, stage)| {
+					matches!(
+						stage.kind,
+						StageKind::Philox4x32_10(contract)
+							if contract.distribution == RandomDistribution::NormalF32
+					)
+				}),
+			"normal random stage",
+		);
+		let lowered = must(
+			lower_stage(
+				normal.0,
+				&build(normal.0, normal.1),
+				&targets()[0],
+				&LoweringOptions {
+					entry_symbol: "recipe_normal_f32".to_owned(),
+					workgroup_lanes: normal.1.geometry.workgroup_lanes,
+				},
+			),
+			"normal random lowering",
+		);
+		let mut child = Command::new("/usr/bin/llc")
+			.args([
+				"-filetype=null",
+				"-march=amdgcn",
+				"-mcpu=gfx1101",
+				"--amdhsa-code-object-version=6",
+				"-",
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn host llc");
+		{
+			let mut stdin = child.stdin.take().expect("host llc stdin");
+			stdin.write_all(lowered.llvm_ir.as_bytes())
+				.expect("write LLVM IR");
+		}
+		let output = child.wait_with_output().expect("wait for host llc");
+		assert!(
+			output.status.success(),
+			"host llc rejected AMD normal initialization:\n{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	#[test]
+	fn index_map_checks_affine_arithmetic_before_forming_output_addresses() {
+		let program = lower_program(
+			primitive(
+				200,
+				&[],
+				&[200],
+				PrimitiveKind::IndexMap(IndexMap {
+					start: i32::MIN,
+					element_step: -1,
+					iteration_step: i32::MAX,
+					modulus: Some(97),
+				}),
+			),
+			&[tensor(200, DType::I32, &[32])],
+		);
+		let stage = &program.stages[0];
+		let lowered = must(
+			lower_stage(
+				&program,
+				&build(&program, stage),
+				&targets()[1],
+				&LoweringOptions {
+					entry_symbol: "recipe_index_map".to_owned(),
+					workgroup_lanes: stage.geometry.workgroup_lanes,
+				},
+			),
+			"index-map lowering",
+		);
+		assert!(
+			lowered
+				.abi
+				.arguments
+				.contains(&KernelArgument::LoopIteration)
+		);
+		assert!(lowered.llvm_ir.contains("@llvm.smul.with.overflow.i64"));
+		assert!(lowered.llvm_ir.contains("@llvm.sadd.with.overflow.i64"));
+		assert!(lowered.llvm_ir.contains("srem i64"));
+		let fault = must_some(
+			lowered.llvm_ir.find("atomicrmw xchg"),
+			"index-map fault publication",
+		);
+		let address = must_some(
+			lowered.llvm_ir.find("index_map_output_address"),
+			"index-map output address",
+		);
+		assert!(fault < address);
+
+		let invariant = lower_program(
+			primitive(
+				201,
+				&[],
+				&[201],
+				PrimitiveKind::IndexMap(IndexMap {
+					start: 7,
+					element_step: 1,
+					iteration_step: 0,
+					modulus: None,
+				}),
+			),
+			&[tensor(201, DType::I32, &[32])],
+		);
+		let invariant_stage = &invariant.stages[0];
+		let invariant_lowered = must(
+			lower_stage(
+				&invariant,
+				&build(&invariant, invariant_stage),
+				&targets()[0],
+				&LoweringOptions {
+					entry_symbol: "recipe_index_map_invariant".to_owned(),
+					workgroup_lanes: invariant_stage.geometry.workgroup_lanes,
+				},
+			),
+			"iteration-invariant index-map lowering",
+		);
+		assert!(
+			!invariant_lowered
+				.abi
+				.arguments
+				.contains(&KernelArgument::LoopIteration)
+		);
+		assert!(!invariant_lowered.llvm_ir.contains("%loop_iteration"));
 	}
 }

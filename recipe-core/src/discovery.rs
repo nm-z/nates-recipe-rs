@@ -27,6 +27,7 @@ pub struct TransferCapability {
 pub struct DiscoveredDevice {
 	pub device: DeviceId,
 	pub available: bool,
+	pub maximum_submission_queues: u32,
 	pub total_capacity: Property<ByteCount>,
 	pub transfer: TransferCapability,
 	pub calculation: Option<CalculationCapability>,
@@ -90,6 +91,12 @@ impl DiscoveryProfile {
 				ValidationCode::UnavailableRequiredObject,
 				format!("devices[{index}].available"),
 				format!("required device {} is unavailable", discovered.device),
+			);
+			validator.require(
+				discovered.maximum_submission_queues != 0,
+				ValidationCode::UnsupportedCapability,
+				format!("devices[{index}].maximum_submission_queues"),
+				"required device must support at least one submission queue",
 			);
 			validator.require(
 				discovered.total_capacity.is_schedulable(),

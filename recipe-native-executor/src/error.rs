@@ -37,10 +37,6 @@ pub enum Error {
 		task: TaskId,
 		completion: CompletionSlotId,
 	},
-	NoMetricSubmission {
-		task: TaskId,
-		device: DeviceId,
-	},
 	ResourceContention {
 		task: TaskId,
 		detail: &'static str,
@@ -74,12 +70,24 @@ pub enum Error {
 	BackendPoisoned {
 		backend: &'static str,
 	},
+	SubmissionQueueLimitExceeded {
+		backend: &'static str,
+		device: DeviceId,
+		requested: usize,
+		maximum: u32,
+	},
 	IntegerOverflow {
 		field: &'static str,
 	},
 	PhysicalAccountingOverflow,
 	Cuda(recipe_cuda::CudaError),
 	CudaContract(&'static str),
+	HsaSymbolLookup {
+		artifact: ArtifactId,
+		abi_entry: String,
+		runtime_symbol: String,
+		source: recipe_hsa::Error,
+	},
 	Hsa(recipe_hsa::Error),
 	Kernel(recipe_kernel::LoweringError),
 	Protocol {
@@ -129,10 +137,6 @@ impl fmt::Display for Error {
 					"task {task} references unavailable completion slot {completion}"
 				)
 			}
-			Self::NoMetricSubmission { task, device } => write!(
-				formatter,
-				"metric task {task} on device {device} cannot be assigned pre-realized queue and completion slots"
-			),
 			Self::ResourceContention { task, detail } => {
 				write!(
 					formatter,
@@ -175,6 +179,15 @@ impl fmt::Display for Error {
 			Self::BackendPoisoned { backend } => {
 				write!(formatter, "{backend} backend is poisoned")
 			}
+			Self::SubmissionQueueLimitExceeded {
+				backend,
+				device,
+				requested,
+				maximum,
+			} => write!(
+				formatter,
+				"{backend} device {device} requires {requested} physical submission queues, exceeding its discovered maximum of {maximum}"
+			),
 			Self::IntegerOverflow { field } => write!(formatter, "{field} does not fit the native ABI"),
 			Self::PhysicalAccountingOverflow => write!(
 				formatter,
@@ -184,6 +197,15 @@ impl fmt::Display for Error {
 			Self::CudaContract(detail) => {
 				write!(formatter, "CUDA Driver resource contract failed: {detail}")
 			}
+			Self::HsaSymbolLookup {
+				artifact,
+				abi_entry,
+				runtime_symbol,
+				source,
+			} => write!(
+				formatter,
+				"HSACO artifact {artifact} logical ABI entry {abi_entry:?} failed ROCr lookup for descriptor symbol {runtime_symbol:?}: {source}"
+			),
 			Self::Hsa(detail) => write!(formatter, "ROCr/HSA operation failed: {detail}"),
 			Self::Kernel(detail) => write!(formatter, "kernel artifact validation failed: {detail}"),
 			Self::Protocol { task, detail } => write!(
@@ -211,5 +233,49 @@ impl From<recipe_hsa::Error> for Error {
 impl From<recipe_kernel::LoweringError> for Error {
 	fn from(error: recipe_kernel::LoweringError) -> Self {
 		Self::Kernel(error)
+	}
+}
+
+pub(crate) fn ensure_submission_queue_capacity(
+	backend: &'static str,
+	device: DeviceId,
+	requested: usize,
+	maximum: u32,
+) -> Result<()> {
+	if requested <= maximum as usize {
+		Ok(())
+	} else {
+		Err(Error::SubmissionQueueLimitExceeded {
+			backend,
+			device,
+			requested,
+			maximum,
+		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn submission_queue_capacity_accepts_exact_limit() {
+		assert_eq!(
+			ensure_submission_queue_capacity("ROCr/HSA", DeviceId::new(7), 4, 4),
+			Ok(())
+		);
+	}
+
+	#[test]
+	fn submission_queue_capacity_returns_typed_error_above_limit() {
+		assert_eq!(
+			ensure_submission_queue_capacity("ROCr/HSA", DeviceId::new(7), 5, 4),
+			Err(Error::SubmissionQueueLimitExceeded {
+				backend: "ROCr/HSA",
+				device: DeviceId::new(7),
+				requested: 5,
+				maximum: 4,
+			})
+		);
 	}
 }

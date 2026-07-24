@@ -7,7 +7,7 @@ use recipe_core::{
 	ScalarProgram, ScalarValueId, ValueId,
 };
 use recipe_language::{
-	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, IndexBounds,
+	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, IndexBounds, IndexMap,
 	PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce,
 	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Shape, Sort, SortDirection, Tensor,
 };
@@ -529,7 +529,48 @@ fn every_random_distribution_fixes_philox10_and_counter_semantics() -> TestResul
 		};
 		assert_eq!(contract.rounds, 10);
 		assert!(contract.fold_kernel_id_into_key);
+		assert!(contract.fold_run_id_into_key);
 		assert_eq!(program.resources.total_flops.get(), 40_960);
+		validate(&program)?;
+	}
+	Ok(())
+}
+
+#[test]
+fn index_map_lowers_to_one_checked_iteration_aware_source_stage() -> TestResult {
+	for (id, spec) in [
+		(
+			140,
+			IndexMap {
+				start: 0,
+				element_step: 0,
+				iteration_step: 1,
+				modulus: None,
+			},
+		),
+		(
+			141,
+			IndexMap {
+				start: -3,
+				element_step: 1,
+				iteration_step: 64,
+				modulus: Some(101),
+			},
+		),
+	] {
+		let tensors = [tensor(1, DType::I32, &[64])?];
+		let index_map = kernel(id, &[], &[1], PrimitiveKind::IndexMap(spec));
+		let program = lower(&index_map, &index(&tensors))?;
+		assert_eq!(program.stages.len(), 1);
+		assert!(matches!(program.stages[0].kind, StageKind::IndexMap(actual) if actual == spec));
+		let Some(fault) = program.stages[0].fault else {
+			return Err(Box::new(TestFailure(String::from(
+				"index map omitted its checked fault path",
+			))));
+		};
+		assert_eq!(fault.reason, FaultReason::ArithmeticDomain);
+		assert_eq!(fault.code, 4);
+		assert!(fault.guard_before_address);
 		validate(&program)?;
 	}
 	Ok(())

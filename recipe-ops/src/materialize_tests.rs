@@ -61,6 +61,7 @@ fn families(materialized: &crate::MaterializedComposition) -> Vec<PrimitiveFamil
 			PrimitiveKind::Scatter(_) => PrimitiveFamily::Scatter,
 			PrimitiveKind::Histogram(_) => PrimitiveFamily::Histogram,
 			PrimitiveKind::Sort(_) => PrimitiveFamily::Sort,
+			PrimitiveKind::IndexMap(_) => PrimitiveFamily::IndexMap,
 			PrimitiveKind::Random(_) => PrimitiveFamily::Random,
 		})
 		.collect()
@@ -506,8 +507,8 @@ fn workspace_and_missing_semantics_fail_closed_with_an_exact_manifest() -> TestR
 		.count();
 	let concrete = total_compositions - manifest.len();
 	assert_eq!(total_compositions, 264);
-	assert_eq!(concrete, 126);
-	assert_eq!(manifest.len(), 138);
+	assert_eq!(concrete, 132);
+	assert_eq!(manifest.len(), 132);
 	assert_eq!(manifest.len(), total_compositions - concrete);
 	assert!(
 		manifest

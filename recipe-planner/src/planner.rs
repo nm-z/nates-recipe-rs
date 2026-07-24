@@ -5,16 +5,18 @@ use recipe_core::{
 	ArtifactBuildBinding, ArtifactBuildProvenance, ArtifactBuildRecipe, ArtifactBuildView, ArtifactDispatchGeometry,
 	ArtifactId, ArtifactIdentity, ArtifactWorkBounds, ByteCount, ByteOffset, CalculationTask, CandidateIdentity,
 	CapacityLedger, CompletionSlot, CompletionSlotId, DType, DeviceBytes, DeviceId, DeviceKind, Digest,
-	DiscoveryProfile, DraftIdentity, DraftPlan, InitDataImage, InitDataImageMember, KernelResourceBounds,
-	KernelTemplate, KernelTemplateId, LinkId, MetricId, MetricPurpose, MetricSlot, MetricSlotId, MetricTask,
-	Nanoseconds, QueueSlot, QueueSlotId, ReservationLedger, ResourceManifest, RunPhase, ScalarLiteral,
-	ScheduleWindow, StaticBufferAccess, SubmissionSlots, Task, TaskId, TaskKind, Topology, TransferEndpoint,
-	TransferLaneClaim, TransferTask, ValueAliasContract, ValueBinding, ValueId, ValueSpec,
+	DiscoveryProfile, DraftIdentity, DraftPlan, InitDataImage, InitDataImageMember, IterationDomain,
+	KernelResourceBounds, KernelTemplate, KernelTemplateId, LinkId, LoopIterations, LoopTaskDomain, MetricId,
+	MetricPurpose, MetricSlot, MetricSlotId, MetricTask, Nanoseconds, QueueSlot, QueueSlotId, ReservationLedger,
+	ResourceManifest, RunPhase, ScalarLiteral, ScheduleWindow, StaticBufferAccess, SubmissionSlots, Task, TaskId,
+	TaskKind, Topology, TransferEndpoint, TransferLaneClaim, TransferTask, ValueAliasContract, ValueBinding, ValueId,
+	ValueSpec,
 };
 use recipe_language::{CalculationGraph, Tensor};
 use recipe_primitives::{
 	AccessMode, BufferLifetime, BufferOrigin, LoweredProgram, ProgramBuffer, ProgramStage, StageKind,
 };
+use recipe_program::{MetricEmission, StaticCalculationProgram};
 use recipe_scheduler::{ScheduleErrorKind, UnscheduledTask, pack_arenas, schedule};
 
 use crate::error::{PlannerError, PlannerErrorKind, PlannerResult};
@@ -42,6 +44,17 @@ pub struct LogicalValueCopy {
 	pub physical: ValueId,
 }
 
+/// Exact declaration-to-egress identity selected while lowering one external
+/// output. Unlike the complete logical-copy inventory, this records only the
+/// physical copy actually chosen by the finalized exit task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlannedExternalOutput {
+	pub task: TaskId,
+	pub logical: ValueId,
+	pub device: DeviceId,
+	pub physical: ValueId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedCandidate {
 	pub draft: DraftPlan,
@@ -51,6 +64,7 @@ pub struct PlannedCandidate {
 	pub stage_placements: Vec<StagePlacement>,
 	pub lowered_programs: Vec<LoweredProgram>,
 	pub value_copies: Vec<LogicalValueCopy>,
+	pub external_outputs: Vec<PlannedExternalOutput>,
 }
 
 /// Ranked, one-shot candidate stream. Once returned, an identity is never
@@ -74,6 +88,61 @@ impl PlannerSearch {
 			let index = self.cursor;
 			self.cursor += 1;
 			let identity = self.ranked[index].draft.candidate;
+			if self.rejected.contains(&identity) {
+				continue;
+			}
+			self.issued.insert(identity);
+			return self.ranked.get(index);
+		}
+		None
+	}
+
+	pub fn reject(&mut self, identity: CandidateIdentity) -> PlannerResult<()> {
+		if !self.issued.contains(&identity) {
+			return Err(PlannerError::new(
+				PlannerErrorKind::UnknownCandidate,
+				"only a previously issued candidate can be rejected",
+			));
+		}
+		if !self.rejected.insert(identity) {
+			return Err(PlannerError::new(
+				PlannerErrorKind::AlreadyRejected,
+				"candidate was already rejected",
+			));
+		}
+		Ok(())
+	}
+}
+
+/// One planned candidate plus the exact bounded activation schedule that
+/// produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedProgramCandidate {
+	pub planned: PlannedCandidate,
+	pub loop_iterations: LoopIterations,
+	pub loop_domains: Vec<LoopTaskDomain>,
+}
+
+/// Ranked one-shot candidate stream for a static calculation program.
+#[derive(Clone, Debug)]
+pub struct ProgramPlannerSearch {
+	ranked: Vec<PlannedProgramCandidate>,
+	cursor: usize,
+	issued: BTreeSet<CandidateIdentity>,
+	rejected: BTreeSet<CandidateIdentity>,
+}
+
+impl ProgramPlannerSearch {
+	#[must_use]
+	pub fn ranked_candidates(&self) -> &[PlannedProgramCandidate] {
+		&self.ranked
+	}
+
+	pub fn next_candidate(&mut self) -> Option<&PlannedProgramCandidate> {
+		while self.cursor < self.ranked.len() {
+			let index = self.cursor;
+			self.cursor += 1;
+			let identity = self.ranked[index].planned.draft.candidate;
 			if self.rejected.contains(&identity) {
 				continue;
 			}
@@ -127,6 +196,42 @@ pub fn plan_candidates(
 	reservations: &ReservationLedger,
 	capacity: &CapacityLedger,
 ) -> PlannerResult<PlannerSearch> {
+	let program = StaticCalculationProgram::every_iteration(graph.clone(), LoopIterations::ONE)
+		.map_err(|error| PlannerError::new(PlannerErrorKind::InvalidGraph, error.to_string()))?;
+	let search = plan_program_candidates(
+		&program,
+		topology,
+		discovery,
+		artifacts,
+		reservations,
+		capacity,
+	)?;
+	Ok(PlannerSearch {
+		ranked: search
+			.ranked
+			.into_iter()
+			.map(|candidate| candidate.planned)
+			.collect(),
+		cursor: 0,
+		issued: BTreeSet::new(),
+		rejected: BTreeSet::new(),
+	})
+}
+
+/// Plans a bounded static calculation program without unrolling its graph or
+/// duplicating stage artifacts.
+pub fn plan_program_candidates(
+	program: &StaticCalculationProgram,
+	topology: &Topology,
+	discovery: &DiscoveryProfile,
+	artifacts: &[ArtifactIdentity],
+	reservations: &ReservationLedger,
+	capacity: &CapacityLedger,
+) -> PlannerResult<ProgramPlannerSearch> {
+	program
+		.validate()
+		.map_err(|error| PlannerError::new(PlannerErrorKind::InvalidGraph, error.to_string()))?;
+	let graph = program.graph();
 	graph.validate()
 		.map_err(|error| PlannerError::new(PlannerErrorKind::InvalidGraph, error.to_string()))?;
 	topology
@@ -157,7 +262,20 @@ pub fn plan_candidates(
 	let (programs, templates) = lower_programs(graph, &tensors)?;
 	validate_artifact_catalog(artifacts)?;
 	let choices = legal_choices(&order, topology, discovery)?;
-	let graph_identity = graph_digest(&order, &nodes, &tensors, &programs)?;
+	let source_domains = program
+		.domains()
+		.iter()
+		.map(|assignment| (assignment.kernel, assignment.domain))
+		.collect::<BTreeMap<_, _>>();
+	let graph_identity = graph_digest(
+		&order,
+		&nodes,
+		&tensors,
+		&programs,
+		program.iterations(),
+		&source_domains,
+		program.metrics(),
+	)?;
 	let context = PlanningContext {
 		order: &order,
 		nodes: &nodes,
@@ -168,6 +286,9 @@ pub fn plan_candidates(
 		discovery,
 		artifacts,
 		capacity,
+		loop_iterations: program.iterations(),
+		source_domains: &source_domains,
+		metrics: program.metrics(),
 	};
 
 	let mut ranked = Vec::new();
@@ -215,8 +336,13 @@ pub fn plan_candidates(
 			),
 		));
 	}
-	ranked.sort_by_key(|candidate| (candidate.makespan, candidate.draft.candidate));
-	Ok(PlannerSearch {
+	ranked.sort_by_key(|candidate| {
+		(
+			candidate.planned.makespan,
+			candidate.planned.draft.candidate,
+		)
+	});
+	Ok(ProgramPlannerSearch {
 		ranked,
 		cursor: 0,
 		issued: BTreeSet::new(),
@@ -414,8 +540,12 @@ fn graph_digest(
 	nodes: &BTreeMap<KernelTemplateId, &recipe_language::CalculationNode>,
 	tensors: &BTreeMap<ValueId, &Tensor>,
 	programs: &BTreeMap<KernelTemplateId, LoweredKernelPlan>,
+	loop_iterations: LoopIterations,
+	source_domains: &BTreeMap<KernelTemplateId, IterationDomain>,
+	metrics: &[MetricEmission],
 ) -> PlannerResult<recipe_core::Digest> {
-	let mut digest = StableDigest::new("recipe-planner-graph-v4");
+	let mut digest = StableDigest::new("recipe-planner-graph-v6");
+	digest.u64(loop_iterations.get());
 	digest.length(tensors.len());
 	for tensor in tensors.values() {
 		digest.u64(tensor.id.get());
@@ -442,6 +572,13 @@ fn graph_digest(
 			)
 		})?;
 		digest.u64(kernel.get());
+		let domain = source_domains.get(kernel).copied().ok_or_else(|| {
+			PlannerError::new(
+				PlannerErrorKind::InvalidGraph,
+				format!("kernel {kernel} has no iteration domain during graph hashing"),
+			)
+		})?;
+		hash_iteration_domain(&mut digest, domain);
 		digest.length(node.kernel.inputs.len());
 		for input in &node.kernel.inputs {
 			digest.u64(input.get());
@@ -467,7 +604,19 @@ fn graph_digest(
 			digest.u64(stage_template.get());
 		}
 	}
+	digest.length(metrics.len());
+	for emission in metrics {
+		digest.u64(emission.metric.get());
+		digest.u64(emission.value.get());
+		hash_iteration_domain(&mut digest, emission.domain);
+	}
 	Ok(digest.finish())
+}
+
+fn hash_iteration_domain(digest: &mut StableDigest, domain: IterationDomain) {
+	digest.u64(domain.first_iteration());
+	digest.u64(domain.end_exclusive());
+	digest.u64(domain.stride().get());
 }
 
 fn hash_kernel_template(digest: &mut StableDigest, template: &KernelTemplate) {
@@ -603,6 +752,9 @@ struct RuntimeCopy {
 	device: DeviceId,
 	value: ValueId,
 	producer: TaskId,
+	/// Domain of the internal transfer that refreshes this copy. Directly
+	/// produced and init-resident values carry no transfer domain.
+	transfer_domain: Option<IterationDomain>,
 }
 
 #[derive(Debug)]
@@ -612,6 +764,7 @@ struct TransferChain {
 	values: Vec<ValueSpec>,
 	tasks: Vec<UnscheduledTask>,
 	submission_devices: Vec<DeviceId>,
+	loop_domains: Vec<LoopTaskDomain>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -678,6 +831,7 @@ struct LoweringState {
 	values: Vec<ValueSpec>,
 	copies: BTreeMap<ValueId, BTreeMap<DeviceId, RuntimeCopy>>,
 	logical_copies: Vec<LogicalValueCopy>,
+	external_outputs: Vec<PlannedExternalOutput>,
 	images: Vec<ImageRegion>,
 	tasks: Vec<UnscheduledTask>,
 	resources: ResourceManifest,
@@ -685,6 +839,7 @@ struct LoweringState {
 	fault_flags: BTreeMap<(KernelTemplateId, u32), ValueId>,
 	fault_readbacks: BTreeMap<ValueId, TaskId>,
 	init_tasks: BTreeMap<DeviceId, TaskId>,
+	loop_domains: BTreeMap<TaskId, IterationDomain>,
 }
 
 impl LoweringState {
@@ -695,6 +850,7 @@ impl LoweringState {
 			values: Vec::new(),
 			copies: BTreeMap::new(),
 			logical_copies: Vec::new(),
+			external_outputs: Vec::new(),
 			images: Vec::new(),
 			tasks: Vec::new(),
 			resources: ResourceManifest {
@@ -708,6 +864,7 @@ impl LoweringState {
 			fault_flags: BTreeMap::new(),
 			fault_readbacks: BTreeMap::new(),
 			init_tasks: BTreeMap::new(),
+			loop_domains: BTreeMap::new(),
 		}
 	}
 
@@ -753,6 +910,16 @@ impl LoweringState {
 		});
 		Ok(())
 	}
+
+	fn assign_loop_domain(&mut self, task: TaskId, domain: IterationDomain) -> PlannerResult<()> {
+		match self.loop_domains.insert(task, domain) {
+			Some(previous) if previous != domain => Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!("loop task {task} was assigned two iteration domains"),
+			)),
+			Some(_) | None => Ok(()),
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -766,13 +933,16 @@ struct PlanningContext<'a> {
 	discovery: &'a DiscoveryProfile,
 	artifacts: &'a [ArtifactIdentity],
 	capacity: &'a CapacityLedger,
+	loop_iterations: LoopIterations,
+	source_domains: &'a BTreeMap<KernelTemplateId, IterationDomain>,
+	metrics: &'a [MetricEmission],
 }
 
 fn lower_candidate(
 	context: &PlanningContext<'_>,
 	assignment: &Assignment,
 	candidate: CandidateIdentity,
-) -> PlannerResult<PlannedCandidate> {
+) -> PlannerResult<PlannedProgramCandidate> {
 	let selected = context
 		.order
 		.iter()
@@ -813,11 +983,18 @@ fn lower_candidate(
 			builds: &mut artifact_builds,
 			placements: &mut stage_placements,
 		};
+		let domain = context.source_domains.get(kernel).copied().ok_or_else(|| {
+			PlannerError::new(
+				PlannerErrorKind::InvalidGraph,
+				format!("kernel {kernel} has no iteration domain during lowering"),
+			)
+		})?;
 		lower_program_invocation(
 			context,
 			node,
 			lowered,
 			option.device,
+			domain,
 			&mut state,
 			&mut artifacts,
 		)?;
@@ -826,6 +1003,7 @@ fn lower_candidate(
 			device: option.device,
 		});
 	}
+	add_user_metrics(context, &selected, &mut state)?;
 	add_alias_dependencies(&mut state.tasks, &state.aliases)?;
 	let aliases = state.aliases.clone();
 	add_external_outputs(
@@ -838,7 +1016,7 @@ fn lower_candidate(
 	add_alias_dependencies(&mut state.tasks, &state.aliases)?;
 	add_phase_barriers(&mut state.tasks);
 
-	let scheduled = schedule(context.topology, context.discovery, &state.tasks).map_err(|error| {
+	let mut scheduled = schedule(context.topology, context.discovery, &state.tasks).map_err(|error| {
 		let kind = match error.kind {
 			ScheduleErrorKind::DependencyCycle | ScheduleErrorKind::InvalidLifecycleDependency => {
 				PlannerErrorKind::DependencyConflict
@@ -851,6 +1029,12 @@ fn lower_candidate(
 		};
 		PlannerError::new(kind, error.to_string())
 	})?;
+	compact_submission_resources(
+		&mut scheduled.tasks,
+		&state.values,
+		&mut state.resources,
+		context.discovery,
+	)?;
 	let auxiliary_peak = finalize_auxiliary_resources(
 		&mut state.resources,
 		&scheduled.tasks,
@@ -869,6 +1053,8 @@ fn lower_candidate(
 		&scheduled.tasks,
 		&state.images,
 		&state.aliases,
+		context.loop_iterations,
+		&state.loop_domains,
 	)?;
 	let arena_layouts = pack_arenas(context.topology, &arena_objects, context.capacity)
 		.map_err(|error| PlannerError::new(PlannerErrorKind::InvalidCapacity, error.to_string()))?;
@@ -879,6 +1065,7 @@ fn lower_candidate(
 	placements.sort();
 	stage_placements.sort();
 	state.logical_copies.sort();
+	state.external_outputs.sort();
 	state.values.sort_by_key(|value| value.id);
 	let mut releases = context
 		.topology
@@ -899,6 +1086,26 @@ fn lower_candidate(
 			members: image.data_members.clone(),
 		})
 		.collect::<Vec<_>>();
+	let loop_domains = scheduled
+		.tasks
+		.iter()
+		.filter(|task| task.phase == RunPhase::Loop)
+		.map(|task| {
+			state.loop_domains
+				.get(&task.id)
+				.copied()
+				.map(|domain| LoopTaskDomain {
+					task: task.id,
+					domain,
+				})
+				.ok_or_else(|| {
+					PlannerError::new(
+						PlannerErrorKind::InvalidDraft,
+						format!("lowered loop task {} has no iteration domain", task.id),
+					)
+				})
+		})
+		.collect::<PlannerResult<Vec<_>>>()?;
 	let draft_identity = hash_draft(&DraftHashInput {
 		candidate,
 		topology: context.topology,
@@ -914,6 +1121,8 @@ fn lower_candidate(
 		value_aliases: &value_aliases,
 		init_images: &init_images,
 		releases: &releases,
+		loop_iterations: context.loop_iterations,
+		loop_domains: &loop_domains,
 	});
 	let draft = DraftPlan {
 		identity: draft_identity,
@@ -939,20 +1148,104 @@ fn lower_candidate(
 				format!("constructed candidate failed Draft validation: {errors}"),
 			)
 		})?;
-	Ok(PlannedCandidate {
-		draft,
-		arena_layouts,
-		makespan: scheduled.makespan,
-		placements,
-		stage_placements,
-		lowered_programs: context
-			.order
-			.iter()
-			.filter_map(|kernel| context.programs.get(kernel))
-			.map(|lowered| lowered.program.clone())
-			.collect(),
-		value_copies: state.logical_copies,
+	Ok(PlannedProgramCandidate {
+		planned: PlannedCandidate {
+			draft,
+			arena_layouts,
+			makespan: scheduled.makespan,
+			placements,
+			stage_placements,
+			lowered_programs: context
+				.order
+				.iter()
+				.filter_map(|kernel| context.programs.get(kernel))
+				.map(|lowered| lowered.program.clone())
+				.collect(),
+			value_copies: state.logical_copies,
+			external_outputs: state.external_outputs,
+		},
+		loop_iterations: context.loop_iterations,
+		loop_domains,
 	})
+}
+
+fn add_user_metrics(
+	context: &PlanningContext<'_>,
+	selected: &BTreeMap<KernelTemplateId, &PlacementOption>,
+	state: &mut LoweringState,
+) -> PlannerResult<()> {
+	for emission in context.metrics {
+		let producer = context
+			.nodes
+			.iter()
+			.find_map(|(kernel, node)| {
+				node.kernel
+					.outputs
+					.contains(&emission.value)
+					.then_some(*kernel)
+			})
+			.ok_or_else(|| {
+				PlannerError::new(
+					PlannerErrorKind::InvalidGraph,
+					format!(
+						"user metric {} value {} has no source-kernel producer",
+						emission.metric, emission.value
+					),
+				)
+			})?;
+		let device = selected
+			.get(&producer)
+			.map(|option| option.device)
+			.ok_or_else(|| {
+				PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					format!("metric producer kernel {producer} has no selected device"),
+				)
+			})?;
+		let copy = state
+			.copies
+			.get(&emission.value)
+			.and_then(|copies| copies.get(&device))
+			.copied()
+			.ok_or_else(|| {
+				PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					format!(
+						"user metric {} value {} has no resident copy on producer device {device}",
+						emission.metric, emission.value
+					),
+				)
+			})?;
+		if copy.transfer_domain.is_some() {
+			return Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!(
+					"user metric {} selected a transferred copy instead of producer-resident value {}",
+					emission.metric, emission.value
+				),
+			));
+		}
+		let (task, submission) = state.next_submission(device)?;
+		let slot = MetricSlotId::new(task.get());
+		state.resources.metrics.push(MetricSlot {
+			id: slot,
+			metric: emission.metric,
+		});
+		state.tasks.push(UnscheduledTask {
+			id: task,
+			phase: RunPhase::Loop,
+			dependencies: vec![copy.producer],
+			kind: TaskKind::Metric(MetricTask {
+				purpose: MetricPurpose::User,
+				metric: emission.metric,
+				value: copy.value,
+				slot,
+				submission,
+			}),
+		});
+		state.assign_loop_domain(task, emission.domain)?;
+	}
+	Ok(())
 }
 
 fn lower_program_invocation(
@@ -960,6 +1253,7 @@ fn lower_program_invocation(
 	node: &recipe_language::CalculationNode,
 	lowered: &LoweredKernelPlan,
 	device: DeviceId,
+	domain: IterationDomain,
 	state: &mut LoweringState,
 	artifacts: &mut LoweredArtifacts<'_>,
 ) -> PlannerResult<()> {
@@ -975,7 +1269,7 @@ fn lower_program_invocation(
 	let mut writers = BTreeMap::<u32, TaskId>::new();
 	let mut stage_barriers = BTreeMap::<u32, TaskId>::new();
 	for buffer in &program.buffers {
-		let (value, producer) = materialize_program_buffer(context, node, program, buffer, device, state)?;
+		let (value, producer) = materialize_program_buffer(context, node, program, buffer, device, domain, state)?;
 		values.insert(buffer.id.get(), value);
 		producer.into_iter().for_each(|producer| {
 			ready.insert(buffer.id.get(), producer);
@@ -1100,9 +1394,10 @@ fn lower_program_invocation(
 				submission,
 			}),
 		});
+		state.assign_loop_domain(task, domain)?;
 		let completion_barrier = match fault_flag {
 			Some(fault_flag) => {
-				let readback = state.next_task()?;
+				let (readback, submission) = state.next_submission(device)?;
 				let metric = MetricId::new(readback.get());
 				let slot = MetricSlotId::new(readback.get());
 				state.resources
@@ -1117,8 +1412,10 @@ fn lower_program_invocation(
 						metric,
 						value: fault_flag,
 						slot,
+						submission,
 					}),
 				});
+				state.assign_loop_domain(readback, domain)?;
 				state.fault_readbacks.insert(fault_flag, readback);
 				readback
 			}
@@ -1189,6 +1486,7 @@ fn lower_program_invocation(
 				device,
 				value: *physical,
 				producer: readiness,
+				transfer_domain: None,
 			},
 		)?;
 	}
@@ -1220,6 +1518,7 @@ fn materialize_program_buffer(
 	program: &LoweredProgram,
 	buffer: &ProgramBuffer,
 	device: DeviceId,
+	domain: IterationDomain,
 	state: &mut LoweringState,
 ) -> PlannerResult<(ValueId, Option<TaskId>)> {
 	match buffer.origin {
@@ -1230,6 +1529,7 @@ fn materialize_program_buffer(
 				context.tensors,
 				context.topology,
 				context.discovery,
+				domain,
 				state,
 			)?;
 			Ok((copy.value, Some(copy.producer)))
@@ -1767,6 +2067,7 @@ fn build_transfer_chain(
 	bytes: ByteCount,
 	topology: &Topology,
 	allocation: TransferAllocationStart,
+	domain: IterationDomain,
 ) -> PlannerResult<TransferChain> {
 	topology
 		.validate_route(source.device, destination, route)
@@ -1861,6 +2162,7 @@ fn build_transfer_chain(
 
 	let mut tasks = Vec::with_capacity(endpoints.len());
 	let mut submission_devices = Vec::with_capacity(endpoints.len());
+	let mut loop_domains = Vec::with_capacity(endpoints.len());
 	let mut source_value = source.value;
 	for (hop, (hop_source, hop_destination, link)) in endpoints.iter().copied().enumerate() {
 		let task = task_ids[hop];
@@ -1892,6 +2194,7 @@ fn build_transfer_chain(
 				submission,
 			}),
 		});
+		loop_domains.push(LoopTaskDomain { task, domain });
 		submission_devices.push(hop_source);
 		source_value = destination_value;
 	}
@@ -1902,6 +2205,7 @@ fn build_transfer_chain(
 		values,
 		tasks,
 		submission_devices,
+		loop_domains,
 	})
 }
 
@@ -2003,6 +2307,7 @@ fn initialize_data_images(
 					device,
 					value: physical,
 					producer: task,
+					transfer_domain: None,
 				},
 			)?;
 			external_members.push((physical, member_offset));
@@ -2090,6 +2395,7 @@ fn ensure_copy(
 	tensors: &BTreeMap<ValueId, &Tensor>,
 	topology: &Topology,
 	discovery: &DiscoveryProfile,
+	consumer_domain: IterationDomain,
 	state: &mut LoweringState,
 ) -> PlannerResult<RuntimeCopy> {
 	if let Some(copy) = state
@@ -2098,7 +2404,16 @@ fn ensure_copy(
 		.and_then(|copies| copies.get(&destination))
 		.copied()
 	{
-		return Ok(copy);
+		if copy.transfer_domain.is_none() || copy.transfer_domain == Some(consumer_domain) {
+			return Ok(copy);
+		}
+		return Err(PlannerError::new(
+			PlannerErrorKind::CandidateInfeasible,
+			format!(
+				"tensor {logical} already has a transferred copy on device {destination} for a different \
+				 iteration domain; distinct-domain consumers require distinct resident copies"
+			),
+		));
 	}
 	let tensor = tensors.get(&logical).ok_or_else(|| {
 		PlannerError::new(
@@ -2127,7 +2442,10 @@ fn ensure_copy(
 	)> = None;
 	let mut route_count = 0_usize;
 	let mut schedulable_count = 0_usize;
-	for source in sources {
+	for source in sources
+		.into_iter()
+		.filter(|source| source.transfer_domain.is_none() || source.transfer_domain == Some(consumer_domain))
+	{
 		for route in directed_routes(topology, source.device, destination) {
 			route_count = route_count.saturating_add(1);
 			let chain = build_transfer_chain(
@@ -2138,6 +2456,7 @@ fn ensure_copy(
 				tensor.storage_bytes,
 				topology,
 				allocation,
+				consumer_domain,
 			)?;
 			let Some((end, makespan)) = trial_chain_timing(
 				topology,
@@ -2179,6 +2498,7 @@ fn ensure_copy(
 		tensor.storage_bytes,
 		topology,
 		allocation,
+		consumer_domain,
 	)?;
 	for expected in &chain.values {
 		let allocated = state.next_value()?;
@@ -2208,7 +2528,11 @@ fn ensure_copy(
 		device: destination,
 		value: chain.final_value,
 		producer: chain.final_task,
+		transfer_domain: Some(consumer_domain),
 	};
+	for assignment in &chain.loop_domains {
+		state.assign_loop_domain(assignment.task, assignment.domain)?;
+	}
 	state.values.extend(chain.values);
 	state.tasks.extend(chain.tasks);
 	state.push_copy(logical, copy)?;
@@ -2271,6 +2595,7 @@ fn add_external_outputs(
 		for source in copies
 			.values()
 			.copied()
+			.filter(|copy| copy.transfer_domain.is_none())
 			.filter(|copy| !overwritten.contains(&copy.value))
 		{
 			safe_count = safe_count.saturating_add(1);
@@ -2338,8 +2663,223 @@ fn add_external_outputs(
 				submission,
 			}),
 		});
+		state.external_outputs.push(PlannedExternalOutput {
+			task,
+			logical: tensor.id,
+			device: source.device,
+			physical: source.value,
+		});
 	}
 	Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubmissionInterval {
+	task_index: usize,
+	task: TaskId,
+	window: ScheduleWindow,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DeviceSubmissionIntervals {
+	explicit: BTreeMap<SubmissionOwnerClass, Vec<SubmissionInterval>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SubmissionOwnerClass {
+	// Local calculations, metrics, admissions, egress, and same-device copies
+	// are realized by the backend owning this manifest device.
+	DeviceLocal,
+	// Cross-device transfers are realized by a bridge or one homogeneous
+	// backend. Keeping exact endpoint pairs separate prevents one logical slot
+	// from materializing once in each physical backend owner.
+	CrossDevice {
+		source: DeviceId,
+		destination: DeviceId,
+	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubmissionColor {
+	id: TaskId,
+	available_at: Nanoseconds,
+}
+
+fn compact_submission_resources(
+	tasks: &mut [Task],
+	values: &[ValueSpec],
+	resources: &mut ResourceManifest,
+	discovery: &DiscoveryProfile,
+) -> PlannerResult<()> {
+	let maximum_queues = discovery
+		.devices
+		.iter()
+		.map(|device| (device.device, device.maximum_submission_queues))
+		.collect::<BTreeMap<_, _>>();
+	compact_submission_resources_with_limits(tasks, values, resources, &maximum_queues)
+}
+
+fn compact_submission_resources_with_limits(
+	tasks: &mut [Task],
+	values: &[ValueSpec],
+	resources: &mut ResourceManifest,
+	maximum_queues: &BTreeMap<DeviceId, u32>,
+) -> PlannerResult<()> {
+	let value_devices = values
+		.iter()
+		.map(|value| (value.id, value.device))
+		.collect::<BTreeMap<_, _>>();
+	let mut by_device = BTreeMap::<DeviceId, DeviceSubmissionIntervals>::new();
+	for (task_index, task) in tasks.iter().enumerate() {
+		let (device, owner) = task_submission_device(task, &value_devices)?;
+		let interval = SubmissionInterval {
+			task_index,
+			task: task.id,
+			window: task.window,
+		};
+		let intervals = by_device.entry(device).or_default();
+		intervals.explicit.entry(owner).or_default().push(interval);
+	}
+
+	let mut assignments = Vec::<(usize, SubmissionSlots)>::new();
+	let mut queues = Vec::new();
+	let mut completions = Vec::new();
+	for (device, intervals) in &mut by_device {
+		let mut device_colors = Vec::<SubmissionColor>::new();
+		for owner_intervals in intervals.explicit.values_mut() {
+			owner_intervals.sort_by_key(|interval| (interval.window.start, interval.window.end, interval.task));
+			let mut owner_colors = Vec::<SubmissionColor>::new();
+			for interval in owner_intervals {
+				// Start-ordered greedy coloring is optimal for intervals. The
+				// first task on each color supplies its stable physical ID.
+				let color = match owner_colors
+					.iter_mut()
+					.find(|color| color.available_at <= interval.window.start)
+				{
+					Some(color) => {
+						color.available_at = interval.window.end;
+						*color
+					}
+					None => {
+						let color = SubmissionColor {
+							id: interval.task,
+							available_at: interval.window.end,
+						};
+						owner_colors.push(color);
+						color
+					}
+				};
+				assignments.push((
+					interval.task_index,
+					SubmissionSlots {
+						queue: QueueSlotId::new(color.id.get()),
+						completion: CompletionSlotId::new(color.id.get()),
+					},
+				));
+			}
+			device_colors.extend(owner_colors);
+		}
+
+		let required = device_colors.len();
+		let limit = maximum_queues.get(device).copied().ok_or_else(|| {
+			PlannerError::new(
+				PlannerErrorKind::InvalidDiscovery,
+				format!("device {device} has no measured submission-queue limit"),
+			)
+		})?;
+		let limit = usize::try_from(limit).map_err(|_| {
+			PlannerError::new(
+				PlannerErrorKind::ArithmeticOverflow,
+				format!("device {device} submission-queue limit does not fit this host"),
+			)
+		})?;
+		if required > limit {
+			return Err(PlannerError::new(
+				PlannerErrorKind::CandidateInfeasible,
+				format!(
+					"device {device} requires {required} simultaneous submission queues, \
+					 but measured capacity is {limit}"
+				),
+			));
+		}
+
+		for color in device_colors {
+			let queue = QueueSlotId::new(color.id.get());
+			let completion = CompletionSlotId::new(color.id.get());
+			queues.push(QueueSlot {
+				id: queue,
+				device: *device,
+			});
+			completions.push(CompletionSlot {
+				id: completion,
+				device: *device,
+			});
+		}
+	}
+
+	for (task_index, slots) in assignments {
+		let task = tasks.get_mut(task_index).ok_or_else(|| {
+			PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				"submission compaction lost a scheduled task index",
+			)
+		})?;
+		match &mut task.kind {
+			TaskKind::Calculation(calculation) => calculation.submission = slots,
+			TaskKind::Transfer(transfer) => transfer.submission = slots,
+			TaskKind::Metric(metric) => metric.submission = slots,
+		}
+	}
+	queues.sort_by_key(|slot| slot.id);
+	completions.sort_by_key(|slot| slot.id);
+	resources.queues = queues;
+	resources.completions = completions;
+	Ok(())
+}
+
+fn task_submission_device(
+	task: &Task,
+	value_devices: &BTreeMap<ValueId, DeviceId>,
+) -> PlannerResult<(DeviceId, SubmissionOwnerClass)> {
+	match &task.kind {
+		TaskKind::Calculation(calculation) => Ok((calculation.device, SubmissionOwnerClass::DeviceLocal)),
+		TaskKind::Transfer(transfer) => match (transfer.source, transfer.destination) {
+			(
+				TransferEndpoint::Device { device: source, .. },
+				TransferEndpoint::Device {
+					device: destination,
+					..
+				},
+			) if source != destination => Ok((
+				source,
+				SubmissionOwnerClass::CrossDevice {
+					source,
+					destination,
+				},
+			)),
+			(TransferEndpoint::Device { device, .. }, _) => Ok((device, SubmissionOwnerClass::DeviceLocal)),
+			(TransferEndpoint::External, TransferEndpoint::Device { device, .. }) => {
+				Ok((device, SubmissionOwnerClass::DeviceLocal))
+			}
+			(TransferEndpoint::External, TransferEndpoint::External) => Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!("task {} is an external-to-external transfer", task.id),
+			)),
+		},
+		TaskKind::Metric(metric) => value_devices
+			.get(&metric.value)
+			.copied()
+			.map(|device| (device, SubmissionOwnerClass::DeviceLocal))
+			.ok_or_else(|| {
+				PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					format!(
+						"metric task {} references unknown value {}",
+						task.id, metric.value
+					),
+				)
+			}),
+	}
 }
 
 fn finalize_auxiliary_resources(
@@ -2523,6 +3063,8 @@ fn build_arena_contract(
 	tasks: &[Task],
 	images: &[ImageRegion],
 	aliases: &[AliasInvocation],
+	loop_iterations: LoopIterations,
+	loop_domains: &BTreeMap<TaskId, IterationDomain>,
 ) -> PlannerResult<(Vec<ArenaObject>, Vec<ValueBinding>)> {
 	let specs = values
 		.iter()
@@ -2661,6 +3203,39 @@ fn build_arena_contract(
 		.iter()
 		.map(|task| (task.id, task))
 		.collect::<BTreeMap<_, _>>();
+	let mut schedule_start = None;
+	let mut schedule_end = None;
+	for task in tasks {
+		extend_lifetime(&mut schedule_start, &mut schedule_end, task.window);
+	}
+	let schedule_window = match (schedule_start, schedule_end) {
+		(Some(start), Some(end)) => Some(ScheduleWindow { start, end }),
+		(None, None) => None,
+		_ => {
+			return Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				"schedule has only one lifetime boundary",
+			));
+		}
+	};
+	let loop_window = (loop_iterations.get() > 1)
+		.then(|| {
+			let mut start = None;
+			let mut end = None;
+			for task in tasks.iter().filter(|task| task.phase == RunPhase::Loop) {
+				extend_lifetime(&mut start, &mut end, task.window);
+			}
+			match (start, end) {
+				(Some(start), Some(end)) => Ok(Some(ScheduleWindow { start, end })),
+				(None, None) => Ok(None),
+				_ => Err(PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					"loop schedule has only one lifetime boundary",
+				)),
+			}
+		})
+		.transpose()?
+		.flatten();
 	let mut objects = Vec::with_capacity(blueprints.len());
 	for mut blueprint in blueprints {
 		blueprint.members.sort();
@@ -2683,6 +3258,28 @@ fn build_arena_contract(
 			}
 			for task in tasks.iter().filter(|task| task_references(task, *value)) {
 				extend_lifetime(&mut start, &mut end, task.window);
+			}
+		}
+		let crosses_phase = blueprint.members.iter().try_fold(false, |crosses, value| {
+			Ok(crosses || value_crosses_phase_boundary(*value, specs[value], tasks, &task_index)?)
+		})?;
+		if crosses_phase {
+			if let Some(schedule_window) = schedule_window {
+				extend_lifetime(&mut start, &mut end, schedule_window);
+			}
+		} else if let Some(loop_window) = loop_window {
+			let crosses_iteration = blueprint.members.iter().try_fold(false, |crosses, value| {
+				Ok(crosses
+					|| value_crosses_iteration_boundary(
+						*value,
+						specs[value],
+						tasks,
+						&task_index,
+						loop_domains,
+					)?)
+			})?;
+			if crosses_iteration {
+				extend_lifetime(&mut start, &mut end, loop_window);
 			}
 		}
 		let lifetime = ScheduleWindow {
@@ -2711,6 +3308,92 @@ fn build_arena_contract(
 	Ok((objects, bindings.into_values().collect()))
 }
 
+fn value_crosses_phase_boundary(
+	value: ValueId,
+	spec: &ValueSpec,
+	tasks: &[Task],
+	task_index: &BTreeMap<TaskId, &Task>,
+) -> PlannerResult<bool> {
+	let producer = spec
+		.producer
+		.and_then(|producer| task_index.get(&producer).copied());
+	for reader in tasks.iter().filter(|task| task_reads_value(task, value)) {
+		let Some(producer) = producer else {
+			return Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!("read value {value} has no scheduled producer"),
+			));
+		};
+		if producer.phase != reader.phase {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+fn value_crosses_iteration_boundary(
+	value: ValueId,
+	spec: &ValueSpec,
+	tasks: &[Task],
+	task_index: &BTreeMap<TaskId, &Task>,
+	loop_domains: &BTreeMap<TaskId, IterationDomain>,
+) -> PlannerResult<bool> {
+	let producer = spec
+		.producer
+		.and_then(|producer| task_index.get(&producer).copied());
+	for reader in tasks
+		.iter()
+		.filter(|task| task.phase == RunPhase::Loop && task_reads_value(task, value))
+	{
+		let reader_domain = loop_domains.get(&reader.id).copied().ok_or_else(|| {
+			PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!("loop reader task {} has no iteration domain", reader.id),
+			)
+		})?;
+		if !domain_has_nonzero_activation(reader_domain) {
+			continue;
+		}
+		let refreshed_before_every_read = producer.is_some_and(|producer| {
+			producer.phase == RunPhase::Loop
+				&& producer.window.end <= reader.window.start
+				&& loop_domains
+					.get(&producer.id)
+					.copied()
+					.is_some_and(|producer_domain| domain_covers(producer_domain, reader_domain))
+		});
+		if !refreshed_before_every_read {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+fn domain_has_nonzero_activation(domain: IterationDomain) -> bool {
+	let span = domain.end_exclusive() - 1 - domain.first_iteration();
+	let last = domain.first_iteration() + span / domain.stride().get() * domain.stride().get();
+	last > 0
+}
+
+fn domain_covers(producer: IterationDomain, consumer: IterationDomain) -> bool {
+	if consumer.first_iteration() < producer.first_iteration() {
+		return false;
+	}
+	let consumer_span = consumer.end_exclusive() - 1 - consumer.first_iteration();
+	let consumer_last =
+		consumer.first_iteration() + consumer_span / consumer.stride().get() * consumer.stride().get();
+	if consumer_last >= producer.end_exclusive()
+		|| !(consumer.first_iteration() - producer.first_iteration()).is_multiple_of(producer.stride().get())
+	{
+		return false;
+	}
+	consumer_last == consumer.first_iteration()
+		|| consumer
+			.stride()
+			.get()
+			.is_multiple_of(producer.stride().get())
+}
+
 fn extend_lifetime(start: &mut Option<Nanoseconds>, end: &mut Option<Nanoseconds>, window: ScheduleWindow) {
 	*start = Some(start.map_or(window.start, |known| known.min(window.start)));
 	*end = Some(end.map_or(window.end, |known| known.max(window.end)));
@@ -2718,6 +3401,24 @@ fn extend_lifetime(start: &mut Option<Nanoseconds>, end: &mut Option<Nanoseconds
 
 fn task_references(task: &Task, value: ValueId) -> bool {
 	task_kind_references(&task.kind, value)
+}
+
+fn task_reads_value(task: &Task, value: ValueId) -> bool {
+	match &task.kind {
+		TaskKind::Calculation(calculation) => {
+			calculation.inputs.contains(&value) || calculation.fault_flag == Some(value)
+		}
+		TaskKind::Transfer(transfer) => {
+			matches!(
+				transfer.source,
+				TransferEndpoint::Device {
+					value: candidate,
+					..
+				} if candidate == value
+			)
+		}
+		TaskKind::Metric(metric) => metric.value == value,
+	}
 }
 
 fn task_kind_references(kind: &TaskKind, value: ValueId) -> bool {
@@ -2799,13 +3500,21 @@ struct DraftHashInput<'a> {
 	value_aliases: &'a [ValueAliasContract],
 	init_images: &'a [InitDataImage],
 	releases: &'a [ArenaRelease],
+	loop_iterations: LoopIterations,
+	loop_domains: &'a [LoopTaskDomain],
 }
 
 fn hash_draft(input: &DraftHashInput<'_>) -> DraftIdentity {
-	let mut digest = StableDigest::new("recipe-planner-draft-v7");
+	let mut digest = StableDigest::new("recipe-planner-draft-v9");
 	digest.digest(input.candidate.digest());
 	digest.digest(input.topology.identity.digest());
 	digest.digest(input.discovery.identity.digest());
+	digest.u64(input.loop_iterations.get());
+	digest.length(input.loop_domains.len());
+	for assignment in input.loop_domains {
+		digest.u64(assignment.task.get());
+		hash_iteration_domain(&mut digest, assignment.domain);
+	}
 	digest.length(input.values.len());
 	for value in input.values {
 		digest.u64(value.id.get());
@@ -2903,6 +3612,8 @@ fn hash_draft(input: &DraftHashInput<'_>) -> DraftIdentity {
 				digest.u64(metric.metric.get());
 				digest.u64(metric.value.get());
 				digest.u64(metric.slot.get());
+				digest.u64(metric.submission.queue.get());
+				digest.u64(metric.submission.completion.get());
 			}
 		}
 	}
@@ -3036,5 +3747,363 @@ fn hash_endpoint(digest: &mut StableDigest, endpoint: TransferEndpoint) {
 			digest.u64(device.get());
 			digest.u64(value.get());
 		}
+	}
+}
+
+#[cfg(test)]
+mod submission_compaction_tests {
+	use super::*;
+
+	const DEVICE: DeviceId = DeviceId::new(1);
+
+	fn window(start: u64, end: u64) -> ScheduleWindow {
+		ScheduleWindow {
+			start: Nanoseconds::new(start),
+			end: Nanoseconds::new(end),
+		}
+	}
+
+	fn transfer(id: u64, start: u64, end: u64) -> Task {
+		let task = TaskId::new(id);
+		Task {
+			id: task,
+			phase: RunPhase::Loop,
+			window: window(start, end),
+			dependencies: Vec::new(),
+			kind: TaskKind::Transfer(TransferTask {
+				source: TransferEndpoint::Device {
+					device: DEVICE,
+					value: ValueId::new(id),
+				},
+				destination: TransferEndpoint::External,
+				bytes: ByteCount::new(4),
+				route: Vec::new(),
+				lane_claims: Vec::new(),
+				submission: SubmissionSlots {
+					queue: QueueSlotId::new(id),
+					completion: CompletionSlotId::new(id),
+				},
+			}),
+		}
+	}
+
+	fn cross_device_transfer(id: u64, start: u64, end: u64, destination: DeviceId) -> Task {
+		let mut task = transfer(id, start, end);
+		let TaskKind::Transfer(transfer) = &mut task.kind else {
+			unreachable!("transfer helper constructs transfer work");
+		};
+		transfer.destination = TransferEndpoint::Device {
+			device: destination,
+			value: ValueId::new(id + 100),
+		};
+		task
+	}
+
+	fn metric(id: u64, value: ValueId, start: u64, end: u64) -> Task {
+		Task {
+			id: TaskId::new(id),
+			phase: RunPhase::Loop,
+			window: window(start, end),
+			dependencies: Vec::new(),
+			kind: TaskKind::Metric(MetricTask {
+				purpose: MetricPurpose::User,
+				metric: MetricId::new(id),
+				value,
+				slot: MetricSlotId::new(id),
+				submission: SubmissionSlots {
+					queue: QueueSlotId::new(id),
+					completion: CompletionSlotId::new(id),
+				},
+			}),
+		}
+	}
+
+	fn resources() -> ResourceManifest {
+		ResourceManifest {
+			queues: Vec::new(),
+			completions: Vec::new(),
+			metrics: Vec::new(),
+			pinned_staging: Vec::new(),
+			scratch: Vec::new(),
+		}
+	}
+
+	fn slots(task: &Task) -> SubmissionSlots {
+		match &task.kind {
+			TaskKind::Calculation(calculation) => calculation.submission,
+			TaskKind::Transfer(transfer) => transfer.submission,
+			TaskKind::Metric(metric) => metric.submission,
+		}
+	}
+
+	#[test]
+	fn sequential_half_open_windows_reuse_queue_and_completion() {
+		let mut tasks = vec![transfer(1, 0, 10), transfer(2, 10, 20)];
+		let mut resources = resources();
+		compact_submission_resources_with_limits(
+			&mut tasks,
+			&[],
+			&mut resources,
+			&BTreeMap::from([(DEVICE, 1)]),
+		)
+		.unwrap();
+
+		assert_eq!(slots(&tasks[0]), slots(&tasks[1]));
+		assert_eq!(resources.queues.len(), 1);
+		assert_eq!(resources.completions.len(), 1);
+	}
+
+	#[test]
+	fn overlapping_windows_never_share_queue_or_completion() {
+		let mut tasks = vec![transfer(1, 0, 11), transfer(2, 10, 20)];
+		let mut resources = resources();
+		compact_submission_resources_with_limits(
+			&mut tasks,
+			&[],
+			&mut resources,
+			&BTreeMap::from([(DEVICE, 2)]),
+		)
+		.unwrap();
+
+		assert_ne!(slots(&tasks[0]).queue, slots(&tasks[1]).queue);
+		assert_ne!(slots(&tasks[0]).completion, slots(&tasks[1]).completion);
+		assert_eq!(resources.queues.len(), 2);
+		assert_eq!(resources.completions.len(), 2);
+	}
+
+	#[test]
+	fn metrics_participate_in_submission_interval_coloring() {
+		let value = ValueId::new(40);
+		let mut tasks = vec![
+			transfer(1, 0, 10),
+			metric(2, value, 1, 5),
+			metric(3, value, 2, 6),
+		];
+		let values = vec![ValueSpec {
+			id: value,
+			dtype: DType::F32,
+			bytes: ByteCount::new(4),
+			device: DEVICE,
+			producer: Some(TaskId::new(1)),
+		}];
+		let mut resources = resources();
+		compact_submission_resources_with_limits(
+			&mut tasks,
+			&values,
+			&mut resources,
+			&BTreeMap::from([(DEVICE, 3)]),
+		)
+		.unwrap();
+
+		assert_eq!(resources.queues.len(), 3);
+		assert_eq!(resources.completions.len(), 3);
+		assert!(
+			resources
+				.queues
+				.iter()
+				.any(|slot| slot.id == QueueSlotId::new(2))
+		);
+		assert!(
+			resources
+				.queues
+				.iter()
+				.any(|slot| slot.id == QueueSlotId::new(3))
+		);
+	}
+
+	#[test]
+	fn distinct_backend_owner_classes_do_not_reuse_slots() {
+		let mut tasks = vec![
+			transfer(1, 0, 10),
+			cross_device_transfer(2, 10, 20, DeviceId::new(2)),
+		];
+		let mut resources = resources();
+		compact_submission_resources_with_limits(
+			&mut tasks,
+			&[],
+			&mut resources,
+			&BTreeMap::from([(DEVICE, 2)]),
+		)
+		.unwrap();
+
+		assert_ne!(slots(&tasks[0]), slots(&tasks[1]));
+		assert_eq!(resources.queues.len(), 2);
+		assert_eq!(resources.completions.len(), 2);
+	}
+
+	#[test]
+	fn measured_queue_limit_rejects_excess_concurrency_cleanly() {
+		let mut tasks = vec![transfer(1, 0, 11), transfer(2, 10, 20)];
+		let original = tasks.clone();
+		let mut resources = resources();
+		let error = compact_submission_resources_with_limits(
+			&mut tasks,
+			&[],
+			&mut resources,
+			&BTreeMap::from([(DEVICE, 1)]),
+		)
+		.unwrap_err();
+
+		assert_eq!(error.kind, PlannerErrorKind::CandidateInfeasible);
+		assert_eq!(tasks, original);
+		assert!(resources.queues.is_empty());
+		assert!(resources.completions.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod arena_lifetime_tests {
+	use super::*;
+
+	const DEVICE: DeviceId = DeviceId::new(1);
+
+	fn window(start: u64, end: u64) -> ScheduleWindow {
+		ScheduleWindow {
+			start: Nanoseconds::new(start),
+			end: Nanoseconds::new(end),
+		}
+	}
+
+	fn calculation(
+		id: u64,
+		phase: RunPhase,
+		start: u64,
+		end: u64,
+		inputs: Vec<ValueId>,
+		outputs: Vec<ValueId>,
+	) -> Task {
+		Task {
+			id: TaskId::new(id),
+			phase,
+			window: window(start, end),
+			dependencies: Vec::new(),
+			kind: TaskKind::Calculation(CalculationTask {
+				device: DEVICE,
+				kernel_template: KernelTemplateId::new(id),
+				artifact: ArtifactId::new(id),
+				inputs,
+				outputs,
+				fault_flag: None,
+				work: recipe_core::FlopCount::ZERO,
+				submission: SubmissionSlots {
+					queue: QueueSlotId::new(id),
+					completion: CompletionSlotId::new(id),
+				},
+			}),
+		}
+	}
+
+	fn value(id: u64, producer: u64) -> ValueSpec {
+		ValueSpec {
+			id: ValueId::new(id),
+			dtype: DType::F32,
+			bytes: ByteCount::new(4),
+			device: DEVICE,
+			producer: Some(TaskId::new(producer)),
+		}
+	}
+
+	fn object_for<'a>(value: ValueId, objects: &'a [ArenaObject], bindings: &[ValueBinding]) -> &'a ArenaObject {
+		let object = bindings
+			.iter()
+			.find(|binding| binding.value == value)
+			.expect("test value has an arena binding")
+			.object;
+		objects
+			.iter()
+			.find(|candidate| candidate.id == object)
+			.expect("bound arena object exists")
+	}
+
+	#[test]
+	fn first_only_value_read_every_iteration_spans_the_complete_loop() {
+		let persistent = ValueId::new(1);
+		let intermediate = ValueId::new(2);
+		let final_value = ValueId::new(3);
+		let iterations = LoopIterations::new(3).unwrap();
+		let tasks = vec![
+			calculation(1, RunPhase::Loop, 10, 20, Vec::new(), vec![persistent]),
+			calculation(
+				2,
+				RunPhase::Loop,
+				20,
+				30,
+				vec![persistent],
+				vec![intermediate],
+			),
+			calculation(
+				3,
+				RunPhase::Loop,
+				30,
+				40,
+				vec![intermediate],
+				vec![final_value],
+			),
+		];
+		let domains = BTreeMap::from([
+			(TaskId::new(1), IterationDomain::first()),
+			(TaskId::new(2), IterationDomain::every(iterations)),
+			(TaskId::new(3), IterationDomain::every(iterations)),
+		]);
+		let (objects, bindings) = build_arena_contract(
+			&[value(1, 1), value(2, 2), value(3, 3)],
+			&tasks,
+			&[],
+			&[],
+			iterations,
+			&domains,
+		)
+		.unwrap();
+
+		assert_eq!(
+			object_for(persistent, &objects, &bindings).lifetime,
+			window(10, 40)
+		);
+	}
+
+	#[test]
+	fn loop_value_consumed_during_exit_spans_the_global_schedule() {
+		let init_value = ValueId::new(1);
+		let checkpoint = ValueId::new(2);
+		let iterations = LoopIterations::new(3).unwrap();
+		let tasks = vec![
+			calculation(1, RunPhase::Init, 0, 5, Vec::new(), vec![init_value]),
+			calculation(2, RunPhase::Loop, 10, 20, Vec::new(), vec![checkpoint]),
+			Task {
+				id: TaskId::new(3),
+				phase: RunPhase::Exit,
+				window: window(30, 40),
+				dependencies: vec![TaskId::new(2)],
+				kind: TaskKind::Transfer(TransferTask {
+					source: TransferEndpoint::Device {
+						device: DEVICE,
+						value: checkpoint,
+					},
+					destination: TransferEndpoint::External,
+					bytes: ByteCount::new(4),
+					route: Vec::new(),
+					lane_claims: Vec::new(),
+					submission: SubmissionSlots {
+						queue: QueueSlotId::new(3),
+						completion: CompletionSlotId::new(3),
+					},
+				}),
+			},
+		];
+		let domains = BTreeMap::from([(TaskId::new(2), IterationDomain::every(iterations))]);
+		let (objects, bindings) = build_arena_contract(
+			&[value(1, 1), value(2, 2)],
+			&tasks,
+			&[],
+			&[],
+			iterations,
+			&domains,
+		)
+		.unwrap();
+
+		assert_eq!(
+			object_for(checkpoint, &objects, &bindings).lifetime,
+			window(0, 40)
+		);
 	}
 }

@@ -537,11 +537,38 @@ fn validate_kind(stage: &ProgramStage, path: &str, errors: &mut Vec<ProgramValid
 					== [
 						PhiloxCounterWord::ElementLow,
 						PhiloxCounterWord::ElementHigh,
-						PhiloxCounterWord::RunXorStreamLow,
-						PhiloxCounterWord::RunXorStreamHigh,
-					] && contract.fold_kernel_id_into_key,
+						PhiloxCounterWord::IterationXorStreamLow,
+						PhiloxCounterWord::IterationXorStreamHigh,
+					] && contract.fold_kernel_id_into_key
+					&& contract.fold_run_id_into_key,
 				format!("{path}.kind.counter"),
 				"Philox counter/key folding contract is not canonical",
+				errors,
+			);
+		}
+		StageKind::IndexMap(spec) => {
+			require(
+				stage.bindings.len() == 2,
+				format!("{path}.bindings"),
+				"index map requires one output and one fault binding",
+				errors,
+			);
+			require(
+				spec.modulus.is_none_or(|modulus| modulus > 0),
+				format!("{path}.kind.modulus"),
+				"index-map modulus must be strictly positive when present",
+				errors,
+			);
+			require(
+				matches!(
+					stage.fault,
+					Some(FaultContract {
+						reason: FaultReason::ArithmeticDomain,
+						..
+					})
+				),
+				format!("{path}.fault"),
+				"index-map arithmetic requires the preallocated checked fault path",
 				errors,
 			);
 		}
@@ -697,6 +724,7 @@ fn validate_stage_resources(stage: &ProgramStage, path: &str, errors: &mut Vec<P
 		| StageKind::StableSortInitialize { .. }
 		| StageKind::StableSortCompareExchange(_)
 		| StageKind::StableSortFinalize { .. }
+		| StageKind::IndexMap(_)
 		| StageKind::Philox4x32_10(_) => Some(0),
 	};
 	match expected_sync {
@@ -831,6 +859,13 @@ fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds>
 		StageKind::StableSortInitialize { .. } => (0, logical, 0, 0, 16),
 		StageKind::StableSortCompareExchange(_) => (logical, logical, 0, 0, 20),
 		StageKind::StableSortFinalize { .. } => (0, logical, 0, 0, 12),
+		StageKind::IndexMap(_) => (
+			0,
+			logical.checked_mul(INDEX_MAP_INTEGER_OPERATIONS_PER_LANE)?,
+			logical,
+			0,
+			32,
+		),
 		StageKind::Philox4x32_10(contract) => (
 			logical
 				.checked_mul(u64::from(contract.rounds))?

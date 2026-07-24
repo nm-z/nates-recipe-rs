@@ -131,8 +131,23 @@ pub struct Sort {
 	pub emit_indices: bool,
 }
 
+/// Iteration-aware affine int32 source.
+///
+/// Lane `element_index` evaluates
+/// `start + element_index * element_step + loop_iteration * iteration_step`
+/// through checked signed-64 intermediates. Without a modulus, the result must
+/// also fit int32. With a modulus, Recipe applies Euclidean remainder using the
+/// strictly positive modulus before the checked int32 result is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexMap {
+	pub start: i32,
+	pub element_step: i32,
+	pub iteration_step: i32,
+	pub modulus: Option<i32>,
+}
+
 /// Counter key material. The runtime additionally folds in the immutable
-/// `RunId`, kernel ID, and linear element index.
+/// `RunId`, loop iteration, kernel ID, and linear element index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomKey {
 	pub seed_low: u64,
@@ -167,6 +182,7 @@ pub enum PrimitiveKind {
 	Scatter(Scatter),
 	Histogram(Histogram),
 	Sort(Sort),
+	IndexMap(IndexMap),
 	Random(RandomMap),
 }
 
@@ -228,6 +244,7 @@ impl PrimitiveKernel {
 			PrimitiveKind::Scatter(spec) => validate_scatter(self.id, *spec, &inputs, &outputs),
 			PrimitiveKind::Histogram(spec) => validate_histogram(self.id, *spec, &inputs, &outputs),
 			PrimitiveKind::Sort(spec) => validate_sort(self.id, *spec, &inputs, &outputs),
+			PrimitiveKind::IndexMap(spec) => validate_index_map(self.id, *spec, &inputs, &outputs),
 			PrimitiveKind::Random(spec) => validate_random(self.id, *spec, &inputs, &outputs),
 		}
 	}
@@ -294,6 +311,7 @@ impl PrimitiveKernel {
 				let slices = input.shape.elements().checked_div(axis).unwrap_or(0);
 				comparisons.checked_mul(slices)
 			}
+			PrimitiveKind::IndexMap(_) => Some(0),
 			PrimitiveKind::Random(spec) => {
 				let rounds = u64::from(spec.philox_rounds);
 				tensor(self.outputs[0])
@@ -666,6 +684,25 @@ fn validate_sort(id: KernelTemplateId, spec: Sort, inputs: &[&Tensor], outputs: 
 	Ok(())
 }
 
+fn validate_index_map(
+	id: KernelTemplateId,
+	spec: IndexMap,
+	inputs: &[&Tensor],
+	outputs: &[&Tensor],
+) -> LanguageResult<()> {
+	require_arity(id, "index-map input", inputs.len(), 0)?;
+	require_arity(id, "index-map output", outputs.len(), 1)?;
+	require_dtype(id, "index-map output", DType::I32, outputs[0].dtype)?;
+	if spec.modulus.is_some_and(|modulus| modulus <= 0) {
+		return Err(LanguageError::new(
+			LanguageErrorKind::InvalidPrimitive,
+			"index-map modulus must be strictly positive when present",
+		)
+		.for_kernel(id));
+	}
+	Ok(())
+}
+
 fn validate_random(
 	id: KernelTemplateId,
 	spec: RandomMap,
@@ -908,6 +945,35 @@ mod tests {
 		let mut invalid = valid;
 		if let PrimitiveKind::Random(spec) = &mut invalid.kind {
 			spec.philox_rounds = 7;
+		}
+		assert_eq!(
+			invalid.validate(&tensors).unwrap_err().kind,
+			LanguageErrorKind::InvalidPrimitive
+		);
+	}
+
+	#[test]
+	fn index_map_requires_one_int32_output_and_a_positive_modulus() {
+		let tensors = [tensor(1, DType::I32, &[64])];
+		let valid = PrimitiveKernel {
+			id: KernelTemplateId::new(6),
+			inputs: Vec::new(),
+			outputs: vec![ValueId::new(1)],
+			alias_rules: Vec::new(),
+			kind: PrimitiveKind::IndexMap(IndexMap {
+				start: -3,
+				element_step: 1,
+				iteration_step: 64,
+				modulus: Some(101),
+			}),
+		};
+		let tensors = index(&tensors);
+		valid.validate(&tensors).unwrap();
+		assert_eq!(valid.work(&tensors).unwrap(), FlopCount::ZERO);
+
+		let mut invalid = valid;
+		if let PrimitiveKind::IndexMap(spec) = &mut invalid.kind {
+			spec.modulus = Some(0);
 		}
 		assert_eq!(
 			invalid.validate(&tensors).unwrap_err().kind,

@@ -60,6 +60,18 @@ struct PendingKeepalive {
 	_dependencies: Vec<Rc<SignalRecord>>,
 }
 
+impl PendingKeepalive {
+	/// Release every device resource after system-scope terminal completion
+	/// while retaining the preallocated vector storage needed to rearm a loop
+	/// token without allocating.
+	fn release_resources(&mut self) {
+		self._queue = None;
+		self._executable = None;
+		self._allocations.clear();
+		self._dependencies.clear();
+	}
+}
+
 /// Result of one explicit deferred-retirement progress pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetirementReport {
@@ -381,7 +393,6 @@ struct AllocationInner {
 	owner: HsaAgent,
 	pool_index: usize,
 	global_flags: Option<MemoryPoolFlags>,
-	accessible_by_all_agents: bool,
 	accessible_agents: RefCell<Vec<u64>>,
 }
 
@@ -396,17 +407,23 @@ impl AllocationInner {
 	}
 
 	fn is_accessible_by(&self, agent: HsaAgent) -> bool {
-		self.accessible_by_all_agents || self.accessible_agents.borrow().contains(&agent.handle)
+		self.accessible_agents.borrow().contains(&agent.handle)
 	}
 
-	fn record_access_grant(&self, agent: HsaAgent) {
-		let mut agents = self.accessible_agents.borrow_mut();
-		agents.clear();
-		agents.push(self.owner.handle);
-		if agent != self.owner {
-			agents.push(agent.handle);
+	fn record_access_grant(&self, agents: &[HsaAgent]) {
+		*self.accessible_agents.borrow_mut() = exact_access_handles(self.owner, agents);
+	}
+}
+
+fn exact_access_handles(owner: HsaAgent, agents: &[HsaAgent]) -> Vec<u64> {
+	let mut handles = Vec::with_capacity(agents.len().saturating_add(1));
+	handles.push(owner.handle);
+	for agent in agents {
+		if !handles.contains(&agent.handle) {
+			handles.push(agent.handle);
 		}
 	}
+	handles
 }
 
 impl Drop for AllocationInner {
@@ -561,7 +578,6 @@ fn allocate_from<'runtime>(
 			owner,
 			pool_index,
 			global_flags: description.global_flags,
-			accessible_by_all_agents: description.accessible_by_all_agents,
 			accessible_agents: RefCell::new(vec![owner.handle]),
 		}),
 		_runtime: PhantomData,
@@ -583,19 +599,29 @@ fn matching_pool(
 		.ok_or(Error::NoMatchingMemoryPool { kind })
 }
 
-fn grant_access(api: &Api, agent: HsaAgent, allocation: &Allocation<'_>) -> Result<()> {
-	// SAFETY: one valid agent is supplied; flags are reserved and therefore
-	// null; the allocation pointer came from the AMD memory-pool allocator.
+fn grant_access(api: &Api, agents: &[HsaAgent], allocation: &Allocation<'_>) -> Result<()> {
+	let count = u32::try_from(agents.len()).map_err(|_| Error::InvalidDispatch {
+		reason: "HSA access-grant agent count exceeds the public ABI",
+	})?;
+	if count == 0 {
+		return Err(Error::InvalidDispatch {
+			reason: "HSA access-grant set must not be empty",
+		});
+	}
+	// ROCr defines this as replacement, not accumulation: upon return only
+	// these agents plus the pool owner retain direct access.
+	// SAFETY: every agent was discovered from the active runtime; flags are
+	// reserved and therefore null; the pointer came from its pool allocator.
 	let status = unsafe {
 		(api.amd_agents_allow_access)(
-			1,
-			&agent,
+			count,
+			agents.as_ptr(),
 			std::ptr::null(),
 			allocation.as_ptr().cast_const(),
 		)
 	};
 	api.check("hsa_amd_agents_allow_access", status)?;
-	allocation.inner.record_access_grant(agent);
+	allocation.inner.record_access_grant(agents);
 	Ok(())
 }
 
@@ -635,7 +661,11 @@ impl<'runtime> DiscoveredAgent<'runtime> {
 
 	pub fn grant_access(&self, allocation: &Allocation<'_>) -> Result<()> {
 		self.runtime.ensure_active()?;
-		grant_access(&self.runtime.api, self.raw_agent, allocation)
+		grant_access(
+			&self.runtime.api,
+			std::slice::from_ref(&self.raw_agent),
+			allocation,
+		)
 	}
 }
 
@@ -675,7 +705,42 @@ impl<'runtime> Session<'runtime> {
 
 	pub fn grant_access(&self, allocation: &Allocation<'_>) -> Result<()> {
 		self.runtime.ensure_active()?;
-		grant_access(&self.runtime.api, self.raw_agent, allocation)
+		grant_access(
+			&self.runtime.api,
+			std::slice::from_ref(&self.raw_agent),
+			allocation,
+		)
+	}
+
+	/// Replace an allocation's direct-access set with the exact discovered
+	/// sessions and agents supplied here. ROCr always retains the pool owner.
+	pub fn grant_access_exact_set(
+		&self,
+		allocation: &Allocation<'_>,
+		sessions: &[&Session<'runtime>],
+		agents: &[&DiscoveredAgent<'runtime>],
+	) -> Result<()> {
+		self.runtime.ensure_active()?;
+		if !Arc::ptr_eq(&self.runtime.api, &allocation.inner.api)
+			|| sessions
+				.iter()
+				.any(|session| !std::ptr::eq(self.runtime, session.runtime))
+			|| agents
+				.iter()
+				.any(|agent| !std::ptr::eq(self.runtime, agent.runtime))
+		{
+			return Err(Error::InvalidDispatch {
+				reason: "HSA access-grant objects belong to different runtimes",
+			});
+		}
+		let mut exact = sessions
+			.iter()
+			.map(|session| session.raw_agent)
+			.chain(agents.iter().map(|agent| agent.raw_agent))
+			.collect::<Vec<_>>();
+		exact.sort_by_key(|agent| agent.handle);
+		exact.dedup_by_key(|agent| agent.handle);
+		grant_access(&self.runtime.api, &exact, allocation)
 	}
 
 	/// Make one nonblocking pass over the explicit deferred-retirement set.
@@ -1144,21 +1209,28 @@ impl<'session, 'runtime> Pending<'session, 'runtime> {
 		match classify_signal(value) {
 			SignalState::Pending => match self.pool.inner.fault.check() {
 				Ok(()) => Ok(PollStatus::Pending),
-				Err(error) => {
-					self.terminal = Some(Err(error.clone()));
-					Err(error)
-				}
+				// A queue callback can poison the session before this operation's
+				// completion signal reaches a terminal value. Keep the operation
+				// nonterminal so Drop moves its signal and every referenced
+				// resource into deferred retirement instead of releasing objects
+				// the device may still reference.
+				Err(error) => Err(error),
 			},
 			SignalState::Complete => {
 				signal.mark_terminal(0);
 				signal.release_retirement_reservation();
+				if let Some(keepalive) = &mut self.keepalive {
+					keepalive.release_resources();
+				}
 				let terminal = self.pool.inner.fault.check();
 				self.terminal = Some(terminal.clone());
 				terminal.map(|()| PollStatus::Complete)
 			}
 			SignalState::Failed(value) => {
 				self.pool.fail(signal, value);
-				drop(self.keepalive.take());
+				if let Some(keepalive) = &mut self.keepalive {
+					keepalive.release_resources();
+				}
 				let error = Error::AsyncSignal { value };
 				self.terminal = Some(Err(error.clone()));
 				Err(error)
@@ -1285,10 +1357,7 @@ impl<'session, 'runtime> PreparedPending<'session, 'runtime> {
 	}
 
 	fn restore_ready(&mut self, signal: Rc<SignalRecord>, mut keepalive: PendingKeepalive) {
-		keepalive._queue = None;
-		keepalive._executable = None;
-		keepalive._allocations.clear();
-		keepalive._dependencies.clear();
+		keepalive.release_resources();
 		self.state = PreparedPendingState::Ready { signal, keepalive };
 	}
 
@@ -2536,6 +2605,27 @@ mod tests {
 	}
 
 	#[test]
+	fn terminal_keepalive_release_preserves_preallocated_rearm_storage() {
+		let allocations = Vec::with_capacity(2);
+		let dependencies = Vec::with_capacity(3);
+		let allocation_storage = allocations.as_ptr();
+		let dependency_storage = dependencies.as_ptr();
+		let mut keepalive = PendingKeepalive {
+			_queue: None,
+			_executable: None,
+			_allocations: allocations,
+			_dependencies: dependencies,
+		};
+
+		keepalive.release_resources();
+
+		assert_eq!(keepalive._allocations.capacity(), 2);
+		assert_eq!(keepalive._dependencies.capacity(), 3);
+		assert_eq!(keepalive._allocations.as_ptr(), allocation_storage);
+		assert_eq!(keepalive._dependencies.as_ptr(), dependency_storage);
+	}
+
+	#[test]
 	fn duration_conversion_is_bounded_and_nonzero() {
 		assert_eq!(
 			duration_to_ticks(Duration::from_millis(1), 1_000_000_000),
@@ -2547,5 +2637,31 @@ mod tests {
 	#[test]
 	fn copy_range_overflow_is_rejected() {
 		assert!(check_range("test", usize::MAX, 2, usize::MAX).is_err());
+	}
+
+	#[test]
+	fn exact_access_grant_replaces_with_owner_and_deduplicated_agents() {
+		let owner = HsaAgent { handle: 7 };
+		let first = HsaAgent { handle: 11 };
+		let second = HsaAgent { handle: 13 };
+		assert_eq!(
+			exact_access_handles(owner, &[first, owner, second, first]),
+			vec![7, 11, 13]
+		);
+		assert_eq!(exact_access_handles(owner, &[second]), vec![7, 13]);
+	}
+
+	#[test]
+	fn exact_arena_and_host_staging_grants_are_mutually_accessible() {
+		let gpu = HsaAgent { handle: 7 };
+		let peer_gpu = HsaAgent { handle: 11 };
+		let cpu = HsaAgent { handle: 13 };
+		let arena_access = exact_access_handles(gpu, &[gpu, peer_gpu, cpu]);
+		let staging_access = exact_access_handles(cpu, &[gpu]);
+
+		assert!(arena_access.contains(&cpu.handle));
+		assert!(arena_access.contains(&peer_gpu.handle));
+		assert!(staging_access.contains(&gpu.handle));
+		assert!(!staging_access.contains(&peer_gpu.handle));
 	}
 }

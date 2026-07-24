@@ -269,14 +269,18 @@ impl MathFunction {
 			Self::RoundNearestEven => "recipe.math.rne.scalar-primitive-f32",
 			Self::Trunc => "recipe.math.trunc.floor-ceil-select-f32",
 			Self::Fmod => "recipe.math.fmod.ieee-remainder-f32",
-			Self::Pow => "recipe.math.pow.log-exp-v1-f32",
+			Self::Pow => "recipe.math.pow.log-exp-subnormal-v2-f32",
 			Self::Sign => "recipe.math.sign.ordered-select-f32",
 			Self::Sigmoid => "recipe.math.sigmoid.stable-exp-f32",
 			Self::Tanh => "recipe.math.tanh.stable-expm1-f32",
 			Self::Softplus => "recipe.math.softplus.stable-log1p-f32",
 			Self::Erf => "recipe.math.erf.as-7.1.26-f32",
 		};
-		AlgorithmIdentity { name, version: 1 }
+		let version = match self {
+			Self::Pow => 2,
+			_ => 1,
+		};
+		AlgorithmIdentity { name, version }
 	}
 
 	const fn domain(self) -> FiniteDomain {
@@ -323,7 +327,7 @@ impl MathFunction {
 			},
 			Self::Pow => FiniteDomain {
 				inputs: POW_INPUTS,
-				relation: "base > 0 and |exponent * log(base)| <= 80",
+				relation: "base > 0 and exponent * log(base) <= 80; binary32 underflow rounds to positive zero",
 			},
 			Self::Tanh => FiniteDomain {
 				inputs: TANH_X,
@@ -412,7 +416,7 @@ impl MathFunction {
 			Self::Pow => ErrorBound {
 				maximum_absolute: 3.0e-5,
 				maximum_relative: 2.0e-4,
-				note: "composed positive-base log and exp contracts",
+				note: "positive-base log plus split-scale exp reconstruction through binary32 subnormals",
 			},
 			Self::Sigmoid => ErrorBound {
 				maximum_absolute: 4.0e-6,

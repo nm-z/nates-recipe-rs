@@ -101,11 +101,11 @@ impl<'a> ProbeEngine<'a> {
 			gpu: gpu_measurements,
 			peers: peer_measurements,
 		};
-		let topology_digest = build_profile_digest("recipe-topology-v5", cache_identity, &measurements);
+		let topology_digest = build_profile_digest("recipe-topology-v6", cache_identity, &measurements);
 		let topology_identity = TopologyIdentity::new(topology_digest);
 		let topology = build_topology(topology_identity, &host, &gpus, &measurements)?;
 		let origins = build_origins(&host, &gpus, &measurements);
-		let discovery_digest = build_profile_digest("recipe-discovery-v5", cache_identity, &measurements);
+		let discovery_digest = build_profile_digest("recipe-discovery-v6", cache_identity, &measurements);
 		let discovery = build_discovery(
 			DiscoveryIdentity::new(discovery_digest),
 			&topology,
@@ -333,6 +333,12 @@ fn validate_gpu_inventory(host: &HostInventory, devices: &[GpuDescriptor]) -> Pr
 		if !device.asynchronous_submission {
 			return Err(ProbeError::Discovery(format!(
 				"GPU {} has no asynchronous submission path",
+				device.key
+			)));
+		}
+		if device.maximum_submission_queues == 0 {
+			return Err(ProbeError::Discovery(format!(
+				"GPU {} reports zero submission queue capacity",
 				device.key
 			)));
 		}
@@ -566,7 +572,7 @@ fn build_cache_identity(
 	gpus: &[GpuDescriptor],
 	peers: &[(&dyn PeerSession, PeerDescriptor)],
 ) -> CacheIdentity {
-	let mut digest = CanonicalDigest::new("recipe-probe-cache-v5", PROFILE_SCHEMA);
+	let mut digest = CanonicalDigest::new("recipe-probe-cache-v6", PROFILE_SCHEMA);
 	hash_seed(&mut digest, seed);
 	hash_machine(&mut digest, &host.machine);
 	for ram in &host.ram {
@@ -622,6 +628,7 @@ fn build_cache_identity(
 		digest.string(gpu.toolchain.version.as_str());
 		digest.digest(gpu.toolchain.digest);
 		digest.bool(gpu.asynchronous_submission);
+		digest.u64(u64::from(gpu.maximum_submission_queues));
 		digest.u64(u64::from(gpu.maximum_concurrent_tasks));
 		digest.bool(gpu.transfer_overlaps_calculation);
 		digest.bool(gpu.duplex == LinkDuplex::Full);
@@ -1124,6 +1131,7 @@ fn build_discovery(
 		devices.push(DiscoveredDevice {
 			device: ids.ram[&domain.key],
 			available: true,
+			maximum_submission_queues: domain.maximum_inflight_transfers.get(),
 			total_capacity: measurement.capacity,
 			transfer: TransferCapability {
 				rate: measurement.transfer_rate,
@@ -1139,6 +1147,11 @@ fn build_discovery(
 		devices.push(DiscoveredDevice {
 			device: ids.storage[&domain.key],
 			available: true,
+			maximum_submission_queues: min_lanes(
+				domain.maximum_concurrent_reads,
+				domain.maximum_concurrent_writes,
+			)
+			.get(),
 			total_capacity: measurement.capacity,
 			transfer: TransferCapability {
 				rate: measured(min_rate(
@@ -1160,6 +1173,7 @@ fn build_discovery(
 		devices.push(DiscoveredDevice {
 			device: ids.gpu[&descriptor.key],
 			available: true,
+			maximum_submission_queues: descriptor.maximum_submission_queues,
 			total_capacity: measurement.capacity,
 			transfer: TransferCapability {
 				rate: measurement.memory_rate,
@@ -1182,6 +1196,11 @@ fn build_discovery(
 		devices.push(DiscoveredDevice {
 			device: ids.peer_ram[&peer.session_id],
 			available: true,
+			maximum_submission_queues: min_lanes(
+				peer.outbound_maximum_inflight,
+				peer.inbound_maximum_inflight,
+			)
+			.get(),
 			total_capacity: measurement.remote_memory_capacity,
 			transfer: TransferCapability {
 				rate: measurement.remote_memory_rate,
@@ -1354,6 +1373,7 @@ mod tests {
 				host_to_device_maximum_inflight: lanes(2),
 				device_to_host_maximum_inflight: lanes(2),
 				asynchronous_submission: true,
+				maximum_submission_queues: 2,
 				maximum_concurrent_tasks: 2,
 				transfer_overlaps_calculation: true,
 			};
@@ -1789,6 +1809,22 @@ mod tests {
 			.unwrap();
 		assert_ne!(first.cache_identity, second.cache_identity);
 		assert!(!first.is_cache_valid_for(second.cache_identity));
+	}
+
+	#[test]
+	fn changed_submission_queue_limit_invalidates_cache_identity() {
+		let host = FakeHost.discover_host().unwrap();
+		let mut gpus = FakeGpuDiscovery {
+			driver: "driver-1",
+			exhaustive: true,
+		}
+		.discover_all()
+		.unwrap()
+		.devices;
+		let first = build_cache_identity(&seed(), &host, &gpus, &[]);
+		gpus[0].maximum_submission_queues += 1;
+		let second = build_cache_identity(&seed(), &host, &gpus, &[]);
+		assert_ne!(first, second);
 	}
 
 	#[test]

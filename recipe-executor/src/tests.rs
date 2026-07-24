@@ -32,6 +32,10 @@ struct FakeBackend {
 	metric_values: BTreeMap<TaskId, MetricValue>,
 	next_resource: u64,
 	completed_lifecycles: u64,
+	repeatable: bool,
+	loop_submissions: u64,
+	iteration_checksum: u64,
+	maximum_iteration: Option<u64>,
 }
 
 impl FakeBackend {
@@ -41,7 +45,16 @@ impl FakeBackend {
 			metric_values: BTreeMap::new(),
 			next_resource: 1,
 			completed_lifecycles: 0,
+			repeatable: false,
+			loop_submissions: 0,
+			iteration_checksum: 0,
+			maximum_iteration: None,
 		}
+	}
+
+	fn repeatable(mut self) -> Self {
+		self.repeatable = true;
+		self
 	}
 
 	fn with_script(mut self, task: TaskId, script: impl IntoIterator<Item = FakeStep>) -> Self {
@@ -156,6 +169,10 @@ impl Backend for FakeBackend {
 		})
 	}
 
+	fn supports_loop_repetition(&self) -> bool {
+		self.repeatable
+	}
+
 	fn submit(
 		&mut self,
 		resource: &mut Self::Resource,
@@ -258,6 +275,31 @@ impl Backend for FakeBackend {
 		};
 		pending.metric = metric;
 		Ok(())
+	}
+
+	fn submit_loop_iteration(
+		&mut self,
+		resource: &mut Self::Resource,
+		arenas: ArenaSet<'_, Self::Arena>,
+		pending: &mut Self::Pending,
+		iteration: LoopIteration,
+		work: BackendWork<'_>,
+		physical_calls: &mut PhysicalCallBatch,
+	) -> std::result::Result<(), Self::Error> {
+		match work {
+			BackendWork::Calculation(calculation) => assert_eq!(calculation.iteration, iteration),
+			BackendWork::Metric(metric) => assert_eq!(metric.iteration, iteration),
+			BackendWork::InternalTransfer(_) => {}
+			BackendWork::InitAdmission(_) | BackendWork::ExitTransfer(_) => {
+				panic!("non-loop work reached loop submission")
+			}
+		}
+		self.loop_submissions = self.loop_submissions.saturating_add(1);
+		self.iteration_checksum = self.iteration_checksum.saturating_add(iteration.index());
+		self.maximum_iteration = Some(self
+			.maximum_iteration
+			.map_or(iteration.index(), |current| current.max(iteration.index())));
+		self.submit(resource, arenas, pending, work, physical_calls)
 	}
 
 	fn poll(
@@ -368,7 +410,11 @@ fn property<T>(value: T) -> Property<T> {
 	Property::new(value, PropertyProvenance::Override)
 }
 
-fn build_fixture(checked: bool) -> FinalizedBundle {
+fn build_fixture_with_iteration_domain(
+	checked: bool,
+	loop_iterations: LoopIterations,
+	iteration_domain: Option<IterationDomain>,
+) -> FinalizedBundle {
 	let machine = MachineId::new(1);
 	let topology_id = TopologyIdentity::new(digest(1));
 	let target = TargetIdentity {
@@ -440,6 +486,7 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 			DiscoveredDevice {
 				device: GPU,
 				available: true,
+				maximum_submission_queues: 64,
 				total_capacity: property(ByteCount::new(12_000_000_000)),
 				transfer: TransferCapability {
 					rate: property(BytesPerSecond::new(432_000_000_000).unwrap()),
@@ -457,6 +504,7 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 			DiscoveredDevice {
 				device: RAM,
 				available: true,
+				maximum_submission_queues: 64,
 				total_capacity: property(ByteCount::new(48_000_000_000)),
 				transfer: TransferCapability {
 					rate: property(BytesPerSecond::new(90_000_000_000).unwrap()),
@@ -780,6 +828,10 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 				metric: fault_metric_id,
 				value: fault_flag,
 				slot: FAULT_SLOT,
+				submission: SubmissionSlots {
+					queue: queue_gpu,
+					completion: completion_gpu,
+				},
 			}),
 		}))
 		.chain([
@@ -793,6 +845,10 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 					metric: metric_id,
 					value: value_gpu,
 					slot: METRIC_SLOT,
+					submission: SubmissionSlots {
+						queue: queue_gpu,
+						completion: completion_gpu,
+					},
 				}),
 			},
 			Task {
@@ -805,6 +861,10 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 					metric: metric_id,
 					value: value_gpu,
 					slot: METRIC_SLOT,
+					submission: SubmissionSlots {
+						queue: queue_gpu,
+						completion: completion_gpu,
+					},
 				}),
 			},
 			Task {
@@ -917,12 +977,16 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 				name: label("user-gpu"),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::HeldAllocation,
+				evidence: ReservationEvidence::GpuDisplay {
+					enabled_connectors: 1,
+				},
 			},
 			ReservationEntry {
 				device: RAM,
 				name: label("user-ram"),
 				bytes: EXACT_USER_RESERVATION,
 				mechanism: ReservationMechanism::EnforcedQuota,
+				evidence: ReservationEvidence::NonGpu,
 			},
 		],
 	};
@@ -977,15 +1041,47 @@ fn build_fixture(checked: bool) -> FinalizedBundle {
 		},
 	];
 
-	FinalizedBundle::finalize(
-		BundleIdentity::new(digest(8)),
-		&topology,
-		&discovery,
-		draft,
-		realization,
-		layouts,
-	)
-	.unwrap()
+	match iteration_domain {
+		Some(domain) => {
+			let loop_domains = draft
+				.tasks
+				.iter()
+				.filter(|task| task.phase == RunPhase::Loop)
+				.map(|task| LoopTaskDomain {
+					task: task.id,
+					domain,
+				})
+				.collect();
+			FinalizedBundle::finalize_with_loop_schedule(
+				BundleIdentity::new(digest(8)),
+				&topology,
+				&discovery,
+				draft,
+				realization,
+				layouts,
+				LoopSchedule::new(loop_iterations, loop_domains),
+			)
+			.unwrap()
+		}
+		None => FinalizedBundle::finalize_with_loop_iterations(
+			BundleIdentity::new(digest(8)),
+			&topology,
+			&discovery,
+			draft,
+			realization,
+			layouts,
+			loop_iterations,
+		)
+		.unwrap(),
+	}
+}
+
+fn build_fixture_with_iterations(checked: bool, loop_iterations: LoopIterations) -> FinalizedBundle {
+	build_fixture_with_iteration_domain(checked, loop_iterations, None)
+}
+
+fn build_fixture(checked: bool) -> FinalizedBundle {
+	build_fixture_with_iterations(checked, LoopIterations::ONE)
 }
 
 fn fixture() -> FinalizedBundle {
@@ -1181,6 +1277,57 @@ fn watchdog_detects_bounded_nonprogress() {
 }
 
 #[test]
+fn pending_polls_use_exact_fixed_task_counters_instead_of_journal_growth() {
+	let mut steps = vec![FakeStep::Pending; 40];
+	steps.push(FakeStep::Complete);
+	let initialized = initialized(
+		FakeBackend::new().with_script(CALCULATION, steps),
+		Watchdog::new(64).unwrap(),
+		23,
+	);
+	let mut running = initialized.start_loop().unwrap();
+	let capacities = running.capacities();
+	running.wait().unwrap();
+
+	assert_eq!(running.capacities(), capacities);
+	assert_eq!(running.journal().pending_poll_count(CALCULATION), Some(40));
+	assert_eq!(
+		running
+			.journal()
+			.physical_calls()
+			.iter()
+			.filter(|call| {
+				matches!(
+					call,
+					PhysicalCall::Poll {
+						task: CALCULATION,
+						status: PhysicalPollStatus::Pending,
+					}
+				)
+			})
+			.count(),
+		1
+	);
+	assert_eq!(
+		running
+			.journal()
+			.physical_calls()
+			.iter()
+			.filter(|call| {
+				matches!(
+					call,
+					PhysicalCall::Poll {
+						task: CALCULATION,
+						status: PhysicalPollStatus::Complete,
+					}
+				)
+			})
+			.count(),
+		1
+	);
+}
+
+#[test]
 fn running_loop_never_allocates_or_admits_external_data() {
 	let initialized = initialized(FakeBackend::new(), Watchdog::new(4).unwrap(), 5);
 	let allocations_before = initialized
@@ -1223,6 +1370,7 @@ fn metric_slots_coalesce_to_the_latest_unconsumed_value() {
 	assert_eq!(exited_loop.metric_mailbox().capacity(), 1);
 	assert_eq!(exited_loop.metric_mailbox().pending_len(), 1);
 	let sample = exited_loop.try_take_metric(METRIC_SLOT).unwrap();
+	assert_eq!(sample.iteration.index(), 0);
 	assert_eq!(sample.task, METRIC_NEW);
 	assert_eq!(sample.value, MetricValue::F32(2.0));
 	let replacements = exited_loop
@@ -1247,6 +1395,7 @@ fn zero_fault_readback_gates_dependents_without_entering_the_user_mailbox() {
 	assert_eq!(exited_loop.metric_mailbox().capacity(), 1);
 	assert_eq!(exited_loop.metric_mailbox().pending_len(), 1);
 	let sample = exited_loop.try_take_metric(METRIC_SLOT).unwrap();
+	assert_eq!(sample.iteration.index(), 0);
 	assert_eq!(sample.task, METRIC_NEW);
 	assert_eq!(sample.value, MetricValue::F32(2.0));
 
@@ -1420,6 +1569,156 @@ fn loop_progress_preserves_every_preallocated_capacity() {
 	assert_eq!(running.capacities(), capacities);
 	assert_eq!(running.poll().unwrap(), LoopStatus::Complete);
 	assert_eq!(running.capacities(), capacities);
+}
+
+#[test]
+fn finalized_loop_repeats_without_repeating_init_exit_or_runtime_allocation() {
+	let iterations = LoopIterations::new(3).unwrap();
+	let bundle = build_fixture_with_iterations(false, iterations);
+	assert_eq!(bundle.loop_iterations(), iterations);
+	let prepared = PreparedRun::prepare(
+		RunId::new(20),
+		bundle,
+		FakeBackend::new().repeatable(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap();
+	let initialized = prepared.initialize(images()).unwrap();
+	let mut running = initialized.start_loop().unwrap();
+	let capacities = running.capacities();
+	assert_eq!(running.current_iteration().index(), 0);
+	running.wait().unwrap();
+	assert_eq!(running.capacities(), capacities);
+	assert_eq!(running.current_iteration().index(), 2);
+
+	let mut exited_loop = running
+		.into_exited_loop()
+		.unwrap_or_else(|_| panic!("repeated loop did not transition"));
+	let sample = exited_loop.try_take_metric(METRIC_SLOT).unwrap();
+	assert_eq!(sample.iteration.index(), 2);
+	let exited = exited_loop.exit().unwrap();
+	let (backend, _, _, journal) = exited.into_parts();
+
+	assert_eq!(backend.completed_lifecycles, 1);
+	assert_eq!(backend.loop_submissions, 12);
+	assert_eq!(backend.iteration_checksum, 12);
+	assert_eq!(backend.maximum_iteration, Some(2));
+	assert_eq!(
+		journal
+			.logical_events()
+			.iter()
+			.filter(|event| matches!(event, LogicalEvent::InitAdmission { .. }))
+			.count(),
+		2
+	);
+	assert_eq!(
+		journal
+			.physical_calls()
+			.iter()
+			.filter(|call| matches!(call, PhysicalCall::SubmitExitTransfer { task: EXIT_GPU }))
+			.count(),
+		1
+	);
+	let started = journal
+		.logical_events()
+		.iter()
+		.filter_map(|event| match event {
+			LogicalEvent::LoopIterationStarted { iteration, .. } => Some(iteration.index()),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	let completed = journal
+		.logical_events()
+		.iter()
+		.filter_map(|event| match event {
+			LogicalEvent::LoopIterationCompleted { iteration, .. } => Some(iteration.index()),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(started, [0, 1, 2]);
+	assert_eq!(completed, [0, 1, 2]);
+	for task in [CALCULATION, INTERNAL_TRANSFER, METRIC_OLD, METRIC_NEW] {
+		assert_eq!(
+			journal
+				.logical_events()
+				.iter()
+				.filter(|event| {
+					matches!(
+						event,
+						LogicalEvent::TaskCompleted {
+							phase: RunPhase::Loop,
+							task: completed,
+						} if *completed == task
+					)
+				})
+				.count(),
+			3
+		);
+	}
+}
+
+#[test]
+fn inactive_domain_tasks_complete_without_backend_submission() {
+	let iterations = LoopIterations::new(3).unwrap();
+	let domain = IterationDomain::new(1, 2, 1).unwrap();
+	let bundle = build_fixture_with_iteration_domain(false, iterations, Some(domain));
+	let prepared = PreparedRun::prepare(
+		RunId::new(22),
+		bundle,
+		FakeBackend::new().repeatable(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap();
+	let initialized = prepared.initialize(images()).unwrap();
+	let mut running = initialized.start_loop().unwrap();
+	let capacities = running.capacities();
+	running.wait().unwrap();
+	assert_eq!(running.capacities(), capacities);
+	let mut exited_loop = running
+		.into_exited_loop()
+		.unwrap_or_else(|_| panic!("sparse loop did not transition"));
+	let sample = exited_loop.try_take_metric(METRIC_SLOT).unwrap();
+	assert_eq!(sample.iteration.index(), 1);
+	let exited = exited_loop.exit().unwrap();
+	let (backend, _, _, journal) = exited.into_parts();
+
+	assert_eq!(backend.loop_submissions, 4);
+	assert_eq!(backend.iteration_checksum, 4);
+	assert_eq!(backend.maximum_iteration, Some(1));
+	for task in [CALCULATION, INTERNAL_TRANSFER, METRIC_OLD, METRIC_NEW] {
+		assert_eq!(
+			journal
+				.logical_events()
+				.iter()
+				.filter(|event| {
+					matches!(
+						event,
+						LogicalEvent::TaskCompleted {
+							phase: RunPhase::Loop,
+							task: completed,
+						} if *completed == task
+					)
+				})
+				.count(),
+			3
+		);
+	}
+}
+
+#[test]
+fn repeated_loop_rejects_a_one_shot_backend_before_resource_binding() {
+	let iterations = LoopIterations::new(2).unwrap();
+	let error = PreparedRun::prepare(
+		RunId::new(21),
+		build_fixture_with_iterations(false, iterations),
+		FakeBackend::new(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap_err();
+	assert_eq!(
+		error,
+		ExecutorError::LoopRepetitionUnsupported { iterations }
+	);
 }
 
 #[test]

@@ -375,6 +375,32 @@ pub fn lower_scalar(descriptor: OperationDescriptor) -> OperationResult<ScalarPr
 	Ok(program)
 }
 
+pub(crate) fn binary_cross_entropy_with_logits_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let logit = composer.input(DType::F32)?;
+	let target = composer.input(DType::F32)?;
+
+	let target_is_finite = composer.unary(ScalarOpcode::IsFinite, target)?;
+	composer.unary(ScalarOpcode::Require, target_is_finite)?;
+	let zero = composer.f32(0.0)?;
+	let one = composer.f32(1.0)?;
+	let target_is_nonnegative = composer.binary(ScalarOpcode::GreaterThanOrEqual, target, zero)?;
+	composer.unary(ScalarOpcode::Require, target_is_nonnegative)?;
+	let target_is_at_most_one = composer.binary(ScalarOpcode::LessThanOrEqual, target, one)?;
+	composer.unary(ScalarOpcode::Require, target_is_at_most_one)?;
+
+	// softplus(logit) is Recipe's owned stable
+	// max(logit, 0) + log1p(exp(-abs(logit))) implementation. Both math
+	// programs are inlined into this program so every scalar value remains in
+	// one owned SSA identity space.
+	let softplus = composer.inline_math(MathFunction::Softplus, &[logit])?;
+	let weighted_logit = composer.binary(ScalarOpcode::Multiply, logit, target)?;
+	let loss = composer.binary(ScalarOpcode::Subtract, softplus, weighted_logit)?;
+	let sigmoid = composer.inline_math(MathFunction::Sigmoid, &[logit])?;
+	let gradient = composer.binary(ScalarOpcode::Subtract, sigmoid, target)?;
+	composer.finish(&[loss, gradient])
+}
+
 fn lower_composite(composite: CompositeScalar) -> OperationResult<ScalarProgram> {
 	let mut composer = Composer::new();
 	let values = composer.inputs(composite.inputs())?;

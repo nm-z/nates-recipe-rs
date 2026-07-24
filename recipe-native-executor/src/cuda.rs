@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use recipe_core::{
 	ArenaLayout, ArtifactId, BundleIdentity, ByteCount, CompletionSlotId, DeviceId, DraftPlan, FinalizedBundle,
-	InitDataImage, LinkId, QueueSlotId, ReservationLedger, ReservationMechanism, ResolvedTransferEndpoint,
-	ResolvedValueLocation, ResourceManifest, RunPhase, SubmissionSlots, Task, TaskId, TaskKind, TransferLaneClaim,
-	ValueId,
+	InitDataImage, LinkId, LoopIteration, QueueSlotId, ReservationLedger, ReservationMechanism,
+	ResolvedTransferEndpoint, ResolvedValueLocation, ResourceManifest, RunPhase, SubmissionSlots, Task, TaskId,
+	TaskKind, TransferLaneClaim, ValueId,
 };
 use recipe_cuda::{
 	CompletionStatus, Context, DeploymentIdentity, DeviceBuffer, Event, Function, LaunchConfig, Module, Pending,
@@ -18,11 +18,17 @@ use recipe_executor::{
 	ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork, MetricValue, MetricWork,
 	PendingRequest, PhysicalCall, PhysicalCallBatch, PhysicalPollStatus, TransferWork, WorkClass, sealed,
 };
-use recipe_kernel::{KernelArgument, inspect_cubin};
+use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_cubin};
 
 use crate::cuda_ffi::ParameterBlock;
+use crate::error::ensure_submission_queue_capacity;
 use crate::plan::InitImageContract;
 use crate::{Error, ExecutionPlan, Result, RuntimeArtifactKind};
+
+/// CUDA Driver API exposes no finite device stream-count attribute. Recipe
+/// therefore reports and enforces this bounded native-executor ceiling rather
+/// than claiming an unbounded or hardware-measured stream capacity.
+pub const CUDA_MAXIMUM_SUBMISSION_QUEUES: u32 = 32;
 
 fn consume_context<T>(context: T) {
 	drop(context);
@@ -33,21 +39,59 @@ pub struct CudaBinding<'context> {
 	device: DeviceId,
 	context: &'context Context,
 	deployment: DeploymentIdentity,
+	maximum_submission_queues: u32,
+	enabled_display_connectors: u32,
 }
 
 impl<'context> CudaBinding<'context> {
 	#[must_use]
-	pub const fn new(device: DeviceId, context: &'context Context, deployment: DeploymentIdentity) -> Self {
+	pub const fn new(
+		device: DeviceId,
+		context: &'context Context,
+		deployment: DeploymentIdentity,
+		maximum_submission_queues: u32,
+		enabled_display_connectors: u32,
+	) -> Self {
 		Self {
 			device,
 			context,
 			deployment,
+			maximum_submission_queues,
+			enabled_display_connectors,
 		}
 	}
 
 	#[must_use]
 	pub const fn device(&self) -> DeviceId {
 		self.device
+	}
+
+	/// Exact deployment identity observed while this binding's CUDA context
+	/// was reopened.
+	#[must_use]
+	pub const fn deployment(&self) -> &DeploymentIdentity {
+		&self.deployment
+	}
+
+	#[must_use]
+	pub const fn maximum_submission_queues(&self) -> u32 {
+		self.maximum_submission_queues
+	}
+
+	#[must_use]
+	pub const fn enabled_display_connectors(&self) -> u32 {
+		self.enabled_display_connectors
+	}
+
+	/// Queries the CUDA driver's current free-memory counter for this exact
+	/// binding before any candidate resources are realized.
+	pub fn available_bytes(&self) -> Result<ByteCount> {
+		let info = self.context.memory_info()?;
+		let bytes = u64::try_from(info.free_bytes).map_err(|_| Error::ArenaMismatch {
+			device: self.device,
+			detail: "CUDA free-memory counter does not fit Recipe byte units",
+		})?;
+		Ok(ByteCount::new(bytes))
 	}
 
 	pub(crate) const fn context(&self) -> &'context Context {
@@ -61,6 +105,11 @@ impl fmt::Debug for CudaBinding<'_> {
 			.debug_struct("CudaBinding")
 			.field("device", &self.device)
 			.field("deployment", &self.deployment)
+			.field("maximum_submission_queues", &self.maximum_submission_queues)
+			.field(
+				"enabled_display_connectors",
+				&self.enabled_display_connectors,
+			)
 			.finish_non_exhaustive()
 	}
 }
@@ -116,21 +165,7 @@ impl fmt::Debug for CudaArena<'_> {
 
 struct LoadedArtifact<'context> {
 	function: Function<'context, 'context>,
-	module: Box<Module<'context>>,
 	abi: recipe_kernel::KernelAbi,
-}
-
-impl LoadedArtifact<'_> {
-	fn close(self) -> Result<()> {
-		let Self {
-			function,
-			module,
-			abi,
-		} = self;
-		drop(function);
-		drop(abi);
-		module.unload().map_err(Error::from)
-	}
 }
 
 impl fmt::Debug for LoadedArtifact<'_> {
@@ -168,13 +203,13 @@ struct DeviceResources<'context> {
 	queues: BTreeMap<QueueSlotId, Stream<'context>>,
 	completions: BTreeMap<CompletionSlotId, CompletionEvent<'context>>,
 	artifacts: BTreeMap<ArtifactId, LoadedArtifact<'context>>,
+	modules: BTreeMap<ArtifactDigest, Box<Module<'context>>>,
 	invocations: BTreeMap<CompletionSlotId, ParameterBlock>,
 	metric_buffers: BTreeMap<TaskId, PinnedHostBuffer<'context>>,
 	staging: PinnedHostBuffer<'context>,
 	admission: Option<InitImageContract>,
 	egress: BTreeMap<TaskId, Vec<u8>>,
 	scratch: Option<DeviceBuffer<'context>>,
-	reservation: DeviceBuffer<'context>,
 }
 
 impl fmt::Debug for DeviceResources<'_> {
@@ -185,6 +220,7 @@ impl fmt::Debug for DeviceResources<'_> {
 			.field("queue_count", &self.queues.len())
 			.field("completion_count", &self.completions.len())
 			.field("artifact_count", &self.artifacts.len())
+			.field("module_count", &self.modules.len())
 			.field("metric_buffer_count", &self.metric_buffers.len())
 			.field("staging_bytes", &self.staging.len())
 			.field("admission", &self.admission)
@@ -193,7 +229,6 @@ impl fmt::Debug for DeviceResources<'_> {
 				"scratch_bytes",
 				&self.scratch.as_ref().map(DeviceBuffer::len),
 			)
-			.field("reservation_bytes", &self.reservation.len())
 			.finish()
 	}
 }
@@ -214,6 +249,10 @@ pub(crate) struct CudaPreparedResources<'context> {
 #[derive(Debug)]
 enum CudaPreparedHandoff {
 	Candidate(Vec<crate::RuntimeArtifact>),
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	Finalized {
 		bundle: BundleIdentity,
 		tasks: BTreeSet<TaskId>,
@@ -228,6 +267,10 @@ enum CudaBackendState<'context> {
 		bindings: Vec<CudaBinding<'context>>,
 		artifacts: Vec<crate::RuntimeArtifact>,
 	},
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	Prepared(CudaPreparedResources<'context>),
 	Warmed(CudaResources<'context>),
 	Bound,
@@ -248,6 +291,10 @@ impl<'context> CudaBackend<'context> {
 		}
 	}
 
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	pub(crate) const fn from_prepared(resources: CudaPreparedResources<'context>) -> Self {
 		Self {
 			state: CudaBackendState::Prepared(resources),
@@ -355,6 +402,14 @@ impl<'context> CudaResources<'context> {
 			.filter(|task| tasks.is_none_or(|selected| selected.contains(&task.id)))
 			.cloned()
 			.collect::<Vec<_>>();
+		for binding in binding_by_device.values() {
+			ensure_submission_queue_capacity(
+				"CUDA Driver",
+				binding.device,
+				requested_submission_queue_count(bundle.resources(), &scoped_tasks, binding.device),
+				binding.maximum_submission_queues,
+			)?;
+		}
 		for (device, binding) in binding_by_device {
 			validate_binding(&binding)?;
 			let resources = realize_device(
@@ -844,6 +899,41 @@ impl<'context> CudaResources<'context> {
 		Ok(BackendPoll::Complete { metric })
 	}
 
+	pub(crate) fn rearm_pending(&mut self, pending: &mut CudaPending<'context>) -> Result<()> {
+		self.ensure_healthy()?;
+		ensure(
+			pending.phase == RunPhase::Loop
+				&& pending.terminal && matches!(pending.native, NativePendingState::Terminal),
+			Error::Protocol {
+				task: pending.task,
+				detail: "only a terminal CUDA loop token may be rearmed",
+			},
+		)?;
+		pending.native = NativePendingState::Ready;
+		pending.action = PendingAction::None;
+		pending.terminal = false;
+		Ok(())
+	}
+
+	pub(crate) fn prepare_loop_pending(&mut self, pending: &mut CudaPending<'context>) -> Result<()> {
+		self.ensure_healthy()?;
+		ensure(
+			pending.phase == RunPhase::Loop,
+			Error::Protocol {
+				task: pending.task,
+				detail: "only a CUDA loop token may be prepared for loop submission",
+			},
+		)?;
+		match pending.loop_submission_action() {
+			Some(LoopSubmissionAction::UsePrepared) => Ok(()),
+			Some(LoopSubmissionAction::Rearm) => self.rearm_pending(pending),
+			None => Err(Error::Protocol {
+				task: pending.task,
+				detail: "an active CUDA loop token may not be submitted again",
+			}),
+		}
+	}
+
 	pub(crate) fn recycle_pending(&mut self, pending: CudaPending<'context>) -> Result<()> {
 		self.ensure_healthy()?;
 		ensure(
@@ -870,11 +960,7 @@ impl<'context> CudaResources<'context> {
 		Ok(ByteCount::new(bytes))
 	}
 
-	pub(crate) fn validate_handoff(
-		&mut self,
-		bundle: &FinalizedBundle,
-		tasks: &BTreeSet<TaskId>,
-	) -> Result<()> {
+	pub(crate) fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		self.ensure_healthy()?;
 		ensure(
 			self.prepared_tasks.is_empty(),
@@ -1072,6 +1158,10 @@ impl<'context> CudaPreparedResources<'context> {
 		})
 	}
 
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently validates warmed resources"
+	)]
 	pub(crate) fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		let runtime_artifacts = match &self.handoff {
 			CudaPreparedHandoff::Candidate(runtime_artifacts) => runtime_artifacts,
@@ -1114,6 +1204,8 @@ impl<'context> Backend for CudaBackend<'context> {
 	type Error = Error;
 	type Pending = CudaPending<'context>;
 	type Resource = CudaResources<'context>;
+
+	const MAX_NON_POLL_PHYSICAL_CALLS: usize = 1;
 
 	fn bind_resources(
 		&mut self,
@@ -1175,6 +1267,10 @@ impl<'context> Backend for CudaBackend<'context> {
 		resource.allocate_arena(layout)
 	}
 
+	fn supports_loop_repetition(&self) -> bool {
+		true
+	}
+
 	fn submit(
 		&mut self,
 		resource: &mut Self::Resource,
@@ -1184,6 +1280,20 @@ impl<'context> Backend for CudaBackend<'context> {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<(), Self::Error> {
 		crate::accounting::record(physical_calls, crate::accounting::submission_call(&work))?;
+		resource.submit(&arenas, pending, work)
+	}
+
+	fn submit_loop_iteration(
+		&mut self,
+		resource: &mut Self::Resource,
+		arenas: ArenaSet<'_, Self::Arena>,
+		pending: &mut Self::Pending,
+		_iteration: LoopIteration,
+		work: BackendWork<'_>,
+		physical_calls: &mut PhysicalCallBatch,
+	) -> std::result::Result<(), Self::Error> {
+		crate::accounting::record(physical_calls, crate::accounting::submission_call(&work))?;
+		resource.prepare_loop_pending(pending)?;
 		resource.submit(&arenas, pending, work)
 	}
 
@@ -1273,6 +1383,12 @@ enum PendingAction {
 	Egress { bytes: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopSubmissionAction {
+	UsePrepared,
+	Rearm,
+}
+
 pub struct CudaPending<'context> {
 	task: TaskId,
 	phase: RunPhase,
@@ -1307,7 +1423,7 @@ impl<'context> CudaPending<'context> {
 			BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work) => {
 				work.submission == planned.slots
 			}
-			BackendWork::Metric(_) => true,
+			BackendWork::Metric(work) => work.submission == planned.slots,
 		};
 		ensure(
 			self.task == work.task()
@@ -1329,6 +1445,14 @@ impl<'context> CudaPending<'context> {
 		debug_assert!(matches!(self.native, NativePendingState::Ready));
 		self.native = NativePendingState::Active(native);
 		self.action = action;
+	}
+
+	fn loop_submission_action(&self) -> Option<LoopSubmissionAction> {
+		match (&self.native, self.terminal) {
+			(NativePendingState::Ready, false) => Some(LoopSubmissionAction::UsePrepared),
+			(NativePendingState::Terminal, true) => Some(LoopSubmissionAction::Rearm),
+			(NativePendingState::Ready | NativePendingState::Active(_) | NativePendingState::Terminal, _) => None,
+		}
 	}
 
 	pub(crate) fn task(&self) -> TaskId {
@@ -1387,7 +1511,13 @@ fn task_contracts(
 				Vec::new(),
 				Vec::new(),
 			),
-			TaskKind::Metric(_) => (WorkClass::Metric, None, None, Vec::new(), Vec::new()),
+			TaskKind::Metric(metric) => (
+				WorkClass::Metric,
+				Some(metric.submission),
+				None,
+				Vec::new(),
+				Vec::new(),
+			),
 			TaskKind::Transfer(transfer) => {
 				let class = transfer_work_class(task.id, task.phase, transfer.source, transfer.destination)?;
 				let admission = match class {
@@ -1485,7 +1615,7 @@ fn work_submission(work: &BackendWork<'_>) -> Option<SubmissionSlots> {
 		BackendWork::InitAdmission(work) => Some(work.submission),
 		BackendWork::Calculation(work) => Some(work.submission),
 		BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work) => Some(work.submission),
-		BackendWork::Metric(_) => None,
+		BackendWork::Metric(work) => Some(work.submission),
 	}
 }
 
@@ -1493,8 +1623,21 @@ fn task_submission(task: &Task) -> Option<SubmissionSlots> {
 	match &task.kind {
 		TaskKind::Calculation(calculation) => Some(calculation.submission),
 		TaskKind::Transfer(transfer) => Some(transfer.submission),
-		TaskKind::Metric(_) => None,
+		TaskKind::Metric(metric) => Some(metric.submission),
 	}
+}
+
+fn requested_submission_queue_count(resources: &ResourceManifest, tasks: &[Task], device: DeviceId) -> usize {
+	let queue_ids = tasks
+		.iter()
+		.filter_map(task_submission)
+		.map(|submission| submission.queue)
+		.collect::<BTreeSet<_>>();
+	resources
+		.queues
+		.iter()
+		.filter(|slot| slot.device == device && queue_ids.contains(&slot.id))
+		.count()
 }
 
 fn validate_binding(binding: &CudaBinding<'_>) -> Result<()> {
@@ -1512,6 +1655,23 @@ fn validate_binding(binding: &CudaBinding<'_>) -> Result<()> {
 	)
 }
 
+fn validate_reservation(reservations: &ReservationLedger, device: DeviceId) -> Result<()> {
+	let reservation = reservations
+		.entry(device)
+		.ok_or(Error::MissingDevice { device })?;
+	require_enforced_quota(device, reservation.mechanism)
+}
+
+fn require_enforced_quota(device: DeviceId, mechanism: ReservationMechanism) -> Result<()> {
+	ensure(
+		mechanism == ReservationMechanism::EnforcedQuota,
+		Error::ArenaMismatch {
+			device,
+			detail: "CUDA bridge requires a scheduler-enforced quota",
+		},
+	)
+}
+
 fn realize_device<'context>(
 	resources: &ResourceManifest,
 	reservations: &ReservationLedger,
@@ -1522,6 +1682,7 @@ fn realize_device<'context>(
 	binding: &CudaBinding<'context>,
 ) -> Result<DeviceResources<'context>> {
 	let device = binding.device;
+	validate_reservation(reservations, device)?;
 	let queue_ids = tasks
 		.iter()
 		.filter_map(task_submission)
@@ -1586,21 +1747,6 @@ fn realize_device<'context>(
 			bytes_to_usize(bytes, "CUDA scratch size")?,
 		)?),
 	};
-	let reservation = reservations
-		.entry(device)
-		.ok_or(Error::MissingDevice { device })?;
-	ensure(
-		reservation.mechanism == ReservationMechanism::HeldAllocation,
-		Error::ArenaMismatch {
-			device,
-			detail: "CUDA bridge requires the finalized held-allocation reservation mechanism",
-		},
-	)?;
-	let reservation = DeviceBuffer::allocate(
-		binding.context,
-		bytes_to_usize(reservation.bytes.get(), "CUDA user reservation")?,
-	)?;
-
 	let artifact_ids = tasks
 		.iter()
 		.filter_map(|task| match &task.kind {
@@ -1608,7 +1754,7 @@ fn realize_device<'context>(
 			TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 		})
 		.collect::<BTreeSet<_>>();
-	let mut artifacts = BTreeMap::new();
+	let mut bundles = BTreeMap::<ArtifactDigest, Vec<(ArtifactId, &crate::RuntimeArtifact)>>::new();
 	for artifact_id in artifact_ids {
 		let runtime = runtime_artifacts
 			.get(&artifact_id)
@@ -1652,7 +1798,56 @@ fn realize_device<'context>(
 				detail: "inspected cubin entry differs from immutable ABI".to_owned(),
 			},
 		)?;
-		artifacts.insert(artifact_id, load_artifact(binding.context, runtime)?);
+		let digest = ArtifactDigest::of(&runtime.bytes);
+		if let Some((_, first)) = bundles.get(&digest).and_then(|entries| entries.first()) {
+			ensure(
+				first.bytes.as_ref() == runtime.bytes.as_ref(),
+				Error::ArtifactMismatch {
+					artifact: artifact_id,
+					detail: "distinct cubin images produced the same content digest".to_owned(),
+				},
+			)?;
+		}
+		bundles
+			.entry(digest)
+			.or_default()
+			.push((artifact_id, runtime));
+	}
+
+	// Runtime artifacts retain per-stage identity and ABI while multiple
+	// entries may share one target cubin. Keep each module in a stable Box,
+	// load it once per distinct image, and resolve all logical functions from
+	// that shared module. `artifacts` is dropped before `modules` on unwind and
+	// explicit teardown follows the same order.
+	let mut modules = BTreeMap::new();
+	let mut artifacts = BTreeMap::new();
+	for (digest, entries) in bundles {
+		let (_, first_runtime) = entries
+			.first()
+			.expect("a cubin bundle group is created only for an artifact");
+		modules.insert(
+			digest,
+			Box::new(Module::load_cubin(binding.context, &first_runtime.bytes)?),
+		);
+		let module = modules
+			.get(&digest)
+			.expect("the just-loaded cubin module remains in the module table");
+		for (artifact_id, runtime) in entries {
+			let function = module.function(&runtime.abi.entry_symbol)?;
+			// SAFETY: `module` lives in a stable Box owned by `modules`.
+			// `artifacts` is dropped before `modules` during both unwind and
+			// explicit teardown, and loaded functions never escape resources.
+			let function = unsafe {
+				core::mem::transmute::<Function<'_, 'context>, Function<'context, 'context>>(function)
+			};
+			artifacts.insert(
+				artifact_id,
+				LoadedArtifact {
+					function,
+					abi: runtime.abi.clone(),
+				},
+			);
+		}
 	}
 
 	let invocations = invocation_sizes(tasks, device, &artifacts)?
@@ -1695,30 +1890,13 @@ fn realize_device<'context>(
 		queues,
 		completions,
 		artifacts,
+		modules,
 		invocations,
 		metric_buffers,
 		staging,
 		admission,
 		egress,
 		scratch,
-		reservation,
-	})
-}
-
-fn load_artifact<'context>(
-	context: &'context Context,
-	artifact: &crate::RuntimeArtifact,
-) -> Result<LoadedArtifact<'context>> {
-	let module = Box::new(Module::load_cubin(context, &artifact.bytes)?);
-	let function = module.function(&artifact.abi.entry_symbol)?;
-	// SAFETY: the module lives in a stable Box owned by `LoadedArtifact`.
-	// `function` is dropped before that Box, never escapes the wrapper, and the
-	// wrapper cannot expose a mutable module reference.
-	let function = unsafe { core::mem::transmute::<Function<'_, 'context>, Function<'context, 'context>>(function) };
-	Ok(LoadedArtifact {
-		function,
-		module,
-		abi: artifact.abi.clone(),
 	})
 }
 
@@ -1812,6 +1990,7 @@ fn fill_invocation<'context>(
 				pointer
 			}
 			KernelArgument::RunId => work.run.get(),
+			KernelArgument::LoopIteration => work.iteration.index(),
 			KernelArgument::ElementCount => abi.elements.get(),
 		};
 		invocation.set_value(index, value)?;
@@ -2037,14 +2216,16 @@ fn destroy_devices(devices: BTreeMap<DeviceId, DeviceResources<'_>>) -> Result<(
 			stream.destroy()?;
 		}
 		for (_, artifact) in device.artifacts {
-			artifact.close()?;
+			drop(artifact);
+		}
+		for (_, module) in device.modules {
+			module.unload().map_err(Error::from)?;
 		}
 		for (_, buffer) in device.metric_buffers {
 			buffer.free()?;
 		}
 		device.staging.free()?;
 		free_optional_buffer(device.scratch)?;
-		device.reservation.free()?;
 	}
 	Ok(())
 }
@@ -2074,5 +2255,59 @@ fn reject_unexpected_device(device: Option<DeviceId>) -> Result<()> {
 	match device {
 		Some(device) => Err(Error::UnexpectedDevice { device }),
 		None => Ok(()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn cuda_backend_accepts_only_scheduler_enforced_quota() {
+		let device = DeviceId::new(1);
+		assert_eq!(
+			require_enforced_quota(device, ReservationMechanism::EnforcedQuota),
+			Ok(())
+		);
+		assert!(matches!(
+			require_enforced_quota(device, ReservationMechanism::HeldAllocation),
+			Err(Error::ArenaMismatch {
+				device: actual,
+				..
+			}) if actual == device
+		));
+	}
+
+	#[test]
+	fn sparse_cuda_loop_submission_uses_prepared_token_then_rearms_terminal_token() {
+		let task = TaskId::new(43);
+		let device = DeviceId::new(4);
+		let slots = SubmissionSlots {
+			queue: QueueSlotId::new(2),
+			completion: CompletionSlotId::new(3),
+		};
+		let mut pending = CudaPending::ready(
+			PendingRequest {
+				task,
+				phase: RunPhase::Loop,
+				class: WorkClass::Calculation,
+				submission: Some(slots),
+			},
+			crate::PlannedSubmission {
+				task,
+				device,
+				slots,
+			},
+		);
+		assert_eq!(
+			pending.loop_submission_action(),
+			Some(LoopSubmissionAction::UsePrepared)
+		);
+		pending.native = NativePendingState::Terminal;
+		pending.terminal = true;
+		assert_eq!(
+			pending.loop_submission_action(),
+			Some(LoopSubmissionAction::Rearm)
+		);
 	}
 }

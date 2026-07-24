@@ -13,7 +13,9 @@
 
 mod image;
 mod numeric;
+mod prepare;
 mod safetensors;
+mod semantic;
 mod source;
 mod table;
 
@@ -24,9 +26,19 @@ pub use numeric::{
 	DecimalError, DecimalErrorKind, F32_GUARANTEED_SIGNIFICANT_DIGITS, F32Decimal, I32_GUARANTEED_SIGNIFICANT_DIGITS,
 	I32Decimal, parse_contract_f32, parse_contract_i32,
 };
+pub use prepare::{
+	ColumnPattern, ComparisonOperator, DenseMatrix, PartitionKind, PredicateLiteral, PreparationRequest,
+	PrepareError, PrepareErrorKind, PrepareResult, PreparedDataset, PreparedPartition, PreparedValues,
+	PreparedVector, RowPredicate, TemporalOrigin, TrainFraction, VariableWidthVector, VectorMetadata, VectorRole,
+	prepare_inferred_table, prepare_table,
+};
 pub use safetensors::{
 	SafeTensorArchive, SafeTensorDType, SafeTensorEntry, SafeTensorError, SafeTensorErrorKind, SafeTensorLimits,
 	SafeTensorResult, parse_safetensors,
+};
+pub use semantic::{
+	AmbiguousVectorModel, CategoricalEncodingModel, InferredVector, InferredVectorList, SemanticError,
+	SemanticErrorKind, SemanticResult, SemanticType, VectorEncoding, VectorEvidence, infer_table_vectors,
 };
 pub use source::{SourceError, SourceErrorKind, SourceLimit, SourceResult, SourceSnapshot, read_source_snapshot};
 pub use table::{

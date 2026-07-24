@@ -1,28 +1,47 @@
 use recipe::*;
 
-const DATASET: &str = "examples/datasets/rogii-wellbore-geology-prediction";
+const DATASET: &str = "examples/datasets/no-show-appointments/KaggleV2-May-2016.csv";
 
-fn main() -> DeclarationResult<()> {
-	let data = recipe.data(DATASET).split(0.8).target("TVT");
+fn main() {
+	let data = recipe
+		.data(DATASET)
+		.target("No-show")
+		.exclude(["AppointmentID", "PatientId"])
+		.exclude(cond!(Age < 0))
+		.split(0.8);
 
 	let model = recipe
 		.model()
-		.loss(mse)
-		.layer(1024)
-		.gelu()
-		.layer(1024)
-		.gelu()
-		.layer(900)
-		.lr(0.0001);
+		.norm(z_score)
+		.layer(128)
+		.silu()
+		.layer(128)
+		.silu()
+		.layer(1)
+		.loss(bce)
+		.optimizer(adamw);
 
-	let declaration = recipe
-		.train()
+	recipe.train()
+		.batch_size(2048)
 		.epochs(100)
-		.log([Loss])
-		.declare(&data, &model)?;
-
-	// Declaration is side-effect free. End-to-end lowering and execution will
-	// replace this boundary once the public integration is complete.
-	assert_eq!(declaration.policy().epoch_bound(), Some(100));
-	Ok(())
+		.lr(0.0001)
+		.warmup(5)
+		.cosine_decay()
+		.gradient_clip(1.0)
+		.early_stop(AuPrc, 10)
+		.calibrate(TemperatureScaling)
+		.log([
+			Loss,
+			AuRoc,
+			AuPrc,
+			Brier,
+			CalibrationError,
+			RecallAt(0.10),
+			RecallAt(0.20),
+			RecallAt(0.30),
+		])
+		.run(&data, &model)
+		.expect("training failed")
+		.save(())
+		.expect("saving model.ogdl failed");
 }

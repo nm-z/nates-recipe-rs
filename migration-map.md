@@ -10,7 +10,7 @@ they do not import, compile, link, or dispatch the retired implementation.
 
 | Retired surface | Replacement owner on `main` | Cutover state |
 |---|---|---|
-| root `src/api/*` and CLI | `src/api.rs`, `src/cli.rs`, and `src/facade.rs` | replacement-only facade; public execution integration remains in progress |
+| root `src/api/*` and CLI | `src/api.rs`, `src/cli.rs`, `src/facade.rs`, and `src/training.rs` | replacement-only facade with native dense-binary training and measured probing |
 | `recipe-ir` declarations | `recipe-core` and `recipe-language` | retired from the workspace |
 | runtime planning and machine models | `recipe-planner`, `recipe-scheduler`, `recipe-probe`, and `recipe-cluster` | replaced with measured, typed inputs |
 | runtime compilation | `recipe-kernel`, `recipe-primitives`, `recipe-cuda`, and `recipe-hsa` | HIP/HIPRTC paths retired |
@@ -20,7 +20,7 @@ they do not import, compile, link, or dispatch the retired implementation.
 | `gpu-core` kernels and operation modules | `recipe-ops`, `recipe-language`, `recipe-primitives`, and `recipe-kernel` | every normative entry is classified by an owned lowering or lifecycle recipe |
 | model parsing | `recipe-ingest` | bounded dependency-clean framing |
 | tokenization and chat rendering | `recipe-text` | bounded pre-init host transformation |
-| training, inference, tree, and boosting behavior | the operation registry plus planner/executor pipeline | operation ownership is present; facade-to-runtime workflow integration remains |
+| training, inference, tree, and boosting behavior | the operation registry plus planner/executor pipeline | dense-binary training is end-to-end; remaining workflow families retain owned declarations and operation contracts |
 | legacy tests and examples | package-scoped replacement tests and examples | retired tests remain on `legacy`; replacement tests are authoritative on `main` |
 
 ## Main-branch invariant

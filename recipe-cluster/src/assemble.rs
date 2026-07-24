@@ -687,6 +687,7 @@ fn remap_member(
 		collected.discovered_devices.push(DiscoveredDevice {
 			device: mapped(&mapping.devices, discovered.device, "discovered device")?,
 			available: discovered.available,
+			maximum_submission_queues: discovered.maximum_submission_queues,
 			total_capacity: discovered.total_capacity,
 			transfer: discovered.transfer,
 			calculation: discovered.calculation.clone(),

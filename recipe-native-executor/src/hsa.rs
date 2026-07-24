@@ -7,20 +7,21 @@ use std::time::Duration;
 
 use recipe_core::{
 	ArenaLayout, ArtifactId, BundleIdentity, ByteCount, CompletionSlotId, DeviceId, DraftPlan, FinalizedBundle,
-	InitDataImage, LinkId, QueueSlotId, ReservationLedger, ReservationMechanism, ResolvedTransferEndpoint,
-	ResolvedValueLocation, ResourceManifest, RunPhase, SubmissionSlots, Task, TaskId, TaskKind, TransferEndpoint,
-	TransferLaneClaim, ValueId,
+	InitDataImage, KernelResourceBounds, LinkId, LoopIteration, QueueSlotId, ReservationLedger, ReservationMechanism,
+	ResolvedTransferEndpoint, ResolvedValueLocation, ResourceManifest, RunPhase, SubmissionSlots, Task, TaskId,
+	TaskKind, TransferEndpoint, TransferLaneClaim, ValueId,
 };
 use recipe_executor::{
 	ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork, MetricValue, MetricWork,
 	PendingRequest, PhysicalCall, PhysicalCallBatch, PhysicalPollStatus, TransferWork, WorkClass, sealed,
 };
 use recipe_hsa::{
-	Allocation, DispatchGeometry, Executable, Kernel, PollStatus, PreparedPending, Queue, QueueConfig, QueueKind,
-	QueueProgress, Session,
+	Allocation, DeviceType, DiscoveredAgent, DispatchGeometry, Executable, Kernel, MemoryPoolFlags, MemorySegment,
+	PollStatus, PreparedPending, Queue, QueueConfig, QueueKind, QueueProgress, Session,
 };
-use recipe_kernel::{KernelArgument, inspect_hsaco};
+use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_hsaco};
 
+use crate::error::ensure_submission_queue_capacity;
 use crate::plan::InitImageContract;
 use crate::{Error, ExecutionPlan, Result, RuntimeArtifactKind};
 
@@ -28,9 +29,12 @@ use crate::{Error, ExecutionPlan, Result, RuntimeArtifactKind};
 pub struct HsaBinding<'scope> {
 	device: DeviceId,
 	session: &'scope Session<'scope>,
+	host_allocator: &'scope DiscoveredAgent<'scope>,
 	target_id: String,
 	code_object_version: u8,
 	queue_packets: u32,
+	maximum_submission_queues: u32,
+	enabled_display_connectors: u32,
 }
 
 impl<'scope> HsaBinding<'scope> {
@@ -38,16 +42,22 @@ impl<'scope> HsaBinding<'scope> {
 	pub fn new(
 		device: DeviceId,
 		session: &'scope Session<'scope>,
+		host_allocator: &'scope DiscoveredAgent<'scope>,
 		target_id: String,
 		code_object_version: u8,
 		queue_packets: u32,
+		maximum_submission_queues: u32,
+		enabled_display_connectors: u32,
 	) -> Self {
 		Self {
 			device,
 			session,
+			host_allocator,
 			target_id,
 			code_object_version,
 			queue_packets,
+			maximum_submission_queues,
+			enabled_display_connectors,
 		}
 	}
 
@@ -56,8 +66,51 @@ impl<'scope> HsaBinding<'scope> {
 		self.device
 	}
 
+	#[must_use]
+	pub fn target_id(&self) -> &str {
+		&self.target_id
+	}
+
+	#[must_use]
+	pub const fn code_object_version(&self) -> u8 {
+		self.code_object_version
+	}
+
+	#[must_use]
+	pub const fn queue_packets(&self) -> u32 {
+		self.queue_packets
+	}
+
+	#[must_use]
+	pub const fn maximum_submission_queues(&self) -> u32 {
+		self.maximum_submission_queues
+	}
+
+	#[must_use]
+	pub const fn enabled_display_connectors(&self) -> u32 {
+		self.enabled_display_connectors
+	}
+
+	/// Queries ROCr's current available-memory counter for this exact binding
+	/// before any candidate resources are realized.
+	pub fn available_bytes(&self) -> Result<ByteCount> {
+		Ok(ByteCount::new(self.session.available_memory_bytes()?))
+	}
+
+	/// Allocate host-accessible fine-grained memory through this GPU's exact
+	/// CPU allocator and grant the bound GPU access.
+	pub fn allocate_host_fine(&self, size: usize) -> recipe_hsa::Result<Allocation<'scope>> {
+		let allocation = self.host_allocator.allocate_fine(size)?;
+		self.session.grant_access(&allocation)?;
+		Ok(allocation)
+	}
+
 	pub(crate) const fn session(&self) -> &'scope Session<'scope> {
 		self.session
+	}
+
+	pub(crate) const fn host_allocator(&self) -> &'scope DiscoveredAgent<'scope> {
+		self.host_allocator
 	}
 }
 
@@ -66,9 +119,18 @@ impl fmt::Debug for HsaBinding<'_> {
 		formatter
 			.debug_struct("HsaBinding")
 			.field("device", &self.device)
+			.field(
+				"host_allocator",
+				&self.host_allocator.description().identity,
+			)
 			.field("target_id", &self.target_id)
 			.field("code_object_version", &self.code_object_version)
 			.field("queue_packets", &self.queue_packets)
+			.field("maximum_submission_queues", &self.maximum_submission_queues)
+			.field(
+				"enabled_display_connectors",
+				&self.enabled_display_connectors,
+			)
 			.finish_non_exhaustive()
 	}
 }
@@ -125,21 +187,14 @@ impl fmt::Debug for HsaArena<'_> {
 
 struct LoadedArtifact<'scope> {
 	kernel: Kernel<'scope, 'scope>,
-	executable: Executable<'scope, 'scope>,
 	abi: recipe_kernel::KernelAbi,
+	resources: Option<HsaArtifactResourceEnvelope>,
 }
 
-impl LoadedArtifact<'_> {
-	fn close(self) -> Result<()> {
-		let Self {
-			kernel,
-			executable,
-			abi,
-		} = self;
-		drop(kernel);
-		drop(abi);
-		executable.close().map_err(Error::from)
-	}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HsaArtifactResourceEnvelope {
+	finalized: KernelResourceBounds,
+	dynamic_private_bytes: u32,
 }
 
 impl fmt::Debug for LoadedArtifact<'_> {
@@ -148,6 +203,7 @@ impl fmt::Debug for LoadedArtifact<'_> {
 			.debug_struct("LoadedArtifact")
 			.field("entry", &self.abi.entry_symbol)
 			.field("metadata", self.kernel.metadata())
+			.field("resources", &self.resources)
 			.finish()
 	}
 }
@@ -185,16 +241,17 @@ struct HsaTaskContract {
 
 struct DeviceResources<'scope> {
 	session: &'scope Session<'scope>,
+	host_allocator: &'scope DiscoveredAgent<'scope>,
 	queues: BTreeMap<QueueSlotId, Queue<'scope, 'scope>>,
 	completions: BTreeMap<CompletionSlotId, CompletionState>,
 	artifacts: BTreeMap<ArtifactId, LoadedArtifact<'scope>>,
+	executables: BTreeMap<ArtifactDigest, Executable<'scope, 'scope>>,
 	kernargs: BTreeMap<CompletionSlotId, KernargSlot<'scope>>,
 	metric_buffers: BTreeMap<TaskId, Allocation<'scope>>,
 	staging: Allocation<'scope>,
 	admission: Option<InitImageContract>,
 	egress: BTreeMap<TaskId, Vec<u8>>,
 	scratch: Option<Allocation<'scope>>,
-	reservation: Allocation<'scope>,
 }
 
 impl fmt::Debug for DeviceResources<'_> {
@@ -202,16 +259,20 @@ impl fmt::Debug for DeviceResources<'_> {
 		formatter
 			.debug_struct("DeviceResources")
 			.field("agent", &self.session.description().identity)
+			.field(
+				"host_allocator",
+				&self.host_allocator.description().identity,
+			)
 			.field("queue_count", &self.queues.len())
 			.field("completion_count", &self.completions.len())
 			.field("artifact_count", &self.artifacts.len())
+			.field("executable_count", &self.executables.len())
 			.field("kernarg_count", &self.kernargs.len())
 			.field("metric_buffer_count", &self.metric_buffers.len())
 			.field("staging_bytes", &self.staging.len())
 			.field("admission", &self.admission)
 			.field("egress_count", &self.egress.len())
 			.field("scratch_bytes", &self.scratch.as_ref().map(Allocation::len))
-			.field("reservation_bytes", &self.reservation.len())
 			.finish()
 	}
 }
@@ -234,6 +295,10 @@ pub(crate) struct HsaPreparedResources<'scope> {
 #[derive(Debug)]
 enum HsaPreparedHandoff {
 	Candidate(Vec<crate::RuntimeArtifact>),
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	Finalized {
 		bundle: BundleIdentity,
 		tasks: BTreeSet<TaskId>,
@@ -248,6 +313,10 @@ enum HsaBackendState<'scope> {
 		bindings: Vec<HsaBinding<'scope>>,
 		artifacts: Vec<crate::RuntimeArtifact>,
 	},
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	Prepared(HsaPreparedResources<'scope>),
 	Warmed(HsaResources<'scope>),
 	Bound,
@@ -268,6 +337,10 @@ impl<'scope> HsaBackend<'scope> {
 		}
 	}
 
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently hands off warmed resources"
+	)]
 	pub(crate) const fn from_prepared(resources: HsaPreparedResources<'scope>) -> Self {
 		Self {
 			state: HsaBackendState::Prepared(resources),
@@ -377,8 +450,16 @@ impl<'scope> HsaResources<'scope> {
 			.filter(|task| tasks.is_none_or(|selected| selected.contains(&task.id)))
 			.cloned()
 			.collect::<Vec<_>>();
-		for (device, binding) in &binding_by_device {
+		for binding in binding_by_device.values() {
+			ensure_submission_queue_capacity(
+				"ROCr/HSA",
+				binding.device,
+				requested_submission_queue_count(bundle.resources(), &scoped_tasks, binding.device),
+				binding.maximum_submission_queues,
+			)?;
 			validate_binding(binding)?;
+		}
+		for (device, binding) in &binding_by_device {
 			devices.insert(
 				*device,
 				realize_device(
@@ -392,6 +473,7 @@ impl<'scope> HsaResources<'scope> {
 				)?,
 			);
 		}
+		bind_finalized_artifact_resources(&mut devices, &plan)?;
 		let contracts = task_contracts(bundle, tasks)?;
 		let pending_pool = prepare_pending_pool(&devices, &scoped_tasks, &value_devices)?;
 		Ok(Self {
@@ -414,9 +496,13 @@ impl<'scope> HsaResources<'scope> {
 		let allocation = owner
 			.session
 			.allocate_coarse(bytes_to_usize(layout.size.get(), "HSA arena size")?)?;
-		for resources in self.devices.values() {
-			resources.session.grant_access(&allocation)?;
-		}
+		let sessions = self
+			.devices
+			.values()
+			.map(|resources| resources.session)
+			.collect::<Vec<_>>();
+		owner.session
+			.grant_access_exact_set(&allocation, &sessions, &[owner.host_allocator])?;
 		Ok(HsaArena {
 			device: layout.device,
 			allocation,
@@ -463,10 +549,13 @@ impl<'scope> HsaResources<'scope> {
 				detail: "HSA pending token was prepared more than once",
 			},
 		)?;
-		let native = self.pending_pool.remove(&request.task).ok_or(Error::Protocol {
-			task: request.task,
-			detail: "HSA pre-final pending token is absent",
-		})?;
+		let native = self
+			.pending_pool
+			.remove(&request.task)
+			.ok_or(Error::Protocol {
+				task: request.task,
+				detail: "HSA pre-final pending token is absent",
+			})?;
 		ensure(
 			self.prepared_tasks.insert(request.task),
 			Error::Protocol {
@@ -510,7 +599,9 @@ impl<'scope> HsaResources<'scope> {
 				Ok(())
 			}
 			Err(error) => {
-				self.poisoned = true;
+				if submission_error_requires_poison(&error) {
+					self.poisoned = true;
+				}
 				Err(error)
 			}
 		}
@@ -614,7 +705,16 @@ impl<'scope> HsaResources<'scope> {
 
 	pub(crate) fn destroy(self) -> Result<()> {
 		self.ensure_healthy()?;
-		destroy_devices(self.devices)
+		let Self {
+			devices,
+			pending_pool,
+			..
+		} = self;
+		// Prepared completion tokens may retain the executable used by their
+		// last dispatch. Release those Rc keepalives before explicitly closing
+		// each shared executable.
+		drop(pending_pool);
+		destroy_devices(devices)
 	}
 
 	fn submit_admission(
@@ -811,6 +911,14 @@ impl<'scope> HsaResources<'scope> {
 				.ok_or(Error::MissingArtifact {
 					artifact: work.artifact,
 				})?;
+			let dynamic_private_bytes = artifact
+				.resources
+				.as_ref()
+				.ok_or(Error::ArtifactMismatch {
+					artifact: work.artifact,
+					detail: "HSA artifact has no finalized resource envelope".to_owned(),
+				})?
+				.dynamic_private_bytes;
 			let slot = device
 				.kernargs
 				.get_mut(&planned.slots.completion)
@@ -834,11 +942,20 @@ impl<'scope> HsaResources<'scope> {
 					detail: "HSA AQL queue is backpressured",
 				},
 			)?;
-			let grid = u32_from_u64(artifact.abi.elements.get(), "HSA grid dimension")?;
-			let lanes = u16_from_u32(artifact.abi.workgroup_lanes, "HSA workgroup dimension")?;
-			let geometry = DispatchGeometry::one_dimensional(grid, lanes);
+			let workgroup_lanes =
+				NonZeroU32::new(artifact.abi.workgroup_lanes).ok_or(Error::ArtifactMismatch {
+					artifact: work.artifact,
+					detail: "HSA artifact has a zero-lane workgroup".to_owned(),
+				})?;
+			let grid = hsa_grid_size(artifact.abi.elements.get(), workgroup_lanes)?;
+			let lanes = u16_from_u32(workgroup_lanes.get(), "HSA workgroup dimension")?;
+			let mut geometry = DispatchGeometry::one_dimensional(grid, lanes);
+			geometry.dynamic_private_bytes = dynamic_private_bytes;
 			ensure(
-				geometry.grid[0] == grid && geometry.workgroup[0] == lanes,
+				geometry.grid[0] == grid
+					&& geometry.workgroup[0] == lanes
+					&& geometry.dynamic_private_bytes == dynamic_private_bytes
+					&& u64::from(grid) >= artifact.abi.elements.get(),
 				Error::Protocol {
 					task: work.task,
 					detail: "HSA dispatch geometry changed during preflight",
@@ -943,6 +1060,40 @@ impl<'scope> HsaResources<'scope> {
 		}
 	}
 
+	pub(crate) fn rearm_pending(&mut self, pending: &mut HsaPending<'scope>) -> Result<()> {
+		self.ensure_healthy()?;
+		ensure(
+			pending.phase == RunPhase::Loop && pending.state == HsaPendingState::Terminal,
+			Error::Protocol {
+				task: pending.task,
+				detail: "only a terminal HSA loop token may be rearmed",
+			},
+		)?;
+		pending.native.reset()?;
+		pending.action = PendingAction::None;
+		pending.state = HsaPendingState::Ready;
+		Ok(())
+	}
+
+	pub(crate) fn prepare_loop_pending(&mut self, pending: &mut HsaPending<'scope>) -> Result<()> {
+		self.ensure_healthy()?;
+		ensure(
+			pending.phase == RunPhase::Loop,
+			Error::Protocol {
+				task: pending.task,
+				detail: "only an HSA loop token may be prepared for loop submission",
+			},
+		)?;
+		match pending.state.loop_submission_action() {
+			Some(LoopSubmissionAction::UsePrepared) => Ok(()),
+			Some(LoopSubmissionAction::Rearm) => self.rearm_pending(pending),
+			None => Err(Error::Protocol {
+				task: pending.task,
+				detail: "an active HSA loop token may not be submitted again",
+			}),
+		}
+	}
+
 	pub(crate) fn recycle_pending(&mut self, mut pending: HsaPending<'scope>) -> Result<()> {
 		self.ensure_healthy()?;
 		ensure(
@@ -971,11 +1122,7 @@ impl<'scope> HsaResources<'scope> {
 		Ok(ByteCount::new(resources.session.available_memory_bytes()?))
 	}
 
-	pub(crate) fn validate_handoff(
-		&mut self,
-		bundle: &FinalizedBundle,
-		tasks: &BTreeSet<TaskId>,
-	) -> Result<()> {
+	pub(crate) fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		self.ensure_healthy()?;
 		ensure(
 			self.prepared_tasks.is_empty() && self.pending_pool.keys().copied().eq(tasks.iter().copied()),
@@ -997,6 +1144,7 @@ impl<'scope> HsaResources<'scope> {
 		let runtime_artifacts = self.plan.runtime_artifacts().cloned().collect();
 		let devices = self.devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts, devices, tasks)?;
+		bind_finalized_artifact_resources(&mut self.devices, &plan)?;
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		self.plan = plan;
 		self.contracts = contracts;
@@ -1114,7 +1262,7 @@ impl<'scope> HsaPreparedResources<'scope> {
 	pub(crate) fn bind(self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<HsaResources<'scope>> {
 		let Self {
 			handoff,
-			devices,
+			mut devices,
 			pending,
 		} = self;
 		let (plan, contracts) = match handoff {
@@ -1135,6 +1283,7 @@ impl<'scope> HsaPreparedResources<'scope> {
 				detail: "candidate resources were not validated for finalized handoff",
 			}),
 		}?;
+		bind_finalized_artifact_resources(&mut devices, &plan)?;
 		Ok(HsaResources {
 			plan,
 			devices,
@@ -1152,7 +1301,7 @@ impl<'scope> HsaPreparedResources<'scope> {
 	) -> Result<HsaResources<'scope>> {
 		let Self {
 			handoff,
-			devices,
+			mut devices,
 			pending,
 		} = self;
 		let runtime_artifacts = match handoff {
@@ -1183,6 +1332,7 @@ impl<'scope> HsaPreparedResources<'scope> {
 		}
 		let planned_devices = devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts, planned_devices, tasks)?;
+		bind_finalized_artifact_resources(&mut devices, &plan)?;
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		Ok(HsaResources {
 			plan,
@@ -1194,6 +1344,10 @@ impl<'scope> HsaPreparedResources<'scope> {
 		})
 	}
 
+	#[allow(
+		dead_code,
+		reason = "retained for direct finalized prepared-resource handoff; production currently validates warmed resources"
+	)]
 	pub(crate) fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		let runtime_artifacts = match &self.handoff {
 			HsaPreparedHandoff::Candidate(runtime_artifacts) => runtime_artifacts,
@@ -1216,6 +1370,7 @@ impl<'scope> HsaPreparedResources<'scope> {
 		}
 		let devices = self.devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts.clone(), devices, tasks)?;
+		bind_finalized_artifact_resources(&mut self.devices, &plan)?;
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		self.handoff = HsaPreparedHandoff::Finalized {
 			bundle: bundle.identity(),
@@ -1240,6 +1395,8 @@ impl<'scope> Backend for HsaBackend<'scope> {
 	type Error = Error;
 	type Pending = HsaPending<'scope>;
 	type Resource = HsaResources<'scope>;
+
+	const MAX_NON_POLL_PHYSICAL_CALLS: usize = 1;
 
 	fn bind_resources(
 		&mut self,
@@ -1301,6 +1458,10 @@ impl<'scope> Backend for HsaBackend<'scope> {
 		resource.allocate_arena(layout)
 	}
 
+	fn supports_loop_repetition(&self) -> bool {
+		true
+	}
+
 	fn submit(
 		&mut self,
 		resource: &mut Self::Resource,
@@ -1311,6 +1472,21 @@ impl<'scope> Backend for HsaBackend<'scope> {
 	) -> std::result::Result<(), Self::Error> {
 		let call = crate::accounting::submission_call(&work);
 		crate::accounting::record(physical_calls, call)?;
+		resource.submit(&arenas, pending, work)
+	}
+
+	fn submit_loop_iteration(
+		&mut self,
+		resource: &mut Self::Resource,
+		arenas: ArenaSet<'_, Self::Arena>,
+		pending: &mut Self::Pending,
+		_iteration: LoopIteration,
+		work: BackendWork<'_>,
+		physical_calls: &mut PhysicalCallBatch,
+	) -> std::result::Result<(), Self::Error> {
+		let call = crate::accounting::submission_call(&work);
+		crate::accounting::record(physical_calls, call)?;
+		resource.prepare_loop_pending(pending)?;
 		resource.submit(&arenas, pending, work)
 	}
 
@@ -1335,7 +1511,6 @@ impl<'scope> Backend for HsaBackend<'scope> {
 				| Error::UnexpectedDevice { .. }
 				| Error::MissingQueue { .. }
 				| Error::MissingCompletion { .. }
-				| Error::NoMetricSubmission { .. }
 				| Error::ResourceContention { .. }
 				| Error::CompletionBusy { .. }
 				| Error::ArenaMismatch { .. }
@@ -1344,10 +1519,12 @@ impl<'scope> Backend for HsaBackend<'scope> {
 				| Error::UnsupportedLoopContract { .. }
 				| Error::BackendState { .. }
 				| Error::BackendPoisoned { .. }
+				| Error::SubmissionQueueLimitExceeded { .. }
 				| Error::IntegerOverflow { .. }
 				| Error::PhysicalAccountingOverflow
 				| Error::CudaContract(_)
 				| Error::Cuda(_)
+				| Error::HsaSymbolLookup { .. }
 				| Error::Hsa(_)
 				| Error::Kernel(_)
 				| Error::Protocol { .. } => PhysicalPollStatus::Failed,
@@ -1423,8 +1600,25 @@ enum HsaPendingState {
 	Terminal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopSubmissionAction {
+	UsePrepared,
+	Rearm,
+}
+
+impl HsaPendingState {
+	const fn loop_submission_action(self) -> Option<LoopSubmissionAction> {
+		match self {
+			Self::Ready => Some(LoopSubmissionAction::UsePrepared),
+			Self::Terminal => Some(LoopSubmissionAction::Rearm),
+			Self::Active => None,
+		}
+	}
+}
+
 pub struct HsaPending<'scope> {
 	task: TaskId,
+	phase: RunPhase,
 	device: DeviceId,
 	queue: QueueSlotId,
 	completion: CompletionSlotId,
@@ -1442,6 +1636,7 @@ impl<'scope> HsaPending<'scope> {
 	) -> Self {
 		Self {
 			task: request.task,
+			phase: request.phase,
 			device: planned.device,
 			queue: planned.slots.queue,
 			completion: planned.slots.completion,
@@ -1510,6 +1705,43 @@ impl fmt::Debug for HsaPending<'_> {
 }
 
 fn validate_binding(binding: &HsaBinding<'_>) -> Result<()> {
+	let allocator = binding.host_allocator().description();
+	ensure(
+		allocator.device_type == DeviceType::Cpu,
+		Error::ArtifactMismatch {
+			artifact: ArtifactId::new(0),
+			detail: "HSA kernarg allocator is not a CPU agent".to_owned(),
+		},
+	)?;
+	let has_kernarg_pool = allocator.memory_pools.iter().any(|pool| {
+		pool.segment == MemorySegment::Global
+			&& pool.runtime_allocation.is_some()
+			&& pool
+				.global_flags
+				.is_some_and(|flags| flags.contains(MemoryPoolFlags::KERNARG_INITIALIZATION))
+	});
+	ensure(
+		has_kernarg_pool,
+		Error::ArtifactMismatch {
+			artifact: ArtifactId::new(0),
+			detail: "HSA CPU kernarg allocator has no allocatable kernarg pool".to_owned(),
+		},
+	)?;
+	let has_fine_pool = allocator.memory_pools.iter().any(|pool| {
+		pool.segment == MemorySegment::Global
+			&& pool.runtime_allocation.is_some()
+			&& pool.global_flags.is_some_and(|flags| {
+				flags.contains(MemoryPoolFlags::FINE_GRAINED)
+					|| flags.contains(MemoryPoolFlags::EXTENDED_SCOPE_FINE_GRAINED)
+			})
+	});
+	ensure(
+		has_fine_pool,
+		Error::ArtifactMismatch {
+			artifact: ArtifactId::new(0),
+			detail: "HSA CPU host allocator has no allocatable fine-grained pool".to_owned(),
+		},
+	)?;
 	let has_target = binding
 		.session
 		.description()
@@ -1525,6 +1757,23 @@ fn validate_binding(binding: &HsaBinding<'_>) -> Result<()> {
 				"HSA session does not advertise exact target {:?}",
 				binding.target_id
 			),
+		},
+	)
+}
+
+fn validate_reservation(reservations: &ReservationLedger, device: DeviceId) -> Result<()> {
+	let reservation = reservations
+		.entry(device)
+		.ok_or(Error::MissingDevice { device })?;
+	require_enforced_quota(device, reservation.mechanism)
+}
+
+fn require_enforced_quota(device: DeviceId, mechanism: ReservationMechanism) -> Result<()> {
+	ensure(
+		mechanism == ReservationMechanism::EnforcedQuota,
+		Error::ArenaMismatch {
+			device,
+			detail: "HSA bridge requires a scheduler-enforced quota",
 		},
 	)
 }
@@ -1585,6 +1834,7 @@ fn realize_device<'scope>(
 	binding: &HsaBinding<'scope>,
 ) -> Result<DeviceResources<'scope>> {
 	let device = binding.device;
+	validate_reservation(reservations, device)?;
 	let queue_ids = tasks
 		.iter()
 		.filter_map(task_submission)
@@ -1622,10 +1872,7 @@ fn realize_device<'scope>(
 		.ok_or(Error::MissingDevice { device })?
 		.bytes
 		.get();
-	let staging = binding
-		.session
-		.allocate_fine(bytes_to_usize(staging_bytes, "HSA fine staging size")?)?;
-	binding.session.grant_access(&staging)?;
+	let staging = binding.allocate_host_fine(bytes_to_usize(staging_bytes, "HSA fine staging size")?)?;
 	let admission = init_images
 		.iter()
 		.find(|manifest| manifest.device == device)
@@ -1651,21 +1898,6 @@ fn realize_device<'scope>(
 			.session
 			.allocate_coarse(bytes_to_usize(bytes, "HSA scratch size")?)?),
 	};
-	let reservation = reservations
-		.entry(device)
-		.ok_or(Error::MissingDevice { device })?;
-	ensure(
-		reservation.mechanism == ReservationMechanism::HeldAllocation,
-		Error::ArenaMismatch {
-			device,
-			detail: "HSA bridge requires the finalized held-allocation reservation mechanism",
-		},
-	)?;
-	let reservation = binding.session.allocate_coarse(bytes_to_usize(
-		reservation.bytes.get(),
-		"HSA user reservation",
-	)?)?;
-
 	let artifact_ids = tasks
 		.iter()
 		.filter_map(|task| match &task.kind {
@@ -1673,7 +1905,14 @@ fn realize_device<'scope>(
 			TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 		})
 		.collect::<BTreeSet<_>>();
-	let mut artifacts = BTreeMap::new();
+	let mut bundles = BTreeMap::<
+		ArtifactDigest,
+		Vec<(
+			ArtifactId,
+			&crate::RuntimeArtifact,
+			recipe_kernel::InspectedHsaco,
+		)>,
+	>::new();
 	for artifact_id in artifact_ids {
 		let runtime = runtime_artifacts
 			.get(&artifact_id)
@@ -1710,30 +1949,68 @@ fn realize_device<'scope>(
 				detail: "inspected HSACO entry differs from immutable ABI".to_owned(),
 			},
 		)?;
-		let executable = binding.session.load_hsaco(&runtime.bytes)?;
-		let kernel = executable.kernel(&runtime.abi.entry_symbol)?;
-		ensure(
-			kernel.metadata().kernarg_segment_size >= runtime.abi.argument_bytes
-				&& kernel.metadata().kernarg_segment_alignment >= runtime.abi.argument_alignment,
-			Error::ArtifactMismatch {
-				artifact: artifact_id,
-				detail: "loaded HSA kernel metadata is smaller than the inspected ABI".to_owned(),
-			},
-		)?;
-		artifacts.insert(
-			artifact_id,
-			LoadedArtifact {
-				kernel,
-				executable,
-				abi: runtime.abi.clone(),
-			},
-		);
+		let digest = ArtifactDigest::of(&runtime.bytes);
+		if let Some((_, first, _)) = bundles.get(&digest).and_then(|entries| entries.first()) {
+			ensure(
+				first.bytes.as_ref() == runtime.bytes.as_ref(),
+				Error::ArtifactMismatch {
+					artifact: artifact_id,
+					detail: "distinct HSACO images produced the same content digest".to_owned(),
+				},
+			)?;
+		}
+		bundles
+			.entry(digest)
+			.or_default()
+			.push((artifact_id, runtime, inspection));
+	}
+
+	// A runtime artifact identifies one logical entry point, while its byte
+	// image may be the device target's shared multi-entry HSACO. Own one
+	// executable per distinct image and resolve every logical stage from it.
+	// `artifacts` is declared after `executables` so unwind drops Kernel Rc
+	// owners before the underlying executable owner.
+	let mut executables = BTreeMap::new();
+	let mut artifacts = BTreeMap::new();
+	for (digest, entries) in bundles {
+		let (_, first_runtime, _) = entries
+			.first()
+			.expect("an HSACO bundle group is created only for an artifact");
+		let executable = binding.session.load_hsaco(&first_runtime.bytes)?;
+		for (artifact_id, runtime, inspection) in entries {
+			let runtime_symbol = inspection.kernel.symbol;
+			let kernel = executable
+				.kernel(&runtime_symbol)
+				.map_err(|source| Error::HsaSymbolLookup {
+					artifact: artifact_id,
+					abi_entry: runtime.abi.entry_symbol.clone(),
+					runtime_symbol: runtime_symbol.clone(),
+					source,
+				})?;
+			ensure(
+				kernel.metadata().kernarg_segment_size >= runtime.abi.argument_bytes
+					&& kernel.metadata().kernarg_segment_alignment >= runtime.abi.argument_alignment,
+				Error::ArtifactMismatch {
+					artifact: artifact_id,
+					detail: "loaded HSA kernel metadata is smaller than the inspected ABI".to_owned(),
+				},
+			)?;
+			artifacts.insert(
+				artifact_id,
+				LoadedArtifact {
+					kernel,
+					abi: runtime.abi.clone(),
+					resources: None,
+				},
+			);
+		}
+		executables.insert(digest, executable);
 	}
 
 	let kernarg_sizes = kernarg_sizes(tasks, device, &artifacts)?;
 	let mut kernargs = BTreeMap::new();
 	for (slot, bytes) in kernarg_sizes {
-		let allocation = binding.session.allocate_kernarg(bytes)?;
+		let allocation = binding.host_allocator().allocate_kernarg(bytes)?;
 		binding.session.grant_access(&allocation)?;
 		kernargs.insert(
 			slot,
@@ -1752,11 +2029,8 @@ fn realize_device<'scope>(
 			},
 			TaskKind::Calculation(_) | TaskKind::Transfer(_) => None,
 		})
-		.map(|task| Ok((task, binding.session.allocate_fine(4)?)))
+		.map(|task| Ok((task, binding.allocate_host_fine(4)?)))
 		.collect::<Result<BTreeMap<_, _>>>()?;
-	for allocation in metric_buffers.values() {
-		binding.session.grant_access(allocation)?;
-	}
 	let egress = tasks
 		.iter()
 		.filter_map(|task| match &task.kind {
@@ -1779,16 +2053,84 @@ fn realize_device<'scope>(
 
 	Ok(DeviceResources {
 		session: binding.session,
+		host_allocator: binding.host_allocator(),
 		queues,
 		completions,
 		artifacts,
+		executables,
 		kernargs,
 		metric_buffers,
 		staging,
 		admission,
 		egress,
 		scratch,
-		reservation,
+	})
+}
+
+fn bind_finalized_artifact_resources(
+	devices: &mut BTreeMap<DeviceId, DeviceResources<'_>>,
+	plan: &ExecutionPlan,
+) -> Result<()> {
+	for device in devices.values_mut() {
+		for (artifact, loaded) in &mut device.artifacts {
+			let contract = plan
+				.artifact_contract(*artifact)
+				.ok_or(Error::MissingArtifact {
+					artifact: *artifact,
+				})?;
+			ensure(
+				loaded.abi == contract.runtime.abi,
+				Error::ArtifactMismatch {
+					artifact: *artifact,
+					detail: "loaded HSA ABI differs from its finalized runtime artifact".to_owned(),
+				},
+			)?;
+			let resources = hsa_artifact_resource_envelope(
+				*artifact,
+				&contract.identity.resources,
+				loaded.kernel.metadata().dynamic_callstack,
+			)?;
+			match &loaded.resources {
+				Some(prior) => ensure(
+					prior == &resources,
+					Error::ArtifactMismatch {
+						artifact: *artifact,
+						detail: "loaded HSA resource envelope differs from its finalized identity"
+							.to_owned(),
+					},
+				)?,
+				None => loaded.resources = Some(resources),
+			}
+		}
+	}
+	Ok(())
+}
+
+fn hsa_artifact_resource_envelope(
+	artifact: ArtifactId,
+	finalized: &KernelResourceBounds,
+	dynamic_callstack: bool,
+) -> Result<HsaArtifactResourceEnvelope> {
+	let dynamic_private_bytes = match dynamic_callstack {
+		false => 0,
+		true => {
+			let private_bytes = finalized.private_bytes_per_lane.get();
+			ensure(
+				private_bytes != 0,
+				Error::ArtifactMismatch {
+					artifact,
+					detail: "dynamic-callstack HSA kernel has a zero finalized private-byte bound".to_owned(),
+				},
+			)?;
+			u32::try_from(private_bytes).map_err(|_| Error::ArtifactMismatch {
+				artifact,
+				detail: "dynamic-callstack HSA kernel private-byte bound exceeds the AQL field".to_owned(),
+			})?
+		}
+	};
+	Ok(HsaArtifactResourceEnvelope {
+		finalized: finalized.clone(),
+		dynamic_private_bytes,
 	})
 }
 
@@ -1818,7 +2160,7 @@ fn task_contracts(
 					Vec::new(),
 				)
 			}
-			TaskKind::Metric(_) => {
+			TaskKind::Metric(metric) => {
 				ensure(
 					task.phase == RunPhase::Loop,
 					Error::Protocol {
@@ -1826,7 +2168,13 @@ fn task_contracts(
 						detail: "HSA metric is not assigned to the loop phase",
 					},
 				)?;
-				(WorkClass::Metric, None, None, Vec::new(), Vec::new())
+				(
+					WorkClass::Metric,
+					Some(metric.submission),
+					None,
+					Vec::new(),
+					Vec::new(),
+				)
 			}
 			TaskKind::Transfer(transfer) => {
 				let class = transfer_work_class(task.id, task.phase, transfer.source, transfer.destination)?;
@@ -1922,7 +2270,7 @@ fn work_submission(work: &BackendWork<'_>) -> Option<SubmissionSlots> {
 		BackendWork::InitAdmission(work) => Some(work.submission),
 		BackendWork::Calculation(work) => Some(work.submission),
 		BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work) => Some(work.submission),
-		BackendWork::Metric(_) => None,
+		BackendWork::Metric(work) => Some(work.submission),
 	}
 }
 
@@ -1930,8 +2278,21 @@ fn task_submission(task: &Task) -> Option<SubmissionSlots> {
 	match &task.kind {
 		TaskKind::Calculation(calculation) => Some(calculation.submission),
 		TaskKind::Transfer(transfer) => Some(transfer.submission),
-		TaskKind::Metric(_) => None,
+		TaskKind::Metric(metric) => Some(metric.submission),
 	}
+}
+
+fn requested_submission_queue_count(resources: &ResourceManifest, tasks: &[Task], device: DeviceId) -> usize {
+	let queue_ids = tasks
+		.iter()
+		.filter_map(task_submission)
+		.map(|submission| submission.queue)
+		.collect::<BTreeSet<_>>();
+	resources
+		.queues
+		.iter()
+		.filter(|slot| slot.device == device && queue_ids.contains(&slot.id))
+		.count()
 }
 
 fn kernarg_sizes(
@@ -1994,6 +2355,7 @@ fn fill_kernarg<'scope>(
 					})?
 			}
 			KernelArgument::RunId => work.run.get(),
+			KernelArgument::LoopIteration => work.iteration.index(),
 			KernelArgument::ElementCount => abi.elements.get(),
 			KernelArgument::FaultFlag => {
 				has_fault_argument = true;
@@ -2147,6 +2509,16 @@ fn finish_submission_claim(
 	}
 }
 
+fn submission_error_requires_poison(error: &Error) -> bool {
+	match error {
+		Error::BackendPoisoned { .. }
+		| Error::Hsa(recipe_hsa::Error::SessionPoisoned { .. })
+		| Error::Hsa(recipe_hsa::Error::DeferredRetirement { poisoned: true, .. }) => true,
+		Error::Hsa(recipe_hsa::Error::AsyncSignal { value }) => *value < 0,
+		_ => false,
+	}
+}
+
 fn ensure_queue(device: &DeviceResources<'_>, task: TaskId, queue: QueueSlotId) -> Result<()> {
 	ensure(
 		device.queues.contains_key(&queue),
@@ -2248,7 +2620,10 @@ fn destroy_devices(devices: BTreeMap<DeviceId, DeviceResources<'_>>) -> Result<(
 			queue.close()?;
 		}
 		for (_, artifact) in device.artifacts {
-			artifact.close()?;
+			drop(artifact);
+		}
+		for (_, executable) in device.executables {
+			executable.close().map_err(Error::from)?;
 		}
 		for (_, slot) in device.kernargs {
 			slot.allocation.close()?;
@@ -2258,7 +2633,6 @@ fn destroy_devices(devices: BTreeMap<DeviceId, DeviceResources<'_>>) -> Result<(
 		}
 		device.staging.close()?;
 		free_optional_allocation(device.scratch)?;
-		device.reservation.close()?;
 	}
 	Ok(())
 }
@@ -2286,6 +2660,21 @@ fn u32_from_u64(value: u64, field: &'static str) -> Result<u32> {
 		Ok(value) => Ok(value),
 		Err(..) => Err(Error::IntegerOverflow { field }),
 	}
+}
+
+fn hsa_grid_size(elements: u64, workgroup_lanes: NonZeroU32) -> Result<u32> {
+	let lanes = u64::from(workgroup_lanes.get());
+	let workgroups = elements
+		.checked_add(lanes - 1)
+		.ok_or(Error::IntegerOverflow {
+			field: "HSA grid rounding",
+		})? / lanes;
+	let padded_lanes = workgroups
+		.checked_mul(lanes)
+		.ok_or(Error::IntegerOverflow {
+			field: "HSA padded grid dimension",
+		})?;
+	u32_from_u64(padded_lanes, "HSA padded grid dimension")
 }
 
 fn u16_from_u32(value: u32, field: &'static str) -> Result<u16> {
@@ -2320,5 +2709,206 @@ fn reject_unexpected_device(device: Option<DeviceId>) -> Result<()> {
 	match device {
 		Some(device) => Err(Error::UnexpectedDevice { device }),
 		None => Ok(()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use recipe_core::{
+		CompletionSlotId, MetricId, MetricPurpose, MetricSlotId, MetricTask, Nanoseconds, QueueSlot, ScheduleWindow,
+	};
+
+	#[test]
+	fn queue_preflight_counts_scoped_metric_submission_without_rocr() {
+		let device = DeviceId::new(7);
+		let metric_queue = QueueSlotId::new(11);
+		let resources = ResourceManifest {
+			queues: vec![
+				QueueSlot {
+					id: metric_queue,
+					device,
+				},
+				QueueSlot {
+					id: QueueSlotId::new(12),
+					device,
+				},
+				QueueSlot {
+					id: QueueSlotId::new(13),
+					device: DeviceId::new(8),
+				},
+			],
+			completions: Vec::new(),
+			metrics: Vec::new(),
+			pinned_staging: Vec::new(),
+			scratch: Vec::new(),
+		};
+		let tasks = [Task {
+			id: TaskId::new(21),
+			phase: RunPhase::Loop,
+			window: ScheduleWindow {
+				start: Nanoseconds::new(0),
+				end: Nanoseconds::new(1),
+			},
+			dependencies: Vec::new(),
+			kind: TaskKind::Metric(MetricTask {
+				purpose: MetricPurpose::User,
+				metric: MetricId::new(1),
+				value: ValueId::new(1),
+				slot: MetricSlotId::new(1),
+				submission: SubmissionSlots {
+					queue: metric_queue,
+					completion: CompletionSlotId::new(1),
+				},
+			}),
+		}];
+
+		assert_eq!(
+			requested_submission_queue_count(&resources, &tasks, device),
+			1
+		);
+	}
+
+	#[test]
+	fn hsa_backend_accepts_only_scheduler_enforced_quota() {
+		let device = DeviceId::new(1);
+		assert_eq!(
+			require_enforced_quota(device, ReservationMechanism::EnforcedQuota),
+			Ok(())
+		);
+		assert!(matches!(
+			require_enforced_quota(device, ReservationMechanism::HeldAllocation),
+			Err(Error::ArenaMismatch {
+				device: actual,
+				..
+			}) if actual == device
+		));
+	}
+
+	#[test]
+	fn sparse_hsa_loop_submission_uses_prepared_token_then_rearms_terminal_token() {
+		assert_eq!(
+			HsaPendingState::Ready.loop_submission_action(),
+			Some(LoopSubmissionAction::UsePrepared)
+		);
+		assert_eq!(
+			HsaPendingState::Terminal.loop_submission_action(),
+			Some(LoopSubmissionAction::Rearm)
+		);
+		assert_eq!(HsaPendingState::Active.loop_submission_action(), None);
+	}
+
+	#[test]
+	fn hsa_grid_launches_complete_workgroups_for_scalar_and_partial_stages() {
+		let lanes = NonZeroU32::new(256).expect("nonzero workgroup");
+		assert_eq!(hsa_grid_size(1, lanes), Ok(256));
+		assert_eq!(hsa_grid_size(256, lanes), Ok(256));
+		assert_eq!(hsa_grid_size(257, lanes), Ok(512));
+		assert!(hsa_grid_size(u64::from(u32::MAX), lanes).is_err());
+	}
+
+	#[test]
+	fn fixed_private_kernel_retains_exact_envelope_without_dynamic_allowance() {
+		let resources = private_resources(24);
+		assert_eq!(
+			hsa_artifact_resource_envelope(ArtifactId::new(9), &resources, false),
+			Ok(HsaArtifactResourceEnvelope {
+				finalized: resources,
+				dynamic_private_bytes: 0,
+			})
+		);
+	}
+
+	#[test]
+	fn dynamic_callstack_uses_exact_per_lane_private_bound() {
+		let resources = private_resources(24);
+		assert_eq!(
+			hsa_artifact_resource_envelope(ArtifactId::new(9), &resources, true),
+			Ok(HsaArtifactResourceEnvelope {
+				finalized: resources,
+				dynamic_private_bytes: 24,
+			})
+		);
+	}
+
+	#[test]
+	fn dynamic_callstack_rejects_missing_or_unrepresentable_private_bound() {
+		let artifact = ArtifactId::new(9);
+		assert!(matches!(
+			hsa_artifact_resource_envelope(artifact, &private_resources(0), true),
+			Err(Error::ArtifactMismatch {
+				artifact: actual,
+				..
+			}) if actual == artifact
+		));
+		assert!(matches!(
+			hsa_artifact_resource_envelope(
+				artifact,
+				&private_resources(u64::from(u32::MAX) + 1),
+				true,
+			),
+			Err(Error::ArtifactMismatch {
+				artifact: actual,
+				..
+			}) if actual == artifact
+		));
+	}
+
+	#[test]
+	fn submission_poisoning_is_limited_to_terminal_or_uncertain_failures() {
+		for error in [
+			Error::BackendPoisoned { backend: "HSA" },
+			Error::Hsa(recipe_hsa::Error::SessionPoisoned {
+				status: -1,
+				source_queue_id: Some(3),
+				epoch: 5,
+			}),
+			Error::Hsa(recipe_hsa::Error::AsyncSignal { value: -7 }),
+			Error::Hsa(recipe_hsa::Error::DeferredRetirement {
+				pending: 1,
+				poisoned: true,
+			}),
+		] {
+			assert!(submission_error_requires_poison(&error), "{error}");
+		}
+	}
+
+	#[test]
+	fn rolled_back_submission_errors_do_not_poison_the_backend() {
+		for error in [
+			Error::Protocol {
+				task: TaskId::new(1),
+				detail: "pre-publication validation failed",
+			},
+			Error::Hsa(recipe_hsa::Error::InvalidDispatch {
+				reason: "prepared submission was rejected",
+			}),
+			Error::Hsa(recipe_hsa::Error::QueueFull {
+				write_index: 8,
+				read_index: 0,
+				size: 8,
+			}),
+			Error::Hsa(recipe_hsa::Error::Hsa {
+				operation: "hsa_amd_memory_async_copy",
+				status: 1,
+				message: None,
+			}),
+			Error::Hsa(recipe_hsa::Error::AsyncSignal { value: 0 }),
+			Error::Hsa(recipe_hsa::Error::DeferredRetirement {
+				pending: 1,
+				poisoned: false,
+			}),
+		] {
+			assert!(!submission_error_requires_poison(&error), "{error}");
+		}
+	}
+
+	fn private_resources(private_bytes_per_lane: u64) -> KernelResourceBounds {
+		KernelResourceBounds {
+			private_bytes_per_lane: ByteCount::new(private_bytes_per_lane),
+			shared_bytes_per_workgroup: ByteCount::new(128),
+			scratch_bytes_per_dispatch: ByteCount::new(256),
+			maximum_workgroup_lanes: 64,
+		}
 	}
 }

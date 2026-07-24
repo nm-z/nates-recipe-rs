@@ -27,7 +27,10 @@ impl fmt::Display for ExecutorDriverBuildError {
 		match self {
 			Self::Projection(error) => write!(formatter, "{error}"),
 			Self::ProgramMismatch(detail) => {
-				write!(formatter, "remote program differs from worker projection: {detail}")
+				write!(
+					formatter,
+					"remote program differs from worker projection: {detail}"
+				)
 			}
 		}
 	}
@@ -423,7 +426,11 @@ fn validate_program(
 			ExternalTransferDirection::Ingress => DataDirection::MasterToWorker,
 			ExternalTransferDirection::Egress => DataDirection::WorkerToMaster,
 		};
-		let Some(link) = transfer.route().first().and_then(|link| topology.link(*link)) else {
+		let Some(link) = transfer
+			.route()
+			.first()
+			.and_then(|link| topology.link(*link))
+		else {
 			return Err(ExecutorDriverBuildError::ProgramMismatch(
 				"cross-transfer route is unavailable",
 			));
@@ -476,8 +483,9 @@ fn executor_fault<E: Error + Send + Sync + 'static>(
 		| WorkerExecutionError::DeviceFault {
 			calculation: task, ..
 		} => task.get(),
-		WorkerExecutionError::WrongPhase { task, .. }
-		| WorkerExecutionError::ByteCountMismatch { task, .. } => task.map_or(0, TaskId::get),
+		WorkerExecutionError::WrongPhase { task, .. } | WorkerExecutionError::ByteCountMismatch { task, .. } => {
+			task.map_or(0, TaskId::get)
+		}
 		WorkerExecutionError::PhaseIncomplete { task, .. } => task.get(),
 		WorkerExecutionError::InvalidLifecycle { state, .. } => lifecycle_code(*state),
 		WorkerExecutionError::InitOffsetMismatch { device, .. } => device.get(),

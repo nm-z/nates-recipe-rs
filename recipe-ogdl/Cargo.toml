@@ -1,0 +1,12 @@
+[package]
+name = "recipe-ogdl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Recipe's dependency-free OGDL-derived ordered graph syntax"
+readme = "README.md"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

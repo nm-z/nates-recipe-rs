@@ -38,6 +38,7 @@ pub enum ValidationCode {
 	DependencyPhaseOrder,
 	DependencyScheduleOrder,
 	InvalidCalculationPlacement,
+	InvalidIterationDomain,
 	InvalidFaultReadback,
 	InvalidExternalTransfer,
 	InvalidDataImage,

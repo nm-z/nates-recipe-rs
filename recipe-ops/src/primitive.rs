@@ -31,6 +31,7 @@ pub enum PrimitiveFamily {
 	Scatter,
 	Histogram,
 	Sort,
+	IndexMap,
 	Random,
 }
 
@@ -88,6 +89,7 @@ pub enum PrimitiveRecipe {
 		stable: bool,
 		axis: AxisRequirement,
 	},
+	IndexMap,
 	Random(RandomRecipe),
 }
 
@@ -114,6 +116,7 @@ impl PrimitiveRecipe {
 			Self::Gather { .. } => PrimitiveFamily::Gather,
 			Self::ScatterAdd { .. } => PrimitiveFamily::Scatter,
 			Self::Sort { .. } => PrimitiveFamily::Sort,
+			Self::IndexMap => PrimitiveFamily::IndexMap,
 			Self::Random(_) => PrimitiveFamily::Random,
 		}
 	}
@@ -125,9 +128,10 @@ impl PrimitiveRecipe {
 			PrimitiveFamily::Reduce => OperationFamily::Reduction,
 			PrimitiveFamily::Scan => OperationFamily::Scan,
 			PrimitiveFamily::Contraction => OperationFamily::Contraction,
-			PrimitiveFamily::Gather | PrimitiveFamily::Scatter | PrimitiveFamily::Sort => {
-				OperationFamily::ShapeAndIndexing
-			}
+			PrimitiveFamily::Gather
+			| PrimitiveFamily::Scatter
+			| PrimitiveFamily::Sort
+			| PrimitiveFamily::IndexMap => OperationFamily::ShapeAndIndexing,
 			PrimitiveFamily::Histogram => OperationFamily::Histogram,
 			PrimitiveFamily::Random => OperationFamily::Random,
 		}
@@ -173,6 +177,10 @@ impl PrimitiveRecipe {
 			Self::Sort { .. } => CanonicalDTypeContract::Exact {
 				inputs: F32_INPUT,
 				outputs: F32_OUTPUT,
+			},
+			Self::IndexMap => CanonicalDTypeContract::Exact {
+				inputs: NO_INPUTS,
+				outputs: I32_OUTPUT,
 			},
 			Self::Random(RandomRecipe::UniformF32 | RandomRecipe::NormalF32) => CanonicalDTypeContract::Exact {
 				inputs: NO_INPUTS,
@@ -260,6 +268,9 @@ impl PrimitiveRecipe {
 				stable: false,
 				..
 			} => "descending binary32 sort",
+			Self::IndexMap => {
+				"checked iteration-aware affine int32 index map with optional positive Euclidean modulus"
+			}
 			Self::Random(RandomRecipe::UniformF32) => "counter-based Philox4x32-10 uniform binary32 map",
 			Self::Random(RandomRecipe::NormalF32) => "counter-based Philox4x32-10 normal binary32 map",
 		}
@@ -330,6 +341,7 @@ impl PrimitiveRecipe {
 				spec.distribution,
 				recipe_language::RandomDistribution::NormalF32
 			),
+			(Self::IndexMap, PrimitiveKind::IndexMap(_)) => true,
 			(
 				Self::Reduce { .. }
 				| Self::Scan { .. }
@@ -337,6 +349,7 @@ impl PrimitiveRecipe {
 				| Self::Gather { .. }
 				| Self::ScatterAdd { .. }
 				| Self::Sort { .. }
+				| Self::IndexMap
 				| Self::Random(_),
 				PrimitiveKind::Elementwise(_)
 				| PrimitiveKind::Reduce(_)
@@ -346,6 +359,7 @@ impl PrimitiveRecipe {
 				| PrimitiveKind::Scatter(_)
 				| PrimitiveKind::Histogram(_)
 				| PrimitiveKind::Sort(_)
+				| PrimitiveKind::IndexMap(_)
 				| PrimitiveKind::Random(_),
 			) => false,
 		}
@@ -378,19 +392,32 @@ pub fn lower_primitive(
 			.for_operation(descriptor.id));
 		}
 	};
+	lower_recipe(recipe, request).map_err(|error| error.for_operation(descriptor.id))
+}
+
+/// Lower Recipe's iteration-aware affine int32 source without inventing a
+/// legacy operation-registry symbol.
+///
+/// The supplied kernel must have no inputs, exactly one int32 output, and no
+/// aliases. Its output shape fixes the number of generated indexes; `start`,
+/// `element_step`, `iteration_step`, and the optional positive modulus remain
+/// explicit in the immutable lowered program.
+pub fn lower_index_map(request: PrimitiveRequest<'_>) -> OperationResult<LoweredProgram> {
+	lower_recipe(PrimitiveRecipe::IndexMap, request)
+}
+
+fn lower_recipe(recipe: PrimitiveRecipe, request: PrimitiveRequest<'_>) -> OperationResult<LoweredProgram> {
 	match recipe.matches(request.kernel, request.tensors) {
 		true => recipe_primitives::lower(request.kernel, request.tensors).map_err(|error| {
 			OperationError::new(
 				OperationErrorKind::PrimitiveLoweringFailed,
 				error.to_string(),
 			)
-			.for_operation(descriptor.id)
 		}),
 		false => Err(OperationError::new(
 			OperationErrorKind::PrimitiveRecipeMismatch,
-			format!("kernel kind does not satisfy {}", descriptor.definition),
-		)
-		.for_operation(descriptor.id)),
+			format!("kernel kind does not satisfy {}", recipe.definition()),
+		)),
 	}
 }
 

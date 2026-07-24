@@ -1,6 +1,6 @@
 use core::fmt::{self, Write};
 
-use recipe_core::{ByteCount, DeviceId, RunPhase, TaskId, ValueId};
+use recipe_core::{ByteCount, DeviceId, LoopIterations, RunPhase, TaskId, ValueId};
 
 pub const BACKEND_MESSAGE_CAPACITY: usize = 96;
 
@@ -162,7 +162,13 @@ pub enum ExecutorError {
 	InvalidWatchdog {
 		max_nonprogress_polls: u32,
 	},
+	LoopRepetitionUnsupported {
+		iterations: LoopIterations,
+	},
 	MetricSequenceOverflow,
+	PendingPollCountOverflow {
+		task: TaskId,
+	},
 	PreparationCapacityOverflow,
 	JournalCapacityExceeded {
 		stream: JournalStream,
@@ -254,7 +260,15 @@ impl fmt::Display for ExecutorError {
 				formatter,
 				"watchdog maximum must be nonzero, got {max_nonprogress_polls}"
 			),
+			Self::LoopRepetitionUnsupported { iterations } => write!(
+				formatter,
+				"backend does not support the finalized loop count of {}",
+				iterations.get()
+			),
 			Self::MetricSequenceOverflow => formatter.write_str("metric sequence counter overflowed"),
+			Self::PendingPollCountOverflow { task } => {
+				write!(formatter, "pending-poll counter overflowed for task {task}")
+			}
 			Self::PreparationCapacityOverflow => {
 				formatter.write_str("executor preallocation capacity arithmetic overflowed")
 			}

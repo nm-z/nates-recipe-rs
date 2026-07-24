@@ -28,10 +28,12 @@ pub mod engine {
 	pub use recipe_math as math;
 	pub use recipe_native_executor as native_executor;
 	pub use recipe_native_probe as native_probe;
+	pub use recipe_ogdl as ogdl;
 	pub use recipe_ops as ops;
 	pub use recipe_planner as planner;
 	pub use recipe_prepare as prepare;
 	pub use recipe_primitives as primitives;
+	pub use recipe_program as program;
 	pub use recipe_probe as probe;
 	pub use recipe_remote as remote;
 	pub use recipe_scheduler as scheduler;

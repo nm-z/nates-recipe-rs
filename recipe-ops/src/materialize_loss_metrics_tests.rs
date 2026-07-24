@@ -88,6 +88,7 @@ fn reductions(materialized: &MaterializedComposition) -> Vec<&Reduce> {
 			| PrimitiveKind::Scatter(_)
 			| PrimitiveKind::Histogram(_)
 			| PrimitiveKind::Sort(_)
+			| PrimitiveKind::IndexMap(_)
 			| PrimitiveKind::Random(_) => None,
 		})
 		.collect()
@@ -146,6 +147,7 @@ fn opcodes(materialized: &MaterializedComposition) -> Vec<ScalarOpcode> {
 			| PrimitiveKind::Scatter(_)
 			| PrimitiveKind::Histogram(_)
 			| PrimitiveKind::Sort(_)
+			| PrimitiveKind::IndexMap(_)
 			| PrimitiveKind::Random(_) => continue,
 		}
 	}
@@ -260,6 +262,7 @@ fn materializes_accuracy_and_finite_metrics_with_fixed_reductions() -> TestResul
 				| PrimitiveKind::Scatter(_)
 				| PrimitiveKind::Histogram(_)
 				| PrimitiveKind::Sort(_)
+				| PrimitiveKind::IndexMap(_)
 				| PrimitiveKind::Random(_) => [].iter(),
 			})
 			.filter(|instruction| instruction.opcode == ScalarOpcode::Require)

@@ -4,7 +4,7 @@ use std::fmt;
 
 use recipe_core::{
 	ArtifactId, BundleIdentity, ByteCount, DType, DeviceId, Digest, FinalizedBundle, KernelTemplateId, LinkId,
-	MachineId, MetricId, MetricPurpose, MetricSlotId, NodeId, NodeRole, ResolvedTransferEndpoint,
+	LoopIteration, MachineId, MetricId, MetricPurpose, MetricSlotId, NodeId, NodeRole, ResolvedTransferEndpoint,
 	ResolvedValueLocation, RunId, RunPhase, ScheduleWindow, SubmissionSlots, Task, TaskId, TaskKind, Topology,
 	TopologyIdentity, TransferLaneClaim,
 };
@@ -238,6 +238,7 @@ enum PreparedWorkerWork {
 		metric: MetricId,
 		slot: MetricSlotId,
 		value: ResolvedValueLocation,
+		submission: SubmissionSlots,
 	},
 	External(WorkerExternalTransfer),
 }
@@ -270,12 +271,19 @@ impl PreparedWorkerWork {
 		match self {
 			Self::InitAdmission { submission, .. }
 			| Self::Calculation { submission, .. }
-			| Self::InternalTransfer { submission, .. } => Some(*submission),
-			Self::Metric { .. } | Self::External(_) => None,
+			| Self::InternalTransfer { submission, .. }
+			| Self::Metric { submission, .. } => Some(*submission),
+			Self::External(_) => None,
 		}
 	}
 
-	fn backend_work<'a>(&'a self, task: TaskId, run: RunId, image: Option<&'a [u8]>) -> Option<BackendWork<'a>> {
+	fn backend_work<'a>(
+		&'a self,
+		task: TaskId,
+		run: RunId,
+		iteration: Option<LoopIteration>,
+		image: Option<&'a [u8]>,
+	) -> Option<BackendWork<'a>> {
 		match self {
 			Self::InitAdmission {
 				destination,
@@ -302,6 +310,7 @@ impl PreparedWorkerWork {
 			} => Some(BackendWork::Calculation(CalculationWork {
 				task,
 				run,
+				iteration: iteration?,
 				device: *device,
 				kernel_template: *kernel_template,
 				artifact: *artifact,
@@ -339,12 +348,15 @@ impl PreparedWorkerWork {
 				metric,
 				slot,
 				value,
+				submission,
 			} => Some(BackendWork::Metric(MetricWork {
 				task,
+				iteration: iteration?,
 				purpose: *purpose,
 				metric: *metric,
 				slot: *slot,
 				value: *value,
+				submission: *submission,
 			})),
 			Self::External(_) => None,
 		}
@@ -663,6 +675,7 @@ fn classify_task(
 					metric: metric.metric,
 					slot: metric.slot,
 					value: location,
+					submission: metric.submission,
 				})),
 				false => Ok(None),
 			}
@@ -1388,6 +1401,7 @@ struct WorkerImage {
 #[derive(Debug)]
 pub struct WorkerExecutionSession<B: WorkerBackend> {
 	run: RunId,
+	loop_iteration: LoopIteration,
 	projection: WorkerProjection,
 	backend: B,
 	resource: Option<B::Resource>,
@@ -1421,7 +1435,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 				backend,
 			});
 		}
-		let journal_capacity = match worker_journal_capacity::<B>(bundle, &projection, watchdog) {
+		let journal_capacity = match worker_journal_capacity::<B>(bundle, &projection) {
 			Ok(capacity) => capacity,
 			Err(error) => {
 				return Err(WorkerPrepareFailure {
@@ -1431,7 +1445,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 				});
 			}
 		};
-		let mut journal = RunJournal::with_capacity(journal_capacity);
+		let mut journal = RunJournal::with_capacity(journal_capacity, bundle.tasks());
 		let mut calls = PhysicalCallBatch::new();
 		let resource = match backend.bind_worker_resources(bundle, &projection, &mut calls) {
 			Ok(resource) => resource,
@@ -1551,6 +1565,10 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		}
 		Ok(Self {
 			run,
+			loop_iteration: bundle
+				.loop_iterations()
+				.iteration(0)
+				.expect("a finalized loop always contains iteration zero"),
 			projection,
 			backend,
 			resource: Some(resource),
@@ -1716,7 +1734,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 			let work = slot
 				.contract
 				.work
-				.backend_work(task_id, run, Some(&self.images[image_index].buffer))
+				.backend_work(task_id, run, None, Some(&self.images[image_index].buffer))
 				.ok_or(WorkerExecutionError::WrongRole {
 					task: task_id,
 					expected: WorkerTaskRole::InitAdmission,
@@ -1813,39 +1831,40 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 				actual: self.tasks[index].contract.role(),
 			})?;
 		let mut calls = PhysicalCallBatch::new();
-		let result =
-			{
-				let resource = self
-					.resource
-					.as_mut()
-					.ok_or(WorkerExecutionError::InvalidLifecycle {
-						state: self.lifecycle,
-						detail: "worker resources are unavailable",
-					})?;
-				let slot = &mut self.tasks[index];
-				let role = slot.contract.role();
-				let work = slot.contract.work.backend_work(task, run, None).ok_or(
-					WorkerExecutionError::WrongRole {
-						task,
-						expected: WorkerTaskRole::Local,
-						actual: role,
-					},
-				)?;
-				let WorkerPending::Local(pending) = &mut slot.pending else {
-					return Err(WorkerExecutionError::WrongRole {
-						task,
-						expected: WorkerTaskRole::Local,
-						actual: role,
-					});
-				};
-				self.backend.submit(
-					resource,
-					ArenaSet::new(&self.arenas),
-					pending,
-					work,
-					&mut calls,
-				)
+		let result = {
+			let resource = self
+				.resource
+				.as_mut()
+				.ok_or(WorkerExecutionError::InvalidLifecycle {
+					state: self.lifecycle,
+					detail: "worker resources are unavailable",
+				})?;
+			let slot = &mut self.tasks[index];
+			let role = slot.contract.role();
+			let work = slot
+				.contract
+				.work
+				.backend_work(task, run, Some(self.loop_iteration), None)
+				.ok_or(WorkerExecutionError::WrongRole {
+					task,
+					expected: WorkerTaskRole::Local,
+					actual: role,
+				})?;
+			let WorkerPending::Local(pending) = &mut slot.pending else {
+				return Err(WorkerExecutionError::WrongRole {
+					task,
+					expected: WorkerTaskRole::Local,
+					actual: role,
+				});
 			};
+			self.backend.submit(
+				resource,
+				ArenaSet::new(&self.arenas),
+				pending,
+				work,
+				&mut calls,
+			)
+		};
 		self.backend_result(WorkerBackendOperation::SubmitLocal(task), calls, result)?;
 		self.tasks[index].state = TaskState::Active;
 		Self::journal_result(
@@ -2654,28 +2673,18 @@ fn prepare_images<B: WorkerBackend>(
 fn worker_journal_capacity<B: WorkerBackend>(
 	bundle: &FinalizedBundle,
 	projection: &WorkerProjection,
-	watchdog: Watchdog,
 ) -> Result<JournalCapacity, WorkerExecutionError<B::Error>> {
-	let base = JournalCapacity::recommended(bundle, watchdog).map_err(WorkerExecutionError::Journal)?;
+	let base = JournalCapacity::for_bundle::<B>(bundle).map_err(WorkerExecutionError::Journal)?;
 	let external = projection.external_transfers().count();
 	let extra_logical = external
 		.checked_mul(2)
 		.and_then(|count| count.checked_add(2))
 		.ok_or(WorkerExecutionError::CapacityOverflow)?;
-	let poll_stretch = projection
-		.tasks
-		.len()
-		.checked_mul(
-			usize::try_from(watchdog.max_nonprogress_polls())
-				.map_err(|_| WorkerExecutionError::CapacityOverflow)?,
-		)
-		.ok_or(WorkerExecutionError::CapacityOverflow)?;
 	let extra_physical = projection
 		.tasks
 		.len()
-		.checked_mul(crate::MAX_PHYSICAL_CALLS_PER_OPERATION)
-		.and_then(|count| count.checked_add(poll_stretch))
-		.and_then(|count| count.checked_add(crate::MAX_PHYSICAL_CALLS_PER_OPERATION))
+		.checked_mul(B::MAX_NON_POLL_PHYSICAL_CALLS)
+		.and_then(|count| count.checked_add(B::MAX_NON_POLL_PHYSICAL_CALLS))
 		.ok_or(WorkerExecutionError::CapacityOverflow)?;
 	Ok(JournalCapacity::new(
 		base.logical_events

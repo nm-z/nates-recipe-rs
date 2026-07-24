@@ -10,7 +10,8 @@ use recipe_native_probe::{
 };
 use recipe_probe::local::{LocalHostBenchmarks, LocalSystemDiscovery};
 use recipe_probe::{
-	BoundedBenchmarkPlan, GpuBenchmarkIo as _, GpuDiscovery as _, HostDiscovery as _, ProbeEngine, SeedContract,
+	BoundedBenchmarkPlan, GpuBenchmarkIo as _, GpuDiscovery as _, HostDiscovery as _, ProbeEngine, ProbeError,
+	SeedContract,
 };
 
 #[test]
@@ -44,6 +45,38 @@ fn discovers_and_benchmarks_every_live_gpu() -> Result<(), Box<dyn std::error::E
 		assert!(measurement.host_to_device_rate.value.get() > 0);
 		assert!(measurement.device_to_host_rate.value.get() > 0);
 	}
+	Ok(())
+}
+
+#[test]
+#[ignore = "requires local ROCr, a gfx1101 GPU, and the host AMDGPU LLVM toolchain"]
+fn generated_gfx1101_hsaco_descriptor_symbol_is_loadable() -> Result<(), Box<dyn std::error::Error>> {
+	let probe = NativeGpuProbe::hsa_diagnostic(configured_probe()?)?;
+	let inventory = probe.discover_all()?;
+	let device = inventory
+		.devices
+		.iter()
+		.find(|device| {
+			device.target.backend.as_str() == "amd-rocr-hsa"
+				&& device
+					.target
+					.architecture
+					.as_str()
+					.rsplit_once("--")
+					.map_or(device.target.architecture.as_str(), |(_, target)| target)
+					.split(':')
+					.next() == Some("gfx1101")
+		})
+		.ok_or_else(|| std::io::Error::other("local ROCr inventory has no gfx1101 GPU"))?;
+	let measurement = probe.benchmark_gpu(
+		device,
+		BoundedBenchmarkPlan {
+			buffer_bytes: ByteCount::new(4 * 1024),
+			iterations: 1,
+			maximum_duration: Duration::from_secs(2),
+		},
+	)?;
+	assert!(measurement.calculation_rate.value.get() > 0);
 	Ok(())
 }
 
@@ -87,10 +120,39 @@ fn measured_origins_reopen_exact_native_bindings() -> Result<(), Box<dyn std::er
 		.iter()
 		.filter(|origin| origin.key.as_str().starts_with("hsa:"))
 		.count();
-	with_native_execution_bindings(&config, &profile, &inventory, |bindings| {
+	with_native_execution_bindings(&native, &profile, &inventory, |bindings| {
 		assert_eq!(bindings.cuda().len(), expected_cuda);
 		assert_eq!(bindings.hsa().len(), expected_hsa);
 		assert_eq!(bindings.machine(), profile.topology.machines[0].id);
+		for binding in bindings.hsa() {
+			let source = (0_u8..=255).cycle().take(4096).collect::<Vec<_>>();
+			let allocation = binding
+				.allocate_host_fine(source.len())
+				.map_err(|error| ProbeError::Benchmark(format!("allocate exact HSA host staging: {error}")))?;
+			// SAFETY: `allocate_host_fine` allocates through the retained CPU
+			// agent, and no GPU operation has been published for this buffer.
+			unsafe {
+				allocation.copy_from_host(0, &source).map_err(|error| {
+					ProbeError::Benchmark(format!("write exact HSA host staging: {error}"))
+				})?;
+			}
+			let mut observed = vec![0_u8; source.len()];
+			// SAFETY: the CPU owns the allocation and no device operation can
+			// be concurrent with this immediate host read.
+			unsafe {
+				allocation.copy_to_host(0, &mut observed).map_err(|error| {
+					ProbeError::Benchmark(format!("read exact HSA host staging: {error}"))
+				})?;
+			}
+			if observed != source {
+				return Err(ProbeError::Benchmark(
+					"exact HSA host staging did not preserve written bytes".to_owned(),
+				));
+			}
+			allocation
+				.close()
+				.map_err(|error| ProbeError::Benchmark(format!("close exact HSA host staging: {error}")))?;
+		}
 		Ok(())
 	})?;
 	Ok(())

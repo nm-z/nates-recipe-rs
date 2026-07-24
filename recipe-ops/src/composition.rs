@@ -257,6 +257,32 @@ const HISTOGRAM_REDUCE_MAP: &[CompositionStep] = &[HISTOGRAM, REDUCE, MAP];
 const SORT_SCAN_MAP: &[CompositionStep] = &[SORT, SCAN, MAP];
 const SORT_SCAN_SCATTER: &[CompositionStep] = &[SORT, SCAN, SCATTER];
 
+const LINEAR_BACKWARD_FULL_STEPS: &[CompositionStep] = &[
+	CompositionStep::primitive(
+		PrimitiveFamily::Contraction,
+		"contract the output gradient with the transposed weight to form the input gradient",
+	),
+	CompositionStep::primitive(
+		PrimitiveFamily::Contraction,
+		"contract the transposed input with the output gradient to form the weight gradient",
+	),
+	CompositionStep::primitive(
+		PrimitiveFamily::Reduce,
+		"sum the output gradient over rows with a fixed tree to form the bias gradient",
+	),
+];
+
+const LINEAR_BACKWARD_WEIGHTS_ONLY_STEPS: &[CompositionStep] = &[
+	CompositionStep::primitive(
+		PrimitiveFamily::Contraction,
+		"contract the transposed input with the output gradient to form the weight gradient",
+	),
+	CompositionStep::primitive(
+		PrimitiveFamily::Reduce,
+		"sum the output gradient over rows with a fixed tree to form the bias gradient",
+	),
+];
+
 const SOFTMAX_STEPS: &[CompositionStep] = &[
 	CompositionStep::primitive(
 		PrimitiveFamily::Reduce,
@@ -1655,10 +1681,17 @@ fn composition_for_entry(symbol: &str, source: &str) -> Option<CompositionRecipe
 			CompositionPayload::F32,
 			OperationFamily::Contraction,
 		),
-		"gpu_linear_backward_full_into" | "gpu_linear_backward_weights_only_into" => recipe(
+		"gpu_linear_backward_full_into" => recipe(
 			"linear_projection_backward",
-			"form input, weight, and optional bias gradients using canonical-order f32 contractions and fixed-tree sums",
-			CONTRACT_MAP_REDUCE,
+			"form input and weight gradients with canonical-order f32 contractions and the bias gradient with a fixed-tree row sum",
+			LINEAR_BACKWARD_FULL_STEPS,
+			CompositionPayload::F32,
+			OperationFamily::Contraction,
+		),
+		"gpu_linear_backward_weights_only_into" => recipe(
+			"linear_projection_backward_weights_only",
+			"form the weight gradient with a canonical-order f32 contraction and the bias gradient with a fixed-tree row sum",
+			LINEAR_BACKWARD_WEIGHTS_ONLY_STEPS,
 			CompositionPayload::F32,
 			OperationFamily::Contraction,
 		),

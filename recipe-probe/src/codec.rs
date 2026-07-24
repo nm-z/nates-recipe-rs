@@ -1171,6 +1171,7 @@ fn encode_discovery(encoder: &mut Encoder, discovery: &DiscoveryProfile) -> Prob
 	for device in &discovery.devices {
 		encoder.u64(device.device.get());
 		encoder.bool(device.available);
+		encoder.u32(device.maximum_submission_queues);
 		encoder.property_bytes(device.total_capacity);
 		encoder.property_rate(device.transfer.rate);
 		encoder.property_lanes(device.transfer.maximum_inflight_transfers);
@@ -1205,6 +1206,9 @@ fn decode_discovery(decoder: &mut Decoder<'_>) -> ProbeResult<DiscoveryProfile> 
 	for index in 0..device_count {
 		let device = DeviceId::new(decoder.u64(&format!("discovery.devices[{index}].id"))?);
 		let available = decoder.bool(&format!("discovery.devices[{index}].available"))?;
+		let maximum_submission_queues = decoder.u32(&format!(
+			"discovery.devices[{index}].maximum_submission_queues"
+		))?;
 		let total_capacity = decoder.property_bytes(&format!("discovery.devices[{index}].capacity"))?;
 		let transfer = TransferCapability {
 			rate: decoder.property_rate(&format!("discovery.devices[{index}].transfer.rate"))?,
@@ -1237,6 +1241,7 @@ fn decode_discovery(decoder: &mut Decoder<'_>) -> ProbeResult<DiscoveryProfile> 
 		devices.push(DiscoveredDevice {
 			device,
 			available,
+			maximum_submission_queues,
 			total_capacity,
 			transfer,
 			calculation,
@@ -1524,12 +1529,12 @@ mod tests {
 	}
 
 	#[test]
-	fn schema_three_cache_is_explicitly_invalidated() {
+	fn schema_five_cache_is_explicitly_invalidated() {
 		let mut bytes = Vec::from(*MAGIC);
-		bytes.extend_from_slice(&3_u32.to_le_bytes());
+		bytes.extend_from_slice(&5_u32.to_le_bytes());
 		let checksum: [u8; 32] = Sha256::digest(&bytes).into();
 		bytes.extend_from_slice(&checksum);
 		let error = MeasuredProfileCodec::decode(&bytes).unwrap_err();
-		assert!(error.to_string().contains("unsupported codec schema 3"));
+		assert!(error.to_string().contains("unsupported codec schema 5"));
 	}
 }

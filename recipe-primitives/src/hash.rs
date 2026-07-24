@@ -557,17 +557,31 @@ impl CanonicalWriter {
 					self.tag(match word {
 						PhiloxCounterWord::ElementLow => 0,
 						PhiloxCounterWord::ElementHigh => 1,
-						PhiloxCounterWord::RunXorStreamLow => 2,
-						PhiloxCounterWord::RunXorStreamHigh => 3,
+						PhiloxCounterWord::IterationXorStreamLow => 2,
+						PhiloxCounterWord::IterationXorStreamHigh => 3,
 					});
 				}
 				self.bool(contract.fold_kernel_id_into_key);
+				self.bool(contract.fold_run_id_into_key);
 				self.tag(match contract.uniform_i32 {
 					UniformI32Mapping::UnbiasedMultiplyHighWithCounterRejection => 0,
 				});
 				self.tag(match contract.normal_f32 {
 					NormalF32Mapping::OwnedBoxMullerV1 => 0,
 				});
+			}
+			StageKind::IndexMap(spec) => {
+				self.tag(15);
+				self.i32(spec.start);
+				self.i32(spec.element_step);
+				self.i32(spec.iteration_step);
+				match spec.modulus {
+					Some(modulus) => {
+						self.bool(true);
+						self.i32(modulus);
+					}
+					None => self.bool(false),
+				}
 			}
 		}
 	}

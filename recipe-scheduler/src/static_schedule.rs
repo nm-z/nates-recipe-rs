@@ -178,7 +178,7 @@ fn prepare_tasks(
 		let (duration, mut resources) = match &mut task.kind {
 			TaskKind::Calculation(calculation) => prepare_calculation(topology, discovery, task.id, calculation)?,
 			TaskKind::Transfer(transfer) => prepare_transfer(topology, discovery, task.id, transfer)?,
-			TaskKind::Metric(_) => (Nanoseconds::new(1), Vec::new()),
+			TaskKind::Metric(metric) => (Nanoseconds::new(1), submission_resources(metric.submission)),
 		};
 		resources.sort();
 		resources.dedup();
@@ -788,6 +788,7 @@ mod tests {
 				DiscoveredDevice {
 					device: gpu,
 					available: true,
+					maximum_submission_queues: 64,
 					total_capacity: measured(ByteCount::new(8_000_000_000)),
 					transfer: TransferCapability {
 						rate: measured(BytesPerSecond::new(100).unwrap()),
@@ -809,6 +810,7 @@ mod tests {
 				DiscoveredDevice {
 					device: ram,
 					available: true,
+					maximum_submission_queues: 64,
 					total_capacity: measured(ByteCount::new(8_000_000_000)),
 					transfer: TransferCapability {
 						rate: measured(BytesPerSecond::new(100).unwrap()),
@@ -870,6 +872,7 @@ mod tests {
 		discovery.devices.push(DiscoveredDevice {
 			device: remote_ram,
 			available: true,
+			maximum_submission_queues: 64,
 			total_capacity: measured(ByteCount::new(8_000_000_000)),
 			transfer: TransferCapability {
 				rate: measured(BytesPerSecond::new(100).unwrap()),

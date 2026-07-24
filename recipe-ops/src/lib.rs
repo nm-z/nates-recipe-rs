@@ -12,6 +12,7 @@
 //! operation without one of those definitions remains unsupported and fails
 //! closed.
 
+mod binary_metrics;
 mod composition;
 mod error;
 mod materialize;
@@ -21,6 +22,11 @@ mod registry;
 mod scalar;
 mod workspace;
 
+pub use binary_metrics::{
+	BinaryClassificationMetricRequest, BinaryMetricMaterialization, BinaryMetricRequirements, MAX_CALIBRATION_BINS,
+	MAX_EXACT_BINARY_EXAMPLES, MAX_RECALL_THRESHOLDS, RecallAtOutput, append_binary_classification_metrics,
+	binary_metric_requirements, materialize_binary_classification_metrics,
+};
 pub use composition::{CompositionPayload, CompositionRecipe, CompositionStep, IterationBound, validate_composition};
 pub use error::{OperationError, OperationErrorKind, OperationResult};
 pub use materialize::{
@@ -32,7 +38,7 @@ pub use materialize::{
 pub use non_calculation::NonCalculationRecipe;
 pub use primitive::{
 	AxisRequirement, ContractionClass, PrimitiveFamily, PrimitiveRecipe, PrimitiveRequest, RandomRecipe,
-	lower_primitive,
+	lower_index_map, lower_primitive,
 };
 pub use recipe_primitives::LoweredProgram;
 pub use registry::{
@@ -56,6 +62,8 @@ mod materialize_indexing_sort_encoding_tests;
 mod materialize_loss_metrics_tests;
 #[cfg(test)]
 mod materialize_tests;
+#[cfg(test)]
+mod materialize_training_tests;
 #[cfg(test)]
 mod materialize_tree_boosting_tests;
 #[cfg(test)]

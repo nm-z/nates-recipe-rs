@@ -652,11 +652,11 @@ fn source_qualified_concrete_manifest_count_is_exact() {
 				descriptor.lowering,
 				crate::LoweringAvailability::Composition(_)
 			)
-	})
+		})
 		.count();
 	assert_eq!(structured, 264);
-	assert_eq!(remaining.len(), 138);
-	assert_eq!(structured - remaining.len(), 126);
+	assert_eq!(remaining.len(), 132);
+	assert_eq!(structured - remaining.len(), 132);
 
 	let mapped = operation_registry()
 		.iter()
@@ -671,7 +671,7 @@ fn source_qualified_concrete_manifest_count_is_exact() {
 		})
 		.map(|descriptor| (descriptor.symbol, descriptor.source))
 		.collect::<BTreeSet<_>>();
-	assert_eq!(mapped.len(), 126);
+	assert_eq!(mapped.len(), 132);
 }
 
 #[test]

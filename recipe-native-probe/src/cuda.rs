@@ -1,15 +1,16 @@
 use core::ffi::c_void;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use recipe_core::{Label, TargetIdentity, TransferLaneCount, TransportKind};
 use recipe_cuda::{
 	CompletionStatus, Context, ContextFlags, DeviceBuffer, DeviceInfo, Dim3, Discovery, Driver, Event, LaunchConfig,
-	Module, Pending, PinnedHostBuffer, SchedulingPolicy, Stream, WaitOutcome,
+	Module, Pending, PinnedHostBuffer, SchedulingPolicy, Stream,
 };
 use recipe_kernel::{
 	ArtifactBuilder, BuildPhase, BuiltArtifact, KernelTarget, LoweringOptions, NvidiaTarget, lower_elementwise,
 };
+use recipe_native_executor::CUDA_MAXIMUM_SUBMISSION_QUEUES;
 use recipe_probe::{BoundedBenchmarkPlan, GpuDescriptor, GpuMeasurement, LinkDuplex, ProbeError, ProbeResult};
 
 use crate::benchmark::{
@@ -25,6 +26,41 @@ use crate::native::Backend;
 
 const CUDA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
 const CUDA_WORKGROUP_LANES: u32 = 256;
+const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
+const COMPLETION_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
+const TIMED_OUT_CLEANUP_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const TIMED_OUT_CLEANUP_MAXIMUM_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug)]
+struct CompletionPollBackoff {
+	next_delay: Duration,
+	maximum_delay: Duration,
+}
+
+impl CompletionPollBackoff {
+	const fn benchmark() -> Self {
+		Self {
+			next_delay: COMPLETION_POLL_INITIAL_DELAY,
+			maximum_delay: COMPLETION_POLL_MAXIMUM_DELAY,
+		}
+	}
+
+	const fn timed_out_cleanup() -> Self {
+		Self {
+			next_delay: TIMED_OUT_CLEANUP_INITIAL_DELAY,
+			maximum_delay: TIMED_OUT_CLEANUP_MAXIMUM_DELAY,
+		}
+	}
+
+	fn wait(&mut self, maximum: Duration) {
+		std::thread::sleep(self.next_delay.min(maximum));
+		self.advance();
+	}
+
+	fn advance(&mut self) {
+		self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay);
+	}
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CudaBackend {
@@ -158,6 +194,7 @@ impl CudaBackend {
 			device_to_host_maximum_inflight: TransferLaneCount::new(1)
 				.map_err(|error| ProbeError::Discovery(format!("CUDA device-to-host lane count: {error}")))?,
 			asynchronous_submission: true,
+			maximum_submission_queues: CUDA_MAXIMUM_SUBMISSION_QUEUES,
 			maximum_concurrent_tasks: 1,
 			transfer_overlaps_calculation: device.attributes.async_engine_count != 0
 				&& device.attributes.concurrent_kernels,
@@ -434,26 +471,40 @@ fn copy_cuda_to_host<'op, 'ctx>(
 	complete_cuda(pending, timeout, "CUDA verification download")
 }
 
-fn complete_cuda(pending: Pending<'_, '_>, timeout: Duration, operation: &'static str) -> ProbeResult<()> {
-	match pending.wait(timeout).map_err(cuda_benchmark_error)? {
-		WaitOutcome::Complete(event) => {
-			drop(event);
-			Ok(())
-		}
-		WaitOutcome::TimedOut(mut pending) => {
-			// CUDA has no cancellation primitive. Continue making nonblocking
-			// progress until the bounded submission reaches a safe teardown
-			// point, then report that it exceeded the probe deadline.
-			loop {
-				match pending.poll().map_err(cuda_benchmark_error)? {
-					CompletionStatus::Complete => {
-						return Err(ProbeError::Benchmark(format!(
-							"{operation} exceeded its {timeout:?} deadline"
-						)));
-					}
-					CompletionStatus::Pending => std::thread::yield_now(),
-				}
+fn complete_cuda(mut pending: Pending<'_, '_>, timeout: Duration, operation: &'static str) -> ProbeResult<()> {
+	let start = Instant::now();
+	let mut backoff = CompletionPollBackoff::benchmark();
+	loop {
+		match pending.poll().map_err(cuda_benchmark_error)? {
+			CompletionStatus::Complete => {
+				drop(pending.recycle_event().map_err(cuda_benchmark_error)?);
+				return Ok(());
 			}
+			CompletionStatus::Pending => {}
+		}
+		let elapsed = start.elapsed();
+		if elapsed >= timeout {
+			break;
+		}
+		backoff.wait(timeout.saturating_sub(elapsed));
+	}
+
+	// CUDA has no cancellation primitive, and this token only phantom-borrows
+	// the live buffers used by the submission. Returning before completion
+	// would permit those buffers to unwind while the GPU still uses them.
+	// Continue awaiting this one operation with a large capped delay; never
+	// submit replacement work or rapidly query the display driver's context.
+	let mut cleanup_backoff = CompletionPollBackoff::timed_out_cleanup();
+	loop {
+		cleanup_backoff.wait(TIMED_OUT_CLEANUP_MAXIMUM_DELAY);
+		match pending.poll().map_err(cuda_benchmark_error)? {
+			CompletionStatus::Complete => {
+				drop(pending.recycle_event().map_err(cuda_benchmark_error)?);
+				return Err(ProbeError::Benchmark(format!(
+					"{operation} exceeded its {timeout:?} deadline"
+				)));
+			}
+			CompletionStatus::Pending => {}
 		}
 	}
 }
@@ -542,5 +593,17 @@ mod tests {
 		assert!(parse_pci_bus_id("04:00").is_err());
 		assert!(parse_pci_bus_id("0000:04:00.8").is_err());
 		assert!(parse_pci_bus_id("0000:gg:00.0").is_err());
+	}
+
+	#[test]
+	fn timed_out_completion_polling_reaches_a_large_fixed_cap() {
+		let mut backoff = CompletionPollBackoff::timed_out_cleanup();
+		assert_eq!(backoff.next_delay, Duration::from_millis(10));
+		for _ in 0..8 {
+			backoff.advance();
+		}
+		assert_eq!(backoff.next_delay, Duration::from_millis(100));
+		backoff.advance();
+		assert_eq!(backoff.next_delay, Duration::from_millis(100));
 	}
 }

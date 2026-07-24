@@ -24,6 +24,8 @@ pub(crate) const AGENT_INFO_VENDOR_NAME: HsaInfo = 1;
 pub(crate) const AGENT_INFO_FEATURE: HsaInfo = 2;
 pub(crate) const AGENT_INFO_PROFILE: HsaInfo = 4;
 pub(crate) const AGENT_INFO_WAVEFRONT_SIZE: HsaInfo = 6;
+/// `HSA_AGENT_INFO_QUEUES_MAX` from the HSA runtime ABI.
+pub(crate) const AGENT_INFO_QUEUES_MAX: HsaInfo = 12;
 pub(crate) const AGENT_INFO_QUEUE_MIN_SIZE: HsaInfo = 13;
 pub(crate) const AGENT_INFO_QUEUE_MAX_SIZE: HsaInfo = 14;
 pub(crate) const AGENT_INFO_QUEUE_TYPE: HsaInfo = 15;
@@ -341,6 +343,7 @@ mod tests {
 
 	#[test]
 	fn reviewed_constant_sentinels_match_headers() {
+		assert_eq!(AGENT_INFO_QUEUES_MAX, 12);
 		assert_eq!(AGENT_INFO_QUEUE_MAX_SIZE, 14);
 		assert_eq!(ISA_INFO_GRID_MAX_SIZE, 16);
 		assert_eq!(AMD_AGENT_INFO_UUID, 0xA011);

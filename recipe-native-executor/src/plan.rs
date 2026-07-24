@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use recipe_core::{
-	ArtifactId, ArtifactIdentity, ByteCount, CompletionSlotId, DeviceId, FinalizedBundle, InitDataImage, QueueSlotId,
-	ScheduleWindow, SubmissionSlots, Task, TaskId, TaskKind, ValueId,
+	ArtifactId, ArtifactIdentity, ByteCount, DeviceId, FinalizedBundle, InitDataImage, SubmissionSlots, Task, TaskId,
+	TaskKind, ValueId,
 };
-use recipe_kernel::{ArtifactDigest, KernelAbi, KernelArgument};
+use recipe_kernel::{ArtifactDigest, BufferAccess, KernelAbi, KernelArgument};
 
 use crate::{Error, Result};
 
@@ -194,6 +194,10 @@ impl ExecutionPlan {
 		self.artifacts.values().map(|contract| &contract.runtime)
 	}
 
+	pub(crate) fn artifact_contract(&self, artifact: ArtifactId) -> Option<&ArtifactContract> {
+		self.artifacts.get(&artifact)
+	}
+
 	pub(crate) fn submission(&self, task: TaskId) -> Option<PlannedSubmission> {
 		self.submissions.get(&task).copied()
 	}
@@ -334,16 +338,79 @@ fn validate_calculation_abi(
 	let TaskKind::Calculation(calculation) = &task.kind else {
 		return Err(mismatch(format!("task {} is not a calculation", task.id)));
 	};
-	let template = bundle
-		.kernel(calculation.kernel_template)
-		.ok_or_else(|| mismatch(format!("task {} has no finalized kernel template", task.id)))?;
+	let (expected_elements, expected_operands) = match bundle.artifact_build(calculation.artifact) {
+		Some(build) => {
+			ensure(
+				build.kernel_template == calculation.kernel_template,
+				mismatch(format!(
+					"task {} stage identity differs from its finalized build recipe",
+					task.id
+				)),
+			)?;
+			ensure(
+				abi.workgroup_lanes == build.dispatch.workgroup_lanes,
+				mismatch(format!(
+					"task {} ABI workgroup width {} differs from finalized build width {}",
+					task.id, abi.workgroup_lanes, build.dispatch.workgroup_lanes
+				)),
+			)?;
+			let operands = build
+				.bindings
+				.iter()
+				.filter(|binding| build.fault_flag != Some(binding.value) && binding.access.reads())
+				.map(|binding| {
+					(
+						binding.dtype,
+						binding.view.storage_bytes,
+						BufferAccess::Read,
+					)
+				})
+				.chain(
+					build.bindings
+						.iter()
+						.filter(|binding| {
+							build.fault_flag != Some(binding.value) && binding.access.writes()
+						})
+						.map(|binding| {
+							(
+								binding.dtype,
+								binding.view.storage_bytes,
+								BufferAccess::Write,
+							)
+						}),
+				)
+				.collect::<Vec<_>>();
+			(build.dispatch.logical_lanes, operands)
+		}
+		None => {
+			let template = bundle.kernel(calculation.kernel_template).ok_or_else(|| {
+				mismatch(format!(
+					"task {} has neither a finalized build recipe nor kernel template",
+					task.id
+				))
+			})?;
+			let operands = template
+				.inputs
+				.iter()
+				.map(|input| (input.dtype, input.access.storage_bytes, BufferAccess::Read))
+				.chain(template.outputs.iter().map(|output| {
+					(
+						output.dtype,
+						output.access.storage_bytes,
+						BufferAccess::Write,
+					)
+				}))
+				.collect::<Vec<_>>();
+			(template.index_space.elements().get(), operands)
+		}
+	};
 	ensure(
-		abi.elements == template.index_space.elements(),
+		abi.elements.get() == expected_elements,
 		mismatch(format!(
-			"task {} ABI element count {} differs from finalized index space {}",
+			"task {} ABI element count {} differs from finalized stage count {}",
 			task.id,
 			abi.elements.get(),
-			template.index_space.elements().get()
+			expected_elements
 		)),
 	)?;
 	let buffer_arguments = calculation
@@ -356,10 +423,22 @@ fn validate_calculation_abi(
 		.iter()
 		.filter(|argument| matches!(argument, KernelArgument::RunId))
 		.count();
+	let loop_iteration_arguments = abi
+		.arguments
+		.iter()
+		.filter(|argument| matches!(argument, KernelArgument::LoopIteration))
+		.count();
 	ensure(
 		run_id_arguments <= 1,
 		mismatch(format!(
 			"task {} ABI repeats its dynamic run-id argument",
+			task.id
+		)),
+	)?;
+	ensure(
+		loop_iteration_arguments <= 1,
+		mismatch(format!(
+			"task {} ABI repeats its loop-iteration argument",
 			task.id
 		)),
 	)?;
@@ -368,6 +447,9 @@ fn validate_calculation_abi(
 		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
 	let expected_arguments = expected_arguments
 		.checked_add(run_id_arguments)
+		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
+	let expected_arguments = expected_arguments
+		.checked_add(loop_iteration_arguments)
 		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
 	let expected_arguments = expected_arguments
 		.checked_add(1)
@@ -391,32 +473,23 @@ fn validate_calculation_abi(
 				.ok_or_else(|| mismatch(format!("task {} has no resolved value {value}", task.id)))
 		})
 		.collect::<Result<Vec<_>>>()?;
-	let accesses = template
-		.inputs
-		.iter()
-		.map(|input| (input.dtype, &input.access))
-		.chain(
-			template
-				.outputs
-				.iter()
-				.map(|output| (output.dtype, &output.access)),
-		)
-		.collect::<Vec<_>>();
 	ensure(
-		locations.len() == accesses.len(),
+		locations.len() == expected_operands.len(),
 		mismatch(format!(
-			"task {} operand count differs from finalized kernel mappings",
+			"task {} operand count differs from finalized stage mappings",
 			task.id
 		)),
 	)?;
-	for (index, ((location, (expected_dtype, access)), argument)) in locations
+	for (index, ((location, (expected_dtype, expected_bytes, expected_access)), argument)) in locations
 		.iter()
-		.zip(&accesses)
+		.zip(&expected_operands)
 		.zip(&abi.arguments)
 		.enumerate()
 	{
 		let KernelArgument::Buffer {
-			dtype, alignment, ..
+			access,
+			dtype,
+			alignment,
 		} = argument
 		else {
 			return Err(mismatch(format!(
@@ -432,6 +505,13 @@ fn validate_calculation_abi(
 			)),
 		)?;
 		ensure(
+			*access == *expected_access,
+			mismatch(format!(
+				"task {} argument {index} access {:?} differs from finalized {:?}",
+				task.id, access, expected_access
+			)),
+		)?;
+		ensure(
 			*alignment != 0
 				&& alignment.is_power_of_two()
 				&& location
@@ -444,12 +524,12 @@ fn validate_calculation_abi(
 			)),
 		)?;
 		ensure(
-			location.bytes == access.storage_bytes,
+			location.bytes == *expected_bytes,
 			mismatch(format!(
-				"task {} argument {index} has {} backing bytes, template requires {}",
+				"task {} argument {index} has {} backing bytes, finalized stage requires {}",
 				task.id,
 				location.bytes.get(),
-				access.storage_bytes.get()
+				expected_bytes.get()
 			)),
 		)?;
 	}
@@ -499,6 +579,26 @@ fn validate_calculation_abi(
 			task.id
 		))),
 	}?;
+	let loop_iteration_index = run_id_index
+		.checked_add(run_id_arguments)
+		.ok_or_else(|| mismatch(format!("task {} argument index overflowed", task.id)))?;
+	match loop_iteration_arguments {
+		0 => Ok(()),
+		1 => ensure(
+			matches!(
+				abi.arguments.get(loop_iteration_index),
+				Some(KernelArgument::LoopIteration)
+			),
+			mismatch(format!(
+				"task {} ABI loop iteration is not in its canonical suffix position",
+				task.id
+			)),
+		),
+		2.. => Err(mismatch(format!(
+			"task {} ABI repeats its loop-iteration argument",
+			task.id
+		))),
+	}?;
 	ensure(
 		matches!(abi.arguments.last(), Some(KernelArgument::ElementCount)),
 		mismatch(format!(
@@ -510,84 +610,30 @@ fn validate_calculation_abi(
 
 fn plan_submissions(bundle: &FinalizedBundle) -> Result<BTreeMap<TaskId, PlannedSubmission>> {
 	let mut result = BTreeMap::new();
-	let mut queue_use = BTreeMap::<QueueSlotId, Vec<ScheduleWindow>>::new();
-	let mut completion_use = BTreeMap::<CompletionSlotId, Vec<ScheduleWindow>>::new();
 
 	for task in bundle.tasks() {
-		let slots = match &task.kind {
-			TaskKind::Calculation(calculation) => Some((calculation.device, calculation.submission)),
-			TaskKind::Transfer(transfer) => Some((
+		let (device, slots) = match &task.kind {
+			TaskKind::Calculation(calculation) => (calculation.device, calculation.submission),
+			TaskKind::Transfer(transfer) => (
 				transfer_submission_device(task.id, transfer.source, transfer.destination)?,
 				transfer.submission,
-			)),
-			TaskKind::Metric(_) => None,
-		};
-		let Some((device, slots)) = slots else {
-			continue;
+			),
+			TaskKind::Metric(metric) => {
+				let location = bundle
+					.value_location(metric.value)
+					.ok_or(Error::ValueMismatch {
+						value: metric.value,
+						detail: "metric value has no finalized arena location",
+					})?;
+				(location.device, metric.submission)
+			}
 		};
 		validate_slots(bundle, task.id, device, slots)?;
-		queue_use.entry(slots.queue).or_default().push(task.window);
-		completion_use
-			.entry(slots.completion)
-			.or_default()
-			.push(task.window);
 		result.insert(
 			task.id,
 			PlannedSubmission {
 				task: task.id,
 				device,
-				slots,
-			},
-		);
-	}
-
-	let mut metrics = bundle
-		.tasks()
-		.iter()
-		.filter(|task| matches!(task.kind, TaskKind::Metric(_)))
-		.collect::<Vec<_>>();
-	metrics.sort_by_key(|task| (task.window.start, task.id));
-	for task in metrics {
-		let TaskKind::Metric(metric) = &task.kind else {
-			unreachable!("filtered metric tasks");
-		};
-		let location = bundle
-			.value_location(metric.value)
-			.ok_or(Error::ValueMismatch {
-				value: metric.value,
-				detail: "metric value has no finalized arena location",
-			})?;
-		let queue = bundle
-			.resources()
-			.queues
-			.iter()
-			.filter(|slot| slot.device == location.device)
-			.map(|slot| slot.id)
-			.find(|slot| slot_is_free(queue_use.get(slot), task.window));
-		let completion = bundle
-			.resources()
-			.completions
-			.iter()
-			.filter(|slot| slot.device == location.device)
-			.map(|slot| slot.id)
-			.find(|slot| slot_is_free(completion_use.get(slot), task.window));
-		let (Some(queue), Some(completion)) = (queue, completion) else {
-			return Err(Error::NoMetricSubmission {
-				task: task.id,
-				device: location.device,
-			});
-		};
-		let slots = SubmissionSlots { queue, completion };
-		queue_use.entry(queue).or_default().push(task.window);
-		completion_use
-			.entry(completion)
-			.or_default()
-			.push(task.window);
-		result.insert(
-			task.id,
-			PlannedSubmission {
-				task: task.id,
-				device: location.device,
 				slots,
 			},
 		);
@@ -631,10 +677,6 @@ fn validate_slots(bundle: &FinalizedBundle, task: TaskId, device: DeviceId, slot
 			completion: slots.completion,
 		},
 	)
-}
-
-fn slot_is_free(windows: Option<&Vec<ScheduleWindow>>, candidate: ScheduleWindow) -> bool {
-	windows.is_none_or(|windows| windows.iter().all(|window| !window.overlaps(candidate)))
 }
 
 fn ensure(valid: bool, error: Error) -> Result<()> {

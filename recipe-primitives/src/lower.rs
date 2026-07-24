@@ -5,8 +5,8 @@ use recipe_core::{
 	KernelOutputId, KernelTemplate, ScalarLiteral, StaticBufferAccess, ValueId,
 };
 use recipe_language::{
-	Elementwise, Gather, Histogram, IndexBounds, PrimitiveKernel, PrimitiveKind, RandomMap, Reduce, ReduceOperator,
-	ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Sort, Tensor,
+	Elementwise, Gather, Histogram, IndexBounds, IndexMap, PrimitiveKernel, PrimitiveKind, RandomMap, Reduce,
+	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Sort, Tensor,
 };
 
 use crate::error::{LoweringError, LoweringErrorKind, LoweringResult};
@@ -76,6 +76,7 @@ pub fn lower(kernel: &PrimitiveKernel, tensors: &BTreeMap<ValueId, &Tensor>) -> 
 			lower_histogram(&mut builder, kernel, *spec, tensors)?;
 		}
 		PrimitiveKind::Sort(spec) => lower_sort(&mut builder, kernel, *spec, tensors)?,
+		PrimitiveKind::IndexMap(spec) => lower_index_map(&mut builder, kernel, *spec, tensors)?,
 		PrimitiveKind::Random(spec) => lower_random(&mut builder, kernel, *spec, tensors)?,
 	}
 
@@ -1487,13 +1488,45 @@ fn lower_random(
 			counter: [
 				PhiloxCounterWord::ElementLow,
 				PhiloxCounterWord::ElementHigh,
-				PhiloxCounterWord::RunXorStreamLow,
-				PhiloxCounterWord::RunXorStreamHigh,
+				PhiloxCounterWord::IterationXorStreamLow,
+				PhiloxCounterWord::IterationXorStreamHigh,
 			],
 			fold_kernel_id_into_key: true,
+			fold_run_id_into_key: true,
 			uniform_i32: UniformI32Mapping::UnbiasedMultiplyHighWithCounterRejection,
 			normal_f32: NormalF32Mapping::OwnedBoxMullerV1,
 		}),
+	)?;
+	Ok(())
+}
+
+fn lower_index_map(
+	builder: &mut ProgramBuilder,
+	kernel: &PrimitiveKernel,
+	spec: IndexMap,
+	tensors: &BTreeMap<ValueId, &Tensor>,
+) -> LoweringResult<()> {
+	let output = tensor(tensors, kernel.outputs[0], kernel.id)?;
+	let false = output.shape.is_empty() else {
+		return Ok(());
+	};
+	let (fault, fault_binding, fault_atomic) = builder.checked_fault(FaultReason::ArithmeticDomain, 4)?;
+	let logical = output.shape.elements();
+	let integer_operations = logical
+		.checked_mul(INDEX_MAP_INTEGER_OPERATIONS_PER_LANE)
+		.ok_or_else(|| builder.overflow("index-map integer-operation bound"))?;
+	push_stage!(
+		builder,
+		geometry(logical, INDEX_WORKGROUP_LANES),
+		vec![
+			builder.binding(builder.tensor_buffer(kernel.outputs[0])?, AccessMode::Write)?,
+			fault_binding,
+		],
+		Vec::new(),
+		vec![fault_atomic],
+		Some(fault),
+		basic_resources(0, integer_operations, logical, 0, 32, INDEX_WORKGROUP_LANES,),
+		StageKind::IndexMap(spec),
 	)?;
 	Ok(())
 }

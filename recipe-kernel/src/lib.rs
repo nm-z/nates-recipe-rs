@@ -21,7 +21,8 @@ pub use artifact::{
 };
 pub use audit::{AuditFinding, AuditKind, audit_llvm_ir};
 pub use builder::{
-	ArtifactBuilder, BuildPhase, BuildProvenance, BuiltArtifact, OfflineToolchain, PinnedTool, ToolInvocation,
+	ArtifactBuilder, BuildPhase, BuildProvenance, BuiltArtifact, BuiltCubinBundle, BuiltHsacoBundle,
+	CubinBundleProvenance, HsacoBundleProvenance, OfflineToolchain, PinnedTool, ToolInvocation,
 };
 pub use error::{LoweringError, LoweringErrorKind};
 pub use llvm::{BufferAccess, KernelAbi, KernelArgument, LoweredKernel, LoweringOptions, lower_elementwise};

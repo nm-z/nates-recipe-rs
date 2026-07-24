@@ -9,5 +9,6 @@ mod planner;
 
 pub use error::{PlannerError, PlannerErrorKind, PlannerResult};
 pub use planner::{
-	KernelPlacement, LogicalValueCopy, PlannedCandidate, PlannerSearch, StagePlacement, plan_candidates,
+	KernelPlacement, LogicalValueCopy, PlannedCandidate, PlannedExternalOutput, PlannedProgramCandidate,
+	PlannerSearch, ProgramPlannerSearch, StagePlacement, plan_candidates, plan_program_candidates,
 };

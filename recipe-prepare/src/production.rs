@@ -7,7 +7,7 @@
 //! `Finalize`. Neither the compiler nor the driver is retained in the
 //! [`PreparedNativeSession`] that crosses into the run lifecycle.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -16,13 +16,11 @@ use std::sync::Arc;
 
 use recipe_core::{
 	ArtifactBuildRecipe, ArtifactId, ArtifactIdentity, CapacityLedger, Device, Digest, DiscoveredDevice,
-	DiscoveryProfile, EXACT_USER_RESERVATION, Label, ReservationEntry, ReservationLedger, ReservationMechanism,
+	DiscoveryProfile, Label, ReservationEntry, ReservationEvidence, ReservationLedger, ReservationMechanism,
 	TargetIdentity, ToolchainIdentity, Topology,
 };
 use recipe_cuda::{ComputeCapability, DriverSymbol, DriverVersion, ToolchainIdentity as CudaToolchainIdentity};
-use recipe_kernel::{
-	ArtifactBuilder, ArtifactDigest, BuildPhase, BuiltArtifact, KernelTarget, LoweringError, LoweringOptions,
-};
+use recipe_kernel::{ArtifactBuilder, ArtifactDigest, BuildPhase, KernelTarget, LoweringError, LoweringOptions};
 use recipe_language::CalculationGraph;
 use recipe_native_executor::{
 	CandidateArtifact as ExecutorCandidateArtifact, CandidateFailure as ExecutorCandidateFailure,
@@ -316,8 +314,29 @@ impl DeferredArtifactCompiler {
 			)?;
 			artifacts.push(artifact.clone());
 		}
+		let mut deferred_by_target = BTreeMap::<usize, Vec<&ArtifactBuildRecipe>>::new();
 		for build in &candidate.draft.artifact_builds {
-			artifacts.push(self.build_deferred(candidate, discovery, build)?);
+			let spec_index = self.build_spec_index(candidate, discovery, build)?;
+			deferred_by_target
+				.entry(spec_index)
+				.or_default()
+				.push(build);
+		}
+		for (spec_index, mut builds) in deferred_by_target {
+			builds.sort_by_key(|build| build.artifact);
+			let spec = self.targets.get(spec_index).ok_or_else(|| {
+				NativePrepareError::InvalidConfiguration(
+					"grouped build specification index is outside the target table".to_owned(),
+				)
+			})?;
+			match &spec.target {
+				KernelTarget::Amd(_) => {
+					artifacts.extend(self.build_amd_bundle(candidate, spec, &builds)?);
+				}
+				KernelTarget::Nvidia(_) => {
+					artifacts.extend(self.build_nvidia_bundle(candidate, spec, &builds)?);
+				}
+			}
 		}
 		artifacts.sort_by_key(|artifact| artifact.identity.id);
 		for pair in artifacts.windows(2) {
@@ -332,100 +351,173 @@ impl DeferredArtifactCompiler {
 		Ok(artifacts)
 	}
 
-	fn build_deferred(
+	fn build_spec_index(
 		&self,
 		candidate: &PlannedCandidate,
 		discovery: &DiscoveryProfile,
 		build: &ArtifactBuildRecipe,
-	) -> Result<NativeArtifact, NativePrepareError<Infallible>> {
+	) -> Result<usize, NativePrepareError<Infallible>> {
 		let target_identity = candidate_target(candidate, discovery, build.artifact)?;
-		let spec_index = match self
+		match self
 			.targets
 			.binary_search_by(|candidate| candidate.target_identity.cmp(&target_identity))
 		{
-			Ok(index) => index,
+			Ok(index) => Ok(index),
 			Err(search_error) => {
 				debug_assert!(search_error <= self.targets.len());
-				return Err(NativePrepareError::MissingBuildTarget(target_identity));
+				Err(NativePrepareError::MissingBuildTarget(target_identity))
 			}
+		}
+	}
+
+	fn build_nvidia_bundle(
+		&self,
+		candidate: &PlannedCandidate,
+		spec: &TargetBuildSpec,
+		builds: &[&ArtifactBuildRecipe],
+	) -> Result<Vec<NativeArtifact>, NativePrepareError<Infallible>> {
+		let KernelTarget::Nvidia(target) = &spec.target else {
+			return Err(NativePrepareError::InvalidConfiguration(
+				"NVIDIA bundle construction received a non-NVIDIA build specification".to_owned(),
+			));
 		};
-		let spec = self.targets.get(spec_index).ok_or_else(|| {
-			NativePrepareError::InvalidConfiguration(
-				"binary-search target index is outside the build specification table".to_owned(),
-			)
-		})?;
-		let program = candidate
-			.lowered_programs
+		let lowered = builds
 			.iter()
-			.find(|program| {
-				program.source_kernel == build.source_kernel
-					&& Digest::new(program.digest.bytes()) == build.provenance.program_digest
-			})
-			.ok_or_else(|| {
-				NativePrepareError::InvalidCandidate(format!(
-					"artifact {} has no exact lowered program",
-					build.artifact
-				))
-			})?;
-		let entry_symbol = format!("recipe_stage_{}", build.artifact.get());
-		let lowered = recipe_kernel::lower_stage(
-			program,
-			build,
-			&spec.target,
-			&LoweringOptions {
-				entry_symbol: entry_symbol.clone(),
-				workgroup_lanes: build.dispatch.workgroup_lanes,
-			},
-		)
-		.map_err(NativePrepareError::Lowering)?;
+			.map(|build| lower_deferred_stage(candidate, spec, build))
+			.collect::<Result<Vec<_>, _>>()?;
 		let built = spec
 			.builder
-			.build(
-				BuildPhase::Realize,
-				&lowered,
-				&spec.target,
-				&spec.scratch_parent,
-			)
+			.build_cubin_bundle(BuildPhase::Realize, &lowered, *target, &spec.scratch_parent)
 			.map_err(NativePrepareError::Lowering)?;
-		let (bytes, phase) = match &built {
-			BuiltArtifact::Hsaco {
-				bytes, provenance, ..
-			}
-			| BuiltArtifact::Cubin {
-				bytes, provenance, ..
-			} => (bytes.as_slice(), provenance.phase),
-		};
 		require(
-			phase == BuildPhase::Realize,
-			NativePrepareError::InvalidArtifact(format!(
-				"artifact {} was not built in Realize",
-				build.artifact
-			)),
+			built.provenance.phase == BuildPhase::Realize,
+			NativePrepareError::InvalidArtifact("NVIDIA cubin bundle was not built in Realize".to_owned()),
 		)?;
-		let digest = ArtifactDigest::of(bytes).bytes();
-		let identity = ArtifactIdentity {
-			id: build.artifact,
-			digest: Digest::new(digest),
-			format: spec.target_identity.abi.clone(),
-			target: spec.target_identity.clone(),
-			toolchain: spec.toolchain_identity.clone(),
-			entry_symbol: Label::new(entry_symbol).map_err(|error| {
+		require(
+			built.inspections.len() == lowered.len(),
+			NativePrepareError::InvalidArtifact(
+				"NVIDIA cubin bundle inspection count differs from its lowered entries".to_owned(),
+			),
+		)?;
+		for (inspection, kernel) in built.inspections.iter().zip(&lowered) {
+			require(
+				inspection.entry_symbol == kernel.abi.entry_symbol,
 				NativePrepareError::InvalidArtifact(format!(
-					"artifact {} entry symbol is invalid: {error}",
-					build.artifact
-				))
-			})?,
-			kernel_template: build.kernel_template,
-			resources: build.resources.clone(),
-			build: Some(build.provenance),
-		};
-		let runtime_kind = runtime_kind(spec, digest)?;
-		let bytes: Arc<[u8]> = match built {
-			BuiltArtifact::Hsaco { bytes, .. } | BuiltArtifact::Cubin { bytes, .. } => bytes.into(),
-		};
-		let runtime = RuntimeArtifact::new(build.artifact, bytes, lowered.abi, runtime_kind);
-		NativeArtifact::new(identity, runtime).map_err(erase_never)
+					"NVIDIA bundle inspection for `{}` returned entry `{}`",
+					kernel.abi.entry_symbol, inspection.entry_symbol
+				)),
+			)?;
+		}
+		let bytes: Arc<[u8]> = built.bytes.into();
+		builds.iter()
+			.zip(lowered)
+			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, Arc::clone(&bytes)))
+			.collect()
 	}
+
+	fn build_amd_bundle(
+		&self,
+		candidate: &PlannedCandidate,
+		spec: &TargetBuildSpec,
+		builds: &[&ArtifactBuildRecipe],
+	) -> Result<Vec<NativeArtifact>, NativePrepareError<Infallible>> {
+		let KernelTarget::Amd(target) = &spec.target else {
+			return Err(NativePrepareError::InvalidConfiguration(
+				"AMD bundle construction received a non-AMD build specification".to_owned(),
+			));
+		};
+		let lowered = builds
+			.iter()
+			.map(|build| lower_deferred_stage(candidate, spec, build))
+			.collect::<Result<Vec<_>, _>>()?;
+		let built = spec
+			.builder
+			.build_hsaco_bundle(BuildPhase::Realize, &lowered, target, &spec.scratch_parent)
+			.map_err(NativePrepareError::Lowering)?;
+		require(
+			built.provenance.phase == BuildPhase::Realize,
+			NativePrepareError::InvalidArtifact("AMD code-object bundle was not built in Realize".to_owned()),
+		)?;
+		require(
+			built.inspections.len() == lowered.len(),
+			NativePrepareError::InvalidArtifact(
+				"AMD code-object bundle inspection count differs from its lowered entries".to_owned(),
+			),
+		)?;
+		for (inspection, kernel) in built.inspections.iter().zip(&lowered) {
+			require(
+				inspection.kernel.name == kernel.abi.entry_symbol,
+				NativePrepareError::InvalidArtifact(format!(
+					"AMD bundle inspection for `{}` returned entry `{}`",
+					kernel.abi.entry_symbol, inspection.kernel.name
+				)),
+			)?;
+		}
+		let bytes: Arc<[u8]> = built.bytes.into();
+		builds.iter()
+			.zip(lowered)
+			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, Arc::clone(&bytes)))
+			.collect()
+	}
+}
+
+fn lower_deferred_stage(
+	candidate: &PlannedCandidate,
+	spec: &TargetBuildSpec,
+	build: &ArtifactBuildRecipe,
+) -> Result<recipe_kernel::LoweredKernel, NativePrepareError<Infallible>> {
+	let program = candidate
+		.lowered_programs
+		.iter()
+		.find(|program| {
+			program.source_kernel == build.source_kernel
+				&& Digest::new(program.digest.bytes()) == build.provenance.program_digest
+		})
+		.ok_or_else(|| {
+			NativePrepareError::InvalidCandidate(format!(
+				"artifact {} has no exact lowered program",
+				build.artifact
+			))
+		})?;
+	let entry_symbol = format!("recipe_stage_{}", build.artifact.get());
+	recipe_kernel::lower_stage(
+		program,
+		build,
+		&spec.target,
+		&LoweringOptions {
+			entry_symbol,
+			workgroup_lanes: build.dispatch.workgroup_lanes,
+		},
+	)
+	.map_err(NativePrepareError::Lowering)
+}
+
+fn native_artifact_from_image(
+	spec: &TargetBuildSpec,
+	build: &ArtifactBuildRecipe,
+	lowered: recipe_kernel::LoweredKernel,
+	bytes: Arc<[u8]>,
+) -> Result<NativeArtifact, NativePrepareError<Infallible>> {
+	let digest = ArtifactDigest::of(&bytes).bytes();
+	let identity = ArtifactIdentity {
+		id: build.artifact,
+		digest: Digest::new(digest),
+		format: spec.target_identity.abi.clone(),
+		target: spec.target_identity.clone(),
+		toolchain: spec.toolchain_identity.clone(),
+		entry_symbol: Label::new(lowered.abi.entry_symbol.clone()).map_err(|error| {
+			NativePrepareError::InvalidArtifact(format!(
+				"artifact {} entry symbol is invalid: {error}",
+				build.artifact
+			))
+		})?,
+		kernel_template: build.kernel_template,
+		resources: build.resources.clone(),
+		build: Some(build.provenance),
+	};
+	let runtime_kind = runtime_kind(spec, digest)?;
+	let runtime = RuntimeArtifact::new(build.artifact, bytes, lowered.abi, runtime_kind);
+	NativeArtifact::new(identity, runtime).map_err(erase_never)
 }
 
 fn runtime_kind(
@@ -608,6 +700,12 @@ pub trait CandidateDriver {
 		discovered: &DiscoveredDevice,
 	) -> Result<ReservationMechanism, Self::Error>;
 
+	fn reservation_evidence(
+		&self,
+		device: &Device,
+		discovered: &DiscoveredDevice,
+	) -> Result<ReservationEvidence, Self::Error>;
+
 	fn realize_candidate(
 		&mut self,
 		request: CandidateRealizationRequest<'_>,
@@ -669,7 +767,16 @@ where
 		discovered: &DiscoveredDevice,
 	) -> Result<ReservationMechanism, Self::Error> {
 		debug_assert_eq!(device.id, discovered.device);
-		Ok(ReservationMechanism::HeldAllocation)
+		Ok(ReservationMechanism::EnforcedQuota)
+	}
+
+	fn reservation_evidence(
+		&self,
+		device: &Device,
+		discovered: &DiscoveredDevice,
+	) -> Result<ReservationEvidence, Self::Error> {
+		debug_assert_eq!(device.id, discovered.device);
+		self.factory.reservation_evidence(device.id)
 	}
 
 	fn realize_candidate(
@@ -932,6 +1039,9 @@ where
 		let mechanism = driver
 			.reservation_mechanism(device, discovered)
 			.map_err(NativePrepareError::Driver)?;
+		let evidence = driver
+			.reservation_evidence(device, discovered)
+			.map_err(NativePrepareError::Driver)?;
 		entries.push(ReservationEntry {
 			device: device.id,
 			name: Label::new(format!("recipe-user-{}", device.id.get())).map_err(|error| {
@@ -940,8 +1050,9 @@ where
 					device.id
 				))
 			})?,
-			bytes: EXACT_USER_RESERVATION,
+			bytes: evidence.required_bytes(),
 			mechanism,
+			evidence,
 		});
 	}
 	let reservations = ReservationLedger { entries };
@@ -992,12 +1103,14 @@ fn map_driver_failure<E>(failure: CandidateDriverFailure<E>) -> RealizeFailure<N
 	}
 }
 
-fn driver_failure_detail<E>(failure: &CandidateDriverFailure<E>) -> String {
+fn driver_failure_detail<E: fmt::Display>(failure: &CandidateDriverFailure<E>) -> String {
 	match failure {
 		CandidateDriverFailure::CandidateRejected { detail } => {
 			format!("candidate rejection with a live session: {detail}")
 		}
-		CandidateDriverFailure::Fatal(_) => "fatal driver failure with a live session".to_owned(),
+		CandidateDriverFailure::Fatal(error) => {
+			format!("fatal driver failure with a live session ({error})")
+		}
 		CandidateDriverFailure::PreFinalRealizationUnavailable { backend } => {
 			format!("{backend} lacks pre-final candidate realization with a live session")
 		}
@@ -1179,6 +1292,7 @@ mod tests {
 				.map(|device| DiscoveredDevice {
 					device: device.id,
 					available: true,
+					maximum_submission_queues: 64,
 					total_capacity: measured(ByteCount::new(4_000_000_000)),
 					transfer: TransferCapability {
 						rate: measured(
@@ -1218,7 +1332,21 @@ mod tests {
 			discovered: &DiscoveredDevice,
 		) -> Result<ReservationMechanism, Self::Error> {
 			debug_assert_eq!(device.id, discovered.device);
-			Ok(ReservationMechanism::HeldAllocation)
+			Ok(ReservationMechanism::EnforcedQuota)
+		}
+
+		fn reservation_evidence(
+			&self,
+			device: &Device,
+			discovered: &DiscoveredDevice,
+		) -> Result<ReservationEvidence, Self::Error> {
+			debug_assert_eq!(device.id, discovered.device);
+			Ok(match device.kind {
+				recipe_core::DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
+					enabled_connectors: 1,
+				},
+				recipe_core::DeviceKind::Ram | recipe_core::DeviceKind::Disk => ReservationEvidence::NonGpu,
+			})
 		}
 
 		fn realize_candidate(
@@ -1275,8 +1403,18 @@ mod tests {
 			let entry = reservations
 				.entry(device.id)
 				.unwrap_or_else(|| panic!("device {} has no reservation", device.id));
-			assert_eq!(entry.bytes, EXACT_USER_RESERVATION);
-			assert_eq!(entry.mechanism, ReservationMechanism::HeldAllocation);
+			assert_eq!(entry.bytes, recipe_core::EXACT_USER_RESERVATION);
+			assert_eq!(entry.mechanism, ReservationMechanism::EnforcedQuota);
+			assert_eq!(
+				entry.evidence,
+				match device.kind {
+					recipe_core::DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
+						enabled_connectors: 1,
+					},
+					recipe_core::DeviceKind::Ram | recipe_core::DeviceKind::Disk =>
+						ReservationEvidence::NonGpu,
+				}
+			);
 			assert_eq!(
 				entry.name.as_str(),
 				format!("recipe-user-{}", device.id.get())
@@ -1414,6 +1552,20 @@ mod tests {
 			Err(RealizeFailure::CandidateRejected { .. })
 		));
 		assert_eq!(realizer.driver.destroyed, 1);
+	}
+
+	#[test]
+	fn teardown_diagnostic_preserves_the_first_fatal_driver_error() {
+		let failure = CandidateDriverFailure::Fatal(std::io::Error::other("first execution failure"));
+		let error = NativePrepareError::Teardown {
+			operation: driver_failure_detail(&failure),
+			source: std::io::Error::other("teardown failure"),
+		};
+
+		assert_eq!(
+			error.to_string(),
+			"candidate teardown failed after fatal driver failure with a live session (first execution failure): teardown failure"
+		);
 	}
 
 	#[test]

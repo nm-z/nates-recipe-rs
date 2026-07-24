@@ -36,11 +36,19 @@ probe requires LLVM `opt` and `llc`. AMD probing additionally needs ROCr/HSA and
 an ELF linker; NVIDIA probing needs the CUDA Driver library and can use a pinned
 `ptxas`.
 
-The public training and inference builders currently produce checked
-declarations. A single facade call that lowers those declarations through
-preparation and runs a complete real workload is still being integrated; the
-README intentionally does not advertise the retired `train`, `serve`, or
-`detect` commands.
+The public dense-binary training facade loads and semantically prepares the
+dataset, compiles Recipe-owned primitives, schedules and prepares the measured
+native GPU, executes the immutable training lifecycle, streams nonblocking
+metrics, tears native resources down, and saves the final weights as OGDL. The
+complete runnable path is:
+
+```bash
+cargo run --release --example train
+```
+
+It writes `model.ogdl` only after a successful `init -> loop -> exit`
+lifecycle. Inference builders remain checked declarations; the README does not
+advertise the retired `train`, `serve`, or `detect` CLI commands.
 
 ## Build and test
 

@@ -28,6 +28,10 @@ pub enum KernelArgument {
 	/// kernels. This is an explicit 64-bit by-value launch argument; it may not
 	/// be folded into an AOT artifact.
 	RunId,
+	/// Zero-based static-loop iteration selected by the executor. This is an
+	/// explicit unsigned 64-bit by-value launch argument and is present only
+	/// for iteration-dependent kernels.
+	LoopIteration,
 	ElementCount,
 }
 
@@ -516,7 +520,7 @@ fn lower_instruction(emitter: &mut Emitter, instruction: &ScalarInstruction) -> 
 		(ScalarOpcode::Add, DType::F32) => constrained_binary(emitter, "fadd", &operands),
 		(ScalarOpcode::Subtract, DType::F32) => constrained_binary(emitter, "fsub", &operands),
 		(ScalarOpcode::Multiply, DType::F32) => constrained_binary(emitter, "fmul", &operands),
-		(ScalarOpcode::Divide, DType::F32) => constrained_binary(emitter, "fdiv", &operands),
+		(ScalarOpcode::Divide, DType::F32) => plain_fdiv(emitter, &operands),
 		(ScalarOpcode::Remainder, DType::F32) => constrained_binary(emitter, "frem", &operands),
 		(ScalarOpcode::Add, DType::I32) => integer_binary(emitter, "add", &operands),
 		(ScalarOpcode::Subtract, DType::I32) => integer_binary(emitter, "sub", &operands),
@@ -577,7 +581,7 @@ fn lower_instruction(emitter: &mut Emitter, instruction: &ScalarInstruction) -> 
 		(ScalarOpcode::Require, DType::I32) => require(emitter, &operands),
 		(ScalarOpcode::IsFinite, DType::I32) => classify_float(emitter, false, &operands),
 		(ScalarOpcode::IsNan, DType::I32) => classify_float(emitter, true, &operands),
-		(ScalarOpcode::SquareRoot, DType::F32) => constrained_square_root(emitter, &operands),
+		(ScalarOpcode::SquareRoot, DType::F32) => square_root(emitter, &operands),
 		(ScalarOpcode::Floor, DType::F32) => unary_float_intrinsic(emitter, "floor", &operands),
 		(ScalarOpcode::Ceiling, DType::F32) => unary_float_intrinsic(emitter, "ceil", &operands),
 		(ScalarOpcode::RoundNearestEven, DType::F32) => unary_float_intrinsic(emitter, "roundeven", &operands),
@@ -621,6 +625,15 @@ fn constrained_binary(emitter: &mut Emitter, operation: &str, operands: &[ValueR
 	let raw = emitter.temporary("fp");
 	emitter.line(format_args!(
 		"  {raw} = call float @llvm.experimental.constrained.{operation}.f32(float {}, float {}, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")",
+		operands[0].operand, operands[1].operand
+	));
+	emitter.canonicalize_nan(raw)
+}
+
+fn plain_fdiv(emitter: &mut Emitter, operands: &[ValueRef]) -> String {
+	let raw = emitter.temporary("fp");
+	emitter.line(format_args!(
+		"  {raw} = fdiv float {}, {}",
 		operands[0].operand, operands[1].operand
 	));
 	emitter.canonicalize_nan(raw)
@@ -871,11 +884,11 @@ fn classify_float(emitter: &mut Emitter, nan: bool, operands: &[ValueRef]) -> St
 	result
 }
 
-fn constrained_square_root(emitter: &mut Emitter, operands: &[ValueRef]) -> String {
+fn square_root(emitter: &mut Emitter, operands: &[ValueRef]) -> String {
 	emitter.uses_square_root = true;
 	let raw = emitter.temporary("sqrt");
 	emitter.line(format_args!(
-		"  {raw} = call float @llvm.experimental.constrained.sqrt.f32(float {}, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")",
+		"  {raw} = call float @llvm.sqrt.f32(float {})",
 		operands[0].operand
 	));
 	emitter.canonicalize_nan(raw)
@@ -944,7 +957,7 @@ fn assemble_module(
 		}
 	}
 	if emitter.uses_f32_arithmetic {
-		for operation in ["fadd", "fsub", "fmul", "fdiv", "frem"] {
+		for operation in ["fadd", "fsub", "fmul", "frem"] {
 			if emitter
 				.body
 				.contains(&format!("constrained.{operation}.f32"))
@@ -972,7 +985,7 @@ fn assemble_module(
 		module.push_str("declare i32 @llvm.fptosi.sat.i32.f32(float)\n");
 	}
 	if emitter.uses_square_root {
-		module.push_str("declare float @llvm.experimental.constrained.sqrt.f32(float, metadata, metadata)\n");
+		module.push_str("declare float @llvm.sqrt.f32(float)\n");
 	}
 	if emitter.uses_floor {
 		module.push_str("declare float @llvm.floor.f32(float)\n");
@@ -1037,6 +1050,9 @@ const fn instruction_flops(opcode: ScalarOpcode) -> u64 {
 
 #[cfg(test)]
 mod tests {
+	use std::io::Write as _;
+	use std::process::{Command, Stdio};
+
 	use recipe_core::{
 		AliasPermission, AliasRule, ElementCount, IndexSpace, KernelInput, KernelInputId, KernelOutput,
 		KernelOutputId, KernelTemplateId, ScalarInput, ScalarProgram,
@@ -1181,6 +1197,83 @@ mod tests {
 		assert!(lowered.llvm_ir.contains("canonical_nan"));
 		assert_eq!(lowered.work, FlopCount::new(1024));
 		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
+	}
+
+	#[test]
+	fn emits_backend_safe_plain_fdiv_for_amd_scalar_division() {
+		let lowered = lower_elementwise(
+			&operation_template(ScalarOpcode::Divide, DType::F32, &[DType::F32, DType::F32]),
+			&KernelTarget::Amd(AmdTarget {
+				target_id: "gfx1101".to_owned(),
+				code_object_version: 6,
+			}),
+			&options(),
+		)
+		.unwrap();
+		assert!(lowered.llvm_ir.contains(" = fdiv float "));
+		assert!(!lowered.llvm_ir.contains("constrained.fdiv"));
+		assert!(lowered.llvm_ir.contains("canonical_nan"));
+		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
+	}
+
+	#[test]
+	fn emits_backend_safe_sqrt_intrinsic_for_amd_scalar_square_root() {
+		let lowered = lower_elementwise(
+			&operation_template(ScalarOpcode::SquareRoot, DType::F32, &[DType::F32]),
+			&KernelTarget::Amd(AmdTarget {
+				target_id: "gfx1101".to_owned(),
+				code_object_version: 6,
+			}),
+			&options(),
+		)
+		.unwrap();
+		assert!(
+			lowered
+				.llvm_ir
+				.contains("declare float @llvm.sqrt.f32(float)")
+		);
+		assert!(lowered.llvm_ir.contains("call float @llvm.sqrt.f32(float "));
+		assert!(!lowered.llvm_ir.contains("constrained.sqrt"));
+		assert!(lowered.llvm_ir.contains("canonical_nan"));
+		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
+	}
+
+	#[test]
+	#[ignore = "requires the host LLVM AMDGPU backend"]
+	fn host_llc_compiles_amd_scalar_division_with_plain_fdiv() {
+		let lowered = lower_elementwise(
+			&operation_template(ScalarOpcode::Divide, DType::F32, &[DType::F32, DType::F32]),
+			&KernelTarget::Amd(AmdTarget {
+				target_id: "gfx1101".to_owned(),
+				code_object_version: 6,
+			}),
+			&options(),
+		)
+		.unwrap();
+		let mut child = Command::new("/usr/bin/llc")
+			.args([
+				"-filetype=null",
+				"-march=amdgcn",
+				"-mcpu=gfx1101",
+				"--amdhsa-code-object-version=6",
+				"-",
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("spawn host llc");
+		{
+			let mut stdin = child.stdin.take().expect("host llc stdin");
+			stdin.write_all(lowered.llvm_ir.as_bytes())
+				.expect("write LLVM IR");
+		}
+		let output = child.wait_with_output().expect("wait for host llc");
+		assert!(
+			output.status.success(),
+			"host llc rejected AMD scalar division:\n{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
 	}
 
 	#[test]

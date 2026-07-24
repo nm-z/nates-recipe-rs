@@ -515,6 +515,29 @@ input height and width, scale height and width, and true
 `input[y / scale_height, x / scale_width]`; a checked gather plus identity map
 uses four workspace bytes per output.
 
+## Training-core materializers
+
+`gpu_linear_into` and `gpu_linear_f32` consume f32 `input[m,k]`,
+`weight[k,n]`, and `bias[n]`, then produce `output[m,n]`. The canonical
+contraction writes one `m*n` intermediate before an owned scalar add broadcasts
+the bias, so workspace is exactly `4*m*n` bytes. `gpu_matvec_bias_into` is the
+`n = 1` ABI: `weight[k]`, `bias[1]`, `output[m]`, and `4*m` workspace bytes.
+
+`gpu_linear_backward_full_into` consumes `output_gradient[m,n]`,
+`input[m,k]`, and `weight[k,n]`; it produces `input_gradient[m,k]`,
+`weight_gradient[k,n]`, and `bias_gradient[n]`. The weights-only form omits
+`weight` and `input_gradient`. Both take only `tree_lanes`; contractions form
+the matrix gradients and a fixed-tree axis-zero sum forms the bias gradient.
+Neither backward graph reserves workspace.
+
+`gpu_bce_with_logits` consumes equal-shaped f32 `logits` and `targets` and
+produces equal-shaped `losses` and `gradients` in one elementwise kernel. Its
+single owned SSA program inlines Recipe's stable softplus and sigmoid programs,
+computing `softplus(logit) - logit*target` and `sigmoid(logit) - target`.
+Targets must be finite values in `[0,1]`; Recipe math domain checks also remain
+in the graph. Workspace is zero. Every training-core input/output alias is
+forbidden and every tensor and prepared-parameter name set is exact.
+
 ## Loss, statistics, and metric materializers (fixed-tree batch)
 
 This batch owns fifteen exact source descriptors. Every payload is canonical
@@ -629,5 +652,5 @@ map evaluates
 `8*rows*dimensions + 8*rows` bytes.
 
 There are 264 structured source descriptors in the normative operation
-surface. One hundred three now have concrete, source-qualified materializers;
-the deterministic remaining manifest contains 161.
+surface. One hundred thirty-two now have concrete, source-qualified
+materializers; the deterministic remaining manifest contains 132.

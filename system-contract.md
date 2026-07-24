@@ -112,15 +112,28 @@ not manually enter device identities, capacities, rates, or links.
 
 ### C5: exact user reservation
 
-Before Recipe's arena is finalized, every required VRAM, RAM, and disk storage
-device holds a named user-owned allocation or enforceable quota of exactly
-`1_000_000_000` bytes. Recipe runtime overhead, driver use, fragmentation, and
-safety headroom are separate ledger entries. Extra unused capacity does not
-change the reservation's size.
+At preparation start, Recipe captures each required device's live available
+capacity exactly once. The scheduler then enforces a Recipe allocation ceiling
+derived from that immutable init snapshot. It does not consume the protected
+bytes with a dummy allocation.
+
+- Every RAM and disk device retains exactly `1_000_000_000` bytes.
+- A GPU with one or more live DRM connectors retains exactly
+  `1_000_000_000` bytes for the user's display context.
+- A GPU with zero live display connectors records an explicit zero-byte
+  headroom exemption.
+
+Recipe-owned runtime overhead is charged inside the allocation ceiling before
+arena capacity is finalized. Driver use, fragmentation, and the user headroom
+remain separate ledger evidence. Extra unused capacity does not change the
+headroom.
 
 The reservation protects capacity within Recipe's accounting domain. Recipe
 does not claim it can prevent an unrelated process or the operating system from
-consuming globally free memory.
+consuming globally free memory. Before a model is saved, all transient VRAM,
+RAM, disk pools, staged data, generated artifacts, and run arenas are released.
+The save path is rechecked against live disk availability so the temporary
+atomic output and the retained user headroom both fit.
 
 ### C6: one upload and one free
 

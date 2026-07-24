@@ -2,13 +2,12 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use recipe_core::{Label, TargetIdentity, TransferLaneCount, TransportKind};
 use recipe_hsa::{
 	AgentDescription, AgentUuidBody, DeviceType, DiscoveredAgent, DispatchGeometry, IsaTarget, MemoryLocation,
 	MemoryPoolFlags, MemorySegment, Pending, PollStatus, QueueConfig, QueueKind, Runtime, Session, SystemDescription,
-	WaitOutcome,
 };
 use recipe_kernel::{
 	AmdTarget, ArtifactBuilder, BuildPhase, BuiltArtifact, KernelTarget, LoweringOptions, lower_elementwise,
@@ -28,6 +27,41 @@ use crate::native::Backend;
 
 const HSA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
 const PREFERRED_WORKGROUP_LANES: u32 = 256;
+const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
+const COMPLETION_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
+const TIMED_OUT_CLEANUP_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const TIMED_OUT_CLEANUP_MAXIMUM_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug)]
+struct CompletionPollBackoff {
+	next_delay: Duration,
+	maximum_delay: Duration,
+}
+
+impl CompletionPollBackoff {
+	const fn benchmark() -> Self {
+		Self {
+			next_delay: COMPLETION_POLL_INITIAL_DELAY,
+			maximum_delay: COMPLETION_POLL_MAXIMUM_DELAY,
+		}
+	}
+
+	const fn timed_out_cleanup() -> Self {
+		Self {
+			next_delay: TIMED_OUT_CLEANUP_INITIAL_DELAY,
+			maximum_delay: TIMED_OUT_CLEANUP_MAXIMUM_DELAY,
+		}
+	}
+
+	fn wait(&mut self, maximum: Duration) {
+		std::thread::sleep(self.next_delay.min(maximum));
+		self.advance();
+	}
+
+	fn advance(&mut self) {
+		self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay);
+	}
+}
 
 pub(crate) struct HsaBackend {
 	library: BackendLibrary,
@@ -113,6 +147,10 @@ impl HsaBackend {
 		operation(&state.library, &state.runtime).map(Some)
 	}
 
+	pub(crate) const fn code_object_version(&self) -> u8 {
+		self.code_object_version
+	}
+
 	pub(crate) fn descriptor(
 		&self,
 		library: &PinnedLibrary,
@@ -147,6 +185,12 @@ impl HsaBackend {
 		let gpu = description.amd_gpu.as_ref().ok_or_else(|| {
 			ProbeError::Discovery(format!(
 				"HSA GPU {} omitted AMD capability properties",
+				description.identity.uuid
+			))
+		})?;
+		let queue = description.queue.ok_or_else(|| {
+			ProbeError::Discovery(format!(
+				"HSA GPU {} omitted its physical queue limits",
 				description.identity.uuid
 			))
 		})?;
@@ -214,6 +258,7 @@ impl HsaBackend {
 			device_to_host_maximum_inflight: TransferLaneCount::new(1)
 				.map_err(|error| ProbeError::Discovery(format!("HSA device-to-host lane count: {error}")))?,
 			asynchronous_submission: true,
+			maximum_submission_queues: queue.maximum_queues,
 			maximum_concurrent_tasks: 1,
 			transfer_overlaps_calculation: gpu.sdma_engine_count != 0,
 		}))
@@ -704,24 +749,41 @@ fn copy_hsa_to_host(allocation: &recipe_hsa::Allocation<'_>, destination: &mut [
 }
 
 fn complete_hsa(pending: &mut Pending<'_, '_>, timeout: Duration, operation: &'static str) -> ProbeResult<()> {
-	match pending
-		.wait(timeout)
-		.map_err(|error| hsa_benchmark_error(operation, error))?
-	{
-		WaitOutcome::Complete => Ok(()),
-		WaitOutcome::TimedOut => loop {
-			match pending
-				.poll()
-				.map_err(|error| hsa_benchmark_error(operation, error))?
-			{
-				PollStatus::Complete => {
-					return Err(ProbeError::Benchmark(format!(
-						"{operation} exceeded its {timeout:?} deadline"
-					)));
-				}
-				PollStatus::Pending => std::thread::yield_now(),
+	let start = Instant::now();
+	let mut backoff = CompletionPollBackoff::benchmark();
+	loop {
+		match pending
+			.poll()
+			.map_err(|error| hsa_benchmark_error(operation, error))?
+		{
+			PollStatus::Complete => return Ok(()),
+			PollStatus::Pending => {}
+		}
+		let elapsed = start.elapsed();
+		if elapsed >= timeout {
+			break;
+		}
+		backoff.wait(timeout.saturating_sub(elapsed));
+	}
+
+	// A live HSA token retains the signal, allocations, and executable needed
+	// by its already-submitted operation. Await that operation at a low capped
+	// query rate so error unwinding cannot release live resources and the
+	// display driver is never hammered by a timeout cleanup loop.
+	let mut cleanup_backoff = CompletionPollBackoff::timed_out_cleanup();
+	loop {
+		cleanup_backoff.wait(TIMED_OUT_CLEANUP_MAXIMUM_DELAY);
+		match pending
+			.poll()
+			.map_err(|error| hsa_benchmark_error(operation, error))?
+		{
+			PollStatus::Complete => {
+				return Err(ProbeError::Benchmark(format!(
+					"{operation} exceeded its {timeout:?} deadline"
+				)));
 			}
-		},
+			PollStatus::Pending => {}
+		}
 	}
 }
 
@@ -762,6 +824,18 @@ mod tests {
 			hsa_workgroup_lanes(&description, 100).expect("workgroup lanes"),
 			64
 		);
+	}
+
+	#[test]
+	fn timed_out_completion_polling_reaches_a_large_fixed_cap() {
+		let mut backoff = CompletionPollBackoff::timed_out_cleanup();
+		assert_eq!(backoff.next_delay, Duration::from_millis(10));
+		for _ in 0..8 {
+			backoff.advance();
+		}
+		assert_eq!(backoff.next_delay, Duration::from_millis(100));
+		backoff.advance();
+		assert_eq!(backoff.next_delay, Duration::from_millis(100));
 	}
 
 	fn fixture_description() -> AgentDescription {

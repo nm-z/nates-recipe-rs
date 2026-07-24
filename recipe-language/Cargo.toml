@@ -7,6 +7,7 @@ description = "Backend-neutral tensor and primitive-kernel language for Recipe"
 
 [dependencies]
 recipe-core = { path = "../recipe-core" }
+recipe-ogdl = { path = "../recipe-ogdl" }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -35,8 +35,8 @@ pub(crate) const fn completion_poll_call(task: recipe_core::TaskId, status: Phys
 mod tests {
 	use super::*;
 	use recipe_core::{
-		ArenaObjectId, ByteCount, ByteOffset, DType, DeviceId, MetricId, MetricSlotId, ResolvedValueLocation,
-		TaskId, ValueId,
+		ArenaObjectId, ByteCount, ByteOffset, CompletionSlotId, DType, DeviceId, MetricId, MetricSlotId,
+		QueueSlotId, ResolvedValueLocation, SubmissionSlots, TaskId, ValueId,
 	};
 	use recipe_executor::{BackendWork, MetricWork};
 
@@ -44,6 +44,9 @@ mod tests {
 	fn one_logical_metric_submission_is_one_physical_submit_record() {
 		let work = BackendWork::Metric(MetricWork {
 			task: TaskId::new(9),
+			iteration: recipe_core::LoopIterations::ONE
+				.iteration(0)
+				.expect("one loop iteration has index zero"),
 			metric: MetricId::new(3),
 			slot: MetricSlotId::new(4),
 			purpose: recipe_core::MetricPurpose::User,
@@ -55,6 +58,10 @@ mod tests {
 				object: ArenaObjectId::new(7),
 				object_offset: ByteOffset::new(0),
 				arena_offset: ByteOffset::new(16),
+			},
+			submission: SubmissionSlots {
+				queue: QueueSlotId::new(5),
+				completion: CompletionSlotId::new(6),
 			},
 		});
 		assert_eq!(

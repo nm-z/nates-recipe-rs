@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use recipe_core::{DeviceId, MachineId, RunId};
 use recipe_cuda::{Context, ContextFlags, DeploymentIdentity};
 use recipe_host::{DiskFileSpec, HostBackendConfig, HostDeviceBinding};
-use recipe_hsa::{DiscoveredAgent, Session};
+use recipe_hsa::{DeviceType, DiscoveredAgent, MemoryPoolFlags, MemorySegment, Session};
 use recipe_native_executor::{CudaBinding, HsaBinding};
 use recipe_probe::{
 	GpuDiscovery as _, HostInventory, MeasuredProfile, ProbeError, ProbeResult, ResolvedGpuDevice,
@@ -11,7 +11,6 @@ use recipe_probe::{
 };
 
 use crate::NativeGpuProbe;
-use crate::config::NativeProbeConfig;
 use crate::cuda::CudaBackend;
 use crate::hsa::{HsaBackend, exact_target};
 
@@ -57,6 +56,7 @@ impl<'cuda, 'hsa> NativeExecutionBindings<'cuda, 'hsa> {
 struct ExpectedGpu {
 	device: DeviceId,
 	key: String,
+	enabled_display_connectors: u32,
 }
 
 #[derive(Debug)]
@@ -64,13 +64,30 @@ struct RealizedCuda {
 	device: DeviceId,
 	context: Context,
 	deployment: DeploymentIdentity,
+	maximum_submission_queues: u32,
+	enabled_display_connectors: u32,
 }
 
 struct RealizedHsa<'runtime> {
 	device: DeviceId,
 	session: Session<'runtime>,
+	host_allocator: usize,
 	target_id: String,
 	queue_packets: u32,
+	maximum_submission_queues: u32,
+	enabled_display_connectors: u32,
+}
+
+struct RealizedHsaSet<'runtime> {
+	host_allocators: Vec<DiscoveredAgent<'runtime>>,
+	devices: Vec<RealizedHsa<'runtime>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostAllocatorSelectionError {
+	Missing,
+	AmbiguousSameNuma { count: usize },
+	AmbiguousFallback { count: usize },
 }
 
 /// Construct the host half of a local backend from exact resolved RAM/storage
@@ -84,7 +101,7 @@ pub fn host_backend_config_from_inventory(
 	inventory: &ResolvedLocalInventory<'_>,
 	run: RunId,
 	worker_threads: usize,
-	staging_bytes_per_slot: usize,
+	staging_bytes_per_worker: usize,
 ) -> recipe_host::Result<HostBackendConfig> {
 	let mut bindings = inventory
 		.ram()
@@ -99,10 +116,9 @@ pub fn host_backend_config_from_inventory(
 		bindings.push(HostDeviceBinding::Disk {
 			device: resolved.device(),
 			arena: DiskFileSpec::new(root.join(format!("{stem}-arena")))?,
-			reservation: DiskFileSpec::new(root.join(format!("{stem}-reservation")))?,
 		});
 	}
-	HostBackendConfig::new(worker_threads, staging_bytes_per_slot, bindings)
+	HostBackendConfig::new(worker_threads, staging_bytes_per_worker, bindings)
 }
 
 /// Reopen every current GPU by the exact keys retained by `recipe probe`, then
@@ -111,22 +127,30 @@ pub fn host_backend_config_from_inventory(
 /// The current host fingerprint and complete RAM/storage/GPU key sets must
 /// still equal the measured profile. There is deliberately no ordinal,
 /// product-name, capacity, or performance fallback.
+///
+/// Pass the same probe that produced the current identity/inventory. It owns
+/// concrete backend state, including the one retained ROCr runtime, until the
+/// callback and all borrowed bindings have been destroyed.
 pub fn with_native_execution_bindings<T>(
-	config: &NativeProbeConfig,
+	probe: &NativeGpuProbe,
 	profile: &MeasuredProfile,
 	host: &HostInventory,
 	operation: impl for<'cuda, 'hsa> FnOnce(NativeExecutionBindings<'cuda, 'hsa>) -> ProbeResult<T>,
 ) -> ProbeResult<T> {
-	let inventory = {
-		let probe = NativeGpuProbe::new(config.clone())?;
-		probe.discover_all()?
-	};
+	let inventory = probe.discover_all()?;
 	let resolved = profile.resolve_local_inventory(host, &inventory)?;
 	let machine = resolved.machine();
-	let (expected_cuda, expected_hsa) = partition_expected(resolved.gpu())?;
+	let (expected_cuda, expected_hsa) = partition_expected(probe, resolved.gpu())?;
 
-	let cuda_backend = CudaBackend::new(config)?;
-	let realized_cuda = realize_cuda(&cuda_backend, &expected_cuda)?;
+	let realized_cuda = match probe.cuda_backend() {
+		Some(backend) => realize_cuda(backend, &expected_cuda)?,
+		None if expected_cuda.is_empty() => Vec::new(),
+		None => {
+			return Err(binding_error(
+				"measured CUDA GPU origins exist but this probe has no CUDA backend",
+			));
+		}
+	};
 	let cuda_bindings = realized_cuda
 		.iter()
 		.map(|realized| {
@@ -134,12 +158,28 @@ pub fn with_native_execution_bindings<T>(
 				realized.device,
 				&realized.context,
 				realized.deployment.clone(),
+				realized.maximum_submission_queues,
+				realized.enabled_display_connectors,
 			)
 		})
 		.collect::<Vec<_>>();
 
-	let hsa_backend = HsaBackend::new(config)?;
 	let mut operation = Some(operation);
+	let Some(hsa_backend) = probe.hsa_backend() else {
+		if !expected_hsa.is_empty() {
+			return Err(binding_error(
+				"measured HSA GPU origins exist but this probe has no HSA backend",
+			));
+		}
+		let operation = operation
+			.take()
+			.expect("native binding operation was not invoked");
+		return operation(NativeExecutionBindings {
+			machine,
+			cuda: cuda_bindings,
+			hsa: Vec::new(),
+		});
+	};
 	let invoked = hsa_backend.with_runtime(|library, runtime| {
 		let discovery = runtime
 			.discover()
@@ -153,14 +193,18 @@ pub fn with_native_execution_bindings<T>(
 			&expected_hsa,
 		)?;
 		let hsa_bindings = realized_hsa
+			.devices
 			.iter()
 			.map(|realized| {
 				HsaBinding::new(
 					realized.device,
 					&realized.session,
+					&realized_hsa.host_allocators[realized.host_allocator],
 					realized.target_id.clone(),
-					config.hsa.code_object_version,
+					hsa_backend.code_object_version(),
 					realized.queue_packets,
+					realized.maximum_submission_queues,
+					realized.enabled_display_connectors,
 				)
 			})
 			.collect::<Vec<_>>();
@@ -192,6 +236,7 @@ pub fn with_native_execution_bindings<T>(
 }
 
 fn partition_expected(
+	probe: &NativeGpuProbe,
 	resolved: &[ResolvedGpuDevice<'_>],
 ) -> ProbeResult<(BTreeMap<String, ExpectedGpu>, BTreeMap<String, ExpectedGpu>)> {
 	let mut cuda = BTreeMap::new();
@@ -201,6 +246,7 @@ fn partition_expected(
 		let expected = ExpectedGpu {
 			device: resolved.device(),
 			key: descriptor.key.as_str().to_owned(),
+			enabled_display_connectors: probe.enabled_display_connectors(descriptor.key.as_str())?,
 		};
 		let destination = match descriptor.target.backend.as_str() {
 			CUDA_BACKEND => &mut cuda,
@@ -263,6 +309,8 @@ fn realize_cuda(backend: &CudaBackend, expected: &BTreeMap<String, ExpectedGpu>)
 			device: expected.device,
 			context,
 			deployment,
+			maximum_submission_queues: descriptor.maximum_submission_queues,
+			enabled_display_connectors: expected.enabled_display_connectors,
 		});
 	}
 	require_all_reopened("CUDA", expected, &seen)?;
@@ -276,10 +324,30 @@ fn realize_hsa<'runtime>(
 	system: &recipe_hsa::SystemDescription,
 	agents: Vec<DiscoveredAgent<'runtime>>,
 	expected: &BTreeMap<String, ExpectedGpu>,
-) -> ProbeResult<Vec<RealizedHsa<'runtime>>> {
+) -> ProbeResult<RealizedHsaSet<'runtime>> {
+	let (mut host_allocators, gpu_agents): (Vec<_>, Vec<_>) = agents
+		.into_iter()
+		.partition(|agent| agent.description().device_type == DeviceType::Cpu);
+	host_allocators.retain(|agent| supports_host_allocation(agent.description()));
+	host_allocators.sort_by(|left, right| {
+		let left = &left.description().identity;
+		let right = &right.description().identity;
+		(
+			left.numa_node_id,
+			left.uuid.as_str(),
+			left.name.as_str(),
+			left.vendor_name.as_str(),
+		)
+			.cmp(&(
+				right.numa_node_id,
+				right.uuid.as_str(),
+				right.name.as_str(),
+				right.vendor_name.as_str(),
+			))
+	});
 	let mut seen = BTreeSet::new();
 	let mut realized = Vec::new();
-	for agent in agents {
+	for agent in gpu_agents {
 		let Some(descriptor) = backend.descriptor(library, system, agent.description())? else {
 			continue;
 		};
@@ -296,16 +364,33 @@ fn realize_hsa<'runtime>(
 			)));
 		}
 		let target_id = exact_target(agent.description())?.as_str().to_owned();
-		let queue_packets = agent
-			.description()
-			.queue
-			.ok_or_else(|| {
-				binding_error(format!(
-					"measured HSA device {} no longer advertises a queue",
+		let queue = agent.description().queue.ok_or_else(|| {
+			binding_error(format!(
+				"measured HSA device {} no longer advertises a queue",
+				expected.key
+			))
+		})?;
+		let queue_packets = queue.minimum_packets;
+		let gpu_numa = agent.description().identity.numa_node_id;
+		let allocator_numa_nodes = host_allocators
+			.iter()
+			.map(|allocator| allocator.description().identity.numa_node_id)
+			.collect::<Vec<_>>();
+		let host_allocator =
+			select_host_allocator(&allocator_numa_nodes, gpu_numa).map_err(|error| match error {
+				HostAllocatorSelectionError::Missing => binding_error(format!(
+					"measured HSA device {} has no CPU agent with allocatable fine-grained and kernarg pools",
 					expected.key
-				))
-			})?
-			.minimum_packets;
+				)),
+				HostAllocatorSelectionError::AmbiguousSameNuma { count } => binding_error(format!(
+					"measured HSA device {} has {count} same-NUMA CPU host allocators; exact binding is ambiguous",
+					expected.key
+				)),
+				HostAllocatorSelectionError::AmbiguousFallback { count } => binding_error(format!(
+					"measured HSA device {} has no same-NUMA CPU host allocator and {count} fallback allocators; exact binding is ambiguous",
+					expected.key
+				)),
+			})?;
 		let session = agent.into_session().map_err(|error| {
 			binding_error(format!(
 				"create HSA session for measured device {}: {error}",
@@ -315,13 +400,62 @@ fn realize_hsa<'runtime>(
 		realized.push(RealizedHsa {
 			device: expected.device,
 			session,
+			host_allocator,
 			target_id,
 			queue_packets,
+			maximum_submission_queues: queue.maximum_queues,
+			enabled_display_connectors: expected.enabled_display_connectors,
 		});
 	}
 	require_all_reopened("HSA", expected, &seen)?;
 	realized.sort_by_key(|binding| binding.device);
-	Ok(realized)
+	Ok(RealizedHsaSet {
+		host_allocators,
+		devices: realized,
+	})
+}
+
+fn supports_host_allocation(description: &recipe_hsa::AgentDescription) -> bool {
+	let allocatable_global_pool_with = |flags: u32| {
+		description.memory_pools.iter().any(|pool| {
+			pool.segment == MemorySegment::Global
+				&& pool.runtime_allocation.is_some()
+				&& pool
+					.global_flags
+					.is_some_and(|available| available.contains(flags))
+		})
+	};
+	allocatable_global_pool_with(MemoryPoolFlags::KERNARG_INITIALIZATION)
+		&& description.memory_pools.iter().any(|pool| {
+			pool.segment == MemorySegment::Global
+				&& pool.runtime_allocation.is_some()
+				&& pool.global_flags.is_some_and(|flags| {
+					flags.contains(MemoryPoolFlags::FINE_GRAINED)
+						|| flags.contains(MemoryPoolFlags::EXTENDED_SCOPE_FINE_GRAINED)
+				})
+		})
+}
+
+fn select_host_allocator(
+	allocator_numa_nodes: &[u32],
+	gpu_numa_node: u32,
+) -> std::result::Result<usize, HostAllocatorSelectionError> {
+	let matching = allocator_numa_nodes
+		.iter()
+		.enumerate()
+		.filter_map(|(index, numa)| (*numa == gpu_numa_node).then_some(index))
+		.collect::<Vec<_>>();
+	match matching.as_slice() {
+		[index] => Ok(*index),
+		[] => match allocator_numa_nodes.len() {
+			0 => Err(HostAllocatorSelectionError::Missing),
+			1 => Ok(0),
+			count => Err(HostAllocatorSelectionError::AmbiguousFallback { count }),
+		},
+		indices => Err(HostAllocatorSelectionError::AmbiguousSameNuma {
+			count: indices.len(),
+		}),
+	}
 }
 
 fn require_all_reopened(
@@ -345,4 +479,37 @@ fn require_all_reopened(
 
 fn binding_error(detail: impl Into<String>) -> ProbeError {
 	ProbeError::Discovery(detail.into())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn host_allocator_selection_prefers_one_exact_numa_match() {
+		assert_eq!(select_host_allocator(&[2, 7], 7), Ok(1));
+		assert_eq!(select_host_allocator(&[2, 7], 2), Ok(0));
+	}
+
+	#[test]
+	fn host_allocator_selection_allows_one_global_fallback_and_sharing() {
+		assert_eq!(select_host_allocator(&[2], 7), Ok(0));
+		assert_eq!(select_host_allocator(&[2], 9), Ok(0));
+	}
+
+	#[test]
+	fn host_allocator_selection_rejects_missing_or_ambiguous_ownership() {
+		assert_eq!(
+			select_host_allocator(&[], 7),
+			Err(HostAllocatorSelectionError::Missing)
+		);
+		assert_eq!(
+			select_host_allocator(&[7, 7], 7),
+			Err(HostAllocatorSelectionError::AmbiguousSameNuma { count: 2 })
+		);
+		assert_eq!(
+			select_host_allocator(&[2, 9], 7),
+			Err(HostAllocatorSelectionError::AmbiguousFallback { count: 2 })
+		);
+	}
 }

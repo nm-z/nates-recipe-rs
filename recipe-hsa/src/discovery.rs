@@ -32,6 +32,7 @@ pub struct AgentIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueCapabilities {
+	pub maximum_queues: u32,
 	pub minimum_packets: u32,
 	pub maximum_packets: u32,
 	pub advertised_kind: QueueKind,
@@ -233,10 +234,17 @@ fn discover_agent(runtime: &Runtime, raw_agent: HsaAgent) -> Result<DiscoveredAg
 		AGENT_INFO_QUEUE_MAX_SIZE,
 		"HSA maximum queue size",
 	)?;
-	let queue = if minimum_packets == 0 && maximum_packets == 0 {
+	let maximum_queues = agent_info(
+		api,
+		raw_agent,
+		AGENT_INFO_QUEUES_MAX,
+		"HSA maximum queue count",
+	)?;
+	let queue = if minimum_packets == 0 && maximum_packets == 0 && maximum_queues == 0 {
 		None
 	} else {
 		let capabilities = QueueCapabilities {
+			maximum_queues,
 			minimum_packets,
 			maximum_packets,
 			advertised_kind: QueueKind::from_raw(agent_info(
@@ -436,7 +444,8 @@ fn discover_agent(runtime: &Runtime, raw_agent: HsaAgent) -> Result<DiscoveredAg
 }
 
 fn validate_queue_capabilities(queue: QueueCapabilities) -> Result<()> {
-	let valid = queue.minimum_packets != 0
+	let valid = queue.maximum_queues != 0
+		&& queue.minimum_packets != 0
 		&& queue.minimum_packets.is_power_of_two()
 		&& queue.maximum_packets != 0
 		&& queue.maximum_packets.is_power_of_two()
@@ -883,6 +892,7 @@ mod tests {
 	#[test]
 	fn rejects_inconsistent_queue_limits() {
 		let error = validate_queue_capabilities(QueueCapabilities {
+			maximum_queues: 1,
 			minimum_packets: 128,
 			maximum_packets: 64,
 			advertised_kind: QueueKind::MultiProducer,
@@ -895,7 +905,21 @@ mod tests {
 	fn rejects_non_power_of_two_queue_limits() {
 		assert!(
 			validate_queue_capabilities(QueueCapabilities {
+				maximum_queues: 1,
 				minimum_packets: 96,
+				maximum_packets: 256,
+				advertised_kind: QueueKind::MultiProducer,
+			})
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn rejects_zero_queue_count() {
+		assert!(
+			validate_queue_capabilities(QueueCapabilities {
+				maximum_queues: 0,
+				minimum_packets: 128,
 				maximum_packets: 256,
 				advertised_kind: QueueKind::MultiProducer,
 			})

@@ -5,10 +5,12 @@ use std::collections::BTreeSet;
 #[non_exhaustive]
 pub enum DeclarationErrorKind {
 	EmptyValue,
+	InvalidExclusion,
 	InvalidSplit,
 	InvalidLayer,
 	InvalidActivation,
 	InvalidLearningRate,
+	InvalidMetric,
 	InvalidTrainingConfiguration,
 	InvalidInferenceConfiguration,
 }
@@ -72,6 +74,262 @@ impl IntoTargets for Vec<String> {
 	}
 }
 
+/// Literal value used by a row-exclusion predicate.
+///
+/// Floating-point values retain their exact declaration bits so immutable
+/// declarations continue to support structural equality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConditionValue {
+	Signed(i64),
+	Unsigned(u64),
+	FloatBits(u64),
+	Boolean(bool),
+	Text(String),
+}
+
+pub trait IntoConditionValue {
+	fn into_condition_value(self) -> ConditionValue;
+}
+
+macro_rules! impl_signed_condition_value {
+	($($integer:ty),+ $(,)?) => {
+		$(
+			impl IntoConditionValue for $integer {
+				fn into_condition_value(self) -> ConditionValue {
+					ConditionValue::Signed(i64::from(self))
+				}
+			}
+		)+
+	};
+}
+
+macro_rules! impl_unsigned_condition_value {
+	($($integer:ty),+ $(,)?) => {
+		$(
+			impl IntoConditionValue for $integer {
+				fn into_condition_value(self) -> ConditionValue {
+					ConditionValue::Unsigned(u64::from(self))
+				}
+			}
+		)+
+	};
+}
+
+impl_signed_condition_value!(i8, i16, i32, i64);
+impl_unsigned_condition_value!(u8, u16, u32, u64);
+
+impl IntoConditionValue for isize {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::Signed(self as i64)
+	}
+}
+
+impl IntoConditionValue for usize {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::Unsigned(self as u64)
+	}
+}
+
+impl IntoConditionValue for f32 {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::FloatBits((self as f64).to_bits())
+	}
+}
+
+impl IntoConditionValue for f64 {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::FloatBits(self.to_bits())
+	}
+}
+
+impl IntoConditionValue for bool {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::Boolean(self)
+	}
+}
+
+impl IntoConditionValue for &str {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::Text(self.to_owned())
+	}
+}
+
+impl IntoConditionValue for String {
+	fn into_condition_value(self) -> ConditionValue {
+		ConditionValue::Text(self)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComparisonOperator {
+	Equal,
+	NotEqual,
+	Less,
+	LessOrEqual,
+	Greater,
+	GreaterOrEqual,
+}
+
+/// Typed predicate selecting rows that must be excluded from the dataset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Condition {
+	column: String,
+	operator: ComparisonOperator,
+	value: ConditionValue,
+}
+
+impl Condition {
+	#[must_use]
+	pub fn new(column: impl Into<String>, operator: ComparisonOperator, value: impl IntoConditionValue) -> Self {
+		Self {
+			column: column.into(),
+			operator,
+			value: value.into_condition_value(),
+		}
+	}
+
+	fn validate(&self) -> DeclarationResult<()> {
+		if self.column.is_empty() {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidExclusion,
+				"condition column name is empty",
+			));
+		}
+		if matches!(self.value, ConditionValue::FloatBits(bits) if !f64::from_bits(bits).is_finite()) {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidExclusion,
+				"condition comparison value must be finite",
+			));
+		}
+		Ok(())
+	}
+
+	#[must_use]
+	pub fn column(&self) -> &str {
+		&self.column
+	}
+
+	#[must_use]
+	pub const fn operator(&self) -> ComparisonOperator {
+		self.operator
+	}
+
+	#[must_use]
+	pub const fn value(&self) -> &ConditionValue {
+		&self.value
+	}
+}
+
+/// Construct a typed row-exclusion predicate without evaluating the column as
+/// a Rust identifier.
+#[macro_export]
+macro_rules! cond {
+	($column:ident <= $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::LessOrEqual,
+			$value,
+		)
+	};
+	($column:ident >= $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::GreaterOrEqual,
+			$value,
+		)
+	};
+	($column:ident == $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::Equal,
+			$value,
+		)
+	};
+	($column:ident != $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::NotEqual,
+			$value,
+		)
+	};
+	($column:ident < $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::Less,
+			$value,
+		)
+	};
+	($column:ident > $value:expr) => {
+		$crate::Condition::new(
+			stringify!($column),
+			$crate::ComparisonOperator::Greater,
+			$value,
+		)
+	};
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Exclusion {
+	Column(String),
+	Condition(Condition),
+}
+
+pub trait IntoExclusions {
+	fn into_exclusions(self) -> Vec<Exclusion>;
+}
+
+impl IntoExclusions for &str {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		vec![Exclusion::Column(self.to_owned())]
+	}
+}
+
+impl IntoExclusions for String {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		vec![Exclusion::Column(self)]
+	}
+}
+
+impl<const N: usize> IntoExclusions for [&str; N] {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		self.into_iter()
+			.map(|column| Exclusion::Column(column.to_owned()))
+			.collect()
+	}
+}
+
+impl IntoExclusions for &[&str] {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		self.iter()
+			.map(|column| Exclusion::Column((*column).to_owned()))
+			.collect()
+	}
+}
+
+impl IntoExclusions for Vec<String> {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		self.into_iter().map(Exclusion::Column).collect()
+	}
+}
+
+impl IntoExclusions for Condition {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		vec![Exclusion::Condition(self)]
+	}
+}
+
+impl IntoExclusions for Exclusion {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		vec![self]
+	}
+}
+
+impl IntoExclusions for Vec<Exclusion> {
+	fn into_exclusions(self) -> Vec<Exclusion> {
+		self
+	}
+}
+
 /// Immutable data-ingestion declaration.
 ///
 /// Construction records paths and preprocessing policy only. Filesystem reads,
@@ -83,6 +341,7 @@ pub struct Data {
 	targets: Vec<String>,
 	test_source: Option<String>,
 	exclusions: Vec<String>,
+	condition_exclusions: Vec<Condition>,
 	split_fraction_bits: Option<u32>,
 	deferred: Option<DeclarationError>,
 }
@@ -95,6 +354,7 @@ impl Data {
 			targets: Vec::new(),
 			test_source: None,
 			exclusions: Vec::new(),
+			condition_exclusions: Vec::new(),
 			split_fraction_bits: None,
 			deferred: None,
 		}
@@ -142,14 +402,26 @@ impl Data {
 	}
 
 	#[must_use]
-	pub fn exclude(mut self, pattern: &str) -> Self {
-		if pattern.is_empty() {
+	pub fn exclude(mut self, exclusions: impl IntoExclusions) -> Self {
+		let exclusions = exclusions.into_exclusions();
+		if exclusions.is_empty() {
 			self.defer(
 				DeclarationErrorKind::EmptyValue,
-				"excluded-column pattern is empty",
+				"at least one column or condition exclusion is required",
 			);
-		} else {
-			self.exclusions.push(pattern.to_owned());
+		}
+		for exclusion in exclusions {
+			match exclusion {
+				Exclusion::Column(pattern) if pattern.is_empty() => self.defer(
+					DeclarationErrorKind::EmptyValue,
+					"excluded-column pattern is empty",
+				),
+				Exclusion::Column(pattern) => self.exclusions.push(pattern),
+				Exclusion::Condition(condition) => match condition.validate() {
+					Ok(()) => self.condition_exclusions.push(condition),
+					Err(error) => self.defer(error.kind, error.detail),
+				},
+			}
 		}
 		self
 	}
@@ -204,6 +476,11 @@ impl Data {
 	#[must_use]
 	pub fn exclusions(&self) -> &[String] {
 		&self.exclusions
+	}
+
+	#[must_use]
+	pub fn condition_exclusions(&self) -> &[Condition] {
+		&self.condition_exclusions
 	}
 
 	#[must_use]
@@ -423,12 +700,30 @@ impl IntoObjective for &Model {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Normalization {
+	ZScore,
+}
+
+#[allow(non_upper_case_globals)]
+pub const z_score: Normalization = Normalization::ZScore;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Optimizer {
+	AdamW,
+}
+
+#[allow(non_upper_case_globals)]
+pub const adamw: Optimizer = Optimizer::AdamW;
+
 /// Backend-neutral model declaration. It contains no runtime handles, loaded
 /// weights, allocations, or mutable global registry entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Model {
 	layers: Vec<LayerSpec>,
 	objective: Option<Objective>,
+	normalization: Option<Normalization>,
+	optimizer: Option<Optimizer>,
 	learning_rate_bits: Option<u32>,
 	weights_source: Option<String>,
 	input_width: Option<usize>,
@@ -441,6 +736,8 @@ impl Model {
 		Self {
 			layers: Vec::new(),
 			objective: None,
+			normalization: None,
+			optimizer: None,
 			learning_rate_bits: None,
 			weights_source: None,
 			input_width: None,
@@ -541,6 +838,18 @@ impl Model {
 	}
 
 	#[must_use]
+	pub const fn norm(mut self, normalization: Normalization) -> Self {
+		self.normalization = Some(normalization);
+		self
+	}
+
+	#[must_use]
+	pub const fn optimizer(mut self, optimizer: Optimizer) -> Self {
+		self.optimizer = Some(optimizer);
+		self
+	}
+
+	#[must_use]
 	pub fn lr(mut self, rate: f64) -> Self {
 		let rate_f32 = rate as f32;
 		if !rate.is_finite() || !rate_f32.is_finite() || rate_f32 <= 0.0 {
@@ -581,6 +890,16 @@ impl Model {
 	#[must_use]
 	pub const fn objective(&self) -> Option<&Objective> {
 		self.objective.as_ref()
+	}
+
+	#[must_use]
+	pub const fn normalization(&self) -> Option<Normalization> {
+		self.normalization
+	}
+
+	#[must_use]
+	pub const fn optimizer_spec(&self) -> Option<Optimizer> {
+		self.optimizer
 	}
 
 	#[must_use]
@@ -628,10 +947,38 @@ pub enum Metric {
 	Loss,
 	Accuracy,
 	R2,
+	AuRoc,
+	AuPrc,
+	Brier,
+	CalibrationError,
+	RecallAt { threshold_bits: u64 },
 	Epoch,
 	LearningRate,
 	Time,
 	Device,
+}
+
+impl Metric {
+	fn validate(self) -> DeclarationResult<()> {
+		if let Self::RecallAt { threshold_bits } = self {
+			let threshold = f64::from_bits(threshold_bits);
+			if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+				return Err(DeclarationError::new(
+					DeclarationErrorKind::InvalidMetric,
+					format!("recall threshold must be finite and in [0, 1], got {threshold}"),
+				));
+			}
+		}
+		Ok(())
+	}
+
+	#[must_use]
+	pub fn recall_threshold(self) -> Option<f64> {
+		match self {
+			Self::RecallAt { threshold_bits } => Some(f64::from_bits(threshold_bits)),
+			_ => None,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,10 +986,33 @@ pub enum LogItem {
 	Metric(Metric),
 }
 
+impl LogItem {
+	fn validate(self) -> DeclarationResult<()> {
+		match self {
+			Self::Metric(metric) => metric.validate(),
+		}
+	}
+
+	#[must_use]
+	pub const fn metric(self) -> Metric {
+		match self {
+			Self::Metric(metric) => metric,
+		}
+	}
+}
+
 #[allow(non_upper_case_globals)]
 pub const Accuracy: LogItem = LogItem::Metric(Metric::Accuracy);
 #[allow(non_upper_case_globals)]
 pub const R2: LogItem = LogItem::Metric(Metric::R2);
+#[allow(non_upper_case_globals)]
+pub const AuRoc: LogItem = LogItem::Metric(Metric::AuRoc);
+#[allow(non_upper_case_globals)]
+pub const AuPrc: LogItem = LogItem::Metric(Metric::AuPrc);
+#[allow(non_upper_case_globals)]
+pub const Brier: LogItem = LogItem::Metric(Metric::Brier);
+#[allow(non_upper_case_globals)]
+pub const CalibrationError: LogItem = LogItem::Metric(Metric::CalibrationError);
 #[allow(non_upper_case_globals)]
 pub const Epoch: LogItem = LogItem::Metric(Metric::Epoch);
 #[allow(non_upper_case_globals)]
@@ -672,13 +1042,52 @@ pub const r2: LogItem = R2;
 #[allow(non_upper_case_globals)]
 pub const device: LogItem = Device;
 
+#[allow(non_snake_case)]
+#[must_use]
+pub const fn RecallAt(threshold: f64) -> LogItem {
+	LogItem::Metric(Metric::RecallAt {
+		threshold_bits: threshold.to_bits(),
+	})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearningRateSchedule {
+	CosineDecay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Calibration {
+	TemperatureScaling,
+}
+
+#[allow(non_upper_case_globals)]
+pub const TemperatureScaling: Calibration = Calibration::TemperatureScaling;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EarlyStopping {
+	metric: LogItem,
+	patience: usize,
+}
+
+impl EarlyStopping {
+	#[must_use]
+	pub const fn metric(self) -> LogItem {
+		self.metric
+	}
+
+	#[must_use]
+	pub const fn patience(self) -> usize {
+		self.patience
+	}
+}
+
 pub trait SavePath {
 	fn or_default(self) -> String;
 }
 
 impl SavePath for () {
 	fn or_default(self) -> String {
-		"model.recipe".to_owned()
+		"model.ogdl".to_owned()
 	}
 }
 
@@ -698,7 +1107,14 @@ impl SavePath for String {
 /// parse data, prepare a bundle, or start a run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Train {
+	batch_size: Option<usize>,
 	epochs: Option<usize>,
+	learning_rate_bits: Option<u32>,
+	warmup_epochs: Option<usize>,
+	learning_rate_schedule: Option<LearningRateSchedule>,
+	gradient_clip_bits: Option<u32>,
+	early_stopping: Option<EarlyStopping>,
+	calibration: Option<Calibration>,
 	log_every: Option<usize>,
 	log: Vec<LogItem>,
 	plot: Vec<LogItem>,
@@ -711,7 +1127,14 @@ impl Train {
 	#[must_use]
 	pub const fn new() -> Self {
 		Self {
+			batch_size: None,
 			epochs: None,
+			learning_rate_bits: None,
+			warmup_epochs: None,
+			learning_rate_schedule: None,
+			gradient_clip_bits: None,
+			early_stopping: None,
+			calibration: None,
 			log_every: None,
 			log: Vec::new(),
 			plot: Vec::new(),
@@ -722,12 +1145,82 @@ impl Train {
 	}
 
 	#[must_use]
+	pub fn batch_size(mut self, batch_size: usize) -> Self {
+		if batch_size == 0 {
+			self.defer("training batch size must be nonzero");
+		} else {
+			self.batch_size = Some(batch_size);
+		}
+		self
+	}
+
+	#[must_use]
 	pub fn epochs(mut self, epochs: usize) -> Self {
 		if epochs == 0 {
 			self.defer("training epoch bound must be nonzero");
 		} else {
 			self.epochs = Some(epochs);
 		}
+		self
+	}
+
+	#[must_use]
+	pub fn lr(mut self, rate: f64) -> Self {
+		let rate_f32 = rate as f32;
+		if !rate.is_finite() || !rate_f32.is_finite() || rate_f32 <= 0.0 {
+			self.defer(format!(
+				"training learning rate must be finite, positive, and representable as f32, got {rate}"
+			));
+		} else {
+			self.learning_rate_bits = Some(rate_f32.to_bits());
+		}
+		self
+	}
+
+	#[must_use]
+	pub fn warmup(mut self, epochs: usize) -> Self {
+		if epochs == 0 {
+			self.defer("training warmup epoch bound must be nonzero");
+		} else {
+			self.warmup_epochs = Some(epochs);
+		}
+		self
+	}
+
+	#[must_use]
+	pub const fn cosine_decay(mut self) -> Self {
+		self.learning_rate_schedule = Some(LearningRateSchedule::CosineDecay);
+		self
+	}
+
+	#[must_use]
+	pub fn gradient_clip(mut self, maximum_norm: f64) -> Self {
+		let maximum_norm_f32 = maximum_norm as f32;
+		if !maximum_norm.is_finite() || !maximum_norm_f32.is_finite() || maximum_norm_f32 <= 0.0 {
+			self.defer(format!(
+				"gradient clipping norm must be finite, positive, and representable as f32, got {maximum_norm}"
+			));
+		} else {
+			self.gradient_clip_bits = Some(maximum_norm_f32.to_bits());
+		}
+		self
+	}
+
+	#[must_use]
+	pub fn early_stop(mut self, metric: LogItem, patience: usize) -> Self {
+		if let Err(error) = metric.validate() {
+			self.defer_kind(error.kind, error.detail);
+		} else if patience == 0 {
+			self.defer("early-stopping patience must be nonzero");
+		} else {
+			self.early_stopping = Some(EarlyStopping { metric, patience });
+		}
+		self
+	}
+
+	#[must_use]
+	pub const fn calibrate(mut self, calibration: Calibration) -> Self {
+		self.calibration = Some(calibration);
 		self
 	}
 
@@ -743,13 +1236,25 @@ impl Train {
 
 	#[must_use]
 	pub fn log(mut self, items: impl IntoIterator<Item = LogItem>) -> Self {
-		self.log.extend(items);
+		for item in items {
+			if let Err(error) = item.validate() {
+				self.defer_kind(error.kind, error.detail);
+			} else {
+				self.log.push(item);
+			}
+		}
 		self
 	}
 
 	#[must_use]
 	pub fn plot(mut self, items: impl IntoIterator<Item = LogItem>) -> Self {
-		self.plot.extend(items);
+		for item in items {
+			if let Err(error) = item.validate() {
+				self.defer_kind(error.kind, error.detail);
+			} else {
+				self.plot.push(item);
+			}
+		}
 		self
 	}
 
@@ -789,10 +1294,27 @@ impl Train {
 	}
 
 	pub fn validate(&self) -> DeclarationResult<()> {
-		match &self.deferred {
-			Some(error) => Err(error.clone()),
-			None => Ok(()),
+		if let Some(error) = &self.deferred {
+			return Err(error.clone());
 		}
+		if matches!((self.warmup_epochs, self.epochs), (Some(warmup), Some(epochs)) if warmup >= epochs) {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidTrainingConfiguration,
+				"warmup epochs must be less than the total epoch bound",
+			));
+		}
+		for item in self.log.iter().chain(&self.plot) {
+			item.validate()?;
+		}
+		if let Some(early_stopping) = self.early_stopping {
+			early_stopping.metric.validate()?;
+		}
+		Ok(())
+	}
+
+	#[must_use]
+	pub const fn batch_size_value(&self) -> Option<usize> {
+		self.batch_size
 	}
 
 	#[must_use]
@@ -803,6 +1325,36 @@ impl Train {
 	#[must_use]
 	pub const fn log_interval(&self) -> Option<usize> {
 		self.log_every
+	}
+
+	#[must_use]
+	pub fn learning_rate(&self) -> Option<f32> {
+		self.learning_rate_bits.map(f32::from_bits)
+	}
+
+	#[must_use]
+	pub const fn warmup_epoch_bound(&self) -> Option<usize> {
+		self.warmup_epochs
+	}
+
+	#[must_use]
+	pub const fn learning_rate_schedule(&self) -> Option<LearningRateSchedule> {
+		self.learning_rate_schedule
+	}
+
+	#[must_use]
+	pub fn gradient_clip_value(&self) -> Option<f32> {
+		self.gradient_clip_bits.map(f32::from_bits)
+	}
+
+	#[must_use]
+	pub const fn early_stopping(&self) -> Option<EarlyStopping> {
+		self.early_stopping
+	}
+
+	#[must_use]
+	pub const fn calibration(&self) -> Option<Calibration> {
+		self.calibration
 	}
 
 	#[must_use]
@@ -826,11 +1378,12 @@ impl Train {
 	}
 
 	fn defer(&mut self, detail: impl Into<String>) {
+		self.defer_kind(DeclarationErrorKind::InvalidTrainingConfiguration, detail);
+	}
+
+	fn defer_kind(&mut self, kind: DeclarationErrorKind, detail: impl Into<String>) {
 		if self.deferred.is_none() {
-			self.deferred = Some(DeclarationError::new(
-				DeclarationErrorKind::InvalidTrainingConfiguration,
-				detail,
-			));
+			self.deferred = Some(DeclarationError::new(kind, detail));
 		}
 	}
 }

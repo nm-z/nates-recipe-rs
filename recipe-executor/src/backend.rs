@@ -3,9 +3,9 @@ use std::error::Error;
 use std::fmt::Debug;
 
 use recipe_core::{
-	ArenaLayout, ArtifactId, ByteCount, DeviceId, FinalizedBundle, KernelTemplateId, LinkId, MetricId, MetricPurpose,
-	MetricSlotId, ResolvedTransferEndpoint, ResolvedValueLocation, RunId, RunPhase, SubmissionSlots, TaskId,
-	TransferLaneClaim,
+	ArenaLayout, ArtifactId, ByteCount, DeviceId, FinalizedBundle, KernelTemplateId, LinkId, LoopIteration, MetricId,
+	MetricPurpose, MetricSlotId, ResolvedTransferEndpoint, ResolvedValueLocation, RunId, RunPhase, SubmissionSlots,
+	TaskId, TransferLaneClaim,
 };
 
 use crate::metrics::MetricValue;
@@ -38,6 +38,8 @@ pub struct InitAdmissionWork<'a> {
 pub struct CalculationWork<'a> {
 	pub task: TaskId,
 	pub run: RunId,
+	/// Zero-based finalized loop iteration for batch and schedule addressing.
+	pub iteration: LoopIteration,
 	pub device: DeviceId,
 	pub kernel_template: KernelTemplateId,
 	pub artifact: ArtifactId,
@@ -61,10 +63,13 @@ pub struct TransferWork<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricWork {
 	pub task: TaskId,
+	/// Zero-based finalized loop iteration whose value is being emitted.
+	pub iteration: LoopIteration,
 	pub purpose: MetricPurpose,
 	pub metric: MetricId,
 	pub slot: MetricSlotId,
 	pub value: ResolvedValueLocation,
+	pub submission: SubmissionSlots,
 }
 
 /// One immutable, fully resolved operation handed to a backend.
@@ -341,6 +346,14 @@ pub trait Backend: sealed::Sealed {
 	type Pending: Debug;
 	type Error: Error + Send + Sync + 'static;
 
+	/// Maximum records emitted by any one operation other than [`Self::poll`].
+	///
+	/// Recipe's executor uses this closed backend contract to preallocate an
+	/// exact finalized-run journal. Implementations may choose a smaller bound
+	/// than the ABI-wide [`MAX_PHYSICAL_CALLS_PER_OPERATION`], but must never
+	/// exceed the declared value.
+	const MAX_NON_POLL_PHYSICAL_CALLS: usize = MAX_PHYSICAL_CALLS_PER_OPERATION;
+
 	fn bind_resources(
 		&mut self,
 		bundle: &FinalizedBundle,
@@ -362,6 +375,16 @@ pub trait Backend: sealed::Sealed {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<Self::Arena, Self::Error>;
 
+	/// Declares that loop pending tokens can be submitted, completed, and
+	/// allocation-free rearmed for another finalized iteration.
+	///
+	/// The compatibility default is one-shot only. Executors reject bundles
+	/// whose loop count exceeds one unless the backend opts in.
+	#[must_use]
+	fn supports_loop_repetition(&self) -> bool {
+		false
+	}
+
 	fn submit(
 		&mut self,
 		resource: &mut Self::Resource,
@@ -371,6 +394,32 @@ pub trait Backend: sealed::Sealed {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<(), Self::Error>;
 
+	/// Submits one task in an exact zero-based loop iteration.
+	///
+	/// A sparse task's first active iteration may be nonzero. Repeatable
+	/// backends must therefore decide whether to use the freshly prepared
+	/// token or rearm a terminal token from the token's own activation state,
+	/// never from the global iteration index. The default preserves one-shot
+	/// backend behavior by forwarding to [`Self::submit`].
+	fn submit_loop_iteration(
+		&mut self,
+		resource: &mut Self::Resource,
+		arenas: ArenaSet<'_, Self::Arena>,
+		pending: &mut Self::Pending,
+		iteration: LoopIteration,
+		work: BackendWork<'_>,
+		physical_calls: &mut PhysicalCallBatch,
+	) -> std::result::Result<(), Self::Error> {
+		let _ = iteration;
+		self.submit(resource, arenas, pending, work, physical_calls)
+	}
+
+	/// Poll one pending task.
+	///
+	/// Implementations must append exactly one [`PhysicalCall::Poll`] for the
+	/// pending task, with a status matching the returned result, and no other
+	/// physical record. Pending records are counted exactly in a fixed per-task
+	/// journal table; complete and failed records remain ordered calls.
 	fn poll(
 		&mut self,
 		resource: &mut Self::Resource,

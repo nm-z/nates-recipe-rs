@@ -10,10 +10,14 @@ const ELF64_SYMBOL_BYTES: usize = 24;
 const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LITTLE_ENDIAN: u8 = 1;
 const ELF_OSABI_AMDGPU_HSA: u8 = 64;
-// LLVM's ELFOSABI_CUDA and cubins emitted by NVIDIA ptxas use 51 (0x33).
-// Keeping this exact is important for older R470-compatible CUDA 11.x
-// artifacts as well as current cubins.
+// CUDA cubins have used multiple architecture-specific ELF OS-ABI tags.
+// LLVM names 51 (0x33) as ELFOSABI_CUDA and 41 (0x29) as
+// ELFOSABI_CUDA_V2. NVIDIA ptxas 13.3 emits 65 (0x41), paired with EM_CUDA
+// and a cubin ABI version of 8. Keep the accepted set explicit: accepting
+// every architecture-specific OS-ABI value would weaken artifact identity.
 const ELF_OSABI_CUDA: u8 = 51;
+const ELF_OSABI_CUDA_V2: u8 = 41;
+const ELF_OSABI_CUDA_TOOLKIT_13_3: u8 = 65;
 const ELF_MACHINE_AMDGPU: u16 = 224;
 const ELF_MACHINE_CUDA: u16 = 190;
 const ELF_SECTION_NOTE: u32 = 7;
@@ -399,13 +403,13 @@ pub fn inspect_cubin(
 	expected_entry_symbol: &str,
 ) -> Result<InspectedCubin, LoweringError> {
 	let elf = ElfFile::parse(bytes)?;
-	if elf.os_abi != ELF_OSABI_CUDA || elf.machine != ELF_MACHINE_CUDA {
+	if !is_cuda_os_abi(elf.os_abi) || elf.machine != ELF_MACHINE_CUDA {
 		return Err(artifact_mismatch(format!(
 			"expected NVIDIA CUDA ELF, got OS ABI {} machine {}",
 			elf.os_abi, elf.machine
 		)));
 	}
-	let sm = cubin_sm(elf.flags)?;
+	let sm = cubin_sm(elf.os_abi, elf.abi_version, elf.flags)?;
 	if sm != expected_sm {
 		return Err(artifact_mismatch(format!(
 			"cubin targets sm_{sm}, expected sm_{expected_sm}"
@@ -433,11 +437,25 @@ pub fn inspect_cubin(
 	})
 }
 
-fn cubin_sm(flags: u32) -> Result<u8, LoweringError> {
-	// CUDA's pre-Blackwell ELF ABI stores EF_CUDA_SM in the low byte.
-	// Other low-order bits begin at bit 8; the old implementation read those
-	// feature bits and consequently interpreted an sm_37 cubin as sm_5.
-	u8::try_from(flags & 0xff).map_err(|_| artifact_format("cubin SM flag is out of range"))
+const fn is_cuda_os_abi(os_abi: u8) -> bool {
+	matches!(
+		os_abi,
+		ELF_OSABI_CUDA | ELF_OSABI_CUDA_V2 | ELF_OSABI_CUDA_TOOLKIT_13_3
+	)
+}
+
+fn cubin_sm(os_abi: u8, abi_version: u8, flags: u32) -> Result<u8, LoweringError> {
+	// CUDA ELF ABIs through the 0x33/0x29 tags store EF_CUDA_SM in the low
+	// byte. The toolkit-13.3 ABI 8 layout identified by OS-ABI 0x41 stores
+	// the decimal SM in the next byte and uses the low byte for ABI flags.
+	// Decode only those observed, discriminated layouts instead of scanning
+	// flags for a value that happens to equal the requested processor.
+	let encoded = if os_abi == ELF_OSABI_CUDA_TOOLKIT_13_3 && abi_version >= 8 {
+		(flags >> 8) & 0xff
+	} else {
+		flags & 0xff
+	};
+	u8::try_from(encoded).map_err(|_| artifact_format("cubin SM flag is out of range"))
 }
 
 fn validate_hsa_abi(metadata: &HsaKernelMetadata, expected: &KernelAbi) -> Result<(), LoweringError> {
@@ -476,6 +494,10 @@ fn validate_hsa_abi(metadata: &HsaKernelMetadata, expected: &KernelAbi) -> Resul
 		.zip(&expected.arguments)
 		.enumerate()
 	{
+		// AMDHSA argument names are optional metadata and full LTO may omit
+		// them. When present they remain a useful contradiction check; the
+		// executable ABI itself is fixed by order, offset, size, value kind,
+		// and address space below.
 		let offset = u64::try_from(index)
 			.ok()
 			.and_then(|value| value.checked_mul(8))
@@ -500,10 +522,10 @@ fn validate_hsa_abi(metadata: &HsaKernelMetadata, expected: &KernelAbi) -> Resul
 					BufferAccess::Read => "input_",
 					BufferAccess::Write => "output_",
 				};
-				if !actual
+				if actual
 					.name
 					.as_deref()
-					.is_some_and(|name| name.starts_with(expected_prefix))
+					.is_some_and(|name| !name.starts_with(expected_prefix))
 				{
 					return Err(artifact_mismatch(format!(
 						"buffer argument {index} has an unexpected name"
@@ -511,7 +533,10 @@ fn validate_hsa_abi(metadata: &HsaKernelMetadata, expected: &KernelAbi) -> Resul
 				}
 			}
 			KernelArgument::FaultFlag => {
-				if actual.name.as_deref() != Some("fault_flag")
+				if actual
+					.name
+					.as_deref()
+					.is_some_and(|name| name != "fault_flag")
 					|| actual.value_kind != "global_buffer"
 					|| actual.address_space.as_deref() != Some("global")
 				{
@@ -521,15 +546,34 @@ fn validate_hsa_abi(metadata: &HsaKernelMetadata, expected: &KernelAbi) -> Resul
 				}
 			}
 			KernelArgument::ElementCount => {
-				if actual.name.as_deref() != Some("element_count") || actual.value_kind != "by_value" {
+				if actual
+					.name
+					.as_deref()
+					.is_some_and(|name| name != "element_count")
+					|| actual.value_kind != "by_value"
+				{
 					return Err(artifact_mismatch(
 						"element-count argument metadata does not match",
 					));
 				}
 			}
 			KernelArgument::RunId => {
-				if actual.name.as_deref() != Some("run_id") || actual.value_kind != "by_value" {
+				if actual.name.as_deref().is_some_and(|name| name != "run_id")
+					|| actual.value_kind != "by_value"
+				{
 					return Err(artifact_mismatch("run-id argument metadata does not match"));
+				}
+			}
+			KernelArgument::LoopIteration => {
+				if actual
+					.name
+					.as_deref()
+					.is_some_and(|name| name != "loop_iteration")
+					|| actual.value_kind != "by_value"
+				{
+					return Err(artifact_mismatch(
+						"loop-iteration argument metadata does not match",
+					));
 				}
 			}
 		}
@@ -946,6 +990,8 @@ impl<'a> MsgDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+	use recipe_core::{DType, ElementCount};
+
 	use super::*;
 
 	fn elf_with_out_of_file_no_bits_section() -> Vec<u8> {
@@ -1018,9 +1064,79 @@ mod tests {
 	}
 
 	#[test]
+	fn hsa_argument_names_are_optional_but_present_contradictions_fail() {
+		let abi = KernelAbi {
+			entry_symbol: "recipe_stage_1".to_owned(),
+			arguments: vec![
+				KernelArgument::Buffer {
+					access: BufferAccess::Read,
+					dtype: DType::F32,
+					alignment: 4,
+				},
+				KernelArgument::ElementCount,
+			],
+			argument_bytes: 16,
+			argument_alignment: 8,
+			elements: ElementCount::new(1).unwrap(),
+			workgroup_lanes: 64,
+		};
+		let mut metadata = HsaKernelMetadata {
+			name: abi.entry_symbol.clone(),
+			symbol: format!("{}.kd", abi.entry_symbol),
+			arguments: vec![
+				HsaKernelArgument {
+					name: None,
+					offset: 0,
+					size: 8,
+					value_kind: "global_buffer".to_owned(),
+					address_space: Some("global".to_owned()),
+				},
+				HsaKernelArgument {
+					name: None,
+					offset: 8,
+					size: 8,
+					value_kind: "by_value".to_owned(),
+					address_space: None,
+				},
+			],
+			kernarg_segment_size: 16,
+			kernarg_segment_alignment: 8,
+			group_segment_fixed_size: 0,
+			private_segment_fixed_size: 0,
+			maximum_workgroup_size: 256,
+			wavefront_size: 32,
+		};
+
+		validate_hsa_abi(&metadata, &abi).unwrap();
+		metadata.arguments[0].name = Some("output_0".to_owned());
+		let error = validate_hsa_abi(&metadata, &abi).unwrap_err();
+		assert_eq!(error.kind, LoweringErrorKind::ArtifactMismatch);
+	}
+
+	#[test]
 	fn cuda_elf_flags_decode_the_processor_byte() {
-		assert_eq!(cubin_sm(0x0025_0525).expect("sm_37 flags"), 37);
-		assert_eq!(cubin_sm(0x0034_0534).expect("sm_52 flags"), 52);
+		assert_eq!(
+			cubin_sm(ELF_OSABI_CUDA, 0, 0x0025_0525).expect("sm_37 flags"),
+			37
+		);
+		assert_eq!(
+			cubin_sm(ELF_OSABI_CUDA, 0, 0x0034_0534).expect("sm_52 flags"),
+			52
+		);
+		assert_eq!(
+			cubin_sm(ELF_OSABI_CUDA_TOOLKIT_13_3, 8, 0x0600_5604).expect("toolkit 13.3 sm_86 flags"),
+			86
+		);
+	}
+
+	#[test]
+	fn cuda_elf_abi_acceptance_is_explicit_across_toolkit_generations() {
+		assert!(is_cuda_os_abi(ELF_OSABI_CUDA));
+		assert!(is_cuda_os_abi(ELF_OSABI_CUDA_V2));
+		assert!(is_cuda_os_abi(ELF_OSABI_CUDA_TOOLKIT_13_3));
+		assert!(!is_cuda_os_abi(0));
+		assert!(!is_cuda_os_abi(64));
+		assert!(!is_cuda_os_abi(66));
 	}
 
 	#[test]

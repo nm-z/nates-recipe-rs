@@ -4,19 +4,17 @@ use std::fs;
 use std::path::Path;
 
 use recipe_core::{
-	ArenaLayout, BundleIdentity, ByteCount, DType, DeviceId, DraftPlan, FinalizedBundle, MetricId, MetricSlotId,
-	ReservationLedger, ResolvedTransferEndpoint, ResolvedValueLocation, RunPhase, SubmissionSlots, TaskId, TaskKind,
-	TransferEndpoint, TransferLaneClaim, ValueId,
+	ArenaLayout, BundleIdentity, ByteCount, DType, DeviceId, DraftPlan, FinalizedBundle, LoopIteration, MetricId,
+	MetricSlotId, ReservationLedger, ReservationMechanism, ResolvedTransferEndpoint, ResolvedValueLocation, RunPhase,
+	SubmissionSlots, TaskId, TaskKind, TransferEndpoint, TransferLaneClaim, ValueId,
 };
-use rustix::fs::statvfs;
 use recipe_executor::{
 	ArenaSet, Backend, BackendPoll, BackendWork, MetricValue, PendingRequest, PhysicalCall, PhysicalCallBatch,
 	PhysicalPollStatus, TransferWork, WorkClass, sealed,
 };
+use rustix::fs::statvfs;
 
-use crate::{
-	Arena, DiskFileSpec, Error, PendingCopy, PollStatus, Reservation, Result, Runtime, RuntimeConfig, SlotCapacity,
-};
+use crate::{Arena, DiskFileSpec, Error, PendingCopy, PollStatus, Result, Runtime, RuntimeConfig, SlotCapacity};
 
 fn require(condition: bool, error: Error) -> Result<()> {
 	match condition {
@@ -42,7 +40,6 @@ pub enum HostDeviceBinding {
 	Disk {
 		device: DeviceId,
 		arena: DiskFileSpec,
-		reservation: DiskFileSpec,
 	},
 }
 
@@ -58,14 +55,14 @@ impl HostDeviceBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostBackendConfig {
 	worker_threads: usize,
-	staging_bytes_per_slot: usize,
+	staging_bytes_per_worker: usize,
 	bindings: Vec<HostDeviceBinding>,
 }
 
 impl HostBackendConfig {
 	pub fn new(
 		worker_threads: usize,
-		staging_bytes_per_slot: usize,
+		staging_bytes_per_worker: usize,
 		bindings: Vec<HostDeviceBinding>,
 	) -> Result<Self> {
 		if worker_threads == 0 {
@@ -73,7 +70,7 @@ impl HostBackendConfig {
 				"host backend worker count must be nonzero",
 			));
 		}
-		if staging_bytes_per_slot == 0 {
+		if staging_bytes_per_worker == 0 {
 			return Err(Error::InvalidConfiguration(
 				"host backend staging capacity must be nonzero",
 			));
@@ -81,7 +78,7 @@ impl HostBackendConfig {
 		validate_bindings(&bindings)?;
 		Ok(Self {
 			worker_threads,
-			staging_bytes_per_slot,
+			staging_bytes_per_worker,
 			bindings,
 		})
 	}
@@ -92,13 +89,27 @@ impl HostBackendConfig {
 	}
 
 	#[must_use]
-	pub const fn staging_bytes_per_slot(&self) -> usize {
-		self.staging_bytes_per_slot
+	pub const fn staging_bytes_per_worker(&self) -> usize {
+		self.staging_bytes_per_worker
 	}
 
 	#[must_use]
 	pub fn bindings(&self) -> &[HostDeviceBinding] {
 		&self.bindings
+	}
+
+	/// Queries the current allocatable capacity for one configured host device
+	/// before any candidate resources are realized.
+	pub fn available_bytes(&self, device: DeviceId) -> Result<ByteCount> {
+		let binding = self
+			.bindings
+			.iter()
+			.find(|binding| binding.device() == device)
+			.ok_or(Error::MissingDevice(device))?;
+		match binding {
+			HostDeviceBinding::Ram { .. } => available_ram_bytes(),
+			HostDeviceBinding::Disk { arena, .. } => available_disk_bytes(arena.path()),
+		}
 	}
 }
 
@@ -189,6 +200,19 @@ impl HostBackend {
 	}
 
 	#[doc(hidden)]
+	pub fn submit_loop_partition<L: HostArenaLookup + ?Sized>(
+		&mut self,
+		resource: &mut HostResources,
+		arenas: &L,
+		pending: &mut HostPending,
+		_iteration: LoopIteration,
+		work: BackendWork<'_>,
+	) -> Result<()> {
+		resource.prepare_loop_pending(pending)?;
+		resource.submit(arenas, pending, work)
+	}
+
+	#[doc(hidden)]
 	pub fn poll_partition(&mut self, resource: &mut HostResources, pending: &mut HostPending) -> Result<BackendPoll> {
 		resource.poll_pending(pending)
 	}
@@ -269,6 +293,7 @@ enum ExpectedWork {
 		metric: MetricId,
 		slot: MetricSlotId,
 		value: ResolvedValueLocation,
+		submission: SubmissionSlots,
 	},
 }
 
@@ -283,8 +308,9 @@ impl ExpectedWork {
 
 	const fn submission(&self) -> Option<SubmissionSlots> {
 		match self {
-			Self::Init { submission, .. } | Self::Transfer { submission, .. } => Some(*submission),
-			Self::Metric { .. } => None,
+			Self::Init { submission, .. }
+			| Self::Transfer { submission, .. }
+			| Self::Metric { submission, .. } => Some(*submission),
 		}
 	}
 
@@ -376,7 +402,6 @@ impl HostPending {
 
 pub struct HostResources {
 	runtime: Runtime,
-	reservations: BTreeMap<DeviceId, Reservation>,
 	bindings: BTreeMap<DeviceId, HostDeviceBinding>,
 	contracts: BTreeMap<TaskId, ExpectedWork>,
 	prepared: BTreeSet<TaskId>,
@@ -393,7 +418,6 @@ enum PendingResources {
 #[doc(hidden)]
 pub struct HostPreparedResources {
 	runtime: Runtime,
-	reservations: BTreeMap<DeviceId, Reservation>,
 	bindings: BTreeMap<DeviceId, HostDeviceBinding>,
 	pending: BTreeMap<TaskId, HostPending>,
 	handoff: HostPreparedHandoff,
@@ -414,7 +438,6 @@ impl fmt::Debug for HostResources {
 		formatter
 			.debug_struct("HostResources")
 			.field("runtime", &self.runtime)
-			.field("reservation_count", &self.reservations.len())
 			.field("bindings", &self.bindings)
 			.field("contract_count", &self.contracts.len())
 			.field("prepared", &self.prepared)
@@ -429,7 +452,6 @@ impl fmt::Debug for HostPreparedResources {
 		formatter
 			.debug_struct("HostPreparedResources")
 			.field("runtime", &self.runtime)
-			.field("reservation_count", &self.reservations.len())
 			.field("bindings", &self.bindings)
 			.field("pending", &self.pending)
 			.field("handoff", &self.handoff)
@@ -466,29 +488,22 @@ impl HostPreparedResources {
 				));
 			}
 		}
+		validate_reservations(reservations, &bindings)?;
 		let slots = SlotCapacity::new(tasks.len().max(1))?;
 		let runtime = Runtime::new(RuntimeConfig::new(
 			config.worker_threads,
 			slots,
-			config.staging_bytes_per_slot,
+			config.staging_bytes_per_worker,
 		)?)?;
-		let reservations = match allocate_reservations_from_ledger(reservations, &bindings) {
-			Ok(reservations) => reservations,
+		let pending = match prepare_candidate_pending(&runtime, draft, tasks) {
+			Ok(pending) => pending,
 			Err(error) => {
 				drop(runtime.close());
 				return Err(error);
 			}
 		};
-		let pending = match prepare_candidate_pending(&runtime, draft, tasks) {
-			Ok(pending) => pending,
-			Err(error) => {
-				drop(destroy_host_resources(runtime, reservations));
-				return Err(error);
-			}
-		};
 		Ok(Self {
 			runtime,
-			reservations,
 			bindings,
 			pending,
 			handoff: HostPreparedHandoff::Candidate,
@@ -498,7 +513,6 @@ impl HostPreparedResources {
 	fn bind(self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<HostResources> {
 		let Self {
 			runtime,
-			reservations,
 			bindings,
 			pending,
 			handoff,
@@ -520,7 +534,6 @@ impl HostPreparedResources {
 		}?;
 		Ok(HostResources {
 			runtime,
-			reservations,
 			bindings,
 			contracts,
 			prepared: BTreeSet::new(),
@@ -533,7 +546,6 @@ impl HostPreparedResources {
 	pub fn bind_candidate(self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<HostResources> {
 		let Self {
 			runtime,
-			reservations,
 			bindings,
 			pending,
 			handoff,
@@ -567,7 +579,6 @@ impl HostPreparedResources {
 		}
 		Ok(HostResources {
 			runtime,
-			reservations,
 			bindings,
 			contracts,
 			prepared: BTreeSet::new(),
@@ -616,13 +627,10 @@ impl HostPreparedResources {
 	#[doc(hidden)]
 	pub fn destroy(self) -> Result<()> {
 		let Self {
-			runtime,
-			reservations,
-			pending,
-			..
+			runtime, pending, ..
 		} = self;
 		drop(pending);
-		destroy_host_resources(runtime, reservations)
+		runtime.close()
 	}
 }
 
@@ -646,23 +654,16 @@ impl HostResources {
 	) -> Result<Self> {
 		let bindings = index_bindings(config.bindings)?;
 		validate_bundle_devices(bundle, &bindings, tasks.is_none())?;
+		validate_reservations(bundle.reservations(), &bindings)?;
 		let contracts = task_contracts(bundle, tasks)?;
 		let slots = SlotCapacity::new(contracts.len().max(1))?;
 		let runtime = Runtime::new(RuntimeConfig::new(
 			config.worker_threads,
 			slots,
-			config.staging_bytes_per_slot,
+			config.staging_bytes_per_worker,
 		)?)?;
-		let reservations = match allocate_reservations(bundle, &bindings) {
-			Ok(reservations) => reservations,
-			Err(error) => {
-				drop(runtime.close());
-				return Err(error);
-			}
-		};
 		Ok(Self {
 			runtime,
-			reservations,
 			bindings,
 			contracts,
 			prepared: BTreeSet::new(),
@@ -848,10 +849,14 @@ impl HostResources {
 					metric,
 					slot,
 					value,
+					submission,
 				},
 				BackendWork::Metric(work),
 			) => {
-				if work.metric != *metric || work.slot != *slot || work.value != *value {
+				if work.metric != *metric
+					|| work.slot != *slot || work.value != *value
+					|| work.submission != *submission
+				{
 					return Err(Error::Protocol {
 						task: work.task,
 						detail: "host metric differs from its finalized contract",
@@ -928,6 +933,39 @@ impl HostResources {
 				self.poisoned = true;
 				Err(error)
 			}
+		}
+	}
+
+	/// Rearms one terminal loop token using its already-realized copy slot and
+	/// staging allocation.
+	#[doc(hidden)]
+	pub fn rearm_pending(&mut self, pending: &mut HostPending) -> Result<()> {
+		self.ensure_healthy()?;
+		require(
+			pending.terminal && pending.submitted,
+			Error::Protocol {
+				task: pending.task,
+				detail: "only a terminal host loop token may be rearmed",
+			},
+		)?;
+		pending.copy.reset()?;
+		pending.submitted = false;
+		pending.terminal = false;
+		Ok(())
+	}
+
+	/// Uses a never-submitted loop token as-is or rearms it after its own prior
+	/// activation reaches terminal completion.
+	#[doc(hidden)]
+	pub fn prepare_loop_pending(&mut self, pending: &mut HostPending) -> Result<()> {
+		self.ensure_healthy()?;
+		match (pending.submitted, pending.terminal) {
+			(false, false) => Ok(()),
+			(true, true) => self.rearm_pending(pending),
+			(false, true) | (true, false) => Err(Error::Protocol {
+				task: pending.task,
+				detail: "an active or inconsistent host loop token may not be submitted again",
+			}),
 		}
 	}
 
@@ -1026,7 +1064,10 @@ impl HostResources {
 
 	#[doc(hidden)]
 	pub fn available_bytes(&self, device: DeviceId) -> Result<ByteCount> {
-		let binding = self.bindings.get(&device).ok_or(Error::MissingDevice(device))?;
+		let binding = self
+			.bindings
+			.get(&device)
+			.ok_or(Error::MissingDevice(device))?;
 		match binding {
 			HostDeviceBinding::Ram { .. } => available_ram_bytes(),
 			HostDeviceBinding::Disk { arena, .. } => available_disk_bytes(arena.path()),
@@ -1074,13 +1115,10 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn destroy(self) -> Result<()> {
 		let HostResources {
-			runtime,
-			reservations,
-			pending,
-			..
+			runtime, pending, ..
 		} = self;
 		drop(pending);
-		destroy_host_resources(runtime, reservations)
+		runtime.close()
 	}
 }
 
@@ -1089,6 +1127,8 @@ impl Backend for HostBackend {
 	type Error = Error;
 	type Pending = HostPending;
 	type Resource = HostResources;
+
+	const MAX_NON_POLL_PHYSICAL_CALLS: usize = 1;
 
 	fn bind_resources(
 		&mut self,
@@ -1141,6 +1181,10 @@ impl Backend for HostBackend {
 		resource.allocate_arena(layout)
 	}
 
+	fn supports_loop_repetition(&self) -> bool {
+		true
+	}
+
 	fn submit(
 		&mut self,
 		resource: &mut Self::Resource,
@@ -1150,6 +1194,20 @@ impl Backend for HostBackend {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<()> {
 		record(physical_calls, submission_call(&work))?;
+		resource.submit(&arenas, pending, work)
+	}
+
+	fn submit_loop_iteration(
+		&mut self,
+		resource: &mut Self::Resource,
+		arenas: ArenaSet<'_, Self::Arena>,
+		pending: &mut Self::Pending,
+		_iteration: LoopIteration,
+		work: BackendWork<'_>,
+		physical_calls: &mut PhysicalCallBatch,
+	) -> Result<()> {
+		record(physical_calls, submission_call(&work))?;
+		resource.prepare_loop_pending(pending)?;
 		resource.submit(&arenas, pending, work)
 	}
 
@@ -1247,14 +1305,11 @@ fn validate_bindings(bindings: &[HostDeviceBinding]) -> Result<()> {
 		if !devices.insert(device) {
 			return Err(Error::DuplicateDevice(device));
 		}
-		if let HostDeviceBinding::Disk {
-			arena, reservation, ..
-		} = binding && (arena.path() == reservation.path()
-			|| !paths.insert(arena.path().to_owned())
-			|| !paths.insert(reservation.path().to_owned()))
+		if let HostDeviceBinding::Disk { arena, .. } = binding
+			&& !paths.insert(arena.path().to_owned())
 		{
 			return Err(Error::InvalidConfiguration(
-				"host disk arena and reservation paths must be globally unique",
+				"host disk arena paths must be globally unique",
 			));
 		}
 	}
@@ -1296,58 +1351,19 @@ fn validate_bundle_devices(
 	Ok(())
 }
 
-fn allocate_reservations(
-	bundle: &FinalizedBundle,
-	bindings: &BTreeMap<DeviceId, HostDeviceBinding>,
-) -> Result<BTreeMap<DeviceId, Reservation>> {
-	allocate_reservations_from_ledger(bundle.reservations(), bindings)
-}
-
-fn allocate_reservations_from_ledger(
-	ledger: &ReservationLedger,
-	bindings: &BTreeMap<DeviceId, HostDeviceBinding>,
-) -> Result<BTreeMap<DeviceId, Reservation>> {
-	let mut reservations = BTreeMap::new();
-	for (device, binding) in bindings {
+fn validate_reservations(ledger: &ReservationLedger, bindings: &BTreeMap<DeviceId, HostDeviceBinding>) -> Result<()> {
+	for device in bindings.keys() {
 		let entry = ledger.entry(*device).ok_or(Error::MissingDevice(*device))?;
-		if entry.mechanism != recipe_core::ReservationMechanism::HeldAllocation {
-			release_reservations(reservations);
-			return Err(Error::InvalidConfiguration(
-				"host backend requires a held-allocation reservation",
-			));
-		}
-		let reservation = match binding {
-			HostDeviceBinding::Ram { .. } => Reservation::ram(*device, entry.bytes),
-			HostDeviceBinding::Disk { reservation, .. } => {
-				Reservation::disk(*device, reservation.clone(), entry.bytes)
-			}
-		};
-		match reservation {
-			Ok(reservation) => {
-				reservations.insert(*device, reservation);
-			}
-			Err(error) => {
-				release_reservations(reservations);
-				return Err(error);
-			}
-		}
+		require_enforced_quota(entry.mechanism)?;
 	}
-	Ok(reservations)
+	Ok(())
 }
 
-fn destroy_host_resources(runtime: Runtime, reservations: BTreeMap<DeviceId, Reservation>) -> Result<()> {
-	let mut first = runtime.close().err();
-	for (_, reservation) in reservations {
-		if let Err(error) = reservation.release()
-			&& first.is_none()
-		{
-			first = Some(error);
-		}
-	}
-	match first {
-		Some(error) => Err(error),
-		None => Ok(()),
-	}
+fn require_enforced_quota(mechanism: ReservationMechanism) -> Result<()> {
+	require(
+		mechanism == ReservationMechanism::EnforcedQuota,
+		Error::InvalidConfiguration("host backend requires a scheduler-enforced quota"),
+	)
 }
 
 fn available_ram_bytes() -> Result<ByteCount> {
@@ -1379,12 +1395,6 @@ fn available_disk_bytes(path: &Path) -> Result<ByteCount> {
 		.checked_mul(statistics.f_frsize)
 		.ok_or(Error::RangeOverflow)?;
 	Ok(ByteCount::new(bytes))
-}
-
-fn release_reservations(reservations: BTreeMap<DeviceId, Reservation>) {
-	for (_, reservation) in reservations {
-		drop(reservation.release());
-	}
 }
 
 fn prepare_candidate_pending(
@@ -1615,6 +1625,7 @@ fn task_contracts(
 					task: task.id,
 					detail: "metric value has no finalized location",
 				})?,
+				submission: metric.submission,
 			},
 			TaskKind::Transfer(transfer) => {
 				let endpoints = bundle.transfer_endpoints(task.id).ok_or(Error::Protocol {
@@ -1832,5 +1843,196 @@ fn record(batch: &mut PhysicalCallBatch, call: PhysicalCall) -> Result<()> {
 			consume_context(overflow);
 			Err(Error::PhysicalReportOverflow)
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use recipe_core::{ArenaObjectId, ByteOffset, LoopIterations, MetricPurpose};
+	use recipe_executor::MetricWork;
+
+	use super::*;
+
+	fn wait_for_metric(
+		backend: &mut HostBackend,
+		resources: &mut HostResources,
+		pending: &mut HostPending,
+	) -> MetricValue {
+		for _ in 0..10_000 {
+			let mut calls = PhysicalCallBatch::new();
+			match <HostBackend as Backend>::poll(backend, resources, pending, &mut calls) {
+				Ok(BackendPoll::Pending) => std::thread::yield_now(),
+				Ok(BackendPoll::Complete { metric }) => {
+					return metric.expect("metric work must return one value");
+				}
+				Err(error) => panic!("host metric failed: {error}"),
+			}
+		}
+		panic!("host metric did not complete");
+	}
+
+	#[test]
+	fn sparse_first_activation_at_nonzero_then_reuses_single_preallocated_slot() {
+		let device = DeviceId::new(1);
+		let task = TaskId::new(1);
+		let metric = MetricId::new(1);
+		let slot = MetricSlotId::new(1);
+		let submission = SubmissionSlots {
+			queue: recipe_core::QueueSlotId::new(1),
+			completion: recipe_core::CompletionSlotId::new(1),
+		};
+		let value = ResolvedValueLocation {
+			value: ValueId::new(1),
+			dtype: DType::F32,
+			device,
+			bytes: ByteCount::new(4),
+			object: ArenaObjectId::new(1),
+			object_offset: ByteOffset::new(0),
+			arena_offset: ByteOffset::new(0),
+		};
+		let runtime = Runtime::new(
+			RuntimeConfig::new(1, SlotCapacity::new(1).expect("one slot is valid"), 4)
+				.expect("host runtime config is valid"),
+		)
+		.expect("host runtime starts");
+		let mut resources = HostResources {
+			runtime,
+			bindings: BTreeMap::from([(device, HostDeviceBinding::Ram { device })]),
+			contracts: BTreeMap::from([(
+				task,
+				ExpectedWork::Metric {
+					metric,
+					slot,
+					value,
+					submission,
+				},
+			)]),
+			prepared: BTreeSet::new(),
+			pending: PendingResources::Deferred,
+			poisoned: false,
+		};
+		assert_eq!(resources.runtime.config().slots().get(), 1);
+		let mut pending = resources
+			.prepare_pending(PendingRequest {
+				task,
+				phase: RunPhase::Loop,
+				class: WorkClass::Metric,
+				submission: Some(submission),
+			})
+			.expect("loop metric pending token is prepared");
+		let staging_backing = Arc::as_ptr(
+			&pending
+				.staging
+				.as_ref()
+				.expect("metric token owns preallocated staging")
+				.backing,
+		);
+		let arena = Arena::ram(device, ByteCount::new(4)).expect("metric arena is allocated");
+		arena.write_exact(0, &1.25_f32.to_le_bytes())
+			.expect("first metric is resident");
+		let mut arenas = BTreeMap::from([(device, arena)]);
+		let iterations = LoopIterations::new(3).expect("three loop iterations are valid");
+		let iteration_one = iterations.iteration(1).expect("iteration one is in range");
+		let iteration_two = iterations.iteration(2).expect("iteration two is in range");
+		let mut backend = HostBackend {
+			state: BackendState::Bound,
+		};
+
+		let mut calls = PhysicalCallBatch::new();
+		<HostBackend as Backend>::submit_loop_iteration(
+			&mut backend,
+			&mut resources,
+			ArenaSet::new(&arenas),
+			&mut pending,
+			iteration_one,
+			BackendWork::Metric(MetricWork {
+				task,
+				iteration: iteration_one,
+				purpose: MetricPurpose::User,
+				metric,
+				slot,
+				value,
+				submission,
+			}),
+			&mut calls,
+		)
+		.expect("fresh token first submits on sparse nonzero iteration");
+		assert_eq!(
+			wait_for_metric(&mut backend, &mut resources, &mut pending),
+			MetricValue::F32(1.25)
+		);
+		assert!(pending.terminal);
+
+		arenas.get(&device)
+			.expect("metric arena remains bound")
+			.write_exact(0, &9.5_f32.to_le_bytes())
+			.expect("second metric is resident");
+		let mut calls = PhysicalCallBatch::new();
+		<HostBackend as Backend>::submit_loop_iteration(
+			&mut backend,
+			&mut resources,
+			ArenaSet::new(&arenas),
+			&mut pending,
+			iteration_two,
+			BackendWork::Metric(MetricWork {
+				task,
+				iteration: iteration_two,
+				purpose: MetricPurpose::User,
+				metric,
+				slot,
+				value,
+				submission,
+			}),
+			&mut calls,
+		)
+		.expect("terminal token rearms for the next sparse activation");
+		assert_eq!(
+			Arc::as_ptr(
+				&pending
+					.staging
+					.as_ref()
+					.expect("metric staging remains present")
+					.backing,
+			),
+			staging_backing
+		);
+		assert!(pending.submitted);
+		assert!(!pending.terminal);
+		assert_eq!(
+			wait_for_metric(&mut backend, &mut resources, &mut pending),
+			MetricValue::F32(9.5)
+		);
+
+		drop(pending);
+		arenas.remove(&device)
+			.expect("metric arena remains owned")
+			.close()
+			.expect("metric arena closes");
+		resources.destroy().expect("host resources close");
+	}
+
+	#[test]
+	fn host_backend_accepts_only_scheduler_enforced_quota() {
+		assert_eq!(
+			require_enforced_quota(ReservationMechanism::EnforcedQuota),
+			Ok(())
+		);
+		assert!(matches!(
+			require_enforced_quota(ReservationMechanism::HeldAllocation),
+			Err(Error::InvalidConfiguration(_))
+		));
+	}
+
+	#[test]
+	fn host_capacity_query_rejects_an_unbound_device_before_realization() {
+		let device = DeviceId::new(1);
+		let config =
+			HostBackendConfig::new(1, 4, vec![HostDeviceBinding::Ram { device }]).expect("host config is valid");
+		assert_eq!(
+			config.available_bytes(DeviceId::new(2)),
+			Err(Error::MissingDevice(DeviceId::new(2)))
+		);
 	}
 }

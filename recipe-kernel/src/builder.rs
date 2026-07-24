@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -91,6 +92,48 @@ pub struct BuildProvenance {
 	pub invocations: Vec<ToolInvocation>,
 }
 
+/// Exact compiler record for one multi-entry AMD code object.
+///
+/// `llvm_ir` and [`BuiltHsacoBundle::inspections`] use the same input order.
+/// Every input module is independently verified and serialized to bitcode
+/// before one full-LTO ELF link produces the returned metadata-bearing HSACO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HsacoBundleProvenance {
+	pub phase: BuildPhase,
+	pub llvm_ir: Vec<ArtifactDigest>,
+	pub tools: Vec<(PathBuf, ArtifactDigest)>,
+	pub invocations: Vec<ToolInvocation>,
+}
+
+/// One AMD code object containing every requested kernel entry point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltHsacoBundle {
+	pub bytes: Vec<u8>,
+	pub inspections: Vec<InspectedHsaco>,
+	pub provenance: HsacoBundleProvenance,
+}
+
+/// Exact compiler record for one multi-entry NVIDIA cubin.
+///
+/// `llvm_ir` and [`BuiltCubinBundle::inspections`] use the same input order.
+/// Every input module is independently verified and lowered to PTX before one
+/// pinned `ptxas` invocation packages all entry points into the returned cubin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CubinBundleProvenance {
+	pub phase: BuildPhase,
+	pub llvm_ir: Vec<ArtifactDigest>,
+	pub tools: Vec<(PathBuf, ArtifactDigest)>,
+	pub invocations: Vec<ToolInvocation>,
+}
+
+/// One NVIDIA cubin containing every requested kernel entry point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltCubinBundle {
+	pub bytes: Vec<u8>,
+	pub inspections: Vec<InspectedCubin>,
+	pub provenance: CubinBundleProvenance,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuiltArtifact {
 	Hsaco {
@@ -167,6 +210,248 @@ impl ArtifactBuilder {
 			KernelTarget::Nvidia(target) => self.build_cubin(phase, lowered, *target, &workspace, invocations)?,
 		};
 		Ok(artifact)
+	}
+
+	/// Compile separately lowered AMD stages into one multi-entry HSACO.
+	///
+	/// Input order is significant and must already be deterministic. Recipe
+	/// verifies every LLVM module, invokes the full-LTO ELF linker exactly once,
+	/// then inspects every entry ABI in the shared image. Full LTO is required
+	/// here because ordinary AMDGPU relocatable-object linking does not merge
+	/// the per-object HSA metadata notes on supported LLVM toolchains.
+	pub fn build_hsaco_bundle(
+		&self,
+		phase: BuildPhase,
+		lowered: &[LoweredKernel],
+		target: &AmdTarget,
+		scratch_parent: &Path,
+	) -> Result<BuiltHsacoBundle, LoweringError> {
+		target.validate()?;
+		if lowered.is_empty() {
+			return Err(LoweringError::new(
+				LoweringErrorKind::InvalidKernel,
+				"an AMD code-object bundle must contain at least one kernel",
+			));
+		}
+		let expected_target = KernelTarget::Amd(target.clone());
+		let mut entry_symbols = BTreeSet::new();
+		for kernel in lowered {
+			if kernel.target != expected_target {
+				return Err(LoweringError::new(
+					LoweringErrorKind::ArtifactMismatch,
+					format!(
+						"lowered module target {:?} does not match requested AMD bundle target {expected_target:?}",
+						kernel.target
+					),
+				));
+			}
+			if !entry_symbols.insert(kernel.abi.entry_symbol.as_str()) {
+				return Err(LoweringError::new(
+					LoweringErrorKind::InvalidEntrySymbol,
+					format!(
+						"AMD code-object bundle repeats entry symbol `{}`",
+						kernel.abi.entry_symbol
+					),
+				));
+			}
+		}
+
+		self.toolchain.verifier.verify()?;
+		self.toolchain.llvm_codegen.verify()?;
+		let linker = self.toolchain.elf_linker.as_ref().ok_or_else(|| {
+			LoweringError::new(
+				LoweringErrorKind::InvalidTarget,
+				"AMD artifact build requires a pinned ELF linker",
+			)
+		})?;
+		linker.verify()?;
+
+		let workspace = BuildWorkspace::create(scratch_parent)?;
+		let mut invocations = Vec::new();
+		let mut modules = Vec::with_capacity(lowered.len());
+		let (processor, features) = amd_processor_and_features(&target.target_id)?;
+		for (index, kernel) in lowered.iter().enumerate() {
+			let ir = workspace.path.join(format!("kernel-{index}.ll"));
+			let module = workspace.path.join(format!("kernel-{index}.bc"));
+			write_new(&ir, kernel.llvm_ir.as_bytes())?;
+			invoke(
+				&self.toolchain.verifier,
+				[
+					OsString::from("-passes=verify"),
+					ir.as_os_str().to_owned(),
+					OsString::from("-o"),
+					module.as_os_str().to_owned(),
+				],
+				&workspace.path,
+				&mut invocations,
+			)?;
+			modules.push(module);
+		}
+
+		let output = workspace.path.join("bundle.hsaco");
+		let mut linker_arguments = vec![
+			OsString::from("-shared"),
+			OsString::from("--no-undefined"),
+			OsString::from("--lto-O0"),
+			OsString::from(format!("--plugin-opt=-mcpu={processor}")),
+			OsString::from(format!(
+				"--plugin-opt=-amdhsa-code-object-version={}",
+				target.code_object_version
+			)),
+		];
+		if !features.is_empty() {
+			linker_arguments.push(OsString::from(format!("--plugin-opt=-mattr={features}")));
+		}
+		linker_arguments.extend(modules.into_iter().map(PathBuf::into_os_string));
+		linker_arguments.extend([OsString::from("-o"), output.as_os_str().to_owned()]);
+		invoke(linker, linker_arguments, &workspace.path, &mut invocations)?;
+		let bytes = read_regular(&output)?;
+		let inspections = lowered
+			.iter()
+			.map(|kernel| {
+				inspect_hsaco(
+					&bytes,
+					&target.target_id,
+					target.code_object_version,
+					&kernel.abi,
+				)
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let provenance = HsacoBundleProvenance {
+			phase,
+			llvm_ir: lowered
+				.iter()
+				.map(|kernel| ArtifactDigest::of(kernel.llvm_ir.as_bytes()))
+				.collect(),
+			tools: self.invoked_tools(&invocations),
+			invocations,
+		};
+		Ok(BuiltHsacoBundle {
+			bytes,
+			inspections,
+			provenance,
+		})
+	}
+
+	/// Compile separately lowered NVIDIA stages into one multi-entry cubin.
+	///
+	/// Input order is significant and must already be deterministic. Each LLVM
+	/// module is independently verified and lowered to a PTX translation unit.
+	/// NVIDIA's pinned offline assembler then receives every PTX unit in one
+	/// invocation and emits one cubin containing all requested entry points.
+	pub fn build_cubin_bundle(
+		&self,
+		phase: BuildPhase,
+		lowered: &[LoweredKernel],
+		target: NvidiaTarget,
+		scratch_parent: &Path,
+	) -> Result<BuiltCubinBundle, LoweringError> {
+		target.validate()?;
+		if lowered.is_empty() {
+			return Err(LoweringError::new(
+				LoweringErrorKind::InvalidKernel,
+				"an NVIDIA cubin bundle must contain at least one kernel",
+			));
+		}
+		let expected_target = KernelTarget::Nvidia(target);
+		let mut entry_symbols = BTreeSet::new();
+		for kernel in lowered {
+			if kernel.target != expected_target {
+				return Err(LoweringError::new(
+					LoweringErrorKind::ArtifactMismatch,
+					format!(
+						"lowered module target {:?} does not match requested NVIDIA bundle target {expected_target:?}",
+						kernel.target
+					),
+				));
+			}
+			if !entry_symbols.insert(kernel.abi.entry_symbol.as_str()) {
+				return Err(LoweringError::new(
+					LoweringErrorKind::InvalidEntrySymbol,
+					format!(
+						"NVIDIA cubin bundle repeats entry symbol `{}`",
+						kernel.abi.entry_symbol
+					),
+				));
+			}
+		}
+
+		self.toolchain.verifier.verify()?;
+		self.toolchain.llvm_codegen.verify()?;
+		let assembler = self.toolchain.ptx_assembler.as_ref().ok_or_else(|| {
+			LoweringError::new(
+				LoweringErrorKind::InvalidTarget,
+				"NVIDIA artifact build requires a pinned ptxas",
+			)
+		})?;
+		assembler.verify()?;
+
+		let workspace = BuildWorkspace::create(scratch_parent)?;
+		let mut invocations = Vec::new();
+		let mut ptx_modules = Vec::with_capacity(lowered.len());
+		let architecture = target.architecture();
+		for (index, kernel) in lowered.iter().enumerate() {
+			let ir = workspace.path.join(format!("kernel-{index}.ll"));
+			let bitcode = workspace.path.join(format!("kernel-{index}.bc"));
+			let ptx = workspace.path.join(format!("kernel-{index}.ptx"));
+			write_new(&ir, kernel.llvm_ir.as_bytes())?;
+			invoke(
+				&self.toolchain.verifier,
+				[
+					OsString::from("-passes=verify"),
+					ir.as_os_str().to_owned(),
+					OsString::from("-o"),
+					bitcode.as_os_str().to_owned(),
+				],
+				&workspace.path,
+				&mut invocations,
+			)?;
+			invoke(
+				&self.toolchain.llvm_codegen,
+				[
+					OsString::from("-march=nvptx64"),
+					OsString::from(format!("-mcpu={architecture}")),
+					OsString::from(format!("-mattr={}", target.llvm_ptx_feature())),
+					bitcode.into_os_string(),
+					OsString::from("-o"),
+					ptx.as_os_str().to_owned(),
+				],
+				&workspace.path,
+				&mut invocations,
+			)?;
+			ptx_modules.push(ptx);
+		}
+
+		let output = workspace.path.join("bundle.cubin");
+		let mut assembler_arguments = vec![OsString::from(format!("-arch={architecture}"))];
+		assembler_arguments.extend(ptx_modules.into_iter().map(PathBuf::into_os_string));
+		assembler_arguments.extend([OsString::from("-o"), output.as_os_str().to_owned()]);
+		invoke(
+			assembler,
+			assembler_arguments,
+			&workspace.path,
+			&mut invocations,
+		)?;
+		let bytes = read_regular(&output)?;
+		let expected_sm = nvidia_sm(target)?;
+		let inspections = lowered
+			.iter()
+			.map(|kernel| inspect_cubin(&bytes, expected_sm, &kernel.abi.entry_symbol))
+			.collect::<Result<Vec<_>, _>>()?;
+		let provenance = CubinBundleProvenance {
+			phase,
+			llvm_ir: lowered
+				.iter()
+				.map(|kernel| ArtifactDigest::of(kernel.llvm_ir.as_bytes()))
+				.collect(),
+			tools: self.invoked_tools(&invocations),
+			invocations,
+		};
+		Ok(BuiltCubinBundle {
+			bytes,
+			inspections,
+			provenance,
+		})
 	}
 
 	fn build_hsaco(
@@ -280,16 +565,7 @@ impl ArtifactBuilder {
 		)?;
 		let ptx = read_regular(&ptx)?;
 		let bytes = read_regular(&output)?;
-		let expected_sm = target
-			.sm_major
-			.checked_mul(10)
-			.and_then(|value| value.checked_add(target.sm_minor))
-			.ok_or_else(|| {
-				LoweringError::new(
-					LoweringErrorKind::ArithmeticOverflow,
-					"NVIDIA SM identity overflowed",
-				)
-			})?;
+		let expected_sm = nvidia_sm(target)?;
 		let inspection = inspect_cubin(&bytes, expected_sm, &lowered.abi.entry_symbol)?;
 		Ok(BuiltArtifact::Cubin {
 			ptx,
@@ -305,8 +581,17 @@ impl ArtifactBuilder {
 		lowered: &LoweredKernel,
 		invocations: Vec<ToolInvocation>,
 	) -> BuildProvenance {
+		BuildProvenance {
+			phase,
+			llvm_ir: ArtifactDigest::of(lowered.llvm_ir.as_bytes()),
+			tools: self.invoked_tools(&invocations),
+			invocations,
+		}
+	}
+
+	fn invoked_tools(&self, invocations: &[ToolInvocation]) -> Vec<(PathBuf, ArtifactDigest)> {
 		let mut tools = Vec::new();
-		for invocation in &invocations {
+		for invocation in invocations {
 			if tools.iter().any(|(path, _)| path == &invocation.program) {
 				continue;
 			}
@@ -315,12 +600,7 @@ impl ArtifactBuilder {
 				.expect("every recorded invocation uses a pinned tool");
 			tools.push((invocation.program.clone(), digest));
 		}
-		BuildProvenance {
-			phase,
-			llvm_ir: ArtifactDigest::of(lowered.llvm_ir.as_bytes()),
-			tools,
-			invocations,
-		}
+		tools
 	}
 
 	fn tool_digest(&self, path: &Path) -> Option<ArtifactDigest> {
@@ -335,6 +615,18 @@ impl ArtifactBuilder {
 		.find(|tool| tool.path == path)
 		.map(|tool| tool.digest)
 	}
+}
+
+fn nvidia_sm(target: NvidiaTarget) -> Result<u8, LoweringError> {
+	target.sm_major
+		.checked_mul(10)
+		.and_then(|value| value.checked_add(target.sm_minor))
+		.ok_or_else(|| {
+			LoweringError::new(
+				LoweringErrorKind::ArithmeticOverflow,
+				"NVIDIA SM identity overflowed",
+			)
+		})
 }
 
 fn invoke(
@@ -573,7 +865,7 @@ mod tests {
 		);
 	}
 
-	fn add_kernel(target: &KernelTarget) -> LoweredKernel {
+	fn add_kernel_named(target: &KernelTarget, entry_symbol: &str) -> LoweredKernel {
 		let left = ScalarValueId::new(1);
 		let right = ScalarValueId::new(2);
 		let result = ScalarValueId::new(3);
@@ -636,11 +928,15 @@ mod tests {
 			&template,
 			target,
 			&LoweringOptions {
-				entry_symbol: "recipe_add_f32".to_owned(),
+				entry_symbol: entry_symbol.to_owned(),
 				workgroup_lanes: 256,
 			},
 		)
 		.unwrap()
+	}
+
+	fn add_kernel(target: &KernelTarget) -> LoweredKernel {
+		add_kernel_named(target, "recipe_add_f32")
 	}
 
 	struct PrivateScratch(PathBuf);
@@ -667,6 +963,129 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir(&self.0);
 		}
+	}
+
+	#[test]
+	fn successful_build_workspace_is_removed_on_drop() {
+		let scratch = PrivateScratch::create();
+		let workspace = BuildWorkspace::create(&scratch.0).unwrap();
+		let workspace_path = workspace.path.clone();
+		write_new(&workspace_path.join("kernel.ll"), b"test input").unwrap();
+
+		drop(workspace);
+
+		assert!(!workspace_path.exists());
+	}
+
+	#[test]
+	fn failed_artifact_build_removes_its_workspace() {
+		let scratch = PrivateScratch::create();
+		let verifier_path = scratch.0.join("failing-opt");
+		let codegen_path = scratch.0.join("unused-llc");
+		for path in [&verifier_path, &codegen_path] {
+			fs::write(path, b"#!/bin/sh\nexit 1\n").unwrap();
+			fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+		}
+		let builder = ArtifactBuilder::new(OfflineToolchain {
+			verifier: PinnedTool::inspect(&verifier_path).unwrap(),
+			llvm_codegen: PinnedTool::inspect(&codegen_path).unwrap(),
+			elf_linker: None,
+			ptx_assembler: None,
+		})
+		.unwrap();
+		let target = KernelTarget::Amd(AmdTarget {
+			target_id: "gfx1101".to_owned(),
+			code_object_version: 6,
+		});
+
+		let error = builder
+			.build(
+				BuildPhase::Offline,
+				&add_kernel(&target),
+				&target,
+				&scratch.0,
+			)
+			.unwrap_err();
+
+		assert_eq!(error.kind, LoweringErrorKind::ToolchainFailed);
+		assert!(!error.message.contains("retained at"));
+		let leaked_workspaces = fs::read_dir(&scratch.0)
+			.unwrap()
+			.filter_map(std::result::Result::ok)
+			.filter(|entry| {
+				entry.file_name()
+					.to_string_lossy()
+					.starts_with("recipe-build-")
+			})
+			.count();
+		assert_eq!(leaked_workspaces, 0);
+		fs::remove_file(verifier_path).unwrap();
+		fs::remove_file(codegen_path).unwrap();
+	}
+
+	#[test]
+	fn amd_bundle_rejects_duplicate_entry_symbols_before_tool_invocation() {
+		let scratch = PrivateScratch::create();
+		let executable = std::env::current_exe().unwrap();
+		let tool = PinnedTool::inspect(executable).unwrap();
+		let builder = ArtifactBuilder::new(OfflineToolchain {
+			verifier: tool.clone(),
+			llvm_codegen: tool.clone(),
+			elf_linker: Some(tool),
+			ptx_assembler: None,
+		})
+		.unwrap();
+		let target = AmdTarget {
+			target_id: "gfx1101".to_owned(),
+			code_object_version: 6,
+		};
+		let kernel_target = KernelTarget::Amd(target.clone());
+		let kernel = add_kernel(&kernel_target);
+
+		let error = builder
+			.build_hsaco_bundle(
+				BuildPhase::Offline,
+				&[kernel.clone(), kernel],
+				&target,
+				&scratch.0,
+			)
+			.unwrap_err();
+
+		assert_eq!(error.kind, LoweringErrorKind::InvalidEntrySymbol);
+		assert!(!scratch.0.join("recipe-build").exists());
+	}
+
+	#[test]
+	fn nvidia_bundle_rejects_duplicate_entry_symbols_before_tool_invocation() {
+		let scratch = PrivateScratch::create();
+		let executable = std::env::current_exe().unwrap();
+		let tool = PinnedTool::inspect(executable).unwrap();
+		let builder = ArtifactBuilder::new(OfflineToolchain {
+			verifier: tool.clone(),
+			llvm_codegen: tool.clone(),
+			elf_linker: None,
+			ptx_assembler: Some(tool),
+		})
+		.unwrap();
+		let target = NvidiaTarget {
+			sm_major: 8,
+			sm_minor: 6,
+			ptx_isa: 75,
+		};
+		let kernel_target = KernelTarget::Nvidia(target);
+		let kernel = add_kernel(&kernel_target);
+
+		let error = builder
+			.build_cubin_bundle(
+				BuildPhase::Offline,
+				&[kernel.clone(), kernel],
+				target,
+				&scratch.0,
+			)
+			.unwrap_err();
+
+		assert_eq!(error.kind, LoweringErrorKind::InvalidEntrySymbol);
+		assert!(!scratch.0.join("recipe-build").exists());
 	}
 
 	#[test]
@@ -704,6 +1123,54 @@ mod tests {
 	}
 
 	#[test]
+	#[ignore = "requires the host LLVM and AMDGPU toolchain"]
+	fn builds_one_hsaco_with_multiple_inspected_entries() {
+		let target = AmdTarget {
+			target_id: "gfx1101".to_owned(),
+			code_object_version: 6,
+		};
+		let kernel_target = KernelTarget::Amd(target.clone());
+		let builder = ArtifactBuilder::new(OfflineToolchain {
+			verifier: PinnedTool::inspect("/usr/bin/opt").unwrap(),
+			llvm_codegen: PinnedTool::inspect("/usr/bin/llc").unwrap(),
+			elf_linker: Some(PinnedTool::inspect("/usr/bin/ld.lld").unwrap()),
+			ptx_assembler: None,
+		})
+		.unwrap();
+		let scratch = PrivateScratch::create();
+		let kernels = [
+			add_kernel_named(&kernel_target, "recipe_add_f32_first"),
+			add_kernel_named(&kernel_target, "recipe_add_f32_second"),
+		];
+
+		let built = builder
+			.build_hsaco_bundle(BuildPhase::Offline, &kernels, &target, &scratch.0)
+			.unwrap();
+
+		assert_eq!(built.inspections.len(), 2);
+		assert_eq!(
+			built.inspections
+				.iter()
+				.map(|inspection| inspection.kernel.name.as_str())
+				.collect::<Vec<_>>(),
+			["recipe_add_f32_first", "recipe_add_f32_second"]
+		);
+		assert!(
+			built.inspections
+				.iter()
+				.all(|inspection| inspection.digest == ArtifactDigest::of(&built.bytes))
+		);
+		assert_eq!(built.provenance.llvm_ir.len(), 2);
+		let linker_invocations = built
+			.provenance
+			.invocations
+			.iter()
+			.filter(|invocation| invocation.program == Path::new("/usr/bin/ld.lld"))
+			.count();
+		assert_eq!(linker_invocations, 1);
+	}
+
+	#[test]
 	#[ignore = "requires the host LLVM and CUDA ptxas toolchain"]
 	fn builds_and_inspects_a_real_cubin_deterministically() {
 		let target = KernelTarget::Nvidia(NvidiaTarget {
@@ -736,5 +1203,59 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(first, second);
+	}
+
+	#[test]
+	#[ignore = "requires the host LLVM and CUDA ptxas toolchain"]
+	fn builds_one_cubin_with_multiple_inspected_entries() {
+		let target = NvidiaTarget {
+			sm_major: 8,
+			sm_minor: 6,
+			ptx_isa: 75,
+		};
+		let kernel_target = KernelTarget::Nvidia(target);
+		let assembler = Path::new("/opt/cuda/bin/ptxas");
+		let builder = ArtifactBuilder::new(OfflineToolchain {
+			verifier: PinnedTool::inspect("/usr/bin/opt").unwrap(),
+			llvm_codegen: PinnedTool::inspect("/usr/bin/llc").unwrap(),
+			elf_linker: None,
+			ptx_assembler: Some(PinnedTool::inspect(assembler).unwrap()),
+		})
+		.unwrap();
+		let scratch = PrivateScratch::create();
+		let kernels = [
+			add_kernel_named(&kernel_target, "recipe_add_f32_first"),
+			add_kernel_named(&kernel_target, "recipe_add_f32_second"),
+		];
+
+		let built = builder
+			.build_cubin_bundle(BuildPhase::Offline, &kernels, target, &scratch.0)
+			.unwrap();
+		let rebuilt = builder
+			.build_cubin_bundle(BuildPhase::Offline, &kernels, target, &scratch.0)
+			.unwrap();
+
+		assert_eq!(built, rebuilt);
+		assert_eq!(built.inspections.len(), 2);
+		assert_eq!(
+			built.inspections
+				.iter()
+				.map(|inspection| inspection.entry_symbol.as_str())
+				.collect::<Vec<_>>(),
+			["recipe_add_f32_first", "recipe_add_f32_second"]
+		);
+		assert!(
+			built.inspections
+				.iter()
+				.all(|inspection| inspection.digest == ArtifactDigest::of(&built.bytes))
+		);
+		assert_eq!(built.provenance.llvm_ir.len(), 2);
+		let assembler_invocations = built
+			.provenance
+			.invocations
+			.iter()
+			.filter(|invocation| invocation.program == assembler)
+			.count();
+		assert_eq!(assembler_invocations, 1);
 	}
 }

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
+use std::time::Duration;
 
 use recipe_core::{
-	ArtifactId, BundleIdentity, ByteCount, DeviceId, FinalizedBundle, KernelTemplateId, LinkId, MetricId,
-	MetricPurpose, MetricSlotId, ResolvedTransferEndpoint, ResolvedValueLocation, RunId, RunPhase, ScheduleWindow,
-	SubmissionSlots, Task, TaskId, TaskKind, TransferEndpoint, TransferLaneClaim, ValueId,
+	ArtifactId, BundleIdentity, ByteCount, DeviceId, FinalizedBundle, IterationDomain, KernelTemplateId, LinkId,
+	LoopIteration, MetricId, MetricPurpose, MetricSlotId, ResolvedTransferEndpoint, ResolvedValueLocation, RunId,
+	RunPhase, ScheduleWindow, SubmissionSlots, Task, TaskId, TaskKind, TransferEndpoint, TransferLaneClaim, ValueId,
 };
 
 use crate::backend::{
@@ -14,6 +15,62 @@ use crate::backend::{
 };
 use crate::error::{BackendMessage, BackendOperation, ExecutorError, JournalStream, Result};
 use crate::metrics::{MetricMailbox, MetricSample};
+
+const RUN_LIFECYCLE_LOGICAL_EVENTS: usize = 5;
+const BLOCKING_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
+const BLOCKING_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
+
+#[derive(Clone, Copy, Debug)]
+struct BlockingPollBackoff {
+	next_delay: Duration,
+}
+
+impl BlockingPollBackoff {
+	const fn new() -> Self {
+		Self {
+			next_delay: BLOCKING_POLL_INITIAL_DELAY,
+		}
+	}
+
+	fn reset(&mut self) {
+		self.next_delay = BLOCKING_POLL_INITIAL_DELAY;
+	}
+
+	fn wait(&mut self) {
+		std::thread::sleep(self.next_delay);
+		self.advance();
+	}
+
+	fn advance(&mut self) {
+		self.next_delay = self
+			.next_delay
+			.saturating_mul(2)
+			.min(BLOCKING_POLL_MAXIMUM_DELAY);
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhasePoll {
+	complete: bool,
+	made_progress: bool,
+}
+
+#[cfg(test)]
+mod blocking_poll_backoff_tests {
+	use super::*;
+
+	#[test]
+	fn nonprogress_backoff_caps_and_progress_resets_it() {
+		let mut backoff = BlockingPollBackoff::new();
+		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
+		for _ in 0..16 {
+			backoff.advance();
+		}
+		assert_eq!(backoff.next_delay, BLOCKING_POLL_MAXIMUM_DELAY);
+		backoff.reset();
+		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Watchdog {
@@ -123,6 +180,10 @@ pub enum LogicalEvent {
 	LoopStarted {
 		run: RunId,
 	},
+	LoopIterationStarted {
+		run: RunId,
+		iteration: LoopIteration,
+	},
 	MetricPublished {
 		task: TaskId,
 		slot: MetricSlotId,
@@ -132,6 +193,10 @@ pub enum LogicalEvent {
 		calculation: TaskId,
 		readback: TaskId,
 		value: ValueId,
+	},
+	LoopIterationCompleted {
+		run: RunId,
+		iteration: LoopIteration,
 	},
 	LoopCompleted {
 		run: RunId,
@@ -166,14 +231,52 @@ impl JournalCapacity {
 		}
 	}
 
-	pub(crate) fn recommended(bundle: &FinalizedBundle, watchdog: Watchdog) -> Result<Self> {
+	/// Derive fixed journal bounds from the exact finalized task graph.
+	///
+	/// Pending completion polls are represented by one ordered marker and one
+	/// exact counter per finalized task, so this bound is independent of the
+	/// watchdog stretch.
+	pub fn for_bundle<B: Backend>(bundle: &FinalizedBundle) -> Result<Self> {
+		if B::MAX_NON_POLL_PHYSICAL_CALLS == 0 || B::MAX_NON_POLL_PHYSICAL_CALLS > MAX_PHYSICAL_CALLS_PER_OPERATION
+		{
+			return Err(ExecutorError::PreparationCapacityOverflow);
+		}
 		let task_count = bundle.tasks().len();
-		let arena_count = bundle.arena_layouts().len();
-		let metric_count = bundle
+		let loop_iterations = usize::try_from(bundle.loop_iterations().get())
+			.map_err(|_| ExecutorError::PreparationCapacityOverflow)?;
+		let loop_task_count = bundle
 			.tasks()
 			.iter()
-			.filter(|task| matches!(task.kind, TaskKind::Metric(_)))
+			.filter(|task| task.phase == RunPhase::Loop)
 			.count();
+		let non_loop_task_count = task_count
+			.checked_sub(loop_task_count)
+			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+		let loop_task_completions = checked_capacity_mul(loop_task_count, loop_iterations)?;
+		let active_loop_tasks = bundle
+			.tasks()
+			.iter()
+			.filter(|task| task.phase == RunPhase::Loop)
+			.try_fold(0_usize, |total, task| {
+				let domain = bundle
+					.iteration_domain(task.id)
+					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+				total.checked_add(iteration_domain_activations(domain)?)
+					.ok_or(ExecutorError::PreparationCapacityOverflow)
+			})?;
+		let task_executions = checked_capacity_sum(&[non_loop_task_count, active_loop_tasks])?;
+		let arena_count = bundle.arena_layouts().len();
+		let metric_emissions = bundle
+			.tasks()
+			.iter()
+			.filter(|task| task.phase == RunPhase::Loop && matches!(task.kind, TaskKind::Metric(_)))
+			.try_fold(0_usize, |total, task| {
+				let domain = bundle
+					.iteration_domain(task.id)
+					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+				total.checked_add(iteration_domain_activations(domain)?)
+					.ok_or(ExecutorError::PreparationCapacityOverflow)
+			})?;
 		let exit_image_count = bundle
 			.tasks()
 			.iter()
@@ -190,51 +293,61 @@ impl JournalCapacity {
 			.count();
 
 		let logical_events = checked_capacity_sum(&[
-			8,
+			// Prepared, Initialized, LoopStarted, LoopCompleted, Exited.
+			RUN_LIFECYCLE_LOGICAL_EVENTS,
 			checked_capacity_mul(arena_count, 2)?,
-			checked_capacity_mul(task_count, 2)?,
-			metric_count,
+			checked_capacity_mul(non_loop_task_count, 2)?,
+			loop_task_completions,
+			active_loop_tasks,
+			metric_emissions,
+			checked_capacity_mul(loop_iterations, 2)?,
 		])?;
 
-		// Every non-poll operation may report a full inline batch. Poll records
-		// receive one terminal record per task plus a declared watchdog stretch
-		// across all task slots. More verbose backends fail closed at this bound.
+		// Every non-poll operation may report a full inline batch. A completed
+		// task contributes one terminal poll record, while arbitrarily many
+		// pending polls consume only its fixed counter and first-marker slot.
 		let fixed_backend_operations = checked_capacity_sum(&[
 			2,
 			checked_capacity_mul(arena_count, 2)?,
-			checked_capacity_mul(task_count, 2)?,
+			task_count,
+			task_executions,
 			exit_image_count,
 		])?;
-		let fixed_physical = checked_capacity_mul(fixed_backend_operations, MAX_PHYSICAL_CALLS_PER_OPERATION)?;
-		let watchdog_polls = checked_capacity_mul(
-			task_count,
-			usize::try_from(watchdog.max_nonprogress_polls).map_err(|conversion_error| {
-				debug_assert!(false, "u32 watchdog did not fit usize: {conversion_error}");
-				ExecutorError::PreparationCapacityOverflow
-			})?,
-		)?;
-		let physical_calls = checked_capacity_sum(&[
-			fixed_physical,
-			task_count,
-			watchdog_polls,
-			MAX_PHYSICAL_CALLS_PER_OPERATION,
-		])?;
+		let fixed_physical = checked_capacity_mul(fixed_backend_operations, B::MAX_NON_POLL_PHYSICAL_CALLS)?;
+		let physical_calls = checked_capacity_sum(&[fixed_physical, task_executions, task_count])?;
 		Ok(Self::new(logical_events, physical_calls))
 	}
+}
+
+/// Exact number of pending completion polls reported for one finalized task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPollCount {
+	pub task: TaskId,
+	pub count: u128,
 }
 
 #[derive(Clone, Debug)]
 pub struct RunJournal {
 	logical_events: Vec<LogicalEvent>,
 	physical_calls: Vec<PhysicalCall>,
+	pending_polls: Vec<PendingPollCount>,
 	declared: JournalCapacity,
 }
 
 impl RunJournal {
-	pub(crate) fn with_capacity(declared: JournalCapacity) -> Self {
+	pub(crate) fn with_capacity(declared: JournalCapacity, tasks: &[Task]) -> Self {
+		let mut pending_polls = tasks
+			.iter()
+			.map(|task| PendingPollCount {
+				task: task.id,
+				count: 0,
+			})
+			.collect::<Vec<_>>();
+		pending_polls.sort_unstable_by_key(|entry| entry.task);
 		Self {
 			logical_events: Vec::with_capacity(declared.logical_events),
 			physical_calls: Vec::with_capacity(declared.physical_calls),
+			pending_polls,
 			declared,
 		}
 	}
@@ -253,15 +366,90 @@ impl RunJournal {
 	}
 
 	pub(crate) fn record_physical(&mut self, calls: PhysicalCallBatch) -> Result<()> {
+		let mut pending_batch = [None::<(TaskId, u8)>; MAX_PHYSICAL_CALLS_PER_OPERATION];
+		let mut pending_batch_len = 0_usize;
+		let mut retained = 0_usize;
+		for call in calls.iter() {
+			let PhysicalCall::Poll {
+				task,
+				status: crate::backend::PhysicalPollStatus::Pending,
+			} = call
+			else {
+				retained = retained
+					.checked_add(1)
+					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+				continue;
+			};
+			let index = self
+				.pending_polls
+				.binary_search_by_key(&task, |entry| entry.task)
+				.map_err(|_| ExecutorError::BackendProtocol {
+					task,
+					detail: "pending poll names a task absent from the finalized bundle",
+				})?;
+			let existing = pending_batch[..pending_batch_len]
+				.iter_mut()
+				.find_map(|entry| entry.as_mut().filter(|(candidate, _)| *candidate == task));
+			match existing {
+				Some((_, count)) => {
+					*count = count
+						.checked_add(1)
+						.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
+				}
+				None => {
+					pending_batch[pending_batch_len] = Some((task, 1));
+					pending_batch_len += 1;
+					if self.pending_polls[index].count == 0 {
+						retained = retained
+							.checked_add(1)
+							.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+					}
+				}
+			}
+		}
+		for (task, increment) in pending_batch[..pending_batch_len].iter().flatten() {
+			let index = self
+				.pending_polls
+				.binary_search_by_key(task, |entry| entry.task)
+				.map_err(|_| ExecutorError::BackendProtocol {
+					task: *task,
+					detail: "pending poll names a task absent from the finalized bundle",
+				})?;
+			self.pending_polls[index]
+				.count
+				.checked_add(u128::from(*increment))
+				.ok_or(ExecutorError::PendingPollCountOverflow { task: *task })?;
+		}
 		let required = self
 			.physical_calls
 			.len()
-			.checked_add(calls.len())
+			.checked_add(retained)
 			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
 		match required <= self.declared.physical_calls {
 			true => {
 				for call in calls.iter() {
-					self.physical_calls.push(call);
+					match call {
+						PhysicalCall::Poll {
+							task,
+							status: crate::backend::PhysicalPollStatus::Pending,
+						} => {
+							let index = self
+								.pending_polls
+								.binary_search_by_key(&task, |entry| entry.task)
+								.map_err(|_| ExecutorError::BackendProtocol {
+									task,
+									detail: "pending poll names a task absent from the finalized bundle",
+								})?;
+							if self.pending_polls[index].count == 0 {
+								self.physical_calls.push(call);
+							}
+							self.pending_polls[index].count = self.pending_polls[index]
+								.count
+								.checked_add(1)
+								.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
+						}
+						_ => self.physical_calls.push(call),
+					}
 				}
 				Ok(())
 			}
@@ -278,8 +466,28 @@ impl RunJournal {
 	}
 
 	#[must_use]
+	/// Ordered non-pending calls, terminal polls, and the first pending marker
+	/// for each task. Use [`Self::pending_poll_counts`] for exact pending totals.
 	pub fn physical_calls(&self) -> &[PhysicalCall] {
 		&self.physical_calls
+	}
+
+	/// Fixed task-indexed pending-poll counters.
+	///
+	/// [`Self::physical_calls`] retains the first pending marker for each task;
+	/// this table preserves the exact number of pending polls across every
+	/// activation without growing the ordered journal.
+	#[must_use]
+	pub fn pending_poll_counts(&self) -> &[PendingPollCount] {
+		&self.pending_polls
+	}
+
+	#[must_use]
+	pub fn pending_poll_count(&self, task: TaskId) -> Option<u128> {
+		self.pending_polls
+			.binary_search_by_key(&task, |entry| entry.task)
+			.ok()
+			.map(|index| self.pending_polls[index].count)
 	}
 
 	#[must_use]
@@ -302,6 +510,7 @@ pub struct RuntimeCapacities {
 	pub completion_entries: usize,
 	pub logical_journal: usize,
 	pub physical_journal: usize,
+	pub pending_poll_entries: usize,
 }
 
 struct RunCore<B: Backend> {
@@ -382,7 +591,7 @@ impl<B: Backend> fmt::Debug for PreparedRun<B> {
 
 impl<B: Backend> PreparedRun<B> {
 	pub fn prepare(run_id: RunId, bundle: FinalizedBundle, backend: B, watchdog: Watchdog) -> Result<Self> {
-		let journal_capacity = JournalCapacity::recommended(&bundle, watchdog)?;
+		let journal_capacity = JournalCapacity::for_bundle::<B>(&bundle)?;
 		Self::prepare_with_journal_capacity(run_id, bundle, backend, watchdog, journal_capacity)
 	}
 
@@ -393,11 +602,16 @@ impl<B: Backend> PreparedRun<B> {
 		watchdog: Watchdog,
 		journal_capacity: JournalCapacity,
 	) -> Result<Self> {
+		if bundle.loop_iterations().get() > 1 && !backend.supports_loop_repetition() {
+			return Err(ExecutorError::LoopRepetitionUnsupported {
+				iterations: bundle.loop_iterations(),
+			});
+		}
 		let prepared = PreparedPhases::new(&bundle)?;
 		let completed = CompletionLedger::new(bundle.tasks());
 		let exit_image_capacity = prepared.exit.external_exit_count();
 		let fault_resets = prepared.fault_resets();
-		let mut journal = RunJournal::with_capacity(journal_capacity);
+		let mut journal = RunJournal::with_capacity(journal_capacity, bundle.tasks());
 		let mut physical_calls = PhysicalCallBatch::new();
 		let bind_result = backend.bind_resources(&bundle, &mut physical_calls);
 		let resource = backend_value(
@@ -516,10 +730,25 @@ impl<B: Backend> fmt::Debug for InitializedRun<B> {
 
 impl<B: Backend> InitializedRun<B> {
 	pub fn start_loop(mut self) -> Result<RunningRun<B>> {
+		let iteration =
+			self.core
+				.bundle
+				.loop_iterations()
+				.iteration(0)
+				.ok_or(ExecutorError::LifecycleInvariant {
+					detail: "finalized loop count did not contain iteration zero",
+				})?;
+		self.loop_phase.begin_loop_iteration(iteration);
 		self.core
 			.journal
 			.record_logical(LogicalEvent::LoopStarted {
 				run: self.core.run_id,
+			})?;
+		self.core
+			.journal
+			.record_logical(LogicalEvent::LoopIterationStarted {
+				run: self.core.run_id,
+				iteration,
 			})?;
 		Ok(RunningRun {
 			core: self.core,
@@ -569,22 +798,63 @@ impl<B: Backend> fmt::Debug for RunningRun<B> {
 impl<B: Backend> RunningRun<B> {
 	/// Performs one bounded, nonblocking scheduler/poll pass.
 	pub fn poll(&mut self) -> Result<LoopStatus> {
+		self.poll_with_progress().map(|(status, _)| status)
+	}
+
+	/// Performs one bounded, nonblocking scheduler/poll pass and reports
+	/// whether that pass submitted or completed any work.
+	pub fn poll_with_progress(&mut self) -> Result<(LoopStatus, bool)> {
 		let failure_check = self.failure.map(Err::<(), ExecutorError>).transpose()?;
 		debug_assert!(failure_check.is_none());
 		match poll_phase_once(&mut self.core, &mut self.phase, None) {
-			Ok(true) => {
+			Ok(PhasePoll {
+				complete: true,
+				made_progress,
+			}) => {
 				let false = self.completion_recorded else {
-					return Ok(LoopStatus::Complete);
+					return Ok((LoopStatus::Complete, made_progress));
 				};
+				let iteration = self
+					.phase
+					.loop_iteration
+					.ok_or(ExecutorError::LifecycleInvariant {
+						detail: "completed loop phase has no active iteration",
+					})?;
+				self.core
+					.journal
+					.record_logical(LogicalEvent::LoopIterationCompleted {
+						run: self.core.run_id,
+						iteration,
+					})?;
+				let next_index = iteration
+					.index()
+					.checked_add(1)
+					.ok_or(ExecutorError::LifecycleInvariant {
+						detail: "loop iteration index overflowed before its declared bound",
+					})?;
+				if let Some(next) = iteration.total().iteration(next_index) {
+					self.core.completed.reset_phase(RunPhase::Loop);
+					self.phase.begin_loop_iteration(next);
+					self.core
+						.journal
+						.record_logical(LogicalEvent::LoopIterationStarted {
+							run: self.core.run_id,
+							iteration: next,
+						})?;
+					return Ok((LoopStatus::Pending, true));
+				}
 				self.core
 					.journal
 					.record_logical(LogicalEvent::LoopCompleted {
 						run: self.core.run_id,
 					})?;
 				self.completion_recorded = true;
-				Ok(LoopStatus::Complete)
+				Ok((LoopStatus::Complete, true))
 			}
-			Ok(false) => Ok(LoopStatus::Pending),
+			Ok(PhasePoll {
+				complete: false,
+				made_progress,
+			}) => Ok((LoopStatus::Pending, made_progress)),
 			Err(error) => {
 				let reported = match self.core.journal.record_logical(LogicalEvent::LoopFailed {
 					run: self.core.run_id,
@@ -600,15 +870,17 @@ impl<B: Backend> RunningRun<B> {
 
 	/// Drives nonblocking polls until completion or a bounded failure.
 	pub fn wait(&mut self) -> Result<()> {
-		let terminal = std::iter::repeat_with(|| self.poll()).find_map(|poll| match poll {
-			Ok(LoopStatus::Pending) => None,
-			Ok(LoopStatus::Complete) => Some(Ok(())),
-			Err(error) => Some(Err(error)),
-		});
-		let Some(result) = terminal else {
-			unreachable!("watchdog-bounded polling always reaches a terminal result");
-		};
-		result
+		let mut backoff = BlockingPollBackoff::new();
+		loop {
+			let (status, made_progress) = self.poll_with_progress()?;
+			if status == LoopStatus::Complete {
+				return Ok(());
+			}
+			match made_progress {
+				true => backoff.reset(),
+				false => backoff.wait(),
+			}
+		}
 	}
 
 	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> {
@@ -633,7 +905,15 @@ impl<B: Backend> RunningRun<B> {
 			completion_entries: self.core.completed.entries.capacity(),
 			logical_journal: journal.logical_events,
 			physical_journal: journal.physical_calls,
+			pending_poll_entries: self.core.journal.pending_polls.capacity(),
 		}
+	}
+
+	#[must_use]
+	pub fn current_iteration(&self) -> LoopIteration {
+		self.phase
+			.loop_iteration
+			.expect("a running loop always has one active iteration")
 	}
 
 	pub fn into_exited_loop(self) -> std::result::Result<ExitedLoop<B>, Box<Self>> {
@@ -812,6 +1092,7 @@ struct PhaseState<P> {
 	slots: Vec<TaskSlot<P>>,
 	nonprogress_polls: u32,
 	complete: bool,
+	loop_iteration: Option<LoopIteration>,
 }
 
 impl<P: fmt::Debug> fmt::Debug for PhaseState<P> {
@@ -822,7 +1103,28 @@ impl<P: fmt::Debug> fmt::Debug for PhaseState<P> {
 			.field("slot_count", &self.slots.len())
 			.field("nonprogress_polls", &self.nonprogress_polls)
 			.field("complete", &self.complete)
+			.field("loop_iteration", &self.loop_iteration)
 			.finish()
+	}
+}
+
+impl<P> PhaseState<P> {
+	fn begin_loop_iteration(&mut self, iteration: LoopIteration) {
+		debug_assert_eq!(self.phase, RunPhase::Loop);
+		debug_assert!(
+			self.loop_iteration.is_none()
+				|| self
+					.slots
+					.iter()
+					.all(|slot| slot.status == SlotStatus::Complete),
+			"a subsequent loop iteration begins only after every slot completed"
+		);
+		for slot in &mut self.slots {
+			slot.status = SlotStatus::Remaining;
+		}
+		self.nonprogress_polls = 0;
+		self.complete = self.slots.is_empty();
+		self.loop_iteration = Some(iteration);
 	}
 }
 
@@ -831,6 +1133,7 @@ struct PreparedTask {
 	id: TaskId,
 	window: ScheduleWindow,
 	dependencies: Vec<TaskId>,
+	iteration_domain: Option<IterationDomain>,
 	work: PreparedWork,
 }
 
@@ -865,11 +1168,22 @@ enum PreparedWork {
 		metric: MetricId,
 		slot: MetricSlotId,
 		value: ResolvedValueLocation,
+		submission: SubmissionSlots,
 	},
 }
 
 impl PreparedTask {
 	fn new(bundle: &FinalizedBundle, task: &Task) -> Result<Self> {
+		let iteration_domain = match task.phase {
+			RunPhase::Loop => {
+				Some(bundle
+					.iteration_domain(task.id)
+					.ok_or(ExecutorError::LifecycleInvariant {
+						detail: "finalized loop task has no iteration domain",
+					})?)
+			}
+			RunPhase::Init | RunPhase::Exit => None,
+		};
 		let work = match (&task.kind, task.phase) {
 			(TaskKind::Calculation(calculation), RunPhase::Loop) => {
 				let inputs = resolve_values(bundle, task.id, &calculation.inputs)?;
@@ -893,6 +1207,7 @@ impl PreparedTask {
 				metric: metric.metric,
 				slot: metric.slot,
 				value: resolve_value(bundle, task.id, metric.value)?,
+				submission: metric.submission,
 			},
 			(TaskKind::Transfer(transfer), RunPhase::Init)
 				if matches!(
@@ -997,8 +1312,14 @@ impl PreparedTask {
 			id: task.id,
 			window: task.window,
 			dependencies: task.dependencies.clone(),
+			iteration_domain,
 			work,
 		})
+	}
+
+	fn active_on(&self, iteration: LoopIteration) -> bool {
+		self.iteration_domain
+			.is_some_and(|domain| domain.contains(iteration.index()))
 	}
 
 	const fn class(&self) -> WorkClass {
@@ -1014,14 +1335,15 @@ impl PreparedTask {
 		match self.work {
 			PreparedWork::InitAdmission { submission, .. }
 			| PreparedWork::Calculation { submission, .. }
-			| PreparedWork::Transfer { submission, .. } => Some(submission),
-			PreparedWork::Metric { .. } => None,
+			| PreparedWork::Transfer { submission, .. }
+			| PreparedWork::Metric { submission, .. } => Some(submission),
 		}
 	}
 
 	fn backend_work<'a>(
 		&'a self,
 		run: RunId,
+		iteration: Option<LoopIteration>,
 		images: Option<&'a BTreeMap<InitImageKey, Vec<u8>>>,
 	) -> Result<BackendWork<'a>> {
 		match &self.work {
@@ -1056,17 +1378,23 @@ impl PreparedTask {
 				inputs,
 				outputs,
 				fault_flag,
-			} => Ok(BackendWork::Calculation(CalculationWork {
-				task: self.id,
-				run,
-				device: *device,
-				kernel_template: *kernel_template,
-				artifact: *artifact,
-				submission: *submission,
-				inputs,
-				outputs,
-				fault_flag: *fault_flag,
-			})),
+			} => {
+				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
+					detail: "calculation work has no active loop iteration",
+				})?;
+				Ok(BackendWork::Calculation(CalculationWork {
+					task: self.id,
+					run,
+					iteration,
+					device: *device,
+					kernel_template: *kernel_template,
+					artifact: *artifact,
+					submission: *submission,
+					inputs,
+					outputs,
+					fault_flag: *fault_flag,
+				}))
+			}
 			PreparedWork::Transfer {
 				class,
 				source,
@@ -1096,13 +1424,21 @@ impl PreparedTask {
 				metric,
 				slot,
 				value,
-			} => Ok(BackendWork::Metric(MetricWork {
-				task: self.id,
-				purpose: *purpose,
-				metric: *metric,
-				slot: *slot,
-				value: *value,
-			})),
+				submission,
+			} => {
+				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
+					detail: "metric work has no active loop iteration",
+				})?;
+				Ok(BackendWork::Metric(MetricWork {
+					task: self.id,
+					iteration,
+					purpose: *purpose,
+					metric: *metric,
+					slot: *slot,
+					value: *value,
+					submission: *submission,
+				}))
+			}
 		}
 	}
 
@@ -1196,6 +1532,7 @@ struct FaultReset {
 #[derive(Debug)]
 struct CompletionEntry {
 	task: TaskId,
+	phase: RunPhase,
 	complete: bool,
 }
 
@@ -1210,6 +1547,7 @@ impl CompletionLedger {
 			.iter()
 			.map(|task| CompletionEntry {
 				task: task.id,
+				phase: task.phase,
 				complete: false,
 			})
 			.collect::<Vec<_>>();
@@ -1240,6 +1578,14 @@ impl CompletionLedger {
 
 	fn completed_count(&self) -> usize {
 		self.entries.iter().filter(|entry| entry.complete).count()
+	}
+
+	fn reset_phase(&mut self, phase: RunPhase) {
+		for entry in &mut self.entries {
+			if entry.phase == phase {
+				entry.complete = false;
+			}
+		}
 	}
 }
 
@@ -1278,6 +1624,7 @@ fn realize_phase<B: Backend>(
 		slots,
 		nonprogress_polls: 0,
 		complete,
+		loop_iteration: None,
 	})
 }
 
@@ -1447,31 +1794,64 @@ fn run_phase_blocking<B: Backend>(
 	state: &mut PhaseState<B::Pending>,
 	images: Option<&BTreeMap<InitImageKey, Vec<u8>>>,
 ) -> Result<()> {
-	let terminal = std::iter::repeat_with(|| poll_phase_once(core, state, images)).find_map(|poll| match poll {
-		Ok(false) => None,
-		Ok(true) => Some(Ok(())),
-		Err(error) => Some(Err(error)),
-	});
-	let Some(result) = terminal else {
-		unreachable!("watchdog-bounded phase polling always reaches a terminal result");
-	};
-	result
+	let mut backoff = BlockingPollBackoff::new();
+	loop {
+		let poll = poll_phase_once(core, state, images)?;
+		if poll.complete {
+			return Ok(());
+		}
+		match poll.made_progress {
+			true => backoff.reset(),
+			false => backoff.wait(),
+		}
+	}
 }
 
 fn poll_phase_once<B: Backend>(
 	core: &mut RunCore<B>,
 	state: &mut PhaseState<B::Pending>,
 	images: Option<&BTreeMap<InitImageKey, Vec<u8>>>,
-) -> Result<bool> {
+) -> Result<PhasePoll> {
 	let false = state.complete else {
-		return Ok(true);
+		return Ok(PhasePoll {
+			complete: true,
+			made_progress: false,
+		});
 	};
 
 	let mut made_progress = false;
+	if let Some(iteration) = state.loop_iteration {
+		for index in 0..state.slots.len() {
+			let inactive_and_ready = {
+				let slot = &state.slots[index];
+				slot.status == SlotStatus::Remaining
+					&& !slot.task.active_on(iteration)
+					&& slot
+						.task
+						.dependencies
+						.iter()
+						.all(|dependency| core.completed.contains(*dependency))
+			};
+			if !inactive_and_ready {
+				continue;
+			}
+			let task = state.slots[index].task.id;
+			core.completed.mark(task)?;
+			core.journal.record_logical(LogicalEvent::TaskCompleted {
+				phase: RunPhase::Loop,
+				task,
+			})?;
+			state.slots[index].status = SlotStatus::Complete;
+			made_progress = true;
+		}
+	}
 	for index in 0..state.slots.len() {
 		let runnable = {
 			let slot = &state.slots[index];
 			slot.status == SlotStatus::Remaining
+				&& state
+					.loop_iteration
+					.is_none_or(|iteration| slot.task.active_on(iteration))
 				&& slot
 					.task
 					.dependencies
@@ -1484,7 +1864,13 @@ fn poll_phase_once<B: Backend>(
 		let true = runnable else {
 			continue;
 		};
-		submit_slot(core, state.phase, &mut state.slots[index], images)?;
+		submit_slot(
+			core,
+			state.phase,
+			state.loop_iteration,
+			&mut state.slots[index],
+			images,
+		)?;
 		made_progress = true;
 	}
 
@@ -1506,7 +1892,7 @@ fn poll_phase_once<B: Backend>(
 				match poll {
 					BackendPoll::Pending => {}
 					BackendPoll::Complete { metric } => {
-						complete_slot(core, state.phase, slot, metric)?;
+						complete_slot(core, state.phase, state.loop_iteration, slot, metric)?;
 						slot.status = SlotStatus::Complete;
 						made_progress = true;
 					}
@@ -1527,7 +1913,10 @@ fn poll_phase_once<B: Backend>(
 	match (has_remaining, has_pending) {
 		(false, false) => {
 			state.complete = true;
-			return Ok(true);
+			return Ok(PhasePoll {
+				complete: true,
+				made_progress,
+			});
 		}
 		(true, false) if !made_progress => {
 			return Err(ExecutorError::SchedulerStalled { phase: state.phase });
@@ -1547,27 +1936,46 @@ fn poll_phase_once<B: Backend>(
 			};
 		}
 	}
-	Ok(false)
+	Ok(PhasePoll {
+		complete: false,
+		made_progress,
+	})
 }
 
 fn submit_slot<B: Backend>(
 	core: &mut RunCore<B>,
 	phase: RunPhase,
+	iteration: Option<LoopIteration>,
 	slot: &mut TaskSlot<B::Pending>,
 	images: Option<&BTreeMap<InitImageKey, Vec<u8>>>,
 ) -> Result<()> {
-	let work = slot.task.backend_work(core.run_id, images)?;
+	let work = slot.task.backend_work(core.run_id, iteration, images)?;
 	let class = work.class();
 	let mut physical_calls = PhysicalCallBatch::new();
 	let result = {
 		let resource = core.resource.active_mut()?;
-		core.backend.submit(
-			resource,
-			ArenaSet::new(&core.arenas),
-			&mut slot.pending,
-			work,
-			&mut physical_calls,
-		)
+		match (phase, iteration) {
+			(RunPhase::Loop, Some(iteration)) => core.backend.submit_loop_iteration(
+				resource,
+				ArenaSet::new(&core.arenas),
+				&mut slot.pending,
+				iteration,
+				work,
+				&mut physical_calls,
+			),
+			(RunPhase::Loop, None) => {
+				return Err(ExecutorError::LifecycleInvariant {
+					detail: "loop task submission has no active iteration",
+				});
+			}
+			(RunPhase::Init | RunPhase::Exit, _) => core.backend.submit(
+				resource,
+				ArenaSet::new(&core.arenas),
+				&mut slot.pending,
+				work,
+				&mut physical_calls,
+			),
+		}
 	};
 	backend_value(
 		&mut core.journal,
@@ -1599,6 +2007,7 @@ fn submit_slot<B: Backend>(
 fn complete_slot<B: Backend>(
 	core: &mut RunCore<B>,
 	phase: RunPhase,
+	iteration: Option<LoopIteration>,
 	slot: &mut TaskSlot<B::Pending>,
 	metric_value: Option<crate::MetricValue>,
 ) -> Result<()> {
@@ -1619,14 +2028,18 @@ fn complete_slot<B: Backend>(
 				metric,
 				slot: metric_slot,
 				value: location,
+				..
 			},
 			WorkClass::Metric,
 			Some(metric_value),
 		) => match purpose {
 			MetricPurpose::User => {
-				let replaced = core
-					.metrics
-					.publish(slot.task.id, *metric_slot, *metric, metric_value)?;
+				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
+					detail: "metric completion has no active loop iteration",
+				})?;
+				let replaced =
+					core.metrics
+						.publish(iteration, slot.task.id, *metric_slot, *metric, metric_value)?;
 				core.journal.record_logical(LogicalEvent::MetricPublished {
 					task: slot.task.id,
 					slot: *metric_slot,
@@ -1714,7 +2127,7 @@ fn collect_exit_image<B: Backend>(
 			}
 		})?;
 	image.resize(length, 0);
-	let BackendWork::ExitTransfer(work) = slot.task.backend_work(core.run_id, None)? else {
+	let BackendWork::ExitTransfer(work) = slot.task.backend_work(core.run_id, None, None)? else {
 		return Err(ExecutorError::BackendProtocol {
 			task: slot.task.id,
 			detail: "external exit did not prepare exit-transfer work",
@@ -1810,6 +2223,19 @@ fn checked_capacity_sum(values: &[usize]) -> Result<usize> {
 		sum.checked_add(*value)
 			.ok_or(ExecutorError::PreparationCapacityOverflow)
 	})
+}
+
+fn iteration_domain_activations(domain: IterationDomain) -> Result<usize> {
+	let span = domain
+		.end_exclusive()
+		.checked_sub(domain.first_iteration())
+		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+	let stride = domain.stride().get();
+	let activations = span
+		.checked_add(stride - 1)
+		.and_then(|value| value.checked_div(stride))
+		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+	usize::try_from(activations).map_err(|_| ExecutorError::PreparationCapacityOverflow)
 }
 
 fn checked_capacity_mul(left: usize, right: usize) -> Result<usize> {

@@ -238,11 +238,10 @@ impl<'cuda, 'hsa> StagedCrossBackend<'cuda, 'hsa> {
 			})
 	}
 
-	fn hsa_session(&self, device: DeviceId) -> Result<&'hsa HsaSession<'hsa>, StagedBridgeError> {
+	fn hsa_binding(&self, device: DeviceId) -> Result<&HsaBinding<'hsa>, StagedBridgeError> {
 		self.hsa_bindings
 			.iter()
 			.find(|binding| binding.device() == device)
-			.map(HsaBinding::session)
 			.ok_or(StagedBridgeError::MissingBinding {
 				device,
 				class: LocalDeviceClass::Hsa,
@@ -315,9 +314,9 @@ impl<'cuda, 'hsa> StagedCrossBackend<'cuda, 'hsa> {
 				))
 			}
 			LocalDeviceClass::Hsa => {
-				let session = self.hsa_session(endpoint.device)?;
-				let staging = session.allocate_fine(bytes)?;
-				session.grant_access(&staging)?;
+				let binding = self.hsa_binding(endpoint.device)?;
+				let session = binding.session();
+				let staging = binding.allocate_host_fine(bytes)?;
 				let pending = session.prepare_pending(2, 0)?;
 				Ok((
 					LegResources::Hsa { session, staging },
@@ -1201,6 +1200,37 @@ impl<'cuda, 'hsa> CrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda
 		}
 	}
 
+	fn supports_loop_repetition(&self) -> bool {
+		true
+	}
+
+	fn rearm_loop_pending(
+		&mut self,
+		resource: &mut Self::Resource,
+		pending: &mut Self::Pending,
+	) -> Result<(), Self::Error> {
+		if pending.state == PendingState::Ready {
+			return Ok(());
+		}
+		let task = resource
+			.tasks
+			.get_mut(&pending.task)
+			.ok_or(StagedBridgeError::MissingTask { task: pending.task })?;
+		if pending.state != PendingState::Complete {
+			return Err(StagedBridgeError::State {
+				task: pending.task,
+				detail: "only a terminal staged loop token may be rearmed",
+			});
+		}
+		task.worker.reset()?;
+		rearm_leg(pending.task, &mut pending.source)?;
+		rearm_leg(pending.task, &mut pending.destination)?;
+		pending.middle = MiddleJobState::Uninitialized;
+		pending.target = DestinationTarget::Host;
+		pending.state = PendingState::Ready;
+		Ok(())
+	}
+
 	fn destroy(&mut self, resource: Self::Resource) -> Result<(), Self::Error> {
 		destroy_resources(resource)
 	}
@@ -1294,6 +1324,32 @@ fn recycle_leg<'cuda, 'hsa>(
 			detail: "staged native completion token is in transition",
 		}),
 	}
+}
+
+fn rearm_leg(task: TaskId, leg: &mut ActiveLeg<'_, '_>) -> Result<(), StagedBridgeError> {
+	let active = core::mem::replace(leg, ActiveLeg::Transition);
+	let ready = match active {
+		ActiveLeg::Host => ActiveLeg::Host,
+		ActiveLeg::CudaReady(event) => ActiveLeg::CudaReady(event),
+		ActiveLeg::CudaActive(pending) => {
+			ActiveLeg::CudaReady(pending.recycle_event().map_err(StagedBridgeError::from)?)
+		}
+		ActiveLeg::Hsa(mut pending) => match pending.reset() {
+			Ok(()) => ActiveLeg::Hsa(pending),
+			Err(error) => {
+				*leg = ActiveLeg::Hsa(pending);
+				return Err(StagedBridgeError::from(error));
+			}
+		},
+		ActiveLeg::Transition => {
+			return Err(StagedBridgeError::State {
+				task,
+				detail: "staged native completion token is in transition",
+			});
+		}
+	};
+	*leg = ready;
+	Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

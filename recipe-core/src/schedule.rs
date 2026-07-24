@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 
 use crate::error::{ValidationCode, ValidationResult, Validator};
 use crate::ids::{
@@ -14,6 +15,202 @@ pub enum RunPhase {
 	Init,
 	Loop,
 	Exit,
+}
+
+/// Exact number of times the immutable loop task graph executes.
+///
+/// One is the compatibility default. Zero is deliberately unrepresentable:
+/// every finalized run enters its loop at least once before exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopIterations(u64);
+
+impl LoopIterations {
+	pub const ONE: Self = Self(1);
+
+	#[must_use]
+	pub const fn new(iterations: u64) -> Option<Self> {
+		match iterations {
+			0 => None,
+			_ => Some(Self(iterations)),
+		}
+	}
+
+	#[must_use]
+	pub const fn get(self) -> u64 {
+		self.0
+	}
+
+	#[must_use]
+	pub const fn from_nonzero(iterations: NonZeroU64) -> Self {
+		Self(iterations.get())
+	}
+
+	#[must_use]
+	pub const fn as_nonzero(self) -> NonZeroU64 {
+		match NonZeroU64::new(self.0) {
+			Some(iterations) => iterations,
+			None => unreachable!(),
+		}
+	}
+
+	#[must_use]
+	pub const fn iteration(self, index: u64) -> Option<LoopIteration> {
+		match index < self.0 {
+			true => Some(LoopIteration { index, total: self }),
+			false => None,
+		}
+	}
+}
+
+impl Default for LoopIterations {
+	fn default() -> Self {
+		Self::ONE
+	}
+}
+
+impl From<NonZeroU64> for LoopIterations {
+	fn from(iterations: NonZeroU64) -> Self {
+		Self::from_nonzero(iterations)
+	}
+}
+
+/// One zero-based execution of a finalized loop task graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopIteration {
+	index: u64,
+	total: LoopIterations,
+}
+
+impl LoopIteration {
+	#[must_use]
+	pub const fn index(self) -> u64 {
+		self.index
+	}
+
+	#[must_use]
+	pub const fn total(self) -> LoopIterations {
+		self.total
+	}
+}
+
+/// One nonempty arithmetic progression within a bounded loop.
+///
+/// Domains are zero-based and half-open. They select submissions without
+/// unrolling the immutable task graph or allocating per iteration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IterationDomain {
+	first: u64,
+	end_exclusive: u64,
+	stride: NonZeroU64,
+}
+
+impl IterationDomain {
+	#[must_use]
+	pub const fn new(first: u64, end_exclusive: u64, stride: u64) -> Option<Self> {
+		let Some(stride) = NonZeroU64::new(stride) else {
+			return None;
+		};
+		if first >= end_exclusive {
+			return None;
+		}
+		Some(Self {
+			first,
+			end_exclusive,
+			stride,
+		})
+	}
+
+	#[must_use]
+	pub const fn every(iterations: LoopIterations) -> Self {
+		Self {
+			first: 0,
+			end_exclusive: iterations.get(),
+			stride: NonZeroU64::MIN,
+		}
+	}
+
+	#[must_use]
+	pub const fn first() -> Self {
+		Self {
+			first: 0,
+			end_exclusive: 1,
+			stride: NonZeroU64::MIN,
+		}
+	}
+
+	#[must_use]
+	pub const fn periodic(offset: u64, period: NonZeroU64, iterations: LoopIterations) -> Option<Self> {
+		Self::new(offset, iterations.get(), period.get())
+	}
+
+	#[must_use]
+	pub const fn first_iteration(self) -> u64 {
+		self.first
+	}
+
+	#[must_use]
+	pub const fn end_exclusive(self) -> u64 {
+		self.end_exclusive
+	}
+
+	#[must_use]
+	pub const fn stride(self) -> NonZeroU64 {
+		self.stride
+	}
+
+	#[must_use]
+	pub const fn contains(self, iteration: u64) -> bool {
+		iteration >= self.first
+			&& iteration < self.end_exclusive
+			&& (iteration - self.first).is_multiple_of(self.stride.get())
+	}
+
+	#[must_use]
+	pub const fn is_within(self, iterations: LoopIterations) -> bool {
+		self.first < self.end_exclusive && self.end_exclusive <= iterations.get()
+	}
+}
+
+/// Exact activation domain assigned to one immutable loop task.
+///
+/// This schedule sidecar preserves the long-standing [`Task`] layout while
+/// making the task/domain association complete and independently validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopTaskDomain {
+	pub task: TaskId,
+	pub domain: IterationDomain,
+}
+
+/// Complete bounded activation schedule supplied to Finalize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopSchedule {
+	iterations: LoopIterations,
+	domains: Vec<LoopTaskDomain>,
+}
+
+impl LoopSchedule {
+	#[must_use]
+	pub const fn new(iterations: LoopIterations, domains: Vec<LoopTaskDomain>) -> Self {
+		Self {
+			iterations,
+			domains,
+		}
+	}
+
+	#[must_use]
+	pub const fn iterations(&self) -> LoopIterations {
+		self.iterations
+	}
+
+	#[must_use]
+	pub fn domains(&self) -> &[LoopTaskDomain] {
+		&self.domains
+	}
+
+	#[must_use]
+	pub fn into_parts(self) -> (LoopIterations, Vec<LoopTaskDomain>) {
+		(self.iterations, self.domains)
+	}
 }
 
 /// Half-open interval in the deterministic schedule.
@@ -196,6 +393,7 @@ pub struct MetricTask {
 	pub metric: MetricId,
 	pub value: ValueId,
 	pub slot: MetricSlotId,
+	pub submission: SubmissionSlots,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,4 +558,37 @@ pub struct ArenaLayout {
 	pub device: DeviceId,
 	pub size: ByteCount,
 	pub allocations: Vec<ArenaAllocation>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn loop_iterations_are_nonzero_bounded_and_zero_based() {
+		assert_eq!(LoopIterations::new(0), None);
+		assert_eq!(LoopIterations::default(), LoopIterations::ONE);
+
+		let iterations = LoopIterations::new(4).unwrap();
+		assert_eq!(iterations.get(), 4);
+		assert_eq!(iterations.iteration(0).unwrap().index(), 0);
+		assert_eq!(iterations.iteration(3).unwrap().index(), 3);
+		assert_eq!(iterations.iteration(3).unwrap().total(), iterations);
+		assert_eq!(iterations.iteration(4), None);
+	}
+
+	#[test]
+	fn iteration_domains_are_nonempty_bounded_arithmetic_progressions() {
+		let iterations = LoopIterations::new(12).unwrap();
+		let domain = IterationDomain::new(2, 11, 3).unwrap();
+		assert!(domain.is_within(iterations));
+		assert_eq!(
+			(0..12)
+				.filter(|iteration| domain.contains(*iteration))
+				.collect::<Vec<_>>(),
+			[2, 5, 8]
+		);
+		assert_eq!(IterationDomain::new(0, 1, 0), None);
+		assert_eq!(IterationDomain::new(2, 2, 1), None);
+	}
 }
