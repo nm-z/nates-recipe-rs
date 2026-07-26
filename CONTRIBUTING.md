@@ -39,7 +39,7 @@ All feature engineering operations are considered to be one of the following:
 - Feature reduction (FR)
 Users who wish to generate features, may do so externally, store them in their dataset, and import that dataset to Recipe as ordinary input.
 
-Recipe may perform FG and FT.
+Recipe may perform FT and FR.
 
 The reasoning is intent: reduction and transformation operate on signal from the data supplied
 features. Recipe will not implement features for the user to train on derived features.
