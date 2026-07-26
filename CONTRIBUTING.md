@@ -1,8 +1,5 @@
 # Contributing to Recipe
 
-Keep this document deliberately thin. `system-contract.md` is normative;
-`AGENTS.md` contains repository layout, commands, and testing guidance.
-
 ## Design Philosophy
 
 Recipe measures real hardware, builds the complete computation-and-transfer DAG
