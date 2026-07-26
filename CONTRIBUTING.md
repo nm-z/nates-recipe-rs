@@ -1,23 +1,26 @@
 # Contributing to Recipe
 
 ## Design Philosophy
+Recipe uses measurements from the user's hardware, and from the script - derives an optimized GPU kernel ahead of execution. This kernel is immutable throught its `init -> loop -> exit` lifecycle.
 
-Recipe measures real hardware, builds the complete computation-and-transfer DAG
-ahead of execution, and runs an immutable `init -> loop -> exit` lifecycle.
-Payload calculation is GPU-only, transfers are explicit, primitives are
-Recipe-owned, and AMD/NVIDIA behavior must remain semantically equal. Prefer
-designs that make invalid states impossible over runtime convention.
+All calculation is GPU-only, transfers are scheduled AOT, since primitives are
+implemented by recipe using no vendored ML AMD/NVIDIA libs. Behavior and configuration is semantically evaluated. Recipe ensures invalid states are impossible, rather than enforce a strict runtime convention.
 
-Kernel generation may lower Recipe-owned operations through LLVM IR directly
-or through MLIR. MLIR is compiler infrastructure, not an operation library:
-Recipe retains its own semantics, cost model, scheduling, and AMD/NVIDIA
-parity.
+Kernel generation may lower Recipe-owned operations through either:
+- the LLVM IR directly
+- or through the MLIR 
+Recipe retains its own internal semantic interpetations, cost modeling, scheduling, and AMD/NVIDIA parity.
 
 ## Data Semantics
-
 Recipe treats all digitally stored, learnable data as vectors belonging to six
-exhaustive semantic types: **numeric, temporal, categorical, ordinal, text, and
-image**. Every other apparent data type is a container, a structural
+semantically detected types: 
+- numeric
+- temporal
+- categorical
+- ordinal
+- text
+- image
+Every other apparent data type is a container, a structural
 relationship, or a composition of these six. Do not introduce additional
 semantic types to describe storage formats or data structures.
 
@@ -26,31 +29,18 @@ automates loading by first attempting to parse each vector semantically as one
 of the six types. When semantic parsing is ambiguous, a categorical encoding
 model labels the vector from training examples that pair features with their
 smallest lossless encoded datatype. This classification and encoding pipeline
-identifies user-provided data; it does not generate features.
+identifies user-provided data types.
 
-## First Law: Feature Generation Is Banned
+## Feature Generation Is Banned
+Recipe will not implement, invent, or derive new features from data.
+All feature engineering operations are considered to be one of the following:
+- Feature generation (FG)
+- Feature transformation (FT)
+- Feature reduction (FR)
+Users who wish to generate features, may do so externally, store them in their dataset, and import that dataset to Recipe as ordinary input.
 
-Recipe does not invent or derive new features from a user's data. Automated
-feature engineering, feature crosses, polynomial features, lag or rolling
-aggregates, and domain-derived signals are outside Recipe's scope.
+Recipe may perform FG and FT.
 
-Users may generate features externally, store them in their dataset, and bring
-that dataset to Recipe as ordinary input.
+The reasoning is intent: reduction and transformation operate on signal from the data supplied
+features. Recipe will not implement features for the user to train on derived features.
 
-Recipe may perform:
-
-- **feature reduction**, including explicit selection, pruning, or dimensional
-  reduction; and
-- **feature transformation**, including explicit scaling, normalization,
-  encoding, or mathematical transformation.
-
-The boundary is intent: reduction and transformation operate on user-supplied
-features under an explicit plan. Recipe must not search for, propose, or create
-additional derived features.
-
-## Contribution Standard
-
-Keep changes narrow and preserve the system contract. Do not introduce HIP,
-vendor math libraries, dynamic loop behavior, hidden CPU payload calculation,
-or automatic feature generation. Add focused tests for changed behavior and
-record any intentional contract change explicitly.
