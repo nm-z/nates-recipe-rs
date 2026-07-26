@@ -129,6 +129,182 @@ pub struct DenseResidual {
 	operations: Vec<DenseOperation>,
 }
 
+/// One channelwise, non-overlapping maximum-pooling block.
+///
+/// The compiler resolves the logical input shape when the block is lowered.
+/// If a dense layer immediately follows the pool, `group_to_neuron` retains
+/// that layer's width so the grouped connection rule cannot be lost while the
+/// facade is translated into the training IR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DensePool {
+	size: NonZeroU64,
+	group_to_neuron: Option<NonZeroU64>,
+}
+
+impl DensePool {
+	#[must_use]
+	pub const fn new(size: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self {
+		Self {
+			size,
+			group_to_neuron,
+		}
+	}
+
+	#[must_use]
+	pub const fn size(self) -> NonZeroU64 {
+		self.size
+	}
+
+	#[must_use]
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
+
+	#[must_use]
+	pub fn routing(self, groups: NonZeroU64) -> Option<DenseGroupToNeuronRouting> {
+		self.group_to_neuron
+			.map(|neurons| DenseGroupToNeuronRouting::resolve(groups, neurons))
+	}
+}
+
+/// Recipe's shared connection rule from reduced groups to a following dense
+/// layer. Divisible shapes use contiguous routing; a non-divisible shape uses
+/// ordinary full connectivity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseGroupToNeuronRouting {
+	Identity {
+		width: NonZeroU64,
+	},
+	Expand {
+		groups: NonZeroU64,
+		neurons: NonZeroU64,
+		neurons_per_group: NonZeroU64,
+	},
+	Contract {
+		groups: NonZeroU64,
+		neurons: NonZeroU64,
+		groups_per_neuron: NonZeroU64,
+	},
+	FullyConnected {
+		groups: NonZeroU64,
+		neurons: NonZeroU64,
+	},
+}
+
+impl DenseGroupToNeuronRouting {
+	#[must_use]
+	pub fn resolve(groups: NonZeroU64, neurons: NonZeroU64) -> Self {
+		let groups_value = groups.get();
+		let neurons_value = neurons.get();
+		if groups == neurons {
+			Self::Identity { width: groups }
+		} else if neurons_value % groups_value == 0 {
+			Self::Expand {
+				groups,
+				neurons,
+				neurons_per_group: NonZeroU64::new(neurons_value / groups_value)
+					.expect("nonzero divisible group expansion"),
+			}
+		} else if groups_value % neurons_value == 0 {
+			Self::Contract {
+				groups,
+				neurons,
+				groups_per_neuron: NonZeroU64::new(groups_value / neurons_value)
+					.expect("nonzero divisible group contraction"),
+			}
+		} else {
+			Self::FullyConnected { groups, neurons }
+		}
+	}
+}
+
+/// Stable flattening order for a pooled logical `[batch, groups, channels]`
+/// tensor when it feeds a dense block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DensePoolGroupOrder {
+	GroupMajorChannelMinor,
+}
+
+/// Stable winner rule used by both maximum-pool forward and backward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DensePoolWinnerContract {
+	LowestLogicalIndex,
+}
+
+/// Resolved, per-example logical shape retained for checkpoint validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DensePoolState {
+	input_length: NonZeroU64,
+	channels: NonZeroU64,
+	output_length: NonZeroU64,
+	group_order: DensePoolGroupOrder,
+	winner_contract: DensePoolWinnerContract,
+}
+
+impl DensePoolState {
+	#[must_use]
+	pub const fn new(input_length: NonZeroU64, channels: NonZeroU64, output_length: NonZeroU64) -> Self {
+		Self {
+			input_length,
+			channels,
+			output_length,
+			group_order: DensePoolGroupOrder::GroupMajorChannelMinor,
+			winner_contract: DensePoolWinnerContract::LowestLogicalIndex,
+		}
+	}
+
+	#[must_use]
+	pub const fn input_length(self) -> NonZeroU64 {
+		self.input_length
+	}
+
+	#[must_use]
+	pub const fn channels(self) -> NonZeroU64 {
+		self.channels
+	}
+
+	#[must_use]
+	pub const fn output_length(self) -> NonZeroU64 {
+		self.output_length
+	}
+
+	#[must_use]
+	pub const fn group_order(self) -> DensePoolGroupOrder {
+		self.group_order
+	}
+
+	#[must_use]
+	pub const fn winner_contract(self) -> DensePoolWinnerContract {
+		self.winner_contract
+	}
+
+	#[must_use]
+	pub fn input_width(self) -> Option<NonZeroU64> {
+		self.input_length
+			.get()
+			.checked_mul(self.channels.get())
+			.and_then(NonZeroU64::new)
+	}
+
+	#[must_use]
+	pub fn output_width(self) -> Option<NonZeroU64> {
+		self.output_length
+			.get()
+			.checked_mul(self.channels.get())
+			.and_then(NonZeroU64::new)
+	}
+
+	#[must_use]
+	pub const fn logical_input_shape(self, batch: NonZeroU64) -> [u64; 3] {
+		[batch.get(), self.input_length.get(), self.channels.get()]
+	}
+
+	#[must_use]
+	pub const fn logical_output_shape(self, batch: NonZeroU64) -> [u64; 3] {
+		[batch.get(), self.output_length.get(), self.channels.get()]
+	}
+}
+
 /// One exact, ordered operation inside a residual branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseResidualOperation {
@@ -150,10 +326,7 @@ impl From<DenseOperation> for DenseResidualOperation {
 
 impl DenseResidual {
 	#[must_use]
-	pub fn new<T>(
-		branch: impl IntoIterator<Item = T>,
-		operations: impl IntoIterator<Item = DenseOperation>,
-	) -> Self
+	pub fn new<T>(branch: impl IntoIterator<Item = T>, operations: impl IntoIterator<Item = DenseOperation>) -> Self
 	where
 		T: Into<DenseResidualOperation>,
 	{
@@ -175,10 +348,13 @@ impl DenseResidual {
 
 	#[must_use]
 	pub fn output_width(&self) -> Option<NonZeroU64> {
-		self.branch.iter().rev().find_map(|operation| match operation {
-			DenseResidualOperation::Layer(layer) => Some(layer.width()),
-			DenseResidualOperation::Operation(_) => None,
-		})
+		self.branch
+			.iter()
+			.rev()
+			.find_map(|operation| match operation {
+				DenseResidualOperation::Layer(layer) => Some(layer.width()),
+				DenseResidualOperation::Operation(_) => None,
+			})
 	}
 }
 
@@ -186,6 +362,7 @@ impl DenseResidual {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseBlock {
 	Layer(DenseLayer),
+	Pool(DensePool),
 	Residual(DenseResidual),
 }
 
@@ -194,6 +371,7 @@ impl DenseBlock {
 	pub fn output_width(&self) -> Option<NonZeroU64> {
 		match self {
 			Self::Layer(layer) => Some(layer.width()),
+			Self::Pool(_) => None,
 			Self::Residual(residual) => residual.output_width(),
 		}
 	}
@@ -202,6 +380,7 @@ impl DenseBlock {
 	pub fn output_operations(&self) -> &[DenseOperation] {
 		match self {
 			Self::Layer(layer) => layer.operations(),
+			Self::Pool(_) => &[],
 			Self::Residual(residual) => residual.operations(),
 		}
 	}
@@ -210,6 +389,12 @@ impl DenseBlock {
 impl From<DenseLayer> for DenseBlock {
 	fn from(layer: DenseLayer) -> Self {
 		Self::Layer(layer)
+	}
+}
+
+impl From<DensePool> for DenseBlock {
+	fn from(pool: DensePool) -> Self {
+		Self::Pool(pool)
 	}
 }
 
@@ -540,12 +725,31 @@ impl DenseFeaturePlan {
 pub(crate) struct DensePartition {
 	features: DenseMatrix,
 	targets: DenseMatrix,
+	target_observations: Vec<TargetObservation>,
 }
 
 impl DensePartition {
-	fn new(features: DenseMatrix, targets: DenseMatrix) -> TrainingCompileResult<Self> {
+	fn new(
+		features: DenseMatrix,
+		targets: DenseMatrix,
+		target_observations: Vec<TargetObservation>,
+	) -> TrainingCompileResult<Self> {
 		validate_partition(&features, &targets)?;
-		Ok(Self { features, targets })
+		if target_observations.len() != targets.rows() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InconsistentRows,
+				format!(
+					"target matrix has {} rows but target observation state has {} rows",
+					targets.rows(),
+					target_observations.len()
+				),
+			));
+		}
+		Ok(Self {
+			features,
+			targets,
+			target_observations,
+		})
 	}
 
 	#[must_use]
@@ -567,16 +771,87 @@ impl DensePartition {
 	pub const fn feature_columns(&self) -> usize {
 		self.features.columns()
 	}
+
+	#[must_use]
+	pub fn all_targets_known(&self) -> bool {
+		self.target_observations
+			.iter()
+			.all(|observation| *observation == TargetObservation::Known)
+	}
+
+	pub(crate) fn accepted_updates_per_epoch(&self, batch_size: usize) -> usize {
+		self.target_observations
+			.chunks(batch_size)
+			.filter(|batch| batch.contains(&TargetObservation::Known))
+			.count()
+	}
+
+	pub(crate) fn target_supervision(&self) -> DenseMatrix {
+		DenseMatrix::F32Bits {
+			rows: self.rows(),
+			columns: 1,
+			values: self
+				.target_observations
+				.iter()
+				.map(|observation| match observation {
+					TargetObservation::Known => 1.0_f32.to_bits(),
+					TargetObservation::Missing | TargetObservation::Unseen => 0.0_f32.to_bits(),
+				})
+				.collect(),
+		}
+	}
+
+	fn known_only(self) -> TrainingCompileResult<Option<Self>> {
+		if self.all_targets_known() {
+			return Ok(Some(self));
+		}
+		let retained_rows = self
+			.target_observations
+			.iter()
+			.enumerate()
+			.filter_map(|(row, observation)| (*observation == TargetObservation::Known).then_some(row))
+			.collect::<Vec<_>>();
+		if retained_rows.is_empty() {
+			return Ok(None);
+		}
+		let features = compact_dense_rows(&self.features, &retained_rows, "validation feature")?;
+		let targets = compact_dense_rows(&self.targets, &retained_rows, "validation target")?;
+		Self::new(
+			features,
+			targets,
+			vec![TargetObservation::Known; retained_rows.len()],
+		)
+		.map(Some)
+	}
+}
+
+/// Whether one prepared target value is supervised by the declared task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetObservation {
+	Known,
+	Missing,
+	Unseen,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoweredDenseTargets {
+	matrix: DenseMatrix,
+	observations: Vec<TargetObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoweredDenseDataset {
 	train: DensePartition,
 	validation: Option<DensePartition>,
+	validation_split_rows: usize,
 }
 
 impl LoweredDenseDataset {
-	fn new(train: DensePartition, validation: Option<DensePartition>) -> TrainingCompileResult<Self> {
+	fn new(
+		train: DensePartition,
+		validation: Option<DensePartition>,
+		validation_split_rows: usize,
+	) -> TrainingCompileResult<Self> {
 		if let Some(validation) = &validation
 			&& validation.feature_columns() != train.feature_columns()
 		{
@@ -589,7 +864,11 @@ impl LoweredDenseDataset {
 				),
 			));
 		}
-		Ok(Self { train, validation })
+		Ok(Self {
+			train,
+			validation,
+			validation_split_rows,
+		})
 	}
 
 	pub(crate) fn from_prepared(
@@ -597,19 +876,25 @@ impl LoweredDenseDataset {
 		feature_plan: &DenseFeaturePlan,
 		task: DenseTask,
 	) -> TrainingCompileResult<Self> {
+		let train_targets = lower_dense_targets(dataset, task, PartitionKind::Train)?;
 		let train = DensePartition::new(
 			lower_dense_features(dataset, feature_plan, PartitionKind::Train)?,
-			lower_dense_targets(dataset, task, PartitionKind::Train)?,
+			train_targets.matrix,
+			train_targets.observations,
 		)?;
+		let validation_split_rows = dataset.validation().len();
 		let validation = if dataset.validation().is_empty() {
 			None
 		} else {
-			Some(DensePartition::new(
+			let validation_targets = lower_dense_targets(dataset, task, PartitionKind::Validation)?;
+			DensePartition::new(
 				lower_dense_features(dataset, feature_plan, PartitionKind::Validation)?,
-				lower_dense_targets(dataset, task, PartitionKind::Validation)?,
-			)?)
+				validation_targets.matrix,
+				validation_targets.observations,
+			)?
+			.known_only()?
 		};
-		Self::new(train, validation)
+		Self::new(train, validation, validation_split_rows)
 	}
 
 	#[must_use]
@@ -621,21 +906,22 @@ impl LoweredDenseDataset {
 	pub const fn validation(&self) -> Option<&DensePartition> {
 		self.validation.as_ref()
 	}
+
+	#[must_use]
+	pub const fn validation_split_rows(&self) -> usize {
+		self.validation_split_rows
+	}
 }
 
 fn lower_dense_targets(
 	dataset: &PreparedDataset,
 	task: DenseTask,
 	partition_kind: PartitionKind,
-) -> TrainingCompileResult<DenseMatrix> {
-	let matrix = dataset.fixed_dense_matrix(VectorRole::Target, partition_kind)?;
-	let DenseTask::MulticlassClassification {
-		target_vector,
-		class_count,
-		reserved_code,
-	} = task
-	else {
-		return Ok(matrix);
+) -> TrainingCompileResult<LoweredDenseTargets> {
+	let target_vector = match task {
+		DenseTask::BinaryClassification { target_vector, .. }
+		| DenseTask::ScalarRegression { target_vector }
+		| DenseTask::MulticlassClassification { target_vector, .. } => target_vector,
 	};
 	let target = dataset
 		.vectors()
@@ -644,86 +930,276 @@ fn lower_dense_targets(
 		.ok_or_else(|| {
 			TrainingCompileError::new(
 				TrainingCompileErrorKind::InvalidTargetMatrix,
-				format!("multiclass target vector {target_vector} is absent"),
+				format!("dense target vector {target_vector} is absent"),
 			)
 		})?;
-	let PreparedValues::I32(values) = target.values() else {
-		return Err(target_lowering_error(
-			target.name(),
-			0,
-			"dictionary encoding does not contain int32 category codes",
-		));
-	};
-	let reserved_index = usize::try_from(reserved_code).map_err(|_| {
-		TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidTargetMatrix,
-			format!("multiclass reserved code {reserved_code} is negative"),
-		)
-	})?;
-	if class_count == 0 || reserved_index.checked_add(1) != Some(class_count) {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidTargetMatrix,
-			"multiclass class count does not include exactly one reserved unseen-label route",
-		));
-	}
-	let DenseMatrix::I32 {
-		rows,
-		columns,
-		values: matrix_values,
-	} = &matrix
-	else {
-		return Err(target_lowering_error(
-			target.name(),
-			0,
-			"dictionary target matrix does not retain int32 category codes",
-		));
-	};
 	let partition = match partition_kind {
 		PartitionKind::Train => dataset.train(),
 		PartitionKind::Validation => dataset.validation(),
 	};
-	if *rows != partition.len() || *columns != 1 || matrix_values.len() != partition.len() {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidTargetMatrix,
-			format!(
-				"multiclass target codes require an int32 [rows, 1] matrix; got [{rows}, {columns}] with {} values",
-				matrix_values.len()
-			),
+	match target.values() {
+		PreparedValues::I32(values) => {
+			let mut lowered = Vec::with_capacity(partition.len());
+			let mut observations = Vec::with_capacity(partition.len());
+			for (retained_position, source_row) in partition
+				.retained_positions()
+				.iter()
+				.copied()
+				.zip(partition.source_rows().iter().copied())
+			{
+				let value = values.get(retained_position).ok_or_else(|| {
+					target_lowering_error(target.name(), source_row, "target value is absent")
+				})?;
+				let (value, observation) = lower_i32_target(target, task, *value, source_row)?;
+				lowered.push(value);
+				observations.push(observation);
+			}
+			Ok(LoweredDenseTargets {
+				matrix: DenseMatrix::I32 {
+					rows: partition.len(),
+					columns: 1,
+					values: lowered,
+				},
+				observations,
+			})
+		}
+		PreparedValues::F32Bits(values) => {
+			if matches!(task, DenseTask::MulticlassClassification { .. }) {
+				return Err(target_lowering_error(
+					target.name(),
+					0,
+					"dictionary target does not retain int32 category codes",
+				));
+			}
+			let mut lowered = Vec::with_capacity(partition.len());
+			let mut observations = Vec::with_capacity(partition.len());
+			for (retained_position, source_row) in partition
+				.retained_positions()
+				.iter()
+				.copied()
+				.zip(partition.source_rows().iter().copied())
+			{
+				let value = values.get(retained_position).ok_or_else(|| {
+					target_lowering_error(target.name(), source_row, "target value is absent")
+				})?;
+				let (bits, observation) = lower_f32_target(target.name(), task, *value, source_row)?;
+				lowered.push(bits);
+				observations.push(observation);
+			}
+			Ok(LoweredDenseTargets {
+				matrix: DenseMatrix::F32Bits {
+					rows: partition.len(),
+					columns: 1,
+					values: lowered,
+				},
+				observations,
+			})
+		}
+		PreparedValues::VariableWidth(_) => Err(target_lowering_error(
+			target.name(),
+			0,
+			"dense target cannot use variable-width storage",
+		)),
+	}
+}
+
+fn lower_i32_target(
+	target: &recipe_ingest::PreparedVector,
+	task: DenseTask,
+	value: Option<i32>,
+	source_row: usize,
+) -> TrainingCompileResult<(i32, TargetObservation)> {
+	let Some(value) = value else {
+		return Ok((0, TargetObservation::Missing));
+	};
+	match task {
+		DenseTask::ScalarRegression { .. } => Ok((value, TargetObservation::Known)),
+		DenseTask::BinaryClassification { positive_code, .. } => {
+			if let VectorMetadata::Categorical { dictionary } = target.metadata() {
+				let expected_positive_code = match dictionary.len() {
+					0 => -1,
+					1 => 0,
+					2 => 1,
+					count => {
+						return Err(target_lowering_error(
+							target.name(),
+							source_row,
+							format!("categorical BCE target has unsupported label count {count}"),
+						));
+					}
+				};
+				if positive_code != expected_positive_code {
+					return Err(target_lowering_error(
+						target.name(),
+						source_row,
+						format!(
+							"categorical BCE positive code {positive_code} disagrees with expected binding {expected_positive_code}"
+						),
+					));
+				}
+				let category = usize::try_from(value).map_err(|_| {
+					target_lowering_error(
+						target.name(),
+						source_row,
+						format!("negative category code {value}"),
+					)
+				})?;
+				if category == dictionary.len() {
+					return Ok((0, TargetObservation::Unseen));
+				}
+				if category > dictionary.len() {
+					return Err(target_lowering_error(
+						target.name(),
+						source_row,
+						format!(
+							"category code {value} exceeds reserved code {}",
+							dictionary.len()
+						),
+					));
+				}
+				return Ok((i32::from(value == positive_code), TargetObservation::Known));
+			}
+			if !matches!(value, 0 | 1) {
+				return Err(target_lowering_error(
+					target.name(),
+					source_row,
+					format!("binary target matrix contains {value}; only exact zero and one are accepted"),
+				));
+			}
+			Ok((value, TargetObservation::Known))
+		}
+		DenseTask::MulticlassClassification {
+			class_count,
+			reserved_code,
+			..
+		} => {
+			let reserved_index = usize::try_from(reserved_code).map_err(|_| {
+				TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					format!("multiclass reserved code {reserved_code} is negative"),
+				)
+			})?;
+			if class_count == 0 || reserved_index.checked_add(1) != Some(class_count) {
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					"multiclass class count does not include exactly one reserved unseen-label route",
+				));
+			}
+			let category = usize::try_from(value).map_err(|_| {
+				target_lowering_error(
+					target.name(),
+					source_row,
+					format!("negative category code {value}"),
+				)
+			})?;
+			if category == reserved_index {
+				return Ok((0, TargetObservation::Unseen));
+			}
+			if category > reserved_index {
+				return Err(target_lowering_error(
+					target.name(),
+					source_row,
+					format!("category code {value} exceeds reserved code {reserved_code}"),
+				));
+			}
+			Ok((value, TargetObservation::Known))
+		}
+	}
+}
+
+fn lower_f32_target(
+	name: &[u8],
+	task: DenseTask,
+	bits: Option<u32>,
+	source_row: usize,
+) -> TrainingCompileResult<(u32, TargetObservation)> {
+	let Some(bits) = bits else {
+		return Ok((0.0_f32.to_bits(), TargetObservation::Missing));
+	};
+	let value = f32::from_bits(bits);
+	if !value.is_finite() {
+		return Err(target_lowering_error(
+			name,
+			source_row,
+			format!("target contains non-finite f32 bits {bits:#010x}"),
 		));
 	}
-	for (retained_position, source_row) in partition
-		.retained_positions()
-		.iter()
-		.copied()
-		.zip(partition.source_rows().iter().copied())
-	{
-		let code = values
-			.get(retained_position)
-			.ok_or_else(|| target_lowering_error(target.name(), source_row, "category code is absent"))?
-			.ok_or_else(|| target_lowering_error(target.name(), source_row, "target category is missing"))?;
-		let category = usize::try_from(code).map_err(|_| {
-			target_lowering_error(
-				target.name(),
-				source_row,
-				format!("negative category code {code}"),
-			)
-		})?;
-		if category >= class_count {
-			return Err(target_lowering_error(
-				target.name(),
-				source_row,
-				format!("category code {code} exceeds reserved code {reserved_code}"),
-			));
+	if matches!(task, DenseTask::BinaryClassification { .. }) && value != 0.0 && value != 1.0 {
+		return Err(target_lowering_error(
+			name,
+			source_row,
+			format!("binary target matrix contains {value}; only exact zero and one are accepted"),
+		));
+	}
+	Ok((bits, TargetObservation::Known))
+}
+
+fn compact_dense_rows(matrix: &DenseMatrix, rows: &[usize], role: &str) -> TrainingCompileResult<DenseMatrix> {
+	let columns = matrix.columns();
+	let capacity = rows.len().checked_mul(columns).ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::ArithmeticOverflow,
+			format!("{role} compaction element count overflowed usize"),
+		)
+	})?;
+	match matrix {
+		DenseMatrix::I32 { values, .. } => {
+			let mut compacted = Vec::with_capacity(capacity);
+			for row in rows.iter().copied() {
+				let start = row.checked_mul(columns).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::ArithmeticOverflow,
+						format!("{role} row offset overflowed usize"),
+					)
+				})?;
+				let end = start.checked_add(columns).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::ArithmeticOverflow,
+						format!("{role} row end overflowed usize"),
+					)
+				})?;
+				compacted.extend_from_slice(values.get(start..end).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InconsistentRows,
+						format!("{role} row {row} is absent from dense storage"),
+					)
+				})?);
+			}
+			Ok(DenseMatrix::I32 {
+				rows: rows.len(),
+				columns,
+				values: compacted,
+			})
 		}
-		if partition_kind == PartitionKind::Train && category == reserved_index {
-			return Err(target_lowering_error(
-				target.name(),
-				source_row,
-				"fit partition unexpectedly uses its validation-only reserved label route",
-			));
+		DenseMatrix::F32Bits { values, .. } => {
+			let mut compacted = Vec::with_capacity(capacity);
+			for row in rows.iter().copied() {
+				let start = row.checked_mul(columns).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::ArithmeticOverflow,
+						format!("{role} row offset overflowed usize"),
+					)
+				})?;
+				let end = start.checked_add(columns).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::ArithmeticOverflow,
+						format!("{role} row end overflowed usize"),
+					)
+				})?;
+				compacted.extend_from_slice(values.get(start..end).ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InconsistentRows,
+						format!("{role} row {row} is absent from dense storage"),
+					)
+				})?);
+			}
+			Ok(DenseMatrix::F32Bits {
+				rows: rows.len(),
+				columns,
+				values: compacted,
+			})
 		}
 	}
-	Ok(matrix)
 }
 
 fn target_lowering_error(name: &[u8], source_row: usize, detail: impl core::fmt::Display) -> TrainingCompileError {
@@ -1127,8 +1603,14 @@ impl OwnedExternalInput {
 pub enum ExternalInputRole {
 	TrainFeatures,
 	TrainTargets,
+	TrainTargetSupervision,
+	TrainingPoolWindowIndices { block: usize },
+	TrainingPoolWinnerBases { block: usize },
+	TrainingPoolGradientBatchIndices { block: usize },
 	ValidationFeatures,
 	ValidationTargets,
+	ValidationPoolWindowIndices { block: usize },
+	ValidationPoolWinnerBases { block: usize },
 	FeatureNormalizationMask,
 }
 
@@ -1158,6 +1640,7 @@ pub struct DenseResidualState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseBlockState {
 	Layer(DenseLayerState),
+	Pool(DensePoolState),
 	Residual(DenseResidualState),
 }
 
@@ -1180,15 +1663,67 @@ pub enum DataNormalizationState {
 	L2Norm,
 }
 
+/// GPU-resident optimizer transition gate and accepted-update progress.
+///
+/// Physical batches continue to execute, but optimizer state advances only
+/// when the batch has at least one known target and, when early stopping is enabled, its
+/// stopped latch is clear. Current checkpoint formats omit this counter, the
+/// beta powers, and the early-stopping latch. They are model snapshots rather
+/// than exact resume points; training resume remains rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptimizerProgressState {
+	pub apply_update: ValueId,
+	pub initial_accepted_updates: ValueId,
+	pub updated_accepted_updates: ValueId,
+	pub update_kernel: KernelTemplateId,
+	pub initial_beta_one_power: ValueId,
+	pub updated_beta_one_power: ValueId,
+	pub initial_beta_two_power: ValueId,
+	pub updated_beta_two_power: ValueId,
+	pub beta_update_kernel: KernelTemplateId,
+	pub accepted_updates_per_epoch: u64,
+	pub maximum_accepted_updates: u64,
+	pub warmup_accepted_updates: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationMetricFamily {
+	Binary,
+	Multiclass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationUnavailableReason {
+	NoKnownTargets,
+	SingleKnownClass { known_rows: NonZeroU64 },
+}
+
+/// Whether requested validation metrics have a supervised population.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationMetricStatus {
+	NotRequested,
+	Available {
+		family: ValidationMetricFamily,
+		known_rows: NonZeroU64,
+	},
+	Unavailable {
+		family: ValidationMetricFamily,
+		reason: ValidationUnavailableReason,
+		split_rows: u64,
+	},
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrainingOutputs {
 	pub batch_loss: ValueId,
 	pub batch_loss_domain: IterationDomain,
 	pub normalization: DataNormalizationState,
+	pub optimizer_progress: Option<OptimizerProgressState>,
 	pub blocks: Vec<DenseBlockState>,
 	pub layers: Vec<DenseLayerState>,
 	pub validation: Option<BinaryValidationOutputs>,
 	pub multiclass_validation: Option<MulticlassValidationOutputs>,
+	pub validation_status: ValidationMetricStatus,
 	pub metric_bindings: Vec<TrainingMetricBinding>,
 }
 
@@ -1345,9 +1880,13 @@ impl CompiledTraining {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedTrainingFeature {
 	DynamicLoopShortening,
+	ExactOptimizerResume,
 }
 
-pub const REMAINING_UNSUPPORTED: &[UnsupportedTrainingFeature] = &[UnsupportedTrainingFeature::DynamicLoopShortening];
+pub const REMAINING_UNSUPPORTED: &[UnsupportedTrainingFeature] = &[
+	UnsupportedTrainingFeature::DynamicLoopShortening,
+	UnsupportedTrainingFeature::ExactOptimizerResume,
+];
 
 fn validate_partition(features: &DenseMatrix, targets: &DenseMatrix) -> TrainingCompileResult<()> {
 	if features.rows() == 0 {
@@ -1440,6 +1979,58 @@ pub(crate) fn validate_binary_targets(targets: &DenseMatrix) -> TrainingCompileR
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn nonzero(value: u64) -> NonZeroU64 {
+		NonZeroU64::new(value).expect("test value is nonzero")
+	}
+
+	#[test]
+	fn group_to_neuron_routing_uses_divisible_ranges_and_full_fallback() {
+		assert_eq!(
+			DenseGroupToNeuronRouting::resolve(nonzero(4), nonzero(4)),
+			DenseGroupToNeuronRouting::Identity { width: nonzero(4) }
+		);
+		assert_eq!(
+			DenseGroupToNeuronRouting::resolve(nonzero(4), nonzero(8)),
+			DenseGroupToNeuronRouting::Expand {
+				groups: nonzero(4),
+				neurons: nonzero(8),
+				neurons_per_group: nonzero(2),
+			}
+		);
+		assert_eq!(
+			DenseGroupToNeuronRouting::resolve(nonzero(8), nonzero(4)),
+			DenseGroupToNeuronRouting::Contract {
+				groups: nonzero(8),
+				neurons: nonzero(4),
+				groups_per_neuron: nonzero(2),
+			}
+		);
+		assert_eq!(
+			DenseGroupToNeuronRouting::resolve(nonzero(5), nonzero(8)),
+			DenseGroupToNeuronRouting::FullyConnected {
+				groups: nonzero(5),
+				neurons: nonzero(8),
+			}
+		);
+	}
+
+	#[test]
+	fn pool_state_preserves_logical_shape_order_and_winner_contract() {
+		let state = DensePoolState::new(nonzero(7), nonzero(3), nonzero(3));
+		assert_eq!(state.input_width(), Some(nonzero(21)));
+		assert_eq!(state.output_width(), Some(nonzero(9)));
+		assert_eq!(state.logical_input_shape(nonzero(2)), [2, 7, 3]);
+		assert_eq!(state.logical_output_shape(nonzero(2)), [2, 3, 3]);
+		assert_eq!(
+			state.group_order(),
+			DensePoolGroupOrder::GroupMajorChannelMinor
+		);
+		assert_eq!(
+			state.winner_contract(),
+			DensePoolWinnerContract::LowestLogicalIndex
+		);
+	}
 
 	#[test]
 	fn categorical_codes_preserve_the_reserved_route_and_reject_corruption() {

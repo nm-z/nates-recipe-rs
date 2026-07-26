@@ -17,6 +17,7 @@ mod composition;
 mod error;
 mod materialize;
 mod non_calculation;
+mod pooling;
 mod primitive;
 mod registry;
 mod scalar;
@@ -36,6 +37,7 @@ pub use materialize::{
 	materialize_composition, remaining_composition_manifest, validate_identity_namespaces,
 };
 pub use non_calculation::NonCalculationRecipe;
+pub use pooling::{ChannelwiseMaxPool1dPreparation, prepare_channelwise_max_pool_1d};
 pub use primitive::{
 	AxisRequirement, ContractionClass, PrimitiveFamily, PrimitiveRecipe, PrimitiveRequest, RandomRecipe,
 	lower_index_map, lower_primitive,
@@ -43,7 +45,8 @@ pub use primitive::{
 pub use recipe_primitives::LoweredProgram;
 pub use registry::{
 	AliasContract, CanonicalDTypeContract, DeterminismContract, LegacyDType, LoweringAvailability,
-	OperationDescriptor, OperationFamily, OperationId, OperationRegistry, UnsupportedReason, operation_registry,
+	OperationDescriptor, OperationFamily, OperationId, OperationRegistry, UnsupportedReason,
+	channelwise_max_pool_1d_backward_descriptor, channelwise_max_pool_1d_descriptor, operation_registry,
 };
 pub use scalar::{CompositeScalar, ScalarRecipe, lower_scalar};
 pub use workspace::{WorkspaceFormula, WorkspaceUnit, WorkspaceValue, evaluate_workspace};

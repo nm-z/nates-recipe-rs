@@ -12,11 +12,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::gguf::{GgufLimits, GgufMetadataValue, parse_gguf};
 use crate::image_header::has_recognized_image_signature;
+use crate::prepare::prepare_table_with_semantics;
 use crate::semantic::{VectorSemantic, VectorSemanticRule, infer_table_vectors_with_semantics};
 use crate::{
-	AmbiguousVectorModel, Delimiter, HeaderMode, InferredVectorList, IngestLimits, RawTable, SafeTensorLimits,
-	SemanticResult, SemanticType, SourceError, SourceErrorKind, SourceLimit, TableRequest, VectorEncoding,
-	parse_safetensors, parse_table, read_source_snapshot,
+	AmbiguousVectorModel, Delimiter, HeaderMode, InferredVectorList, IngestLimits, PreparationRequest, PrepareResult,
+	PreparedDataset, RawTable, SafeTensorLimits, SemanticResult, SemanticType, SourceError, SourceErrorKind,
+	SourceLimit, TableRequest, VectorEncoding, parse_safetensors, parse_table, read_source_snapshot,
 };
 
 const ARCHIVE_DEPTH_LIMIT: usize = 32;
@@ -141,6 +142,19 @@ impl DistilledDataset {
 
 	pub fn infer_vectors(&self, model: &impl AmbiguousVectorModel) -> SemanticResult<InferredVectorList> {
 		infer_table_vectors_with_semantics(&self.table, model, &self.semantics)
+	}
+
+	/// Fit semantics and preprocessing state from the exact retained train
+	/// partition while preserving source-owned exact semantic declarations.
+	///
+	/// Unlike separately calling [`Self::infer_vectors`] and applying that result,
+	/// this operation never presents validation rows to an infer/classify rule.
+	pub fn prepare(
+		&self,
+		request: &PreparationRequest,
+		model: &impl AmbiguousVectorModel,
+	) -> PrepareResult<PreparedDataset> {
+		prepare_table_with_semantics(&self.table, request, model, &self.semantics)
 	}
 
 	#[must_use]

@@ -149,7 +149,7 @@ fn begin_recipe_data(data: Data) {
 }
 
 pub(crate) fn remember_recipe_data(data: Data) {
-	RECIPE_SEQUENCE.with(|sequence| sequence.borrow_mut().data = Some(data));
+	begin_recipe_data(data);
 }
 
 fn begin_recipe_model(model: Model) {
@@ -161,18 +161,29 @@ pub(crate) fn remember_recipe_model(model: Model) {
 }
 
 pub(crate) fn take_recipe_sequence() -> Result<(Data, Model), &'static str> {
+	take_recipe_sequence_with_diagnostics(
+		"recipe.train().run() requires a preceding recipe.data(...) declaration",
+		"recipe.train().run() requires a preceding recipe.model() declaration",
+	)
+}
+
+pub(crate) fn take_recipe_inference_sequence() -> Result<(Data, Model), &'static str> {
+	take_recipe_sequence_with_diagnostics(
+		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration",
+		"recipe.infer().evaluate() requires a preceding recipe.model() declaration",
+	)
+}
+
+fn take_recipe_sequence_with_diagnostics(
+	missing_data: &'static str,
+	missing_model: &'static str,
+) -> Result<(Data, Model), &'static str> {
 	RECIPE_SEQUENCE.with(|sequence| {
 		let mut sequence = sequence.borrow_mut();
-		let data = sequence
-			.data
-			.clone()
-			.ok_or("recipe.train().run() requires a preceding recipe.data(...) declaration")?;
-		let model = sequence
-			.model
-			.clone()
-			.ok_or("recipe.train().run() requires a preceding recipe.model() declaration")?;
-		sequence.data = None;
-		sequence.model = None;
+		let data = sequence.data.take();
+		let model = sequence.model.take();
+		let data = data.ok_or(missing_data)?;
+		let model = model.ok_or(missing_model)?;
 		Ok((data, model))
 	})
 }

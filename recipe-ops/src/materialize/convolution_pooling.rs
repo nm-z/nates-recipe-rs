@@ -33,6 +33,14 @@ const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_max_pool_2d_f32", "gpu-core/src/nn_f32.rs:463"),
 	("gpu_pool_grad_expand", "gpu-core/src/kernels.rs:4622"),
 	("gpu_upsample_nearest_2d", "gpu-core/src/kernels.rs:6620"),
+	(
+		"recipe_max_pool_1d",
+		"recipe-ops/src/pooling.rs:channelwise_max_pool_1d",
+	),
+	(
+		"recipe_max_pool_1d_backward",
+		"recipe-ops/src/pooling.rs:channelwise_max_pool_1d_backward",
+	),
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +50,15 @@ struct PoolGeometry {
 	window_elements: u64,
 	input_width: u64,
 	kernel_width: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChannelwisePool1dGeometry {
+	batch: u64,
+	channels: u64,
+	groups: u64,
+	window_width: u64,
+	input_elements: u64,
 }
 
 pub(super) fn supports(descriptor: OperationDescriptor) -> bool {
@@ -72,12 +89,14 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 		),
 		"gpu_im2col_2d" => emit_im2col_2d(request, emitter, false),
 		"gpu_im2col_2d_ext" => emit_im2col_2d(request, emitter, true),
-		"gpu_max_pool_1d" => emit_max_pool_1d(request, emitter),
-		"gpu_max_pool_1d_backward" => emit_max_pool_1d_backward(request, emitter),
+		"gpu_max_pool_1d" => emit_legacy_max_pool_1d(request, emitter),
+		"gpu_max_pool_1d_backward" => emit_legacy_max_pool_1d_backward(request, emitter),
 		"gpu_max_pool_2d" | "gpu_max_pool_2d_f32" => emit_max_pool_2d(request, emitter),
 		"gpu_max_pool_2d_backward" | "gpu_max_pool_2d_backward_f32" => emit_max_pool_2d_backward(request, emitter),
 		"gpu_pool_grad_expand" => emit_pool_gradient_expand(request, emitter),
 		"gpu_upsample_nearest_2d" => emit_upsample_nearest_2d(request, emitter),
+		"recipe_max_pool_1d" => emit_channelwise_max_pool_1d(request, emitter),
+		"recipe_max_pool_1d_backward" => emit_channelwise_max_pool_1d_backward(request, emitter),
 		symbol => Err(operation_error(
 			request.descriptor.id,
 			OperationErrorKind::GraphMaterializationFailed,
@@ -505,7 +524,7 @@ fn emit_average_pool(
 	)
 }
 
-fn emit_max_pool_1d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
+fn emit_legacy_max_pool_1d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(
 		request,
 		&["values", "window_indices"],
@@ -537,6 +556,98 @@ fn emit_max_pool_1d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<
 		kernel_width: window,
 	};
 	emit_max_pool(request, emitter, geometry, false)
+}
+
+fn emit_channelwise_max_pool_1d(
+	request: &MaterializationRequest<'_>,
+	emitter: &mut Emitter<'_>,
+) -> OperationResult<()> {
+	require_exact_abi(
+		request,
+		&["values", "window_indices", "winner_bases"],
+		&["pooled", "winning_indices"],
+		&[
+			"batch",
+			"channelwise_nonoverlap",
+			"channels",
+			"input_length",
+			"pool_size",
+			"tail_window_repeats_last_coordinate",
+			"tree_lanes",
+			"window_indices_encode_channelwise_nonoverlap",
+			"winner_bases_encode_channelwise_nonoverlap",
+		],
+	)?;
+	for fact in [
+		"channelwise_nonoverlap",
+		"tail_window_repeats_last_coordinate",
+		"window_indices_encode_channelwise_nonoverlap",
+		"winner_bases_encode_channelwise_nonoverlap",
+	] {
+		require_true(request, fact)?;
+	}
+	let geometry = channelwise_pool_1d_geometry(request)?;
+	let tree_lanes = prepared_tree_lanes(request)?;
+	let values = input(request, "values")?;
+	let window_indices = input(request, "window_indices")?;
+	let winner_bases = input(request, "winner_bases")?;
+	let pooled = output(request, "pooled")?;
+	let winning_indices = output(request, "winning_indices")?;
+	require_dtype(request, values, DType::F32, "values")?;
+	require_dtype(request, window_indices, DType::I32, "window_indices")?;
+	require_dtype(request, winner_bases, DType::I32, "winner_bases")?;
+	require_dtype(request, pooled, DType::F32, "pooled")?;
+	require_dtype(request, winning_indices, DType::I32, "winning_indices")?;
+	require_shape(request, values, &[geometry.input_elements], "values")?;
+	require_shape(
+		request,
+		window_indices,
+		&[
+			geometry.batch,
+			geometry.groups,
+			geometry.channels,
+			geometry.window_width,
+		],
+		"window_indices",
+	)?;
+	let output_shape = [geometry.batch, geometry.groups, geometry.channels];
+	for (name, tensor) in [
+		("winner_bases", winner_bases),
+		("pooled", pooled),
+		("winning_indices", winning_indices),
+	] {
+		require_shape(request, tensor, &output_shape, name)?;
+	}
+
+	let windows = emitter.intermediate(DType::F32, window_indices.shape.clone())?;
+	emitter.emit(
+		vec![values.id, window_indices.id],
+		vec![windows],
+		PrimitiveKind::Gather(Gather {
+			axis: 0,
+			bounds: IndexBounds::Reject,
+		}),
+	)?;
+	let maxima = emitter.intermediate(DType::F32, pooled.shape.clone())?;
+	let local_indices = emitter.intermediate(DType::I32, winning_indices.shape.clone())?;
+	emitter.emit(
+		vec![windows],
+		vec![maxima, local_indices],
+		PrimitiveKind::Reduce(Reduce {
+			operator: ReduceOperator::Maximum,
+			axes: channelwise_pool_axis(request)?,
+			keep_dimensions: false,
+			result: ReduceResult::ValueAndIndex,
+			tree_lanes,
+		}),
+	)?;
+	emitter.emit(
+		vec![maxima, local_indices, winner_bases.id],
+		vec![pooled.id, winning_indices.id],
+		PrimitiveKind::Elementwise(Elementwise {
+			program: channelwise_pool_result_program(request, geometry.channels)?,
+		}),
+	)
 }
 
 fn emit_max_pool_2d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
@@ -817,7 +928,10 @@ fn emit_average_backward(
 	)
 }
 
-fn emit_max_pool_1d_backward(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
+fn emit_legacy_max_pool_1d_backward(
+	request: &MaterializationRequest<'_>,
+	emitter: &mut Emitter<'_>,
+) -> OperationResult<()> {
 	require_exact_abi(
 		request,
 		&[
@@ -859,6 +973,101 @@ fn emit_max_pool_1d_backward(request: &MaterializationRequest<'_>, emitter: &mut
 		output_elements,
 		filters,
 		true,
+	)
+}
+
+fn emit_channelwise_max_pool_1d_backward(
+	request: &MaterializationRequest<'_>,
+	emitter: &mut Emitter<'_>,
+) -> OperationResult<()> {
+	require_exact_abi(
+		request,
+		&[
+			"output_gradient",
+			"winning_indices",
+			"gradient_batch_indices",
+			"input_gradient_base",
+		],
+		&["input_gradient"],
+		&[
+			"batch",
+			"channelwise_nonoverlap",
+			"channels",
+			"gradient_batch_indices_identity",
+			"input_gradient_base_zero",
+			"input_length",
+			"pool_size",
+			"winning_indices_from_matching_forward",
+			"winning_indices_unique",
+		],
+	)?;
+	for fact in [
+		"channelwise_nonoverlap",
+		"gradient_batch_indices_identity",
+		"input_gradient_base_zero",
+		"winning_indices_from_matching_forward",
+		"winning_indices_unique",
+	] {
+		require_true(request, fact)?;
+	}
+	let geometry = channelwise_pool_1d_geometry(request)?;
+	let output_gradient = input(request, "output_gradient")?;
+	let winning_indices = input(request, "winning_indices")?;
+	let gradient_batch_indices = input(request, "gradient_batch_indices")?;
+	let gradient_base = input(request, "input_gradient_base")?;
+	let input_gradient = output(request, "input_gradient")?;
+	require_dtype(request, output_gradient, DType::F32, "output_gradient")?;
+	require_dtype(request, winning_indices, DType::I32, "winning_indices")?;
+	require_dtype(
+		request,
+		gradient_batch_indices,
+		DType::I32,
+		"gradient_batch_indices",
+	)?;
+	require_dtype(request, gradient_base, DType::F32, "input_gradient_base")?;
+	require_dtype(request, input_gradient, DType::F32, "input_gradient")?;
+	let output_shape = [geometry.batch, geometry.groups, geometry.channels];
+	require_shape(request, output_gradient, &output_shape, "output_gradient")?;
+	require_shape(request, winning_indices, &output_shape, "winning_indices")?;
+	require_shape(
+		request,
+		gradient_batch_indices,
+		&[geometry.batch],
+		"gradient_batch_indices",
+	)?;
+	require_shape(
+		request,
+		gradient_base,
+		&[geometry.input_elements],
+		"input_gradient_base",
+	)?;
+	require_same_tensor_contract(request, gradient_base, input_gradient, "input_gradient")?;
+	let gathered = emitter.intermediate(DType::F32, output_gradient.shape.clone())?;
+	emitter.emit(
+		vec![output_gradient.id, gradient_batch_indices.id],
+		vec![gathered],
+		PrimitiveKind::Gather(Gather {
+			axis: 0,
+			bounds: IndexBounds::Reject,
+		}),
+	)?;
+	let mapped = emitter.intermediate(DType::F32, output_gradient.shape.clone())?;
+	let destinations = emitter.intermediate(DType::I32, winning_indices.shape.clone())?;
+	emitter.emit(
+		vec![gathered, winning_indices.id],
+		vec![mapped, destinations],
+		PrimitiveKind::Elementwise(Elementwise {
+			program: typed_pair_identity_program(request)?,
+		}),
+	)?;
+	emitter.emit(
+		vec![gradient_base.id, destinations, mapped],
+		vec![input_gradient.id],
+		PrimitiveKind::Scatter(Scatter {
+			axis: 0,
+			bounds: IndexBounds::Reject,
+			conflict: ScatterConflict::UniqueIndices,
+		}),
 	)
 }
 
@@ -1165,6 +1374,44 @@ fn pooling_2d_geometry(request: &MaterializationRequest<'_>) -> OperationResult<
 	})
 }
 
+fn channelwise_pool_1d_geometry(request: &MaterializationRequest<'_>) -> OperationResult<ChannelwisePool1dGeometry> {
+	let batch = prepared_extent(request, "batch")?;
+	let input_length = prepared_extent(request, "input_length")?;
+	let channels = prepared_extent(request, "channels")?;
+	let pool_size = prepared_u64(request.descriptor.id, request.parameters, "pool_size")?;
+	if pool_size == 0 {
+		return Err(operation_error(
+			request.descriptor.id,
+			OperationErrorKind::UnsupportedConcreteShape,
+			"pool_size must be positive",
+		));
+	}
+	let groups = input_length.div_ceil(pool_size);
+	let window_width = input_length.min(pool_size);
+	let input_elements = checked_product(
+		request,
+		&[batch, input_length, channels],
+		"channelwise maximum-pool input element count",
+	)?;
+	let output_elements = checked_product(
+		request,
+		&[batch, groups, channels],
+		"channelwise maximum-pool output element count",
+	)?;
+	checked_product(
+		request,
+		&[output_elements, window_width],
+		"channelwise maximum-pool window-index element count",
+	)?;
+	Ok(ChannelwisePool1dGeometry {
+		batch,
+		channels,
+		groups,
+		window_width,
+		input_elements,
+	})
+}
+
 fn checked_effective_kernel(
 	request: &MaterializationRequest<'_>,
 	kernel: u64,
@@ -1213,6 +1460,10 @@ fn pool_axis(request: &MaterializationRequest<'_>) -> OperationResult<AxisSet> {
 	AxisSet::new(vec![1]).map_err(|error| language_error(request.descriptor.id, error.to_string()))
 }
 
+fn channelwise_pool_axis(request: &MaterializationRequest<'_>) -> OperationResult<AxisSet> {
+	AxisSet::new(vec![3]).map_err(|error| language_error(request.descriptor.id, error.to_string()))
+}
+
 fn divide_by_program(
 	request: &MaterializationRequest<'_>,
 	divisor: f32,
@@ -1235,6 +1486,34 @@ fn typed_pair_identity_program(request: &MaterializationRequest<'_>) -> Operatio
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let index = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
 	scalar_finish(request.descriptor.id, builder, &[value, index])
+}
+
+fn channelwise_pool_result_program(
+	request: &MaterializationRequest<'_>,
+	channels: u64,
+) -> OperationResult<recipe_core::ScalarProgram> {
+	let mut builder = scalar_builder(request.descriptor.id)?;
+	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
+	let local = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
+	let base = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
+	let stride = builder
+		.i32(i32_extent(request, channels, "channels")?)
+		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
+	let offset = scalar_binary(
+		request.descriptor.id,
+		&mut builder,
+		ScalarOpcode::Multiply,
+		local,
+		stride,
+	)?;
+	let global = scalar_binary(
+		request.descriptor.id,
+		&mut builder,
+		ScalarOpcode::Add,
+		base,
+		offset,
+	)?;
+	scalar_finish(request.descriptor.id, builder, &[value, global])
 }
 
 fn max_pool_2d_result_program(

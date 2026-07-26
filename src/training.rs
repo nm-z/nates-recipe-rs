@@ -16,10 +16,10 @@ use recipe_prepare::{
 use recipe_training::{
 	AdamWConfig, BinaryValidationConfig, CheckpointError, CheckpointManifest, CompiledTraining,
 	CompletedTrainingCheckpoint, CompletedTrainingExecution, DenseActivation, DenseBlock, DenseBlockKind,
-	DenseDataNormalization, DenseLayer, DenseLoss, DenseNormalization, DenseOperation, DenseResidual,
+	DenseDataNormalization, DenseLayer, DenseLoss, DenseNormalization, DenseOperation, DensePool, DenseResidual,
 	DenseResidualOperation, DenseTrainingConfig, FinalTrainingMetric, LearningRateDecay, MulticlassValidationConfig,
 	TrainingBounds, TrainingCompileError, TrainingExecutionLimits, TrainingMetricKind, TrainingMetricObserver,
-	TrainingMetricSample, bounded_training_metric_channel, compile_dense_training,
+	TrainingMetricSample, ValidationMetricStatus, bounded_training_metric_channel, compile_dense_training,
 	compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
 	compile_dense_training_with_blocks_and_binary_validation,
 	compile_dense_training_with_blocks_and_multiclass_validation, compile_dense_training_with_multiclass_validation,
@@ -28,7 +28,8 @@ use recipe_training::{
 
 use crate::api::{
 	Activation, Data, DataNormalization, DeclarationError, LayerNormalization, LayerOperation, LayerSpec,
-	LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation, ResidualSkip, SavePath, Train,
+	LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation, ResidualSkip, SavePath,
+	Train,
 };
 use crate::data_prepare::{DataPreparationError, prepare_data};
 use crate::native_prepare::{NativePreparationError, with_current_native_preparation};
@@ -170,12 +171,18 @@ pub type TrainingResult<T> = Result<T, TrainingError>;
 #[derive(Clone, Debug)]
 pub struct TrainingReport {
 	checkpoint: CompletedTrainingCheckpoint,
+	validation_status: ValidationMetricStatus,
 }
 
 impl TrainingReport {
-	fn new(execution: CompletedTrainingExecution, manifest: CheckpointManifest) -> TrainingResult<Self> {
+	fn new(
+		execution: CompletedTrainingExecution,
+		manifest: CheckpointManifest,
+		validation_status: ValidationMetricStatus,
+	) -> TrainingResult<Self> {
 		Ok(Self {
 			checkpoint: CompletedTrainingCheckpoint::new(execution, manifest)?,
+			validation_status,
 		})
 	}
 
@@ -197,6 +204,12 @@ impl TrainingReport {
 	#[must_use]
 	pub fn metrics(&self) -> &[FinalTrainingMetric] {
 		self.checkpoint.metrics()
+	}
+
+	/// Whether requested validation reporting had known target rows.
+	#[must_use]
+	pub const fn validation_status(&self) -> ValidationMetricStatus {
+		self.validation_status
 	}
 
 	#[must_use]
@@ -275,7 +288,7 @@ fn compile_training_graph(policy: &Train, data: &Data, model: &Model) -> Trainin
 		.iter()
 		.map(|block| match block {
 			DenseBlock::Layer(layer) => Some(layer.clone()),
-			DenseBlock::Residual(_) => None,
+			DenseBlock::Pool(_) | DenseBlock::Residual(_) => None,
 		})
 		.collect::<Option<Vec<_>>>()
 		.unwrap_or_default();
@@ -333,12 +346,18 @@ fn compile_training_graph(policy: &Train, data: &Data, model: &Model) -> Trainin
 	};
 	let binary_validation = binary_validation_config(policy, loss)?;
 	let multiclass_validation = multiclass_validation_config(policy, loss)?;
-	let contains_residual = blocks
+	let contains_structured_blocks = blocks
 		.iter()
-		.any(|block| matches!(block, DenseBlock::Residual(_)));
-	let training = match (contains_residual, binary_validation, multiclass_validation) {
-		(false, Some(validation), None) => compile_dense_training_with_binary_validation(&prepared, &config, &validation)
-			.map_err(TrainingError::from),
+		.any(|block| !matches!(block, DenseBlock::Layer(_)));
+	let training = match (
+		contains_structured_blocks,
+		binary_validation,
+		multiclass_validation,
+	) {
+		(false, Some(validation), None) => {
+			compile_dense_training_with_binary_validation(&prepared, &config, &validation)
+				.map_err(TrainingError::from)
+		}
 		(false, None, Some(validation)) => {
 			compile_dense_training_with_multiclass_validation(&prepared, &config, &validation)
 				.map_err(TrainingError::from)
@@ -348,13 +367,10 @@ fn compile_training_graph(policy: &Train, data: &Data, model: &Model) -> Trainin
 			compile_dense_training_with_blocks_and_binary_validation(&prepared, &config, &blocks, &validation)
 				.map_err(TrainingError::from)
 		}
-		(true, None, Some(validation)) => compile_dense_training_with_blocks_and_multiclass_validation(
-			&prepared,
-			&config,
-			&blocks,
-			&validation,
-		)
-		.map_err(TrainingError::from),
+		(true, None, Some(validation)) => {
+			compile_dense_training_with_blocks_and_multiclass_validation(&prepared, &config, &blocks, &validation)
+				.map_err(TrainingError::from)
+		}
 		(true, None, None) => {
 			compile_dense_training_with_blocks(&prepared, &config, &blocks).map_err(TrainingError::from)
 		}
@@ -421,11 +437,16 @@ impl Train {
 	fn try_run_with(&self, data: &Data, model: &Model) -> TrainingResult<TrainingReport> {
 		let package = compile_training_package(self, data, model)?;
 		let execution = execute_current_training(self, &package.training)?;
-		TrainingReport::new(execution, package.checkpoint)
+		TrainingReport::new(
+			execution,
+			package.checkpoint,
+			package.training.outputs().validation_status,
+		)
 	}
 }
 
 fn execute_current_training(policy: &Train, training: &CompiledTraining) -> TrainingResult<CompletedTrainingExecution> {
+	report_unavailable_validation(training)?;
 	let presentations = live_metric_presentations(policy, training);
 	if presentations.is_empty() {
 		return execute_current_training_native(training, None);
@@ -448,6 +469,16 @@ fn execute_current_training(policy: &Train, training: &CompiledTraining) -> Trai
 	drop(observer);
 	let _ = presenter.join();
 	result
+}
+
+fn report_unavailable_validation(training: &CompiledTraining) -> TrainingResult<()> {
+	let Some(line) = crate::validation_reporting::unavailable_validation_line(training.outputs().validation_status)
+	else {
+		return Ok(());
+	};
+	let stdout = io::stdout();
+	write_live_metric_row(&mut stdout.lock(), &line)
+		.map_err(|error| TrainingError::runtime("report validation availability", error.to_string()))
 }
 
 fn execute_current_training_native(
@@ -538,9 +569,7 @@ fn log_selects(requested: Metric, available: TrainingMetricKind) -> bool {
 		Metric::AuPrc => available == TrainingMetricKind::AuPrc,
 		Metric::Brier => available == TrainingMetricKind::BrierScore,
 		Metric::CalibrationError => available == TrainingMetricKind::ExpectedCalibrationError,
-		Metric::R2 | Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => {
-			false
-		}
+		Metric::R2 | Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => false,
 	}
 }
 
@@ -753,7 +782,7 @@ fn require_supported_model(model: &Model) -> TrainingResult<DenseLoss> {
 fn require_supported_policy(policy: &Train) -> TrainingResult<()> {
 	if policy.optimizer_spec() != Some(Optimizer::AdamW) {
 		return Err(TrainingError::unsupported(
-			"dense binary training requires the Recipe-owned AdamW optimizer on the training declaration",
+			"dense training requires the Recipe-owned AdamW optimizer on the training declaration",
 		));
 	}
 	if policy.learning_rate_schedule().is_none() {
@@ -812,10 +841,7 @@ fn binary_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<O
 	Ok(Some(validation))
 }
 
-fn multiclass_validation_config(
-	policy: &Train,
-	loss: DenseLoss,
-) -> TrainingResult<Option<MulticlassValidationConfig>> {
+fn multiclass_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<Option<MulticlassValidationConfig>> {
 	let requested = policy
 		.log_items()
 		.iter()
@@ -834,6 +860,16 @@ fn multiclass_validation_config(
 
 fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 	match layer {
+		LayerSpec::Pool {
+			size,
+			group_to_neuron,
+		} => {
+			let size = map_dense_width(*size, "pool size")?;
+			let group_to_neuron = group_to_neuron
+				.map(|connection| map_dense_width(connection.neurons(), "pool destination neuron count"))
+				.transpose()?;
+			Ok(DenseBlock::Pool(DensePool::new(size, group_to_neuron)))
+		}
 		LayerSpec::Residual {
 			branch,
 			output_width,
@@ -1034,6 +1070,30 @@ mod tests {
 	}
 
 	#[test]
+	fn pool_lowering_preserves_size_and_immediate_dense_routing() {
+		let model = Model::new().pool(2).layer(8);
+		let block = map_dense_block(&model.layers()[0]).expect("pool block lowers");
+		let DenseBlock::Pool(pool) = block else {
+			panic!("pool facade block lowered as another block kind");
+		};
+
+		assert_eq!(pool.size().get(), 2);
+		assert_eq!(pool.group_to_neuron().map(NonZeroU64::get), Some(8));
+		assert!(matches!(
+			map_dense_block(&model.layers()[1]).expect("following dense layer lowers"),
+			DenseBlock::Layer(layer) if layer.width().get() == 8
+		));
+
+		let unconnected = Model::new().pool(3);
+		let DenseBlock::Pool(pool) = map_dense_block(&unconnected.layers()[0]).expect("terminal pool block lowers")
+		else {
+			panic!("terminal pool facade block lowered as another block kind");
+		};
+		assert_eq!(pool.size().get(), 3);
+		assert_eq!(pool.group_to_neuron(), None);
+	}
+
+	#[test]
 	fn residual_lowering_preserves_branch_and_post_add_operation_order() {
 		let model = Model::new()
 			.residual([
@@ -1054,9 +1114,15 @@ mod tests {
 			residual.branch(),
 			[
 				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
-				DenseResidualOperation::Layer(DenseLayer::with_operations(NonZeroU64::new(64).unwrap(), [])),
+				DenseResidualOperation::Layer(DenseLayer::with_operations(
+					NonZeroU64::new(64).unwrap(),
+					[]
+				)),
 				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
-				DenseResidualOperation::Layer(DenseLayer::with_operations(NonZeroU64::new(32).unwrap(), [])),
+				DenseResidualOperation::Layer(DenseLayer::with_operations(
+					NonZeroU64::new(32).unwrap(),
+					[]
+				)),
 			]
 		);
 		assert_eq!(
@@ -1085,11 +1151,8 @@ mod tests {
 			"recipe-residual-package-{}-{sequence}.csv",
 			std::process::id(),
 		));
-		std::fs::write(
-			&path,
-			b"feature,target\n1,2\n2,3\n3,4\n4,5\n5,6\n6,7\n",
-		)
-		.expect("write residual package fixture");
+		std::fs::write(&path, b"feature,target\n1,2\n2,3\n3,4\n4,5\n5,6\n6,7\n")
+			.expect("write residual package fixture");
 		let _fixture = RemoveOnDrop(path.clone());
 		let data = Data::empty()
 			.set(path.to_str().expect("temporary path is UTF-8"))
@@ -1108,7 +1171,10 @@ mod tests {
 			.cos();
 
 		let package = compile_training_package(&policy, &data, &model).expect("residual package compiles");
-		assert!(matches!(package.training.blocks()[0], DenseBlock::Residual(_)));
+		assert!(matches!(
+			package.training.blocks()[0],
+			DenseBlock::Residual(_)
+		));
 		assert_eq!(package.checkpoint.format_version(), 6);
 	}
 

@@ -28,13 +28,13 @@ pub fn canonical_declarations_compile() {
 		.log([recipe::Loss, recipe::Accuracy]);
 	let infer = recipe::recipe
 		.infer()
-		.log(recipe::Loss)
-		.log([recipe::Loss, recipe::Accuracy]);
+		.log(recipe::Time)
+		.log([recipe::Time, recipe::Device]);
+	let _ = infer.evaluate();
 	let _knn = recipe::recipe.model().knn(3);
 	let _residual = recipe::recipe.model()
 		.residual([recipe::layer(64), recipe::relu()]);
 	let _ = recipe::compile_training(&train, &data, &model);
-	let _ = infer.evaluate(&data, &model);
 }
 
 pub fn canonical_sequence_compiles() {
@@ -48,5 +48,7 @@ pub fn canonical_sequence_compiles() {
 		.exp()
 		.run()
 		.save("model.ogdl");
-	let _ = recipe::recipe.model().load("model.ogdl", 1);
+	recipe::recipe.data("inference.csv");
+	recipe::recipe.model().load("model.ogdl");
+	let _ = recipe::recipe.infer().evaluate();
 }

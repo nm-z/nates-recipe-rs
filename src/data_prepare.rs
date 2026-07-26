@@ -63,9 +63,7 @@ impl std::error::Error for DataPreparationError {
 			Self::Source(error) => Some(error),
 			Self::Semantic(error) => Some(error),
 			Self::Prepare(error) => Some(error),
-			Self::MissingTargets
-			| Self::MissingSplit
-			| Self::FloatPredicateOutsideF32 { .. } => None,
+			Self::MissingTargets | Self::MissingSplit | Self::FloatPredicateOutsideF32 { .. } => None,
 		}
 	}
 }

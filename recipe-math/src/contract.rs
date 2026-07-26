@@ -72,6 +72,7 @@ pub enum MathFunction {
 	Tan,
 	Atan2,
 	Exp,
+	ExpWithGradualUnderflow,
 	ExpMinusOne,
 	Log,
 	LogOnePlus,
@@ -138,6 +139,12 @@ const EXP_X: &[FiniteInputDomain] = &[FiniteInputDomain {
 	upper: FiniteBound::Inclusive(80.0),
 	nonzero: false,
 }];
+const NONPOSITIVE_X: &[FiniteInputDomain] = &[FiniteInputDomain {
+	name: "x",
+	lower: FiniteBound::Unbounded,
+	upper: FiniteBound::Inclusive(0.0),
+	nonzero: false,
+}];
 const LOG1P_X: &[FiniteInputDomain] = &[FiniteInputDomain {
 	name: "x",
 	lower: FiniteBound::Exclusive(-1.0),
@@ -186,7 +193,7 @@ const ERF_X: &[FiniteInputDomain] = &[FiniteInputDomain {
 }];
 
 impl MathFunction {
-	pub const ALL: [Self; 21] = [
+	pub const ALL: [Self; 22] = [
 		Self::Reciprocal,
 		Self::ReciprocalSquareRoot,
 		Self::Sin,
@@ -194,6 +201,7 @@ impl MathFunction {
 		Self::Tan,
 		Self::Atan2,
 		Self::Exp,
+		Self::ExpWithGradualUnderflow,
 		Self::ExpMinusOne,
 		Self::Log,
 		Self::LogOnePlus,
@@ -220,6 +228,7 @@ impl MathFunction {
 			| Self::Cos
 			| Self::Tan
 			| Self::Exp
+			| Self::ExpWithGradualUnderflow
 			| Self::ExpMinusOne
 			| Self::Log
 			| Self::LogOnePlus
@@ -261,6 +270,7 @@ impl MathFunction {
 			Self::Tan => "recipe.math.tan.cody-waite-ratio-f32",
 			Self::Atan2 => "recipe.math.atan2.octant-atan15-f32",
 			Self::Exp => "recipe.math.exp.bitpow2-taylor7-f32",
+			Self::ExpWithGradualUnderflow => "recipe.math.exp.split-scale-subnormal-f32",
 			Self::ExpMinusOne => "recipe.math.expm1.hybrid-taylor8-f32",
 			Self::Log => "recipe.math.log.bitdecompose-atanh13-f32",
 			Self::LogOnePlus => "recipe.math.log1p.hybrid-series12-f32",
@@ -269,7 +279,7 @@ impl MathFunction {
 			Self::RoundNearestEven => "recipe.math.rne.scalar-primitive-f32",
 			Self::Trunc => "recipe.math.trunc.floor-ceil-select-f32",
 			Self::Fmod => "recipe.math.fmod.ieee-remainder-f32",
-			Self::Pow => "recipe.math.pow.log-exp-subnormal-v2-f32",
+			Self::Pow => "recipe.math.pow.log-exp-subnormal-v3-f32",
 			Self::Sign => "recipe.math.sign.ordered-select-f32",
 			Self::Sigmoid => "recipe.math.sigmoid.stable-exp-f32",
 			Self::Tanh => "recipe.math.tanh.stable-expm1-f32",
@@ -277,7 +287,7 @@ impl MathFunction {
 			Self::Erf => "recipe.math.erf.as-7.1.26-f32",
 		};
 		let version = match self {
-			Self::Pow => 2,
+			Self::Pow => 3,
 			_ => 1,
 		};
 		AlgorithmIdentity { name, version }
@@ -308,6 +318,10 @@ impl MathFunction {
 			Self::Exp | Self::ExpMinusOne | Self::Sigmoid | Self::Softplus => FiniteDomain {
 				inputs: EXP_X,
 				relation: "range reduction exponent remains a normal binary32 value",
+			},
+			Self::ExpWithGradualUnderflow => FiniteDomain {
+				inputs: NONPOSITIVE_X,
+				relation: "every finite x <= 0 is accepted; binary32 underflow uses round-to-nearest-even",
 			},
 			Self::Log => FiniteDomain {
 				inputs: POSITIVE_X,
@@ -356,7 +370,9 @@ impl MathFunction {
 			| Self::Sign
 			| Self::Tanh
 			| Self::Erf => "an input signed zero is preserved exactly",
-			Self::Cos | Self::Exp | Self::Pow => "either signed zero maps to positive one when it is in-domain",
+			Self::Cos | Self::Exp | Self::ExpWithGradualUnderflow | Self::Pow => {
+				"either signed zero maps to positive one when it is in-domain"
+			}
 			Self::Atan2 => "signed y zero selects the signed x-axis result; the (zero, zero) pair is rejected",
 			Self::Fmod => "a zero dividend preserves its sign",
 			Self::Sigmoid => "either signed zero maps to positive 0.5",
@@ -397,6 +413,11 @@ impl MathFunction {
 				maximum_absolute: 2.0e-6,
 				maximum_relative: 5.0e-6,
 				note: "normal-power-of-two reconstruction with degree-7 residual polynomial",
+			},
+			Self::ExpWithGradualUnderflow => ErrorBound {
+				maximum_absolute: 2.0e-6,
+				maximum_relative: 5.0e-6,
+				note: "split-scale power-of-two reconstruction preserves binary32 subnormals and rounds true underflow",
 			},
 			Self::ExpMinusOne => ErrorBound {
 				maximum_absolute: 3.0e-6,

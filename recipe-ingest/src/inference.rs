@@ -1,6 +1,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
+use crate::prepare::CategoricalObservation;
 use crate::{RawTable, parse_contract_f32, parse_contract_i32};
 
 /// Exact saved encoding contract for one inference feature.
@@ -199,6 +200,7 @@ pub struct PreparedInferenceFeature {
 	schema: InferenceFeatureSchema,
 	source_column: usize,
 	values: PreparedInferenceValues,
+	categorical_observations: Option<Vec<CategoricalObservation>>,
 }
 
 impl PreparedInferenceFeature {
@@ -215,6 +217,16 @@ impl PreparedInferenceFeature {
 	#[must_use]
 	pub const fn values(&self) -> &PreparedInferenceValues {
 		&self.values
+	}
+
+	/// Typed categorical observations in inference-row order.
+	///
+	/// Existing graph consumers retain calculation-facing i32 codes in
+	/// [`Self::values`]. This parallel route preserves the distinction between a
+	/// missing source value and an unseen nonempty label, including its bytes.
+	#[must_use]
+	pub fn categorical_observations(&self) -> Option<&[CategoricalObservation]> {
+		self.categorical_observations.as_deref()
 	}
 }
 
@@ -242,8 +254,10 @@ impl PreparedInferenceDataset {
 /// Feature identity is matched by exact column-name bytes, so source columns
 /// may be reordered and unrelated columns are ignored. No semantic inference,
 /// dictionary fitting, target selection, row filtering, or train/evaluation
-/// split occurs. Missing numeric values fail closed. Missing and previously
-/// unseen categorical labels both use the checkpoint-v5 reserved code.
+/// split occurs. Missing numeric values fail closed. Existing graph consumers
+/// receive the checkpoint-v5 reserved code for categorical missing/unseen
+/// values, while [`PreparedInferenceFeature::categorical_observations`] records
+/// their distinct typed routes and preserves every unseen label.
 ///
 /// # Errors
 ///
@@ -260,6 +274,26 @@ pub fn prepare_inference_table(
 			"saved model schema contains no features",
 		));
 	}
+	let mut saved_names = BTreeMap::<&[u8], usize>::new();
+	let mut saved_sources = BTreeMap::<usize, usize>::new();
+	for (feature, feature_schema) in schema.iter().enumerate() {
+		let path = InferenceDataPath::new(feature, feature_schema);
+		validate_schema(feature_schema, &path)?;
+		if let Some(first) = saved_names.insert(feature_schema.name(), feature) {
+			return Err(InferencePrepareError::new(
+				InferencePrepareErrorKind::InvalidFeatureSchema,
+				format!("saved feature name duplicates feature {first}"),
+			)
+			.at(path));
+		}
+		if let Some(first) = saved_sources.insert(feature_schema.source_vector(), feature) {
+			return Err(InferencePrepareError::new(
+				InferencePrepareErrorKind::InvalidFeatureSchema,
+				format!("saved source-vector identity duplicates feature {first}"),
+			)
+			.at(path));
+		}
+	}
 	let columns = table.headers().iter().enumerate().fold(
 		BTreeMap::<&[u8], Vec<usize>>::new(),
 		|mut columns, (index, name)| {
@@ -272,7 +306,6 @@ pub fn prepare_inference_table(
 		.enumerate()
 		.map(|(feature, schema)| {
 			let path = InferenceDataPath::new(feature, schema);
-			validate_schema(schema, &path)?;
 			let matches = columns.get(schema.name()).ok_or_else(|| {
 				InferencePrepareError::new(
 					InferencePrepareErrorKind::MissingRequiredFeature,
@@ -291,11 +324,23 @@ pub fn prepare_inference_table(
 				.at(path));
 			}
 			let source_column = matches[0];
-			let values = encode_feature(table, source_column, schema, feature)?;
+			let (values, categorical_observations) = encode_feature(table, source_column, schema, feature)?;
+			if values.len() != table.rows().len()
+				|| categorical_observations
+					.as_ref()
+					.is_some_and(|observations| observations.len() != table.rows().len())
+			{
+				return Err(InferencePrepareError::new(
+					InferencePrepareErrorKind::ArithmeticOverflow,
+					"schema application did not preserve inference-row length",
+				)
+				.at(path));
+			}
 			Ok(PreparedInferenceFeature {
 				schema: schema.clone(),
 				source_column,
 				values,
+				categorical_observations,
 			})
 		})
 		.collect::<InferencePrepareResult<Vec<_>>>()?;
@@ -316,13 +361,6 @@ fn validate_schema(schema: &InferenceFeatureSchema, path: &InferenceDataPath) ->
 	let InferenceFeatureEncoding::CategoricalDictionary { dictionary } = &schema.encoding else {
 		return Ok(());
 	};
-	if dictionary.is_empty() {
-		return Err(InferencePrepareError::new(
-			InferencePrepareErrorKind::InvalidFeatureSchema,
-			"saved categorical dictionary is empty",
-		)
-		.at(path.clone()));
-	}
 	if dictionary.iter().any(Vec::is_empty)
 		|| dictionary
 			.windows(2)
@@ -349,7 +387,7 @@ fn encode_feature(
 	source_column: usize,
 	schema: &InferenceFeatureSchema,
 	feature: usize,
-) -> InferencePrepareResult<PreparedInferenceValues> {
+) -> InferencePrepareResult<(PreparedInferenceValues, Option<Vec<CategoricalObservation>>)> {
 	match &schema.encoding {
 		InferenceFeatureEncoding::NumericI32 => table
 			.rows()
@@ -367,7 +405,7 @@ fn encode_feature(
 					.map_err(|error| invalid_value(schema, feature, source_row, error))
 			})
 			.collect::<InferencePrepareResult<Vec<_>>>()
-			.map(PreparedInferenceValues::I32),
+			.map(|values| (PreparedInferenceValues::I32(values), None)),
 		InferenceFeatureEncoding::NumericF32 => table
 			.rows()
 			.iter()
@@ -384,7 +422,7 @@ fn encode_feature(
 					.map_err(|error| invalid_value(schema, feature, source_row, error))
 			})
 			.collect::<InferencePrepareResult<Vec<_>>>()
-			.map(PreparedInferenceValues::F32Bits),
+			.map(|values| (PreparedInferenceValues::F32Bits(values), None)),
 		InferenceFeatureEncoding::CategoricalDictionary { dictionary } => {
 			let codes = dictionary
 				.iter()
@@ -397,18 +435,64 @@ fn encode_feature(
 				.collect::<InferencePrepareResult<BTreeMap<_, _>>>()?;
 			let reserved =
 				i32::try_from(dictionary.len()).map_err(|error| invalid_value(schema, feature, 0, error))?;
-			let values = table
+			let encoded = table
 				.rows()
 				.iter()
 				.enumerate()
 				.map(|(source_row, row)| {
 					let value = source_value(row, source_column, schema, feature, source_row)?;
-					Ok(codes.get(value).copied().unwrap_or(reserved))
+					if value.is_empty() {
+						Ok((reserved, CategoricalObservation::Missing))
+					} else if let Some(code) = codes.get(value).copied() {
+						Ok((code, CategoricalObservation::Known { code }))
+					} else {
+						Ok((
+							reserved,
+							CategoricalObservation::Unseen {
+								label: value.to_vec(),
+							},
+						))
+					}
 				})
 				.collect::<InferencePrepareResult<Vec<_>>>()?;
-			Ok(PreparedInferenceValues::I32(values))
+			let (values, observations): (Vec<i32>, Vec<CategoricalObservation>) = encoded.into_iter().unzip();
+			validate_categorical_alignment(schema, feature, reserved, &values, &observations)?;
+			Ok((PreparedInferenceValues::I32(values), Some(observations)))
 		}
 	}
+}
+
+fn validate_categorical_alignment(
+	schema: &InferenceFeatureSchema,
+	feature: usize,
+	reserved: i32,
+	codes: &[i32],
+	observations: &[CategoricalObservation],
+) -> InferencePrepareResult<()> {
+	if codes.len() != observations.len() {
+		return Err(invalid_value(
+			schema,
+			feature,
+			0,
+			"categorical calculation codes and observation routes have different lengths",
+		));
+	}
+	for (source_row, (code, observation)) in codes.iter().zip(observations).enumerate() {
+		let aligned = match observation {
+			CategoricalObservation::Known { code: known } => *code == *known && *known >= 0 && *known < reserved,
+			CategoricalObservation::Missing => *code == reserved,
+			CategoricalObservation::Unseen { label } => !label.is_empty() && *code == reserved,
+		};
+		if !aligned {
+			return Err(invalid_value(
+				schema,
+				feature,
+				source_row,
+				"categorical calculation code does not match its typed observation route",
+			));
+		}
+	}
+	Ok(())
 }
 
 fn source_value<'a>(
@@ -497,7 +581,7 @@ mod tests {
 	}
 
 	#[test]
-	fn unseen_and_missing_categories_use_the_saved_reserved_code() {
+	fn saved_categorical_schema_records_known_unseen_and_missing_routes_alongside_codes() {
 		let schema = [InferenceFeatureSchema::new(
 			4,
 			b"color",
@@ -510,6 +594,117 @@ mod tests {
 			prepared.features()[0].values(),
 			&PreparedInferenceValues::I32(vec![0, 2, 2])
 		);
+		assert_eq!(
+			prepared.features()[0].categorical_observations(),
+			Some([
+				CategoricalObservation::Known { code: 0 },
+				CategoricalObservation::Unseen {
+					label: b"purple".to_vec(),
+				},
+				CategoricalObservation::Missing,
+			]
+			.as_slice())
+		);
+	}
+
+	#[test]
+	fn empty_saved_dictionary_applies_without_learning_from_inference_rows() {
+		let schema = [InferenceFeatureSchema::new(
+			4,
+			b"color",
+			InferenceFeatureEncoding::CategoricalDictionary {
+				dictionary: Vec::new(),
+			},
+		)];
+		let prepared = prepare_inference_table(&table(b"color\nblue\n\"\"\nred\n"), &schema).unwrap();
+		assert_eq!(
+			prepared.features()[0].values(),
+			&PreparedInferenceValues::I32(vec![0, 0, 0])
+		);
+		assert_eq!(
+			prepared.features()[0].categorical_observations(),
+			Some([
+				CategoricalObservation::Unseen {
+					label: b"blue".to_vec(),
+				},
+				CategoricalObservation::Missing,
+				CategoricalObservation::Unseen {
+					label: b"red".to_vec(),
+				},
+			]
+			.as_slice())
+		);
+	}
+
+	#[test]
+	fn header_only_saved_schema_application_preserves_empty_typed_routes() {
+		let schema = [
+			InferenceFeatureSchema::new(0, b"number", InferenceFeatureEncoding::NumericI32),
+			InferenceFeatureSchema::new(
+				1,
+				b"label",
+				InferenceFeatureEncoding::CategoricalDictionary {
+					dictionary: Vec::new(),
+				},
+			),
+		];
+		let prepared = prepare_inference_table(&table(b"number,label\n"), &schema).unwrap();
+		assert_eq!(prepared.rows(), 0);
+		assert_eq!(
+			prepared.features()[0].values(),
+			&PreparedInferenceValues::I32(Vec::new())
+		);
+		assert_eq!(prepared.features()[0].categorical_observations(), None);
+		assert_eq!(
+			prepared.features()[1].values(),
+			&PreparedInferenceValues::I32(Vec::new())
+		);
+		assert_eq!(
+			prepared.features()[1].categorical_observations(),
+			Some([].as_slice())
+		);
+	}
+
+	#[test]
+	fn saved_schema_is_globally_validated_before_source_lookup() {
+		let malformed_later = [
+			InferenceFeatureSchema::new(0, b"absent", InferenceFeatureEncoding::NumericI32),
+			InferenceFeatureSchema::new(
+				1,
+				b"label",
+				InferenceFeatureEncoding::CategoricalDictionary {
+					dictionary: vec![b"z".to_vec(), b"a".to_vec()],
+				},
+			),
+		];
+		let error = prepare_inference_table(&table(b"present\n1\n"), &malformed_later).unwrap_err();
+		assert_eq!(
+			error.kind(),
+			InferencePrepareErrorKind::InvalidFeatureSchema
+		);
+		assert_eq!(error.path().unwrap().feature(), 1);
+
+		let duplicate_name = [
+			InferenceFeatureSchema::new(0, b"present", InferenceFeatureEncoding::NumericI32),
+			InferenceFeatureSchema::new(1, b"present", InferenceFeatureEncoding::NumericF32),
+		];
+		let error = prepare_inference_table(&table(b"present\n1\n"), &duplicate_name).unwrap_err();
+		assert_eq!(
+			error.kind(),
+			InferencePrepareErrorKind::InvalidFeatureSchema
+		);
+		assert_eq!(error.path().unwrap().feature(), 1);
+
+		let duplicate_source = [
+			InferenceFeatureSchema::new(4, b"present", InferenceFeatureEncoding::NumericI32),
+			InferenceFeatureSchema::new(4, b"other", InferenceFeatureEncoding::NumericI32),
+		];
+		let error = prepare_inference_table(&table(b"present,other\n1,2\n"), &duplicate_source).unwrap_err();
+		assert_eq!(
+			error.kind(),
+			InferencePrepareErrorKind::InvalidFeatureSchema
+		);
+		assert_eq!(error.path().unwrap().feature(), 1);
 	}
 
 	#[test]

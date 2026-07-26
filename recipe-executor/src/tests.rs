@@ -36,6 +36,7 @@ struct FakeBackend {
 	loop_submissions: u64,
 	iteration_checksum: u64,
 	maximum_iteration: Option<u64>,
+	failing_release: Option<DeviceId>,
 }
 
 impl FakeBackend {
@@ -49,6 +50,7 @@ impl FakeBackend {
 			loop_submissions: 0,
 			iteration_checksum: 0,
 			maximum_iteration: None,
+			failing_release: None,
 		}
 	}
 
@@ -64,6 +66,11 @@ impl FakeBackend {
 
 	fn with_metric(mut self, task: TaskId, value: MetricValue) -> Self {
 		self.metric_values.insert(task, value);
+		self
+	}
+
+	fn failing_release(mut self, device: DeviceId) -> Self {
+		self.failing_release = Some(device);
 		self
 	}
 }
@@ -384,7 +391,11 @@ impl Backend for FakeBackend {
 		assert_ne!(resource.generation, 0);
 		assert_eq!(arena.device, device);
 		assert!(arena.bytes >= ByteCount::new(16));
-		record_physical(physical_calls, PhysicalCall::ReleaseArena { device })
+		record_physical(physical_calls, PhysicalCall::ReleaseArena { device })?;
+		match self.failing_release == Some(device) {
+			true => Err(FakeError("injected release fault")),
+			false => Ok(()),
+		}
 	}
 
 	fn destroy_resources(
@@ -1258,6 +1269,101 @@ fn injected_asynchronous_failure_is_typed_and_retains_running_state() {
 }
 
 #[test]
+fn recoverable_loop_failure_releases_every_arena_then_destroys_resources() {
+	let backend = FakeBackend::new().with_script(CALCULATION, [FakeStep::Fail("injected async fault")]);
+	let initialized = initialized(backend, Watchdog::new(4).unwrap(), 31);
+	let mut running = initialized.start_loop().unwrap();
+	let error = running.poll().unwrap_err();
+	let failure = running.fail(error);
+
+	assert_eq!(failure.error(), error);
+	assert_eq!(failure.cleanup_error(), None);
+	assert_eq!(failure.run_id(), RunId::new(31));
+	let journal = failure.journal().unwrap();
+	assert!(matches!(
+		&journal.physical_calls()[journal.physical_calls().len() - 3..],
+		[
+			PhysicalCall::ReleaseArena { device: GPU },
+			PhysicalCall::ReleaseArena { device: RAM },
+			PhysicalCall::DestroyResources,
+		]
+	));
+	assert!(
+		!journal
+			.logical_events()
+			.iter()
+			.any(|event| matches!(event, LogicalEvent::Exited { .. }))
+	);
+
+	let parts = failure.into_parts();
+	assert_eq!(parts.backend.completed_lifecycles, 1);
+	assert!(parts.journal.is_some());
+}
+
+#[test]
+fn recoverable_loop_failure_continues_teardown_after_an_arena_release_fails() {
+	let backend = FakeBackend::new()
+		.failing_release(GPU)
+		.with_script(CALCULATION, [FakeStep::Fail("injected async fault")]);
+	let initialized = initialized(backend, Watchdog::new(4).unwrap(), 33);
+	let mut running = initialized.start_loop().unwrap();
+	let error = running.poll().unwrap_err();
+	let failure = running.fail(error);
+
+	assert_eq!(
+		failure.cleanup_error(),
+		Some(ExecutorError::Backend {
+			operation: BackendOperation::ReleaseArena { device: GPU },
+			message: BackendMessage::new("injected release fault"),
+		})
+	);
+	let journal = failure.journal().unwrap();
+	assert!(matches!(
+		&journal.physical_calls()[journal.physical_calls().len() - 3..],
+		[
+			PhysicalCall::ReleaseArena { device: GPU },
+			PhysicalCall::ReleaseArena { device: RAM },
+			PhysicalCall::DestroyResources,
+		]
+	));
+	let parts = failure.into_parts();
+	assert_eq!(parts.backend.completed_lifecycles, 1);
+}
+
+#[test]
+fn recoverable_initialization_failure_destroys_bound_resources_and_retains_journal() {
+	let prepared = PreparedRun::prepare_recoverable(
+		RunId::new(32),
+		fixture(),
+		FakeBackend::new(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap();
+	let failure = prepared
+		.initialize_recoverable([
+			DeviceImage::new(GPU, ValueId::new(1), vec![0; 16]),
+			DeviceImage::new(RAM, ValueId::new(2), vec![0; 15]),
+		])
+		.unwrap_err();
+
+	assert_eq!(
+		failure.error(),
+		ExecutorError::AdmissionSizeMismatch {
+			device: RAM,
+			expected: ByteCount::new(16),
+			actual: ByteCount::new(15),
+		}
+	);
+	assert_eq!(failure.cleanup_error(), None);
+	let parts = failure.into_parts();
+	assert_eq!(parts.backend.completed_lifecycles, 1);
+	assert!(matches!(
+		parts.journal.as_ref().unwrap().physical_calls().last(),
+		Some(PhysicalCall::DestroyResources)
+	));
+}
+
+#[test]
 fn watchdog_detects_bounded_nonprogress() {
 	let pending = std::iter::repeat_n(FakeStep::Pending, 8);
 	let backend = FakeBackend::new()
@@ -1749,7 +1855,7 @@ fn external_exit_bytes_are_returned_as_typed_images() {
 
 #[test]
 fn declared_journal_exhaustion_fails_closed() {
-	let error = PreparedRun::prepare_with_journal_capacity(
+	let failure = PreparedRun::prepare_with_journal_capacity_recoverable(
 		RunId::new(12),
 		fixture(),
 		FakeBackend::new(),
@@ -1758,12 +1864,22 @@ fn declared_journal_exhaustion_fails_closed() {
 	)
 	.unwrap_err();
 	assert_eq!(
-		error,
+		failure.error(),
 		ExecutorError::JournalCapacityExceeded {
 			stream: JournalStream::Physical,
 			capacity: 1,
 		}
 	);
+	assert_eq!(
+		failure.cleanup_error(),
+		Some(ExecutorError::JournalCapacityExceeded {
+			stream: JournalStream::Physical,
+			capacity: 1,
+		})
+	);
+	let parts = failure.into_parts();
+	assert_eq!(parts.backend.completed_lifecycles, 1);
+	assert!(parts.journal.is_some());
 }
 
 #[test]

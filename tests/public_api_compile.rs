@@ -127,6 +127,15 @@ fn public_surface_keeps_canonical_calls_and_rejects_banned_calls() {
 		("fail/try_save.rs", "method `try_save` is private"),
 		("fail/calibrate.rs", "no method named `calibrate`"),
 		("fail/linear.rs", "no method named `linear`"),
+		(
+			"fail/load_with_input_width.rs",
+			"this method takes 1 argument but 2 arguments were supplied",
+		),
+		("fail/model_input_width.rs", "no method named `input_width`"),
+		(
+			"fail/evaluate_with_explicit_declarations.rs",
+			"this method takes 0 arguments but 2 arguments were supplied",
+		),
 	] {
 		let output = crate_under_test.check(&fixture(path));
 		let stderr = String::from_utf8_lossy(&output.stderr);

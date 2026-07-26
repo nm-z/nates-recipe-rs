@@ -1,11 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use recipe_ingest::{
-	AmbiguousVectorModel, CategoricalEncodingModel, DatasetSourceErrorKind, IngestLimits, SemanticType,
-	VectorEvidence, distill_dataset, distill_datasets,
+	AmbiguousVectorModel, CategoricalEncodingModel, DatasetSourceErrorKind, IngestLimits, PreparationRequest,
+	SemanticType, TrainFraction, VectorEvidence, VectorMetadata, distill_dataset, distill_datasets,
 };
 use zip::write::SimpleFileOptions;
 
@@ -43,6 +44,14 @@ impl Drop for TestDirectory {
 
 fn limits() -> IngestLimits {
 	IngestLimits::new(1 << 20, 1_000, 128, 1 << 20).unwrap()
+}
+
+fn jpeg(width: u16, height: u16) -> Vec<u8> {
+	let mut bytes = b"\xff\xd8\xff\xe0\x00\x07JFIF\0\xff\xc0\x00\x11\x08".to_vec();
+	bytes.extend_from_slice(&height.to_be_bytes());
+	bytes.extend_from_slice(&width.to_be_bytes());
+	bytes.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+	bytes
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +195,57 @@ fn directory_members_are_sorted_and_distilled_as_samples() {
 }
 
 #[test]
+fn distilled_prepare_preserves_exact_image_rules_and_fits_classified_state_on_train_only() {
+	#[derive(Debug, Default)]
+	struct RecordingModel {
+		evidence: RefCell<Vec<VectorEvidence>>,
+	}
+
+	impl AmbiguousVectorModel for RecordingModel {
+		fn classify(&self, evidence: VectorEvidence) -> SemanticType {
+			self.evidence.borrow_mut().push(evidence);
+			SemanticType::Categorical
+		}
+	}
+
+	let directory = TestDirectory::new();
+	for (name, width) in [("a.jpg", 10), ("b.jpg", 11), ("c.jpg", 20), ("d.jpg", 21)] {
+		fs::write(directory.path().join(name), jpeg(width, 7)).unwrap();
+	}
+	let dataset = distill_dataset(directory.path(), limits()).unwrap();
+	let model = RecordingModel::default();
+	let prepared = dataset
+		.prepare(
+			&PreparationRequest::new(["sample_index"], TrainFraction::new(1, 2).unwrap()),
+			&model,
+		)
+		.unwrap();
+	let image = prepared
+		.vectors()
+		.iter()
+		.find(|vector| vector.name() == b"image")
+		.unwrap();
+	assert_eq!(image.semantic_type(), SemanticType::Image);
+	let VectorMetadata::Image { encoded_variants } = image.metadata() else {
+		panic!("distilled exact image rule must remain an image schema");
+	};
+	assert_eq!(
+		encoded_variants
+			.iter()
+			.map(|variant| (variant.width(), variant.height()))
+			.collect::<Vec<_>>(),
+		[(10, 7), (11, 7)]
+	);
+	assert!(!model.evidence.borrow().is_empty());
+	assert!(
+		model.evidence
+			.borrow()
+			.iter()
+			.all(|evidence| evidence.values == 2)
+	);
+}
+
+#[test]
 fn declared_sources_append_rows_in_order_and_retain_source_identity() {
 	let directory = TestDirectory::new();
 	let first = directory.path().join("first.csv");
@@ -225,7 +285,12 @@ fn declared_sources_append_rows_in_order_and_retain_source_identity() {
 			.iter()
 			.map(|row| row[source_index].as_slice())
 			.collect::<Vec<_>>(),
-		[b"0".as_slice(), b"0".as_slice(), b"1".as_slice(), b"1".as_slice()]
+		[
+			b"0".as_slice(),
+			b"0".as_slice(),
+			b"1".as_slice(),
+			b"1".as_slice()
+		]
 	);
 	assert_eq!(
 		dataset
@@ -248,7 +313,12 @@ fn declared_sources_append_rows_in_order_and_retain_source_identity() {
 			.iter()
 			.map(|row| row[value].as_slice())
 			.collect::<Vec<_>>(),
-		[b"10".as_slice(), b"11".as_slice(), b"20".as_slice(), b"21".as_slice()]
+		[
+			b"10".as_slice(),
+			b"11".as_slice(),
+			b"20".as_slice(),
+			b"21".as_slice()
+		]
 	);
 
 	let duplicate = distill_datasets([first.as_path(), first.as_path()], limits()).unwrap();
@@ -265,7 +335,12 @@ fn declared_sources_append_rows_in_order_and_retain_source_identity() {
 			.iter()
 			.map(|row| row[source_index].as_slice())
 			.collect::<Vec<_>>(),
-		[b"0".as_slice(), b"0".as_slice(), b"1".as_slice(), b"1".as_slice()]
+		[
+			b"0".as_slice(),
+			b"0".as_slice(),
+			b"1".as_slice(),
+			b"1".as_slice()
+		]
 	);
 }
 
@@ -295,7 +370,11 @@ fn declared_files_directories_and_zips_share_one_ordered_source_list() {
 	archive.write_all(b"value,label\n30,yes\n").unwrap();
 	archive.finish().unwrap();
 
-	let dataset = distill_datasets([first.as_path(), folder.as_path(), zip_path.as_path()], limits()).unwrap();
+	let dataset = distill_datasets(
+		[first.as_path(), folder.as_path(), zip_path.as_path()],
+		limits(),
+	)
+	.unwrap();
 	assert_eq!(dataset.file_count(), 3);
 	assert_eq!(dataset.sample_count(), 3);
 	let source_index = dataset

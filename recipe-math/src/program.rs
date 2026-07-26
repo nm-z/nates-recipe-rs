@@ -71,6 +71,12 @@ fn emit_function(
 			require_closed_interval(builder, x, -80.0, 80.0)?;
 			emit_exp_core(builder, x)
 		}
+		MathFunction::ExpWithGradualUnderflow => {
+			let zero = builder.f32(0.0)?;
+			let nonpositive = builder.binary(ScalarOpcode::LessThanOrEqual, x, zero)?;
+			require_condition(builder, nonpositive)?;
+			emit_exp_with_underflow(builder, x)
+		}
 		MathFunction::ExpMinusOne => {
 			require_closed_interval(builder, x, -80.0, 80.0)?;
 			let result = emit_expm1_core(builder, x)?;
@@ -344,7 +350,7 @@ fn emit_exp_with_underflow(
 	x: ScalarExpression,
 ) -> LanguageResult<ScalarExpression> {
 	let cutoff = builder.f32(EXP_HALF_MIN_SUBNORMAL_LOG)?;
-	let underflows = builder.binary(ScalarOpcode::LessThanOrEqual, x, cutoff)?;
+	let underflows = builder.binary(ScalarOpcode::LessThan, x, cutoff)?;
 	// Clamp before f32-to-i32 range reduction so a finite multiplication that
 	// overflowed toward negative infinity cannot enter numeric conversion.
 	let bounded = builder.binary(ScalarOpcode::Maximum, x, cutoff)?;

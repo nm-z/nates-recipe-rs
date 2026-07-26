@@ -175,27 +175,92 @@ fn run_source(path: &OsStr, arguments: &[OsString]) -> Result<(), String> {
 	let mut recipe_external = OsString::from("recipe=");
 	recipe_external.push(library.as_os_str());
 
-	let first = compile_run_source(&source, &binary, &library_root, &recipe_external, None)?;
+	let named_grad_rewrite = if let Some(probe) = crate::source_frontend::named_grad_probe(&source_text) {
+		let probe_source = TransformedRunSource::create(&source, sequence, probe.generated())?;
+		let probe_binary = run_root.join(format!("recipe-run-{}-{sequence}-named-grad-probe", std::process::id()));
+		let probe_output = compile_run_source(
+			probe_source.path(),
+			&probe_binary,
+			&library_root,
+			&recipe_external,
+			None,
+		)?;
+		if let Err(error) = fs::remove_file(&probe_binary)
+			&& error.kind() != std::io::ErrorKind::NotFound
+		{
+			return Err(format!(
+				"remove named-gradient probe binary {}: {error}",
+				probe_binary.display()
+			));
+		}
+		let probe_diagnostics = crate::source_frontend::DiagnosticStream::parse(&probe_output.stderr);
+		let rewrite = crate::source_frontend::named_grad_rewrite(
+			&source,
+			probe_source.path(),
+			&probe,
+			&probe_diagnostics,
+		)?;
+		drop(probe_source);
+		rewrite
+	} else {
+		None
+	};
+	let named_grad_source = named_grad_rewrite
+		.as_ref()
+		.map(|rewrite| TransformedRunSource::create(&source, sequence, rewrite.generated()))
+		.transpose()?;
+	let compiler_source = named_grad_source
+		.as_ref()
+		.map_or(source.as_path(), |transformed| transformed.path());
+	let compiler_text = named_grad_rewrite
+		.as_ref()
+		.map_or(source_text.as_str(), |rewrite| rewrite.generated());
+	let remap = named_grad_source
+		.as_ref()
+		.map(|transformed| (source.as_path(), transformed.path()));
+	let diagnostic_source = if named_grad_source.is_some() {
+		source.as_path()
+	} else {
+		compiler_source
+	};
+
+	let first = compile_run_source(compiler_source, &binary, &library_root, &recipe_external, remap)?;
 	let first_diagnostics = crate::source_frontend::DiagnosticStream::parse(&first.stderr);
 	let compile_status = if first.status.success() {
-		emit_compiler_output(&first.stdout, &first_diagnostics.original_rendering())?;
+		let rendering = match (&named_grad_rewrite, &named_grad_source) {
+			(Some(rewrite), Some(transformed)) => first_diagnostics.mapped_rendering(rewrite, transformed.path(), &source),
+			_ => first_diagnostics.original_rendering(),
+		};
+		emit_compiler_output(&first.stdout, &rendering)?;
 		first.status
-	} else if let Some(rewrite) = crate::source_frontend::arity_rewrite(&source, &source_text, &first_diagnostics) {
+	} else if let Some(rewrite) =
+		crate::source_frontend::arity_rewrite(diagnostic_source, compiler_text, &first_diagnostics)
+	{
 		let _ = fs::remove_file(&binary);
-		let transformed = TransformedRunSource::create(&source, sequence, rewrite.generated())?;
+		let transformed = TransformedRunSource::create(compiler_source, sequence, rewrite.generated())?;
 		let second = compile_run_source(
 			transformed.path(),
 			&binary,
 			&library_root,
 			&recipe_external,
-			Some((&source, transformed.path())),
+			Some((compiler_source, transformed.path())),
 		)?;
 		let second_diagnostics = crate::source_frontend::DiagnosticStream::parse(&second.stderr);
-		let rendering = second_diagnostics.mapped_rendering(&rewrite, transformed.path(), &source);
+		let rendering = match (&named_grad_rewrite, &named_grad_source) {
+			(Some(named_rewrite), Some(named_source)) => second_diagnostics.mapped_rendering_chain(&[
+				(&rewrite, transformed.path(), compiler_source),
+				(named_rewrite, named_source.path(), &source),
+			]),
+			_ => second_diagnostics.mapped_rendering(&rewrite, transformed.path(), &source),
+		};
 		emit_compiler_output(&second.stdout, &rendering)?;
 		second.status
 	} else {
-		emit_compiler_output(&first.stdout, &first_diagnostics.original_rendering())?;
+		let rendering = match (&named_grad_rewrite, &named_grad_source) {
+			(Some(rewrite), Some(transformed)) => first_diagnostics.mapped_rendering(rewrite, transformed.path(), &source),
+			_ => first_diagnostics.original_rendering(),
+		};
+		emit_compiler_output(&first.stdout, &rendering)?;
 		first.status
 	};
 	if !compile_status.success() {

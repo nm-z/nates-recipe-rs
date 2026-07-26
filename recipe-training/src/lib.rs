@@ -11,20 +11,21 @@
 //! latch, and bounded post-training temperature scaling use the same static
 //! lifecycle without loop-phase host transfers.
 
+pub mod bayes;
 mod checkpoint;
 mod compile;
 mod error;
 mod execute;
 mod inference;
 mod model;
-pub mod bayes;
 
 pub use checkpoint::{
-	CheckpointArtifact, CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointDecodeError,
-	CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError, CheckpointImageMetadata,
-	CheckpointBlockImage, CheckpointLayerImage, CheckpointManifest, CheckpointParameterImage, CheckpointPath,
-	CheckpointPathSegment, CheckpointResidualBranchImage, CheckpointResidualImage, CheckpointResidualSkipImage,
-	CheckpointResult, CheckpointTensorImage, CheckpointVectorSchema, CompletedTrainingCheckpoint, decode_checkpoint,
+	CheckpointArtifact, CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointBlockImage,
+	CheckpointDecodeError, CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError,
+	CheckpointImageMetadata, CheckpointLayerImage, CheckpointManifest, CheckpointParameterImage, CheckpointPath,
+	CheckpointPathSegment, CheckpointPoolImage, CheckpointResidualBranchImage, CheckpointResidualImage,
+	CheckpointResidualSkipImage, CheckpointResult, CheckpointTensorImage, CheckpointVectorSchema,
+	CompletedTrainingCheckpoint, decode_checkpoint,
 };
 pub use compile::{
 	compile_dense_training, compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
@@ -33,23 +34,30 @@ pub use compile::{
 };
 pub use error::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult};
 pub use execute::{
-	CompletedTrainingExecution, FinalTrainingMetric, TrainingExecutionError, TrainingExecutionLimits,
-	TrainingExecutionResult, TrainingMetricObserver, TrainingMetricObserverStats, TrainingMetricSample,
-	bounded_training_metric_channel, build_training_device_images, prepare_and_execute_local_training,
-	prepare_and_execute_local_training_with_observer,
+	CompletedInferenceExecution, CompletedTrainingExecution, FinalTrainingMetric, InferenceExecutionError,
+	InferenceExecutionLimits, InferenceExecutionResult, InferencePrediction, InferenceRunFailure,
+	TrainingExecutionError, TrainingExecutionLimits, TrainingExecutionResult, TrainingMetricObserver,
+	TrainingMetricObserverStats, TrainingMetricSample, bounded_training_metric_channel,
+	build_inference_device_images, build_training_device_images, prepare_and_execute_local_inference,
+	prepare_and_execute_local_training, prepare_and_execute_local_training_with_observer,
 };
 pub use inference::{
-	InferencePreparationError, InferencePreparationResult, PreparedInference, load_and_prepare_checkpoint_inference,
-	load_checkpoint_file, prepare_checkpoint_inference, prepare_checkpoint_inference_table,
+	CompiledInference, InferenceCompileError, InferenceCompileErrorKind, InferenceCompileResult,
+	InferenceExternalInput, InferenceInputRole, InferenceOutputContract, InferencePredictionKind,
+	InferencePreparationError, InferencePreparationResult, PreparedInference, compile_prepared_inference,
+	load_and_prepare_checkpoint_inference, load_checkpoint_file, prepare_checkpoint_inference,
+	prepare_checkpoint_inference_table,
 };
 pub use model::{
 	AdamWConfig, BinaryMetricOutputs, BinaryValidationConfig, BinaryValidationOutputs, CompiledDatasetSchema,
-	CompiledFeatureSpan, CompiledTraining, DataNormalizationState, DecodedMulticlassClass, DenseActivation, DenseBlock,
-	DenseBlockKind, DenseBlockState, DenseDataNormalization, DenseFeatureLowering, DenseLayer, DenseLayerState, DenseLoss,
-	DenseNormalization, DenseOperation, DenseOutputAdapter, DenseResidual, DenseResidualOperation, DenseResidualState,
-	DenseTask, DenseTrainingConfig, EarlyStoppingState, ExternalInputRole,
-	LearningRateDecay, MinMaxState, MulticlassMetricOutputs, MulticlassValidationConfig,
-	MulticlassValidationOutputs, OwnedExternalInput, ParameterState, REMAINING_UNSUPPORTED, RecallMetricOutput,
-	TemperatureScalingConfig, TemperatureScalingState, TrainingBounds, TrainingMetricBinding, TrainingMetricKind,
-	TrainingOutputs, UnsupportedTrainingFeature, ZScoreState,
+	CompiledFeatureSpan, CompiledTraining, DataNormalizationState, DecodedMulticlassClass, DenseActivation,
+	DenseBlock, DenseBlockKind, DenseBlockState, DenseDataNormalization, DenseFeatureLowering,
+	DenseGroupToNeuronRouting, DenseLayer, DenseLayerState, DenseLoss, DenseNormalization, DenseOperation,
+	DenseOutputAdapter, DensePool, DensePoolGroupOrder, DensePoolState, DensePoolWinnerContract, DenseResidual,
+	DenseResidualOperation, DenseResidualState, DenseTask, DenseTrainingConfig, EarlyStoppingState,
+	ExternalInputRole, LearningRateDecay, MinMaxState, MulticlassMetricOutputs, MulticlassValidationConfig,
+	MulticlassValidationOutputs, OptimizerProgressState, OwnedExternalInput, ParameterState, REMAINING_UNSUPPORTED,
+	RecallMetricOutput, TemperatureScalingConfig, TemperatureScalingState, TrainingBounds, TrainingMetricBinding,
+	TrainingMetricKind, TrainingOutputs, UnsupportedTrainingFeature, ValidationMetricFamily, ValidationMetricStatus,
+	ValidationUnavailableReason, ZScoreState,
 };

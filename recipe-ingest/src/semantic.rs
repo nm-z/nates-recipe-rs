@@ -610,6 +610,25 @@ pub(crate) fn ordinal_vocabulary(values: &[&[u8]]) -> Option<&'static [&'static 
 	})
 }
 
+/// Resolve one ordinal vocabulary from fit-partition values only.
+///
+/// A single fit label is sufficient when it identifies exactly one declared
+/// order. Ambiguous or empty fit evidence deliberately chooses no vocabulary;
+/// validation labels never participate in disambiguation.
+pub(crate) fn fit_ordinal_vocabulary(values: &[&[u8]]) -> Option<&'static [&'static [u8]]> {
+	if values.is_empty() {
+		return None;
+	}
+	let mut candidates = ORDINAL_VOCABULARIES.iter().copied().filter(|order| {
+		values.iter().all(|value| {
+			order.iter()
+				.any(|candidate| value.eq_ignore_ascii_case(candidate))
+		})
+	});
+	let vocabulary = candidates.next()?;
+	(!candidates.any(|_| true)).then_some(vocabulary)
+}
+
 fn is_ordinal_vector(values: &[&[u8]]) -> bool {
 	ordinal_vocabulary(values).is_some()
 }

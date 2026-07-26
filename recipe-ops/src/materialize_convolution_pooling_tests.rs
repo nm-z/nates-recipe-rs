@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 
-use recipe_core::{ByteCount, DType, KernelTemplateId, ValueId};
-use recipe_language::{AtomicOperation, PrimitiveKind, ScatterConflict, Shape, Tensor};
+use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarLiteral, ScalarOpcode, ValueId};
+use recipe_language::{AtomicOperation, PrimitiveKind, ReduceOperator, ReduceResult, ScatterConflict, Shape, Tensor};
+use recipe_primitives::{ReductionTieBreak, StageKind};
 
 use crate::{
 	IdentityNamespace, MaterializationRequest, NamedTensor, OperationErrorKind, PreparedParameter,
-	PreparedParameters, materialize_composition, operation_registry,
+	PreparedParameters, channelwise_max_pool_1d_backward_descriptor, channelwise_max_pool_1d_descriptor,
+	materialize_composition, operation_registry, prepare_channelwise_max_pool_1d,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -577,6 +580,205 @@ fn materializes_every_max_pool_backward_alias_with_explicit_race_policy() -> Tes
 			_ => return Err("two-dimensional max backward did not scatter".into()),
 		}
 	}
+	Ok(())
+}
+
+#[test]
+fn materializes_channelwise_nonoverlapping_max_pool_with_short_tail_and_global_winners() -> TestResult {
+	let preparation = prepare_channelwise_max_pool_1d(2, 5, 2, 3)?;
+	let values = input_tensor(101, DType::F32, &preparation.input_shape())?;
+	let indices = input_tensor(102, DType::I32, &preparation.window_indices_shape())?;
+	let bases = input_tensor(103, DType::I32, &preparation.output_shape())?;
+	let pooled = output_tensor(104, DType::F32, &preparation.output_shape())?;
+	let winners = output_tensor(105, DType::I32, &preparation.output_shape())?;
+	let inputs = [
+		NamedTensor::new("values", &values),
+		NamedTensor::new("window_indices", &indices),
+		NamedTensor::new("winner_bases", &bases),
+	];
+	let outputs = [
+		NamedTensor::new("pooled", &pooled),
+		NamedTensor::new("winning_indices", &winners),
+	];
+	let materialized = materialize_composition(MaterializationRequest::new(
+		channelwise_max_pool_1d_descriptor(),
+		&inputs,
+		&outputs,
+		"values",
+		&preparation.forward_parameters(4),
+		namespace(80_000),
+		preparation.forward_workspace(),
+	))?;
+	assert_graph(&materialized, 160, 3)?;
+
+	let reduction = materialized
+		.graph()
+		.nodes
+		.iter()
+		.find(|node| matches!(node.kernel.kind, PrimitiveKind::Reduce(_)))
+		.ok_or("channelwise pool omitted its maximum reduction")?;
+	let PrimitiveKind::Reduce(spec) = &reduction.kernel.kind else {
+		unreachable!();
+	};
+	assert_eq!(spec.operator, ReduceOperator::Maximum);
+	assert_eq!(spec.result, ReduceResult::ValueAndIndex);
+	assert_eq!(spec.axes.as_slice(), [3]);
+	let PrimitiveKind::Elementwise(result_map) = &materialized.graph().nodes[2].kernel.kind else {
+		return Err("channelwise pool omitted its global-winner map".into());
+	};
+	assert_eq!(
+		result_map
+			.program
+			.constants
+			.iter()
+			.map(|constant| constant.value)
+			.collect::<Vec<_>>(),
+		[ScalarLiteral::I32(2)]
+	);
+	assert_eq!(
+		result_map
+			.program
+			.instructions
+			.iter()
+			.map(|instruction| instruction.opcode)
+			.collect::<Vec<_>>(),
+		[ScalarOpcode::Multiply, ScalarOpcode::Add]
+	);
+	let tensors = materialized
+		.graph()
+		.tensors
+		.iter()
+		.map(|tensor| (tensor.id, tensor))
+		.collect::<BTreeMap<_, _>>();
+	let lowered = recipe_primitives::lower(&reduction.kernel, &tensors)?;
+	assert!(lowered.stages.iter().all(|stage| match &stage.kind {
+		StageKind::FixedTreeReduce(stage) => stage.tie_break == ReductionTieBreak::LowestLogicalIndex,
+		_ => false,
+	}));
+	Ok(())
+}
+
+#[test]
+fn materializes_channelwise_max_pool_backward_as_one_unique_global_scatter() -> TestResult {
+	let preparation = prepare_channelwise_max_pool_1d(2, 5, 2, 3)?;
+	let output_gradient = input_tensor(111, DType::F32, &preparation.output_shape())?;
+	let winners = input_tensor(112, DType::I32, &preparation.output_shape())?;
+	let batch_indices = input_tensor(113, DType::I32, &[preparation.batch()])?;
+	let base = input_tensor(114, DType::F32, &preparation.input_shape())?;
+	let input_gradient = output_tensor(115, DType::F32, &preparation.input_shape())?;
+	let inputs = [
+		NamedTensor::new("output_gradient", &output_gradient),
+		NamedTensor::new("winning_indices", &winners),
+		NamedTensor::new("gradient_batch_indices", &batch_indices),
+		NamedTensor::new("input_gradient_base", &base),
+	];
+	let outputs = [NamedTensor::new("input_gradient", &input_gradient)];
+	let materialized = materialize_composition(MaterializationRequest::new(
+		channelwise_max_pool_1d_backward_descriptor(),
+		&inputs,
+		&outputs,
+		"output_gradient",
+		&preparation.backward_parameters(),
+		namespace(82_000),
+		preparation.backward_workspace(),
+	))?;
+	assert_graph(&materialized, 96, 3)?;
+	let PrimitiveKind::Scatter(scatter) = materialized.graph().nodes[2].kernel.kind else {
+		return Err("channelwise maximum-pool backward did not scatter".into());
+	};
+	assert_eq!(scatter.conflict, ScatterConflict::UniqueIndices);
+	Ok(())
+}
+
+#[test]
+fn materializes_size_one_as_shape_preserving_forward_and_backward() -> TestResult {
+	let preparation = prepare_channelwise_max_pool_1d(2, 3, 2, 1)?;
+	let values = input_tensor(131, DType::F32, &preparation.input_shape())?;
+	let indices = input_tensor(132, DType::I32, &preparation.window_indices_shape())?;
+	let bases = input_tensor(133, DType::I32, &preparation.output_shape())?;
+	let pooled = output_tensor(134, DType::F32, &preparation.output_shape())?;
+	let winners = output_tensor(135, DType::I32, &preparation.output_shape())?;
+	let forward_inputs = [
+		NamedTensor::new("values", &values),
+		NamedTensor::new("window_indices", &indices),
+		NamedTensor::new("winner_bases", &bases),
+	];
+	let forward_outputs = [
+		NamedTensor::new("pooled", &pooled),
+		NamedTensor::new("winning_indices", &winners),
+	];
+	let forward = materialize_composition(MaterializationRequest::new(
+		channelwise_max_pool_1d_descriptor(),
+		&forward_inputs,
+		&forward_outputs,
+		"values",
+		&preparation.forward_parameters(1),
+		namespace(86_000),
+		preparation.forward_workspace(),
+	))?;
+	assert_eq!(preparation.output_shape(), [2, 3, 2]);
+	assert_graph(&forward, 144, 3)?;
+
+	let output_gradient = input_tensor(141, DType::F32, &preparation.output_shape())?;
+	let winners = input_tensor(142, DType::I32, &preparation.output_shape())?;
+	let batch_indices = input_tensor(143, DType::I32, &[preparation.batch()])?;
+	let gradient_base = input_tensor(144, DType::F32, &preparation.input_shape())?;
+	let input_gradient = output_tensor(145, DType::F32, &preparation.input_shape())?;
+	let backward_inputs = [
+		NamedTensor::new("output_gradient", &output_gradient),
+		NamedTensor::new("winning_indices", &winners),
+		NamedTensor::new("gradient_batch_indices", &batch_indices),
+		NamedTensor::new("input_gradient_base", &gradient_base),
+	];
+	let backward_outputs = [NamedTensor::new("input_gradient", &input_gradient)];
+	let backward = materialize_composition(MaterializationRequest::new(
+		channelwise_max_pool_1d_backward_descriptor(),
+		&backward_inputs,
+		&backward_outputs,
+		"output_gradient",
+		&preparation.backward_parameters(),
+		namespace(88_000),
+		preparation.backward_workspace(),
+	))?;
+	assert_graph(&backward, 144, 3)
+}
+
+#[test]
+fn channelwise_pool_requires_the_exact_tail_proof() -> TestResult {
+	let preparation = prepare_channelwise_max_pool_1d(1, 5, 2, 2)?;
+	let values = input_tensor(121, DType::F32, &preparation.input_shape())?;
+	let indices = input_tensor(122, DType::I32, &preparation.window_indices_shape())?;
+	let bases = input_tensor(123, DType::I32, &preparation.output_shape())?;
+	let pooled = output_tensor(124, DType::F32, &preparation.output_shape())?;
+	let winners = output_tensor(125, DType::I32, &preparation.output_shape())?;
+	let inputs = [
+		NamedTensor::new("values", &values),
+		NamedTensor::new("window_indices", &indices),
+		NamedTensor::new("winner_bases", &bases),
+	];
+	let outputs = [
+		NamedTensor::new("pooled", &pooled),
+		NamedTensor::new("winning_indices", &winners),
+	];
+	let mut parameters = preparation.forward_parameters(4);
+	parameters.insert(
+		"tail_window_repeats_last_coordinate".to_owned(),
+		PreparedParameter::Bool(false),
+	);
+	let error = materialize_composition(MaterializationRequest::new(
+		channelwise_max_pool_1d_descriptor(),
+		&inputs,
+		&outputs,
+		"values",
+		&parameters,
+		namespace(84_000),
+		preparation.forward_workspace(),
+	))
+	.expect_err("channelwise pool accepted an unproved short-tail table");
+	assert_eq!(
+		error.kind,
+		OperationErrorKind::InvalidMaterializationRequest
+	);
 	Ok(())
 }
 

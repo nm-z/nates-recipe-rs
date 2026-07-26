@@ -336,7 +336,8 @@ fn public_no_show_training_declaration_compiles_to_the_static_program() {
 		.exclude(recipe::cond!(Age < 0))
 		.norm(recipe::z_score)
 		.split(0.8);
-	let model = recipe::recipe.model()
+	let model = recipe::recipe
+		.model()
 		.layer(128)
 		.silu()
 		.layer(128)
@@ -554,14 +555,6 @@ fn facade_builders_are_immutable_validated_declarations() {
 		Some(recipe::DataNormalization::MinMax)
 	);
 
-	let model = recipe::recipe
-		.model()
-		.layer(32)
-		.relu()
-		.embed(8)
-		.vocab(1024)
-		.attn(4)
-		.loss(recipe::mse);
 	let train = recipe::recipe
 		.train()
 		.epochs(3)
@@ -679,37 +672,86 @@ fn facade_builders_are_immutable_validated_declarations() {
 		]
 	);
 
+	let declare_inference_sequence = || {
+		let data = recipe::recipe
+			.data("not-opened.csv")
+			.set("also-not-opened.csv")
+			.target(["label", "weight"])
+			.exclude("ignored_*")
+			.norm(recipe::min_max)
+			.split(0.8);
+		let model = recipe::recipe
+			.model()
+			.layer(32)
+			.relu()
+			.embed(8)
+			.vocab(1024)
+			.attn(4)
+			.loss(recipe::mse);
+		(data, model)
+	};
+	let (inference_data, inference_model) = declare_inference_sequence();
 	let inference = recipe::recipe
 		.infer()
-		.log([recipe::Time])
-		.evaluate(&prepared_data, &model)
+		.log([recipe::Time, recipe::Device])
+		.evaluate()
 		.expect("valid inference declaration");
-	assert_eq!(inference.data(), Some(&prepared_data));
-	assert_eq!(inference.model(), &model);
-	assert_eq!(inference.policy().log_items(), [recipe::Time]);
+	assert_eq!(inference.data(), Some(&inference_data));
+	assert_eq!(inference.model(), &inference_model);
 	assert_eq!(
-		recipe::recipe.infer().log(recipe::Loss).log_items(),
-		[recipe::Loss]
+		inference.policy().log_items(),
+		[recipe::Time, recipe::Device]
 	);
+	let (_inference_data, _inference_model) = declare_inference_sequence();
+	let target_derived = recipe::recipe.infer().log(recipe::Loss);
+	assert_eq!(target_derived.log_items(), [recipe::Loss]);
+	let error = target_derived
+		.evaluate()
+		.expect_err("target-free inference accepted a target-derived metric");
 	assert_eq!(
-		recipe::recipe
-			.infer()
-			.log([recipe::Loss, recipe::Accuracy, recipe::AuPrc])
-			.log_items(),
+		error.kind,
+		recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+	);
+	assert!(error.detail.starts_with("Loss:"));
+	let (_inference_data, _inference_model) = declare_inference_sequence();
+	let target_derived = recipe::recipe
+		.infer()
+		.log([recipe::Loss, recipe::Accuracy, recipe::AuPrc]);
+	assert_eq!(
+		target_derived.log_items(),
 		[recipe::Loss, recipe::Accuracy, recipe::AuPrc]
 	);
+	assert_eq!(
+		target_derived
+			.evaluate()
+			.expect_err("target-free inference accepted target-derived metrics")
+			.kind,
+		recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+	);
+	for training_only in [recipe::Epoch, recipe::Lr] {
+		let (_inference_data, _inference_model) = declare_inference_sequence();
+		assert_eq!(
+			recipe::recipe
+				.infer()
+				.log(training_only)
+				.evaluate()
+				.expect_err("inference accepted a training-only metric")
+				.kind,
+			recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+		);
+	}
 }
 
 #[test]
 fn model_bayes_declares_the_requested_ordered_acyclic_graph() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe
 		.model()
 		.bayes("housing", ["age", "job"])
 		.bayes("loan", ["income", "housing"])
 		.bayes("y", ["loan", "housing", "balance"]);
 
-	assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 	let declarations = model
 		.bayes_dependencies()
 		.iter()
@@ -736,14 +778,14 @@ fn model_bayes_declares_the_requested_ordered_acyclic_graph() {
 
 #[test]
 fn model_bayes_allows_forward_declarations_and_shared_parents() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe
 		.model()
 		.bayes("loan", ["income", "housing"])
 		.bayes("approval", ["housing", "loan"])
 		.bayes("housing", ["employment", "income"]);
 
-	assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 	let declarations = model
 		.bayes_dependencies()
 		.iter()
@@ -770,28 +812,30 @@ fn model_bayes_allows_forward_declarations_and_shared_parents() {
 
 #[test]
 fn model_bayes_rejects_invalid_names_and_parent_lists() {
-	let data = recipe::recipe.data("not-opened");
-	for (model, detail) in [
+	let cases: [(fn(recipe::Model) -> recipe::Model, &str); 4] = [
 		(
-			recipe::recipe.model().bayes("", ["age"]),
+			|model| model.bayes("", ["age"]),
 			"Bayesian child name is empty",
 		),
 		(
-			recipe::recipe.model().bayes("housing", [""]),
+			|model| model.bayes("housing", [""]),
 			"Bayesian dependency for \"housing\" contains an empty parent name",
 		),
 		(
-			recipe::recipe.model().bayes("housing", ["housing"]),
+			|model| model.bayes("housing", ["housing"]),
 			"Bayesian dependency \"housing\" cannot name itself as a parent",
 		),
 		(
-			recipe::recipe.model().bayes("housing", ["age", "age"]),
+			|model| model.bayes("housing", ["age", "age"]),
 			"Bayesian dependency \"housing\" contains a duplicate parent",
 		),
-	] {
+	];
+	for (declare_model, detail) in cases {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_model(recipe::recipe.model());
 		let error = recipe::recipe
 			.infer()
-			.evaluate(&data, &model)
+			.evaluate()
 			.expect_err("invalid Bayesian declaration was accepted");
 		assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidBayes);
 		assert_eq!(error.detail, detail);
@@ -800,7 +844,7 @@ fn model_bayes_rejects_invalid_names_and_parent_lists() {
 
 #[test]
 fn model_bayes_rejects_a_second_declaration_for_the_same_child() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe
 		.model()
 		.bayes("housing", ["age"])
@@ -808,7 +852,7 @@ fn model_bayes_rejects_a_second_declaration_for_the_same_child() {
 
 	let error = recipe::recipe
 		.infer()
-		.evaluate(&data, &model)
+		.evaluate()
 		.expect_err("duplicate Bayesian child was accepted");
 	assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidBayes);
 	assert_eq!(
@@ -820,7 +864,7 @@ fn model_bayes_rejects_a_second_declaration_for_the_same_child() {
 
 #[test]
 fn model_bayes_rejects_cycles_completed_through_forward_references() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe
 		.model()
 		.bayes("loan", ["housing"])
@@ -829,7 +873,7 @@ fn model_bayes_rejects_cycles_completed_through_forward_references() {
 
 	let error = recipe::recipe
 		.infer()
-		.evaluate(&data, &model)
+		.evaluate()
 		.expect_err("cyclic Bayesian network was accepted");
 	assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidBayes);
 	assert_eq!(error.detail, "Bayesian dependencies contain a cycle");
@@ -838,26 +882,187 @@ fn model_bayes_rejects_cycles_completed_through_forward_references() {
 
 #[test]
 fn model_load_is_a_recipe_model_chain_method() {
-	let data = recipe::recipe.data("not-opened");
-	let model = recipe::recipe.model().load("weights.ogdl", 32);
+	let _data = recipe::recipe.data("not-opened");
+	let model = recipe::recipe.model().load("weights.ogdl");
 
 	assert_eq!(model.weights_source(), Some("weights.ogdl"));
-	assert_eq!(model.input_width(), Some(32));
-	assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 
-	for invalid in [
-		recipe::recipe.model().load("", 32),
-		recipe::recipe.model().load("weights.ogdl", 0),
-	] {
+	let _data = recipe::recipe.data("not-opened");
+	let _invalid = recipe::recipe.model().load("");
+	assert_eq!(
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("empty model checkpoint path was accepted")
+			.kind,
+		recipe::DeclarationErrorKind::EmptyValue,
+	);
+
+	let conflicting_declarations: [fn(recipe::Model) -> recipe::Model; 4] = [
+		|model| model.layer(1),
+		|model| model.bayes("loan", ["income"]),
+		|model| model.loss(recipe::mse),
+		|model| model.grad(recipe::clip(1.0)),
+	];
+	for declare_conflict in conflicting_declarations {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_conflict(recipe::recipe.model().load("weights.ogdl"));
+		let error = recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("checkpoint-backed model accepted another declaration");
+		assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidLayer);
 		assert_eq!(
-			recipe::recipe
-				.infer()
-				.evaluate(&data, &invalid)
-				.expect_err("invalid model load was accepted")
-				.kind,
-			recipe::DeclarationErrorKind::EmptyValue,
+			error.detail,
+			"a checkpoint-backed model cannot also declare layers, Bayesian dependencies, a loss, or gradient policy"
 		);
 	}
+	for declare_conflict in conflicting_declarations {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_conflict(recipe::recipe.model()).load("weights.ogdl");
+		let error = recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("a declared model accepted a checkpoint source");
+		assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidLayer);
+		assert_eq!(
+			error.detail,
+			"a checkpoint-backed model cannot also declare layers, Bayesian dependencies, a loss, or gradient policy"
+		);
+	}
+
+	let _data = recipe::recipe.data("not-opened");
+	let _model = recipe::recipe
+		.model()
+		.load("first.ogdl")
+		.load("second.ogdl");
+	let error = recipe::recipe
+		.infer()
+		.evaluate()
+		.expect_err("a second checkpoint source was accepted");
+	assert_eq!(error.kind, recipe::DeclarationErrorKind::InvalidLayer);
+	assert_eq!(
+		error.detail,
+		"a model accepts exactly one checkpoint source"
+	);
+}
+
+#[test]
+fn inference_requires_a_fresh_data_then_model_sequence() {
+	let missing_data = std::thread::spawn(|| {
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("inference without data was accepted")
+	})
+	.join()
+	.expect("missing-data diagnostic thread");
+	assert_eq!(
+		missing_data.kind,
+		recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+	);
+	assert_eq!(
+		missing_data.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration"
+	);
+
+	let missing_model = std::thread::spawn(|| {
+		let _data = recipe::recipe.data("not-opened");
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("inference without a model was accepted")
+	})
+	.join()
+	.expect("missing-model diagnostic thread");
+	assert_eq!(
+		missing_model.kind,
+		recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+	);
+	assert_eq!(
+		missing_model.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.model() declaration"
+	);
+
+	let missing_after_success = std::thread::spawn(|| {
+		recipe::recipe.data("not-opened");
+		recipe::recipe.model().layer(1);
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect("complete inference sequence");
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("a successful inference sequence was reusable")
+	})
+	.join()
+	.expect("successful-consumption diagnostic thread");
+	assert_eq!(
+		missing_after_success.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration"
+	);
+
+	let missing_after_policy_error = std::thread::spawn(|| {
+		recipe::recipe.data("not-opened");
+		recipe::recipe.model().layer(1);
+		let policy_error = recipe::recipe
+			.infer()
+			.log(recipe::Loss)
+			.evaluate()
+			.expect_err("target-derived inference logging was accepted");
+		let reuse_error = recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("a policy-rejected inference sequence was reusable");
+		(policy_error, reuse_error)
+	})
+	.join()
+	.expect("policy-error consumption diagnostic thread");
+	assert_eq!(
+		missing_after_policy_error.0.kind,
+		recipe::DeclarationErrorKind::InvalidInferenceConfiguration,
+	);
+	assert_eq!(
+		missing_after_policy_error.1.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration"
+	);
+
+	let missing_after_incomplete_sequence = std::thread::spawn(|| {
+		recipe::recipe.data("not-opened");
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("inference without a model was accepted");
+		recipe::recipe.model().layer(1);
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("an incomplete inference sequence retained its data")
+	})
+	.join()
+	.expect("incomplete-consumption diagnostic thread");
+	assert_eq!(
+		missing_after_incomplete_sequence.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration"
+	);
+
+	let data_mutation_error = std::thread::spawn(|| {
+		let data = recipe::recipe.data("first.csv");
+		recipe::recipe.model().layer(1);
+		data.set("second.csv");
+		recipe::recipe
+			.infer()
+			.evaluate()
+			.expect_err("data changed after its model without requiring a new model")
+	})
+	.join()
+	.expect("data-mutation ordering diagnostic thread");
+	assert_eq!(
+		data_mutation_error.detail,
+		"recipe.infer().evaluate() requires a preceding recipe.model() declaration"
+	);
 }
 
 #[test]
@@ -973,7 +1178,7 @@ fn model_preserves_convolution_pooling_and_boosted_tree_composition() {
 
 #[test]
 fn kmeans_followed_by_an_equal_width_layer_records_the_exact_identity_mapping() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe.model().kmeans(4).layer(4);
 
 	let connection = match &model.layers()[0] {
@@ -989,12 +1194,12 @@ fn kmeans_followed_by_an_equal_width_layer_records_the_exact_identity_mapping() 
 		connection.routing(4),
 		Some(recipe::GroupToNeuronRouting::Identity { width: 4 })
 	);
-	assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 }
 
 #[test]
 fn knn_arities_preserve_prediction_and_reduction_identity() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let prediction = recipe::recipe.model().knn(5);
 	let reduction = recipe::recipe
 		.model()
@@ -1017,18 +1222,29 @@ fn knn_arities_preserve_prediction_and_reduction_identity() {
 			],
 		}]
 	);
-	assert!(recipe::recipe.infer().evaluate(&data, &prediction).is_ok());
-	assert!(recipe::recipe.infer().evaluate(&data, &reduction).is_ok());
+	let _data = recipe::recipe.data("not-opened");
+	let _prediction = recipe::recipe.model().knn(5);
+	assert!(recipe::recipe.infer().evaluate().is_ok());
+	let _data = recipe::recipe.data("not-opened");
+	let _reduction = recipe::recipe
+		.model()
+		.knn([8, 3])
+		.norm(recipe::layer_norm)
+		.silu();
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 
-	for invalid in [
-		recipe::recipe.model().knn(0),
-		recipe::recipe.model().knn([0, 3]),
-		recipe::recipe.model().knn([8, 0]),
-	] {
+	let invalid_declarations: [fn(recipe::Model) -> recipe::Model; 3] = [
+		|model| model.knn(0),
+		|model| model.knn([0, 3]),
+		|model| model.knn([8, 0]),
+	];
+	for declare_invalid in invalid_declarations {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_invalid(recipe::recipe.model());
 		assert_eq!(
 			recipe::recipe
 				.infer()
-				.evaluate(&data, &invalid)
+				.evaluate()
 				.expect_err("zero KNN dimension was accepted")
 				.kind,
 			recipe::DeclarationErrorKind::InvalidLayer,
@@ -1038,7 +1254,7 @@ fn knn_arities_preserve_prediction_and_reduction_identity() {
 
 #[test]
 fn residual_branch_preserves_order_width_and_projection_rule() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let model = recipe::recipe
 		.model()
 		.residual([recipe::layer(64), recipe::relu()])
@@ -1063,7 +1279,7 @@ fn residual_branch_preserves_order_width_and_projection_rule() {
 			},
 		]
 	);
-	assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+	assert!(recipe::recipe.infer().evaluate().is_ok());
 	let preactivated = recipe::recipe.model().residual([
 		recipe::relu(),
 		recipe::layer(32),
@@ -1091,16 +1307,18 @@ fn residual_branch_preserves_order_width_and_projection_rule() {
 		}]
 	));
 
-	for invalid in [
-		recipe::recipe.model()
-			.residual([] as [recipe::ResidualOperation; 0]),
-		recipe::recipe.model()
-			.residual([recipe::layer(0), recipe::relu()]),
-		recipe::recipe.model().residual(recipe::relu()),
-	] {
+	let invalid_declarations: [fn(recipe::Model) -> recipe::Model; 3] = [
+		|model| model.residual([] as [recipe::ResidualOperation; 0]),
+		|model| model.residual([recipe::layer(0), recipe::relu()]),
+		|model| model.residual(recipe::relu()),
+	];
+	for declare_invalid in invalid_declarations {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_invalid(recipe::recipe.model());
 		assert_eq!(
-			recipe::recipe.infer()
-				.evaluate(&data, &invalid)
+			recipe::recipe
+				.infer()
+				.evaluate()
 				.expect_err("invalid residual branch was accepted")
 				.kind,
 			recipe::DeclarationErrorKind::InvalidLayer,
@@ -1111,17 +1329,20 @@ fn residual_branch_preserves_order_width_and_projection_rule() {
 #[test]
 fn residual_training_compiles_without_flattening_the_branch() {
 	let csv = Fixture::write("csv", b"feature,target\n1,2\n2,3\n3,4\n4,5\n");
-	let data = recipe::recipe.data(csv.path().to_str().unwrap())
+	let data = recipe::recipe
+		.data(csv.path().to_str().unwrap())
 		.target("target")
 		.norm(recipe::z_score)
 		.split(0.5);
-	let model = recipe::recipe.model()
+	let model = recipe::recipe
+		.model()
 		.residual([recipe::relu(), recipe::layer(64), recipe::relu()])
 		.norm(recipe::layer_norm)
 		.silu()
 		.layer(1)
 		.loss(recipe::mse);
-	let policy = recipe::recipe.train()
+	let policy = recipe::recipe
+		.train()
 		.optimizer(recipe::adamw)
 		.batch(0.5)
 		.epochs(1)
@@ -1161,20 +1382,74 @@ fn residual_training_compiles_without_flattening_the_branch() {
 }
 
 #[test]
+fn pool_training_compiles_as_a_structured_block_with_grouped_dense_routing() {
+	let csv = Fixture::write(
+		"csv",
+		b"a,b,c,d,target\n\
+		1,4,3,2,10\n\
+		2,5,4,3,11\n\
+		3,6,5,4,12\n\
+		4,7,6,5,13\n\
+		5,8,7,6,14\n\
+		6,9,8,7,15\n\
+		7,10,9,8,16\n\
+		8,11,10,9,17\n",
+	);
+	let data = recipe::recipe
+		.data(csv.path().to_str().unwrap())
+		.target("target")
+		.norm(recipe::z_score)
+		.split(0.75);
+	let model = recipe::recipe
+		.model()
+		.pool(2)
+		.layer(4)
+		.layer(1)
+		.loss(recipe::mse);
+	let policy = recipe::recipe
+		.train()
+		.optimizer(recipe::adamw)
+		.batch(0.5)
+		.epochs(1)
+		.lr(0.001)
+		.cos();
+
+	let compiled = recipe::compile_training(&policy, &data, &model).unwrap();
+	assert_eq!(compiled.blocks().len(), 3);
+	let recipe_training::DenseBlock::Pool(pool) = &compiled.blocks()[0] else {
+		panic!("public pool was flattened into an ordinary dense layer");
+	};
+	assert_eq!(pool.size().get(), 2);
+	assert_eq!(pool.group_to_neuron().unwrap().get(), 4);
+	assert!(matches!(
+		&compiled.blocks()[1],
+		recipe_training::DenseBlock::Layer(layer) if layer.width().get() == 4
+	));
+
+	let checkpoint = recipe_training::CheckpointManifest::from_compiled(&compiled).unwrap();
+	assert_eq!(checkpoint.format_version(), 7);
+	compiled.graph().validate().unwrap();
+	compiled.program().validate().unwrap();
+}
+
+#[test]
 fn residual_training_routes_binary_and_multiclass_validation() {
 	let binary_csv = Fixture::write(
 		"csv",
 		b"feature,target\n1,0\n2,1\n3,0\n4,1\n5,1\n6,0\n7,0\n8,1\n",
 	);
-	let binary_data = recipe::recipe.data(binary_csv.path().to_str().unwrap())
+	let binary_data = recipe::recipe
+		.data(binary_csv.path().to_str().unwrap())
 		.target("target")
 		.norm(recipe::z_score)
 		.split(0.75);
-	let binary_model = recipe::recipe.model()
+	let binary_model = recipe::recipe
+		.model()
 		.residual([recipe::layer(4), recipe::relu()])
 		.layer(1)
 		.loss(recipe::bce);
-	let binary_policy = recipe::recipe.train()
+	let binary_policy = recipe::recipe
+		.train()
 		.optimizer(recipe::adamw)
 		.batch(0.5)
 		.epochs(1)
@@ -1201,15 +1476,18 @@ fn residual_training_routes_binary_and_multiclass_validation() {
 		11,blue\n\
 		12,green\n",
 	);
-	let multiclass_data = recipe::recipe.data(multiclass_csv.path().to_str().unwrap())
+	let multiclass_data = recipe::recipe
+		.data(multiclass_csv.path().to_str().unwrap())
 		.target("target")
 		.norm(recipe::z_score)
 		.split(0.75);
-	let multiclass_model = recipe::recipe.model()
+	let multiclass_model = recipe::recipe
+		.model()
 		.residual([recipe::relu(), recipe::layer(4), recipe::relu()])
 		.silu()
 		.loss(recipe::ce);
-	let multiclass_policy = recipe::recipe.train()
+	let multiclass_policy = recipe::recipe
+		.train()
 		.optimizer(recipe::adamw)
 		.batch(0.5)
 		.epochs(1)
@@ -1219,13 +1497,16 @@ fn residual_training_routes_binary_and_multiclass_validation() {
 	let multiclass = recipe::compile_training(&multiclass_policy, &multiclass_data, &multiclass_model).unwrap();
 	assert!(multiclass.outputs().validation.is_none());
 	assert!(multiclass.outputs().multiclass_validation.is_some());
-	assert!(matches!(multiclass.blocks()[0], recipe_training::DenseBlock::Residual(_)));
+	assert!(matches!(
+		multiclass.blocks()[0],
+		recipe_training::DenseBlock::Residual(_)
+	));
 	assert!(multiclass.output_adapter().is_some());
 }
 
 #[test]
 fn grouped_blocks_record_divisible_and_fully_connected_dense_routing() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let cases = [
 		(
 			recipe::recipe.model().kmeans(4).layer(8),
@@ -1281,13 +1562,25 @@ fn grouped_blocks_record_divisible_and_fully_connected_dense_routing() {
 		};
 		assert_eq!(connection.groups(), declared_groups);
 		assert_eq!(connection.routing(resolved_groups), Some(expected_routing));
-		assert!(recipe::recipe.infer().evaluate(&data, &model).is_ok());
+		let _data = recipe::recipe.data("not-opened");
+		let _model = match &model.layers()[0] {
+			recipe::LayerSpec::KMeans { clusters, .. } => recipe::recipe
+				.model()
+				.kmeans(*clusters)
+				.layer(connection.neurons()),
+			recipe::LayerSpec::Pool { size, .. } => recipe::recipe
+				.model()
+				.pool(*size)
+				.layer(connection.neurons()),
+			other => panic!("unexpected grouped declaration: {other:?}"),
+		};
+		assert!(recipe::recipe.infer().evaluate().is_ok());
 	}
 }
 
 #[test]
 fn model_blocks_keep_post_block_operations_and_reject_zero_widths() {
-	let data = recipe::recipe.data("not-opened");
+	recipe::recipe.data("not-opened");
 	let operations = vec![
 		recipe::LayerOperation::Normalization(recipe::LayerNormalization::LayerNorm),
 		recipe::LayerOperation::Activation(recipe::Activation::Silu),
@@ -1328,29 +1621,32 @@ fn model_blocks_keep_post_block_operations_and_reject_zero_widths() {
 			},
 		]
 	);
-	for invalid in [
-		recipe::recipe.model().perc(0),
-		recipe::recipe.model().rnn(0),
-		recipe::recipe.model().gru(0),
-		recipe::recipe.model().lstm(0),
-		recipe::recipe.model().conv(0, 3),
-		recipe::recipe.model().conv(3, 0),
-		recipe::recipe.model().pool(0),
-		recipe::recipe.model().lgbm(0),
-		recipe::recipe.model().cbst(0),
-		recipe::recipe.model().xgbst(0),
-		recipe::recipe.model().forest(0).lgbm(3),
-		recipe::recipe.model().forest(3),
-		recipe::recipe.model().kmeans(0),
-		recipe::recipe.model().embed(0),
-		recipe::recipe.model().embed(8).vocab(0),
-		recipe::recipe.model().vocab(8),
-		recipe::recipe.model().attn(0),
-	] {
+	let invalid_declarations: [fn(recipe::Model) -> recipe::Model; 17] = [
+		|model| model.perc(0),
+		|model| model.rnn(0),
+		|model| model.gru(0),
+		|model| model.lstm(0),
+		|model| model.conv(0, 3),
+		|model| model.conv(3, 0),
+		|model| model.pool(0),
+		|model| model.lgbm(0),
+		|model| model.cbst(0),
+		|model| model.xgbst(0),
+		|model| model.forest(0).lgbm(3),
+		|model| model.forest(3),
+		|model| model.kmeans(0),
+		|model| model.embed(0),
+		|model| model.embed(8).vocab(0),
+		|model| model.vocab(8),
+		|model| model.attn(0),
+	];
+	for declare_invalid in invalid_declarations {
+		let _data = recipe::recipe.data("not-opened");
+		let _model = declare_invalid(recipe::recipe.model());
 		assert_eq!(
 			recipe::recipe
 				.infer()
-				.evaluate(&data, &invalid)
+				.evaluate()
 				.expect_err("zero-width block was accepted")
 				.kind,
 			recipe::DeclarationErrorKind::InvalidLayer,
@@ -1550,6 +1846,11 @@ fn main() {
 		recipe.model().residual(layer(16)).layers(),
 		[LayerSpec::Residual { output_width: 16, .. }]
 	));
+	recipe.data("inference.csv");
+	recipe.model().load("checkpoint.ogdl");
+	let inference = recipe.infer().evaluate().unwrap();
+	assert_eq!(inference.data().unwrap().sources(), ["inference.csv"]);
+	assert_eq!(inference.model().weights_source(), Some("checkpoint.ogdl"));
 }
 "#,
 	)
@@ -1700,7 +2001,13 @@ fn main() {
 
 #[test]
 fn facade_exposes_the_exact_normative_operation_registry() {
-	assert_eq!(recipe::operations::all().len(), 421);
+	let registry = recipe::operations::registry();
+	assert_eq!(registry.surface_len(), 421);
+	assert_eq!(registry.owned_len(), 2);
+	assert_eq!(
+		recipe::operations::all().len(),
+		registry.surface_len() + registry.owned_len()
+	);
 	assert_eq!(
 		recipe::operations::resolve("predict").unwrap_err().kind,
 		recipe::operations::OperationErrorKind::AmbiguousSymbol
@@ -1821,4 +2128,172 @@ fn facade_reaches_bounded_raw_model_format_framing() {
 		archive.encoded_tensor("weight"),
 		Some(1.0_f32.to_le_bytes().as_slice())
 	);
+}
+
+fn run_recipe_source_fixture(source_text: &str) -> (FixtureDirectory, PathBuf, std::process::Output) {
+	let root = FixtureDirectory::new();
+	let source = root.path().join("train.rs");
+	std::fs::write(&source, source_text).expect("write Recipe source-runner fixture");
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_recipe"))
+		.args(["run", source.to_str().expect("UTF-8 fixture path")])
+		.env("XDG_CACHE_HOME", root.path().join("cache"))
+		.output()
+		.expect("run Recipe source fixture");
+	(root, source, output)
+}
+
+#[test]
+fn binary_run_accepts_named_gradient_clip_with_a_nested_expression() {
+	let (root, _source, output) = run_recipe_source_fixture(
+		r#"fn main() {
+	let untouched = ".grad(clip: 99.0)";
+	// .grad(clip: 88.0) must remain a comment.
+	let data = recipe::recipe.data().set("first.csv");
+	assert_eq!(data.sources(), ["first.csv"]);
+	let scale: f64 = 0.25;
+	let model = recipe::recipe.model().loss(recipe::bce).grad(clip /* field comment */ : {
+		let base = 0.5;
+		(base + scale).min(1.0)
+	});
+	assert_eq!(untouched, ".grad(clip: 99.0)");
+	assert_eq!(model.gradient_clip_value(), Some(0.75));
+	let canonical = recipe::recipe.model().loss(recipe::mse).grad(recipe::clip(0.5));
+	assert_eq!(canonical.gradient_clip_value(), Some(0.5));
+}
+"#,
+	);
+	assert!(
+		output.status.success(),
+		"stdout: {}\nstderr: {}",
+		String::from_utf8_lossy(&output.stdout),
+		String::from_utf8_lossy(&output.stderr),
+	);
+	assert!(
+		std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+			.unwrap()
+			.file_name()
+			.to_string_lossy()
+			.contains(".recipe-")),
+		"named-gradient transformed source was not cleaned up",
+	);
+}
+
+#[test]
+fn binary_run_never_rewrites_named_gradient_syntax_on_an_unrelated_receiver() {
+	let (_root, source, output) = run_recipe_source_fixture(
+		r#"use recipe::clip;
+
+struct Other;
+
+impl Other {
+	fn grad(self, _policy: recipe::Grad) -> Self { self }
+}
+
+fn main() {
+	let _other = Other.grad(clip: 1.0);
+}
+"#,
+	);
+	assert!(!output.status.success());
+	let stderr = String::from_utf8(output.stderr).expect("rustc diagnostics are UTF-8");
+	assert!(
+		stderr.contains(&format!("{}:10:", source.display())),
+		"{stderr}"
+	);
+	assert!(stderr.contains("Other.grad(clip: 1.0)"), "{stderr}");
+	assert!(!stderr.contains("Other.grad(clip(1.0))"), "{stderr}");
+}
+
+#[test]
+fn binary_run_reports_duplicate_named_gradient_fields_at_the_original_source() {
+	let (_root, source, output) = run_recipe_source_fixture(
+		r#"use recipe::*;
+fn main() {
+	let _model = recipe.model().loss(bce).grad(clip: 1.0, clip: 2.0);
+}
+"#,
+	);
+	assert!(!output.status.success());
+	let stderr = String::from_utf8(output.stderr).expect("frontend diagnostic is UTF-8");
+	assert!(
+		stderr.contains("duplicate named field `clip` in Recipe Model `.grad(...)`"),
+		"{stderr}",
+	);
+	assert!(
+		stderr.contains(&format!("{}:3:", source.display())),
+		"{stderr}"
+	);
+	assert!(stderr.contains("clip: 1.0, clip: 2.0"), "{stderr}");
+	assert!(!stderr.contains(".recipe-"), "{stderr}");
+}
+
+#[test]
+fn binary_run_rejects_a_malformed_named_gradient_field_cleanly() {
+	let (_root, source, output) = run_recipe_source_fixture(
+		r#"use recipe::*;
+fn main() {
+	let _model = recipe.model().loss(bce).grad(clip:);
+}
+"#,
+	);
+	assert!(!output.status.success());
+	let stderr = String::from_utf8(output.stderr).expect("frontend diagnostic is UTF-8");
+	assert!(
+		stderr.contains("malformed Recipe Model `.grad(...)` fields"),
+		"{stderr}",
+	);
+	assert!(stderr.contains("expected exactly `clip: EXPR`"), "{stderr}");
+	assert!(
+		stderr.contains(&format!("{}:3:", source.display())),
+		"{stderr}"
+	);
+	assert!(stderr.contains("grad(clip:)"), "{stderr}");
+	assert!(!stderr.contains(".recipe-"), "{stderr}");
+}
+
+#[test]
+fn binary_run_maps_named_gradient_followup_diagnostics_to_original_columns() {
+	let (_root, source, output) = run_recipe_source_fixture(
+		r#"use recipe::*;
+fn main() {
+	let _model = recipe.model().loss(bce).grad(clip: 1.0);
+	let _broken: u32 = "not a number";
+}
+"#,
+	);
+	assert!(!output.status.success());
+	let stderr = String::from_utf8(output.stderr).expect("rustc diagnostics are UTF-8");
+	assert!(
+		stderr.contains(&format!("{}:4:21", source.display())),
+		"{stderr}"
+	);
+	assert!(
+		stderr.contains("let _broken: u32 = \"not a number\";"),
+		"{stderr}"
+	);
+	assert!(!stderr.contains("grad(clip( 1.0))"), "{stderr}");
+	assert!(!stderr.contains(".recipe-"), "{stderr}");
+}
+
+#[test]
+fn binary_run_maps_diagnostics_inside_the_named_gradient_expression() {
+	let (_root, source, output) = run_recipe_source_fixture(
+		r#"use recipe::*;
+fn main() {
+    let _model = recipe.model().loss(bce).grad(clip: missing_norm + 1.0);
+}
+"#,
+	);
+	assert!(!output.status.success());
+	let stderr = String::from_utf8(output.stderr).expect("rustc diagnostics are UTF-8");
+	assert!(
+		stderr.contains(&format!("{}:3:54", source.display())),
+		"{stderr}"
+	);
+	assert!(
+		stderr.contains("grad(clip: missing_norm + 1.0)"),
+		"{stderr}"
+	);
+	assert!(!stderr.contains("recipe::clip"), "{stderr}");
+	assert!(!stderr.contains(".recipe-"), "{stderr}");
 }

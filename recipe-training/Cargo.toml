@@ -10,6 +10,7 @@ recipe-core = { path = "../recipe-core" }
 recipe-executor = { path = "../recipe-executor" }
 recipe-ingest = { path = "../recipe-ingest" }
 recipe-language = { path = "../recipe-language" }
+recipe-math = { path = "../recipe-math" }
 recipe-native-executor = { path = "../recipe-native-executor" }
 recipe-ogdl = { path = "../recipe-ogdl" }
 recipe-ops = { path = "../recipe-ops" }

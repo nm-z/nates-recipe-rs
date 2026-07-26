@@ -24,9 +24,11 @@ fn inventory_matches_every_normative_line_in_order() {
 			})
 		})
 		.collect::<Vec<_>>();
-	let actual = operation_registry().iter().collect::<Vec<_>>();
+	let registry = operation_registry();
+	let actual = registry.surface_iter().collect::<Vec<_>>();
 
 	assert_eq!(expected.len(), 421);
+	assert_eq!(registry.surface_len(), expected.len());
 	assert_eq!(actual.len(), expected.len());
 	for (ordinal, (descriptor, (line, symbol, source))) in actual.iter().zip(expected).enumerate() {
 		assert_eq!(descriptor.id.ordinal(), ordinal);
@@ -35,6 +37,65 @@ fn inventory_matches_every_normative_line_in_order() {
 		assert_eq!(descriptor.source, source);
 		assert!(!descriptor.definition.is_empty());
 	}
+}
+
+#[test]
+fn recipe_owned_extensions_follow_the_surface_and_resolve_canonically() {
+	let registry = operation_registry();
+	let owned = registry.owned_iter().collect::<Vec<_>>();
+	assert_eq!(registry.surface_len(), 421);
+	assert_eq!(registry.owned_len(), 2);
+	assert_eq!(registry.len(), 423);
+	assert_eq!(owned.len(), registry.owned_len());
+	assert_eq!(
+		owned.iter()
+			.map(|descriptor| descriptor.symbol)
+			.collect::<Vec<_>>(),
+		["recipe_max_pool_1d", "recipe_max_pool_1d_backward"]
+	);
+	for (owned_index, descriptor) in owned.into_iter().enumerate() {
+		assert!(descriptor.id.is_recipe_owned());
+		assert_eq!(descriptor.id.surface_line(), 0);
+		assert_eq!(
+			descriptor.id.ordinal(),
+			registry.surface_len() + owned_index
+		);
+		assert_eq!(descriptor.family, OperationFamily::Pooling);
+		assert!(matches!(
+			descriptor.lowering,
+			LoweringAvailability::Composition(_)
+		));
+		assert_eq!(
+			registry.named(descriptor.symbol).collect::<Vec<_>>(),
+			[descriptor]
+		);
+		assert_eq!(
+			registry.resolve_unique(descriptor.symbol).unwrap(),
+			descriptor
+		);
+		assert_eq!(
+			registry
+				.resolve_exact(descriptor.symbol, descriptor.source)
+				.unwrap(),
+			descriptor
+		);
+	}
+	assert_eq!(registry.iter().count(), registry.len());
+	assert!(
+		registry
+			.surface_iter()
+			.all(|descriptor| !descriptor.id.is_recipe_owned())
+	);
+	assert_eq!(
+		channelwise_max_pool_1d_descriptor(),
+		registry.resolve_unique("recipe_max_pool_1d").unwrap()
+	);
+	assert_eq!(
+		channelwise_max_pool_1d_backward_descriptor(),
+		registry
+			.resolve_unique("recipe_max_pool_1d_backward")
+			.unwrap()
+	);
 }
 
 #[test]
@@ -478,7 +539,7 @@ fn every_surface_row_has_one_explicit_lowering_state_and_no_residual_gap() {
 	let mut workspace = 0_usize;
 	let mut non_calculation = 0_usize;
 	let mut unsupported = 0_usize;
-	for descriptor in operation_registry().iter() {
+	for descriptor in operation_registry().surface_iter() {
 		match descriptor.lowering {
 			LoweringAvailability::Scalar(_) => scalar += 1,
 			LoweringAvailability::Primitive(_) => primitive += 1,
@@ -501,7 +562,7 @@ fn every_surface_row_has_one_explicit_lowering_state_and_no_residual_gap() {
 	);
 	assert_eq!(
 		scalar + primitive + composition + workspace + non_calculation + unsupported,
-		operation_registry().len()
+		operation_registry().surface_len()
 	);
 }
 
@@ -511,7 +572,7 @@ fn every_structured_recipe_is_finite_specific_and_valid() {
 		.iter()
 		.filter(|descriptor| matches!(descriptor.lowering, LoweringAvailability::Composition(_)))
 		.collect::<Vec<_>>();
-	assert_eq!(descriptors.len(), 264);
+	assert_eq!(descriptors.len(), 266);
 	for descriptor in descriptors {
 		let recipe = match descriptor.lowering {
 			LoweringAvailability::Composition(recipe) => recipe,

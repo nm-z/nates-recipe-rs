@@ -28,6 +28,10 @@ path = "tests/facade_boundary.rs"
 name = "public-api-compile"
 path = "tests/public_api_compile.rs"
 
+[[test]]
+name = "training-reporting"
+path = "tests/training_reporting.rs"
+
 [workspace]
 resolver = "3"
 members = [

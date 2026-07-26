@@ -4,10 +4,13 @@ use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::image_header::{EncodedImageMetadata, inspect_encoded_image};
-use crate::semantic::{TemporalInstant, ordinal_vocabulary, parse_temporal_instant};
+use crate::semantic::{
+	TemporalInstant, VectorSemantic, VectorSemanticRule, fit_ordinal_vocabulary, infer_table_vectors_with_semantics,
+	parse_temporal_instant,
+};
 use crate::{
 	AmbiguousVectorModel, InferredVector, InferredVectorList, RawTable, SemanticError, SemanticType, VectorEncoding,
-	infer_table_vectors, parse_contract_f32, parse_contract_i32,
+	parse_contract_f32, parse_contract_i32,
 };
 
 /// An exact rational train share. No randomization or host floating-point
@@ -329,8 +332,10 @@ pub enum VectorMetadata {
 		origin: TemporalOrigin,
 	},
 	Categorical {
-		/// Known code `n` denotes `dictionary[n]`. Code `dictionary.len()`
-		/// is reserved for a nonempty value not observed in the fit partition.
+		/// Known code `n` denotes `dictionary[n]`. Code `dictionary.len()` is
+		/// the calculation-facing route for a nonempty value not observed in
+		/// the fit partition. [`CategoricalObservation`] retains whether every
+		/// row was known, missing, or unseen and preserves unseen label bytes.
 		dictionary: Vec<Vec<u8>>,
 	},
 	Ordinal {
@@ -342,6 +347,37 @@ pub enum VectorMetadata {
 		/// nonmissing values. Multiple entries preserve mixed formats or shapes.
 		encoded_variants: Vec<EncodedImageMetadata>,
 	},
+}
+
+/// The lossless categorical observation route recorded for one retained row.
+///
+/// Calculation codes remain available in [`PreparedValues::I32`] for existing
+/// graph consumers. This typed route is authoritative for observation identity:
+/// missing input is not an unseen label, and an unseen nonempty label retains
+/// its exact source bytes instead of being represented only by a reserved code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CategoricalObservation {
+	Known { code: i32 },
+	Missing,
+	Unseen { label: Vec<u8> },
+}
+
+impl CategoricalObservation {
+	#[must_use]
+	pub const fn known_code(&self) -> Option<i32> {
+		match self {
+			Self::Known { code } => Some(*code),
+			Self::Missing | Self::Unseen { .. } => None,
+		}
+	}
+
+	#[must_use]
+	pub fn unseen_label(&self) -> Option<&[u8]> {
+		match self {
+			Self::Unseen { label } => Some(label),
+			Self::Known { .. } | Self::Missing => None,
+		}
+	}
 }
 
 /// Packed values for exactly one retained source vector.
@@ -421,6 +457,7 @@ pub struct PreparedVector {
 	encoding: VectorEncoding,
 	metadata: VectorMetadata,
 	values: PreparedValues,
+	categorical_observations: Option<Vec<CategoricalObservation>>,
 }
 
 /// Row-free semantic identity of one prepared source vector.
@@ -512,6 +549,15 @@ impl PreparedVector {
 	#[must_use]
 	pub const fn values(&self) -> &PreparedValues {
 		&self.values
+	}
+
+	/// Typed categorical observations in retained-row order.
+	///
+	/// This is `Some` exactly for dictionary-encoded categorical vectors. Its
+	/// length and order are identical to [`Self::values`].
+	#[must_use]
+	pub fn categorical_observations(&self) -> Option<&[CategoricalObservation]> {
+		self.categorical_observations.as_deref()
 	}
 }
 
@@ -819,7 +865,8 @@ impl std::error::Error for PrepareError {}
 
 pub type PrepareResult<T> = Result<T, PrepareError>;
 
-/// Infer semantics and prepare a table without inventing derived features.
+/// Discover source semantics, fit preprocessing state only on the exact train
+/// partition, then apply that immutable state to every retained row.
 ///
 /// # Errors
 ///
@@ -830,14 +877,44 @@ pub fn prepare_table(
 	request: &PreparationRequest,
 	model: &impl AmbiguousVectorModel,
 ) -> PrepareResult<PreparedDataset> {
-	let inferred = infer_table_vectors(table, model).map_err(semantic_error)?;
-	prepare_inferred_table(table, &inferred, request)
+	prepare_table_with_semantics(table, request, model, &[])
 }
 
-/// Prepare a table using a caller-retained inference result.
+pub(crate) fn prepare_table_with_semantics(
+	table: &RawTable,
+	request: &PreparationRequest,
+	model: &impl AmbiguousVectorModel,
+	semantics: &[VectorSemanticRule],
+) -> PrepareResult<PreparedDataset> {
+	let (target_indices, excluded_columns, retained_source_rows, excluded_source_rows) =
+		select_rows_and_columns_before_fit(table, request)?;
+	let train_rows = request
+		.train_fraction
+		.train_rows(retained_source_rows.len())?;
+	let fit_table = fit_partition_table(table, &retained_source_rows[..train_rows])?;
+	let fit_semantics = fit_semantics_with_predicate_constraints(&fit_table, request, semantics)?;
+	let fitted = infer_table_vectors_with_semantics(&fit_table, model, &fit_semantics).map_err(semantic_error)?;
+	validate_inference(table, &fitted)?;
+	validate_predicates_after_fit(request, &fitted)?;
+	prepare_preselected_table(
+		table,
+		&fitted,
+		&target_indices,
+		&excluded_columns,
+		retained_source_rows,
+		excluded_source_rows,
+		train_rows,
+	)
+}
+
+/// Prepare a table using a caller-supplied authoritative semantic contract.
 ///
 /// Exactly one output vector is emitted for each source vector retained after
 /// column exclusion. Rows are excluded before the exact rational split.
+/// Metadata is still fitted on train rows, but the supplied semantic types and
+/// encodings are not re-inferred. Automatic callers must use [`prepare_table`]
+/// or [`crate::DistilledDataset::prepare`] so validation rows cannot influence
+/// semantic discovery.
 ///
 /// # Errors
 ///
@@ -849,6 +926,27 @@ pub fn prepare_inferred_table(
 	request: &PreparationRequest,
 ) -> PrepareResult<PreparedDataset> {
 	validate_inference(table, inferred)?;
+	let (target_indices, excluded_columns, retained_source_rows, excluded_source_rows) =
+		select_rows_and_columns(table, inferred, request)?;
+	let train_rows = request
+		.train_fraction
+		.train_rows(retained_source_rows.len())?;
+	prepare_preselected_table(
+		table,
+		inferred,
+		&target_indices,
+		&excluded_columns,
+		retained_source_rows,
+		excluded_source_rows,
+		train_rows,
+	)
+}
+
+fn select_rows_and_columns(
+	table: &RawTable,
+	inferred: &InferredVectorList,
+	request: &PreparationRequest,
+) -> PrepareResult<(BTreeSet<usize>, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
 	let names = build_name_index(inferred)?;
 	let target_indices = resolve_targets(request, &names)?;
 	let excluded_columns = resolve_column_exclusions(request, inferred, &target_indices)?;
@@ -870,15 +968,130 @@ pub fn prepare_inferred_table(
 			"row exclusions retained no source rows",
 		));
 	}
-	let train_rows = request
-		.train_fraction
-		.train_rows(retained_source_rows.len())?;
-	let vectors = inferred
+	Ok((
+		target_indices,
+		excluded_columns,
+		retained_source_rows,
+		excluded_source_rows,
+	))
+}
+
+fn select_rows_and_columns_before_fit(
+	table: &RawTable,
+	request: &PreparationRequest,
+) -> PrepareResult<(BTreeSet<usize>, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
+	let names = build_header_name_index(table)?;
+	let target_indices = resolve_targets(request, &names)?;
+	let excluded_columns = resolve_column_exclusions_from_headers(request, table.headers(), &target_indices)?;
+	if table
+		.headers()
+		.iter()
+		.enumerate()
+		.all(|(index, _)| target_indices.contains(&index) || excluded_columns.contains(&index))
+	{
+		return Err(PrepareError::new(
+			PrepareErrorKind::NoFeatureVectors,
+			"column selection retained no feature vectors",
+		));
+	}
+	let predicates = resolve_predicates_before_fit(request, &names)?;
+	let (retained_source_rows, excluded_source_rows) = filter_rows(table, &predicates)?;
+	if retained_source_rows.is_empty() {
+		return Err(PrepareError::new(
+			PrepareErrorKind::NoRetainedRows,
+			"row exclusions retained no source rows",
+		));
+	}
+	Ok((
+		target_indices,
+		excluded_columns,
+		retained_source_rows,
+		excluded_source_rows,
+	))
+}
+
+fn fit_partition_table(table: &RawTable, fit_source_rows: &[usize]) -> PrepareResult<RawTable> {
+	let rows = fit_source_rows
+		.iter()
+		.map(|source_row| {
+			table.rows().get(*source_row).cloned().ok_or_else(|| {
+				PrepareError::new(
+					PrepareErrorKind::InconsistentInference,
+					"fit partition references a source row outside the table",
+				)
+				.for_row(*source_row)
+			})
+		})
+		.collect::<PrepareResult<Vec<_>>>()?;
+	RawTable::from_parts(table.headers().to_vec(), rows).map_err(|error| {
+		PrepareError::new(
+			PrepareErrorKind::InconsistentInference,
+			format!("cannot construct the fit-partition semantic view: {error}"),
+		)
+	})
+}
+
+fn fit_semantics_with_predicate_constraints(
+	fit_table: &RawTable,
+	request: &PreparationRequest,
+	semantics: &[VectorSemanticRule],
+) -> PrepareResult<Vec<VectorSemanticRule>> {
+	let names = build_header_name_index(fit_table)?;
+	let mut fitted = (0..fit_table.width())
+		.map(|index| {
+			semantics
+				.get(index)
+				.copied()
+				.unwrap_or(VectorSemanticRule::Infer)
+		})
+		.collect::<Vec<_>>();
+	for predicate in &request.excluded_rows {
+		let Some((semantic_type, encoding)) = (match predicate.literal {
+			PredicateLiteral::Signed(_) | PredicateLiteral::Unsigned(_) => {
+				Some((SemanticType::Numeric, VectorEncoding::I32))
+			}
+			PredicateLiteral::F32Bits(_) => Some((SemanticType::Numeric, VectorEncoding::F32)),
+			PredicateLiteral::Text(_) => Some((SemanticType::Text, VectorEncoding::Utf8)),
+		}) else {
+			continue;
+		};
+		let index = names.get(&predicate.column).copied().ok_or_else(|| {
+			PrepareError::new(
+				PrepareErrorKind::PredicateColumnNotFound,
+				"row predicate column does not exist in fit table",
+			)
+			.for_column(&predicate.column)
+		})?;
+		let has_fit_value = fit_table
+			.rows()
+			.iter()
+			.any(|row| row.get(index).is_some_and(|value| !value.is_empty()));
+		if !has_fit_value && fitted[index] == VectorSemanticRule::Infer {
+			fitted[index] = VectorSemanticRule::Exact(VectorSemantic {
+				semantic_type,
+				encoding,
+			});
+		}
+	}
+	Ok(fitted)
+}
+
+fn prepare_preselected_table(
+	table: &RawTable,
+	inferred: &InferredVectorList,
+	target_indices: &BTreeSet<usize>,
+	excluded_columns: &BTreeSet<usize>,
+	retained_source_rows: Vec<usize>,
+	excluded_source_rows: Vec<usize>,
+	train_rows: usize,
+) -> PrepareResult<PreparedDataset> {
+	let fit_source_rows = &retained_source_rows[..train_rows];
+	let schemas = inferred
 		.vectors()
 		.iter()
 		.filter(|vector| !excluded_columns.contains(&vector.index()))
 		.map(|vector| {
-			encode_vector(
+			fit_vector_schema(
 				table,
 				vector,
 				if target_indices.contains(&vector.index()) {
@@ -886,10 +1099,13 @@ pub fn prepare_inferred_table(
 				} else {
 					VectorRole::Feature
 				},
-				&retained_source_rows,
-				train_rows,
+				fit_source_rows,
 			)
 		})
+		.collect::<PrepareResult<Vec<_>>>()?;
+	let vectors = schemas
+		.iter()
+		.map(|schema| apply_vector_schema(table, schema, &retained_source_rows))
 		.collect::<PrepareResult<Vec<_>>>()?;
 	let train = partition(PartitionKind::Train, 0..train_rows, &retained_source_rows);
 	let validation = partition(
@@ -952,6 +1168,20 @@ fn build_name_index(inferred: &InferredVectorList) -> PrepareResult<BTreeMap<Vec
 				"source column names must be unique for named selection",
 			)
 			.for_column(vector.name()));
+		}
+	}
+	Ok(names)
+}
+
+fn build_header_name_index(table: &RawTable) -> PrepareResult<BTreeMap<Vec<u8>, usize>> {
+	let mut names = BTreeMap::new();
+	for (index, name) in table.headers().iter().enumerate() {
+		if names.insert(name.clone(), index).is_some() {
+			return Err(PrepareError::new(
+				PrepareErrorKind::DuplicateColumnName,
+				"source column names must be unique for named selection",
+			)
+			.for_column(name));
 		}
 	}
 	Ok(names)
@@ -1021,11 +1251,48 @@ fn resolve_column_exclusions(
 	Ok(excluded)
 }
 
+fn resolve_column_exclusions_from_headers(
+	request: &PreparationRequest,
+	headers: &[Vec<u8>],
+	targets: &BTreeSet<usize>,
+) -> PrepareResult<BTreeSet<usize>> {
+	let mut excluded = BTreeSet::new();
+	for pattern in &request.excluded_columns {
+		let matches = headers
+			.iter()
+			.enumerate()
+			.filter(|(_, name)| pattern.matches(name))
+			.map(|(index, _)| index)
+			.collect::<Vec<_>>();
+		if matches.is_empty() {
+			return Err(PrepareError::new(
+				PrepareErrorKind::UnmatchedColumnPattern,
+				format!(
+					"column pattern {:?} matched no source vector",
+					String::from_utf8_lossy(pattern.as_bytes())
+				),
+			));
+		}
+		for index in matches {
+			if targets.contains(&index) {
+				return Err(PrepareError::new(
+					PrepareErrorKind::TargetExcluded,
+					"column exclusion pattern also matched a target",
+				)
+				.for_column(&headers[index]));
+			}
+			excluded.insert(index);
+		}
+	}
+	Ok(excluded)
+}
+
 struct ResolvedPredicate<'a> {
 	predicate: &'a RowPredicate,
 	column_index: usize,
 	semantic_type: SemanticType,
 	encoding: VectorEncoding,
+	fitted_type: bool,
 }
 
 fn resolve_predicates<'a>(
@@ -1053,9 +1320,68 @@ fn resolve_predicates<'a>(
 				column_index,
 				semantic_type,
 				encoding,
+				fitted_type: true,
 			})
 		})
 		.collect()
+}
+
+fn resolve_predicates_before_fit<'a>(
+	request: &'a PreparationRequest,
+	names: &BTreeMap<Vec<u8>, usize>,
+) -> PrepareResult<Vec<ResolvedPredicate<'a>>> {
+	request
+		.excluded_rows
+		.iter()
+		.map(|predicate| {
+			let column_index = names.get(&predicate.column).copied().ok_or_else(|| {
+				PrepareError::new(
+					PrepareErrorKind::PredicateColumnNotFound,
+					"row predicate column does not exist",
+				)
+				.for_column(&predicate.column)
+			})?;
+			let (semantic_type, encoding) = match predicate.literal {
+				PredicateLiteral::Signed(_) | PredicateLiteral::Unsigned(_) => {
+					(SemanticType::Numeric, VectorEncoding::I32)
+				}
+				PredicateLiteral::F32Bits(bits) => {
+					if !f32::from_bits(bits).is_finite() {
+						return Err(PrepareError::new(
+							PrepareErrorKind::InvalidPredicateLiteral,
+							"f32 predicate literal must be finite",
+						)
+						.for_column(&predicate.column));
+					}
+					(SemanticType::Numeric, VectorEncoding::F32)
+				}
+				PredicateLiteral::Text(_) => (SemanticType::Text, VectorEncoding::Utf8),
+			};
+			Ok(ResolvedPredicate {
+				predicate,
+				column_index,
+				semantic_type,
+				encoding,
+				fitted_type: false,
+			})
+		})
+		.collect()
+}
+
+fn validate_predicates_after_fit(request: &PreparationRequest, inferred: &InferredVectorList) -> PrepareResult<()> {
+	let names = build_name_index(inferred)?;
+	for predicate in &request.excluded_rows {
+		let index = names.get(&predicate.column).copied().ok_or_else(|| {
+			PrepareError::new(
+				PrepareErrorKind::PredicateColumnNotFound,
+				"row predicate column does not exist in fitted semantics",
+			)
+			.for_column(&predicate.column)
+		})?;
+		let vector = &inferred.vectors()[index];
+		validate_predicate_type(predicate, vector.semantic_type(), vector.encoding())?;
+	}
+	Ok(())
 }
 
 fn validate_predicate_type(
@@ -1101,6 +1427,9 @@ fn filter_rows(table: &RawTable, predicates: &[ResolvedPredicate<'_>]) -> Prepar
 	for (source_row, row) in table.rows().iter().enumerate() {
 		let mut exclude = false;
 		for resolved in predicates {
+			if exclude {
+				break;
+			}
 			let value = row.get(resolved.column_index).ok_or_else(|| {
 				PrepareError::new(
 					PrepareErrorKind::InconsistentInference,
@@ -1109,7 +1438,7 @@ fn filter_rows(table: &RawTable, predicates: &[ResolvedPredicate<'_>]) -> Prepar
 				.for_column(&resolved.predicate.column)
 				.for_row(source_row)
 			})?;
-			exclude |= evaluate_predicate(value, source_row, resolved)?;
+			exclude = evaluate_predicate(value, source_row, resolved)?;
 		}
 		if exclude {
 			excluded.push(source_row);
@@ -1170,7 +1499,11 @@ fn predicate_value_error(
 	error: impl fmt::Display,
 ) -> PrepareError {
 	PrepareError::new(
-		PrepareErrorKind::InvalidPredicateValue,
+		if resolved.fitted_type {
+			PrepareErrorKind::InvalidPredicateValue
+		} else {
+			PrepareErrorKind::PredicateTypeMismatch
+		},
 		format!(
 			"cannot compare {:?}/{:?} source value using {:?}: {error}",
 			resolved.semantic_type, resolved.encoding, resolved.predicate.literal
@@ -1191,119 +1524,184 @@ const fn compare_ordering(ordering: Ordering, operator: ComparisonOperator) -> b
 	}
 }
 
-fn encode_vector(
+fn fit_vector_schema(
 	table: &RawTable,
 	inferred: &InferredVector,
 	role: VectorRole,
-	retained_source_rows: &[usize],
-	train_rows: usize,
-) -> PrepareResult<PreparedVector> {
-	let source_values = table
-		.rows()
-		.iter()
-		.map(|row| row[inferred.index()].as_slice())
-		.collect::<Vec<_>>();
-	let retained_values = retained_source_rows
-		.iter()
-		.map(|source_row| source_values[*source_row])
-		.collect::<Vec<_>>();
-	let (metadata, values) = match inferred.encoding() {
-		VectorEncoding::I32 => (
-			VectorMetadata::None,
-			PreparedValues::I32(encode_i32(
-				inferred,
-				retained_source_rows,
-				&retained_values,
-			)?),
-		),
-		VectorEncoding::F32 => (
-			VectorMetadata::None,
-			PreparedValues::F32Bits(encode_f32(
-				inferred,
-				retained_source_rows,
-				&retained_values,
-			)?),
-		),
-		VectorEncoding::RelativeSecondsI32 => {
-			let (origin, values) = encode_temporal(inferred, retained_source_rows, &retained_values)?;
-			(
-				VectorMetadata::Temporal { origin },
-				PreparedValues::I32(values),
-			)
-		}
-		VectorEncoding::DictionaryI32 => {
-			let (dictionary, values) =
-				encode_dictionary(inferred, retained_source_rows, &retained_values, train_rows)?;
-			(
-				VectorMetadata::Categorical { dictionary },
-				PreparedValues::I32(values),
-			)
-		}
+	fit_source_rows: &[usize],
+) -> PrepareResult<VectorSchema> {
+	let fit_values = vector_values(table, inferred.index(), inferred.name(), fit_source_rows)?;
+	let metadata = match inferred.encoding() {
+		VectorEncoding::I32 | VectorEncoding::F32 | VectorEncoding::Utf8 => VectorMetadata::None,
+		VectorEncoding::RelativeSecondsI32 => VectorMetadata::Temporal {
+			origin: fit_temporal_origin(inferred, fit_source_rows, &fit_values)?,
+		},
+		VectorEncoding::DictionaryI32 => VectorMetadata::Categorical {
+			dictionary: fit_dictionary(inferred, &fit_values)?,
+		},
 		VectorEncoding::OrdinalI32 => {
-			let vocabulary = ordinal_vocabulary(
-				&source_values
+			let present = fit_values
+				.iter()
+				.copied()
+				.filter(|value| !value.is_empty())
+				.collect::<Vec<_>>();
+			let ordered_labels = if present.is_empty() {
+				Vec::new()
+			} else {
+				fit_ordinal_vocabulary(&present)
+					.ok_or_else(|| {
+						PrepareError::new(
+							PrepareErrorKind::EncodingFailure,
+							"fit partition does not identify one recognized ordinal vocabulary",
+						)
+						.for_column(inferred.name())
+					})?
 					.iter()
-					.copied()
-					.filter(|value| !value.is_empty())
-					.collect::<Vec<_>>(),
-			)
-			.ok_or_else(|| {
-				PrepareError::new(
-					PrepareErrorKind::EncodingFailure,
-					"inferred ordinal vector has no recognized order vocabulary",
-				)
-				.for_column(inferred.name())
-			})?;
-			let values = encode_ordinal(inferred, retained_source_rows, &retained_values, vocabulary)?;
-			(
-				VectorMetadata::Ordinal {
-					ordered_labels: vocabulary.iter().map(|label| label.to_vec()).collect(),
-				},
-				PreparedValues::I32(values),
-			)
+					.map(|label| label.to_vec())
+					.collect()
+			};
+			VectorMetadata::Ordinal { ordered_labels }
 		}
-		VectorEncoding::Utf8 => (
-			VectorMetadata::None,
-			PreparedValues::VariableWidth(encode_variable(
-				inferred,
-				retained_source_rows,
-				&retained_values,
-			)?),
-		),
 		VectorEncoding::Bytes => {
-			let metadata = if inferred.semantic_type() == SemanticType::Image {
+			if inferred.semantic_type() == SemanticType::Image {
 				VectorMetadata::Image {
-					encoded_variants: inspect_image_variants(
-						inferred,
-						retained_source_rows,
-						&retained_values,
-					)?,
+					encoded_variants: inspect_image_variants(inferred, fit_source_rows, &fit_values)?,
 				}
 			} else {
 				VectorMetadata::None
-			};
-			(
-				metadata,
-				PreparedValues::VariableWidth(encode_variable(
-					inferred,
-					retained_source_rows,
-					&retained_values,
-				)?),
-			)
+			}
 		}
 	};
-	Ok(PreparedVector {
+	Ok(VectorSchema {
 		source_index: inferred.index(),
 		name: inferred.name().to_vec(),
 		role,
 		semantic_type: inferred.semantic_type(),
 		encoding: inferred.encoding(),
 		metadata,
-		values,
 	})
 }
 
-fn encode_i32(inferred: &InferredVector, source_rows: &[usize], values: &[&[u8]]) -> PrepareResult<Vec<Option<i32>>> {
+fn apply_vector_schema(
+	table: &RawTable,
+	schema: &VectorSchema,
+	retained_source_rows: &[usize],
+) -> PrepareResult<PreparedVector> {
+	let values = vector_values(
+		table,
+		schema.source_index,
+		&schema.name,
+		retained_source_rows,
+	)?;
+	let (prepared_values, categorical_observations) = match (schema.encoding, &schema.metadata) {
+		(VectorEncoding::I32, VectorMetadata::None) => (
+			PreparedValues::I32(encode_i32(schema, retained_source_rows, &values)?),
+			None,
+		),
+		(VectorEncoding::F32, VectorMetadata::None) => (
+			PreparedValues::F32Bits(encode_f32(schema, retained_source_rows, &values)?),
+			None,
+		),
+		(VectorEncoding::RelativeSecondsI32, VectorMetadata::Temporal { origin }) => (
+			PreparedValues::I32(encode_temporal(
+				schema,
+				retained_source_rows,
+				&values,
+				*origin,
+			)?),
+			None,
+		),
+		(VectorEncoding::DictionaryI32, VectorMetadata::Categorical { dictionary }) => {
+			let (codes, observations) = encode_dictionary(schema, retained_source_rows, &values, dictionary)?;
+			validate_categorical_alignment(schema, dictionary.len(), &codes, &observations)?;
+			(PreparedValues::I32(codes), Some(observations))
+		}
+		(VectorEncoding::OrdinalI32, VectorMetadata::Ordinal { ordered_labels }) => (
+			PreparedValues::I32(encode_ordinal(
+				schema,
+				retained_source_rows,
+				&values,
+				ordered_labels,
+			)?),
+			None,
+		),
+		(VectorEncoding::Utf8, VectorMetadata::None) => (
+			PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
+			None,
+		),
+		(VectorEncoding::Bytes, VectorMetadata::Image { .. }) if schema.semantic_type == SemanticType::Image => {
+			// Applying a schema still validates every encoded image header, but
+			// validation-only variants are deliberately not added to fitted metadata.
+			inspect_image_variants_for_schema(schema, retained_source_rows, &values)?;
+			(
+				PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
+				None,
+			)
+		}
+		(VectorEncoding::Bytes, VectorMetadata::None) => (
+			PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
+			None,
+		),
+		_ => {
+			return Err(PrepareError::new(
+				PrepareErrorKind::InconsistentPreparedVector,
+				format!(
+					"fitted {:?}/{:?} vector has incompatible metadata {:?}",
+					schema.semantic_type, schema.encoding, schema.metadata
+				),
+			)
+			.for_column(&schema.name));
+		}
+	};
+	if prepared_values.len() != retained_source_rows.len()
+		|| categorical_observations
+			.as_ref()
+			.is_some_and(|observations| observations.len() != retained_source_rows.len())
+	{
+		return Err(PrepareError::new(
+			PrepareErrorKind::InconsistentPreparedVector,
+			"schema application did not preserve retained-row length",
+		)
+		.for_column(&schema.name));
+	}
+	Ok(PreparedVector {
+		source_index: schema.source_index,
+		name: schema.name.clone(),
+		role: schema.role,
+		semantic_type: schema.semantic_type,
+		encoding: schema.encoding,
+		metadata: schema.metadata.clone(),
+		values: prepared_values,
+		categorical_observations,
+	})
+}
+
+fn vector_values<'a>(
+	table: &'a RawTable,
+	source_index: usize,
+	name: &[u8],
+	source_rows: &[usize],
+) -> PrepareResult<Vec<&'a [u8]>> {
+	source_rows
+		.iter()
+		.map(|source_row| {
+			table.rows()
+				.get(*source_row)
+				.and_then(|row| row.get(source_index))
+				.map(Vec::as_slice)
+				.ok_or_else(|| {
+					PrepareError::new(
+						PrepareErrorKind::InconsistentInference,
+						"source row does not contain the fitted vector",
+					)
+					.for_column(name)
+					.for_row(*source_row)
+				})
+		})
+		.collect()
+}
+
+fn encode_i32(schema: &VectorSchema, source_rows: &[usize], values: &[&[u8]]) -> PrepareResult<Vec<Option<i32>>> {
 	values.iter()
 		.zip(source_rows)
 		.map(|(value, source_row)| {
@@ -1311,16 +1709,16 @@ fn encode_i32(inferred: &InferredVector, source_rows: &[usize], values: &[&[u8]]
 				Ok(None)
 			} else {
 				let text = core::str::from_utf8(value)
-					.map_err(|error| encoding_error(inferred, *source_row, error))?;
+					.map_err(|error| encoding_error(schema, *source_row, error))?;
 				parse_contract_i32(text)
 					.map(|value| Some(value.value()))
-					.map_err(|error| encoding_error(inferred, *source_row, error))
+					.map_err(|error| encoding_error(schema, *source_row, error))
 			}
 		})
 		.collect()
 }
 
-fn encode_f32(inferred: &InferredVector, source_rows: &[usize], values: &[&[u8]]) -> PrepareResult<Vec<Option<u32>>> {
+fn encode_f32(schema: &VectorSchema, source_rows: &[usize], values: &[&[u8]]) -> PrepareResult<Vec<Option<u32>>> {
 	values.iter()
 		.zip(source_rows)
 		.map(|(value, source_row)| {
@@ -1328,20 +1726,20 @@ fn encode_f32(inferred: &InferredVector, source_rows: &[usize], values: &[&[u8]]
 				Ok(None)
 			} else {
 				let text = core::str::from_utf8(value)
-					.map_err(|error| encoding_error(inferred, *source_row, error))?;
+					.map_err(|error| encoding_error(schema, *source_row, error))?;
 				parse_contract_f32(text)
 					.map(|value| Some(value.bits()))
-					.map_err(|error| encoding_error(inferred, *source_row, error))
+					.map_err(|error| encoding_error(schema, *source_row, error))
 			}
 		})
 		.collect()
 }
 
-fn encode_temporal(
+fn fit_temporal_origin(
 	inferred: &InferredVector,
 	source_rows: &[usize],
 	values: &[&[u8]],
-) -> PrepareResult<(TemporalOrigin, Vec<Option<i32>>)> {
+) -> PrepareResult<TemporalOrigin> {
 	let parsed = values
 		.iter()
 		.zip(source_rows)
@@ -1351,37 +1749,62 @@ fn encode_temporal(
 			} else {
 				parse_temporal_instant(value)
 					.map(Some)
-					.ok_or_else(|| encoding_error(inferred, *source_row, "invalid temporal value"))
+					.ok_or_else(|| inferred_encoding_error(inferred, *source_row, "invalid temporal value"))
 			}
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
-	let origin = parsed.iter().flatten().copied().min().ok_or_else(|| {
-		PrepareError::new(
-			PrepareErrorKind::EncodingFailure,
-			"temporal vector has no retained nonmissing value",
-		)
-		.for_column(inferred.name())
-	})?;
+	let origin = parsed
+		.iter()
+		.flatten()
+		.copied()
+		.min()
+		.unwrap_or(TemporalInstant {
+			unix_seconds: 0,
+			nanoseconds: 0,
+		});
+	Ok(TemporalOrigin {
+		unix_seconds: origin.unix_seconds,
+		nanoseconds: origin.nanoseconds,
+	})
+}
+
+fn encode_temporal(
+	schema: &VectorSchema,
+	source_rows: &[usize],
+	values: &[&[u8]],
+	origin: TemporalOrigin,
+) -> PrepareResult<Vec<Option<i32>>> {
+	let origin = TemporalInstant {
+		unix_seconds: origin.unix_seconds,
+		nanoseconds: origin.nanoseconds,
+	};
+	let parsed = values
+		.iter()
+		.zip(source_rows)
+		.map(|(value, source_row)| {
+			if value.is_empty() {
+				Ok(None)
+			} else {
+				parse_temporal_instant(value)
+					.map(Some)
+					.ok_or_else(|| encoding_error(schema, *source_row, "invalid temporal value"))
+			}
+		})
+		.collect::<PrepareResult<Vec<_>>>()?;
 	let values = parsed
 		.into_iter()
 		.zip(source_rows)
 		.map(|(instant, source_row)| {
 			instant
-				.map(|instant| temporal_delta(inferred, origin, instant, *source_row))
+				.map(|instant| temporal_delta(schema, origin, instant, *source_row))
 				.transpose()
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
-	Ok((
-		TemporalOrigin {
-			unix_seconds: origin.unix_seconds,
-			nanoseconds: origin.nanoseconds,
-		},
-		values,
-	))
+	Ok(values)
 }
 
 fn temporal_delta(
-	inferred: &InferredVector,
+	schema: &VectorSchema,
 	origin: TemporalInstant,
 	value: TemporalInstant,
 	source_row: usize,
@@ -1396,7 +1819,7 @@ fn temporal_delta(
 				PrepareErrorKind::ArithmeticOverflow,
 				"relative temporal nanoseconds overflowed i128",
 			)
-			.for_column(inferred.name())
+			.for_column(&schema.name)
 			.for_row(source_row)
 		})?;
 	if total_nanoseconds % 1_000_000_000 != 0 {
@@ -1404,7 +1827,7 @@ fn temporal_delta(
 			PrepareErrorKind::EncodingFailure,
 			"temporal values do not share a lossless whole-second offset from the retained origin",
 		)
-		.for_column(inferred.name())
+		.for_column(&schema.name)
 		.for_row(source_row));
 	}
 	let relative_seconds = total_nanoseconds / 1_000_000_000;
@@ -1413,29 +1836,78 @@ fn temporal_delta(
 			PrepareErrorKind::TemporalRangeExceeded,
 			format!("relative temporal seconds exceed i32: {error}"),
 		)
-		.for_column(inferred.name())
+		.for_column(&schema.name)
 		.for_row(source_row)
 	})
 }
 
-type DictionaryEncoding = (Vec<Vec<u8>>, Vec<Option<i32>>);
-
-fn encode_dictionary(
-	inferred: &InferredVector,
-	source_rows: &[usize],
-	values: &[&[u8]],
-	train_rows: usize,
-) -> PrepareResult<DictionaryEncoding> {
+fn fit_dictionary(inferred: &InferredVector, values: &[&[u8]]) -> PrepareResult<Vec<Vec<u8>>> {
 	let dictionary = values
 		.iter()
-		.take(train_rows)
 		.copied()
 		.filter(|value| !value.is_empty())
 		.map(<[u8]>::to_vec)
 		.collect::<BTreeSet<_>>()
 		.into_iter()
 		.collect::<Vec<_>>();
-	let codes = dictionary
+	i32::try_from(dictionary.len()).map_err(|error| {
+		PrepareError::new(
+			PrepareErrorKind::EncodingFailure,
+			format!("categorical reserved code exceeds i32: {error}"),
+		)
+		.for_column(inferred.name())
+	})?;
+	Ok(dictionary)
+}
+
+type AppliedDictionary = (Vec<Option<i32>>, Vec<CategoricalObservation>);
+
+fn validate_categorical_alignment(
+	schema: &VectorSchema,
+	dictionary_len: usize,
+	codes: &[Option<i32>],
+	observations: &[CategoricalObservation],
+) -> PrepareResult<()> {
+	let reserved = i32::try_from(dictionary_len).map_err(|error| {
+		PrepareError::new(
+			PrepareErrorKind::InconsistentPreparedVector,
+			format!("categorical reserved code cannot be represented: {error}"),
+		)
+		.for_column(&schema.name)
+	})?;
+	if codes.len() != observations.len() {
+		return Err(PrepareError::new(
+			PrepareErrorKind::InconsistentPreparedVector,
+			"categorical calculation codes and observation routes have different lengths",
+		)
+		.for_column(&schema.name));
+	}
+	for (code, observation) in codes.iter().zip(observations) {
+		let aligned = match observation {
+			CategoricalObservation::Known { code: known } => {
+				*code == Some(*known) && *known >= 0 && *known < reserved
+			}
+			CategoricalObservation::Missing => code.is_none(),
+			CategoricalObservation::Unseen { label } => !label.is_empty() && *code == Some(reserved),
+		};
+		if !aligned {
+			return Err(PrepareError::new(
+				PrepareErrorKind::InconsistentPreparedVector,
+				"categorical calculation code does not match its typed observation route",
+			)
+			.for_column(&schema.name));
+		}
+	}
+	Ok(())
+}
+
+fn encode_dictionary(
+	schema: &VectorSchema,
+	source_rows: &[usize],
+	values: &[&[u8]],
+	dictionary: &[Vec<u8>],
+) -> PrepareResult<AppliedDictionary> {
+	let known_codes = dictionary
 		.iter()
 		.enumerate()
 		.map(|(index, value)| {
@@ -1446,7 +1918,7 @@ fn encode_dictionary(
 						PrepareErrorKind::EncodingFailure,
 						format!("categorical dictionary exceeds i32 codes: {error}"),
 					)
-					.for_column(inferred.name())
+					.for_column(&schema.name)
 				})
 		})
 		.collect::<PrepareResult<BTreeMap<_, _>>>()?;
@@ -1455,27 +1927,35 @@ fn encode_dictionary(
 			PrepareErrorKind::EncodingFailure,
 			format!("categorical reserved code exceeds i32: {error}"),
 		)
-		.for_column(inferred.name())
+		.for_column(&schema.name)
 	})?;
 	let encoded = values
 		.iter()
 		.zip(source_rows)
 		.map(|(value, _source_row)| {
 			if value.is_empty() {
-				Ok(None)
+				Ok((None, CategoricalObservation::Missing))
+			} else if let Some(code) = known_codes.get(value).copied() {
+				Ok((Some(code), CategoricalObservation::Known { code }))
 			} else {
-				Ok(Some(codes.get(value).copied().unwrap_or(reserved_code)))
+				Ok((
+					Some(reserved_code),
+					CategoricalObservation::Unseen {
+						label: value.to_vec(),
+					},
+				))
 			}
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
-	Ok((dictionary, encoded))
+	let (codes, observations) = encoded.into_iter().unzip();
+	Ok((codes, observations))
 }
 
 fn encode_ordinal(
-	inferred: &InferredVector,
+	schema: &VectorSchema,
 	source_rows: &[usize],
 	values: &[&[u8]],
-	vocabulary: &[&[u8]],
+	vocabulary: &[Vec<u8>],
 ) -> PrepareResult<Vec<Option<i32>>> {
 	values.iter()
 		.zip(source_rows)
@@ -1488,20 +1968,20 @@ fn encode_ordinal(
 				.position(|label| value.eq_ignore_ascii_case(label))
 				.ok_or_else(|| {
 					encoding_error(
-						inferred,
+						schema,
 						*source_row,
 						"value is absent from ordinal vocabulary",
 					)
 				})?;
 			i32::try_from(rank)
 				.map(Some)
-				.map_err(|error| encoding_error(inferred, *source_row, error))
+				.map_err(|error| encoding_error(schema, *source_row, error))
 		})
 		.collect()
 }
 
 fn encode_variable(
-	inferred: &InferredVector,
+	schema: &VectorSchema,
 	source_rows: &[usize],
 	values: &[&[u8]],
 ) -> PrepareResult<VariableWidthVector> {
@@ -1510,8 +1990,8 @@ fn encode_variable(
 	let mut valid = Vec::with_capacity(values.len());
 	offsets.push(0);
 	for (value, source_row) in values.iter().zip(source_rows) {
-		if inferred.encoding() == VectorEncoding::Utf8 && !value.is_empty() {
-			core::str::from_utf8(value).map_err(|error| encoding_error(inferred, *source_row, error))?;
+		if schema.encoding == VectorEncoding::Utf8 && !value.is_empty() {
+			core::str::from_utf8(value).map_err(|error| encoding_error(schema, *source_row, error))?;
 		}
 		valid.push(!value.is_empty());
 		payload.extend_from_slice(value);
@@ -1520,7 +2000,7 @@ fn encode_variable(
 				PrepareErrorKind::ArithmeticOverflow,
 				format!("variable-width payload offset exceeds u64: {error}"),
 			)
-			.for_column(inferred.name())
+			.for_column(&schema.name)
 			.for_row(*source_row)
 		})?);
 	}
@@ -1542,7 +2022,7 @@ fn inspect_image_variants(
 		.filter(|(value, _source_row)| !value.is_empty())
 		.map(|(value, source_row)| {
 			inspect_encoded_image(value).map_err(|error| {
-				encoding_error(
+				inferred_encoding_error(
 					inferred,
 					*source_row,
 					format!("invalid encoded image header: {error}"),
@@ -1552,25 +2032,47 @@ fn inspect_image_variants(
 		.collect::<PrepareResult<BTreeSet<_>>>()?
 		.into_iter()
 		.collect::<Vec<_>>();
-	if variants.is_empty() {
-		return Err(PrepareError::new(
-			PrepareErrorKind::EncodingFailure,
-			"image vector has no retained nonmissing encoded image",
-		)
-		.for_column(inferred.name()));
-	}
 	Ok(variants)
 }
 
-fn encoding_error(inferred: &InferredVector, source_row: usize, error: impl fmt::Display) -> PrepareError {
+fn inspect_image_variants_for_schema(
+	schema: &VectorSchema,
+	source_rows: &[usize],
+	values: &[&[u8]],
+) -> PrepareResult<()> {
+	for (value, source_row) in values.iter().zip(source_rows) {
+		if !value.is_empty() {
+			inspect_encoded_image(value).map_err(|error| {
+				encoding_error(
+					schema,
+					*source_row,
+					format!("invalid encoded image header: {error}"),
+				)
+			})?;
+		}
+	}
+	Ok(())
+}
+
+fn inferred_encoding_error(inferred: &InferredVector, source_row: usize, error: impl fmt::Display) -> PrepareError {
+	encoding_error_parts(inferred.name(), inferred.encoding(), source_row, error)
+}
+
+fn encoding_error(schema: &VectorSchema, source_row: usize, error: impl fmt::Display) -> PrepareError {
+	encoding_error_parts(&schema.name, schema.encoding, source_row, error)
+}
+
+fn encoding_error_parts(
+	name: &[u8],
+	encoding: VectorEncoding,
+	source_row: usize,
+	error: impl fmt::Display,
+) -> PrepareError {
 	PrepareError::new(
 		PrepareErrorKind::EncodingFailure,
-		format!(
-			"lossless {:?} encoding failed: {error}",
-			inferred.encoding()
-		),
+		format!("lossless {encoding:?} encoding failed: {error}"),
 	)
-	.for_column(inferred.name())
+	.for_column(name)
 	.for_row(source_row)
 }
 
@@ -1669,6 +2171,8 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::cell::RefCell;
+
 	use crate::{CategoricalEncodingModel, Delimiter, HeaderMode, IngestLimits, TableRequest, parse_table};
 
 	use super::*;
@@ -1817,6 +2321,18 @@ mod tests {
 		assert_eq!(
 			category.values(),
 			&PreparedValues::I32(vec![Some(1), Some(0), Some(1), Some(2)])
+		);
+		assert_eq!(
+			category.categorical_observations(),
+			Some([
+				CategoricalObservation::Known { code: 1 },
+				CategoricalObservation::Known { code: 0 },
+				CategoricalObservation::Known { code: 1 },
+				CategoricalObservation::Unseen {
+					label: b"beta".to_vec(),
+				},
+			]
+			.as_slice())
 		);
 		assert_eq!(
 			prepared.vectors()[4].values(),
@@ -2123,7 +2639,7 @@ mod tests {
 	}
 
 	#[test]
-	fn mixed_image_shapes_remain_encoded_and_clone_into_vector_schema() {
+	fn validation_image_shapes_remain_encoded_without_entering_fitted_schema() {
 		let images = [jpeg(23, 17), jpeg(29, 19)];
 		let raw = image_table(&images);
 		let prepared = prepare_table(
@@ -2136,13 +2652,13 @@ mod tests {
 		let VectorMetadata::Image { encoded_variants } = image.metadata() else {
 			panic!("image vector must retain encoded header metadata");
 		};
-		assert_eq!(encoded_variants.len(), 2);
+		assert_eq!(encoded_variants.len(), 1);
 		assert_eq!(
 			encoded_variants
 				.iter()
 				.map(|variant| (variant.width(), variant.height()))
 				.collect::<Vec<_>>(),
-			[(23, 17), (29, 19)]
+			[(23, 17)]
 		);
 		assert!(encoded_variants.iter().all(|variant| {
 			variant.format() == crate::EncodedImageFormat::Jpeg
@@ -2170,7 +2686,7 @@ mod tests {
 	}
 
 	#[test]
-	fn mixed_image_formats_are_retained_as_distinct_schema_variants() {
+	fn validation_image_formats_do_not_enter_fitted_schema_variants() {
 		let raw = image_table(&[jpeg(23, 17), gif(31, 19)]);
 		let prepared = prepare_table(
 			&raw,
@@ -2186,10 +2702,7 @@ mod tests {
 				.iter()
 				.map(|variant| (variant.format(), variant.width(), variant.height()))
 				.collect::<Vec<_>>(),
-			[
-				(crate::EncodedImageFormat::Jpeg, 23, 17),
-				(crate::EncodedImageFormat::Gif89a, 31, 19),
-			]
+			[(crate::EncodedImageFormat::Jpeg, 23, 17)]
 		);
 	}
 
@@ -2206,6 +2719,224 @@ mod tests {
 		assert_eq!(error.column.as_deref(), Some(b"image".as_slice()));
 		assert_eq!(error.source_row, Some(0));
 		assert!(error.detail.contains("invalid encoded image header"));
+	}
+
+	#[test]
+	fn fitted_temporal_ordinal_and_categorical_state_uses_only_train_rows() {
+		let raw = table(
+			b"time,rank,label,target\n\
+			2024-01-10T00:00:00Z,low,alpha,0\n\
+			2024-01-11T00:00:00Z,medium,beta,1\n\
+			2024-01-12T00:00:00Z,low,alpha,0\n\
+			2024-01-01T00:00:00Z,high,gamma,1\n\
+			2024-02-01T00:00:00Z,medium,,0\n\
+			2024-03-01T00:00:00Z,high,beta,1\n",
+			8,
+		);
+		let prepared = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		let fit_origin = parse_temporal_instant(b"2024-01-10T00:00:00Z").unwrap();
+		assert_eq!(
+			prepared.vectors()[0].metadata(),
+			&VectorMetadata::Temporal {
+				origin: TemporalOrigin {
+					unix_seconds: fit_origin.unix_seconds,
+					nanoseconds: fit_origin.nanoseconds,
+				},
+			}
+		);
+		assert_eq!(
+			prepared.vectors()[0].values(),
+			&PreparedValues::I32(vec![
+				Some(0),
+				Some(86_400),
+				Some(172_800),
+				Some(-777_600),
+				Some(1_900_800),
+				Some(4_406_400)
+			])
+		);
+		assert_eq!(
+			prepared.vectors()[1].metadata(),
+			&VectorMetadata::Ordinal {
+				ordered_labels: vec![b"low".to_vec(), b"medium".to_vec(), b"high".to_vec()],
+			}
+		);
+		let category = &prepared.vectors()[2];
+		assert_eq!(
+			category.metadata(),
+			&VectorMetadata::Categorical {
+				dictionary: vec![b"alpha".to_vec(), b"beta".to_vec()],
+			}
+		);
+		assert_eq!(
+			category.values(),
+			&PreparedValues::I32(vec![Some(0), Some(1), Some(0), Some(2), None, Some(1)])
+		);
+		assert_eq!(
+			category.categorical_observations(),
+			Some([
+				CategoricalObservation::Known { code: 0 },
+				CategoricalObservation::Known { code: 1 },
+				CategoricalObservation::Known { code: 0 },
+				CategoricalObservation::Unseen {
+					label: b"gamma".to_vec(),
+				},
+				CategoricalObservation::Missing,
+				CategoricalObservation::Known { code: 1 },
+			]
+			.as_slice())
+		);
+		assert_eq!(
+			category.values().len(),
+			category.categorical_observations().unwrap().len()
+		);
+	}
+
+	#[test]
+	fn validation_novelty_is_applied_under_train_semantics_without_refitting() {
+		let temporal = table(
+			b"time,target\n2024-01-01T00:00:00Z,0\n2024-01-02T00:00:00Z,1\nnot-a-time,0\n2024-01-04T00:00:00Z,1\n",
+			6,
+		);
+		let error = prepare_table(
+			&temporal,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap_err();
+		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
+		assert_eq!(error.column.as_deref(), Some(b"time".as_slice()));
+		assert_eq!(error.source_row, Some(2));
+
+		let ordinal = table(b"rank,target\nlow,0\nmedium,1\ngold,0\ngold,1\n", 6);
+		let error = prepare_table(
+			&ordinal,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap_err();
+		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
+		assert_eq!(error.column.as_deref(), Some(b"rank".as_slice()));
+		assert_eq!(error.source_row, Some(2));
+	}
+
+	#[test]
+	fn zero_fit_rows_and_all_missing_fit_categories_preserve_observation_identity() {
+		let zero_fit = table(b"feature,target\nnovel,1\n", 3);
+		let prepared = prepare_table(
+			&zero_fit,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		assert!(prepared.train().is_empty());
+		assert_eq!(
+			prepared.vectors()[0].metadata(),
+			&VectorMetadata::Categorical {
+				dictionary: Vec::new()
+			}
+		);
+		assert_eq!(
+			prepared.vectors()[0].values(),
+			&PreparedValues::I32(vec![Some(0)])
+		);
+		assert_eq!(
+			prepared.vectors()[0].categorical_observations(),
+			Some([CategoricalObservation::Unseen {
+				label: b"novel".to_vec(),
+			}]
+			.as_slice())
+		);
+
+		let all_missing_fit = table(b"feature,target\n,0\n,1\nnovel,0\n,1\n", 6);
+		let prepared = prepare_table(
+			&all_missing_fit,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		let feature = &prepared.vectors()[0];
+		assert_eq!(
+			feature.metadata(),
+			&VectorMetadata::Categorical {
+				dictionary: Vec::new()
+			}
+		);
+		assert_eq!(
+			feature.values(),
+			&PreparedValues::I32(vec![None, None, Some(0), None])
+		);
+		assert_eq!(
+			feature.categorical_observations(),
+			Some([
+				CategoricalObservation::Missing,
+				CategoricalObservation::Missing,
+				CategoricalObservation::Unseen {
+					label: b"novel".to_vec(),
+				},
+				CategoricalObservation::Missing,
+			]
+			.as_slice())
+		);
+	}
+
+	#[test]
+	fn ambiguous_model_receives_only_fit_partition_evidence() {
+		#[derive(Debug, Default)]
+		struct RecordingModel {
+			evidence: RefCell<Vec<crate::VectorEvidence>>,
+		}
+
+		impl AmbiguousVectorModel for RecordingModel {
+			fn classify(&self, evidence: crate::VectorEvidence) -> SemanticType {
+				self.evidence.borrow_mut().push(evidence);
+				SemanticType::Categorical
+			}
+		}
+
+		let raw = table(
+			b"label,target\nalpha,0\nbeta,1\nvalidation-only-one,0\nvalidation-only-two,1\n",
+			6,
+		);
+		let model = RecordingModel::default();
+		let prepared = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&model,
+		)
+		.unwrap();
+		assert_eq!(
+			prepared.vectors()[0].metadata(),
+			&VectorMetadata::Categorical {
+				dictionary: vec![b"alpha".to_vec(), b"beta".to_vec()],
+			}
+		);
+		let evidence = model.evidence.borrow();
+		assert_eq!(evidence.len(), 1);
+		assert_eq!(evidence[0].values, 2);
+		assert_eq!(evidence[0].unique, 2);
+		assert_eq!(evidence[0].source_bytes, 9);
+	}
+
+	#[test]
+	fn row_predicates_short_circuit_after_one_or_branch_excludes_a_row() {
+		let raw = table(b"id,later,target\n1,,0\n2,5,1\n", 4);
+		let request = PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()).exclude_rows([
+			RowPredicate::new("id", ComparisonOperator::Equal, PredicateLiteral::Signed(1)),
+			RowPredicate::new(
+				"later",
+				ComparisonOperator::Greater,
+				PredicateLiteral::Signed(10),
+			),
+		]);
+		let prepared = prepare_table(&raw, &request, &CategoricalEncodingModel).unwrap();
+		assert_eq!(prepared.retained_source_rows(), [1]);
+		assert_eq!(prepared.excluded_source_rows(), [0]);
 	}
 
 	#[test]

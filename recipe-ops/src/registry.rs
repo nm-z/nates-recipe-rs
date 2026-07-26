@@ -38,6 +38,13 @@ impl OperationId {
 	pub const fn is_duplicate_symbol(self) -> bool {
 		self.occurrences > 1
 	}
+
+	/// Whether this identity belongs to the Recipe-owned extension segment
+	/// rather than a numbered `operation-surface.txt` line.
+	#[must_use]
+	pub const fn is_recipe_owned(self) -> bool {
+		self.surface_line == 0
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +219,25 @@ pub(crate) struct RawSurfaceEntry {
 
 include!(concat!(env!("OUT_DIR"), "/operation_surface.rs"));
 
+const RECIPE_OWNED_OPERATIONS: &[RawSurfaceEntry] = &[
+	RawSurfaceEntry {
+		ordinal: RAW_OPERATION_COUNT,
+		line: 0,
+		symbol: "recipe_max_pool_1d",
+		source: "recipe-ops/src/pooling.rs:channelwise_max_pool_1d",
+		occurrence: 1,
+		occurrences: 1,
+	},
+	RawSurfaceEntry {
+		ordinal: RAW_OPERATION_COUNT + 1,
+		line: 0,
+		symbol: "recipe_max_pool_1d_backward",
+		source: "recipe-ops/src/pooling.rs:channelwise_max_pool_1d_backward",
+		occurrence: 1,
+		occurrences: 1,
+	},
+];
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OperationRegistry;
 
@@ -220,19 +246,62 @@ pub const fn operation_registry() -> OperationRegistry {
 	OperationRegistry
 }
 
+/// Recipe-owned channelwise max-pool descriptor. This is deliberately
+/// separate from the preserved legacy operation-surface inventory.
+#[must_use]
+pub fn channelwise_max_pool_1d_descriptor() -> OperationDescriptor {
+	describe(&RECIPE_OWNED_OPERATIONS[0])
+}
+
+/// Recipe-owned channelwise max-pool backward descriptor. This is deliberately
+/// separate from the preserved legacy operation-surface inventory.
+#[must_use]
+pub fn channelwise_max_pool_1d_backward_descriptor() -> OperationDescriptor {
+	describe(&RECIPE_OWNED_OPERATIONS[1])
+}
+
 impl OperationRegistry {
+	/// Total canonical descriptors: the immutable legacy surface prefix followed
+	/// by Recipe-owned extensions.
 	#[must_use]
 	pub const fn len(self) -> usize {
-		RAW_OPERATION_COUNT
+		RAW_OPERATION_COUNT + RECIPE_OWNED_OPERATIONS.len()
 	}
 
 	#[must_use]
 	pub const fn is_empty(self) -> bool {
-		RAW_OPERATION_COUNT == 0
+		self.len() == 0
 	}
 
+	/// Iterate the complete canonical registry without changing legacy ordinal
+	/// order. Recipe-owned extensions always follow the surface prefix.
 	pub fn iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {
+		(0..self.len()).map(|ordinal| match ordinal < RAW_OPERATION_COUNT {
+			true => describe(&RAW_OPERATION_SURFACE[ordinal]),
+			false => describe(&RECIPE_OWNED_OPERATIONS[ordinal - RAW_OPERATION_COUNT]),
+		})
+	}
+
+	/// Number of descriptors sourced verbatim from `operation-surface.txt`.
+	#[must_use]
+	pub const fn surface_len(self) -> usize {
+		RAW_OPERATION_COUNT
+	}
+
+	/// Iterate only the immutable `operation-surface.txt` prefix.
+	pub fn surface_iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {
 		RAW_OPERATION_SURFACE.iter().map(describe)
+	}
+
+	/// Number of native Recipe-owned extensions after the legacy surface.
+	#[must_use]
+	pub const fn owned_len(self) -> usize {
+		RECIPE_OWNED_OPERATIONS.len()
+	}
+
+	/// Iterate only native Recipe-owned extensions.
+	pub fn owned_iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {
+		RECIPE_OWNED_OPERATIONS.iter().map(describe)
 	}
 
 	pub fn named(self, symbol: &str) -> impl Iterator<Item = OperationDescriptor> + '_ {
@@ -265,7 +334,7 @@ impl OperationRegistry {
 		let descriptor = matches.next().ok_or_else(|| {
 			OperationError::new(
 				OperationErrorKind::UnknownOperation,
-				format!("operation ({symbol:?}, {source:?}) is absent from the normative surface"),
+				format!("operation ({symbol:?}, {source:?}) is absent from the canonical registry"),
 			)
 		})?;
 		if matches.next().is_some() {

@@ -45,10 +45,10 @@ pub use numeric::{
 	I32Decimal, parse_contract_f32, parse_contract_i32,
 };
 pub use prepare::{
-	ColumnPattern, ComparisonOperator, DenseMatrix, PartitionKind, PredicateLiteral, PreparationRequest,
-	PrepareError, PrepareErrorKind, PrepareResult, PreparedDataset, PreparedPartition, PreparedValues,
-	PreparedVector, RowPredicate, TemporalOrigin, TrainFraction, VariableWidthVector, VectorMetadata, VectorRole,
-	VectorSchema, prepare_inferred_table, prepare_table,
+	CategoricalObservation, ColumnPattern, ComparisonOperator, DenseMatrix, PartitionKind, PredicateLiteral,
+	PreparationRequest, PrepareError, PrepareErrorKind, PrepareResult, PreparedDataset, PreparedPartition,
+	PreparedValues, PreparedVector, RowPredicate, TemporalOrigin, TrainFraction, VariableWidthVector, VectorMetadata,
+	VectorRole, VectorSchema, prepare_inferred_table, prepare_table,
 };
 pub use safetensors::{
 	SafeTensorArchive, SafeTensorDType, SafeTensorEntry, SafeTensorError, SafeTensorErrorKind, SafeTensorLimits,

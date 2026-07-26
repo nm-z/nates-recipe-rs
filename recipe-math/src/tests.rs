@@ -4,7 +4,7 @@ use std::ops::{Add, Mul, Sub};
 use recipe_core::{DType, ScalarLiteral, ScalarOpcode, ScalarProgram, ScalarValueId};
 use recipe_language::LanguageError;
 
-use crate::{AlgorithmIdentity, MathFunction};
+use crate::{AlgorithmIdentity, MathFunction, exp_with_gradual_underflow_program};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MathProgram {
@@ -479,7 +479,7 @@ fn every_function_builds_a_valid_versioned_program() {
 		assert_eq!(first.algorithm, function.algorithm());
 		assert_eq!(
 			first.algorithm.version,
-			if function == MathFunction::Pow { 2 } else { 1 }
+			if function == MathFunction::Pow { 3 } else { 1 }
 		);
 		assert!(identities.insert(first.algorithm.name));
 		assert_eq!(first.program.inputs.len(), function.arity());
@@ -748,6 +748,41 @@ fn positive_base_pow_crosses_adam_beta_one_underflow_without_faulting() {
 			_ => unreachable!("the test enumerates exact Adam steps"),
 		}
 	}
+}
+
+#[test]
+fn nonpositive_exp_preserves_distinct_subnormal_tail_then_rounds_true_underflow_to_zero() {
+	let program = exp_with_gradual_underflow_program().unwrap();
+	let at_negative_ninety = evaluate(&program, &[-90.0]);
+	let at_negative_one_hundred = evaluate(&program, &[-100.0]);
+	let at_negative_one_hundred_three = evaluate(&program, &[-103.0]);
+	for evaluation in [
+		&at_negative_ninety,
+		&at_negative_one_hundred,
+		&at_negative_one_hundred_three,
+	] {
+		assert!(!evaluation.faulted);
+		assert!(evaluation.output.is_subnormal());
+		assert!(evaluation.output.is_sign_positive());
+	}
+	assert!(at_negative_ninety.output > at_negative_one_hundred.output);
+	assert!(at_negative_one_hundred.output > at_negative_one_hundred_three.output);
+
+	let stored_cutoff = -103.972_08_f32;
+	let cutoff = evaluate(&program, &[stored_cutoff]);
+	assert!(!cutoff.faulted);
+	assert_eq!(cutoff.output.to_bits(), 1);
+	let next_lower = f32::from_bits(stored_cutoff.to_bits() + 1);
+	let below_cutoff = evaluate(&program, &[next_lower]);
+	assert!(!below_cutoff.faulted);
+	assert_eq!(below_cutoff.output.to_bits(), 0.0_f32.to_bits());
+
+	let true_underflow = evaluate(&program, &[-104.0]);
+	assert!(!true_underflow.faulted);
+	assert_eq!(true_underflow.output.to_bits(), 0.0_f32.to_bits());
+
+	assert!(evaluate(&program, &[1.0]).faulted);
+	assert!(evaluate(&program, &[f32::NEG_INFINITY]).faulted);
 }
 
 #[test]

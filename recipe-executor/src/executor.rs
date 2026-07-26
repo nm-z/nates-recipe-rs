@@ -567,6 +567,96 @@ impl<B: Backend> fmt::Debug for RunCore<B> {
 	}
 }
 
+/// One failed run with native-backend ownership and bounded execution evidence
+/// preserved after best-effort teardown.
+///
+/// `cleanup_error` is the first teardown failure observed after `error`.
+/// Teardown still attempts every remaining arena release and resource
+/// destruction in lifecycle order.
+pub struct RunFailure<B: Backend> {
+	run_id: RunId,
+	bundle: BundleIdentity,
+	error: ExecutorError,
+	cleanup_error: Option<ExecutorError>,
+	backend: B,
+	journal: Option<RunJournal>,
+}
+
+impl<B: Backend> fmt::Debug for RunFailure<B> {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("RunFailure")
+			.field("run_id", &self.run_id)
+			.field("bundle", &self.bundle)
+			.field("error", &self.error)
+			.field("cleanup_error", &self.cleanup_error)
+			.field("journal", &self.journal)
+			.finish_non_exhaustive()
+	}
+}
+
+impl<B: Backend> RunFailure<B> {
+	#[must_use]
+	pub const fn run_id(&self) -> RunId {
+		self.run_id
+	}
+
+	#[must_use]
+	pub const fn bundle_identity(&self) -> BundleIdentity {
+		self.bundle
+	}
+
+	#[must_use]
+	pub const fn error(&self) -> ExecutorError {
+		self.error
+	}
+
+	#[must_use]
+	pub const fn cleanup_error(&self) -> Option<ExecutorError> {
+		self.cleanup_error
+	}
+
+	#[must_use]
+	pub const fn journal(&self) -> Option<&RunJournal> {
+		self.journal.as_ref()
+	}
+
+	#[must_use]
+	pub fn into_parts(self) -> RunFailureParts<B> {
+		RunFailureParts {
+			run_id: self.run_id,
+			bundle: self.bundle,
+			error: self.error,
+			cleanup_error: self.cleanup_error,
+			backend: self.backend,
+			journal: self.journal,
+		}
+	}
+}
+
+/// Owned components of a failed run, including the recovered backend.
+pub struct RunFailureParts<B: Backend> {
+	pub run_id: RunId,
+	pub bundle: BundleIdentity,
+	pub error: ExecutorError,
+	pub cleanup_error: Option<ExecutorError>,
+	pub backend: B,
+	pub journal: Option<RunJournal>,
+}
+
+impl<B: Backend> fmt::Debug for RunFailureParts<B> {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("RunFailureParts")
+			.field("run_id", &self.run_id)
+			.field("bundle", &self.bundle)
+			.field("error", &self.error)
+			.field("cleanup_error", &self.cleanup_error)
+			.field("journal", &self.journal)
+			.finish_non_exhaustive()
+	}
+}
+
 /// A finalized run whose backend resources and every pending token are already
 /// realized, but whose arenas and external data images have not been admitted.
 pub struct PreparedRun<B: Backend> {
@@ -591,62 +681,162 @@ impl<B: Backend> fmt::Debug for PreparedRun<B> {
 
 impl<B: Backend> PreparedRun<B> {
 	pub fn prepare(run_id: RunId, bundle: FinalizedBundle, backend: B, watchdog: Watchdog) -> Result<Self> {
-		let journal_capacity = JournalCapacity::for_bundle::<B>(&bundle)?;
-		Self::prepare_with_journal_capacity(run_id, bundle, backend, watchdog, journal_capacity)
+		Self::prepare_recoverable(run_id, bundle, backend, watchdog).map_err(|failure| failure.error())
+	}
+
+	pub fn prepare_recoverable(
+		run_id: RunId,
+		bundle: FinalizedBundle,
+		backend: B,
+		watchdog: Watchdog,
+	) -> std::result::Result<Self, RunFailure<B>> {
+		let journal_capacity = match JournalCapacity::for_bundle::<B>(&bundle) {
+			Ok(capacity) => capacity,
+			Err(error) => return Err(unstarted_failure(run_id, bundle.identity(), backend, error)),
+		};
+		Self::prepare_with_journal_capacity_recoverable(run_id, bundle, backend, watchdog, journal_capacity)
 	}
 
 	pub fn prepare_with_journal_capacity(
 		run_id: RunId,
 		bundle: FinalizedBundle,
-		mut backend: B,
+		backend: B,
 		watchdog: Watchdog,
 		journal_capacity: JournalCapacity,
 	) -> Result<Self> {
+		Self::prepare_with_journal_capacity_recoverable(run_id, bundle, backend, watchdog, journal_capacity)
+			.map_err(|failure| failure.error())
+	}
+
+	pub fn prepare_with_journal_capacity_recoverable(
+		run_id: RunId,
+		bundle: FinalizedBundle,
+		mut backend: B,
+		watchdog: Watchdog,
+		journal_capacity: JournalCapacity,
+	) -> std::result::Result<Self, RunFailure<B>> {
+		let bundle_identity = bundle.identity();
 		if bundle.loop_iterations().get() > 1 && !backend.supports_loop_repetition() {
-			return Err(ExecutorError::LoopRepetitionUnsupported {
-				iterations: bundle.loop_iterations(),
-			});
+			return Err(unstarted_failure(
+				run_id,
+				bundle_identity,
+				backend,
+				ExecutorError::LoopRepetitionUnsupported {
+					iterations: bundle.loop_iterations(),
+				},
+			));
 		}
-		let prepared = PreparedPhases::new(&bundle)?;
+		let mut journal = RunJournal::with_capacity(journal_capacity, bundle.tasks());
+		let prepared = match PreparedPhases::new(&bundle) {
+			Ok(prepared) => prepared,
+			Err(error) => {
+				return Err(RunFailure {
+					run_id,
+					bundle: bundle_identity,
+					error,
+					cleanup_error: None,
+					backend,
+					journal: Some(journal),
+				});
+			}
+		};
 		let completed = CompletionLedger::new(bundle.tasks());
 		let exit_image_capacity = prepared.exit.external_exit_count();
 		let fault_resets = prepared.fault_resets();
-		let mut journal = RunJournal::with_capacity(journal_capacity, bundle.tasks());
 		let mut physical_calls = PhysicalCallBatch::new();
 		let bind_result = backend.bind_resources(&bundle, &mut physical_calls);
-		let resource = backend_value(
+		let mut resource = match backend_value(
 			&mut journal,
 			BackendOperation::BindResources,
 			physical_calls,
 			bind_result,
-		)?;
-		let mut resource = resource;
-		let init_phase = realize_phase(
+		) {
+			Ok(resource) => resource,
+			Err(error) => {
+				return Err(RunFailure {
+					run_id,
+					bundle: bundle_identity,
+					error,
+					cleanup_error: None,
+					backend,
+					journal: Some(journal),
+				});
+			}
+		};
+		let init_phase = match realize_phase(
 			prepared.init,
 			RunPhase::Init,
 			&mut backend,
 			&mut resource,
 			&mut journal,
-		)?;
-		let loop_phase = realize_phase(
+		) {
+			Ok(phase) => phase,
+			Err(error) => {
+				return Err(prepared_resource_failure(
+					run_id,
+					bundle_identity,
+					backend,
+					resource,
+					journal,
+					error,
+				));
+			}
+		};
+		let loop_phase = match realize_phase(
 			prepared.loop_phase,
 			RunPhase::Loop,
 			&mut backend,
 			&mut resource,
 			&mut journal,
-		)?;
-		let exit_phase = realize_phase(
+		) {
+			Ok(phase) => phase,
+			Err(error) => {
+				drop(init_phase);
+				return Err(prepared_resource_failure(
+					run_id,
+					bundle_identity,
+					backend,
+					resource,
+					journal,
+					error,
+				));
+			}
+		};
+		let exit_phase = match realize_phase(
 			prepared.exit,
 			RunPhase::Exit,
 			&mut backend,
 			&mut resource,
 			&mut journal,
-		)?;
+		) {
+			Ok(phase) => phase,
+			Err(error) => {
+				drop((init_phase, loop_phase));
+				return Err(prepared_resource_failure(
+					run_id,
+					bundle_identity,
+					backend,
+					resource,
+					journal,
+					error,
+				));
+			}
+		};
 		let metrics = MetricMailbox::new(&bundle.resources().metrics, bundle.tasks());
-		journal.record_logical(LogicalEvent::Prepared {
+		if let Err(error) = journal.record_logical(LogicalEvent::Prepared {
 			run: run_id,
-			bundle: bundle.identity(),
-		})?;
+			bundle: bundle_identity,
+		}) {
+			drop((init_phase, loop_phase, exit_phase));
+			return Err(prepared_resource_failure(
+				run_id,
+				bundle_identity,
+				backend,
+				resource,
+				journal,
+				error,
+			));
+		}
 		Ok(Self {
 			core: RunCore {
 				run_id,
@@ -668,39 +858,72 @@ impl<B: Backend> PreparedRun<B> {
 		})
 	}
 
-	pub fn initialize(mut self, images: impl IntoIterator<Item = DeviceImage>) -> Result<InitializedRun<B>> {
-		let images = validate_images(&self.core.bundle, images, &self.fault_resets)?;
+	pub fn initialize(self, images: impl IntoIterator<Item = DeviceImage>) -> Result<InitializedRun<B>> {
+		self.initialize_recoverable(images)
+			.map_err(|failure| failure.error())
+	}
+
+	pub fn initialize_recoverable(
+		mut self,
+		images: impl IntoIterator<Item = DeviceImage>,
+	) -> std::result::Result<InitializedRun<B>, RunFailure<B>> {
+		let images = match validate_images(&self.core.bundle, images, &self.fault_resets) {
+			Ok(images) => images,
+			Err(error) => return Err(self.into_failure(error)),
+		};
 		for layout_index in 0..self.core.bundle.arena_layouts().len() {
 			let layout = &self.core.bundle.arena_layouts()[layout_index];
 			let device = layout.device;
 			let bytes = layout.size;
 			let operation = BackendOperation::AllocateArena { device };
 			let mut physical_calls = PhysicalCallBatch::new();
-			let result = {
-				let resource = self.core.resource.active_mut()?;
-				self.core
+			let result = match self.core.resource.active_mut() {
+				Ok(resource) => self
+					.core
 					.backend
-					.allocate_arena(resource, layout, &mut physical_calls)
+					.allocate_arena(resource, layout, &mut physical_calls),
+				Err(error) => return Err(self.into_failure(error)),
 			};
-			let arena = backend_value(&mut self.core.journal, operation, physical_calls, result)?;
+			let arena = match backend_value(&mut self.core.journal, operation, physical_calls, result) {
+				Ok(arena) => arena,
+				Err(error) => return Err(self.into_failure(error)),
+			};
 			let previous = self.core.arenas.insert(device, arena);
 			debug_assert!(previous.is_none(), "finalized layouts have unique devices");
-			self.core
+			if let Err(error) = self
+				.core
 				.journal
-				.record_logical(LogicalEvent::ArenaAllocated { device, bytes })?;
+				.record_logical(LogicalEvent::ArenaAllocated { device, bytes })
+			{
+				return Err(self.into_failure(error));
+			}
 		}
 
-		run_phase_blocking(&mut self.core, &mut self.init_phase, Some(&images))?;
-		self.core
-			.journal
-			.record_logical(LogicalEvent::Initialized {
-				run: self.core.run_id,
-			})?;
+		if let Err(error) = run_phase_blocking(&mut self.core, &mut self.init_phase, Some(&images)) {
+			return Err(self.into_failure(error));
+		}
+		if let Err(error) = self.core.journal.record_logical(LogicalEvent::Initialized {
+			run: self.core.run_id,
+		}) {
+			return Err(self.into_failure(error));
+		}
 		Ok(InitializedRun {
 			core: self.core,
 			loop_phase: self.loop_phase,
 			exit_phase: self.exit_phase,
 		})
+	}
+
+	fn into_failure(self, error: ExecutorError) -> RunFailure<B> {
+		let Self {
+			core,
+			init_phase,
+			loop_phase,
+			exit_phase,
+			fault_resets: _,
+		} = self;
+		drop((init_phase, loop_phase, exit_phase));
+		failed_core(core, error)
 	}
 
 	#[must_use]
@@ -729,27 +952,35 @@ impl<B: Backend> fmt::Debug for InitializedRun<B> {
 }
 
 impl<B: Backend> InitializedRun<B> {
-	pub fn start_loop(mut self) -> Result<RunningRun<B>> {
-		let iteration =
-			self.core
-				.bundle
-				.loop_iterations()
-				.iteration(0)
-				.ok_or(ExecutorError::LifecycleInvariant {
+	pub fn start_loop(self) -> Result<RunningRun<B>> {
+		self.start_loop_recoverable()
+			.map_err(|failure| failure.error())
+	}
+
+	pub fn start_loop_recoverable(mut self) -> std::result::Result<RunningRun<B>, RunFailure<B>> {
+		let iteration = match self.core.bundle.loop_iterations().iteration(0) {
+			Some(iteration) => iteration,
+			None => {
+				return Err(self.into_failure(ExecutorError::LifecycleInvariant {
 					detail: "finalized loop count did not contain iteration zero",
-				})?;
+				}));
+			}
+		};
 		self.loop_phase.begin_loop_iteration(iteration);
-		self.core
-			.journal
-			.record_logical(LogicalEvent::LoopStarted {
-				run: self.core.run_id,
-			})?;
-		self.core
+		if let Err(error) = self.core.journal.record_logical(LogicalEvent::LoopStarted {
+			run: self.core.run_id,
+		}) {
+			return Err(self.into_failure(error));
+		}
+		if let Err(error) = self
+			.core
 			.journal
 			.record_logical(LogicalEvent::LoopIterationStarted {
 				run: self.core.run_id,
 				iteration,
-			})?;
+			}) {
+			return Err(self.into_failure(error));
+		}
 		Ok(RunningRun {
 			core: self.core,
 			phase: self.loop_phase,
@@ -757,6 +988,16 @@ impl<B: Backend> InitializedRun<B> {
 			failure: None,
 			completion_recorded: false,
 		})
+	}
+
+	fn into_failure(self, error: ExecutorError) -> RunFailure<B> {
+		let Self {
+			core,
+			loop_phase,
+			exit_phase,
+		} = self;
+		drop((loop_phase, exit_phase));
+		failed_core(core, error)
 	}
 
 	#[must_use]
@@ -925,6 +1166,21 @@ impl<B: Backend> RunningRun<B> {
 			false => Err(Box::new(self)),
 		}
 	}
+
+	/// Ends a run that cannot legally reach [`ExitedLoop`], preserving its
+	/// primary failure and attempting ordered native teardown.
+	#[must_use]
+	pub fn fail(self, error: ExecutorError) -> RunFailure<B> {
+		let Self {
+			core,
+			phase,
+			exit_phase,
+			failure: _,
+			completion_recorded: _,
+		} = self;
+		drop((phase, exit_phase));
+		failed_core(core, error)
+	}
 }
 
 /// A run with no remaining loop work. Exit transfers and arena teardown are now
@@ -945,52 +1201,39 @@ impl<B: Backend> fmt::Debug for ExitedLoop<B> {
 }
 
 impl<B: Backend> ExitedLoop<B> {
-	pub fn exit(mut self) -> Result<ExitedRun<B>> {
-		run_phase_blocking(&mut self.core, &mut self.exit_phase, None)?;
+	pub fn exit(self) -> Result<ExitedRun<B>> {
+		self.exit_recoverable().map_err(|failure| failure.error())
+	}
 
-		let arenas = core::mem::take(&mut self.core.arenas);
-		for (device, arena) in arenas {
-			let mut physical_calls = PhysicalCallBatch::new();
-			let result = {
-				let resource = self.core.resource.active_mut()?;
-				self.core
-					.backend
-					.release_arena(resource, device, arena, &mut physical_calls)
-			};
-			backend_value(
-				&mut self.core.journal,
-				BackendOperation::ReleaseArena { device },
-				physical_calls,
-				result,
-			)?;
-			self.core
-				.journal
-				.record_logical(LogicalEvent::ArenaReleased { device })?;
+	pub fn exit_recoverable(mut self) -> std::result::Result<ExitedRun<B>, RunFailure<B>> {
+		if let Err(error) = run_phase_blocking(&mut self.core, &mut self.exit_phase, None) {
+			let Self { core, exit_phase } = self;
+			drop(exit_phase);
+			return Err(failed_core(core, error));
+		}
+		let Self {
+			mut core,
+			exit_phase,
+		} = self;
+		drop(exit_phase);
+		let (error, cleanup_error) = teardown_resources(&mut core);
+		if let Some(error) = error {
+			return Err(run_failure(core, error, cleanup_error));
+		}
+		if let Err(error) = core
+			.journal
+			.record_logical(LogicalEvent::Exited { run: core.run_id })
+		{
+			return Err(run_failure(core, error, None));
 		}
 
-		let resource = self.core.resource.consume()?;
-		let mut physical_calls = PhysicalCallBatch::new();
-		let result = self
-			.core
-			.backend
-			.destroy_resources(resource, &mut physical_calls);
-		backend_value(
-			&mut self.core.journal,
-			BackendOperation::DestroyResources,
-			physical_calls,
-			result,
-		)?;
-		self.core.journal.record_logical(LogicalEvent::Exited {
-			run: self.core.run_id,
-		})?;
-
 		Ok(ExitedRun {
-			run_id: self.core.run_id,
-			bundle: self.core.bundle.identity(),
-			backend: self.core.backend,
-			metrics: self.core.metrics,
-			exit_images: self.core.exit_images,
-			journal: self.core.journal,
+			run_id: core.run_id,
+			bundle: core.bundle.identity(),
+			backend: core.backend,
+			metrics: core.metrics,
+			exit_images: core.exit_images,
+			journal: core.journal,
 		})
 	}
 
@@ -1060,6 +1303,134 @@ impl<B: Backend> ExitedRun<B> {
 
 	pub fn into_parts(self) -> (B, MetricMailbox, Vec<ExitImage>, RunJournal) {
 		(self.backend, self.metrics, self.exit_images, self.journal)
+	}
+}
+
+fn unstarted_failure<B: Backend>(
+	run_id: RunId,
+	bundle: BundleIdentity,
+	backend: B,
+	error: ExecutorError,
+) -> RunFailure<B> {
+	RunFailure {
+		run_id,
+		bundle,
+		error,
+		cleanup_error: None,
+		backend,
+		journal: None,
+	}
+}
+
+fn prepared_resource_failure<B: Backend>(
+	run_id: RunId,
+	bundle: BundleIdentity,
+	mut backend: B,
+	resource: B::Resource,
+	mut journal: RunJournal,
+	error: ExecutorError,
+) -> RunFailure<B> {
+	let mut physical_calls = PhysicalCallBatch::new();
+	let result = backend.destroy_resources(resource, &mut physical_calls);
+	let cleanup_error = backend_value(
+		&mut journal,
+		BackendOperation::DestroyResources,
+		physical_calls,
+		result,
+	)
+	.err();
+	RunFailure {
+		run_id,
+		bundle,
+		error,
+		cleanup_error,
+		backend,
+		journal: Some(journal),
+	}
+}
+
+fn failed_core<B: Backend>(mut core: RunCore<B>, error: ExecutorError) -> RunFailure<B> {
+	let (cleanup_error, _) = teardown_resources(&mut core);
+	run_failure(core, error, cleanup_error)
+}
+
+fn run_failure<B: Backend>(
+	core: RunCore<B>,
+	error: ExecutorError,
+	cleanup_error: Option<ExecutorError>,
+) -> RunFailure<B> {
+	RunFailure {
+		run_id: core.run_id,
+		bundle: core.bundle.identity(),
+		error,
+		cleanup_error,
+		backend: core.backend,
+		journal: Some(core.journal),
+	}
+}
+
+fn teardown_resources<B: Backend>(core: &mut RunCore<B>) -> (Option<ExecutorError>, Option<ExecutorError>) {
+	let mut error = None;
+	let mut cleanup_error = None;
+	let arenas = core::mem::take(&mut core.arenas);
+	for (device, arena) in arenas {
+		let mut physical_calls = PhysicalCallBatch::new();
+		let result = match core.resource.active_mut() {
+			Ok(resource) => core
+				.backend
+				.release_arena(resource, device, arena, &mut physical_calls),
+			Err(reported) => {
+				record_teardown_error(&mut error, &mut cleanup_error, reported);
+				continue;
+			}
+		};
+		match backend_value(
+			&mut core.journal,
+			BackendOperation::ReleaseArena { device },
+			physical_calls,
+			result,
+		) {
+			Ok(()) => {
+				if let Err(reported) = core
+					.journal
+					.record_logical(LogicalEvent::ArenaReleased { device })
+				{
+					record_teardown_error(&mut error, &mut cleanup_error, reported);
+				}
+			}
+			Err(reported) => record_teardown_error(&mut error, &mut cleanup_error, reported),
+		}
+	}
+
+	match core.resource.consume() {
+		Ok(resource) => {
+			let mut physical_calls = PhysicalCallBatch::new();
+			let result = core
+				.backend
+				.destroy_resources(resource, &mut physical_calls);
+			if let Err(reported) = backend_value(
+				&mut core.journal,
+				BackendOperation::DestroyResources,
+				physical_calls,
+				result,
+			) {
+				record_teardown_error(&mut error, &mut cleanup_error, reported);
+			}
+		}
+		Err(reported) => record_teardown_error(&mut error, &mut cleanup_error, reported),
+	}
+	(error, cleanup_error)
+}
+
+fn record_teardown_error(
+	error: &mut Option<ExecutorError>,
+	cleanup_error: &mut Option<ExecutorError>,
+	reported: ExecutorError,
+) {
+	if error.is_none() {
+		*error = Some(reported);
+	} else if cleanup_error.is_none() {
+		*cleanup_error = Some(reported);
 	}
 }
 

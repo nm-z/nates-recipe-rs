@@ -1024,6 +1024,9 @@ impl BayesDependency {
 	}
 }
 
+const CHECKPOINT_MODEL_DECLARATION_CONFLICT: &str =
+	"a checkpoint-backed model cannot also declare layers, Bayesian dependencies, a loss, or gradient policy";
+
 /// Backend-neutral model declaration. It contains no runtime handles, loaded
 /// weights, allocations, or mutable global registry entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1033,7 +1036,6 @@ pub struct Model {
 	objective: Option<Objective>,
 	gradient_clip_bits: Option<u32>,
 	weights_source: Option<String>,
-	input_width: Option<usize>,
 	deferred: Option<DeclarationError>,
 }
 
@@ -1046,20 +1048,33 @@ impl Model {
 			objective: None,
 			gradient_clip_bits: None,
 			weights_source: None,
-			input_width: None,
 			deferred: None,
 		}
 	}
 
-	pub fn load(mut self, weights: &str, input_width: usize) -> Self {
-		if weights.is_empty() || input_width == 0 {
+	/// Declare a checkpoint-backed model.
+	///
+	/// Input width, feature schema, topology, and parameter shapes are read from
+	/// the checkpoint during inference preparation; callers do not redeclare
+	/// them here.
+	pub fn load(mut self, path: &str) -> Self {
+		if path.is_empty() {
 			self.defer(
 				DeclarationErrorKind::EmptyValue,
-				"model weight path and input width must be nonempty",
+				"model checkpoint path is empty",
+			);
+		} else if self.has_inline_definition() {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				CHECKPOINT_MODEL_DECLARATION_CONFLICT,
+			);
+		} else if self.weights_source.is_some() {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"a model accepts exactly one checkpoint source",
 			);
 		} else {
-			self.weights_source = Some(weights.to_owned());
-			self.input_width = Some(input_width);
+			self.weights_source = Some(path.to_owned());
 		}
 		crate::remember_recipe_model(self.clone());
 		self
@@ -1450,6 +1465,12 @@ impl Model {
 		if let Some(error) = &self.deferred {
 			return Err(error.clone());
 		}
+		if self.weights_source.is_some() && self.has_inline_definition() {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidLayer,
+				CHECKPOINT_MODEL_DECLARATION_CONFLICT,
+			));
+		}
 		if self.layers.is_empty() && self.bayes_dependencies.is_empty() && self.weights_source.is_none() {
 			return Err(DeclarationError::new(
 				DeclarationErrorKind::InvalidLayer,
@@ -1512,9 +1533,11 @@ impl Model {
 		self.weights_source.as_deref()
 	}
 
-	#[must_use]
-	pub const fn input_width(&self) -> Option<usize> {
-		self.input_width
+	fn has_inline_definition(&self) -> bool {
+		!self.layers.is_empty()
+			|| !self.bayes_dependencies.is_empty()
+			|| self.objective.is_some()
+			|| self.gradient_clip_bits.is_some()
 	}
 
 	fn with_tree_booster(mut self, booster: ForestBooster) -> Self {
@@ -1657,6 +1680,20 @@ pub(crate) enum Metric {
 impl Metric {
 	fn validate(self) -> DeclarationResult<()> {
 		Ok(())
+	}
+
+	const fn inference_rejection(self) -> Option<&'static str> {
+		match self {
+			Self::Time | Self::Device => None,
+			Self::Loss
+			| Self::Accuracy
+			| Self::R2
+			| Self::AuRoc
+			| Self::AuPrc
+			| Self::Brier
+			| Self::CalibrationError => Some("target-free inference has no target values for this metric"),
+			Self::Epoch | Self::LearningRate => Some("inference has no training epoch or optimizer state for this metric"),
+		}
 	}
 }
 
@@ -2084,18 +2121,32 @@ impl Infer {
 				}
 			} else {
 				self.log.push(item);
+				if let Some(detail) = item.metric().inference_rejection()
+					&& self.deferred.is_none()
+				{
+					self.deferred = Some(DeclarationError::new(
+						DeclarationErrorKind::InvalidInferenceConfiguration,
+						format!("{:?}: {detail}", item.metric()),
+					));
+				}
 			}
 		}
 		self
 	}
 
-	pub fn evaluate(&self, data: &Data, model: &Model) -> DeclarationResult<InferenceDeclaration> {
+	/// Resolve this policy against the immediately preceding `recipe.data(...)`
+	/// and `recipe.model()` declarations.
+	pub fn evaluate(&self) -> DeclarationResult<InferenceDeclaration> {
+		let sequence = crate::take_recipe_inference_sequence();
 		self.validate()?;
+		let (data, model) = sequence.map_err(|detail| {
+			DeclarationError::new(DeclarationErrorKind::InvalidInferenceConfiguration, detail)
+		})?;
 		data.validate()?;
 		model.validate()?;
 		Ok(InferenceDeclaration {
-			model: model.clone(),
-			data: Some(data.clone()),
+			model,
+			data: Some(data),
 			policy: self.clone(),
 		})
 	}

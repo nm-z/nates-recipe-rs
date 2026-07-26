@@ -1751,6 +1751,20 @@ fn composition_for_entry(symbol: &str, source: &str) -> Option<CompositionRecipe
 			CompositionPayload::F32AndI32,
 			OperationFamily::Pooling,
 		),
+		"recipe_max_pool_1d" => recipe(
+			"channelwise_maximum_pool_1d",
+			"gather non-overlapping channelwise windows, retain the final short window, and select the lowest global coordinate on ties",
+			POOL_STEPS,
+			CompositionPayload::F32AndI32,
+			OperationFamily::Pooling,
+		),
+		"recipe_max_pool_1d_backward" => recipe(
+			"channelwise_maximum_pool_1d_backward",
+			"route each output gradient to its recorded global winner through a checked unique scatter",
+			POOL_BACKWARD_STEPS,
+			CompositionPayload::F32AndI32,
+			OperationFamily::Pooling,
+		),
 		"gpu_max_pool_1d_backward" | "gpu_max_pool_2d_backward" | "gpu_max_pool_2d_backward_f32" => recipe(
 			"maximum_pool_backward",
 			"recompute the deterministic winning source coordinate and atomically accumulate overlapping gradients",

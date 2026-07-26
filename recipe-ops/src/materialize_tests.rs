@@ -506,8 +506,8 @@ fn workspace_and_missing_semantics_fail_closed_with_an_exact_manifest() -> TestR
 		.filter(|descriptor| matches!(descriptor.lowering, LoweringAvailability::Composition(_)))
 		.count();
 	let concrete = total_compositions - manifest.len();
-	assert_eq!(total_compositions, 264);
-	assert_eq!(concrete, 132);
+	assert_eq!(total_compositions, 266);
+	assert_eq!(concrete, 134);
 	assert_eq!(manifest.len(), 132);
 	assert_eq!(manifest.len(), total_compositions - concrete);
 	assert!(

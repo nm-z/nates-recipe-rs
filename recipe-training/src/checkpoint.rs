@@ -19,13 +19,15 @@ use recipe_ogdl::{Graph as OgdlGraph, NodeId as OgdlNodeId};
 use crate::{
 	AdamWConfig, CompiledFeatureSpan, CompiledTraining, CompletedTrainingExecution, DataNormalizationState,
 	DecodedMulticlassClass, DenseActivation, DenseBlock, DenseBlockKind, DenseBlockState, DenseDataNormalization,
-	DenseFeatureLowering, DenseLayer, DenseLayerState, DenseLoss, DenseOperation, DenseOutputAdapter, DenseResidual,
-	DenseResidualOperation, DenseResidualState, DenseTask, DenseTrainingConfig, FinalTrainingMetric, LearningRateDecay,
-	ParameterState, TrainingBounds,
+	DenseFeatureLowering, DenseGroupToNeuronRouting, DenseLayer, DenseLayerState, DenseLoss, DenseOperation,
+	DenseOutputAdapter, DensePool, DensePoolGroupOrder, DensePoolState, DensePoolWinnerContract, DenseResidual,
+	DenseResidualOperation, DenseResidualState, DenseTask, DenseTrainingConfig, FinalTrainingMetric,
+	LearningRateDecay, ParameterState, TrainingBounds,
 };
 
 const FLAT_CHECKPOINT_FORMAT_VERSION: u32 = 5;
 const STRUCTURED_CHECKPOINT_FORMAT_VERSION: u32 = 6;
+const POOL_CHECKPOINT_FORMAT_VERSION: u32 = 7;
 const HEX_CHUNK_BYTES: usize = 64;
 const TEMP_CREATE_ATTEMPTS: u64 = 64;
 
@@ -525,7 +527,7 @@ impl CheckpointParameterImage {
 	}
 }
 
-/// One effective dense block and its exact final optimizer state.
+/// One effective dense block with its saved parameter and per-parameter moment tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointLayerImage {
 	declaration: DenseLayer,
@@ -566,7 +568,7 @@ pub enum CheckpointResidualSkipImage {
 	Projection(CheckpointParameterImage),
 }
 
-/// One topology-preserving residual block and its complete optimizer state.
+/// One topology-preserving residual block with its saved parameter and per-parameter moment tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointResidualImage {
 	branch: Vec<CheckpointResidualBranchImage>,
@@ -597,11 +599,76 @@ impl CheckpointResidualImage {
 	}
 }
 
+/// One saved channelwise maximum-pool declaration and its resolved logical shape.
+///
+/// Pool blocks own no parameter or optimizer-moment tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointPoolImage {
+	size: NonZeroU64,
+	group_to_neuron: Option<NonZeroU64>,
+	input_length: NonZeroU64,
+	channels: NonZeroU64,
+	output_length: NonZeroU64,
+	input_width: NonZeroU64,
+	output_width: NonZeroU64,
+	group_order: DensePoolGroupOrder,
+	winner_contract: DensePoolWinnerContract,
+}
+
+impl CheckpointPoolImage {
+	#[must_use]
+	pub const fn size(&self) -> NonZeroU64 {
+		self.size
+	}
+
+	#[must_use]
+	pub const fn group_to_neuron(&self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
+
+	#[must_use]
+	pub const fn input_length(&self) -> NonZeroU64 {
+		self.input_length
+	}
+
+	#[must_use]
+	pub const fn channels(&self) -> NonZeroU64 {
+		self.channels
+	}
+
+	#[must_use]
+	pub const fn output_length(&self) -> NonZeroU64 {
+		self.output_length
+	}
+
+	#[must_use]
+	pub const fn input_width(&self) -> NonZeroU64 {
+		self.input_width
+	}
+
+	#[must_use]
+	pub const fn output_width(&self) -> NonZeroU64 {
+		self.output_width
+	}
+
+	#[must_use]
+	pub const fn group_order(&self) -> DensePoolGroupOrder {
+		self.group_order
+	}
+
+	#[must_use]
+	pub const fn winner_contract(&self) -> DensePoolWinnerContract {
+		self.winner_contract
+	}
+}
+
 /// One effective saved model block. Checkpoint v5 contains only `Layer`;
-/// checkpoint v6 additionally retains residual topology.
+/// checkpoint v6 additionally retains residual topology, and checkpoint v7
+/// retains maximum-pool topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckpointBlockImage {
 	Layer(CheckpointLayerImage),
+	Pool(CheckpointPoolImage),
 	Residual(CheckpointResidualImage),
 }
 
@@ -610,6 +677,7 @@ impl CheckpointBlockImage {
 	pub fn output_width(&self) -> NonZeroU64 {
 		match self {
 			Self::Layer(layer) => layer.declaration.width(),
+			Self::Pool(pool) => pool.output_width,
 			Self::Residual(residual) => residual.output_width,
 		}
 	}
@@ -618,6 +686,7 @@ impl CheckpointBlockImage {
 	pub fn output_operations(&self) -> &[DenseOperation] {
 		match self {
 			Self::Layer(layer) => layer.declaration.operations(),
+			Self::Pool(_) => &[],
 			Self::Residual(residual) => &residual.operations,
 		}
 	}
@@ -698,8 +767,8 @@ impl CheckpointArtifact {
 	}
 
 	/// Effective topology. For a flat v5 artifact this contains the same layers
-	/// exposed by [`Self::layers`]. A structured v6 artifact leaves the legacy
-	/// flat layer view empty and retains its complete topology here.
+	/// exposed by [`Self::layers`]. Structured v6 and v7 artifacts leave the
+	/// legacy flat layer view empty and retain their saved topology here.
 	#[must_use]
 	pub fn blocks(&self) -> &[CheckpointBlockImage] {
 		&self.blocks
@@ -749,7 +818,7 @@ impl CheckpointArtifact {
 	}
 }
 
-/// Decode and fully validate one bounded checkpoint-v5 document.
+/// Decode and fully validate one bounded, versioned checkpoint document.
 pub fn decode_checkpoint(bytes: &[u8], limits: CheckpointDecodeLimits) -> CheckpointResult<CheckpointArtifact> {
 	if bytes.len() > limits.source_bytes {
 		return Err(decode_error(
@@ -1008,13 +1077,18 @@ impl Decoder<'_> {
 			)?,
 			&root_path.field("version"),
 		)?;
-		if !matches!(version, FLAT_CHECKPOINT_FORMAT_VERSION | STRUCTURED_CHECKPOINT_FORMAT_VERSION) {
+		if !matches!(
+			version,
+			FLAT_CHECKPOINT_FORMAT_VERSION
+				| STRUCTURED_CHECKPOINT_FORMAT_VERSION
+				| POOL_CHECKPOINT_FORMAT_VERSION
+		) {
 			return Err(decode_error(
 				CheckpointDecodeErrorKind::InvalidValue,
 				root_path.field("version"),
 				format!(
-					"checkpoint version is {version}, expected {FLAT_CHECKPOINT_FORMAT_VERSION} or \
-					 {STRUCTURED_CHECKPOINT_FORMAT_VERSION}"
+					"checkpoint version is {version}, expected {FLAT_CHECKPOINT_FORMAT_VERSION}, \
+					 {STRUCTURED_CHECKPOINT_FORMAT_VERSION}, or {POOL_CHECKPOINT_FORMAT_VERSION}"
 				),
 			));
 		}
@@ -2177,14 +2251,13 @@ impl Decoder<'_> {
 			format_version,
 		)?;
 		let layers = if format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
-			blocks
-				.iter()
+			blocks.iter()
 				.map(|block| match block {
 					CheckpointBlockImage::Layer(layer) => Ok(layer.clone()),
-					CheckpointBlockImage::Residual(_) => Err(decode_error(
+					CheckpointBlockImage::Pool(_) | CheckpointBlockImage::Residual(_) => Err(decode_error(
 						CheckpointDecodeErrorKind::InvalidValue,
 						path.field("blocks"),
-						"checkpoint v5 cannot contain a residual block",
+						"checkpoint v5 cannot contain a structured block",
 					)),
 				})
 				.collect::<CheckpointResult<Vec<_>>>()?
@@ -2285,14 +2358,29 @@ impl Decoder<'_> {
 			self.claim_block(&block_path)?;
 			let block = match self.node(child, &block_path)?.text() {
 				"layer" | "perc" => CheckpointBlockImage::Layer(self.parse_layer(child, &block_path, index)?),
-				"residual" if format_version == STRUCTURED_CHECKPOINT_FORMAT_VERSION => {
+				"pool" if format_version == POOL_CHECKPOINT_FORMAT_VERSION => {
+					CheckpointBlockImage::Pool(self.parse_pool(child, &block_path, index)?)
+				}
+				"pool" => {
+					return Err(decode_error(
+						CheckpointDecodeErrorKind::InvalidValue,
+						block_path,
+						format!("checkpoint v{format_version} cannot contain a pool block"),
+					));
+				}
+				"residual"
+					if matches!(
+						format_version,
+						STRUCTURED_CHECKPOINT_FORMAT_VERSION | POOL_CHECKPOINT_FORMAT_VERSION
+					) =>
+				{
 					CheckpointBlockImage::Residual(self.parse_residual(child, &block_path, index)?)
 				}
 				"residual" => {
 					return Err(decode_error(
 						CheckpointDecodeErrorKind::InvalidValue,
 						block_path,
-						"checkpoint v5 cannot contain a residual block",
+						format!("checkpoint v{format_version} cannot contain a residual block"),
 					));
 				}
 				value => return Err(self.invalid_enum(&block_path, "dense block", value)),
@@ -2368,6 +2456,72 @@ impl Decoder<'_> {
 		})
 	}
 
+	fn parse_pool(
+		&self,
+		node: OgdlNodeId,
+		path: &CheckpointPath,
+		expected_index: usize,
+	) -> CheckpointResult<CheckpointPoolImage> {
+		let fields = self.fields(
+			node,
+			path,
+			&[
+				"index",
+				"size",
+				"group-to-neuron",
+				"input-length",
+				"channels",
+				"output-length",
+				"group-order",
+				"winner-contract",
+			],
+			&[],
+		)?;
+		let index = self.parse_usize(
+			self.scalar(fields.require("index", path)?, &path.field("index"))?,
+			&path.field("index"),
+		)?;
+		if index != expected_index {
+			return Err(decode_error(
+				CheckpointDecodeErrorKind::InconsistentValue,
+				path.field("index"),
+				format!("serialized block index is {index}, expected {expected_index}"),
+			));
+		}
+		let nonzero_field = |name: &str| {
+			self.parse_nonzero_u64(
+				self.scalar(fields.require(name, path)?, &path.field(name))?,
+				&path.field(name),
+			)
+		};
+		let size = nonzero_field("size")?;
+		let group_to_neuron = match self.scalar(
+			fields.require("group-to-neuron", path)?,
+			&path.field("group-to-neuron"),
+		)? {
+			"none" => None,
+			value => Some(self.parse_nonzero_u64(value, &path.field("group-to-neuron"))?),
+		};
+		let input_length = nonzero_field("input-length")?;
+		let channels = nonzero_field("channels")?;
+		let output_length = nonzero_field("output-length")?;
+		self.expect_scalar(
+			fields.require("group-order", path)?,
+			&path.field("group-order"),
+			"group-major-channel-minor",
+		)?;
+		self.expect_scalar(
+			fields.require("winner-contract", path)?,
+			&path.field("winner-contract"),
+			"lowest-logical-index",
+		)?;
+		checkpoint_pool_image(
+			DensePool::new(size, group_to_neuron),
+			DensePoolState::new(input_length, channels, output_length),
+			path,
+		)
+	}
+
 	fn parse_residual(
 		&mut self,
 		node: OgdlNodeId,
@@ -2439,7 +2593,10 @@ impl Decoder<'_> {
 			return Err(decode_error(
 				CheckpointDecodeErrorKind::InconsistentValue,
 				path.field("count"),
-				format!("branch step count is {count}, but {} steps follow", payload.len()),
+				format!(
+					"branch step count is {count}, but {} steps follow",
+					payload.len()
+				),
 			));
 		}
 		let mut branch = Vec::with_capacity(count);
@@ -2755,9 +2912,33 @@ struct ParsedModel {
 	temperature: Option<CheckpointTensorImage>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointTopologyStorage {
+	Manifest,
+	Artifact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointTensorValidation {
+	Declaration,
+	Payload,
+}
+
 fn validate_artifact(artifact: &CheckpointArtifact) -> CheckpointResult<()> {
+	validate_checkpoint_semantic_invariants(
+		artifact,
+		CheckpointTopologyStorage::Artifact,
+		CheckpointTensorValidation::Payload,
+	)
+}
+
+fn validate_checkpoint_semantic_invariants(
+	artifact: &CheckpointArtifact,
+	topology_storage: CheckpointTopologyStorage,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
 	let root = CheckpointPath::root().field("recipe");
-	validate_artifact_topology(artifact, &root.field("model"))?;
+	validate_checkpoint_topology(artifact, &root.field("model"), topology_storage)?;
 	validate_training_config(
 		&artifact.config,
 		&root.field("training"),
@@ -2769,11 +2950,49 @@ fn validate_artifact(artifact: &CheckpointArtifact) -> CheckpointResult<()> {
 		&root.field("training").field("bounds"),
 	)?;
 	validate_vector_schema(artifact, &root.field("dataset"))?;
-	validate_effective_model(artifact, &root.field("model"))?;
+	validate_effective_model(artifact, &root.field("model"), tensor_validation)?;
 	Ok(())
 }
 
-fn validate_artifact_topology(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+fn validate_checkpoint_topology(
+	artifact: &CheckpointArtifact,
+	path: &CheckpointPath,
+	storage: CheckpointTopologyStorage,
+) -> CheckpointResult<()> {
+	if storage == CheckpointTopologyStorage::Manifest {
+		let valid =
+			match artifact.format_version {
+				FLAT_CHECKPOINT_FORMAT_VERSION => !artifact.layers.is_empty() && artifact.blocks.is_empty(),
+				STRUCTURED_CHECKPOINT_FORMAT_VERSION => {
+					artifact.layers.is_empty()
+						&& !artifact.blocks.is_empty() && artifact
+						.blocks
+						.iter()
+						.any(|block| matches!(block, CheckpointBlockImage::Residual(_)))
+						&& !artifact
+							.blocks
+							.iter()
+							.any(|block| matches!(block, CheckpointBlockImage::Pool(_)))
+						&& artifact.config.layers.is_empty()
+				}
+				POOL_CHECKPOINT_FORMAT_VERSION => {
+					artifact.layers.is_empty()
+						&& !artifact.blocks.is_empty() && artifact
+						.blocks
+						.iter()
+						.any(|block| matches!(block, CheckpointBlockImage::Pool(_)))
+						&& artifact.config.layers.is_empty()
+				}
+				_ => false,
+			};
+		if !valid {
+			return Err(validation_error(
+				path.field("blocks"),
+				"checkpoint manifest mixes incompatible flat and structured topology",
+			));
+		}
+		return Ok(());
+	}
 	match artifact.format_version {
 		FLAT_CHECKPOINT_FORMAT_VERSION => {
 			if artifact.layers.is_empty() || artifact.blocks.len() != artifact.layers.len() {
@@ -2798,6 +3017,16 @@ fn validate_artifact_topology(artifact: &CheckpointArtifact, path: &CheckpointPa
 					"checkpoint v6 must not mix a legacy flat layer view with structured blocks",
 				));
 			}
+			if artifact
+				.blocks
+				.iter()
+				.any(|block| matches!(block, CheckpointBlockImage::Pool(_)))
+			{
+				return Err(validation_error(
+					path.field("blocks"),
+					"checkpoint v6 cannot contain a pool block",
+				));
+			}
 			if artifact.blocks.is_empty()
 				|| !artifact
 					.blocks
@@ -2813,6 +3042,31 @@ fn validate_artifact_topology(artifact: &CheckpointArtifact, path: &CheckpointPa
 				return Err(validation_error(
 					path.field("blocks"),
 					"checkpoint v6 cannot mix legacy configuration layers with structured blocks",
+				));
+			}
+		}
+		POOL_CHECKPOINT_FORMAT_VERSION => {
+			if !artifact.layers.is_empty() {
+				return Err(validation_error(
+					path.field("blocks"),
+					"checkpoint v7 must not mix a legacy flat layer view with structured blocks",
+				));
+			}
+			if artifact.blocks.is_empty()
+				|| !artifact
+					.blocks
+					.iter()
+					.any(|block| matches!(block, CheckpointBlockImage::Pool(_)))
+			{
+				return Err(validation_error(
+					path.field("blocks"),
+					"checkpoint v7 requires a nonempty topology containing a pool block",
+				));
+			}
+			if !artifact.config.layers.is_empty() {
+				return Err(validation_error(
+					path.field("blocks"),
+					"checkpoint v7 cannot mix legacy configuration layers with structured blocks",
 				));
 			}
 		}
@@ -2832,6 +3086,54 @@ fn validation_error(path: CheckpointPath, detail: impl Into<String>) -> Checkpoi
 
 fn invalid_value(path: CheckpointPath, detail: impl Into<String>) -> CheckpointError {
 	decode_error(CheckpointDecodeErrorKind::InvalidValue, path, detail)
+}
+
+fn checkpoint_pool_image(
+	declaration: DensePool,
+	state: DensePoolState,
+	path: &CheckpointPath,
+) -> CheckpointResult<CheckpointPoolImage> {
+	let expected_output_length = NonZeroU64::new(
+		state.input_length()
+			.get()
+			.div_ceil(declaration.size().get()),
+	)
+	.expect("nonzero pool extents have a nonzero output length");
+	if state.output_length() != expected_output_length {
+		return Err(validation_error(
+			path.field("output-length"),
+			format!(
+				"pool output length is {}, expected {} for input length {} and size {}",
+				state.output_length(),
+				expected_output_length,
+				state.input_length(),
+				declaration.size()
+			),
+		));
+	}
+	let input_width = state.input_width().ok_or_else(|| {
+		validation_error(
+			path.field("channels"),
+			"pool input length and channel count overflow u64",
+		)
+	})?;
+	let output_width = state.output_width().ok_or_else(|| {
+		validation_error(
+			path.field("channels"),
+			"pool output length and channel count overflow u64",
+		)
+	})?;
+	Ok(CheckpointPoolImage {
+		size: declaration.size(),
+		group_to_neuron: declaration.group_to_neuron(),
+		input_length: state.input_length(),
+		channels: state.channels(),
+		output_length: state.output_length(),
+		input_width,
+		output_width,
+		group_order: state.group_order(),
+		winner_contract: state.winner_contract(),
+	})
 }
 
 fn validate_training_config(
@@ -3118,7 +3420,9 @@ fn validate_vector_metadata(vector: &CheckpointArtifactVector, path: &Checkpoint
 			VectorEncoding::DictionaryI32,
 			CheckpointArtifactMetadata::Categorical { dictionary },
 		) => {
-			validate_byte_dictionary(dictionary, &path.field("metadata"), true)?;
+			if !dictionary.is_empty() || vector.role != VectorRole::Target {
+				validate_byte_dictionary(dictionary, &path.field("metadata"), true)?;
+			}
 			true
 		}
 		(
@@ -3296,31 +3600,31 @@ fn validate_task(
 					"binary task requires binary cross entropy",
 				));
 			}
-			if positive_code != 1 {
-				return Err(validation_error(
-					path.field("positive-code"),
-					"checkpoint v5 binary targets reserve code 1 as positive",
-				));
-			}
-			let compatible = matches!(
-				(target.semantic_type, target.encoding, &target.metadata),
+			let expected_positive_code = match (target.semantic_type, target.encoding, &target.metadata) {
 				(
 					SemanticType::Numeric,
 					VectorEncoding::I32 | VectorEncoding::F32,
-					CheckpointArtifactMetadata::None
-				)
-			) || matches!(
-				(target.semantic_type, target.encoding, &target.metadata),
+					CheckpointArtifactMetadata::None,
+				) => Some(1),
 				(
 					SemanticType::Categorical,
 					VectorEncoding::DictionaryI32,
-					CheckpointArtifactMetadata::Categorical { dictionary }
-				) if dictionary.len() == 2
-			);
-			if !compatible {
+					CheckpointArtifactMetadata::Categorical { dictionary },
+				) if dictionary.len() <= 2 => Some(i32::try_from(dictionary.len()).expect("length at most two") - 1),
+				_ => None,
+			};
+			let Some(expected_positive_code) = expected_positive_code else {
 				return Err(validation_error(
 					path.clone(),
-					"target schema is incompatible with checkpoint-v5 BCE",
+					"target schema is incompatible with checkpoint categorical BCE",
+				));
+			};
+			if positive_code != expected_positive_code {
+				return Err(validation_error(
+					path.field("positive-code"),
+					format!(
+						"binary positive code is {positive_code}, expected {expected_positive_code} from the saved target schema"
+					),
 				));
 			}
 		}
@@ -3509,10 +3813,16 @@ fn validate_feature_spans(artifact: &CheckpointArtifact, path: &CheckpointPath) 
 	Ok(())
 }
 
-fn validate_effective_model(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+fn validate_effective_model(
+	artifact: &CheckpointArtifact,
+	path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
 	match artifact.format_version {
-		FLAT_CHECKPOINT_FORMAT_VERSION => validate_effective_flat_model(artifact, path),
-		STRUCTURED_CHECKPOINT_FORMAT_VERSION => validate_effective_structured_model(artifact, path),
+		FLAT_CHECKPOINT_FORMAT_VERSION => validate_effective_flat_model(artifact, path, tensor_validation),
+		STRUCTURED_CHECKPOINT_FORMAT_VERSION | POOL_CHECKPOINT_FORMAT_VERSION => {
+			validate_effective_structured_model(artifact, path, tensor_validation)
+		}
 		version => Err(invalid_value(
 			CheckpointPath::root().field("recipe").field("version"),
 			format!("unsupported checkpoint version {version}"),
@@ -3520,7 +3830,11 @@ fn validate_effective_model(artifact: &CheckpointArtifact, path: &CheckpointPath
 	}
 }
 
-fn validate_effective_flat_model(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+fn validate_effective_flat_model(
+	artifact: &CheckpointArtifact,
+	path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
 	if artifact.layers.is_empty() {
 		return Err(validation_error(
 			path.field("blocks"),
@@ -3612,7 +3926,7 @@ fn validate_effective_flat_model(artifact: &CheckpointArtifact, path: &Checkpoin
 			}
 		}
 	}
-	validate_normalization_state(artifact, &path.field("normalization"))?;
+	validate_normalization_state(artifact, &path.field("normalization"), tensor_validation)?;
 	let mut input_width = u64::try_from(artifact.feature_width).map_err(|error| {
 		validation_error(
 			path.field("input-width"),
@@ -3626,16 +3940,23 @@ fn validate_effective_flat_model(artifact: &CheckpointArtifact, path: &Checkpoin
 			&layer.weight,
 			&layer_path.field("weight"),
 			&[input_width, output_width],
+			tensor_validation,
 		)?;
-		validate_parameter(&layer.bias, &layer_path.field("bias"), &[output_width])?;
+		validate_parameter(
+			&layer.bias,
+			&layer_path.field("bias"),
+			&[output_width],
+			tensor_validation,
+		)?;
 		input_width = output_width;
 	}
-	validate_temperature(artifact, &path.field("calibration"))
+	validate_temperature(artifact, &path.field("calibration"), tensor_validation)
 }
 
 fn validate_effective_structured_model(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
 ) -> CheckpointResult<()> {
 	if artifact.blocks.is_empty() {
 		return Err(validation_error(
@@ -3643,6 +3964,7 @@ fn validate_effective_structured_model(
 			"effective model has no blocks",
 		));
 	}
+	validate_structured_pool_declarations(artifact, path)?;
 	let target_width = artifact.task.output_width();
 	match artifact.output_adapter {
 		Some(adapter) => {
@@ -3690,7 +4012,10 @@ fn validate_effective_structured_model(
 			{
 				return Err(validation_error(
 					path.field("output-adapter"),
-					"serialized adapter is redundant under the checkpoint-v6 effective-block rule",
+					format!(
+						"serialized adapter is redundant under the checkpoint-v{} effective-block rule",
+						artifact.format_version
+					),
 				));
 			}
 		}
@@ -3719,13 +4044,15 @@ fn validate_effective_structured_model(
 			}
 		}
 	}
-	validate_normalization_state(artifact, &path.field("normalization"))?;
+	validate_normalization_state(artifact, &path.field("normalization"), tensor_validation)?;
 	let mut input_width = u64::try_from(artifact.feature_width).map_err(|error| {
 		validation_error(
 			path.field("input-width"),
 			format!("feature width cannot be represented by u64: {error}"),
 		)
 	})?;
+	let mut logical_length = input_width;
+	let mut logical_channels = 1u64;
 	for (index, block) in artifact.blocks.iter().enumerate() {
 		let block_path = path.field("blocks").index(index);
 		match block {
@@ -3735,9 +4062,55 @@ fn validate_effective_structured_model(
 					&layer.weight,
 					&block_path.field("weight"),
 					&[input_width, output_width],
+					tensor_validation,
 				)?;
-				validate_parameter(&layer.bias, &block_path.field("bias"), &[output_width])?;
+				validate_parameter(
+					&layer.bias,
+					&block_path.field("bias"),
+					&[output_width],
+					tensor_validation,
+				)?;
+				if let Some(CheckpointBlockImage::Pool(pool)) = index
+					.checked_sub(1)
+					.and_then(|previous| artifact.blocks.get(previous))
+				{
+					validate_pool_routed_weight(pool, layer, &block_path, tensor_validation)?;
+				}
 				input_width = output_width;
+				logical_length = output_width;
+				logical_channels = 1;
+			}
+			CheckpointBlockImage::Pool(pool) => {
+				if pool.input_width.get() != input_width {
+					return Err(validation_error(
+						block_path.field("input-length"),
+						format!(
+							"pool input width is {}, preceding block width is {input_width}",
+							pool.input_width
+						),
+					));
+				}
+				if pool.input_length.get() != logical_length {
+					return Err(validation_error(
+						block_path.field("input-length"),
+						format!(
+							"pool input length is {}, expected {logical_length} from the preceding logical shape",
+							pool.input_length
+						),
+					));
+				}
+				if pool.channels.get() != logical_channels {
+					return Err(validation_error(
+						block_path.field("channels"),
+						format!(
+							"pool channel count is {}, expected {logical_channels} from the preceding logical shape",
+							pool.channels
+						),
+					));
+				}
+				input_width = pool.output_width.get();
+				logical_length = pool.output_length.get();
+				logical_channels = pool.channels.get();
 			}
 			CheckpointBlockImage::Residual(residual) => {
 				let residual_input_width = input_width;
@@ -3752,8 +4125,14 @@ fn validate_effective_structured_model(
 							&layer.weight,
 							&step_path.field("weight"),
 							&[branch_width, output_width],
+							tensor_validation,
 						)?;
-						validate_parameter(&layer.bias, &step_path.field("bias"), &[output_width])?;
+						validate_parameter(
+							&layer.bias,
+							&step_path.field("bias"),
+							&[output_width],
+							tensor_validation,
+						)?;
 						branch_width = output_width;
 					}
 				}
@@ -3770,6 +4149,7 @@ fn validate_effective_structured_model(
 							projection,
 							&block_path.field("skip").field("weight"),
 							&[residual_input_width, branch_width],
+							tensor_validation,
 						)?;
 					}
 					(CheckpointResidualSkipImage::Identity, false) => {
@@ -3786,13 +4166,122 @@ fn validate_effective_structured_model(
 					}
 				}
 				input_width = branch_width;
+				logical_length = branch_width;
+				logical_channels = 1;
 			}
 		}
 	}
-	validate_temperature(artifact, &path.field("calibration"))
+	validate_temperature(artifact, &path.field("calibration"), tensor_validation)
 }
 
-fn validate_normalization_state(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+fn validate_structured_pool_declarations(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+	for (index, block) in artifact.blocks.iter().enumerate() {
+		let CheckpointBlockImage::Pool(pool) = block else {
+			continue;
+		};
+		let block_path = path.field("blocks").index(index);
+		let expected = checkpoint_pool_image(
+			DensePool::new(pool.size, pool.group_to_neuron),
+			DensePoolState::new(pool.input_length, pool.channels, pool.output_length),
+			&block_path,
+		)?;
+		if *pool != expected {
+			return Err(validation_error(
+				block_path.clone(),
+				"pool cached widths or semantic contracts differ from its saved shape",
+			));
+		}
+		let Some(neurons) = pool.group_to_neuron else {
+			continue;
+		};
+		let Some(CheckpointBlockImage::Layer(layer)) = artifact.blocks.get(index + 1) else {
+			return Err(validation_error(
+				block_path.field("group-to-neuron"),
+				"pool group-to-neuron routing requires an immediately following ordinary layer",
+			));
+		};
+		if layer.declaration.kind() != DenseBlockKind::Layer || layer.declaration.width() != neurons {
+			return Err(validation_error(
+				block_path.field("group-to-neuron"),
+				format!(
+					"pool routes to {neurons} neurons, but the immediately following block is not an ordinary layer of that width"
+				),
+			));
+		}
+	}
+	Ok(())
+}
+
+fn validate_pool_routed_weight(
+	pool: &CheckpointPoolImage,
+	layer: &CheckpointLayerImage,
+	layer_path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
+	let Some(neurons) = pool.group_to_neuron else {
+		return Ok(());
+	};
+	if tensor_validation == CheckpointTensorValidation::Declaration {
+		return Ok(());
+	}
+	let routing = DenseGroupToNeuronRouting::resolve(pool.output_length, neurons);
+	for (name, tensor) in [
+		("parameter", &layer.weight.parameter),
+		("first-moment", &layer.weight.first_moment),
+		("second-moment", &layer.weight.second_moment),
+	] {
+		let neurons = usize::try_from(neurons.get()).map_err(|error| {
+			validation_error(
+				layer_path.field("weight").field(name).field("shape"),
+				format!("routed neuron width cannot be represented by usize: {error}"),
+			)
+		})?;
+		let channels = usize::try_from(pool.channels.get()).map_err(|error| {
+			validation_error(
+				layer_path.field("weight").field(name).field("shape"),
+				format!("pool channel count cannot be represented by usize: {error}"),
+			)
+		})?;
+		for (entry, bytes) in tensor.bytes.chunks_exact(4).enumerate() {
+			let input = entry / neurons;
+			let neuron = entry % neurons;
+			let group = input / channels;
+			let allowed = match routing {
+				DenseGroupToNeuronRouting::Identity { .. } => neuron == group,
+				DenseGroupToNeuronRouting::Expand {
+					neurons_per_group, ..
+				} => {
+					neuron / usize::try_from(neurons_per_group.get()).expect("routing divisor fits usize")
+						== group
+				}
+				DenseGroupToNeuronRouting::Contract {
+					groups_per_neuron, ..
+				} => {
+					group / usize::try_from(groups_per_neuron.get()).expect("routing divisor fits usize")
+						== neuron
+				}
+				DenseGroupToNeuronRouting::FullyConnected { .. } => true,
+			};
+			if !allowed && u32::from_le_bytes(bytes.try_into().expect("exact four-byte tensor chunk")) != 0 {
+				return Err(validation_error(
+					layer_path
+						.field("weight")
+						.field(name)
+						.field("payload")
+						.index(entry),
+					"pool-routed dense state requires every disallowed weight entry to be exact +0.0",
+				));
+			}
+		}
+	}
+	Ok(())
+}
+
+fn validate_normalization_state(
+	artifact: &CheckpointArtifact,
+	path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
 	let shape = [u64::try_from(artifact.feature_width).map_err(|error| {
 		validation_error(
 			path.clone(),
@@ -3812,12 +4301,14 @@ fn validate_normalization_state(artifact: &CheckpointArtifact, path: &Checkpoint
 				&path.field("mean"),
 				&shape,
 				false,
+				tensor_validation,
 			)?;
 			validate_f32_tensor(
 				&artifact.normalization[1],
 				&path.field("variance"),
 				&shape,
 				true,
+				tensor_validation,
 			)
 		}
 		DenseDataNormalization::MinMax => {
@@ -3832,22 +4323,26 @@ fn validate_normalization_state(artifact: &CheckpointArtifact, path: &Checkpoint
 				&path.field("minimum"),
 				&shape,
 				false,
+				tensor_validation,
 			)?;
 			validate_f32_tensor(
 				&artifact.normalization[1],
 				&path.field("maximum"),
 				&shape,
 				false,
+				tensor_validation,
 			)?;
-			for (index, (minimum, maximum)) in f32_values(&artifact.normalization[0])
-				.zip(f32_values(&artifact.normalization[1]))
-				.enumerate()
-			{
-				if minimum > maximum {
-					return Err(validation_error(
-						path.field("maximum").field("payload").index(index),
-						format!("maximum {maximum} is below minimum {minimum}"),
-					));
+			if tensor_validation == CheckpointTensorValidation::Payload {
+				for (index, (minimum, maximum)) in f32_values(&artifact.normalization[0])
+					.zip(f32_values(&artifact.normalization[1]))
+					.enumerate()
+				{
+					if minimum > maximum {
+						return Err(validation_error(
+							path.field("maximum").field("payload").index(index),
+							format!("maximum {maximum} is below minimum {minimum}"),
+						));
+					}
 				}
 			}
 			Ok(())
@@ -3868,19 +4363,28 @@ fn validate_parameter(
 	parameter: &CheckpointParameterImage,
 	path: &CheckpointPath,
 	shape: &[u64],
+	tensor_validation: CheckpointTensorValidation,
 ) -> CheckpointResult<()> {
-	validate_f32_tensor(&parameter.parameter, &path.field("parameter"), shape, false)?;
+	validate_f32_tensor(
+		&parameter.parameter,
+		&path.field("parameter"),
+		shape,
+		false,
+		tensor_validation,
+	)?;
 	validate_f32_tensor(
 		&parameter.first_moment,
 		&path.field("first-moment"),
 		shape,
 		false,
+		tensor_validation,
 	)?;
 	validate_f32_tensor(
 		&parameter.second_moment,
 		&path.field("second-moment"),
 		shape,
 		true,
+		tensor_validation,
 	)
 }
 
@@ -3889,6 +4393,7 @@ fn validate_f32_tensor(
 	path: &CheckpointPath,
 	expected_shape: &[u64],
 	require_nonnegative: bool,
+	tensor_validation: CheckpointTensorValidation,
 ) -> CheckpointResult<()> {
 	if tensor.dtype != DType::F32 {
 		return Err(validation_error(
@@ -3924,7 +4429,7 @@ fn validate_f32_tensor(
 		.checked_mul(4)
 		.and_then(|bytes| usize::try_from(bytes).ok())
 		.ok_or_else(|| validation_error(path.field("payload"), "tensor byte size overflowed usize"))?;
-	if tensor.bytes.len() != bytes {
+	if tensor_validation == CheckpointTensorValidation::Payload && tensor.bytes.len() != bytes {
 		return Err(validation_error(
 			path.field("payload"),
 			format!(
@@ -3933,18 +4438,20 @@ fn validate_f32_tensor(
 			),
 		));
 	}
-	for (index, value) in f32_values(tensor).enumerate() {
-		if !value.is_finite() {
-			return Err(invalid_value(
-				path.field("payload").index(index),
-				format!("tensor state contains nonfinite value {value}"),
-			));
-		}
-		if require_nonnegative && value < 0.0 {
-			return Err(invalid_value(
-				path.field("payload").index(index),
-				format!("tensor state contains negative value {value}"),
-			));
+	if tensor_validation == CheckpointTensorValidation::Payload {
+		for (index, value) in f32_values(tensor).enumerate() {
+			if !value.is_finite() {
+				return Err(invalid_value(
+					path.field("payload").index(index),
+					format!("tensor state contains nonfinite value {value}"),
+				));
+			}
+			if require_nonnegative && value < 0.0 {
+				return Err(invalid_value(
+					path.field("payload").index(index),
+					format!("tensor state contains negative value {value}"),
+				));
+			}
 		}
 	}
 	Ok(())
@@ -3956,7 +4463,11 @@ fn f32_values(tensor: &CheckpointTensorImage) -> impl Iterator<Item = f32> + '_ 
 		.map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact four-byte chunk")))
 }
 
-fn validate_temperature(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
+fn validate_temperature(
+	artifact: &CheckpointArtifact,
+	path: &CheckpointPath,
+	tensor_validation: CheckpointTensorValidation,
+) -> CheckpointResult<()> {
 	match (
 		&artifact.temperature,
 		artifact.bounds.calibration_iterations,
@@ -3979,7 +4490,16 @@ fn validate_temperature(artifact: &CheckpointArtifact, path: &CheckpointPath) ->
 					"temperature scaling is retained only for binary BCE training",
 				));
 			}
-			validate_f32_tensor(temperature, &path.field("temperature"), &[1], true)?;
+			validate_f32_tensor(
+				temperature,
+				&path.field("temperature"),
+				&[1],
+				true,
+				tensor_validation,
+			)?;
+			if tensor_validation == CheckpointTensorValidation::Declaration {
+				return Ok(());
+			}
 			let temperature_value = f32_values(temperature)
 				.next()
 				.expect("validated scalar tensor");
@@ -4039,12 +4559,17 @@ struct CheckpointResidual {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CheckpointBlock {
 	Layer(CheckpointLayer),
+	Pool(CheckpointPoolImage),
 	Residual(CheckpointResidual),
 }
 
 /// Immutable semantic description used to interpret a completed execution's
 /// egress images. It contains no dataset rows, executable artifacts, devices,
 /// queues, contexts, or native handles.
+///
+/// Current formats omit the accepted-update counter, beta powers, and
+/// early-stopping latch. They are inference/model snapshots, not exact
+/// training-resume points; resume remains rejected.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointManifest {
 	format_version: u32,
@@ -4065,10 +4590,15 @@ impl CheckpointManifest {
 	/// Capture only the declaration and no-row schema needed to interpret the
 	/// final model state.
 	pub fn from_compiled(training: &CompiledTraining) -> CheckpointResult<Self> {
-		let structured = training
+		let contains_pool = training
 			.blocks()
 			.iter()
-			.any(|block| matches!(block, DenseBlock::Residual(_)));
+			.any(|block| matches!(block, DenseBlock::Pool(_)));
+		let structured = contains_pool
+			|| training
+				.blocks()
+				.iter()
+				.any(|block| matches!(block, DenseBlock::Residual(_)));
 		if !structured && training.layers().len() != training.outputs().layers.len() {
 			return Err(CheckpointError::manifest(format!(
 				"{} effective layers produced {} layer states",
@@ -4114,7 +4644,11 @@ impl CheckpointManifest {
 			let mut config = training.config().clone();
 			config.layers.clear();
 			(
-				STRUCTURED_CHECKPOINT_FORMAT_VERSION,
+				if contains_pool {
+					POOL_CHECKPOINT_FORMAT_VERSION
+				} else {
+					STRUCTURED_CHECKPOINT_FORMAT_VERSION
+				},
 				config,
 				Vec::new(),
 				checkpoint_blocks(training, training.blocks(), &output.blocks)?,
@@ -4154,6 +4688,7 @@ impl CheckpointManifest {
 			blocks,
 			temperature,
 		};
+		validate_manifest_semantic_invariants(&manifest).map_err(manifest_semantic_error)?;
 		manifest.validate_external_boundary(training)?;
 		Ok(manifest)
 	}
@@ -4200,6 +4735,7 @@ impl CheckpointManifest {
 					push_checkpoint_parameter_tensors(&mut tensors, &layer.weight);
 					push_checkpoint_parameter_tensors(&mut tensors, &layer.bias);
 				}
+				CheckpointBlock::Pool(_) => {}
 				CheckpointBlock::Residual(residual) => {
 					for step in &residual.branch {
 						if let CheckpointResidualBranch::Layer(layer) = step {
@@ -4245,6 +4781,22 @@ impl CheckpointManifest {
 	}
 }
 
+fn validate_manifest_semantic_invariants(manifest: &CheckpointManifest) -> CheckpointResult<()> {
+	let artifact = declaration_artifact_from_manifest(manifest);
+	validate_checkpoint_semantic_invariants(
+		&artifact,
+		CheckpointTopologyStorage::Manifest,
+		CheckpointTensorValidation::Declaration,
+	)
+}
+
+fn manifest_semantic_error(error: CheckpointError) -> CheckpointError {
+	match error {
+		CheckpointError::Decode(error) => CheckpointError::manifest(error.to_string()),
+		other => other,
+	}
+}
+
 fn checkpoint_layer(
 	training: &CompiledTraining,
 	declaration: DenseLayer,
@@ -4277,11 +4829,22 @@ fn checkpoint_blocks(
 			(DenseBlock::Layer(layer), DenseBlockState::Layer(state)) => {
 				checkpoint_layer(training, layer.clone(), *state).map(CheckpointBlock::Layer)
 			}
+			(DenseBlock::Pool(pool), DenseBlockState::Pool(state)) => checkpoint_pool_image(
+				*pool,
+				*state,
+				&CheckpointPath::root()
+					.field("recipe")
+					.field("model")
+					.field("blocks")
+					.index(index),
+			)
+			.map(CheckpointBlock::Pool)
+			.map_err(manifest_semantic_error),
 			(DenseBlock::Residual(residual), DenseBlockState::Residual(state)) => {
 				checkpoint_residual(training, residual, state).map(CheckpointBlock::Residual)
 			}
 			_ => Err(CheckpointError::manifest(format!(
-				"structured block {index} declaration and optimizer state have different kinds"
+				"structured block {index} declaration and saved state have different kinds"
 			))),
 		})
 		.collect()
@@ -4338,10 +4901,7 @@ fn checkpoint_residual(
 	})
 }
 
-fn push_checkpoint_parameter_tensors<'a>(
-	tensors: &mut Vec<&'a CheckpointTensor>,
-	parameter: &'a CheckpointParameter,
-) {
+fn push_checkpoint_parameter_tensors<'a>(tensors: &mut Vec<&'a CheckpointTensor>, parameter: &'a CheckpointParameter) {
 	tensors.extend([
 		&parameter.parameter,
 		&parameter.first_moment,
@@ -4407,8 +4967,9 @@ impl CompletedTrainingCheckpoint {
 		self.execution
 	}
 
-	/// Persist the semantic model and exact final tensor bits without retaining
-	/// or serializing any native artifact.
+	/// Persist the semantic model and the tensor images represented by this
+	/// snapshot bit-for-bit, without retaining or serializing native artifacts.
+	/// This does not make the snapshot an exact training-resume point.
 	pub fn save(&self, path: impl AsRef<Path>) -> CheckpointResult<()> {
 		let path = path.as_ref();
 		let outputs = self.output_bytes();
@@ -4524,30 +5085,108 @@ fn encode_checkpoint(
 	outputs: &BTreeMap<ValueId, &[u8]>,
 	writer: &mut impl Write,
 ) -> io::Result<()> {
-	validate_manifest_topology_for_encoding(manifest)?;
-	encode_artifact(&artifact_from_manifest(manifest, outputs)?, writer)
+	validate_manifest_semantic_invariants(manifest).map_err(checkpoint_validation_io_error)?;
+	let artifact = artifact_from_manifest(manifest, outputs)?;
+	validate_artifact(&artifact).map_err(checkpoint_validation_io_error)?;
+	encode_artifact(&artifact, writer)
 }
 
-fn validate_manifest_topology_for_encoding(manifest: &CheckpointManifest) -> io::Result<()> {
-	let valid = match manifest.format_version {
-		FLAT_CHECKPOINT_FORMAT_VERSION => !manifest.layers.is_empty() && manifest.blocks.is_empty(),
-		STRUCTURED_CHECKPOINT_FORMAT_VERSION => {
-			manifest.layers.is_empty()
-				&& !manifest.blocks.is_empty()
-				&& manifest
-					.blocks
-					.iter()
-					.any(|block| matches!(block, CheckpointBlock::Residual(_)))
-		}
-		_ => false,
-	};
-	if !valid {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidData,
-			"checkpoint manifest mixes incompatible flat and structured topology",
-		));
+fn checkpoint_validation_io_error(error: CheckpointError) -> io::Error {
+	io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn declaration_artifact_from_manifest(manifest: &CheckpointManifest) -> CheckpointArtifact {
+	CheckpointArtifact {
+		format_version: manifest.format_version,
+		vectors: manifest
+			.vectors
+			.iter()
+			.map(|vector| CheckpointArtifactVector {
+				source_index: vector.source_index,
+				name: vector.name.clone(),
+				role: vector.role,
+				semantic_type: vector.semantic_type,
+				encoding: vector.encoding,
+				metadata: artifact_metadata(&vector.metadata),
+			})
+			.collect(),
+		feature_spans: manifest.feature_spans.clone(),
+		feature_normalization_mask: feature_normalization_mask(&manifest.feature_spans, manifest.feature_width),
+		feature_width: manifest.feature_width,
+		task: manifest.task,
+		output_adapter: manifest.output_adapter,
+		config: manifest.config.clone(),
+		bounds: manifest.bounds,
+		normalization: manifest
+			.normalization
+			.iter()
+			.map(declaration_tensor_image)
+			.collect(),
+		layers: manifest
+			.layers
+			.iter()
+			.map(declaration_layer_image)
+			.collect(),
+		blocks: manifest
+			.blocks
+			.iter()
+			.map(declaration_block_image)
+			.collect(),
+		temperature: manifest.temperature.as_ref().map(declaration_tensor_image),
 	}
-	Ok(())
+}
+
+fn declaration_tensor_image(tensor: &CheckpointTensor) -> CheckpointTensorImage {
+	CheckpointTensorImage {
+		dtype: tensor.dtype,
+		shape: tensor.shape.clone(),
+		bytes: Vec::new(),
+	}
+}
+
+fn declaration_parameter_image(parameter: &CheckpointParameter) -> CheckpointParameterImage {
+	CheckpointParameterImage {
+		parameter: declaration_tensor_image(&parameter.parameter),
+		first_moment: declaration_tensor_image(&parameter.first_moment),
+		second_moment: declaration_tensor_image(&parameter.second_moment),
+	}
+}
+
+fn declaration_layer_image(layer: &CheckpointLayer) -> CheckpointLayerImage {
+	CheckpointLayerImage {
+		declaration: layer.declaration.clone(),
+		weight: declaration_parameter_image(&layer.weight),
+		bias: declaration_parameter_image(&layer.bias),
+	}
+}
+
+fn declaration_block_image(block: &CheckpointBlock) -> CheckpointBlockImage {
+	match block {
+		CheckpointBlock::Layer(layer) => CheckpointBlockImage::Layer(declaration_layer_image(layer)),
+		CheckpointBlock::Pool(pool) => CheckpointBlockImage::Pool(*pool),
+		CheckpointBlock::Residual(residual) => CheckpointBlockImage::Residual(CheckpointResidualImage {
+			branch: residual
+				.branch
+				.iter()
+				.map(|step| match step {
+					CheckpointResidualBranch::Layer(layer) => {
+						CheckpointResidualBranchImage::Layer(declaration_layer_image(layer))
+					}
+					CheckpointResidualBranch::Operation(operation) => {
+						CheckpointResidualBranchImage::Operation(*operation)
+					}
+				})
+				.collect(),
+			output_width: residual.output_width,
+			skip: match &residual.skip {
+				CheckpointResidualSkip::Identity => CheckpointResidualSkipImage::Identity,
+				CheckpointResidualSkip::Projection(projection) => {
+					CheckpointResidualSkipImage::Projection(declaration_parameter_image(projection))
+				}
+			},
+			operations: residual.operations.clone(),
+		}),
+	}
 }
 
 fn artifact_from_manifest(
@@ -4560,8 +5199,7 @@ fn artifact_from_manifest(
 		.map(|layer| artifact_layer(layer, outputs))
 		.collect::<io::Result<Vec<_>>>()?;
 	let blocks = if manifest.format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
-		layers
-			.iter()
+		layers.iter()
 			.cloned()
 			.map(CheckpointBlockImage::Layer)
 			.collect()
@@ -4608,10 +5246,7 @@ fn artifact_from_manifest(
 	})
 }
 
-fn artifact_layer(
-	layer: &CheckpointLayer,
-	outputs: &BTreeMap<ValueId, &[u8]>,
-) -> io::Result<CheckpointLayerImage> {
+fn artifact_layer(layer: &CheckpointLayer, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointLayerImage> {
 	Ok(CheckpointLayerImage {
 		declaration: layer.declaration.clone(),
 		weight: artifact_parameter(&layer.weight, outputs)?,
@@ -4619,12 +5254,10 @@ fn artifact_layer(
 	})
 }
 
-fn artifact_block(
-	block: &CheckpointBlock,
-	outputs: &BTreeMap<ValueId, &[u8]>,
-) -> io::Result<CheckpointBlockImage> {
+fn artifact_block(block: &CheckpointBlock, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointBlockImage> {
 	match block {
 		CheckpointBlock::Layer(layer) => artifact_layer(layer, outputs).map(CheckpointBlockImage::Layer),
+		CheckpointBlock::Pool(pool) => Ok(CheckpointBlockImage::Pool(*pool)),
 		CheckpointBlock::Residual(residual) => {
 			let branch = residual
 				.branch
@@ -4848,6 +5481,29 @@ fn encode_artifact_block(
 ) -> io::Result<()> {
 	match block {
 		CheckpointBlockImage::Layer(layer) => encode_artifact_layer(writer, depth, index, layer),
+		CheckpointBlockImage::Pool(pool) => {
+			write_tabs(writer, depth)?;
+			writeln!(writer, "pool")?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "index\t{index}")?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "size\t{}", pool.size)?;
+			write_tabs(writer, depth + 1)?;
+			match pool.group_to_neuron {
+				Some(neurons) => writeln!(writer, "group-to-neuron\t{neurons}")?,
+				None => writeln!(writer, "group-to-neuron\tnone")?,
+			}
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "input-length\t{}", pool.input_length)?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "channels\t{}", pool.channels)?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "output-length\t{}", pool.output_length)?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "group-order\tgroup-major-channel-minor")?;
+			write_tabs(writer, depth + 1)?;
+			writeln!(writer, "winner-contract\tlowest-logical-index")
+		}
 		CheckpointBlockImage::Residual(residual) => {
 			write_tabs(writer, depth)?;
 			writeln!(writer, "residual")?;
@@ -4907,11 +5563,7 @@ fn encode_artifact_layer(
 	encode_artifact_parameter(writer, depth + 2, &layer.bias)
 }
 
-fn encode_artifact_operations(
-	writer: &mut impl Write,
-	depth: usize,
-	operations: &[DenseOperation],
-) -> io::Result<()> {
+fn encode_artifact_operations(writer: &mut impl Write, depth: usize, operations: &[DenseOperation]) -> io::Result<()> {
 	write_tabs(writer, depth)?;
 	writeln!(writer, "operations\t{}", operations.len())?;
 	for operation in operations {
@@ -5518,6 +6170,26 @@ pub(crate) fn encoded_categorical_feature_test_checkpoint_fixture() -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn encoded_multiclass_test_checkpoint_fixture() -> Vec<u8> {
+	tests::encoded_multiclass_test_checkpoint()
+}
+
+#[cfg(test)]
+pub(crate) fn encoded_regression_test_checkpoint_fixture() -> Vec<u8> {
+	tests::encoded_regression_test_checkpoint()
+}
+
+#[cfg(test)]
+pub(crate) fn encoded_calibrated_test_checkpoint_fixture() -> Vec<u8> {
+	tests::encoded_calibrated_test_checkpoint()
+}
+
+#[cfg(test)]
+pub(crate) fn encoded_residual_test_checkpoint_fixture() -> Vec<u8> {
+	tests::encoded_projected_residual_checkpoint()
+}
+
+#[cfg(test)]
 mod tests {
 	use core::num::{NonZeroU64, NonZeroUsize};
 	use std::os::unix::fs::PermissionsExt;
@@ -5543,7 +6215,7 @@ mod tests {
 	}
 
 	#[test]
-	fn checkpoint_v6_roundtrips_ordered_residual_projection_and_every_optimizer_tensor() {
+	fn checkpoint_v6_roundtrips_ordered_residual_projection_and_saved_parameter_moments() {
 		let manifest = projected_residual_manifest();
 		let owned = owned_outputs(&manifest);
 		let outputs = borrowed_outputs(&owned);
@@ -5554,11 +6226,16 @@ mod tests {
 
 		let decoded = decode_checkpoint(&encoded, CheckpointDecodeLimits::default()).unwrap();
 
-		assert_eq!(decoded.format_version(), STRUCTURED_CHECKPOINT_FORMAT_VERSION);
+		assert_eq!(
+			decoded.format_version(),
+			STRUCTURED_CHECKPOINT_FORMAT_VERSION
+		);
 		assert!(decoded.layers().is_empty());
 		assert_eq!(decoded, expected_artifact);
-		let [CheckpointBlockImage::Residual(residual), CheckpointBlockImage::Layer(adapter)] =
-			decoded.blocks()
+		let [
+			CheckpointBlockImage::Residual(residual),
+			CheckpointBlockImage::Layer(adapter),
+		] = decoded.blocks()
 		else {
 			panic!("expected residual plus effective adapter topology");
 		};
@@ -5586,7 +6263,9 @@ mod tests {
 		assert_eq!(projection.second_moment().shape(), [1, 2]);
 		assert_eq!(
 			residual.operations(),
-			[DenseOperation::Normalization(crate::DenseNormalization::Layer)]
+			[DenseOperation::Normalization(
+				crate::DenseNormalization::Layer
+			)]
 		);
 		assert_eq!(adapter.declaration().width().get(), 1);
 		assert_eq!(decoded.encode().unwrap(), encoded);
@@ -5607,6 +6286,233 @@ mod tests {
 		};
 		assert_eq!(residual.skip(), &CheckpointResidualSkipImage::Identity);
 		assert_eq!(decoded.encode().unwrap(), encoded);
+	}
+
+	#[test]
+	fn checkpoint_v7_roundtrips_pool_shape_contracts_routing_and_parameter_free_state() {
+		let manifest = routed_pool_manifest();
+		let owned = owned_outputs(&manifest);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&manifest, &outputs, &mut encoded).unwrap();
+
+		let decoded = decode_checkpoint(&encoded, CheckpointDecodeLimits::default()).unwrap();
+
+		assert_eq!(decoded.format_version(), POOL_CHECKPOINT_FORMAT_VERSION);
+		assert!(decoded.layers().is_empty());
+		let [
+			CheckpointBlockImage::Pool(pool),
+			CheckpointBlockImage::Layer(layer),
+			CheckpointBlockImage::Layer(adapter),
+		] = decoded.blocks()
+		else {
+			panic!("expected pool, routed layer, and synthetic adapter");
+		};
+		assert_eq!(pool.size().get(), 2);
+		assert_eq!(pool.group_to_neuron().map(NonZeroU64::get), Some(3));
+		assert_eq!(pool.input_length().get(), 6);
+		assert_eq!(pool.channels().get(), 1);
+		assert_eq!(pool.output_length().get(), 3);
+		assert_eq!(pool.input_width().get(), 6);
+		assert_eq!(pool.output_width().get(), 3);
+		assert_eq!(
+			pool.group_order(),
+			DensePoolGroupOrder::GroupMajorChannelMinor
+		);
+		assert_eq!(
+			pool.winner_contract(),
+			DensePoolWinnerContract::LowestLogicalIndex
+		);
+		assert_eq!(layer.weight().parameter().shape(), [3, 3]);
+		assert_eq!(adapter.weight().parameter().shape(), [3, 1]);
+		assert_eq!(manifest.tensors().count(), 14);
+		let text = core::str::from_utf8(&encoded).unwrap();
+		assert!(text.contains("\t\t\tpool\n"));
+		assert!(text.contains("\t\t\t\tgroup-to-neuron\t3\n"));
+		assert!(text.contains("\t\t\t\tgroup-order\tgroup-major-channel-minor\n"));
+		assert!(text.contains("\t\t\t\twinner-contract\tlowest-logical-index\n"));
+		assert_eq!(decoded.encode().unwrap(), encoded);
+
+		let mut unrouted = routed_pool_manifest();
+		let CheckpointBlock::Pool(pool) = &mut unrouted.blocks[0] else {
+			panic!("pool fixture lost its first block");
+		};
+		pool.group_to_neuron = None;
+		let owned = owned_outputs(&unrouted);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&unrouted, &outputs, &mut encoded).unwrap();
+		assert!(
+			core::str::from_utf8(&encoded)
+				.unwrap()
+				.contains("\t\t\t\tgroup-to-neuron\tnone\n")
+		);
+		assert_eq!(
+			decode_checkpoint(&encoded, CheckpointDecodeLimits::default())
+				.unwrap()
+				.encode()
+				.unwrap(),
+			encoded
+		);
+	}
+
+	#[test]
+	fn checkpoint_v7_rejects_pool_under_old_versions_and_corrupt_shape_or_routing_contracts() {
+		let manifest = routed_pool_manifest();
+		let owned = owned_outputs(&manifest);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&manifest, &outputs, &mut encoded).unwrap();
+		let text = String::from_utf8(encoded).unwrap();
+
+		let v6 = text.replacen("\tversion\t7\n", "\tversion\t6\n", 1);
+		assert_decode_error(
+			v6.as_bytes(),
+			CheckpointDecodeErrorKind::InvalidValue,
+			"recipe.model.blocks[0]",
+		);
+
+		let output_length = text.replacen(
+			"\t\t\t\toutput-length\t3\n",
+			"\t\t\t\toutput-length\t4\n",
+			1,
+		);
+		assert_decode_error(
+			output_length.as_bytes(),
+			CheckpointDecodeErrorKind::InconsistentValue,
+			"recipe.model.blocks[0].output-length",
+		);
+
+		let group_order = text.replacen(
+			"\t\t\t\tgroup-order\tgroup-major-channel-minor\n",
+			"\t\t\t\tgroup-order\tchannel-major-group-minor\n",
+			1,
+		);
+		assert_decode_error(
+			group_order.as_bytes(),
+			CheckpointDecodeErrorKind::InvalidValue,
+			"recipe.model.blocks[0].group-order",
+		);
+
+		let missing_winner = text.replacen("\t\t\t\twinner-contract\tlowest-logical-index\n", "", 1);
+		assert_decode_error(
+			missing_winner.as_bytes(),
+			CheckpointDecodeErrorKind::MissingField,
+			"recipe.model.blocks[0].winner-contract",
+		);
+
+		let routed_width = text.replacen(
+			"\t\t\t\tgroup-to-neuron\t3\n",
+			"\t\t\t\tgroup-to-neuron\t4\n",
+			1,
+		);
+		assert_decode_error(
+			routed_width.as_bytes(),
+			CheckpointDecodeErrorKind::InconsistentValue,
+			"recipe.model.blocks[0].group-to-neuron",
+		);
+	}
+
+	#[test]
+	fn checkpoint_v6_encoder_rejects_pool_even_when_a_residual_is_present() {
+		let mut manifest = routed_pool_manifest();
+		manifest.format_version = STRUCTURED_CHECKPOINT_FORMAT_VERSION;
+		let residual = identity_residual_manifest()
+			.blocks
+			.into_iter()
+			.next()
+			.expect("identity residual fixture has one block");
+		manifest.blocks.insert(0, residual);
+
+		let error = encode_checkpoint(&manifest, &BTreeMap::new(), &mut Vec::new()).unwrap_err();
+
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(
+			error.to_string()
+				.contains("mixes incompatible flat and structured topology")
+		);
+
+		let artifact = declaration_artifact_from_manifest(&manifest);
+		let error = validate_checkpoint_topology(
+			&artifact,
+			&CheckpointPath::root().field("recipe").field("model"),
+			CheckpointTopologyStorage::Artifact,
+		)
+		.unwrap_err();
+		let CheckpointError::Decode(error) = error else {
+			panic!("expected typed v6 pool rejection");
+		};
+		assert_eq!(error.path().to_string(), "recipe.model.blocks");
+		assert_eq!(error.detail(), "checkpoint v6 cannot contain a pool block");
+	}
+
+	#[test]
+	fn checkpoint_v7_requires_exact_positive_zero_in_every_disallowed_routed_weight_state() {
+		for (value, bits) in [
+			(ValueId::new(3), (-0.0f32).to_bits()),
+			(ValueId::new(4), 1.0f32.to_bits()),
+			(ValueId::new(5), 1.0f32.to_bits()),
+		] {
+			let manifest = routed_pool_manifest();
+			let mut owned = owned_outputs(&manifest);
+			owned.get_mut(&value).unwrap()[4..8].copy_from_slice(&bits.to_le_bytes());
+			let outputs = borrowed_outputs(&owned);
+			let error = encode_checkpoint(&manifest, &outputs, &mut Vec::new()).unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+			assert!(error.to_string().contains("exact +0.0"));
+		}
+	}
+
+	#[test]
+	fn checkpoint_v7_pool_routing_masks_identity_expansion_contraction_and_full_connectivity() {
+		for (groups, channels, neurons, allowed_entry, disallowed_entry) in [
+			(2, 2, 2, 2, Some(1)),
+			(2, 1, 4, 1, Some(2)),
+			(4, 1, 2, 2, Some(1)),
+			(3, 1, 2, 3, None),
+		] {
+			let pool = checkpoint_pool_image(
+				DensePool::new(NonZeroU64::new(1).unwrap(), NonZeroU64::new(neurons)),
+				DensePoolState::new(
+					NonZeroU64::new(groups).unwrap(),
+					NonZeroU64::new(channels).unwrap(),
+					NonZeroU64::new(groups).unwrap(),
+				),
+				&CheckpointPath::root(),
+			)
+			.unwrap();
+			let mut layer = zero_layer_image(groups * channels, neurons);
+			set_f32_bits(
+				&mut layer.weight.parameter.bytes,
+				allowed_entry,
+				1.0f32.to_bits(),
+			);
+			validate_pool_routed_weight(
+				&pool,
+				&layer,
+				&CheckpointPath::root(),
+				CheckpointTensorValidation::Payload,
+			)
+			.unwrap();
+			if let Some(entry) = disallowed_entry {
+				set_f32_bits(&mut layer.weight.parameter.bytes, allowed_entry, 0);
+				set_f32_bits(&mut layer.weight.parameter.bytes, entry, 1.0f32.to_bits());
+				let error = validate_pool_routed_weight(
+					&pool,
+					&layer,
+					&CheckpointPath::root(),
+					CheckpointTensorValidation::Payload,
+				)
+				.unwrap_err();
+				let CheckpointError::Decode(error) = error else {
+					panic!("expected routed payload decode error");
+				};
+				assert_eq!(
+					error.path().segments().last(),
+					Some(&CheckpointPathSegment::Index(entry))
+				);
+			}
+		}
 	}
 
 	#[test]
@@ -5634,10 +6540,7 @@ mod tests {
 			.map(|offset| skip_start + offset)
 			.unwrap();
 		let mut missing_projection = text.clone();
-		missing_projection.replace_range(
-			skip_start..operations_start,
-			"\t\t\t\tskip\tidentity\n",
-		);
+		missing_projection.replace_range(skip_start..operations_start, "\t\t\t\tskip\tidentity\n");
 		assert_decode_error(
 			missing_projection.as_bytes(),
 			CheckpointDecodeErrorKind::InconsistentValue,
@@ -5671,6 +6574,73 @@ mod tests {
 
 		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 		assert!(error.to_string().contains("mixes incompatible"));
+	}
+
+	#[test]
+	fn shared_semantic_checker_rejects_manifest_inconsistency_with_decode_paths() {
+		let mut dataset = test_manifest();
+		dataset.vectors[1].name = dataset.vectors[0].name.clone();
+		assert_manifest_semantic_error(&dataset, "recipe.dataset.vectors[1].name-bytes");
+
+		let mut target = test_manifest();
+		target.task = DenseTask::BinaryClassification {
+			target_vector: 7,
+			positive_code: 1,
+		};
+		assert_manifest_semantic_error(&target, "recipe.dataset.target.source-index");
+
+		let mut classes = multiclass_adapter_manifest();
+		classes.task = DenseTask::MulticlassClassification {
+			target_vector: 1,
+			class_count: 5,
+			reserved_code: 3,
+		};
+		assert_manifest_semantic_error(&classes, "recipe.dataset.target.class-count");
+
+		let mut span = test_manifest();
+		span.feature_spans[0] = CompiledFeatureSpan::new(
+			0,
+			0,
+			2,
+			DenseFeatureLowering::CategoricalOneHot {
+				dictionary_width: 1,
+				reserved_index: 1,
+			},
+		);
+		span.feature_width = 2;
+		assert_manifest_semantic_error(&span, "recipe.dataset.feature-spans[0].lowering");
+
+		let mut normalization = test_manifest();
+		normalization.normalization[0].dtype = DType::I32;
+		assert_manifest_semantic_error(&normalization, "recipe.model.normalization.mean.dtype");
+
+		let mut adapter = test_manifest();
+		adapter.output_adapter = Some(DenseOutputAdapter::new(
+			NonZeroU64::new(2).unwrap(),
+			NonZeroU64::new(1).unwrap(),
+		));
+		assert_manifest_semantic_error(&adapter, "recipe.model.output-adapter");
+
+		let mut parameter = test_manifest();
+		parameter.layers[0].weight.parameter.shape = vec![2, 1];
+		assert_manifest_semantic_error(&parameter, "recipe.model.blocks[0].weight.parameter.shape");
+
+		let mut topology = test_manifest();
+		topology.blocks = identity_residual_manifest().blocks;
+		assert_manifest_semantic_error(&topology, "recipe.model.blocks");
+	}
+
+	#[test]
+	fn encoder_applies_shared_semantic_checker_before_reading_tensor_outputs() {
+		let mut manifest = test_manifest();
+		manifest.layers[0].weight.parameter.shape = vec![2, 1];
+		let error = encode_checkpoint(&manifest, &BTreeMap::new(), &mut Vec::new()).unwrap_err();
+
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(
+			error.to_string()
+				.contains("recipe.model.blocks[0].weight.parameter.shape")
+		);
 	}
 
 	#[test]
@@ -5712,6 +6682,63 @@ mod tests {
 		);
 		assert_eq!(decoded.decode_multiclass_class(4), None);
 		assert_eq!(decoded.encode().unwrap(), encoded);
+	}
+
+	#[test]
+	fn categorical_target_snapshots_accept_zero_known_labels_without_inventing_labels() {
+		for (dictionary, positive_code) in [
+			(Vec::<Vec<u8>>::new(), -1),
+			(vec![b"known".to_vec()], 0),
+			(vec![b"negative".to_vec(), b"positive".to_vec()], 1),
+		] {
+			let mut binary = test_manifest();
+			binary.vectors[1].semantic_type = SemanticType::Categorical;
+			binary.vectors[1].encoding = VectorEncoding::DictionaryI32;
+			binary.vectors[1].metadata = VectorMetadata::Categorical { dictionary };
+			binary.task = DenseTask::BinaryClassification {
+				target_vector: 1,
+				positive_code,
+			};
+			assert_manifest_roundtrip(&binary);
+		}
+		let mut wrong_binding = test_manifest();
+		wrong_binding.vectors[1].semantic_type = SemanticType::Categorical;
+		wrong_binding.vectors[1].encoding = VectorEncoding::DictionaryI32;
+		wrong_binding.vectors[1].metadata = VectorMetadata::Categorical {
+			dictionary: Vec::new(),
+		};
+		assert_manifest_semantic_error(&wrong_binding, "recipe.dataset.target.positive-code");
+
+		let mut multiclass = test_manifest();
+		multiclass.vectors[1].semantic_type = SemanticType::Categorical;
+		multiclass.vectors[1].encoding = VectorEncoding::DictionaryI32;
+		multiclass.vectors[1].metadata = VectorMetadata::Categorical {
+			dictionary: Vec::new(),
+		};
+		multiclass.task = DenseTask::MulticlassClassification {
+			target_vector: 1,
+			class_count: 1,
+			reserved_code: 0,
+		};
+		multiclass.config.loss = DenseLoss::CrossEntropy;
+		let owned = owned_outputs(&multiclass);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&multiclass, &outputs, &mut encoded).unwrap();
+		let decoded = decode_checkpoint(&encoded, CheckpointDecodeLimits::default()).unwrap();
+		assert_eq!(
+			decoded.decode_multiclass_class(0),
+			Some(DecodedMulticlassClass::ReservedUnseen)
+		);
+		assert_eq!(decoded.decode_multiclass_class(1), None);
+
+		let mut corrupt_binary = test_manifest();
+		corrupt_binary.vectors[1].semantic_type = SemanticType::Categorical;
+		corrupt_binary.vectors[1].encoding = VectorEncoding::DictionaryI32;
+		corrupt_binary.vectors[1].metadata = VectorMetadata::Categorical {
+			dictionary: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+		};
+		assert_manifest_semantic_error(&corrupt_binary, "recipe.dataset.target");
 	}
 
 	#[test]
@@ -5898,17 +6925,16 @@ mod tests {
 	}
 
 	#[test]
-	fn codec_is_deterministic_valid_ogdl_and_preserves_raw_f32_and_i32_bits() {
-		let mut manifest = test_manifest();
-		manifest.normalization[0].dtype = DType::I32;
+	fn codec_is_deterministic_valid_ogdl_and_preserves_raw_f32_bits() {
+		let manifest = test_manifest();
 		let mut owned = owned_outputs(&manifest);
 		owned.insert(
 			manifest.normalization[0].value,
-			vec![0xff, 0xff, 0xff, 0xff],
+			vec![0x01, 0x00, 0x00, 0x00],
 		);
 		owned.insert(
 			manifest.normalization[1].value,
-			vec![0x01, 0x00, 0xc0, 0x7f],
+			vec![0x00, 0x00, 0x80, 0x3f],
 		);
 		let outputs = borrowed_outputs(&owned);
 		let mut first = Vec::new();
@@ -5920,10 +6946,9 @@ mod tests {
 		assert_eq!(first, second);
 		let text = String::from_utf8(first).unwrap();
 		recipe_ogdl::Graph::parse(&text).unwrap();
-		assert!(text.contains("dtype\tint32"));
-		assert!(text.contains("0xffffffff"));
 		assert!(text.contains("dtype\tf32"));
-		assert!(text.contains("0x0100c07f"));
+		assert!(text.contains("0x01000000"));
+		assert!(text.contains("0x0000803f"));
 		assert!(!text.contains("cuda"));
 		assert!(!text.contains("hsaco"));
 		assert!(!text.contains("artifact"));
@@ -5981,16 +7006,7 @@ mod tests {
 
 	#[test]
 	fn checkpoint_v5_records_multiclass_target_and_effective_output_adapter() {
-		let mut manifest = test_manifest();
-		manifest.task = DenseTask::MulticlassClassification {
-			target_vector: 7,
-			class_count: 4,
-			reserved_code: 3,
-		};
-		manifest.output_adapter = Some(DenseOutputAdapter::new(
-			NonZeroU64::new(2).unwrap(),
-			NonZeroU64::new(4).unwrap(),
-		));
+		let manifest = multiclass_adapter_manifest();
 		let owned = owned_outputs(&manifest);
 		let outputs = borrowed_outputs(&owned);
 		let mut encoded = Vec::new();
@@ -6228,7 +7244,9 @@ mod tests {
 				],
 				output_width: NonZeroU64::new(2).unwrap(),
 				skip: CheckpointResidualSkip::Projection(test_parameter(9, &[1, 2])),
-				operations: vec![DenseOperation::Normalization(crate::DenseNormalization::Layer)],
+				operations: vec![DenseOperation::Normalization(
+					crate::DenseNormalization::Layer,
+				)],
 			}),
 			CheckpointBlock::Layer(CheckpointLayer {
 				declaration: DenseLayer::new(NonZeroU64::new(1).unwrap(), DenseActivation::Linear),
@@ -6260,7 +7278,84 @@ mod tests {
 		manifest
 	}
 
-	fn encoded_projected_residual_checkpoint() -> Vec<u8> {
+	fn routed_pool_manifest() -> CheckpointManifest {
+		let mut manifest = test_manifest();
+		manifest.format_version = POOL_CHECKPOINT_FORMAT_VERSION;
+		manifest.vectors = (0..6)
+			.map(|source_index| CheckpointVectorSchema {
+				source_index,
+				name: format!("feature-{source_index}").into_bytes(),
+				role: VectorRole::Feature,
+				semantic_type: SemanticType::Numeric,
+				encoding: VectorEncoding::F32,
+				metadata: VectorMetadata::None,
+			})
+			.chain([CheckpointVectorSchema {
+				source_index: 6,
+				name: b"target".to_vec(),
+				role: VectorRole::Target,
+				semantic_type: SemanticType::Numeric,
+				encoding: VectorEncoding::F32,
+				metadata: VectorMetadata::None,
+			}])
+			.collect();
+		manifest.feature_spans = (0..6)
+			.map(|source_index| {
+				CompiledFeatureSpan::new(
+					source_index,
+					source_index,
+					1,
+					DenseFeatureLowering::NumericScalar,
+				)
+			})
+			.collect();
+		manifest.feature_width = 6;
+		manifest.task = DenseTask::BinaryClassification {
+			target_vector: 6,
+			positive_code: 1,
+		};
+		manifest.config.layers.clear();
+		manifest.layers.clear();
+		manifest.normalization = vec![
+			test_tensor_with_shape(1, DType::F32, &[6]),
+			test_tensor_with_shape(2, DType::F32, &[6]),
+		];
+		manifest.output_adapter = Some(DenseOutputAdapter::new(
+			NonZeroU64::new(3).unwrap(),
+			NonZeroU64::new(1).unwrap(),
+		));
+		manifest.blocks = vec![
+			CheckpointBlock::Pool(
+				checkpoint_pool_image(
+					DensePool::new(NonZeroU64::new(2).unwrap(), NonZeroU64::new(3)),
+					DensePoolState::new(
+						NonZeroU64::new(6).unwrap(),
+						NonZeroU64::new(1).unwrap(),
+						NonZeroU64::new(3).unwrap(),
+					),
+					&CheckpointPath::root()
+						.field("recipe")
+						.field("model")
+						.field("blocks")
+						.index(0),
+				)
+				.unwrap(),
+			),
+			CheckpointBlock::Layer(CheckpointLayer {
+				declaration: DenseLayer::new(NonZeroU64::new(3).unwrap(), DenseActivation::Linear),
+				weight: test_parameter(3, &[3, 3]),
+				bias: test_parameter(6, &[3]),
+			}),
+			CheckpointBlock::Layer(CheckpointLayer {
+				declaration: DenseLayer::new(NonZeroU64::new(1).unwrap(), DenseActivation::Linear),
+				weight: test_parameter(9, &[3, 1]),
+				bias: test_parameter(12, &[1]),
+			}),
+		];
+		manifest
+	}
+
+	pub(super) fn encoded_projected_residual_checkpoint() -> Vec<u8> {
 		let manifest = projected_residual_manifest();
 		let owned = owned_outputs(&manifest);
 		let outputs = borrowed_outputs(&owned);
@@ -6368,6 +7463,40 @@ mod tests {
 		}
 	}
 
+	fn zero_layer_image(input_width: u64, output_width: u64) -> CheckpointLayerImage {
+		let tensor = |shape: Vec<u64>| {
+			let elements = shape.iter().product::<u64>();
+			CheckpointTensorImage {
+				dtype: DType::F32,
+				shape,
+				bytes: vec![0; usize::try_from(elements * 4).unwrap()],
+			}
+		};
+		let weight_shape = vec![input_width, output_width];
+		let bias_shape = vec![output_width];
+		CheckpointLayerImage {
+			declaration: DenseLayer::new(
+				NonZeroU64::new(output_width).unwrap(),
+				DenseActivation::Linear,
+			),
+			weight: CheckpointParameterImage {
+				parameter: tensor(weight_shape.clone()),
+				first_moment: tensor(weight_shape.clone()),
+				second_moment: tensor(weight_shape),
+			},
+			bias: CheckpointParameterImage {
+				parameter: tensor(bias_shape.clone()),
+				first_moment: tensor(bias_shape.clone()),
+				second_moment: tensor(bias_shape),
+			},
+		}
+	}
+
+	fn set_f32_bits(bytes: &mut [u8], index: usize, bits: u32) {
+		let start = index * 4;
+		bytes[start..start + 4].copy_from_slice(&bits.to_le_bytes());
+	}
+
 	fn owned_outputs(manifest: &CheckpointManifest) -> BTreeMap<ValueId, Vec<u8>> {
 		manifest
 			.tensors()
@@ -6405,6 +7534,39 @@ mod tests {
 		encoded
 	}
 
+	pub(super) fn encoded_multiclass_test_checkpoint() -> Vec<u8> {
+		let manifest = multiclass_adapter_manifest();
+		let owned = owned_outputs(&manifest);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&manifest, &outputs, &mut encoded).unwrap();
+		encoded
+	}
+
+	pub(super) fn encoded_regression_test_checkpoint() -> Vec<u8> {
+		let mut manifest = test_manifest();
+		manifest.task = DenseTask::ScalarRegression { target_vector: 1 };
+		manifest.config.loss = DenseLoss::MeanSquaredError;
+		let owned = owned_outputs(&manifest);
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&manifest, &outputs, &mut encoded).unwrap();
+		encoded
+	}
+
+	pub(super) fn encoded_calibrated_test_checkpoint() -> Vec<u8> {
+		let mut manifest = test_manifest();
+		manifest.bounds.calibration_iterations = 1;
+		manifest.bounds.iterations = NonZeroU64::new(2).unwrap();
+		manifest.temperature = Some(test_tensor(9, DType::F32));
+		let mut owned = owned_outputs(&manifest);
+		owned.insert(ValueId::new(9), 2.0f32.to_le_bytes().to_vec());
+		let outputs = borrowed_outputs(&owned);
+		let mut encoded = Vec::new();
+		encode_checkpoint(&manifest, &outputs, &mut encoded).unwrap();
+		encoded
+	}
+
 	fn assert_manifest_roundtrip(manifest: &CheckpointManifest) {
 		let owned = owned_outputs(manifest);
 		let outputs = borrowed_outputs(&owned);
@@ -6412,6 +7574,15 @@ mod tests {
 		encode_checkpoint(manifest, &outputs, &mut encoded).unwrap();
 		let decoded = decode_checkpoint(&encoded, CheckpointDecodeLimits::default()).unwrap();
 		assert_eq!(decoded.encode().unwrap(), encoded);
+	}
+
+	fn assert_manifest_semantic_error(manifest: &CheckpointManifest, path: &str) {
+		let error = validate_manifest_semantic_invariants(manifest).unwrap_err();
+		let CheckpointError::Decode(error) = error else {
+			panic!("expected typed semantic error, got {error}");
+		};
+		assert_eq!(error.kind(), CheckpointDecodeErrorKind::InconsistentValue);
+		assert_eq!(error.path().to_string(), path);
 	}
 
 	fn assert_decode_error(bytes: &[u8], kind: CheckpointDecodeErrorKind, path: &str) {
