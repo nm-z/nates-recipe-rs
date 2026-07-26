@@ -44,3 +44,25 @@ Recipe may perform FT and FR.
 The reasoning is intent: reduction and transformation operate on signal from the data supplied
 features. Recipe will not implement features for the user to train on derived features.
 
+## No Performance-Reducing Configuration
+The system derives all execution parameters from the hardware
+and the model. Do not add user-facing configuration APIs for any of the following:
+
+.batch()             system knows VRAM, computes what fits
+.tile_size()         system probes optimal tile per shape
+.chunk_size()        same as tile, different name
+.num_threads()       system reads available_parallelism
+.num_streams()       system knows CU count and occupancy
+.precision()         system reads model dtype, probes GPU rates
+.cache_size()        system reads LDS/L2/IC from hardware
+.prefetch_depth()    system determines from memory latency
+.block_size()        system computes from tile and wave width
+.grid_size()         derived from problem size and tile
+.memory_limit()      system probes claimable_bytes
+.context_length()    system reads from model metadata
+.rope_base()         system reads from model metadata
+.head_dim()          system reads from model metadata
+.vocab_size()        system reads from model metadata
+
+Do not add any parameter the system can derive from hardware
+or model metadata.
