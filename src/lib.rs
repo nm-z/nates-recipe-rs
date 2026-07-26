@@ -1,6 +1,7 @@
 pub mod data_prepare;
 pub mod native_prepare;
 pub mod training;
+mod source_frontend;
 
 pub use data_prepare::{
 	DEFAULT_DATA_FIELD_BYTES, DEFAULT_DATA_FIELDS_PER_RECORD, DEFAULT_DATA_RECORDS, DEFAULT_DATA_SOURCE_BYTES,

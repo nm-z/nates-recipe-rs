@@ -10,13 +10,13 @@ const TENSOR_NAME_BYTES_MAX: u64 = 64;
 const ARRAY_DEPTH_HARD_MAX: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GgufEndian {
+pub enum GgufEndian {
 	Little,
 	Big,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GgufLimits {
+pub struct GgufLimits {
 	file_bytes: NonZeroU64,
 	metadata_pairs: NonZeroU64,
 	tensors: NonZeroU64,
@@ -33,7 +33,7 @@ impl GgufLimits {
 	///
 	/// Returns [`GgufErrorKind::InvalidLimit`] for zero limits or an array
 	/// depth above the fixed recursion ceiling.
-	pub(crate) fn new(
+	pub fn new(
 		file_bytes: u64,
 		metadata_pairs: u64,
 		tensors: u64,
@@ -61,43 +61,43 @@ impl GgufLimits {
 	}
 
 	#[must_use]
-	pub(crate) const fn file_bytes(self) -> NonZeroU64 {
+	pub const fn file_bytes(self) -> NonZeroU64 {
 		self.file_bytes
 	}
 
 	#[must_use]
-	pub(crate) const fn metadata_pairs(self) -> NonZeroU64 {
+	pub const fn metadata_pairs(self) -> NonZeroU64 {
 		self.metadata_pairs
 	}
 
 	#[must_use]
-	pub(crate) const fn tensors(self) -> NonZeroU64 {
+	pub const fn tensors(self) -> NonZeroU64 {
 		self.tensors
 	}
 
 	#[must_use]
-	pub(crate) const fn rank(self) -> NonZeroU32 {
+	pub const fn rank(self) -> NonZeroU32 {
 		self.rank
 	}
 
 	#[must_use]
-	pub(crate) const fn string_bytes(self) -> NonZeroU64 {
+	pub const fn string_bytes(self) -> NonZeroU64 {
 		self.string_bytes
 	}
 
 	#[must_use]
-	pub(crate) const fn array_elements(self) -> NonZeroU64 {
+	pub const fn array_elements(self) -> NonZeroU64 {
 		self.array_elements
 	}
 
 	#[must_use]
-	pub(crate) const fn array_depth(self) -> NonZeroU32 {
+	pub const fn array_depth(self) -> NonZeroU32 {
 		self.array_depth
 	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum GgufMetadataType {
+pub enum GgufMetadataType {
 	U8,
 	I8,
 	U16,
@@ -137,7 +137,7 @@ impl GgufMetadataType {
 	}
 
 	#[must_use]
-	pub(crate) const fn code(self) -> u32 {
+	pub const fn code(self) -> u32 {
 		match self {
 			Self::U8 => 0,
 			Self::I8 => 1,
@@ -157,26 +157,26 @@ impl GgufMetadataType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GgufMetadataArray<'a> {
+pub struct GgufMetadataArray<'a> {
 	element_type: GgufMetadataType,
 	values: Vec<GgufMetadataValue<'a>>,
 }
 
 impl<'a> GgufMetadataArray<'a> {
 	#[must_use]
-	pub(crate) const fn element_type(&self) -> GgufMetadataType {
+	pub const fn element_type(&self) -> GgufMetadataType {
 		self.element_type
 	}
 
 	#[must_use]
-	pub(crate) fn values(&self) -> &[GgufMetadataValue<'a>] {
+	pub fn values(&self) -> &[GgufMetadataValue<'a>] {
 		&self.values
 	}
 }
 
 /// Metadata payload that retains the encoded scalar type and floating bits.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GgufMetadataValue<'a> {
+pub enum GgufMetadataValue<'a> {
 	U8(u8),
 	I8(i8),
 	U16(u16),
@@ -194,7 +194,7 @@ pub(crate) enum GgufMetadataValue<'a> {
 
 impl GgufMetadataValue<'_> {
 	#[must_use]
-	pub(crate) const fn value_type(&self) -> GgufMetadataType {
+	pub const fn value_type(&self) -> GgufMetadataType {
 		match self {
 			Self::U8(..) => GgufMetadataType::U8,
 			Self::I8(..) => GgufMetadataType::I8,
@@ -214,25 +214,25 @@ impl GgufMetadataValue<'_> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GgufMetadataEntry<'a> {
+pub struct GgufMetadataEntry<'a> {
 	key: &'a str,
 	value: GgufMetadataValue<'a>,
 }
 
 impl<'a> GgufMetadataEntry<'a> {
 	#[must_use]
-	pub(crate) const fn key(&self) -> &'a str {
+	pub const fn key(&self) -> &'a str {
 		self.key
 	}
 
 	#[must_use]
-	pub(crate) const fn value(&self) -> &GgufMetadataValue<'a> {
+	pub const fn value(&self) -> &GgufMetadataValue<'a> {
 		&self.value
 	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum GgufTensorType {
+pub enum GgufTensorType {
 	F32,
 	F16,
 	Q4_0,
@@ -310,7 +310,7 @@ impl GgufTensorType {
 	}
 
 	#[must_use]
-	pub(crate) const fn code(self) -> u32 {
+	pub const fn code(self) -> u32 {
 		match self {
 			Self::F32 => 0,
 			Self::F16 => 1,
@@ -348,7 +348,7 @@ impl GgufTensorType {
 	}
 
 	#[must_use]
-	pub(crate) const fn block_elements(self) -> u64 {
+	pub const fn block_elements(self) -> u64 {
 		match self {
 			Self::F32 | Self::F16 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::F64 | Self::Bf16 => 1,
 			Self::Q4_0
@@ -379,7 +379,7 @@ impl GgufTensorType {
 	}
 
 	#[must_use]
-	pub(crate) const fn block_bytes(self) -> u64 {
+	pub const fn block_bytes(self) -> u64 {
 		match self {
 			Self::I8 => 1,
 			Self::F16 | Self::I16 | Self::Bf16 => 2,
@@ -411,7 +411,7 @@ impl GgufTensorType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GgufTensor<'a> {
+pub struct GgufTensor<'a> {
 	name: &'a str,
 	dimensions: Vec<u64>,
 	tensor_type: GgufTensorType,
@@ -422,43 +422,43 @@ pub(crate) struct GgufTensor<'a> {
 
 impl<'a> GgufTensor<'a> {
 	#[must_use]
-	pub(crate) const fn name(&self) -> &'a str {
+	pub const fn name(&self) -> &'a str {
 		self.name
 	}
 
 	#[must_use]
-	pub(crate) fn dimensions(&self) -> &[u64] {
+	pub fn dimensions(&self) -> &[u64] {
 		&self.dimensions
 	}
 
 	#[must_use]
-	pub(crate) const fn tensor_type(&self) -> GgufTensorType {
+	pub const fn tensor_type(&self) -> GgufTensorType {
 		self.tensor_type
 	}
 
 	#[must_use]
-	pub(crate) const fn data_offset(&self) -> u64 {
+	pub const fn data_offset(&self) -> u64 {
 		self.data_offset
 	}
 
 	#[must_use]
-	pub(crate) const fn file_offset(&self) -> u64 {
+	pub const fn file_offset(&self) -> u64 {
 		self.file_offset
 	}
 
 	#[must_use]
-	pub(crate) const fn encoded_bytes(&self) -> u64 {
+	pub const fn encoded_bytes(&self) -> u64 {
 		self.encoded_bytes
 	}
 
 	#[must_use]
-	pub(crate) const fn data_end(&self) -> u64 {
+	pub const fn data_end(&self) -> u64 {
 		self.data_offset + self.encoded_bytes
 	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GgufArchive<'a> {
+pub struct GgufArchive<'a> {
 	version: u32,
 	endian: GgufEndian,
 	alignment: u32,
@@ -470,52 +470,52 @@ pub(crate) struct GgufArchive<'a> {
 
 impl<'a> GgufArchive<'a> {
 	#[must_use]
-	pub(crate) const fn version(&self) -> u32 {
+	pub const fn version(&self) -> u32 {
 		self.version
 	}
 
 	#[must_use]
-	pub(crate) const fn endian(&self) -> GgufEndian {
+	pub const fn endian(&self) -> GgufEndian {
 		self.endian
 	}
 
 	#[must_use]
-	pub(crate) const fn alignment(&self) -> u32 {
+	pub const fn alignment(&self) -> u32 {
 		self.alignment
 	}
 
 	#[must_use]
-	pub(crate) const fn data_start(&self) -> u64 {
+	pub const fn data_start(&self) -> u64 {
 		self.data_start
 	}
 
 	#[must_use]
-	pub(crate) fn data(&self) -> &'a [u8] {
+	pub fn data(&self) -> &'a [u8] {
 		self.data
 	}
 
 	#[must_use]
-	pub(crate) fn metadata(&self) -> &[GgufMetadataEntry<'a>] {
+	pub fn metadata(&self) -> &[GgufMetadataEntry<'a>] {
 		&self.metadata
 	}
 
 	#[must_use]
-	pub(crate) fn metadata_entry(&self, key: &str) -> Option<&GgufMetadataEntry<'a>> {
+	pub fn metadata_entry(&self, key: &str) -> Option<&GgufMetadataEntry<'a>> {
 		self.metadata.iter().find(|entry| entry.key == key)
 	}
 
 	#[must_use]
-	pub(crate) fn tensors(&self) -> &[GgufTensor<'a>] {
+	pub fn tensors(&self) -> &[GgufTensor<'a>] {
 		&self.tensors
 	}
 
 	#[must_use]
-	pub(crate) fn tensor(&self, name: &str) -> Option<&GgufTensor<'a>> {
+	pub fn tensor(&self, name: &str) -> Option<&GgufTensor<'a>> {
 		self.tensors.iter().find(|tensor| tensor.name == name)
 	}
 
 	#[must_use]
-	pub(crate) fn raw_tensor(&self, name: &str) -> Option<&'a [u8]> {
+	pub fn raw_tensor(&self, name: &str) -> Option<&'a [u8]> {
 		let tensor = self.tensor(name)?;
 		let begin = match usize::try_from(tensor.data_offset) {
 			Ok(value) => value,
@@ -531,7 +531,7 @@ impl<'a> GgufArchive<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum GgufErrorKind {
+pub enum GgufErrorKind {
 	InvalidLimit,
 	FileLimitExceeded,
 	Truncated,
@@ -562,9 +562,9 @@ pub(crate) enum GgufErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GgufError {
-	pub(crate) kind: GgufErrorKind,
-	pub(crate) detail: String,
+pub struct GgufError {
+	pub kind: GgufErrorKind,
+	pub detail: String,
 }
 
 impl GgufError {
@@ -576,12 +576,12 @@ impl GgufError {
 	}
 
 	#[must_use]
-	pub(crate) const fn kind(&self) -> GgufErrorKind {
+	pub const fn kind(&self) -> GgufErrorKind {
 		self.kind
 	}
 
 	#[must_use]
-	pub(crate) fn detail(&self) -> &str {
+	pub fn detail(&self) -> &str {
 		&self.detail
 	}
 }
@@ -594,7 +594,7 @@ impl fmt::Display for GgufError {
 
 impl std::error::Error for GgufError {}
 
-pub(crate) type GgufResult<T> = Result<T, GgufError>;
+pub type GgufResult<T> = Result<T, GgufError>;
 
 #[derive(Clone, Debug)]
 struct RawTensor<'a> {
@@ -854,7 +854,7 @@ impl<'a> Reader<'a> {
 /// # Errors
 ///
 /// Returns a fail-closed bound, encoding, layout, or arithmetic error.
-pub(crate) fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_>> {
+pub fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_>> {
 	let file_bytes = u64::try_from(bytes.len()).map_err(|error| {
 		GgufError::new(
 			GgufErrorKind::ArithmeticOverflow,
@@ -1038,7 +1038,10 @@ pub(crate) fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArc
 			format!("GGUF header position cannot be represented by u64: {error}"),
 		)
 	})?;
-	let data_start = align_up(header_end, alignment_u64)?;
+	let data_start = match tensor_count {
+		0 => header_end,
+		_ => align_up(header_end, alignment_u64)?,
+	};
 	let data_start_host = bounded_usize(data_start, "tensor data start")?;
 	let header_padding = bytes
 		.get(reader.position()..data_start_host)
@@ -1639,6 +1642,21 @@ mod tests {
 			Ok(archive) => archive,
 			Err(error) => panic!("valid fixture was rejected: {error}"),
 		}
+	}
+
+	#[test]
+	fn accepts_metadata_only_files_without_inventing_tensor_padding() {
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(GGUF_MAGIC);
+		bytes.extend_from_slice(&3_u32.to_le_bytes());
+		bytes.extend_from_slice(&0_u64.to_le_bytes());
+		bytes.extend_from_slice(&0_u64.to_le_bytes());
+
+		let archive = parse_valid(&bytes, limits(64, 1, 1, 1, 1, 1, 1));
+		assert_eq!(archive.data_start(), 24);
+		assert!(archive.data().is_empty());
+		assert!(archive.metadata().is_empty());
+		assert!(archive.tensors().is_empty());
 	}
 
 	fn error_kind(bytes: &[u8], limits: GgufLimits) -> GgufErrorKind {

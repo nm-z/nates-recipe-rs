@@ -11,14 +11,12 @@ recipe-executor = { path = "../recipe-executor" }
 recipe-ingest = { path = "../recipe-ingest" }
 recipe-language = { path = "../recipe-language" }
 recipe-native-executor = { path = "../recipe-native-executor" }
+recipe-ogdl = { path = "../recipe-ogdl" }
 recipe-ops = { path = "../recipe-ops" }
 recipe-prepare = { path = "../recipe-prepare" }
 recipe-probe = { path = "../recipe-probe" }
 recipe-program = { path = "../recipe-program" }
 rustix = { version = "0.38.44", features = ["fs"] }
-
-[dev-dependencies]
-recipe-ogdl = { path = "../recipe-ogdl" }
 
 [lints]
 workspace = true

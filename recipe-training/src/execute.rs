@@ -88,7 +88,7 @@ pub struct TrainingMetricObserverStats {
 /// full or disconnected consumer can never backpressure executor polling.
 #[derive(Debug)]
 pub struct TrainingMetricObserver {
-	sender: SyncSender<MetricSample>,
+	sender: SyncSender<TrainingMetricSample>,
 	selected: BTreeMap<MetricId, u64>,
 	cadence: NonZeroU64,
 	stats: TrainingMetricObserverStats,
@@ -100,7 +100,7 @@ impl TrainingMetricObserver {
 		self.stats
 	}
 
-	fn try_observe(&mut self, sample: &MetricSample) {
+	fn try_observe(&mut self, sample: &TrainingMetricSample) {
 		let Some(observed) = self.selected.get_mut(&sample.metric) else {
 			return;
 		};
@@ -130,7 +130,7 @@ pub fn bounded_training_metric_channel(
 	capacity: NonZeroUsize,
 	selected: impl IntoIterator<Item = MetricId>,
 	cadence: NonZeroU64,
-) -> (TrainingMetricObserver, Receiver<MetricSample>) {
+) -> (TrainingMetricObserver, Receiver<TrainingMetricSample>) {
 	let (sender, receiver) = sync_channel(capacity.get());
 	let observer = TrainingMetricObserver {
 		sender,
@@ -141,6 +141,42 @@ pub fn bounded_training_metric_channel(
 	(observer, receiver)
 }
 
+/// One user-visible training metric sample.
+///
+/// `epoch` is always the one-based ordinal a user sees: the first epoch is 1
+/// and the final epoch is the configured epoch count. The executor's raw loop
+/// coordinate remains available only as `zero_based_iteration` for diagnostic
+/// correlation with immutable schedules; it is not an epoch number.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingMetricSample {
+	pub sequence: u64,
+	pub epoch: NonZeroU64,
+	pub zero_based_iteration: recipe_core::LoopIteration,
+	pub task: TaskId,
+	pub slot: MetricSlotId,
+	pub metric: MetricId,
+	pub value: recipe_executor::MetricValue,
+}
+
+impl TrainingMetricSample {
+	fn from_executor(sample: MetricSample, batches_per_epoch: NonZeroU64) -> Self {
+		let epoch = sample.iteration.index() / batches_per_epoch.get() + 1;
+		let epoch = match NonZeroU64::new(epoch) {
+			Some(epoch) => epoch,
+			None => unreachable!("one-based epoch calculation returned zero"),
+		};
+		Self {
+			sequence: sample.sequence,
+			epoch,
+			zero_based_iteration: sample.iteration,
+			task: sample.task,
+			slot: sample.slot,
+			metric: sample.metric,
+			value: sample.value,
+		}
+	}
+}
+
 /// One planned user metric and the newest sample retained across the live loop.
 ///
 /// `sample` is `None` only when its statically planned task never activated.
@@ -148,7 +184,7 @@ pub fn bounded_training_metric_channel(
 pub struct FinalTrainingMetric {
 	pub slot: MetricSlotId,
 	pub metric: MetricId,
-	pub sample: Option<MetricSample>,
+	pub sample: Option<TrainingMetricSample>,
 }
 
 /// Fully exited execution evidence. Native resources have been destroyed
@@ -273,6 +309,9 @@ pub enum TrainingExecutionError {
 	ExternalOutputMapping {
 		detail: String,
 	},
+	InvalidTrainingBounds {
+		detail: &'static str,
+	},
 	LoopDidNotReachTerminalState,
 }
 
@@ -357,6 +396,9 @@ impl fmt::Display for TrainingExecutionError {
 					"finalized checkpoint output mapping is invalid: {detail}"
 				)
 			}
+			Self::InvalidTrainingBounds { detail } => {
+				write!(formatter, "compiled training bounds are invalid: {detail}")
+			}
 			Self::LoopDidNotReachTerminalState => formatter
 				.write_str("bounded training wait returned before the loop reached terminal completion"),
 		}
@@ -380,6 +422,7 @@ impl StdError for TrainingExecutionError {
 			| Self::ImageMembersOverlap { .. }
 			| Self::LoopExternalTransfer { .. }
 			| Self::ExternalOutputMapping { .. }
+			| Self::InvalidTrainingBounds { .. }
 			| Self::LoopDidNotReachTerminalState => None,
 		}
 	}
@@ -504,6 +547,11 @@ where
 			>,
 		>,
 {
+	let batches_per_epoch = NonZeroU64::new(training.bounds().batches_per_epoch).ok_or(
+		TrainingExecutionError::InvalidTrainingBounds {
+			detail: "batches per epoch must be nonzero",
+		},
+	)?;
 	let prepared_system = preparer.prepare_program(training.program(), profile)?;
 	reject_loop_external_transfers(prepared_system.bundle())?;
 	let images = build_training_device_images(training, prepared_system.bundle())?;
@@ -536,6 +584,7 @@ where
 			&mut metrics,
 			|slot| running.try_take_metric(slot),
 			observer.as_deref_mut(),
+			batches_per_epoch,
 		);
 		if status == LoopStatus::Complete {
 			break;
@@ -552,6 +601,7 @@ where
 		&mut metrics,
 		|slot| exited_loop.try_take_metric(slot),
 		observer.as_deref_mut(),
+		batches_per_epoch,
 	);
 	let exited = exited_loop.exit()?;
 	let bundle_identity = exited.bundle_identity();
@@ -572,6 +622,7 @@ where
 		&mut metrics,
 		|slot| mailbox.try_take(slot),
 		observer.as_deref_mut(),
+		batches_per_epoch,
 	);
 	Ok(CompletedTrainingExecution {
 		run,
@@ -694,12 +745,14 @@ fn drain_user_metrics(
 	metrics: &mut [FinalTrainingMetric],
 	mut take: impl FnMut(MetricSlotId) -> Option<MetricSample>,
 	mut observer: Option<&mut TrainingMetricObserver>,
+	batches_per_epoch: NonZeroU64,
 ) {
 	for metric in metrics {
 		let Some(sample) = take(metric.slot) else {
 			continue;
 		};
 		debug_assert_eq!(sample.metric, metric.metric);
+		let sample = TrainingMetricSample::from_executor(sample, batches_per_epoch);
 		if let Some(observer) = observer.as_deref_mut() {
 			observer.try_observe(&sample);
 		}
@@ -920,6 +973,27 @@ mod tests {
 	}
 
 	#[test]
+	fn metric_epochs_are_one_based_for_first_validation_and_final_samples() {
+		let batches_per_epoch = NonZeroU64::new(3).unwrap();
+		for (iteration, expected_epoch) in [(0, 1), (2, 1), (3, 2), (11, 4)] {
+			let sample =
+				TrainingMetricSample::from_executor(sample(iteration, 7, 9, iteration), batches_per_epoch);
+			assert_eq!(sample.epoch.get(), expected_epoch);
+			assert_eq!(sample.zero_based_iteration.index(), iteration);
+		}
+	}
+
+	#[test]
+	fn separate_training_runs_each_begin_at_epoch_one() {
+		let batches_per_epoch = NonZeroU64::new(4).unwrap();
+		let first_run = TrainingMetricSample::from_executor(sample(0, 7, 9, 0), batches_per_epoch);
+		let second_run = TrainingMetricSample::from_executor(sample(0, 7, 9, 0), batches_per_epoch);
+
+		assert_eq!(first_run.epoch, NonZeroU64::MIN);
+		assert_eq!(second_run.epoch, NonZeroU64::MIN);
+	}
+
+	#[test]
 	fn packs_one_zero_filled_image_per_device_from_finalized_offsets() {
 		let inputs = vec![
 			input(1, &[1, 2, 3, 4]),
@@ -1003,12 +1077,25 @@ mod tests {
 			sample: None,
 		}];
 		let mut first = Some(sample(1, 7, 11, 0));
-		drain_user_metrics(&mut metrics, |_| first.take(), Some(&mut observer));
+		drain_user_metrics(
+			&mut metrics,
+			|_| first.take(),
+			Some(&mut observer),
+			NonZeroU64::new(2).unwrap(),
+		);
 		let mut second = Some(sample(2, 7, 11, 1));
-		drain_user_metrics(&mut metrics, |_| second.take(), Some(&mut observer));
+		drain_user_metrics(
+			&mut metrics,
+			|_| second.take(),
+			Some(&mut observer),
+			NonZeroU64::new(2).unwrap(),
+		);
 
 		assert_eq!(metrics[0].sample.as_ref().unwrap().sequence, 2);
-		assert_eq!(receiver.try_recv().unwrap().sequence, 1);
+		let observed = receiver.try_recv().unwrap();
+		assert_eq!(observed.sequence, 1);
+		assert_eq!(observed.epoch, NonZeroU64::MIN);
+		assert_eq!(observed.zero_based_iteration.index(), 0);
 		assert_eq!(
 			observer.stats(),
 			TrainingMetricObserverStats {
@@ -1028,8 +1115,11 @@ mod tests {
 			NonZeroU64::new(2).unwrap(),
 		);
 		for sequence in 0..4 {
-			observer.try_observe(&sample(sequence, 3, 9, sequence));
-			observer.try_observe(&sample(sequence + 10, 4, 10, sequence));
+			let selected = TrainingMetricSample::from_executor(sample(sequence, 3, 9, sequence), NonZeroU64::MIN);
+			let filtered =
+				TrainingMetricSample::from_executor(sample(sequence + 10, 4, 10, sequence), NonZeroU64::MIN);
+			observer.try_observe(&selected);
+			observer.try_observe(&filtered);
 		}
 		assert_eq!(
 			receiver

@@ -12,6 +12,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use hf_chat_template::ChatTemplate;
 use hf_chat_template::minijinja::{Value, context};
@@ -147,6 +148,8 @@ pub enum TextErrorKind {
 	InvalidModel,
 	InvalidVocabulary,
 	InvalidTokenId,
+	InvalidBatch,
+	TokenizerMismatch,
 	Tokenization,
 	Decode,
 	InvalidMessage,
@@ -180,10 +183,297 @@ impl std::error::Error for TextError {}
 
 pub type TextResult<T> = Result<T, TextError>;
 
+/// Exact tokenizer configuration identity carried by prepared text artifacts.
+///
+/// Equality compares the complete canonical tokenizer serialization, including
+/// its vocabulary, added-token metadata, normalizer, pre-tokenizer, and decoder.
+/// It is intentionally not a lossy hash or a process-local instance identifier.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenizerIdentity {
+	canonical: Arc<str>,
+}
+
+impl fmt::Debug for TokenizerIdentity {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("TokenizerIdentity")
+			.field("canonical_bytes", &self.canonical.len())
+			.finish_non_exhaustive()
+	}
+}
+
+/// Position at which padding is placed inside every fixed-width sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaddingSide {
+	Left,
+	Right,
+}
+
+/// Deterministic handling for tokenized inputs longer than the fixed width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncationPolicy {
+	/// Refuse to silently discard tokens.
+	Reject,
+	/// Retain the first `sequence_length` tokens and discard the tail.
+	KeepStart,
+	/// Retain the last `sequence_length` tokens and discard the head.
+	KeepEnd,
+}
+
+/// Token identifiers with roles that preparation must retain explicitly.
+///
+/// Role overlap is permitted. For example, a model may deliberately use its
+/// end-of-sequence token for padding. Validity is never inferred from any ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextTokenIds {
+	pad: i32,
+	unknown: Option<i32>,
+	special: Box<[i32]>,
+}
+
+impl TextTokenIds {
+	/// Construct checked token-role metadata.
+	///
+	/// # Errors
+	///
+	/// Returns [`TextErrorKind::InvalidTokenId`] for a negative identifier.
+	pub fn new(pad: i32, unknown: Option<i32>, special: impl Into<Vec<i32>>) -> TextResult<Self> {
+		let special = special.into();
+		for (role, id) in core::iter::once(("pad", pad))
+			.chain(unknown.map(|id| ("unknown", id)))
+			.chain(special.iter().copied().map(|id| ("special", id)))
+		{
+			if id < 0 {
+				return Err(TextError::new(
+					TextErrorKind::InvalidTokenId,
+					format!("{role} token ID {id} is negative"),
+				));
+			}
+		}
+		Ok(Self {
+			pad,
+			unknown,
+			special: special.into_boxed_slice(),
+		})
+	}
+
+	#[must_use]
+	pub const fn pad(&self) -> i32 {
+		self.pad
+	}
+
+	#[must_use]
+	pub const fn unknown(&self) -> Option<i32> {
+		self.unknown
+	}
+
+	#[must_use]
+	pub fn special(&self) -> &[i32] {
+		&self.special
+	}
+}
+
+/// Immutable preparation contract for one bounded fixed-width text batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextBatchSpec {
+	max_sequences: NonZeroUsize,
+	sequence_length: NonZeroUsize,
+	padding: PaddingSide,
+	truncation: TruncationPolicy,
+	add_special_tokens: bool,
+	token_ids: TextTokenIds,
+}
+
+impl TextBatchSpec {
+	/// Construct a preparation contract with explicit batch and sequence bounds.
+	///
+	/// # Errors
+	///
+	/// Returns [`TextErrorKind::InvalidLimit`] when either bound is zero and
+	/// [`TextErrorKind::ArithmeticOverflow`] when their maximum flat layout does
+	/// not fit `usize`.
+	pub fn new(
+		max_sequences: usize,
+		sequence_length: usize,
+		padding: PaddingSide,
+		truncation: TruncationPolicy,
+		add_special_tokens: bool,
+		token_ids: TextTokenIds,
+	) -> TextResult<Self> {
+		let max_sequences = nonzero("text batch sequences", max_sequences)?;
+		let sequence_length = nonzero("text sequence length", sequence_length)?;
+		max_sequences
+			.get()
+			.checked_mul(sequence_length.get())
+			.ok_or_else(|| {
+				TextError::new(
+					TextErrorKind::ArithmeticOverflow,
+					"maximum text batch layout overflows usize",
+				)
+			})?;
+		Ok(Self {
+			max_sequences,
+			sequence_length,
+			padding,
+			truncation,
+			add_special_tokens,
+			token_ids,
+		})
+	}
+
+	#[must_use]
+	pub const fn max_sequences(&self) -> NonZeroUsize {
+		self.max_sequences
+	}
+
+	#[must_use]
+	pub const fn sequence_length(&self) -> NonZeroUsize {
+		self.sequence_length
+	}
+
+	#[must_use]
+	pub const fn padding(&self) -> PaddingSide {
+		self.padding
+	}
+
+	#[must_use]
+	pub const fn truncation(&self) -> TruncationPolicy {
+		self.truncation
+	}
+
+	#[must_use]
+	pub const fn add_special_tokens(&self) -> bool {
+		self.add_special_tokens
+	}
+
+	#[must_use]
+	pub const fn token_ids(&self) -> &TextTokenIds {
+		&self.token_ids
+	}
+}
+
+/// Stable physical layout of a prepared text batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextBatchLayout {
+	/// Contiguous `[batch, sequence]` rows; flat index is
+	/// `batch_index * sequence_length + sequence_index`.
+	BatchMajor,
+}
+
+/// Immutable, fixed-width token and attention metadata produced at preparation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextBatch {
+	tokenizer: TokenizerIdentity,
+	spec: TextBatchSpec,
+	sequences: usize,
+	token_ids: Box<[i32]>,
+	attention_mask: Box<[i32]>,
+	original_lengths: Box<[usize]>,
+	retained_lengths: Box<[usize]>,
+}
+
+impl TextBatch {
+	#[must_use]
+	pub const fn layout(&self) -> TextBatchLayout {
+		TextBatchLayout::BatchMajor
+	}
+
+	#[must_use]
+	pub const fn tokenizer_identity(&self) -> &TokenizerIdentity {
+		&self.tokenizer
+	}
+
+	#[must_use]
+	pub const fn spec(&self) -> &TextBatchSpec {
+		&self.spec
+	}
+
+	#[must_use]
+	pub const fn sequences(&self) -> usize {
+		self.sequences
+	}
+
+	#[must_use]
+	pub fn shape(&self) -> [usize; 2] {
+		[self.sequences, self.spec.sequence_length.get()]
+	}
+
+	/// Flat batch-major token storage, including explicit padding positions.
+	#[must_use]
+	pub fn token_ids(&self) -> &[i32] {
+		&self.token_ids
+	}
+
+	/// Flat batch-major validity mask containing only exact zero and one.
+	///
+	/// A value of one marks a retained encoded token. A value of zero marks
+	/// padding, even when a retained token happens to equal the pad token ID.
+	#[must_use]
+	pub fn attention_mask(&self) -> &[i32] {
+		&self.attention_mask
+	}
+
+	#[must_use]
+	pub fn original_lengths(&self) -> &[usize] {
+		&self.original_lengths
+	}
+
+	#[must_use]
+	pub fn retained_lengths(&self) -> &[usize] {
+		&self.retained_lengths
+	}
+
+	/// Return one complete fixed-width batch row.
+	#[must_use]
+	pub fn row(&self, index: usize) -> Option<TextBatchRow<'_>> {
+		let width = self.spec.sequence_length.get();
+		let start = index.checked_mul(width)?;
+		let end = start.checked_add(width)?;
+		Some(TextBatchRow {
+			token_ids: self.token_ids.get(start..end)?,
+			attention_mask: self.attention_mask.get(start..end)?,
+			original_length: *self.original_lengths.get(index)?,
+			retained_length: *self.retained_lengths.get(index)?,
+		})
+	}
+}
+
+/// Borrowed view of one fixed-width batch row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextBatchRow<'a> {
+	token_ids: &'a [i32],
+	attention_mask: &'a [i32],
+	original_length: usize,
+	retained_length: usize,
+}
+
+impl<'a> TextBatchRow<'a> {
+	#[must_use]
+	pub const fn token_ids(self) -> &'a [i32] {
+		self.token_ids
+	}
+
+	#[must_use]
+	pub const fn attention_mask(self) -> &'a [i32] {
+		self.attention_mask
+	}
+
+	#[must_use]
+	pub const fn original_length(self) -> usize {
+		self.original_length
+	}
+
+	#[must_use]
+	pub const fn retained_length(self) -> usize {
+		self.retained_length
+	}
+}
+
 /// A preparation-owned tokenizer with immutable invocation limits.
 pub struct Tokenizer {
 	inner: InnerTokenizer,
 	limits: TextLimits,
+	identity: TokenizerIdentity,
 }
 
 impl fmt::Debug for Tokenizer {
@@ -192,6 +482,7 @@ impl fmt::Debug for Tokenizer {
 			.debug_struct("Tokenizer")
 			.field("vocabulary_size", &self.inner.get_vocab_size(true))
 			.field("limits", &self.limits)
+			.field("identity", &self.identity)
 			.finish_non_exhaustive()
 	}
 }
@@ -211,7 +502,12 @@ impl Tokenizer {
 		let inner = InnerTokenizer::from_bytes(bytes)
 			.map_err(|error| TextError::new(TextErrorKind::InvalidModel, error.to_string()))?;
 		validate_vocab_size(&inner, limits)?;
-		Ok(Self { inner, limits })
+		let identity = tokenizer_identity(&inner)?;
+		Ok(Self {
+			inner,
+			limits,
+			identity,
+		})
 	}
 
 	/// Snapshot and parse one tokenizer file during preparation.
@@ -250,7 +546,12 @@ impl Tokenizer {
 			}
 		};
 		validate_vocab_size(&inner, limits)?;
-		Ok(Self { inner, limits })
+		let identity = tokenizer_identity(&inner)?;
+		Ok(Self {
+			inner,
+			limits,
+			identity,
+		})
 	}
 
 	/// Convert raw text to checked `int32` token metadata.
@@ -329,6 +630,162 @@ impl Tokenizer {
 	pub fn vocabulary_size(&self) -> usize {
 		self.inner.get_vocab_size(true)
 	}
+
+	/// Exact tokenizer identity attached to every prepared batch.
+	#[must_use]
+	pub const fn identity(&self) -> &TokenizerIdentity {
+		&self.identity
+	}
+
+	/// Encode and deterministically lay out a bounded fixed-width batch.
+	///
+	/// The returned attention mask is constructed from retained positions. Pad,
+	/// unknown, and special token values never determine validity.
+	///
+	/// # Errors
+	///
+	/// Rejects an empty batch, exceeded bounds, undeclared-vocabulary role IDs,
+	/// tokenization failures, rejected truncation, and layout overflow.
+	pub fn prepare_batch(&self, texts: &[&str], spec: &TextBatchSpec) -> TextResult<TextBatch> {
+		if texts.is_empty() {
+			return Err(TextError::new(
+				TextErrorKind::InvalidBatch,
+				"text batch contains no sequences",
+			));
+		}
+		require_limit(
+			"text batch sequences",
+			texts.len(),
+			spec.max_sequences.get(),
+		)?;
+		require_limit(
+			"fixed text sequence length",
+			spec.sequence_length.get(),
+			self.limits.output_tokens.get(),
+		)?;
+		self.validate_token_roles(spec.token_ids())?;
+
+		let width = spec.sequence_length.get();
+		let elements = texts.len().checked_mul(width).ok_or_else(|| {
+			TextError::new(
+				TextErrorKind::ArithmeticOverflow,
+				"prepared text batch layout overflows usize",
+			)
+		})?;
+		let mut token_ids = vec![spec.token_ids.pad; elements];
+		let mut attention_mask = vec![0_i32; elements];
+		let mut original_lengths = Vec::with_capacity(texts.len());
+		let mut retained_lengths = Vec::with_capacity(texts.len());
+
+		for (batch_index, text) in texts.iter().enumerate() {
+			let encoded = self.encode(text, spec.add_special_tokens)?;
+			let original_length = encoded.len();
+			let retained = if original_length <= width {
+				encoded.as_slice()
+			} else {
+				match spec.truncation {
+					TruncationPolicy::Reject => {
+						return Err(TextError::new(
+							TextErrorKind::LimitExceeded,
+							format!(
+								"tokenized sequence {batch_index} has {original_length} tokens, fixed length is {width}"
+							),
+						));
+					}
+					TruncationPolicy::KeepStart => &encoded[..width],
+					TruncationPolicy::KeepEnd => &encoded[original_length - width..],
+				}
+			};
+			let retained_length = retained.len();
+			let row_start = batch_index.checked_mul(width).ok_or_else(|| {
+				TextError::new(
+					TextErrorKind::ArithmeticOverflow,
+					"prepared text row offset overflows usize",
+				)
+			})?;
+			let token_start = match spec.padding {
+				PaddingSide::Left => row_start + width - retained_length,
+				PaddingSide::Right => row_start,
+			};
+			let token_end = token_start + retained_length;
+			token_ids[token_start..token_end].copy_from_slice(retained);
+			attention_mask[token_start..token_end].fill(1);
+			original_lengths.push(original_length);
+			retained_lengths.push(retained_length);
+		}
+
+		Ok(TextBatch {
+			tokenizer: self.identity.clone(),
+			spec: spec.clone(),
+			sequences: texts.len(),
+			token_ids: token_ids.into_boxed_slice(),
+			attention_mask: attention_mask.into_boxed_slice(),
+			original_lengths: original_lengths.into_boxed_slice(),
+			retained_lengths: retained_lengths.into_boxed_slice(),
+		})
+	}
+
+	/// Decode one prepared row using the tokenizer that gave its IDs meaning.
+	///
+	/// Padding is removed exclusively through the stored validity mask. A valid
+	/// token equal to the pad ID remains in the decoded sequence.
+	///
+	/// # Errors
+	///
+	/// Returns [`TextErrorKind::TokenizerMismatch`] for a batch produced by a
+	/// different tokenizer configuration and [`TextErrorKind::InvalidBatch`] for
+	/// an out-of-range row.
+	pub fn decode_batch_row(&self, batch: &TextBatch, row: usize, skip_special_tokens: bool) -> TextResult<String> {
+		if self.identity != batch.tokenizer {
+			return Err(TextError::new(
+				TextErrorKind::TokenizerMismatch,
+				"prepared batch tokenizer identity does not match decoder",
+			));
+		}
+		let row = batch.row(row).ok_or_else(|| {
+			TextError::new(
+				TextErrorKind::InvalidBatch,
+				format!("prepared text batch row {row} is out of range"),
+			)
+		})?;
+		let retained = row
+			.token_ids()
+			.iter()
+			.zip(row.attention_mask())
+			.filter_map(|(id, valid)| (*valid == 1).then_some(*id))
+			.collect::<Vec<_>>();
+		self.decode(&retained, skip_special_tokens)
+	}
+
+	fn validate_token_roles(&self, roles: &TextTokenIds) -> TextResult<()> {
+		for (role, id) in core::iter::once(("pad", roles.pad))
+			.chain(roles.unknown.map(|id| ("unknown", id)))
+			.chain(roles.special.iter().copied().map(|id| ("special", id)))
+		{
+			let unsigned = u32::try_from(id).map_err(|error| {
+				TextError::new(
+					TextErrorKind::InvalidTokenId,
+					format!("{role} token ID {id} is negative: {error}"),
+				)
+			})?;
+			if self.inner.id_to_token(unsigned).is_none() {
+				return Err(TextError::new(
+					TextErrorKind::InvalidTokenId,
+					format!("{role} token ID {id} is outside this tokenizer vocabulary"),
+				));
+			}
+		}
+		Ok(())
+	}
+}
+
+fn tokenizer_identity(inner: &InnerTokenizer) -> TextResult<TokenizerIdentity> {
+	let canonical = inner
+		.to_string(false)
+		.map_err(|error| TextError::new(TextErrorKind::InvalidModel, error.to_string()))?;
+	Ok(TokenizerIdentity {
+		canonical: Arc::from(canonical),
+	})
 }
 
 fn validate_vocab_size(inner: &InnerTokenizer, limits: TextLimits) -> TextResult<()> {
@@ -624,6 +1081,42 @@ mod tests {
 		TextLimits::new(4096, 256, 64, 1024, 8192, 1024, 4096, 16, 4096).unwrap()
 	}
 
+	fn byte_pair(tokens: &[&str]) -> Tokenizer {
+		let tokens = tokens
+			.iter()
+			.map(|token| (*token).to_owned())
+			.collect::<Vec<_>>();
+		Tokenizer::from_vocabulary(
+			VocabularySpec {
+				kind: VocabularyKind::BytePair,
+				tokens: &tokens,
+				merges: &[],
+				score_bits: &[],
+				unknown_token_id: None,
+			},
+			limits(),
+		)
+		.unwrap()
+	}
+
+	fn batch_spec(
+		max_sequences: usize,
+		sequence_length: usize,
+		padding: PaddingSide,
+		truncation: TruncationPolicy,
+		pad: i32,
+	) -> TextBatchSpec {
+		TextBatchSpec::new(
+			max_sequences,
+			sequence_length,
+			padding,
+			truncation,
+			false,
+			TextTokenIds::new(pad, None, vec![]).unwrap(),
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn byte_pair_vocabulary_emits_checked_int32_ids() {
 		let tokens = vec!["H".to_owned(), "i".to_owned(), "Hi".to_owned()];
@@ -748,6 +1241,210 @@ mod tests {
 			.unwrap_err()
 			.kind,
 			TextErrorKind::InvalidVocabulary
+		);
+	}
+
+	#[test]
+	fn fixed_batch_is_immutable_batch_major_and_deterministic() {
+		let tokenizer = byte_pair(&["a", "b", "c"]);
+		let spec = batch_spec(2, 4, PaddingSide::Right, TruncationPolicy::Reject, 2);
+		let first = tokenizer.prepare_batch(&["ab", "c"], &spec).unwrap();
+		let second = tokenizer.prepare_batch(&["ab", "c"], &spec).unwrap();
+
+		assert_eq!(first, second);
+		assert_eq!(first.layout(), TextBatchLayout::BatchMajor);
+		assert_eq!(first.shape(), [2, 4]);
+		assert_eq!(first.token_ids(), [0, 1, 2, 2, 2, 2, 2, 2]);
+		assert_eq!(first.attention_mask(), [1, 1, 0, 0, 1, 0, 0, 0]);
+		assert_eq!(first.original_lengths(), [2, 1]);
+		assert_eq!(first.retained_lengths(), [2, 1]);
+		assert_eq!(first.row(0).unwrap().token_ids(), [0, 1, 2, 2]);
+		assert!(first.row(2).is_none());
+		assert_eq!(tokenizer.decode_batch_row(&first, 0, false).unwrap(), "ab");
+		assert_eq!(tokenizer.decode_batch_row(&first, 1, false).unwrap(), "c");
+	}
+
+	#[test]
+	fn padding_side_and_mask_do_not_depend_on_pad_token_value() {
+		let tokenizer = byte_pair(&["a"]);
+		let right = tokenizer
+			.prepare_batch(
+				&["a"],
+				&batch_spec(1, 3, PaddingSide::Right, TruncationPolicy::Reject, 0),
+			)
+			.unwrap();
+		let left = tokenizer
+			.prepare_batch(
+				&["a"],
+				&batch_spec(1, 3, PaddingSide::Left, TruncationPolicy::Reject, 0),
+			)
+			.unwrap();
+
+		assert_eq!(right.token_ids(), [0, 0, 0]);
+		assert_eq!(right.attention_mask(), [1, 0, 0]);
+		assert_eq!(left.token_ids(), [0, 0, 0]);
+		assert_eq!(left.attention_mask(), [0, 0, 1]);
+		assert_eq!(tokenizer.decode_batch_row(&right, 0, false).unwrap(), "a");
+		assert_eq!(tokenizer.decode_batch_row(&left, 0, false).unwrap(), "a");
+	}
+
+	#[test]
+	fn empty_text_is_all_padding_while_an_empty_batch_is_rejected() {
+		let tokenizer = byte_pair(&["a"]);
+		let spec = batch_spec(1, 3, PaddingSide::Right, TruncationPolicy::Reject, 0);
+		let batch = tokenizer.prepare_batch(&[""], &spec).unwrap();
+
+		assert_eq!(batch.token_ids(), [0, 0, 0]);
+		assert_eq!(batch.attention_mask(), [0, 0, 0]);
+		assert_eq!(batch.original_lengths(), [0]);
+		assert_eq!(batch.retained_lengths(), [0]);
+		assert_eq!(tokenizer.decode_batch_row(&batch, 0, false).unwrap(), "");
+		assert_eq!(
+			tokenizer.prepare_batch(&[], &spec).unwrap_err().kind,
+			TextErrorKind::InvalidBatch
+		);
+	}
+
+	#[test]
+	fn long_sequences_follow_the_declared_truncation_policy() {
+		let tokenizer = byte_pair(&["a", "b", "c"]);
+		let reject = batch_spec(1, 2, PaddingSide::Right, TruncationPolicy::Reject, 0);
+		assert_eq!(
+			tokenizer.prepare_batch(&["abc"], &reject).unwrap_err().kind,
+			TextErrorKind::LimitExceeded
+		);
+
+		let keep_start = tokenizer
+			.prepare_batch(
+				&["abc"],
+				&batch_spec(1, 2, PaddingSide::Right, TruncationPolicy::KeepStart, 0),
+			)
+			.unwrap();
+		let keep_end = tokenizer
+			.prepare_batch(
+				&["abc"],
+				&batch_spec(1, 2, PaddingSide::Right, TruncationPolicy::KeepEnd, 0),
+			)
+			.unwrap();
+
+		assert_eq!(keep_start.token_ids(), [0, 1]);
+		assert_eq!(keep_end.token_ids(), [1, 2]);
+		assert_eq!(keep_start.original_lengths(), [3]);
+		assert_eq!(keep_start.retained_lengths(), [2]);
+	}
+
+	#[test]
+	fn batch_contract_enforces_shape_and_vocabulary_bounds() {
+		let tokenizer = byte_pair(&["a"]);
+		let one = batch_spec(1, 1, PaddingSide::Right, TruncationPolicy::Reject, 0);
+		assert_eq!(
+			tokenizer.prepare_batch(&["a", "a"], &one).unwrap_err().kind,
+			TextErrorKind::LimitExceeded
+		);
+		let too_wide = batch_spec(1, 65, PaddingSide::Right, TruncationPolicy::Reject, 0);
+		assert_eq!(
+			tokenizer.prepare_batch(&["a"], &too_wide).unwrap_err().kind,
+			TextErrorKind::LimitExceeded
+		);
+		let unknown_role = TextBatchSpec::new(
+			1,
+			1,
+			PaddingSide::Right,
+			TruncationPolicy::Reject,
+			false,
+			TextTokenIds::new(4, None, vec![]).unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			tokenizer
+				.prepare_batch(&["a"], &unknown_role)
+				.unwrap_err()
+				.kind,
+			TextErrorKind::InvalidTokenId
+		);
+		assert_eq!(
+			TextBatchSpec::new(
+				0,
+				1,
+				PaddingSide::Right,
+				TruncationPolicy::Reject,
+				false,
+				TextTokenIds::new(0, None, vec![]).unwrap(),
+			)
+			.unwrap_err()
+			.kind,
+			TextErrorKind::InvalidLimit
+		);
+		assert_eq!(
+			TextTokenIds::new(-1, None, vec![]).unwrap_err().kind,
+			TextErrorKind::InvalidTokenId
+		);
+	}
+
+	#[test]
+	fn unicode_unknown_and_special_tokens_remain_valid_positions() {
+		let bytes = include_bytes!("../../examples/datasets/tokenizers/bert-base-uncased/tokenizer.json");
+		let mut model_limits = limits();
+		model_limits.model_bytes = NonZeroUsize::new(bytes.len()).unwrap();
+		model_limits.vocabulary_entries = NonZeroUsize::new(100_000).unwrap();
+		model_limits.aggregate_piece_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+		model_limits.merge_entries = NonZeroUsize::new(100_000).unwrap();
+		let tokenizer = Tokenizer::from_json(bytes, model_limits).unwrap();
+		let spec = TextBatchSpec::new(
+			1,
+			16,
+			PaddingSide::Right,
+			TruncationPolicy::Reject,
+			true,
+			TextTokenIds::new(0, Some(100), vec![101, 102, 103]).unwrap(),
+		)
+		.unwrap();
+		let batch = tokenizer.prepare_batch(&["héllo 𓀀"], &spec).unwrap();
+		let row = batch.row(0).unwrap();
+
+		assert_eq!(row.token_ids()[0], 101);
+		assert!(row.token_ids().contains(&100));
+		assert_eq!(row.token_ids()[row.retained_length() - 1], 102);
+		assert!(
+			row.attention_mask()[..row.retained_length()]
+				.iter()
+				.all(|valid| *valid == 1)
+		);
+		assert!(
+			row.attention_mask()[row.retained_length()..]
+				.iter()
+				.all(|valid| *valid == 0)
+		);
+		assert!(
+			!tokenizer
+				.decode_batch_row(&batch, 0, false)
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn prepared_batches_require_their_exact_tokenizer_identity_for_decode() {
+		let tokenizer_a = byte_pair(&["a"]);
+		let tokenizer_a_equivalent = byte_pair(&["a"]);
+		let tokenizer_b = byte_pair(&["b"]);
+		let spec = batch_spec(1, 1, PaddingSide::Right, TruncationPolicy::Reject, 0);
+		let batch = tokenizer_a.prepare_batch(&["a"], &spec).unwrap();
+
+		assert_eq!(tokenizer_a.identity(), batch.tokenizer_identity());
+		assert_eq!(tokenizer_a.identity(), tokenizer_a_equivalent.identity());
+		assert_eq!(
+			tokenizer_a_equivalent
+				.decode_batch_row(&batch, 0, false)
+				.unwrap(),
+			"a"
+		);
+		assert_eq!(
+			tokenizer_b
+				.decode_batch_row(&batch, 0, false)
+				.unwrap_err()
+				.kind,
+			TextErrorKind::TokenizerMismatch
 		);
 	}
 }

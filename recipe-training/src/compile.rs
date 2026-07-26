@@ -2,11 +2,11 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use recipe_core::{AliasPermission, ByteCount, DType, KernelTemplateId, MetricId, ScalarOpcode, ValueId};
-use recipe_ingest::DenseMatrix;
+use recipe_ingest::{DenseMatrix, PreparedDataset, SemanticType, VectorEncoding, VectorRole};
 use recipe_language::{
-	AxisSet, CalculationGraph, CalculationNode, Elementwise, Gather, IndexBounds, IndexMap, PrimitiveAliasRule,
-	PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce, ReduceOperator, ReduceResult,
-	ScalarProgramBuilder, Shape, Tensor,
+	AxisSet, CalculationGraph, CalculationNode, Contraction, Elementwise, Gather, IndexBounds, IndexMap,
+	PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce,
+	ReduceOperator, ReduceResult, ScalarExpression, ScalarProgramBuilder, Shape, Tensor,
 };
 use recipe_ops::{
 	BinaryClassificationMetricRequest, IdentityNamespace, MaterializationRequest, NamedTensor, PreparedParameter,
@@ -15,24 +15,61 @@ use recipe_ops::{
 };
 use recipe_program::{IterationDomain, KernelIterationDomain, MetricEmission, StaticCalculationProgram};
 
+use crate::model::{DenseFeaturePlan, LoweredDenseDataset, validate_binary_targets};
 use crate::{
-	BinaryMetricOutputs, BinaryValidationConfig, BinaryValidationOutputs, CompiledTraining, DenseActivation,
-	DenseBinaryDataset, DenseLayerState, DenseTrainingConfig, EarlyStoppingState, ExternalInputRole,
-	OwnedExternalInput, ParameterState, RecallMetricOutput, TemperatureScalingConfig, TemperatureScalingState,
-	TrainingBounds, TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult, TrainingMetricBinding,
-	TrainingMetricKind, TrainingOutputs, ZScoreState,
+	BinaryMetricOutputs, BinaryValidationConfig, BinaryValidationOutputs, CompiledDatasetSchema, CompiledTraining,
+	DataNormalizationState, DenseActivation, DenseBlock, DenseBlockState, DenseDataNormalization, DenseLayer,
+	DenseLayerState, DenseLoss, DenseNormalization, DenseOperation, DenseOutputAdapter, DenseResidualOperation,
+	DenseResidualState, DenseTask, DenseTrainingConfig, EarlyStoppingState, ExternalInputRole, LearningRateDecay,
+	MinMaxState, MulticlassMetricOutputs, MulticlassValidationConfig, MulticlassValidationOutputs, OwnedExternalInput,
+	ParameterState, RecallMetricOutput, TemperatureScalingConfig, TemperatureScalingState, TrainingBounds,
+	TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult, TrainingMetricBinding, TrainingMetricKind,
+	TrainingOutputs, ZScoreState,
 };
 
 const MATERIALIZATION_RESERVATION: u64 = 64;
 const WORKSPACE_LIMIT: ByteCount = ByteCount::new(u64::MAX);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct LayerValues {
 	input: ValueId,
-	preactivation: ValueId,
 	weight: InitialParameter,
 	bias: InitialParameter,
-	activation: DenseActivation,
+	operations: Vec<OperationValues>,
+}
+
+#[derive(Clone, Debug)]
+enum BlockValues {
+	Layer(LayerValues),
+	Residual(ResidualValues),
+}
+
+#[derive(Clone, Debug)]
+struct ResidualValues {
+	input: ValueId,
+	branch: Vec<ResidualBranchValues>,
+	projection: Option<InitialParameter>,
+	operations: Vec<OperationValues>,
+}
+
+#[derive(Clone, Debug)]
+enum ResidualBranchValues {
+	Layer(LayerValues),
+	Operation(OperationValues),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OperationValues {
+	operation: DenseOperation,
+	input: ValueId,
+	output: ValueId,
+	variance: Option<ValueId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NormalizedValues {
+	normalized: ValueId,
+	variance: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,11 +85,40 @@ struct GradientPair {
 	bias: ValueId,
 }
 
+#[derive(Clone, Debug)]
+enum BlockGradients {
+	Layer(GradientPair),
+	Residual {
+		branch: Vec<GradientPair>,
+		projection: Option<ValueId>,
+	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParameterRole {
+	LayerWeight,
+	LayerBias,
+	ResidualProjectionWeight,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParameterGradient {
+	role: ParameterRole,
+	value: ValueId,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ZScoreValues {
 	normalized: ValueId,
 	mean: ValueId,
 	variance: ValueId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MinMaxValues {
+	normalized: ValueId,
+	minimum: ValueId,
+	maximum: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,37 +135,119 @@ struct InitialEarlyStoppingState {
 	stopped: ValueId,
 }
 
-/// Compile one fixed-width binary-classification dataset and dense model into
-/// a bounded static Recipe program.
+/// Compile one semantically typed fixed-width dataset and dense model into a
+/// bounded static Recipe program.
 ///
 /// The final partial batch is represented by clamped gathers plus an exact GPU
 /// validity mask. Padded lanes contribute zero loss and zero gradient, so no
 /// source row is repeated and no host-side batch calculation is required.
-pub fn compile_dense_binary_training(
-	dataset: &DenseBinaryDataset,
+pub fn compile_dense_training(
+	dataset: &PreparedDataset,
 	config: &DenseTrainingConfig,
 ) -> TrainingCompileResult<CompiledTraining> {
-	compile_dense_binary_training_impl(dataset, config, None)
+	let blocks = config
+		.layers
+		.iter()
+		.cloned()
+		.map(DenseBlock::Layer)
+		.collect::<Vec<_>>();
+	compile_dense_training_impl(dataset, config, &blocks, None, None)
+}
+
+/// Compile a topology-preserving dense model containing ordinary and residual
+/// blocks. Existing flat compilation remains a strict wrapper over this path.
+/// The explicit `blocks` are the network declaration; `config.layers` remains
+/// only the legacy declaration used by the flat entrypoints.
+pub fn compile_dense_training_with_blocks(
+	dataset: &PreparedDataset,
+	config: &DenseTrainingConfig,
+	blocks: &[DenseBlock],
+) -> TrainingCompileResult<CompiledTraining> {
+	compile_dense_training_impl(dataset, config, blocks, None, None)
+}
+
+/// Compile topology-preserving blocks with binary validation.
+pub fn compile_dense_training_with_blocks_and_binary_validation(
+	dataset: &PreparedDataset,
+	config: &DenseTrainingConfig,
+	blocks: &[DenseBlock],
+	validation: &BinaryValidationConfig,
+) -> TrainingCompileResult<CompiledTraining> {
+	compile_dense_training_impl(dataset, config, blocks, Some(validation), None)
+}
+
+/// Compile topology-preserving blocks with multiclass validation.
+pub fn compile_dense_training_with_blocks_and_multiclass_validation(
+	dataset: &PreparedDataset,
+	config: &DenseTrainingConfig,
+	blocks: &[DenseBlock],
+	validation: &MulticlassValidationConfig,
+) -> TrainingCompileResult<CompiledTraining> {
+	compile_dense_training_impl(dataset, config, blocks, None, Some(validation))
 }
 
 /// Compile the dense training program plus epoch-bound validation, a
 /// GPU-resident AUPRC early-stop latch, and optional post-training temperature
 /// scaling.
-pub fn compile_dense_binary_training_with_validation(
-	dataset: &DenseBinaryDataset,
+pub fn compile_dense_training_with_binary_validation(
+	dataset: &PreparedDataset,
 	config: &DenseTrainingConfig,
 	validation: &BinaryValidationConfig,
 ) -> TrainingCompileResult<CompiledTraining> {
-	compile_dense_binary_training_impl(dataset, config, Some(validation))
+	let blocks = config
+		.layers
+		.iter()
+		.cloned()
+		.map(DenseBlock::Layer)
+		.collect::<Vec<_>>();
+	compile_dense_training_impl(dataset, config, &blocks, Some(validation), None)
 }
 
-fn compile_dense_binary_training_impl(
-	dataset: &DenseBinaryDataset,
+/// Compile categorical cross-entropy training plus epoch-bound mean loss and
+/// top-one accuracy over the prepared validation partition.
+pub fn compile_dense_training_with_multiclass_validation(
+	dataset: &PreparedDataset,
 	config: &DenseTrainingConfig,
-	validation_config: Option<&BinaryValidationConfig>,
+	validation: &MulticlassValidationConfig,
 ) -> TrainingCompileResult<CompiledTraining> {
-	validate_config(config)?;
-	validate_validation_config(dataset, validation_config)?;
+	let blocks = config
+		.layers
+		.iter()
+		.cloned()
+		.map(DenseBlock::Layer)
+		.collect::<Vec<_>>();
+	compile_dense_training_impl(dataset, config, &blocks, None, Some(validation))
+}
+
+fn compile_dense_training_impl(
+	prepared: &PreparedDataset,
+	config: &DenseTrainingConfig,
+	declared_blocks: &[DenseBlock],
+	validation_config: Option<&BinaryValidationConfig>,
+	multiclass_validation_config: Option<&MulticlassValidationConfig>,
+) -> TrainingCompileResult<CompiledTraining> {
+	let task = resolve_dense_task(prepared, config.loss)?;
+	validate_config(config, declared_blocks)?;
+	let (blocks, output_adapter) = effective_blocks(declared_blocks, task)?;
+	let layers = blocks
+		.iter()
+		.map(|block| match block {
+			DenseBlock::Layer(layer) => Some(layer.clone()),
+			DenseBlock::Residual(_) => None,
+		})
+		.collect::<Option<Vec<_>>>()
+		.unwrap_or_default();
+	let feature_plan = DenseFeaturePlan::from_prepared(prepared)?;
+	let dataset = LoweredDenseDataset::from_prepared(prepared, &feature_plan, task)?;
+	validate_lowered_dataset(&dataset, task)?;
+	let dataset_schema = CompiledDatasetSchema::from_prepared(prepared, task, feature_plan.spans().to_vec());
+	validate_validation_config(
+		&dataset,
+		task,
+		config.loss,
+		validation_config,
+		multiclass_validation_config,
+	)?;
 	let calibration_iterations = validation_config
 		.and_then(BinaryValidationConfig::temperature_scaling)
 		.map_or(0, |calibration| calibration.iterations.get());
@@ -129,6 +277,10 @@ fn compile_dense_binary_training_impl(
 			))
 		})
 		.transpose()?;
+	let feature_normalization_mask = feature_plan
+		.normalization_mask()
+		.map(|mask| compiler.external_f32_vector(ExternalInputRole::FeatureNormalizationMask, mask))
+		.transpose()?;
 
 	let feature_columns = u64::try_from(dataset.train().feature_columns()).map_err(|error| {
 		TrainingCompileError::new(
@@ -136,12 +288,26 @@ fn compile_dense_binary_training_impl(
 			format!("feature width cannot be represented by u64: {error}"),
 		)
 	})?;
+	let target_code_columns = u64::try_from(dataset.train().targets().columns()).map_err(|error| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			format!("target code width cannot be represented by u64: {error}"),
+		)
+	})?;
+	let output_columns = u64::try_from(task.output_width()).map_err(|error| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			format!("task output width cannot be represented by u64: {error}"),
+		)
+	})?;
 	let train_rows = bounds.train_rows;
 	let batch = bounds.batch_size;
 	let full_feature_shape = shape(&[train_rows, feature_columns])?;
-	let full_target_shape = shape(&[train_rows, 1])?;
+	let full_target_shape = shape(&[train_rows, target_code_columns])?;
 	let batch_feature_shape = shape(&[batch, feature_columns])?;
-	let batch_target_shape = shape(&[batch, 1])?;
+	let batch_target_shape = shape(&[batch, target_code_columns])?;
+	let batch_output_shape = shape(&[batch, output_columns])?;
+	let batch_row_shape = shape(&[batch, 1])?;
 	let scalar_shape = shape(&[1])?;
 
 	let converted_features = compiler.convert_matrix_if_i32(
@@ -149,40 +315,133 @@ fn compile_dense_binary_training_impl(
 		full_feature_shape.clone(),
 		IterationDomain::first(),
 	)?;
-	let training_z_score = compiler.z_score(
-		converted_features,
-		full_feature_shape,
-		feature_columns,
-		train_rows,
-		config.normalization_epsilon,
-		config.reduction_tree_lanes,
-	)?;
-	let converted_targets =
-		compiler.convert_matrix_if_i32(train_targets, full_target_shape, IterationDomain::first())?;
-	let validation_values = match validation_inputs {
-		Some((features, targets, rows)) => {
-			let feature_shape = shape(&[rows, feature_columns])?;
-			let target_shape = shape(&[rows, 1])?;
-			let features =
-				compiler.convert_matrix_if_i32(features, feature_shape.clone(), IterationDomain::first())?;
-			let features = compiler.apply_z_score(
-				features,
-				training_z_score.mean,
-				training_z_score.variance,
+	let prepared_targets = match task {
+		DenseTask::MulticlassClassification { .. } => train_targets,
+		DenseTask::BinaryClassification { .. } | DenseTask::ScalarRegression { .. } => {
+			compiler.convert_matrix_if_i32(train_targets, full_target_shape, IterationDomain::first())?
+		}
+	};
+	let validation_features = validation_inputs
+		.as_ref()
+		.map(|(features, _, rows)| -> TrainingCompileResult<_> {
+			let feature_shape = shape(&[*rows, feature_columns])?;
+			Ok((
+				compiler.convert_matrix_if_i32(*features, feature_shape.clone(), IterationDomain::first())?,
 				feature_shape,
+			))
+		})
+		.transpose()?;
+	let (normalized_features, normalization, normalized_validation_features) = match config.data_normalization {
+		DenseDataNormalization::ZScore => {
+			let training = compiler.z_score(
+				converted_features,
+				full_feature_shape,
+				feature_columns,
+				train_rows,
 				config.normalization_epsilon,
-				IterationDomain::first(),
+				config.reduction_tree_lanes,
+				feature_normalization_mask,
 			)?;
-			let targets = compiler.convert_matrix_if_i32(targets, target_shape, IterationDomain::first())?;
+			let validation = validation_features
+				.map(|(features, feature_shape)| {
+					compiler.apply_z_score(
+						features,
+						training.mean,
+						training.variance,
+						feature_shape,
+						config.normalization_epsilon,
+						IterationDomain::first(),
+						feature_normalization_mask,
+					)
+				})
+				.transpose()?;
+			(
+				training.normalized,
+				DataNormalizationState::ZScore(ZScoreState {
+					mean: training.mean,
+					variance: training.variance,
+				}),
+				validation,
+			)
+		}
+		DenseDataNormalization::MinMax => {
+			let training = compiler.min_max(
+				converted_features,
+				full_feature_shape,
+				feature_columns,
+				config.normalization_epsilon,
+				config.reduction_tree_lanes,
+				feature_normalization_mask,
+			)?;
+			let validation = validation_features
+				.map(|(features, feature_shape)| {
+					compiler.apply_min_max(
+						features,
+						training.minimum,
+						training.maximum,
+						feature_shape,
+						config.normalization_epsilon,
+						IterationDomain::first(),
+						feature_normalization_mask,
+					)
+				})
+				.transpose()?;
+			(
+				training.normalized,
+				DataNormalizationState::MinMax(MinMaxState {
+					minimum: training.minimum,
+					maximum: training.maximum,
+				}),
+				validation,
+			)
+		}
+		DenseDataNormalization::L2Norm => {
+			let training = compiler.l2_norm(
+				converted_features,
+				full_feature_shape,
+				config.normalization_epsilon,
+				config.reduction_tree_lanes,
+				IterationDomain::first(),
+				feature_normalization_mask,
+			)?;
+			let validation = validation_features
+				.map(|(features, feature_shape)| {
+					compiler.l2_norm(
+						features,
+						feature_shape,
+						config.normalization_epsilon,
+						config.reduction_tree_lanes,
+						IterationDomain::first(),
+						feature_normalization_mask,
+					)
+				})
+				.transpose()?;
+			(training, DataNormalizationState::L2Norm, validation)
+		}
+	};
+	let validation_values = match (validation_inputs, normalized_validation_features) {
+		(Some((_, targets, rows)), Some(features)) => {
+			let target_shape = shape(&[rows, target_code_columns])?;
+			let targets = match task {
+				DenseTask::MulticlassClassification { .. } => targets,
+				DenseTask::BinaryClassification { .. } | DenseTask::ScalarRegression { .. } => {
+					compiler.convert_matrix_if_i32(targets, target_shape, IterationDomain::first())?
+				}
+			};
 			Some(ValidationValues {
 				features,
 				targets,
 				rows,
 			})
 		}
-		None => None,
+		(None, None) => None,
+		_ => {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				"validation feature normalization did not preserve the validation partition",
+			));
+		}
 	};
-	let normalized_features = training_z_score.normalized;
 
 	let index = compiler.tensor(DType::I32, shape(&[batch])?)?;
 	compiler.emit(
@@ -200,7 +459,7 @@ fn compile_dense_binary_training_impl(
 		Vec::new(),
 		compiler.training_domain,
 	)?;
-	let mask_index = compiler.tensor(DType::I32, batch_target_shape.clone())?;
+	let mask_index = compiler.tensor(DType::I32, batch_row_shape.clone())?;
 	compiler.emit(
 		Vec::new(),
 		vec![mask_index],
@@ -216,7 +475,7 @@ fn compile_dense_binary_training_impl(
 		Vec::new(),
 		compiler.training_domain,
 	)?;
-	let validity = compiler.tensor(DType::F32, batch_target_shape.clone())?;
+	let validity = compiler.tensor(DType::F32, batch_row_shape.clone())?;
 	compiler.emit_elementwise(
 		vec![mask_index],
 		vec![validity],
@@ -243,9 +502,16 @@ fn compile_dense_binary_training_impl(
 		forbidden_aliases(2, 1),
 		compiler.training_domain,
 	)?;
-	let batch_targets = compiler.tensor(DType::F32, batch_target_shape.clone())?;
+	let batch_targets = compiler.tensor(
+		if matches!(task, DenseTask::MulticlassClassification { .. }) {
+			DType::I32
+		} else {
+			DType::F32
+		},
+		batch_target_shape,
+	)?;
 	compiler.emit(
-		vec![converted_targets, index],
+		vec![prepared_targets, index],
 		vec![batch_targets],
 		PrimitiveKind::Gather(Gather {
 			axis: 0,
@@ -255,80 +521,58 @@ fn compile_dense_binary_training_impl(
 		compiler.training_domain,
 	)?;
 
-	let mut layer_values = Vec::with_capacity(config.layers.len());
-	let mut current = batch_features;
-	let mut current_width = feature_columns;
-	for (layer_index, layer) in config.layers.iter().copied().enumerate() {
-		let output_width = layer.width().get();
-		let parameter_shape = shape(&[current_width, output_width])?;
-		let bias_shape = shape(&[output_width])?;
-		let weight = compiler.initialize_weight(
-			parameter_shape,
-			current_width,
-			config.random_seed,
-			u64::try_from(layer_index).map_err(|error| {
-				TrainingCompileError::new(
-					TrainingCompileErrorKind::ArithmeticOverflow,
-					format!("layer index cannot be represented by u64: {error}"),
-				)
-			})?,
-		)?;
-		let bias = compiler.initialize_zero_parameter(bias_shape)?;
-		let preactivation = compiler.tensor(DType::F32, shape(&[batch, output_width])?)?;
-		compiler.materialize(
-			"gpu_linear_into",
-			&[
-				("input", current),
-				("weight", weight.value),
-				("bias", bias.value),
-			],
-			&[("output", preactivation)],
-			"input",
-			&PreparedParameters::new(),
-			compiler.training_domain,
-		)?;
-		let output = match layer.activation() {
-			DenseActivation::Linear => preactivation,
-			DenseActivation::Silu => {
-				let output = compiler.tensor(DType::F32, shape(&[batch, output_width])?)?;
-				compiler.emit_owned_scalar(
-					"gpu_silu_into",
-					vec![preactivation],
-					vec![output],
-					compiler.training_domain,
-				)?;
-				output
-			}
-		};
-		layer_values.push(LayerValues {
-			input: current,
-			preactivation,
-			weight,
-			bias,
-			activation: layer.activation(),
-		});
-		current = output;
-		current_width = output_width;
-	}
-
-	let losses = compiler.tensor(DType::F32, batch_target_shape.clone())?;
-	let loss_gradient = compiler.tensor(DType::F32, batch_target_shape.clone())?;
-	compiler.materialize(
-		"gpu_bce_with_logits",
-		&[("logits", current), ("targets", batch_targets)],
-		&[("losses", losses), ("gradients", loss_gradient)],
-		"logits",
-		&PreparedParameters::new(),
-		compiler.training_domain,
+	let (current, _, block_values) = compiler.compile_training_blocks(
+		&blocks,
+		batch_features,
+		feature_columns,
+		batch,
+		validity,
+		valid_count,
+		config,
 	)?;
-	let normalized_gradient = compiler.tensor(DType::F32, batch_target_shape.clone())?;
+
+	let losses = compiler.tensor(DType::F32, batch_output_shape.clone())?;
+	let loss_gradient = compiler.tensor(DType::F32, batch_output_shape.clone())?;
+	match config.loss {
+		DenseLoss::BinaryCrossEntropy => {
+			compiler.materialize(
+				"gpu_bce_with_logits",
+				&[("logits", current), ("targets", batch_targets)],
+				&[("losses", losses), ("gradients", loss_gradient)],
+				"logits",
+				&PreparedParameters::new(),
+				compiler.training_domain,
+			)?;
+		}
+		DenseLoss::MeanSquaredError | DenseLoss::MeanAbsoluteError | DenseLoss::Huber => {
+			compiler.emit_elementwise(
+				vec![current, batch_targets],
+				vec![losses, loss_gradient],
+				pointwise_loss_program(config.loss)?,
+				compiler.training_domain,
+			)?;
+		}
+		DenseLoss::CrossEntropy => {
+			compiler.cross_entropy_with_logits(
+				current,
+				batch_targets,
+				losses,
+				loss_gradient,
+				batch,
+				output_columns,
+				config.reduction_tree_lanes,
+				compiler.training_domain,
+			)?;
+		}
+	}
+	let normalized_gradient = compiler.tensor(DType::F32, batch_output_shape.clone())?;
 	compiler.emit_elementwise(
 		vec![loss_gradient, validity, valid_count],
 		vec![normalized_gradient],
 		masked_mean_program()?,
 		compiler.training_domain,
 	)?;
-	let masked_losses = compiler.tensor(DType::F32, batch_target_shape)?;
+	let masked_losses = compiler.tensor(DType::F32, batch_output_shape)?;
 	compiler.emit_elementwise(
 		vec![losses, validity],
 		vec![masked_losses],
@@ -350,15 +594,19 @@ fn compile_dense_binary_training_impl(
 		divide_program()?,
 		compiler.training_domain,
 	)?;
-	let gradients = compiler.backward(
-		&layer_values,
+	let gradients = compiler.backward_blocks(
+		&block_values,
 		normalized_gradient,
 		batch,
+		validity,
+		valid_count,
+		config.normalization_epsilon,
 		config.reduction_tree_lanes,
 	)?;
-	let flattened_gradients = gradients
+	let parameter_gradients = flatten_parameter_gradients(&gradients);
+	let flattened_gradients = parameter_gradients
 		.iter()
-		.flat_map(|gradient| [gradient.weight, gradient.bias])
+		.map(|gradient| gradient.value)
 		.collect::<Vec<_>>();
 	let clipped = compiler.global_clip(
 		&flattened_gradients,
@@ -375,38 +623,30 @@ fn compile_dense_binary_training_impl(
 		&bounds,
 		early_stopping_initial.map(|state| state.stopped),
 	)?;
-	let mut layer_states = Vec::with_capacity(layer_values.len());
-	for (layer_index, layer) in layer_values.iter().copied().enumerate() {
-		let gradient_offset = layer_index.checked_mul(2).ok_or_else(|| {
-			TrainingCompileError::new(
-				TrainingCompileErrorKind::ArithmeticOverflow,
-				"gradient index overflowed usize",
-			)
-		})?;
-		let weight = compiler.adamw_update(
-			clipped[gradient_offset],
-			layer.weight,
-			learning_rate,
-			beta_one_power,
-			beta_two_power,
-			config,
-		)?;
-		let bias = compiler.adamw_update(
-			clipped[gradient_offset + 1],
-			layer.bias,
-			learning_rate,
-			beta_one_power,
-			beta_two_power,
-			config,
-		)?;
-		layer_states.push(DenseLayerState { weight, bias });
-	}
+	let block_states = compiler.update_blocks(
+		&block_values,
+		&parameter_gradients,
+		&clipped,
+		learning_rate,
+		beta_one_power,
+		beta_two_power,
+		config,
+	)?;
+	let layer_states = block_states
+		.iter()
+		.map(|state| match state {
+			DenseBlockState::Layer(state) => Some(*state),
+			DenseBlockState::Residual(_) => None,
+		})
+		.collect::<Option<Vec<_>>>()
+		.unwrap_or_default();
 	let validation = match (validation_config, validation_values) {
 		(Some(validation_config), Some(validation_values)) => Some(compiler.compile_validation(
 			validation_values,
 			config,
+			&blocks,
 			validation_config,
-			&layer_states,
+			&block_states,
 			early_stopping_initial,
 			&bounds,
 		)?),
@@ -418,41 +658,236 @@ fn compile_dense_binary_training_impl(
 		}
 		(None, _) => None,
 	};
+	let multiclass_validation = match (multiclass_validation_config, validation_values) {
+		(Some(_), Some(validation_values)) => Some(compiler.compile_multiclass_validation(
+			validation_values,
+			config,
+			&blocks,
+			&block_states,
+			&bounds,
+		)?),
+		(Some(_), None) => {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				"multiclass validation was requested without validation values",
+			));
+		}
+		(None, _) => None,
+	};
 
 	let batch_loss_domain = compiler.training_domain;
-	let metric_bindings = training_metric_bindings(batch_loss, batch_loss_domain, validation.as_ref())?;
-	compiler
-		.external_outputs
-		.extend([training_z_score.mean, training_z_score.variance]);
+	let metric_bindings = training_metric_bindings(
+		batch_loss,
+		batch_loss_domain,
+		validation.as_ref(),
+		multiclass_validation.as_ref(),
+	)?;
+	match normalization {
+		DataNormalizationState::ZScore(state) => {
+			compiler
+				.external_outputs
+				.extend([state.mean, state.variance]);
+		}
+		DataNormalizationState::MinMax(state) => {
+			compiler
+				.external_outputs
+				.extend([state.minimum, state.maximum]);
+		}
+		DataNormalizationState::L2Norm => {}
+	}
 	compiler.finish(
 		bounds,
 		TrainingOutputs {
 			batch_loss,
 			batch_loss_domain,
-			normalization: ZScoreState {
-				mean: training_z_score.mean,
-				variance: training_z_score.variance,
-			},
+			normalization,
+			blocks: block_states,
 			layers: layer_states,
 			validation,
+			multiclass_validation,
 			metric_bindings,
 		},
+		dataset_schema,
+		config.clone(),
+		blocks,
+		layers,
+		output_adapter,
 	)
 }
 
-fn validate_config(config: &DenseTrainingConfig) -> TrainingCompileResult<()> {
-	if config.layers.is_empty() {
+fn resolve_dense_task(dataset: &PreparedDataset, loss: DenseLoss) -> TrainingCompileResult<DenseTask> {
+	let targets = dataset
+		.vectors()
+		.iter()
+		.filter(|vector| vector.role() == VectorRole::Target)
+		.collect::<Vec<_>>();
+	if targets.len() != 1 {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			format!(
+				"dense training requires exactly one typed target vector, got {}",
+				targets.len()
+			),
+		));
+	}
+	let target = targets[0];
+	let classified = format!("{:?}/{:?}", target.semantic_type(), target.encoding());
+	match loss {
+		DenseLoss::BinaryCrossEntropy => {
+			let compatible = match (target.semantic_type(), target.encoding(), target.metadata()) {
+				(SemanticType::Numeric, VectorEncoding::I32 | VectorEncoding::F32, _) => true,
+				(
+					SemanticType::Categorical,
+					VectorEncoding::DictionaryI32,
+					recipe_ingest::VectorMetadata::Categorical { dictionary },
+				) => dictionary.len() == 2,
+				_ => false,
+			};
+			if !compatible {
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					format!(
+						"target {:?} classified {classified} is not an explicit numeric 0/1 or two-category BCE target",
+						String::from_utf8_lossy(target.name())
+					),
+				));
+			}
+			Ok(DenseTask::BinaryClassification {
+				target_vector: target.source_index(),
+				positive_code: 1,
+			})
+		}
+		DenseLoss::MeanSquaredError | DenseLoss::MeanAbsoluteError | DenseLoss::Huber => {
+			if target.semantic_type() != SemanticType::Numeric
+				|| !matches!(target.encoding(), VectorEncoding::I32 | VectorEncoding::F32)
+			{
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					format!(
+						"target {:?} classified {classified} is incompatible with scalar regression",
+						String::from_utf8_lossy(target.name())
+					),
+				));
+			}
+			Ok(DenseTask::ScalarRegression {
+				target_vector: target.source_index(),
+			})
+		}
+		DenseLoss::CrossEntropy => {
+			let (
+				SemanticType::Categorical,
+				VectorEncoding::DictionaryI32,
+				recipe_ingest::VectorMetadata::Categorical { dictionary },
+			) = (target.semantic_type(), target.encoding(), target.metadata())
+			else {
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					format!(
+						"target {:?} classified {classified} is incompatible with categorical cross entropy",
+						String::from_utf8_lossy(target.name())
+					),
+				));
+			};
+			if dictionary.is_empty() {
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					format!(
+						"target {:?} has no labels in its training-fit dictionary",
+						String::from_utf8_lossy(target.name())
+					),
+				));
+			}
+			let class_count = dictionary.len().checked_add(1).ok_or_else(|| {
+				TrainingCompileError::new(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					"categorical class count overflowed while adding the reserved unseen-label route",
+				)
+			})?;
+			let reserved_code = i32::try_from(dictionary.len()).map_err(|error| {
+				TrainingCompileError::new(
+					TrainingCompileErrorKind::UnsupportedExtent,
+					format!("categorical reserved code cannot be represented by i32: {error}"),
+				)
+			})?;
+			Ok(DenseTask::MulticlassClassification {
+				target_vector: target.source_index(),
+				class_count,
+				reserved_code,
+			})
+		}
+	}
+}
+
+fn validate_lowered_dataset(dataset: &LoweredDenseDataset, task: DenseTask) -> TrainingCompileResult<()> {
+	for partition in core::iter::once(dataset.train()).chain(dataset.validation()) {
+		if partition.targets().columns() != 1 {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				format!(
+					"dense task requires one classified target-code column, got {}",
+					partition.targets().columns(),
+				),
+			));
+		}
+		validate_exact_i32_to_f32(partition.features(), "feature")?;
+		match task {
+			DenseTask::BinaryClassification { .. } => {
+				validate_exact_i32_to_f32(partition.targets(), "target")?;
+				validate_binary_targets(partition.targets())?;
+			}
+			DenseTask::ScalarRegression { .. } => {
+				validate_exact_i32_to_f32(partition.targets(), "target")?;
+			}
+			DenseTask::MulticlassClassification { .. } => {
+				if !matches!(partition.targets(), DenseMatrix::I32 { .. }) {
+					return Err(TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidTargetMatrix,
+						"multiclass categorical targets must retain dictionary int32 codes",
+					));
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+fn validate_exact_i32_to_f32(matrix: &DenseMatrix, role: &str) -> TrainingCompileResult<()> {
+	let DenseMatrix::I32 { values, .. } = matrix else {
+		return Ok(());
+	};
+	if let Some(value) = values
+		.iter()
+		.copied()
+		.find(|value| f64::from(*value as f32) != f64::from(*value))
+	{
+		return Err(TrainingCompileError::new(
+			if role == "feature" {
+				TrainingCompileErrorKind::InvalidFeatureMatrix
+			} else {
+				TrainingCompileErrorKind::InvalidTargetMatrix
+			},
+			format!("{role} int32 value {value} cannot be represented exactly by dense f32 calculation"),
+		));
+	}
+	Ok(())
+}
+
+fn validate_config(config: &DenseTrainingConfig, blocks: &[DenseBlock]) -> TrainingCompileResult<()> {
+	if blocks.is_empty() {
 		return Err(TrainingCompileError::new(
 			TrainingCompileErrorKind::InvalidNetwork,
 			"dense network requires at least one layer",
 		));
 	}
-	let output = config.layers.last().copied().expect("nonempty was checked");
-	if output.width().get() != 1 || output.activation() != DenseActivation::Linear {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidNetwork,
-			"binary BCE-with-logits requires a final width-one Linear layer",
-		));
+	for (block_index, block) in blocks.iter().enumerate() {
+		if let DenseBlock::Residual(residual) = block
+			&& residual.output_width().is_none()
+		{
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				format!("residual block {block_index} requires at least one layer operation"),
+			));
+		}
 	}
 	if config.warmup_epochs > config.epochs.get() {
 		return Err(TrainingCompileError::new(
@@ -504,13 +939,167 @@ fn validate_config(config: &DenseTrainingConfig) -> TrainingCompileResult<()> {
 	Ok(())
 }
 
+fn effective_blocks(
+	declared: &[DenseBlock],
+	task: DenseTask,
+) -> TrainingCompileResult<(Vec<DenseBlock>, Option<DenseOutputAdapter>)> {
+	let mut blocks = declared.to_vec();
+	let output = blocks.last().ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"dense network requires at least one layer",
+		)
+	})?;
+	let target_width = NonZeroU64::new(u64::try_from(task.output_width()).map_err(|error| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			format!("task output width cannot be represented by u64: {error}"),
+		)
+	})?)
+	.ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			"task output width must be nonzero",
+		)
+	})?;
+	let source_width = output.output_width().ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"final residual block requires at least one branch layer",
+		)
+	})?;
+	let output_is_logits = output
+		.output_operations()
+		.iter()
+		.all(|operation| *operation == DenseOperation::Activation(DenseActivation::Linear));
+	let requires_logits = matches!(
+		task,
+		DenseTask::BinaryClassification { .. } | DenseTask::MulticlassClassification { .. }
+	);
+	let needs_adapter = source_width != target_width || (requires_logits && !output_is_logits);
+	if !needs_adapter {
+		return Ok((blocks, None));
+	}
+	let adapter = DenseOutputAdapter::new(source_width, target_width);
+	blocks.push(DenseBlock::Layer(DenseLayer::new(
+		target_width,
+		DenseActivation::Linear,
+	)));
+	Ok((blocks, Some(adapter)))
+}
+
+fn flatten_parameter_gradients(blocks: &[BlockGradients]) -> Vec<ParameterGradient> {
+	let mut flattened = Vec::new();
+	for block in blocks {
+		match block {
+			BlockGradients::Layer(gradient) => flattened.extend([
+				ParameterGradient {
+					role: ParameterRole::LayerWeight,
+					value: gradient.weight,
+				},
+				ParameterGradient {
+					role: ParameterRole::LayerBias,
+					value: gradient.bias,
+				},
+			]),
+			BlockGradients::Residual { branch, projection } => {
+				for gradient in branch {
+					flattened.extend([
+						ParameterGradient {
+							role: ParameterRole::LayerWeight,
+							value: gradient.weight,
+						},
+						ParameterGradient {
+							role: ParameterRole::LayerBias,
+							value: gradient.bias,
+						},
+					]);
+				}
+				if let Some(projection) = projection {
+					flattened.push(ParameterGradient {
+						role: ParameterRole::ResidualProjectionWeight,
+						value: *projection,
+					});
+				}
+			}
+		}
+	}
+	flattened
+}
+
+fn take_clipped_gradient(
+	parameter_gradients: &[ParameterGradient],
+	clipped: &[ValueId],
+	cursor: &mut usize,
+	expected: ParameterRole,
+) -> TrainingCompileResult<ValueId> {
+	let parameter = parameter_gradients.get(*cursor).ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"optimizer parameter traversal ended before the model tape",
+		)
+	})?;
+	if parameter.role != expected {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			format!(
+				"optimizer parameter role {:?} disagrees with expected {expected:?}",
+				parameter.role
+			),
+		));
+	}
+	let gradient = clipped.get(*cursor).copied().ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"clipped gradient traversal ended before the model tape",
+		)
+	})?;
+	*cursor = cursor.checked_add(1).ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::ArithmeticOverflow,
+			"optimizer parameter cursor overflowed usize",
+		)
+	})?;
+	Ok(gradient)
+}
+
 fn validate_validation_config(
-	dataset: &DenseBinaryDataset,
-	config: Option<&BinaryValidationConfig>,
+	dataset: &LoweredDenseDataset,
+	task: DenseTask,
+	loss: DenseLoss,
+	binary: Option<&BinaryValidationConfig>,
+	multiclass: Option<&MulticlassValidationConfig>,
 ) -> TrainingCompileResult<()> {
-	let Some(config) = config else {
+	if binary.is_some() && multiclass.is_some() {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"binary and multiclass validation cannot be requested for one target",
+		));
+	}
+	if multiclass.is_some() {
+		if loss != DenseLoss::CrossEntropy || !matches!(task, DenseTask::MulticlassClassification { .. }) {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"multiclass validation requires a categorical cross-entropy target",
+			));
+		}
+		if dataset.validation().is_none() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				"multiclass validation metrics require a prepared validation partition",
+			));
+		}
+		return Ok(());
+	}
+	let Some(config) = binary else {
 		return Ok(());
 	};
+	if loss != DenseLoss::BinaryCrossEntropy || !matches!(task, DenseTask::BinaryClassification { .. }) {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"binary classification validation is available only with BCE",
+		));
+	}
 	let validation = dataset.validation().ok_or_else(|| {
 		TrainingCompileError::new(
 			TrainingCompileErrorKind::InvalidTargetMatrix,
@@ -619,7 +1208,7 @@ fn training_bounds(
 	if training_iterations.get() > i32::MAX as u64 {
 		return Err(TrainingCompileError::new(
 			TrainingCompileErrorKind::UnsupportedExtent,
-			"GPU-derived Adam step currently requires at most i32::MAX training iterations",
+			"GPU-derived training schedule currently requires at most i32::MAX training iterations",
 		));
 	}
 	let iterations = training_iterations
@@ -666,6 +1255,7 @@ struct GraphCompiler {
 	domains: Vec<KernelIterationDomain>,
 	next_value: u64,
 	next_kernel: u64,
+	next_weight_stream: u64,
 	iterations: recipe_core::LoopIterations,
 	training_domain: IterationDomain,
 	external_inputs: Vec<OwnedExternalInput>,
@@ -687,6 +1277,7 @@ impl GraphCompiler {
 			domains: Vec::new(),
 			next_value: 1,
 			next_kernel: 1,
+			next_weight_stream: 0,
 			iterations: recipe_core::LoopIterations::from(iterations),
 			training_domain,
 			external_inputs: Vec::new(),
@@ -734,6 +1325,46 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	fn external_f32_vector(&mut self, role: ExternalInputRole, values: &[u32]) -> TrainingCompileResult<ValueId> {
+		if values.is_empty() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				format!("{role:?} cannot be empty"),
+			));
+		}
+		if let Some(bits) = values
+			.iter()
+			.copied()
+			.find(|bits| !f32::from_bits(*bits).is_finite())
+		{
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				format!("{role:?} contains non-finite f32 bits {bits:#010x}"),
+			));
+		}
+		let columns = u64::try_from(values.len()).map_err(|error| {
+			TrainingCompileError::new(
+				TrainingCompileErrorKind::UnsupportedExtent,
+				format!("{role:?} width cannot be represented by u64: {error}"),
+			)
+		})?;
+		let shape = shape(&[columns])?;
+		let bytes = values
+			.iter()
+			.flat_map(|bits| bits.to_le_bytes())
+			.collect::<Vec<_>>();
+		let value = self.tensor(DType::F32, shape.clone())?;
+		self.external_input_ids.insert(value);
+		self.external_inputs.push(OwnedExternalInput::new(
+			role,
+			value,
+			DType::F32,
+			shape,
+			bytes,
+		));
+		Ok(value)
+	}
+
 	fn convert_matrix_if_i32(
 		&mut self,
 		input: ValueId,
@@ -756,6 +1387,7 @@ impl GraphCompiler {
 		rows: u64,
 		epsilon: f32,
 		tree_lanes: u32,
+		normalization_mask: Option<ValueId>,
 	) -> TrainingCompileResult<ZScoreValues> {
 		let column_shape = shape(&[columns])?;
 		let sums = self.tensor(DType::F32, column_shape.clone())?;
@@ -803,6 +1435,7 @@ impl GraphCompiler {
 			matrix_shape,
 			epsilon,
 			IterationDomain::first(),
+			normalization_mask,
 		)?;
 		Ok(ZScoreValues {
 			normalized,
@@ -819,15 +1452,977 @@ impl GraphCompiler {
 		output_shape: Shape,
 		epsilon: f32,
 		domain: IterationDomain,
+		normalization_mask: Option<ValueId>,
 	) -> TrainingCompileResult<ValueId> {
 		let normalized = self.tensor(DType::F32, output_shape)?;
+		let mut inputs = vec![input, mean, variance];
+		if let Some(mask) = normalization_mask {
+			inputs.push(mask);
+		}
 		self.emit_elementwise(
-			vec![input, mean, variance],
+			inputs,
 			vec![normalized],
-			z_score_program(epsilon)?,
+			z_score_program(epsilon, normalization_mask.is_some())?,
 			domain,
 		)?;
 		Ok(normalized)
+	}
+
+	fn min_max(
+		&mut self,
+		input: ValueId,
+		matrix_shape: Shape,
+		columns: u64,
+		epsilon: f32,
+		tree_lanes: u32,
+		normalization_mask: Option<ValueId>,
+	) -> TrainingCompileResult<MinMaxValues> {
+		let column_shape = shape(&[columns])?;
+		let minimum = self.tensor(DType::F32, column_shape.clone())?;
+		self.reduce_value(
+			input,
+			minimum,
+			ReduceOperator::Minimum,
+			&[0],
+			false,
+			tree_lanes,
+			IterationDomain::first(),
+		)?;
+		let maximum = self.tensor(DType::F32, column_shape)?;
+		self.reduce_value(
+			input,
+			maximum,
+			ReduceOperator::Maximum,
+			&[0],
+			false,
+			tree_lanes,
+			IterationDomain::first(),
+		)?;
+		let normalized = self.apply_min_max(
+			input,
+			minimum,
+			maximum,
+			matrix_shape,
+			epsilon,
+			IterationDomain::first(),
+			normalization_mask,
+		)?;
+		Ok(MinMaxValues {
+			normalized,
+			minimum,
+			maximum,
+		})
+	}
+
+	fn apply_min_max(
+		&mut self,
+		input: ValueId,
+		minimum: ValueId,
+		maximum: ValueId,
+		output_shape: Shape,
+		epsilon: f32,
+		domain: IterationDomain,
+		normalization_mask: Option<ValueId>,
+	) -> TrainingCompileResult<ValueId> {
+		let normalized = self.tensor(DType::F32, output_shape)?;
+		let mut inputs = vec![input, minimum, maximum];
+		if let Some(mask) = normalization_mask {
+			inputs.push(mask);
+		}
+		self.emit_elementwise(
+			inputs,
+			vec![normalized],
+			min_max_program(epsilon, normalization_mask.is_some())?,
+			domain,
+		)?;
+		Ok(normalized)
+	}
+
+	fn l2_norm(
+		&mut self,
+		input: ValueId,
+		matrix_shape: Shape,
+		epsilon: f32,
+		tree_lanes: u32,
+		domain: IterationDomain,
+		normalization_mask: Option<ValueId>,
+	) -> TrainingCompileResult<ValueId> {
+		let rows = matrix_shape.extents().first().copied().ok_or_else(|| {
+			TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				"L2 normalization requires a matrix",
+			)
+		})?;
+		let squares = self.tensor(DType::F32, matrix_shape.clone())?;
+		let mut square_inputs = vec![input];
+		if let Some(mask) = normalization_mask {
+			square_inputs.push(mask);
+		}
+		self.emit_elementwise(
+			square_inputs,
+			vec![squares],
+			l2_square_program(normalization_mask.is_some())?,
+			domain,
+		)?;
+		let norms_squared = self.tensor(DType::F32, shape(&[rows, 1])?)?;
+		self.reduce_value(
+			squares,
+			norms_squared,
+			ReduceOperator::Sum,
+			&[1],
+			true,
+			tree_lanes,
+			domain,
+		)?;
+		let normalized = self.tensor(DType::F32, matrix_shape)?;
+		let mut normalize_inputs = vec![input, norms_squared];
+		if let Some(mask) = normalization_mask {
+			normalize_inputs.push(mask);
+		}
+		self.emit_elementwise(
+			normalize_inputs,
+			vec![normalized],
+			l2_norm_program(epsilon, normalization_mask.is_some())?,
+			domain,
+		)?;
+		Ok(normalized)
+	}
+
+	fn apply_activation(
+		&mut self,
+		input: ValueId,
+		activation: DenseActivation,
+		output_shape: Shape,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<ValueId> {
+		if activation == DenseActivation::Linear {
+			return Ok(input);
+		}
+		let output = self.tensor(DType::F32, output_shape.clone())?;
+		match activation {
+			DenseActivation::Linear => {}
+			DenseActivation::Cosine => {
+				self.emit_owned_scalar("gpu_cos", vec![input], vec![output], domain)?;
+			}
+			DenseActivation::Exponential => {
+				self.emit_owned_scalar("gpu_exp", vec![input], vec![output], domain)?;
+			}
+			DenseActivation::Logarithm => {
+				let absolute = self.tensor(DType::F32, output_shape.clone())?;
+				self.emit_owned_scalar("gpu_abs_into", vec![input], vec![absolute], domain)?;
+				let magnitude = self.tensor(DType::F32, output_shape.clone())?;
+				self.emit_owned_scalar("gpu_log1p", vec![absolute], vec![magnitude], domain)?;
+				let sign = self.tensor(DType::F32, output_shape)?;
+				self.emit_owned_scalar("gpu_sign_into", vec![input], vec![sign], domain)?;
+				self.emit_elementwise(
+					vec![sign, magnitude],
+					vec![output],
+					multiply_program()?,
+					domain,
+				)?;
+			}
+			DenseActivation::Huber => {
+				self.emit_elementwise(
+					vec![input],
+					vec![output],
+					huber_activation_program()?,
+					domain,
+				)?;
+			}
+			DenseActivation::Tangent => {
+				self.emit_owned_scalar("gpu_tan", vec![input], vec![output], domain)?;
+			}
+			DenseActivation::Relu => {
+				self.emit_owned_scalar("gpu_relu_into", vec![input], vec![output], domain)?;
+			}
+			DenseActivation::Gelu => {
+				self.emit_owned_scalar("gpu_gelu_into", vec![input], vec![output], domain)?;
+			}
+			DenseActivation::Silu => {
+				self.emit_owned_scalar("gpu_silu_into", vec![input], vec![output], domain)?;
+			}
+		}
+		Ok(output)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn cross_entropy_with_logits(
+		&mut self,
+		logits: ValueId,
+		targets: ValueId,
+		losses: ValueId,
+		gradients: ValueId,
+		rows: u64,
+		classes: u64,
+		tree_lanes: u32,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<()> {
+		let matrix_shape = shape(&[rows, classes])?;
+		let row_shape = shape(&[rows, 1])?;
+		let classes_i32 = checked_i32(classes, "categorical class count")?;
+		let class_indices = self.tensor(DType::I32, shape(&[1, classes])?)?;
+		self.emit(
+			Vec::new(),
+			vec![class_indices],
+			PrimitiveKind::IndexMap(IndexMap {
+				start: 0,
+				element_step: 1,
+				iteration_step: 0,
+				modulus: None,
+			}),
+			Vec::new(),
+			IterationDomain::first(),
+		)?;
+		let maximum = self.tensor(DType::F32, row_shape.clone())?;
+		self.reduce_value(
+			logits,
+			maximum,
+			ReduceOperator::Maximum,
+			&[1],
+			true,
+			tree_lanes,
+			domain,
+		)?;
+		let shifted = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![logits, maximum],
+			vec![shifted],
+			subtract_program()?,
+			domain,
+		)?;
+		let exponentials = self.tensor(DType::F32, matrix_shape)?;
+		self.emit_owned_scalar(
+			"gpu_exp",
+			vec![shifted],
+			vec![exponentials],
+			domain,
+		)?;
+		let exponential_sum = self.tensor(DType::F32, row_shape.clone())?;
+		self.reduce_value(
+			exponentials,
+			exponential_sum,
+			ReduceOperator::Sum,
+			&[1],
+			true,
+			tree_lanes,
+			domain,
+		)?;
+		let logarithmic_sum = self.tensor(DType::F32, row_shape)?;
+		self.emit_owned_scalar(
+			"gpu_log_into",
+			vec![exponential_sum],
+			vec![logarithmic_sum],
+			domain,
+		)?;
+		self.emit_elementwise(
+			vec![
+				logits,
+				targets,
+				class_indices,
+				maximum,
+				logarithmic_sum,
+				exponentials,
+				exponential_sum,
+			],
+			vec![losses, gradients],
+			cross_entropy_with_logits_program(classes_i32)?,
+			domain,
+		)?;
+		Ok(())
+	}
+
+	fn normalize_training(
+		&mut self,
+		input: ValueId,
+		normalization: DenseNormalization,
+		rows: u64,
+		columns: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
+		tree_lanes: u32,
+	) -> TrainingCompileResult<NormalizedValues> {
+		match normalization {
+			DenseNormalization::Layer => self.normalize_unmasked(
+				input,
+				rows,
+				columns,
+				1,
+				columns as f32,
+				true,
+				epsilon,
+				tree_lanes,
+				self.training_domain,
+			),
+			DenseNormalization::Batch => self.normalize_masked_batch(
+				input,
+				rows,
+				columns,
+				validity,
+				valid_count,
+				epsilon,
+				tree_lanes,
+			),
+		}
+	}
+
+	fn normalize_validation(
+		&mut self,
+		input: ValueId,
+		normalization: DenseNormalization,
+		rows: u64,
+		columns: u64,
+		epsilon: f32,
+		tree_lanes: u32,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<NormalizedValues> {
+		match normalization {
+			DenseNormalization::Layer => self.normalize_unmasked(
+				input,
+				rows,
+				columns,
+				1,
+				columns as f32,
+				true,
+				epsilon,
+				tree_lanes,
+				domain,
+			),
+			DenseNormalization::Batch => self.normalize_unmasked(
+				input,
+				rows,
+				columns,
+				0,
+				rows as f32,
+				false,
+				epsilon,
+				tree_lanes,
+				domain,
+			),
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn normalize_unmasked(
+		&mut self,
+		input: ValueId,
+		rows: u64,
+		columns: u64,
+		axis: usize,
+		population: f32,
+		keep_dimensions: bool,
+		epsilon: f32,
+		tree_lanes: u32,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<NormalizedValues> {
+		let matrix_shape = shape(&[rows, columns])?;
+		let statistic_shape = if keep_dimensions {
+			shape(&[rows, 1])?
+		} else {
+			shape(&[columns])?
+		};
+		let sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_value(
+			input,
+			sums,
+			ReduceOperator::Sum,
+			&[axis],
+			keep_dimensions,
+			tree_lanes,
+			domain,
+		)?;
+		let means = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.emit_elementwise(
+			vec![sums],
+			vec![means],
+			divide_constant_program(population)?,
+			domain,
+		)?;
+		let centered = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![input, means],
+			vec![centered],
+			subtract_program()?,
+			domain,
+		)?;
+		let squares = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(vec![centered], vec![squares], square_program()?, domain)?;
+		let variance_sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_value(
+			squares,
+			variance_sums,
+			ReduceOperator::Sum,
+			&[axis],
+			keep_dimensions,
+			tree_lanes,
+			domain,
+		)?;
+		let variance = self.tensor(DType::F32, statistic_shape)?;
+		self.emit_elementwise(
+			vec![variance_sums],
+			vec![variance],
+			divide_constant_program(population)?,
+			domain,
+		)?;
+		let normalized = self.apply_z_score(input, means, variance, matrix_shape, epsilon, domain, None)?;
+		Ok(NormalizedValues {
+			normalized,
+			variance,
+		})
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn normalize_masked_batch(
+		&mut self,
+		input: ValueId,
+		rows: u64,
+		columns: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
+		tree_lanes: u32,
+	) -> TrainingCompileResult<NormalizedValues> {
+		let matrix_shape = shape(&[rows, columns])?;
+		let statistic_shape = shape(&[columns])?;
+		let masked = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![input, validity],
+			vec![masked],
+			multiply_program()?,
+			self.training_domain,
+		)?;
+		let sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_sum(masked, sums, &[0], tree_lanes, self.training_domain)?;
+		let means = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.emit_elementwise(
+			vec![sums, valid_count],
+			vec![means],
+			divide_program()?,
+			self.training_domain,
+		)?;
+		let centered = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![input, means],
+			vec![centered],
+			subtract_program()?,
+			self.training_domain,
+		)?;
+		let squares = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![centered],
+			vec![squares],
+			square_program()?,
+			self.training_domain,
+		)?;
+		let masked_squares = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![squares, validity],
+			vec![masked_squares],
+			multiply_program()?,
+			self.training_domain,
+		)?;
+		let variance_sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_sum(
+			masked_squares,
+			variance_sums,
+			&[0],
+			tree_lanes,
+			self.training_domain,
+		)?;
+		let variance = self.tensor(DType::F32, statistic_shape)?;
+		self.emit_elementwise(
+			vec![variance_sums, valid_count],
+			vec![variance],
+			divide_program()?,
+			self.training_domain,
+		)?;
+		let normalized = self.apply_z_score(
+			input,
+			means,
+			variance,
+			matrix_shape,
+			epsilon,
+			self.training_domain,
+			None,
+		)?;
+		Ok(NormalizedValues {
+			normalized,
+			variance,
+		})
+	}
+
+	fn backward_activation(
+		&mut self,
+		gradient: ValueId,
+		input: ValueId,
+		output: ValueId,
+		activation: DenseActivation,
+	) -> TrainingCompileResult<ValueId> {
+		if activation == DenseActivation::Linear {
+			return Ok(gradient);
+		}
+		let output_shape = self.tensor_ref(gradient)?.shape.clone();
+		let activation_gradient = self.tensor(DType::F32, output_shape.clone())?;
+		match activation {
+			DenseActivation::Linear => {}
+			DenseActivation::Cosine => {
+				let sine = self.tensor(DType::F32, output_shape)?;
+				self.emit_owned_scalar("gpu_sin", vec![input], vec![sine], self.training_domain)?;
+				self.emit_elementwise(
+					vec![gradient, sine],
+					vec![activation_gradient],
+					negative_multiply_program()?,
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Exponential => {
+				self.emit_elementwise(
+					vec![gradient, output],
+					vec![activation_gradient],
+					multiply_program()?,
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Logarithm => {
+				self.emit_elementwise(
+					vec![gradient, input],
+					vec![activation_gradient],
+					signed_log_one_plus_backward_program()?,
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Huber => {
+				self.emit_elementwise(
+					vec![gradient, input],
+					vec![activation_gradient],
+					huber_activation_backward_program()?,
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Tangent => {
+				self.emit_elementwise(
+					vec![gradient, output],
+					vec![activation_gradient],
+					tangent_activation_backward_program()?,
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Relu => {
+				self.emit_owned_scalar(
+					"gpu_relu_backward_into",
+					vec![gradient, input],
+					vec![activation_gradient],
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Gelu => {
+				self.emit_owned_scalar(
+					"gpu_gelu_backward_into",
+					vec![gradient, input],
+					vec![activation_gradient],
+					self.training_domain,
+				)?;
+			}
+			DenseActivation::Silu => {
+				self.emit_owned_scalar(
+					"gpu_silu_backward_into",
+					vec![gradient, input],
+					vec![activation_gradient],
+					self.training_domain,
+				)?;
+			}
+		}
+		Ok(activation_gradient)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn backward_normalization(
+		&mut self,
+		gradient: ValueId,
+		normalized: ValueId,
+		variance: ValueId,
+		normalization: DenseNormalization,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
+		tree_lanes: u32,
+	) -> TrainingCompileResult<ValueId> {
+		let matrix_shape = self.tensor_ref(gradient)?.shape.clone();
+		let extents = matrix_shape.extents();
+		let rows = extents.first().copied().ok_or_else(|| {
+			TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"normalization gradient is not rank two",
+			)
+		})?;
+		let columns = extents.get(1).copied().ok_or_else(|| {
+			TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"normalization gradient is not rank two",
+			)
+		})?;
+		let (axis, keep_dimensions, statistic_shape) = match normalization {
+			DenseNormalization::Layer => (1, true, shape(&[rows, 1])?),
+			DenseNormalization::Batch => (0, false, shape(&[columns])?),
+		};
+		let gradient_sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_value(
+			gradient,
+			gradient_sums,
+			ReduceOperator::Sum,
+			&[axis],
+			keep_dimensions,
+			tree_lanes,
+			self.training_domain,
+		)?;
+		let gradient_means = self.tensor(DType::F32, statistic_shape.clone())?;
+		match normalization {
+			DenseNormalization::Layer => {
+				self.emit_elementwise(
+					vec![gradient_sums],
+					vec![gradient_means],
+					divide_constant_program(columns as f32)?,
+					self.training_domain,
+				)?;
+			}
+			DenseNormalization::Batch => {
+				self.emit_elementwise(
+					vec![gradient_sums, valid_count],
+					vec![gradient_means],
+					divide_program()?,
+					self.training_domain,
+				)?;
+			}
+		}
+		let gradient_products = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![gradient, normalized],
+			vec![gradient_products],
+			multiply_program()?,
+			self.training_domain,
+		)?;
+		let product_sums = self.tensor(DType::F32, statistic_shape.clone())?;
+		self.reduce_value(
+			gradient_products,
+			product_sums,
+			ReduceOperator::Sum,
+			&[axis],
+			keep_dimensions,
+			tree_lanes,
+			self.training_domain,
+		)?;
+		let product_means = self.tensor(DType::F32, statistic_shape.clone())?;
+		match normalization {
+			DenseNormalization::Layer => {
+				self.emit_elementwise(
+					vec![product_sums],
+					vec![product_means],
+					divide_constant_program(columns as f32)?,
+					self.training_domain,
+				)?;
+			}
+			DenseNormalization::Batch => {
+				self.emit_elementwise(
+					vec![product_sums, valid_count],
+					vec![product_means],
+					divide_program()?,
+					self.training_domain,
+				)?;
+			}
+		}
+		let inverse_standard_deviation = self.tensor(DType::F32, statistic_shape)?;
+		self.emit_elementwise(
+			vec![variance],
+			vec![inverse_standard_deviation],
+			inverse_standard_deviation_program(epsilon)?,
+			self.training_domain,
+		)?;
+		let unmasked = self.tensor(DType::F32, matrix_shape.clone())?;
+		self.emit_elementwise(
+			vec![
+				gradient,
+				gradient_means,
+				normalized,
+				product_means,
+				inverse_standard_deviation,
+			],
+			vec![unmasked],
+			normalization_backward_program()?,
+			self.training_domain,
+		)?;
+		if normalization == DenseNormalization::Layer {
+			return Ok(unmasked);
+		}
+		let masked = self.tensor(DType::F32, matrix_shape)?;
+		self.emit_elementwise(
+			vec![unmasked, validity],
+			vec![masked],
+			multiply_program()?,
+			self.training_domain,
+		)?;
+		Ok(masked)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn compile_training_blocks(
+		&mut self,
+		blocks: &[DenseBlock],
+		input: ValueId,
+		input_width: u64,
+		batch: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		config: &DenseTrainingConfig,
+	) -> TrainingCompileResult<(ValueId, u64, Vec<BlockValues>)> {
+		let mut current = input;
+		let mut current_width = input_width;
+		let mut values = Vec::with_capacity(blocks.len());
+		for block in blocks {
+			match block {
+				DenseBlock::Layer(layer) => {
+					let (output, layer_values) = self.compile_training_layer(
+						layer,
+						current,
+						current_width,
+						batch,
+						validity,
+						valid_count,
+						config,
+					)?;
+					current = output;
+					current_width = layer.width().get();
+					values.push(BlockValues::Layer(layer_values));
+				}
+				DenseBlock::Residual(residual) => {
+					let residual_input = current;
+					let residual_input_width = current_width;
+					let mut branch_current = residual_input;
+					let mut branch_width = residual_input_width;
+					let mut branch_values = Vec::with_capacity(residual.branch().len());
+					for branch_operation in residual.branch() {
+						match branch_operation {
+							DenseResidualOperation::Layer(layer) => {
+								let (output, layer_values) = self.compile_training_layer(
+									layer,
+									branch_current,
+									branch_width,
+									batch,
+									validity,
+									valid_count,
+									config,
+								)?;
+								branch_current = output;
+								branch_width = layer.width().get();
+								branch_values.push(ResidualBranchValues::Layer(layer_values));
+							}
+							DenseResidualOperation::Operation(operation) => {
+								let (output, operation_values) = self.compile_training_operation(
+									branch_current,
+									*operation,
+									batch,
+									branch_width,
+									validity,
+									valid_count,
+									config,
+								)?;
+								branch_current = output;
+								branch_values.push(ResidualBranchValues::Operation(operation_values));
+							}
+						}
+					}
+					let output_width = residual.output_width().ok_or_else(|| {
+						TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual branch requires at least one layer operation",
+						)
+					})?;
+					if branch_width != output_width.get() {
+						return Err(TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual branch output disagrees with its final layer width",
+						));
+					}
+					let (skip, projection) = if residual_input_width == output_width.get() {
+						(residual_input, None)
+					} else {
+						let projection = self.initialize_weight(
+							shape(&[residual_input_width, output_width.get()])?,
+							residual_input_width,
+							config.random_seed,
+						)?;
+						let skip = self.bias_free_linear(
+							residual_input,
+							projection.value,
+							batch,
+							output_width.get(),
+							self.training_domain,
+						)?;
+						(skip, Some(projection))
+					};
+					current = self.exact_add(branch_current, skip, self.training_domain)?;
+					current_width = output_width.get();
+					let mut operation_values = Vec::with_capacity(residual.operations().len());
+					for operation in residual.operations().iter().copied() {
+						let (output, values) = self.compile_training_operation(
+							current,
+							operation,
+							batch,
+							current_width,
+							validity,
+							valid_count,
+							config,
+						)?;
+						current = output;
+						operation_values.push(values);
+					}
+					values.push(BlockValues::Residual(ResidualValues {
+						input: residual_input,
+						branch: branch_values,
+						projection,
+						operations: operation_values,
+					}));
+				}
+			}
+		}
+		Ok((current, current_width, values))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn compile_training_layer(
+		&mut self,
+		layer: &DenseLayer,
+		input: ValueId,
+		input_width: u64,
+		batch: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		config: &DenseTrainingConfig,
+	) -> TrainingCompileResult<(ValueId, LayerValues)> {
+		let output_width = layer.width().get();
+		let output_shape = shape(&[batch, output_width])?;
+		let weight = self.initialize_weight(
+			shape(&[input_width, output_width])?,
+			input_width,
+			config.random_seed,
+		)?;
+		let bias = self.initialize_zero_parameter(shape(&[output_width])?)?;
+		let preactivation = self.tensor(DType::F32, output_shape)?;
+		self.materialize(
+			"gpu_linear_into",
+			&[("input", input), ("weight", weight.value), ("bias", bias.value)],
+			&[("output", preactivation)],
+			"input",
+			&PreparedParameters::new(),
+			self.training_domain,
+		)?;
+		let mut current = preactivation;
+		let mut operations = Vec::with_capacity(layer.operations().len());
+		for operation in layer.operations().iter().copied() {
+			let (output, values) = self.compile_training_operation(
+				current,
+				operation,
+				batch,
+				output_width,
+				validity,
+				valid_count,
+				config,
+			)?;
+			current = output;
+			operations.push(values);
+		}
+		Ok((
+			current,
+			LayerValues {
+				input,
+				weight,
+				bias,
+				operations,
+			},
+		))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn compile_training_operation(
+		&mut self,
+		input: ValueId,
+		operation: DenseOperation,
+		batch: u64,
+		width: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		config: &DenseTrainingConfig,
+	) -> TrainingCompileResult<(ValueId, OperationValues)> {
+		let output_shape = shape(&[batch, width])?;
+		let (output, variance) = match operation {
+			DenseOperation::Activation(activation) => (
+				self.apply_activation(input, activation, output_shape, self.training_domain)?,
+				None,
+			),
+			DenseOperation::Normalization(normalization) => {
+				let normalized = self.normalize_training(
+					input,
+					normalization,
+					batch,
+					width,
+					validity,
+					valid_count,
+					config.normalization_epsilon,
+					config.reduction_tree_lanes,
+				)?;
+				(normalized.normalized, Some(normalized.variance))
+			}
+		};
+		Ok((
+			output,
+			OperationValues {
+				operation,
+				input,
+				output,
+				variance,
+			},
+		))
+	}
+
+	fn bias_free_linear(
+		&mut self,
+		input: ValueId,
+		weight: ValueId,
+		rows: u64,
+		output_width: u64,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<ValueId> {
+		let output = self.tensor(DType::F32, shape(&[rows, output_width])?)?;
+		self.emit(
+			vec![input, weight],
+			vec![output],
+			PrimitiveKind::Contraction(Contraction {
+				batch_axes: Vec::new(),
+				contract_axes: vec![(1, 0)],
+			}),
+			forbidden_aliases(2, 1),
+			domain,
+		)?;
+		Ok(output)
+	}
+
+	fn exact_add(
+		&mut self,
+		left: ValueId,
+		right: ValueId,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<ValueId> {
+		let left_dtype = self.tensor_ref(left)?.dtype;
+		let left_shape = self.tensor_ref(left)?.shape.clone();
+		let right_tensor = self.tensor_ref(right)?;
+		if left_dtype != right_tensor.dtype || left_shape != right_tensor.shape {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"residual addition requires exactly equal dtypes and shapes",
+			));
+		}
+		let output = self.tensor(left_dtype, left_shape)?;
+		self.emit_elementwise(vec![left, right], vec![output], sum_program(2)?, domain)?;
+		Ok(output)
 	}
 
 	fn initialize_weight(
@@ -835,8 +2430,9 @@ impl GraphCompiler {
 		parameter_shape: Shape,
 		fan_in: u64,
 		seed: u64,
-		stream: u64,
 	) -> TrainingCompileResult<InitialParameter> {
+		let stream = self.next_weight_stream;
+		self.next_weight_stream = stream.checked_add(1).ok_or_else(identity_exhausted)?;
 		let random = self.tensor(DType::F32, parameter_shape.clone())?;
 		self.emit(
 			Vec::new(),
@@ -955,12 +2551,195 @@ impl GraphCompiler {
 		})
 	}
 
+	fn compile_validation_blocks(
+		&mut self,
+		blocks: &[DenseBlock],
+		states: &[DenseBlockState],
+		input: ValueId,
+		rows: u64,
+		config: &DenseTrainingConfig,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<(ValueId, u64)> {
+		if blocks.len() != states.len() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"validation declaration and block-state counts disagree",
+			));
+		}
+		let mut current = input;
+		let mut current_width = self.matrix_width(input, "validation input")?;
+		for (block, state) in blocks.iter().zip(states) {
+			match (block, state) {
+				(DenseBlock::Layer(layer), DenseBlockState::Layer(state)) => {
+					current = self.compile_validation_layer(layer, state, current, rows, config, domain)?;
+					current_width = layer.width().get();
+				}
+				(DenseBlock::Residual(residual), DenseBlockState::Residual(state)) => {
+					let residual_input = current;
+					let residual_input_width = current_width;
+					let mut branch = residual_input;
+					let mut branch_width = residual_input_width;
+					let mut layer_states = state.branch.iter();
+					for operation in residual.branch() {
+						match operation {
+							DenseResidualOperation::Layer(layer) => {
+								let layer_state = layer_states.next().ok_or_else(|| {
+									TrainingCompileError::new(
+										TrainingCompileErrorKind::InvalidNetwork,
+										"residual validation state omitted a branch layer",
+									)
+								})?;
+								branch = self.compile_validation_layer(
+									layer,
+									layer_state,
+									branch,
+									rows,
+									config,
+									domain,
+								)?;
+								branch_width = layer.width().get();
+							}
+							DenseResidualOperation::Operation(operation) => {
+								branch = self.apply_validation_operation(
+									branch,
+									*operation,
+									rows,
+									branch_width,
+									config,
+									domain,
+								)?;
+							}
+						}
+					}
+					if layer_states.next().is_some() {
+						return Err(TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual validation state has an extra branch layer",
+						));
+					}
+					let output_width = residual.output_width().ok_or_else(|| {
+						TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual validation requires a branch layer",
+						)
+					})?;
+					if branch_width != output_width.get() {
+						return Err(TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual validation branch width disagrees with its final layer",
+						));
+					}
+					let skip = match (residual_input_width == output_width.get(), state.projection) {
+						(true, None) => residual_input,
+						(false, Some(projection)) => self.bias_free_linear(
+							residual_input,
+							projection.updated_parameter,
+							rows,
+							output_width.get(),
+							domain,
+						)?,
+						(true, Some(_)) => {
+							return Err(TrainingCompileError::new(
+								TrainingCompileErrorKind::InvalidNetwork,
+								"equal-width residual unexpectedly retained a projection",
+							));
+						}
+						(false, None) => {
+							return Err(TrainingCompileError::new(
+								TrainingCompileErrorKind::InvalidNetwork,
+								"mismatched residual omitted its projection",
+							));
+						}
+					};
+					current = self.exact_add(branch, skip, domain)?;
+					current_width = output_width.get();
+					for operation in residual.operations().iter().copied() {
+						current = self.apply_validation_operation(
+							current,
+							operation,
+							rows,
+							current_width,
+							config,
+							domain,
+						)?;
+					}
+				}
+				_ => {
+					return Err(TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidNetwork,
+						"validation block declaration and state variants disagree",
+					));
+				}
+			}
+		}
+		Ok((current, current_width))
+	}
+
+	fn compile_validation_layer(
+		&mut self,
+		layer: &DenseLayer,
+		state: &DenseLayerState,
+		input: ValueId,
+		rows: u64,
+		config: &DenseTrainingConfig,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<ValueId> {
+		let output_width = layer.width().get();
+		let output_shape = shape(&[rows, output_width])?;
+		let preactivation = self.tensor(DType::F32, output_shape)?;
+		self.materialize(
+			"gpu_linear_into",
+			&[
+				("input", input),
+				("weight", state.weight.updated_parameter),
+				("bias", state.bias.updated_parameter),
+			],
+			&[("output", preactivation)],
+			"input",
+			&PreparedParameters::new(),
+			domain,
+		)?;
+		let mut current = preactivation;
+		for operation in layer.operations().iter().copied() {
+			current = self.apply_validation_operation(current, operation, rows, output_width, config, domain)?;
+		}
+		Ok(current)
+	}
+
+	fn apply_validation_operation(
+		&mut self,
+		input: ValueId,
+		operation: DenseOperation,
+		rows: u64,
+		width: u64,
+		config: &DenseTrainingConfig,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<ValueId> {
+		match operation {
+			DenseOperation::Activation(activation) => {
+				self.apply_activation(input, activation, shape(&[rows, width])?, domain)
+			}
+			DenseOperation::Normalization(normalization) => Ok(self
+				.normalize_validation(
+					input,
+					normalization,
+					rows,
+					width,
+					config.normalization_epsilon,
+					config.reduction_tree_lanes,
+					domain,
+				)?
+				.normalized),
+		}
+	}
+
 	fn compile_validation(
 		&mut self,
 		validation: ValidationValues,
 		training_config: &DenseTrainingConfig,
+		block_declarations: &[DenseBlock],
 		validation_config: &BinaryValidationConfig,
-		layers: &[DenseLayerState],
+		block_states: &[DenseBlockState],
 		early_stopping_initial: Option<InitialEarlyStoppingState>,
 		bounds: &TrainingBounds,
 	) -> TrainingCompileResult<BinaryValidationOutputs> {
@@ -975,36 +2754,14 @@ impl GraphCompiler {
 				"validation domain must contain each epoch's final training iteration",
 			)
 		})?;
-		let mut current = validation.features;
-		for (layer, state) in training_config.layers.iter().copied().zip(layers) {
-			let output_shape = shape(&[validation.rows, layer.width().get()])?;
-			let preactivation = self.tensor(DType::F32, output_shape.clone())?;
-			self.materialize(
-				"gpu_linear_into",
-				&[
-					("input", current),
-					("weight", state.weight.updated_parameter),
-					("bias", state.bias.updated_parameter),
-				],
-				&[("output", preactivation)],
-				"input",
-				&PreparedParameters::new(),
-				validation_domain,
-			)?;
-			current = match layer.activation() {
-				DenseActivation::Linear => preactivation,
-				DenseActivation::Silu => {
-					let activated = self.tensor(DType::F32, output_shape)?;
-					self.emit_owned_scalar(
-						"gpu_silu_into",
-						vec![preactivation],
-						vec![activated],
-						validation_domain,
-					)?;
-					activated
-				}
-			};
-		}
+		let (current, _) = self.compile_validation_blocks(
+			block_declarations,
+			block_states,
+			validation.features,
+			validation.rows,
+			training_config,
+			validation_domain,
+		)?;
 		let logits = current;
 		let matrix_shape = shape(&[validation.rows, 1])?;
 		let probabilities_matrix = self.tensor(DType::F32, matrix_shape.clone())?;
@@ -1093,6 +2850,104 @@ impl GraphCompiler {
 			metric_domain: validation_domain,
 			early_stopping,
 			temperature_scaling,
+		})
+	}
+
+	fn compile_multiclass_validation(
+		&mut self,
+		validation: ValidationValues,
+		training_config: &DenseTrainingConfig,
+		block_declarations: &[DenseBlock],
+		block_states: &[DenseBlockState],
+		bounds: &TrainingBounds,
+	) -> TrainingCompileResult<MulticlassValidationOutputs> {
+		let validation_domain = IterationDomain::new(
+			bounds.batches_per_epoch - 1,
+			bounds.training_iterations.get(),
+			bounds.batches_per_epoch,
+		)
+		.ok_or_else(|| {
+			TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidOptimizer,
+				"validation domain must contain each epoch's final training iteration",
+			)
+		})?;
+		let (current, classes) = self.compile_validation_blocks(
+			block_declarations,
+			block_states,
+			validation.features,
+			validation.rows,
+			training_config,
+			validation_domain,
+		)?;
+		let logits = current;
+		let matrix_shape = shape(&[validation.rows, classes])?;
+		let losses = self.tensor(DType::F32, matrix_shape.clone())?;
+		let unused_gradient = self.tensor(DType::F32, matrix_shape)?;
+		self.cross_entropy_with_logits(
+			logits,
+			validation.targets,
+			losses,
+			unused_gradient,
+			validation.rows,
+			classes,
+			training_config.reduction_tree_lanes,
+			validation_domain,
+		)?;
+		let scalar_shape = shape(&[1])?;
+		let loss_sum = self.tensor(DType::F32, scalar_shape.clone())?;
+		self.reduce_sum(
+			losses,
+			loss_sum,
+			&[0, 1],
+			training_config.reduction_tree_lanes,
+			validation_domain,
+		)?;
+		let mean_cross_entropy = self.tensor(DType::F32, scalar_shape.clone())?;
+		self.emit_elementwise(
+			vec![loss_sum],
+			vec![mean_cross_entropy],
+			divide_constant_program(validation.rows as f32)?,
+			validation_domain,
+		)?;
+
+		let target_vector = self.tensor(DType::I32, shape(&[validation.rows])?)?;
+		self.reduce_sum(
+			validation.targets,
+			target_vector,
+			&[1],
+			training_config.reduction_tree_lanes,
+			validation_domain,
+		)?;
+		let correct_count = self.tensor(DType::F32, scalar_shape.clone())?;
+		let parameters = [(
+			"tree_lanes".to_owned(),
+			PreparedParameter::U64(u64::from(training_config.reduction_tree_lanes)),
+		)]
+		.into_iter()
+		.collect::<PreparedParameters>();
+		self.materialize(
+			"gpu_accuracy",
+			&[("predictions", logits), ("targets", target_vector)],
+			&[("correct_count", correct_count)],
+			"predictions",
+			&parameters,
+			validation_domain,
+		)?;
+		let accuracy = self.tensor(DType::F32, scalar_shape)?;
+		self.emit_elementwise(
+			vec![correct_count],
+			vec![accuracy],
+			divide_constant_program(validation.rows as f32)?,
+			validation_domain,
+		)?;
+		Ok(MulticlassValidationOutputs {
+			logits,
+			metrics: MulticlassMetricOutputs {
+				mean_cross_entropy,
+				accuracy,
+			},
+			metric_domain: validation_domain,
 		})
 	}
 
@@ -1318,91 +3173,160 @@ impl GraphCompiler {
 		})
 	}
 
-	fn backward(
+	#[allow(clippy::too_many_arguments)]
+	fn backward_blocks(
 		&mut self,
-		layers: &[LayerValues],
+		blocks: &[BlockValues],
 		mut gradient: ValueId,
 		batch: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
 		tree_lanes: u32,
-	) -> TrainingCompileResult<Vec<GradientPair>> {
-		let mut gradients = vec![None; layers.len()];
-		for layer_index in (0..layers.len()).rev() {
-			let layer = layers[layer_index];
-			let parameter_gradient = match layer.activation {
-				DenseActivation::Linear => gradient,
-				DenseActivation::Silu => {
-					let activation_gradient =
-						self.tensor(DType::F32, self.tensor_ref(gradient)?.shape.clone())?;
-					self.emit_owned_scalar(
-						"gpu_silu_backward_into",
-						vec![gradient, layer.preactivation],
-						vec![activation_gradient],
-						self.training_domain,
+	) -> TrainingCompileResult<Vec<BlockGradients>> {
+		let mut gradients = vec![None; blocks.len()];
+		for block_index in (0..blocks.len()).rev() {
+			let need_input_gradient = block_index != 0;
+			match &blocks[block_index] {
+				BlockValues::Layer(layer) => {
+					let (parameter_gradient, input_gradient) = self.backward_layer(
+						layer,
+						gradient,
+						need_input_gradient,
+						batch,
+						validity,
+						valid_count,
+						epsilon,
+						tree_lanes,
 					)?;
-					activation_gradient
+					if let Some(input_gradient) = input_gradient {
+						gradient = input_gradient;
+					}
+					gradients[block_index] = Some(BlockGradients::Layer(parameter_gradient));
 				}
-			};
-			let weight_shape = self.tensor_ref(layer.weight.value)?.shape.clone();
-			let bias_shape = self.tensor_ref(layer.bias.value)?.shape.clone();
-			let weight_gradient = self.tensor(DType::F32, weight_shape)?;
-			let bias_gradient = self.tensor(DType::F32, bias_shape)?;
-			let prepared = [(
-				"tree_lanes".to_owned(),
-				PreparedParameter::U64(u64::from(tree_lanes)),
-			)]
-			.into_iter()
-			.collect::<PreparedParameters>();
-			if layer_index == 0 {
-				self.materialize(
-					"gpu_linear_backward_weights_only_into",
-					&[
-						("output_gradient", parameter_gradient),
-						("input", layer.input),
-					],
-					&[
-						("weight_gradient", weight_gradient),
-						("bias_gradient", bias_gradient),
-					],
-					"output_gradient",
-					&prepared,
-					self.training_domain,
-				)?;
-			} else {
-				let input_width = self
-					.tensor_ref(layer.input)?
-					.shape
-					.extents()
-					.get(1)
-					.copied()
-					.ok_or_else(|| {
+				BlockValues::Residual(residual) => {
+					for operation in residual.operations.iter().rev() {
+						gradient = self.backward_operation(
+							gradient,
+							*operation,
+							validity,
+							valid_count,
+							epsilon,
+							tree_lanes,
+						)?;
+					}
+					let merge_gradient = gradient;
+					let layer_count = residual
+						.branch
+						.iter()
+						.filter(|operation| matches!(operation, ResidualBranchValues::Layer(_)))
+						.count();
+					let mut branch_gradients = vec![None; layer_count];
+					let mut branch_gradient = Some(merge_gradient);
+					let mut layer_index = layer_count;
+					for operation in residual.branch.iter().rev() {
+						match operation {
+							ResidualBranchValues::Operation(operation) => {
+								if let Some(current) = branch_gradient {
+									branch_gradient = Some(self.backward_operation(
+										current,
+										*operation,
+										validity,
+										valid_count,
+										epsilon,
+										tree_lanes,
+									)?);
+								}
+							}
+							ResidualBranchValues::Layer(layer) => {
+								layer_index = layer_index.checked_sub(1).ok_or_else(|| {
+									TrainingCompileError::new(
+										TrainingCompileErrorKind::InvalidNetwork,
+										"residual branch layer tape underflowed",
+									)
+								})?;
+								let current = branch_gradient.ok_or_else(|| {
+									TrainingCompileError::new(
+										TrainingCompileErrorKind::InvalidNetwork,
+										"residual branch gradient ended before all parameters",
+									)
+								})?;
+								let (parameter_gradient, input_gradient) = self.backward_layer(
+									layer,
+									current,
+									true,
+									batch,
+									validity,
+									valid_count,
+									epsilon,
+									tree_lanes,
+								)?;
+								branch_gradients[layer_index] = Some(parameter_gradient);
+								branch_gradient = input_gradient;
+							}
+						}
+					}
+					let branch_gradients = branch_gradients
+						.into_iter()
+						.map(|gradient| {
+							gradient.ok_or_else(|| {
+								TrainingCompileError::new(
+									TrainingCompileErrorKind::InvalidNetwork,
+									"residual backward omitted a branch parameter gradient",
+								)
+							})
+						})
+						.collect::<TrainingCompileResult<Vec<_>>>()?;
+					let (projection_gradient, skip_gradient) = match residual.projection {
+						Some(projection) => {
+							let weight_shape = self.tensor_ref(projection.value)?.shape.clone();
+							let weight_gradient = self.tensor(DType::F32, weight_shape)?;
+							self.emit(
+								vec![residual.input, merge_gradient],
+								vec![weight_gradient],
+								PrimitiveKind::Contraction(Contraction {
+									batch_axes: Vec::new(),
+									contract_axes: vec![(0, 0)],
+								}),
+								forbidden_aliases(2, 1),
+								self.training_domain,
+							)?;
+							let input_shape = self.tensor_ref(residual.input)?.shape.clone();
+							let input_gradient = self.tensor(DType::F32, input_shape)?;
+							self.emit(
+								vec![merge_gradient, projection.value],
+								vec![input_gradient],
+								PrimitiveKind::Contraction(Contraction {
+									batch_axes: Vec::new(),
+									contract_axes: vec![(1, 1)],
+								}),
+								forbidden_aliases(2, 1),
+								self.training_domain,
+							)?;
+							let skip_gradient = Some(input_gradient);
+							(Some(weight_gradient), skip_gradient)
+						}
+						None => (None, Some(merge_gradient)),
+					};
+					let branch_gradient = branch_gradient.ok_or_else(|| {
 						TrainingCompileError::new(
 							TrainingCompileErrorKind::InvalidNetwork,
-							"dense backward input is not rank two",
+							"residual branch did not produce its input gradient",
 						)
 					})?;
-				let input_gradient = self.tensor(DType::F32, shape(&[batch, input_width])?)?;
-				self.materialize(
-					"gpu_linear_backward_full_into",
-					&[
-						("output_gradient", parameter_gradient),
-						("input", layer.input),
-						("weight", layer.weight.value),
-					],
-					&[
-						("input_gradient", input_gradient),
-						("weight_gradient", weight_gradient),
-						("bias_gradient", bias_gradient),
-					],
-					"output_gradient",
-					&prepared,
-					self.training_domain,
-				)?;
-				gradient = input_gradient;
+					let skip_gradient = skip_gradient.ok_or_else(|| {
+						TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidNetwork,
+							"residual skip did not produce its input gradient",
+						)
+					})?;
+					gradient = self.exact_add(branch_gradient, skip_gradient, self.training_domain)?;
+					gradients[block_index] = Some(BlockGradients::Residual {
+						branch: branch_gradients,
+						projection: projection_gradient,
+					});
+				}
 			}
-			gradients[layer_index] = Some(GradientPair {
-				weight: weight_gradient,
-				bias: bias_gradient,
-			});
 		}
 		gradients
 			.into_iter()
@@ -1410,11 +3334,245 @@ impl GraphCompiler {
 				gradient.ok_or_else(|| {
 					TrainingCompileError::new(
 						TrainingCompileErrorKind::InvalidNetwork,
-						"dense backward failed to produce one gradient pair per layer",
+						"dense backward failed to produce one gradient structure per block",
 					)
 				})
 			})
 			.collect()
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn backward_layer(
+		&mut self,
+		layer: &LayerValues,
+		mut gradient: ValueId,
+		need_input_gradient: bool,
+		batch: u64,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
+		tree_lanes: u32,
+	) -> TrainingCompileResult<(GradientPair, Option<ValueId>)> {
+		for operation in layer.operations.iter().rev() {
+			gradient = self.backward_operation(
+				gradient,
+				*operation,
+				validity,
+				valid_count,
+				epsilon,
+				tree_lanes,
+			)?;
+		}
+		let weight_shape = self.tensor_ref(layer.weight.value)?.shape.clone();
+		let bias_shape = self.tensor_ref(layer.bias.value)?.shape.clone();
+		let weight_gradient = self.tensor(DType::F32, weight_shape)?;
+		let bias_gradient = self.tensor(DType::F32, bias_shape)?;
+		let prepared = [(
+			"tree_lanes".to_owned(),
+			PreparedParameter::U64(u64::from(tree_lanes)),
+		)]
+		.into_iter()
+		.collect::<PreparedParameters>();
+		let input_gradient = if need_input_gradient {
+			let input_width = self
+				.tensor_ref(layer.input)?
+				.shape
+				.extents()
+				.get(1)
+				.copied()
+				.ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidNetwork,
+						"dense backward input is not rank two",
+					)
+				})?;
+			let input_gradient = self.tensor(DType::F32, shape(&[batch, input_width])?)?;
+			self.materialize(
+				"gpu_linear_backward_full_into",
+				&[
+					("output_gradient", gradient),
+					("input", layer.input),
+					("weight", layer.weight.value),
+				],
+				&[
+					("input_gradient", input_gradient),
+					("weight_gradient", weight_gradient),
+					("bias_gradient", bias_gradient),
+				],
+				"output_gradient",
+				&prepared,
+				self.training_domain,
+			)?;
+			Some(input_gradient)
+		} else {
+			self.materialize(
+				"gpu_linear_backward_weights_only_into",
+				&[("output_gradient", gradient), ("input", layer.input)],
+				&[("weight_gradient", weight_gradient), ("bias_gradient", bias_gradient)],
+				"output_gradient",
+				&prepared,
+				self.training_domain,
+			)?;
+			None
+		};
+		Ok((
+			GradientPair {
+				weight: weight_gradient,
+				bias: bias_gradient,
+			},
+			input_gradient,
+		))
+	}
+
+	fn backward_operation(
+		&mut self,
+		gradient: ValueId,
+		operation: OperationValues,
+		validity: ValueId,
+		valid_count: ValueId,
+		epsilon: f32,
+		tree_lanes: u32,
+	) -> TrainingCompileResult<ValueId> {
+		match operation.operation {
+			DenseOperation::Activation(activation) => {
+				self.backward_activation(gradient, operation.input, operation.output, activation)
+			}
+			DenseOperation::Normalization(normalization) => self.backward_normalization(
+				gradient,
+				operation.output,
+				operation.variance.ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidNetwork,
+						"normalization forward state omitted its variance",
+					)
+				})?,
+				normalization,
+				validity,
+				valid_count,
+				epsilon,
+				tree_lanes,
+			),
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn update_blocks(
+		&mut self,
+		blocks: &[BlockValues],
+		parameter_gradients: &[ParameterGradient],
+		clipped: &[ValueId],
+		learning_rate: ValueId,
+		beta_one_power: ValueId,
+		beta_two_power: ValueId,
+		config: &DenseTrainingConfig,
+	) -> TrainingCompileResult<Vec<DenseBlockState>> {
+		if parameter_gradients.len() != clipped.len() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"global clipping changed the parameter-gradient count",
+			));
+		}
+		let mut cursor = 0usize;
+		let mut states = Vec::with_capacity(blocks.len());
+		for block in blocks {
+			match block {
+				BlockValues::Layer(layer) => {
+					states.push(DenseBlockState::Layer(self.update_layer_state(
+						layer,
+						parameter_gradients,
+						clipped,
+						&mut cursor,
+						learning_rate,
+						beta_one_power,
+						beta_two_power,
+						config,
+					)?));
+				}
+				BlockValues::Residual(residual) => {
+					let mut branch = Vec::new();
+					for operation in &residual.branch {
+						if let ResidualBranchValues::Layer(layer) = operation {
+							branch.push(self.update_layer_state(
+								layer,
+								parameter_gradients,
+								clipped,
+								&mut cursor,
+								learning_rate,
+								beta_one_power,
+								beta_two_power,
+								config,
+							)?);
+						}
+					}
+					let projection = residual
+						.projection
+						.map(|projection| -> TrainingCompileResult<_> {
+							let gradient = take_clipped_gradient(
+								parameter_gradients,
+								clipped,
+								&mut cursor,
+								ParameterRole::ResidualProjectionWeight,
+							)?;
+							self.adamw_update(
+								gradient,
+								projection,
+								learning_rate,
+								beta_one_power,
+								beta_two_power,
+								config,
+							)
+						})
+						.transpose()?;
+					states.push(DenseBlockState::Residual(DenseResidualState { branch, projection }));
+				}
+			}
+		}
+		if cursor != parameter_gradients.len() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"optimizer parameter traversal retained unused gradients",
+			));
+		}
+		Ok(states)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn update_layer_state(
+		&mut self,
+		layer: &LayerValues,
+		parameter_gradients: &[ParameterGradient],
+		clipped: &[ValueId],
+		cursor: &mut usize,
+		learning_rate: ValueId,
+		beta_one_power: ValueId,
+		beta_two_power: ValueId,
+		config: &DenseTrainingConfig,
+	) -> TrainingCompileResult<DenseLayerState> {
+		let weight_gradient = take_clipped_gradient(
+			parameter_gradients,
+			clipped,
+			cursor,
+			ParameterRole::LayerWeight,
+		)?;
+		let bias_gradient =
+			take_clipped_gradient(parameter_gradients, clipped, cursor, ParameterRole::LayerBias)?;
+		let weight = self.adamw_update(
+			weight_gradient,
+			layer.weight,
+			learning_rate,
+			beta_one_power,
+			beta_two_power,
+			config,
+		)?;
+		let bias = self.adamw_update(
+			bias_gradient,
+			layer.bias,
+			learning_rate,
+			beta_one_power,
+			beta_two_power,
+			config,
+		)?;
+		Ok(DenseLayerState { weight, bias })
 	}
 
 	fn global_clip(
@@ -1489,24 +3647,63 @@ impl GraphCompiler {
 			Vec::new(),
 			self.training_domain,
 		)?;
-		let step_f32 = self.tensor(DType::F32, scalar_shape.clone())?;
 		let warmup = self.tensor(DType::F32, scalar_shape.clone())?;
-		let cosine_angle = self.tensor(DType::F32, scalar_shape.clone())?;
+		let progress = self.tensor(DType::F32, scalar_shape.clone())?;
+		let remaining_fraction = self.tensor(DType::F32, scalar_shape.clone())?;
 		self.emit_elementwise(
 			vec![step_i32],
-			vec![step_f32, warmup, cosine_angle],
-			schedule_inputs_program(bounds.warmup_iterations, bounds.iterations.get())?,
+			vec![warmup, progress, remaining_fraction],
+			schedule_inputs_program(bounds.warmup_iterations, bounds.training_iterations.get())?,
 			self.training_domain,
 		)?;
-		let cosine = self.tensor(DType::F32, scalar_shape.clone())?;
-		self.emit_owned_scalar(
-			"gpu_cos",
-			vec![cosine_angle],
-			vec![cosine],
-			self.training_domain,
-		)?;
+		let decay = match config.learning_rate_decay {
+			LearningRateDecay::Linear => remaining_fraction,
+			LearningRateDecay::Cosine => {
+				let angle = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_elementwise(
+					vec![remaining_fraction],
+					vec![angle],
+					cosine_angle_program()?,
+					self.training_domain,
+				)?;
+				let sine = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_owned_scalar("gpu_sin", vec![angle], vec![sine], self.training_domain)?;
+				let decay = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_elementwise(
+					vec![sine, remaining_fraction],
+					vec![decay],
+					cosine_decay_program()?,
+					self.training_domain,
+				)?;
+				decay
+			}
+			LearningRateDecay::Exponential => {
+				let argument = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_elementwise(
+					vec![remaining_fraction],
+					vec![argument],
+					exponential_decay_argument_program()?,
+					self.training_domain,
+				)?;
+				let curve = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_owned_scalar(
+					"gpu_expm1",
+					vec![argument],
+					vec![curve],
+					self.training_domain,
+				)?;
+				let decay = self.tensor(DType::F32, scalar_shape.clone())?;
+				self.emit_elementwise(
+					vec![curve, remaining_fraction],
+					vec![decay],
+					exponential_decay_program()?,
+					self.training_domain,
+				)?;
+				decay
+			}
+		};
 		let learning_rate = self.tensor(DType::F32, scalar_shape.clone())?;
-		let mut learning_rate_inputs = vec![cosine, warmup];
+		let mut learning_rate_inputs = vec![decay, warmup];
 		if let Some(stopped) = stopped {
 			learning_rate_inputs.push(stopped);
 		}
@@ -1516,26 +3713,36 @@ impl GraphCompiler {
 			learning_rate_program(config.adamw.learning_rate, stopped.is_some())?,
 			self.training_domain,
 		)?;
-		let beta_one = self.tensor(DType::F32, scalar_shape.clone())?;
-		let beta_two = self.tensor(DType::F32, scalar_shape.clone())?;
+		let beta_seed = self.tensor(DType::I32, scalar_shape.clone())?;
+		self.emit(
+			Vec::new(),
+			vec![beta_seed],
+			PrimitiveKind::IndexMap(IndexMap {
+				start: 0,
+				element_step: 0,
+				iteration_step: 0,
+				modulus: None,
+			}),
+			Vec::new(),
+			IterationDomain::first(),
+		)?;
+		let initial_beta_one_power = self.tensor(DType::F32, scalar_shape.clone())?;
+		let initial_beta_two_power = self.tensor(DType::F32, scalar_shape.clone())?;
 		self.emit_elementwise(
-			vec![step_f32],
-			vec![beta_one, beta_two],
-			adam_beta_program(config.adamw.beta_one, config.adamw.beta_two)?,
-			self.training_domain,
+			vec![beta_seed],
+			vec![initial_beta_one_power, initial_beta_two_power],
+			adam_beta_power_initial_program()?,
+			IterationDomain::first(),
 		)?;
 		let beta_one_power = self.tensor(DType::F32, scalar_shape.clone())?;
-		self.emit_owned_scalar(
-			"gpu_pow",
-			vec![beta_one, step_f32],
-			vec![beta_one_power],
-			self.training_domain,
-		)?;
 		let beta_two_power = self.tensor(DType::F32, scalar_shape)?;
-		self.emit_owned_scalar(
-			"gpu_pow",
-			vec![beta_two, step_f32],
-			vec![beta_two_power],
+		self.emit(
+			vec![initial_beta_one_power, initial_beta_two_power],
+			vec![beta_one_power, beta_two_power],
+			PrimitiveKind::Elementwise(Elementwise {
+				program: adam_beta_power_update_program(config.adamw.beta_one, config.adamw.beta_two)?,
+			}),
+			exact_pair_recurrence_aliases(),
 			self.training_domain,
 		)?;
 		Ok((learning_rate, beta_one_power, beta_two_power))
@@ -1607,13 +3814,35 @@ impl GraphCompiler {
 		tree_lanes: u32,
 		domain: IterationDomain,
 	) -> TrainingCompileResult<KernelTemplateId> {
+		self.reduce_value(
+			input,
+			output,
+			ReduceOperator::Sum,
+			axes,
+			false,
+			tree_lanes,
+			domain,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn reduce_value(
+		&mut self,
+		input: ValueId,
+		output: ValueId,
+		operator: ReduceOperator,
+		axes: &[usize],
+		keep_dimensions: bool,
+		tree_lanes: u32,
+		domain: IterationDomain,
+	) -> TrainingCompileResult<KernelTemplateId> {
 		self.emit(
 			vec![input],
 			vec![output],
 			PrimitiveKind::Reduce(Reduce {
-				operator: ReduceOperator::Sum,
+				operator,
 				axes: AxisSet::new(axes.to_vec())?,
-				keep_dimensions: false,
+				keep_dimensions,
 				result: ReduceResult::Value,
 				tree_lanes,
 			}),
@@ -1781,6 +4010,17 @@ impl GraphCompiler {
 		})
 	}
 
+	fn matrix_width(&self, value: ValueId, role: &str) -> TrainingCompileResult<u64> {
+		let extents = self.tensor_ref(value)?.shape.extents();
+		if extents.len() != 2 {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				format!("{role} must be a rank-two matrix"),
+			));
+		}
+		Ok(extents[1])
+	}
+
 	fn next_value(&mut self) -> TrainingCompileResult<ValueId> {
 		let value = self.next_value;
 		self.next_value = value.checked_add(1).ok_or_else(identity_exhausted)?;
@@ -1793,7 +4033,16 @@ impl GraphCompiler {
 		Ok(KernelTemplateId::new(kernel))
 	}
 
-	fn finish(mut self, bounds: TrainingBounds, outputs: TrainingOutputs) -> TrainingCompileResult<CompiledTraining> {
+	fn finish(
+		mut self,
+		bounds: TrainingBounds,
+		outputs: TrainingOutputs,
+		dataset_schema: CompiledDatasetSchema,
+		config: DenseTrainingConfig,
+		blocks: Vec<DenseBlock>,
+		layers: Vec<crate::DenseLayer>,
+		output_adapter: Option<DenseOutputAdapter>,
+	) -> TrainingCompileResult<CompiledTraining> {
 		for tensor in self.tensors.values_mut() {
 			tensor.external_input = self.external_input_ids.contains(&tensor.id);
 			tensor.external_output = self.external_outputs.contains(&tensor.id);
@@ -1822,6 +4071,11 @@ impl GraphCompiler {
 			external_inputs: self.external_inputs,
 			bounds,
 			outputs,
+			dataset_schema,
+			config,
+			blocks,
+			layers,
+			output_adapter,
 		})
 	}
 }
@@ -1860,6 +4114,7 @@ fn training_metric_bindings(
 	batch_loss: ValueId,
 	batch_loss_domain: IterationDomain,
 	validation: Option<&BinaryValidationOutputs>,
+	multiclass_validation: Option<&MulticlassValidationOutputs>,
 ) -> TrainingCompileResult<Vec<TrainingMetricBinding>> {
 	let mut bindings = vec![TrainingMetricBinding {
 		kind: TrainingMetricKind::BatchLoss,
@@ -1867,51 +4122,67 @@ fn training_metric_bindings(
 		value: batch_loss,
 		domain: batch_loss_domain,
 	}];
-	let Some(validation) = validation else {
-		return Ok(bindings);
-	};
-	for (kind, value) in [
-		(
-			TrainingMetricKind::ValidationMeanBce,
-			validation.metrics.mean_bce,
-		),
-		(TrainingMetricKind::AuRoc, validation.metrics.auroc),
-		(TrainingMetricKind::AuPrc, validation.metrics.auprc),
-		(
-			TrainingMetricKind::BrierScore,
-			validation.metrics.brier_score,
-		),
-		(
-			TrainingMetricKind::ExpectedCalibrationError,
-			validation.metrics.expected_calibration_error,
-		),
-	] {
-		let ordinal = u64::try_from(bindings.len())
-			.ok()
-			.and_then(|index| index.checked_add(1))
-			.ok_or_else(identity_exhausted)?;
-		bindings.push(TrainingMetricBinding {
-			kind,
-			metric: MetricId::new(ordinal),
-			value,
-			domain: validation.metric_domain,
-		});
+	if let Some(validation) = validation {
+		for (kind, value) in [
+			(
+				TrainingMetricKind::ValidationMeanBce,
+				validation.metrics.mean_bce,
+			),
+			(TrainingMetricKind::AuRoc, validation.metrics.auroc),
+			(TrainingMetricKind::AuPrc, validation.metrics.auprc),
+			(
+				TrainingMetricKind::BrierScore,
+				validation.metrics.brier_score,
+			),
+			(
+				TrainingMetricKind::ExpectedCalibrationError,
+				validation.metrics.expected_calibration_error,
+			),
+		] {
+			push_metric_binding(&mut bindings, kind, value, validation.metric_domain)?;
+		}
+		for recall in &validation.metrics.recall_at {
+			push_metric_binding(
+				&mut bindings,
+				TrainingMetricKind::RecallAt {
+					threshold_bits: recall.threshold_bits,
+				},
+				recall.value,
+				validation.metric_domain,
+			)?;
+		}
 	}
-	for recall in &validation.metrics.recall_at {
-		let ordinal = u64::try_from(bindings.len())
-			.ok()
-			.and_then(|index| index.checked_add(1))
-			.ok_or_else(identity_exhausted)?;
-		bindings.push(TrainingMetricBinding {
-			kind: TrainingMetricKind::RecallAt {
-				threshold_bits: recall.threshold_bits,
-			},
-			metric: MetricId::new(ordinal),
-			value: recall.value,
-			domain: validation.metric_domain,
-		});
+	if let Some(validation) = multiclass_validation {
+		for (kind, value) in [
+			(
+				TrainingMetricKind::ValidationMeanCrossEntropy,
+				validation.metrics.mean_cross_entropy,
+			),
+			(TrainingMetricKind::Accuracy, validation.metrics.accuracy),
+		] {
+			push_metric_binding(&mut bindings, kind, value, validation.metric_domain)?;
+		}
 	}
 	Ok(bindings)
+}
+
+fn push_metric_binding(
+	bindings: &mut Vec<TrainingMetricBinding>,
+	kind: TrainingMetricKind,
+	value: ValueId,
+	domain: IterationDomain,
+) -> TrainingCompileResult<()> {
+	let ordinal = u64::try_from(bindings.len())
+		.ok()
+		.and_then(|index| index.checked_add(1))
+		.ok_or_else(identity_exhausted)?;
+	bindings.push(TrainingMetricBinding {
+		kind,
+		metric: MetricId::new(ordinal),
+		value,
+		domain,
+	});
+	Ok(())
 }
 
 fn identity_exhausted() -> TrainingCompileError {
@@ -1957,6 +4228,21 @@ fn exact_early_stopping_aliases() -> Vec<PrimitiveAliasRule> {
 			input,
 			output,
 			permission: if matches!((input, output), (1, 0) | (2, 1) | (3, 2)) {
+				AliasPermission::MustAliasExact
+			} else {
+				AliasPermission::Forbidden
+			},
+		})
+	})
+	.collect()
+}
+
+fn exact_pair_recurrence_aliases() -> Vec<PrimitiveAliasRule> {
+	(0..2).flat_map(|input| {
+		(0..2).map(move |output| PrimitiveAliasRule {
+			input,
+			output,
+			permission: if input == output {
 				AliasPermission::MustAliasExact
 			} else {
 				AliasPermission::Forbidden
@@ -2033,6 +4319,169 @@ fn multiply_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[result])?)
 }
 
+fn negative_multiply_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let left = builder.input(DType::F32)?;
+	let right = builder.input(DType::F32)?;
+	let product = builder.binary(ScalarOpcode::Multiply, left, right)?;
+	let result = builder.unary(ScalarOpcode::Negate, product)?;
+	Ok(builder.finish(&[result])?)
+}
+
+fn pointwise_loss_program(loss: DenseLoss) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let prediction = builder.input(DType::F32)?;
+	let target = builder.input(DType::F32)?;
+	let prediction_is_finite = builder.unary(ScalarOpcode::IsFinite, prediction)?;
+	let target_is_finite = builder.unary(ScalarOpcode::IsFinite, target)?;
+	let _ = builder.unary(ScalarOpcode::Require, prediction_is_finite)?;
+	let _ = builder.unary(ScalarOpcode::Require, target_is_finite)?;
+	let difference = builder.binary(ScalarOpcode::Subtract, prediction, target)?;
+
+	let (loss, gradient) = match loss {
+		DenseLoss::MeanSquaredError => {
+			let loss = builder.binary(ScalarOpcode::Multiply, difference, difference)?;
+			let two = builder.f32(2.0)?;
+			let gradient = builder.binary(ScalarOpcode::Multiply, two, difference)?;
+			(loss, gradient)
+		}
+		DenseLoss::MeanAbsoluteError => {
+			let loss = builder.unary(ScalarOpcode::Absolute, difference)?;
+			let zero = builder.f32(0.0)?;
+			let one = builder.f32(1.0)?;
+			let negative_one = builder.f32(-1.0)?;
+			let positive = builder.binary(ScalarOpcode::GreaterThan, difference, zero)?;
+			let negative = builder.binary(ScalarOpcode::LessThan, difference, zero)?;
+			let positive_or_zero = builder.ternary(ScalarOpcode::Select, positive, one, zero)?;
+			let gradient = builder.ternary(
+				ScalarOpcode::Select,
+				negative,
+				negative_one,
+				positive_or_zero,
+			)?;
+			(loss, gradient)
+		}
+		DenseLoss::CrossEntropy => {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical cross entropy uses its stable logits program",
+			));
+		}
+		DenseLoss::Huber => {
+			let absolute = builder.unary(ScalarOpcode::Absolute, difference)?;
+			let one = builder.f32(1.0)?;
+			let quadratic_domain = builder.binary(ScalarOpcode::LessThan, absolute, one)?;
+			let square = builder.binary(ScalarOpcode::Multiply, difference, difference)?;
+			let half = builder.f32(0.5)?;
+			let quadratic = builder.binary(ScalarOpcode::Multiply, half, square)?;
+			let linear = builder.binary(ScalarOpcode::Subtract, absolute, half)?;
+			let loss = builder.ternary(ScalarOpcode::Select, quadratic_domain, quadratic, linear)?;
+			let negative_one = builder.f32(-1.0)?;
+			let lower_bounded = builder.binary(ScalarOpcode::Maximum, difference, negative_one)?;
+			let gradient = builder.binary(ScalarOpcode::Minimum, lower_bounded, one)?;
+			(loss, gradient)
+		}
+		DenseLoss::BinaryCrossEntropy => {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"BCE-with-logits uses its stable dedicated loss program",
+			));
+		}
+	};
+	Ok(builder.finish(&[loss, gradient])?)
+}
+
+fn cross_entropy_with_logits_program(classes: i32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	if classes <= 0 {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			"categorical class count must be positive",
+		));
+	}
+	let mut builder = ScalarProgramBuilder::new()?;
+	let logit = builder.input(DType::F32)?;
+	let target = builder.input(DType::I32)?;
+	let class_index = builder.input(DType::I32)?;
+	let maximum = builder.input(DType::F32)?;
+	let logarithmic_sum = builder.input(DType::F32)?;
+	let exponential = builder.input(DType::F32)?;
+	let exponential_sum = builder.input(DType::F32)?;
+	for value in [logit, maximum, logarithmic_sum, exponential, exponential_sum] {
+		let finite = builder.unary(ScalarOpcode::IsFinite, value)?;
+		let _ = builder.unary(ScalarOpcode::Require, finite)?;
+	}
+	let zero = builder.i32(0)?;
+	let class_count = builder.i32(classes)?;
+	let target_nonnegative = builder.binary(ScalarOpcode::GreaterThanOrEqual, target, zero)?;
+	let target_below_class_count = builder.binary(ScalarOpcode::LessThan, target, class_count)?;
+	let target_in_range = builder.binary(
+		ScalarOpcode::BitAnd,
+		target_nonnegative,
+		target_below_class_count,
+	)?;
+	let _ = builder.unary(ScalarOpcode::Require, target_in_range)?;
+	let target_indicator = builder.binary(ScalarOpcode::Equal, target, class_index)?;
+	let target_indicator = builder.unary(ScalarOpcode::ConvertI32ToF32, target_indicator)?;
+	let log_partition = builder.binary(ScalarOpcode::Add, maximum, logarithmic_sum)?;
+	let negative_log_probability = builder.binary(ScalarOpcode::Subtract, log_partition, logit)?;
+	let loss = builder.binary(
+		ScalarOpcode::Multiply,
+		target_indicator,
+		negative_log_probability,
+	)?;
+	let probability = builder.binary(ScalarOpcode::Divide, exponential, exponential_sum)?;
+	let gradient = builder.binary(ScalarOpcode::Subtract, probability, target_indicator)?;
+	Ok(builder.finish(&[loss, gradient])?)
+}
+
+fn signed_log_one_plus_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let upstream = builder.input(DType::F32)?;
+	let value = builder.input(DType::F32)?;
+	let absolute = builder.unary(ScalarOpcode::Absolute, value)?;
+	let one = builder.f32(1.0)?;
+	let denominator = builder.binary(ScalarOpcode::Add, one, absolute)?;
+	let result = builder.binary(ScalarOpcode::Divide, upstream, denominator)?;
+	Ok(builder.finish(&[result])?)
+}
+
+fn huber_activation_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let value = builder.input(DType::F32)?;
+	let absolute = builder.unary(ScalarOpcode::Absolute, value)?;
+	let one = builder.f32(1.0)?;
+	let quadratic_domain = builder.binary(ScalarOpcode::LessThanOrEqual, absolute, one)?;
+	let square = builder.binary(ScalarOpcode::Multiply, value, value)?;
+	let half = builder.f32(0.5)?;
+	let quadratic = builder.binary(ScalarOpcode::Multiply, half, square)?;
+	let linear = builder.binary(ScalarOpcode::Subtract, absolute, half)?;
+	let result = builder.ternary(ScalarOpcode::Select, quadratic_domain, quadratic, linear)?;
+	Ok(builder.finish(&[result])?)
+}
+
+fn huber_activation_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let upstream = builder.input(DType::F32)?;
+	let value = builder.input(DType::F32)?;
+	let negative_one = builder.f32(-1.0)?;
+	let one = builder.f32(1.0)?;
+	let lower_bounded = builder.binary(ScalarOpcode::Maximum, value, negative_one)?;
+	let derivative = builder.binary(ScalarOpcode::Minimum, lower_bounded, one)?;
+	let result = builder.binary(ScalarOpcode::Multiply, upstream, derivative)?;
+	Ok(builder.finish(&[result])?)
+}
+
+fn tangent_activation_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let upstream = builder.input(DType::F32)?;
+	let tangent = builder.input(DType::F32)?;
+	let square = builder.binary(ScalarOpcode::Multiply, tangent, tangent)?;
+	let one = builder.f32(1.0)?;
+	let derivative = builder.binary(ScalarOpcode::Add, one, square)?;
+	let result = builder.binary(ScalarOpcode::Multiply, upstream, derivative)?;
+	Ok(builder.finish(&[result])?)
+}
+
 fn divide_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let numerator = builder.input(DType::F32)?;
@@ -2072,17 +4521,95 @@ fn divide_constant_program(divisor: f32) -> TrainingCompileResult<recipe_core::S
 	Ok(builder.finish(&[result])?)
 }
 
-fn z_score_program(epsilon: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+fn z_score_program(epsilon: f32, masked: bool) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
 	let mean = builder.input(DType::F32)?;
 	let variance = builder.input(DType::F32)?;
+	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
 	let epsilon = builder.f32(epsilon)?;
 	let variance = builder.binary(ScalarOpcode::Maximum, variance, epsilon)?;
 	let standard_deviation = builder.unary(ScalarOpcode::SquareRoot, variance)?;
 	let centered = builder.binary(ScalarOpcode::Subtract, value, mean)?;
-	let normalized = builder.binary(ScalarOpcode::Divide, centered, standard_deviation)?;
+	let mut normalized = builder.binary(ScalarOpcode::Divide, centered, standard_deviation)?;
+	if let Some(mask) = mask {
+		let zero = builder.f32(0.0)?;
+		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
+		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
+	}
 	Ok(builder.finish(&[normalized])?)
+}
+
+fn min_max_program(epsilon: f32, masked: bool) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let value = builder.input(DType::F32)?;
+	let minimum = builder.input(DType::F32)?;
+	let maximum = builder.input(DType::F32)?;
+	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
+	let range = builder.binary(ScalarOpcode::Subtract, maximum, minimum)?;
+	let epsilon = builder.f32(epsilon)?;
+	let denominator = builder.binary(ScalarOpcode::Maximum, range, epsilon)?;
+	let centered = builder.binary(ScalarOpcode::Subtract, value, minimum)?;
+	let mut normalized = builder.binary(ScalarOpcode::Divide, centered, denominator)?;
+	if let Some(mask) = mask {
+		let zero = builder.f32(0.0)?;
+		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
+		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
+	}
+	Ok(builder.finish(&[normalized])?)
+}
+
+fn l2_square_program(masked: bool) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let value = builder.input(DType::F32)?;
+	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
+	let mut square = builder.binary(ScalarOpcode::Multiply, value, value)?;
+	if let Some(mask) = mask {
+		square = builder.binary(ScalarOpcode::Multiply, square, mask)?;
+	}
+	Ok(builder.finish(&[square])?)
+}
+
+fn l2_norm_program(epsilon: f32, masked: bool) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let value = builder.input(DType::F32)?;
+	let norm_squared = builder.input(DType::F32)?;
+	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
+	let epsilon = builder.f32(epsilon)?;
+	let norm_squared = builder.binary(ScalarOpcode::Maximum, norm_squared, epsilon)?;
+	let norm = builder.unary(ScalarOpcode::SquareRoot, norm_squared)?;
+	let mut normalized = builder.binary(ScalarOpcode::Divide, value, norm)?;
+	if let Some(mask) = mask {
+		let zero = builder.f32(0.0)?;
+		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
+		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
+	}
+	Ok(builder.finish(&[normalized])?)
+}
+
+fn inverse_standard_deviation_program(epsilon: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let variance = builder.input(DType::F32)?;
+	let epsilon = builder.f32(epsilon)?;
+	let variance = builder.binary(ScalarOpcode::Maximum, variance, epsilon)?;
+	let standard_deviation = builder.unary(ScalarOpcode::SquareRoot, variance)?;
+	let one = builder.f32(1.0)?;
+	let inverse = builder.binary(ScalarOpcode::Divide, one, standard_deviation)?;
+	Ok(builder.finish(&[inverse])?)
+}
+
+fn normalization_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let gradient = builder.input(DType::F32)?;
+	let gradient_mean = builder.input(DType::F32)?;
+	let normalized = builder.input(DType::F32)?;
+	let gradient_normalized_mean = builder.input(DType::F32)?;
+	let inverse_standard_deviation = builder.input(DType::F32)?;
+	let centered_gradient = builder.binary(ScalarOpcode::Subtract, gradient, gradient_mean)?;
+	let projection = builder.binary(ScalarOpcode::Multiply, normalized, gradient_normalized_mean)?;
+	let adjusted = builder.binary(ScalarOpcode::Subtract, centered_gradient, projection)?;
+	let result = builder.binary(ScalarOpcode::Multiply, adjusted, inverse_standard_deviation)?;
+	Ok(builder.finish(&[result])?)
 }
 
 fn masked_mean_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
@@ -2130,28 +4657,151 @@ fn schedule_inputs_program(
 	warmup_iterations: u64,
 	total_iterations: u64,
 ) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	if total_iterations == 0 || total_iterations > i32::MAX as u64 || warmup_iterations > total_iterations {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidOptimizer,
+			"training schedule requires 1..=i32::MAX updates and warmup no longer than training",
+		));
+	}
+	let warmup_iterations_i32 = warmup_iterations as i32;
 	let mut builder = ScalarProgramBuilder::new()?;
 	let step = builder.input(DType::I32)?;
-	let step = builder.unary(ScalarOpcode::ConvertI32ToF32, step)?;
 	let one = builder.f32(1.0)?;
-	let zero = builder.f32(0.0)?;
+	let zero_i32 = builder.i32(0)?;
 	let warmup = if warmup_iterations == 0 {
 		one
 	} else {
-		let denominator = builder.f32(warmup_iterations as f32)?;
-		let fraction = builder.binary(ScalarOpcode::Divide, step, denominator)?;
-		builder.binary(ScalarOpcode::Minimum, one, fraction)?
+		let warmup_end = builder.i32(warmup_iterations_i32)?;
+		let warmup_step = builder.binary(ScalarOpcode::Minimum, step, warmup_end)?;
+		exact_nonnegative_i32_ratio(&mut builder, warmup_step, warmup_iterations_i32)?
 	};
-	let warmup_start = builder.f32(warmup_iterations as f32)?;
-	let elapsed = builder.binary(ScalarOpcode::Subtract, step, warmup_start)?;
-	let elapsed = builder.binary(ScalarOpcode::Maximum, elapsed, zero)?;
-	let decay_iterations = total_iterations.saturating_sub(warmup_iterations).max(1);
-	let decay_denominator = builder.f32(decay_iterations as f32)?;
-	let progress = builder.binary(ScalarOpcode::Divide, elapsed, decay_denominator)?;
-	let progress = builder.binary(ScalarOpcode::Minimum, one, progress)?;
-	let pi = builder.f32(core::f32::consts::PI)?;
-	let angle = builder.binary(ScalarOpcode::Multiply, progress, pi)?;
-	Ok(builder.finish(&[step, warmup, angle])?)
+	let decay_start = warmup_iterations.max(1);
+	let (progress, remaining_fraction) = if total_iterations <= decay_start {
+		(builder.f32(0.0)?, one)
+	} else {
+		let decay_start = builder.i32(decay_start as i32)?;
+		let elapsed = builder.binary(ScalarOpcode::Subtract, step, decay_start)?;
+		let elapsed = builder.binary(ScalarOpcode::Maximum, elapsed, zero_i32)?;
+		let decay_iterations = total_iterations.saturating_sub(warmup_iterations.max(1));
+		let decay_end = builder.i32(decay_iterations as i32)?;
+		let elapsed = builder.binary(ScalarOpcode::Minimum, elapsed, decay_end)?;
+		let remaining = builder.binary(ScalarOpcode::Subtract, decay_end, elapsed)?;
+		(
+			exact_nonnegative_i32_ratio(&mut builder, elapsed, decay_iterations as i32)?,
+			exact_nonnegative_i32_ratio(&mut builder, remaining, decay_iterations as i32)?,
+		)
+	};
+	Ok(builder.finish(&[warmup, progress, remaining_fraction])?)
+}
+
+fn exact_nonnegative_i32_ratio(
+	builder: &mut ScalarProgramBuilder,
+	numerator: ScalarExpression,
+	denominator: i32,
+) -> TrainingCompileResult<ScalarExpression> {
+	const LIMB_BITS: i32 = 12;
+	const LIMB_MASK: i32 = (1 << LIMB_BITS) - 1;
+	const LIMB_SCALE: f32 = (1 << LIMB_BITS) as f32;
+	if denominator <= 0 {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidOptimizer,
+			"schedule ratio denominator must be positive",
+		));
+	}
+
+	if denominator <= LIMB_MASK {
+		let terminal = builder.i32(denominator)?;
+		let terminal = builder.binary(ScalarOpcode::Equal, numerator, terminal)?;
+		let numerator = builder.unary(ScalarOpcode::ConvertI32ToF32, numerator)?;
+		let denominator = builder.f32(denominator as f32)?;
+		let ratio = builder.binary(ScalarOpcode::Divide, numerator, denominator)?;
+		let one = builder.f32(1.0)?;
+		return Ok(builder.ternary(ScalarOpcode::Select, terminal, one, ratio)?);
+	}
+
+	let terminal = builder.i32(denominator)?;
+	let terminal = builder.binary(ScalarOpcode::Equal, numerator, terminal)?;
+	let shift = builder.i32(LIMB_BITS)?;
+	let mask = builder.i32(LIMB_MASK)?;
+	let numerator_high = builder.binary(ScalarOpcode::ShiftRightLogical, numerator, shift)?;
+	let numerator_low = builder.binary(ScalarOpcode::BitAnd, numerator, mask)?;
+	let numerator_high = builder.unary(ScalarOpcode::ConvertI32ToF32, numerator_high)?;
+	let numerator_low = builder.unary(ScalarOpcode::ConvertI32ToF32, numerator_low)?;
+	let limb_scale = builder.f32(LIMB_SCALE)?;
+	let numerator_low = builder.binary(ScalarOpcode::Divide, numerator_low, limb_scale)?;
+
+	let denominator_high = builder.f32((denominator >> LIMB_BITS) as f32)?;
+	let denominator_low = builder.f32((denominator & LIMB_MASK) as f32 / LIMB_SCALE)?;
+	let quotient = builder.binary(ScalarOpcode::Divide, numerator_high, denominator_high)?;
+	let negative_quotient = builder.unary(ScalarOpcode::Negate, quotient)?;
+	let residual = builder.ternary(
+		ScalarOpcode::Fma,
+		negative_quotient,
+		denominator_high,
+		numerator_high,
+	)?;
+	let residual = builder.binary(ScalarOpcode::Add, residual, numerator_low)?;
+	let residual = builder.ternary(
+		ScalarOpcode::Fma,
+		negative_quotient,
+		denominator_low,
+		residual,
+	)?;
+	let denominator = builder.binary(ScalarOpcode::Add, denominator_high, denominator_low)?;
+	let correction = builder.binary(ScalarOpcode::Divide, residual, denominator)?;
+	let ratio = builder.binary(ScalarOpcode::Add, quotient, correction)?;
+	let zero = builder.f32(0.0)?;
+	let ratio = builder.binary(ScalarOpcode::Maximum, zero, ratio)?;
+	let one = builder.f32(1.0)?;
+	let ratio = builder.binary(ScalarOpcode::Minimum, one, ratio)?;
+	Ok(builder.ternary(ScalarOpcode::Select, terminal, one, ratio)?)
+}
+
+fn cosine_angle_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let remaining_fraction = builder.input(DType::F32)?;
+	let half_pi = builder.f32(core::f32::consts::FRAC_PI_2)?;
+	let angle = builder.binary(ScalarOpcode::Multiply, remaining_fraction, half_pi)?;
+	Ok(builder.finish(&[angle])?)
+}
+
+fn cosine_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let sine = builder.input(DType::F32)?;
+	let remaining_fraction = builder.input(DType::F32)?;
+	let decay = builder.binary(ScalarOpcode::Multiply, sine, sine)?;
+	let zero = builder.f32(0.0)?;
+	let one = builder.f32(1.0)?;
+	let at_start = builder.binary(ScalarOpcode::Equal, remaining_fraction, one)?;
+	let at_end = builder.binary(ScalarOpcode::Equal, remaining_fraction, zero)?;
+	let decay = builder.ternary(ScalarOpcode::Select, at_start, one, decay)?;
+	let decay = builder.ternary(ScalarOpcode::Select, at_end, zero, decay)?;
+	Ok(builder.finish(&[decay])?)
+}
+
+fn exponential_decay_argument_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let remaining_fraction = builder.input(DType::F32)?;
+	let rate = builder.f32(5.0)?;
+	let argument = builder.binary(ScalarOpcode::Multiply, rate, remaining_fraction)?;
+	Ok(builder.finish(&[argument])?)
+}
+
+fn exponential_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let curve = builder.input(DType::F32)?;
+	let remaining_fraction = builder.input(DType::F32)?;
+	let end = builder.f32((-5.0_f32).exp())?;
+	let one = builder.f32(1.0)?;
+	let denominator = builder.binary(ScalarOpcode::Subtract, one, end)?;
+	let scale = builder.binary(ScalarOpcode::Divide, end, denominator)?;
+	let decay = builder.binary(ScalarOpcode::Multiply, scale, curve)?;
+	let zero = builder.f32(0.0)?;
+	let at_start = builder.binary(ScalarOpcode::Equal, remaining_fraction, one)?;
+	let at_end = builder.binary(ScalarOpcode::Equal, remaining_fraction, zero)?;
+	let decay = builder.ternary(ScalarOpcode::Select, at_start, one, decay)?;
+	let decay = builder.ternary(ScalarOpcode::Select, at_end, zero, decay)?;
+	Ok(builder.finish(&[decay])?)
 }
 
 fn learning_rate_program(
@@ -2159,16 +4809,12 @@ fn learning_rate_program(
 	gated_by_early_stopping: bool,
 ) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
-	let cosine = builder.input(DType::F32)?;
+	let decay = builder.input(DType::F32)?;
 	let warmup = builder.input(DType::F32)?;
 	let stopped = gated_by_early_stopping
 		.then(|| builder.input(DType::I32))
 		.transpose()?;
-	let one = builder.f32(1.0)?;
-	let shifted = builder.binary(ScalarOpcode::Add, one, cosine)?;
-	let half = builder.f32(0.5)?;
-	let cosine_factor = builder.binary(ScalarOpcode::Multiply, half, shifted)?;
-	let factor = builder.binary(ScalarOpcode::Multiply, warmup, cosine_factor)?;
+	let factor = builder.binary(ScalarOpcode::Multiply, warmup, decay)?;
 	let base = builder.f32(base_learning_rate)?;
 	let mut learning_rate = builder.binary(ScalarOpcode::Multiply, base, factor)?;
 	if let Some(stopped) = stopped {
@@ -2180,12 +4826,23 @@ fn learning_rate_program(
 	Ok(builder.finish(&[learning_rate])?)
 }
 
-fn adam_beta_program(beta_one: f32, beta_two: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+fn adam_beta_power_initial_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
-	let _step = builder.input(DType::F32)?;
+	let _seed = builder.input(DType::I32)?;
+	let beta_one_power = builder.f32(1.0)?;
+	let beta_two_power = builder.f32(1.0)?;
+	Ok(builder.finish(&[beta_one_power, beta_two_power])?)
+}
+
+fn adam_beta_power_update_program(beta_one: f32, beta_two: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
+	let mut builder = ScalarProgramBuilder::new()?;
+	let beta_one_power = builder.input(DType::F32)?;
+	let beta_two_power = builder.input(DType::F32)?;
 	let beta_one = builder.f32(beta_one)?;
 	let beta_two = builder.f32(beta_two)?;
-	Ok(builder.finish(&[beta_one, beta_two])?)
+	let beta_one_power = builder.binary(ScalarOpcode::Multiply, beta_one_power, beta_one)?;
+	let beta_two_power = builder.binary(ScalarOpcode::Multiply, beta_two_power, beta_two)?;
+	Ok(builder.finish(&[beta_one_power, beta_two_power])?)
 }
 
 fn adamw_program(
@@ -2262,4 +4919,488 @@ fn temperature_update_program(config: TemperatureScalingConfig) -> TrainingCompi
 	let maximum = builder.f32(config.maximum_temperature)?;
 	let bounded = builder.binary(ScalarOpcode::Minimum, bounded, maximum)?;
 	Ok(builder.finish(&[bounded])?)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use recipe_core::{ScalarLiteral, ScalarProgram, ScalarValueId};
+
+	#[derive(Clone, Copy, Debug)]
+	enum TestValue {
+		F32(f32),
+		I32(i32),
+	}
+
+	impl TestValue {
+		fn f32(self) -> f32 {
+			match self {
+				Self::F32(value) => value,
+				Self::I32(_) => panic!("expected f32"),
+			}
+		}
+
+		fn i32(self) -> i32 {
+			match self {
+				Self::I32(value) => value,
+				Self::F32(_) => panic!("expected i32"),
+			}
+		}
+	}
+
+	fn evaluate(program: &ScalarProgram, inputs: &[f32]) -> Vec<f32> {
+		let inputs = inputs
+			.iter()
+			.copied()
+			.map(TestValue::F32)
+			.collect::<Vec<_>>();
+		evaluate_values(program, &inputs)
+			.into_iter()
+			.map(TestValue::f32)
+			.collect()
+	}
+
+	fn evaluate_i32(program: &ScalarProgram, inputs: &[i32]) -> Vec<f32> {
+		let inputs = inputs
+			.iter()
+			.copied()
+			.map(TestValue::I32)
+			.collect::<Vec<_>>();
+		evaluate_values(program, &inputs)
+			.into_iter()
+			.map(TestValue::f32)
+			.collect()
+	}
+
+	fn evaluate_values(program: &ScalarProgram, inputs: &[TestValue]) -> Vec<TestValue> {
+		assert_eq!(program.inputs.len(), inputs.len());
+		let mut values = BTreeMap::<ScalarValueId, TestValue>::new();
+		for (input, value) in program.inputs.iter().zip(inputs) {
+			assert_eq!(
+				input.dtype,
+				match value {
+					TestValue::F32(_) => DType::F32,
+					TestValue::I32(_) => DType::I32,
+				}
+			);
+			values.insert(input.id, *value);
+		}
+		for constant in &program.constants {
+			let value = match constant.value {
+				ScalarLiteral::F32Bits(bits) => TestValue::F32(f32::from_bits(bits)),
+				ScalarLiteral::I32(value) => TestValue::I32(value),
+			};
+			values.insert(constant.id, value);
+		}
+		for instruction in &program.instructions {
+			let operands = instruction
+				.operands
+				.iter()
+				.map(|operand| values[operand])
+				.collect::<Vec<_>>();
+			let value = match instruction.opcode {
+				ScalarOpcode::Add => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left + right),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32(left + right),
+					_ => panic!("mixed Add operands"),
+				},
+				ScalarOpcode::Subtract => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left - right),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32(left - right),
+					_ => panic!("mixed Subtract operands"),
+				},
+				ScalarOpcode::Multiply => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left * right),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32(left * right),
+					_ => panic!("mixed Multiply operands"),
+				},
+				ScalarOpcode::Divide => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left / right),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32(left / right),
+					_ => panic!("mixed Divide operands"),
+				},
+				ScalarOpcode::Remainder => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left % right),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32(left % right),
+					_ => panic!("mixed Remainder operands"),
+				},
+				ScalarOpcode::Negate => match operands[0] {
+					TestValue::F32(value) => TestValue::F32(-value),
+					TestValue::I32(value) => TestValue::I32(-value),
+				},
+				ScalarOpcode::Absolute => match operands[0] {
+					TestValue::F32(value) => TestValue::F32(value.abs()),
+					TestValue::I32(value) => TestValue::I32(value.abs()),
+				},
+				ScalarOpcode::Fma => TestValue::F32(
+					operands[0]
+						.f32()
+						.mul_add(operands[1].f32(), operands[2].f32()),
+				),
+				ScalarOpcode::SquareRoot => TestValue::F32(operands[0].f32().sqrt()),
+				ScalarOpcode::Minimum => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left.min(*right)),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32((*left).min(*right)),
+					_ => panic!("mixed Minimum operands"),
+				},
+				ScalarOpcode::Maximum => match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => TestValue::F32(left.max(*right)),
+					[TestValue::I32(left), TestValue::I32(right)] => TestValue::I32((*left).max(*right)),
+					_ => panic!("mixed Maximum operands"),
+				},
+				ScalarOpcode::Equal => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left == right,
+					[TestValue::I32(left), TestValue::I32(right)] => left == right,
+					_ => panic!("mixed Equal operands"),
+				})),
+				ScalarOpcode::NotEqual => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left != right,
+					[TestValue::I32(left), TestValue::I32(right)] => left != right,
+					_ => panic!("mixed NotEqual operands"),
+				})),
+				ScalarOpcode::LessThan => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left < right,
+					[TestValue::I32(left), TestValue::I32(right)] => left < right,
+					_ => panic!("mixed LessThan operands"),
+				})),
+				ScalarOpcode::LessThanOrEqual => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left <= right,
+					[TestValue::I32(left), TestValue::I32(right)] => left <= right,
+					_ => panic!("mixed LessThanOrEqual operands"),
+				})),
+				ScalarOpcode::GreaterThan => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left > right,
+					[TestValue::I32(left), TestValue::I32(right)] => left > right,
+					_ => panic!("mixed GreaterThan operands"),
+				})),
+				ScalarOpcode::GreaterThanOrEqual => TestValue::I32(i32::from(match operands.as_slice() {
+					[TestValue::F32(left), TestValue::F32(right)] => left >= right,
+					[TestValue::I32(left), TestValue::I32(right)] => left >= right,
+					_ => panic!("mixed GreaterThanOrEqual operands"),
+				})),
+				ScalarOpcode::Select => {
+					if operands[0].i32() != 0 {
+						operands[1]
+					} else {
+						operands[2]
+					}
+				}
+				ScalarOpcode::BitAnd => TestValue::I32(operands[0].i32() & operands[1].i32()),
+				ScalarOpcode::BitOr => TestValue::I32(operands[0].i32() | operands[1].i32()),
+				ScalarOpcode::BitXor => TestValue::I32(operands[0].i32() ^ operands[1].i32()),
+				ScalarOpcode::BitNot => TestValue::I32(!operands[0].i32()),
+				ScalarOpcode::ShiftLeft => {
+					TestValue::I32(operands[0].i32().wrapping_shl(operands[1].i32() as u32))
+				}
+				ScalarOpcode::ShiftRightLogical => {
+					TestValue::I32(((operands[0].i32() as u32).wrapping_shr(operands[1].i32() as u32)) as i32)
+				}
+				ScalarOpcode::ShiftRightArithmetic => {
+					TestValue::I32(operands[0].i32().wrapping_shr(operands[1].i32() as u32))
+				}
+				ScalarOpcode::ConvertI32ToF32 => TestValue::F32(operands[0].i32() as f32),
+				ScalarOpcode::IsFinite => TestValue::I32(i32::from(operands[0].f32().is_finite())),
+				ScalarOpcode::Require => {
+					assert_ne!(operands[0].i32(), 0);
+					operands[0]
+				}
+				other => panic!("unsupported test opcode {other:?}"),
+			};
+			values.insert(instruction.result, value);
+		}
+		program
+			.outputs
+			.iter()
+			.map(|output| values[output])
+			.collect()
+	}
+
+	fn assert_close(actual: &[f32], expected: [f32; 2]) {
+		for (actual, expected) in actual.iter().zip(expected) {
+			assert!(
+				(actual - expected).abs() <= 0.000_001,
+				"{actual} != {expected}"
+			);
+		}
+	}
+
+	fn assert_table_close(actual: &[f32], expected: &[f32]) {
+		assert_eq!(actual.len(), expected.len());
+		for (actual, expected) in actual.iter().zip(expected) {
+			assert!(
+				(actual - expected).abs() <= 0.000002,
+				"{actual} != {expected}"
+			);
+		}
+	}
+
+	fn learning_rate_from_coordinates(coordinates: &[f32], schedule: LearningRateDecay) -> f32 {
+		let warmup = coordinates[0];
+		let remaining_fraction = coordinates[2];
+		let decay = match schedule {
+			LearningRateDecay::Linear => remaining_fraction,
+			LearningRateDecay::Cosine => {
+				let angle = evaluate(&cosine_angle_program().unwrap(), &[remaining_fraction])[0];
+				evaluate(
+					&cosine_decay_program().unwrap(),
+					&[angle.sin(), remaining_fraction],
+				)[0]
+			}
+			LearningRateDecay::Exponential => {
+				let argument = evaluate(
+					&exponential_decay_argument_program().unwrap(),
+					&[remaining_fraction],
+				)[0];
+				evaluate(
+					&exponential_decay_program().unwrap(),
+					&[argument.exp_m1(), remaining_fraction],
+				)[0]
+			}
+		};
+		evaluate(
+			&learning_rate_program(1.0, false).unwrap(),
+			&[decay, warmup],
+		)[0]
+	}
+
+	fn schedule_learning_rates(total: u64, warmup: u64, decay: LearningRateDecay) -> Vec<f32> {
+		let schedule = schedule_inputs_program(warmup, total).unwrap();
+		(1..=total)
+			.map(|step| {
+				let coordinates = evaluate_i32(&schedule, &[step as i32]);
+				learning_rate_from_coordinates(&coordinates, decay)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn learning_rate_tables_cover_the_full_training_interval() {
+		assert_table_close(
+			&schedule_learning_rates(5, 0, LearningRateDecay::Linear),
+			&[1.0, 0.75, 0.5, 0.25, 0.0],
+		);
+		assert_table_close(
+			&schedule_learning_rates(5, 0, LearningRateDecay::Cosine),
+			&[1.0, 0.8535534, 0.5, 0.1464466, 0.0],
+		);
+		assert_table_close(
+			&schedule_learning_rates(5, 0, LearningRateDecay::Exponential),
+			&[1.0, 0.2816647, 0.07585818, 0.01689363, 0.0],
+		);
+	}
+
+	#[test]
+	fn warmup_reaches_the_base_rate_before_decay() {
+		assert_table_close(
+			&schedule_learning_rates(6, 2, LearningRateDecay::Linear),
+			&[0.5, 1.0, 0.75, 0.5, 0.25, 0.0],
+		);
+		assert_table_close(
+			&schedule_learning_rates(6, 2, LearningRateDecay::Cosine),
+			&[0.5, 1.0, 0.8535534, 0.5, 0.1464466, 0.0],
+		);
+		assert_table_close(
+			&schedule_learning_rates(6, 2, LearningRateDecay::Exponential),
+			&[0.5, 1.0, 0.2816647, 0.07585818, 0.01689363, 0.0],
+		);
+	}
+
+	#[test]
+	fn one_update_uses_the_full_base_learning_rate() {
+		for warmup in [0, 1] {
+			for decay in [
+				LearningRateDecay::Linear,
+				LearningRateDecay::Cosine,
+				LearningRateDecay::Exponential,
+			] {
+				assert_eq!(schedule_learning_rates(1, warmup, decay), [1.0]);
+			}
+		}
+		let coordinates = evaluate_i32(&schedule_inputs_program(0, 1).unwrap(), &[1]);
+		let learning_rate = evaluate(
+			&learning_rate_program(0.1, false).unwrap(),
+			&[coordinates[2], coordinates[0]],
+		)[0];
+		let update = evaluate(
+			&adamw_program(0.9, 0.999, 0.00000001, 0.0).unwrap(),
+			&[1.0, 1.0, 0.0, 0.0, learning_rate, 0.9, 0.999],
+		);
+		assert!(update[2].is_finite());
+		assert!(update[2] < 1.0);
+	}
+
+	#[test]
+	fn schedule_keeps_exact_integer_limbs_past_the_f32_integer_boundary() {
+		let schedule = schedule_inputs_program(0, 16777218).unwrap();
+		assert!(
+			schedule
+				.instructions
+				.iter()
+				.any(|instruction| instruction.opcode == ScalarOpcode::ShiftRightLogical)
+		);
+		assert!(
+			schedule
+				.instructions
+				.iter()
+				.any(|instruction| instruction.opcode == ScalarOpcode::BitAnd)
+		);
+		let before_boundary = evaluate_i32(&schedule, &[16777216])[1];
+		let after_boundary = evaluate_i32(&schedule, &[16777217])[1];
+		assert!(before_boundary < after_boundary);
+		assert_eq!(after_boundary, (16777216.0_f64 / 16777217.0_f64) as f32);
+		assert_eq!(evaluate_i32(&schedule, &[16777218])[1], 1.0);
+	}
+
+	#[test]
+	fn every_decay_keeps_a_nonzero_penultimate_rate_at_the_i32_limit() {
+		let schedule = schedule_inputs_program(0, i32::MAX as u64).unwrap();
+		let penultimate = evaluate_i32(&schedule, &[i32::MAX - 1]);
+		let final_update = evaluate_i32(&schedule, &[i32::MAX]);
+		for decay in [
+			LearningRateDecay::Linear,
+			LearningRateDecay::Cosine,
+			LearningRateDecay::Exponential,
+		] {
+			assert!(learning_rate_from_coordinates(&penultimate, decay) > 0.0);
+			assert_eq!(learning_rate_from_coordinates(&final_update, decay), 0.0);
+		}
+	}
+
+	#[test]
+	fn large_warmup_does_not_round_the_penultimate_step_to_completion() {
+		let schedule = schedule_inputs_program(16777217, 16777218).unwrap();
+		let penultimate = evaluate_i32(&schedule, &[16777216]);
+		let warmup_end = evaluate_i32(&schedule, &[16777217]);
+		assert_eq!(penultimate[0], 0.99999994);
+		assert_eq!(warmup_end[0], 1.0);
+	}
+
+	#[test]
+	fn zero_adam_betas_use_the_finite_recurrent_update() {
+		for (beta_one, beta_two, expected) in [
+			(0.0, 0.999, [0.0, 0.999]),
+			(0.9, 0.0, [0.9, 0.0]),
+			(0.0, 0.0, [0.0, 0.0]),
+		] {
+			let program = adam_beta_power_update_program(beta_one, beta_two).unwrap();
+			assert_eq!(evaluate(&program, &[1.0, 1.0]), expected);
+			assert!(
+				program
+					.instructions
+					.iter()
+					.all(|instruction| instruction.opcode != ScalarOpcode::Require)
+			);
+		}
+		let update = evaluate(
+			&adamw_program(0.0, 0.0, 0.00000001, 0.0).unwrap(),
+			&[2.0, 1.0, 0.0, 0.0, 0.1, 0.0, 0.0],
+		);
+		assert!(update.iter().all(|value| value.is_finite()));
+		assert_eq!(update[0], 2.0);
+		assert_eq!(update[1], 4.0);
+	}
+
+	#[test]
+	fn pointwise_losses_and_gradients_match_the_declared_formulas() {
+		assert_close(
+			&evaluate(
+				&pointwise_loss_program(DenseLoss::MeanSquaredError).unwrap(),
+				&[3.0, 1.0],
+			),
+			[4.0, 4.0],
+		);
+		assert_close(
+			&evaluate(
+				&pointwise_loss_program(DenseLoss::MeanAbsoluteError).unwrap(),
+				&[-2.0, 1.0],
+			),
+			[3.0, -1.0],
+		);
+		assert_close(
+			&evaluate(
+				&pointwise_loss_program(DenseLoss::Huber).unwrap(),
+				&[0.5, 0.0],
+			),
+			[0.125, 0.5],
+		);
+		assert_close(
+			&evaluate(
+				&pointwise_loss_program(DenseLoss::Huber).unwrap(),
+				&[-2.0, 0.0],
+			),
+			[1.5, -1.0],
+		);
+	}
+
+	#[test]
+	fn categorical_cross_entropy_program_consumes_logits_and_returns_softmax_gradient() {
+		let logits = [2.0f32, 1.0, -1.0];
+		let target_code = 2i32;
+		let maximum = 2.0f32;
+		let exponentials = logits.map(|logit| (logit - maximum).exp());
+		let exponential_sum = exponentials.iter().sum::<f32>();
+		let logarithmic_sum = exponential_sum.ln();
+		for (index, (logit, exponential)) in logits
+			.into_iter()
+			.zip(exponentials)
+			.enumerate()
+		{
+			let target_indicator = f32::from(index == usize::try_from(target_code).unwrap());
+			let actual = evaluate_values(
+				&cross_entropy_with_logits_program(3).unwrap(),
+				&[
+					TestValue::F32(logit),
+					TestValue::I32(target_code),
+					TestValue::I32(i32::try_from(index).unwrap()),
+					TestValue::F32(maximum),
+					TestValue::F32(logarithmic_sum),
+					TestValue::F32(exponential),
+					TestValue::F32(exponential_sum),
+				],
+			)
+			.into_iter()
+			.map(TestValue::f32)
+			.collect::<Vec<_>>();
+			let expected_loss = target_indicator * (maximum + logarithmic_sum - logit);
+			let expected_gradient = exponential / exponential_sum - target_indicator;
+			assert_close(&actual, [expected_loss, expected_gradient]);
+			if index == usize::try_from(target_code).unwrap() {
+				assert!(actual[0] > 0.0);
+			}
+		}
+	}
+
+	#[test]
+	fn data_normalization_programs_leave_categorical_spans_unchanged() {
+		assert_eq!(
+			evaluate(
+				&z_score_program(0.000001, true).unwrap(),
+				&[1.0, 0.5, 0.25, 0.0]
+			),
+			[1.0]
+		);
+		assert_eq!(
+			evaluate(
+				&min_max_program(0.000001, true).unwrap(),
+				&[1.0, 0.25, 0.75, 0.0]
+			),
+			[1.0]
+		);
+		assert_eq!(
+			evaluate(&l2_square_program(true).unwrap(), &[1.0, 0.0]),
+			[0.0]
+		);
+		assert_eq!(
+			evaluate(&l2_norm_program(0.000001, true).unwrap(), &[1.0, 9.0, 0.0]),
+			[1.0]
+		);
+		assert_eq!(
+			evaluate(&l2_square_program(true).unwrap(), &[3.0, 1.0]),
+			[9.0]
+		);
+		assert_eq!(
+			evaluate(&l2_norm_program(0.000001, true).unwrap(), &[6.0, 9.0, 1.0]),
+			[2.0]
+		);
+	}
 }

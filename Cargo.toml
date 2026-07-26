@@ -24,6 +24,10 @@ test = false
 name = "facade-boundary"
 path = "tests/facade_boundary.rs"
 
+[[test]]
+name = "public-api-compile"
+path = "tests/public_api_compile.rs"
+
 [workspace]
 resolver = "3"
 members = [
@@ -56,6 +60,7 @@ members = [
 ]
 
 [dependencies]
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 recipe-cluster = { path = "recipe-cluster" }
 recipe-core = { path = "recipe-core" }
 recipe-cuda = { path = "recipe-cuda" }
@@ -80,6 +85,8 @@ recipe-scheduler = { path = "recipe-scheduler" }
 recipe-text = { path = "recipe-text" }
 recipe-training = { path = "recipe-training" }
 recipe-transport = { path = "recipe-transport" }
+serde_json = "1.0.150"
+syn = { version = "2.0.117", features = ["full", "visit"] }
 
 [lints]
 workspace = true

@@ -8,23 +8,27 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use recipe_core::{BundleIdentity, MetricId, RunId};
-use recipe_executor::{ExitImage, MetricSample, MetricValue, RunJournal, Watchdog};
+use recipe_executor::{ExitImage, MetricValue, RunJournal, Watchdog};
 use recipe_native_executor::{LocalCandidateFactory, StagedCrossBackend};
 use recipe_prepare::{
 	NativeArtifactCatalog, NativeArtifactProvider, NativeCandidateRealizer, NativeExecutorDriver, Preparer,
 };
 use recipe_training::{
 	AdamWConfig, BinaryValidationConfig, CheckpointError, CheckpointManifest, CompiledTraining,
-	CompletedTrainingCheckpoint, CompletedTrainingExecution, DenseActivation, DenseBinaryDataset, DenseLayer,
-	DenseTrainingConfig, FinalTrainingMetric, TemperatureScalingConfig, TrainingBounds, TrainingCompileError,
-	TrainingExecutionLimits, TrainingMetricKind, TrainingMetricObserver, bounded_training_metric_channel,
-	compile_dense_binary_training, compile_dense_binary_training_with_validation, prepare_and_execute_local_training,
-	prepare_and_execute_local_training_with_observer,
+	CompletedTrainingCheckpoint, CompletedTrainingExecution, DenseActivation, DenseBlock, DenseBlockKind,
+	DenseDataNormalization, DenseLayer, DenseLoss, DenseNormalization, DenseOperation, DenseResidual,
+	DenseResidualOperation, DenseTrainingConfig, FinalTrainingMetric, LearningRateDecay, MulticlassValidationConfig,
+	TrainingBounds, TrainingCompileError, TrainingExecutionLimits, TrainingMetricKind, TrainingMetricObserver,
+	TrainingMetricSample, bounded_training_metric_channel, compile_dense_training,
+	compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
+	compile_dense_training_with_blocks_and_binary_validation,
+	compile_dense_training_with_blocks_and_multiclass_validation, compile_dense_training_with_multiclass_validation,
+	prepare_and_execute_local_training, prepare_and_execute_local_training_with_observer,
 };
 
 use crate::api::{
-	Activation, Calibration, Data, DeclarationError, LayerSpec, LearningRateSchedule, Loss, Metric, Model,
-	Normalization, Objective, Optimizer, SavePath, Train,
+	Activation, Data, DataNormalization, DeclarationError, LayerNormalization, LayerOperation, LayerSpec,
+	LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation, ResidualSkip, SavePath, Train,
 };
 use crate::data_prepare::{DataPreparationError, prepare_data};
 use crate::native_prepare::{NativePreparationError, with_current_native_preparation};
@@ -80,15 +84,40 @@ impl TrainingError {
 impl fmt::Display for TrainingError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Declaration(error) => write!(formatter, "invalid training declaration: {error}"),
-			Self::Data(error) => write!(formatter, "prepare training data: {error}"),
-			Self::Compile(error) => write!(formatter, "compile training graph: {error}"),
-			Self::Checkpoint(error) => write!(formatter, "checkpoint trained model: {error}"),
-			Self::Native(error) => write!(formatter, "prepare current native system: {error}"),
-			Self::Unsupported { detail } => write!(formatter, "unsupported training declaration: {detail}"),
-			Self::Runtime { stage, detail } => write!(formatter, "{stage}: {detail}"),
+			Self::Declaration(error) => write_training_error(formatter, "invalid training declaration", error),
+			Self::Data(error) => write_training_error(formatter, "prepare training data", error),
+			Self::Compile(error) => write_training_error(formatter, "compile training graph", error),
+			Self::Checkpoint(error) => write_training_error(formatter, "checkpoint trained model", error),
+			Self::Native(error) => write_training_error(formatter, "prepare current native system", error),
+			Self::Unsupported { detail } => {
+				write_training_error(formatter, "unsupported training declaration", detail)
+			}
+			Self::Runtime { stage, detail } => write_training_error(formatter, stage, detail),
 		}
 	}
+}
+
+fn write_training_error(formatter: &mut fmt::Formatter<'_>, stage: &str, detail: impl fmt::Display) -> fmt::Result {
+	formatter.write_str("training failed")?;
+	write_ogdl_error_node(formatter, 1, stage)?;
+	let detail = detail.to_string();
+	for (index, node) in detail.split(": ").enumerate() {
+		write_ogdl_error_node(formatter, index.saturating_add(2), node)?;
+	}
+	Ok(())
+}
+
+fn write_ogdl_error_node(formatter: &mut fmt::Formatter<'_>, depth: usize, text: &str) -> fmt::Result {
+	formatter.write_str("\n")?;
+	for _ in 0..depth {
+		formatter.write_str("\t")?;
+	}
+	let text = text.replace(['\t', '\r', '\n'], " ");
+	formatter.write_str(if text.is_empty() {
+		"unspecified"
+	} else {
+		&text
+	})
 }
 
 impl std::error::Error for TrainingError {
@@ -182,7 +211,18 @@ impl TrainingReport {
 
 	/// Save a deterministic Recipe-owned OGDL model. Pass `()` to use
 	/// `model.ogdl`.
-	pub fn save(&self, path: impl SavePath) -> TrainingResult<()> {
+	///
+	/// # Panics
+	///
+	/// Panics when the checkpoint cannot be saved.
+	pub fn save(self, path: impl SavePath) -> Self {
+		if let Err(error) = self.try_save(path) {
+			panic!("{error}");
+		}
+		self
+	}
+
+	fn try_save(&self, path: impl SavePath) -> TrainingResult<()> {
 		self.checkpoint
 			.save(path.or_default())
 			.map_err(TrainingError::from)
@@ -206,24 +246,43 @@ struct CompiledTrainingPackage {
 /// This boundary loads and losslessly prepares the user dataset, but performs
 /// no native probing, artifact compilation, allocation, or execution.
 pub fn compile_training(policy: &Train, data: &Data, model: &Model) -> TrainingResult<CompiledTraining> {
-	Ok(compile_training_package(policy, data, model)?.training)
+	compile_training_graph(policy, data, model)
 }
 
 fn compile_training_package(policy: &Train, data: &Data, model: &Model) -> TrainingResult<CompiledTrainingPackage> {
-	policy.declare(data, model)?;
-	require_supported_model(model)?;
+	let training = compile_training_graph(policy, data, model)?;
+	let checkpoint = CheckpointManifest::from_compiled(&training)?;
+	Ok(CompiledTrainingPackage {
+		training,
+		checkpoint,
+	})
+}
+
+fn compile_training_graph(policy: &Train, data: &Data, model: &Model) -> TrainingResult<CompiledTraining> {
+	policy.validate()?;
+	data.validate()?;
+	model.validate()?;
+	let loss = require_supported_model(model)?;
 	require_supported_policy(policy)?;
 
 	let prepared = prepare_data(data)?;
-	let dataset = DenseBinaryDataset::from_prepared(&prepared)?;
-	let layers = model
+	let blocks = model
 		.layers()
 		.iter()
-		.map(map_dense_layer)
+		.map(map_dense_block)
 		.collect::<TrainingResult<Vec<_>>>()?;
-	let batch_size = policy
-		.batch_size_value()
-		.ok_or_else(|| TrainingError::unsupported("a finite batch_size is required"))?;
+	let layers = blocks
+		.iter()
+		.map(|block| match block {
+			DenseBlock::Layer(layer) => Some(layer.clone()),
+			DenseBlock::Residual(_) => None,
+		})
+		.collect::<Option<Vec<_>>>()
+		.unwrap_or_default();
+	let batch_fraction = policy
+		.batch_fraction()
+		.ok_or_else(|| TrainingError::unsupported("a finite batch fraction is required"))?;
+	let batch_size = batch_size_from_fraction(prepared.train().len(), batch_fraction)?;
 	let epochs = policy
 		.epoch_bound()
 		.ok_or_else(|| TrainingError::unsupported("a finite epoch bound is required"))?;
@@ -233,15 +292,37 @@ fn compile_training_package(policy: &Train, data: &Data, model: &Model) -> Train
 		.map_err(|error| TrainingError::unsupported(format!("warmup epoch bound does not fit u64: {error}")))?;
 	let learning_rate = policy
 		.learning_rate()
-		.or_else(|| model.learning_rate())
 		.unwrap_or_else(|| AdamWConfig::default().learning_rate);
+	let learning_rate_decay = match policy.learning_rate_schedule() {
+		Some(LearningRateSchedule::LinearDecay) => LearningRateDecay::Linear,
+		Some(LearningRateSchedule::CosineDecay) => LearningRateDecay::Cosine,
+		Some(LearningRateSchedule::ExponentialDecay) => LearningRateDecay::Exponential,
+		None => {
+			return Err(TrainingError::unsupported(
+				"an explicit learning-rate decay is required",
+			));
+		}
+	};
+	let data_normalization = match data.normalization() {
+		Some(DataNormalization::ZScore) => DenseDataNormalization::ZScore,
+		Some(DataNormalization::MinMax) => DenseDataNormalization::MinMax,
+		Some(DataNormalization::L2Norm) => DenseDataNormalization::L2Norm,
+		None => {
+			return Err(TrainingError::unsupported(
+				"dense training requires explicit data normalization",
+			));
+		}
+	};
 	let config = DenseTrainingConfig {
 		layers,
+		loss,
+		data_normalization,
 		batch_size: NonZeroUsize::new(batch_size)
 			.ok_or_else(|| TrainingError::unsupported("batch size must be nonzero"))?,
 		epochs: NonZeroU64::new(epochs).ok_or_else(|| TrainingError::unsupported("epoch bound must be nonzero"))?,
 		warmup_epochs,
-		gradient_clip_norm: policy.gradient_clip_value().unwrap_or(1.0),
+		learning_rate_decay,
+		gradient_clip_norm: model.gradient_clip_value().unwrap_or(1.0),
 		normalization_epsilon: 1.0e-6,
 		reduction_tree_lanes: 256,
 		random_seed: 0x7265_6369_7065,
@@ -250,26 +331,94 @@ fn compile_training_package(policy: &Train, data: &Data, model: &Model) -> Train
 			..AdamWConfig::default()
 		},
 	};
-	let training = match binary_validation_config(policy)? {
-		Some(validation) => compile_dense_binary_training_with_validation(&dataset, &config, &validation)
+	let binary_validation = binary_validation_config(policy, loss)?;
+	let multiclass_validation = multiclass_validation_config(policy, loss)?;
+	let contains_residual = blocks
+		.iter()
+		.any(|block| matches!(block, DenseBlock::Residual(_)));
+	let training = match (contains_residual, binary_validation, multiclass_validation) {
+		(false, Some(validation), None) => compile_dense_training_with_binary_validation(&prepared, &config, &validation)
 			.map_err(TrainingError::from),
-		None => compile_dense_binary_training(&dataset, &config).map_err(TrainingError::from),
+		(false, None, Some(validation)) => {
+			compile_dense_training_with_multiclass_validation(&prepared, &config, &validation)
+				.map_err(TrainingError::from)
+		}
+		(false, None, None) => compile_dense_training(&prepared, &config).map_err(TrainingError::from),
+		(true, Some(validation), None) => {
+			compile_dense_training_with_blocks_and_binary_validation(&prepared, &config, &blocks, &validation)
+				.map_err(TrainingError::from)
+		}
+		(true, None, Some(validation)) => compile_dense_training_with_blocks_and_multiclass_validation(
+			&prepared,
+			&config,
+			&blocks,
+			&validation,
+		)
+		.map_err(TrainingError::from),
+		(true, None, None) => {
+			compile_dense_training_with_blocks(&prepared, &config, &blocks).map_err(TrainingError::from)
+		}
+		(_, Some(_), Some(_)) => Err(TrainingError::unsupported(
+			"one training run cannot request binary and multiclass validation simultaneously",
+		)),
 	}?;
-	let checkpoint = CheckpointManifest::from_compiled(&prepared, &config, &training)?;
-	Ok(CompiledTrainingPackage {
-		training,
-		checkpoint,
-	})
+	Ok(training)
+}
+
+fn batch_size_from_fraction(rows: usize, fraction: f32) -> TrainingResult<usize> {
+	if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 {
+		return Err(TrainingError::unsupported(format!(
+			"batch fraction must be finite and in (0, 1), got {fraction}"
+		)));
+	}
+	let bits = fraction.to_bits();
+	let exponent = (bits >> 23) & 0xff;
+	let fraction_bits = bits & 0x7f_ffff;
+	let (numerator, denominator_power) = if exponent == 0 {
+		(u128::from(fraction_bits), 149_u32)
+	} else {
+		(
+			u128::from((1 << 23) | fraction_bits),
+			150_u32.saturating_sub(exponent),
+		)
+	};
+	let product = u128::try_from(rows)
+		.map_err(|error| TrainingError::unsupported(format!("training row count does not fit u128: {error}")))?
+		.checked_mul(numerator)
+		.ok_or_else(|| TrainingError::unsupported("batch fraction multiplication overflowed u128"))?;
+	let derived = if denominator_power >= 128 {
+		0
+	} else {
+		product >> denominator_power
+	};
+	usize::try_from(derived.max(1))
+		.map_err(|error| TrainingError::unsupported(format!("derived batch size does not fit usize: {error}")))
 }
 
 impl Train {
-	/// Compile and execute this declaration against the current exact measured
-	/// machine profile.
+	/// Compile and execute this declaration with the preceding `recipe.data(...)`
+	/// and `recipe.model()` declarations.
 	///
 	/// Preparation performs all discovery validation, placement, artifact
 	/// generation, loading, warming, allocation, and finalization before the
 	/// singular external data image for each device is admitted.
-	pub fn run(&self, data: &Data, model: &Model) -> TrainingResult<TrainingReport> {
+	///
+	/// # Panics
+	///
+	/// Panics when training cannot be compiled, prepared, or executed.
+	pub fn run(&self) -> TrainingReport {
+		match self.try_run() {
+			Ok(report) => report,
+			Err(error) => panic!("{error}"),
+		}
+	}
+
+	fn try_run(&self) -> TrainingResult<TrainingReport> {
+		let (data, model) = crate::take_recipe_sequence().map_err(TrainingError::unsupported)?;
+		self.try_run_with(&data, &model)
+	}
+
+	fn try_run_with(&self, data: &Data, model: &Model) -> TrainingResult<TrainingReport> {
 		let package = compile_training_package(self, data, model)?;
 		let execution = execute_current_training(self, &package.training)?;
 		TrainingReport::new(execution, package.checkpoint)
@@ -380,22 +529,16 @@ fn log_selects(requested: Metric, available: TrainingMetricKind) -> bool {
 	match requested {
 		Metric::Loss => matches!(
 			available,
-			TrainingMetricKind::BatchLoss | TrainingMetricKind::ValidationMeanBce
+			TrainingMetricKind::BatchLoss
+				| TrainingMetricKind::ValidationMeanBce
+				| TrainingMetricKind::ValidationMeanCrossEntropy
 		),
+		Metric::Accuracy => available == TrainingMetricKind::Accuracy,
 		Metric::AuRoc => available == TrainingMetricKind::AuRoc,
 		Metric::AuPrc => available == TrainingMetricKind::AuPrc,
 		Metric::Brier => available == TrainingMetricKind::BrierScore,
 		Metric::CalibrationError => available == TrainingMetricKind::ExpectedCalibrationError,
-		Metric::RecallAt { threshold_bits } => {
-			let threshold_bits = (f64::from_bits(threshold_bits) as f32).to_bits();
-			matches!(
-				available,
-				TrainingMetricKind::RecallAt {
-					threshold_bits: available,
-				} if available == threshold_bits
-			)
-		}
-		Metric::Accuracy | Metric::R2 | Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => {
+		Metric::R2 | Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => {
 			false
 		}
 	}
@@ -405,6 +548,8 @@ fn metric_label(metric: TrainingMetricKind) -> String {
 	match metric {
 		TrainingMetricKind::BatchLoss => "loss".to_owned(),
 		TrainingMetricKind::ValidationMeanBce => "validation_loss".to_owned(),
+		TrainingMetricKind::ValidationMeanCrossEntropy => "validation_loss".to_owned(),
+		TrainingMetricKind::Accuracy => "accuracy".to_owned(),
 		TrainingMetricKind::AuRoc => "auroc".to_owned(),
 		TrainingMetricKind::AuPrc => "auprc".to_owned(),
 		TrainingMetricKind::BrierScore => "brier".to_owned(),
@@ -417,7 +562,10 @@ fn metric_label(metric: TrainingMetricKind) -> String {
 
 const fn metric_width(metric: TrainingMetricKind) -> usize {
 	match metric {
-		TrainingMetricKind::BatchLoss | TrainingMetricKind::ValidationMeanBce => 7,
+		TrainingMetricKind::BatchLoss
+		| TrainingMetricKind::ValidationMeanBce
+		| TrainingMetricKind::ValidationMeanCrossEntropy => 7,
+		TrainingMetricKind::Accuracy => 6,
 		TrainingMetricKind::AuRoc
 		| TrainingMetricKind::AuPrc
 		| TrainingMetricKind::BrierScore
@@ -427,7 +575,7 @@ const fn metric_width(metric: TrainingMetricKind) -> usize {
 }
 
 fn spawn_live_metric_presenter(
-	receiver: Receiver<MetricSample>,
+	receiver: Receiver<TrainingMetricSample>,
 	presentations: BTreeMap<MetricId, LiveMetricPresentation>,
 	bounds: TrainingBounds,
 	epoch_cadence: NonZeroU64,
@@ -445,7 +593,12 @@ fn spawn_live_metric_presenter(
 			);
 			while let Ok(sample) = receiver.recv() {
 				if rows
-					.push(sample.iteration.index(), sample.metric, sample.value)
+					.push(
+						sample.zero_based_iteration.index(),
+						sample.epoch,
+						sample.metric,
+						sample.value,
+					)
 					.is_some_and(|row| write_live_metric_row(&mut output, &row).is_err())
 				{
 					break;
@@ -469,7 +622,7 @@ struct LiveMetricRows {
 	batches_per_epoch: u64,
 	epochs: NonZeroU64,
 	epoch_cadence: NonZeroU64,
-	pending_iteration: Option<u64>,
+	pending_sample: Option<(u64, NonZeroU64)>,
 	pending_values: BTreeMap<MetricId, MetricValue>,
 }
 
@@ -485,27 +638,27 @@ impl LiveMetricRows {
 			batches_per_epoch,
 			epochs,
 			epoch_cadence,
-			pending_iteration: None,
+			pending_sample: None,
 			pending_values: BTreeMap::new(),
 		}
 	}
 
-	fn push(&mut self, iteration: u64, metric: MetricId, value: MetricValue) -> Option<String> {
+	fn push(&mut self, iteration: u64, epoch: NonZeroU64, metric: MetricId, value: MetricValue) -> Option<String> {
 		let completed = if self
-			.pending_iteration
-			.is_some_and(|pending| pending != iteration)
+			.pending_sample
+			.is_some_and(|(pending, _)| pending != iteration)
 		{
-			let completed = self.pending_iteration.map(|pending| self.render(pending));
-			self.pending_iteration = None;
+			let completed = self.pending_sample.map(|(_, epoch)| self.render(epoch));
+			self.pending_sample = None;
 			self.pending_values.clear();
 			completed
 		} else {
 			None
 		};
-		if !self.selects(iteration) {
+		if !self.selects(iteration, epoch) {
 			return completed;
 		}
-		self.pending_iteration = Some(iteration);
+		self.pending_sample = Some((iteration, epoch));
 		if self.presentations.contains_key(&metric) {
 			self.pending_values.insert(metric, value);
 		}
@@ -513,22 +666,20 @@ impl LiveMetricRows {
 	}
 
 	fn finish(&mut self) -> Option<String> {
-		let iteration = self.pending_iteration.take()?;
-		let row = self.render(iteration);
+		let (_, epoch) = self.pending_sample.take()?;
+		let row = self.render(epoch);
 		self.pending_values.clear();
 		Some(row)
 	}
 
-	fn selects(&self, iteration: u64) -> bool {
+	fn selects(&self, iteration: u64, epoch: NonZeroU64) -> bool {
 		if self.batches_per_epoch == 0 || iteration % self.batches_per_epoch != self.batches_per_epoch - 1 {
 			return false;
 		}
-		let epoch = iteration / self.batches_per_epoch;
-		epoch % self.epoch_cadence.get() == 0 || epoch.saturating_add(1) == self.epochs.get()
+		epoch.get() % self.epoch_cadence.get() == 0 || epoch == self.epochs
 	}
 
-	fn render(&self, iteration: u64) -> String {
-		let epoch = iteration / self.batches_per_epoch.max(1);
+	fn render(&self, epoch: NonZeroU64) -> String {
 		let mut fields = Vec::with_capacity(self.pending_values.len().saturating_add(1));
 		fields.push(live_metric_field("epoch", 5, &epoch.to_string(), 0));
 		for (metric, presentation) in &self.presentations {
@@ -570,34 +721,44 @@ fn next_run_id() -> RunId {
 	RunId::new(value.max(1))
 }
 
-fn require_supported_model(model: &Model) -> TrainingResult<()> {
+fn require_supported_model(model: &Model) -> TrainingResult<DenseLoss> {
 	if model.weights_source().is_some() {
 		return Err(TrainingError::unsupported(
 			"loading an existing weight image is not part of the dense training compiler",
 		));
 	}
-	if model.normalization() != Some(Normalization::ZScore) {
+	if !model.bayes_dependencies().is_empty() {
 		return Err(TrainingError::unsupported(
-			"dense training currently requires explicit z-score normalization",
+			"Bayesian dependencies require a Bayesian model compiler and cannot be ignored by dense training",
 		));
 	}
-	if model.objective() != Some(&Objective::Builtin(Loss::BinaryCrossEntropy)) {
-		return Err(TrainingError::unsupported(
-			"dense binary training requires the built-in BCE objective",
-		));
+	match model.objective() {
+		Some(Objective::Builtin(Loss::BinaryCrossEntropy)) => Ok(DenseLoss::BinaryCrossEntropy),
+		Some(Objective::Builtin(Loss::MeanSquaredError)) => Ok(DenseLoss::MeanSquaredError),
+		Some(Objective::Builtin(Loss::MeanAbsoluteError)) => Ok(DenseLoss::MeanAbsoluteError),
+		Some(Objective::Builtin(Loss::CrossEntropy)) => Ok(DenseLoss::CrossEntropy),
+		Some(Objective::Builtin(Loss::Huber)) => Ok(DenseLoss::Huber),
+		Some(Objective::Builtin(Loss::Focal)) => Err(TrainingError::unsupported(
+			"focal loss has no dense training lowering",
+		)),
+		Some(Objective::Reference(_)) => Err(TrainingError::unsupported(
+			"model-referenced objectives have no dense training lowering",
+		)),
+		None => Err(TrainingError::unsupported(
+			"dense training requires an explicit built-in objective",
+		)),
 	}
-	if model.optimizer_spec() != Some(Optimizer::AdamW) {
-		return Err(TrainingError::unsupported(
-			"dense binary training requires the Recipe-owned AdamW optimizer",
-		));
-	}
-	Ok(())
 }
 
 fn require_supported_policy(policy: &Train) -> TrainingResult<()> {
-	if policy.learning_rate_schedule() != Some(LearningRateSchedule::CosineDecay) {
+	if policy.optimizer_spec() != Some(Optimizer::AdamW) {
 		return Err(TrainingError::unsupported(
-			"dense training currently requires an explicit cosine-decay schedule",
+			"dense binary training requires the Recipe-owned AdamW optimizer on the training declaration",
+		));
+	}
+	if policy.learning_rate_schedule().is_none() {
+		return Err(TrainingError::unsupported(
+			"dense training requires an explicit learning-rate decay",
 		));
 	}
 	if policy.resume_source().is_some() {
@@ -605,36 +766,22 @@ fn require_supported_policy(policy: &Train) -> TrainingResult<()> {
 			"resume requires a finalized Recipe weight-image format",
 		));
 	}
-	if !policy.nodes().is_empty() {
-		return Err(TrainingError::unsupported(
-			"explicit multi-node placement is not yet connected to the native training runner",
-		));
-	}
 	Ok(())
 }
 
-fn binary_validation_config(policy: &Train) -> TrainingResult<Option<BinaryValidationConfig>> {
-	let mut requested = policy.early_stopping().is_some() || policy.calibration().is_some();
-	let mut recall_thresholds = Vec::new();
+fn binary_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<Option<BinaryValidationConfig>> {
+	let mut requested = policy.early_stopping().is_some();
 	for item in policy.log_items().iter().chain(policy.plot_items()) {
 		match item.metric() {
-			Metric::Loss | Metric::AuRoc | Metric::AuPrc | Metric::Brier | Metric::CalibrationError => {
+			Metric::Loss => {}
+			Metric::AuRoc | Metric::AuPrc | Metric::Brier | Metric::CalibrationError => {
 				requested = true;
-			}
-			Metric::RecallAt { .. } => {
-				requested = true;
-				let threshold = item
-					.metric()
-					.recall_threshold()
-					.expect("RecallAt always exposes its threshold") as f32;
-				if !recall_thresholds.contains(&threshold) {
-					recall_thresholds.push(threshold);
-				}
 			}
 			Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => {}
+			Metric::Accuracy if loss == DenseLoss::CrossEntropy => {}
 			Metric::Accuracy | Metric::R2 => {
 				return Err(TrainingError::unsupported(format!(
-					"metric {:?} is not defined for the current binary validation graph",
+					"metric {:?} is not defined for the current training objective",
 					item.metric()
 				)));
 			}
@@ -643,8 +790,13 @@ fn binary_validation_config(policy: &Train) -> TrainingResult<Option<BinaryValid
 	if !requested {
 		return Ok(None);
 	}
+	if loss != DenseLoss::BinaryCrossEntropy {
+		return Err(TrainingError::unsupported(
+			"binary classification validation metrics, early stopping, and calibration require BCE",
+		));
+	}
 	let bins = NonZeroU32::new(15).expect("the Recipe ECE default is nonzero");
-	let mut validation = BinaryValidationConfig::new(bins, recall_thresholds);
+	let mut validation = BinaryValidationConfig::new(bins, Vec::new());
 	if let Some(early) = policy.early_stopping() {
 		if early.metric().metric() != Metric::AuPrc {
 			return Err(TrainingError::unsupported(
@@ -657,36 +809,140 @@ fn binary_validation_config(policy: &Train) -> TrainingResult<Option<BinaryValid
 			.ok_or_else(|| TrainingError::unsupported("early-stop patience does not fit a nonzero u64"))?;
 		validation = validation.with_auprc_early_stopping(patience);
 	}
-	if let Some(calibration) = policy.calibration() {
-		match calibration {
-			Calibration::TemperatureScaling => {
-				validation = validation.with_temperature_scaling(TemperatureScalingConfig::default());
-			}
-		}
-	}
 	Ok(Some(validation))
 }
 
-fn map_dense_layer(layer: &LayerSpec) -> TrainingResult<DenseLayer> {
-	let LayerSpec::Dense { units, activation } = layer else {
+fn multiclass_validation_config(
+	policy: &Train,
+	loss: DenseLoss,
+) -> TrainingResult<Option<MulticlassValidationConfig>> {
+	let requested = policy
+		.log_items()
+		.iter()
+		.chain(policy.plot_items())
+		.any(|item| item.metric() == Metric::Accuracy);
+	if !requested {
+		return Ok(None);
+	}
+	if loss != DenseLoss::CrossEntropy {
 		return Err(TrainingError::unsupported(
-			"the current training compiler accepts dense layers only",
+			"accuracy validation requires categorical cross entropy",
 		));
-	};
-	let width = u64::try_from(*units)
-		.map_err(|error| TrainingError::unsupported(format!("dense layer width does not fit u64: {error}")))?;
-	let width =
-		NonZeroU64::new(width).ok_or_else(|| TrainingError::unsupported("dense layer width must be nonzero"))?;
-	let activation = match activation {
-		Activation::Linear => DenseActivation::Linear,
-		Activation::Silu => DenseActivation::Silu,
-		other => {
-			return Err(TrainingError::unsupported(format!(
-				"dense activation {other:?} has no Recipe primitive training lowering"
-			)));
+	}
+	Ok(Some(MulticlassValidationConfig))
+}
+
+fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
+	match layer {
+		LayerSpec::Residual {
+			branch,
+			output_width,
+			skip: ResidualSkip::IdentityOrLinearProjection,
+			operations,
+		} => {
+			let branch = branch
+				.iter()
+				.copied()
+				.map(map_dense_residual_operation)
+				.collect::<TrainingResult<Vec<_>>>()?;
+			let operations = map_dense_operations(operations)?;
+			let residual = DenseResidual::new(branch, operations);
+			let declared_output_width = map_dense_width(*output_width, "residual output width")?;
+			if residual.output_width() != Some(declared_output_width) {
+				return Err(TrainingError::unsupported(format!(
+					"residual branch resolves to output width {:?}, but the facade retained {}",
+					residual.output_width().map(NonZeroU64::get),
+					declared_output_width.get(),
+				)));
+			}
+			Ok(DenseBlock::Residual(residual))
+		}
+		_ => map_dense_layer(layer).map(DenseBlock::Layer),
+	}
+}
+
+fn map_dense_residual_operation(operation: ResidualOperation) -> TrainingResult<DenseResidualOperation> {
+	match operation {
+		ResidualOperation::Layer { width } => Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
+			DenseBlockKind::Layer,
+			map_dense_width(width, "residual branch layer width")?,
+			[],
+		))),
+		ResidualOperation::Activation(activation) => Ok(DenseResidualOperation::Operation(
+			DenseOperation::Activation(map_dense_activation(activation)?),
+		)),
+	}
+}
+
+fn map_dense_layer(layer: &LayerSpec) -> TrainingResult<DenseLayer> {
+	let (kind, units, operations) = match layer {
+		LayerSpec::Dense { units, operations } => (DenseBlockKind::Layer, units, operations),
+		LayerSpec::Perc { count, operations } => (DenseBlockKind::Perc, count, operations),
+		LayerSpec::Rnn { .. }
+		| LayerSpec::Gru { .. }
+		| LayerSpec::Lstm { .. }
+		| LayerSpec::Convolution { .. }
+		| LayerSpec::Pool { .. }
+		| LayerSpec::Lgbm { .. }
+		| LayerSpec::Cbst { .. }
+		| LayerSpec::Xgbst { .. }
+		| LayerSpec::Forest { .. }
+		| LayerSpec::KMeans { .. }
+		| LayerSpec::KnnPrediction { .. }
+		| LayerSpec::KnnReduction { .. }
+		| LayerSpec::Embedding { .. }
+		| LayerSpec::Attention { .. }
+		| LayerSpec::Residual { .. } => {
+			return Err(TrainingError::unsupported(
+				"the current training compiler accepts layer, perc, and residual blocks only",
+			));
 		}
 	};
-	Ok(DenseLayer::new(width, activation))
+	let width = map_dense_width(*units, "dense layer width")?;
+	let operations = map_dense_operations(operations)?;
+	Ok(DenseLayer::with_kind(kind, width, operations))
+}
+
+fn map_dense_width(width: usize, role: &str) -> TrainingResult<NonZeroU64> {
+	let width = u64::try_from(width)
+		.map_err(|error| TrainingError::unsupported(format!("{role} does not fit u64: {error}")))?;
+	NonZeroU64::new(width).ok_or_else(|| TrainingError::unsupported(format!("{role} must be nonzero")))
+}
+
+fn map_dense_operations(operations: &[LayerOperation]) -> TrainingResult<Vec<DenseOperation>> {
+	let operations = operations
+		.iter()
+		.copied()
+		.map(|operation| match operation {
+			LayerOperation::Activation(activation) => {
+				map_dense_activation(activation).map(DenseOperation::Activation)
+			}
+			LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
+				Ok(DenseOperation::Normalization(DenseNormalization::Layer))
+			}
+			LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
+				Ok(DenseOperation::Normalization(DenseNormalization::Batch))
+			}
+		})
+		.collect::<TrainingResult<Vec<_>>>()?;
+	Ok(operations)
+}
+
+fn map_dense_activation(activation: Activation) -> TrainingResult<DenseActivation> {
+	match activation {
+		Activation::Linear => Ok(DenseActivation::Linear),
+		Activation::Cosine => Ok(DenseActivation::Cosine),
+		Activation::Exponential => Ok(DenseActivation::Exponential),
+		Activation::Logarithm => Ok(DenseActivation::Logarithm),
+		Activation::Huber => Ok(DenseActivation::Huber),
+		Activation::Tangent => Ok(DenseActivation::Tangent),
+		Activation::Relu => Ok(DenseActivation::Relu),
+		Activation::Gelu => Ok(DenseActivation::Gelu),
+		Activation::Silu => Ok(DenseActivation::Silu),
+		other => Err(TrainingError::unsupported(format!(
+			"dense activation {other:?} has no Recipe primitive training lowering"
+		))),
+	}
 }
 
 #[cfg(test)]
@@ -715,6 +971,192 @@ mod tests {
 	}
 
 	#[test]
+	fn loss_logging_uses_batch_loss_without_requesting_validation() {
+		let policy = Train::new().log([crate::api::Loss]);
+
+		assert_eq!(
+			binary_validation_config(&policy, DenseLoss::MeanSquaredError).expect("valid policy"),
+			None
+		);
+		assert_eq!(
+			multiclass_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
+			None
+		);
+	}
+
+	#[test]
+	fn accuracy_logging_selects_only_categorical_cross_entropy_validation() {
+		let policy = Train::new().log([crate::api::Accuracy]);
+
+		assert_eq!(
+			binary_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
+			None
+		);
+		assert_eq!(
+			multiclass_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
+			Some(MulticlassValidationConfig)
+		);
+		assert!(multiclass_validation_config(&policy, DenseLoss::MeanSquaredError).is_err());
+	}
+
+	#[test]
+	fn public_losses_map_to_distinct_dense_compiler_losses() {
+		for (loss, expected) in [
+			(Loss::BinaryCrossEntropy, DenseLoss::BinaryCrossEntropy),
+			(Loss::MeanSquaredError, DenseLoss::MeanSquaredError),
+			(Loss::MeanAbsoluteError, DenseLoss::MeanAbsoluteError),
+			(Loss::CrossEntropy, DenseLoss::CrossEntropy),
+			(Loss::Huber, DenseLoss::Huber),
+		] {
+			let model = Model::new()
+				.layer(1)
+				.loss(loss)
+				.grad(crate::api::clip(0.75));
+			assert_eq!(
+				require_supported_model(&model).expect("supported loss"),
+				expected
+			);
+			assert_eq!(model.gradient_clip_value(), Some(0.75));
+		}
+	}
+
+	#[test]
+	fn perc_lowers_as_a_distinct_dense_block_kind() {
+		let model = Model::new().perc(30).silu();
+		let block = map_dense_layer(&model.layers()[0]).expect("perc block lowers");
+
+		assert_eq!(block.kind(), DenseBlockKind::Perc);
+		assert_eq!(block.width().get(), 30);
+		assert_eq!(
+			block.operations(),
+			[DenseOperation::Activation(DenseActivation::Silu)]
+		);
+	}
+
+	#[test]
+	fn residual_lowering_preserves_branch_and_post_add_operation_order() {
+		let model = Model::new()
+			.residual([
+				crate::api::relu(),
+				crate::api::layer(64),
+				crate::api::relu(),
+				crate::api::layer(32),
+			])
+			.norm(crate::api::layer_norm)
+			.silu();
+		let block = map_dense_block(&model.layers()[0]).expect("residual block lowers");
+		let DenseBlock::Residual(residual) = block else {
+			panic!("residual facade block lowered as an ordinary layer");
+		};
+
+		assert_eq!(residual.output_width().map(NonZeroU64::get), Some(32));
+		assert_eq!(
+			residual.branch(),
+			[
+				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
+				DenseResidualOperation::Layer(DenseLayer::with_operations(NonZeroU64::new(64).unwrap(), [])),
+				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
+				DenseResidualOperation::Layer(DenseLayer::with_operations(NonZeroU64::new(32).unwrap(), [])),
+			]
+		);
+		assert_eq!(
+			residual.operations(),
+			[
+				DenseOperation::Normalization(DenseNormalization::Layer),
+				DenseOperation::Activation(DenseActivation::Silu),
+			]
+		);
+	}
+
+	#[test]
+	fn residual_training_package_constructs_a_structured_checkpoint_manifest() {
+		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+		struct RemoveOnDrop(std::path::PathBuf);
+
+		impl Drop for RemoveOnDrop {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_file(&self.0);
+			}
+		}
+
+		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+		let path = std::env::temp_dir().join(format!(
+			"recipe-residual-package-{}-{sequence}.csv",
+			std::process::id(),
+		));
+		std::fs::write(
+			&path,
+			b"feature,target\n1,2\n2,3\n3,4\n4,5\n5,6\n6,7\n",
+		)
+		.expect("write residual package fixture");
+		let _fixture = RemoveOnDrop(path.clone());
+		let data = Data::empty()
+			.set(path.to_str().expect("temporary path is UTF-8"))
+			.target("target")
+			.norm(DataNormalization::ZScore)
+			.split(0.75);
+		let model = Model::new()
+			.residual([crate::api::relu(), crate::api::layer(4), crate::api::relu()])
+			.layer(1)
+			.loss(Loss::MeanSquaredError);
+		let policy = Train::new()
+			.optimizer(Optimizer::AdamW)
+			.batch(0.5)
+			.epochs(1)
+			.lr(0.001)
+			.cos();
+
+		let package = compile_training_package(&policy, &data, &model).expect("residual package compiles");
+		assert!(matches!(package.training.blocks()[0], DenseBlock::Residual(_)));
+		assert_eq!(package.checkpoint.format_version(), 6);
+	}
+
+	#[test]
+	fn specialized_blocks_are_never_silently_treated_as_dense_layers() {
+		let bayes = Model::new()
+			.bayes("housing", ["age", "job"])
+			.loss(Loss::BinaryCrossEntropy);
+		assert!(matches!(
+			require_supported_model(&bayes),
+			Err(TrainingError::Unsupported { detail })
+				if detail.contains("Bayesian dependencies require a Bayesian model compiler")
+		));
+
+		for model in [
+			Model::new().rnn(30),
+			Model::new().gru(30),
+			Model::new().lstm(30),
+			Model::new().conv(12, 3),
+			Model::new().pool(2),
+			Model::new().lgbm(4),
+			Model::new().cbst(4),
+			Model::new().xgbst(4),
+			Model::new().forest(20).lgbm(4),
+			Model::new().kmeans(4),
+		] {
+			assert!(matches!(
+				map_dense_layer(&model.layers()[0]),
+				Err(TrainingError::Unsupported { detail })
+					if detail.contains("accepts layer, perc, and residual blocks only")
+			));
+		}
+	}
+
+	#[test]
+	fn batch_fraction_derives_samples_after_data_preparation() {
+		assert_eq!(batch_size_from_fraction(5, 0.5).expect("half batch"), 2);
+		assert_eq!(
+			batch_size_from_fraction(100, 0.25).expect("quarter batch"),
+			25
+		);
+		assert_eq!(
+			batch_size_from_fraction(3, f32::MIN_POSITIVE).expect("minimum positive batch"),
+			1
+		);
+	}
+
+	#[test]
 	fn live_metric_row_preserves_legacy_colors_widths_and_precision() {
 		let mut rows = LiveMetricRows::new(
 			presentations(),
@@ -722,25 +1164,43 @@ mod tests {
 			NonZeroU64::new(2).expect("two epochs"),
 			NonZeroU64::MIN,
 		);
-		assert_eq!(rows.push(41, MetricId::new(1), MetricValue::F32(9.0)), None);
-		assert_eq!(rows.pending_iteration, None);
 		assert_eq!(
-			rows.push(42, MetricId::new(1), MetricValue::F32(0.7451)),
+			rows.push(41, NonZeroU64::MIN, MetricId::new(1), MetricValue::F32(9.0),),
+			None,
+		);
+		assert_eq!(rows.pending_sample, None);
+		assert_eq!(
+			rows.push(
+				42,
+				NonZeroU64::MIN,
+				MetricId::new(1),
+				MetricValue::F32(0.7451),
+			),
 			None
 		);
 		assert_eq!(
-			rows.push(42, MetricId::new(2), MetricValue::F32(0.5528)),
+			rows.push(
+				42,
+				NonZeroU64::MIN,
+				MetricId::new(2),
+				MetricValue::F32(0.5528),
+			),
 			None
 		);
 
 		let row = rows
-			.push(43, MetricId::new(1), MetricValue::F32(1.0))
+			.push(
+				43,
+				NonZeroU64::new(2).unwrap(),
+				MetricId::new(1),
+				MetricValue::F32(1.0),
+			)
 			.expect("the next iteration completes the epoch-final row");
 
 		assert_eq!(
 			row,
 			concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     0  ",
+				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     1  ",
 				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.7451  ",
 				"\u{1b}[38;2;0;174;107mauroc\u{1b}[0m 0.5528",
 			)
@@ -757,20 +1217,49 @@ mod tests {
 			NonZeroU64::new(3).expect("every third epoch"),
 		);
 		assert_eq!(
-			rows.push(3, MetricId::new(1), MetricValue::F32(1.0)),
+			rows.push(
+				3,
+				NonZeroU64::new(2).unwrap(),
+				MetricId::new(1),
+				MetricValue::F32(1.0),
+			),
 			None,
-			"epoch one is not selected",
+			"epoch two is not selected",
 		);
-		assert_eq!(rows.pending_iteration, None);
+		assert_eq!(rows.pending_sample, None);
 		assert_eq!(
-			rows.push(9, MetricId::new(1), MetricValue::F32(0.5)),
+			rows.push(
+				5,
+				NonZeroU64::new(3).unwrap(),
+				MetricId::new(1),
+				MetricValue::F32(0.75),
+			),
 			None,
-			"the final epoch is selected even off cadence",
+			"epoch three is selected",
+		);
+		assert_eq!(
+			rows.push(
+				9,
+				NonZeroU64::new(5).unwrap(),
+				MetricId::new(1),
+				MetricValue::F32(0.5),
+			),
+			Some(concat!(
+				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     3  ",
+				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.7500",
+			)
+			.to_owned(),),
+			"the selected third epoch is completed before the final epoch",
+		);
+		assert_eq!(
+			rows.pending_sample,
+			Some((9, NonZeroU64::new(5).unwrap())),
+			"the final epoch is selected even off cadence"
 		);
 		assert_eq!(
 			rows.finish(),
 			Some(concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     4  ",
+				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     5  ",
 				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.5000",
 			)
 			.to_owned(),),

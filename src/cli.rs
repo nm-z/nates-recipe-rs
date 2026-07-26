@@ -6,7 +6,7 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use recipe_core::{Digest, Label};
@@ -49,25 +49,9 @@ const RECEIPT_FIELDS: [&str; 16] = [
 ];
 
 const USAGE: &str = "\
-Recipe command line
-
 Usage:
-  recipe probe [OPTIONS]
-
-The zero-argument probe uses the embedded theoretical seed contract, discovers
-the current bare-metal machine, benchmarks every discovered device and link,
-and writes an identity-keyed measured profile under the user's private cache.
-
-Options:
-  --contract PATH       Use another theoretical probe seed contract
-  --profile PATH        Write/load this absolute measured-profile path
-  --cuda-driver PATH    Exact CUDA Driver library candidate (repeatable)
-  --hsa-runtime PATH    Exact ROCr/HSA runtime candidate (repeatable)
-  --llvm-opt PATH       Exact LLVM IR verifier
-  --llvm-llc PATH       Exact LLVM code generator
-  --lld PATH            Exact ELF linker
-  --ptxas PATH          Exact NVIDIA PTX assembler
-  -h, --help             Show this help
+	recipe run FILE.rs	[ARGS...]
+	recipe probe		[OPTIONS]
 ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -136,18 +120,245 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 		print!("{USAGE}");
 		return Ok(());
 	}
-	if command != "probe" {
-		return Err(format!(
-			"unknown command {:?}; expected `probe`\n\n{USAGE}",
+	match command.to_str() {
+		Some("run") => {
+			let Some(path) = arguments.get(1) else {
+				return Err(format!("`recipe run` requires a Rust source file\n\n{USAGE}"));
+			};
+			if path == "-h" || path == "--help" {
+				print!("{USAGE}");
+				return Ok(());
+			}
+			run_source(path, &arguments[2..])
+		}
+		Some("probe") => {
+			if arguments.len() == 2 && (arguments[1] == "-h" || arguments[1] == "--help") {
+				print!("{USAGE}");
+				return Ok(());
+			}
+			let options = parse_probe_options(&arguments[1..])?;
+			run_probe(options)
+		}
+		Some(_) => Err(format!(
+			"unknown command {:?}; expected `run` or `probe`\n\n{USAGE}",
 			command
+		)),
+		None => Err("commands must be valid UTF-8".to_owned()),
+	}
+}
+
+fn run_source(path: &OsStr, arguments: &[OsString]) -> Result<(), String> {
+	let requested_source = Path::new(path);
+	let source = fs::canonicalize(requested_source)
+		.map_err(|error| format!("read training source {}: {error}", requested_source.display()))?;
+	let metadata = fs::metadata(&source)
+		.map_err(|error| format!("read training source {}: {error}", requested_source.display()))?;
+	if !metadata.is_file() {
+		return Err(format!(
+			"training source {} is not a regular file",
+			requested_source.display()
 		));
 	}
-	if arguments.len() == 2 && (arguments[1] == "-h" || arguments[1] == "--help") {
-		print!("{USAGE}");
-		return Ok(());
+	let source_directory = source
+		.parent()
+		.ok_or_else(|| format!("training source {} has no parent directory", source.display()))?;
+	let source_text = fs::read_to_string(&source)
+		.map_err(|error| format!("read training source {}: {error}", source.display()))?;
+
+	let (library_root, library) = locate_recipe_library()?;
+	let state_root = private_state_root()?;
+	let run_root = state_root.join("run");
+	ensure_private_directory(&run_root)?;
+	static NEXT_RUN_SOURCE: AtomicU64 = AtomicU64::new(1);
+	let sequence = NEXT_RUN_SOURCE.fetch_add(1, Ordering::Relaxed);
+	let binary = run_root.join(format!("recipe-run-{}-{sequence}", std::process::id()));
+	let mut recipe_external = OsString::from("recipe=");
+	recipe_external.push(library.as_os_str());
+
+	let first = compile_run_source(&source, &binary, &library_root, &recipe_external, None)?;
+	let first_diagnostics = crate::source_frontend::DiagnosticStream::parse(&first.stderr);
+	let compile_status = if first.status.success() {
+		emit_compiler_output(&first.stdout, &first_diagnostics.original_rendering())?;
+		first.status
+	} else if let Some(rewrite) = crate::source_frontend::arity_rewrite(&source, &source_text, &first_diagnostics) {
+		let _ = fs::remove_file(&binary);
+		let transformed = TransformedRunSource::create(&source, sequence, rewrite.generated())?;
+		let second = compile_run_source(
+			transformed.path(),
+			&binary,
+			&library_root,
+			&recipe_external,
+			Some((&source, transformed.path())),
+		)?;
+		let second_diagnostics = crate::source_frontend::DiagnosticStream::parse(&second.stderr);
+		let rendering = second_diagnostics.mapped_rendering(&rewrite, transformed.path(), &source);
+		emit_compiler_output(&second.stdout, &rendering)?;
+		second.status
+	} else {
+		emit_compiler_output(&first.stdout, &first_diagnostics.original_rendering())?;
+		first.status
+	};
+	if !compile_status.success() {
+		let _ = fs::remove_file(&binary);
+		return Err(format!("rustc failed for {} with {compile_status}", source.display()));
 	}
-	let options = parse_probe_options(&arguments[1..])?;
-	run_probe(options)
+
+	let run_status = Command::new(&binary)
+		.args(arguments)
+		.current_dir(source_directory)
+		.status()
+		.map_err(|error| format!("run {}: {error}", source.display()));
+	let cleanup = fs::remove_file(&binary)
+		.map_err(|error| format!("remove compiled training binary {}: {error}", binary.display()));
+	let run_status = run_status?;
+	cleanup?;
+	if !run_status.success() {
+		return Err(format!("{} exited with {run_status}", source.display()));
+	}
+	Ok(())
+}
+
+fn compile_run_source(
+	source: &Path,
+	binary: &Path,
+	library_root: &Path,
+	recipe_external: &OsStr,
+	remap: Option<(&Path, &Path)>,
+) -> Result<Output, String> {
+	let mut compiler = Command::new("rustc");
+	compiler
+		.arg(source)
+		.args([
+			"--crate-name",
+			"recipe_run",
+			"--crate-type",
+			"bin",
+			"--edition",
+			"2024",
+			"--error-format=json",
+		])
+		.arg("-L")
+		.arg(library_root);
+	let dependencies = library_root.join("deps");
+	if dependencies.is_dir() {
+		compiler.arg("-L").arg(&dependencies);
+	}
+	if let Some((original, transformed)) = remap {
+		let mut mapping = transformed.as_os_str().to_owned();
+		mapping.push("=");
+		mapping.push(original.as_os_str());
+		compiler.arg("--remap-path-prefix").arg(mapping);
+	}
+	compiler
+		.arg("--extern")
+		.arg(recipe_external)
+		.arg("-o")
+		.arg(binary)
+		.output()
+		.map_err(|error| format!("start rustc for {}: {error}", source.display()))
+}
+
+fn emit_compiler_output(stdout: &[u8], diagnostics: &str) -> Result<(), String> {
+	std::io::stdout()
+		.write_all(stdout)
+		.map_err(|error| format!("write rustc standard output: {error}"))?;
+	std::io::stderr()
+		.write_all(diagnostics.as_bytes())
+		.map_err(|error| format!("write rustc diagnostics: {error}"))
+}
+
+struct TransformedRunSource {
+	path: PathBuf,
+}
+
+impl TransformedRunSource {
+	fn create(source: &Path, sequence: u64, contents: &str) -> Result<Self, String> {
+		let parent = source
+			.parent()
+			.ok_or_else(|| format!("training source {} has no parent directory", source.display()))?;
+		let file_name = source
+			.file_name()
+			.ok_or_else(|| format!("training source {} has no file name", source.display()))?;
+		let mut temporary_name = OsString::from(".");
+		temporary_name.push(file_name);
+		temporary_name.push(format!(".recipe-{}-{sequence}.rs", std::process::id()));
+		let path = parent.join(temporary_name);
+		let mut file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.mode(PRIVATE_FILE_MODE)
+			.custom_flags(O_CLOEXEC | O_NOFOLLOW)
+			.open(&path)
+			.map_err(|error| format!("create transformed Recipe source {}: {error}", path.display()))?;
+		if let Err(error) = file.write_all(contents.as_bytes()) {
+			let _ = fs::remove_file(&path);
+			return Err(format!("write transformed Recipe source {}: {error}", path.display()));
+		}
+		Ok(Self { path })
+	}
+
+	fn path(&self) -> &Path {
+		&self.path
+	}
+}
+
+impl Drop for TransformedRunSource {
+	fn drop(&mut self) {
+		let _ = fs::remove_file(&self.path);
+	}
+}
+
+fn locate_recipe_library() -> Result<(PathBuf, PathBuf), String> {
+	let executable = env::current_exe().map_err(|error| format!("locate recipe executable: {error}"))?;
+	let mut roots = Vec::new();
+	if let Some(parent) = executable.parent() {
+		roots.push(parent.to_path_buf());
+		if parent.file_name() == Some(OsStr::new("deps"))
+			&& let Some(profile) = parent.parent()
+		{
+			roots.push(profile.to_path_buf());
+		}
+	}
+	if let Ok(current) = env::current_dir() {
+		roots.push(current.join("target/debug"));
+		roots.push(current.join("target/release"));
+	}
+	roots.push(PathBuf::from("/usr/lib/recipe"));
+	for root in roots {
+		if let Some(library) = newest_recipe_library(&root) {
+			return Ok((root, library));
+		}
+	}
+	Err(
+		"librecipe.rlib is unavailable; build Recipe first or install its source-runner libraries under /usr/lib/recipe"
+			.to_owned(),
+	)
+}
+
+fn newest_recipe_library(root: &Path) -> Option<PathBuf> {
+	let dependencies = root.join("deps");
+	let newest = fs::read_dir(&dependencies).ok().and_then(|entries| {
+		entries
+			.filter_map(Result::ok)
+			.filter_map(|entry| {
+				let name = entry.file_name();
+				let name = name.as_bytes();
+				if !name.starts_with(b"librecipe-") || !name.ends_with(b".rlib") {
+					return None;
+				}
+				let metadata = entry.metadata().ok()?;
+				if !metadata.is_file() {
+					return None;
+				}
+				Some((metadata.modified().ok()?, entry.path()))
+			})
+			.max_by_key(|(modified, _)| *modified)
+			.map(|(_, path)| path)
+	});
+	newest.or_else(|| {
+		let library = root.join("librecipe.rlib");
+		library.is_file().then_some(library)
+	})
 }
 
 fn parse_probe_options(arguments: &[OsString]) -> Result<ProbeOptions, String> {

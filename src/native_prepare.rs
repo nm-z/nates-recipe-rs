@@ -1,4 +1,5 @@
 use core::fmt;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,10 @@ const HSA_TARGET_PREFIX: &str = "amdgcn-amd-amdhsa--";
 const CACHE_PREFIX: &str = "measured-v";
 const CACHE_SUFFIX: &str = ".recipe-profile";
 const HEX_DIGEST_BYTES: usize = 32;
+
+thread_local! {
+	static CURRENT_NATIVE_PROBE: RefCell<Option<(NativeProbeConfig, NativeGpuProbe)>> = const { RefCell::new(None) };
+}
 
 /// A failure before Recipe owns a finalized native execution session.
 #[derive(Debug)]
@@ -393,6 +398,8 @@ fn with_native_preparation_from_probe<T>(
 /// Resolve the exact current bare-metal cache identity produced by the
 /// zero-argument `recipe probe`, load that profile, and lend matching native
 /// bindings to one callback. This never selects a merely newest cache file.
+/// The thread retains its exact probe root so repeated training calls reuse
+/// one initialized GPU runtime while still rebuilding all per-run resources.
 pub fn with_current_native_preparation<T>(
 	operation: impl for<'cuda, 'hsa> FnOnce(
 		&MeasuredProfile,
@@ -408,13 +415,27 @@ pub fn with_current_native_preparation<T>(
 		.ok_or_else(|| NativePreparationError::ProfileNotFound {
 			path: current.profile_path.clone(),
 		})?;
-	with_native_preparation_from_probe(
-		&current.native,
-		&current.config,
-		&profile,
-		&current.host,
-		|scope| operation(&profile, &current.config, scope),
-	)
+	CURRENT_NATIVE_PROBE.with(|cached| {
+		let mut cached = cached.borrow_mut();
+		if let Some((config, _probe)) = cached.as_ref()
+			&& config != &current.config
+		{
+			return Err(NativePreparationError::IdentityMismatch {
+				detail: "current native configuration changed after this thread opened its GPU runtime"
+					.to_owned(),
+			});
+		}
+		if cached.is_none() {
+			*cached = Some((current.config.clone(), current.native));
+		}
+		let probe = &cached
+			.as_ref()
+			.expect("the current native probe cache was populated above")
+			.1;
+		with_native_preparation_from_probe(probe, &current.config, &profile, &current.host, |scope| {
+			operation(&profile, &current.config, scope)
+		})
+	})
 }
 
 fn cache_identity_from_path(path: &Path) -> NativePreparationResult<CacheIdentity> {

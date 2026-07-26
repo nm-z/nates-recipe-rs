@@ -3,6 +3,7 @@ use core::fmt;
 use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::image_header::{EncodedImageMetadata, inspect_encoded_image};
 use crate::semantic::{TemporalInstant, ordinal_vocabulary, parse_temporal_instant};
 use crate::{
 	AmbiguousVectorModel, InferredVector, InferredVectorList, RawTable, SemanticError, SemanticType, VectorEncoding,
@@ -328,12 +329,18 @@ pub enum VectorMetadata {
 		origin: TemporalOrigin,
 	},
 	Categorical {
-		/// Code `n` denotes `dictionary[n]`.
+		/// Known code `n` denotes `dictionary[n]`. Code `dictionary.len()`
+		/// is reserved for a nonempty value not observed in the fit partition.
 		dictionary: Vec<Vec<u8>>,
 	},
 	Ordinal {
 		/// Rank `n` denotes `ordered_labels[n]`.
 		ordered_labels: Vec<Vec<u8>>,
+	},
+	Image {
+		/// Exact, deterministic set of encoded headers observed in retained
+		/// nonmissing values. Multiple entries preserve mixed formats or shapes.
+		encoded_variants: Vec<EncodedImageMetadata>,
 	},
 }
 
@@ -416,7 +423,62 @@ pub struct PreparedVector {
 	values: PreparedValues,
 }
 
+/// Row-free semantic identity of one prepared source vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorSchema {
+	source_index: usize,
+	name: Vec<u8>,
+	role: VectorRole,
+	semantic_type: SemanticType,
+	encoding: VectorEncoding,
+	metadata: VectorMetadata,
+}
+
+impl VectorSchema {
+	#[must_use]
+	pub const fn source_index(&self) -> usize {
+		self.source_index
+	}
+
+	#[must_use]
+	pub fn name(&self) -> &[u8] {
+		&self.name
+	}
+
+	#[must_use]
+	pub const fn role(&self) -> VectorRole {
+		self.role
+	}
+
+	#[must_use]
+	pub const fn semantic_type(&self) -> SemanticType {
+		self.semantic_type
+	}
+
+	#[must_use]
+	pub const fn encoding(&self) -> VectorEncoding {
+		self.encoding
+	}
+
+	#[must_use]
+	pub const fn metadata(&self) -> &VectorMetadata {
+		&self.metadata
+	}
+}
+
 impl PreparedVector {
+	#[must_use]
+	pub fn schema(&self) -> VectorSchema {
+		VectorSchema {
+			source_index: self.source_index,
+			name: self.name.clone(),
+			role: self.role,
+			semantic_type: self.semantic_type,
+			encoding: self.encoding,
+			metadata: self.metadata.clone(),
+		}
+	}
+
 	#[must_use]
 	pub const fn source_index(&self) -> usize {
 		self.source_index
@@ -496,8 +558,8 @@ impl PreparedPartition {
 }
 
 /// Homogeneous, row-major projection requested explicitly from prepared
-/// vectors. Mixed scalar encodings, missing values, text, and images fail
-/// rather than being coerced or imputed.
+/// vectors. Mixed fixed-width numeric vectors use f32 only for exact integer
+/// conversions; missing values, text, images, and lossy conversions fail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseMatrix {
 	I32 {
@@ -572,13 +634,14 @@ impl PreparedDataset {
 	}
 
 	/// Materialize one role and partition as a homogeneous row-major matrix.
-	/// This is layout-only: no normalization, imputation, casting, or feature
-	/// derivation occurs.
+	/// No normalization, imputation, lossy casting, or feature derivation
+	/// occurs.
 	///
 	/// # Errors
 	///
-	/// Fails for variable-width vectors, mixed i32/f32 columns, missing values,
-	/// an absent role, or inconsistent internal lengths.
+	/// Mixed i32/f32 columns produce f32 only when every integer is exactly
+	/// representable. Variable-width vectors, lossy conversions, missing
+	/// values, an absent role, and inconsistent internal lengths fail closed.
 	pub fn fixed_dense_matrix(&self, role: VectorRole, partition: PartitionKind) -> PrepareResult<DenseMatrix> {
 		let vectors = self
 			.vectors
@@ -595,10 +658,18 @@ impl PreparedDataset {
 			PartitionKind::Train => &self.train,
 			PartitionKind::Validation => &self.validation,
 		};
-		match vectors[0].values {
-			PreparedValues::I32(_) => self.dense_i32(&vectors, partition),
-			PreparedValues::F32Bits(_) => self.dense_f32(&vectors, partition),
-			PreparedValues::VariableWidth(_) => Err(variable_dense_error(vectors[0])),
+		if let Some(vector) = vectors
+			.iter()
+			.find(|vector| matches!(vector.values, PreparedValues::VariableWidth(_)))
+		{
+			return Err(variable_dense_error(vector));
+		}
+		match vectors
+			.iter()
+			.all(|vector| matches!(vector.values, PreparedValues::I32(_)))
+		{
+			true => self.dense_i32(&vectors, partition),
+			false => self.dense_f32(&vectors, partition),
 		}
 	}
 
@@ -610,7 +681,9 @@ impl PreparedDataset {
 				let PreparedValues::I32(values) = &vector.values else {
 					return match vector.values {
 						PreparedValues::VariableWidth(_) => Err(variable_dense_error(vector)),
-						PreparedValues::F32Bits(_) => Err(mixed_dense_error(vector)),
+						PreparedValues::F32Bits(_) => {
+							unreachable!("dense_i32 is selected only for all-i32 vectors")
+						}
 						PreparedValues::I32(_) => unreachable!(),
 					};
 				};
@@ -633,17 +706,28 @@ impl PreparedDataset {
 		let mut output = Vec::with_capacity(capacity);
 		for position in &partition.retained_positions {
 			for vector in vectors {
-				let PreparedValues::F32Bits(values) = &vector.values else {
-					return match vector.values {
-						PreparedValues::VariableWidth(_) => Err(variable_dense_error(vector)),
-						PreparedValues::I32(_) => Err(mixed_dense_error(vector)),
-						PreparedValues::F32Bits(_) => unreachable!(),
-					};
+				let value = match &vector.values {
+					PreparedValues::F32Bits(values) => values
+						.get(*position)
+						.ok_or_else(|| inconsistent_vector_error(vector, *position))?
+						.ok_or_else(|| missing_dense_error(vector, self.source_row_at(*position)))?,
+					PreparedValues::I32(values) => {
+						let value = values
+							.get(*position)
+							.ok_or_else(|| inconsistent_vector_error(vector, *position))?
+							.ok_or_else(|| missing_dense_error(vector, self.source_row_at(*position)))?;
+						let converted = value as f32;
+						if f64::from(converted) != f64::from(value) {
+							return Err(mixed_dense_error(
+								vector,
+								self.source_row_at(*position),
+								value,
+							));
+						}
+						converted.to_bits()
+					}
+					PreparedValues::VariableWidth(_) => return Err(variable_dense_error(vector)),
 				};
-				let value = values
-					.get(*position)
-					.ok_or_else(|| inconsistent_vector_error(vector, *position))?
-					.ok_or_else(|| missing_dense_error(vector, self.source_row_at(*position)))?;
 				output.push(value);
 			}
 		}
@@ -786,6 +870,9 @@ pub fn prepare_inferred_table(
 			"row exclusions retained no source rows",
 		));
 	}
+	let train_rows = request
+		.train_fraction
+		.train_rows(retained_source_rows.len())?;
 	let vectors = inferred
 		.vectors()
 		.iter()
@@ -800,12 +887,10 @@ pub fn prepare_inferred_table(
 					VectorRole::Feature
 				},
 				&retained_source_rows,
+				train_rows,
 			)
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
-	let train_rows = request
-		.train_fraction
-		.train_rows(retained_source_rows.len())?;
 	let train = partition(PartitionKind::Train, 0..train_rows, &retained_source_rows);
 	let validation = partition(
 		PartitionKind::Validation,
@@ -1111,6 +1196,7 @@ fn encode_vector(
 	inferred: &InferredVector,
 	role: VectorRole,
 	retained_source_rows: &[usize],
+	train_rows: usize,
 ) -> PrepareResult<PreparedVector> {
 	let source_values = table
 		.rows()
@@ -1146,7 +1232,8 @@ fn encode_vector(
 			)
 		}
 		VectorEncoding::DictionaryI32 => {
-			let (dictionary, values) = encode_dictionary(inferred, retained_source_rows, &retained_values)?;
+			let (dictionary, values) =
+				encode_dictionary(inferred, retained_source_rows, &retained_values, train_rows)?;
 			(
 				VectorMetadata::Categorical { dictionary },
 				PreparedValues::I32(values),
@@ -1175,7 +1262,7 @@ fn encode_vector(
 				PreparedValues::I32(values),
 			)
 		}
-		VectorEncoding::Utf8 | VectorEncoding::Bytes => (
+		VectorEncoding::Utf8 => (
 			VectorMetadata::None,
 			PreparedValues::VariableWidth(encode_variable(
 				inferred,
@@ -1183,6 +1270,27 @@ fn encode_vector(
 				&retained_values,
 			)?),
 		),
+		VectorEncoding::Bytes => {
+			let metadata = if inferred.semantic_type() == SemanticType::Image {
+				VectorMetadata::Image {
+					encoded_variants: inspect_image_variants(
+						inferred,
+						retained_source_rows,
+						&retained_values,
+					)?,
+				}
+			} else {
+				VectorMetadata::None
+			};
+			(
+				metadata,
+				PreparedValues::VariableWidth(encode_variable(
+					inferred,
+					retained_source_rows,
+					&retained_values,
+				)?),
+			)
+		}
 	};
 	Ok(PreparedVector {
 		source_index: inferred.index(),
@@ -1316,9 +1424,11 @@ fn encode_dictionary(
 	inferred: &InferredVector,
 	source_rows: &[usize],
 	values: &[&[u8]],
+	train_rows: usize,
 ) -> PrepareResult<DictionaryEncoding> {
 	let dictionary = values
 		.iter()
+		.take(train_rows)
 		.copied()
 		.filter(|value| !value.is_empty())
 		.map(<[u8]>::to_vec)
@@ -1340,20 +1450,21 @@ fn encode_dictionary(
 				})
 		})
 		.collect::<PrepareResult<BTreeMap<_, _>>>()?;
+	let reserved_code = i32::try_from(dictionary.len()).map_err(|error| {
+		PrepareError::new(
+			PrepareErrorKind::EncodingFailure,
+			format!("categorical reserved code exceeds i32: {error}"),
+		)
+		.for_column(inferred.name())
+	})?;
 	let encoded = values
 		.iter()
 		.zip(source_rows)
-		.map(|(value, source_row)| {
+		.map(|(value, _source_row)| {
 			if value.is_empty() {
 				Ok(None)
 			} else {
-				codes.get(value).copied().map(Some).ok_or_else(|| {
-					encoding_error(
-						inferred,
-						*source_row,
-						"categorical value is absent from its own stable dictionary",
-					)
-				})
+				Ok(Some(codes.get(value).copied().unwrap_or(reserved_code)))
 			}
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
@@ -1420,6 +1531,37 @@ fn encode_variable(
 	})
 }
 
+fn inspect_image_variants(
+	inferred: &InferredVector,
+	source_rows: &[usize],
+	values: &[&[u8]],
+) -> PrepareResult<Vec<EncodedImageMetadata>> {
+	let variants = values
+		.iter()
+		.zip(source_rows)
+		.filter(|(value, _source_row)| !value.is_empty())
+		.map(|(value, source_row)| {
+			inspect_encoded_image(value).map_err(|error| {
+				encoding_error(
+					inferred,
+					*source_row,
+					format!("invalid encoded image header: {error}"),
+				)
+			})
+		})
+		.collect::<PrepareResult<BTreeSet<_>>>()?
+		.into_iter()
+		.collect::<Vec<_>>();
+	if variants.is_empty() {
+		return Err(PrepareError::new(
+			PrepareErrorKind::EncodingFailure,
+			"image vector has no retained nonmissing encoded image",
+		)
+		.for_column(inferred.name()));
+	}
+	Ok(variants)
+}
+
 fn encoding_error(inferred: &InferredVector, source_row: usize, error: impl fmt::Display) -> PrepareError {
 	PrepareError::new(
 		PrepareErrorKind::EncodingFailure,
@@ -1469,12 +1611,13 @@ fn variable_dense_error(vector: &PreparedVector) -> PrepareError {
 	.for_column(&vector.name)
 }
 
-fn mixed_dense_error(vector: &PreparedVector) -> PrepareError {
-	PrepareError::new(
+fn mixed_dense_error(vector: &PreparedVector, source_row: Option<usize>, value: i32) -> PrepareError {
+	let error = PrepareError::new(
 		PrepareErrorKind::MixedDenseEncoding,
-		"fixed dense projection does not cast between i32 and f32",
+		format!("int32 value {value} cannot be represented exactly in a mixed f32 dense matrix"),
 	)
-	.for_column(&vector.name)
+	.for_column(&vector.name);
+	source_row.map_or(error.clone(), |row| error.for_row(row))
 }
 
 fn missing_dense_error(vector: &PreparedVector, source_row: Option<usize>) -> PrepareError {
@@ -1546,6 +1689,33 @@ mod tests {
 		TrainFraction::new(3, 4).unwrap()
 	}
 
+	fn jpeg(width: u16, height: u16) -> Vec<u8> {
+		let mut bytes = b"\xff\xd8\xff\xe0\x00\x07JFIF\0\xff\xc0\x00\x11\x08".to_vec();
+		bytes.extend_from_slice(&height.to_be_bytes());
+		bytes.extend_from_slice(&width.to_be_bytes());
+		bytes.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+		bytes
+	}
+
+	fn gif(width: u16, height: u16) -> Vec<u8> {
+		let mut bytes = b"GIF89a".to_vec();
+		bytes.extend_from_slice(&width.to_le_bytes());
+		bytes.extend_from_slice(&height.to_le_bytes());
+		bytes.extend_from_slice(&[0, 0, 0]);
+		bytes
+	}
+
+	fn image_table(images: &[Vec<u8>]) -> RawTable {
+		let mut bytes = b"image,target\n".to_vec();
+		for (index, image) in images.iter().enumerate() {
+			bytes.extend_from_slice(image);
+			bytes.push(b',');
+			bytes.extend_from_slice(index.to_string().as_bytes());
+			bytes.push(b'\n');
+		}
+		table(&bytes, u64::try_from(images.len() + 1).unwrap())
+	}
+
 	#[test]
 	fn no_show_shaped_table_filters_before_split_and_preserves_source_vectors() {
 		let raw = table(
@@ -1592,7 +1762,7 @@ mod tests {
 	}
 
 	#[test]
-	fn semantic_encodings_are_stable_lossless_and_keep_one_vector_each() {
+	fn semantic_encodings_fit_categorical_state_on_train_rows_and_keep_one_vector_each() {
 		let raw = table(
 			b"integer,float,time,label,rank,prose,target\n\
 			-2,1.25,2024-01-02T00:00:00Z,zeta,low,\"first sentence with spaces\",yes\n\
@@ -1641,12 +1811,12 @@ mod tests {
 		assert_eq!(
 			category.metadata(),
 			&VectorMetadata::Categorical {
-				dictionary: vec![b"alpha".to_vec(), b"beta".to_vec(), b"zeta".to_vec()]
+				dictionary: vec![b"alpha".to_vec(), b"zeta".to_vec()]
 			}
 		);
 		assert_eq!(
 			category.values(),
-			&PreparedValues::I32(vec![Some(2), Some(0), Some(2), Some(1)])
+			&PreparedValues::I32(vec![Some(1), Some(0), Some(1), Some(2)])
 		);
 		assert_eq!(
 			prepared.vectors()[4].values(),
@@ -1705,6 +1875,41 @@ mod tests {
 				.kind,
 			PrepareErrorKind::MissingDenseValue
 		);
+	}
+
+	#[test]
+	fn dense_projection_combines_only_exact_mixed_numeric_values() {
+		let raw = table(b"float,count,target\n1.5,1,0\n2.5,2,1\n", 4);
+		let prepared = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		assert_eq!(
+			prepared
+				.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Train)
+				.unwrap(),
+			DenseMatrix::F32Bits {
+				rows: 1,
+				columns: 2,
+				values: vec![1.5f32.to_bits(), 1.0f32.to_bits()],
+			}
+		);
+
+		let lossy = table(b"float,count,target\n1.5,1,0\n2.5,16777217,1\n", 4);
+		let prepared = prepare_table(
+			&lossy,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		let error = prepared
+			.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Validation)
+			.unwrap_err();
+		assert_eq!(error.kind, PrepareErrorKind::MixedDenseEncoding);
+		assert_eq!(error.column.as_deref(), Some(b"count".as_slice()));
+		assert_eq!(error.source_row, Some(1));
 	}
 
 	#[test]
@@ -1865,12 +2070,14 @@ mod tests {
 
 	#[test]
 	fn temporal_offsets_are_lossless_or_rejected_and_images_remain_variable_width() {
-		let temporal = table(
-			b"time,image,target\n\
-			2024-01-01T00:00:00.125+01:00,\xff\xd8\xffone,0\n\
-			2024-01-01T00:00:01.125+01:00,\xff\xd8\xfftwo,1\n",
-			4,
-		);
+		let first = jpeg(23, 17);
+		let second = jpeg(23, 17);
+		let mut bytes = b"time,image,target\n2024-01-01T00:00:00.125+01:00,".to_vec();
+		bytes.extend_from_slice(&first);
+		bytes.extend_from_slice(b",0\n2024-01-01T00:00:01.125+01:00,");
+		bytes.extend_from_slice(&second);
+		bytes.extend_from_slice(b",1\n");
+		let temporal = table(&bytes, 4);
 		let prepared = prepare_table(
 			&temporal,
 			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
@@ -1894,6 +2101,10 @@ mod tests {
 			prepared.vectors()[1].values(),
 			PreparedValues::VariableWidth(_)
 		));
+		assert!(matches!(
+			prepared.vectors()[1].metadata(),
+			VectorMetadata::Image { encoded_variants } if encoded_variants.len() == 1
+		));
 
 		let lossy = table(
 			b"time,target\n2024-01-01T00:00:00.1Z,0\n2024-01-01T00:00:01.2Z,1\n",
@@ -1909,6 +2120,92 @@ mod tests {
 			.kind,
 			PrepareErrorKind::EncodingFailure
 		);
+	}
+
+	#[test]
+	fn mixed_image_shapes_remain_encoded_and_clone_into_vector_schema() {
+		let images = [jpeg(23, 17), jpeg(29, 19)];
+		let raw = image_table(&images);
+		let prepared = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		let image = &prepared.vectors()[0];
+		let VectorMetadata::Image { encoded_variants } = image.metadata() else {
+			panic!("image vector must retain encoded header metadata");
+		};
+		assert_eq!(encoded_variants.len(), 2);
+		assert_eq!(
+			encoded_variants
+				.iter()
+				.map(|variant| (variant.width(), variant.height()))
+				.collect::<Vec<_>>(),
+			[(23, 17), (29, 19)]
+		);
+		assert!(encoded_variants.iter().all(|variant| {
+			variant.format() == crate::EncodedImageFormat::Jpeg
+				&& variant.channels() == Some(3)
+				&& variant.color_model() == Some(crate::ImageColorModel::YCbCr)
+				&& variant.sample_bits() == Some(8)
+				&& variant.value_layout() == crate::ImageValueLayout::EncodedFile
+				&& variant.value_range() == crate::ImageValueRange::EncodedBytes
+		}));
+		let PreparedValues::VariableWidth(values) = image.values() else {
+			panic!("encoded image bytes must remain variable-width");
+		};
+		assert_eq!(values.value(0), Some(Some(images[0].as_slice())));
+		assert_eq!(values.value(1), Some(Some(images[1].as_slice())));
+
+		let schema = image.schema();
+		let cloned = schema.clone();
+		assert_eq!(cloned, schema);
+		assert_eq!(schema.source_index(), 0);
+		assert_eq!(schema.name(), b"image");
+		assert_eq!(schema.role(), VectorRole::Feature);
+		assert_eq!(schema.semantic_type(), SemanticType::Image);
+		assert_eq!(schema.encoding(), VectorEncoding::Bytes);
+		assert_eq!(schema.metadata(), image.metadata());
+	}
+
+	#[test]
+	fn mixed_image_formats_are_retained_as_distinct_schema_variants() {
+		let raw = image_table(&[jpeg(23, 17), gif(31, 19)]);
+		let prepared = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap();
+		let VectorMetadata::Image { encoded_variants } = prepared.vectors()[0].metadata() else {
+			panic!("image vector must retain encoded header metadata");
+		};
+		assert_eq!(
+			encoded_variants
+				.iter()
+				.map(|variant| (variant.format(), variant.width(), variant.height()))
+				.collect::<Vec<_>>(),
+			[
+				(crate::EncodedImageFormat::Jpeg, 23, 17),
+				(crate::EncodedImageFormat::Gif89a, 31, 19),
+			]
+		);
+	}
+
+	#[test]
+	fn truncated_image_header_reports_its_source_vector_and_row() {
+		let raw = image_table(&[b"\xff\xd8\xff".to_vec(), jpeg(23, 17)]);
+		let error = prepare_table(
+			&raw,
+			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
+			&CategoricalEncodingModel,
+		)
+		.unwrap_err();
+		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
+		assert_eq!(error.column.as_deref(), Some(b"image".as_slice()));
+		assert_eq!(error.source_row, Some(0));
+		assert!(error.detail.contains("invalid encoded image header"));
 	}
 
 	#[test]

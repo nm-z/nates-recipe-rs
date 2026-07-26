@@ -96,6 +96,27 @@ pub struct RawTable {
 }
 
 impl RawTable {
+	pub(crate) fn from_parts(headers: Vec<Vec<u8>>, rows: Vec<Vec<Vec<u8>>>) -> IngestResult<Self> {
+		for (index, row) in rows.iter().enumerate() {
+			if row.len() != headers.len() {
+				return Err(IngestError::new(
+					IngestErrorKind::InconsistentWidth,
+					format!(
+						"record {} has {} fields, expected {}",
+						index + 1,
+						row.len(),
+						headers.len()
+					),
+				));
+			}
+		}
+		Ok(Self {
+			delimiter: Delimiter::Auto,
+			headers,
+			rows,
+		})
+	}
+
 	#[must_use]
 	pub const fn delimiter(&self) -> Delimiter {
 		self.delimiter

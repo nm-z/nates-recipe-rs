@@ -1,4 +1,4 @@
-use std::fmt;
+use std::cell::RefCell;
 
 pub mod cli {
 	include!("cli.rs");
@@ -130,15 +130,129 @@ pub struct Recipe;
 )]
 pub static recipe: Recipe = Recipe;
 
+#[derive(Default)]
+struct RecipeSequence {
+	data: Option<Data>,
+	model: Option<Model>,
+}
+
+thread_local! {
+	static RECIPE_SEQUENCE: RefCell<RecipeSequence> = RefCell::new(RecipeSequence::default());
+}
+
+fn begin_recipe_data(data: Data) {
+	RECIPE_SEQUENCE.with(|sequence| {
+		let mut sequence = sequence.borrow_mut();
+		sequence.data = Some(data);
+		sequence.model = None;
+	});
+}
+
+pub(crate) fn remember_recipe_data(data: Data) {
+	RECIPE_SEQUENCE.with(|sequence| sequence.borrow_mut().data = Some(data));
+}
+
+fn begin_recipe_model(model: Model) {
+	RECIPE_SEQUENCE.with(|sequence| sequence.borrow_mut().model = Some(model));
+}
+
+pub(crate) fn remember_recipe_model(model: Model) {
+	RECIPE_SEQUENCE.with(|sequence| sequence.borrow_mut().model = Some(model));
+}
+
+pub(crate) fn take_recipe_sequence() -> Result<(Data, Model), &'static str> {
+	RECIPE_SEQUENCE.with(|sequence| {
+		let mut sequence = sequence.borrow_mut();
+		let data = sequence
+			.data
+			.clone()
+			.ok_or("recipe.train().run() requires a preceding recipe.data(...) declaration")?;
+		let model = sequence
+			.model
+			.clone()
+			.ok_or("recipe.train().run() requires a preceding recipe.model() declaration")?;
+		sequence.data = None;
+		sequence.model = None;
+		Ok((data, model))
+	})
+}
+
+trait IntoDataSources {
+	fn into_data_sources(self) -> Vec<String>;
+}
+
+impl IntoDataSources for () {
+	fn into_data_sources(self) -> Vec<String> {
+		Vec::new()
+	}
+}
+
+impl IntoDataSources for &str {
+	fn into_data_sources(self) -> Vec<String> {
+		vec![self.to_owned()]
+	}
+}
+
+impl IntoDataSources for String {
+	fn into_data_sources(self) -> Vec<String> {
+		vec![self]
+	}
+}
+
+impl IntoDataSources for &String {
+	fn into_data_sources(self) -> Vec<String> {
+		vec![self.clone()]
+	}
+}
+
+impl<S, const N: usize> IntoDataSources for [S; N]
+where
+	S: AsRef<str>,
+{
+	fn into_data_sources(self) -> Vec<String> {
+		self.into_iter()
+			.map(|source| source.as_ref().to_owned())
+			.collect()
+	}
+}
+
+impl<S> IntoDataSources for Vec<S>
+where
+	S: AsRef<str>,
+{
+	fn into_data_sources(self) -> Vec<String> {
+		self.into_iter()
+			.map(|source| source.as_ref().to_owned())
+			.collect()
+	}
+}
+
+impl<S> IntoDataSources for &[S]
+where
+	S: AsRef<str>,
+{
+	fn into_data_sources(self) -> Vec<String> {
+		self.iter()
+			.map(|source| source.as_ref().to_owned())
+			.collect()
+	}
+}
+
 impl Recipe {
-	#[must_use]
-	pub fn data(&self, path: &str) -> Data {
-		Data::load(path)
+	#[allow(private_bounds)]
+	pub fn data(&self, sources: impl IntoDataSources) -> Data {
+		let mut data = Data::empty();
+		for source in sources.into_data_sources() {
+			data = data.set(&source);
+		}
+		begin_recipe_data(data.clone());
+		data
 	}
 
-	#[must_use]
-	pub const fn model(&self) -> Model {
-		Model::new()
+	pub fn model(&self) -> Model {
+		let model = Model::new();
+		begin_recipe_model(model.clone());
+		model
 	}
 
 	#[must_use]
@@ -150,28 +264,4 @@ impl Recipe {
 	pub const fn infer(&self) -> Infer {
 		Infer::new()
 	}
-}
-
-pub fn block(content: impl fmt::Display) {
-	eprintln!("{content}");
-}
-
-#[must_use]
-pub fn data(path: &str) -> Data {
-	Data::load(path)
-}
-
-#[must_use]
-pub const fn model() -> Model {
-	Model::new()
-}
-
-#[must_use]
-pub const fn train() -> Train {
-	Train::new()
-}
-
-#[must_use]
-pub const fn infer() -> Infer {
-	Infer::new()
 }

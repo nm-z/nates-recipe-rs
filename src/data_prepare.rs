@@ -1,9 +1,9 @@
 use core::fmt;
 
 use recipe_ingest::{
-	CategoricalEncodingModel, ColumnPattern, ComparisonOperator as IngestComparisonOperator, Delimiter, HeaderMode,
+	CategoricalEncodingModel, ColumnPattern, ComparisonOperator as IngestComparisonOperator, DatasetSourceError,
 	IngestError, IngestLimits, PredicateLiteral, PreparationRequest, PrepareError, PreparedDataset, RowPredicate,
-	TableRequest, TrainFraction, prepare_table, read_table,
+	SemanticError, TrainFraction, distill_datasets, prepare_inferred_table,
 };
 
 use crate::api::{ComparisonOperator, Condition, ConditionValue, Data, DeclarationError};
@@ -22,12 +22,12 @@ pub const DEFAULT_DATA_FIELD_BYTES: u64 = 16 << 20;
 #[non_exhaustive]
 pub enum DataPreparationError {
 	Declaration(DeclarationError),
-	UnsupportedSourceCount { count: usize },
-	UnsupportedTestSource { path: String },
 	MissingTargets,
 	MissingSplit,
 	FloatPredicateOutsideF32 { column: String, value: f64 },
 	Ingest(IngestError),
+	Source(DatasetSourceError),
+	Semantic(SemanticError),
 	Prepare(PrepareError),
 }
 
@@ -35,14 +35,6 @@ impl fmt::Display for DataPreparationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Declaration(error) => write!(formatter, "invalid data declaration: {error}"),
-			Self::UnsupportedSourceCount { count } => write!(
-				formatter,
-				"one PreparedDataset requires exactly one data source, but the declaration contains {count}"
-			),
-			Self::UnsupportedTestSource { path } => write!(
-				formatter,
-				"a separate test source cannot be represented by PreparedDataset: {path}"
-			),
 			Self::MissingTargets => write!(
 				formatter,
 				"dataset preparation requires at least one target vector"
@@ -56,6 +48,8 @@ impl fmt::Display for DataPreparationError {
 				"predicate for column {column:?} cannot be represented as a finite, non-underflowing f32: {value}"
 			),
 			Self::Ingest(error) => write!(formatter, "load data source: {error}"),
+			Self::Source(error) => write!(formatter, "distill data source: {error}"),
+			Self::Semantic(error) => write!(formatter, "infer data vectors: {error}"),
 			Self::Prepare(error) => write!(formatter, "prepare data source: {error}"),
 		}
 	}
@@ -66,10 +60,10 @@ impl std::error::Error for DataPreparationError {
 		match self {
 			Self::Declaration(error) => Some(error),
 			Self::Ingest(error) => Some(error),
+			Self::Source(error) => Some(error),
+			Self::Semantic(error) => Some(error),
 			Self::Prepare(error) => Some(error),
-			Self::UnsupportedSourceCount { .. }
-			| Self::UnsupportedTestSource { .. }
-			| Self::MissingTargets
+			Self::MissingTargets
 			| Self::MissingSplit
 			| Self::FloatPredicateOutsideF32 { .. } => None,
 		}
@@ -80,10 +74,11 @@ pub type DataPreparationResult<T> = Result<T, DataPreparationError>;
 
 /// Load and prepare one public data declaration with finite default bounds.
 ///
-/// CSV and TSV framing is selected from the source contents. The first record
-/// is the header. Preparation preserves one output vector per retained source
-/// vector and performs no feature generation, imputation, normalization, or
-/// scalar encoding conversion.
+/// Files, recursively discovered directories, and ZIP containers are
+/// distilled into one rectangular list of vectors. Known container structure
+/// is retained as ordinary semantic vectors; ambiguous textual vectors are passed
+/// through the configured semantic model. Preparation performs no imputation,
+/// normalization, or lossy scalar conversion.
 ///
 /// # Errors
 ///
@@ -112,16 +107,6 @@ pub fn prepare_data(data: &Data) -> DataPreparationResult<PreparedDataset> {
 /// [`prepare_data`].
 pub fn prepare_data_with_limits(data: &Data, limits: IngestLimits) -> DataPreparationResult<PreparedDataset> {
 	data.validate().map_err(DataPreparationError::Declaration)?;
-	if data.sources().len() != 1 {
-		return Err(DataPreparationError::UnsupportedSourceCount {
-			count: data.sources().len(),
-		});
-	}
-	if let Some(path) = data.test_source() {
-		return Err(DataPreparationError::UnsupportedTestSource {
-			path: path.to_owned(),
-		});
-	}
 	if data.targets().is_empty() {
 		return Err(DataPreparationError::MissingTargets);
 	}
@@ -147,12 +132,12 @@ pub fn prepare_data_with_limits(data: &Data, limits: IngestLimits) -> DataPrepar
 	)
 	.exclude_columns(excluded_columns)
 	.exclude_rows(excluded_rows);
-	let table = read_table(
-		std::path::Path::new(data.source()),
-		TableRequest::new(Delimiter::Auto, HeaderMode::Present, limits),
-	)
-	.map_err(DataPreparationError::Ingest)?;
-	prepare_table(&table, &request, &CategoricalEncodingModel).map_err(DataPreparationError::Prepare)
+	let distilled = distill_datasets(data.sources().iter().map(std::path::Path::new), limits)
+		.map_err(DataPreparationError::Source)?;
+	let inferred = distilled
+		.infer_vectors(&CategoricalEncodingModel)
+		.map_err(DataPreparationError::Semantic)?;
+	prepare_inferred_table(distilled.table(), &inferred, &request).map_err(DataPreparationError::Prepare)
 }
 
 fn map_condition(condition: &Condition) -> DataPreparationResult<RowPredicate> {

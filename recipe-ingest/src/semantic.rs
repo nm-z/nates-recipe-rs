@@ -1,6 +1,7 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
+use crate::image_header::has_recognized_image_signature;
 use crate::{RawTable, parse_contract_f32, parse_contract_i32};
 
 /// Recipe's exhaustive semantic classification for digitally stored,
@@ -13,6 +14,7 @@ pub enum SemanticType {
 	Ordinal,
 	Text,
 	Image,
+	Binary,
 }
 
 /// Smallest calculation-facing representation that preserves the source
@@ -204,6 +206,19 @@ impl InferredVectorList {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VectorSemantic {
+	pub semantic_type: SemanticType,
+	pub encoding: VectorEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VectorSemanticRule {
+	Infer,
+	Classify,
+	Exact(VectorSemantic),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SemanticErrorKind {
 	InconsistentWidth,
@@ -242,6 +257,14 @@ pub type SemanticResult<T> = Result<T, SemanticError>;
 /// remaining vector is classified from its complete value list and smallest
 /// lossless dictionary/UTF-8 representation.
 pub fn infer_table_vectors(table: &RawTable, model: &impl AmbiguousVectorModel) -> SemanticResult<InferredVectorList> {
+	infer_table_vectors_with_semantics(table, model, &[])
+}
+
+pub(crate) fn infer_table_vectors_with_semantics(
+	table: &RawTable,
+	model: &impl AmbiguousVectorModel,
+	semantics: &[VectorSemanticRule],
+) -> SemanticResult<InferredVectorList> {
 	let width = table.width();
 	for (row_index, row) in table.rows().iter().enumerate() {
 		if row.len() != width {
@@ -262,7 +285,18 @@ pub fn infer_table_vectors(table: &RawTable, model: &impl AmbiguousVectorModel) 
 			.map(|row| row[index].as_slice())
 			.collect::<Vec<_>>();
 		let evidence = collect_evidence(&values)?;
-		let (semantic_type, encoding) = classify_vector(&values, evidence, model);
+		let (semantic_type, encoding) = match semantics
+			.get(index)
+			.copied()
+			.unwrap_or(VectorSemanticRule::Infer)
+		{
+			VectorSemanticRule::Infer => classify_vector(&values, evidence, model),
+			VectorSemanticRule::Classify => {
+				let semantic_type = model.classify(evidence);
+				(semantic_type, encoding_for(semantic_type))
+			}
+			VectorSemanticRule::Exact(semantic) => (semantic.semantic_type, semantic.encoding),
+		};
 		let name = table
 			.headers()
 			.get(index)
@@ -310,15 +344,20 @@ fn classify_vector(
 		return (SemanticType::Numeric, VectorEncoding::F32);
 	}
 	let semantic_type = model.classify(evidence);
-	let encoding = match semantic_type {
+	let encoding = encoding_for(semantic_type);
+	(semantic_type, encoding)
+}
+
+const fn encoding_for(semantic_type: SemanticType) -> VectorEncoding {
+	match semantic_type {
 		SemanticType::Categorical => VectorEncoding::DictionaryI32,
 		SemanticType::Text => VectorEncoding::Utf8,
 		SemanticType::Numeric => VectorEncoding::F32,
 		SemanticType::Temporal => VectorEncoding::RelativeSecondsI32,
 		SemanticType::Ordinal => VectorEncoding::OrdinalI32,
 		SemanticType::Image => VectorEncoding::Bytes,
-	};
-	(semantic_type, encoding)
+		SemanticType::Binary => VectorEncoding::Bytes,
+	}
 }
 
 fn collect_evidence(values: &[&[u8]]) -> SemanticResult<VectorEvidence> {
@@ -408,12 +447,7 @@ fn ratio_per_thousand(numerator: usize, denominator: usize) -> u16 {
 }
 
 fn is_image_value(value: &[u8]) -> bool {
-	value.starts_with(b"\x89PNG\r\n\x1a\n")
-		|| value.starts_with(b"\xff\xd8\xff")
-		|| value.starts_with(b"GIF87a")
-		|| value.starts_with(b"GIF89a")
-		|| value.starts_with(b"BM")
-		|| value.starts_with(b"RIFF") && value.get(8..12) == Some(b"WEBP")
+	has_recognized_image_signature(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -599,7 +633,7 @@ mod tests {
 	}
 
 	#[test]
-	fn infers_all_six_exhaustive_semantic_types() {
+	fn infers_all_nonbinary_table_semantic_types() {
 		let raw = table(b"number,time,category,rank,prose,picture\n\
 			1,2024-02-29T12:00:00Z,red,low,\"a sentence with several spaces\",\xff\xd8\xffone\n\
 			2,2024-03-01T12:00:00Z,blue,medium,\"another sentence with several spaces\",\xff\xd8\xfftwo\n\

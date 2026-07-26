@@ -11,7 +11,11 @@
 //! model-format parsers expose validated encoded spans without decoding their
 //! calculation payloads on the CPU.
 
+mod dataset;
+mod gguf;
 mod image;
+mod image_header;
+mod inference;
 mod numeric;
 mod prepare;
 mod safetensors;
@@ -19,8 +23,22 @@ mod semantic;
 mod source;
 mod table;
 
+pub use dataset::{
+	DatasetSourceError, DatasetSourceErrorKind, DatasetSourceResult, DistilledDataset, SourceFormat, distill_dataset,
+	distill_datasets,
+};
+pub use gguf::{
+	GgufArchive, GgufEndian, GgufError, GgufErrorKind, GgufLimits, GgufMetadataArray, GgufMetadataEntry,
+	GgufMetadataType, GgufMetadataValue, GgufResult, GgufTensor, GgufTensorType, parse_gguf,
+};
 pub use image::{
 	ExternalValue, ImagePackError, ImagePackErrorKind, ImagePackResult, PackedInitImage, pack_init_images,
+};
+pub use image_header::{EncodedImageFormat, EncodedImageMetadata, ImageColorModel, ImageValueLayout, ImageValueRange};
+pub use inference::{
+	InferenceDataPath, InferenceFeatureEncoding, InferenceFeatureSchema, InferencePrepareError,
+	InferencePrepareErrorKind, InferencePrepareResult, PreparedInferenceDataset, PreparedInferenceFeature,
+	PreparedInferenceValues, prepare_inference_table,
 };
 pub use numeric::{
 	DecimalError, DecimalErrorKind, F32_GUARANTEED_SIGNIFICANT_DIGITS, F32Decimal, I32_GUARANTEED_SIGNIFICANT_DIGITS,
@@ -30,7 +48,7 @@ pub use prepare::{
 	ColumnPattern, ComparisonOperator, DenseMatrix, PartitionKind, PredicateLiteral, PreparationRequest,
 	PrepareError, PrepareErrorKind, PrepareResult, PreparedDataset, PreparedPartition, PreparedValues,
 	PreparedVector, RowPredicate, TemporalOrigin, TrainFraction, VariableWidthVector, VectorMetadata, VectorRole,
-	prepare_inferred_table, prepare_table,
+	VectorSchema, prepare_inferred_table, prepare_table,
 };
 pub use safetensors::{
 	SafeTensorArchive, SafeTensorDType, SafeTensorEntry, SafeTensorError, SafeTensorErrorKind, SafeTensorLimits,

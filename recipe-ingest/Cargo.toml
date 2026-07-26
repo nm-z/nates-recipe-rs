@@ -6,11 +6,14 @@ license = "MIT"
 description = "Dependency-clean external representation and framing for Recipe"
 
 [dependencies]
+calamine = "0.36"
 csv = "1"
+quick-xml = "0.41"
 recipe-core = { path = "../recipe-core" }
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [lints.rust]
 unsafe_code = "forbid"

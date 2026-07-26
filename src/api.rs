@@ -9,6 +9,7 @@ pub enum DeclarationErrorKind {
 	InvalidSplit,
 	InvalidLayer,
 	InvalidActivation,
+	InvalidBayes,
 	InvalidLearningRate,
 	InvalidMetric,
 	InvalidTrainingConfiguration,
@@ -180,7 +181,11 @@ pub struct Condition {
 
 impl Condition {
 	#[must_use]
-	pub fn new(column: impl Into<String>, operator: ComparisonOperator, value: impl IntoConditionValue) -> Self {
+	pub(crate) fn new(
+		column: impl Into<String>,
+		operator: ComparisonOperator,
+		value: impl IntoConditionValue,
+	) -> Self {
 		Self {
 			column: column.into(),
 			operator,
@@ -220,47 +225,58 @@ impl Condition {
 	}
 }
 
+/// Implementation detail for the exported [`cond!`] macro.
+#[doc(hidden)]
+#[must_use]
+pub fn __condition(
+	column: impl Into<String>,
+	operator: ComparisonOperator,
+	value: impl IntoConditionValue,
+) -> Condition {
+	Condition::new(column, operator, value)
+}
+
 /// Construct a typed row-exclusion predicate without evaluating the column as
 /// a Rust identifier.
 #[macro_export]
 macro_rules! cond {
 	($column:ident <= $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::LessOrEqual,
 			$value,
 		)
 	};
 	($column:ident >= $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::GreaterOrEqual,
 			$value,
 		)
 	};
 	($column:ident == $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::Equal,
 			$value,
 		)
 	};
 	($column:ident != $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::NotEqual,
 			$value,
 		)
 	};
 	($column:ident < $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::Less,
 			$value,
 		)
 	};
 	($column:ident > $value:expr) => {
-		$crate::Condition::new(
+		$crate::__condition(
 			stringify!($column),
 			$crate::ComparisonOperator::Greater,
 			$value,
@@ -330,6 +346,20 @@ impl IntoExclusions for Vec<Exclusion> {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataNormalization {
+	ZScore,
+	MinMax,
+	L2Norm,
+}
+
+#[allow(non_upper_case_globals)]
+pub const z_score: DataNormalization = DataNormalization::ZScore;
+#[allow(non_upper_case_globals)]
+pub const min_max: DataNormalization = DataNormalization::MinMax;
+#[allow(non_upper_case_globals)]
+pub const l2_norm: DataNormalization = DataNormalization::L2Norm;
+
 /// Immutable data-ingestion declaration.
 ///
 /// Construction records paths and preprocessing policy only. Filesystem reads,
@@ -339,29 +369,26 @@ impl IntoExclusions for Vec<Exclusion> {
 pub struct Data {
 	sources: Vec<String>,
 	targets: Vec<String>,
-	test_source: Option<String>,
 	exclusions: Vec<String>,
 	condition_exclusions: Vec<Condition>,
 	split_fraction_bits: Option<u32>,
+	normalization: Option<DataNormalization>,
 	deferred: Option<DeclarationError>,
 }
 
 impl Data {
-	#[must_use]
-	pub fn load(path: &str) -> Self {
+	pub(crate) const fn empty() -> Self {
 		Self {
 			sources: Vec::new(),
 			targets: Vec::new(),
-			test_source: None,
 			exclusions: Vec::new(),
 			condition_exclusions: Vec::new(),
 			split_fraction_bits: None,
+			normalization: None,
 			deferred: None,
 		}
-		.set(path)
 	}
 
-	#[must_use]
 	pub fn set(mut self, path: &str) -> Self {
 		if path.is_empty() {
 			self.defer(
@@ -371,10 +398,10 @@ impl Data {
 		} else {
 			self.sources.push(path.to_owned());
 		}
+		crate::remember_recipe_data(self.clone());
 		self
 	}
 
-	#[must_use]
 	pub fn target(mut self, targets: impl IntoTargets) -> Self {
 		let targets = targets.into_targets();
 		if targets.is_empty() || targets.iter().any(String::is_empty) {
@@ -385,23 +412,10 @@ impl Data {
 		} else {
 			self.targets = targets;
 		}
+		crate::remember_recipe_data(self.clone());
 		self
 	}
 
-	#[must_use]
-	pub fn test(mut self, path: &str) -> Self {
-		if path.is_empty() {
-			self.defer(
-				DeclarationErrorKind::EmptyValue,
-				"test source path is empty",
-			);
-		} else {
-			self.test_source = Some(path.to_owned());
-		}
-		self
-	}
-
-	#[must_use]
 	pub fn exclude(mut self, exclusions: impl IntoExclusions) -> Self {
 		let exclusions = exclusions.into_exclusions();
 		if exclusions.is_empty() {
@@ -423,13 +437,18 @@ impl Data {
 				},
 			}
 		}
+		crate::remember_recipe_data(self.clone());
 		self
 	}
 
-	#[must_use]
 	pub fn split(mut self, train_fraction: f64) -> Self {
 		let narrowed = train_fraction as f32;
-		if !train_fraction.is_finite() || !(0.0..1.0).contains(&train_fraction) || !(0.0..1.0).contains(&narrowed) {
+		if !train_fraction.is_finite()
+			|| train_fraction <= 0.0
+			|| train_fraction >= 1.0
+			|| narrowed <= 0.0
+			|| narrowed >= 1.0
+		{
 			self.defer(
 				DeclarationErrorKind::InvalidSplit,
 				format!("split fraction must be finite and in (0, 1), got {train_fraction}"),
@@ -437,10 +456,17 @@ impl Data {
 		} else {
 			self.split_fraction_bits = Some(narrowed.to_bits());
 		}
+		crate::remember_recipe_data(self.clone());
 		self
 	}
 
-	pub fn validate(&self) -> DeclarationResult<()> {
+	pub fn norm(mut self, normalization: DataNormalization) -> Self {
+		self.normalization = Some(normalization);
+		crate::remember_recipe_data(self.clone());
+		self
+	}
+
+	pub(crate) fn validate(&self) -> DeclarationResult<()> {
 		if let Some(error) = &self.deferred {
 			return Err(error.clone());
 		}
@@ -469,11 +495,6 @@ impl Data {
 	}
 
 	#[must_use]
-	pub fn test_source(&self) -> Option<&str> {
-		self.test_source.as_deref()
-	}
-
-	#[must_use]
 	pub fn exclusions(&self) -> &[String] {
 		&self.exclusions
 	}
@@ -488,6 +509,11 @@ impl Data {
 		self.split_fraction_bits.map(f32::from_bits)
 	}
 
+	#[must_use]
+	pub const fn normalization(&self) -> Option<DataNormalization> {
+		self.normalization
+	}
+
 	fn defer(&mut self, kind: DeclarationErrorKind, detail: impl Into<String>) {
 		if self.deferred.is_none() {
 			self.deferred = Some(DeclarationError::new(kind, detail));
@@ -499,6 +525,11 @@ impl Data {
 pub enum Activation {
 	#[default]
 	Linear,
+	Cosine,
+	Exponential,
+	Logarithm,
+	Huber,
+	Tangent,
 	Relu,
 	LeakyRelu,
 	Sigmoid,
@@ -510,17 +541,232 @@ pub enum Activation {
 	PRelu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerNormalization {
+	LayerNorm,
+	BatchNorm,
+}
+
+#[allow(non_upper_case_globals)]
+pub const layer_norm: LayerNormalization = LayerNormalization::LayerNorm;
+#[allow(non_upper_case_globals)]
+pub const batch_norm: LayerNormalization = LayerNormalization::BatchNorm;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerOperation {
+	Activation(Activation),
+	Normalization(LayerNormalization),
+}
+
+/// One operation inside a residual branch, retained in declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualOperation {
+	Layer { width: usize },
+	Activation(Activation),
+}
+
+/// The shortcut rule implied by a residual branch's declared output width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualSkip {
+	IdentityOrLinearProjection,
+}
+
+/// Declare a dense operation inside a residual branch.
+#[must_use]
+pub const fn layer(width: usize) -> ResidualOperation {
+	ResidualOperation::Layer { width }
+}
+
+/// Declare a ReLU operation inside a residual branch.
+#[must_use]
+pub const fn relu() -> ResidualOperation {
+	ResidualOperation::Activation(Activation::Relu)
+}
+
+trait IntoResidualBranch {
+	fn into_residual_branch(self) -> Vec<ResidualOperation>;
+}
+
+impl IntoResidualBranch for ResidualOperation {
+	fn into_residual_branch(self) -> Vec<ResidualOperation> {
+		vec![self]
+	}
+}
+
+impl<const N: usize> IntoResidualBranch for [ResidualOperation; N] {
+	fn into_residual_branch(self) -> Vec<ResidualOperation> {
+		self.into_iter().collect()
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForestBooster {
+	Lgbm { depth: usize },
+	Cbst { depth: usize },
+	Xgbst { depth: usize },
+}
+
+impl ForestBooster {
+	const fn depth(&self) -> usize {
+		match self {
+			Self::Lgbm { depth } | Self::Cbst { depth } | Self::Xgbst { depth } => *depth,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupCount {
+	Derived,
+	Exact(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupToNeuronRouting {
+	Identity {
+		width: usize,
+	},
+	Expand {
+		groups: usize,
+		neurons: usize,
+		neurons_per_group: usize,
+	},
+	Contract {
+		groups: usize,
+		neurons: usize,
+		groups_per_neuron: usize,
+	},
+	FullyConnected {
+		groups: usize,
+		neurons: usize,
+	},
+}
+
+/// Connection from an immediately preceding grouped block into a dense layer.
+///
+/// Pooling derives the number of output groups from its input shape. K-means
+/// knows the exact group count from its cluster declaration. Once that count is
+/// resolved, [`Self::routing`] yields the shared contiguous or fully connected
+/// routing rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupToNeuronConnection {
+	groups: GroupCount,
+	neurons: usize,
+}
+
+impl GroupToNeuronConnection {
+	#[must_use]
+	pub const fn groups(&self) -> GroupCount {
+		self.groups
+	}
+
+	#[must_use]
+	pub const fn neurons(&self) -> usize {
+		self.neurons
+	}
+
+	/// Resolve routing after the grouped block's actual output count is known.
+	///
+	/// Expansion and contraction use contiguous ranges. Non-divisible widths use
+	/// ordinary full connectivity. An exact group declaration returns `None` if
+	/// `groups` disagrees with it.
+	#[must_use]
+	pub fn routing(&self, groups: usize) -> Option<GroupToNeuronRouting> {
+		if groups == 0 || self.neurons == 0 {
+			return None;
+		}
+		if let GroupCount::Exact(expected) = self.groups
+			&& groups != expected
+		{
+			return None;
+		}
+		if groups == self.neurons {
+			Some(GroupToNeuronRouting::Identity { width: groups })
+		} else if self.neurons % groups == 0 {
+			Some(GroupToNeuronRouting::Expand {
+				groups,
+				neurons: self.neurons,
+				neurons_per_group: self.neurons / groups,
+			})
+		} else if groups % self.neurons == 0 {
+			Some(GroupToNeuronRouting::Contract {
+				groups,
+				neurons: self.neurons,
+				groups_per_neuron: groups / self.neurons,
+			})
+		} else {
+			Some(GroupToNeuronRouting::FullyConnected {
+				groups,
+				neurons: self.neurons,
+			})
+		}
+	}
+
+	fn valid_for(self, groups: GroupCount) -> bool {
+		self.neurons != 0 && self.groups == groups
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerSpec {
 	Dense {
 		units: usize,
-		activation: Activation,
+		operations: Vec<LayerOperation>,
+	},
+	Perc {
+		count: usize,
+		operations: Vec<LayerOperation>,
+	},
+	Rnn {
+		width: usize,
+		operations: Vec<LayerOperation>,
+	},
+	Gru {
+		width: usize,
+		operations: Vec<LayerOperation>,
+	},
+	Lstm {
+		width: usize,
+		operations: Vec<LayerOperation>,
 	},
 	Convolution {
 		filters: usize,
 		kernel: usize,
-		stride: usize,
 		activation: Activation,
+	},
+	Pool {
+		size: usize,
+		group_to_neuron: Option<GroupToNeuronConnection>,
+	},
+	Lgbm {
+		depth: usize,
+	},
+	Cbst {
+		depth: usize,
+	},
+	Xgbst {
+		depth: usize,
+	},
+	Forest {
+		trees: usize,
+		booster: Option<ForestBooster>,
+	},
+	KMeans {
+		clusters: usize,
+		group_to_neuron: Option<GroupToNeuronConnection>,
+	},
+	KnnPrediction {
+		neighbors: usize,
+	},
+	KnnReduction {
+		outputs: usize,
+		neighbors: usize,
+		operations: Vec<LayerOperation>,
+	},
+	Residual {
+		branch: Vec<ResidualOperation>,
+		output_width: usize,
+		skip: ResidualSkip,
+		operations: Vec<LayerOperation>,
 	},
 	Embedding {
 		dimensions: usize,
@@ -535,12 +781,37 @@ impl LayerSpec {
 	fn validate(&self) -> DeclarationResult<()> {
 		let valid = match self {
 			Self::Dense { units, .. } => *units != 0,
+			Self::Perc { count, .. } => *count != 0,
+			Self::Rnn { width, .. } | Self::Gru { width, .. } | Self::Lstm { width, .. } => *width != 0,
 			Self::Convolution {
-				filters,
-				kernel,
-				stride,
+				filters, kernel, ..
+			} => *filters != 0 && *kernel != 0,
+			Self::Pool {
+				size,
+				group_to_neuron,
+			} => *size != 0 && group_to_neuron.is_none_or(|connection| connection.valid_for(GroupCount::Derived)),
+			Self::Lgbm { depth } | Self::Cbst { depth } | Self::Xgbst { depth } => *depth != 0,
+			Self::Forest { trees, booster } => {
+				*trees != 0 && booster.as_ref().is_some_and(|booster| booster.depth() != 0)
+			}
+			Self::KMeans {
+				clusters,
+				group_to_neuron,
+			} => {
+				*clusters != 0
+					&& group_to_neuron
+						.is_none_or(|connection| connection.valid_for(GroupCount::Exact(*clusters)))
+			}
+			Self::KnnPrediction { neighbors } => *neighbors != 0,
+			Self::KnnReduction {
+				outputs, neighbors, ..
+			} => *outputs != 0 && *neighbors != 0,
+			Self::Residual {
+				branch,
+				output_width,
+				skip: ResidualSkip::IdentityOrLinearProjection,
 				..
-			} => *filters != 0 && *kernel != 0 && *stride != 0,
+			} => residual_output_width(branch) == Some(*output_width),
 			Self::Embedding {
 				dimensions,
 				vocabulary,
@@ -552,7 +823,7 @@ impl LayerSpec {
 		} else {
 			Err(DeclarationError::new(
 				DeclarationErrorKind::InvalidLayer,
-				"layer dimensions, heads, filters, kernels, and strides must be nonzero",
+				"model blocks must be complete, nonzero, and preserve every declared grouped routing",
 			))
 		}
 	}
@@ -566,7 +837,7 @@ impl IntoLayer for usize {
 	fn into_layer(self) -> LayerSpec {
 		LayerSpec::Dense {
 			units: self,
-			activation: Activation::Linear,
+			operations: Vec::new(),
 		}
 	}
 }
@@ -577,82 +848,37 @@ impl IntoLayer for LayerSpec {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseSpec {
-	units: usize,
-	activation: Activation,
+trait IntoKnnSpec {
+	fn into_knn_spec(self) -> LayerSpec;
 }
 
-impl DenseSpec {
-	#[must_use]
-	pub const fn new(units: usize) -> Self {
-		Self {
-			units,
-			activation: Activation::Linear,
-		}
-	}
-
-	#[must_use]
-	pub const fn activation(mut self, activation: Activation) -> Self {
-		self.activation = activation;
-		self
+impl IntoKnnSpec for usize {
+	fn into_knn_spec(self) -> LayerSpec {
+		LayerSpec::KnnPrediction { neighbors: self }
 	}
 }
 
-impl IntoLayer for DenseSpec {
-	fn into_layer(self) -> LayerSpec {
-		LayerSpec::Dense {
-			units: self.units,
-			activation: self.activation,
+impl IntoKnnSpec for [usize; 2] {
+	fn into_knn_spec(self) -> LayerSpec {
+		let [outputs, neighbors] = self;
+		LayerSpec::KnnReduction {
+			outputs,
+			neighbors,
+			operations: Vec::new(),
 		}
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EmbedSpec {
-	dimensions: usize,
-	vocabulary: Option<usize>,
-}
-
-#[must_use]
-pub const fn embed(dimensions: usize) -> EmbedSpec {
-	EmbedSpec {
-		dimensions,
-		vocabulary: None,
-	}
-}
-
-impl EmbedSpec {
-	#[must_use]
-	pub const fn vocab(mut self, vocabulary: usize) -> Self {
-		self.vocabulary = Some(vocabulary);
-		self
-	}
-}
-
-impl IntoLayer for EmbedSpec {
-	fn into_layer(self) -> LayerSpec {
-		LayerSpec::Embedding {
-			dimensions: self.dimensions,
-			vocabulary: self.vocabulary,
+fn residual_output_width(branch: &[ResidualOperation]) -> Option<usize> {
+	let mut output_width = None;
+	for operation in branch {
+		match operation {
+			ResidualOperation::Layer { width: 0 } => return None,
+			ResidualOperation::Layer { width } => output_width = Some(*width),
+			ResidualOperation::Activation(_) => {}
 		}
 	}
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AttnSpec {
-	heads: usize,
-}
-
-#[must_use]
-pub const fn attn(heads: usize) -> AttnSpec {
-	AttnSpec { heads }
-}
-
-impl IntoLayer for AttnSpec {
-	fn into_layer(self) -> LayerSpec {
-		LayerSpec::Attention { heads: self.heads }
-	}
+	output_width
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,17 +892,48 @@ pub enum Loss {
 }
 
 #[allow(non_upper_case_globals)]
+/// Mean squared error: `(z - y)²`.
 pub const mse: Loss = Loss::MeanSquaredError;
 #[allow(non_upper_case_globals)]
+/// Mean absolute error: `abs(z - y)`.
 pub const mae: Loss = Loss::MeanAbsoluteError;
 #[allow(non_upper_case_globals)]
+/// Unit-delta Huber loss: `(z - y)² / 2` below unit absolute
+/// error and `abs(z - y) - 1/2` otherwise.
 pub const huber: Loss = Loss::Huber;
 #[allow(non_upper_case_globals)]
+/// Binary cross entropy evaluated by the training compiler from logits.
 pub const bce: Loss = Loss::BinaryCrossEntropy;
 #[allow(non_upper_case_globals)]
+/// Multiclass cross entropy evaluated from logits using the target class and
+/// a numerically stable log-softmax. The compiler derives the class width from
+/// the categorical target contract.
 pub const ce: Loss = Loss::CrossEntropy;
 #[allow(non_upper_case_globals)]
 pub const focal: Loss = Loss::Focal;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grad {
+	clip_bits: Option<u32>,
+	invalid_clip_bits: Option<u64>,
+}
+
+/// Configure an explicit global gradient clipping norm for [`Model::grad`].
+#[must_use]
+pub fn clip(maximum_norm: f64) -> Grad {
+	let narrowed = maximum_norm as f32;
+	if maximum_norm.is_finite() && narrowed.is_finite() && narrowed > 0.0 {
+		Grad {
+			clip_bits: Some(narrowed.to_bits()),
+			invalid_clip_bits: None,
+		}
+	} else {
+		Grad {
+			clip_bits: None,
+			invalid_clip_bits: Some(maximum_norm.to_bits()),
+		}
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Objective {
@@ -701,14 +958,6 @@ impl IntoObjective for &Model {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Normalization {
-	ZScore,
-}
-
-#[allow(non_upper_case_globals)]
-pub const z_score: Normalization = Normalization::ZScore;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimizer {
 	AdamW,
 }
@@ -716,15 +965,73 @@ pub enum Optimizer {
 #[allow(non_upper_case_globals)]
 pub const adamw: Optimizer = Optimizer::AdamW;
 
+/// One conditional dependency in a Bayesian model.
+///
+/// The edge direction is `parent -> child`; declaration order is retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BayesDependency {
+	child: String,
+	parents: Vec<String>,
+}
+
+impl BayesDependency {
+	#[must_use]
+	pub fn child(&self) -> &str {
+		&self.child
+	}
+
+	#[must_use]
+	pub fn parents(&self) -> &[String] {
+		&self.parents
+	}
+
+	fn validate(&self) -> DeclarationResult<()> {
+		if self.child.is_empty() {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidBayes,
+				"Bayesian child name is empty",
+			));
+		}
+		if self.parents.iter().any(String::is_empty) {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidBayes,
+				format!(
+					"Bayesian dependency for {:?} contains an empty parent name",
+					self.child
+				),
+			));
+		}
+		if self.parents.iter().any(|parent| parent == &self.child) {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidBayes,
+				format!(
+					"Bayesian dependency {:?} cannot name itself as a parent",
+					self.child
+				),
+			));
+		}
+		let unique = self.parents.iter().collect::<BTreeSet<_>>();
+		if unique.len() != self.parents.len() {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidBayes,
+				format!(
+					"Bayesian dependency {:?} contains a duplicate parent",
+					self.child
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
 /// Backend-neutral model declaration. It contains no runtime handles, loaded
 /// weights, allocations, or mutable global registry entries.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
 	layers: Vec<LayerSpec>,
+	bayes_dependencies: Vec<BayesDependency>,
 	objective: Option<Objective>,
-	normalization: Option<Normalization>,
-	optimizer: Option<Optimizer>,
-	learning_rate_bits: Option<u32>,
+	gradient_clip_bits: Option<u32>,
 	weights_source: Option<String>,
 	input_width: Option<usize>,
 	deferred: Option<DeclarationError>,
@@ -732,50 +1039,196 @@ pub struct Model {
 
 impl Model {
 	#[must_use]
-	pub const fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Self {
 			layers: Vec::new(),
+			bayes_dependencies: Vec::new(),
 			objective: None,
-			normalization: None,
-			optimizer: None,
-			learning_rate_bits: None,
+			gradient_clip_bits: None,
 			weights_source: None,
 			input_width: None,
 			deferred: None,
 		}
 	}
 
-	#[must_use]
-	pub fn load(weights: &str, mut prototype: Self, input_width: usize) -> Self {
+	pub fn load(mut self, weights: &str, input_width: usize) -> Self {
 		if weights.is_empty() || input_width == 0 {
-			prototype.defer(
+			self.defer(
 				DeclarationErrorKind::EmptyValue,
 				"model weight path and input width must be nonempty",
 			);
 		} else {
-			prototype.weights_source = Some(weights.to_owned());
-			prototype.input_width = Some(input_width);
+			self.weights_source = Some(weights.to_owned());
+			self.input_width = Some(input_width);
 		}
-		prototype
+		crate::remember_recipe_model(self.clone());
+		self
 	}
 
-	#[must_use]
 	pub fn layer(mut self, spec: impl IntoLayer) -> Self {
 		let spec = spec.into_layer();
 		if let Err(error) = spec.validate() {
 			self.defer(error.kind, error.detail);
 		} else {
+			if let LayerSpec::Dense { units, .. } = &spec {
+				match self.layers.last_mut() {
+					Some(LayerSpec::Pool {
+						group_to_neuron, ..
+					}) => {
+						*group_to_neuron = Some(GroupToNeuronConnection {
+							groups: GroupCount::Derived,
+							neurons: *units,
+						});
+					}
+					Some(LayerSpec::KMeans {
+						clusters,
+						group_to_neuron,
+					}) => {
+						*group_to_neuron = Some(GroupToNeuronConnection {
+							groups: GroupCount::Exact(*clusters),
+							neurons: *units,
+						});
+					}
+					_ => {}
+				}
+			}
 			self.layers.push(spec);
 		}
+		crate::remember_recipe_model(self.clone());
 		self
 	}
 
-	#[must_use]
-	pub fn conv(mut self, filters: usize, kernel: usize, stride: usize) -> Self {
+	pub fn embed(mut self, dimensions: usize) -> Self {
+		let spec = LayerSpec::Embedding {
+			dimensions,
+			vocabulary: None,
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub fn vocab(mut self, vocabulary: usize) -> Self {
+		if vocabulary == 0 {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"embedding vocabulary must be nonzero",
+			);
+		} else {
+			match self.layers.last_mut() {
+				Some(LayerSpec::Embedding {
+					vocabulary: current,
+					..
+				}) => *current = Some(vocabulary),
+				_ => self.defer(
+					DeclarationErrorKind::InvalidLayer,
+					"vocab requires a preceding embedding block",
+				),
+			}
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub fn attn(mut self, heads: usize) -> Self {
+		let spec = LayerSpec::Attention { heads };
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	/// Add one block containing `count` parallel perceptrons.
+	pub fn perc(mut self, count: usize) -> Self {
+		let spec = LayerSpec::Perc {
+			count,
+			operations: Vec::new(),
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	/// Add a recurrent neural-network block with `width` recurrent states.
+	pub fn rnn(mut self, width: usize) -> Self {
+		let spec = LayerSpec::Rnn {
+			width,
+			operations: Vec::new(),
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	/// Add a gated recurrent-unit block with `width` recurrent states.
+	pub fn gru(mut self, width: usize) -> Self {
+		let spec = LayerSpec::Gru {
+			width,
+			operations: Vec::new(),
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	/// Add a long short-term-memory block with `width` recurrent states.
+	pub fn lstm(mut self, width: usize) -> Self {
+		let spec = LayerSpec::Lstm {
+			width,
+			operations: Vec::new(),
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	/// Declare that `child` is conditionally modeled from `parents`.
+	///
+	/// Repeated calls append to one network in source order. Each child has one
+	/// declaration, while a parent may feed any number of children. Parent nodes
+	/// may be declared later or remain implicit roots. The resulting network
+	/// must be acyclic.
+	pub fn bayes(mut self, child: &str, parents: impl IntoTargets) -> Self {
+		let dependency = BayesDependency {
+			child: child.to_owned(),
+			parents: parents.into_targets(),
+		};
+		self.bayes_dependencies.push(dependency);
+		if let Err(error) = validate_bayes_network(&self.bayes_dependencies) {
+			self.bayes_dependencies.pop();
+			self.defer(error.kind, error.detail);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub fn conv(mut self, filters: usize, kernel: usize) -> Self {
 		let spec = LayerSpec::Convolution {
 			filters,
 			kernel,
-			stride,
 			activation: Activation::Linear,
 		};
 		if let Err(error) = spec.validate() {
@@ -783,99 +1236,251 @@ impl Model {
 		} else {
 			self.layers.push(spec);
 		}
+		crate::remember_recipe_model(self.clone());
 		self
 	}
 
-	#[must_use]
+	pub fn pool(mut self, size: usize) -> Self {
+		let spec = LayerSpec::Pool {
+			size,
+			group_to_neuron: None,
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub fn lgbm(self, depth: usize) -> Self {
+		self.with_tree_booster(ForestBooster::Lgbm { depth })
+	}
+
+	pub fn cbst(self, depth: usize) -> Self {
+		self.with_tree_booster(ForestBooster::Cbst { depth })
+	}
+
+	pub fn xgbst(self, depth: usize) -> Self {
+		self.with_tree_booster(ForestBooster::Xgbst { depth })
+	}
+
+	pub fn forest(mut self, trees: usize) -> Self {
+		if trees == 0 {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"forest tree count must be nonzero",
+			);
+		} else {
+			self.layers.push(LayerSpec::Forest {
+				trees,
+				booster: None,
+			});
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub fn kmeans(mut self, clusters: usize) -> Self {
+		let spec = LayerSpec::KMeans {
+			clusters,
+			group_to_neuron: None,
+		};
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	#[allow(private_bounds)]
+	pub fn knn(mut self, spec: impl IntoKnnSpec) -> Self {
+		let spec = spec.into_knn_spec();
+		if let Err(error) = spec.validate() {
+			self.defer(error.kind, error.detail);
+		} else {
+			self.layers.push(spec);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	#[allow(private_bounds)]
+	pub fn residual(mut self, branch: impl IntoResidualBranch) -> Self {
+		let branch = branch.into_residual_branch();
+		if let Some(output_width) = residual_output_width(&branch) {
+			self.layers.push(LayerSpec::Residual {
+				branch,
+				output_width,
+				skip: ResidualSkip::IdentityOrLinearProjection,
+				operations: Vec::new(),
+			});
+		} else {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"a residual branch requires at least one layer and every declared layer width must be nonzero",
+			);
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
 	pub fn relu(self) -> Self {
 		self.with_last_activation(Activation::Relu)
 	}
 
-	#[must_use]
 	pub fn leak(self) -> Self {
 		self.with_last_activation(Activation::LeakyRelu)
 	}
 
-	#[must_use]
 	pub fn sigmoid(self) -> Self {
 		self.with_last_activation(Activation::Sigmoid)
 	}
 
-	#[must_use]
 	pub fn tanh(self) -> Self {
 		self.with_last_activation(Activation::Tanh)
 	}
 
-	#[must_use]
 	pub fn selu(self) -> Self {
 		self.with_last_activation(Activation::Selu)
 	}
 
-	#[must_use]
 	pub fn gelu(self) -> Self {
 		self.with_last_activation(Activation::Gelu)
 	}
 
-	#[must_use]
 	pub fn silu(self) -> Self {
 		self.with_last_activation(Activation::Silu)
 	}
 
-	#[must_use]
 	pub fn elu(self) -> Self {
 		self.with_last_activation(Activation::Elu)
 	}
 
-	#[must_use]
 	pub fn prelu(self) -> Self {
 		self.with_last_activation(Activation::PRelu)
 	}
 
-	#[must_use]
+	pub fn cos(self) -> Self {
+		self.with_last_activation(Activation::Cosine)
+	}
+
+	pub fn exp(self) -> Self {
+		self.with_last_activation(Activation::Exponential)
+	}
+
+	/// Applies the signed logarithmic activation
+	/// `sign(x) * ln(1 + abs(x))`.
+	pub fn log(self) -> Self {
+		self.with_last_activation(Activation::Logarithm)
+	}
+
+	pub fn huber(self) -> Self {
+		self.with_last_activation(Activation::Huber)
+	}
+
+	pub fn tan(self) -> Self {
+		self.with_last_activation(Activation::Tangent)
+	}
+
 	pub fn loss(mut self, objective: impl IntoObjective) -> Self {
 		self.objective = Some(objective.into_objective());
+		crate::remember_recipe_model(self.clone());
 		self
 	}
 
-	#[must_use]
-	pub const fn norm(mut self, normalization: Normalization) -> Self {
-		self.normalization = Some(normalization);
-		self
-	}
-
-	#[must_use]
-	pub const fn optimizer(mut self, optimizer: Optimizer) -> Self {
-		self.optimizer = Some(optimizer);
-		self
-	}
-
-	#[must_use]
-	pub fn lr(mut self, rate: f64) -> Self {
-		let rate_f32 = rate as f32;
-		if !rate.is_finite() || !rate_f32.is_finite() || rate_f32 <= 0.0 {
-			self.defer(
-				DeclarationErrorKind::InvalidLearningRate,
-				format!("learning rate must be finite, positive, and representable as f32, got {rate}"),
-			);
-		} else {
-			self.learning_rate_bits = Some(rate_f32.to_bits());
+	pub fn grad(mut self, gradient: Grad) -> Self {
+		match gradient.clip_bits {
+			Some(bits) => self.gradient_clip_bits = Some(bits),
+			None => {
+				let maximum_norm = gradient
+					.invalid_clip_bits
+					.map(f64::from_bits)
+					.unwrap_or(f64::NAN);
+				self.defer(
+					DeclarationErrorKind::InvalidTrainingConfiguration,
+					format!(
+						"gradient clipping norm must be finite, positive, and representable as f32, got {maximum_norm}"
+					),
+				);
+			}
 		}
+		crate::remember_recipe_model(self.clone());
 		self
 	}
 
-	pub fn validate(&self) -> DeclarationResult<()> {
+	pub fn norm(mut self, normalization: LayerNormalization) -> Self {
+		match self.layers.last_mut() {
+			Some(
+				LayerSpec::Dense { operations, .. }
+				| LayerSpec::Perc { operations, .. }
+				| LayerSpec::Rnn { operations, .. }
+				| LayerSpec::Gru { operations, .. }
+				| LayerSpec::Lstm { operations, .. }
+				| LayerSpec::KnnReduction { operations, .. }
+				| LayerSpec::Residual { operations, .. },
+			) => {
+				operations.push(LayerOperation::Normalization(normalization));
+			}
+			Some(
+				LayerSpec::Convolution { .. }
+				| LayerSpec::Pool { .. }
+				| LayerSpec::Lgbm { .. }
+				| LayerSpec::Cbst { .. }
+				| LayerSpec::Xgbst { .. }
+				| LayerSpec::Forest { .. }
+				| LayerSpec::KMeans { .. }
+				| LayerSpec::KnnPrediction { .. }
+				| LayerSpec::Embedding { .. }
+				| LayerSpec::Attention { .. },
+			)
+			| None => self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"layer normalization requires a preceding dense, perceptron, recurrent, KNN reduction, or residual block",
+			),
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
+	pub(crate) fn validate(&self) -> DeclarationResult<()> {
 		if let Some(error) = &self.deferred {
 			return Err(error.clone());
 		}
-		if self.layers.is_empty() && self.weights_source.is_none() {
+		if self.layers.is_empty() && self.bayes_dependencies.is_empty() && self.weights_source.is_none() {
 			return Err(DeclarationError::new(
 				DeclarationErrorKind::InvalidLayer,
-				"a model requires at least one layer or a declared weight source",
+				"a model requires at least one layer, Bayesian dependency, or declared weight source",
 			));
 		}
-		for layer in &self.layers {
+		for (index, layer) in self.layers.iter().enumerate() {
 			layer.validate()?;
+			let connection = match layer {
+				LayerSpec::Pool {
+					group_to_neuron, ..
+				}
+				| LayerSpec::KMeans {
+					group_to_neuron, ..
+				} => group_to_neuron.as_ref(),
+				_ => None,
+			};
+			if let Some(connection) = connection {
+				let has_exact_following_layer = matches!(
+					self.layers.get(index + 1),
+					Some(LayerSpec::Dense { units, .. }) if *units == connection.neurons()
+				);
+				if !has_exact_following_layer {
+					return Err(DeclarationError::new(
+						DeclarationErrorKind::InvalidLayer,
+						"a grouped-to-dense connection must refer to the immediately following layer",
+					));
+				}
+			}
 		}
+		validate_bayes_network(&self.bayes_dependencies)?;
 		if let Some(Objective::Reference(model)) = &self.objective {
 			model.validate()?;
 		}
@@ -888,23 +1493,18 @@ impl Model {
 	}
 
 	#[must_use]
+	pub fn bayes_dependencies(&self) -> &[BayesDependency] {
+		&self.bayes_dependencies
+	}
+
+	#[must_use]
 	pub const fn objective(&self) -> Option<&Objective> {
 		self.objective.as_ref()
 	}
 
 	#[must_use]
-	pub const fn normalization(&self) -> Option<Normalization> {
-		self.normalization
-	}
-
-	#[must_use]
-	pub const fn optimizer_spec(&self) -> Option<Optimizer> {
-		self.optimizer
-	}
-
-	#[must_use]
-	pub fn learning_rate(&self) -> Option<f32> {
-		self.learning_rate_bits.map(f32::from_bits)
+	pub fn gradient_clip_value(&self) -> Option<f32> {
+		self.gradient_clip_bits.map(f32::from_bits)
 	}
 
 	#[must_use]
@@ -917,21 +1517,67 @@ impl Model {
 		self.input_width
 	}
 
+	fn with_tree_booster(mut self, booster: ForestBooster) -> Self {
+		let depth = booster.depth();
+		if depth == 0 {
+			self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"boosted-tree depth must be nonzero",
+			);
+		} else if let Some(LayerSpec::Forest {
+			booster: pending @ None,
+			..
+		}) = self.layers.last_mut()
+		{
+			*pending = Some(booster);
+		} else {
+			self.layers.push(match booster {
+				ForestBooster::Lgbm { depth } => LayerSpec::Lgbm { depth },
+				ForestBooster::Cbst { depth } => LayerSpec::Cbst { depth },
+				ForestBooster::Xgbst { depth } => LayerSpec::Xgbst { depth },
+			});
+		}
+		crate::remember_recipe_model(self.clone());
+		self
+	}
+
 	fn with_last_activation(mut self, activation: Activation) -> Self {
 		match self.layers.last_mut() {
-			Some(LayerSpec::Dense {
-				activation: current,
-				..
-			})
-			| Some(LayerSpec::Convolution {
+			Some(
+				LayerSpec::Dense { operations, .. }
+				| LayerSpec::Perc { operations, .. }
+				| LayerSpec::Rnn { operations, .. }
+				| LayerSpec::Gru { operations, .. }
+				| LayerSpec::Lstm { operations, .. }
+				| LayerSpec::KnnReduction { operations, .. }
+				| LayerSpec::Residual { operations, .. },
+			) => {
+				operations.push(LayerOperation::Activation(activation));
+			}
+			Some(LayerSpec::Convolution {
 				activation: current,
 				..
 			}) => *current = activation,
-			Some(LayerSpec::Embedding { .. } | LayerSpec::Attention { .. }) | None => self.defer(
+			Some(
+				LayerSpec::Pool { .. }
+				| LayerSpec::Lgbm { .. }
+				| LayerSpec::Cbst { .. }
+				| LayerSpec::Xgbst { .. }
+				| LayerSpec::Forest { .. }
+				| LayerSpec::KMeans { .. }
+				| LayerSpec::KnnPrediction { .. }
+				| LayerSpec::Embedding { .. }
+				| LayerSpec::Attention { .. },
+			)
+			| None => self.defer(
 				DeclarationErrorKind::InvalidActivation,
-				"activation methods require a preceding dense or convolution layer",
+				concat!(
+					"activation methods require a preceding dense, perceptron, recurrent, convolution, KNN reduction,",
+					" or residual block",
+				),
 			),
 		}
+		crate::remember_recipe_model(self.clone());
 		self
 	}
 
@@ -942,8 +1588,59 @@ impl Model {
 	}
 }
 
+fn validate_bayes_network(dependencies: &[BayesDependency]) -> DeclarationResult<()> {
+	let mut children = BTreeSet::new();
+	for dependency in dependencies {
+		dependency.validate()?;
+		if !children.insert(dependency.child.as_str()) {
+			return Err(DeclarationError::new(
+				DeclarationErrorKind::InvalidBayes,
+				format!(
+					"Bayesian child {:?} is declared more than once",
+					dependency.child
+				),
+			));
+		}
+	}
+	if bayes_dependencies_have_cycle(dependencies) {
+		return Err(DeclarationError::new(
+			DeclarationErrorKind::InvalidBayes,
+			"Bayesian dependencies contain a cycle",
+		));
+	}
+	Ok(())
+}
+
+fn bayes_dependencies_have_cycle(dependencies: &[BayesDependency]) -> bool {
+	dependencies.iter().any(|dependency| {
+		dependency
+			.parents
+			.iter()
+			.any(|parent| bayes_path_exists(dependencies, &dependency.child, parent))
+	})
+}
+
+fn bayes_path_exists(dependencies: &[BayesDependency], from: &str, to: &str) -> bool {
+	let mut pending = vec![from];
+	let mut visited = BTreeSet::new();
+	while let Some(current) = pending.pop() {
+		if current == to {
+			return true;
+		}
+		if !visited.insert(current) {
+			continue;
+		}
+		for dependency in dependencies {
+			if dependency.parents.iter().any(|parent| parent == current) {
+				pending.push(dependency.child.as_str());
+			}
+		}
+	}
+	false
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Metric {
+pub(crate) enum Metric {
 	Loss,
 	Accuracy,
 	R2,
@@ -951,7 +1648,6 @@ pub enum Metric {
 	AuPrc,
 	Brier,
 	CalibrationError,
-	RecallAt { threshold_bits: u64 },
 	Epoch,
 	LearningRate,
 	Time,
@@ -960,69 +1656,96 @@ pub enum Metric {
 
 impl Metric {
 	fn validate(self) -> DeclarationResult<()> {
-		if let Self::RecallAt { threshold_bits } = self {
-			let threshold = f64::from_bits(threshold_bits);
-			if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-				return Err(DeclarationError::new(
-					DeclarationErrorKind::InvalidMetric,
-					format!("recall threshold must be finite and in [0, 1], got {threshold}"),
-				));
-			}
-		}
 		Ok(())
-	}
-
-	#[must_use]
-	pub fn recall_threshold(self) -> Option<f64> {
-		match self {
-			Self::RecallAt { threshold_bits } => Some(f64::from_bits(threshold_bits)),
-			_ => None,
-		}
 	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogItem {
-	Metric(Metric),
+pub struct LogItem {
+	metric: Metric,
 }
 
 impl LogItem {
 	fn validate(self) -> DeclarationResult<()> {
-		match self {
-			Self::Metric(metric) => metric.validate(),
-		}
+		self.metric.validate()
 	}
 
 	#[must_use]
-	pub const fn metric(self) -> Metric {
-		match self {
-			Self::Metric(metric) => metric,
-		}
+	pub(crate) const fn metric(self) -> Metric {
+		self.metric
+	}
+}
+
+pub trait IntoLogItems {
+	fn into_log_items(self) -> Vec<LogItem>;
+}
+
+impl IntoLogItems for LogItem {
+	fn into_log_items(self) -> Vec<LogItem> {
+		vec![self]
+	}
+}
+
+impl<const N: usize> IntoLogItems for [LogItem; N] {
+	fn into_log_items(self) -> Vec<LogItem> {
+		self.into()
+	}
+}
+
+impl IntoLogItems for Vec<LogItem> {
+	fn into_log_items(self) -> Vec<LogItem> {
+		self
+	}
+}
+
+impl IntoLogItems for &[LogItem] {
+	fn into_log_items(self) -> Vec<LogItem> {
+		self.to_vec()
 	}
 }
 
 #[allow(non_upper_case_globals)]
-pub const Accuracy: LogItem = LogItem::Metric(Metric::Accuracy);
+pub const Accuracy: LogItem = LogItem {
+	metric: Metric::Accuracy,
+};
 #[allow(non_upper_case_globals)]
-pub const R2: LogItem = LogItem::Metric(Metric::R2);
+pub const R2: LogItem = LogItem { metric: Metric::R2 };
 #[allow(non_upper_case_globals)]
-pub const AuRoc: LogItem = LogItem::Metric(Metric::AuRoc);
+pub const AuRoc: LogItem = LogItem {
+	metric: Metric::AuRoc,
+};
 #[allow(non_upper_case_globals)]
-pub const AuPrc: LogItem = LogItem::Metric(Metric::AuPrc);
+pub const AuPrc: LogItem = LogItem {
+	metric: Metric::AuPrc,
+};
 #[allow(non_upper_case_globals)]
-pub const Brier: LogItem = LogItem::Metric(Metric::Brier);
+pub const Brier: LogItem = LogItem {
+	metric: Metric::Brier,
+};
 #[allow(non_upper_case_globals)]
-pub const CalibrationError: LogItem = LogItem::Metric(Metric::CalibrationError);
+pub const CalibrationError: LogItem = LogItem {
+	metric: Metric::CalibrationError,
+};
 #[allow(non_upper_case_globals)]
-pub const Epoch: LogItem = LogItem::Metric(Metric::Epoch);
+pub const Epoch: LogItem = LogItem {
+	metric: Metric::Epoch,
+};
 #[allow(non_upper_case_globals)]
-pub const Lr: LogItem = LogItem::Metric(Metric::LearningRate);
+pub const Lr: LogItem = LogItem {
+	metric: Metric::LearningRate,
+};
 #[allow(non_upper_case_globals)]
-pub const Time: LogItem = LogItem::Metric(Metric::Time);
+pub const Time: LogItem = LogItem {
+	metric: Metric::Time,
+};
 #[allow(non_upper_case_globals)]
-pub const Device: LogItem = LogItem::Metric(Metric::Device);
+pub const Device: LogItem = LogItem {
+	metric: Metric::Device,
+};
 #[allow(non_upper_case_globals)]
-pub const LossMetric: LogItem = LogItem::Metric(Metric::Loss);
+pub const LossMetric: LogItem = LogItem {
+	metric: Metric::Loss,
+};
 #[allow(non_upper_case_globals)]
 pub const Loss: LogItem = LossMetric;
 #[allow(non_upper_case_globals)]
@@ -1042,26 +1765,12 @@ pub const r2: LogItem = R2;
 #[allow(non_upper_case_globals)]
 pub const device: LogItem = Device;
 
-#[allow(non_snake_case)]
-#[must_use]
-pub const fn RecallAt(threshold: f64) -> LogItem {
-	LogItem::Metric(Metric::RecallAt {
-		threshold_bits: threshold.to_bits(),
-	})
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LearningRateSchedule {
+	LinearDecay,
 	CosineDecay,
+	ExponentialDecay,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Calibration {
-	TemperatureScaling,
-}
-
-#[allow(non_upper_case_globals)]
-pub const TemperatureScaling: Calibration = Calibration::TemperatureScaling;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EarlyStopping {
@@ -1105,51 +1814,50 @@ impl SavePath for String {
 
 /// Static training policy. Calling builder methods does not probe hardware,
 /// parse data, prepare a bundle, or start a run.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Train {
-	batch_size: Option<usize>,
+	batch_fraction_bits: Option<u32>,
 	epochs: Option<usize>,
 	learning_rate_bits: Option<u32>,
 	warmup_epochs: Option<usize>,
 	learning_rate_schedule: Option<LearningRateSchedule>,
-	gradient_clip_bits: Option<u32>,
+	optimizer: Option<Optimizer>,
 	early_stopping: Option<EarlyStopping>,
-	calibration: Option<Calibration>,
 	log_every: Option<usize>,
 	log: Vec<LogItem>,
 	plot: Vec<LogItem>,
 	resume: Option<String>,
-	nodes: Vec<String>,
 	deferred: Option<DeclarationError>,
 }
 
 impl Train {
 	#[must_use]
-	pub const fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Self {
-			batch_size: None,
+			batch_fraction_bits: None,
 			epochs: None,
 			learning_rate_bits: None,
 			warmup_epochs: None,
 			learning_rate_schedule: None,
-			gradient_clip_bits: None,
+			optimizer: None,
 			early_stopping: None,
-			calibration: None,
 			log_every: None,
 			log: Vec::new(),
 			plot: Vec::new(),
 			resume: None,
-			nodes: Vec::new(),
 			deferred: None,
 		}
 	}
 
 	#[must_use]
-	pub fn batch_size(mut self, batch_size: usize) -> Self {
-		if batch_size == 0 {
-			self.defer("training batch size must be nonzero");
+	pub fn batch(mut self, fraction: f64) -> Self {
+		let narrowed = fraction as f32;
+		if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 || narrowed <= 0.0 || narrowed >= 1.0 {
+			self.defer(format!(
+				"training batch fraction must be finite and in (0, 1), got {fraction}"
+			));
 		} else {
-			self.batch_size = Some(batch_size);
+			self.batch_fraction_bits = Some(narrowed.to_bits());
 		}
 		self
 	}
@@ -1168,11 +1876,15 @@ impl Train {
 	pub fn lr(mut self, rate: f64) -> Self {
 		let rate_f32 = rate as f32;
 		if !rate.is_finite() || !rate_f32.is_finite() || rate_f32 <= 0.0 {
-			self.defer(format!(
-				"training learning rate must be finite, positive, and representable as f32, got {rate}"
-			));
+			self.defer_kind(
+				DeclarationErrorKind::InvalidLearningRate,
+				format!(
+					"training learning rate must be finite, positive, and representable as f32, got {rate}"
+				),
+			);
 		} else {
 			self.learning_rate_bits = Some(rate_f32.to_bits());
+			self.learning_rate_schedule = Some(LearningRateSchedule::LinearDecay);
 		}
 		self
 	}
@@ -1188,21 +1900,20 @@ impl Train {
 	}
 
 	#[must_use]
-	pub const fn cosine_decay(mut self) -> Self {
+	pub const fn cos(mut self) -> Self {
 		self.learning_rate_schedule = Some(LearningRateSchedule::CosineDecay);
 		self
 	}
 
 	#[must_use]
-	pub fn gradient_clip(mut self, maximum_norm: f64) -> Self {
-		let maximum_norm_f32 = maximum_norm as f32;
-		if !maximum_norm.is_finite() || !maximum_norm_f32.is_finite() || maximum_norm_f32 <= 0.0 {
-			self.defer(format!(
-				"gradient clipping norm must be finite, positive, and representable as f32, got {maximum_norm}"
-			));
-		} else {
-			self.gradient_clip_bits = Some(maximum_norm_f32.to_bits());
-		}
+	pub const fn exp(mut self) -> Self {
+		self.learning_rate_schedule = Some(LearningRateSchedule::ExponentialDecay);
+		self
+	}
+
+	#[must_use]
+	pub const fn optimizer(mut self, optimizer: Optimizer) -> Self {
+		self.optimizer = Some(optimizer);
 		self
 	}
 
@@ -1219,12 +1930,6 @@ impl Train {
 	}
 
 	#[must_use]
-	pub const fn calibrate(mut self, calibration: Calibration) -> Self {
-		self.calibration = Some(calibration);
-		self
-	}
-
-	#[must_use]
 	pub fn log_every(mut self, interval: usize) -> Self {
 		if interval == 0 {
 			self.defer("training log interval must be nonzero");
@@ -1235,8 +1940,8 @@ impl Train {
 	}
 
 	#[must_use]
-	pub fn log(mut self, items: impl IntoIterator<Item = LogItem>) -> Self {
-		for item in items {
+	pub fn log(mut self, items: impl IntoLogItems) -> Self {
+		for item in items.into_log_items() {
 			if let Err(error) = item.validate() {
 				self.defer_kind(error.kind, error.detail);
 			} else {
@@ -1269,31 +1974,7 @@ impl Train {
 		self
 	}
 
-	#[must_use]
-	pub fn net<'a>(mut self, nodes: impl IntoIterator<Item = &'a str>) -> Self {
-		let mut unique = BTreeSet::new();
-		for node in nodes {
-			if node.is_empty() || !unique.insert(node) {
-				self.defer("network node aliases must be nonempty and unique");
-				break;
-			}
-			self.nodes.push(node.to_owned());
-		}
-		self
-	}
-
-	pub fn declare(&self, data: &Data, model: &Model) -> DeclarationResult<TrainingDeclaration> {
-		self.validate()?;
-		data.validate()?;
-		model.validate()?;
-		Ok(TrainingDeclaration {
-			data: data.clone(),
-			model: model.clone(),
-			policy: self.clone(),
-		})
-	}
-
-	pub fn validate(&self) -> DeclarationResult<()> {
+	pub(crate) fn validate(&self) -> DeclarationResult<()> {
 		if let Some(error) = &self.deferred {
 			return Err(error.clone());
 		}
@@ -1313,8 +1994,8 @@ impl Train {
 	}
 
 	#[must_use]
-	pub const fn batch_size_value(&self) -> Option<usize> {
-		self.batch_size
+	pub fn batch_fraction(&self) -> Option<f32> {
+		self.batch_fraction_bits.map(f32::from_bits)
 	}
 
 	#[must_use]
@@ -1343,18 +2024,13 @@ impl Train {
 	}
 
 	#[must_use]
-	pub fn gradient_clip_value(&self) -> Option<f32> {
-		self.gradient_clip_bits.map(f32::from_bits)
+	pub const fn optimizer_spec(&self) -> Option<Optimizer> {
+		self.optimizer
 	}
 
 	#[must_use]
 	pub const fn early_stopping(&self) -> Option<EarlyStopping> {
 		self.early_stopping
-	}
-
-	#[must_use]
-	pub const fn calibration(&self) -> Option<Calibration> {
-		self.calibration
 	}
 
 	#[must_use]
@@ -1372,11 +2048,6 @@ impl Train {
 		self.resume.as_deref()
 	}
 
-	#[must_use]
-	pub fn nodes(&self) -> &[String] {
-		&self.nodes
-	}
-
 	fn defer(&mut self, detail: impl Into<String>) {
 		self.defer_kind(DeclarationErrorKind::InvalidTrainingConfiguration, detail);
 	}
@@ -1388,32 +2059,8 @@ impl Train {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrainingDeclaration {
-	data: Data,
-	model: Model,
-	policy: Train,
-}
-
-impl TrainingDeclaration {
-	#[must_use]
-	pub const fn data(&self) -> &Data {
-		&self.data
-	}
-
-	#[must_use]
-	pub const fn model(&self) -> &Model {
-		&self.model
-	}
-
-	#[must_use]
-	pub const fn policy(&self) -> &Train {
-		&self.policy
-	}
-}
-
 /// Static inference policy and logging declaration.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Infer {
 	log: Vec<LogItem>,
 	deferred: Option<DeclarationError>,
@@ -1421,7 +2068,7 @@ pub struct Infer {
 
 impl Infer {
 	#[must_use]
-	pub const fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Self {
 			log: Vec::new(),
 			deferred: None,
@@ -1429,19 +2076,17 @@ impl Infer {
 	}
 
 	#[must_use]
-	pub fn log(mut self, items: impl IntoIterator<Item = LogItem>) -> Self {
-		self.log.extend(items);
+	pub fn log(mut self, items: impl IntoLogItems) -> Self {
+		for item in items.into_log_items() {
+			if let Err(error) = item.validate() {
+				if self.deferred.is_none() {
+					self.deferred = Some(error);
+				}
+			} else {
+				self.log.push(item);
+			}
+		}
 		self
-	}
-
-	pub fn declare(&self, model: &Model) -> DeclarationResult<InferenceDeclaration> {
-		self.validate()?;
-		model.validate()?;
-		Ok(InferenceDeclaration {
-			model: model.clone(),
-			data: None,
-			policy: self.clone(),
-		})
 	}
 
 	pub fn evaluate(&self, data: &Data, model: &Model) -> DeclarationResult<InferenceDeclaration> {
@@ -1455,7 +2100,7 @@ impl Infer {
 		})
 	}
 
-	pub fn validate(&self) -> DeclarationResult<()> {
+	pub(crate) fn validate(&self) -> DeclarationResult<()> {
 		match &self.deferred {
 			Some(error) => Err(error.clone()),
 			None => Ok(()),
